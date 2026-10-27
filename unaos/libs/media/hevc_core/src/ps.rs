@@ -684,6 +684,15 @@ impl Sps {
     pub fn chroma_array_type(&self) -> u32 {
         if self.separate_colour_plane_flag { 0 } else { self.chroma_format_idc }
     }
+    /// HEVCREXT (SR334): the Picture / Frame chroma format of ChromaArrayType 1..3 (None: monochrome or separate planes).
+    pub fn chroma_format(&self) -> Option<h264_core::ChromaFormat> {
+        match self.chroma_array_type() {
+            1 => Some(h264_core::ChromaFormat::Yuv420),
+            2 => Some(h264_core::ChromaFormat::Yuv422),
+            3 => Some(h264_core::ChromaFormat::Yuv444),
+            _ => None,
+        }
+    }
     /// The ordering of the highest sub-layer (HighestTid = sps_max_sub_layers_minus1).
     pub fn highest_ordering(&self) -> Ordering {
         self.ordering.last().copied().unwrap_or_default()

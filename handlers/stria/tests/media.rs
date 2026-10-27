@@ -564,9 +564,9 @@ fn my_log_lines(containing: &str) -> Vec<String> {
     CAPTURED.lock().unwrap().iter().filter(|(t, l)| *t == me && l.contains(containing)).map(|(_, l)| l.clone()).collect()
 }
 
-/// HEVC_SPS with bit_depth_luma_minus8 = bit_depth_chroma_minus8 = 4 (the two ue(v) after the conformance flag, 7.3.2.2:
-/// `1` -> `00101` each), re-packed and re-escaped: a 12-bit SPS hevc_core refuses by name at activation (HEVCREXT).
-const HEVC_SPS_12BIT: [u8; 28] = [0x42, 0x01, 0x01, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0x90, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00, 0x3c, 0xa0, 0x20, 0x83, 0x11, 0x4a, 0x5f, 0x92, 0x4c, 0x20, 0x80];
+/// HEVC_SPS with bit_depth_luma_minus8 = bit_depth_chroma_minus8 = 5 (the two ue(v) after the conformance flag, 7.3.2.2:
+/// `1` -> `00110` each), re-packed in place: a 13-bit SPS hevc_core refuses by name at activation (above 12: HEVCREXT-TOOLS).
+const HEVC_SPS_12BIT: [u8; 28] = [0x42, 0x01, 0x01, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0x90, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00, 0x3c, 0xa0, 0x20, 0x83, 0x11, 0x8c, 0x5f, 0x92, 0x4c, 0x20, 0x80];
 
 #[derive(Default)]
 struct CountSink {
@@ -578,7 +578,7 @@ impl FrameSink for CountSink {
     }
 }
 
-/// Rule: a decoder that refuses the stream mid-stream (the second sample carries an in-band 12-bit SPS, so every later
+/// Rule: a decoder that refuses the stream mid-stream (the second sample carries an in-band 13-bit SPS, so every later
 /// IDR activates an unsupported SPS) hands the picture to the labelled stand-in ONCE with one `swapped to stand-in`
 /// line; no per-packet warnings follow, and every sample still presents a frame (0 real, 1-3 the stand-in).
 #[test]
@@ -606,7 +606,7 @@ fn hevcdepthcore_12bit_mid_stream_swaps_to_the_stand_in_once() {
     }
     let lines = my_log_lines("[STRIA] :: video decode:");
     assert_eq!(lines.len(), 1, "{lines:?}");
-    assert_eq!(lines[0], "[STRIA] :: video decode: swapped to stand-in: no decoder: hevc: unsupported (bit depth above 10 (HEVCREXT))");
+    assert_eq!(lines[0], "[STRIA] :: video decode: swapped to stand-in: no decoder: hevc: unsupported (bit depth above 12 (HEVCREXT-TOOLS))");
     assert!(!p.info().real_video);
     assert_eq!(p.info().video_decoder, "test-pattern (stand-in)");
     assert_eq!(sink.shown.iter().map(|s| s.1).collect::<Vec<_>>(), [0, 40_000_000, 80_000_000, 120_000_000], "{:?}", sink.shown);
@@ -679,8 +679,8 @@ fn meterplayer_rms_of_a_stereo_sine_through_the_players_sink() {
     }
 }
 
-// SWAPBACK (LEDGER SR329): an HEVC reel whose sample 1 turns 12-bit (an in-band HEVC_SPS_12BIT), sample 2 a bare IDR still
-// inside the 12-bit span, and sample 3 8-bit again (the in-band HEVC_SPS): the one `stria::decode_swap` takes the
+// SWAPBACK (LEDGER SR329): an HEVC reel whose sample 1 turns 13-bit (an in-band HEVC_SPS_12BIT), sample 2 a bare IDR still
+// inside the 13-bit span, and sample 3 8-bit again (the in-band HEVC_SPS): the one `stria::decode_swap` takes the
 // Player and the editor to the stand-in at sample 1 and back at sample 3's keyframe.
 fn swapback_reel() -> Vec<u8> {
     let mut t = hevc_kat_track(6);
@@ -717,8 +717,8 @@ impl FrameSink for RgbaSink {
     }
 }
 
-/// Rule: the Player swaps to the stand-in ONCE at the 12-bit sample and back ONCE at the later 8-bit keyframe (the bare
-/// IDR between is offered to the parked decoder and refused, since it keeps the in-band 12-bit SPS); two log lines, every
+/// Rule: the Player swaps to the stand-in ONCE at the 13-bit sample and back ONCE at the later 8-bit keyframe (the bare
+/// IDR between is offered to the parked decoder and refused, since it keeps the in-band 13-bit SPS); two log lines, every
 /// sample presents a frame, real pixels after the swap back, and `MediaInfo` names the real decoder again.
 #[test]
 fn swapback_player_returns_to_the_real_decoder_at_the_8bit_keyframe() {
@@ -738,7 +738,7 @@ fn swapback_player_returns_to_the_real_decoder_at_the_8bit_keyframe() {
     assert_eq!(
         lines,
         [
-            "[STRIA] :: video decode: swapped to stand-in: no decoder: hevc: unsupported (bit depth above 10 (HEVCREXT))",
+            "[STRIA] :: video decode: swapped to stand-in: no decoder: hevc: unsupported (bit depth above 12 (HEVCREXT-TOOLS))",
             "[STRIA] :: video decode: swapped back at 120000000",
         ],
     );
@@ -751,7 +751,7 @@ fn swapback_player_returns_to_the_real_decoder_at_the_8bit_keyframe() {
     println!("swapback: {} | {} | frames={}", lines[0], lines[1], sink.shown.len());
 }
 
-/// Rule: the editor's render over the same reel draws the stand-in for the 12-bit span and real frames after it (today's
+/// Rule: the editor's render over the same reel draws the stand-in for the 13-bit span and real frames after it (today's
 /// render failed whole on the refusal), and the reel's open report says ` decode=stand-in` only once a render drew it.
 #[test]
 fn swapback_editor_renders_the_stand_in_span_and_reports_it() {

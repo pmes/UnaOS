@@ -3,14 +3,14 @@
 //
 //! The deblocking filter (8.7.2) over a whole decoded picture: the vertical edges of the picture first, then the
 //! horizontal edges on their output (8.7.2.1). Edges are the transform and coding block edges on the 8x8 luma grid
-//! (16x16 for 4:2:0 chroma); an edge is skipped at the picture boundary, across a slice boundary whose slice (the one
+//! (chroma: every 8 chroma samples, 16x16 luma for 4:2:0; HEVCREXT SR334); an edge is skipped at the picture boundary, across a slice boundary whose slice (the one
 //! holding q0) disallows it, across a tile boundary when loop_filter_across_tiles_enabled_flag is 0, and in a slice with
 //! slice_deblocking_filter_disabled_flag. The boundary strength (8.7.2.4, HEVCINTER SR216): 2 when p0 or q0 is intra
 //! (every block of an I picture), 1 on a transform edge with non-zero luma coefficients on either side, 1 when the
 //! two prediction blocks use different reference pictures or numbers of motion vectors or motion vectors 4 quarter
 //! samples apart, else 0 (no filtering). Prediction block edges are edges too. Luma: the dE / dEp / dEq decisions
 //! (8.7.2.5.3) and the strong / normal filters (8.7.2.5.7) with tC from bS; chroma: only bS 2 edges, the filter of
-//! 8.7.2.5.5 with QpC from Table 8-10 and cQpPicOffset. pcm (with pcm_loop_filter_disabled_flag) and transquant
+//! 8.7.2.5.5 with QpC from Table 8-10 (ChromaArrayType 1, else Min(qPi, 51)) and cQpPicOffset. pcm (with pcm_loop_filter_disabled_flag) and transquant
 //! bypass samples are left as they are.
 
 use crate::picture::{Picture, PuMotion, F_BYPASS, F_CBF, F_EDGE_H, F_EDGE_V, F_PCM, F_PU_EDGE_H, F_PU_EDGE_V};
@@ -188,8 +188,9 @@ fn filter_chroma_line(d: &mut [u16], q0: usize, across: isize, tc: i32, no_p: bo
     }
 }
 
-fn chroma_tc(f: &EdgeFacts, offset: i32, bd: u32) -> i32 {
-    let qpc = qpc_420(((f.qp_q + f.qp_p + 1) >> 1) + offset);
+fn chroma_tc(f: &EdgeFacts, offset: i32, bd: u32, chroma_array_type: u32) -> i32 {
+    let qpi = ((f.qp_q + f.qp_p + 1) >> 1) + offset;
+    let qpc = if chroma_array_type == 1 { qpc_420(qpi) } else { qpi.min(51) };
     TC_TABLE[(qpc + 2 * (BS_INTRA - 1) + (f.tc_offset_div2 << 1)).clamp(0, 53) as usize] as i32 * (1 << (bd - 8))
 }
 
@@ -212,23 +213,26 @@ pub fn deblock_picture(pic: &mut Picture, geo: &Geometry, sps: &Sps, pps: &Pps) 
                 filter_luma(&mut pic.planes[0].data, q0, across, along, &f, bdy);
             }
         }
-        // Chroma: edges every 8 chroma samples (16 luma), one line at a time.
-        let (cw, ch) = (w / 2, h / 2);
+        // Chroma: edges every 8 chroma samples (16 luma at 4:2:0), one line at a time; HEVCREXT (SR334): the luma
+        // location of q0 is the chroma one scaled by (SubWidthC, SubHeightC), p0's is one luma sample before it.
+        let (sw, sh) = pic.chroma.sub();
+        let cat = sps.chroma_array_type();
+        let (cw, ch) = (w / sw, h / sh);
         let cstride = pic.planes[1].w;
         let (outer, inner) = if vertical { (cw, ch) } else { (ch, cw) };
         for e in (8..outer).step_by(8) {
             for s in 0..inner {
-                let (qc, pc) = if vertical { ((e, s), (e - 1, s)) } else { ((s, e), (s, e - 1)) };
-                let q = (qc.0 * 2, qc.1 * 2);
-                let p = (pc.0 * 2 + if vertical { 1 } else { 0 }, pc.1 * 2 + if vertical { 0 } else { 1 });
+                let qc = if vertical { (e, s) } else { (s, e) };
+                let q = (qc.0 * sw, qc.1 * sh);
+                let p = if vertical { (q.0 - 1, q.1) } else { (q.0, q.1 - 1) };
                 let Some(f) = edge_facts(pic, geo, pps, pcm_lf_off, p, q, flag) else { continue };
                 if f.bs != BS_INTRA {
                     continue;
                 }
                 let q0 = qc.1 * cstride + qc.0;
                 let across = if vertical { 1isize } else { cstride as isize };
-                let tc_cb = chroma_tc(&f, pps.cb_qp_offset, bdc);
-                let tc_cr = chroma_tc(&f, pps.cr_qp_offset, bdc);
+                let tc_cb = chroma_tc(&f, pps.cb_qp_offset, bdc, cat);
+                let tc_cr = chroma_tc(&f, pps.cr_qp_offset, bdc, cat);
                 filter_chroma_line(&mut pic.planes[1].data, q0, across, tc_cb, f.no_p, f.no_q, bdc);
                 filter_chroma_line(&mut pic.planes[2].data, q0, across, tc_cr, f.no_p, f.no_q, bdc);
             }

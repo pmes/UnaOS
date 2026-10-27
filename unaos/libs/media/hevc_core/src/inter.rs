@@ -410,8 +410,9 @@ pub fn luma_mc(r: &Plane, xp: i32, yp: i32, mv: [i32; 2], w: i32, h: i32, bd: u3
     }
 }
 
-/// 8.5.3.3.3.2: the w x h chroma prediction samples of the 4:2:0 chroma block at (xc, yc) (chroma samples) with the
-/// luma motion vector `mv`, read as eighth chroma samples (mvCLX = mvLX).
+/// 8.5.3.3.3.2: the w x h chroma prediction samples of the chroma block at (xc, yc) (chroma samples) with the chroma
+/// motion vector `mv` in eighth chroma samples (mvCLX: = mvLX at 4:2:0; HEVCREXT SR334: the caller scales mvLX by
+/// 2 / SubWidthC, 2 / SubHeightC, 8.5.3.2.10).
 pub fn chroma_mc(r: &Plane, xc: i32, yc: i32, mv: [i32; 2], w: i32, h: i32, bd: u32, out: &mut [i32]) {
     let (xf, yf) = ((mv[0] & 7) as usize, (mv[1] & 7) as usize);
     let (xi, yi) = (xc + (mv[0] >> 3), yc + (mv[1] >> 3));
@@ -468,8 +469,10 @@ pub fn predict_pu(pic: &mut Picture, ctx: &InterCtx, sh: &SliceHeader, pps: &Pps
         SliceType::B => pps.weighted_bipred_flag,
         SliceType::I => false,
     } && sh.pred_weights.is_some();
+    // HEVCREXT (SR334): (SubWidthC, SubHeightC) of the chroma planes.
+    let (sub_w, sub_h) = { let (a, b) = pic.chroma.sub(); (a as i32, b as i32) };
     for c in 0..3 {
-        let (cx, cy, cw, ch) = if c == 0 { (x, y, w, h) } else { (x / 2, y / 2, w / 2, h / 2) };
+        let (cx, cy, cw, ch) = if c == 0 { (x, y, w, h) } else { (x / sub_w, y / sub_h, w / sub_w, h / sub_h) };
         let bd = if c == 0 { bd_y } else { bd_c };
         let n = (cw * ch) as usize;
         let mut pred: [Option<Vec<i32>>; 2] = [None, None];
@@ -482,7 +485,8 @@ pub fn predict_pu(pic: &mut Picture, ctx: &InterCtx, sh: &SliceHeader, pps: &Pps
                 if c == 0 {
                     luma_mc(&r.planes[0], cx, cy, m.mv[l], cw, ch, bd, &mut v);
                 } else {
-                    chroma_mc(&r.planes[c], cx, cy, m.mv[l], cw, ch, bd, &mut v);
+                    let mvc = [m.mv[l][0] * 2 / sub_w, m.mv[l][1] * 2 / sub_h];
+                    chroma_mc(&r.planes[c], cx, cy, mvc, cw, ch, bd, &mut v);
                 }
                 pred[l] = Some(v);
             }

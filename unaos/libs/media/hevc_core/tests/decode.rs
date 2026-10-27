@@ -255,8 +255,8 @@ fn inter_slices_high_bit_depth_and_422_are_refused_by_name() {
     assert_eq!(err, Error::Invalid("reference picture set names a missing picture (8.3.2)"));
 
     for (cfg, want) in [
-        (SpsCfg { bit_depth: 12, ..Default::default() }, "bit depth above 10 (HEVCREXT)"),
-        (SpsCfg { chroma_format_idc: 2, ..Default::default() }, "chroma other than 4:2:0"),
+        (SpsCfg { bit_depth: 13, ..Default::default() }, "bit depth above 12 (HEVCREXT-TOOLS)"),
+        (SpsCfg { chroma_format_idc: 0, ..Default::default() }, "monochrome 4:0:0 (HEVCREXT-MONO)"),
     ] {
         let mut s = headers(&cfg, &PpsCfg { init_qp: 26, ..Default::default() });
         let hdr = idr_slice_header(false, false, false, false);

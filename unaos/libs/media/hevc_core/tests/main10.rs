@@ -3,8 +3,8 @@
 //! by construction against a hand-built 16-bit picture: (a) a 32x32 INTRA_DC picture with no residual is
 //! 1 << (BitDepth - 1) = 512 everywhere; (b) a 32x32 pcm coding unit with PcmBitDepthY 10 (samples above 255) and
 //! PcmBitDepthC 9 (decoded << 1, 8.4.4.1); (c) one DC level in a 16x16 luma TU at Qp'Y = 26 + QpBdOffsetY 12 = 38
-//! through 8.6.2 / 8.6.4.2 at bdShift 20 - 10; (d) an 8-bit Frame keeps bit_depth 8 and no planes16; (e) the refusals
-//! by name above 10 bits and for unequal luma / chroma depths (HEVCREXT). `planes` is always planes16 >> (BitDepth - 8).
+//! through 8.6.2 / 8.6.4.2 at bdShift 20 - 10; (d) an 8-bit Frame keeps bit_depth 8 and no planes16; (e) the refusal
+//! by name above 12 bits (HEVCREXT SR334 decodes 12-bit and unequal depths: rext.rs). `planes` is always planes16 >> (BitDepth - 8).
 
 mod common;
 
@@ -142,10 +142,10 @@ fn eight_bit_frames_carry_no_planes16() {
 }
 
 #[test]
-fn twelve_bit_and_unequal_depths_are_refused_by_name() {
+fn depths_above_twelve_are_refused_by_name() {
     for (cfg, want) in [
-        (cfg32(12), "bit depth above 10 (HEVCREXT)"),
-        (SpsCfg { chroma_bit_depth: Some(8), ..cfg32(10) }, "luma and chroma bit depths differ (HEVCREXT)"),
+        (cfg32(13), "bit depth above 12 (HEVCREXT-TOOLS)"),
+        (SpsCfg { chroma_bit_depth: Some(13), ..cfg32(10) }, "bit depth above 12 (HEVCREXT-TOOLS)"),
     ] {
         assert_eq!(Decoder::new().decode_annexb(&dc32(&cfg)).unwrap_err(), Error::Unsupported(want));
     }

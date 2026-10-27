@@ -283,3 +283,7 @@ pub const CHROMA_FILTER: [[i32; 4]; 8] = [
 
 /// 8.5.3.2.4 Table 8-7: (l0CandIdx, l1CandIdx) for combIdx 0..11 of the combined bi-predictive merging candidates.
 pub const COMB_IDX: [(usize, usize); 12] = [(0, 1), (1, 0), (0, 2), (2, 0), (1, 2), (2, 1), (0, 3), (3, 0), (1, 3), (3, 1), (2, 3), (3, 2)];
+
+/// HEVCREXT (SR334) 8.4.3 Table 8-3: the 4:2:2 IntraPredModeC from the mode X of Table 8-2 (ChromaArrayType 2).
+pub const CHROMA_422_MODE: [u8; 35] =
+    [0, 1, 2, 2, 2, 2, 3, 5, 7, 8, 10, 11, 13, 15, 16, 18, 19, 20, 21, 22, 23, 23, 24, 24, 25, 25, 26, 27, 27, 28, 28, 29, 29, 30, 31];

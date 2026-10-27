@@ -2,7 +2,7 @@
 //! HEVCCONF (LEDGER SR321): the JCT-VC conformance bitstreams of ITU-T H.265.1 must decode to the reference decoder's
 //! output — every output picture (cropped, output order; yuv420p, or yuv420p10le at Main 10) hashed into one md5 equal
 //! to the listed one — and every decoded picture hash SEI (D.3.19: CRC and checksum; MD5 refused by name) must match its
-//! picture. The hand KATs (decode.rs, inter.rs, main10.rs) exercise each process once; these exercise their
+//! picture. The hand KATs (decode.rs, inter.rs, main10.rs, rext.rs) exercise each process once; these exercise their
 //! interactions. The constrained-intra-in-inter vector must be refused by name (HEVCINTER-CIP). Offline => SKIP (the
 //! vectors are fetched by h264_core's fetcher, linked below, never committed; vectors.txt holds the rows and their
 //! provenance). The D.3.19 hash functions and the SEI parser have offline KATs at the foot.
@@ -77,6 +77,11 @@ fn md5(data: &[u8]) -> Option<String> {
 fn run(name: &str) -> Option<String> {
     let v = fetch(name)?;
     let (frames, checks) = decode_all(&v.stream).unwrap_or_else(|e| panic!("{name}: {e}"));
+    check_vector(name, &v, frames, checks)
+}
+
+/// HEVCREXT (SR334): `run`'s check of one decoded vector — the hash SEI verdicts, then the md5 of the output YUV.
+fn check_vector(name: &str, v: &Vector, frames: Vec<Frame>, checks: Vec<(i32, HashCheck)>) -> Option<String> {
     assert!(!frames.is_empty(), "{name}: no frames decoded");
     let bad: Vec<_> = checks.iter().filter(|(_, c)| matches!(c, HashCheck::Mismatch(_))).collect();
     assert!(bad.is_empty(), "{name}: decoded picture hash SEI mismatch at (POC, cIdx) {bad:?}");
@@ -135,6 +140,27 @@ vectors!(
     initqp_b_main10_sony_1 = "INITQP_B_Main10_Sony_1",
 );
 
+/// HEVCREXT (SR334): every `hevc/rext/` row of vectors.txt (the JCT-VC RExt suite) decodes to its md5, or is refused by
+/// a name carrying HEVCREXT (the RExt tools, monochrome, depths above 12 stay owed); offline each row SKIPs.
+#[test]
+fn rext_vectors_decode_or_are_refused_by_name() {
+    let names = LIST.lines().filter_map(|l| l.split_whitespace().nth(1)?.strip_prefix("hevc/rext/")?.strip_suffix(".zip"));
+    for name in names {
+        let Some(v) = fetch(&format!("rext/{name}")) else {
+            eprintln!("SKIP hevc/rext/{name}");
+            continue;
+        };
+        match decode_all(&v.stream) {
+            Err(Error::Unsupported(msg)) if msg.contains("HEVCREXT") => eprintln!("{name}: refused by name ({msg})"),
+            Err(e) => panic!("{name}: {e}"),
+            Ok((frames, checks)) => match check_vector(name, &v, frames, checks) {
+                Some(s) => eprintln!("{name}: {s}"),
+                None => eprintln!("SKIP {name}"),
+            },
+        }
+    }
+}
+
 #[test]
 fn constrained_intra_in_inter_slices_is_refused_by_name() {
     let name = "CIP_A_Panasonic_3";
@@ -192,7 +218,7 @@ fn sei_parse_kat() {
     md5.push(0x80);
     let want: [[u8; 16]; 3] = core::array::from_fn(|c| core::array::from_fn(|i| (c * 16 + i) as u8));
     assert_eq!(sei::picture_hash(&md5), Ok(Some(PictureHash::Md5(want))));
-    assert_eq!(sei::check(&[plane(1, 1, &[0]), plane(1, 1, &[0]), plane(1, 1, &[0])], 8, &PictureHash::Md5(want)), HashCheck::Md5Unchecked);
+    assert_eq!(sei::check(&[plane(1, 1, &[0]), plane(1, 1, &[0]), plane(1, 1, &[0])], 8, 8, &PictureHash::Md5(want)), HashCheck::Md5Unchecked);
     assert_eq!(sei::picture_hash(&[5, 1, 0, 0x80]), Ok(None));
     assert_eq!(sei::picture_hash(&[132, 7, 1, 0x12]), Err(Error::Truncated));
 }

@@ -172,6 +172,7 @@ fn heic_tile(
     item: &demux_core::heif::Item,
     fallback: Option<demux_core::heif::Nclx>,
 ) -> Result<(u32, u32, Vec<u8>), Error> {
+    let mut d = hevc_core::Decoder::new(); d.set_chroma_420_only(true); // HEVCREXT (SR334): to_rgba is 4:2:0 only until COLOURONE-422
     use super::video::{Frame as VideoFrame, Pixels};
     let rec = item.hvcc.as_deref().ok_or(Error::Malformed("heic: hvc1 item has no hvcC"))?;
     let cfg = hevc_core::nal::parse_hvcc(rec).map_err(heic_hevc_err)?;
@@ -185,7 +186,6 @@ fn heic_tile(
     if nclx.is_some_and(|n| !matches!(n.matrix_coefficients, 2 | 5 | 6)) {
         return Err(Error::Unsupported("heic: colr matrix is not BT.601 (to_rgba is BT.601 only; HEVCHEIC-COLR)"));
     }
-    let mut d = hevc_core::Decoder::new();
     d.configure_hvcc(rec).map_err(heic_hevc_err)?;
     d.decode_sample(&h.data(bytes, item).map_err(heic_demux_err)?).map_err(heic_hevc_err)?;
     d.flush();

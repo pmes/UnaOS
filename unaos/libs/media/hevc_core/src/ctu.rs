@@ -17,7 +17,7 @@ use alloc::vec::Vec;
 
 use crate::cabac::{init_type, Contexts, Engine};
 use crate::inter::{amvp, merge_motion, predict_pu, wrap_mv, InterCtx, Part, Pb, PRED_BI, PRED_L0, PRED_L1};
-use crate::intra::{chroma_mode, luma_mode, predict, DC};
+use crate::intra::{chroma_mode, chroma_mode_422, luma_mode, predict, DC};
 use crate::picture::{Picture, PuMotion, SaoParams, F_BYPASS, F_CBF, F_EDGE_H, F_EDGE_V, F_PCM, F_PU_EDGE_H, F_PU_EDGE_V, F_SKIP};
 use crate::ps::{Geometry, Pps, ScalingList, Sps, SCAN_ORDER};
 use crate::slice::{SliceHeader, SliceType};
@@ -62,6 +62,9 @@ pub struct SliceDecoder<'a> {
     /// The coding unit under decoding is intra (CuPredMode) / its transform tree splits by interSplitFlag.
     cu_intra: bool,
     inter_split: bool,
+    /// HEVCREXT (SR334): ChromaArrayType 3 with an NxN intra coding unit carries one IntraPredModeC per partition:
+    /// (the four modes, the CU's x, y and half size); None otherwise.
+    nxn_cmodes: Option<([u32; 4], usize, usize, usize)>,
 }
 
 impl<'a> SliceDecoder<'a> {
@@ -104,6 +107,7 @@ impl<'a> SliceDecoder<'a> {
             inter,
             cu_intra: true,
             inter_split: false,
+            nxn_cmodes: None,
         }
     }
 
@@ -242,13 +246,14 @@ impl<'a> SliceDecoder<'a> {
             self.pic.sao[rs] = self.pic.sao[rs - w];
             return;
         }
-        let bd = self.sps.bit_depth_luma.min(10);
-        let cmax = (1u32 << (bd - 5)) - 1;
         let mut p = SaoParams::default();
         for c in 0..3 {
             if !((self.sh.sao_luma_flag && c == 0) || (self.sh.sao_chroma_flag && c > 0)) {
                 continue;
             }
+            // cMax of sao_offset_abs: (1 << (Min(bitDepth, 10) - 5)) - 1 with the component's bit depth (HEVCREXT SR334).
+            let bd = if c == 0 { self.sps.bit_depth_luma } else { self.sps.bit_depth_chroma }.min(10);
+            let cmax = (1u32 << (bd - 5)) - 1;
             let ty = if c == 2 {
                 p.type_idx[1]
             } else if self.eng.decision(SAO_TYPE) == 0 {
@@ -408,10 +413,22 @@ impl<'a> SliceDecoder<'a> {
                 let m = luma_mode(a, b, prev[i], mpm[i], rem[i]);
                 self.pic.fill4(xp as usize, yp as usize, pb, pb, |p, j| p.intra_mode[j] = m as u8);
             }
-            let icpm = if self.eng.decision(INTRA_CHROMA) == 0 { 4 } else { self.eng.bypass_bits(2) };
-            let cmode = chroma_mode(icpm, self.pic.intra_mode[self.pic.idx4(xu, yu)] as u32);
+            // intra_chroma_pred_mode (7.3.8.5): one per partition at ChromaArrayType 3 with NxN, else one; Table 8-2,
+            // then Table 8-3 at ChromaArrayType 2 (HEVCREXT SR334).
+            let cat = self.sps.chroma_array_type();
+            let ncm = if cat == 3 && nxn { 4 } else { 1 };
+            let mut cmodes = [DC; 4];
+            for (i, m) in cmodes.iter_mut().enumerate().take(ncm) {
+                let icpm = if self.eng.decision(INTRA_CHROMA) == 0 { 4 } else { self.eng.bypass_bits(2) };
+                let (xp, yp) = (xu + (i & 1) * pb, yu + (i >> 1) * pb);
+                let x = chroma_mode(icpm, self.pic.intra_mode[self.pic.idx4(xp, yp)] as u32);
+                *m = if cat == 2 { chroma_mode_422(x) } else { x };
+            }
+            self.nxn_cmodes = if ncm == 4 { Some((cmodes, xu, yu, pb)) } else { None };
+            let cmode = cmodes[0];
             let max_depth = self.sps.max_transform_hierarchy_depth_intra + nxn as u32;
-            self.transform_tree(xu, yu, xu, yu, log2, 0, 0, true, true, nxn, max_depth, cmode)?;
+            self.transform_tree(xu, yu, xu, yu, log2, 0, 0, 1, 1, nxn, max_depth, cmode)?;
+            self.nxn_cmodes = None;
         }
         self.finish_cu(xu, yu, size)
     }
@@ -450,11 +467,13 @@ impl<'a> SliceDecoder<'a> {
                 self.pic.planes[0].set(x0 + x, y0 + y, v as u16);
             }
         }
+        // HEVCREXT (SR334): (CbSize / SubWidthC) x (CbSize / SubHeightC) samples per chroma component.
+        let (sw, sh) = self.pic.chroma.sub();
         for c in 1..3 {
-            for y in 0..n / 2 {
-                for x in 0..n / 2 {
+            for y in 0..n / sh {
+                for x in 0..n / sw {
                     let v = read(pcm.bit_depth_chroma)? << (bdc - pcm.bit_depth_chroma);
-                    self.pic.planes[c].set(x0 / 2 + x, y0 / 2 + y, v as u16);
+                    self.pic.planes[c].set(x0 / sw + x, y0 / sh + y, v as u16);
                 }
             }
         }
@@ -462,7 +481,9 @@ impl<'a> SliceDecoder<'a> {
         Ok(())
     }
 
-    /// transform_tree() (7.3.8.8). `parent_cb` / `parent_cr` are cbf_cb / cbf_cr of the parent node (true at the root).
+    /// transform_tree() (7.3.8.8). `parent_cb` / `parent_cr` are cbf_cb / cbf_cr of the parent node (nonzero at the root).
+    /// HEVCREXT (SR334): cbf_cb / cbf_cr are 2-bit masks — bit 0 the (top) chroma block, bit 1 the second block of
+    /// ChromaArrayType 2.
     fn transform_tree(
         &mut self,
         x0: usize,
@@ -472,8 +493,8 @@ impl<'a> SliceDecoder<'a> {
         log2: u32,
         depth: u32,
         blk: u32,
-        parent_cb: bool,
-        parent_cr: bool,
+        parent_cb: u8,
+        parent_cr: u8,
         intra_split: bool,
         max_depth: u32,
         cmode: u32,
@@ -484,13 +505,21 @@ impl<'a> SliceDecoder<'a> {
         } else {
             log2 > sps.log2_max_tb || (intra_split && depth == 0) || (self.inter_split && depth == 0)
         };
-        let (mut cb, mut cr) = (false, false);
-        if log2 > 2 {
-            if depth == 0 || parent_cb {
-                cb = self.eng.decision(CBF_CHROMA + depth as usize) == 1;
+        let (mut cb, mut cr) = (0u8, 0u8);
+        let cat = sps.chroma_array_type();
+        if log2 > 2 || cat == 3 {
+            let two = cat == 2 && (!split || log2 == 3);
+            if depth == 0 || parent_cb != 0 {
+                cb = self.eng.decision(CBF_CHROMA + depth as usize) as u8;
+                if two {
+                    cb |= (self.eng.decision(CBF_CHROMA + depth as usize) as u8) << 1;
+                }
             }
-            if depth == 0 || parent_cr {
-                cr = self.eng.decision(CBF_CHROMA + depth as usize) == 1;
+            if depth == 0 || parent_cr != 0 {
+                cr = self.eng.decision(CBF_CHROMA + depth as usize) as u8;
+                if two {
+                    cr |= (self.eng.decision(CBF_CHROMA + depth as usize) as u8) << 1;
+                }
             }
         }
         if split {
@@ -502,7 +531,7 @@ impl<'a> SliceDecoder<'a> {
             Ok(())
         } else {
             // cbf_luma is inferred 1 in an inter coding unit's root transform unit without chroma cbfs (7.3.8.8).
-            let cbf_luma = if self.cu_intra || depth != 0 || cb || cr { self.eng.decision(CBF_LUMA + if depth == 0 { 1 } else { 0 }) == 1 } else { true };
+            let cbf_luma = if self.cu_intra || depth != 0 || cb != 0 || cr != 0 { self.eng.decision(CBF_LUMA + if depth == 0 { 1 } else { 0 }) == 1 } else { true };
             self.transform_unit(x0, y0, xb, yb, log2, blk, cbf_luma, cb, cr, parent_cb, parent_cr, cmode)
         }
     }
@@ -517,15 +546,16 @@ impl<'a> SliceDecoder<'a> {
         log2: u32,
         blk: u32,
         cbf_luma: bool,
-        cb: bool,
-        cr: bool,
-        parent_cb: bool,
-        parent_cr: bool,
+        cb: u8,
+        cr: u8,
+        parent_cb: u8,
+        parent_cr: u8,
         cmode: u32,
     ) -> Result<()> {
-        let chroma_here = log2 > 2;
+        let cat = self.sps.chroma_array_type();
+        let chroma_here = log2 > 2 || cat == 3;
         let (ccb, ccr) = if chroma_here { (cb, cr) } else { (parent_cb, parent_cr) };
-        if (cbf_luma || ccb || ccr) && self.pps.cu_qp_delta_enabled_flag && !self.is_cu_qp_delta_coded {
+        if (cbf_luma || ccb != 0 || ccr != 0) && self.pps.cu_qp_delta_enabled_flag && !self.is_cu_qp_delta_coded {
             let mut v: i32 = 0;
             if self.eng.decision(CU_QP_DELTA_ABS) == 1 {
                 v = 1;
@@ -558,23 +588,36 @@ impl<'a> SliceDecoder<'a> {
             self.pic.fill4(x0, y0, n, n, |p, i| p.flags[i] |= F_CBF);
             self.residual(x0, y0, log2, 0, lmode)?;
         }
-        let bdc = self.sps.bit_depth_chroma;
+        // HEVCREXT (SR334): the chroma block(s) at log2TrafoSizeC (ChromaArrayType 3: log2TrafoSize; else log2TrafoSize
+        // - 1, or 2 at blkIdx 3 of a 4x4 split), at (x / SubWidthC, y / SubHeightC).
+        let (sw, sh) = self.pic.chroma.sub();
+        let cmode = match self.nxn_cmodes {
+            Some((m, xc, yc, half)) => m[(((y0 >= yc + half) as usize) << 1) | (x0 >= xc + half) as usize],
+            None => cmode,
+        };
         if chroma_here {
-            for (c, cbf) in [(1usize, cb), (2, cr)] {
-                if self.cu_intra {
-                    predict(self.pic, self.geo, c, x0 / 2, y0 / 2, log2 - 1, cmode, false, bdc);
-                }
-                if cbf {
-                    self.residual(x0 / 2, y0 / 2, log2 - 1, c, cmode)?;
-                }
-            }
+            let log2c = if cat == 3 { log2 } else { log2 - 1 };
+            self.chroma_blocks(x0 / sw, y0 / sh, log2c, cb, cr, cmode)?;
         } else if blk == 3 {
-            for (c, cbf) in [(1usize, parent_cb), (2, parent_cr)] {
+            self.chroma_blocks(xb / sw, yb / sh, 2, parent_cb, parent_cr, cmode)?;
+        }
+        Ok(())
+    }
+
+    /// HEVCREXT (SR334): the chroma blocks of a transform unit in parse order (7.3.8.10) — per component one block, or
+    /// two stacked at (xc, yc) and (xc, yc + (1 << log2c)) for ChromaArrayType 2 — each predicted (intra) then
+    /// reconstructed; bit t of `cb` / `cr` is the cbf of block t.
+    fn chroma_blocks(&mut self, xc: usize, yc: usize, log2c: u32, cb: u8, cr: u8, cmode: u32) -> Result<()> {
+        let bdc = self.sps.bit_depth_chroma;
+        let nblk = if self.sps.chroma_array_type() == 2 { 2 } else { 1 };
+        for (c, cbf) in [(1usize, cb), (2, cr)] {
+            for t in 0..nblk {
+                let y = yc + (t << log2c);
                 if self.cu_intra {
-                    predict(self.pic, self.geo, c, xb / 2, yb / 2, 2, cmode, false, bdc);
+                    predict(self.pic, self.geo, c, xc, y, log2c, cmode, false, bdc);
                 }
-                if cbf {
-                    self.residual(xb / 2, yb / 2, 2, c, cmode)?;
+                if cbf & (1 << t) != 0 {
+                    self.residual(xc, y, log2c, c, cmode)?;
                 }
             }
         }
@@ -594,7 +637,8 @@ impl<'a> SliceDecoder<'a> {
                 let off = 6 * (bd as i32 - 8);
                 let (po, so) = if c == 1 { (self.pps.cb_qp_offset, self.sh.cb_qp_offset) } else { (self.pps.cr_qp_offset, self.sh.cr_qp_offset) };
                 let qpi = (self.qp_y + po + so).clamp(-off, 57);
-                qpc_420(qpi) + off
+                // 8.6.1: Table 8-10 at ChromaArrayType 1, else Min(qPi, 51) (HEVCREXT SR334).
+                (if self.sps.chroma_array_type() == 1 { qpc_420(qpi) } else { qpi.min(51) }) + off
             };
             let n = 1usize << log2;
             let factor = match self.scaling {
@@ -634,8 +678,8 @@ impl<'a> SliceDecoder<'a> {
             let nb = (py >> 1) - 1;
             ly = ((1usize << nb) * (2 + (py as usize & 1))) + self.eng.bypass_bits(nb) as usize;
         }
-        // scanIdx (8.4.4.1 / 7.4.9.11).
-        let scan_idx = if log2 == 2 || (log2 == 3 && c == 0) {
+        // scanIdx (8.4.4.1 / 7.4.9.11; HEVCREXT SR334: log2TrafoSize 3 of every component at ChromaArrayType 3).
+        let scan_idx = if log2 == 2 || (log2 == 3 && (c == 0 || self.sps.chroma_array_type() == 3)) {
             if (6..=14).contains(&pred_mode) {
                 2
             } else if (22..=30).contains(&pred_mode) {
@@ -813,7 +857,7 @@ impl<'a> SliceDecoder<'a> {
             if root {
                 let max_depth = self.sps.max_transform_hierarchy_depth_inter;
                 self.inter_split = max_depth == 0 && part != Part::P2Nx2N;
-                self.transform_tree(xu, yu, xu, yu, log2, 0, 0, true, true, false, max_depth, DC)?;
+                self.transform_tree(xu, yu, xu, yu, log2, 0, 0, 1, 1, false, max_depth, DC)?;
                 self.inter_split = false;
             }
         }

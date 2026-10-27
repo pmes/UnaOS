@@ -230,11 +230,17 @@ impl CabacEnc {
     }
     /// A 2Nx2N intra CU above the minimum size coded as INTRA_DC through mpm_idx `mpm`, no residual.
     pub fn dc_cu(&mut self, mpm: u32) {
+        self.dc_cu_fmt(mpm, 1);
+    }
+    /// HEVCREXT (SR334): [`CabacEnc::dc_cu`] at any chroma_format_idc 1..3 for an unsplit root transform unit: at 4:2:2
+    /// the two cbf_cb then the two cbf_cr (7.3.8.8), else one each.
+    pub fn dc_cu_fmt(&mut self, mpm: u32, chroma_format_idc: u32) {
         self.prev_intra(true);
         self.mpm_idx(mpm);
         self.chroma_dm();
-        self.cbf_chroma(0, false);
-        self.cbf_chroma(0, false);
+        for _ in 0..if chroma_format_idc == 2 { 4 } else { 2 } {
+            self.cbf_chroma(0, false);
+        }
         self.cbf_luma(0, false);
     }
     // HEVCINTER (SR216) syntax elements.
@@ -305,7 +311,17 @@ impl CabacEnc {
     }
     /// HEVCMAIN10 (SR311): [`CabacEnc::pcm_cu`] with PcmBitDepthY / PcmBitDepthC of `luma_bits` / `chroma_bits`.
     pub fn pcm_cu_bits(&mut self, split_inc: usize, log2: u32, luma_bits: u32, chroma_bits: u32, y: &[u16], cb: &[u16], cr: &[u16]) {
+        self.pcm_cu_fmt(split_inc, log2, luma_bits, chroma_bits, y, cb, cr, (2, 2));
+    }
+    /// HEVCREXT (SR334): [`CabacEnc::pcm_cu_bits`] with (SubWidthC, SubHeightC) `sub`: each chroma component carries
+    /// (n / SubWidthC) x (n / SubHeightC) samples (7.3.8.7).
+    pub fn pcm_cu_fmt(&mut self, split_inc: usize, log2: u32, luma_bits: u32, chroma_bits: u32, y: &[u16], cb: &[u16], cr: &[u16], sub: (usize, usize)) {
         self.split_cu(split_inc, false);
+        self.pcm_samples_fmt(log2, luma_bits, chroma_bits, y, cb, cr, sub);
+    }
+    /// HEVCREXT (SR334): pcm_flag 1 and the samples of a 2^log2 coding unit whose split flag (or, at the minimum size,
+    /// part_mode) the caller wrote; the engine restarted after them.
+    pub fn pcm_samples_fmt(&mut self, log2: u32, luma_bits: u32, chroma_bits: u32, y: &[u16], cb: &[u16], cr: &[u16], sub: (usize, usize)) {
         self.terminate(1);
         self.zero_align();
         let n = 1usize << log2;
@@ -313,7 +329,7 @@ impl CabacEnc {
             self.bw.u(v as u64, luma_bits);
         }
         for p in [cb, cr] {
-            for &v in &p[..n * n / 4] {
+            for &v in &p[..(n / sub.0) * (n / sub.1)] {
                 self.bw.u(v as u64, chroma_bits);
             }
         }
@@ -438,6 +454,10 @@ pub struct SpsCfg {
     pub conf_win: Option<[u32; 4]>,
     /// HEVCMAIN10 (SR311): bit_depth_chroma when it differs from `bit_depth` (None: the same).
     pub chroma_bit_depth: Option<u32>,
+    /// HEVCREXT (SR334): separate_colour_plane_flag (written at chroma_format_idc 3).
+    pub separate_colour_plane: bool,
+    /// HEVCREXT (SR334): the nine sps_range_extension() flags in syntax order (None: no SPS extension).
+    pub range_ext: Option<[bool; 9]>,
 }
 
 impl Default for SpsCfg {
@@ -457,6 +477,8 @@ impl Default for SpsCfg {
             strong: false,
             conf_win: None,
             chroma_bit_depth: None,
+            separate_colour_plane: false,
+            range_ext: None,
         }
     }
 }
@@ -484,7 +506,7 @@ pub fn sps_rbsp_ext(c: &SpsCfg, x: &InterSps) -> Vec<u8> {
     b.ue(0);
     b.ue(c.chroma_format_idc);
     if c.chroma_format_idc == 3 {
-        b.bit(0);
+        b.flag(c.separate_colour_plane);
     }
     b.ue(c.width);
     b.ue(c.height);
@@ -529,7 +551,18 @@ pub fn sps_rbsp_ext(c: &SpsCfg, x: &InterSps) -> Vec<u8> {
     b.flag(x.temporal_mvp); // sps_temporal_mvp_enabled_flag
     b.flag(c.strong);
     b.bit(0); // vui
-    b.bit(0); // extension
+    match c.range_ext {
+        Some(f) => {
+            b.bit(1); // sps_extension_present_flag
+            b.bit(1); // sps_range_extension_flag
+            b.u(0, 3); // multilayer, 3d, scc
+            b.u(0, 4); // sps_extension_4bits
+            for v in f {
+                b.flag(v);
+            }
+        }
+        None => b.bit(0), // extension
+    }
     b.trailing();
     b.out
 }

@@ -39,7 +39,7 @@ pub use hevc_core::ps::hvcc_reorder_depth;
 
 impl HevcDecoder {
     pub fn new(track: &Track) -> Result<HevcDecoder, DecodeError> {
-        let mut dec = hevc_core::Decoder::new();
+        let mut dec = hevc_core::Decoder::new(); dec.set_chroma_420_only(true); // HEVCREXT (SR334): to_rgba is 4:2:0 only until COLOURONE-422
         let length_prefixed = !track.config.is_empty();
         if length_prefixed {
             dec.configure_hvcc(&track.config).map_err(map_err)?;
