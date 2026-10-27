@@ -68,6 +68,8 @@ pub mod nle_export;
 pub mod nle_face;
 /// AETHERMEDIA2 (SR134): the Media Source Extensions feed.
 pub mod media_source;
+/// SWAPBACK (SR329): the one codec-blind mid-stream video decoder swap (to the stand-in and back) the Player and the editor share.
+pub mod decode_swap;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
