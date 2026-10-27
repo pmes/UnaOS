@@ -19,10 +19,14 @@
 //! * selection: [`select`] — a span-based selection parallel to the DOM one (selection.rs holds DOM boundary points),
 //!   over PDF3's `Page::text` spans; copy joins them through PDF3's `spans_to_string`;
 //! * find: `chrome::find::find_all` per span, the engine's own `FindState`; hits painted as span sub-boxes;
-//! * the status line: `AetherEngine::pdf_status` ("Page p / n").
+//! * the status line: `AetherEngine::pdf_status` ("Page p / n");
+//! * links and form widgets: [`forms`] (PDF4ANNOTS SR343) — /URI, /GoTo and /Named links (hover: the pointer and the
+//!   status line), check boxes and text fields filled through pdf_core's `Form::set_value` + `Edit::save_update`.
 //!
-//! A password-protected file opens a visible page saying so (PDF4-PASSWORD owed: no prompt wire exists).
+//! A password-protected file opens a visible page saying so (PDF4-PASSWORD owed: no prompt wire exists — `window.prompt`
+//! is a headless stub and the bus has no dialog message).
 
+pub mod forms;
 pub mod select;
 #[cfg(test)]
 mod tests;
@@ -34,7 +38,7 @@ use std::sync::OnceLock;
 
 use pdf_core::font::{Fallback, GlyphSink, TextSpan};
 use pdf_core::render::Pixmap;
-use pdf_core::{Document, Page};
+use pdf_core::{Annot, Document, Form, Page, Ref};
 
 use self::select::{PdfSelection, Pos, Range};
 
@@ -105,6 +109,21 @@ pub struct PdfDocument {
     /// Find hits, and the active one.
     pub hits: Vec<Range>,
     pub cur: Option<usize>,
+    /// PDF4ANNOTS (SR343): the file as open: the fetched bytes, then those plus the form's incremental update(s) — the
+    /// filled form a save writes (PDF4-FORMSAVE owed: no verb carries it to the downloads folder).
+    pub bytes: Vec<u8>,
+    /// Each page's object reference (what a destination names).
+    page_refs: Vec<Option<Ref>>,
+    /// Each page's annotations, read on first use.
+    annots: RefCell<Vec<Option<Rc<Vec<Annot>>>>>,
+    /// The AcroForm.
+    pub form: Option<Form>,
+    /// The link or widget the button went down on, the one under the pointer, and the focused text field.
+    pub pressed: Option<forms::Target>,
+    pub hover: Option<forms::Target>,
+    pub focus: Option<forms::FieldFocus>,
+    /// The last fill pdf_core refused, by name (the page shows the file as it was).
+    pub form_refused: Option<String>,
 }
 
 impl PdfDocument {
@@ -130,6 +149,8 @@ impl PdfDocument {
         }
         let title = doc.info().title.map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
         let n = pages.len();
+        let page_refs = pages.iter().map(|p| p.obj).collect();
+        let form = doc.form();
         Ok(PdfDocument {
             doc,
             pages,
@@ -141,6 +162,14 @@ impl PdfDocument {
             sel: PdfSelection::default(),
             hits: Vec::new(),
             cur: None,
+            bytes: bytes.to_vec(),
+            page_refs,
+            annots: RefCell::new(vec![None; n]),
+            form,
+            pressed: None,
+            hover: None,
+            focus: None,
+            form_refused: None,
         })
     }
 
@@ -274,7 +303,7 @@ impl PdfDocument {
 
     /// Page `i`'s highlight boxes (72-dpi page space) and their colours.
     fn marks(&self, i: usize) -> Vec<([f64; 4], (u8, u8, u8))> {
-        let mut out = Vec::new();
+        let mut out: Vec<([f64; 4], (u8, u8, u8))> = self.focus_box(i).map(|r| (r, SELECT_MARK)).into_iter().collect();
         let sel = self.sel.ordered().filter(|(a, b)| a.page <= i && i <= b.page && a != b);
         if sel.is_none() && !self.hits.iter().any(|h| h.page == i) {
             return out;
@@ -407,6 +436,18 @@ impl crate::AetherEngine {
     pub(crate) fn pdf_press(&mut self, x: f64, y: f64, clicks: u8, shift: bool) {
         let (vw, sy) = (self.width as f64, self.scroll_y);
         let Some(pdf) = self.pdf.as_mut() else { return };
+        // PDF4ANNOTS (SR343): a press on a link or form widget starts no selection (its release activates it); a press
+        // anywhere else blurs the focused text field.
+        let target = pdf.target_at(x, y, vw, sy);
+        pdf.pressed = target;
+        if target.is_some() {
+            pdf.sel.drag = None;
+            if pdf.focus.as_ref().map(|f| f.target) != target && pdf.blur() {
+                self.pdf_dirty();
+            }
+            return;
+        }
+        pdf.blur();
         match pdf.hit_at(x, y, vw, sy) {
             None => pdf.sel = PdfSelection::default(),
             Some(p) => match pdf.sel.anchor.filter(|_| shift) {

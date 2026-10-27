@@ -134,20 +134,15 @@ impl Page {
         if pw > svg_core::MAX_DIM as f64 || ph > svg_core::MAX_DIM as f64 {
             return Err(Error::TooLarge);
         }
-        let flip = Transform::new(s, 0.0, 0.0, -s, -x0 * s, y1 * s);
-        let (rot, w, h) = match self.rotate {
-            90 => (Transform::new(0.0, 1.0, -1.0, 0.0, h0, 0.0), ph, pw),
-            180 => (Transform::new(-1.0, 0.0, 0.0, -1.0, w0, h0), pw, ph),
-            270 => (Transform::new(0.0, -1.0, 1.0, 0.0, 0.0, w0), ph, pw),
-            _ => (Transform::IDENTITY, pw, ph),
-        };
+        let (w, h) = if self.rotate == 90 || self.rotate == 270 { (ph, pw) } else { (pw, ph) };
+        let base = self.device(dpi);
         let (w, h) = (w as usize, h as usize);
         let mut canvas = Pixmap::new(w, h);
         canvas.data.fill(255);
         let mut it = Interp {
             doc,
             canvas,
-            gs: GState::new(rot.then_pre(&flip)),
+            gs: GState::new(base),
             stack: Vec::new(),
             path: Path::new(),
             cur: (0.0, 0.0),
@@ -160,8 +155,25 @@ impl Page {
             sink,
             depth: 0,
         };
-        it.run(&ops(&self.contents)); it.annots(self, rot.then_pre(&flip));
+        it.run(&ops(&self.contents)); it.annots(self, base);
         Ok(Rendered { pixmap: it.canvas, refused: it.refused })
+    }
+
+    /// PDF4ANNOTS (SR343): the page's initial CTM at `dpi` — default user space onto the rendered pixmap (the CropBox's
+    /// top-left corner at the origin, y down, /Rotate applied clockwise): the ONE base `render` paints through and a
+    /// viewer hit-tests /Rect and destination coordinates through (`Page::text` spans are in `device(72.0)`'s space).
+    pub fn device(&self, dpi: f64) -> Transform {
+        let s = dpi / 72.0;
+        let [x0, y0, x1, y1] = self.crop_box;
+        let (w0, h0) = ((x1 - x0) * s, (y1 - y0) * s);
+        let flip = Transform::new(s, 0.0, 0.0, -s, -x0 * s, y1 * s);
+        let rot = match self.rotate {
+            90 => Transform::new(0.0, 1.0, -1.0, 0.0, h0, 0.0),
+            180 => Transform::new(-1.0, 0.0, 0.0, -1.0, w0, h0),
+            270 => Transform::new(0.0, -1.0, 1.0, 0.0, 0.0, w0),
+            _ => Transform::IDENTITY,
+        };
+        rot.then_pre(&flip)
     }
 }
 
