@@ -895,7 +895,7 @@ impl AetherEngine {
                 self.surface = vec![255; (w * h * 4) as usize];
                 // Real reflow: media queries and wrap widths depend on the
                 // viewport, so relayout — not just repaint.
-                self.relayout();
+                self.relayout(); self.pdf_refit(); // PDF4-FIT (SR389): re-fit after the arm (a zoom inside it re-enters Resize)
             }
             api::events::Event::Text(text) => {
                 // Typed characters land at the caret of the focused text control (input or textarea

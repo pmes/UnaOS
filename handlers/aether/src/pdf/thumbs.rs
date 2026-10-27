@@ -438,7 +438,7 @@ pub fn refused(a: &LinkAction) -> Option<&'static str> {
     }
 }
 
-/// An outline row's title ink: [`MUTED`] for a refused action, else its /C (black, the spec's default and invisible on
+/// An outline row's title ink: [`MUTED`] for a refused action, else its /C lifted to the strip's floor ([`ink_floor`], SR389; black, the spec's default and invisible on
 /// the strip, keeps [`LABEL_INK`]), else [`LABEL_INK`].
 pub fn row_ink(it: &pdf_core::OutlineItem) -> (u8, u8, u8) {
     if it.action.as_ref().and_then(refused).is_some() {
@@ -447,7 +447,7 @@ pub fn row_ink(it: &pdf_core::OutlineItem) -> (u8, u8, u8) {
     match it.color {
         Some(c) if c != [0.0; 3] => {
             let b = |v: f64| (v * 255.0).round() as u8;
-            (b(c[0]), b(c[1]), b(c[2]))
+            ink_floor((b(c[0]), b(c[1]), b(c[2])))
         }
         _ => LABEL_INK,
     }
@@ -473,4 +473,200 @@ pub fn ellipsize<'a>(adv: &crate::fonts::shape::Advancer, text: &'a str, avail: 
         cut -= 1;
     }
     Cow::Owned(format!("{}\u{2026}", text[..cut].trim_end()))
+}
+
+// =================================================================================================
+// PDF4-STRIPKEYS / PDF4-OUTLINE-CONTRAST (SR389): the keys inside the strip, its focus ring, and the dark strip's ink
+// floor. The strip's keyboard focus is `PdfDocument::strip_focus` beside the form field's (`PdfDocument::focus`): Tab
+// into the strip blurs the field (`PdfDocument::blur`), a press outside the strip clears it (`pdf_press`), so one of
+// them at most holds the keys. Enter follows through `pdf_follow` (the one follower the clicks use).
+// =================================================================================================
+
+/// The entries the strip's keys step over: each page (thumbnails) or each shown outline item (`rows`).
+fn entries(pdf: &PdfDocument) -> Vec<usize> {
+    match pdf.side {
+        Side::Thumbs => (0..pdf.page_count()).collect(),
+        Side::Outline => rows(pdf),
+    }
+}
+
+/// Where the strip's focus starts: the current page's thumbnail, or the current page's outline item, else the first.
+fn focus_seed(pdf: &PdfDocument, dh: f64, zoom: f64, scroll_y: f64) -> Option<usize> {
+    let cur = current(pdf, dh, zoom, scroll_y);
+    match pdf.side {
+        Side::Thumbs => Some(cur.min(pdf.page_count() - 1)),
+        Side::Outline => {
+            let rows = rows(pdf);
+            current_row(pdf, &rows, cur).map(|r| rows[r]).or(rows.first().copied())
+        }
+    }
+}
+
+/// Nudge the strip's stored scroll so entry `i` is inside a window `dh` device px tall (`sync` clamps it at paint),
+/// every length at the engine's scale `z` ([`strip_px`], SR387).
+fn reveal(pdf: &PdfDocument, i: usize, dh: f64, z: f64) {
+    let (gap, lh, rh) = (strip_px(THUMB_GAP, z), strip_px(LABEL_H, z), strip_px(ROW_H, z));
+    let (t, h) = match pdf.side {
+        Side::Thumbs => match layout(pdf, z).get(i) {
+            Some(&(top, _, h)) => (top - gap, h + lh + gap),
+            None => return,
+        },
+        Side::Outline => match rows(pdf).iter().position(|&r| r == i) {
+            Some(r) => (gap + r as f64 * rh, rh),
+            None => return,
+        },
+    };
+    let off = pdf.strip_off.get();
+    let off = if t < off { t } else if t + h > off + dh { t + h - dh } else { off };
+    pdf.strip_off.set(off.max(0.0));
+}
+
+/// A `t` px band just inside device rect [x0, x1) x [y0, y1), clipped to the strip's `sw` columns.
+fn band(out: &mut [u8], size: (usize, usize), sw: usize, (x0, y0, x1, y1): (i64, i64, i64, i64), t: i64, c: (u8, u8, u8)) {
+    fill(out, size, sw, x0, y0, x1, y0 + t, c);
+    fill(out, size, sw, x0, y1 - t, x1, y1, c);
+    fill(out, size, sw, x0, y0, x0 + t, y1, c);
+    fill(out, size, sw, x1 - t, y0, x1, y1, c);
+}
+
+/// The focused entry's focus ring, painted over the open strip (`present` calls it after `paint`): the engine's focus
+/// ring theme (`render::focusring::theme`: its colour and width, its 1 px halo outside) around the focused thumbnail
+/// (outside its frame) or inside the focused outline row.
+pub fn focus_paint(pdf: &PdfDocument, out: &mut [u8], (dw, dh): (usize, usize), zoom: f64, scroll_y: f64) {
+    let Some(f) = pdf.strip_focus.filter(|_| pdf.thumbs) else { return };
+    let strip_w = strip_px(STRIP_W, zoom);
+    let sw = (strip_w.round() as usize).min(dw);
+    let th = crate::render::focusring::theme();
+    let t = (strip_px(th.width as f64, zoom).round() as i64).max(1);
+    let cur = current(pdf, dh as f64, zoom, scroll_y);
+    let b = match pdf.side {
+        Side::Thumbs => {
+            let lay = layout(pdf, zoom);
+            let off = thumbs_off(pdf, &lay, cur, dh as f64, zoom);
+            let Some(&(top, w, h)) = lay.get(f) else { return };
+            let x0 = ((strip_w - w) / 2.0).round() as i64;
+            let y0 = (top - off).round() as i64;
+            let o = strip_px(FRAME as f64, zoom).round() as i64 + t;
+            (x0 - o, y0 - o, x0 + w as i64 + o, y0 + h as i64 + o)
+        }
+        Side::Outline => {
+            let rows = rows(pdf);
+            let off = outline_off(pdf, &rows, cur, dh as f64, zoom);
+            let Some(r) = rows.iter().rposition(|&i| i <= f) else { return };
+            let rh = strip_px(ROW_H, zoom);
+            let y0 = (strip_px(THUMB_GAP, zoom) + r as f64 * rh - off).round() as i64;
+            (1, y0 + 1, sw as i64 - 1, y0 + rh.round() as i64 - 1)
+        }
+    };
+    if let Some(halo) = th.halo {
+        band(out, (dw, dh), sw, (b.0 - 1, b.1 - 1, b.2 + 1, b.3 + 1), 1, halo);
+    }
+    band(out, (dw, dh), sw, b, t, th.color);
+}
+
+/// PDF4-OUTLINE-CONTRAST (SR389): the ink floor on the dark strip, in the engine's one ink luminance
+/// (`fonts::raster::luminance`, a grey maps to itself): grey 158 is the darkest whose WCAG contrast on [`STRIP_BG`] is
+/// 4.5:1 (157 is 4.49).
+pub const INK_FLOOR: u8 = 158;
+
+/// An ink lifted to [`INK_FLOOR`]: unchanged at or above it, else mixed toward white by the smallest step (k / 255,
+/// bisected over the monotone luminance) that reaches it, so its hue holds. The call site is the outline row's /C
+/// colour (PDF4-OUTLINE-STYLE).
+pub fn ink_floor(c: (u8, u8, u8)) -> (u8, u8, u8) {
+    use crate::fonts::raster::luminance;
+    if luminance(c) >= INK_FLOOR {
+        return c;
+    }
+    let mix = |k: u32| {
+        let m = |v: u8| (v as u32 + (255 - v as u32) * k / 255) as u8;
+        (m(c.0), m(c.1), m(c.2))
+    };
+    let (mut lo, mut hi) = (0u32, 255u32);
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        if luminance(mix(mid)) >= INK_FLOOR {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    mix(hi)
+}
+
+impl crate::AetherEngine {
+    /// The keys inside the open strip (`pdf_view_key` asks first): Tab / Shift+Tab move the focus between the page and
+    /// the strip; with the strip focused Up / Down step its entries, Home / End go to the first / last, Return follows
+    /// the entry, and on the outline Left / Right close / open a parent (`outline_open`, the toggle's state). False
+    /// (the key goes on) for a closed strip, a modified key and any other key.
+    pub(crate) fn pdf_strip_key(&mut self, key: &str) -> bool {
+        use crate::forms::edit::{parse_key, Key};
+        let (m, k) = parse_key(key);
+        let Some(k) = k else { return false };
+        if m.ctrl || m.alt || m.meta {
+            return false;
+        }
+        let (z, dh, sy) = (self.zoom(), self.device.1 as f64, self.scroll_y);
+        let Some(pdf) = self.pdf.as_mut().filter(|p| p.thumbs) else { return false };
+        if k == Key::Tab {
+            pdf.strip_focus = match pdf.strip_focus {
+                Some(_) => None,
+                None => {
+                    pdf.blur();
+                    focus_seed(pdf, dh, z, sy)
+                }
+            };
+            self.pdf_dirty();
+            return true;
+        }
+        let Some(f) = pdf.strip_focus.filter(|_| !m.shift) else { return false };
+        let list = entries(pdf);
+        if list.is_empty() {
+            return false;
+        }
+        // A focused item a collapse hid falls back to the last shown entry at or before it.
+        let at = list.iter().rposition(|&i| i <= f).unwrap_or(0);
+        let next = match k {
+            Key::Up => list[at.saturating_sub(1)],
+            Key::Down => list[(at + 1).min(list.len() - 1)],
+            Key::Home => list[0],
+            Key::End => list[list.len() - 1],
+            Key::Return => return self.pdf_strip_follow(list[at]),
+            Key::Left | Key::Right if pdf.side == Side::Outline => {
+                let item = list[at];
+                if pdf.outline[item].kids > 0 {
+                    if let Some(o) = pdf.outline_open.get_mut(item) {
+                        *o = k == Key::Right;
+                    }
+                }
+                item
+            }
+            _ => return false,
+        };
+        pdf.strip_focus = Some(next);
+        reveal(pdf, next, dh, z);
+        self.pdf_dirty();
+        true
+    }
+
+    /// Return on the strip's entry `i`: a thumbnail goes to its page's top, an outline item follows its action, both
+    /// through `pdf_follow`.
+    fn pdf_strip_follow(&mut self, i: usize) -> bool {
+        use pdf_core::annots::{Dest, View};
+        let Some(pdf) = self.pdf.as_ref() else { return false };
+        let a = match pdf.side {
+            Side::Thumbs => Some(LinkAction::GoTo(Dest { page: i, view: View::Fit })),
+            Side::Outline => pdf.outline.get(i).and_then(|it| it.action.clone()),
+        };
+        if let Some(a) = a {
+            self.pdf_follow(a);
+        }
+        true
+    }
+
+    /// After F4: a closed strip drops its focus; an open one that held it re-seeds it for the new mode.
+    pub(crate) fn pdf_strip_refocus(&mut self) {
+        let (z, dh, sy) = (self.zoom(), self.device.1 as f64, self.scroll_y);
+        let Some(pdf) = self.pdf.as_mut() else { return };
+        pdf.strip_focus = if pdf.thumbs && pdf.strip_focus.is_some() { focus_seed(pdf, dh, z, sy) } else { None };
+    }
 }
