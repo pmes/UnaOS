@@ -110,7 +110,7 @@ pub fn ofdm_listed(rs: Option<w::RateSet>) -> bool {
 
 /// The wire's name for a rate `station_rate` chooses.
 pub fn rate_name(rate: u8) -> &'static str {
-    match rate { 4 => "cck2", 11 => "cck5.5", 22 => "cck11", 48 => "ofdm24", _ => "cck1" }
+    match rate { 4 => "cck2", 11 => "cck5.5", 22 => "cck11", 12 => "ofdm6", 18 => "ofdm9", 24 => "ofdm12", 36 => "ofdm18", 48 => "ofdm24", 72 => "ofdm36", 96 => "ofdm48", 108 => "ofdm54", _ => "cck1" } // STATIONRATECTL (B881): every legacy rate the controller can step to
 }
 
 /// The AP's rate set as `1*,2*,5.5*,11*,6,9,…` (Mbit/s, `*` = basic), or `unread`.
@@ -227,4 +227,13 @@ pub fn witness() {
         state, rung_word(s8, "AUTHENTICATED", "NOT-AUTHENTICATED"), rung_word(s9, "ASSOCIATED", "NOT-ASSOCIATED"),
         if s9 == 1 { alloc::format!("{}", aid) } else { alloc::string::String::from("-") }
     );
+}
+
+/// STATIONRATECTL (B881): the TX header's fallback rate for a frame at `rate` (500 kbit/s units) — the highest BASIC CCK rate
+/// strictly below it (the AP answers a basic rate at that rate, so the fallback's NAV is exact), CCK 1 when none is (or the set
+/// is unread, or `rate` is CCK 1). Stated divergence from b43 `b43_calc_fallback_rate` (OFDM -> OFDM): the header's fallback
+/// words stay in CCK form (`tx::fb_of`).
+pub fn fallback_rate(rs: Option<w::RateSet>, rate: u8) -> u8 {
+    let basic = rs.map_or(0u16, |r| r.basic);
+    (0..4usize).rev().find(|&i| basic & (1 << i) != 0 && w::LEGACY_RATES[i] < rate).map_or(w::RATE_1M, |i| w::LEGACY_RATES[i])
 }

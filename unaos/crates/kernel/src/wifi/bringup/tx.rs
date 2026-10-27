@@ -436,7 +436,7 @@ fn plcp(out: &mut [u8], octets: usize, rate: u8) {
 }
 
 /// `xmit.c:235-567` for a frame at `rate` (STATIONRATE B855: the rungs pass `RATE_1M`; the kept station its chosen rate),
-/// no key, no RTS/CTS, no short preamble, the fallback ALWAYS CCK 1 (`plcp_fb`, `phy_ctl1_fb`, extra_ft FB_CCK: `:354-361`):
+/// no key, no RTS/CTS, no short preamble, the fallback `TxRate::fb`, a CCK rate (CCK 1 for the rungs; STATIONRATECTL B881) (`plcp_fb`, `phy_ctl1_fb`, extra_ft FB_CCK: `:354-361`):
 /// phy_rate (`:271-274`), phy_ctl's encoding (`:370-371`), the FC copy, the receiver, dur_fb = the frame's own duration (0: `:279-286`), both PLCPs,
 /// extra_ft CCK fallback, chan_radio_code = the channel (`:360-364`), phy_ctl CCK + ANT01AUTO
 /// (`:367-392`), mac_ctl HWSEQ + STMSDU + LONGFRAME (`:396-421`) + ACK on a unicast addr1 (`:399-400`), phy_ctl1 and
@@ -465,9 +465,9 @@ fn txhdr(frame: &[u8], ch: u16, cookie: u16, r: TxRate) -> [u8; TXH_SIZE] {
     h[TXH_EXTRA_FT] = TXH_EFT_FB_CCK;
     h[TXH_CHAN_RADIO_CODE] = ch as u8;
     h[TXH_TX_RECEIVER..TXH_TX_RECEIVER + 6].copy_from_slice(&frame[4..10]);
-    plcp(&mut h[TXH_PLCP_FB..TXH_PLCP_FB + 6], octets, RATE_1M);
+    plcp(&mut h[TXH_PLCP_FB..TXH_PLCP_FB + 6], octets, fb_of(r));
     let dur_fb = match duration(frame, r) {
-        Some(d) if d != 0 && rate != RATE_1M => nav_us(TxRate::long(RATE_1M)).to_le_bytes(),
+        Some(d) if d != 0 && rate != fb_of(r) => nav_us(TxRate::long(fb_of(r))).to_le_bytes(),
         Some(d) => d.to_le_bytes(),
         None => [frame[2], frame[3]],
     };
@@ -679,7 +679,7 @@ pub(super) struct Queue {
     pub acked: u32,
     pub failed: u32,
     pub stuck: u32,
-    pub full: u32,
+    pub full: u32, rate: [u8; BUF_FRAMES], pub ctl: crate::wifi::data::RateCtl, // STATIONRATECTL (B881): the rate each buffer pair's frame was posted at (0 = group addr1, not counted) and the rate controller, both under STATION
 }
 
 impl Queue {
@@ -714,7 +714,7 @@ pub(super) fn queue(bar0: u64, p: &Prep, q: &mut Queue, frame: &[u8], ch: u16, n
     if q.n == 0 {
         q.first = n;
     }
-    q.t0_ms[n % BUF_FRAMES] = now_ms;
+    q.t0_ms[n % BUF_FRAMES] = now_ms; q.rate[n % BUF_FRAMES] = if frame[4] & 0x01 == 0 { rate.rate } else { 0 }; // STATIONRATECTL (B881)
     let (cookie, _, _, _) = post(bar0, p, frame, ch, n, rate, w);
     q.n += 1;
     q.posted += 1;
@@ -740,13 +740,13 @@ pub(super) fn reap(bar0: u64, q: &mut Queue, now_ms: u64) {
         if r.intermediate || q.n == 0 {
             continue;
         }
-        let Some(k) = (0..q.n).find(|&i| cookie_of(q.first + i) == ck) else { continue };
+        let Some(k) = (0..q.n).find(|&i| cookie_of(q.first + i) == ck) else { continue }; let at = q.rate[(q.first + k) % FRAMES % BUF_FRAMES]; // STATIONRATECTL (B881): the popped frame's posted rate
         for _ in 0..k {
             q.pop();
             q.failed += 1;
         }
         q.pop();
-        let ok = r.frame_count > 0 && r.supp == 0;
+        let ok = r.frame_count > 0 && r.supp == 0; q.ctl.frame(at, ok && r.acked && (r.frame_count as u16) <= RETRY_LONG, r.frame_count); // STATIONRATECTL (B881): `Report::acked_at_rate`'s rule, the one status reader counts
         if ok {
             q.sent += 1;
             if r.acked {
@@ -810,13 +810,13 @@ pub(super) fn rate_kat() -> [bool; 4] {
 pub(super) struct TxRate {
     pub rate: u8,
     pub ack: u8,
-    pub short: bool,
+    pub short: bool, pub fb: u8, // STATIONRATECTL (B881): `fb` = the TX header's fallback rate, a CCK rate (`assoc::fallback_rate`; the rungs CCK 1)
 }
 
 impl TxRate {
     /// `rate`, answered at `rate`, long preamble.
     pub(super) const fn long(rate: u8) -> TxRate {
-        TxRate { rate, ack: rate, short: false }
+        TxRate { rate, ack: rate, short: false, fb: RATE_1M }
     }
 }
 
@@ -870,7 +870,7 @@ pub(super) fn air_kat() -> [bool; 2] {
     f[0] = 0x08;
     f[1] = 0x01;
     f[4..10].copy_from_slice(&[0x00, 0x11, 0x22, 0x33, 0x44, 0x55]);
-    let t = |rate: u8, ack: u8, short: bool| TxRate { rate, ack, short };
+    let t = |rate: u8, ack: u8, short: bool| TxRate { rate, ack, short, fb: RATE_1M };
     let mut grp = f.clone();
     grp[4..10].copy_from_slice(&[0xFF; 6]);
     let mut mgmt = f.clone();
@@ -898,4 +898,33 @@ pub(super) fn air_kat() -> [bool; 2] {
         && s11[TXH_PLCP_FB..TXH_PLCP_FB + 6] == h11[TXH_PLCP_FB..TXH_PLCP_FB + 6]
         && s1[TXH_PHY_CTL..TXH_PHY_CTL + 2] == [0xC0, 0x00] && s24[TXH_PHY_CTL..TXH_PHY_CTL + 2] == [0xC1, 0x00];
     [dur, short]
+}
+
+// ── STATIONRATECTL (rmbp-ledger B881): the TX header's fallback follows the rate ──────────────────────────────────
+
+/// The fallback rate `txhdr` writes: `r.fb` when it is a CCK rate (the header's fallback words stay in CCK form: extra_ft
+/// FB_CCK, phy_ctl1_fb BW_20), else CCK 1. `assoc::fallback_rate` picks the highest BASIC CCK rate below the primary, so the
+/// AP answers a fallback frame at the fallback rate and dur_fb = SIFS + the ACK at `fb` long is exact. Stated divergence from
+/// b43 `b43_calc_fallback_rate` (OFDM falls back to OFDM there).
+fn fb_of(r: TxRate) -> u8 {
+    if matches!(ratecode(r.fb), Some((_, false))) { r.fb } else { RATE_1M }
+}
+
+/// `tests wifi` (through `join::station_kat`, `data::kat`'s `fallback` row): a 60-octet unicast ToDS data frame (64 octets
+/// with FCS) at OFDM 24 with fallback CCK 11 -> plcp_fb 6E 04 2F 00 (64 * 16 / 22 = 46 r 12 -> 47; 512 % 11 = 6 -> 0x04),
+/// dur_fb 10 + 192 + 11 = 213 (D5 00), phy_ctl1_fb 0x0002, extra_ft 0; an OFDM `fb` is refused to CCK 1; `TxRate::long`
+/// keeps the CCK 1 fallback (0A 04 00 02, the rungs' bytes).
+pub(super) fn fb_kat() -> bool {
+    use wifi_core::ieee80211::{RATE_11M, RATE_24M};
+    let mut f = alloc::vec![0u8; 60];
+    f[0] = 0x08;
+    f[1] = 0x01;
+    f[4..10].copy_from_slice(&[0x00, 0x11, 0x22, 0x33, 0x44, 0x55]);
+    let h = txhdr(&f, 11, COOKIE_RING1, TxRate { rate: RATE_24M, ack: RATE_24M, short: false, fb: RATE_11M });
+    let o = txhdr(&f, 11, COOKIE_RING1, TxRate { rate: RATE_24M, ack: RATE_24M, short: false, fb: 12 });
+    let l = txhdr(&f, 11, COOKIE_RING1, TxRate::long(RATE_24M));
+    h[TXH_PLCP_FB..TXH_PLCP_FB + 6] == [0x6E, 0x04, 0x2F, 0x00, 0, 0] && h[TXH_DUR_FB..TXH_DUR_FB + 2] == [0xD5, 0x00]
+        && h[TXH_PHY_CTL1_FB..TXH_PHY_CTL1_FB + 2] == [0x02, 0x00] && h[TXH_EXTRA_FT] == TXH_EFT_FB_CCK
+        && o[TXH_PLCP_FB..TXH_PLCP_FB + 6] == [0x0A, 0x04, 0x00, 0x02, 0, 0] && o[TXH_DUR_FB..TXH_DUR_FB + 2] == [0x3A, 0x01]
+        && l[TXH_PLCP_FB..TXH_PLCP_FB + 6] == [0x0A, 0x04, 0x00, 0x02, 0, 0] && l[TXH_DUR_FB..TXH_DUR_FB + 2] == [0x3A, 0x01]
 }
