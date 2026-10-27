@@ -368,9 +368,13 @@ impl<'a> SliceDecoder<'a> {
             self.is_cu_qp_delta_coded = false;
             self.cu_qp_delta_val = 0;
         }
-        // HEVCREXTTOOLS (SR345) 7.3.8.4: IsCuChromaQpOffsetCoded at Log2MinCuChromaQpOffsetSize.
+        // HEVCREXTTOOLS (SR345) 7.3.8.4: IsCuChromaQpOffsetCoded at Log2MinCuChromaQpOffsetSize. HEVCSCCTAIL (SR365,
+        // HEVCREXT-QPOFF): CuQpOffsetCb / Cr restart at 0 with the group, as HM does (TDecCu::xFinishDecodeCU gives a CU
+        // the coded adjustment only once its group coded it; initCtu's 0 otherwise) — no sample differs, since a chroma TU
+        // with coefficients codes the flag in its own group first.
         if self.sh.cu_chroma_qp_offset_enabled_flag && log2 + self.pps.range_ext.diff_cu_chroma_qp_offset_depth >= self.sps.log2_ctb {
             self.chroma_qp_offset_coded = false;
+            self.cu_qp_offset = (0, 0);
         }
         if split {
             let half = size >> 1;

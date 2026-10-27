@@ -2248,6 +2248,7 @@ dependencies = [
 name = "hevc_core"
 version = "0.1.0"
 dependencies = [
+ "crypto_core",
  "h264_core",
 ]
 
