@@ -29,7 +29,7 @@ use gneiss_pal::dsp::demux::TrackKind;
 use gneiss_pal::dsp::demux::build;
 use gneiss_pal::dsp::image::{PngError, encode_rgba};
 use h264enc_core::yuv::I420;
-use h264enc_core::{Config, Encoder};
+use h264enc_core::{Config, Encoder, RateControl, RcMode};
 use timeline_core::{Timebase, Timeline};
 
 use crate::nle::{RenderError, RenderSink, Sources, render};
@@ -110,26 +110,35 @@ impl VideoEncoder for RawSequence {
     }
 }
 
-/// H.264 through H264ENC (Constrained Baseline, constant QP, an IDR every `gop` frames): each RGBA frame becomes I420
+/// H.264 through H264ENC (Constrained Baseline, constant QP or a CBR target ([`H264Encoder::with_bitrate`], H264ENCRC
+/// SR218), an IDR every `gop` frames): each RGBA frame becomes I420
 /// by `h264enc_core::yuv::I420::from_rgba`, then one access unit, stored as its avcC sample. The encoder is built at
 /// the first frame (its size); a later frame of another size is refused (`h264enc_core::Error::FrameSize`).
 pub struct H264Encoder {
     qp: u8,
     gop: u32,
+    rate: Option<RateControl>,
     enc: Option<Encoder>,
 }
 
 impl H264Encoder {
     /// `qp` 16..=40 and `gop` >= 1 (checked by `Encoder::new` at the first frame).
     pub fn new(qp: u8, gop: u32) -> H264Encoder {
-        H264Encoder { qp, gop, enc: None }
+        H264Encoder { qp, gop, rate: None, enc: None }
+    }
+
+    /// A constant bit rate of `kbps` kbit/s at `fps_num / fps_den` frames per second (`nle export --bitrate`): `qp`
+    /// becomes the rate controller's starting QP.
+    pub fn with_bitrate(mut self, kbps: u32, fps_num: u32, fps_den: u32) -> H264Encoder {
+        self.rate = Some(RateControl { bits_per_second: kbps.saturating_mul(1000), fps_num, fps_den, mode: RcMode::Cbr });
+        self
     }
 }
 
 impl VideoEncoder for H264Encoder {
     fn encode(&mut self, width: u32, height: u32, rgba: &[u8]) -> Result<Vec<Access>, ExportError> {
         if self.enc.is_none() {
-            self.enc = Some(Encoder::new(Config { width, height, qp: self.qp, gop: self.gop, ..Default::default() }).map_err(ExportError::H264)?);
+            self.enc = Some(Encoder::new(Config { width, height, qp: self.qp, gop: self.gop, rate: self.rate, ..Default::default() }).map_err(ExportError::H264)?);
         }
         let enc = self.enc.as_mut().expect("built above");
         let yuv = I420::from_rgba(width, height, rgba).map_err(ExportError::H264)?;

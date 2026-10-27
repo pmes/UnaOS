@@ -116,10 +116,11 @@ pub fn write_pps(qp: i32) -> Vec<u8> {
 /// slice_header (7.3.3) of the one slice of a picture: first_mb_in_slice 0, slice_type 7 (I, all
 /// slices of the picture) or 5 (P), the PPS, frame_num, idr_pic_id on an IDR; a P slice keeps the
 /// default one active reference and no list modification; marking is the IDR's 0 / 0 or sliding
-/// window; slice_qp_delta 0; disable_deblocking_filter_idc 0 with zero filter offsets when
+/// window; slice_qp_delta (SliceQPY - pic_init_qp: 0 at constant QP, the rate controller's picture QP
+/// otherwise, SR218); disable_deblocking_filter_idc 0 with zero filter offsets when
 /// `deblock` (the encoder filters its reconstruction as the decoder does, SR211), else 1 (the
 /// reconstruction is unfiltered).
-pub fn write_slice_header(w: &mut BitWriter, idr: bool, frame_num: u32, log2_max_frame_num: u32, idr_pic_id: u32, deblock: bool) {
+pub fn write_slice_header(w: &mut BitWriter, idr: bool, frame_num: u32, log2_max_frame_num: u32, idr_pic_id: u32, deblock: bool, slice_qp_delta: i32) {
     w.ue(0); // first_mb_in_slice
     w.ue(if idr { 7 } else { 5 }); // slice_type
     w.ue(0); // pic_parameter_set_id
@@ -139,7 +140,7 @@ pub fn write_slice_header(w: &mut BitWriter, idr: bool, frame_num: u32, log2_max
     } else {
         w.flag(false); // adaptive_ref_pic_marking_mode_flag: sliding window
     }
-    w.se(0); // slice_qp_delta
+    w.se(slice_qp_delta); // slice_qp_delta
     if deblock {
         w.ue(0); // disable_deblocking_filter_idc
         w.se(0); // slice_alpha_c0_offset_div2
