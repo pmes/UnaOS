@@ -23,16 +23,22 @@
 //!   so a group's band is one range sharing one scalefactor and codebook. M/S (AACENCSHORT): a stereo frame is always a
 //!   CPE with `common_window` 1; a band goes M/S when its perceptual-entropy estimate is lower that way (`ms_decide`),
 //!   ms_mask_present 0/1/2. Not built: PNS, intensity, SBR.
-//! * TNS (AACENCTNS, LEDGER SR381; §4.6.9): on the blocks around an attack (LONG_START / EIGHT_SHORT / LONG_STOP: the
-//!   attack gate; a stationary ONLY_LONG block carries none), per channel per window, the spectrum from `TNS_START_HZ` to
-//!   the decoder's `TNS_MAX_BANDS` limit is LPC-analysed (Levinson-Durbin, order <= 12 long / 7 short) and, where the
-//!   prediction gain exceeds `TNS_GAIN` 1.4, its parcor coefficients are quantised (4 / 3 bits), turned into the filter by
+//! * TNS (AACENCTNS, LEDGER SR381; §4.6.9): per channel per window, the spectrum from `TNS_START_HZ` to the decoder's
+//!   `TNS_MAX_BANDS` limit is LPC-analysed (Levinson-Durbin, order <= 12 long / 7 short) over its BAND-NORMALISED
+//!   autocorrelation (AACENCTNSNORM, LEDGER SR385; 3GPP TS 26.403's detection: each band weighted by 1/sqrt of its mean
+//!   energy, the weights smoothed across bands, `tns_weights`, so a tonal frame's strong bands and their leakage do not
+//!   read as a predictable spectrum) and, on ANY block where that prediction gain exceeds `TNS_GAIN_NORM` 2.1 (SR381's
+//!   attack gate retired to the KAT switch `tns_gate`; the raw autocorrelation and `TNS_GAIN` 1.4 are the `tns_norm`
+//!   off arm), its parcor coefficients are quantised (4 / 3 bits), turned into the filter by
 //!   the decoder's own `tns_lpc` and the spectrum replaced by the residual before the two loops (`tns_window`); the
 //!   decoder's `spectral_tools` synthesis inverts it exactly. The thresholds are taken from the unfiltered spectrum and
 //!   divided by the synthesis filter's noise gain.
 //! * THE PSY MODEL (AACENCTNS, LEDGER SR381; `allowed`): the band energies spread by a two-slope Bark function (3GPP TS
 //!   26.403: `SPREAD_LO_DB` 30 / `SPREAD_HI_DB` 15 dB per Bark, one `Spread` table per block type built in `new`), under a
-//!   spectral-flatness tonality offset (`TONAL_DB` 18 for a tonal band, `NOISE_DB` 6 for a flat one). A band under the
+//!   spectral-flatness tonality offset (`TONAL_DB` 18 for a tonal band, `NOISE_DB` 6 for a flat one; AACENCTNSNORM SR385:
+//!   the opt-in `Psy::Pred` takes a long block's tonality from the unpredictability of its MDCT magnitudes over the two
+//!   previous long blocks instead, `chaos_tonality`; not the default: on the correlated CPE fixture it overran the
+//!   bitrate by 6 bytes, AACENC-PSY-PRED-DEFAULT owed). A band under the
 //!   floor below is not coded; a band the model masks keeps a base scalefactor (never coarser than the last that codes
 //!   anything) the inner loop's spare bits reach (the seat's ruling: with the masked bands dropped, the 1 kHz tone fell to
 //!   36.7 dB). THE BIT RESERVOIR: a frame borrows the bits earlier frames left (capped at `AU_MAX_BITS` a channel) and
@@ -76,6 +82,10 @@ pub struct AccessUnit {
 const TONAL_DB: f64 = 18.0;
 const NOISE_DB: f64 = 6.0;
 const SFM_TONAL_DB: f64 = -60.0;
+/// AACENCTNSNORM (LEDGER SR385): `Psy::Pred`'s chaos -> tonality map (ISO/IEC 13818-7 psychoacoustic model 2):
+/// tonality = clamp(PRED_A - PRED_B · ln c, 0, 1).
+const PRED_A: f64 = -0.299;
+const PRED_B: f64 = 0.43;
 const ATH: f64 = 1000.0;
 /// The two-slope Bark spreading (3GPP TS 26.403's AAC psy model): dB per Bark toward lower bands and toward higher.
 const SPREAD_LO_DB: f64 = 30.0;
@@ -86,6 +96,10 @@ const MASK_DB: f64 = 60.0;
 /// TNS (§4.6.9, AACENCTNS): a filter where the spectrum's prediction gain exceeds TNS_GAIN, of order at most
 /// TNS_ORDER_LONG / TNS_ORDER_SHORT, over the bands from TNS_START_HZ to the TNS_MAX_BANDS table's limit.
 const TNS_GAIN: f64 = 1.4;
+/// AACENCTNSNORM (LEDGER SR385): the gate on the band-normalised prediction gain, every block. Measured on the
+/// tone + noise-burst fixture: the stationary tonal blocks peak at 1.9, the burst blocks start at 2.4 (raw 1.7-4.2 vs
+/// 2.6+: they overlapped, hence SR381's attack gate); 2.1 is their geometric middle.
+const TNS_GAIN_NORM: f64 = 2.1;
 const TNS_ORDER_LONG: usize = 12;
 const TNS_ORDER_SHORT: usize = 7;
 const TNS_START_HZ: f64 = 1500.0;
@@ -188,6 +202,16 @@ impl Coded {
     }
 }
 
+/// The psy model's tonality source (AACENCTNSNORM, LEDGER SR385): the band's spectral flatness (the default), or the
+/// unpredictability of its MDCT magnitudes over the two previous long blocks (opt-in, AACENC-PSY-PRED).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Psy {
+    Flatness,
+    /// opt-in: only the KATs choose it today (no caller sets it)
+    #[cfg_attr(not(test), allow(dead_code))]
+    Pred,
+}
+
 /// The AAC-LC encoder: 1 or 2 channels at one of the 13 AAC rates, a target bitrate.
 pub struct Encoder {
     rate: u32,
@@ -234,6 +258,12 @@ pub struct Encoder {
     tns: bool,
     reservoir: bool,
     tns_windows: u8,
+    /// AACENCTNSNORM (LEDGER SR385): the band-normalised TNS detector on, SR381's attack gate off (KAT switches), the
+    /// tonality source, and per channel the two previous long spectra `Psy::Pred` reads (kept only under Pred)
+    tns_norm: bool,
+    tns_gate: bool,
+    psy: Psy,
+    pred: Vec<(Option<Vec<f32>>, Option<Vec<f32>>)>,
 }
 
 impl Encoder {
@@ -292,6 +322,10 @@ impl Encoder {
             tns: true,
             reservoir: true,
             tns_windows: 0,
+            tns_norm: true,
+            tns_gate: false,
+            psy: Psy::Flatness,
+            pred: vec![(None, None); ch],
         })
     }
 
@@ -496,9 +530,14 @@ impl Encoder {
             // AACENCTNS: the thresholds from the unfiltered spectrum, then TNS on the window-major spectrum, the thresholds
             // of the filtered bands lowered by the synthesis filter's noise gain
             let orig = if g.short { interleave(&s, &g) } else { s.clone() };
-            let (mut a, mut fl) = self.allowed(&orig, &g);
-            // the attack gate (3GPP): TNS only on the blocks around an attack, never on a stationary ONLY_LONG block
-            let t = if self.tns && seq != ONLY_LONG { self.tns_block(&mut s, &g) } else { TnsSide::none(g.short) };
+            // AACENCTNSNORM: `Psy::Pred` reads the two previous long spectra (a short block clears them)
+            let pred = if self.psy == Psy::Pred { core::mem::replace(&mut self.pred[c], (None, None)) } else { (None, None) };
+            let prev = match (&pred, g.short) { ((Some(p1), Some(p2)), false) => Some((&p1[..], &p2[..])), _ => None };
+            let (mut a, mut fl) = self.allowed(&orig, &g, prev);
+            if self.psy == Psy::Pred { self.pred[c] = if g.short { (None, None) } else { (Some(orig.clone()), pred.0) }; }
+            // AACENCTNSNORM: every block whose band-normalised prediction gain passes; SR381's attack gate (LONG_START /
+            // EIGHT_SHORT / LONG_STOP only) is the `tns_gate` KAT switch
+            let t = if self.tns && (!self.tns_gate || seq != ONLY_LONG) { self.tns_block(&mut s, &g) } else { TnsSide::none(g.short) };
             t.lift(&mut a, &g);
             t.lift(&mut fl, &g);
             x.push(if !t.any() { orig } else if g.short { interleave(&s, &g) } else { s });
@@ -545,7 +584,8 @@ impl Encoder {
     /// band, `NOISE_DB` for a flat one), floored at the absolute level and at the frame's mask floor (`MASK_DB` under its
     /// loudest band per coefficient). Also returned: that floor alone per band (the outer loop's coded-or-not line, the
     /// seat's ruling (B): a band the model masks is still coded when spare bits reach it).
-    fn allowed(&self, x: &[f32], g: &Grid) -> (Vec<f64>, Vec<f64>) {
+    /// AACENCTNSNORM (SR385): with `prev` (the two previous long spectra, `Psy::Pred`) the tonality is `chaos_tonality`'s.
+    fn allowed(&self, x: &[f32], g: &Grid, prev: Option<(&[f32], &[f32])>) -> (Vec<f64>, Vec<f64>) {
         let nb = g.bands();
         let sp = if g.short { &self.spread_s } else { &self.spread_l };
         let energy: Vec<f64> = (0..nb).map(|i| { let (lo, hi) = g.rng(i); x[lo..hi].iter().map(|&v| v as f64 * v as f64).sum() }).collect();
@@ -563,7 +603,10 @@ impl Encoder {
             // spectral flatness: geometric over arithmetic mean of the coefficients' energies (+1: no log of zero)
             let geo = x[lo..hi].iter().map(|&v| math::ln(v as f64 * v as f64 + 1.0)).sum::<f64>() / n;
             let sfm = 10.0 * math::log10(math::exp(geo) / (energy[i] / n + 1.0));
-            let alpha = (sfm / SFM_TONAL_DB).clamp(0.0, 1.0);
+            let alpha = match prev {
+                Some((p1, p2)) => chaos_tonality(x, p1, p2, lo, hi),
+                None => (sfm / SFM_TONAL_DB).clamp(0.0, 1.0),
+            };
             let off = NOISE_DB + alpha * (TONAL_DB - NOISE_DB);
             (s[i] * db(-off)).max(fl[i])
         }).collect();
@@ -586,7 +629,10 @@ impl Encoder {
         side.bands = (start, end);
         let (lo, hi) = (g.swb[start] as usize, g.swb[end] as usize);
         for w in 0..if g.short { 8 } else { 1 } {
-            if let Some((p, idx, gain)) = tns_window(&mut s[w * bins..(w + 1) * bins], lo, hi, order, res_bits) {
+            let win = &mut s[w * bins..(w + 1) * bins];
+            // AACENCTNSNORM (SR385): the band-normalised detector's weights
+            let wts = if self.tns_norm { Some(tns_weights(win, g.swb, start, end)) } else { None };
+            if let Some((p, idx, gain)) = tns_window(win, lo, hi, order, res_bits, wts.as_deref()) {
                 side.order[w] = p as u8;
                 side.idx[w] = idx;
                 side.gain[w] = gain;
@@ -992,17 +1038,22 @@ impl TnsSide {
     }
 }
 
-/// TNS on one window's spectrum `x` over `lo..hi`: the autocorrelation, Levinson-Durbin to `order` parcor coefficients,
-/// and where the prediction gain exceeds `TNS_GAIN`, the coefficients quantised to `res_bits` (trailing zeros trim the
+/// TNS on one window's spectrum `x` over `lo..hi`: the autocorrelation — of x·w with the band weights `w`
+/// (AACENCTNSNORM, LEDGER SR385: `tns_weights`, gated at `TNS_GAIN_NORM`), of x itself without (`TNS_GAIN`) —,
+/// Levinson-Durbin to `order` parcor coefficients, and where the prediction gain passes, the coefficients quantised to
+/// `res_bits` (trailing zeros trim the
 /// order), turned into the LPC by the decoder's own `tns_lpc`, and the spectrum replaced by the prediction residual
 /// (the FIR inverse of the decoder's all-pole synthesis, from the top down). Returns (order, indices, the synthesis
 /// filter's noise gain Σh²).
-fn tns_window(x: &mut [f32], lo: usize, hi: usize, order: usize, res_bits: u32) -> Option<(usize, [i32; 12], f64)> {
+fn tns_window(x: &mut [f32], lo: usize, hi: usize, order: usize, res_bits: u32, w: Option<&[f64]>) -> Option<(usize, [i32; 12], f64)> {
     let n = hi.saturating_sub(lo);
     if n <= 2 * order { return None; }
     let mut r = [0f64; 13];
     for (k, rk) in r.iter_mut().enumerate().take(order + 1) {
-        *rk = (lo..hi - k).map(|i| x[i] as f64 * x[i + k] as f64).sum();
+        *rk = match w {
+            Some(w) => (lo..hi - k).map(|i| x[i] as f64 * w[i] * x[i + k] as f64 * w[i + k]).sum(),
+            None => (lo..hi - k).map(|i| x[i] as f64 * x[i + k] as f64).sum(),
+        };
     }
     if r[0] <= 0.0 { return None; }
     let mut a = [0f64; 13];
@@ -1019,7 +1070,7 @@ fn tns_window(x: &mut [f32], lo: usize, hi: usize, order: usize, res_bits: u32) 
         err *= 1.0 - km * km;
         if err <= 0.0 { return None; }
     }
-    if r[0] / err <= TNS_GAIN { return None; }
+    if r[0] / err <= if w.is_some() { TNS_GAIN_NORM } else { TNS_GAIN } { return None; }
     let half = (1i32 << (res_bits - 1)) as f64;
     let (iqfac, iqfac_m) = ((half - 0.5) / (core::f64::consts::PI / 2.0), (half + 0.5) / (core::f64::consts::PI / 2.0));
     let mut idx = [0i32; 12];
@@ -1045,6 +1096,42 @@ fn tns_window(x: &mut [f32], lo: usize, hi: usize, order: usize, res_bits: u32) 
         gain += y * y;
     }
     Some((p, idx, gain))
+}
+
+/// AACENCTNSNORM (LEDGER SR385): the band normalisation of TNS detection (3GPP TS 26.403; the FDK encoder's weighted
+/// spectrum): per scalefactor band `start..end` of the window `x` (band edges `swb`), 1/sqrt(mean energy + 1), smoothed
+/// half-and-half forward then backward across the bands, spread over the band's lines (zero outside the range).
+fn tns_weights(x: &[f32], swb: &[u16], start: usize, end: usize) -> Vec<f64> {
+    let mut wb: Vec<f64> = (start..end)
+        .map(|b| {
+            let (lo, hi) = (swb[b] as usize, swb[b + 1] as usize);
+            let e = x[lo..hi].iter().map(|&v| v as f64 * v as f64).sum::<f64>() / (hi - lo) as f64;
+            1.0 / math::sqrt(e + 1.0)
+        })
+        .collect();
+    for i in 1..wb.len() { wb[i] = 0.5 * wb[i - 1] + 0.5 * wb[i]; }
+    for i in (0..wb.len().saturating_sub(1)).rev() { wb[i] = 0.5 * wb[i + 1] + 0.5 * wb[i]; }
+    let mut w = vec![0f64; x.len()];
+    for (j, b) in (start..end).enumerate() {
+        for v in w[swb[b] as usize..swb[b + 1] as usize].iter_mut() { *v = wb[j]; }
+    }
+    w
+}
+
+/// AACENCTNSNORM (LEDGER SR385), `Psy::Pred`: band `lo..hi`'s tonality from the unpredictability of its MDCT magnitudes —
+/// per line the prediction r̂ = 2|X(t-1)| - |X(t-2)| from the two previous long spectra `p1`, `p2`, the chaos
+/// c = | |X| - r̂ | / (|X| + |r̂|), the band's energy-weighted mean c mapped by PRED_A - PRED_B · ln c into 0..1.
+fn chaos_tonality(x: &[f32], p1: &[f32], p2: &[f32], lo: usize, hi: usize) -> f64 {
+    let (mut cw, mut ew) = (0f64, 0f64);
+    for i in lo..hi {
+        let r = (x[i] as f64).abs();
+        let rh = 2.0 * (p1[i] as f64).abs() - (p2[i] as f64).abs();
+        let c = (r - rh).abs() / (r + rh.abs() + 1e-9);
+        cw += c * r * r;
+        ew += r * r;
+    }
+    let chaos = if ew > 0.0 { cw / ew } else { 1.0 };
+    (PRED_A - PRED_B * math::ln(chaos.max(1e-9))).clamp(0.0, 1.0)
 }
 
 /// The two-slope Bark spreading of one block type's bands (3GPP TS 26.403's AAC psy model): `up[b]` the power factor
@@ -1128,7 +1215,7 @@ mod tests {
     }
 
     /// A 1 kHz sine at 128 kb/s stereo decodes through OUR decoder at >= 30 dB SNR, within the bitrate. Measured: 56.8 dB
-    /// at MASK_DB 60 (49.6 at 50, 40.2 at 40, 14.4 with no mask floor; 34.0 / 54.3 dB at 3000 / 6000 bits a channel
+    /// (AACENCTNSNORM SR385: 56.9/57.5, TNS now on its stationary blocks) at MASK_DB 60 (49.6 at 50, 40.2 at 40, 14.4 with no mask floor; 34.0 / 54.3 dB at 3000 / 6000 bits a channel
     /// without it: the transform and bitstream are exact, the allocation is the psy model's).
     #[test]
     fn aac_enc_sine_snr() {
@@ -1156,6 +1243,8 @@ mod tests {
             assert!(snr >= 30.0, "channel {c}: SNR {snr:.1} dB");
             // AACENCTNS (LEDGER SR381): the psy model, TNS and the reservoir hold SR378's tone within 1 dB
             assert!(snr >= SINE_SR378[c] - 1.0, "channel {c}: SNR {snr:.1} dB, SR378 {:.1}", SINE_SR378[c]);
+            // AACENCTNSNORM (LEDGER SR385): the band-normalised gate on every block keeps or beats SR381's tone (56.9/57.5)
+            assert!(snr >= SINE_SR381[c], "channel {c}: SNR {snr:.1} dB, SR381 {:.1}", SINE_SR381[c]);
         }
     }
 
@@ -1373,7 +1462,10 @@ mod tests {
 
     /// L = a broadband noise, R = L + an independent ±8: (units, total bytes, per-channel SNR) with M/S on or off and the
     /// one CPE budget on or off.
-    fn correlated(ms: bool, cpe: bool) -> (Vec<AccessUnit>, usize, [f64; 2]) {
+    fn correlated(ms: bool, cpe: bool) -> (Vec<AccessUnit>, usize, [f64; 2]) { correlated_psy(ms, cpe, Psy::Flatness) }
+
+    /// `correlated` with the psy model's tonality source (AACENCTNSNORM, LEDGER SR385: `aac_enc_psy_pred`).
+    fn correlated_psy(ms: bool, cpe: bool, psy: Psy) -> (Vec<AccessUnit>, usize, [f64; 2]) {
         let frames = 24000;
         let (mut a, mut b) = (0x1234_5678u32, 0x9abc_def0u32);
         let mut pcm = Vec::with_capacity(frames * 2);
@@ -1389,6 +1481,7 @@ mod tests {
         e.ms = ms;
         e.cpe = cpe;
         e.reservoir = cpe; // AACENCTNS: the per-channel arms measure the idle bits a reservoir would re-spend
+        e.psy = psy;
         let mut units = e.encode(&pcm);
         units.extend(e.flush());
         let bytes = units.iter().map(|u| u.data.len()).sum();
@@ -1449,14 +1542,20 @@ mod tests {
     /// SR378's measured sine SNR (dB, per channel) and its one-budget correlated SNR: the floors this arc keeps.
     const SINE_SR378: [f64; 2] = [56.5, 57.1];
     const CPE_SR378: f64 = 4.9;
+    /// AACENCTNSNORM (LEDGER SR385): SR381's measured sine SNR, the floor this arc keeps or beats.
+    const SINE_SR381: [f64; 2] = [56.3, 56.8];
     /// AACENCTNS: (unit, windows TNS filtered) on the tone + noise-burst stream — LONG_START / EIGHT_SHORT / LONG_STOP of
-    /// each burst (`aac_enc_short_click_sequence`'s units), the short units' filtered windows of eight.
-    const TNS_UNITS: [(usize, u8); 9] = [(9, 1), (10, 3), (11, 1), (19, 1), (20, 4), (21, 1), (28, 1), (29, 7), (30, 1)];
-    const TNS_PRE_ECHO_DB: f64 = 9.0;
+    /// each burst (`aac_enc_short_click_sequence`'s units), the short units' filtered windows of eight. AACENCTNSNORM
+    /// (LEDGER SR385; SR381's pin (9,1) (10,3) (11,1) (19,1) (20,4) (21,1) (28,1) (29,7) (30,1)): unit 0 joins (the
+    /// tone's onset over the encoder's silent history), unit 29 filters 6 windows of eight; no stationary block filters.
+    const TNS_UNITS: [(usize, u8); 10] = [(0, 1), (9, 1), (10, 3), (11, 1), (19, 1), (20, 4), (21, 1), (28, 1), (29, 6), (30, 1)];
+    /// SR381 9 dB (measured 10.5); AACENCTNSNORM (SR385) measured 11.2 (6.248e7 -> 4.731e6), the floor raised to 10.5.
+    const TNS_PRE_ECHO_DB: f64 = 10.5;
     /// SR378's short-block pre-echo (`aac_enc_short_pre_echo`, block switching alone) and the margin this arc keeps under it.
     const PRE_ECHO_SR378: f64 = 4.257e7;
     const PRE_ECHO_VS_SR378_DB: f64 = 20.0;
-    const RESERVOIR_BYTES: (usize, usize) = (586, 160);
+    /// SR381 (586, 160); AACENCTNSNORM (SR385): (566, 168), the burst's neighbours now filtered by the normalised gate.
+    const RESERVOIR_BYTES: (usize, usize) = (566, 168);
 
     /// A tone (440 Hz + 2 harmonics) with 512-sample white-noise bursts (abrupt onset) at `BURSTS`, mono.
     fn tone_bursts(frames: usize) -> Vec<i16> {
@@ -1516,8 +1615,8 @@ mod tests {
         pre
     }
 
-    /// TNS on the bursts, the attack gate: on the tone + noise-burst stream only the blocks around the bursts filter
-    /// (the per-unit record PINNED, `TNS_UNITS`; stationary tonal blocks carry none) and the stream decodes through the
+    /// TNS on the bursts: on the tone + noise-burst stream only the blocks around the bursts and the tone's onset filter
+    /// (the per-unit record PINNED, `TNS_UNITS`; stationary tonal blocks carry none: AACENCTNSNORM's normalised gate) and the stream decodes through the
     /// decoder's TNS synthesis; at the fixed budget TNS lowers the silence clicks' pre-echo by at least `TNS_PRE_ECHO_DB`.
     #[test]
     fn aac_enc_tns_burst() {
@@ -1530,7 +1629,9 @@ mod tests {
         let db = 10.0 * math::log10(c_off / c_on.max(1e-9));
         std::println!("aac_enc_tns_burst: tns units {on:?}; tone+bursts error before the bursts tns {pre_on:.3e} off {pre_off:.3e}, SNR tns {snr_on:.1} off {snr_off:.1} dB; clicks at the fixed budget tns {c_on:.3e} off {c_off:.3e} ({db:.1} dB lower)");
         for u in [10usize, 20, 29] { assert_eq!(wire_seq(&units[u]), 2); assert!(filt[u] > 0, "unit {u}: no TNS"); }
-        for &(u, _) in &on { assert_ne!(wire_seq(&units[u]), 0, "unit {u}: TNS on an ONLY_LONG block"); }
+        // AACENCTNSNORM (SR385): the gate is the band-normalised gain, no longer the block type: the one ONLY_LONG unit
+        // that filters is unit 0, the tone's onset; the stationary tonal blocks carry none
+        for &(u, _) in &on { assert!(u == 0 || wire_seq(&units[u]) != 0, "unit {u}: TNS on a stationary ONLY_LONG block"); }
         assert_eq!(on, TNS_UNITS.to_vec());
         assert!(db >= TNS_PRE_ECHO_DB, "pre-echo only {db:.1} dB lower");
     }
@@ -1562,5 +1663,83 @@ mod tests {
         assert!(b_on * 8 <= AU_MAX_BITS, "on: {b_on} bytes over the AU max");
         assert_eq!((b_on, b_off), RESERVOIR_BYTES);
         assert!(total <= cap, "{total} bytes, the bitrate's {cap}");
+    }
+    // ---- AACENCTNSNORM (LEDGER SR385): the band-normalised TNS gate, the opt-in unpredictability tonality
+
+    /// The tone + noise-burst stream (64 kb/s mono) with the TNS detector's switches: the windows filtered per unit of
+    /// the encode phase.
+    fn tns_filtered(norm: bool, gate: bool) -> (Vec<AccessUnit>, Vec<u8>) {
+        let pcm = tone_bursts(40960);
+        let mut e = Encoder::new(48000, 1, 64000).unwrap();
+        e.tns_norm = norm;
+        e.tns_gate = gate;
+        let mut units = Vec::new();
+        let mut filt = Vec::new();
+        for f in pcm.chunks(1024) {
+            for u in e.encode(f) { units.push(u); filt.push(e.tns_windows); }
+        }
+        (units, filt)
+    }
+
+    /// The 1 kHz sine at 128 kb/s stereo (`aac_enc_sine_snr`'s fixture) through `set`: per-channel SNR and the bytes.
+    fn sine_with(set: impl Fn(&mut Encoder)) -> ([f64; 2], usize) {
+        let frames = 48000;
+        let pcm = sine_pcm(48000, frames, 1000.0, 16000.0);
+        let mut e = Encoder::new(48000, 2, 128000).unwrap();
+        set(&mut e);
+        let mut units = e.encode(&pcm);
+        units.extend(e.flush());
+        let d = decode(&e, &units);
+        let mut snr = [0f64; 2];
+        for c in 0..2 {
+            let (mut s, mut n) = (0f64, 0f64);
+            for i in 2048..frames - 2048 {
+                let x = pcm[i * 2 + c] as f64;
+                let y = d[c][i + PRIMING as usize];
+                s += x * x;
+                n += (x - y) * (x - y);
+            }
+            snr[c] = 10.0 * math::log10(s / n.max(1e-9));
+        }
+        (snr, units.iter().map(|u| u.data.len()).sum())
+    }
+
+    /// The band-normalised gate (3GPP TS 26.403's detection): on the tone + noise-burst stream the RAW detector with no
+    /// attack gate (`tns_norm` and `tns_gate` off: what SR381 had to gate) filters every stationary tonal block — the
+    /// 440 Hz tone's leakage reads as a predictable spectrum (raw gains 1.7-4.2) — and the normalised one filters none of
+    /// them (1.1-1.9, under `TNS_GAIN_NORM`), while every burst block filters under both. On the 1 kHz sine the attack
+    /// gate's retirement costs nothing (the arc's rule: keep the gate if it cost more than 0.3 dB; measured +0.6 dB).
+    #[test]
+    fn aac_enc_tns_norm() {
+        let (units, norm) = tns_filtered(true, false);
+        let (_, raw) = tns_filtered(false, false);
+        let bursts = [9usize, 10, 11, 19, 20, 21, 28, 29, 30];
+        let tonal: Vec<usize> = (1..units.len()).filter(|u| !bursts.contains(u) && wire_seq(&units[*u]) == 0).collect();
+        let raw_on = tonal.iter().filter(|&&u| raw[u] > 0).count();
+        let norm_on = tonal.iter().filter(|&&u| norm[u] > 0).count();
+        let (sine, sine_b) = sine_with(|_| {});
+        let (sine_381, sine_381_b) = sine_with(|e| { e.tns_norm = false; e.tns_gate = true; });
+        std::println!("aac_enc_tns_norm: stationary tonal units {} filtered raw {raw_on} normalised {norm_on}; burst units raw {:?} normalised {:?}; sine {:.1}/{:.1} dB {sine_b} B (SR381 arm {:.1}/{:.1} dB {sine_381_b} B)",
+            tonal.len(), bursts.map(|u| raw[u]), bursts.map(|u| norm[u]), sine[0], sine[1], sine_381[0], sine_381[1]);
+        assert!(tonal.len() >= 25, "{} stationary units", tonal.len());
+        assert_eq!(raw_on, tonal.len(), "the raw detector filtered {raw_on} of {} stationary tonal units", tonal.len());
+        assert_eq!(norm_on, 0, "the normalised detector filtered {norm_on} stationary tonal units");
+        for u in bursts { assert!(raw[u] > 0 && norm[u] > 0, "burst unit {u}: raw {} normalised {}", raw[u], norm[u]); }
+        for c in 0..2 { assert!(sine[c] >= sine_381[c] - 0.3, "channel {c}: {:.1} dB, the SR381 arm {:.1} dB", sine[c], sine_381[c]); }
+    }
+
+    /// `Psy::Pred` (opt-in, AACENC-PSY-PRED): the tonality from the unpredictability of the MDCT magnitudes over the two
+    /// previous long blocks holds the sine within 0.3 dB of SR381 and the correlated CPE at SR378's one-budget floor, and
+    /// both streams decode. Not the default: measured (SR385) the CPE stream at 8539 bytes, over the bitrate's 8533
+    /// (`aac_enc_cpe_budget`'s bound); the 1 kHz tone's MDCT magnitudes cycle every 3 blocks, which a magnitude-only
+    /// two-block prediction reads as partly chaotic (AACENC-PSY-PRED-DEFAULT owed).
+    #[test]
+    fn aac_enc_psy_pred() {
+        let (sine, sine_b) = sine_with(|e| e.psy = Psy::Pred);
+        let (u, bytes, cpe) = correlated_psy(true, true, Psy::Pred);
+        let cap = 128000 * u.len() * 1024 / 48000 / 8;
+        std::println!("aac_enc_psy_pred: sine {:.1}/{:.1} dB {sine_b} B; correlated one budget {:.1}/{:.1} dB {bytes} bytes, the bitrate's {cap}", sine[0], sine[1], cpe[0], cpe[1]);
+        for c in 0..2 { assert!(sine[c] >= SINE_SR381[c] - 0.3, "channel {c}: Pred {:.1} dB, SR381 {:.1}", sine[c], SINE_SR381[c]); }
+        for c in 0..2 { assert!(cpe[c] >= CPE_SR378, "channel {c}: Pred {:.1} dB, SR378 {CPE_SR378}", cpe[c]); }
     }
 }
