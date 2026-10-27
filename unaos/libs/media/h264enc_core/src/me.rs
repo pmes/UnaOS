@@ -3,7 +3,9 @@
 //
 //! Inter macroblocks: motion vector prediction (8.4.1.3) and the P_Skip motion (8.4.1.1) over
 //! whole-macroblock partitions, an integer-sample full search in a +-[`SEARCH`] window over the
-//! encoder's own reconstruction of the previous frame, and the P_Skip / P_L0_16x16 decision.
+//! encoder's own reconstruction of the previous frame, its half / quarter-sample refinement
+//! ([`refine`], `Config::subpel`; SR211), and the P_Skip / P_L0_16x16 decision. A refinement
+//! candidate is predicted by `luma_mc` itself, so the search scores the decoder's own samples.
 //! Prediction samples come from h264_core's `inter::luma_mc` / `chroma_mc` (the chroma vector is
 //! the luma vector in eighth chroma samples, as the decoder's `predict` passes it).
 //!
@@ -19,7 +21,7 @@ use crate::nal::se_bits;
 use crate::transform::{code_chroma, fdct16, quant4, recon4};
 use crate::{lambda, Encoder, Kind, MbCode};
 
-/// The integer search range in samples, each direction.
+/// The integer search range in samples, each direction (the refinement adds up to 3/4 sample).
 pub const SEARCH: i32 = 8;
 
 /// The motion of a coded macroblock: refIdxL0 (-1 = not inter / not coded yet) and mvL0.
@@ -120,6 +122,45 @@ pub fn search(src: &Plane, refp: &Plane, px: usize, py: usize, mvp: Mv, lam: u32
     best.1
 }
 
+/// Sub-sample refinement of the 16x16 luma block at (px, py) around the integer vector `mv`:
+/// `depth` 0 returns `mv`; 1 tries its 8 half-sample neighbours; 2 then the 8 quarter-sample
+/// neighbours of the best. Cost = SAD against `luma_mc`'s prediction + `lam` x the bits of mvd
+/// against `mvp`; a candidate wins only with a strictly lower cost.
+pub fn refine(src: &Plane, refp: &Plane, px: usize, py: usize, mv: Mv, mvp: Mv, lam: u32, depth: u8) -> Mv {
+    if depth == 0 {
+        return mv;
+    }
+    let mut buf = [0u8; 256];
+    let mut cost = |m: Mv| -> u32 {
+        let mut c = lam * (se_bits(m.x as i32 - mvp.x as i32) + se_bits(m.y as i32 - mvp.y as i32));
+        luma_mc(refp, px as i32, py as i32, m, 16, 16, &mut buf);
+        for y in 0..16 {
+            let row = (py + y) * src.w + px;
+            for x in 0..16 {
+                c += (src.data[row + x] as i32 - buf[y * 16 + x] as i32).unsigned_abs();
+            }
+        }
+        c
+    };
+    let mut best = (cost(mv), mv);
+    for step in [2i32, 1].into_iter().take(depth.min(2) as usize) {
+        let centre = best.1;
+        for dy in -1..=1 {
+            for dx in -1..=1 {
+                if dx == 0 && dy == 0 {
+                    continue;
+                }
+                let m = Mv::new(centre.x as i32 + dx * step, centre.y as i32 + dy * step);
+                let c = cost(m);
+                if c < best.0 {
+                    best = (c, m);
+                }
+            }
+        }
+    }
+    best.1
+}
+
 impl Encoder {
     /// The motion-compensated prediction of macroblock (mbx, mby) for `mv` from the reference:
     /// luma (16x16) and the two chroma blocks (8x8).
@@ -187,7 +228,7 @@ impl Encoder {
             return code;
         }
         let pred_mv = mvp(&self.motion, self.mb_w, mbx, mby);
-        let mv = search(&self.src[0], &self.refp[0], mbx * 16, mby * 16, pred_mv, lambda(self.qp));
+        let mv = refine(&self.src[0], &self.refp[0], mbx * 16, mby * 16, search(&self.src[0], &self.refp[0], mbx * 16, mby * 16, pred_mv, lambda(self.qp)), pred_mv, lambda(self.qp), self.cfg.subpel.min(2));
         if mv != skip {
             (luma, chroma) = self.inter_pred(mbx, mby, mv);
             code = self.inter_luma(mbx, mby, &luma);

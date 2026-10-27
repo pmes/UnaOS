@@ -54,23 +54,39 @@ fn decode_one(dec: &mut Decoder, au: &Access) -> Frame {
 
 /// Encode `n` frames of `src(t)` with `gop` and decode them back; returns the access units.
 fn round_trip(gop: u32, n: usize, src: impl Fn(usize) -> [Vec<u8>; 3]) -> Vec<Access> {
-    let mut enc = Encoder::new(Config { width: W as u32, height: H as u32, qp: 26, gop }).unwrap();
+    round_trip_cfg(Config { width: W as u32, height: H as u32, qp: 26, gop, ..Default::default() }, n, src, 35.0).0
+}
+
+/// Encode `n` frames of `src(t)` under `cfg` and decode them back: every decoded frame equals the
+/// encoder's reconstruction byte for byte and sits at least `floor` dB from the source. Returns the
+/// access units and the mean luma PSNR.
+fn round_trip_cfg(cfg: Config, n: usize, src: impl Fn(usize) -> [Vec<u8>; 3], floor: f64) -> (Vec<Access>, f64) {
+    let gop = cfg.gop;
+    let mut enc = Encoder::new(cfg).unwrap();
     let mut dec = Decoder::new();
     let mut aus = Vec::new();
+    let mut sum_db = 0.0;
     for t in 0..n {
         let p = src(t);
         let au = enc.encode(&yuv(&p)).unwrap();
         let f = decode_one(&mut dec, &au);
         let rec = enc.reconstruction();
         for c in 0..3 {
-            assert_eq!(f.planes[c].as_slice(), rec[c], "gop {gop} frame {t} plane {c}: decode differs from the reconstruction");
+            assert_eq!(f.planes[c].as_slice(), rec[c], "{cfg:?} frame {t} plane {c}: decode differs from the reconstruction");
             let db = psnr(&f.planes[c], &p[c]);
-            assert!(db >= 35.0, "gop {gop} frame {t} plane {c}: {db:.2} dB < 35");
+            assert!(db >= floor, "{cfg:?} frame {t} plane {c}: {db:.2} dB < {floor}");
         }
-        println!("gop {gop} frame {t}: {} {} bytes, Y {:.2} dB", if au.keyframe { "IDR" } else { "P  " }, au.annexb().len(), psnr(&f.planes[0], &p[0]));
+        let y_db = psnr(&f.planes[0], &p[0]);
+        sum_db += y_db;
+        println!("gop {gop} frame {t}: {} {} bytes, Y {:.2} dB", if au.keyframe { "IDR" } else { "P  " }, au.annexb().len(), y_db);
         aus.push(au);
     }
-    aus
+    (aus, sum_db / n as f64)
+}
+
+/// The bytes of the P access units.
+fn p_bytes(aus: &[Access]) -> usize {
+    aus.iter().filter(|a| !a.keyframe).map(|a| a.annexb().len()).sum()
 }
 
 #[test]
@@ -139,4 +155,71 @@ fn m2_panning_scene_is_followed_by_the_motion_search() {
         let n = au.annexb().len();
         assert!(n * 3 < idr, "pan frame {t}: P {n} bytes not under a third of the IDR's {idr}");
     }
+}
+
+/// A smooth textured scene panning by (1.25, 0.5) samples per frame: a quarter-sample motion the
+/// integer search can only approximate (H264ENC2, SR211).
+fn pan_frac(t: usize) -> [Vec<u8>; 3] {
+    let (ox, oy) = (1.25 * t as f64, 0.5 * t as f64);
+    let tex = |x: f64, y: f64| -> u8 { (128.0 + 50.0 * (x * 0.45).sin() * (y * 0.3).cos() + 30.0 * ((x + 2.0 * y) * 0.21).sin()).round().clamp(0.0, 255.0) as u8 };
+    let mut p = [vec![0u8; W * H], vec![0u8; W * H / 4], vec![0u8; W * H / 4]];
+    for y in 0..H {
+        for x in 0..W {
+            p[0][y * W + x] = tex(x as f64 + ox, y as f64 + oy);
+        }
+    }
+    for y in 0..H / 2 {
+        for x in 0..W / 2 {
+            let (cx, cy) = (2.0 * x as f64 + ox, 2.0 * y as f64 + oy);
+            p[1][y * (W / 2) + x] = (120.0 + 20.0 * (cx * 0.1).sin()).round() as u8;
+            p[2][y * (W / 2) + x] = (130.0 + 20.0 * (cy * 0.12).cos()).round() as u8;
+        }
+    }
+    p
+}
+
+fn cfg(qp: u8, gop: u32, deblock: bool, subpel: u8) -> Config {
+    Config { width: W as u32, height: H as u32, qp, gop, deblock, subpel }
+}
+
+/// H264ENC2 M1 (LEDGER SR211): with the in-loop filter on (idc 0) every I and P frame h264_core
+/// decodes — and deblocks — equals the encoder's filtered reconstruction byte for byte at QP 26
+/// and 40, and on the moving pattern the filter does not lower the mean luma PSNR of the idc 1
+/// run. The textured pan's PSNRs are printed only: a smoothing filter over its genuine hard
+/// checker edges may lose a fraction of a dB (measured -0.08 dB at QP 26).
+#[test]
+fn m1_deblock_qp26_qp40_decode_is_recon() {
+    for (name, scene) in [("moving", frame as fn(usize) -> [Vec<u8>; 3]), ("pan", pan)] {
+        for qp in [26u8, 40] {
+            let floor = if qp <= 26 { 33.0 } else { 20.0 };
+            let (_, off) = round_trip_cfg(cfg(qp, 4, false, 0), 10, scene, floor);
+            let (_, on) = round_trip_cfg(cfg(qp, 4, true, 0), 10, scene, floor);
+            println!("deblock {name} qp {qp}: mean Y {off:.3} dB (idc 1) -> {on:.3} dB (idc 0)");
+            if name == "moving" {
+                assert!(on >= off, "{name} qp {qp}: deblocked mean Y {on:.3} dB below the unfiltered {off:.3} dB");
+            }
+        }
+    }
+}
+
+/// H264ENC2 M2 (LEDGER SR211): the half / quarter-sample refinement decodes to the reconstruction
+/// and shrinks the P frames of a scene moving by fractions of a sample; the integer pan is quoted.
+#[test]
+fn m2_subpel_quarter_shrinks_p_frames() {
+    let (int_aus, _) = round_trip_cfg(cfg(26, 10, false, 0), 6, pan_frac, 35.0);
+    let (half_aus, _) = round_trip_cfg(cfg(26, 10, false, 1), 6, pan_frac, 35.0);
+    let (q_aus, _) = round_trip_cfg(cfg(26, 10, false, 2), 6, pan_frac, 35.0);
+    let (i, h, q) = (p_bytes(&int_aus), p_bytes(&half_aus), p_bytes(&q_aus));
+    println!("pan_frac P bytes: subpel 0 {i}, subpel 1 {h}, subpel 2 {q}");
+    assert!(q < i, "fractional pan: subpel 2 P frames {q} bytes not below subpel 0's {i}");
+    let (pi, _) = round_trip_cfg(cfg(26, 10, false, 0), 6, pan, 35.0);
+    let (pq, _) = round_trip_cfg(cfg(26, 10, false, 2), 6, pan, 35.0);
+    println!("integer pan P bytes: subpel 0 {}, subpel 2 {}", p_bytes(&pi), p_bytes(&pq));
+}
+
+/// H264ENC2 (LEDGER SR211): both tools together still decode to the reconstruction.
+#[test]
+fn m2_deblock_and_subpel_together() {
+    round_trip_cfg(cfg(30, 4, true, 2), 8, pan_frac, 30.0);
+    round_trip_cfg(cfg(30, 4, true, 2), 8, frame, 30.0);
 }

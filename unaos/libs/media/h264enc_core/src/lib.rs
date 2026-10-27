@@ -10,8 +10,19 @@
 //! one slice per picture, constant QP (16..=40). An IDR every `gop` frames, P frames between them
 //! against the previous reconstruction (one reference frame). Macroblocks: Intra_4x4 and
 //! Intra_16x16 (the SAD-cheapest mode of each, chroma likewise) in I slices; P_Skip and
-//! P_L0_16x16 by an integer-sample full search in a +-8 window in P slices. Output as Annex B
-//! byte stream or as avcC samples with the AVCDecoderConfigurationRecord ([`Encoder::avcc`]).
+//! P_L0_16x16 by an integer-sample full search in a +-8 window in P slices, optionally refined to
+//! half / quarter samples (H264ENC2, SR211). With [`Config::deblock`] the slices carry
+//! disable_deblocking_filter_idc 0 and the reconstruction passes h264_core's in-loop filter
+//! before it becomes the reference (else idc 1, unfiltered). Output as Annex B byte stream or as
+//! avcC samples with the AVCDecoderConfigurationRecord ([`Encoder::avcc`]).
+//!
+//! | [`Config`] field | range         | default | effect                                                  |
+//! |------------------|---------------|---------|---------------------------------------------------------|
+//! | `width`, `height`| even, 2..=16384 | (set) | the picture size; cropped from whole macroblocks        |
+//! | `qp`             | 16..=40       | (set)   | constant QPY of every macroblock                        |
+//! | `gop`            | >= 1          | (set)   | an IDR every `gop` frames                               |
+//! | `deblock`        | bool          | false   | idc 0 + h264_core's `deblock_picture` over the recon    |
+//! | `subpel`         | 0 / 1 / 2     | 0       | motion refinement: integer / half / quarter (>2 = 2)    |
 //!
 //! | module          | Recommendation                                                          |
 //! |-----------------|-------------------------------------------------------------------------|
@@ -20,21 +31,23 @@
 //! | [`transform`]   | 8.5 forward: 4x4 core transform, DC Hadamards, quantiser                 |
 //! | [`intra`]       | 8.3 mode decision over h264_core's predictors, 8.3.1.1 mode coding       |
 //! | [`cavlc`]       | 9.2 residual_block_cavlc written, 9.2.1 nC                               |
-//! | [`me`]          | 8.4.1 MV prediction and P_Skip, integer motion search                    |
+//! | [`me`]          | 8.4.1 MV prediction and P_Skip, integer search + sub-sample refinement   |
+//! | [`deblock`]     | 8.7 the facts h264_core's deblocking filter reads, recorded per MB       |
 //!
 //! Shared, never copied: h264_core's `transform` (`LevelScale`, `scale4`, `luma_dc`, `chroma_dc`,
 //! `idct4_add`) is the encoder's reconstruction; its `intra` (`pred_nxn`, `pred_16x16`,
 //! `pred_chroma`, `Edges`) its prediction; its `tables` (coeff_token, total_zeros, run_before,
 //! coded_block_pattern, QPc, zig-zag) its code words; its `inter` (`luma_mc`, `chroma_mc`) and
-//! `picture` (`Plane`, `Mv`) its motion compensation. The reconstruction loop is the decoder's
+//! `picture` (`Plane`, `Mv`) its motion compensation; its `deblock` (`deblock_picture`) its in-loop
+//! filter. The reconstruction loop is the decoder's
 //! arithmetic in the decoder's order, so `h264_core::Decoder` decodes the output to exactly
 //! [`Encoder::reconstruction`] (the KAT). The neighbour rules (availability, predicted intra mode,
 //! nC, mvp) are decoder-private methods there, so they are mirrored here for one slice per
 //! picture; making them shared free fns is owed (H264ENC-NBSHARE).
 //!
-//! Owed (handlers.md §5): rate control (H264ENC-RC), CABAC / Main / High (H264ENC-CABAC), sub-pel
-//! motion (H264ENC-SUBPEL), B-frames (H264ENC-BFRAMES), the in-loop deblocking filter
-//! (H264ENC-DEBLOCK: slices carry disable_deblocking_filter_idc 1), hardware encode (H264ENC-HW).
+//! Owed (handlers.md §5): rate control (H264ENC-RC), CABAC / Main / High (H264ENC-CABAC), the
+//! 16x8 / 8x16 / 8x8 partitions (inside H264ENC-SUBPEL), per-slice filter offsets (inside
+//! H264ENC-DEBLOCK), B-frames (H264ENC-BFRAMES), hardware encode (H264ENC-HW).
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -43,6 +56,7 @@
 extern crate alloc;
 
 pub mod cavlc;
+pub mod deblock;
 pub mod intra;
 pub mod me;
 pub mod nal;
@@ -53,7 +67,7 @@ use alloc::boxed::Box;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use h264_core::picture::{Plane, BLK_X, BLK_Y};
+use h264_core::picture::{MbInfo, Motion, Plane, BLK_X, BLK_Y};
 use h264_core::ps::ScalingMatrices;
 use h264_core::tables::{CBP_INTER, CBP_INTRA, QPC, ZIGZAG4};
 use h264_core::transform::LevelScale;
@@ -89,8 +103,9 @@ impl core::fmt::Display for Error {
 
 pub type Result<T> = core::result::Result<T, Error>;
 
-/// The stream's fixed parameters.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The stream's fixed parameters. `width`, `height`, `qp` and `gop` must be set; the coding tools
+/// after them default off (`..Default::default()` keeps SR197's bytes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Config {
     pub width: u32,
     pub height: u32,
@@ -98,6 +113,12 @@ pub struct Config {
     pub qp: u8,
     /// An IDR picture every `gop` frames (1 = every frame intra).
     pub gop: u32,
+    /// The in-loop deblocking filter (8.7): slices carry disable_deblocking_filter_idc 0 and the
+    /// reconstruction is filtered before it becomes the reference. false = idc 1, unfiltered.
+    pub deblock: bool,
+    /// Motion refinement after the integer search: 0 integer, 1 half, 2 quarter samples (above 2
+    /// is read as 2).
+    pub subpel: u8,
 }
 
 /// One 8-bit 4:2:0 planar input frame, borrowed: the field names of gneiss_pal's
@@ -239,6 +260,10 @@ pub struct Encoder {
     pub(crate) modes: Vec<u8>,
     /// Motion per macroblock of the current P picture.
     pub(crate) motion: Vec<MbMotion>,
+    /// The deblocking filter's per-macroblock facts of the current picture ([`deblock`]).
+    pub(crate) dinfo: Vec<MbInfo>,
+    /// The deblocking filter's per-4x4 motion of the current picture ([`deblock`]).
+    pub(crate) dmo: Motion,
     frames: u64,
     idr_count: u32,
     frame_num: u32,
@@ -283,6 +308,8 @@ impl Encoder {
             nnz: Nnz::new(mb_w, mb_h),
             modes: vec![2; mb_w * mb_h * 16],
             motion: vec![MbMotion::NONE; mb_w * mb_h],
+            dinfo: vec![MbInfo::default(); mb_w * mb_h],
+            dmo: Motion::new(mb_w, mb_h),
             frames: 0,
             idr_count: 0,
             frame_num: 0,
@@ -323,15 +350,17 @@ impl Encoder {
         self.modes.fill(2);
         self.motion.fill(MbMotion::NONE);
         let mut w = BitWriter::new();
-        sps::write_slice_header(&mut w, idr, self.frame_num, self.log2_max_frame_num, self.idr_count & 0xffff);
+        sps::write_slice_header(&mut w, idr, self.frame_num, self.log2_max_frame_num, self.idr_count & 0xffff, self.cfg.deblock);
         let mut run = 0u32;
         for mby in 0..self.mb_h {
             for mbx in 0..self.mb_w {
                 if idr {
                     let code = self.intra_mb(mbx, mby);
                     self.write_mb(&mut w, mbx, mby, &code, false);
+                    self.note_mb(mbx, mby, &code);
                 } else {
                     let code = self.inter_mb(mbx, mby);
+                    self.note_mb(mbx, mby, &code);
                     if code.kind == Kind::PSkip {
                         run += 1;
                     } else {
@@ -348,6 +377,7 @@ impl Encoder {
         w.trailing();
         let slice = nal::nal_unit(3, if idr { nal::NAL_IDR } else { nal::NAL_SLICE }, &w.finish());
         let nals = if idr { vec![self.sps.clone(), self.pps.clone(), slice] } else { vec![slice] };
+        self.deblock();
         self.store_crop();
         core::mem::swap(&mut self.rec, &mut self.refp);
         self.frames += 1;
