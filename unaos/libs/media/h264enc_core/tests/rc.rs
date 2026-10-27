@@ -234,3 +234,36 @@ fn g_cabac_is_smaller_on_the_gop30_scene() {
     println!("cabac gop30: cavlc={a} cabac={b} bytes ({:.1}%)", 100.0 * b as f64 / a as f64);
     assert!(b < a, "the CABAC stream ({b} bytes) is not smaller than the CAVLC one ({a})");
 }
+
+/// H264ENC8X8 (LEDGER SR322): (h) with `transform8x8` the GOP-30 scene (High, Intra_8x8 and the 8x8
+/// transform chosen per macroblock) decodes to the reconstruction byte for byte under both entropy
+/// coders, and is no larger than the same coder's stream without it (both printed); (i) the three
+/// pinned constant-QP streams are unchanged with `transform8x8: false` named.
+#[test]
+fn h_transform8x8_gop30_decodes_and_is_not_larger() {
+    for entropy in [h264enc_core::Entropy::Cavlc, h264enc_core::Entropy::Cabac] {
+        let off = run(Config { entropy, ..base(26) }, &scene, true);
+        let on = run(Config { entropy, transform8x8: true, ..base(26) }, &scene, true);
+        let (a, b) = (off.sizes.iter().sum::<usize>(), on.sizes.iter().sum::<usize>());
+        println!("8x8 gop30 {entropy:?}: off={a} on={b} bytes ({:.1}%)", 100.0 * b as f64 / a as f64);
+        assert!(b <= a, "{entropy:?}: the 8x8 stream ({b} bytes) is larger than the 4x4 one ({a})");
+    }
+}
+
+#[test]
+fn i_transform8x8_off_keeps_the_pinned_bytes() {
+    let off = |c: Config| Config { transform8x8: false, ..c };
+    for (name, cfg, want) in [
+        ("qp26 gop30", off(base(26)), 0x1290_fbb5_41d1_0774u64),
+        ("qp30 gop10 deblock subpel2", off(Config { gop: 10, deblock: true, subpel: 2, ..base(30) }), 0x20e7_2796_bb58_a08b),
+        ("qp36 gop1", off(Config { gop: 1, ..base(36) }), 0x7785_4898_5213_d0db),
+    ] {
+        let mut enc = Encoder::new(cfg).unwrap();
+        let mut samples = Vec::new();
+        for t in 0..N {
+            let p = scene(t);
+            samples.push(enc.encode(&Yuv420 { width: W as u32, height: H as u32, y: &p[0], u: &p[1], v: &p[2], y_stride: W, uv_stride: W / 2 }).unwrap().avcc_sample());
+        }
+        assert_eq!(fnv(&samples), want, "{name}: transform8x8 false moved the pinned bytes");
+    }
+}

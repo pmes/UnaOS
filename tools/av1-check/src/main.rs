@@ -5,7 +5,7 @@
 //!        [--libyuv] (oracle-only: Chromium/libyuv coefficient quantisation)
 //!        [--yuv <out.yuv>]   (raw planes, 16-bit LE per sample, Y then U then V)
 
-use av1_core::image::{decode_avif_planes, decode_obus, planes_to_rgba_with, Conversion, Filters, Upsampling};
+use av1_core::image::{decode_item_planes, decode_obus, planes_to_rgba_with, Conversion, Filters, Upsampling};
 use std::process::ExitCode;
 
 fn crc32(data: &[u8]) -> u32 {
@@ -672,7 +672,7 @@ fn main() -> ExitCode {
         i += 1;
     }
     let t0 = std::time::Instant::now();
-    let planes = if args[1].ends_with(".obu") { decode_obus(&input, &[], filters) } else { decode_avif_planes(&input, filters) };
+    let planes = if args[1].ends_with(".obu") { decode_obus(&input, &[], filters).map_err(|e| e.to_string()) } else { heif_planes(&input, filters) };
     let planes = match planes {
         Ok(p) => p,
         Err(e) => {
@@ -736,4 +736,21 @@ fn main() -> ExitCode {
     }
     std::fs::write(&args[2], png_rgba(img.w, img.h, &img.rgba)).expect("write png");
     ExitCode::SUCCESS
+}
+
+/// HEIFONE-RETIRE (LEDGER SR318): an AVIF file's primary `av01` item to planes. demux_core's HEIF reader (THE item walk;
+/// av1_core's own retired) finds the item and av1_core's `decode_item_planes` decodes its forwarded fields. A `grid`
+/// primary is refused by name: av1-check checks ONE coded item's planes (gneiss_pal's `decode_heif` composites grids).
+fn heif_planes(file: &[u8], filters: Filters) -> Result<av1_core::image::Planes, String> {
+    use demux_core::heif::{self, ItemKind};
+    let h = heif::parse_heif(file).map_err(|e| format!("heif: {e:?}"))?;
+    let item = h.item(h.primary).ok_or("heif: primary item missing")?;
+    match item.kind {
+        ItemKind::Av01 => {}
+        ItemKind::Grid => return Err("primary item is a grid: av1-check decodes one av01 item (a grid is decode_heif's)".into()),
+        k => return Err(format!("primary item is {k:?}, not av01")),
+    }
+    let data = h.data(file, item).map_err(|e| format!("heif: {e:?}"))?;
+    let nclx = item.nclx.map(|n| (n.colour_primaries, n.transfer_characteristics, n.matrix_coefficients, n.full_range));
+    decode_item_planes(&data, item.av1c.as_deref(), item.ispe, nclx, filters).map_err(|e| e.to_string())
 }

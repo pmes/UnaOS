@@ -25,83 +25,14 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 use super::glyph::{GlyphEntry, GlyphLabel};
-use bandy::{PrefValue, SMessage, Synapse};
+use bandy::{SMessage, Synapse};
 
-/// The pane's panels, as the engine labels them (`aether::devtools::Panel::label`); AETHERDEVTOOLS3
-/// (SR128) adds Sources, in the engine's tab order.
-pub const PANELS: [&str; 7] = ["Elements", "Console", "Sources", "Network", "Storage", "Performance", "Accessibility"];
-
-/// AETHERDEVTOOLS3 (SR128): the (url, line) a pane text line names when it is a V8-shaped frame
-/// (`    at fn (url:line:col)`, `    at url:line:col`) — the face's half of a frame click; the engine's own
-/// reading is `aether::devtools::sources::frame_target`, the same grammar. The click itself waits on a bus
-/// verb carrying it to `DevTools::goto` (bandy has none yet: named in the SR128 row).
-pub fn goto_target(line: &str) -> Option<(String, u32)> {
-    let t = line.trim();
-    let rest = t.strip_prefix("at ")?.trim_end();
-    let loc = match (rest.strip_suffix(')'), rest.rfind(" (")) {
-        (Some(r), Some(k)) => &r[k + 2..],
-        _ => rest,
-    };
-    let mut it = loc.rsplitn(3, ':');
-    let _col: u32 = it.next()?.parse().ok()?;
-    let n: u32 = it.next()?.parse().ok()?;
-    let file = it.next().filter(|f| !f.is_empty() && !f.contains(char::is_whitespace))?;
-    Some((file.to_string(), n))
-}
-
-/// Principia's spelling of a dock side (`aether.devtools.dock`): true = under the page.
-pub fn dock_from_pref(v: &str) -> bool {
-    v.eq_ignore_ascii_case("bottom")
-}
-
-pub fn dock_pref(bottom: bool) -> &'static str {
-    if bottom { "bottom" } else { "right" }
-}
-
-/// The pane's share (percent of the dock axis) for a splitter at `pos` of `total` px, rounded.
-pub fn share_from_position(pos: i32, total: i32) -> u32 {
-    if total <= 0 {
-        return 0;
-    }
-    let pane = (total - pos.clamp(0, total)) as i64;
-    ((pane * 100 + total as i64 / 2) / total as i64) as u32
-}
-
-/// The `Paned` position for a layout: the page rect's extent along the dock axis.
-pub fn paned_position(bottom: bool, page: (u32, u32, u32, u32)) -> i32 {
-    (if bottom { page.3 } else { page.2 }) as i32
-}
-
-/// Whether the splitter at `current` is already where a layout puts it (within 1 % of `total`): a
-/// drag's own echo is not snapped back.
-pub fn splitter_settled(current: i32, target: i32, total: i32) -> bool {
-    (current - target).abs() <= (total / 100).max(1)
-}
-
-/// The dock side the person chose last (Principia `aether.devtools.dock`, else its schema default).
-pub fn stored_dock() -> bool {
-    let Ok(store) = principia::prefs::PrefStore::load(principia::default_prefs_path()) else { return false };
-    if let Some(PrefValue::Str(s)) = store.get("aether", "devtools.dock") {
-        return dock_from_pref(&s);
-    }
-    match store.effective("aether", "devtools.dock", |k| std::env::var(k).ok()) {
-        Some((PrefValue::Str(s), _)) => dock_from_pref(&s),
-        _ => false,
-    }
-}
-
-/// Store the dock side in Principia (only into a store that loaded: a failed load never writes over the
-/// person's other `aether` choices).
-pub fn store_dock(bottom: bool) {
-    match principia::prefs::PrefStore::load(principia::default_prefs_path()) {
-        Ok(mut store) => {
-            if let Err(e) = store.set("aether", "devtools.dock", PrefValue::Str(dock_pref(bottom).to_string())) {
-                log::warn!("[aether] devtools dock not stored: {e}");
-            }
-        }
-        Err(e) => log::warn!("[aether] devtools dock not stored (prefs did not load): {e}"),
-    }
-}
+// AETHERMACDEVTOOLS (SR312): the pane's rules and verbs are `widgets::devtools_rows`' (both faces read them); the
+// names stay re-exported here so `devtools_view::stored_dock` and the rest keep their paths.
+pub use crate::widgets::devtools_rows::{
+    dock_from_pref, dock_pref, goto_target, paned_position, share_from_position, splitter_settled, store_dock, stored_dock, PANELS,
+};
+use crate::widgets::devtools_rows::{eval_msg, toggle_key};
 
 /// The page and the pane, split.
 pub struct DevtoolsView {
@@ -182,9 +113,8 @@ pub fn bootstrap_devtools(synapse: Synapse, page: &gtk4::Widget) -> DevtoolsView
     {
         let syn = synapse.clone();
         eval.connect_activate(move |e| {
-            let line = e.text();
-            if !line.trim().is_empty() {
-                syn.fire(SMessage::BrowserDevtoolsEval(line));
+            if let Some(m) = eval_msg(&e.text()) {
+                syn.fire(m);
                 e.set_text("");
             }
         });
@@ -256,7 +186,7 @@ pub fn bootstrap_devtools(synapse: Synapse, page: &gtk4::Widget) -> DevtoolsView
     {
         let syn = synapse.clone();
         close.connect_clicked(move |_| {
-            syn.fire(SMessage::BrowserDevtoolsKey { key: "F12".into(), ctrl: false, shift: false, alt: false });
+            syn.fire(toggle_key());
         });
     }
 
@@ -297,40 +227,4 @@ pub fn bootstrap_devtools(synapse: Synapse, page: &gtk4::Widget) -> DevtoolsView
     });
 
     DevtoolsView { root: overlay.upcast(), paned, pane }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The face's half of the split: a layout's page rect places the splitter, a drag at that place reads
-    /// back the share the model split by, a drag's echo within 1 % is not snapped, and the dock side
-    /// round-trips through Principia's spelling.
-    #[test]
-    fn splitter_position_and_share_round_trip() {
-        // Right dock, 40 % of 1000 x 800: the page is 600 wide, the pane 400.
-        assert_eq!(paned_position(false, (0, 0, 600, 800)), 600);
-        assert_eq!(share_from_position(600, 1000), 40);
-        // Bottom dock, 15 % of 800 high: the page is 680 high.
-        assert_eq!(paned_position(true, (0, 0, 1000, 680)), 680);
-        assert_eq!(share_from_position(680, 800), 15);
-        assert_eq!(share_from_position(0, 0), 0);
-        assert_eq!(share_from_position(-5, 100), 100);
-        assert!(splitter_settled(605, 600, 1000));
-        assert!(!splitter_settled(620, 600, 1000));
-        assert!(dock_from_pref(dock_pref(true)) && !dock_from_pref(dock_pref(false)));
-        assert!(!dock_from_pref("left"));
-    }
-
-    /// AETHERDEVTOOLS3 (SR128): the Sources tab is the third, and a frame line reads back its url and line.
-    #[test]
-    fn sources_tab_and_frame_targets() {
-        assert_eq!(PANELS.len(), 7);
-        assert_eq!(PANELS[2], "Sources");
-        assert_eq!(goto_target("    at boom (https://a.test/index.html:3:9)"), Some(("https://a.test/index.html".to_string(), 3)));
-        assert_eq!(goto_target("    at https://a.test/app.js:12:1"), Some(("https://a.test/app.js".to_string(), 12)));
-        assert_eq!(goto_target("    at new C (https://a.test/c.js:4:20)"), Some(("https://a.test/c.js".to_string(), 4)));
-        assert_eq!(goto_target("    at inner (t.js)"), None);
-        assert_eq!(goto_target("x Uncaught Error: boom"), None);
-    }
 }

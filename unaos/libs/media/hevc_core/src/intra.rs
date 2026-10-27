@@ -215,7 +215,7 @@ pub fn predict(pic: &mut Picture, geo: &Geometry, c: usize, x0: usize, y0: usize
     let plane = &mut pic.planes[c];
     for y in 0..n {
         for x in 0..n {
-            plane.set(x0 + x, y0 + y, pred[y * n + x] as u8);
+            plane.set(x0 + x, y0 + y, pred[y * n + x] as u16);
         }
     }
 }

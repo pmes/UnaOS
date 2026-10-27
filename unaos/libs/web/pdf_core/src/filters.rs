@@ -6,7 +6,8 @@
 //! FlateDecode is pixel_core's inflater (`zlib_inflate`, and `inflate_raw` when the zlib header is refused — the
 //! http_core rule); this module adds no DEFLATE decoder of its own. Real files carry Flate streams whose Adler-32 is
 //! wrong or missing, or that stop short: the bytes already produced are kept, as every reader does. The predictors
-//! (§7.4.4.4: TIFF 2, PNG 10-15) live here because pixel_core's PNG unfilter is private (PIXEL-UNFILTER is owed).
+//! (§7.4.4.4): PNG 10-15 runs on pixel_core's `png::unfilter_rows` (PIXEL-UNFILTER SR316; the PDF lenient rules —
+//! an unknown filter type reads as None, a short last row is kept — stay here); TIFF 2 lives here (pixel_core has none).
 //! The image codecs (DCT, JPX, CCITTFax, JBIG2) are not decoded here: decoding stops at the first one and the
 //! result carries the raw bytes and the filter's name (PDF2 decodes DCT through pixel_core::jpeg).
 
@@ -72,7 +73,7 @@ pub fn decode(stream: &Stream, resolve: &dyn Fn(&Object) -> Object) -> Result<De
                 };
                 return Ok(Decoded { data: cur, image_filter: Some(full.to_vec()), image_parms: parm });
             }
-            b"Crypt" => return Err(Error::Unsupported("Crypt filter (PDF-CRYPT)")),
+            b"Crypt" => cur, // PDFCRYPT (SR315): the security handler decrypted this stream on resolve (crypt.rs)
             _ => return Err(Error::Unsupported("stream filter")),
         };
         if cur.len() > MAX_DECODED {
@@ -154,7 +155,7 @@ pub fn predict(data: &[u8], predictor: i64, colors: usize, bpc: usize, columns: 
     match predictor {
         1 => Ok(data.to_vec()),
         2 => Ok(tiff(data, row, colors, bpc)),
-        10..=15 => Ok(png(data, row, (colors * bpc).div_ceil(8).max(1))),
+        10..=15 => png(data, row, (colors * bpc).div_ceil(8).max(1)),
         _ => Err(Error::Unsupported("predictor")),
     }
 }
@@ -203,42 +204,27 @@ fn tiff(data: &[u8], row: usize, colors: usize, bpc: usize) -> Vec<u8> {
     out
 }
 
-fn paeth(a: u8, b: u8, c: u8) -> u8 {
-    let p = a as i16 + b as i16 - c as i16;
-    let (pa, pb, pc) = ((p - a as i16).abs(), (p - b as i16).abs(), (p - c as i16).abs());
-    if pa <= pb && pa <= pc {
-        a
-    } else if pb <= pc {
-        b
-    } else {
-        c
-    }
-}
-
-fn png(data: &[u8], row: usize, bpp: usize) -> Vec<u8> {
-    let mut out = Vec::with_capacity(data.len());
-    let mut prev = vec![0u8; row];
-    for chunk in data.chunks(row + 1) {
-        let kind = chunk[0];
-        let src = &chunk[1..];
-        let mut cur = vec![0u8; src.len()];
-        for i in 0..src.len() {
-            let a = if i >= bpp { cur[i - bpp] } else { 0 };
-            let b = prev[i];
-            let c = if i >= bpp { prev[i - bpp] } else { 0 };
-            cur[i] = src[i].wrapping_add(match kind {
-                1 => a,
-                2 => b,
-                3 => ((a as u16 + b as u16) / 2) as u8,
-                4 => paeth(a, b, c),
-                // 0, and an unknown type, read as None.
-                _ => 0,
-            });
+/// PNG predictors 10-15 through pixel_core's ONE unfilter. PDF policy around it: an unknown filter type reads as None
+/// (remapped to 0 first), a short trailing row is unfiltered and kept (the shared fn's last-row rule), and the
+/// filter-type bytes are dropped from the output.
+fn png(data: &[u8], row: usize, bpp: usize) -> Result<Vec<u8>, Error> {
+    let stride = row + 1;
+    let mut buf = data.to_vec();
+    for i in (0..buf.len()).step_by(stride) {
+        if buf[i] > 4 {
+            buf[i] = 0;
         }
-        out.extend_from_slice(&cur);
-        prev[..cur.len()].copy_from_slice(&cur);
     }
-    out
+    pixel_core::png::unfilter_rows(bpp, stride, &mut buf).map_err(|_| Error::Unsupported("predictor"))?;
+    let mut w = 0usize;
+    for i in 0..buf.len() {
+        if i % stride != 0 {
+            buf[w] = buf[i];
+            w += 1;
+        }
+    }
+    buf.truncate(w);
+    Ok(buf)
 }
 
 /// §7.4.4.2 LZWDecode: MSB-first codes of 9 to 12 bits, 256 = clear, 257 = end of data. With `early` the code width

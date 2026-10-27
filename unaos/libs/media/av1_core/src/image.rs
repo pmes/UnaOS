@@ -1,8 +1,8 @@
 //! Frame orchestration (§7.4 decode_frame_wrapup for intra frames: deblock → CDEF → loop
-//! restoration → output), and the `pixel_core`-shaped entry point `decode_avif` that converts the
-//! decoded Y'CbCr planes to 8-bit RGBA using the AVIF `colr`/nclx (or sequence header) matrix.
+//! restoration → output), the `av01` item decode `decode_item_planes` (the container read by demux_core's HEIF
+//! reader), and `planes_to_rgba`, which converts the decoded Y'CbCr planes to 8-bit RGBA using the AVIF `colr`/nclx
+//! (or sequence header) matrix.
 
-use crate::avif::avif_payload;
 use crate::cdf::CdfContext;
 use crate::decode::{Dec, FrameState, ToolStats};
 use crate::obu::*;
@@ -417,28 +417,25 @@ fn output_planes(seq: &SequenceHeader, hdr: &FrameHeader, lr: &[crate::decode::P
     }
 }
 
-/// Decode an AVIF file's primary item to planes (container colour info applied to the fields).
-pub fn decode_avif_planes(file: &[u8], filters: Filters) -> Result<Planes> {
-    let item = avif_payload(file)?;
-    let cfg = item.av1c.as_ref().map(|c| c.config_obus.as_slice()).unwrap_or(&[]);
-    let ispe = (item.width != 0).then_some((item.width, item.height));
-    let nclx = item.nclx.map(|n| (n.colour_primaries, n.transfer_characteristics, n.matrix_coefficients, n.full_range));
-    decode_item_planes(&item.data, cfg, ispe, nclx, filters)
-}
-
 /// HEIFONE (LEDGER SR303): decode one `av01` image item's bytes (a low-overhead OBU stream) to planes, whatever read the
-/// container (this crate's [`crate::avif`] walk, or demux_core's HEIF reader on the host). `config_obus` are the av1C
-/// record's configOBUs; `ispe` the item's spatial extents — when the first shown frame is not that size the item is a
-/// layered image and the last shown frame of the `ispe` size is presented; `nclx` the container's `colr` (primaries,
-/// transfer, matrix, full range), which is authoritative for presentation (AVIF §2.2.1).
+/// container (demux_core's HEIF reader: HEIFONE-RETIRE SR318 retired this crate's own walk). `av1c` is the item's raw
+/// AV1CodecConfigurationRecord (parsed here for its configOBUs, [`crate::avif::Av1Config`]); `ispe` the item's spatial
+/// extents (a width of 0 is no `ispe`) — when the first shown frame is not that size the item is a layered image and the
+/// last shown frame of the `ispe` size is presented; `nclx` the container's `colr` (primaries, transfer, matrix, full
+/// range), which is authoritative for presentation (AVIF §2.2.1). A container caller only forwards its item's fields.
 pub fn decode_item_planes(
     data: &[u8],
-    config_obus: &[u8],
+    av1c: Option<&[u8]>,
     ispe: Option<(u32, u32)>,
     nclx: Option<(u16, u16, u16, bool)>,
     filters: Filters,
 ) -> Result<Planes> {
-    let cfg = config_obus;
+    let config_obus = match av1c {
+        Some(rec) => crate::avif::Av1Config::parse(rec)?.config_obus,
+        None => Vec::new(),
+    };
+    let cfg = config_obus.as_slice();
+    let ispe = ispe.filter(|&(w, _)| w != 0);
     let mut p = decode_obus(data, cfg, filters)?;
     if let Some((iw, ih)) = ispe.filter(|&(iw, ih)| iw != p.width || ih != p.height) {
         // A layered image (a1lx / a1op / lsel): the item holds several frames, the upper spatial
@@ -496,7 +493,7 @@ fn kr_kb(mc: u8) -> Option<(f64, f64)> {
 /// How the Y'CbCr → R'G'B' matrix is evaluated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Conversion {
-    /// The H.273 equations in floating point (what `decode_avif` uses).
+    /// The H.273 equations in floating point (what the AVIF still path, gneiss_pal `decode_heif`, uses).
     Exact,
     /// ORACLE ONLY: the same equations with the chroma coefficients quantised the way libyuv
     /// (Chromium's converter) stores them — 6 fractional bits in an int8, so a coefficient above
@@ -619,12 +616,6 @@ pub fn planes_to_rgba_with(p: &Planes, up: Upsampling, conv: Conversion) -> Imag
 fn libm_floor(x: f64) -> f64 {
     let t = x as i64 as f64;
     if t > x { t - 1.0 } else { t }
-}
-
-/// The `pixel_core` entry point: an AVIF file to 8-bit RGBA.
-pub fn decode_avif(file: &[u8]) -> Result<Image> {
-    let p = decode_avif_planes(file, Filters::default())?;
-    Ok(planes_to_rgba(&p, Upsampling::Bilinear))
 }
 
 /// DEMUXSEEK (LEDGER SR200): the reorder depth of an AV1 track from its AV1CodecConfigurationRecord (`av1C`, Matroska

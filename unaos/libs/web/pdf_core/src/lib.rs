@@ -20,8 +20,10 @@
 //!   (/EarlyChange), ASCIIHexDecode, ASCII85Decode, RunLengthDecode; the image codecs (DCT, JPX, CCITTFax, JBIG2)
 //!   pass through as raw bytes with their filter name kept.
 //! * [`doc`]: [`Document::parse`], `resolve` (object cache, object streams), the page tree with inherited attributes
-//!   ([`Page`]), the /Info strings. /Encrypt is refused by name ([`Error::Encrypted`]; PDF-CRYPT is owed).
+//!   ([`Page`]), the /Info strings; an /Encrypt dictionary is opened by [`crypt`] ([`Document::parse_with_password`]).
 //! * [`content`]: the content-stream TOKENIZER (operands + operator, inline images) — PDF2 interprets it.
+//! * [`render`]: PDF2 (SR313) — the content interpreter (§8: graphics state, paths, clips, colour spaces, functions,
+//!   images, shadings, form XObjects) painting through svg_core's rasterizer; `Page::render`; text goes to a `TextSink`.
 //! * [`font`]: PDF3 (SR314) — font dictionaries, encodings and CMaps, glyph outlines through font_core, text extraction.
 //!
 //! Everything is bounded: nesting and reference chains by [`MAX_DEPTH`], object counts by [`MAX_OBJECTS`], every
@@ -38,7 +40,9 @@ pub mod filters;
 pub mod lexer;
 pub mod object;
 pub mod xref;
+pub mod render;
 pub mod font;
+pub mod crypt;
 
 pub use doc::{Document, Info, Page, XrefKind};
 pub use object::{Dict, Object, Ref, Stream};
@@ -57,7 +61,8 @@ pub const MAX_PAGES: usize = 1 << 20;
 pub enum Error {
     /// The bytes are not the syntax the spec names; the reason and the byte offset.
     Syntax(&'static str, usize),
-    /// The trailer names /Encrypt: the standard security handler is PDF-CRYPT (owed).
+    /// The trailer names an /Encrypt dictionary this core cannot read (a standard dictionary with a missing or short
+    /// /O or /U, or an unknown /V or /R).
     Encrypted,
     /// A feature this core does not read yet, by name.
     Unsupported(&'static str),
@@ -71,19 +76,22 @@ pub enum Error {
     Missing,
     /// FlateDecode refused the stream; pixel_core's reason.
     Inflate(&'static str),
+    /// The password opens the file neither as its user nor as its owner (PDFCRYPT SR315, `crypt`).
+    Password,
 }
 
 impl core::fmt::Display for Error {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Error::Syntax(why, at) => write!(f, "syntax: {why} at byte {at}"),
-            Error::Encrypted => f.write_str("encrypted (PDF-CRYPT owed)"),
+            Error::Encrypted => f.write_str("encrypted with an /Encrypt dictionary this core cannot read"),
             Error::Unsupported(what) => write!(f, "unsupported: {what}"),
             Error::Depth => f.write_str("nesting too deep"),
             Error::TooLarge => f.write_str("over a size cap"),
             Error::Loop => f.write_str("reference loop"),
             Error::Missing => f.write_str("required object missing"),
             Error::Inflate(why) => write!(f, "inflate: {why}"),
+            Error::Password => f.write_str("password: neither the user nor the owner password"),
         }
     }
 }

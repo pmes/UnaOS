@@ -27,3 +27,9 @@ pub mod telemetry;
 
 // AETHERMACCHROME (SR205): the browser chrome face's rows and text from the Browser* wire (every target; host-tested).
 pub mod chrome_rows;
+
+// AETHERMACDEVTOOLS (SR312): the Console's rows, the developer-tools pane's rules and verbs, the accessibility rows and
+// F6 order (every target; host-tested; GTK and AppKit both read them).
+pub mod console_rows;
+pub mod devtools_rows;
+pub mod a11y_rows;

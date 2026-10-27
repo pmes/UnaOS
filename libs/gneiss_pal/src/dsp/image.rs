@@ -28,7 +28,7 @@ pub use demux_core::heif::is_avif;
 /// intra; the `hevc` feature) and the ONE YCbCr->RGB conversion of the HEVC face, [`super::video::Frame::to_rgba`]
 /// (BT.601 limited range; a full-range picture — `colr` nclx's flag, else the stream's VUI — is first mapped into
 /// limited range); `av01` through av1_core (`decode_item_planes`, the `av1` feature) and the AV1 face's conversion,
-/// `av1_core::image::planes_to_rgba` with bilinear chroma (the one `decode_avif` and `dsp::video::av1` use: any matrix,
+/// `av1_core::image::planes_to_rgba` with bilinear chroma (the one `dsp::video::av1` uses: any matrix,
 /// range, depth and subsampling; so an AVIF still's pixels are av1_core's own). A `grid` item's tiles are composited
 /// row-major into its canvas and cut to the grid's output size, then the primary item's `clap` and `irot` apply in
 /// association order (`irot` through [`Image::apply_orientation`]). Refused by name: 10-bit HEVC (HEVCMAIN10 — most
@@ -131,9 +131,9 @@ fn heif_tile(
     }
 }
 
-/// HEIFONE (SR303): one `av01` item to straight RGBA: the av1C record's configOBUs, av1_core's `decode_item_planes`
-/// (the layered-image pick and the container's nclx are av1_core's), then `planes_to_rgba` with bilinear chroma — the
-/// same pixels `av1_core::image::decode_avif` gives.
+/// HEIFONE (SR303): one `av01` item to straight RGBA: its fields forwarded to av1_core's `decode_item_planes` (the av1C
+/// record's configOBUs, the layered-image pick and the container's nclx are av1_core's; HEIFONE-RETIRE SR318), then
+/// `planes_to_rgba` with bilinear chroma — the pixels av1_core's retired `decode_avif` gave, byte for byte.
 #[cfg(feature = "av1")]
 fn avif_tile(
     h: &demux_core::heif::Heif,
@@ -146,13 +146,9 @@ fn avif_tile(
     if let Some((w, ht)) = ispe {
         heic_dims(w, ht)?;
     }
-    let cfg = match item.av1c.as_deref() {
-        Some(rec) => av1_core::avif::Av1Config::parse(rec).map_err(avif_err)?.config_obus,
-        None => Vec::new(),
-    };
     let nclx = item.nclx.or(fallback).map(|n| (n.colour_primaries, n.transfer_characteristics, n.matrix_coefficients, n.full_range));
     let data = h.data(bytes, item).map_err(heic_demux_err)?;
-    let p = decode_item_planes(&data, &cfg, ispe, nclx, Filters::default()).map_err(avif_err)?;
+    let p = decode_item_planes(&data, item.av1c.as_deref(), ispe, nclx, Filters::default()).map_err(avif_err)?;
     heic_dims(p.width, p.height)?;
     let img = planes_to_rgba(&p, Upsampling::Bilinear);
     Ok((img.w, img.h, img.rgba))
@@ -535,8 +531,8 @@ mod avif_tests {
         img.rgba[o..o + 4].try_into().unwrap()
     }
 
-    /// FNV-1a 64 of the RGBA the OLD path (`av1_core::image::decode_avif`, av1_core's own item walk) gives for the
-    /// two KAT files, pinned before decode_heif existed.
+    /// FNV-1a 64 of the RGBA the OLD path (`av1_core::image::decode_avif`, av1_core's own item walk, retired by
+    /// HEIFONE-RETIRE SR318) gave for the two KAT files, pinned before decode_heif existed.
     const WHITE_FNV: u64 = 0x2fa3_2458_7145_aacb;
     const PIXI_FNV: u64 = 0x0aca_7e31_0b81_f28e;
 
@@ -544,19 +540,16 @@ mod avif_tests {
     fn avif_stills_are_av1_cores_own_pixels() {
         for (f, w, h, pin) in [(white_avif(), 1, 1, WHITE_FNV), (pixi_avif(), 4, 4, PIXI_FNV)] {
             assert!(is_avif(&f));
-            let old = av1_core::image::decode_avif(&f).unwrap();
-            assert_eq!((old.w, old.h, fnv(&old.rgba)), (w, h, pin), "the old path moved");
             let new = decode_heif(&f).unwrap();
             assert_eq!((new.width, new.height, new.orientation, new.frames.is_none()), (w, h, 1, true));
-            assert_eq!(new.rgba, old.rgba, "decode_heif is byte-identical to decode_avif");
+            assert_eq!(fnv(&new.rgba), pin, "decode_heif is byte-identical to the retired decode_avif");
         }
     }
 
     #[test]
     fn avif_grid_2x2_composites_a_new_capability() {
         let f = grid_2x2_avif();
-        // av1_core's own walk refuses a grid primary; decode_heif composites it.
-        assert_eq!(av1_core::image::decode_avif(&f), Err(av1_core::Error::Unsupported("AVIF grid item")));
+        // av1_core's retired walk refused a grid primary; decode_heif composites it.
         let tile = decode_heif(&pixi_avif()).unwrap();
         let g = decode_heif(&f).unwrap();
         assert_eq!((g.width, g.height), (7, 6));

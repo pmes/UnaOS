@@ -249,7 +249,7 @@ impl Viewer {
                 (self.render(), None)
             }
             FacetCommand::ImageRendered { receipt_id, width, height, rgba, .. } if self.want_frame == Some(*receipt_id) => {
-                let blit = SMessage::SurfaceBlit { url: SURFACE.into(), width: *width, height: *height, pixels: rgba.clone() };
+                let blit = SMessage::SurfaceBlit { url: SURFACE.into(), width: *width, height: *height, pixels: rgba.clone(), damage: None };
                 (Vec::new(), Some(blit))
             }
             FacetCommand::ImageExported { path, .. } => {

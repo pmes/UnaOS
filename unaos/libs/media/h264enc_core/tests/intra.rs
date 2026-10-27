@@ -290,3 +290,69 @@ fn cabac_every_intra_scene_decodes_to_the_reconstruction() {
         }
     }
 }
+
+/// H264ENC8X8 (LEDGER SR322): with `transform8x8` (High) every intra scene above, under both entropy
+/// coders, at QP 16 / 26 / 40 with the filter off and on, decodes to the encoder's reconstruction
+/// byte for byte; the flat frame stays bit-exact to the source; the textured scene takes Intra_8x8
+/// somewhere (its reconstruction leaves the knob-off one: with no 8x8 chosen the decisions and the
+/// reconstruction are SR197's). Bytes printed against the knob off.
+#[test]
+fn t8x8_every_intra_scene_decodes_to_the_reconstruction() {
+    let scenes = [("smooth", smooth(64, 48)), ("flat", flat(64, 48, [144, 144, 112])), ("textured", textured(64, 48)), ("crop", smooth(50, 34))];
+    for (name, img) in &scenes {
+        let mut took = 0;
+        for entropy in [h264enc_core::Entropy::Cavlc, h264enc_core::Entropy::Cabac] {
+            for qp in [16u8, 26, 40] {
+                for deblock in [false, true] {
+                    let base = Config { width: img.w as u32, height: img.h as u32, qp, gop: 1, deblock, entropy, ..Default::default() };
+                    let mut off = Encoder::new(base).unwrap();
+                    let off_au = off.encode(&img.yuv()).unwrap();
+                    let mut enc = Encoder::new(Config { transform8x8: true, ..base }).unwrap();
+                    let au = enc.encode(&img.yuv()).unwrap();
+                    let mut dec = Decoder::new();
+                    let f = decode_one(&mut dec, &au);
+                    assert_decode_is_recon(&f, &enc, img.w, img.h);
+                    if enc.reconstruction() != off.reconstruction() {
+                        took += 1;
+                    }
+                    if *name == "flat" && qp == 26 && !deblock {
+                        for c in 0..3 {
+                            assert_eq!(f.planes[c], img.p[c], "8x8 {entropy:?} flat plane {c} not bit-exact");
+                        }
+                    }
+                    println!("8x8 intra {name} {entropy:?} qp {qp} deblock {deblock}: off={} on={} bytes", off_au.annexb().len(), au.annexb().len());
+                }
+            }
+        }
+        println!("8x8 intra {name}: Intra_8x8 moved the reconstruction in {took} of 12 encodes");
+        if *name == "textured" {
+            assert!(took > 0, "the textured scene never took Intra_8x8");
+        }
+    }
+}
+
+/// H264ENC8X8 (LEDGER SR322): the High parameter sets read back through h264_core under both entropy
+/// coders: profile_idc 100 with no constraint flags, chroma_format_idc 1, 8-bit, no scaling lists
+/// (SPS or PPS), transform_8x8_mode_flag 1; the avcC carries profile 100 and the High extension.
+#[test]
+fn t8x8_high_parameter_sets_read_back() {
+    let img = smooth(64, 48);
+    for entropy in [h264enc_core::Entropy::Cavlc, h264enc_core::Entropy::Cabac] {
+        let mut enc = Encoder::new(Config { width: 64, height: 48, qp: 26, gop: 1, entropy, transform8x8: true, ..Default::default() }).unwrap();
+        let au = enc.encode(&img.yuv()).unwrap();
+        let mut rbsp = Vec::new();
+        nal::unescape(&au.nals[0][1..], &mut rbsp);
+        assert_eq!(rbsp[1], 0, "High: no constraint flags");
+        let sps = ps::parse_sps(&rbsp).unwrap();
+        assert_eq!((sps.profile_idc, sps.chroma_format_idc, sps.bit_depth_luma, sps.bit_depth_chroma, sps.seq_scaling_present), (100, 1, 8, 8, false));
+        nal::unescape(&au.nals[1][1..], &mut rbsp);
+        let pps = ps::parse_pps(&rbsp, |_| 1).unwrap();
+        assert!(pps.transform_8x8_mode && !pps.pic_scaling_present);
+        assert_eq!(pps.cabac, entropy == h264enc_core::Entropy::Cabac);
+        assert_eq!(pps.chroma_qp_offset, [0, 0]);
+        let avcc = enc.avcc();
+        let c = nal::parse_avcc(&avcc).unwrap();
+        assert_eq!(c.profile_idc, 100);
+        assert_eq!(&avcc[avcc.len() - 4..], &[0xFD, 0xF8, 0xF8, 0], "the avcC High extension");
+    }
+}

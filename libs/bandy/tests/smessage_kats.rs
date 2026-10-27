@@ -282,8 +282,21 @@ kat!(
         width: 2,
         height: 1,
         pixels: vec![1, 2, 3, 4, 5, 6, 7, 8],
+        damage: None,
     },
     r#"{"SurfaceBlit":{"url":"https://una.os/","width":2,"height":1,"pixels":[1,2,3,4,5,6,7,8]}}"#
+);
+// AETHERMACGPU-DAMAGE (SR320): a damage blit carries only the rect's rows (here row 1 of a 2x2 frame) and names the rect.
+kat!(
+    kat_surface_blit_damage,
+    SMessage::SurfaceBlit {
+        url: "viewport".to_string(),
+        width: 2,
+        height: 2,
+        pixels: vec![5, 6, 7, 8, 1, 2, 3, 4],
+        damage: Some((0, 1, 2, 1)),
+    },
+    r#"{"SurfaceBlit":{"url":"viewport","width":2,"height":2,"pixels":[5,6,7,8,1,2,3,4],"damage":[0,1,2,1]}}"#
 );
 kat!(
     kat_play_media,

@@ -48,7 +48,6 @@ name = "aether"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "av1_core",
  "bandy",
  "base64",
  "clap",
@@ -357,6 +356,7 @@ name = "av1-check"
 version = "0.1.0"
 dependencies = [
  "av1_core",
+ "demux_core",
 ]
 
 [[package]]
@@ -376,6 +376,9 @@ dependencies = [
 [[package]]
 name = "av1_core"
 version = "0.1.0"
+dependencies = [
+ "demux_core",
+]
 
 [[package]]
 name = "avif-serialize"
@@ -3498,8 +3501,10 @@ dependencies = [
 name = "pdf_core"
 version = "0.1.0"
 dependencies = [
+ "crypto_core",
  "font_core",
  "pixel_core",
+ "svg_core",
 ]
 
 [[package]]

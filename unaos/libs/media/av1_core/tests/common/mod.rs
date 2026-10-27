@@ -318,3 +318,31 @@ fn sha256_kat() {
     assert_eq!(hex(&sha256(b"abc")), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
     assert_eq!(hex(&sha256(b"")), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
 }
+
+/// HEIFONE-RETIRE (LEDGER SR318): the primary `av01` item of an AVIF file as demux_core's HEIF reader (THE item walk)
+/// returns it: the item's bytes, its raw av1C record, `ispe`, `pixi` and `colr` nclx (primaries, transfer, matrix, full).
+pub struct AvifItem {
+    pub data: Vec<u8>,
+    pub av1c: Option<Vec<u8>>,
+    pub ispe: Option<(u32, u32)>,
+    pub pixi: Option<Vec<u8>>,
+    pub nclx: Option<(u16, u16, u16, bool)>,
+}
+
+/// The primary item of `file` (an `av01` one, else Err).
+pub fn avif_item(file: &[u8]) -> Result<AvifItem, String> {
+    let h = demux_core::heif::parse_heif(file).map_err(|e| format!("heif: {e:?}"))?;
+    let it = h.item(h.primary).ok_or("heif: no primary item")?;
+    if it.kind != demux_core::heif::ItemKind::Av01 {
+        return Err(format!("primary item is {:?}, not av01", it.kind));
+    }
+    let data = h.data(file, it).map_err(|e| format!("heif: {e:?}"))?;
+    let nclx = it.nclx.map(|n| (n.colour_primaries, n.transfer_characteristics, n.matrix_coefficients, n.full_range));
+    Ok(AvifItem { data, av1c: it.av1c.clone(), ispe: it.ispe, pixi: it.pixi.clone(), nclx })
+}
+
+/// An AVIF file's primary item decoded to planes: [`avif_item`]'s fields forwarded to av1_core's `decode_item_planes`.
+pub fn avif_planes(file: &[u8], filters: av1_core::image::Filters) -> Result<av1_core::image::Planes, String> {
+    let it = avif_item(file)?;
+    av1_core::image::decode_item_planes(&it.data, it.av1c.as_deref(), it.ispe, it.nclx, filters).map_err(|e| format!("{e}"))
+}

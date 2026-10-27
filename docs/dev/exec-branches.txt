@@ -864,5 +864,17 @@ refs/heads/exec-rmbp-gneisspalnostd   9bbbfa121 FOLDED-BY-HAND (this commit) 202
 refs/heads/exec-rmbp-nle4bkernel   0e0b7d856 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-aethermacgpu   667c333dd FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-h264enccabac   706bf9b6e FOLDED-BY-HAND (this commit) 2026-10-27
-refs/heads/exec-rmbp-hevcmain10   e8ed82064 IN-FLIGHT cut 2026-10-27
-refs/heads/exec-rmbp-aethermacdevtools   e8ed82064 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-hevcmain10   dbcff7094 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-aethermacdevtools   f3c5334d5 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-pdf2   5a65c0d63 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-pdf3   db1ebf8fb IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-pdfcrypt   3817105a7 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-pixelunfilter   119610687 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-rsfixed   daf87bfb8 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-heifoneretire   68abd678d FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-meterplayer   bb52f8dfe FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-aethermacgpudamage   98a53fa76 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-hevcconf   12930de7d FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-h264enc8x8   e5a7667f3 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-stationroam   52c0b238d FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-nle3cblack   f5dd95c24 FOLDED-BY-HAND (this commit) 2026-10-27

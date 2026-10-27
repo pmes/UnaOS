@@ -537,48 +537,7 @@ fn pass_dims(w: usize, h: usize, x0: usize, y0: usize, dx: usize, dy: usize) -> 
 /// `1 + row_bytes(w)` bytes, each starting with its filter-type byte; the first line's "previous
 /// line" is all zeros.
 fn unfilter(h: &Header, w: usize, rows: usize, data: &mut [u8]) -> Result<(), Error> {
-    let rb = h.row_bytes(w);
-    let stride = rb + 1;
-    let bpp = h.filter_bpp();
-    for y in 0..rows {
-        let (before, cur) = data.split_at_mut(y * stride);
-        let prev: &[u8] = if y == 0 { &[] } else { &before[(y - 1) * stride + 1..y * stride] };
-        let ft = cur[0];
-        let line = &mut cur[1..stride];
-        let up = |i: usize| -> u8 { if prev.is_empty() { 0 } else { prev[i] } };
-        match ft {
-            0 => {}
-            1 => {
-                for i in bpp..rb {
-                    line[i] = line[i].wrapping_add(line[i - bpp]);
-                }
-            }
-            2 => {
-                if !prev.is_empty() {
-                    for i in 0..rb {
-                        line[i] = line[i].wrapping_add(prev[i]);
-                    }
-                }
-            }
-            3 => {
-                for i in 0..rb {
-                    let a = if i >= bpp { line[i - bpp] as u16 } else { 0 };
-                    let b = up(i) as u16;
-                    line[i] = line[i].wrapping_add(((a + b) >> 1) as u8);
-                }
-            }
-            4 => {
-                for i in 0..rb {
-                    let a = if i >= bpp { line[i - bpp] } else { 0 };
-                    let b = up(i);
-                    let c = if i >= bpp { up(i - bpp) } else { 0 };
-                    line[i] = line[i].wrapping_add(paeth(a, b, c));
-                }
-            }
-            _ => return Err(Error::Malformed("png filter type")),
-        }
-    }
-    Ok(())
+    unfilter_rows(h.filter_bpp(), h.row_bytes(w) + 1, &mut data[..rows * (h.row_bytes(w) + 1)])
 }
 
 /// The Paeth predictor (§9.4), exactly as the spec writes it — the tie order is part of the format.
@@ -665,3 +624,58 @@ fn expand_row(h: &Header, pal: &[[u8; 4]], trns: &Trns, line: &[u8], w: usize, o
     }
 }
 
+/// PIXEL-UNFILTER (LEDGER SR316): reverse the PNG per-scanline filters in place (§9.2–9.4), Header-free.
+/// `data` is lines of `stride` bytes (`1 + ` the row's bytes), each starting with its filter-type byte; `bpp` is the
+/// filter's bytes per complete pixel (at least 1). The first line's "previous line" is all zeros. The LAST line may be
+/// short (a filter byte and fewer bytes: a PDF predictor stream that stops mid-row); its "previous line" is the full
+/// line before it. An unknown filter type is `Error::Malformed("png filter type")`. pixel_core's own decoder passes
+/// exactly `rows * stride` bytes; pdf_core's PNG predictor (§7.4.4.4, 10-15) runs on this fn.
+pub fn unfilter_rows(bpp: usize, stride: usize, data: &mut [u8]) -> Result<(), Error> {
+    if stride == 0 {
+        return Ok(());
+    }
+    let mut start = 0usize;
+    while start < data.len() {
+        let end = (start + stride).min(data.len());
+        let (before, rest) = data.split_at_mut(start);
+        let prev: &[u8] = if start == 0 { &[] } else { &before[start - stride + 1..] };
+        let cur = &mut rest[..end - start];
+        let ft = cur[0];
+        let line = &mut cur[1..];
+        let rb = line.len();
+        let up = |i: usize| -> u8 { if prev.is_empty() { 0 } else { prev[i] } };
+        match ft {
+            0 => {}
+            1 => {
+                for i in bpp..rb {
+                    line[i] = line[i].wrapping_add(line[i - bpp]);
+                }
+            }
+            2 => {
+                if !prev.is_empty() {
+                    for i in 0..rb {
+                        line[i] = line[i].wrapping_add(prev[i]);
+                    }
+                }
+            }
+            3 => {
+                for i in 0..rb {
+                    let a = if i >= bpp { line[i - bpp] as u16 } else { 0 };
+                    let b = up(i) as u16;
+                    line[i] = line[i].wrapping_add(((a + b) >> 1) as u8);
+                }
+            }
+            4 => {
+                for i in 0..rb {
+                    let a = if i >= bpp { line[i - bpp] } else { 0 };
+                    let b = up(i);
+                    let c = if i >= bpp { up(i - bpp) } else { 0 };
+                    line[i] = line[i].wrapping_add(paeth(a, b, c));
+                }
+            }
+            _ => return Err(Error::Malformed("png filter type")),
+        }
+        start = end;
+    }
+    Ok(())
+}

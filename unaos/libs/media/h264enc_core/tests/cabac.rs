@@ -11,7 +11,7 @@
 //! scenes: tests/intra.rs, pframes.rs and rc.rs (`cabac_*`, `e_` / `f_` / `g_`).
 
 use h264_core::bits::BitReader;
-use h264_core::cabac::{Cabac, CAT_CHROMA_AC, CAT_CHROMA_DC, CAT_LUMA_4X4, CAT_LUMA_AC, CAT_LUMA_DC, NUM_CTX};
+use h264_core::cabac::{Cabac, CAT_CHROMA_AC, CAT_CHROMA_DC, CAT_LUMA_4X4, CAT_LUMA_8X8, CAT_LUMA_AC, CAT_LUMA_DC, NUM_CTX};
 use h264_core::nal;
 use h264_core::ps::{self, SliceType};
 use h264enc_core::cabac::Writer;
@@ -184,5 +184,61 @@ fn c_parameter_sets_read_back_main_cabac() {
         for b in sh.data_bit..sh.data_bit.div_ceil(8) * 8 {
             assert_eq!((rbsp[b / 8] >> (7 - b % 8)) & 1, 1, "cabac_alignment_one_bit at bit {b}");
         }
+    }
+}
+
+/// H264ENC8X8 (LEDGER SR322): residual_block_cabac for ctxBlockCat 5 (an 8x8 luma block: 64 levels,
+/// the significance map over h264_core's `SIG_COEFF_8X8_FRAME` / `LAST_COEFF_8X8` at ctxIdxOffsets 402
+/// / 417 / 426) read back level for level by the decoder's own `residual_block(CAT_LUMA_8X8, 64)`:
+/// 300 pseudo-random blocks of every density, levels up to 4000, the last-position-only block and a
+/// DC-only block, in I (column 0) and P (column 1) context sets.
+#[test]
+fn d_cat5_residual_blocks_round_trip_through_the_decoders_residual_block() {
+    let mut rng = Rng(0x0bad_cafe);
+    for (column, qp) in [(0usize, 26i32), (1, 34)] {
+        let mut blocks = Vec::new();
+        for n in 0..300 {
+            let mut l = vec![0i32; 64];
+            let density = 1 + rng.next() % 16;
+            for v in l.iter_mut() {
+                let r = rng.next();
+                if r % 32 < density {
+                    let mag = match (r >> 8) % 10 {
+                        0..=5 => 1,
+                        6..=8 => 2 + (r >> 12) % 14,
+                        _ => 15 + (r >> 12) % 4000,
+                    };
+                    *v = if (r >> 30) & 1 == 1 { -(mag as i32) } else { mag as i32 };
+                }
+            }
+            if n % 50 == 0 {
+                l = vec![0; 64];
+                l[63] = -3; // the last position alone: the inferred-last path
+            } else if n % 50 == 1 {
+                l = vec![0; 64];
+                l[0] = 77; // DC only
+            } else if l.iter().all(|&v| v == 0) {
+                l[5] = 1;
+            }
+            blocks.push(l);
+        }
+        let mut w = BitWriter::new();
+        let mut c = Writer::new(&mut w, column, qp, 1);
+        for l in &blocks {
+            c.residual_block(&mut w, CAT_LUMA_8X8, 64, l);
+        }
+        c.terminate(&mut w, true);
+        w.u((8 - w.bits() as u32 % 8) % 8, 0);
+        let data = w.finish();
+        let mut d = Cabac::new(&data, 0);
+        d.init_contexts(column, qp);
+        let mut buf = [0i32; 64];
+        for (n, l) in blocks.iter().enumerate() {
+            let nz = d.residual_block(CAT_LUMA_8X8, 64, &mut buf);
+            assert_eq!(&buf[..], l.as_slice(), "column {column} block {n}");
+            assert_eq!(nz as usize, l.iter().filter(|&&v| v != 0).count());
+        }
+        assert_eq!(d.terminate(), 1);
+        println!("cat 5 column {column} qp {qp}: {} blocks in {} bytes", blocks.len(), data.len());
     }
 }

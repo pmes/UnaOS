@@ -516,7 +516,7 @@ impl Face {
     /// The canvas as the surface's blit.
     pub fn frame(&mut self) -> SMessage {
         let (width, height) = self.canvas;
-        SMessage::SurfaceBlit { url: SURFACE.into(), width, height, pixels: self.paint() }
+        SMessage::SurfaceBlit { url: SURFACE.into(), width, height, pixels: self.paint(), damage: None }
     }
 }
 
@@ -1065,11 +1065,11 @@ const GLYPHS: [[u8; 7]; 6] = [
 fn glyph(kind: TransitionKind) -> &'static [u8; 7] {
     &GLYPHS[match kind {
         TransitionKind::Dissolve => 0,
-        TransitionKind::Wipe(WipeDir::LeftToRight) => 1,
-        TransitionKind::Wipe(WipeDir::TopToBottom) => 2,
-        TransitionKind::Wipe(WipeDir::Diagonal) => 3,
-        TransitionKind::Wipe(WipeDir::Box) => 4,
-        TransitionKind::Wipe(WipeDir::Clock) => 5,
+        TransitionKind::Wipe(WipeDir::LeftToRight | WipeDir::BarnDoorVertical) => 1,
+        TransitionKind::Wipe(WipeDir::TopToBottom | WipeDir::BarnDoorHorizontal) => 2,
+        TransitionKind::Wipe(WipeDir::Diagonal | WipeDir::DiagonalTopRight) => 3,
+        TransitionKind::Wipe(WipeDir::Box | WipeDir::CornerTopLeft | WipeDir::CornerTopRight | WipeDir::CornerBottomRight | WipeDir::CornerBottomLeft) => 4,
+        TransitionKind::Wipe(WipeDir::Clock | WipeDir::ClockThree | WipeDir::ClockSix | WipeDir::ClockNine) => 5,
     }]
 }
 
@@ -1108,7 +1108,7 @@ pub fn transition_mid(x: &Transition) -> i64 {
 }
 
 /// Every transition's widget: the bracket (outlined white when selected), its kind glyph and, from black, a black
-/// marker on its outgoing (left) edge.
+/// marker on its outgoing (left) edge; NLE3cBLACK: to black, one on its incoming (right) edge.
 fn paint_transitions(c: &mut Canvas, l: Layout, st: &EditorState) {
     for (row, tr) in st.timeline.tracks.iter().enumerate().take(l.rows) {
         for (i, x) in tr.transitions.iter().enumerate() {
@@ -1124,6 +1124,7 @@ fn paint_transitions(c: &mut Canvas, l: Layout, st: &EditorState) {
             } else {
                 x0 + 2
             };
+            if x.to_black { c.rect((x1 - 4).max(x0 + 1), y0 + 1, x1 - 1, y1 - 1, FIELD); } // NLE3cBLACK: the to-black marker
             for (dy, bits) in glyph(x.kind).iter().enumerate() {
                 for dx in 0..7i64 {
                     if bits & (0x40 >> dx) != 0 && gx + dx < x1 - 1 {
@@ -1365,7 +1366,7 @@ mod tests {
 
         // The Face: preview band 48 px high (144 - 16 - 2 x 40), so the 64x48 frame lands 1:1 at x = (320 - 64) / 2.
         let mut face = Face::new(st, src, (320, 144), PixelOrder::Rgba, false);
-        let SMessage::SurfaceBlit { url, width, height, pixels } = face.frame() else { panic!("not a blit") };
+        let SMessage::SurfaceBlit { url, width, height, pixels, .. } = face.frame() else { panic!("not a blit") };
         assert_eq!((url.as_str(), width, height, pixels.len()), (SURFACE, 320, 144, 320 * 144 * 4));
         let still = face.still().expect("a still").clone();
         let mut crop = Vec::with_capacity(64 * 48 * 4);
@@ -1881,6 +1882,29 @@ mod tests {
 
     /// `nle3d_widget_paint_golden`'s hash, measured by the test's first run (FNV-1a 64 of the 320x160 RGBA paint).
     const GOLDEN_TRANSITIONS: &str = "9b5278f1281cd494";
+
+    /// NLE3cBLACK (SR323): a 5-tick dissolve TO black on B's end at 20 (the gap 20..25): its widget spans x 160..200 at
+    /// zoom 8 with the black marker on its right (incoming) edge; `[` keeps it a to-black; golden.
+    #[test]
+    fn nle3cblack_to_black_marker_golden() {
+        let (mut st, _) = state();
+        st.timeline = st.timeline.add_transition_to_black(0, 20, TransitionKind::Dissolve, 5).unwrap();
+        let l = Layout::of(320, 160, &st);
+        assert_eq!(l.transition_rect(0, &st.timeline.tracks[0].transitions[0]), (160, 108, 200, 118));
+        let rgba = paint(&st, 320, 160, PixelOrder::Rgba, None, None);
+        let at = |x: usize, y: usize| &rgba[(y * 320 + x) * 4..(y * 320 + x) * 4 + 4];
+        assert_eq!(at(160, 108), TRANS, "the widget's outline");
+        assert_eq!(at(197, 112), FIELD, "the to-black marker");
+        assert_eq!(at(194, 112), TRANS_FILL, "the bracket left of the marker");
+        assert_eq!(at(162, 110), TRANS, "the dissolve glyph's corner");
+        assert_eq!(format!("{:016x}", fnv1a(&rgba)), GOLDEN_TO_BLACK);
+        st.select_transition(0, 0).unwrap();
+        st.set_transition_dur(4).unwrap();
+        assert_eq!(st.selected_transition().map(|x| (x.at, x.dur, x.to_black)), Some((20, 4, true)));
+    }
+
+    /// `nle3cblack_to_black_marker_golden`'s hash, measured by the test's first run (FNV-1a 64 of the 320x160 RGBA paint).
+    const GOLDEN_TO_BLACK: &str = "7c909fba68bf567e";
 }
 
 // ---------------------------------------------------------------------------------------------------------------------

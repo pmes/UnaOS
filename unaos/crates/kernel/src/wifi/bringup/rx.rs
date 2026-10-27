@@ -329,7 +329,7 @@ fn take(buf: u64, s: &mut Seen, ch: u16, raw_rows: &mut u32, tag: &str) -> usize
     if len < start + 24 + FCS_LEN {
         return 1;
     }
-    let frame = copy_out(buf + (FRAMEOFFSET + start) as u64, len - start - FCS_LEN); #[cfg(feature = "wifi10")] super::join::hear(&frame, &mut s.join); #[cfg(feature = "wifi10")] super::super::data::keep(&frame, s.me, &mut s.data);
+    let frame = copy_out(buf + (FRAMEOFFSET + start) as u64, len - start - FCS_LEN); #[cfg(feature = "wifi10")] super::join::hear(&frame, super::super::data::ht_power(&hdr), &mut s.join); #[cfg(feature = "wifi10")] super::super::data::keep(&frame, s.me, &mut s.data);
     // FC byte 0: type bits 3:2 = 0 (management), subtype bits 7:4 = 8 (beacon) — IEEE 802.11 §9.2.4.1.
     if (frame[0] >> 2) & 0x3 == 0 && (frame[0] >> 4) == 0x8 {
         if let Some(b) = wifi_core::ieee80211::parse_beacon(&frame) {
@@ -529,4 +529,17 @@ pub(super) fn station_filter(bar0: u64, bssid: [u8; 6], w: &mut Writes) -> (u32,
     macctl_w(bar0, station_macctl(pre), w);
     let post = unsafe { r32(bar0, D11_MACCTL) };
     (pre, post)
+}
+
+// ── STATIONROAM (rmbp-ledger B897): the scan window widens the station's filter to every BSS's beacons ─────────────────
+
+/// From `join::roam_step` / `join::associate`: BEACPROMISC on (`open`) or off, every other MACCTL bit kept — b43's scan shape
+/// (FIF_BCN_PRBRESP_PROMISC, `main.c:3131-3132`): other BSSIDs' beacons pass the BSSID filter while unicast data to us still
+/// passes the station's own filter, so the current association is not dropped; PROMISC and KEEP_BAD stay off. Through the
+/// one MACCTL writer `macctl_w`, read-modify-written live as `station_filter` does. Returns the post-image.
+#[cfg(feature = "wifi10")]
+pub(super) fn scan_filter(bar0: u64, open: bool, w: &mut Writes) -> u32 {
+    let pre = unsafe { r32(bar0, D11_MACCTL) };
+    macctl_w(bar0, if open { pre | MACCTL_BEACPROMISC } else { pre & !MACCTL_BEACPROMISC }, w);
+    unsafe { r32(bar0, D11_MACCTL) }
 }

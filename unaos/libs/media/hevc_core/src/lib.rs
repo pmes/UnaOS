@@ -20,6 +20,7 @@
 //! | [`picture`]     | the picture under decoding and the per-block facts the loop filters read        |
 //! | [`deblock`]     | 8.7.2 deblocking filter                                                         |
 //! | [`sao`]         | 8.7.3 sample adaptive offset                                                    |
+//! | [`sei`]         | 7.3.5 sei_message, D.2.19 / D.3.19 the decoded picture hash (HEVCCONF SR321)     |
 //! | [`dpb`]         | 8.3.2 reference picture set, 8.3.4 reference picture lists, C.5.2 DPB output    |
 //! | [`inter`]       | 8.5.3 merge / AMVP / TMVP, 8-tap / 4-tap interpolation, weighted prediction      |
 //! | [`decoder`]     | access units, 8.3.1 POC, NoRaslOutputFlag, C.5.2 output order, the API          |
@@ -54,7 +55,7 @@
 //! The inter elements' slots are already laid out and initialised (initTypes 1 and 2) so the inter arc only adds the
 //! syntax.
 //!
-//! Decoded: Main and Main Still Picture streams at 8-bit 4:2:0 made of I, P and B slices — CTB 16/32/64 down
+//! Decoded: Main, Main 10 (HEVCMAIN10 SR311: 16-bit sample planes) and Main Still Picture streams at 8- and 10-bit 4:2:0 made of I, P and B slices — CTB 16/32/64 down
 //! to an 8x8 CU, 2Nx2N and NxN intra, I_PCM, the 35 intra modes with strong intra smoothing, the 4x4 DST and the
 //! 4..32 DCTs with scaling lists, transform skip, cu_transquant_bypass, sign data hiding, cu_qp_delta, chroma QP
 //! offsets, tiles, wavefront (entropy_coding_sync) and dependent slice segments, deblocking, SAO, the conformance
@@ -63,7 +64,7 @@
 //! deblocking bS 0 / 1 from motion.
 //!
 //! Refused by name ([`Error::Unsupported`]): constrained_intra_pred_flag in P / B slices (HEVCINTER-CIP), bit depths
-//! above 8 (HEVCMAIN10), chroma other than 4:2:0, separate colour planes, every range-extension and screen-content
+//! above 10 or unequal luma / chroma bit depths (HEVCREXT), chroma other than 4:2:0, separate colour planes, every range-extension and screen-content
 //! tool. Layers above the base (nuh_layer_id > 0) are ignored.
 
 #![no_std]
@@ -87,6 +88,7 @@ pub mod nal;
 pub mod picture;
 pub mod ps;
 pub mod sao;
+pub mod sei;
 pub mod slice;
 pub mod tables;
 pub mod transform;

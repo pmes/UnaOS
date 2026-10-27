@@ -244,3 +244,28 @@ fn cabac_every_p_scene_decodes_to_the_reconstruction() {
         }
     }
 }
+
+/// H264ENC8X8 (LEDGER SR322): every scene above with `transform8x8` (High: Intra_8x8 in the IDRs, the
+/// P macroblocks on the 4x4 transform with transform_size_8x8_flag 0 written after a luma
+/// coded_block_pattern), under both entropy coders, decodes frame by frame to the encoder's
+/// reconstruction byte for byte: the moving pattern (GOP 10 and 4), the static sequence, the pans
+/// with the filter and the refinement. Bytes printed against the knob off.
+#[test]
+fn t8x8_every_p_scene_decodes_to_the_reconstruction() {
+    for entropy in [h264enc_core::Entropy::Cavlc, h264enc_core::Entropy::Cabac] {
+        let on = |c: Config| Config { entropy, transform8x8: true, ..c };
+        let off = |c: Config| Config { entropy, ..c };
+        for gop in [10u32, 4] {
+            round_trip_cfg(on(cfg(26, gop, false, 0)), 10, frame, 35.0);
+        }
+        round_trip_cfg(on(cfg(26, 10, false, 0)), 5, |_| frame(0), 35.0);
+        for (name, scene) in [("moving", frame as fn(usize) -> [Vec<u8>; 3]), ("pan", pan), ("pan_frac", pan_frac)] {
+            for (qp, deblock, subpel, floor) in [(16u8, false, 0u8, 35.0), (26, true, 2, 33.0), (40, false, 1, 20.0), (30, true, 2, 30.0)] {
+                let (a, _) = round_trip_cfg(off(cfg(qp, 4, deblock, subpel)), 8, scene, floor);
+                let (b, _) = round_trip_cfg(on(cfg(qp, 4, deblock, subpel)), 8, scene, floor);
+                let bytes = |aus: &[Access]| aus.iter().map(|a| a.annexb().len()).sum::<usize>();
+                println!("8x8 {entropy:?} {name} qp {qp} deblock {deblock} subpel {subpel}: off={} on={} bytes", bytes(&a), bytes(&b));
+            }
+        }
+    }
+}

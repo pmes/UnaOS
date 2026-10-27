@@ -12,6 +12,8 @@
 //! * [`Sinc`] — the QUALITY path (NLE4B, the render's): a Kaiser-windowed sinc (beta [`BETA`], [`TAPS`] taps, more going
 //!   down, cutoff [`CUTOFF`] of the lower rate), its table of [`PHASES`] + 1 rows built at construction and linearly
 //!   interpolated between rows; position-addressed ([`Sinc::at`]) or streamed over caller buffers ([`Sinc::process`]).
+//!   Its i16 face ([`Sinc::process_i16`], RSFIXED SR317) runs the same stream in integers: a Q30 copy of the table and
+//!   an i64 multiply-accumulate, no f32 in the loop (the kernel's soft-float target).
 //! * [`linear`] — the CHEAP path: interpolation between the two neighbouring source frames. It aliases on the way down
 //!   and dulls the top octave on the way up.
 
@@ -79,9 +81,12 @@ pub struct Sinc {
     /// Taps per phase (even; 1 at equal rates) and `(PHASES + 1) * taps` coefficients, row `r` at phase `r / PHASES`.
     taps: usize,
     table: Vec<f32>,
-    /// The streaming form's state: source frames from `hist_at` on, the next output frame, the frames fed, and (after
-    /// `flush`) the real stream length.
+    /// RSFIXED (SR317): the same rows in Q30 (`1 << 30` = 1.0), read by the i16 form's integer kernel.
+    fixed: Vec<i32>,
+    /// The streaming form's state: source frames from `hist_at` on (`hist` for the f32 form, `hist16` for the i16
+    /// form; a stream is fed by ONE form), the next output frame, the frames fed, and (after `flush`) the real length.
     hist: Vec<f32>,
+    hist16: Vec<i16>,
     hist_at: i64,
     next: i64,
     fed: i64,
@@ -101,8 +106,8 @@ impl Sinc {
         let (from, to, ch) = (from.max(1), to.max(1), ch.max(1));
         let g = gcd(from, to);
         let (rf, rt) = (from / g, to / g);
-        let (taps, table) = if rf == rt {
-            (1, alloc::vec![1.0f32; PHASES + 1])
+        let (taps, (table, fixed)) = if rf == rt {
+            (1, (alloc::vec![1.0f32; PHASES + 1], alloc::vec![1i32 << 30; PHASES + 1]))
         } else {
             let mut t = TAPS;
             if rf > rt {
@@ -111,7 +116,7 @@ impl Sinc {
             }
             (t, table(t, CUTOFF * from.min(to) as f64 / from as f64))
         };
-        let mut s = Sinc { rates: (from, to), from: rf, to: rt, ch, taps, table, hist: Vec::new(), hist_at: 0, next: 0, fed: 0, end: None };
+        let mut s = Sinc { rates: (from, to), from: rf, to: rt, ch, taps, table, fixed, hist: Vec::new(), hist16: Vec::new(), hist_at: 0, next: 0, fed: 0, end: None };
         s.reset();
         s
     }
@@ -137,6 +142,8 @@ impl Sinc {
         let b = self.back();
         self.hist.clear();
         self.hist.resize(b as usize * self.ch, 0.0);
+        self.hist16.clear();
+        self.hist16.resize(b as usize * self.ch, 0);
         self.hist_at = -b;
         self.next = 0;
         self.fed = 0;
@@ -160,23 +167,33 @@ impl Sinc {
     /// `(source frames consumed, output frames produced)`. All input is taken (held as history); outputs that did not
     /// fit come on the next call. Two calls over a split stream give the same frames as one over the whole.
     pub fn process(&mut self, input: &[f32], output: &mut [f32]) -> (usize, usize) {
-        let frames = input.len() / self.ch;
-        self.hist.extend_from_slice(&input[..frames * self.ch]);
+        self.feed(input, output)
+    }
+    /// The ONE streaming feed, either form (RSFIXED SR317: generic over [`Form`]).
+    fn feed<T: Form>(&mut self, input: &[T], output: &mut [T]) -> (usize, usize) {
+        let (ch, frames) = (self.ch, input.len() / self.ch);
+        T::hist(self).extend_from_slice(&input[..frames * ch]);
         self.fed += frames as i64;
         (frames, self.produce(output))
     }
     /// End of stream: the window's lookahead is silence, and the outputs run to `ceil(fed * to / from)` frames in all
     /// (the count [`linear`] gives over the same span). Call again while it returns a full `output`.
     pub fn flush(&mut self, output: &mut [f32]) -> usize {
+        self.end(output)
+    }
+    /// The ONE end of stream, either form.
+    fn end<T: Form>(&mut self, output: &mut [T]) -> usize {
         if self.end.is_none() {
             self.end = Some(self.fed);
             let pad = self.delay().max(1) * self.ch;
-            self.hist.resize(self.hist.len() + pad, 0.0);
+            let h = T::hist(self);
+            let n = h.len() + pad;
+            h.resize(n, T::ZERO);
             self.fed += self.delay().max(1) as i64;
         }
         self.produce(output)
     }
-    fn produce(&mut self, output: &mut [f32]) -> usize {
+    fn produce<T: Form>(&mut self, output: &mut [T]) -> usize {
         let (ch, h) = (self.ch, self.delay() as i64);
         let room = output.len() / ch;
         let mut made = 0;
@@ -191,14 +208,14 @@ impl Sinc {
                 break;
             }
             let o = &mut output[made * ch..(made + 1) * ch];
-            o.fill(0.0);
-            self.frame_at(&self.hist, self.hist_at, i, f, o);
+            o.fill(T::ZERO);
+            T::frame(self, T::hist_ref(self), self.hist_at, i, f, o);
             self.next += 1;
             made += 1;
         }
         let (keep, _, _) = linear_pos(self.next, self.from, self.to);
-        let drop = ((keep - self.back() - self.hist_at).max(0) as usize * ch).min(self.hist.len());
-        self.hist.drain(..drop);
+        let drop = ((keep - self.back() - self.hist_at).max(0) as usize * ch).min(T::hist_ref(self).len());
+        T::hist(self).drain(..drop);
         self.hist_at += (drop / ch) as i64;
         made
     }
@@ -223,12 +240,14 @@ impl Sinc {
 
 /// The `(PHASES + 1) x taps` table at cutoff `fc` cycles per source frame: row `r`, tap `j` is the windowed sinc at
 /// distance `d = j - (taps / 2 - 1) - r / PHASES` source frames, `2 fc sinc(2 fc d) I0(BETA sqrt(1 - (d / h)^2)) /
-/// I0(BETA)`, each row scaled to a unity sum (DC passes at every phase).
-fn table(taps: usize, fc: f64) -> Vec<f32> {
+/// I0(BETA)`, each row scaled to a unity sum (DC passes at every phase). Returned twice from the same f64 rows: as f32
+/// and (RSFIXED SR317) as Q30 i32, rounded half away from zero.
+fn table(taps: usize, fc: f64) -> (Vec<f32>, Vec<i32>) {
     use crate::math::{PI, bessel_i0, sin, sqrt};
     let h = (taps / 2) as f64;
     let norm = bessel_i0(BETA);
     let mut out = Vec::with_capacity((PHASES + 1) * taps);
+    let mut q30 = Vec::with_capacity((PHASES + 1) * taps);
     let mut row = alloc::vec![0.0f64; taps];
     for r in 0..=PHASES {
         let frac = r as f64 / PHASES as f64;
@@ -242,8 +261,12 @@ fn table(taps: usize, fc: f64) -> Vec<f32> {
             sum += *v;
         }
         out.extend(row.iter().map(|v| (v / sum) as f32));
+        q30.extend(row.iter().map(|v| {
+            let q = v / sum * (1u64 << 30) as f64;
+            (if q >= 0.0 { q + 0.5 } else { q - 0.5 }) as i32
+        }));
     }
-    out
+    (out, q30)
 }
 
 #[cfg(test)]
@@ -278,13 +301,13 @@ mod tests {
     // ---- NLE4B (SR222): the windowed sinc ----
 
     /// A sine of `hz` at `rate` Hz, amplitude 1, `n` frames (the angle reduced exactly in integers).
-    fn tone(hz: u64, rate: u64, n: usize) -> Vec<f32> {
+    pub(super) fn tone(hz: u64, rate: u64, n: usize) -> Vec<f32> {
         use crate::math::{PI, sin};
         (0..n as u64).map(|i| sin(2.0 * PI * ((hz * i) % rate) as f64 / rate as f64) as f32).collect()
     }
 
     /// |DFT| of `x` at `hz`, `x` taken at `rate` Hz (bin-centred: `x.len()` is the rate).
-    fn bin(x: &[f32], hz: u64, rate: u64) -> f64 {
+    pub(super) fn bin(x: &[f32], hz: u64, rate: u64) -> f64 {
         use crate::math::{PI, sincos, sqrt};
         let (mut re, mut im) = (0.0f64, 0.0f64);
         for (i, &v) in x.iter().enumerate() {
@@ -295,13 +318,13 @@ mod tests {
         sqrt(re * re + im * im)
     }
 
-    fn db(x: f64) -> f64 {
+    pub(super) fn db(x: f64) -> f64 {
         20.0 * crate::math::log10(x)
     }
 
     /// Image rejection (dB) of a `hz` tone taken 48 kHz -> 44.1 kHz by `conv`: its bin over the worse image bin
     /// (`48k -+ hz` folded at 44.1 kHz), over exactly one second of interior output (output frames 1000..45100).
-    fn rejection(hz: u64, conv: impl Fn(&[f32]) -> Vec<f32>) -> f64 {
+    pub(super) fn rejection(hz: u64, conv: impl Fn(&[f32]) -> Vec<f32>) -> f64 {
         let out = conv(&tone(hz, 48_000, 52_800));
         assert_eq!(out.len(), 44_100);
         let fold = |f: u64| if f % 44_100 > 22_050 { 44_100 - f % 44_100 } else { f % 44_100 };
@@ -406,69 +429,96 @@ mod tests {
 }
 
 // ---- NLE4BKERNEL (rmbp-ledger B896): the streaming form over interleaved i16, for the kernel's mixer ----
-// The ONE i16 <-> f32 conversion of the kernel's converters: the mixer's source ingest (any rate -> 48 kHz) and its A2DP
-// output (48 -> 44.1 kHz) call these, never `process` with their own conversion. Alloc-free: the samples cross in
-// stack chunks of `I16_CHUNK` samples (so at most `I16_CHUNK` channels); an output rounds half away from zero and
-// saturates to i16 (never wraps).
-
-/// Samples per stack chunk of [`Sinc::process_i16`] / [`Sinc::flush_i16`] (also their channel limit).
-pub const I16_CHUNK: usize = 64;
+// The ONE i16 face of the kernel's converters: the mixer's source ingest (any rate -> 48 kHz) and its A2DP output
+// (48 -> 44.1 kHz) call these. RSFIXED (SR317): they run the stream machine on an i16 history through `frame_q`, the
+// Q30 integer kernel (no f32 anywhere, no chunking, any channel count); an output rounds half away from zero and
+// saturates to i16 (never wraps), within 1 LSB of the f32 form's rounded frames.
 
 impl Sinc {
     /// [`Sinc::process`] over interleaved i16: all of `input`'s whole frames are taken, and as many ready output frames
     /// as fit are written into `output` (`(source frames consumed, output frames produced)`); outputs that did not fit
-    /// come on the next call (`input` may then be empty). Bit-for-bit the f32 form's frames, rounded.
+    /// come on the next call (`input` may then be empty). Integer arithmetic; within 1 LSB of the f32 form, rounded.
     pub fn process_i16(&mut self, input: &[i16], output: &mut [i16]) -> (usize, usize) {
-        let ch = self.ch;
-        let step = (I16_CHUNK / ch).max(1);
-        let (frames, room_all) = (input.len() / ch, output.len() / ch);
-        let (mut fi, mut fo) = ([0.0f32; I16_CHUNK], [0.0f32; I16_CHUNK]);
-        let (mut took, mut made) = (0usize, 0usize);
-        loop {
-            let n = (frames - took).min(step);
-            for (d, s) in fi.iter_mut().zip(&input[took * ch..(took + n) * ch]) {
-                *d = *s as f32;
-            }
-            let room = (room_all - made).min(step);
-            let (t, m) = self.process(&fi[..n * ch], &mut fo[..room * ch]);
-            for (d, s) in output[made * ch..(made + m) * ch].iter_mut().zip(&fo[..m * ch]) {
-                *d = round_i16(*s);
-            }
-            took += t;
-            made += m;
-            if took == frames && m < room.max(1) {
-                break;
-            }
-        }
-        (took, made)
+        self.feed(input, output)
     }
 
     /// [`Sinc::flush`] over interleaved i16: the stream's tail (the lookahead read as silence) into `output`; call again
     /// while it returns a full `output`.
     pub fn flush_i16(&mut self, output: &mut [i16]) -> usize {
-        let ch = self.ch;
-        let step = (I16_CHUNK / ch).max(1);
-        let room_all = output.len() / ch;
-        let mut fo = [0.0f32; I16_CHUNK];
-        let mut made = 0usize;
-        while made < room_all {
-            let room = (room_all - made).min(step);
-            let m = self.flush(&mut fo[..room * ch]);
-            for (d, s) in output[made * ch..(made + m) * ch].iter_mut().zip(&fo[..m * ch]) {
-                *d = round_i16(*s);
-            }
-            made += m;
-            if m < room {
-                break;
-            }
-        }
-        made
+        self.end(output)
     }
 }
 
-/// An f32 sample (i16 scale) to i16: rounded half away from zero, saturated (`as` saturates; NaN is 0).
+/// An f32 sample (i16 scale) to i16: rounded half away from zero, saturated (`as` saturates; NaN is 0). The KATs'
+/// reference rounding of the f32 form.
+#[cfg(test)]
 fn round_i16(v: f32) -> i16 {
     (if v >= 0.0 { v + 0.5 } else { v - 0.5 }) as i16
+}
+
+// ---- RSFIXED (LEDGER SR317): the sample forms of the ONE stream machine, and the Q30 integer kernel ----
+
+/// A sample form the stream machine (`feed` / `end` / `produce`) runs on: its silence, its history in the [`Sinc`],
+/// and its kernel (`f32` -> [`Sinc::frame_at`], `i16` -> [`Sinc::frame_q`]).
+trait Form: Copy {
+    const ZERO: Self;
+    fn hist(s: &mut Sinc) -> &mut Vec<Self>;
+    fn hist_ref(s: &Sinc) -> &Vec<Self>;
+    fn frame(s: &Sinc, src: &[Self], src_first: i64, i: i64, f: u32, out: &mut [Self]);
+}
+
+impl Form for f32 {
+    const ZERO: f32 = 0.0;
+    fn hist(s: &mut Sinc) -> &mut Vec<f32> {
+        &mut s.hist
+    }
+    fn hist_ref(s: &Sinc) -> &Vec<f32> {
+        &s.hist
+    }
+    fn frame(s: &Sinc, src: &[f32], src_first: i64, i: i64, f: u32, out: &mut [f32]) {
+        s.frame_at(src, src_first, i, f, out)
+    }
+}
+
+impl Form for i16 {
+    const ZERO: i16 = 0;
+    fn hist(s: &mut Sinc) -> &mut Vec<i16> {
+        &mut s.hist16
+    }
+    fn hist_ref(s: &Sinc) -> &Vec<i16> {
+        &s.hist16
+    }
+    fn frame(s: &Sinc, src: &[i16], src_first: i64, i: i64, f: u32, out: &mut [i16]) {
+        s.frame_q(src, src_first, i, f, out)
+    }
+}
+
+impl Sinc {
+    /// [`Sinc::frame_at`] in integers: the same row pair, the weight between them in Q16, each tap's coefficient
+    /// interpolated in Q30 once per frame, then per channel an i64 sum of sample x coefficient, rounded half away from
+    /// zero at 2^30 and clamped to i16. (|coef| < 2 and `MAX_TAPS` taps: the sum stays under 2^55.)
+    fn frame_q(&self, src: &[i16], src_first: i64, i: i64, f: u32, out: &mut [i16]) {
+        let (ch, t) = (self.ch, self.taps);
+        let frames = (src.len() / ch) as i64;
+        let p = f as u64 * PHASES as u64;
+        let (r, w) = ((p / self.to as u64) as usize, (((p % self.to as u64) << 16) / self.to as u64) as i64);
+        let (a, b) = (&self.fixed[r * t..(r + 1) * t], &self.fixed[(r + 1) * t..(r + 2) * t]);
+        let mut coef = [0i32; MAX_TAPS];
+        for (c, (x, y)) in coef.iter_mut().zip(a.iter().zip(b)) {
+            *c = *x + (((*y as i64 - *x as i64) * w) >> 16) as i32;
+        }
+        let first = i - self.back() - src_first;
+        for (c, o) in out.iter_mut().enumerate() {
+            let mut acc = 0i64;
+            for (j, k) in coef[..t].iter().enumerate() {
+                let at = (first + j as i64).clamp(0, frames - 1) as usize * ch + c;
+                acc += *k as i64 * src[at] as i64;
+            }
+            let half = 1i64 << 29;
+            let v = if acc >= 0 { (acc + half) >> 30 } else { -((half - acc) >> 30) };
+            *o = v.clamp(i16::MIN as i64, i16::MAX as i64) as i16;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -480,7 +530,7 @@ mod kernel_i16 {
         (0..n * ch).map(|i| (((i as i64 * 7_919) % 32_749) - 16_374) as i16).collect()
     }
 
-    /// The whole-stream f32 form, rounded: the reference the i16 form must equal.
+    /// The whole-stream f32 form, rounded: the reference the i16 form stays within 1 LSB of (RSFIXED SR317).
     fn whole_f32(from: u32, to: u32, ch: usize, src: &[i16]) -> Vec<i16> {
         let mut s = Sinc::new(from, to, ch);
         let fin: Vec<f32> = src.iter().map(|&v| v as f32).collect();
@@ -488,6 +538,25 @@ mod kernel_i16 {
         let (_, a) = s.process(&fin, &mut out);
         let b = s.flush(&mut out[a * ch..]);
         out[..(a + b) * ch].iter().map(|&v| round_i16(v)).collect()
+    }
+
+    /// The whole stream through the i16 (Q30 integer) form in one call, then its flush.
+    fn whole_i16(from: u32, to: u32, ch: usize, src: &[i16]) -> Vec<i16> {
+        let mut s = Sinc::new(from, to, ch);
+        let mut out = alloc::vec![0i16; (src.len() / ch * to as usize / from as usize + 64) * ch];
+        let (_, a) = s.process_i16(src, &mut out);
+        let b = s.flush_i16(&mut out[a * ch..]);
+        out.truncate((a + b) * ch);
+        out
+    }
+
+    /// The largest |a - b| over two equal-length streams, and how many samples differ.
+    fn diff(a: &[i16], b: &[i16]) -> (i32, usize) {
+        assert_eq!(a.len(), b.len());
+        a.iter().zip(b).fold((0, 0), |(m, n), (x, y)| {
+            let d = (*x as i32 - *y as i32).abs();
+            (m.max(d), n + (d != 0) as usize)
+        })
     }
 
     #[test]
@@ -518,7 +587,9 @@ mod kernel_i16 {
                     break;
                 }
             }
-            assert_eq!(got, whole_f32(from, to, ch, &src), "{from}->{to} ch={ch}");
+            assert_eq!(got, whole_i16(from, to, ch, &src), "{from}->{to} ch={ch}");
+            let (worst, _) = diff(&got, &whole_f32(from, to, ch, &src));
+            assert!(worst <= 1, "{from}->{to} ch={ch}: {worst} LSB from the f32 form");
         }
     }
 
@@ -545,7 +616,7 @@ mod kernel_i16 {
             } else if *r < -32_768.0 {
                 assert_eq!(*o, i16::MIN);
             } else {
-                assert!((*o as f32 - r).abs() <= 0.5, "{o} vs {r}");
+                assert!((*o as i32 - round_i16(*r) as i32).abs() <= 1, "{o} vs {r}");
             }
         }
     }
@@ -569,5 +640,71 @@ mod kernel_i16 {
             }
         }
         assert_eq!(made, 7_938);
+    }
+
+    // ---- RSFIXED (SR317): the Q30 integer form against the f32 form ----
+
+    use super::tests::{bin, db, rejection, tone};
+
+    /// A `tone` at i16 scale (amplitude 32000), interleaved over `ch` equal channels.
+    fn tone_i16(hz: u64, rate: u64, n: usize, ch: usize) -> Vec<i16> {
+        tone(hz, rate, n).iter().flat_map(|v| core::iter::repeat(round_i16(v * 32_000.0)).take(ch)).collect()
+    }
+
+    #[test]
+    fn q_sines_within_one_lsb() {
+        for (from, to) in [(48_000u32, 44_100u32), (44_100, 48_000)] {
+            for hz in [1_000u64, 10_000] {
+                let src = tone_i16(hz, from as u64, 9_600, 2);
+                let (worst, n) = diff(&whole_i16(from, to, 2, &src), &whole_f32(from, to, 2, &src));
+                std::println!("q sines {from}->{to} {hz} Hz: max_diff={worst} differing={n}");
+                assert!(worst <= 1, "{from}->{to} {hz} Hz: {worst}");
+            }
+        }
+    }
+
+    /// The interior frames `first..first + n` of a Q30 stream over `src` (amplitude 1), back at amplitude 1.
+    fn q_stream(from: u32, to: u32, src: &[f32], first: usize, n: usize) -> Vec<f32> {
+        let s: Vec<i16> = src.iter().map(|v| round_i16(v * 32_000.0)).collect();
+        whole_i16(from, to, 1, &s)[first..first + n].iter().map(|&v| v as f32 / 32_000.0).collect()
+    }
+
+    #[test]
+    fn q_rejects_images_going_down() {
+        let r1 = rejection(1_000, |s| q_stream(48_000, 44_100, s, 1_000, 44_100));
+        let r10 = rejection(10_000, |s| q_stream(48_000, 44_100, s, 1_000, 44_100));
+        std::println!("q 1k={r1:.1} dB 10k={r10:.1} dB");
+        assert!(r1 >= 60.0 && r10 >= 60.0, "q30 {r1} {r10}");
+    }
+
+    #[test]
+    fn q_keeps_15k_going_up() {
+        let out = q_stream(44_100, 48_000, &tone(15_000, 44_100, 52_920), 1_000, 48_000);
+        let g = db(bin(&out, 15_000, 48_000) / 24_000.0);
+        std::println!("q 15k up {g:.3} dB");
+        assert!(g.abs() <= 0.5, "q30 {g}");
+    }
+
+    #[test]
+    fn q_cost_per_frame() {
+        // the host figure (run with --release for a meaningful number): ns per output frame, f32 `process` vs the
+        // Q30 `process_i16`, one second of stereo each way; only the counts are asserted
+        for (from, to) in [(44_100u32, 48_000u32), (48_000, 44_100)] {
+            let src = tone_i16(1_000, from as u64, from as usize, 2);
+            let fin: Vec<f32> = src.iter().map(|&v| v as f32).collect();
+            let mut fo = alloc::vec![0.0f32; (to as usize + 64) * 2];
+            let mut qo = alloc::vec![0i16; (to as usize + 64) * 2];
+            let mut sf = Sinc::new(from, to, 2);
+            let t0 = std::time::Instant::now();
+            let (_, mf) = sf.process(&fin, &mut fo);
+            let tf = t0.elapsed().as_nanos() as f64;
+            let mut sq = Sinc::new(from, to, 2);
+            let t1 = std::time::Instant::now();
+            let (_, mq) = sq.process_i16(&src, &mut qo);
+            let tq = t1.elapsed().as_nanos() as f64;
+            assert_eq!(mf, mq);
+            assert!(mq + sq.taps() >= to as usize, "{mq}");
+            std::println!("cost {from}->{to} stereo taps={}: f32 {:.1} ns/frame q30 {:.1} ns/frame", sq.taps(), tf / mf as f64, tq / mq as f64);
+        }
     }
 }

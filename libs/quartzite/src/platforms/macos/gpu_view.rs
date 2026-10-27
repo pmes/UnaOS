@@ -1234,19 +1234,52 @@ pub fn page_frame(page: &NSView, rgba: &[u8], width: u32, height: u32) -> bool {
         let Some((tex, _, _)) = slot.as_ref() else {
             return false;
         };
-        let region = MtlRegion {
-            origin: MtlOrigin { x: 0, y: 0, z: 0 },
-            size: MtlSize { width: width as usize, height: height as usize, depth: 1 },
+        replace_rect(tex, rgba, (0, 0, width, height));
+    }
+    view.draw();
+    true
+}
+
+/// AETHERMACGPU-DAMAGE (LEDGER SR320): `bytes` (the rect's rows, stride `w * 4`) into `tex` at `(x, y)` - the one
+/// `replaceRegion` both the whole frame (`page_frame`) and a damage rect (`page_damage`) go through. The caller checks
+/// that the rect lies inside the texture and that `bytes` holds `w * h * 4`.
+fn replace_rect(tex: &AnyObject, bytes: &[u8], rect: (u32, u32, u32, u32)) {
+    let (x, y, w, h) = rect;
+    let region = MtlRegion {
+        origin: MtlOrigin { x: x as usize, y: y as usize, z: 0 },
+        size: MtlSize { width: w as usize, height: h as usize, depth: 1 },
+    };
+    unsafe {
+        let _: () = msg_send![
+            tex,
+            replaceRegion: region,
+            mipmapLevel: 0usize,
+            withBytes: bytes.as_ptr() as *const c_void,
+            bytesPerRow: w as usize * 4,
+        ];
+    }
+}
+
+/// AETHERMACGPU-DAMAGE (LEDGER SR320): a damage blit's rows into the page's EXISTING `width x height` texture, then
+/// presented. `false` when the page has no GPU view, no texture of that size (the first frame at a size comes whole),
+/// or the rect does not fit (the caller's CPU path then decides). Main thread only.
+pub fn page_damage(page: &NSView, rows: &[u8], width: u32, height: u32, rect: (u32, u32, u32, u32)) -> bool {
+    let Some(view) = page_view(page) else {
+        return false;
+    };
+    let (x, y, w, h) = rect;
+    if w == 0 || h == 0 || x as u64 + w as u64 > width as u64 || y as u64 + h as u64 > height as u64 || rows.len() != w as usize * h as usize * 4 {
+        return false;
+    }
+    {
+        let slot = view.ivars().texture.borrow();
+        let Some((tex, tw, th)) = slot.as_ref() else {
+            return false;
         };
-        unsafe {
-            let _: () = msg_send![
-                &**tex,
-                replaceRegion: region,
-                mipmapLevel: 0usize,
-                withBytes: rgba.as_ptr() as *const c_void,
-                bytesPerRow: width as usize * 4,
-            ];
+        if (*tw, *th) != (width, height) {
+            return false;
         }
+        replace_rect(tex, rows, rect);
     }
     view.draw();
     true

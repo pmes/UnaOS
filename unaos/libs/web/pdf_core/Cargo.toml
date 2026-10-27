@@ -3,14 +3,19 @@ name = "pdf_core"
 version = "0.1.0"
 edition = "2024"
 license = "LGPL-3.0-or-later"
-description = "Aether's PDF core: the PDF 32000-1 reader (lexer, objects, xref tables and streams, object streams, incremental updates, reconstruction, the standard filters, the page tree, the content-stream tokenizer) — no_std + alloc, shared by Ring 0 and Ring 3."
+description = "Aether's PDF core: the PDF 32000-1 reader (lexer, objects, xref tables and streams, object streams, incremental updates, reconstruction, the standard filters, the page tree, the content-stream tokenizer, the content interpreter and renderer through svg_core) — no_std + alloc, shared by Ring 0 and Ring 3."
 
 # PDF1 (LEDGER SR300): `#![no_std]` + `alloc`, `#![forbid(unsafe_code)]`, the midden_core shape: a shared core under
-# `unaos/libs/web/` beside Aether's other cores, a member of the ROOT host workspace (tools/pdfprobe links it). Its one
-# dependency is pixel_core, for the ONE inflater (`pixel_core::inflate::zlib_inflate` / `inflate_raw`): FlateDecode is
-# never a second DEFLATE decoder.
+# `unaos/libs/web/` beside Aether's other cores, a member of the ROOT host workspace (tools/pdfprobe links it). Its two
+# dependencies are sibling shared cores: pixel_core, for the ONE inflater (`pixel_core::inflate::zlib_inflate` /
+# `inflate_raw`): FlateDecode is never a second DEFLATE decoder; and crypto_core (PDFCRYPT SR315), for the standard
+# security handler's MD5 / RC4 / AES-CBC / SHA-2: `src/crypt.rs` is never a second primitive.
 [dependencies]
 pixel_core = { path = "../../media/pixel_core" }
+crypto_core = { path = "../../sys/crypto_core" }
+# PDF2 (LEDGER SR313): the renderer paints through svg_core (no_std + alloc): its path filler, stroker, shaders, clip
+# Mask and paint loop — one rasterizer, never a second. pixel_core also decodes DCTDecode images (`jpeg`).
+svg_core = { path = "../../media/svg_core" }
 # PDF3 (LEDGER SR314): font_core reads every embedded font program (TrueType / OpenType, CFF, Type 1) — never a second
 # font parser in pdf_core.
 font_core = { path = "../../text/font_core" }

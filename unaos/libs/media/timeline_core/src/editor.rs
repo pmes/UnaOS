@@ -287,7 +287,7 @@ impl EditorState {
     pub fn set_transition_dur(&mut self, dur: i64) -> Result<(), EditError> {
         let (track, idx) = self.transition.ok_or(EditError::Transition)?;
         let x = self.selected_transition().ok_or(EditError::Transition)?;
-        let tl = if x.from_black {
+        let tl = if x.to_black { self.timeline.add_transition_to_black(track, x.at, x.kind, dur)? } else if x.from_black {
             self.timeline.add_transition_from_black(track, x.at, x.kind, dur)?
         } else {
             self.timeline.add_transition(track, x.at, x.kind, dur)?

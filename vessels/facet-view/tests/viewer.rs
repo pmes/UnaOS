@@ -18,7 +18,7 @@ fn pump(v: &mut Viewer, f: &mut facet::Facet, reqs: Vec<FacetCommand>) -> Option
         for ans in f.dispatch(&r) {
             let (more, b) = v.answer(&ans);
             queue.extend(more);
-            if let Some(SMessage::SurfaceBlit { width, height, pixels, url }) = b {
+            if let Some(SMessage::SurfaceBlit { width, height, pixels, url, .. }) = b {
                 assert_eq!(url, facet_view::SURFACE);
                 blit = Some((width, height, pixels));
             }

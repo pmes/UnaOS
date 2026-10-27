@@ -111,6 +111,10 @@ pub struct Frame {
     pub tag: i64,
     /// VUI video_full_range_flag.
     pub full_range: bool,
+    /// HEVCMAIN10 (SR311): the bit depth of the decoded samples (8 for every h264_core frame).
+    pub bit_depth: u8,
+    /// HEVCMAIN10 (SR311): above 8 bits, the samples as decoded (`planes` then holds them narrowed `>> (bit_depth - 8)`).
+    pub planes16: Option<[Vec<u16>; 3]>,
 }
 
 impl Frame {
@@ -136,7 +140,7 @@ impl Frame {
             ],
             poc: p.poc,
             tag: p.tag,
-            full_range: p.full_range,
+            full_range: p.full_range, bit_depth: 8, planes16: None,
         }
     }
 

@@ -1,19 +1,15 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 //! PDF3 (SR314): fonts and text. Every PDF here is built by PDF1's `PdfBuilder`; the font programs are the tree's own
 //! bundled faces (fonts/) or are written by this file (a two-glyph CFF built byte by byte, a Type 1 program written in
-//! the clear and eexec-encrypted here). The glyphs are filled by a TEST painter: font_core's own `Rasterizer` through
-//! its `Scaled` sink (PDF2's renderer paints through svg_core in the product), one page-sized coverage canvas, y up.
-//! Each KAT pins an FNV-1a over that coverage, a few sampled pixels and the extracted text.
+//! the clear and eexec-encrypted here). Pages are drawn by PDF2's renderer (`Page::render`, 72 dpi, svg_core's
+//! rasterizer) with PDF3's `GlyphSink` as its TextSink, and the text is read by `Page::text`. Each KAT pins an FNV-1a
+//! over the ink (255 - red of the white page), a few sampled pixels and the extracted text.
 
 mod common;
 
 use common::PdfBuilder;
-use font_core::raster::{Rasterizer, Scaled};
-use font_core::OutlineSink;
-use pdf_core::content::ops;
 use pdf_core::font::cmap::CMap;
-use pdf_core::font::text::walk;
-use pdf_core::font::{Fallback, GlyphSink, IDENTITY, Matrix, apply, mul, spans_to_string};
+use pdf_core::font::{Fallback, GlyphSink, spans_to_string};
 use pdf_core::Document;
 
 const W: usize = 200;
@@ -27,80 +23,16 @@ fn fnv(b: &[u8]) -> u64 {
     b.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &x| (h ^ x as u64).wrapping_mul(0x0000_0100_0000_01b3))
 }
 
-/// Text space -> device (PDF units = pixels), forwarded to font_core's rasterizer (y up: `Scaled` flips at `oy`).
-struct Dev<'r> {
-    m: Matrix,
-    s: Scaled<'r>,
-}
-
-impl Dev<'_> {
-    fn p(&self, x: f32, y: f32) -> (f32, f32) {
-        let (a, b) = apply(&self.m, x as f64, y as f64);
-        (a as f32, b as f32)
-    }
-}
-
-impl OutlineSink for Dev<'_> {
-    fn move_to(&mut self, x: f32, y: f32) {
-        let (a, b) = self.p(x, y);
-        self.s.move_to(a, b);
-    }
-    fn line_to(&mut self, x: f32, y: f32) {
-        let (a, b) = self.p(x, y);
-        self.s.line_to(a, b);
-    }
-    fn quad_to(&mut self, x1: f32, y1: f32, x: f32, y: f32) {
-        let (a, b) = self.p(x1, y1);
-        let (c, d) = self.p(x, y);
-        self.s.quad_to(a, b, c, d);
-    }
-    fn curve_to(&mut self, x1: f32, y1: f32, x2: f32, y2: f32, x: f32, y: f32) {
-        let (a, b) = self.p(x1, y1);
-        let (c, d) = self.p(x2, y2);
-        let (e, f) = self.p(x, y);
-        self.s.curve_to(a, b, c, d, e, f);
-    }
-    fn close(&mut self) {
-        self.s.close();
-    }
-}
-
-/// The test painter's stand-in for PDF2's interpreter on a Type 3 CharProc: `re` rectangles only (`f` implied).
-fn type3_proc(proc_: &[u8], m: Matrix, r: &mut Rasterizer) {
-    for op in ops(proc_) {
-        let n: Vec<f64> = op.operands.iter().filter_map(|o| o.as_f64()).collect();
-        if op.operator == b"re" && n.len() == 4 {
-            let (x, y, w, h) = (n[0] as f32, n[1] as f32, n[2] as f32, n[3] as f32);
-            let mut d = Dev { m, s: Scaled { r: &mut *r, scale: 1.0, ox: 0.0, oy: H as f32 } };
-            d.move_to(x, y);
-            d.line_to(x + w, y);
-            d.line_to(x + w, y + h);
-            d.line_to(x, y + h);
-            d.close();
-        }
-    }
-}
-
-/// Render page 0's text through `walk` + `GlyphSink::show`; return the coverage and the extracted text.
+/// Render page 0 through PDF2's renderer with GlyphSink as its TextSink; return the ink and the extracted text.
 fn render(pdf: &[u8], fb: Fallback<'_>) -> (Vec<u8>, String) {
     let doc = Document::parse(pdf).unwrap();
     let page = &doc.pages().unwrap()[0];
-    let mut r = Rasterizer::new(W, H);
     let mut sink = GlyphSink::new(&doc, fb);
-    walk(&doc, &page.contents, &page.resources, IDENTITY, &mut |font, bytes, p, tm, ctm| {
-        let shown = sink.show(font, bytes, p);
-        let m = mul(tm, ctm);
-        {
-            let mut d = Dev { m, s: Scaled { r: &mut r, scale: 1.0, ox: 0.0, oy: H as f32 } };
-            shown.outline.replay(&mut d);
-        }
-        for t3 in &shown.type3 {
-            type3_proc(&t3.proc_, mul(&t3.m, &m), &mut r);
-        }
-        shown.advance
-    });
+    let r = page.render(&doc, 72.0, &mut sink).unwrap();
+    assert_eq!((r.pixmap.w, r.pixmap.h), (W, H));
+    let cov = r.pixmap.data.chunks_exact(4).map(|p| 255 - p[0]).collect();
     let text = spans_to_string(&page.text(&doc, &fb));
-    (r.finish(), text)
+    (cov, text)
 }
 
 /// Coverage at the pixel whose centre is (x + 0.5, y + 0.5) in PDF units (y up).
@@ -141,7 +73,7 @@ fn helvetica_fallback_hello() {
     assert_eq!(px(&cov, 13, 20), 255);
     assert_eq!(px(&cov, 24, 25), 255);
     assert_eq!(px(&cov, 18, 25), 0);
-    assert_eq!(fnv(&cov), 0x2b5c5fe87849c205);
+    assert_eq!(fnv(&cov), 0x35681a31cab46eb3);
     // Without a fallback face nothing is drawn, the text still extracts.
     let (cov, text) = render(&b.classic(), Fallback::default());
     assert_eq!(ink(&cov), 0);
@@ -167,7 +99,7 @@ fn truetype_embedded() {
     // Four 12-unit advances from x = 10: glyph 'o' (the 4th) starts at x = 46 and ends before 58.
     assert!(ink(&cov) > 100);
     assert_eq!((60..W).map(|x| (0..H).map(|y| px(&cov, x, y) as u32).sum::<u32>()).sum::<u32>(), 0);
-    assert_eq!(fnv(&cov), 0x0b2817cfb4d731df);
+    assert_eq!(fnv(&cov), 0xcb580178c69dcf95);
 }
 
 // ------------------------------------------------------------------------------------------------- (c) CFF
@@ -257,7 +189,7 @@ fn cff_type1c() {
     // 'B': the triangle 24..34 at its base (y 12..13), its apex at x = 29, y = 22.
     assert_eq!(px(&cov, 29, 13), 255);
     assert_eq!(px(&cov, 25, 20), 0);
-    assert_eq!(fnv(&cov), 0x770526419867acf9);
+    assert_eq!(fnv(&cov), 0xbf05fa0694d9a7b7);
 }
 
 // ------------------------------------------------------------------------------------------------- (d) Type 1
@@ -395,7 +327,7 @@ fn type1_eexec() {
     // 'Aacute' at x = 22: its accent 150..250 x 800..900 units = x 25..27, y 26..28.
     assert_eq!(px(&cov, 25, 26), 255);
     assert_eq!(px(&cov, 25, 23), 0);
-    assert_eq!(fnv(&cov), 0x25406a2034d34375);
+    assert_eq!(fnv(&cov), 0x38b6b586b00e7c61);
 }
 
 // ------------------------------------------------------------------------------------------------- (e) Type 0
@@ -426,7 +358,7 @@ fn type0_identity_h() {
     assert!(ink(&cov) > 100);
     // Seven 12-unit advances from x = 10 end at x = 94.
     assert_eq!((96..W).map(|x| (0..H).map(|y| px(&cov, x, y) as u32).sum::<u32>()).sum::<u32>(), 0);
-    assert_eq!(fnv(&cov), 0x7dd013c7cb2be79c);
+    assert_eq!(fnv(&cov), 0xbae1b686980266ec);
     // The same glyphs through an EMBEDDED one-byte CMap (cidchar + cidrange) draw the same pixels.
     let cmap = "/CIDInit /ProcSet findresource begin 12 dict begin begincmap\n/CMapName /Test-1B def\n1 begincodespacerange <00> <FF> endcodespacerange\n4 begincidchar <48> 64 <65> 225 <6C> 275 <6F> 290 endcidchar\n1 begincidrange <42> <43> 26 endcidrange\nendcmap CMapName currentdict /CMap defineresource pop end end\n";
     let to_u = "begincmap 1 begincodespacerange <00> <FF> endcodespacerange 1 beginbfrange <20> <7E> <0020> endbfrange endcmap";

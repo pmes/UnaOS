@@ -104,7 +104,7 @@ pub fn sao_picture(pic: &mut Picture, geo: &Geometry, sps: &Sps, pps: &Pps) {
                         continue;
                     }
                     let v = (cur + off[idx] as i32).clamp(0, max);
-                    pic.planes[c].set(x, y, v as u8);
+                    pic.planes[c].set(x, y, v as u16);
                 }
             }
         }

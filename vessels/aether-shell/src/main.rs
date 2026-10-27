@@ -226,6 +226,8 @@ struct Tab {
     devtools: chrome::devtools::DevTools,
     window: (u32, u32),
     last_lines: Option<Vec<String>>,
+    /// AETHERMACGPU-DAMAGE (SR320): the frame last blitted, so the next blit carries only its changed rows.
+    sent: quartzite::tetra::SurfaceDamage,
 }
 
 impl Tab {
@@ -254,6 +256,7 @@ impl Tab {
             devtools: chrome::devtools::DevTools::new(),
             window,
             last_lines: None,
+            sent: quartzite::tetra::SurfaceDamage::default(),
         }
     }
 
@@ -307,10 +310,13 @@ impl Tab {
         let _ = self.reports.send(r);
     }
 
-    fn blit(&self) {
+    fn blit(&mut self) {
         if self.is_active() {
             let (width, height, pixels) = self.engine.present_rgba();
-            self.bus.fire(SMessage::SurfaceBlit { url: "viewport".into(), width, height, pixels });
+            // AETHERMACGPU-DAMAGE (SR320): only the rows that changed since the last blit (whole on the tetra rules).
+            if let Some(m) = self.sent.frame("viewport", width, height, pixels) {
+                self.bus.fire(m);
+            }
         }
     }
 
@@ -322,6 +328,7 @@ impl Tab {
         let (w, h) = (self.engine.width, self.engine.height);
         self.engine.damage_rects.push((0, 0, w, h));
         let _ = self.engine.render_frame();
+        self.sent.forget(); // AETHERMACGPU-DAMAGE (SR320): the face holds another tab's frame: this one goes whole
         self.blit();
         self.bus.fire(SMessage::BrowserUrlChanged(self.engine.current_url()));
         self.bus.fire(SMessage::BrowserTitleChanged(self.engine.title.clone()));
@@ -475,7 +482,8 @@ impl Tab {
                 }));
             }
             SMessage::Facet(FacetCommand::ImageRendered { receipt_id, width, height, rgba, .. }) if receipt_id >> 56 == FACET_RECEIPT_TAG >> 56 => {
-                self.show(SMessage::SurfaceBlit { url: "viewport".into(), width, height, pixels: rgba });
+                self.sent.forget(); // AETHERMACGPU-DAMAGE (SR320): the image replaces the face's frame; the next page blit goes whole
+                self.show(SMessage::SurfaceBlit { url: "viewport".into(), width, height, pixels: rgba, damage: None });
                 if let Some(u) = self.facet_url.take() {
                     self.show(SMessage::BrowserUrlChanged(u.clone()));
                     self.report(TabReport::Url(self.id, u));
@@ -1364,6 +1372,114 @@ mod tests {
                 k.msg
             );
         }
+    }
+
+    /// AETHERMACDEVTOOLS (SR312): the faces' developer-tools, console and accessibility rows
+    /// (`quartzite::widgets::{devtools_rows, console_rows, a11y_rows}`, both faces' one copy) against the model: the panel
+    /// labels are `Panel::ALL`'s; the face's toggle and GTK's Ctrl+Shift+I are `is_devtools_toggle`'s; AppKit's
+    /// JavaScript Console key opens a closed pane on the Console panel and never closes an open one (applied as
+    /// `Coordinator::on_devtools` and the tab's `BrowserDevtoolsPanel` arm apply them), and the layout the face receives
+    /// reads open / closed; the console filter over a `LogTail`; the face's accessibility rows reach the engine as the
+    /// prefs Principia's values mean (`A11yPrefs::from_rows` == `from_prefs`); F6 alternates the address and the page.
+    #[test]
+    fn aethermacdevtools_model_kat() {
+        use chrome::devtools::Panel;
+        use quartzite::widgets::{a11y_rows, console_rows, devtools_rows};
+        let labels: Vec<&str> = Panel::ALL.iter().map(|p| p.label()).collect();
+        assert_eq!(labels, devtools_rows::PANELS);
+
+        let is_toggle = |m: &SMessage| match m {
+            SMessage::BrowserDevtoolsKey { key, ctrl, shift, alt } => chrome::is_devtools_toggle(key, *ctrl, *shift, *alt),
+            _ => false,
+        };
+        assert!(is_toggle(&devtools_rows::toggle_key()));
+        assert!(is_toggle(&SMessage::BrowserDevtoolsKey { key: "I".into(), ctrl: true, shift: true, alt: false }));
+
+        fn apply(c: &mut chrome::DevtoolsChrome, panel: &mut Panel, msgs: Vec<SMessage>) {
+            for m in msgs {
+                match m {
+                    SMessage::BrowserDevtoolsKey { key, ctrl, shift, alt } => {
+                        c.on_key(&key, ctrl, shift, alt);
+                    }
+                    SMessage::BrowserDevtoolsPanel(label) => {
+                        if let Some(p) = Panel::ALL.iter().find(|p| p.label().eq_ignore_ascii_case(&label)) {
+                            *panel = *p;
+                        }
+                    }
+                    other => panic!("not a pane verb: {other:?}"),
+                }
+            }
+        }
+        let mut c = chrome::DevtoolsChrome::default();
+        let mut panel = Panel::Elements;
+        let area = Some((1000, 800));
+        assert_eq!(devtools_rows::pane_open(&devtools_layout(&c, area)), Some(false));
+        let v = devtools_rows::console_verbs(c.open);
+        apply(&mut c, &mut panel, v);
+        assert!(c.open);
+        assert_eq!(panel, Panel::Console);
+        assert_eq!(devtools_rows::pane_open(&devtools_layout(&c, area)), Some(true));
+        panel = Panel::Network;
+        let v = devtools_rows::console_verbs(c.open);
+        apply(&mut c, &mut panel, v);
+        assert!(c.open, "an open pane stays open");
+        assert_eq!(panel, Panel::Console);
+        apply(&mut c, &mut panel, vec![devtools_rows::toggle_key()]);
+        assert_eq!(devtools_rows::pane_open(&devtools_layout(&c, area)), Some(false));
+
+        let tail = [
+            bandy::state::LogLine { seq: 1, level: "INFO".into(), source: "net".into(), content: "up".into() },
+            bandy::state::LogLine { seq: 2, level: "ERROR".into(), source: "usb".into(), content: "gone".into() },
+        ];
+        let rows = console_rows::rows_from_tail(&tail);
+        assert_eq!(console_rows::render_body(&console_rows::filtered(&rows, console_rows::LevelFilter::All)), "net  up\nusb  gone");
+        assert_eq!(console_rows::render_body(&console_rows::filtered(&rows, console_rows::LevelFilter::Warn)), "usb  gone");
+
+        let stored = |k: &str| match k {
+            "accessibility.reduce_motion" => Some("on".to_string()),
+            "accessibility.contrast" => Some("more".to_string()),
+            "accessibility.forced_colors" => Some("true".to_string()),
+            _ => None,
+        };
+        let face = a11y_rows::A11yRows::from_values(|k| stored(k).map(bandy::PrefValue::Str));
+        let SMessage::BrowserA11yPrefs { reduce_motion, contrast, forced_colors } = face.message() else { panic!("not the rows") };
+        let applied = aether::dom::a11y::prefs::A11yPrefs::from_rows(reduce_motion, &contrast, forced_colors);
+        assert_eq!(applied, aether::dom::a11y::prefs::A11yPrefs::from_prefs(stored));
+        assert!(matches!(
+            a11y_rows::A11yRows::from_values(|_| None).message(),
+            SMessage::BrowserA11yPrefs { reduce_motion: false, ref contrast, forced_colors: false } if contrast == "no-preference"
+        ));
+
+        use a11y_rows::FocusStop::{Address, Page};
+        assert_eq!(a11y_rows::f6_step(Some(Page), false), Address);
+        assert_eq!(a11y_rows::f6_step(Some(Address), false), Page);
+        assert_eq!(a11y_rows::f6_step(None, true), Page);
+}
+
+    /// AETHERMACGPU-DAMAGE (SR320): two frames of a real engine that differ in one row blit as that row alone (the
+    /// shell's `Tab::blit` path: `present_rgba` through `SurfaceDamage`), and the saving is the frame's height.
+    #[test]
+    fn aethermacgpudamage_one_row_kat() {
+        let mut engine = AetherEngine::new();
+        engine.load_html("about:blank", "<html><body><p>damage</p></body></html>", true);
+        let _ = engine.render_frame();
+        let mut sent = quartzite::tetra::SurfaceDamage::default();
+        let (w, h, first) = engine.present_rgba();
+        let Some(SMessage::SurfaceBlit { damage: None, pixels, .. }) = sent.frame("viewport", w, h, first) else { panic!("first blit is whole") };
+        let whole = pixels.len();
+        assert_eq!(whole, (w * h * 4) as usize);
+        let y = h / 2;
+        let at = ((y * w + 3) * 4) as usize;
+        engine.surface[at] ^= 0xFF; // one pixel of row y
+        let (w2, h2, second) = engine.present_rgba();
+        assert_eq!((w2, h2), (w, h));
+        let Some(SMessage::SurfaceBlit { damage, pixels, width, height, .. }) = sent.frame("viewport", w2, h2, second.clone()) else { panic!("a changed frame blits") };
+        assert_eq!((width, height), (w, h));
+        assert_eq!(damage, Some((0, y, w, 1)));
+        let stride = (w * 4) as usize;
+        assert_eq!(pixels, second[y as usize * stride..(y as usize + 1) * stride]);
+        assert_eq!(whole / pixels.len(), h as usize, "one row instead of {h}");
+        assert!(sent.frame("viewport", w2, h2, second).is_none(), "an identical frame sends nothing");
     }
 }
 

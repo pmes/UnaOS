@@ -5,7 +5,8 @@
 //! bytes of a shown string into the string's outline in TEXT SPACE and its horizontal displacement `tx`. The
 //! renderer (PDF2) applies Tm x CTM, paints per the render mode Tr and advances Tm by `tx`; Type 3 glyphs come back
 //! as CharProcs ([`Type3Glyph`]) for its content interpreter. One position loop ([`GlyphSink::layout`]) serves both
-//! drawing and text extraction.
+//! drawing and text extraction. `GlyphSink` is PDF2's `render::TextSink` (the adapter at the end of this file):
+//! `page.render(&doc, dpi, &mut GlyphSink::new(&doc, fallback))` draws a page's text.
 //!
 //! Codes: one byte for simple fonts, the encoding CMap's codespace for Type 0. Code -> glyph: TrueType by the cmap
 //! rules of §9.6.6.4 (non-symbolic: name -> AGL -> (3,1), else (1,0) by the name's MacRoman code, else the `post`
@@ -43,18 +44,13 @@ impl Default for TextParams {
     }
 }
 
-/// A Type 3 glyph: its CharProc (decoded content), the font's /Resources (empty: the page's apply), and `m`, glyph
-/// space -> text space (FontMatrix x the glyph's placement). The renderer runs `proc_` under `m` x Tm x CTM.
-#[derive(Clone, Debug, PartialEq)]
-pub struct Type3Glyph {
-    pub proc_: Vec<u8>,
-    pub resources: Dict,
-    pub m: Matrix,
-}
+/// A Type 3 glyph (PDF2's own type, `render::Type3Glyph`): its CharProc (decoded content), the font's /Resources
+/// (empty: the page's apply), and `m`, glyph space -> text space; the renderer runs `proc_` under `m` x Tm x CTM.
+pub use crate::render::Type3Glyph;
 
 /// What a shown string draws: every glyph's outline in text space, the displacement `tx` (text space units, Tc / Tw /
 /// Th applied), and the Type 3 glyphs to run.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default)]
 pub struct Shown {
     pub advance: f64,
     pub outline: Path,
@@ -393,4 +389,30 @@ fn layout_in(font: &PdfFont<'_>, face: &Face<'_>, bytes: &[u8], p: &TextParams) 
         pen += advance;
     }
     (out, pen)
+}
+
+/// PDF2's font seam (`render::TextSink`, SR313): the run's text state in, the string's glyphs out. The outline goes
+/// from font_core's path shape to svg_core's (the renderer's), command for command.
+impl crate::render::TextSink for GlyphSink<'_, '_> {
+    fn text(&mut self, r: &crate::render::TextRun) -> crate::render::Glyphs {
+        let p = TextParams { size: r.size, char_spacing: r.char_spacing, word_spacing: r.word_spacing, h_scale: r.h_scale, rise: r.rise };
+        let s = self.show(r.font, r.bytes, &p);
+        crate::render::Glyphs { advance: s.advance, outline: to_svg(&s.outline), type3: s.type3 }
+    }
+}
+
+fn to_svg(p: &Path) -> svg_core::geom::Path {
+    use font_core::PathCmd;
+    let mut out = svg_core::geom::Path::new();
+    let f = |x: f32, y: f32| (x as f64, y as f64);
+    for c in &p.cmds {
+        match *c {
+            PathCmd::MoveTo(x, y) => out.move_to(x as f64, y as f64),
+            PathCmd::LineTo(x, y) => out.line_to(x as f64, y as f64),
+            PathCmd::QuadTo(a, b, x, y) => out.quad_to(f(a, b), f(x, y)),
+            PathCmd::CubicTo(a, b, c2, d, x, y) => out.cubic_to(f(a, b), f(c2, d), f(x, y)),
+            PathCmd::Close => out.close(),
+        }
+    }
+    out
 }
