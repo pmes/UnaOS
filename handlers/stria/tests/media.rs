@@ -1465,3 +1465,93 @@ fn vp9inbandcolour_webm_bt709_fills_track_colour() {
     assert_eq!(d0.tracks()[0].colour, None, "CS_UNKNOWN states nothing: the size default stays");
     println!("vp9inbandcolour: WebM color_space 2 -> {c709}");
 }
+
+// SWAPBACKNLECACHE (LEDGER SR388): the editor holds one DecodeSwap and decoder per reel across its runs (a run's close parks
+// them in the reel's `Media`, the next run open resets and reseeds them, the Player's seek), the set state is keyed by its
+// (kind, id) -> unit map through gneiss_pal's `param_set_ids`, and the parked-decoder depth is `set_cache_depth`.
+
+/// Rule: two renders of tick 2 of the swapback reel (a run opened, closed, reopened at the same span: a preview scrub back)
+/// reseed miss then HIT on reel 0 (today each run built its own decoders: miss, miss), and both draw the stand-in.
+#[test]
+fn swapbacknlecache_editor_run_reopened_at_the_same_span_hits() {
+    use stria::nle::{RenderSink, Sources, render};
+    struct Frames(Vec<Vec<u8>>);
+    impl RenderSink for Frames {
+        fn frame(&mut self, _out_t: i64, _w: u32, _h: u32, rgba: &[u8]) {
+            self.0.push(rgba.to_vec());
+        }
+        fn pcm(&mut self, _: i64, _: u32, _: u16, _: &[f32]) {}
+    }
+    capture_logs();
+    let (tl, src) = Sources::from_media("A", &swapback_reel(), 25).unwrap().unwrap();
+    let mut first = Frames(Vec::new());
+    render(&tl, 2..3, &src, &mut first).unwrap();
+    let mut again = Frames(Vec::new());
+    render(&tl, 2..3, &src, &mut again).unwrap();
+    assert_eq!(first.0, [TestPattern::render(64, 48, 2)], "the first run at s2 is not the stand-in");
+    assert_eq!(again.0, first.0, "the reopened run does not draw the first run's frame");
+    assert_eq!(my_log_lines("[STRIA] :: nle reseed"), ["[STRIA] :: nle reseed reel=0 cache=miss", "[STRIA] :: nle reseed reel=0 cache=hit"]);
+    println!("swapbacknlecache: editor reel=0 miss hit");
+}
+
+/// SWAPBACK-SETIDS: s1 carries [SPS, PPS] and s4 [PPS, SPS] — the same ids and bytes in another blob.
+fn swapbacknlecache_setids_reel() -> Vec<u8> {
+    let mut t = hevc_kat_track(8);
+    let carriers: [(usize, &[&[u8]]); 2] = [(1, &[&HEVC_SPS[..], &HEVC_PPS[..], &HEVC_IDR[..]]), (4, &[&HEVC_PPS[..], &HEVC_SPS[..], &HEVC_IDR[..]])];
+    for (i, units) in carriers {
+        t.samples[i].data = units.iter().flat_map(|u| [&(u.len() as u32).to_be_bytes()[..], *u].concat()).collect();
+    }
+    build::mp4(&[t], &Mp4Options::default())
+}
+
+/// Rule: reseeds at s2 (state [s1's blob]) then s6 ([s1's, s4's]) build ONE decoder — the two states key alike by id, the second
+/// reseed a hit (today the blob lists differ: a second construction, a miss) — and s6 then decodes flat.
+#[test]
+fn swapbacknlecache_setids_equal_states_in_different_blobs_hit() {
+    use gneiss_pal::dsp::demux::Demuxer;
+    use stria::decode_swap::{DecodeSwap, open};
+    capture_logs();
+    let d = Demuxer::open(swapbacknlecache_setids_reel()).unwrap();
+    let t = d.tracks()[0].clone();
+    let mut dec = open(&t);
+    let mut swap = DecodeSwap::default();
+    let mut built = Vec::new();
+    let mut hits = Vec::new();
+    for ns in [80_000_000i64, 240_000_000] {
+        hits.push(swap.reseed(&mut dec, &t, &d, ns));
+        built.push(swap.built());
+    }
+    assert_eq!(built, [1, 1]);
+    assert_eq!(hits, [Some(false), Some(true)]);
+    assert_eq!(
+        my_log_lines("[STRIA] :: video reseed:"),
+        ["[STRIA] :: video reseed: at 80000000 sets=1 cache=miss", "[STRIA] :: video reseed: at 240000000 sets=2 cache=hit"],
+    );
+    let s6 = d.packet_at(&d.samples()[6]);
+    let mut frames = swap.decode(&mut dec, &t, &s6).unwrap().frames;
+    frames.extend(dec.flush());
+    assert!(frames[0].to_rgba().chunks(4).all(|p| p == SWAPBACK_FLAT), "s6 is not flat");
+    println!("swapbacknlecache: setids built={}", swap.built());
+}
+
+/// Rule: reseeds at s9 / s4 / s0 / s9 of the swapbackseek reel build 1, 2, 2, 2 decoders at the default depth (s0 and s9 parked)
+/// and 1, 2, 3, 4 at `set_cache_depth(1)` (each park evicts the span the next reseed wants).
+#[test]
+fn swapbacknlecache_depth_one_cache_evicts() {
+    use gneiss_pal::dsp::demux::Demuxer;
+    use stria::decode_swap::{DecodeSwap, open};
+    let d = Demuxer::open(swapbackseek_reel()).unwrap();
+    let t = d.tracks()[0].clone();
+    let builds = |depth: usize| {
+        let mut dec = open(&t);
+        let mut swap = DecodeSwap::default();
+        swap.set_cache_depth(depth);
+        [360_000_000i64, 160_000_000, 0, 360_000_000].map(|ns| {
+            swap.reseed(&mut dec, &t, &d, ns);
+            swap.built()
+        })
+    };
+    assert_eq!(builds(0), [1, 2, 2, 2]);
+    assert_eq!(builds(1), [1, 2, 3, 4]);
+    println!("swapbacknlecache: depth2 {:?} depth1 {:?}", builds(0), builds(1));
+}

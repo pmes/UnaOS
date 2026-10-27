@@ -132,6 +132,8 @@ struct Media {
     a0: i64,
     /// SWAPBACKSPANCACHE (SR370): the reel's in-band parameter sets, walked once at the first run open and shared by every run.
     sets: std::sync::OnceLock<Arc<crate::decode_swap::SetIndex>>,
+    /// SWAPBACK-NLECACHE (SR388): the decoder and swap state the reel's last closed run left ([`Vid`]'s drop), taken by the next run open.
+    park: ReelPark,
 }
 
 impl Media {
@@ -162,7 +164,7 @@ impl Media {
             .unwrap_or(0)
         };
         let (v0, a0) = (origin(video), origin(audio));
-        Ok(Media { demux, video, audio, v0, a0, sets: Default::default() })
+        Ok(Media { demux, video, audio, v0, a0, sets: Default::default(), park: Default::default() })
     }
     fn stream(&self, kind: Kind) -> Option<(usize, i64)> {
         match kind {
@@ -297,6 +299,8 @@ struct Vid {
     track: Track,
     swap: DecodeSwap,
     stood_in: bool,
+    /// SWAPBACK-NLECACHE (SR388): the reel's slot this run's decoder and swap go back to when it closes.
+    park: ReelPark,
     pending: VecDeque<Frame>,
     peeked: Option<Frame>,
     last: Option<Frame>,
@@ -307,10 +311,20 @@ impl Vid {
     fn open(m: &Media, src: SourceId, key_ns: i64) -> Result<Vid, RenderError> {
         let (i, origin) = m.stream(Kind::Video).ok_or(RenderError::NoStream(src, Kind::Video))?;
         let track = &m.demux.tracks()[i];
-        let mut dec = crate::decode_swap::open(track); // NLE-STANDIN-OPEN (SR353): the Player's decoder-or-stand-in, never a refused render
+        let held = m.park.lock().ok().and_then(|mut p| p.take()); // SWAPBACK-NLECACHE (SR388): the reel's held swap and decoder, reset as a Player seek resets
+        let (mut swap, mut dec) = match held {
+            Some((swap, mut dec)) => {
+                dec.reset();
+                (swap, dec)
+            }
+            None => (DecodeSwap::with_index(m.sets.get_or_init(|| Arc::new(crate::decode_swap::SetIndex::of(track, &m.demux))).clone()), crate::decode_swap::open(track)), // NLE-STANDIN-OPEN (SR353): the Player's decoder-or-stand-in, never a refused render; SWAPBACKSPANCACHE (SR370): the reel's index walked once
+        };
         let mut cursor = m.demux.share();
-        cursor.seek_track(i, origin + key_ns); let mut swap = DecodeSwap::with_index(m.sets.get_or_init(|| Arc::new(crate::decode_swap::SetIndex::of(track, &m.demux))).clone()); swap.reseed(&mut dec, track, &cursor, origin + key_ns); // SWAPBACKSEEK (SR353): the run's keyframe with its in-band parameter sets; SWAPBACKSPANCACHE (SR370): every set in effect, the reel's index walked once
-        Ok(Vid { src, origin, track_id: track.id, cursor, track: track.clone(), swap, stood_in: !dec.is_real(), dec, pending: VecDeque::new(), peeked: None, last: None, done: false })
+        cursor.seek_track(i, origin + key_ns);
+        if let Some(hit) = swap.reseed(&mut dec, track, &cursor, origin + key_ns) { // SWAPBACKSEEK (SR353): the run's keyframe with every set in effect there
+            log::info!("[STRIA] :: nle reseed reel={} cache={}", src.0, if hit { "hit" } else { "miss" });
+        }
+        Ok(Vid { src, origin, track_id: track.id, cursor, track: track.clone(), swap, stood_in: !dec.is_real(), park: m.park.clone(), dec, pending: VecDeque::new(), peeked: None, last: None, done: false })
     }
     fn pull(&mut self) -> Result<Option<Frame>, RenderError> {
         loop {
@@ -878,4 +892,22 @@ impl Sources {
 fn src_rgba(sources: &Sources, src: SourceId, f: &Frame) -> Vec<u8> {
     let track = sources.get(src).ok().and_then(|m| m.video.map(|i| &m.demux.tracks()[i]));
     f.to_rgba_colour(track.and_then(|t| t.colour.as_ref()), track.map_or(gneiss_pal::dsp::video::Chroma::Nearest, gneiss_pal::dsp::video::chroma_of))
+}
+
+/// SWAPBACK-NLECACHE (LEDGER SR388): the editor's runs park their decoder across runs. A run's close (a cut, a seek step, the
+/// end of a render: every preview tick is one render) hands its decoder and [`DecodeSwap`] (its parked spans, LRU, keyed by set
+/// state) back to its reel's `Media`, and the reel's next run open takes them, resets the decoder and reseeds it — the
+/// Player's seek, so a scrub back into a span reuses its decoder (`[STRIA] :: nle reseed reel=<id> cache=hit|miss`). The slot
+/// is locked only for that take and this put, never across a decode. A second live run of one reel (a transition between two
+/// of its clips) opens fresh, and its close leaves an occupied slot as it is (SWAPBACK-NLECACHE-SHARED owed).
+type ReelPark = Arc<std::sync::Mutex<Option<(DecodeSwap, Box<dyn VideoDecoder>)>>>;
+
+impl Drop for Vid {
+    fn drop(&mut self) {
+        let Ok(mut slot) = self.park.lock() else { return };
+        if slot.is_none() {
+            let dec = std::mem::replace(&mut self.dec, Box::new(gneiss_pal::dsp::video::TestPattern::stand_in(&self.track)));
+            *slot = Some((std::mem::take(&mut self.swap), dec));
+        }
+    }
 }

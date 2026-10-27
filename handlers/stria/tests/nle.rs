@@ -819,3 +819,23 @@ fn nle_standin_open_a_reel_no_decoder_fits_is_edited_on_stand_in_frames() {
     assert_eq!(sink.frames[0], (3, TestPattern::render(64, 48, 3)));
     println!("nle-standin-open: {report} frames={}", r.frames);
 }
+
+/// SWAPBACKNLECACHE (LEDGER SR388): a reel's runs reuse ONE held decoder (each run's close parks it in the reel's `Media`, the
+/// next open resets it, the Player's seek). Rule: ticks rendered one at a time out of order (a preview scrub: each a run opened
+/// on the held, reset decoder) draw exactly the whole render's frames at those ticks.
+#[test]
+fn swapbacknlecache_scrubbed_runs_draw_the_whole_render() {
+    let tl = timeline();
+    let mut src = Sources::new(&tl);
+    for (i, b) in BASE.iter().enumerate() {
+        src.add(SourceId(i as u32), synth_source(*b, 50, 25)).unwrap();
+    }
+    let mut whole = Collect::default();
+    render(&tl, 0..35, &src, &mut whole).unwrap();
+    for t in [30i64, 5, 17, 12, 30, 5, 0, 34] {
+        let mut one = Collect::default();
+        render(&tl, t..t + 1, &src, &mut one).unwrap();
+        assert_eq!(one.frames, [whole.frames[t as usize].clone()], "tick {t}");
+    }
+    println!("swapbacknlecache: scrub 8 ticks = whole");
+}
