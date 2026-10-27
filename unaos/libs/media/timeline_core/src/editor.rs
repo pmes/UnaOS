@@ -13,7 +13,7 @@
 
 use alloc::vec::Vec;
 
-use crate::{Clip, EditError, Timeline, edl};
+use crate::{Clip, EditError, Timeline, Transition, edl};
 
 /// Undo depth kept.
 pub const UNDO_MAX: usize = 256;
@@ -43,11 +43,13 @@ pub struct EditorState {
     pub zoom: u32,
     undo: Vec<Timeline>,
     redo: Vec<Timeline>,
+    /// NLE3d (SR302): the selected transition, `(track, index into tracks[track].transitions)`; the face's widget.
+    pub transition: Option<(usize, usize)>,
 }
 
 impl EditorState {
     pub fn new(timeline: Timeline) -> EditorState {
-        EditorState { timeline, selection: None, set: Vec::new(), playhead: 0, zoom: ZOOM_DEFAULT, undo: Vec::new(), redo: Vec::new() }
+        EditorState { timeline, selection: None, set: Vec::new(), playhead: 0, zoom: ZOOM_DEFAULT, undo: Vec::new(), redo: Vec::new(), transition: None }
     }
     /// Open a CMX 3600 EDL (`fps` when it carries no `* UNA FPS` line).
     pub fn open(text: &str, fps: u32) -> Result<EditorState, edl::EdlError> {
@@ -168,6 +170,7 @@ impl EditorState {
     fn settle(&mut self) {
         let tl = &self.timeline;
         self.set.retain(|&(t, i)| tl.tracks.get(t).is_some_and(|tr| i < tr.clips.len()));
+        self.transition = self.transition.filter(|&(t, i)| tl.tracks.get(t).is_some_and(|tr| i < tr.transitions.len()));
         if self.selected().is_none() {
             self.selection = self.set.first().copied();
         }
@@ -247,6 +250,50 @@ impl EditorState {
         self.set.sort_unstable();
         self.selection = self.timeline.clip_at(p_at.0, p_at.1).map(|i| (p_at.0, i));
         self.settle();
+        Ok(())
+    }
+}
+
+/// NLE3d (LEDGER SR302): the transition selection (the face's widget on a cut) and its edits, each ONE `commit` of one of
+/// timeline_core's transition ops: `remove_transition`, and a length change as `add_transition` /
+/// `add_transition_from_black` at the same `at` (the op replaces the transition there and keeps its index).
+impl EditorState {
+    /// Select the transition `idx` of `track` (the clips are deselected).
+    pub fn select_transition(&mut self, track: usize, idx: usize) -> Result<(), EditError> {
+        let tr = self.timeline.tracks.get(track).ok_or(EditError::NoTrack)?;
+        if idx >= tr.transitions.len() {
+            return Err(EditError::Transition);
+        }
+        self.deselect();
+        self.transition = Some((track, idx));
+        Ok(())
+    }
+    /// The selected transition.
+    pub fn selected_transition(&self) -> Option<Transition> {
+        let (t, i) = self.transition?;
+        self.timeline.tracks.get(t)?.transitions.get(i).copied()
+    }
+    /// Take the selected transition off its cut (`Timeline::remove_transition`); the selection goes.
+    pub fn remove_selected_transition(&mut self) -> Result<(), EditError> {
+        let (track, _) = self.transition.ok_or(EditError::Transition)?;
+        let x = self.selected_transition().ok_or(EditError::Transition)?;
+        let tl = self.timeline.remove_transition(track, x.at)?;
+        self.commit(tl);
+        self.transition = None;
+        Ok(())
+    }
+    /// Give the selected transition `dur` ticks (the add op of its kind at the same `at`; `validate` refuses `dur < 1`
+    /// and a handle too short). The selection stays on it.
+    pub fn set_transition_dur(&mut self, dur: i64) -> Result<(), EditError> {
+        let (track, idx) = self.transition.ok_or(EditError::Transition)?;
+        let x = self.selected_transition().ok_or(EditError::Transition)?;
+        let tl = if x.from_black {
+            self.timeline.add_transition_from_black(track, x.at, x.kind, dur)?
+        } else {
+            self.timeline.add_transition(track, x.at, x.kind, dur)?
+        };
+        self.commit(tl);
+        self.transition = Some((track, idx));
         Ok(())
     }
 }
