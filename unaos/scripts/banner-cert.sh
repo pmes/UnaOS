@@ -329,6 +329,7 @@ nvidia-kepler|:: kepler: probe-abort bar0-unmapped|-|measured
 nvidia-kepler-takeover|:: kdisp: takeover-abort no-gop-info ::|nvidia-kepler|measured
 nvidia-kepler-fifo|:: kepler: |nvidia-kepler|measured
 nvidia-kepler-ce|VOID — the control bracket moved across this base|-|measured
+nvidia-kepler-cecopy|:: KEPLERCE: channel=absent copy=- verify=- us=0 jobs=0/3 wall=- -> SKIP reason=no-kepler ::|-|unmeasured-here
 noaspm|[pcih] aspm cleared rp|-|measured
 rtwit|[rtwit] <utf8-error>|-|measured
 deadman|[deadman] <utf8-error>|-|measured
