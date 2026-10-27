@@ -23,10 +23,11 @@ use crate::ctu::{SliceDecoder, Storage};
 use crate::deblock::deblock_picture;
 use crate::dpb::{Dpb, RefList, Rps};
 use crate::inter::InterCtx;
-use crate::nal::{self, NalHeader, AUD_NUT, CRA_NUT, EOB_NUT, EOS_NUT, PPS_NUT, SPS_NUT, VPS_NUT};
+use crate::nal::{self, NalHeader, AUD_NUT, CRA_NUT, EOB_NUT, EOS_NUT, PPS_NUT, SPS_NUT, SUFFIX_SEI_NUT, VPS_NUT};
 use crate::picture::{Picture, SliceInfo};
 use crate::ps::{parse_pps, parse_sps, parse_vps, Geometry, Pps, Sps, Vps};
 use crate::sao::sao_picture;
+use crate::sei::{self, HashCheck, PictureHash};
 use crate::slice::{parse_slice_header, peek_pps_id, SliceHeader, SliceType};
 use crate::{Error, Frame, Result};
 
@@ -41,6 +42,8 @@ struct CurPic {
     /// The picture's reference picture set (8.3.2) and the current slice's lists (8.3.4).
     rps: Rps,
     lists: [RefList; 2],
+    /// HEVCCONF (SR321): the picture's decoded picture hash (a suffix SEI of its access unit), checked at its end.
+    hash: Option<PictureHash>,
 }
 
 /// An H.265 decoder for one stream.
@@ -53,6 +56,8 @@ pub struct Decoder {
     dpb: Dpb,
     /// The reference picture lists of each independent P / B slice of the latest picture started.
     lists_log: Vec<[RefList; 2]>,
+    /// HEVCCONF (SR321): (PicOrderCntVal, verdict) of every picture that carried a decoded picture hash.
+    hashes: Vec<(i32, HashCheck)>,
     out: VecDeque<Frame>,
     tag: i64,
     nal_length_size: usize,
@@ -102,6 +107,7 @@ impl Decoder {
             cur: None,
             dpb: Dpb::default(),
             lists_log: Vec::new(),
+            hashes: Vec::new(),
             out: VecDeque::new(),
             tag: 0,
             nal_length_size: 4,
@@ -118,6 +124,7 @@ impl Decoder {
         self.cur = None;
         self.dpb.clear();
         self.lists_log.clear();
+        self.hashes.clear();
         self.out.clear();
         self.first_picture = true;
         self.skip_rasl = false;
@@ -207,6 +214,12 @@ impl Decoder {
         &self.lists_log
     }
 
+    /// HEVCCONF (SR321): the decoded picture hash verdicts (D.3.19) of the pictures finished since the last call, in
+    /// decoding order, as (PicOrderCntVal, verdict); a picture without a hash SEI has no entry.
+    pub fn take_hash_checks(&mut self) -> Vec<(i32, HashCheck)> {
+        core::mem::take(&mut self.hashes)
+    }
+
     /// Decode one NAL unit (two header bytes first, no start code or length prefix).
     pub fn decode_nal(&mut self, data: &[u8]) -> Result<()> {
         if data.is_empty() {
@@ -256,7 +269,15 @@ impl Decoder {
                 self.first_picture = true;
                 Ok(())
             }
-            // SEI, filler data, reserved and unspecified types.
+            // HEVCCONF (SR321): the decoded picture hash of the picture under decoding; SEI is non-normative, so a
+            // malformed message is dropped, never an error.
+            SUFFIX_SEI_NUT => {
+                if let (Some(cur), Ok(Some(h))) = (self.cur.as_mut(), sei::picture_hash(rbsp)) {
+                    cur.hash = Some(h);
+                }
+                Ok(())
+            }
+            // Prefix SEI, filler data, reserved and unspecified types.
             _ => Ok(()),
         }
     }
@@ -368,7 +389,7 @@ impl Decoder {
         let (reorder, latency, max_dec) = self.bump;
         self.dpb.make_room(reorder, latency, max_dec, &mut self.out);
         self.lists_log.clear();
-        self.cur = Some(CurPic { pic, sps, pps, geo, store: Storage::default(), indep: None, rps, lists: Default::default() });
+        self.cur = Some(CurPic { pic, sps, pps, geo, store: Storage::default(), indep: None, rps, lists: Default::default(), hash: None });
         Ok(())
     }
 
@@ -427,6 +448,10 @@ impl Decoder {
         let Some(mut cur) = self.cur.take() else { return };
         deblock_picture(&mut cur.pic, &cur.geo, &cur.sps, &cur.pps);
         sao_picture(&mut cur.pic, &cur.geo, &cur.sps, &cur.pps);
+        // HEVCCONF (SR321): D.3.19 over the filtered, uncropped sample arrays.
+        if let Some(h) = &cur.hash {
+            self.hashes.push((cur.pic.poc, sei::check(&cur.pic.planes, cur.pic.bit_depth, h)));
+        }
         // C.5.2.3: every picture is stored (a reference even when not output), then bumped as the DPB requires.
         let (reorder, latency, _) = self.bump;
         self.dpb.store(cur.pic, reorder, latency, &mut self.out);

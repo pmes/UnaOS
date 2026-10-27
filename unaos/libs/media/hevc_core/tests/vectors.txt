@@ -1,0 +1,37 @@
+# HEVCCONF (LEDGER SR321) conformance vectors: <sha256> <path under the vector cache> <url> <yuv md5> <bitstream>.
+# Fetched at test time by h264_core's fetcher (tests/conformance.rs links h264_core/tests/common/mod.rs) into
+# $HEVC_VECTORS or target/tmp/hevc-vectors/, verified by sha256; never committed. Offline => SKIP.
+# The JCT-VC conformance suite of ITU-T H.265.1 (draft_conformance/HEVC_v1): each zip holds the bitstream named in the
+# last column; every output picture (cropped, output order) is hashed into one md5 that must equal the 4th column, and
+# every decoded picture hash SEI (CRC / checksum; MD5 refused by name) must match its picture.
+#
+# PROVENANCE: the URL, the bitstream name and the decoded-YUV md5 of each row are those of fluster's
+# test_suites/h.265/JCT-VC-HEVC_V1.json (github.com/fluendo/fluster @5d9d2bc676d97a17900e98fc69216d6d2c8f1ad0,
+# 2026-10-26: 147 vectors, "test_method": "md5" over yuv420p / yuv420p10le).
+# PIN OWED (HEVCCONF-PIN): www.itu.int answered 403 (CONNECT refused) at the authoring executor's and the seat's egress
+# (2026-10-27), so the rows carry `-` and the fetcher prints `UNPINNED <path> <sha256>`; the first bench with access
+# replaces each `-` with that digest.
+# Main, 8-bit 4:2:0: the interactions of inter (AMP partitions, AMVP, merge candidates, TMVP, mv clipping at and past
+# the picture edge, weighted prediction, the RPS with long-term pictures, POC, deblocking and SAO over inter pictures,
+# wavefront).
+- hevc/AMP_A_Samsung_7.zip https://www.itu.int/wftp3/av-arch/jctvc-site/bitstream_exchange/draft_conformance/HEVC_v1/AMP_A_Samsung_7.zip 93a5875d58072db5539c04e1e943ed9d AMP_A_Samsung_7.bin
+- hevc/AMVP_A_MTK_4.zip https://www.itu.int/wftp3/av-arch/jctvc-site/bitstream_exchange/draft_conformance/HEVC_v1/AMVP_A_MTK_4.zip 5dd1b1099391ad659225fbf94965a6c7 AMVP_A_MTK_4/AMVP_A_MTK_4.bit
+- hevc/MERGE_A_TI_3.zip https://www.itu.int/wftp3/av-arch/jctvc-site/bitstream_exchange/draft_conformance/HEVC_v1/MERGE_A_TI_3.zip 3a15886a0158ef1aaf557869b2e9c522 MERGE_A_TI_3/MERGE_A_TI_3.bit
+- hevc/MERGE_F_MTK_4.zip https://www.itu.int/wftp3/av-arch/jctvc-site/bitstream_exchange/draft_conformance/HEVC_v1/MERGE_F_MTK_4.zip a8f0982f026dfda1c02b4d4d3eb88132 MERGE_F_MTK_4/MERGE_F_MTK_4.bit
+- hevc/TMVP_A_MS_3.zip https://www.itu.int/wftp3/av-arch/jctvc-site/bitstream_exchange/draft_conformance/HEVC_v1/TMVP_A_MS_3.zip 168f8096e56b8a8c1aa03fa5fffdfd23 TMVP_A_MS_3.bit
+- hevc/MVCLIP_A_qualcomm_3.zip https://www.itu.int/wftp3/av-arch/jctvc-site/bitstream_exchange/draft_conformance/HEVC_v1/MVCLIP_A_qualcomm_3.zip 78b398c201089b6b17bcbda2bbccf3ae MVCLIP_A_qualcomm_3/MVCLIP_A_qualcomm_3.bit
+- hevc/MVEDGE_A_qualcomm_3.zip https://www.itu.int/wftp3/av-arch/jctvc-site/bitstream_exchange/draft_conformance/HEVC_v1/MVEDGE_A_qualcomm_3.zip 101c5bfe16ff1739909161794af29a2d MVEDGE_A_qualcomm_3/MVEDGE_A_qualcomm_3.bit
+- hevc/WP_A_Toshiba_3.zip https://www.itu.int/wftp3/av-arch/jctvc-site/bitstream_exchange/draft_conformance/HEVC_v1/WP_A_Toshiba_3.zip 127b99d0c11c930b6f248750b5848a0b WP_A_Toshiba_3.bit
+- hevc/RPS_A_docomo_5.zip https://www.itu.int/wftp3/av-arch/jctvc-site/bitstream_exchange/draft_conformance/HEVC_v1/RPS_A_docomo_5.zip 7f4ad6c6b3de54558b0db59629b87db9 RPS_A_docomo_5.bit
+- hevc/LTRPSPS_A_Qualcomm_1.zip https://www.itu.int/wftp3/av-arch/jctvc-site/bitstream_exchange/draft_conformance/HEVC_v1/LTRPSPS_A_Qualcomm_1.zip e925d467c20180090c09c02d02c3aa25 LTRPSPS_A_Qualcomm_1.bit
+- hevc/POC_A_Bossen_3.zip https://www.itu.int/wftp3/av-arch/jctvc-site/bitstream_exchange/draft_conformance/HEVC_v1/POC_A_Bossen_3.zip faf33bec64d3e58c426ed2772903a0bf POC_A_Bossen_3/POC_A_Bossen_3.bin
+- hevc/DBLK_A_SONY_3.zip https://www.itu.int/wftp3/av-arch/jctvc-site/bitstream_exchange/draft_conformance/HEVC_v1/DBLK_A_SONY_3.zip 42486a48ea12d5ab6cd98ed2e2807cfe DBLK_A_SONY_3.bit
+- hevc/SAO_A_MediaTek_4.zip https://www.itu.int/wftp3/av-arch/jctvc-site/bitstream_exchange/draft_conformance/HEVC_v1/SAO_A_MediaTek_4.zip 272e694a2262a2b34f6248f787a4431d SAO_A_MediaTek_4.bit
+- hevc/WPP_A_ericsson_MAIN_2.zip https://www.itu.int/wftp3/av-arch/jctvc-site/bitstream_exchange/draft_conformance/HEVC_v1/WPP_A_ericsson_MAIN_2.zip cd7e815eb47e8138fec2185d4de84304 WPP_A_ericsson_MAIN_2.bit
+# Refused by name: constrained_intra_pred_flag in P / B slices (HEVCINTER-CIP).
+- hevc/CIP_A_Panasonic_3.zip https://www.itu.int/wftp3/av-arch/jctvc-site/bitstream_exchange/draft_conformance/HEVC_v1/CIP_A_Panasonic_3.zip 4cbf601ba98d63f642defab5eaa12c8d CIP_A_Panasonic_3/CIP_A_Panasonic_3.bit
+# Main 10 (HEVCMAIN10 SR311): the reference md5 is of yuv420p10le (two bytes per sample, low first).
+- hevc/WP_A_MAIN10_Toshiba_3.zip https://www.itu.int/wftp3/av-arch/jctvc-site/bitstream_exchange/draft_conformance/HEVC_v1/WP_A_MAIN10_Toshiba_3.zip c48e853010a234786dc87790d053b03a WP_A_MAIN10_Toshiba_3/WP_A_MAIN10_Toshiba_3.bit
+- hevc/DBLK_A_MAIN10_VIXS_4.zip https://www.itu.int/wftp3/av-arch/jctvc-site/bitstream_exchange/draft_conformance/HEVC_v1/DBLK_A_MAIN10_VIXS_4.zip c4594956bb9e8303f1662f9eb1bcdf50 DBLK_A_MAIN10_VIXS_4/DBLK_A_MAIN10_VIXS_4.bit
+- hevc/WPP_A_ericsson_MAIN10_2.zip https://www.itu.int/wftp3/av-arch/jctvc-site/bitstream_exchange/draft_conformance/HEVC_v1/WPP_A_ericsson_MAIN10_2.zip e68b9d75ff9cf1d9486e964051351f69 WPP_A_ericsson_MAIN10_2.bit
+- hevc/INITQP_B_Main10_Sony_1.zip https://www.itu.int/wftp3/av-arch/jctvc-site/bitstream_exchange/draft_conformance/HEVC_v1/INITQP_B_Main10_Sony_1.zip f63c71e5f6b9c6ddf2b080524f9f14b1 INITQP_B_Main10_Sony_1/INITQP_B_Main10_Sony_1.bit

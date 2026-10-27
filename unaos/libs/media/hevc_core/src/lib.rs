@@ -20,6 +20,7 @@
 //! | [`picture`]     | the picture under decoding and the per-block facts the loop filters read        |
 //! | [`deblock`]     | 8.7.2 deblocking filter                                                         |
 //! | [`sao`]         | 8.7.3 sample adaptive offset                                                    |
+//! | [`sei`]         | 7.3.5 sei_message, D.2.19 / D.3.19 the decoded picture hash (HEVCCONF SR321)     |
 //! | [`dpb`]         | 8.3.2 reference picture set, 8.3.4 reference picture lists, C.5.2 DPB output    |
 //! | [`inter`]       | 8.5.3 merge / AMVP / TMVP, 8-tap / 4-tap interpolation, weighted prediction      |
 //! | [`decoder`]     | access units, 8.3.1 POC, NoRaslOutputFlag, C.5.2 output order, the API          |
@@ -87,6 +88,7 @@ pub mod nal;
 pub mod picture;
 pub mod ps;
 pub mod sao;
+pub mod sei;
 pub mod slice;
 pub mod tables;
 pub mod transform;

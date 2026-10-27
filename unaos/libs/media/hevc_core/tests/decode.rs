@@ -412,3 +412,35 @@ fn sao_edge_offset_kat() {
     assert_eq!(pic.planes[0].at(4, 5), 100); // edgeIdx 3 (offset 0)
     assert_eq!(pic.planes[0].at(0, 5), 100); // the picture's left column: a neighbour outside, left as is
 }
+
+/// HEVCCONF (SR321): the decoded picture hash SEI (a suffix SEI after the picture's slice) is checked against the
+/// decoded, filtered, uncropped picture: the flat-128 64x48 picture with its true CRCs is a Match, with a checksum one
+/// off in luma a Mismatch(0). The hash functions themselves have KATs in tests/conformance.rs.
+#[test]
+fn picture_hash_sei_checks_the_decoded_picture() {
+    use hevc_core::picture::Plane;
+    use hevc_core::sei::{plane_checksum, plane_crc, HashCheck};
+    let flat = [Plane::new(64, 48, 128), Plane::new(32, 24, 128), Plane::new(32, 24, 128)];
+    let checks = |payload: Vec<u8>| {
+        let mut s = all_dc_stream(false, None);
+        let mut rbsp = vec![132, payload.len() as u8];
+        rbsp.extend(payload);
+        rbsp.push(0x80);
+        s.extend(nal(40, &rbsp));
+        let mut d = Decoder::new();
+        d.decode_annexb(&s).expect("decode");
+        d.flush();
+        assert_eq!(d.take_frames().len(), 1);
+        d.take_hash_checks()
+    };
+    let mut crc = vec![1u8];
+    for p in &flat {
+        crc.extend(plane_crc(p, 8).to_be_bytes());
+    }
+    assert_eq!(checks(crc), [(0, HashCheck::Match)]);
+    let mut sum = vec![2u8];
+    for (c, p) in flat.iter().enumerate() {
+        sum.extend((plane_checksum(p, 8) + u32::from(c == 0)).to_be_bytes());
+    }
+    assert_eq!(checks(sum), [(0, HashCheck::Mismatch(0))]);
+}
