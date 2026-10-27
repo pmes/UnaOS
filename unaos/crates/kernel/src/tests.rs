@@ -8108,7 +8108,7 @@ fn autolock_root_kept(root0: u8) -> bool {
 // the scheduler's sleep / spawn / placement and TESTWATCH (x86 only). The overrun is ONE path on both arches ([`abandon`]:
 // the run retired, the B817 SKIP line, the child marked abandoned and named); a marked child's return is counted by
 // [`late`] (`[bootlist] late … late=<n>`), and a tally line rides beside every summary (whose format the x86-wc spec pins).
-// A list line's `@<board>` tags are matched against `boot::OLDEST.0` (rmbp12, pi4, orin): no second board identity.
+// A list line's `@<board>` tags are matched against `boot::oldest().0` (rmbp12, zenbook, pi4, orin): no second board identity.
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 mod bootlist_arm {
     //! CHARTER: Kernel — kernel-by-ruling R132 (BOOTLISTARM: the list runner's arch shims and its one overrun path; seam: kernel-only)
@@ -8188,10 +8188,10 @@ mod bootlist_arm {
     #[cfg(target_arch = "aarch64")]
     pub(super) fn watch_disarm() {}
 
-    /// This board's name for the list's `@<board>` tags: `boot::OLDEST.0` (one identity per image line).
+    /// This board's name for the list's `@<board>` tags: `boot::oldest().0` (one identity per boot; ZENBOOKOLDEST Z12: the Zenbook says `zenbook`).
     #[cfg(feature = "login")]
     pub(super) fn board() -> &'static str {
-        crate::boot::OLDEST.0
+        crate::boot::oldest().0
     }
 
     /// No `login`, no OLDEST: no board-tagged line runs.

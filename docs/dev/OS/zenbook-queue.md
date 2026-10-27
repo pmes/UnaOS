@@ -27,8 +27,8 @@ ZENBOOKGOP, ZENBOOKMT7925) are the next rows. No Zenbook image line exists yet (
 2. **ZENBOOK-IMAGELINE** — In flight (ZENBOOKIMAGELINE, Z6): `unaos/scripts/image-line-zenbook.env` (25 kernel knobs +
    the `[media]` UNAOS_MT7925_FW_PATH: the rMBP line without its Mac-only knobs and the SATA set, plus NVME) and
    `./arroyo esp-zenbook` (esp-x86 under that file after every inherited `UNAOS_*` is unset, bar four bench values); the
-   check leg `x86-zenbook-image`; um5606w.md §5/§6. Owed: ZENBOOK-OLDEST (`boot::OLDEST` is cfg-only, so the image prints
-   rmbp12 2012, not 2024), ZENBOOK-QEMULANE (an arroyo `test` lane with the Zenbook knobs), ZENBOOK-LINEGATE (a
+   check leg `x86-zenbook-image`; um5606w.md §5/§6. Owed: ZENBOOK-OLDEST in flight (ZENBOOKOLDEST, Z12: ONE `boot::oldest()`, the cfg
+   default overridden by `hw::platform()`: the Zenbook prints zenbook 2024, `@zenbook` bootlist lines), ZENBOOK-QEMULANE (an arroyo `test` lane with the Zenbook knobs), ZENBOOK-LINEGATE (a
    `knob-parity-zenbook` gates row running the x86 `--line` mode on the file); row 1's recipe should name esp-zenbook.
    bdf=<b:d.f>` off the glass, and if the FTDI did not bind rebuild with `UNAOS_XHCI_PICK=<i>` for the next i (Z7). Expected first lines and refusals: um5606w.md §6. Bench only, Peter's go.
 3. **ZENBOOK-NVME** — `drivers/nvme.rs` (class 0108, vendor varies): the root volume. Rung 1 ZENBOOKNVME (Z2); in flight (NVMEBOOT, Z9: the handle, the root grant, the granted write).
