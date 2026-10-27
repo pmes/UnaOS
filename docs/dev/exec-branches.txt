@@ -1083,3 +1083,8 @@ refs/heads/exec-rmbp-preemptoffarm   72fe44acd FOLDED-BY-HAND (this commit) 2026
 refs/heads/exec-rmbp-wifileave   cd26b9213 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-xhciloanptpcopy   edb51e58d FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-loginfurnitureonce   eee01749e FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-aethersubmitcaption   a9bb0b749 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-aethersurfaceheight   a9bb0b749 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-aetherheaderband   a9bb0b749 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-installervessel   a9bb0b749 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-installercard   a9bb0b749 IN-FLIGHT cut 2026-10-27
