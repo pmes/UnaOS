@@ -23,7 +23,7 @@ pixel_core = { path = "../../unaos/libs/media/pixel_core" }
 # HEVCHEIC (SR220): HEIC stills decode through `gneiss_pal::dsp::image::decode_heic` (demux_core's HEIF reader +
 # hevc_core). GNEISSPAL-NOSTD (SR308): gneiss_pal's `api` + `forge` are gated on `std`, so Facet takes
 # `default-features = false` and links dsp only — no http_core / tokio through gneiss_pal (HEVCHEIC's option A undone).
-gneiss_pal = { path = "../../libs/gneiss_pal", default-features = false, features = ["hevc"] }
+gneiss_pal = { path = "../../libs/gneiss_pal", default-features = false, features = ["hevc", "av1"] }
 
 [dev-dependencies]
 tokio = { version = "1.53", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }

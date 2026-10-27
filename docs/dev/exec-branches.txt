@@ -855,7 +855,7 @@ refs/heads/exec-rmbp-pngone   113d4379a FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-pdf1   5da786379 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-nle4c   c754fb842 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-nle3d   aa1992d30 FOLDED-BY-HAND (this commit) 2026-10-27
-refs/heads/exec-rmbp-heifone   5da786379 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-heifone   e518f806f FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-hevcdepthcore   94fa106ce FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-nleprobehdrwire   3f450a486 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-nle2mods   44d0e2b7a FOLDED-BY-HAND (this commit) 2026-10-27
