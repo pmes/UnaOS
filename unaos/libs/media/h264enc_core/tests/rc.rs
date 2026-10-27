@@ -136,7 +136,7 @@ fn b_vbr_spends_on_the_complex_picture_and_holds_the_mean() {
     let at = 40;
     let src = spiked(at);
     let target = 60u32;
-    let vbr = Some(RateControl { bits_per_second: target * 1000, fps_num: FPS, fps_den: 1, mode: RcMode::Vbr { max_bits_per_second: 2 * target * 1000 } });
+    let vbr = Some(RateControl::vbr(target, 2 * target, (FPS, 1)));
     let c = run(Config { rate: cbr(target), ..base(26) }, &src, false);
     let v = run(Config { rate: vbr, ..base(26) }, &src, false);
     let (gc, gv) = (kbps(&c.sizes), kbps(&v.sizes));
@@ -152,7 +152,7 @@ fn b_vbr_spends_on_the_complex_picture_and_holds_the_mean() {
 
 #[test]
 fn c_rate_controlled_decode_is_the_reconstruction() {
-    let vbr = Some(RateControl { bits_per_second: 45_000, fps_num: FPS, fps_den: 1, mode: RcMode::Vbr { max_bits_per_second: 90_000 } });
+    let vbr = Some(RateControl::vbr(45, 90, (FPS, 1)));
     for rate in [cbr(60), cbr(25), vbr] {
         for deblock in [false, true] {
             let r = run(Config { rate, deblock, subpel: 2, ..base(26) }, &spiked(40), true);
@@ -197,7 +197,7 @@ fn d_rate_none_keeps_the_constant_qp_bytes() {
 /// GOP-30 scene is smaller than the CAVLC one (both printed).
 #[test]
 fn e_cabac_rate_controlled_decode_is_the_reconstruction() {
-    let vbr = Some(RateControl { bits_per_second: 45_000, fps_num: FPS, fps_den: 1, mode: RcMode::Vbr { max_bits_per_second: 90_000 } });
+    let vbr = Some(RateControl::vbr(45, 90, (FPS, 1)));
     for rate in [cbr(60), cbr(25), vbr] {
         for deblock in [false, true] {
             let r = run(Config { rate, deblock, subpel: 2, entropy: h264enc_core::Entropy::Cabac, ..base(26) }, &spiked(40), true);
@@ -266,4 +266,39 @@ fn i_transform8x8_off_keeps_the_pinned_bytes() {
         }
         assert_eq!(fnv(&samples), want, "{name}: transform8x8 false moved the pinned bytes");
     }
+}
+
+/// H264ENCVBRCRF (LEDGER SR383): (j) the VBR constructor builds the literal the tests wrote (saturating like `cbr`).
+#[test]
+fn j_vbr_constructor_equals_the_literal() {
+    assert_eq!(RateControl::vbr(60, 120, (FPS, 1)), RateControl { bits_per_second: 60_000, fps_num: FPS, fps_den: 1, mode: RcMode::Vbr { max_bits_per_second: 120_000 } });
+    assert_eq!(RateControl::vbr(45, 90, (30_000, 1_001)), RateControl { bits_per_second: 45_000, fps_num: 30_000, fps_den: 1_001, mode: RcMode::Vbr { max_bits_per_second: 90_000 } });
+    assert_eq!(RateControl::vbr(u32::MAX, u32::MAX, (FPS, 1)).mode, RcMode::Vbr { max_bits_per_second: u32::MAX });
+}
+
+/// (k) constant quality: every picture of the GOP-30 scene is coded at its crf (I and P), decodes to the reconstruction byte
+/// for byte, and crf 18 spends more bytes than crf 28 (both printed).
+#[test]
+fn k_crf_holds_its_qp_and_orders_sizes() {
+    let mut total = Vec::new();
+    for crf in [18u8, 28] {
+        let r = run(Config { rate: Some(RateControl::crf(crf, (FPS, 1))), deblock: true, ..base(26) }, &scene, true);
+        assert!(r.qps.iter().all(|&q| q == crf), "crf {crf}: picture QPs {:?}", r.qps);
+        total.push(r.sizes.iter().sum::<usize>());
+    }
+    println!("rc crf 18={} crf 28={} bytes", total[0], total[1]);
+    assert!(total[0] > total[1], "crf 18 ({} bytes) is not larger than crf 28 ({})", total[0], total[1]);
+}
+
+/// (l) the QP floor (`Config::qp_min`): a CBR far above the scene's need drives the picture QP below 24 without a floor; with
+/// `qp_min: Some(24)` no picture goes below 24, and the stream still decodes to the reconstruction.
+#[test]
+fn l_qp_min_clamps_the_rate_controller() {
+    let free = run(Config { rate: cbr(2000), ..base(26) }, &scene, false);
+    let lo = *free.qps.iter().min().unwrap();
+    assert!(lo < 24, "the unfloored CBR never went below 24 (min {lo}): the floor would not be exercised");
+    let floored = run(Config { rate: cbr(2000), qp_min: Some(24), ..base(26) }, &scene, true);
+    let flo = *floored.qps.iter().min().unwrap();
+    println!("rc qp_min: cbr 2000 picture QP min {lo} unfloored, {flo} with qp_min 24");
+    assert!(flo >= 24, "qp_min 24: a picture at QP {flo}");
 }
