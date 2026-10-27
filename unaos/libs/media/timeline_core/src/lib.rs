@@ -12,7 +12,8 @@
 //!   [`Track`]s of [`Clip`]s. A clip shows source ticks `src_in..src_out` from timeline tick `at`.
 //! * The operations are pure: each takes `&self` and returns a new, validated `Timeline` or an [`EditError`]
 //!   ([`Timeline::place`], [`Timeline::split`], [`Timeline::trim_in`], [`Timeline::trim_out`],
-//!   [`Timeline::ripple_delete`], [`Timeline::lift`], [`Timeline::move_clip`]).
+//!   [`Timeline::ripple_delete`], [`Timeline::lift`], [`Timeline::move_clip`]; NLE2c LEDGER SR217: over a set of clips
+//!   as ONE edit, [`Timeline::ripple_delete_many`], [`Timeline::lift_many`], [`Timeline::move_many`]).
 //! * The invariants ([`Timeline::validate`]): on every track clips are ordered by `at` and never overlap; `at >= 0`;
 //!   `0 <= src_in < src_out <= source.duration`; every clip names a source that exists.
 //! * [`edl`]: the CMX 3600 text EDL (non-drop frame) — reader and writer.
@@ -539,6 +540,47 @@ impl Timeline {
         tl.validate()?;
         Ok(tl)
     }
+
+    /// NLE2c: ripple-delete every clip in `picks` (`(track, idx)`, indices into `self`) as ONE edit: [`Timeline::ripple_delete`]
+    /// applied per pick in descending `(track, idx)` order on the running value. Any refusal refuses the whole set.
+    pub fn ripple_delete_many(&self, picks: &[(usize, usize)]) -> Result<Timeline, EditError> {
+        let mut tl = self.clone();
+        for (t, i) in picks_desc(self, picks)? {
+            tl = tl.ripple_delete(t, i)?;
+        }
+        Ok(tl)
+    }
+
+    /// NLE2c: lift every clip in `picks` as ONE edit ([`Timeline::lift`] per pick, descending; the holes stay).
+    pub fn lift_many(&self, picks: &[(usize, usize)]) -> Result<Timeline, EditError> {
+        let mut tl = self.clone();
+        for (t, i) in picks_desc(self, picks)? {
+            tl = tl.lift(t, i)?;
+        }
+        Ok(tl)
+    }
+
+    /// NLE2c: move every clip in `picks` by `delta` ticks on its own track as ONE transaction: all leave, all land, ONE
+    /// `validate` (an overlap, a negative `at` or a pinned transition refuses the whole set). Butted clips move together,
+    /// where a sequence of [`Timeline::move_clip`]s would trip on an intermediate overlap.
+    pub fn move_many(&self, picks: &[(usize, usize)], delta: i64) -> Result<Timeline, EditError> {
+        let order = picks_desc(self, picks)?;
+        let mut tl = self.clone();
+        let mut moved: Vec<(usize, Clip)> = Vec::new();
+        for (t, i) in order {
+            let mut c = tl.tracks[t].clips.remove(i);
+            c.at = c.at.saturating_add(delta);
+            moved.push((t, c));
+        }
+        for (t, c) in moved {
+            tl.tracks[t].clips.push(c);
+        }
+        for t in &mut tl.tracks {
+            sort(t);
+        }
+        tl.validate()?;
+        Ok(tl)
+    }
 }
 
 fn clip_mut(tl: &mut Timeline, track: usize, idx: usize) -> Result<&mut Clip, EditError> {
@@ -570,4 +612,21 @@ fn carve(t: &mut Track, a: i64, b: i64) {
     split_at(t, a);
     split_at(t, b);
     t.clips.retain(|c| !(c.at >= a && c.end() <= b));
+}
+
+/// NLE2c: a set of `(track, idx)` picks checked against `tl` (none -> `NoClip`, a bad track -> `NoTrack`, a bad index ->
+/// `NoClip`), deduped and sorted descending so removing them one by one never shifts a later pick.
+fn picks_desc(tl: &Timeline, picks: &[(usize, usize)]) -> Result<Vec<(usize, usize)>, EditError> {
+    if picks.is_empty() {
+        return Err(EditError::NoClip);
+    }
+    for &(t, i) in picks {
+        if i >= tl.tracks.get(t).ok_or(EditError::NoTrack)?.clips.len() {
+            return Err(EditError::NoClip);
+        }
+    }
+    let mut v = picks.to_vec();
+    v.sort_unstable_by(|a, b| b.cmp(a));
+    v.dedup();
+    Ok(v)
 }

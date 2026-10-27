@@ -22,6 +22,10 @@
 //!   body begins a drag, `BrowserMouseMove` updates it (a preview timeline is painted, nothing committed), the release
 //!   commits ONE `trim` / `move_selected`, Esc cancels; the wheel zooms about the pointer's tick; J/K/L shuttle on the
 //!   serve clock, I/O trim at the playhead, and the other keys map onto the transport verbs.
+//! * NLE2c (LEDGER SR217): the selection is a SET (`EditorState::set`, `selection` its primary): a shift-press adds, a
+//!   marquee from an empty track spot selects what it crosses ([`Layout::crossing`]), `BrowserSelectAll` takes all; delete
+//!   / lift / a drag / the arrows edit the set through ONE of timeline_core's set ops; a drag's moving edge snaps to clip
+//!   edges and the playhead within [`SNAP_PX`] (the guide line painted by `paint_drag`); a press on the ruler scrubs.
 
 use std::time::Duration;
 
@@ -54,6 +58,9 @@ pub struct EditorState {
     pub timeline: Timeline,
     /// `(track, clip index)`.
     pub selection: Option<(usize, usize)>,
+    /// NLE2c (SR217): every selected `(track, clip index)`, sorted and deduped; empty exactly when `selection` (the
+    /// primary) is `None`, and holding it otherwise.
+    pub set: Vec<(usize, usize)>,
     pub playhead: i64,
     /// Pixels per tick, `ZOOM_MIN..=ZOOM_MAX`.
     pub zoom: u32,
@@ -63,7 +70,7 @@ pub struct EditorState {
 
 impl EditorState {
     pub fn new(timeline: Timeline) -> EditorState {
-        EditorState { timeline, selection: None, playhead: 0, zoom: ZOOM_DEFAULT, undo: Vec::new(), redo: Vec::new() }
+        EditorState { timeline, selection: None, set: Vec::new(), playhead: 0, zoom: ZOOM_DEFAULT, undo: Vec::new(), redo: Vec::new() }
     }
     /// Open a CMX 3600 EDL (`fps` when it carries no `* UNA FPS` line).
     pub fn open(text: &str, fps: u32) -> Result<EditorState, edl::EdlError> {
@@ -86,6 +93,8 @@ impl EditorState {
             return Err(EditError::NoClip);
         }
         self.selection = Some((track, idx));
+        self.set.clear();
+        self.set.push((track, idx));
         Ok(())
     }
     /// Select the clip on `track` showing tick `t`.
@@ -94,11 +103,11 @@ impl EditorState {
             return Err(EditError::NoTrack);
         }
         let idx = self.timeline.clip_at(track, t).ok_or(EditError::NoClip)?;
-        self.selection = Some((track, idx));
-        Ok(())
+        self.select(track, idx)
     }
     pub fn deselect(&mut self) {
         self.selection = None;
+        self.set.clear();
     }
     /// Move the playhead to `t`, clamped to `0..=timeline.end()`.
     pub fn seek(&mut self, t: i64) {
@@ -112,7 +121,7 @@ impl EditorState {
         let (track, _) = self.selection.ok_or(EditError::NoClip)?;
         let tl = self.timeline.split(track, self.playhead)?;
         self.commit(tl);
-        self.selection = self.timeline.clip_at(track, self.playhead).map(|i| (track, i));
+        self.select_at(track, self.playhead).unwrap_or_else(|_| self.deselect());
         Ok(())
     }
     /// Move the selected clip's in (`Timeline::trim_in`) or out (`Timeline::trim_out`) point by `delta` source ticks.
@@ -131,15 +140,16 @@ impl EditorState {
         let (track, idx) = self.selection.ok_or(EditError::NoClip)?;
         let tl = self.timeline.move_clip(track, idx, to_track, to_at)?;
         self.commit(tl);
-        self.selection = self.timeline.clip_at(to_track, to_at).map(|i| (to_track, i));
+        self.select_at(to_track, to_at).unwrap_or_else(|_| self.deselect());
         Ok(())
     }
-    /// Remove the selected clip and close the hole (`Timeline::ripple_delete`).
+    /// Remove the selected clips and close the holes (NLE2c: `Timeline::ripple_delete_many` over the set, ONE edit; a set
+    /// of one is `Timeline::ripple_delete`).
     pub fn ripple_delete(&mut self) -> Result<(), EditError> {
-        let (track, idx) = self.selection.ok_or(EditError::NoClip)?;
-        let tl = self.timeline.ripple_delete(track, idx)?;
+        self.selection.ok_or(EditError::NoClip)?;
+        let tl = self.timeline.ripple_delete_many(&self.set)?;
         self.commit(tl);
-        self.selection = None;
+        self.deselect();
         Ok(())
     }
     /// Step back one edit; false when there is none.
@@ -178,10 +188,88 @@ impl EditorState {
     }
     /// Keep the selection and the playhead valid for the current timeline.
     fn settle(&mut self) {
+        let tl = &self.timeline;
+        self.set.retain(|&(t, i)| tl.tracks.get(t).is_some_and(|tr| i < tr.clips.len()));
         if self.selected().is_none() {
-            self.selection = None;
+            self.selection = self.set.first().copied();
+        }
+        if let Some(p) = self.selection.filter(|p| !self.set.contains(p)) {
+            self.set.push(p);
+            self.set.sort_unstable();
         }
         self.seek(self.playhead);
+    }
+}
+
+/// NLE2c (LEDGER SR217): the selection as a SET (`set`, with `selection` its primary) and the edits over it, each ONE
+/// `commit` of one of timeline_core's set ops. no_std-clean (it moves with `EditorState` into `timeline_core::editor`).
+impl EditorState {
+    /// Add a clip to the set (a shift-press); it becomes the primary.
+    pub fn select_add(&mut self, track: usize, idx: usize) -> Result<(), EditError> {
+        let tr = self.timeline.tracks.get(track).ok_or(EditError::NoTrack)?;
+        if idx >= tr.clips.len() {
+            return Err(EditError::NoClip);
+        }
+        self.selection = Some((track, idx));
+        if !self.set.contains(&(track, idx)) {
+            self.set.push((track, idx));
+            self.set.sort_unstable();
+        }
+        Ok(())
+    }
+    /// Select `picks` (a marquee): added to the set when `additive`, else replacing it (none -> nothing selected). The
+    /// primary is the first pick unless `additive` keeps one.
+    pub fn select_many(&mut self, picks: &[(usize, usize)], additive: bool) {
+        if !additive {
+            self.deselect();
+        }
+        let keep = self.selection;
+        for &(t, i) in picks {
+            let _ = self.select_add(t, i);
+        }
+        if keep.is_some() {
+            self.selection = keep;
+        } else {
+            self.selection = self.set.first().copied();
+        }
+    }
+    /// Select every clip on every track (Cmd / Ctrl+A).
+    pub fn select_all(&mut self) {
+        let mut all = Vec::new();
+        for (t, tr) in self.timeline.tracks.iter().enumerate() {
+            for i in 0..tr.clips.len() {
+                all.push((t, i));
+            }
+        }
+        self.select_many(&all, false);
+    }
+    /// Remove the selected clips and leave the holes (`Timeline::lift_many`, ONE edit).
+    pub fn lift_selected(&mut self) -> Result<(), EditError> {
+        self.selection.ok_or(EditError::NoClip)?;
+        let tl = self.timeline.lift_many(&self.set)?;
+        self.commit(tl);
+        self.deselect();
+        Ok(())
+    }
+    /// Move every selected clip by `delta` ticks on its own track (`Timeline::move_many`, ONE edit; refused whole if any
+    /// would overlap). The set and the primary follow their clips.
+    pub fn move_set(&mut self, delta: i64) -> Result<(), EditError> {
+        let primary = self.selection.ok_or(EditError::NoClip)?;
+        let tl = self.timeline.move_many(&self.set, delta)?;
+        let at = |st: &EditorState, (t, i): (usize, usize)| st.timeline.tracks[t].clips[i].at + delta;
+        let landed: Vec<(usize, i64)> = self.set.iter().map(|&p| (p.0, at(self, p))).collect();
+        let p_at = (primary.0, at(self, primary));
+        self.commit(tl);
+        self.set.clear();
+        for &(t, a) in &landed {
+            if let Some(i) = self.timeline.clip_at(t, a) {
+                self.set.push((t, i));
+            }
+        }
+        self.set.sort_unstable();
+        self.selection = self.timeline.clip_at(p_at.0, p_at.1).map(|i| (p_at.0, i));
+        self.settle();
+        Ok(())
     }
 }
 
@@ -417,7 +505,12 @@ pub fn paint_in(st: &EditorState, l: Layout, order: PixelOrder, labels: Option<&
             }
         }
     }
-    // The selection: an outline and both trim handles.
+    // The selection (NLE2c: every clip of the set outlined), and the primary's two trim handles.
+    for &(row, i) in &st.set {
+        if let Some(clip) = tl.tracks.get(row).and_then(|tr| tr.clips.get(i)) {
+            c.frame(l.x_of(clip.at), l.row_y(row), l.x_of(clip.end()), l.row_y(row) + ROW_H as i64, SELECT);
+        }
+    }
     if let (Some((row, _)), Some(clip)) = (st.selection, st.selected()) {
         let (x0, x1) = (l.x_of(clip.at), l.x_of(clip.end()));
         let (y0, y1) = (l.row_y(row), l.row_y(row) + ROW_H as i64);
@@ -489,7 +582,7 @@ pub fn synth_fixture() -> (Timeline, Sources) {
 // ---------------------------------------------------------------------------------------------------------------------
 
 /// The transport verbs a button (or the headless witness) fires as `SMessage::Input { target: SURFACE, text }`.
-pub const VERBS: [&str; 13] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}"];
+pub const VERBS: [&str; 14] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift"];
 
 /// One editor window's model: the state, the media, the canvas size and pixel order, the transport.
 pub struct Face {
@@ -510,13 +603,15 @@ pub struct Face {
     wheel: f64,
     /// A wheel zoom's anchored view: `(t0, the playhead it was anchored at)`.
     view: Option<(i64, i64)>,
+    /// NLE2c: the one-shot modifier latch `(shift, no-snap)` a modifier keydown arms and the next press consumes.
+    mods: (bool, bool),
 }
 
 impl Face {
     /// `labels`: name the clips through the host font stack (off for a golden).
     pub fn new(state: EditorState, sources: Sources, canvas: (u32, u32), order: PixelOrder, labels: bool) -> Face {
         let labels = labels.then(|| TextStyle::new(&["sans"], 11.0));
-        Face { state, sources, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None }
+        Face { state, sources, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, mods: (false, false) }
     }
     /// The preview frame of the last [`Face::frame`].
     pub fn still(&self) -> Option<&Still> {
@@ -537,6 +632,10 @@ impl Face {
             SMessage::BrowserScroll(_, dy) => self.scroll(*dy),
             SMessage::BrowserZoom(d) if *d != 0 => {
                 self.state.zoom_by(*d);
+                true
+            }
+            SMessage::BrowserSelectAll => {
+                self.state.select_all();
                 true
             }
             SMessage::BrowserKey(k) => self.key(k, false),
@@ -583,6 +682,7 @@ impl Face {
             "]" => st.trim(Edge::In, 1),
             "{" => st.trim(Edge::Out, -1),
             "}" => st.trim(Edge::Out, 1),
+            "lift" => st.lift_selected(),
             _ => return false,
         };
         if let Err(e) = r {
@@ -635,7 +735,8 @@ impl Face {
                 None
             }
         };
-        paint_in(st, l, self.order, self.labels.as_ref(), self.still.as_ref())
+        let px = paint_in(st, l, self.order, self.labels.as_ref(), self.still.as_ref());
+        paint_drag(px, l, self.order, self.drag.as_ref())
     }
     /// The canvas as the surface's blit.
     pub fn frame(&mut self) -> SMessage {
@@ -706,6 +807,10 @@ pub const KEYS: &[(&str, &str)] = &[
     ("Meta+z", "undo"),
     ("Ctrl+Shift+Z", "redo"),
     ("Meta+Shift+Z", "redo"),
+    ("Left", "nudge-"),
+    ("Right", "nudge+"),
+    ("\u{f702}", "nudge-"),
+    ("\u{f703}", "nudge+"),
 ];
 /// The wheel delta one zoom step takes (the AppKit surface sends 3 per notch).
 pub const WHEEL_STEP: f64 = 3.0;
@@ -719,8 +824,12 @@ pub enum DragKind {
     TrimIn,
     /// The selected clip's out handle (`EditorState::trim(Edge::Out, ..)`).
     TrimOut,
-    /// A clip body (`EditorState::move_selected`).
+    /// A clip body (`EditorState::move_selected`; NLE2c: `EditorState::move_set` for a set of more than one).
     Move,
+    /// NLE2c: a rubber band from an empty track spot (`EditorState::select_many` of the clips it crosses).
+    Marquee,
+    /// NLE2c: a press on the ruler; the playhead follows the pointer (a seek, not an edit).
+    Scrub,
 }
 
 /// One pointer drag: begun by a press, updated by moves, committed ONCE on release ([`Drag::finish`]). It reads the
@@ -734,18 +843,46 @@ pub struct Drag {
     /// The tick under the press.
     pub origin_tick: i64,
     pub layout: Layout,
-    /// Ticks moved since the press.
+    /// Ticks moved since the press (snapped when `snap`).
     pub delta: i64,
     /// Where a move lands (a track of the clip's kind).
     pub to_track: usize,
+    /// NLE2c: the press and the pointer now (surface pixels).
+    pub origin: (f64, f64),
+    pub at: (f64, f64),
+    /// NLE2c: snap the moving edge to clip edges / the playhead (off under the no-snap modifier).
+    pub snap: bool,
+    /// NLE2c: begun with shift (adds to the set instead of replacing it).
+    pub additive: bool,
+    /// NLE2c: the tick the delta snapped to (painted as the guide line).
+    pub guide: Option<i64>,
 }
 
 impl Drag {
-    /// A press at `(x, y)`: on the selected clip's drawn trim handle (the rects [`paint`] draws) a trim, on a clip
-    /// body a move (the clip is selected); anywhere else no drag.
+    /// A press at `(x, y)` with no modifier ([`Drag::begin_with`]).
     pub fn begin(st: &mut EditorState, l: Layout, x: f64, y: f64) -> Option<Drag> {
+        Drag::begin_with(st, l, x, y, false, false)
+    }
+    /// A press at `(x, y)`: on the primary's drawn trim handle (the rects [`paint`] draws) a trim; on a clip body a move
+    /// (a clip of the set keeps the set and becomes its primary, `shift` adds the clip, else it alone is selected); on
+    /// an empty track spot a marquee; on the ruler a scrub; anywhere else no drag.
+    pub fn begin_with(st: &mut EditorState, l: Layout, x: f64, y: f64, shift: bool, nosnap: bool) -> Option<Drag> {
         let origin_tick = l.tick_at(x);
-        if let (Some((track, idx)), Some(c)) = (st.selection, st.selected()) {
+        let mk = |kind, track, idx| Drag {
+            kind,
+            track,
+            idx,
+            origin_tick,
+            layout: l,
+            delta: 0,
+            to_track: track,
+            origin: (x, y),
+            at: (x, y),
+            snap: !nosnap,
+            additive: shift,
+            guide: None,
+        };
+        if let (Some((track, idx)), Some(c), false) = (st.selection, st.selected(), shift) {
             let y0 = l.row_y(track) as f64;
             if y >= y0 && y < y0 + ROW_H as f64 {
                 let (x0, x1) = (l.x_of(c.at) as f64, l.x_of(c.end()) as f64);
@@ -758,18 +895,34 @@ impl Drag {
                     None
                 };
                 if let Some(kind) = kind {
-                    return Some(Drag { kind, track, idx, origin_tick, layout: l, delta: 0, to_track: track });
+                    return Some(mk(kind, track, idx));
                 }
             }
         }
-        let Hit::Clip(track, idx, _) = l.hit(&st.timeline, x, y) else { return None };
-        st.select(track, idx).ok()?;
-        Some(Drag { kind: DragKind::Move, track, idx, origin_tick, layout: l, delta: 0, to_track: track })
+        match l.hit(&st.timeline, x, y) {
+            Hit::Clip(track, idx, _) => {
+                if shift || st.set.contains(&(track, idx)) {
+                    st.select_add(track, idx).ok()?;
+                } else {
+                    st.select(track, idx).ok()?;
+                }
+                Some(mk(DragKind::Move, track, idx))
+            }
+            Hit::Track(track, _) => Some(mk(DragKind::Marquee, track, 0)),
+            Hit::Ruler(_) => Some(mk(DragKind::Scrub, 0, 0)),
+            Hit::None => None,
+        }
     }
-    /// The pointer is at `(x, y)`: the tick delta, and for a move the row under it when that track's kind matches.
+    /// The pointer is at `(x, y)`: the tick delta (snapped), and for a move of one clip the row under it when that
+    /// track's kind matches.
     pub fn update(&mut self, st: &EditorState, x: f64, y: f64) {
+        self.at = (x, y);
         self.delta = self.layout.tick_at(x) - self.origin_tick;
-        if self.kind != DragKind::Move {
+        self.guide = None;
+        if self.snap {
+            self.snap_delta(st, x);
+        }
+        if self.kind != DragKind::Move || st.set.len() > 1 {
             return;
         }
         if let Hit::Clip(row, ..) | Hit::Track(row, _) = self.layout.hit(&st.timeline, x, y) {
@@ -781,15 +934,32 @@ impl Drag {
     }
     /// The drag would change something.
     pub fn moved(&self) -> bool {
-        self.delta != 0 || self.to_track != self.track
+        match self.kind {
+            DragKind::Marquee => {
+                (self.at.0 - self.origin.0).abs() >= MARQUEE_MIN || (self.at.1 - self.origin.1).abs() >= MARQUEE_MIN
+            }
+            _ => self.delta != 0 || self.to_track != self.track,
+        }
     }
-    /// THE commit of the gesture: one `trim` or `move_selected` on the dragged clip.
+    /// THE commit of the gesture: one `trim`, `move_selected` / `move_set` or marquee selection (a scrub commits nothing).
     pub fn finish(&self, st: &mut EditorState) -> Result<(), EditError> {
-        st.select(self.track, self.idx)?;
+        match self.kind {
+            DragKind::Marquee => {
+                let (x0, y0, x1, y1) = (self.origin.0, self.origin.1, self.at.0, self.at.1);
+                st.select_many(&self.layout.crossing(&st.timeline, x0, y0, x1, y1), self.additive);
+                return Ok(());
+            }
+            DragKind::Scrub => return Ok(()),
+            _ => {}
+        }
+        if st.selection != Some((self.track, self.idx)) {
+            st.select(self.track, self.idx)?;
+        }
         match self.kind {
             DragKind::TrimIn => st.trim(Edge::In, self.delta),
             DragKind::TrimOut => st.trim(Edge::Out, self.delta),
-            DragKind::Move => {
+            DragKind::Move if st.set.len() > 1 => st.move_set(self.delta),
+            _ => {
                 let at = st.selected().ok_or(EditError::NoClip)?.at;
                 st.move_selected(self.to_track, at + self.delta)
             }
@@ -802,6 +972,7 @@ impl Drag {
         }
         let mut s = EditorState::new(st.timeline.clone());
         s.selection = st.selection;
+        s.set = st.set.clone();
         s.playhead = st.playhead;
         s.zoom = st.zoom;
         self.finish(&mut s).ok()?;
@@ -838,9 +1009,13 @@ impl Face {
         self.pointer = Some((x, y));
         let l = self.layout();
         let dropped = self.drag.take().is_some();
-        let sel = self.state.selection;
-        self.drag = Drag::begin(&mut self.state, l, x, y);
-        dropped || self.state.selection != sel
+        let (sel, set, ph) = (self.state.selection, self.state.set.clone(), self.state.playhead);
+        let (shift, nosnap) = std::mem::take(&mut self.mods);
+        self.drag = Drag::begin_with(&mut self.state, l, x, y, shift, nosnap);
+        if let Some(d) = self.drag.filter(|d| d.kind == DragKind::Scrub) {
+            self.state.seek(d.origin_tick);
+        }
+        dropped || self.state.selection != sel || self.state.set != set || self.state.playhead != ph
     }
     /// The button came up: a drag that moved commits once; otherwise it is the click it always was.
     fn release(&mut self, x: f64, y: f64) -> bool {
@@ -848,7 +1023,11 @@ impl Face {
         let Some(mut d) = self.drag.take() else { return self.click(x, y) };
         d.update(&self.state, x, y);
         if !d.moved() {
-            return self.click(x, y);
+            return if d.additive { true } else { self.click(x, y) };
+        }
+        if d.kind == DragKind::Scrub {
+            self.state.seek(d.origin_tick + d.delta);
+            return true;
         }
         if let Err(e) = d.finish(&mut self.state) {
             self.last_error = Some(format!("drag: {e}"));
@@ -859,9 +1038,17 @@ impl Face {
     fn hover(&mut self, x: f64, y: f64) -> bool {
         self.pointer = Some((x, y));
         let Some(d) = self.drag.as_mut() else { return false };
-        let before = (d.delta, d.to_track);
+        let before = (d.delta, d.to_track, d.at, d.guide);
         d.update(&self.state, x, y);
-        (d.delta, d.to_track) != before
+        let changed = match d.kind {
+            DragKind::Marquee => d.at != before.2,
+            _ => (d.delta, d.to_track, d.guide) != (before.0, before.1, before.3),
+        };
+        if d.kind == DragKind::Scrub {
+            let t = d.origin_tick + d.delta;
+            self.state.seek(t);
+        }
+        changed
     }
     /// The wheel: one zoom step per [`WHEEL_STEP`] (up zooms in), about the pointer.
     fn scroll(&mut self, dy: f64) -> bool {
@@ -888,6 +1075,9 @@ impl Face {
     }
     /// A key ([`KEYS`]); `text` says it came as `BrowserText`. False for a key the face does not take.
     fn key(&mut self, k: &str, text: bool) -> bool {
+        if let Some(r) = self.latch(k, text) {
+            return r;
+        }
         if (k.chars().count() == 1) != text {
             return false;
         }
@@ -929,13 +1119,167 @@ impl Face {
                 self.state.seek(e);
                 Ok(())
             }
+            "nudge-" => self.state.move_set(-1),
+            "nudge+" => self.state.move_set(1),
             "cancel" => return self.drag.take().is_some(),
             _ => return false,
         };
         if let Err(e) = r {
-            self.last_error = Some(format!("{act}: {e}"));
+            self.last_error = Some(format!("{}: {e}", act.trim_end_matches(['-', '+'])));
         }
         true
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// THE SET, SNAPPING AND THE RULER SCRUB (NLE2c, LEDGER SR217)
+// ---------------------------------------------------------------------------------------------------------------------
+
+/// How near (px, at the current zoom) a moving edge must come to a clip edge or the playhead to snap to it.
+pub const SNAP_PX: f64 = 6.0;
+/// How far (px) the pointer must travel before a press on an empty track is a marquee rather than a click.
+pub const MARQUEE_MIN: f64 = 3.0;
+const GUIDE: [u8; 4] = [0x40, 0xd0, 0xff, 255];
+const MARQUEE: [u8; 4] = [0xa0, 0xa0, 0xff, 255];
+
+impl Layout {
+    /// The clips whose drawn rect (`x_of(at)..x_of(end)` x its row) meets the rect with corners `(x0, y0)` and
+    /// `(x1, y1)` (surface pixels, either order), sorted.
+    pub fn crossing(&self, tl: &Timeline, x0: f64, y0: f64, x1: f64, y1: f64) -> Vec<(usize, usize)> {
+        let (xa, xb) = (x0.min(x1), x0.max(x1));
+        let (ya, yb) = (y0.min(y1), y0.max(y1));
+        let mut out = Vec::new();
+        for (row, tr) in tl.tracks.iter().enumerate().take(self.rows) {
+            let (r0, r1) = (self.row_y(row) as f64, (self.row_y(row) + ROW_H as i64) as f64);
+            if yb < r0 || ya >= r1 {
+                continue;
+            }
+            for (i, c) in tr.clips.iter().enumerate() {
+                let (c0, c1) = (self.x_of(c.at) as f64, self.x_of(c.end()) as f64);
+                if xb >= c0 && xa < c1 {
+                    out.push((row, i));
+                }
+            }
+        }
+        out
+    }
+}
+
+/// Where a moving edge may snap: every clip's `at` and `end` on any track except the `exclude`d clips', plus the
+/// playhead when `playhead`; sorted, deduped.
+pub fn snap_targets(st: &EditorState, exclude: &[(usize, usize)], playhead: bool) -> Vec<i64> {
+    let mut v = Vec::new();
+    for (t, tr) in st.timeline.tracks.iter().enumerate() {
+        for (i, c) in tr.clips.iter().enumerate() {
+            if !exclude.contains(&(t, i)) {
+                v.push(c.at);
+                v.push(c.end());
+            }
+        }
+    }
+    if playhead {
+        v.push(st.playhead);
+    }
+    v.sort_unstable();
+    v.dedup();
+    v
+}
+
+/// The target nearest pixel `x` whose `x_of` lies within [`SNAP_PX`] of it (a tie: the earlier tick); `None` when none
+/// is in range.
+pub fn snap_to(l: &Layout, targets: &[i64], x: f64) -> Option<i64> {
+    let mut best: Option<(f64, i64)> = None;
+    for &t in targets {
+        let d = (l.x_of(t) as f64 - x).abs();
+        if d <= SNAP_PX && best.is_none_or(|(bd, _)| d < bd) {
+            best = Some((d, t));
+        }
+    }
+    best.map(|(_, t)| t)
+}
+
+impl Drag {
+    /// Snap the delta: each moving edge sits at pixel `x_of(edge) + (x - origin.x)` (a scrub's is the pointer); the
+    /// nearest (edge, target) pair within [`SNAP_PX`] sets `delta = target - edge` and the guide. A marquee never snaps.
+    fn snap_delta(&mut self, st: &EditorState, x: f64) {
+        let l = self.layout;
+        let dx = x - self.origin.0;
+        let one = [(self.track, self.idx)];
+        let (edges, exclude, playhead): (Vec<i64>, &[(usize, usize)], bool) = match self.kind {
+            DragKind::Marquee => return,
+            DragKind::Scrub => {
+                if let Some(t) = snap_to(&l, &snap_targets(st, &[], false), x) {
+                    self.delta = t - self.origin_tick;
+                    self.guide = Some(t);
+                }
+                return;
+            }
+            DragKind::TrimIn | DragKind::TrimOut => {
+                let Some(c) = st.timeline.tracks.get(self.track).and_then(|tr| tr.clips.get(self.idx)) else { return };
+                (vec![if self.kind == DragKind::TrimIn { c.at } else { c.end() }], &one, true)
+            }
+            DragKind::Move => {
+                let set: &[(usize, usize)] = if st.set.len() > 1 { &st.set } else { &one };
+                let edges = set
+                    .iter()
+                    .filter_map(|&(t, i)| st.timeline.tracks.get(t)?.clips.get(i))
+                    .flat_map(|c| [c.at, c.end()])
+                    .collect();
+                (edges, set, true)
+            }
+        };
+        let targets = snap_targets(st, exclude, playhead);
+        let mut best: Option<(f64, i64, i64)> = None;
+        for &e in &edges {
+            let ex = l.x_of(e) as f64 + dx;
+            if let Some(t) = snap_to(&l, &targets, ex) {
+                let d = (l.x_of(t) as f64 - ex).abs();
+                if best.is_none_or(|(bd, _, _)| d < bd) {
+                    best = Some((d, e, t));
+                }
+            }
+        }
+        if let Some((_, e, t)) = best {
+            self.delta = t - e;
+            self.guide = Some(t);
+        }
+    }
+}
+
+/// The live drag over the painted canvas: the snap guide (a vertical line from the ruler down) and the marquee's rect.
+fn paint_drag(px: Vec<u8>, l: Layout, order: PixelOrder, drag: Option<&Drag>) -> Vec<u8> {
+    let Some(d) = drag else { return px };
+    let mut c = Canvas { w: l.w, h: l.h, order, px };
+    if let Some(t) = d.guide {
+        let x = l.x_of(t);
+        c.rect(x, l.ruler_y as i64, x + 1, l.h as i64, GUIDE);
+    }
+    if d.kind == DragKind::Marquee && d.moved() {
+        let (x0, x1) = (d.origin.0.min(d.at.0) as i64, d.origin.0.max(d.at.0) as i64 + 1);
+        let (y0, y1) = (d.origin.1.min(d.at.1) as i64, d.origin.1.max(d.at.1) as i64 + 1);
+        c.frame(x0, y0, x1, y1, MARQUEE);
+    }
+    c.px
+}
+
+impl Face {
+    /// The modifier latch: GTK sends a bare modifier's keydown as `BrowserKey("Shift_L")` (autorepeat
+    /// `"Shift+Shift_L"`); Shift arms the add-to-set press, Alt the no-snap one, any other key disarms both. `Some`
+    /// when the key was a modifier (nothing to repaint). AppKit sends no bare modifier (NLE2-MODS owed).
+    fn latch(&mut self, k: &str, text: bool) -> Option<bool> {
+        let mut name = k;
+        while let Some(rest) = ["Ctrl+", "Alt+", "Shift+", "Meta+"].iter().find_map(|p| name.strip_prefix(p)) {
+            name = rest;
+        }
+        match (text, name) {
+            (false, "Shift_L" | "Shift_R") => self.mods.0 = true,
+            (false, "Alt_L" | "Alt_R") => self.mods.1 = true,
+            _ => {
+                self.mods = (false, false);
+                return None;
+            }
+        }
+        Some(false)
     }
 }
 
@@ -1297,4 +1641,170 @@ mod tests {
         assert_eq!(face.state.zoom, 8);
         assert_eq!(face.layout().tick_at(160.0), 20);
     }
+
+    fn key(f: &mut Face, k: &str) -> bool {
+        f.on(&SMessage::BrowserKey(k.into()))
+    }
+
+    /// NLE2c M1/M3: a shift-press adds to the set; delete over the set is ONE `ripple_delete_many`, which is the single
+    /// ripple deletes applied by hand; one undo step restores it; lift leaves the holes.
+    #[test]
+    fn nle2c_set_delete_is_one_transaction() {
+        let mut face = face();
+        let tl0 = face.state.timeline.clone();
+        let (x, y) = face.layout().point(0, 5);
+        face.on(&btn(true, x, y));
+        face.on(&btn(false, x, y));
+        assert!(!key(&mut face, "Shift_L"), "a modifier alone repaints nothing");
+        let (x, y) = face.layout().point(0, 28);
+        assert!(face.on(&btn(true, x, y)));
+        assert!(face.on(&btn(false, x, y)));
+        assert_eq!((face.state.selection, face.state.set.clone()), (Some((0, 2)), vec![(0, 0), (0, 2)]));
+        assert!(face.verb("delete"));
+        let by_hand = tl0.ripple_delete(0, 2).unwrap().ripple_delete(0, 0).unwrap();
+        assert_eq!(face.state.timeline, by_hand);
+        assert_eq!(face.state.timeline, tl0.ripple_delete_many(&[(0, 0), (0, 2)]).unwrap());
+        assert_eq!((face.state.undo_depth(), face.state.selection, face.state.set.len()), (1, None, 0));
+        assert!(face.verb("undo"));
+        assert_eq!(face.state.timeline, tl0);
+        face.state.select(1, 0).unwrap();
+        face.state.select_add(1, 2).unwrap();
+        assert!(face.verb("lift"));
+        assert_eq!(face.state.timeline, tl0.lift_many(&[(1, 0), (1, 2)]).unwrap());
+        assert_eq!(face.state.timeline.tracks[1].clips, vec![tl0.tracks[1].clips[1]], "the holes stay");
+        assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    }
+
+    /// NLE2c M1/M3: dragging a two-clip set onto a neighbour is refused and changes nothing (timeline, undo, set); a legal
+    /// set drag is ONE `move_many`; the arrow keys nudge the set one tick; with nothing selected they say so.
+    #[test]
+    fn nle2c_set_move_refused_leaves_state() {
+        let mut face = face();
+        let tl0 = face.state.timeline.clone();
+        face.state.select(0, 0).unwrap();
+        face.state.select_add(0, 1).unwrap();
+        let (x, y) = face.layout().point(0, 15); // B's body (B[0,10)@10 butts A@0 and ends 5 before A@25)
+        key(&mut face, "Alt_L");
+        face.on(&btn(true, x, y));
+        face.on(&SMessage::BrowserMouseMove(x + 48.0, y));
+        assert_eq!(face.dragging().map(|d| (d.kind, d.delta, d.snap)), Some((DragKind::Move, 6, false)));
+        face.on(&btn(false, x + 48.0, y));
+        assert_eq!(face.last_error.take().as_deref(), Some("drag: clips overlap"));
+        assert_eq!((&face.state.timeline, face.state.undo_depth()), (&tl0, 0));
+        assert_eq!((face.state.selection, face.state.set.clone()), (Some((0, 1)), vec![(0, 0), (0, 1)]));
+        key(&mut face, "Alt_L");
+        face.on(&btn(true, x, y));
+        face.on(&SMessage::BrowserMouseMove(x + 40.0, y));
+        face.on(&btn(false, x + 40.0, y));
+        let want = tl0.move_many(&[(0, 0), (0, 1)], 5).unwrap();
+        assert_eq!((&face.state.timeline, face.state.undo_depth()), (&want, 1));
+        assert_eq!((face.state.selection, face.state.set.clone()), (Some((0, 1)), vec![(0, 0), (0, 1)]));
+        assert!(key(&mut face, "Right"));
+        assert_eq!(face.last_error.take().as_deref(), Some("nudge: clips overlap"));
+        assert!(face.on(&SMessage::BrowserText("\u{f702}".into())));
+        assert_eq!(face.state.timeline, want.move_many(&[(0, 0), (0, 1)], -1).unwrap());
+        assert_eq!(face.state.undo_depth(), 2);
+        face.state.deselect();
+        assert!(key(&mut face, "Left"));
+        assert_eq!(face.last_error.take().as_deref(), Some("nudge: no such clip"));
+    }
+
+    /// NLE2c M1: a marquee from an empty spot selects the clips its rect crosses (shift adds), a press that barely moves
+    /// stays a click, and select-all (Cmd / Ctrl+A as `BrowserSelectAll`) takes every clip.
+    #[test]
+    fn nle2c_marquee_and_select_all() {
+        let mut face = face();
+        let l = face.layout();
+        assert_eq!(l.crossing(&face.state.timeline, 300.0, 130.0, 172.0, 90.0), vec![(0, 2), (1, 2)]);
+        face.on(&btn(true, 172.0, 90.0)); // V1's gap 20..25
+        assert_eq!(face.dragging().map(|d| d.kind), Some(DragKind::Marquee));
+        assert!(face.on(&SMessage::BrowserMouseMove(300.0, 130.0)));
+        face.on(&btn(false, 300.0, 130.0));
+        assert_eq!((face.state.selection, face.state.set.clone()), (Some((0, 2)), vec![(0, 2), (1, 2)]));
+        key(&mut face, "Shift_L");
+        face.on(&btn(true, 172.0, 125.0));
+        face.on(&SMessage::BrowserMouseMove(40.0, 150.0));
+        face.on(&btn(false, 40.0, 150.0));
+        assert_eq!(face.state.set, vec![(0, 2), (1, 0), (1, 1), (1, 2)]);
+        assert_eq!(face.state.selection, Some((0, 2)), "an additive marquee keeps the primary");
+        face.on(&btn(true, 172.0, 90.0));
+        face.on(&btn(false, 173.0, 91.0));
+        assert_eq!((face.state.selection, face.state.set.len(), face.state.playhead), (None, 0, 21), "a click");
+        assert!(face.on(&SMessage::BrowserSelectAll));
+        assert_eq!(face.state.set.len(), 6);
+        assert_eq!(face.state.undo_depth(), 0);
+    }
+
+    /// NLE2c M2: snapping picks the nearest edge within SNAP_PX and none outside; a drag snaps a clip edge to another
+    /// clip's edge and to the playhead (the guide names it); the no-snap modifier leaves the raw delta.
+    #[test]
+    fn nle2c_snap_nearest_within_range() {
+        let mut face = face();
+        let l = face.layout();
+        assert_eq!(snap_to(&l, &[10, 20], 84.0), Some(10));
+        assert_eq!(snap_to(&l, &[10, 20], 86.0), Some(10));
+        assert_eq!(snap_to(&l, &[10, 20], 87.0), None);
+        assert_eq!(snap_to(&l, &[10, 20], 120.0), None);
+        assert_eq!(snap_to(&l, &[10, 11], 84.0), Some(10), "a tie takes the earlier tick");
+        assert_eq!(snap_to(&l, &[10, 11], 87.0), Some(11));
+        assert_eq!(snap_targets(&face.state, &[(0, 2), (1, 2)], false), vec![0, 10, 20]);
+        let tl0 = face.state.timeline.clone();
+        // A@25 on V1 (x 200): 35 px left puts its in edge at 165, 5 px from B's out edge at tick 20 (raw delta -4).
+        let (x, y) = l.point(0, 28);
+        face.on(&btn(true, x, y));
+        face.on(&SMessage::BrowserMouseMove(x - 35.0, y));
+        assert_eq!(face.dragging().map(|d| (d.delta, d.guide)), Some((-5, Some(20))));
+        let px = face.paint();
+        assert_eq!(&px[(150 * 320 + 160) * 4..(150 * 320 + 160) * 4 + 4], GUIDE, "the guide line");
+        face.on(&btn(false, x - 35.0, y));
+        assert_eq!(face.state.timeline, tl0.move_clip(0, 2, 0, 20).unwrap());
+        face.verb("undo");
+        // To the playhead at 30 (x 240): 34 px right puts the in edge 6 px from it (raw +4).
+        face.state.seek(30);
+        face.on(&btn(true, x, y));
+        face.on(&SMessage::BrowserMouseMove(x + 34.0, y));
+        assert_eq!(face.dragging().map(|d| (d.delta, d.guide)), Some((5, Some(30))));
+        key(&mut face, "Escape");
+        key(&mut face, "Alt_L");
+        face.on(&btn(true, x, y));
+        face.on(&SMessage::BrowserMouseMove(x - 35.0, y));
+        assert_eq!(face.dragging().map(|d| (d.delta, d.guide)), Some((-4, None)));
+    }
+
+    /// NLE2c M2: a press on the ruler seeks there, a move scrubs the playhead (snapping to clip edges), the release keeps
+    /// it; nothing is edited.
+    #[test]
+    fn nle2c_ruler_scrub_seeks() {
+        let mut face = face();
+        let tl0 = face.state.timeline.clone();
+        assert!(face.on(&btn(true, 44.0, 70.0)));
+        assert_eq!((face.dragging().map(|d| d.kind), face.state.playhead), (Some(DragKind::Scrub), 5));
+        assert!(face.on(&SMessage::BrowserMouseMove(77.0, 70.0)));
+        assert_eq!((face.state.playhead, face.dragging().and_then(|d| d.guide)), (10, Some(10)), "snapped to tick 10");
+        face.on(&SMessage::BrowserMouseMove(124.0, 70.0));
+        assert_eq!(face.state.playhead, 15);
+        assert!(face.on(&btn(false, 124.0, 70.0)));
+        assert_eq!((face.state.playhead, face.state.undo_depth(), &face.state.timeline), (15, 0, &tl0));
+        assert!(face.dragging().is_none());
+    }
+
+    /// NLE2c M3: the painted editor with a two-clip set: both outlined, the trim handles only on the primary; golden.
+    #[test]
+    fn nle2c_two_clip_selection_golden() {
+        let (mut st, _) = state();
+        st.select(0, 0).unwrap();
+        st.select_add(0, 2).unwrap();
+        st.seek(15);
+        let rgba = paint(&st, 320, 160, PixelOrder::Rgba, None, None);
+        let at = |x: usize, y: usize| &rgba[(y * 320 + x) * 4..(y * 320 + x) * 4 + 4];
+        assert_eq!(at(5, 80), SELECT);
+        assert_eq!(at(210, 80), SELECT);
+        assert_eq!(at(201, 100), HANDLE);
+        assert_eq!(at(2, 100), clip_colour(0, Kind::Video), "no handle on a non-primary");
+        assert_eq!(at(100, 80), ROW[0], "B is not selected");
+        assert_eq!(format!("{:016x}", fnv1a(&rgba)), GOLDEN_SET);
+    }
+
+    /// `nle2c_two_clip_selection_golden`'s hash, measured by the test's first run (FNV-1a 64 of the 320x160 RGBA paint).
+    const GOLDEN_SET: &str = "b274098fed21524f";
 }
