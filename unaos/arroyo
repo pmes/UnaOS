@@ -10682,7 +10682,7 @@ zenbook_lane_typed() { # $1 = the wall (s)
     TYPIST_PORT="$zport" TYPIST_LOG="$SERIAL_LOG"
     local -a zph=("$FIRSTUSER_PHASE")
     prev=":: BOOTLIST: ran="   # ZENBOOKLANELIST (Z19): held on the lane list's light summary (it runs at [desktop] built), so no typed `tests` meets a list fixture's RUNNING (`:: TESTS: already running — refused ::`)
-    for v in platform:PLATFORM ec:EC nvme:NVME i8042:I8042 dwi2c:DWI2C hdacensus:HDACENSUS gopshot:GOPSHOT eclid:ECLID suspend:SUSPEND ecqnames:ECQNAMES dwi2cacpi:DWI2CFAST bootlist:BOOTLIST; do   # ZENBOOKFLIGHTLIST (Z33): hdacensus, gopshot, eclid typed before bootlist (COMPLETE unchanged). ZENBOOKSPECPINS (Z54): suspend, ecqnames, dwi2cacpi (held on DWI2CFAST, its last of three verdicts), each pinned by x86-zenbook.spec §9
+    for v in platform:PLATFORM ec:EC nvme:NVME i8042:I8042 dwi2c:DWI2C hdacensus:HDACENSUS gopshot:GOPSHOT eclid:ECLID suspend:SUSPEND ecqnames:ECQNAMES dwi2cacpi:DWI2CFAST bootlist:BOOTLIST; do   # ZENBOOKFLIGHTLIST (Z33): hdacensus, gopshot, eclid typed before bootlist (COMPLETE unchanged). ZENBOOKSPECPINS (Z54): suspend, ecqnames, dwi2cacpi (held on DWI2CFAST, its last of three verdicts), each pinned by x86-zenbook.spec §9. SPECCOV (zenbook-ledger Z58): this lane's marker, equal to the loop's own verbs — SPEC-COVERAGE: x86-zenbook.spec platform ec nvme i8042 dwi2c hdacensus gopshot eclid suspend ecqnames dwi2cacpi bootlist
         local done_mark=":: ${v#*:}: "; [ "${v%%:*}" = bootlist ] && done_mark=":: BOOTLIST: probe"
         zph+=("${prev}|tests ${v%%:*}|t:tests spc t:${v%%:*} ret|${done_mark}")
         prev="$done_mark"
@@ -14898,7 +14898,7 @@ jobs_image() {
 # plants GATEREVIEW's table proved each gate catches) in a scratch copy of the tree, runs that gate through
 # `_gates_one` there, and needs a non-zero rc whose log names the plant. Witness (host):
 #   GATEPATH selftest: plants=<n> caught=<n> -> PASS
-GATES_SET="charter:unaos/scripts/charter-check.sh arch:unaos/scripts/arch-check.py attrkeys:unaos/scripts/attrkeys-check.py status:tools/status-check.py prefs:tools/prefs-schema-check.py appearance:unaos/scripts/appearance-check.py deps:tools/deps-audit/run.py knob:unaos/scripts/knob-hygiene.sh verbs:unaos/scripts/verb-roots.sh banner:unaos/scripts/banner-cert.sh k8reach:unaos/scripts/k8-reach.py sanity:unaos/scripts/sanity-legs.py image-line:unaos/scripts/knob-parity.sh knob-parity-orin:unaos/scripts/knob-parity.sh knob-parity-pi:unaos/scripts/knob-parity.sh mbench-selftest:unaos/scripts/mbench.py specscore:unaos/scripts/orin-specscore.py blueprint:unaos/scripts/blueprint-check.py nonet:unaos/scripts/nonet-check.py nonetreach:unaos/scripts/nonet-reach.py neutral:tools/neutral-check.py firmware:tools/firmware-census.py locktype:unaos/scripts/lock-type.py knob-parity-zenbook:unaos/scripts/knob-parity.sh"
+GATES_SET="charter:unaos/scripts/charter-check.sh arch:unaos/scripts/arch-check.py attrkeys:unaos/scripts/attrkeys-check.py status:tools/status-check.py prefs:tools/prefs-schema-check.py appearance:unaos/scripts/appearance-check.py deps:tools/deps-audit/run.py knob:unaos/scripts/knob-hygiene.sh verbs:unaos/scripts/verb-roots.sh banner:unaos/scripts/banner-cert.sh k8reach:unaos/scripts/k8-reach.py sanity:unaos/scripts/sanity-legs.py image-line:unaos/scripts/knob-parity.sh knob-parity-orin:unaos/scripts/knob-parity.sh knob-parity-pi:unaos/scripts/knob-parity.sh mbench-selftest:unaos/scripts/mbench.py specscore:unaos/scripts/orin-specscore.py blueprint:unaos/scripts/blueprint-check.py nonet:unaos/scripts/nonet-check.py nonetreach:unaos/scripts/nonet-reach.py neutral:tools/neutral-check.py firmware:tools/firmware-census.py locktype:unaos/scripts/lock-type.py knob-parity-zenbook:unaos/scripts/knob-parity.sh speccov:unaos/scripts/spec-coverage.sh"
 # NEUTRAL (SR166 GATENEUTRAL, BP-shape-4, R16): no board name (orin/rmbp/pi4/jetson/tegra word parts) in an identifier or a
 # string of a shared kernel file (crates/kernel/src minus arch/); comments, `feature = "…"` gates, arch board-module paths
 # and ledger/round citations excepted; the ruled exceptions are tools/neutral.allow, one row + reason each, shrink-only.
@@ -14907,6 +14907,11 @@ GATES_SET="charter:unaos/scripts/charter-check.sh arch:unaos/scripts/arch-check.
 # LOCKTYPE (SR188 GATELOCKTYPE, BP-cores-20, B414/B823): every kernel spin lock is crate::sync::Mutex (the registry names it by
 # its site); a raw spin::Mutex / MutexGuard / spin::mutex::* / spin::RwLock* in the code of crates/kernel/src reds, save the
 # registry's own inner lock in sync.rs (exact path+line rows in the script, shrink-only); spin::Once and spin::Spin pass.
+# SPECCOV (zenbook-ledger Z58 SPECCOVERAGE, BP-gates-15): every `:: TAG: … ->` verdict a typed lane's verbs print (verb -> its
+# register/defer fn -> that fn's same-file callee closure; tags by witness-owners.py's SITE, bodies by neutral-check.py's lex)
+# is named by a REQUIRE/OPTIONAL/FORBID/PENDING/COMPLETE/COUNT of the lane's spec or skipped there by `# COVERAGE-SKIP TAG why`;
+# the lanes are the SPEC-COVERAGE markers in this file's comments (test-zenbook's typist loop, kernel8-test --desk), each
+# held equal to its line's own verb list (spec-coverage.sh; marker-drift is rc 1, a broken resolver or control rc 2).
 # BLUEPRINT (2026-10-19, Peter: "a set of blueprints … a front-side gate"): docs/dev/blueprint/ sheets — every anchor
 # exists at its line, BP-ids unique and stem-named, every sheet listed and ≤ 120 lines, no claim words (blueprint-check.py).
 # NONET (B672, BP-bar-10): no fn reachable from the video/ furniture (menubar, dock, crystal, notify, strip, settings,
@@ -14974,6 +14979,7 @@ _gates_plant() { # $1 = scratch repo root, $2 = gate: plants the defect, prints 
         neutral)    printf 'pub fn orinzzgateplant() {}\n' > "$K/video/zz_gateplant_neutral.rs"; echo zz_gateplant_neutral ;; # NEUTRAL (SR166): a board-named fn in a shared file with no allowlist row
         firmware)   printf '\177ELF\000\000zzgateplant' > "$C/unaos/firmware/zz_gateplant.bin"; echo zz_gateplant.bin ;; # FIRMWARE (SR166): a binary blob committed under unaos/firmware (R52)
         locktype)   printf 'pub static P: spin::Mutex<u8> = spin::Mutex::new(0);\n' > "$K/video/zz_gateplant_locktype.rs"; echo zz_gateplant_locktype ;; # LOCKTYPE (SR188): a raw spin::Mutex static outside sync.rs (the 38 LOCKREG2 swept)
+        speccov)    printf 'COMPLETE :: ZZGATEPLANT: nothing ::\n' > "$C/unaos/scripts/specs/zz_gateplant.spec" && printf '# for v in platform:PLATFORM; do :; done # SPEC-%s: zz_gateplant.spec platform\n' COVERAGE >> "$C/unaos/arroyo"; echo zz_gateplant.spec ;; # SPECCOV (Z58): a marked lane whose spec scores none of its verb's verdicts (PLATFORM unscored; the planted comment carries its own `for v in` list, so it is no marker-drift); arroyo is restored from the selftest's backup, the planted spec is read by no later gate (speccov is the set's last row)
         *) return 1 ;;
     esac
 }
@@ -15297,7 +15303,7 @@ case "${1:-}" in
         run_kernel8
         ;;
     kernel8-test|test-pi)
-        if [ "${2:-}" = "--desk" ]; then export UNAOS_PIDESK=1; export UNAOS_K8_SCRIPT="${UNAOS_K8_SCRIPT-${WORKSPACE_DIR}/scripts/specs/pi4-desktop.inject}" UNAOS_K8_SPEC="${UNAOS_K8_SPEC:-${PI4_DESKTOP_SPEC}}"; set -- "$1" "${@:3}"; fi   # PIDESKQEMULIST (B894): the desk lane types `tests textscale` (specs/pi4-desktop.inject, `UNAOS_K8_SCRIPT=` opts out) and its typed spec is the desk spec, asserted once by k8_desk_replay. PIDESK-SPEC (B878): `./arroyo kernel8-test --desk 300` = UNAOS_PIDESK=1, scored by pi4-regression.spec then pi4-desktop.spec
+        if [ "${2:-}" = "--desk" ]; then export UNAOS_PIDESK=1; export UNAOS_K8_SCRIPT="${UNAOS_K8_SCRIPT-${WORKSPACE_DIR}/scripts/specs/pi4-desktop.inject}" UNAOS_K8_SPEC="${UNAOS_K8_SPEC:-${PI4_DESKTOP_SPEC}}"; set -- "$1" "${@:3}"; fi   # PIDESKQEMULIST (B894): the desk lane types `tests textscale` (specs/pi4-desktop.inject, `UNAOS_K8_SCRIPT=` opts out) and its typed spec is the desk spec, asserted once by k8_desk_replay. PIDESK-SPEC (B878): `./arroyo kernel8-test --desk 300` = UNAOS_PIDESK=1, scored by pi4-regression.spec then pi4-desktop.spec. SPECCOV (zenbook-ledger Z58): the desk lane's marker, equal to the inject's typed verbs — SPEC-COVERAGE: pi4-desktop.spec textscale
         test_kernel8 "${2:-60}"   # MBENCH-HONEST: 8 s never finished a pi4 boot — see test_kernel8
         ;;
     kernel8-install|install-pi)
