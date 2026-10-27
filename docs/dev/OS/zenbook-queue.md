@@ -35,7 +35,7 @@ ZENBOOKGOP, ZENBOOKMT7925) are the next rows. No Zenbook image line exists yet (
 4. **ZENBOOK-I8042** — `drivers/i8042.rs`: the internal keyboard on the EC's 8042 into the input route. In flight
    (ZENBOOKI8042; it asks `hw::platform()`).
 5. **ZENBOOK-GOP** — the loader picks the CONNECTED output's native mode (the dead internal panel enumerated or not:
-   um5606w.md §4), `desktop_uefi` + dpi for an external monitor. In flight (ZENBOOKGOP). The desktop's ignition without a Kepler takeover: in flight (GOPIGNITE, Z10: `desktop_uefi::gop_ignite`, Origin `gop`, the Zenbook only).
+   um5606w.md §4), `desktop_uefi` + dpi for an external monitor. In flight (ZENBOOKGOP). The desktop's ignition without a Kepler takeover: in flight (GOPIGNITE, Z10: `desktop_uefi::gop_ignite`, Origin `gop`, the Zenbook only). The ignite's pixel witness: in flight (GOPIGNITEPIXEL, Z28: five named squares read back at ignite, `[gop] shot`, `tests gopshot`; owed GOPSHOT-QMP).
 6. **ZENBOOK-XHCIPICK** — the kernel brings up ONE xHCI, the first class 0C/03/30 in walk order (`PciScanner::scan`,
    `unaos/crates/kernel/src/arch/x86_64/pci.rs:895`); Strix Point has four (1022:151a/151b/151e/151f) plus two USB4
    NHIs (151c/151d). Measure which physical ports the first one serves; then bring up every xHCI or pick by port.
