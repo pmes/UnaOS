@@ -63,7 +63,7 @@ pub fn bootstrap_image_surface(id: &str, synapse: Synapse) -> NativeView {
             da.grab_focus();
             syn.fire(SMessage::BrowserClick(x, y));
         });
-        drawing_area.add_controller(click);
+        drawing_area.add_controller(click); { let drag = gtk4::GestureDrag::new(); let s = synapse.clone(); drag.connect_drag_begin(move |_, x, y| s.fire(SMessage::BrowserButton { down: true, x, y })); let s = synapse.clone(); drag.connect_drag_end(move |g, dx, dy| { if let Some((x, y)) = g.start_point() { s.fire(SMessage::BrowserButton { down: false, x: x + dx, y: y + dy }); } }); drawing_area.add_controller(drag); } // NLE2B (SR208): the press and the release (BrowserButton) for every drag; GestureClick sends no release past its threshold
     }
     {
         let key = gtk4::EventControllerKey::new();

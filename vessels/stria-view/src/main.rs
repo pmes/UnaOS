@@ -15,7 +15,11 @@
 //! stria-view --synth --size 320x160 --do at:12:0,split,delete,undo [--out shot.rgba] [--labels]
 //! ```
 //! `--do`: comma-separated transport verbs (`stria::nle_face::VERBS`), `at:<tick>:<track>` (a click on that track at
-//! that tick) and `ruler:<tick>` (a click on the ruler).
+//! that tick) and `ruler:<tick>` (a click on the ruler). NLE2B (SR208), the gestures as a face sends them:
+//! `press:<x>:<y>` / `move:<x>:<y>` (surface pixels), `release` (at the last pointer: `BrowserButton` up + `BrowserClick`),
+//! `key:<name>` (as GTK sends it: `BrowserKey`, plus `BrowserText` for a one-character key; `key:space` types a space)
+//! and `wheel:<n>` (n notches at the last pointer, n > 0 up = zoom in). The JSON line also carries `playing`, `rate`
+//! and the selected clip as `clip: "<at>:<src_in>:<src_out>"`.
 
 use bandy::{SMessage, Synapse};
 use quartzite::tetra::TetraNode;
@@ -34,7 +38,7 @@ struct Cli {
     labels: bool,
 }
 
-const USAGE: &str = "usage: stria-view <edl> [--fps N] --src REEL=<media> ... | --synth  [--size WxH] [--do SCRIPT] [--out shot.rgba] [--labels]";
+const USAGE: &str = "usage: stria-view <edl> [--fps N] --src REEL=<media> ... | --synth  [--size WxH] [--do SCRIPT] [--out shot.rgba] [--labels]  (SCRIPT: verbs, at:T:ROW, ruler:T, press:X:Y, move:X:Y, release, key:NAME, wheel:N)";
 
 fn die(msg: String) -> ! {
     eprintln!("stria-view: {msg}");
@@ -123,29 +127,46 @@ fn surface_order() -> PixelOrder {
     if cfg!(all(target_os = "linux", feature = "gtk")) { PixelOrder::Bgra } else { PixelOrder::Rgba }
 }
 
-/// A `--do` token as the message the window would send.
-fn token(face: &Face, tok: &str) -> Option<SMessage> {
+/// A `--do` token as the messages the window would send.
+fn token(face: &Face, tok: &str) -> Option<Vec<SMessage>> {
     let num = |s: &str| s.parse::<i64>().ok();
-    let l = Layout::of(face.canvas.0, face.canvas.1, &face.state);
+    let px = |s: &str| s.parse::<f64>().ok();
+    let l: Layout = face.layout();
+    let (lx, ly) = face.pointer().unwrap_or((0.0, 0.0));
+    if let Some(name) = tok.strip_prefix("key:") {
+        let (key, text) = if name == "space" { (name, " ") } else { (name, name) };
+        let mut out = vec![SMessage::BrowserKey(key.to_string())];
+        if text.chars().count() == 1 {
+            out.push(SMessage::BrowserText(text.to_string()));
+        }
+        return Some(out);
+    }
     let parts: Vec<&str> = tok.split(':').collect();
-    match parts.as_slice() {
+    let one = match parts.as_slice() {
         ["at", t, row] => {
             let (x, y) = l.point(row.parse().ok()?, num(t)?);
-            Some(SMessage::BrowserClick(x, y))
+            SMessage::BrowserClick(x, y)
         }
-        ["ruler", t] => Some(SMessage::BrowserClick(l.x_of(num(t)?) as f64 + 0.5, l.ruler_y as f64 + 1.0)),
-        [v] if nle_face::VERBS.contains(v) => Some(SMessage::Input { target: SURFACE.into(), text: v.to_string() }),
-        _ => None,
-    }
+        ["ruler", t] => SMessage::BrowserClick(l.x_of(num(t)?) as f64 + 0.5, l.ruler_y as f64 + 1.0),
+        ["press", x, y] => SMessage::BrowserButton { down: true, x: px(x)?, y: px(y)? },
+        ["move", x, y] => SMessage::BrowserMouseMove(px(x)?, px(y)?),
+        ["release"] => return Some(vec![SMessage::BrowserButton { down: false, x: lx, y: ly }, SMessage::BrowserClick(lx, ly)]),
+        ["wheel", n] => SMessage::BrowserScroll(0.0, -nle_face::WHEEL_STEP * px(n)?),
+        [v] if nle_face::VERBS.contains(v) => SMessage::Input { target: SURFACE.into(), text: v.to_string() },
+        _ => return None,
+    };
+    Some(vec![one])
 }
 
-/// The headless witness: the script through `Face::on`, then the last frame's facts as one JSON line.
-fn witness(c: &Cli, mut face: Face) -> i32 {
+/// The script through `Face::on`, token by token; the errors it met.
+fn drive(face: &mut Face, script: &str) -> Vec<String> {
     let mut errors = Vec::new();
-    for tok in c.script.as_deref().unwrap_or("").split(',').filter(|t| !t.is_empty()) {
-        match token(&face, tok) {
-            Some(m) => {
-                face.on(&m);
+    for tok in script.split(',').filter(|t| !t.is_empty()) {
+        match token(face, tok) {
+            Some(ms) => {
+                for m in ms {
+                    face.on(&m);
+                }
             }
             None => errors.push(format!("bad token {tok}")),
         }
@@ -153,6 +174,12 @@ fn witness(c: &Cli, mut face: Face) -> i32 {
             errors.push(e);
         }
     }
+    errors
+}
+
+/// The headless witness: the script through `Face::on`, then the last frame's facts as one JSON line.
+fn witness(c: &Cli, mut face: Face) -> i32 {
+    let mut errors = drive(&mut face, c.script.as_deref().unwrap_or(""));
     let SMessage::SurfaceBlit { width, height, pixels, .. } = face.frame() else { return 1 };
     if let Some(e) = face.last_error.take() {
         errors.push(e);
@@ -166,12 +193,15 @@ fn witness(c: &Cli, mut face: Face) -> i32 {
     let st = &face.state;
     let clips: usize = st.timeline.tracks.iter().map(|t| t.clips.len()).sum();
     let sel = st.selection.map(|(t, i)| format!("\"{t}:{i}\"")).unwrap_or_else(|| "null".into());
+    let clip = st.selected().map(|c| format!("\"{}:{}:{}\"", c.at, c.src_in, c.src_out)).unwrap_or_else(|| "null".into());
     let err = errors.join("; ").replace('"', "'");
     println!(
-        "{{\"playhead\":{},\"tracks\":{},\"clips\":{},\"selection\":{sel},\"undo\":{},\"zoom\":{},\"w\":{width},\"h\":{height},\"fnv\":\"{:016x}\",\"errors\":\"{err}\"}}",
+        "{{\"playhead\":{},\"tracks\":{},\"clips\":{},\"selection\":{sel},\"clip\":{clip},\"playing\":{},\"rate\":{},\"undo\":{},\"zoom\":{},\"w\":{width},\"h\":{height},\"fnv\":\"{:016x}\",\"errors\":\"{err}\"}}",
         st.playhead,
         st.timeline.tracks.len(),
         clips,
+        face.playing,
+        face.rate,
         st.undo_depth(),
         st.zoom,
         nle_face::fnv1a(&pixels)
@@ -226,5 +256,31 @@ mod tests {
             assert_eq!(target, SURFACE);
             assert!(face.verb(text), "{text}");
         }
+    }
+
+    /// NLE2B M3: the witness's gesture tokens are the messages a face sends; the script's result is the ops by hand.
+    #[test]
+    fn nle2b_witness_gestures() {
+        let (tl, src) = nle_face::synth_fixture();
+        let tl0 = tl.clone();
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        // Select B (a click at tick 12 on V1), drag its in handle (x 80..84) right 3 ticks, release.
+        let errors = drive(&mut face, "at:12:0,press:81:100,move:105:100,release");
+        assert!(errors.is_empty(), "{errors:?}");
+        let want = tl0.trim_in(0, 1, 3).unwrap();
+        assert_eq!(face.state.timeline, want);
+        assert_eq!((face.state.playhead, face.state.undo_depth()), (12, 1));
+        let c = face.state.selected().unwrap();
+        assert_eq!((c.at, c.src_in, c.src_out), (13, 3, 10));
+        // Drag A[23,33)@25 (tick 28: x 228) 4 ticks right, Esc a second drag, L L shuttles at 2x, undo by chord.
+        let errors = drive(&mut face, "press:228:100,move:260:100,release,press:260:100,move:300:100,key:Escape,release,key:l,key:l");
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(face.state.timeline, want.move_clip(0, 2, 0, 29).unwrap());
+        assert_eq!((face.playing, face.rate), (true, 2));
+        drive(&mut face, "key:k,key:Ctrl+z,key:Home,move:160:100,wheel:1");
+        assert_eq!(face.state.timeline, want);
+        assert_eq!((face.playing, face.state.playhead, face.state.zoom), (false, 0, 16));
+        assert_eq!(face.layout().tick_at(160.0), 20);
+        assert_eq!(drive(&mut face, "press:x:1"), vec!["bad token press:x:1".to_string()]);
     }
 }

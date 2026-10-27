@@ -478,6 +478,11 @@ pub enum SMessage {
     /// Tabula gives. APPENDED after `UiReady` so no earlier wire tag moves. Mirrors the
     /// [`SMessage::Facet`] sub-enum shape: one outer variant, the verbs inside it.
     Tabula(TabulaCommand),
+    /// Chrome -> owner (NLE2B, LEDGER SR208): the primary button went down (`down: true`) or up on a surface, in
+    /// surface pixels (top-left origin). Both ends of a press, so a drag has a start and an end on every face (GTK's
+    /// click gesture sends no `BrowserClick` once the pointer passes its drag threshold). `BrowserClick` on release
+    /// and `BrowserMouseMove` are still sent as before. APPENDED so no earlier wire tag moves.
+    BrowserButton { down: bool, x: f64, y: f64 },
 }
 
 /// A typed preference value — the whole value domain of the Principia

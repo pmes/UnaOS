@@ -497,6 +497,11 @@ kat!(
     SMessage::BrowserA11yPrefs { reduce_motion: true, contrast: "more".to_string(), forced_colors: false },
     r#"{"BrowserA11yPrefs":{"reduce_motion":true,"contrast":"more","forced_colors":false}}"#
 );
+kat!(
+    kat_browser_button,
+    SMessage::BrowserButton { down: true, x: 12.5, y: 40.0 },
+    r#"{"BrowserButton":{"down":true,"x":12.5,"y":40.0}}"#
+);
 
 /// A11YFACE (SR124): the `a11y` verb table reads every spelling back to its verb, a heading level, and nothing else.
 #[test]
@@ -1478,6 +1483,7 @@ fn smessage_variant_name(m: &SMessage) -> &'static str {
         SMessage::BrowserA11y(_) => "BrowserA11y", // A11YFACE (SR124): the accessibility verbs and rows
         SMessage::BrowserA11yLines(_) => "BrowserA11yLines",
         SMessage::BrowserA11yPrefs { .. } => "BrowserA11yPrefs",
+        SMessage::BrowserButton { .. } => "BrowserButton", // NLE2B (SR208): the press / release of a surface's button
     }
 }
 
