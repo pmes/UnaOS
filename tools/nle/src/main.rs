@@ -7,7 +7,7 @@
 //! ```text
 //! nle schedule <edl|media> [--fps N] --src REEL=<media> ...
 //! nle render   <edl|media> [--fps N] --src REEL=<media> ... --out <stem>
-//! nle export   <edl|media> [--fps N] --src REEL=<media> ... --out <dir> [--video png|raw|h264] [--qp N] [--gop N] [--bitrate KBPS] [--audio wav|mp4|none]
+//! nle export   <edl|media> [--fps N] --src REEL=<media> ... --out <dir> [--video png|raw|h264] [--qp N] [--gop N] [--bitrate KBPS] [--audio wav|mp4|none] [--mkv]
 //! nle --make-src <out.mp4> <base> [frames] [fps]
 //! ```
 //!
@@ -23,19 +23,20 @@
 //! `video.rgba` + `video.json`, and `audio.wav` or `audio.mp4`; one JSON line: codec, frames, files, bytes, the RGBA
 //! fnv (`render`'s) and PCM frames. `--video h264` (NLE5B, SR206) writes `movie.mp4` (H.264 + PCM16) under
 //! `--audio mp4`, else `video.mp4`; `--qp` (16..=40, default 26) and `--gop` (default the timeline's fps); `--bitrate`
-//! a CBR target in kbit/s at the timeline's fps (H264ENCRC SR218: `--qp` becomes the starting QP).
+//! a CBR target in kbit/s at the timeline's fps (H264ENCRC SR218: `--qp` becomes the starting QP). `--mkv` (NLE6EXPORTMKV,
+//! rmbp-ledger B966) names the muxed file `.mkv` (`movie.mkv` / `video.mkv` / `audio.mkv`): the extension is the container.
 
 use std::io::Write;
 
 use stria::nle::{RenderSink, Sources, render, synth_source};
-use stria::nle_export::{AudioOut, H264Encoder, PngSequence, RawSequence, VideoEncoder, export};
+use stria::nle_export::{AudioOut, Container, H264Encoder, PngSequence, RawSequence, VideoEncoder, export_as};
 use timeline_core::schedule::schedule;
 use timeline_core::{Kind, Timeline, edl};
 
 fn usage() -> ! {
     eprintln!("usage: nle schedule <edl|media> [--fps N] --src REEL=<media> ...");
     eprintln!("       nle render <edl|media> [--fps N] --src REEL=<media> ... --out <stem>");
-    eprintln!("       nle export <edl|media> [--fps N] --src REEL=<media> ... --out <dir> [--video png|raw|h264] [--qp N] [--gop N] [--bitrate KBPS] [--audio wav|mp4|none]");
+    eprintln!("       nle export <edl|media> [--fps N] --src REEL=<media> ... --out <dir> [--video png|raw|h264] [--qp N] [--gop N] [--bitrate KBPS] [--audio wav|mp4|none] [--mkv]");
     eprintln!("       nle --make-src <out.mp4> <base> [frames] [fps]");
     std::process::exit(2)
 }
@@ -99,6 +100,7 @@ fn main() {
     let (mut fps, mut out, mut srcs) = (25u32, None::<String>, Vec::new());
     let (mut video, mut audio) = ("png".to_string(), "wav".to_string());
     let (mut qp, mut gop, mut bitrate) = (26u8, None::<u32>, None::<u32>);
+    let mut container = Container::Mp4;
     let mut it = args[2..].iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -109,6 +111,7 @@ fn main() {
             "--qp" => qp = it.next().and_then(|s| s.parse().ok()).unwrap_or_else(|| usage()),
             "--gop" => gop = Some(it.next().and_then(|s| s.parse().ok()).unwrap_or_else(|| usage())),
             "--bitrate" => bitrate = Some(it.next().and_then(|s| s.parse().ok()).unwrap_or_else(|| usage())),
+            "--mkv" => container = Container::Mkv,
             "--src" => {
                 let v = it.next().unwrap_or_else(|| usage());
                 let Some((r, p)) = v.split_once('=') else { usage() };
@@ -154,7 +157,7 @@ fn main() {
         }
         "export" => {
             let gop = gop.unwrap_or((tl.tb.den / tl.tb.num.max(1)).max(1) as u32);
-            export_verb(&tl, range, &sources, &out.unwrap_or_else(|| usage()), &video, &audio, qp, gop, bitrate)
+            export_verb(&tl, range, &sources, &out.unwrap_or_else(|| usage()), &video, &audio, qp, gop, bitrate, container)
         }
         _ => usage(),
     }
@@ -162,7 +165,7 @@ fn main() {
 
 /// NLE5 (SR204): the `export` verb — plumbing only; the export is `stria::nle_export`'s.
 #[allow(clippy::too_many_arguments)]
-fn export_verb(tl: &Timeline, range: std::ops::Range<i64>, sources: &Sources, dir: &str, video: &str, audio: &str, qp: u8, gop: u32, bitrate: Option<u32>) {
+fn export_verb(tl: &Timeline, range: std::ops::Range<i64>, sources: &Sources, dir: &str, video: &str, audio: &str, qp: u8, gop: u32, bitrate: Option<u32>, container: Container) {
     let enc: Box<dyn VideoEncoder> = match video {
         "png" => Box::new(PngSequence),
         "raw" => Box::new(RawSequence),
@@ -179,7 +182,7 @@ fn export_verb(tl: &Timeline, range: std::ops::Range<i64>, sources: &Sources, di
         _ => usage(),
     };
     std::fs::create_dir_all(dir).unwrap_or_else(|e| die(format!("{dir}: {e}")));
-    let r = export(tl, range, sources, std::path::Path::new(dir), enc, aud).unwrap_or_else(|e| die(e.to_string()));
+    let r = export_as(tl, range, sources, std::path::Path::new(dir), enc, aud, container).unwrap_or_else(|e| die(e.to_string()));
     println!(
         "{{\"codec\":\"{video}\",\"frames\":{},\"files\":{},\"bytes\":{},\"fnv\":\"{:016x}\",\"pcm_frames\":{}}}",
         r.frames, r.files, r.bytes, r.fnv, r.pcm_frames

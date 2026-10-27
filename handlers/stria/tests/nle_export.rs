@@ -406,3 +406,44 @@ fn h264_pyramid_export_reorder_depth_two() {
     let bytes: usize = want.iter().map(|a| a.avcc_sample().len()).sum();
     println!("h264 pyramid bframes 3 export: {bytes} bytes, ctts offsets {offsets:?}");
 }
+
+/// NLE6EXPORTMKV (rmbp-ledger B966): `export_as(.., Container::Mkv)` writes `movie.mkv` (no `movie.mp4`) through
+/// `build::mux`'s Matroska; re-demuxed it is the encoder's stream: Avc with the encoder's avcC as CodecPrivate, 35
+/// samples, a keyframe every 10, pts at 40 ms per tick (Matroska stores no dts), each sample the encoder's access unit,
+/// and the PCM track the render's samples.
+#[test]
+fn h264_movie_mkv_round_trip() {
+    use stria::nle_export::{Container, export_as};
+    let tl = timeline();
+    let src = sources(&tl);
+    let refr = reference(&tl, &src);
+    let dir = fresh("h264mkv");
+    let r = export_as(&tl, 0..TICKS, &src, &dir, Box::new(H264Encoder::new(26, 10)), AudioOut::Mp4, Container::Mkv).unwrap();
+    assert_eq!((r.frames, r.files, r.pcm_frames), (35, 1, 35 * PER as u64));
+    let mkv = std::fs::read(dir.join("movie.mkv")).unwrap();
+    assert_eq!(r.bytes, mkv.len() as u64);
+    assert!(!dir.join("movie.mp4").exists());
+    let (want, avcc, _, _) = fresh_h264(&refr.frames, 10);
+
+    let d = Demuxer::open(mkv.clone()).unwrap();
+    assert_eq!(d.format(), gneiss_pal::dsp::demux::Format::Matroska);
+    assert_eq!(d.tracks().len(), 2);
+    let vt = &d.tracks()[0];
+    assert_eq!((vt.kind, vt.codec.clone(), vt.width, vt.height), (TrackKind::Video, Codec::Avc, 64, 48));
+    assert_eq!(vt.config, avcc, "CodecPrivate is the encoder's avcC record");
+    let samples: Vec<_> = d.track_samples(0).copied().collect();
+    assert_eq!(samples.len(), 35);
+    for (i, s) in samples.iter().enumerate() {
+        let pk = d.packet_at(s);
+        assert_eq!(pk.keyframe, i % 10 == 0, "sample {i} keyframe flag");
+        assert_eq!(vt.to_ns(pk.pts), i as i64 * 40_000_000, "sample {i} pts");
+        assert_eq!(pk.data, want[i], "sample {i} is the encoder's access unit");
+    }
+    let at = &d.tracks()[1];
+    assert_eq!((at.kind, at.sample_rate, at.channels), (TrackKind::Audio, SYNTH_RATE, 1));
+    assert_eq!(at.codec, Codec::Pcm { bits: 16, float: false, big_endian: false });
+    let data: Vec<u8> = d.track_samples(1).flat_map(|s| d.packet_at(s).data).collect();
+    let got: Vec<i16> = data.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]])).collect();
+    assert_eq!(got, want_pcm(&tl, &src));
+    assert!(Demuxer::open_indexed(mkv).unwrap().indexed(), "the Cues are found");
+}

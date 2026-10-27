@@ -30,6 +30,8 @@ use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use gneiss_pal::dsp::demux::build;
+/// NLE6EXPORTMKV (rmbp-ledger B966): the export's container, for the faces that name it (`nle export --mkv`).
+pub use gneiss_pal::dsp::demux::build::Container;
 use gneiss_pal::dsp::image::{PngError, encode_rgba};
 use h264enc_core::rgba::{RgbaEncoder, Unit};
 use h264enc_core::{Config, RateControl, RcMode};
@@ -261,6 +263,8 @@ pub struct ExportSink {
     units: u64,
     report: ExportReport,
     err: Option<ExportError>,
+    /// NLE6EXPORTMKV (rmbp-ledger B966): the muxed file's container (its name's extension, `build::Container`).
+    container: build::Container,
 }
 
 impl ExportSink {
@@ -279,6 +283,7 @@ impl ExportSink {
             units: 0,
             report: ExportReport { fnv: 0xcbf2_9ce4_8422_2325, ..ExportReport::default() },
             err: None,
+            container: build::Container::Mp4,
         }
     }
 
@@ -382,12 +387,14 @@ impl ExportSink {
         }
         tracks.extend(audio);
         if !tracks.is_empty() {
-            let name = match (movie, self.audio == AudioOut::Mp4) {
-                (true, true) => "movie.mp4",
-                (true, false) => "video.mp4",
-                (false, _) => "audio.mp4",
+            let stem = match (movie, self.audio == AudioOut::Mp4) {
+                (true, true) => "movie",
+                (true, false) => "video",
+                (false, _) => "audio",
             };
-            let mp4 = build::mp4(&tracks, &build::Mp4Options::default());
+            // NLE6EXPORTMKV (rmbp-ledger B966): the container is the file name's extension; ONE one-shot muxer for both
+            let name = format!("{stem}.{}", self.container.ext());
+            let mp4 = build::mux(&tracks, self.container).map_err(|e| ExportError::Io(std::io::Error::other(e)))?;
             std::fs::write(self.dir.join(name), &mp4)?;
             self.report.files += 1;
             self.report.bytes += mp4.len() as u64;
@@ -434,7 +441,23 @@ pub fn export(
     video: Box<dyn VideoEncoder>,
     audio: AudioOut,
 ) -> Result<ExportReport, ExportError> {
+    export_as(tl, range, sources, dir, video, audio, build::Container::Mp4)
+}
+
+/// NLE6EXPORTMKV (rmbp-ledger B966): [`export`] with the muxed file's container: `movie.mp4` / `video.mp4` / `audio.mp4`, or
+/// the same names in `.mkv` (`build::mux`: the Matroska `build::MkvStream` fed in decode order). The rule is the kernel's:
+/// the file name's extension names the container (`build::Container::of`); `nle export --mkv` picks the `.mkv` names.
+pub fn export_as(
+    tl: &Timeline,
+    range: std::ops::Range<i64>,
+    sources: &Sources,
+    dir: &Path,
+    video: Box<dyn VideoEncoder>,
+    audio: AudioOut,
+    container: build::Container,
+) -> Result<ExportReport, ExportError> {
     let mut sink = ExportSink::new(dir, video, audio);
+    sink.container = container;
     render(tl, range, sources, &mut sink).map_err(ExportError::Render)?;
     sink.finish(tl.tb)
 }

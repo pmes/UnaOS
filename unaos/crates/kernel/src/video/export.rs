@@ -92,7 +92,7 @@ struct Exp {
     out: String,
     opts: Opts,
     rgba: RgbaEncoder,
-    stream: Option<build::Mp4Stream<VfsOut>>,
+    stream: Option<build::MuxStream<VfsOut>>, // NLE6EXPORTMKV (rmbp-ledger B966): the container is the out path's extension
     vtrack: usize,
     /// The file was created by this export (so a refusal unlinks it; a file that was there before is never touched).
     begun: bool,
@@ -113,9 +113,9 @@ pub fn start(edl: &str, out: &str, opts: Opts) -> Result<u32, String> {
     if !super::vplay::is_edl(edl) {
         return Err(alloc::format!("{} is not an .edl", edl));
     }
-    let n = out.len();
-    if !(n > 4 && out.is_char_boundary(n - 4) && out[n - 4..].eq_ignore_ascii_case(".mp4")) {
-        return Err(alloc::format!("{}: the export writes .mp4 (MKV owed)", out));
+    if build::Container::of(out).is_none() {
+        // NLE6EXPORTMKV (rmbp-ledger B966): THE RULE — the out path's extension names the container (`build::Container::of`)
+        return Err(alloc::format!("{}: the export writes .mp4 or .mkv", out));
     }
     if super::player::is_open() {
         return Err(String::from("the Player is open (close it first: the export takes vplay's one job)"));
@@ -251,7 +251,7 @@ impl Exp {
         }
         let Some(mut st) = self.stream.take() else { return Err(("no-frames", String::from("the EDL encoded no frame"))) };
         for t in tracks {
-            let i = st.track(t.spec);
+            let i = st.track(t.spec).map_err(|e| ("write-refused", e))?; // NLE6EXPORTMKV (rmbp-ledger B966): the stream choice at finish (Matroska refuses a codec by name)
             for smp in t.samples {
                 st.push(i, smp).map_err(|e| ("write-refused", e))?;
             }
@@ -271,8 +271,8 @@ impl Exp {
             if self.stream.is_none() {
                 crate::shell::vfs_mount_table().put_file(&self.out, &[], crate::fs::vfs::KERNEL_PRINCIPAL).map_err(|e| alloc::format!("create {}: {:?}", self.out, e))?;
                 self.begun = true;
-                let mut st = build::Mp4Stream::begin(VfsOut { path: self.out.clone() })?;
-                self.vtrack = st.track(build::coded_video_spec(1, *b"avc1", Some(*b"avcC"), self.rgba.avcc(), self.size.0 as u16, self.size.1 as u16, self.tb));
+                let mut st = build::MuxStream::begin(build::Container::of(&self.out).unwrap_or(build::Container::Mp4), VfsOut { path: self.out.clone() })?; // NLE6EXPORTMKV (rmbp-ledger B966): the stream choice at begin
+                self.vtrack = st.track(build::coded_video_spec(1, *b"avc1", Some(*b"avcC"), self.rgba.avcc(), self.size.0 as u16, self.size.1 as u16, self.tb))?;
                 self.stream = Some(st);
             }
             if let Some(st) = self.stream.as_mut() {
