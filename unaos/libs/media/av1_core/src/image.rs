@@ -501,7 +501,7 @@ pub fn planes_to_rgba(p: &Planes, up: Upsampling) -> Image {
 /// convention, unchanged: 0 identity (GBR), 8 YCgCo (MATRIX-MORE; before SR340 it fell to BT.601), 10 (BT.2020
 /// constant-luminance) as BT.2020's Kr / Kb, 2 (unspecified) and every matrix without a stated Kr / Kb BT.601 (as libavif).
 pub fn planes_to_rgba_with(p: &Planes, up: Upsampling, conv: Conversion) -> Image {
-    use yuv_core::{Chroma, Matrix, Picture};
+    use yuv_core::{Chroma, Matrix};
     let (w, h) = (p.width as usize, p.height as usize);
     let m = match p.matrix_coefficients {
         0 => Matrix::Identity,
@@ -514,19 +514,7 @@ pub fn planes_to_rgba_with(p: &Planes, up: Upsampling, conv: Conversion) -> Imag
             }
         }
     };
-    let pic = Picture {
-        w,
-        h,
-        y: &p.y,
-        u: &p.u,
-        v: &p.v,
-        y_stride: w,
-        uv_stride: p.chroma_width() as usize,
-        ss: (p.ss_x, p.ss_y),
-        mono: p.mono,
-        bit_depth: p.bit_depth,
-        full: p.full_range,
-    };
+    let pic = picture(p);
     let chroma = match up {
         Upsampling::Nearest => Chroma::Nearest,
         Upsampling::Bilinear => Chroma::Bilinear,
@@ -534,6 +522,25 @@ pub fn planes_to_rgba_with(p: &Planes, up: Upsampling, conv: Conversion) -> Imag
     let mut rgba = vec![0u8; w * h * 4];
     yuv_core::to_rgba(&pic, m, chroma, false, &mut rgba);
     Image { w: p.width, h: p.height, rgba }
+}
+
+/// AV1COLOURONE (LEDGER SR340): decoded planes as the one kernel's `yuv_core::Picture` (luma `width` per row, chroma
+/// `chroma_width`, the stream's subsampling, mono, depth and range) — the picture `planes_to_rgba_with` converts and the
+/// kernel Player hands `yuv_core::to_rgba` with its own pick.
+pub fn picture(p: &Planes) -> yuv_core::Picture<'_, u16> {
+    yuv_core::Picture {
+        w: p.width as usize,
+        h: p.height as usize,
+        y: &p.y,
+        u: &p.u,
+        v: &p.v,
+        y_stride: p.width as usize,
+        uv_stride: p.chroma_width() as usize,
+        ss: (p.ss_x, p.ss_y),
+        mono: p.mono,
+        bit_depth: p.bit_depth,
+        full: p.full_range,
+    }
 }
 
 /// ORACLE ONLY ([`Conversion::Libyuv`]): `yuv_core::coeffs` with the four chroma coefficients quantised as libyuv stores

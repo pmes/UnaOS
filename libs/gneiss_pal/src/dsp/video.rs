@@ -21,9 +21,9 @@
 use super::demux::{Codec, Packet, Track};
 use super::demux::build::TestPatternPacket;
 // AV1COLOURONE (SR340): COLOURONE's kernel lives in yuv_core (no_std, no alloc, zero deps), shared with av1_core.
-use yuv_core::{Chroma, Matrix, Picture, KR_KB_601, KR_KB_709};
+use yuv_core::{Chroma, Matrix, Picture, KR_KB_601};
 #[cfg(test)]
-use yuv_core::coeffs as yuv_coeffs;
+use yuv_core::{coeffs as yuv_coeffs, KR_KB_709};
 
 /// Decoded pixels: packed 8-bit RGBA, or planar 8-bit 4:2:0 YCbCr (what an AV1 decoder emits), or planar 4:2:0 YCbCr
 /// above 8 bits (COLOURONE SR328: `I420Hi`, a Main10 picture's samples as decoded, `bit_depth` 9..16).
@@ -59,15 +59,11 @@ impl Frame {
     /// untagged video, as ffmpeg's swscale and the browsers do). `full_range == Some(true)` is full range, anything else
     /// limited. Integer only: a sample above 8 bits (`Pixels::I420Hi`) is narrowed to 8 inside the one rounded multiply,
     /// after the conversion (no dither: `yuv_core::to_rgba`'s `dither` is false here). No tone mapping: a PQ / HLG picture
-    /// keeps its transfer. The kernel is `yuv_core`'s (AV1COLOURONE SR340), the one av1_core converts with.
+    /// keeps its transfer. The pick (`yuv_core::pick`) and the kernel are `yuv_core`'s (AV1COLOURONE SR340), shared with av1_core
+    /// and the kernel Player.
     pub fn to_rgba_colour(&self, colour: Option<&super::demux::colour::Colour>) -> Vec<u8> {
-        let hd = self.width >= 1280 || self.height >= 720;
-        let m = match colour.map(|c| c.matrix) {
-            Some(0) => Matrix::Identity,
-            Some(8) => Matrix::YCgCo,
-            mc => Matrix::Kr(mc.and_then(yuv_core::kr_kb).unwrap_or(if hd { KR_KB_709 } else { KR_KB_601 })),
-        };
-        self.yuv_rgba(m, colour.is_some_and(|c| c.full_range == Some(true)))
+        let (m, full) = yuv_core::pick(colour.map(|c| c.matrix), colour.and_then(|c| c.full_range), self.width, self.height);
+        self.yuv_rgba(m, full)
     }
 
     /// The one kernel at 4:2:0, nearest chroma (the 2x2 block), no dither: COLOURONE's bytes.

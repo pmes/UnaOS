@@ -33,6 +33,20 @@ pub fn kr_kb(matrix: u8) -> Option<(i64, i64)> {
     }
 }
 
+/// The video pick (COLOURONE SR328's `to_rgba_colour` match, moved here by AV1COLOURONE SR340 so the host Player and
+/// the kernel Player share it): matrix 0 identity, 8 YCgCo, a stated Kr / Kb by [`kr_kb`], and any other matrix
+/// (2 unspecified, 10 BT.2020 constant-luminance, reserved) or `None` the size default — BT.601 below HD, BT.709 when the
+/// picture is at least 1280 wide or 720 high. Full range only when `full_range == Some(true)`.
+pub fn pick(matrix: Option<u8>, full_range: Option<bool>, w: u32, h: u32) -> (Matrix, bool) {
+    let hd = w >= 1280 || h >= 720;
+    let m = match matrix {
+        Some(0) => Matrix::Identity,
+        Some(8) => Matrix::YCgCo,
+        mc => Matrix::Kr(mc.and_then(kr_kb).unwrap_or(if hd { KR_KB_709 } else { KR_KB_601 })),
+    };
+    (m, full_range == Some(true))
+}
+
 /// `(shift, [yc, rv, gu, gv, bu], y_offset, c_offset)`, the fixed-point table [`coeffs`] derives.
 pub type Coeffs = (u32, [i32; 5], i32, i32);
 
@@ -198,6 +212,12 @@ mod tests {
         assert_eq!(coeffs(KR_KB_601, true, 8), (8, [256, 359, 88, 183, 454], 0, 128));
         assert_eq!(coeffs(kr_kb(9).unwrap(), false, 10), (16, [19077, 27503, 3069, 10657, 35091], 64, 512));
         assert_eq!((kr_kb(0), kr_kb(2), kr_kb(8), kr_kb(10)), (None, None, None, None));
+        // The video pick: the size default at 1280 wide or 720 high, a stated matrix wins, full only on Some(true).
+        assert_eq!(pick(None, None, 2, 2), (Matrix::Kr(KR_KB_601), false));
+        assert_eq!(pick(Some(2), Some(false), 1280, 2), (Matrix::Kr(KR_KB_709), false));
+        assert_eq!(pick(Some(10), None, 2, 720), (Matrix::Kr(KR_KB_709), false));
+        assert_eq!(pick(Some(6), Some(true), 1920, 1080), (Matrix::Kr(KR_KB_601), true));
+        assert_eq!((pick(Some(0), None, 2, 2).0, pick(Some(8), None, 2, 2).0), (Matrix::Identity, Matrix::YCgCo));
     }
 
     #[test]
