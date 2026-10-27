@@ -261,8 +261,21 @@ fn a_48k_source_on_a_44k1_project_is_resampled() {
     let (r, s) = mix(&[0], vec![vec![Clip::new(SourceId(0), 0, 25, 0)]], 25, 44_100);
     assert_eq!((r.rate, s.rate), (44_100, 44_100));
     assert!((s.pcm.len() as i64 - 44_100).abs() <= 1, "{} samples", s.pcm.len());
-    // output sample 441 sits exactly on source sample 480
-    assert_eq!(s.pcm[441], q(synth_sample(0, 480) as i32));
+    // NLE4B (SR222): the windowed sinc's tolerance. Output sample 441 sits exactly on source sample 480 (within one LSB),
+    // and EVERY interior sample is the source ramp (`i mod 10000`) at `k * 48000 / 44100` within one LSB, skipping the
+    // first 32 and the window's reach (24 source samples) around each wrap of the ramp, where any filter rings.
+    assert!((s.pcm[441] * 32768.0 - synth_sample(0, 480) as f32).abs() <= 1.0, "{}", s.pcm[441] * 32768.0);
+    let mut checked = 0;
+    for (k, &v) in s.pcm.iter().enumerate().skip(32) {
+        let x = k as f64 * 48_000.0 / 44_100.0;
+        let ramp = x % 10_000.0;
+        if !(24.0..10_000.0 - 24.0).contains(&ramp) {
+            continue;
+        }
+        assert!((v as f64 * 32768.0 - ramp).abs() <= 1.0, "sample {k}: {} vs {ramp}", v as f64 * 32768.0);
+        checked += 1;
+    }
+    assert!(checked > 43_000, "{checked}");
     assert_eq!(r.pcm_frames, s.pcm.len() as u64);
 }
 
