@@ -461,8 +461,8 @@ pub fn test() {
     let (sb, db) = (FW * FH * 4, DW * DH * 4);
     let lay_s = Layout::from_size_align(sb, 4096).unwrap();
     let lay_d = Layout::from_size_align(db, 4096).unwrap();
-    // SAFETY: page-aligned heap scratch, held for the boot once the BCS may have mapped it (gen7.md §2.6).
-    let (sp, dp) = unsafe { (alloc_zeroed(lay_s), alloc_zeroed(lay_d)) };
+    // Page-aligned heap scratch from gen7blit's slots, held for the boot once the BCS may have mapped it (gen7.md §2.6).
+    let ((sp, s_re), (dp, d_re)) = (super::held_take(&super::BLIT_HELD[0], lay_s.size().div_ceil(4096)), super::held_take(&super::BLIT_HELD[1], lay_d.size().div_ceil(4096))); let (sp, dp) = (sp as *mut u8, dp as *mut u8); // GEN7HOLDONCE (B1025): r11's rule (gen7.rs tail); the heap-short return below no longer leaks them
     let (Some(mut dcpu), Some(mut dgpu)) = (heap(db), heap(db)) else {
         serial_println!(":: GEN7BLIT2: impl=bcs selftest=heap-short us=0 -> declined ::");
         return;
@@ -558,9 +558,9 @@ pub fn test() {
         None => alloc::string::String::from("-"),
     };
     let l1 = alloc::format!(
-        "[gen7blit] job rects=2 fixture={}x{}->{}x{} win={} cand={} landed={} armed={} head={:08X} tail={:08X} sentinel={} idle={} regs_restored={} fw_restored={} ptes_restored={} match={}/{} spill={} setup_us={} bcs_us={} cpu_us={} gpu_us={} reclaim=held",
+        "[gen7blit] job rects=2 fixture={}x{}->{}x{} win={} cand={} landed={} armed={} head={:08X} tail={:08X} sentinel={} idle={} regs_restored={} fw_restored={} ptes_restored={} match={}/{} spill={} setup_us={} bcs_us={} cpu_us={} gpu_us={} reclaim=held reuse={} held_kb={}",
         FW, FH, DW, DH, o.win, o.cand, o.landed as u8, o.armed as u8, o.head, o.tail, o.sentinel as u8, o.idle as u8,
-        o.regs_restored as u8, o.fw_restored as u8, o.ptes_restored as u8, matched, total, spill, o.setup_us, o.bcs_us, cpu_us, gpu_tok
+        o.regs_restored as u8, o.fw_restored as u8, o.ptes_restored as u8, matched, total, spill, o.setup_us, o.bcs_us, cpu_us, gpu_tok, if s_re && d_re { "y" } else { "n" }, super::held_kb()
     );
     let (winner, arm) = decide(ok, o.bcs_us, cpu_us, gpu_us, owner);
     PANEL_IGD.store(owner == "igd", AO::Release);
@@ -583,5 +583,5 @@ pub fn test() {
         serial_println!("{}", s);
     }
     *DONE.lock() = Some([l1, l2, l3]); #[cfg(all(target_arch = "x86_64", feature = "wc"))] { use crate::allocator::census::{retag, GEN7_HELD}; retag(sp as usize, lay_s.size(), GEN7_HELD); retag(dp as usize, lay_d.size(), GEN7_HELD); } // FIXTURERETAIN (B1017): sp/dp are `gen7-held`. LINE-NEUTRAL append, code first
-    // sp/dp are deliberately not freed (reclaim=held); dcpu/dgpu were never GGTT-mapped and drop here.
+    // sp/dp are deliberately not freed (reclaim=held, in BLIT_HELD: a later job reuses them); dcpu/dgpu were never GGTT-mapped and drop here.
 }
