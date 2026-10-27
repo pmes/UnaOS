@@ -29,7 +29,7 @@
 // HIDBOOTLEDS (rmbp-ledger B987): the lock LEDs leave the decoder through ONE `Transport::set_leds`
 // call; `[keystat] <tag>` and the PRTSCR `on <transport>` word name the transport (EHCI byte-identical).
 // HIDBOOTLEDSEHCI (B991): EHCI's arm marks the endpoint's LED slot, drained after the walk. Owed (input.md
-// §5 Z3 row): HIDBOOT-LEDS-TEST; the Fn keys; HIDBOOT-ARM; HIDBOOT-PUMP (the i8042 is pumped only from `ehci::service_ehci_hid`).
+// §5 Z3 row): the Fn keys; HIDBOOT-ARM; HIDBOOT-PUMP (the i8042 is pumped only from `ehci::service_ehci_hid`). HIDBOOTLEDSTEST (B995): the slot drain is `drain_led_slots` (file tail), `tests hidboot`.
 
 /// The transport that carried a boot keyboard report. Labels the decoder's wire; changes no decode.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -568,4 +568,148 @@ pub fn note_leds_sent(t: Transport, leds: u8, addr: u8, intf: u8, r: Result<(), 
             serial_println!("[hidboot] leds via={} leds={:#04x} caps={} addr={} intf={} -> refused why={}", t.tag(), leds, caps, addr, intf, why);
         }
     }
+}
+
+// HIDBOOTLEDSTEST (rmbp-ledger B995) — TAIL-APPENDED: B991's LED SLOT DRAIN, split out of `ehci::Controller::service` so
+// a KAT can drive it without a live controller (B991's owed HIDBOOT-LEDS-TEST, input.md §5 Z3 row). The drain cannot
+// take `&mut [IntEp]` plus a `send` closure: `IntEp` is private to `ehci`, and the closure would need the controller's
+// `&mut self` (EP0's `set_hid_leds`) while the slice already borrows `self.int_eps`. So the slot OWNER implements
+// `LedSlots` (EHCI's `Controller` at ehci/mod.rs's tail, the KAT's fake below) and the ONE drain below holds the whole
+// rule: skip a clean slot, a latched-off LED and a retired endpoint; one send per dirty slot carrying its LATEST byte
+// (toggles in one pass coalesce); the `[hidboot] leds` line; a refusal latches the slot off (one refused line per
+// endpoint). Best-effort: a refusal costs a dark key, never a keystroke (the case fold already moved with the byte).
+
+/// HIDBOOTLEDSTEST (B995): a transport's per-endpoint LED slots, as the one drain sees them.
+#[cfg(feature = "ehcihid")]
+pub trait LedSlots {
+    /// How many slots (EHCI: one per interrupt endpoint).
+    fn count(&self) -> usize;
+    /// Slot `i` as `(dirty, ok, dead, leds, addr, intf)`, its dirty flag CLEARED by the read.
+    fn take(&mut self, i: usize) -> (bool, bool, bool, u8, u8, u8);
+    /// Ship `leds` to slot `i`'s device (EHCI: SET_REPORT on EP0); the control fn's own answer.
+    fn send(&mut self, i: usize, leds: u8) -> Result<(), &'static str>;
+    /// Slot `i` refused: never send to it again this boot.
+    fn latch_off(&mut self, i: usize);
+}
+
+/// HIDBOOTLEDSTEST (B995): the ONE LED slot drain (B991's loop body, moved verbatim in logic). Returns `(sent, refused)`.
+#[cfg(feature = "ehcihid")]
+pub fn drain_led_slots<S: LedSlots>(s: &mut S, t: Transport) -> (u32, u32) {
+    let (mut sent, mut refused) = (0u32, 0u32);
+    for i in 0..s.count() {
+        let (dirty, ok, dead, leds, addr, intf) = s.take(i);
+        if !dirty || !ok || dead {
+            continue; // nothing owed, a latched-off LED, or a retired endpoint
+        }
+        let r = s.send(i, leds);
+        note_leds_sent(t, leds, addr, intf, r);
+        if r.is_err() {
+            s.latch_off(i); // the case fold is untouched
+            refused += 1;
+        } else {
+            sent += 1;
+        }
+    }
+    (sent, refused)
+}
+
+/// HIDBOOTLEDSTEST (B995): the KAT's slot owner — two endpoints on address 0 (no enumerated USB device holds it).
+#[cfg(feature = "ehcihid")]
+struct KatSlots {
+    dirty: [bool; 2],
+    ok: [bool; 2],
+    dead: [bool; 2],
+    leds: [u8; 2],
+    refuse: [bool; 2],
+    sends: [u32; 2],
+    last: [u8; 2],
+}
+
+#[cfg(feature = "ehcihid")]
+impl LedSlots for KatSlots {
+    fn count(&self) -> usize {
+        2
+    }
+    fn take(&mut self, i: usize) -> (bool, bool, bool, u8, u8, u8) {
+        let d = self.dirty[i];
+        self.dirty[i] = false;
+        (d, self.ok[i], self.dead[i], self.leds[i], 0, i as u8)
+    }
+    fn send(&mut self, i: usize, leds: u8) -> Result<(), &'static str> {
+        self.sends[i] += 1;
+        self.last[i] = leds;
+        if self.refuse[i] { Err("kat-refuse") } else { Ok(()) }
+    }
+    fn latch_off(&mut self, i: usize) {
+        self.ok[i] = false;
+    }
+}
+
+/// HIDBOOTLEDSTEST (B995) — `tests hidboot` (R80: registered, never at boot). The live decoder and the live drain over
+/// a fake slot owner: `owed` = `decode_boot_keyboard` under `Transport::Ehci` answers true on a lock-key PRESS EDGE only
+/// (restated, released and short reports answer false); `coalesce` = four owed toggles in one pass ship ONE send with
+/// the latest byte, a dead endpoint's dirty slot is skipped and cleared, a clean pass sends nothing; `latch` = a
+/// refusing endpoint is sent to once, latched off, and never again. The decoder runs under `ehci::EHCI_HID`, as every
+/// caller does (the DBLSTROKE atomics and the typematic feed). Lock usages carry no character: no `pal::push_event`.
+/// `:: HIDBOOT: owed=ok|bad coalesce=ok|bad latch=ok|bad -> PASS|FAIL ::`
+#[cfg(feature = "ehcihid")]
+pub fn selftest() {
+    const CAPS: u8 = 0x39;
+    const NUM: u8 = 0x53;
+    let rep = |kc: u8| -> [u8; 8] { [0, 0, kc, 0, 0, 0, 0, 0] };
+    let up = [0u8; 8];
+    let mut fake = KatSlots {
+        dirty: [false; 2],
+        ok: [true; 2],
+        dead: [false, true],
+        leds: [0; 2],
+        refuse: [false; 2],
+        sends: [0; 2],
+        last: [0; 2],
+    };
+    let (mut prev, mut pm) = ([0u8; 6], 0u8);
+    let (owed_ok, coalesce_ok, latch_ok) = {
+        let _g = crate::drivers::ehci::EHCI_HID.lock();
+        // owed: a press edge owes the slot; a restated level, a release and a short report do not.
+        let mut leds = 0u8;
+        let (mut p0, mut m0) = ([0u8; 6], 0u8);
+        let o1 = unsafe { decode_boot_keyboard(Transport::Ehci, &rep(CAPS), &mut p0, &mut m0, &mut leds) };
+        let l1 = leds;
+        let o2 = unsafe { decode_boot_keyboard(Transport::Ehci, &rep(CAPS), &mut p0, &mut m0, &mut leds) };
+        let o3 = unsafe { decode_boot_keyboard(Transport::Ehci, &up, &mut p0, &mut m0, &mut leds) };
+        let o4 = unsafe { decode_boot_keyboard(Transport::Ehci, &rep(CAPS)[..4], &mut p0, &mut m0, &mut leds) };
+        let owed_ok = o1 && l1 == 0x02 && !o2 && !o3 && !o4 && leds == 0x02;
+        // coalesce: slot 0's byte through the decoder, marked as the walk marks it; slot 1 dirty but dead.
+        for r in [rep(CAPS), up, rep(NUM), up] {
+            if unsafe { decode_boot_keyboard(Transport::Ehci, &r, &mut prev, &mut pm, &mut fake.leds[0]) } {
+                fake.dirty[0] = true;
+            }
+        }
+        fake.dirty[1] = true;
+        let d1 = drain_led_slots(&mut fake, Transport::Ehci);
+        let d2 = drain_led_slots(&mut fake, Transport::Ehci);
+        let coalesce_ok = d1 == (1, 0) && fake.sends == [1, 0] && fake.last[0] == 0x03 && !fake.dirty[1] && d2 == (0, 0);
+        // latch: a refusing endpoint is sent to once and latched off; the next owed toggle sends nothing.
+        fake.refuse[0] = true;
+        for r in [rep(CAPS), up] {
+            if unsafe { decode_boot_keyboard(Transport::Ehci, &r, &mut prev, &mut pm, &mut fake.leds[0]) } {
+                fake.dirty[0] = true;
+            }
+        }
+        let d3 = drain_led_slots(&mut fake, Transport::Ehci);
+        for r in [rep(CAPS), up] {
+            if unsafe { decode_boot_keyboard(Transport::Ehci, &r, &mut prev, &mut pm, &mut fake.leds[0]) } {
+                fake.dirty[0] = true;
+            }
+        }
+        let d4 = drain_led_slots(&mut fake, Transport::Ehci);
+        let latch_ok = d3 == (0, 1) && !fake.ok[0] && fake.last[0] == 0x01 && d4 == (0, 0) && fake.sends == [2, 0];
+        (owed_ok, coalesce_ok, latch_ok)
+    };
+    let w = |b: bool| if b { "ok" } else { "bad" };
+    serial_println!(
+        ":: HIDBOOT: owed={} coalesce={} latch={} -> {} ::",
+        w(owed_ok), w(coalesce_ok), w(latch_ok),
+        if owed_ok && coalesce_ok && latch_ok { "PASS" } else { "FAIL" }
+    );
 }
