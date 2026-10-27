@@ -555,7 +555,7 @@ pub fn present(dst: &mut [u32], w: usize, vh: usize, audio_ms: Option<u64>, play
             p.shown.push(o); // NLE6 (SR207): the presented frame counter
         }
     }
-    let vh = view_band(dst, w, vh, Some(f.pts_ms)); let c0 = crate::arch::now_cycles(); blit_fit(dst, w, 0, 0, w, vh, &f, Some(0)); present_cost(c0); // NLE6KEYS (rmbp-ledger B961): the EDL's track view in the picture rect's lower band (file tail)
+    let vh = view_band(dst, w, vh, Some(f.pts_ms)); let c0 = crate::arch::now_cycles(); present_fit(dst, w, vh, &f); present_cost(c0); // NLE6KEYS (rmbp-ledger B961): the EDL's track view in the picture rect's lower band (file tail). KERNELPRESENTPOLICY (rmbp-ledger B997): the blit by the shown clip's reel's size policy (file tail)
     (true, media)
 }
 
@@ -1898,10 +1898,7 @@ pub fn edit_key(path: &str, b: u8, ms: u64) -> Option<u64> {
         st.seek(tick_of(tb, ms));
         let at = st.playhead;
         if verb.starts_with("zoom") { return edit_zoom(st, verb, at); } if verb != "undo" && verb != "redo" { // NLE6KEYSLABELS (rmbp-ledger B968): a zoom key neither reselects nor saves (section tail)
-            let top = (0..st.timeline.tracks.len())
-                .rev()
-                .filter(|&i| st.timeline.tracks[i].kind == timeline_core::Kind::Video)
-                .find_map(|i| st.timeline.clip_at(i, at).map(|c| (i, c)));
+            let top = shown_clip(&st.timeline, at); // KERNELPRESENTPOLICY (rmbp-ledger B997): the ONE shown-clip rule, the present's too (file tail)
             match top {
                 Some((t, i)) => {
                     let _ = st.select(t, i);
@@ -2556,4 +2553,86 @@ fn edit_size_note(st: &timeline_core::editor::EditorState, verb: &str, at: i64) 
     }
     let Some(s) = st.selected().and_then(|c| st.timeline.source(c.src)) else { return };
     serial_println!("[nle] edit size {} -> {} at={}", s.reel, s.size_policy.name(), at);
+}
+
+// ── KERNELPRESENTPOLICY (rmbp-ledger B997): the present by the shown clip's reel's size policy (handlers.md §5 NLEPROBE-HDR's KERNEL-PRESENT-POLICY) ─
+// [`present`]'s blit is [`present_fit`]: in the EDL mode the presented frame's reel is the clip its tick shows ([`shown_clip`]:
+// the highest-numbered video track holding a clip, the schedule's rule and the clip [`edit_key`] selects for `f`), its
+// `SizePolicy` read from the Player's ONE editor state (`EDIT`, by try, after the live path: [`view_band`]'s order). Letterbox
+// (every non-EDL play, a gap, a pass whose try fails) is [`blit_fit`] with the former arguments, byte for byte; Fill / Stretch
+// go through the export's ONE door [`fit_rgba`] ([`place_rgba`] -> `Canvas::blit_policy`, `SizePolicy::place`'s geometry)
+// over the frame's whole picture (`Px::rgb`); Adopt is the frame at its own size centred over black, a side larger than the
+// picture rect cropped centred (the window's clip): a row copy, no scale. The `f` key needs nothing here: `edit_pass` hands
+// `edit_key`'s playhead to the seek door, whose restarted job presents by the edited state. Wire: `[vplay] present
+// fit=<fill|stretch|adopt> reel=<reel> frame=<W>x<H> box=<w>x<vh> drawn=<dw>x<dh>`, once per change of a non-Letterbox fit
+// (a Letterbox play prints nothing).
+
+/// The last non-Letterbox fit the present's line named (`SizePolicy as u8`; 0 = Letterbox, never printed).
+static PRESENT_FIT: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// The clip tick `at` shows: `(track, clip)` on the highest-numbered video track holding one (what the schedule shows).
+fn shown_clip(tl: &timeline_core::Timeline, at: i64) -> Option<(usize, usize)> {
+    (0..tl.tracks.len()).rev().filter(|&i| tl.tracks[i].kind == timeline_core::Kind::Video).find_map(|i| tl.clip_at(i, at).map(|c| (i, c)))
+}
+
+/// The presented frame's reel and its size policy, from the live job's EDL editor state at the frame's tick (`pts_ms` is
+/// the job's floored `out_ms`; `+ 1` makes [`tick_of`] its exact inverse below 1000 fps). None: no EDL, a gap, a lock held.
+fn present_policy(pts_ms: u64) -> Option<(String, timeline_core::SizePolicy)> {
+    let live = JOB.try_lock().and_then(|g| g.as_ref().map(|j| j.path.clone()))?;
+    let g = EDIT.try_lock()?;
+    let e = g.as_ref().filter(|e| e.path == live)?;
+    let tl = &e.st.timeline;
+    let (t, c) = shown_clip(tl, tick_of(tl.tb, pts_ms + 1))?;
+    let s = tl.source(tl.tracks[t].clips[c].src)?;
+    Some((s.reel.clone(), s.size_policy))
+}
+
+/// **The present's blit** of `f` into `dst`'s `w x vh` picture rect by [`present_policy`]; [`blit_fit`] when Letterbox or
+/// when the policy's path cannot serve the frame.
+fn present_fit(dst: &mut [u32], w: usize, vh: usize, f: &Frame) {
+    use timeline_core::SizePolicy;
+    let (reel, fit) = present_policy(f.pts_ms).unwrap_or((String::new(), SizePolicy::Letterbox));
+    let drawn = match fit {
+        SizePolicy::Letterbox => None,
+        SizePolicy::Fill | SizePolicy::Stretch => place_frame(dst, w, vh, f, fit),
+        SizePolicy::Adopt => adopt_rows(dst, w, vh, f),
+    };
+    let Some((dw, dh)) = drawn else {
+        blit_fit(dst, w, 0, 0, w, vh, f, Some(0));
+        return;
+    };
+    if PRESENT_FIT.swap(fit as u8, Ordering::AcqRel) != fit as u8 {
+        serial_println!("[vplay] present fit={} reel={} frame={}x{} box={}x{} drawn={}x{}", fit.name(), reel, f.w, f.h, w, vh, dw, dh);
+    }
+}
+
+/// Fill / Stretch: the frame's whole picture through [`fit_rgba`] (the export's door) into `w x vh`, packed into `dst`;
+/// the drawn size is `SizePolicy::place`'s. None when the frame's pixels are not `w x h` or `dst` is short.
+fn place_frame(dst: &mut [u32], w: usize, vh: usize, f: &Frame, fit: timeline_core::SizePolicy) -> Option<(usize, usize)> {
+    let px = f.px.rgb();
+    if f.w == 0 || f.h == 0 || w == 0 || vh == 0 || px.len() != f.w * f.h || dst.len() < w * vh {
+        return None;
+    }
+    let out = fit_rgba(unpack(px), f.w, f.h, w, vh, fit)?;
+    dst[..w * vh].copy_from_slice(&pack(&out));
+    let p = fit.place(f.w, f.h, w, vh);
+    Some((p.dst.w, p.dst.h))
+}
+
+/// Adopt: the frame at its own size (no scale) centred in `w x vh` over black bars, a side larger than the rect cropped
+/// centred. None when the frame's pixels are not `w x h` or `dst` is short.
+fn adopt_rows(dst: &mut [u32], w: usize, vh: usize, f: &Frame) -> Option<(usize, usize)> {
+    let px = f.px.rgb();
+    if f.w == 0 || f.h == 0 || w == 0 || vh == 0 || px.len() != f.w * f.h || dst.len() < w * vh {
+        return None;
+    }
+    let (dw, dh) = (f.w.min(w), f.h.min(vh));
+    let (ox, oy, sx, sy) = ((w - dw) / 2, (vh - dh) / 2, (f.w - dw) / 2, (f.h - dh) / 2);
+    dst[..w * vh].fill(0);
+    for r in 0..dh {
+        let s = (sy + r) * f.w + sx;
+        let d = (oy + r) * w + ox;
+        dst[d..d + dw].copy_from_slice(&px[s..s + dw]);
+    }
+    Some((dw, dh))
 }
