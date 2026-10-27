@@ -806,7 +806,7 @@ pub fn init(_dtb_addr: u64, _dtb_size: usize) {
     // step 4e (`apic::report_tick_rate` — a 50 ms PM-timer window) and nothing else, and so a boot
     // that dies anywhere below still shows that it got this far. Everything from here to
     // `pci-usb` used to be one undivided delta; see `docs/dev/OS/01_BOOT_HAL/bootpace.md` §6a.
-    crate::bootpace::record("pci-enter"); crate::hw::platform_say(); // ZENBOOKSURVEY (zenbook-ledger Z1): which machine this is, read from SMBIOS ONCE, before any Apple-only probe below asks `hw::gate`; the ZENBOOK sibling arcs hook AFTER this line.
+    crate::bootpace::record("pci-enter"); crate::hw::platform_say(); crate::drivers::ec::probe(); // ZENBOOKEC (zenbook-ledger Z8): `drivers::ec::probe` — the ACPI EC census, silent unless `hw::gate(Probe::Ec)`; LINE-NEUTRAL, the call before this comment. ZENBOOKSURVEY (zenbook-ledger Z1): which machine this is, read from SMBIOS ONCE, before any Apple-only probe below asks `hw::gate`; the ZENBOOK sibling arcs hook AFTER this line.
 
     // VPERF (bench builds only): read-only display diagnostics — the effective framebuffer memory
     // type (MTRR + live PTE + PAT) and which class-0x03 device's BAR owns the fb address. Rides

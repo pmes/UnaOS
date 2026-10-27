@@ -37,7 +37,7 @@ ZENBOOKGOP, ZENBOOKMT7925) are the next rows. No Zenbook image line exists yet (
    `unaos/crates/kernel/src/arch/x86_64/pci.rs:895`); Strix Point has four (1022:151a/151b/151e/151f) plus two USB4
    NHIs (151c/151d). Measure which physical ports the first one serves; then bring up every xHCI or pick by port.
 7. **ZENBOOK-MT7925** — `drivers/mt7925.rs` (14c3:7925): probe + firmware pin only. In flight (ZENBOOKMT7925).
-8. **ZENBOOK-EC** — battery, lid and the Fn keys through the ACPI embedded controller (the SMC's job on the rMBP).
+8. **ZENBOOK-EC** — battery, lid and the Fn keys through the ACPI embedded controller (the SMC's job on the rMBP). In flight (ZENBOOKEC, Z8): rung 1 is the ECDT-located transport + a 256-byte RAM census at pci init; the battery decode is ZENBOOK-EC-BATTERY (needs the first boot's DSDT).
 9. **ZENBOOK-TOUCHPAD** — the touchpad over I2C-HID on the AMD DesignWare I2C controller.
 10. **ZENBOOK-ACP** — audio: the ALC294 codec on the Ryzen HD Audio controller (1022:15e3; Linux quirk 1043:1df3
     `ALC294_FIXUP_BASS_SPEAKER_15`) with its CS35L41 amplifiers, and the ACP 7.x coprocessor (1022:15e2). Until this
