@@ -586,7 +586,7 @@ pub enum BlockHandle {
     /// `sdmmc_arm` ladder in `sdmmc_tegra.rs`; [`write_block_tegra_sd`] exists so the dispatch below
     /// is total and fails CLOSED, not so that anything writes.
     #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
-    SdMmc, #[cfg(all(target_arch = "x86_64", feature = "ahci"))] /** AHCIBOOT: one published SATA disk, keyed on the HBA PORT — the enumerator's key (`drivers::ahci`'s `PI` mask), never anything read off the medium. Reads go through [`read_block_ahci_port`]; every write through it is REFUSED, because `drivers/ahci.rs` compiles no ATA write opcode at all. The installer refuses it by construction (`install/mod.rs`, rmbp-ledger B91). */ Ahci { port: u8 },
+    SdMmc, #[cfg(all(target_arch = "x86_64", feature = "ahci"))] /** AHCIBOOT: one published SATA disk, keyed on the HBA PORT — the enumerator's key (`drivers::ahci`'s `PI` mask), never anything read off the medium. Reads go through [`read_block_ahci_port`]; every write through it is REFUSED, because `drivers/ahci.rs` compiles no ATA write opcode at all. The installer refuses it by construction (`install/mod.rs`, rmbp-ledger B91). */ Ahci { port: u8 }, #[cfg(all(target_arch = "x86_64", feature = "nvme"))] /** NVMEBOOT (zenbook-ledger Z9): the NVMe namespace 1 that `drivers::nvme` published into the NVMe registry (block.rs tail). Reads go through [`read_block_nvme`]; a write is admitted only inside the boot's NVMe root grant (one UnaFS extent), -EPERM elsewhere. */ Nvme,
 }
 
 /// INSTALL-SEL: a durable name for ONE block device, good across frames and across a registry change.
@@ -646,7 +646,7 @@ pub fn lookup(id: BlockDeviceId) -> Option<BlockDeviceInfo> {
         #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
         BlockHandle::Sdhc => sdhc_info(),
         #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
-        BlockHandle::SdMmc => tegra_sd_info(), #[cfg(all(target_arch = "x86_64", feature = "ahci"))] BlockHandle::Ahci { port } => ahci_info_port(port), // AHCIBOOT: the registry row for that port, so an identity captured on a SATA disk re-resolves to the same disk.
+        BlockHandle::SdMmc => tegra_sd_info(), #[cfg(all(target_arch = "x86_64", feature = "ahci"))] BlockHandle::Ahci { port } => ahci_info_port(port), #[cfg(all(target_arch = "x86_64", feature = "nvme"))] BlockHandle::Nvme => nvme_info(), // AHCIBOOT: the registry row for that port, so an identity captured on a SATA disk re-resolves to the same disk.
     };
     match cur {
         Some(d) if d.slot_id == id.slot_id && d.num_blocks == id.num_blocks => Some(d),
@@ -2281,7 +2281,7 @@ pub fn mbr_census(handle: BlockHandle, sec: &[u8], dev_blocks: u64) -> Option<Mb
         // is censused once on its own terms and can neither suppress nor be suppressed by the boot
         // stick's census. Disjoint from bit 4 by construction: no build carries both handles.
         #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
-        BlockHandle::SdMmc => 8, #[cfg(all(target_arch = "x86_64", feature = "ahci"))] BlockHandle::Ahci { .. } => 16, // AHCIBOOT: one latch bit for the whole SATA handle, so a two-disk rMBP censuses once rather than per port.
+        BlockHandle::SdMmc => 8, #[cfg(all(target_arch = "x86_64", feature = "ahci"))] BlockHandle::Ahci { .. } => 16, #[cfg(all(target_arch = "x86_64", feature = "nvme"))] BlockHandle::Nvme => 32, // AHCIBOOT: one latch bit for the whole SATA handle, so a two-disk rMBP censuses once rather than per port.
     };
     let prev = MBR_CENSUS_LATCH.fetch_or(bit, core::sync::atomic::Ordering::Relaxed);
     if prev & bit != 0 || sec.len() < SECTOR_BYTES {
@@ -2293,7 +2293,7 @@ pub fn mbr_census(handle: BlockHandle, sec: &[u8], dev_blocks: u64) -> Option<Mb
         #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
         BlockHandle::Sdhc => "sdhc",
         #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
-        BlockHandle::SdMmc => "tegra-sd", #[cfg(all(target_arch = "x86_64", feature = "ahci"))] BlockHandle::Ahci { .. } => "ahci",
+        BlockHandle::SdMmc => "tegra-sd", #[cfg(all(target_arch = "x86_64", feature = "ahci"))] BlockHandle::Ahci { .. } => "ahci", #[cfg(all(target_arch = "x86_64", feature = "nvme"))] BlockHandle::Nvme => "nvme",
     };
 
     // --- RAW, before decoding anything: the signature word and the four 16-byte entries verbatim.
@@ -2414,7 +2414,7 @@ impl PartitionRange {
             // gate every other handle goes through — no second addressing path, no absolute LBA
             // computed by a caller.
             #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
-            BlockHandle::SdMmc => read_block_tegra_sd(abs, buf), #[cfg(all(target_arch = "x86_64", feature = "ahci"))] BlockHandle::Ahci { port } => read_block_ahci_port(port, abs, buf),
+            BlockHandle::SdMmc => read_block_tegra_sd(abs, buf), #[cfg(all(target_arch = "x86_64", feature = "ahci"))] BlockHandle::Ahci { port } => read_block_ahci_port(port, abs, buf), #[cfg(all(target_arch = "x86_64", feature = "nvme"))] BlockHandle::Nvme => read_block_nvme(abs, buf),
         }
     }
 
@@ -2433,7 +2433,7 @@ impl PartitionRange {
             // one-shot witness + `NotReady`), so the variant cannot become a fourth door past the
             // armed `sdmmc_arm` ladder — a range that carries the card is readable and nothing more.
             #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
-            BlockHandle::SdMmc => write_block_tegra_sd(abs, buf), #[cfg(all(target_arch = "x86_64", feature = "ahci"))] BlockHandle::Ahci { port } => write_block_ahci_port(port, abs, buf), // AHCIBOOT: REFUSES, in every cfg — `write_block_ahci` is the refusal and the image carries no ATA write opcode.
+            BlockHandle::SdMmc => write_block_tegra_sd(abs, buf), #[cfg(all(target_arch = "x86_64", feature = "ahci"))] BlockHandle::Ahci { port } => write_block_ahci_port(port, abs, buf), #[cfg(all(target_arch = "x86_64", feature = "nvme"))] BlockHandle::Nvme => write_block_nvme(abs, buf), // AHCIBOOT: REFUSES, in every cfg — `write_block_ahci` is the refusal and the image carries no ATA write opcode.
         }
     }
 
@@ -2447,7 +2447,7 @@ impl PartitionRange {
             #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
             BlockHandle::Sdhc => read_blocks_sdhc(abs, buf),
             #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
-            BlockHandle::SdMmc => read_blocks_tegra_sd(abs, buf), #[cfg(all(target_arch = "x86_64", feature = "ahci"))] BlockHandle::Ahci { port } => read_blocks_ahci_port(port, abs, buf),
+            BlockHandle::SdMmc => read_blocks_tegra_sd(abs, buf), #[cfg(all(target_arch = "x86_64", feature = "ahci"))] BlockHandle::Ahci { port } => read_blocks_ahci_port(port, abs, buf), #[cfg(all(target_arch = "x86_64", feature = "nvme"))] BlockHandle::Nvme => read_blocks_nvme(abs, buf),
         }
     }
 
@@ -2461,7 +2461,7 @@ impl PartitionRange {
             BlockHandle::Sdhc => write_blocks_sdhc(abs, buf),
             // TEGRA-SDBLK: refuses, as the single-sector twin above does and for the same reason.
             #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
-            BlockHandle::SdMmc => write_blocks_tegra_sd(abs, buf), #[cfg(all(target_arch = "x86_64", feature = "ahci"))] BlockHandle::Ahci { port } => write_blocks_ahci_port(port, abs, buf), // AHCIBOOT: refuses, as the single-sector twin does.
+            BlockHandle::SdMmc => write_blocks_tegra_sd(abs, buf), #[cfg(all(target_arch = "x86_64", feature = "ahci"))] BlockHandle::Ahci { port } => write_blocks_ahci_port(port, abs, buf), #[cfg(all(target_arch = "x86_64", feature = "nvme"))] BlockHandle::Nvme => write_blocks_nvme(abs, buf), // AHCIBOOT: refuses, as the single-sector twin does.
         }
     }
 
@@ -2476,7 +2476,7 @@ impl PartitionRange {
             #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
             BlockHandle::Sdhc => sdhc_info(),
             #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
-            BlockHandle::SdMmc => tegra_sd_info(), #[cfg(all(target_arch = "x86_64", feature = "ahci"))] BlockHandle::Ahci { port } => ahci_info_port(port),
+            BlockHandle::SdMmc => tegra_sd_info(), #[cfg(all(target_arch = "x86_64", feature = "ahci"))] BlockHandle::Ahci { port } => ahci_info_port(port), #[cfg(all(target_arch = "x86_64", feature = "nvme"))] BlockHandle::Nvme => nvme_info(),
         }
         .ok_or(BlockError::NotReady)?;
         let bs = dev.block_size as usize;
@@ -2598,7 +2598,7 @@ pub fn native_mount_write_veto() -> Option<&'static str> {
     let Some(handle) = crate::fs::unafs::mount_bound_handle() else {
         return None;
     };
-    #[cfg(all(target_arch = "x86_64", feature = "ahciroot"))] if let BlockHandle::Ahci { port } = handle { if crate::install::ahciroot::root_port() == Some(port) { return None; } } // AHCIROOT (B332): the native root on a root-granted SSD is writable (the grant bounds it to p2); the per-HANDLE answer below is unchanged, so leg 8's FAT/handle agreement is untouched
+    #[cfg(all(target_arch = "x86_64", feature = "ahciroot"))] if let BlockHandle::Ahci { port } = handle { if crate::install::ahciroot::root_port() == Some(port) { return None; } } #[cfg(all(target_arch = "x86_64", feature = "nvme"))] if handle == BlockHandle::Nvme && nvme_root_grant().is_some() { return None; } // AHCIROOT (B332): the native root on a root-granted SSD is writable (the grant bounds it to p2); the per-HANDLE answer below is unchanged, so leg 8's FAT/handle agreement is untouched
     handle_write_veto(handle)
 }
 
@@ -2634,7 +2634,7 @@ pub fn handle_write_veto(handle: BlockHandle) -> Option<&'static str> {
             } else {
                 Some(NATIVE_TEGRA_SD_VETO)
             }
-        } #[cfg(all(target_arch = "x86_64", feature = "ahci"))] BlockHandle::Ahci { .. } => Some(NATIVE_AHCI_VETO), // AHCIBOOT: a flat NO with no exception to carve — `write_block_ahci` refuses in every cfg and the image compiles no ATA write opcode. A forward to that standing answer, not a second policy.
+        } #[cfg(all(target_arch = "x86_64", feature = "ahci"))] BlockHandle::Ahci { .. } => Some(NATIVE_AHCI_VETO), #[cfg(all(target_arch = "x86_64", feature = "nvme"))] BlockHandle::Nvme => Some(NATIVE_NVME_VETO), // AHCIBOOT: a flat NO with no exception to carve — `write_block_ahci` refuses in every cfg and the image compiles no ATA write opcode. A forward to that standing answer, not a second policy.
     }
 }
 
@@ -3866,9 +3866,9 @@ pub fn boot_medium_not_sdhc() -> bool {
 //
 // TAIL-APPENDED (no line above moves). The AHCI first rung's shape (`AHCI_DISKS` / `register_ahci` /
 // `read_blocks_ahci_ix` / the refusing `write_block_ahci`), for ONE namespace: `drivers/nvme.rs`
-// publishes namespace 1 here after IDENTIFY. Like AHCI's first rung this is NOT a `BlockHandle`, so
-// `fs/bootdisk.rs`'s walk does not see it yet — that is owed row NVMEBOOT (storage.md §5). The global
-// [`BLOCK_DEVICE`] is never touched.
+// publishes namespace 1 here after IDENTIFY. NVMEBOOT (zenbook-ledger Z9) made it a handle
+// (`BlockHandle::Nvme`, `fs::fat::BlockSource::Nvme`) so the root walk sees it, and its writes granted
+// (the NVMEBOOT section below). The global [`BLOCK_DEVICE`] is never touched.
 
 /// NVME: the published namespace's geometry. Never held across I/O.
 #[cfg(all(target_arch = "x86_64", feature = "nvme"))]
@@ -3905,16 +3905,124 @@ pub fn read_blocks_nvme(lba: u64, buf: &mut [u8]) -> Result<usize, BlockError> {
     Ok(buf.len())
 }
 
-/// NVME: one-shot latch for the refusal below.
-#[cfg(all(target_arch = "x86_64", feature = "nvme"))]
-static NVME_WRITE_REFUSED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+// ══════════ NVMEBOOT (zenbook-ledger Z9) — the NVMe root grant and the granted write ══════════
+//
+// TAIL-APPENDED (no line above moves). AHCIROOT's slot shape (B332, the AHCIROOT section above) for the
+// NVMe namespace: ONE grant, ONE inclusive absolute-LBA range, held for the boot (the root is written
+// until power-off), never cleared. Its ONE minter is `fs::unafs::ensure_nvme_root_grant`, which grants
+// exactly the one UnaFS volume `fs::unafs::locate_on(BlockHandle::Nvme)` finds — the extent the mount
+// rides — so a foreign partition beside it (the Zenbook's Windows) is outside the grant by construction.
+// The audit is `grep -rn hold_nvme_root_grant unaos/crates/kernel/src` -> this declaration + that call.
+//
+// [`write_blocks_nvme`] is the ONLY block-layer path to `drivers::nvme::write_at`: -EPERM unless the
+// live grant covers every block of the run, else written and READ BACK block by block (AHCIROOT's
+// `ahci_port_write` rule). [`flush_nvme`] is the K8a commit barrier `fs::unafs::SdSectorDevice::flush`
+// calls on an NVMe handle. The slot's lock is taken IRQ-masked, copied out, never held across I/O.
 
-/// NVME: every block-layer write is refused — there is no granted NVMe write path yet (owed NVMEWRITE,
-/// the AHCIWRITE/AHCIROOT grant shape). Nothing is written.
+/// NVMEBOOT: THE slot — `(first_lba, last_lba)`, inclusive. `None` = every NVMe write is -EPERM.
 #[cfg(all(target_arch = "x86_64", feature = "nvme"))]
-pub fn write_blocks_nvme(_lba: u64, _buf: &[u8]) -> Result<(), BlockError> {
-    if !NVME_WRITE_REFUSED.swap(true, core::sync::atomic::Ordering::Relaxed) {
-        serial_println!(":: [nvme] write refused — no block-layer NVMe write path (owed NVMEWRITE) ::");
+static NVME_ROOT_GRANT: Mutex<Option<(u64, u64)>> = Mutex::new(None);
+
+/// NVMEBOOT: refusal lines printed so far (the first [`NVME_DENY_LINES`] print; the rest are counted).
+#[cfg(all(target_arch = "x86_64", feature = "nvme"))]
+static NVME_DENIED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+#[cfg(all(target_arch = "x86_64", feature = "nvme"))]
+const NVME_DENY_LINES: u32 = 4;
+
+/// NVMEBOOT: put the boot's root grant in the slot. `false` (and nothing changes) when the slot is already
+/// held, when the range is empty or reversed, starts at LBA 0 (the partition table is never ours to write)
+/// or runs past the namespace. ⚠ ONE caller: `fs::unafs::ensure_nvme_root_grant` — do not add a second.
+#[cfg(all(target_arch = "x86_64", feature = "nvme"))]
+pub fn hold_nvme_root_grant(first: u64, last: u64) -> bool {
+    let Some(dev) = nvme_info() else { return false };
+    if first == 0 || last < first || last >= dev.num_blocks {
+        return false;
     }
-    Err(BlockError::Denied)
+    crate::arch::without_interrupts(|| {
+        let mut s = NVME_ROOT_GRANT.lock();
+        if s.is_some() {
+            return false;
+        }
+        *s = Some((first, last));
+        true
+    })
 }
+
+/// NVMEBOOT: the live root grant, if any — `(first_lba, last_lba)`.
+#[cfg(all(target_arch = "x86_64", feature = "nvme"))]
+pub fn nvme_root_grant() -> Option<(u64, u64)> {
+    crate::arch::without_interrupts(|| *NVME_ROOT_GRANT.lock())
+}
+
+/// NVMEBOOT: read ONE block at `lba` into the front of `buf` (the single-block twin the handle and source
+/// dispatchers call). Returns the block size read.
+#[cfg(all(target_arch = "x86_64", feature = "nvme"))]
+pub fn read_block_nvme(lba: u64, buf: &mut [u8]) -> Result<usize, BlockError> {
+    let bs = nvme_info().ok_or(BlockError::NotReady)?.block_size as usize;
+    if buf.len() < bs {
+        return Err(BlockError::Io);
+    }
+    read_blocks_nvme(lba, &mut buf[..bs])?;
+    Ok(bs)
+}
+
+/// NVMEBOOT: write ONE block at `lba` from the front of `buf` — through [`write_blocks_nvme`]'s grant check.
+#[cfg(all(target_arch = "x86_64", feature = "nvme"))]
+pub fn write_block_nvme(lba: u64, buf: &[u8]) -> Result<(), BlockError> {
+    let bs = nvme_info().ok_or(BlockError::NotReady)?.block_size as usize;
+    if buf.len() < bs {
+        return Err(BlockError::Io);
+    }
+    write_blocks_nvme(lba, &buf[..bs])
+}
+
+/// NVMEBOOT (NVMEWRITE): THE NVMe block-layer write. -EPERM unless the live root grant covers every block
+/// of the run; otherwise written through `drivers::nvme::write_at` and read back block by block. A grant
+/// exists only over a 512-byte-LBA namespace (`fs::unafs::SdSectorDevice` is 512-only), so the read-back
+/// buffer is one sector and any other block size is refused.
+#[cfg(all(target_arch = "x86_64", feature = "nvme"))]
+pub fn write_blocks_nvme(lba: u64, buf: &[u8]) -> Result<(), BlockError> {
+    let dev = nvme_info().ok_or(BlockError::NotReady)?;
+    let count = span_blocks(&dev, lba, buf.len())?;
+    let last = lba + count as u64 - 1;
+    match nvme_root_grant() {
+        Some((a, b)) if lba >= a && last <= b => {}
+        other => {
+            let k = NVME_DENIED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            if k < NVME_DENY_LINES {
+                match other {
+                    None => serial_println!(":: [nvme] write -EPERM lba={} grant=none — nothing written ::", lba),
+                    Some((a, b)) => serial_println!(":: [nvme] write -EPERM lba={} grant={}..{} — nothing written ::", lba, a, b),
+                }
+            }
+            return Err(BlockError::Denied);
+        }
+    }
+    let bs = dev.block_size as usize;
+    if bs != SECTOR_BYTES {
+        return Err(BlockError::BadLba);
+    }
+    crate::drivers::nvme::write_at(lba, buf).map_err(|_| BlockError::Io)?;
+    let mut rb = [0u8; SECTOR_BYTES];
+    for i in 0..count {
+        crate::drivers::nvme::read_at(lba + i as u64, &mut rb).map_err(|_| BlockError::Io)?;
+        if rb[..] != buf[i * bs..(i + 1) * bs] {
+            serial_println!(":: [nvme] write readback MISMATCH lba={} — the medium does not hold what was written ::", lba + i as u64);
+            return Err(BlockError::Io);
+        }
+    }
+    Ok(())
+}
+
+/// NVMEBOOT: NVM Flush on namespace 1 — the commit barrier (a controller with no volatile write cache
+/// completes it as a no-op, NVMe 1.4).
+#[cfg(all(target_arch = "x86_64", feature = "nvme"))]
+pub fn flush_nvme() -> Result<(), BlockError> {
+    crate::drivers::nvme::flush().map_err(|_| BlockError::Io)
+}
+
+/// NVMEBOOT: the NVMe root's standing write refusal, as [`handle_write_veto`] reports it (the root-granted
+/// namespace is lifted by `native_mount_write_veto`, AHCIROOT's shape).
+#[cfg(all(feature = "sdwrite", target_arch = "x86_64", feature = "nvme"))]
+const NATIVE_NVME_VETO: &str = "the volume rides the NVMe namespace and the block layer refuses every \
+                                write outside the boot's NVMe root grant (one UnaFS extent, NVMEBOOT)";

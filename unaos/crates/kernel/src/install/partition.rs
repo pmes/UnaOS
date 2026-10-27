@@ -456,7 +456,7 @@ pub fn transport_writable(h: block::BlockHandle) -> bool {
         #[cfg(all(target_arch = "x86_64", feature = "ahci", not(feature = "ahci-write")))]
         block::BlockHandle::Ahci { .. } => false,
         #[cfg(all(target_arch = "x86_64", feature = "ahci-write"))]
-        block::BlockHandle::Ahci { .. } => true,
+        block::BlockHandle::Ahci { .. } => true, #[cfg(all(target_arch = "x86_64", feature = "nvme"))] block::BlockHandle::Nvme => false, // NVMEBOOT (Z9): no installer write reaches the NVMe (owed NVMEINSTALL)
     }
 }
 
@@ -484,7 +484,7 @@ pub fn transport_name(h: block::BlockHandle) -> &'static str {
         #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
         block::BlockHandle::SdMmc => "tegra-sd",
         #[cfg(all(target_arch = "x86_64", feature = "ahci"))]
-        block::BlockHandle::Ahci { .. } => "ahci",
+        block::BlockHandle::Ahci { .. } => "ahci", #[cfg(all(target_arch = "x86_64", feature = "nvme"))] block::BlockHandle::Nvme => "nvme",
     }
 }
 

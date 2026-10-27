@@ -18,15 +18,18 @@
 //! ([`T_CMD_MS`]). A miss prints `[nvme] cmd timeout opcode=0x<op> ...` and MARKS the controller
 //! (DONGLEBOOT's rule, rmbp-ledger B658): every later command is refused at once.
 //!
-//! **Does NOT (owed rows, docs/dev/blueprint/storage.md §5):** become a `BlockHandle` / `BlockSource`,
-//! so `fs/bootdisk.rs`'s root walk cannot see the namespace yet (NVMEBOOT); write through the block
-//! layer (`block::write_blocks_nvme` refuses — NVMEWRITE); MSI-X; namespaces other than 1; TRIM; the
-//! SMART/Health log page.
+//! **Rung 2 — NVMEBOOT (zenbook-ledger Z9):** the namespace is `BlockHandle::Nvme` / `fs::fat::BlockSource::Nvme`,
+//! so the root walk sees it; the boot's NVMe root grant (one UnaFS extent, `block::hold_nvme_root_grant`)
+//! admits writes through `block::write_blocks_nvme`; [`flush`] (NVM Flush) is the commit barrier.
 //!
-//! **The one write:** WRITE (0x01) is compiled, and [`write_at`] is PRIVATE with exactly ONE caller —
-//! the `tests nvme` scratch leg ([`selftest`]), which runs it only on QEMU's emulated controller (model
-//! string `QEMU NVMe Ctrl`) and restores the scratch blocks it wrote. `grep -n 'write_at' drivers/nvme.rs`
-//! is the audit.
+//! **Does NOT (owed rows, docs/dev/blueprint/storage.md §5):** MSI-X; namespaces other than 1; TRIM; the
+//! SMART/Health log page; a 4096-byte-LBA root (NVME4KN); an installer path onto the NVMe (NVMEINSTALL).
+//!
+//! **The writes:** WRITE (0x01) is compiled, and [`write_at`] is `pub(crate)` with exactly TWO callers —
+//! `block::write_blocks_nvme` (-EPERM outside the live root grant, every block read back) and the
+//! `tests nvme` scratch leg ([`selftest`]), which runs it only on QEMU's emulated controller (model
+//! string `QEMU NVMe Ctrl`), never inside the live root grant, and restores the scratch blocks it wrote.
+//! `grep -rn 'nvme::write_at\|write_at(' unaos/crates/kernel/src/drivers` is the audit.
 //!
 //! # Lock
 //!
@@ -366,8 +369,9 @@ pub(crate) fn read_at(lba: u64, buf: &mut [u8]) -> Result<(), ()> {
     transfer(lba, buf.as_mut_ptr(), buf.len(), false)
 }
 
-/// Write whole blocks at `lba` from `buf`. PRIVATE: its ONE caller is [`selftest`]'s scratch leg.
-fn write_at(lba: u64, buf: &[u8]) -> Result<(), ()> {
+/// Write whole blocks at `lba` from `buf`. TWO callers: `block::write_blocks_nvme` (grant-checked, NVMEBOOT
+/// Z9) and [`selftest`]'s scratch leg. Never call it from anywhere else.
+pub(crate) fn write_at(lba: u64, buf: &[u8]) -> Result<(), ()> {
     transfer(lba, buf.as_ptr() as *mut u8, buf.len(), true)
 }
 
@@ -626,8 +630,11 @@ pub fn selftest() {
     };
 
     let scratch = dev.num_blocks.saturating_sub(SCRATCH_FROM_END);
+    let in_root = crate::drivers::block::nvme_root_grant().is_some_and(|(a, b)| scratch <= b && scratch + SCRATCH_BLOCKS > a); // NVMEBOOT (Z9): the live volume's blocks are never the test's scratch
     let rw: &str = if !mn.starts_with(QEMU_MN) {
         "skip"
+    } else if in_root {
+        "in-root"
     } else if dev.num_blocks < SCRATCH_FROM_END * 2 {
         "bad:small"
     } else {
@@ -638,14 +645,17 @@ pub fn selftest() {
         if identify { "ok" } else { "bad" }, sector0, scratch, SCRATCH_BLOCKS, rw
     );
     let ctrl = if identify { "ok" } else { "bad" };
+    let root = root_leg();
     if !identify || sector0 == "unreadable" {
-        serial_println!(":: NVME: ctrl={} ns=1 rw={} -> FAIL reason={} ::", ctrl, rw, if identify { "read" } else { "identify" });
-    } else if rw == "ok" {
-        serial_println!(":: NVME: ctrl=ok ns=1 rw=ok -> PASS ::");
-    } else if rw == "skip" {
-        serial_println!(":: NVME: ctrl=ok ns=1 rw=skip -> SKIP reason=rw-not-qemu ::");
+        serial_println!(":: NVME: ctrl={} ns=1 rw={} -> FAIL reason={} :: root={} ::", ctrl, rw, if identify { "read" } else { "identify" }, root);
+    } else if rw.starts_with("bad") {
+        serial_println!(":: NVME: ctrl=ok ns=1 rw={} -> FAIL reason=rw :: root={} ::", rw, root);
+    } else if root.starts_with("bad") {
+        serial_println!(":: NVME: ctrl=ok ns=1 rw={} -> FAIL reason=root :: root={} ::", rw, root);
+    } else if rw == "ok" || rw == "in-root" {
+        serial_println!(":: NVME: ctrl=ok ns=1 rw={} -> PASS :: root={} ::", rw, root);
     } else {
-        serial_println!(":: NVME: ctrl=ok ns=1 rw={} -> FAIL reason=rw ::", rw);
+        serial_println!(":: NVME: ctrl=ok ns=1 rw=skip -> SKIP reason=rw-not-qemu :: root={} ::", root);
     }
 }
 
@@ -675,4 +685,42 @@ fn scratch_rw(lba: u64, bs: usize) -> &'static str {
         return "bad:restore-verify";
     }
     if same { "ok" } else { "bad:mismatch" }
+}
+
+// ══════════ NVMEBOOT (zenbook-ledger Z9) — the commit barrier and the root leg ══════════
+
+/// NVM Flush (opcode 0x00) on namespace 1, through the one hold — what `block::flush_nvme` forwards, the
+/// K8a pre-flip barrier of a UnaFS root on the NVMe.
+pub(crate) fn flush() -> Result<(), ()> {
+    with_ctrl(0, |c| {
+        let mut cmd = [0u32; 16];
+        cmd[0] = 0x00; // NVM Flush
+        cmd[1] = 1; // NSID 1
+        submit(c, false, &mut cmd).map(|_| ())
+    })
+}
+
+/// `tests nvme`'s root leg: `skip` with no NVMe root grant; else a write of LBA 0's OWN bytes (outside every
+/// grant: `hold_nvme_root_grant` refuses a range from 0) must come back -EPERM, and the shared UnaFS mount
+/// must ride the NVMe handle.
+fn root_leg() -> &'static str {
+    let Some((first, _last)) = crate::drivers::block::nvme_root_grant() else { return "skip" };
+    if first == 0 {
+        return "bad:grant-covers-0";
+    }
+    let Some(dev) = crate::drivers::block::nvme_info() else { return "bad:no-namespace" };
+    let mut sec = alloc::vec![0u8; dev.block_size as usize];
+    if crate::drivers::block::read_blocks_nvme(0, &mut sec).is_err() {
+        return "bad:read-lba0";
+    }
+    if !matches!(crate::drivers::block::write_blocks_nvme(0, &sec), Err(crate::drivers::block::BlockError::Denied)) {
+        return "bad:lba0-admitted";
+    }
+    #[cfg(feature = "unafs")]
+    {
+        if crate::fs::unafs::mount_bound_handle() != Some(crate::drivers::block::BlockHandle::Nvme) {
+            return "bad:unbound";
+        }
+    }
+    "ok"
 }

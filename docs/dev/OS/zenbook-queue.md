@@ -28,7 +28,7 @@ ZENBOOKGOP, ZENBOOKMT7925) are the next rows. No Zenbook image line exists yet (
    its Mac-only knobs (SMC, LIDSLEEP, KEPLER*, NOASPM, IVB*, GMUX_IGD, BEAM, HDA, HDATONE, WIFI..WIFI10 and the b43
    firmware path, BT/BTC/A2DP — the list in um5606w.md §5), its `boot::OLDEST` const (2024) and its arroyo media verb.
    Without IVB the loader's entry traces are not built (ZENBOOK-LOADERTRACE).
-3. **ZENBOOK-NVME** — `drivers/nvme.rs` (class 0108, vendor varies): the root volume. In flight (ZENBOOKNVME).
+3. **ZENBOOK-NVME** — `drivers/nvme.rs` (class 0108, vendor varies): the root volume. Rung 1 ZENBOOKNVME (Z2); in flight (NVMEBOOT, Z9: the handle, the root grant, the granted write).
 4. **ZENBOOK-I8042** — `drivers/i8042.rs`: the internal keyboard on the EC's 8042 into the input route. In flight
    (ZENBOOKI8042; it asks `hw::platform()`).
 5. **ZENBOOK-GOP** — the loader picks the CONNECTED output's native mode (the dead internal panel enumerated or not:

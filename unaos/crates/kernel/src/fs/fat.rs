@@ -640,7 +640,7 @@ pub enum BlockSource {
     /// it routes a mount that only `mount_source` could ask for; binding one is
     /// `docs/dev/OS/10_INSTALL/orin-unafs-root.md` §3 item 4's job, behind its own knob.
     #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
-    SdMmc, #[cfg(all(target_arch = "x86_64", feature = "ahci"))] /** AHCIBOOT (x86, `ahci` knob): an internal SATA disk, addressed by its HBA PORT — the SAME number [`crate::drivers::block::BlockHandle::Ahci`] carries, so [`handle_of`] and [`source_of`] are a lossless bijection and neither enum can name a disk the other cannot. READ-ONLY, unconditionally: the block layer refuses every write and `drivers/ahci.rs` compiles no ATA write opcode. Unlike `UsbN` the number is NOT a registry index — see the block layer's AHCIBOOT section. */ Ahci(u8),
+    SdMmc, #[cfg(all(target_arch = "x86_64", feature = "ahci"))] /** AHCIBOOT (x86, `ahci` knob): an internal SATA disk, addressed by its HBA PORT — the SAME number [`crate::drivers::block::BlockHandle::Ahci`] carries, so [`handle_of`] and [`source_of`] are a lossless bijection and neither enum can name a disk the other cannot. READ-ONLY, unconditionally: the block layer refuses every write and `drivers/ahci.rs` compiles no ATA write opcode. Unlike `UsbN` the number is NOT a registry index — see the block layer's AHCIBOOT section. */ Ahci(u8), #[cfg(all(target_arch = "x86_64", feature = "nvme"))] /** NVMEBOOT (zenbook-ledger Z9): the NVMe namespace 1 — the SAME disk [`crate::drivers::block::BlockHandle::Nvme`] names, so [`handle_of`] / [`source_of`] stay a bijection. A FAT volume on it is READ-ONLY: the block layer admits a write only inside the boot's NVMe root grant, which is one UnaFS extent and never a FAT volume. */ Nvme,
 }
 
 impl BlockSource {
@@ -669,7 +669,7 @@ impl BlockSource {
             // Spelled exactly as `mbr_census` spells the same handle, for the same one-vocabulary
             // reason the `sdhc` arm above gives.
             #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
-            BlockSource::SdMmc => "tegra-sd", #[cfg(all(target_arch = "x86_64", feature = "ahci"))] BlockSource::Ahci(p) => ahci_source_name(*p),
+            BlockSource::SdMmc => "tegra-sd", #[cfg(all(target_arch = "x86_64", feature = "ahci"))] BlockSource::Ahci(p) => ahci_source_name(*p), #[cfg(all(target_arch = "x86_64", feature = "nvme"))] BlockSource::Nvme => "nvme",
         }
     }
 
@@ -736,7 +736,7 @@ impl BlockSource {
             // an exception for — the block layer's `write_block_tegra_sd` refuses in EVERY cfg. This
             // arm is a forward to that standing answer, not a second policy.
             #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
-            BlockSource::SdMmc => if crate::drivers::block::tegra_sd_writes_admitted() { None } else { Some(TEGRA_SD_VETO) }, #[cfg(all(target_arch = "x86_64", feature = "ahci"))] BlockSource::Ahci(_) => Some(AHCI_VETO), // SDWRITE (A60): still a FORWARD, never a second policy — the block layer decides, this arm reports. AHCIBOOT: the `Ahci` arm is a flat NO with no reserved extent to carve an exception for — `write_block_ahci` refuses in EVERY cfg and the image compiles no ATA write opcode. A forward too, never a second policy.
+            BlockSource::SdMmc => if crate::drivers::block::tegra_sd_writes_admitted() { None } else { Some(TEGRA_SD_VETO) }, #[cfg(all(target_arch = "x86_64", feature = "ahci"))] BlockSource::Ahci(_) => Some(AHCI_VETO), #[cfg(all(target_arch = "x86_64", feature = "nvme"))] BlockSource::Nvme => Some(NVME_VETO), // SDWRITE (A60): still a FORWARD, never a second policy — the block layer decides, this arm reports. AHCIBOOT: the `Ahci` arm is a flat NO with no reserved extent to carve an exception for — `write_block_ahci` refuses in EVERY cfg and the image compiles no ATA write opcode. A forward too, never a second policy.
         }
     }
 }
@@ -798,7 +798,7 @@ fn read_sector(source: BlockSource, lba: u64, buf: &mut [u8; SECTOR_SIZE]) -> Re
         #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
         BlockSource::Sdhc => crate::drivers::block::read_block_sdhc(lba, buf),
         #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
-        BlockSource::SdMmc => crate::drivers::block::read_block_tegra_sd(lba, buf), #[cfg(all(target_arch = "x86_64", feature = "ahci"))] BlockSource::Ahci(p) => crate::drivers::block::read_block_ahci_port(p, lba, buf),
+        BlockSource::SdMmc => crate::drivers::block::read_block_tegra_sd(lba, buf), #[cfg(all(target_arch = "x86_64", feature = "ahci"))] BlockSource::Ahci(p) => crate::drivers::block::read_block_ahci_port(p, lba, buf), #[cfg(all(target_arch = "x86_64", feature = "nvme"))] BlockSource::Nvme => crate::drivers::block::read_block_nvme(lba, buf),
     };
     match r {
         Ok(n) if n >= SECTOR_SIZE => { #[cfg(all(feature = "fatperf", target_arch = "aarch64"))] crate::fs::fatperf::note_sectors(1); Ok(()) } // FATFIX M2: read funnel #1
@@ -838,7 +838,7 @@ fn write_sector(source: BlockSource, lba: u64, buf: &[u8; SECTOR_SIZE]) -> Resul
         // arm cannot write. It is a forward to that refusal rather than a local `Err`, so there is
         // exactly one place in the tree that decides the Orin card's write answer.
         #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
-        BlockSource::SdMmc => crate::drivers::block::write_block_tegra_sd(lba, buf), #[cfg(all(target_arch = "x86_64", feature = "ahci"))] BlockSource::Ahci(p) => crate::drivers::block::write_block_ahci_port(p, lba, buf), // AHCIBOOT: the block layer IS the refusal; forwarded so one place decides.
+        BlockSource::SdMmc => crate::drivers::block::write_block_tegra_sd(lba, buf), #[cfg(all(target_arch = "x86_64", feature = "ahci"))] BlockSource::Ahci(p) => crate::drivers::block::write_block_ahci_port(p, lba, buf), #[cfg(all(target_arch = "x86_64", feature = "nvme"))] BlockSource::Nvme => crate::drivers::block::write_block_nvme(lba, buf), // AHCIBOOT: the block layer IS the refusal; forwarded so one place decides.
     };
     if r.is_ok() { SECTOR_WRITES.fetch_add(1, core::sync::atomic::Ordering::Relaxed); } r.map_err(|e| match e { // LFNMV2 M2: counted on device Ok, folded onto this line (line-sensitive file)
         // WEDGE-8 (F3): see `read_sector` — Busy stays Busy so it can be retried, not mourned.
@@ -902,7 +902,7 @@ fn read_sectors(source: BlockSource, lba: u64, buf: &mut [u8]) -> Result<(), Fat
             #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
             BlockSource::Sdhc => crate::drivers::block::read_blocks_sdhc(at, chunk),
             #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
-            BlockSource::SdMmc => crate::drivers::block::read_blocks_tegra_sd(at, chunk), #[cfg(all(target_arch = "x86_64", feature = "ahci"))] BlockSource::Ahci(p) => crate::drivers::block::read_blocks_ahci_port(p, at, chunk),
+            BlockSource::SdMmc => crate::drivers::block::read_blocks_tegra_sd(at, chunk), #[cfg(all(target_arch = "x86_64", feature = "ahci"))] BlockSource::Ahci(p) => crate::drivers::block::read_blocks_ahci_port(p, at, chunk), #[cfg(all(target_arch = "x86_64", feature = "nvme"))] BlockSource::Nvme => crate::drivers::block::read_blocks_nvme(at, chunk),
         };
         match r {
             Ok(n) if n == take => { #[cfg(all(feature = "fatperf", target_arch = "aarch64"))] crate::fs::fatperf::note_sectors((take / SECTOR_SIZE) as u64); } // FATFIX M2: read funnel #2
@@ -953,7 +953,7 @@ fn write_sectors(source: BlockSource, lba: u64, buf: &[u8]) -> Result<(), FatErr
             BlockSource::Sdhc => crate::drivers::block::write_blocks_sdhc(at, chunk),
             // TEGRA-SDBLK: refuses, as the single-sector twin does. See `write_sector`.
             #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
-            BlockSource::SdMmc => crate::drivers::block::write_blocks_tegra_sd(at, chunk), #[cfg(all(target_arch = "x86_64", feature = "ahci"))] BlockSource::Ahci(p) => crate::drivers::block::write_blocks_ahci_port(p, at, chunk), // AHCIBOOT: refuses, as the single-sector twin does.
+            BlockSource::SdMmc => crate::drivers::block::write_blocks_tegra_sd(at, chunk), #[cfg(all(target_arch = "x86_64", feature = "ahci"))] BlockSource::Ahci(p) => crate::drivers::block::write_blocks_ahci_port(p, at, chunk), #[cfg(all(target_arch = "x86_64", feature = "nvme"))] BlockSource::Nvme => crate::drivers::block::write_blocks_nvme(at, chunk), // AHCIBOOT: refuses, as the single-sector twin does.
         };
         if r.is_ok() { SECTOR_WRITES.fetch_add((take / SECTOR_SIZE) as u64, core::sync::atomic::Ordering::Relaxed); } r.map_err(|_| FatError::Io)?; // LFNMV2 M2: counted on device Ok, folded onto this line
         off += take;
@@ -1634,7 +1634,7 @@ fn source_of(handle: crate::drivers::block::BlockHandle) -> BlockSource {
         // returns this handle (the Orin's program volume is the global slot; see the block layer's
         // TEGRA-SDBLK section on why the card is not a program-source rung).
         #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
-        crate::drivers::block::BlockHandle::SdMmc => BlockSource::SdMmc, #[cfg(all(target_arch = "x86_64", feature = "ahci"))] crate::drivers::block::BlockHandle::Ahci { port } => BlockSource::Ahci(port),
+        crate::drivers::block::BlockHandle::SdMmc => BlockSource::SdMmc, #[cfg(all(target_arch = "x86_64", feature = "ahci"))] crate::drivers::block::BlockHandle::Ahci { port } => BlockSource::Ahci(port), #[cfg(all(target_arch = "x86_64", feature = "nvme"))] crate::drivers::block::BlockHandle::Nvme => BlockSource::Nvme,
     }
 }
 
@@ -1652,7 +1652,7 @@ pub fn mount_source(source: BlockSource) -> Result<FatFs, FatError> {
         #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
         BlockSource::Sdhc => crate::drivers::block::sdhc_info(),
         #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
-        BlockSource::SdMmc => crate::drivers::block::tegra_sd_info(), #[cfg(all(target_arch = "x86_64", feature = "ahci"))] BlockSource::Ahci(p) => crate::drivers::block::ahci_info_port(p),
+        BlockSource::SdMmc => crate::drivers::block::tegra_sd_info(), #[cfg(all(target_arch = "x86_64", feature = "ahci"))] BlockSource::Ahci(p) => crate::drivers::block::ahci_info_port(p), #[cfg(all(target_arch = "x86_64", feature = "nvme"))] BlockSource::Nvme => crate::drivers::block::nvme_info(),
     }
     .ok_or(FatError::NoDisk)?;
     if dev.block_size != SECTOR_SIZE as u32 {
@@ -1731,7 +1731,7 @@ pub fn handle_of(source: BlockSource) -> crate::drivers::block::BlockHandle {
         #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
         BlockSource::Sdhc => crate::drivers::block::BlockHandle::Sdhc,
         #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
-        BlockSource::SdMmc => crate::drivers::block::BlockHandle::SdMmc, #[cfg(all(target_arch = "x86_64", feature = "ahci"))] BlockSource::Ahci(p) => crate::drivers::block::BlockHandle::Ahci { port: p },
+        BlockSource::SdMmc => crate::drivers::block::BlockHandle::SdMmc, #[cfg(all(target_arch = "x86_64", feature = "ahci"))] BlockSource::Ahci(p) => crate::drivers::block::BlockHandle::Ahci { port: p }, #[cfg(all(target_arch = "x86_64", feature = "nvme"))] BlockSource::Nvme => crate::drivers::block::BlockHandle::Nvme,
     }
 }
 
@@ -1818,7 +1818,7 @@ pub fn volume_serials(source: BlockSource) -> alloc::vec::Vec<u32> {
         #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
         BlockSource::Sdhc => crate::drivers::block::sdhc_info(),
         #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
-        BlockSource::SdMmc => crate::drivers::block::tegra_sd_info(), #[cfg(all(target_arch = "x86_64", feature = "ahci"))] BlockSource::Ahci(p) => crate::drivers::block::ahci_info_port(p),
+        BlockSource::SdMmc => crate::drivers::block::tegra_sd_info(), #[cfg(all(target_arch = "x86_64", feature = "ahci"))] BlockSource::Ahci(p) => crate::drivers::block::ahci_info_port(p), #[cfg(all(target_arch = "x86_64", feature = "nvme"))] BlockSource::Nvme => crate::drivers::block::nvme_info(),
     };
     let Some(dev) = dev else { return out };
     if dev.block_size != SECTOR_SIZE as u32 {
@@ -1876,7 +1876,7 @@ pub fn source_present(source: BlockSource) -> bool {
         #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
         BlockSource::Sdhc => crate::drivers::block::sdhc_info(),
         #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
-        BlockSource::SdMmc => crate::drivers::block::tegra_sd_info(), #[cfg(all(target_arch = "x86_64", feature = "ahci"))] BlockSource::Ahci(p) => crate::drivers::block::ahci_info_port(p),
+        BlockSource::SdMmc => crate::drivers::block::tegra_sd_info(), #[cfg(all(target_arch = "x86_64", feature = "ahci"))] BlockSource::Ahci(p) => crate::drivers::block::ahci_info_port(p), #[cfg(all(target_arch = "x86_64", feature = "nvme"))] BlockSource::Nvme => crate::drivers::block::nvme_info(),
     };
     dev.is_some()
 }
@@ -1972,7 +1972,7 @@ pub fn live_sources() -> alloc::vec::Vec<BlockSource> {
                 }
             }
         }
-    } push_ahci_sources(&mut out); // AHCIBOOT: the SATA registry expanded onto the END of the list — never interleaved, so a machine with no SATA disk (every Pi, every default x86 leg) walks byte-for-byte the list it walked before, and the first-found root rule keeps binding whatever the USB rungs already bound.
+    } push_ahci_sources(&mut out); push_nvme_sources(&mut out); // AHCIBOOT: the SATA registry expanded onto the END of the list — never interleaved, so a machine with no SATA disk (every Pi, every default x86 leg) walks byte-for-byte the list it walked before, and the first-found root rule keeps binding whatever the USB rungs already bound.
     out
 }
 
@@ -1999,7 +1999,7 @@ pub fn source_unit(source: BlockSource) -> Option<u8> {
         #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
         BlockSource::Sdhc => None,
         #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
-        BlockSource::SdMmc => None, #[cfg(all(target_arch = "x86_64", feature = "ahci"))] BlockSource::Ahci(_) => None, // AHCIBOOT: not a USB registry entry, so it aliases nothing.
+        BlockSource::SdMmc => None, #[cfg(all(target_arch = "x86_64", feature = "ahci"))] BlockSource::Ahci(_) => None, #[cfg(all(target_arch = "x86_64", feature = "nvme"))] BlockSource::Nvme => None, // AHCIBOOT: not a USB registry entry, so it aliases nothing.
     }
 }
 
@@ -5127,7 +5127,7 @@ pub fn source_blocks(source: BlockSource) -> Option<u64> {
         #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
         BlockSource::Sdhc => crate::drivers::block::sdhc_info(),
         #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
-        BlockSource::SdMmc => crate::drivers::block::tegra_sd_info(), #[cfg(all(target_arch = "x86_64", feature = "ahci"))] BlockSource::Ahci(p) => crate::drivers::block::ahci_info_port(p),
+        BlockSource::SdMmc => crate::drivers::block::tegra_sd_info(), #[cfg(all(target_arch = "x86_64", feature = "ahci"))] BlockSource::Ahci(p) => crate::drivers::block::ahci_info_port(p), #[cfg(all(target_arch = "x86_64", feature = "nvme"))] BlockSource::Nvme => crate::drivers::block::nvme_info(),
     };
     dev.map(|d| d.num_blocks)
 }
@@ -5268,7 +5268,7 @@ pub fn source_device(source: BlockSource) -> Option<BlockDeviceInfo> {
         #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
         BlockSource::Sdhc => crate::drivers::block::sdhc_info(),
         #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
-        BlockSource::SdMmc => crate::drivers::block::tegra_sd_info(), #[cfg(all(target_arch = "x86_64", feature = "ahci"))] BlockSource::Ahci(p) => crate::drivers::block::ahci_info_port(p),
+        BlockSource::SdMmc => crate::drivers::block::tegra_sd_info(), #[cfg(all(target_arch = "x86_64", feature = "ahci"))] BlockSource::Ahci(p) => crate::drivers::block::ahci_info_port(p), #[cfg(all(target_arch = "x86_64", feature = "nvme"))] BlockSource::Nvme => crate::drivers::block::nvme_info(),
     }
 }
 
@@ -7058,3 +7058,30 @@ impl FatFs {
 
 /// POWERMENU (R75): is a deferred directory entry waiting to be written? (the `flushed=` term of `:: POWER:`).
 pub fn dirent_pending() -> bool { PEND_VALID.load(Ordering::Acquire) }
+
+// =========================================================================================
+// NVMEBOOT (zenbook-ledger Z9) — the NVMe namespace as a FAT BlockSource.
+//
+// APPENDED AT THE FILE TAIL; every change above is a LINE-NEUTRAL fold (LAWS §5). AHCIBOOT's shape one
+// controller over: the source joins `live_sources` at the END, after the SATA disks, so the walk's order
+// for every machine without an NVMe namespace is byte-for-byte what it was, and the first-found root rule
+// keeps binding whatever the earlier rungs bound.
+
+/// NVMEBOOT: the FAT volume's standing write refusal on the NVMe, as [`BlockSource::write_veto`] reports it.
+#[cfg(all(target_arch = "x86_64", feature = "nvme"))]
+const NVME_VETO: &str = "the volume rides the NVMe namespace, which is mounted READ-ONLY for FAT \u{2014} \
+                         the block layer admits a write only inside the boot's NVMe root grant, one UnaFS \
+                         extent (NVMEBOOT)";
+
+/// NVMEBOOT: append the published NVMe namespace (if any) to a [`live_sources`] list, after the SATA disks.
+#[cfg(all(target_arch = "x86_64", feature = "nvme"))]
+fn push_nvme_sources(out: &mut alloc::vec::Vec<BlockSource>) {
+    if crate::drivers::block::nvme_info().is_some() {
+        out.push(BlockSource::Nvme);
+    }
+}
+
+/// No NVMe handle in this image, so there is nothing to append. Byte-identical to pre-NVMEBOOT.
+#[cfg(not(all(target_arch = "x86_64", feature = "nvme")))]
+#[inline(always)]
+fn push_nvme_sources(_out: &mut alloc::vec::Vec<BlockSource>) {}
