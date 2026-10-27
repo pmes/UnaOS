@@ -353,7 +353,7 @@ pub fn fetch_to_cache(src: &str, dest: &Path, chunk: u64) -> Result<FetchReport,
     if let Some(d) = dest.parent() {
         std::fs::create_dir_all(d).map_err(|e| format!("{}: {e}", d.display()))?;
     }
-    let part = dest.with_extension("part");
+    let part = gneiss_pal::fs::part(dest); // WRITEONE (SR386): the ONE writer's `<dest>.part` (== the old `with_extension("part")`: cache names have no extension)
     let client = crate::net::blocking_client_builder().build().map_err(|e| e.to_string())?;
     let mut rep = FetchReport::default();
     let mut have = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
@@ -419,7 +419,7 @@ pub fn fetch_to_cache(src: &str, dest: &Path, chunk: u64) -> Result<FetchReport,
         }
     }
     rep.bytes = have;
-    std::fs::rename(&part, dest).map_err(|e| format!("{}: {e}", dest.display()))?;
+    gneiss_pal::fs::land(dest).map_err(|e| format!("{}: {e}", dest.display()))?; // WRITEONE (SR386): the ONE writer's rename
     Ok(rep)
 }
 

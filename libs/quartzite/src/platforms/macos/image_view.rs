@@ -936,6 +936,11 @@ pub fn bootstrap_image_surface(id: &str, synapse: bandy::Synapse) -> Retained<NS
                     let syn = resend.clone();
                     dispatch2::DispatchQueue::main().exec_async(move || super::save_panel::run(url, &name, &syn));
                 }
+                // OPEN-DIALOG-ONE (SR386): the owner asks THIS surface's window for a file: the platform open panel, on the main thread.
+                Ok(bandy::SMessage::OpenPanel { url, filters }) if url == target_id => {
+                    let syn = resend.clone();
+                    dispatch2::DispatchQueue::main().exec_async(move || super::open_panel::run(url, &filters, &syn));
+                }
                 // AETHERSELECT (SR69): the engine's copy lands on the general pasteboard as plain text.
                 Ok(bandy::SMessage::BrowserClipboardSet(text)) => {
                     dispatch2::DispatchQueue::main().exec_async(move || unsafe {

@@ -33,6 +33,7 @@ pub mod find_bar;
 pub mod status_line;
 pub mod downloads;
 pub mod save_panel; // SAVEDIALOG (SR364): the platform save panel the image surface's lane opens
+pub mod open_panel; // OPEN-DIALOG-ONE (SR386): the platform open panel, the same lane's
 pub mod tab_search;
 // AETHERMACDEVTOOLS (SR312): the system-log Console and the developer-tools pane (`widgets::{console_rows, devtools_rows}`).
 pub mod console_view;

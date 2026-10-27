@@ -518,6 +518,14 @@ pub enum SMessage {
     /// Face -> owner (SAVEDIALOG, SR364): the path the person chose in the [`SMessage::SavePanel`] over `url`, or `None`
     /// when the panel was cancelled. A chosen path that exists was confirmed as a replace by the panel.
     SavePanelChose { url: String, path: Option<String> },
+    /// Owner -> face (OPEN-DIALOG-ONE, LEDGER SR386): show the platform open panel (AppKit NSOpenPanel / GTK FileDialog)
+    /// over the surface `url` (the lane that draws that surface answers; every other surface ignores it), offering the
+    /// files whose names end in one of `filters` (extensions without the dot; empty = any file). The face reads nothing:
+    /// it answers [`SMessage::OpenPanelChose`]. APPENDED so no earlier wire tag moves.
+    OpenPanel { url: String, filters: Vec<String> },
+    /// Face -> owner (OPEN-DIALOG-ONE, SR386): the file the person chose in the [`SMessage::OpenPanel`] over `url`, or
+    /// `None` when the panel was cancelled.
+    OpenPanelChose { url: String, path: Option<String> },
 }
 
 /// A typed preference value — the whole value domain of the Principia

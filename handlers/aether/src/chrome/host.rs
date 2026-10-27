@@ -42,15 +42,13 @@ pub fn load_bookmarks() -> Bookmarks {
         .unwrap_or_default()
 }
 
-/// Write the bookmarks file atomically (temp file, then rename).
+/// Write the bookmarks file atomically through gneiss_pal's ONE writer (WRITEONE, SR386: `bookmarks.tsv.part`, then rename).
 pub fn save_bookmarks(b: &Bookmarks) -> std::io::Result<()> {
     let path = bookmarks_path().ok_or_else(|| std::io::Error::other("no data directory"))?;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let tmp = path.with_extension("tsv.tmp");
-    std::fs::write(&tmp, b.serialize())?;
-    std::fs::rename(tmp, path)
+    gneiss_pal::fs::save_bytes(&path, b.serialize().as_bytes())
 }
 
 /// The Downloads folder.

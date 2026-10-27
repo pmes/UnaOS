@@ -210,6 +210,7 @@ pub mod text_field;
 pub mod glyph;
 pub mod image_view;
 pub mod save_dialog; // SAVEDIALOG (SR364): the platform save panel the image surface's lane opens
+pub mod open_dialog; // OPEN-DIALOG-ONE (SR386): the platform open panel, the same lane's
 pub mod console_view;
 // AETHERCHROME (SR84): the browser chrome's GTK face.
 pub mod tab_strip;
