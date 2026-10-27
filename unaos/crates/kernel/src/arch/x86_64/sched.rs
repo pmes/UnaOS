@@ -8391,7 +8391,7 @@ pub fn singleton_restart(from: usize, live: usize) -> Option<(u64, u64)> {
     // SAFETY: `entry` was stored from a `fn(usize)` in `singleton_register`; fn pointers round-trip through usize.
     let f: fn(usize) = unsafe { core::mem::transmute::<usize, fn(usize)>(entry) };
     let name = sgl_name();
-    let new = spawn_inner(name, f, live, live, SGL_PRIO.load(Ordering::Relaxed), TASK_STACK_SIZE, None, None);
+    let new = spawn_inner(name, f, live, live, SGL_PRIO.load(Ordering::Relaxed), PUMP_PATH_STACK_SIZE, None, None); // PUMPSTACK (B1006): the one registered singleton is the usb-pump (main.rs `usb_pump` prologue), so its fresh instance takes the pump's MEASURED 32 KiB, never the blanket 16 KiB (flight 38: deaths=3; the RENDSTACK precedent sized `render-rehomed` too). LINE-NEUTRAL, in place
     SGL_TID.store(new, Ordering::Release);
     SGL_FRESH_MS.store(0, Ordering::Release);
     SGL_RESTART_OLD.store(old, Ordering::Relaxed);
@@ -9266,4 +9266,41 @@ pub fn spawn_joinable_stack(
     done.init(); // reserve the waiter list BEFORE the task can run + post (alloc-free park)
     let id = spawn_inner(name, entry, arg, target_cpu, PRIO_NORMAL, stack_bytes, Some(done.clone()), None);
     JoinHandle { done, id }
+}
+
+// ── PUMPSTACK (rmbp-ledger B1006) — THE x86 usb-pump ON A MEASURED STACK, and the per-fixture high-water reading. ──
+// Flight 38 boot 1 (narino, `docs/dev/evidence/rmbp-0915/flight38/FLIGHT38.md` on hw-rmbp, f38-boot1.log:3850-3856):
+// `[stack] guard hit task=usb-pump size=16384 high=17712 holding=2`, the pump in its prtscr step right after
+// `:: SHOTZIP: … -> PASS ::` (the PNG encode, then the shot's UnaFS write under the ticket: the two locks it held were
+// `unafs` and `unafs-ticket`). The 16 KiB was the SOURCE, not a lost request: main.rs spawned the x86 pump through
+// [`spawn`] (TASK_STACK_SIZE); the Pi's `PUMP_PATH_STACK_SIZE` (main.rs tail) is aarch64-only and never reached x86.
+// The cure is RENDSTACK's: [`spawn_stack`] with a measured size, at the primary spawn (main.rs, renamed in place) AND
+// at the singleton restart ([`singleton_restart`], in place), whose one registrant is the pump — sizing only the first
+// would put every re-homed pump (f38: `deaths=3`) back on 16 KiB. 32 KiB: `high=17712` is a FLOOR (the guard stopped
+// the descent), 32768 is 1.85x it, and RENDSTACK read 15536-15600 B on render's comparable pass at 32 KiB. A future
+// reading near the size is answered by a bigger number and the guard's verdict, never a raised TASK_STACK_SIZE.
+// Owed (B1006): PUMP-FIXTURE-AUDIT (every pump step's high-water on metal, prtscr's encode+save first), STACK-POOL-ONE
+// (one size table for both arches). At the tail: no line above moves.
+
+/// PUMPSTACK — the x86 usb-pump's USABLE stack span (the x86 twin of main.rs's aarch64 `PUMP_PATH_STACK_SIZE`).
+pub const PUMP_PATH_STACK_SIZE: usize = 32 * 1024;
+
+/// PUMPSTACK — `(name, lifetime high-water, usable size)` of the task CURRENT on this core: RENDSTACK's
+/// [`stack_high_water`] reading, one more caller (`tests::run`'s per-fixture `[tests] fixture=` line). Read with
+/// interrupts masked so the caller cannot migrate between the core lookup and the scan; `None` off a scheduled task.
+#[cfg(feature = "witness")]
+pub fn current_stack_high() -> Option<(&'static str, usize, usize)> {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let cpu = percpu::this_cpu().cpu_index as usize;
+        if cpu >= MAX_CPUS {
+            return None;
+        }
+        let raw = SCHED[cpu].current.load(Ordering::Acquire) as *const Task;
+        if raw.is_null() {
+            return None;
+        }
+        // SAFETY: the task running on THIS core with IF=0; nothing can free its Box underneath us.
+        let task = unsafe { &*raw };
+        Some((task.name, stack_high_water(task), task.stack.len() - STACK_GUARD))
+    })
 }

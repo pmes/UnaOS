@@ -127,7 +127,7 @@ pub fn run(name: Option<&str>) -> usize {
         if let Some(want) = name { if want != n { continue; } }
         serial_println!(":: TESTS: run {} ::", n);
         *CUR.lock() = n;
-        crate::serial_line::tail_arm(); let vb = verdicts(); f(); skip_note(n, vb); verdict_note(n); // QUIETBOOT3 (B352): the fixture's own wire tail, for the glass.
+        crate::serial_line::tail_arm(); let vb = verdicts(); f(); skip_note(n, vb); verdict_note(n); #[cfg(all(feature = "witness", target_arch = "x86_64"))] { fixture_stack_note(n); } // QUIETBOOT3 (B352): the fixture's own wire tail, for the glass.
         if RUN_GEN.load(Ordering::Acquire) == my_gen { *CUR.lock() = ""; } // BOOTLIST (B817): a superseded run leaves CUR to the run that replaced it (LINE-NEUTRAL)
         ran += 1;
     }
@@ -8424,5 +8424,17 @@ mod typed_child {
         let mut con = crate::console::Console::new();
         super::shell_verb(&args, &mut con);
         LIVE.store(false, Release);
+    }
+}
+
+// ── PUMPSTACK (rmbp-ledger B1006) — the per-fixture stack witness, called from `run`'s fixture line (one fold). The
+// reading is the RUNNING task's lifetime high-water (`sched::current_stack_high`, RENDSTACK's `stack_high_water`):
+// exact per fixture on a `bootlist-fx` child (one child per list row), cumulative on a `shell-job` running all of
+// `tests`. `on=` names the task, so a capture says which stack each fixture ran on (flight 38: `uvccam` on the list's
+// 64 KiB child, never the pump). x86 `witness` only; the aarch64 line is owed (STACK-POOL-ONE). At the tail. ──
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+fn fixture_stack_note(name: &str) {
+    if let Some((task, high, size)) = crate::arch::sched::current_stack_high() {
+        serial_println!("[tests] fixture={} on={} stack_high={} size={}", name, task, high, size);
     }
 }
