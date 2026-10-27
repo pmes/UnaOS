@@ -1580,10 +1580,10 @@ mod nle_fx {
         let ctts = vi.is_some_and(|i| d.track_samples(i).any(|s| s.pts != s.dts));
         let audio_ok = d.audio_track().is_some_and(|t| t.sample_rate == 48_000 && t.channels == 2) && rep.audio_target > 0 && rep.audio_mixed >= rep.audio_target;
         let need_audio = cfg!(any(feature = "uvc", feature = "hda-tone"));
-        let ok = samples == ticks && rep.frames == ticks && ctts && (audio_ok || !need_audio) && bitrate_verdict(dir); // NLE6EXPORTONE (rmbp-ledger B963): the `--bitrate` export (module tail), behind the first
+        let (col_ok, col_word) = export_colour(&d, vi); let ok = samples == ticks && rep.frames == ticks && ctts && (audio_ok || !need_audio) && bitrate_verdict(dir) && col_ok; // H264ENCCOLOURHOST (LEDGER SR377): the re-read file's colour (module tail). NLE6EXPORTONE (rmbp-ledger B963): the `--bitrate` export (module tail), behind the first
         serial_println!(
-            "[nle] fixture export out={} samples={} ticks={} ctts={} audio={} mixed={}/{} bytes={} ms={} -> {}",
-            out, samples, ticks, ctts as u8, audio_ok as u8, rep.audio_mixed, rep.audio_target, rep.bytes, rep.ms, if ok { "ok" } else { "FAIL" }
+            "[nle] fixture export out={} samples={} ticks={} ctts={} colour={} audio={} mixed={}/{} bytes={} ms={} -> {}",
+            out, samples, ticks, ctts as u8, col_word, audio_ok as u8, rep.audio_mixed, rep.audio_target, rep.bytes, rep.ms, if ok { "ok" } else { "FAIL" }
         );
         (ok, if !ok { "FAIL" } else if need_audio { "ok" } else { "skip(no-audio)" })
     }
@@ -1847,6 +1847,22 @@ mod nle_fx {
             path, drags, if saved_ok { "ok" } else { "FAIL" }, if tab { "ok" } else { "FAIL" }, band.is_some() as u8, if ok { "ok" } else { "FAIL" }
         );
         (ok, if ok { "ok" } else { "FAIL" })
+    }
+
+    // ── H264ENCCOLOURHOST (LEDGER SR377): EXPORT-COLOUR-PIN — the exported file's colour read back (handlers.md §5 NLEPROBE-HDR) ──
+    // `export_verdict` re-demuxes NLEFX.MP4; the avc1 track's `Track::colour` (the `colr` `Exp::colour_entry` wrote, the same
+    // colour the SPS VUI states: the kernel reads the container only, it links no h264_core) must state a Kr matrix and an
+    // explicit range. Token `colour=<matrix>/<limited|full>` (the fixture's tick 0 is a utp1 reel: the RGBA path, 6/limited),
+    // `none` when the file states no colour.
+    fn export_colour(d: &demux_core::Demuxer, vi: Option<usize>) -> (bool, String) {
+        let c = vi.and_then(|i| d.tracks().get(i)).and_then(|t| t.colour);
+        match c {
+            Some(c) if yuv_core::kr_kb(c.matrix).is_some() && c.full_range.is_some() => {
+                (true, alloc::format!("{}/{}", c.matrix, if c.full_range == Some(true) { "full" } else { "limited" }))
+            }
+            Some(c) => (false, alloc::format!("{}/{:?}", c.matrix, c.full_range)),
+            None => (false, String::from("none")),
+        }
     }
 }
 

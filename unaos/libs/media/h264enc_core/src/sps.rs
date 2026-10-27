@@ -21,6 +21,9 @@
 //! max_num_reorder_frames [`SeqParams::num_reorder`] (2 at bframes >= 3) and max_dec_frame_buffering 4; per slice a
 //! [`SliceExtra`] carries the reference B's marking, the anchor's list-0 modification and MMCO 1, temporal direct and the
 //! explicit pred_weight_table; the PPS names weighted_bipred_idc.
+//!
+//! H264ENCCOLOURHOST (SR377): with [`SeqParams::colour`] the VUI states video_signal_type (video_format 5, the range flag)
+//! and its colour_description (primaries, transfer, matrix), the codes h264_core's `ps::vui` reads back; None = the flag 0.
 
 use alloc::vec::Vec;
 
@@ -59,6 +62,8 @@ pub struct SeqParams {
     pub pyramid: bool,
     /// VUI max_num_reorder_frames: 0 without B, 1, or 2 under a pyramid of bframes >= 3 (SR349).
     pub num_reorder: u32,
+    /// H264ENCCOLOURHOST (SR377): VUI video_signal_type (primaries, transfer, matrix, full range); None writes the flag 0.
+    pub colour: Option<(u8, u8, u8, bool)>,
 }
 
 /// level_idc for a frame of `mb_w` x `mb_h` macroblocks: the lowest level of Table A-1 whose
@@ -113,10 +118,18 @@ pub fn write_sps(p: &SeqParams) -> Vec<u8> {
         w.ue(cb);
     }
     w.flag(true); // vui_parameters_present_flag
-    // vui_parameters (E.1.1): only the bitstream restriction.
+    // vui_parameters (E.1.1): the bitstream restriction, and the colour when stated (SR377).
     w.flag(false); // aspect_ratio_info_present_flag
     w.flag(false); // overscan_info_present_flag
-    w.flag(false); // video_signal_type_present_flag
+    w.flag(p.colour.is_some()); // video_signal_type_present_flag (H264ENCCOLOURHOST SR377: the file's colour, else 0)
+    if let Some((primaries, transfer, matrix, full)) = p.colour {
+        w.u(3, 5); // video_format: unspecified
+        w.flag(full); // video_full_range_flag
+        w.flag(true); // colour_description_present_flag
+        w.u(8, primaries as u32); // colour_primaries (Table E-3 = H.273)
+        w.u(8, transfer as u32); // transfer_characteristics (Table E-4)
+        w.u(8, matrix as u32); // matrix_coefficients (Table E-5)
+    }
     w.flag(false); // chroma_loc_info_present_flag
     w.flag(false); // timing_info_present_flag
     w.flag(false); // nal_hrd_parameters_present_flag
