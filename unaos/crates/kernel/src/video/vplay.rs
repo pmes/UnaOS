@@ -445,7 +445,7 @@ pub fn start_at(path: &str, ms: u64) -> u32 {
     let jid = GEN.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
     *JOB.lock() = Some(Job { jid, path: String::from(path), facts: None, queue: VecDeque::new(), decoded: 0, err: None, eos: false, sound: None, seek_ms: ms });
     let t = now();
-    *PLAY.lock() = Play { open_ms: t, wall_ms: t, media_ms: ms, ..Play::new() };
+    *PLAY.lock() = Play { open_ms: t, wall_ms: t, media_ms: ms, ..Play::new() }; knobs_latch(); // KERNELSCALEONEARM (rmbp-ledger B980): the `vid` queue depth and filter apply from this job start (file tail)
     PAUSED.store(false, Ordering::Release);
     SPAWN_MS.store(t, Ordering::Release);
     DRAIN_MS.store(t, Ordering::Release);
@@ -672,7 +672,7 @@ fn room(jid: u32) -> Result<(), &'static str> {
             return Err("aborted");
         }
         let q = JOB.lock().as_ref().map(|j| j.queue.len()).unwrap_or(0);
-        if q < QUEUE {
+        if q < QUEUE_LIVE.load(Ordering::Acquire) as usize {
             return Ok(());
         }
         if now().saturating_sub(DRAIN_MS.load(Ordering::Acquire)) > ORPHAN_MS && !PAUSED.load(Ordering::Acquire) {
@@ -2024,8 +2024,8 @@ impl timeline_core::view::Text for ViewLabels {
 // (`vp8_core::Yuv420`, `av1_core::image::Planes`) with the track's colour. A consumer that needs the whole picture (the
 // exporter, `edl_mix`, the `coded` and face-preview hashes) calls [`Px::rgb`]: the existing full conversion (`colour_rgba_vp8`
 // / `colour_rgba_av1` -> `pack`), once, cached, so every pin hashes the bytes it hashed before. The present path
-// ([`Frame::rows`]) converts only the rows the window shows: VP8 (Nearest) sampled by `yuv_core::scale::nearest_rows` and
-// converted per output row by `yuv_core::to_rgba`; AV1 (Bilinear) one sampled source row at a time by `yuv_core::to_rgba_cols`
+// ([`Frame::rows`]) converts only the rows the window shows: VP8 (Nearest, KERNELSCALEONEARM B980: no gathered scratch rows) and
+// AV1 (Bilinear) through ONE `sampled`, one sampled source row at a time by `yuv_core::to_rgba_cols`
 // over the distinct sampled columns only (KERNELSCALECOLS B978; its neighbour chroma read from the whole planes), the output
 // gathered from them; every row and column index is the
 // scaler's own. Bit for bit the full conversion then nearest-sampled. A dropped or run-up frame converts nothing. One holder
@@ -2091,29 +2091,11 @@ impl Frame {
             (Some(px), _) => yuv_core::scale::nearest_rows(&mono(self.w, self.h, px), dw, dh, &mut out, &mut [], &mut [], |r, s| row(r, s.y)),
             (None, Src::Vp8(y, c)) => {
                 let (p, m) = vp8_picture(y, *c);
-                let (mut ry, mut ru, mut rv, mut rgba) = (alloc::vec![0u8; dw], alloc::vec![0u8; dw], alloc::vec![0u8; dw], alloc::vec![0u8; dw * 4]);
-                yuv_core::scale::nearest_rows(&p, dw, dh, &mut ry, &mut ru, &mut rv, |r, s| {
-                    yuv_core::to_rgba(s, m, yuv_core::Chroma::Nearest, false, &mut rgba);
-                    row(r, &pack(&rgba));
-                });
+                sampled(&p, m, yuv_core::Chroma::Nearest, dw, dh, &mut out, &mut row); // KERNELSCALEONEARM (rmbp-ledger B980): the AV1 arm's column list, Nearest (file tail)
             }
             (None, Src::Av1(pl, c)) => {
                 let (p, m) = av1_picture(pl, *c);
-                let idx: Vec<u32> = (0..self.h.max(self.w) as u32).collect(); // the source row / column each output row / column samples: the scaler's own index
-                let mut sxs = alloc::vec![0u32; dw];
-                yuv_core::scale::nearest_rows(&mono(self.w, 1, &idx), dw, 1, &mut sxs, &mut [], &mut [], |_, _| {});
-                let (cols, at) = distinct(&sxs); // KERNELSCALECOLS (B978): convert only the distinct sampled source columns
-                let (mut one, mut rgba) = ([0u32; 1], alloc::vec![0u8; cols.len() * 4]);
-                let mut line: (usize, Vec<u32>) = (usize::MAX, Vec::new());
-                yuv_core::scale::nearest_rows(&mono(1, self.h, &idx), 1, dh, &mut one, &mut [], &mut [], |r, s| {
-                    let sy = s.y[0] as usize;
-                    if line.0 != sy {
-                        yuv_core::to_rgba_cols(&p, sy, sy + 1, cols.iter().map(|&x| x as usize), m, yuv_core::Chroma::Bilinear, false, &mut rgba);
-                        line = (sy, pack(&rgba));
-                    }
-                    out.iter_mut().zip(&at).for_each(|(o, &i)| *o = line.1[i as usize]);
-                    row(r, &out);
-                });
+                sampled(&p, m, yuv_core::Chroma::Bilinear, dw, dh, &mut out, &mut row); // KERNELSCALECOLS (B978): the distinct sampled source columns only
             }
             (None, Src::Rgb) => {}
         }
@@ -2353,11 +2335,12 @@ fn present_cost(c0: u64) {
     p.present_max = p.present_max.max(dt);
 }
 
-/// `(mean present us, largest present us, queue depth)` of the play: the `[player] ended` line's cost tokens.
-pub fn present_us() -> (u64, u64, usize) {
+/// `(mean present us, largest present us, queue depth, filter)` of the play: the `[player] ended` line's cost tokens (the depth and
+/// the filter the job started with, KERNELSCALEONEARM B980).
+pub fn present_us() -> (u64, u64, usize, &'static str) {
     let p = PLAY.lock();
     let us = crate::video::blitter::cycles_to_us;
-    (us(p.present_cyc) / p.presented.max(1), us(p.present_max), QUEUE)
+    (us(p.present_cyc) / p.presented.max(1), us(p.present_max), QUEUE_LIVE.load(Ordering::Acquire) as usize, filter_word(AREA_LIVE.load(Ordering::Acquire)))
 }
 
 /// `UNAOS_VPLAY_QUEUE`: unset or empty = 3 frames; a decimal 1..=16 (0 would never let `room` pass, 16 AV1 1080p frames hold
@@ -2382,4 +2365,81 @@ const fn vplay_queue(s: Option<&str>) -> usize {
         panic!("UNAOS_VPLAY_QUEUE must be 1..=16 frames");
     }
     v
+}
+
+// ── KERNELSCALEONEARM (rmbp-ledger B980): one present shape for both codecs, the runtime queue depth, the area filter ──────────
+// handlers.md §5 NLEPROBE-HDR's KERNEL-SCALE-ONE-ARM, VPLAY-QUEUE-RUNTIME and SCALE-AREA. [`sampled`] is B978's AV1 present
+// (the scaler's own index, the distinct sampled source columns, one `yuv_core::to_rgba_cols` per distinct sampled source row,
+// the output gathered) generalised over the sample type and the chroma mode; the VP8 arm calls it with `Chroma::Nearest` where
+// it gathered three 4:4:4 scratch rows per output row: with no dither the bias is position-free and Nearest reads the same
+// luma and chroma sample at (row, column), so the bytes are the gathered row's and the conversions drop to distinct rows x
+// distinct columns. The queue depth and the filter are the Player's own `vid` verb (`player::shell_verb`), debugging aids that
+// must not outlive a boot (no Principia key): `vid queue <1..=16>` / `vid filter area|nearest` set the NEXT values, every job
+// start ([`start_at`]: an open, a seek, the export) latches them into the live ones `room`, `sampled` and `present_us` read.
+// [`QUEUE`] (B978's build knob) stays the default depth; the filter defaults to nearest (the pins hash nearest presents). Area
+// (`yuv_core::scale::area_rows`, then the ONE converter) applies to a planes frame downscaled 2x or more; a 0RGB frame stays
+// nearest. Atomics only: no lock.
+
+static QUEUE_NEXT: AtomicU32 = AtomicU32::new(QUEUE as u32);
+static QUEUE_LIVE: AtomicU32 = AtomicU32::new(QUEUE as u32);
+static AREA_NEXT: AtomicBool = AtomicBool::new(false);
+static AREA_LIVE: AtomicBool = AtomicBool::new(false);
+
+/// A picture's planes sampled to `dw x dh` with `up` chroma, each output row handed to `row(r, 0RGB)` through `out` (`dw` long):
+/// the area filter on a downscale of 2x or more when the job started with it, else the distinct-columns nearest present.
+fn sampled<T: Copy + Into<i32> + Into<u64> + TryFrom<u64>>(p: &yuv_core::Picture<'_, T>, m: yuv_core::Matrix, up: yuv_core::Chroma, dw: usize, dh: usize, out: &mut [u32], row: &mut impl FnMut(usize, &[u32])) {
+    if AREA_LIVE.load(Ordering::Acquire) && (p.w >= 2 * dw || p.h >= 2 * dh) {
+        let s0 = p.y[0];
+        let (mut ry, mut ru, mut rv, mut rgba) = (alloc::vec![s0; dw], alloc::vec![s0; dw], alloc::vec![s0; dw], alloc::vec![0u8; dw * 4]);
+        yuv_core::scale::area_rows(p, dw, dh, &mut ry, &mut ru, &mut rv, |r, s| {
+            yuv_core::to_rgba(s, m, up, false, &mut rgba);
+            row(r, &pack(&rgba));
+        });
+        return;
+    }
+    let idx: Vec<u32> = (0..p.h.max(p.w) as u32).collect(); // the source row / column each output row / column samples: the scaler's own index
+    let mut sxs = alloc::vec![0u32; dw];
+    yuv_core::scale::nearest_rows(&mono(p.w, 1, &idx), dw, 1, &mut sxs, &mut [], &mut [], |_, _| {});
+    let (cols, at) = distinct(&sxs); // KERNELSCALECOLS (B978): convert only the distinct sampled source columns
+    let (mut one, mut rgba) = ([0u32; 1], alloc::vec![0u8; cols.len() * 4]);
+    let mut line: (usize, Vec<u32>) = (usize::MAX, Vec::new());
+    yuv_core::scale::nearest_rows(&mono(1, p.h, &idx), 1, dh, &mut one, &mut [], &mut [], |r, s| {
+        let sy = s.y[0] as usize;
+        if line.0 != sy {
+            yuv_core::to_rgba_cols(p, sy, sy + 1, cols.iter().map(|&x| x as usize), m, up, false, &mut rgba);
+            line = (sy, pack(&rgba));
+        }
+        out.iter_mut().zip(&at).for_each(|(o, &i)| *o = line.1[i as usize]);
+        row(r, &*out);
+    });
+}
+
+/// A job start takes the `vid` verb's queue depth and filter.
+fn knobs_latch() {
+    QUEUE_LIVE.store(QUEUE_NEXT.load(Ordering::Acquire), Ordering::Release);
+    AREA_LIVE.store(AREA_NEXT.load(Ordering::Acquire), Ordering::Release);
+}
+
+/// `vid queue <n>`: the queue depth from the next job start; `false` (nothing set) outside 1..=16.
+pub fn set_queue(n: u32) -> bool {
+    if !(1..=16).contains(&n) {
+        return false;
+    }
+    QUEUE_NEXT.store(n, Ordering::Release);
+    true
+}
+
+/// `vid filter area|nearest`: the present's downscale filter from the next job start.
+pub fn set_filter(area: bool) {
+    AREA_NEXT.store(area, Ordering::Release);
+}
+
+/// `(next queue depth, next filter is area, live queue depth, live filter is area)`.
+pub fn knobs() -> (u32, bool, u32, bool) {
+    (QUEUE_NEXT.load(Ordering::Acquire), AREA_NEXT.load(Ordering::Acquire), QUEUE_LIVE.load(Ordering::Acquire), AREA_LIVE.load(Ordering::Acquire))
+}
+
+/// The filter's wire word.
+pub fn filter_word(area: bool) -> &'static str {
+    if area { "area" } else { "nearest" }
 }

@@ -968,4 +968,4 @@ refs/heads/exec-rmbp-kernelscalecols   1e5dd1888 FOLDED-BY-HAND (this commit) 20
 refs/heads/exec-rmbp-exportcolourprim   447813eb5 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-kerneliccintlut   447813eb5 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-aacenctns   447813eb5 IN-FLIGHT cut 2026-10-27
-refs/heads/exec-rmbp-kernelscaleonearm   447813eb5 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-kernelscaleonearm   bae965ecb FOLDED-BY-HAND (this commit) 2026-10-27

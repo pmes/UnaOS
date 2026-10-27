@@ -1121,8 +1121,8 @@ mod vid {
             st.ended = true;
             let (dec, pres, drop, sync, smax, clk) = vplay::stats(); let pu = vplay::present_us(); // KERNELSCALECOLS (rmbp-ledger B978): the present cost and the queue depth
             serial_println!(
-                "[player] ended path={} at_ms={} frames={} presented={} dropped={} av_sync_ms={} max={} clock={} present_us={} present_max_us={} queue={}",
-                st.path, clock, dec, pres, drop, sync, smax, clk, pu.0, pu.1, pu.2
+                "[player] ended path={} at_ms={} frames={} presented={} dropped={} av_sync_ms={} max={} clock={} present_us={} present_max_us={} queue={} filter={}",
+                st.path, clock, dec, pres, drop, sync, smax, clk, pu.0, pu.1, pu.2, pu.3
             );
             controls = true;
         }
@@ -2011,4 +2011,29 @@ fn nle_tab(_: wm::WinId, _: &str) {}
 #[cfg(not(all(target_arch = "x86_64", feature = "videoplayer")))]
 fn edit_press_route(_: usize, _: usize) -> bool {
     false
+}
+
+// ── KERNELSCALEONEARM (rmbp-ledger B980): the Player's `vid` verb (handlers.md §5 NLEPROBE-HDR's VPLAY-QUEUE-RUNTIME, SCALE-AREA) ──
+// The queue depth and the present's downscale filter at runtime, for measuring the present cost on metal: the Player's own verb,
+// not a Principia key (a debugging aid must not outlive a boot). Each sets the NEXT value; vplay's next job start (an open, a
+// seek) latches it, so `[player] ended ... queue=<n> filter=<nearest|area>` describes the whole play.
+#[cfg(all(target_arch = "x86_64", feature = "videoplayer"))]
+pub fn shell_verb(args: &[&str], console: &mut crate::console::Console) {
+    use crate::video::vplay;
+    const USAGE: &str = "usage: vid | vid queue <1..16> | vid filter area|nearest";
+    match (args.first().copied(), args.get(1).copied(), args.len()) {
+        (None, _, _) => {
+            let (qn, an, ql, al) = vplay::knobs();
+            console.println(&alloc::format!("vid: queue={}/{} filter={}/{} (live/next)", ql, qn, vplay::filter_word(al), vplay::filter_word(an)));
+        }
+        (Some("queue"), Some(n), 2) => match n.parse::<u32>() {
+            Ok(n) if vplay::set_queue(n) => console.println(&alloc::format!("vid: queue={} at the next open", n)),
+            _ => console.println(USAGE),
+        },
+        (Some("filter"), Some(f @ ("area" | "nearest")), 2) => {
+            vplay::set_filter(f == "area");
+            console.println(&alloc::format!("vid: filter={} at the next open{}", f, if f == "area" { " (downscales >= 2x)" } else { "" }));
+        }
+        _ => console.println(USAGE),
+    }
 }
