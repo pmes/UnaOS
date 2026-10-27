@@ -509,7 +509,7 @@ pub fn dock_tile_row(out: &mut [u32], w: usize, key: &str, bx: usize, by: usize,
 /// that is a built-in or a sighted program — then [`dock_tile_row`]. Allocation-free until an icon is first
 /// decoded at a size; never waits on a lock.
 pub fn dock_icon_row(out: &mut [u32], w: usize, id: u32, title: &[u8], bx: usize, by: usize, tw: usize, th: usize, j: usize) -> bool {
-    #[cfg(feature = "facet")]
+    #[cfg(all(feature = "facet", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))] // KNOBOFF (seat, 2026-10-26): `video::facet` is desktop-family
     if id != 0 && id == crate::video::facet::win() {
         return dock_tile_row(out, w, "facet", bx, by, tw, th, j);
     }

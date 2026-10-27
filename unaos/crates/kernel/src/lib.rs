@@ -278,6 +278,8 @@ pub mod prof;
 // SETTINGSBUS (rmbp-ledger B337): the kernel's preference CLIENT — the desktop speaks Principia's bus verbs (relayed to PREFS.ELF when it owns them, else the kernel fulfiller), PrefChanged to the window. The bus cfg. Tail statement, so no existing line moves.
 #[cfg(any(feature = "aarch64_el0", target_arch = "x86_64", all(target_arch = "aarch64", feature = "desktop_firmware")))] // ARMNOEL0: arch-neutral client; without EL0 (no busreg) every verb falls to the kernel fulfiller
 pub mod prefs_client;
+#[cfg(not(any(feature = "aarch64_el0", target_arch = "x86_64", all(target_arch = "aarch64", feature = "desktop_firmware"))))] // KNOBOFF (seat, 2026-10-26): the aarch64 leg with no EL0 and no desktop has no prefs bus — the client's unconditional readers (locale, keyring) see a store that answers nothing
+pub mod prefs_client { use alloc::{string::String, vec::Vec}; pub fn sys_text(_k: &str) -> Option<String> { None } pub fn sys_set(_k: &str, _v: crate::prefs::PrefValue) {} pub fn relay_tag(_tag: u8, _prin: [u8; 32], _body: &[u8], _wait_ms: u64) -> Result<(i32, Vec<u8>), i64> { Err(-38) } }
 // SELFDIAG (rmbp-ledger B324, R82): the boot log on disk (`bootwit`) and the diagnosis program's kernel half —
 // SYS_PATH_READ/WRITE fulfilment and `tests selfdiag` (`selfdiag`). Tail statements, so no existing line moves.
 #[cfg(feature = "selfdiag")]

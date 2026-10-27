@@ -6379,7 +6379,7 @@ fn x86_render_service(cpu: usize) {
     // boot, a `wc`-off x86 build) the shell is still the desktop and draws exactly as it always did.
     let desktop = desktop_owns_backdrop(); #[cfg(feature = "login")] unaos_kernel::fs::users::boot_session(desktop); // LOGIN13 M1 (R63, rmbp-ledger B189) — the machine boots to the ROOT desktop: this site used to OPEN the login screen (LOGIN M3), and flight 12 shows what that did (`[login] screen open window=2` over a live desktop, no keyboard). `boot_session` opens nothing and says so on the wire; the screen opens at the root session's Log Out. ⚠ LINE-NEUTRAL fold.
     if desktop {
-        unaos_kernel::video::retire_desktop_chrome(screen.width(), screen.height()); screen.paint_desktop_scene(); // WINEDGE2 (B668): the desktop layer and the shadow fill lay the SAME base — the scene owns the backdrop on x86 too (flight 36's pale boxes: the margin was the picture, the desktop beside it flat DESKTOP_BG)
+        #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] unaos_kernel::video::retire_desktop_chrome(screen.width(), screen.height()); screen.paint_desktop_scene(); // WINEDGE2 (B668): the desktop layer and the shadow fill lay the SAME base — the scene owns the backdrop on x86 too (flight 36's pale boxes: the margin was the picture, the desktop beside it flat DESKTOP_BG)
     }
 
     // WCSER-REHOME — is this instance a REPLACEMENT for a render task that died with its core?
