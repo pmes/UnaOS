@@ -1811,7 +1811,7 @@ fn kbd_report(l: &mut Link, body8: &[u8], _rid: u8) {
             }
         }
     }
-    let led = unsafe { decode_boot_keyboard(&r, &mut l.kprev, &mut l.kmods, &mut l.kleds) };
+    let led = unsafe { decode_boot_keyboard(crate::drivers::hidboot::Transport::Bluetooth, &r, &mut l.kprev, &mut l.kmods, &mut l.kleds) };
     if led {
         PENDING_LED.with(|v| *v = Some(l.kleds));
     }
