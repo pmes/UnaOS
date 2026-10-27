@@ -1275,9 +1275,7 @@ mod tests {
     /// the same store start in creation order (the read-only one waits); an abort undoes its writes.
     #[test]
     fn scheduler_orders_overlapping_transactions() {
-        let dir = std::env::temp_dir().join(format!("aether_idb_kat_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        crate::storage::set_root_dir(Some(dir.clone()));
+        let _root = TestRoot::new("aether_idb_kat");
         let key = "https://kat.example";
         let o = open(key, "db", Some(1), 0, false).unwrap();
         let conn = o["conn"].as_u64().unwrap();
@@ -1313,7 +1311,36 @@ mod tests {
         close(conn);
         assert_eq!(databases(key), json!([{ "name": "db", "version": 1 }]));
         assert_eq!(delete_database(key, "db", false).unwrap()["deleted"], json!(1));
-        crate::storage::set_root_dir(None);
+    }
+}
+
+/// IDBKATORDER (LEDGER SR346): the storage root an IndexedDB KAT holds for its whole run. `storage::set_root_dir`
+/// is ONE process global and the harness runs tests on parallel threads: the two IDB KATs each set it and reset
+/// it to None, so one KAT's reset sent the other's `open` to the platform data directory (and a stale database
+/// there). The guard serialises its holders on one lock, points the root at a fresh `<temp>/<name>_<pid>`, and
+/// on drop (a panic included) restores None and removes the dir. Every other storage test: AETHER-TESTROOT, owed.
+#[cfg(test)]
+pub(crate) struct TestRoot {
+    dir: std::path::PathBuf,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl TestRoot {
+    pub(crate) fn new(name: &str) -> TestRoot {
+        static LOCK: Mutex<()> = Mutex::new(());
+        let lock = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("{name}_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
+        crate::storage::set_root_dir(Some(dir.clone()));
+        TestRoot { dir, _lock: lock }
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestRoot {
+    fn drop(&mut self) {
+        crate::storage::set_root_dir(None);
+        let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
