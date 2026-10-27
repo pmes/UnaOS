@@ -109,6 +109,11 @@ async fn settle(
 }
 
 fn main() {
+    // RASTERFACE (SR234): `--edit` / `--synth` hand the process to the editor face; every other line is the viewer.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|a| a == "--edit" || a == "--synth") {
+        std::process::exit(facet_view::editor::main(&args));
+    }
     let cli = cli();
     let principal = Origin::LocalUser(std::env::var("USER").unwrap_or_else(|_| "una".into()));
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("tokio runtime");
