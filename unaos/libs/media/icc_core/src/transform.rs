@@ -9,6 +9,8 @@
 //! 4096-step interpolated OETF table; a GRAY profile becomes one 256-entry RGB table. LUT profiles evaluate their
 //! pipeline per pixel (the last sample is memoised). Lab PCS values decode by the tag type's encoding: lut16 the v2
 //! legacy one (L* 100 = 0xFF00), lut8 and lutAToB the v4 one (L* 100 = 0xFFFF).
+//! KERNEL-ICC-INT (LEDGER SR376): `apply_rgba` runs a matrix/TRC source in integers (`Q14Run`, DisplayTransform's
+//! shape: u16 decode tables, a Q14 3x3 in i64, the ONE `encode_table` of sRGB); `apply_rgba_f32` is the f32 reference.
 
 use alloc::vec::Vec;
 
@@ -76,7 +78,7 @@ const OETF_STEPS: usize = 4096;
 #[derive(Clone, Debug)]
 enum Stage {
     /// RGB matrix/TRC: the curves, their 8-bit tables, and colorants folded into the output matrix.
-    Matrix { trc: [Curve; 3], lin: [Vec<f32>; 3], m: M3 },
+    Matrix { trc: [Curve; 3], lin: [Vec<f32>; 3], m: M3, q: Q14Run },
     /// GRAY: the curve, whether its output is L* (Lab PCS), and the 8-bit result per grey level.
     Gray { trc: Curve, lab: bool, rgb8: Vec<[u8; 3]> },
     /// An A2B pipeline with its PCS.
@@ -100,7 +102,8 @@ impl Transform {
         let stage = match &p.model {
             Model::MatrixTrc { m, trc } => {
                 let lin = core::array::from_fn(|c| (0..256).map(|v| trc[c].eval(v as f32 / 255.0)).collect());
-                Stage::Matrix { trc: trc.clone(), lin, m: mul(&out, m) }
+                let fm = mul(&out, m);
+                Stage::Matrix { trc: trc.clone(), lin, m: fm, q: Q14Run::new(trc, &fm) }
             }
             Model::GrayTrc(trc) => Stage::Gray { trc: trc.clone(), lab: p.pcs == Pcs::Lab, rgb8: Vec::new() },
             Model::Lut(lut) => Stage::Lut { lut: lut.clone(), pcs: p.pcs },
@@ -192,8 +195,18 @@ impl Transform {
     }
 
     /// Convert straight RGBA in place (alpha untouched). A GRAY source reads the red channel; a CMYK source cannot
-    /// run over RGBA and leaves the pixels as they are (`apply_icc_to_srgb` refuses it by name first).
+    /// run over RGBA and leaves the pixels as they are (`apply_icc_to_srgb` refuses it by name first). A matrix/TRC
+    /// source runs in integers (KERNEL-ICC-INT, SR376: within 1 of [`Transform::apply_rgba_f32`]); GRAY and LUT
+    /// sources run as `apply_rgba_f32` does (KERNEL-ICC-INT-LUT owed).
     pub fn apply_rgba(&self, rgba: &mut [u8]) {
+        match &self.stage {
+            Stage::Matrix { q, .. } => q.run(rgba),
+            _ => self.apply_rgba_f32(rgba),
+        }
+    }
+
+    /// The f32 run (SR358's): the reference the integer run is held within 1 of.
+    pub fn apply_rgba_f32(&self, rgba: &mut [u8]) {
         match &self.stage {
             Stage::Matrix { lin, m, .. } => {
                 for px in rgba.chunks_exact_mut(4) {
@@ -231,4 +244,71 @@ impl Transform {
             }
         }
     }
+}
+
+// ── KERNEL-ICC-INT (LEDGER SR376): the integer run, ONE Q14 arithmetic shared with `display::DisplayTransform` ──
+//
+// A matrix/TRC source in DisplayTransform's shape (SR372): per-channel 256-entry u16 decode tables (the source TRC x
+// 65535, evaluated once at build: any monotone `Curve`), the folded 3x3 (colorants . Bradford D50 to D65 . XYZ to linear
+// sRGB) in Q14 accumulated in i64 and clamped, and sRGB's inverse TRC through the 65536-entry `encode_table` both sides
+// build with. No float per pixel (the kernel is soft-float).
+
+/// The integer run of a matrix/TRC source to sRGB.
+#[derive(Clone, Debug)]
+pub(crate) struct Q14Run {
+    /// The source TRC per channel, linear x 65535.
+    dec: [[u16; 256]; 3],
+    /// The folded source-to-linear-sRGB matrix in Q14.
+    m: [[i32; 3]; 3],
+    /// sRGB's inverse TRC over a 16-bit linear input.
+    enc: Vec<u8>,
+}
+
+impl Q14Run {
+    fn new(trc: &[Curve; 3], m: &M3) -> Q14Run {
+        let dec = core::array::from_fn(|c| core::array::from_fn(|v| (trc[c].eval(v as f32 / 255.0) * 65535.0 + 0.5) as u16));
+        Q14Run { dec, m: q14_matrix(m), enc: encode_table(&crate::profile::SRGB_TRC) }
+    }
+
+    /// Convert straight RGBA in place (alpha untouched; a trailing partial pixel passes).
+    fn run(&self, rgba: &mut [u8]) {
+        for px in rgba.chunks_exact_mut(4) {
+            let l = [self.dec[0][px[0] as usize] as i64, self.dec[1][px[1] as usize] as i64, self.dec[2][px[2] as usize] as i64];
+            for i in 0..3 {
+                px[i] = self.enc[q14_dot(&self.m[i], &l)];
+            }
+        }
+    }
+}
+
+/// A 3x3 in Q14 (rounded).
+pub(crate) fn q14_matrix(m: &M3) -> [[i32; 3]; 3] {
+    m.map(|r| r.map(|v| libm::roundf(v * 16384.0) as i32))
+}
+
+/// One Q14 row times a 16-bit linear triple, rounded and clamped to a 16-bit linear index.
+#[inline]
+pub(crate) fn q14_dot(r: &[i32; 3], l: &[i64; 3]) -> usize {
+    let v = (r[0] as i64 * l[0] + r[1] as i64 * l[1] + r[2] as i64 * l[2] + 8192) >> 14;
+    v.clamp(0, 65535) as usize
+}
+
+/// The inverse of `trc` to 8 bits over a 16-bit linear input: entry `v` is the code nearest (in code space) to
+/// linear `v / 65535` (moved from display.rs, SR372; the ONE builder both runs use).
+pub(crate) fn encode_table(trc: &Curve) -> Vec<u8> {
+    let mut th = [0f32; 255];
+    let mut run = 0f32;
+    for (k, t) in th.iter_mut().enumerate() {
+        run = run.max(trc.eval((k as f32 + 0.5) / 255.0) * 65535.0);
+        *t = run;
+    }
+    let mut out = Vec::with_capacity(65536);
+    let mut k = 0usize;
+    for v in 0..65536u32 {
+        while k < 255 && v as f32 >= th[k] {
+            k += 1;
+        }
+        out.push(k as u8);
+    }
+    out
 }

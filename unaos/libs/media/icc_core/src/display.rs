@@ -24,11 +24,12 @@
 //! for any monotone curve (`curv` gamma, `curv` table or `para`; a non-monotone table is held monotone by a running
 //! max), so no per-type closed form is needed. Identity ([`DisplayTransform::is_identity`]): the EDID's sRGB-default
 //! bit, or the matrix within 0.01 of I and every TRC within 1/255 of sRGB's at 17 points (`Profile::is_srgb`'s
-//! tolerances) — an sRGB panel is a no-op.
+//! tolerances) — an sRGB panel is a no-op. The Q14 arithmetic and the inverse-TRC builder (`q14_matrix`, `q14_dot`,
+//! `encode_table`) live in `transform.rs`, shared with the source side's integer run (KERNEL-ICC-INT, SR376).
 use alloc::vec::Vec;
 
 use crate::profile::{Curve, Model, Pcs, Profile, Refusal, SRGB_TRC, Space};
-use crate::transform::{D50, apply, bradford, inverse, mul};
+use crate::transform::{D50, apply, bradford, encode_table, inverse, mul, q14_dot, q14_matrix};
 
 type M3 = [[f32; 3]; 3];
 
@@ -98,26 +99,6 @@ pub fn colorants(chroma: &[[f32; 2]; 4]) -> Result<[[f32; 3]; 3], Refusal> {
     Ok(mul(&bradford(w, D50), &npm))
 }
 
-/// The inverse of `trc` to 8 bits over a 16-bit linear input: entry `v` is the panel code nearest (in code space) to
-/// linear `v / 65535`.
-fn encode_table(trc: &Curve) -> Vec<u8> {
-    let mut th = [0f32; 255];
-    let mut run = 0f32;
-    for (k, t) in th.iter_mut().enumerate() {
-        run = run.max(trc.eval((k as f32 + 0.5) / 255.0) * 65535.0);
-        *t = run;
-    }
-    let mut out = Vec::with_capacity(65536);
-    let mut k = 0usize;
-    for v in 0..65536u32 {
-        while k < 255 && v as f32 >= th[k] {
-            k += 1;
-        }
-        out.push(k as u8);
-    }
-    out
-}
-
 /// sRGB to one panel, ready to run over 8-bit pixels.
 #[derive(Clone, Debug)]
 pub struct DisplayTransform {
@@ -151,7 +132,7 @@ impl DisplayTransform {
             return Ok(DisplayTransform::identity());
         }
         let dec = core::array::from_fn(|k| (SRGB_TRC.eval(k as f32 / 255.0) * 65535.0 + 0.5) as u16);
-        let m = t.map(|r| r.map(|v| libm::roundf(v * 16384.0) as i32));
+        let m = q14_matrix(&t);
         let mut enc: Vec<Vec<u8>> = Vec::new();
         let mut pick = [0u8; 3];
         for c in 0..3 {
@@ -204,9 +185,7 @@ impl DisplayTransform {
     fn px(&self, s: [u8; 3]) -> [u8; 3] {
         let l = [self.dec[s[0] as usize] as i64, self.dec[s[1] as usize] as i64, self.dec[s[2] as usize] as i64];
         core::array::from_fn(|i| {
-            let r = &self.m[i];
-            let v = (r[0] as i64 * l[0] + r[1] as i64 * l[1] + r[2] as i64 * l[2] + 8192) >> 14;
-            self.enc[self.pick[i] as usize][v.clamp(0, 65535) as usize]
+            self.enc[self.pick[i] as usize][q14_dot(&self.m[i], &l)]
         })
     }
 

@@ -299,3 +299,91 @@ fn display_bgra_is_rgba_swapped() {
         assert_eq!([bgra[4 * p + 2], bgra[4 * p + 1], bgra[4 * p], bgra[4 * p + 3]], rgba[4 * p..4 * p + 4]);
     }
 }
+
+// KERNEL-ICC-INT + KERNEL-ICC-CACHE (LEDGER SR376): the matrix/TRC source run in integers (DisplayTransform's Q14 shape)
+// is held within 1 of the f32 run (`apply_rgba_f32`, SR358's) over a sweep of hand-built profiles; GRAY and LUT sources
+// are untouched; a `TransformCache` builds a profile once. Measured max |int - f32| over the sweep: 1 (five profiles, 18^3 grid + greys + ramps).
+fn sweep() -> Vec<u8> {
+    let mut v = Vec::new();
+    for r in (0..=255u32).step_by(16).chain([255]) {
+        for g in (0..=255u32).step_by(16).chain([255]) {
+            for b in (0..=255u32).step_by(16).chain([255]) {
+                v.extend([r as u8, g as u8, b as u8, 77]);
+            }
+        }
+    }
+    for k in 0..=255u8 {
+        v.extend([k, k, k, 255, k, 0, 0, 1, 0, k, 0, 2, 0, 0, k, 3]);
+    }
+    v
+}
+
+fn rows(m: [[f32; 3]; 3]) -> [[f32; 3]; 3] {
+    core::array::from_fn(|c| [m[0][c], m[1][c], m[2][c]])
+}
+
+#[test]
+fn int_run_within_one_of_f32() {
+    let adobe = rows([[0.60974, 0.20528, 0.14919], [0.31111, 0.62567, 0.06322], [0.01947, 0.06087, 0.74457]]);
+    let srgb_para = || kat::para(3, &[2.4, 1.0 / 1.055, 0.055 / 1.055, 1.0 / 12.92, 0.04045]);
+    let table: Vec<u16> = (0..4096).map(|i| ((i as f64 / 4095.0).powf(2.2) * 65535.0).round() as u16).collect();
+    let profiles = [
+        ("adobe-rgb-v2", kat::adobe_rgb_v2()),
+        ("srgb-primaries-para", kat::matrix_trc_v2(rows(colorants(&display::SRGB_XY).unwrap()), srgb_para())),
+        ("p3-para", kat::matrix_trc_v2(rows(colorants(&q10(P3_Q10)).unwrap()), srgb_para())),
+        ("adobe-gamma-1.8", kat::matrix_trc_v2(adobe, kat::curv_gamma(1.8))),
+        ("adobe-curv-table", kat::matrix_trc_v2(adobe, kat::curv_table(&table))),
+    ];
+    let mut worst = 0u8;
+    for (name, icc) in &profiles {
+        let t = Transform::from_icc(icc).unwrap();
+        let src = sweep();
+        let (mut a, mut b) = (src.clone(), src.clone());
+        t.apply_rgba(&mut a);
+        t.apply_rgba_f32(&mut b);
+        let w = a.iter().zip(&b).map(|(x, y)| x.abs_diff(*y)).max().unwrap();
+        assert!(w <= 1, "{name}: worst {w}");
+        assert!(a.iter().zip(&src).skip(3).step_by(4).all(|(x, y)| x == y), "{name}: alpha moved");
+        worst = worst.max(w);
+    }
+    eprintln!("KERNEL-ICC-INT max |int - f32| = {worst}");
+}
+
+#[test]
+fn int_run_only_on_matrix_trc() {
+    for icc in [kat::gray_v2(1.8), kat::lut16_cmyk_v2()] {
+        let t = Transform::from_icc(&icc).unwrap();
+        let src = sweep();
+        let (mut a, mut b) = (src.clone(), src.clone());
+        t.apply_rgba(&mut a);
+        t.apply_rgba_f32(&mut b);
+        assert_eq!(a, b);
+    }
+}
+
+#[test]
+fn transform_cache_builds_once() {
+    use icc_core::{TRANSFORM_CACHE_SLOTS, TransformCache};
+    let mut c = TransformCache::new();
+    let icc = kat::adobe_rgb_v2();
+    let (mut a, mut b) = (sweep(), sweep());
+    c.for_rgba(&icc).unwrap().unwrap().apply_rgba(&mut a);
+    c.for_rgba(&icc).unwrap().unwrap().apply_rgba(&mut b);
+    assert_eq!((c.builds(), &a), (1, &b), "the same profile twice: one build");
+    // An sRGB answer and a refusal are kept too.
+    assert!(c.for_rgba(&kat::srgb_v2()).unwrap().is_none());
+    assert!(c.for_rgba(&kat::srgb_v2()).unwrap().is_none());
+    assert_eq!(c.for_rgba(&kat::lut16_cmyk_v2()).err(), Some(Refusal::Unsupported("CMYK profile over RGB samples")));
+    assert_eq!(c.for_rgba(&kat::lut16_cmyk_v2()).err(), Some(Refusal::Unsupported("CMYK profile over RGB samples")));
+    assert_eq!(c.builds(), 3);
+    // Least recently used out: adobe, srgb, cmyk, then two more push adobe out (four slots).
+    assert_eq!(TRANSFORM_CACHE_SLOTS, 4);
+    c.for_rgba(&kat::gray_v2(1.8)).unwrap();
+    c.for_rgba(&kat::gray_v2(2.2)).unwrap();
+    assert_eq!(c.builds(), 5);
+    let _ = c.for_rgba(&kat::lut16_cmyk_v2());
+    assert_eq!(c.builds(), 5, "cmyk still kept");
+    c.for_rgba(&icc).unwrap();
+    assert_eq!(c.builds(), 6, "adobe was evicted and is rebuilt");
+    assert_ne!(icc_core::fnv1a64(b"a"), icc_core::fnv1a64(b"b"));
+}

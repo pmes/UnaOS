@@ -2198,7 +2198,7 @@ const ICCP_CHUNK_MAX: u64 = 1 << 20;
 pub(super) fn icc_xform(icc: Option<&[u8]>) -> (Option<icc_core::Transform>, String) {
     match icc {
         None => (None, String::from("srgb")),
-        Some(p) => match icc_core::Transform::for_rgba(p) {
+        Some(p) => match ICC_CACHE.lock().for_rgba(p) { // KERNEL-ICC-CACHE (LEDGER SR376): one build per profile across opens
             Ok(None) => (None, String::from("srgb")),
             Ok(Some(xf)) => (Some(xf), String::from("converted")),
             Err(e) => (None, alloc::format!("refused:{}", e).chars().map(|c| if c == ' ' { '-' } else { c }).collect()),
@@ -2235,3 +2235,7 @@ fn png_icc(mt: &crate::fs::vfs::MountTable, path: &str, iccp: Option<Span>, px: 
     }
     serial_println!("[image] icc {} bytes={} src=png-stream ms={} path={}", verdict, n, crate::arch::ms().saturating_sub(t0), path);
 }
+
+// KERNEL-ICC-CACHE (LEDGER SR376): the built transforms of the last four profiles (`icc_core::TransformCache`, fnv-keyed),
+// taken only by `icc_xform`, so every open (still, streamed PNG, wallpaper, animation, RAW preview) shares it.
+static ICC_CACHE: crate::sync::Mutex<icc_core::TransformCache> = crate::sync::Mutex::new(icc_core::TransformCache::new());
