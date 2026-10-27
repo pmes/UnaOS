@@ -851,3 +851,4 @@ refs/heads/exec-rmbp-editmap   1d99c4ae9 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-local-rastercore   3376c4c69 FOLDED 0f863677f 2026-10-27 (hw-rmbp)
 refs/heads/exec-rmbp-local-brushcore   e925b9a35 FOLDED dad77b031 2026-10-27 (hw-rmbp)
 refs/heads/exec-rmbp-local-adjustcore   e925b9a35 FOLDED 0e5264413 2026-10-27 (hw-rmbp)
+refs/heads/exec-rmbp-local-rastercli   85fb9145b IN-FLIGHT cut 2026-10-27

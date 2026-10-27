@@ -1,0 +1,26 @@
+# =====================================================================
+# CRATE: tools/raster/Cargo.toml
+# DESCRIPTION: RASTERCLI (LEDGER SR233) headless face of Facet's editor:
+#              runs a `--do` script against one raster_core Document
+#              (brush_core paints, adjust_core adjusts, pixel_core's PNG
+#              writer exports) and prints one JSON status line. No logic
+#              of its own; no third-party crates.
+# =====================================================================
+
+[package]
+name = "raster"
+version = "0.1.0"
+edition = "2024"
+license = "LGPL-3.0-or-later"
+
+[[bin]]
+name = "raster"
+path = "src/main.rs"
+
+[dependencies]
+raster_core = { path = "../../unaos/libs/media/raster_core", default-features = false }
+brush_core = { path = "../../unaos/libs/media/brush_core", default-features = false }
+adjust_core = { path = "../../unaos/libs/media/adjust_core", default-features = false }
+# The PNG writer raster_core's container uses (`png::encode::encode_rgba`); raster_core does not re-export it.
+# pixel_core has no `std` feature (`default = []`), so no `default-features` line.
+pixel_core = { path = "../../unaos/libs/media/pixel_core" }
