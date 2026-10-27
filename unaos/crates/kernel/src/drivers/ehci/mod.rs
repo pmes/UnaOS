@@ -18612,7 +18612,7 @@ pub fn service_ehci_hid() {
     // passes per second and this measures the gap BETWEEN them, which is the quantity `dark_gap_ms`
     // is made of; stamped here, beside its twin and above the lock, for the identical reason.
     pass_period_note();
-    let mut g = EHCI_HID.lock(); crate::pointerfeel::note_pass(crate::arch::ms()); crate::drivers::i8042::pump(); // ZENBOOKI8042 (Z3): the i8042 transport drains here, under this lock, into the one boot-keyboard decoder (`drivers::hidboot`, HIDBOOTSHARED B982) (LINE-NEUTRAL fold, code first). PUMPHOLE (B541): the pass cadence `tests pointerfeel` classes each report gap by — stamped AFTER the lock, so a pass that waited on it is charged the wait (LINE-NEUTRAL fold, code first)
+    let mut g = EHCI_HID.lock(); crate::pointerfeel::note_pass(crate::arch::ms()); crate::drivers::i8042::pump(); crate::drivers::dwi2c::touchpad::pump(); // ZENBOOKTOUCHPADREPORTS (zenbook-ledger Z18): the I2C-HID touchpad polls here, under this lock, into `pal::push_pointer_report` (LINE-NEUTRAL fold, code first). ZENBOOKI8042 (Z3): the i8042 transport drains here, under this lock, into the one boot-keyboard decoder (`drivers::hidboot`, HIDBOOTSHARED B982) (LINE-NEUTRAL fold, code first). PUMPHOLE (B541): the pass cadence `tests pointerfeel` classes each report gap by — stamped AFTER the lock, so a pass that waited on it is charged the wait (LINE-NEUTRAL fold, code first)
     let Some(ctrls) = g.as_mut() else { return };
     for c in ctrls.iter_mut() {
         unsafe { c.service() }; #[cfg(all(feature = "lidsleep", feature = "wc"))] c.port_suspend_service(); // USBSUSPEND (B766): the sleep state's SUSPEND/resume of this controller's root ports, under this lock; the body is `suspend` at the file tail. LINE-NEUTRAL fold, code first
@@ -20560,5 +20560,26 @@ pub mod mtreport {
             raw, k1.map_or(0, |f| f.fingers), w(swapped), w(three), d.0, d.1, if jump { "yes" } else { "no" },
             if press { "primary" } else { "FAIL" }, lift, tap, tap2, w(rebase12), w(honest), if over { "jump" } else { "FAIL" }, max, if ok { "PASS" } else { "FAIL" }
         );
+    }
+}
+
+/// ZENBOOKTOUCHPADREPORTS (zenbook-ledger Z18) — the pointer map's bit reader and the vendor lane's curve, LENT to the
+/// I2C-HID touchpad (`drivers::dwi2c::touchpad`), which rides this file's HID pass. Not copies: the touchpad's packet
+/// fields are read by `extract_bits` and its first finger's step goes through `finemotion::step2`, pre-scaled to the
+/// vendor lane's span. finemotion's own counters (`jump=` / `rebase=`) are not touched. File-tail append.
+pub(crate) mod lend {
+    /// A contact silent this long re-baselines (the vendor lane's re-touch rule).
+    pub(crate) const JUMP_GAP_MS: u64 = super::finemotion::JUMP_GAP_MS;
+
+    /// `size` bits at bit `off` of `data`, little-endian (the pointer map's reader).
+    pub(crate) fn bits(data: &[u8], off: u16, size: u8) -> u32 {
+        super::extract_bits(data, off, size)
+    }
+
+    /// One raw step of a pad whose x range is `span` units, in whole pixels, the Q8 remainder carried in `res`.
+    pub(crate) fn curve(r: (i32, i32), span: i32, res: &mut (i32, i32)) -> (i32, i32) {
+        let (s, k) = (super::finemotion::span() as i64, span.max(1) as i64);
+        let r = ((r.0 as i64 * s / k) as i32, (r.1 as i64 * s / k) as i32);
+        super::finemotion::step2(r, res).0
     }
 }
