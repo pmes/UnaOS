@@ -410,7 +410,7 @@ mod reg {
     #[inline]
     pub fn acquire(addr: usize, class: &AtomicU16, site: &'static Loc, at: &'static Loc, edges: bool) -> u16 { // KVMLAT (B578): `edges` = this acquire could have waited (`lock`), false for `try_lock`
         let Some((tid, cpu)) = who() else {
-            EARLY.fetch_add(1, Relaxed);
+            if ON.load(Relaxed) { UNGS.fetch_add(1, Relaxed); } else { EARLY.fetch_add(1, Relaxed); } // LOCKREGFULL (B1034): armed but unplaceable (foreign GS, cpu >= MAX_CPUS) counts apart from pre-arm (`untracked_gs=` vs `untracked_early=`). LINE-NEUTRAL fold
             return NONE;
         };
         let p = &PARTS[cpu];
@@ -444,7 +444,7 @@ mod reg {
         let i = loop {
             let free = !m;
             if free == 0 {
-                OVERFLOW.fetch_add(1, Relaxed); // LOCKREG2 (B823): this core's partition is full — this hold goes untimed
+                OVERFLOW.fetch_add(1, Relaxed); full_note(p, cpu, tid, addr, at); // LOCKREGFULL (B1034): counted in `untracked_full=` and the boot's first FULL noted for the scan's one line (reg tail). LOCKREG2 (B823): this core's partition is full — this hold goes untimed
                 return NONE;
             }
             let i = free.trailing_zeros();
@@ -457,7 +457,7 @@ mod reg {
         p.at[i].store(at as *const Loc as *mut Loc, Relaxed);
         p.t0[i].store(rdtsc(), Relaxed);
         p.intent[i].store(tid << 24 | (c as u64) << 8 | (cpu as u64 + 1) | WIN, Release); // REGGAP (B1021): CLAIMED with intent, WIN set for the CAS that follows; `flip` makes it the tag. LINE-NEUTRAL fold
-        p.tracked.store(p.tracked.load(Relaxed) + 1, Relaxed);
+        p.tracked.store(p.tracked.load(Relaxed) + 1, Relaxed); slot_high(cpu, m); // LOCKREGFULL (B1034): this partition's claimed-slot high-water (`slot_high=`; reg tail). LINE-NEUTRAL fold
         (cpu * PER + i) as u16
     }
 
@@ -705,7 +705,7 @@ mod reg {
             let (a, b) = ((v >> 48) as u16, ((v >> 32) & 0xFFFF) as u16);
             serial_println!("[lock] order-inversion a={} b={} by={}@cpu{}", Site(class_site(a)), Site(class_site(b)), (v >> 8) & 0xFF_FFFF, v & 0xFF);
         }
-        drain_long();
+        drain_long(); full_say(); // LOCKREGFULL (B1034): the boot's first partition-full, said once (reg tail). LINE-NEUTRAL fold
     }
 
     /// Up to 16 names for one line.
@@ -875,7 +875,7 @@ mod reg {
         let freed = if died && tid != 0 { release_task(tid, "tests lockreg") } else { 0 };
         let back = DIE.try_lock().is_some();
         let _ = DIE.take_poison(); let (gword, poisoned, retake_ms) = guard_leg(); let released = died && freed == 1 && back && gword == "ok"; let ((hword, fword), mword) = (heap_leg(), mount_leg()); let rword = crate::allocator::heappoison::reinit_leg(); let cword = if on { crate::drivers::sdhc::card_leg() } else { "skip(unarmed)" }; let bword = bind_leg(); let kword = if on { crate::allocator::heappoison::census_leg() } else { "skip(unarmed)" }; // BINDLIVE (B873): the bind task's real guard death (`bind_dead=`) and the census take's check (`census_check=`). HEAPREGION (B854): the free-first check (`free_first=`) and the scratch re-init (`heap_reinit=`). POISON2 (B846): the heap's and the mount's synthetic deaths, read released and checked (reg tail). STACKGUARD3 (B832): the death leg's mark cleared; the REAL guard leg (file tail) must pass too. LINE-NEUTRAL fold
-        let (mut acq, mut tracked, mut held_max) = (EARLY.load(Relaxed), 0u64, 0u64);
+        let fullw = full_kat(); let sh = slot_high_max(); let (mut acq, mut tracked, mut held_max) = (EARLY.load(Relaxed) + UNGS.load(Relaxed), 0u64, 0u64); // LOCKREGFULL (B1034): the FULL KAT (its counts taken back out before `overflow` is read), the high-water, every untracked acquire in `wrapped=`. LINE-NEUTRAL fold
         for p in PARTS.iter() {
             acq += p.acq.load(Relaxed);
             tracked += p.tracked.load(Relaxed);
@@ -888,9 +888,9 @@ mod reg {
         let max_at = HELD_MAX_AT.load(Relaxed);
         // SAFETY: `max_at` is a `&'static Location` or null.
         let max_at = if max_at.is_null() { None } else { Some(unsafe { &*max_at }) };
-        let pass = on && held_done && named && released && inv == 0 && overflow == 0 && leg_ok(hword) && leg_ok(mword) && leg_ok(rword) && leg_ok(fword) && (cword == "registered" || cword.starts_with("skip")) && leg_ok(bword) && leg_ok(kword);
+        let pass = on && held_done && named && released && inv == 0 && overflow == 0 && leg_ok(hword) && leg_ok(mword) && leg_ok(rword) && leg_ok(fword) && (cword == "registered" || cword.starts_with("skip")) && leg_ok(bword) && leg_ok(kword) && leg_ok(fullw);
         serial_println!(
-            ":: LOCKREG: locks={} wrapped={}/{} held_max_ms={} inversions={} released_on_death={} poisoned={} retake_ms={} heap_check={} mount_poison={} heap_reinit={} free_first={} named={} overflow={} -> {} :: held_max_at={} held_max_via={} held_max_by={}@cpu{} poison_slots={}/16 poison_lost={} card={} bind_dead={} census_check={}",
+            ":: LOCKREG: locks={} wrapped={}/{} held_max_ms={} inversions={} released_on_death={} poisoned={} retake_ms={} heap_check={} mount_poison={} heap_reinit={} free_first={} named={} overflow={} -> {} :: held_max_at={} held_max_via={} held_max_by={}@cpu{} poison_slots={}/16 poison_lost={} card={} bind_dead={} census_check={} untracked_early={} untracked_gs={} untracked_full={} slot_high={}@cpu{} full_kat={}",
             CLASS_N.load(Relaxed),
             tracked,
             acq,
@@ -902,7 +902,7 @@ mod reg {
             if pass { "PASS" } else { "FAIL" }, Site(class_site(HELD_MAX_CLASS.load(Relaxed))), // KVMLAT (B578): the longest hold's lock, by name (`?` = none recorded)
             Site(max_at),
             tag_tid(max_tag),
-            tag_cpu(max_tag), POISON_N.load(Acquire), POISON_LOST.load(Relaxed), cword, bword, kword
+            tag_cpu(max_tag), POISON_N.load(Acquire), POISON_LOST.load(Relaxed), cword, bword, kword, EARLY.load(Relaxed), UNGS.load(Relaxed), FULL.load(Relaxed), sh.0, sh.1, fullw
         );
         reggap_leg(); // REGGAP (B1021): the intent arm's KAT, its own `:: REGGAP:` line after LOCKREG's
     }
@@ -1412,6 +1412,222 @@ mod reg {
         });
         let pass = iword == "ok" && n == 1 && why == "intent-gap" && kword == "ok" && fword == "ok";
         serial_println!(":: REGGAP: intent={} flip={} walk_released={} why={} waiter_kept={} -> {} ::", iword, fword, n, why, kword, if pass { "PASS" } else { "FAIL" });
+    }
+
+    // ── LOCKREGFULL (rmbp-ledger B1034, BP-cores-20): an acquire the registry could not place is counted by its cause —
+    // pre-arm (`EARLY`), armed but unplaceable (`UNGS`: a foreign GS, cpu >= MAX_CPUS), this core's partition full
+    // (`FULL`, also in `overflow=`) — each partition keeps its claimed-slot high-water, and the boot's FIRST partition-full
+    // is noted lock-free in `acquire` and said ONCE by the scan (never inside `lock`/`release`), naming the refused taker
+    // and the partition's oldest hold (the leaker, if one exists). ──
+
+    /// Acquires taken armed whose caller the registry could not place (a foreign GS, cpu >= MAX_CPUS).
+    static UNGS: AtomicU64 = AtomicU64::new(0);
+    /// Acquires refused a slot because this core's partition was full (each also counted in `OVERFLOW`).
+    static FULL: AtomicU64 = AtomicU64::new(0);
+    /// Per partition: the most slots ever claimed at once (written by the owning core on claim).
+    static SLOT_HIGH: [core::sync::atomic::AtomicU8; MAX_CPUS] = [const { core::sync::atomic::AtomicU8::new(0) }; MAX_CPUS];
+    /// The once note's state: open, being written (`full_note`), pending (the scan says it), said.
+    const FN_OPEN: u8 = 0;
+    const FN_WRITING: u8 = 1;
+    const FN_PENDING: u8 = 2;
+    const FN_SAID: u8 = 3;
+    static FULL_STATE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(FN_OPEN);
+    /// The refused taker (`tid << 24 | (cpu + 1)`), its own slots in that partition, its acquire site.
+    static FULL_TAG: AtomicU64 = AtomicU64::new(0);
+    static FULL_DEPTH: AtomicU32 = AtomicU32::new(0);
+    static FULL_AT: AtomicPtr<Loc> = AtomicPtr::new(core::ptr::null_mut());
+    /// The partition's oldest hold at the refusal: its tag (or claimed intent), acquire site, age (TSC).
+    static FULL_OLD_TAG: AtomicU64 = AtomicU64::new(0);
+    static FULL_OLD_AT: AtomicPtr<Loc> = AtomicPtr::new(core::ptr::null_mut());
+    static FULL_OLD_SPAN: AtomicU64 = AtomicU64::new(0);
+    /// The note is the KAT's own (`kat=1`), and the lines said so far.
+    static FULL_KAT: AtomicBool = AtomicBool::new(false);
+    static FULL_SAID_N: AtomicU32 = AtomicU32::new(0);
+
+    /// A claim won with `m` the mask it CAS'd: this partition's high-water rises when the claim is a new depth.
+    #[inline(always)]
+    fn slot_high(cpu: usize, m: u32) {
+        let d = m.count_ones() as u8 + 1;
+        let h = &SLOT_HIGH[cpu];
+        if d > h.load(Relaxed) {
+            h.fetch_max(d, Relaxed);
+        }
+    }
+
+    /// The highest partition high-water and its cpu (`slot_high=<n>@cpu<c>`).
+    fn slot_high_max() -> (u8, usize) {
+        let mut best = (0u8, 0usize);
+        for (c, h) in SLOT_HIGH.iter().enumerate() {
+            let v = h.load(Relaxed);
+            if v > best.0 {
+                best = (v, c);
+            }
+        }
+        best
+    }
+
+    /// The tag a slot carries, or its claimed intent (WIN cleared) while it has none; 0 = empty.
+    #[inline]
+    fn slot_word(p: &Part, i: usize) -> u64 {
+        match p.tag[i].load(Acquire) {
+            0 => p.intent[i].load(Acquire) & !WIN,
+            t => t,
+        }
+    }
+
+    /// `acquire` found partition `p` full: counted, and the boot's FIRST refusal noted for the scan (atomics only — this
+    /// runs inside `Mutex::lock`/`try_lock`, so it never prints and never takes a lock).
+    #[cold]
+    #[inline(never)]
+    fn full_note(p: &Part, cpu: usize, tid: u64, addr: usize, at: &'static Loc) {
+        FULL.fetch_add(1, Relaxed);
+        if FULL_STATE.compare_exchange(FN_OPEN, FN_WRITING, AcqRel, Relaxed).is_err() {
+            return;
+        }
+        let (mut depth, mut old_i, mut old_t0) = (0u32, PER, u64::MAX);
+        for i in 0..PER {
+            let t = slot_word(p, i);
+            if t == 0 {
+                continue;
+            }
+            if tag_tid(t) == tid {
+                depth += 1;
+            }
+            let t0 = p.t0[i].load(Relaxed);
+            if t0 < old_t0 {
+                old_t0 = t0;
+                old_i = i;
+            }
+        }
+        FULL_TAG.store(tid << 24 | (cpu as u64 + 1), Relaxed);
+        FULL_DEPTH.store(depth, Relaxed);
+        FULL_AT.store(at as *const Loc as *mut Loc, Relaxed);
+        if old_i < PER {
+            FULL_OLD_TAG.store(slot_word(p, old_i), Relaxed);
+            FULL_OLD_AT.store(p.at[old_i].load(Relaxed), Relaxed);
+            FULL_OLD_SPAN.store(rdtsc().wrapping_sub(old_t0), Relaxed);
+        } else {
+            FULL_OLD_TAG.store(0, Relaxed);
+            FULL_OLD_AT.store(core::ptr::null_mut(), Relaxed);
+            FULL_OLD_SPAN.store(0, Relaxed);
+        }
+        FULL_KAT.store(addr == FULLKAT.addr(), Relaxed);
+        FULL_STATE.store(FN_PENDING, Release);
+    }
+
+    /// The scan's tail: a pending note is said ONCE — `[lock] registry full cpu= depth= at= by= oldest= oldest_at=
+    /// oldest_by= oldest_ms=` (+ ` kat=1` for the KAT's own).
+    fn full_say() {
+        if FULL_STATE.load(Acquire) != FN_PENDING || FULL_STATE.compare_exchange(FN_PENDING, FN_SAID, AcqRel, Relaxed).is_err() {
+            return;
+        }
+        let hz = crate::arch::apic::tsc_hz().max(1000);
+        let (tag, old) = (FULL_TAG.load(Relaxed), FULL_OLD_TAG.load(Relaxed));
+        let (at, old_at) = (FULL_AT.load(Relaxed), FULL_OLD_AT.load(Relaxed));
+        // SAFETY: both are `&'static Location`s or null.
+        let (at, old_at) = (if at.is_null() { None } else { Some(unsafe { &*at }) }, if old_at.is_null() { None } else { Some(unsafe { &*old_at }) });
+        let span = FULL_OLD_SPAN.load(Relaxed);
+        let old_ms = if span > (u64::MAX >> 1) { 0 } else { span / (hz / 1000) };
+        serial_println!(
+            "[lock] registry full cpu={} depth={} at={} by={} oldest={} oldest_at={} oldest_by={}@cpu{} oldest_ms={}{}",
+            tag_cpu(tag),
+            FULL_DEPTH.load(Relaxed),
+            Site(at),
+            tag_tid(tag),
+            Site(class_site(tag_class(old))),
+            Site(old_at),
+            tag_tid(old),
+            tag_cpu(old),
+            old_ms,
+            if FULL_KAT.load(Relaxed) { " kat=1" } else { "" }
+        );
+        FULL_SAID_N.fetch_add(1, Release);
+    }
+
+    // `tests lockreg`'s FULL leg: this core's partition filled on purpose with claims on FULLKAT.
+    static FULLKAT: super::Mutex<u32> = super::Mutex::new(0);
+
+    /// The FULL KAT (`full_kat=`), masked on this core: claim FULLKAT slots until `acquire` refuses (the "33rd" take),
+    /// take once more (refused again); both refusals counted, the partition's high-water 32; every claim abandoned and
+    /// the boot's counters (FULL, OVERFLOW, this core's acq/tracked, its high-water) given back. Unmasked: the next take
+    /// is tracked, and the note is said exactly ONCE by the scan; the latch the KAT's note took is re-opened, so a real
+    /// FULL later still gets its one line. A latch a real FULL already took: `skip(latched)`.
+    fn full_kat() -> &'static str {
+        if !ON.load(Acquire) {
+            return "skip(unarmed)";
+        }
+        let open = FULL_STATE.load(Acquire) == FN_OPEN;
+        let said0 = FULL_SAID_N.load(Acquire);
+        let w = crate::arch::without_interrupts(|| {
+            let Some((_, cpu)) = who() else { return "skip(no-cpu)" };
+            let p = &PARTS[cpu];
+            let (high0, f0) = (SLOT_HIGH[cpu].load(Relaxed), FULL.load(Relaxed));
+            let mut s = [NONE; PER];
+            let (mut n, mut refused, mut calls, mut claims) = (0usize, 0u64, 0u64, 0u64);
+            for _ in 0..PER + 2 {
+                let x = acquire(FULLKAT.addr(), &FULLKAT.class, FULLKAT.site, FULLKAT.site, false);
+                calls += 1;
+                if x == NONE {
+                    refused += 1;
+                    if refused == 2 {
+                        break;
+                    }
+                    continue;
+                }
+                claims += 1;
+                if n < PER {
+                    s[n] = x;
+                    n += 1;
+                } else {
+                    abandon(x);
+                }
+            }
+            let counted = refused == 2 && FULL.load(Relaxed) >= f0 + 2;
+            let high = SLOT_HIGH[cpu].load(Relaxed);
+            for &x in &s[..n] {
+                abandon(x);
+            }
+            if refused > 0 {
+                FULL.fetch_sub(refused, Relaxed);
+                OVERFLOW.fetch_sub(refused, Relaxed);
+            }
+            p.acq.store(p.acq.load(Relaxed).wrapping_sub(calls), Relaxed);
+            p.tracked.store(p.tracked.load(Relaxed).wrapping_sub(claims), Relaxed);
+            SLOT_HIGH[cpu].store(high0, Relaxed);
+            if refused == 0 {
+                "no-full"
+            } else if !counted {
+                "not-counted"
+            } else if high != PER as u8 {
+                "high-short"
+            } else {
+                "ok"
+            }
+        });
+        if w != "ok" {
+            return w;
+        }
+        if !FULLKAT.try_lock().map(|g| g.slot != NONE).unwrap_or(false) {
+            return "untracked-after";
+        }
+        if !open {
+            return "skip(latched)";
+        }
+        let t0 = crate::arch::ms();
+        while FULL_SAID_N.load(Acquire) == said0 && crate::arch::ms().saturating_sub(t0) <= 2 * SCAN_MS + 50 {
+            crate::arch::sched::sleep_ms(5);
+        }
+        let said = FULL_SAID_N.load(Acquire).wrapping_sub(said0);
+        if said == 1 && FULL_KAT.load(Relaxed) {
+            let _ = FULL_STATE.compare_exchange(FN_SAID, FN_OPEN, AcqRel, Relaxed);
+        }
+        if said == 0 {
+            "not-said"
+        } else if said > 1 {
+            "said-twice"
+        } else {
+            "ok"
+        }
     }
 }
 
