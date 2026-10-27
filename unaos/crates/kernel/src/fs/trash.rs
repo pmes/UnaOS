@@ -143,7 +143,7 @@ impl TrashFs for Mt {
                 0
             }
         };
-        self.0.write(path, off, bytes, P).map(|_| ()).map_err(err_s)
+        self.0.write_all_at(path, off, bytes, P).map(|_| ()).map_err(err_s) // VFSPUTREST (rmbp-ledger B969): the append completes or says `short-write`
     }
     fn case_insensitive(&self) -> bool {
         true // FAT homes fold case; the kernel has always compared Trash names without it
