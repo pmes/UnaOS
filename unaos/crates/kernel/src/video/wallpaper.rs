@@ -87,7 +87,7 @@ fn install(mut new: Option<Wall>) {
         SNAP.store(snap, Ordering::Release); #[cfg(target_arch = "x86_64")] crate::video::wm::desktop::veil_cache_invalidate();
         core::mem::replace(&mut *g, new)
     };
-    #[cfg(not(all(target_arch = "x86_64", feature = "wc")))] *RETIRED.lock() = old; #[cfg(all(target_arch = "x86_64", feature = "wc"))] retire(old); // RETIREDFREE (B845): the retire stamped and retagged in one RETIRED hold, freed by `wall-reap` after the grace. LINE-NEUTRAL fold, code first
+    #[cfg(not(all(target_arch = "x86_64", feature = "wc")))] { *RETIRED.lock() = old; } #[cfg(all(target_arch = "x86_64", feature = "wc"))] { retire(old); } // RETIREDFREE (B845): the retire stamped and retagged in one RETIRED hold, freed by `wall-reap` after the grace. LINE-NEUTRAL fold, code first
 }
 
 /// DESKTOPCRAFT (B631): the installed picture and its VEIL for the furniture painters (`None` = the flat colour).
