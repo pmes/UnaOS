@@ -151,16 +151,20 @@ const SHM_SC_SRLIMIT: u32 = 0x0006;
 const SHM_SC_LRLIMIT: u32 = 0x0007;
 const RETRY_SHORT: u16 = 7;
 const RETRY_LONG: u16 = 4;
-/// WIFIDHCP (B831): a frame's header and its body each own one `FRAME_STRIDE` region of `buf` (header region at
-/// `2i * FRAME_STRIDE`, body region right after it), so the body cap IS the stride: a 342-octet DHCP DISCOVER is
-/// 360 octets of air and fits. `buf` holds `BUF_FRAMES` such pairs (8 KiB).
-const FRAME_STRIDE: u64 = 512;
-pub(in crate::wifi) const FRAME_MAX: usize = FRAME_STRIDE as usize;
+/// STATIONMTU (B843; was WIFIDHCP B831's 512-octet pair): a frame's body owns one `BODY_STRIDE` region of `buf` (body `k`
+/// at `k * BODY_STRIDE`, 2 KiB aligned) and its TX header one `HDR_STRIDE` region after all the bodies (header `k` at
+/// `BUF_FRAMES * BODY_STRIDE + k * HDR_STRIDE`, >= `TXH_SIZE`), so the body cap IS the body stride: a 1514-octet Ethernet
+/// frame is 1532 octets of air and fits (the descriptor byte count is 13 bits, `DCTL1_BYTECNT`). `buf` holds `BUF_FRAMES`
+/// bodies and headers (17 KiB).
+const BODY_STRIDE: u64 = 2048;
+const HDR_STRIDE: u64 = 128;
+pub(in crate::wifi) const FRAME_MAX: usize = BODY_STRIDE as usize;
 const BUF_FRAMES: usize = 8;
-const BUF_BYTES: usize = BUF_FRAMES * 2 * FRAME_STRIDE as usize;
+const BUF_BYTES: usize = BUF_FRAMES * (BODY_STRIDE + HDR_STRIDE) as usize;
 /// Frame numbers on the descriptor ring: two slots each, 32 per lap. Frame `n` uses buffer pair `n % BUF_FRAMES`
-/// (free again once `fire_frame` returned: it waits for the frame's status) and slots `2n`/`2n+1`; the index wraps
-/// to slot 0 after slot 63, which carries DTABLEEND (`fill`; b43 `dma.c` next_slot).
+/// (free again once its status was read: `fire_frame` waits for it; the kept station's `Queue` keeps at most
+/// `BUF_FRAMES` frames in flight, and consecutive frame numbers mod 32 map to distinct pairs) and slots `2n`/`2n+1`;
+/// the index wraps to slot 0 after slot 63, which carries DTABLEEND (`fill`; b43 `dma.c` next_slot).
 pub(in crate::wifi) const FRAMES: usize = SLOTS / TX_SLOTS_PER_FRAME;
 
 /// How long the TX-status FIFO is polled after the poke (1 ms steps).
@@ -441,28 +445,9 @@ pub(super) fn fire_frame(bar0: u64, p: &Prep, frame: &[u8], ch: u16, n: usize, k
         serial_println!("[wifi10] tx-poke kind={} REFUSED reason=frame-slot(n={} len={}) — nothing written", kind, n, frame.len());
         return r;
     }
-    let slot = n * TX_SLOTS_PER_FRAME;
-    let cookie = COOKIE_RING1 | slot as u16;
-    let hdr = txhdr(frame, ch, cookie);
+    let (cookie, txindex, dptr, hdr) = post(bar0, p, frame, ch, n, w);
     r.cookie = cookie;
-    let hbuf = p.buf + (n % BUF_FRAMES) as u64 * 2 * FRAME_STRIDE;
-    let fbuf = hbuf + FRAME_STRIDE;
-    for (i, b) in hdr.iter().enumerate() {
-        unsafe { core::ptr::write_volatile((hbuf + i as u64) as *mut u8, *b) };
-    }
-    for (i, b) in frame.iter().enumerate() {
-        unsafe { core::ptr::write_volatile((fbuf + i as u64) as *mut u8, *b) };
-    }
-    unsafe {
-        fill(p.ring, slot, hbuf, TXH_SIZE, DCTL0_FRAMESTART, w);
-        fill(p.ring, slot + 1, fbuf, frame.len(), DCTL0_FRAMEEND | DCTL0_IRQ, w);
-    }
-    r.dptr_before = unsafe { r32(bar0, TXSTATUS) } & TXSTATDPTR;
-    // dma.c:1284-1285: wmb, then poke the slot AFTER the frame's last one (slot 0 after slot 63, the table end).
-    core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-    let txindex = ((slot + TX_SLOTS_PER_FRAME) % SLOTS) * DESC_BYTES;
-    unsafe { w32(bar0, TXINDEX, txindex as u32) };
-    w.dma += 1;
+    r.dptr_before = dptr;
     let mut hx = String::new();
     for b in hdr.iter().take(24) {
         hx.push_str(&alloc::format!("{:02x}", b));
@@ -479,19 +464,9 @@ pub(super) fn fire_frame(bar0: u64, p: &Prep, frame: &[u8], ch: u16, n: usize, k
             let v1 = unsafe { r32(bar0, XMITSTAT_1) };
             let ck = (v0 >> 16) as u16;
             if !r.status_seen && ck == cookie {
-                let tmp = v0 & 0xFFFF;
                 r.status_seen = true;
                 r.cookie_match = true;
-                r.frame_count = ((tmp & 0xF000) >> 12) as u8;
-                r.rts_count = ((tmp & 0x0F00) >> 8) as u8;
-                r.supp = ((tmp & 0x001C) >> 2) as u8;
-                r.acked = tmp & 0x0002 != 0;
-                r.intermediate = tmp & 0x0040 != 0;
-                r.for_ampdu = tmp & 0x0020 != 0;
-                r.seq = (v1 & 0xFFFF) as u16;
-                r.phy_stat = ((v1 & 0x00FF_0000) >> 16) as u8;
-                r.v0 = v0;
-                r.v1 = v1;
+                decode(v0, v1, &mut r);
                 if r.intermediate {
                     // main.c:823 — not final; keep reading for the final one.
                     r.status_seen = false;
@@ -508,8 +483,8 @@ pub(super) fn fire_frame(bar0: u64, p: &Prep, frame: &[u8], ch: u16, n: usize, k
             }
             continue;
         }
-        // WIFIDHCP (B831): a spin, not a sleep — the kept station sends from inside smolnet's STACK hold, which must
-        // never park its holder.
+        // WIFIDHCP (B831): a spin, not a sleep (it ran under smolnet's STACK hold); since STATIONTX (B843) only the pass's
+        // rungs wait here — the kept station posts through `queue` and reaps through `reap`.
         let _ = settle(1000);
         waited += 1;
     }
@@ -537,4 +512,160 @@ pub(super) fn stop(bar0: u64, w: &mut Writes) -> bool {
     }
     w.dma += 2;
     ok
+}
+
+// ── STATIONMTU / STATIONTX (rmbp-ledger B843): the one posting half and the one status decode, and the kept station's
+// asynchronous ring over them ─────────────────────────────────────────────────────────────────────────────────────
+
+/// The posting half of `fire_frame` (and of the kept station's `queue`): the header into pair `n % BUF_FRAMES`'s header
+/// region, the frame into its body region, slot 2n (FRAMESTART) and 2n+1 (FRAMEEND | IRQ) filled, `TXINDEX` <- the slot
+/// after (`dma.c:1186-1286`, `:213-217`). Precondition (the callers' guards): `n < FRAMES`, 24 <= len <= `FRAME_MAX`.
+/// Returns (the cookie `(controller + 1) << 12 | 2n`, the TXINDEX written, the engine's pointer before the poke, the header).
+fn post(bar0: u64, p: &Prep, frame: &[u8], ch: u16, n: usize, w: &mut Writes) -> (u16, usize, u32, [u8; TXH_SIZE]) {
+    let slot = n * TX_SLOTS_PER_FRAME;
+    let cookie = COOKIE_RING1 | slot as u16;
+    let hdr = txhdr(frame, ch, cookie);
+    let k = (n % BUF_FRAMES) as u64;
+    let fbuf = p.buf + k * BODY_STRIDE;
+    let hbuf = p.buf + BUF_FRAMES as u64 * BODY_STRIDE + k * HDR_STRIDE;
+    for (i, b) in hdr.iter().enumerate() {
+        unsafe { core::ptr::write_volatile((hbuf + i as u64) as *mut u8, *b) };
+    }
+    for (i, b) in frame.iter().enumerate() {
+        unsafe { core::ptr::write_volatile((fbuf + i as u64) as *mut u8, *b) };
+    }
+    unsafe {
+        fill(p.ring, slot, hbuf, TXH_SIZE, DCTL0_FRAMESTART, w);
+        fill(p.ring, slot + 1, fbuf, frame.len(), DCTL0_FRAMEEND | DCTL0_IRQ, w);
+    }
+    let dptr = unsafe { r32(bar0, TXSTATUS) } & TXSTATDPTR;
+    // dma.c:1284-1285: wmb, then poke the slot AFTER the frame's last one (slot 0 after slot 63, the table end).
+    core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+    let txindex = ((slot + TX_SLOTS_PER_FRAME) % SLOTS) * DESC_BYTES;
+    unsafe { w32(bar0, TXINDEX, txindex as u32) };
+    w.dma += 1;
+    (cookie, txindex, dptr, hdr)
+}
+
+/// `main.c:1341-1356` — one TX-status entry's fields into `r` (the caller matched the cookie, `v0 >> 16`).
+fn decode(v0: u32, v1: u32, r: &mut Report) {
+    let tmp = v0 & 0xFFFF;
+    r.frame_count = ((tmp & 0xF000) >> 12) as u8;
+    r.rts_count = ((tmp & 0x0F00) >> 8) as u8;
+    r.supp = ((tmp & 0x001C) >> 2) as u8;
+    r.acked = tmp & 0x0002 != 0;
+    r.intermediate = tmp & 0x0040 != 0;
+    r.for_ampdu = tmp & 0x0020 != 0;
+    r.seq = (v1 & 0xFFFF) as u16;
+    r.phy_stat = ((v1 & 0x00FF_0000) >> 16) as u8;
+    r.v0 = v0;
+    r.v1 = v1;
+}
+
+/// Frames the kept station may have posted and not yet reaped: every buffer pair, so a pair is never rewritten while
+/// the engine may still read it.
+const INFLIGHT: usize = BUF_FRAMES;
+/// Per-frame station lines (witness knob only): the first frames, then only a non-success (usbnet's `tx done` shape).
+const SAY_FIRST: u32 = 8;
+
+/// STATIONTX (B843) — the kept station's TX ring, usbnet's asynchronous shape: a frame is posted and returns at once;
+/// its status is reaped on a later pass (`reap`); `room` is the stack's back-pressure. Frames in flight carry
+/// consecutive ring numbers from `first`.
+#[derive(Default)]
+pub(super) struct Queue {
+    first: usize,
+    n: usize,
+    t0_ms: [u64; BUF_FRAMES],
+    pub posted: u32,
+    pub sent: u32,
+    pub acked: u32,
+    pub failed: u32,
+    pub stuck: u32,
+    pub full: u32,
+}
+
+impl Queue {
+    /// Room for one more frame right now.
+    pub fn room(&self) -> bool {
+        self.n < INFLIGHT
+    }
+    /// Frames posted and not yet reaped.
+    pub fn in_flight(&self) -> usize {
+        self.n
+    }
+    fn pop(&mut self) {
+        self.first = (self.first + 1) % FRAMES;
+        self.n -= 1;
+    }
+}
+
+fn cookie_of(n: usize) -> u16 {
+    COOKIE_RING1 | ((n % FRAMES) * TX_SLOTS_PER_FRAME) as u16
+}
+
+/// Post frame `n` on the ring for the kept station and return — no wait (`post`). `false` = refused (no room, counted
+/// `full`; or outside the ring's frame / length bounds), nothing written.
+pub(super) fn queue(bar0: u64, p: &Prep, q: &mut Queue, frame: &[u8], ch: u16, n: usize, now_ms: u64, w: &mut Writes) -> bool {
+    if !q.room() {
+        q.full += 1;
+        return false;
+    }
+    if n >= FRAMES || frame.len() > FRAME_MAX || frame.len() < 24 {
+        return false;
+    }
+    if q.n == 0 {
+        q.first = n;
+    }
+    q.t0_ms[n % BUF_FRAMES] = now_ms;
+    let (cookie, _, _, _) = post(bar0, p, frame, ch, n, w);
+    q.n += 1;
+    q.posted += 1;
+    if cfg!(feature = "witness") && q.posted <= SAY_FIRST {
+        serial_println!("[wifi10] station tx n={} len={} cookie={:#06x} q={}", n, frame.len(), cookie, q.n);
+    }
+    true
+}
+
+/// Reap the TX-status FIFO without waiting (`main.c:1334-1360`): each final entry naming an in-flight frame pops it and
+/// every earlier frame still unstatused (counted `failed`), the frame counted `sent` (and `acked`) or `failed`; then the
+/// oldest frame older than `TXSTAT_WAIT_MS` is abandoned (`stuck`), so back-pressure never wedges.
+pub(super) fn reap(bar0: u64, q: &mut Queue, now_ms: u64) {
+    for _ in 0..(2 * FRAMES) {
+        let v0 = unsafe { r32(bar0, XMITSTAT_0) };
+        if v0 & 0x0000_0001 == 0 {
+            break;
+        }
+        let v1 = unsafe { r32(bar0, XMITSTAT_1) };
+        let mut r = Report::default();
+        decode(v0, v1, &mut r);
+        let ck = (v0 >> 16) as u16;
+        if r.intermediate || q.n == 0 {
+            continue;
+        }
+        let Some(k) = (0..q.n).find(|&i| cookie_of(q.first + i) == ck) else { continue };
+        for _ in 0..k {
+            q.pop();
+            q.failed += 1;
+        }
+        q.pop();
+        let ok = r.frame_count > 0 && r.supp == 0;
+        if ok {
+            q.sent += 1;
+            if r.acked {
+                q.acked += 1;
+            }
+        } else {
+            q.failed += 1;
+        }
+        if cfg!(feature = "witness") && (q.sent + q.failed <= SAY_FIRST || !ok) {
+            serial_println!(
+                "[wifi10] station tx-status cookie={:#06x} frame_count={} acked={} supp={}",
+                ck, r.frame_count, r.acked as u8, SUPP_NAMES[(r.supp & 7) as usize]
+            );
+        }
+    }
+    if q.n > 0 && now_ms.saturating_sub(q.t0_ms[q.first % BUF_FRAMES]) >= TXSTAT_WAIT_MS as u64 {
+        q.pop();
+        q.stuck += 1;
+    }
 }

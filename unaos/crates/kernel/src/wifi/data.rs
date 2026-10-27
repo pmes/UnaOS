@@ -20,7 +20,8 @@
 //! the gateway the operator named is S10a; smoltcp's DHCP over the kept station is S10b (`verb.rs::wifidhcp`).
 //!
 //! The KATs are hand-assembled from the clause layouts (no captured data frame exists in `docs/dev/evidence`),
-//! so `n=6/6` certifies the judge and the codec against the standard's field order, not a replay of a capture.
+//! so `n=9/9` certifies the judge, the codec, the 1514-octet frame cap, the addr1 filter and the link watch (STATIONWATCH
+//! B843) against the standard's field order, not a replay of a capture.
 
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -38,7 +39,8 @@ const FC0_DATA: u8 = (w::SUBTYPE_DATA << 4) | (w::FC_TYPE_DATA << 2);
 const FC1_TODS: u8 = 0x01;
 const FC1_FROMDS: u8 = 0x02;
 
-/// An Ethernet II frame as the 802.11 data frame to the AP (ToDS): `ethernet_to_data`, then the ring's cap (`tx.rs` `FRAME_MAX`).
+/// An Ethernet II frame as the 802.11 data frame to the AP (ToDS): `ethernet_to_data`, then the ring's cap (`tx.rs` `FRAME_MAX`,
+/// the 2 KiB body region since STATIONMTU B843: a full 1514-octet Ethernet frame is 1532 octets of air).
 /// `None` = shorter than an Ethernet header, or longer than one TX ring frame (`Link` counts it `tx_toolong`).
 pub fn to_air(eth: &[u8], sta: Mac, bssid: Mac, seq: u16) -> Option<Vec<u8>> {
     let f = w::ethernet_to_data(eth, sta, bssid, seq)?;
@@ -49,7 +51,8 @@ pub fn to_air(eth: &[u8], sta: Mac, bssid: Mac, seq: u16) -> Option<Vec<u8>> {
 }
 
 /// A received frame judged as the AP's data frame to us, then `data_to_ethernet`: Data subtype 0 (§9.2.4.1.3),
-/// FromDS = 1 and ToDS = 0 (§9.2.4.1.4), addr1 = `sta` and addr2 = `bssid` (§9.3.2.1, Table 9-26), and the
+/// FromDS = 1 and ToDS = 0 (§9.2.4.1.4), addr1 = `sta` or a group address (STATIONRX B843: the BSS's broadcast /
+/// multicast, e.g. the gateway's ARP request for us) and addr2 = `bssid` (§9.3.2.1, Table 9-26), and the
 /// full RFC 1042 SNAP header (AA AA 03 00 00 00, §5.1.4). Anything else is `None` (the codec refuses Protected).
 pub fn from_air(frame: &[u8], sta: Mac, bssid: Mac) -> Option<Vec<u8>> {
     if frame.len() < 24 + 8 || frame[0] != FC0_DATA {
@@ -58,7 +61,7 @@ pub fn from_air(frame: &[u8], sta: Mac, bssid: Mac) -> Option<Vec<u8>> {
     if frame[1] & (FC1_TODS | FC1_FROMDS) != FC1_FROMDS {
         return None;
     }
-    if frame[4..10] != sta || frame[10..16] != bssid || frame[24..30] != w::SNAP_PREFIX {
+    if !to_us(frame, sta) || frame[10..16] != bssid || frame[24..30] != w::SNAP_PREFIX {
         return None;
     }
     w::data_to_ethernet(frame)
@@ -106,10 +109,16 @@ pub fn ipv4(word: Option<&str>) -> Option<[u8; 4]> {
     Some(ip)
 }
 
-/// Called by `rx::take` for every clean frame: a Data-type frame (§9.2.4.1.3) is kept, at most `KEEP`, for
-/// `Link::recv` to judge; nothing else is.
-pub fn keep(frame: &[u8], q: &mut Vec<Vec<u8>>) {
-    if frame.len() >= 24 && (frame[0] >> 2) & 0x3 == w::FC_TYPE_DATA && q.len() < KEEP {
+/// addr1 (§9.2.4.3) names this station: our MAC, or a group address (the I/G bit, bit 0 of octet 0, §9.2.4.3.2).
+fn to_us(frame: &[u8], sta: Mac) -> bool {
+    frame[4..10] == sta || frame[4] & 0x01 != 0
+}
+
+/// Called by `rx::take` for every clean frame: a Data-type frame (§9.2.4.1.3) whose addr1 is `sta` or a group address
+/// (STATIONRX B843: the receiver stays promiscuous, so the filter is here) is kept, at most `KEEP`, for `Link::recv`
+/// to judge; nothing else is.
+pub fn keep(frame: &[u8], sta: Mac, q: &mut Vec<Vec<u8>>) {
+    if frame.len() >= 24 && (frame[0] >> 2) & 0x3 == w::FC_TYPE_DATA && to_us(frame, sta) && q.len() < KEEP {
         q.push(frame.to_vec());
     }
 }
@@ -226,6 +235,61 @@ pub fn kat() -> (u8, u8, Option<&'static str>) {
     let mut s = rx.clone();
     s[29] = 0xF8;
     checks.push(("snap", from_air(&s, STA, BSSID).is_none()));
+    // 7. full-frame (STATIONMTU B843): a 1514-octet Ethernet frame (IPv4, 1500 octets of payload) -> 1514 - 14 + 24 + 8 =
+    //    1532 octets of air, within the ring's body region, FC 08 01, SNAP ending 08 00.
+    let mut big = alloc::vec![0x5Au8; 1514];
+    big[0..6].copy_from_slice(&GW_MAC);
+    big[6..12].copy_from_slice(&STA);
+    big[12..14].copy_from_slice(&[0x08, 0x00]);
+    checks.push(("full-frame", matches!(to_air(&big, STA, BSSID, 0), Some(f) if f.len() == 1532 && f.len() <= FRAME_MAX
+        && f[0] == 0x08 && f[1] == FC1_TODS && f[30..32] == [0x08, 0x00] && f[1531] == 0x5A)));
+    // 8. keep (STATIONRX B843): the reply to STA is kept; the same frame to another unicast station is not; to broadcast
+    //    it is kept and `from_air` accepts it (DA broadcast).
+    let mut kq: Vec<Vec<u8>> = Vec::new();
+    keep(&rx, STA, &mut kq);
+    keep(&a, STA, &mut kq);
+    let mut b = rx.clone();
+    b[4..10].copy_from_slice(&[0xFF; 6]);
+    keep(&b, STA, &mut kq);
+    checks.push(("keep", kq.len() == 2 && kq[0] == rx && kq[1] == b
+        && matches!(from_air(&b, STA, BSSID), Some(e) if e[0..6] == [0xFF; 6] && e[6..12] == GW_MAC)));
+    // 9. watch (STATIONWATCH B843): a Deauthentication (FC c0 00, reason 7) from the BSSID to STA -> deauth; a
+    //    Disassociation (FC a0 00, reason 8) -> disassoc; a Beacon (interval 100 TU) then 100 ms ticks: none at 500 ms,
+    //    beacon-loss past 10 intervals (1024 ms); one 5 s gap between ticks restarts the clock.
+    let mgmt = |fc0: u8, a1: Mac, tail: &[u8]| {
+        let mut f = alloc::vec![fc0, 0x00, 0x00, 0x00];
+        f.extend_from_slice(&a1);
+        f.extend_from_slice(&BSSID);
+        f.extend_from_slice(&BSSID);
+        f.extend_from_slice(&[0x20, 0x00]);
+        f.extend_from_slice(tail);
+        f
+    };
+    let deauth = mgmt(0xC0, STA, &[7u8, 0][..]);
+    let disassoc = mgmt(0xA0, STA, &[8u8, 0][..]);
+    let beacon = mgmt(FC0_BEACON, [0xFF; 6], &[0u8, 0, 0, 0, 0, 0, 0, 0, 100, 0, 0x01, 0x00][..]);
+    let mut wd = Watch::new(BSSID, 0);
+    wd.frame(&deauth, STA, 10);
+    let mut wa = Watch::new(BSSID, 0);
+    wa.frame(&disassoc, STA, 10);
+    let mut wb = Watch::new(BSSID, 0);
+    wb.frame(&beacon, STA, 0);
+    let mut at500 = None;
+    let mut lost_at = 0u64;
+    for t in (100..=1200u64).step_by(100) {
+        let r = wb.tick(t);
+        if t == 500 {
+            at500 = r;
+        }
+        if r.is_some() && lost_at == 0 {
+            lost_at = t;
+        }
+    }
+    let mut wg = Watch::new(BSSID, 0);
+    let gap = (wg.tick(100), wg.tick(5100), wg.tick(5200));
+    checks.push(("watch", wd.tick(20) == Some("deauth") && wd.reason == 7 && wa.tick(20) == Some("disassoc") && wa.reason == 8
+        && wb.beacons == 1 && wb.tu == 100 && at500.is_none() && lost_at == 1100 && wb.tick(1300) == Some("beacon-loss")
+        && gap == (None, None, None)));
     let mut pass = 0u8;
     let mut first = None;
     for (name, ok) in checks.iter() {
@@ -268,9 +332,10 @@ pub fn witness() {
 /// `None` — `drivers/e1000.rs`'s fallback chain is lazy), so smoltcp's frames carry the station MAC.
 static BOUND: AtomicBool = AtomicBool::new(false);
 
-/// The station outlived `wifi10()`'s pass (S10a LINKED; `bringup/join.rs::keep`).
+/// The station outlived `wifi10()`'s pass (S10a LINKED; `bringup/join.rs::keep`) and its link is up (STATIONWATCH B843: a
+/// station that heard a deauth / disassoc or lost the beacons is kept no more).
 pub fn kept() -> bool {
-    super::bringup::station_mac().is_some()
+    super::bringup::station_mac().map_or(false, |(_, up)| up)
 }
 
 /// The smoltcp stack rides the station (see `BOUND`).
@@ -279,11 +344,12 @@ pub fn bound() -> bool {
 }
 
 /// `e1000::hw_addr`'s fallback after usbnet's: (the SPROM MAC, 0.0.0.0 — the only honest address before a lease,
-/// RFC 2131 §4.1 — link up), or `None` while no station is kept.
+/// RFC 2131 §4.1 — link up, or link DOWN once the station's watch dropped it, STATIONWATCH B843), or `None` while no
+/// station is kept.
 pub fn hw_addr() -> Option<([u8; 6], [u8; 4], bool)> {
-    let m = super::bringup::station_mac()?;
+    let (m, up) = super::bringup::station_mac()?;
     BOUND.store(true, Ordering::Relaxed);
-    Some((m, [0; 4], true))
+    Some((m, [0; 4], up))
 }
 
 /// `e1000::raw_rx`'s fallback after usbnet's: the next data frame to us as Ethernet.
@@ -307,6 +373,12 @@ pub fn raw_tx(frame: &[u8]) -> bool {
 /// smolnet's poll gate (`rx_ready`): the receiver drained once and a data frame kept.
 pub fn rx_ready() -> bool {
     bound() && super::bringup::station_pending()
+}
+
+/// smolnet's `tx_ready` for the station (STATIONTX B843): room on the station's asynchronous TX ring right now (its
+/// statuses reaped first); `false` = back-pressure, smoltcp keeps the packet for a later poll.
+pub fn tx_ready() -> bool {
+    bound() && super::bringup::station_tx_room()
 }
 
 /// S10b this boot: 0 not run, 1 bound (a lease over the station), 2 SILENT, 3 not attempted.
@@ -342,11 +414,83 @@ pub fn kat_dhcp() -> (bool, bool, usize, Option<&'static str>) {
             f[4..10].copy_from_slice(&STA);
             f[10..16].copy_from_slice(&BSSID);
             f[16..22].copy_from_slice(&STA);
-            keep(&f, &mut q);
+            keep(&f, STA, &mut q);
             matches!(l.recv(&mut q, &mut back), Some(m) if m == n && back[..6] == STA && back[6..12] == STA && back[12..m] == disc[12..n])
         }
         _ => false,
     };
     let first = if n != 342 { Some("discover-len") } else if !kat_ok { Some("to-air") } else if !stub_ok { Some("stub") } else { None };
     (kat_ok, stub_ok, n, first)
+}
+
+// ── STATIONWATCH (rmbp-ledger B843): the kept station's link watch — pure, fed by `join::hear`, ticked on the station's
+// own drains under `STATION` (no timer task, no sleep) ────────────────────────────────────────────────────────────
+
+/// FC octet 0 of a Beacon (§9.2.4.1.3): management, subtype 8.
+const FC0_BEACON: u8 = w::SUBTYPE_BEACON << 4;
+/// Beacon loss: no beacon from the BSSID for this many beacon intervals.
+pub const LOST_BEACONS: u64 = 10;
+/// The beacon interval assumed until a beacon names its own (§9.4.1.3, in TU of 1024 us).
+const TU_DEFAULT: u16 = 100;
+
+/// The link watch: a Deauthentication / Disassociation from the BSSID to the station (`assoc::refusal`, §9.3.3.12 /
+/// §9.3.3.4) or `LOST_BEACONS` beacon intervals with no beacon from the BSSID ends the link.
+pub struct Watch {
+    bssid: Mac,
+    /// The beacon interval in TU, from the last beacon's field (§9.3.3.3: octets 32..34 after the 8-octet timestamp).
+    pub tu: u16,
+    heard_ms: u64,
+    tick_ms: u64,
+    pub beacons: u32,
+    /// The refusal's reason code (§9.4.1.7); 0 for beacon loss.
+    pub reason: u16,
+    lost: Option<&'static str>,
+}
+
+impl Watch {
+    pub fn new(bssid: Mac, now_ms: u64) -> Watch {
+        Watch { bssid, tu: TU_DEFAULT, heard_ms: now_ms, tick_ms: now_ms, beacons: 0, reason: 0, lost: None }
+    }
+
+    fn window_ms(&self) -> u64 {
+        LOST_BEACONS * self.tu as u64 * 1024 / 1000
+    }
+
+    /// Every clean management frame the receiver took: a Beacon whose addr3 is the BSSID restarts the clock (its interval
+    /// field read when the frame carries it — a short beacon keeps the last interval); a refusal to `sta` is the loss.
+    pub fn frame(&mut self, f: &[u8], sta: Mac, now_ms: u64) {
+        if self.lost.is_some() || f.len() < 24 {
+            return;
+        }
+        if f[0] == FC0_BEACON && f[16..22] == self.bssid {
+            if f.len() >= 34 {
+                let tu = u16::from_le_bytes([f[32], f[33]]);
+                if tu != 0 {
+                    self.tu = tu;
+                }
+            }
+            self.beacons += 1;
+            self.heard_ms = now_ms;
+            return;
+        }
+        if let Some((why, reason)) = super::assoc::refusal(f, sta, self.bssid) {
+            self.lost = Some(why);
+            self.reason = reason;
+        }
+    }
+
+    /// After each drain: the loss (`deauth` / `disassoc` / `beacon-loss`), else `None`. A gap between ticks longer than
+    /// half the window restarts the clock — an undrained receiver is not evidence that the beacons stopped.
+    pub fn tick(&mut self, now_ms: u64) -> Option<&'static str> {
+        if self.lost.is_none() {
+            let win = self.window_ms();
+            if now_ms.saturating_sub(self.tick_ms) > win / 2 {
+                self.heard_ms = now_ms;
+            } else if now_ms.saturating_sub(self.heard_ms) > win {
+                self.lost = Some("beacon-loss");
+            }
+            self.tick_ms = now_ms;
+        }
+        self.lost
+    }
 }
