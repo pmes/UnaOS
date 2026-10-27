@@ -5,7 +5,7 @@
 // INSTALLERCARD (LEDGER SR414): face (a) of the UnaOS_Installer vessel — put UnaOS on a card from a Mac or a
 // Linux box. The card face ENCODES NOTHING: the image is the one `./arroyo esp-x86` lays under UNAOS_UNAFS=1
 // (`unaos/target/unaos-x86-card.img`, GPT p1 ESP + p2 UnaFS, built by `tools/una-card` over amber_core); the
-// devices are Amber's (`amber_bytes::disks` on Linux; `diskutil -plist` read here on macOS, AMBER-PLIST owed);
+// devices are Amber's (`amber_bytes::disks::list()` on Linux and macOS, AMBERPLIST SR417);
 // the device is opened only through Amber's write policy (`amber_bytes::policy::Policy`: the typed confirmation
 // is `yes_i_mean_it`, the picked device the sole allowlist entry, never while mounted); every byte goes through
 // amber_core's `Block` (`FileBlock`) in `ClonePlan::chunks` steps of 4 MiB, then `flush` (sync_all), a read-back
@@ -104,15 +104,15 @@ pub fn phrase_ok(dev: &Device, typed: &str) -> bool {
     !typed.trim().is_empty() && norm(typed) == norm(&dev.phrase())
 }
 
-/// Linux: Amber's sysfs enumeration, judged.
+/// Amber's enumeration (sysfs on Linux, `diskutil -plist` on macOS), judged: the ONE mapping for both OSes.
 pub fn devices_from_disks(disks: Vec<amber_bytes::disks::DiskInfo>) -> Vec<Device> {
     disks
         .into_iter()
         .map(|d| {
-            let holds_os = d.mounts.iter().any(|m| OS_MOUNTS.contains(&m.as_str()));
+            let holds_os = d.os_internal || d.mounts.iter().any(|m| OS_MOUNTS.contains(&m.as_str()) || m.starts_with("/System"));
             let bytes = d.bytes();
             Device {
-                internal: d.virtual_dev || !d.removable,
+                internal: d.virtual_dev || d.internal,
                 model: format!("{} {}", d.vendor, d.model).trim().to_string(),
                 removable: d.removable && !d.virtual_dev,
                 id: d.name,
@@ -125,46 +125,6 @@ pub fn devices_from_disks(disks: Vec<amber_bytes::disks::DiskInfo>) -> Vec<Devic
         .collect()
 }
 
-/// macOS: `diskutil list -plist external physical` + one `diskutil info -plist <id>` per whole disk
-/// (`infos` maps the id to that text). A disk with no info is judged internal (refused), never guessed writable.
-pub fn devices_from_plists(list: &str, infos: &[(String, String)]) -> Vec<Device> {
-    let Some(root) = parse_plist(list) else { return Vec::new() };
-    let mut out = Vec::new();
-    for whole in root.get("AllDisksAndPartitions").map(Pv::items).unwrap_or_default() {
-        let Some(id) = whole.get("DeviceIdentifier").and_then(Pv::str) else { continue };
-        let mut mounts = Vec::new();
-        let mut take = |v: &Pv| {
-            if let Some(m) = v.get("MountPoint").and_then(Pv::str).filter(|m| !m.is_empty()) {
-                mounts.push(m.to_string());
-            }
-        };
-        take(whole);
-        for key in ["Partitions", "APFSVolumes"] {
-            for p in whole.get(key).map(Pv::items).unwrap_or_default() {
-                take(p);
-            }
-        }
-        let info = infos.iter().find(|(k, _)| k == id).and_then(|(_, t)| parse_plist(t));
-        let flag = |k: &str| info.as_ref().and_then(|i| i.get(k)).and_then(Pv::bool);
-        let internal = flag("Internal").unwrap_or(true);
-        let removable = flag("RemovableMedia").or(flag("Removable")).unwrap_or(false) || (!internal && flag("Ejectable").unwrap_or(false));
-        let os_internal = flag("OSInternalMedia").unwrap_or(false) || whole.get("OSInternal").and_then(Pv::bool).unwrap_or(false);
-        let bytes = info
-            .as_ref()
-            .and_then(|i| i.get("TotalSize").or(i.get("Size")))
-            .and_then(Pv::int)
-            .or(whole.get("Size").and_then(Pv::int))
-            .unwrap_or(0);
-        let node = info.as_ref().and_then(|i| i.get("DeviceNode")).and_then(Pv::str).map(PathBuf::from).unwrap_or_else(|| PathBuf::from(format!("/dev/{id}")));
-        let model = info.as_ref().and_then(|i| i.get("MediaName")).and_then(Pv::str).unwrap_or("").trim().to_string();
-        let holds_os = os_internal || mounts.iter().any(|m| OS_MOUNTS.contains(&m.as_str()) || m.starts_with("/System"));
-        // An internal SD slot (RemovableMedia on an Internal bus) is a card; an internal fixed disk is not.
-        let internal = internal && !removable;
-        out.push(Device { id: id.to_string(), node, bytes, removable, internal, model, mounts, holds_os });
-    }
-    out
-}
-
 /// The host's candidate disks, every one judged (refused ones are listed with their reason).
 pub fn devices() -> Vec<Device> {
     let devs = host_devices();
@@ -173,31 +133,15 @@ pub fn devices() -> Vec<Device> {
     devs
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn host_devices() -> Vec<Device> {
     amber_bytes::disks::list().map(devices_from_disks).unwrap_or_default()
-}
-
-#[cfg(target_os = "macos")]
-fn host_devices() -> Vec<Device> {
-    let Some(list) = run_out("diskutil", &["list", "-plist", "external", "physical"]) else { return Vec::new() };
-    let ids: Vec<String> = parse_plist(&list)
-        .and_then(|r| r.get("WholeDisks").map(|w| w.items().iter().filter_map(Pv::str).map(str::to_string).collect()))
-        .unwrap_or_default();
-    let infos: Vec<(String, String)> = ids.iter().filter_map(|id| run_out("diskutil", &["info", "-plist", id]).map(|t| (id.clone(), t))).collect();
-    devices_from_plists(&list, &infos)
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn host_devices() -> Vec<Device> {
     println!("{}", refused_line("windows-unbuilt", None));
     Vec::new()
-}
-
-#[cfg(target_os = "macos")]
-fn run_out(cmd: &str, args: &[&str]) -> Option<String> {
-    let o = std::process::Command::new(cmd).args(args).output().ok()?;
-    o.status.success().then(|| String::from_utf8_lossy(&o.stdout).into_owned())
 }
 
 fn run_ok(cmd: &str, args: &[&str]) -> bool {
@@ -208,146 +152,6 @@ fn run_ok(cmd: &str, args: &[&str]) -> bool {
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
-}
-
-// ── the plist subset (diskutil's XML: dict / array / string / integer / true / false) ───────────
-
-/// A plist value; `Other` is any element the card face never reads (`real`, `data`, `date`).
-#[derive(Clone, Debug, PartialEq)]
-pub enum Pv {
-    Dict(Vec<(String, Pv)>),
-    Array(Vec<Pv>),
-    Str(String),
-    Int(i64),
-    Bool(bool),
-    Other,
-}
-
-impl Pv {
-    pub fn get(&self, key: &str) -> Option<&Pv> {
-        match self {
-            Pv::Dict(kv) => kv.iter().find(|(k, _)| k == key).map(|(_, v)| v),
-            _ => None,
-        }
-    }
-    pub fn items(&self) -> &[Pv] {
-        match self {
-            Pv::Array(v) => v,
-            _ => &[],
-        }
-    }
-    pub fn str(&self) -> Option<&str> {
-        match self {
-            Pv::Str(s) => Some(s),
-            _ => None,
-        }
-    }
-    pub fn int(&self) -> Option<u64> {
-        match self {
-            Pv::Int(i) => u64::try_from(*i).ok(),
-            _ => None,
-        }
-    }
-    pub fn bool(&self) -> Option<bool> {
-        match self {
-            Pv::Bool(b) => Some(*b),
-            _ => None,
-        }
-    }
-}
-
-/// Parse an XML property list's root value.
-pub fn parse_plist(text: &str) -> Option<Pv> {
-    let start = text.find("<plist")?;
-    let mut p = Px { s: text, i: start };
-    p.tag()?; // <plist version="1.0">
-    p.value()
-}
-
-struct Px<'a> {
-    s: &'a str,
-    i: usize,
-}
-
-impl<'a> Px<'a> {
-    /// The next tag's inside (`dict`, `/dict`, `true/`), skipping text, comments and declarations.
-    fn tag(&mut self) -> Option<&'a str> {
-        loop {
-            let open = self.s[self.i..].find('<')? + self.i;
-            if self.s[open..].starts_with("<!--") {
-                self.i = self.s[open..].find("-->")? + open + 3;
-                continue;
-            }
-            let close = self.s[open..].find('>')? + open;
-            self.i = close + 1;
-            let inner = &self.s[open + 1..close];
-            if inner.starts_with('?') || inner.starts_with('!') {
-                continue;
-            }
-            return Some(inner.trim());
-        }
-    }
-    /// Text up to `</name>`, consumed with the closing tag.
-    fn text(&mut self, name: &str) -> Option<String> {
-        let end = format!("</{name}>");
-        let at = self.s[self.i..].find(&end)? + self.i;
-        let raw = &self.s[self.i..at];
-        self.i = at + end.len();
-        Some(unescape(raw))
-    }
-    fn value(&mut self) -> Option<Pv> {
-        let t = self.tag()?;
-        self.value_from(t)
-    }
-    fn value_from(&mut self, t: &str) -> Option<Pv> {
-        let name = t.split_whitespace().next().unwrap_or("");
-        let empty = t.ends_with('/');
-        let name = name.trim_end_matches('/');
-        match name {
-            "true" => Some(Pv::Bool(true)),
-            "false" => Some(Pv::Bool(false)),
-            "dict" if empty => Some(Pv::Dict(Vec::new())),
-            "array" if empty => Some(Pv::Array(Vec::new())),
-            "string" if empty => Some(Pv::Str(String::new())),
-            "string" => self.text("string").map(Pv::Str),
-            "integer" => self.text("integer").and_then(|s| s.trim().parse().ok()).map(Pv::Int),
-            "dict" => {
-                let mut kv = Vec::new();
-                loop {
-                    let t = self.tag()?;
-                    if t == "/dict" {
-                        return Some(Pv::Dict(kv));
-                    }
-                    if t != "key" {
-                        return None;
-                    }
-                    let k = self.text("key")?;
-                    let v = self.value()?;
-                    kv.push((k, v));
-                }
-            }
-            "array" => {
-                let mut v = Vec::new();
-                loop {
-                    let t = self.tag()?;
-                    if t == "/array" {
-                        return Some(Pv::Array(v));
-                    }
-                    v.push(self.value_from(t)?);
-                }
-            }
-            _ if empty => Some(Pv::Other),
-            "" => None,
-            other => {
-                self.text(other)?;
-                Some(Pv::Other)
-            }
-        }
-    }
-}
-
-fn unescape(s: &str) -> String {
-    s.replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&apos;", "'").replace("&amp;", "&")
 }
 
 // ── image, write, verify, eject ─────────────────────────────────────────────────────────────────
@@ -746,9 +550,10 @@ mod tests {
     use super::*;
     use std::fs;
 
-    const LIST: &str = include_str!("../tests/fixtures/diskutil-list-external.plist");
-    const DISK4: &str = include_str!("../tests/fixtures/diskutil-info-disk4.plist");
-    const DISK0: &str = include_str!("../tests/fixtures/diskutil-info-disk0.plist");
+    // The diskutil fixtures live with the reader in Amber Bytes (AMBERPLIST SR417).
+    const LIST: &str = include_str!("../../../handlers/amber_bytes/tests/fixtures/diskutil-list-external.plist");
+    const DISK4: &str = include_str!("../../../handlers/amber_bytes/tests/fixtures/diskutil-info-disk4.plist");
+    const DISK0: &str = include_str!("../../../handlers/amber_bytes/tests/fixtures/diskutil-info-disk0.plist");
     const IMG4G: u64 = 4_500 << 20;
 
     fn scratch(name: &str) -> PathBuf {
@@ -759,23 +564,9 @@ mod tests {
     }
 
     #[test]
-    fn plist_parses_diskutil_shapes() {
-        let r = parse_plist(LIST).unwrap();
-        let whole: Vec<&str> = r.get("WholeDisks").unwrap().items().iter().filter_map(Pv::str).collect();
-        assert_eq!(whole, ["disk0", "disk4"]);
-        let i = parse_plist(DISK4).unwrap();
-        assert_eq!(i.get("MediaName").and_then(Pv::str), Some("SD Card Reader"));
-        assert_eq!(i.get("Size").and_then(Pv::int), Some(63_864_569_856));
-        assert_eq!(i.get("MountPoint").and_then(Pv::str), Some(""));
-        assert_eq!(i.get("Internal").and_then(Pv::bool), Some(false));
-        assert_eq!(parse_plist("<plist><string>a &amp; b</string></plist>"), Some(Pv::Str("a & b".into())));
-        assert_eq!(parse_plist("not a plist"), None);
-    }
-
-    #[test]
     fn macos_devices_judged() {
         let infos = vec![("disk0".to_string(), DISK0.to_string()), ("disk4".to_string(), DISK4.to_string())];
-        let d = devices_from_plists(LIST, &infos);
+        let d = devices_from_disks(amber_bytes::disks::list_from_plists(LIST, &infos));
         assert_eq!(d.len(), 2);
         let (ssd, sd) = (&d[0], &d[1]);
         assert_eq!(ssd.id, "disk0");
@@ -788,7 +579,7 @@ mod tests {
         assert_eq!(sd.refusal(IMG4G), None);
         assert_eq!(sd.phrase(), "63.9 GB disk4");
         // No info for a disk: judged internal, never guessed writable.
-        let blind = devices_from_plists(LIST, &[]);
+        let blind = devices_from_disks(amber_bytes::disks::list_from_plists(LIST, &[]));
         assert!(blind.iter().all(|d| d.refusal(0) == Some("system-disk")));
     }
 

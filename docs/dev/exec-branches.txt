@@ -1103,4 +1103,4 @@ refs/heads/exec-rmbp-clockcoremaskcore   b2cdaad4d FOLDED-BY-HAND (this commit) 
 refs/heads/exec-rmbp-gen7slotnohold   59915baad FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-preemptauditunafsleg   55b7df91d FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-wifileavebuild   ac9fa5580 FOLDED-BY-HAND (this commit) 2026-10-27
-refs/heads/exec-rmbp-amberplist   b1942a9da IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-amberplist   d62533d98 FOLDED-BY-HAND (this commit) 2026-10-27
