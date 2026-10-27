@@ -986,7 +986,7 @@ fn main() -> Status { #[cfg(target_arch = "x86_64")] let tsc_loader_entry: u64 =
         edid_block,
         edid_block_valid,
         edid_total_len,
-        boot_volume_serial, #[cfg(target_arch = "x86_64")] tsc_loader_entry, #[cfg(target_arch = "x86_64")] tsc_loader_read, #[cfg(target_arch = "x86_64")] tsc_loader_jump: 0, #[cfg(target_arch = "x86_64")] loader_stages: unaos_boot_info::LoaderStages::EMPTY, #[cfg(target_arch = "x86_64")] kelf: kelf_verdict, // KELFHASH (B709): the loader's hash verdict rides the seam. BOOTCLOCK: stamps 1 and 2 ride the initialiser; stamp 3 is written into the leaked struct after `exit_boot_services`, exactly like `igpu_trace_2` below, so it is seeded 0 here. 0 is also the ABSENT sentinel the kernel prints as `absent`, which is what a pre-BOOTCLOCK `bootloader.efi` sitting on old boot media will produce. LINE-NEUTRAL fold, x86-gated — see the fold note on `fn main`.
+        boot_volume_serial, #[cfg(target_arch = "x86_64")] tsc_loader_entry, #[cfg(target_arch = "x86_64")] tsc_loader_read, #[cfg(target_arch = "x86_64")] tsc_loader_jump: 0, #[cfg(target_arch = "x86_64")] loader_stages: unaos_boot_info::LoaderStages::EMPTY, #[cfg(target_arch = "x86_64")] kelf: kelf_verdict, #[cfg(target_arch = "x86_64")] smbios_ptr: smbios_ptr(), // ZENBOOKSURVEY (zenbook-ledger Z1): the tagged SMBIOS entry point (`smbios_ptr`, file tail). KELFHASH (B709): the loader's hash verdict rides the seam. BOOTCLOCK: stamps 1 and 2 ride the initialiser; stamp 3 is written into the leaked struct after `exit_boot_services`, exactly like `igpu_trace_2` below, so it is seeded 0 here. 0 is also the ABSENT sentinel the kernel prints as `absent`, which is what a pre-BOOTCLOCK `bootloader.efi` sitting on old boot media will produce. LINE-NEUTRAL fold, x86-gated — see the fold note on `fn main`.
         #[cfg(feature = "unaos_ivb")]
         igpu_trace_0: t0,
         #[cfg(feature = "unaos_ivb")]
@@ -1814,4 +1814,26 @@ mod panelknob {
         log::info!("GOP: panel knob {}x{} -> {}", W, H, if m.is_some() { "offered" } else { "not offered (today's pick)" });
         m
     }
+}
+
+/// ZENBOOKSURVEY (zenbook-ledger Z1): the SMBIOS entry point from the UEFI configuration table — SMBIOS 3.0 (`_SM3_`)
+/// preferred, 2.x (`_SM_`) the fallback — tagged with `unaos_boot_info::SMBIOS_TAG` for `BootInfo::smbios_ptr`. 0 when
+/// the firmware publishes neither (or an address at or above 2^48, which the tag could not carry). Runs while boot
+/// services are live (the BootInfo initialiser, before `exit_boot_services`); the kernel's `hw::platform` reads it.
+#[cfg(target_arch = "x86_64")]
+fn smbios_ptr() -> u64 {
+    use uefi::table::cfg::ConfigTableEntry;
+    let (mut v3, mut v2) = (0u64, 0u64);
+    uefi::system::with_config_table(|config_table| {
+        for entry in config_table {
+            if entry.guid == ConfigTableEntry::SMBIOS3_GUID {
+                v3 = entry.address as u64;
+            } else if entry.guid == ConfigTableEntry::SMBIOS_GUID {
+                v2 = entry.address as u64;
+            }
+        }
+    });
+    let addr = if v3 != 0 { v3 } else { v2 };
+    log::info!("SMBIOS ep at {:#x} ({})", addr, if v3 != 0 { "smbios3" } else if v2 != 0 { "smbios2" } else { "absent" });
+    if addr == 0 || addr >> 48 != 0 { 0 } else { unaos_boot_info::SMBIOS_TAG | addr }
 }

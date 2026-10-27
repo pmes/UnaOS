@@ -806,7 +806,7 @@ pub fn init(_dtb_addr: u64, _dtb_size: usize) {
     // step 4e (`apic::report_tick_rate` — a 50 ms PM-timer window) and nothing else, and so a boot
     // that dies anywhere below still shows that it got this far. Everything from here to
     // `pci-usb` used to be one undivided delta; see `docs/dev/OS/01_BOOT_HAL/bootpace.md` §6a.
-    crate::bootpace::record("pci-enter");
+    crate::bootpace::record("pci-enter"); crate::hw::platform_say(); // ZENBOOKSURVEY (zenbook-ledger Z1): which machine this is, read from SMBIOS ONCE, before any Apple-only probe below asks `hw::gate`; the ZENBOOK sibling arcs hook AFTER this line.
 
     // VPERF (bench builds only): read-only display diagnostics — the effective framebuffer memory
     // type (MTRR + live PTE + PAT) and which class-0x03 device's BAR owns the fb address. Rides
@@ -858,7 +858,7 @@ pub fn init(_dtb_addr: u64, _dtb_size: usize) {
     // value-mutating WRITE_CMD). Knob OFF => this call does not exist and the module is unlinked.
     #[cfg(feature = "smc")]
     {
-        crate::drivers::smc::scout();
+        if crate::hw::gate(crate::hw::Probe::Smc) { crate::drivers::smc::scout(); } // ZENBOOKSURVEY (Z1): the Apple SMC scout runs as today except on a positively identified non-Apple machine (`[hw] skip smc`).
         // M2: take one battery reading at boot so every knob-ON boot log carries a `:: SMC-BATT: ::`
         // witness proving the snapshot read path ran (honest `present=false` on QEMU / a machine
         // without a battery). The main loops + the vug meter cadence keep refreshing it live.
@@ -1055,7 +1055,7 @@ pub fn init(_dtb_addr: u64, _dtb_size: usize) {
         }
 
         #[cfg(all(feature = "gmux_igd", feature = "intel-ivb"))]
-        unsafe { crate::drivers::gpu::igpu::gmux_igd_switch() };
+        if crate::hw::gate(crate::hw::Probe::Gmux) { unsafe { crate::drivers::gpu::igpu::gmux_igd_switch() }; } // ZENBOOKSURVEY (Z1): the gmux IGD ladder runs as today except on a positively identified non-Apple machine (`[hw] skip gmux`).
     }
 
     // SDHC-1 (milestone 1): storage-class PCI census + the read-only SD Host Controller
