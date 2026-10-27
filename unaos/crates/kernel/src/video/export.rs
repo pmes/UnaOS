@@ -27,6 +27,11 @@
 //!   trimmed by `build::mp4a_edit_list` in the extras `Mp4Stream::finish` takes ([`audio_track`]) — then the moov. Written as the shell writes (`write_veto` at start, the kernel principal) through
 //!   the ONE VFS writer, `MountTable::put_file` / `write_all_at`; a refused, failed or superseded export unlinks its
 //!   partial file. `--bitrate KBPS` is h264enc_core's `Config.rate` (CBR), the field Stria's `with_bitrate` sets.
+//! * THE PICTURE (H264ENCPLANES, rmbp-ledger B973): the file has ONE colour, fixed at its first frame ([`Exp::push`]): an
+//!   unmixed 8-bit 4:2:0 decoder picture enters h264enc_core's planar entry (`RgbaEncoder::push_planes`) with no RGBA round
+//!   trip when its resolved colour is the file's; any other frame (mixed, black, 10-bit, 4:4:4, another colour) converts its
+//!   RGBA through `yuv_core::from_rgba` at the file's matrix. An RGBA-first file is BT.601 limited (the samples it always had);
+//!   every file states its colour as `colr` (`build::Mp4Extras::colour`). Wire `[nle] export colour matrix= range= src= planes=`.
 //! * LOCKS: [`ENC`] (the armed export) is a leaf; [`frame`] TAKES the export out of it and encodes with no lock held (a
 //!   1080p picture is far past the lock registry's 50 ms), putting it back unless superseded. `bus::CAP` (the capture) is
 //!   taken under vplay's `snd::SND` and takes nothing (the live forward drops it first): the one new edge is SND -> CAP.
@@ -108,6 +113,8 @@ struct Exp {
     frames: u64,
     next_pct: u64,
     t0: u64,
+    /// H264ENCPLANES (B973): the file's one colour and the frames that entered as planes (file tail).
+    col: ExpColour,
 }
 
 static ENC: crate::sync::Mutex<Option<Exp>> = crate::sync::Mutex::new(None);
@@ -134,7 +141,7 @@ pub fn start(edl: &str, out: &str, opts: Opts) -> Result<u32, String> {
     let jid = {
         // armed under the lock across the start, so the job's first `sink` sees its own jid
         let mut g = ENC.lock();
-        *g = Some(Exp { jid: 0, out: String::from(out), opts, rgba: RgbaEncoder::new(cfg), stream: None, vtrack: 0, begun: false, size: (0, 0), tb: Timebase { num: 1, den: 25 }, total: 1, frames: 0, next_pct: 10, t0 });
+        *g = Some(Exp { jid: 0, out: String::from(out), opts, rgba: RgbaEncoder::new(cfg), stream: None, vtrack: 0, begun: false, size: (0, 0), tb: Timebase { num: 1, den: 25 }, total: 1, frames: 0, next_pct: 10, t0, col: ExpColour::default() });
         let jid = super::vplay::start(edl);
         if let Some(e) = g.as_mut() {
             e.jid = jid;
@@ -157,9 +164,10 @@ pub fn arm_audio(jid: u32) {
     }
 }
 
-/// The step's frame (`w x h` straight RGBA) into the encoder; `tb` the EDL's time base and `total` its video steps (the
-/// progress). Encodes with no lock held.
-pub fn frame(jid: u32, tb: Timebase, total: u64, w: usize, h: usize, rgba: &[u8]) -> Result<(), String> {
+/// The step's frame into the encoder: its decoder planes with the source's colour when unmixed 8-bit 4:2:0 (H264ENCPLANES
+/// B973), and its `w x h` straight RGBA made on demand ([`Exp::push`] decides); `tb` the EDL's time base and `total` its video
+/// steps (the progress). Encodes with no lock held.
+pub fn frame(jid: u32, tb: Timebase, total: u64, w: usize, h: usize, planes: Option<(h264enc_core::Yuv420<'_>, Option<Colour>)>, rgba: impl FnOnce() -> Vec<u8>) -> Result<(), String> {
     let Some(mut e) = ENC.lock().take_if(|e| e.jid == jid) else { return Err(String::from("superseded")) };
     if e.frames == 0 {
         e.tb = tb;
@@ -173,7 +181,7 @@ pub fn frame(jid: u32, tb: Timebase, total: u64, w: usize, h: usize, rgba: &[u8]
         }
     }
     e.size = (w as u32, h as u32);
-    let r = match e.rgba.push_rgba(w as u32, h as u32, rgba) {
+    let r = match e.push(w, h, planes, rgba) {
         Ok(u) => e.stream_units(u).map_err(|m| alloc::format!("write-refused: {}", m)),
         Err(err) => Err(alloc::format!("{}", err)),
     };
@@ -248,6 +256,7 @@ impl Exp {
         let mut tracks: Vec<build::MediaTrack> = Vec::new();
         let mut rep = Report { frames: self.frames, bframes: self.opts.bframes, out: self.out.clone(), ..Report::default() };
         let mut extras = build::Mp4Extras::default(); // NLE6EXPORTAAC (rmbp-ledger B960): the AAC track's priming edit; empty for PCM16
+        extras.colour.extend(self.colour_entry()); // H264ENCPLANES (rmbp-ledger B973): the file's one colour as the avc1's `colr`, and its wire line (file tail)
         if let Some((mut pcm, rate)) = pcm.filter(|(p, _)| !p.is_empty()) {
             let target = (self.tb.to_ns(self.total as i64).max(0) as u128 * rate as u128 / 1_000_000_000) as u64;
             rep.audio_mixed = (pcm.len() / 2) as u64;
@@ -482,4 +491,75 @@ fn audio_track(pcm: &[i16], rate: u32, aac_kbps: u32) -> Result<(build::MediaTra
     serial_println!("[nle] export audio=aac bytes={} units={} kbps={}", bytes, n, aac_kbps);
     let track = build::mp4a_track(2, rate, 2, &enc.asc(), units.into_iter().map(|u| u.data).collect(), bps);
     Ok((track, Some(build::mp4a_edit_list(2, rate, PRIMING, (pcm.len() / 2) as u64))))
+}
+
+// ── H264ENCPLANES (rmbp-ledger B973): the export's picture path and its ONE colour (handlers.md §5 NLEPROBE-HDR's H264ENC-PLANES) ──
+// vplay's `export_frame` hands an unmixed 8-bit 4:2:0 decoder picture (VP8, 8-bit AV1) as planes with the frame's colour; a mixed,
+// black, stand-in, 10-bit, 4:4:4 or mono frame as None (its RGBA made on demand by `Px::rgb`). The FILE's colour is fixed at the
+// first frame: that frame's resolved source colour when it came as planes, else BT.601 limited (the matrix the RGBA path always
+// encoded with: its samples unchanged, now stated). Every frame enters in the file's colour: planes whose (Kr / Kb, range) match
+// go straight to `RgbaEncoder::push_planes` (no conversion); everything else through `push_rgba_in` = `yuv_core::from_rgba` at
+// the file's matrix and range. `write_inner` states it as `colr` through `build::Mp4Extras::colour` (the existing writer). The
+// state lives in `Exp`, which `frame` holds outside `ENC`: no lock of its own.
+
+use demux_core::colour::Colour;
+
+/// The export file's one colour and how many frames entered as planes.
+#[derive(Default)]
+struct ExpColour {
+    /// (the colour the `colr` states, its Kr / Kb x 10000, full range), fixed at the first frame.
+    file: Option<(Colour, (i64, i64), bool)>,
+    /// What fixed it: "planes" or "rgba".
+    src: &'static str,
+    planes: u64,
+}
+
+/// The RGBA path's colour: BT.601 limited, primaries / transfer unspecified (H264ENC-COLOUR: the untagged file read as BT.709 at HD).
+const RGBA_COLOUR: (Colour, (i64, i64), bool) = (Colour { primaries: 2, transfer: 2, matrix: 6, full_range: Some(false), mastering: None, light: None }, yuv_core::KR_KB_601, false);
+
+/// A planes frame's colour as the Player converts it (`yuv_core::pick` at its size): the code points the `colr` states (the
+/// matrix explicit: the source's stated Kr / Kb code, else the size default's 1 / 6; the range explicit; the rest the source's,
+/// 2 when it states none), its Kr / Kb and range. None for a non-Kr pick (identity, YCgCo): that frame takes the RGBA path.
+fn file_colour(c: Option<Colour>, w: usize, h: usize) -> Option<(Colour, (i64, i64), bool)> {
+    let (m, full) = yuv_core::pick(c.map(|c| c.matrix), c.and_then(|c| c.full_range), w as u32, h as u32);
+    let yuv_core::Matrix::Kr(k) = m else { return None };
+    let code = match c.map(|c| c.matrix) {
+        Some(mc) if yuv_core::kr_kb(mc).is_some() => mc,
+        _ if k == yuv_core::KR_KB_709 => 1,
+        _ => 6,
+    };
+    let base = c.unwrap_or(Colour { primaries: 2, transfer: 2, matrix: 2, full_range: None, mastering: None, light: None });
+    Some((Colour { matrix: code, full_range: Some(full), ..base }, k, full))
+}
+
+impl Exp {
+    /// One frame into the encoder in the FILE's colour (fixed by the first frame): matching planes straight to the planar entry,
+    /// anything else its RGBA converted at the file's matrix and range.
+    fn push(&mut self, w: usize, h: usize, planes: Option<(h264enc_core::Yuv420<'_>, Option<Colour>)>, rgba: impl FnOnce() -> Vec<u8>) -> h264enc_core::Result<Vec<h264enc_core::rgba::Unit>> {
+        let src = planes.and_then(|(p, c)| file_colour(c, w, h).map(|fc| (p, fc)));
+        if self.col.file.is_none() {
+            self.col.src = if src.is_some() { "planes" } else { "rgba" };
+        }
+        let file = *self.col.file.get_or_insert(match &src {
+            Some((_, fc)) => *fc,
+            None => RGBA_COLOUR,
+        });
+        match src {
+            Some((p, (_, k, full))) if (k, full) == (file.1, file.2) => {
+                self.col.planes += 1;
+                self.rgba.push_planes(&p)
+            }
+            _ => self.rgba.push_rgba_in(w as u32, h as u32, &rgba(), file.1, file.2),
+        }
+    }
+
+    /// The file's `colr` entry for `build::Mp4Extras::colour` (the avc1 track is id 1, [`Exp::stream_units`]), and the wire line.
+    fn colour_entry(&self) -> Option<(u32, Colour)> {
+        let (c, _, full) = self.col.file?;
+        serial_println!(
+            "[nle] export colour matrix={} range={} src={} planes={}/{}",
+            c.matrix, if full { "full" } else { "limited" }, self.col.src, self.col.planes, self.frames
+        );
+        Some((1, c))
+    }
 }

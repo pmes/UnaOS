@@ -1090,7 +1090,7 @@ fn edl_run(jid: u32, path: &str, seek_ms: u64, rep: &mut EdlReport) -> Result<()
         if pts_ms < seek_ms {
             continue; // a Player seek: the steps before it decoded unseen (job_task's rule)
         }
-        if let super::export::Sink::Encode = super::export::sink(jid) { super::export::frame(jid, tl.tb, vcount, frame.w, frame.h, &unpack(frame.px.rgb())).map_err(|e| ("encode-refused", Some(e)))?; rep.frames += 1; snd::tick(jid); crate::arch::sched::yield_now(); continue; } face_preview(seek_ms, rep, s.out_t, &frame); room(jid).map_err(|why| (why, None))?; // NLE6EXPORT (rmbp-ledger B959): the Encode sink — the step's frame to the exporter, not the queue (video/export.rs). NLE6MIXFACE (rmbp-ledger B957): the first frame a Player seek shows (file tail)
+        if let super::export::Sink::Encode = super::export::sink(jid) { export_frame(jid, tl.tb, vcount, &frame).map_err(|e| ("encode-refused", Some(e)))?; rep.frames += 1; snd::tick(jid); crate::arch::sched::yield_now(); continue; } face_preview(seek_ms, rep, s.out_t, &frame); room(jid).map_err(|why| (why, None))?; // NLE6EXPORT (rmbp-ledger B959): the Encode sink — the step's frame to the exporter, not the queue (video/export.rs). NLE6MIXFACE (rmbp-ledger B957): the first frame a Player seek shows (file tail)
         {
             let mut g = JOB.lock();
             let Some(j) = g.as_mut().filter(|j| j.jid == jid) else { return Err(("superseded", None)) };
@@ -2152,4 +2152,27 @@ fn inband_colour(d: &mut av1_core::image::StreamDecoder, c: Option<Colour>, pts:
         Some((primaries, transfer, matrix, full_range)) => Some(Colour { primaries, transfer, matrix, full_range, mastering: c.and_then(|c| c.mastering), light: c.and_then(|c| c.light) }),
         None => c,
     }
+}
+
+// ── H264ENCPLANES (rmbp-ledger B973): the exporter takes an unmixed picture's planes (handlers.md §5 NLEPROBE-HDR's H264ENC-PLANES) ──
+// At the export call a frame still holding the decoder's planes (`Src::Vp8` / `Src::Av1`) is UNMIXED: `edl_mix` leaves a mixed
+// frame as `Src::Rgb`, and a gap's black, the stand-in and utp1 are `Src::Rgb` too. An 8-bit 4:2:0 picture (every VP8; AV1 at 8
+// bits, not mono, 4:2:0, its u16 samples narrowed by a plain copy) goes to the exporter as h264enc_core planes with the frame's
+// colour; the exporter decides whether they match its file's colour (`export.rs` `Exp::push`). Any other frame gives None and
+// its RGBA on demand (`Px::rgb`, the cached conversion), so an unmixed 8-bit frame converts nothing. 10-bit / 4:4:4 / mono
+// pictures take the RGBA path (H264ENC-PLANES-HI owed).
+
+/// The EDL job's frame into the exporter: its planes when unmixed 8-bit 4:2:0, else None; its RGBA only if the exporter asks.
+fn export_frame(jid: u32, tb: timeline_core::Timebase, total: u64, f: &Frame) -> Result<(), String> {
+    let narrow = |s: &[u16]| s.iter().map(|&x| x as u8).collect::<Vec<u8>>();
+    let av1 = match &f.px.src {
+        Src::Av1(p, _) if p.bit_depth == 8 && !p.mono && (p.ss_x, p.ss_y) == (1, 1) => Some((narrow(&p.y), narrow(&p.u), narrow(&p.v))),
+        _ => None,
+    };
+    let planes = match (&f.px.src, &av1) {
+        (Src::Vp8(y, c), _) => Some((h264enc_core::Yuv420 { width: y.width, height: y.height, y: &y.y, u: &y.u, v: &y.v, y_stride: y.width as usize, uv_stride: y.chroma_width() as usize }, *c)),
+        (Src::Av1(p, c), Some((py, pu, pv))) => Some((h264enc_core::Yuv420 { width: p.width, height: p.height, y: py, u: pu, v: pv, y_stride: p.width as usize, uv_stride: p.chroma_width() as usize }, *c)),
+        _ => None,
+    };
+    super::export::frame(jid, tb, total, f.w, f.h, planes, || unpack(f.px.rgb()))
 }

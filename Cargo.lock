@@ -2189,6 +2189,7 @@ version = "0.1.0"
 dependencies = [
  "demux_core",
  "h264_core",
+ "yuv_core",
 ]
 
 [[package]]
