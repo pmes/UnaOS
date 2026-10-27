@@ -1,0 +1,429 @@
+[2J[001;001H[=3h[2J[001;001H[2J[001;001H[8;042;160t[2J[001;001H[2J[001;001H[8;056;240t[2J[001;001HBdsDxe: loading Boot0002 "UEFI QEMU HARDDISK QM00011 " from PciRoot(0x0)/Pci(0x1F,0x2)/Sata(0x5,0xFFFF,0x0)
+BdsDxe: starting Boot0002 "UEFI QEMU HARDDISK QM00011 " from PciRoot(0x0)/Pci(0x1F,0x2)/Sata(0x5,0xFFFF,0x0)
+[ INFO]: crates/bootloader/src/main.rs@451: UnaOS UEFI Bootloader Started
+[ INFO]: crates/bootloader/src/main.rs@486: CON cur=160x42 wide=160x42 n=4
+loader wire=efi-serial tsc=2002MHz
+firmware ok 100ms
+[ INFO]: crates/bootloader/src/main.rs@570: GOP: 30 modes (firmware current 1280x800):
+[ INFO]: crates/bootloader/src/main.rs@574:   GOP mode: 1280x800 stride=1280 fmt=Bgr
+[ INFO]: crates/bootloader/src/main.rs@574:   GOP mode: 640x480 stride=640 fmt=Bgr
+[ INFO]: crates/bootloader/src/main.rs@574:   GOP mode: 800x480 stride=800 fmt=Bgr
+[ INFO]: crates/bootloader/src/main.rs@574:   GOP mode: 800x600 stride=800 fmt=Bgr
+[ INFO]: crates/bootloader/src/main.rs@574:   GOP mode: 832x624 stride=832 fmt=Bgr
+[ INFO]: crates/bootloader/src/main.rs@574:   GOP mode: 960x640 stride=960 fmt=Bgr
+[ INFO]: crates/bootloader/src/main.rs@574:   GOP mode: 1024x600 stride=1024 fmt=Bgr
+[ INFO]: crates/bootloader/src/main.rs@574:   GOP mode: 1024x768 stride=1024 fmt=Bgr
+[ INFO]: crates/bootloader/src/main.rs@574:   GOP mode: 1152x864 stride=1152 fmt=Bgr
+[ INFO]: crates/bootloader/src/main.rs@574:   GOP mode: 1152x870 stride=1152 fmt=Bgr
+[ INFO]: crates/bootloader/src/main.rs@574:   GOP mode: 1280x720 stride=1280 fmt=Bgr
+[ INFO]: crates/bootloader/src/main.rs@574:   GOP mode: 1280x760 stride=1280 fmt=Bgr
+[ INFO]: crates/bootloader/src/main.rs@574:   GOP mode: 1280x768 stride=1280 fmt=Bgr
+[ INFO]: crates/bootloader/src/main.rs@574:   GOP mode: 1280x960 stride=1280 fmt=Bgr
+[ INFO]: crates/bootloader/src/main.rs@574:   GOP mode: 1280x1024 stride=1280 fmt=Bgr
+[ INFO]: crates/bootloader/src/main.rs@574:   GOP mode: 1360x768 stride=1360 fmt=Bgr
+[ INFO]: crates/bootloader/src/main.rs@574:   GOP mode: 1366x768 stride=1366 fmt=Bgr
+[ INFO]: crates/bootloader/src/main.rs@574:   GOP mode: 1400x1050 stride=1400 fmt=Bgr
+[ INFO]: crates/bootloader/src/main.rs@574:   GOP mode: 1440x900 stride=1440 fmt=Bgr
+[ INFO]: crates/bootloader/src/main.rs@574:   GOP mode: 1600x900 stride=1600 fmt=Bgr
+[ INFO]: crates/bootloader/src/main.rs@574:   GOP mode: 1600x1200 stride=1600 fmt=Bgr
+[ INFO]: crates/bootloader/src/main.rs@574:   GOP mode: 1680x1050 stride=1680 fmt=Bgr
+[ INFO]: crates/bootloader/src/main.rs@574:   GOP mode: 1920x1080 stride=1920 fmt=Bgr
+[ INFO]: crates/bootloader/src/main.rs@574:   GOP mode: 1920x1200 stride=1920 fmt=Bgr
+[ INFO]: crates/bootloader/src/main.rs@574:   GOP mode: 1920x1440 stride=1920 fmt=Bgr
+[ INFO]: crates/bootloader/src/main.rs@574:   GOP mode: 2000x2000 stride=2000 fmt=Bgr
+[ INFO]: crates/bootloader/src/main.rs@574:   GOP mode: 2048x1536 stride=2048 fmt=Bgr
+[ INFO]: crates/bootloader/src/main.rs@574:   GOP mode: 2048x2048 stride=2048 fmt=Bgr
+[ INFO]: crates/bootloader/src/main.rs@574:   GOP mode: 2560x1440 stride=2560 fmt=Bgr
+[ INFO]: crates/bootloader/src/main.rs@574:   GOP mode: 2560x1600 stride=2560 fmt=Bgr
+[ INFO]: crates/bootloader/src/main.rs@606: EDID: not available; using the firmware's current mode
+[ INFO]: crates/bootloader/src/main.rs@660: GOP: keeping firmware current mode 1280x800
+gop 1280x800 6ms
+[ INFO]: crates/bootloader/src/main.rs@1627: [loader] slot=ELF why=normal
+volumes 1 0ms
+kernel 23171080 54ms retries=0
+[ INFO]: crates/bootloader/src/main.rs@1721: [loader] kelf slot=A hash=ok why=ok sha=2fff270a
+[ INFO]: crates/bootloader/src/main.rs@795: KELF min=0x0 max=0x1530d30 pg=5425
+[ INFO]: crates/bootloader/src/main.rs@808: Allocated kernel at 0x3a5eb000
+elf 204ms
+[ INFO]: crates/bootloader/src/main.rs@957: ACPI RSDP at 0x3f77e014
+[ INFO]: crates/bootloader/src/main.rs@964: boot volume FAT serial 0xfabe1afd (extended BPB BS_VolID)
+discover 1ms
+[ INFO]: crates/bootloader/src/main.rs@1055: iGPU trace 1 (pre-EBS) collected.
+jumping 0ms
+[      ?ms] :: video: edid present=0 hdr=- sum=- native=- len=0 ::
+[      ?ms] :: SMEP unsupported (TCG?) — metal Ivy Bridge has it ::
+[      ?ms] :: WXN-M3B: xseg=[0x3A5EB000,0x3B6B2000) xpages=4295 armed=0 huge_leaves=8 absent=0 already_ro=0 -> REFUSED (the executable extent is not the all-4K-present-writable map this stage models; no entry written, map unmodified) ::
+[      ?ms] [splash] gop scene=ground stars=592 ms=7 WxH=1280x800
+[      ?ms] :: SPLASH: stage=gop at_ms=1 paint_ms=8 WxH=1280x800 ::
+[      ?ms] :: install: boot volume serial=0xfabe1afd — INSTALL-SELF boot-device guard ARMED ::
+[      ?ms] :: FRGUARD: boot volume serial=0xfabe1afd — Default-write substitution guard ARMED ::
+[      ?ms] [heap] reserve mib=8 at=0x11780000 from=tail (HEAPREGION B854, BINDLIVE B873)
+[      ?ms] [ioapic] census ioapics=1 isos=5 gsis=24 nmis=1 dropped=0 madt_entries=7 == witness ::
+[     14ms] :: BOOTCLOCK: firmware->loader=2837ms loader-read=162ms loader-jump=221ms kernel-entry=6430356580 tsc_hz=1996139114(measured) ::
+[05:55:37Z] :: LOADER: firmware->loader=2837ms loader->kernel=384ms stages=firmware:100ms,gop:6ms,volumes:0ms,kernel:54ms,elf:204ms,discover:1ms,jump:15ms volumes=1 kernel_bytes=23171080 uart=efi-serial retries=0 timeouts=0 ::
+[05:55:37Z] [boot] kelf slot=A hash=ok sha=2fff270a
+[05:55:37Z] [tlb] shootdown pages=1 cpus=1 acked=1 us=197
+[05:55:38Z] [clock] source=apic hz=1996139114 invariant=0 civil=ms at=2026-10-27T05:55:38+00:00 tz=UTC off_min=0 dst=0 per_core_tick=1 cores=6 skew_max_cycles=0 sync_timeouts=0 offsets=none (CLOCKCORE)
+[05:55:38Z] :: SMC-BATT: present=false soc=-% volt=-mV amp=-mA full=-mAh rem=-mAh ac=? retries=0/0 st0=0 rfail=0 rok=0 short=0 unc=0 gap=0 busy=0 late=0 == witness ::
+[05:55:38Z] :: xHCI 1b36:000d not a shared-port Intel part — port switchover INERT (no config writes; e.g. QEMU, or firmware already routed / no EHCI companion) ::
+[05:55:38Z] :: kepler: no-device ::
+[05:55:38Z] :: igpu: [AUX] PRE-SWITCH DPCD Read: (n/a - path never reached) ::
+[05:55:38Z] :: igpu: [AUX] DPCD REV: (n/a) ::
+[05:55:38Z] :: igpu: [AUX] EDID Dump: (n/a) ::
+[05:55:38Z] :: igpu: [GMUX] REFUSED: protocol-unproven (status: 0x00000000) ::
+[05:55:38Z] :: igpu-dpy: LADDER highest=00/10 name=harness ok=0 pending=0 gmux=UNTOUCHED why=protocol-unproven elapsed_ms=0 pp_seen=none pp=0x00000000/0x00000000->0x00000000/0x00000000 pp_settle_ms=0 aux_port=DPA(0x64010) aux_div=0x000 dpcd_tries=0 pps=not-reached pending_items=none ::
+[05:55:38Z] :: sdhc: card v2.00+ SDSC byte-addressed blocks=32768 size=16 MiB rca=0x4c6f ::
+[05:55:38Z] :: sdhc: w2 armed=1 lba=32763 n=4 verify=ok busy_ms=0 restore=IDENTICAL reason=none -> ok ::
+[05:55:38Z] :: SDHCREG: handle=built register=ok blocks=32768 addressing=byte — the internal card IS a program source this boot ::
+[05:55:38Z] [disk] smart model="QEMU HARDDISK" hours=1 wear_pct=na realloc=0 pending=na temp_c=31 health=ok port=5 smart=ok attrs=7 fw="2.5+" trim=1 tripped=-
+[05:55:38Z] :: AHCI: selfcheck port=5 identify=ok sector0=MBR -> armed ::
+[05:55:38Z] :: PART: fat mounted from MBR slot 1 — extent LBA 63..1032192 (1032129 sectors), FAT16 vol@LBA63 volsec=1032129 bps=512 spc=16 nfat=2 fatsz=252sec reserved=1 fat@LBA64 data@LBA600 clusters=64474 rootdir@LBA568 (32sec) ::
+[05:55:38Z] [e1000] BAR0 = 0x810a0000; enabling bus master + bringing up RX/TX
+[05:55:38Z] [e1000] up: MAC=52:54:00:12:34:56 link=UP ip=10.0.2.15 (RX 32 / TX 8 desc, promiscuous)
+[05:55:38Z] [dhcp] DISCOVER sent (xid 0x554e414f)
+[05:55:38Z] [e1000] RX interrupt (MSI vector 0x41): enabled
+[05:55:38Z] [stack] guards armed tasks=3 aps=5 ist=24 bsp=owed(region-under-128k) page=4096
+[05:55:38Z] [lock] registry armed classes=0 cap=256 (LOCKREG)
+[05:55:38Z] [hid] pump task=hid-pump cpu=5 cadence=1tick (INPUTSTALL2: the HID pass never waits on the device-service loop)
+[05:55:38Z] :: PTRLOST: window=1:0 furniture=0:1 backdrop=0:0 furn_subtracted=1 sprite_owns_paint=1 lost_reachable=0 :: PASS ::
+[05:55:38Z] [keyboot] root=none hold=none
+[05:55:38Z] [boot] step=users-load begin at_ms=1448 budget_ms=249
+[05:55:38Z] [users] store pinned via=sdhc vol=0x4c43344300001fe7 (STOREMOVE B530: every later mount of the store asks this rung and this volume, for the boot)
+[05:55:38Z] :: SDHCPOST: posture sdw-ro=0 wp-pin=enabled write-path=live -> sdhc=rw reason=none (the pin is read ONCE, at the mount; 4a/4b re-read it at every write — SDHCPOST/SDHCRW, first, once) ::
+[05:55:38Z] [boot] step=users-load end ms=5 budget_ms=249 over=0 blocks_read=1 blocks_written=0 cmds=6 store=fat via=sdhc users=1
+[05:55:38Z] [vfs] root = boot volume serial=0xfabe1afd source=ahci5 match=/kernel.elf sha=2e6832e8-dcc3cb6 unafs=absent matches=1 home=- files=1 aliased=- window_off=0x3a89e5b0 window_len=4096 file_off=0x2b25b0 candidates=53 disks=global=absent usb=absent sdhc=present tegra-sd=unbuilt ahci5=present ::
+[05:55:38Z] [vfs] root = boot volume serial=0xfabe1afd source=ahci5 match=/kernel.elf sha=2e6832e8-dcc3cb6 unafs=absent matches=1 home=- files=1 aliased=- window_off=0x3a89e5b0 window_len=4096 file_off=0x2b25b0 candidates=53 disks=global=absent usb=absent sdhc=present tegra-sd=unbuilt ahci5=present ::
+[05:55:38Z] [vfs] volume mounted /volumes/UNAOS SDHC4 source=sdhc rw=yes ::
+[05:55:38Z] [vfs] root mount / = fat boot volume source=ahci5 rw=no ::
+[05:55:38Z] :: UNAFSX86: root=fat disk=ahci5 blocks=0 gen=0 home=/HOME -> skipped reason=fat-root ::
+[05:55:38Z] [vfs] lib mount /lib = fat boot volume source=ahci5 rooted=LIB (R94: fat root) ::
+[05:55:38Z] [vfs] boot mount /boot = fat boot volume source=ahci5 rw=no ::
+[05:55:38Z] [vfs] apps mount /apps = fat boot volume source=ahci5 rooted=APPS ::
+[05:55:38Z] [vfs] volume alias /volumes/boot = fat boot volume source=ahci5 (Volumes shows boot/efi only) ::
+[05:55:38Z] [users] seat store=fat:/USERS.DAT (no UnaFS root: the FAT is /) ::
+[05:55:38Z] [login] root locked (R100: no row, no prompt, no set-password; the first user is the administrator)
+[05:55:38Z] [boot] step=root-mount begin at_ms=1484 budget_ms=3891
+[05:55:38Z] [boot] step=root-mount end ms=1 budget_ms=3891 over=0 blocks_read=0 blocks_written=0 cmds=0 root=plain
+[05:55:38Z] [prefs] load clamped=0
+[05:55:38Z] :: PREFS: path=/settings domains=0 loaded=0 saved=0 ns=system -> loaded ::
+[05:55:38Z] [dock] trash state why=first full=0 took_ms=2 on=worker (HIDSTALL2: read on a change, off the hid pump's core)
+[05:55:38Z] [dock] prefs position=bottom autohide=0 via=login
+[05:55:38Z] [dock] dockpin login
+[05:55:38Z] :: DOCKPIN: left=8 minimized=0 pinned=8 running=0 loaded=0 saved=0 -> held ::
+[05:55:38Z] [starfield] gen wall_ms=90 stars=592 lensed=357 streams=4208 facets=17 front=7 glints=2592 groups=388 surface=1280x800
+[05:55:38Z] [wallpaper] probe try=1 found=0 kept=generated on=worker cpu=2 ms=151
+[05:55:38Z] [settings] prefchanged subscribe once (SETTINGSSUB B802)
+[05:55:38Z] [kfont] load dir=/system/fonts faces=11/13 fallback=none scripts_missing=none font_kib=4530 cache_kib=2048 ppi=0 scale=1.0 cell=7x16 grid=182x50 panel=1280x800 font=sans font_size=13 body=jetbrains-mono-11.50 chrome=inter-16.25 ui=inter-13.00 console=jetbrains-mono-11.50 ms=116
+[05:55:38Z] [font] face=Inter file=InterVariable.ttf axes=opsz:14-32,wght:100-900 ui=13.00 wght=400.0 opsz=14.0 bold_wght=600 mono=jetbrains-mono chain=inter>noto-sans>dejavu-sans>font8x8 title=20.0/26@600 look=una base_pt=13 features=kern,liga,calt+tnum,zero,ss01,ss02,cv01,cv05,cv08,case-on-request atlases=per-role reason=ok
+[05:55:38Z] :: KFONTPPI: edid_src=none ppi=0 scale=1.0 cell=7x16 grid=182x50 -> skipped reason=no-edid ::
+[05:55:38Z] [ui] metrics ppi=0 scale=1.0 s2=2 bar=34 title=34 frame=5 gap=12 disc=12 chrome=9x20 cell=7x16 glyph=1 win=520x448 consts=1 asserts=tests
+[05:55:38Z] [kfont] repaint epoch=1 console_rows=0 win=boot-log routed=0 windows=quarry,settings,activity,fileview,textedit,login face=inter-13.00
+[05:55:38Z] [prefsbus] ring on owner=prefs_client mode=sticky seq=0 (SUBSCRIBEKEEP B796)
+[05:55:39Z] [prefs] stat domain=- mounts_walked=6 device=ahci5 store=full-table (DONGLEBOOT: the delete watch stats the store's volume only)
+[05:55:39Z] [backlight] seed readback=- max=1023 level=12 (gmux did not answer; steps from the default)
+[05:55:39Z] :: SDHCBLK: FAT mounted READ-WRITE on the internal SD card (16 MiB): FAT16 vol@LBA0 volsec=32768 bps=512 spc=4 nfat=2 fatsz=32sec reserved=1 fat@LBA1 data@LBA97 clusters=8167 rootdir@LBA65 (32sec) ::
+[05:55:39Z] :: SDHCBLK: sdhc root directory (3 entries) ::
+[05:55:39Z] :: SDHCBLK:          65536       UNALOG.BIN ::
+[05:55:39Z] :: SDHCBLK:   <DIR>              HOME ::
+[05:55:39Z] :: SDHCBLK:            160       USERS.DAT ::
+[05:55:39Z] :: SDHC4C: selftest bounds extent=[97..225) — 4/4 out-of-extent spans REFUSED (below, above, straddle, overflow); the permit admits nothing outside its extent ::
+[05:55:39Z] [vfs] root-pass HOLD probe=witness-fixture at=2515ms :: BOOTSLOW: this probe does not serve the root and waits for the root pass's verdict ::
+[05:55:39Z] [vfs] root-pass BOUND source=ahci5 match=/kernel.elf at=2516ms source_seen_at=2516ms wait_ms=0ms pass=1 held=witness-fixture :: BOOTSLOW: the root is bound on its own pass; the probes named in held= run after it ::
+[05:55:39Z] :: BOOTLOG: 3 milestone(s) recorded (GUI-WITNESS ring) ::
+[05:55:39Z] :: BOOTLOG: [    1283 ms] ehci:kbd-armed ::
+[05:55:39Z] :: BOOTLOG: [    1287 ms] portsw:inert ::
+[05:55:39Z] :: BOOTLOG: [    1427 ms] gui:handoff ::
+[05:55:39Z] [fb] aperture pat=WC mtrr=none -> remapped-wc mtrr_type=UC idx=4 leaf=l2 fb=0x80000000 leaves=2 host=vm
+[05:55:39Z] [smc] lid=no-key key=MSLD (rung 0 refuted for MSLD; poll stopped)
+[05:55:39Z] [pump] paygo-take task on c2 from c5 (GATESTEAL B657: the PAYGO read-back never holds the gate on the pump's core)
+[05:55:39Z] :: BPACE: entry t=0ms d=0ms ::
+[05:55:39Z] :: BPACE: fb-wc t=0ms d=0ms ::
+[05:55:39Z] :: BPACE: fb-wc-done t=0ms d=0ms ::
+[05:55:39Z] :: BPACE: core-init t=5ms d=5ms ::
+[05:55:39Z] :: BPACE: mem-init t=19ms d=13ms ::
+[05:55:39Z] :: BPACE: heap t=20ms d=1ms ::
+[05:55:39Z] :: BPACE: acpi t=23ms d=2ms ::
+[05:55:39Z] :: BPACE: calib t=123ms d=100ms ::
+[05:55:39Z] :: BPACE: smp t=1101ms d=978ms ::
+[05:55:39Z] :: BPACE: sched t=1102ms d=1ms ::
+[05:55:39Z] :: BPACE: pci-enter t=1154ms d=51ms ::
+[05:55:39Z] :: BPACE: ehci-hid t=1154ms d=0ms ::
+[05:55:39Z] :: BPACE: ehci-hid-done t=1394ms d=240ms ::
+[05:55:39Z] :: BPACE: pci-probes t=1396ms d=2ms ::
+[05:55:39Z] :: BPACE: pci-scan t=1396ms d=0ms ::
+[05:55:39Z] :: BPACE: portsw t=1397ms d=0ms ::
+[05:55:39Z] :: BPACE: xhci-handoff t=1397ms d=0ms ::
+[05:55:39Z] :: BPACE: xhci-halt t=1397ms d=0ms ::
+[05:55:39Z] :: BPACE: xhci-hcrst t=1398ms d=1ms ::
+[05:55:39Z] :: BPACE: xhci-cnr t=1398ms d=0ms ::
+[05:55:39Z] :: BPACE: xhci-ptrs t=1399ms d=1ms ::
+[05:55:39Z] :: BPACE: xhci-run t=1399ms d=0ms ::
+[05:55:39Z] :: BPACE: xhci-portpwr t=1399ms d=0ms ::
+[05:55:39Z] :: BPACE: xhci-settle t=1499ms d=100ms ::
+[05:55:39Z] :: BPACE: enum:p1 t=1500ms d=0ms ::
+[05:55:39Z] :: BPACE: pci-usb t=1530ms d=30ms ::
+[05:55:39Z] :: BPACE: gui t=1536ms d=5ms ::
+[05:55:39Z] :: BPACE: root-bind t=1601ms d=64ms ::
+[05:55:39Z] :: BPACE: total gui=1536ms ftdi=none n=28 dropped=0 hz=1996139114 result=LEDGER ::
+[05:55:39Z] [flight] service on=worker cpu=2 pace_ms=1 hid_pump_cpu=5 (POINTERFEEL: the flight-recorder step leaves the hid pump's core) ::
+[05:55:39Z] [flight] service deferred passes=1 until_ms=2521 from_ms=2521 ring_kib=192 why=worker-up (PUMPHOLE2: no recorder work on the hid pump's core while its worker is coming) ::
+[05:55:39Z] :: TESTS: deferred=161 fire=tests at_boot=0 ::
+[05:55:39Z] [flight] ring rolling_kib=3510 pinned_head_kib=64 heap_free_mib=219 captured=11617 (FLIGHTRING B400: the newest 3510 KiB always held, the boot's first 64 KiB pinned)
+[05:55:39Z] [e1000] RX #1 len=590 src=52:55:0a:00:02:02 dst=ff:ff:ff:ff:ff:ff type=Ipv4 irqs=0
+[s5drain] fill 00 0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF
+[s5drain] fill 01 0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF
+[s5drain] fill 02 0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF
+[s5drain] fill 03 0123456789ABCDEF0123456789ABCDEF01234567[05:55:389A9Z]BCDE [s5drF
+ain] fill 0[s5dra3 0123456in789A] fiBCDEF01ll 04 01234562345789ABC6789ABCDEF0123DEF01234456789ABCDE56789ABCDEFF
+0123456789ABCDEF
+[05:55:39Z] [s5drain] fill 04 0123456789ABC[DEF0123456s5drain] fill789 05 01234567ABC89ABCDEDEF012F0123456789A345678BCDEF01239AB456789ABCDEF
+[s5drain] fCDEF
+ill 06 0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF
+[s5drain] fill 07 0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF
+[s5drain] fill [05:55:39Z] [s5drain] fill 08 0123456789ABCDEF0123456789ABCDEF0123456789ABC08 0123456789ABCDEFDEF0123
+456[05789ABCD:55EF012345:396789ABCZ] DEF
+[s5drain[s5drain] fill 09 0123456789ABCDEF01] fill234 09 5678012349ABCDEF01234567856789ABCD9ABCDEF0123456789ABCEF
+DEF012345[s5drain] f6789Aill 10 0BCDE1234F
+56789ABCD[05:55:3EF019Z] [s234567895draABCDin] EF0123456789ABfill 10 CDEF
+0[s5d1234567rain] fill 11 01234589ABCD6789ABCDEF01EF0123423456789ABCDEF0123456756789ABCDEF0189ABCDEF
+234567[s5d89ABrainCDEF
+] fill 12 0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF
+[s5drain] fill 13 0123456789ABCDEF0123456789AB[05:5CD5:39EF0123456789ABCZ] [s5draiDEn] fill F
+13[s5 012dra3456in] fill 14 0123456789ABC789ABDEF01CDEF23012345674589AB67CDEF012389ABCDEF012345456767889AB9ABCDEF
+CDEF[05:
+55[s5:39Z] [s5dradraiin]n] f fill 15 0123456789ABCDill 14 0EF01123456789A23456789ABCDEF01234567BCDEF01289AB3456CDEF
+789ABCD[s5draEF01in]23456 fill 789A16 0BCDE123F
+456789ABCDEF0123456789ABCDEF0123456789ABCDEF
+[s5drain] fill 17 0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF
+[s5drain] fill 18 0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF
+[s5drain] fill 19 0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF
+[s5drain] fill 20 0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF
+[s5drain] fill 21 0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF
+[s5drain] fill 22 0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF
+[s5drain] fill 23 0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF
+[s5drain] fill 24 0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF
+[s5drain] fill 25 0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF
+[s5drain] fill 26 0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF
+[s5drain] fill 27 0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF
+[s5drain] fill 28 0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF
+[s5drain] fill 29 0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF
+[s5drain] fill 30 0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF
+[s5drain] fill 31 0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF
+[s5drain] fill 32 0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF
+[s5drain] fill 33 0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF
+[s5drain] fill 34 0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF
+[s5drain] fill 35 0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF
+[s5drain] fill 36 0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF
+[s5drain] fill 37 0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF
+[s5drain] fill 38 0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF
+[s5drain] fill 39 0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF
+[s5drain] fill 40 0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF
+[s5drain] fill 41 0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF
+[s5drain] fill 42 0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF
+[s5drain] fill 43 0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF
+[s5drain] fill 44 0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF
+[s5drain] fill 45 0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF
+[s5drain] fill 46 0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF
+[s5drain] fill 47 0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF
+[s5drain] fill 48 0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF
+[s5drain] fill 49 0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF
+[s5drain] fill 50 0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF
+[s5drain] fill 51 0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF
+[s5drain] fill 52 0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF
+[s5drain] fill 53 0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF
+[s5drain] fill 54 0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF
+[s5drain] fill 55 0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF
+[s5drain] fill 56 0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF
+[s5drain] fill 57 0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF
+[s5drain] fill 58 0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF
+[s5drain] fill 59 0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF
+[s5drain] fill 60 0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF
+[s5drain] fill 61 0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF
+[s5drain] fill 62 0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF
+[s5drain] fill 63 0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF
+[dhcp] OFFER 10.0.2.20 from 10.0.2.2 -> REQUEST
+[pwrshutoff] ring drained lines=65 bytes=4336 mirror=ok
+[e1000] TX reply len=303
+[e1000] RX #2 len=590 src=52:55:0a:00:02:02 dst=ff:ff:ff:ff:ff:ff type=Ipv4 irqs=1
+[dhcp] bound: IP 10.0.2.20
+[05:55:39Z] :: S5DRAIN: FAIL — filled=64 lines=65 bytes=4336 want_bytes=4288 residue=3 dropped=0 ::
+[05:55:39Z] [block] boot medium=not-sdhc serial=0xfabe1afd; usb index 0 may hold the global slot (legacy)
+[05:55:39Z] >>> SYSTEM ALERT: NEW HARDWARE DETECTED <<<
+[05:55:39Z] >>> [CONTACT ESTABLISHED] SLOT 1
+[05:55:39Z] [boot] log flush on=flightrec every_passes=4096 (BOOTLOGCARD: no global slot — the flightrec worker writes the boot log to UnaFS, never the FAT) ::
+[05:55:39Z] >>> VENDOR ID : [46f4]
+[05:55:39Z] >>> PRODUCT ID: [0001]
+[05:55:39Z] :: STORSLOT: claim slot=1 ix=0 devices=1 — mass-storage record taken; SCSI bring-up deferred to the main loop ::
+[05:55:40Z] [wallpaper] probe try=2 found=0 kept=generated on=worker cpu=2 ms=1
+[05:55:40Z] [vfs] root-pass fixture n=1 held_ms=1200 at=2527ms verdict=bound :: BOOTSLOW: a synthetic probe that does not serve the root; bound is the ordering; a pending verdict is a probe that ran ahead of the root ::
+[05:55:40Z] :: BPACE: enum:p1-done t=2655ms d=1054ms ::
+[05:55:40Z] :: BPACE: enum:p10 t=2655ms d=0ms ::
+[05:55:40Z] :: BPACE: total gui=1536ms ftdi=none n=30 dropped=0 hz=1996139114 result=LEDGER ::
+[05:55:40Z] >>> SYSTEM ALERT: NEW HARDWARE DETECTED <<<
+[05:55:40Z] >>> [CONTACT ESTABLISHED] SLOT 2
+[05:55:40Z] >>> VENDOR ID : [0627]
+[05:55:40Z] >>> PRODUCT ID: [0001]
+[05:55:40Z] :: HIDESIT: slot=2 ptr ep=0x81 dci=3 speed=3 mps=8 burst=0 bival=4 ival=3/3 dw0=0x00030000 dw4=0x00080008 esit=8 esithi=0 avgtrb=8 want=8 -> PASS ::
+[05:55:40Z] :: MOUSE-1: HID pointer detected vid:pid=0627:0001 proto=0 absolute ep=0x81 mps=8 interval=4 == witness ::
+[05:55:40Z] :: BPACE: enum:p10-done t=3852ms d=1197ms ::
+[05:55:40Z] :: BPACE: enum:p11 t=3852ms d=0ms ::
+[05:55:40Z] :: BPACE: total gui=1536ms ftdi=none n=32 dropped=0 hz=1996139114 result=LEDGER ::
+[05:55:40Z] [e1000] TX ARP request who-has 10.0.2.2 (len 42)
+[05:55:40Z] [e1000] RX #3 len=64 src=52:55:0a:00:02:02 dst=52:54:00:12:34:56 type=Arp irqs=2
+[05:55:40Z] [e1000] RX #4 len=60 src=52:55:0a:00:02:02 dst=52:54:00:12:34:56 type=Ipv4 irqs=3
+[05:55:40Z] [icmp] echo reply id=0x554e seq=1 from 10.0.2.2
+[05:55:40Z] [selftest] gateway 10.0.2.2 reachable — ICMP echo reply seq=1 (outbound path OK)
+[05:55:40Z] [e1000] RX #5 len=60 src=52:55:0a:00:02:02 dst=52:54:00:12:34:56 type=Ipv4 irqs=4
+[05:55:40Z] [selftest] TCP connect to 10.0.2.2:7777 — no server (ok if the backend has none)
+[05:55:40Z] [e1000] RX #6 len=79 src=52:55:0a:00:02:02 dst=52:54:00:12:34:56 type=Ipv4 irqs=5
+[05:55:40Z] [lock] held-too-long name=e1000.rs:1070 at=e1000.rs:1185 by=1@cpu5 ms=53 waiters=0
+[05:55:41Z] [selftest] UDP send to 10.0.2.2:9998 — no echo (ok if the backend has none)
+[05:55:41Z] [lock] held-too-long name=e1000.rs:1070 at=e1000.rs:1185 by=1@cpu5 ms=252 released=1
+[05:55:41Z] >>> SYSTEM ALERT: NEW HARDWARE DETECTED <<<
+[05:55:41Z] >>> [CONTACT ESTABLISHED] SLOT 3
+[05:55:41Z] >>> VENDOR ID : [0403]
+[05:55:41Z] >>> PRODUCT ID: [6001]
+[05:55:41Z] :: U2.5: FTDI console up (0403:6001, 115200 8N1) ::
+[05:55:41Z] :: FTDI: tx pump budget=3992278228 used=133520 n=1 timeouts=0 yields=0 result=OK ::
+[05:55:41Z] [boot] step=stage-resolve waited_ms=2549 for=console console=up bound_ms=8000
+[05:55:41Z] [boot] step=stage-resolve begin at_ms=4034 budget_ms=927
+[05:55:41Z] [users] stage-resolve sub=store-read why=store-loaded stage=desktop users=1 at_ms=4035
+[05:55:41Z] [users] stage-resolve sub=stage-witness why=store-has-users at_ms=4035
+[05:55:41Z] :: FIRSTBOOT: stage=login-screen root=locked users=1 desktop_ignited=false why=store-has-users -> coherent ::
+[05:55:41Z] :: BOOT: firmware->loader=2837ms loader->desktop=4541ms total=7378ms lines=168 steps=2 slowest=users-load:5 over=0 ::
+[05:55:41Z] [users] stage-resolve sub=published why=store-has-users at_ms=4036
+[05:55:41Z] [login] installer: stage=login-screen (R86: the login dialog only; the desktop ignites at the first login)
+[05:55:41Z] [users] stage-resolve sub=login-screen at_ms=4036
+[05:55:41Z] [login] screen open window=1 box=440x334 at (420,155) modal=true power_row=1
+[05:55:41Z] [fbdirect] expose why=screen-open rects=0 px=0 handed=0 painted=0
+[05:55:41Z] [login] boot 2: the login screen is the boot session (R64/R65/R77: root is not the assumed login; the desktop is built when a session opens)
+[05:55:41Z] :: FIRSTUSER: flow=mac first_user=una role=admin root=locked prompts=0 login_window=users+power migrated=0 at=login-window -> ok ::
+[05:55:41Z] [users] stage-resolve sub=done why=store-loaded at_ms=4115
+[05:55:41Z] [boot] step=stage-resolve end ms=81 budget_ms=927 over=0 blocks_read=0 blocks_written=0 cmds=0 login-screen
+[05:55:41Z] [wcser] pump step=store-services gate=released declined=2 redriven=1 (GATESTEAL2 B667: a long usb-pump step never holds COMP_GATE; its declined pass is re-driven once at the step boundary)
+[05:55:41Z] [lock] held-too-long name=login.rs:202 at=login.rs:488 by=1@cpu5 ms=70 released=1
+[05:55:41Z] [lock] held-too-long name=wm.rs:30197 at=wm.rs:30208 by=1@cpu5 ms=57 waiters=0
+[05:55:41Z] [lock] held-too-long name=wm.rs:30382 at=wm.rs:30400 by=1@cpu5 ms=57 waiters=0
+[05:55:41Z] [lock] held-too-long name=wm.rs:30385 at=wm.rs:30400 by=1@cpu5 ms=57 waiters=0
+[05:55:41Z] [lock] held-too-long name=wm.rs:30386 at=wm.rs:30400 by=1@cpu5 ms=57 waiters=0
+[05:55:41Z] [lock] held-too-long name=wm.rs:30384 at=wm.rs:30400 by=1@cpu5 ms=57 waiters=0
+[05:55:41Z] :: BOOTLOG: 4 milestone(s) recorded (GUI-WITNESS ring) ::
+[05:55:41Z] :: BOOTLOG: [    1283 ms] ehci:kbd-armed ::
+[05:55:41Z] :: BOOTLOG: [    1287 ms] portsw:inert ::
+[05:55:41Z] :: BOOTLOG: [    1427 ms] gui:handoff ::
+[05:55:41Z] :: BOOTLOG: [    4031 ms] ftdi:console-up ::
+[05:55:41Z] :: BPACE: entry t=0ms d=0ms ::
+[05:55:41Z] :: BPACE: fb-wc t=0ms d=0ms ::
+[05:55:41Z] :: BPACE: fb-wc-done t=0ms d=0ms ::
+[05:55:41Z] :: BPACE: core-init t=5ms d=5ms ::
+[05:55:41Z] :: BPACE: mem-init t=19ms d=13ms ::
+[05:55:41Z] :: BPACE: heap t=20ms d=1ms ::
+[05:55:41Z] :: BPACE: acpi t=23ms d=2ms ::
+[05:55:41Z] :: BPACE: calib t=123ms d=100ms ::
+[05:55:41Z] :: BPACE: smp t=1101ms d=978ms ::
+[05:55:41Z] :: BPACE: sched t=1102ms d=1ms ::
+[05:55:41Z] :: BPACE: pci-enter t=1154ms d=51ms ::
+[05:55:41Z] :: BPACE: ehci-hid t=1154ms d=0ms ::
+[05:55:41Z] :: BPACE: ehci-hid-done t=1394ms d=240ms ::
+[05:55:41Z] :: BPACE: pci-probes t=1396ms d=2ms ::
+[05:55:41Z] :: BPACE: pci-scan t=1396ms d=0ms ::
+[05:55:41Z] :: BPACE: portsw t=1397ms d=0ms ::
+[05:55:41Z] :: BPACE: xhci-handoff t=1397ms d=0ms ::
+[05:55:41Z] :: BPACE: xhci-halt t=1397ms d=0ms ::
+[05:55:41Z] :: BPACE: xhci-hcrst t=1398ms d=1ms ::
+[05:55:41Z] :: BPACE: xhci-cnr t=1398ms d=0ms ::
+[05:55:41Z] :: BPACE: xhci-ptrs t=1399ms d=1ms ::
+[05:55:41Z] :: BPACE: xhci-run t=1399ms d=0ms ::
+[05:55:41Z] :: BPACE: xhci-portpwr t=1399ms d=0ms ::
+[05:55:41Z] :: BPACE: xhci-settle t=1499ms d=100ms ::
+[05:55:41Z] :: BPACE: enum:p1 t=1500ms d=0ms ::
+[05:55:41Z] :: BPACE: pci-usb t=1530ms d=30ms ::
+[05:55:41Z] :: BPACE: gui t=1536ms d=5ms ::
+[05:55:41Z] :: BPACE: root-bind t=1601ms d=64ms ::
+[05:55:41Z] :: BPACE: enum:p1-done t=2655ms d=1054ms ::
+[05:55:41Z] :: BPACE: enum:p10 t=2655ms d=0ms ::
+[05:55:41Z] :: BPACE: enum:p10-done t=3852ms d=1197ms ::
+[05:55:41Z] :: BPACE: enum:p11 t=3852ms d=0ms ::
+[05:55:41Z] :: BPACE: enum:p11-done t=4152ms d=299ms ::
+[05:55:41Z] :: BPACE: enum:p12 t=4152ms d=0ms ::
+[05:55:41Z] :: BPACE: ftdi-up t=4153ms d=0ms ::
+[05:55:41Z] :: BPACE: total gui=1536ms ftdi=4153ms n=35 dropped=0 hz=1996139114 result=LEDGER ::
+[05:55:41Z] :: FTDI-CAP: replayed=24791 cap=1048576 lost=0 head_cut=n ::
+[05:55:41Z] >>> SYSTEM ALERT: NEW HARDWARE DETECTED <<<
+[05:55:41Z] >>> [CONTACT ESTABLISHED] SLOT 4
+[05:55:41Z] >>> VENDOR ID : [0525]
+[05:55:41Z] >>> PRODUCT ID: [a4a2]
+[05:55:41Z] :: USBNET: configuration 0 holds no ECM pair (rndis_seen=1) — requesting configuration index 1 of 2 ::
+[05:55:41Z] :: USBNET: candidate kind=ecm slot=4 vidpid=0525:a4a2 cfg=1 ctrl=0 data=1 alt=1 imac=3 mss=0 in_mps=64 out_mps=64 ::
+[05:55:41Z] :: BOT: pump budget=3992278228 used=479600 peak=479600 route=0x0 depth=0 slot=1 n=1 nowait=0 timeouts=0 IMAN=0x2 USBSTS=0x0 result=OK ::
+[05:55:41Z] :: USBLUN: get-max-lun slot=1 intf=0 result=ok raw=0x00 max_lun=0 — the device declares 1 logical unit(s) ::
+[05:55:41Z] :: USBLUN: lun=0/0 inquiry="QEMU" "QEMU HARDDISK" capacity=262144x512 verdict=PRESENT reason=none ::
+[05:55:41Z] :: USBLUN: census slot=1 max_lun=0 luns=1 present=1 first_present=0 ::
+[05:55:41Z] :: USBLUN: publish lun=0/0 present=1 source=first-present — every CBW for this device now carries this LUN ::
+[05:55:41Z] :: BOT: deqprobe slot=1 dci=3 enq=7 running_epstate=1 running_ctxdeq=0x179deb1 -> stopped_epstate=3 stopped_ctxdeq=0x179deb1 stop_ok=yes stop_cc=1 stop_why=ok restore_ok=yes epstate_after=1 verdict=ctxdeq-live (field unchanged across the stop; either already current or not written back) ::
+[05:55:41Z] xHCI: Disk 'QEMU' 'QEMU HARDDISK' block_size=512 num_blocks=262144 (128 MiB)
+[05:55:41Z] :: USBREG: publish slot=1 lun=0 ix=0 block_size=512 num_blocks=262144 disks=1 ::
+[05:55:41Z] :: BOT: portreg why=bringup port=1 usb3 portsc=0x00001203 ccs=1 ped=1 oca=0 pr=0 pls=0(U0) pp=1 speed=4 cas=0 csc=0 pec=0 prc=0 plc=0 cec=0 pmsc=0x00000000 l1s=0(invalid) rwe=0 hird=0 l1slot=0 hle=0 li=0x00000000 result=PORTREG ::
+[05:55:41Z] :: BOT: portreg why=bringup port=10 usb2 portsc=0x00000e03 ccs=1 ped=1 oca=0 pr=0 pls=0(U0) pp=1 speed=3 cas=0 csc=0 pec=0 prc=0 plc=0 cec=0 pmsc=0x00000000 l1s=0(invalid) rwe=0 hird=0 l1slot=0 hle=0 li=0x00000000 result=PORTREG ::
+[05:55:41Z] :: BOT: portreg why=bringup port=11 usb2 portsc=0x00000603 ccs=1 ped=1 oca=0 pr=0 pls=0(U0) pp=1 speed=1 cas=0 csc=0 pec=0 prc=0 plc=0 cec=0 pmsc=0x00000000 l1s=0(invalid) rwe=0 hird=0 l1slot=0 hle=0 li=0x00000000 result=PORTREG ::
+[05:55:41Z] :: BOT: portreg why=bringup port=12 usb2 portsc=0x00000603 ccs=1 ped=1 oca=0 pr=0 pls=0(U0) pp=1 speed=1 cas=0 csc=0 pec=0 prc=0 plc=0 cec=0 pmsc=0x00000000 l1s=0(invalid) rwe=0 hird=0 l1slot=0 hle=0 li=0x00000000 result=PORTREG ::
+[05:55:41Z] :: BOT: knobs ring_trbs=16 botring64=off-16trb cbw=always-awaited order=console-first pump=spin+hlt result=KNOBS ::
+[05:55:41Z] :: SPACE: [wait=1680ms(n=1) setcfg=0ms(n=1) tur=1ms(n=1) sense=0ms(n=0) inq=0ms(n=1) rdcap=0ms(n=1) pub=1ms(n=1) resid=4ms] {cbw=0ms(n=5) data=0ms(n=4) csw=0ms(n=5) peak=0ms@cbw} ftdi=2ms(n=397) total=1686ms sum=1682ms per_ms=1996139 result=SPACE ::
+[05:55:41Z] :: BOT: [botseq] mount-first attempted lba0=ok matrices=deferred ::
+[05:55:41Z] :: STORSLOT: bringup done slot=1 ix=0 devices=1 diag=armed ::
+[05:55:41Z] :: FAT-LFN: SKIPPED — no FAT volume on the boot block device ::
+[05:55:41Z] FS: no FAT filesystem (NotFat)
+[05:55:41Z] :: BOOTLOG: 5 milestone(s) recorded (GUI-WITNESS ring) ::
+[05:55:41Z] :: BOOTLOG: [    1283 ms] ehci:kbd-armed ::
+[05:55:41Z] :: BOOTLOG: [    1287 ms] portsw:inert ::
+[05:55:41Z] :: BOOTLOG: [    1427 ms] gui:handoff ::
+[05:55:41Z] :: BOOTLOG: [    4031 ms] ftdi:console-up ::
+[05:55:41Z] :: BOOTLOG: [    4218 ms] block:up ::
+[05:55:41Z] [volumes] not mounted source=usb slot=1 fs=unknown part_type=0 reason=no-fat-volume ::
+[05:55:41Z] :: BPACE: enum:p12-done t=4335ms d=182ms ::
+[05:55:41Z] :: BPACE: stor-bringup t=4335ms d=0ms ::
+[05:55:41Z] :: BPACE: bot-first t=4337ms d=1ms ::
+[05:55:41Z] :: BPACE: stor-ready t=4341ms d=4ms ::
+[05:55:41Z] [users] store pinned via=sdhc ladder=global -> stays (STOREMOVE B530: the ladder moved after the first load; the store does not)
+[05:55:41Z] :: BPACE: total gui=1536ms ftdi=4153ms n=39 dropped=0 hz=1996139114 result=LEDGER ::
+[05:55:41Z] :: INSTALL-SELF: guard decision table (disarmed / match / multi-volume match / no-match / no-FAT / 0-sentinel / clone) => PASS ::
+[05:55:41Z] :: USBSTOR: boot_medium_kept=0 stick_at_boot=1 pw_write=ok mounted=- hotplug=- -> FAIL :: reason=unmountable-disk refused=1 ::
+[05:55:41Z] :: SELFGUARD: census disks=2 usb=0 sata=1 boot=ahci5/slot5 ::
+[05:55:41Z] :: FRGUARD: boot volume serial 0xfabe1afd found on NEITHER handle (Default blocks=262144 has 0 FAT volume(s), Sdhc blocks=32768 has 1) — the boot medium is not reachable through the block layer, so no substitution can be proven; writes ALLOWED (guard DISARMED) ::
+[05:55:41Z] :: SELFGUARD: classify global/slot1 (262144 sectors, 0 FAT volume(s)) -> Eligible reason=no-FAT-volume-on-this-disk ::
+[05:55:41Z] :: FR: UNAOS.LOG not reserved — R99: the boot FAT is sacred; the boot log goes to /var/log/boot-<n>.log on UnaFS (RAM until the root is bound) ::
+[05:55:41Z] :: SELFGUARD: classify ahci5/slot5 (1032192 sectors, 1 FAT volume(s)) -> INSTALL-SELF reason=carries-the-boot-volume-serial ::
+[05:55:41Z] :: install: candidate global/slot1 (262144 sectors) — no FAT volume, cannot be the boot device, ELIGIBLE ::
+[05:55:41Z] :: install: boot device ahci5/slot5 (1032192 sectors) serial=0xfabe1afd EXCLUDED ::
+[05:55:41Z] :: INSTALL-SELF: live => 1 of 2 candidate(s) EXCLUDED as the boot device (boot serial 0xfabe1afd, 1 carrying FAT) ::
+[05:55:41Z] [install] armed, verbs only: the unattended boot fixture (partition::run_fixture, run_demo) writes nothing on an image without tests-at-boot (R25; INSTALL4 B619)
+[05:55:41Z] :: SELFGUARD: census disks=2 usb=0 sata=1 boot=ahci5/slot5 ::
+[05:55:41Z] :: SELFGUARD: classify global/slot1 (262144 sectors, 0 FAT volume(s)) -> Eligible reason=no-FAT-volume-on-this-disk ::
+[05:55:41Z] :: SELFGUARD: classify ahci5/slot5 (1032192 sectors, 1 FAT volume(s)) -> INSTALL-SELF reason=carries-the-boot-volume-serial ::
+[05:55:41Z] :: install: candidate global/slot1 (262144 sectors) — no FAT volume, cannot be the boot device, ELIGIBLE ::
+[05:55:41Z] :: install: boot device ahci5/slot5 (1032192 sectors) serial=0xfabe1afd EXCLUDED ::
+[05:55:41Z] :: INSTALL-SELF: live-media global/slot1 — 0 FAT volume(s) read off the device, first serial=0x00000000, boot=0xfabe1afd => Eligible ::
+[05:55:41Z] :: INSTALL-SELF: live-media ahci5/slot5 — 1 FAT volume(s) read off the device, first serial=0xfabe1afd, boot=0xfabe1afd => BootDevice ::
+[05:55:41Z] :: INSTALL-SELF: live-media — 1 of 2 candidate(s) carry a readable FAT volume, 1 EXCLUDED as the boot device => PASS ::
+[05:55:41Z] :: INSTALL-SELF: live-media exclusion (role-swapped: boot serial := 0xfabe1afd read off ahci5/slot5) => EXCLUDED, PASS ::
+[05:55:41Z] :: USB: [usbw] scratch geometry: USB last_lba=262143 (num_blocks=262144), keep-out ceiling=0 [raw (no container in sector 0)] ::
+[05:55:41Z] [lock] held-too-long name=wm.rs:30384 at=wm.rs:30400 by=1@cpu5 ms=84 released=1
+[05:55:41Z] [lock] held-too-long name=wm.rs:30386 at=wm.rs:30400 by=1@cpu5 ms=84 released=1
+[05:55:41Z] [lock] held-too-long name=wm.rs:30385 at=wm.rs:30400 by=1@cpu5 ms=84 released=1
+[05:55:41Z] [lock] held-too-long name=wm.rs:30382 at=wm.rs:30400 by=1@cpu5 ms=84 released=1
+[05:55:41Z] [lock] held-too-long name=wm.rs:30197 at=wm.rs:30208 by=1@cpu5 ms=84 released=1
+[05:55:41Z] :: USB: [usbw] write lba=262143 ok — RMW+readback+restore, medium byte-identical ::
+[05:55:42Z] [wallpaper] probe try=3 found=0 kept=generated on=worker cpu=2 ms=1
+[05:55:42Z] [logts] source=counter anchor=rtc advancing=1 span_ms=3000 moved_s=3
+[05:55:43Z] :: BOT: pump budget=3992278228 peak=479600 sum=2490100 mean=27066 n=92 nowait=0 timeouts=0 storage_slot=1 route=0x0 depth=0 tag_mismatch=0 bad_sig=0 abandoned_in=0 abandoned_out=0 undrained=0 short_in=0 short_out=0 ev_late=0 ev_unaddressed=0 cbw_fault=0 db_in=59 db_out=61 ev_stopped=0 ev_stopped_li=0 ev_any=621 wrap_push=40 wrap_db=6 w=92/0/0/0/0/0/0/0/0/0/0/0 result=SUMMARY ::
+[05:55:43Z] :: USB: [botpark] key — an identity is (root port + route string); it survives re-enumeration and slot-id reuse, which is what the per-slot surrender could not. Four PARK clauses, first to reach its bound closes the account: surrenders>=2 (the ladder's verdict on two whole generations) | ladders>=6 (retry entries across all generations) | ms>=45000 (pump wall-clock charged to the identity) | dead>=8 (pump timeouts on a PROVABLY IDLE ring — no event, no foreign event, no doorbell for the whole wait; CUMULATIVE, so a live wait does not refund it). dead_streak>=2 additionally CUTS the pump budget to 1/8 of base — read dead= not dead_streak= when asking why a device did or did not park. named=no used to mean hub-downstream (no VID:PID banner) and be normal; XHCIHUB (S2) stores the downstream identity, so named=no is now a real anomaly. BOTLATCH M2: the dead clause is the only one with a forgiveness rule, because it is the only one that can be wrong about a HEALTHY device (a NAKing spin-up posts no event, exactly like a dead ring) — a COMPLETED transfer zeroes dead=, and a dead-ring park unparks itself once after 60000 ms for a single probe at the cut budget (reprobe= says none/armed/spent; a second park on the same identity is permanent) ::
+[05:55:43Z] :: BOT: park rollup accounts=0 parked=0 refused=0 backoff_refused=0 pass_refused=0 aborts=0 capped=92 yields=0 pump_refused=0 anon=0 ladder_max=6 surrender_max=2 cycle_max_ms=45000 dead_max=8 pass_ms=10000 pass_pump_ms=2000 reprobes=0 dead_forgiven=0 reprobe_ms=60000 result=CENSUS ::
+[05:55:43Z] :: BOT: tx single=30 multi=0 maxlen=512 wrapped_tx=2 rd_sectors=24 wr_sectors=2 max_blocks=64 result=SIZES ::
+[05:55:44Z] [wallpaper] probe try=4 found=0 kept=generated on=worker cpu=2 ms=1
+[05:55:46Z] [wallpaper] probe try=5 found=0 kept=generated on=worker cpu=2 ms=1
+[05:57:05Z] [tlb] shootdown escalated nmi_mask=16 acked=1/1 masked_mask=0 rip=- nmi_us=2487 escalations=1 (KVMLAT: past the 2000 us IPI bound; IF=1 at the NMI: the IPI was late, not refused)
+[05:58:00Z] [wc-g] rollup win=1 scope=window paygo=yes samples=4 coher=0 race=0 blit=4 clean=0 slow=2 maxus=14234 wit_us=4081 frame_us=16667 -> BLIT
+[05:58:00Z] [wcgseam] census win=1 armed=yes glyphs=0 locked=0 seam_win=0 routed=no -> QUIET
+[05:58:00Z] [wc-h] rollup win=1 scope=window emit=1 age_ms=140896 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 shrunk=0 blitnet=[0,1,0,0,0,0,0,0] beam=blind beamobs=0 beamwaits=0 beamwait_us=0 beammaxwait_us=0 beamgiveup=0 beamcross_ppk=1353 blitter=cpu blit_us=1279 gpu_fallback=0 fixture=1 whole=3 banded=0 lines=4 minspan=0 minspan_bytes=0 maxpresent_us=754 minpresent_us=252 presspread=2 presspop=3 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[05:59:00Z] [wc-h] rollup win=1 scope=window emit=2 age_ms=200899 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 shrunk=0 blitnet=[0,1,0,0,0,0,0,0] beam=blind beamobs=0 beamwaits=0 beamwait_us=0 beammaxwait_us=0 beamgiveup=0 beamcross_ppk=1786 blitter=cpu blit_us=1529 gpu_fallback=0 fixture=1 whole=4 banded=0 lines=4 minspan=0 minspan_bytes=0 maxpresent_us=754 minpresent_us=252 presspread=2 presspop=4 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[06:00:00Z] [wc-h] rollup win=1 scope=window emit=3 age_ms=261077 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 shrunk=0 blitnet=[0,1,0,0,0,0,0,0] beam=blind beamobs=0 beamwaits=0 beamwait_us=0 beammaxwait_us=0 beamgiveup=0 beamcross_ppk=2239 blitter=cpu blit_us=2103 gpu_fallback=0 fixture=1 whole=5 banded=0 lines=4 minspan=0 minspan_bytes=0 maxpresent_us=754 minpresent_us=252 presspread=2 presspop=5 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE

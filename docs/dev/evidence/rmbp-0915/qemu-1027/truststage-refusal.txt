@@ -1,0 +1,5 @@
+⚡ kernel features: witness,selfhost,wcg-paygo,wcdvalve,logts,ehcihid,kbdwit,smc,sdw,sdhcblk,bt,btc,a2dp,tickless,login,installdemo,smolnet,wifi,wifi2,wifi3,wifi4,wifi9,wifi10,nvidia-kepler,nvidia-kepler-takeover,noaspm,nvidia-kepler-ce,wc,nvidia-kepler-vblank,deadman,linuxabi,busreg,lumen,stria,netring3,selfdiag,lidsleep,videoplayer,intel-ivb,unaos_ivb,gen7,gen7r8,gen7blit,gen7r9,gmux_igd,beam,quarry,facet,sdwrite,ftdirx,usbnet,ahci,ahci-write,unafs,ahciroot,hda,hda-tone,uvc,ioapic
+⚡ ROOTDISK2: UnaFS volume 4096 MiB (content 27 MiB: apps + lib + system; floor 4096)
+⚡ UNAFSX86: formatting the x86 UnaFS system volume (4096 MiB)...
+❌ TRUST: system/trust/roots.pem absent and the line arms NETRING3/LUMEN — run tools/trust-bundle — no card image
+--- the refusal (TRUSTSTAGE B836), 2026-10-27 06:00Z, twoboot --card over an ESP built without tools/trust-bundle in /home/pmes/src/github.com/pmes/UnaOS-rmbp
