@@ -205,3 +205,50 @@ fn wifidhcp() {
         }
     }
 }
+
+// ── MT7925S7 (zenbook-ledger Z34): `tests wifiscan` — the station's scan over the MT7925 (S7) ────────────────────────────
+/// The most BSSes one scan lists (each once, on its own `[wifi] scan bss=` line).
+const SCAN_LIST_MAX: usize = 32;
+
+/// `tests wifiscan` (MT7925S7, zenbook-ledger Z34): the operator's scan, never at boot (BP-net-7). The driver's KAT first
+/// (`mt7925::scan_kat`, hand-assembled request and RX descriptors); with no MT7925 registered (QEMU, the rMBP) that is the
+/// verdict and nothing touches a device. Else `mt7925::scan` hands each received beacon / probe response here raw: parsed by
+/// the ONE codec (`wifi_core::ieee80211::parse_beacon`), counted, each new BSSID listed once (bounded `SCAN_LIST_MAX`; the
+/// dedup array lives on this frame and is dropped at return, no list is kept), and the beacon count recorded in the
+/// station's scan record (`status::set_scan`, the `scan=` of `wifi` and `tests wifi`). PASS = the KAT held and at least one
+/// BSS was heard.
+pub fn wifiscan() {
+    let kat = crate::drivers::mt7925::scan_kat();
+    let k = if kat { "ok" } else { "FAIL" };
+    if !crate::drivers::mt7925::registered() {
+        serial_println!(":: wifiscan: kat={} radio=absent -> {} ::", k, if kat { "PASS" } else { "FAIL" });
+        return;
+    }
+    let mut seen = [[0u8; 6]; SCAN_LIST_MAX];
+    let (mut n, mut beacons, mut frames) = (0usize, 0u32, 0u32);
+    let _ = crate::drivers::mt7925::scan(&mut |f: &[u8]| -> bool {
+        frames += 1;
+        let Some(b) = wifi_core::ieee80211::parse_beacon(f) else { return false };
+        beacons += 1;
+        if n >= SCAN_LIST_MAX || seen[..n].contains(&b.bssid) {
+            return false;
+        }
+        seen[n] = b.bssid;
+        n += 1;
+        let ssid: alloc::string::String =
+            b.ssid.iter().take(32).map(|&c| if (0x20..0x7f).contains(&c) && c != b'"' { c as char } else { '.' }).collect();
+        let ch = b.channel.map_or(alloc::string::String::from("-"), |c| alloc::format!("{}", c));
+        let m = b.bssid;
+        serial_println!(
+            "[wifi] scan bss={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} ch={} sec={} ssid=\"{}\"",
+            m[0], m[1], m[2], m[3], m[4], m[5], ch, if b.protected() { "protected" } else { "open" }, ssid
+        );
+        true
+    });
+    status::set_scan(beacons);
+    serial_println!(
+        "[wifi] scan radio=mt7925 frames={} beacons={} bss={} -> {}",
+        frames, beacons, n, if n > 0 { "listed" } else { "empty" }
+    );
+    serial_println!(":: wifiscan: kat={} radio=mt7925 bss={} -> {} ::", k, n, if kat && n > 0 { "PASS" } else { "FAIL" });
+}
