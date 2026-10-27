@@ -874,7 +874,7 @@ mod reg {
         let tid = DIE_TID.load(Acquire);
         let freed = if died && tid != 0 { release_task(tid, "tests lockreg") } else { 0 };
         let back = DIE.try_lock().is_some();
-        let _ = DIE.take_poison(); let (gword, poisoned, retake_ms) = guard_leg(); let released = died && freed == 1 && back && gword == "ok"; let ((hword, fword), mword) = (heap_leg(), mount_leg()); let rword = crate::allocator::heappoison::reinit_leg(); // HEAPREGION (B854): the free-first check (`free_first=`) and the scratch re-init (`heap_reinit=`). POISON2 (B846): the heap's and the mount's synthetic deaths, read released and checked (reg tail). STACKGUARD3 (B832): the death leg's mark cleared; the REAL guard leg (file tail) must pass too. LINE-NEUTRAL fold
+        let _ = DIE.take_poison(); let (gword, poisoned, retake_ms) = guard_leg(); let released = died && freed == 1 && back && gword == "ok"; let ((hword, fword), mword) = (heap_leg(), mount_leg()); let rword = crate::allocator::heappoison::reinit_leg(); let cword = if on { crate::drivers::sdhc::card_leg() } else { "skip(unarmed)" }; // HEAPREGION (B854): the free-first check (`free_first=`) and the scratch re-init (`heap_reinit=`). POISON2 (B846): the heap's and the mount's synthetic deaths, read released and checked (reg tail). STACKGUARD3 (B832): the death leg's mark cleared; the REAL guard leg (file tail) must pass too. LINE-NEUTRAL fold
         let (mut acq, mut tracked, mut held_max) = (EARLY.load(Relaxed), 0u64, 0u64);
         for p in PARTS.iter() {
             acq += p.acq.load(Relaxed);
@@ -888,9 +888,9 @@ mod reg {
         let max_at = HELD_MAX_AT.load(Relaxed);
         // SAFETY: `max_at` is a `&'static Location` or null.
         let max_at = if max_at.is_null() { None } else { Some(unsafe { &*max_at }) };
-        let pass = on && held_done && named && released && inv == 0 && overflow == 0 && leg_ok(hword) && leg_ok(mword) && leg_ok(rword) && leg_ok(fword);
+        let pass = on && held_done && named && released && inv == 0 && overflow == 0 && leg_ok(hword) && leg_ok(mword) && leg_ok(rword) && leg_ok(fword) && (cword == "registered" || cword.starts_with("skip"));
         serial_println!(
-            ":: LOCKREG: locks={} wrapped={}/{} held_max_ms={} inversions={} released_on_death={} poisoned={} retake_ms={} heap_check={} mount_poison={} heap_reinit={} free_first={} named={} overflow={} -> {} :: held_max_at={} held_max_via={} held_max_by={}@cpu{} poison_slots={}/16 poison_lost={}",
+            ":: LOCKREG: locks={} wrapped={}/{} held_max_ms={} inversions={} released_on_death={} poisoned={} retake_ms={} heap_check={} mount_poison={} heap_reinit={} free_first={} named={} overflow={} -> {} :: held_max_at={} held_max_via={} held_max_by={}@cpu{} poison_slots={}/16 poison_lost={} card={}",
             CLASS_N.load(Relaxed),
             tracked,
             acq,
@@ -902,7 +902,7 @@ mod reg {
             if pass { "PASS" } else { "FAIL" }, Site(class_site(HELD_MAX_CLASS.load(Relaxed))), // KVMLAT (B578): the longest hold's lock, by name (`?` = none recorded)
             Site(max_at),
             tag_tid(max_tag),
-            tag_cpu(max_tag), POISON_N.load(Acquire), POISON_LOST.load(Relaxed)
+            tag_cpu(max_tag), POISON_N.load(Acquire), POISON_LOST.load(Relaxed), cword
         );
     }
 

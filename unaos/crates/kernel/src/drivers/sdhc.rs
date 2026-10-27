@@ -4270,3 +4270,44 @@ fn card_lock() -> crate::sync::MutexGuard<'static, Option<SdCard>> {
     }
     guard
 }
+
+// ===================================================================================
+// KEYBOOT3 (rmbp-ledger B856) — FILE-TAIL append, NOT `sdw`-gated: the PROOF that a CARD hold is in the registry's walk.
+// A CARD holder that dies is released POISONED by `sync::release_task`'s walk (STACKGUARD3 B832) only if its hold was
+// recorded there. `tests lockreg` takes CARD the way the data paths do (masked, `CARD.lock()`) and asks the registry what
+// this task holds: `registered` = CARD's construction site is among them. CARD is never added to `lockowner` (that path
+// force-unlocks without the walk, and the walk already releases it).
+// ===================================================================================
+
+/// `tests lockreg`'s `card=` word: `registered` | `unregistered` | `skip(no-task)` (no task id: the registry is off).
+pub fn card_leg() -> &'static str {
+    use core::fmt::Write;
+    struct Buf {
+        b: [u8; 512],
+        n: usize,
+    }
+    impl Write for Buf {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            let k = s.len().min(self.b.len() - self.n);
+            self.b[self.n..self.n + k].copy_from_slice(&s.as_bytes()[..k]);
+            self.n += k;
+            Ok(())
+        }
+    }
+    let tid = crate::sync::here_tid();
+    if tid == 0 {
+        return "skip(no-task)";
+    }
+    let site = CARD.site();
+    let file = site.file().rsplit('/').next().unwrap_or(site.file());
+    let mut want = Buf { b: [0; 512], n: 0 };
+    let _ = write!(want, "{}:{}", file, site.line());
+    let mut held = Buf { b: [0; 512], n: 0 };
+    crate::arch::without_interrupts(|| {
+        let g = CARD.lock(); // TRASHLOCK (B523): CARD only under without_interrupts, as every CARD take
+        let _ = write!(held, "{}", crate::sync::task_holds(tid));
+        drop(g);
+    });
+    let w = &want.b[..want.n];
+    if held.b[..held.n].split(|&c| c == b',').any(|t| t == w) { "registered" } else { "unregistered" }
+}

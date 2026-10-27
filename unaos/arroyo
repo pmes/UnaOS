@@ -683,6 +683,9 @@ _feats="${_feats}sdw,"
 # not ask to WRITE its boot medium must be incapable of it, and a shipping login boot never carries a
 # fixture credential. Implies `login` in Cargo.toml. Kept in sync with builder/src/main.rs.
 [ -n "${UNAOS_LOGINST:-}" ] && _feats="${_feats}loginst,"
+# KEYBOOT3 (rmbp-ledger B856): UNAOS_KEYBOOT_DEFER=1 defers the first-user keying of the native root (`[keyboot]
+# first-user keying=deferred`); unset keys it. Implies `login` in Cargo.toml. Kept in sync with builder/src/main.rs.
+[ -n "${UNAOS_KEYBOOT_DEFER:-}" ] && _feats="${_feats}keyboot_defer,"
 # R77 M3: UNAOS_TESTS_AT_BOOT=1 runs the desktop fixture registry (`tests.rs`) at registration, in boot order, exactly as before the `tests` verb existed; unset, the desktop boots quiet and `tests` fires them. The test/test-arm lanes default it ON (top of this file). Kept in sync with builder/src/main.rs.
 [ -n "${UNAOS_TESTS_AT_BOOT:-}" ] && _feats="${_feats}tests-at-boot,"
 # QUIETBOOT (R80): UNAOS_CENSUS=1 boots with every periodic sampler (`census.rs`) on; unset, the boot prints the boot and `census start <name>` turns one on. The battery verbs export it (head `case`).
@@ -12542,6 +12545,10 @@ kernel8() {
     if [ -n "${UNAOS_LOGINST:-}" ]; then
         K8_FEATS="${K8_FEATS},loginst"
         echo -e "${COLOR_YELLOW}  • UNAOS_LOGINST: the LOGIN fixtures (BOOT-TIME WRITE: user una with a known password in USERS.DAT; home; screen)${COLOR_RESET}"
+    fi
+    if [ -n "${UNAOS_KEYBOOT_DEFER:-}" ]; then
+        K8_FEATS="${K8_FEATS},keyboot_defer"
+        echo -e "${COLOR_YELLOW}  • UNAOS_KEYBOOT_DEFER: the first user's password does NOT key the native root (KEYBOOT3 B856; keying deferred)${COLOR_RESET}"
     fi
     if [ -n "${UNAOS_BUSREG:-}" ]; then
         K8_FEATS="${K8_FEATS},busreg"
