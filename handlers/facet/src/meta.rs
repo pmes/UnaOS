@@ -77,6 +77,7 @@ pub fn read(bytes: &[u8], format: Format) -> Meta {
         Format::Bmp => bmp(bytes),
         Format::Qoi => qoi(bytes),
         Format::WebP => webp(bytes),
+        Format::Heic => Meta::default(), // HEVCHEIC (SR220): the HEIF Exif item is owed (handlers.md §5)
         Format::Svg => Meta::default(), // markup carries no pixel metadata Facet reads; svg_core renders it
     }
 }

@@ -1498,6 +1498,7 @@ name = "facet"
 version = "0.1.0"
 dependencies = [
  "bandy",
+ "gneiss_pal",
  "image",
  "log",
  "pixel_core",
