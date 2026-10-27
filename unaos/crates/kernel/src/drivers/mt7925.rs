@@ -1,9 +1,9 @@
-//! CHARTER: Kernel — driver (the MediaTek MT7925 Wi-Fi 7 radio's S1 probe, zenbook-ledger Z5, S2 driver-own and the chip id, Z11, and S3 the WFSYS reset and the WFDMA rings, Z15, and S4 the firmware upload, Z17; no CODEX §2 handler owns a NIC driver, the BCM4331 `wifi/**` sits in the same seam)
+//! CHARTER: Kernel — driver (the MediaTek MT7925 Wi-Fi 7 radio's S1 probe, zenbook-ledger Z5, S2 driver-own and the chip id, Z11, and S3 the WFSYS reset and the WFDMA rings, Z15, and S4 the firmware upload, Z17, and S5 the NIC capability and MAC, Z23; no CODEX §2 handler owns a NIC driver, the BCM4331 `wifi/**` sits in the same seam)
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 The Architect & Una
 
 //! MT7925 — S1, the probe (ZENBOOKMT7925, zenbook-ledger Z5). The ladder is
-//! `docs/dev/OS/06_NETWORK_STACK/mt7925.md`; S2 (MT7925S2, Z11), S3 (MT7925S3, Z15) and S4 (MT7925S4, Z17) are the three file-tail blocks; S5..S10 are owed there by name.
+//! `docs/dev/OS/06_NETWORK_STACK/mt7925.md`; S2 (MT7925S2, Z11), S3 (MT7925S3, Z15), S4 (MT7925S4, Z17) and S5 (MT7925S5, Z23) are the four file-tail blocks; S6..S10 are owed there by name.
 //!
 //! WHAT THIS RUNG DOES. Once per boot, from the three storage-ready passes in `main.rs` (beside `wifi::service()`,
 //! the same forward-only polled shape), and only after `boot::services_gate("wifi")` answers (R86, BP-net-4):
@@ -89,6 +89,7 @@ pub fn service() {
         S_S2 => s2(),
         S_S3 => s3(),
         S_S4 => s4(), // MT7925S4 (zenbook-ledger Z17): the pass after a clean S3 line (`s3_done`)
+        S_S5 => s5(), // MT7925S5 (zenbook-ledger Z23): the pass after a kept S4 line (`s4_done`)
         _ => {}
     }
 }
@@ -715,7 +716,8 @@ const MAX_REGIONS: usize = 16;
 const TXD_BYTES: usize = 64;
 /// TX descriptor ctrl: LAST_SEC0 (bit 30); SD_LEN0 sits in bits 29:16.
 const LAST_SEC0: u32 = 1 << 30;
-/// Event ring: 31 buffers of 2048 bytes in one 64 KiB block (the 32nd descriptor stays DMA_DONE: a full ring).
+/// Event ring: 31 buffers of 2048 bytes handed from one 64 KiB block of 32 slots; one descriptor always stays unhanded
+/// (a full ring), and `recycle` (MT7925S5, Z23) re-hands the slot behind each consumed event, the 32nd slot first.
 const RX_BUFS: u32 = 31;
 const RX_BUF_BYTES: u64 = 2048;
 const RX_BLOCK: usize = 65536;
@@ -725,12 +727,16 @@ const EVENT_MS: u64 = 3000;
 const TXDONE_MS: u64 = 100;
 const N9_MS: u64 = 2000;
 
-/// The device-facing state of one S4 run; owned by `s4`'s stack frame, no lock.
+/// The device-facing state of the MCU channel S4 opens; owned by `s4_run`'s frame, then (MT7925S5, Z23) handed to S5
+/// through `MCU_LINK` only when FW_START was acked and N9 read ready.
 struct Hw {
     q16: u64,
     q15: u64,
-    /// Ring 0's descriptor memory, the command page, the event-buffer block.
+    /// Ring 0's register block (MT7925S5: `recycle` moves its CPU index).
+    q0: u64,
+    /// Ring 0's descriptor memory, the WM ring (MT7925S5: so S5 can re-arm ring 15), the command page, the event-buffer block.
     rx0: u64,
+    wm: u64,
     page: u64,
     rxb: u64,
     /// CPU indices of rings 16 and 15, the next event descriptor, the last command sequence (1..15).
@@ -738,6 +744,8 @@ struct Hw {
     wi: u32,
     ri: u32,
     seq: u8,
+    /// The last matched event's bytes, rxd included (MT7925S5: copied before its buffer is re-handed).
+    last: Vec<u8>,
 }
 
 /// What `s4` says at the end.
@@ -856,14 +864,7 @@ fn s4_run(p: &Probe, hold: &mut Vec<u8>, rep: &mut Rep) -> Result<(), String> {
     }
     *hold = patch_bytes;
     dma_off(b)?;
-    for i in 0..RX_BUFS as u64 {
-        let d = rx0 + i * DESC_BYTES;
-        // SAFETY: descriptor i of ring 0's block (RING_BYTES, 32 descriptors, i < 31); the buffer is inside the 64 KiB block.
-        unsafe {
-            core::ptr::write_volatile(d as *mut u32, (rxb + i * RX_BUF_BYTES) as u32);
-            core::ptr::write_volatile((d + 4) as *mut u32, (RX_BUF_BYTES as u32) << 16); // DMA_DONE clear: handed to the device
-        }
-    }
+    hand_rx(rx0, rxb); // MT7925S5 (Z23) hoisted the 31-buffer hand into `hand_rx`, unchanged, so S4 and S5 share it
     let mut rb = arm(q16, tx16, 0);
     rb &= arm(q15, wm, 0);
     rb &= arm(q0, rx0, RX_BUFS);
@@ -875,7 +876,7 @@ fn s4_run(p: &Probe, hold: &mut Vec<u8>, rep: &mut Rep) -> Result<(), String> {
     let saved = unsafe { crate::arch::pci::read_config_16(p.bus, p.dev, p.func, PCI_COMMAND) };
     crate::drivers::pci::PciScanner::enable_bus_master(p.bus, p.dev, p.func); // the ONE config write
     rep.saved = Some(saved);
-    let mut h = Hw { q16, q15, rx0, page, rxb, fi: 0, wi: 0, ri: 0, seq: 0 };
+    let mut h = Hw { q16, q15, q0, rx0, wm, page, rxb, fi: 0, wi: 0, ri: 0, seq: 0, last: Vec::new() };
     let sem = cmd(&mut h, CID_SEM, &SEM_GET.to_le_bytes()).map_err(|e| why_of(e, String::from("sem")))?;
     match sem {
         SEM_IS_DL => rep.patch = String::from("resident"),
@@ -903,6 +904,7 @@ fn s4_run(p: &Probe, hold: &mut Vec<u8>, rep: &mut Rep) -> Result<(), String> {
     let misc = b + CONN_HOST_CSR_TOP + CONN_ON_MISC;
     let (ready, _) = spin_until(N9_MS, || r32(misc) & FW_N9_RDY == FW_N9_RDY);
     rep.n9 = if ready { "ready" } else { "timeout" };
+    s4_done(h, rep); // MT7925S5 (Z23): the MCU channel handed to S5 only when FW_START was acked and N9 is ready
     Ok(())
 }
 
@@ -928,18 +930,15 @@ fn tx_done(q: u64, next: u32) -> bool {
     spin_until(TXDONE_MS, || r32(q + 12) & 0xfff == next).0
 }
 
-/// One acked MCU command: the connac2 TXD built in the command page, posted on ring 15, its TX completion awaited, then
-/// the event with this sequence. Ok = the event's status byte (@40).
+/// One acked MCU command: the legacy connac2 TXD built in the command page, posted on ring 15, its TX completion awaited,
+/// then the event with this sequence. Ok = the event's status byte (@40). MT7925S5 (Z23) hoisted the shared head into
+/// `txd_head` and the post/wait into `send`, so `uni_cmd` rides the same path; the bytes written are unchanged.
 fn cmd(h: &mut Hw, cid: u8, payload: &[u8]) -> Result<u8, &'static str> {
     let total = TXD_BYTES + payload.len();
-    h.seq = if h.seq >= 15 { 1 } else { h.seq + 1 };
-    let seq = h.seq;
+    let seq = txd_head(h, total);
     let pg = h.page;
     // SAFETY: the 4 KiB command page (total <= 4096: payloads are at most 12 bytes), owned by this run, one command at a time.
     unsafe {
-        core::ptr::write_bytes(pg as *mut u8, 0, TXD_BYTES + 16);
-        core::ptr::write_volatile(pg as *mut u32, total as u32 | (2 << 23) | (0x20 << 25)); // TX_BYTES | PKT_FMT=CMD | Q_IDX
-        core::ptr::write_volatile((pg + 4) as *mut u32, 1 << 14); // HDR_FORMAT=CMD
         core::ptr::write_volatile((pg + 32) as *mut u16, (total - 32) as u16);
         core::ptr::write_volatile((pg + 34) as *mut u16, 0x8000); // pq_id
         core::ptr::write_volatile((pg + 36) as *mut u8, cid);
@@ -950,37 +949,48 @@ fn cmd(h: &mut Hw, cid: u8, payload: &[u8]) -> Result<u8, &'static str> {
             core::ptr::write_volatile((pg + TXD_BYTES as u64 + i as u64) as *mut u8, *v);
         }
     }
-    let next = post(h.q15, h.wi, pg, total as u32);
-    h.wi = next;
-    if !tx_done(h.q15, next) {
-        return Err("tx");
-    }
-    event(h, seq)
+    send(h, total, seq)
 }
 
-/// The event ring: descriptor `ri` polled for DMA_DONE (the whole wait bounded EVENT_MS), its buffer's seq (@37) matched,
-/// status @40 returned; other events are skipped. No recycling: the 32nd event is the `rx-full` refusal.
+/// The event ring, the ONE event consumer: descriptor `ri` polled for DMA_DONE (the whole wait bounded EVENT_MS), its
+/// buffer's seq (@37) matched, status @40 returned; other events are skipped. MT7925S5 (Z23, S4-RECYCLE): a matched
+/// event's bytes go to `h.last` first, then every consumed descriptor is followed by one `recycle`, so the ring never fills.
 fn event(h: &mut Hw, seq: u8) -> Result<u8, &'static str> {
     let t0 = crate::arch::ms();
     loop {
-        if h.ri >= RX_BUFS {
-            return Err("rx-full");
-        }
         let left = EVENT_MS.saturating_sub(crate::arch::ms().saturating_sub(t0));
         if left == 0 {
             return Err("event");
         }
         let d = h.rx0 + h.ri as u64 * DESC_BYTES;
-        // SAFETY: descriptor ri (< 31) of ring 0's block; a status read.
+        // SAFETY: descriptor ri (< RING_DEPTH) of ring 0's block; a status read.
         let (done, _) = spin_until(left, || unsafe { core::ptr::read_volatile((d + 4) as *const u32) } & DMA_DONE != 0);
         if !done {
             return Err("event");
         }
         core::sync::atomic::fence(Ordering::SeqCst);
         let buf = h.rxb + h.ri as u64 * RX_BUF_BYTES;
-        h.ri += 1;
-        // SAFETY: inside this descriptor's 2048-byte buffer, which the device has finished writing (DMA_DONE).
-        let (got, status) = unsafe { (core::ptr::read_volatile((buf + 37) as *const u8), core::ptr::read_volatile((buf + 40) as *const u8)) };
+        // SAFETY: descriptor ri's ctrl word and its 2048-byte buffer, which the device has finished writing (DMA_DONE).
+        let (ctrl, got, status) = unsafe {
+            (
+                core::ptr::read_volatile((d + 4) as *const u32),
+                core::ptr::read_volatile((buf + 37) as *const u8),
+                core::ptr::read_volatile((buf + 40) as *const u8),
+            )
+        };
+        if got == seq {
+            // The reply's bytes (SD_LEN0, capped at the buffer) leave the buffer before it is re-handed; a reply split over
+            // buffers (LAST_SEC0 clear) keeps nothing, so S5 reads it as `cap-parse`.
+            h.last.clear();
+            if ctrl & LAST_SEC0 != 0 {
+                let n = (((ctrl & SD_LEN0) >> 16) as u64).min(RX_BUF_BYTES);
+                for i in 0..n {
+                    // SAFETY: inside this descriptor's 2048-byte buffer (i < n <= RX_BUF_BYTES), written by the device.
+                    h.last.push(unsafe { core::ptr::read_volatile((buf + i) as *const u8) });
+                }
+            }
+        }
+        recycle(h);
         if got == seq {
             return Ok(status);
         }
@@ -1102,4 +1112,269 @@ fn ram(h: &mut Hw, fw: &[u8]) -> Result<(u32, u32), String> {
         off = end;
     }
     Ok((ov.is_some() as u32, ov.unwrap_or(0)))
+}
+
+// ── MT7925S5 (zenbook-ledger Z23) — S5: S4-RECYCLE, the NIC capability over a unified command, the MAC address ─────────
+// Once, on the storage-ready pass after a kept S4 line (`s4_done` hands to S_S5 and parks the MCU channel in `MCU_LINK`
+// only when FW_START was acked and N9 read ready). Linux's `mt7925_run_firmware`: firmware, then
+// `mt7925_mcu_get_nic_capability` = the unified CHIP_CONFIG command (cid 0x0e) carrying the NIC_CAPA tag, its reply a count
+// and TLVs (MAC address 7, phy caps 8, chip caps 0x20). S4 gave own back with the N9 running, so S5 re-takes it and does
+// linux's wake reset (`mt792x_wpdma_reinit_cond`: DMA off, indices 0, RX refilled, DMA on) every time: the WFDMA_DUMMY_CR
+// flag that would say whether it is needed is S3b's, owed. Bus master is left as S4 left it (on); no config write, no
+// interrupt enable, nothing transmitted over the air. The efuse buffer mode and the CLC are owed (S5b, S5-CLC).
+// Hardware facts only; no code copied.
+
+const S_S5: u8 = 7;
+/// The MCU channel S4 opened (rings, command page, event block, indices, seq): written by `s4_done`, taken by `s5`, put
+/// back by `s5` on a clean line for the next rung. Never held across MMIO, a spin or a command.
+static MCU_LINK: crate::sync::Mutex<Option<Hw>> = crate::sync::Mutex::new(None);
+/// The radio's MAC address from the capability reply: written by `s5` on a clean line, read by `mac`.
+static MAC: crate::sync::Mutex<Option<[u8; 6]>> = crate::sync::Mutex::new(None);
+
+/// MCU_UNI_CMD_CHIP_CONFIG and its UNI_CHIP_CONFIG_NIC_CAPA tag (mt76_connac_mcu.h, mt7925/mcu.h).
+const UNI_CHIP_CONFIG: u16 = 0x0e;
+const NIC_CAPA: u16 = 3;
+/// The unified command TXD (connac2 mcu_uni_txd): 48 bytes; option = ACK | UNI | SET (a set command wanting its reply).
+const UNI_TXD_BYTES: usize = 48;
+const UNI_OPT_EXT_ACK: u8 = 0x07;
+/// The event header (mt7925_mcu_rxd) the reply's body follows, and the capability count header after it.
+const RXD_BYTES: usize = 44;
+const CAP_HDR: usize = 4;
+/// Capability TLV tags (MT_NIC_CAP_*): MAC address, phy caps (13 bytes), chip caps (u64).
+const TAG_MAC: u16 = 7;
+const TAG_PHY: u16 = 8;
+const TAG_CHIP_CAP: u16 = 0x20;
+const PHY_CAP_BYTES: usize = 13;
+/// RX descriptor ctrl: the received byte count (SD_LEN0, bits 29:16).
+const SD_LEN0: u32 = 0x3fff << 16;
+
+/// Ring 0's 31 buffers handed (S4's loop, hoisted unchanged by MT7925S5): descriptor i gets slot i of the event block, its
+/// length, DMA_DONE clear. Descriptor 31 is left as it is; the CPU index (31) is the caller's `arm`.
+fn hand_rx(rx0: u64, rxb: u64) {
+    for i in 0..RX_BUFS as u64 {
+        let d = rx0 + i * DESC_BYTES;
+        // SAFETY: descriptor i of ring 0's block (RING_BYTES, 32 descriptors, i < 31); the buffer is inside the 64 KiB block.
+        unsafe {
+            core::ptr::write_volatile(d as *mut u32, (rxb + i * RX_BUF_BYTES) as u32);
+            core::ptr::write_volatile((d + 4) as *mut u32, (RX_BUF_BYTES as u32) << 16); // DMA_DONE clear: handed to the device
+        }
+    }
+}
+
+/// The head every MCU command shares (hoisted out of `cmd`): the next sequence (1..15), the page's header zeroed, DW0
+/// (byte count, PKT_FMT = CMD, Q_IDX = the MCU port's RX queue 0) and DW1 (HDR_FORMAT = CMD). Returns the sequence.
+fn txd_head(h: &mut Hw, total: usize) -> u8 {
+    h.seq = if h.seq >= 15 { 1 } else { h.seq + 1 };
+    let pg = h.page;
+    // SAFETY: the 4 KiB command page, owned by the MCU channel, one command at a time; 80 bytes zeroed.
+    unsafe {
+        core::ptr::write_bytes(pg as *mut u8, 0, TXD_BYTES + 16);
+        core::ptr::write_volatile(pg as *mut u32, total as u32 | (2 << 23) | (0x20 << 25)); // TX_BYTES | PKT_FMT=CMD | Q_IDX
+        core::ptr::write_volatile((pg + 4) as *mut u32, 1 << 14); // HDR_FORMAT=CMD
+    }
+    h.seq
+}
+
+/// The tail every MCU command shares (hoisted out of `cmd`): the page posted on ring 15, its TX completion awaited, then
+/// the event with `seq`.
+fn send(h: &mut Hw, total: usize, seq: u8) -> Result<u8, &'static str> {
+    let next = post(h.q15, h.wi, h.page, total as u32);
+    h.wi = next;
+    if !tx_done(h.q15, next) {
+        return Err("tx");
+    }
+    event(h, seq)
+}
+
+/// One acked unified MCU command on the same path as `cmd`: the 48-byte uni TXD (len, cid, pkt_type 0xa0, seq, host-to-WM,
+/// option ACK|UNI|SET) and the TLV payload after it. Ok = the event's byte @40 (unused by CHIP_CONFIG); its bytes in `h.last`.
+fn uni_cmd(h: &mut Hw, cid: u16, payload: &[u8]) -> Result<u8, &'static str> {
+    let total = UNI_TXD_BYTES + payload.len();
+    let seq = txd_head(h, total);
+    let pg = h.page;
+    // SAFETY: the 4 KiB command page (total <= 4096: S5's payload is 8 bytes), owned by the MCU channel, one command at a time.
+    unsafe {
+        core::ptr::write_volatile((pg + 32) as *mut u16, (total - 32) as u16); // len, not counting the 32-byte hardware TXD
+        core::ptr::write_volatile((pg + 34) as *mut u16, cid);
+        core::ptr::write_volatile((pg + 37) as *mut u8, 0xa0); // pkt_type
+        core::ptr::write_volatile((pg + 39) as *mut u8, seq);
+        core::ptr::write_volatile((pg + 42) as *mut u8, 0); // s2d: host to WM
+        core::ptr::write_volatile((pg + 43) as *mut u8, UNI_OPT_EXT_ACK);
+        for (i, v) in payload.iter().enumerate() {
+            core::ptr::write_volatile((pg + UNI_TXD_BYTES as u64 + i as u64) as *mut u8, *v);
+        }
+    }
+    send(h, total, seq)
+}
+
+/// S4-RECYCLE: after descriptor `ri` is consumed, the slot one behind it (`ri + 31`, mod 32) gets its own fixed buffer back
+/// (buf1 and info 0, the length in ctrl, DMA_DONE clear), a fence, then ring 0's CPU index moves to `ri`, so 31 buffers stay
+/// handed and one descriptor unhanded; `ri` advances, wrapping at 32.
+fn recycle(h: &mut Hw) {
+    let slot = (h.ri + RX_BUFS) % RING_DEPTH;
+    let d = h.rx0 + slot as u64 * DESC_BYTES;
+    // SAFETY: descriptor `slot` (< 32) of ring 0's block; the buffer is slot `slot` of the 64 KiB event block (32 x 2 KiB).
+    unsafe {
+        core::ptr::write_volatile(d as *mut u32, (h.rxb + slot as u64 * RX_BUF_BYTES) as u32);
+        core::ptr::write_volatile((d + 8) as *mut u32, 0);
+        core::ptr::write_volatile((d + 12) as *mut u32, 0);
+        core::ptr::write_volatile((d + 4) as *mut u32, (RX_BUF_BYTES as u32) << 16); // DMA_DONE clear: handed to the device
+    }
+    core::sync::atomic::fence(Ordering::SeqCst);
+    w32(h.q0 + 8, (slot + 1) % RING_DEPTH);
+    h.ri = (h.ri + 1) % RING_DEPTH;
+}
+
+/// S4 calls this at its end: the MCU channel parked for S5, and S5 on the next pass, only when FW_START was acked and N9 is
+/// ready (`s4`'s `keep` condition: s4_run reached its end, so the run is Ok and the RAM code was sent).
+fn s4_done(h: Hw, rep: &Rep) {
+    if rep.fw_start == "ok" && rep.n9 == "ready" {
+        *MCU_LINK.lock() = Some(h);
+        STATE.store(S_S5, Ordering::Relaxed);
+    }
+}
+
+/// What the capability reply carried.
+struct Caps {
+    n: u16,
+    mac: [u8; 6],
+    chip: Option<u64>,
+    phy: Option<[u8; PHY_CAP_BYTES]>,
+}
+
+/// S5's failures: before the command (`NOT ATTEMPTED`) or the command's own refusals (`REFUSED`, with the TLV count when read).
+enum S5Why {
+    Pre(String),
+    Refused(&'static str, Option<u16>),
+}
+
+fn s5() {
+    STATE.store(S_PARKED, Ordering::Relaxed);
+    let held = *PROBE.lock();
+    let Some(p) = held else { return };
+    let link = MCU_LINK.lock().take();
+    let Some(mut h) = link else { return };
+    let b = p.bar0;
+    let lp = b + CONN_HOST_CSR_TOP + LPCTL;
+    if !(map_page(b + WFDMA0) && map_page(b + (DMASHDL_SW_CONTROL & !0xfff))) {
+        serial_println!("[mt7925] s5 -> NOT ATTEMPTED why=unmapped rel=found");
+        return;
+    }
+    let took = r32(lp) & OWN_SYNC != 0;
+    if took {
+        let (ok, last, _) = own(lp, CLR_OWN, false);
+        if !ok {
+            let rel = if own(lp, SET_OWN, true).0 { "fw" } else { "timeout" };
+            serial_println!("[mt7925] s5 -> NOT ATTEMPTED why=own lpctl={:#010x} rel={}", last, rel);
+            return;
+        }
+    }
+    let mut kept = "lost";
+    let res = s5_run(b, &mut h, &mut kept);
+    let rel = give_back(lp, took);
+    match res {
+        Ok(c) => {
+            let m = c.mac;
+            let chip = c.chip.map_or(String::from("-"), |v| alloc::format!("{:#018x}", v));
+            let phy = c.phy.map_or(String::from("-"), |v| {
+                let mut t = String::with_capacity(2 * PHY_CAP_BYTES);
+                for x in v {
+                    let _ = core::fmt::Write::write_fmt(&mut t, format_args!("{:02x}", x));
+                }
+                t
+            });
+            *MAC.lock() = Some(m);
+            serial_println!(
+                "[mt7925] s5 mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} caps={} chip_cap={} phy={} held={} rel={} -> parked",
+                m[0], m[1], m[2], m[3], m[4], m[5], c.n, chip, phy, kept, rel
+            );
+            *MCU_LINK.lock() = Some(h); // the channel kept for the next rung (S6)
+        }
+        Err(S5Why::Pre(w)) => {
+            serial_println!("[mt7925] s5 -> NOT ATTEMPTED why={} rel={}", w, rel);
+        }
+        Err(S5Why::Refused(w, n)) => {
+            let caps = n.map_or(String::from("-"), |v| alloc::format!("{}", v));
+            serial_println!("[mt7925] s5 -> REFUSED why={} caps={} held={} rel={}", w, caps, kept, rel);
+        }
+    }
+}
+
+/// Everything between driver-own and give-back: `held`, linux's wake reset over S4's memory (ring 16's CPU index back to 0
+/// so S4's firmware chunks cannot be fetched again), then the capability query and its parse.
+fn s5_run(b: u64, h: &mut Hw, held: &mut &'static str) -> Result<Caps, S5Why> {
+    *held = if r32(h.q15) as u64 == h.wm && r32(h.q0) as u64 == h.rx0 { "kept" } else { "lost" };
+    dma_off(b).map_err(S5Why::Pre)?;
+    hand_rx(h.rx0, h.rxb);
+    let mut rb = arm(h.q16, S4_TX16.load(Ordering::Relaxed), 0);
+    rb &= arm(h.q15, h.wm, 0);
+    rb &= arm(h.q0, h.rx0, RX_BUFS);
+    let glo = dma_on(b);
+    if !rb || glo & (GLO_TX_EN | GLO_RX_EN) != (GLO_TX_EN | GLO_RX_EN) {
+        return Err(S5Why::Pre(String::from("rb")));
+    }
+    h.wi = 0;
+    h.ri = 0;
+    let mut pl = [0u8; 8]; // 4 reserved bytes, then the NIC_CAPA tag and its length (4)
+    pl[4..6].copy_from_slice(&NIC_CAPA.to_le_bytes());
+    pl[6..8].copy_from_slice(&4u16.to_le_bytes());
+    uni_cmd(h, UNI_CHIP_CONFIG, &pl).map_err(|_| S5Why::Refused("cap-timeout", None))?;
+    caps(&h.last)
+}
+
+/// The capability reply: past the 44-byte event header, a TLV count and the TLVs (each length counting its own 4-byte
+/// header); the walk stops at a short or overlong TLV. The MAC is required and must pass `mac_ok`. The chip caps are the
+/// TLV's 8 data bytes (linux copies 8 bytes from the TLV's header instead).
+fn caps(ev: &[u8]) -> Result<Caps, S5Why> {
+    if ev.len() < RXD_BYTES + CAP_HDR {
+        return Err(S5Why::Refused("cap-parse", None));
+    }
+    let n = u16::from_le_bytes([ev[RXD_BYTES], ev[RXD_BYTES + 1]]);
+    let (mut mac, mut chip, mut phy) = (None, None, None);
+    let mut o = RXD_BYTES + CAP_HDR;
+    for _ in 0..n {
+        if ev.len() - o < 4 {
+            break;
+        }
+        let tag = u16::from_le_bytes([ev[o], ev[o + 1]]);
+        let len = u16::from_le_bytes([ev[o + 2], ev[o + 3]]) as usize;
+        if len < 4 || len > ev.len() - o {
+            break;
+        }
+        let d = &ev[o + 4..o + len];
+        match tag {
+            TAG_MAC if d.len() >= 6 => {
+                let mut m = [0u8; 6];
+                m.copy_from_slice(&d[..6]);
+                mac = Some(m);
+            }
+            TAG_PHY if d.len() >= PHY_CAP_BYTES => {
+                let mut c = [0u8; PHY_CAP_BYTES];
+                c.copy_from_slice(&d[..PHY_CAP_BYTES]);
+                phy = Some(c);
+            }
+            TAG_CHIP_CAP if d.len() >= 8 => {
+                let mut c = [0u8; 8];
+                c.copy_from_slice(&d[..8]);
+                chip = Some(u64::from_le_bytes(c));
+            }
+            _ => {}
+        }
+        o += len;
+    }
+    match mac {
+        Some(m) if mac_ok(&m) => Ok(Caps { n, mac: m, chip, phy }),
+        _ => Err(S5Why::Refused("no-mac", Some(n))),
+    }
+}
+
+/// The station-MAC rule `wifi_core::sprom::decode` applies inline (not zero, not all-ones, unicast); wifi_core is not on
+/// the always-on MT7925 path, so the one-line rule is restated here (MACOK-SHARED owed: one wifi_core fn for both).
+fn mac_ok(m: &[u8; 6]) -> bool {
+    *m != [0; 6] && *m != [0xff; 6] && m[0] & 1 == 0
+}
+
+/// The MT7925's MAC address once S5 read a clean capability reply, else None; RawNic::mac's shape, for S6's backend.
+pub fn mac() -> Option<[u8; 6]> {
+    *MAC.lock()
 }
