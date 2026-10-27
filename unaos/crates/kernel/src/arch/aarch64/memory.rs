@@ -56,3 +56,144 @@ pub fn init(boot_info: &'static mut BootInfo) {
 /// FOCUSARM64 (SR180): the caller's address-space slot, at the path x86 names it (`arch::memory::current_slot`) — `wm::focussteal::note_arm` reads it on both desktops. The body is `xwin`'s (TTBR0_EL1's ASID).
 #[cfg(feature = "aarch64_el0")]
 pub use super::xwin::current_slot;
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+// DMAALLOCXHCI (rmbp-ledger B988) — THE KERNEL'S ONE DMA ALLOCATOR, AARCH64 HALF (tail-appended).
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+/// The aarch64 twin of x86's `arch::memory::dma` (B986), same API, so `crate::arch::memory::dma` names ONE
+/// allocator on both arches (arch/mod.rs's cfg_if re-export is the shared place). Two differences, both the
+/// arch's: (1) the bus address. `init` hands the heap to `init_heap_raw` at its PHYSICAL start (tegra: the
+/// carveout-clear window's start), so a heap address IS its bus address; this half has no page walk, so the
+/// bus address is the CPU address when the whole buffer lies inside `allocator::heap_bounds()` (the identity
+/// window) and the buffer is refused otherwise. (2) coherency. The BCM2711 PCIe and Tegra XUSB paths do not
+/// snoop the data cache, so the zeroed buffer is cleaned and invalidated to the PoC here, the ONE place
+/// (`super::cache::clean_invalidate_range`), before any device can see it. One arch-neutral body with per-arch
+/// bus/settle hooks is owed (DMA-ONEBODY); nothing is ever freed (DMA-FREE owed), as on x86.
+pub mod dma {
+    use alloc::alloc::{alloc_zeroed, dealloc, Layout};
+    use core::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+
+    /// A device-visible buffer: the CPU's address, the device's bus address, and the length in bytes.
+    pub struct DmaBuf {
+        pub va: u64,
+        pub pa: u64,
+        pub len: usize,
+    }
+
+    /// Successful `alloc` calls since boot (the KAT's uncounted `take`s excluded).
+    static ALLOCS: AtomicU64 = AtomicU64::new(0);
+    /// Bytes those calls handed out.
+    static BYTES: AtomicU64 = AtomicU64::new(0);
+
+    /// The 32-bit bus window a `below_4g` device can address (the Pi's RC inbound window is RAM @ 0, 4 GiB).
+    const LIMIT_4G: u64 = 0x1_0000_0000;
+
+    /// The bus address of `[va, va + len)`: `va` itself when the span lies inside the identity-mapped heap.
+    fn bus(va: u64, len: usize) -> Option<u64> {
+        let (lo, hi) = crate::allocator::heap_bounds();
+        let end = va.checked_add(len as u64)?;
+        if va >= lo as u64 && end <= hi as u64 { Some(va) } else { None }
+    }
+
+    /// Zeroed, `align`-aligned device memory of `bytes` bytes, cleaned to the PoC. With `below_4g` the buffer
+    /// must end at or below 4 GiB; one that does not is freed before any device sees it and the call returns
+    /// `None` (DMA-BOUNCE owed). `None` also for zero bytes, an invalid layout, an exhausted heap, or an address
+    /// outside the identity-mapped heap.
+    pub fn alloc(bytes: usize, align: usize, below_4g: bool) -> Option<DmaBuf> {
+        let b = take(bytes, align, if below_4g { Some(LIMIT_4G) } else { None })?;
+        ALLOCS.fetch_add(1, Relaxed);
+        BYTES.fetch_add(b.len as u64, Relaxed);
+        Some(b)
+    }
+
+    /// The allocation itself, uncounted (the KAT's entry). `limit`: the bus address the buffer must end at or below.
+    fn take(bytes: usize, align: usize, limit: Option<u64>) -> Option<DmaBuf> {
+        if bytes == 0 {
+            return None;
+        }
+        let layout = Layout::from_size_align(bytes, align).ok()?;
+        // SAFETY: a non-zero-sized, valid layout.
+        let p = unsafe { alloc_zeroed(layout) };
+        if p.is_null() {
+            return None;
+        }
+        let va = p as u64;
+        let pa = bus(va, bytes);
+        let fits = match (pa, limit) {
+            (None, _) => false,
+            (Some(pa), Some(lim)) => pa.checked_add(bytes as u64).map_or(false, |end| end <= lim),
+            (Some(_), None) => true,
+        };
+        if !fits {
+            // SAFETY: allocated just above with this layout and never handed to a device.
+            unsafe { dealloc(p, layout) };
+            return None;
+        }
+        // The zeros reach DRAM and no stale line survives to shadow the device's later writes.
+        super::super::cache::clean_invalidate_range(va as usize, bytes);
+        Some(DmaBuf { va, pa: pa.unwrap_or(0), len: bytes })
+    }
+
+    /// The drivers' shim: one u64 that is both the CPU pointer and the bus address (0 = no memory), as on x86.
+    pub fn ident(bytes: usize, align: usize) -> u64 {
+        match alloc(bytes, align, false) {
+            Some(b) if b.pa == b.va => b.va,
+            _ => 0,
+        }
+    }
+
+    /// Give a buffer back. A no-op today, as on x86 (DMA-FREE owed).
+    pub fn free(_b: DmaBuf) {}
+
+    /// The boot's DMA census, printed once on a `census` / tests-at-boot build (the caller is owed: DMA-CENSUS-ARM).
+    pub fn census() {
+        static DONE: AtomicBool = AtomicBool::new(false);
+        if DONE.swap(true, Relaxed) {
+            return;
+        }
+        crate::census_println!("[dma] census allocs={} bytes={}", ALLOCS.load(Relaxed), BYTES.load(Relaxed));
+    }
+
+    /// `tests dma`: alignment, zeroing, the below-4G refusal against a fake bound, and the identity window.
+    pub fn selftest() {
+        let mut align_ok = true;
+        let mut zero_ok = true;
+        let mut ident_ok = true;
+        for &(bytes, align) in &[(4096usize, 4096usize), (1000, 64), (8192, 4096)] {
+            match take(bytes, align, None) {
+                Some(b) => {
+                    align_ok &= b.va % align as u64 == 0 && b.len == bytes;
+                    // SAFETY: `b.len` bytes at `b.va` were allocated just above.
+                    let s = unsafe { core::slice::from_raw_parts(b.va as *const u8, b.len) };
+                    zero_ok &= s.iter().all(|&x| x == 0);
+                    ident_ok &= bus(b.va, b.len) == Some(b.pa) && b.pa == b.va;
+                    // SAFETY: allocated by `take` with exactly this layout; no device saw it.
+                    unsafe { dealloc(b.va as *mut u8, Layout::from_size_align_unchecked(bytes, align)) };
+                }
+                None => {
+                    align_ok = false;
+                }
+            }
+        }
+        // The fake bound: 4 KiB. A 4 KiB buffer could end there only at address 0, which no allocation returns.
+        let refused = match take(4096, 4096, Some(0x1000)) {
+            Some(b) => {
+                // SAFETY: allocated by `take` (4096, 4096); no device saw it.
+                unsafe { dealloc(b.va as *mut u8, Layout::from_size_align_unchecked(4096, 4096)) };
+                false
+            }
+            None => true,
+        };
+        let zero_len = take(0, 64, None).is_none();
+        let pass = align_ok && zero_ok && ident_ok && refused && zero_len;
+        serial_println!(
+            ":: DMA: align={} zero={} below4g={} ident={} census={}/{} -> {} ::",
+            if align_ok { "ok" } else { "bad" },
+            if zero_ok { "ok" } else { "bad" },
+            if refused { "refused" } else { "bad" },
+            if ident_ok { "ok" } else { "bad" },
+            ALLOCS.load(Relaxed),
+            BYTES.load(Relaxed),
+            if pass { "PASS" } else { "FAIL" }
+        );
+    }
+}

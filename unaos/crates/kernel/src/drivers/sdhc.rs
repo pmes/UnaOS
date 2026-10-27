@@ -2009,8 +2009,8 @@ fn adma2_init(card: &mut SdCard, caps: &HostCaps) {
         refuse(card, "bounce-buffer layout invalid");
         return;
     };
-    let table = unsafe { alloc::alloc::alloc_zeroed(table_layout) } as u64;
-    let bounce = unsafe { alloc::alloc::alloc_zeroed(bounce_layout) } as u64;
+    let table = crate::arch::memory::dma::ident(table_layout.size(), table_layout.align()); // DMAALLOCXHCI (B988): the one DMA allocator
+    let bounce = crate::arch::memory::dma::ident(bounce_layout.size(), bounce_layout.align());
     if table == 0 || bounce == 0 {
         refuse(card, "dma allocation failed");
         return;

@@ -726,7 +726,7 @@ fn ep0_buf() -> Option<u64> {
     }
     let l = core::alloc::Layout::from_size_align(EP0_CAP, 4096).ok()?;
     // SAFETY: a non-zero-size layout.
-    let p = unsafe { alloc::alloc::alloc_zeroed(l) } as u64;
+    let p = crate::arch::memory::dma::ident(l.size(), l.align());
     if p == 0 {
         return None;
     }
@@ -894,8 +894,8 @@ impl IsoHost for XhciUvc<'_> {
         let rl = core::alloc::Layout::from_size_align((nslots + 1) * 16, 4096).map_err(|_| (0u8, "layout"))?;
         let bl = core::alloc::Layout::from_size_align(nslots * stride, stride).map_err(|_| (0u8, "layout"))?;
         // SAFETY: non-zero layouts; zeroed so no stale cycle bit is ever a produced TRB (§4.9.2).
-        let ring = unsafe { alloc::alloc::alloc_zeroed(rl) } as *mut Trb;
-        let bufs = unsafe { alloc::alloc::alloc_zeroed(bl) };
+        let ring = crate::arch::memory::dma::ident(rl.size(), rl.align()) as *mut Trb;
+        let bufs = crate::arch::memory::dma::ident(bl.size(), bl.align()) as *mut u8;
         if ring.is_null() || bufs.is_null() {
             return Err((0, "no-memory"));
         }
