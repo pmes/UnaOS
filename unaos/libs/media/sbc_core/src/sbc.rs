@@ -4,19 +4,22 @@
 //! The SBC encoder (A2DP, rmbp-ledger B739). ONE file with no `crate::` path: `sbc_core` declares it as `pub mod sbc`
 //! and the kernel's A2DP sink (`drivers/bt/avdtp.rs`) includes the same file by `#[path]`.
 //!
-//! Per frame (A2DP specification, the SBC chapter):
-//! 1. ANALYSIS, per block and channel: the history X (10 x subbands samples) shifts by `subbands`, the new samples
-//!    enter oldest-at-X[M-1]; Z = C x X (C = the specification's prototype, 80 taps for 8 subbands, 40 for 4);
-//!    Y[i] = sum_j Z[i + 2Mj] (j = 0..4); S[k] = sum_i cos((k + 1/2)(i - M/2)pi/M) Y[i]. Fixed point: C in Q24, the
-//!    cosine matrix in Q15, i64 accumulation, S kept in Q12 (|S| <= 2.5 x 2^15 x 2^12 < 2^31 for any 16-bit input:
-//!    the prototype's absolute sum is 2.52).
-//! 2. SCALE FACTORS: per channel and subband the smallest k (0..15) with max|S| < 2^(k+1).
-//! 3. JOINT STEREO: subband sb (all but the last) is sent as M = (L+R)/2, S = (L-R)/2 when sf(M) + sf(S) <
-//!    sf(L) + sf(R); the join bit says so.
+//! Per frame (A2DP specification, the SBC chapter; the arithmetic of steps 1-3 and 5 is Google libsbc's, A2DPKAT
+//! rmbp-ledger B870 — github.com/google/libsbc @ 6e505650145c9973d08a0bdd5e5f5e1914305e40, `src/sbc.c`, Apache-2.0 —
+//! so the frames are byte-exact against that reference, [`kat`]):
+//! 1. ANALYSIS, per block and channel (libsbc `analyze_4` / `analyze_8`): the window (fixed 2.13, [`W4`] / [`W8`],
+//!    the specification's prototype x 4 x 2^13, duplicated and transposed for a circular history of 10 blocks split by
+//!    parity) gives the folded half-sums, rounded to i16; the DCT ([`COS8`] / [`COSMAT`], Q13) gives the subband
+//!    samples, rounded to i16. Unity gain against the specification's synthesis.
+//! 2. SCALE FACTORS: per channel and subband the highest set bit of the OR of every block's magnitude (a negative
+//!    sample counts as its ones' complement), 0 for silence.
+//! 3. JOINT STEREO: subband sb (all but the last) is sent as M = (L+R)/2, S = (L-R)/2 when the scale factors of the
+//!    UNHALVED L+R and L-R sum below sf(L) + sf(R); those are the scale factors sent; the join bit says so.
 //! 4. BIT ALLOCATION ([`bit_alloc`]): the specification's procedure word for word — bitneed (SNR = the scale factor;
 //!    LOUDNESS = scale factor - offset, halved when positive, -5 for a zero scale factor), the bitslice descent, the
-//!    two distribution passes; joint over both channels in STEREO/JOINT_STEREO, per channel in MONO/DUAL_CHANNEL.
-//! 5. QUANTIZATION: q = floor((S / 2^(sf+1) + 1) x (2^bits - 1) / 2).
+//!    two distribution passes; joint over both channels in STEREO/JOINT_STEREO, per channel in MONO/DUAL_CHANNEL
+//!    (libsbc's `compute_nbits` is the same procedure).
+//! 5. QUANTIZATION: q = (((s x (2^bits - 1)) >> (sf + 1)) + 2^bits - 1) >> 1 on the i16 subband sample.
 //! 6. PACKING: syncword 0x9C, the header byte, bitpool, CRC, join bits, scale factors (4 bits), samples (block,
 //!    channel, subband); the CRC-8 (x^8+x^4+x^3+x^2+1, init 0x0F) covers the header byte, the bitpool and every bit
 //!    from the join field to the last scale factor.
@@ -281,51 +284,114 @@ fn alloc_set(cfg: &Config, scf: &[[u8; 8]; 2], bits: &mut [[u8; 8]; 2], c0: usiz
     }
 }
 
-/// Fractional bits of the subband samples the analysis produces.
-const SB_FRAC: u32 = 12;
+/// i16 saturation (libsbc's `SBC_SAT16`).
+fn sat16(v: i32) -> i32 {
+    v.clamp(i16::MIN as i32, i16::MAX as i32)
+}
 
-/// The analysis filter for one block of one channel: `inp` = the `nsb` new samples, oldest first.
-fn analyze(x: &mut [i32; 80], inp: &[i32], nsb: usize, s: &mut [i32; 8]) {
-    let l = 10 * nsb;
-    for i in (nsb..l).rev() {
-        x[i] = x[i - nsb];
+/// One channel's analysis state (libsbc's `sbc_estate`): the block counter (0..=9), the PCM history split by block
+/// parity in the window's row order, and the half-sums carried into the next block.
+#[derive(Clone)]
+struct Est {
+    idx: usize,
+    x: [[[i16; 5]; 8]; 2],
+    y: [i32; 4],
+}
+
+impl Est {
+    const ZERO: Est = Est { idx: 0, x: [[[0; 5]; 8]; 2], y: [0; 4] };
+}
+
+/// x[k] x w[k + idx] summed over k < 5 (libsbc's window rows read from `window[..][0] + idx`).
+fn dot5(x: &[i16; 5], w: &[i16; 10], idx: usize) -> i32 {
+    let mut a = 0i32;
+    for k in 0..5 {
+        a += x[k] as i32 * w[k + idx] as i32;
     }
-    for i in 0..nsb {
-        x[nsb - 1 - i] = inp[i];
-    }
-    let (c, m): (&[i32], &[i32]) = if nsb == 8 { (&C8, &M8) } else { (&C4, &M4) };
-    let mut y = [0i64; 16];
-    for i in 0..2 * nsb {
-        let mut acc = 0i64;
-        for j in 0..5 {
-            let k = i + j * 2 * nsb;
-            acc += c[k] as i64 * x[k] as i64;
-        }
-        y[i] = acc;
-    }
-    for k in 0..nsb {
-        let mut acc = 0i64;
-        for i in 0..2 * nsb {
-            acc += m[k * 2 * nsb + i] as i64 * y[i];
-        }
-        s[k] = (acc >> (24 + 15 - SB_FRAC)) as i32;
+    a
+}
+
+/// libsbc `analyze_4`: four new samples (oldest first) -> four subband samples.
+fn analyze_4(st: &mut Est, inp: &[i16; 8], out: &mut [i32; 8]) {
+    let (idx, odd) = (st.idx >> 1, st.idx & 1);
+    let ii = if idx != 0 { 5 - idx } else { 0 };
+    let x = &mut st.x[odd];
+    x[0][ii] = inp[3];
+    x[1][ii] = inp[1];
+    x[2][ii] = inp[2];
+    x[3][ii] = inp[0];
+    let (w0, w1) = (&W4[0], &W4[1]);
+    let y0 = dot5(&x[0], &w0[0], idx) + st.y[0];
+    st.y[0] = dot5(&x[0], &w1[0], idx);
+    let y1 = dot5(&x[2], &w0[2], idx) + dot5(&x[3], &w0[3], idx);
+    let y2 = st.y[1];
+    st.y[1] = dot5(&x[2], &w1[2], idx) - dot5(&x[3], &w1[3], idx);
+    let y3 = dot5(&x[1], &w0[1], idx);
+    let y = [y0, y1, y2, y3].map(|v| sat16((v + (1 << 14)) >> 15));
+    st.idx = if st.idx < 9 { st.idx + 1 } else { 0 };
+    let c = COS8;
+    let s = [
+        y[0] * c[2] + y[1] * c[1] + y[2] * c[3] + (y[3] << 13),
+        -y[0] * c[2] + y[1] * c[3] - y[2] * c[1] + (y[3] << 13),
+        -y[0] * c[2] - y[1] * c[3] + y[2] * c[1] + (y[3] << 13),
+        y[0] * c[2] - y[1] * c[1] - y[2] * c[3] + (y[3] << 13),
+    ];
+    for k in 0..4 {
+        out[k] = sat16((s[k] + (1 << 12)) >> 13);
     }
 }
 
-/// The smallest k in 0..=15 with |v| < 2^(k+1) for every v the subband carried (`maxabs` in Q12).
-fn scf_of(maxabs: i64) -> u8 {
-    let mut k = 0u8;
-    while k < 15 && maxabs >= 1i64 << (k as u32 + 1 + SB_FRAC) {
-        k += 1;
+/// libsbc `analyze_8`: eight new samples (oldest first) -> eight subband samples.
+fn analyze_8(st: &mut Est, inp: &[i16; 8], out: &mut [i32; 8]) {
+    let (idx, odd) = (st.idx >> 1, st.idx & 1);
+    let ii = if idx != 0 { 5 - idx } else { 0 };
+    let x = &mut st.x[odd];
+    x[0][ii] = inp[7];
+    x[1][ii] = inp[3];
+    x[2][ii] = inp[6];
+    x[3][ii] = inp[0];
+    x[4][ii] = inp[5];
+    x[5][ii] = inp[1];
+    x[6][ii] = inp[4];
+    x[7][ii] = inp[2];
+    let (w0, w1) = (&W8[0], &W8[1]);
+    let y0 = dot5(&x[0], &w0[0], idx) + st.y[0];
+    st.y[0] = dot5(&x[0], &w1[0], idx);
+    let y1 = dot5(&x[2], &w0[2], idx) + dot5(&x[3], &w0[3], idx);
+    let y4 = st.y[1];
+    st.y[1] = dot5(&x[2], &w1[2], idx) - dot5(&x[3], &w1[3], idx);
+    let y2 = dot5(&x[4], &w0[4], idx) + dot5(&x[5], &w0[5], idx);
+    let y5 = st.y[2];
+    st.y[2] = dot5(&x[4], &w1[4], idx) - dot5(&x[5], &w1[5], idx);
+    let y3 = dot5(&x[6], &w0[6], idx) + dot5(&x[7], &w0[7], idx);
+    let y6 = st.y[3];
+    st.y[3] = dot5(&x[6], &w1[6], idx) - dot5(&x[7], &w1[7], idx);
+    let y7 = dot5(&x[1], &w0[1], idx);
+    let y = [y0, y1, y2, y3, y4, y5, y6, y7].map(|v| sat16((v + (1 << 14)) >> 15));
+    st.idx = if st.idx < 9 { st.idx + 1 } else { 0 };
+    for i in 0..8 {
+        let mut s = 0i32;
+        for j in 0..8 {
+            s += y[j] * COSMAT[i][j];
+        }
+        out[i] = sat16((s + (1 << 12)) >> 13);
     }
-    k
 }
 
-fn quantize(v: i32, scf: u8, bits: u8) -> u32 {
-    let levels = (1i64 << bits) - 1;
-    let sh = scf as u32 + 1 + SB_FRAC;
-    let q = ((v as i64 + (1i64 << sh)) * levels) >> (sh + 1);
-    q.clamp(0, levels) as u32
+/// libsbc's magnitude for the scale factor: a negative sample counts as its ones' complement.
+fn mag(s: i32) -> u32 {
+    (if s < 0 { !s } else { s }) as u32
+}
+
+/// The highest set bit of `m` (0 for 0): libsbc's scale factor of an OR of magnitudes.
+fn msb(m: u32) -> u8 {
+    if m == 0 { 0 } else { (31 - m.leading_zeros()) as u8 }
+}
+
+/// libsbc's quantizer: (((s x (2^bits - 1)) >> (sf + 1)) + 2^bits - 1) >> 1.
+fn quantize(s: i32, scf: u8, bits: u8) -> u32 {
+    let range = (1i64 << bits) - 1;
+    ((((s as i64 * range) >> (scf as u32 + 1)) + range) >> 1) as u32
 }
 
 struct BitW<'a> {
@@ -346,16 +412,16 @@ impl BitW<'_> {
     }
 }
 
-/// An SBC encoder: the configuration and each channel's analysis history.
+/// An SBC encoder: the configuration and each channel's analysis state.
 #[derive(Clone)]
 pub struct Encoder {
     cfg: Config,
-    x: [[i32; 80]; 2],
+    est: [Est; 2],
 }
 
 impl Encoder {
     pub const fn new(cfg: Config) -> Encoder {
-        Encoder { cfg, x: [[0; 80]; 2] }
+        Encoder { cfg, est: [Est::ZERO, Est::ZERO] }
     }
 
     pub const fn config(&self) -> &Config {
@@ -364,7 +430,7 @@ impl Encoder {
 
     /// Forget the history (a new stream).
     pub fn reset(&mut self) {
-        self.x = [[0; 80]; 2];
+        self.est = [Est::ZERO, Est::ZERO];
     }
 
     /// Encode ONE frame. `pcm` = `config().samples()` PCM frames, 16-bit, interleaved by channel (one channel in
@@ -377,51 +443,57 @@ impl Encoder {
         if !cfg.valid() || pcm.len() < cfg.samples() * nch || out.len() < len {
             return 0;
         }
-        // 1. Analysis: [block][channel][subband], Q12.
+        // 1. Analysis: [block][channel][subband], each an i16 value.
         let mut sbs = [[[0i32; 8]; 2]; 16];
         for blk in 0..nbl {
             for ch in 0..nch {
-                let mut inp = [0i32; 8];
+                let mut inp = [0i16; 8];
                 for i in 0..nsb {
-                    inp[i] = pcm[(blk * nsb + i) * nch + ch] as i32;
+                    inp[i] = pcm[(blk * nsb + i) * nch + ch];
                 }
-                analyze(&mut self.x[ch], &inp[..nsb], nsb, &mut sbs[blk][ch]);
+                if nsb == 8 {
+                    analyze_8(&mut self.est[ch], &inp, &mut sbs[blk][ch]);
+                } else {
+                    analyze_4(&mut self.est[ch], &inp, &mut sbs[blk][ch]);
+                }
             }
         }
-        // 2. Scale factors.
-        let maxabs = |sbs: &[[[i32; 8]; 2]; 16], ch: usize, sb: usize| (0..nbl).map(|b| (sbs[b][ch][sb] as i64).abs()).max().unwrap_or(0);
+        // 2. Scale factors, and 3. joint stereo's decision (every subband but the last).
         let mut scf = [[0u8; 8]; 2];
-        for ch in 0..nch {
-            for sb in 0..nsb {
-                scf[ch][sb] = scf_of(maxabs(&sbs, ch, sb));
-            }
-        }
-        // 3. Joint stereo, every subband but the last.
         let mut join = [false; 8];
-        if cfg.mode == Mode::Joint {
-            for sb in 0..nsb - 1 {
-                let (mut mm, mut ms) = (0i64, 0i64);
-                for b in 0..nbl {
-                    let (l, r) = (sbs[b][0][sb] as i64, sbs[b][1][sb] as i64);
-                    mm = mm.max(((l + r) >> 1).abs());
-                    ms = ms.max(((l - r) >> 1).abs());
-                }
-                let (sm, ss) = (scf_of(mm), scf_of(ms));
-                if (sm as u32 + ss as u32) < (scf[0][sb] as u32 + scf[1][sb] as u32) {
+        for sb in 0..nsb {
+            let (mut m0, mut m1, mut j0, mut j1) = (0u32, 0u32, 0u32, 0u32);
+            for b in 0..nbl {
+                let (s0, s1) = (sbs[b][0][sb], sbs[b][1][sb]);
+                m0 |= mag(s0);
+                m1 |= mag(s1);
+                j0 |= mag(s0 + s1);
+                j1 |= mag(s0 - s1);
+            }
+            scf[0][sb] = msb(m0);
+            scf[1][sb] = msb(m1);
+            if cfg.mode == Mode::Joint && sb + 1 < nsb {
+                let (js0, js1) = (msb(j0), msb(j1));
+                if (js0 as u32 + js1 as u32) < (scf[0][sb] as u32 + scf[1][sb] as u32) {
                     join[sb] = true;
-                    for b in 0..nbl {
-                        let (l, r) = (sbs[b][0][sb], sbs[b][1][sb]);
-                        sbs[b][0][sb] = ((l as i64 + r as i64) >> 1) as i32;
-                        sbs[b][1][sb] = ((l as i64 - r as i64) >> 1) as i32;
-                    }
-                    scf[0][sb] = sm;
-                    scf[1][sb] = ss;
+                    scf[0][sb] = js0;
+                    scf[1][sb] = js1;
                 }
             }
         }
         // 4. Bit allocation.
         let mut bits = [[0u8; 8]; 2];
         bit_alloc(&cfg, &scf, &mut bits);
+        // 3. Joint stereo's coupling: M = (L+R)/2, S = (L-R)/2.
+        for sb in 0..nsb {
+            if join[sb] {
+                for b in 0..nbl {
+                    let (s0, s1) = (sbs[b][0][sb], sbs[b][1][sb]);
+                    sbs[b][0][sb] = (s0 + s1) >> 1;
+                    sbs[b][1][sb] = (s0 - s1) >> 1;
+                }
+            }
+        }
         // 6. Packing (the CRC byte is written last).
         for b in out[..len].iter_mut() {
             *b = 0;
@@ -491,7 +563,20 @@ pub fn crc_end(cfg: &Config) -> usize {
 ///   specification's shift-register loop in Python — not by this function);
 /// * a digital-silence frame of the high-quality set: no subband joined, every scale factor 0, so its first twelve
 ///   bytes are 9C BD 35 7D 00 x 8 (0x7D = the CRC of BD 35 and 72 zero bits, by the same reference);
-/// * a tone frame's CRC byte equals the CRC recomputed over its own coverage, and the frame is `frame_len()` long.
+/// * a tone frame's CRC byte equals the CRC recomputed over its own coverage, and the frame is `frame_len()` long;
+/// * A2DPKAT (rmbp-ledger B870): TWO WHOLE FRAMES per vector, byte for byte ([`KAT_JS44`], [`KAT_MONO16`]), computed
+///   from Google libsbc's encoder (github.com/google/libsbc @ 6e505650145c9973d08a0bdd5e5f5e1914305e40, `src/sbc.c`
+///   `sbc_encode`: `analyze_4`/`analyze_8`, `compute_scale_factors(_js)`, `compute_nbits`, `encode_frame`,
+///   `compute_crc`) by a hand transcription whose every table was compared with that source (A2DPKAT's
+///   `libsbc_ref.py`; regenerating them with libsbc's own `tools/esbc` is owed, KATBIN). The input is integers only
+///   ([`kat_lcg`], [`kat_tri`]): s = s x 1664525 + 1013904223 (u32), a = (s >> 16) - 32768; tri(i) = the 16-step
+///   triangle +-8192 (`t * 2048 - 8192` rising for t = i % 16 < 8, `(16 - t) * 2048 - 8192` falling).
+///   - JOINT STEREO 44.1 kHz, 16 blocks, 8 subbands, loudness, bitpool 53 (`Config::A2DP_HQ`); seed 1, per frame
+///     index i (0..256) draw a then b: L = tri(i) + (a >> 3), R = ((L x 7) >> 3) + (b >> 4); frames 0 and 1 (frame 0
+///     joins subbands 0, 1; frame 1 joins 0, 1, 5). For `esbc -j -b 53` write these as a 44.1 kHz stereo WAV.
+///   - MONO 16 kHz, 8 blocks, 4 subbands, SNR, bitpool 18; seed 2, per sample i (0..64): tri(i) + (a >> 3); frames 0
+///     and 1 (`esbc -s 4 -B 8 -S -b 18` on a 16 kHz mono WAV).
+///   A mismatch fails as `kat-js44-frame<n>` / `kat-mono16-frame<n>` (`tests a2dp`: `sbc_kat=FAIL`).
 pub fn kat() -> Result<(), &'static str> {
     let set = |mode, bitpool| Config { mode, bitpool, ..Config::A2DP_HQ };
     for (cfg, len, kbps) in [(set(Mode::Mono, 19), 46, 127), (set(Mode::Mono, 31), 70, 193), (set(Mode::Joint, 35), 83, 229), (set(Mode::Joint, 53), 119, 328)] {
@@ -537,15 +622,55 @@ pub fn kat() -> Result<(), &'static str> {
     if f[4..12].iter().all(|&b| b == 0) {
         return Err("tone-scale-factors");
     }
+    // A2DPKAT (B870): the two cited vectors, two whole frames each.
+    let mut pcm = [0i16; 512];
+    let mut seed = 1u32;
+    for i in 0..256 {
+        let (a, b) = (kat_lcg(&mut seed), kat_lcg(&mut seed));
+        let l = kat_tri(i) + (a >> 3);
+        pcm[2 * i] = l as i16;
+        pcm[2 * i + 1] = (((l * 7) >> 3) + (b >> 4)) as i16;
+    }
+    let mut enc = Encoder::new(Config::A2DP_HQ);
+    for (n, want) in KAT_JS44.iter().enumerate() {
+        if enc.encode(&pcm[n * 256..(n + 1) * 256], &mut f) != 119 || f[..119] != want[..] {
+            return Err(["kat-js44-frame0", "kat-js44-frame1"][n]);
+        }
+    }
+    let mono = Config { freq: Freq::F16000, blocks: 8, mode: Mode::Mono, alloc: Alloc::Snr, subbands: 4, bitpool: 18 };
+    let mut pcm = [0i16; 64];
+    let mut seed = 2u32;
+    for i in 0..64 {
+        pcm[i] = (kat_tri(i) + (kat_lcg(&mut seed) >> 3)) as i16;
+    }
+    let mut enc = Encoder::new(mono);
+    for (n, want) in KAT_MONO16.iter().enumerate() {
+        if enc.encode(&pcm[n * 32..(n + 1) * 32], &mut f) != 24 || f[..24] != want[..] {
+            return Err(["kat-mono16-frame0", "kat-mono16-frame1"][n]);
+        }
+    }
     Ok(())
 }
 
-// ── The specification's tables in fixed point, generated once from the printed values: C = round(coefficient x 2^24)
-// (the printed table carries its sign pattern: C[i] = h[i] x (-1)^floor(i / 2M) for the symmetric lowpass h); the
-// cosine matrices = round(cos((k + 1/2)(i - M/2) pi / M) x 2^15), row k. A float model of this filter bank with the
-// specification's synthesis (window -M x C) reconstructs noise at 64 dB (4 subbands) / 66 dB (8 subbands). ──────
+/// A2DPKAT: the KAT input's generator (Numerical Recipes' LCG): the next value in -32768..32768.
+fn kat_lcg(s: &mut u32) -> i32 {
+    *s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+    (*s >> 16) as i32 - 32768
+}
+
+/// A2DPKAT: the KAT input's 16-step triangle, -8192..=8192.
+fn kat_tri(i: usize) -> i32 {
+    let t = (i % 16) as i32;
+    if t < 8 { t * 2048 - 8192 } else { (16 - t) * 2048 - 8192 }
+}
+
+// ── The specification's prototype in fixed point, generated once from the printed values: C = round(coefficient x
+// 2^24) (the printed table carries its sign pattern: C[i] = h[i] x (-1)^floor(i / 2M) for the symmetric lowpass h). The
+// encoder's analysis no longer uses it (A2DPKAT B870: libsbc's windows below); the host tests' decoder synthesizes with
+// it (window -M x C), so it is compiled for tests only. ─────────────────────────────────────────────────────────
 
 /// The 8-subband prototype (80 taps), Q24.
+#[cfg(test)]
 pub(crate) const C8: [i32; 80] = [
     0, 2627, 5759, 9305, 13823, 19125, 24770, 29926,
     33753, 35295, 33463, 27121, 15136, -3000, -27678, -58673,
@@ -559,6 +684,7 @@ pub(crate) const C8: [i32; 80] = [
     33753, 29926, 24770, 19125, 13823, 9305, 5759, 2627,
 ];
 /// The 4-subband prototype (40 taps), Q24.
+#[cfg(test)]
 pub(crate) const C4: [i32; 40] = [
     0, 9002, 25030, 45864, 64378, 65298, 31303, -51340,
     183103, 342901, 484455, 540125, 434140, 102885, -483548, -1302690,
@@ -566,21 +692,92 @@ pub(crate) const C4: [i32; 40] = [
     -2274878, -1302690, -483548, 102885, 434140, 540125, 484455, 342901,
     -183103, -51340, 31303, 65298, 64378, 45864, 25030, 9002,
 ];
-/// The 8-subband analysis matrix, Q15.
-pub(crate) const M8: [i32; 128] = [
-    23170, 27246, 30274, 32138, 32768, 32138, 30274, 27246, 23170, 18205, 12540, 6393, 0, -6393, -12540, -18205,
-    -23170, -6393, 12540, 27246, 32768, 27246, 12540, -6393, -23170, -32138, -30274, -18205, 0, 18205, 30274, 32138,
-    -23170, -32138, -12540, 18205, 32768, 18205, -12540, -32138, -23170, 6393, 30274, 27246, 0, -27246, -30274, -6393,
-    23170, -18205, -30274, 6393, 32768, 6393, -30274, -18205, 23170, 27246, -12540, -32138, 0, 32138, 12540, -27246,
-    23170, 18205, -30274, -6393, 32768, -6393, -30274, 18205, 23170, -27246, -12540, 32138, 0, -32138, 12540, 27246,
-    -23170, 32138, -12540, -18205, 32768, -18205, -12540, 32138, -23170, -6393, 30274, -27246, 0, 27246, -30274, 6393,
-    -23170, 6393, 12540, -27246, 32768, -27246, 12540, 6393, -23170, 32138, -30274, 18205, 0, -18205, 30274, -32138,
-    23170, -27246, 30274, -32138, 32768, -32138, 30274, -27246, 23170, -18205, 12540, -6393, 0, 6393, -12540, 18205,
+// ── A2DPKAT (rmbp-ledger B870): Google libsbc's analysis tables (github.com/google/libsbc @ 6e505650, src/sbc.c,
+// Copyright 2022 Google LLC, Apache-2.0), copied value for value (A2DPKAT's tablecheck.py compared them with that
+// source), and the KAT's two cited vectors. ─────────────────────────────────────────────────────────────────────
+
+/// libsbc's 4-subband window (fixed 2.13), duplicated and transposed for its circular history (rows 0, 2, 1, 3).
+const W4: [[[i16; 10]; 4]; 2] = [
+    [
+        [0, 358, 4443, -4443, -358, 0, 358, 4443, -4443, -358], // 0
+        [49, 946, 8082, -944, 61, 49, 946, 8082, -944, 61], // 2
+        [18, 670, 6389, -2544, -100, 18, 670, 6389, -2544, -100], // 1
+        [90, 1055, 9235, 201, 128, 90, 1055, 9235, 201, 128], // 3
+    ],
+    [
+        [126, 848, 9644, 848, 126, 126, 848, 9644, 848, 126], // 0
+        [61, -944, 8082, 946, 49, 61, -944, 8082, 946, 49], // 2
+        [128, 201, 9235, 1055, 90, 128, 201, 9235, 1055, 90], // 1
+        [-100, -2544, 6389, 670, 18, -100, -2544, 6389, 670, 18], // 3
+    ],
 ];
-/// The 4-subband analysis matrix, Q15.
-pub(crate) const M4: [i32; 32] = [
-    23170, 30274, 32768, 30274, 23170, 12540, 0, -12540,
-    -23170, 12540, 32768, 12540, -23170, -30274, 0, 30274,
-    -23170, -12540, 32768, -12540, -23170, 30274, 0, -30274,
-    23170, -30274, 32768, -30274, 23170, -12540, 0, 12540,
+/// libsbc's 8-subband window (fixed 2.13), rows 0, 4, 1, 7, 2, 6, 3, 5.
+const W8: [[[i16; 10]; 8]; 2] = [
+    [
+        [0, 185, 2228, -2228, -185, 0, 185, 2228, -2228, -185], // 0
+        [27, 480, 4039, -480, 30, 27, 480, 4039, -480, 30], // 4
+        [5, 263, 2719, -1743, -115, 5, 263, 2719, -1743, -115], // 1
+        [58, 502, 4764, 290, 69, 58, 502, 4764, 290, 69], // 7
+        [11, 343, 3197, -1280, -54, 11, 343, 3197, -1280, -54], // 2
+        [48, 532, 4612, 96, 65, 48, 532, 4612, 96, 65], // 6
+        [18, 418, 3644, -856, -6, 18, 418, 3644, -856, -6], // 3
+        [37, 521, 4367, -161, 53, 37, 521, 4367, -161, 53], // 5
+    ],
+    [
+        [66, 424, 4815, 424, 66, 66, 424, 4815, 424, 66], // 0
+        [30, -480, 4039, 480, 27, 30, -480, 4039, 480, 27], // 4
+        [69, 290, 4764, 502, 58, 69, 290, 4764, 502, 58], // 1
+        [-115, -1743, 2719, 263, 5, -115, -1743, 2719, 263, 5], // 7
+        [65, 96, 4612, 532, 48, 65, 96, 4612, 532, 48], // 2
+        [-54, -1280, 3197, 343, 11, -54, -1280, 3197, 343, 11], // 6
+        [53, -161, 4367, 521, 37, 53, -161, 4367, 521, 37], // 3
+        [-6, -856, 3644, 418, 18, -6, -856, 3644, 418, 18], // 5
+    ],
+];
+/// libsbc's 4-subband DCT constants (Q13): cos(k pi / 8), k = 0..3.
+const COS8: [i32; 4] = [8192, 7568, 5793, 3135];
+/// libsbc's 8-subband DCT matrix (Q13) over its folded half-sums.
+const COSMAT: [[i32; 8]; 8] = [
+    [5793, 6811, 7568, 8035, 4551, 3135, 1598, 8192],
+    [-5793, -1598, 3135, 6811, -8035, -7568, -4551, 8192],
+    [-5793, -8035, -3135, 4551, 1598, 7568, 6811, 8192],
+    [5793, -4551, -7568, 1598, 6811, -3135, -8035, 8192],
+    [5793, 4551, -7568, -1598, -6811, -3135, 8035, 8192],
+    [-5793, 8035, -3135, -4551, -1598, 7568, -6811, 8192],
+    [-5793, 1598, 3135, -6811, 8035, -7568, 4551, 8192],
+    [5793, -6811, 7568, -8035, -4551, 3135, -1598, 8192],
+];
+/// A2DPKAT (B870): libsbc @ 6e505650's joint-stereo 44.1 kHz bitpool 53 frames 0 and 1 of [`kat`]'s stereo input.
+const KAT_JS44: [[u8; 119]; 2] = [
+    [
+        0x9C, 0xBD, 0x35, 0x6E, 0xC0, 0xDC, 0xAA, 0xAA, 0xAB, 0xA9, 0xAA, 0xAB, 0xAA, 0x7E, 0xF6, 0xDB,
+        0x57, 0xDB, 0x6D, 0xAB, 0xF7, 0xB6, 0xDA, 0xBE, 0xDB, 0x6D, 0x5F, 0x3D, 0xB6, 0xD5, 0xE6, 0xDB,
+        0x6A, 0xFA, 0x09, 0x46, 0xAF, 0xB4, 0xA3, 0x56, 0xCB, 0xB9, 0xBA, 0x69, 0x4C, 0xDB, 0x4A, 0x59,
+        0x4A, 0x4C, 0x50, 0xA4, 0xE5, 0x9D, 0x25, 0xA8, 0x58, 0x76, 0xD4, 0x94, 0x1B, 0x1D, 0x71, 0x6B,
+        0x6F, 0x38, 0x63, 0x39, 0x4B, 0x16, 0x9B, 0xA9, 0x85, 0x46, 0x36, 0xE0, 0xCC, 0xDA, 0x90, 0x96,
+        0xC6, 0xA6, 0xC5, 0xD9, 0x4A, 0x81, 0x41, 0xC9, 0xB6, 0x31, 0xB2, 0xDB, 0x56, 0x13, 0x6E, 0xE5,
+        0x71, 0x47, 0x29, 0x4D, 0x49, 0x71, 0xA4, 0x89, 0x4A, 0xD1, 0x84, 0xE4, 0x35, 0x61, 0x91, 0x98,
+        0xB4, 0x57, 0x1B, 0x2A, 0xFA, 0x8A, 0x25,
+    ],
+    [
+        0x9C, 0xBD, 0x35, 0xF2, 0xC4, 0xDC, 0xBA, 0xAB, 0xAA, 0xA9, 0xBA, 0xA9, 0xAA, 0x59, 0x55, 0x8A,
+        0x2C, 0x11, 0x56, 0xAD, 0x07, 0x2B, 0x4A, 0x62, 0x49, 0xA6, 0x55, 0xD2, 0x9C, 0x74, 0xBC, 0x92,
+        0xB5, 0x4D, 0xAC, 0x9B, 0x58, 0x5B, 0x49, 0x56, 0x51, 0xCA, 0x92, 0xC1, 0x2C, 0x4A, 0xD2, 0x5C,
+        0x29, 0x02, 0x46, 0xDC, 0x55, 0xA4, 0x62, 0xD6, 0xAE, 0xB9, 0x6A, 0x94, 0x1E, 0xED, 0x34, 0x89,
+        0x38, 0xA4, 0x67, 0x48, 0x91, 0x2B, 0xD2, 0x58, 0x8C, 0xF6, 0x2A, 0x4E, 0x21, 0x49, 0x35, 0x17,
+        0xD6, 0x2C, 0x6A, 0xBB, 0x91, 0xAD, 0x39, 0xAC, 0x93, 0x98, 0xDA, 0x49, 0x56, 0x13, 0x68, 0xD4,
+        0xB2, 0xDA, 0x62, 0xCC, 0x53, 0xA4, 0xC5, 0xF8, 0x92, 0x45, 0x84, 0xEB, 0x17, 0x49, 0xB9, 0x92,
+        0xB4, 0x54, 0xF6, 0x42, 0x79, 0xB8, 0x92,
+    ],
+];
+/// A2DPKAT (B870): libsbc @ 6e505650's mono 16 kHz 4-subband SNR bitpool 18 frames 0 and 1 of [`kat`]'s mono input.
+const KAT_MONO16: [[u8; 24]; 2] = [
+    [
+        0x9C, 0x12, 0x12, 0xB2, 0xCB, 0xAB, 0x7D, 0xED, 0xDF, 0x7B, 0x77, 0x5C, 0xDD, 0xE9, 0x27, 0x30,
+        0x6E, 0xE4, 0x5B, 0x6D, 0xEE, 0x99, 0x7C, 0x56,
+    ],
+    [
+        0x9C, 0x12, 0x12, 0x57, 0xDA, 0xAA, 0x46, 0x6D, 0x28, 0x17, 0x09, 0xAE, 0xCD, 0x6D, 0x44, 0x54,
+        0xB4, 0xE7, 0x0E, 0xCC, 0x2A, 0xF1, 0xA8, 0x93,
+    ],
 ];

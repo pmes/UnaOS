@@ -5424,10 +5424,10 @@ fn sinkall_selftest() {
         sources += sinkall_player("video", s, k) as u32; clock = sinkall_clock(s, k);
         overlap = if sinkall_overlap(s) { "ok" } else { "FAIL" }; pause_ms = sinkall_pause(s); start_gap = sinkall_start(s); // SINKALLDOCS (B781): the Player's pause lands within the sink's queue (file tail). PLAYSTARTGAP (B805): a file play's start gap on the HDA ring (file tail)
     }
-    let usb_volume = sinkall_usb_volume(usb); let slider_ms = sinkall_slider(hda, usb); let idle_level = sinkall_idle_level(usb); // MIXERPUMP (B787): a set through `status::set_volume` reaches its carrier within one period + 10 ms (file tail)
+    let usb_volume = sinkall_usb_volume(usb); let slider_ms = sinkall_slider(hda, usb); let idle_level = sinkall_idle_level(usb); #[cfg(all(target_arch = "x86_64", feature = "a2dp"))] let bt_clock = sinkall_bt_clock(bt_live); // MIXERPUMP (B787): a set through `status::set_volume` reaches its carrier within one period + 10 ms (file tail)
     let direct = play::epoch().wrapping_sub(e0) as i64 - mixer::hda_opens().wrapping_sub(o0) as i64;
     let _ = audio::sink(if was == Sink::Usb { "usb" } else if was == Sink::Hda { "hda" } else { "bt" });
-    let failed = [hda, usb, bt_live, bt, overlap, usb_volume, idle_level, clock].iter().any(|v| *v == "FAIL");
+    let failed = [hda, usb, bt_live, bt, overlap, usb_volume, idle_level, clock].iter().any(|v| *v == "FAIL"); #[cfg(all(target_arch = "x86_64", feature = "a2dp"))] let failed = failed || bt_clock == "FAIL"; // A2DPKAT (rmbp-ledger B870): the player clock leg on BT (file tail). LINE-NEUTRAL append, before this comment.
     let verdict = if live.is_none() { "SKIP" } else if !failed && sources == 3 && direct == 0 && pause_ms <= SINKALL_PAUSE_MS && slider_ms <= SINKALL_SLIDER_MS && start_gap.map_or(true, |g| g <= play::REFILL_MS) { "PASS" } else { "FAIL" };
     serial_println!(
         ":: SINKALL: sources={} direct_writes={} usb_volume={} -> {} :: hda={} usb={} bt={} overlap={} pause_ms={} slider_ms={} start_gap_ms={} ::",
@@ -7614,7 +7614,7 @@ fn sinkall_clock(sink: &str, k: usize) -> &'static str {
         let _ = play::pump_until(500, || mixer::sources() == 0);
     }
     let frames = mixer::delivered()[k].wrapping_sub(d0);
-    let ok = closed && backsteps == 0 && moves > 0 && last >= 800 && gap <= play::REFILL_MS;
+    let ok = closed && backsteps == 0 && moves > 0 && last >= 800 && gap <= play::REFILL_MS; #[cfg(all(target_arch = "x86_64", feature = "a2dp"))] let ok = ok || (k == 2 && closed && backsteps == 0 && moves > 0 && last + sinkall_bt_delay_ms() >= 800 && gap <= play::REFILL_MS); // A2DPKAT (rmbp-ledger B870): on BT the 800 ms are played audio before the headset's reported delay (file tail). LINE-NEUTRAL append, before this comment.
     serial_println!(
         "[sinkall] leg player src={} sink={} position_ms={} monotone={} backsteps={} gap_ms={} moves={} closed={} frames={} -> {}",
         src, sink, last, if backsteps == 0 { "ok" } else { "FAIL" }, backsteps, gap, moves, closed as u8, frames, if ok { "ok" } else { "FAIL" }
@@ -7664,4 +7664,31 @@ fn settingsmap_tabs_leg() {
         ":: SETTINGSMAP: tabs leg {} -> {} :: tab_scroll={} probes_rule={} ::",
         detail, if ok { "PASS" } else { "FAIL" }, scroll, rule
     );
+}
+
+// A2DPKAT (rmbp-ledger B870; BP-audio-17) — TAIL-APPENDED: `tests sinkall`'s Player clock leg (AUDIOSINK B850's
+// `sinkall_clock`) on the BT output when an A2DP stream is kept (metal only: QEMU has no Bluetooth, the leg skips and
+// says why). On BT `mixer::played_now` subtracts the headset's AVDTP DelayReport (read at stream start), so the clock
+// ends near 1000 ms - delay: the leg's 800 ms bound is taken before the delay (`sinkall_clock`'s folded BT arm). A
+// FAIL fails SINKALL. Wire: `[sinkall] leg player sink=bt -> skip reason=<no-a2dp-stream|bt-alert-failed>` or
+// `[sinkall] leg player sink=bt delay_ms=<n> src=<sink|none> -> run`, then `sinkall_clock`'s `[sinkall] leg player`.
+#[cfg(all(target_arch = "x86_64", feature = "hda-tone", feature = "a2dp"))]
+fn sinkall_bt_clock(bt_live: &str) -> &'static str {
+    if bt_live != "ok" {
+        serial_println!("[sinkall] leg player sink=bt -> skip reason={}", if bt_live == "absent" { "no-a2dp-stream" } else { "bt-alert-failed" });
+        return "skip";
+    }
+    if crate::audio::sink("bt").is_err() {
+        serial_println!("[sinkall] leg player sink=bt -> skip reason=no-a2dp-stream");
+        return "skip";
+    }
+    let d = crate::drivers::ehci::bthid::avdtp::delay_tenth_ms();
+    serial_println!("[sinkall] leg player sink=bt delay_ms={} src={} -> run", sinkall_bt_delay_ms(), if d.is_some() { "sink" } else { "none" });
+    sinkall_clock("bt", 2)
+}
+
+/// A2DPKAT: the streaming headset's reported delay in ms (0 when none).
+#[cfg(all(target_arch = "x86_64", feature = "hda-tone", feature = "a2dp"))]
+fn sinkall_bt_delay_ms() -> u64 {
+    crate::drivers::ehci::bthid::avdtp::delay_tenth_ms().map_or(0, |t| t as u64 / 10)
 }

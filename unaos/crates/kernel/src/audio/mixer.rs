@@ -625,7 +625,7 @@ pub fn state(id: u32) -> Option<Played> {
 /// None when the mixer is busy this instant or `id` is closed.
 pub fn played_now(id: u32) -> Option<u64> {
     let m = MIX.try_lock()?;
-    let sp = SINK_PLAYED.load(Ordering::Acquire);
+    let sp = SINK_PLAYED.load(Ordering::Acquire); #[cfg(all(target_arch = "x86_64", feature = "a2dp"))] let sp = sp.saturating_sub(bt_delay()); // A2DPKAT (rmbp-ledger B870): on BT the headset's reported delay comes off the A/V clock (file tail). LINE-NEUTRAL append, before this comment.
     m.srcs.iter().find(|s| s.id == id).map(|s| s.played_src(sp))
 }
 
@@ -944,3 +944,19 @@ fn usb_level() {
 fn status_volume() -> (u8, bool) { crate::video::status::volume() }
 #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
 fn status_volume() -> (u8, bool) { (100, false) }
+
+// ── A2DPKAT (rmbp-ledger B870) — TAIL-APPENDED: the headset's delay comes off the A/V clock on BT ─────────────────────
+// Owner: the audio handler (CODEX §2), the mixer's OUT_BT position. The sink's AVDTP DelayReport (1/10 ms, read once at
+// stream start by `avdtp`) is subtracted ONLY where the A/V clock is read ([`played_now`], folded on its line):
+// `queued` keeps the pump's high-water flow control (a 200 ms delay there would exceed BT's 100 ms high mark and stop
+// delivery) and SINK_PLAYED keeps `reap`/`account`'s drain test (an ended source must still reap once the output
+// idles). No report: 0, the kernel-ms clock alone (as before). Atomics only, so `played_now` stays paint-safe.
+
+/// A2DPKAT: the streaming headset's reported delay in 48 kHz frames while BT is the output, else 0.
+#[cfg(all(target_arch = "x86_64", feature = "a2dp"))]
+fn bt_delay() -> u64 {
+    if OUT_KIND.load(Ordering::Acquire) != OUT_BT {
+        return 0;
+    }
+    a2dp::delay_tenth_ms().map_or(0, |t| t as u64 * RATE as u64 / 10_000)
+}
