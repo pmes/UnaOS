@@ -26,7 +26,7 @@
 //! The touchpad's reports: the `touchpad` module at the tail (ZENBOOKTOUCHPADREPORTS, zenbook-ledger Z18; `ehcihid`
 //! images, pumped by the one HID pass) — the controller that answered is HELD open for it only when armed. `tests dwi2c`
 //! runs the register-sequence machine against a fake controller: `:: DWI2C: proto=ok cases=8/8 -> PASS ::`;
-//! `tests dwi2ctp` the touchpad over the same fake: `:: DWI2C-TP: rdesc=ok reports=2 events=2 -> PASS ::`.
+//! `tests dwi2ctp` the touchpad over the same fake: `:: DWI2C-TP: rdesc=ok reports=2 events=2 scroll2 dy=<n> palm=ok -> PASS ::`.
 
 use core::cell::RefCell;
 
@@ -762,6 +762,14 @@ pub mod touchpad {
     //! position becomes a relative delta by the Wellspring lane's rules (a lift, a contact id or contact count change,
     //! or a 250 ms silence re-baselines; the curve is `finemotion::step2`, the raw step pre-scaled to that lane's span);
     //! the Button-page bit is the click (the pad's physical press, as bcm5974's `ibt`); a touch is never a press.
+    //!
+    //! DWI2CTPGEST (zenbook-ledger Z26): the first TWO finger collections are read with their Confidence (0x47); a
+    //! touching slot with Confidence 0 is a PALM, dropped before counting, and the first CONFIDENT contact is the
+    //! pointer, its curve pixels through BP-input-12's gain (`prefs_core::trackpad::gain_step`, `tpgest`'s live speed).
+    //! Two confident contacts and no click freeze the pointer and turn the centroid's curve dy into `Event::Wheel`
+    //! detents by the rMBP lane's rule ([`scroll2`]: `tpgest::DETENT_PX`, `prefs_core::trackpad::wheel` with the live
+    //! `natural`), pushed through `pal::push_event` as `tpgest::shape` does. Vertical only (`pal::Event` has no
+    //! horizontal wheel).
 
     use super::{HidDesc, Mmio};
     use core::sync::atomic::{AtomicBool, Ordering};
@@ -789,6 +797,8 @@ pub mod touchpad {
     const U_X: u32 = 0x0001_0030;
     const U_Y: u32 = 0x0001_0031;
     const U_BUTTON1: u32 = 0x0009_0001;
+    /// DWI2CTPGEST (Z26): a finger's Confidence (0 = a palm).
+    const U_CONFIDENCE: u32 = 0x000d_0047;
 
     /// One report field: bit offset in the report body (after the id byte), size in bits (0 = absent), logical max.
     #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
@@ -818,6 +828,18 @@ pub mod touchpad {
         mode_len: u16,
         /// A Touch Pad collection with the first finger's X, Y and Tip found.
         ptp: bool,
+        /// DWI2CTPGEST (Z26): the second finger's fields and both fingers' Confidence.
+        more: More,
+    }
+
+    /// DWI2CTPGEST (Z26): the second Finger collection's fields and each finger's Confidence (size 0 = absent).
+    #[derive(Clone, Copy, Default, Debug)]
+    struct More {
+        conf: [Field; 2],
+        tip2: Field,
+        cid2: Field,
+        x2: Field,
+        y2: Field,
     }
 
     /// The running bit offset of one report id (input or feature).
@@ -935,6 +957,12 @@ pub mod touchpad {
                                     U_CONTACT_ID if finger == 1 => p.cid = f,
                                     U_X if finger == 1 => p.x = f,
                                     U_Y if finger == 1 => p.y = f,
+                                    U_CONFIDENCE if finger == 1 => p.more.conf[0] = f,
+                                    U_CONFIDENCE if finger == 2 => p.more.conf[1] = f,
+                                    U_TIP if finger == 2 => p.more.tip2 = f,
+                                    U_CONTACT_ID if finger == 2 => p.more.cid2 = f,
+                                    U_X if finger == 2 => p.more.x2 = f,
+                                    U_Y if finger == 2 => p.more.y2 = f,
                                     U_CONTACT_COUNT if p.count.size == 0 => p.count = f,
                                     U_BUTTON1 if p.button.size == 0 => p.button = f,
                                     _ => {}
@@ -974,7 +1002,9 @@ pub mod touchpad {
         p
     }
 
-    /// The first finger of one input packet (`[len lo, len hi, id, body]`); `None` = nothing pending or another report.
+    /// The first CONFIDENT contact of one input packet (`[len lo, len hi, id, body]`) and the second one's position;
+    /// `None` = nothing pending or another report. DWI2CTPGEST (Z26): a touching slot with Confidence 0 is a palm,
+    /// counted in `palms` and never in `n`; `count` stays the report's Contact Count.
     #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
     struct Contact {
         x: i32,
@@ -983,6 +1013,11 @@ pub mod touchpad {
         cid: u32,
         count: u32,
         buttons: u8,
+        /// Confident contacts among the first two slots.
+        n: u8,
+        x2: i32,
+        y2: i32,
+        palms: u8,
     }
 
     fn contact(p: &Ptp, pkt: &[u8]) -> Option<Contact> {
@@ -1003,14 +1038,31 @@ pub mod touchpad {
             rep
         };
         let rd = |f: Field| if f.size == 0 { 0 } else { crate::drivers::ehci::lend::bits(body, f.off, f.size) };
-        Some(Contact {
-            x: rd(p.x) as i32,
-            y: rd(p.y) as i32,
-            tip: rd(p.tip) != 0,
-            cid: rd(p.cid),
-            count: rd(p.count),
-            buttons: (rd(p.button) & 1) as u8,
-        })
+        let conf = |f: Field| f.size == 0 || rd(f) != 0;
+        let m = p.more;
+        let s1 = (rd(p.tip) != 0, conf(m.conf[0]), rd(p.x) as i32, rd(p.y) as i32, rd(p.cid));
+        let s2 = (m.tip2.size != 0 && rd(m.tip2) != 0, conf(m.conf[1]), rd(m.x2) as i32, rd(m.y2) as i32, rd(m.cid2));
+        let mut c = Contact { count: rd(p.count), buttons: (rd(p.button) & 1) as u8, ..Contact::default() };
+        for (tip, sure, x, y, cid) in [s1, s2] {
+            if !tip {
+                continue;
+            }
+            if !sure {
+                c.palms += 1;
+                continue;
+            }
+            if c.n == 0 {
+                c.x = x;
+                c.y = y;
+                c.tip = true;
+                c.cid = cid;
+            } else {
+                c.x2 = x;
+                c.y2 = y;
+            }
+            c.n += 1;
+        }
+        Some(c)
     }
 
     /// The absolute-to-relative state (the Wellspring lane's `mt_step` rules).
@@ -1022,32 +1074,38 @@ pub mod touchpad {
         ms: u64,
         res: (i32, i32),
         buttons: u8,
+        /// DWI2CTPGEST (Z26): BP-input-12's gain remainder, and the two-finger scroll burst.
+        gres: (i32, i32),
+        sc: Scroll2,
     }
 
-    /// What one packet comes to: the contact, the whole-pixel motion, a button edge.
+    /// What one packet comes to: the contact, the whole-pixel motion, a button edge, a wheel detent (DWI2CTPGEST).
     struct Out {
         c: Option<Contact>,
         motion: Option<(i32, i32)>,
         edge: bool,
         buttons: u8,
+        wheel: Option<i8>,
     }
 
     impl Out {
         /// The pal events this packet pushes.
         fn events(&self) -> u32 {
-            self.motion.is_some() as u32 + self.edge as u32
+            self.motion.is_some() as u32 + self.edge as u32 + self.wheel.is_some() as u32
         }
     }
 
     /// One packet, PURE but for `t`: a lift, a contact id or count change, or a silence of `lend::JUMP_GAP_MS`
     /// re-baselines; else the first finger's step through the lent curve. HID y is already screen-down.
     fn step(p: &Ptp, t: &mut Track, pkt: &[u8], now_ms: u64) -> Out {
-        let mut o = Out { c: None, motion: None, edge: false, buttons: t.buttons };
+        let mut o = Out { c: None, motion: None, edge: false, buttons: t.buttons, wheel: None };
         let Some(c) = contact(p, pkt) else { return o };
         o.c = Some(c);
-        if !c.tip {
+        o.wheel = scroll2(p, t, &c, now_ms);
+        if !c.tip || t.sc.on {
             t.prev = None;
             t.res = (0, 0);
+            t.gres = (0, 0);
         } else {
             let gap = now_ms.wrapping_sub(t.ms);
             let rebase = c.cid != t.cid || c.count != t.count || gap >= crate::drivers::ehci::lend::JUMP_GAP_MS;
@@ -1055,11 +1113,16 @@ pub mod touchpad {
                 Some((px, py)) if !rebase => {
                     let span = (p.x.max.min(i32::MAX as u32) as i32).max(1);
                     let (dx, dy) = crate::drivers::ehci::lend::curve((c.x - px, c.y - py), span, &mut t.res);
+                    let speed = crate::drivers::ehci::tpgest::get().0;
+                    let (dx, dy) = (prefs_core::trackpad::gain_step(dx, speed, &mut t.gres.0), prefs_core::trackpad::gain_step(dy, speed, &mut t.gres.1));
                     if dx != 0 || dy != 0 {
                         o.motion = Some((dx, dy));
                     }
                 }
-                _ => t.res = (0, 0),
+                _ => {
+                    t.res = (0, 0);
+                    t.gres = (0, 0);
+                }
             }
             t.prev = Some((c.x, c.y));
             t.cid = c.cid;
@@ -1277,6 +1340,19 @@ pub mod touchpad {
             o.motion.map(|(x, y)| crate::pal::Event::Mouse { x, y }),
             if o.edge { Some(crate::pal::Event::Button(o.buttons)) } else { None },
         );
+        if let Some(w) = o.wheel {
+            crate::pal::push_event(crate::pal::Event::Wheel(w));
+            if !tp.t.sc.said {
+                tp.t.sc.said = true;
+                if SCROLL_WIT.load(Ordering::Relaxed) < SCROLL_WIT_MAX {
+                    SCROLL_WIT.fetch_add(1, Ordering::Relaxed);
+                    serial_println!(
+                        "[dwi2c] touchpad gest=scroll2 fingers=2 wheel={} natural={} palms={}",
+                        w, crate::drivers::ehci::tpgest::get().2 as u8, c.palms
+                    );
+                }
+            }
+        }
     }
 
     /// The KAT's Precision Touchpad descriptor: Touch Pad (rid 4) with two Finger collections (Confidence, Tip,
@@ -1330,6 +1406,7 @@ pub mod touchpad {
         }
         let raw = f.s.borrow().desc;
         let (mut rdesc_ok, mut reports, mut events, mut first_ok) = (false, 0u32, 0u32, false);
+        let (mut scroll_ok, mut sdy, mut palm_ok) = (false, 0i32, false);
         if let (Some(d), Ok((saved, _))) = (super::parse_desc(&raw), super::open(&f)) {
             let win = super::window(super::identify(&f).param1);
             let mut rbuf = [0u8; RDESC_MAX];
@@ -1337,6 +1414,7 @@ pub mod touchpad {
             let p = b.p;
             let cmds = f.s.borrow().cmds;
             rdesc_ok = b.why.is_none() && p.ptp && p.rid == 4 && p.contacts == 2 && p.x.max == 4095 && p.y.max == 2047 && p.has_mode && p.mode_rid == 3 && b.mode == "set" && cmds == 3;
+            rdesc_ok = rdesc_ok && p.more.x2.size == 16 && p.more.conf[0].size == 1 && p.more.conf[1].size == 1;
             {
                 let mut st = f.s.borrow_mut();
                 st.input[0] = kat_report(1000, 800, true, false);
@@ -1359,12 +1437,112 @@ pub mod touchpad {
                 }
                 events += o.events();
             }
+            (scroll_ok, sdy, palm_ok) = kat_gest(&p);
             let _ = super::close(&f, &saved);
         }
-        let pass = rdesc_ok && first_ok && reports == 2 && events == 2;
+        let pass = rdesc_ok && first_ok && reports == 2 && events == 2 && scroll_ok && palm_ok;
         serial_println!(
-            ":: DWI2C-TP: rdesc={} reports={} events={} -> {} ::",
-            if rdesc_ok { "ok" } else { "fail" }, reports, events, if pass { "PASS" } else { "FAIL" }
+            ":: DWI2C-TP: rdesc={} reports={} events={} scroll2 dy={} palm={} -> {} ::",
+            if rdesc_ok { "ok" } else { "fail" }, reports, events, sdy,
+            if palm_ok { "ok" } else { "fail" }, if pass { "PASS" } else { "FAIL" }
         );
+    }
+
+    // DWI2CTPGEST (zenbook-ledger Z26) — two-finger scroll and the palm rule. Module tail.
+
+    /// One two-finger scroll burst: on while two confident contacts are down and nothing is clicked.
+    #[derive(Clone, Copy, Default)]
+    struct Scroll2 {
+        on: bool,
+        /// The centroid at the last sample (sensor units).
+        last: (i32, i32),
+        /// The curve's Q8 remainder.
+        res: (i32, i32),
+        /// Curve pixels of dy not yet a detent.
+        acc: i32,
+        /// Detents this burst (signed, after `natural`).
+        sum: i32,
+        ms: u64,
+        /// The burst's witness line spent.
+        said: bool,
+    }
+
+    /// `[dwi2c] touchpad gest=scroll2` lines per boot.
+    const SCROLL_WIT_MAX: u8 = 4;
+    static SCROLL_WIT: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+    /// Two confident contacts and no click: the centroid's step through the lent curve, its dy as `Event::Wheel`
+    /// detents by the rMBP lane's rule. The accumulate-and-detent below MIRRORS `tpgest::shape`'s two-finger arm
+    /// (three lines over the same `DETENT_PX` and `prefs_core::trackpad::wheel`): that arm is inline over a `Wsp2Frame`
+    /// and its private `ST`, not a fn over contacts (named in Z26). A burst's first sample, or one after
+    /// `lend::JUMP_GAP_MS` of silence, baselines the centroid and makes nothing. dx is not used (no horizontal wheel).
+    fn scroll2(p: &Ptp, t: &mut Track, c: &Contact, now_ms: u64) -> Option<i8> {
+        if c.n < 2 || c.buttons != 0 {
+            t.sc.on = false;
+            return None;
+        }
+        let mid = ((c.x + c.x2) / 2, (c.y + c.y2) / 2);
+        if !t.sc.on {
+            t.sc = Scroll2 { on: true, last: mid, ms: now_ms, ..Scroll2::default() };
+            return None;
+        }
+        let gap = now_ms.wrapping_sub(t.sc.ms);
+        t.sc.ms = now_ms;
+        if gap >= crate::drivers::ehci::lend::JUMP_GAP_MS {
+            t.sc.last = mid;
+            t.sc.res = (0, 0);
+            return None;
+        }
+        let span = (p.x.max.min(i32::MAX as u32) as i32).max(1);
+        let (_, dy) = crate::drivers::ehci::lend::curve((mid.0 - t.sc.last.0, mid.1 - t.sc.last.1), span, &mut t.sc.res);
+        t.sc.last = mid;
+        t.sc.acc += dy;
+        let det = t.sc.acc / crate::drivers::ehci::tpgest::DETENT_PX;
+        if det == 0 {
+            return None;
+        }
+        t.sc.acc -= det * crate::drivers::ehci::tpgest::DETENT_PX;
+        let w = prefs_core::trackpad::wheel(det, crate::drivers::ehci::tpgest::get().2).clamp(-127, 127);
+        t.sc.sum += w;
+        Some(w as i8)
+    }
+
+    /// One canned two-finger touch report for [`KAT_RDESC`]: each finger `(x, y, confidence, tip)`, contact ids 1 and 2.
+    fn kat_report2(f1: (u16, u16, bool, bool), f2: (u16, u16, bool, bool), count: u8, button: bool) -> [u8; 32] {
+        let mut r = [0u8; 32];
+        r[0] = 17;
+        r[2] = 0x04;
+        for (k, f) in [f1, f2].iter().enumerate() {
+            let at = 3 + 6 * k;
+            r[at] = (f.2 as u8) | ((f.3 as u8) << 1);
+            r[at + 1] = k as u8 + 1;
+            r[at + 2..at + 4].copy_from_slice(&f.0.to_le_bytes());
+            r[at + 4..at + 6].copy_from_slice(&f.1.to_le_bytes());
+        }
+        r[15] = count;
+        r[16] = button as u8;
+        r
+    }
+
+    /// `tests dwi2ctp`'s gesture legs, driving [`step`] on canned packets (nothing is pushed): a two-finger stroke
+    /// down makes wheel detents and no pointer motion; a palm in slot 1 is dropped and slot 2's finger is the pointer.
+    /// Returns `(scroll_ok, the burst's detents, palm_ok)`.
+    fn kat_gest(p: &Ptp) -> (bool, i32, bool) {
+        let want = prefs_core::trackpad::wheel(1, crate::drivers::ehci::tpgest::get().2).signum();
+        let mut t = Track::default();
+        let (mut moved, mut sum) = (false, 0i32);
+        for k in 0..5u64 {
+            let y = 800 + 200 * k as u16;
+            let o = step(p, &mut t, &kat_report2((1000, y, true, true), (1400, y, true, true), 2, false), k * POLL_MS);
+            moved |= o.motion.is_some();
+            sum += o.wheel.map_or(0, |w| w as i32);
+        }
+        let scroll_ok = !moved && sum != 0 && sum.signum() == want && t.sc.sum == sum;
+        let mut t = Track::default();
+        let a = step(p, &mut t, &kat_report2((500, 500, false, true), (2000, 1000, true, true), 2, false), 0);
+        let b = step(p, &mut t, &kat_report2((200, 500, false, true), (2300, 1000, true, true), 2, false), POLL_MS);
+        let first = a.c.is_some_and(|c| c.n == 1 && c.palms == 1 && c.x == 2000 && c.tip);
+        let palm_ok = first && a.wheel.is_none() && b.wheel.is_none() && b.motion.is_some_and(|(dx, _)| dx > 0);
+        (scroll_ok, sum, palm_ok)
     }
 }
