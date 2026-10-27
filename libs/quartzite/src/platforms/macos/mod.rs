@@ -32,6 +32,7 @@ pub mod tab_strip;
 pub mod find_bar;
 pub mod status_line;
 pub mod downloads;
+pub mod tab_search;
 
 // The UI bootstrapping closure
 type BootstrapFn = Box<
@@ -426,15 +427,18 @@ impl Backend {
 /// the top; under it the side tab column ([`tab_strip`], carrying the find bar's Cmd+F button) beside the page column
 /// (the [`find_bar`] over the page surface, the [`downloads`] list under it); the [`status_line`] at the foot. The
 /// title bar follows the page (`window_title::bind_browser_title`). The page surface is the one `eval_tetra` builds
-/// (stretched), so it takes the window's slack; every other piece hugs.
+/// (stretched), so it takes the window's slack; every other piece hugs. STRIP2 (SR219): the top strip stands between
+/// the toolbar and the body, the side column in the body; Principia's `aether.tabs.layout` shows one
+/// (`tab_strip::bootstrap_tab_strips`); the keys are the Tab menu's ([`install_tab_keys`]).
 pub fn bootstrap_browser_chrome(window: &NSWindow, toolbar: crate::tetra::TetraNode, synapse: bandy::Synapse) -> Retained<NSView> {
     window_title::bind_browser_title(window, synapse.clone());
     let bar = tetra_eval::eval_tetra(toolbar, synapse.clone());
     tab_strip::hug(&bar, 1);
     let find = find_bar::bootstrap_find_bar(synapse.clone());
-    let side = tab_strip::bootstrap_side_tabs(synapse.clone(), find_bar::find_toggle(&find));
+    let strips = tab_strip::bootstrap_tab_strips(synapse.clone(), find_bar::find_toggle(&find));
     let page = tetra_eval::eval_tetra(crate::tetra::TetraNode::Surface { id: "viewport".into() }, synapse.clone());
     let downloads = downloads::bootstrap_downloads(synapse.clone());
+    install_tab_keys(&bar, &find, &synapse);
     let status = status_line::bootstrap_status_line(synapse);
 
     let page_col = tab_strip::stack(true);
@@ -449,11 +453,118 @@ pub fn bootstrap_browser_chrome(window: &NSWindow, toolbar: crate::tetra::TetraN
         let _: () = msg_send![&page_col, addArrangedSubview: &*find.root];
         let _: () = msg_send![&page_col, addArrangedSubview: &*page];
         let _: () = msg_send![&page_col, addArrangedSubview: &*downloads];
-        let _: () = msg_send![&body, addArrangedSubview: &*side];
+        let _: () = msg_send![&body, addArrangedSubview: &*strips.side];
         let _: () = msg_send![&body, addArrangedSubview: &*page_col];
         let _: () = msg_send![&root, addArrangedSubview: &*bar];
+        let _: () = msg_send![&root, addArrangedSubview: &*strips.top];
         let _: () = msg_send![&root, addArrangedSubview: &*body];
         let _: () = msg_send![&root, addArrangedSubview: &*status];
         Retained::cast_unchecked::<NSView>(root)
+    }
+}
+
+/// STRIP2 (SR219): the browser's keys as a visible "Tab" menu on the main menu (a hidden item's key equivalent needs
+/// `allowsKeyEquivalentWhenHidden`, macOS 13+): one item per `chrome_rows::key_verbs` (Primary = Cmd, Control =
+/// Ctrl: Cmd+T new, Cmd+W close, Ctrl+Tab / Ctrl+PgDn next, Ctrl+Shift+Tab / Ctrl+PgUp previous, Cmd+D bookmark,
+/// Cmd+= / Cmd++ / Cmd+- / Cmd+0 zoom), each firing its bandy verb through a `bootstrap_button` target; then
+/// Cmd+L (the toolbar's address field takes the keys), Cmd+F (the find bar) and Cmd+Shift+A (the tab search).
+fn install_tab_keys(bar: &NSView, find: &find_bar::FindBar, synapse: &bandy::Synapse) {
+    use crate::widgets::chrome_rows::{self, KeyMods};
+    use tab_strip::{CMD, CONTROL, SHIFT};
+    let Some(mtm) = MainThreadMarker::new() else { return };
+    let menu = tab_strip::new_menu("Tab");
+    let add = |title: &str, key: &str, mask: usize, target: Retained<NSView>| unsafe {
+        let item = tab_strip::menu_item(title, key, mask, &target);
+        let _: () = msg_send![&*menu, addItem: &*item];
+    };
+    for kv in chrome_rows::key_verbs() {
+        let Some(key) = mac_key(kv.key) else { continue };
+        let mask = match kv.mods {
+            KeyMods::Primary => CMD,
+            KeyMods::PrimaryShift => CMD | SHIFT,
+            KeyMods::Control => CONTROL,
+            KeyMods::ControlShift => CONTROL | SHIFT,
+        };
+        let title = verb_title(&kv.msg);
+        add(title, &key, mask, button::bootstrap_button(title, kv.msg.clone(), synapse.clone()));
+    }
+    unsafe {
+        let sep: Retained<AnyObject> = msg_send![objc2::class!(NSMenuItem), separatorItem];
+        let _: () = msg_send![&*menu, addItem: &*sep];
+    }
+    let field_host: Retained<NSView> = objc2::Message::retain(bar);
+    add("Open Location", "l", CMD, button::bootstrap_button_with("Open Location", Box::new(move || focus_address(&field_host))));
+    let f = find.clone();
+    add("Find", "f", CMD, button::bootstrap_button_with("Find", Box::new(move || find_bar::show(&f))));
+    let syn = synapse.clone();
+    add("Search Tabs", "A", CMD, button::bootstrap_button_with("Search Tabs", Box::new(move || tab_search::open(&syn))));
+    unsafe {
+        let app = NSApplication::sharedApplication(mtm);
+        let main: *mut AnyObject = msg_send![&app, mainMenu];
+        if main.is_null() {
+            return;
+        }
+        let item: *mut AnyObject = msg_send![objc2::class!(NSMenuItem), alloc];
+        let t = objc2_foundation::NSString::from_str("Tab");
+        let k = objc2_foundation::NSString::from_str("");
+        let item: *mut AnyObject = msg_send![item, initWithTitle: &*t, action: None::<objc2::runtime::Sel>, keyEquivalent: &*k];
+        let Some(item) = Retained::<AnyObject>::from_raw(item) else { return };
+        let _: () = msg_send![&*item, setSubmenu: &*menu];
+        let _: () = msg_send![main, addItem: &*item];
+    }
+}
+
+/// A `chrome_rows::KeyVerb` key (a GTK keysym name) as an AppKit key equivalent; `None` for one AppKit has no
+/// spelling for here.
+fn mac_key(key: &str) -> Option<String> {
+    Some(match key {
+        "Tab" => "\t".to_string(),
+        // NSPageDownFunctionKey / NSPageUpFunctionKey
+        "Page_Down" => "\u{F72D}".to_string(),
+        "Page_Up" => "\u{F72C}".to_string(),
+        "plus" => "+".to_string(),
+        "equal" => "=".to_string(),
+        "minus" => "-".to_string(),
+        k if k.chars().count() == 1 => k.to_string(),
+        _ => return None,
+    })
+}
+
+/// The Tab menu's title for a key's verb.
+fn verb_title(m: &bandy::SMessage) -> &'static str {
+    use bandy::SMessage as M;
+    match m {
+        M::BrowserTabNew => "New Tab",
+        M::BrowserTabClose(_) => "Close Tab",
+        M::BrowserTabStep(n) if *n > 0 => "Next Tab",
+        M::BrowserTabStep(_) => "Previous Tab",
+        M::BrowserBookmarkToggle => "Bookmark This Page",
+        M::BrowserZoom(n) if *n > 0 => "Zoom In",
+        M::BrowserZoom(n) if *n < 0 => "Zoom Out",
+        M::BrowserZoom(_) => "Actual Size",
+        _ => "Tab",
+    }
+}
+
+/// Cmd+L: the first address field under `host` (the toolbar's `UnaTextField`) takes the keys, its text selected.
+fn focus_address(host: &NSView) {
+    let Some(field) = first_text_field(host) else { return };
+    unsafe {
+        let window: *mut AnyObject = msg_send![&field, window];
+        if !window.is_null() {
+            let _: objc2::runtime::Bool = msg_send![window, makeFirstResponder: &*field];
+        }
+    }
+}
+
+/// The first `UnaTextField` in `v`'s subtree, depth-first.
+fn first_text_field(v: &NSView) -> Option<Retained<NSView>> {
+    unsafe {
+        let is: objc2::runtime::Bool = msg_send![v, isKindOfClass: text_field::UnaTextField::class()];
+        if is.as_bool() {
+            return Some(objc2::Message::retain(v));
+        }
+        let subs: Retained<objc2_foundation::NSArray<NSView>> = msg_send![v, subviews];
+        subs.to_vec().iter().find_map(|s| first_text_field(s))
     }
 }

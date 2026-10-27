@@ -34,35 +34,13 @@ use gtk4::{gdk, gio, glib};
 use gtk4::{Box, Button, Orientation, ScrolledWindow};
 
 use super::glyph::GlyphLabel;
-use crate::widgets::chrome_rows::{self, clip, SideRow, SIDE_LABEL_MAX};
+use crate::widgets::chrome_rows::{self, clip, DropOn, MenuRow, SideRow, Tile, SIDE_LABEL_MAX};
 use crate::NativeView;
-use bandy::{BrowserTabGroupRow, BrowserTabRow, PrefValue, PrincipiaCommand, SMessage, Synapse};
+use bandy::{BrowserTabGroupRow, BrowserTabRow, SMessage, Synapse};
 
-/// Principia's namespace and key for where the tabs stand (prefs_core `schema.rs`, docs/dev/PREFS-SCHEMA.md).
-pub const LAYOUT_NS: &str = "aether";
-pub const LAYOUT_KEY: &str = "tabs.layout";
-
-/// The stored value means the side strip (`side`); anything else, and an unset row, is the top strip.
-pub fn layout_is_side(v: &str) -> bool {
-    v.trim().eq_ignore_ascii_case("side")
-}
-
-/// Whether the tabs stand on the side now: Principia's row, else the schema default (`top`).
-pub fn stored_layout() -> bool {
-    let Ok(store) = principia::prefs::PrefStore::load(principia::default_prefs_path()) else { return false };
-    if let Some(PrefValue::Str(s)) = store.get(LAYOUT_NS, LAYOUT_KEY) {
-        return layout_is_side(&s);
-    }
-    match store.effective(LAYOUT_NS, LAYOUT_KEY, |k| std::env::var(k).ok()) {
-        Some((PrefValue::Str(s), _)) => layout_is_side(&s),
-        _ => false,
-    }
-}
-
-/// A Principia change to the layout row.
-pub fn is_layout_change(msg: &SMessage) -> bool {
-    matches!(msg, SMessage::Principia(PrincipiaCommand::PrefChanged { ns, key, .. }) if ns == LAYOUT_NS && key == LAYOUT_KEY)
-}
+/// STRIP2 (SR219): the layout row (Principia's `aether.tabs.layout`) is chrome_rows', the one read both faces make;
+/// the names stay public here.
+pub use crate::widgets::chrome_rows::{is_layout_change, layout_is_side, stored_layout, LAYOUT_KEY, LAYOUT_NS};
 
 thread_local! {
     /// The layout in force (true: side), the views that follow it, and whether its watch is installed.
@@ -120,46 +98,16 @@ fn on_layout(synapse: &Synapse, f: impl Fn(bool) + 'static) {
     LISTENERS.with(|l| l.borrow_mut().push(f));
 }
 
-/// The longest label a tab shows, in characters (the rest is an ellipsis).
-const LABEL_MAX: usize = 24;
-
+/// A top-strip label, cut at chrome_rows' `TOP_LABEL_MAX` characters (the rest is an ellipsis).
 fn short(label: &str) -> String {
-    clip(label, LABEL_MAX)
+    clip(label, chrome_rows::TOP_LABEL_MAX)
 }
 
 // ---- AETHERSIDETABS2 (SR143): the strip as the shell sends it, the favicons, the drag ----------------------------
 
 /// The strip as the shell last sent it (`SMessage::BrowserTabs`): what both strips draw and the tab search lists.
-#[derive(Clone, Default)]
-struct Strip {
-    active: u64,
-    tabs: Vec<BrowserTabRow>,
-    groups: Vec<BrowserTabGroupRow>,
-}
-
-impl Strip {
-    fn group(&self, id: u64) -> Option<&BrowserTabGroupRow> {
-        self.groups.iter().find(|g| g.id == id)
-    }
-
-    fn pos(&self, id: u64) -> Option<usize> {
-        self.tabs.iter().position(|t| t.id == id)
-    }
-
-    /// Where a tab dragged onto tab `onto` lands (the model's `move_to` index, counted after it is taken out):
-    /// dragged rightwards it goes just after `onto`, leftwards just before it — `onto`'s own index either way.
-    fn drop_index(&self, id: u64, onto: u64) -> Option<u32> {
-        self.pos(id)?;
-        self.pos(onto).map(|k| k as u32)
-    }
-
-    /// The tabs whose label or URL holds `query` (case-insensitive), in strip order; every tab for an empty query
-    /// (the model's `TabStrip::search`, over the wire's rows).
-    fn search(&self, query: &str) -> Vec<BrowserTabRow> {
-        let q = query.trim().to_lowercase();
-        self.tabs.iter().filter(|t| t.label.to_lowercase().contains(&q) || t.url.to_lowercase().contains(&q)).cloned().collect()
-    }
-}
+/// STRIP2 (SR219): chrome_rows' `TabWire` (its `group`, `pos`, `drop_index`, `drop_verb`, `search`).
+use crate::widgets::chrome_rows::TabWire as Strip;
 
 thread_local! {
     static LAST: RefCell<Strip> = RefCell::new(Strip::default());
@@ -176,13 +124,16 @@ fn take(m: &SMessage) -> bool {
             true
         }
         SMessage::BrowserTabFavicon { id, size, rgba } => {
-            let n = *size as usize;
-            if n == 0 || rgba.len() < n * n * 4 {
-                ICONS.with(|i| i.borrow_mut().remove(id));
-            } else {
-                let bytes = glib::Bytes::from(&rgba[..n * n * 4]);
-                let tex = gdk::MemoryTexture::new(n as i32, n as i32, gdk::MemoryFormat::R8g8b8a8, &bytes, n * 4);
-                ICONS.with(|i| i.borrow_mut().insert(*id, tex.upcast()));
+            match chrome_rows::favicon_rgba(*size, rgba) {
+                None => {
+                    ICONS.with(|i| i.borrow_mut().remove(id));
+                }
+                Some(px) => {
+                    let n = *size as usize;
+                    let bytes = glib::Bytes::from(px);
+                    let tex = gdk::MemoryTexture::new(n as i32, n as i32, gdk::MemoryFormat::R8g8b8a8, &bytes, n * 4);
+                    ICONS.with(|i| i.borrow_mut().insert(*id, tex.upcast()));
+                }
             }
             true
         }
@@ -233,36 +184,36 @@ fn bar(rgb: u32, w: i32, h: i32) -> gtk4::DrawingArea {
     a
 }
 
-/// The favicon slot: the tab's tile when the engine sent one, else the letter tile (`◌` while loading).
+/// The favicon slot: the tab's tile when the engine sent one, else the letter tile (`◌` while loading) — STRIP2
+/// (SR219): chrome_rows' `tile_face` rule.
 fn tile(t: &BrowserTabRow, d: i32) -> gtk4::Widget {
-    if let Some(tex) = ICONS.with(|i| i.borrow().get(&t.id).cloned()) {
-        if !t.loading {
-            let img = gtk4::Image::from_paintable(Some(&tex));
-            img.set_pixel_size(16);
+    let tex = ICONS.with(|i| i.borrow().get(&t.id).cloned());
+    let letter = match chrome_rows::tile_face(t, tex.is_some()) {
+        Tile::Icon => {
+            let img = gtk4::Image::from_paintable(tex.as_ref());
+            img.set_pixel_size(chrome_rows::FAVICON_PX as i32);
             img.set_size_request(d, d);
             img.set_valign(gtk4::Align::Center);
             return img.upcast();
         }
-    }
+        Tile::Letter(l) => l,
+    };
     let frame = gtk4::Frame::new(None);
     frame.set_size_request(d, d);
     frame.set_valign(gtk4::Align::Center);
     frame.add_css_class("view");
-    let letter = GlyphLabel::new(if t.loading { "◌" } else { &t.initial });
+    let letter = GlyphLabel::new(&letter);
     letter.set_halign(gtk4::Align::Center);
     letter.set_valign(gtk4::Align::Center);
     frame.set_child(Some(&letter));
     frame.upcast()
 }
 
-/// The drag's payload: a tab id, as text.
-const DRAG_PREFIX: &str = "aether-tab:";
-
-/// `w` can be dragged: it carries tab `id`.
+/// `w` can be dragged: it carries tab `id` (chrome_rows' `drag_payload`).
 fn drag_source(w: &impl IsA<gtk4::Widget>, id: u64) {
     let src = gtk4::DragSource::new();
     src.set_actions(gdk::DragAction::MOVE);
-    src.connect_prepare(move |_, _, _| Some(gdk::ContentProvider::for_value(&format!("{DRAG_PREFIX}{id}").to_value())));
+    src.connect_prepare(move |_, _, _| Some(gdk::ContentProvider::for_value(&chrome_rows::drag_payload(id).to_value())));
     w.as_ref().add_controller(src);
 }
 
@@ -270,7 +221,7 @@ fn drag_source(w: &impl IsA<gtk4::Widget>, id: u64) {
 fn drop_target(w: &impl IsA<gtk4::Widget>, on_drop: impl Fn(u64) + 'static) {
     let t = gtk4::DropTarget::new(glib::Type::STRING, gdk::DragAction::MOVE);
     t.connect_drop(move |_, v, _, _| {
-        let id = v.get::<String>().ok().and_then(|s| s.strip_prefix(DRAG_PREFIX).and_then(|x| x.parse::<u64>().ok()));
+        let id = v.get::<String>().ok().and_then(|s| chrome_rows::drag_id(&s));
         match id {
             Some(id) => {
                 on_drop(id);
@@ -282,28 +233,29 @@ fn drop_target(w: &impl IsA<gtk4::Widget>, on_drop: impl Fn(u64) + 'static) {
     w.as_ref().add_controller(t);
 }
 
-/// A tab dropped on tab `onto`: the move (the model joins or leaves groups by where it lands).
-fn drop_on_tab(synapse: &Synapse, onto: u64) -> impl Fn(u64) + 'static {
+/// A tab dropped on `on` (a tab, a group's header or chip, `+`): chrome_rows' `drop_verb` over the strip.
+fn drop_on(synapse: &Synapse, on: DropOn) -> impl Fn(u64) + 'static {
     let syn = synapse.clone();
     move |id| {
-        if id == onto {
-            return;
-        }
-        if let Some(to) = LAST.with(|l| l.borrow().drop_index(id, onto)) {
-            syn.fire(SMessage::BrowserTabMove { id, to });
+        if let Some(m) = LAST.with(|l| l.borrow().drop_verb(id, on)) {
+            syn.fire(m);
         }
     }
 }
 
+/// A tab dropped on tab `onto`: the move (the model joins or leaves groups by where it lands).
+fn drop_on_tab(synapse: &Synapse, onto: u64) -> impl Fn(u64) + 'static {
+    drop_on(synapse, DropOn::Tab(onto))
+}
+
 /// A tab dropped on group `group`'s header or chip: it joins the group.
 fn drop_on_group(synapse: &Synapse, group: u64) -> impl Fn(u64) + 'static {
-    let syn = synapse.clone();
-    move |id| syn.fire(SMessage::BrowserTabGroupAdd { id, group })
+    drop_on(synapse, DropOn::Group(group))
 }
 
 /// The right-click menu on `w`: `items` are (label, the message it sends); a `None` message is the rename entry
 /// for that group.
-fn context_menu(w: &impl IsA<gtk4::Widget>, synapse: &Synapse, items: impl Fn() -> Vec<(String, Option<SMessage>, u64)> + 'static) {
+fn context_menu(w: &impl IsA<gtk4::Widget>, synapse: &Synapse, items: impl Fn() -> Vec<MenuRow> + 'static) {
     let click = gtk4::GestureClick::new();
     click.set_button(3);
     let (anchor, syn) = (w.as_ref().clone(), synapse.clone());
@@ -344,31 +296,14 @@ fn context_menu(w: &impl IsA<gtk4::Widget>, synapse: &Synapse, items: impl Fn() 
     w.as_ref().add_controller(click);
 }
 
-/// A tab's menu: a new group with it, into each other group, out of its own, close.
-fn tab_menu(id: u64) -> Vec<(String, Option<SMessage>, u64)> {
-    let s = LAST.with(|l| l.borrow().clone());
-    let own = s.tabs.iter().find(|t| t.id == id).and_then(|t| t.group);
-    let mut v = vec![("Add to a new group".to_string(), Some(SMessage::BrowserTabGroupNew { tabs: vec![id], name: String::new(), color: None }), 0)];
-    for g in s.groups.iter().filter(|g| Some(g.id) != own) {
-        let name = if g.name.is_empty() { format!("Add to the {} group", g.color) } else { format!("Add to “{}”", g.name) };
-        v.push((name, Some(SMessage::BrowserTabGroupAdd { id, group: g.id }), 0));
-    }
-    if own.is_some() {
-        v.push(("Remove from group".to_string(), Some(SMessage::BrowserTabUngroup(id)), 0));
-    }
-    v.push(("Close tab".to_string(), Some(SMessage::BrowserTabClose(Some(id))), 0));
-    v
+/// A tab's menu over the strip now (chrome_rows' `tab_menu`).
+fn tab_menu(id: u64) -> Vec<MenuRow> {
+    LAST.with(|l| chrome_rows::tab_menu(&l.borrow(), id))
 }
 
-/// A group's menu: collapse or expand, rename, the next colour, ungroup.
-fn group_menu(gid: u64) -> Vec<(String, Option<SMessage>, u64)> {
-    let collapsed = LAST.with(|l| l.borrow().group(gid).is_some_and(|g| g.collapsed));
-    vec![
-        ((if collapsed { "Expand group" } else { "Collapse group" }).to_string(), Some(SMessage::BrowserTabGroupToggle(gid)), gid),
-        ("Name the group (Enter)".to_string(), None, gid),
-        ("Next colour".to_string(), Some(SMessage::BrowserTabGroupRecolor { group: gid, color: None }), gid),
-        ("Ungroup".to_string(), Some(SMessage::BrowserTabGroupDissolve(gid)), gid),
-    ]
+/// A group's menu over the strip now (chrome_rows' `group_menu`).
+fn group_menu(gid: u64) -> Vec<MenuRow> {
+    LAST.with(|l| chrome_rows::group_menu(&l.borrow(), gid))
 }
 
 // ---- the top strip ---------------------------------------------------------------------------------------------
@@ -432,24 +367,25 @@ fn group_chip(g: &BrowserTabGroupRow, synapse: &Synapse) -> gtk4::Widget {
 }
 
 /// Rebuild the top strip: each group's chip before its run (the run hidden while collapsed), then its tabs.
+/// STRIP2 (SR219): the walk is chrome_rows' `top_rows`; this face only builds each cell.
 fn fill_top(tabs: &Box, synapse: &Synapse) {
     while let Some(child) = tabs.first_child() {
         tabs.remove(&child);
     }
     let s = LAST.with(|l| l.borrow().clone());
-    let mut cur: Option<u64> = None;
-    for t in &s.tabs {
-        if t.group != cur {
-            cur = t.group;
-            if let Some(g) = cur.and_then(|g| s.group(g)) {
-                tabs.append(&group_chip(g, synapse));
+    for r in chrome_rows::top_rows(s.active, &s.tabs, &s.groups) {
+        match r {
+            SideRow::Group { id, .. } => {
+                if let Some(g) = s.group(id) {
+                    tabs.append(&group_chip(g, synapse));
+                }
             }
+            SideRow::Tab { id, active, .. } => {
+                let Some(t) = s.tabs.iter().find(|t| t.id == id) else { continue };
+                tabs.append(&tab_button(t, active, t.group.and_then(|g| s.group(g)), synapse));
+            }
+            SideRow::New => {}
         }
-        let g = t.group.and_then(|g| s.group(g));
-        if g.is_some_and(|g| g.collapsed) {
-            continue;
-        }
-        tabs.append(&tab_button(t, t.id == s.active, g, synapse));
     }
 }
 
@@ -475,11 +411,7 @@ pub fn bootstrap_tab_strip(synapse: Synapse) -> NativeView {
     new_tab.connect_clicked(move |_| syn.fire(SMessage::BrowserTabNew));
     {
         // A tab dropped on `+` goes to the end of the strip.
-        let syn = synapse.clone();
-        drop_target(&new_tab, move |id| {
-            let to = LAST.with(|l| l.borrow().tabs.len()) as u32;
-            syn.fire(SMessage::BrowserTabMove { id, to });
-        });
+        drop_target(&new_tab, drop_on(&synapse, DropOn::End));
     }
     outer.append(&scroller);
     outer.append(&new_tab);
@@ -614,13 +546,7 @@ fn fill_side(list: &gtk4::ListBox, ids: &RefCell<Vec<SideRow>>, rail: bool, syna
                 plus.set_margin_bottom(4);
                 plus.append(&GlyphLabel::new(if rail { "+" } else { "+   New tab" }));
                 plus.set_tooltip_text(Some("New tab (Ctrl+T)"));
-                {
-                    let syn = synapse.clone();
-                    drop_target(&plus, move |id| {
-                        let to = LAST.with(|l| l.borrow().tabs.len()) as u32;
-                        syn.fire(SMessage::BrowserTabMove { id, to });
-                    });
-                }
+                drop_target(&plus, drop_on(synapse, DropOn::End));
                 list.append(&plus);
             }
         }
