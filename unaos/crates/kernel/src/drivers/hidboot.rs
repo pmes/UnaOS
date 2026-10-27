@@ -29,7 +29,7 @@
 // HIDBOOTLEDS (rmbp-ledger B987): the lock LEDs leave the decoder through ONE `Transport::set_leds`
 // call; `[keystat] <tag>` and the PRTSCR `on <transport>` word name the transport (EHCI byte-identical).
 // HIDBOOTLEDSEHCI (B991): EHCI's arm marks the endpoint's LED slot, drained after the walk. Owed (input.md
-// §5 Z3 row): the Fn keys; HIDBOOT-ARM; HIDBOOT-PUMP (the i8042 is pumped only from `ehci::service_ehci_hid`). HIDBOOTLEDSTEST (B995): the slot drain is `drain_led_slots` (file tail), `tests hidboot`.
+// §5 Z3 row): the Fn keys; HIDBOOT-PUMP (the i8042 is pumped only from `ehci::service_ehci_hid`). HIDBOOT-ARM BUILT by HIDBOOTARM (B1000): declared on aarch64, the aarch64 xHCI keyboard calls `decode_noted` (file tail) with `Transport::Xhci`. HIDBOOTLEDSTEST (B995): the slot drain is `drain_led_slots` (file tail), `tests hidboot`.
 
 /// The transport that carried a boot keyboard report. Labels the decoder's wire; changes no decode.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -40,6 +40,8 @@ pub enum Transport {
     Bluetooth,
     /// The i8042 PS/2 keyboard (`drivers::i8042`), its set-1 scancodes folded into a boot report.
     Ps2,
+    /// HIDBOOTARM (B1000): a USB boot keyboard on xHCI (aarch64: the Orin's XUSB, the Pi's VL805; x86 xHCI keeps its inline decode, HIDBOOT-XHCI-X86 owed).
+    Xhci,
 }
 
 impl Transport {
@@ -49,6 +51,7 @@ impl Transport {
             Transport::Ehci => "EHCI-HID",
             Transport::Bluetooth => "BT-HID",
             Transport::Ps2 => "PS2-HID",
+            Transport::Xhci => "xHCI",
         }
     }
 
@@ -58,6 +61,7 @@ impl Transport {
             Transport::Ehci => "ehci",
             Transport::Bluetooth => "bt",
             Transport::Ps2 => "ps2",
+            Transport::Xhci => "xhci",
         }
     }
 
@@ -67,12 +71,13 @@ impl Transport {
     /// DATA|Output report on the next pass. EHCI (HIDBOOTLEDSEHCI B991): SET_REPORT is an EP0 control
     /// transfer that needs `&mut Controller`, which the endpoint walk holds while it calls the decoder,
     /// and this unit label cannot address the endpoint — so the arm answers `true`: the caller's
-    /// per-endpoint LED slot (`kbd_leds` + `kbd_led_dirty`) is owed, drained after the walk. Bluetooth and PS/2 queue themselves and answer `false`.
+    /// per-endpoint LED slot (`kbd_leds` + `kbd_led_dirty`) is owed, drained after the walk. Bluetooth and PS/2 queue themselves and answer `false`. xHCI (HIDBOOTARM B1000) answers `true` like EHCI: the slot's `keyboard_leds_dirty`.
     pub fn set_leds(self, leds: u8) -> bool {
         match self {
             Transport::Ehci => true,
             Transport::Bluetooth => { bt_queue_led(leds); false }
-            Transport::Ps2 => { crate::drivers::i8042::set_leds(leds); false }
+            Transport::Ps2 => { ps2_set_leds(leds); false }
+            Transport::Xhci => true, // HIDBOOTARM (B1000): the caller owes HIDLEDDEFER's `keyboard_leds_dirty`, drained by `service_hid_leds`
         }
     }
 }
@@ -265,10 +270,10 @@ impl Transport {
 // which endpoint carried it. All of it is dead weight on a boot where nobody types: every counter
 // stays 0 and not one line is emitted.
 //
-// This whole block is x86-only by construction — `drivers/mod.rs` gates `pub mod hidboot` on
-// `target_arch = "x86_64"` (HIDBOOTSHARED B982: no longer the `ehcihid` gate, so the PS/2 transport
-// needs only this module), so aarch64 never compiles a byte of it. The one dependency that is not on
-// every x86 image, `pal::typematic_note_keys` (pal's own `x86_64 + ehcihid` gate), is cfg'd at its call.
+// HIDBOOTARM (B1000): `drivers/mod.rs` declares `pub mod hidboot` on x86_64 AND aarch64 (the aarch64 xHCI
+// keyboard is a caller, under the xHCI loan); HIDBOOTSHARED (B982) had it x86-only. The one dependency
+// that is not on every image, `pal::typematic_note_keys`, carries pal's own gate (`x86_64 + ehcihid`,
+// `aarch64 + baremetal|tegra`) at its call; the i8042 and Bluetooth arms are x86-gated at their helpers.
 
 /// DBLSTROKE — `Event::Key` pushes this decoder made, i.e. genuine press edges.
 static PRESS_EDGES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
@@ -397,7 +402,7 @@ pub unsafe fn decode_boot_keyboard(
     // drain in `service_ehci_hid` runs the chain under the lock. Ctrl+Alt+b resolves to no printable
     // character, so `hid_key_ascii` returns 0 for it and the loop below emits nothing for this key —
     // the chord types nothing. Gated on `bt`: a non-Bluetooth build has no chord and no request path.
-    #[cfg(feature = "bt")]
+    #[cfg(all(target_arch = "x86_64", feature = "bt"))]
     {
         const CHORD_KEY_B: u8 = 0x05;
         let ctrl = modifiers & 0x11 != 0;
@@ -466,7 +471,7 @@ pub unsafe fn decode_boot_keyboard(
                 }
             }
         }
-        #[cfg(feature = "ehcihid")] { crate::pal::typematic_note_keys(newest_press, &held[..hn]); } for &kc in cur_keys.iter() { if kc > 1 && !prev_keys.contains(&kc) { #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] let _ = crate::video::fnrow::fn_row_usage(crate::video::fnrow::PATH_EHCI, kc, modifiers); } } // XHCIMEDIA (B438): through the one fn-row router. VOLKEYS: F10/F11/F12 press edges -> mute/down/up (codec amp + bar indicator)
+        #[cfg(any(all(target_arch = "x86_64", feature = "ehcihid"), all(target_arch = "aarch64", any(feature = "baremetal", feature = "tegra"))))] { crate::pal::typematic_note_keys(newest_press, &held[..hn]); } for &kc in cur_keys.iter() { if kc > 1 && !prev_keys.contains(&kc) { #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] let _ = crate::video::fnrow::fn_row_usage(if t == Transport::Xhci { crate::video::fnrow::PATH_XHCI } else { crate::video::fnrow::PATH_EHCI }, kc, modifiers); } } // XHCIMEDIA (B438): through the one fn-row router. VOLKEYS: F10/F11/F12 press edges -> mute/down/up (codec amp + bar indicator)
     }
 
     // The release edges. Bounded by six per report, and a human's key releases are human-rate, so
@@ -544,11 +549,11 @@ pub unsafe fn decode_boot_keyboard(
 
 // HIDBOOTLEDS (B987): `Transport::set_leds`'s Bluetooth arm — bthid's `PENDING_LED` slot where the
 // Bluetooth HID host is linked (`btc`), nothing where it is not.
-#[cfg(feature = "btc")]
+#[cfg(all(target_arch = "x86_64", feature = "btc"))]
 fn bt_queue_led(leds: u8) {
     crate::drivers::ehci::bthid::queue_led(leds);
 }
-#[cfg(not(feature = "btc"))]
+#[cfg(not(all(target_arch = "x86_64", feature = "btc")))]
 fn bt_queue_led(_leds: u8) {}
 
 // HIDBOOTLEDSEHCI (rmbp-ledger B991): the `[hidboot] leds` line for a transport whose LED change its
@@ -556,7 +561,7 @@ fn bt_queue_led(_leds: u8) {}
 // control fn's own answer; "timeout" names itself and every other refusal (stall, hse, ...) reads
 // `ctrl-fail` (the EHCI-HID ALLKEYS witness beside it keeps the exact cause). Human-rate: one line per
 // lock press, and a refusing keyboard's latch makes its refused line once per endpoint.
-#[cfg(feature = "ehcihid")]
+#[cfg(any(feature = "ehcihid", target_arch = "aarch64"))]
 pub fn note_leds_sent(t: Transport, leds: u8, addr: u8, intf: u8, r: Result<(), &'static str>) {
     let caps = (leds >> 1) & 1;
     match r {
@@ -580,7 +585,7 @@ pub fn note_leds_sent(t: Transport, leds: u8, addr: u8, intf: u8, r: Result<(), 
 // endpoint). Best-effort: a refusal costs a dark key, never a keystroke (the case fold already moved with the byte).
 
 /// HIDBOOTLEDSTEST (B995): a transport's per-endpoint LED slots, as the one drain sees them.
-#[cfg(feature = "ehcihid")]
+#[cfg(any(feature = "ehcihid", target_arch = "aarch64"))]
 pub trait LedSlots {
     /// How many slots (EHCI: one per interrupt endpoint).
     fn count(&self) -> usize;
@@ -593,7 +598,7 @@ pub trait LedSlots {
 }
 
 /// HIDBOOTLEDSTEST (B995): the ONE LED slot drain (B991's loop body, moved verbatim in logic). Returns `(sent, refused)`.
-#[cfg(feature = "ehcihid")]
+#[cfg(any(feature = "ehcihid", target_arch = "aarch64"))]
 pub fn drain_led_slots<S: LedSlots>(s: &mut S, t: Transport) -> (u32, u32) {
     let (mut sent, mut refused) = (0u32, 0u32);
     for i in 0..s.count() {
@@ -614,7 +619,7 @@ pub fn drain_led_slots<S: LedSlots>(s: &mut S, t: Transport) -> (u32, u32) {
 }
 
 /// HIDBOOTLEDSTEST (B995): the KAT's slot owner — two endpoints on address 0 (no enumerated USB device holds it).
-#[cfg(feature = "ehcihid")]
+#[cfg(any(feature = "ehcihid", target_arch = "aarch64"))]
 struct KatSlots {
     dirty: [bool; 2],
     ok: [bool; 2],
@@ -625,7 +630,7 @@ struct KatSlots {
     last: [u8; 2],
 }
 
-#[cfg(feature = "ehcihid")]
+#[cfg(any(feature = "ehcihid", target_arch = "aarch64"))]
 impl LedSlots for KatSlots {
     fn count(&self) -> usize {
         2
@@ -652,10 +657,11 @@ impl LedSlots for KatSlots {
 /// refusing endpoint is sent to once, latched off, and never again. The decoder runs under `ehci::EHCI_HID`, as every
 /// caller does (the DBLSTROKE atomics and the typematic feed). Lock usages carry no character: no `pal::push_event`.
 /// `:: HIDBOOT: owed=ok|bad coalesce=ok|bad latch=ok|bad -> PASS|FAIL ::`
-#[cfg(feature = "ehcihid")]
+#[cfg(any(feature = "ehcihid", target_arch = "aarch64"))]
 pub fn selftest() {
     const CAPS: u8 = 0x39;
     const NUM: u8 = 0x53;
+    const KT: Transport = if cfg!(target_arch = "aarch64") { Transport::Xhci } else { Transport::Ehci }; // HIDBOOTARM (B1000): the aarch64 KAT drives the xHCI arm (same `true` answer)
     let rep = |kc: u8| -> [u8; 8] { [0, 0, kc, 0, 0, 0, 0, 0] };
     let up = [0u8; 8];
     let mut fake = KatSlots {
@@ -669,40 +675,40 @@ pub fn selftest() {
     };
     let (mut prev, mut pm) = ([0u8; 6], 0u8);
     let (owed_ok, coalesce_ok, latch_ok) = {
-        let _g = crate::drivers::ehci::EHCI_HID.lock();
+        #[cfg(feature = "ehcihid")] let _g = crate::drivers::ehci::EHCI_HID.lock(); // HIDBOOTARM (B1000): aarch64 has no EHCI; its KAT runs unserialised (lock keys push no event), HIDBOOT-ARM-KATLOCK owed
         // owed: a press edge owes the slot; a restated level, a release and a short report do not.
         let mut leds = 0u8;
         let (mut p0, mut m0) = ([0u8; 6], 0u8);
-        let o1 = unsafe { decode_boot_keyboard(Transport::Ehci, &rep(CAPS), &mut p0, &mut m0, &mut leds) };
+        let o1 = unsafe { decode_boot_keyboard(KT, &rep(CAPS), &mut p0, &mut m0, &mut leds) };
         let l1 = leds;
-        let o2 = unsafe { decode_boot_keyboard(Transport::Ehci, &rep(CAPS), &mut p0, &mut m0, &mut leds) };
-        let o3 = unsafe { decode_boot_keyboard(Transport::Ehci, &up, &mut p0, &mut m0, &mut leds) };
-        let o4 = unsafe { decode_boot_keyboard(Transport::Ehci, &rep(CAPS)[..4], &mut p0, &mut m0, &mut leds) };
+        let o2 = unsafe { decode_boot_keyboard(KT, &rep(CAPS), &mut p0, &mut m0, &mut leds) };
+        let o3 = unsafe { decode_boot_keyboard(KT, &up, &mut p0, &mut m0, &mut leds) };
+        let o4 = unsafe { decode_boot_keyboard(KT, &rep(CAPS)[..4], &mut p0, &mut m0, &mut leds) };
         let owed_ok = o1 && l1 == 0x02 && !o2 && !o3 && !o4 && leds == 0x02;
         // coalesce: slot 0's byte through the decoder, marked as the walk marks it; slot 1 dirty but dead.
         for r in [rep(CAPS), up, rep(NUM), up] {
-            if unsafe { decode_boot_keyboard(Transport::Ehci, &r, &mut prev, &mut pm, &mut fake.leds[0]) } {
+            if unsafe { decode_boot_keyboard(KT, &r, &mut prev, &mut pm, &mut fake.leds[0]) } {
                 fake.dirty[0] = true;
             }
         }
         fake.dirty[1] = true;
-        let d1 = drain_led_slots(&mut fake, Transport::Ehci);
-        let d2 = drain_led_slots(&mut fake, Transport::Ehci);
+        let d1 = drain_led_slots(&mut fake, KT);
+        let d2 = drain_led_slots(&mut fake, KT);
         let coalesce_ok = d1 == (1, 0) && fake.sends == [1, 0] && fake.last[0] == 0x03 && !fake.dirty[1] && d2 == (0, 0);
         // latch: a refusing endpoint is sent to once and latched off; the next owed toggle sends nothing.
         fake.refuse[0] = true;
         for r in [rep(CAPS), up] {
-            if unsafe { decode_boot_keyboard(Transport::Ehci, &r, &mut prev, &mut pm, &mut fake.leds[0]) } {
+            if unsafe { decode_boot_keyboard(KT, &r, &mut prev, &mut pm, &mut fake.leds[0]) } {
                 fake.dirty[0] = true;
             }
         }
-        let d3 = drain_led_slots(&mut fake, Transport::Ehci);
+        let d3 = drain_led_slots(&mut fake, KT);
         for r in [rep(CAPS), up] {
-            if unsafe { decode_boot_keyboard(Transport::Ehci, &r, &mut prev, &mut pm, &mut fake.leds[0]) } {
+            if unsafe { decode_boot_keyboard(KT, &r, &mut prev, &mut pm, &mut fake.leds[0]) } {
                 fake.dirty[0] = true;
             }
         }
-        let d4 = drain_led_slots(&mut fake, Transport::Ehci);
+        let d4 = drain_led_slots(&mut fake, KT);
         let latch_ok = d3 == (0, 1) && !fake.ok[0] && fake.last[0] == 0x01 && d4 == (0, 0) && fake.sends == [2, 0];
         (owed_ok, coalesce_ok, latch_ok)
     };
@@ -712,4 +718,33 @@ pub fn selftest() {
         w(owed_ok), w(coalesce_ok), w(latch_ok),
         if owed_ok && coalesce_ok && latch_ok { "PASS" } else { "FAIL" }
     );
+}
+
+// HIDBOOTARM (rmbp-ledger B1000) — TAIL-APPENDED. The i8042 arm of `Transport::set_leds` behind its arch (the
+// `bt_queue_led` shape: the i8042 module is x86_64-only), and the aarch64 xHCI keyboard's entry: `decode_noted` is a
+// WITNESS WRAPPER over the ONE decoder, not a second decoder — it calls `decode_boot_keyboard` and, on the first report
+// that pushed a press edge, prints `[hidboot] via=<tag> arch=aarch64 keys=<edges this report>` once per boot.
+#[cfg(target_arch = "x86_64")]
+fn ps2_set_leds(leds: u8) {
+    crate::drivers::i8042::set_leds(leds);
+}
+#[cfg(not(target_arch = "x86_64"))]
+fn ps2_set_leds(_leds: u8) {}
+
+/// HIDBOOTARM (B1000): set once the first-key line has printed.
+#[cfg(target_arch = "aarch64")]
+static ARM_FIRST: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// HIDBOOTARM (B1000): the aarch64 xHCI keyboard completion's call (`drivers::xhci` `poll_events`, under the xHCI loan,
+/// which owns the slot state passed here). Returns `decode_boot_keyboard`'s answer (true = the caller owes its LED slot).
+#[cfg(target_arch = "aarch64")]
+pub fn decode_noted(t: Transport, report: &[u8], prev_keys: &mut [u8; 6], prev_mods: &mut u8, leds: &mut u8) -> bool {
+    use core::sync::atomic::Ordering;
+    let before = PRESS_EDGES.load(Ordering::Relaxed);
+    let owed = unsafe { decode_boot_keyboard(t, report, prev_keys, prev_mods, leds) };
+    let keys = PRESS_EDGES.load(Ordering::Relaxed).wrapping_sub(before);
+    if keys > 0 && !ARM_FIRST.swap(true, Ordering::Relaxed) {
+        serial_println!("[hidboot] via={} arch={} keys={}", t.tag(), if cfg!(target_arch = "aarch64") { "aarch64" } else { "x86_64" }, keys);
+    }
+    owed
 }
