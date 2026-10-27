@@ -804,7 +804,7 @@ refs/heads/exec-rmbp-nle1   24b620060 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-nleprobe   2c8aa19b1 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-aethermac   d08ed067e FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-h264enc   5f08b4680 FOLDED-BY-HAND (this commit) 2026-10-27
-refs/heads/exec-rmbp-heaacsbr   3ead33dc7 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-heaacsbr   bbc4e7bae FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-hevcparse   3ead33dc7 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-demuxseek   0f8b5a732 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-bootlistarm   e116e1449 FOLDED-BY-HAND (this commit) 2026-10-27

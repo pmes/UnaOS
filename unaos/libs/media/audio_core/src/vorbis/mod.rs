@@ -634,7 +634,7 @@ impl Imdct {
         Imdct { n, tw, tw_post, fft_tw, bitrev, window: [slope(blocksize[0] / 2), slope(blocksize[1] / 2)] }
     }
 
-    fn fft(&self, re: &mut [f32], im: &mut [f32]) {
+    pub(crate) fn fft(&self, re: &mut [f32], im: &mut [f32]) {
         let m = re.len();
         for i in 0..m {
             let j = self.bitrev[i] as usize;
