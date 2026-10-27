@@ -61,7 +61,7 @@ pub fn gate(ev: Event) -> bool {
         _ => (false, false),
     };
     if !input { return false; }
-    LAST_ACTIVITY_MS.store(crate::arch::ms().max(1), Ordering::Relaxed); #[cfg(all(target_arch = "x86_64", feature = "lidsleep"))] if super::lidsleep::claim_wake(press) && !BLANKED.load(Ordering::Acquire) { return swallow(ev); } // LIDKEYSWALLOW (B784): the sleep state's first input claims its wake; a claimed press is swallowed by the one [`swallow`] (BLANKED too: the branch below swallows it). LINE-NEUTRAL fold, code first
+    LAST_ACTIVITY_MS.store(crate::arch::ms().max(1), Ordering::Relaxed); #[cfg(target_arch = "x86_64")] if super::lidsleep::claim_wake(press) && !BLANKED.load(Ordering::Acquire) { return swallow(ev); } // LIDKEYSWALLOW (B784): the sleep state's first input claims its wake; a claimed press is swallowed by the one [`swallow`] (BLANKED too: the branch below swallows it); SLEEPRESUME (B863): every x86 image, the knob left. LINE-NEUTRAL fold, code first
     if BLANKED.swap(false, Ordering::AcqRel) {
         WOKE_AT_MS.store(crate::arch::ms().max(1), Ordering::Relaxed);
         WAKE_OWED.store(true, Ordering::Release);

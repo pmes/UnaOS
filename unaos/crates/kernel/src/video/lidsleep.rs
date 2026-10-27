@@ -193,7 +193,7 @@ fn blank(via: &str) -> Blank {
 /// unreachable from this tree and `power::sleep` says why. Idempotent: a second request keeps the first prior level.
 pub fn sleep_request(via: &str) -> Blank {
     let b = blank(via);
-    if !SLEPT.load(Ordering::Relaxed) { PRIOR_RAW.store(b.prior.unwrap_or(0), Ordering::Relaxed); } #[cfg(all(target_arch = "x86_64", feature = "lidsleep"))] if !SLEPT.load(Ordering::Relaxed) { arm_wake_claim(); } // LIDKEYSWALLOW (B784): a first entry re-arms the wake claim before SLEPT is set (file tail). LINE-NEUTRAL fold, code first
+    if !SLEPT.load(Ordering::Relaxed) { PRIOR_RAW.store(b.prior.unwrap_or(0), Ordering::Relaxed); } #[cfg(target_arch = "x86_64")] if !SLEPT.load(Ordering::Relaxed) { arm_wake_claim(via); } // LIDKEYSWALLOW (B784): a first entry re-arms the wake claim before SLEPT is set (file tail); SLEEPRESUME (B863): on every x86 image (the login window's backlight-only Sleep without `lidsleep` too), the entry named. LINE-NEUTRAL fold, code first
     SLEPT_HW.store(b.hw, Ordering::Relaxed);
     SLEPT_AT_MS.store(crate::arch::ms().max(1), Ordering::Relaxed);
     let first = !SLEPT.swap(true, Ordering::AcqRel);
@@ -211,7 +211,7 @@ pub fn sleep_request(via: &str) -> Blank {
 /// Leave the sleep state from `via` (a named waker): restore the level the blank took, release the panel, and owe the
 /// service pass its repaint. Returns the readback.
 pub fn wake(via: &str) -> Option<u32> {
-    if !SLEPT.swap(false, Ordering::AcqRel) { return None; } #[cfg(all(target_arch = "x86_64", feature = "lidsleep"))] clear_wake_claim(); // LIDKEYSWALLOW (B784): the wake edge clears the claim, so a claim made in one sleep never answers the next (file tail). LINE-NEUTRAL fold, code first
+    if !SLEPT.swap(false, Ordering::AcqRel) { return None; } #[cfg(target_arch = "x86_64")] clear_wake_claim(); // LIDKEYSWALLOW (B784): the wake edge clears the claim, so a claim made in one sleep never answers the next (file tail). LINE-NEUTRAL fold, code first
     let prior = PRIOR_RAW.load(Ordering::Relaxed);
     let a = super::backlight::set_raw_via(prior, "lidsleep-wake");
     #[cfg(all(target_arch = "x86_64", feature = "lidsleep"))] crate::power::sleep::woke(via);
@@ -265,15 +265,15 @@ pub fn sleep_selftest() {
 // swallowed, pointer motion wakes and is not, later events pass; a `lid`, `power-key` or `tests` wake claims nothing.
 // Atomics only: `gate` stays interrupt-safe.
 /// The wake is claimed (the first input event of this sleep was seen).
-#[cfg(all(target_arch = "x86_64", feature = "lidsleep"))]
+#[cfg(target_arch = "x86_64")]
 static WAKE_CLAIMED: AtomicBool = AtomicBool::new(false);
 /// The claim was a press, and `dimidle::gate` dropped it (`key_swallowed=` on the wake line).
-#[cfg(all(target_arch = "x86_64", feature = "lidsleep"))]
+#[cfg(target_arch = "x86_64")]
 static KEY_SWALLOWED: AtomicBool = AtomicBool::new(false);
 
 /// From `dimidle::gate`, every input event: `true` exactly once per sleep entry, for the first input event while the
 /// state is in force, when it is a press (the gate then swallows it).
-#[cfg(all(target_arch = "x86_64", feature = "lidsleep"))]
+#[cfg(target_arch = "x86_64")]
 pub fn claim_wake(press: bool) -> bool {
     if !SLEPT.load(Ordering::Acquire) || WAKE_CLAIMED.swap(true, Ordering::AcqRel) { return false; }
     KEY_SWALLOWED.store(press, Ordering::Release);
@@ -285,16 +285,20 @@ pub fn claim_wake(press: bool) -> bool {
 pub fn wake_key_swallowed() -> bool { KEY_SWALLOWED.load(Ordering::Acquire) }
 
 /// A first entry (from [`sleep_request`], before SLEPT is set): the claim is open and nothing is swallowed yet.
-#[cfg(all(target_arch = "x86_64", feature = "lidsleep"))]
-fn arm_wake_claim() {
+#[cfg(target_arch = "x86_64")]
+fn arm_wake_claim(via: &str) {
     WAKE_CLAIMED.store(false, Ordering::Release);
     KEY_SWALLOWED.store(false, Ordering::Release);
+    ENTRY_SRC.store(match via { "lid" => SRC_LID, "loginwindow" => SRC_LOGIN, "tests" => SRC_TESTS, _ => 0 }, Ordering::Release); // SLEEPRESUME (B863)
 }
 
 /// The wake edge (from [`wake`], after SLEPT is cleared): the claim is cleared so no claim of this sleep answers the
 /// next; `KEY_SWALLOWED` is kept for the wake's line.
-#[cfg(all(target_arch = "x86_64", feature = "lidsleep"))]
-fn clear_wake_claim() { WAKE_CLAIMED.store(false, Ordering::Release); }
+#[cfg(target_arch = "x86_64")]
+fn clear_wake_claim() {
+    WAKE_CLAIMED.store(false, Ordering::Release);
+    serial_println!("[sleep] wake key swallowed={} src={}", KEY_SWALLOWED.load(Ordering::Acquire) as u8, src_word(ENTRY_SRC.load(Ordering::Acquire))); // SLEEPRESUME (B863): every wake edge, both images
+}
 
 /// `tests sleep`'s second cycle: enter, hold 500 ms, push a key, and wait (bounded 2 s) for the state to leave through
 /// the `input` waker — draining through the shared pop with DIMIDLE's own `drain_own` when this task is the drainer
@@ -302,7 +306,44 @@ fn clear_wake_claim() { WAKE_CLAIMED.store(false, Ordering::Release); }
 /// swallowed its key. `tests_ks`: the first cycle's answer.
 #[cfg(all(target_arch = "x86_64", feature = "lidsleep"))]
 fn key_wake_leg(tests_ks: bool) {
-    let _ = sleep_request("tests");
+    let woke = key_cycle("tests"); // SLEEPRESUME (B863): the cycle's body moved to `key_cycle` (file tail), `tests usbsuspend` drives the login entry through it
+    let key_ks = wake_key_swallowed();
+    let ok = woke && !tests_ks && key_ks;
+    serial_println!(
+        ":: SLEEPKEY: tests_wake_key_swallowed={} input_wake_key_swallowed={} woke={} -> {} ::{}",
+        tests_ks as u8, key_ks as u8, woke as u8, if ok { "PASS" } else { "FAIL" }, if woke { "" } else { " reason=no-drain" }
+    );
+}
+
+// SLEEPRESUME (rmbp-ledger B863, BP-power-13) — TAIL-APPENDED, x86 only (nothing below compiles on aarch64). The wake claim
+// left the `lidsleep` knob: a sleep entered on a `wc` image without it (the login window's backlight-only Sleep) claims its
+// waking key through the same one claim and DIMIDLE's one swallow. The entry is named ([`arm_wake_claim`]) and every wake
+// edge says what the claim did: `[sleep] wake key swallowed=<0|1> src=<lid|login|tests>`.
+#[cfg(target_arch = "x86_64")]
+const SRC_LID: u8 = 1;
+#[cfg(target_arch = "x86_64")]
+const SRC_LOGIN: u8 = 2;
+#[cfg(target_arch = "x86_64")]
+const SRC_TESTS: u8 = 3;
+/// The first entry's path (`SRC_*`; 0 = another via), written by [`arm_wake_claim`], read at the wake edge.
+#[cfg(target_arch = "x86_64")]
+static ENTRY_SRC: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+#[cfg(target_arch = "x86_64")]
+fn src_word(src: u8) -> &'static str {
+    match src { SRC_LID => "lid", SRC_LOGIN => "login", SRC_TESTS => "tests", _ => "other" }
+}
+
+/// The last sleep's entry path (`tests usbsuspend`'s key leg).
+#[cfg(all(target_arch = "x86_64", feature = "lidsleep"))]
+pub fn entry_src() -> &'static str { src_word(ENTRY_SRC.load(Ordering::Acquire)) }
+
+/// One key-woken sleep cycle entered through `via` (moved out of `key_wake_leg`): enter, hold 500 ms, push a key, wait
+/// (bounded 2 s) for the `input` waker — draining through the shared pop with DIMIDLE's own `drain_own` when this task is
+/// the drainer (QEMUCLASS2 B565) — leave as `tests` if it did not, then wait (bounded 3 s) for the repaint. `true` = woke.
+#[cfg(all(target_arch = "x86_64", feature = "lidsleep"))]
+pub fn key_cycle(via: &str) -> bool {
+    let _ = sleep_request(via);
     crate::arch::sched::sleep_ms(500);
     crate::pal::push_event(crate::pal::Event::Key(b'~'));
     let t0 = crate::arch::ms();
@@ -314,10 +355,5 @@ fn key_wake_leg(tests_ks: bool) {
     if !woke { let _ = wake("tests"); }
     let t1 = crate::arch::ms();
     while REPAINT_OWED.load(Ordering::Acquire) && crate::arch::ms().wrapping_sub(t1) < 3000 { crate::arch::sched::sleep_ms(50); }
-    let key_ks = wake_key_swallowed();
-    let ok = woke && !tests_ks && key_ks;
-    serial_println!(
-        ":: SLEEPKEY: tests_wake_key_swallowed={} input_wake_key_swallowed={} woke={} -> {} ::{}",
-        tests_ks as u8, key_ks as u8, woke as u8, if ok { "PASS" } else { "FAIL" }, if woke { "" } else { " reason=no-drain" }
-    );
+    woke
 }

@@ -7421,7 +7421,7 @@ impl XhciController {
         // transport cannot carry is a caller error, never a silently shortened command.
         if cdb.is_empty() || cdb.len() > 16 {
             return Err(BotError::BadRequest);
-        }
+        } #[cfg(all(target_arch = "x86_64", feature = "lidsleep", feature = "wc"))] { if !self.io_resume(slot_id) { return Err(BotError::NoDevice); } } // SLEEPRESUME (B863): a transfer to a slot on a port the sleep suspended RESUMES that port first (`io_resume`, the file tail), else refused before anything is queued. LINE-NEUTRAL fold, code first
         let out = self.bot_transfer_body(slot_id, cdb, data_phys, data_len, dir);
         if let Err(cause) = out {
             // `NoDevice` is raised before anything is built or queued (no rings, no endpoints, or a
@@ -18029,8 +18029,8 @@ pub mod suspend {
     //! phase machine never waits with the loan held: USB2 resume signalling holds 20 ms (TDRSMDN) and recovery 10 ms
     //! (TRSMRCY) as DEADLINES the next passes check (the pump runs every 1 ms tick).
     //!
-    //! Kept up and named: the FTDI console's port (`why=wire`) and every storage record's port (`why=storage`: the BOT
-    //! pump has no auto-resume).
+    //! Kept up and named: the FTDI console's port (`why=wire`) and the ROOT medium's storage port (`why=root`; `root-unknown`
+    //! keeps every storage port when its try_lock loses). Every other storage port suspends and resumes on I/O (SLEEPRESUME B863).
     //!
     //! STOPENDPOINT (B775): before U3 every Running DCI of every slot on the port gets Stop Endpoint with SP=1
     //! ([`XhciController::endpoints_stop`], xHCI 1.2 §4.6.9, §4.15.1); after the resume's recovery (USB 2.0 §7.1.7.7
@@ -18045,10 +18045,10 @@ pub mod suspend {
     use super::{XhciController, PORT_CHANGE_BITS};
     use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 
-    const UP: u8 = 0;
-    const SUSPENDED: u8 = 1;
-    const RESUMING: u8 = 2;
-    const RECOVERING: u8 = 3;
+    pub(super) const UP: u8 = 0;
+    pub(super) const SUSPENDED: u8 = 1;
+    pub(super) const RESUMING: u8 = 2;
+    pub(super) const RECOVERING: u8 = 3;
     /// USB 2.0 §7.1.7.7 TDRSMDN: resume signalling held by the host.
     const RESUME_MS: u64 = 20;
     /// USB 2.0 §7.1.7.7 TRSMRCY: recovery before the first transaction.
@@ -18064,13 +18064,13 @@ pub mod suspend {
     /// The sleep state wants the bus suspended (written by `power::sleep` only).
     static WANT: AtomicBool = AtomicBool::new(false);
     /// The phase (written by the loan holder only).
-    static PHASE: AtomicU8 = AtomicU8::new(UP);
-    static DUE_MS: AtomicU64 = AtomicU64::new(0);
+    pub(super) static PHASE: AtomicU8 = AtomicU8::new(UP);
+    pub(super) static DUE_MS: AtomicU64 = AtomicU64::new(0);
     static T0_MS: AtomicU64 = AtomicU64::new(0);
     /// Root ports this driver put in U3 (bit `port - 1`; ports 1..=64).
-    static SUSP_MASK: AtomicU64 = AtomicU64::new(0);
+    pub(super) static SUSP_MASK: AtomicU64 = AtomicU64::new(0);
     /// USB2 ports among them (they take resume signalling; a SuperSpeed port takes U0 at once).
-    static USB2_MASK: AtomicU64 = AtomicU64::new(0);
+    pub(super) static USB2_MASK: AtomicU64 = AtomicU64::new(0);
     /// The last cycle's census: ports with a device, ports written to U3, ports whose PLS read 3, ports back in U0.
     static PORTS: AtomicU32 = AtomicU32::new(0);
     static SUSPENDED_N: AtomicU32 = AtomicU32::new(0);
@@ -18081,15 +18081,15 @@ pub mod suspend {
     /// Per slot: bit 0 = the slot's root port is suspended by this driver, bit `dci` = this driver stopped that DCI.
     /// Set BEFORE each Stop is pushed (`run_command_sync` pumps the event ring, so the cc=26 Transfer Event is
     /// dispatched ahead of the Command Completion); cleared by `endpoints_restart` before it rings. Loan holder only.
-    static HELD: [AtomicU32; 256] = [const { AtomicU32::new(0) }; 256];
+    pub(super) static HELD: [AtomicU32; 256] = [const { AtomicU32::new(0) }; 256];
     /// XHCIHOLDDCI (B795): per slot, bit `dci` = a doorbell for that DCI was held (`HELD` is full: bit 0 + bits 1..31).
     /// Written by `doorbell_held` (`ring_doorbell` is `&mut self`: the loan holder), taken by `endpoints_restart`.
     static RANG: [AtomicU32; 256] = [const { AtomicU32::new(0) }; 256];
     /// Doorbells the hold suppressed this cycle (zeroed by `ports_suspend`).
     static HELD_RINGS: AtomicU32 = AtomicU32::new(0);
     /// DCIs read Stopped(3) after their Stop; of those, DCIs read Running(1) after the restart doorbell.
-    static EP_STOPPED_N: AtomicU32 = AtomicU32::new(0);
-    static EP_RUNNING_N: AtomicU32 = AtomicU32::new(0);
+    pub(super) static EP_STOPPED_N: AtomicU32 = AtomicU32::new(0);
+    pub(super) static EP_RUNNING_N: AtomicU32 = AtomicU32::new(0);
     /// Stop Endpoint Command TRB (xHCI 1.2 §6.4.3.8): type 15, SP bit 23 (the endpoint is stopped for a suspend).
     const TRB_STOP_EP: u32 = 15 << 10;
     const STOP_SP: u32 = 1 << 23;
@@ -18099,7 +18099,7 @@ pub mod suspend {
     /// SLEEP2 (B812): root ports whose resume missed its bound (bit `port - 1`). Their slots stay `HELD` (so the
     /// HELDSLOTEP0 refusal keeps every synchronous EP0 off the dead link) and [`refusal`] refuses the next sleep's USB
     /// suspend. Never cleared this boot (owed: the port's disconnect). Written by the loan holder, read anywhere.
-    static STUCK: AtomicU64 = AtomicU64::new(0);
+    pub(super) static STUCK: AtomicU64 = AtomicU64::new(0);
     /// SLEEP2 (B812): ports of this resume not yet judged, and the USB2 ports whose U0 has been written. Loan holder only.
     static PENDING: AtomicU64 = AtomicU64::new(0);
     static U0W: AtomicU64 = AtomicU64::new(0);
@@ -18162,7 +18162,7 @@ pub mod suspend {
         matches!(cc, 26 | 27) && dci < 32 && HELD[slot as usize].load(Ordering::Relaxed) & (1u32 << dci) != 0
     }
 
-    fn bit(port: u8) -> u64 { if (1..=64).contains(&port) { 1u64 << (port - 1) } else { 0 } }
+    pub(super) fn bit(port: u8) -> u64 { if (1..=64).contains(&port) { 1u64 << (port - 1) } else { 0 } }
 
     impl XhciController {
         /// The pump's pass (folded into `service_hid_setproto`): apply [`request`], and run the resume deadlines.
@@ -18181,14 +18181,14 @@ pub mod suspend {
             }
         }
 
-        /// Every root port with an enabled device in U0..U2 goes to U3 (LWS), except the wire and storage.
+        /// Every root port with an enabled device in U0..U2 goes to U3 (LWS), except the wire and the root medium's storage port.
         /// `false` = deferred (an enumeration is in flight; its EP0 and the descriptor buffers are busy).
         fn ports_suspend(&mut self) -> bool {
             if self.enum_active { return false; }
             let mut keep_wire = 0u64;
-            let mut keep_storage = 0u64;
+            let mut keep_storage = 0u64; let root_slot = super::root_storage_slot(); // SLEEPRESUME (B863): only the ROOT medium's port stays up (`why=root`); a lost try_lock keeps every storage port (`why=root-unknown`)
             if self.ftdi_slot != 0 { keep_wire |= bit(self.slots[self.ftdi_slot as usize].port_id); }
-            for r in self.storage.iter() { if r.slot != 0 { keep_storage |= bit(self.slots[r.slot as usize].port_id); } }
+            for r in self.storage.iter() { if r.slot != 0 && root_slot.map_or(true, |rs| rs == r.slot) { keep_storage |= bit(self.slots[r.slot as usize].port_id); } } // SLEEPRESUME (B863): every other storage port suspends and resumes on I/O (`io_resume`, the file tail)
             let (mut ports, mut kept, mut done, mut pls3) = (0u32, 0u32, 0u32, 0u32);
             let (mut mask, mut usb2) = (0u64, 0u64);
             EP_STOPPED_N.store(0, Ordering::Relaxed);
@@ -18198,7 +18198,7 @@ pub mod suspend {
                 let portsc = self.read_portsc(port);
                 if portsc & 0b11 != 0b11 { continue; } // CCS and PED: an enabled device
                 ports += 1;
-                let why = if keep_wire & bit(port) != 0 { Some("wire") } else if keep_storage & bit(port) != 0 { Some("storage") } else if self.port_major(port) == 0 { Some("resume-unwritten") } else { None }; // SLEEP2 (B812): a port of no known kind has no written resume
+                let why = if keep_wire & bit(port) != 0 { Some("wire") } else if keep_storage & bit(port) != 0 { Some(if root_slot.is_ok() { "root" } else { "root-unknown" }) } else if self.port_major(port) == 0 { Some("resume-unwritten") } else { None }; // SLEEP2 (B812): a port of no known kind has no written resume
                 if let Some(why) = why {
                     kept += 1;
                     serial_println!("[usb] port={} keep why={}", port, why);
@@ -18235,7 +18235,7 @@ pub mod suspend {
         /// Resume and driven by the controller; 0 = host-initiated). USB2 ports get PLS=Resume (TDRSMDN runs from now);
         /// SuperSpeed ports get U0 now (xHCI 1.2 §4.15.2.2). Each port's PLS before the write is kept for its line, and
         /// every port is left PENDING for [`XhciController::ports_resume`] (SLEEP2 B812).
-        fn ports_resume_begin(&mut self, remote: u8) {
+        pub(super) fn ports_resume_begin(&mut self, remote: u8) {
             let mask = SUSP_MASK.load(Ordering::Relaxed);
             let usb2 = USB2_MASK.load(Ordering::Relaxed);
             let now = crate::arch::ms();
@@ -18258,7 +18258,7 @@ pub mod suspend {
         /// write) = `stuck`: recorded in `STUCK`, so `endpoints_restart` leaves its slots HELD (the HELDSLOTEP0
         /// refusal keeps EP0 off the dead link) and the next sleep keeps USB up. Every port judged: the 10 ms
         /// recovery (TRSMRCY) begins.
-        fn ports_resume(&mut self, now: u64) {
+        pub(super) fn ports_resume(&mut self, now: u64) {
             let usb2 = USB2_MASK.load(Ordering::Relaxed);
             let t0 = T0_MS.load(Ordering::Relaxed);
             let elapsed = now.saturating_sub(t0);
@@ -18310,7 +18310,7 @@ pub mod suspend {
                     let state = self.ep_state_of(slot as u8, dci);
                     if ok && state == 3 {
                         stopped += 1;
-                        serial_println!("[usb] slot={} dci={} stop -> state={}", slot, dci, state);
+                        serial_println!("[usb] slot={} dci={} stop -> state={}", slot, dci, state); self.stop_td_check(slot as u8, dci);
                     } else {
                         HELD[slot].fetch_and(!(1u32 << dci), Ordering::Relaxed);
                         serial_println!("[usb] slot={} dci={} stop -> state={} cc={} why={}", slot, dci, state, cc, why);
@@ -18323,9 +18323,9 @@ pub mod suspend {
         /// After the resume's recovery: every held slot's word is taken (so `doorbell_held` opens) and each stopped
         /// DCI's doorbell is rung (Stopped -> Running, xHCI 1.2 §4.8.3), then its state read, bounded 5 ms. Then each DCI
         /// whose doorbell the hold remembered and the stop did not stop is rung (XHCIHOLDDCI B795, xHCI 1.2 §4.15.1).
-        fn endpoints_restart(&mut self) {
+        pub(super) fn endpoints_restart(&mut self) {
             let mut running = 0u32;
-            let stuck = STUCK.load(Ordering::Relaxed);
+            let stuck = STUCK.load(Ordering::Relaxed) | super::IO_SKIP.swap(0, Ordering::Relaxed); // SLEEPRESUME (B863): `io_resume`'s one-shot mask, every port but the one it resumed (0 for the wake's restart)
             for slot in 1..self.slots.len().min(HELD.len()) {
                 if stuck & bit(self.slots[slot].port_id) != 0 { continue; } // SLEEP2 (B812): a stuck port's slots stay HELD
                 let held = HELD[slot].swap(0, Ordering::Relaxed);
@@ -18795,4 +18795,179 @@ impl XhciController {
         );
         (st, stop_cc, deq_cc)
     }
+}
+
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+// SLEEPRESUME (rmbp-ledger B863, docs/dev/blueprint/power.md BP-power-7) — a storage port resumes on I/O; a hub's
+// status-change TD the controller consumed at the Stop is re-queued. FILE-TAIL append under the suspend module's cfg: the
+// three blocks between the module and here are UNCONDITIONAL, so a line added inside the module would move their
+// `panic::Location`s on every image — every body of this arc is here and the module's edits are in place.
+// M1: `bot_transfer` (the one storage entry) asks [`XhciController::io_resume`]: a held slot's root port is resumed by the
+// ONE resume, `ports_resume_begin` + `ports_resume` UNMODIFIED, driven for that port alone (the set both iterate,
+// `SUSP_MASK`, is the port's bit for the drive and the rest after it), then that port's slots alone are restarted by
+// `endpoints_restart` (its one-shot [`IO_SKIP`] mask). M3: [`XhciController::stop_td_check`] from `endpoints_stop`'s
+// stop line. Loan holder only (the BOT caller holds the loan for the whole synchronous transfer).
+
+/// `endpoints_restart`'s one-shot skip mask (bit `port - 1`): every root port but the one `io_resume` resumed. Taken (swapped
+/// to 0) by the restart, so the wake's own restart skips only `STUCK`.
+#[cfg(all(target_arch = "x86_64", feature = "lidsleep", feature = "wc"))]
+static IO_SKIP: AtomicU64 = AtomicU64::new(0);
+/// I/O resumes judged ok / refused, this boot (`tests usbsuspend` `io_resume=`).
+#[cfg(all(target_arch = "x86_64", feature = "lidsleep", feature = "wc"))]
+static IO_RESUME_N: AtomicU32 = AtomicU32::new(0);
+#[cfg(all(target_arch = "x86_64", feature = "lidsleep", feature = "wc"))]
+static IO_RESUME_FAIL_N: AtomicU32 = AtomicU32::new(0);
+/// Hub status-change TDs found kept at the Stop (the context dequeue still on them, xHCI 1.2 §4.6.9) / found consumed and
+/// re-queued, this boot (`tests usbsuspend` `hub_td=`).
+#[cfg(all(target_arch = "x86_64", feature = "lidsleep", feature = "wc"))]
+static HUB_TD_KEPT_N: AtomicU32 = AtomicU32::new(0);
+#[cfg(all(target_arch = "x86_64", feature = "lidsleep", feature = "wc"))]
+static HUB_TD_REQUEUED_N: AtomicU32 = AtomicU32::new(0);
+/// The bound on one port's drive through the resume: ports_resume judges a port by 20 ms TDRSMDN + its 100 ms bound.
+#[cfg(all(target_arch = "x86_64", feature = "lidsleep", feature = "wc"))]
+const IO_RESUME_BOUND_MS: u64 = 150;
+/// The bound on waiting out a wake's resume already in flight (its 20 ms + 100 ms + 10 ms recovery, with margin).
+#[cfg(all(target_arch = "x86_64", feature = "lidsleep", feature = "wc"))]
+const IO_PHASE_BOUND_MS: u64 = 200;
+
+/// SLEEPRESUME (B863): I/O resumes judged ok this boot.
+#[cfg(all(target_arch = "x86_64", feature = "lidsleep", feature = "wc"))]
+pub fn io_resumes() -> u32 { IO_RESUME_N.load(Ordering::Relaxed) }
+
+/// SLEEPRESUME (B863): (hub TDs kept, hub TDs re-queued) at the Stop, this boot.
+#[cfg(all(target_arch = "x86_64", feature = "lidsleep", feature = "wc"))]
+pub fn hub_td_counts() -> (u32, u32) { (HUB_TD_KEPT_N.load(Ordering::Relaxed), HUB_TD_REQUEUED_N.load(Ordering::Relaxed)) }
+
+#[cfg(all(target_arch = "x86_64", feature = "lidsleep", feature = "wc"))]
+impl XhciController {
+    /// M1, from `bot_transfer` before anything is built: `true` = the slot is not held (one atomic load) or its root port is
+    /// back in U0 with its endpoints running; `false` = refused (the caller returns `NoDevice`, nothing queued). A wake's
+    /// resume already in flight is the pump's own pass ([`XhciController::port_suspend_service`]), driven until it releases
+    /// the slot; a port still SUSPENDED is driven through the one resume alone, then restarted alone. Bounded throughout:
+    /// a port that misses its bound is `STUCK` exactly as a wake's would be (PORTRESET owns it at UP).
+    fn io_resume(&mut self, slot: u8) -> bool {
+        use suspend as sp;
+        if sp::HELD[slot as usize].load(Ordering::Relaxed) == 0 { return true; }
+        let port = self.slots.get(slot as usize).map(|s| s.port_id).unwrap_or(0);
+        let b = sp::bit(port);
+        let t0 = crate::arch::ms();
+        serial_println!("[usb] port={} resume why=io slot={}", port, slot);
+        while matches!(sp::PHASE.load(Ordering::Acquire), sp::RESUMING | sp::RECOVERING)
+            && sp::HELD[slot as usize].load(Ordering::Relaxed) != 0
+            && crate::arch::ms().wrapping_sub(t0) < IO_PHASE_BOUND_MS
+        {
+            self.port_suspend_service();
+            core::hint::spin_loop();
+        }
+        if sp::HELD[slot as usize].load(Ordering::Relaxed) == 0 {
+            IO_RESUME_N.fetch_add(1, Ordering::Relaxed);
+            serial_println!("[usb] port={} resume why=io slot={} -> ok via=wake ms={}", port, slot, crate::arch::ms().wrapping_sub(t0));
+            return true;
+        }
+        let mask = sp::SUSP_MASK.load(Ordering::Relaxed);
+        if sp::STUCK.load(Ordering::Acquire) & b != 0 { return self.io_resume_refused(port, slot, "stuck"); }
+        if sp::PHASE.load(Ordering::Acquire) != sp::SUSPENDED || mask & b == 0 { return self.io_resume_refused(port, slot, "phase"); }
+        sp::SUSP_MASK.store(b, Ordering::Relaxed);
+        self.ports_resume_begin(0);
+        while sp::PHASE.load(Ordering::Acquire) == sp::RESUMING && crate::arch::ms().wrapping_sub(t0) < IO_RESUME_BOUND_MS {
+            self.ports_resume(crate::arch::ms());
+            core::hint::spin_loop();
+        }
+        let judged = sp::PHASE.load(Ordering::Acquire) == sp::RECOVERING;
+        if !judged { sp::STUCK.fetch_or(b, Ordering::Release); }
+        let ok = judged && sp::STUCK.load(Ordering::Acquire) & b == 0;
+        if ok {
+            let due = sp::DUE_MS.load(Ordering::Relaxed);
+            while crate::arch::ms() < due { core::hint::spin_loop(); }
+        }
+        sp::SUSP_MASK.store(mask & !b, Ordering::Relaxed);
+        sp::USB2_MASK.fetch_and(!b, Ordering::Relaxed);
+        sp::PHASE.store(sp::SUSPENDED, Ordering::Release);
+        if !ok { return self.io_resume_refused(port, slot, if judged { "stuck" } else { "bound" }); }
+        IO_SKIP.store(!b, Ordering::Relaxed);
+        let keep = sp::EP_RUNNING_N.load(Ordering::Relaxed);
+        self.endpoints_restart();
+        let ran = sp::EP_RUNNING_N.swap(keep, Ordering::Relaxed);
+        let _ = sp::EP_STOPPED_N.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| Some(v.saturating_sub(ran)));
+        IO_RESUME_N.fetch_add(1, Ordering::Relaxed);
+        serial_println!("[usb] port={} resume why=io slot={} -> ok ms={} ep_running={}", port, slot, crate::arch::ms().wrapping_sub(t0), ran);
+        true
+    }
+
+    /// `io_resume`'s refusal: counted and named; the slot stays held (no TRB, no doorbell).
+    fn io_resume_refused(&self, port: u8, slot: u8, why: &str) -> bool {
+        IO_RESUME_FAIL_N.fetch_add(1, Ordering::Relaxed);
+        serial_println!("[usb] port={} resume why=io slot={} -> refused why={}", port, slot, why);
+        false
+    }
+
+    /// M3, from `endpoints_stop` once a DCI read Stopped(3): on a hub's status-change DCI with a read armed, the endpoint
+    /// context's TR Dequeue Pointer is compared with the armed TD (`hub_int_expect_phys`). Equal = the TD is KEPT (xHCI 1.2
+    /// §4.6.9: the xHC re-executes it on the restart doorbell). Past it = the controller consumed it at the Stop (QEMU 8.2
+    /// advances the context dequeue for a NAKing TD), so the hub's single status-change read would be lost: it is
+    /// re-queued through `queue_hub_change_read` (the one arming fn; its doorbell is held and remembered, and
+    /// `endpoints_restart` rings the DCI). Keyed on the pointer, never on a QEMU knob.
+    fn stop_td_check(&mut self, slot: u8, dci: u8) {
+        let Some(s) = self.slots.get(slot as usize) else { return };
+        if !s.is_hub || s.hub_int_ep == 0 || dci != (s.hub_int_ep & 0x0F) * 2 + 1 || s.hub_int_expect_phys == 0 { return; }
+        let expect = s.hub_int_expect_phys & !0xF;
+        let deq = self.ep_ctx_deq(slot, dci) & !0xF;
+        if deq == expect {
+            HUB_TD_KEPT_N.fetch_add(1, Ordering::Relaxed);
+            serial_println!("[usb] slot={} stop ep={} td=kept", slot, dci);
+            return;
+        }
+        HUB_TD_REQUEUED_N.fetch_add(1, Ordering::Relaxed);
+        self.slots[slot as usize].hub_int_expect_phys = 0;
+        self.queue_hub_change_read(slot);
+        serial_println!("[usb] slot={} stop ep={} td=consumed deq={:#x} expect={:#x} -> requeued", slot, dci, deq, expect);
+    }
+
+    /// `tests usbsuspend`'s io leg, while SUSPENDED: a TEST UNIT READY (through `scsi_test_unit_ready` -> `bot_transfer`) to
+    /// the first storage record whose slot is held. `none` (no storage record), `unheld` (no storage slot is held), `ok`
+    /// (the port was resumed by the I/O and the transfer returned), `fail` (resumed, the transfer failed), `refused`.
+    pub fn io_resume_probe(&mut self) -> &'static str {
+        if !self.storage.iter().any(|r| r.slot != 0) { return "none"; }
+        let Some(slot) = self.storage.iter().map(|r| r.slot).find(|&s| s != 0 && suspend::HELD[s as usize].load(Ordering::Relaxed) != 0) else { return "unheld" };
+        let n0 = IO_RESUME_N.load(Ordering::Relaxed);
+        let r = self.scsi_test_unit_ready(slot);
+        let resumed = IO_RESUME_N.load(Ordering::Relaxed) != n0 && suspend::HELD[slot as usize].load(Ordering::Relaxed) == 0;
+        match (resumed, r.is_ok()) {
+            (true, true) => "ok",
+            (true, false) => "fail",
+            (false, _) => "refused",
+        }
+    }
+
+    /// `tests usbsuspend`'s hub leg, after UP: the first hub's status-change endpoint has a TD for the controller (its context
+    /// dequeue differs from the ring's enqueue). `None` = no hub with a status-change ring on this controller.
+    pub fn hub_td_armed(&self) -> Option<bool> {
+        let (i, s) = self.slots.iter().enumerate().skip(1).find(|(_, s)| s.active && s.is_hub && s.hub_int_ep != 0 && s.hub_int_ring.is_some())?;
+        let dci = (s.hub_int_ep & 0x0F) * 2 + 1;
+        let enq = s.hub_int_ring.as_ref()?.enqueue_ptr_dcs() & !0xF;
+        Some(self.ep_ctx_deq(i as u8, dci) & !0xF != enq)
+    }
+}
+
+/// SLEEPRESUME (B863): the xHCI slot of the ROOT medium, read WITHOUT waiting (`ports_suspend` holds the loan): the bootdisk
+/// survey's cached root source (`bootdisk::root_source_now`) to the USB registry entry (`Usb` = index 0, `UsbN(n)`) or the
+/// global block device (`Default`) to its `slot_id`. `Ok(0)` = the root is not a USB disk or none is bound; `Err(())` = a
+/// try_lock lost (the caller keeps every storage port: contention is a keep, never a drop).
+#[cfg(all(target_arch = "x86_64", feature = "lidsleep", feature = "wc"))]
+fn root_storage_slot() -> Result<u8, ()> {
+    use crate::fs::fat::BlockSource;
+    let ix = match crate::fs::bootdisk::root_source_now()? {
+        None => return Ok(0),
+        Some(BlockSource::Usb) => 0usize,
+        Some(BlockSource::UsbN(n)) => n as usize,
+        Some(BlockSource::Default) => {
+            let g = crate::drivers::block::BLOCK_DEVICE.try_lock().ok_or(())?;
+            return Ok(g.map(|i| i.slot_id).unwrap_or(0));
+        }
+        #[allow(unreachable_patterns)]
+        Some(_) => return Ok(0),
+    };
+    let g = crate::drivers::block::USB_DISKS.try_lock().ok_or(())?;
+    Ok(g.get(ix).copied().flatten().map(|d| d.info.slot_id).unwrap_or(0))
 }

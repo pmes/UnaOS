@@ -5313,14 +5313,14 @@ fn usbsuspend_selftest() {
     }
     #[cfg(feature = "ehcihid")] use crate::drivers::ehci::suspend as es; #[cfg(feature = "ehcihid")] let (e_down, e_up): (fn() -> bool, fn() -> bool) = (es::suspended, es::up);
     #[cfg(not(feature = "ehcihid"))] let (e_down, e_up): (fn() -> bool, fn() -> bool) = (|| true, || true);
-    let to0 = xs::ep0_timeouts(); let rw0 = xhci::ep0_rewinds(); xs::request(true); #[cfg(feature = "ehcihid")] es::request(true);
+    let to0 = xs::ep0_timeouts(); let rw0 = xhci::ep0_rewinds(); let h0 = xhci::hub_td_counts(); xs::request(true); #[cfg(feature = "ehcihid")] es::request(true);
     let in_u3 = wait(2_000, &|| xs::suspended() && e_down());
     let c = xs::census();
-    let held = usbsuspend_held_queue(in_u3);
+    let held = usbsuspend_held_queue(in_u3); let io = usbsuspend_io_leg(in_u3);
     xs::request(false); #[cfg(feature = "ehcihid")] es::request(false);
     let up = wait(2_000, &|| xs::up() && e_up());
     let held_word = usbsuspend_held_collect(held);
-    let r = xs::census(); let (ep0_word, ep0_refused, ep0_replayed) = usbsuspend_held_ep0_leg(up && held_word != "none", &wait); let rs = usbsuspend_reset_leg(up && held_word != "none", &wait); // HELDSLOTEP0 (B804): the second, xHCI-only cycle (file-tail fn), after this cycle's census; LINE-NEUTRAL fold, code first
+    let r = xs::census(); let (ep0_word, ep0_refused, ep0_replayed) = usbsuspend_held_ep0_leg(up && held_word != "none", &wait); let rs = usbsuspend_reset_leg(up && held_word != "none", &wait); let hub = usbsuspend_hub_leg(h0, up); let ks = usbsuspend_key_leg(&wait, &|| xs::up() && e_up()); // SLEEPRESUME (B863): the hub TD after UP, then the login-entry key cycle LAST (it waits for all-up); HELDSLOTEP0 (B804): the second, xHCI-only cycle (file-tail fn), after this cycle's census; LINE-NEUTRAL fold, code first
     let mut probe = None;
     let t0 = crate::arch::ms();
     while probe.is_none() && crate::arch::ms().wrapping_sub(t0) < 1_000 {
@@ -5335,7 +5335,7 @@ fn usbsuspend_selftest() {
     let (e, e_kbd) = usbsuspend_ehci_leg(kbd == "none");
     let verdict = if xs::ep0_timeouts() != to0 { "FAIL reason=xhci-dead" } else if !in_u3 || !up {
         "FAIL reason=phase-timeout"
-    } else if c.pls3 != c.suspended || r.resumed < c.suspended || e.resumed < e.suspended || r.ep_running < r.ep_stopped { "FAIL"
+    } else if c.pls3 != c.suspended || r.resumed < c.suspended || e.resumed < e.suspended || r.ep_running < r.ep_stopped || !matches!(io, "ok" | "none") || ks != "ok" || hub == "lost" { "FAIL"
     } else if kbd != "none" { if kbd != "ok" || c.suspended == 0 || held_word != "ok" || ep0_word != "ok" || rs.0 != "ok" || rs.1 != "ok" || rs.2 != "ok" { "FAIL" } else { "PASS" }
     } else if e_kbd == "none" {
         "SKIP reason=no-kbd"
@@ -5346,8 +5346,8 @@ fn usbsuspend_selftest() {
     };
     let (kbd_on, kbd_word) = if kbd != "none" { ("xhci", kbd) } else { ("ehci", e_kbd) };
     serial_println!(
-        ":: USBSUSPEND: ports={} suspended={} resumed={} kbd={} ep_stopped={} ep_running={} -> {} :: pls3={} kept={} kbd_ep={} remote_wakes={} ehci={}/{} ehci_kept={} ehci_resumed={} wake_armed={} kbd_on={} held_report={} held_rings={} held_ep0_refused={} replayed={} ep0_after_wake={} ep0_timeouts={} stuck={} held_halt_replayed={} phy_skipped={} rewinds={} held_recovery={} port_reset={} reenum={} ep0_after_reset={} reset={}",
-        c.ports, c.suspended, r.resumed, kbd_word, r.ep_stopped, r.ep_running, verdict, c.pls3, c.kept, ep, r.remote_wakes, e.suspended, e.ports, e.kept, e.resumed, e.wake_armed, kbd_on, held_word, r.held_rings, ep0_refused, ep0_replayed, kbd, xs::ep0_timeouts().wrapping_sub(to0), r.stuck, xs::census().held_halt_replayed, xs::census().phy_skipped, xhci::ep0_rewinds().wrapping_sub(rw0), xs::census().held_recovery, rs.0, rs.1, rs.2, rs.3 // HELDMAP (B838): the second (held-EP0) cycle's census; rewinds= is 0 because the rewind is unreachable while the ring push is infallible, not because it never happened
+        ":: USBSUSPEND: ports={} suspended={} resumed={} kbd={} ep_stopped={} ep_running={} -> {} :: pls3={} kept={} kbd_ep={} remote_wakes={} ehci={}/{} ehci_kept={} ehci_resumed={} wake_armed={} kbd_on={} held_report={} held_rings={} held_ep0_refused={} replayed={} ep0_after_wake={} ep0_timeouts={} stuck={} held_halt_replayed={} phy_skipped={} rewinds={} held_recovery={} port_reset={} reenum={} ep0_after_reset={} reset={} io_resume={} key_swallow={} hub_td={}",
+        c.ports, c.suspended, r.resumed, kbd_word, r.ep_stopped, r.ep_running, verdict, c.pls3, c.kept, ep, r.remote_wakes, e.suspended, e.ports, e.kept, e.resumed, e.wake_armed, kbd_on, held_word, r.held_rings, ep0_refused, ep0_replayed, kbd, xs::ep0_timeouts().wrapping_sub(to0), r.stuck, xs::census().held_halt_replayed, xs::census().phy_skipped, xhci::ep0_rewinds().wrapping_sub(rw0), xs::census().held_recovery, rs.0, rs.1, rs.2, rs.3, io, ks, hub // HELDMAP (B838): the second (held-EP0) cycle's census; rewinds= is 0 because the rewind is unreachable while the ring push is infallible, not because it never happened
     );
 }
 
@@ -7664,4 +7664,66 @@ fn settingsmap_tabs_leg() {
         ":: SETTINGSMAP: tabs leg {} -> {} :: tab_scroll={} probes_rule={} ::",
         detail, if ok { "PASS" } else { "FAIL" }, scroll, rule
     );
+}
+
+// ══════════════ SLEEPRESUME (rmbp-ledger B863, BP-power-7/13) — `tests usbsuspend`'s io, hub and key legs — TAIL-APPENDED ══════════════
+
+/// SLEEPRESUME (B863) M1: while SUSPENDED, a TEST UNIT READY to a held storage slot (`io_resume_probe`) must resume its port
+/// and complete. `ok` | `none` (no storage record) | `unheld` | `refused` | `fail` | `busy` (no claim in 1 s) | `phase`; an
+/// `unheld` slot whose port another storage caller already resumed by I/O (`io_resumes` grew) reads `ok`.
+#[cfg(all(target_arch = "x86_64", feature = "lidsleep", feature = "wc"))]
+fn usbsuspend_io_leg(in_u3: bool) -> &'static str {
+    use crate::drivers::xhci;
+    if !in_u3 { return "phase"; }
+    let n0 = xhci::io_resumes();
+    let t0 = crate::arch::ms();
+    loop {
+        match xhci::claim() {
+            Ok(mut x) => {
+                let w = x.io_resume_probe();
+                return if w == "unheld" && xhci::io_resumes() != n0 { "ok" } else { w };
+            }
+            Err(_) if crate::arch::ms().wrapping_sub(t0) < 1_000 => crate::arch::sched::sleep_ms(5),
+            Err(_) => return "busy",
+        }
+    }
+}
+
+/// SLEEPRESUME (B863) M3: what the cycle's Stop found on a hub's status-change TD (`requeued` | `kept` | `none`: no hub was
+/// stopped), and after UP the hub's endpoint must still hold a TD for the controller (`lost` otherwise, a FAIL).
+#[cfg(all(target_arch = "x86_64", feature = "lidsleep", feature = "wc"))]
+fn usbsuspend_hub_leg(h0: (u32, u32), up: bool) -> &'static str {
+    use crate::drivers::xhci;
+    let (kept, requeued) = xhci::hub_td_counts();
+    let word = if requeued != h0.1 { "requeued" } else if kept != h0.0 { "kept" } else { return "none" };
+    if !up { return word; }
+    let t0 = crate::arch::ms();
+    loop {
+        match xhci::claim() {
+            Ok(x) => return if x.hub_td_armed() == Some(false) { "lost" } else { word },
+            Err(_) if crate::arch::ms().wrapping_sub(t0) < 1_000 => crate::arch::sched::sleep_ms(5),
+            Err(_) => return word,
+        }
+    }
+}
+
+/// SLEEPRESUME (B863) M2: a real login-entry sleep (`lidsleep::key_cycle("loginwindow")`, the entry the login window's
+/// Sleep reaches through `power::sleep_request`) woken by a key: the key is swallowed and the entry is named `login`. Waits
+/// (bounded 2 s) for every driver back UP and restores the backlight level it found if the cycle left another. `ok` | `fail`
+/// | `busy` (already asleep).
+#[cfg(all(target_arch = "x86_64", feature = "lidsleep", feature = "wc"))]
+fn usbsuspend_key_leg(wait: &dyn Fn(u64, &dyn Fn() -> bool) -> bool, all_up: &dyn Fn() -> bool) -> &'static str {
+    use crate::video::{backlight, lidsleep};
+    if lidsleep::asleep() { return "busy"; }
+    let found = backlight::readback_now();
+    let woke = lidsleep::key_cycle("loginwindow");
+    let swallowed = lidsleep::wake_key_swallowed();
+    let src = lidsleep::entry_src();
+    let _ = wait(2_000, all_up);
+    let restored = match found {
+        Some(p) if backlight::readback_now() != Some(p) => backlight::set_raw_via(p, "usbsuspend-key").readback == Some(p),
+        _ => true,
+    };
+    serial_println!("[usbsuspend] key leg woke={} swallowed={} src={} backlight_restored={}", woke as u8, swallowed as u8, src, restored as u8);
+    if woke && swallowed && src == "login" && restored { "ok" } else { "fail" }
 }

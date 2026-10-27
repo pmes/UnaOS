@@ -3059,3 +3059,15 @@ fn keyboot_locked() -> bool {
         false
     }
 }
+
+// SLEEPRESUME (rmbp-ledger B863, docs/dev/blueprint/power.md BP-power-7) — TAIL-APPENDED under the xHCI suspend cfg, so no
+// `panic::Location` above moves and a knob-off build carries none of it. The xHCI sleep keeps the ROOT medium's port up and
+// asks which it is from the loan holder's pass, where neither a walk (disk I/O) nor a blocking lock may run.
+
+/// The cached survey's root source, WITHOUT walking and without waiting: `Err(())` = [`CACHE`] is held right now (the
+/// caller treats contention as unknown), `Ok(None)` = no root is cached (no root bound), `Ok(Some(source))`.
+#[cfg(all(target_arch = "x86_64", feature = "lidsleep", feature = "wc"))]
+pub fn root_source_now() -> Result<Option<BlockSource>, ()> {
+    let g = CACHE.try_lock().ok_or(())?;
+    Ok(g.as_ref().and_then(|s| s.root.as_ref().map(|f| f.source)))
+}
