@@ -85,7 +85,7 @@ impl JobOut {
 /// The engine's lock: a second job while one runs is `busy`. The ring + sentinel pages (8 KiB, GGTT-reachable,
 /// gen7.md §2.6) are held in gen7.rs's `BLIT_RING_HELD` slot through `held_take` (GEN7HELDONE, B1031), taken under
 /// this lock (PAGES -> slot, never the reverse).
-static PAGES: crate::sync::Mutex<()> = crate::sync::Mutex::new(());
+pub(super) static PAGES: crate::sync::Mutex<()> = crate::sync::Mutex::new(());
 
 fn span_pages(p: &Plane) -> (usize, usize) {
     let first = p.va & !0xFFF;
