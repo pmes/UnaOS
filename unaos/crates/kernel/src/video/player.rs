@@ -1368,20 +1368,7 @@ mod nle_fx {
             (alloc::format!("{}.MP4", REELS[3]), standin_reel()), // SWAPBACKVPLAY (rmbp-ledger B956)
             (String::from("NLEFX.EDL"), edl.into_bytes()),
         ];
-        let put = |c: &str, body: &[u8]| -> bool {
-            let _ = mt.unlink(c, p);
-            if mt.create(c, crate::fs::vfs::NodeKind::File, p).is_err() {
-                return false;
-            }
-            let mut off = 0usize;
-            while off < body.len() {
-                match mt.write(c, off as u64, &body[off..(off + 4096).min(body.len())], p) {
-                    Ok(n) if n > 0 => off += n,
-                    _ => break,
-                }
-            }
-            off == body.len()
-        };
+        let put = |c: &str, body: &[u8]| -> bool { mt.put_file(c, body, p).is_ok() }; // NLE6EXPORTONE (rmbp-ledger B963): the ONE VFS whole-file writer (fs/vfs.rs tail)
         let Some(dir) = ["/home", ""].into_iter().find(|d| files.iter().all(|(n, b)| put(&alloc::format!("{}/{}", d, n), b))) else {
             serial_println!(":: NLE: reason=fixture-write (neither /home nor / took the reels) -> SKIP ::");
             return;
@@ -1593,11 +1580,52 @@ mod nle_fx {
         let ctts = vi.is_some_and(|i| d.track_samples(i).any(|s| s.pts != s.dts));
         let audio_ok = d.audio_track().is_some_and(|t| t.sample_rate == 48_000 && t.channels == 2) && rep.audio_target > 0 && rep.audio_mixed >= rep.audio_target;
         let need_audio = cfg!(any(feature = "uvc", feature = "hda-tone"));
-        let ok = samples == ticks && rep.frames == ticks && ctts && (audio_ok || !need_audio);
+        let ok = samples == ticks && rep.frames == ticks && ctts && (audio_ok || !need_audio) && bitrate_verdict(dir); // NLE6EXPORTONE (rmbp-ledger B963): the `--bitrate` export (module tail), behind the first
         serial_println!(
             "[nle] fixture export out={} samples={} ticks={} ctts={} audio={} mixed={}/{} bytes={} ms={} -> {}",
             out, samples, ticks, ctts as u8, audio_ok as u8, rep.audio_mixed, rep.audio_target, rep.bytes, rep.ms, if ok { "ok" } else { "FAIL" }
         );
         (ok, if !ok { "FAIL" } else if need_audio { "ok" } else { "skip(no-audio)" })
+    }
+
+    // ── NLE6EXPORTONE (rmbp-ledger B963): `nle export --bitrate 40` over the fixture ─────────────────────────────────────
+    // The same EDL exported again at a CBR target through h264enc_core's `Config.rate` (no B pictures) to `<dir>/NLEFXR.MP4`:
+    // the video samples' bytes must land within 25% of the target over the timeline's ticks (40 kbit/s x 39 / 25 s = 7800
+    // bytes at the fixture's 39 ticks). 40, not 200: 64x48 is 12 macroblocks and the rate controller cannot spend below
+    // QP 16 (`rc::QP_MIN`), so 200 kbit/s (1000 bytes a frame) would read the encoder's QP floor, not its rate control.
+    fn bitrate_verdict(dir: &str) -> bool {
+        use crate::video::export;
+        const KBPS: u32 = 40;
+        let ticks = timeline().map(with_audio).map(|t| t.end()).unwrap_or(0).max(0) as u64;
+        let target = KBPS as u64 * 1000 * ticks / FPS as u64 / 8;
+        let (edl, out) = (alloc::format!("{}/NLEFX.EDL", dir), alloc::format!("{}/NLEFXR.MP4", dir));
+        let t0 = crate::arch::ms();
+        let jid = match export::start(&edl, &out, export::Opts { bitrate: KBPS, ..export::Opts::default() }) {
+            Ok(j) => j,
+            Err(e) => {
+                serial_println!("[nle] fixture export bitrate={} refused ({}) -> FAIL", KBPS, e);
+                return false;
+            }
+        };
+        let rep = loop {
+            if let Some(r) = export::report(jid) {
+                break Some(r);
+            }
+            if crate::arch::ms().saturating_sub(t0) > 30_000 {
+                break None;
+            }
+            crate::arch::sched::sleep_ms(4);
+        };
+        let (bytes, err) = match rep {
+            Some(r) if r.err.is_none() => (r.video_bytes, None),
+            r => (0, Some(r.and_then(|r| r.err).unwrap_or_else(|| String::from("timeout")))),
+        };
+        let dev = (bytes as i64 - target as i64) * 100 / (target.max(1) as i64);
+        let ok = err.is_none() && target > 0 && dev.abs() <= 25;
+        serial_println!(
+            "[nle] fixture export bitrate={} video_bytes={} target={} dev_pct={} out={}{} -> {}",
+            KBPS, bytes, target, dev, out, err.map(|e| alloc::format!(" err={}", e)).unwrap_or_default(), if ok { "ok" } else { "FAIL" }
+        );
+        ok
     }
 }

@@ -17,27 +17,30 @@
 //!   OFFLINE `audio::mixer::Mix` — the mixer's own engine (per-frame ramps, `align`, the Sinc ingest, `period`) — pumped as
 //!   an infinitely fast sink (after every write / end / state: `period` while `ready`, each period appended to the
 //!   capture). snd's feed, crossfade and drain run unchanged; the capture is 48 kHz stereo PCM16, the mixer's own format.
-//! * THE FILE ([`finish`], after the job's sound closed): the encoder flushed, ONE `build::mp4` of the `avc1` track (sample
-//!   i at its unit's (dts, pts) x the tick, so B pictures write `ctts`; timescale the EDL's fps, Stria's `video_track`
-//!   shape) and, when sound was captured, a `sowt` PCM16 track (`build::pcm16_track`) cut to the video's length (an AAC
-//!   encoder is owed: NLE6EXPORT-AAC). Written as the shell writes (`write_veto` at start, `SHELL_PRINCIPAL` = the kernel
-//!   principal).
+//! * THE FILE (NLE6EXPORTONE, rmbp-ledger B963): ONE `build::Mp4Stream` (ftyp, the mdat, the moov at the end). The `avc1`
+//!   track is `build::coded_video_spec` (the constructor Stria's `video_track` uses too); each unit is written to the file as
+//!   [`frame`] gets it (`build::coded_video_sample`: its (dts, pts) x the tick, so B pictures write `ctts`), so the export
+//!   holds no more than the encoder's reorder window. At [`finish`] (after the job's sound closed) the flush's units, then,
+//!   when sound was captured, a `sowt` PCM16 track (`build::pcm16_track`) cut to the video's length (an AAC encoder is
+//!   owed: NLE6EXPORT-AAC), then the moov. Written as the shell writes (`write_veto` at start, the kernel principal) through
+//!   the ONE VFS writer, `MountTable::put_file` / `write_all_at`; a refused, failed or superseded export unlinks its
+//!   partial file. `--bitrate KBPS` is h264enc_core's `Config.rate` (CBR), the field Stria's `with_bitrate` sets.
 //! * LOCKS: [`ENC`] (the armed export) is a leaf; [`frame`] TAKES the export out of it and encodes with no lock held (a
 //!   1080p picture is far past the lock registry's 50 ms), putting it back unless superseded. `bus::CAP` (the capture) is
 //!   taken under vplay's `snd::SND` and takes nothing (the live forward drops it first): the one new edge is SND -> CAP.
 //! * The export takes vplay's ONE job: refused while the Player (the job's one presenter) is open (`player::is_open`;
 //!   `vplay::finished` cannot say it: a superseded job ends with neither eos nor an error).
 //!
-//! Wire: `[nle] export start edl= out= qp= gop= bframes= jid=` · `[nle] export progress pct=<10..100> frames=<n>/<total>` ·
+//! Wire: `[nle] export start edl= out= qp= gop= bframes= bitrate= jid=` · `[nle] export progress pct=<10..100> frames=<n>/<total>` ·
 //! `[nle] export frames=<n> bytes=<n> ms=<n> audio=<mixed>/<target> bframes=<n> out=<p>` · `[nle] export refused why=<w> (<reason>)`.
-//! The witness is player.rs `tests nle` (`export=` on `:: NLE: … ::`). Owed: `--bitrate`, the Pi budget, a progress UI on
-//! the kernel face, MKV, AAC, a streaming writer (the units and PCM are held whole until the one `build::mp4`).
+//! The witness is player.rs `tests nle` (`export=` on `:: NLE: … ::`). Owed: the Pi budget, a progress UI on the kernel
+//! face, MKV, AAC, the sound streamed too (NLE6EXPORT-STREAMPCM: the capture's PCM is held whole until [`finish`]).
 
 use alloc::string::String;
 use alloc::vec::Vec;
 
 use demux_core::build;
-use h264enc_core::rgba::{RgbaEncoder, Unit};
+use h264enc_core::rgba::RgbaEncoder;
 use timeline_core::Timebase;
 
 /// The export's knobs (`nle export … --qp --gop --bframes`).
@@ -49,11 +52,13 @@ pub struct Opts {
     pub gop: u32,
     /// B pictures between anchors (0..=4; h264enc_core's `Config::bframes`).
     pub bframes: u8,
+    /// A constant bit rate in kbit/s (h264enc_core's `Config.rate`, CBR; `qp` its starting QP); 0 = constant QP.
+    pub bitrate: u32,
 }
 
 impl Default for Opts {
     fn default() -> Opts {
-        Opts { qp: 26, gop: 0, bframes: 0 }
+        Opts { qp: 26, gop: 0, bframes: 0, bitrate: 0 }
     }
 }
 
@@ -75,17 +80,22 @@ pub struct Report {
     pub audio_target: u64,
     pub audio: bool,
     pub bframes: u8,
+    /// The video samples' bytes (the `--bitrate` witness).
+    pub video_bytes: u64,
     pub out: String,
     pub err: Option<String>,
 }
 
-/// One armed export: the job it rides, the encoder and its units, the progress.
+/// One armed export: the job it rides, the encoder, the file being streamed and its video track, the progress.
 struct Exp {
     jid: u32,
     out: String,
     opts: Opts,
     rgba: RgbaEncoder,
-    units: Vec<Unit>,
+    stream: Option<build::Mp4Stream<VfsOut>>,
+    vtrack: usize,
+    /// The file was created by this export (so a refusal unlinks it; a file that was there before is never touched).
+    begun: bool,
     size: (u32, u32),
     tb: Timebase,
     total: u64,
@@ -118,14 +128,14 @@ pub fn start(edl: &str, out: &str, opts: Opts) -> Result<u32, String> {
     let jid = {
         // armed under the lock across the start, so the job's first `sink` sees its own jid
         let mut g = ENC.lock();
-        *g = Some(Exp { jid: 0, out: String::from(out), opts, rgba: RgbaEncoder::new(cfg), units: Vec::new(), size: (0, 0), tb: Timebase { num: 1, den: 25 }, total: 1, frames: 0, next_pct: 10, t0 });
+        *g = Some(Exp { jid: 0, out: String::from(out), opts, rgba: RgbaEncoder::new(cfg), stream: None, vtrack: 0, begun: false, size: (0, 0), tb: Timebase { num: 1, den: 25 }, total: 1, frames: 0, next_pct: 10, t0 });
         let jid = super::vplay::start(edl);
         if let Some(e) = g.as_mut() {
             e.jid = jid;
         }
         jid
     };
-    serial_println!("[nle] export start edl={} out={} qp={} gop={} bframes={} jid={}", edl, out, opts.qp, opts.gop, opts.bframes, jid);
+    serial_println!("[nle] export start edl={} out={} qp={} gop={} bframes={} bitrate={} jid={}", edl, out, opts.qp, opts.gop, opts.bframes, opts.bitrate, jid);
     Ok(jid)
 }
 
@@ -151,15 +161,16 @@ pub fn frame(jid: u32, tb: Timebase, total: u64, w: usize, h: usize, rgba: &[u8]
         if e.rgba.cfg.gop == 0 {
             e.rgba.cfg.gop = (tb.den / tb.num.max(1)).clamp(1, 600) as u32;
         }
-    }
-    let r = match e.rgba.push_rgba(w as u32, h as u32, rgba) {
-        Ok(u) => {
-            e.units.extend(u);
-            Ok(())
+        if e.opts.bitrate > 0 {
+            // tools/nle's `with_bitrate(k, tb.den, tb.num)`: the same `Config.rate`, set before the first picture builds the encoder
+            e.rgba.cfg.rate = Some(h264enc_core::RateControl { bits_per_second: e.opts.bitrate.saturating_mul(1000), fps_num: tb.den as u32, fps_den: tb.num.max(1) as u32, mode: h264enc_core::RcMode::Cbr });
         }
+    }
+    e.size = (w as u32, h as u32);
+    let r = match e.rgba.push_rgba(w as u32, h as u32, rgba) {
+        Ok(u) => e.stream_units(u).map_err(|m| alloc::format!("write-refused: {}", m)),
         Err(err) => Err(alloc::format!("{}", err)),
     };
-    e.size = (w as u32, h as u32);
     e.frames += 1;
     while e.next_pct <= 100 && e.frames * 100 >= e.next_pct * e.total {
         serial_println!("[nle] export progress pct={} frames={}/{}", e.next_pct, e.frames, e.total);
@@ -168,6 +179,9 @@ pub fn frame(jid: u32, tb: Timebase, total: u64, w: usize, h: usize, rgba: &[u8]
     let mut g = ENC.lock();
     if g.is_none() {
         *g = Some(e); // a new export armed meanwhile supersedes this one (its job ends at the next step)
+    } else {
+        drop(g);
+        e.abandon();
     }
     r
 }
@@ -175,11 +189,14 @@ pub fn frame(jid: u32, tb: Timebase, total: u64, w: usize, h: usize, rgba: &[u8]
 /// The EDL job `jid` ended with `r` (its sound closed): an Encode job's file is muxed and written here. Returns `r`, or
 /// `export-refused` when the job ran but the file could not be made. A Present job passes `r` through.
 pub fn finish(jid: u32, r: Result<(), (&'static str, Option<String>)>) -> Result<(), (&'static str, Option<String>)> {
-    let Some(e) = ENC.lock().take_if(|e| e.jid == jid) else { return r };
+    let Some(mut e) = ENC.lock().take_if(|e| e.jid == jid) else { return r };
     let pcm = bus::take(jid);
     let res = match &r {
         Ok(()) => e.write(pcm),
-        Err((why, m)) => Err((*why, m.clone().unwrap_or_else(|| String::from("superseded")))),
+        Err((why, m)) => {
+            e.abandon();
+            Err((*why, m.clone().unwrap_or_else(|| String::from("superseded"))))
+        }
     };
     match res {
         Ok(rep) => {
@@ -206,35 +223,23 @@ pub fn report(jid: u32) -> Option<Report> {
 }
 
 impl Exp {
-    /// Flush, mux (video + the capture's PCM16), write; the report is kept in [`LAST`].
+    /// Flush the encoder's tail into the stream, push the capture's PCM16 track, write the moov; the report is kept in
+    /// [`LAST`]. Any refusal unlinks the partial file.
     fn write(mut self, pcm: Option<(Vec<i16>, u32)>) -> Result<Report, (&'static str, String)> {
+        let r = self.write_inner(pcm);
+        if r.is_err() {
+            self.abandon();
+        }
+        r
+    }
+
+    fn write_inner(&mut self, pcm: Option<(Vec<i16>, u32)>) -> Result<Report, (&'static str, String)> {
         let tail = self.rgba.flush().map_err(|e| ("encode-refused", alloc::format!("{}", e)))?;
-        self.units.extend(tail);
-        if self.units.is_empty() {
+        self.stream_units(tail).map_err(|e| ("write-refused", e))?;
+        if self.stream.is_none() {
             return Err(("no-frames", String::from("the EDL encoded no frame")));
         }
-        let num = self.tb.num.max(1) as u32;
-        let den = self.tb.den.max(1);
-        let spec = build::TrackSpec {
-            id: 1,
-            kind: demux_core::TrackKind::Video,
-            fourcc: *b"avc1",
-            config_box: Some(*b"avcC"),
-            codec_id: "",
-            config: self.rgba.avcc(),
-            timescale: den as u32,
-            width: self.size.0 as u16,
-            height: self.size.1 as u16,
-            sample_rate: 0,
-            channels: 0,
-            bit_depth: 0,
-            default_duration_ns: num as u64 * 1_000_000_000 / den,
-        };
-        let samples = core::mem::take(&mut self.units)
-            .into_iter()
-            .map(|u| build::SampleSpec { data: u.sample, dts: u.dts * num as i64, pts: u.pts * num as i64, duration: num, keyframe: u.keyframe })
-            .collect();
-        let mut tracks = alloc::vec![build::MediaTrack { spec, samples }];
+        let mut tracks: Vec<build::MediaTrack> = Vec::new();
         let mut rep = Report { frames: self.frames, bframes: self.opts.bframes, out: self.out.clone(), ..Report::default() };
         if let Some((mut pcm, rate)) = pcm.filter(|(p, _)| !p.is_empty()) {
             let target = (self.tb.to_ns(self.total as i64).max(0) as u128 * rate as u128 / 1_000_000_000) as u64;
@@ -244,35 +249,57 @@ impl Exp {
             pcm.resize(target as usize * 2, 0);
             tracks.push(build::pcm16_track(2, rate, 2, &pcm, 1024));
         }
-        let mp4 = build::mp4(&tracks, &build::Mp4Options::default());
-        drop(tracks);
-        rep.bytes = write_file(&self.out, &mp4).map_err(|e| ("write-refused", e))?;
+        let Some(mut st) = self.stream.take() else { return Err(("no-frames", String::from("the EDL encoded no frame"))) };
+        for t in tracks {
+            let i = st.track(t.spec);
+            for smp in t.samples {
+                st.push(i, smp).map_err(|e| ("write-refused", e))?;
+            }
+        }
+        rep.video_bytes = st.video_bytes();
+        let (_, len) = st.finish(&build::Mp4Options::default()).map_err(|e| ("write-refused", e))?;
+        rep.bytes = len;
         rep.ms = crate::arch::ms().saturating_sub(self.t0);
         *LAST.lock() = Some((self.jid, rep.clone()));
         Ok(rep)
     }
-}
 
-/// `body` as the whole of `path` (replaced if it exists), through the VFS as the shell writes (`SHELL_PRINCIPAL`).
-fn write_file(path: &str, body: &[u8]) -> Result<u64, String> {
-    let mt = crate::shell::vfs_mount_table();
-    let p = crate::fs::vfs::KERNEL_PRINCIPAL;
-    let _ = mt.unlink(path, p);
-    mt.create(path, crate::fs::vfs::NodeKind::File, p).map_err(|e| alloc::format!("create {}: {:?}", path, e))?;
-    let mut off = 0usize;
-    while off < body.len() {
-        let n = mt.write(path, off as u64, &body[off..(off + 64 * 1024).min(body.len())], p).map_err(|e| alloc::format!("write {}: {:?}", path, e))?;
-        if n == 0 {
-            return Err(alloc::format!("write {}: no progress at byte {}", path, off));
+    /// Units out of the encoder into the file: the file is created and the `avc1` track declared at the first one (the
+    /// encoder, hence its avcC and size, exists by then).
+    fn stream_units(&mut self, units: Vec<h264enc_core::rgba::Unit>) -> Result<(), String> {
+        for u in units {
+            if self.stream.is_none() {
+                crate::shell::vfs_mount_table().put_file(&self.out, &[], crate::fs::vfs::KERNEL_PRINCIPAL).map_err(|e| alloc::format!("create {}: {:?}", self.out, e))?;
+                self.begun = true;
+                let mut st = build::Mp4Stream::begin(VfsOut { path: self.out.clone() })?;
+                self.vtrack = st.track(build::coded_video_spec(1, *b"avc1", Some(*b"avcC"), self.rgba.avcc(), self.size.0 as u16, self.size.1 as u16, self.tb));
+                self.stream = Some(st);
+            }
+            if let Some(st) = self.stream.as_mut() {
+                st.push(self.vtrack, build::coded_video_sample(self.tb, u.keyframe, u.sample, u.dts, u.pts))?;
+            }
         }
-        off += n;
+        Ok(())
     }
-    Ok(off as u64)
+
+    /// Drop the stream and unlink the partial file (ftyp + mdat with no moov), if this export created one.
+    fn abandon(&mut self) {
+        self.stream = None;
+        if core::mem::take(&mut self.begun) {
+            let _ = crate::shell::vfs_mount_table().unlink(&self.out, crate::fs::vfs::KERNEL_PRINCIPAL);
+        }
+    }
 }
 
-/// `nle export <edl> <out.mp4> [--qp N] [--gop N] [--bframes N]`: arm and start; the job prints the progress and the end.
+/// `body` as the whole of `path` (replaced if it exists), through the ONE VFS writer as the shell writes (the kernel
+/// principal). Kept by name for the editor's EDL save (NLE6KEYS).
+pub(crate) fn write_file(path: &str, body: &[u8]) -> Result<u64, String> {
+    crate::shell::vfs_mount_table().put_file(path, body, crate::fs::vfs::KERNEL_PRINCIPAL).map(|n| n as u64).map_err(|e| alloc::format!("write {}: {:?}", path, e))
+}
+
+/// `nle export <edl> <out.mp4> [--qp N] [--gop N] [--bframes N] [--bitrate KBPS]`: arm and start; the job prints the progress and the end.
 pub fn shell_verb(args: &[&str], console: &mut crate::console::Console) {
-    const USAGE: &str = "usage: nle export <edl> <out.mp4> [--qp N] [--gop N] [--bframes N]";
+    const USAGE: &str = "usage: nle export <edl> <out.mp4> [--qp N] [--gop N] [--bframes N] [--bitrate KBPS]";
     if args.first().copied() != Some("export") || args.len() < 3 {
         console.println(USAGE);
         return;
@@ -285,10 +312,7 @@ pub fn shell_verb(args: &[&str], console: &mut crate::console::Console) {
             ("--qp", Some(n)) => o.qp = n.min(255) as u8,
             ("--gop", Some(n)) => o.gop = n,
             ("--bframes", Some(n)) => o.bframes = n.min(255) as u8,
-            ("--bitrate", _) => {
-                console.println("nle export: --bitrate is owed (NLE6EXPORT-BITRATE)");
-                return;
-            }
+            ("--bitrate", Some(n)) => o.bitrate = n,
             _ => {
                 console.println(USAGE);
                 return;
@@ -412,5 +436,21 @@ mod bus {
     pub(super) fn arm(_: u32) {}
     pub(super) fn take(_: u32) -> Option<(alloc::vec::Vec<i16>, u32)> {
         None
+    }
+}
+
+// ── NLE6EXPORTONE (rmbp-ledger B963): the stream's sink, the export's file through the ONE VFS writer ──────────────────────
+/// `build::Mp4Stream`'s sink: bytes at an offset of the export's file (`MountTable::write_all_at`, the kernel principal).
+struct VfsOut {
+    path: String,
+}
+
+impl build::Sink for VfsOut {
+    type Error = String;
+    fn write_at(&mut self, off: u64, bytes: &[u8]) -> Result<(), String> {
+        crate::shell::vfs_mount_table()
+            .write_all_at(&self.path, off, bytes, crate::fs::vfs::KERNEL_PRINCIPAL)
+            .map(|_| ())
+            .map_err(|e| alloc::format!("write {} at {}: {:?}", self.path, off, e))
     }
 }
