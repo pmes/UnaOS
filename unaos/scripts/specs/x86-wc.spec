@@ -1024,6 +1024,12 @@ OPTIONAL \[nle\] fixture export pixel fit=letterbox bars=yes .* -> ok
 OPTIONAL \[nle\] fixture export pixel fit=fill bars=no .* -> ok
 OPTIONAL \[nle\] fixture export pixel fit=stretch bars=no .* -> ok
 FORBID \[nle\] fixture export pixel.* -> FAIL
+# KERNELSIZEPIN (rmbp-ledger B1001): `tests nle`'s keys leg posts `f` over NLEFXA (Letterbox -> Fill), the saved EDL carries `* UNA SIZE NLEFXA fill`, the Player presents a Fill frame with no black word in its picture rows, then three more `f` restore Letterbox and the EDL byte for byte; the present line is pinned as a prefix (KERNELPRESENTROWS appends `rows=`) (OPTIONAL as NLE above).
+OPTIONAL \[nle\] edit size NLEFXA -> fill at=\d+
+OPTIONAL \[vplay\] present fit=fill reel=NLEFXA
+OPTIONAL \[nle\] fixture keys size reel=NLEFXA fit=fill edl=ok presents=[1-9]\d* bars=0 .* back=ok -> ok
+OPTIONAL \[nle\] fixture keys path=\S+ edits=3/3 plan=ok saved=ok size=ok .* -> ok
+FORBID \[nle\] fixture keys size .* -> FAIL
 # HIDBOOTLEDSTEST (rmbp-ledger B995), TAIL-APPENDED — `tests hidboot`: the boot decoder under Transport::Ehci owes the LED slot on a lock-key press edge only, the ONE slot drain (`hidboot::drain_led_slots`) coalesces four toggles into one send with the latest byte and skips a dead endpoint, a refusing endpoint is latched off after one send. OPTIONAL until a typist types it (nothing types it on this lane today).
 OPTIONAL :: HIDBOOT: owed=ok coalesce=ok latch=ok -> PASS ::
 FORBID :: HIDBOOT: .*-> FAIL

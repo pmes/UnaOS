@@ -1058,7 +1058,7 @@ refs/heads/exec-rmbp-dwi2cgpio   92a0b0c20 FOLDED-BY-HAND (this commit) 2026-10-
 refs/heads/exec-rmbp-zenbookacpcodec   3585b7f12 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-pagesavecssurls   f3327e17e FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-hidbootarm   376bea1cb FOLDED-BY-HAND (this commit) 2026-10-27
-refs/heads/exec-rmbp-kernelsizepin   ff4fa8a0b cut 2026-10-27 (wave36 batch 19)
+refs/heads/exec-rmbp-kernelsizepin   dfc3069fa FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-kernelpresentrows   cf5f1b2fa FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-hidbootxhcix86   e0efe15d8 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-pdf4kernellane   80db1f2f1 FOLDED-BY-HAND (this commit) 2026-10-27
