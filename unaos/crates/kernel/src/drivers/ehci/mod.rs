@@ -206,7 +206,7 @@ struct IntEp {
     /// and two LEDs, and each USB keyboard latches its own. 0 at arm time = all locks off, which is
     /// the state a freshly-configured HID device is in (SET_CONFIGURATION resets its LEDs), so the
     /// software state and the hardware agree from the first report without an explicit sync.
-    kbd_leds: u8,
+    kbd_leds: u8, kbd_led_dirty: bool, // HIDBOOT-LEDS-EHCI (rmbp-ledger B991): this keyboard's LED SLOT is `kbd_leds` + this flag — marked by the walk when `decode_boot_keyboard`'s `Transport::set_leds` Ehci arm owes it, drained after the walk by ONE `set_hid_leds` carrying the latest byte. LINE-NEUTRAL fold, code first
     /// ALLKEYS P1 (EHCITARGET: EVERY interrupt endpoint carries these — hub, pointer, keyboard): the EP0 addressing tuple and interface number for THIS endpoint's device —
     /// everything `set_hid_leds` needs to send SET_REPORT back to it. Captured at arm time because
     /// the service loop, where a lock-key press is detected, has no other route to them: it walks
@@ -5042,7 +5042,7 @@ impl Controller {
     ///
     /// Returns whether the device accepted it, so the caller can latch a refusing keyboard off
     /// (`IntEp::kbd_led_ok`) rather than paying an EP0 timeout on every subsequent lock press.
-    unsafe fn set_hid_leds(&mut self, t: &Target, intf: u8, leds: u8) -> bool {
+    unsafe fn set_hid_leds(&mut self, t: &Target, intf: u8, leds: u8) -> Result<(), &'static str> { // HIDBOOT-LEDS-EHCI (B991): the control fn's own Err, so the drain names why=timeout|ctrl-fail
         self.data_buf.write(leds);
         let caps = (leds >> 1) & 1;
         match self.control(t, 0x21, 0x09, 0x0200, intf as u16, 1, false) {
@@ -5051,7 +5051,7 @@ impl Controller {
                     ":: EHCI-HID: [{}] ALLKEYS caps={} leds={:#04x} SET_REPORT ok addr={} intf={} == witness ::",
                     self.idx, caps, leds, t.addr, intf
                 );
-                true
+                Ok(())
             }
             // F6: a plain NAK/STALL/timeout is a device declining the LED — latch off, keep typing.
             // But `Err("hse")` is NOT that: `control` -> `chain_txn` returns it on a Host System
@@ -5067,14 +5067,14 @@ impl Controller {
                     ":: EHCI-HID: [{}] ALLKEYS caps={} leds={:#04x} SET_REPORT HSE addr={} intf={} — controller wedged (needs HCRESET), NOT a device LED decline ::",
                     self.idx, caps, leds, t.addr, intf
                 );
-                false
+                Err("hse")
             }
             Err(e) => {
                 crate::bootlog_println!(
                     ":: EHCI-HID: [{}] ALLKEYS caps={} leds={:#04x} SET_REPORT nak addr={} intf={} ({}) — LED latched off, case still tracked ::",
                     self.idx, caps, leds, t.addr, intf, e
                 );
-                false
+                Err(e)
             }
         }
     }
@@ -13554,7 +13554,7 @@ impl Controller {
             kbd_prev_mods: 0,
             // ALLKEYS P1: locks off at arm time — the state SET_CONFIGURATION just left the
             // device in, so software and hardware agree without an explicit sync request.
-            kbd_leds: 0,
+            kbd_leds: 0, kbd_led_dirty: false, // HIDBOOT-LEDS-EHCI (B991): no LED owed at arm time. LINE-NEUTRAL fold, code first
             target: *t,
             intf, #[cfg(all(feature = "lidsleep", feature = "wc"))] hub: None, // EHCIHUBDISC (B801): `configure_hub_interrupt_ep` sets it on a hub's status-change endpoint. LINE-NEUTRAL fold, code first
             kbd_led_ok: true,
@@ -13685,15 +13685,15 @@ impl Controller {
         let (kw_op, kw_fl) = (self.op, self.frame_list as *const u32);
         // MT-INVESTIGATION (IVY): local mirror of the capture-window counter, so the endpoint
         // iteration below keeps its exclusive borrow of `int_eps` (the EP0 restore runs after).
-        // ALLKEYS P1: lock-LED writes discovered during the endpoint walk, deferred until after it.
-        // A control transfer needs `&mut self`, which the `iter_mut()` borrow below rules out — the
-        // same constraint `mt_dumped` above is working around. Sized `MAX_INT_EPS` so that if two
-        // keyboards toggle a lock in the SAME service pass neither write is dropped; `Target` is
-        // `Copy`, so the array is plain stack scratch and costs nothing when nothing toggles.
-        let mut led_pushes: [Option<(usize, Target, u8, u8)>; MAX_INT_EPS] = [None; MAX_INT_EPS];
-        let mut n_led = 0usize; let mut tp_reassert: Option<(usize, Target, u8)> = None; // POINTERFEEL (B535): a trackpad whose stream contradicted its latched readback, re-asserted after the walk (EP0 needs `&mut self`, as `led_pushes`). LINE-NEUTRAL fold, code first.
+        // HIDBOOT-LEDS-EHCI (rmbp-ledger B991): lock-LED writes discovered during the endpoint walk
+        // no longer ride a stack array here. A control transfer needs `&mut self`, which the
+        // `iter_mut()` borrow below rules out — the same constraint `mt_dumped` above is working
+        // around — so each keyboard's LED SLOT (`IntEp::kbd_leds` + `kbd_led_dirty`) is marked in the
+        // walk and drained after it: one SET_REPORT per dirty slot per pass, toggles coalesced.
+        // (The `led_pushes` array that stood here is deleted: the slot replaced its only use.)
+        let mut tp_reassert: Option<(usize, Target, u8)> = None; // POINTERFEEL (B535): a trackpad whose stream contradicted its latched readback, re-asserted after the walk (EP0 needs `&mut self`, as the LED slot drain). LINE-NEUTRAL fold, code first.
         // KBDFLAP: stalled endpoints discovered during the walk, deferred for the same reason and
-        // in the same shape as `led_pushes` above — `ClearFeature(ENDPOINT_HALT)` is a control
+        // in the same shape as the LED slot drain — `ClearFeature(ENDPOINT_HALT)` is a control
         // transfer and needs `&mut self`. Entries are `(index into int_eps, the device's EP0
         // addressing tuple, the endpoint number)`; the endpoint number is decoded from the QH's own
         // `ep_chars` at the halt, so the wIndex the clear addresses is the one the controller was
@@ -14307,19 +14307,19 @@ impl Controller {
                         // raw pointer with no borrow of `e`, so handing the decoder `&mut e.kbd_prev_keys`
                         // alongside it is not an aliasing violation — the buffer and the diff state are
                         // disjoint memory.
-                        // ALLKEYS P1: the decoder also owns the lock-key state now. It reports back
-                        // whether this report toggled one; the SET_REPORT that lights the key is queued
-                        // for after the loop, where `self` is borrowable again.
+                        // ALLKEYS P1: the decoder also owns the lock-key state now. HIDBOOT-LEDS-EHCI
+                        // (B991): it returns whether its `Transport::set_leds` Ehci arm owes this
+                        // endpoint's LED slot; the slot is marked here and drained after the loop.
                         if decode_boot_keyboard(crate::drivers::hidboot::Transport::Ehci,
                             report,
                             &mut e.kbd_prev_keys,
                             &mut e.kbd_prev_mods,
                             &mut e.kbd_leds,
-                        ) && e.kbd_led_ok
-                            && n_led < led_pushes.len()
-                        {
-                            led_pushes[n_led] = Some((ep_i, e.target, e.intf, e.kbd_leds));
-                            n_led += 1;
+                        ) {
+                            // The byte is already in `e.kbd_leds`; a second toggle in this pass only
+                            // rewrites it, so the drain ships the LATEST state once (coalesced).
+                            e.kbd_led_dirty = true;
+                            // `kbd_led_ok` and `dead` are read at the drain, not here.
                         }
                         if e.reports == 1 || e.reports % 32 == 0 {
                             crate::bootlog_println!(
@@ -14380,18 +14380,18 @@ impl Controller {
                 break;
             }
         }
-        // ALLKEYS P1: the endpoint borrow is released here, so EP0 is usable again — light (or
-        // extinguish) the lock LEDs this pass toggled. Best-effort by construction: `set_hid_leds`
-        // swallows a refusal, because a keyboard that will not take an Output report must not cost
-        // the input path anything, and the software state has already been updated either way (the
-        // CASE fold works even on a device with no LED at all).
-        for slot in led_pushes.iter().take(n_led) {
-            if let Some((ep_i, t, intf, leds)) = *slot {
-                if !self.set_hid_leds(&t, intf, leds) {
-                    // Refused: latch this keyboard's LED off so a halted EP0 can never cost a
-                    // `hw_wait_budget()` stall on a later press. The case fold is untouched.
-                    self.int_eps[ep_i].kbd_led_ok = false;
-                }
+        // HIDBOOT-LEDS-EHCI (B991): the endpoint borrow is released here, so EP0 is usable again —
+        // drain every keyboard's LED slot this pass marked: ONE SET_REPORT per dirty slot, carrying
+        // the slot's latest byte. Best-effort by construction: a refusal costs a dark key, never a
+        // keystroke (the CASE fold already moved with `kbd_leds`), and latches `kbd_led_ok` off so
+        // a halted EP0 never costs a later press a `hw_wait_budget()` — one refused line per endpoint.
+        for ep_i in 0..self.int_eps.len() {
+            let (dirty, ok, dead, t, intf, leds) = { let e = &mut self.int_eps[ep_i]; let d = e.kbd_led_dirty; e.kbd_led_dirty = false; (d, e.kbd_led_ok, e.dead, e.target, e.intf, e.kbd_leds) };
+            if !dirty || !ok || dead { continue; } // nothing owed, a latched-off LED, or a retired endpoint
+            let r = self.set_hid_leds(&t, intf, leds);
+            crate::drivers::hidboot::note_leds_sent(crate::drivers::hidboot::Transport::Ehci, leds, t.addr, intf, r);
+            if r.is_err() {
+                self.int_eps[ep_i].kbd_led_ok = false; // the case fold is untouched
             }
         } if let Some((ep_i, t, intf)) = tp_reassert { self.tp_mode_reassert(ep_i, &t, intf); } // POINTERFEEL (B535): the endpoint borrow is released, EP0 is usable — the trackpad's mode re-assert (FILE-TAIL `impl Controller`). LINE-NEUTRAL fold, code first.
         // KBDFLAP: the endpoint borrow is released here, so EP0 is usable — clear the device-side
@@ -14557,7 +14557,7 @@ impl Controller {
 //
 // BOUNDS. At most `HALT_CLEARS_MAX` clears per endpoint per boot, one control transfer each,
 // issued only for `class=stall`, and only after the endpoint borrow is released (the same deferred
-// shape ALLKEYS P1's `led_pushes` uses — a control transfer needs `&mut self`). A refused clear
+// shape the LED slot drain (B991) uses — a control transfer needs `&mut self`). A refused clear
 // retires the endpoint exactly as before, held-key flush included. Exhausting the budget retires
 // it too. No loop, no wait, no allocation.
 // ══════════════════════════════════════════════════════════════════════════════════════════════
