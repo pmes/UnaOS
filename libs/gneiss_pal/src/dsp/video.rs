@@ -21,7 +21,7 @@
 use super::demux::{Codec, Packet, Track};
 use super::demux::build::TestPatternPacket;
 // AV1COLOURONE (SR340): COLOURONE's kernel lives in yuv_core (no_std, no alloc, zero deps), shared with av1_core.
-use yuv_core::{Chroma, Matrix, Picture, KR_KB_601};
+pub use yuv_core::Chroma; use yuv_core::{Matrix, Picture, KR_KB_601}; // AV1PLAYERCOLOUR (SR347): Chroma re-exported, `to_rgba_colour`'s upsampler
 #[cfg(test)]
 use yuv_core::{coeffs as yuv_coeffs, KR_KB_709};
 
@@ -48,7 +48,7 @@ impl Frame {
     /// [`Frame::to_rgba_colour`] uses (COLOURONE SR328); at 8 bits its derived table is the historical 298 / 409 / 100 /
     /// 208 / 516 at >> 8, so every caller is byte-identical.
     pub fn to_rgba(&self) -> Vec<u8> {
-        self.yuv_rgba(Matrix::Kr(KR_KB_601), false)
+        self.yuv_rgba(Matrix::Kr(KR_KB_601), false, Chroma::Nearest)
     }
 
     /// COLOURONE (LEDGER SR328): packed RGBA converted by the source's colour (`Track::colour`, NLEPROBEHDR SR226) —
@@ -60,25 +60,26 @@ impl Frame {
     /// limited. Integer only: a sample above 8 bits (`Pixels::I420Hi`) is narrowed to 8 inside the one rounded multiply,
     /// after the conversion (no dither: `yuv_core::to_rgba`'s `dither` is false here). No tone mapping: a PQ / HLG picture
     /// keeps its transfer. The pick (`yuv_core::pick`) and the kernel are `yuv_core`'s (AV1COLOURONE SR340), shared with av1_core
-    /// and the kernel Player.
-    pub fn to_rgba_colour(&self, colour: Option<&super::demux::colour::Colour>) -> Vec<u8> {
+    /// and the kernel Player. AV1PLAYERCOLOUR (SR347): `chroma` is the upsampler, the track's [`chroma_of`] (AV1 bilinear, as
+    /// the kernel Player's AV1 path; everything else nearest, COLOURONE's bytes).
+    pub fn to_rgba_colour(&self, colour: Option<&super::demux::colour::Colour>, chroma: Chroma) -> Vec<u8> {
         let (m, full) = yuv_core::pick(colour.map(|c| c.matrix), colour.and_then(|c| c.full_range), self.width, self.height);
-        self.yuv_rgba(m, full)
+        self.yuv_rgba(m, full, chroma)
     }
 
-    /// The one kernel at 4:2:0, nearest chroma (the 2x2 block), no dither: COLOURONE's bytes.
-    fn yuv_rgba(&self, m: Matrix, full: bool) -> Vec<u8> {
+    /// The one kernel at 4:2:0, the caller's chroma upsampling (nearest: the 2x2 block, COLOURONE's bytes), no dither.
+    fn yuv_rgba(&self, m: Matrix, full: bool, up: Chroma) -> Vec<u8> {
         let (w, h) = (self.width as usize, self.height as usize);
         let mut out = vec![0u8; w * h * 4];
         match &self.pixels {
             Pixels::Rgba(p) => return p.clone(),
             Pixels::I420 { y, u, v, y_stride, uv_stride } => {
                 let p = Picture { w, h, y: &y[..], u: &u[..], v: &v[..], y_stride: *y_stride, uv_stride: *uv_stride, ss: (1, 1), mono: false, bit_depth: 8, full };
-                yuv_core::to_rgba(&p, m, Chroma::Nearest, false, &mut out);
+                yuv_core::to_rgba(&p, m, up, false, &mut out);
             }
             Pixels::I420Hi { y, u, v, y_stride, uv_stride, bit_depth } => {
                 let p = Picture { w, h, y: &y[..], u: &u[..], v: &v[..], y_stride: *y_stride, uv_stride: *uv_stride, ss: (1, 1), mono: false, bit_depth: *bit_depth as u32, full };
-                yuv_core::to_rgba(&p, m, Chroma::Nearest, false, &mut out);
+                yuv_core::to_rgba(&p, m, up, false, &mut out);
             }
         }
         out
@@ -188,6 +189,18 @@ pub fn colour_of(track: &Track) -> Option<super::demux::colour::Colour> {
         #[cfg(feature = "av1")]
         Codec::Av1 => av1_core::image::av1c_codes(&track.config).map(|(c, l, m)| Colour::from_av1(c, l, m)), // KERNELCOLOUR (B952): the one mapping, the kernel Player's too
         _ => None,
+    }
+}
+
+/// AV1PLAYERCOLOUR (LEDGER SR347): the chroma upsampling a video track's frames convert with ([`Frame::to_rgba_colour`]'s
+/// `chroma`), the [`colour_of`] dispatch shape: AV1 -> `Chroma::Bilinear` (9-3-3-1, the kernel Player's `colour_rgba_av1`, so
+/// the two agree pixel for pixel) when the `av1` feature is on; anything else -> `Chroma::Nearest` (COLOURONE's bytes, the
+/// kernel's `colour_rgba_vp8`). Both of Stria's RGBA sinks (`media_bus`'s `BusSink`, `nle`'s `src_rgba`) pass it.
+pub fn chroma_of(track: &Track) -> Chroma {
+    match &track.codec {
+        #[cfg(feature = "av1")]
+        Codec::Av1 => Chroma::Bilinear,
+        _ => Chroma::Nearest,
     }
 }
 
@@ -566,7 +579,7 @@ mod tests {
     fn px8(w: u32, h: u32, y: u8, u: u8, v: u8, c: Option<&Colour>) -> Vec<u8> {
         let (cw, ch) = (w.div_ceil(2) as usize, h.div_ceil(2) as usize);
         let pixels = Pixels::I420 { y: vec![y; (w * h) as usize], u: vec![u; cw * ch], v: vec![v; cw * ch], y_stride: w as usize, uv_stride: cw };
-        Frame { width: w, height: h, pts_ns: 0, pixels }.to_rgba_colour(c)[..3].to_vec()
+        Frame { width: w, height: h, pts_ns: 0, pixels }.to_rgba_colour(c, Chroma::Nearest)[..3].to_vec()
     }
 
     #[test]
@@ -579,9 +592,9 @@ mod tests {
                 for v in (0..=255u8).step_by(17) {
                     let f = Frame { width: 4, height: 2, pts_ns: 0, pixels: Pixels::I420 { y: vec![y; 8], u: vec![u; 2], v: vec![v; 2], y_stride: 4, uv_stride: 2 } };
                     let old = f.to_rgba();
-                    assert_eq!(f.to_rgba_colour(None), old);
-                    assert_eq!(f.to_rgba_colour(Some(&bt601)), old);
-                    assert_eq!(f.to_rgba_colour(Some(&colour(2, None))), old);
+                    assert_eq!(f.to_rgba_colour(None, Chroma::Nearest), old);
+                    assert_eq!(f.to_rgba_colour(Some(&bt601), Chroma::Nearest), old);
+                    assert_eq!(f.to_rgba_colour(Some(&colour(2, None)), Chroma::Nearest), old);
                 }
             }
         }
@@ -603,7 +616,7 @@ mod tests {
         // R (6442640 - 5830636) >> 16 = 9, G (6442640 - 270072 + 2259284) >> 16 = 128, B (6442640 + 3088008) >> 16 = 145.
         assert_eq!(yuv_coeffs((2627, 593), false, 10), (16, [19077, 27503, 3069, 10657, 35091], 64, 512));
         let hi = Frame { width: 2, height: 2, pts_ns: 0, pixels: Pixels::I420Hi { y: vec![400; 4], u: vec![600], v: vec![300], y_stride: 2, uv_stride: 1, bit_depth: 10 } };
-        assert_eq!(hi.to_rgba_colour(Some(&colour(9, Some(false))))[..4], [9, 128, 145, 255]);
+        assert_eq!(hi.to_rgba_colour(Some(&colour(9, Some(false))), Chroma::Nearest)[..4], [9, 128, 145, 255]);
         // A Main10 sample narrowed after the conversion, not before: 601 limited Y 515 Cb 600 Cr 400 is (87, 145, 176);
         // the >> 2 planes (128, 150, 100) through the 8-bit table give (86, 145, 175).
         let m10 = Frame { width: 2, height: 2, pts_ns: 0, pixels: Pixels::I420Hi { y: vec![515; 4], u: vec![600], v: vec![400], y_stride: 2, uv_stride: 1, bit_depth: 10 } };
@@ -622,6 +635,6 @@ mod tests {
         assert_eq!(f.to_rgba()[..3], [76, 139, 145]);
         // RGBA frames pass through untouched.
         let rgba = Frame { width: 1, height: 1, pts_ns: 0, pixels: Pixels::Rgba(vec![1, 2, 3, 4]) };
-        assert_eq!(rgba.to_rgba_colour(Some(&colour(9, Some(true)))), [1, 2, 3, 4]);
+        assert_eq!(rgba.to_rgba_colour(Some(&colour(9, Some(true))), Chroma::Nearest), [1, 2, 3, 4]);
     }
 }

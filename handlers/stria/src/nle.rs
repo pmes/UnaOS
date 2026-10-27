@@ -872,8 +872,8 @@ impl Sources {
 
 /// COLOURONE (LEDGER SR328): a frame of source `src` as RGBA, converted by its reel's colour (`Track::colour`, the
 /// container's else the bitstream's) through `dsp::video::Frame::to_rgba_colour`. Both of the render's frame -> RGBA
-/// lines (a step's own source and a transition's outgoing source) call it.
+/// lines (a step's own source and a transition's outgoing source) call it. AV1PLAYERCOLOUR (SR347): by the reel track's `chroma_of`.
 fn src_rgba(sources: &Sources, src: SourceId, f: &Frame) -> Vec<u8> {
-    let colour = sources.get(src).ok().and_then(|m| m.video.and_then(|i| m.demux.tracks()[i].colour.as_ref()));
-    f.to_rgba_colour(colour)
+    let track = sources.get(src).ok().and_then(|m| m.video.map(|i| &m.demux.tracks()[i]));
+    f.to_rgba_colour(track.and_then(|t| t.colour.as_ref()), track.map_or(gneiss_pal::dsp::video::Chroma::Nearest, gneiss_pal::dsp::video::chroma_of))
 }

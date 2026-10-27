@@ -70,12 +70,12 @@ struct BusSink<'a> {
     /// Meters waiting for the next video frame.
     levels: &'a mut Vec<[f32; 2]>,
     /// COLOURONE (SR328): the Player's video colour (`Player::colour`), what the frame converts by.
-    colour: Option<gneiss_pal::dsp::demux::colour::Colour>,
+    colour: Option<gneiss_pal::dsp::demux::colour::Colour>, chroma: gneiss_pal::dsp::video::Chroma, // AV1PLAYERCOLOUR (SR347): and its upsampling, `chroma_of` the video track
 }
 impl FrameSink for BusSink<'_> {
     fn present(&mut self, f: &Frame, _ordinal: u64) {
         let levels = std::mem::take(self.levels);
-        self.synapse.fire(SMessage::MediaFrame { url: self.url.to_string(), pts_ns: f.pts_ns, width: f.width, height: f.height, rgba: f.to_rgba_colour(self.colour.as_ref()), levels });
+        self.synapse.fire(SMessage::MediaFrame { url: self.url.to_string(), pts_ns: f.pts_ns, width: f.width, height: f.height, rgba: f.to_rgba_colour(self.colour.as_ref(), self.chroma), levels });
     }
     fn levels(&mut self, pts_ns: i64, peaks: &[[f32; 2]]) {
         if self.audio_only {
@@ -139,7 +139,7 @@ impl MediaService {
                             continue;
                         }
                         let audio_only = !s.player.info().has_video;
-                        let mut sink = BusSink { synapse: &synapse, url, audio_only, levels: &mut s.levels, colour: s.player.colour().copied() };
+                        let mut sink = BusSink { synapse: &synapse, url, audio_only, levels: &mut s.levels, colour: s.player.colour().copied(), chroma: s.player.video_track().map_or(gneiss_pal::dsp::video::Chroma::Nearest, gneiss_pal::dsp::video::chroma_of) };
                         if s.player.tick(&mut sink) == Tick::Ended && s.playing {
                             s.ended = true;
                             let st = s.player.stats();

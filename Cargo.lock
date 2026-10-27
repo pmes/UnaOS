@@ -4589,7 +4589,9 @@ name = "stria"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "av1_core",
  "bandy",
+ "demux_core",
  "gneiss_pal",
  "h264enc_core",
  "log",

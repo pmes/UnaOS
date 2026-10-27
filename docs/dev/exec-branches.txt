@@ -908,7 +908,7 @@ refs/heads/exec-rmbp-pdfreencrypt   11bc87214 FOLDED-BY-HAND (this commit) 2026-
 refs/heads/exec-rmbp-hevcrexttools   2d45f0931 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-idbkatorder   8f639f6b0 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-phyoncetests   99c1251a2 FOLDED-BY-HAND (this commit) 2026-10-27
-refs/heads/exec-rmbp-av1playercolour   e9df84207 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-av1playercolour   e55b425a8 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-jpegcolourone   afa439cfa FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-h264encpyramid   e9df84207 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-pdfsign   82a21486d FOLDED-BY-HAND (this commit) 2026-10-27

@@ -201,7 +201,7 @@ fn heic_tile(
         light: None,
     };
     let frame = super::video::h264::to_frame(f);
-    Ok((frame.width, frame.height, frame.to_rgba_colour(Some(&colour))))
+    Ok((frame.width, frame.height, frame.to_rgba_colour(Some(&colour), super::video::Chroma::Nearest)))
 }
 
 #[cfg(any(feature = "hevc", feature = "av1"))]
@@ -497,7 +497,7 @@ mod heic_tests {
             pts_ns: 0,
             pixels: super::super::video::Pixels::I420 { y: vec![y; 4], u: vec![cb], v: vec![cr], y_stride: 2, uv_stride: 1 },
         };
-        f.to_rgba_colour(Some(c))[..4].try_into().unwrap()
+        f.to_rgba_colour(Some(c), super::super::video::Chroma::Nearest)[..4].try_into().unwrap()
     }
 
     #[test]
