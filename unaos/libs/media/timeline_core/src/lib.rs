@@ -17,6 +17,12 @@
 //!   `0 <= src_in < src_out <= source.duration`; every clip names a source that exists.
 //! * [`edl`]: the CMX 3600 text EDL (non-drop frame) — reader and writer.
 //! * [`schedule`]: the render schedule — what source tick each output tick shows, and where a decoder must seek.
+//! * Transitions (NLE3, LEDGER SR202): a [`Transition`] (a dissolve or an edge wipe, `dur` ticks) sits on a cut of a
+//!   video track and STARTS at it (CMX 3600's alignment): ticks `at..at+dur` show the incoming clip's own first `dur`
+//!   ticks mixed with the outgoing source's handle (`src_out..src_out+dur`). [`Timeline::add_transition`] /
+//!   [`Timeline::remove_transition`]; [`Timeline::validate`] refuses a transition off a cut ([`EditError::Transition`],
+//!   so an op that moves or removes a transition's cut is refused until the transition is removed) or longer than the
+//!   outgoing's handle or the incoming clip ([`EditError::Handle`]).
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -85,6 +91,51 @@ impl Clip {
 pub struct Track {
     pub kind: Kind,
     pub clips: Vec<Clip>,
+    /// NLE3: the transitions on this track's cuts, ordered by `at` (video tracks only).
+    pub transitions: Vec<Transition>,
+}
+
+/// An edge wipe's SMPTE pattern (CMX 3600 `W<nnn>`): the incoming source enters behind a moving edge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WipeDir {
+    /// `W001`: a vertical edge moving left to right (the incoming on the left).
+    LeftToRight,
+    /// `W002`: a horizontal edge moving top to bottom (the incoming on top).
+    TopToBottom,
+}
+
+impl WipeDir {
+    /// The SMPTE wipe code.
+    pub fn code(self) -> u16 {
+        match self {
+            WipeDir::LeftToRight => 1,
+            WipeDir::TopToBottom => 2,
+        }
+    }
+    pub fn from_code(code: u16) -> Option<WipeDir> {
+        match code {
+            1 => Some(WipeDir::LeftToRight),
+            2 => Some(WipeDir::TopToBottom),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransitionKind {
+    /// CMX `D`: the incoming fades in over the outgoing.
+    Dissolve,
+    /// CMX `W<nnn>`.
+    Wipe(WipeDir),
+}
+
+/// A transition on the cut at timeline tick `at` (the outgoing clip's end = the incoming clip's `at`), lasting `dur`
+/// ticks from the cut: the incoming shows its own first `dur` ticks, the outgoing its `dur` ticks past `src_out`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Transition {
+    pub at: i64,
+    pub kind: TransitionKind,
+    pub dur: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -122,6 +173,10 @@ pub enum EditError {
     Negative,
     /// A move between a video and an audio track.
     Kind,
+    /// A transition not on a cut between two butted clips of a video track (or none there to remove, or `dur < 1`).
+    Transition,
+    /// A transition longer than the outgoing source's handle past its out point, or than the incoming clip.
+    Handle,
 }
 
 impl core::fmt::Display for EditError {
@@ -135,6 +190,8 @@ impl core::fmt::Display for EditError {
             EditError::Empty => "empty clip",
             EditError::Negative => "negative time",
             EditError::Kind => "video and audio tracks do not mix",
+            EditError::Transition => "transition is not on a cut of a video track",
+            EditError::Handle => "transition is longer than a clip's handle",
         })
     }
 }
@@ -166,7 +223,7 @@ impl Timeline {
     }
     /// Add an empty track (builder); returns its index.
     pub fn add_track(&mut self, kind: Kind) -> usize {
-        self.tracks.push(Track { kind, clips: Vec::new() });
+        self.tracks.push(Track { kind, clips: Vec::new(), transitions: Vec::new() });
         self.tracks.len() - 1
     }
     pub fn source(&self, id: SourceId) -> Option<&Source> {
@@ -210,8 +267,53 @@ impl Timeline {
                 }
                 prev = Some(c);
             }
+            self.validate_transitions(t)?;
         }
         Ok(())
+    }
+
+    /// NLE3: every transition sits on a cut between two butted clips of a video track, in `at` order, and fits the
+    /// outgoing source's handle (`src_out + dur <= duration`) and the incoming clip (`dur <= len`).
+    fn validate_transitions(&self, t: &Track) -> Result<(), EditError> {
+        let mut last: Option<i64> = None;
+        for x in &t.transitions {
+            if t.kind != Kind::Video || x.dur < 1 || last.is_some_and(|l| x.at <= l) {
+                return Err(EditError::Transition);
+            }
+            last = Some(x.at);
+            let out = t.clips.iter().find(|c| c.end() == x.at);
+            let inc = t.clips.iter().find(|c| c.at == x.at);
+            let (Some(o), Some(i)) = (out, inc) else { return Err(EditError::Transition) };
+            let handle = self.source(o.src).ok_or(EditError::NoSource)?.duration - o.src_out;
+            if x.dur > i.len() || x.dur > handle {
+                return Err(EditError::Handle);
+            }
+        }
+        Ok(())
+    }
+
+    /// NLE3: put a transition on the cut at tick `at` of `track` (replacing one already there).
+    pub fn add_transition(&self, track: usize, at: i64, kind: TransitionKind, dur: i64) -> Result<Timeline, EditError> {
+        let mut tl = self.clone();
+        let tr = tl.tracks.get_mut(track).ok_or(EditError::NoTrack)?;
+        tr.transitions.retain(|x| x.at != at);
+        tr.transitions.push(Transition { at, kind, dur });
+        tr.transitions.sort_by_key(|x| x.at);
+        tl.validate()?;
+        Ok(tl)
+    }
+
+    /// NLE3: take the transition off the cut at tick `at` of `track` (the cut is a plain cut again).
+    pub fn remove_transition(&self, track: usize, at: i64) -> Result<Timeline, EditError> {
+        let mut tl = self.clone();
+        let tr = tl.tracks.get_mut(track).ok_or(EditError::NoTrack)?;
+        let n = tr.transitions.len();
+        tr.transitions.retain(|x| x.at != at);
+        if tr.transitions.len() == n {
+            return Err(EditError::Transition);
+        }
+        tl.validate()?;
+        Ok(tl)
     }
 
     /// Lay `clip` on `track` in `mode` (see [`Mode`]).
