@@ -6,18 +6,23 @@
 //!
 //! ```text
 //! pdfprobe <file>
+//! pdfprobe --text <file> <page>
 //! ```
 //!
 //! Prints `pages=<n> version=<v> xref=<table|stream|rebuilt> info=<title|->`, then one line per page:
 //! `page=<i> media=<w>x<h> rotate=<r> ops=<n> fonts=<n> images=<n>` (fonts = the /Resources /Font entries; images =
 //! the /Resources /XObject entries whose /Subtype is /Image, plus the inline images among the page's ops).
 //! A refused file prints `error=<reason>` and exits 1.
+//!
+//! `--text` (PDF3, LEDGER SR314) prints page `<page>`'s extracted text (`Page::text` + `spans_to_string`); unembedded
+//! fonts take their advances from the tree's bundled faces (fonts/ beside this crate: Inter, JetBrains Mono, Noto Sans).
 
 use pdf_core::content::ops;
+use pdf_core::font::{Fallback, spans_to_string};
 use pdf_core::{Document, Object, Page};
 
 fn usage() -> ! {
-    eprintln!("usage: pdfprobe <file>");
+    eprintln!("usage: pdfprobe <file> | pdfprobe --text <file> <page>");
     std::process::exit(2)
 }
 
@@ -55,8 +60,24 @@ fn page_line(doc: &Document, i: usize, p: &Page) -> String {
     )
 }
 
+/// `--text <file> <page>`: the page's text through pdf_core's extraction.
+fn text(path: &str, page: &str) {
+    let bytes = std::fs::read(path).unwrap_or_else(|e| fail(e));
+    let doc = Document::parse(&bytes).unwrap_or_else(|e| fail(e));
+    let pages = doc.pages().unwrap_or_else(|e| fail(e));
+    let i: usize = page.parse().unwrap_or_else(|_| usage());
+    let p = pages.get(i).unwrap_or_else(|| fail(format!("no page {i}")));
+    let face = |rel: &str| std::fs::read(format!("{}/../../fonts/{rel}", env!("CARGO_MANIFEST_DIR"))).ok();
+    let (sans, mono, serif) = (face("inter/InterVariable.ttf"), face("jetbrains-mono/JetBrainsMono-Variable.ttf"), face("noto-sans/NotoSans-Variable.ttf"));
+    let fb = Fallback { sans: sans.as_deref(), mono: mono.as_deref(), serif: serif.as_deref() };
+    println!("{}", spans_to_string(&p.text(&doc, &fb)));
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if args.len() == 4 && args[1] == "--text" {
+        return text(&args[2], &args[3]);
+    }
     if args.len() != 2 {
         usage();
     }

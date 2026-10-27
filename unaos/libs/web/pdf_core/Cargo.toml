@@ -11,6 +11,9 @@ description = "Aether's PDF core: the PDF 32000-1 reader (lexer, objects, xref t
 # never a second DEFLATE decoder.
 [dependencies]
 pixel_core = { path = "../../media/pixel_core" }
+# PDF3 (LEDGER SR314): font_core reads every embedded font program (TrueType / OpenType, CFF, Type 1) — never a second
+# font parser in pdf_core.
+font_core = { path = "../../text/font_core" }
 
 [features]
 default = ["std"]
