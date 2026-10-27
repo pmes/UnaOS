@@ -371,7 +371,7 @@ struct Ghost {
 static GHOST: Mutex<Option<Ghost>> = Mutex::new(None);
 
 /// Half of each channel of `a` plus half of `b` — the 50 percent mix of two tokens.
-#[cfg_attr(not(all(target_arch = "x86_64", feature = "wc")), allow(dead_code))]
+#[cfg_attr(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))), allow(dead_code))]
 fn mix50(a: u32, b: u32) -> u32 {
     ((a >> 1) & 0x007f_7f7f) + ((b >> 1) & 0x007f_7f7f)
 }
@@ -386,7 +386,7 @@ fn ghost_at(x: i32, y: i32, w: usize, h: usize) -> (usize, usize) {
 }
 
 fn ghost_open(label: &str, x: i32, y: i32) {
-    #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
     {
         use crate::video::{text, theme};
         let face = text::Face::Ui;

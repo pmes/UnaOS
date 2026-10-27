@@ -270,12 +270,12 @@ fn paint(kind: u8, lv: u8) {
     }
 }
 
-/// Paint and open (or re-present) the row. Returns the row id (0: headless, no panel, aarch64).
+/// Paint and open (or re-present) the row. Returns the row id (0: headless, no panel, no desktop family).
 fn draw(kind: u8, lv: u8) -> u32 {
     if HEADLESS.load(Ordering::Relaxed) {
         return 0;
     }
-    #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
     {
         let (pw, ph) = { let i = super::WRITER.lock().info(); (i.width, i.height) };
         if pw == 0 || ph == 0 {
@@ -293,10 +293,10 @@ fn draw(kind: u8, lv: u8) -> u32 {
         WIN.store(if id == wm::WIN_NONE { 0 } else { id }, Ordering::Release);
         return if id == wm::WIN_NONE { 0 } else { id };
     }
-    #[cfg(not(all(target_arch = "x86_64", feature = "wc")))]
+    #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
     {
         let _ = (kind, lv, paint as fn(u8, u8));
-        0 // aarch64: wire-only (no chromeless overlay row there yet — the toast's shape)
+        0 // no desktop family: wire-only (no overlay row; OVERLAYARM2 B866 opened the aarch64 desktop's)
     }
 }
 

@@ -1501,11 +1501,6 @@ fn row_unpub(i: usize, win: wm::WinId) {
     }
 }
 
-/// Is `id` one of notify's live rows (a card or the Center)? Read by `wm::overlay_occludes`.
-pub fn owns_row(id: wm::WinId) -> bool {
-    id != wm::WIN_NONE && ROW_WIN.iter().any(|w| w.load(Ordering::Acquire) == id)
-}
-
 /// The leg's line on its cards (the cleanup's key).
 const FIX_LINE: &[u8] = b"toastflicker fixture";
 
