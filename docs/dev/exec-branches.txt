@@ -947,3 +947,9 @@ refs/heads/exec-rmbp-yuvfancy   672c23c04 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-swapbackspancache   672c23c04 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-h264enccbrone   672c23c04 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-kerneldisplayicc   81c1b985e FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-av1inbandswitch   437062021 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-pdf4outline   437062021 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-nle6keyslabels   437062021 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-vfsputrest   437062021 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-windowaudit   437062021 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-kernelscaleconvert   437062021 IN-FLIGHT cut 2026-10-27
