@@ -810,10 +810,9 @@ fn sync_metal_layer(view: &NSView, layer: &AnyObject) -> (u32, u32) {
     };
     let scale = if scale > 0.0 { scale } else { 1.0 };
     let bounds = view.bounds();
-    let want = NSSize::new(
-        (bounds.size.width * scale).round().max(1.0),
-        (bounds.size.height * scale).round().max(1.0),
-    );
+    // AETHERSURFACEHEIGHT (SR411): the drawable is the view x the backing scale, the one rule's arithmetic.
+    let (pw, ph) = crate::platforms::page_geometry((bounds.size.width, bounds.size.height), scale, (0, 0)).drawable;
+    let want = NSSize::new(pw as f64, ph as f64);
     unsafe {
         let cur_scale: f64 = msg_send![layer, contentsScale];
         let cur: NSSize = msg_send![layer, drawableSize];
@@ -1034,7 +1033,7 @@ impl PageGpuView {
             return;
         };
         let bounds = self.bounds();
-        let Some(quad) = crate::tetra::surface_ndc(bounds.size.width, bounds.size.height, *tw, *th) else {
+        page_witness(self, (*tw, *th)); let Some(quad) = crate::tetra::surface_ndc(bounds.size.width, bounds.size.height, *tw, *th) else {
             return;
         };
         let (dw, dh) = sync_metal_layer(self, &m.layer);
@@ -1285,4 +1284,26 @@ pub fn page_damage(page: &NSView, rows: &[u8], width: u32, height: u32, rects: &
     }
     view.draw();
     true
+}
+
+// AETHERSURFACEHEIGHT (LEDGER SR411): the page surface's geometry witness. ONE `[surface] geometry:` line each time the
+// view, the backing scale or the texture changes (`crate::platforms::page_geometry`'s `witness`): `covers=no` with a short
+// frame names the face, `covers=yes` names the page's own layout. Main thread only, as every `PageGpuView` method.
+thread_local! {
+    static PAGE_WITNESS: RefCell<String> = const { RefCell::new(String::new()) };
+}
+
+fn page_witness(view: &NSView, tex: (u32, u32)) {
+    let scale: f64 = match view.window() {
+        Some(w) => unsafe { msg_send![&w, backingScaleFactor] },
+        None => 1.0,
+    };
+    let bounds = view.bounds();
+    let line = crate::platforms::page_geometry((bounds.size.width, bounds.size.height), scale, tex).witness();
+    PAGE_WITNESS.with(|last| {
+        if *last.borrow() != line {
+            log::info!("[surface] geometry: {line}");
+            *last.borrow_mut() = line;
+        }
+    });
 }
