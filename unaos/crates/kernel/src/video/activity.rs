@@ -356,7 +356,7 @@ pub fn open() -> Result<(), &'static str> {
     witness(&st, true);
     *STATE.lock() = Some(st);
     WIN.store(id, Ordering::Relaxed);
-    wm::winid_register_holder(&WIN, "activity");
+    wm::winid_register_close_hook(&WIN, "activity", close_hook); // WMCLOSEHOOK (rmbp-ledger B1038): a close behind our back frees STATE (file tail)
     wm::focus_changed(OWNER);
     let _ = wm::present(id);
     serial_println!("[activity] open win={}", id);
@@ -520,4 +520,16 @@ pub fn textscale_rows() -> (usize, bool) {
 #[cfg(feature = "witness")]
 pub fn textscale_frames() -> u32 {
     TS_FRAMES.load(Ordering::Relaxed)
+}
+
+// ── WMCLOSEHOOK (rmbp-ledger B1038, BP-video-18 kept) — FILE-TAIL. A close behind this window's back (the furniture disc,
+// `wm::close_all_furniture` at a Log Out) cleared `WIN` through wm's WINID registry, so [`close`] returned at its
+// `WIN_NONE` guard and STATE (with its surface) stayed. `wm::close` now runs this hook after the drain, with no wm lock
+// held: STATE is taken iff its surface is the one the closed row seated (a reopen builds a fresh one), dropped outside the lock.
+fn close_hook(_id: wm::WinId, surf: usize) {
+    let st = {
+        let mut g = STATE.lock();
+        if g.as_ref().map(|s| s.surf.as_ptr() as usize) == Some(surf) { g.take() } else { None }
+    };
+    drop(st);
 }

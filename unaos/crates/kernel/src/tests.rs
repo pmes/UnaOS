@@ -8447,7 +8447,7 @@ fn fixture_stack_note(name: &str) {
 // (`attributed`); dropped, the row returns to where the run found it (`delta<k>` = 0); then a 128 KiB block must land
 // under the enclosing run's own `fx:memline` (`nest`: the probe's drop restored the word). x86 `wc`.
 // Wire: `[fixtureretain] top fx:<verb>:<kb>,…` · `:: FIXTURERETAIN: fixtures=<n> freed_kb=<n> once_kb=<n>
-// attributed=<y|n> nest=<ok|bad> surf_ok=<1|0|skip> -> PASS|FAIL :: delta1=<kb> delta2=<kb>` · `-> SKIP :: reason=<census-unarmed|alloc>`.
+// attributed=<y|n> nest=<ok|bad> surf_ok=<1|0|skip> surf_bypass_ok=<1|0|skip> -> PASS|FAIL :: delta1=<kb> delta2=<kb>` · `-> SKIP :: reason=<census-unarmed|alloc>`.
 #[cfg(all(target_arch = "x86_64", feature = "wc"))]
 fn fixtureretain() {
     use crate::allocator::census;
@@ -8478,7 +8478,7 @@ fn fixtureretain() {
     let mut v: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
     let nest = v.try_reserve_exact(NEST).is_ok() && census::snapshot().bytes_of("fx:memline", true) >= n0 + NEST as u64;
     drop(v);
-    let s = census::snapshot(); let surf_ok = windowsurftag_leg(); // WINDOWSURFTAG (B1030): the window-surface leg (LINE-NEUTRAL append, code first; body at the file tail)
+    let s = census::snapshot(); let surf_ok = windowsurftag_leg(); let surf_bypass_ok = closehook_leg(); /* WMCLOSEHOOK (B1038): the bypass-close leg, body at the file tail */ // WINDOWSURFTAG (B1030): the window-surface leg (LINE-NEUTRAL append, code first; body at the file tail)
     let mut fx: [(&str, u64); census::ROWS] = [("", 0); census::ROWS];
     let mut n = 0usize;
     for r in s.rows.iter().flatten() {
@@ -8499,11 +8499,11 @@ fn fixtureretain() {
     }
     serial_println!("[fixtureretain] top {}", if top.is_empty() { "-" } else { top.as_str() });
     let freed = deltas == [0, 0];
-    let pass = attributed && nest && freed && surf_ok != Some(false);
+    let pass = attributed && nest && freed && surf_ok != Some(false) && surf_bypass_ok != Some(false);
     serial_println!(
-        ":: FIXTURERETAIN: fixtures={} freed_kb={} once_kb={} gen7_released_kb={} attributed={} nest={} surf_ok={} -> {} :: delta1={} delta2={}",
+        ":: FIXTURERETAIN: fixtures={} freed_kb={} once_kb={} gen7_released_kb={} attributed={} nest={} surf_ok={} surf_bypass_ok={} -> {} :: delta1={} delta2={}",
         n, if freed { PROBE / 1024 } else { 0 }, s.bytes_of("gen7-held", true) / 1024, { #[cfg(any(feature = "gen7r9", feature = "gen7blit"))] { crate::drivers::gpu::gen7::held_released_kb() } #[cfg(not(any(feature = "gen7r9", feature = "gen7blit")))] { 0usize } }, if attributed { "y" } else { "n" },
-        if nest { "ok" } else { "bad" }, match surf_ok { Some(true) => "1", Some(false) => "0", None => "skip" }, if pass { "PASS" } else { "FAIL" }, deltas[0] / 1024, deltas[1] / 1024
+        if nest { "ok" } else { "bad" }, match surf_ok { Some(true) => "1", Some(false) => "0", None => "skip" }, match surf_bypass_ok { Some(true) => "1", Some(false) => "0", None => "skip" }, if pass { "PASS" } else { "FAIL" }, deltas[0] / 1024, deltas[1] / 1024
     );
 }
 
@@ -8546,4 +8546,60 @@ fn windowsurftag_leg() -> Option<bool> {
     wm::close(id);
     drop(sv);
     Some(open_ok && census::snapshot().bytes_of("window-surface", true) == w0)
+}
+
+// ── WMCLOSEHOOK (rmbp-ledger B1038, BP-cores-22, BP-video-18) — FILE-TAIL. FIXTURERETAIN's bypass-close leg ──
+// A 100 KiB surface held in a leg-owned static, its id cell registered with a close hook, is closed by a bare `wm::close(id)`
+// — the call every bypass route makes (`close_all_furniture` loops it; running that here would take down the live desktop)
+// — and the leg never frees its own buffer: wm's WINID teardown clears the cell and, after the drain, runs the hook, so the
+// `window-surface` row returns to where the leg found it AND the static's capacity is 0. `None` = no window or no memory
+// (`surf_bypass_ok=skip`). Called from `fixtureretain` (x86 `wc`).
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+static CLOSEHOOK_WIN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(crate::video::wm::WIN_NONE);
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+static CLOSEHOOK_SURF: crate::sync::Mutex<alloc::vec::Vec<u32>> = crate::sync::Mutex::new(alloc::vec::Vec::new());
+
+/// The leg's close-free: what an owner's hook does — drop only the buffer the closed row seated.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+fn closehook_free(_id: crate::video::wm::WinId, surf: usize) {
+    let mut s = CLOSEHOOK_SURF.lock();
+    if s.as_ptr() as usize == surf {
+        *s = alloc::vec::Vec::new();
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+fn closehook_leg() -> Option<bool> {
+    use crate::allocator::census;
+    use crate::video::wm;
+    use core::sync::atomic::Ordering;
+    const HOOK_OWNER: u64 = 0xF5F;
+    const SURF_WORDS: usize = 160 * 160;
+    let w0 = census::snapshot().bytes_of("window-surface", true);
+    let base = {
+        let mut s = CLOSEHOOK_SURF.lock();
+        s.clear();
+        if s.try_reserve_exact(SURF_WORDS).is_err() {
+            return None;
+        }
+        s.resize(SURF_WORDS, 0);
+        s.as_ptr() as usize
+    };
+    let len = SURF_WORDS * 4;
+    let id = wm::create(HOOK_OWNER, base, len, 8, 8, 32, b"closehook");
+    if id == wm::WIN_NONE {
+        *CLOSEHOOK_SURF.lock() = alloc::vec::Vec::new();
+        return None;
+    }
+    CLOSEHOOK_WIN.store(id, Ordering::Release);
+    if !wm::winid_register_close_hook(&CLOSEHOOK_WIN, "closehook-leg", closehook_free) {
+        wm::close(id);
+        *CLOSEHOOK_SURF.lock() = alloc::vec::Vec::new();
+        return None;
+    }
+    let open_ok = census::snapshot().bytes_of("window-surface", true) >= w0 + len as u64;
+    wm::close(id); // the bypass: the leg does not free its buffer; wm clears the cell and runs the hook
+    let cell_cleared = CLOSEHOOK_WIN.load(Ordering::Acquire) == wm::WIN_NONE;
+    let freed = CLOSEHOOK_SURF.lock().capacity() == 0;
+    Some(open_ok && cell_cleared && freed && census::snapshot().bytes_of("window-surface", true) == w0)
 }
