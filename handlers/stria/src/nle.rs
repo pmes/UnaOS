@@ -511,7 +511,7 @@ pub fn render(tl: &Timeline, range: std::ops::Range<i64>, sources: &Sources, sin
                 if f.width != w || f.height != h {
                     return Err(RenderError::Size { src, width: f.width, height: f.height });
                 }
-                sink.frame(s.out_t, w, h, &vmix_frame(tl, sources, s, &mut vmix_run, &f.to_rgba(), f.width, f.height, tol, &mut r)?);
+                sink.frame(s.out_t, w, h, &vmix_frame(tl, sources, s, &mut vmix_run, &src_rgba(sources, src, &f), f.width, f.height, tol, &mut r)?);
                 r.frames += 1;
             }
             (Kind::Audio, _) => {
@@ -721,7 +721,7 @@ fn vmix_frame(
             if a.width != w || a.height != h {
                 return Err(RenderError::Size { src, width: a.width, height: a.height });
             }
-            a.to_rgba()
+            src_rgba(sources, src, &a)
         }
         // NLE3c: from black: the outgoing is opaque black (the gap's black).
         None => [0u8, 0, 0, 255].repeat(w as usize * h as usize),
@@ -930,4 +930,12 @@ impl Sources {
             }
         }
     }
+}
+
+/// COLOURONE (LEDGER SR328): a frame of source `src` as RGBA, converted by its reel's colour (`Track::colour`, the
+/// container's else the bitstream's) through `dsp::video::Frame::to_rgba_colour`. Both of the render's frame -> RGBA
+/// lines (a step's own source and a transition's outgoing source) call it.
+fn src_rgba(sources: &Sources, src: SourceId, f: &Frame) -> Vec<u8> {
+    let colour = sources.get(src).ok().and_then(|m| m.video.and_then(|i| m.demux.tracks()[i].colour.as_ref()));
+    f.to_rgba_colour(colour)
 }

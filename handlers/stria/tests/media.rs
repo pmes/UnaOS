@@ -779,3 +779,50 @@ fn swapback_editor_renders_the_stand_in_span_and_reports_it() {
     assert_eq!(after, format!("{before} decode=stand-in"));
     println!("swapback: editor {after}");
 }
+
+// COLOURONE (LEDGER SR328): the Player's RGBA path (`media_bus`'s BusSink) converts a Main 10 picture from its 16-bit
+// samples (HEVCMAIN10-PLAYER) and by the Player's colour (`Player::colour`).
+
+/// The first MediaFrame's RGBA of `file` posted through the MediaService (the bus sink's one conversion).
+fn posted_rgba(file: Vec<u8>, name: &str) -> (u32, u32, Vec<u8>) {
+    let dir = std::env::temp_dir().join(format!("stria-colourone-{}-{name}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(format!("{name}.mp4"));
+    std::fs::write(&path, file).unwrap();
+    let url = format!("file://{}", path.display());
+    let synapse = Synapse::new();
+    let mut rx = synapse.subscribe();
+    let svc = MediaService::spawn(synapse.clone(), 120, false);
+    synapse.fire(SMessage::MediaPoster { url: url.clone() });
+    let t0 = Instant::now();
+    let mut got = None;
+    while got.is_none() && t0.elapsed() < Duration::from_secs(20) {
+        match rx.try_recv() {
+            Ok(SMessage::MediaFrame { width, height, rgba, .. }) if width > 0 => got = Some((width, height, rgba)),
+            Ok(_) => {}
+            Err(_) => std::thread::sleep(Duration::from_millis(2)),
+        }
+    }
+    drop(svc);
+    let _ = std::fs::remove_dir_all(&dir);
+    got.expect("a poster frame")
+}
+
+#[test]
+fn colourone_player_main10_converts_from_ten_bits_and_by_its_colour() {
+    use gneiss_pal::dsp::demux::colour::Colour;
+    use gneiss_pal::dsp::image::heic_kat::{access_unit, hvc1_track, main10_hvcc, main10_slice};
+    let track = || hvc1_track(main10_hvcc(), &access_unit(&main10_slice()), 32, 32, 2);
+    // Untagged 32x32: BT.601 limited from Y 515 Cb 600 Cr 400 at 10 bits (the >> 2 planes would give 86, 145, 175).
+    let (w, h, rgba) = posted_rgba(build::mp4(&[track()], &Mp4Options::default()), "plain");
+    assert_eq!((w, h), (32, 32));
+    assert!(rgba.chunks_exact(4).all(|p| p == [87, 145, 176, 255]), "{:?}", &rgba[..4]);
+    // A colr saying BT.709 limited: the 10-bit table (19077, 29372, 3494, 8731, 34610) at >> 16 gives (81, 142, 178).
+    let c709 = Colour { primaries: 1, transfer: 1, matrix: 1, full_range: Some(false), mastering: None, light: None };
+    let x = build::Mp4Extras { colour: vec![(1, c709)], ..Default::default() };
+    let file = build::mp4_with(&[track()], &Mp4Options::default(), &x);
+    assert_eq!(Player::open(file.clone(), Arc::new(ManualTime::new()), None, 60).unwrap().colour(), Some(&c709));
+    let (_, _, tagged) = posted_rgba(file, "bt709");
+    assert!(tagged.chunks_exact(4).all(|p| p == [81, 142, 178, 255]), "{:?}", &tagged[..4]);
+    println!("colourone: player main10 rgba=87,145,176 bt709=81,142,178");
+}

@@ -504,7 +504,7 @@ impl Player {
         self.demux.as_ref().map(|d| d.survey())
     }
     /// NLEPROBEHDRWIRE (SR305): the video track's colour (container, else the bitstream's through `fill_colour(colour_of)`);
-    /// `None` without a video track or a stated colour. Read-only: the Player converts nothing by it yet (HEVCHEIC-COLR).
+    /// `None` without a video track or a stated colour. COLOURONE (SR328): the bus sink (`media_bus`'s `BusSink`) converts every frame by it.
     pub fn colour(&self) -> Option<&gneiss_pal::dsp::demux::colour::Colour> {
         self.vtrack.as_ref()?.colour.as_ref()
     }
