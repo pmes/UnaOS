@@ -1240,6 +1240,62 @@ fn mkv_colour(opts: &MkvOptions, id: u32) -> Vec<u8> {
     el(0x55B0, &b)
 }
 
+/// NLE6EXPORTAAC (rmbp-ledger B960): an AAC track (`mp4a` + `esds`), one raw_data_block per sample of 1024 frames,
+/// timescale = the sample rate. `asc` is the AudioSpecificConfig (audio_core `aac::enc::Encoder::asc`); `config` holds the
+/// whole `esds` body (the full-box word, ES_Descriptor -> DecoderConfigDescriptor (objectTypeIndication 0x40, audio
+/// stream) -> DecoderSpecificInfo = `asc`, SLConfigDescriptor 2), which the reader's `parse_esds` takes back to the ASC.
+/// [`mkv`] does not take this track (it writes `config` verbatim); [`MkvStream`] does (NLE6EXPORTMKV B966, AACENC-MKV:
+/// `A_AAC` with the ASC out of the `esds` as CodecPrivate; the edit list refused under Matroska). The encoder's priming is trimmed by [`mp4a_edit_list`] through [`Mp4Extras::edit_lists`].
+pub fn mp4a_track(id: u32, sample_rate: u32, channels: u16, asc: &[u8], units: Vec<Vec<u8>>, avg_bitrate: u32) -> MediaTrack {
+    let desc = |tag: u8, body: &[u8]| -> Vec<u8> {
+        let mut d = alloc::vec![tag];
+        let n = body.len();
+        d.extend_from_slice(&[0x80 | ((n >> 21) & 0x7F) as u8, 0x80 | ((n >> 14) & 0x7F) as u8, 0x80 | ((n >> 7) & 0x7F) as u8, (n & 0x7F) as u8]);
+        d.extend_from_slice(body);
+        d
+    };
+    let biggest = units.iter().map(|u| u.len()).max().unwrap_or(0) as u32;
+    let max_bitrate = (biggest as u64 * 8 * sample_rate as u64 / 1024).max(avg_bitrate as u64) as u32;
+    let mut dcd = alloc::vec![0x40u8, 0x15];
+    dcd.extend_from_slice(&biggest.to_be_bytes()[1..]);
+    dcd.u32b(max_bitrate);
+    dcd.u32b(avg_bitrate);
+    dcd.extend_from_slice(&desc(0x05, asc));
+    let mut es = alloc::vec![0u8, 0, 0]; // ES_ID 0, no dependence / URL / OCR
+    es.extend_from_slice(&desc(0x04, &dcd));
+    es.extend_from_slice(&desc(0x06, &[0x02]));
+    let mut config = alloc::vec![0u8; 4]; // the full-box version and flags
+    config.extend_from_slice(&desc(0x03, &es));
+    let spec = TrackSpec {
+        id,
+        kind: TrackKind::Audio,
+        fourcc: *b"mp4a",
+        config_box: Some(*b"esds"),
+        codec_id: "A_AAC",
+        config,
+        timescale: sample_rate,
+        width: 0,
+        height: 0,
+        sample_rate,
+        channels,
+        bit_depth: 16,
+        default_duration_ns: 0,
+    };
+    let samples = units
+        .into_iter()
+        .enumerate()
+        .map(|(i, data)| SampleSpec { data, dts: i as i64 * 1024, pts: i as i64 * 1024, duration: 1024, keyframe: true })
+        .collect();
+    MediaTrack { spec, samples }
+}
+
+/// The [`Mp4Extras::edit_lists`] entry of an [`mp4a_track`]: skip `priming` media samples, present `frames` (in the
+/// default movie timescale, 1000).
+pub fn mp4a_edit_list(id: u32, sample_rate: u32, priming: u32, frames: u64) -> (u32, Vec<(u32, i64, i32)>) {
+    let seg = (frames as u128 * 1000 / sample_rate.max(1) as u128) as u32;
+    (id, alloc::vec![(seg, priming as i64, 0x0001_0000)])
+}
+
 #[cfg(test)]
 mod tests {
     /// SWAPBACKVPLAY (rmbp-ledger B956): the stand-in's pixels, pinned. FNV-1a 64 of `test_pattern_rgba(64, 48, n)`,
@@ -1252,6 +1308,28 @@ mod tests {
         assert_eq!(fnv(&super::test_pattern_rgba(64, 48, 1)), 0xdb29_ef26_80d9_5484);
         for n in [0u32, 1, 42, 999_999] {
             assert_eq!(super::test_pattern_counter(&super::test_pattern_rgba(64, 48, n), 64, 48), Some(n));
+        }
+    }
+
+    /// NLE6EXPORTAAC (rmbp-ledger B960): the `mp4a` / `esds` track and its priming edit read back through the demuxer.
+    #[test]
+    fn mp4a_track_round_trip() {
+        use alloc::vec;
+        let asc = [0x11u8, 0x90];
+        let units: alloc::vec::Vec<alloc::vec::Vec<u8>> = (0..5u8).map(|i| vec![0x21, i, 0x40]).collect();
+        let t = super::mp4a_track(1, 48000, 2, &asc, units.clone(), 128000);
+        let x = super::Mp4Extras { edit_lists: vec![super::mp4a_edit_list(1, 48000, 1024, 3000)], ..Default::default() };
+        let mp4 = super::mp4_with(&[t], &super::Mp4Options::default(), &x);
+        let d = crate::Demuxer::open(mp4).unwrap();
+        let tr = &d.tracks()[0];
+        assert_eq!(tr.codec, crate::Codec::Aac);
+        assert_eq!(tr.config, asc.to_vec());
+        assert_eq!((tr.sample_rate, tr.channels), (48000, 2));
+        assert_eq!(tr.edit.map(|e| e.media_time), Some(1024));
+        let got: alloc::vec::Vec<_> = d.track_samples(0).map(|s| (s.dts, s.duration, d.packet_at(s).data)).collect();
+        assert_eq!(got.len(), 5);
+        for (i, (dts, dur, data)) in got.into_iter().enumerate() {
+            assert_eq!((dts, dur, data), (i as i64 * 1024, 1024, units[i].clone()));
         }
     }
 }
@@ -1381,20 +1459,20 @@ impl<S: Sink> Mp4Stream<S> {
         self.video_bytes
     }
 
-    /// Write the `moov` at the end and patch the mdat's size; the sink and the file's length.
-    pub fn finish(mut self, opts: &Mp4Options) -> Result<(S, u64), S::Error> {
+    /// Write the `moov` at the end and patch the mdat's size; the sink and the file's length. `x` is what [`mp4_with`] takes
+    /// (NLE6EXPORTAAC rmbp-ledger B960: the AAC track's priming edit list), so the one-shot and the stream write one moov.
+    pub fn finish(mut self, opts: &Mp4Options, x: &Mp4Extras) -> Result<(S, u64), S::Error> {
         let movie_ts = if opts.movie_timescale == 0 { 1000 } else { opts.movie_timescale };
         let mut o = opts.clone();
         o.chunk = 1;
         o.co64 = opts.co64 || self.end > u32::MAX as u64;
-        let x = Mp4Extras::default();
         let built: Vec<(MediaTrack, Vec<u32>, Vec<u64>)> =
             core::mem::take(&mut self.tracks).into_iter().map(|t| (MediaTrack { spec: t.spec, samples: t.samples }, t.sizes, t.offsets)).collect();
         let next_id = built.iter().map(|(t, _, _)| t.spec.id).max().unwrap_or(0) + 1;
         let movie_dur = built.iter().map(|(t, _, _)| track_duration(t) * movie_ts as u64 / t.spec.timescale.max(1) as u64).max().unwrap_or(0);
         let mut m = mvhd(movie_ts, movie_dur, next_id);
         for (t, sizes, offsets) in &built {
-            m.extend_from_slice(&trak(t, &o, &x, movie_ts, &offsets[..], true, Some(&sizes[..])));
+            m.extend_from_slice(&trak(t, &o, x, movie_ts, &offsets[..], true, Some(&sizes[..])));
         }
         let moov = bx(b"moov", &m);
         self.sink.write_at(self.end, &moov)?;
@@ -1478,7 +1556,7 @@ mod stream_kats {
                 st.push(i, s).unwrap();
             }
         }
-        let (file, n) = st.finish(&Mp4Options::default()).unwrap();
+        let (file, n) = st.finish(&Mp4Options::default(), &Mp4Extras::default()).unwrap();
         assert_eq!(n as usize, file.len());
         let (da, db) = (crate::Demuxer::open(one.clone()).unwrap(), crate::Demuxer::open(file.clone()).unwrap());
         assert_eq!(da.tracks().len(), 2);
@@ -1810,11 +1888,18 @@ impl<S: Sink> MuxStream<S> {
         }
     }
 
-    /// [`Mp4Stream::finish`] with `opts`, or [`MkvStream::finish`] (which takes none).
-    pub fn finish(self, opts: &Mp4Options) -> Result<(S, u64), S::Error> {
+    /// [`Mp4Stream::finish`] with `opts` and `x`, or [`MkvStream::finish`] (which takes neither: [`mkv_refuses_extras`]
+    /// refuses a non-empty edit list by name — the AAC priming has no Matroska form here — and the other extras are MP4's).
+    pub fn finish(self, opts: &Mp4Options, x: &Mp4Extras) -> Result<(S, u64), S::Error>
+    where
+        S::Error: From<alloc::string::String>,
+    {
         match self {
-            MuxStream::Mp4(m) => m.finish(opts),
-            MuxStream::Mkv(m) => m.finish(),
+            MuxStream::Mp4(m) => m.finish(opts, x),
+            MuxStream::Mkv(m) => {
+                mkv_refuses_extras(x)?;
+                m.finish()
+            }
         }
     }
 }
@@ -1824,12 +1909,23 @@ fn never(e: core::convert::Infallible) -> alloc::string::String {
     match e {}
 }
 
-/// NLE6EXPORTMKV (B966): the one-shot file of `tracks` in container `c`: MP4 = [`mp4`] with the default options (the bytes
-/// Stria's export wrote before), Matroska = an [`MkvStream`] fed in decode order. Refused: a codec Matroska does not write.
-pub fn mux(tracks: &[MediaTrack], c: Container) -> Result<Vec<u8>, alloc::string::String> {
-    if c == Container::Mp4 {
-        return Ok(mp4(tracks, &Mp4Options::default()));
+/// NLE6EXPORTMKV (B966): an [`Mp4Extras`] edit list under Matroska, refused by name (the AAC priming's Matroska form is
+/// CodecDelay: NLE6EXPORTMKV-AACDELAY owed). The other extras (sidx, mfra, sdtp, colour) are MP4 boxes and are not read.
+fn mkv_refuses_extras(x: &Mp4Extras) -> Result<(), alloc::string::String> {
+    match x.edit_lists.iter().find(|(_, l)| !l.is_empty()) {
+        Some((id, _)) => Err(alloc::format!("track {}: an edit list (the AAC priming) has no Matroska form here (CodecDelay owed)", id)),
+        None => Ok(()),
     }
+}
+
+/// NLE6EXPORTMKV (B966): the one-shot file of `tracks` in container `c`: MP4 = [`mp4_with`] with the default options and
+/// `x` (the bytes Stria's export wrote before), Matroska = an [`MkvStream`] fed in decode order. Refused: a codec Matroska
+/// does not write, or an edit list in `x` under Matroska ([`mkv_refuses_extras`]).
+pub fn mux(tracks: &[MediaTrack], c: Container, x: &Mp4Extras) -> Result<Vec<u8>, alloc::string::String> {
+    if c == Container::Mp4 {
+        return Ok(mp4_with(tracks, &Mp4Options::default(), x));
+    }
+    mkv_refuses_extras(x)?;
     let mut st = MkvStream::begin(Vec::new()).map_err(never)?;
     let ids = tracks.iter().map(|t| st.track(t.spec.clone())).collect::<Result<Vec<usize>, _>>()?;
     for (i, k) in decode_order(tracks) {
@@ -1873,7 +1969,8 @@ mod mkv_stream_kats {
     #[test]
     fn mkv_round_trip() {
         let t = tracks();
-        let (m4, mk) = (mux(&t, Container::Mp4).unwrap(), mux(&t, Container::Mkv).unwrap());
+        let none = Mp4Extras::default();
+        let (m4, mk) = (mux(&t, Container::Mp4, &none).unwrap(), mux(&t, Container::Mkv, &none).unwrap());
         assert_eq!(m4, mp4(&t, &Mp4Options::default()));
         let (da, db) = (crate::Demuxer::open(m4).unwrap(), crate::Demuxer::open(mk.clone()).unwrap());
         assert_eq!(db.format(), crate::Format::Matroska);
@@ -1898,14 +1995,14 @@ mod mkv_stream_kats {
         assert_eq!(n as usize, file.len());
         assert_eq!(file, mk, "the streamed file is the one-shot's bytes");
 
-        let mut st = MuxStream::begin(Container::Mkv, Vec::new()).unwrap();
+        let mut st = MkvStream::begin(Vec::new()).unwrap();
         for x in &t {
             let i = st.track(x.spec.clone()).unwrap();
             for s in &x.samples {
                 st.push(i, s.clone()).unwrap();
             }
         }
-        let (late, _) = st.finish(&Mp4Options::default()).unwrap();
+        let (late, _) = st.finish().unwrap();
         let dc = crate::Demuxer::open(late).unwrap();
         for i in 0..2 {
             same(&rows(&db, i), &rows(&dc, i));
@@ -1924,5 +2021,22 @@ mod mkv_stream_kats {
         assert_eq!(Container::of("movie.mp4"), Some(Container::Mp4));
         assert_eq!(Container::of("movie.mov"), None);
         assert_eq!(Container::of(".mkv"), None);
+    }
+
+    /// NLE6EXPORTMKV (B966): an `mp4a` track ([`mp4a_track`], its config the whole `esds` body) is `A_AAC` with the bare
+    /// AudioSpecificConfig as CodecPrivate; its priming edit list is refused under Matroska by name and kept under MP4.
+    #[test]
+    fn mkv_aac_track_and_its_edit_list() {
+        let asc = [0x11u8, 0x90];
+        let aac = mp4a_track(2, 48_000, 2, &asc, vec![vec![0x21, 0x10, 0x04]; 4], 128_000);
+        let mk = mux(&[aac.clone()], Container::Mkv, &Mp4Extras::default()).unwrap();
+        let d = crate::Demuxer::open(mk).unwrap();
+        assert_eq!(d.tracks()[0].codec, crate::Codec::Aac);
+        assert_eq!(d.tracks()[0].config, asc.to_vec(), "CodecPrivate is the ASC");
+        assert_eq!(d.track_samples(0).count(), 4);
+        let x = Mp4Extras { edit_lists: vec![mp4a_edit_list(2, 48_000, 1024, 3 * 1024)], ..Mp4Extras::default() };
+        let e = mux(&[aac.clone()], Container::Mkv, &x).unwrap_err();
+        assert!(e.starts_with("track 2:"), "{}", e);
+        assert_eq!(mux(&[aac.clone()], Container::Mp4, &x).unwrap(), mp4_with(&[aac], &Mp4Options::default(), &x));
     }
 }

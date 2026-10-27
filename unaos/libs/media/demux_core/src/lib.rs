@@ -871,3 +871,19 @@ impl Demuxer {
         Some((b >> 1) & 0x3F)
     }
 }
+
+// AV1INBANDCOLOUR (LEDGER SR366): a track's first sample, read at open by `Demuxer::fill_colour` (an AV1 track whose av1C has
+// no configOBUs states its colour in the first temporal unit's sequence header).
+impl Demuxer {
+    /// AV1INBANDCOLOUR (SR366): the track's first sample in decode order as a slice of the file (no copy, no `frame_prefix`,
+    /// as [`Demuxer::sample_data`]): from the loaded table, else, on an indexed open whose window holds none of it, from the
+    /// first span read through `read_span` — the window and the cursor do not move. `None` when the track has no sample there.
+    pub fn first_sample(&self, track_index: usize) -> Option<&[u8]> {
+        let s = match self.order.iter().find(|s| s.track_index == track_index) {
+            Some(s) => *s,
+            None if self.lazy.is_some() => *self.read_span(0).ok()?.get(track_index)?.first()?,
+            None => return None,
+        };
+        Some(self.sample_data(&s)).filter(|b| !b.is_empty())
+    }
+}

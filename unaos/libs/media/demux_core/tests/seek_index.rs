@@ -534,7 +534,7 @@ use demux_core::colour::{Colour, Light, Mastering};
 
 /// The test's mirror of the caller's dispatch (as [`avc_depth`] is for the reorder depth): the codec core's colour reading
 /// of a video track's configuration, for `Demuxer::fill_colour`.
-fn colour_of(t: &demux_core::Track) -> Option<Colour> {
+fn colour_of(t: &demux_core::Track, first: &[u8]) -> Option<Colour> {
     match t.codec {
         Codec::Avc => {
             let s = h264_core::ps::avcc_sps(&t.config)?;
@@ -550,27 +550,7 @@ fn colour_of(t: &demux_core::Track) -> Option<Colour> {
                 light: None,
             })
         }
-        Codec::Av1 => {
-            let (cc, meta) = av1_core::image::av1c_colour(&t.config)?;
-            let mut c = Colour {
-                primaries: cc.color_primaries,
-                transfer: cc.transfer_characteristics,
-                matrix: cc.matrix_coefficients,
-                full_range: Some(cc.color_range),
-                mastering: None,
-                light: None,
-            };
-            for m in meta {
-                match m {
-                    av1_core::obu::Metadata::Cll { max_cll, max_fall } => c.light = Some(Light { max_cll, max_fall }),
-                    av1_core::obu::Metadata::Mdcv { primaries, white, luminance_max, luminance_min } => {
-                        c.mastering = Some(Mastering::from_av1(primaries, white, luminance_max, luminance_min))
-                    }
-                    av1_core::obu::Metadata::Other(_) => {}
-                }
-            }
-            Some(c)
-        }
+        Codec::Av1 => av1_core::image::stream_codes(&t.config, first).map(|(c, l, m)| Colour::from_av1(c, l, m)), // AV1INBANDCOLOUR (SR366): the production reading
         _ => None,
     }
 }
@@ -703,4 +683,80 @@ fn hdr_av1_metadata_obus_fill_mastering_and_light() {
     assert_eq!((c.primaries, c.transfer, c.matrix, c.full_range), (2, 2, 2, Some(false)), "no color_description: unspecified");
     assert_eq!(c.to_string(), "colour=2/2/2/limited mdcv clli");
     assert_eq!(av1_core::image::av1c_reorder_depth(&av1c_with_hdr_metadata()), Some(0), "the metadata OBUs leave the depth read alone");
+}
+
+// ----- AV1INBANDCOLOUR (LEDGER SR366): an av1C without configOBUs takes the first sample's in-band sequence header -----
+
+/// A reduced profile-0 8-bit 4:2:0 sequence header payload stating BT.709 primaries / transfer, the BT.601 matrix, full range.
+fn inband_seq_payload() -> Vec<u8> {
+    let mut b = Bits::new();
+    b.u(0, 3); // seq_profile
+    b.bit(1); // still_picture
+    b.bit(1); // reduced_still_picture_header
+    b.u(0, 5); // seq_level_idx[0]
+    b.u(7, 4); // frame_width_bits_minus_1
+    b.u(7, 4); // frame_height_bits_minus_1
+    b.u(63, 8); // max_frame_width_minus_1
+    b.u(47, 8); // max_frame_height_minus_1
+    for _ in 0..6 {
+        b.bit(0); // 128x128, filter_intra, intra_edge, superres, cdef, restoration
+    }
+    b.bit(0); // high_bitdepth
+    b.bit(0); // mono_chrome
+    b.bit(1); // color_description_present_flag
+    b.u(1, 8); // color_primaries
+    b.u(1, 8); // transfer_characteristics
+    b.u(6, 8); // matrix_coefficients
+    b.bit(1); // color_range
+    b.u(0, 2); // chroma_sample_position
+    b.bit(0); // separate_uv_delta_q
+    b.bit(0); // film_grain_params_present
+    b.trailing()
+}
+
+/// A temporal unit as an MP4 / Matroska sample holds it: temporal delimiter, the sequence header, a padding OBU.
+fn inband_tu() -> Vec<u8> {
+    let seq = inband_seq_payload();
+    let mut tu = vec![(2 << 3) | 0x02, 0];
+    tu.extend_from_slice(&[(1 << 3) | 0x02, seq.len() as u8]);
+    tu.extend_from_slice(&seq);
+    tu.extend_from_slice(&[(15 << 3) | 0x02, 2, 0xAA, 0x55]);
+    tu
+}
+
+fn inband_track(config: Vec<u8>) -> MediaTrack {
+    bframe_mp4_track(&[0, 1, 2, 3], &[0], *b"av01", *b"av1C", config, &|i| if i == 0 { inband_tu() } else { vec![0x12, 0, i as u8] })
+}
+
+#[test]
+fn av1inband_no_config_obus_fills_from_the_first_sample() {
+    let bare = vec![0x81, 0x00, 0x0C, 0x00];
+    let inband = Colour { primaries: 1, transfer: 1, matrix: 6, full_range: Some(true), mastering: None, light: None };
+    let mp4 = build::mp4_with(&[inband_track(bare.clone())], &Mp4Options::default(), &Mp4Extras::default());
+    let mkv = build::mkv(&[inband_track(bare.clone())], &MkvOptions::default());
+    for file in [mp4, mkv] {
+        let mut d = Demuxer::open(file).unwrap();
+        assert_eq!(d.first_sample(0), Some(inband_tu().as_slice()), "the first sample in decode order, as a slice of the file");
+        assert_eq!(d.tracks()[0].colour, None, "the container says nothing");
+        assert_eq!(d.fill_colour(colour_of), 1);
+        assert_eq!(d.tracks()[0].colour, Some(inband), "the in-band sequence header fills it");
+        assert_eq!(d.fill_colour(colour_of), 0);
+    }
+    // The container's colour wins over the in-band header.
+    let x = Mp4Extras { colour: vec![(1, bt709_limited())], ..Default::default() };
+    let mut d = Demuxer::open(build::mp4_with(&[inband_track(bare.clone())], &Mp4Options::default(), &x)).unwrap();
+    assert_eq!(d.fill_colour(colour_of), 0);
+    assert_eq!(d.tracks()[0].colour, Some(bt709_limited()));
+    // An indexed open reads the first span for it and leaves the window empty.
+    let cued = build::mkv(&[inband_track(bare.clone())], &MkvOptions { cues: true, ..Default::default() });
+    let mut idx = Demuxer::open_indexed(cued).unwrap();
+    assert!(idx.indexed() && idx.samples().is_empty());
+    assert_eq!(idx.fill_colour(colour_of), 1);
+    assert_eq!(idx.tracks()[0].colour, Some(inband));
+    assert!(idx.samples().is_empty(), "the window did not move");
+    // configOBUs present: their reading, as before (the in-band header is not consulted).
+    let mut d = Demuxer::open(build::mkv(&[inband_track(av1c_with_hdr_metadata())], &MkvOptions::default())).unwrap();
+    assert_eq!(d.fill_colour(colour_of), 1);
+    assert_eq!(d.tracks()[0].colour.unwrap().to_string(), "colour=2/2/2/limited mdcv clli");
+    assert_eq!(av1_core::image::av1c_codes(&bare), None);
 }

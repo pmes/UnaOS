@@ -8,7 +8,7 @@
 //! frame-to-encoder glue Stria's host `H264Encoder` drives too) and demux_core's `build::mp4` — never a second encoder,
 //! renderer or mixer.
 //!
-//! * ONE RENDER PATH: `nle export <edl> <out.mp4>` arms an [`Exp`] and starts vplay's EDL job on the EDL ([`start`]). The
+//! * ONE RENDER PATH: `nle export <edl> <out.mp4|out.mkv>` arms an [`Exp`] and starts vplay's EDL job on the EDL ([`start`]). The
 //!   job's schedule loop (`vplay::edl_run`) asks [`sink`] per video step: [`Sink::Encode`] hands the step's frame (RGBA, by
 //!   vplay's `unpack`) to [`frame`] instead of the queue (`room` + `push_back`); nothing is presented. The frame is the one
 //!   the Player would have shown: the same decode, the same transition mix.
@@ -17,12 +17,14 @@
 //!   OFFLINE `audio::mixer::Mix` — the mixer's own engine (per-frame ramps, `align`, the Sinc ingest, `period`) — pumped as
 //!   an infinitely fast sink (after every write / end / state: `period` while `ready`, each period appended to the
 //!   capture). snd's feed, crossfade and drain run unchanged; the capture is 48 kHz stereo PCM16, the mixer's own format.
-//! * THE FILE (NLE6EXPORTONE, rmbp-ledger B963): ONE `build::Mp4Stream` (ftyp, the mdat, the moov at the end). The `avc1`
+//! * THE FILE (NLE6EXPORTONE, rmbp-ledger B963): ONE `build::MuxStream` (NLE6EXPORTMKV B966: the out path's extension picks `build::Mp4Stream` — ftyp, the mdat, the moov at the end — or `build::MkvStream`). The `avc1`
 //!   track is `build::coded_video_spec` (the constructor Stria's `video_track` uses too); each unit is written to the file as
 //!   [`frame`] gets it (`build::coded_video_sample`: its (dts, pts) x the tick, so B pictures write `ctts`), so the export
 //!   holds no more than the encoder's reorder window. At [`finish`] (after the job's sound closed) the flush's units, then,
-//!   when sound was captured, a `sowt` PCM16 track (`build::pcm16_track`) cut to the video's length (an AAC encoder is
-//!   owed: NLE6EXPORT-AAC), then the moov. Written as the shell writes (`write_veto` at start, the kernel principal) through
+//!   when sound was captured, a `sowt` PCM16 track (`build::pcm16_track`) cut to the video's length — or, under `--aac KBPS`
+//!   ([`Opts::aac_kbps`], NLE6EXPORTAAC rmbp-ledger B960), the same cut PCM through audio_core's `aac::enc::Encoder` (Stria's
+//!   host export's one encoder) as an `mp4a` track (`build::mp4a_track`) pushed through the same stream, its priming
+//!   trimmed by `build::mp4a_edit_list` in the extras `Mp4Stream::finish` takes ([`audio_track`]) — then the moov. Written as the shell writes (`write_veto` at start, the kernel principal) through
 //!   the ONE VFS writer, `MountTable::put_file` / `write_all_at`; a refused, failed or superseded export unlinks its
 //!   partial file. `--bitrate KBPS` is h264enc_core's `Config.rate` (CBR), the field Stria's `with_bitrate` sets.
 //! * LOCKS: [`ENC`] (the armed export) is a leaf; [`frame`] TAKES the export out of it and encodes with no lock held (a
@@ -32,9 +34,11 @@
 //!   `vplay::finished` cannot say it: a superseded job ends with neither eos nor an error).
 //!
 //! Wire: `[nle] export start edl= out= qp= gop= bframes= bitrate= jid=` · `[nle] export progress pct=<10..100> frames=<n>/<total>` ·
-//! `[nle] export frames=<n> bytes=<n> ms=<n> audio=<mixed>/<target> bframes=<n> out=<p>` · `[nle] export refused why=<w> (<reason>)`.
-//! The witness is player.rs `tests nle` (`export=` on `:: NLE: … ::`). Owed: the Pi budget, a progress UI on the kernel
-//! face, MKV, AAC, the sound streamed too (NLE6EXPORT-STREAMPCM: the capture's PCM is held whole until [`finish`]).
+//! `[nle] export frames=<n> bytes=<n> ms=<n> audio=<mixed>/<target> bframes=<n> out=<p>` · `[nle] export refused why=<w> (<reason>)`
+//! · NLE6EXPORTAAC: `[nle] export audio=aac bytes=<n> units=<n> kbps=<k>` (before the `frames=` line).
+//! The witness is player.rs `tests nle` (`export=` on `:: NLE: … ::`; the AAC leg's `[nle] fixture export audio=aac`).
+//! Owed: the Pi budget, a progress UI on the kernel face, the AAC priming under .mkv (refused by name: CodecDelay owed), the sound streamed too (NLE6EXPORT-STREAMPCM: the
+//! capture's PCM is held whole until [`finish`], and the AAC encode runs on it there).
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -54,11 +58,13 @@ pub struct Opts {
     pub bframes: u8,
     /// A constant bit rate in kbit/s (h264enc_core's `Config.rate`, CBR; `qp` its starting QP); 0 = constant QP.
     pub bitrate: u32,
+    /// NLE6EXPORTAAC (rmbp-ledger B960): the sound as AAC-LC at this many kb/s; 0 = PCM16 `sowt` (the default).
+    pub aac_kbps: u32,
 }
 
 impl Default for Opts {
     fn default() -> Opts {
-        Opts { qp: 26, gop: 0, bframes: 0, bitrate: 0 }
+        Opts { qp: 26, gop: 0, bframes: 0, bitrate: 0, aac_kbps: 0 }
     }
 }
 
@@ -107,7 +113,7 @@ struct Exp {
 static ENC: crate::sync::Mutex<Option<Exp>> = crate::sync::Mutex::new(None);
 static LAST: crate::sync::Mutex<Option<(u32, Report)>> = crate::sync::Mutex::new(None);
 
-/// **Export `edl` to `out` (an `.mp4`)**: arm the exporter and start vplay's EDL job on it; the job id. The export runs on
+/// **Export `edl` to `out` (an `.mp4` or an `.mkv`: `build::Container::of`)**: arm the exporter and start vplay's EDL job on it; the job id. The export runs on
 /// the job's worker core; [`report`] answers once it has finished.
 pub fn start(edl: &str, out: &str, opts: Opts) -> Result<u32, String> {
     if !super::vplay::is_edl(edl) {
@@ -241,13 +247,16 @@ impl Exp {
         }
         let mut tracks: Vec<build::MediaTrack> = Vec::new();
         let mut rep = Report { frames: self.frames, bframes: self.opts.bframes, out: self.out.clone(), ..Report::default() };
+        let mut extras = build::Mp4Extras::default(); // NLE6EXPORTAAC (rmbp-ledger B960): the AAC track's priming edit; empty for PCM16
         if let Some((mut pcm, rate)) = pcm.filter(|(p, _)| !p.is_empty()) {
             let target = (self.tb.to_ns(self.total as i64).max(0) as u128 * rate as u128 / 1_000_000_000) as u64;
             rep.audio_mixed = (pcm.len() / 2) as u64;
             rep.audio_target = target;
             rep.audio = true;
             pcm.resize(target as usize * 2, 0);
-            tracks.push(build::pcm16_track(2, rate, 2, &pcm, 1024));
+            let (track, edit) = audio_track(&pcm, rate, self.opts.aac_kbps)?;
+            tracks.push(track);
+            extras.edit_lists.extend(edit);
         }
         let Some(mut st) = self.stream.take() else { return Err(("no-frames", String::from("the EDL encoded no frame"))) };
         for t in tracks {
@@ -257,7 +266,7 @@ impl Exp {
             }
         }
         rep.video_bytes = st.video_bytes();
-        let (_, len) = st.finish(&build::Mp4Options::default()).map_err(|e| ("write-refused", e))?;
+        let (_, len) = st.finish(&build::Mp4Options::default(), &extras).map_err(|e| ("write-refused", e))?;
         rep.bytes = len;
         rep.ms = crate::arch::ms().saturating_sub(self.t0);
         *LAST.lock() = Some((self.jid, rep.clone()));
@@ -297,9 +306,9 @@ pub(crate) fn write_file(path: &str, body: &[u8]) -> Result<u64, String> {
     crate::shell::vfs_mount_table().put_file(path, body, crate::fs::vfs::KERNEL_PRINCIPAL).map(|n| n as u64).map_err(|e| alloc::format!("write {}: {:?}", path, e))
 }
 
-/// `nle export <edl> <out.mp4> [--qp N] [--gop N] [--bframes N] [--bitrate KBPS]`: arm and start; the job prints the progress and the end.
+/// `nle export <edl> <out.mp4|out.mkv> [--qp N] [--gop N] [--bframes N] [--bitrate KBPS] [--aac KBPS]`: arm and start; the job prints the progress and the end.
 pub fn shell_verb(args: &[&str], console: &mut crate::console::Console) {
-    const USAGE: &str = "usage: nle export <edl> <out.mp4> [--qp N] [--gop N] [--bframes N] [--bitrate KBPS]";
+    const USAGE: &str = "usage: nle export <edl> <out.mp4|out.mkv> [--qp N] [--gop N] [--bframes N] [--bitrate KBPS] [--aac KBPS]";
     if args.first().copied() != Some("export") || args.len() < 3 {
         console.println(USAGE);
         return;
@@ -313,6 +322,7 @@ pub fn shell_verb(args: &[&str], console: &mut crate::console::Console) {
             ("--gop", Some(n)) => o.gop = n,
             ("--bframes", Some(n)) => o.bframes = n.min(255) as u8,
             ("--bitrate", Some(n)) => o.bitrate = n,
+            ("--aac", Some(n)) => o.aac_kbps = n,
             _ => {
                 console.println(USAGE);
                 return;
@@ -453,4 +463,23 @@ impl build::Sink for VfsOut {
             .map(|_| ())
             .map_err(|e| alloc::format!("write {} at {}: {:?}", self.path, off, e))
     }
+}
+
+/// NLE6EXPORTAAC (rmbp-ledger B960): the captured sound's track (track 2, stereo at `rate`, already cut to the video): PCM16
+/// `sowt` when `aac_kbps` is 0, else AAC-LC through audio_core's `aac::enc::Encoder` (the encoder Stria's host export
+/// takes) as `build::mp4a_track` with its priming edit (`build::mp4a_edit_list`, for `Mp4Stream::finish`'s extras). Runs
+/// in [`Exp::write`], no lock held.
+fn audio_track(pcm: &[i16], rate: u32, aac_kbps: u32) -> Result<(build::MediaTrack, Option<(u32, Vec<(u32, i64, i32)>)>), (&'static str, String)> {
+    if aac_kbps == 0 {
+        return Ok((build::pcm16_track(2, rate, 2, pcm, 1024), None));
+    }
+    use audio_core::aac::enc::{Encoder, PRIMING};
+    let bps = aac_kbps.saturating_mul(1000);
+    let mut enc = Encoder::new(rate, 2, bps).map_err(|e| ("aac-refused", alloc::format!("{:?}", e)))?;
+    let mut units = enc.encode(pcm);
+    units.extend(enc.flush());
+    let (n, bytes) = (units.len(), units.iter().map(|u| u.data.len()).sum::<usize>());
+    serial_println!("[nle] export audio=aac bytes={} units={} kbps={}", bytes, n, aac_kbps);
+    let track = build::mp4a_track(2, rate, 2, &enc.asc(), units.into_iter().map(|u| u.data).collect(), bps);
+    Ok((track, Some(build::mp4a_edit_list(2, rate, PRIMING, (pcm.len() / 2) as u64))))
 }

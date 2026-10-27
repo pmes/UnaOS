@@ -176,6 +176,49 @@ fn mp4_audio_round_trip() {
     assert_eq!(got, want_pcm(&tl, &src));
 }
 
+/// NLE6EXPORTAAC (rmbp-ledger B960): `AudioOut::Aac` writes `audio.mp4` with one `mp4a` AAC-LC track: the ASC is LC
+/// mono at 48 kHz, the edit list skips the encoder's 1024-sample priming, every sample decodes through audio_core's
+/// decoder (`gneiss_pal::dsp::audio::aac`), and the decoded sound after the priming tracks the render's samples (the
+/// synthetic sawtooth at 128 kb/s: 34.2 dB measured, 67 units, 7325 bytes; the floor 30 dB).
+#[test]
+fn aac_audio_round_trip() {
+    use gneiss_pal::dsp::audio::aac::{AacDecoder, Asc};
+    use gneiss_pal::dsp::audio::bits::BitReader;
+    const SNR_FLOOR: f64 = 30.0;
+    let tl = timeline();
+    let src = sources(&tl);
+    let dir = fresh("aac");
+    let r = export(&tl, 0..TICKS, &src, &dir, Box::new(RawSequence), AudioOut::Aac(128)).unwrap();
+    assert_eq!((r.files, r.pcm_frames), (3, 35 * PER as u64));
+    let mp4 = std::fs::read(dir.join("audio.mp4")).unwrap();
+    assert_eq!(r.bytes, std::fs::metadata(dir.join("video.rgba")).unwrap().len() + std::fs::metadata(dir.join("video.json")).unwrap().len() + mp4.len() as u64);
+    let d = Demuxer::open(mp4).unwrap();
+    assert_eq!(d.tracks().len(), 1);
+    let t = &d.tracks()[0];
+    assert_eq!((t.kind, t.codec.clone(), t.sample_rate, t.channels), (TrackKind::Audio, Codec::Aac, SYNTH_RATE, 1));
+    assert_eq!(t.config, vec![0x11, 0x88]);
+    assert_eq!(t.edit.map(|e| e.media_time), Some(1024));
+    let asc = Asc::parse(&t.config).unwrap();
+    let mut dec = AacDecoder::new(asc.sf_index, asc.layout().unwrap()).unwrap();
+    let want = want_pcm(&tl, &src);
+    let units: Vec<Vec<u8>> = d.track_samples(0).map(|s| d.packet_at(s).data).collect();
+    assert_eq!(units.len(), want.len().div_ceil(1024) + 1);
+    let mut got = Vec::new();
+    for u in &units {
+        dec.decode_block(&mut BitReader::new(u), 0).unwrap();
+        got.extend(dec.out[0].iter().map(|&v| v as f64 * 32768.0));
+    }
+    let (mut s, mut n) = (0f64, 0f64);
+    for (i, &w) in want.iter().enumerate() {
+        let e = w as f64 - got[i + 1024];
+        s += w as f64 * w as f64;
+        n += e * e;
+    }
+    let snr = 10.0 * (s / n.max(1e-9)).log10();
+    println!("aac_audio_round_trip: units={} bytes={} snr={snr:.1} dB", units.len(), units.iter().map(|u| u.len()).sum::<usize>());
+    assert!(snr >= SNR_FLOOR, "SNR {snr:.1} dB");
+}
+
 /// NLE5B: a fresh H264ENC encoder over the render's frames (the same converter and config): its samples, its avcC and
 /// its reconstruction per frame.
 fn fresh_h264(frames: &[Vec<u8>], gop: u32) -> (Vec<Vec<u8>>, Vec<u8>, Vec<[Vec<u8>; 3]>, Vec<I420>) {

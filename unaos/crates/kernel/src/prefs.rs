@@ -193,20 +193,7 @@ fn read_all(p: &str) -> Option<Vec<u8>> {
 }
 
 fn write_all(p: &str, b: &[u8]) -> Result<(), String> {
-    use crate::fs::vfs::NodeKind;
-    let mt = store_mt();
-    let k = crate::fs::vfs::KERNEL_PRINCIPAL;
-    let _ = mt.unlink(p, k);
-    mt.create(p, NodeKind::File, k).map_err(|e| alloc::format!("create {}: {:?}", p, e))?;
-    let mut off = 0usize;
-    while off < b.len() {
-        let w = mt.write(p, off as u64, &b[off..], k).map_err(|e| alloc::format!("write {}: {:?}", p, e))?;
-        if w == 0 {
-            return Err(alloc::format!("write {}: zero", p));
-        }
-        off += w;
-    }
-    Ok(())
+    store_mt().put_file(p, b, crate::fs::vfs::KERNEL_PRINCIPAL).map(|_| ()).map_err(|e| alloc::format!("write {}: {:?}", p, e)) // VFSPUTONE (rmbp-ledger B964): prefs' binding (its store, its String error) on the ONE VFS whole-file writer
 }
 
 /// `<home>/settings` — a plain folder in the home (R98: no link, no dot).

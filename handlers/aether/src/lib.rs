@@ -859,7 +859,7 @@ impl AetherEngine {
                     .map(|h| (h as f64 - self.height as f64).max(0.0))
                     .unwrap_or(f64::MAX);
                 let max_scroll = self.pdf.as_ref().map_or(max_scroll, |p| p.max_scroll(self.height as f64)); // PDF4 (SR324)
-                self.scroll_y = (self.scroll_y + dy).clamp(0.0, max_scroll);
+                self.scroll_y = (self.scroll_y + dy).clamp(0.0, max_scroll); self.pdf_scroll_x(dx); // PDF4-HSCROLL (SR360): the clamp's x half on a PDF (pdf/mod.rs)
                 self.lazy_images_pass(); // AETHERMEDIA (SR107): loading=lazy images nearing the viewport
                 // Integer shift must equal the difference of the TRUNCATED
                 // positions the renderer will actually paint at — deriving it
@@ -890,7 +890,7 @@ impl AetherEngine {
                 }
             }
             api::events::Event::Resize(w, h) => {
-                self.width = w;
+                self.width = w; self.pdf_resized(); // PDF4-HSCROLL (SR360): the thumbnail strip's CSS width follows the zoom, scroll_x re-clamps
                 self.height = h;
                 self.surface = vec![255; (w * h * 4) as usize];
                 // Real reflow: media queries and wrap widths depend on the
@@ -1652,7 +1652,7 @@ impl AetherEngine {
     /// its channels swapped (quartzite's set_frame contract is RGBA) and, under zoom, resampled
     /// bilinearly from the CSS-size frame.
     pub fn present_rgba(&self) -> (u32, u32, Vec<u8>) {
-        if let Some(p) = &self.pdf { return p.present(self.device, self.zoom(), self.width as f64, self.scroll_y); } // PDF4 (SR324)
+        if let Some(p) = &self.pdf { return p.present(self.device, self.zoom(), self.width as f64, self.scroll_x, self.scroll_y); } // PDF4 (SR324)
         let (sw, sh) = (self.width as usize, self.height as usize);
         let (dw, dh) = (self.device.0 as usize, self.device.1 as usize);
         let src = &self.surface;

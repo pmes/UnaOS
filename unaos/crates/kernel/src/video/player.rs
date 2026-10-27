@@ -1399,7 +1399,7 @@ mod nle_fx {
         let kat = MIX_KAT.iter().filter(|k| rep.mixes.contains(*k)).count();
         let mix_ok = rep.mixed == 8 && rep.mix_refused == 0 && kat == MIX_KAT.len(); let mix_ok = mix_ok && face_verdict(&rep, face); // NLE6MIXFACE (rmbp-ledger B957): the fresh outgoing run and the seek preview (module tail)
         let colour = rep.coded.iter().filter(|k| **k == COLOUR_KAT).count(); // KERNELCOLOUR (B952): NLEFXC's middle frame by BT.709
-        let ok = open_ok && err.is_none() && ended && pres > 0 && !shown.is_empty() && agree == shown.len() && pres + drop == rep.frames && rep.seeks == seek_steps && mix_ok && colour == 1 && standin_ok(&rep); let (env_ok, env_word) = env_verdict(&env, &rep); let ok = ok && env_ok; let (exp_ok, exp_word) = export_verdict(dir); let ok = ok && exp_ok; let (key_ok, key_word) = keys_leg(dir, &put); let ok = ok && key_ok; // NLE6KEYS (rmbp-ledger B961): the editing keys through the key door (module tail). NLE6MIXAUDIO (rmbp-ledger B953): the dissolve's sound (module tail)
+        let ok = open_ok && err.is_none() && ended && pres > 0 && !shown.is_empty() && agree == shown.len() && pres + drop == rep.frames && rep.seeks == seek_steps && mix_ok && colour == 1 && standin_ok(&rep); let (env_ok, env_word) = env_verdict(&env, &rep); let ok = ok && env_ok; let (exp_ok, exp_word) = export_verdict(dir); let ok = ok && exp_ok; let (key_ok, key_word) = keys_leg(dir, &put); let ok = ok && key_ok; let aac_ok = export_aac_leg(dir); let ok = ok && aac_ok; // NLE6KEYS (rmbp-ledger B961): the editing keys through the key door (module tail). NLE6MIXAUDIO (rmbp-ledger B953): the dissolve's sound (module tail)
         serial_println!(
             "[nle] fixture edl={} presented={} dropped={} queued={} gaps={} seek_steps={} ms={}{}",
             path, pres, drop, rep.frames, rep.gaps, seek_steps, crate::arch::ms().saturating_sub(t0), err.map(|e| alloc::format!(" err={}", e)).unwrap_or_default()
@@ -1708,6 +1708,78 @@ mod nle_fx {
             path, edits, if plan_ok { "ok" } else { "FAIL" }, if saved_ok { "ok" } else { "FAIL" }, fnv, KEY_VIEW_KAT, if ok { "ok" } else { "FAIL" }
         );
         (ok, if ok { "ok" } else { "FAIL" })
+    }
+
+    // ── NLE6EXPORTAAC (rmbp-ledger B960): the same EDL exported with its sound as AAC-LC and the track decoded back ───────
+    // A second export of NLEFX.EDL (`--aac 128`, `<dir>/NLEFXA.MP4`) after the PCM16 one: the file's audio track must be
+    // demux_core's `Codec::Aac` at 48 kHz stereo with ceil(target / 1024) + 1 samples (the encoder's padded last block and
+    // its drain block), and every sample must decode through audio_core's `AacDecoder` (the kernel links the decoder
+    // Stria's host export is checked against) with sound in it. No audio module: nothing was captured, no second export.
+    fn export_aac_leg(dir: &str) -> bool {
+        use crate::video::export;
+        if cfg!(not(any(feature = "uvc", feature = "hda-tone"))) {
+            serial_println!("[nle] fixture export audio=aac skip(no-audio)");
+            return true;
+        }
+        let t0 = crate::arch::ms();
+        let (edl, out) = (alloc::format!("{}/NLEFX.EDL", dir), alloc::format!("{}/NLEFXA.MP4", dir));
+        let jid = match export::start(&edl, &out, export::Opts { aac_kbps: 128, ..export::Opts::default() }) {
+            Ok(j) => j,
+            Err(e) => {
+                serial_println!("[nle] fixture export audio=aac refused ({}) -> FAIL", e);
+                return false;
+            }
+        };
+        let rep = loop {
+            if let Some(r) = export::report(jid) {
+                break Some(r);
+            }
+            if crate::arch::ms().saturating_sub(t0) > 30_000 {
+                break None;
+            }
+            crate::arch::sched::sleep_ms(4);
+        };
+        let rep = match rep {
+            Some(r) if r.err.is_none() => r,
+            r => {
+                serial_println!("[nle] fixture export audio=aac out={} err={} -> FAIL", out, r.and_then(|r| r.err).unwrap_or_else(|| String::from("timeout")));
+                return false;
+            }
+        };
+        let d = match vplay::read_all(&out).and_then(|b| demux_core::Demuxer::open(b).map_err(|e| alloc::format!("demux: {}", e))) {
+            Ok(d) => d,
+            Err(e) => {
+                serial_println!("[nle] fixture export audio=aac out={} reread={} -> FAIL", out, e);
+                return false;
+            }
+        };
+        let Some(t) = d.audio_track().filter(|t| t.codec == demux_core::Codec::Aac && t.sample_rate == 48_000 && t.channels == 2) else {
+            serial_println!("[nle] fixture export audio=aac out={} track=missing -> FAIL", out);
+            return false;
+        };
+        let units: Vec<Vec<u8>> = d.track_index(t.id).map(|i| d.track_samples(i).map(|s| d.packet_at(s).data).collect()).unwrap_or_default();
+        let mut dec = match audio_core::aac::Asc::parse(&t.config).and_then(|a| a.layout().and_then(|l| audio_core::aac::AacDecoder::new(a.sf_index, l))) {
+            Ok(dc) => dc,
+            Err(e) => {
+                serial_println!("[nle] fixture export audio=aac out={} asc={:?} -> FAIL", out, e);
+                return false;
+            }
+        };
+        let (mut decoded, mut loud) = (0usize, false);
+        for u in &units {
+            if dec.decode_block(&mut audio_core::bits::BitReader::new(u), 0).is_err() {
+                break;
+            }
+            decoded += 1;
+            loud |= dec.out.iter().any(|c| c.iter().any(|v| v.abs() > 1.0 / 256.0));
+        }
+        let bytes: usize = units.iter().map(|u| u.len()).sum();
+        let ok = rep.audio_target > 0 && units.len() as u64 == rep.audio_target.div_ceil(1024) + 1 && decoded == units.len() && loud;
+        serial_println!(
+            "[nle] fixture export audio=aac units={} decoded={} bytes={} target={} loud={} -> {}",
+            units.len(), decoded, bytes, rep.audio_target, loud as u8, if ok { "ok" } else { "FAIL" }
+        );
+        ok
     }
 
     // ── NLE6EXPORTMKV (rmbp-ledger B966): the fixture's EDL exported as Matroska and re-demuxed ───────────────────────────

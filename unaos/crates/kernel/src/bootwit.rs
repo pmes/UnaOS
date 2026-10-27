@@ -141,22 +141,6 @@ pub(crate) fn read_all(mt: &crate::fs::vfs::MountTable, p: &str, max: usize) -> 
     mt.read(p, 0, st.size as usize).ok()
 }
 
-pub(crate) fn write_all(mt: &crate::fs::vfs::MountTable, p: &str, b: &[u8]) -> bool {
-    use crate::fs::vfs::{NodeKind, KERNEL_PRINCIPAL};
-    let _ = mt.unlink(p, KERNEL_PRINCIPAL);
-    if mt.create(p, NodeKind::File, KERNEL_PRINCIPAL).is_err() {
-        return false;
-    }
-    let mut off = 0usize;
-    while off < b.len() {
-        match mt.write(p, off as u64, &b[off..], KERNEL_PRINCIPAL) {
-            Ok(0) | Err(_) => return false,
-            Ok(w) => off += w,
-        }
-    }
-    true
-}
-
 pub(crate) fn ensure_dir(mt: &crate::fs::vfs::MountTable, d: &str) {
     use crate::fs::vfs::{NodeKind, KERNEL_PRINCIPAL};
     if mt.stat(d).is_err() {
@@ -189,7 +173,7 @@ pub fn flush(why: &str) {
         n = last + 1;
         BOOT_N.store(n, Ordering::Relaxed);
         first = true;
-        let _ = write_all(&mt, &last_path(), format!("{}\n", n).as_bytes());
+        let _ = mt.put_file(&last_path(), format!("{}\n", n).as_bytes(), crate::fs::vfs::KERNEL_PRINCIPAL); // VFSPUTONE (rmbp-ledger B964): the ONE VFS whole-file writer
         if n > KEEP {
             let _ = mt.unlink(&witness_path(n - KEEP), crate::fs::vfs::KERNEL_PRINCIPAL);
         }
@@ -205,7 +189,7 @@ pub fn flush(why: &str) {
     )
     .into_bytes();
     text.extend_from_slice(&body);
-    let ok = write_all(&mt, &witness_path(n), &text);
+    let ok = mt.put_file(&witness_path(n), &text, crate::fs::vfs::KERNEL_PRINCIPAL).is_ok();
     STATE.store(if ok { 1 } else { 3 }, Ordering::Relaxed);
     if ok {
         WRITES.fetch_add(1, Ordering::Relaxed);
@@ -229,7 +213,7 @@ pub(crate) fn fill_next_boot(mt: &crate::fs::vfs::MountTable, prev: u64, n: u64,
     let k = o.len();
     let mut all = md.clone();
     all.extend_from_slice(&add[..k]);
-    write_all(mt, &p, &all)
+    mt.put_file(&p, &all, crate::fs::vfs::KERNEL_PRINCIPAL).is_ok()
 }
 
 fn trim(b: &[u8]) -> &[u8] {

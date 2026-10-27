@@ -320,36 +320,35 @@ fn pack(rgba: &[u8]) -> Vec<u32> {
 }
 
 /// Nearest-scale `f` into the `bw x bh` rect at `(x, y)` of a `stride`-wide surface, aspect kept, the bars
-/// `bar`. Returns the picture's drawn size.
+/// `bar`. Returns the picture's drawn size. KERNELSCALEONE (rmbp-ledger B965): the letterbox and the samples are yuv_core's
+/// ONE resampler (`yuv_core::scale::fit` / `nearest_rows`, user-stria's too) over the frame as a mono `Picture<u32>`.
 pub fn blit_fit(dst: &mut [u32], stride: usize, x: usize, y: usize, bw: usize, bh: usize, f: &Frame, bar: Option<u32>) -> (usize, usize) {
-    if f.w == 0 || f.h == 0 || bw == 0 || bh == 0 {
+    let pic = yuv_core::Picture { w: f.w, h: f.h, y: &f.px[..], u: &[], v: &[], y_stride: f.w, uv_stride: 0, ss: (0, 0), mono: true, bit_depth: 8, full: true };
+    if f.w == 0 || f.h == 0 || bw == 0 || bh == 0 || !yuv_core::scale::fits(&pic) {
         return (0, 0);
     }
-    let (dw, dh) = if bw * f.h <= bh * f.w { (bw, (f.h * bw / f.w).max(1)) } else { ((f.w * bh / f.h).max(1), bh) };
-    let (ox, oy) = (x + (bw - dw) / 2, y + (bh - dh) / 2);
+    let fr = yuv_core::scale::fit(f.w, f.h, bw, bh);
+    let (dw, dh, ox, oy) = (fr.w, fr.h, x + fr.x, y + fr.y);
     for r in 0..bh {
         let row = (y + r) * stride;
         if row + x + bw > dst.len() {
             break;
         }
-        let inside = r + y >= oy && r + y < oy + dh;
-        if !inside {
-            if let Some(c) = bar {
-                dst[row + x..row + x + bw].fill(c);
-            }
-            continue;
-        }
-        let sy = ((r + y - oy) * f.h / dh).min(f.h - 1);
-        let src = &f.px[sy * f.w..sy * f.w + f.w];
-        for c in 0..bw {
-            let px = x + c;
-            if px >= ox && px < ox + dw {
-                dst[row + px] = src[((px - ox) * f.w / dw).min(f.w - 1)];
-            } else if let Some(b) = bar {
-                dst[row + px] = b;
-            }
+        let Some(c) = bar else { continue };
+        if r + y >= oy && r + y < oy + dh {
+            dst[row + x..row + ox].fill(c);
+            dst[row + ox + dw..row + x + bw].fill(c);
+        } else {
+            dst[row + x..row + x + bw].fill(c);
         }
     }
+    let mut buf = alloc::vec![0u32; dw];
+    yuv_core::scale::nearest_rows(&pic, dw, dh, &mut buf, &mut [], &mut [], |i, s| {
+        let row = (oy + i) * stride;
+        if row + x + bw <= dst.len() {
+            dst[row + ox..row + ox + dw].copy_from_slice(&s.y[..dw]);
+        }
+    });
     (dw, dh)
 }
 
@@ -1263,7 +1262,7 @@ fn unpack(px: &[u32]) -> Vec<u8> {
 // ── KERNELCOLOUR (rmbp-ledger B952): the open's colour and the picture -> RGBA conversion, Stria's own ────────────────────
 // handlers.md §5 NLEPROBE-HDR's KERNEL-COLOUR. An open (`job_task`, `poster_task`, each EDL reel) fills the video track's
 // `Track::colour` as Stria's opens do: the container's statement (MP4 `colr`, Matroska `Colour`, read by demux_core at open)
-// wins, and the bitstream's (AV1 `av1C`: `av1_core::image::av1c_codes` mapped by `demux_core::colour::Colour::from_av1`, the
+// wins, and the bitstream's (AV1: `av1_core::image::stream_codes`, the av1C configOBUs else the first sample's in-band header, AV1INBANDCOLOUR SR366, mapped by `demux_core::colour::Colour::from_av1`, the
 // one mapping gneiss_pal's `colour_of` calls too) fills its gaps through demux_core's one merge, `Demuxer::fill_colour`.
 // Each picture then converts through yuv_core's ONE `pick` (the H.273 matrix, else the size default: BT.601 below 1280x720,
 // BT.709 at it; full range only when stated) and ONE `to_rgba`: VP8 with nearest chroma (Stria's I420 path,
@@ -1285,10 +1284,10 @@ fn open_colour(d: &mut Demuxer, log: bool) {
     serial_println!("[vplay] colour matrix={} range={} src={}", stated.unwrap_or(2), if full { "full" } else { "limited" }, src);
 }
 
-/// The bitstream's colour of a video track (what `fill_colour` takes): AV1's `av1C` through the one mapping; VP8 states none.
-fn bitstream_colour(t: &demux_core::Track) -> Option<Colour> {
+/// The bitstream's colour of a video track (what `fill_colour` takes, with the track's first sample): AV1 through the one reading and mapping; VP8 states none.
+fn bitstream_colour(t: &demux_core::Track, first: &[u8]) -> Option<Colour> {
     match t.codec {
-        Codec::Av1 => av1_core::image::av1c_codes(&t.config).map(|(c, l, m)| Colour::from_av1(c, l, m)),
+        Codec::Av1 => av1_core::image::stream_codes(&t.config, first).map(|(c, l, m)| Colour::from_av1(c, l, m)),
         _ => None,
     }
 }

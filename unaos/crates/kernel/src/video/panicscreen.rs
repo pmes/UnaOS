@@ -383,7 +383,7 @@ fn write_log() {
     let room = unsafe { &mut (&mut *FILE.b.get())[at..(at + TAIL_CAP).min(FILE_CAP)] };
     let got = crate::flight_recorder::panic_tail(room);
     FILE.n.store(at + got, Ordering::Relaxed);
-    let ok = write_all(&mt, p, FILE.get());
+    let ok = mt.put_file(p, FILE.get(), crate::fs::vfs::KERNEL_PRINCIPAL).is_ok(); // VFSPUTONE (rmbp-ledger B964): the ONE VFS whole-file writer
     if !ok {
         serial_println!("[panic] log not written reason=write path={}", p);
         return;
@@ -394,7 +394,7 @@ fn write_log() {
         let _ = write!(w, "{} {} {}\n", n, p, s(REASON.get()));
         w.n
     };
-    let marked = write_all(&mt, MARKER, &m[..ml]);
+    let marked = mt.put_file(MARKER, &m[..ml], crate::fs::vfs::KERNEL_PRINCIPAL).is_ok();
     serial_println!("[panic] log written path={} bytes={} marker={}", p, FILE.get().len(), marked as u8);
 }
 
@@ -438,22 +438,6 @@ fn read_small(mt: &crate::fs::vfs::MountTable, p: &str) -> Option<alloc::vec::Ve
     mt.read(p, 0, st.size as usize).ok()
 }
 
-fn write_all(mt: &crate::fs::vfs::MountTable, p: &str, b: &[u8]) -> bool {
-    use crate::fs::vfs::{NodeKind, KERNEL_PRINCIPAL};
-    let _ = mt.unlink(p, KERNEL_PRINCIPAL);
-    if mt.create(p, NodeKind::File, KERNEL_PRINCIPAL).is_err() {
-        return false;
-    }
-    let mut off = 0usize;
-    while off < b.len() {
-        match mt.write(p, off as u64, &b[off..], KERNEL_PRINCIPAL) {
-            Ok(0) | Err(_) => return false,
-            Ok(w) => off += w,
-        }
-    }
-    true
-}
-
 fn parse_dec(b: &[u8]) -> Option<u64> {
     let mut v: u64 = 0;
     let mut any = false;
@@ -487,7 +471,7 @@ fn boot_number(mt: &crate::fs::vfs::MountTable, claim: bool) -> u64 {
         let mut w = Slice { b: &mut d, n: 0 };
         let _ = write!(w, "{}\n", n);
         let k = w.n;
-        let _ = write_all(mt, last, &d[..k]);
+        let _ = mt.put_file(last, &d[..k], crate::fs::vfs::KERNEL_PRINCIPAL);
     }
     n
 }
@@ -594,7 +578,7 @@ pub fn test() {
         ensure_dir(&mt, "/var");
         ensure_dir(&mt, DIR);
         let probe = "/var/log/panic.probe";
-        let ok = write_all(&mt, probe, b"probe\n");
+        let ok = mt.put_file(probe, b"probe\n", crate::fs::vfs::KERNEL_PRINCIPAL).is_ok();
         let _ = mt.unlink(probe, crate::fs::vfs::KERNEL_PRINCIPAL);
         ok
     };
