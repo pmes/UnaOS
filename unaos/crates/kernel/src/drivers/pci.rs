@@ -470,3 +470,38 @@ impl PciScanner {
         hda
     }
 }
+
+// ══════════ NVMEMSIX (zenbook-ledger Z45) — map a function's MSI-X table before `enable_msix` writes it ══════════
+// APPENDED after the file's last line and cfg-erased without `nvme`: no existing line moves, knob-off bytes unchanged.
+#[cfg(all(target_arch = "x86_64", feature = "nvme"))]
+impl PciScanner {
+    /// Find the MSI-X capability (id 0x11, `enable_msix`'s walk) and map its table window (`TableSize` x 16 bytes at
+    /// `bar0_phys + TableOffset`) uncacheable, so `enable_msix` can program entry 0. Refuses by name: `no-cap-list`,
+    /// `no-msix`, `msix-bir-not-0` (`enable_msix` takes BAR0 tables only). Lock-free: config space + one page-table map.
+    pub fn msix_map_table(bus: u8, slot: u8, func: u8, bar0_phys: u64) -> Result<(), &'static str> {
+        unsafe {
+            let status = (crate::arch::pci::read_config_32(bus, slot, func, 0x04) >> 16) as u16;
+            if (status & (1 << 4)) == 0 {
+                return Err("no-cap-list");
+            }
+            let mut cap_ptr = (crate::arch::pci::read_config_32(bus, slot, func, 0x34) & 0xFF) as u8;
+            let mut guard = 0u8;
+            while cap_ptr != 0 && cap_ptr != 0xFF && guard < 32 {
+                let cap = crate::arch::pci::read_config_32(bus, slot, func, cap_ptr);
+                if (cap & 0xFF) as u8 == 0x11 {
+                    let entries = (((cap >> 16) & 0x7FF) + 1) as usize;
+                    let table_off_bir = crate::arch::pci::read_config_32(bus, slot, func, cap_ptr + 4);
+                    if table_off_bir & 0x7 != 0 {
+                        return Err("msix-bir-not-0");
+                    }
+                    let table = bar0_phys + (table_off_bir & !0x7u32) as u64;
+                    crate::arch::memory::map_mmio_window(table, entries * 16);
+                    return Ok(());
+                }
+                cap_ptr = ((cap >> 8) & 0xFF) as u8;
+                guard += 1;
+            }
+            Err("no-msix")
+        }
+    }
+}
