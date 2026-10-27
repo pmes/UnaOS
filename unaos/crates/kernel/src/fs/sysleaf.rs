@@ -30,7 +30,7 @@ pub fn active() -> bool {
 #[cfg(any(target_arch = "aarch64", feature = "unafs"))]
 fn owner_is_kernel(id: u64) -> bool {
     use ::unafs::inode::AttributeValue;
-    crate::fs::unafs::with_unafs(|fs| match fs.read_inode(id) {
+    crate::fs::unafs::with_unafs_read(|fs| match fs.read_inode(id) {
         Ok(ino) => matches!(ino.attributes.get("owner"), Some(AttributeValue::String(s)) if s == crate::fs::vfs::KERNEL_PRINCIPAL),
         Err(_) => false,
     })
