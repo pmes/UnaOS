@@ -40,7 +40,7 @@ fn owner_is_kernel(id: u64) -> bool {
 #[cfg(any(target_arch = "aarch64", feature = "unafs"))]
 fn stamp_kernel(id: u64) -> bool {
     use ::unafs::inode::AttributeValue;
-    crate::fs::unafs::with_unafs(|fs| {
+    crate::fs::unafs::with_unafs_write(|fs| {
         fs.set_attribute(id, String::from("owner"), AttributeValue::String(String::from(crate::fs::vfs::KERNEL_PRINCIPAL))).is_ok()
     })
     .unwrap_or(false)

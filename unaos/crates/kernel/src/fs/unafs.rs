@@ -1084,7 +1084,7 @@ pub fn native_acl_write(
     owner: &[u8],
     grants: &[(&[u8], &[u8])],
 ) -> bool {
-    with_unafs(|fs| native_acl_write_on(fs, dir_lba, dir_off, name, first_cluster, owner, grants))
+    with_unafs_write(|fs| native_acl_write_on(fs, dir_lba, dir_off, name, first_cluster, owner, grants))
         .unwrap_or(false)
 }
 
@@ -1270,7 +1270,7 @@ fn native_acl_row_of(fs: &mut KernelUnaFS, id: u64) -> Option<NativeAclRow> {
 /// unafs ACL file (journaled), reverting the FAT file to public. Idempotent: an absent row is already
 /// clear (`true`); only a real mount/I-O error is `false`.
 pub fn native_acl_clear(dir_lba: u64, dir_off: u32) -> bool {
-    match with_unafs(|fs| {
+    match with_unafs_write(|fs| {
         let root = fs.superblock.root_inode;
         let fname = acl_file_name(dir_lba, dir_off);
         match fs.unlink(root, &fname) {
@@ -3986,6 +3986,9 @@ pub fn record_attrs_on<D: ::unafs::BlockDevice>(fs: &mut UnaFS<D>, id: u64, ino:
 // btree store's node writes (catalog, name index, attribute index) are held too (`node_blocks`): an op writes nothing
 // under MOUNT. `write`/`truncate` split too (vfs.rs): `nospace_room`'s version drop runs in a split op that is its own
 // attempt, the drop's commit whole (a full versioned volume only; DROPSPLIT owed), the retried write staged.
+// UNAFSWRITE3 (rmbp-ledger B872): a split op may return BEFORE it is done (`OpAgain`): the version drop on a full volume
+// is a staged commit of its own (DROPSPLIT) and a write past `CHUNK_BLOCKS` lands in chunks (HELDCAP), each a staged
+// commit; `run` flips each and reruns the op (the rerun-on-Lost extended), the ticket held across all of them.
 // =================================================================================================
 #[cfg(all(target_arch = "x86_64", feature = "wc"))]
 pub use splitwrite::with_unafs_write;
@@ -3996,7 +3999,7 @@ pub use with_unafs as with_unafs_write;
 #[cfg(all(target_arch = "x86_64", feature = "wc"))]
 pub mod splitwrite {
     use super::*;
-    use ::unafs::fs::{FlipOutcome, StagedCommit};
+    use ::unafs::fs::{FlipOutcome, OpAgain, StagedCommit};
     use core::sync::atomic::AtomicU64;
 
     /// The commit ticket: the holder's task id, 0 = free.
@@ -4017,6 +4020,13 @@ pub mod splitwrite {
     static DATA_STAGED: AtomicU64 = AtomicU64::new(0);
     /// UNAFSWRITE2 second half (B861): the op's btree node blocks carried by flipped split commits (`node_blocks`).
     static NODE_STAGED: AtomicU64 = AtomicU64::new(0);
+    /// UNAFSWRITE3 (B872): version drops landed by a split op's own staged commit (DROPSPLIT) / landed whole (ciphered
+    /// root, no bound span, a failed write phase, a restage); and chunk commits of a chunked write that owed more (HELDCAP).
+    static DROPS_STAGED: AtomicU64 = AtomicU64::new(0);
+    static DROPS_WHOLE: AtomicU64 = AtomicU64::new(0);
+    static CHUNKS: AtomicU64 = AtomicU64::new(0);
+    /// UNAFSWRITE3 (B872): the most chunk reruns one op may ask for (4096 x 4 MiB = 16 GiB); past it the op answers Busy.
+    const CHUNK_RUNS: u32 = 4096;
 
     /// The bound on any wait for the ticket: RENDERWEDGE's `MOUNT_BOUND_MS` (`video/renderwedge.rs`, 1500 ms — not
     /// re-exported by that module, so its value is restated here), past which the caller answers `Busy`.
@@ -4173,15 +4183,25 @@ pub mod splitwrite {
         out
     }
 
+    /// UNAFSWRITE3 (rmbp-ledger B872): the op may return before it is done — `take_again` after it, `resume_again` before
+    /// its rerun: a version drop (DROPSPLIT) or a chunk (HELDCAP) lands as its own split commit, then the op runs again.
+    /// The ticket is held across ALL of the op's commits; a death between them is TICKETOWNER's release (`release_dead`:
+    /// the staged RAM goes with the leaked instance; a drop or chunk already flipped stays landed — correct by K8a, and a
+    /// landed chunk is a shorter file, never a torn one). Never an `Ok` for an op that owed more: past the bound, Busy.
     fn run<R>(f: &mut impl FnMut(&mut KernelUnaFS) -> R) -> Result<R, MountError> {
-        for _ in 0..LOST_RUNS {
+        let (mut lost, mut again, mut drops, mut chunks) = (0u32, None::<OpAgain>, 0usize, 0u32); // UNAFSWRITE3 (B872)
+        while lost < LOST_RUNS {
             // HOLD 1: the op, then the stage.
-            let (r, stage, held1) = with_unafs(|fs| {
+            let (r, stage, held1, next) = with_unafs(|fs| {
                 let h0 = now_us();
                 let r = {
                     let mut hold = FreshHold::on(fs); // UNAFSWRITE2 (B844): autocommit off + hold_fresh on, both undone by Drop
+                    if let Some(a) = again {
+                        hold.0.resume_again(a); // UNAFSWRITE3 (B872): the cursor of the op's last landed chunk
+                    }
                     f(&mut *hold.0)
                 };
+                let next = fs.take_again(); // UNAFSWRITE3 (B872): the op returned before it was done
                 let stage = if MOUNT_DISCARD.load(Ordering::Relaxed) || !fs.has_staged() {
                     Stage::Done // a K9 discard drops the mount after this closure; or nothing to commit
                 } else if fs.key_slot().is_some_and(|k| k.cipher == ::unafs::keyslot::CIPHER_AES256_XTS) {
@@ -4196,13 +4216,20 @@ pub mod splitwrite {
                         },
                     }
                 };
-                (r, stage, now_us().saturating_sub(h0))
+                (r, stage, now_us().saturating_sub(h0), next)
             })?;
             let (s, handle, span) = match stage {
-                Stage::Done => return Ok(r),
+                Stage::Done => return if next.is_some() { Err(MountError::Busy) } else { Ok(r) }, // UNAFSWRITE3 (B872): never a short Ok
                 Stage::Whole(Ok(())) => {
                     WHOLE.fetch_add(1, Ordering::Relaxed);
-                    return Ok(r);
+                    match again_after(next, false, &mut drops, &mut chunks) {
+                        Next::Done => return Ok(r),
+                        Next::Again(a) => {
+                            again = Some(a); // UNAFSWRITE3 (B872): landed whole — run the op again
+                            continue;
+                        }
+                        Next::Bound => return Err(MountError::Busy),
+                    }
                 }
                 Stage::Whole(Err(e)) => return Err(MountError::Fs(e)),
                 Stage::Split(s, handle, span) => (s, handle, span),
@@ -4264,12 +4291,46 @@ pub mod splitwrite {
                 serial_println!("[unafs] commit staged_blocks={} write_ms={} held_us={} flip={}", s.blocks(), write_ms, held, name);
             }
             match out {
-                Some(Ok(())) => return Ok(r),
+                Some(Ok(())) => match again_after(next, name == "ok", &mut drops, &mut chunks) {
+                    Next::Done => return Ok(r),
+                    Next::Again(a) => again = Some(a), // UNAFSWRITE3 (B872): landed — run the op again
+                    Next::Bound => return Err(MountError::Busy),
+                },
                 Some(Err(e)) => return Err(MountError::Fs(e)),
-                None => {} // Lost: run the op again on the mount that is bound now
+                None => lost += 1, // Lost: run the op again on the mount that is bound now (`again` stays the last landed answer)
             }
         }
         Err(MountError::Busy)
+    }
+
+    /// UNAFSWRITE3 (B872): what `run` does after a commit LANDED.
+    enum Next {
+        Done,
+        Again(OpAgain),
+        Bound,
+    }
+
+    /// UNAFSWRITE3 (B872): the op asked to run again (`take_again`) and its commit landed (`staged` = split): count it,
+    /// say a drop on the wire, and bound the reruns — drops by the version ring (`RING_MAX`), chunks by `CHUNK_RUNS`.
+    fn again_after(next: Option<OpAgain>, staged: bool, drops: &mut usize, chunks: &mut u32) -> Next {
+        let Some(a) = next else {
+            return Next::Done;
+        };
+        if a.drop {
+            if *drops >= ::unafs::RING_MAX {
+                return Next::Bound;
+            }
+            *drops += 1;
+            if staged { DROPS_STAGED.fetch_add(1, Ordering::Relaxed) } else { DROPS_WHOLE.fetch_add(1, Ordering::Relaxed) };
+            serial_println!("[unafs] drop staged={}", staged as u8);
+        } else {
+            if *chunks >= CHUNK_RUNS {
+                return Next::Bound;
+            }
+            *chunks += 1;
+            CHUNKS.fetch_add(1, Ordering::Relaxed);
+        }
+        Next::Again(a)
     }
 
     /// The staged blocks through a device of their own on the bound mount's medium — the constructors `mount_on`
@@ -4304,7 +4365,9 @@ pub mod splitwrite {
     /// `tests unafslock` write leg (:3266 fold): 8 attribute commits on a scratch file under `/var`, each through
     /// `with_unafs_write`. ok = 8 commits, all split, none under MOUNT, none lost, every hold <= 20 ms. UNAFSWRITE2 second
     /// half (B861): then a 3-block `write` and a `truncate` to 5000, each ONE split commit read back; ok also needs a node
-    /// block per attribute commit in the stages and `under_mount_writes` (whole commits + held spills) 0.
+    /// block per attribute commit in the stages and `under_mount_writes` (whole commits + held spills) 0. UNAFSWRITE3 (B872):
+    /// then the file is extended at its EOF by 2 x `CHUNK_BLOCKS` + 1 blocks — ok also needs 3 chunks, each one split commit,
+    /// none whole, none spilled, read back off MOUNT — and no version drop this boot landed whole (`drop_staged`).
     pub fn write_leg() {
         const LEAF: &str = "unafslock.tmp";
         const PATH: &str = "/var/unafslock.tmp";
@@ -4360,12 +4423,26 @@ pub mod splitwrite {
         let data = DATA_STAGED.load(Ordering::Relaxed).wrapping_sub(d0); // UNAFSWRITE2 (B844): each attribute commit's inode travels in its stage
         let node = NODE_STAGED.load(Ordering::Relaxed).wrapping_sub(n0); // UNAFSWRITE2 (B861): each attribute commit's index path travels too
         let spilled = with_unafs(|fs| fs.commit_stats().held_direct).unwrap_or(0).wrapping_sub(hd0);
+        // UNAFSWRITE3 HELDCAP (B872): a write past the hold's cap, extending the file at its EOF (5000), lands in chunks.
+        const CBYTES: usize = (2 * ::unafs::fs::CHUNK_BLOCKS as usize + 1) * 4096;
+        let cbuf = alloc::vec![0xa5u8; CBYTES]; // heap, not the task stack
+        let (cs0, cw0, _, _, _, _) = census();
+        let ch0 = CHUNKS.load(Ordering::Relaxed);
+        let chd0 = with_unafs(|fs| fs.commit_stats().held_direct).unwrap_or(0);
+        let cwrote = matches!(with_unafs_write(|fs| fs.write_data(id, 5000, &cbuf).is_ok()), Ok(true));
+        let (cs1, cw1, _, _, _, _) = census();
+        let chunks = CHUNKS.load(Ordering::Relaxed).wrapping_sub(ch0) + cwrote as u64; // the reruns, plus the last chunk
+        let cspill = with_unafs(|fs| fs.commit_stats().held_direct).unwrap_or(0).wrapping_sub(chd0);
+        let cread = super::splitread::read(PATH, 5000, CBYTES as u64).is_ok_and(|d| d == cbuf);
+        let chunk_ok = cwrote && chunks == 3 && cs1.wrapping_sub(cs0) == 3 && cw1 == cw0 && cspill == 0 && cread;
+        let drops = DROPS_STAGED.load(Ordering::Relaxed).wrapping_add(DROPS_WHOLE.load(Ordering::Relaxed));
+        let drop_ok = DROPS_WHOLE.load(Ordering::Relaxed) == 0; // DROPSPLIT: no drop this boot landed whole
         let _ = with_unafs_write(|fs| fs.resolve_path("/var").and_then(|var| fs.unlink(var, LEAF)));
         let (split, whole, restaged, lost) = (s1.wrapping_sub(s0), w1.wrapping_sub(w0), r1.wrapping_sub(r0), l1.wrapping_sub(l0));
         let under = whole.wrapping_add(spilled); // UNAFSWRITE2 (B861): card writes under MOUNT — whole commits + held spills
-        let ok = commits == N && split >= N && whole == 0 && lost == 0 && held <= 20_000 && data >= N && node >= N && under == 0 && write_ok && trunc_ok;
+        let ok = commits == N && split >= N && whole == 0 && lost == 0 && held <= 20_000 && data >= N && node >= N && under == 0 && write_ok && trunc_ok && chunk_ok && drop_ok;
         serial_println!(
-            "[unafslock] write commits={} split={} write_held_us={} write_ms_max={} io_under_lock={} restaged={} lost={} data_blocks_staged={} node_blocks_staged={} under_mount_writes={} write_staged={} truncate_staged={} -> {}",
+            "[unafslock] write commits={} split={} write_held_us={} write_ms_max={} io_under_lock={} restaged={} lost={} data_blocks_staged={} node_blocks_staged={} under_mount_writes={} write_staged={} truncate_staged={} drop_staged={} drops={} chunks={} -> {}",
             commits,
             split,
             held,
@@ -4378,6 +4455,9 @@ pub mod splitwrite {
             under,
             if write_ok { "ok" } else { "FAIL" },
             if trunc_ok { "ok" } else { "FAIL" },
+            if drop_ok { "ok" } else { "FAIL" },
+            drops,
+            chunks,
             if ok { "ok" } else { "FAIL" }
         );
     }
