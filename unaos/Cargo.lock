@@ -252,6 +252,9 @@ version = "0.1.0"
 [[package]]
 name = "probe_core"
 version = "0.1.0"
+dependencies = [
+ "yuv_core",
+]
 
 [[package]]
 name = "proc-macro2"
@@ -597,6 +600,9 @@ checksum = "af8ca9a5d4debca0633e697c88269395493cebf2e10db21ca2dbde37c1356452"
 [[package]]
 name = "vp8_core"
 version = "0.1.0"
+dependencies = [
+ "yuv_core",
+]
 
 [[package]]
 name = "wifi_core"

@@ -5,8 +5,9 @@ edition = "2024"
 license = "LGPL-3.0-or-later"
 description = "REALSENSE (SR92, R112): Sonde's probe core — the frame model (Z16/Y8/Y16/YUY2), the depth model (depth scale, pinhole intrinsics, deprojection, point clouds), the depth colour ramp and the IMU sample model; no_std + alloc, shared by Ring 0 and Ring 3."
 
-# PROBECORE (R112): `#![no_std]` + `alloc`, `#![forbid(unsafe_code)]`, and NO dependencies — the
+# PROBECORE (R112): `#![no_std]` + `alloc`, `#![forbid(unsafe_code)]`, one dependency (yuv_core's converter, VP8COLOURONE SR356) — the
 # pixel_core/midden_core shape: a member of the ROOT host workspace (handlers/sonde links it) and, since
 # SONDE2 (SR105), an OPTIONAL path dep of the kernel pulled only by its `sonde` feature (`dep:probe_core`):
 # the census's stream classification, the Z16 statistics and the `/dev/probe/depth0` record are decoded here.
 [dependencies]
+yuv_core = { path = "../yuv_core" }

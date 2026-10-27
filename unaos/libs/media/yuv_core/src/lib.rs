@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // Copyright (C) 2026 The Architect & Una
 //
-// CHARTER: Stria (CODEX §2 A/V), seam shared-core — the ONE YCbCr -> RGB kernel gneiss_pal, av1_core and the kernel link.
+// CHARTER: Stria (CODEX §2 A/V), seam shared-core — the ONE YCbCr -> RGB kernel gneiss_pal, av1_core, pixel_core, vp8_core, probe_core and the kernel link.
 //! `yuv_core` — Stria's ONE integer Y'CbCr -> R'G'B' kernel (AV1COLOURONE, LEDGER SR340).
 //!
 //! COLOURONE (SR328) wrote it in gneiss_pal's `dsp/video.rs` as `yuv_coeffs` + `yuv_to_rgba`; AV1COLOURONE moved it here,
@@ -9,7 +9,8 @@
 //! played frame and the kernel Player's AV1 picture are converted by the same integer arithmetic. [`coeffs`] derives the
 //! fixed-point table of one (Kr, Kb), range and sample depth; [`to_rgba`] runs the one loop over 8-bit or deeper planes:
 //! any chroma subsampling, nearest or bilinear (9-3-3-1, centre-sited) chroma, monochrome, the identity (GBR) matrix and
-//! YCgCo, and an optional 2x2 ordered dither on the narrowing of samples deeper than 8 bits. No tone mapping.
+//! YCgCo, and an optional 2x2 ordered dither on the narrowing of samples deeper than 8 bits. No tone mapping. VP8COLOURONE (SR356):
+//! libwebp's per-product arithmetic ([`Matrix::MultHi`]) and its fancy upsampling ([`Chroma::Fancy`]), so WebP converts here too.
 //!
 //! `#![no_std]`, no `alloc`, no dependencies: the caller owns the RGBA buffer.
 #![no_std]
@@ -71,6 +72,12 @@ pub fn coeffs((kr, kb): (i64, i64), full: bool, n: u32) -> Coeffs {
     (s, c, yoff, coff)
 }
 
+/// libwebp's fixed-point form (VP8COLOURONE SR356): `([yc, rv, gu, gv, bu], [kr, kg, kb])`, coefficients at 8 fractional bits,
+/// each product of a RAW 8-bit sample truncated `>> 8` on its own (libwebp's `MultHi`; `>> 8 + f` with Bilinear's carried bits),
+/// plus the channel constant, the sum at 6 fractional bits clamped (libwebp's `VP8Clip8`). No affine table is this function:
+/// the per-product truncation of the chroma term is not linear (measured over all 2^24 triples).
+pub type MultHi = ([i32; 5], [i32; 3]);
+
 /// The matrix [`to_rgba`] applies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Matrix {
@@ -82,6 +89,8 @@ pub enum Matrix {
     Identity,
     /// H.273 MatrixCoefficients 8: R = Y - Cg + Co, G = Y + Cg, B = Y - Cg - Co, exact (one rounded division per channel).
     YCgCo,
+    /// libwebp's per-product arithmetic ([`MultHi`]): vp8_core's WebP converter. Monochrome reads the BT.601 grey.
+    MultHi(MultHi),
 }
 
 /// How chroma reaches luma resolution.
@@ -92,6 +101,9 @@ pub enum Chroma {
     /// 9-3-3-1 (3-1 per subsampled axis) interpolation of centre-sited chroma, edges clamped, in integer at 2 extra
     /// fractional bits per subsampled axis.
     Bilinear,
+    /// Bilinear's 9-3-3-1 sum rounded half up to the sample BEFORE the matrix: libwebp's `UpsampleRgbaLinePair` (VP8COLOURONE
+    /// SR356). libjpeg's fancy filters bias odd outputs down (+8 / +7) and are not this.
+    Fancy,
 }
 
 /// One picture's planes. `y` is `y_stride` samples per row; `u` / `v` are `uv_stride` per row at
@@ -124,14 +136,16 @@ pub fn to_rgba<T: Copy + Into<i32>>(p: &Picture<'_, T>, m: Matrix, up: Chroma, d
     let k = match m {
         Matrix::Table(k) => k,
         Matrix::Kr(kk) => coeffs(kk, p.full, n),
-        Matrix::Identity | Matrix::YCgCo => coeffs(KR_KB_601, p.full, n),
+        Matrix::Identity | Matrix::YCgCo | Matrix::MultHi(_) => coeffs(KR_KB_601, p.full, n),
     };
     let (s, [yc, rv, gu, gv, bu], yoff, coff) = k;
     let (sx, sy) = p.ss;
-    let bil = up == Chroma::Bilinear;
+    let bil = up != Chroma::Nearest;
+    let rf = up == Chroma::Fancy;
     let fx = if bil && sx != 0 { 2 } else { 0 };
     let fy = if bil && sy != 0 { 2 } else { 0 };
-    let f = fx + fy;
+    let fs = fx + fy;
+    let f = if rf { 0 } else { fs };
     let sh = s + f;
     let dith = dither && n > 8;
     let cw = (p.w + sx as usize) >> sx;
@@ -152,7 +166,8 @@ pub fn to_rgba<T: Copy + Into<i32>>(p: &Picture<'_, T>, m: Matrix, up: Chroma, d
             let a: i32 = plane[r * p.uv_stride + xn].into();
             if sx == 0 { a } else { 3 * a + Into::<i32>::into(plane[r * p.uv_stride + xf]) }
         };
-        if sy == 0 { hrow(yn) } else { 3 * hrow(yn) + hrow(yf) }
+        let sum = if sy == 0 { hrow(yn) } else { 3 * hrow(yn) + hrow(yf) };
+        if rf { (sum + ((1 << fs) >> 1)) >> fs } else { sum }
     };
     let (ys, cs) = if p.full { (((1i64 << n) - 1), ((1i64 << n) - 1)) } else { (219i64 << (n - 8), 224i64 << (n - 8)) };
     for row in 0..p.h {
@@ -178,6 +193,11 @@ pub fn to_rgba<T: Copy + Into<i32>>(p: &Picture<'_, T>, m: Matrix, up: Chroma, d
                         let d = ys * cs << f;
                         let q = |num: i64| (2 * 255 * num + d).div_euclid(2 * d) as i32;
                         (q(yn - cg + co), q(yn + cg), q(yn - cg - co))
+                    }
+                    Matrix::MultHi(([wy, wrv, wgu, wgv, wbu], [kr, kg, kb])) => {
+                        let hi = |s: i32, w: i32| (s * w) >> (8 + f);
+                        let yh = (yraw * wy) >> 8;
+                        ((yh + hi(v, wrv) + kr) >> 6, (yh - hi(u, wgu) - hi(v, wgv) + kg) >> 6, (yh + hi(u, wbu) + kb) >> 6)
                     }
                 }
             };
@@ -288,5 +308,37 @@ mod tests {
         to_rgba(&p8, Matrix::Kr(KR_KB_709), Chroma::Nearest, false, &mut flat);
         to_rgba(&p8, Matrix::Kr(KR_KB_709), Chroma::Nearest, true, &mut dith);
         assert_eq!(flat, dith);
+    }
+
+    /// libwebp's constants (vp8_core's `yuv::WEBP`).
+    const WEBP: MultHi = ([19077, 26149, 6419, 13320, 33050], [-14234, 8708, -17685]);
+
+    #[test]
+    fn vp8colourone_multhi_is_libwebps_arithmetic() {
+        // Hand-computed from libwebp's MultHi / VP8Clip8: Y 120 Cb 140 Cr 100 -> (76, 139, 145); limited black and white.
+        assert_eq!(px(120u8, 140, 100, 8, false, Matrix::MultHi(WEBP)), [76, 139, 145]);
+        assert_eq!(px(16u8, 128, 128, 8, false, Matrix::MultHi(WEBP)), [0, 0, 0]);
+        assert_eq!(px(235u8, 128, 128, 8, false, Matrix::MultHi(WEBP)), [255, 255, 255]);
+    }
+
+    #[test]
+    fn vp8colourone_fancy_rounds_first() {
+        // 4x2 luma Y 120, chroma 2x1 Cb (100, 181), Cr 128. The 9-3-3-1 Cb per column, x16: 1600, 1924, 2572, 2896.
+        // Fancy rounds each half up to the sample first (100, 120, 161, 181), so it equals Nearest over those planes at
+        // ss (0, 0); Bilinear carries 120.25 / 160.75 into the matrix instead.
+        let (y, u, v) = ([120u8; 8], [100u8, 181], [128u8; 2]);
+        let p = Picture { w: 4, h: 2, y: &y, u: &u, v: &v, y_stride: 4, uv_stride: 2, ss: (1, 1), mono: false, bit_depth: 8, full: false };
+        let (mut fancy, mut bil, mut full) = ([0u8; 32], [0u8; 32], [0u8; 32]);
+        to_rgba(&p, Matrix::MultHi(WEBP), Chroma::Fancy, false, &mut fancy);
+        to_rgba(&p, Matrix::MultHi(WEBP), Chroma::Bilinear, false, &mut bil);
+        let (fu, fv) = ([100u8, 120, 161, 181, 100, 120, 161, 181], [128u8; 8]);
+        let q = Picture { u: &fu, v: &fv, uv_stride: 4, ss: (0, 0), ..p };
+        to_rgba(&q, Matrix::MultHi(WEBP), Chroma::Nearest, false, &mut full);
+        assert_eq!(fancy, full);
+        assert_ne!(fancy, bil);
+        // Kr / Table pictures are untouched by the new mode: Fancy over Kr equals Nearest over the rounded planes too.
+        to_rgba(&p, Matrix::Kr(KR_KB_709), Chroma::Fancy, false, &mut fancy);
+        to_rgba(&q, Matrix::Kr(KR_KB_709), Chroma::Nearest, false, &mut full);
+        assert_eq!(fancy, full);
     }
 }

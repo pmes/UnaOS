@@ -3706,6 +3706,9 @@ dependencies = [
 [[package]]
 name = "probe_core"
 version = "0.1.0"
+dependencies = [
+ "yuv_core",
+]
 
 [[package]]
 name = "proc-macro-crate"
@@ -5276,6 +5279,9 @@ dependencies = [
 [[package]]
 name = "vp8_core"
 version = "0.1.0"
+dependencies = [
+ "yuv_core",
+]
 
 [[package]]
 name = "vp9_core"
