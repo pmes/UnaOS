@@ -29,9 +29,10 @@
 //!   track) is refused (scaling is owed). A gap is black (opaque) or silence.
 //! * Audio is a MIX (NLE4, LEDGER SR203): each audio step renders its `timeline_core::schedule::audio_runs` run: every
 //!   layer decoded on its own track's decoder, resampled to the project rate when its rate differs
-//!   (`audio_core::resample::linear`; the project rate is [`Sources::set_audio_rate`]'s, else the first scheduled audio
-//!   source's), scaled by its gain and its linear fade envelope, summed in integers and clamped to 16 bits once. Only a
-//!   CHANNEL-count mismatch is refused. One layer at 0 dB with no fade passes through bit for bit. NLE3b (SR209): a
+//!   (`audio_core::resample::Sinc`, NLE4B's windowed sinc; the project rate is [`Sources::set_audio_rate`]'s, else
+//!   the first scheduled audio source's), scaled by its gain and its linear fade envelope, summed in integers and
+//!   clamped to 16 bits once. Only a CHANNEL-count mismatch is refused. One layer at 0 dB with no fade passes through
+//!   bit for bit. NLE3b (SR209): a
 //!   crossfade's UNDER layer (the outgoing's handle, before the incoming layer of the same track) decodes on its own
 //!   slot (`tracks + track`), so the track's own decoder carries the incoming on; the sum is the same `mix_into`.
 //!
@@ -322,6 +323,8 @@ struct Aud {
     buf_at: i64,
     started: bool,
     done: bool,
+    /// NLE4B: the windowed-sinc converter (its table) for the last output rate asked of `take_at`.
+    rs: Option<resample::Sinc>,
 }
 
 impl Aud {
@@ -337,7 +340,7 @@ impl Aud {
         let mut cursor = m.demux.share();
         cursor.seek_track(i, origin + key_ns);
         let ch = channels.max(1) as usize;
-        Ok(Aud { src, origin, track_id: track.id, rate, ch, cursor, dec, buf: Vec::new(), buf_at: 0, started: false, done: false })
+        Ok(Aud { src, origin, track_id: track.id, rate, ch, cursor, dec, buf: Vec::new(), buf_at: 0, started: false, done: false, rs: None })
     }
     /// Source samples `start..start + n`, interleaved (sample-exact; a hole in the stream is silence).
     fn take(&mut self, start: i64, n: i64) -> Result<Vec<f32>, RenderError> {
@@ -479,7 +482,8 @@ pub fn render(tl: &Timeline, range: std::ops::Range<i64>, sources: &Sources, sin
 
 impl Aud {
     /// NLE4: output samples `out_start..out_start + n` at `out_rate` (counted from the source's origin): the source's
-    /// own samples when the rates agree, else linearly resampled (the neighbour past the media's end holds).
+    /// own samples when the rates agree, else NLE4B's windowed sinc (`resample::Sinc`, its table kept in `rs`; the window's
+    /// neighbours past the media's end hold).
     fn take_at(&mut self, out_start: i64, n: i64, out_rate: u32) -> Result<Vec<f32>, RenderError> {
         if self.rate == out_rate {
             return self.take(out_start, n);
@@ -487,14 +491,16 @@ impl Aud {
         if n <= 0 {
             return Ok(Vec::new());
         }
-        let (i0, _, _) = resample::linear_pos(out_start, self.rate, out_rate);
-        let (i1, f1, _) = resample::linear_pos(out_start + n - 1, self.rate, out_rate);
-        self.fill(i1 + 1, false)?;
-        if f1 != 0 {
-            self.fill(i1 + 2, true)?;
+        if self.rs.as_ref().map(|s| s.rates()) != Some((self.rate, out_rate)) {
+            self.rs = Some(resample::Sinc::new(self.rate, out_rate, self.ch));
         }
-        self.seat(i0);
-        Ok(resample::linear(&self.buf, self.buf_at, self.ch, self.rate, out_rate, out_start, n as usize))
+        let h = self.rs.as_ref().expect("built above").delay() as i64;
+        let (i0, _, _) = resample::linear_pos(out_start, self.rate, out_rate);
+        let (i1, _, _) = resample::linear_pos(out_start + n - 1, self.rate, out_rate);
+        self.fill(i1 + 1, false)?;
+        self.fill(i1 + h + 1, true)?;
+        self.seat(i0 - h + 1);
+        Ok(self.rs.as_ref().expect("built above").at(&self.buf, self.buf_at, out_start, n as usize))
     }
 }
 
