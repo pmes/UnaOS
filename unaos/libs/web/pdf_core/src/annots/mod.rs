@@ -149,7 +149,7 @@ pub fn normal_appearance(doc: &Document, d: &Dict) -> Option<Stream> {
     }
 }
 
-fn link(doc: &Document, d: &Dict, page_refs: &[Option<Ref>]) -> Option<LinkAction> {
+pub(crate) fn link(doc: &Document, d: &Dict, page_refs: &[Option<Ref>]) -> Option<LinkAction> {
     if let Some(dest) = d.get(b"Dest") {
         return dests::resolve(doc, dest, page_refs).map(LinkAction::GoTo);
     }

@@ -526,7 +526,7 @@ impl Tab {
             // The chrome speaks device pixels; the page lays out in CSS pixels (zoom).
             SMessage::BrowserScroll(dx, dy, _) => {
                 let (dx, dy) = self.engine.to_css(dx, dy);
-                self.engine.handle_event(aether::api::events::Event::Scroll(dx, dy));
+                if !self.engine.pdf_wheel(dx, dy) { self.engine.handle_event(aether::api::events::Event::Scroll(dx, dy)); } // PDF4-THUMBSCROLL (SR374): a wheel over the PDF strip scrolls the strip
             }
             SMessage::BrowserClick(x, y, _) => {
                 let (x, y) = self.engine.to_css(x, y);
