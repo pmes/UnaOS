@@ -1021,7 +1021,7 @@ refs/heads/exec-rmbp-exportsizefixture   43541b9e1 FOLDED-BY-HAND (this commit) 
 refs/heads/exec-rmbp-aacencpsypreddefault   dbad75420 cut 2026-10-27 (wave36 batch 11)
 refs/heads/exec-rmbp-swapbacksetidsavc   a7b85c589 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-pagesavecomplete   dbad75420 cut 2026-10-27 (wave36 batch 11)
-refs/heads/exec-rmbp-statuswordsone   643d11388 cut 2026-10-27 (wave36 batch 12)
+refs/heads/exec-rmbp-statuswordsone   2c2e4b2a0 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-vp9inbandswitch   643d11388 cut 2026-10-27 (wave36 batch 12)
 refs/heads/exec-rmbp-pdf4fitzoomround   643d11388 cut 2026-10-27 (wave36 batch 12)
 refs/heads/exec-rmbp-dwi2ctpgest   b85edea71 FOLDED-BY-HAND (this commit) 2026-10-27

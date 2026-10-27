@@ -36,21 +36,24 @@ fn usage() -> ExitCode {
     ExitCode::from(2)
 }
 
-fn status_name(s: i32) -> &'static str {
+/// STATUS-WORDS-ONE (SR399): the word is holocron_core's ONE table (`wire::status::word`), then the action the
+/// CLI names for it (`hint`), as `<word>: <hint>`.
+fn status_name(s: i32) -> String {
+    match hint(s) {
+        Some(h) => format!("{}: {h}", status::word(s)),
+        None => status::word(s).to_string(),
+    }
+}
+
+/// The action a person can take on a refusal; `None` = the word says it all.
+fn hint(s: i32) -> Option<&'static str> {
     match s {
-        status::BAD_PASSWORD => "wrong password",
-        status::NOT_FOUND => "not found",
-        status::IO => "store I/O error",
-        status::RATE_LIMITED => "too many attempts; wait and retry",
-        status::DENIED => "denied: this user does not own the ring",
-        status::EXISTS => "a ring already exists",
-        status::NO_RING => "no ring: run `holocron init`",
-        status::INVALID => "invalid request",
-        status::TOO_BIG => "secret too large",
-        status::LOCKED => "locked: run `holocron unlock`",
-        status::CORRUPT => "stored file failed to authenticate",
-        status::NO_VERB => "unknown verb",
-        _ => "error",
+        status::BAD_PASSWORD => Some("wrong password"),
+        status::RATE_LIMITED => Some("too many attempts; wait and retry"),
+        status::DENIED => Some("this user does not own the ring"),
+        status::NO_RING => Some("run `holocron init`"),
+        status::LOCKED => Some("run `holocron unlock`"),
+        _ => None,
     }
 }
 

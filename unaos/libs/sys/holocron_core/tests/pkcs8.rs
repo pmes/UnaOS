@@ -220,3 +220,39 @@ fn reason_words() {
     }
     assert_eq!(status::word(-1000), "error");
 }
+
+/// STATUS-WORDS-ONE (SR399): `status::word` is the union of every table the faces kept (user-holocron's
+/// `status_name`, the kernel keyring's `status_word`, the holocron CLI's `status_name`): every code they named has its
+/// own word (none falls to `error`), and the prefixes the kernel and CLI hints hang off are `word`'s.
+#[test]
+fn reason_words_union() {
+    let all = [
+        (status::OK, "ok"),
+        (status::BAD_PASSWORD, "bad-password"),
+        (status::NOT_FOUND, "not-found"),
+        (status::IO, "io"),
+        (status::RATE_LIMITED, "rate-limited"),
+        (status::DENIED, "denied"),
+        (status::EXISTS, "exists"),
+        (status::NO_RING, "no-ring"),
+        (status::INVALID, "invalid"),
+        (status::TOO_BIG, "too-big"),
+        (status::LOCKED, "locked"),
+        (status::CORRUPT, "corrupt"),
+        (status::NO_VERB, "no-verb"),
+        (status::WRONG_KIND, "wrong-kind"),
+        (status::BAD_DIGEST_LEN, "bad-digest-len"),
+        (status::UNSUPPORTED_SCHEME, "unsupported-scheme"),
+    ];
+    for (i, (code, w)) in all.iter().enumerate() {
+        assert_eq!(status::word(*code), *w, "{code}");
+        assert_ne!(*w, "error", "{code} is named");
+        assert!(all[i + 1..].iter().all(|(c, x)| c != code && x != w), "{code} is one code with one word");
+    }
+    // The kernel's login hint and the CLI's hints are `<word>: <hint>`; their heads are the table's words.
+    let kernel_hint = "bad-password: the ring is under another password";
+    assert_eq!(kernel_hint.split(':').next(), Some(status::word(status::BAD_PASSWORD)));
+    for code in [status::BAD_PASSWORD, status::RATE_LIMITED, status::DENIED, status::NO_RING, status::LOCKED] {
+        assert_ne!(status::word(code), "error");
+    }
+}

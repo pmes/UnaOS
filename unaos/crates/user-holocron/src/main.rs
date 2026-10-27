@@ -113,23 +113,9 @@ impl Line {
     }
 }
 
+/// STATUS-WORDS-ONE (SR399): the word is holocron_core's ONE table (`wire::status::word`); no local copy.
 fn status_name(s: i32) -> &'static [u8] {
-    match s {
-        status::OK => b"ok",
-        status::BAD_PASSWORD => b"bad-password",
-        status::NOT_FOUND => b"not-found",
-        status::IO => b"io",
-        status::RATE_LIMITED => b"rate-limited",
-        status::DENIED => b"denied",
-        status::EXISTS => b"exists",
-        status::NO_RING => b"no-ring",
-        status::INVALID => b"invalid",
-        status::TOO_BIG => b"too-big",
-        status::LOCKED => b"locked",
-        status::CORRUPT => b"corrupt",
-        status::NO_VERB => b"no-verb",
-        _ => b"error",
-    }
+    status::word(s).as_bytes()
 }
 
 fn verb_name(v: u8) -> &'static [u8] {

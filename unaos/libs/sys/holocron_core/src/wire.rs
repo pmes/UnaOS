@@ -99,8 +99,8 @@ pub mod status {
     /// a hash).
     pub const UNSUPPORTED_SCHEME: i32 = -95;
 
-    /// KEYSIGNONE (SR393): the ONE word for a status (the user-holocron, kernel keyring and holocron CLI tables are
-    /// owed onto it: STATUS-WORDS-ONE); `error` for a code this table does not name.
+    /// KEYSIGNONE (SR393): the ONE word for a status (user-holocron's `status_name`, the kernel keyring's `status_word`
+    /// and the holocron CLI's `status_name` read it: STATUS-WORDS-ONE SR399); `error` for a code this table does not name.
     pub fn word(s: i32) -> &'static str {
         match s {
             OK => "ok",
