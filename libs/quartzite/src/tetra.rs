@@ -130,8 +130,9 @@ pub enum TetraNode {
     /// NLE2ORDER (SR227): the Surface pixel contract. Every `SurfaceBlit { url == id }` carries RGBA8, straight
     /// (non-premultiplied) alpha, row-major, stride `width * 4`, on every embassy; an embassy whose native buffer
     /// differs converts ONCE at its hand-off (GTK's cairo ARgb32: [`surface_argb32`]), so no caller swizzles.
-    /// AETHERMACGPU-DAMAGE (SR320): a blit with `damage: Some(rect)` carries only that rect's rows (stride `w * 4`), which
-    /// the receiver writes into the frame it holds through [`surface_splice`]; the sender's side is [`SurfaceDamage`].
+    /// AETHERMACGPU-DAMAGE (SR320) / -ENGINEDAMAGE (SR341): a blit with `damage: Some(rects)` carries only those rects'
+    /// rows (each stride `w * 4`, in list order), which the receiver walks with `damage::spans` and writes into the frame it
+    /// holds through [`surface_splice`]; the sender's side is [`SurfaceDamage`].
     Surface {
         id: String,
     },
@@ -380,7 +381,8 @@ pub fn surface_splice(kept: &mut [u8], width: u32, height: u32, rect: (u32, u32,
 }
 
 /// AETHERMACGPU-DAMAGE (SR320): a sender's side of damage blits. It keeps the frame it last sent and turns the next one
-/// into the `SurfaceBlit` to fire: the changed row band only (`damage: Some`), nothing when identical, the whole frame
+/// into the `SurfaceBlit` to fire: the painter's own rects when it has them ([`SurfaceDamage::frame_rects`], SR341), else
+/// the changed row band only (`damage: Some`), nothing when identical, the whole frame
 /// (`damage: None`) on the first send, on a size change, after [`SurfaceDamage::forget`] (the receiver's frame was
 /// replaced by someone else) and at least once every [`bandy::SURFACE_FULL_EVERY`] sends (the bus is lossy: a lagged
 /// receiver heals). The frame is moved into the kept slot, never copied, after the band is cut.
@@ -392,20 +394,33 @@ pub struct SurfaceDamage {
 }
 
 impl SurfaceDamage {
-    /// The blit to fire for this frame, `None` when it is identical to the last one sent.
+    /// The blit to fire for this frame, `None` when it is identical to the last one sent (the row diff decides).
     pub fn frame(&mut self, url: &str, width: u32, height: u32, pixels: Vec<u8>) -> Option<bandy::SMessage> {
-        let band = if self.dims == (width, height) && self.since_full + 1 < bandy::SURFACE_FULL_EVERY {
-            surface_rows_damage(&self.prev, &pixels, width, height)
+        self.frame_rects(url, width, height, pixels, None)
+    }
+
+    /// AETHERMACGPU-ENGINEDAMAGE (SR341): the blit to fire for this frame when the painter names what it changed: `rects`
+    /// (in this frame's pixels) through `damage::merge`: nothing when they are empty, those rects' rows when they are few
+    /// and small; the row diff when `rects` is `None` or covers most of the frame. The whole-frame rules come first.
+    pub fn frame_rects(&mut self, url: &str, width: u32, height: u32, pixels: Vec<u8>, rects: Option<&[(u32, u32, u32, u32)]>) -> Option<bandy::SMessage> {
+        let damage = if self.dims == (width, height) && self.since_full + 1 < bandy::SURFACE_FULL_EVERY {
+            match rects.and_then(|r| crate::damage::merge(r, width, height)) {
+                Some(list) => Some(Some(list)),
+                None => surface_rows_damage(&self.prev, &pixels, width, height).map(|band| band.map(|r| vec![r])),
+            }
         } else {
             None
         };
-        let msg = match band {
+        let msg = match damage {
             Some(None) => return None,
-            Some(Some(rect)) => {
-                let stride = width as usize * 4;
-                let rows = pixels[rect.1 as usize * stride..(rect.1 + rect.3) as usize * stride].to_vec();
+            Some(Some(list)) if list.is_empty() => {
+                self.prev = pixels;
+                return None;
+            }
+            Some(Some(list)) => {
+                let rows = crate::damage::cut(&pixels, width, &list);
                 self.since_full += 1;
-                bandy::SMessage::SurfaceBlit { url: url.to_string(), width, height, pixels: rows, damage: Some(rect) }
+                bandy::SMessage::SurfaceBlit { url: url.to_string(), width, height, pixels: rows, damage: Some(list) }
             }
             None => {
                 self.since_full = 0;
@@ -513,11 +528,18 @@ mod surface_contract_tests {
         let mut rx: Vec<u8> = Vec::new();
         let apply = |m: Option<SMessage>, rx: &mut Vec<u8>| -> Option<Option<(u32, u32, u32, u32)>> {
             let SMessage::SurfaceBlit { width, height, pixels, damage, .. } = m? else { panic!("not a blit") };
-            match damage {
+            match &damage {
                 None => *rx = pixels,
-                Some(r) => assert!(surface_splice(rx, width, height, r, &pixels)),
+                Some(list) => {
+                    for (r, range) in crate::damage::spans(list, width, height, pixels.len()).expect("spans") {
+                        assert!(surface_splice(rx, width, height, r, &pixels[range]));
+                    }
+                }
             }
-            Some(damage)
+            Some(damage.map(|list| {
+                assert_eq!(list.len(), 1, "the row diff sends one band");
+                list[0]
+            }))
         };
         assert_eq!(apply(tx.frame("viewport", w, h, blank.clone()), &mut rx), Some(None));
         let mut f = blank.clone();
@@ -539,6 +561,42 @@ mod surface_contract_tests {
         assert_eq!(rx, g);
         tx.forget();
         assert_eq!(apply(tx.frame("viewport", 3, 4, g.clone()), &mut rx), Some(None));
+    }
+
+    /// AETHERMACGPU-ENGINEDAMAGE (SR341): the painter's rects: two apart rects send exactly their rows (not the band
+    /// between them), an empty list sends nothing, `None` falls to the row diff, most-of-the-frame falls to the row diff,
+    /// and the whole-frame rules still win; a receiver walking `damage::spans` ends on the sender's frame.
+    #[test]
+    fn surface_damage_rects_kat() {
+        use bandy::SMessage;
+        let (w, h) = (8u32, 8u32);
+        let mut tx = SurfaceDamage::default();
+        let mut rx = vec![0u8; (w * h * 4) as usize];
+        let whole = tx.frame_rects("viewport", w, h, rx.clone(), Some(&[(0, 0, 1, 1)]));
+        assert!(matches!(whole, Some(SMessage::SurfaceBlit { damage: None, .. })), "the first send is whole");
+        let mut f = rx.clone();
+        let set = |f: &mut Vec<u8>, x: u32, y: u32| f[((y * w + x) * 4) as usize] = 9;
+        set(&mut f, 1, 0);
+        set(&mut f, 6, 7);
+        let rects = [(1, 0, 1, 1), (6, 7, 1, 1)];
+        let Some(SMessage::SurfaceBlit { pixels, damage: Some(list), width, height, .. }) = tx.frame_rects("viewport", w, h, f.clone(), Some(&rects)) else {
+            panic!("a rect blit")
+        };
+        assert_eq!(list, rects.to_vec());
+        assert_eq!(pixels.len(), 2 * 4, "two pixels, not the 8-row band");
+        for (r, range) in crate::damage::spans(&list, width, height, pixels.len()).expect("spans") {
+            assert!(surface_splice(&mut rx, width, height, r, &pixels[range]));
+        }
+        assert_eq!(rx, f);
+        assert!(tx.frame_rects("viewport", w, h, f.clone(), Some(&[])).is_none(), "nothing painted, nothing sent");
+        set(&mut f, 3, 4);
+        let band = tx.frame_rects("viewport", w, h, f.clone(), None);
+        assert!(matches!(band, Some(SMessage::SurfaceBlit { damage: Some(ref l), .. }) if *l == vec![(0, 4, 8, 1)]), "None: the row diff");
+        set(&mut f, 3, 5);
+        let most = tx.frame_rects("viewport", w, h, f.clone(), Some(&[(0, 0, 8, 8)]));
+        assert!(matches!(most, Some(SMessage::SurfaceBlit { damage: Some(ref l), .. }) if *l == vec![(0, 5, 8, 1)]), "whole cover: the row diff");
+        tx.forget();
+        assert!(matches!(tx.frame_rects("viewport", w, h, f, Some(&rects)), Some(SMessage::SurfaceBlit { damage: None, .. })), "forget: whole");
     }
 }
 

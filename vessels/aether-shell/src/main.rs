@@ -228,6 +228,8 @@ struct Tab {
     last_lines: Option<Vec<String>>,
     /// AETHERMACGPU-DAMAGE (SR320): the frame last blitted, so the next blit carries only its changed rows.
     sent: quartzite::tetra::SurfaceDamage,
+    /// AETHERMACGPU-ENGINEDAMAGE (SR341): what that frame was painted at (`aether::render::present_damage`).
+    painted: aether::render::PresentMark,
 }
 
 impl Tab {
@@ -257,6 +259,7 @@ impl Tab {
             window,
             last_lines: None,
             sent: quartzite::tetra::SurfaceDamage::default(),
+            painted: aether::render::PresentMark::default(),
         }
     }
 
@@ -278,14 +281,14 @@ impl Tab {
             if self.engine.tick() {
                 let damages = self.engine.render_frame();
                 if !damages.is_empty() {
-                    self.blit();
+                    self.blit(&damages);
                 }
             }
             return;
         }
         let (damage, lines) = chrome::host::devtools_frame(&mut self.engine, &self.devtools_chrome, &mut self.devtools, self.window);
-        if damage.is_some_and(|d| !d.is_empty()) {
-            self.blit();
+        if let Some(d) = damage.filter(|d| !d.is_empty()) {
+            self.blit(&d);
         }
         if let Some(lines) = lines {
             if self.is_active() && self.last_lines.as_ref() != Some(&lines) {
@@ -310,11 +313,14 @@ impl Tab {
         let _ = self.reports.send(r);
     }
 
-    fn blit(&mut self) {
+    /// AETHERMACGPU-ENGINEDAMAGE (SR341): `damages` is the paint's own list (`render_frame`'s, CSS px): mapped to the
+    /// presented frame's device px (`present_damage`: whole after a scroll), the blit carries only those rects' rows (the
+    /// row diff when they cover most of the frame; whole on the tetra rules).
+    fn blit(&mut self, damages: &[(u32, u32, u32, u32)]) {
         if self.is_active() {
+            let rects = aether::render::present_damage(&self.engine, damages, &mut self.painted);
             let (width, height, pixels) = self.engine.present_rgba();
-            // AETHERMACGPU-DAMAGE (SR320): only the rows that changed since the last blit (whole on the tetra rules).
-            if let Some(m) = self.sent.frame("viewport", width, height, pixels) {
+            if let Some(m) = self.sent.frame_rects("viewport", width, height, pixels, Some(&rects)) {
                 self.bus.fire(m);
             }
         }
@@ -329,7 +335,7 @@ impl Tab {
         self.engine.damage_rects.push((0, 0, w, h));
         let _ = self.engine.render_frame();
         self.sent.forget(); // AETHERMACGPU-DAMAGE (SR320): the face holds another tab's frame: this one goes whole
-        self.blit();
+        self.blit(&[(0, 0, w, h)]);
         self.bus.fire(SMessage::BrowserUrlChanged(self.engine.current_url()));
         self.bus.fire(SMessage::BrowserTitleChanged(self.engine.title.clone()));
         if let Some((width, height, rgba)) = self.favicon.borrow().clone() {
@@ -593,6 +599,12 @@ impl Tab {
                 if self.is_active() {
                     eprintln!("{}", p.witness());
                 }
+            }
+            // AETHERMACGPU-ENGINEDAMAGE (SR341): the face lagged on the bus and no longer knows its frame: send it whole.
+            SMessage::SurfaceResend { url } if url == "viewport" => {
+                self.sent.forget();
+                let (w, h) = (self.engine.width, self.engine.height);
+                self.blit(&[(0, 0, w, h)]);
             }
             _ => {}
         }
@@ -911,7 +923,7 @@ impl Coordinator {
             | SMessage::BrowserDevtoolsPanel(_)
             | SMessage::BrowserDevtoolsEval(_)
             | SMessage::BrowserDevtoolsGoto { .. }
-            | SMessage::BrowserA11y(_) => self.to_active(m),
+            | SMessage::BrowserA11y(_) | SMessage::SurfaceResend { .. } => self.to_active(m), // SurfaceResend: AETHERMACGPU-ENGINEDAMAGE (SR341)
             _ => {}
         }
     }
@@ -1475,7 +1487,7 @@ mod tests {
         assert_eq!((w2, h2), (w, h));
         let Some(SMessage::SurfaceBlit { damage, pixels, width, height, .. }) = sent.frame("viewport", w2, h2, second.clone()) else { panic!("a changed frame blits") };
         assert_eq!((width, height), (w, h));
-        assert_eq!(damage, Some((0, y, w, 1)));
+        assert_eq!(damage, Some(vec![(0, y, w, 1)]));
         let stride = (w * 4) as usize;
         assert_eq!(pixels, second[y as usize * stride..(y as usize + 1) * stride]);
         assert_eq!(whole / pixels.len(), h as usize, "one row instead of {h}");

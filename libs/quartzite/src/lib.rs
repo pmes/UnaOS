@@ -24,7 +24,7 @@
 pub mod platforms;
 pub mod spline;
 pub mod surface;
-
+pub mod damage; // AETHERMACGPU-ENGINEDAMAGE (SR341): the damage rect geometry (host-testable)
 pub mod text;
 pub mod tetra;
 pub mod widgets;

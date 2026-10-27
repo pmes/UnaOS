@@ -900,6 +900,7 @@ pub fn bootstrap_image_surface(id: &str, synapse: bandy::Synapse) -> Retained<NS
     let mut rx = synapse.subscribe();
 
     let target_id = id.to_string();
+    let resend = synapse.clone(); // AETHERMACGPU-ENGINEDAMAGE (SR341): a lagged loop asks for the surface whole
     // The AppKit main thread has no tokio reactor; give the subscription loop
     // its own thread + current-thread runtime and hop frames back via GCD.
     std::thread::Builder::new().name("surface-blit".into()).spawn(move || {
@@ -924,8 +925,8 @@ pub fn bootstrap_image_surface(id: &str, synapse: bandy::Synapse) -> Retained<NS
                             let mtm = MainThreadMarker::new().unwrap();
                             match damage {
                                 None => bound.get(mtm).set_frame(&pixels, &[], width, height),
-                                // AETHERMACGPU-DAMAGE (SR320): the rect's rows only.
-                                Some(rect) => bound.get(mtm).set_damage(&pixels, width, height, rect),
+                                // AETHERMACGPU-DAMAGE (SR320) / -ENGINEDAMAGE (SR341): the rects' rows only.
+                                Some(rects) => bound.get(mtm).set_damage(&pixels, width, height, &rects),
                             }
                         });
                     }
@@ -944,7 +945,8 @@ pub fn bootstrap_image_surface(id: &str, synapse: bandy::Synapse) -> Retained<NS
                     });
                 }
                 Ok(_) => {}
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                // AETHERMACGPU-ENGINEDAMAGE (SR341): the kept frame missed blits; the sender sends this surface whole.
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => resend.fire(bandy::SMessage::SurfaceResend { url: target_id.clone() }),
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }
         }
@@ -954,18 +956,25 @@ pub fn bootstrap_image_surface(id: &str, synapse: bandy::Synapse) -> Retained<NS
     Retained::into_super(view)
 }
 
-// AETHERMACGPU-DAMAGE (LEDGER SR320): a damage blit (`SurfaceBlit { damage: Some(rect) }`, `pixels` = the rect's rows).
+// AETHERMACGPU-DAMAGE (LEDGER SR320) / -ENGINEDAMAGE (SR341): a damage blit (`SurfaceBlit { damage: Some(rects) }`,
+// `pixels` = the rects' rows in list order).
 impl FacetImageView {
-    /// The Metal page takes the rect into its texture (`gpu_view::page_damage`); otherwise the rows are spliced into the
-    /// kept frame (`ivars.rgba`, through `tetra::surface_splice`) and that frame is shown through `set_frame`. A kept frame
-    /// of another size drops the blit (the sender's next whole frame repairs it). Main thread only.
-    pub fn set_damage(&self, rows: &[u8], width: u32, height: u32, rect: (u32, u32, u32, u32)) {
-        if super::gpu_view::page_damage(self, rows, width, height, rect) {
+    /// The Metal page takes the rects into its texture (`gpu_view::page_damage`); otherwise each rect's rows
+    /// (`damage::spans`) are spliced into the kept frame (`ivars.rgba`, through `tetra::surface_splice`) and that frame is
+    /// shown once through `set_frame`. A kept frame of another size, or rects that do not fit, drop the blit (the sender's
+    /// next whole frame repairs it). Main thread only.
+    pub fn set_damage(&self, rows: &[u8], width: u32, height: u32, rects: &[(u32, u32, u32, u32)]) {
+        if super::gpu_view::page_damage(self, rows, width, height, rects) {
             return;
         }
+        let Some(spans) = crate::damage::spans(rects, width, height, rows.len()) else {
+            return;
+        };
         let kept = {
             let mut kept = self.ivars().rgba.borrow_mut();
-            if *self.ivars().size.borrow() != (width, height) || !crate::tetra::surface_splice(&mut kept, width, height, rect, rows) {
+            if *self.ivars().size.borrow() != (width, height)
+                || !spans.into_iter().all(|(r, range)| crate::tetra::surface_splice(&mut kept, width, height, r, &rows[range]))
+            {
                 return;
             }
             kept.clone()

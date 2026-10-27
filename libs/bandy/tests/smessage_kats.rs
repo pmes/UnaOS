@@ -294,9 +294,9 @@ kat!(
         width: 2,
         height: 2,
         pixels: vec![5, 6, 7, 8, 1, 2, 3, 4],
-        damage: Some((0, 1, 2, 1)),
+        damage: Some(vec![(0, 1, 2, 1)]),
     },
-    r#"{"SurfaceBlit":{"url":"viewport","width":2,"height":2,"pixels":[5,6,7,8,1,2,3,4],"damage":[0,1,2,1]}}"#
+    r#"{"SurfaceBlit":{"url":"viewport","width":2,"height":2,"pixels":[5,6,7,8,1,2,3,4],"damage":[[0,1,2,1]]}}"#
 );
 kat!(
     kat_play_media,
@@ -1445,6 +1445,7 @@ fn smessage_variant_name(m: &SMessage) -> &'static str {
         SMessage::ReEmbedDone { .. } => "ReEmbedDone",
         SMessage::OpenDocument { .. } => "OpenDocument",
         SMessage::SurfaceBlit { .. } => "SurfaceBlit",
+        SMessage::SurfaceResend { .. } => "SurfaceResend",
         SMessage::PlayMedia { .. } => "PlayMedia",
         SMessage::BrowserNavBack => "BrowserNavBack",
         SMessage::BrowserNavForward => "BrowserNavForward",
@@ -1712,3 +1713,22 @@ fn surfaceresize_old_form_is_surface_zero() {
     *m.surface_mut().unwrap() = 2;
     assert_eq!(serde_json::to_string(&m).unwrap(), r#"{"BrowserResize":[800,600,2]}"#);
 }
+
+// AETHERMACGPU-ENGINEDAMAGE (SR341): a blit of two rects carries each rect's rows in list order (pixel (1,0) of a 3x2
+// frame, then the 2x1 run at (0,1)); a face that lagged asks for its surface whole.
+kat!(
+    kat_surface_blit_damage_rects,
+    SMessage::SurfaceBlit {
+        url: "viewport".to_string(),
+        width: 3,
+        height: 2,
+        pixels: vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+        damage: Some(vec![(1, 0, 1, 1), (0, 1, 2, 1)]),
+    },
+    r#"{"SurfaceBlit":{"url":"viewport","width":3,"height":2,"pixels":[1,2,3,4,5,6,7,8,9,10,11,12],"damage":[[1,0,1,1],[0,1,2,1]]}}"#
+);
+kat!(
+    kat_surface_resend,
+    SMessage::SurfaceResend { url: "viewport".to_string() },
+    r#"{"SurfaceResend":{"url":"viewport"}}"#
+);
