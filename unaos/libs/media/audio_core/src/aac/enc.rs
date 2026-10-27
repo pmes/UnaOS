@@ -16,17 +16,21 @@
 //! * BLOCK SWITCHING (AACENCSHORT, LEDGER SR375): an attack detector (8 sub-blocks of 128 high-passed samples per block,
 //!   an attack where one carries `ATTACK_RATIO` times the mean of the 8 before it and at least `ATTACK_MIN`) over a
 //!   ONE-FRAME LOOKAHEAD (`encode` holds one input frame: API latency only, the stream's delay is still [`PRIMING`]) drives
-//!   LONG → LONG_START → EIGHT_SHORT → LONG_STOP with sine shapes; the eight short windows are coded as eight groups
-//!   (no grouping rule: AACENC-GROUPING owed). M/S (AACENCSHORT): a stereo frame is always a CPE with `common_window`
-//!   1; a band goes M/S when its perceptual-entropy estimate is lower that way (`ms_decide`), ms_mask_present 0/1/2.
-//!   Not built: TNS, PNS, intensity, SBR, a bit reservoir, one budget across the CPE (AACENC-CPEBUDGET).
+//!   LONG → LONG_START → EIGHT_SHORT → LONG_STOP with sine shapes. WINDOW GROUPING (AACENCGROUPING, LEDGER SR378): the
+//!   detector's own 8 sub-block energies of the block (sub-block s = short window s's centre, summed over the channels)
+//!   join window w to w-1's group unless the larger of the two exceeds `GROUP_RATIO` times the smaller (both floored by
+//!   `ATTACK_MIN`: `grouping`); the spectrum is interleaved into the decoder's group → band → window order (`interleave`),
+//!   so a group's band is one range sharing one scalefactor and codebook. M/S (AACENCSHORT): a stereo frame is always a
+//!   CPE with `common_window` 1; a band goes M/S when its perceptual-entropy estimate is lower that way (`ms_decide`),
+//!   ms_mask_present 0/1/2. Not built: TNS, PNS, intensity, SBR, a bit reservoir.
 //! * THE QUANTISER (the two loops): a per-band threshold from the band's energy at a fixed SNR offset (floored at an
 //!   absolute level and at the frame's mask floor, `MASK_DB` under its loudest band per coefficient, so a tone's window
 //!   leakage is not coded at the tone's SNR; measured on `aac_enc_sine_snr`'s 1 kHz tone at 128 kb/s stereo, 1356 bits a
 //!   channel: MASK_DB 40 -> 40.2 dB at 75 B/frame, 50 -> 49.6 dB at 155 B, 60 (taken) -> 56.8 dB at 247 B; with no floor
 //!   14.4 dB, the leakage bands eating the budget) — the OUTER loop takes, per band, the coarsest scalefactor whose measured quantisation noise stays
 //!   under it; the INNER loop shifts every band by one global offset, binary-searched so the frame's counted bits fit
-//!   the per-channel budget (`bitrate · 1024 / rate / channels`); a band above the bitrate's cutoff or quantised to
+//!   the budget (`bitrate · 1024 / rate / channels` a channel; a CPE's two channels share ONE offset against twice that,
+//!   AACENCGROUPING SR378, so an M/S frame spends S's leftover on M); a band above the bitrate's cutoff or quantised to
 //!   nothing is ZERO_HCB; consecutive scalefactors are held within ±60 by coarsening the finer band.
 //! * OUTPUT: one raw_data_block per [`AccessUnit`] (MP4's sample), [`Encoder::adts`] frames one for a `.aac` stream,
 //!   [`Encoder::asc`] is the AudioSpecificConfig. The first unit carries the 1024-sample MDCT priming ([`PRIMING`]): an
@@ -69,6 +73,9 @@ const LONG_STOP: u8 = 3;
 /// its absolute floor (i16² summed over the sub-block: an rms step of ~88 LSB).
 const ATTACK_RATIO: f64 = 10.0;
 const ATTACK_MIN: f64 = 1.0e6;
+/// The grouping rule (AACENCGROUPING): neighbouring short windows share a group while their sub-block energies (each
+/// plus `ATTACK_MIN`) lie within this ratio (6 dB).
+const GROUP_RATIO: f64 = 4.0;
 
 /// The private MSB-first bit writer (BITWRITER-ONE owed: h264enc_core's lives in a crate this one does not link).
 struct Bits {
@@ -94,23 +101,28 @@ impl Bits {
 }
 
 /// The bands a block codes (AACENCSHORT): long, one window of `SWB_1024` bands; EIGHT_SHORT, eight windows of `SWB_128`
-/// bands. Band `i` is window `i / nb`, band `i % nb` — the decoder's scalefactor and spectral order with one window a group.
+/// bands in `ng` groups (AACENCGROUPING). Band `i` is group `i / nb`, band `i % nb` — the decoder's scalefactor order.
 #[derive(Clone, Copy)]
 struct Grid {
     short: bool,
-    nw: usize,
+    /// window groups (long: 1), the windows in each, the 7 scale_factor_grouping bits on the wire
+    ng: usize,
+    glen: [usize; 8],
+    bits: u32,
     swb: &'static [u16],
     /// bands per window below the bitrate's cutoff
     nb: usize,
 }
 
 impl Grid {
-    fn bands(&self) -> usize { self.nw * self.nb }
-    /// Coefficient range of band `i` in the 1024-value block (short windows window-major, `w * 128 + k`).
+    fn bands(&self) -> usize { self.ng * self.nb }
+    /// Coefficient range of band `i` in the group-interleaved 1024-value block (`interleave`): group g starts at 128 ×
+    /// the windows before it, its band b runs `swb[b]·gl .. swb[b+1]·gl` past that (the decoder's g → sfb → window order).
     fn rng(&self, i: usize) -> (usize, usize) {
-        let (w, b) = (i / self.nb, i % self.nb);
-        let o = if self.short { w * 128 } else { 0 };
-        (o + self.swb[b] as usize, o + self.swb[b + 1] as usize)
+        let (gi, b) = (i / self.nb, i % self.nb);
+        let o = 128 * self.glen[..gi].iter().sum::<usize>();
+        let gl = self.glen[gi];
+        (o + self.swb[b] as usize * gl, o + self.swb[b + 1] as usize * gl)
     }
 }
 
@@ -118,7 +130,7 @@ impl Grid {
 struct Coded {
     max_sfb: usize,
     global_gain: i32,
-    /// per window and band (`w * max_sfb + b`): codebook (0 = ZERO_HCB) and scalefactor
+    /// per group and band (`g * max_sfb + b`): codebook (0 = ZERO_HCB) and scalefactor
     cb: Vec<u8>,
     sf: Vec<i32>,
     q: Vec<i32>,
@@ -127,11 +139,11 @@ struct Coded {
 
 impl Coded {
     /// Re-strided to `m >= max_sfb` bands a window (a CPE's common max_sfb), the new bands ZERO_HCB.
-    fn pad(&mut self, m: usize, nw: usize) {
+    fn pad(&mut self, m: usize, ng: usize) {
         if m == self.max_sfb { return; }
-        let mut cb = vec![0u8; nw * m];
-        let mut sf = vec![0i32; nw * m];
-        for w in 0..nw {
+        let mut cb = vec![0u8; ng * m];
+        let mut sf = vec![0i32; ng * m];
+        for w in 0..ng {
             for b in 0..self.max_sfb {
                 cb[w * m + b] = self.cb[w * self.max_sfb + b];
                 sf[w * m + b] = self.sf[w * self.max_sfb + b];
@@ -173,9 +185,12 @@ pub struct Encoder {
     prev_seq: u8,
     /// per channel: the last 8 sub-block energies and the last sample (the detector's high-pass)
     det: Vec<([f64; 8], f32)>,
-    /// block switching and M/S on (the in-module KATs turn them off for the long-only / L-R comparisons)
+    /// block switching, M/S, window grouping and the one CPE budget on (the in-module KATs turn them off for the
+    /// long-only / L-R / eight-group / per-channel-budget comparisons)
     blocks: bool,
     ms: bool,
+    group: bool,
+    cpe: bool,
 }
 
 impl Encoder {
@@ -223,6 +238,8 @@ impl Encoder {
             det: vec![([0f64; 8], 0f32); ch],
             blocks: true,
             ms: true,
+            group: true,
+            cpe: true,
         })
     }
 
@@ -308,12 +325,19 @@ impl Encoder {
         hit
     }
 
-    /// One ICS grid per window_sequence.
-    fn grid(&self, seq: u8) -> Grid {
+    /// One ICS grid per window_sequence; EIGHT_SHORT groups its windows by `grouping` over the block's sub-block energies
+    /// `env` (eight groups with `group` off), the group lengths read off the bits as the decoder's `ics_info` does.
+    fn grid(&self, seq: u8, env: &[f64; 8]) -> Grid {
         if seq == EIGHT_SHORT {
-            Grid { short: true, nw: 8, swb: t::SWB_128[self.sf_index], nb: self.max_band_s }
+            let bits = if self.group { grouping(env) } else { 0 };
+            let (mut glen, mut ng) = ([0usize; 8], 1usize);
+            glen[0] = 1;
+            for w in 1..8 {
+                if (bits >> (7 - w)) & 1 != 0 { glen[ng - 1] += 1; } else { glen[ng] = 1; ng += 1; }
+            }
+            Grid { short: true, ng, glen, bits, swb: t::SWB_128[self.sf_index], nb: self.max_band_s }
         } else {
-            Grid { short: false, nw: 1, swb: t::SWB_1024[self.sf_index], nb: self.max_band }
+            Grid { short: false, ng: 1, glen: [1, 0, 0, 0, 0, 0, 0, 0], bits: 0, swb: t::SWB_1024[self.sf_index], nb: self.max_band }
         }
     }
 
@@ -387,6 +411,9 @@ impl Encoder {
         let mut look = Vec::with_capacity(n);
         look.extend_from_slice(&cur[n / 2..]);
         look.extend_from_slice(&next[..n / 2]);
+        // THIS block's 8 sub-block energies (computed when the last frame looked ahead), summed over the channels: the
+        // grouping signal (a common_window CPE shares one ics_info), read before `attack` moves on to the next block
+        let env: [f64; 8] = core::array::from_fn(|s| self.det.iter().map(|d| d.0[s]).sum());
         let attack = self.attack(&look) && self.blocks;
         // the sequence state machine (one decision for both channels: a common_window CPE needs it)
         let seq = if self.short_next || (self.prev_seq == EIGHT_SHORT && attack) {
@@ -400,7 +427,7 @@ impl Encoder {
         };
         self.short_next = attack;
         self.prev_seq = seq;
-        let g = self.grid(seq);
+        let g = self.grid(seq, &env);
         let mut x: Vec<Vec<f32>> = Vec::with_capacity(ch);
         for c in 0..ch {
             let mut raw = vec![0f32; 2048];
@@ -410,11 +437,12 @@ impl Encoder {
                 raw[FRAME + i] = s;
                 self.hist[c][i] = s;
             }
-            x.push(self.analyse(seq, &raw));
+            let s = self.analyse(seq, &raw);
+            x.push(if g.short { interleave(&s, &g) } else { s });
         }
         let mut allowed: Vec<Vec<f64>> = x.iter().map(|s| self.allowed(s, &g)).collect();
         let ms = if ch == 2 && self.ms { ms_decide(&mut x, &mut allowed, &g) } else { vec![false; g.bands()] };
-        let mut coded: Vec<Coded> = (0..ch).map(|c| self.code(&x[c], &g, &allowed[c])).collect();
+        let mut coded: Vec<Coded> = self.code(&x, &g, &allowed);
         let mut w = Bits::new();
         if ch == 1 {
             w.put(3, super::decoder::ID_SCE);
@@ -422,13 +450,13 @@ impl Encoder {
             write_ics(&mut w, &coded[0], &g, Some(seq));
         } else {
             let m = coded[0].max_sfb.max(coded[1].max_sfb);
-            for c in coded.iter_mut() { c.pad(m, g.nw); }
+            for c in coded.iter_mut() { c.pad(m, g.ng); }
             w.put(3, super::decoder::ID_CPE);
             w.put(4, 0);
             w.put(1, 1); // common_window: one ics_info, the M/S mask
-            write_info(&mut w, seq, m);
-            let mut used: Vec<bool> = Vec::with_capacity(g.nw * m);
-            for win in 0..g.nw { for b in 0..m { used.push(ms[win * g.nb + b]); } }
+            write_info(&mut w, seq, m, g.bits);
+            let mut used: Vec<bool> = Vec::with_capacity(g.ng * m);
+            for grp in 0..g.ng { for b in 0..m { used.push(ms[grp * g.nb + b]); } }
             let present = if !used.iter().any(|&u| u) { 0 } else if used.iter().all(|&u| u) { 2 } else { 1 };
             w.put(2, present);
             if present == 1 { for &u in &used { w.put(1, u as u32); } }
@@ -453,40 +481,56 @@ impl Encoder {
         }).collect()
     }
 
-    /// The two loops on one channel's spectrum over the grid, each band held under its `allowed` noise.
-    fn code(&self, x: &[f32], g: &Grid, allowed: &[f64]) -> Coded {
+    /// The two loops on the channels' spectra over the grid, each band held under its `allowed` noise: the OUTER loop per
+    /// channel, the INNER loop per budget set — every channel in ONE set against `budget · channels` (AACENCGROUPING: a
+    /// CPE's common global offset, so an M/S frame spends S's leftover on M), or with `cpe` off one set per channel.
+    fn code(&self, xs: &[Vec<f32>], g: &Grid, allowed: &[Vec<f64>]) -> Vec<Coded> {
         let nb = g.bands();
-        let a: Vec<f32> = x.iter().map(|&v| math::pow(v.abs() as f64, 0.75) as f32).collect();
-        // the OUTER loop: per band, the coarsest scalefactor within its threshold (None: the band is not coded)
-        let mut base: Vec<Option<(i32, i32)>> = Vec::with_capacity(nb); // (sf, the finest sf without overflow)
-        for i in 0..nb {
-            let (lo, hi) = g.rng(i);
-            let e: f64 = x[lo..hi].iter().map(|&v| v as f64 * v as f64).sum();
-            let allowed = allowed[i];
-            if e <= allowed { base.push(None); continue; }
-            // the finest legal sf: |q| <= MAX_Q (maxq falls as sf rises)
-            let (mut l, mut h) = (0i32, 255i32);
-            while l < h { let m = (l + h) / 2; if self.band(x, &a, lo, hi, m).1 <= MAX_Q { h = m; } else { l = m + 1; } }
-            let fine = l;
-            // the coarsest sf whose noise stays under the threshold
-            let (mut l, mut h) = (fine, 255i32);
-            while l < h { let m = (l + h + 1) / 2; if self.band(x, &a, lo, hi, m).0 <= allowed { l = m; } else { h = m - 1; } }
-            base.push(Some((l, fine)));
+        let mut aa: Vec<Vec<f32>> = Vec::with_capacity(xs.len());
+        let mut bases: Vec<Vec<Option<(i32, i32)>>> = Vec::with_capacity(xs.len());
+        for (x, allowed) in xs.iter().zip(allowed) {
+            let a: Vec<f32> = x.iter().map(|&v| math::pow(v.abs() as f64, 0.75) as f32).collect();
+            // the OUTER loop: per band, the coarsest scalefactor within its threshold (None: the band is not coded)
+            let mut base: Vec<Option<(i32, i32)>> = Vec::with_capacity(nb); // (sf, the finest sf without overflow)
+            for i in 0..nb {
+                let (lo, hi) = g.rng(i);
+                let e: f64 = x[lo..hi].iter().map(|&v| v as f64 * v as f64).sum();
+                let allowed = allowed[i];
+                if e <= allowed { base.push(None); continue; }
+                // the finest legal sf: |q| <= MAX_Q (maxq falls as sf rises)
+                let (mut l, mut h) = (0i32, 255i32);
+                while l < h { let m = (l + h) / 2; if self.band(x, &a, lo, hi, m).1 <= MAX_Q { h = m; } else { l = m + 1; } }
+                let fine = l;
+                // the coarsest sf whose noise stays under the threshold
+                let (mut l, mut h) = (fine, 255i32);
+                while l < h { let m = (l + h + 1) / 2; if self.band(x, &a, lo, hi, m).0 <= allowed { l = m; } else { h = m - 1; } }
+                base.push(Some((l, fine)));
+            }
+            aa.push(a);
+            bases.push(base);
         }
-        // the INNER loop: the smallest global offset whose frame fits the budget
-        let (mut l, mut h) = (-60i32, 60i32);
-        while l < h {
-            let m = l + (h - l) / 2;
-            if self.plan(x, &a, &base, m, g, g.nb).bits <= self.budget { h = m; } else { l = m + 1; }
+        let sets: Vec<Vec<usize>> = if self.cpe { vec![(0..xs.len()).collect()] } else { (0..xs.len()).map(|c| vec![c]).collect() };
+        let mut out: Vec<Coded> = Vec::with_capacity(xs.len());
+        for set in &sets {
+            let budget = self.budget * set.len();
+            let run = |gofs: i32, top: usize| -> Vec<Coded> { set.iter().map(|&c| self.plan(&xs[c], &aa[c], &bases[c], gofs, g, top)).collect() };
+            let bits = |cs: &[Coded]| cs.iter().map(|c| c.bits).sum::<usize>();
+            // the INNER loop: the smallest global offset whose frame fits the budget
+            let (mut l, mut h) = (-60i32, 60i32);
+            while l < h {
+                let m = l + (h - l) / 2;
+                if bits(&run(m, g.nb)) <= budget { h = m; } else { l = m + 1; }
+            }
+            let mut cs = run(l, g.nb);
+            // still over at the coarsest offset: drop the top bands (of every group, every channel of the set) until it fits
+            let mut top = g.nb;
+            while bits(&cs) > budget && top > 0 {
+                top -= 1;
+                cs = run(60, top);
+            }
+            out.extend(cs);
         }
-        let mut c = self.plan(x, &a, &base, l, g, g.nb);
-        // still over at the coarsest offset: drop the top bands (of every window) until it fits
-        let mut top = g.nb;
-        while c.bits > self.budget && top > 0 {
-            top -= 1;
-            c = self.plan(x, &a, &base, 60, g, top);
-        }
-        c
+        out
     }
 
     /// Band `lo..hi` quantised at `sf`: (the noise energy, the largest |q|).
@@ -547,11 +591,11 @@ impl Encoder {
             if !on[i] { let (lo, hi) = g.rng(i); for k in lo..hi { q[k] = 0; } }
         }
         let max_sfb = (0..nb).filter(|&i| on[i]).map(|i| i % g.nb + 1).max().unwrap_or(0);
-        let mut cb = vec![0u8; g.nw * max_sfb];
-        let mut sfc = vec![0i32; g.nw * max_sfb];
+        let mut cb = vec![0u8; g.ng * max_sfb];
+        let mut sfc = vec![0i32; g.ng * max_sfb];
         // global_gain, ics_info (short: 4-bit max_sfb + 7 grouping bits), pulse/tns/gain_control flags
         let mut bits = if g.short { 8 + 15 + 3 } else { 8 + 11 + 3 };
-        for w in 0..g.nw {
+        for w in 0..g.ng {
             for b in 0..max_sfb {
                 let i = w * g.nb + b;
                 if on[i] {
@@ -563,9 +607,9 @@ impl Encoder {
                 }
             }
         }
-        // section data: runs of one codebook per window (3-bit lengths, escape 7, short; 5-bit, escape 31, long)
+        // section data: runs of one codebook per group (3-bit lengths, escape 7, short; 5-bit, escape 31, long)
         let (sb, esc) = if g.short { (3, 7) } else { (5, 31) };
-        for w in 0..g.nw {
+        for w in 0..g.ng {
             let row = &cb[w * max_sfb..(w + 1) * max_sfb];
             let mut b = 0;
             while b < max_sfb {
@@ -621,15 +665,43 @@ fn ms_decide(x: &mut [Vec<f32>], a: &mut [Vec<f64>], g: &Grid) -> Vec<bool> {
     ms
 }
 
-/// ics_info (§4.4.2.1): EIGHT_SHORT carries a 4-bit max_sfb and the 7 grouping bits (0: eight groups), the long
-/// sequences a 6-bit max_sfb and predictor_data_present 0; the shape is sine.
-fn write_info(w: &mut Bits, seq: u8, max_sfb: usize) {
+/// The grouping rule (AACENCGROUPING, LEDGER SR378): the 7 scale_factor_grouping bits from a block's 8 sub-block
+/// energies (`Encoder::attack`'s, sub-block s = short window s's centre). Window w joins window w-1's group (bit 7 - w)
+/// while the larger of the two energies plus `ATTACK_MIN` is within `GROUP_RATIO` of the smaller plus `ATTACK_MIN`.
+fn grouping(env: &[f64; 8]) -> u32 {
+    let mut bits = 0u32;
+    for w in 1..8 {
+        let (a, b) = (env[w - 1], env[w]);
+        if a.max(b) + ATTACK_MIN <= GROUP_RATIO * (a.min(b) + ATTACK_MIN) { bits |= 1 << (7 - w); }
+    }
+    bits
+}
+
+/// An EIGHT_SHORT spectrum (window-major, `w * 128 + k`) in the decoder's group → band → window order over every
+/// `SWB_128` band of the grid's groups: what `Grid::rng` indexes.
+fn interleave(x: &[f32], g: &Grid) -> Vec<f32> {
+    let mut out = Vec::with_capacity(x.len());
+    let mut w0 = 0;
+    for gi in 0..g.ng {
+        let gl = g.glen[gi];
+        for b in 0..g.swb.len() - 1 {
+            let (lo, hi) = (g.swb[b] as usize, g.swb[b + 1] as usize);
+            for w in w0..w0 + gl { out.extend_from_slice(&x[w * 128 + lo..w * 128 + hi]); }
+        }
+        w0 += gl;
+    }
+    out
+}
+
+/// ics_info (§4.4.2.1): EIGHT_SHORT carries a 4-bit max_sfb and the 7 grouping bits (`grouping`: bit 6 joins window
+/// 1 to window 0's group; 0 is eight groups), the long sequences a 6-bit max_sfb and predictor_data_present 0; sine shape.
+fn write_info(w: &mut Bits, seq: u8, max_sfb: usize, grouping: u32) {
     w.put(1, 0); // ics_reserved_bit
     w.put(2, seq as u32);
     w.put(1, 0); // window_shape: sine
     if seq == EIGHT_SHORT {
         w.put(4, max_sfb as u32);
-        w.put(7, 0); // scale_factor_grouping: every window its own group (AACENC-GROUPING owed)
+        w.put(7, grouping); // scale_factor_grouping (AACENCGROUPING)
     } else {
         w.put(6, max_sfb as u32);
         w.put(1, 0); // predictor_data_present
@@ -637,13 +709,14 @@ fn write_info(w: &mut Bits, seq: u8, max_sfb: usize) {
 }
 
 /// individual_channel_stream (§4.4.2.7): the ics_info when `info` (an SCE; a common_window CPE wrote it once), no pulse
-/// / TNS / gain control; section data, scalefactors and spectral data per window (one window a group).
+/// / TNS / gain control; section data and scalefactors per group, spectral data group → band → window (one range of
+/// the interleaved block per group band: the decoder's per-window reads concatenated).
 fn write_ics(w: &mut Bits, c: &Coded, g: &Grid, info: Option<u8>) {
     w.put(8, c.global_gain as u32);
-    if let Some(seq) = info { write_info(w, seq, c.max_sfb); }
+    if let Some(seq) = info { write_info(w, seq, c.max_sfb, g.bits); }
     let m = c.max_sfb;
     let (sb, esc) = if g.short { (3u32, 7usize) } else { (5u32, 31usize) };
-    for win in 0..g.nw {
+    for win in 0..g.ng {
         let row = &c.cb[win * m..(win + 1) * m];
         let mut b = 0;
         while b < m {
@@ -667,11 +740,10 @@ fn write_ics(w: &mut Bits, c: &Coded, g: &Grid, info: Option<u8>) {
     w.put(1, 0); // pulse_data_present
     w.put(1, 0); // tns_data_present
     w.put(1, 0); // gain_control_data_present
-    for win in 0..g.nw {
-        let o = if g.short { win * 128 } else { 0 };
+    for grp in 0..g.ng {
         for b in 0..m {
-            let cb = c.cb[win * m + b];
-            if cb != 0 { write_band(w, cb, &c.q[o + g.swb[b] as usize..o + g.swb[b + 1] as usize]); }
+            let cb = c.cb[grp * m + b];
+            if cb != 0 { let (lo, hi) = g.rng(grp * g.nb + b); write_band(w, cb, &c.q[lo..hi]); }
         }
     }
 }
@@ -826,6 +898,7 @@ mod tests {
                 n += (x - y) * (x - y);
             }
             let snr = 10.0 * math::log10(s / n.max(1e-9));
+            std::println!("aac_enc_sine_snr: channel {c} SNR {snr:.1} dB");
             assert!(snr >= 30.0, "channel {c}: SNR {snr:.1} dB");
         }
     }
@@ -886,11 +959,25 @@ mod tests {
         r.read(1).unwrap();
         let seq = r.read(2).unwrap();
         r.read(1).unwrap();
-        let (groups, max_sfb) = if seq == 2 { let m = r.read(4).unwrap() as usize; assert_eq!(r.read(7).unwrap(), 0); (8, m) } else { let m = r.read(6).unwrap() as usize; r.read(1).unwrap(); (1, m) };
+        let (groups, max_sfb) = if seq == 2 { let m = r.read(4).unwrap() as usize; (8 - r.read(7).unwrap().count_ones() as usize, m) } else { let m = r.read(6).unwrap() as usize; r.read(1).unwrap(); (1, m) };
         let present = r.read(2).unwrap();
         let n = groups * max_sfb;
         let on = match present { 1 => (0..n).filter(|_| r.read(1).unwrap() == 1).count(), 2 => n, _ => 0 };
         (present, on, n)
+    }
+
+    /// An EIGHT_SHORT unit's 7 scale_factor_grouping bits off the wire (AACENCGROUPING); None for a long sequence.
+    fn wire_grouping(u: &AccessUnit) -> Option<u32> {
+        let mut r = BitReader::new(&u.data);
+        let id = r.read(3).unwrap();
+        r.read(4).unwrap();
+        if id == crate::aac::decoder::ID_CPE { r.read(1).unwrap(); } else { r.read(8).unwrap(); }
+        r.read(1).unwrap();
+        let seq = r.read(2).unwrap();
+        r.read(1).unwrap();
+        if seq != 2 { return None; }
+        r.read(4).unwrap();
+        Some(r.read(7).unwrap())
     }
 
     /// Castanet-like bursts on silence: 64 samples of a decaying 3 kHz tone (amplitude 16000) at each position; the
@@ -907,12 +994,17 @@ mod tests {
     }
 
     // floors under the measured numbers (LEDGER SR375): the bursts' SNR 15.5 / 16.1 dB at 128 kb/s stereo; the pre-echo
-    // 10.1 dB lower with short windows (4.37e8 -> 4.27e7, mono 64 kb/s; SNR 2.6 -> 15.5 dB); M/S on 1025 of 1025 bands
+    // 10.1 dB lower with short windows (4.37e8 -> 4.27e7, mono 64 kb/s; SNR 2.6 -> 15.5 dB); M/S on 1025 of 1025 bands.
+    // AACENCGROUPING (LEDGER SR378): grouped, the bursts 15.1 / 15.8 dB (eight groups 15.5 / 16.2), the short units 1011
+    // bytes (eight groups 997: those frames sit at the budget, the saved side bits go to the spectrum; the group band's
+    // pooled threshold costs the 0.4 dB, AACENC-GROUP-THRESHOLD owed); the pre-echo 4.37e8 -> 4.26e7, 10.1 dB (floor 10)
     const SHORT_SNR_FLOOR: f64 = 12.0;
-    const PRE_ECHO_DB: f64 = 6.0;
+    const PRE_ECHO_DB: f64 = 10.0;
     const MS_BANDS_FLOOR: f64 = 0.9;
 
     const BURSTS: [usize; 3] = [10000, 20000, 30000];
+    /// AACENCGROUPING (LEDGER SR378): the grouping bits of the three short units, read off the wire.
+    const CLICK_GROUPS: [u32; 3] = [0x4F, 0x3F, 0x7C];
 
     /// The 256-point fold (the short windows) against the definition, as `aac_enc_mdct_matches_direct` does for 2048.
     #[test]
@@ -934,23 +1026,16 @@ mod tests {
         assert!(worst <= peak * 1e-4, "worst {worst} peak {peak}");
     }
 
-    /// The window sequence around three bursts, read off the wire and PINNED: block u's attack window is input
-    /// [(u-1)·1024 + 512, u·1024 + 512), so a burst at p makes unit (p - 512) / 1024 + 1 EIGHT_SHORT, the one before
-    /// LONG_START, the one after LONG_STOP; every other unit ONLY_LONG. The stream decodes through the decoder's short path.
-    #[test]
-    fn aac_enc_short_click_sequence() {
+    /// The three bursts at 128 kb/s stereo with window grouping on or off: (units, per-channel SNR, the short units' bytes).
+    fn clicks(group: bool) -> (Vec<AccessUnit>, [f64; 2], usize) {
         let frames = 40960;
         let pcm = bursts(frames, &BURSTS, 2);
         let mut e = Encoder::new(48000, 2, 128000).unwrap();
+        e.group = group;
         let mut units = e.encode(&pcm);
         units.extend(e.flush());
-        assert_eq!(units.len(), 41);
-        for (i, u) in units.iter().enumerate() { assert_eq!(u.pts, i as u64 * 1024); }
-        let seq: Vec<u32> = units.iter().map(wire_seq).collect();
-        let mut want = vec![0u32; 41];
-        for u in [9usize, 19, 28] { want[u] = 1; want[u + 1] = 2; want[u + 2] = 3; }
-        assert_eq!(seq, want);
         let d = decode(&e, &units);
+        let mut snr = [0f64; 2];
         for c in 0..2 {
             let (mut s, mut n) = (0f64, 0f64);
             for i in 0..frames {
@@ -959,10 +1044,39 @@ mod tests {
                 s += x * x;
                 n += (x - y) * (x - y);
             }
-            let snr = 10.0 * math::log10(s / n.max(1e-9));
-            std::println!("aac_enc_short_click_sequence: channel {c} SNR {snr:.1} dB");
-            assert!(snr >= SHORT_SNR_FLOOR, "channel {c}: SNR {snr:.1} dB");
+            snr[c] = 10.0 * math::log10(s / n.max(1e-9));
         }
+        let short = units.iter().filter(|u| wire_seq(u) == 2).map(|u| u.data.len()).sum();
+        (units, snr, short)
+    }
+
+    /// The window sequence around three bursts, read off the wire and PINNED: block u's attack window is input
+    /// [(u-1)·1024 + 512, u·1024 + 512), so a burst at p makes unit (p - 512) / 1024 + 1 EIGHT_SHORT, the one before
+    /// LONG_START, the one after LONG_STOP; every other unit ONLY_LONG. The stream decodes through the decoder's short path.
+    /// AACENCGROUPING: the short units' grouping bits are PINNED (`CLICK_GROUPS`; the burst sits in sub-block 2, 0 and 6
+    /// of units 10 / 20 / 29), the same sequence with grouping off and eight groups there.
+    #[test]
+    fn aac_enc_short_click_sequence() {
+        let (units, snr, short) = clicks(true);
+        let (units8, snr8, short8) = clicks(false);
+        assert_eq!(units.len(), 41);
+        for (i, u) in units.iter().enumerate() { assert_eq!(u.pts, i as u64 * 1024); }
+        let seq: Vec<u32> = units.iter().map(wire_seq).collect();
+        let mut want = vec![0u32; 41];
+        for u in [9usize, 19, 28] { want[u] = 1; want[u + 1] = 2; want[u + 2] = 3; }
+        assert_eq!(seq, want);
+        assert_eq!(units8.iter().map(wire_seq).collect::<Vec<u32>>(), want);
+        let grp: Vec<Option<u32>> = units.iter().map(wire_grouping).collect();
+        let mut want_grp = vec![None; 41];
+        for (k, u) in [10usize, 20, 29].into_iter().enumerate() { want_grp[u] = Some(CLICK_GROUPS[k]); }
+        assert_eq!(grp, want_grp);
+        for (k, u) in [10usize, 20, 29].into_iter().enumerate() {
+            let groups = 8 - CLICK_GROUPS[k].count_ones();
+            assert!((2..=8).contains(&groups), "unit {u}: {groups} groups");
+            assert_eq!(wire_grouping(&units8[u]), Some(0));
+        }
+        std::println!("aac_enc_short_click_sequence: grouping {:#04x} {:#04x} {:#04x}; short units {short} bytes (eight groups {short8}); SNR {:.1}/{:.1} dB (eight groups {:.1}/{:.1})", CLICK_GROUPS[0], CLICK_GROUPS[1], CLICK_GROUPS[2], snr[0], snr[1], snr8[0], snr8[1]);
+        for c in 0..2 { assert!(snr[c] >= SHORT_SNR_FLOOR, "channel {c}: SNR {:.1} dB", snr[c]); }
     }
 
     /// Mono bursts at 64 kb/s, block switching on vs off: (the decoded energy in [p - 768, p - 64) summed over the
@@ -997,8 +1111,9 @@ mod tests {
         assert!(db >= PRE_ECHO_DB, "pre-echo only {db:.1} dB lower");
     }
 
-    /// L = a broadband noise, R = L + an independent ±8: (units, total bytes, per-channel SNR) with M/S on or off.
-    fn correlated(ms: bool) -> (Vec<AccessUnit>, usize, [f64; 2]) {
+    /// L = a broadband noise, R = L + an independent ±8: (units, total bytes, per-channel SNR) with M/S on or off and the
+    /// one CPE budget on or off.
+    fn correlated(ms: bool, cpe: bool) -> (Vec<AccessUnit>, usize, [f64; 2]) {
         let frames = 24000;
         let (mut a, mut b) = (0x1234_5678u32, 0x9abc_def0u32);
         let mut pcm = Vec::with_capacity(frames * 2);
@@ -1012,6 +1127,7 @@ mod tests {
         }
         let mut e = Encoder::new(48000, 2, 128000).unwrap();
         e.ms = ms;
+        e.cpe = cpe;
         let mut units = e.encode(&pcm);
         units.extend(e.flush());
         let bytes = units.iter().map(|u| u.data.len()).sum();
@@ -1032,10 +1148,11 @@ mod tests {
 
     /// A correlated pair (L ≈ R) takes M/S on most bands (read off the wire), costs fewer bytes than the independent
     /// L/R coding (S falls under its threshold and codes nothing) and decodes through the decoder's M/S path no worse.
+    /// Both at SR375's per-channel budget (`cpe` off): the byte saving is that budget's; `aac_enc_cpe_budget` spends it.
     #[test]
     fn aac_enc_ms_correlated() {
-        let (u_ms, b_ms, s_ms) = correlated(true);
-        let (u_lr, b_lr, s_lr) = correlated(false);
+        let (u_ms, b_ms, s_ms) = correlated(true, false);
+        let (u_lr, b_lr, s_lr) = correlated(false, false);
         let (mut on, mut all) = (0usize, 0usize);
         for u in &u_ms { let (_, o, n) = wire_ms(u); on += o; all += n; }
         for u in &u_lr { assert_eq!(wire_ms(u).0, 0); }
@@ -1044,5 +1161,23 @@ mod tests {
         assert!(frac >= MS_BANDS_FLOOR, "M/S on {on}/{all}");
         assert!(b_ms < b_lr, "M/S {b_ms} bytes, L/R {b_lr}");
         for c in 0..2 { assert!(s_ms[c] >= s_lr[c] - 1.0, "channel {c}: M/S {:.1} dB, L/R {:.1} dB", s_ms[c], s_lr[c]); }
+    }
+
+    // ---- AACENCGROUPING (LEDGER SR378): one budget across the CPE
+
+    /// The correlated pair with M/S: one budget (the common global offset over both channels) against SR375's
+    /// per-channel budget. S codes almost nothing, so its leftover now funds M: the SNR rises and the stream stays within
+    /// the bitrate's bytes (no slack). Measured (LEDGER SR378): 8434 bytes at 4.9/4.9 dB against 4205 bytes at 3.1/3.1 dB;
+    /// the bitrate allows 8533. The L/R stream's bytes (8173) are the wrong bound: each L/R channel is held to its own
+    /// budget and leaves ~3% of it unspent, which one shared budget spends.
+    #[test]
+    fn aac_enc_cpe_budget() {
+        let (u_one, b_one, s_one) = correlated(true, true);
+        let (_, b_two, s_two) = correlated(true, false);
+        let (_, b_lr, _) = correlated(false, false);
+        std::println!("aac_enc_cpe_budget: M/S one budget {b_one} bytes SNR {:.1}/{:.1} dB, per-channel {b_two} bytes SNR {:.1}/{:.1} dB, L/R {b_lr} bytes", s_one[0], s_one[1], s_two[0], s_two[1]);
+        for c in 0..2 { assert!(s_one[c] > s_two[c], "channel {c}: one budget {:.1} dB, per-channel {:.1} dB", s_one[c], s_two[c]); }
+        let cap = 128000 * u_one.len() * 1024 / 48000 / 8;
+        assert!(b_one <= cap, "one budget {b_one} bytes, the bitrate's {cap}");
     }
 }

@@ -961,7 +961,7 @@ refs/heads/exec-rmbp-nle6keystab   33c9f83bb FOLDED-BY-HAND (this commit) 2026-1
 refs/heads/exec-rmbp-kerneliccint   2e1698471 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-nle6exportstreampcm   2e1698471 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-h264enccolourhost   2e1698471 IN-FLIGHT cut 2026-10-27
-refs/heads/exec-rmbp-aacencgrouping   2e1698471 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-aacencgrouping   16cacfacd FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-nle6dragsnap   2e1698471 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-av1inbandsize   2e1698471 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-kernelscalecols   2e1698471 IN-FLIGHT cut 2026-10-27
