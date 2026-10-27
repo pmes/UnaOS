@@ -758,7 +758,7 @@ refs/heads/exec-rmbp-cardregistry   c9d155994 FOLDED-BY-HAND (this commit) 2026-
 refs/heads/exec-rmbp-navread   ad3b4fe55 FOLDED-BY-HAND (this commit) 2026-10-26
 refs/heads/exec-rmbp-zoomcost   731d173b0 FOLDED-BY-HAND (this commit) 2026-10-26
 refs/heads/exec-rmbp-aetherfit   df909c747 IN-FLIGHT cut 2026-10-27
-refs/heads/exec-rmbp-truststage   df909c747 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-truststage   82650e085 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-portreset   df909c747 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-heldmap   df909c747 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-pumppark   939b08961 FOLDED-BY-HAND (this commit) 2026-10-27

@@ -27,6 +27,9 @@ REQUIRE \[login\] desktop bare: furniture=none \(R88\) why=session
 REQUIRE \[desktop\] built at=
 # OLDEST (rmbp-ledger B682, BP-bar-1, BP-boot-15): the line's oldest machine, printed by `boot::oldest_say` at the boot's first build.
 REQUIRE :: OLDEST: board=rmbp12 year=2012 image=[^ ]+ net=(absent|present) -> BOOTS ::
+# TRUSTSTAGE (rmbp-ledger B836, net.md §5): the trust bundle the https clients open, read once by `boot::trust_say` beside
+# OLDEST. The bench stages it first (tools/trust-bundle, then the builder's stage_trust); a bench without it reds this row.
+REQUIRE \[trust\] roots\.pem bytes=\d+ pin=[0-9a-f]{8} -> ok
 FORBID :: LOGIN: users\+session -> FAIL
 FORBID :: FIRSTBOOT: .* -> incoherent
 COMPLETE \[boot\] services up first=

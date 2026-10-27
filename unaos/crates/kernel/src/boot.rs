@@ -455,5 +455,40 @@ pub fn oldest_say() {
         OLDEST.1,
         crate::fs::bootdisk::BUILD_SHA,
         oldest_net()
-    ); #[cfg(all(target_arch = "x86_64", feature = "wc"))] crate::tests::bootlist::start(); // BOOTLIST (rmbp-ledger B817, R132): the boot's first [desktop] built starts the ESP list's one worker (tests.rs tail). LINE-NEUTRAL append, code first
+    ); trust_say(); #[cfg(all(target_arch = "x86_64", feature = "wc"))] crate::tests::bootlist::start(); // BOOTLIST (rmbp-ledger B817, R132): the boot's first [desktop] built starts the ESP list's one worker (tests.rs tail). LINE-NEUTRAL append, code first
+}
+
+// ── TRUSTSTAGE (rmbp-ledger B836; net.md §5, BP-boot-15) ─────────────────────────────────────────────────────────────
+// Every https page and LUMEN's provider open the trust bundle `/system/trust/roots.pem` (`vein_ring3::trust`); the card
+// build refuses a NETRING3/LUMEN line without it (arroyo `trust_card_gate`). The boot says what the clients will find,
+// ONCE, beside OLDEST at the first `[desktop] built`: `[trust] roots.pem bytes=<n> pin=<first 8 hex of its sha256> ->
+// ok|absent`, so a flight record reads it without opening Aether. FILE-TAIL append (nothing above moves); `login` only,
+// the OLDEST call's own gate (its call is folded onto `oldest_say`'s closing line, code first).
+
+/// The trust line (`oldest_say`, the boot's first build only). Streams the file through the mount table in 64 KiB reads
+/// into ONE crypto_core SHA-256 state, so the bundle is never held whole; a stat miss, an empty file or a short read is
+/// `absent` (the client could not load it either).
+#[cfg(feature = "login")]
+fn trust_say() {
+    const PATH: &str = "/system/trust/roots.pem";
+    let mt = crate::shell::vfs_mount_table();
+    let n = mt.stat(PATH).map_or(0, |st| st.size);
+    let mut h = crypto_core::sha2::Sha256::new();
+    let mut at: u64 = 0;
+    while at < n {
+        match mt.read(PATH, at, (n - at).min(64 * 1024) as usize) {
+            Ok(b) if !b.is_empty() => {
+                let k = b.len().min((n - at) as usize);
+                h.update(&b[..k]);
+                at += k as u64;
+            }
+            _ => break,
+        }
+    }
+    if n != 0 && at == n {
+        let d = h.finalize();
+        serial_println!("[trust] roots.pem bytes={} pin={:02x}{:02x}{:02x}{:02x} -> ok", n, d[0], d[1], d[2], d[3]);
+    } else {
+        serial_println!("[trust] roots.pem bytes=0 pin=none -> absent");
+    }
 }
