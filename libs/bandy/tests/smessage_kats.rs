@@ -499,8 +499,13 @@ kat!(
 );
 kat!(
     kat_browser_button,
-    SMessage::BrowserButton { down: true, x: 12.5, y: 40.0 },
+    SMessage::BrowserButton { down: true, x: 12.5, y: 40.0, mods: 0 },
     r#"{"BrowserButton":{"down":true,"x":12.5,"y":40.0}}"#
+);
+kat!(
+    kat_browser_button_mods,
+    SMessage::BrowserButton { down: true, x: 12.5, y: 40.0, mods: bandy::MOD_SHIFT | bandy::MOD_ALT },
+    r#"{"BrowserButton":{"down":true,"x":12.5,"y":40.0,"mods":5}}"#
 );
 
 /// A11YFACE (SR124): the `a11y` verb table reads every spelling back to its verb, a heading level, and nothing else.

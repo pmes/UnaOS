@@ -263,7 +263,7 @@ define_class!(
         fn mouse_down(&self, event: &AnyObject) {
             // Anchor the pan and take key focus for reset-to-fit.
             let win = self.event_window_point(event);
-            self.ivars().drag_anchor.set(Some(win)); let syn = self.ivars().synapse.borrow().clone(); if let (Some(syn), Some((px, py))) = (syn, self.surface_point(event)) { syn.fire(bandy::SMessage::BrowserButton { down: true, x: px, y: py }); } // NLE2B (SR208): the press
+            self.ivars().drag_anchor.set(Some(win)); let syn = self.ivars().synapse.borrow().clone(); if let (Some(syn), Some((px, py))) = (syn, self.surface_point(event)) { syn.fire(bandy::SMessage::BrowserButton { down: true, x: px, y: py, mods: { let f: usize = unsafe { msg_send![event, modifierFlags] }; ((f >> 17) & 0xF) as u8 } }); } // NLE2B (SR208): the press; NLE2-MODS (SR306): modifierFlags bits 17-20 (shift, control, option, command) are bandy's MOD_* bits 0-3
             if let Some(window) = self.window() {
                 let _: bool = unsafe { msg_send![&window, makeFirstResponder: self] };
             }
@@ -302,7 +302,7 @@ define_class!(
                     if dw > 0.0 && dh > 0.0 && iw > 0 && ih > 0 {
                         let px = (vx - dx) / dw * iw as f64;
                         let py = ih as f64 - ((vy - dy) / dh * ih as f64);
-                        syn.fire(bandy::SMessage::BrowserButton { down: false, x: px, y: py }); if px >= 0.0 && px < iw as f64 && py >= 0.0 && py < ih as f64 { // NLE2B (SR208): the release, off the frame too
+                        syn.fire(bandy::SMessage::BrowserButton { down: false, x: px, y: py, mods: { let f: usize = unsafe { msg_send![event, modifierFlags] }; ((f >> 17) & 0xF) as u8 } }); if px >= 0.0 && px < iw as f64 && py >= 0.0 && py < ih as f64 { // NLE2B (SR208): the release, off the frame too
                             syn.fire(bandy::SMessage::BrowserClick(px, py));
                         }
                     }

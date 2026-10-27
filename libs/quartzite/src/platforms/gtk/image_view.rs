@@ -63,7 +63,7 @@ pub fn bootstrap_image_surface(id: &str, synapse: Synapse) -> NativeView {
             da.grab_focus();
             syn.fire(SMessage::BrowserClick(x, y));
         });
-        drawing_area.add_controller(click); { let drag = gtk4::GestureDrag::new(); let s = synapse.clone(); drag.connect_drag_begin(move |_, x, y| s.fire(SMessage::BrowserButton { down: true, x, y })); let s = synapse.clone(); drag.connect_drag_end(move |g, dx, dy| { if let Some((x, y)) = g.start_point() { s.fire(SMessage::BrowserButton { down: false, x: x + dx, y: y + dy }); } }); drawing_area.add_controller(drag); } // NLE2B (SR208): the press and the release (BrowserButton) for every drag; GestureClick sends no release past its threshold
+        drawing_area.add_controller(click); { let drag = gtk4::GestureDrag::new(); let s = synapse.clone(); drag.connect_drag_begin(move |g, x, y| s.fire(SMessage::BrowserButton { down: true, x, y, mods: button_mods(g.current_event_state()) })); let s = synapse.clone(); drag.connect_drag_end(move |g, dx, dy| { if let Some((x, y)) = g.start_point() { s.fire(SMessage::BrowserButton { down: false, x: x + dx, y: y + dy, mods: button_mods(g.current_event_state()) }); } }); drawing_area.add_controller(drag); } // NLE2B (SR208): the press and the release (BrowserButton) for every drag; GestureClick sends no release past its threshold
     }
     {
         let key = gtk4::EventControllerKey::new();
@@ -298,4 +298,19 @@ pub fn bootstrap_page_view(id: &str, synapse: Synapse) -> PageView {
     });
 
     PageView { root: overlay.upcast(), surface, find_bar, find_entry }
+}
+
+/// NLE2-MODS (LEDGER SR306): gdk's modifier state as `BrowserButton`'s `mods` bits (bandy's `MOD_*`), read the way the
+/// surface's key handler reads it (Meta or Super is the super bit).
+fn button_mods(m: gtk4::gdk::ModifierType) -> u8 {
+    use gtk4::gdk::ModifierType as M;
+    [
+        (M::SHIFT_MASK, bandy::MOD_SHIFT),
+        (M::CONTROL_MASK, bandy::MOD_CONTROL),
+        (M::ALT_MASK, bandy::MOD_ALT),
+        (M::META_MASK | M::SUPER_MASK, bandy::MOD_SUPER),
+    ]
+    .into_iter()
+    .filter(|(mask, _)| m.intersects(*mask))
+    .fold(0, |bits, (_, bit)| bits | bit)
 }
