@@ -14,10 +14,10 @@
 //!   (a positively identified non-Apple machine — the rMBP, QEMU and an unread SMBIOS print nothing), EC RAM
 //!   0x00..0xFF is read with RD_EC and printed as eight `[ec] ram` lines: the witness ZENBOOK-EC-BATTERY decodes.
 //!
-//! WRITE SURFACE: the RD_EC command byte (0x80) to the command port and the address byte to the data port — the read
-//! protocol's arguments. WR_EC (0x81), BE_EC/BD_EC (0x82/0x83) and QR_EC (0x84) are never issued.
+//! WRITE SURFACE: RD_EC (0x80) + its address byte, and QR_EC (0x84) from the `_Qxx` event drain alone (ZENBOOKECQEVENTS
+//! Z30, file tail), which dequeues one pending query byte. WR_EC (0x81), BE_EC/BD_EC (0x82/0x83) are never issued.
 //! BOUNDED: every IBF/OBF wait has a deadline (`hw_wait_budget() / 200`, ~10 ms calibrated); the census stops at the
-//! first stuck handshake and names the step and the status byte. `_Qxx` events need AML and a GPE handler: owed.
+//! first stuck handshake and names the step and the status byte. `_Qxx` BYTES drained (Z30); their METHODS need AML: owed.
 //! `tests ec` runs the protocol against a fake port (never a real one): `:: EC: proto=ok cases=5/5 -> PASS ::`.
 
 use x86_64::instructions::port::Port;
@@ -82,7 +82,7 @@ impl EcIo for PortIo {
         unsafe { Port::<u8>::new(self.cmd).read() }
     }
     fn cmd(&mut self, v: u8) {
-        // SAFETY: as above; only RD_EC is ever passed (the write surface in the header).
+        // SAFETY: as above; only RD_EC or QR_EC is ever passed (the write surface in the header).
         unsafe { Port::<u8>::new(self.cmd).write(v) }
     }
     fn wdata(&mut self, v: u8) {
@@ -234,14 +234,14 @@ pub fn probe() {
     let mut ram = [0u8; 256];
     let t0 = crate::arch::ms();
     let (n, stale, stuck) = census(&mut io, &mut ram);
-    let ms = crate::arch::ms().saturating_sub(t0);
+    let ms = crate::arch::ms().saturating_sub(t0); let q = if stuck.is_none() { qevent_boot(&mut io) } else { 0 }; // ZENBOOKECQEVENTS (zenbook-ledger Z30): the boot drain of the `_Qxx` bytes queued before this census, with the census's own io (`qevent_boot`, file tail). LINE-NEUTRAL fold, code before the comment.
     let mut base = 0;
     while base < n {
         say_row(base, &ram[base..n.min(base + 32)]);
         base += 32;
     }
     match stuck {
-        None => serial_println!("[ec] census bytes={} stale={} ms={} -> ok lid={}", n, stale, ms, lid_census(&ram[..n]).word()),
+        None => serial_println!("[ec] census bytes={} stale={} ms={} -> ok lid={} qevents={}", n, stale, ms, lid_census(&ram[..n]).word(), q),
         Some((at, s)) => serial_println!(
             "[ec] census bytes={} stale={} ms={} -> stuck at={:#04x} step={} status={:#04x} lid={}",
             n,
@@ -272,7 +272,7 @@ struct Fake {
     ibf_wedge: bool,
     obf_wedge: bool,
     polls: u32,
-    budget: u32,
+    budget: u32, q: [u8; 12], qn: usize, // ZENBOOKECQEVENTS (zenbook-ledger Z30): the fake's pending `_Qxx` queue, front first (`qr_take`, file tail)
 }
 
 impl Fake {
@@ -281,7 +281,7 @@ impl Fake {
         for (i, b) in ram.iter_mut().enumerate() {
             *b = (i as u8).wrapping_mul(37) ^ 0x5a;
         }
-        Fake { ram, st: 0, out: 0, lat: 3, pend: 0, held: 0, held_v: 0, want_addr: false, bad_cmd: false, ibf_wedge: false, obf_wedge: false, polls: 0, budget: 64 }
+        Fake { ram, st: 0, out: 0, lat: 3, pend: 0, held: 0, held_v: 0, want_addr: false, bad_cmd: false, ibf_wedge: false, obf_wedge: false, polls: 0, budget: 64, q: [0; 12], qn: 0 }
     }
     fn take(&mut self) {
         let v = self.held_v;
@@ -289,7 +289,7 @@ impl Fake {
             1 => {
                 if v == RD_EC {
                     self.want_addr = true;
-                } else {
+                } else if v == QR_EC { self.qr_take(); } else { // ZENBOOKECQEVENTS (zenbook-ledger Z30): QR_EC answers the queue's front (file tail)
                     self.bad_cmd = true;
                 }
             }
@@ -322,7 +322,7 @@ impl EcIo for Fake {
                 self.pend -= 1;
             }
         }
-        self.st | if self.ibf_wedge { IBF } else { 0 }
+        self.st | self.sci() | if self.ibf_wedge { IBF } else { 0 } // ZENBOOKECQEVENTS (zenbook-ledger Z30): SCI_EVT while the queue holds a byte
     }
     fn cmd(&mut self, v: u8) {
         self.hold(1, v);
@@ -589,8 +589,8 @@ pub fn battery_selftest() {
     let mut f = kat_battery(73, 0x02);
     let charge = read_row(&mut f, &KAT_ROW);
     let charge_ok = charge == Ok(Reading { pct: 73, charging: true, ma: 1200, mv: 12300 }) && !f.bad_cmd;
-    let cases: [(&str, bool); 6] =
-        [("charge", charge_ok), ("discharge", bkat_discharge()), ("range", bkat_range()), ("stuck", bkat_stuck()), ("table", bkat_table()), ("lid", bkat_lid())]; // ZENBOOKECLID (zenbook-ledger Z27): the lid leg (file tail)
+    let cases: [(&str, bool); 7] =
+        [("charge", charge_ok), ("discharge", bkat_discharge()), ("range", bkat_range()), ("stuck", bkat_stuck()), ("table", bkat_table()), ("lid", bkat_lid()), ("qevents", bkat_qevents())]; // ZENBOOKECLID (zenbook-ledger Z27): the lid leg (file tail); ZENBOOKECQEVENTS (zenbook-ledger Z30): the qevents leg (file tail)
     let mut ok = 0;
     let mut first: Option<&str> = None;
     for (name, r) in cases {
@@ -824,4 +824,186 @@ fn bkat_lid() -> bool {
     w.obf_wedge = true;
     let stuck = matches!(read_lid(&mut w, &KAT_LID), Err(Why::Stuck(9, Stuck { step: Step::Obf, .. })));
     set && census_closed && clear && census_open && stuck && !f.bad_cmd && row_for("zenbook_um5606w", EC_LID_OFFSETS).is_none()
+}
+
+// ── ZENBOOKECQEVENTS (zenbook-ledger Z30) — the EC's `_Qxx` query bytes, drained by a polled pass. TAIL-APPENDED ────────────
+// An ACPI EC raises SCI_EVT (EC_SC bit 5) when it has an event queued; QR_EC (0x84) dequeues it and answers the query byte
+// whose `_Qxx` method the OS would run (ACPI 6.5 §12.3.5). This tree runs no AML (BP-power-4), so the METHODS cannot run:
+// this section delivers the BYTES (ZENBOOK-EC-QHANDLERS owed). There is no SCI path either: no GPE0 block reader exists, the
+// SCI GSI is never routed (`ioapic::route_gsi`'s callers are i8042 and PCI INTx) and ACPI mode is requested only at S5, so
+// no SCI reaches the kernel, nothing storms and no GPE status needs clearing (ZENBOOK-EC-GPE owed). The shape is the rMBP's:
+// the SMC is polled, the fixed power button is a polled PM1 read, and the drain is a polled pass — once at the census
+// (`qevent_boot`, the census's own io) and then from the desktop service pass beside `status::poll`, at the battery sweep's
+// cadence (`qevent_service`, `Q_POLL_MS`), through the ONE `conversation`. At most `Q_PER_PASS` bytes per pass; each byte
+// is counted (`qevents=` on the census line) and a byte not seen before this boot prints `[ec] q=0x<nn> total=<n>` once.
+// Silent and port-free on every machine `hw::gate(Probe::Ec)` refuses (the rMBP, QEMU). `tests ecbattery`'s `qevents` case.
+
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+
+/// QR_EC (ACPI §12.3.5): dequeue the pending query byte.
+const QR_EC: u8 = 0x84;
+/// EC_SC status: an SCI event is pending (a query byte waits for QR_EC).
+const SCI_EVT: u8 = 1 << 5;
+/// The most query bytes one pass drains.
+const Q_PER_PASS: usize = 8;
+/// The service drain's cadence: the battery sweep's, `video::status::POLL_MS` (10 s). Restated, not named: `status` is
+/// `wc`-gated and this module is always-on x86.
+const Q_POLL_MS: u64 = 10_000;
+
+/// Query bytes drained this boot.
+static QEVENTS: AtomicU32 = AtomicU32::new(0);
+/// The seen-table: one bit per query byte, set at its first sighting this boot.
+static SEEN: [AtomicU32; 8] = [const { AtomicU32::new(0) }; 8];
+/// `arch::ms()` of the last service drain (0 = none yet); a compare_exchange, so two cores never both sweep.
+static LAST_Q_MS: AtomicU64 = AtomicU64::new(0);
+/// The `[ec] qevents stuck` line has been printed (once per boot).
+static QSTUCK_SAID: AtomicBool = AtomicBool::new(false);
+
+/// One QR_EC transaction: a stale byte drained, IBF clear, 0x84, OBF set, the query byte (0 = no event pending).
+fn qr_ec<I: EcIo>(io: &mut I) -> Result<u8, Stuck> {
+    if io.status() & OBF != 0 {
+        let _ = io.rdata();
+    }
+    wait(io, Step::Ibf)?;
+    io.cmd(QR_EC);
+    wait(io, Step::Obf)?;
+    Ok(io.rdata())
+}
+
+/// Drain while SCI_EVT is set, at most `Q_PER_PASS` bytes into `out`: (bytes drained, the stuck handshake if one stopped
+/// it). A 0 answer (no event after all) stops the pass uncounted.
+fn qdrain<I: EcIo>(io: &mut I, out: &mut [u8; Q_PER_PASS]) -> (usize, Option<Stuck>) {
+    for i in 0..Q_PER_PASS {
+        if io.status() & SCI_EVT == 0 {
+            return (i, None);
+        }
+        match qr_ec(io) {
+            Ok(0) => return (i, None),
+            Ok(q) => out[i] = q,
+            Err(e) => return (i, Some(e)),
+        }
+    }
+    (Q_PER_PASS, None)
+}
+
+/// Mark `q` in `bits`; `true` at its first sighting.
+fn note_seen(bits: &[AtomicU32; 8], q: u8) -> bool {
+    let m = 1u32 << (q & 31);
+    bits[(q >> 5) as usize].fetch_or(m, Ordering::Relaxed) & m == 0
+}
+
+/// Count each drained byte; print `[ec] q=0x<nn> total=<n>` for a byte not seen before this boot.
+fn qsay(bytes: &[u8]) {
+    for &q in bytes {
+        let total = QEVENTS.fetch_add(1, Ordering::Relaxed) + 1;
+        if note_seen(&SEEN, q) {
+            serial_println!("[ec] q={:#04x} total={}", q, total);
+        }
+    }
+}
+
+/// `[ec] qevents stuck step=<ibf|obf> status=0x<ss>` — once per boot.
+fn say_qstuck(s: Stuck) {
+    if !QSTUCK_SAID.swap(true, Ordering::Relaxed) {
+        serial_println!("[ec] qevents stuck step={} status={:#04x}", s.step.name(), s.status);
+    }
+}
+
+/// The boot drain (`probe`, after a census that did not stick), with the census's own io: no service pass exists yet, so
+/// no `TXN`, exactly as the census runs. Returns the bytes drained this boot (the census line's `qevents=`).
+fn qevent_boot(io: &mut PortIo) -> u32 {
+    let mut b = [0u8; Q_PER_PASS];
+    let (n, st) = qdrain(io, &mut b);
+    qsay(&b[..n]);
+    if let Some(s) = st {
+        say_qstuck(s);
+    }
+    QEVENTS.load(Ordering::Relaxed)
+}
+
+/// The service drain (`desktop_uefi::desktop_app_service`, beside `status::poll`): every `Q_POLL_MS`, through the ONE
+/// `conversation`; no ECDT or a busy lock = nothing this pass, silently. Port-free unless `hw::gate(Probe::Ec)`.
+pub fn qevent_service() {
+    if !crate::hw::gate(crate::hw::Probe::Ec) {
+        return;
+    }
+    let now = crate::arch::ms();
+    let last = LAST_Q_MS.load(Ordering::Relaxed);
+    if last != 0 && now.wrapping_sub(last) < Q_POLL_MS {
+        return;
+    }
+    if LAST_Q_MS.compare_exchange(last, now.max(1), Ordering::AcqRel, Ordering::Relaxed).is_err() {
+        return;
+    }
+    let mut b = [0u8; Q_PER_PASS];
+    if let Ok((n, st)) = conversation(|io| qdrain(io, &mut b)) {
+        qsay(&b[..n]);
+        if let Some(s) = st {
+            say_qstuck(s);
+        }
+    }
+}
+
+impl Fake {
+    /// QR_EC taken: the queue's front (0 when empty) loads OBF and leaves the queue.
+    fn qr_take(&mut self) {
+        let v = if self.qn > 0 { self.q[0] } else { 0 };
+        if self.qn > 0 {
+            self.q.copy_within(1.., 0);
+            self.qn -= 1;
+        }
+        self.out = v;
+        if !self.obf_wedge {
+            self.st |= OBF;
+        }
+    }
+    /// SCI_EVT while the queue holds a byte (a real EC drops it once the last query byte is read).
+    fn sci(&self) -> u8 {
+        if self.qn > 0 { SCI_EVT } else { 0 }
+    }
+    /// A fake EC with `bytes` queued (at most 12).
+    fn with_q(bytes: &[u8]) -> Fake {
+        let mut f = Fake::new();
+        f.q[..bytes.len()].copy_from_slice(bytes);
+        f.qn = bytes.len();
+        f
+    }
+}
+
+/// `tests ecbattery`'s `qevents` case: three bytes drained in order with SCI_EVT clear after and the seen-table counting two
+/// distinct; the bound at `Q_PER_PASS`; no SCI_EVT = no command; a 0 answer uncounted; a wedged OBF named; RD_EC after a
+/// drain still reads RAM. Local seen-table only: the boot's `SEEN`/`QEVENTS` are never touched.
+fn bkat_qevents() -> bool {
+    let mut f = Fake::with_q(&[0x52, 0x1d, 0x52]);
+    let mut b = [0u8; Q_PER_PASS];
+    let (n, st) = qdrain(&mut f, &mut b);
+    let seen: [AtomicU32; 8] = [const { AtomicU32::new(0) }; 8];
+    let fresh = [note_seen(&seen, b[0]), note_seen(&seen, b[1]), note_seen(&seen, b[2])];
+    let distinct = fresh.iter().filter(|&&x| x).count();
+    let three = n == 3 && st.is_none() && b[..3] == [0x52, 0x1d, 0x52] && f.status() & SCI_EVT == 0 && fresh == [true, true, false] && !f.bad_cmd;
+    let after = rd_ec(&mut f, 5) == Ok((f.ram[5], false)) && !f.bad_cmd;
+
+    let mut g = Fake::with_q(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+    let mut gb = [0u8; Q_PER_PASS];
+    let (gn, gst) = qdrain(&mut g, &mut gb);
+    let bound = gn == Q_PER_PASS && gst.is_none() && gb == [1, 2, 3, 4, 5, 6, 7, 8] && g.qn == 2 && g.status() & SCI_EVT != 0;
+
+    let mut h = Fake::new();
+    let mut hb = [0u8; Q_PER_PASS];
+    let (hn, hst) = qdrain(&mut h, &mut hb);
+    let idle = hn == 0 && hst.is_none() && h.held_v == 0 && h.status() & OBF == 0;
+
+    let mut z = Fake::with_q(&[0]);
+    let mut zb = [0u8; Q_PER_PASS];
+    let (zn, zst) = qdrain(&mut z, &mut zb);
+    let zero = zn == 0 && zst.is_none() && z.qn == 0 && z.held_v == QR_EC;
+
+    let mut w = Fake::with_q(&[0x52]);
+    w.obf_wedge = true;
+    let mut wb = [0u8; Q_PER_PASS];
+    let (wn, wst) = qdrain(&mut w, &mut wb);
+    let wedge = wn == 0 && matches!(wst, Some(Stuck { step: Step::Obf, .. }));
+
+    serial_println!("[ec] qevents kat drained={} distinct={} q={:#04x} q={:#04x} bound={}", n, distinct, b[0], b[1], gn);
+    three && after && bound && idle && zero && wedge
 }
