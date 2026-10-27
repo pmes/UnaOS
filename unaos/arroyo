@@ -4002,7 +4002,7 @@ build_selfbuild_x86() {
     # a scratch path — UnaOS passes /apps/HELLO.C, the size its loader sees, <home>/kat2.tmp) before it is staged.
     rm -f "$sb/SYSKAT2.LNX"
     if _lnx_kat "$sb/SYSKAT2.LNX" "$c/syskat2.c" -mno-red-zone \
-        && { _lnx_deferred 2 SYSKAT2.LNX || "$sb/SYSKAT2.LNX" "$c/hello.c" "$(stat -c %s "$c/hello.c")" "$sb/kat2.tmp" | grep -q "^syskat2 ok threads=4 counter=400000 "; }; then
+        && { _lnx_deferred 2 SYSKAT2.LNX || "$sb/SYSKAT2.LNX" "$c/hello.c" "$(_fsize "$c/hello.c")" "$sb/kat2.tmp" | grep -q "^syskat2 ok threads=4 counter=400000 "; }; then
         cp "$sb/SYSKAT2.LNX" "${WORKSPACE_DIR}/target/SYSKAT2.LNX"
     else
         _sb_skip 2 SYSKAT2.LNX "$(_sb_kat_why "$sb/SYSKAT2.LNX")"; rm -f "${WORKSPACE_DIR}/target/SYSKAT2.LNX"
@@ -4012,7 +4012,7 @@ build_selfbuild_x86() {
     local lib="${WORKSPACE_DIR}/target/LIB"
     if [ ! -f "$lib/libc.a" ]; then
         if _selfbuild_fetch "$sb/musl" "$SELFBUILD_MUSL_URL" "$SELFBUILD_MUSL_REV" \
-            && ( cd "$sb/musl" && ./configure --prefix="$sb/musl-out" --disable-shared CC="$_LNX_CC" "${_LNX_TOOLS[@]}" CFLAGS="-O2" >/dev/null && make -s -j"$(nproc)" >/dev/null 2>&1 && make -s install >/dev/null 2>&1 ); then
+            && ( cd "$sb/musl" && ./configure --prefix="$sb/musl-out" --disable-shared CC="$_LNX_CC" "${_LNX_TOOLS[@]}" CFLAGS="-O2" >/dev/null && make -s -j"$(_ncpu)" >/dev/null 2>&1 && make -s install >/dev/null 2>&1 ); then
             rm -rf "$lib" && mkdir -p "$lib/include" "$lib/tcc/include" \
                 && cp "$sb/musl-out/lib/crt1.o" "$sb/musl-out/lib/crti.o" "$sb/musl-out/lib/crtn.o" "$sb/musl-out/lib/libc.a" "$lib/" \
                 && cp -r "$sb/musl-out/include/." "$lib/include/" \
@@ -4055,7 +4055,7 @@ build_selfbuild_x86() {
     # madvise), proven on the host kernel before it is staged.
     rm -f "$sb/SYSKAT3.LNX"
     if _lnx_kat "$sb/SYSKAT3.LNX" "$c/syskat3.c" -mno-red-zone \
-        && { _lnx_deferred 3 SYSKAT3.LNX || "$sb/SYSKAT3.LNX" "$c/hello.c" "$(stat -c %s "$c/hello.c")" "$sb/kat3.tmp" | grep -q "^syskat3 ok mmap=ok shared=ok anon_mib=256 resident_pages=256 "; }; then
+        && { _lnx_deferred 3 SYSKAT3.LNX || "$sb/SYSKAT3.LNX" "$c/hello.c" "$(_fsize "$c/hello.c")" "$sb/kat3.tmp" | grep -q "^syskat3 ok mmap=ok shared=ok anon_mib=256 resident_pages=256 "; }; then
         cp "$sb/SYSKAT3.LNX" "${WORKSPACE_DIR}/target/SYSKAT3.LNX"
     else
         _sb_skip 3 SYSKAT3.LNX "$(_sb_kat_why "$sb/SYSKAT3.LNX")"; rm -f "${WORKSPACE_DIR}/target/SYSKAT3.LNX"
@@ -4065,7 +4065,7 @@ build_selfbuild_x86() {
         if _selfbuild_fetch "$sb/busybox" "$SELFBUILD_BB_URL" "$SELFBUILD_BB_REV" \
             && ( cd "$sb/busybox" && make -s defconfig >/dev/null 2>&1 \
                  && sed -i 's/^# CONFIG_STATIC is not set/CONFIG_STATIC=y/; s/^CONFIG_TC=y/# CONFIG_TC is not set/; s/^# CONFIG_FEATURE_SH_STANDALONE is not set/CONFIG_FEATURE_SH_STANDALONE=y/; s/^# CONFIG_FEATURE_PREFER_APPLETS is not set/CONFIG_FEATURE_PREFER_APPLETS=y/' .config \
-                 && (yes "" | make -s oldconfig >/dev/null 2>&1) && make -s -j"$(nproc)" >/dev/null 2>&1 ); then
+                 && (yes "" | make -s oldconfig >/dev/null 2>&1) && make -s -j"$(_ncpu)" >/dev/null 2>&1 ); then
             cp "$sb/busybox/busybox" "${WORKSPACE_DIR}/target/PROBE.LNX"
         else
             _sb_skip 1 PROBE.LNX "$(_sb_fetch_why "$sb/busybox" "$SELFBUILD_BB_URL" "$SELFBUILD_BB_REV" "busybox make" make gcc)"
@@ -4074,7 +4074,7 @@ build_selfbuild_x86() {
     build_selfbuild4_x86   # SELFBUILD4 (B356): SYSKAT4.LNX + RUST.LNX
     build_selfbuild5_x86   # SELFBUILD5 (B357): SYSKAT5.LNX + LLD.LNX + LIB/rust (RUST.LNX's objects, std rlibs, musl crt)
     build_selfbuild6_x86   # SELFBUILD6 (B360): LIB/dyn (libc.so, libgcc_s.so.1, the dyn probe) + LIB/rustc (default on, R87; UNAOS_SELFBUILD6_RUSTC=0 opts out)
-    ( cd "${WORKSPACE_DIR}/target" && sha256sum TCC.LNX PROBE.LNX SYSKAT.LNX SYSKAT2.LNX SYSKAT3.LNX SYSKAT4.LNX RUST.LNX HELLO.C PRINTF.C 2>/dev/null | sed 's/^/   SELFBUILD1: sha256 /' )
+    ( cd "${WORKSPACE_DIR}/target" && for _f in TCC.LNX PROBE.LNX SYSKAT.LNX SYSKAT2.LNX SYSKAT3.LNX SYSKAT4.LNX RUST.LNX HELLO.C PRINTF.C; do if [ -f "$_f" ]; then echo "   SELFBUILD1: sha256 $(sha256_of "$_f")  $_f"; fi; done )
     local _p _st="" _ns=""   # SMALLFIX (B380): one summary line; each not_staged entry has its own `not staged … reason=` line above
     for _p in SYSKAT.LNX SYSKAT2.LNX SYSKAT3.LNX SYSKAT4.LNX SYSKAT5.LNX TCC.LNX PROBE.LNX RUST.LNX LLD.LNX LIB/libc.a LIB/rust LIB/dyn LIB/rustc; do
         if [ -e "${WORKSPACE_DIR}/target/$_p" ]; then _st="$_st${_st:+,}$_p"; else _ns="$_ns${_ns:+,}$_p"; fi
@@ -4262,7 +4262,7 @@ PY
         else whyr="build failed python3 staging of the recorded link"; fi
         _sb_skip 5 LIB/rust "$whyr"; rm -rf "$out"
     fi
-    ( cd "${WORKSPACE_DIR}/target" && sha256sum SYSKAT5.LNX LLD.LNX LIB/rust/link.rsp 2>/dev/null | sed 's/^/   SELFBUILD5: sha256 /' )
+    ( cd "${WORKSPACE_DIR}/target" && for _f in SYSKAT5.LNX LLD.LNX LIB/rust/link.rsp; do if [ -f "$_f" ]; then echo "   SELFBUILD5: sha256 $(sha256_of "$_f")  $_f"; fi; done )
 }
 
 # SELFBUILD6 (B360): DYNAMIC Linux programs through the shared loader core (unaos/libs/sys/ldso_core; the kernel's
@@ -11519,9 +11519,9 @@ k8_lock_acquire() {
     mkdir -p "${WORKSPACE_DIR}/target"
     while ! mkdir "$K8_LOCKDIR" 2>/dev/null; do
         holder=$(cat "$K8_LOCKDIR/pid" 2>/dev/null || echo "")
-        # BSD stat first, GNU stat second — the `|| echo 0` fallback alone would make every
-        # contended wait on Linux read age=huge and false-reclaim a live holder's lock
-        mtime=$(stat -f %m "$K8_LOCKDIR" 2>/dev/null || stat -c %Y "$K8_LOCKDIR" 2>/dev/null || echo 0)
+        # K8LOCK-STAT (B1023): GNU stat first, BSD second (_fsize's order) — GNU `stat -f` is the FILESYSTEM mode, prints `?` for
+        # %m and exits 0, so the BSD-first order read mtime=? on Linux; `|| echo 0` alone would read age=huge and false-reclaim
+        mtime=$(stat -c %Y "$K8_LOCKDIR" 2>/dev/null || stat -f %m "$K8_LOCKDIR" 2>/dev/null || echo 0)
         now=$(date +%s); age=$(( now - mtime ))
         if [ -n "$holder" ] && ! kill -0 "$holder" 2>/dev/null; then
             echo -e "${COLOR_YELLOW}kernel8: stale build lock reclaimed — holder PID $holder dead (age ${age}s)${COLOR_RESET}" >&2
@@ -15047,8 +15047,8 @@ fw_stage_pinned() {
         f="${m%%:*}"
         [ -r "${src}/${f}" ] || { echo -e "${COLOR_RED}❌ ${tag}: ${src}/${f} missing or unreadable — no card image${COLOR_RESET}"; return 1; }
     done
-    local stage="${WORKSPACE_DIR}/target/${tag,,}"
-    rm -rf "$stage"; mkdir -p "$stage" "${esp}/${sub}" || { echo -e "${COLOR_RED}❌ ${tag}: making target/${tag,,} or ${sub}/ on the ESP tree failed — no card image${COLOR_RESET}"; return 1; }
+    local stage; stage="${WORKSPACE_DIR}/target/$(printf '%s' "$tag" | tr '[:upper:]' '[:lower:]')"
+    rm -rf "$stage"; mkdir -p "$stage" "${esp}/${sub}" || { echo -e "${COLOR_RED}❌ ${tag}: making target/${stage##*/} or ${sub}/ on the ESP tree failed — no card image${COLOR_RESET}"; return 1; }
     for m in "$@"; do
         f="${m%%:*}"
         cp "${src}/${f}" "$stage/" && cp "$stage/${f}" "${esp}/${sub}/" || { echo -e "${COLOR_RED}❌ ${tag}: copying ${f} onto the ESP tree at ${sub}/ failed — no card image${COLOR_RESET}"; return 1; }
@@ -15072,11 +15072,11 @@ fw_stage_pinned() {
 # single-file `put` refuses an existing name; the directory form lands the contents in <unafs dir>, made with its parents, and
 # REPLACES what is there — tools/unafs put, ROOTDISK2). An empty <src dir> stages nothing.
 fw_stage_unafs() {
-    local tag="$1" src="$2" img="$3" dir="$4"
+    local tag="$1" src="$2" img="$3" dir="$4"; local ltag; ltag="$(printf '%s' "$tag" | tr '[:upper:]' '[:lower:]')"
     [ -n "$src" ] || return 0
-    cargo run -q --manifest-path "${WORKSPACE_DIR}/../tools/unafs/Cargo.toml" -- put "${WORKSPACE_DIR}/target/${tag,,}" "$dir" -i "$img" >/dev/null || {
-        echo -e "${COLOR_RED}❌ ${tag}: tools/unafs put target/${tag,,} -> ${dir} failed — no card image${COLOR_RESET}"; return 1; }
-    echo -e "${COLOR_YELLOW}⚡ ${tag}: target/${tag,,} onto the UnaFS root at ${dir}/ (bench-only, never in-tree)${COLOR_RESET}"
+    cargo run -q --manifest-path "${WORKSPACE_DIR}/../tools/unafs/Cargo.toml" -- put "${WORKSPACE_DIR}/target/${ltag}" "$dir" -i "$img" >/dev/null || {
+        echo -e "${COLOR_RED}❌ ${tag}: tools/unafs put target/${ltag} -> ${dir} failed — no card image${COLOR_RESET}"; return 1; }
+    echo -e "${COLOR_YELLOW}⚡ ${tag}: target/${ltag} onto the UnaFS root at ${dir}/ (bench-only, never in-tree)${COLOR_RESET}"
 }
 
 # ARROYOMAC (rmbp-ledger B1011): the host-portable helpers, so a macOS bench builds the flight image (`esp-x86`) without
