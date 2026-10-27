@@ -1263,7 +1263,7 @@ fn unpack(px: &[u32]) -> Vec<u8> {
 // ── KERNELCOLOUR (rmbp-ledger B952): the open's colour and the picture -> RGBA conversion, Stria's own ────────────────────
 // handlers.md §5 NLEPROBE-HDR's KERNEL-COLOUR. An open (`job_task`, `poster_task`, each EDL reel) fills the video track's
 // `Track::colour` as Stria's opens do: the container's statement (MP4 `colr`, Matroska `Colour`, read by demux_core at open)
-// wins, and the bitstream's (AV1 `av1C`: `av1_core::image::av1c_codes` mapped by `demux_core::colour::Colour::from_av1`, the
+// wins, and the bitstream's (AV1: `av1_core::image::stream_codes`, the av1C configOBUs else the first sample's in-band header, AV1INBANDCOLOUR SR366, mapped by `demux_core::colour::Colour::from_av1`, the
 // one mapping gneiss_pal's `colour_of` calls too) fills its gaps through demux_core's one merge, `Demuxer::fill_colour`.
 // Each picture then converts through yuv_core's ONE `pick` (the H.273 matrix, else the size default: BT.601 below 1280x720,
 // BT.709 at it; full range only when stated) and ONE `to_rgba`: VP8 with nearest chroma (Stria's I420 path,
@@ -1285,10 +1285,10 @@ fn open_colour(d: &mut Demuxer, log: bool) {
     serial_println!("[vplay] colour matrix={} range={} src={}", stated.unwrap_or(2), if full { "full" } else { "limited" }, src);
 }
 
-/// The bitstream's colour of a video track (what `fill_colour` takes): AV1's `av1C` through the one mapping; VP8 states none.
-fn bitstream_colour(t: &demux_core::Track) -> Option<Colour> {
+/// The bitstream's colour of a video track (what `fill_colour` takes, with the track's first sample): AV1 through the one reading and mapping; VP8 states none.
+fn bitstream_colour(t: &demux_core::Track, first: &[u8]) -> Option<Colour> {
     match t.codec {
-        Codec::Av1 => av1_core::image::av1c_codes(&t.config).map(|(c, l, m)| Colour::from_av1(c, l, m)),
+        Codec::Av1 => av1_core::image::stream_codes(&t.config, first).map(|(c, l, m)| Colour::from_av1(c, l, m)),
         _ => None,
     }
 }

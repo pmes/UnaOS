@@ -571,12 +571,7 @@ pub fn av1c_reorder_depth(av1c: &[u8]) -> Option<u32> {
 /// its configOBUs (§5.5.2) and every METADATA OBU there that parses ([`parse_metadata`]: HDR_CLL, HDR_MDCV). The one walk of
 /// the configOBUs [`av1c_reorder_depth`] also takes. `None` when the record holds no sequence header that parses.
 pub fn av1c_colour(av1c: &[u8]) -> Option<(ColorConfig, Vec<Metadata>)> {
-    let cfg = crate::avif::Av1Config::parse(av1c).ok()?;
-    let obus = split_obus(&cfg.config_obus).ok()?;
-    let o = obus.iter().find(|o| o.obu_type == OBU_SEQUENCE_HEADER_T)?;
-    let seq = SequenceHeader::parse(o.payload).ok()?;
-    let meta = obus.iter().filter(|o| o.obu_type == OBU_METADATA_T).filter_map(|o| parse_metadata(o.payload).ok()).collect();
-    Some((seq.color_config, meta))
+    obus_colour(&crate::avif::Av1Config::parse(av1c).ok()?.config_obus) // AV1INBANDCOLOUR (SR366): the one OBU walk, the in-band reading's too
 }
 
 /// KERNELCOLOUR (rmbp-ledger B952): [`av1c_codes`]' answer — `((primaries, transfer, matrix, color_range), the last HDR_CLL
@@ -587,7 +582,31 @@ pub type Av1Codes = ((u8, u8, u8, bool), Option<(u16, u16)>, Option<([[u16; 2]; 
 /// KERNELCOLOUR (rmbp-ledger B952): [`av1c_colour`] as plain code points — what `demux_core::colour::Colour::from_av1`
 /// maps, for gneiss_pal's `colour_of` and the kernel Player alike (one walk, one mapping).
 pub fn av1c_codes(av1c: &[u8]) -> Option<Av1Codes> {
-    let (cc, meta) = av1c_colour(av1c)?;
+    av1c_colour(av1c).map(codes_of) // AV1INBANDCOLOUR (SR366): the one fold, `sequence_codes`' too
+}
+
+// ── AV1INBANDCOLOUR (LEDGER SR366): the in-band sequence header as the AV1 colour fallback ───────────────────────────────
+// An av1C without configOBUs (legal: AV1-ISOBMFF §2.3.3 makes them optional, and some muxers write none) states no colour in
+// the record; the stream then carries its sequence header in-band, in the first temporal unit (§7.5). ONE walk (`obus_colour`)
+// reads either OBU run and ONE fold (`codes_of`) makes the plain codes; `stream_codes` is THE AV1 reading gneiss_pal's
+// `colour_of` and the kernel Player's `bitstream_colour` both call, so the two rings agree. The rule: the container's colour
+// (applied by `demux_core::colour::Colour::or`) > the av1C configOBUs' header > the first temporal unit's header > the size
+// default (`yuv_core::pick`).
+
+/// AV1INBANDCOLOUR (SR366): the color_config of the first sequence header OBU in a low-overhead OBU run (§5.2: an av1C's
+/// configOBUs or a temporal unit as MP4 / Matroska store it) and every METADATA OBU in the run that parses. `None` when the run
+/// does not split or holds no sequence header that parses.
+pub fn obus_colour(obus: &[u8]) -> Option<(ColorConfig, Vec<Metadata>)> {
+    let obus = split_obus(obus).ok()?;
+    let o = obus.iter().find(|o| o.obu_type == OBU_SEQUENCE_HEADER_T)?;
+    let seq = SequenceHeader::parse(o.payload).ok()?;
+    let meta = obus.iter().filter(|o| o.obu_type == OBU_METADATA_T).filter_map(|o| parse_metadata(o.payload).ok()).collect();
+    Some((seq.color_config, meta))
+}
+
+/// AV1INBANDCOLOUR (SR366): [`obus_colour`]'s answer as plain codes ([`Av1Codes`]): the code points and range, the last
+/// HDR_CLL and the last HDR_MDCV.
+fn codes_of((cc, meta): (ColorConfig, Vec<Metadata>)) -> Av1Codes {
     let (mut cll, mut mdcv) = (None, None);
     for m in meta {
         match m {
@@ -596,5 +615,23 @@ pub fn av1c_codes(av1c: &[u8]) -> Option<Av1Codes> {
             Metadata::Other(_) => {}
         }
     }
-    Some(((cc.color_primaries, cc.transfer_characteristics, cc.matrix_coefficients, cc.color_range), cll, mdcv))
+    ((cc.color_primaries, cc.transfer_characteristics, cc.matrix_coefficients, cc.color_range), cll, mdcv)
+}
+
+/// AV1INBANDCOLOUR (SR366): [`Av1Codes`] of any low-overhead OBU run (the one walk, the one fold).
+pub fn codes_from_obus(obus: &[u8]) -> Option<Av1Codes> {
+    obus_colour(obus).map(codes_of)
+}
+
+/// AV1INBANDCOLOUR (SR366): the codes a temporal unit's in-band sequence header (and its METADATA OBUs) state; `None` when
+/// the unit carries no sequence header.
+pub fn sequence_codes(tu: &[u8]) -> Option<Av1Codes> {
+    codes_from_obus(tu)
+}
+
+/// AV1INBANDCOLOUR (SR366): THE bitstream colour of an AV1 track — the av1C's configOBUs ([`av1c_codes`], byte-identical to
+/// before), else the in-band sequence header of the track's first temporal unit ([`sequence_codes`]; `first_tu` empty when
+/// the caller has none). `demux_core::colour::Colour::from_av1` maps it, for gneiss_pal and the kernel Player alike.
+pub fn stream_codes(av1c: &[u8], first_tu: &[u8]) -> Option<Av1Codes> {
+    av1c_codes(av1c).or_else(|| sequence_codes(first_tu))
 }

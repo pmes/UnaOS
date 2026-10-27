@@ -754,7 +754,7 @@ fn nleprobehdrwire_a_no_colr_h264_reel_falls_back_to_the_vui() {
     // The dispatch itself reads the SPS VUI; the reorder depth beside it is unchanged by the colour description.
     let t = avc_vui709();
     let track = gneiss_pal::dsp::demux::Demuxer::open(build::mkv(&[t], &MkvOptions { webm: false, ..Default::default() })).unwrap().tracks()[0].clone();
-    assert_eq!(colour_of(&track), Some(bt709));
+    assert_eq!(colour_of(&track, &[]), Some(bt709));
     assert_eq!(reorder_depth(&track), Some(2));
     println!("nleprobehdrwire: vui {r}");
 }
