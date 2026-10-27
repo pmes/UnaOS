@@ -22,17 +22,17 @@ use super::dma_coherency;
 const RING_SIZE: usize = 16;
 
 pub fn allocate_ring(num_trbs: usize) -> *mut u8 {
-    unsafe {
+    { // DMAALLOCXHCI (B988): the one DMA allocator (`arch::memory::dma`), in place of a private alloc_zeroed
         let size = num_trbs * 16;
         let layout = Layout::from_size_align(size, 64).unwrap();
-        alloc::alloc::alloc_zeroed(layout)
+        crate::arch::memory::dma::ident(layout.size(), layout.align()) as *mut u8
     }
 }
 
 pub fn allocate_buffer(size: usize) -> *mut u8 {
-    unsafe {
+    { // DMAALLOCXHCI (B988): same allocator as allocate_ring
         let layout = Layout::from_size_align(size, 64).unwrap();
-        alloc::alloc::alloc_zeroed(layout)
+        crate::arch::memory::dma::ident(layout.size(), layout.align()) as *mut u8
     }
 }
 

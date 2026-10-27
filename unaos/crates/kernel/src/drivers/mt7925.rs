@@ -621,11 +621,11 @@ fn dma_off(b: u64) -> Result<(), String> {
     Ok(())
 }
 
-/// One ring's descriptors: zeroed, page-aligned, heap address = bus address (the identity map, nvme.rs `dma_alloc`'s
-/// standing property), every ctrl word DMA_DONE (linux's queue reset, dma.c:209-211). 0 on failure. Never freed: the
-/// device holds the base while GLO_CFG's EN bits are set (the one shared allocator, DMAALLOCONE B986).
+/// One ring's descriptors: zeroed, page-aligned, below 4 GiB, heap address = bus address, every ctrl word DMA_DONE
+/// (linux's queue reset, dma.c:209-211). 0 on failure, a ring past 4 GiB included (DMAALLOCXHCI B988: the allocator
+/// refuses it, so S3 says `no-memory` and its `dma-high` arm is unreachable). Never freed (DMAALLOCONE B986).
 fn ring() -> u64 {
-    let p = crate::arch::memory::dma::ident(RING_BYTES, 4096);
+    let p = crate::arch::memory::dma::alloc(RING_BYTES, 4096, true).filter(|b| b.pa == b.va).map_or(0, |b| b.va);
     if p != 0 {
         for i in 0..RING_DEPTH as u64 {
             // SAFETY: inside the RING_BYTES block just allocated; descriptor i's ctrl word at +4.
