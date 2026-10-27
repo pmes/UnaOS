@@ -506,10 +506,11 @@ fn s10_wpa2(me: [u8; 6], bssid: [u8; 6], ch: u8, ssid: &str, rsn: Option<alloc::
 pub fn wpa2() {
     let a = super::assoc::wpa2_kat();
     let keys = crate::drivers::mt7925::s10_kat();
+    let kz = crate::drivers::mt7925::keyzero_kat();
     let ok = |b: bool| if b { "ok" } else { "FAIL" };
     serial_println!(
-        ":: WPA2KAT: pbkdf2={} prf={} mic={} unwrap={} frame={} keys={} rekey={} -> {} ::",
-        ok(a[0]), ok(a[1]), ok(a[2]), ok(a[3]), ok(a[4]), ok(keys), ok(a[5]), if a.iter().all(|&b| b) && keys { "PASS" } else { "FAIL" }
+        ":: WPA2KAT: pbkdf2={} prf={} mic={} unwrap={} frame={} keys={} rekey={} keyzero={} -> {} ::",
+        ok(a[0]), ok(a[1]), ok(a[2]), ok(a[3]), ok(a[4]), ok(keys), ok(a[5]), kz, if a.iter().all(|&b| b) && keys && kz.starts_with("skip") { "PASS" } else { "FAIL" }
     );
 }
 
