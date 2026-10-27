@@ -36,3 +36,5 @@ python3 adts2mp4.py a01.aac m01.m4a --skip 2048 --dur 30000
 python3 adts2mp4.py a07.aac m07.m4a --frag 5
 python3 adts2mp4.py a10.aac m10.m4a --skip 1024 --dur 20000 --smpb --moov-last
 python3 adts2mp4.py a04.aac m04.m4a
+# HEAACSBR (LEDGER SR198): the HE-AAC references (FFmpeg 6.1.1, Chromium's bear streams from tests/vectors.txt)
+ffmpeg -i bear-audio-implicit-he-aac-v1.aac -c:a flac -sample_fmt s32 -bits_per_raw_sample 24 -compression_level 8 -fflags +bitexact -map_metadata -1 he1.ref.flac && ffmpeg -i bear-audio-implicit-he-aac-v2.aac -c:a flac -sample_fmt s16 -compression_level 8 -fflags +bitexact -map_metadata -1 he2.ref.flac

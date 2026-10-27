@@ -19,3 +19,8 @@ m01.m4a a01 2048 30000 snr
 m07.m4a a07 0 18432 pns
 m10.m4a a10 1024 20000 snr
 m04.m4a a04 0 19456 pns
+# HEAACSBR (LEDGER SR198): he1.ref.flac / he2.ref.flac are FFmpeg 6.1.1 (6.1.1-3ubuntu5, Lavf 60.16.100) float decodes
+# of Chromium's bear-audio-implicit-he-aac-v1.aac / -v2.aac (fetched, sha256 in tests/vectors.txt), read by
+# tests/aac_kat.rs heaac_vs_ffmpeg (not by this table). Commands (also in oracle/gen-aac.sh):
+#   ffmpeg -i bear-audio-implicit-he-aac-v1.aac -c:a flac -sample_fmt s32 -bits_per_raw_sample 24 -compression_level 8 -fflags +bitexact -map_metadata -1 he1.ref.flac
+#   ffmpeg -i bear-audio-implicit-he-aac-v2.aac -c:a flac -sample_fmt s16 -compression_level 8 -fflags +bitexact -map_metadata -1 he2.ref.flac

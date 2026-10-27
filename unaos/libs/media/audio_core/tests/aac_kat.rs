@@ -125,8 +125,9 @@ fn aac_fetched_streams() {
         ("chromium-sfx.m4a", Some((44100, 1, 12701))),
         ("chromium-bear-640x360-a_frag.mp4", Some((44100, 2, 123904))),
         ("chromium-bear-mpeg2-aac-only_frag.mp4", Some((44100, 2, 121856))),
-        ("chromium-bear-audio-implicit-he-aac-v1.aac", Some((24000, 2, 68608))),
-        ("chromium-bear-audio-implicit-he-aac-v2.aac", Some((24000, 1, 69632))),
+        // HEAACSBR (LEDGER SR198): implicit HE-AAC plays at twice the 24 kHz core rate; v2's PS core is duplicated
+        ("chromium-bear-audio-implicit-he-aac-v1.aac", Some((48000, 2, 137216))),
+        ("chromium-bear-audio-implicit-he-aac-v2.aac", Some((48000, 2, 139264))),
         ("chromium-bear-audio-main-aac.aac", None),
     ];
     let mut checked = 0;
@@ -146,4 +147,68 @@ fn aac_fetched_streams() {
         checked += 1;
     }
     eprintln!("fetched AAC streams: {} checked", checked);
+}
+
+/// HEAACSBR (LEDGER SR198): Chromium's implicit HE-AAC streams (fetched, sha256-pinned in vectors.txt) against
+/// FFmpeg 6.1.1's float decode (`he1.ref.flac` 24-bit, `he2.ref.flac` 16-bit; the commands are in expected.txt and
+/// oracle/gen-aac.sh). v1 (SBR): waveform SNR >= 50 dB. v2 (SBR + parametric stereo): FFmpeg synthesises the stereo
+/// image, ours duplicates the mono core (`ps=seen`, PS synthesis owed: handlers.md HEAACSBR-PS), so v2 is held to
+/// the level of the SBR band — third-octave bands above the core's 12 kHz Nyquist, ours vs the reference's mid
+/// (L+R)/2, mean difference within 6 dB.
+#[test]
+fn heaac_vs_ffmpeg() {
+    let mut checked = 0;
+    for v in common::vectors("aac") {
+        let name = v.path.file_name().unwrap().to_string_lossy().to_string();
+        let refname = match name.as_str() {
+            "chromium-bear-audio-implicit-he-aac-v1.aac" => "he1",
+            "chromium-bear-audio-implicit-he-aac-v2.aac" => "he2",
+            _ => continue,
+        };
+        let Some(bytes) = common::fetch(&v) else { continue };
+        // the first ADTS frame through the public probe: implicit SBR found, and PS seen or not
+        let (sfi, cc) = (((bytes[2] >> 2) & 15) as usize, ((bytes[2] & 1) << 2) | (bytes[3] >> 6));
+        let flen = (((bytes[3] & 3) as usize) << 11) | ((bytes[4] as usize) << 3) | (bytes[5] as usize >> 5);
+        let off = if bytes[1] & 1 != 0 { 7 } else { 9 };
+        let layout = audio_core::aac::Layout::from_config(cc).unwrap();
+        let dec = audio_core::aac::sbr_probe(audio_core::aac::AacDecoder::new(sfi, layout).unwrap(), Some(&bytes[off..flen]), false).unwrap();
+        assert_eq!(dec.frame_len(), 2048, "{}: SBR not found", name);
+        let ps = if dec.ps_seen { "ps=seen" } else { "ps=none" };
+        let (info, pcm) = decode_all(&bytes).unwrap_or_else(|e| panic!("{}: {:?}", name, e));
+        let (rinfo, rf) = decode_all(&std::fs::read(data().join(format!("{}.ref.flac", refname))).unwrap()).unwrap();
+        let ch = info.channels as usize;
+        assert_eq!((info.rate, ch), (rinfo.rate, rinfo.channels as usize), "{}: rate/channels", name);
+        assert_eq!(pcm.len(), rf.len(), "{}: length", name);
+        let frames = pcm.len() / ch;
+        if refname == "he1" {
+            assert_eq!(ps, "ps=none", "{}", name);
+            let (mut s, mut e) = (0f64, 0f64);
+            for i in 0..pcm.len() { let d = (pcm[i] - rf[i]) as f64; s += (rf[i] as f64).powi(2); e += d * d; }
+            let snr = 10.0 * (s / e).log10();
+            eprintln!("HE-AAC v1 {:<44} {}ch {}Hz frames={} {} SNR={:.1} dB -> {}", name, ch, info.rate, frames, ps, snr, if snr >= 50.0 { "OK" } else { "FAIL" });
+            assert!(snr >= 50.0, "{}: SNR {:.1} dB", name, snr);
+        } else {
+            assert_eq!(ps, "ps=seen", "{}", name);
+            let ours: Vec<f64> = (0..frames).map(|i| pcm[i * ch] as f64).collect();
+            let mid: Vec<f64> = (0..frames).map(|i| 0.5 * (rf[i * ch] as f64 + rf[i * ch + 1] as f64)).collect();
+            let rate = info.rate as f64;
+            let (mut hi_sum, mut hi_n, mut lo_sum, mut lo_n) = (0f64, 0usize, 0f64, 0usize);
+            for blk in 0..frames / 1024 {
+                let (pa, pb) = (bands(&ours[blk * 1024..], rate), bands(&mid[blk * 1024..], rate));
+                let top = pb.iter().cloned().fold(0.0, f64::max);
+                for k in 0..pb.len() {
+                    if pb[k] < top * 1e-6 || pb[k] < 1e-8 { continue; }
+                    let d = 10.0 * (pa[k] / pb[k]).log10();
+                    if 100.0 * 2f64.powf(k as f64 / 3.0) > 12000.0 { hi_sum += d; hi_n += 1; } else { lo_sum += d; lo_n += 1; }
+                }
+            }
+            let (hi, lo) = (hi_sum / hi_n.max(1) as f64, lo_sum / lo_n.max(1) as f64);
+            let good = hi_n > 0 && hi.abs() < 6.0;
+            eprintln!("HE-AAC v2 {:<44} {}ch {}Hz frames={} {} (PS skipped, mono duplicated) high band (>12 kHz) {:+.2} dB over {} bands, low band {:+.2} dB -> {}",
+                name, ch, info.rate, frames, ps, hi, hi_n, lo, if good { "OK" } else { "FAIL" });
+            assert!(good, "{}: high band {:+.2} dB over {} bands", name, hi, hi_n);
+        }
+        checked += 1;
+    }
+    eprintln!("HE-AAC streams: {} checked", checked);
 }

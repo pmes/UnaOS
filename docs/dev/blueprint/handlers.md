@@ -74,13 +74,19 @@
   | AV1 | av1C | container keys; `frame_type` KEY_FRAME in `obu` | ok: `image::Decoder::decode_temporal_unit`, 8/10/12-bit config | METADATA OBUs skipped (HDR mdcv/cll; NLEPROBE-HDR) |
   | VP9 | vpcC / V_VP9 | container keys; `key_frame`/`intra_only` | ok: profiles 0/2 (8/10/12-bit), superframes | profiles 1/3 (4:2:2, 4:4:4, alpha) refused |
   | VP8 | V_VP8 | container keys; `FrameTag.key_frame` | ok | none measured |
-  | AAC | esds ASC | every unit sync | AAC-LC | HE-AAC SBR/PS decodes as the LC core at half rate (NLEPROBE-HI) |
+  | AAC | esds ASC | every unit sync | AAC-LC; HE-AAC v1: SBR at twice the core rate (HEAACSBR, LEDGER SR198; explicit or implicit signalling); v2: PS recognised (`ps=seen`), the mono core on both channels | PS synthesis (HEAACSBR-PS); downsampled SBR and 960-sample frames (HEAACSBR-DS) |
   | Opus / Vorbis / FLAC / MP3 / PCM | ok (Opus pre-skip `codec_delay_ns`) | every unit sync; audio_core's Opus seek takes the 80 ms pre-roll | ok | the editor's `preroll` flag is pts-based; an audio codec's own pre-roll stays audio_core's |
 - NLEPROBE-MKVDTS (SR195 owed): Matroska stores no decode time; a B-frame H.264/HEVC Matroska track needs dts derived (the SPS reorder depth or the pts sort) before its composition offsets mean anything, and `mkv.rs` `parse`'s next-pts duration fill must follow presentation order.
 - NLEPROBE-CUES (SR195 owed): Matroska Cues and MP4 `sidx`/`mfra` are unread; an index-only open would let the editor survey a long file without walking every cluster or fragment.
 - NLEPROBE-EDITS (SR195 owed): `mp4.rs` `parse_trak` honours the first media edit only; multi-edit and rate edits, `sdtp`, and open-GOP leading pictures (a `samples_from` on a non-IDR key can hand undecodable leading Bs) are owed.
 - NLEPROBE-HDR (SR195 owed): colour and HDR metadata (MP4 `colr`/`mdcv`/`clli`, Matroska `Colour`, AV1 METADATA OBUs, H.264 VUI primaries/transfer) reach no `Track` field.
-- NLEPROBE-HI (SR195 owed): H.264 High10 and 4:2:2, an HEVC decoder, HE-AAC SBR/PS, and a cross-check of the container's keyframe flag against the decoder's own (`idr`, `frame_type`, `key_frame`).
+- NLEPROBE-HI (SR195 owed): H.264 High10 and 4:2:2, an HEVC decoder, and a cross-check of the container's keyframe flag against the decoder's own (`idr`, `frame_type`, `key_frame`). (HE-AAC SBR: HEAACSBR, LEDGER SR198; its PS: HEAACSBR-PS.)
+- HEAACSBR-PS (SR198 owed): parametric stereo synthesis (hybrid analysis, decorrelator, IID/ICC/IPD/OPD mixing) in `unaos/libs/media/audio_core/src/aac/sbr.rs`; today the PS extension is stepped over by its size (its Huffman tables unread) and `AacDecoder` duplicates the mono core; PS first appearing after the probed first access unit leaves the stream mono.
+- HEAACSBR-DS (SR198 owed): downsampled SBR (extension rate = core rate) and 960-sample frames are not decoded; the output is always twice the core rate.
+- HEAACSBR-SEEK (SR198 owed): a seek restarts the SBR state with the decoder (`mod.rs` `restart`); until the next `sbr_header` the frames play the low band only (the pre-roll is the LC unit).
+- HEAACSBR-HOST (SR198 owed): `libs/gneiss_pal/src/dsp/audio_track.rs` (`AacCodec`) builds `AacDecoder::new` directly and stays on the LC core at half rate until it calls `audio_core::aac::sbr_probe`.
+- HEAACSBR-COST (SR198 owed): the QMF banks' cost on the soft-float kernel (hda_play decodes through audio_core) is unmeasured.
+- HEAACSBR-SMPB (SR198 owed): an `iTunSMPB` gapless trim on HE-AAC is doubled like the edit list (taken as core-rate samples); unverified against an iTunes-made file.
 
 ## 6. Read further
 - `docs/CODEX.md`; `docs/dev/USERLAND/ARCHITECTURE.md`; each handler's own `README.md` for implementation (not charter).
