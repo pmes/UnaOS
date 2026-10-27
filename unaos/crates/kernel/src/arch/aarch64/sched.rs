@@ -11334,12 +11334,12 @@ pub mod preemptoff {
         let ok = |b: bool, y: &'static str, n: &'static str| if b { y } else { n };
         match reason {
             None => serial_println!(
-                ":: PREEMPTAUDIT: arch=aarch64 converted_fat={} fat_irq_on=ok dir_irq_on=ok fat_held=ok dir_held=ok masked_kept=ok released=ok -> PASS ::",
-                CONVERTED_FAT
+                ":: PREEMPTAUDIT: arch=aarch64 sites={} isr={} holder={} both={} converted={} converted_fat={} fat_irq_on=ok dir_irq_on=ok fat_held=ok dir_held=ok masked_kept=ok released=ok -> PASS ::",
+                AUDIT_SITES, AUDIT_ISR, AUDIT_HOLDER, AUDIT_BOTH, AUDIT_CONVERTED, CONVERTED_FAT
             ),
             Some(r) => serial_println!(
-                ":: PREEMPTAUDIT: arch=aarch64 converted_fat={} fat_irq_on={} dir_irq_on={} fat_held={} dir_held={} masked_kept={} released={} -> FAIL reason={} ::",
-                CONVERTED_FAT,
+                ":: PREEMPTAUDIT: arch=aarch64 sites={} isr={} holder={} both={} converted={} converted_fat={} fat_irq_on={} dir_irq_on={} fat_held={} dir_held={} masked_kept={} released={} -> FAIL reason={} ::",
+                AUDIT_SITES, AUDIT_ISR, AUDIT_HOLDER, AUDIT_BOTH, AUDIT_CONVERTED, CONVERTED_FAT,
                 ok(fat_on, "ok", "masked"),
                 ok(dir_on, "ok", "masked"),
                 ok(fat_held, "ok", "free"),
@@ -11350,4 +11350,19 @@ pub mod preemptoff {
             ),
         }
     }
+
+    /// PREEMPTOFFARMCENSUS (zenbook-ledger Z72) M1: the census of the aarch64 kernel's IRQ-mask sites (cores.md §4, the
+    /// PREEMPTOFFARM line), measured at 05beb9fa9 (held at d06742fa1) over FIVE forms — `arch::without_interrupts`, `arch::IrqMask`, this file's
+    /// `mask_irq` / `irq_save_mask`, syscall.rs `IrqGuard::mask_save` / `remask_irq`, raw `msr daifset` (#2, #0xf); NOT the
+    /// SError A-bit `daifset #4` (exceptions.rs). Any site compiled on aarch64 under any feature set counts (Z57's rule).
+    /// The ISR set: GICv2 SGI / `timer::on_tick` (prints) / PL011 RX `serial::on_rx_interrupt` -> `RX_READY.post()` ->
+    /// `make_ready` -> `rq().push`, so the run queue and `Semaphore` are ISR-shared (III); GICv3 SGI / tick. 167 sites — 28 I
+    /// (switch, SVC epilogue, PAR/TTBR0, boot/probe edges, fixtures), 116 II (syscall tables, futex, Condvar, UnaFS, pal,
+    /// WEDGE-10 loans, usbnet, wm/desktop), 23 III (heap, serial `_print`, fbcon, run queue, Semaphore); the two FAT/DIR
+    /// spans (`CONVERTED_FAT`) are converted to preempt-off and counted inside II (Z65's rule).
+    pub const AUDIT_SITES: u32 = 167;
+    pub const AUDIT_ISR: u32 = 28;
+    pub const AUDIT_HOLDER: u32 = 116;
+    pub const AUDIT_BOTH: u32 = 23;
+    pub const AUDIT_CONVERTED: u32 = CONVERTED_FAT;
 }
