@@ -64,7 +64,7 @@ impl<T: ?Sized> Mutex<T> {
     #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))] // aarch64: the wrapper only (no registry)
     #[inline]
     fn addr(&self) -> usize {
-        &self.raw as *const spin::Mutex<()> as usize
+        &self.raw as *const spin::Mutex<()> as usize } #[cfg(target_arch = "x86_64")] #[inline] fn raw_locked(addr: usize) -> bool { unsafe { (*(addr as *const spin::Mutex<()>)).is_locked() } // REGGAP (B1021): the raw lock by address for the walk's intent-gap arm, on the registry's allowed line (seat ruling). LINE-NEUTRAL fold
     }
 
     #[track_caller]
@@ -72,22 +72,22 @@ impl<T: ?Sized> Mutex<T> {
     pub fn lock(&self) -> MutexGuard<'_, T> {
         #[cfg(target_arch = "x86_64")]
         {
-            let at = Location::caller();
+            let at = Location::caller(); let s = reg::acquire(self.addr(), &self.class, self.site, at, true); // REGGAP (B1021): the slot CLAIMED with intent (every call: who, class, edges) BEFORE the raw CAS. LINE-NEUTRAL fold
             if let Some(g) = self.raw.try_lock() {
-                return self.guard(g, reg::acquire(self.addr(), &self.class, self.site, at, true));
+                return self.guard(g, reg::flip(s)); // REGGAP (B1021): held — only inline stores between the winning CAS and the flip
             }
-            // The slow path: say who waits on what, so the 50 ms scan can name a spin past 10 ms.
+            reg::unwin(s); // REGGAP (B1021): the CAS lost — out of the window before any call. The slow path: say who waits on what, so the 50 ms scan can name a spin past 10 ms.
             let w = reg::wait_begin(self.addr(), self.site, at);
             let g = loop {
                 while self.raw.is_locked() {
                     core::hint::spin_loop();
                 }
-                if let Some(g) = self.raw.try_lock() {
-                    break g;
-                }
+                reg::win(s); if let Some(g) = self.raw.try_lock() { // REGGAP (B1021): into the window, call-free, for this CAS only
+                    reg::flip(s); break g;
+                } reg::unwin(s); // REGGAP (B1021): a lost in-loop CAS leaves the window before the next spin
             };
             reg::wait_end(w);
-            self.guard(g, reg::acquire(self.addr(), &self.class, self.site, at, true))
+            self.guard(g, s)
         }
         #[cfg(not(target_arch = "x86_64"))]
         {
@@ -100,8 +100,8 @@ impl<T: ?Sized> Mutex<T> {
     pub fn try_lock(&self) -> Option<MutexGuard<'_, T>> {
         #[cfg(target_arch = "x86_64")]
         {
-            let at = Location::caller();
-            self.raw.try_lock().map(|g| self.guard(g, reg::acquire(self.addr(), &self.class, self.site, at, false))) // KVMLAT (B578): a try can never WAIT, so it closes no deadlock cycle: no order edge (the hold is still tracked). LINE-NEUTRAL fold
+            let at = Location::caller(); if self.raw.is_locked() { return None; } let s = reg::acquire(self.addr(), &self.class, self.site, at, false); // REGGAP (B1021): a held lock answers None for one load; else the slot is CLAIMED with intent before the CAS. LINE-NEUTRAL fold
+            match self.raw.try_lock() { Some(g) => Some(self.guard(g, reg::flip(s))), None => { reg::abandon(s); None } } // KVMLAT (B578): a try can never WAIT, so it closes no deadlock cycle: no order edge (the hold is still tracked). LINE-NEUTRAL fold
         }
         #[cfg(not(target_arch = "x86_64"))]
         {
@@ -221,7 +221,7 @@ mod reg {
     struct Part {
         mask: AtomicU32,
         /// `tid << 24 | class << 8 | (cpu + 1)` (0 = free).
-        tag: [AtomicU64; PER],
+        tag: [AtomicU64; PER], intent: [AtomicU64; PER], // REGGAP (B1021): the claimed slot's tag before its raw CAS, + WIN across the CAS window (0 = none) — LINE-NEUTRAL fold
         lock: [AtomicUsize; PER],
         at: [AtomicPtr<Loc>; PER],
         t0: [AtomicU64; PER],
@@ -242,7 +242,7 @@ mod reg {
         const fn new() -> Self {
             Part {
                 mask: AtomicU32::new(0),
-                tag: [const { AtomicU64::new(0) }; PER],
+                tag: [const { AtomicU64::new(0) }; PER], intent: [const { AtomicU64::new(0) }; PER], // REGGAP (B1021) — LINE-NEUTRAL fold
                 lock: [const { AtomicUsize::new(0) }; PER],
                 at: [const { AtomicPtr::new(core::ptr::null_mut()) }; PER],
                 t0: [const { AtomicU64::new(0) }; PER],
@@ -406,7 +406,7 @@ mod reg {
         }
     }
 
-    /// A hold begins: one CAS (the entry) + four stores; the order edges against this task's other holds on this core.
+    /// A hold is CLAIMED: one CAS (the entry) + four stores, the tag into `intent` with WIN (REGGAP B1021: before the raw CAS; `flip` makes it the tag after it); the order edges against this task's other holds on this core.
     #[inline]
     pub fn acquire(addr: usize, class: &AtomicU16, site: &'static Loc, at: &'static Loc, edges: bool) -> u16 { // KVMLAT (B578): `edges` = this acquire could have waited (`lock`), false for `try_lock`
         let Some((tid, cpu)) = who() else {
@@ -456,7 +456,7 @@ mod reg {
         p.lock[i].store(addr, Relaxed);
         p.at[i].store(at as *const Loc as *mut Loc, Relaxed);
         p.t0[i].store(rdtsc(), Relaxed);
-        p.tag[i].store(tid << 24 | (c as u64) << 8 | (cpu as u64 + 1), Release);
+        p.intent[i].store(tid << 24 | (c as u64) << 8 | (cpu as u64 + 1) | WIN, Release); // REGGAP (B1021): CLAIMED with intent, WIN set for the CAS that follows; `flip` makes it the tag. LINE-NEUTRAL fold
         p.tracked.store(p.tracked.load(Relaxed) + 1, Relaxed);
         (cpu * PER + i) as u16
     }
@@ -755,7 +755,7 @@ mod reg {
             while bits != 0 {
                 let i = bits.trailing_zeros() as usize;
                 bits &= bits - 1;
-                let t = p.tag[i].load(Acquire);
+                let t = p.tag[i].load(Acquire); let t = if t == 0 { won_gap(p, i, tid, gap == 0) } else { t }; // REGGAP (B1021): ONE arm — a slot this dead task CLAIMED: its intent when it won the raw CAS and died before the flip (released by the body below), else the slot freed and 0. LINE-NEUTRAL fold
                 if t == 0 || tag_tid(t) != tid {
                     continue;
                 }
@@ -904,6 +904,7 @@ mod reg {
             tag_tid(max_tag),
             tag_cpu(max_tag), POISON_N.load(Acquire), POISON_LOST.load(Relaxed), cword, bword, kword
         );
+        reggap_leg(); // REGGAP (B1021): the intent arm's KAT, its own `:: REGGAP:` line after LOCKREG's
     }
 
     // ── LOCKREG2 (B823): every hold past 50 ms is NAMED — in flight by the scan, or at its release through the pending
@@ -1033,6 +1034,11 @@ mod reg {
                 let (tag, at, poisoned) = self.v[k];
                 // SAFETY: `at` is a `&'static Location` or null.
                 let at = if at.is_null() { None } else { Some(unsafe { &*at }) };
+                if tag & WIN != 0 {
+                    let tag = tag & !WIN; // REGGAP (B1021): a slot its dead task CLAIMED and won before the flip (`won_gap`)
+                    serial_println!("[lock] released-on-death name={} at={} by={}@cpu{} why=intent-gap death={} poisoned={}", Site(class_site(tag_class(tag))), Site(at), tag_tid(tag), tag_cpu(tag), why, poisoned as u8);
+                    continue;
+                }
                 serial_println!("[lock] released-on-death name={} at={} by={}@cpu{} why={} poisoned={}", Site(class_site(tag_class(tag))), Site(at), tag_tid(tag), tag_cpu(tag), why, poisoned as u8);
             }
             if self.more > 0 {
@@ -1263,6 +1269,149 @@ mod reg {
     /// Drop lock `addr`'s entries WITHOUT the unlock (`tests pumpdeath`'s deliberate gap hold only).
     pub fn untrack(addr: usize) {
         forget(addr)
+    }
+
+    // ── REGGAP (rmbp-ledger B1021, BP-cores-14): the slot is CLAIMED before the raw CAS (`acquire` writes `intent`, WIN
+    // set) and FLIPPED to the tag right after it. WIN marks only the call-free instructions around a CAS (spin's
+    // `try_lock` is inline(always)), so a task that dies between its winning CAS and the flip is still named, and the walk
+    // releases it (`won_gap`); a task that dies spinning or before its CAS releases nothing. ──
+
+    /// The window bit in an `intent` word (bit 23: above every class, never in a tag).
+    const WIN: u64 = 1 << 23;
+
+    /// The raw CAS won: the claimed slot becomes the hold's tag (t0 re-stamped: the span is the hold, not the spin).
+    /// Inline stores only — no call between the CAS and this. `slot` back for the guard.
+    #[inline(always)]
+    pub fn flip(slot: u16) -> u16 {
+        if slot != NONE {
+            let (p, i) = (&PARTS[slot as usize / PER], slot as usize % PER);
+            let v = p.intent[i].load(Relaxed);
+            p.t0[i].store(unsafe { core::arch::x86_64::_rdtsc() }, Relaxed);
+            p.tag[i].store(v & !WIN, Release);
+            p.intent[i].store(0, Release);
+        }
+        slot
+    }
+
+    /// Into the window for one slow-path CAS (call-free up to the CAS).
+    #[inline(always)]
+    pub fn win(slot: u16) {
+        if slot != NONE {
+            let w = &PARTS[slot as usize / PER].intent[slot as usize % PER];
+            w.store(w.load(Relaxed) | WIN, Release);
+        }
+    }
+
+    /// Out of the window: the CAS lost (before any call: `wait_begin`, the next spin).
+    #[inline(always)]
+    pub fn unwin(slot: u16) {
+        if slot != NONE {
+            let w = &PARTS[slot as usize / PER].intent[slot as usize % PER];
+            w.store(w.load(Relaxed) & !WIN, Release);
+        }
+    }
+
+    /// A `try_lock` that lost its CAS: the claimed slot is freed (no hold began).
+    #[inline(always)]
+    pub fn abandon(slot: u16) {
+        if slot != NONE {
+            let (p, i) = (&PARTS[slot as usize / PER], slot as usize % PER);
+            p.intent[i].store(0, Release);
+            p.mask.fetch_and(!(1u32 << i), Release);
+        }
+    }
+
+    /// `release_task`'s ONE intent arm: slot `i` of `p` was CLAIMED by dead task `tid` (its tag still 0). It won its raw
+    /// CAS and died before the flip when WIN is set, the raw lock is locked, no tracked holder names the lock and the
+    /// heap's gap release took nothing (`may`): its intent (WIN kept, for `Dead::say`) goes back to the walk's body (mark,
+    /// free, force-unlock). Otherwise it never took the lock (spinning, before its CAS, CAS lost): the slot is freed, 0.
+    fn won_gap(p: &Part, i: usize, tid: u64, may: bool) -> u64 {
+        let v = p.intent[i].load(Acquire);
+        if v == 0 || tag_tid(v) != tid {
+            return 0;
+        }
+        let addr = p.lock[i].load(Relaxed);
+        p.intent[i].store(0, Release);
+        if may && v & WIN != 0 && addr != 0 && super::Mutex::<()>::raw_locked(addr) && holder_of(addr).is_none() {
+            return v;
+        }
+        p.mask.fetch_and(!(1u32 << i), Release);
+        0
+    }
+
+    // `tests lockreg`'s REGGAP leg: a death between the CAS and the flip cannot be staged on purpose, so the walk's arm is
+    // asserted directly on a synthetic dead task FAKE (no live task; lockowner and heapgap match nothing).
+    static GAP: super::Mutex<u32> = super::Mutex::new(0);
+    const FAKE: u64 = 0xFF_FFFE;
+
+    /// A GAP slot claimed as dead FAKE would hold it: `acquire`'s intent re-tagged to FAKE, WIN kept. NONE = no slot.
+    fn fake_claim() -> u16 {
+        let s = acquire(GAP.addr(), &GAP.class, GAP.site, GAP.site, false);
+        if s != NONE {
+            let w = &PARTS[s as usize / PER].intent[s as usize % PER];
+            w.store((w.load(Relaxed) & 0xFF_FFFF) | FAKE << 24, Release);
+        }
+        s
+    }
+
+    fn slot_free(s: u16) -> bool {
+        PARTS[s as usize / PER].mask.load(Acquire) & (1u32 << (s as usize % PER)) == 0
+    }
+
+    /// The REGGAP leg, masked on this core: (1) intent — a FAKE slot with WIN and the raw word set is invisible to every
+    /// reader; (2) walk — `release_task(FAKE)` releases it (1), unlocked, poisoned, slot freed, `why=intent-gap`;
+    /// (3) waiter_kept — GAP held tracked by this task and a FAKE WIN slot on it: nothing released, no mark, slot freed;
+    /// (4) flip — `GAP.lock()`'s slot is a tag, its intent cleared, its holder this task.
+    fn reggap_leg() {
+        if !ON.load(Acquire) {
+            serial_println!(":: REGGAP: -> SKIP(unarmed) ::");
+            return;
+        }
+        let _ = GAP.take_poison(); // a mark left by an earlier run
+        let (iword, n, why, kword, fword) = crate::arch::without_interrupts(|| {
+            let s = fake_claim();
+            if s == NONE {
+                return ("no-slot", 0usize, "none", "skip(intent)", "skip(intent)");
+            }
+            let took = GAP.raw.try_lock().map(core::mem::forget).is_some();
+            let v = PARTS[s as usize / PER].intent[s as usize % PER].load(Acquire);
+            let iword = if !took { "busy" } else if v & WIN == 0 { "no-win" } else if holder_of(GAP.addr()).is_some() { "tagged" } else { "ok" };
+            if iword != "ok" {
+                abandon(s);
+                if took {
+                    // SAFETY: this leg took the raw word itself and forgot its guard; nothing else holds it.
+                    unsafe { GAP.force_unlock() };
+                }
+                return (iword, 0, "none", "skip(intent)", "skip(intent)");
+            }
+            let n = release_task(FAKE, "tests lockreg reggap");
+            let (unlocked, poisoned, freed) = (!GAP.is_locked(), GAP.take_poison(), slot_free(s));
+            let why = if n == 1 && unlocked && poisoned && freed { "intent-gap" } else { "none" };
+            let g = GAP.lock();
+            let s2 = fake_claim();
+            let kword = if s2 == NONE {
+                "no-slot"
+            } else {
+                let k = release_task(FAKE, "tests lockreg reggap waiter");
+                if k != 0 || !GAP.is_locked() { "released" } else if GAP.take_poison() { "poisoned" } else if !slot_free(s2) { "slot-kept" } else { "ok" }
+            };
+            let fword = if g.slot == NONE {
+                "untagged"
+            } else {
+                let (p, i) = (&PARTS[g.slot as usize / PER], g.slot as usize % PER);
+                if p.intent[i].load(Acquire) != 0 {
+                    "intent-left"
+                } else if p.tag[i].load(Acquire) == 0 || holder_of(GAP.addr()).map(|(t, _)| t) != Some(here_tid()) {
+                    "untagged"
+                } else {
+                    "ok"
+                }
+            };
+            drop(g);
+            (iword, n, why, kword, fword)
+        });
+        let pass = iword == "ok" && n == 1 && why == "intent-gap" && kword == "ok" && fword == "ok";
+        serial_println!(":: REGGAP: intent={} flip={} walk_released={} why={} waiter_kept={} -> {} ::", iword, fword, n, why, kword, if pass { "PASS" } else { "FAIL" });
     }
 }
 
