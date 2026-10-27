@@ -922,7 +922,7 @@ pub fn tests_gpublit() {
 // J2 a fresh heap source (new `map_sys` PTEs written after the GMMU walked the table, no TLB invalidate: fresh-pte), J3 the same
 // source again (the cached mapping: reuse). Each destination is read back through the BAR1 aperture word by word. Behind
 // `nvidia-kepler-cecopy` (UNAOS_KEPLERCE), never at boot (R80); it calls `run`, never `copy_wait`, so it neither demotes nor
-// selects the compositor's blitter (WALL A, the selection latched before `arm`, is KEPLER3D2's). The region is the knob-only
+// selects the compositor's blitter (WALL A, the selection latched before `arm`, is KEPLER3D2's: `blitter::reprobe`, B883). The region is the knob-only
 // tail of this module's own VRAM window (`CEFIX_BYTES`, 0 bytes knob-off), inside the PDE[0] identity map, never scanned out.
 
 /// KEPLER3D: the fixture's VRAM region past the USERD table (source half + destination half); 0 bytes without the knob.
@@ -996,13 +996,15 @@ mod cefix {
         (out, us)
     }
 
-    /// `tests keplerce`: PASS iff all three jobs copy and verify byte-exact; `wall=` names the first job that did not.
+    /// `tests keplerce`: PASS iff all three jobs copy and verify byte-exact; `wall=` names the first job that did not;
+    /// `sel=` is the compositor's blitter (`blitter::selected`) at the test, after KEPLER3D2's re-probe (B883).
     pub fn tests_keplerce() {
+        let sel = crate::video::blitter::selected().name(); // KEPLER3D2 (B883): the compositor's selection beside the wall verdict
         if !super::BUILT.load(Acquire) {
             if super::VERDICT.load(Acquire) == 0 {
-                serial_println!(":: KEPLERCE: channel=absent copy=- verify=- us=0 jobs=0/3 wall=- -> SKIP reason=no-kepler ::");
+                serial_println!(":: KEPLERCE: channel=absent copy=- verify=- us=0 jobs=0/3 wall=- sel={} -> SKIP reason=no-kepler ::", sel);
             } else {
-                serial_println!(":: KEPLERCE: channel=refused({}) copy=- verify=- us=0 jobs=0/3 wall=- -> FAIL ::", *super::REFUSED.lock());
+                serial_println!(":: KEPLERCE: channel=refused({}) copy=- verify=- us=0 jobs=0/3 wall=- sel={} -> FAIL ::", *super::REFUSED.lock(), sel);
             }
             return;
         }
@@ -1010,12 +1012,12 @@ mod cefix {
         // unwound one; the bench runs `tests keplerce` before `tests gen7`, whose candidate race is what demoted f34/f36/f37).
         let prior = if super::UNWOUND.load(Acquire) { "unwound" } else if super::DEMOTED.load(Acquire) { "demoted" } else { "" };
         if !prior.is_empty() {
-            serial_println!(":: KEPLERCE: channel={} copy=- verify=- us=0 jobs=0/3 wall=- -> FAIL ::", prior);
+            serial_println!(":: KEPLERCE: channel={} copy=- verify=- us=0 jobs=0/3 wall=- sel={} -> FAIL ::", prior, sel);
             return;
         }
         let mut heap = alloc::vec::Vec::new();
         if heap.try_reserve_exact(F_W * F_H).is_err() {
-            serial_println!(":: KEPLERCE: channel=ok copy=refused(heap) verify=- us=0 jobs=0/3 wall=- -> FAIL ::");
+            serial_println!(":: KEPLERCE: channel=ok copy=refused(heap) verify=- us=0 jobs=0/3 wall=- sel={} -> FAIL ::", sel);
             return;
         }
         heap.resize(F_W * F_H, 0u32);
@@ -1027,7 +1029,7 @@ mod cefix {
             core::hint::spin_loop();
         }
         let Some(mut ch) = g else {
-            serial_println!(":: KEPLERCE: channel=busy copy=- verify=- us=0 jobs=0/3 wall=- -> FAIL ::");
+            serial_println!(":: KEPLERCE: channel=busy copy=- verify=- us=0 jobs=0/3 wall=- sel={} -> FAIL ::", sel);
             return;
         };
         // J1's source: the CPU writes the pattern through BAR1, timed — the aperture write the copy engine replaces.
@@ -1074,8 +1076,8 @@ mod cefix {
             _ => alloc::string::String::from("-"),
         };
         serial_println!(
-            ":: KEPLERCE: channel=ok copy={} verify={} us={} jobs={}/3 wall={} cpu_us={} px={} -> {} ::",
-            copy, verify, sys_us, done, wall, cpu_us, F_W * F_H, if done == 3 { "PASS" } else { "FAIL" }
+            ":: KEPLERCE: channel=ok copy={} verify={} us={} jobs={}/3 wall={} sel={} cpu_us={} px={} -> {} ::",
+            copy, verify, sys_us, done, wall, sel, cpu_us, F_W * F_H, if done == 3 { "PASS" } else { "FAIL" }
         );
     }
 }

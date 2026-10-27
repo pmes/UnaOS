@@ -38,7 +38,17 @@ the glass.
 Wire: `[keplerce] job=<k> kind= us= verify=<ok|mismatch@n|timeout|unmappable> seq= gp_get= gp_put= sem=` per job, then
 `:: KEPLERCE: channel=ok copy=<ok|timeout|unmappable> verify=<ok|mismatch@n|-> us=<J2> jobs=<k>/3 wall=<…> cpu_us=<n> px=65536 -> PASS|FAIL ::`;
 a non-ok job adds the existing `[gpublit]`/`[kfifo] decode` dump. Refusals: `channel=<refused(why)|unwound|demoted|busy> … -> FAIL`;
-QEMU: `:: KEPLERCE: channel=absent copy=- verify=- us=0 jobs=0/3 wall=- -> SKIP reason=no-kepler ::`. `wall=none` opens KEPLER3D2.
+QEMU: `:: KEPLERCE: channel=absent copy=- verify=- us=0 jobs=0/3 wall=- sel=cpu -> SKIP reason=no-kepler ::`. `wall=none` opens KEPLER3D2.
+
+- **KEPLER3D2 (rmbp-ledger B883), cut 2026-10-27 at 5e65a8816: WALL A behind the same knob.** `kepler.rs:1474`'s arm line calls
+  `blitter::reprobe` (file tail of `video/blitter.rs`, `nvidia-kepler-cecopy` only): it releases `IGNITED` by compare-exchange and
+  re-runs `ignite` verbatim, so the selection is made once more, now that `arm` has run. Every `:: KEPLERCE:` line gains `sel=<cpu|gpu|bcs>`
+  (`blitter::selected`) after `wall=`. Expected on an `UNAOS_KEPLERCE=1` metal image:
+  self-test ok -> `[wc] blitter reprobe armed=1 was=cpu now=gpu why=selftest-ok`, then `[wc-h] rollup … blitter=gpu`; with WALL B
+  fixed, `:: KEPLERCE: channel=ok … wall=none sel=gpu … -> PASS ::`; with WALL B standing, the first present demotes
+  (`:: GPUBLIT: demoted reason=timeout job=1 …`) and `:: KEPLERCE: channel=demoted … wall=- sel=cpu -> FAIL ::`. Self-test not ok ->
+  `[wc] blitter reprobe armed=0 was=cpu now=cpu why=selftest-<mismatch|timeout|refused>`. A build without `wc` -> `why=not-ignited`.
+  QEMU: no reprobe line (`arm` never runs). Knob off: no line, no token; `./arroyo knoboff nvidia-kepler-cecopy` is the proof.
 
 ## PRE-REGISTERED — KEPLERGR4 (rmbp-ledger B627, R101), cut 2026-10-13: the GR class, SET_OBJECT, one readable method; UCODE-GATED
 
