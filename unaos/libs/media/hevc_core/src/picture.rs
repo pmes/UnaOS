@@ -249,6 +249,7 @@ impl Picture {
             bit_depth: self.bit_depth as u8,
             planes16: if self.bit_depth > 8 || self.bit_depth_c > 8 { Some(planes16) } else { None },
             chroma: self.chroma,
+            bit_depth_c: self.bit_depth_c as u8,
         }
     }
 }

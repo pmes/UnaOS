@@ -57,9 +57,17 @@ pub type Coeffs = (u32, [i32; 5], i32, i32);
 /// coefficient rounded half up from the exact rational: yc = 255 / ys, rv = 2(1-Kr) / cs, bu = 2(1-Kb) / cs,
 /// gu = 2Kb(1-Kb) / (Kg cs), gv = 2Kr(1-Kr) / (Kg cs), with ys = 219 << (n-8), cs = 224 << (n-8) limited and
 /// ys = cs = 2^n - 1 full. The 255 maps every depth straight to 8-bit output.
-pub fn coeffs((kr, kb): (i64, i64), full: bool, n: u32) -> Coeffs {
-    let s = if n <= 8 { 8 } else { 16 };
-    let (ys, cs) = if full { (((1i64 << n) - 1), ((1i64 << n) - 1)) } else { (219i64 << (n - 8), 224i64 << (n - 8)) };
+pub fn coeffs(kk: (i64, i64), full: bool, n: u32) -> Coeffs {
+    coeffs_depths(kk, full, n, n)
+}
+
+/// COLOURONE422 (LEDGER SR359): [`coeffs`] at a luma depth `ny` and a chroma depth `nc` (H.265 BitDepthY / BitDepthC):
+/// yc and the y offset from `ny`, rv / gu / gv / bu and the c offset from `nc`, shift 16 when either is above 8.
+/// `coeffs_depths(k, f, n, n)` is `coeffs(k, f, n)` exactly.
+pub fn coeffs_depths((kr, kb): (i64, i64), full: bool, ny: u32, nc: u32) -> Coeffs {
+    let s = if ny.max(nc) <= 8 { 8 } else { 16 };
+    let ys = if full { (1i64 << ny) - 1 } else { 219i64 << (ny - 8) };
+    let cs = if full { (1i64 << nc) - 1 } else { 224i64 << (nc - 8) };
     let rnd = |a: i64, b: i64| ((2 * a + b) / (2 * b)) as i32;
     let kg = 10000 - kr - kb;
     let c = [
@@ -69,7 +77,8 @@ pub fn coeffs((kr, kb): (i64, i64), full: bool, n: u32) -> Coeffs {
         rnd(2 * kr * (10000 - kr) * (255 << s), 10000 * kg * cs),
         rnd(2 * (10000 - kb) * (255 << s), 10000 * cs),
     ];
-    let (yoff, coff) = if full { (0, 1i32 << (n - 1)) } else { (16i32 << (n - 8), 128i32 << (n - 8)) };
+    let yoff = if full { 0 } else { 16i32 << (ny - 8) };
+    let coff = if full { 1i32 << (nc - 1) } else { 128i32 << (nc - 8) };
     (s, c, yoff, coff)
 }
 
@@ -140,14 +149,30 @@ pub fn to_rgba<T: Copy + Into<i32>>(p: &Picture<'_, T>, m: Matrix, up: Chroma, d
 /// 8 bits is narrowed inside the one rounded shift, after the conversion; with `dither` (and only above 8 bits) the
 /// rounding half is replaced by the 2x2 Bayer bias (1/8, 5/8, 7/8, 3/8 of an LSB, mean 1/2), so a flat field keeps its
 /// mean within half an LSB. YCgCo rounds half up (no dither). At 8-bit 4:2:0, `Matrix::Kr`, `Chroma::Nearest` and no
-/// dither this is COLOURONE's `yuv_to_rgba` byte for byte.
+/// dither this is COLOURONE's `yuv_to_rgba` byte for byte. One depth for every plane: [`to_rgba_cols_depths`] at `p.bit_depth`.
 pub fn to_rgba_cols<T: Copy + Into<i32>>(p: &Picture<'_, T>, y0: usize, y1: usize, cols: impl Iterator<Item = usize> + Clone, m: Matrix, up: Chroma, dither: bool, out: &mut [u8]) {
+    to_rgba_cols_depths(p, p.bit_depth, y0, y1, cols, m, up, dither, out)
+}
+
+/// COLOURONE422 (LEDGER SR359): the whole picture with the Cb / Cr planes at their own depth `nc` ([`to_rgba_cols_depths`]).
+pub fn to_rgba_depths<T: Copy + Into<i32>>(p: &Picture<'_, T>, nc: u32, m: Matrix, up: Chroma, dither: bool, out: &mut [u8]) {
+    to_rgba_cols_depths(p, nc, 0, p.h, 0..p.w, m, up, dither, out)
+}
+
+/// COLOURONE422 (LEDGER SR359): [`to_rgba_cols`] with the Cb / Cr planes at their own depth `nc` (8..=16) beside the luma's
+/// `p.bit_depth` (HEVC RExt's BitDepthC): the table is [`coeffs_depths`], YCgCo's chroma scale and the identity matrix's
+/// Cb / Cr planes take `nc`, the dither applies when either depth is above 8. `Matrix::Table` / `MultHi` are 8-bit callers'
+/// tables, used as given. At `nc == p.bit_depth` this is `to_rgba_cols` byte for byte.
+#[allow(clippy::too_many_arguments)]
+pub fn to_rgba_cols_depths<T: Copy + Into<i32>>(p: &Picture<'_, T>, nc: u32, y0: usize, y1: usize, cols: impl Iterator<Item = usize> + Clone, m: Matrix, up: Chroma, dither: bool, out: &mut [u8]) {
     let n = p.bit_depth;
     let k = match m {
         Matrix::Table(k) => k,
-        Matrix::Kr(kk) => coeffs(kk, p.full, n),
-        Matrix::Identity | Matrix::YCgCo | Matrix::MultHi(_) => coeffs(KR_KB_601, p.full, n),
+        Matrix::Kr(kk) => coeffs_depths(kk, p.full, n, nc),
+        Matrix::Identity | Matrix::YCgCo | Matrix::MultHi(_) => coeffs_depths(KR_KB_601, p.full, n, nc),
     };
+    // The identity matrix's Cb / Cr planes are B / R samples at the chroma depth: their scale and offset (same shift).
+    let (_, [ycc, ..], yoffc, _) = coeffs_depths(KR_KB_601, p.full, nc, n);
     let (s, [yc, rv, gu, gv, bu], yoff, coff) = k;
     let (sx, sy) = p.ss;
     let bil = up != Chroma::Nearest;
@@ -157,7 +182,7 @@ pub fn to_rgba_cols<T: Copy + Into<i32>>(p: &Picture<'_, T>, y0: usize, y1: usiz
     let fs = fx + fy;
     let f = if rf { 0 } else { fs };
     let sh = s + f;
-    let dith = dither && n > 8;
+    let dith = dither && n.max(nc) > 8;
     let cw = (p.w + sx as usize) >> sx;
     let ch = (p.h + sy as usize) >> sy;
     // A chroma sample at luma (row, col), scaled by 2^f.
@@ -169,7 +194,8 @@ pub fn to_rgba_cols<T: Copy + Into<i32>>(p: &Picture<'_, T>, y0: usize, y1: usiz
         let h = (1i32 << fs) >> 1;
         if rf { fancy(plane, p.uv_stride, (cw, ch), p.ss, (row, col), (h, h)) } else { fancy_sum(plane, p.uv_stride, (cw, ch), p.ss, (row, col)) }
     };
-    let (ys, cs) = if p.full { (((1i64 << n) - 1), ((1i64 << n) - 1)) } else { (219i64 << (n - 8), 224i64 << (n - 8)) };
+    let ys = if p.full { (1i64 << n) - 1 } else { 219i64 << (n - 8) };
+    let cs = if p.full { (1i64 << nc) - 1 } else { 224i64 << (nc - 8) };
     let mut cur = 0usize;
     for row in y0..y1.min(p.h) {
         for col in cols.clone() {
@@ -186,7 +212,7 @@ pub fn to_rgba_cols<T: Copy + Into<i32>>(p: &Picture<'_, T>, y0: usize, y1: usiz
                         let (cb, cr) = (u - (coff << f), v - (coff << f));
                         ((c + rv * cr) >> sh, (c - gu * cb - gv * cr) >> sh, (c + bu * cb) >> sh)
                     }
-                    Matrix::Identity => (((yc * (v - (yoff << f))) + bias) >> sh, c >> sh, ((yc * (u - (yoff << f))) + bias) >> sh),
+                    Matrix::Identity => (((ycc * (v - (yoffc << f))) + bias) >> sh, c >> sh, ((ycc * (u - (yoffc << f))) + bias) >> sh),
                     Matrix::YCgCo => {
                         let yn = (yy as i64) * cs << f;
                         let cg = (u - (coff << f)) as i64 * ys;
@@ -223,6 +249,39 @@ mod tests {
         to_rgba(&p, m, Chroma::Nearest, false, &mut out);
         assert_eq!(out[3], 255);
         [out[0], out[1], out[2]]
+    }
+
+    #[test]
+    fn colourone422_per_plane_depth() {
+        // COLOURONE422 (SR359): BT.601 limited, luma 10 bits / chroma 8 (HEVC RExt BitDepthY != BitDepthC). yc and the y
+        // offset from 10 bits, the chroma terms from 8, at >> 16: Y 480 Cb 90 Cr 160 -> (172, 110, 44), the colour of the
+        // 10/10 picture Y 480 Cb 360 Cr 640 and of the 8/8 Y 120 Cb 90 Cr 160; read as 10/10 the chroma would give (0, 234, 0).
+        assert_eq!(coeffs_depths(KR_KB_601, false, 10, 8), (16, [19077, 104597, 25675, 53279, 132201], 64, 128));
+        for n in [8, 10, 12, 16] {
+            for full in [false, true] {
+                assert_eq!(coeffs_depths(KR_KB_709, full, n, n), coeffs(KR_KB_709, full, n));
+            }
+        }
+        let one = |y: u16, u: u16, v: u16, ny: u32, nc: u32, m: Matrix| {
+            let (yp, up, vp) = ([y; 4], [u; 1], [v; 1]);
+            let p = Picture { w: 2, h: 2, y: &yp, u: &up, v: &vp, y_stride: 2, uv_stride: 1, ss: (1, 1), mono: false, bit_depth: ny, full: false };
+            let mut out = [0u8; 16];
+            to_rgba_depths(&p, nc, m, Chroma::Nearest, false, &mut out);
+            [out[0], out[1], out[2]]
+        };
+        let k = Matrix::Kr(KR_KB_601);
+        assert_eq!(one(480, 90, 160, 10, 8, k), [172, 110, 44]);
+        assert_eq!(one(480, 360, 640, 10, 10, k), [172, 110, 44]);
+        assert_eq!(one(120, 360, 640, 8, 10, k), [172, 110, 44]);
+        assert_eq!(one(480, 90, 160, 10, 10, k), [0, 234, 0]);
+        assert_eq!(one(480, 128, 128, 10, 8, k), [121, 121, 121]);
+        // to_rgba is to_rgba_depths at one depth, for every matrix.
+        for m in [k, Matrix::Kr(KR_KB_709), Matrix::Identity, Matrix::YCgCo] {
+            assert_eq!(one(600, 300, 700, 10, 10, m), px(600u16, 300, 700, 10, false, m));
+        }
+        // Identity and YCgCo read the chroma planes at their own depth: a 10/8 picture equals its 10/10 widening (<< 2).
+        assert_eq!(one(480, 90, 160, 10, 8, Matrix::Identity), one(480, 360, 640, 10, 10, Matrix::Identity));
+        assert_eq!(one(480, 90, 160, 10, 8, Matrix::YCgCo), one(480, 360, 640, 10, 10, Matrix::YCgCo));
     }
 
     #[test]

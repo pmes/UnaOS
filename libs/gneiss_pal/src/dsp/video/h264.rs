@@ -34,6 +34,7 @@ fn map_err(e: h264_core::Error) -> DecodeError {
 
 /// HEVCREXTTOOLS (SR345): hevc_core's monochrome (`ChromaFormat::Mono`, empty Cb / Cr) as a grey 4:2:0 frame — flat
 /// 128 chroma, and 1 << (bit_depth - 1) in `planes16` — THE one copy of that fill, for the Player and the HEIC tile.
+/// COLOURONE422 (SR359): the fill is at the luma's depth, so the frame's chroma depth becomes the luma's.
 fn mono_grey(f: &mut h264_core::Frame) {
     if f.chroma != h264_core::ChromaFormat::Mono {
         return;
@@ -46,19 +47,30 @@ fn mono_grey(f: &mut h264_core::Frame) {
         p[1] = vec![mid; n];
         p[2] = vec![mid; n];
     }
+    f.bit_depth_c = f.bit_depth;
     f.chroma = h264_core::ChromaFormat::Yuv420;
 }
 
 /// The one h264_core / hevc_core `Frame` -> [`Frame`] bridge. COLOURONE (SR328): above 8 bits (HEVC Main10) the samples
 /// as decoded (`planes16`) become `Pixels::I420Hi`, so the conversion narrows after it converts; 8-bit is `I420` as before.
+/// COLOURONE422 (SR359): every format at its own sampling (`ChromaFormat::sub`: chroma rows of w / SubWidthC) and each
+/// plane's depth (`bit_depth`, `bit_depth_c`); 8-bit 4:2:2 / 4:4:4 are `I420Hi` at depth 8, 8-bit 4:2:0 stays `I420`.
 pub(crate) fn to_frame(mut f: h264_core::Frame) -> Frame {
     let (w, h) = (f.width, f.height);
-    let (y_stride, uv_stride) = (w as usize, w as usize / 2); mono_grey(&mut f); // HEVCREXTTOOLS (SR345): 4:0:0 -> grey 4:2:0
-    let pixels = match f.planes16 {
-        Some([y, u, v]) => Pixels::I420Hi { y, u, v, y_stride, uv_stride, bit_depth: f.bit_depth },
-        None => {
+    mono_grey(&mut f); // HEVCREXTTOOLS (SR345): 4:0:0 -> grey 4:2:0
+    let (sw, sh) = f.chroma.sub();
+    let ss = ((sw >> 1) as u32, (sh >> 1) as u32);
+    let (y_stride, uv_stride) = (w as usize, w as usize / sw);
+    let (bit_depth, bit_depth_c) = (f.bit_depth, f.bit_depth_c);
+    let pixels = match (f.planes16, ss) {
+        (Some([y, u, v]), _) => Pixels::I420Hi { y, u, v, y_stride, uv_stride, bit_depth, ss, bit_depth_c },
+        (None, (1, 1)) => {
             let [y, u, v] = f.planes;
             Pixels::I420 { y, u, v, y_stride, uv_stride }
+        }
+        (None, _) => {
+            let [y, u, v] = f.planes.map(|p| p.into_iter().map(u16::from).collect::<Vec<u16>>());
+            Pixels::I420Hi { y, u, v, y_stride, uv_stride, bit_depth: 8, ss, bit_depth_c: 8 }
         }
     };
     Frame { width: w, height: h, pts_ns: f.tag, pixels }

@@ -225,6 +225,7 @@ fn md5_kat() {
         bit_depth,
         planes16,
         chroma: h264_core::ChromaFormat::Yuv420,
+        bit_depth_c: bit_depth,
     };
     let f8 = frame([vec![1, 2, 3, 4], vec![5], vec![6]], 8, None);
     assert_eq!(md5(&yuv_bytes(&f8)), "6ac1e56bc78f031059be7be854522c4c");
