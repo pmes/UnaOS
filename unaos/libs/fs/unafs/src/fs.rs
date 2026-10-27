@@ -382,6 +382,11 @@ pub struct UnaFS<D: BlockDevice> {
     /// UNAFSWRITE2 second half (rmbp-ledger B861): how many of `fresh_held` are btree NODE blocks (the node store's
     /// [`node_store`](Self::node_store) pushes, less the held copies its releases dropped); cleared with `fresh_held`.
     fresh_nodes: u64,
+    /// UNAFSWRITE3 (rmbp-ledger B872): the split op returned before it was done ([`take_again`](Self::take_again)).
+    again: Option<OpAgain>,
+    /// UNAFSWRITE3 (B872): the chunk cursor the driver handed back ([`resume_again`](Self::resume_again)); taken by the
+    /// op's first `write_data`, so it never outlives the rerun it was handed to.
+    chunk: Option<ChunkAt>,
 }
 
 /// UNAFSWRITE2 (rmbp-ledger B844): THE read of a write_fresh-class block (inode, extents, data) — the held copy
@@ -401,6 +406,38 @@ pub(crate) fn read_held<D: BlockDevice>(device: &mut D, held: &[(u64, Vec<u8>)],
 /// block not already held goes to the device — unreferenced until the flip (K8a), exactly the unheld write — so a large
 /// `write` never doubles into the heap (the stage copies the held set). Counted in [`CommitStats::held_direct`].
 pub const FRESH_HOLD_MAX: usize = 2048;
+
+/// UNAFSWRITE3 HELDCAP (rmbp-ledger B872): the most data blocks one staged commit of a chunked `write` carries (1024 =
+/// 4 MiB) — half of [`FRESH_HOLD_MAX`], the other half headroom for the chunk's inode, extent, spill and node blocks, so a
+/// chunk never spills.
+pub const CHUNK_BLOCKS: u64 = FRESH_HOLD_MAX as u64 / 2;
+
+/// UNAFSWRITE3 (B872): a chunked write's cursor — the write `(inode, offset, len)` and the bytes of it already landed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ChunkAt {
+    inode: u64,
+    offset: u64,
+    len: u64,
+    done: u64,
+}
+
+/// UNAFSWRITE3 (rmbp-ledger B872): a SPLIT op returned before it was done ([`UnaFS::take_again`]). Its driver lands
+/// what is staged (stage, write, flip), hands this back ([`UnaFS::resume_again`]) and runs the op again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OpAgain {
+    /// DROPSPLIT: the op found the volume full and dropped the oldest version instead — the drop is what is staged,
+    /// nothing of the op; the rerun spends the room once the drop's flip has landed it (K8a).
+    pub drop: bool,
+    /// HELDCAP: the chunked write's cursor (`None` for a drop before any chunk landed).
+    chunk: Option<ChunkAt>,
+}
+
+impl OpAgain {
+    /// HELDCAP: the op landed one chunk of a large write and owes the rest.
+    pub fn chunk(&self) -> bool {
+        !self.drop && self.chunk.is_some()
+    }
+}
 
 /// UNAFSWRITE2 (B861): what [`hold_block`] did with a block.
 pub(crate) enum Held {
@@ -622,6 +659,8 @@ impl<D: BlockDevice> UnaFS<D> {
             fresh_hold: false,
             fresh_held: Vec::new(),
             fresh_nodes: 0,
+            again: None,
+            chunk: None,
         };
 
         // The reserved system objects, in id order (1..=4).
@@ -750,6 +789,8 @@ impl<D: BlockDevice> UnaFS<D> {
             fresh_hold: false,
             fresh_held: Vec::new(),
             fresh_nodes: 0,
+            again: None,
+            chunk: None,
         };
 
         // Persistent reclaim queue: v1 drains eagerly on mount (crash-safe —
@@ -1482,6 +1523,22 @@ impl<D: BlockDevice> UnaFS<D> {
         self.fresh_held.len()
     }
 
+    /// UNAFSWRITE3 (rmbp-ledger B872): the split op just run returned BEFORE it was done — `Some` = land what is staged
+    /// (stage, write, flip), then [`resume_again`](Self::resume_again) and run the op again. Only a split op (hold on,
+    /// autocommit off, nothing staged before it) ever sets it: a version drop on a full volume (DROPSPLIT) or one chunk
+    /// of a write past [`CHUNK_BLOCKS`] (HELDCAP); the op itself returned `Ok`. Taking it clears the cursor.
+    pub fn take_again(&mut self) -> Option<OpAgain> {
+        self.chunk = None;
+        self.again.take()
+    }
+
+    /// UNAFSWRITE3 (B872): hand [`take_again`](Self::take_again)'s answer back right before the rerun, once its commit
+    /// LANDED (or, after a lost stage, the last landed answer): the op's first `write_data` resumes the cursor when it
+    /// is the same write and the file's size says exactly its landed part is there; any other write starts fresh.
+    pub fn resume_again(&mut self, a: OpAgain) {
+        self.chunk = a.chunk;
+    }
+
     /// UNAFSWRITE2 (B844): `refmap.decref`, and a block whose count reaches 0 loses its held copy — it may be
     /// re-allocated inside this transaction (to the btree store, written straight to the device), and a stale held
     /// copy must never land over it.
@@ -2048,11 +2105,54 @@ impl<D: BlockDevice> UnaFS<D> {
     }
 
     fn write_data_staged(&mut self, inode_id: u64, offset: u64, data: &[u8]) -> Result<(), FileSystemError> {
-        let need = (data.len() as u64).div_ceil(BLOCK_SIZE).saturating_add(1);
+        let (at, part) = self.chunk_span(inode_id, offset, data)?; // UNAFSWRITE3 HELDCAP (B872): this run's part
+        let need = (part.len() as u64).div_ceil(BLOCK_SIZE).saturating_add(1);
         self.nospace_room(need, |fs| {
-            fs.write_data_inner(inode_id, offset, data)?;
+            fs.write_data_inner(inode_id, offset + at, part)?;
             fs.maybe_commit()
-        })
+        })?;
+        self.chunk_done(inode_id, offset, data.len() as u64, at, at + part.len() as u64);
+        Ok(())
+    }
+
+    /// UNAFSWRITE3 HELDCAP (rmbp-ledger B872): the part of `data` this run writes, as `(at, data[at..])` — the whole of it
+    /// unless the op is a split one (hold on, autocommit off, nothing staged) and `data` is longer than [`CHUNK_BLOCKS`]
+    /// blocks: then the next chunk, from the cursor the driver handed back ([`resume_again`](Self::resume_again)) when it
+    /// is this write and the file's size is exactly `offset + done`, else from 0 when the write EXTENDS the file
+    /// (`offset >= size`). An overwrite past the cap is written whole, as before (its tail spills, HELDCAP-OVERWRITE).
+    /// INVARIANT: a cut between chunks leaves the file `offset + k * CHUNK_BLOCKS * BLOCK_SIZE` bytes long holding a
+    /// PREFIX of the write, never a torn one — each chunk's flip lands its extent map and the size together, and chunks
+    /// only extend past the committed end of the file.
+    fn chunk_span<'a>(&mut self, inode_id: u64, offset: u64, data: &'a [u8]) -> Result<(u64, &'a [u8]), FileSystemError> {
+        let cursor = self.chunk.take();
+        let n = data.len() as u64;
+        let cap = CHUNK_BLOCKS * BLOCK_SIZE;
+        if !self.fresh_hold || self.autocommit || n <= cap || self.has_staged() {
+            return Ok((0, data));
+        }
+        let size = self.read_inode(inode_id)?.size;
+        let at = match cursor {
+            Some(c) if c.inode == inode_id && c.offset == offset && c.len == n && c.done < n && offset.checked_add(c.done) == Some(size) => c.done,
+            _ if offset >= size => 0,
+            _ => return Ok((0, data)),
+        };
+        let end = at.saturating_add(cap).min(n);
+        Ok((at, &data[at as usize..end as usize]))
+    }
+
+    /// UNAFSWRITE3 HELDCAP (B872): after a run wrote `data[at..upto]` of the write `(inode, offset, len)`: more to come =
+    /// keep the cursor and ask the driver for another run ([`take_again`](Self::take_again)). A run whose room went to a
+    /// version drop instead (DROPSPLIT) wrote nothing: the cursor stays at `at`.
+    fn chunk_done(&mut self, inode: u64, offset: u64, len: u64, at: u64, upto: u64) {
+        if let Some(a) = self.again.as_mut() {
+            if a.drop {
+                a.chunk = (at > 0).then_some(ChunkAt { inode, offset, len, done: at });
+                return;
+            }
+        }
+        if upto < len {
+            self.again = Some(OpAgain { drop: false, chunk: Some(ChunkAt { inode, offset, len, done: upto }) });
+        }
     }
 
     /// FILEVERSIONS (B714): run `op` (one whole transaction, its commit included). While it finds the volume
@@ -2066,6 +2166,9 @@ impl<D: BlockDevice> UnaFS<D> {
     /// UNAFSWRITE2 second half (rmbp-ledger B861): a SPLIT op ([`hold_fresh`](Self::hold_fresh) on, autocommit off) whose
     /// transaction held nothing before `op` (`own`) is its own attempt, so it unwinds, drops and retries like an autocommit
     /// one; the drop's commit is whole (only on a full versioned volume), the retry stays staged for the caller.
+    /// CHANGED by UNAFSWRITE3 DROPSPLIT (rmbp-ledger B872): the split op's drop is NOT committed here — it returns `Ok`
+    /// with the drop staged and [`take_again`](Self::take_again) set; the driver lands it (stage, write, flip) and runs
+    /// the op again, so the drop and the retry are two staged commits. Autocommit callers: unchanged.
     /// INVARIANT: a block freed by a drop (or by anything in a transaction) is never re-allocated before the flip that
     /// lands its release — `RefMap::allocate` hands out only blocks free in the FROZEN view too (K8a); that is why the drop
     /// must LAND before the retry can spend its room, and why no second free list exists.
@@ -2075,6 +2178,7 @@ impl<D: BlockDevice> UnaFS<D> {
         mut op: impl FnMut(&mut Self) -> Result<(), FileSystemError>,
     ) -> Result<(), FileSystemError> {
         let own = self.autocommit || (self.fresh_hold && !self.has_staged()); // UNAFSWRITE2 (B861)
+        self.again = None; // UNAFSWRITE3 (B872)
         let mut r = op(self);
         let mut tries = 0;
         while matches!(r, Err(FileSystemError::NoSpace)) && self.versioning && own && tries < crate::RING_MAX {
@@ -2083,7 +2187,17 @@ impl<D: BlockDevice> UnaFS<D> {
             if room == 0 || self.free_blocks().saturating_add(room) < need {
                 break;
             }
-            if !matches!(self.version_drop_oldest(), Ok(true)) || self.commit().is_err() {
+            if !matches!(self.version_drop_oldest(), Ok(true)) {
+                self.txn_unwind();
+                break;
+            }
+            if !self.autocommit {
+                // UNAFSWRITE3 DROPSPLIT (B872): the split op's drop is a staged commit of its OWN — returned staged, the
+                // driver flips it, then runs the op again (the retry staged too): no whole commit on a full volume.
+                self.again = Some(OpAgain { drop: true, chunk: None });
+                return Ok(());
+            }
+            if self.commit().is_err() {
                 self.txn_unwind();
                 break;
             }

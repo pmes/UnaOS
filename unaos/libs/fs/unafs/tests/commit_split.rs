@@ -487,10 +487,47 @@ fn a_truncate_lands_staged() {
     assert_eq!(m.read_data(id, 0, 3 * BLK as u64).unwrap(), bytes(6, 3 * BLK));
 }
 
-#[test]
-fn a_full_volume_spends_a_version_inside_a_split_write() {
-    // `nospace_room`'s drop runs in a split op whose transaction is its own attempt: the drop commits WHOLE (its freed
-    // blocks become allocatable only at that flip — K8a), the retried overwrite is staged.
+/// UNAFSWRITE3 (rmbp-ledger B872): the kernel's `splitwrite::run` in miniature — each run of `op` under HOLD 1's shape
+/// (autocommit off, `hold_fresh` on; the medium must not move under it), then stage, write, flip; while the op asks for
+/// another run (`take_again`), hand the answer back (`resume_again`) and run it again. Stops after `stop` flips (a cut).
+/// Returns the flips and the `OpAgain`s seen. No whole commit may land: every generation step is a flip.
+fn drive(fs: &mut UnaFS<MemDevice>, stop: usize, mut op: impl FnMut(&mut UnaFS<MemDevice>)) -> (usize, Vec<unafs::fs::OpAgain>) {
+    let mut again = None;
+    let (mut flips, mut seen) = (0, Vec::new());
+    while flips < stop {
+        let g0 = fs.root_generation();
+        let before = fs.device.as_bytes().to_vec();
+        let d0 = fs.commit_stats().held_direct;
+        fs.set_autocommit(false);
+        fs.hold_fresh(true);
+        if let Some(a) = again {
+            fs.resume_again(a);
+        }
+        op(fs);
+        let next = fs.take_again();
+        fs.hold_fresh(false);
+        assert_eq!(changed_blocks(&before, fs.device.as_bytes()), 0, "the op wrote to the medium under the hold");
+        assert_eq!(fs.commit_stats().held_direct, d0, "nothing spilled past FRESH_HOLD_MAX");
+        assert_eq!(fs.root_generation(), g0, "no whole commit inside the op");
+        let s = fs.stage().unwrap().expect("staged");
+        assert!(s.blocks() <= unafs::fs::FRESH_HOLD_MAX + 64, "one stage stays near the hold's cap");
+        s.write_staged(&mut fs.device).unwrap();
+        assert_eq!(fs.flip(&s).unwrap(), FlipOutcome::Landed);
+        fs.set_autocommit(true);
+        flips += 1;
+        match next {
+            Some(a) => {
+                seen.push(a);
+                again = Some(a);
+            }
+            None => break,
+        }
+    }
+    (flips, seen)
+}
+
+/// A nearly full versioned volume: `doc` holds 30 blocks of tag 2 and ONE version (30 blocks of tag 1).
+fn full_versioned() -> (UnaFS<MemDevice>, u64) {
     let mut fs = UnaFS::format(MemDevice::with_blocks(512), 0).expect("format");
     fs.set_versioning(true);
     let root = fs.superblock.root_inode;
@@ -506,24 +543,97 @@ fn a_full_volume_spends_a_version_inside_a_split_write() {
     }
     fs.set_versioning(true);
     assert!(fs.free_blocks() < 20);
+    (fs, doc)
+}
+
+#[test]
+fn a_full_volume_drop_is_its_own_staged_commit() {
+    // UNAFSWRITE3 DROPSPLIT (B872): `nospace_room`'s drop in a split op is a staged commit of its own — flipped before the
+    // retry (K8a: its freed blocks are allocatable only once it landed) — and the retried overwrite a second one. No
+    // whole commit (`drive` asserts every generation step is a flip).
+    let (mut fs, doc) = full_versioned();
     let g0 = fs.root_generation();
-    fs.set_autocommit(false);
-    fs.hold_fresh(true);
-    fs.write_data(doc, 0, &bytes(3, 20 * BLK)).expect("the oldest version gives its room to the split overwrite");
-    fs.hold_fresh(false);
-    assert_eq!(fs.root_generation(), g0 + 1, "the drop landed in its own (whole) commit");
-    let s = fs.stage().unwrap().expect("the overwrite is staged");
-    assert!(s.fresh_blocks() >= 20);
-    s.write_staged(&mut fs.device).unwrap();
-    // INVARIANT (nospace_room's doc): no block the overwrite freed was re-allocated before the flip — a cut here
-    // mounts the dropped-version tree with the old contents whole.
-    let mut cut = remount_clean(fs.device.clone());
-    assert_eq!(cut.read_data(doc, 0, 30 * BLK as u64).unwrap(), bytes(2, 30 * BLK));
-    assert_eq!(cut.versions(doc).unwrap().len(), 0, "the drop landed");
-    assert_eq!(fs.flip(&s).unwrap(), FlipOutcome::Landed);
+    let c0 = fs.commit_stats().commits;
+    let (flips, seen) = drive(&mut fs, usize::MAX, |fs| fs.write_data(doc, 0, &bytes(3, 20 * BLK)).expect("the drop gives its room"));
+    assert_eq!(flips, 2, "the drop, then the overwrite");
+    assert_eq!(seen.len(), 1);
+    assert!(seen[0].drop && !seen[0].chunk());
+    assert_eq!(fs.root_generation(), g0 + 2);
+    assert_eq!(fs.commit_stats().commits, c0 + 2, "two flips, nothing else landed");
     let mut want = bytes(3, 20 * BLK);
     want.extend_from_slice(&bytes(2, 30 * BLK)[20 * BLK..]);
     let mut m = remount_clean(fs.device.clone());
     assert_eq!(m.read_data(doc, 0, 30 * BLK as u64).unwrap(), want);
     assert_eq!(m.versions(doc).unwrap().len(), 1, "the overwrite kept its own version");
+
+    // A cut after the drop's flip, before the retry: the dropped-version tree, the old contents whole.
+    let (mut fs, doc) = full_versioned();
+    let (flips, _) = drive(&mut fs, 1, |fs| fs.write_data(doc, 0, &bytes(3, 20 * BLK)).unwrap());
+    assert_eq!(flips, 1);
+    let mut cut = remount_clean(fs.device.clone());
+    assert_eq!(cut.read_data(doc, 0, 30 * BLK as u64).unwrap(), bytes(2, 30 * BLK));
+    assert_eq!(cut.versions(doc).unwrap().len(), 0, "the drop landed");
+}
+
+const CAP: usize = unafs::fs::CHUNK_BLOCKS as usize * BLK;
+
+fn big_fs() -> (UnaFS<MemDevice>, u64) {
+    let mut fs = fresh_fs(6000);
+    let root = fs.superblock.root_inode;
+    let id = fs.create_file(root, "big.bin".into()).unwrap();
+    fs.write_data(id, 0, b"head").unwrap();
+    (fs, id)
+}
+
+fn pattern(len: usize) -> Vec<u8> {
+    (0..len).map(|i| (i / BLK) as u8 ^ (i as u8).wrapping_mul(7)).collect()
+}
+
+#[test]
+fn a_large_write_lands_in_staged_chunks() {
+    // UNAFSWRITE3 HELDCAP (B872): a write past CHUNK_BLOCKS that extends the file lands in chunks, each ONE staged commit
+    // extending the extent map and the size, none spilling (`drive` asserts held_direct unmoved per run).
+    let (mut fs, id) = big_fs();
+    let data = pattern(2 * CAP + BLK);
+    let (flips, seen) = drive(&mut fs, usize::MAX, |fs| fs.write_data(id, 4, &data).unwrap());
+    assert_eq!(flips, 3);
+    assert!(seen.iter().all(|a| a.chunk()));
+    let mut m = remount_clean(fs.device.clone());
+    assert_eq!(m.read_inode(id).unwrap().size, 4 + data.len() as u64);
+    assert_eq!(m.read_data(id, 0, 4).unwrap(), b"head");
+    assert!(m.read_data(id, 4, data.len() as u64).unwrap() == data, "bytes equal");
+}
+
+#[test]
+fn a_cut_between_chunks_leaves_a_shorter_file() {
+    // INVARIANT (`chunk_span`): a cut after k chunk flips mounts a file of `offset + k * cap` bytes holding the write's
+    // prefix — never a torn one.
+    let data = pattern(2 * CAP + BLK);
+    for k in 1..=2usize {
+        let (mut fs, id) = big_fs();
+        let (flips, _) = drive(&mut fs, k, |fs| fs.write_data(id, 4, &data).unwrap());
+        assert_eq!(flips, k);
+        let mut m = remount_clean(fs.device.clone());
+        let len = k * CAP;
+        assert_eq!(m.read_inode(id).unwrap().size, 4 + len as u64);
+        assert!(m.read_data(id, 4, len as u64).unwrap() == data[..len], "the prefix");
+    }
+}
+
+#[test]
+fn an_overwrite_past_the_cap_is_not_chunked() {
+    // An overwrite (offset below the size) past the cap is written whole as before (chunking it would tear the file):
+    // one run, no OpAgain (past FRESH_HOLD_MAX its tail would spill — HELDCAP-OVERWRITE owed).
+    let (mut fs, id) = big_fs();
+    let data = pattern(CAP + BLK);
+    fs.set_autocommit(false);
+    fs.hold_fresh(true);
+    fs.write_data(id, 0, &data).unwrap();
+    assert!(fs.take_again().is_none());
+    fs.hold_fresh(false);
+    let s = fs.stage().unwrap().expect("staged");
+    s.write_staged(&mut fs.device).unwrap();
+    assert_eq!(fs.flip(&s).unwrap(), FlipOutcome::Landed);
+    let mut m = remount_clean(fs.device.clone());
+    assert!(m.read_data(id, 0, data.len() as u64).unwrap() == data);
 }
