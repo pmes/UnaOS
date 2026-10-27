@@ -298,7 +298,7 @@ fn open_pending() {
     let mut win = wm::WIN_NONE;
     let mut sheet = false;
     if !HEADLESS.load(Ordering::Relaxed) {
-        DLG_H.store(h_at(theme::metrics()), Ordering::Relaxed); DLG_SEEN.store(super::text::epoch(), Ordering::Relaxed); if let Some((_s, ow, oh)) = wm::spawn_geometry_native(metrics::size(W), metrics::size(H())) { // TEXTSCALE3 (B849): the height this dialog lays out at, latched before the row exists
+        DLG_H.store(h_at(theme::metrics()), Ordering::Relaxed); DLG_SEEN.store(super::text::epoch(), Ordering::Relaxed); seat_open(); if let Some((_s, ow, oh)) = wm::spawn_geometry_native(metrics::size(W), metrics::size(H())) { // TEXTSCALE3 (B849): the height this dialog lays out at, latched before the row exists
             let (pw, ph) = { let i = super::WRITER.lock().info(); (i.width, i.height) };
             let (mut x, mut y) = (pw.saturating_sub(ow) / 2 + wm::BORDER(), ph.saturating_sub(oh) / 4 + wm::TITLE_H() + wm::BORDER());
             let mut slide = 0u8;
@@ -313,7 +313,7 @@ fn open_pending() {
             paint(&d, d.countdown_s);
             let (sw, sh) = (metrics::size(W), metrics::size(H()));
             let start_y = y.saturating_sub(slide as usize * metrics::size(SLIDE_PX));
-            win = wm::create_at_native(OWNER, surf().as_mut_ptr() as usize, sw * sh * 4, sw as u32, sh as u32, (sw * 4) as u32, d.title(), x, start_y);
+            win = wm::create_at_native(OWNER, surf().as_mut_ptr() as usize, sw * metrics::size(DLG_CAP.load(Ordering::Relaxed)) * 4, sw as u32, sh as u32, (sw * 4) as u32, d.title(), x, start_y);
             if win != wm::WIN_NONE {
                 if d.screen {
                     wm::set_modal_top(win); // DIALOG2: over the login screen — the ceiling is the dialog's while it is up
@@ -1224,8 +1224,10 @@ pub fn toastcap_leg() -> (usize, u32, bool, bool) {
 // ── TEXTSCALE3 (rmbp-ledger B849) — the dialog reflows with the text size ───────────────────────────────────────────
 // The message, the informative lines and the button labels draw the UI face; their bands sat on a constant 16 px
 // rhythm. Each band now grows by what the UI line grew (`theme::metrics().grow`, TEXTSCALE's one reader) and the
-// window's height follows (`h_at`), latched at open: no public wm door resizes a kernel row, so a dialog open across a
-// step keeps its height (TEXTSCALE-RESEAT, owed). The default size draws the constants.
+// window's height follows (`h_at`), set at open and RE-SEATED live (TEXTSCALERESEAT B880): the open reserves the
+// surface for the dialog's LARGEST height (`h_at` at the cap, `DLG_CAP`) and names that capacity at create, and
+// `font_follow` repaints at the new `h_at` and asks `wm::resize_kernel_row` for it; past the capacity the door refuses and
+// the dialog keeps its height. The default size draws the constants.
 
 /// The height the open dialog was laid out at (`h_at`, stored at open).
 static DLG_H: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(H0);
@@ -1256,7 +1258,24 @@ fn font_follow(d: &Dlg, win: wm::WinId, shown: u32) {
     if win == wm::WIN_NONE || DLG_SEEN.swap(e, Ordering::Relaxed) == e {
         return;
     }
-    paint(d, shown);
+    let h = h_at(theme::metrics());
+    let old = DLG_H.load(Ordering::Relaxed);
+    if h != old && h <= DLG_CAP.load(Ordering::Relaxed) {
+        // TEXTSCALERESEAT (B880): lay out at the new height, then ask wm for it; refused -> back to the kept height.
+        DLG_H.store(h, Ordering::Relaxed);
+        paint(d, shown);
+        if wm::resize_kernel_row(win, metrics::size(W), metrics::size(h)) == Some(true) {
+            RESEATS.fetch_add(1, Ordering::Relaxed);
+            if h < old {
+                band_clear(h);
+            }
+        } else {
+            DLG_H.store(old, Ordering::Relaxed);
+            paint(d, shown);
+        }
+    } else {
+        paint(d, shown);
+    }
     let _ = wm::present(win);
     TS_FRAMES.fetch_add(1, Ordering::Relaxed);
 }
@@ -1273,4 +1292,49 @@ pub fn textscale_rows() -> (usize, bool) {
     let last = info0 + 3 * m.grow(18) + lh;
     let ok = 22 + lh <= info0 && m.grow(18) >= lh && BH() >= lh && last <= h.saturating_sub(20 + BH());
     (h, ok)
+}
+
+// ── TEXTSCALERESEAT (rmbp-ledger B880; BP-video-40) — TAIL-APPENDED: the open dialog re-seats at a text step ─────────
+// The open reserves the leaked surface ONCE for the dialog's LARGEST height (`cap_h`: `h_at` at the cap metrics, never
+// below the live one) and names that capacity as the row's `surf_len`; every later `surf()` is a no-alloc slice of it,
+// so the surface is never re-allocated under the live row. The band below `H()` holds the window's own surface colour,
+// so a user edge-drag that grows the row into its capacity shows that colour, never a stale band.
+
+/// The height the open dialog's surface was reserved for (logical px; `cap_h` at open).
+static DLG_CAP: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(H0);
+/// Re-seats the door accepted (the `tests textscale` leg reads deltas).
+static RESEATS: AtomicU32 = AtomicU32::new(0);
+
+/// The dialog's largest height: `h_at` at the cap the restyle published (else the live panel's `cap_now`), never below
+/// the live `h_at`.
+fn cap_h() -> usize {
+    let m = theme::metrics();
+    let cap = if m.cap_css > 0 { m.cap_css } else { crate::video::text::textscale::cap_now().max(0) as u32 };
+    let top = theme::TextMetrics { line: crate::video::text::textscale::line_at(cap, crate::video::dpi::s2()), cap_css: cap };
+    h_at(m).max(h_at(top))
+}
+
+/// The open, before the row exists: record the capacity, reserve the surface for it, and fill the band below `H()`.
+fn seat_open() {
+    DLG_CAP.store(cap_h(), Ordering::Relaxed);
+    band_clear(H());
+}
+
+/// Fill the capacity surface from logical row `from` to `DLG_CAP` with the window's surface colour.
+fn band_clear(from: usize) {
+    let cap = DLG_CAP.load(Ordering::Relaxed);
+    let px = metrics::leaked_surf(&SURF_AT, metrics::size(W) * metrics::size(cap));
+    metrics::fill(px, metrics::size(W), 0, from, W, cap.saturating_sub(from), theme::surface_window());
+}
+
+/// `tests textscale`: (re-seats so far, the row's height, the height the live text size wants), source px; `None` when
+/// no dialog row is up.
+#[cfg(feature = "witness")]
+pub fn reseat_probe() -> Option<(u32, usize, usize)> {
+    let win = ST.lock().win;
+    if win == wm::WIN_NONE {
+        return None;
+    }
+    let i = wm::info(win)?;
+    Some((RESEATS.load(Ordering::Relaxed), i.h, metrics::size(h_at(theme::metrics()))))
 }
