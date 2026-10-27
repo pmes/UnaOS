@@ -564,9 +564,9 @@ fn my_log_lines(containing: &str) -> Vec<String> {
     CAPTURED.lock().unwrap().iter().filter(|(t, l)| *t == me && l.contains(containing)).map(|(_, l)| l.clone()).collect()
 }
 
-/// HEVC_SPS with bit_depth_luma_minus8 = bit_depth_chroma_minus8 = 2 (the two ue(v) after the conformance flag, 7.3.2.2:
-/// `1` -> `011` each), re-packed and re-escaped: a Main10 SPS hevc_core refuses by name at activation (HEVCMAIN10).
-const HEVC_SPS_MAIN10: [u8; 27] = [0x42, 0x01, 0x01, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0x90, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00, 0x3c, 0xa0, 0x20, 0x83, 0x13, 0x65, 0xf9, 0x24, 0xc2, 0x08];
+/// HEVC_SPS with bit_depth_luma_minus8 = bit_depth_chroma_minus8 = 4 (the two ue(v) after the conformance flag, 7.3.2.2:
+/// `1` -> `00101` each), re-packed and re-escaped: a 12-bit SPS hevc_core refuses by name at activation (HEVCREXT).
+const HEVC_SPS_12BIT: [u8; 28] = [0x42, 0x01, 0x01, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0x90, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00, 0x3c, 0xa0, 0x20, 0x83, 0x11, 0x4a, 0x5f, 0x92, 0x4c, 0x20, 0x80];
 
 #[derive(Default)]
 struct CountSink {
@@ -578,15 +578,15 @@ impl FrameSink for CountSink {
     }
 }
 
-/// Rule: a decoder that refuses the stream mid-stream (the second sample carries an in-band Main10 SPS, so every later
+/// Rule: a decoder that refuses the stream mid-stream (the second sample carries an in-band 12-bit SPS, so every later
 /// IDR activates an unsupported SPS) hands the picture to the labelled stand-in ONCE with one `swapped to stand-in`
 /// line; no per-packet warnings follow, and every sample still presents a frame (0 real, 1-3 the stand-in).
 #[test]
-fn hevcdepthcore_main10_mid_stream_swaps_to_the_stand_in_once() {
+fn hevcdepthcore_12bit_mid_stream_swaps_to_the_stand_in_once() {
     capture_logs();
     let mut t = hevc_kat_track(4);
     let mut s1 = Vec::new();
-    for unit in [&HEVC_SPS_MAIN10[..], &HEVC_PPS[..], &HEVC_IDR[..]] {
+    for unit in [&HEVC_SPS_12BIT[..], &HEVC_PPS[..], &HEVC_IDR[..]] {
         s1.extend_from_slice(&(unit.len() as u32).to_be_bytes());
         s1.extend_from_slice(unit);
     }
@@ -606,7 +606,7 @@ fn hevcdepthcore_main10_mid_stream_swaps_to_the_stand_in_once() {
     }
     let lines = my_log_lines("[STRIA] :: video decode:");
     assert_eq!(lines.len(), 1, "{lines:?}");
-    assert_eq!(lines[0], "[STRIA] :: video decode: swapped to stand-in: no decoder: hevc: unsupported (bit depth above 8 (HEVCMAIN10))");
+    assert_eq!(lines[0], "[STRIA] :: video decode: swapped to stand-in: no decoder: hevc: unsupported (bit depth above 10 (HEVCREXT))");
     assert!(!p.info().real_video);
     assert_eq!(p.info().video_decoder, "test-pattern (stand-in)");
     assert_eq!(sink.shown.iter().map(|s| s.1).collect::<Vec<_>>(), [0, 40_000_000, 80_000_000, 120_000_000], "{:?}", sink.shown);

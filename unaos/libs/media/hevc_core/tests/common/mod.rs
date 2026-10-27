@@ -300,16 +300,21 @@ impl CabacEnc {
     /// A 2^log2 coding unit with pcm_flag 1 (its quadtree split flag `split_inc` 0 coded first) holding `y` / `cb` /
     /// `cr` samples (row-major), the engine restarted after them.
     pub fn pcm_cu(&mut self, split_inc: usize, log2: u32, y: &[u8], cb: &[u8], cr: &[u8]) {
+        let w = |p: &[u8]| p.iter().map(|&v| v as u16).collect::<Vec<u16>>();
+        self.pcm_cu_bits(split_inc, log2, 8, 8, &w(y), &w(cb), &w(cr));
+    }
+    /// HEVCMAIN10 (SR311): [`CabacEnc::pcm_cu`] with PcmBitDepthY / PcmBitDepthC of `luma_bits` / `chroma_bits`.
+    pub fn pcm_cu_bits(&mut self, split_inc: usize, log2: u32, luma_bits: u32, chroma_bits: u32, y: &[u16], cb: &[u16], cr: &[u16]) {
         self.split_cu(split_inc, false);
         self.terminate(1);
         self.zero_align();
         let n = 1usize << log2;
         for &v in &y[..n * n] {
-            self.bw.u(v as u64, 8);
+            self.bw.u(v as u64, luma_bits);
         }
         for p in [cb, cr] {
             for &v in &p[..n * n / 4] {
-                self.bw.u(v as u64, 8);
+                self.bw.u(v as u64, chroma_bits);
             }
         }
         self.restart();
@@ -431,6 +436,8 @@ pub struct SpsCfg {
     pub pcm: Option<(u32, u32, u32, u32, bool)>,
     pub strong: bool,
     pub conf_win: Option<[u32; 4]>,
+    /// HEVCMAIN10 (SR311): bit_depth_chroma when it differs from `bit_depth` (None: the same).
+    pub chroma_bit_depth: Option<u32>,
 }
 
 impl Default for SpsCfg {
@@ -449,6 +456,7 @@ impl Default for SpsCfg {
             pcm: None,
             strong: false,
             conf_win: None,
+            chroma_bit_depth: None,
         }
     }
 }
@@ -490,7 +498,7 @@ pub fn sps_rbsp_ext(c: &SpsCfg, x: &InterSps) -> Vec<u8> {
         None => b.bit(0),
     }
     b.ue(c.bit_depth - 8);
-    b.ue(c.bit_depth - 8);
+    b.ue(c.chroma_bit_depth.unwrap_or(c.bit_depth) - 8);
     b.ue(4); // log2_max_pic_order_cnt_lsb_minus4
     b.bit(1);
     b.ue(x.max_dec_pic_buffering_minus1);

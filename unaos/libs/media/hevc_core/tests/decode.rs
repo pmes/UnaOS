@@ -255,7 +255,7 @@ fn inter_slices_high_bit_depth_and_422_are_refused_by_name() {
     assert_eq!(err, Error::Invalid("reference picture set names a missing picture (8.3.2)"));
 
     for (cfg, want) in [
-        (SpsCfg { bit_depth: 10, ..Default::default() }, "bit depth above 8 (HEVCMAIN10)"),
+        (SpsCfg { bit_depth: 12, ..Default::default() }, "bit depth above 10 (HEVCREXT)"),
         (SpsCfg { chroma_format_idc: 2, ..Default::default() }, "chroma other than 4:2:0"),
     ] {
         let mut s = headers(&cfg, &PpsCfg { init_qp: 26, ..Default::default() });
@@ -333,10 +333,10 @@ fn intra_predictors_kat() {
     // corner 100; below-left and above-right are later in z-scan order, so they are substituted (40 and 80).
     let setup = || {
         let (_, _, geo, mut pic) = unit(16, 16, 4);
-        for (i, v) in [10u8, 20, 30, 40].iter().enumerate() {
+        for (i, v) in [10u16, 20, 30, 40].iter().enumerate() {
             pic.planes[0].set(3, 4 + i, *v);
         }
-        for (i, v) in [50u8, 60, 70, 80].iter().enumerate() {
+        for (i, v) in [50u16, 60, 70, 80].iter().enumerate() {
             pic.planes[0].set(4 + i, 3, *v);
         }
         pic.planes[0].set(3, 3, 100);
@@ -371,9 +371,9 @@ fn intra_predictors_kat() {
 fn deblocking_strong_and_normal_kat() {
     for (q, want) in [
         // |p0 - q0| = 10 < (5 tC + 1) >> 1 = 13 at QP 37 (beta 36, tC 5): the strong filter.
-        (70u8, [(5usize, 61u8), (6, 63), (7, 64), (8, 66), (9, 68), (10, 69)]),
+        (70u16, [(5usize, 61u16), (6, 63), (7, 64), (8, 66), (9, 68), (10, 69)]),
         // |p0 - q0| = 20: the normal filter, Delta 5 (clipped from 8), dEp / dEq: p1 + 2, q1 - 2.
-        (80u8, [(5, 60), (6, 62), (7, 65), (8, 75), (9, 78), (10, 80)]),
+        (80u16, [(5, 60), (6, 62), (7, 65), (8, 75), (9, 78), (10, 80)]),
     ] {
         let (sps, pps, geo, mut pic) = unit(16, 16, 4);
         for y in 0..16 {

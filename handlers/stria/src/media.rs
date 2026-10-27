@@ -1062,7 +1062,7 @@ fn edit_map_of(demux: Option<&Demuxer>, vtrack: Option<&Track>) -> Vec<timeline_
 }
 
 /// HEVCPAL-SWAP (LEDGER SR304): a decoder that refuses the stream MID-STREAM (`DecodeError::Unsupported`: an in-band SPS
-/// turning HEVC Main10, an H.264 stream switching to 4:2:2, ...) hands the picture to the labelled stand-in ONCE, as the
+/// turning 12-bit HEVC (HEVCREXT), an H.264 stream switching to 4:2:2, ...) hands the picture to the labelled stand-in ONCE, as the
 /// open does when no decoder fits: the frames it still holds are drained first, `MediaInfo` says stand-in, one
 /// `video decode: swapped to stand-in` line is logged, and the refused packet is drawn by the stand-in so its interval
 /// is not a gap. Codec-blind (every decoder's refusal is this one error). A corrupt packet, or any error once the

@@ -447,14 +447,14 @@ impl<'a> SliceDecoder<'a> {
         for y in 0..n {
             for x in 0..n {
                 let v = read(pcm.bit_depth_luma)? << (bdy - pcm.bit_depth_luma);
-                self.pic.planes[0].set(x0 + x, y0 + y, v as u8);
+                self.pic.planes[0].set(x0 + x, y0 + y, v as u16);
             }
         }
         for c in 1..3 {
             for y in 0..n / 2 {
                 for x in 0..n / 2 {
                     let v = read(pcm.bit_depth_chroma)? << (bdc - pcm.bit_depth_chroma);
-                    self.pic.planes[c].set(x0 / 2 + x, y0 / 2 + y, v as u8);
+                    self.pic.planes[c].set(x0 / 2 + x, y0 / 2 + y, v as u16);
                 }
             }
         }

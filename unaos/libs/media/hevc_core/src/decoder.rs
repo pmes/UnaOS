@@ -78,8 +78,11 @@ fn check_supported(sps: &Sps, pps: &Pps) -> Result<()> {
     if sps.chroma_format_idc != 1 || sps.separate_colour_plane_flag {
         return Err(Error::Unsupported("chroma other than 4:2:0"));
     }
-    if sps.bit_depth_luma != 8 || sps.bit_depth_chroma != 8 {
-        return Err(Error::Unsupported("bit depth above 8 (HEVCMAIN10)"));
+    if sps.bit_depth_luma > 10 || sps.bit_depth_chroma > 10 {
+        return Err(Error::Unsupported("bit depth above 10 (HEVCREXT)"));
+    }
+    if sps.bit_depth_luma != sps.bit_depth_chroma {
+        return Err(Error::Unsupported("luma and chroma bit depths differ (HEVCREXT)"));
     }
     if sps.range_ext.any() || pps.range_ext.any() {
         return Err(Error::Unsupported("range extension tools"));
@@ -347,6 +350,7 @@ impl Decoder {
         pic.poc = poc;
         pic.tag = self.tag;
         pic.full_range = sps.vui.as_ref().is_some_and(|v| v.video_full_range_flag);
+        pic.bit_depth = sps.bit_depth_luma;
         pic.output = sh.pic_output_flag && !(nal.is_rasl() && self.skip_rasl);
         let [l, r, t, b] = sps.conf_win;
         let (x0, y0) = (2 * l as usize, 2 * t as usize);
