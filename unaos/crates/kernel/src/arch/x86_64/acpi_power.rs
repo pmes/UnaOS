@@ -878,3 +878,95 @@ pub(crate) fn dsdt() -> Option<&'static [u8]> {
         Some(core::slice::from_raw_parts(dsdt as *const u8, len))
     }
 }
+
+// ── ZENBOOKECGPE (zenbook-ledger Z36) — the FADT's GPE0 block, SCI_INT and the boot's SCI_EN, read only — FILE TAIL ──────
+// Before Z36 no reader of the FADT's SCI_INT (@46), GPE0_BLK (@80), GPE0_BLK_LEN (@92) or X_GPE0_BLK (@220) existed, and
+// nothing read PM1a_CNT.SCI_EN at boot (only `enter_acpi_mode`, inside `poweroff`). `gpe0` reads them once, located through
+// the same `acpi::root_sdt` + `acpi::find_table` and decoded by `gas_io_port` (X_ preferred when the FADT carries it, else
+// the legacy u32), and SCI_EN through `discover`'s own PM1a port (no second PM1a locator). NOTHING here writes: the one
+// GPE0_STS write in the tree is `drivers::ec`'s W1C of the ECDT's GPE bit after a drain (ec.rs file tail). GPE0_EN, the
+// SCI GSI's route and ACPI_ENABLE at boot are ZENBOOK-SCI (owed: on the rMBP every firmware-armed GPE would fire with no
+// AML to service it). `gpe0_say` puts the facts on the wire once per x86 boot (`ec::probe`'s signature line).
+
+/// FADT u16 SCI_INT: the SCI's interrupt (a GSI on an APIC machine).
+const FADT_SCI_INT: usize = 46;
+/// FADT u32 GPE0_BLK: the I/O port of the GPE0 register block (STS half first, EN half second).
+const FADT_GPE0_BLK: usize = 80;
+/// FADT u8 GPE0_BLK_LEN: the block's length in bytes (both halves).
+const FADT_GPE0_BLK_LEN: usize = 92;
+/// FADT 12-byte GAS X_GPE0_BLK (ACPI 2.0+); preferred when it names a System I/O port.
+const FADT_X_GPE0_BLK: usize = 220;
+
+/// The FADT's GPE0 facts and the boot's ACPI mode. Read only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Gpe0 {
+    /// GPE0 block port (0 = the FADT names no GPE0 block).
+    pub blk: u16,
+    /// GPE0_BLK_LEN in bytes (STS = the first len/2, EN = the second).
+    pub len: u8,
+    /// SCI_INT.
+    pub sci: u16,
+    /// PM1a_CNT.SCI_EN at the read: `Some(true)` = ACPI mode, `None` = `discover` found no PM1a port.
+    pub sci_en: Option<bool>,
+}
+
+impl Gpe0 {
+    /// The GPE0_STS port and mask of GPE number `gpe`, or `None` when there is no block or the bit lies past the STS half
+    /// (a GPE1 bit).
+    pub fn sts_bit(&self, gpe: u8) -> Option<(u16, u8)> {
+        let byte = (gpe / 8) as u16;
+        if self.blk == 0 || byte >= (self.len / 2) as u16 {
+            return None;
+        }
+        Some((self.blk + byte, 1u8 << (gpe % 8)))
+    }
+}
+
+/// The facts, read once (`None` inside = no RSDP or no FADT).
+static GPE0: spin::Once<Option<Gpe0>> = spin::Once::new();
+
+/// The FADT's GPE0 block, SCI_INT and the boot's SCI_EN; `None` = no RSDP or no FADT. Read once, no write.
+pub fn gpe0() -> Option<Gpe0> {
+    *GPE0.call_once(|| {
+        let (sdt, es) = acpi::root_sdt(acpi::rsdp_addr())?;
+        // SAFETY: as `discover`: the FADT sits on the firmware's identity map and every read is bounded by its length; the
+        // one port read is PM1a_CNT, the FADT's own port, read only.
+        unsafe {
+            let fadt = acpi::find_table(sdt, es, b"FACP")?;
+            let fl = acpi::table_len(fadt);
+            let sci = if fl >= FADT_SCI_INT + 2 { ((fadt as usize + FADT_SCI_INT) as *const u16).read_unaligned() } else { 0 };
+            let len = if fl > FADT_GPE0_BLK_LEN { ((fadt as usize + FADT_GPE0_BLK_LEN) as *const u8).read_unaligned() } else { 0 };
+            let mut blk = if fl >= FADT_X_GPE0_BLK + 12 { gas_io_port(fadt as usize + FADT_X_GPE0_BLK).unwrap_or(0) } else { 0 };
+            if blk == 0 && fl >= FADT_GPE0_BLK + 4 {
+                let v = ((fadt as usize + FADT_GPE0_BLK) as *const u32).read_unaligned();
+                if v != 0 && v <= 0xFFFF {
+                    blk = v as u16;
+                }
+            }
+            let sci_en = discover().ok().map(|s5| Port::<u16>::new(s5.pm1a).read() & PM1_CNT_SCI_EN != 0);
+            Some(Gpe0 { blk, len: if blk == 0 { 0 } else { len }, sci, sci_en })
+        }
+    })
+}
+
+/// `[acpi] gpe0=0x<blk> len=<n> sci=<gsi> sci_en=<0|1|?>` — once per x86 boot (`ec::probe`'s signature line).
+pub fn gpe0_say() {
+    static SAID: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    if SAID.swap(true, core::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let Some(g) = gpe0() else {
+        serial_println!("[acpi] gpe0=? why=no-fadt");
+        return;
+    };
+    let en = match g.sci_en {
+        Some(true) => "1",
+        Some(false) => "0",
+        None => "?",
+    };
+    if g.blk == 0 {
+        serial_println!("[acpi] gpe0=none sci={} sci_en={}", g.sci, en);
+    } else {
+        serial_println!("[acpi] gpe0={:#x} len={} sci={} sci_en={}", g.blk, g.len, g.sci, en);
+    }
+}
