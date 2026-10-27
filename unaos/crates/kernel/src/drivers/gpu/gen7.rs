@@ -6115,32 +6115,32 @@ mod r8 {
         let ring_layout = Layout::from_size_align(4096, 4096).unwrap();
         let src_layout = Layout::from_size_align(src_bytes, 4096).unwrap();
         let dst_layout = Layout::from_size_align(dst_bytes, 4096).unwrap();
-        let ring_page = alloc_zeroed(ring_layout);
+        let (ring_page, ring_re) = super::held_take(&super::R8_HELD[0], ring_layout.size().div_ceil(4096)); let ring_page = ring_page as *mut u8; // GEN7HOLDONCE (B1025): the ring page from its slot (r11's rule, gen7.rs tail)
         if ring_page.is_null() {
             serial_println!(":: gen7: r8 verdict=r8-alloc-failed which=ring bytes=4096 writes=0 note=nothing-written ::");
             serial_println!(":: gen7: r8 next=STOP-no-ring-page note=no-hold-no-ring-armed ::");
             serial_println!(":: gen7: r8 end ::");
             return;
         }
-        let src_page = alloc_zeroed(src_layout);
+        let (src_page, src_re) = super::held_take(&super::R8_HELD[1], src_layout.size().div_ceil(4096)); let src_page = src_page as *mut u8; // GEN7HOLDONCE (B1025): the source surface from its slot
         if src_page.is_null() {
-            dealloc(ring_page, ring_layout);
-            serial_println!(":: gen7: r8 verdict=r8-alloc-failed which=source bytes={} writes=0 note=ring-page-freed-nothing-written ::", src_bytes);
+            let _ = (ring_page, ring_layout); // GEN7HOLDONCE (B1025): stays in R8_HELD, never freed (a reused block may carry an earlier run's translation)
+            serial_println!(":: gen7: r8 verdict=r8-alloc-failed which=source bytes={} writes=0 note=ring-page-held-nothing-written ::", src_bytes);
             serial_println!(":: gen7: r8 next=STOP-no-source-surface note=no-hold-no-ring-armed ::");
             serial_println!(":: gen7: r8 end ::");
             return;
         }
-        let dst_page = alloc_zeroed(dst_layout);
+        let (dst_page, dst_re) = super::held_take(&super::R8_HELD[2], dst_layout.size().div_ceil(4096)); let dst_page = dst_page as *mut u8; // GEN7HOLDONCE (B1025): the destination surface from its slot
         if dst_page.is_null() {
-            dealloc(src_page, src_layout);
-            dealloc(ring_page, ring_layout);
-            serial_println!(":: gen7: r8 verdict=r8-alloc-failed which=dest bytes={} writes=0 note=ring+source-freed-nothing-written ::", dst_bytes);
+            let _ = (src_page, src_layout); // GEN7HOLDONCE (B1025): stays in R8_HELD, never freed (a reused block may carry an earlier run's translation)
+            let _ = (ring_page, ring_layout); // GEN7HOLDONCE (B1025): stays in R8_HELD, never freed (a reused block may carry an earlier run's translation)
+            serial_println!(":: gen7: r8 verdict=r8-alloc-failed which=dest bytes={} writes=0 note=ring+source-held-nothing-written ::", dst_bytes);
             serial_println!(":: gen7: r8 next=STOP-no-destination-surface note=no-hold-no-ring-armed ::");
             serial_println!(":: gen7: r8 end ::");
             return;
         }
-        // Nothing above this point has touched MMIO state, so the three frees on the failure paths are
-        // safe and the pages do NOT need the reclaim gate: no PTE maps them and no engine has run.
+        // Nothing above this point has touched MMIO state, but the failure paths no longer free (GEN7HOLDONCE, B1025): the
+        // three surfaces stay in R8_HELD, since a REUSED block may carry an earlier run's GGTT translation (GEN7TLB).
 
         // ---- Translate every page of the three surfaces and build its PTE -------------------
         //
@@ -6152,10 +6152,10 @@ mod r8 {
         // the only bound). Reserved fallibly and refused by name, before any page is translated.
         let mut ptes: Vec<u32> = Vec::new();
         if ptes.try_reserve_exact(win_slots).is_err() {
-            dealloc(dst_page, dst_layout);
-            dealloc(src_page, src_layout);
-            dealloc(ring_page, ring_layout);
-            serial_println!(":: gen7: r8 verdict=r8-alloc-failed which=ptes entries={} writes=0 note=all-three-surfaces-freed-nothing-written ::", win_slots);
+            let _ = (dst_page, dst_layout); // GEN7HOLDONCE (B1025): stays in R8_HELD, never freed (a reused block may carry an earlier run's translation)
+            let _ = (src_page, src_layout); // GEN7HOLDONCE (B1025): stays in R8_HELD, never freed (a reused block may carry an earlier run's translation)
+            let _ = (ring_page, ring_layout); // GEN7HOLDONCE (B1025): stays in R8_HELD, never freed (a reused block may carry an earlier run's translation)
+            serial_println!(":: gen7: r8 verdict=r8-alloc-failed which=ptes entries={} writes=0 note=all-three-surfaces-held-nothing-written ::", win_slots);
             serial_println!(":: gen7: r8 next=STOP-no-PTE-table note=no-hold-no-ring-armed ::");
             serial_println!(":: gen7: r8 end ::");
             return;
@@ -6190,11 +6190,11 @@ mod r8 {
             }
         }
         if let Some((v, k, val)) = bad {
-            dealloc(dst_page, dst_layout);
-            dealloc(src_page, src_layout);
-            dealloc(ring_page, ring_layout);
+            let _ = (dst_page, dst_layout); // GEN7HOLDONCE (B1025): stays in R8_HELD, never freed (a reused block may carry an earlier run's translation)
+            let _ = (src_page, src_layout); // GEN7HOLDONCE (B1025): stays in R8_HELD, never freed (a reused block may carry an earlier run's translation)
+            let _ = (ring_page, ring_layout); // GEN7HOLDONCE (B1025): stays in R8_HELD, never freed (a reused block may carry an earlier run's translation)
             serial_println!(
-                ":: gen7: r8 verdict={} win_index={} slot={} value={:016X} base_img={:08X} mode={} writes=0 note=no-GGTT-entry-was-written-all-three-surfaces-freed ::",
+                ":: gen7: r8 verdict={} win_index={} slot={} value={:016X} base_img={:08X} mode={} writes=0 note=no-GGTT-entry-was-written-all-three-surfaces-held ::",
                 v, k, R8_BASE_SLOT + k, val, base_img, mode
             );
             serial_println!(":: gen7: r8 next=STOP-a-scratch-page-could-not-be-given-a-witnessable-PTE-re-run-R4-before-any-further-ring-work note=no-hold-no-ring-armed ::");
@@ -6210,9 +6210,9 @@ mod r8 {
         // strips `r8-ring-addr-illegal` from the artifact — the invariant discharged at COMPILE time,
         // not absent. If `R8_BASE_SLOT` is ever made non-constant, the branch and its token return.
         if ring_gtt_addr & 0xE000_0000 != 0 {
-            dealloc(dst_page, dst_layout);
-            dealloc(src_page, src_layout);
-            dealloc(ring_page, ring_layout);
+            let _ = (dst_page, dst_layout); // GEN7HOLDONCE (B1025): stays in R8_HELD, never freed (a reused block may carry an earlier run's translation)
+            let _ = (src_page, src_layout); // GEN7HOLDONCE (B1025): stays in R8_HELD, never freed (a reused block may carry an earlier run's translation)
+            let _ = (ring_page, ring_layout); // GEN7HOLDONCE (B1025): stays in R8_HELD, never freed (a reused block may carry an earlier run's translation)
             serial_println!(
                 ":: gen7: r8 verdict=r8-ring-addr-illegal ring_gtt_addr={:08X} writes=0 note=RING_START-requires-bits-31:29-zero-IVB-V1P3-1.1.11.3-p77 ::",
                 ring_gtt_addr
@@ -6233,11 +6233,11 @@ mod r8 {
             }
         }
         if drifted {
-            dealloc(dst_page, dst_layout);
-            dealloc(src_page, src_layout);
-            dealloc(ring_page, ring_layout);
+            let _ = (dst_page, dst_layout); // GEN7HOLDONCE (B1025): stays in R8_HELD, never freed (a reused block may carry an earlier run's translation)
+            let _ = (src_page, src_layout); // GEN7HOLDONCE (B1025): stays in R8_HELD, never freed (a reused block may carry an earlier run's translation)
+            let _ = (ring_page, ring_layout); // GEN7HOLDONCE (B1025): stays in R8_HELD, never freed (a reused block may carry an earlier run's translation)
             serial_println!(
-                ":: gen7: r8 verdict=r8-entry-drifted mode={} base_img={:08X} writes=0 note=window-changed-between-census-and-claim-all-three-surfaces-freed-nothing-written ::",
+                ":: gen7: r8 verdict=r8-entry-drifted mode={} base_img={:08X} writes=0 note=window-changed-between-census-and-claim-all-three-surfaces-held-nothing-written ::",
                 mode, base_img
             );
             serial_println!(":: gen7: r8 next=STOP-entry-image-drifted-park-and-report note=no-hold-no-ring-armed ::");
@@ -6765,9 +6765,9 @@ mod r8 {
         );
 
         if reclaim {
-            dealloc(dst_page, dst_layout);
-            dealloc(src_page, src_layout);
-            dealloc(ring_page, ring_layout);
+            super::held_end(&super::R8_HELD[2], !dst_re); // GEN7HOLDONCE (B1025): only a block fresh THIS run goes back (never_fetched speaks for this run); a reused one is abandoned
+            super::held_end(&super::R8_HELD[1], !src_re);
+            super::held_end(&super::R8_HELD[0], !ring_re);
             serial_println!(
                 ":: gen7: r8 reclaim=freed pages={} bytes={} reason={} note=the-three-scratch-surfaces-are-back-on-the-heap ::",
                 pages, bytes, reclaim_reason
@@ -6775,11 +6775,11 @@ mod r8 {
         } else if reversal_clean {
             let _ = (ring_page, src_page, dst_page); #[cfg(all(target_arch = "x86_64", feature = "wc"))] { use crate::allocator::census::{retag, GEN7_HELD}; retag(ring_page as usize, ring_layout.size(), GEN7_HELD); retag(src_page as usize, src_layout.size(), GEN7_HELD); retag(dst_page as usize, dst_layout.size(), GEN7_HELD); } // FIXTURERETAIN (B1017): R8's held surfaces are `gen7-held` (the leaked branch below stays fx:gen7). LINE-NEUTRAL append, code first
             serial_println!(
-                ":: gen7: r8 reclaim=held pages={} bytes={} reason={} note=GEN7TLB-DECIDED-RETENTION-engine-quiesced-every-write-restored-and-NO-GGTT-invalidation-witness-exists-on-this-part-bounded-and-documented-accepted-gen7.md-2.6 ::",
-                pages, bytes, reclaim_reason
+                ":: gen7: r8 reclaim=held pages={} bytes={} reason={} reuse={} held_kb={} note=GEN7TLB-DECIDED-RETENTION-engine-quiesced-every-write-restored-and-NO-GGTT-invalidation-witness-exists-on-this-part-bounded-and-documented-accepted-gen7.md-2.6 ::",
+                pages, bytes, reclaim_reason, if ring_re && src_re && dst_re { "y" } else { "n" }, super::held_kb()
             );
         } else {
-            let _ = (ring_page, src_page, dst_page);
+            let _ = (ring_page, src_page, dst_page); for s in super::R8_HELD.iter() { super::held_end(s, false); } // GEN7HOLDONCE (B1025): a leaked window is never reused: the slots forget it, the pages stay out of the allocator
             serial_println!(
                 ":: gen7: r8 reclaim=leaked pages={} bytes={} reason={} note=SAFETY-REFUSAL-the-engine-was-not-provably-quiesced-or-the-reversal-did-not-verify-a-page-a-GT-may-hold-a-translation-to-never-goes-back-to-the-allocator ::",
                 pages, bytes, reclaim_reason
@@ -7310,7 +7310,7 @@ pub fn ladder_test() {
     ladder::run();
     #[cfg(feature = "gen7blit")]
     blit::test(); // GEN7B (B422): the BCS job, the display capture, KCOMP's second-blitter decision
-}
+    hold_leg(); } // GEN7HOLDONCE (B1025): the second run, asserting no new held page (`:: GEN7HOLD: ::`, body at the file tail). LINE-NEUTRAL append
 
 mod ladder {
     use super::GtWake;
@@ -7496,3 +7496,83 @@ fn wake_decline() -> Option<(u32, u32, u32, &'static str)> {
 #[cfg(feature = "gen7r9")]
 #[path = "gen7_r9.rs"]
 mod r9;
+
+// =================================================================================
+// GEN7HOLDONCE (rmbp-ledger B1025) — FILE-TAIL append: nothing above it moves. THE one GEN7TLB hold rule (gen7.md
+// §2.6: 0x101008 has no read decode, so a page the GT may hold a GGTT translation to never goes back to the allocator),
+// r11's HELD rule hoisted verbatim: a slot is `(base VA, pages)`; a take that fits the held block REUSES it, a bigger
+// take allocates zeroed pages and the smaller block stays held, never freed. r11 (`quad::exec11`), R8's three surfaces
+// (`r8::fb_blit`) and gen7blit's sp/dp take through it. Each slot's own Mutex owns it, taken only inside these fns and
+// never held across a GPU op. The DONE replays (ladder, R8, gen7blit) are untouched: they cache results, slots cache
+// pages. Measured at the cut: a healthy armed boot grew nothing per run already (the replays); the per-run growers
+// were R8's unarmed path (DONE unset, fb_blit re-run, a new ~1 MiB window), gen7blit's heap-short return and r11's
+// bigger-size abandon. `tests gen7` now runs twice and says `:: GEN7HOLD: runs=2 held_kb=<n> growth_kb=0 -> PASS ::`.
+// =================================================================================
+
+/// R8's slots: the ring page, the source surface, the destination surface.
+#[cfg(feature = "gen7r8")]
+static R8_HELD: [crate::sync::Mutex<(usize, usize)>; 3] =
+    [crate::sync::Mutex::new((0, 0)), crate::sync::Mutex::new((0, 0)), crate::sync::Mutex::new((0, 0))];
+/// gen7blit's slots: the job's source `sp` and destination `dp`.
+#[cfg(feature = "gen7blit")]
+static BLIT_HELD: [crate::sync::Mutex<(usize, usize)>; 2] = [crate::sync::Mutex::new((0, 0)), crate::sync::Mutex::new((0, 0))];
+/// Bytes `held_take` has allocated, minus what `held_end` freed (an abandoned block stays counted: it is still held).
+static HELD_BYTES: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// r11's rule: `(base VA, reused)`. A reused block is NOT re-zeroed (every caller seeds what it reads). Base 0 when the
+/// layout or the allocation fails (the caller refuses by name).
+#[allow(dead_code)]
+pub(crate) fn held_take(slot: &crate::sync::Mutex<(usize, usize)>, n: usize) -> (usize, bool) {
+    let mut held = slot.lock();
+    if held.1 < n {
+        let Ok(l) = Layout::from_size_align(n * 4096, 4096) else { return (0, false) };
+        // SAFETY: a non-zero-sized, page-aligned layout (n >= 1 here: held.1 < n).
+        let p = unsafe { alloc_zeroed(l) };
+        if p.is_null() {
+            return (0, false);
+        }
+        *held = (p as usize, n); // a smaller earlier block stays held (GEN7TLB), never freed
+        HELD_BYTES.fetch_add(n * 4096, core::sync::atomic::Ordering::Relaxed);
+        return (p as usize, false);
+    }
+    (held.0, true)
+}
+
+/// End a slot: it forgets its block. `free` (only for a block allocated by THIS run, after R8's reclaim legs fired)
+/// returns it to the heap with the slot's own layout; otherwise the block is abandoned — out of the allocator for the
+/// boot and never reused (R8's `reclaim=leaked`).
+#[allow(dead_code)]
+fn held_end(slot: &crate::sync::Mutex<(usize, usize)>, free: bool) {
+    let mut held = slot.lock();
+    let (p, n) = *held;
+    *held = (0, 0);
+    if free && p != 0 && n != 0 {
+        if let Ok(l) = Layout::from_size_align(n * 4096, 4096) {
+            // SAFETY: `p` came from `held_take`'s `alloc_zeroed` with exactly this layout.
+            unsafe { dealloc(p as *mut u8, l) };
+            HELD_BYTES.fetch_sub(n * 4096, core::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+/// KiB `held_take` holds now.
+pub(crate) fn held_kb() -> usize {
+    HELD_BYTES.load(core::sync::atomic::Ordering::Relaxed) / 1024
+}
+
+/// `tests gen7`'s second run — the ladder and the BCS job again, as an operator's re-typed `tests gen7` would: every
+/// hold through `held_take` reuses, so the held total does not grow. Nothing held before it (QEMU: no IGD bank) is a
+/// SKIP: a zero-compare is never a verdict.
+fn hold_leg() {
+    let k0 = held_kb();
+    ladder::run();
+    #[cfg(feature = "gen7blit")]
+    blit::test();
+    let k1 = held_kb();
+    let growth = k1 as i64 - k0 as i64;
+    if k0 == 0 {
+        serial_println!(":: GEN7HOLD: runs=2 held_kb={} growth_kb={} -> SKIP reason=nothing-held ::", k1, growth);
+    } else {
+        serial_println!(":: GEN7HOLD: runs=2 held_kb={} growth_kb={} -> {} ::", k1, growth, if growth == 0 { "PASS" } else { "FAIL" });
+    }
+}

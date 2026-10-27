@@ -169,7 +169,7 @@ const RT_MAX_BYTES: usize = 24 << 20;
 const DIM_MAX: usize = 8192;
 
 /// The pages, allocated once per size and held for the boot (GEN7TLB, gen7.md §2.6): (base VA, page count). A run
-/// needing more pages allocates afresh and the smaller block stays held, never freed.
+/// needing more pages allocates afresh and the smaller block stays held, never freed. The rule: gen7.rs `held_take` (GEN7HOLDONCE, B1025).
 static HELD: crate::sync::Mutex<(usize, usize)> = crate::sync::Mutex::new((0, 0));
 
 /// The draw's geometry: the source window and the render target.
@@ -411,15 +411,15 @@ unsafe fn exec11(bar0: usize, bar0_size: usize, g: &Geom, src: &[u32]) -> Result
 
     // ---- the pages, held for the boot ---------------------------------------------------------------------------------
     let base_va = {
-        let mut held = HELD.lock();
-        if held.1 < n {
-            let p = alloc_zeroed(Layout::from_size_align(n * 4096, 4096).map_err(|_| "layout")?);
-            if p.is_null() {
+        let (p, reused) = crate::drivers::gpu::gen7::held_take(&HELD, n); // GEN7HOLDONCE (B1025): r11's rule, hoisted verbatim to gen7.rs's tail (r8 and gen7blit take through it too)
+        if !reused {
+            Layout::from_size_align(n * 4096, 4096).map_err(|_| "layout")?; // the refusal by name r11 always made (held_take returned 0)
+            if p == 0 {
                 return Err("alloc");
             }
-            *held = (p as usize, n); #[cfg(all(target_arch = "x86_64", feature = "wc"))] crate::allocator::census::retag(p as usize, n * 4096, crate::allocator::census::GEN7_HELD); /* FIXTURERETAIN (B1017): counted once, never fx:gen7 */ // a smaller earlier block stays held (GEN7TLB), never freed
+            #[cfg(all(target_arch = "x86_64", feature = "wc"))] crate::allocator::census::retag(p as usize, n * 4096, crate::allocator::census::GEN7_HELD); /* FIXTURERETAIN (B1017): counted once, never fx:gen7 */ // a smaller earlier block stays held (GEN7TLB), never freed
         }
-        held.0
+        p
     };
     let va = |k: usize| base_va + k * 4096;
     let mut ptes: alloc::vec::Vec<u32> = alloc::vec::Vec::new();
