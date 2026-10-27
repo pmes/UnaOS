@@ -70,8 +70,8 @@ pub struct Decoder {
     prev_tid0_poc: i32,
     /// (sps_max_num_reorder_pics, SpsMaxLatencyPictures or 0, sps_max_dec_pic_buffering) of the active SPS.
     bump: (u32, u32, u32),
-    /// HEVCREXT (SR334): the consumer shows 4:2:0 at one bit depth only, so 4:2:2 / 4:4:4 and unequal luma / chroma depths
-    /// are refused by name ([`Decoder::set_chroma_420_only`]).
+    /// HEVCREXT (SR334): a consumer that shows 4:2:0 at one bit depth only refuses 4:2:2 / 4:4:4 and unequal luma / chroma
+    /// depths by name ([`Decoder::set_chroma_420_only`]); no in-tree consumer sets it since COLOURONE422 (SR359).
     chroma_420_only: bool,
 }
 
@@ -138,9 +138,9 @@ impl Decoder {
         }
     }
 
-    /// HEVCREXT (SR334): a consumer that can only display 4:2:0 at one bit depth (gneiss_pal's `to_frame` / `Pixels::I420Hi`
-    /// carry one `bit_depth`, until COLOURONE-422) asks for 4:2:2 / 4:4:4 streams and unequal luma / chroma depths to be
-    /// refused by name at SPS activation, so its player keeps the labelled stand-in instead of showing wrong colours.
+    /// HEVCREXT (SR334): a consumer that can only display 4:2:0 at one bit depth asks for 4:2:2 / 4:4:4 streams and unequal
+    /// luma / chroma depths to be refused by name at SPS activation, so its player keeps the labelled stand-in. COLOURONE422
+    /// (SR359): gneiss_pal's `to_frame` carries every format and both depths, so no in-tree consumer sets it (tests/rext.rs pins it).
     /// Kept across [`Decoder::reset`].
     pub fn set_chroma_420_only(&mut self, on: bool) {
         self.chroma_420_only = on;

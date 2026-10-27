@@ -564,9 +564,13 @@ fn my_log_lines(containing: &str) -> Vec<String> {
     CAPTURED.lock().unwrap().iter().filter(|(t, l)| *t == me && l.contains(containing)).map(|(_, l)| l.clone()).collect()
 }
 
-/// HEVC_SPS with bit_depth_luma_minus8 5 / bit_depth_chroma_minus8 4 (the two ue(v) after the conformance flag, 7.3.2.2: `1` ->
-/// `00110` / `00101`), re-packed in place: luma 13 / chroma 12 bits, which the Player's 4:2:0-only hevc_core refuses by name (HEVCREXTTOOLS SR345: 13 bits alone now decode).
-const HEVC_SPS_12BIT: [u8; 28] = [0x42, 0x01, 0x01, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0x90, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00, 0x3c, 0xa0, 0x20, 0x83, 0x11, 0x8a, 0x5f, 0x92, 0x4c, 0x20, 0x80];
+/// HEVC_SPS re-packed as a stream hevc_core refuses by name. COLOURONE422 (SR359): luma and chroma depths that differ now
+/// decode (was this fixture's trigger, luma 13 / chroma 12), so chroma_format_idc becomes 3 (ue `010` -> `00100`) with
+/// separate_colour_plane_flag 1 after it (RBSP bit 105; depths 13 / 12 kept), re-escaped: "separate colour planes (HEVCREXT)".
+const HEVC_SPS_SEPPLANES: [u8; 28] = [0x42, 0x01, 0x01, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0x90, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00, 0x3c, 0x92, 0x04, 0x10, 0x62, 0x31, 0x4b, 0xf2, 0x49, 0x84, 0x10];
+/// HEVC_IDR with colour_plane_id u(2) = 0 after slice_type (payload bit 6): the slice header parses under
+/// HEVC_SPS_SEPPLANES, so the refusal is the named one (the bare HEVC_IDR there fails its alignment bit, a corrupt stream).
+const HEVC_IDR_SEPPLANES: [u8; 11] = [0x26, 0x01, 0xac, 0xe0, 0x09, 0x87, 0x4b, 0x4b, 0x2f, 0x51, 0xcc];
 
 #[derive(Default)]
 struct CountSink {
@@ -578,7 +582,7 @@ impl FrameSink for CountSink {
     }
 }
 
-/// Rule: a decoder that refuses the stream mid-stream (the second sample carries an in-band 13-bit SPS, so every later
+/// Rule: a decoder that refuses the stream mid-stream (the second sample carries an in-band refused SPS, so every later
 /// IDR activates an unsupported SPS) hands the picture to the labelled stand-in ONCE with one `swapped to stand-in`
 /// line; no per-packet warnings follow, and every sample still presents a frame (0 real, 1-3 the stand-in).
 #[test]
@@ -586,11 +590,14 @@ fn hevcdepthcore_12bit_mid_stream_swaps_to_the_stand_in_once() {
     capture_logs();
     let mut t = hevc_kat_track(4);
     let mut s1 = Vec::new();
-    for unit in [&HEVC_SPS_12BIT[..], &HEVC_PPS[..], &HEVC_IDR[..]] {
+    for unit in [&HEVC_SPS_SEPPLANES[..], &HEVC_PPS[..], &HEVC_IDR_SEPPLANES[..]] {
         s1.extend_from_slice(&(unit.len() as u32).to_be_bytes());
         s1.extend_from_slice(unit);
     }
     t.samples[1].data = s1;
+    for i in 2..4 {
+        t.samples[i].data = [&(HEVC_IDR_SEPPLANES.len() as u32).to_be_bytes()[..], &HEVC_IDR_SEPPLANES[..]].concat();
+    }
     let file = build::mp4(&[t], &Mp4Options::default());
     let time = ManualTime::new();
     let mut p = Player::open(file, Arc::new(time.clone()), None, 60).unwrap();
@@ -606,7 +613,7 @@ fn hevcdepthcore_12bit_mid_stream_swaps_to_the_stand_in_once() {
     }
     let lines = my_log_lines("[STRIA] :: video decode:");
     assert_eq!(lines.len(), 1, "{lines:?}");
-    assert_eq!(lines[0], "[STRIA] :: video decode: swapped to stand-in: no decoder: hevc: unsupported (luma and chroma bit depths differ (COLOURONE-422))");
+    assert_eq!(lines[0], "[STRIA] :: video decode: swapped to stand-in: no decoder: hevc: unsupported (separate colour planes (HEVCREXT))");
     assert!(!p.info().real_video);
     assert_eq!(p.info().video_decoder, "test-pattern (stand-in)");
     assert_eq!(sink.shown.iter().map(|s| s.1).collect::<Vec<_>>(), [0, 40_000_000, 80_000_000, 120_000_000], "{:?}", sink.shown);
@@ -679,20 +686,28 @@ fn meterplayer_rms_of_a_stereo_sine_through_the_players_sink() {
     }
 }
 
-// SWAPBACK (LEDGER SR329): an HEVC reel whose sample 1 turns 13-bit (an in-band HEVC_SPS_12BIT), sample 2 a bare IDR still
-// inside the 13-bit span, and sample 3 8-bit again (the in-band HEVC_SPS): the one `stria::decode_swap` takes the
-// Player and the editor to the stand-in at sample 1 and back at sample 3's keyframe.
+// SWAPBACK (LEDGER SR329): an HEVC reel whose sample 1 turns refused (an in-band HEVC_SPS_SEPPLANES; COLOURONE422 SR359:
+// was 13-bit), sample 2 a bare IDR still inside the refused span, and sample 3 8-bit again (the in-band HEVC_SPS): the one
+// `stria::decode_swap` takes the Player and the editor to the stand-in at sample 1 and back at sample 3's keyframe.
 fn swapback_reel() -> Vec<u8> {
     let mut t = hevc_kat_track(6);
-    for (i, sps) in [(1usize, &HEVC_SPS_12BIT[..]), (3, &HEVC_SPS[..])] {
-        let mut s = Vec::new();
-        for unit in [sps, &HEVC_PPS[..], &HEVC_IDR[..]] {
-            s.extend_from_slice(&(unit.len() as u32).to_be_bytes());
-            s.extend_from_slice(unit);
-        }
-        t.samples[i].data = s;
-    }
+    swapback_span(&mut t, 1, 3);
     build::mp4(&[t], &Mp4Options::default())
+}
+
+/// COLOURONE422 (SR359): sample `from` carries the refused in-band sets, `from + 1 .. back` bare IDRs on them (each with its
+/// colour_plane_id, so each is refused by name), sample `back` the 8-bit HEVC_SPS again.
+fn swapback_span(t: &mut build::MediaTrack, from: usize, back: usize) {
+    for i in from..=back {
+        let units: Vec<&[u8]> = if i == from {
+            vec![&HEVC_SPS_SEPPLANES[..], &HEVC_PPS[..], &HEVC_IDR_SEPPLANES[..]]
+        } else if i == back {
+            vec![&HEVC_SPS[..], &HEVC_PPS[..], &HEVC_IDR[..]]
+        } else {
+            vec![&HEVC_IDR_SEPPLANES[..]]
+        };
+        t.samples[i].data = units.iter().flat_map(|u| [&(u.len() as u32).to_be_bytes()[..], *u].concat()).collect();
+    }
 }
 
 /// The flat-128 KAT picture (Y = U = V = 128) through `Frame::to_rgba`, pinned (BT.601 limited range: (128 - 16) * 255 / 219).
@@ -717,8 +732,8 @@ impl FrameSink for RgbaSink {
     }
 }
 
-/// Rule: the Player swaps to the stand-in ONCE at the 13-bit sample and back ONCE at the later 8-bit keyframe (the bare
-/// IDR between is offered to the parked decoder and refused, since it keeps the in-band 13-bit SPS); two log lines, every
+/// Rule: the Player swaps to the stand-in ONCE at the refused sample and back ONCE at the later 8-bit keyframe (the bare
+/// IDR between is offered to the parked decoder and refused, since it keeps the in-band refused SPS); two log lines, every
 /// sample presents a frame, real pixels after the swap back, and `MediaInfo` names the real decoder again.
 #[test]
 fn swapback_player_returns_to_the_real_decoder_at_the_8bit_keyframe() {
@@ -738,7 +753,7 @@ fn swapback_player_returns_to_the_real_decoder_at_the_8bit_keyframe() {
     assert_eq!(
         lines,
         [
-            "[STRIA] :: video decode: swapped to stand-in: no decoder: hevc: unsupported (luma and chroma bit depths differ (COLOURONE-422))",
+            "[STRIA] :: video decode: swapped to stand-in: no decoder: hevc: unsupported (separate colour planes (HEVCREXT))",
             "[STRIA] :: video decode: swapped back at 120000000",
         ],
     );
@@ -751,7 +766,7 @@ fn swapback_player_returns_to_the_real_decoder_at_the_8bit_keyframe() {
     println!("swapback: {} | {} | frames={}", lines[0], lines[1], sink.shown.len());
 }
 
-/// Rule: the editor's render over the same reel draws the stand-in for the 13-bit span and real frames after it (today's
+/// Rule: the editor's render over the same reel draws the stand-in for the refused span and real frames after it (today's
 /// render failed whole on the refusal), and the reel's open report says ` decode=stand-in` only once a render drew it.
 #[test]
 fn swapback_editor_renders_the_stand_in_span_and_reports_it() {
@@ -829,18 +844,11 @@ fn colourone_player_main10_converts_from_ten_bits_and_by_its_colour() {
 
 // SWAPBACKSEEK (LEDGER SR353): a seek (the Player's) and a run open (the editor's) restart the decode at the target keyframe
 // with the in-band parameter sets in effect THERE (`DecodeSwap::reseed`). The Player decodes VIDEO_AHEAD (4) frames ahead of
-// the glass, so its reel's refused span outlasts that: s1 carries the in-band 13-bit sets (`HEVC_SPS_12BIT`), s2-s7 are bare
-// IDRs on them, s8 carries the 8-bit `HEVC_SPS` again, s9-s11 are bare IDRs on it, s0 a bare IDR on the container's.
+// the glass, so its reel's refused span outlasts that: s1 carries the in-band refused sets (`HEVC_SPS_SEPPLANES`), s2-s7 are
+// bare IDRs on them, s8 carries the 8-bit `HEVC_SPS` again, s9-s11 are bare IDRs on it, s0 a bare IDR on the container's.
 fn swapbackseek_reel() -> Vec<u8> {
     let mut t = hevc_kat_track(12);
-    for (i, sps) in [(1usize, &HEVC_SPS_12BIT[..]), (8, &HEVC_SPS[..])] {
-        let mut s = Vec::new();
-        for unit in [sps, &HEVC_PPS[..], &HEVC_IDR[..]] {
-            s.extend_from_slice(&(unit.len() as u32).to_be_bytes());
-            s.extend_from_slice(unit);
-        }
-        t.samples[i].data = s;
-    }
+    swapback_span(&mut t, 1, 8);
     build::mp4(&[t], &Mp4Options::default())
 }
 
@@ -872,7 +880,7 @@ fn swapbackseek_straight() -> Vec<(i64, Vec<u8>)> {
     sink.shown
 }
 
-/// A Player on the stand-in with the refused decoder parked (it holds s1's 13-bit sets; s8 is past the lookahead).
+/// A Player on the stand-in with the refused decoder parked (it holds s1's refused sets; s8 is past the lookahead).
 fn swapbackseek_parked() -> (Player, ManualTime) {
     let time = ManualTime::new();
     let mut p = Player::open(swapbackseek_reel(), Arc::new(time.clone()), None, 60).unwrap();
@@ -883,7 +891,7 @@ fn swapbackseek_parked() -> (Player, ManualTime) {
     (p, time)
 }
 
-/// Rule: after straight play (the decoder holds s8's 8-bit sets) a seek to s4 decodes it with s1's 13-bit sets: the target
+/// Rule: after straight play (the decoder holds s8's 8-bit sets) a seek to s4 decodes it with s1's refused sets: the target
 /// is refused and the stand-in shows AT the target (today: the stale 8-bit sets decode it flat).
 #[test]
 fn swapbackseek_player_seek_into_the_refused_span_starts_on_the_stand_in() {
@@ -907,7 +915,7 @@ fn swapbackseek_player_seek_into_the_refused_span_starts_on_the_stand_in() {
     println!("swapbackseek: into the span -> {}", p.info().video_decoder);
 }
 
-/// Rule: parked on the stand-in (13-bit sets), a seek to s9 decodes it with s8's 8-bit sets on the real decoder at once —
+/// Rule: parked on the stand-in (refused sets), a seek to s9 decodes it with s8's 8-bit sets on the real decoder at once —
 /// the frames equal the straight-play frames at those pts, and no `swapped back` line (nothing waited for a keyframe); a
 /// seek to s0 decodes on the container's sets (today: both offered to the parked decoder, refused, the stand-in).
 #[test]
@@ -933,7 +941,7 @@ fn swapbackseek_player_seek_out_of_the_span_decodes_the_8bit_keyframe_at_once() 
     println!("swapbackseek: out of the span -> s9 s10 s0 real, equal to straight play");
 }
 
-/// Rule: the editor's run opened at s2 (a render of tick 2 alone) decodes with s1's 13-bit sets and draws the stand-in; a run
+/// Rule: the editor's run opened at s2 (a render of tick 2 alone) decodes with s1's refused sets and draws the stand-in; a run
 /// opened at s4 draws the frame the whole render draws there (today: the container's sets decode s2 flat).
 #[test]
 fn swapbackseek_editor_run_opened_inside_the_span_draws_the_stand_in() {

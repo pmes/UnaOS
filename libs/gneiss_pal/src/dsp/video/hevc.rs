@@ -9,8 +9,9 @@
 //! ISO/IEC 14496-15, configured by the HEVCDecoderConfigurationRecord demux_core leaves in `Track::config` (`hvcC` /
 //! CodecPrivate); a track without one is taken to carry Annex B byte-stream samples. Frames leave in output (POC)
 //! order stamped with the pts of the sample they were decoded from; hevc_core's `Frame` is h264_core's, so the
-//! conversion is [`super::h264::to_frame`]. Streams the decoder refuses (P / B slices until HEVCINTER, bit depth above
-//! 8, 4:2:2 / 4:4:4, range extensions) are `DecodeError::Unsupported` with the decoder's own reason.
+//! conversion is [`super::h264::to_frame`]. Streams the decoder refuses (separate colour planes and the rest of hevc_core's
+//! `check_supported`) are `DecodeError::Unsupported` with the decoder's own reason; COLOURONE422 (SR359): 4:2:2 / 4:4:4 and
+//! unequal luma / chroma depths reach the Player (hevc_core's 4:2:0-only opt-in is no longer set).
 
 use std::collections::VecDeque;
 
@@ -39,7 +40,7 @@ pub use hevc_core::ps::hvcc_reorder_depth;
 
 impl HevcDecoder {
     pub fn new(track: &Track) -> Result<HevcDecoder, DecodeError> {
-        let mut dec = hevc_core::Decoder::new(); dec.set_chroma_420_only(true); // HEVCREXT (SR334): to_frame is 4:2:0 at one depth until COLOURONE-422
+        let mut dec = hevc_core::Decoder::new(); // COLOURONE422 (SR359): to_frame carries every format and depth; no 4:2:0-only opt-in
         let length_prefixed = !track.config.is_empty();
         if length_prefixed {
             dec.configure_hvcc(&track.config).map_err(map_err)?;
@@ -85,5 +86,75 @@ impl VideoDecoder for HevcDecoder {
     fn reset(&mut self) {
         self.dec.reset();
         self.ready.clear();
+    }
+}
+
+/// COLOURONE422 (SR359): hevc_core's hand-assembled-stream kit, by path as tools/play-check takes it.
+#[cfg(test)]
+#[path = "../../../../../unaos/libs/media/hevc_core/tests/common/mod.rs"]
+#[allow(dead_code, unused_imports)]
+mod hevc_kit;
+
+#[cfg(test)]
+mod tests {
+    use super::hevc_kit::{idr_slice_header, nal, pps, sps, vps, CabacEnc, PpsCfg, SpsCfg};
+    use crate::dsp::demux::colour::Colour;
+    use crate::dsp::video::{Chroma, Pixels};
+
+    /// One 32x32 I_PCM picture (one CU, deblocking off) at `idc`, PcmBitDepth = BitDepth, through hevc_core and `to_frame`.
+    fn pcm32(idc: u32, (bdy, bdc): (u32, u32), y: &[u16], cb: &[u16], cr: &[u16]) -> crate::dsp::video::Frame {
+        let cfg = SpsCfg { width: 32, height: 32, log2_ctb: 5, chroma_format_idc: idc, bit_depth: bdy, chroma_bit_depth: Some(bdc), pcm: Some((bdy, bdc, 3, 5, true)), ..Default::default() };
+        let mut s = vps(false);
+        s.extend(sps(&cfg));
+        s.extend(pps(&PpsCfg { init_qp: 26, deblocking_disabled: true, ..Default::default() }));
+        let mut e = CabacEnc::new(idr_slice_header(false, false, false, true), 0, 26);
+        let sub = [(2, 2), (2, 2), (2, 1), (1, 1)][idc as usize];
+        e.pcm_cu_fmt(0, 5, bdy, bdc, y, cb, cr, sub);
+        s.extend(nal(19, &e.finish().out));
+        let mut d = hevc_core::Decoder::new();
+        d.decode_annexb(&s).expect("decode");
+        d.flush();
+        super::to_frame(d.take_frames().remove(0))
+    }
+
+    fn bt601_limited() -> Colour {
+        Colour { primaries: 2, transfer: 2, matrix: 6, full_range: Some(false), mastering: None, light: None }
+    }
+
+    fn at(rgba: &[u8], x: usize, y: usize) -> [u8; 3] {
+        let o = (y * 32 + x) * 4;
+        [rgba[o], rgba[o + 1], rgba[o + 2]]
+    }
+
+    /// 4:2:2 and 4:4:4 (was: refused by the 4:2:0-only opt-in): Y 120, Cb 90 in the left half / 160 in the right, Cr 160 in
+    /// the top half / 90 in the bottom, BT.601 limited at 8 bits (298 / 409 / 100 / 208 / 516 >> 8): TL (172, 110, 44),
+    /// TR (172, 83, 186), BL (60, 167, 44), BR (60, 139, 186) on each side of the centre — a wrong subsampling reads across.
+    #[test]
+    fn colourone422_hevc_422_and_444_pcm_convert_by_their_sampling() {
+        for (idc, (sw, sh), ss) in [(2u32, (2usize, 1usize), (1u32, 0u32)), (3, (1, 1), (0, 0))] {
+            let (cw, ch) = (32 / sw, 32 / sh);
+            let cb: Vec<u16> = (0..cw * ch).map(|i| if (i % cw) * sw < 16 { 90 } else { 160 }).collect();
+            let cr: Vec<u16> = (0..cw * ch).map(|i| if (i / cw) * sh < 16 { 160 } else { 90 }).collect();
+            let f = pcm32(idc, (8, 8), &[120; 1024], &cb, &cr);
+            assert!(matches!(&f.pixels, Pixels::I420Hi { ss: s, bit_depth: 8, bit_depth_c: 8, uv_stride, .. } if *s == ss && *uv_stride == cw), "idc {idc}");
+            let rgba = f.to_rgba_colour(Some(&bt601_limited()), Chroma::Nearest);
+            for (x, y, want) in [(15, 15, [172, 110, 44]), (16, 15, [172, 83, 186]), (15, 16, [60, 167, 44]), (16, 16, [60, 139, 186])] {
+                assert_eq!(at(&rgba, x, y), want, "idc {idc} ({x}, {y})");
+            }
+            assert_eq!((at(&rgba, 0, 0), at(&rgba, 31, 31)), ([172, 110, 44], [60, 139, 186]), "idc {idc}");
+        }
+    }
+
+    /// Luma 10 bits beside chroma 8 (was: refused, "luma and chroma bit depths differ"): Y 480 Cb 90 Cr 160 converts with
+    /// each plane's depth to (172, 110, 44) — the 8-bit Y 120 Cb 90 Cr 160 colour; read at one depth it would be (0, 234, 0).
+    #[test]
+    fn colourone422_hevc_unequal_depths_convert_by_each_plane() {
+        let f = pcm32(1, (10, 8), &[480; 1024], &[90; 256], &[160; 256]);
+        assert!(matches!(&f.pixels, Pixels::I420Hi { ss: (1, 1), bit_depth: 10, bit_depth_c: 8, .. }));
+        let rgba = f.to_rgba_colour(Some(&bt601_limited()), Chroma::Nearest);
+        assert!(rgba.chunks_exact(4).all(|q| q == [172, 110, 44, 255]));
+        // 4:2:0 at one depth is unchanged: 8-bit stays `I420`, Main 10 `I420Hi` 10 / 10.
+        assert!(matches!(pcm32(1, (8, 8), &[120; 1024], &[90; 256], &[160; 256]).pixels, Pixels::I420 { .. }));
+        assert!(matches!(pcm32(1, (10, 10), &[480; 1024], &[360; 256], &[640; 256]).pixels, Pixels::I420Hi { ss: (1, 1), bit_depth: 10, bit_depth_c: 10, .. }));
     }
 }

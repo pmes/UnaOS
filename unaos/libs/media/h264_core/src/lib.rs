@@ -117,6 +117,8 @@ pub struct Frame {
     pub planes16: Option<[Vec<u16>; 3]>,
     /// HEVCREXT (SR334): the sampling of the Cb / Cr planes (always 4:2:0 from h264_core).
     pub chroma: ChromaFormat,
+    /// COLOURONE422 (SR359): the bit depth of the Cb / Cr samples (HEVC BitDepthC; `bit_depth` is the luma's; 8 from h264_core).
+    pub bit_depth_c: u8,
 }
 
 impl Frame {
@@ -142,7 +144,7 @@ impl Frame {
             ],
             poc: p.poc,
             tag: p.tag,
-            full_range: p.full_range, bit_depth: 8, planes16: None, chroma: ChromaFormat::Yuv420,
+            full_range: p.full_range, bit_depth: 8, planes16: None, chroma: ChromaFormat::Yuv420, bit_depth_c: 8,
         }
     }
 

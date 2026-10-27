@@ -139,7 +139,7 @@ impl From<h264_core::Error> for Error {
 pub type Result<T> = core::result::Result<T, Error>;
 
 /// PLAYCHECKHI (LEDGER SR352): planes above 8 bits as the reference decoder writes them — every sample two bytes, low
-/// first, Y then Cb then Cr (yuv420p10le / yuv420p12le at 4:2:0; the planes as decoded otherwise). ONE layout: HEVCCONF's
+/// first, Y then Cb then Cr at their own sizes (yuv420p10le / yuv422p10le / yuv444p12le ...; COLOURONE422 SR359). ONE layout: HEVCCONF's
 /// md5 (tests/conformance.rs) and tools/play-check's I420Hi oracle and `--md5` hash and compare these bytes.
 pub fn le_bytes(planes: [&[u16]; 3]) -> alloc::vec::Vec<u8> {
     planes.iter().flat_map(|p| p.iter()).flat_map(|v| v.to_le_bytes()).collect()

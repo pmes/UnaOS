@@ -23,7 +23,8 @@
 //! produced for the same pts (`<dir>/<file name>.<pts µs>.i420`, written by
 //! `unaos/libs/media/vp8_core/oracle/video-frames.cjs`): frames compared, exact, worst max diff.
 //! PLAYCHECKHI (SR352): an I420Hi frame (`bit_depth` 9..16) is compared as yuv420p10le / yuv420p12le bytes (each sample
-//! two bytes, low first: `hevc_core::le_bytes`, HEVCCONF's ONE layout) and reported apart as `i420_hi` with its depth;
+//! two bytes, low first: `hevc_core::le_bytes`, HEVCCONF's ONE layout) and reported apart as `i420_hi` with its depth
+//! (COLOURONE422 SR359: 4:2:2 / 4:4:4 frames as yuv422p / yuv444p{10,12}le, 8-bit ones under `i420_oracle`);
 //! `--md5` lists each presented frame's md5 (crypto_core) of its yuv420p / yuv420p10le / yuv420p12le bytes.
 //!
 //! AUDIOTRACK (SR45): with `--audio-out` the player gets a headless DEVICE — an [`AudioOut`]
@@ -446,8 +447,9 @@ impl I420Oracle {
 /// PLAYCHECKHI (SR352): a presented frame's planes packed as the oracles and `--md5` take them, with its depth: yuv420p
 /// at 8 bits (the crop VP8CORE SR40 wrote inline), above 8 bits the u16 samples cropped at their strides and laid out by
 /// `hevc_core::le_bytes` (yuv420p10le / 12le, HEVCCONF's ONE layout). An I420Hi plane too short for its rows yields no
-/// bytes (the oracle counts the frame missing); a frame without YUV planes yields None. 4:2:2 / 4:4:4 never arrive here:
-/// gneiss_pal's HEVC adapter refuses them by name (COLOURONE-422).
+/// bytes (the oracle counts the frame missing); a frame without YUV planes yields None. COLOURONE422 (SR359): an I420Hi
+/// frame's chroma is cropped at its own subsampling (`ss`) and its depth is the deeper plane's: at 8 bits one byte per
+/// sample (yuv422p / yuv444p), above them `le_bytes` (yuv422p10le, yuv444p12le ...), the bytes `hevc_core::yuv_bytes` writes.
 fn yuv_layout(f: &Frame) -> Option<(Vec<u8>, u8)> {
     let (w, h) = (f.width as usize, f.height as usize);
     let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
@@ -464,15 +466,18 @@ fn yuv_layout(f: &Frame) -> Option<(Vec<u8>, u8)> {
             }
             Some((ours, 8))
         }
-        Pixels::I420Hi { y, u, v, y_stride, uv_stride, bit_depth } => {
+        Pixels::I420Hi { y, u, v, y_stride, uv_stride, bit_depth, ss: (sx, sy), bit_depth_c } => {
             let crop = |p: &[u16], stride: usize, pw: usize, ph: usize| -> Option<Vec<u16>> {
                 (0..ph).map(|r| p.get(r * stride..r * stride + pw)).collect::<Option<Vec<&[u16]>>>().map(|rows| rows.concat())
             };
+            let (cw, ch) = ((w + *sx as usize) >> sx, (h + *sy as usize) >> sy);
+            let depth = (*bit_depth).max(*bit_depth_c);
             let bytes = match (crop(y.as_slice(), *y_stride, w, h), crop(u.as_slice(), *uv_stride, cw, ch), crop(v.as_slice(), *uv_stride, cw, ch)) {
+                (Some(py), Some(pu), Some(pv)) if depth <= 8 => [py, pu, pv].concat().into_iter().map(|s| s as u8).collect(),
                 (Some(py), Some(pu), Some(pv)) => hevc_core::le_bytes([py.as_slice(), pu.as_slice(), pv.as_slice()]),
                 _ => Vec::new(),
             };
-            Some((bytes, *bit_depth))
+            Some((bytes, depth))
         }
         _ => None,
     }
@@ -572,7 +577,7 @@ mod tests {
     /// PLAYCHECKHI (SR352): a flat 10-bit field through the I420Hi path against an inline yuv420p10le oracle.
     #[test]
     fn i420hi_flat_ten_bit_field_against_inline_oracle() {
-        let f = Frame { width: 4, height: 2, pts_ns: 0, pixels: Pixels::I420Hi { y: vec![600; 8], u: vec![512; 2], v: vec![512; 2], y_stride: 4, uv_stride: 2, bit_depth: 10 } };
+        let f = Frame { width: 4, height: 2, pts_ns: 0, pixels: Pixels::I420Hi { y: vec![600; 8], u: vec![512; 2], v: vec![512; 2], y_stride: 4, uv_stride: 2, bit_depth: 10, ss: (1, 1), bit_depth_c: 10 } };
         let mut oracle: Vec<u8> = [0x58u8, 0x02].repeat(8);
         oracle.extend([0x00u8, 0x02].repeat(4));
         let (ours, depth) = yuv_layout(&f).unwrap();
@@ -584,7 +589,7 @@ mod tests {
         assert_eq!(max_diff(&ours, &oracle[..oracle.len() - 2], 10), None);
         assert_eq!(md5_hex(&ours), "4a25c6d2b52679da6bb5a2c244bd87ad");
         // A plane too short for its rows: no bytes, so the frame counts missing.
-        let short = Frame { pixels: Pixels::I420Hi { y: vec![600; 7], u: vec![512; 2], v: vec![512; 2], y_stride: 4, uv_stride: 2, bit_depth: 10 }, ..f };
+        let short = Frame { pixels: Pixels::I420Hi { y: vec![600; 7], u: vec![512; 2], v: vec![512; 2], y_stride: 4, uv_stride: 2, bit_depth: 10, ss: (1, 1), bit_depth_c: 10 }, ..f };
         assert_eq!(yuv_layout(&short), Some((Vec::new(), 10)));
         let mut o = I420Oracle::new(String::new(), String::new());
         o.hi = (10, 1, 1, 0, 0);
@@ -614,11 +619,58 @@ mod tests {
         let f = d.take_frames().remove(0);
         let [y, u, v] = f.planes16.clone().expect("Main 10 keeps planes16");
         let w = f.width as usize;
-        let ours = Frame { width: f.width, height: f.height, pts_ns: 0, pixels: Pixels::I420Hi { y, u, v, y_stride: w, uv_stride: w / 2, bit_depth: f.bit_depth } };
+        let ours = Frame { width: f.width, height: f.height, pts_ns: 0, pixels: Pixels::I420Hi { y, u, v, y_stride: w, uv_stride: w / 2, bit_depth: f.bit_depth, ss: (1, 1), bit_depth_c: f.bit_depth_c } };
         let (bytes, depth) = yuv_layout(&ours).unwrap();
         assert_eq!(depth, 10);
         assert_eq!(bytes, hevc_core::yuv_bytes(&f));
         assert_eq!(md5_hex(&bytes), "ca021302dd2c310dc2b2c9a2ff98fefc");
+    }
+
+    /// COLOURONE422 (SR359): a flat 10-bit 4:4:4 field against an inline yuv444p10le oracle, and a strided 8-bit 4:2:2
+    /// frame against inline yuv422p bytes (one byte per sample, counted with the 8-bit frames).
+    #[test]
+    fn i420hi_444_and_422_layouts_against_inline_oracles() {
+        let f = Frame { width: 4, height: 2, pts_ns: 0, pixels: Pixels::I420Hi { y: vec![600; 8], u: vec![512; 8], v: vec![300; 8], y_stride: 4, uv_stride: 4, bit_depth: 10, ss: (0, 0), bit_depth_c: 10 } };
+        let mut oracle: Vec<u8> = [0x58u8, 0x02].repeat(8);
+        oracle.extend([0x00u8, 0x02].repeat(8));
+        oracle.extend([0x2cu8, 0x01].repeat(8));
+        let (ours, depth) = yuv_layout(&f).unwrap();
+        assert_eq!((ours.as_slice(), depth), (oracle.as_slice(), 10));
+        assert_eq!(max_diff(&ours, &oracle, 10), Some(0));
+        // 3x2 4:2:2, luma stride 4, chroma 2 wide (ceil(3 / 2)) at stride 3, 2 rows.
+        let y: Vec<u16> = (1..=8).collect();
+        let g = Frame { width: 3, height: 2, pts_ns: 0, pixels: Pixels::I420Hi { y, u: vec![20, 21, 99, 22, 23, 99], v: vec![30, 31, 99, 32, 33, 99], y_stride: 4, uv_stride: 3, bit_depth: 8, ss: (1, 0), bit_depth_c: 8 } };
+        assert_eq!(yuv_layout(&g), Some((vec![1u8, 2, 3, 5, 6, 7, 20, 21, 22, 23, 30, 31, 32, 33], 8)));
+        // Unequal depths: the deeper plane's, two bytes per sample for every plane (hevc_core::yuv_bytes's choice).
+        let h = Frame { pixels: Pixels::I420Hi { y: vec![600; 8], u: vec![128; 8], v: vec![128; 8], y_stride: 4, uv_stride: 4, bit_depth: 10, ss: (0, 0), bit_depth_c: 8 }, ..f };
+        assert_eq!(yuv_layout(&h).map(|(b, d)| (b.len(), d)), Some((48, 10)));
+    }
+
+    /// COLOURONE422 (SR359): a 4:4:4 Main 4:4:4 10 picture (all INTRA_DC, flat 512) from hevc_core's kit, laid out as
+    /// gneiss_pal's `to_frame` hands it on (ss (0, 0), uv_stride w): the bytes are `hevc_core::yuv_bytes` — ONE layout.
+    #[test]
+    fn rext444_kat_picture_bytes_equal_hevcconf_layout() {
+        use crate::hevc_kit::{CabacEnc, PpsCfg, SpsCfg, idr_slice_header, nal, pps, sps, vps};
+        let cfg = SpsCfg { width: 32, height: 32, log2_ctb: 5, chroma_format_idc: 3, bit_depth: 10, ..Default::default() };
+        let mut s = vps(false);
+        s.extend(sps(&cfg));
+        s.extend(pps(&PpsCfg { init_qp: 26, ..Default::default() }));
+        let mut e = CabacEnc::new(idr_slice_header(false, false, false, false), 0, 26);
+        e.split_cu(0, false);
+        e.dc_cu_fmt(1, 3);
+        s.extend(nal(19, &e.finish().out));
+        let mut d = hevc_core::Decoder::new();
+        d.decode_annexb(&s).expect("decode");
+        d.flush();
+        let f = d.take_frames().remove(0);
+        let [y, u, v] = f.planes16.clone().expect("10-bit keeps planes16");
+        let w = f.width as usize;
+        let ours = Frame { width: f.width, height: f.height, pts_ns: 0, pixels: Pixels::I420Hi { y, u, v, y_stride: w, uv_stride: w, bit_depth: f.bit_depth, ss: (0, 0), bit_depth_c: f.bit_depth_c } };
+        let (bytes, depth) = yuv_layout(&ours).unwrap();
+        assert_eq!((depth, bytes.len()), (10, 3 * 32 * 32 * 2));
+        assert_eq!(bytes, hevc_core::yuv_bytes(&f));
+        assert!(bytes.chunks_exact(2).all(|c| c == [0x00, 0x02]));
+        assert_eq!(md5_hex(&bytes), "9d5570f5289013181c6b25eb4bddccce"); // md5 of 0x00 0x02 x 3072 (python hashlib)
     }
 
     /// PLAYCHECKHI (SR352): the 8-bit path is VP8CORE's (SR40) — the same strided crop, the same report fragment and rule.
