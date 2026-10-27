@@ -1,0 +1,478 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
+// Copyright (C) 2026 The Architect & Una
+//
+//! The editor's track view: ONE geometry and ONE painter both faces draw (NLE6KEYS, rmbp-ledger B961).
+//!
+//! CHARTER: Stria — shared-core. The non-linear editor's view (BP-handlers-14): the host face (`stria::nle_face`, which
+//! re-exports this module's names) and the on-UnaOS face (the kernel Player's EDL mode, `video/vplay.rs`'s view band)
+//! paint the SAME pixels from the SAME [`Layout`]. Moved byte for byte from `stria::nle_face` (NLE2 SR201, NLE2c SR217,
+//! NLE3d SR302, NLE3cBLACK SR323, NLE2-SPLIT SR339); its goldens (`nle2_track_paint_golden`, `nle3d_widget_paint_golden`,
+//! `nle3cblack_to_black_marker_golden`, …) are this painter's.
+//!
+//! * [`Layout`]: where everything is on a canvas (the preview band, the ruler, one row per track), read by [`paint_in`],
+//!   [`Layout::hit`], [`Layout::crossing`] and the transition widget's [`Layout::transition_rect`]; [`Layout::of_role`]
+//!   cuts it for a Surface showing only the preview or only the tracks.
+//! * [`paint_in`]: RGBA (or BGRA, [`Order`]) bytes over a plain [`Canvas`]; the optional [`Text`] hook names the clips
+//!   and the ruler's seconds (the host's text_host; the kernel paints none yet). No font, no I/O, no_std + alloc.
+//! * The colours are the editor's own table (the host's, moved unchanged); NLE6VIEW-TOKENS (video.md §5) owes them as
+//!   palette_core tokens.
+
+use alloc::vec;
+use alloc::vec::Vec;
+
+use crate::editor::EditorState;
+use crate::{Kind, Timeline, Transition, TransitionKind, WipeDir, edl};
+
+// ---------------------------------------------------------------------------------------------------------------------
+// THE ONE GEOMETRY
+// ---------------------------------------------------------------------------------------------------------------------
+
+/// The ruler band's height (px).
+pub const RULER_H: u32 = 16;
+/// One track row's height (px).
+pub const ROW_H: u32 = 40;
+/// The trim handle's width (px).
+pub const HANDLE_W: i64 = 4;
+
+/// Where everything is on a `w` x `h` canvas: the preview band `0..preview_h`, the ruler, then one row per track.
+/// The track area shows ticks from `t0` (the page holding the playhead).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Layout {
+    pub w: u32,
+    pub h: u32,
+    pub preview_h: u32,
+    pub ruler_y: u32,
+    pub tracks_y: u32,
+    pub rows: usize,
+    pub zoom: u32,
+    pub t0: i64,
+}
+
+/// What a point on the canvas is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Hit {
+    Ruler(i64),
+    /// `(track, clip index, tick)`.
+    Clip(usize, usize, i64),
+    /// An empty spot on a track: `(track, tick)`.
+    Track(usize, i64),
+    None,
+}
+
+impl Layout {
+    pub fn of(w: u32, h: u32, st: &EditorState) -> Layout {
+        let rows = st.timeline.tracks.len();
+        let below = RULER_H + rows as u32 * ROW_H;
+        let preview_h = h.saturating_sub(below);
+        let zoom = st.zoom.max(1);
+        let per_page = (w / zoom).max(1) as i64;
+        let t0 = st.playhead.max(0) / per_page * per_page;
+        Layout { w, h, preview_h, ruler_y: preview_h, tracks_y: preview_h + RULER_H, rows, zoom, t0 }
+    }
+    /// The x of tick `t`'s left edge.
+    pub fn x_of(&self, t: i64) -> i64 {
+        (t - self.t0) * self.zoom as i64
+    }
+    /// The tick under x.
+    pub fn tick_at(&self, x: f64) -> i64 {
+        self.t0 + (x.max(0.0) as i64) / self.zoom as i64
+    }
+    /// The y of track row `row`'s top.
+    pub fn row_y(&self, row: usize) -> i64 {
+        self.tracks_y as i64 + row as i64 * ROW_H as i64
+    }
+    /// The centre of tick `t` on track row `row` (what a click on that clip sends).
+    pub fn point(&self, row: usize, t: i64) -> (f64, f64) {
+        (self.x_of(t) as f64 + self.zoom as f64 / 2.0, self.row_y(row) as f64 + ROW_H as f64 / 2.0)
+    }
+    pub fn hit(&self, tl: &Timeline, x: f64, y: f64) -> Hit {
+        if x < 0.0 || y < 0.0 || x >= self.w as f64 || y >= self.h as f64 || y < self.ruler_y as f64 {
+            return Hit::None;
+        }
+        let t = self.tick_at(x);
+        if y < self.tracks_y as f64 {
+            return Hit::Ruler(t);
+        }
+        let row = ((y - self.tracks_y as f64) / ROW_H as f64) as usize;
+        if row >= self.rows {
+            return Hit::None;
+        }
+        match tl.clip_at(row, t) {
+            Some(i) => Hit::Clip(row, i, t),
+            None => Hit::Track(row, t),
+        }
+    }
+    /// The clips whose drawn rect (`x_of(at)..x_of(end)` x its row) meets the rect with corners `(x0, y0)` and
+    /// `(x1, y1)` (surface pixels, either order), sorted. (NLE2c SR217's marquee.)
+    pub fn crossing(&self, tl: &Timeline, x0: f64, y0: f64, x1: f64, y1: f64) -> Vec<(usize, usize)> {
+        let (xa, xb) = (x0.min(x1), x0.max(x1));
+        let (ya, yb) = (y0.min(y1), y0.max(y1));
+        let mut out = Vec::new();
+        for (row, tr) in tl.tracks.iter().enumerate().take(self.rows) {
+            let (r0, r1) = (self.row_y(row) as f64, (self.row_y(row) + ROW_H as i64) as f64);
+            if yb < r0 || ya >= r1 {
+                continue;
+            }
+            for (i, c) in tr.clips.iter().enumerate() {
+                let (c0, c1) = (self.x_of(c.at) as f64, self.x_of(c.end()) as f64);
+                if xb >= c0 && xa < c1 {
+                    out.push((row, i));
+                }
+            }
+        }
+        out
+    }
+}
+
+/// Which part of the editor a Surface shows (NLE2-SPLIT SR339).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    /// All three bands on one Surface (the one-Surface tree).
+    Whole,
+    /// The preview band only.
+    Preview,
+    /// The ruler and the tracks only.
+    Tracks,
+}
+
+impl Layout {
+    /// THE geometry for a Surface of `role`: [`Layout::of`] (zoom, page, rows: one computation), with only the band fields
+    /// set for the role. `Preview` puts the ruler a band below the canvas (`ruler_y = h + RULER_H`: no tick or label reaches
+    /// it, and [`Layout::hit`] finds nothing on it); `Tracks` has no preview band (the ruler at 0, the rows under it).
+    pub fn of_role(role: Role, w: u32, h: u32, st: &EditorState) -> Layout {
+        let mut l = Layout::of(w, h, st);
+        match role {
+            Role::Whole => {}
+            Role::Preview => {
+                l.preview_h = h;
+                l.ruler_y = h + RULER_H;
+                l.tracks_y = h + 2 * RULER_H;
+            }
+            Role::Tracks => {
+                l.preview_h = 0;
+                l.ruler_y = 0;
+                l.tracks_y = RULER_H;
+            }
+        }
+        l
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// THE ONE PAINTER
+// ---------------------------------------------------------------------------------------------------------------------
+
+/// A preview frame: `width * height * 4` RGBA bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Still {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+}
+
+/// The byte order a canvas is painted in (the host's surfaces read either; the kernel packs RGBA into 0RGB words).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Order {
+    Rgba,
+    Bgra,
+}
+
+pub const BG: [u8; 4] = [0x1e, 0x1e, 0x24, 255];
+pub const FIELD: [u8; 4] = [0x00, 0x00, 0x00, 255];
+pub const RULER: [u8; 4] = [0x2a, 0x2a, 0x33, 255];
+pub const TICK: [u8; 4] = [0x88, 0x88, 0x99, 255];
+pub const ROW: [[u8; 4]; 2] = [[0x26, 0x26, 0x2e, 255], [0x2c, 0x2c, 0x35, 255]];
+pub const SELECT: [u8; 4] = [0xff, 0xff, 0xff, 255];
+pub const HANDLE: [u8; 4] = [0xff, 0xd0, 0x40, 255];
+pub const PLAYHEAD: [u8; 4] = [0xff, 0x40, 0x40, 255];
+pub const REEL: [[u8; 3]; 6] =
+    [[0x4a, 0x7d, 0xc9], [0xc9, 0x7d, 0x4a], [0x5a, 0xa8, 0x6a], [0xa8, 0x5a, 0xa0], [0xb8, 0xa8, 0x4a], [0x4a, 0xa8, 0xa8]];
+
+/// A clip's colour: its reel's, darker on an audio track.
+pub fn clip_colour(src: u32, kind: Kind) -> [u8; 4] {
+    let c = REEL[src as usize % REEL.len()];
+    match kind {
+        Kind::Video => [c[0], c[1], c[2], 255],
+        Kind::Audio => [c[0] / 4 * 3, c[1] / 4 * 3, c[2] / 4 * 3, 255],
+    }
+}
+
+/// A canvas in one byte order.
+pub struct Canvas {
+    pub w: u32,
+    pub h: u32,
+    pub order: Order,
+    pub px: Vec<u8>,
+}
+
+impl Canvas {
+    pub fn new(w: u32, h: u32, order: Order) -> Canvas {
+        Canvas { w, h, order, px: vec![0; w as usize * h as usize * 4] }
+    }
+    pub fn put(&self, c: [u8; 4]) -> [u8; 4] {
+        match self.order {
+            Order::Rgba => c,
+            Order::Bgra => [c[2], c[1], c[0], c[3]],
+        }
+    }
+    /// Fill `x0..x1` x `y0..y1`, clipped to the canvas.
+    pub fn rect(&mut self, x0: i64, y0: i64, x1: i64, y1: i64, c: [u8; 4]) {
+        let (x0, x1) = (x0.clamp(0, self.w as i64) as usize, x1.clamp(0, self.w as i64) as usize);
+        let (y0, y1) = (y0.clamp(0, self.h as i64) as usize, y1.clamp(0, self.h as i64) as usize);
+        let c = self.put(c);
+        for y in y0..y1 {
+            let row = y * self.w as usize * 4;
+            for x in x0..x1 {
+                self.px[row + x * 4..row + x * 4 + 4].copy_from_slice(&c);
+            }
+        }
+    }
+    /// A 1 px outline of `x0..x1` x `y0..y1`.
+    pub fn frame(&mut self, x0: i64, y0: i64, x1: i64, y1: i64, c: [u8; 4]) {
+        self.rect(x0, y0, x1, y0 + 1, c);
+        self.rect(x0, y1 - 1, x1, y1, c);
+        self.rect(x0, y0, x0 + 1, y1, c);
+        self.rect(x1 - 1, y0, x1, y1, c);
+    }
+    /// `s` nearest-scaled to fit (aspect kept) and centred in `x0..x0+bw` x `y0..y0+bh`.
+    pub fn blit_fit(&mut self, s: &Still, x0: u32, y0: u32, bw: u32, bh: u32) {
+        if s.width == 0 || s.height == 0 || bw == 0 || bh == 0 || s.rgba.len() < s.width as usize * s.height as usize * 4 {
+            return;
+        }
+        let k = (bw as f64 / s.width as f64).min(bh as f64 / s.height as f64);
+        let (dw, dh) = (((s.width as f64 * k) as u32).max(1), ((s.height as f64 * k) as u32).max(1));
+        let (ox, oy) = (x0 + (bw - dw.min(bw)) / 2, y0 + (bh - dh.min(bh)) / 2);
+        for dy in 0..dh {
+            let (y, sy) = (oy + dy, dy as u64 * s.height as u64 / dh as u64);
+            if y >= self.h {
+                break;
+            }
+            for dx in 0..dw {
+                let (x, sx) = (ox + dx, dx as u64 * s.width as u64 / dw as u64);
+                if x >= self.w {
+                    break;
+                }
+                let si = (sy as usize * s.width as usize + sx as usize) * 4;
+                let p = self.put([s.rgba[si], s.rgba[si + 1], s.rgba[si + 2], s.rgba[si + 3]]);
+                let di = (y as usize * self.w as usize + x as usize) * 4;
+                self.px[di..di + 4].copy_from_slice(&p);
+            }
+        }
+    }
+}
+
+/// The label hook: one line of text at `x` / `baseline`, clipped to columns `clip` (the host's text_host shaper; a face
+/// with no font passes none and the paint is the rects alone).
+pub trait Text {
+    fn text(&mut self, c: &mut Canvas, s: &str, x: f32, baseline: f32, clip: (i32, i32));
+}
+
+/// Paint the editor on a `w` x `h` canvas in `order`. `labels` names the clips (and the seconds on the ruler); `preview`
+/// is the frame at the playhead.
+pub fn paint(st: &EditorState, w: u32, h: u32, order: Order, labels: Option<&mut dyn Text>, preview: Option<&Still>) -> Vec<u8> {
+    paint_in(st, Layout::of(w, h, st), order, labels, preview)
+}
+
+/// [`paint`] in a given layout (a face's view, which a wheel zoom anchors at the pointer, or a Surface's role).
+pub fn paint_in(st: &EditorState, l: Layout, order: Order, mut labels: Option<&mut dyn Text>, preview: Option<&Still>) -> Vec<u8> {
+    let (w, h) = (l.w, l.h);
+    let tl = &st.timeline;
+    let mut c = Canvas::new(w, h, order);
+    c.rect(0, 0, w as i64, h as i64, BG);
+    // The preview band.
+    c.rect(0, 0, w as i64, l.preview_h as i64, FIELD);
+    if let Some(s) = preview {
+        c.blit_fit(s, 0, 0, w, l.preview_h);
+    }
+    // The ruler: a short mark per tick when they are 4 px apart, a long one per second.
+    let fps = tl.fps().unwrap_or(25).max(1) as i64;
+    let (ry, ty) = (l.ruler_y as i64, l.tracks_y as i64);
+    c.rect(0, ry, w as i64, ty, RULER);
+    let t_end = l.tick_at(w as f64) + 1;
+    for t in l.t0..=t_end {
+        let x = l.x_of(t);
+        if t % fps == 0 {
+            c.rect(x, ry + RULER_H as i64 / 2, x + 1, ty, TICK);
+            if let Some(text) = labels.as_mut().filter(|_| l.zoom as i64 * fps >= 60) {
+                text.text(&mut c, &edl::timecode(t, fps as u32), x as f32 + 2.0, ry as f32 + 9.0, (x as i32, w as i32));
+            }
+        } else if l.zoom >= 4 {
+            c.rect(x, ty - 3, x + 1, ty, TICK);
+        }
+    }
+    // The tracks and their clips.
+    for (row, track) in tl.tracks.iter().enumerate() {
+        let y0 = l.row_y(row);
+        let y1 = y0 + ROW_H as i64;
+        c.rect(0, y0, w as i64, y1, ROW[row % 2]);
+        for clip in &track.clips {
+            let (x0, x1) = (l.x_of(clip.at), l.x_of(clip.end()));
+            if x1 <= 0 || x0 >= w as i64 {
+                continue;
+            }
+            c.rect(x0 + 1, y0 + 2, x1 - 1, y1 - 2, clip_colour(clip.src.0, track.kind));
+            if let (Some(text), Some(src)) = (labels.as_mut(), tl.source(clip.src)) {
+                text.text(&mut c, &src.reel, x0 as f32 + 4.0, y0 as f32 + 15.0, ((x0 + 1) as i32, (x1 - 1) as i32));
+            }
+        }
+    }
+    // The selection (NLE2c: every clip of the set outlined), and the primary's two trim handles.
+    for &(row, i) in &st.set {
+        if let Some(clip) = tl.tracks.get(row).and_then(|tr| tr.clips.get(i)) {
+            c.frame(l.x_of(clip.at), l.row_y(row), l.x_of(clip.end()), l.row_y(row) + ROW_H as i64, SELECT);
+        }
+    }
+    if let (Some((row, _)), Some(clip)) = (st.selection, st.selected()) {
+        let (x0, x1) = (l.x_of(clip.at), l.x_of(clip.end()));
+        let (y0, y1) = (l.row_y(row), l.row_y(row) + ROW_H as i64);
+        c.frame(x0, y0, x1, y1, SELECT);
+        c.rect(x0, y0 + 2, x0 + HANDLE_W, y1 - 2, HANDLE);
+        c.rect(x1 - HANDLE_W, y0 + 2, x1, y1 - 2, HANDLE);
+    }
+    paint_transitions(&mut c, l, st);
+    // The playhead, through the ruler and the tracks.
+    let px = l.x_of(st.playhead);
+    c.rect(px, ry, px + 1, h as i64, PLAYHEAD);
+    c.px
+}
+
+/// FNV-1a 64 of a buffer (the goldens' hash, tools/nle's, the kernel fixture's view pin).
+pub fn fnv1a(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3))
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// THE TRANSITION WIDGET (NLE3d, LEDGER SR302)
+// ---------------------------------------------------------------------------------------------------------------------
+
+/// The widget's height (px): a band at the foot of the track row.
+pub const TRANS_H: i64 = 10;
+/// The narrowest widget (px), so a short transition at a low zoom stays clickable.
+pub const TRANS_MIN_W: i64 = 8;
+/// The selected transition's thumbnail box (px), above its row.
+pub const THUMB_W: i64 = 48;
+pub const THUMB_H: i64 = 36;
+pub const TRANS: [u8; 4] = [0xe0, 0x90, 0xff, 255];
+pub const TRANS_FILL: [u8; 4] = [0x50, 0x30, 0x70, 255];
+/// The kind glyphs, 7x7 (bit 6 the leftmost column): D, W001, W002, W041, W101, W201.
+const GLYPHS: [[u8; 7]; 6] = [
+    [0x41, 0x22, 0x14, 0x08, 0x14, 0x22, 0x41],
+    [0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70],
+    [0x7f, 0x7f, 0x7f, 0x00, 0x00, 0x00, 0x00],
+    [0x7f, 0x7e, 0x7c, 0x78, 0x70, 0x60, 0x40],
+    [0x7f, 0x41, 0x5d, 0x55, 0x5d, 0x41, 0x7f],
+    [0x1c, 0x2a, 0x49, 0x4f, 0x41, 0x22, 0x1c],
+];
+
+fn glyph(kind: TransitionKind) -> &'static [u8; 7] {
+    &GLYPHS[match kind {
+        TransitionKind::Dissolve => 0,
+        TransitionKind::Wipe(WipeDir::LeftToRight | WipeDir::BarnDoorVertical) => 1,
+        TransitionKind::Wipe(WipeDir::TopToBottom | WipeDir::BarnDoorHorizontal) => 2,
+        TransitionKind::Wipe(WipeDir::Diagonal | WipeDir::DiagonalTopRight) => 3,
+        TransitionKind::Wipe(WipeDir::Box | WipeDir::CornerTopLeft | WipeDir::CornerTopRight | WipeDir::CornerBottomRight | WipeDir::CornerBottomLeft) => 4,
+        TransitionKind::Wipe(WipeDir::Clock | WipeDir::ClockThree | WipeDir::ClockSix | WipeDir::ClockNine) => 5,
+    }]
+}
+
+impl Layout {
+    /// THE widget geometry, read by [`paint_in`] and [`Layout::transition_at`]: a bracket spanning the transition's `dur`
+    /// ticks from its cut (`x_of(at)..x_of(at + dur)`, at least [`TRANS_MIN_W`] wide) in the foot band of row `row`.
+    pub fn transition_rect(&self, row: usize, x: &Transition) -> (i64, i64, i64, i64) {
+        let x0 = self.x_of(x.at);
+        let x1 = self.x_of(x.at + x.dur).max(x0 + TRANS_MIN_W);
+        let y1 = self.row_y(row) + ROW_H as i64 - 2;
+        (x0, y1 - TRANS_H, x1, y1)
+    }
+    /// The transition whose widget is under `(x, y)`: `(track, index)` (the last drawn wins).
+    pub fn transition_at(&self, tl: &Timeline, x: f64, y: f64) -> Option<(usize, usize)> {
+        let mut hit = None;
+        for (row, tr) in tl.tracks.iter().enumerate().take(self.rows) {
+            for (i, t) in tr.transitions.iter().enumerate() {
+                let (x0, y0, x1, y1) = self.transition_rect(row, t);
+                if x >= x0 as f64 && x < x1 as f64 && y >= y0 as f64 && y < y1 as f64 {
+                    hit = Some((row, i));
+                }
+            }
+        }
+        hit
+    }
+    /// The thumbnail box `(x0, y0)` ([`THUMB_W`] x [`THUMB_H`]): above row `row`, at the widget's left, kept on the canvas.
+    pub fn transition_thumb(&self, row: usize, x: &Transition) -> (i64, i64) {
+        let x0 = self.x_of(x.at).min((self.w as i64 - THUMB_W).max(0)).max(0);
+        (x0, (self.row_y(row) - THUMB_H).max(0))
+    }
+}
+
+/// The tick a transition's preview shows: its midpoint, `at + dur / 2`.
+pub fn transition_mid(x: &Transition) -> i64 {
+    x.at + x.dur / 2
+}
+
+/// Every transition's widget: the bracket (outlined white when selected), its kind glyph and, from black, a black
+/// marker on its outgoing (left) edge; NLE3cBLACK: to black, one on its incoming (right) edge.
+fn paint_transitions(c: &mut Canvas, l: Layout, st: &EditorState) {
+    for (row, tr) in st.timeline.tracks.iter().enumerate().take(l.rows) {
+        for (i, x) in tr.transitions.iter().enumerate() {
+            let (x0, y0, x1, y1) = l.transition_rect(row, x);
+            if x1 <= 0 || x0 >= l.w as i64 {
+                continue;
+            }
+            c.rect(x0, y0, x1, y1, TRANS_FILL);
+            c.frame(x0, y0, x1, y1, if st.transition == Some((row, i)) { SELECT } else { TRANS });
+            let gx = if x.from_black {
+                c.rect(x0 + 1, y0 + 1, (x0 + 4).min(x1 - 1), y1 - 1, FIELD);
+                x0 + 5
+            } else {
+                x0 + 2
+            };
+            if x.to_black { c.rect((x1 - 4).max(x0 + 1), y0 + 1, x1 - 1, y1 - 1, FIELD); } // NLE3cBLACK: the to-black marker
+            for (dy, bits) in glyph(x.kind).iter().enumerate() {
+                for dx in 0..7i64 {
+                    if bits & (0x40 >> dx) != 0 && gx + dx < x1 - 1 {
+                        let (px, py) = (gx + dx, y0 + 2 + dy as i64);
+                        c.rect(px, py, px + 1, py + 1, TRANS);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Clip, Timeline};
+
+    /// The kernel `tests nle` keys leg's timeline after its `s` / `]` / `u` (player.rs `nle_fx::keys_leg`): NLEFXA 0..20
+    /// at 0 split at 8.
+    fn keys_state() -> EditorState {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("NLEFXA", 40);
+        tl.add_track(Kind::Video);
+        tl.tracks[0].clips = alloc::vec![Clip::new(a, 0, 20, 0)];
+        EditorState::new(tl.split(0, 8).unwrap())
+    }
+
+    /// NLE6KEYS (rmbp-ledger B961) M3: the kernel fixture's pins, host-computed through the SAME `paint_in` and
+    /// `edl::write` the kernel calls: the saved EDL's text, and the view band (Role::Tracks, 320x56, the right half
+    /// selected, playhead 8). `KEY_VIEW_KAT` / `KEY_EDL` in player.rs `nle_fx` are these literals.
+    #[test]
+    fn kernel_keys_view_pin() {
+        let mut st = keys_state();
+        assert_eq!(
+            edl::write(&st.timeline, "NLEKEY").unwrap(),
+            "TITLE: NLEKEY\nFCM: NON-DROP FRAME\n* UNA FPS 25\n* UNA SOURCE NLEFXA 00:00:01:15\n\n001  NLEFXA   V     C        00:00:00:00 00:00:00:08 00:00:00:00 00:00:00:08\n002  NLEFXA   V     C        00:00:00:08 00:00:00:20 00:00:00:08 00:00:00:20\n"
+        );
+        st.select_at(0, 8).unwrap();
+        st.seek(8);
+        let l = Layout::of_role(Role::Tracks, 320, 56, &st);
+        assert_eq!((l.ruler_y, l.tracks_y, l.t0), (0, RULER_H, 0));
+        let px = paint_in(&st, l, Order::Rgba, None, None);
+        let at = |x: usize, y: usize| &px[(y * 320 + x) * 4..(y * 320 + x) * 4 + 4];
+        assert_eq!(at(64, 30), PLAYHEAD, "the playhead at tick 8");
+        assert_eq!(at(66, 30), HANDLE, "the right half's in handle");
+        assert_eq!(at(10, 30), clip_colour(0, Kind::Video), "the left half");
+        assert_eq!(fnv1a(&px), 0x53f5_5489_46f1_502f);
+    }
+}

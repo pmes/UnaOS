@@ -556,7 +556,7 @@ pub fn present(dst: &mut [u32], w: usize, vh: usize, audio_ms: Option<u64>, play
             p.shown.push(o); // NLE6 (SR207): the presented frame counter
         }
     }
-    blit_fit(dst, w, 0, 0, w, vh, &f, Some(0));
+    let vh = view_band(dst, w, vh, f.pts_ms); blit_fit(dst, w, 0, 0, w, vh, &f, Some(0)); // NLE6KEYS (rmbp-ledger B961): the EDL's track view in the picture rect's lower band (file tail)
     (true, media)
 }
 
@@ -1026,7 +1026,7 @@ fn edl_run(jid: u32, path: &str, seek_ms: u64, rep: &mut EdlReport) -> Result<()
     use timeline_core::Kind;
     let bytes = read_all(path).map_err(|e| ("read-refused", Some(e)))?;
     let text = core::str::from_utf8(&bytes).map_err(|_| ("edl-refused", Some(String::from("the EDL is not UTF-8 text"))))?;
-    let st = timeline_core::editor::EditorState::open(text, 25).map_err(|e| ("edl-refused", Some(alloc::format!("edl: {}", e))))?;
+    let st = timeline_core::editor::EditorState::open(text, 25).map_err(|e| ("edl-refused", Some(alloc::format!("edl: {}", e))))?; let st = edit_seed(jid, path, st); // NLE6KEYS (rmbp-ledger B961): the Player's one editor state survives the job's restarts (file tail)
     let tl = &st.timeline;
     let dir = path.rfind('/').map(|i| &path[..i]).unwrap_or("");
     let mt = crate::shell::vfs_mount_table();
@@ -1804,4 +1804,163 @@ fn face_preview(seek_ms: u64, rep: &EdlReport, out_t: i64, f: &Frame) {
 /// The last seek job's preview, cleared (`None` before one queued a frame).
 pub fn face_preview_take() -> Option<(i64, bool, u64)> {
     PREVIEW.lock().take()
+}
+
+// ── NLE6KEYS (rmbp-ledger B961): the kernel face's editing keys and its track view ───────────────────────────────────────
+//
+// ONE editor state per EDL open in the Player (`EDIT`): seeded by the EDL job's open (`edl_run` -> [`edit_seed`]) and kept
+// across the job's restarts (a seek, an edit), so undo survives them; cleared when the Player closes ([`edit_close`]). The
+// Player's key door (player.rs `key_route` -> `edit_post`, run on the pass by `edit_pass`) hands a byte to [`edit_key`]:
+// [`EDIT_KEYS`] names timeline_core's verb (`EditorState::verb`, the ONE dispatch the host face calls), on the clip at the
+// playhead of the highest-numbered video track that has one (what the schedule shows). A changed timeline is written back
+// through timeline_core's ONE writer (`edl::write`, titled by the file's stem) and export.rs's `write_file`, and the
+// Player's seek door (`vid::seek`) restarts the job at the playhead over the edited state. [`view_band`]: the picture
+// rect's lower band shows timeline_core's ONE track view (`view::paint_in`, `Role::Tracks`): the host face's pixels.
+// Wire: `[nle] edit <verb> at=<tick> clips=<n> undo=<n> saved=<bytes|refused(..)>`, `[nle] edit <verb> at=<tick> refused
+// (<why>)`, `[nle] view w=<n> h=<n> rows=<n> at=<tick>` (once per seed). Witness: player.rs `tests nle` (`keys=`).
+
+struct Edit {
+    path: String,
+    st: timeline_core::editor::EditorState,
+    said: bool,
+}
+
+static EDIT: crate::sync::Mutex<Option<Edit>> = crate::sync::Mutex::new(None);
+
+/// The kernel face's key bindings (bytes) onto timeline_core's editor verbs: `s` split, `x` / Delete / Backspace delete,
+/// `u` / `z` undo, `Z` redo, `[` / `]` the in point -1 / +1, `{` / `}` the out point -1 / +1, `i` / `o` the in / out point
+/// to the playhead (the host face's meanings; Space and the arrows stay the Player's transport).
+const EDIT_KEYS: [(u8, &str); 13] = [
+    (b's', "split"),
+    (b'x', "delete"),
+    (0x7F, "delete"),
+    (0x08, "delete"),
+    (b'u', "undo"),
+    (b'z', "undo"),
+    (b'Z', "redo"),
+    (b'[', "["),
+    (b']', "]"),
+    (b'{', "{"),
+    (b'}', "}"),
+    (b'i', "mark-in"),
+    (b'o', "mark-out"),
+];
+
+/// The EDL job's open: a fresh EDL (or another path) seeds the Player's editor state; the same path keeps it (a restart
+/// after a seek or an edit) and the job plays ITS timeline. An Encode (export) job neither seeds nor reads it.
+fn edit_seed(jid: u32, path: &str, st: timeline_core::editor::EditorState) -> timeline_core::editor::EditorState {
+    if let super::export::Sink::Encode = super::export::sink(jid) {
+        return st;
+    }
+    let mut g = EDIT.lock();
+    if let Some(e) = g.as_ref().filter(|e| e.path == path) {
+        return timeline_core::editor::EditorState::new(e.st.timeline.clone());
+    }
+    let fresh = timeline_core::editor::EditorState::new(st.timeline.clone());
+    *g = Some(Edit { path: String::from(path), st, said: false });
+    fresh
+}
+
+/// The Player's EDL at `path` has an editor state (the keys are taken).
+pub fn edit_live(path: &str) -> bool {
+    EDIT.try_lock().map(|g| g.as_ref().is_some_and(|e| e.path == path)).unwrap_or(false)
+}
+
+/// The editor verb a key byte names ([`EDIT_KEYS`]).
+pub fn edit_verb(b: u8) -> Option<&'static str> {
+    EDIT_KEYS.iter().find(|k| k.0 == b).map(|k| k.1)
+}
+
+/// The output tick shown at `ms` (the inverse of the job's `out_ms`).
+fn tick_of(tb: timeline_core::Timebase, ms: u64) -> i64 {
+    (ms as i128 * 1_000_000 * tb.den as i128 / (tb.num.max(1) as i128 * 1_000_000_000)) as i64
+}
+
+/// **One editing key** on the Player's EDL at `path`, the playhead at `ms`: the verb on the shared editor state, the EDL
+/// saved back when the timeline changed. `Some(ms)`: the playhead to restart the job at (the seek door); `None`: refused,
+/// unchanged, or no EDL open at `path`.
+pub fn edit_key(path: &str, b: u8, ms: u64) -> Option<u64> {
+    let verb = edit_verb(b)?;
+    let (at, tl, clips, undo, back) = {
+        let mut g = EDIT.lock();
+        let e = g.as_mut().filter(|e| e.path == path)?;
+        let st = &mut e.st;
+        let tb = st.timeline.tb;
+        st.seek(tick_of(tb, ms));
+        let at = st.playhead;
+        if verb != "undo" && verb != "redo" {
+            let top = (0..st.timeline.tracks.len())
+                .rev()
+                .filter(|&i| st.timeline.tracks[i].kind == timeline_core::Kind::Video)
+                .find_map(|i| st.timeline.clip_at(i, at).map(|c| (i, c)));
+            match top {
+                Some((t, i)) => {
+                    let _ = st.select(t, i);
+                }
+                None => st.deselect(),
+            }
+        }
+        let before = st.timeline.clone();
+        match st.verb(verb) {
+            Some(Ok(())) if st.timeline != before => {}
+            Some(Ok(())) => {
+                serial_println!("[nle] edit {} at={} unchanged", verb, at);
+                return None;
+            }
+            Some(Err(why)) => {
+                serial_println!("[nle] edit {} at={} refused ({})", verb, at, why);
+                return None;
+            }
+            None => return None,
+        }
+        let clips: usize = st.timeline.tracks.iter().map(|t| t.clips.len()).sum();
+        (at, st.timeline.clone(), clips, st.undo_depth(), (tb.to_ns(at).max(0) as u64) / 1_000_000)
+    };
+    let leaf = path.rsplit('/').next().unwrap_or(path);
+    let stem = if is_edl(leaf) { &leaf[..leaf.len() - 4] } else { leaf };
+    let saved = match timeline_core::edl::write(&tl, stem) {
+        Ok(text) => match super::export::write_file(path, text.as_bytes()) {
+            Ok(n) => alloc::format!("{}", n),
+            Err(e) => alloc::format!("refused({})", e),
+        },
+        Err(e) => alloc::format!("refused({})", e),
+    };
+    serial_println!("[nle] edit {} at={} clips={} undo={} saved={}", verb, at, clips, undo, saved);
+    Some(back)
+}
+
+/// The Player's editor timeline (the witness reads it).
+pub fn edit_timeline() -> Option<timeline_core::Timeline> {
+    EDIT.lock().as_ref().map(|e| e.st.timeline.clone())
+}
+
+/// The Player closed: its editor state goes (a later open of the same EDL reads the saved file afresh).
+pub fn edit_close() {
+    *EDIT.lock() = None;
+}
+
+/// The present's view band: with an editor state for the live job's EDL, timeline_core's track view (`Role::Tracks`, the
+/// playhead at the presented frame's tick) over the picture rect's lower `RULER_H + rows * ROW_H` rows (at most half
+/// of it); returns the rows left for the picture (`vh` unchanged when there is no view).
+fn view_band(dst: &mut [u32], w: usize, vh: usize, pts_ms: u64) -> usize {
+    use timeline_core::view;
+    let Some(live) = JOB.try_lock().and_then(|g| g.as_ref().map(|j| j.path.clone())) else { return vh };
+    let Some(mut g) = EDIT.try_lock() else { return vh };
+    let Some(e) = g.as_mut().filter(|e| e.path == live) else { return vh };
+    let rows = e.st.timeline.tracks.len();
+    let band = (view::RULER_H as usize + rows * view::ROW_H as usize).min(vh / 2);
+    if band == 0 || w == 0 || dst.len() < vh * w {
+        return vh;
+    }
+    let tb = e.st.timeline.tb;
+    e.st.seek(tick_of(tb, pts_ms));
+    let l = view::Layout::of_role(view::Role::Tracks, w as u32, band as u32, &e.st);
+    let px = pack(&view::paint_in(&e.st, l, view::Order::Rgba, None, None));
+    let y0 = vh - band;
+    dst[y0 * w..vh * w].copy_from_slice(&px);
+    if !e.said {
+        e.said = true;
+        serial_println!("[nle] view w={} h={} rows={} at={}", w, band, rows, e.st.playhead);
+    }
+    y0
 }
