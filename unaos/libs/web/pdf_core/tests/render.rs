@@ -42,6 +42,7 @@ fn render_pdf(bytes: &[u8]) -> (Rendered, TextLog) {
     let pages = doc.pages().unwrap();
     let mut log = TextLog::default();
     let r = pages[0].render(&doc, 72.0, &mut log).unwrap();
+    assert_saved_renders_same(bytes, &r);
     (r, log)
 }
 
@@ -419,4 +420,13 @@ fn transparency_refusals() {
     assert_eq!(px(&r, 5, 35), [0, 255, 0, 255]);
     assert_eq!(px(&r, 25, 15), [0, 0, 255, 255]);
     pin(&r, 0xd3733284beac14fd);
+}
+
+/// PDFWRITE (SR325): every PDF2 fixture saved through `Document::save` and re-parsed renders to the same pixels.
+fn assert_saved_renders_same(bytes: &[u8], r: &Rendered) {
+    let saved = Document::parse(bytes).unwrap().save();
+    let back = Document::parse(&saved).unwrap();
+    let again = back.pages().unwrap()[0].render(&back, 72.0, &mut TextLog::default()).unwrap();
+    assert_eq!((again.pixmap.w, again.pixmap.h), (r.pixmap.w, r.pixmap.h));
+    assert!(again.pixmap.data == r.pixmap.data, "the saved file renders differently");
 }

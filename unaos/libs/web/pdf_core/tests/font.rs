@@ -32,6 +32,7 @@ fn render(pdf: &[u8], fb: Fallback<'_>) -> (Vec<u8>, String) {
     assert_eq!((r.pixmap.w, r.pixmap.h), (W, H));
     let cov = r.pixmap.data.chunks_exact(4).map(|p| 255 - p[0]).collect();
     let text = spans_to_string(&page.text(&doc, &fb));
+    assert_saved_renders_same(pdf, fb, &cov, &text);
     (cov, text)
 }
 
@@ -410,4 +411,18 @@ fn type3_square() {
     assert_eq!(px(&cov, 17, 26), 0);
     assert_eq!(ink(&cov), 2 * 15 * 15);
     assert_eq!(fnv(&cov), 0x726d158504492575);
+}
+
+/// PDFWRITE (SR325): every PDF3 fixture saved through `Document::save` and re-parsed draws the same ink and reads the
+/// same text (the font programs travel as stored streams).
+#[allow(clippy::ptr_arg)] // `&Vec`: `render`'s `cov` takes its type from this call before its own return
+fn assert_saved_renders_same(pdf: &[u8], fb: Fallback<'_>, cov: &Vec<u8>, text: &str) {
+    let saved = Document::parse(pdf).unwrap().save();
+    let doc = Document::parse(&saved).unwrap();
+    let page = &doc.pages().unwrap()[0];
+    let mut sink = GlyphSink::new(&doc, fb);
+    let r = page.render(&doc, 72.0, &mut sink).unwrap();
+    let again: Vec<u8> = r.pixmap.data.chunks_exact(4).map(|p| 255 - p[0]).collect();
+    assert!(&again == cov, "the saved file draws different ink");
+    assert_eq!(spans_to_string(&page.text(&doc, &fb)), text);
 }
