@@ -312,7 +312,7 @@ fn claim_for_io() -> Result<SdLoan, BlockError> {
         Err(SdClaimError::NotReady) => return Err(BlockError::NotReady),
         Err(SdClaimError::Busy) => {}
     }
-    if crate::arch::irqs_masked() {
+    if crate::arch::irqs_masked() || (cfg!(target_arch = "aarch64") && crate::arch::sched::preemptoff::witness().0) { // PREEMPTOFFARM (zenbook-ledger Z67): a preempt-off holder (the FAT/DIR spans) takes the bounded spin too, never the hlt wait on a same-core preempted holder. LINE-NEUTRAL fold
         // Masked: spin on the O(1) claim under a CNTPCT deadline — never `hlt` (we are masked), never
         // the mutex. `deadline_ms`/`expired` are this driver's own bounded-wait discipline.
         let dl = deadline_ms(MASKED_CLAIM_BUDGET_MS);

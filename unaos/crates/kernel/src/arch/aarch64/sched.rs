@@ -11235,3 +11235,119 @@ pub fn spawn_joinable_stack(name: &'static str, entry: fn(usize), arg: usize, cp
     let id = spawn_inner(name, entry, arg, cpu, PRIO_NORMAL, Some(done.clone()), stack_bytes);
     JoinHandle { done, id }
 }
+
+// ══ PREEMPTOFFARM (zenbook-ledger Z67) — `preemptoff`, x86's API on the aarch64 count COMPGATE already keeps ══
+// BP-cores-23's preempt-off count exists on this arch: COMPGATE's `NOPREEMPT` (above), honoured by BOTH involuntary switch
+// paths (`timer_preempt`, `ipi_preempt`) through `nopreempt_held`, above `kill_check_current`. This module is x86's
+// `sched::preemptoff` API (`disable` / `enable` / `scoped` / `witness` / `audit_selftest`) over that ONE counter — no
+// second count, so `crate::arch::sched::preemptoff::scoped` compiles on both arches. Every take here is MASKED around the
+// core read and the increment (COMPGATE's `preempt_hold` reads the core unmasked: a migration window this closes for its
+// callers). Holders today: the FAT/DIR RMW spans (`fs/fat.rs` `with_fat_lock` / `with_dir_lock`, were
+// `without_interrupts`), PSTATE.I as the caller had it. Semantics that differ from x86, owed by name (cores.md §5):
+// PREEMPTOFF-ARM-QUANTUM (the quantum is not consumed while held; no FIRED counter; no dispatch-time leak reset).
+pub mod preemptoff {
+    use super::{current_tid_relaxed, meter_current_cpu, nopreempt_held, NOPREEMPT, NUM_CPUS};
+    use core::sync::atomic::{AtomicBool, Ordering};
+
+    /// The FAT/DIR spans converted from `without_interrupts` (the aarch64 audit's `converted_fat=`).
+    pub const CONVERTED_FAT: u32 = 2;
+
+    static ENABLE_ZERO_SAID: AtomicBool = AtomicBool::new(false);
+
+    /// This core's slot, clamped exactly as `preempt_hold` / `preempt_hold_standing` clamp it (the slot read is the slot
+    /// written).
+    #[inline]
+    fn slot() -> usize {
+        meter_current_cpu().min(NUM_CPUS - 1)
+    }
+
+    /// Hold this core's preempt-off count (nests; saturates). Masked so the caller cannot migrate between reading its core
+    /// and writing that core's count.
+    pub fn disable() {
+        crate::arch::without_interrupts(|| {
+            let _ = NOPREEMPT[slot()].fetch_update(Ordering::AcqRel, Ordering::Relaxed, |n| Some(n.saturating_add(1)));
+        });
+    }
+
+    /// Release one hold. An enable with the count already 0 is refused by name (once a boot) and changes nothing.
+    pub fn enable() {
+        let refused = crate::arch::without_interrupts(|| {
+            let c = slot();
+            match NOPREEMPT[c].fetch_update(Ordering::AcqRel, Ordering::Relaxed, |n| n.checked_sub(1)) {
+                Ok(_) => None,
+                Err(_) => Some(c),
+            }
+        });
+        if let Some(cpu) = refused {
+            if !ENABLE_ZERO_SAID.swap(true, Ordering::AcqRel) {
+                serial_println!("[sched] preempt_enable refused cpu={} — count already 0 (unpaired enable)", cpu);
+            }
+        }
+    }
+
+    /// The `without_interrupts`-shaped preempt-off span: COMPGATE's own guard (`preempt_hold`), taken masked, held around
+    /// `f`, interrupts as the caller had them. The guard's Drop releases the core it took, so an unwinding `f` still does.
+    pub fn scoped<R>(f: impl FnOnce() -> R) -> R {
+        let _hold = crate::arch::without_interrupts(super::preempt_hold);
+        f()
+    }
+
+    /// `(this core's preempt-off count is held, the current task id or u64::MAX)`, read masked — x86's signature. The
+    /// block claimants read `.0` as F3's must-not-wait predicate beside `irqs_masked()`.
+    pub fn witness() -> (bool, u64) {
+        crate::arch::without_interrupts(|| {
+            let c = slot();
+            let held = nopreempt_held(c);
+            let tid = match current_tid_relaxed(c) {
+                0 => u64::MAX,
+                id => id,
+            };
+            (held, tid)
+        })
+    }
+
+    /// `tests preemptaudit` (aarch64): from this unmasked task, read PSTATE.I and the count inside both FAT spans
+    /// (`fs::fat::preemptoff_span_probe`, no I/O); again from a masked caller (the span must leave it masked); then the
+    /// count must be free.
+    pub fn audit_selftest() {
+        if crate::arch::irqs_masked() {
+            serial_println!(":: PREEMPTAUDIT: -> SKIP(masked) ::");
+            return;
+        }
+        let ((fat_on, fat_held), (dir_on, dir_held)) = crate::fs::fat::preemptoff_span_probe();
+        let ((m_fat_on, _), (m_dir_on, _)) = crate::arch::without_interrupts(crate::fs::fat::preemptoff_span_probe);
+        let masked_kept = !m_fat_on && !m_dir_on;
+        let released = !witness().0;
+        let reason = if !fat_on {
+            Some("fat-masked")
+        } else if !dir_on {
+            Some("dir-masked")
+        } else if !fat_held || !dir_held {
+            Some("not-held")
+        } else if !masked_kept {
+            Some("unmasked")
+        } else if !released {
+            Some("leaked")
+        } else {
+            None
+        };
+        let ok = |b: bool, y: &'static str, n: &'static str| if b { y } else { n };
+        match reason {
+            None => serial_println!(
+                ":: PREEMPTAUDIT: arch=aarch64 converted_fat={} fat_irq_on=ok dir_irq_on=ok fat_held=ok dir_held=ok masked_kept=ok released=ok -> PASS ::",
+                CONVERTED_FAT
+            ),
+            Some(r) => serial_println!(
+                ":: PREEMPTAUDIT: arch=aarch64 converted_fat={} fat_irq_on={} dir_irq_on={} fat_held={} dir_held={} masked_kept={} released={} -> FAIL reason={} ::",
+                CONVERTED_FAT,
+                ok(fat_on, "ok", "masked"),
+                ok(dir_on, "ok", "masked"),
+                ok(fat_held, "ok", "free"),
+                ok(dir_held, "ok", "free"),
+                ok(masked_kept, "ok", "unmasked"),
+                ok(released, "ok", "leaked"),
+                r
+            ),
+        }
+    }
+}

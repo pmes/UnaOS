@@ -1024,7 +1024,7 @@ static FAT_MUTATION: crate::sync::Mutex<()> = crate::sync::Mutex::new(());
 #[cfg(target_arch = "aarch64")]
 #[inline]
 fn with_fat_lock<R>(f: impl FnOnce() -> R) -> R {
-    crate::arch::without_interrupts(|| {
+    crate::arch::sched::preemptoff::scoped(|| { // PREEMPTOFFARM (zenbook-ledger Z67): preempt-off, PSTATE.I as the caller had it (was without_interrupts; the doc above predates it: no ISR takes the lock, the claimants inside treat a preempt-off holder as masked). LINE-NEUTRAL fold
         let _guard = FAT_MUTATION.lock();
         f()
     })
@@ -1130,7 +1130,7 @@ static DIR_MUTATION: crate::sync::Mutex<()> = crate::sync::Mutex::new(());
 #[cfg(target_arch = "aarch64")]
 #[inline]
 fn with_dir_lock<R>(f: impl FnOnce() -> R) -> R {
-    crate::arch::without_interrupts(|| {
+    crate::arch::sched::preemptoff::scoped(|| { // PREEMPTOFFARM (zenbook-ledger Z67): preempt-off, PSTATE.I as the caller had it (was without_interrupts; the doc above predates it: no ISR takes the lock, the claimants inside treat a preempt-off holder as masked). LINE-NEUTRAL fold
         let _guard = DIR_MUTATION.lock();
         f()
     })
@@ -7085,3 +7085,13 @@ fn push_nvme_sources(out: &mut alloc::vec::Vec<BlockSource>) {
 #[cfg(not(all(target_arch = "x86_64", feature = "nvme")))]
 #[inline(always)]
 fn push_nvme_sources(_out: &mut alloc::vec::Vec<BlockSource>) {}
+
+// ── PREEMPTOFFARM (zenbook-ledger Z67) — `tests preemptaudit`'s FAT leg. FILE-TAIL append: no line above moves. ──
+
+/// PREEMPTOFFARM: `((irq_on, held) inside [`with_fat_lock`], (irq_on, held) inside [`with_dir_lock`])` — PSTATE.I and this
+/// core's preempt-off count read INSIDE each span with a closure that touches no sector (the spans' locks only).
+#[cfg(target_arch = "aarch64")]
+pub fn preemptoff_span_probe() -> ((bool, bool), (bool, bool)) {
+    let probe = || (!crate::arch::irqs_masked(), crate::arch::sched::preemptoff::witness().0);
+    (with_fat_lock(probe), with_dir_lock(probe))
+}
