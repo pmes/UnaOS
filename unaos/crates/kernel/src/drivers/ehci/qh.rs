@@ -2,8 +2,8 @@
 // Copyright (C) 2026 The Architect & Una
 
 //! EHCI-3 schedule structures — Queue Heads, qTDs, the periodic frame list, and small DMA
-//! buffers. All controller-visible memory lives in STATIC pools inside the kernel image (the
-//! driver's DMA needs are small and fixed), and every pointer handed to the controller is
+//! buffers. All controller-visible memory lives in ONE pool pair from the kernel's DMA allocator
+//! (`dma_pool`, file tail; DMAALLOCEHCI B989 — it was a kernel-image static), and every pointer handed to the controller is
 //! resolved through the live page tables (`phys_of` → translate()) — never the heap's
 //! virt==phys shortcut. Probe-3/5 history: heap-resident schedules at ~538 MB HSE-master-
 //! aborted on the metal Panther Point EHCI (while xHCI DMA'd the same region fine); the
@@ -144,9 +144,9 @@ pub struct IntSlot {
     pub buf: IntBuf,
 }
 
-/// Static DMA pool for one controller — probe-5 metal experiment AND the permanent shape: the
-/// driver's DMA needs are small and fixed, so they live in the kernel image (low physical
-/// memory, where firmware's own EHCI DMA demonstrably worked) instead of the heap. All
+/// DMA pool for one controller — the driver's DMA needs are small and fixed (probe-5 put them in
+/// the kernel image; DMAALLOCEHCI B989 moved them onto `arch::memory::dma::alloc`, below 4 GiB,
+/// at first use, `dma_pool` at the file tail; heap pool + periodic engine is unflown on metal). All
 /// controller-visible pointers are derived via translate() rather than the heap's virt==phys
 /// shortcut, so this is correct under any kernel mapping.
 #[repr(C, align(4096))]
@@ -193,9 +193,9 @@ pub const MAX_CONTROLLERS: usize = 2;
 /// again. Cost is 2 static `IntSlot`s per controller in the kernel image.
 pub const MAX_INT_EPS: usize = 6;
 
-/// The pools (one per EHCI function; the 2012 rMBP has exactly two). Extra functions beyond
-/// MAX_CONTROLLERS are skipped with a trace by the caller.
-pub static mut DMA_POOLS: [DmaPool; MAX_CONTROLLERS] = unsafe { core::mem::zeroed() };
+/// The pools' base (one per EHCI function; the 2012 rMBP has exactly two), 0 until `dma_pool` (file tail) fills it once.
+/// Extra functions beyond MAX_CONTROLLERS are skipped with a trace by the caller.
+static POOLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0); // DMAALLOCEHCI (B989): was the .bss `DMA_POOLS` array
 
 /// Fill one qTD in place: `total` bytes at `buf_phys` (0 for a zero-length status stage), PID +
 /// data-toggle + IOC from `flags`, next pointer chained or terminated. Marks it Active.
@@ -208,4 +208,37 @@ pub unsafe fn write_qtd(qtd: *mut Qtd, next_phys: u32, flags: u32, total: u32, b
         &mut (*qtd).token,
         QTD_ACTIVE | QTD_CERR3 | (total << QTD_TOTAL_SHIFT) | flags,
     );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+// DMAALLOCEHCI (rmbp-ledger B989) — THE POOLS FROM THE KERNEL'S ONE DMA ALLOCATOR (tail-appended).
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+/// Controller `idx`'s `DmaPool`. The first call takes ONE `arch::memory::dma::alloc` for the whole
+/// `[DmaPool; MAX_CONTROLLERS]` (zeroed, as the .bss was; page-aligned; ending below 4 GiB, which
+/// `phys_of` still checks per field) and publishes its base in `POOLS` once; a racing loser gives
+/// its buffer back. Never freed: the controllers own it for the boot. `None` for an index past
+/// MAX_CONTROLLERS or when the allocator refuses (the callers' "controller skipped" paths).
+pub fn dma_pool(idx: usize) -> Option<*mut DmaPool> {
+    use core::sync::atomic::Ordering;
+    if idx >= MAX_CONTROLLERS {
+        return None;
+    }
+    let mut base = POOLS.load(Ordering::Acquire);
+    if base == 0 {
+        let b = crate::arch::memory::dma::alloc(
+            core::mem::size_of::<[DmaPool; MAX_CONTROLLERS]>(),
+            core::mem::align_of::<DmaPool>(),
+            true,
+        )?;
+        let va = b.va;
+        match POOLS.compare_exchange(0, va, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => base = va,
+            Err(won) => {
+                // SAFETY: allocated just above and never published, so no controller was handed it.
+                unsafe { crate::arch::memory::dma::free(b) };
+                base = won;
+            }
+        }
+    }
+    Some((base as *mut DmaPool).wrapping_add(idx))
 }

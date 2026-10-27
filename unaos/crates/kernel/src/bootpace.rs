@@ -421,6 +421,6 @@ pub fn boot_line() {
     let total = Dur { raw: Some(if fw != 0 { now } else { now.wrapping_sub(start) }), hz };
     serial_println!(":: BOOT: firmware->loader={} loader->desktop={} total={} lines={} {} ::", fw_d, ld, total, lines, crate::fs::bootstep::boot_fields()); // SPLASHSTALL (B510): `steps=<n> slowest=<name>:<ms> over=<n>` — the steps under the splash ended by now (this line prints inside `stage-resolve`; `tests splash` has the whole set)
     crate::perf::note_boot(total.raw.unwrap_or(0), hz); // PERFREVIEW (B443)
-    crate::census::boot_banner(); #[cfg(target_arch = "x86_64")] crate::arch::memory::dma::census(); #[cfg(feature = "selfdiag")] crate::bootwit::mark_desktop(); // SELFDIAG M1 (B324): arm the desktop-ready boot-log write (same-line fold)
+    crate::census::boot_banner(); crate::arch::memory::dma::census(); #[cfg(feature = "selfdiag")] crate::bootwit::mark_desktop(); // SELFDIAG M1 (B324): arm the desktop-ready boot-log write (same-line fold)
     crate::tests::register("quietboot", crate::tests::quietboot_selftest);
 }
