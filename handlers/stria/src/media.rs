@@ -37,7 +37,7 @@ use gneiss_pal::dsp::audio::{self as ac, AudioDecoder};
 use gneiss_pal::dsp::audio_track::{AudioTrackDecoder, Timing, audio_decoder_for};
 use gneiss_pal::dsp::avsync::{Decision, DriftMeter, DriftReport, MasterClock, SchedStats, Scheduler, TimeSource};
 use gneiss_pal::dsp::demux::{Demuxer, Packet, Track, TrackKind};
-use gneiss_pal::dsp::video::{Frame, TestPattern, VideoDecoder, decoder_for, reorder_depth};
+use gneiss_pal::dsp::video::{Frame, TestPattern, VideoDecoder, decoder_for, reorder_depth, colour_of};
 
 /// Where presented frames (and the audio meters) go.
 pub trait FrameSink {
@@ -308,9 +308,9 @@ impl Player {
         let mut audio_start_ns = 0i64;
         let opened = match pre {
             Some(d) => Ok(d),
-            // DEMUXWIRE (SR213): a Matroska video track's decode times from its codec's reorder depth (B-frames play in decode order).
+            // DEMUXWIRE (SR213): a Matroska video track's decode times from its codec's reorder depth (B-frames play in decode order); NLEPROBEHDRWIRE (SR305): the bitstream's colour where the container states none.
             None => Demuxer::open(bytes.clone()).map(|mut d| {
-                d.derive_dts(reorder_depth);
+                d.derive_dts(reorder_depth); d.fill_colour(colour_of);
                 d
             }),
         };
@@ -492,6 +492,11 @@ impl Player {
     /// times come from (`decode_time`) and the composition offsets the Player decodes by. Read-only.
     pub fn survey(&self) -> Option<gneiss_pal::dsp::demux::survey::Survey> {
         self.demux.as_ref().map(|d| d.survey())
+    }
+    /// NLEPROBEHDRWIRE (SR305): the video track's colour (container, else the bitstream's through `fill_colour(colour_of)`);
+    /// `None` without a video track or a stated colour. Read-only: the Player converts nothing by it yet (HEVCHEIC-COLR).
+    pub fn colour(&self) -> Option<&gneiss_pal::dsp::demux::colour::Colour> {
+        self.vtrack.as_ref()?.colour.as_ref()
     }
     pub fn play(&mut self) {
         self.running = true;

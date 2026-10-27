@@ -597,3 +597,93 @@ fn nle3e_a_transition_follows_an_insert_and_renders_there() {
     assert_eq!(sink.frames[0].1, model);
     println!("nle3e: moved_at=30 frame34=blend");
 }
+
+// ---------------------------------------------------------------------------------------------------
+// NLEPROBEHDRWIRE (LEDGER SR305): the colour reaches the editor's open (`OpenReport`, what `nle schedule` prints) and the
+// Player (`Player::colour`) through `dsp::video::colour_of` passed to `fill_colour` beside `reorder_depth`.
+// ---------------------------------------------------------------------------------------------------
+
+use gneiss_pal::dsp::demux::colour::{Colour, Light, Mastering};
+use gneiss_pal::dsp::video::colour_of;
+
+/// [`AVCC_REORDER2`]'s SPS with a VUI video_signal_type: video_format 5, limited range, colour_description 1/1/1 (BT.709),
+/// then the same bitstream_restriction (reorder 2, dpb 3): demux_core's seek_index
+/// `sps_rbsp_vui(Some((2, 3)), 0, Some((1, 1, 1, false)))` in `avcc(..)`'s record (no emulation-prevention byte needed).
+const AVCC_VUI709_REORDER2: [u8; 31] = [
+    0x01, 0x4D, 0x00, 0x1E, 0xFF, 0xE1, 0x00, 0x10, 0x67, 0x4D, 0x00, 0x1E, 0xED, 0x88, 0xF4, 0xD4, 0x04, 0x04, 0x04, 0x1E,
+    0x11, 0x08, 0xB2, 0x40, 0x01, 0x00, 0x04, 0x68, 0xCE, 0x38, 0x80,
+];
+
+/// BT.2020 PQ, limited range, ST 2086 mastering (1000 / 0.005 cd/m²) and content light levels 1000 / 400 (NLEPROBEHDR's).
+fn bt2020_pq() -> Colour {
+    Colour {
+        primaries: 9,
+        transfer: 16,
+        matrix: 9,
+        full_range: Some(false),
+        mastering: Some(Mastering { primaries: [[35400, 14600], [8500, 39850], [6550, 2300]], white: [15635, 16450], max_lum: 10_000_000, min_lum: 50 }),
+        light: Some(Light { max_cll: 1000, max_fall: 400 }),
+    }
+}
+
+fn avc_vui709() -> MediaTrack {
+    let mut t = avc_bframes();
+    t.spec.config = AVCC_VUI709_REORDER2.to_vec();
+    t
+}
+
+#[test]
+fn nleprobehdrwire_editor_and_player_report_a_bt2020_pq_mp4() {
+    let x = build::Mp4Extras { colour: vec![(1, bt2020_pq())], ..Default::default() };
+    let file = synth_source_with(0, 50, 25, &x);
+    let tl = Timeline::new(25);
+    let mut src = Sources::new(&tl);
+    src.add(SourceId(0), file.clone()).unwrap();
+    src.add(SourceId(1), synth_source(0, 50, 25)).unwrap();
+    let r = src.open_report(SourceId(0)).unwrap();
+    assert_eq!(r.colour, Some(bt2020_pq()));
+    // What `nle schedule` prints after `reel=<r> ` (tools/nle: `println!("reel={} {r}", ..)`).
+    assert_eq!(r.to_string(), "open=full dts=stored edits=0 applied=first-only colour=9/16/9/limited mdcv clli");
+    // A reel that states no colour prints the open line it printed before the wire.
+    let plain = src.open_report(SourceId(1)).unwrap();
+    assert_eq!((plain.colour, plain.to_string().contains("colour=")), (None, false), "{plain}");
+
+    let p = Player::open(file, Arc::new(ManualTime::new()), None, 60).unwrap();
+    assert_eq!(p.colour(), Some(&bt2020_pq()));
+    let q = Player::open(synth_source(0, 50, 25), Arc::new(ManualTime::new()), None, 60).unwrap();
+    assert_eq!(q.colour(), None);
+    println!("nleprobehdrwire: reel=AX {r}");
+}
+
+#[test]
+fn nleprobehdrwire_a_no_colr_h264_reel_falls_back_to_the_vui() {
+    let bt709 = Colour { primaries: 1, transfer: 1, matrix: 1, full_range: Some(false), mastering: None, light: None };
+    let mkv = build::mkv(&[avc_vui709()], &MkvOptions { webm: false, ..Default::default() });
+    let mp4 = build::mp4(&[avc_vui709()], &build::Mp4Options::default());
+    // The container wins: an MP4 whose colr says BT.2020 PQ keeps it over the SPS's BT.709.
+    let pq_only = Colour { mastering: None, light: None, ..bt2020_pq() };
+    let x = build::Mp4Extras { colour: vec![(1, pq_only)], ..Default::default() };
+    let tagged = build::mp4_with(&[avc_vui709()], &build::Mp4Options::default(), &x);
+
+    let tl = Timeline::new(25);
+    let mut src = Sources::new(&tl);
+    src.add(SourceId(0), mkv.clone()).unwrap();
+    src.add(SourceId(1), mp4.clone()).unwrap();
+    src.add(SourceId(2), tagged.clone()).unwrap();
+    let r = src.open_report(SourceId(0)).unwrap();
+    assert_eq!(r.to_string(), "open=full dts=derived:2 edits=0 applied=first-only colour=1/1/1/limited", "{r:?}");
+    let m = src.open_report(SourceId(1)).unwrap();
+    assert!(m.to_string().ends_with(" colour=1/1/1/limited"), "{m}");
+    assert_eq!(src.open_report(SourceId(2)).unwrap().colour, Some(pq_only));
+
+    for (file, want) in [(mkv, bt709), (mp4, bt709), (tagged, pq_only)] {
+        let p = Player::open(file, Arc::new(ManualTime::new()), None, 60).unwrap();
+        assert_eq!(p.colour(), Some(&want));
+    }
+    // The dispatch itself reads the SPS VUI; the reorder depth beside it is unchanged by the colour description.
+    let t = avc_vui709();
+    let track = gneiss_pal::dsp::demux::Demuxer::open(build::mkv(&[t], &MkvOptions { webm: false, ..Default::default() })).unwrap().tracks()[0].clone();
+    assert_eq!(colour_of(&track), Some(bt709));
+    assert_eq!(reorder_depth(&track), Some(2));
+    println!("nleprobehdrwire: vui {r}");
+}
