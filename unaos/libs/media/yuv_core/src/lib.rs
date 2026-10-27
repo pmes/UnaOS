@@ -102,7 +102,7 @@ pub enum Chroma {
     /// fractional bits per subsampled axis.
     Bilinear,
     /// Bilinear's 9-3-3-1 sum rounded half up to the sample BEFORE the matrix: libwebp's `UpsampleRgbaLinePair` (VP8COLOURONE
-    /// SR356). libjpeg's fancy filters bias odd outputs down (+8 / +7) and are not this.
+    /// SR356). libjpeg's fancy filters are the same kernel with their own parity bias: [`fancy`] (YUVFANCY SR369).
     Fancy,
 }
 
@@ -155,19 +155,9 @@ pub fn to_rgba<T: Copy + Into<i32>>(p: &Picture<'_, T>, m: Matrix, up: Chroma, d
         if !bil || (sx == 0 && sy == 0) {
             return plane[(row >> sy) * p.uv_stride + (col >> sx)].into();
         }
-        let near_far = |pos: usize, ss: u32, len: usize| -> (usize, usize) {
-            let near = pos >> ss;
-            let far = if ss == 0 { near } else if pos & 1 == 0 { near.saturating_sub(1) } else { (near + 1).min(len - 1) };
-            (near, far)
-        };
-        let (xn, xf) = near_far(col, sx, cw);
-        let (yn, yf) = near_far(row, sy, ch);
-        let hrow = |r: usize| -> i32 {
-            let a: i32 = plane[r * p.uv_stride + xn].into();
-            if sx == 0 { a } else { 3 * a + Into::<i32>::into(plane[r * p.uv_stride + xf]) }
-        };
-        let sum = if sy == 0 { hrow(yn) } else { 3 * hrow(yn) + hrow(yf) };
-        if rf { (sum + ((1 << fs) >> 1)) >> fs } else { sum }
+        // YUVFANCY (SR369): the ONE 9-3-3-1 kernel is [`fancy_sum`] / [`fancy`] at the file tail; Fancy is libwebp's, half at both parities.
+        let h = (1i32 << fs) >> 1;
+        if rf { fancy(plane, p.uv_stride, (cw, ch), p.ss, (row, col), (h, h)) } else { fancy_sum(plane, p.uv_stride, (cw, ch), p.ss, (row, col)) }
     };
     let (ys, cs) = if p.full { (((1i64 << n) - 1), ((1i64 << n) - 1)) } else { (219i64 << (n - 8), 224i64 << (n - 8)) };
     for row in 0..p.h {
@@ -340,5 +330,96 @@ mod tests {
         to_rgba(&p, Matrix::Kr(KR_KB_709), Chroma::Fancy, false, &mut fancy);
         to_rgba(&q, Matrix::Kr(KR_KB_709), Chroma::Nearest, false, &mut full);
         assert_eq!(fancy, full);
+    }
+}
+
+/// YUVFANCY (LEDGER SR369): THE ONE chroma upsampling kernel, moved out of [`to_rgba`]'s loop byte for byte. The chroma
+/// sample at luma `(row, col)` of a plane `stride` samples per row, `cw x ch` valid, subsampled by `(sx, sy)`: the 9-3-3-1
+/// sum of centre-sited chroma (3-1 per subsampled axis, the sample itself on an axis that is not), edges clamped, at 2^fs
+/// with fs = 2 per subsampled axis. [`Chroma::Bilinear`] carries it into the matrix unrounded; [`fancy`] rounds it.
+#[inline]
+pub fn fancy_sum<T: Copy + Into<i32>>(plane: &[T], stride: usize, (cw, ch): (usize, usize), (sx, sy): (u32, u32), (row, col): (usize, usize)) -> i32 {
+    let near_far = |pos: usize, ss: u32, len: usize| -> (usize, usize) {
+        let near = pos >> ss;
+        let far = if ss == 0 { near } else if pos & 1 == 0 { near.saturating_sub(1) } else { (near + 1).min(len - 1) };
+        (near, far)
+    };
+    let (xn, xf) = near_far(col, sx, cw);
+    let (yn, yf) = near_far(row, sy, ch);
+    let hrow = |r: usize| -> i32 {
+        let a: i32 = plane[r * stride + xn].into();
+        if sx == 0 { a } else { 3 * a + Into::<i32>::into(plane[r * stride + xf]) }
+    };
+    if sy == 0 { hrow(yn) } else { 3 * hrow(yn) + hrow(yf) }
+}
+
+/// YUVFANCY (SR369): [`fancy_sum`] rounded ONCE to the sample, `(sum + bias) >> fs`, the bias the caller's `(even, odd)` by
+/// the parity of `col` when the plane is subsampled across (`sx != 0`), else of `row`; the sample itself when nothing is
+/// subsampled. The caller chooses the pair for its subsampling: libwebp's `UpsampleRgbaLinePair` is (8, 8) at 4:2:0 (half
+/// at both parities: [`Chroma::Fancy`]); libjpeg's `h2v2_fancy_upsample` is (8, 7), its `h2v1_fancy_upsample` (1, 2) by
+/// column and `h1v2_fancy_upsample` (1, 2) by row (pixel_core's JPEG upsampler).
+#[inline]
+pub fn fancy<T: Copy + Into<i32>>(plane: &[T], stride: usize, dims: (usize, usize), ss: (u32, u32), pos: (usize, usize), (even, odd): (i32, i32)) -> i32 {
+    let fs: u32 = (if ss.0 != 0 { 2 } else { 0 }) + (if ss.1 != 0 { 2 } else { 0 });
+    let sum = fancy_sum(plane, stride, dims, ss, pos);
+    if fs == 0 {
+        return sum;
+    }
+    let par = if ss.0 != 0 { pos.1 } else { pos.0 };
+    (sum + if par & 1 == 0 { even } else { odd }) >> fs
+}
+
+#[cfg(test)]
+mod yuvfancy_tests {
+    //! YUVFANCY (SR369) KATs: the one kernel under libwebp's and libjpeg's bias pairs, by hand from their formulas.
+    use super::*;
+
+    #[test]
+    fn yuvfancy_libwebp_and_libjpeg_bias_by_hand() {
+        // A 4x2 4:2:0 picture: chroma 2x1 = [10, 12] (one row, so the vertical 3-1 sees it twice). Sums at 2^4:
+        // col 0 16*10 = 160, col 1 4*(3*10 + 12) = 168, col 2 4*(3*12 + 10) = 184, col 3 16*12 = 192.
+        // libwebp (8, 8): 170>>4, 176>>4, 192>>4, 200>>4 = 10 11 12 12. libjpeg h2v2 (8, 7): col 1 is odd, 175>>4 = 10.
+        let c = [10u8, 12];
+        let row = |r: usize, b: (i32, i32)| -> [i32; 4] { core::array::from_fn(|x| fancy(&c, 2, (2, 1), (1, 1), (r, x), b)) };
+        for r in 0..2 {
+            assert_eq!(row(r, (8, 8)), [10, 11, 12, 12], "libwebp row {r}");
+            assert_eq!(row(r, (8, 7)), [10, 10, 12, 12], "libjpeg h2v2 row {r}");
+        }
+        assert_eq!(fancy_sum(&c, 2, (2, 1), (1, 1), (0, 1)), 168);
+    }
+
+    #[test]
+    fn yuvfancy_1d_bias_by_row_and_column() {
+        // [10, 12] 2:1 on one axis. Sums at 2^2: 40, 42 (3*10 + 12), 46 (3*12 + 10), 48.
+        // libjpeg (1, 2): 41>>2, 44>>2, 47>>2, 50>>2 = 10 11 11 12; half (2, 2): 10 11 12 12.
+        let c = [10u8, 12];
+        let h2v1: [i32; 4] = core::array::from_fn(|x| fancy(&c, 2, (2, 1), (1, 0), (0, x), (1, 2)));
+        assert_eq!(h2v1, [10, 11, 11, 12], "h2v1 by column");
+        let half: [i32; 4] = core::array::from_fn(|x| fancy(&c, 2, (2, 1), (1, 0), (0, x), (2, 2)));
+        assert_eq!(half, [10, 11, 12, 12]);
+        // h1v2: the same column of two samples (stride 1), the parity is the ROW's (col 0 is always even).
+        let h1v2: [i32; 4] = core::array::from_fn(|y| fancy(&c, 1, (1, 2), (0, 1), (y, 0), (1, 2)));
+        assert_eq!(h1v2, [10, 11, 11, 12], "h1v2 by row");
+        // Nothing subsampled: the sample, whatever the bias.
+        assert_eq!(fancy(&c, 2, (2, 1), (0, 0), (0, 1), (8, 7)), 12);
+    }
+
+    #[test]
+    fn yuvfancy_fancy_is_to_rgbas_fancy() {
+        // to_rgba's Chroma::Fancy over a 7x5 4:2:0 gradient == Chroma::Nearest over full planes built by fancy(.., (8, 8)).
+        let (w, h, cw, ch) = (7usize, 5usize, 4usize, 3usize);
+        let y: [u8; 35] = core::array::from_fn(|i| ((i % w) * 31 + (i / w) * 17 + 16) as u8);
+        let u: [u8; 12] = core::array::from_fn(|i| ((i % cw) * 53 + (i / cw) * 29 + 7) as u8);
+        let v: [u8; 12] = core::array::from_fn(|i| (250 - (i % cw) * 41 - (i / cw) * 23) as u8);
+        let p = Picture { w, h, y: &y, u: &u, v: &v, y_stride: w, uv_stride: cw, ss: (1, 1), mono: false, bit_depth: 8, full: false };
+        let fu: [u8; 35] = core::array::from_fn(|i| fancy(&u, cw, (cw, ch), (1, 1), (i / w, i % w), (8, 8)) as u8);
+        let fv: [u8; 35] = core::array::from_fn(|i| fancy(&v, cw, (cw, ch), (1, 1), (i / w, i % w), (8, 8)) as u8);
+        let q = Picture { u: &fu, v: &fv, uv_stride: w, ss: (0, 0), ..p };
+        for m in [Matrix::Kr(KR_KB_601), Matrix::Kr(KR_KB_709)] {
+            let (mut a, mut b) = ([0u8; 35 * 4], [0u8; 35 * 4]);
+            to_rgba(&p, m, Chroma::Fancy, false, &mut a);
+            to_rgba(&q, m, Chroma::Nearest, false, &mut b);
+            assert_eq!(a, b, "{m:?}");
+        }
     }
 }
