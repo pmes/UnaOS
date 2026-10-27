@@ -30,6 +30,10 @@
 //! the last keyframe of the reference track at or before a time. Times are in each track's
 //! [`Timebase`]; [`Track::to_ns`] converts.
 //!
+//! [`survey`] is the editor's probe (NLEPROBE, SR195): one [`survey::Survey`] per file, read from the same
+//! tables; [`Demuxer::keyframe_before`] and [`Demuxer::samples_from`] are the editor's two seek reads, which
+//! never move the playback cursor.
+//!
 //! [`build`] holds minimal *writers* for both containers — the test media the KATs and Stria's
 //! test-pattern pipeline are made from, and the remux path that lets Chromium act as an oracle for
 //! fragmented MP4 and WebM built around a real AV1 stream.
@@ -51,6 +55,8 @@ pub mod mime;
 pub mod facts;
 pub mod mp4;
 mod read;
+/// NLEPROBE (SR195): the editor's probe of a file — streams, time bases, keyframe index, composition offsets.
+pub mod survey;
 /// AETHERMEDIA2 (SR134): WebVTT for `<track>`.
 pub mod vtt;
 
@@ -458,21 +464,7 @@ impl Demuxer {
             return None;
         }
         let tb = self.tracks[ref_idx].timebase;
-        let mut best: Option<(usize, i64)> = None;
-        let mut first: Option<(usize, i64)> = None;
-        for (i, s) in self.order.iter().enumerate() {
-            if s.track_index != ref_idx || !s.keyframe {
-                continue;
-            }
-            let p = tb.to_ns(s.pts);
-            if first.is_none() {
-                first = Some((i, p));
-            }
-            if p <= target_ns && best.is_none_or(|(_, bp)| p >= bp) {
-                best = Some((i, p));
-            }
-        }
-        let (i, p) = best.or(first)?;
+        let (i, p) = self.key_at_or_before(ref_idx, target_ns)?;
         let d = tb.to_ns(self.order[i].dts);
         // First index (any track) whose decode time reaches the keyframe's; the keyframe itself
         // is at or after it, so the reference track restarts exactly on its keyframe.
@@ -488,6 +480,56 @@ impl Demuxer {
         self.pos = start;
         Some(p)
     }
+
+    /// NLEPROBE (SR195): THE keyframe search [`Demuxer::seek_track`] and the editor's reads share — the index into
+    /// [`Demuxer::samples`] of the last keyframe of track `ref_idx` whose presentation time is <= `target_ns`
+    /// (the first keyframe when none is), and that keyframe's pts in ns.
+    fn key_at_or_before(&self, ref_idx: usize, target_ns: i64) -> Option<(usize, i64)> {
+        let tb = self.tracks.get(ref_idx)?.timebase;
+        let mut best: Option<(usize, i64)> = None;
+        let mut first: Option<(usize, i64)> = None;
+        for (i, s) in self.order.iter().enumerate() {
+            if s.track_index != ref_idx || !s.keyframe {
+                continue;
+            }
+            let p = tb.to_ns(s.pts);
+            if first.is_none() {
+                first = Some((i, p));
+            }
+            if p <= target_ns && best.is_none_or(|(_, bp)| p >= bp) {
+                best = Some((i, p));
+            }
+        }
+        best.or(first)
+    }
+
+    /// NLEPROBE (SR195), the editor's first read: SEEK-TO-KEYFRAME-BEFORE(t). The index into [`Demuxer::samples`]
+    /// of the last keyframe of track `track_index` presented at or before `target_ns` (the first keyframe when t
+    /// precedes them all), and its pts in ns. Does not move the playback cursor.
+    pub fn keyframe_before(&self, track_index: usize, target_ns: i64) -> Option<(usize, i64)> {
+        self.key_at_or_before(track_index, target_ns)
+    }
+
+    /// NLEPROBE (SR195), the editor's second read: READ-SAMPLES-FROM(t). Track `track_index`'s samples in decode
+    /// order from [`Demuxer::keyframe_before`]'s keyframe to the end of the track; `preroll` marks a sample
+    /// presented before `target_ns` (decode it, do not show it). Payloads through [`Demuxer::packet_at`] or
+    /// [`Demuxer::sample_data`]. Empty when the track has no keyframe. Does not move the playback cursor.
+    pub fn samples_from(&self, track_index: usize, target_ns: i64) -> impl Iterator<Item = SampleRead> + '_ {
+        let start = self.key_at_or_before(track_index, target_ns).map_or(self.order.len(), |(i, _)| i);
+        let tb = self.tracks.get(track_index).map_or(Timebase::NANOS, |t| t.timebase);
+        self.order[start..]
+            .iter()
+            .filter(move |s| s.track_index == track_index)
+            .map(move |s| SampleRead { sample: *s, preroll: tb.to_ns(s.pts) < target_ns })
+    }
+}
+
+/// NLEPROBE (SR195): one sample of [`Demuxer::samples_from`] — `preroll` is true when it is presented before the
+/// read's target (a reference the decoder needs, not a frame the editor shows).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SampleRead {
+    pub sample: Sample,
+    pub preroll: bool,
 }
 
 /// k-way merge of per-track decode-order tables by decode time in ns. Each track's own order is
