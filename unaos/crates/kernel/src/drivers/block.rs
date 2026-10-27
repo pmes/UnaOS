@@ -4515,6 +4515,180 @@ impl BlockLoan {
     }
 }
 
+// ══════════ XHCILOANPTPYIELD (zenbook-ledger Z73) — a PTP/MTP data phase hands the loan back to a block claimant between TDs ══════════
+//
+// A claim-only PTP hold (Z69) keeps controller 0 for a whole data phase: a 64 MiB GetPartialObject (`mtp::READ_CHUNK`) is
+// 2048 TDs of 32 KiB (`STORAGE_DATA_BYTES`), seconds at USB2, and a masked block claimant (FAT RMW, `with_unafs`) is told
+// `Busy` at once (why=holder-preemptible) and gives up after its 64 / 8 tick-paced retries. `ptp::loan_yield` calls
+// `yield_now` from the ONE bulk-in loop (`ptp_txn_inner`'s Phase::In) between two TDs (nothing of PTP armed; a bulk
+// transfer has no inter-TD timing): the PUT (`XhciLoan`'s masked O(1) put), a bounded WINDOW in which a block claimant
+// takes it (its take publishes `BLOCK_LOAN_CPU`), the RE-TAKE through `claim_only` again (its bounded wait is the ONE
+// path's), pointer-checked to be the same heap controller. Only a demoted loan (tag 0) yields. Owed: XHCILOAN-PTPYIELD-ARM.
+
+/// XHCILOANPTPYIELD: a periodic yield every this many TDs (4 MiB of 32 KiB TDs) ...
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+pub const LOAN_YIELD_TDS: u32 = 128;
+/// XHCILOANPTPYIELD: ... and no sooner than this many ms after the last (a no-claimant window then costs <= 3/50 of a pull).
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+pub const LOAN_YIELD_MIN_MS: u64 = 50;
+/// XHCILOANPTPYIELD: a masked claimant refused since the last yield makes one due after this many TDs (256 KiB).
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+pub const LOAN_YIELD_DEMAND_TDS: u32 = 8;
+/// XHCILOANPTPYIELD: the window on the ms clock (>= 2 real ms: two 1 kHz ticks on every CPU, so a hlt-waiter retries).
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+pub const LOAN_YIELD_WINDOW_MS: u64 = 3;
+/// XHCILOANPTPYIELD: `claim_only` attempts for the re-take (~8 s at x86's 2 s budget: past a failing BOT ladder's 3x first attempt).
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+const LOAN_YIELD_RETAKES: u32 = 4;
+
+/// XHCILOANPTPYIELD: TDs since the last yield, `arch::ms` at it, `LOAN_MASKED_BUSY` at it (one PTP hold at a time: written
+/// only by the holder).
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+static LOAN_YIELD_TDS_SINCE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+static LOAN_YIELD_LAST_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+static LOAN_YIELD_SEEN_BUSY: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// XHCILOANPTPYIELD: yields this boot, and windows a block claimant took.
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+static LOAN_YIELDS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+static LOAN_YIELD_TAKEN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+impl BlockLoan {
+    /// XHCILOANPTPYIELD: one TD of a PTP data phase passed; a yield is due at >= `LOAN_YIELD_TDS` TDs and
+    /// >= `LOAN_YIELD_MIN_MS` since the last, or at >= `LOAN_YIELD_DEMAND_TDS` when a masked claimant was refused since.
+    pub fn yield_due() -> bool {
+        use core::sync::atomic::Ordering;
+        let n = LOAN_YIELD_TDS_SINCE.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+        let periodic = n >= LOAN_YIELD_TDS
+            && crate::arch::ms().saturating_sub(LOAN_YIELD_LAST_MS.load(Ordering::Relaxed)) >= LOAN_YIELD_MIN_MS;
+        let demand = n >= LOAN_YIELD_DEMAND_TDS
+            && LOAN_MASKED_BUSY.load(Ordering::Relaxed) != LOAN_YIELD_SEEN_BUSY.load(Ordering::Relaxed);
+        periodic || demand
+    }
+
+    /// XHCILOANPTPYIELD: put the loan back, give a block claimant a bounded window, re-take it through `claim_only`.
+    /// `Ok((µs put -> re-take, a block claimant took the window))`; `Ok((0, false))` with nothing moved for a loan that must
+    /// not yield (masked, preempt-off held, published, absent). `Err` leaves the loan EMPTY: the caller must not touch the
+    /// controller again (the Drop of an empty demoted loan does nothing).
+    pub fn yield_now(&mut self) -> Result<(u64, bool), BlockError> {
+        use core::sync::atomic::Ordering;
+        if crate::arch::irqs_masked() || crate::arch::sched::preemptoff::witness().0 || self.tag != 0 || self.loan.is_none() {
+            return Ok((0, false));
+        }
+        let before: *const crate::drivers::xhci::XhciController = &***self;
+        let t0 = crate::arch::now_cycles();
+        drop(self.loan.take()); // the PUT: XhciLoan's masked O(1) put
+        let m0 = crate::arch::ms();
+        let mut taken = false;
+        loop {
+            if BLOCK_LOAN_CPU.load(Ordering::Acquire) != 0 {
+                taken = true; // a block take published: the re-take below waits out its transaction
+                break;
+            }
+            if crate::arch::ms().saturating_sub(m0) >= LOAN_YIELD_WINDOW_MS {
+                break;
+            }
+            crate::arch::sched::yield_now(); // a same-CPU claimant runs
+        }
+        let mut tries = 0u32;
+        let mut l = loop {
+            match BlockLoan::claim_only() {
+                Ok(l) => break l,
+                Err(BlockError::Busy) => {
+                    tries += 1;
+                    if tries >= LOAN_YIELD_RETAKES {
+                        return Err(BlockError::Busy);
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        };
+        let after: *const crate::drivers::xhci::XhciController = &**l;
+        if !core::ptr::eq(before, after) {
+            return Err(BlockError::Io); // `l` drops: the controller goes back
+        }
+        self.loan = l.loan.take(); // the demoted temporary drops empty (tag 0)
+        LOAN_YIELD_TDS_SINCE.store(0, Ordering::Relaxed);
+        LOAN_YIELD_LAST_MS.store(crate::arch::ms(), Ordering::Relaxed);
+        LOAN_YIELD_SEEN_BUSY.store(LOAN_MASKED_BUSY.load(Ordering::Relaxed), Ordering::Relaxed);
+        LOAN_YIELDS.fetch_add(1, Ordering::Relaxed);
+        if taken {
+            LOAN_YIELD_TAKEN.fetch_add(1, Ordering::Relaxed);
+        }
+        let us = crate::arch::now_cycles().wrapping_sub(t0).saturating_mul(1000) / wait::cycles_ms(1).max(1);
+        Ok((us, taken))
+    }
+}
+
+/// XHCILOANPTPYIELD: aarch64 never yields (no `BLOCK_LOAN_CPU` publication there: XHCILOAN-PTPYIELD-ARM owed).
+#[cfg(all(feature = "uvc", not(target_arch = "x86_64")))]
+impl BlockLoan {
+    pub fn yield_due() -> bool {
+        false
+    }
+    pub fn yield_now(&mut self) -> Result<(u64, bool), BlockError> {
+        Ok((0, false))
+    }
+}
+
+/// XHCILOANPTPYIELD: `(yields, windows a block claimant took)` this boot.
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+pub fn xhci_loan_yields() -> (u32, u32) {
+    (
+        LOAN_YIELDS.load(core::sync::atomic::Ordering::Relaxed),
+        LOAN_YIELD_TAKEN.load(core::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// XHCILOANPTPYIELD KAT handshake: 0 idle, 1 the claimant is about to wait, 2 it holds the loan, 3 it put it back, 9 refused.
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+static LOAN_YIELD_KAT: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// XHCILOANPTPYIELD KAT claimant (a task on a sibling CPU, Z62's `loan_kat_holder` shape): an unmasked block claim that
+/// hlt-waits while the KAT's PTP claim holds the loan, takes it in the yield window, holds 1 ms, puts it back.
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+fn loan_yield_kat_claimant(_: usize) {
+    use core::sync::atomic::Ordering;
+    LOAN_YIELD_KAT.store(1, Ordering::Release);
+    match claim_xhci_for_io() {
+        Ok(l) => {
+            LOAN_YIELD_KAT.store(2, Ordering::Release);
+            let _ = wait::bounded(1, || false);
+            drop(l);
+            LOAN_YIELD_KAT.store(3, Ordering::Release);
+        }
+        Err(_) => LOAN_YIELD_KAT.store(9, Ordering::Release),
+    }
+}
+
+/// XHCILOANPTPYIELD: arm the KAT claimant on a sibling CPU and wait until it is in its claim wait (called while the
+/// PTP claim holds the loan). `Err` = `skip(one-cpu)` / `skip(claimant-late)`.
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+pub fn xhci_loan_yield_kat_arm() -> Result<(), &'static str> {
+    use core::sync::atomic::Ordering;
+    let me = crate::arch::percpu::this_cpu().cpu_index as usize;
+    let cpu = crate::arch::sched::sibling_online_cpu(me);
+    if cpu == me {
+        return Err("skip(one-cpu)");
+    }
+    LOAN_YIELD_KAT.store(0, Ordering::Release);
+    crate::arch::sched::spawn("ptpyield-kat", loan_yield_kat_claimant, 0, cpu, crate::arch::sched::PRIO_HIGH);
+    if !wait::bounded(1000, || LOAN_YIELD_KAT.load(Ordering::Acquire) == 1) {
+        return Err("skip(claimant-late)");
+    }
+    let _ = wait::bounded(2, || false); // it is in `claim_xhci_for_io`'s hlt wait now
+    Ok(())
+}
+
+/// XHCILOANPTPYIELD: after the KAT's PTP claim is put back, wait (<= 2500 ms) for the claimant to finish.
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+pub fn xhci_loan_yield_kat_settle() {
+    let _ = wait::bounded(2500, || LOAN_YIELD_KAT.load(core::sync::atomic::Ordering::Acquire) >= 3);
+}
+
 /// XHCILOANPTPCOPY: PTP/MTP claims through the one path this boot (read by `ptp::loan_path_kat`).
 pub fn xhci_loan_ptp_claims() -> u32 {
     LOAN_PTP_CLAIMS.load(core::sync::atomic::Ordering::Relaxed)
