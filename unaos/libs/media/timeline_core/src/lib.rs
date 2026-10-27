@@ -20,8 +20,8 @@
 //! * Transitions (NLE3, LEDGER SR202): a [`Transition`] (a dissolve or an edge wipe, `dur` ticks) sits on a cut of a
 //!   video track and STARTS at it (CMX 3600's alignment): ticks `at..at+dur` show the incoming clip's own first `dur`
 //!   ticks mixed with the outgoing source's handle (`src_out..src_out+dur`). [`Timeline::add_transition`] /
-//!   [`Timeline::remove_transition`]; [`Timeline::validate`] refuses a transition off a cut ([`EditError::Transition`],
-//!   so an op that moves or removes a transition's cut is refused until the transition is removed) or longer than the
+//!   [`Timeline::remove_transition`]; [`Timeline::validate`] refuses a transition off a cut ([`EditError::Transition`];
+//!   NLE3E SR225: an op first moves each transition to its surviving cut, refusing one whose cut is gone) or longer than the
 //!   outgoing's handle or the incoming clip ([`EditError::Handle`]).
 //! * NLE3b/NLE3c (LEDGER SR209): a video transition implies the audio crossfade on every audio track whose clips butt
 //!   at the same cut with the same sources ([`Timeline::audio_crossfade`]; `validate` refuses [`EditError::Handle`]
@@ -450,7 +450,7 @@ impl Timeline {
         }
         t.clips.push(clip);
         sort(t);
-        tl.validate()?;
+        tl.retarget_transitions(self)?; tl.validate()?;
         Ok(tl)
     }
 
@@ -472,7 +472,7 @@ impl Timeline {
         let c = clip_mut(&mut tl, track, idx)?;
         c.at += src_in - c.src_in;
         c.src_in = src_in;
-        tl.validate()?;
+        tl.retarget_transitions(self)?; tl.validate()?;
         Ok(tl)
     }
 
@@ -480,7 +480,7 @@ impl Timeline {
     pub fn trim_out(&self, track: usize, idx: usize, src_out: i64) -> Result<Timeline, EditError> {
         let mut tl = self.clone();
         clip_mut(&mut tl, track, idx)?.src_out = src_out;
-        tl.validate()?;
+        tl.retarget_transitions(self)?; tl.validate()?;
         Ok(tl)
     }
 
@@ -495,7 +495,7 @@ impl Timeline {
         for c in tr.clips.iter_mut().filter(|c| c.at >= gone.end()) {
             c.at -= gone.len();
         }
-        tl.validate()?;
+        tl.retarget_transitions(self)?; tl.validate()?;
         Ok(tl)
     }
 
@@ -507,7 +507,7 @@ impl Timeline {
             return Err(EditError::NoClip);
         }
         tr.clips.remove(idx);
-        tl.validate()?;
+        tl.retarget_transitions(self)?; tl.validate()?;
         Ok(tl)
     }
 
@@ -529,7 +529,7 @@ impl Timeline {
         c.at = to_at;
         tl.tracks[to_track].clips.push(c);
         sort(&mut tl.tracks[to_track]);
-        tl.validate()?;
+        tl.retarget_transitions(self)?; tl.validate()?;
         Ok(tl)
     }
 
@@ -588,6 +588,40 @@ impl Timeline {
         sort(t);
         tl.validate()?;
         Ok(tl)
+}
+
+    /// NLE3E (LEDGER SR225): after an op moved clips, move every transition of `before` to where its cut now is. A cut
+    /// is known by its clips' SOURCE edges (clips have no ids): the incoming's `(src, src_in)` and the outgoing's
+    /// `(src, src_out)` (from black: no clip ends at the cut). The match nearest the old tick wins (ties: the earlier).
+    /// A cut that no longer exists (a clip deleted, moved or trimmed at the cut, a clip inserted into it) is REFUSED by
+    /// name, `EditError::Transition`, never dropped: the op did not name the transition. `validate` stays the one gate.
+    fn retarget_transitions(&mut self, before: &Timeline) -> Result<(), EditError> {
+        for (k, bt) in before.tracks.iter().enumerate() {
+            if bt.transitions.is_empty() {
+                continue;
+            }
+            let clips = &self.tracks.get(k).ok_or(EditError::NoTrack)?.clips;
+            let mut moved = Vec::with_capacity(bt.transitions.len());
+            for x in &bt.transitions {
+                let inc = bt.clips.iter().find(|c| c.at == x.at).ok_or(EditError::Transition)?;
+                let out = bt.clips.iter().find(|c| c.end() == x.at);
+                let at = clips
+                    .iter()
+                    .filter(|i| i.src == inc.src && i.src_in == inc.src_in)
+                    .map(|i| i.at)
+                    .filter(|&at| match (out, clips.iter().find(|c| c.end() == at)) {
+                        (Some(a), Some(b)) => a.src == b.src && a.src_out == b.src_out,
+                        (None, None) => true,
+                        _ => false,
+                    })
+                    .min_by_key(|&at| ((at - x.at).abs(), at))
+                    .ok_or(EditError::Transition)?;
+                moved.push(Transition { at, ..*x });
+            }
+            moved.sort_by_key(|y| y.at);
+            self.tracks[k].transitions = moved;
+        }
+        Ok(())
     }
 }
 
