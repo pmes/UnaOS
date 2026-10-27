@@ -5,7 +5,7 @@
 //!
 //! CHARTER: Stria — the non-linear editor's face model over `timeline_core` (shared-core, BP-handlers-4/-14).
 //!
-//! * [`EditorState`]: the timeline, the selected clip, the playhead, the zoom (px per tick) and the undo / redo stacks.
+//! * [`EditorState`] (timeline_core's `editor` since NLE6 SR207, re-exported here): the timeline, the selected clip, the playhead, the zoom (px per tick) and the undo / redo stacks.
 //!   Every edit is ONE of timeline_core's pure ops (`split`, `trim_in`, `trim_out`, `ripple_delete`) and goes through
 //!   ONE `commit`: the op's returned `Timeline` replaces the current one, which goes on the undo stack (undo is the
 //!   stack of returned values; there are no inverse ops). A refused edit leaves the state unchanged.
@@ -30,148 +30,8 @@ use crate::nle::{RenderError, RenderSink, Sources, render, synth_source};
 
 /// The editor surface's id (the tetra `Surface` and every `SurfaceBlit` / `Input` target).
 pub const SURFACE: &str = "stria.nle";
-/// Undo depth kept.
-pub const UNDO_MAX: usize = 256;
-pub const ZOOM_MIN: u32 = 1;
-pub const ZOOM_MAX: u32 = 64;
-/// The zoom a fresh state opens at (px per tick).
-pub const ZOOM_DEFAULT: u32 = 8;
-
-/// Which edge of the selected clip a trim moves.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Edge {
-    In,
-    Out,
-}
-
-/// The editor's state (see the module docs).
-#[derive(Debug, Clone, PartialEq)]
-pub struct EditorState {
-    pub timeline: Timeline,
-    /// `(track, clip index)`.
-    pub selection: Option<(usize, usize)>,
-    pub playhead: i64,
-    /// Pixels per tick, `ZOOM_MIN..=ZOOM_MAX`.
-    pub zoom: u32,
-    undo: Vec<Timeline>,
-    redo: Vec<Timeline>,
-}
-
-impl EditorState {
-    pub fn new(timeline: Timeline) -> EditorState {
-        EditorState { timeline, selection: None, playhead: 0, zoom: ZOOM_DEFAULT, undo: Vec::new(), redo: Vec::new() }
-    }
-    /// Open a CMX 3600 EDL (`fps` when it carries no `* UNA FPS` line).
-    pub fn open(text: &str, fps: u32) -> Result<EditorState, edl::EdlError> {
-        Ok(EditorState::new(edl::parse(text, fps)?))
-    }
-    pub fn undo_depth(&self) -> usize {
-        self.undo.len()
-    }
-    pub fn redo_depth(&self) -> usize {
-        self.redo.len()
-    }
-    /// The selected clip.
-    pub fn selected(&self) -> Option<Clip> {
-        let (t, i) = self.selection?;
-        self.timeline.tracks.get(t)?.clips.get(i).copied()
-    }
-    pub fn select(&mut self, track: usize, idx: usize) -> Result<(), EditError> {
-        let tr = self.timeline.tracks.get(track).ok_or(EditError::NoTrack)?;
-        if idx >= tr.clips.len() {
-            return Err(EditError::NoClip);
-        }
-        self.selection = Some((track, idx));
-        Ok(())
-    }
-    /// Select the clip on `track` showing tick `t`.
-    pub fn select_at(&mut self, track: usize, t: i64) -> Result<(), EditError> {
-        if track >= self.timeline.tracks.len() {
-            return Err(EditError::NoTrack);
-        }
-        let idx = self.timeline.clip_at(track, t).ok_or(EditError::NoClip)?;
-        self.selection = Some((track, idx));
-        Ok(())
-    }
-    pub fn deselect(&mut self) {
-        self.selection = None;
-    }
-    /// Move the playhead to `t`, clamped to `0..=timeline.end()`.
-    pub fn seek(&mut self, t: i64) {
-        self.playhead = t.clamp(0, self.timeline.end().max(0));
-    }
-    pub fn nudge(&mut self, dt: i64) {
-        self.seek(self.playhead.saturating_add(dt));
-    }
-    /// Cut the selected track's clip at the playhead (`Timeline::split`); the right half is selected.
-    pub fn split_at_playhead(&mut self) -> Result<(), EditError> {
-        let (track, _) = self.selection.ok_or(EditError::NoClip)?;
-        let tl = self.timeline.split(track, self.playhead)?;
-        self.commit(tl);
-        self.selection = self.timeline.clip_at(track, self.playhead).map(|i| (track, i));
-        Ok(())
-    }
-    /// Move the selected clip's in (`Timeline::trim_in`) or out (`Timeline::trim_out`) point by `delta` source ticks.
-    pub fn trim(&mut self, edge: Edge, delta: i64) -> Result<(), EditError> {
-        let (track, idx) = self.selection.ok_or(EditError::NoClip)?;
-        let c = self.selected().ok_or(EditError::NoClip)?;
-        let tl = match edge {
-            Edge::In => self.timeline.trim_in(track, idx, c.src_in + delta)?,
-            Edge::Out => self.timeline.trim_out(track, idx, c.src_out + delta)?,
-        };
-        self.commit(tl);
-        Ok(())
-    }
-    /// Remove the selected clip and close the hole (`Timeline::ripple_delete`).
-    pub fn ripple_delete(&mut self) -> Result<(), EditError> {
-        let (track, idx) = self.selection.ok_or(EditError::NoClip)?;
-        let tl = self.timeline.ripple_delete(track, idx)?;
-        self.commit(tl);
-        self.selection = None;
-        Ok(())
-    }
-    /// Step back one edit; false when there is none.
-    pub fn undo(&mut self) -> bool {
-        let Some(prev) = self.undo.pop() else { return false };
-        let cur = std::mem::replace(&mut self.timeline, prev);
-        self.redo.push(cur);
-        self.settle();
-        true
-    }
-    /// Re-apply the last undone edit; false when there is none.
-    pub fn redo(&mut self) -> bool {
-        let Some(next) = self.redo.pop() else { return false };
-        let cur = std::mem::replace(&mut self.timeline, next);
-        self.undo.push(cur);
-        self.settle();
-        true
-    }
-    /// Double (`step > 0`) or halve (`step < 0`) the zoom, `|step|` times, within `ZOOM_MIN..=ZOOM_MAX`.
-    pub fn zoom_by(&mut self, step: i32) {
-        let mut z = self.zoom;
-        for _ in 0..step.unsigned_abs().min(8) {
-            z = if step > 0 { z.saturating_mul(2) } else { z / 2 };
-        }
-        self.zoom = z.clamp(ZOOM_MIN, ZOOM_MAX);
-    }
-    /// THE one edit path: the op's value replaces the timeline, the old one goes on the undo stack.
-    fn commit(&mut self, tl: Timeline) {
-        let old = std::mem::replace(&mut self.timeline, tl);
-        self.undo.push(old);
-        if self.undo.len() > UNDO_MAX {
-            self.undo.remove(0);
-        }
-        self.redo.clear();
-        self.settle();
-    }
-    /// Keep the selection and the playhead valid for the current timeline.
-    fn settle(&mut self) {
-        if self.selected().is_none() {
-            self.selection = None;
-        }
-        self.seek(self.playhead);
-    }
-}
+/// NLE6 (SR207): the editor state is timeline_core's (`timeline_core::editor`), shared with the on-UnaOS face.
+pub use timeline_core::editor::{Edge, EditorState, UNDO_MAX, ZOOM_DEFAULT, ZOOM_MAX, ZOOM_MIN};
 
 // ---------------------------------------------------------------------------------------------------------------------
 // THE ONE GEOMETRY

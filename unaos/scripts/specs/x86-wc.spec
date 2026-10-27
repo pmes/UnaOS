@@ -1001,3 +1001,5 @@ REQUIRE :: PROBESLOW: -> SKIP\(budget 1s\) ::
 REQUIRE :: BOOTLIST: ran=3 pass=2 fail=0 skip=1 heavy=ran ms=[0-9]+ ::
 REQUIRE :: BOOTLIST: probe entries=3 heavy=1 budget_skips=1 summary=ok -> PASS ::
 FORBID :: BOOTLIST: .* -> FAIL ::
+# NLE6 (LEDGER SR207): `tests nle` (typed, R80; needs UNAOS_VIDEO=1, which this leg does not set) — the Player's EDL mode over two synthetic utp1 reels.
+OPTIONAL :: NLE: frames=\d+ seeks=\d+ runup=\d+ agree=\d+/\d+ counter=frame-ord -> PASS ::

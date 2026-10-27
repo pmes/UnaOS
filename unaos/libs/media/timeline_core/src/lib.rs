@@ -26,6 +26,8 @@
 //! * Audio (NLE4, LEDGER SR203): a clip carries a gain in centi-dB ([`Clip::gain_cdb`], 0 = unity) and linear fades in
 //!   ticks ([`Clip::fade_in`], [`Clip::fade_out`], 0 = none; `fade_in + fade_out <= len`); [`Timeline::set_gain`] and
 //!   [`Timeline::set_fades`] edit them; [`schedule::audio_runs`] mixes every audio track.
+//! * [`editor`] (NLE6, LEDGER SR207): the editor's state (`EditorState`: selection, playhead, zoom, undo / redo over the ops), one
+//!   model for the host face (`stria::nle_face`) and the on-UnaOS face (the kernel Player's EDL mode).
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -36,6 +38,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 pub mod edl;
+pub mod editor;
 pub mod schedule;
 
 /// The ONE time-base type (demux_core's): seconds per tick = `num / den`. A timeline's is `1/fps`.
