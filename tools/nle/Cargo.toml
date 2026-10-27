@@ -1,0 +1,17 @@
+# =====================================================================
+# CRATE: tools/nle/Cargo.toml
+# DESCRIPTION: NLE1 (LEDGER SR194) headless face of the non-linear
+#              editor: reads a CMX 3600 EDL, prints its render schedule,
+#              or renders it through stria::nle into raw RGBA frames +
+#              f32 PCM. No logic of its own; no third-party crates.
+# =====================================================================
+
+[package]
+name = "nle"
+version = "0.1.0"
+edition = "2024"
+license = "LGPL-3.0-or-later"
+
+[dependencies]
+stria = { path = "../../handlers/stria" }
+timeline_core = { path = "../../unaos/libs/media/timeline_core" }

@@ -22,6 +22,8 @@ resonance = { path = "../../libs/resonance" }
 gneiss_pal = { path = "../../libs/gneiss_pal", features = ["av1"] }
 tokio = { version = "1.53", features = ["rt", "sync", "time", "macros"] }
 anyhow = "1.0"
+# NLE1 (SR194): the editor's timeline core (no_std, shared with the on-UnaOS face); `nle` renders its schedule.
+timeline_core = { path = "../../unaos/libs/media/timeline_core" }
 log = "0.4"
 
 [dev-dependencies]
