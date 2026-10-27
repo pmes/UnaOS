@@ -1,0 +1,17 @@
+[package]
+name = "adjust_core"
+version = "0.1.0"
+edition = "2024"
+license = "LGPL-3.0-or-later"
+description = "Facet's adjustments core: levels, curves, hue/saturation, invert, threshold, box and gaussian blur and unsharp mask as pure functions over straight RGBA8 — shared by Ring 0 and Ring 3."
+
+# ADJUSTCORE (LEDGER SR232): `#![no_std]` + `alloc`, `#![forbid(unsafe_code)]`, the timeline_core / raster_core shape:
+# a shared core under `unaos/libs/`, a member of the ROOT host workspace, linkable by the kernel by path with
+# `default-features = false` the day a face needs it. No dependencies at all: the pixel layout (straight RGBA8,
+# row-major, w*h*4) is restated, not imported.
+[dependencies]
+
+[features]
+default = ["std"]
+# The seam only: nothing in `src/` is std-gated (midden_core's spelling, so a kernel `default-features = false` is honest).
+std = []
