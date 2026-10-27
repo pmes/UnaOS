@@ -11,7 +11,9 @@
 //   fx_tracks_f32        — the two scalars render the same picture (mean display difference, 64x64).
 //   bar                  — the measurement: per scalar, the 960x600 still converging pass by pass, and the 480x300
 //                          orbit (accumulator reset every frame, 2x upscale to 960x600 inside the timing). One core
-//                          (one thread). `TEMPLE_EVIDENCE=<dir>` writes the PNGs and the numbers there.
+//                          (one thread). `TEMPLE_EVIDENCE=<dir>` writes the PNGs and the numbers there. The still's
+//                          bar is per scalar: fx16 <= 3000 ms (R128), f32 <= 2000 ms (B876). Each scalar also prints
+//                          one `TEMPLE phases` line: a 960x600 pass split by the core's public per-phase fns.
 //
 // Run: `cargo test -- --nocapture --test-threads=1` (the profile in Cargo.toml optimises the test build).
 
@@ -313,15 +315,16 @@ fn report<R: Real>(lines: &mut Vec<String>, ev: Option<&std::path::Path>) -> (f6
         (16, s.ms_at[15])
     };
     let n = R::NAME;
+    let bar_ms = if n == Fx::NAME { 3000.0 } else { 2000.0 };
     lines.push(format!("TEMPLE bar [{}] build (tables + flow bake) {:.0} ms", n, build_ms));
     lines.push(format!(
         "TEMPLE bar [{}] still 960x600: 1 spp {:.0} ms, 4 spp {:.0} ms, 8 spp {:.0} ms, 16 spp {:.0} ms ({:.0} ns per sample incl. resolve)",
         n, s.ms_at[0], s.ms_at[3], s.ms_at[7], s.ms_at[15], per_sample_ns
     ));
     lines.push(format!(
-        "TEMPLE bar [{}] still convergence: mean |img4-img8| {:.3} LSB ({:.2}% ch > 8), mean |img8-img16| {:.3} LSB ({:.2}% ch > 8); converged (mean <= 0.5 LSB, < 0.5% > 8) at {} spp{} = {:.0} ms -> {} (bar <= 3000 ms)",
+        "TEMPLE bar [{}] still convergence: mean |img4-img8| {:.3} LSB ({:.2}% ch > 8), mean |img8-img16| {:.3} LSB ({:.2}% ch > 8); converged (mean <= 0.5 LSB, < 0.5% > 8) at {} spp{} = {:.0} ms -> {} (bar <= {:.0} ms)",
         n, s.d4_8.0, s.d4_8.1, s.d8_16.0, s.d8_16.1, conv.0, if conv.0 == 16 { " or later (not reached by 8)" } else { "" }, conv.1,
-        if conv.0 < 16 && conv.1 <= 3000.0 { "MEETS" } else { "MISSES" }
+        if conv.0 < 16 && conv.1 <= bar_ms { "MEETS" } else { "MISSES" }, bar_ms
     ));
     lines.push(format!(
         "TEMPLE bar [{}] orbit 480x300 (reset every frame, 2x upscale to 960x600 timed): {:.2} fps, worst frame {:.0} ms -> {} (bar >= 10 fps)",
@@ -344,6 +347,8 @@ fn bar() {
     lines.push(format!("TEMPLE bar host: {} logical cpus, one thread; cpu: {}", std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1), cpu_name()));
     report::<Fx>(&mut lines, ev.as_deref());
     report::<f32>(&mut lines, ev.as_deref());
+    lines.push(phases::<Fx>());
+    lines.push(phases::<f32>());
     for l in &lines {
         println!("{}", l);
     }
@@ -357,4 +362,87 @@ fn cpu_name() -> String {
         .ok()
         .and_then(|s| s.lines().find(|l| l.starts_with("model name")).map(|l| l.split(':').nth(1).unwrap_or("").trim().to_string()))
         .unwrap_or_else(|| "unknown".into())
+}
+
+/// One 960x600 pass split by phase (B876): each of the core's public per-phase fns timed over every primary ray of
+/// the frame, beside one whole `pass` and one `resolve`. No instrumentation in the core; the phases overlap the
+/// pass's own work, so they read as shares of it, not as a sum.
+fn phases<R: Real>() -> String {
+    use std::hint::black_box as bb;
+    let tp = Temple::<R>::new();
+    let (w, h) = (960usize, 600usize);
+    let cam = tp.camera(STILL_ORBIT_MRAD, 0, w, h);
+    let mut dirs = Vec::with_capacity(w * h);
+    for y in 0..h {
+        for x in 0..w {
+            let px = R::from_q16(((((x as i64) << 17) + 65536) / w as i64 - 65536) as i32);
+            let py = R::from_q16((65536 - ((((y as i64) << 17) + 65536) / h as i64)) as i32);
+            dirs.push((cam.fwd + cam.up_s * py + cam.right_s * px).norm());
+        }
+    }
+    let o = cam.eye;
+    let ms = |t: Instant| t.elapsed().as_secs_f64() * 1000.0;
+    let far = R::k(200.0);
+    let tm = |hit: &Option<(R, usize)>| match hit {
+        Some((t, _)) => *t,
+        None => far,
+    };
+    let t = Instant::now();
+    for d in &dirs {
+        bb((cam.fwd + cam.up_s * d.y + cam.right_s * d.x).norm());
+    }
+    let norm = ms(t);
+    let mut hits = Vec::with_capacity(dirs.len());
+    let t = Instant::now();
+    for d in &dirs {
+        hits.push(tp.gem.intersect(o, *d));
+    }
+    let intersect = ms(t);
+    let mut defl = Vec::with_capacity(dirs.len());
+    let t = Instant::now();
+    for (d, hit) in dirs.iter().zip(&hits) {
+        defl.push(tp.flow(&cam, o, *d, tm(hit)));
+    }
+    let flow = ms(t);
+    let t = Instant::now();
+    for (d, hit) in dirs.iter().zip(&hits) {
+        bb(tp.beam(o, *d, tm(hit)));
+    }
+    let beam = ms(t);
+    let t = Instant::now();
+    for (d, hit) in dirs.iter().zip(&hits) {
+        bb(tp.splash(o, *d, tm(hit)));
+    }
+    let splash = ms(t);
+    let t = Instant::now();
+    for (d, hit) in dirs.iter().zip(&hits) {
+        bb(tp.fans(o, *d, tm(hit)));
+    }
+    let fans = ms(t);
+    let t = Instant::now();
+    for (d, hit) in dirs.iter().zip(&hits) {
+        if let Some((tt, i)) = hit {
+            bb(tp.shade_gem(o + *d * *tt, *i, *d));
+        }
+    }
+    let shade_gem = ms(t);
+    let t = Instant::now();
+    for ((d, hit), (_, g)) in dirs.iter().zip(&hits).zip(&defl) {
+        if hit.is_none() {
+            bb(tp.stars(&cam, tp.lens(*d, *g)));
+        }
+    }
+    let lens_stars = ms(t);
+    let mut fr = Frame::new(w, h);
+    let t = Instant::now();
+    tp.pass(&cam, &mut fr);
+    let pass = ms(t);
+    let mut out = vec![0u32; w * h];
+    let t = Instant::now();
+    tp.resolve(&fr, &mut out);
+    let resolve = ms(t);
+    format!(
+        "TEMPLE phases [{}] 960x600 pass={:.0} ns_px={:.0} flow={:.0} fans={:.0} lens_stars={:.0} shade_gem={:.0} intersect={:.0} norm={:.0} beam={:.0} splash={:.0} resolve={:.0}",
+        R::NAME, pass, pass * 1e6 / (w * h) as f64, flow, fans, lens_stars, shade_gem, intersect, norm, beam, splash, resolve
+    )
 }
