@@ -944,7 +944,7 @@ refs/heads/exec-rmbp-hevclevelline   4553618d5 FOLDED-BY-HAND (this commit) 2026
 refs/heads/exec-rmbp-nle6exportmkv   672c23c04 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-stationroampmu   1cfa919fe FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-yuvfancy   672c23c04 IN-FLIGHT cut 2026-10-27
-refs/heads/exec-rmbp-swapbackspancache   672c23c04 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-swapbackspancache   d72af4ea4 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-h264enccbrone   f60e245bb FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-kerneldisplayicc   81c1b985e FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-av1inbandswitch   91e6201a7 FOLDED-BY-HAND (this commit) 2026-10-27
