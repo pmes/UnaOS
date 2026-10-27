@@ -913,6 +913,6 @@ refs/heads/exec-rmbp-jpegcolourone   afa439cfa FOLDED-BY-HAND (this commit) 2026
 refs/heads/exec-rmbp-h264encpyramid   e9df84207 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-pdfsign   e9df84207 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-aethermacgpupresentrects   e9df84207 IN-FLIGHT cut 2026-10-27
-refs/heads/exec-rmbp-playcheckhi   e9df84207 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-playcheckhi   a80198ec9 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-swapbackseek   e9df84207 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-stationroambgscan   e9df84207 IN-FLIGHT cut 2026-10-27

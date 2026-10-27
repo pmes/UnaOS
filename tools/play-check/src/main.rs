@@ -5,7 +5,7 @@
 //!
 //! ```text
 //! play-check <file> [--frame N --out f.png] [--hz 60] [--oracle chromium-oracle.jsonl]
-//!            [--i420-oracle <dir>]
+//!            [--i420-oracle <dir>] [--md5]
 //!            [--audio-out played.f32 [--audio-ref chromium.f32 --audio-floor exact|snr:<dB>|lsb:<n>
 //!             [--ref-frames-max]]]
 //! play-check --make-utp <out.mp4|out.webm> [frames] [fps]
@@ -22,7 +22,9 @@
 //! every presented I420 frame is compared byte for byte with the planes Chromium's own decoder
 //! produced for the same pts (`<dir>/<file name>.<pts µs>.i420`, written by
 //! `unaos/libs/media/vp8_core/oracle/video-frames.cjs`): frames compared, exact, worst max diff.
-//! frame counts agree; exit status 1 on any mismatch.
+//! PLAYCHECKHI (SR352): an I420Hi frame (`bit_depth` 9..16) is compared as yuv420p10le / yuv420p12le bytes (each sample
+//! two bytes, low first: `hevc_core::le_bytes`, HEVCCONF's ONE layout) and reported apart as `i420_hi` with its depth;
+//! `--md5` lists each presented frame's md5 (crypto_core) of its yuv420p / yuv420p10le / yuv420p12le bytes.
 //!
 //! AUDIOTRACK (SR45): with `--audio-out` the player gets a headless DEVICE — an [`AudioOut`]
 //! that consumes the stereo stream at exactly its sample rate on the same manual clock — so the
@@ -44,7 +46,7 @@ use std::sync::Arc;
 
 use gneiss_pal::dsp::avsync::{ManualTime, TimeSource};
 use gneiss_pal::dsp::image::encode_rgba;
-use gneiss_pal::dsp::video::{Frame, TestPattern};
+use gneiss_pal::dsp::video::{Frame, Pixels, TestPattern};
 use stria::media::{AudioOut, FrameSink, Player, Tick};
 
 /// A headless audio device: takes stereo frames into a half-second ring and consumes them at
@@ -111,8 +113,10 @@ struct Capture {
     shown: Vec<(u64, i64, i64)>,
     clock: i64,
     frame: Option<Frame>,
-    /// `--i420-oracle`: (dir, file name, frames compared, exact, missing, worst max abs diff).
-    i420: Option<(String, String, u64, u64, u64, u8)>,
+    /// `--i420-oracle` (VP8CORE SR40; I420Hi frames PLAYCHECKHI SR352).
+    i420: Option<I420Oracle>,
+    /// `--md5` (PLAYCHECKHI SR352): per presented frame, the md5 of its yuv bytes (None: no YUV planes).
+    md5: Option<Vec<Option<String>>>,
 }
 impl FrameSink for Capture {
     fn present(&mut self, f: &Frame, ordinal: u64) {
@@ -120,29 +124,7 @@ impl FrameSink for Capture {
         if self.want == Some(ordinal) {
             self.frame = Some(f.clone());
         }
-        if let (Some(o), gneiss_pal::dsp::video::Pixels::I420 { y, u, v, y_stride, uv_stride }) = (self.i420.as_mut(), &f.pixels) {
-            let (w, h) = (f.width as usize, f.height as usize);
-            let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
-            let mut ours = Vec::with_capacity(w * h + 2 * cw * ch);
-            for r in 0..h {
-                ours.extend_from_slice(&y[r * y_stride..r * y_stride + w]);
-            }
-            for p in [u, v] {
-                for r in 0..ch {
-                    ours.extend_from_slice(&p[r * uv_stride..r * uv_stride + cw]);
-                }
-            }
-            let path = format!("{}/{}.{}.i420", o.0, o.1, (f.pts_ns + 500) / 1000);
-            match std::fs::read(&path) {
-                Ok(theirs) if theirs.len() == ours.len() => {
-                    let d = ours.iter().zip(&theirs).map(|(a, b)| a.abs_diff(*b)).max().unwrap_or(0);
-                    o.2 += 1;
-                    o.3 += (d == 0) as u64;
-                    o.5 = o.5.max(d);
-                }
-                _ => o.4 += 1,
-            }
-        }
+        self.compare_yuv(f);
     }
 }
 
@@ -259,8 +241,9 @@ fn main() {
     });
     let period = 1_000_000_000u64 / hz as u64;
     let name = std::path::Path::new(file).file_name().and_then(|s| s.to_str()).unwrap_or("").to_string();
-    let i420 = arg(&args, "--i420-oracle").map(|d| (d, name, 0, 0, 0, 0u8));
-    let mut cap = Capture { want, shown: Vec::new(), clock: 0, frame: None, i420 };
+    let i420 = arg(&args, "--i420-oracle").map(|d| I420Oracle::new(d, name));
+    let md5 = args.iter().any(|a| a == "--md5").then(Vec::new);
+    let mut cap = Capture { want, shown: Vec::new(), clock: 0, frame: None, i420, md5 };
     p.play();
     let max_ticks = (p.info().duration_ns / period + hz as u64 * 3) as usize;
     for _ in 0..max_ticks {
@@ -302,10 +285,12 @@ fn main() {
             }
         }
     }
-    if let Some((_, _, compared, exact, missing, worst)) = &cap.i420 {
-        let all = *compared > 0 && compared == exact && *missing == 0;
-        ok &= all;
-        extra += &format!(",\"i420_oracle\":{{\"compared\":{compared},\"exact\":{exact},\"missing\":{missing},\"max_abs_diff\":{worst}}}");
+    if let Some(o) = &cap.i420 {
+        ok &= o.ok();
+        extra += &o.json();
+    }
+    if let Some(m) = &cap.md5 {
+        extra += &format!(",\"md5\":[{}]", m.iter().map(|h| h.as_ref().map(|h| format!("\"{h}\"")).unwrap_or_else(|| "null".into())).collect::<Vec<String>>().join(","));
     }
     if let Some(o) = arg(&args, "--oracle") {
         let name = std::path::Path::new(file).file_name().and_then(|s| s.to_str()).unwrap_or("");
@@ -423,6 +408,140 @@ pub fn fnv1a(d: &[u8]) -> u32 {
     h
 }
 
+/// PLAYCHECKHI (LEDGER SR352): the `--i420-oracle` counters — 8-bit (`Pixels::I420`) frames as VP8CORE (SR40) counted
+/// them, I420Hi frames (yuv420p10le / 12le oracle bytes) apart, so an 8-bit run reports byte for byte as before.
+struct I420Oracle {
+    dir: String,
+    name: String,
+    compared: u64,
+    exact: u64,
+    missing: u64,
+    worst: u16,
+    /// I420Hi frames: (bit depth, compared, exact, missing, worst max abs sample diff).
+    hi: (u8, u64, u64, u64, u16),
+}
+
+impl I420Oracle {
+    fn new(dir: String, name: String) -> I420Oracle {
+        I420Oracle { dir, name, compared: 0, exact: 0, missing: 0, worst: 0, hi: (0, 0, 0, 0, 0) }
+    }
+
+    /// VP8CORE's rule over both depths: at least one frame compared, every compared frame exact, none missing.
+    fn ok(&self) -> bool {
+        let (_, hc, he, hm, _) = self.hi;
+        self.compared + hc > 0 && self.compared == self.exact && hc == he && self.missing + hm == 0
+    }
+
+    /// The report fragment: `i420_oracle` as before, then `i420_hi` only when an I420Hi frame was presented.
+    fn json(&self) -> String {
+        let mut s = format!(",\"i420_oracle\":{{\"compared\":{},\"exact\":{},\"missing\":{},\"max_abs_diff\":{}}}", self.compared, self.exact, self.missing, self.worst);
+        let (d, hc, he, hm, hw) = self.hi;
+        if hc + hm > 0 {
+            s += &format!(",\"i420_hi\":{{\"depth\":{d},\"compared\":{hc},\"exact\":{he},\"missing\":{hm},\"max_abs_diff\":{hw}}}");
+        }
+        s
+    }
+}
+
+/// PLAYCHECKHI (SR352): a presented frame's planes packed as the oracles and `--md5` take them, with its depth: yuv420p
+/// at 8 bits (the crop VP8CORE SR40 wrote inline), above 8 bits the u16 samples cropped at their strides and laid out by
+/// `hevc_core::le_bytes` (yuv420p10le / 12le, HEVCCONF's ONE layout). An I420Hi plane too short for its rows yields no
+/// bytes (the oracle counts the frame missing); a frame without YUV planes yields None. 4:2:2 / 4:4:4 never arrive here:
+/// gneiss_pal's HEVC adapter refuses them by name (COLOURONE-422).
+fn yuv_layout(f: &Frame) -> Option<(Vec<u8>, u8)> {
+    let (w, h) = (f.width as usize, f.height as usize);
+    let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+    match &f.pixels {
+        Pixels::I420 { y, u, v, y_stride, uv_stride } => {
+            let mut ours = Vec::with_capacity(w * h + 2 * cw * ch);
+            for r in 0..h {
+                ours.extend_from_slice(&y[r * y_stride..r * y_stride + w]);
+            }
+            for p in [u, v] {
+                for r in 0..ch {
+                    ours.extend_from_slice(&p[r * uv_stride..r * uv_stride + cw]);
+                }
+            }
+            Some((ours, 8))
+        }
+        Pixels::I420Hi { y, u, v, y_stride, uv_stride, bit_depth } => {
+            let crop = |p: &[u16], stride: usize, pw: usize, ph: usize| -> Option<Vec<u16>> {
+                (0..ph).map(|r| p.get(r * stride..r * stride + pw)).collect::<Option<Vec<&[u16]>>>().map(|rows| rows.concat())
+            };
+            let bytes = match (crop(y.as_slice(), *y_stride, w, h), crop(u.as_slice(), *uv_stride, cw, ch), crop(v.as_slice(), *uv_stride, cw, ch)) {
+                (Some(py), Some(pu), Some(pv)) => hevc_core::le_bytes([py.as_slice(), pu.as_slice(), pv.as_slice()]),
+                _ => Vec::new(),
+            };
+            Some((bytes, *bit_depth))
+        }
+        _ => None,
+    }
+}
+
+/// PLAYCHECKHI (SR352): the largest |ours − theirs| sample difference — per byte at 8 bits, per two-byte little-endian
+/// sample above; None when the lengths differ (the oracle's frame is missing, or of another size or depth).
+fn max_diff(ours: &[u8], theirs: &[u8], depth: u8) -> Option<u16> {
+    if ours.len() != theirs.len() {
+        return None;
+    }
+    Some(if depth <= 8 {
+        ours.iter().zip(theirs).map(|(a, b)| a.abs_diff(*b) as u16).max().unwrap_or(0)
+    } else {
+        let s = |c: &[u8]| u16::from_le_bytes([c[0], c[1]]);
+        ours.chunks_exact(2).zip(theirs.chunks_exact(2)).map(|(a, b)| s(a).abs_diff(s(b))).max().unwrap_or(0)
+    })
+}
+
+/// PLAYCHECKHI (SR352): lowercase hex of crypto_core's MD5 (the digest md5sum and the conformance lists print).
+fn md5_hex(data: &[u8]) -> String {
+    crypto_core::md5::md5(data).iter().map(|b| format!("{b:02x}")).collect()
+}
+
+impl Capture {
+    /// PLAYCHECKHI (SR352): one presented frame's `--md5` entry and its `--i420-oracle` compare against
+    /// `<dir>/<file name>.<pts µs>.i420` (yuv420p bytes at 8 bits, yuv420p10le / 12le above).
+    fn compare_yuv(&mut self, f: &Frame) {
+        if self.i420.is_none() && self.md5.is_none() {
+            return;
+        }
+        let lay = yuv_layout(f);
+        if let Some(m) = self.md5.as_mut() {
+            m.push(lay.as_ref().filter(|(b, d)| *d <= 8 || !b.is_empty()).map(|(b, _)| md5_hex(b)));
+        }
+        let (Some(o), Some((ours, depth))) = (self.i420.as_mut(), lay) else {
+            return;
+        };
+        let path = format!("{}/{}.{}.i420", o.dir, o.name, (f.pts_ns + 500) / 1000);
+        let d = if depth > 8 && ours.is_empty() { None } else { std::fs::read(&path).ok().and_then(|theirs| max_diff(&ours, &theirs, depth)) };
+        if depth <= 8 {
+            match d {
+                Some(d) => {
+                    o.compared += 1;
+                    o.exact += (d == 0) as u64;
+                    o.worst = o.worst.max(d);
+                }
+                None => o.missing += 1,
+            }
+        } else {
+            o.hi.0 = depth;
+            match d {
+                Some(d) => {
+                    o.hi.1 += 1;
+                    o.hi.2 += (d == 0) as u64;
+                    o.hi.4 = o.hi.4.max(d);
+                }
+                None => o.hi.3 += 1,
+            }
+        }
+    }
+}
+
+/// PLAYCHECKHI (SR352): hevc_core's hand-assembled-stream kit (HEVCMAIN10's KAT pictures), by path as HEVCCONF takes
+/// h264_core's (`tests/conformance.rs` `mod jvt`).
+#[cfg(test)]
+#[path = "../../../unaos/libs/media/hevc_core/tests/common/mod.rs"]
+mod hevc_kit;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -448,5 +567,77 @@ mod tests {
             assert_eq!(img.rgba, rgba);
             assert_eq!(fnv1a(&png), want, "{w}x{h}: {} B", png.len());
         }
+    }
+
+    /// PLAYCHECKHI (SR352): a flat 10-bit field through the I420Hi path against an inline yuv420p10le oracle.
+    #[test]
+    fn i420hi_flat_ten_bit_field_against_inline_oracle() {
+        let f = Frame { width: 4, height: 2, pts_ns: 0, pixels: Pixels::I420Hi { y: vec![600; 8], u: vec![512; 2], v: vec![512; 2], y_stride: 4, uv_stride: 2, bit_depth: 10 } };
+        let mut oracle: Vec<u8> = [0x58u8, 0x02].repeat(8);
+        oracle.extend([0x00u8, 0x02].repeat(4));
+        let (ours, depth) = yuv_layout(&f).unwrap();
+        assert_eq!((ours.as_slice(), depth), (oracle.as_slice(), 10));
+        assert_eq!(max_diff(&ours, &oracle, 10), Some(0));
+        let mut off = oracle.clone();
+        off[6] = 0x59; // Y sample 3: 601
+        assert_eq!(max_diff(&ours, &off, 10), Some(1));
+        assert_eq!(max_diff(&ours, &oracle[..oracle.len() - 2], 10), None);
+        assert_eq!(md5_hex(&ours), "4a25c6d2b52679da6bb5a2c244bd87ad");
+        // A plane too short for its rows: no bytes, so the frame counts missing.
+        let short = Frame { pixels: Pixels::I420Hi { y: vec![600; 7], u: vec![512; 2], v: vec![512; 2], y_stride: 4, uv_stride: 2, bit_depth: 10 }, ..f };
+        assert_eq!(yuv_layout(&short), Some((Vec::new(), 10)));
+        let mut o = I420Oracle::new(String::new(), String::new());
+        o.hi = (10, 1, 1, 0, 0);
+        assert!(o.ok());
+        assert_eq!(o.json(), ",\"i420_oracle\":{\"compared\":0,\"exact\":0,\"missing\":0,\"max_abs_diff\":0},\"i420_hi\":{\"depth\":10,\"compared\":1,\"exact\":1,\"missing\":0,\"max_abs_diff\":0}");
+        o.hi.3 = 1;
+        assert!(!o.ok());
+    }
+
+    /// PLAYCHECKHI (SR352): HEVCMAIN10's KAT picture (tests/main10.rs `main10_all_dc_is_flat_512`, assembled with the
+    /// same kit calls as its `dc32(&cfg32(10))`), as gneiss_pal's `to_frame` hands it on (y_stride w, uv_stride w / 2):
+    /// the md5 `--md5` prints is the md5 of the bytes HEVCCONF hashes (`hevc_core::yuv_bytes`) — ONE layout.
+    #[test]
+    fn main10_kat_picture_md5_equals_hevcconf_layout() {
+        use crate::hevc_kit::{CabacEnc, PpsCfg, SpsCfg, idr_slice_header, nal, pps, sps, vps};
+        let cfg = SpsCfg { width: 32, height: 32, log2_ctb: 5, bit_depth: 10, ..Default::default() };
+        let mut s = vps(false);
+        s.extend(sps(&cfg));
+        s.extend(pps(&PpsCfg { init_qp: 26, ..Default::default() }));
+        let mut e = CabacEnc::new(idr_slice_header(false, false, false, false), 0, 26);
+        e.split_cu(0, false);
+        e.dc_cu(1);
+        s.extend(nal(19, &e.finish().out));
+        let mut d = hevc_core::Decoder::new();
+        d.decode_annexb(&s).expect("decode");
+        d.flush();
+        let f = d.take_frames().remove(0);
+        let [y, u, v] = f.planes16.clone().expect("Main 10 keeps planes16");
+        let w = f.width as usize;
+        let ours = Frame { width: f.width, height: f.height, pts_ns: 0, pixels: Pixels::I420Hi { y, u, v, y_stride: w, uv_stride: w / 2, bit_depth: f.bit_depth } };
+        let (bytes, depth) = yuv_layout(&ours).unwrap();
+        assert_eq!(depth, 10);
+        assert_eq!(bytes, hevc_core::yuv_bytes(&f));
+        assert_eq!(md5_hex(&bytes), "ca021302dd2c310dc2b2c9a2ff98fefc");
+    }
+
+    /// PLAYCHECKHI (SR352): the 8-bit path is VP8CORE's (SR40) — the same strided crop, the same report fragment and rule.
+    #[test]
+    fn eight_bit_layout_and_report_unchanged() {
+        let y: Vec<u8> = (1..=12).collect();
+        let f = Frame { width: 3, height: 3, pts_ns: 0, pixels: Pixels::I420 { y, u: vec![20, 21, 99, 22, 23, 99], v: vec![30, 31, 99, 32, 33, 99], y_stride: 4, uv_stride: 3 } };
+        let want = vec![1u8, 2, 3, 5, 6, 7, 9, 10, 11, 20, 21, 22, 23, 30, 31, 32, 33];
+        assert_eq!(yuv_layout(&f), Some((want.clone(), 8)));
+        assert_eq!(md5_hex(&want), "330511d9a5adb60b4e5469bf7aa40652");
+        assert_eq!(md5_hex(&[1, 2, 3, 4, 5, 6, 7, 8, 9]), "8596c1af55b14b7b320112944fcb8536");
+        let mut off = want.clone();
+        off[4] += 3;
+        assert_eq!((max_diff(&want, &want, 8), max_diff(&want, &off, 8), max_diff(&want, &want[1..], 8)), (Some(0), Some(3), None));
+        assert_eq!(yuv_layout(&Frame { width: 1, height: 1, pts_ns: 0, pixels: Pixels::Rgba(vec![0; 4]) }), None);
+        let mut o = I420Oracle::new(String::new(), String::new());
+        assert!(!o.ok());
+        (o.compared, o.exact) = (3, 3);
+        assert!(o.ok());
+        assert_eq!(o.json(), ",\"i420_oracle\":{\"compared\":3,\"exact\":3,\"missing\":0,\"max_abs_diff\":0}");
     }
 }

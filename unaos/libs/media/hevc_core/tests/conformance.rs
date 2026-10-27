@@ -16,7 +16,7 @@ use std::process::{Command, Stdio};
 
 use hevc_core::picture::Plane;
 use hevc_core::sei::{self, HashCheck, PictureHash};
-use hevc_core::{Decoder, Error, Frame};
+use hevc_core::{Decoder, Error, Frame, yuv_bytes};
 
 const LIST: &str = include_str!("vectors.txt");
 
@@ -55,14 +55,6 @@ fn decode_all(stream: &[u8]) -> Result<(Vec<Frame>, Vec<(i32, HashCheck)>), Erro
     frames.extend(d.take_frames());
     checks.extend(d.take_hash_checks());
     Ok((frames, checks))
-}
-
-/// A frame as the reference decoder writes it: I420 bytes, or two bytes per sample (low first) above 8 bits.
-fn yuv_bytes(f: &Frame) -> Vec<u8> {
-    match &f.planes16 {
-        Some(p16) => p16.iter().flatten().flat_map(|v| v.to_le_bytes()).collect(),
-        None => f.i420(),
-    }
 }
 
 /// The md5 of `data` through the host's md5sum (the harness's tools are host tools, as sha256sum is for the fetcher).
