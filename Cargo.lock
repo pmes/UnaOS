@@ -1521,11 +1521,15 @@ dependencies = [
 name = "facet-view"
 version = "0.1.0"
 dependencies = [
+ "adjust_core",
  "bandy",
+ "brush_core",
  "facet",
  "gneiss_pal",
  "log",
+ "pixel_core",
  "quartzite",
+ "raster_core",
  "tempfile",
  "tokio",
 ]
