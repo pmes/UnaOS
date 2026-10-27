@@ -431,13 +431,8 @@ pub(super) fn arm(bar0: u64, bus: u8, dev: u8, func: u8, w: &mut Writes, tag: &'
     }
     w.dma += 4;
     let st0 = unsafe { r32(bar0, RXSTATUS) };
-    // ── MAC enable (main.c:2958-2983): ENABLED, ack MAC_SUSPENDED, flush, awake. ──
-    let v = unsafe { r32(bar0, D11_MACCTL) };
-    macctl_w(bar0, v | MACCTL_ENABLED, w);
-    unsafe { w32(bar0, D11_GEN_IRQ_REASON, IRQ_MAC_SUSPENDED) };
-    w.irq_ack += 1;
-    let _ = unsafe { (r32(bar0, D11_MACCTL), r32(bar0, D11_GEN_IRQ_REASON)) };
-    let _ = awake(bar0, w);
+    // ── MAC enable (main.c:2958-2983): ENABLED, ack MAC_SUSPENDED, flush, awake (`resume`, ROAMXCHAN B898: one enable). ──
+    resume(bar0, w);
     let mac_on = unsafe { r32(bar0, D11_MACCTL) };
     serial_println!(
         "[{}] rx-setup ring={:#x} bufs={:#x} slots={} buf={} fo={} rxctl={:#010x} ringhi={:#010x} rxstatus={:#010x} reset={} pci_cmd={:#06x}->{:#06x} macctl={:#010x}->{:#010x} — dma.c:672-750, main.c:3103-3160, :2958-2983",
@@ -542,4 +537,18 @@ pub(super) fn scan_filter(bar0: u64, open: bool, w: &mut Writes) -> u32 {
     let pre = unsafe { r32(bar0, D11_MACCTL) };
     macctl_w(bar0, if open { pre | MACCTL_BEACPROMISC } else { pre & !MACCTL_BEACPROMISC }, w);
     unsafe { r32(bar0, D11_MACCTL) }
+}
+
+// ── STATIONROAM-XCHAN (rmbp-ledger B898): the MAC enable as one fn, `suspend`'s other half ─────────────────────────────
+
+/// `main.c:2958-2983` (`b43_mac_enable`): MACCTL.ENABLED on, MAC_SUSPENDED acked, the posting reads, awake. `arm`'s enable and
+/// `join::retune`'s (the channel switch inside suspend/enable, as b43's op_config wraps b43_switch_channel) — the same writes in
+/// the same order.
+pub(super) fn resume(bar0: u64, w: &mut Writes) {
+    let v = unsafe { r32(bar0, D11_MACCTL) };
+    macctl_w(bar0, v | MACCTL_ENABLED, w);
+    unsafe { w32(bar0, D11_GEN_IRQ_REASON, IRQ_MAC_SUSPENDED) };
+    w.irq_ack += 1;
+    let _ = unsafe { (r32(bar0, D11_MACCTL), r32(bar0, D11_GEN_IRQ_REASON)) };
+    let _ = awake(bar0, w);
 }

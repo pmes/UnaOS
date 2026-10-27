@@ -6,6 +6,7 @@ use bandy::{SMessage, Synapse};
 use crate::NativeView;
 
 pub fn bootstrap_image_surface(id: &str, synapse: Synapse) -> NativeView {
+    let surface = crate::tetra::surface_number(id); // SURFACEID (SR332): this Surface's number on every pointer message
     let drawing_area = DrawingArea::builder()
         .hexpand(true)
         .vexpand(true)
@@ -46,7 +47,7 @@ pub fn bootstrap_image_surface(id: &str, synapse: Synapse) -> NativeView {
     let motion = gtk4::EventControllerMotion::new();
     let motion_syn = synapse.clone();
     motion.connect_motion(move |_, x, y| {
-        motion_syn.fire(SMessage::BrowserMouseMove(x, y));
+        motion_syn.fire(SMessage::BrowserMouseMove(x, y, surface));
     });
     drawing_area.add_controller(motion);
     // AETHERINPUT (SR68): the surface takes the page's input. A click (fired on release) focuses the
@@ -61,9 +62,9 @@ pub fn bootstrap_image_surface(id: &str, synapse: Synapse) -> NativeView {
         let da = drawing_area.clone();
         click.connect_released(move |_, _n, x, y| {
             da.grab_focus();
-            syn.fire(SMessage::BrowserClick(x, y));
+            syn.fire(SMessage::BrowserClick(x, y, surface));
         });
-        drawing_area.add_controller(click); { let drag = gtk4::GestureDrag::new(); let s = synapse.clone(); drag.connect_drag_begin(move |g, x, y| s.fire(SMessage::BrowserButton { down: true, x, y, mods: button_mods(g.current_event_state()) })); let s = synapse.clone(); drag.connect_drag_end(move |g, dx, dy| { if let Some((x, y)) = g.start_point() { s.fire(SMessage::BrowserButton { down: false, x: x + dx, y: y + dy, mods: button_mods(g.current_event_state()) }); } }); drawing_area.add_controller(drag); } // NLE2B (SR208): the press and the release (BrowserButton) for every drag; GestureClick sends no release past its threshold
+        drawing_area.add_controller(click); { let drag = gtk4::GestureDrag::new(); let s = synapse.clone(); drag.connect_drag_begin(move |g, x, y| s.fire(SMessage::BrowserButton { down: true, x, y, mods: button_mods(g.current_event_state()), surface })); let s = synapse.clone(); drag.connect_drag_end(move |g, dx, dy| { if let Some((x, y)) = g.start_point() { s.fire(SMessage::BrowserButton { down: false, x: x + dx, y: y + dy, mods: button_mods(g.current_event_state()), surface }); } }); drawing_area.add_controller(drag); } // NLE2B (SR208): the press and the release (BrowserButton) for every drag; GestureClick sends no release past its threshold
     }
     {
         let key = gtk4::EventControllerKey::new();

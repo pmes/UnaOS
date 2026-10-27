@@ -28,7 +28,7 @@
 //! | [`ccm`] | AES-CCM (generic M and L; 802.11 CCMP is M=8, L=2) | RFC 3610, SP 800-38C |
 //! | [`keywrap`] | AES Key Wrap (default IV, unwrap integrity check) | RFC 3394 |
 //! | [`cbc`] | CBC mode over AES (whole blocks, PKCS #7 unpad) — PDF's AESV2/AESV3 crypt filters | SP 800-38A §6.2 |
-//! | [`md5`] | MD5 — LEGACY-ONLY (broken): PDF's standard security handler only | RFC 1321 |
+//! | [`md5`] | MD5 — LEGACY-ONLY (broken): PDF's standard security handler and FLAC's STREAMINFO checksum only | RFC 1321 |
 //! | [`rc4`] | RC4 — LEGACY-ONLY (broken, not constant-time): PDF's standard security handler only | RFC 6229 (vectors) |
 //! | [`x25519`] | X25519 | RFC 7748 |
 //! | [`ed25519`] | Ed25519 | RFC 8032 |

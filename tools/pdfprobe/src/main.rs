@@ -8,12 +8,14 @@
 //! pdfprobe <file>
 //! pdfprobe --render <file> <page> <out.png>
 //! pdfprobe --text <file> <page>
+//! pdfprobe --save <in> <out>
 //! ```
 //!
 //! Prints `pages=<n> version=<v> xref=<table|stream|rebuilt> encrypt=<none|rc4-40|rc4-128|aesv2|aesv3|...>
 //! info=<title|->` (encrypt: PDFCRYPT SR315, the file opened with the empty user password), then one line per page:
-//! `page=<i> media=<w>x<h> rotate=<r> ops=<n> fonts=<n> images=<n>` (fonts = the /Resources /Font entries; images =
-//! the /Resources /XObject entries whose /Subtype is /Image, plus the inline images among the page's ops).
+//! `page=<i> media=<w>x<h> rotate=<r> ops=<n> fonts=<n> images=<n> annots=<n> fields=<n>` (fonts = the /Resources /Font
+//! entries; images = the /Resources /XObject entries whose /Subtype is /Image, plus the inline images among the page's
+//! ops; annots = the page's /Annots, fields = those that are widgets of a form field: PDFFORMS SR326).
 //! `--render` (PDF2, LEDGER SR313) draws page `<page>` (0-based) at 72 dpi through `Page::render`, writes it as a PNG, and
 //! prints `page=<i> render=<w>x<h> runs=<text runs> refused=<names|->` (text runs: the strings the page shows, each
 //! drawn by PDF3's `GlyphSink`, unembedded fonts on the bundled faces).
@@ -21,6 +23,10 @@
 //!
 //! `--text` (PDF3, LEDGER SR314) prints page `<page>`'s extracted text (`Page::text` + `spans_to_string`); unembedded
 //! fonts take their advances from the tree's bundled faces (fonts/ beside this crate: Inter, JetBrains Mono, Noto Sans).
+//!
+//! `--save` (PDF-WRITE, LEDGER SR325) opens `<in>` with the empty user password, writes `Document::save` (every reachable
+//! object, a classic xref, decrypted: no /Encrypt) to `<out>`, re-parses it and prints
+//! `save=<out> bytes=<n> pages=<n> encrypt=<source kind> -> <saved kind>`; a page count that differs is an error.
 
 use pdf_core::content::ops;
 use pdf_core::font::{Fallback, GlyphSink, spans_to_string};
@@ -28,7 +34,7 @@ use pdf_core::render::{Glyphs, TextLog, TextRun, TextSink, png};
 use pdf_core::{Document, Object, Page};
 
 fn usage() -> ! {
-    eprintln!("usage: pdfprobe <file> | pdfprobe --render <file> <page> <out.png> | pdfprobe --text <file> <page>");
+    eprintln!("usage: pdfprobe <file> | pdfprobe --render <file> <page> <out.png> | pdfprobe --text <file> <page> | pdfprobe --save <in> <out>");
     std::process::exit(2)
 }
 
@@ -57,12 +63,15 @@ fn page_line(doc: &Document, i: usize, p: &Page) -> String {
     let xobjects = dict_len(b"XObject");
     let images = xobjects.iter().filter(|(_, v)| doc.get(v).as_dict().and_then(|d| d.name(b"Subtype")) == Some(&b"Image"[..])).count()
         + o.iter().filter(|op| op.operator == b"BI").count();
+    let annots = p.annots_with(doc, &[]);
+    let fields = annots.iter().filter(|a| a.field.is_some()).count();
     format!(
-        "page={i} media={}x{} rotate={} ops={} fonts={fonts} images={images}",
+        "page={i} media={}x{} rotate={} ops={} fonts={fonts} images={images} annots={} fields={fields}",
         num(p.media_box[2] - p.media_box[0]),
         num(p.media_box[3] - p.media_box[1]),
         p.rotate,
-        o.len()
+        o.len(),
+        annots.len()
     )
 }
 
@@ -116,8 +125,26 @@ fn render(file: &str, page: &str, out: &str) {
     println!("page={index} render={}x{} runs={} refused={refused}", r.pixmap.w, r.pixmap.h, sink.log.runs.len());
 }
 
+/// `--save <in> <out>`.
+fn save(input: &str, out: &str) {
+    let bytes = std::fs::read(input).unwrap_or_else(|e| fail(e));
+    let doc = Document::parse(&bytes).unwrap_or_else(|e| fail(e));
+    let pages = doc.pages().unwrap_or_else(|e| fail(e)).len();
+    let saved = doc.save();
+    let back = Document::parse(&saved).unwrap_or_else(|e| fail(format!("the saved file does not parse: {e}")));
+    let again = back.pages().unwrap_or_else(|e| fail(e)).len();
+    if again != pages {
+        fail(format!("the saved file has {again} pages, the source {pages}"));
+    }
+    std::fs::write(out, &saved).unwrap_or_else(|e| fail(e));
+    println!("save={out} bytes={} pages={pages} encrypt={} -> {}", saved.len(), doc.encryption(), back.encryption());
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if args.len() == 4 && args[1] == "--save" {
+        return save(&args[2], &args[3]);
+    }
     if args.len() == 5 && args[1] == "--render" {
         render(&args[2], &args[3], &args[4]);
         return;

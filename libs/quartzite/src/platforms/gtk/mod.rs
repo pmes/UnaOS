@@ -193,7 +193,7 @@ impl Backend {
         synapse: bandy::Synapse,
     ) -> Self {
         Self::new_vessel(app_id, title, content_size, move |_window| {
-            crate::platforms::gtk::tetra_eval::eval_tetra(tetra_node, synapse.clone())
+            crate::tetra::SurfaceMap::of(&tetra_node).scope(|| crate::platforms::gtk::tetra_eval::eval_tetra(tetra_node, synapse.clone())) // SURFACEID (SR332): each Surface leaf reads its number
         })
     }
 

@@ -54,7 +54,7 @@ fn opus_vectors_bit_exact() {
         let bytes: Vec<u8> = out.iter().flat_map(|s| s.to_le_bytes()).collect();
         let mut m = Md5::new();
         m.update(&bytes);
-        let md5 = hex(&m.finish());
+        let md5 = hex(&m.finalize());
         let mut detail = String::new();
         if let Ok(dir) = std::env::var("AUDIO_CORE_OPUS_REF") {
             if let Ok(r) = std::fs::read(PathBuf::from(dir).join(format!("{}.dec", name))) {
@@ -121,7 +121,7 @@ fn opus_packet_loss_bit_exact() {
         let bytes: Vec<u8> = out.iter().flat_map(|s| s.to_le_bytes()).collect();
         let mut m = Md5::new();
         m.update(&bytes);
-        let md5 = hex(&m.finish());
+        let md5 = hex(&m.finalize());
         let mut detail = String::new();
         if let Ok(dir) = std::env::var("AUDIO_CORE_OPUS_REF") {
             if let Ok(r) = std::fs::read(PathBuf::from(dir).join(format!("{}_loss.dec", name))) {

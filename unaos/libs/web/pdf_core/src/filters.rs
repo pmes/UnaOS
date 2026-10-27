@@ -8,8 +8,9 @@
 //! wrong or missing, or that stop short: the bytes already produced are kept, as every reader does. The predictors
 //! (§7.4.4.4): PNG 10-15 runs on pixel_core's `png::unfilter_rows` (PIXEL-UNFILTER SR316; the PDF lenient rules —
 //! an unknown filter type reads as None, a short last row is kept — stay here); TIFF 2 lives here (pixel_core has none).
-//! The image codecs (DCT, JPX, CCITTFax, JBIG2) are not decoded here: decoding stops at the first one and the
-//! result carries the raw bytes and the filter's name (PDF2 decodes DCT through pixel_core::jpeg).
+//! The image codecs (DCT, JPX, CCITTFax, JBIG2) stop the chain: decoding stops at the first one and the result
+//! carries the raw bytes and the filter's name (PDF2 decodes DCT through pixel_core::jpeg); [`bilevel`] then decodes
+//! CCITTFax ([`ccitt`]) and JBIG2 ([`jbig2`], over the one MQ coder [`mq`]) to 1-bit rows (PDFFAX SR331). JPX stays raw.
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -18,6 +19,10 @@ use pixel_core::inflate::{self, ByteSource, InflateError, Sink};
 
 use crate::object::{Dict, Object, Stream};
 use crate::{Error, MAX_DECODED};
+
+pub mod ccitt;
+pub mod jbig2;
+pub mod mq;
 
 /// A decoded stream.
 #[derive(Debug, Clone, PartialEq)]
@@ -384,6 +389,61 @@ pub fn run_length(data: &[u8]) -> Result<Vec<u8>, Error> {
         }
         if out.len() > MAX_DECODED {
             return Err(Error::TooLarge);
+        }
+    }
+    Ok(out)
+}
+
+/// CCITTFaxDecode and JBIG2Decode (PDFFAX SR331): `dec` stopped at one of them (its `image_filter`); its bytes become
+/// packed 1-bit rows `w` wide (`w.div_ceil(8)` bytes a row), `h` rows, cropped or white-padded, in the PDF sample
+/// sense (§7.4.6-7.4.7: black is 0, or 1 under CCITT /BlackIs1 true). The /JBIG2Globals stream is undone by
+/// [`decode`] itself; `resolve` dereferences its entries.
+pub fn bilevel(dec: &Decoded, resolve: &dyn Fn(&Object) -> Object, w: usize, h: usize) -> Result<Vec<u8>, Error> {
+    let parms = dec.image_parms.as_ref();
+    let int = |k: &[u8]| parms.and_then(|p| p.get(k)).map(resolve).and_then(|o| o.as_int());
+    let flag = |k: &[u8], dflt: bool| match parms.and_then(|p| p.get(k)).map(resolve) {
+        Some(Object::Bool(b)) => b,
+        _ => dflt,
+    };
+    let (bits, bw, white) = match dec.image_filter.as_deref() {
+        Some(b"CCITTFaxDecode") => {
+            let p = ccitt::Params {
+                k: int(b"K").unwrap_or(0),
+                columns: int(b"Columns").filter(|&c| c > 0).map_or(1728, |c| c as usize),
+                rows: int(b"Rows").filter(|&r| r > 0).map_or(0, |r| r as usize),
+                black_is_1: flag(b"BlackIs1", false),
+                byte_align: flag(b"EncodedByteAlign", false),
+                end_of_line: flag(b"EndOfLine", false),
+                end_of_block: flag(b"EndOfBlock", true),
+            };
+            (ccitt::decode(&dec.data, &p)?, p.columns, !p.black_is_1)
+        }
+        Some(b"JBIG2Decode") => {
+            let globals = match parms.and_then(|p| p.get(b"JBIG2Globals")).map(resolve) {
+                Some(Object::Stream(g)) => Some(decode(&g, resolve)?.data),
+                _ => None,
+            };
+            let bm = jbig2::decode(&dec.data, globals.as_deref())?;
+            (bm.pack(true), bm.w, true)
+        }
+        _ => return Err(Error::Unsupported("image codec")),
+    };
+    let (src, dst) = (bw.div_ceil(8), w.div_ceil(8));
+    if dst.saturating_mul(h) > MAX_DECODED {
+        return Err(Error::TooLarge);
+    }
+    let mut out = vec![if white { 0xFF } else { 0 }; dst * h];
+    let have = if src == 0 { 0 } else { (bits.len() / src).min(h) };
+    for y in 0..have {
+        let from = &bits[y * src..(y + 1) * src];
+        if bw == w {
+            out[y * dst..(y + 1) * dst].copy_from_slice(from);
+            continue;
+        }
+        for x in 0..w.min(bw) {
+            let m = 0x80u8 >> (x % 8);
+            let o = &mut out[y * dst + x / 8];
+            if from[x / 8] & m != 0 { *o |= m } else { *o &= !m }
         }
     }
     Ok(out)

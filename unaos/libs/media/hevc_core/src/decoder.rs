@@ -70,7 +70,8 @@ pub struct Decoder {
     prev_tid0_poc: i32,
     /// (sps_max_num_reorder_pics, SpsMaxLatencyPictures or 0, sps_max_dec_pic_buffering) of the active SPS.
     bump: (u32, u32, u32),
-    /// HEVCREXT (SR334): the consumer shows 4:2:0 only, so 4:2:2 / 4:4:4 are refused by name ([`Decoder::set_chroma_420_only`]).
+    /// HEVCREXT (SR334): the consumer shows 4:2:0 at one bit depth only, so 4:2:2 / 4:4:4 and unequal luma / chroma depths
+    /// are refused by name ([`Decoder::set_chroma_420_only`]).
     chroma_420_only: bool,
 }
 
@@ -144,9 +145,10 @@ impl Decoder {
         }
     }
 
-    /// HEVCREXT (SR334): a consumer that can only display 4:2:0 (gneiss_pal's `to_rgba` until COLOURONE-422) asks for
-    /// 4:2:2 / 4:4:4 streams to be refused by name at SPS activation, so its player keeps the labelled stand-in instead
-    /// of showing wrong colours. Kept across [`Decoder::reset`].
+    /// HEVCREXT (SR334): a consumer that can only display 4:2:0 at one bit depth (gneiss_pal's `to_frame` / `Pixels::I420Hi`
+    /// carry one `bit_depth`, until COLOURONE-422) asks for 4:2:2 / 4:4:4 streams and unequal luma / chroma depths to be
+    /// refused by name at SPS activation, so its player keeps the labelled stand-in instead of showing wrong colours.
+    /// Kept across [`Decoder::reset`].
     pub fn set_chroma_420_only(&mut self, on: bool) {
         self.chroma_420_only = on;
     }
@@ -337,6 +339,9 @@ impl Decoder {
             check_supported(&sps, &pps)?;
             if self.chroma_420_only && sps.chroma_format_idc != 1 {
                 return Err(Error::Unsupported("chroma 4:2:2 / 4:4:4 not displayable yet (COLOURONE-422)"));
+            }
+            if self.chroma_420_only && sps.bit_depth_luma != sps.bit_depth_chroma {
+                return Err(Error::Unsupported("luma and chroma bit depths differ (COLOURONE-422)"));
             }
             self.start_picture(nal, &sh, sps, pps, poc)?;
             return self.decode_segment(sh, rbsp);

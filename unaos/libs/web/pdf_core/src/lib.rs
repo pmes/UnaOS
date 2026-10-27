@@ -25,6 +25,10 @@
 //! * [`render`]: PDF2 (SR313) — the content interpreter (§8: graphics state, paths, clips, colour spaces, functions,
 //!   images, shadings, form XObjects) painting through svg_core's rasterizer; `Page::render`; text goes to a `TextSink`.
 //! * [`font`]: PDF3 (SR314) — font dictionaries, encodings and CMaps, glyph outlines through font_core, text extraction.
+//! * [`annots`]: PDFFORMS (SR326) — annotations, destinations, link actions and the AcroForm; `Page::render` paints
+//!   their appearances after the content; `Form::set_value` returns the edits a writer serializes.
+//! * [`write`]: PDF-WRITE (SR325) — `Document::save` / [`write::Edit`] (full and incremental save, classic xref, saving
+//!   decrypts) and [`write::Builder`] / [`write::from_rgba`] (print to PDF), through pixel_core's compressor.
 //!
 //! Everything is bounded: nesting and reference chains by [`MAX_DEPTH`], object counts by [`MAX_OBJECTS`], every
 //! decoded stream by [`MAX_DECODED`], the page tree by [`MAX_PAGES`] and a visited set.
@@ -43,9 +47,12 @@ pub mod xref;
 pub mod render;
 pub mod font;
 pub mod crypt;
+pub mod annots;
+pub mod write;
 
 pub use doc::{Document, Info, Page, XrefKind};
 pub use object::{Dict, Object, Ref, Stream};
+pub use annots::{Annot, Field, Form};
 
 /// The deepest nesting (arrays, dictionaries, page-tree levels) and the longest reference chain followed.
 pub const MAX_DEPTH: usize = 64;

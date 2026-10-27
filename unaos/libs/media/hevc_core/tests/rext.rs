@@ -385,6 +385,11 @@ fn g_table_8_3_and_the_refusals_by_name() {
         d.set_chroma_420_only(true);
         assert_eq!(d.decode_annexb(&dc32(&cfg32(idc, 8))).unwrap_err(), Error::Unsupported("chroma 4:2:2 / 4:4:4 not displayable yet (COLOURONE-422)"));
     }
+    // ... and unequal luma / chroma depths (I420Hi carries one bit_depth), which decode without the gate (b).
+    let mut d = Decoder::new();
+    d.set_chroma_420_only(true);
+    let unequal = SpsCfg { chroma_bit_depth: Some(8), ..cfg32(1, 10) };
+    assert_eq!(d.decode_annexb(&dc32(&unequal)).unwrap_err(), Error::Unsupported("luma and chroma bit depths differ (COLOURONE-422)"));
     let mut d = Decoder::new();
     d.set_chroma_420_only(true);
     d.decode_annexb(&dc32(&cfg32(1, 8))).expect("4:2:0 through the gate");

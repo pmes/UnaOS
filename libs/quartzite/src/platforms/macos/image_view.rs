@@ -113,6 +113,8 @@ pub struct FacetImageIvars {
     /// given size at most once (dedupes the guaranteed end-of-drag fire against
     /// a throttled one that already carried the same size).
     last_resize_sent: Cell<Option<(u32, u32)>>,
+    /// SURFACEID (SR332): this Surface's number in its tetra tree, on every pointer message it fires.
+    surface: Cell<u32>,
 }
 
 /// Coarse tracking cadence during a live-resize drag: one `BrowserResize` per
@@ -143,6 +145,7 @@ define_class!(
                 live_resize: Cell::new(false),
                 last_resize_fire: Cell::new(None),
                 last_resize_sent: Cell::new(None),
+                surface: Cell::new(0),
             });
             unsafe { msg_send![super(this), initWithFrame: frame] }
         }
@@ -231,7 +234,7 @@ define_class!(
                 // fingers-down/content-up in natural scrolling; the engine
                 // wants positive dy = scroll further down the document).
                 if dy != 0.0 {
-                    syn.fire(bandy::SMessage::BrowserScroll(0.0, -dy * 3.0));
+                    syn.fire(bandy::SMessage::BrowserScroll(0.0, -dy * 3.0, self.ivars().surface.get()));
                 }
                 return;
             }
@@ -263,7 +266,7 @@ define_class!(
         fn mouse_down(&self, event: &AnyObject) {
             // Anchor the pan and take key focus for reset-to-fit.
             let win = self.event_window_point(event);
-            self.ivars().drag_anchor.set(Some(win)); let syn = self.ivars().synapse.borrow().clone(); if let (Some(syn), Some((px, py))) = (syn, self.surface_point(event)) { syn.fire(bandy::SMessage::BrowserButton { down: true, x: px, y: py, mods: { let f: usize = unsafe { msg_send![event, modifierFlags] }; ((f >> 17) & 0xF) as u8 } }); } // NLE2B (SR208): the press; NLE2-MODS (SR306): modifierFlags bits 17-20 (shift, control, option, command) are bandy's MOD_* bits 0-3
+            self.ivars().drag_anchor.set(Some(win)); let syn = self.ivars().synapse.borrow().clone(); if let (Some(syn), Some((px, py))) = (syn, self.surface_point(event)) { syn.fire(bandy::SMessage::BrowserButton { down: true, x: px, y: py, mods: { let f: usize = unsafe { msg_send![event, modifierFlags] }; ((f >> 17) & 0xF) as u8 }, surface: self.ivars().surface.get() }); } // NLE2B (SR208): the press; NLE2-MODS (SR306): modifierFlags bits 17-20 (shift, control, option, command) are bandy's MOD_* bits 0-3
             if let Some(window) = self.window() {
                 let _: bool = unsafe { msg_send![&window, makeFirstResponder: self] };
             }
@@ -271,7 +274,7 @@ define_class!(
 
         #[unsafe(method(mouseDragged:))]
         fn mouse_dragged(&self, event: &AnyObject) {
-            if let Some(syn) = self.ivars().synapse.borrow().clone() { if let Some((px, py)) = self.surface_point(event) { syn.fire(bandy::SMessage::BrowserMouseMove(px, py)); } // NLE2B (SR208): a button-held drag moves too
+            if let Some(syn) = self.ivars().synapse.borrow().clone() { if let Some((px, py)) = self.surface_point(event) { syn.fire(bandy::SMessage::BrowserMouseMove(px, py, self.ivars().surface.get())); } // NLE2B (SR208): a button-held drag moves too
                 return; // browser surface: no picture panning
             }
             let (nx, ny) = self.event_window_point(event);
@@ -302,8 +305,8 @@ define_class!(
                     if dw > 0.0 && dh > 0.0 && iw > 0 && ih > 0 {
                         let px = (vx - dx) / dw * iw as f64;
                         let py = ih as f64 - ((vy - dy) / dh * ih as f64);
-                        syn.fire(bandy::SMessage::BrowserButton { down: false, x: px, y: py, mods: { let f: usize = unsafe { msg_send![event, modifierFlags] }; ((f >> 17) & 0xF) as u8 } }); if px >= 0.0 && px < iw as f64 && py >= 0.0 && py < ih as f64 { // NLE2B (SR208): the release, off the frame too
-                            syn.fire(bandy::SMessage::BrowserClick(px, py));
+                        syn.fire(bandy::SMessage::BrowserButton { down: false, x: px, y: py, mods: { let f: usize = unsafe { msg_send![event, modifierFlags] }; ((f >> 17) & 0xF) as u8 }, surface: self.ivars().surface.get() }); if px >= 0.0 && px < iw as f64 && py >= 0.0 && py < ih as f64 { // NLE2B (SR208): the release, off the frame too
+                            syn.fire(bandy::SMessage::BrowserClick(px, py, self.ivars().surface.get()));
                         }
                     }
                 }
@@ -324,7 +327,7 @@ define_class!(
                 // (hover, `:hover`, the page's mouse events); the page's cursor is re-asserted
                 // (AppKit resets it to the arrow as the pointer crosses views).
                 if let Some((px, py)) = self.surface_point(event) {
-                    syn.fire(bandy::SMessage::BrowserMouseMove(px, py));
+                    syn.fire(bandy::SMessage::BrowserMouseMove(px, py, self.ivars().surface.get()));
                 }
                 self.apply_page_cursor();
                 return;
@@ -891,7 +894,7 @@ pub fn bootstrap_image_surface(id: &str, synapse: bandy::Synapse) -> Retained<NS
 
     let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(800.0, 600.0));
     let view = FacetImageView::new(mtm, frame);
-    *view.ivars().synapse.borrow_mut() = Some(synapse.clone());
+    *view.ivars().synapse.borrow_mut() = Some(synapse.clone()); view.ivars().surface.set(crate::tetra::surface_number(id)); // SURFACEID (SR332)
 
     let bound = std::sync::Arc::new(dispatch2::MainThreadBound::new(view.clone(), mtm));
     let mut rx = synapse.subscribe();

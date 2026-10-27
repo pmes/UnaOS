@@ -407,7 +407,7 @@ impl Backend {
             // arrive over bandy and are written onto this window. Inert for a
             // tetra vessel that is not a browser — nothing else fires those.
             crate::platforms::macos::window_title::bind_browser_title(window, synapse.clone());
-            crate::platforms::macos::tetra_eval::eval_tetra(tetra_node, synapse.clone())
+            crate::tetra::SurfaceMap::of(&tetra_node).scope(|| crate::platforms::macos::tetra_eval::eval_tetra(tetra_node, synapse.clone())) // SURFACEID (SR332): each Surface leaf reads its number
         })
     }
 

@@ -4,8 +4,10 @@
 //! Images (ISO 32000-1 §8.9): image XObjects and inline images (§8.9.7, the abbreviations rebuilt as a stream so
 //! `filters::decode` is the one decoder) to a premultiplied svg_core `Pixmap`. DCTDecode goes through
 //! `pixel_core::jpeg`; raw samples at 1/2/4/8/16 bits per component with /Decode through the colour space; /ImageMask
-//! stencils (painted later in the fill colour); /SMask as alpha. JPX, CCITTFax and JBIG2 are refused by name (the
-//! caller draws a grey box). Explicit and colour-key /Mask and /Matte are owed (PDF-IMGMASK).
+//! stencils (painted later in the fill colour); /SMask as alpha. CCITTFax and JBIG2 decode to 1-bit rows through
+//! `filters::bilevel` and take the stencil or bpc-1 sample path (PDFFAX SR331; a feature their decoders refuse is
+//! refused by its name). JPX is refused by name (the caller draws a grey box; PDF-JPX owed). Explicit and colour-key
+//! /Mask and /Matte are owed (PDF-IMGMASK).
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -14,6 +16,7 @@ use svg_core::raster::Pixmap;
 
 use super::colour::ColourSpace;
 use crate::doc::Document;
+use crate::filters::{self, Decoded};
 use crate::object::{Dict, Object, Stream};
 
 /// A decoded image.
@@ -69,6 +72,7 @@ fn decode(s: &Stream, res: &Dict, doc: &Document, depth: usize) -> Option<Img> {
     let smooth = matches!(get(b"Interpolate"), Some(Object::Bool(true)));
     let stencil = matches!(get(b"ImageMask"), Some(Object::Bool(true)));
     let dec = doc.decode(s).ok()?;
+    let (dec, bits1) = match bilevel_of(dec, doc, w, h) { Ok(v) => v, Err(why) => return Some(Img::Refused(why)) };
     let mut pix = if let Some(f) = &dec.image_filter {
         match f.as_slice() {
             b"DCTDecode" => {
@@ -78,9 +82,8 @@ fn decode(s: &Stream, res: &Dict, doc: &Document, depth: usize) -> Option<Img> {
                 p.data.copy_from_slice(&img.rgba);
                 p
             }
-            b"JPXDecode" => return Some(Img::Refused("JPXDecode")),
-            b"CCITTFaxDecode" => return Some(Img::Refused("CCITTFaxDecode")),
-            _ => return Some(Img::Refused("JBIG2Decode")),
+            // CCITTFax and JBIG2 became 1-bit rows above; JPX is owed (PDF-JPX: mq.rs is its first piece).
+            _ => return Some(Img::Refused("JPXDecode")),
         }
     } else if stencil {
         let decode = nums(doc, get(b"Decode")).unwrap_or_else(|| vec![0.0, 1.0]);
@@ -98,7 +101,7 @@ fn decode(s: &Stream, res: &Dict, doc: &Document, depth: usize) -> Option<Img> {
         }
         return Some(Img::Stencil { pix: p, smooth });
     } else {
-        let bpc = int(b"BitsPerComponent").unwrap_or(8) as u32;
+        let bpc = if bits1 { 1 } else { int(b"BitsPerComponent").unwrap_or(8) as u32 };
         if !matches!(bpc, 1 | 2 | 4 | 8 | 16) {
             return None;
         }
@@ -179,5 +182,20 @@ fn apply_alpha(pix: &mut Pixmap, m: &Pixmap) {
                 *c = svg_core::raster::div255(*c as u32 * a) as u8;
             }
         }
+    }
+}
+
+/// CCITTFaxDecode / JBIG2Decode (PDFFAX SR331): their rows through `filters::bilevel`, flagged as 1 bit per sample;
+/// any other stream passes through. A refusal carries the decoder's feature name, else the filter's.
+fn bilevel_of(dec: Decoded, doc: &Document, w: usize, h: usize) -> Result<(Decoded, bool), &'static str> {
+    let name = match dec.image_filter.as_deref() {
+        Some(b"CCITTFaxDecode") => "CCITTFaxDecode",
+        Some(b"JBIG2Decode") => "JBIG2Decode",
+        _ => return Ok((dec, false)),
+    };
+    match filters::bilevel(&dec, &|o| doc.get(o), w, h) {
+        Ok(data) => Ok((Decoded { data, image_filter: None, image_parms: None }, true)),
+        Err(crate::Error::Unsupported(why)) => Err(why),
+        Err(_) => Err(name),
     }
 }

@@ -29,6 +29,11 @@ pub struct Page {
     pub resources: Dict,
     /// Every /Contents stream decoded and joined with a newline.
     pub contents: Vec<u8>,
+    /// The page dictionary's own /Annots as written (a reference or an array; not inherited), null when absent
+    /// (PDFFORMS SR326: `crate::annots` reads it).
+    pub annots: Object,
+    /// The page object's reference (`None` for a page written directly inside /Kids): what a destination names.
+    pub obj: Option<Ref>,
 }
 
 /// The document information dictionary's text strings.
@@ -299,13 +304,14 @@ impl Document {
             _ => return Err(Error::Missing),
         };
         let mut out = Vec::new();
-        self.walk(&node, Inherit::default(), 0, &mut visited, &mut out)?;
+        self.walk(&node, root.as_ref(), Inherit::default(), 0, &mut visited, &mut out)?;
         Ok(out)
     }
 
     fn walk(
         &self,
         node: &Dict,
+        me: Option<Ref>,
         mut inh: Inherit,
         depth: usize,
         visited: &mut BTreeSet<Ref>,
@@ -340,7 +346,7 @@ impl Document {
                     }
                 }
                 if let Object::Dict(d) = self.get(kid) {
-                    self.walk(&d, inh.clone(), depth + 1, visited, out)?;
+                    self.walk(&d, kid.as_ref(), inh.clone(), depth + 1, visited, out)?;
                 }
             }
             return Ok(());
@@ -357,6 +363,8 @@ impl Document {
             rotate,
             resources: inh.resources.unwrap_or_default(),
             contents: self.contents(node.get(b"Contents")),
+            annots: node.get(b"Annots").cloned().unwrap_or(Object::Null),
+            obj: me,
         });
         Ok(())
     }
@@ -382,7 +390,7 @@ impl Document {
         out
     }
 
-    fn rect(&self, o: Option<&Object>) -> Option<[f64; 4]> {
+    pub(crate) fn rect(&self, o: Option<&Object>) -> Option<[f64; 4]> {
         let a = self.get(o?);
         let a = a.as_array()?;
         if a.len() != 4 {
