@@ -1095,4 +1095,4 @@ refs/heads/exec-rmbp-xhciloanptpyield   05beb9fa9 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-hidmaskcore   05beb9fa9 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-leakedsurfgrow   05beb9fa9 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-gen7lockheld   05beb9fa9 IN-FLIGHT cut 2026-10-27
-refs/heads/exec-rmbp-flushverdictone   05beb9fa9 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-flushverdictone   225bddeba FOLDED-BY-HAND (this commit) 2026-10-27
