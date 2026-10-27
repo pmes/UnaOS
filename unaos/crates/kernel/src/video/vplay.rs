@@ -987,7 +987,7 @@ fn edl_run(jid: u32, path: &str, seek_ms: u64, rep: &mut EdlReport) -> Result<()
         if pts_ms < seek_ms {
             continue; // a Player seek: the steps before it decoded unseen (job_task's rule)
         }
-        room(jid).map_err(|why| (why, None))?;
+        face_preview(seek_ms, rep, s.out_t, &frame); room(jid).map_err(|why| (why, None))?; // NLE6MIXFACE (rmbp-ledger B957): the first frame a Player seek shows (file tail)
         {
             let mut g = JOB.lock();
             let Some(j) = g.as_mut().filter(|j| j.jid == jid) else { return Err(("superseded", None)) };
@@ -1667,4 +1667,31 @@ mod snd {
     }
     pub fn drain(_: u32) {}
     pub fn close(_: &mut super::EdlReport) {}
+}
+
+// ── NLE6MIXFACE (rmbp-ledger B957): the face's transition preview — the first frame a Player seek shows ──────────────
+// handlers.md §5 NLE6's NLE6MIX-FACE. The on-UnaOS face is the Player's EDL mode; its scrubber / arrow seek is `vid::seek` ->
+// [`start_at`] -> [`edl_run`], which walks every step from 0 (each transition step mixed by [`edl_mix`] through timeline_core's
+// ONE `vmix::mix_step`) and queues from the seek's tick on: a seek or pause inside a transition shows the MIXED frame, no
+// second mixer. This records what the seek showed: the job's first queued frame after a seek > 0, its tick, whether
+// `edl_mix` mixed it (its `rep.mixes` entry is this tick) and its FNV-1a 64. Wire: `[nle] face preview tick=<n> mixed=<0|1>`
+// (once per seek job); `tests nle` takes it through [`face_preview_take`] (player.rs `nle_fx::face_leg`).
+
+/// `(output tick, mixed, FNV-1a 64 of the RGBA)` of the last seek job's first queued frame; written by `play-vedl`, taken by the witness.
+static PREVIEW: crate::sync::Mutex<Option<(i64, bool, u64)>> = crate::sync::Mutex::new(None);
+
+/// The seek job's first queued frame (`seek_ms > 0`, nothing queued yet): named on the wire and kept for the witness.
+fn face_preview(seek_ms: u64, rep: &EdlReport, out_t: i64, f: &Frame) {
+    if seek_ms == 0 || rep.frames > 0 {
+        return;
+    }
+    let mix = rep.mixes.last().filter(|m| m.0 == out_t).map(|m| m.1);
+    let sum = mix.unwrap_or_else(|| frame_fnv_rgba(&unpack(&f.px)));
+    serial_println!("[nle] face preview tick={} mixed={}", out_t, mix.is_some() as u8);
+    *PREVIEW.lock() = Some((out_t, mix.is_some(), sum));
+}
+
+/// The last seek job's preview, cleared (`None` before one queued a frame).
+pub fn face_preview_take() -> Option<(i64, bool, u64)> {
+    PREVIEW.lock().take()
 }

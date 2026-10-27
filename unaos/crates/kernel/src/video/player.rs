@@ -1340,7 +1340,7 @@ mod nle_fx {
         let b = tl.add_source(REELS[1], FRAMES as i64);
         let c = tl.add_source(REELS[2], 4);
         tl.add_track(Kind::Video);
-        tl.tracks[0].clips = alloc::vec![Clip::new(a, 13, 23, 0), Clip::new(b, 0, 10, 10), Clip::new(a, 23, 33, 25), Clip::new(c, 0, 4, 35)];
+        tl.tracks[0].clips = alloc::vec![Clip::new(a, 13, 23, 0), Clip::new(b, 0, 10, 10), Clip::new(a, 23, 33, 25), Clip::new(c, 0, 4, 35)]; with_v2(&mut tl, b); // NLE6MIXFACE (rmbp-ledger B957): V2 over V1 before the dissolve (module tail)
         tl.add_transition(0, 10, TransitionKind::Dissolve, 4)?.add_transition_to_black(0, 20, TransitionKind::Wipe(WipeDir::LeftToRight), 4)
     }
 
@@ -1403,13 +1403,13 @@ mod nle_fx {
         let rep = vplay::edl_report().unwrap_or_default();
         let err = STATE.lock().as_ref().and_then(|s| s.err.clone());
         let ended = STATE.lock().as_ref().map(|s| s.ended).unwrap_or(false);
-        super::close("fixture"); let env = env_take(false); // NLE6MIXAUDIO (rmbp-ledger B953): the periods mixed during the run
+        let face = face_leg(); super::close("fixture"); let env = env_take(false); // NLE6MIXAUDIO (rmbp-ledger B953): the periods mixed during the run
         // the schedule's ordinal at an output tick: the reel's base + the step's source tick
         let want = |t: i64| rep.plan.iter().find(|s| s.0 == t).and_then(|s| s.1).map(|(src, st)| BASE.get(src as usize).copied().unwrap_or(0) + st as u32);
         let agree = shown.iter().filter(|(t, n)| want(*t) == Some(*n)).count();
         let seek_steps = rep.plan.iter().filter(|s| s.2).count() as u64;
         let kat = MIX_KAT.iter().filter(|k| rep.mixes.contains(*k)).count();
-        let mix_ok = rep.mixed == 8 && rep.mix_refused == 0 && kat == MIX_KAT.len();
+        let mix_ok = rep.mixed == 8 && rep.mix_refused == 0 && kat == MIX_KAT.len(); let mix_ok = mix_ok && face_verdict(&rep, face); // NLE6MIXFACE (rmbp-ledger B957): the fresh outgoing run and the seek preview (module tail)
         let colour = rep.coded.iter().filter(|k| **k == COLOUR_KAT).count(); // KERNELCOLOUR (B952): NLEFXC's middle frame by BT.709
         let ok = open_ok && err.is_none() && ended && pres > 0 && !shown.is_empty() && agree == shown.len() && pres + drop == rep.frames && rep.seeks == seek_steps && mix_ok && colour == 1; let (env_ok, env_word) = env_verdict(&env, &rep); let ok = ok && env_ok; // NLE6MIXAUDIO (rmbp-ledger B953): the dissolve's sound (module tail)
         serial_println!(
@@ -1475,5 +1475,51 @@ mod nle_fx {
             got, ENV_KAT, p0, env.len(), rep.xfades, rep.snd_refused, rep.snd_underruns, rep.snd_frames
         );
         (ok, if ok { "ok" } else { "FAIL" })
+    }
+
+    // ── NLE6MIXFACE (rmbp-ledger B957): V2 over V1's dissolve — a FRESH outgoing run — and the face's seek preview ───────
+    // A transition's outgoing is the previous clip on its own track (timeline_core `vmix_for`). V2 here shows B 30..34 at
+    // ticks 6..10, over V1's A: at the cut V1's outgoing A no longer continues the live run (V2's B), so the schedule seeks
+    // it and the job opens a fresh outgoing run (`mix_seeks` 1; A from its keyframe 20, the run-up 20..22 unseen). Then the
+    // Player's own seek door (`vid::seek`, the scrubber's) lands at tick 10, and the job's first queued frame there must be
+    // the MIXED one (vplay `face_preview`). `PREVIEW_KAT` is tick 10, the dissolve at k=0 (t = 1/5, alpha 51): outgoing A
+    // ord 1023 (level 51) under incoming B ord 2000 (level 28), a flat 46; host-derived by the arc's kat.py (pixel_core's
+    // `blend_nonpremult`, which reproduces `MIX_KAT`'s tick 11) and re-derived by timeline_core `vmix::tests::kernel_fixture_pins`
+    // through the SAME `vmix::mix_step`.
+    const PREVIEW_KAT: (i64, u64) = (10, 0x575a_f060_ca99_7325);
+
+    /// V2: B 30..34 at 6 (reel NLEFXB again: no new reel), ending at V1's dissolve cut.
+    fn with_v2(tl: &mut Timeline, b: timeline_core::SourceId) {
+        let v2 = tl.add_track(Kind::Video);
+        tl.tracks[v2].clips = alloc::vec![Clip::new(b, 30, 34, 6)];
+    }
+
+    /// The face's preview: the Player seeks to `PREVIEW_KAT`'s tick through `vid::seek`; the seek job's first queued frame
+    /// (`vplay::face_preview_take`), or `None` when the Player is closed or nothing lands in 5 s.
+    fn face_leg() -> Option<(i64, bool, u64)> {
+        let _ = vplay::face_preview_take();
+        let ms = (PREVIEW_KAT.0 * 1000 / FPS as i64) as u64;
+        super::vid::seek(ms)?;
+        let t0 = crate::arch::ms();
+        loop {
+            hw::pump_until(4, || false);
+            super::vid::tick();
+            if let Some(p) = vplay::face_preview_take() {
+                return Some(p);
+            }
+            if crate::arch::ms().saturating_sub(t0) > 5_000 {
+                return None;
+            }
+            crate::arch::sched::sleep_ms(4);
+        }
+    }
+
+    /// The verdict: a fresh outgoing run opened (`mix_seeks >= 1`), the play-through mixed `PREVIEW_KAT`, and the seek showed it.
+    fn face_verdict(rep: &vplay::EdlReport, face: Option<(i64, bool, u64)>) -> bool {
+        let pin = rep.mixes.contains(&PREVIEW_KAT);
+        let ok = rep.mix_seeks >= 1 && pin && face == Some((PREVIEW_KAT.0, true, PREVIEW_KAT.1));
+        let pv = face.map(|(t, m, f)| alloc::format!("tick={},mixed={},fnv={:x}", t, m as u8, f)).unwrap_or_else(|| String::from("none"));
+        serial_println!("[nle] fixture face mix_seeks={} pin={} preview={} -> {}", rep.mix_seeks, pin as u8, pv, if ok { "ok" } else { "FAIL" });
+        ok
     }
 }
