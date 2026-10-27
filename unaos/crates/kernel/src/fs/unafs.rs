@@ -2806,7 +2806,7 @@ fn ra_window(handle: block::BlockHandle) -> u64 {
     match handle {
         #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
         block::BlockHandle::Sdhc => (crate::drivers::sdhc::MB_MAX_BLOCKS as u64).min(block::MAX_BLOCKS_PER_OP as u64),
-        _ => 0,
+        #[cfg(all(target_arch = "x86_64", feature = "nvme"))] block::BlockHandle::Nvme => (crate::drivers::nvme::xfer_sectors() as u64).min(block::MAX_BLOCKS_PER_OP as u64), _ => 0, // NVMEBATCHREAD (zenbook-ledger Z24): the NVMe window is the MDTS span, so one window fill is ONE READ command; 0 on a non-512 namespace (SAME-LINE fold)
     }
 }
 
@@ -2822,7 +2822,7 @@ fn map_block_err(at: u64, e: BlockError) -> SectorError {
 
 /// `buf.len() / 512` consecutive sectors from `lba`: one counted read per block-layer op on the SD card,
 /// the per-sector loop elsewhere.
-fn handle_read_multi(handle: block::BlockHandle, lba: u64, buf: &mut [u8]) -> Result<(), SectorError> {
+fn handle_read_multi(handle: block::BlockHandle, lba: u64, buf: &mut [u8]) -> Result<(), SectorError> { #[cfg(all(target_arch = "x86_64", feature = "nvme"))] if handle == block::BlockHandle::Nvme { return nvme_read_multi(lba, buf); } // NVMEBATCHREAD (zenbook-ledger Z24): a window fill is ONE read run on the NVMe, never eight 512 B reads (LINE-NEUTRAL fold, before this comment)
     #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
     if let block::BlockHandle::Sdhc = handle {
         let per = block::MAX_BLOCKS_PER_OP * 512;
@@ -5070,6 +5070,36 @@ fn nvme_root_one(span: &PartitionSpan) -> bool {
             NVME_ROOT_NONE.store(true, Ordering::Release);
             false
         }
+        Err(_) => false,
+    }
+}
+
+// =================================================================================================
+// NVMEBATCHREAD (zenbook-ledger Z24) — the NVMe read path through the BOOT80 read-ahead window.
+// TAIL-APPENDED (no line above moves). `ra_window`'s Nvme arm (the MDTS span, `drivers::nvme::xfer_sectors`)
+// sends `SdSectorDevice::read_sectors` through the existing `RaSet` (its coherence `splitwrite::ra_sync` is
+// handle-agnostic), and `handle_read_multi`'s Nvme fold lands the window fill here: ONE `block::read_blocks_nvme`
+// per MAX_BLOCKS_PER_OP chunk, which `drivers::nvme::transfer` issues as ONE READ when it fits `max_xfer`.
+// =================================================================================================
+
+/// NVMEBATCHREAD: `buf.len() / 512` consecutive sectors from `lba` on the NVMe — the Sdhc arm's shape.
+#[cfg(all(target_arch = "x86_64", feature = "nvme"))]
+fn nvme_read_multi(lba: u64, buf: &mut [u8]) -> Result<(), SectorError> {
+    let per = block::MAX_BLOCKS_PER_OP * 512;
+    for (i, c) in buf.chunks_mut(per).enumerate() {
+        let at = lba + (i * block::MAX_BLOCKS_PER_OP) as u64;
+        block::read_blocks_nvme(at, c).map_err(|e| map_block_err(at, e))?;
+    }
+    Ok(())
+}
+
+/// NVMEBATCHREAD: `tests nvme`'s `rpath` leg — read `out.len() / 512` sectors at `lba` through a FRESH mount-shaped
+/// device on the NVMe (the read path a UnaFS root rides). `false` when the device has no read-ahead window or the
+/// read fails; the caller counts the READ commands it cost.
+#[cfg(all(target_arch = "x86_64", feature = "nvme"))]
+pub fn nvme_read_leg(lba: u64, out: &mut [u8]) -> bool {
+    match SdSectorDevice::open_on(block::BlockHandle::Nvme) {
+        Ok(mut dev) => dev.ra.window_sectors() > 1 && dev.read_sectors(lba, out).is_ok(),
         Err(_) => false,
     }
 }
