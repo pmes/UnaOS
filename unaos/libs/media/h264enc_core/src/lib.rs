@@ -6,7 +6,8 @@
 //!
 //! CHARTER: Stria (A/V) — seam `shared-core` (a `no_std` lib both rings link, beside h264_core).
 //!
-//! What it writes: Constrained Baseline (profile_idc 66, constraint_set0/1), CAVLC, frames only,
+//! What it writes: Constrained Baseline (profile_idc 66, constraint_set0/1), CAVLC, or Main
+//! (profile_idc 77, constraint_set1) with CABAC ([`Config::entropy`], H264ENCCABAC SR310), frames only,
 //! one slice per picture, constant QP (16..=40) or rate-controlled ([`Config::rate`], H264ENCRC SR218). An IDR every `gop` frames, P frames between them
 //! against the previous reconstruction (one reference frame). Macroblocks: Intra_4x4 and
 //! Intra_16x16 (the SAD-cheapest mode of each, chroma likewise) in I slices; P_Skip and
@@ -24,6 +25,7 @@
 //! | `deblock`        | bool          | false   | idc 0 + h264_core's `deblock_picture` over the recon    |
 //! | `subpel`         | 0 / 1 / 2     | 0       | motion refinement: integer / half / quarter (>2 = 2)    |
 //! | `rate`           | `Option<RateControl>` | None | CBR / VBR: `qp` starts, [`rc`] picks each picture's and row's QP |
+//! | `entropy`        | [`Entropy`]   | Cavlc   | Cabac: Main profile, entropy_coding_mode_flag 1, [`cabac`] writes the slice data |
 //!
 //! | module          | Recommendation                                                          |
 //! |-----------------|-------------------------------------------------------------------------|
@@ -32,6 +34,7 @@
 //! | [`transform`]   | 8.5 forward: 4x4 core transform, DC Hadamards, quantiser                 |
 //! | [`intra`]       | 8.3 mode decision over h264_core's predictors, 8.3.1.1 mode coding       |
 //! | [`cavlc`]       | 9.2 residual_block_cavlc written, 9.2.1 nC                               |
+//! | [`cabac`]       | 9.3.4 the arithmetic encoder, 9.3.2 binarizations, 9.3.3.1 ctxIdxInc      |
 //! | [`me`]          | 8.4.1 MV prediction and P_Skip, integer search + sub-sample refinement   |
 //! | [`yuv`]         | RGBA -> I420 input, BT.601 limited range (Rec. ITU-R BT.601), NLE5B      |
 //! | [`deblock`]     | 8.7 the facts h264_core's deblocking filter reads, recorded per MB       |
@@ -48,7 +51,7 @@
 //! nC, mvp) are decoder-private methods there, so they are mirrored here for one slice per
 //! picture; making them shared free fns is owed (H264ENC-NBSHARE).
 //!
-//! Owed (handlers.md §5): two-pass / scene cuts / activity masking (inside H264ENC-RC), CABAC / Main / High (H264ENC-CABAC), the
+//! Owed (handlers.md §5): two-pass / scene cuts / activity masking (inside H264ENC-RC), High / the 8x8 transform (inside H264ENC-CABAC), the
 //! 16x8 / 8x16 / 8x8 partitions (inside H264ENC-SUBPEL), per-slice filter offsets (inside
 //! H264ENC-DEBLOCK), B-frames (H264ENC-BFRAMES), hardware encode (H264ENC-HW).
 
@@ -58,6 +61,7 @@
 
 extern crate alloc;
 
+pub mod cabac;
 pub mod cavlc;
 pub mod deblock;
 pub mod intra;
@@ -132,6 +136,17 @@ pub struct Config {
     /// and [`rc`] chooses each picture's QP from the bit budget and each macroblock row's from the
     /// running bit count.
     pub rate: Option<RateControl>,
+    /// The entropy coder (H264ENCCABAC, SR310): Cavlc (Constrained Baseline, SR197's bytes) or
+    /// Cabac (Main profile).
+    pub entropy: Entropy,
+}
+
+/// entropy_coding_mode_flag (7.4.2.2): CAVLC (9.2) or CABAC (9.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Entropy {
+    #[default]
+    Cavlc,
+    Cabac,
 }
 
 /// One 8-bit 4:2:0 planar input frame, borrowed: the field names of gneiss_pal's
@@ -311,9 +326,10 @@ impl Encoder {
         while log2_max_frame_num < 16 && (1u64 << log2_max_frame_num) < cfg.gop as u64 {
             log2_max_frame_num += 1;
         }
-        let p = SeqParams { width: cfg.width, height: cfg.height, mb_w: mb_w as u32, mb_h: mb_h as u32, log2_max_frame_num, qp };
+        let cabac = cfg.entropy == Entropy::Cabac;
+        let p = SeqParams { width: cfg.width, height: cfg.height, mb_w: mb_w as u32, mb_h: mb_h as u32, log2_max_frame_num, qp, cabac };
         let sps = nal::nal_unit(3, nal::NAL_SPS, &sps::write_sps(&p));
-        let pps = nal::nal_unit(3, nal::NAL_PPS, &sps::write_pps(qp));
+        let pps = nal::nal_unit(3, nal::NAL_PPS, &sps::write_pps(qp, cabac));
         let planes = || [Plane::new(mb_w * 16, mb_h * 16, 0), Plane::new(mb_w * 8, mb_h * 8, 128), Plane::new(mb_w * 8, mb_h * 8, 128)];
         let (w, h) = (cfg.width as usize, cfg.height as usize);
         Ok(Encoder {
@@ -385,20 +401,28 @@ impl Encoder {
         self.modes.fill(2);
         self.motion.fill(MbMotion::NONE);
         let mut w = BitWriter::new();
-        sps::write_slice_header(&mut w, idr, self.frame_num, self.log2_max_frame_num, self.idr_count & 0xffff, self.cfg.deblock, slice_qp - self.cfg.qp as i32);
+        let is_cabac = self.cfg.entropy == Entropy::Cabac;
+        sps::write_slice_header(&mut w, idr, self.frame_num, self.log2_max_frame_num, self.idr_count & 0xffff, self.cfg.deblock, slice_qp - self.cfg.qp as i32, is_cabac);
         let hdr = w.bits();
+        // CABAC (SR310): the slice data's writer, contexts for I (column 0) or P with cabac_init_idc 0.
+        let mut cw = is_cabac.then(|| cabac::Writer::new(&mut w, if idr { 0 } else { 1 }, slice_qp, self.mb_w * self.mb_h));
         let mut run = 0u32;
         for mby in 0..self.mb_h {
-            self.rc_row(mby, w.bits() - hdr);
+            self.rc_row(mby, w.bits() + cw.as_ref().map_or(0, cabac::Writer::pending) - hdr);
             for mbx in 0..self.mb_w {
                 if idr {
                     let code = self.intra_mb(mbx, mby);
-                    self.write_mb(&mut w, mbx, mby, &code, false);
                     self.note_mb(mbx, mby, &code);
+                    match &mut cw {
+                        Some(c) => self.write_mb_cabac(&mut w, c, mbx, mby, &code, false),
+                        None => self.write_mb(&mut w, mbx, mby, &code, false),
+                    }
                 } else {
                     let code = self.inter_mb(mbx, mby);
                     self.note_mb(mbx, mby, &code);
-                    if code.kind == Kind::PSkip {
+                    if let Some(c) = &mut cw {
+                        self.write_mb_cabac(&mut w, c, mbx, mby, &code, true);
+                    } else if code.kind == Kind::PSkip {
                         run += 1;
                     } else {
                         w.ue(run); // mb_skip_run
@@ -408,10 +432,14 @@ impl Encoder {
                 }
             }
         }
-        if run > 0 {
-            w.ue(run);
+        if cw.is_some() {
+            w.u((8 - w.bits() as u32 % 8) % 8, 0); // rbsp_alignment_zero_bit: the flush wrote the stop bit
+        } else {
+            if run > 0 {
+                w.ue(run);
+            }
+            w.trailing();
         }
-        w.trailing();
         let slice = nal::nal_unit(3, if idr { nal::NAL_IDR } else { nal::NAL_SLICE }, &w.finish());
         let nals = if idr { vec![self.sps.clone(), self.pps.clone(), slice] } else { vec![slice] };
         self.rc_update(nals.iter().map(|n| n.len() as u64 * 8).sum());

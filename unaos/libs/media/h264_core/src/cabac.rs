@@ -25,9 +25,9 @@ pub const CAT_CHROMA_AC: usize = 4; // ChromaACLevel
 pub const CAT_LUMA_8X8: usize = 5; // LumaLevel8x8
 
 /// ctxBlockCatOffset (Table 9-40) for coded_block_flag, significant / last, coeff_abs_level_minus1.
-const CBF_OFFSET: [usize; 5] = [0, 4, 8, 12, 16];
-const SIG_OFFSET: [usize; 5] = [0, 15, 29, 44, 47];
-const ABS_OFFSET: [usize; 5] = [0, 10, 20, 30, 39];
+pub const CBF_OFFSET: [usize; 5] = [0, 4, 8, 12, 16];
+pub const SIG_OFFSET: [usize; 5] = [0, 15, 29, 44, 47];
+pub const ABS_OFFSET: [usize; 5] = [0, 10, 20, 30, 39];
 
 pub struct Cabac<'a> {
     data: &'a [u8],

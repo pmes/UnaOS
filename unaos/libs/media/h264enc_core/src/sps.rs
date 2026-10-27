@@ -6,7 +6,8 @@
 //! subset h264_core's `ps::parse_sps`, `ps::parse_pps` and `ps::parse_slice_header` read back.
 //!
 //! The stream is Constrained Baseline (A.2.1.1: profile_idc 66 with constraint_set0_flag and
-//! constraint_set1_flag): frames only, CAVLC, one slice per picture, one reference frame, POC type
+//! constraint_set1_flag), or Main (A.2.2: profile_idc 77, constraint_set1_flag) under CABAC
+//! (SR310): frames only, CAVLC / CABAC, one slice per picture, one reference frame, POC type
 //! 2 (output order = decoding order) and a VUI bitstream_restriction of max_num_reorder_frames 0 /
 //! max_dec_frame_buffering 1, so a decoder outputs each picture as its access unit ends.
 
@@ -18,6 +19,10 @@ use crate::nal::BitWriter;
 pub const PROFILE_BASELINE: u8 = 66;
 /// constraint_set0_flag | constraint_set1_flag: Constrained Baseline (A.2.1.1).
 pub const CONSTRAINT_FLAGS: u8 = 0xC0;
+/// profile_idc of Main (A.2.2): the CABAC stream (H264ENCCABAC, SR310).
+pub const PROFILE_MAIN: u8 = 77;
+/// constraint_set1_flag alone: the CABAC stream conforms to Main (A.2.2), not to Baseline.
+pub const CONSTRAINT_MAIN: u8 = 0x40;
 
 /// The sequence-level facts the writers need.
 #[derive(Clone, Copy, Debug)]
@@ -28,6 +33,8 @@ pub struct SeqParams {
     pub mb_h: u32,
     pub log2_max_frame_num: u32,
     pub qp: i32,
+    /// CABAC (entropy_coding_mode_flag 1): Main profile instead of Constrained Baseline.
+    pub cabac: bool,
 }
 
 /// level_idc for a frame of `mb_w` x `mb_h` macroblocks: the lowest level of Table A-1 whose
@@ -47,8 +54,8 @@ pub fn level_idc(mb_w: u32, mb_h: u32) -> u8 {
 /// seq_parameter_set_rbsp (7.3.2.1.1), the RBSP after the NAL header byte.
 pub fn write_sps(p: &SeqParams) -> Vec<u8> {
     let mut w = BitWriter::new();
-    w.u(8, PROFILE_BASELINE as u32);
-    w.u(8, CONSTRAINT_FLAGS as u32); // constraint_set0..5 flags + reserved_zero_2bits
+    w.u(8, (if p.cabac { PROFILE_MAIN } else { PROFILE_BASELINE }) as u32);
+    w.u(8, (if p.cabac { CONSTRAINT_MAIN } else { CONSTRAINT_FLAGS }) as u32); // constraint_set0..5 flags + reserved_zero_2bits
     w.u(8, level_idc(p.mb_w, p.mb_h) as u32);
     w.ue(0); // seq_parameter_set_id
     w.ue(p.log2_max_frame_num - 4);
@@ -89,14 +96,14 @@ pub fn write_sps(p: &SeqParams) -> Vec<u8> {
     w.finish()
 }
 
-/// pic_parameter_set_rbsp (7.3.2.2): CAVLC, one slice group, one active reference by default,
+/// pic_parameter_set_rbsp (7.3.2.2): CAVLC or CABAC (`cabac`, SR310), one slice group, one active reference by default,
 /// pic_init_qp = the stream's QP (so slice_qp_delta is 0), chroma_qp_index_offset 0,
 /// deblocking_filter_control_present_flag 1 (each slice names its filter idc).
-pub fn write_pps(qp: i32) -> Vec<u8> {
+pub fn write_pps(qp: i32, cabac: bool) -> Vec<u8> {
     let mut w = BitWriter::new();
     w.ue(0); // pic_parameter_set_id
     w.ue(0); // seq_parameter_set_id
-    w.flag(false); // entropy_coding_mode_flag: CAVLC
+    w.flag(cabac); // entropy_coding_mode_flag: 0 CAVLC, 1 CABAC
     w.flag(false); // bottom_field_pic_order_in_frame_present_flag
     w.ue(0); // num_slice_groups_minus1
     w.ue(0); // num_ref_idx_l0_default_active_minus1
@@ -119,8 +126,8 @@ pub fn write_pps(qp: i32) -> Vec<u8> {
 /// window; slice_qp_delta (SliceQPY - pic_init_qp: 0 at constant QP, the rate controller's picture QP
 /// otherwise, SR218); disable_deblocking_filter_idc 0 with zero filter offsets when
 /// `deblock` (the encoder filters its reconstruction as the decoder does, SR211), else 1 (the
-/// reconstruction is unfiltered).
-pub fn write_slice_header(w: &mut BitWriter, idr: bool, frame_num: u32, log2_max_frame_num: u32, idr_pic_id: u32, deblock: bool, slice_qp_delta: i32) {
+/// reconstruction is unfiltered). Under CABAC a P slice carries cabac_init_idc 0 (SR310).
+pub fn write_slice_header(w: &mut BitWriter, idr: bool, frame_num: u32, log2_max_frame_num: u32, idr_pic_id: u32, deblock: bool, slice_qp_delta: i32, cabac: bool) {
     w.ue(0); // first_mb_in_slice
     w.ue(if idr { 7 } else { 5 }); // slice_type
     w.ue(0); // pic_parameter_set_id
@@ -139,6 +146,9 @@ pub fn write_slice_header(w: &mut BitWriter, idr: bool, frame_num: u32, log2_max
         w.flag(false); // long_term_reference_flag
     } else {
         w.flag(false); // adaptive_ref_pic_marking_mode_flag: sliding window
+    }
+    if cabac && !idr {
+        w.ue(0); // cabac_init_idc (P slices only; the I slices are the IDRs)
     }
     w.se(slice_qp_delta); // slice_qp_delta
     if deblock {

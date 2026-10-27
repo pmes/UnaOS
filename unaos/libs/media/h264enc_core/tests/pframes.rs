@@ -179,7 +179,7 @@ fn pan_frac(t: usize) -> [Vec<u8>; 3] {
 }
 
 fn cfg(qp: u8, gop: u32, deblock: bool, subpel: u8) -> Config {
-    Config { width: W as u32, height: H as u32, qp, gop, deblock, subpel, rate: None }
+    Config { width: W as u32, height: H as u32, qp, gop, deblock, subpel, rate: None, ..Default::default() }
 }
 
 /// H264ENC2 M1 (LEDGER SR211): with the in-loop filter on (idc 0) every I and P frame h264_core
@@ -222,4 +222,25 @@ fn m2_subpel_quarter_shrinks_p_frames() {
 fn m2_deblock_and_subpel_together() {
     round_trip_cfg(cfg(30, 4, true, 2), 8, pan_frac, 30.0);
     round_trip_cfg(cfg(30, 4, true, 2), 8, frame, 30.0);
+}
+
+/// H264ENCCABAC (LEDGER SR310): every scene above under CABAC (Main profile) decodes, frame by
+/// frame, to the encoder's reconstruction byte for byte: the moving pattern (GOP 10 and 4), the
+/// static sequence (P_Skip flags), the integer and fractional pans, the filter and the refinement.
+#[test]
+fn cabac_every_p_scene_decodes_to_the_reconstruction() {
+    let cabac = |c: Config| Config { entropy: h264enc_core::Entropy::Cabac, ..c };
+    for gop in [10u32, 4] {
+        round_trip_cfg(cabac(cfg(26, gop, false, 0)), 10, frame, 35.0);
+    }
+    let still = round_trip_cfg(cabac(cfg(26, 10, false, 0)), 5, |_| frame(0), 35.0).0;
+    println!("cabac static P bytes: {:?}", still.iter().skip(1).map(|a| a.annexb().len()).collect::<Vec<_>>());
+    for (name, scene) in [("moving", frame as fn(usize) -> [Vec<u8>; 3]), ("pan", pan), ("pan_frac", pan_frac)] {
+        for (qp, deblock, subpel, floor) in [(16u8, false, 0u8, 35.0), (26, true, 2, 33.0), (40, false, 1, 20.0), (30, true, 2, 30.0)] {
+            let (cv, _) = round_trip_cfg(cfg(qp, 4, deblock, subpel), 8, scene, floor);
+            let (cb, _) = round_trip_cfg(cabac(cfg(qp, 4, deblock, subpel)), 8, scene, floor);
+            let bytes = |aus: &[Access]| aus.iter().map(|a| a.annexb().len()).sum::<usize>();
+            println!("cabac {name} qp {qp} deblock {deblock} subpel {subpel}: cavlc={} cabac={} bytes", bytes(&cv), bytes(&cb));
+        }
+    }
 }

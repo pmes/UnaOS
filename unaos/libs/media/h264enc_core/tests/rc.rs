@@ -190,3 +190,47 @@ fn d_rate_none_keeps_the_constant_qp_bytes() {
         assert_eq!(fnv(&samples), want, "{name}: rate None moved the bytes measured at 1d99c4ae9");
     }
 }
+
+/// H264ENCCABAC (LEDGER SR310): (e) under CABAC the rate-controlled streams (CBR 60 / 25 kbit/s,
+/// VBR 45 / 90, deblocking on and off) decode to the reconstruction byte for byte; (f) the three
+/// pinned constant-QP streams are unchanged with `entropy` named Cavlc; (g) the CABAC stream of the
+/// GOP-30 scene is smaller than the CAVLC one (both printed).
+#[test]
+fn e_cabac_rate_controlled_decode_is_the_reconstruction() {
+    let vbr = Some(RateControl { bits_per_second: 45_000, fps_num: FPS, fps_den: 1, mode: RcMode::Vbr { max_bits_per_second: 90_000 } });
+    for rate in [cbr(60), cbr(25), vbr] {
+        for deblock in [false, true] {
+            let r = run(Config { rate, deblock, subpel: 2, entropy: h264enc_core::Entropy::Cabac, ..base(26) }, &spiked(40), true);
+            let lo = r.qps.iter().min().unwrap();
+            let hi = r.qps.iter().max().unwrap();
+            println!("cabac rc decode == recon {rate:?} deblock {deblock}: picture QP {lo}..={hi}, {:.2} kbit/s", kbps(&r.sizes));
+        }
+    }
+}
+
+#[test]
+fn f_cavlc_named_keeps_the_pinned_bytes() {
+    let cavlc = |c: Config| Config { entropy: h264enc_core::Entropy::Cavlc, ..c };
+    for (name, cfg, want) in [
+        ("qp26 gop30", cavlc(base(26)), 0x1290_fbb5_41d1_0774u64),
+        ("qp30 gop10 deblock subpel2", cavlc(Config { gop: 10, deblock: true, subpel: 2, ..base(30) }), 0x20e7_2796_bb58_a08b),
+        ("qp36 gop1", cavlc(Config { gop: 1, ..base(36) }), 0x7785_4898_5213_d0db),
+    ] {
+        let mut enc = Encoder::new(cfg).unwrap();
+        let mut samples = Vec::new();
+        for t in 0..N {
+            let p = scene(t);
+            samples.push(enc.encode(&Yuv420 { width: W as u32, height: H as u32, y: &p[0], u: &p[1], v: &p[2], y_stride: W, uv_stride: W / 2 }).unwrap().avcc_sample());
+        }
+        assert_eq!(fnv(&samples), want, "{name}: Entropy::Cavlc moved the pinned bytes");
+    }
+}
+
+#[test]
+fn g_cabac_is_smaller_on_the_gop30_scene() {
+    let cavlc = run(base(26), &scene, true);
+    let cabac = run(Config { entropy: h264enc_core::Entropy::Cabac, ..base(26) }, &scene, true);
+    let (a, b) = (cavlc.sizes.iter().sum::<usize>(), cabac.sizes.iter().sum::<usize>());
+    println!("cabac gop30: cavlc={a} cabac={b} bytes ({:.1}%)", 100.0 * b as f64 / a as f64);
+    assert!(b < a, "the CABAC stream ({b} bytes) is not smaller than the CAVLC one ({a})");
+}

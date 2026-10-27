@@ -10,17 +10,22 @@
 //! kind, QPY, transform size, the non-zero map of the luma 4x4 blocks) and the per-4x4 `Motion`
 //! (mvL0, refIdxL0, the reference's id) — in the decoder's shape. With [`crate::Config::deblock`]
 //! off both fns return at once and the slices carry disable_deblocking_filter_idc 1.
+//!
+//! H264ENCCABAC (SR310): the same `MbInfo` grid is the CABAC writer's neighbour record, as the
+//! decoder's one `info` grid serves both its contexts and its filter: under
+//! [`crate::Entropy::Cabac`] `note_mb` runs with the filter off too and also records
+//! `chroma_mode` and `cbf` (coded_block_flag per block, h264_core's `CBF_*` bit layout).
 
 use h264_core::deblock::{deblock_picture, SliceDeblock};
-use h264_core::picture::{MbKind, Mv, BLK_X, BLK_Y};
+use h264_core::picture::{MbKind, Mv, BLK_X, BLK_Y, CBF_CHROMA_AC, CBF_CHROMA_DC, CBF_LUMA_DC};
 
-use crate::{Encoder, Kind, MbCode};
+use crate::{Encoder, Entropy, Kind, MbCode};
 
 impl Encoder {
     /// Record the deblocking facts of the coded macroblock (mbx, mby) (its motion is already in
     /// `self.motion`).
     pub(crate) fn note_mb(&mut self, mbx: usize, mby: usize, code: &MbCode) {
-        if !self.cfg.deblock {
+        if !self.cfg.deblock && self.cfg.entropy == Entropy::Cavlc {
             return;
         }
         let i = mby * self.mb_w + mbx;
@@ -48,6 +53,8 @@ impl Encoder {
         info.t8x8 = false;
         info.qp = (if code.cbp != 0 || code.kind == Kind::I16 { self.qp } else { self.qp_pred }) as u8; // QPY: a MB without mb_qp_delta keeps QPY,pred
         info.nz = nz;
+        info.chroma_mode = code.chroma_mode;
+        info.cbf = cbf_bits(code);
         let m = self.motion[i];
         let w4 = self.dmo.w4;
         for blk in 0..16 {
@@ -75,4 +82,31 @@ impl Encoder {
         let slices = [SliceDeblock { disable: 0, alpha_offset: 0, beta_offset: 0 }];
         deblock_picture(&mut self.rec, &self.dmo, &self.dinfo, &slices, self.mb_w, self.mb_h, [0, 0]);
     }
+}
+
+/// coded_block_flag of every block of a coded macroblock as h264_core's `parse_residual` records it
+/// in `MbInfo::cbf`: set where the block is coded (by coded_block_pattern) and has a non-zero level,
+/// which is exactly where the CABAC writer writes coded_block_flag 1.
+pub(crate) fn cbf_bits(code: &MbCode) -> u32 {
+    let mut cbf = 0u32;
+    for blk in 0..16 {
+        if (code.cbp >> (blk / 4)) & 1 == 1 && code.luma[blk].iter().any(|&v| v != 0) {
+            cbf |= 1 << blk;
+        }
+    }
+    if code.kind == Kind::I16 && code.dc.iter().any(|&v| v != 0) {
+        cbf |= 1 << CBF_LUMA_DC;
+    }
+    let cc = code.cbp >> 4;
+    for c in 0..2 {
+        if cc != 0 && code.cdc[c].iter().any(|&v| v != 0) {
+            cbf |= 1 << (CBF_CHROMA_DC as usize + c);
+        }
+        for blk in 0..4 {
+            if cc == 2 && code.cac[c][blk].iter().any(|&v| v != 0) {
+                cbf |= 1 << (CBF_CHROMA_AC as usize + c * 4 + blk);
+            }
+        }
+    }
+    cbf
 }
