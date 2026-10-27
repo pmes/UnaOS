@@ -282,3 +282,91 @@ fn only_a_channel_mismatch_is_refused() {
     let mut sink = Collect::default();
     assert!(matches!(render(&tl, 0..10, &src, &mut sink), Err(stria::nle::RenderError::Format { .. })));
 }
+
+// ----- DEMUXWIRE (LEDGER SR213): the editor's and the Player's opens call DEMUXSEEK's reads -----
+
+use std::sync::Arc;
+
+use gneiss_pal::dsp::avsync::ManualTime;
+use gneiss_pal::dsp::demux::build::{self, MediaTrack, MkvOptions, SampleSpec, TrackSpec};
+use gneiss_pal::dsp::demux::{DecodeTime, TrackKind};
+use gneiss_pal::dsp::video::reorder_depth;
+use stria::media::Player;
+use timeline_core::SourceIndex;
+
+/// An AVCDecoderConfigurationRecord: a Main-profile SPS (4x3 macroblocks, level 3.0) whose VUI bitstream_restriction says
+/// max_num_reorder_frames 2 / max_dec_frame_buffering 3 (demux_core's seek_index `sps_rbsp(Some((2, 3)), 0)`), and a
+/// stand-in PPS.
+const AVCC_REORDER2: [u8; 27] = [
+    0x01, 0x4D, 0x00, 0x1E, 0xFF, 0xE1, 0x00, 0x0C, 0x67, 0x4D, 0x00, 0x1E, 0xED, 0x88, 0xF4, 0x03, 0xC2, 0x21, 0x16, 0x48,
+    0x01, 0x00, 0x04, 0x68, 0xCE, 0x38, 0x80,
+];
+
+/// Decode order I P B B P B B I P B B; presentation order in frame units (NLEPROBE's / DEMUXSEEK's pattern).
+const PRES: [i64; 11] = [0, 3, 1, 2, 6, 4, 5, 7, 10, 8, 9];
+const MS: i64 = 1_000_000;
+
+/// An AVC track at 25 fps, 1 ms ticks (pts = (pres + 1) x 40), keyframes at decode index 0 and 7.
+fn avc_bframes() -> MediaTrack {
+    let spec = TrackSpec {
+        id: 1,
+        kind: TrackKind::Video,
+        fourcc: *b"avc1",
+        config_box: Some(*b"avcC"),
+        codec_id: "V_MPEG4/ISO/AVC",
+        config: AVCC_REORDER2.to_vec(),
+        timescale: 1000,
+        width: 64,
+        height: 48,
+        sample_rate: 0,
+        channels: 0,
+        bit_depth: 0,
+        default_duration_ns: 0,
+    };
+    let samples = PRES
+        .iter()
+        .enumerate()
+        .map(|(i, &p)| SampleSpec { data: vec![i as u8; 5 + i], dts: i as i64 * 40, pts: (p + 1) * 40, duration: 40, keyframe: i == 0 || i == 7 })
+        .collect();
+    MediaTrack { spec, samples }
+}
+
+#[test]
+fn demuxwire_editor_open_indexes_and_derives() {
+    let tl = Timeline::new(25);
+    let mkv = |cues: bool| {
+        build::mkv(&[avc_bframes()], &MkvOptions { webm: false, cues, cluster_blocks: 7, duration: true, ..Default::default() })
+    };
+    let mut src = Sources::new(&tl);
+    src.add(SourceId(0), mkv(true)).unwrap();
+    src.add(SourceId(1), mkv(false)).unwrap();
+    src.add(SourceId(2), synth_source(0, 50, 25)).unwrap();
+    let r = src.open_report(SourceId(0)).unwrap();
+    assert_eq!(r.to_string(), "open=indexed dts=derived:2 edits=0", "{r:?}");
+    assert_eq!(src.open_report(SourceId(1)).unwrap().to_string(), "open=full dts=derived:2 edits=0");
+    let mp4 = src.open_report(SourceId(2)).unwrap();
+    assert!(mp4.to_string().starts_with("open=full dts=stored edits="), "{mp4}");
+    // keyframe-before: source time 0 is the first pts (40 ms); the second keyframe is presented at 320 ms. At 300 ms the
+    // indexed reel reads the second Cluster's span (load_at) and answers what the whole-file reel answers.
+    for id in [SourceId(0), SourceId(1)] {
+        assert_eq!(src.keyframe_ns(id, Kind::Video, 300 * MS), Some(280 * MS), "{id:?}");
+        assert_eq!(src.keyframe_ns(id, Kind::Video, 100 * MS), Some(0), "{id:?}");
+    }
+    println!("demuxwire: editor {r} key300={}ms", src.keyframe_ns(SourceId(0), Kind::Video, 300 * MS).unwrap() / MS);
+}
+
+#[test]
+fn demuxwire_player_plays_a_bframe_mkv_in_decode_order() {
+    let pcm = vec![0i16; 24_000];
+    let file = build::mkv(&[avc_bframes(), build::pcm16_track(2, 48_000, 1, &pcm, 960)], &MkvOptions { webm: false, ..Default::default() });
+    let p = Player::open(file, Arc::new(ManualTime::new()), None, 60).unwrap();
+    assert_eq!(reorder_depth(p.video_track().unwrap()), Some(2), "the avcC's VUI reorder depth");
+    let s = p.survey().unwrap();
+    let v = s.streams.iter().find(|x| x.kind == TrackKind::Video).unwrap();
+    let a = s.streams.iter().find(|x| x.kind == TrackKind::Audio).unwrap();
+    assert_eq!(v.decode_time, DecodeTime::Derived(2));
+    assert_eq!(a.decode_time, DecodeTime::Presentation, "audio is not reordered");
+    // dts = the sorted pts two frames back: every frame decodes no later than it is presented.
+    assert_eq!(v.composition_offsets, [80, 160, 40, 40, 160, 40, 40, 80, 160, 40, 40].map(|o| o * MS).to_vec());
+    println!("demuxwire: player dts=derived:2");
+}
