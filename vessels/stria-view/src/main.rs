@@ -19,7 +19,10 @@
 //! `press:<x>:<y>` / `move:<x>:<y>` (surface pixels), `release` (at the last pointer: `BrowserButton` up + `BrowserClick`),
 //! `key:<name>` (as GTK sends it: `BrowserKey`, plus `BrowserText` for a one-character key; `key:space` types a space)
 //! and `wheel:<n>` (n notches at the last pointer, n > 0 up = zoom in). The JSON line also carries `playing`, `rate`
-//! and the selected clip as `clip: "<at>:<src_in>:<src_out>"`.
+//! and the selected clip as `clip: "<at>:<src_in>:<src_out>"`. NLE2c (SR217): `shift:<token>` / `alt:<token>` send GTK's
+//! bare modifier keydown (`BrowserKey("Shift_L")` / `"Alt_L"`, the latch the next press consumes: add to the set / no
+//! snapping) before the token, `marquee:<x0>:<y0>:<x1>:<y1>` is a press, a move and the release, `key:Ctrl+a` /
+//! `key:Meta+a` is the `BrowserSelectAll` both faces send for it, and the JSON line ends with the set's size `set`.
 
 use bandy::{SMessage, Synapse};
 use quartzite::tetra::TetraNode;
@@ -38,7 +41,7 @@ struct Cli {
     labels: bool,
 }
 
-const USAGE: &str = "usage: stria-view <edl> [--fps N] --src REEL=<media> ... | --synth  [--size WxH] [--do SCRIPT] [--out shot.rgba] [--labels]  (SCRIPT: verbs, at:T:ROW, ruler:T, press:X:Y, move:X:Y, release, key:NAME, wheel:N)";
+const USAGE: &str = "usage: stria-view <edl> [--fps N] --src REEL=<media> ... | --synth  [--size WxH] [--do SCRIPT] [--out shot.rgba] [--labels]  (SCRIPT: verbs, at:T:ROW, ruler:T, press:X:Y, move:X:Y, release, key:NAME, wheel:N, marquee:X0:Y0:X1:Y1, shift:TOKEN, alt:TOKEN)";
 
 fn die(msg: String) -> ! {
     eprintln!("stria-view: {msg}");
@@ -117,6 +120,7 @@ fn editor_tree() -> TetraNode {
             button("]", "In +"),
             button("{", "Out -"),
             button("}", "Out +"),
+            button("lift", "Lift"),
         ]),
     ])
 }
@@ -127,6 +131,16 @@ fn token(face: &Face, tok: &str) -> Option<Vec<SMessage>> {
     let px = |s: &str| s.parse::<f64>().ok();
     let l: Layout = face.layout();
     let (lx, ly) = face.pointer().unwrap_or((0.0, 0.0));
+    for (prefix, key) in [("shift:", "Shift_L"), ("alt:", "Alt_L")] {
+        if let Some(rest) = tok.strip_prefix(prefix) {
+            let mut out = vec![SMessage::BrowserKey(key.to_string())];
+            out.extend(token(face, rest)?);
+            return Some(out);
+        }
+    }
+    if matches!(tok, "key:Ctrl+a" | "key:Meta+a") {
+        return Some(vec![SMessage::BrowserSelectAll]);
+    }
     if let Some(name) = tok.strip_prefix("key:") {
         let (key, text) = if name == "space" { (name, " ") } else { (name, name) };
         let mut out = vec![SMessage::BrowserKey(key.to_string())];
@@ -145,6 +159,15 @@ fn token(face: &Face, tok: &str) -> Option<Vec<SMessage>> {
         ["press", x, y] => SMessage::BrowserButton { down: true, x: px(x)?, y: px(y)? },
         ["move", x, y] => SMessage::BrowserMouseMove(px(x)?, px(y)?),
         ["release"] => return Some(vec![SMessage::BrowserButton { down: false, x: lx, y: ly }, SMessage::BrowserClick(lx, ly)]),
+        ["marquee", x0, y0, x1, y1] => {
+            let (x0, y0, x1, y1) = (px(x0)?, px(y0)?, px(x1)?, px(y1)?);
+            return Some(vec![
+                SMessage::BrowserButton { down: true, x: x0, y: y0 },
+                SMessage::BrowserMouseMove(x1, y1),
+                SMessage::BrowserButton { down: false, x: x1, y: y1 },
+                SMessage::BrowserClick(x1, y1),
+            ]);
+        }
         ["wheel", n] => SMessage::BrowserScroll(0.0, -nle_face::WHEEL_STEP * px(n)?),
         [v] if nle_face::VERBS.contains(v) => SMessage::Input { target: SURFACE.into(), text: v.to_string() },
         _ => return None,
@@ -190,7 +213,7 @@ fn witness(c: &Cli, mut face: Face) -> i32 {
     let clip = st.selected().map(|c| format!("\"{}:{}:{}\"", c.at, c.src_in, c.src_out)).unwrap_or_else(|| "null".into());
     let err = errors.join("; ").replace('"', "'");
     println!(
-        "{{\"playhead\":{},\"tracks\":{},\"clips\":{},\"selection\":{sel},\"clip\":{clip},\"playing\":{},\"rate\":{},\"undo\":{},\"zoom\":{},\"w\":{width},\"h\":{height},\"fnv\":\"{:016x}\",\"errors\":\"{err}\"}}",
+        "{{\"playhead\":{},\"tracks\":{},\"clips\":{},\"selection\":{sel},\"clip\":{clip},\"playing\":{},\"rate\":{},\"undo\":{},\"zoom\":{},\"w\":{width},\"h\":{height},\"fnv\":\"{:016x}\",\"errors\":\"{err}\",\"set\":{}}}",
         st.playhead,
         st.timeline.tracks.len(),
         clips,
@@ -198,7 +221,8 @@ fn witness(c: &Cli, mut face: Face) -> i32 {
         face.rate,
         st.undo_depth(),
         st.zoom,
-        nle_face::fnv1a(&pixels)
+        nle_face::fnv1a(&pixels),
+        st.set.len()
     );
     0
 }
@@ -276,5 +300,27 @@ mod tests {
         assert_eq!((face.playing, face.state.playhead, face.state.zoom), (false, 0, 16));
         assert_eq!(face.layout().tick_at(160.0), 20);
         assert_eq!(drive(&mut face, "press:x:1"), vec!["bad token press:x:1".to_string()]);
+    }
+
+    /// NLE2c M3: `shift:` sends GTK's bare Shift keydown before its token (the press then adds to the set), `marquee:`
+    /// is a press, move and release from an empty spot, `key:Ctrl+a` is `BrowserSelectAll`; the results are the ops.
+    #[test]
+    fn nle2c_witness_set_tokens() {
+        let (tl, src) = nle_face::synth_fixture();
+        let tl0 = tl.clone();
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        let errors = drive(&mut face, "at:5:0,shift:press:228:100,release,delete");
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(face.state.timeline, tl0.ripple_delete_many(&[(0, 0), (0, 2)]).unwrap());
+        assert_eq!((face.state.undo_depth(), face.state.set.len()), (1, 0));
+        let (tl, src) = nle_face::synth_fixture();
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        assert!(drive(&mut face, "marquee:316:85:1:155").is_empty());
+        assert_eq!(face.state.set.len(), 6);
+        assert!(drive(&mut face, "press:172:90,release").is_empty());
+        assert_eq!(face.state.set.len(), 0, "a click on an empty spot deselects");
+        assert!(drive(&mut face, "key:Ctrl+a").is_empty());
+        assert_eq!(face.state.set.len(), 6);
+        assert_eq!(drive(&mut face, "shift:nope"), vec!["bad token shift:nope".to_string()]);
     }
 }

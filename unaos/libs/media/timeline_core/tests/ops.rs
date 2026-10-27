@@ -116,3 +116,37 @@ fn validate_refuses_a_hand_built_overlap() {
     assert_eq!(tl.place(0, Clip::new(a, 5, 5, 0), Mode::Insert), Err(EditError::Empty));
     assert_eq!(tl.place(0, Clip::new(a, 0, 101, 0), Mode::Insert), Err(EditError::OutOfSource));
 }
+
+/// NLE2c (SR217): the set ops are ONE transaction each: ripple / lift over a set equal the single ops applied by hand
+/// (descending), a set move lands butted clips together, and a refused set move or an empty set leaves the input as is.
+#[test]
+fn many_ops_are_one_transaction() {
+    let (mut tl, a, b) = base();
+    tl.tracks[0].clips.push(Clip::new(a, 50, 55, 25)); // V1: A[0,10)@0 B[20,30)@10 A[50,55)@25
+    tl.tracks[1].clips = vec![Clip::new(a, 0, 10, 0)];
+    tl.validate().unwrap();
+    let picks = [(0, 0), (0, 2), (1, 0), (0, 0)];
+
+    let want = tl.ripple_delete(1, 0).unwrap().ripple_delete(0, 2).unwrap().ripple_delete(0, 0).unwrap();
+    assert_eq!(tl.ripple_delete_many(&picks).unwrap(), want);
+    assert_eq!(want.tracks[0].clips, vec![Clip::new(b, 20, 30, 0)]);
+
+    let lifted = tl.lift_many(&picks).unwrap();
+    assert_eq!(lifted.tracks[0].clips, vec![Clip::new(b, 20, 30, 10)], "the holes stay");
+    assert!(lifted.tracks[1].clips.is_empty());
+
+    // A[0,10)@0 and B@10 are butted: moving both right by 5 is one value; the first single move_clip already overlaps.
+    let moved = tl.move_many(&[(0, 0), (0, 1)], 5).unwrap();
+    assert_eq!(moved.tracks[0].clips, vec![Clip::new(a, 0, 10, 5), Clip::new(b, 20, 30, 15), Clip::new(a, 50, 55, 25)]);
+    assert_eq!(tl.move_clip(0, 0, 0, 5), Err(EditError::Overlap));
+
+    // Into a neighbour, before zero, an empty set, a bad pick: refused, and the input is untouched (pure).
+    let before = tl.clone();
+    assert_eq!(tl.move_many(&[(0, 0), (0, 1)], 6), Err(EditError::Overlap));
+    assert_eq!(tl.move_many(&[(0, 1), (0, 2)], -6), Err(EditError::Overlap));
+    assert_eq!(tl.move_many(&[(0, 0)], -1), Err(EditError::Negative));
+    assert_eq!(tl.move_many(&[], 1), Err(EditError::NoClip));
+    assert_eq!(tl.lift_many(&[(0, 9)]), Err(EditError::NoClip));
+    assert_eq!(tl.ripple_delete_many(&[(7, 0)]), Err(EditError::NoTrack));
+    assert_eq!(tl, before);
+}
