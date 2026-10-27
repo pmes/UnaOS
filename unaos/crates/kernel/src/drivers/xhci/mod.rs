@@ -12310,7 +12310,7 @@ impl XhciController {
     /// Stop arm is `resync_bulk_ep`'s too, and carried for its reason (boot23/PA32): Stop Endpoint
     /// refused from a non-Running state means the endpoint is ALREADY out of Running, which is this
     /// arm's whole goal, so the refusal IS the goal state and the resync proceeds.
-    fn ep0_resync(&mut self, slot_id: u8) -> bool {
+    fn ep0_resync(&mut self, slot_id: u8) -> bool { #[cfg(all(target_arch = "x86_64", feature = "lidsleep", feature = "wc"))] suspend::note_held_recovery(slot_id); // HELDMAP (B838): counted if the slot is held (`tests usbsuspend` `held_recovery=`, 0 for PASS)
         if self.slots[slot_id as usize].output_context.is_null() {
             serial_println!(":: USBLUN: ep0-resync slot={} ok=no why=no-output-context ::", slot_id);
             return false;
@@ -13898,7 +13898,7 @@ impl XhciController {
             dma_coherency::clean(data_phys as usize, w_length as usize);
         }
         // Setup stage. TRT: 0 = no data, 2 = OUT data, 3 = IN data.
-        let trt: u32 = if w_length == 0 { 0 } else if dir_in { 3 } else { 2 };
+        let trt: u32 = if w_length == 0 { 0 } else if dir_in { 3 } else { 2 }; let mark = self.slots[slot_id as usize].ep0_ring.as_ref().map(|r| r.mark()); // HELDMAP (B838) M2: the producer position before the Setup stage, so a later stage that cannot be pushed rewinds the whole TD
         if self.push_ep0(slot_id, Trb { parameter: setup, status: 8, control: (2 << 10) | (1 << 6) | (trt << 16) }) == 0 { return Err(()); } // HELDSLOTEP0 (B804) M2: Setup, Data and Status all on the ring BEFORE the park and the doorbell, so a held doorbell (`suspend::doorbell_held`) is remembered only for a whole TD
         // Data stage (if any). XENUM-3 M1: set IOC (bit 5) so the DATA stage posts its OWN transfer
         // event carrying the TRB Transfer Length residual — without it only the Status TRB (IOC)
@@ -13907,7 +13907,7 @@ impl XhciController {
         // drives completion. This lets the downstream enumerator reject a short (partial) read.
         let data_trb_phys = if w_length > 0 {
             let dir: u32 = if dir_in { 1 } else { 0 };
-            match self.push_ep0(slot_id, Trb { parameter: data_phys, status: w_length as u32, control: (3 << 10) | (1 << 5) | (dir << 16) }) { 0 => return Err(()), p => p }
+            match self.push_ep0(slot_id, Trb { parameter: data_phys, status: w_length as u32, control: (3 << 10) | (1 << 5) | (dir << 16) }) { 0 => { self.ep0_rewind(slot_id, mark); return Err(()) } p => p } // HELDMAP (B838) M2: Setup is on the ring, Data is not: rewind
         } else {
             0
         };
@@ -13916,7 +13916,7 @@ impl XhciController {
         let status_phys = {
             let ring = self.slots[slot_id as usize].ep0_ring.as_mut().ok_or(())?;
             let base = ring.get_ptr();
-            let idx = ring.push(Trb { parameter: 0, status: 0, control: (4 << 10) | (1 << 5) | (status_dir << 16) }).map_err(|_| ())?;
+            let idx = match ring.push(Trb { parameter: 0, status: 0, control: (4 << 10) | (1 << 5) | (status_dir << 16) }) { Ok(i) => i, Err(_) => { self.ep0_rewind(slot_id, mark); return Err(()) } }; // HELDMAP (B838) M2: Status does not fit: the TD's earlier stages are rewound
             base + (idx as u64) * 16
         };
 
@@ -16004,7 +16004,7 @@ impl XhciController {
                 let ring = if is_mouse { s.mouse_ring.as_ref() } else { s.keyboard_ring.as_ref() };
                 (ep, s.port_id, ring.map(|r| r.dequeue_reset_target()))
             };
-            if ep_addr == 0 { continue; }
+            if ep_addr == 0 { continue; } #[cfg(all(target_arch = "x86_64", feature = "lidsleep", feature = "wc"))] if suspend::halt_owe(slot, is_mouse) { continue; } // HELDMAP (B838): a held slot's halt is OWED whole (no Reset Endpoint / Set TR Dequeue / CLEAR_FEATURE on the suspended link); `ep0_replay` re-queues it here after UP
             // A device that unplugged between the error and now: recovery would ring a doorbell
             // for a completion that never arrives and burn the EP0 pump budget (same guard as
             // `service_hid_setproto`). Hub-downstream slots carry port_id 0 -> treat as present.
@@ -17405,26 +17405,26 @@ impl XhciController {
         matches!(self.sync_control(slot, 0x40, usbnet::ax::REQ_PHY, usbnet::ax::PHY_ID, reg, 2, buf, false), Ok(1) | Ok(13))
     }
     /// AX88179 PHY (MII) register read: vendor request 0x02, bmRequestType 0xC0, wValue = phy id, wIndex = mii reg.
-    fn ax_phy_read(&mut self, slot: u8, reg: u16) -> Option<u16> {
+    fn ax_phy_read(&mut self, slot: u8, reg: u16) -> Result<u16, Ep0Err> { // HELDMAP (B838): the failure NAMED (`Ep0Err::Held` = refused on a held slot), so the link poll can tell a refusal from a reading
         let buf = self.slots[slot as usize].descriptor_buffer as u64;
         if buf == 0 {
-            return None;
+            return Err(Ep0Err::NoCompletion);
         }
         dma_coherency::clean(buf as usize, 64);
-        if !matches!(self.sync_control(slot, 0xC0, usbnet::ax::REQ_PHY, usbnet::ax::PHY_ID, reg, 2, buf, true), Ok(1) | Ok(13)) {
-            return None;
+        if let Err(e) = self.ep0_control(slot, 0xC0, usbnet::ax::REQ_PHY, usbnet::ax::PHY_ID, reg, 2, buf, true).and_then(|cc| if matches!(cc, 1 | 13) { Ok(cc) } else { Err(Ep0Err::NoCompletion) }) {
+            return Err(e);
         }
         dma_coherency::inval(buf as usize, 64);
         let mut b = [0u8; 2];
         unsafe { core::ptr::copy_nonoverlapping(buf as *const u8, b.as_mut_ptr(), 2) };
-        Some(u16::from_le_bytes(b))
+        Ok(u16::from_le_bytes(b))
     }
     /// USBNET3: the non-blocking link poll — PHYSR (link, speed, duplex) on a cadence; on link-up the medium
     /// mode is rewritten for the negotiated speed (the bring-up wrote a provisional one); the witness follows.
     fn usbnet_ax_poll(&mut self, slot: u8) {
         let now = crate::arch::ms();
         if usbnet::poll_due(now) {
-            let physr = self.ax_phy_read(slot, usbnet::ax::GMII_PHY_PHYSR);
+            let physr = match self.ax_phy_read(slot, usbnet::ax::GMII_PHY_PHYSR) { #[cfg(all(target_arch = "x86_64", feature = "lidsleep", feature = "wc"))] Err(Ep0Err::Held) => { usbnet::link_poll_held(now); suspend::held_deferred(slot, suspend::DEFER_PHY); usbnet::witness_tick(now, slot); return; } r => r.ok() }; // HELDMAP (B838): a held slot's PHY read is a refusal, not a reading — the poll skips (LINK unchanged, the next poll re-armed, the link-status read not issued)
             let mut l = [0u8; 1];
             let _ = self.ax_read(slot, usbnet::ax::REG_PHYSICAL_LINK_STATUS, &mut l);
             if let Some(m) = usbnet::link_seen(now, physr, l[0]) {
@@ -18113,7 +18113,9 @@ pub mod suspend {
 
     /// One cycle's numbers, for `tests usbsuspend`.
     #[derive(Clone, Copy)]
-    pub struct Census { pub ports: u32, pub suspended: u32, pub pls3: u32, pub resumed: u32, pub kept: u32, pub remote_wakes: u32, pub ep_stopped: u32, pub ep_running: u32, pub held_rings: u32, pub held_ep0_refused: u32, pub replayed: u32, pub stuck: u32 } // HELDSLOTEP0 (B804): held_ep0_refused, replayed; SLEEP2 (B812): stuck
+    pub struct Census { pub ports: u32, pub suspended: u32, pub pls3: u32, pub resumed: u32, pub kept: u32, pub remote_wakes: u32, pub ep_stopped: u32, pub ep_running: u32, pub held_rings: u32, pub held_ep0_refused: u32, pub replayed: u32, pub stuck: u32, // HELDSLOTEP0 (B804): held_ep0_refused, replayed; SLEEP2 (B812): stuck
+        pub held_halt_owed: u32, pub held_halt_replayed: u32, pub phy_skipped: u32, pub held_recovery: u32, // HELDMAP (B838)
+    }
 
     /// `true` while the ports are in U3 (the last request has been applied); `false` once fully back in U0.
     pub fn suspended() -> bool { PHASE.load(Ordering::Acquire) == SUSPENDED }
@@ -18125,6 +18127,7 @@ pub mod suspend {
             resumed: RESUMED_N.load(Ordering::Relaxed), kept: KEPT_N.load(Ordering::Relaxed), remote_wakes: REMOTE_WAKES.load(Ordering::Relaxed),
             ep_stopped: EP_STOPPED_N.load(Ordering::Relaxed), ep_running: EP_RUNNING_N.load(Ordering::Relaxed),
             held_rings: HELD_RINGS.load(Ordering::Relaxed), held_ep0_refused: HELD_EP0_REFUSED_N.load(Ordering::Relaxed), replayed: HELD_EP0_REPLAYED_N.load(Ordering::Relaxed), stuck: STUCK.load(Ordering::Relaxed).count_ones(),
+            held_halt_owed: HELD_HALT_OWED_N.load(Ordering::Relaxed), held_halt_replayed: HELD_HALT_REPLAYED_N.load(Ordering::Relaxed), phy_skipped: PHY_SKIPPED_N.load(Ordering::Relaxed), held_recovery: HELD_RECOVERY_N.load(Ordering::Relaxed), // HELDMAP (B838)
         }
     }
 
@@ -18187,7 +18190,7 @@ pub mod suspend {
             let (mut mask, mut usb2) = (0u64, 0u64);
             EP_STOPPED_N.store(0, Ordering::Relaxed);
             EP_RUNNING_N.store(0, Ordering::Relaxed);
-            HELD_RINGS.store(0, Ordering::Relaxed); HELD_EP0_REFUSED_N.store(0, Ordering::Relaxed); HELD_EP0_REPLAYED_N.store(0, Ordering::Relaxed); // HELDSLOTEP0 (B804): per-cycle counts
+            HELD_RINGS.store(0, Ordering::Relaxed); HELD_EP0_REFUSED_N.store(0, Ordering::Relaxed); HELD_EP0_REPLAYED_N.store(0, Ordering::Relaxed); HELD_HALT_OWED_N.store(0, Ordering::Relaxed); HELD_HALT_REPLAYED_N.store(0, Ordering::Relaxed); PHY_SKIPPED_N.store(0, Ordering::Relaxed); HELD_RECOVERY_N.store(0, Ordering::Relaxed); // HELDSLOTEP0 (B804): per-cycle counts; HELDMAP (B838): its four
             for port in 1..=self.max_ports.min(64) {
                 let portsc = self.read_portsc(port);
                 if portsc & 0b11 != 0b11 { continue; } // CCS and PED: an enabled device
@@ -18464,7 +18467,11 @@ pub mod suspend {
     pub(super) fn ep0_refuse(slot: u8, bm_req: u8, b_req: u8) -> bool {
         if HELD[slot as usize].load(Ordering::Relaxed) == 0 { return false; }
         HELD_EP0_REFUSED_N.fetch_add(1, Ordering::Relaxed);
-        serial_println!("[usb] slot={} ep0 req={:#04x}/{:#04x} -> refused why=held", slot, bm_req, b_req);
+        // HELDMAP (B838): every refusal is counted, the line prints once per slot per cycle (`DEFER_SAID` bit `SAID_REFUSE`,
+        // cleared by `ep0_replay`): a held AX88179's 250 ms PHY cadence across a long sleep would otherwise flood the wire.
+        if DEFER_SAID[slot as usize].fetch_or(SAID_REFUSE, Ordering::Relaxed) & SAID_REFUSE == 0 {
+            serial_println!("[usb] slot={} ep0 req={:#04x}/{:#04x} -> refused why=held", slot, bm_req, b_req);
+        }
         true
     }
 
@@ -18475,9 +18482,11 @@ pub mod suspend {
         /// `endpoints_restart`'s per-slot replay of what the hold refused: the lock-LED bitmap is owed to the device again
         /// (`keyboard_leds_dirty`, HIDLEDDEFER's own push in `service_hid_leds`), the slot goes back on `hid_setproto_pending`.
         fn ep0_replay(&mut self, slot: u8) {
+            DEFER_SAID[slot as usize].store(0, Ordering::Relaxed); // HELDMAP (B838): the next cycle's refusals print once again
             let owed = OWED[slot as usize].swap(0, Ordering::Relaxed);
             if owed == 0 { return; }
             let (leds, setproto) = (owed & OWE_LEDS != 0, owed & OWE_SETPROTO != 0);
+            let (halts, requeued) = self.halt_replay(slot, owed); // HELDMAP (B838): the owed halt recoveries, re-queued whole
             if leds {
                 self.slots[slot as usize].keyboard_leds_dirty = true;
                 HELD_EP0_REPLAYED_N.fetch_add(1, Ordering::Relaxed);
@@ -18486,7 +18495,7 @@ pub mod suspend {
                 if !self.hid_setproto_pending.contains(&slot) { self.hid_setproto_pending.push(slot); }
                 HELD_EP0_REPLAYED_N.fetch_add(1, Ordering::Relaxed);
             }
-            serial_println!("[usb] slot={} ep0 replay leds={} setproto={}", slot, leds as u8, setproto as u8);
+            serial_println!("[usb] slot={} ep0 replay leds={} setproto={} halt={} requeued={}", slot, leds as u8, setproto as u8, halts, requeued);
         }
 
         /// `tests usbsuspend`'s held-EP0 leg: while SUSPENDED, the held xHCI keyboard's lock-LED bitmap is marked owed to the
@@ -18497,6 +18506,88 @@ pub mod suspend {
             let Some((slot, _, _)) = self.kbd_slot_on(0) else { return false };
             if HELD[slot as usize].load(Ordering::Relaxed) == 0 { return false; }
             self.slots[slot as usize].keyboard_leds_dirty = true;
+            true
+        }
+    }
+
+    // ══════════════ HELDMAP (rmbp-ledger B838, BP-power-7) — every EP0 caller maps the held refusal honestly ══════════════
+    // The four callers HELDSLOTEP0 left owed: isoch `control` and mtp `mtp_os_probe` match `Ep0Err::Held` and skip their EP0
+    // recovery (a refusal is not a STALL: EP0 is Stopped by `endpoints_stop`, not Halted) and hand the refusal to their
+    // caller ([`held_deferred`]); `usbnet_ax_poll` skips the link poll on `Held` (LINK unchanged, the next poll re-armed by
+    // `usbnet::link_poll_held`); `service_hid_halts` owes a held slot's halt WHOLE ([`halt_owe`]: no Reset Endpoint, Set TR
+    // Dequeue or CLEAR_FEATURE on the suspended link) and `ep0_replay` re-queues it on `hid_halt_pending` after UP
+    // ([`XhciController::halt_replay`]). Loan holder only.
+
+    /// Per slot, which callers already printed their `held -> deferred` line this cycle (`DEFER_*`), and `SAID_REFUSE`
+    /// (`ep0_refuse`'s line). Cleared by `ep0_replay`; a stuck port's slots are never replayed, so they print once for good.
+    static DEFER_SAID: [AtomicU8; 256] = [const { AtomicU8::new(0) }; 256];
+    #[cfg_attr(not(feature = "uvc"), allow(dead_code))] pub(super) const DEFER_UVC: u8 = 1;
+    #[cfg_attr(not(feature = "uvc"), allow(dead_code))] pub(super) const DEFER_MTP: u8 = 2;
+    pub(super) const DEFER_PHY: u8 = 4;
+    const SAID_REFUSE: u8 = 0x80;
+    /// `OWED` bits: the keyboard's / the pointer's interrupt-IN halt recovery, owed to the resume.
+    pub(super) const OWE_HALT_KBD: u8 = 4;
+    pub(super) const OWE_HALT_PTR: u8 = 8;
+    /// Per cycle (zeroed by `ports_suspend`): halts owed; owed halts the restart took; PHY polls skipped; EP0 recoveries
+    /// (`ep0_resync` / `mtp_ep0_unhalt`) entered on a held slot (0 is the invariant `tests usbsuspend` holds).
+    static HELD_HALT_OWED_N: AtomicU32 = AtomicU32::new(0);
+    static HELD_HALT_REPLAYED_N: AtomicU32 = AtomicU32::new(0);
+    static PHY_SKIPPED_N: AtomicU32 = AtomicU32::new(0);
+    static HELD_RECOVERY_N: AtomicU32 = AtomicU32::new(0);
+
+    /// A caller whose EP0 transfer `ep0_control` refused on a held slot, deferring its work to a pass after UP:
+    /// `[usb] slot=<s> <uvc|mtp|phy> held -> deferred`, once per slot per caller per cycle; a PHY skip is counted every time.
+    pub(super) fn held_deferred(slot: u8, who: u8) {
+        if who == DEFER_PHY { PHY_SKIPPED_N.fetch_add(1, Ordering::Relaxed); }
+        if DEFER_SAID[slot as usize].fetch_or(who, Ordering::Relaxed) & who != 0 { return; }
+        let name = match who { DEFER_UVC => "uvc", DEFER_MTP => "mtp", _ => "phy" };
+        serial_println!("[usb] slot={} {} held -> deferred", slot, name);
+    }
+
+    /// `service_hid_halts`' question before its first command: `true` = the slot is held (the same `HELD` word `ep0_refuse`
+    /// reads), so the whole recovery is owed to the resume (`OWE_HALT_KBD` / `OWE_HALT_PTR`) and nothing is issued.
+    pub(super) fn halt_owe(slot: u8, is_mouse: bool) -> bool {
+        if HELD[slot as usize].load(Ordering::Relaxed) == 0 { return false; }
+        owe(slot, if is_mouse { OWE_HALT_PTR } else { OWE_HALT_KBD });
+        HELD_HALT_OWED_N.fetch_add(1, Ordering::Relaxed);
+        serial_println!("[usb] slot={} halt {} -> owed why=held", slot, if is_mouse { "ptr" } else { "kbd" });
+        true
+    }
+
+    /// From the first line of `ep0_resync` and `mtp_ep0_unhalt`: an EP0 recovery entered on a held slot is counted
+    /// (`held_recovery=`); with every caller mapped it stays 0.
+    pub(super) fn note_held_recovery(slot: u8) {
+        if HELD[slot as usize].load(Ordering::Relaxed) != 0 { HELD_RECOVERY_N.fetch_add(1, Ordering::Relaxed); }
+    }
+
+    impl XhciController {
+        /// `ep0_replay`'s halt half: each owed halt is taken (counted) and its endpoint re-queued on `hid_halt_pending`, so
+        /// `service_hid_halts` runs the WHOLE recovery after UP — only if the endpoint context still reads Halted(2) (xHCI 1.2
+        /// §4.6.8: Reset Endpoint is legal only from Halted; a Running endpoint answers Context State Error). `(halts, requeued)`.
+        fn halt_replay(&mut self, slot: u8, owed: u8) -> (u32, u32) {
+            let (mut halts, mut requeued) = (0u32, 0u32);
+            for (bit, is_mouse) in [(OWE_HALT_KBD, false), (OWE_HALT_PTR, true)] {
+                if owed & bit == 0 { continue; }
+                halts += 1;
+                HELD_HALT_REPLAYED_N.fetch_add(1, Ordering::Relaxed);
+                let ep = if is_mouse { self.slots[slot as usize].mouse_ep } else { self.slots[slot as usize].keyboard_ep };
+                if ep == 0 { continue; }
+                let dci = (ep & 0x0F) * 2 + ((ep & 0x80) != 0) as u8;
+                if self.ep_state_of(slot, dci) != 2 { continue; }
+                if !self.hid_halt_pending.contains(&(slot, is_mouse)) { self.hid_halt_pending.push((slot, is_mouse)); }
+                requeued += 1;
+            }
+            (halts, requeued)
+        }
+
+        /// `tests usbsuspend`'s held-EP0 leg: while SUSPENDED, the held xHCI keyboard's interrupt-IN endpoint is put on
+        /// `hid_halt_pending` (the stimulus a halting completion gives), so the next pass's `service_hid_halts` meets a held
+        /// slot. `false` = not SUSPENDED, no keyboard, or its slot not held.
+        pub fn held_halt_probe(&mut self) -> bool {
+            if !suspended() { return false; }
+            let Some((slot, _, _)) = self.kbd_slot_on(0) else { return false };
+            if HELD[slot as usize].load(Ordering::Relaxed) == 0 { return false; }
+            if !self.hid_halt_pending.contains(&(slot, false)) { self.hid_halt_pending.push((slot, false)); }
             true
         }
     }
@@ -18525,5 +18616,30 @@ impl XhciController {
         }
         self.ep0_queue(slot_id, bm_req, b_req, w_value, w_index, w_length, data_phys, dir_in).map_err(|()| Ep0Err::NoCompletion)?;
         self.ep0_wait(slot_id, w_length, data_phys, dir_in).map_err(|()| Ep0Err::NoCompletion)
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+// HELDMAP (rmbp-ledger B838, docs/dev/blueprint/power.md BP-power-7) M2 — a control TD is all-or-nothing on the EP0 ring.
+// FILE-TAIL append (unconditional: `ep0_queue` calls it on both arches); no panic site (`get_mut`, no indexing).
+
+/// TDs `ep0_queue` rewound because a later stage did not fit, this boot (`tests usbsuspend` `rewinds=`). MEASURED at the cut:
+/// `TransferRing::push` never fails (`produce`), so this reads 0 because the rewind is UNREACHABLE today, not because no
+/// partial TD ever happened; a refusal is reachable only at Setup (no EP0 ring), before anything is pushed.
+static EP0_REWINDS: AtomicU32 = AtomicU32::new(0);
+
+/// HELDMAP (B838): `rewinds=` for the fixtures.
+pub fn ep0_rewinds() -> u32 { EP0_REWINDS.load(Ordering::Relaxed) }
+
+impl XhciController {
+    /// HELDMAP (B838) M2: `ep0_queue`'s Data or Status stage could not be pushed after its Setup was — un-produce every stage
+    /// of this TD back to `mark` (`TransferRing::rewind`: cycle bits, the Link's dword, enqueue and colour), before the park
+    /// and the doorbell, so the ring holds no partial TD. `None` = no ring when the mark was taken: nothing was pushed.
+    fn ep0_rewind(&mut self, slot_id: u8, mark: Option<ring::RingMark>) {
+        let Some(m) = mark else { return };
+        let Some(r) = self.slots.get_mut(slot_id as usize).and_then(|s| s.ep0_ring.as_mut()) else { return };
+        let trbs = r.rewind(m);
+        EP0_REWINDS.fetch_add(1, Ordering::Relaxed);
+        serial_println!("[usb] slot={} ep0 rewind trbs={}", slot_id, trbs);
     }
 }

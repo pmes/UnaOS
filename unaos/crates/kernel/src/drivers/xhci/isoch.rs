@@ -819,8 +819,8 @@ impl XhciUvc<'_> {
 impl IsoHost for XhciUvc<'_> {
     fn control(&mut self, bm: u8, br: u8, wv: u16, wi: u16, wl: u16, dir_in: bool) -> Result<u32, &'static str> {
         let wl = wl.min(EP0_CAP as u16);
-        match self.c.sync_control(self.slot, bm, br, wv, wi, wl, self.buf, dir_in) {
-            Ok(1) => Ok(if wl == 0 { 0 } else { self.c.last_control_len }),
+        match self.c.ep0_control(self.slot, bm, br, wv, wi, wl, self.buf, dir_in) {
+            Ok(1) => Ok(if wl == 0 { 0 } else { self.c.last_control_len }), #[cfg(all(target_arch = "x86_64", feature = "lidsleep", feature = "wc"))] Err(super::Ep0Err::Held) => { super::suspend::held_deferred(self.slot, super::suspend::DEFER_UVC); Err("held") } // HELDMAP (B838): refused on a held slot (EP0 Stopped, not Halted) — no resync; the refusal goes back to the class driver
             other => {
                 // A STALL halts EP0 (§4.10.2.1) and a timeout leaves a TD on it: either way the next request
                 // needs the ring resynchronised, exactly the USBLUN recovery.
@@ -831,7 +831,7 @@ impl IsoHost for XhciUvc<'_> {
                     Ok(4) => "usb-transaction-error",
                     Ok(3) => "babble",
                     Ok(_) => "cc-error",
-                    Err(()) => "timeout",
+                    Err(_) => "timeout",
                 })
             }
         }

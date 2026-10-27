@@ -523,3 +523,73 @@ impl TransferRing {
         true
     }
 }
+
+// HELDMAP (rmbp-ledger B838, docs/dev/blueprint/power.md BP-power-7) — FILE-TAIL append. A control TD is all-or-nothing on
+// the ring: `ep0_queue` takes a `mark` before its Setup stage and `rewind`s to it when a later stage cannot be pushed, so no
+// partial TD stays produced ahead of the next transfer. MEASURED at the cut: `produce` never fails, so today no caller
+// reaches `rewind` (the refusal is reachable only at Setup, before anything is pushed); it holds the invariant for any
+// fallible push.
+
+/// HELDMAP (B838): the producer position (enqueue index, cycle colour) and the Link TRB's control dword at one instant.
+#[derive(Clone, Copy, Debug)]
+pub struct RingMark {
+    index: usize,
+    cycle: bool,
+    link_dw3: u32,
+}
+
+impl TransferRing {
+    /// HELDMAP (B838): the producer position now, for a later `rewind`. Pure read.
+    pub fn mark(&self) -> RingMark {
+        let link_dw3 = self.trb_raw(self.num_trbs - 1).map(|t| t.3).unwrap_or(0);
+        RingMark { index: self.enqueue_index, cycle: self.cycle_bit, link_dw3 }
+    }
+
+    /// HELDMAP (B838): un-produce every TRB pushed since `m` — each slot's cycle bit is written back to the colour the
+    /// consumer does NOT expect on that lap (xHCI 1.2 §4.9.1), the Link TRB's dword is restored if the walk crossed it
+    /// (`arm_link_trb` armed it), and the enqueue index and cycle colour return to `m`. Bounded by the ring's length.
+    /// Returns the TRBs un-produced. Only TRBs no doorbell has been rung for may be rewound (`ep0_queue` rings after
+    /// all three stages are on the ring).
+    pub fn rewind(&mut self, m: RingMark) -> usize {
+        let n = self.num_trbs;
+        if m.index >= n {
+            return 0;
+        }
+        let (mut idx, mut colour) = (m.index, m.cycle);
+        let (mut undone, mut crossed) = (0usize, false);
+        for _ in 0..=n {
+            if idx == self.enqueue_index && colour == self.cycle_bit {
+                break;
+            }
+            if idx == n - 1 {
+                idx = 0;
+                colour = !colour;
+                crossed = true;
+                continue;
+            }
+            self.rewrite_control(idx, |c| if colour { c & !1 } else { c | 1 });
+            undone += 1;
+            idx += 1;
+        }
+        if crossed {
+            let dw3 = m.link_dw3;
+            self.rewrite_control(n - 1, |_| dw3);
+        }
+        self.enqueue_index = m.index;
+        self.cycle_bit = m.cycle;
+        self.wrapped_on_last_push = false;
+        undone
+    }
+
+    /// HELDMAP (B838): rewrite ONLY the control dword (the cycle-bearing one) of slot `index`, then clean the line.
+    fn rewrite_control(&mut self, index: usize, f: impl Fn(u32) -> u32) {
+        unsafe {
+            // Byte-addressed as `arm_link_trb` does: `Trb` is packed; offset 12 of a 16-byte TRB is 4-byte aligned.
+            let p = (self.trbs as *mut u8).add(index * 16 + 12) as *mut u32;
+            let c = core::ptr::read_volatile(p);
+            core::ptr::write_volatile(p, f(c));
+            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+            dma_coherency::clean(self.trbs.add(index) as usize, core::mem::size_of::<Trb>());
+        }
+    }
+}
