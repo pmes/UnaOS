@@ -44,7 +44,7 @@ pub enum BlockError {
     /// or the microSD card mid-CMD17/CMD24 sector transfer. Callers that CAN wait — unmasked,
     /// schedulable contexts — never see this from a healthy device: `claim_xhci_for_io` and
     /// `emmc2::claim_for_io` each retry with a bounded `hlt` wait first. A caller running with IRQs
-    /// MASKED gets it immediately, because a masked wait on a driver lock is exactly the deadlock
+    /// MASKED gets it at once (x86, PREEMPTOFFXHCILOAN Z62: after a <= 10 ms spin only on a RUNNING block holder on another CPU), because a masked wait on a preempted holder is exactly the deadlock
     /// this family is named for; the FAT layer retries OUTSIDE its masked span and surfaces
     /// `-EAGAIN` on exhaustion.
     Busy,
@@ -55,30 +55,30 @@ pub enum BlockError {
 
 /// WEDGE-8 (F3): claim the xHCI controller for one block transaction.
 ///
-/// Masked callers (the FAT/dir RMW spans under `without_interrupts`) get an INSTANT
-/// `BlockError::Busy` when the controller is loaned out — the whole point of F3 is that a masked
-/// context must never wait on a driver lock, because the loan holder is preemptible and, once
-/// preempted on this core, can only run again if this core takes timer IRQs.
+/// Masked callers (the FAT/dir RMW spans, `with_unafs`) get `BlockError::Busy` at once unless the holder is RUNNING:
+/// PREEMPTOFFXHCILOAN (zenbook-ledger Z62, x86) holds the block layer's loan preempt-off and publishes its CPU (`BlockLoan`,
+/// file tail), and a masked caller spins <= `LOAN_MASKED_WAIT_MS` only on a published holder on ANOTHER CPU. F3 kept: a masked
+/// context never waits on a preemptible or same-core holder, which could only run again if this core took timer IRQs.
 ///
 /// Unmasked callers keep the old effectively-blocking semantics, honestly bounded: retry the claim
 /// with a `hlt` between attempts (each wakes on the next IRQ, letting the scheduler run the loan
 /// holder) up to `hw_wait_budget()` wall-clock — long enough for any healthy SERVICE PASS, but NOT for
 /// every healthy BOT transaction: the driver itself budgets a first attempt at 3× this wait (`BOT_BUDGET_SCALE_FIRST` in `xhci/mod.rs`), so a slow-but-healthy transfer can hold the loan past this whole wait, and `Busy` is then a NORMAL, RETRYABLE outcome — not a wedge verdict (`usb_xhci.md` §32.3).
 /// Still short enough that a wedged 25 s failing-transfer hold surfaces as `Busy` instead of hanging the caller forever.
-fn claim_xhci_for_io() -> Result<XhciLoan, BlockError> {
-    match xhci::claim() {
+fn claim_xhci_for_io() -> Result<BlockLoan, BlockError> {
+    match take_block_loan() { // PREEMPTOFFXHCILOAN (Z62): the take holds this CPU's preempt-off count and publishes the holder
         Ok(l) => return Ok(l),
         Err(XhciClaimError::NotReady) => return Err(BlockError::NotReady),
         Err(XhciClaimError::Busy) => {}
     }
     if crate::arch::irqs_masked() {
-        return Err(BlockError::Busy);
+        return masked_loan_wait(); // PREEMPTOFFXHCILOAN (Z62): a bounded spin on a RUNNING holder only (was: Busy at once)
     }
     let start = crate::arch::now_cycles();
     let budget = crate::arch::hw_wait_budget();
     loop {
         crate::hlt();
-        match xhci::claim() {
+        match take_block_loan() {
             Ok(l) => return Ok(l),
             Err(XhciClaimError::NotReady) => return Err(BlockError::NotReady),
             Err(XhciClaimError::Busy) => {}
@@ -4229,4 +4229,247 @@ pub fn write_sector_nvme(sector: u64, buf: &[u8]) -> Result<(), BlockError> {
 #[cfg(all(target_arch = "x86_64", feature = "nvme"))]
 pub fn nvme_rmw_count() -> u32 {
     NVME_RMW.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+// ══════════ PREEMPTOFFXHCILOAN (zenbook-ledger Z62) — the block layer's xHCI loan held preempt-off; a masked claimant waits on a RUNNING holder only ══════════
+//
+// TAIL-APPENDED (no line above moves; `claim_xhci_for_io` changed in place, line-neutral). WEDGE-8 F3 gave a MASKED
+// `claim_xhci_for_io` caller (the FAT RMW spans, `with_unafs`) `Busy` at once, because the loan holder was preemptible:
+// a masked spinner could wait on a holder preempted on its own core. The block layer's holders (eight, each a local loan
+// for one BOT transaction) never sleep under the loan (their waits are `crate::hlt()` at IF=1), and no ISR touches the
+// loan's state (`xhci_msi_handler` is MMIO and one atomic), so the take now holds this CPU's preempt-off count
+// (BP-cores-23) from before the take to after the put and publishes the holder's CPU in `BLOCK_LOAN_CPU`. A masked
+// claimant spins (`wait::bounded`, `LOAN_MASKED_WAIT_MS`) only while the published holder is on ANOTHER CPU — a running
+// holder — and answers `Busy` at once for an unpublished holder (the pump, xhci-poll, ftdi, usbnet, ptp: preemptible as
+// before) or a same-CPU one. aarch64 keeps the at-once refusal (PREEMPTOFF-ARM owed). Owed: XHCILOAN-FAILHOLD (a failing
+// BOT ladder holds preempt-off up to 3x `hw_wait_budget`), XHCILOAN-POLL, XHCILOAN-PUMP (refused), XHCILOAN-PTPCOPY.
+
+/// PREEMPTOFFXHCILOAN: the block layer's loan of the xHCI controller. Derefs to [`XhciLoan`]; on x86 it holds this CPU's
+/// preempt-off count from before the take (`take_block_loan`) to after the put (its Drop), and `tag` is the published
+/// holder word (cpu + 1; 0 on aarch64).
+pub struct BlockLoan {
+    loan: Option<XhciLoan>,
+    tag: u32,
+}
+
+impl core::ops::Deref for BlockLoan {
+    type Target = XhciLoan;
+    #[inline]
+    fn deref(&self) -> &XhciLoan {
+        self.loan.as_ref().expect("BlockLoan invariant: Some until drop")
+    }
+}
+
+impl core::ops::DerefMut for BlockLoan {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut XhciLoan {
+        self.loan.as_mut().expect("BlockLoan invariant: Some until drop")
+    }
+}
+
+impl Drop for BlockLoan {
+    fn drop(&mut self) {
+        // The put first (XhciLoan's masked O(1) put), while this CPU is still preempt-off; then the publication is
+        // withdrawn (only if it is still ours) and the count released.
+        drop(self.loan.take());
+        #[cfg(target_arch = "x86_64")]
+        {
+            let _ = BLOCK_LOAN_CPU.compare_exchange(
+                self.tag,
+                0,
+                core::sync::atomic::Ordering::AcqRel,
+                core::sync::atomic::Ordering::Relaxed,
+            );
+            crate::arch::sched::preemptoff::enable();
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = self.tag;
+    }
+}
+
+/// PREEMPTOFFXHCILOAN: the CPU (+1) of the block-layer holder of controller 0's loan, held preempt-off; 0 = none
+/// published. Written by the holder (after its take, cleared by CAS after its put), read by masked claimants. Lock-free.
+#[cfg(target_arch = "x86_64")]
+static BLOCK_LOAN_CPU: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// PREEMPTOFFXHCILOAN: the longest a MASKED claimant spins on a running holder: past a healthy 32 KiB BOT transaction
+/// (~1-2 ms at USB2), and inside the 20 ms masked goal (CLOCKCORE / HIDSTALL `masked_max_ms`).
+pub const LOAN_MASKED_WAIT_MS: u64 = 10;
+
+/// PREEMPTOFFXHCILOAN: masked waits that got the loan, and masked claims refused, this boot; the last refusal's why.
+#[cfg(target_arch = "x86_64")]
+static LOAN_MASKED_OK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+#[cfg(target_arch = "x86_64")]
+static LOAN_MASKED_BUSY: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+#[cfg(target_arch = "x86_64")]
+static LOAN_LAST_WHY: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+#[cfg(target_arch = "x86_64")]
+static LOAN_REFUSAL_SAID: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+#[cfg(target_arch = "x86_64")]
+fn loan_why_word(code: u8) -> &'static str {
+    match code {
+        1 => "holder-preemptible",
+        2 => "same-cpu",
+        3 => "masked-timeout(10ms)",
+        _ => "none",
+    }
+}
+
+/// PREEMPTOFFXHCILOAN: take controller 0's loan for the block layer — this CPU's preempt-off count held first, the holder
+/// published on success, the count released on a refusal.
+#[cfg(target_arch = "x86_64")]
+fn take_block_loan() -> Result<BlockLoan, XhciClaimError> {
+    crate::arch::sched::preemptoff::disable();
+    match xhci::claim() {
+        Ok(l) => {
+            let tag = crate::arch::percpu::this_cpu().cpu_index.saturating_add(1);
+            BLOCK_LOAN_CPU.store(tag, core::sync::atomic::Ordering::Release);
+            Ok(BlockLoan { loan: Some(l), tag })
+        }
+        Err(e) => {
+            crate::arch::sched::preemptoff::enable();
+            Err(e)
+        }
+    }
+}
+
+/// PREEMPTOFFXHCILOAN: the aarch64 take is the plain claim (no preempt-off count there yet: PREEMPTOFF-ARM).
+#[cfg(not(target_arch = "x86_64"))]
+fn take_block_loan() -> Result<BlockLoan, XhciClaimError> {
+    xhci::claim().map(|l| BlockLoan { loan: Some(l), tag: 0 })
+}
+
+/// PREEMPTOFFXHCILOAN: a MASKED claimant met a held loan. Spin re-taking it for at most [`LOAN_MASKED_WAIT_MS`], but only
+/// while the published holder is a preempt-off block holder on ANOTHER CPU (running, so it returns the loan); an
+/// unpublished holder (preemptible) or one on this CPU answers `Busy` at once, as WEDGE-8 F3 did. The first refusal is
+/// said once.
+#[cfg(target_arch = "x86_64")]
+fn masked_loan_wait() -> Result<BlockLoan, BlockError> {
+    let me = crate::arch::percpu::this_cpu().cpu_index.saturating_add(1);
+    let got: core::cell::Cell<Option<Result<BlockLoan, BlockError>>> = core::cell::Cell::new(None);
+    let why = core::cell::Cell::new(0u8);
+    let t0 = crate::arch::now_cycles();
+    let _ = wait::bounded(LOAN_MASKED_WAIT_MS, || match take_block_loan() {
+        Ok(l) => {
+            got.set(Some(Ok(l)));
+            true
+        }
+        Err(XhciClaimError::NotReady) => {
+            got.set(Some(Err(BlockError::NotReady)));
+            true
+        }
+        Err(XhciClaimError::Busy) => {
+            let h = BLOCK_LOAN_CPU.load(core::sync::atomic::Ordering::Acquire);
+            if h == 0 {
+                why.set(1);
+                true
+            } else if h == me {
+                why.set(2);
+                true
+            } else {
+                false
+            }
+        }
+    });
+    if let Some(r) = got.into_inner() {
+        if r.is_ok() {
+            LOAN_MASKED_OK.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
+        return r;
+    }
+    let code = if why.get() == 0 { 3 } else { why.get() };
+    LOAN_LAST_WHY.store(code, core::sync::atomic::Ordering::Relaxed);
+    LOAN_MASKED_BUSY.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    if !LOAN_REFUSAL_SAID.swap(true, core::sync::atomic::Ordering::AcqRel) {
+        let us = crate::arch::now_cycles().wrapping_sub(t0).saturating_mul(1000) / wait::cycles_ms(1).max(1);
+        serial_println!(
+            "[xhci] loan masked claim -> Busy why={} waited_us={} (PREEMPTOFFXHCILOAN Z62, first refusal, once)",
+            loan_why_word(code),
+            us
+        );
+    }
+    Err(BlockError::Busy)
+}
+
+/// PREEMPTOFFXHCILOAN: aarch64 keeps WEDGE-8's at-once refusal for a masked claimant (PREEMPTOFF-ARM owed).
+#[cfg(not(target_arch = "x86_64"))]
+fn masked_loan_wait() -> Result<BlockLoan, BlockError> {
+    Err(BlockError::Busy)
+}
+
+/// PREEMPTOFFXHCILOAN: `(masked waits that got the loan, masked claims refused)` this boot.
+#[cfg(target_arch = "x86_64")]
+pub fn xhci_loan_masked_census() -> (u32, u32) {
+    (
+        LOAN_MASKED_OK.load(core::sync::atomic::Ordering::Relaxed),
+        LOAN_MASKED_BUSY.load(core::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// PREEMPTOFFXHCILOAN KAT handshake: 0 idle, 1 the holder task holds the loan, 2 the masked claimant is spinning,
+/// 3 the holder put the loan back, 9 the holder never got it.
+#[cfg(target_arch = "x86_64")]
+static LOAN_KAT_STATE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// PREEMPTOFFXHCILOAN KAT holder (a task on a sibling CPU): take the block loan unmasked, hold it until the claimant
+/// spins (<= 200 ms) and 2 ms more, put it back.
+#[cfg(target_arch = "x86_64")]
+fn loan_kat_holder(_: usize) {
+    use core::sync::atomic::Ordering;
+    let Ok(l) = claim_xhci_for_io() else {
+        LOAN_KAT_STATE.store(9, Ordering::Release);
+        return;
+    };
+    LOAN_KAT_STATE.store(1, Ordering::Release);
+    let _ = wait::bounded(200, || LOAN_KAT_STATE.load(Ordering::Acquire) == 2);
+    let _ = wait::bounded(2, || false);
+    drop(l);
+    LOAN_KAT_STATE.store(3, Ordering::Release);
+}
+
+/// PREEMPTOFFXHCILOAN: `tests preemptaudit`'s loan leg — a task on a sibling CPU holds the block loan (preempt-off,
+/// published), and a MASKED claimant on this CPU must get it inside [`LOAN_MASKED_WAIT_MS`]. Returns
+/// `(loan_wait word, µs the masked claim took)`: `ok` / `refused-<why>` / `notready` / `err`, or
+/// `skip(masked|no-xhci|one-cpu|holder-late)`.
+#[cfg(target_arch = "x86_64")]
+pub fn xhci_loan_wait_kat() -> (&'static str, u64) {
+    use core::sync::atomic::Ordering;
+    if crate::arch::irqs_masked() {
+        return ("skip(masked)", 0);
+    }
+    if matches!(xhci::claim(), Err(XhciClaimError::NotReady)) {
+        return ("skip(no-xhci)", 0);
+    }
+    let me = crate::arch::percpu::this_cpu().cpu_index as usize;
+    let cpu = crate::arch::sched::sibling_online_cpu(me);
+    if cpu == me {
+        return ("skip(one-cpu)", 0);
+    }
+    LOAN_KAT_STATE.store(0, Ordering::Release);
+    crate::arch::sched::spawn("loanwait-kat", loan_kat_holder, 0, cpu, crate::arch::sched::PRIO_HIGH);
+    if !wait::bounded(1000, || LOAN_KAT_STATE.load(Ordering::Acquire) == 1) {
+        return ("skip(holder-late)", 0);
+    }
+    let (word, cycles) = crate::arch::without_interrupts(|| {
+        LOAN_KAT_STATE.store(2, Ordering::Release);
+        let t0 = crate::arch::now_cycles();
+        let r = claim_xhci_for_io();
+        let c = crate::arch::now_cycles().wrapping_sub(t0);
+        let w = match &r {
+            Ok(_) => "ok",
+            Err(BlockError::Busy) => match LOAN_LAST_WHY.load(Ordering::Relaxed) {
+                1 => "refused-holder-preemptible",
+                2 => "refused-same-cpu",
+                3 => "refused-masked-timeout",
+                _ => "refused",
+            },
+            Err(BlockError::NotReady) => "notready",
+            Err(_) => "err",
+        };
+        drop(r);
+        (w, c)
+    });
+    let _ = wait::bounded(200, || LOAN_KAT_STATE.load(Ordering::Acquire) >= 3);
+    (word, cycles.saturating_mul(1000) / wait::cycles_ms(1).max(1))
 }

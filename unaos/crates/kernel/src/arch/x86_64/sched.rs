@@ -9548,7 +9548,7 @@ pub mod preemptoff {
         let (sdhc_word, sdhc_sw): (&'static str, u64) = ("skip(no-sdhcblk)", 0);
         let converted_sdhc = cfg!(feature = "sdhcblk") as u32;
         let switched = switched.saturating_add(sdhc_sw);
-        let reason = if !on {
+        let (lw, lw_us) = crate::drivers::block::xhci_loan_wait_kat(); let reason = if !on { // PREEMPTOFFXHCILOAN (Z62) leg: the masked claimant on a running block-loan holder (`loan_wait=`)
             Some("masked")
         } else if ticks == 0 {
             Some("no-tick")
@@ -9560,18 +9560,18 @@ pub mod preemptoff {
             Some("sdhc-not-held")
         } else if sdhc_word == "err" {
             Some("sdhc-read")
-        } else {
+        } else if !(lw == "ok" || lw.starts_with("skip")) { Some("loan-wait") } else {
             None
         };
         match reason {
             None => serial_println!(
-                ":: PREEMPTAUDIT: sites={} isr={} holder={} both={} converted={} converted_sdhc={} sdhc_irq_on={} hold_irq_on=ok tick_in_hold=ok switched=0 -> PASS ::",
-                AUDIT_SITES, AUDIT_ISR, AUDIT_HOLDER, AUDIT_BOTH, AUDIT_CONVERTED, converted_sdhc, sdhc_word
+                ":: PREEMPTAUDIT: sites={} isr={} holder={} both={} converted={} converted_sdhc={} sdhc_irq_on={} hold_irq_on=ok tick_in_hold=ok switched=0 loan_wait={} loan_wait_us={} -> PASS ::",
+                AUDIT_SITES, AUDIT_ISR, AUDIT_HOLDER, AUDIT_BOTH, AUDIT_CONVERTED, converted_sdhc, sdhc_word, lw, lw_us
             ),
             Some(r) => serial_println!(
-                ":: PREEMPTAUDIT: sites={} isr={} holder={} both={} converted={} converted_sdhc={} sdhc_irq_on={} hold_irq_on={} tick_in_hold={} switched={} -> FAIL reason={} ::",
+                ":: PREEMPTAUDIT: sites={} isr={} holder={} both={} converted={} converted_sdhc={} sdhc_irq_on={} hold_irq_on={} tick_in_hold={} switched={} loan_wait={} loan_wait_us={} -> FAIL reason={} ::",
                 AUDIT_SITES, AUDIT_ISR, AUDIT_HOLDER, AUDIT_BOTH, AUDIT_CONVERTED, converted_sdhc, sdhc_word,
-                if on { "ok" } else { "masked" }, if ticks > 0 { "ok" } else { "none" }, switched, r
+                if on { "ok" } else { "masked" }, if ticks > 0 { "ok" } else { "none" }, switched, lw, lw_us, r
             ),
         }
     }
