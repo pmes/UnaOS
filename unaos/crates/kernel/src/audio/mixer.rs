@@ -82,7 +82,7 @@ pub struct Source {
     /// SINKALL: held out of the mix (the Player's pause): no frame taken, no underrun counted.
     paused: bool,
     underruns: u32,
-    owner: Option<Owner>, rs: Option<Sinc>, // NLE4BKERNEL (rmbp-ledger B896): a non-48 kHz source's ONE converter, built before MIX by `ingest_sinc` (file tail)
+    owner: Option<Owner>, rs: Option<Sinc>, #[cfg(feature = "videoplayer")] ramps: VecDeque<Ramp>, // NLE6MIXAUDIO (rmbp-ledger B953): the gain ramps (file tail). NLE4BKERNEL (rmbp-ledger B896): a non-48 kHz source's ONE converter, built before MIX by `ingest_sinc` (file tail)
 }
 
 /// SINKALL: a source's account: source frames written and played (capped), its underruns, and drained = ended with
@@ -120,7 +120,7 @@ pub struct Mix {
     pub emitted: u64,
     pub periods: u64,
     pub underruns: u32,
-    next_id: u32,
+    next_id: u32, #[cfg(feature = "videoplayer")] tap: Option<Vec<u64>>, // NLE6MIXAUDIO (rmbp-ledger B953): the `tests nle` witness, each period's mean square (file tail)
 }
 
 /// The saturating add: `acc + s * gain`, clamped to i16 at every add.
@@ -137,7 +137,7 @@ pub fn master_out(acc: i32, master: u16, mute: bool) -> i16 {
 
 impl Mix {
     pub const fn new() -> Mix {
-        Mix { srcs: Vec::new(), emitted: 0, periods: 0, underruns: 0, next_id: 0 }
+        Mix { srcs: Vec::new(), emitted: 0, periods: 0, underruns: 0, next_id: 0, #[cfg(feature = "videoplayer")] tap: None }
     }
 
     /// A new source of `rate` / `ch` / `bits` at `gain`: its id, or (errno, refusal word).
@@ -157,7 +157,7 @@ impl Mix {
         let id = self.next_id;
         self.srcs.push(Source {
             id, name, gain, ring: VecDeque::new(), rate, ch, bits, in_n: 0, out_n: 0, taken: 0, last_e: self.emitted,
-            primed: false, ended: false, paused: false, underruns: 0, owner, rs: None,
+            primed: false, ended: false, paused: false, underruns: 0, owner, rs: None, #[cfg(feature = "videoplayer")] ramps: VecDeque::new(),
         });
         Ok(id)
     }
@@ -208,7 +208,7 @@ impl Mix {
     }
 
     pub fn set_gain(&mut self, id: u32, gain: u16) -> bool {
-        self.at(id).map(|s| s.gain = gain).is_some()
+        self.at(id).map(|s| { s.gain = gain; ramps_clear(s) }).is_some() // NLE6MIXAUDIO (B953): a 0-frame ramp — the hold gain from the play head on, every queued ramp dropped (file tail)
     }
 
     /// SINKALL: hold source `id` out of the mix (`on`) or put it back.
@@ -246,10 +246,10 @@ impl Mix {
                 s.underruns += 1;
                 self.underruns += 1;
             }
-            for a in acc.iter_mut().take(have) {
-                let [l, r] = s.ring.pop_front().unwrap_or([0, 0]);
-                a[0] = mix_add(a[0], l, s.gain);
-                a[1] = mix_add(a[1], r, s.gain);
+            for (j, a) in acc.iter_mut().take(have).enumerate() {
+                let [l, r] = s.ring.pop_front().unwrap_or([0, 0]); let g = { let i = s.taken + j as u64; gain_at(s, i) }; // NLE6MIXAUDIO (rmbp-ledger B953): the per-frame gain, ONE fn (file tail)
+                a[0] = mix_add(a[0], l, g);
+                a[1] = mix_add(a[1], r, g);
             }
             if have > 0 {
                 s.taken += have as u64;
@@ -261,7 +261,7 @@ impl Mix {
             out[2 * i + 1] = master_out(a[1], master, mute);
         }
         self.emitted = e;
-        self.periods += 1;
+        self.periods += 1; tap_push(self, out); // NLE6MIXAUDIO (rmbp-ledger B953): the witness tap (file tail)
     }
 }
 
@@ -1078,4 +1078,123 @@ fn bt_drain(o: &mut Out) {
         DELIVERED[OUT_BT as usize].fetch_add(took / 4, Ordering::Relaxed);
         o.delivered += took / 4;
     }
+}
+
+// ── NLE6MIXAUDIO (rmbp-ledger B953): THE GAIN RAMP, the alignment and the witness tap ─────────────────────────────────
+// A source's gain per mixed frame is ONE fn, [`gain_at`]: the queued ramps (each anchored at the source's PRODUCED
+// 48 kHz frame index when it was set, so it applies to exactly the frames written after it however deep the ring is),
+// interpolated by audio_core's ONE curve (`audio_core::ramp::at`, Stria's render's too); before any ramp, the hold gain.
+// `set_gain` is the 0-frame ramp: the hold gain from the play head on, the queue dropped. The Player's EDL mode
+// (`video::vplay`, the audio crossfade) is the caller; under `not(videoplayer)` the gain is the hold gain, today's mix.
+// [`align`] pads a new source with silence to another's unmixed depth in ONE MIX hold, so its first written frame mixes
+// in the same period as the other's next one. Wire: none of its own (the callers' `[nle] audio …` lines).
+
+/// One gain ramp of a source: from `from` at its produced frame `at` to `to` at `at + n` (Q8; `n == 0` = a step).
+#[cfg(feature = "videoplayer")]
+pub struct Ramp {
+    at: u64,
+    from: u16,
+    to: u16,
+    n: u32,
+}
+
+/// Ramps queued per source (a run each; the 200 ms ring holds at most five 40 ms runs).
+#[cfg(feature = "videoplayer")]
+pub const RAMP_MAX: usize = 8;
+
+/// The gain of source frame `idx` (its index among the frames taken from the ring): the ramp it falls in, else the
+/// last ramp's end, else (no ramp yet) the hold gain. Ramps behind `idx` are dropped.
+#[cfg(feature = "videoplayer")]
+fn gain_at(s: &mut Source, idx: u64) -> u16 {
+    while s.ramps.len() >= 2 && s.ramps[1].at <= idx {
+        s.ramps.pop_front();
+    }
+    match s.ramps.front() {
+        Some(r) if idx >= r.at => {
+            let k = idx - r.at;
+            if r.n == 0 || k >= r.n as u64 { r.to } else { audio_core::ramp::at(r.from as i64, r.to as i64, k as i64, r.n as i64) as u16 }
+        }
+        _ => s.gain,
+    }
+}
+
+#[cfg(not(feature = "videoplayer"))]
+#[inline(always)]
+fn gain_at(s: &mut Source, _idx: u64) -> u16 {
+    s.gain
+}
+
+#[cfg(feature = "videoplayer")]
+fn ramps_clear(s: &mut Source) {
+    s.ramps.clear();
+}
+
+#[cfg(not(feature = "videoplayer"))]
+#[inline(always)]
+fn ramps_clear(_: &mut Source) {}
+
+/// Witness periods kept (10 s).
+#[cfg(feature = "videoplayer")]
+const TAP_MAX: usize = 1024;
+
+#[cfg(feature = "videoplayer")]
+fn tap_push(m: &mut Mix, out: &[i16]) {
+    if let Some(t) = m.tap.as_mut().filter(|t| t.len() < TAP_MAX && !out.is_empty()) {
+        let sq: u64 = out.iter().map(|&v| (v as i64 * v as i64) as u64).sum();
+        t.push(sq / out.len() as u64);
+    }
+}
+
+#[cfg(not(feature = "videoplayer"))]
+#[inline(always)]
+fn tap_push(_: &mut Mix, _: &[i16]) {}
+
+#[cfg(feature = "videoplayer")]
+impl Mix {
+    /// Queue a ramp on source `id` from `from` to `to` (Q8) over its next `frames` produced 48 kHz frames.
+    pub fn set_gain_ramp(&mut self, id: u32, from: u16, to: u16, frames: u32) -> bool {
+        let Some(s) = self.at(id) else { return false };
+        if s.ramps.len() >= RAMP_MAX {
+            return false;
+        }
+        let at = s.out_n;
+        s.ramps.push_back(Ramp { at, from, to, n: frames });
+        true
+    }
+
+    /// Pad source `id` with silent 48 kHz frames until its unmixed depth equals source `to`'s; primes it.
+    pub fn align(&mut self, id: u32, to: u32) -> bool {
+        let Some(want) = self.srcs.iter().find(|s| s.id == to).map(|s| s.out_n.saturating_sub(s.taken)) else { return false };
+        let Some(s) = self.at(id) else { return false };
+        let have = s.out_n.saturating_sub(s.taken);
+        for _ in have..want {
+            s.ring.push_back([0, 0]);
+        }
+        s.out_n += want.saturating_sub(have);
+        s.primed = true;
+        true
+    }
+}
+
+/// Queue a gain ramp on kernel source `id` (see [`Mix::set_gain_ramp`]); false when it is closed or its queue is full.
+#[cfg(feature = "videoplayer")]
+pub fn set_gain_ramp(id: u32, from: u16, to: u16, frames: u32) -> bool {
+    MIX.lock().set_gain_ramp(id, from, to, frames)
+}
+
+/// Align kernel source `id` to source `to` (see [`Mix::align`]).
+#[cfg(feature = "videoplayer")]
+pub fn align(id: u32, to: u32) -> bool {
+    MIX.lock().align(id, to)
+}
+
+/// The witness tap: each mixed period's mean square (interleaved L/R) since the last call; `on` re-arms it.
+#[cfg(feature = "videoplayer")]
+pub fn tap(on: bool) -> Vec<u64> {
+    let mut m = MIX.lock();
+    let was = m.tap.take().unwrap_or_default();
+    if on {
+        m.tap = Some(Vec::new());
+    }
+    was
 }

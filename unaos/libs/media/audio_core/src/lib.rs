@@ -56,6 +56,8 @@ pub mod ogg;
 pub mod opus;
 /// NLE4 (SR203) / NLE4B (SR222): position-addressed resamplers: `Sinc` the windowed-sinc quality path (Stria's editor render), `linear` the cheap one.
 pub mod resample;
+/// NLE6MIXAUDIO (rmbp-ledger B953): the ONE gain curve (in-run envelope interpolation, clip gain), Stria and the kernel mixer.
+pub mod ramp;
 /// AETHERMEDIA2 (SR134): WSOLA time-stretch (playbackRate with the pitch kept).
 pub mod stretch;
 pub mod vorbis;

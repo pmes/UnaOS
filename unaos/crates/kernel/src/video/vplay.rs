@@ -578,7 +578,7 @@ fn room(jid: u32) -> Result<(), &'static str> {
         if now().saturating_sub(DRAIN_MS.load(Ordering::Acquire)) > ORPHAN_MS && !PAUSED.load(Ordering::Acquire) {
             return Err("consumer-gone");
         }
-        crate::arch::sched::sleep_ms(2);
+        snd::tick(jid); crate::arch::sched::sleep_ms(2); // NLE6MIXAUDIO (rmbp-ledger B953): the EDL's sound is written while the job waits (file tail; no-op outside the EDL mode)
     }
 }
 
@@ -782,8 +782,8 @@ pub fn fact_lines(f: &Facts) -> [String; 2] {
 // the outgoing source's frame (a second run, `mix`: the live run it continues via timeline_core's `vmix::take_outgoing`,
 // else opened at its keyframe; dropped at the first step without `vmix`) with its own picture (or the to-black's black)
 // through timeline_core's ONE `vmix::mix_step` (the fn Stria's render calls); a slot the heap or the registry cannot give
-// is refused by name and the incoming shows. The audio steps are counted, not played (audio_core::container has no PCM
-// door; NLE6-MIX). Wire: `[nle] reel …`, `[nle] open edl=<path> reels=<n> clips=<n> steps=<n>`, `[nle] job exit
+// is refused by name and the incoming shows. NLE6MIXAUDIO (rmbp-ledger B953): the audio runs play through the mixer,
+// a crossfade on a second source (the section at the file tail, `snd`). Wire: `[nle] reel …`, `[nle] open edl=<path> reels=<n> clips=<n> steps=<n>`, `[nle] job exit
 // frames=<n> seeks=<n> runup=<n> gaps=<n> mixed=<n> mix_seeks=<n> refused=<n> mix_us_max=<n>`, `[vplay] transition:
 // second decoder slot refused (<why>)`; the witness is player.rs `tests nle` (`:: NLE: … ::`).
 
@@ -864,7 +864,7 @@ pub struct EdlReport {
     pub mix_seeks: u64,
     pub mix_refused: u64,
     pub mix_us_max: u64,
-    pub mixes: Vec<(i64, u64)>,
+    pub mixes: Vec<(i64, u64)>, pub snd_runs: u64, pub xfades: u64, pub snd_refused: u64, pub snd_underruns: u64, pub snd_frames: u64, // NLE6MIXAUDIO (rmbp-ledger B953): the sound's runs, second sources opened and refused, underruns, frames played
 }
 
 static NLE: crate::sync::Mutex<Option<EdlReport>> = crate::sync::Mutex::new(None);
@@ -889,7 +889,7 @@ fn edl_task(arg: usize) {
     serial_println!("[vplay] job run jid={} cpu={} wait_ms={} mode=edl", jid, crate::arch::percpu::this_cpu().cpu_index, now().saturating_sub(SPAWN_MS.load(Ordering::Acquire)));
     *NLE.lock() = None;
     let mut rep = EdlReport::default();
-    let r = edl_run(jid, &path, seek_ms, &mut rep);
+    let r = edl_run(jid, &path, seek_ms, &mut rep); snd::close(&mut rep); // NLE6MIXAUDIO (rmbp-ledger B953): every source closed, on every path (file tail)
     serial_println!(
         "[nle] job exit frames={} seeks={} runup={} gaps={} mixed={} mix_seeks={} refused={} mix_us_max={}",
         rep.frames, rep.seeks, rep.runup, rep.gaps, rep.mixed, rep.mix_seeks, rep.mix_refused, rep.mix_us_max
@@ -945,7 +945,7 @@ fn edl_run(jid: u32, path: &str, seek_ms: u64, rep: &mut EdlReport) -> Result<()
     serial_println!("[nle] open edl={} reels={} clips={} steps={}", path, rep.reels, rep.clips, rep.steps);
     let audio = steps.iter().filter(|s| s.kind == Kind::Audio).count();
     if audio > 0 {
-        serial_println!("[nle] audio steps={} -> owed (audio_core::container has no PCM door; NLE6-MIX)", audio);
+        snd::open(&reels, tl, seek_ms); // NLE6MIXAUDIO (rmbp-ledger B953): the EDL's sound, one mixer source per audio track, the crossfade's second (file tail)
     }
     // the facts: the first scheduled video reel sizes the picture (and the gaps); the EDL's rate is the clock's
     let first = steps.iter().filter(|s| s.kind == Kind::Video).find_map(|s| s.src).and_then(|id| reels.get(id)).and_then(|r| r.v.as_ref());
@@ -995,9 +995,9 @@ fn edl_run(jid: u32, path: &str, seek_ms: u64, rep: &mut EdlReport) -> Result<()
             rep.frames += 1;
             j.decoded = rep.frames;
         }
-        crate::arch::sched::yield_now();
+        snd::tick(jid); crate::arch::sched::yield_now(); // NLE6MIXAUDIO (rmbp-ledger B953): the sound, once per step (file tail)
     }
-    Ok(())
+    snd::drain(jid); Ok(()) // NLE6MIXAUDIO (rmbp-ledger B953): the sound plays out after the last picture, bounded (file tail)
 }
 
 // ── NLE6MIX (rmbp-ledger B899): the transition mix on the EDL job — the second run, the ONE mix fn, the refusal ─────────
@@ -1213,4 +1213,458 @@ fn coded(rep: &mut EdlReport, out_t: i64, ord: Option<u32>, px: &[u32]) {
 /// FNV-1a 64 of straight RGBA (the mix witness and the coded witness hash the same bytes).
 fn frame_fnv_rgba(rgba: &[u8]) -> u64 {
     rgba.iter().fold(crate::video::strip::FNV_BASIS, |acc, x| crate::video::strip::fnv1a(acc, *x))
+}
+
+// ── NLE6MIXAUDIO (rmbp-ledger B953): the EDL job's sound — one mixer source per audio track, the crossfade's second ──────
+// `snd::open` takes timeline_core's audio runs (`schedule::audio_runs`, the runs Stria's `mix_run` renders) and opens ONE
+// mixer source per audio track (`nle`, the format of the track's first playable reel, PCM16 into the mixer's own
+// converter). `snd::tick` (from the job's waits: `room`, and once per video step) writes every source as far as its ring
+// takes, run by run: a layer's reel through audio_core's ONE door (`container::open_demuxed`, its PCM door included; a
+// `seek` or another source reopens it, a jump forward within it skips), a track with no layer as silence (the clock), each
+// run's gain a mixer RAMP between its edges (`Layer.env` x `gain_cdb` through `audio_core::ramp::layer_q8`, set before the
+// run's first frame is written; the mixer interpolates per frame through `audio_core::ramp::at`). A crossfade run's UNDER
+// layer (timeline_core's `AudioRun::under`, Stria's slot rule) plays on a SECOND source, opened when the top source reaches
+// the span and `mixer::align`ed to it (its first frame mixes with the top's), ended at the first run without one and
+// closed once drained; a source the mixer refuses is named, `[nle] audio crossfade: second source refused (<why>)`, and that
+// span is a cut (the incoming at its clip gain). `snd::drain` plays the rest out after the last picture (it gives up after
+// `STALL_MS` without progress: no sink); `snd::close` closes every source and prints `[nle] audio exit runs=<n> xfades=<n>
+// refused=<n> underruns=<n> frames=<n>`. A Player seek starts every run's sound at the seek (its ramp entered part-way).
+// The EDL's clock stays the wall. Lock: `SND` (the job task's) then the mixer's; nothing under the mixer takes `SND`. The
+// image without an audio module (`uvc` / `hda-tone` off) carries the silent twin below.
+#[cfg(any(feature = "uvc", feature = "hda-tone"))]
+mod snd {
+    use super::{EdlReport, Reels, GEN};
+    use crate::audio::mixer;
+    use alloc::vec::Vec;
+    use audio_core::AudioDecoder;
+    use core::sync::atomic::Ordering;
+    use timeline_core::schedule::{AudioRun, ENV_ONE};
+    use timeline_core::{SourceId, Timebase};
+
+    /// Frames a slot makes per step before offering them to the mixer.
+    const CHUNK: u64 = 1024;
+    /// The drain gives up after this long with no byte taken and no frame played (no sink).
+    const STALL_MS: u64 = 3_000;
+
+    /// A layer's decoder: its reel's sound from source frame `pos` on.
+    struct Aud {
+        src: SourceId,
+        dec: audio_core::Decoder,
+        pos: u64,
+    }
+
+    /// One mixer source of an audio track: its top layer, or a crossfade's under layer (`under`).
+    struct Slot {
+        track: usize,
+        under: bool,
+        id: u32,
+        rate: u32,
+        ch: u8,
+        aud: Option<Aud>,
+        /// The run being written, the frames of it written (slot rate), its setup done, a layer plays in it.
+        ri: usize,
+        off: u64,
+        set: bool,
+        play: bool,
+        /// Bytes made, not yet taken by the mixer.
+        pend: Vec<u8>,
+        /// Top only: this span's second source was opened (`span`) or refused (`cut`: the span is a cut).
+        span: bool,
+        cut: bool,
+        done: bool,
+    }
+
+    /// A reel's sound: its demuxer share when audio_core plays its audio track, and the track's format.
+    struct ReelSnd {
+        id: SourceId,
+        d: Option<demux_core::Demuxer>,
+        rate: u32,
+        ch: u8,
+    }
+
+    struct Snd {
+        runs: Vec<AudioRun>,
+        tb: Timebase,
+        reels: Vec<ReelSnd>,
+        slots: Vec<Slot>,
+        /// Ended second sources, closed once drained.
+        retiring: Vec<u32>,
+        skip_ms: u64,
+        xfades: u64,
+        refused: u64,
+        underruns: u64,
+        frames: u64,
+        /// The last time the mixer took a byte.
+        took_ms: u64,
+        said: u32,
+    }
+
+    static SND: crate::sync::Mutex<Option<Snd>> = crate::sync::Mutex::new(None);
+
+    /// Frames at `rate` before timeline tick `t`.
+    fn frames(tb: Timebase, t: i64, rate: u32) -> u64 {
+        (tb.to_ns(t).max(0) as u128 * rate as u128 / 1_000_000_000) as u64
+    }
+
+    fn slot(track: usize, under: bool, id: u32, rate: u32, ch: u8, ri: usize) -> Slot {
+        Slot { track, under, id, rate, ch, aud: None, ri, off: 0, set: false, play: false, pend: Vec::new(), span: false, cut: false, done: false }
+    }
+
+    /// The EDL's sound (see the section head); a refusal leaves the pictures playing silent.
+    pub fn open(reels: &Reels, tl: &timeline_core::Timeline, seek_ms: u64) {
+        *SND.lock() = None;
+        let runs = match timeline_core::schedule::audio_runs(tl, 0..tl.end(), reels) {
+            Ok(r) => r,
+            Err(e) => {
+                serial_println!("[nle] audio refused (schedule: {})", e);
+                return;
+            }
+        };
+        let rs: Vec<ReelSnd> = reels
+            .reels
+            .iter()
+            .map(|r| {
+                let t = r.a.map(|(i, _)| r.d.tracks()[i].clone());
+                let ok = t.as_ref().is_some_and(|t| audio_core::container::plays(r.d.format(), &t.codec));
+                let (rate, ch) = t.as_ref().map(|t| (t.sample_rate, t.channels.min(255) as u8)).unwrap_or((0, 0));
+                ReelSnd { id: r.id, d: if ok { Some(r.d.share()) } else { None }, rate, ch }
+            })
+            .collect();
+        let mut tracks: Vec<usize> = runs.iter().flat_map(|r| r.layers.iter().map(|l| l.track)).collect();
+        tracks.sort_unstable();
+        tracks.dedup();
+        let mut slots = Vec::new();
+        for t in tracks {
+            let first = runs.iter().flat_map(|r| r.layers.iter()).filter(|l| l.track == t).find_map(|l| rs.iter().find(|r| r.id == l.src && r.d.is_some()));
+            let Some(r) = first else {
+                serial_println!("[nle] audio refused (track {}: no reel sound audio_core plays)", t);
+                continue;
+            };
+            match mixer::open_fmt("nle", r.rate, r.ch, 16, 0) {
+                Ok(id) => slots.push(slot(t, false, id, r.rate, r.ch, 0)),
+                Err(why) => serial_println!("[nle] audio refused (track {}: {})", t, why),
+            }
+        }
+        if slots.is_empty() {
+            return;
+        }
+        *SND.lock() = Some(Snd {
+            runs,
+            tb: tl.tb,
+            reels: rs,
+            slots,
+            retiring: Vec::new(),
+            skip_ms: seek_ms,
+            xfades: 0,
+            refused: 0,
+            underruns: 0,
+            frames: 0,
+            took_ms: crate::arch::ms(),
+            said: 0,
+        });
+    }
+
+    /// Write every source as far as the mixer takes (never waits); true while something is left to write.
+    pub fn tick(jid: u32) -> bool {
+        if GEN.load(Ordering::Acquire) != jid {
+            return false;
+        }
+        match SND.lock().as_mut() {
+            Some(s) => s.pass(),
+            None => false,
+        }
+    }
+
+    /// After the last picture: write the rest and let it play out; bounded by `STALL_MS` without progress.
+    pub fn drain(jid: u32) {
+        let mut mark = (crate::arch::ms(), u64::MAX);
+        loop {
+            if GEN.load(Ordering::Acquire) != jid {
+                return;
+            }
+            let (busy, m) = match SND.lock().as_mut() {
+                None => return,
+                Some(s) => {
+                    let left = s.pass();
+                    let tops: Vec<u32> = s.slots.iter().filter(|x| !x.under).map(|x| x.id).collect();
+                    let mut played = 0u64;
+                    let mut playing = false;
+                    for id in tops {
+                        if let Some(p) = mixer::state(id) {
+                            played += p.played;
+                            playing |= !p.drained;
+                        }
+                    }
+                    (left || playing || !s.retiring.is_empty(), played.wrapping_add(s.took_ms))
+                }
+            };
+            if !busy {
+                return;
+            }
+            let now = crate::arch::ms();
+            if m != mark.1 {
+                mark = (now, m);
+            } else if now.saturating_sub(mark.0) > STALL_MS {
+                serial_println!("[nle] audio drain stalled ms={} (no sink plays the mixer)", STALL_MS);
+                return;
+            }
+            crate::arch::sched::sleep_ms(2);
+        }
+    }
+
+    /// Close every source (on every path of the job) and fold the account into the report.
+    pub fn close(rep: &mut EdlReport) {
+        let Some(mut s) = SND.lock().take() else { return };
+        let mut ids: Vec<u32> = s.slots.iter().filter(|x| !x.under || !x.done).map(|x| x.id).collect();
+        ids.extend(s.retiring.iter().copied());
+        for id in ids {
+            if let Some(p) = mixer::close(id) {
+                s.underruns += p.underruns as u64;
+                s.frames += p.played;
+            }
+        }
+        rep.snd_runs = s.runs.len() as u64;
+        rep.xfades = s.xfades;
+        rep.snd_refused = s.refused;
+        rep.snd_underruns = s.underruns;
+        rep.snd_frames = s.frames;
+        serial_println!("[nle] audio exit runs={} xfades={} refused={} underruns={} frames={}", rep.snd_runs, s.xfades, s.refused, s.underruns, s.frames);
+    }
+
+    impl Snd {
+        fn pass(&mut self) -> bool {
+            self.reap();
+            let mut left = false;
+            let mut i = 0;
+            while i < self.slots.len() {
+                left |= self.feed(i); // a top slot may push its span's second source: fed in this pass too
+                i += 1;
+            }
+            left
+        }
+
+        /// Close the ended second sources the sink has played out.
+        fn reap(&mut self) {
+            let mut k = 0;
+            while k < self.retiring.len() {
+                let id = self.retiring[k];
+                if mixer::state(id).is_none_or(|p| p.drained) {
+                    if let Some(p) = mixer::close(id) {
+                        self.underruns += p.underruns as u64;
+                        self.frames += p.played;
+                    }
+                    self.retiring.swap_remove(k);
+                } else {
+                    k += 1;
+                }
+            }
+        }
+
+        /// Slot `i`'s writes, run by run, until the mixer's ring is full; true while it has more to write.
+        fn feed(&mut self, i: usize) -> bool {
+            loop {
+                {
+                    let sl = &mut self.slots[i];
+                    if sl.done {
+                        return false;
+                    }
+                    if !sl.pend.is_empty() {
+                        let took = mixer::write(sl.id, &sl.pend);
+                        sl.pend.drain(..took.min(sl.pend.len()));
+                        if took > 0 {
+                            self.took_ms = crate::arch::ms();
+                        }
+                        if !self.slots[i].pend.is_empty() {
+                            return true;
+                        }
+                    }
+                }
+                let Some((out_t, len)) = self.runs.get(self.slots[i].ri).map(|r| (r.out_t, r.len)) else {
+                    return self.finish(i);
+                };
+                let rate = self.slots[i].rate;
+                let start = frames(self.tb, out_t, rate);
+                let cnt = frames(self.tb, out_t + len, rate).saturating_sub(start);
+                let opened = self.slots.len();
+                if !self.slots[i].set && !self.setup(i, start, cnt) {
+                    return false; // a second source whose span ended
+                }
+                if self.slots.len() > opened {
+                    return true; // the span's second source is fed next in this pass, before the top writes on (its pad holds)
+                }
+                let sl = &mut self.slots[i];
+                if sl.off >= cnt {
+                    sl.ri += 1;
+                    sl.off = 0;
+                    sl.set = false;
+                    continue;
+                }
+                let k = (cnt - sl.off).min(CHUNK);
+                make(sl, k);
+                sl.off += k;
+            }
+        }
+
+        /// Every run written: the source ends (what it holds plays out); a second source is closed once drained.
+        fn finish(&mut self, i: usize) -> bool {
+            let (id, under) = (self.slots[i].id, self.slots[i].under);
+            mixer::end(id);
+            self.slots[i].done = true;
+            if under {
+                self.retiring.push(id);
+            }
+            false
+        }
+
+        /// Run `ri`'s setup on slot `i` (written from frame `s0`, the Player's seek): the layer it plays (none = silence),
+        /// its gain ramp, its decoder; the top slot opens the span's second source. False: a second source's span ended.
+        fn setup(&mut self, i: usize, start: u64, cnt: u64) -> bool {
+            let run = self.runs[self.slots[i].ri].clone();
+            let (track, under, rate, id) = (self.slots[i].track, self.slots[i].under, self.slots[i].rate, self.slots[i].id);
+            let li = (0..run.layers.len()).find(|&li| run.layers[li].track == track && run.under(li) == under);
+            if under && li.is_none() {
+                mixer::end(id);
+                self.slots[i].done = true;
+                self.retiring.push(id);
+                return false;
+            }
+            let s0 = (self.skip_ms * rate as u64 / 1000).saturating_sub(start).min(cnt);
+            if !under {
+                let span = (0..run.layers.len()).any(|li| run.layers[li].track == track && run.under(li));
+                if !span {
+                    (self.slots[i].span, self.slots[i].cut) = (false, false);
+                } else if s0 < cnt && !self.slots[i].span && !self.slots[i].cut {
+                    self.slots[i].span = true; // the span's first written run opens its second source, once
+                    self.open_under(i, &run);
+                }
+            }
+            let mut play = false;
+            if let Some(li) = li {
+                let l = run.layers[li];
+                let env = if self.slots[i].cut { [ENV_ONE, ENV_ONE] } else { l.env };
+                let (e0, e1) = (audio_core::ramp::layer_q8(l.gain_cdb, env[0]) as i64, audio_core::ramp::layer_q8(l.gain_cdb, env[1]) as i64);
+                let from = audio_core::ramp::at(e0, e1, s0 as i64, cnt as i64) as u16;
+                let n48 = ((cnt - s0) * mixer::RATE as u64 / rate.max(1) as u64) as u32;
+                if !mixer::set_gain_ramp(id, from, e1 as u16, n48) {
+                    self.refuse("ramp-queue");
+                }
+                play = self.seat(i, l.src, l.src_t, l.seek.is_some(), s0);
+            }
+            let sl = &mut self.slots[i];
+            sl.play = play;
+            sl.off = s0;
+            sl.set = true;
+            true
+        }
+
+        /// The span's second source for top slot `top`: opened at the under layer's reel format and aligned to the top
+        /// source (its backlog is all before the span: the top's earlier runs are taken); a refusal makes the span a cut.
+        fn open_under(&mut self, top: usize, run: &AudioRun) {
+            let track = self.slots[top].track;
+            if self.slots.iter().any(|x| x.under && x.track == track && !x.done) {
+                return self.refuse_span(top, "the previous span still plays");
+            }
+            let Some(l) = (0..run.layers.len()).find(|&li| run.layers[li].track == track && run.under(li)).map(|li| run.layers[li]) else { return };
+            let Some((rate, ch)) = self.reels.iter().find(|r| r.id == l.src && r.d.is_some()).map(|r| (r.rate, r.ch)) else {
+                return self.refuse_span(top, "no reel sound");
+            };
+            let id = match mixer::open_fmt("nle", rate, ch, 16, 0) {
+                Ok(id) => id,
+                Err(why) => return self.refuse_span(top, why),
+            };
+            if !mixer::align(id, self.slots[top].id) {
+                let _ = mixer::close(id);
+                return self.refuse_span(top, "align");
+            }
+            self.xfades += 1;
+            let ri = self.slots[top].ri;
+            self.slots.push(slot(track, true, id, rate, ch, ri));
+        }
+
+        fn refuse_span(&mut self, top: usize, why: &str) {
+            self.slots[top].cut = true;
+            self.refuse(why);
+        }
+
+        fn refuse(&mut self, why: &str) {
+            self.refused += 1;
+            if self.refused <= 4 {
+                serial_println!("[nle] audio crossfade: second source refused ({})", why);
+            }
+        }
+
+        /// Slot `i`'s decoder at layer source tick `src_t` + `s0` frames: kept when it continues (no `seek`, the same
+        /// source, at or before the frame), else reopened through audio_core's door and seeked; then skipped forward to
+        /// the frame. False when the reel has no sound this slot can play (the run is silence).
+        fn seat(&mut self, i: usize, src: SourceId, src_t: i64, seek: bool, s0: u64) -> bool {
+            let (rate, ch) = (self.slots[i].rate, self.slots[i].ch);
+            let Some(r) = self.reels.iter().find(|r| r.id == src) else { return false };
+            let Some(d) = r.d.as_ref().filter(|_| r.rate == rate && r.ch == ch) else {
+                self.said += 1;
+                if self.said <= 4 {
+                    serial_println!("[nle] audio refused (reel {}: no sound in the track's format {} Hz x {})", src.0, rate, ch);
+                }
+                return false;
+            };
+            let want = frames(self.tb, src_t, rate) + s0;
+            let keep = !seek && self.slots[i].aud.as_ref().is_some_and(|a| a.src == src && a.pos <= want);
+            if !keep {
+                let mut dec = match audio_core::container::open_demuxed(d.share()) {
+                    Ok(source) => audio_core::Decoder::from_source(source),
+                    Err(e) => {
+                        self.said += 1;
+                        if self.said <= 4 {
+                            serial_println!("[nle] audio refused (reel {}: {})", src.0, e);
+                        }
+                        self.slots[i].aud = None;
+                        return false;
+                    }
+                };
+                let pos = match dec.seek(want * 1000 / rate.max(1) as u64) {
+                    Ok(Some(p)) => p.landed,
+                    _ => 0, // no table: decoded from the top (a failed seek left the stream at its start)
+                };
+                self.slots[i].aud = Some(Aud { src, dec, pos });
+            }
+            let Some(a) = self.slots[i].aud.as_mut() else { return false };
+            let ch = ch.max(1) as usize;
+            let mut scratch = alloc::vec![0i32; CHUNK as usize * ch];
+            while a.pos < want {
+                let k = ((want - a.pos) as usize).min(CHUNK as usize);
+                let got = a.dec.next_i32(&mut scratch[..k * ch]).unwrap_or(0);
+                if got == 0 {
+                    break; // the reel ends before the frame: the run plays silence
+                }
+                a.pos += got as u64;
+            }
+            true
+        }
+    }
+
+    /// `k` frames of slot `sl` into its pending bytes (PCM16 LE): its decoder's, silence past the reel's end or in a gap.
+    fn make(sl: &mut Slot, k: u64) {
+        let ch = sl.ch.max(1) as usize;
+        let mut buf = alloc::vec![0i32; k as usize * ch];
+        if let (true, Some(a)) = (sl.play, sl.aud.as_mut()) {
+            let got = a.dec.next_i32(&mut buf).unwrap_or(0);
+            a.pos += got as u64;
+        }
+        sl.pend.reserve(buf.len() * 2);
+        for v in &buf {
+            sl.pend.extend_from_slice(&((*v >> 16) as i16).to_le_bytes());
+        }
+    }
+}
+
+/// The silent twin: an image without an audio module plays the EDL's pictures alone.
+#[cfg(not(any(feature = "uvc", feature = "hda-tone")))]
+mod snd {
+    pub fn open(_: &super::Reels, _: &timeline_core::Timeline, _: u64) {
+        serial_println!("[nle] audio refused (no audio module in this image)");
+    }
+    pub fn tick(_: u32) -> bool {
+        false
+    }
+    pub fn drain(_: u32) {}
+    pub fn close(_: &mut super::EdlReport) {}
 }

@@ -1313,7 +1313,7 @@ mod nle_fx {
         for (i, s) in video.samples.iter_mut().enumerate() {
             s.data = build::TestPatternPacket { frame: base + i as u32, width: 64, height: 48 }.encode();
         }
-        build::mp4(&[video], &build::Mp4Options::default())
+        build::mp4(&[video, sound(base)], &build::Mp4Options::default()) // NLE6MIXAUDIO (rmbp-ledger B953): + the reel's PCM sound (module tail)
     }
 
     /// KERNELCOLOUR (B952): a VP8 reel of 4 keyframes (`NLEFXC_KEY` each) whose `vp08` sample entry carries a `colr` of BT.709 limited.
@@ -1347,7 +1347,7 @@ mod nle_fx {
     pub fn fixture() {
         let mt = crate::shell::vfs_mount_table();
         let p = crate::fs::vfs::KERNEL_PRINCIPAL;
-        let tl = match timeline() {
+        let tl = match timeline().map(with_audio) { // NLE6MIXAUDIO (rmbp-ledger B953): + an audio track mirroring the cuts (module tail)
             Ok(t) => t,
             Err(e) => {
                 serial_println!(":: NLE: reason=transition ({:?}) -> FAIL ::", e);
@@ -1386,7 +1386,7 @@ mod nle_fx {
             return;
         };
         let path = alloc::format!("{}/NLEFX.EDL", dir);
-        let t0 = crate::arch::ms();
+        let t0 = crate::arch::ms(); env_take(true); // NLE6MIXAUDIO (rmbp-ledger B953): the mixer's witness tap armed (module tail)
         let opened = super::open(&path);
         let open_ok = opened.is_ok() && super::is_open() && super::shown() == path;
         loop {
@@ -1403,7 +1403,7 @@ mod nle_fx {
         let rep = vplay::edl_report().unwrap_or_default();
         let err = STATE.lock().as_ref().and_then(|s| s.err.clone());
         let ended = STATE.lock().as_ref().map(|s| s.ended).unwrap_or(false);
-        super::close("fixture");
+        super::close("fixture"); let env = env_take(false); // NLE6MIXAUDIO (rmbp-ledger B953): the periods mixed during the run
         // the schedule's ordinal at an output tick: the reel's base + the step's source tick
         let want = |t: i64| rep.plan.iter().find(|s| s.0 == t).and_then(|s| s.1).map(|(src, st)| BASE.get(src as usize).copied().unwrap_or(0) + st as u32);
         let agree = shown.iter().filter(|(t, n)| want(*t) == Some(*n)).count();
@@ -1411,14 +1411,69 @@ mod nle_fx {
         let kat = MIX_KAT.iter().filter(|k| rep.mixes.contains(*k)).count();
         let mix_ok = rep.mixed == 8 && rep.mix_refused == 0 && kat == MIX_KAT.len();
         let colour = rep.coded.iter().filter(|k| **k == COLOUR_KAT).count(); // KERNELCOLOUR (B952): NLEFXC's middle frame by BT.709
-        let ok = open_ok && err.is_none() && ended && pres > 0 && !shown.is_empty() && agree == shown.len() && pres + drop == rep.frames && rep.seeks == seek_steps && mix_ok && colour == 1;
+        let ok = open_ok && err.is_none() && ended && pres > 0 && !shown.is_empty() && agree == shown.len() && pres + drop == rep.frames && rep.seeks == seek_steps && mix_ok && colour == 1; let (env_ok, env_word) = env_verdict(&env, &rep); let ok = ok && env_ok; // NLE6MIXAUDIO (rmbp-ledger B953): the dissolve's sound (module tail)
         serial_println!(
             "[nle] fixture edl={} presented={} dropped={} queued={} gaps={} seek_steps={} ms={}{}",
             path, pres, drop, rep.frames, rep.gaps, seek_steps, crate::arch::ms().saturating_sub(t0), err.map(|e| alloc::format!(" err={}", e)).unwrap_or_default()
         );
         serial_println!(
-            ":: NLE: frames={} seeks={} runup={} agree={}/{} counter=frame-ord mix={} kat={}/{} colour={}/1 -> {} ::",
-            pres, rep.seeks, rep.runup, agree, shown.len(), rep.mixed, kat, MIX_KAT.len(), colour, if ok { "PASS" } else { "FAIL" }
+            ":: NLE: frames={} seeks={} runup={} agree={}/{} counter=frame-ord mix={} kat={}/{} colour={}/1 env={} xfades={} -> {} ::",
+            pres, rep.seeks, rep.runup, agree, shown.len(), rep.mixed, kat, MIX_KAT.len(), colour, env_word, rep.xfades, if ok { "PASS" } else { "FAIL" }
         );
+    }
+
+    // ── NLE6MIXAUDIO (rmbp-ledger B953): the dissolve's sound ──────────────────────────────────────────────────────
+    // Each reel carries a mono PCM16 48 kHz track (demux_core's `pcm16_track`, `sowt`: the kernel plays it through
+    // audio_core's PCM door): reel A a +-8000 square of period 48, reel B one of period 160 (orthogonal over a 480-frame
+    // mixer period). The audio track mirrors the video cuts, so the dissolve at tick 10 is an audio crossfade (NLE3b): B
+    // on the track's source rising over A at its handle on the second source. The mixer's witness tap gives each mixed
+    // period's mean square; counted from the first audible period (timeline frame 0), the dissolve is periods 40..56
+    // (tick 10 = 19200 frames, 4 ticks = 16 periods) and the RMS of periods 41, 43 .. 55 must be `ENV_KAT` (+-2%): the
+    // LINEAR curve's dip, pinned on the host by `audio_core::ramp` `tests::kernel_fixture_envelope` through the SAME
+    // `ramp::at` and the mixer's arithmetic. No period mixed (no sink) is `skip(no-sink)`; no audio module, `skip(no-audio)`.
+    const ENV_KAT: [u32; 8] = [7304, 6503, 5936, 5672, 5754, 6168, 6854, 7741];
+
+    /// Reel `base`'s sound: `FRAMES` frames' worth of a +-8000 square (half period 24 for reel A, 80 for reel B).
+    fn sound(base: u32) -> demux_core::build::MediaTrack {
+        let half = if base == BASE[0] { 24 } else { 80 };
+        let n = FRAMES as usize * 48_000 / FPS as usize;
+        let pcm: Vec<i16> = (0..n).map(|i| if (i / half) % 2 == 0 { 8000 } else { -8000 }).collect();
+        demux_core::build::pcm16_track(2, 48_000, 1, &pcm, 960)
+    }
+
+    /// An audio track whose clips are the video track's (the dissolve then implies the crossfade, NLE3b).
+    fn with_audio(mut tl: Timeline) -> Timeline {
+        let a = tl.add_track(Kind::Audio);
+        tl.tracks[a].clips = tl.tracks[0].clips.clone();
+        tl
+    }
+
+    #[cfg(any(feature = "uvc", feature = "hda-tone"))]
+    fn env_take(arm: bool) -> Vec<u64> {
+        crate::audio::mixer::tap(arm)
+    }
+
+    #[cfg(not(any(feature = "uvc", feature = "hda-tone")))]
+    fn env_take(_: bool) -> Vec<u64> {
+        Vec::new()
+    }
+
+    /// The envelope's verdict and its wire word (`ok`, `FAIL`, `skip(<why>)`); the detail line always.
+    fn env_verdict(env: &[u64], rep: &vplay::EdlReport) -> (bool, &'static str) {
+        if cfg!(not(any(feature = "uvc", feature = "hda-tone"))) {
+            return (true, "skip(no-audio)");
+        }
+        let Some(p0) = env.iter().position(|&m| m > 0) else {
+            serial_println!("[nle] fixture env periods=0 xfades={} refused={} underruns={}", rep.xfades, rep.snd_refused, rep.snd_underruns);
+            return (true, "skip(no-sink)");
+        };
+        let got: Vec<u32> = (0..ENV_KAT.len()).map(|q| env.get(p0 + 41 + 2 * q).map(|&m| m.isqrt() as u32).unwrap_or(0)).collect();
+        let near = got.iter().zip(ENV_KAT.iter()).all(|(&g, &w)| (g as i64 - w as i64).abs() * 50 <= w as i64);
+        let ok = near && rep.xfades == 1 && rep.snd_refused == 0 && rep.snd_underruns == 0;
+        serial_println!(
+            "[nle] fixture env={:?} want={:?} p0={} periods={} xfades={} refused={} underruns={} frames={}",
+            got, ENV_KAT, p0, env.len(), rep.xfades, rep.snd_refused, rep.snd_underruns, rep.snd_frames
+        );
+        (ok, if ok { "ok" } else { "FAIL" })
     }
 }
