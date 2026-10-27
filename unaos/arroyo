@@ -3533,7 +3533,7 @@ fi
 gate_x86_rodata_no_code() {
     local elf="$1"
     [ -f "$elf" ] || { echo -e "${COLOR_RED}ERROR: .rodata gate: ${elf} missing — the x86 kernel link produced no ELF${COLOR_RESET}"; exit 1; }
-    local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
+    local TOOLBIN; TOOLBIN="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | awk '/host/{print $2}')/bin"
     local NM="$TOOLBIN/llvm-nm"
     [ -x "$NM" ] || NM="$(command -v llvm-nm 2>/dev/null || true)"
     # No silent downgrade: a gate that cannot read the ELF must fail the build, not wave it through.
@@ -3565,7 +3565,7 @@ gate_x86_rodata_no_code() {
 }
 
 # ⚠ EVERY KERNEL IMAGE IS BUILT `--release`, AND DIAGNOSTIC CODE RELIES ON IT (rmbp 14, 2026-09-06).
-# MEASURED, not assumed: `grep -n "cargo +nightly build" arroyo | grep -v -- "--release"` is EMPTY —
+# MEASURED, not assumed: `grep -n "cargo build --" arroyo | grep -v -- "--release"` is EMPTY —
 # all 15 build legs in this file pass `--release`, and there is no debug leg anywhere. (The first
 # draft of this comment said "this leg and the three below it", which was wrong by a dozen; the check
 # that corrected it is the one written above, so run it rather than trusting this sentence.)
@@ -3731,18 +3731,18 @@ EOF
 # PROFILE (rmbp-ledger B331, M2): the kernel's symbol table, written BESIDE the ELF the link step just produced
 # (address-sorted, demangled, one line per defined symbol) for `tools/flame` to resolve `prof dump` samples
 # against. The kernel embeds nothing; a missing llvm-nm warns and never fails the build.
-emit_kernel_syms() { "$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin/llvm-nm" -n -C --defined-only "$1" > "$2" 2>/dev/null && echo -e "${COLOR_GREEN}  • symbols: $2 ($(wc -l < "$2") lines)${COLOR_RESET}" || echo -e "${COLOR_YELLOW}  • symbols: llvm-nm failed on $1 — no $2 (prof dump stays unresolved)${COLOR_RESET}"; }
+emit_kernel_syms() { "$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | awk '/host/{print $2}')/bin/llvm-nm" -n -C --defined-only "$1" > "$2" 2>/dev/null && echo -e "${COLOR_GREEN}  • symbols: $2 ($(wc -l < "$2") lines)${COLOR_RESET}" || echo -e "${COLOR_YELLOW}  • symbols: llvm-nm failed on $1 — no $2 (prof dump stays unresolved)${COLOR_RESET}"; }
 
 # PROFILE2 (rmbp-ledger B340, M3): a ring-3 program's symbol table, written from the UNSTRIPPED link
 # product (the staged ELF is `--strip-all`ed) to `target/APPS/<NAME>.syms`, NAME = the staged basename
 # without `.ELF` — the program name the kernel's `prof dump` prints (`[prof] prog id= name=`), so
 # `tools/flame` resolves a ring-3 RIP against the right program. Warns, never fails the build.
-emit_user_syms() { mkdir -p "${WORKSPACE_DIR}/target/APPS"; "$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin/llvm-nm" -n -C --defined-only "$1" > "${WORKSPACE_DIR}/target/APPS/$2.syms" 2>/dev/null && echo -e "${COLOR_GREEN}  • symbols: target/APPS/$2.syms ($(wc -l < "${WORKSPACE_DIR}/target/APPS/$2.syms") lines)${COLOR_RESET}" || echo -e "${COLOR_YELLOW}  • symbols: llvm-nm failed on $1 — no APPS/$2.syms (its ring-3 samples stay unresolved)${COLOR_RESET}"; }
+emit_user_syms() { mkdir -p "${WORKSPACE_DIR}/target/APPS"; "$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | awk '/host/{print $2}')/bin/llvm-nm" -n -C --defined-only "$1" > "${WORKSPACE_DIR}/target/APPS/$2.syms" 2>/dev/null && echo -e "${COLOR_GREEN}  • symbols: target/APPS/$2.syms ($(wc -l < "${WORKSPACE_DIR}/target/APPS/$2.syms") lines)${COLOR_RESET}" || echo -e "${COLOR_YELLOW}  • symbols: llvm-nm failed on $1 — no APPS/$2.syms (its ring-3 samples stay unresolved)${COLOR_RESET}"; }
 
 build_kernel_x86_64() {
     echo -e "${COLOR_YELLOW}⚡ Building x86_64 Kernel...${COLOR_RESET}"
     cd "$WORKSPACE_DIR/crates/kernel"
-    RUSTFLAGS="$KERNEL_FP_RUSTFLAGS" cargo +nightly build --release \
+    RUSTFLAGS="$KERNEL_FP_RUSTFLAGS" cargo build --release \
       --target ../../x86_64-unaos.json \
       $NIGHTLY_FLAGS $KERNEL_FEATURES
     cd "$WORKSPACE_DIR"
@@ -3763,12 +3763,12 @@ build_kernel_x86_64() {
 # (RIP-relative + inline message), so it runs wherever the kernel copies it. Fast/incremental — safe
 # to call at the start of every x86 build path.
 build_user_hello_x86() {
-    local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
+    local TOOLBIN; TOOLBIN="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | awk '/host/{print $2}')/bin"
     echo -e "${COLOR_YELLOW}⚡ Building x86 ring-3 user blob (crates/user-blob-x86 → target/hello.bin)...${COLOR_RESET}"
     mkdir -p "${WORKSPACE_DIR}/target"
     cd "$WORKSPACE_DIR/crates/user-blob-x86"
     RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-blob-x86/user-blob-x86.ld" \
-      cargo +nightly build --release -Z json-target-spec
+      cargo build --release -Z json-target-spec
     cd "$WORKSPACE_DIR"
     "$TOOLBIN/llvm-objcopy" -O binary --only-section=.text \
       "${WORKSPACE_DIR}/crates/user-blob-x86/target/x86_64-unknown-none/release/user-blob-x86" \
@@ -3837,12 +3837,12 @@ PY
 # other's artifacts. The output keeps a distinct name (STAT-X86.ELF) for the same reason — both arches'
 # images live in the one shared target/ directory, and the staging steps pick the right one.
 build_user_stat_x86() {
-    local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
+    local TOOLBIN; TOOLBIN="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | awk '/host/{print $2}')/bin"
     echo -e "${COLOR_YELLOW}⚡ Building x86 EL0 persistence static-ELF program (crates/user-stat → target/STAT-X86.ELF)...${COLOR_RESET}"
     mkdir -p "${WORKSPACE_DIR}/target"
     cd "$WORKSPACE_DIR/crates/user-stat"
     RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-stat/user-stat-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000" \
-      cargo +nightly build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json"
+      cargo build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json"
     cd "$WORKSPACE_DIR"
     emit_user_syms "${WORKSPACE_DIR}/crates/user-stat/target/x86_64-unknown-none/release/user-stat" STAT  # PROFILE2 M3: target/APPS/<NAME>.syms, BEFORE the strip
     "$TOOLBIN/llvm-objcopy" --strip-all \
@@ -3897,13 +3897,13 @@ build_user_stat_x86() {
 # up by the objcopy of the NEXT image if a build ever failed after the first.
 build_one_vug_x86() {
     local out="$1" feats="$2"
-    local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
+    local TOOLBIN; TOOLBIN="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | awk '/host/{print $2}')/bin"
     echo -e "${COLOR_YELLOW}⚡ Building x86 EL0 mini-vug static-ELF program (crates/user-vug${feats:+ [$feats]} → target/${out})...${COLOR_RESET}"
     mkdir -p "${WORKSPACE_DIR}/target"
     cd "$WORKSPACE_DIR/crates/user-vug"
     local tdir="${WORKSPACE_DIR}/crates/user-vug/target/x86${feats:+-$feats}"
     RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-vug/user-vug-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000" \
-      cargo +nightly build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json" \
+      cargo build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json" \
       --target-dir "$tdir" ${feats:+--features "$feats"}
     cd "$WORKSPACE_DIR"
     emit_user_syms "${tdir}/x86_64-unknown-none/release/user-vug" "${out%-X86.ELF}"  # PROFILE2 M3: target/APPS/<NAME>.syms, BEFORE the strip
@@ -3941,7 +3941,7 @@ build_user_vug_x86() {
 # unless the kernel carries `linuxabi` and someone runs `linux`/`tests linuxabi`.
 build_user_linux_hello_x86() {
     mkdir -p "${WORKSPACE_DIR}/target"
-    ( cd "$WORKSPACE_DIR/crates/user-linux-hello" && cargo +nightly run --release --quiet -- "${WORKSPACE_DIR}/target/HELLO.LNX" )
+    ( cd "$WORKSPACE_DIR/crates/user-linux-hello" && cargo run --release --quiet -- "${WORKSPACE_DIR}/target/HELLO.LNX" )
     build_selfbuild_x86   # SELFBUILD1: TCC.LNX + HELLO.C + SYSKAT.LNX + PROBE.LNX; SELFBUILD2: SYSKAT2.LNX
 }
 
@@ -3975,7 +3975,7 @@ _sb_skip() { # n product reason
 _sb_missing() { # tool… — prints "tool missing: <first absent>" and succeeds when one is absent; fails (prints nothing) when all are present
     local t; for t in "$@"; do command -v "$t" >/dev/null 2>&1 || { echo "tool missing: $t"; return 0; }; done; return 1
 }
-_sb_musl_selfc() { echo "$(rustc +nightly --print sysroot 2>/dev/null)/lib/rustlib/x86_64-unknown-linux-musl/lib/self-contained"; }
+_sb_musl_selfc() { echo "$(rustc --print sysroot 2>/dev/null)/lib/rustlib/x86_64-unknown-linux-musl/lib/self-contained"; }
 _sb_fetch_why() { # dir url rev step tool… — why a fetch-then-build product is absent: a missing tool, the fetch, or the build step
     local d="$1" u="$2" r="$3" st="$4"; shift 4
     _sb_missing git "$@" && return 0
@@ -4098,18 +4098,18 @@ build_selfbuild4_x86() {
     else
         _sb_skip 4 SYSKAT4.LNX "$(_sb_kat_why "$sb/SYSKAT4.LNX")"; rm -f "${WORKSPACE_DIR}/target/SYSKAT4.LNX"
     fi
-    rustup +nightly target list --installed 2>/dev/null | grep -qx x86_64-unknown-linux-musl \
-        || rustup +nightly target add x86_64-unknown-linux-musl >/dev/null 2>&1 || true
+    rustup target list --installed 2>/dev/null | grep -qx x86_64-unknown-linux-musl \
+        || rustup target add x86_64-unknown-linux-musl >/dev/null 2>&1 || true
     local bin="$sb/rust/x86_64-unknown-linux-musl/release/rust-probe"
     rm -f "$bin"
-    if ( cd "$rs" && _lnx_cargoenv && CARGO_TARGET_DIR="$sb/rust" cargo +nightly build --release --quiet --target x86_64-unknown-linux-musl ) \
+    if ( cd "$rs" && _lnx_cargoenv && CARGO_TARGET_DIR="$sb/rust" cargo build --release --quiet --target x86_64-unknown-linux-musl ) \
         && [ "$(od -An -t u2 -j 16 -N 2 "$bin" | tr -d ' ')" = "2" ] \
         && { _lnx_deferred 4 RUST.LNX || "$bin" "$c/hello.c" 2>/dev/null | grep -q "^rust ok threads=4 counter=400000 hashmap=ok fs=ok panic_caught=1 "; }; then
         _lnx_strip -o "${WORKSPACE_DIR}/target/RUST.LNX" "$bin"
     else
         local why4
         if why4="$(_sb_missing "$_LNX_STRIP")"; then :
-        elif [ ! -f "$(_sb_musl_selfc)/libc.a" ]; then why4="musl target missing (rustup +nightly target add x86_64-unknown-linux-musl refused)"
+        elif [ ! -f "$(_sb_musl_selfc)/libc.a" ]; then why4="musl target missing (rustup target add x86_64-unknown-linux-musl refused)"
         elif [ ! -f "$bin" ]; then why4="build failed cargo crates/user-linux-rust --target x86_64-unknown-linux-musl"
         elif [ "$(od -An -t u2 -j 16 -N 2 "$bin" | tr -d ' ')" != "2" ]; then why4="build failed not ET_EXEC"
         else why4="host proof failed rust-probe"; fi
@@ -4121,7 +4121,7 @@ build_selfbuild4_x86() {
 # SELFBUILD5 (B357): UnaOS LINKS a Rust program. Three products, each proven on the HOST kernel before it is staged:
 # * SYSKAT5.LNX = crates/user-linux-hello/c/syskat5.c (mremap grow/move/FIXED/DONTUNMAP, the alternate signal stack at delivery,
 #   getcpu, madvise(MADV_HUGEPAGE), sched_yield).
-# * LLD.LNX = LLVM's `lld` at the toolchain's own LLVM release (rustc +nightly -vV: LLVM 22.1.8), built here from the release source
+# * LLD.LNX = LLVM's `lld` at the toolchain's own LLVM release (rustc -vV: LLVM 22.1.8), built here from the release source
 #   tarball (sha256 pinned below) as ONE static-PIE binary (WINDOW2/R85: -fPIE + -static-pie; glibc: the host has no musl C++ runtime; no zlib/zstd, no
 #   plugins, X86 only), stripped. It is a multi-flavour driver: `LLD.LNX -flavor gnu …` is ld.lld. Built ONCE (target/LLD.LNX is
 #   kept; ~1960 ninja steps, about an hour on 4 idle cores). `UNAOS_LLD_LNX=<path>` stages an operator-supplied static ld.lld
@@ -4184,15 +4184,15 @@ build_selfbuild5_x86() {
     fi
     # LIB/rust: record RUST.LNX's link through a wrapper around rust-lld, then stage its inputs and the response file.
     local out="${WORKSPACE_DIR}/target/LIB/rust" rec="$sb/rust5rec" tgt="$sb/rust5"
-    local sysroot; sysroot="$(rustc +nightly --print sysroot)"
-    local rlld="$sysroot/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin/rust-lld"
+    local sysroot; sysroot="$(rustc --print sysroot)"
+    local rlld="$sysroot/lib/rustlib/$(rustc -vV | awk '/host/{print $2}')/bin/rust-lld"
     local selfc="$sysroot/lib/rustlib/x86_64-unknown-linux-musl/lib/self-contained"
     rm -rf "$out" "$rec" && mkdir -p "$rec/objs"
     printf '#!/bin/sh\nprintf "%%s\\n" "$@" > "%s/args"\nfor a in "$@"; do case "$a" in *.o) cp "$a" "%s/objs/" ;; esac; done\n[ "$1" = "-flavor" ] && exec "%s" "$@"\nexec "%s" -flavor gnu "$@"\n' \
         "$rec" "$rec" "$rlld" "$rlld" > "$rec/lldwrap" && chmod +x "$rec/lldwrap"
     if [ -x "$rlld" ] && [ -d "$selfc" ] \
         && ( cd "$rs" && rm -rf "$tgt" && CARGO_TARGET_DIR="$tgt" RUSTFLAGS="-C relocation-model=static -C target-feature=+crt-static -C linker=$rec/lldwrap -C linker-flavor=ld.lld -C link-self-contained=yes" \
-               cargo +nightly build --release --quiet --target x86_64-unknown-linux-musl ) \
+               cargo build --release --quiet --target x86_64-unknown-linux-musl ) \
         && [ -s "$rec/args" ] \
         && python3 - "$rec" "$out" <<'PY'
 import os, shutil, subprocess, sys
@@ -4245,7 +4245,7 @@ PY
         sed "s|@LIB@|$out|g" "$out/link.rsp.in" > "$rec/host.rsp"
         rm -f "$out/link.rsp.in"
         printf 'RUST.LNX objects + std rlibs (rustc %s, x86_64-unknown-linux-musl; rmeta dropped, --strip-debug) + musl crt/libc.a/libunwind.a\nfrom the Rust target self-contained dir, for LLD.LNX -flavor gnu @/lib/rust/link.rsp -o <out> (SELFBUILD5, B357)\n' \
-            "$(rustc +nightly -V | awk '{print $2, $3, $4}')" > "$out/RUST.TXT"
+            "$(rustc -V | awk '{print $2, $3, $4}')" > "$out/RUST.TXT"
         # Host proof: the staged linker (or rust-lld when LLD.LNX is absent) links the staged inputs into a program that runs.
         local hl="$lld"; [ -f "$hl" ] || hl="$rlld"
         if "$hl" -flavor gnu "@$rec/host.rsp" -o "$rec/rust2" && [ "$(od -An -t u2 -j 16 -N 2 "$rec/rust2" | tr -d ' ')" = "2" ] \
@@ -4288,12 +4288,12 @@ SELFBUILD6_STD_SHA256="778d9ca7f9cfed6accc3174e2f75a7a0d670e62d8e010f5cbff59b8af
 build_selfbuild6_x86() {
     local sb="${WORKSPACE_DIR}/target/selfbuild/sb6" core="$WORKSPACE_DIR/libs/sys/ldso_core"
     local dyn="${WORKSPACE_DIR}/target/LIB/dyn" rlib="${WORKSPACE_DIR}/target/LIB/rustc"
-    local selfc; selfc="$(rustc +nightly --print sysroot)/lib/rustlib/x86_64-unknown-linux-musl/lib/self-contained"
-    local tb; tb="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
+    local selfc; selfc="$(rustc --print sysroot)/lib/rustlib/x86_64-unknown-linux-musl/lib/self-contained"
+    local tb; tb="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | awk '/host/{print $2}')/bin"
     mkdir -p "$sb"
     rm -rf "$dyn"
     # The host runner (the R78 execution proof).
-    if ! ( cd "$WORKSPACE_DIR/.." && CARGO_TARGET_DIR="$sb/host" cargo +nightly build --release --quiet -p ldso_core --bin ldrun ); then  # the ROOT workspace
+    if ! ( cd "$WORKSPACE_DIR/.." && CARGO_TARGET_DIR="$sb/host" cargo build --release --quiet -p ldso_core --bin ldrun ); then  # the ROOT workspace
         _sb_skip 6 LIB/dyn "build failed ldso_core ldrun"; _sb_skip 6 LIB/rustc "needs LIB/dyn"; return 0
     fi
     local ldrun="$sb/host/release/ldrun"
@@ -4332,8 +4332,8 @@ build_selfbuild6_x86() {
     cp "$sb/x/$tri/bin/rust-lld" "$rlib/$tri/bin/rust-lld"
     rm -rf "$sb/x"
     # The std rlibs of the same build.
-    local hstd; hstd="$(rustc +nightly --print sysroot)/$tri/lib"
-    if rustc +nightly -vV | grep -q "^commit-hash: ${SELFBUILD6_RUSTC_COMMIT}" && [ -d "$hstd/self-contained" ]; then
+    local hstd; hstd="$(rustc --print sysroot)/$tri/lib"
+    if rustc -vV | grep -q "^commit-hash: ${SELFBUILD6_RUSTC_COMMIT}" && [ -d "$hstd/self-contained" ]; then
         cp -r "$hstd" "$rlib/$tri/lib"
     else
         local stdt="$sb/std.tar.xz"
@@ -4378,12 +4378,12 @@ build_selfbuild6_x86() {
 # and draws is the end-to-end statement that the ring-3 stub in crates/user-pulse and the kernel handler in
 # arch/x86_64/syscall.rs agree about that number AND about the 272-byte payload layout.
 build_user_pulse_x86() {
-    local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
+    local TOOLBIN; TOOLBIN="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | awk '/host/{print $2}')/bin"
     echo -e "${COLOR_YELLOW}⚡ Building x86 EL0 cpu-pulse static-ELF program (crates/user-pulse → target/PULSE-X86.ELF)...${COLOR_RESET}"
     mkdir -p "${WORKSPACE_DIR}/target"
     cd "$WORKSPACE_DIR/crates/user-pulse"
     RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-pulse/user-pulse-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000" \
-      cargo +nightly build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json"
+      cargo build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json"
     cd "$WORKSPACE_DIR"
     emit_user_syms "${WORKSPACE_DIR}/crates/user-pulse/target/x86_64-unknown-none/release/user-pulse" PULSE  # PROFILE2 M3: target/APPS/<NAME>.syms, BEFORE the strip
     "$TOOLBIN/llvm-objcopy" --strip-all \
@@ -4407,12 +4407,12 @@ build_user_pulse_x86() {
 # builder above (bash keeps the last one) and left `build_user_prefs_x86` undefined, so every caller below
 # died on exit 127 under `set -e` and no x86 ESP could be built. Renamed to the name its callers use.
 build_user_prefs_x86() {
-    local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
+    local TOOLBIN; TOOLBIN="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | awk '/host/{print $2}')/bin"
     echo -e "${COLOR_YELLOW}⚡ Building x86 EL0 Principia prefs fulfiller static-ELF program (crates/user-prefs → target/PREFS-X86.ELF)...${COLOR_RESET}"
     mkdir -p "${WORKSPACE_DIR}/target"
     cd "$WORKSPACE_DIR/crates/user-prefs"
     RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-prefs/user-prefs-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000" \
-      cargo +nightly build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json"
+      cargo build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json"
     cd "$WORKSPACE_DIR"
     emit_user_syms "${WORKSPACE_DIR}/crates/user-prefs/target/x86_64-unknown-none/release/user-prefs" PREFS  # PROFILE2 M3: target/APPS/<NAME>.syms, BEFORE the strip
     "$TOOLBIN/llvm-objcopy" --strip-all \
@@ -4447,12 +4447,12 @@ una_res_stamp() {
 }
 
 build_user_lumen_x86() {
-    local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
+    local TOOLBIN; TOOLBIN="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | awk '/host/{print $2}')/bin"
     echo -e "${COLOR_YELLOW}⚡ Building x86 ring-3 Lumen app (crates/user-lumen → target/LUMEN-X86.ELF, ELF window)...${COLOR_RESET}"
     mkdir -p "${WORKSPACE_DIR}/target"
     cd "$WORKSPACE_DIR/crates/user-lumen"
     RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-lumen/user-lumen-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x40000" \
-      cargo +nightly build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json" --features cryptocore   # VEINTLS (SR36): the product crypto provider under tls_core
+      cargo build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json" --features cryptocore   # VEINTLS (SR36): the product crypto provider under tls_core
     cd "$WORKSPACE_DIR"
     emit_user_syms "${WORKSPACE_DIR}/crates/user-lumen/target/x86_64-unknown-none/release/user-lumen" LUMEN  # PROFILE2 M3: target/APPS/<NAME>.syms, BEFORE the strip
     "$TOOLBIN/llvm-objcopy" --strip-all \
@@ -4472,12 +4472,12 @@ build_user_lumen_x86() {
 # window check, APPRES stamp) → target/MIDDEN-X86.ELF, staged by the builder as APPS/MIDDEN.ELF. Inert until
 # launched (`run /apps/MIDDEN.ELF`); UNAOS_MIDDEN=1 adds the `tests midden` fixture (kernel middenapp.rs).
 build_user_midden_x86() {
-    local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
+    local TOOLBIN; TOOLBIN="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | awk '/host/{print $2}')/bin"
     echo -e "${COLOR_YELLOW}⚡ Building x86 ring-3 Midden app (crates/user-midden → target/MIDDEN-X86.ELF, ELF window)...${COLOR_RESET}"
     mkdir -p "${WORKSPACE_DIR}/target"
     cd "$WORKSPACE_DIR/crates/user-midden"
     RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-midden/user-midden-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x40000" \
-      cargo +nightly build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json"
+      cargo build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json"
     cd "$WORKSPACE_DIR"
     emit_user_syms "${WORKSPACE_DIR}/crates/user-midden/target/x86_64-unknown-none/release/user-midden" MIDDEN  # PROFILE2 M3: target/APPS/<NAME>.syms, BEFORE the strip
     "$TOOLBIN/llvm-objcopy" --strip-all \
@@ -4497,12 +4497,12 @@ build_user_midden_x86() {
 # target/UNA-X86.ELF, staged by the builder as APPS/UNA.ELF. Inert until launched (`una [workspace]`, a bare name
 # resolved on /apps); UNAOS_UNA=1 adds the `tests una` fixture (kernel unaapp.rs).
 build_user_una_x86() {
-    local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
+    local TOOLBIN; TOOLBIN="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | awk '/host/{print $2}')/bin"
     echo -e "${COLOR_YELLOW}⚡ Building x86 ring-3 Una IDE (crates/user-una → target/UNA-X86.ELF, ELF window)...${COLOR_RESET}"
     mkdir -p "${WORKSPACE_DIR}/target"
     cd "$WORKSPACE_DIR/crates/user-una"
     RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-una/user-una-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x40000" \
-      cargo +nightly build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json"
+      cargo build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json"
     cd "$WORKSPACE_DIR"
     emit_user_syms "${WORKSPACE_DIR}/crates/user-una/target/x86_64-unknown-none/release/user-una" UNA  # PROFILE2 M3: target/APPS/<NAME>.syms, BEFORE the strip
     "$TOOLBIN/llvm-objcopy" --strip-all \
@@ -4523,12 +4523,12 @@ build_user_una_x86() {
 # target/AETHER-X86.ELF, staged by the builder as APPS/AETHER.ELF with /system/doc/welcome.html. Inert until
 # launched; UNAOS_AETHER=1 adds the `tests aether` fixture.
 build_user_aether_x86() {
-    local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
+    local TOOLBIN; TOOLBIN="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | awk '/host/{print $2}')/bin"
     echo -e "${COLOR_YELLOW}⚡ Building x86 ring-3 Aether app (crates/user-aether → target/AETHER-X86.ELF, ELF window)...${COLOR_RESET}"
     mkdir -p "${WORKSPACE_DIR}/target"
     cd "$WORKSPACE_DIR/crates/user-aether"
     RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-aether/user-aether-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x40000" \
-      cargo +nightly build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json"
+      cargo build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json"
     cd "$WORKSPACE_DIR"
     emit_user_syms "${WORKSPACE_DIR}/crates/user-aether/target/x86_64-unknown-none/release/user-aether" AETHER  # PROFILE2 M3: target/APPS/<NAME>.syms, BEFORE the strip
     "$TOOLBIN/llvm-objcopy" --strip-all \
@@ -4549,12 +4549,12 @@ build_user_aether_x86() {
 # the APPRES stamp (res/: name, icon, signature org.unaos.stria, the media doctypes). target/STRIA-X86.ELF, staged by
 # the builder as APPS/STRIA.ELF. Inert until launched; UNAOS_STRIA=1 adds the `tests stria` fixture.
 build_user_stria_x86() {
-    local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
+    local TOOLBIN; TOOLBIN="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | awk '/host/{print $2}')/bin"
     echo -e "${COLOR_YELLOW}⚡ Building x86 ring-3 Stria app (crates/user-stria → target/STRIA-X86.ELF, ELF window)...${COLOR_RESET}"
     mkdir -p "${WORKSPACE_DIR}/target"
     cd "$WORKSPACE_DIR/crates/user-stria"
     RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-stria/user-stria-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x40000" \
-      cargo +nightly build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json"
+      cargo build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json"
     cd "$WORKSPACE_DIR"
     emit_user_syms "${WORKSPACE_DIR}/crates/user-stria/target/x86_64-unknown-none/release/user-stria" STRIA  # PROFILE2 M3: target/APPS/<NAME>.syms, BEFORE the strip
     "$TOOLBIN/llvm-objcopy" --strip-all \
@@ -4574,12 +4574,12 @@ build_user_stria_x86() {
 # build_user_diag_x86 shape, linked in the ELF window; app note RESIDENT (a bare `holocron …` detaches). Inert
 # until run (or launched by the login path when the user has a ring; UNAOS_LUMEN=1 arms that and SYS_KDF).
 build_user_holocron_x86() {
-    local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
+    local TOOLBIN; TOOLBIN="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | awk '/host/{print $2}')/bin"
     echo -e "${COLOR_YELLOW}⚡ Building x86 ring-3 secrets handler (crates/user-holocron → target/HOLOCRON-X86.ELF, ELF window)...${COLOR_RESET}"
     mkdir -p "${WORKSPACE_DIR}/target"
     cd "$WORKSPACE_DIR/crates/user-holocron"
     RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-holocron/user-holocron-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x40000" \
-      cargo +nightly build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json"
+      cargo build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json"
     cd "$WORKSPACE_DIR"
     emit_user_syms "${WORKSPACE_DIR}/crates/user-holocron/target/x86_64-unknown-none/release/user-holocron" HOLOCRON  # PROFILE2 M3: target/APPS/<NAME>.syms, BEFORE the strip
     "$TOOLBIN/llvm-objcopy" --strip-all \
@@ -4601,12 +4601,12 @@ build_user_holocron_x86() {
 # test), the file within xwin::IMAGE_CAP (12 MiB on the 48 MiB heap) and image + stack within the window.
 USER_XWIN_VA_ARM=$((0x7840200000))
 build_user_holocron_aarch64() {
-    local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
+    local TOOLBIN; TOOLBIN="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | awk '/host/{print $2}')/bin"
     echo -e "${COLOR_YELLOW}⚡ Building aarch64 ring-3 secrets handler (crates/user-holocron → target/HOLOCRON.ELF, ELF window)...${COLOR_RESET}"
     mkdir -p "${WORKSPACE_DIR}/target"
     cd "$WORKSPACE_DIR/crates/user-holocron"
     RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-holocron/user-holocron.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x40000" \
-      cargo +nightly build --release -Z json-target-spec
+      cargo build --release -Z json-target-spec
     cd "$WORKSPACE_DIR"
     "$TOOLBIN/llvm-objcopy" --strip-all \
       "${WORKSPACE_DIR}/crates/user-holocron/target/aarch64-base/release/user-holocron" \
@@ -4649,12 +4649,12 @@ PY
 # cargo args (an explicit --target for a crate whose .cargo/config.toml defaults to x86, --features).
 build_user_xwin_aarch64() {
     local crate="$1" name="$2" what="$3"; shift 3
-    local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
+    local TOOLBIN; TOOLBIN="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | awk '/host/{print $2}')/bin"
     echo -e "${COLOR_YELLOW}⚡ Building aarch64 ring-3 ${what} (crates/${crate} → target/${name}.ELF, ELF window)...${COLOR_RESET}"
     mkdir -p "${WORKSPACE_DIR}/target"
     cd "$WORKSPACE_DIR/crates/${crate}"
     RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/${crate}/${crate}.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x40000" \
-      cargo +nightly build --release -Z json-target-spec "$@"
+      cargo build --release -Z json-target-spec "$@"
     cd "$WORKSPACE_DIR"
     local bin="${WORKSPACE_DIR}/crates/${crate}/target/aarch64-base/release/${crate}" f="${WORKSPACE_DIR}/target/${name}.ELF" out
     # PROFILE2 M3's symbol table, BEFORE the strip — emit_user_syms' llvm-nm line, written to target/APPS-ARM/ and not
@@ -4700,12 +4700,12 @@ build_user_stria_aarch64()  { build_user_xwin_aarch64 user-stria  STRIA  "Stria 
 # resolves api.anthropic.com, connects :80 and prints the status line (UNAOS_NETRING3=1; knob off the two new
 # syscalls answer the unknown-syscall default and it says so in its verdict line).
 build_user_net_x86() {
-    local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
+    local TOOLBIN; TOOLBIN="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | awk '/host/{print $2}')/bin"
     echo -e "${COLOR_YELLOW}⚡ Building x86 ring-3 network client static-ELF program (crates/user-net → target/NET-X86.ELF, ELF window)...${COLOR_RESET}"
     mkdir -p "${WORKSPACE_DIR}/target"
     cd "$WORKSPACE_DIR/crates/user-net"
     RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-net/user-net-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x40000" \
-      cargo +nightly build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json" --features cryptocore   # VEINTLS (SR36): vein_ring3's verified TLS, CRYPTOCORE's provider; 256 KiB stack as LUMEN
+      cargo build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json" --features cryptocore   # VEINTLS (SR36): vein_ring3's verified TLS, CRYPTOCORE's provider; 256 KiB stack as LUMEN
     cd "$WORKSPACE_DIR"
     emit_user_syms "${WORKSPACE_DIR}/crates/user-net/target/x86_64-unknown-none/release/user-net" NET  # PROFILE2 M3: target/APPS/<NAME>.syms, BEFORE the strip
     "$TOOLBIN/llvm-objcopy" --strip-all \
@@ -4727,13 +4727,13 @@ build_user_net_x86() {
 # so the gate is user_elf_window_check (which runs scripts/elf-entry-check.sh). A console program: app note
 # flags 0, a bare `diag` runs it in the foreground. Inert until run; UNAOS_SELFDIAG=1 arms its two syscalls.
 build_user_diag_x86() {
-    local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
+    local TOOLBIN; TOOLBIN="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | awk '/host/{print $2}')/bin"
     echo -e "${COLOR_YELLOW}⚡ Building x86 ring-3 diagnosis program (crates/user-diag → target/DIAG-X86.ELF, ELF window)...${COLOR_RESET}"
     mkdir -p "${WORKSPACE_DIR}/target"
     python3 "${WORKSPACE_DIR}/scripts/witness-owners.py" "${WORKSPACE_DIR}" "${WORKSPACE_DIR}/target/witness-owners.txt" || { echo -e "${COLOR_RED}ERROR: witness-owners.py produced no table${COLOR_RESET}"; exit 1; }
     cd "$WORKSPACE_DIR/crates/user-diag"
     RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-diag/user-diag-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x40000" \
-      cargo +nightly build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json" --features cryptocore   # VEINTLS via vein_ring3 (merge12 fold)
+      cargo build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json" --features cryptocore   # VEINTLS via vein_ring3 (merge12 fold)
     cd "$WORKSPACE_DIR"
     "$TOOLBIN/llvm-objcopy" --strip-all \
       "${WORKSPACE_DIR}/crates/user-diag/target/x86_64-unknown-none/release/user-diag" \
@@ -4752,12 +4752,12 @@ build_user_diag_x86() {
 # the ABSOLUTE ELF-window VA (crates/user-big/user-big-x86.ld, no PHDRS) and declares a 256 KiB stack with
 # `-z stack-size`, which lld writes into PT_GNU_STACK's p_memsz — the kernel's stack request.
 build_user_big_x86() {
-    local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
+    local TOOLBIN; TOOLBIN="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | awk '/host/{print $2}')/bin"
     echo -e "${COLOR_YELLOW}⚡ Building x86 ring-3 ELF-window proof program (crates/user-big → target/BIG-X86.ELF)...${COLOR_RESET}"
     mkdir -p "${WORKSPACE_DIR}/target"
     cd "$WORKSPACE_DIR/crates/user-big"
     RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-big/user-big-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x40000" \
-      cargo +nightly build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json"
+      cargo build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json"
     cd "$WORKSPACE_DIR"
     emit_user_syms "${WORKSPACE_DIR}/crates/user-big/target/x86_64-unknown-none/release/user-big" BIG  # PROFILE2 M3: target/APPS/<NAME>.syms, BEFORE the strip
     "$TOOLBIN/llvm-objcopy" --strip-all \
@@ -4777,12 +4777,12 @@ build_user_big_x86() {
 # runs it under `uac` on an x86 `wc` image; without a microphone capture alternate (QEMU's usb-audio) it SKIPs
 # `reason=no-capture-device`, and without this ELF on the volume it SKIPs `reason=no-fixture`.
 build_user_micring3_x86() {
-    local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
+    local TOOLBIN; TOOLBIN="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | awk '/host/{print $2}')/bin"
     echo -e "${COLOR_YELLOW}⚡ Building x86 ring-3 microphone fixture program (crates/user-micring3 → target/MICRING3-X86.ELF)...${COLOR_RESET}"
     mkdir -p "${WORKSPACE_DIR}/target"
     cd "$WORKSPACE_DIR/crates/user-micring3"
     RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-micring3/user-micring3-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x40000" \
-      cargo +nightly build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json"
+      cargo build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json"
     cd "$WORKSPACE_DIR"
     emit_user_syms "${WORKSPACE_DIR}/crates/user-micring3/target/x86_64-unknown-none/release/user-micring3" MICRING3  # PROFILE2 M3: target/APPS/<NAME>.syms, BEFORE the strip
     "$TOOLBIN/llvm-objcopy" --strip-all \
@@ -4804,12 +4804,12 @@ build_user_micring3_x86() {
 # fixtures/ABIPROBE-v<N>.ELF and `sha256sum` it beside (the old fixtures stay). It prints the committed pin beside
 # the fresh build's for comparison; a differing rebuild is expected across toolchains and is not a verdict.
 build_user_abiprobe_x86() {
-    local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
+    local TOOLBIN; TOOLBIN="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | awk '/host/{print $2}')/bin"
     echo -e "${COLOR_YELLOW}⚡ Building x86 ring-3 ABI probe (crates/user-abiprobe → target/ABIPROBE-X86.ELF)...${COLOR_RESET}"
     mkdir -p "${WORKSPACE_DIR}/target"
     cd "$WORKSPACE_DIR/crates/user-abiprobe"
     RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-abiprobe/user-abiprobe-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x40000" \
-      cargo +nightly build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json"
+      cargo build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json"
     cd "$WORKSPACE_DIR"
     "$TOOLBIN/llvm-objcopy" --strip-all \
       "${WORKSPACE_DIR}/crates/user-abiprobe/target/x86_64-unknown-none/release/user-abiprobe" \
@@ -4833,7 +4833,7 @@ build_kernel_aarch64() {
     # armed esp-jetson already do their own unconditional build; this closes esp-arm/arm/test-arm).
     case ",${_af#--features }," in
         *,baremetal,*|*,tegra_el0,*|*,virt_el0,*|*,virt_tick,*)  # VIRTPREEMPT (orin 17): the virt terms added. JV1 made `virt_el0` a THIRD feature set that compiles syscall.rs's `include_bytes!`, but this case still listed only two — so `UNAOS_GICV3=1 UNAOS_VIRT_EL0=1 ./arroyo test-arm` baked whatever blob a prior `check`/`kernel8` had left, which is exactly the "image whose contents cannot be derived from its stated inputs" BLOBATOMIC exists to forbid (and in a fresh worktree with no blob at all it simply fails to compile). `virt_tick` is listed separately because arroyo appends knob NAMES and lets Cargo resolve the `virt_tick = ["virt_el0"]` implication, so the `--features` string for UNAOS_VIRT_TICK=1 alone does not contain `virt_el0`.
-            local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
+            local TOOLBIN; TOOLBIN="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | awk '/host/{print $2}')/bin"
             ( cd "$WORKSPACE_DIR" && build_user_blob )
             cd "$WORKSPACE_DIR/crates/kernel"
             ;;
@@ -4841,7 +4841,7 @@ build_kernel_aarch64() {
     # Surface the effective aarch64 feature set when it differs from the (x86) banner — makes the
     # SMOLNET-DEFAULT strip visible so an operator doesn't read `smolnet` off the banner for aarch64.
     [ "$_af" != "$KERNEL_FEATURES" ] && echo -e "${COLOR_YELLOW}⚡ aarch64 effective features: ${_af#--features }${COLOR_RESET}"
-    cargo +nightly build --release \
+    cargo build --release \
       --target ../../aarch64-unaos.json \
       $NIGHTLY_FLAGS $_af
     cd "$WORKSPACE_DIR"
@@ -4873,7 +4873,7 @@ launch_x86_64() {
 
     echo -e "${COLOR_CYAN}⚡ Launching x86_64 via Builder (kernel + bootloader + QEMU)...${COLOR_RESET}"
     cd "$WORKSPACE_DIR/builder"
-    cargo +nightly run --release
+    cargo run --release
     cd "$WORKSPACE_DIR"
 }
 
@@ -4890,7 +4890,7 @@ prepare_aarch64() {
 
     echo -e "${COLOR_YELLOW}⚡ Building aarch64 UEFI Bootloader...${COLOR_RESET}"
     cd "$WORKSPACE_DIR/crates/bootloader"
-    cargo +nightly build --release --target aarch64-unknown-uefi \
+    cargo build --release --target aarch64-unknown-uefi \
       $BOOTLOADER_FEATURES \
       -Z build-std=core,compiler_builtins,alloc \
       -Z build-std-features=compiler-builtins-mem
@@ -6150,7 +6150,7 @@ test_x86_64() {
     # is passed EXPLICITLY so `QEMU_GRACE_DEFAULT` above stays the single source of that number —
     # the builder carries a 20.0 of its own, but only for a bare `cargo run` with no arroyo.
     UNAOS_SERIAL_LOG="$SERIAL_LOG" UNAOS_TEST_SECS="$secs" UNAOS_TEST_SPEC="$X86_TEST_SPEC" \
-        UNAOS_QEMU_GRACE="${UNAOS_QEMU_GRACE:-$QEMU_GRACE_DEFAULT}" cargo +nightly run --release
+        UNAOS_QEMU_GRACE="${UNAOS_QEMU_GRACE:-$QEMU_GRACE_DEFAULT}" cargo run --release
     cd "$WORKSPACE_DIR"
     if [ -n "$qmp_pid" ]; then wait "$qmp_pid" 2>/dev/null || true; fi
     if [ -n "$typist_pid" ]; then wait "$typist_pid" 2>/dev/null || true; fi
@@ -6423,7 +6423,7 @@ check_user_arch() {
         [ "$_tgt" = "-" ] || _targ_arg="--target $_tgt"
         cd "$WORKSPACE_DIR/crates/$_crate"
         # `|| _rc=...` keeps set -e from aborting the loop; the failure is recorded and reported below.
-        if RUSTFLAGS="$_rustflags" cargo +nightly check --release -Z json-target-spec $_targ_arg; then
+        if RUSTFLAGS="$_rustflags" cargo check --release -Z json-target-spec $_targ_arg; then
             echo -e "${COLOR_GREEN}  ✅ ${_crate} (${_arch})${COLOR_RESET}"
         else
             echo -e "${COLOR_RED}  ❌ ${_crate} (${_arch}) FAILED to compile${COLOR_RESET}"
@@ -8066,7 +8066,7 @@ KERNEL_CFG_MATRIX=(
   #     #[cfg(all(feature = "smpmark", feature = "supstate"))]                       let _pb: u32 = "SMPMARKLEG-PROBE-B";
   # both appended after the `:P:` mark inside `start_secondaries` (itself
   # `#[cfg(feature = "tegrasmp")]`, which both new rows carry). Result, each leg run as its own
-  # `cargo +nightly check --release --target ../../aarch64-unaos.json`:
+  # `cargo check --release --target ../../aarch64-unaos.json`:
   #     arm-tegra-furn-vpar-smpmark     EXIT 101   error[E0308] expected `u32`, found `&str`
   #     arm-tegra-supstate-el0-smpmark  EXIT 101   error[E0308] expected `u32`, found `&str`
   #     arm-tegra-smpmark               EXIT 0     smpmark, neither conjunct
@@ -8171,7 +8171,7 @@ KERNEL_CFG_MATRIX=(
   # was planted inside `jd1_dc_probe` (`arch/aarch64/display_tegra.rs`), conjoined so that exactly one
   # row of this matrix reaches it and no existing row does:
   #     #[cfg(all(feature = "jd1dc", feature = "tegra_el0"))] let _pjd: u32 = "EL0JD1DC-PROBE";
-  # Each leg run as its own `cargo +nightly check --release --target ../../aarch64-unaos.json`:
+  # Each leg run as its own `cargo check --release --target ../../aarch64-unaos.json`:
   #     arm-tegra-el0-jd1dc (NEW)       EXIT 101   error[E0308] expected `u32`, found `&str`
   #                                                display_tegra.rs:802:75 — the planted line
   #     arm-tegra-jd1dc                 EXIT 0     jd1dc, no tegra_el0
@@ -8743,7 +8743,7 @@ _cfg_slot_worker() {
         # An EMPTY _slotbase means the default target dir (UNAOS_CHECK_P unset): no --target-dir at all,
         # so the leg is the old serial gate's cargo line verbatim and shares the dir every other verb uses.
         local -a _tdarg=(); [ -n "$_slotbase" ] && _tdarg=(--target-dir "${_slotbase}/slot${_s}")
-        if cargo +nightly check --release --target "$_ftgt" $NIGHTLY_FLAGS --features "$_ffeats" \
+        if cargo check --release --target "$_ftgt" $NIGHTLY_FLAGS --features "$_ffeats" \
              "${_tdarg[@]}" > "${_res}/${_fleg}.log" 2>&1; then _lrc=0; else _lrc=$?; fi
         _t1=$(date +%s.%N)
         # `.t` first, `.rc` LAST: the rc file is the "this leg ran" token the count check consumes,
@@ -9048,7 +9048,7 @@ ensure_user_blob() {
     fi
     # Same TOOLBIN computation as `build_user_blob`'s other two callers — it requires the caller to
     # set it, and bash's dynamic scoping hands this `local` down into the call.
-    local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
+    local TOOLBIN; TOOLBIN="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | awk '/host/{print $2}')/bin"
     echo -e "${COLOR_CYAN}  (target/user_blob.bin absent — building it once, for the aarch64 EL0 legs)${COLOR_RESET}"
     build_user_blob
 }
@@ -9235,13 +9235,13 @@ BRACEPY
     ensure_user_blob
     echo -e "${COLOR_YELLOW}⚡ Syntax Check: x86_64...${COLOR_RESET}"
     cd "$WORKSPACE_DIR/crates/kernel"
-    cargo +nightly check --release \
+    cargo check --release \
       --target ../../x86_64-unaos.json \
       $NIGHTLY_FLAGS $KERNEL_FEATURES
     echo -e "${COLOR_GREEN}✅ x86_64 OK${COLOR_RESET}"
 
     echo -e "${COLOR_YELLOW}⚡ Syntax Check: aarch64...${COLOR_RESET}"
-    cargo +nightly check --release \
+    cargo check --release \
       --target ../../aarch64-unaos.json \
       $NIGHTLY_FLAGS $(arm_features)
     cd "$WORKSPACE_DIR"
@@ -9265,12 +9265,12 @@ BRACEPY
     echo -e "${COLOR_YELLOW}⚡ Syntax Check: bootloader (aarch64-unknown-uefi, x86_64-unknown-uefi, +feature leg)...${COLOR_RESET}"
     cd "$WORKSPACE_DIR/crates/bootloader"
     for _bl_target in aarch64-unknown-uefi x86_64-unknown-uefi; do
-        cargo +nightly check --release --target "$_bl_target" \
+        cargo check --release --target "$_bl_target" \
           $BOOTLOADER_FEATURES \
           -Z build-std=core,compiler_builtins,alloc \
           -Z build-std-features=compiler-builtins-mem
     done
-    cargo +nightly check --release --target aarch64-unknown-uefi \
+    cargo check --release --target aarch64-unknown-uefi \
       --features bootdiag,jb8lever \
       -Z build-std=core,compiler_builtins,alloc \
       -Z build-std-features=compiler-builtins-mem
@@ -9282,7 +9282,7 @@ BRACEPY
     # loader half WITHOUT it — the two halves of the shared struct were never checked in agreement by
     # any leg. x86 target only: that is the path that ships it; an aarch64 cross reflects nothing that
     # boots.
-    cargo +nightly check --release --target x86_64-unknown-uefi --features unaos_ivb \
+    cargo check --release --target x86_64-unknown-uefi --features unaos_ivb \
       -Z build-std=core,compiler_builtins,alloc -Z build-std-features=compiler-builtins-mem
     cd "$WORKSPACE_DIR"
     echo -e "${COLOR_GREEN}✅ bootloader OK${COLOR_RESET}"
@@ -9543,14 +9543,14 @@ BRACEPY
     # probe: crates/kernel must be enumerated AND resolved as a root of check_both, or exit 2, no verdict.
     local _rrc=0
     echo -e "${COLOR_YELLOW}⚡ Syntax Check: builder (host)...${COLOR_RESET}"
-    if (cd "$WORKSPACE_DIR/builder" && cargo +nightly check --release); then
+    if (cd "$WORKSPACE_DIR/builder" && cargo check --release); then
         echo -e "${COLOR_GREEN}  ✅ builder (host)${COLOR_RESET}"
     else
         echo -e "${COLOR_RED}  ❌ builder (host) FAILED to compile${COLOR_RESET}"
         _rrc=1
     fi
     echo -e "${COLOR_YELLOW}⚡ Syntax Check: user-linux-hello (host fixture generator, LINUXABI)...${COLOR_RESET}"
-    if (cd "$WORKSPACE_DIR/crates/user-linux-hello" && cargo +nightly check --release); then
+    if (cd "$WORKSPACE_DIR/crates/user-linux-hello" && cargo check --release); then
         echo -e "${COLOR_GREEN}  ✅ user-linux-hello (host)${COLOR_RESET}"
     else
         echo -e "${COLOR_RED}  ❌ user-linux-hello (host) FAILED to compile${COLOR_RESET}"
@@ -10061,7 +10061,7 @@ esp_x86() {
     build_user_holocron_x86   # HOLOCRON2 (B355): target/HOLOCRON-X86.ELF — staged as APPS/HOLOCRON.ELF
     build_user_prefs_x86; build_user_big_x86; build_user_micring3_x86   # BANDY3: target/PREFS-X86.ELF — staged as APPS/PREFS.ELF. RING3WIN: target/BIG-X86.ELF — staged as APPS/BIG.ELF. MICSTAGE (B744): target/MICRING3-X86.ELF — staged as APPS/MICRING3.ELF (tests micring3)
     _rustc_floor || exit 1; ensure_kfont_noto; cd "$WORKSPACE_DIR/builder"   # KERNELFONT2 (B363): the Noto script faces on the builder host first
-    UNAOS_PACKAGE_ONLY=1 cargo +nightly run --release
+    UNAOS_PACKAGE_ONLY=1 cargo run --release
     cd "$WORKSPACE_DIR"
     # The media path does NOT go through build_kernel_x86_64 (the builder compiles the kernel
     # itself), so the .rodata gate runs here too — on the STAGED image, which is the ELF the
@@ -10126,7 +10126,7 @@ vm_image() {
     build_user_holocron_x86   # HOLOCRON2 (B355): target/HOLOCRON-X86.ELF — staged as APPS/HOLOCRON.ELF
     build_user_prefs_x86; build_user_big_x86; build_user_micring3_x86   # BANDY3: target/PREFS-X86.ELF — staged as APPS/PREFS.ELF. RING3WIN: target/BIG-X86.ELF — staged as APPS/BIG.ELF. MICSTAGE (B744): target/MICRING3-X86.ELF — staged as APPS/MICRING3.ELF (tests micring3)
     ensure_kfont_noto; cd "$WORKSPACE_DIR/builder"   # KERNELFONT2 (B363)
-    UNAOS_VM_IMAGE=1 UNAOS_VM_GIT7="$git7" cargo +nightly run --release
+    UNAOS_VM_IMAGE=1 UNAOS_VM_GIT7="$git7" cargo run --release
     cd "$WORKSPACE_DIR"
     local img="${WORKSPACE_DIR}/target/vm/unaos-x86-${git7}.img"
     if [ ! -f "$img" ]; then
@@ -10381,7 +10381,7 @@ install_ssd_leg() { # $1 = blank|beside, $2 = wall seconds
     pid=$!
     rm -f "$log"
     echo -e "${COLOR_CYAN}⚡ INSTALL4 ssd-${mode}: booting with the virtual SSD on ide.1 and typing install ssd (${secs}s full wall); serial -> ${log}${COLOR_RESET}"
-    (cd "$WORKSPACE_DIR/builder" && UNAOS_SERIAL_LOG="$log" UNAOS_TEST_SECS="$secs" cargo +nightly run --release) || true
+    (cd "$WORKSPACE_DIR/builder" && UNAOS_SERIAL_LOG="$log" UNAOS_TEST_SECS="$secs" cargo run --release) || true
     wait "$pid" 2>/dev/null || true
     echo -e "${COLOR_PURPLE}──────── ssd-${mode} typist transcript (${tlog}) ────────${COLOR_RESET}"
     cat "$tlog" 2>/dev/null || echo "(no typist transcript)"
@@ -11023,7 +11023,7 @@ esp_jetson() {
         esac
     fi
     echo -e "${COLOR_YELLOW}⚡ kernel features (jetson): ${_feats%,}${COLOR_RESET}"
-    local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
+    local TOOLBIN; TOOLBIN="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | awk '/host/{print $2}')/bin"
     # JETSON-EL0 (M1b): an ARMED jetson image compiles `arch/aarch64/syscall.rs`, which
     # `include_bytes!`es `target/user_blob.bin` (the el0-hello payload). That file is produced by
     # `build_user_blob`, which until this arc ran ONLY from the Pi `kernel8` path — so a first
@@ -11567,13 +11567,13 @@ k8_lock_acquire() {
 # artifact lands under `<target-dir>/aarch64-base/release/`.
 build_one_vug_aarch64() {
     local out="$1" feats="$2"
-    local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
+    local TOOLBIN; TOOLBIN="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | awk '/host/{print $2}')/bin"
     echo -e "${COLOR_YELLOW}⚡ Building EL0 mini-vug static-ELF program (crates/user-vug${feats:+ [$feats]} → target/${out})...${COLOR_RESET}"
     mkdir -p "${WORKSPACE_DIR}/target"
     cd "$WORKSPACE_DIR/crates/user-vug"
     local tdir="${WORKSPACE_DIR}/crates/user-vug/target/arm${feats:+-$feats}"
     RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-vug/user-vug.ld -C link-arg=-z -C link-arg=max-page-size=0x1000" \
-      cargo +nightly build --release -Z json-target-spec --target-dir "$tdir" ${feats:+--features "$feats"}
+      cargo build --release -Z json-target-spec --target-dir "$tdir" ${feats:+--features "$feats"}
     cd "$WORKSPACE_DIR"
     "$TOOLBIN/llvm-objcopy" --strip-all \
       "${tdir}/aarch64-base/release/user-vug" \
@@ -11664,12 +11664,12 @@ build_user_blob() {
     # own .cargo/config.toml; it is its own workspace. Since TEGRAEL0LEG, `./arroyo check` DOES
     # build the blob once per fresh tree (`ensure_user_blob`) and armed aarch64 runnable images
     # rebuild it unconditionally (BLOBATOMIC); validation runs here, on every build, pre-landing.)
-    local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
+    local TOOLBIN; TOOLBIN="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | awk '/host/{print $2}')/bin"
     echo -e "${COLOR_YELLOW}⚡ Building EL0 user blob (crates/user-blob → target/user_blob.bin)...${COLOR_RESET}"
     mkdir -p "${WORKSPACE_DIR}/target"
     cd "$WORKSPACE_DIR/crates/user-blob"
     RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-blob/user-blob.ld" \
-      cargo +nightly build --release -Z json-target-spec
+      cargo build --release -Z json-target-spec
     cd "$WORKSPACE_DIR"
     # BLOBATOMIC (2026-08-21, peer-ruled): objcopy to a temp name and validate BEFORE the artifact
     # lands, then mv (atomic on one filesystem) — an interrupted build can no longer leave a
@@ -11718,7 +11718,7 @@ build_user_el0_elf_images() {
     echo -e "${COLOR_YELLOW}⚡ Building EL0 static-ELF program (crates/user-elf → target/ELFHELLO.ELF)...${COLOR_RESET}"
     cd "$WORKSPACE_DIR/crates/user-elf"
     RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-elf/user-elf.ld -C link-arg=-z -C link-arg=max-page-size=0x1000" \
-      cargo +nightly build --release -Z json-target-spec
+      cargo build --release -Z json-target-spec
     cd "$WORKSPACE_DIR"
     mkdir -p "${WORKSPACE_DIR}/target"   # a fresh worktree has no target/ yet — two executors hit this 2026-08-25
     "$TOOLBIN/llvm-objcopy" --strip-all \
@@ -11757,7 +11757,7 @@ build_user_el0_elf_images() {
     echo -e "${COLOR_YELLOW}⚡ Building EL0 KERNEL-VUG static-ELF program (crates/user-vug [kvug] → target/VUGK.ELF)...${COLOR_RESET}"
     cd "$WORKSPACE_DIR/crates/user-vug"
     RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-vug/user-vug.ld -C link-arg=-z -C link-arg=max-page-size=0x1000" \
-      cargo +nightly build --release -Z json-target-spec --features kvug \
+      cargo build --release -Z json-target-spec --features kvug \
       --target-dir "${WORKSPACE_DIR}/crates/user-vug/target/a64-kvug"
     cd "$WORKSPACE_DIR"
     "$TOOLBIN/llvm-objcopy" --strip-all \
@@ -11783,7 +11783,7 @@ build_user_el0_elf_images() {
     echo -e "${COLOR_YELLOW}⚡ Building EL0 persistence static-ELF program (crates/user-stat → target/STAT.ELF)...${COLOR_RESET}"
     cd "$WORKSPACE_DIR/crates/user-stat"
     RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-stat/user-stat.ld -C link-arg=-z -C link-arg=max-page-size=0x1000" \
-      cargo +nightly build --release -Z json-target-spec
+      cargo build --release -Z json-target-spec
     cd "$WORKSPACE_DIR"
     "$TOOLBIN/llvm-objcopy" --strip-all \
       "${WORKSPACE_DIR}/crates/user-stat/target/aarch64-base/release/user-stat" \
@@ -11809,7 +11809,7 @@ build_user_el0_elf_images() {
     echo -e "${COLOR_YELLOW}⚡ Building EL0 cpu-pulse static-ELF program (crates/user-pulse → target/PULSE.ELF)...${COLOR_RESET}"
     cd "$WORKSPACE_DIR/crates/user-pulse"
     RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-pulse/user-pulse.ld -C link-arg=-z -C link-arg=max-page-size=0x1000" \
-      cargo +nightly build --release -Z json-target-spec
+      cargo build --release -Z json-target-spec
     cd "$WORKSPACE_DIR"
     "$TOOLBIN/llvm-objcopy" --strip-all \
       "${WORKSPACE_DIR}/crates/user-pulse/target/aarch64-base/release/user-pulse" \
@@ -11824,7 +11824,7 @@ build_user_el0_elf_images() {
 
 kernel8() {
     k8_lock_acquire
-    local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
+    local TOOLBIN; TOOLBIN="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | awk '/host/{print $2}')/bin"
 
     # The hello blob, unconditionally (a kernel8 image must never carry a stale routine). The same
     # `cargo build --release` this runs also links the other [[bin]]s of the crate, which the K2 and
@@ -12836,7 +12836,7 @@ kernel8() {
     echo -e "${COLOR_YELLOW}⚡ Building bare-metal kernel8.img (Pi 4, microSD-slot boot)...${COLOR_RESET}"
     cd "$WORKSPACE_DIR/crates/kernel"
     RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/kernel/pi-baremetal.ld" \
-      cargo +nightly build --release --target ../../aarch64-base.json \
+      cargo build --release --target ../../aarch64-base.json \
       $NIGHTLY_FLAGS --features "$K8_FEATS"
     cd "$WORKSPACE_DIR"
 
@@ -14190,7 +14190,7 @@ _knoboff_arm_csv() {
 _knoboff_flat() {
     local _tree="$1" _tgt="$2" _arch="$3" _feats="$4" _out="$5" _log="$6" _census="${7:-}"
     local _tspec _elf _TOOLBIN _rc=0 _crate=kernel _uefi=0
-    _TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
+    _TOOLBIN="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | awk '/host/{print $2}')/bin"
     case "$_arch" in
         x86) _tspec="../../x86_64-unaos.json"; _elf="$_tgt/x86_64-unaos/release/unaos-kernel" ;;
         arm) _tspec="../../aarch64-unaos.json"; _elf="$_tgt/aarch64-unaos/release/unaos-kernel" ;;
@@ -14205,7 +14205,7 @@ _knoboff_flat() {
     local _step="${_log}.step"
     : > "$_step"
     ( cd "$_tree/unaos/crates/$_crate" \
-      && CARGO_TARGET_DIR="$_tgt" cargo +nightly build --release \
+      && CARGO_TARGET_DIR="$_tgt" cargo build --release \
          --target "$_tspec" $_zflags $_fargs ) >"$_step" 2>&1 || _rc=1
     if [ -n "$_census" ]; then
         awk '$1 == "Compiling" { print $2 }' "$_step" | sort -u | paste -sd, - > "$_census"
@@ -15084,18 +15084,29 @@ sha512_of() {
     elif command -v sha512sum >/dev/null 2>&1; then sha512sum "$1" | awk '{print $1}'
     else echo ""; fi
 }
-# The kernel and the builder are built with `cargo +nightly`, which overrides rust-toolchain.toml, so the floor is checked
-# on THAT toolchain: its commit date (YYYY-MM-DD, compared as a string — no `date -d`) must be >= the oldest nightly the
-# flights build on. A stale nightly (flight 38's Mac had a March one) is refused here, not as a compile error deep in a crate.
+# TOOLCHAIN-ONE (B1018): rust-toolchain.toml (repo root) is THE one pin. Nothing here passes `+<toolchain>`; `_toml_channel`
+# is the ONE reader of the file (prints `channel`, or with arg `components` the comma-joined list), and its channel is
+# exported as RUSTUP_TOOLCHAIN once at load, so the sysroot/TOOLBIN reads that run in the CALLER's cwd (before any cd, maybe
+# outside the tree, where rustup would fall back to its default) and the builder's child cargo resolve the same toolchain.
+_toml_channel() {
+    awk -v want="${1:-channel}" -F'=' '
+        $1 ~ "^[ \t]*" want "[ \t]*$" { v=$2; sub(/#.*/, "", v); gsub(/[][" \t]/, "", v); print v; exit }
+    ' "$WORKSPACE_DIR/../rust-toolchain.toml" 2>/dev/null
+}
+_tc="$(_toml_channel || true)"; [ -n "$_tc" ] && export RUSTUP_TOOLCHAIN="$_tc"   # TOOLCHAINONE (B1018): the toml's channel, every rustup proxy below
+# The floor is checked on the toml's toolchain (`rustc -V`): its commit date (YYYY-MM-DD, compared as a string — no `date -d`)
+# must be >= the oldest nightly the flights build on. A stale or absent toolchain (flight 38's Mac had a March one) is refused
+# here, not as a compile error deep in a crate; the remedy installs the pinned channel with the toml's components.
 _rustc_floor() {
-    local floor="2026-08-31" have
-    have="$(rustc +nightly -V 2>/dev/null | awk '{d=$NF; gsub(/[()]/, "", d); print d}')"
+    local floor="2026-08-31" have fix
+    fix="rustup toolchain install $(_toml_channel) --component $(_toml_channel components)"
+    have="$(rustc -V 2>/dev/null | awk '{d=$NF; gsub(/[()]/, "", d); print d}')"
     case "$have" in
         [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) ;;
-        *) echo -e "${COLOR_RED}❌ TOOLCHAIN: no dated \`rustc +nightly -V\` on this host — run: rustup toolchain install nightly (B1011)${COLOR_RESET}"; return 1 ;;
+        *) echo -e "${COLOR_RED}❌ TOOLCHAIN: no dated \`rustc -V\` on this host — run: ${fix} (B1018)${COLOR_RESET}"; return 1 ;;
     esac
     if [[ "$have" < "$floor" ]]; then
-        echo -e "${COLOR_RED}❌ TOOLCHAIN: nightly ${have} is older than ${floor} — run: rustup update nightly (B1011)${COLOR_RESET}"; return 1
+        echo -e "${COLOR_RED}❌ TOOLCHAIN: nightly ${have} is older than ${floor} — run: ${fix} (B1018)${COLOR_RESET}"; return 1
     fi
     return 0
 }
@@ -15114,7 +15125,7 @@ _lnx_pick() {
     local tb why=""
     if [ "$(uname -s)" = "Darwin" ]; then
         _LNX_HOST=darwin
-        tb="$(rustc +nightly --print sysroot 2>/dev/null)/lib/rustlib/$(rustc +nightly -vV 2>/dev/null | awk '/host/{print $2}')/bin"
+        tb="$(rustc --print sysroot 2>/dev/null)/lib/rustlib/$(rustc -vV 2>/dev/null | awk '/host/{print $2}')/bin"
         if [ -x "$tb/gcc-ld/ld.lld" ]; then _LNX_LD="$tb/gcc-ld/ld.lld"; else _LNX_LD="$(command -v ld.lld 2>/dev/null || echo ld.lld)"; fi
         if [ -x "$tb/llvm-strip" ]; then _LNX_STRIP="$tb/llvm-strip"; else _LNX_STRIP="$(command -v llvm-strip 2>/dev/null || echo llvm-strip)"; fi
         _LNX_CC="clang --target=x86_64-unknown-linux-musl -fuse-ld=lld --ld-path=$_LNX_LD"

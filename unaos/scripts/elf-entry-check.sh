@@ -26,7 +26,7 @@
 # One line per image: `:: ELFENTRY: <name> entry=0x… insns=N rip_refs=N -> PASS|FAIL ::`, each refusal on its
 # own `:: ELFENTRY: refused <rule> at entry+0x… — <insn> ::` line before it. Exit 1 if any image fails.
 set -u
-TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
+TOOLBIN="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | awk '/host/{print $2}')/bin"
 OBJDUMP="${TOOLBIN}/llvm-objdump"
 [ -x "$OBJDUMP" ] || OBJDUMP="$(command -v llvm-objdump || true)"
 [ -n "$OBJDUMP" ] || { echo ":: ELFENTRY: no llvm-objdump (rustup component add llvm-tools) -> FAIL ::"; exit 1; }
