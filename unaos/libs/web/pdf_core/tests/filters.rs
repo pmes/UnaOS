@@ -140,3 +140,11 @@ fn filter_chains_and_image_pass_through() {
     let s = Stream { dict: dict("<< /Filter /LZWDecode /DecodeParms << /EarlyChange 0 >> >>"), data: lzw_encode(b"abcabcabc", false) };
     assert_eq!(filters::decode(&s, &|o| o.clone()).unwrap().data, b"abcabcabc");
 }
+
+#[test]
+fn png_predictor_lenient() {
+    // PIXEL-UNFILTER (SR316): the PDF rules kept around pixel_core's unfilter. 3 columns of gray, row 3, stride 4:
+    // row 0 has filter type 7 (read as None), row 1 is Sub, row 2 is a short Up row (the stream stops mid-row).
+    let enc = [7u8, 1, 2, 3, 1, 1, 1, 1, 2, 5];
+    assert_eq!(predict(&enc, 10, 1, 8, 3).unwrap(), [1, 2, 3, 1, 2, 3, 6]);
+}
