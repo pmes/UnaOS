@@ -119,23 +119,29 @@ pub fn bootstrap_image_surface(id: &str, synapse: Synapse) -> NativeView {
 
     let da_clone = drawing_area.clone();
     let mut rx = synapse.subscribe();
+    let resend = synapse.clone();
     
     let target_id = id.to_string();
     gtk4::glib::spawn_future_local(async move {
-        while let Ok(msg) = rx.recv().await {
-            match msg {
-                SMessage::SurfaceBlit { url, width, height, pixels, damage } if url == target_id => {
+        loop {
+            match rx.recv().await {
+                Ok(SMessage::SurfaceBlit { url, width, height, pixels, damage }) if url == target_id => {
                     // NLE2ORDER (SR227): the Surface takes RGBA (tetra's contract); converted ONCE here to cairo's ARgb32.
                     match damage {
                         None => {
                             *buffer.borrow_mut() = crate::tetra::surface_argb32(&pixels);
                             *dim.borrow_mut() = (width, height);
                         }
-                        // AETHERMACGPU-DAMAGE (SR320): only the rect's rows are converted and spliced into the kept frame;
-                        // a frame of another size drops the blit (the sender's next whole frame repairs it).
-                        Some(rect) => {
+                        // AETHERMACGPU-DAMAGE (SR320) / -ENGINEDAMAGE (SR341): only the rects' rows are converted and
+                        // spliced into the kept frame (`damage::spans`, one range per rect); a frame of another size or a
+                        // rect list that does not fit drops the blit (the sender's next whole frame repairs it).
+                        Some(rects) => {
                             let same = *dim.borrow() == (width, height);
-                            if !same || !crate::tetra::surface_splice(&mut buffer.borrow_mut(), width, height, rect, &crate::tetra::surface_argb32(&pixels)) {
+                            let Some(spans) = crate::damage::spans(&rects, width, height, pixels.len()).filter(|_| same) else {
+                                continue;
+                            };
+                            let mut kept = buffer.borrow_mut();
+                            if !spans.into_iter().all(|(r, range)| crate::tetra::surface_splice(&mut kept, width, height, r, &crate::tetra::surface_argb32(&pixels[range]))) {
                                 continue;
                             }
                         }
@@ -144,13 +150,17 @@ pub fn bootstrap_image_surface(id: &str, synapse: Synapse) -> NativeView {
                 }
                 // SR67: the hovered element's css-ui-4 cursor keyword IS the GTK cursor name
                 // (GTK uses the CSS names, as `glyph.rs` does with "text"); `auto` is the arrow.
-                SMessage::BrowserCursorChanged(name) => {
+                Ok(SMessage::BrowserCursorChanged(name)) => {
                     let name = if name == "auto" { "default" } else { name.as_str() };
                     da_clone.set_cursor_from_name(Some(name));
                 }
                 // The engine's answer to BrowserCopy: the display's clipboard.
-                SMessage::BrowserClipboardSet(text) => da_clone.clipboard().set_text(&text),
-                _ => {}
+                Ok(SMessage::BrowserClipboardSet(text)) => da_clone.clipboard().set_text(&text),
+                Ok(_) => {}
+                // AETHERMACGPU-ENGINEDAMAGE (SR341): a lagged page no longer ENDS this loop (the page froze); its kept frame
+                // is unknown, so it asks the sender for the surface whole.
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => resend.fire(SMessage::SurfaceResend { url: target_id.clone() }),
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }
         }
     });

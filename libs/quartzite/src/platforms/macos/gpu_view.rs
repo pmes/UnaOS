@@ -1260,17 +1260,17 @@ fn replace_rect(tex: &AnyObject, bytes: &[u8], rect: (u32, u32, u32, u32)) {
     }
 }
 
-/// AETHERMACGPU-DAMAGE (LEDGER SR320): a damage blit's rows into the page's EXISTING `width x height` texture, then
-/// presented. `false` when the page has no GPU view, no texture of that size (the first frame at a size comes whole),
-/// or the rect does not fit (the caller's CPU path then decides). Main thread only.
-pub fn page_damage(page: &NSView, rows: &[u8], width: u32, height: u32, rect: (u32, u32, u32, u32)) -> bool {
+/// AETHERMACGPU-DAMAGE (LEDGER SR320) / -ENGINEDAMAGE (SR341): a damage blit's rects (`rows` = their rows in list order,
+/// walked by `damage::spans`) into the page's EXISTING `width x height` texture, one `replace_rect` each, then presented
+/// ONCE. `false` when the page has no GPU view, no texture of that size (the first frame at a size comes whole), or the
+/// rects do not fit (the caller's CPU path then decides). Main thread only.
+pub fn page_damage(page: &NSView, rows: &[u8], width: u32, height: u32, rects: &[(u32, u32, u32, u32)]) -> bool {
     let Some(view) = page_view(page) else {
         return false;
     };
-    let (x, y, w, h) = rect;
-    if w == 0 || h == 0 || x as u64 + w as u64 > width as u64 || y as u64 + h as u64 > height as u64 || rows.len() != w as usize * h as usize * 4 {
+    let Some(spans) = crate::damage::spans(rects, width, height, rows.len()) else {
         return false;
-    }
+    };
     {
         let slot = view.ivars().texture.borrow();
         let Some((tex, tw, th)) = slot.as_ref() else {
@@ -1279,7 +1279,9 @@ pub fn page_damage(page: &NSView, rows: &[u8], width: u32, height: u32, rect: (u
         if (*tw, *th) != (width, height) {
             return false;
         }
-        replace_rect(tex, rows, rect);
+        for (rect, range) in spans {
+            replace_rect(tex, &rows[range], rect);
+        }
     }
     view.draw();
     true

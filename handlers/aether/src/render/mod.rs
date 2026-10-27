@@ -4025,3 +4025,174 @@ fn frame_walk(
     // AETHERA11Y (SR119): `:focus-visible` from the keyboard — the ring over everything.
     focusring::paint(layout, surface, width, height, sx, sy, damage_rects);
 }
+
+// =================================================================================================
+// AETHERMACGPU-ENGINEDAMAGE (LEDGER SR341): the frame's damage on the PRESENTED (device) frame.
+// =================================================================================================
+
+/// A damage rect `(x, y, w, h)`.
+pub type DamageRect = (u32, u32, u32, u32);
+
+/// What the last presented frame was painted at: the truncated scroll `render_frame` used. The caller (aether-shell's
+/// tab, beside its `tetra::SurfaceDamage`) keeps one per surface and hands it to every [`present_damage`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PresentMark {
+    scroll: (i32, i32),
+}
+
+/// The device-pixel rects of `damages` (the list `AetherEngine::render_frame` returned, CSS px of the viewport) on the
+/// frame `present_rgba` makes: the whole device viewport when the viewport scrolled since `mark` (the surface was shifted
+/// by `copy_within` and only the exposed band was damaged: every presented pixel moved), when there is no layout (the
+/// surface was filled whole), or when `damages` is empty or covers the viewport; else [`device_rects`]. Updates `mark`.
+pub fn present_damage(engine: &crate::AetherEngine, damages: &[DamageRect], mark: &mut PresentMark) -> Vec<DamageRect> {
+    let scroll = (engine.scroll_x as i32, engine.scroll_y as i32);
+    let moved = std::mem::replace(&mut mark.scroll, scroll) != scroll;
+    let css = (engine.width, engine.height);
+    let device = engine.device_size();
+    let covers = damages.iter().any(|&(x, y, w, h)| x == 0 && y == 0 && w >= css.0 && h >= css.1);
+    if moved || engine.layout_tree.is_none() || damages.is_empty() || covers {
+        return vec![(0, 0, device.0, device.1)];
+    }
+    device_rects(damages, css, device)
+}
+
+/// CSS-surface rects on a `device` frame resampled from the `css` one (`AetherEngine::present_rgba`'s bilinear: a
+/// device pixel reads a 2x2 CSS footprint): each rect grown one CSS px on every side, scaled outward (floor / ceil) and
+/// clipped to the device; the identity (clipped) when the sizes match. Pure.
+pub fn device_rects(rects: &[DamageRect], css: (u32, u32), device: (u32, u32)) -> Vec<DamageRect> {
+    let clip = |x0: u32, y0: u32, x1: u32, y1: u32| {
+        let (x1, y1) = (x1.min(device.0), y1.min(device.1));
+        (x1 > x0 && y1 > y0).then(|| (x0, y0, x1 - x0, y1 - y0))
+    };
+    if css == device || css.0 == 0 || css.1 == 0 {
+        return rects.iter().filter_map(|&(x, y, w, h)| clip(x, y, x.saturating_add(w), y.saturating_add(h))).collect();
+    }
+    let (sx, sy) = (device.0 as f64 / css.0 as f64, device.1 as f64 / css.1 as f64);
+    rects
+        .iter()
+        .filter_map(|&(x, y, w, h)| {
+            let x0 = ((x as f64 - 1.0) * sx).floor().max(0.0) as u32;
+            let y0 = ((y as f64 - 1.0) * sy).floor().max(0.0) as u32;
+            let x1 = ((x as f64 + w as f64 + 1.0) * sx).ceil().min(device.0 as f64) as u32;
+            let y1 = ((y as f64 + h as f64 + 1.0) * sy).ceil().min(device.1 as f64) as u32;
+            clip(x0, y0, x1, y1)
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod device_damage_tests {
+    use super::{PresentMark, device_rects, present_damage};
+    use crate::AetherEngine;
+
+    fn engine(html: &str, device: (u32, u32), zoom: u32) -> AetherEngine {
+        let mut e = AetherEngine::new();
+        e.set_device_size(device.0, device.1);
+        e.set_zoom_pct(zoom);
+        e.load_html_styled("file:///page/index.html", html, &[], true);
+        let _ = e.render_frame();
+        e
+    }
+
+    /// Every device pixel `present_rgba` changes when a CSS rect changes lies inside `device_rects` of it.
+    fn assert_bilinear_covered(css: (u32, u32), device: (u32, u32), rect: super::DamageRect) {
+        let got = device_rects(&[rect], css, device);
+        assert_eq!(got.len(), 1);
+        let (gx, gy, gw, gh) = got[0];
+        let (rx, ry) = (css.0 as f64 / device.0 as f64, css.1 as f64 / device.1 as f64);
+        let reads = |d: u32, r: f64, n: u32, lo: u32, len: u32| {
+            let f = ((d as f64 + 0.5) * r - 0.5).clamp(0.0, (n - 1) as f64);
+            let (a, b) = (f.floor() as u32, (f.floor() as u32 + 1).min(n - 1));
+            (lo..lo + len).contains(&a) || (lo..lo + len).contains(&b)
+        };
+        for y in 0..device.1 {
+            for x in 0..device.0 {
+                if reads(x, rx, css.0, rect.0, rect.2) && reads(y, ry, css.1, rect.1, rect.3) {
+                    assert!(x >= gx && x < gx + gw && y >= gy && y < gy + gh, "device ({x},{y}) outside {:?}", got[0]);
+                }
+            }
+        }
+    }
+
+    /// The same sizes map to themselves (clipped to the device).
+    #[test]
+    fn device_rects_identity_kat() {
+        assert_eq!(device_rects(&[(10, 20, 30, 40), (90, 90, 50, 50), (200, 0, 1, 1)], (100, 100), (100, 100)), vec![(10, 20, 30, 40), (90, 90, 10, 10)]);
+    }
+
+    /// A style change on ONE element at zoom 150 and at zoom 200 (the page's devicePixelRatio 2: the faces' only scale)
+    /// presents as ONE device rect that holds the element's device box and is smaller than the viewport; the CSS->device
+    /// numbers are exact; and every device pixel the bilinear resample reads from the rect lies inside it.
+    #[test]
+    fn damage_device_style_zoom_kat() {
+        assert_eq!(device_rects(&[(10, 20, 30, 40)], (400, 300), (600, 450)), vec![(13, 28, 49, 64)]);
+        assert_eq!(device_rects(&[(10, 20, 30, 40)], (400, 300), (800, 600)), vec![(18, 38, 64, 84)]);
+        assert_bilinear_covered((400, 300), (600, 450), (10, 20, 30, 40));
+        assert_bilinear_covered((400, 300), (800, 600), (0, 0, 7, 3));
+        assert_bilinear_covered((400, 300), (200, 150), (33, 17, 9, 5));
+        let html = r#"<html><body style="margin:0"><div id="a" style="margin:40px;width:60px;height:30px;background:#00f"></div>
+            <div style="height:2000px"></div></body></html>"#;
+        for (zoom, device) in [(150u32, (600u32, 450u32)), (200, (800, 600))] {
+            let mut e = engine(html, device, zoom);
+            assert_eq!((e.width, e.height), (400, 300), "zoom {zoom}: the CSS viewport");
+            let mut mark = PresentMark::default();
+            let a = e.document.as_ref().and_then(|d| crate::dom::a11y::by_id(d, "a")).expect("#a");
+            e.damage_node(&a); // the element's box, as a restyle of it damages
+            let damages = e.render_frame();
+            let got = present_damage(&e, &damages, &mut mark);
+            assert_eq!(got.len(), 1, "zoom {zoom}: one rect, got {got:?}");
+            let (x, y, w, h) = got[0];
+            let z = zoom as f64 / 100.0;
+            let (bx0, by0, bx1, by1) = ((40.0 * z) as u32, (40.0 * z) as u32, (100.0 * z) as u32, (70.0 * z) as u32);
+            assert!(x <= bx0 && y <= by0 && x + w >= bx1 && y + h >= by1, "zoom {zoom}: {got:?} holds the box");
+            assert!((w as u64) * (h as u64) * 4 < device.0 as u64 * device.1 as u64, "zoom {zoom}: {got:?} is small");
+        }
+    }
+
+    /// A viewport scroll shifts the surface and damages only the exposed band; on the presented frame it is the whole
+    /// viewport. The next unscrolled frame is rects again.
+    #[test]
+    fn damage_device_scroll_kat() {
+        let html = r#"<html><body style="margin:0"><div style="height:3000px;background:linear-gradient(red,blue)"></div></body></html>"#;
+        let mut e = engine(html, (300, 200), 100);
+        let mut mark = PresentMark::default();
+        let damages = vec![(0, 0, e.width, e.height)];
+        assert_eq!(present_damage(&e, &damages, &mut mark), vec![(0, 0, 300, 200)]);
+        e.handle_event(crate::api::events::Event::Scroll(0.0, 40.0));
+        let damages = e.render_frame();
+        assert_eq!(damages, vec![(0, 160, 300, 40)], "the engine damages the exposed band");
+        assert_eq!(present_damage(&e, &damages, &mut mark), vec![(0, 0, 300, 200)], "the presented frame moved whole");
+        e.damage_rects.push((5, 6, 7, 8));
+        let damages = e.render_frame();
+        assert_eq!(present_damage(&e, &damages, &mut mark), vec![(5, 6, 7, 8)], "no scroll since: the rects");
+    }
+
+    /// A playing <video>'s next frame damages its box alone: the presented frame uploads only that rect.
+    #[test]
+    fn damage_device_video_kat() {
+        use bandy::SMessage;
+        let url = "file:///page/clip.webm";
+        let mut e = engine(r#"<html><body style="margin:0"><p>text</p><video src="clip.webm" width="160" height="120"></video></body></html>"#, (640, 480), 100);
+        e.on_media_message(&SMessage::MediaOpened {
+            url: url.into(),
+            duration_ns: 1_000_000_000,
+            width: 160,
+            height: 120,
+            video: "vp8".into(),
+            audio: String::new(),
+            real_video: true,
+            audio_clock: false,
+        });
+        let frame = |n: i64| SMessage::MediaFrame { url: url.into(), pts_ns: n * 40_000_000, width: 160, height: 120, rgba: vec![n as u8; 160 * 120 * 4], levels: vec![] };
+        e.on_media_message(&frame(0));
+        let _ = e.render_frame();
+        let mut mark = PresentMark::default();
+        let _ = present_damage(&e, &[(0, 0, e.width, e.height)], &mut mark);
+        assert!(e.on_media_message(&frame(1)), "a frame repaints");
+        let damages = e.render_frame();
+        let el = &e.media_elements()[0];
+        let (x, y, w, h) = e.box_of(&el.node).expect("video box");
+        let video = (x.floor() as u32, y.floor() as u32, w.ceil() as u32, h.ceil() as u32);
+        assert_eq!(present_damage(&e, &damages, &mut mark), vec![video], "the overlay rect alone");
+    }
+}
