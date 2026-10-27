@@ -915,4 +915,4 @@ refs/heads/exec-rmbp-pdfsign   e9df84207 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-aethermacgpupresentrects   e9df84207 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-playcheckhi   a80198ec9 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-swapbackseek   e9df84207 IN-FLIGHT cut 2026-10-27
-refs/heads/exec-rmbp-stationroambgscan   e9df84207 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-stationroambgscan   7b77f79c3 FOLDED-BY-HAND (this commit) 2026-10-27

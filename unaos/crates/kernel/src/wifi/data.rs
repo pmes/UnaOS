@@ -373,7 +373,7 @@ pub fn kat() -> (u8, u8, Option<&'static str>) {
         checks.push(("lease", crate::smolnet::lease_of(&ack) == Some(3600) && crate::smolnet::lease_of(&offer).is_none()
             && crate::smolnet::lease_of(&bad).is_none()));
     }
-    ratectl_rows(&mut checks); erp_rows(&mut checks); rejoin_rows(&mut checks); roam_rows(&mut checks); xchan_rows(&mut checks); active_rows(&mut checks); let mut pass = 0u8; // STATIONROAM-ACTIVE (B951): `probe`, `idleuni` after `idlegate`; STATIONROAM-XCHAN (B898): `dwell`, `idlegate` after `roamwindow`; STATIONROAM (B897): `bsstable`, `roampick`, `roamwindow` after `rejoin`; STATIONREJOIN (B891): `rejoin` after them; STATIONRATECTL (B881): `ratectl`, `fallback` at the END of the table (LINE-NEUTRAL); STATIONERP (B884): `erp`, `cts` after them
+    ratectl_rows(&mut checks); erp_rows(&mut checks); rejoin_rows(&mut checks); roam_rows(&mut checks); xchan_rows(&mut checks); active_rows(&mut checks); bg_rows(&mut checks); let mut pass = 0u8; // STATIONROAM-BGSCAN (B955): `bgplan`, `bggate` after `idleuni`; STATIONROAM-ACTIVE (B951): `probe`, `idleuni` after `idlegate`; STATIONROAM-XCHAN (B898): `dwell`, `idlegate` after `roamwindow`; STATIONROAM (B897): `bsstable`, `roampick`, `roamwindow` after `rejoin`; STATIONREJOIN (B891): `rejoin` after them; STATIONRATECTL (B881): `ratectl`, `fallback` at the END of the table (LINE-NEUTRAL); STATIONERP (B884): `erp`, `cts` after them
     let mut first = None;
     for (name, ok) in checks.iter() {
         if *ok {
@@ -1217,4 +1217,114 @@ fn active_rows(checks: &mut Vec<(&'static str, bool)>) {
     g &= !t.quiet(l.rx_uni, 7, 2250) && !t.quiet(l.rx_uni, 7, 4249) && t.quiet(l.rx_uni, 7, 4250);
     g &= l.rx_data == 2 && l.rx_uni == 1;
     checks.push(("idleuni", g));
+}
+
+// ── STATIONROAM-BGSCAN (rmbp-ledger B955): one PS-announced off-channel dwell per window on a busy station — PURE, held in `join::Heard.bg` under `STATION` ──
+
+/// A linked station that is not quiet opens one background window this often (`join::bg_open`); each window ends in at most ONE dwell.
+pub const ROAM_BG_MS: u64 = 10_000;
+/// A window's dwell is refused when more frames than this are in flight at its end (`tx::Queue::in_flight`, after the reap): they must
+/// drain before the PS Null, since `tx::fire_frame`'s status spin would consume their statuses and a frame left in the ring across the
+/// retune carries the home channel's code.
+pub const ROAM_BG_QMAX: usize = 2;
+/// How long `join::bgscan` reaps the queue empty before the PS Null (else `failed:drain`).
+pub const ROAM_BG_DRAIN_MS: u64 = 30;
+
+/// The background scan's schedule and its round-robin cursor over `dwell_plan(home)`: `arm` (from `keep`) puts the first window
+/// `ROAM_BG_MS` out; `due` -> the window opens (`window` set, `BssTable::open_bg`) -> at its end `gate` decides (the next window
+/// `ROAM_BG_MS` out either way); a go takes `channel`, one channel per dwell. A refusal is counted (`refused`, said on the next dwell's
+/// line) and said only on the first of a streak.
+#[derive(Default, Clone, Copy, Debug)]
+pub struct BgScan {
+    next_ms: u64,
+    cursor: u8,
+    /// The window open now is a background one (a quiet end never becomes the 60 s window's full sweep).
+    pub window: bool,
+    pub refused: u32,
+    streak: bool,
+}
+
+impl BgScan {
+    pub fn arm(&mut self, now_ms: u64) {
+        self.next_ms = now_ms + ROAM_BG_MS;
+        self.window = false;
+    }
+
+    pub fn due(&self, now_ms: u64) -> bool {
+        now_ms >= self.next_ms
+    }
+
+    /// At a window's end: `Ok` = the dwell may run (`in_flight <= ROAM_BG_QMAX`); `Err(say)` = refused, `say` on the first refusal of a
+    /// streak. The window flag clears and the next window is `ROAM_BG_MS` out either way.
+    pub fn gate(&mut self, in_flight: usize, now_ms: u64) -> Result<(), bool> {
+        self.window = false;
+        self.next_ms = now_ms + ROAM_BG_MS;
+        if in_flight <= ROAM_BG_QMAX {
+            self.streak = false;
+            return Ok(());
+        }
+        self.refused += 1;
+        let say = !self.streak;
+        self.streak = true;
+        Err(say)
+    }
+
+    /// The next dwell's channel: `dwell_plan(home)` round robin, the cursor advanced once per call (held mod 6, the plans' 2 and 3).
+    pub fn channel(&mut self, home: u8) -> u8 {
+        let (plan, n) = dwell_plan(home);
+        let c = plan[self.cursor as usize % n.max(1)];
+        self.cursor = (self.cursor + 1) % 6;
+        c
+    }
+}
+
+impl BssTable {
+    /// STATIONROAM-BGSCAN (B955): a background window opens — entries heard before it are stale, the 60 s schedule (`next_ms`) stays
+    /// where `arm` / `open` put it.
+    pub fn open_bg(&mut self, now_ms: u64) {
+        self.open = true;
+        self.opened_ms = now_ms;
+    }
+}
+
+/// `kat`'s rows after B951's (STATIONROAM-BGSCAN rmbp-ledger B955). `bgplan`: arm(0): not due at 9 999, due at 10 000; channel(11) =
+/// 1, 6, 1; a fresh cursor: channel(3) = 1, 6, 11, 1; channel(6) = 1, 11; a gate at 10 000 puts the next window at 20 000; a table
+/// armed at 0 and opened in the background at 5 000 is still due at 60 000 (not 59 999) and an entry heard at 4 999 is stale.
+/// `bggate`: gate(2) Ok, gate(3) Err(true), gate(8) Err(false), refused 2; gate(0) Ok ends the streak, gate(3) Err(true) again; the
+/// window flag clears; drain + dwell <= 150 ms, the period longer than a window; `build_null_data_pm` sets octet 1 to 0x11 and is
+/// byte-identical to `build_null_data` when off.
+fn bg_rows(checks: &mut Vec<(&'static str, bool)>) {
+    let mut b = BgScan::default();
+    b.arm(0);
+    let mut ok = !b.due(9_999) && b.due(10_000);
+    ok &= b.channel(11) == 1 && b.channel(11) == 6 && b.channel(11) == 1;
+    let mut c = BgScan::default();
+    ok &= c.channel(3) == 1 && c.channel(3) == 6 && c.channel(3) == 11 && c.channel(3) == 1;
+    let mut d = BgScan::default();
+    ok &= d.channel(6) == 1 && d.channel(6) == 11;
+    ok &= b.gate(0, 10_000) == Ok(()) && !b.due(19_999) && b.due(20_000);
+    let mut t = BssTable::default();
+    t.arm(0);
+    t.open(0);
+    t.see(BSSID, 11, -60, 4_999);
+    t.close();
+    t.arm(0);
+    t.open_bg(5_000);
+    ok &= t.is_open() && roam_pick(None, 11, &t).is_none();
+    t.close();
+    ok &= !t.due(59_999) && t.due(60_000);
+    checks.push(("bgplan", ok));
+
+    let mut g = BgScan::default();
+    g.window = true;
+    let mut q = g.gate(2, 0) == Ok(()) && !g.window;
+    g.window = true;
+    q &= g.gate(3, 10) == Err(true) && !g.window && g.gate(8, 20) == Err(false) && g.refused == 2;
+    q &= g.gate(0, 30) == Ok(()) && g.gate(3, 40) == Err(true);
+    q &= ROAM_BG_DRAIN_MS + ROAM_DWELL_MS <= 150 && ROAM_BG_MS > ROAM_WINDOW_MS;
+    let on = wifi_core::ieee80211::build_null_data_pm(STA, BSSID, 0, true);
+    let off = wifi_core::ieee80211::build_null_data_pm(STA, BSSID, 0, false);
+    let base = wifi_core::ieee80211::build_null_data(STA, BSSID, 0);
+    q &= on[1] == 0x11 && on[0] == base[0] && on[2..] == base[2..] && off == base;
+    checks.push(("bggate", q));
 }

@@ -436,3 +436,16 @@ pub fn build_null_data(sta: Mac, bssid: Mac, seq: u16) -> Vec<u8> {
     f.extend_from_slice(&(seq << 4).to_le_bytes());
     f
 }
+
+/// STATIONROAM-BGSCAN (rmbp-ledger B955): the frame control's Power Management bit (IEEE 802.11-2020 §9.2.4.1.7), octet 1.
+pub const FC_FLAG_PM: u8 = 0x10;
+
+/// STATIONROAM-BGSCAN (B955): `build_null_data` with the Power Management bit set (`pm`: the station enters power save, so the AP
+/// buffers its frames while it dwells off-channel) or clear (it leaves power save; byte-identical to `build_null_data`).
+pub fn build_null_data_pm(sta: Mac, bssid: Mac, seq: u16, pm: bool) -> Vec<u8> {
+    let mut f = build_null_data(sta, bssid, seq);
+    if pm {
+        f[1] |= FC_FLAG_PM;
+    }
+    f
+}
