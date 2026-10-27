@@ -223,6 +223,21 @@ pub struct Mp4Options {
     pub fragment: usize,
 }
 
+/// DEMUXSEEK (SR200): what [`mp4_with`] writes beyond [`Mp4Options`] (which keeps its fields: callers spell it whole).
+#[derive(Debug, Clone, Default)]
+pub struct Mp4Extras {
+    /// Fragmented: a `sidx` after the `moov` indexing every fragment (the first track as the reference stream).
+    pub sidx: bool,
+    /// Fragmented: an `mfra` (a `tfra` per track, one entry per fragment that holds a sync sample) and its `mfro` at the end.
+    pub mfra: bool,
+    /// A whole edit list per track id: (segment_duration in movie ticks, media_time in media ticks or -1, media_rate 16.16).
+    /// Replaces [`Mp4Options::edits`] for that track.
+    pub edit_lists: Vec<(u32, Vec<(u32, i64, i32)>)>,
+    /// Per track id, one §8.6.4 `sdtp` byte per sample: an `sdtp` box (progressive) or the sample_flags bits 27..20 of the
+    /// `trun` (fragmented).
+    pub sdtp: Vec<(u32, Vec<u8>)>,
+}
+
 fn track_duration(t: &MediaTrack) -> u64 {
     t.samples.iter().map(|s| (s.pts + s.duration as i64).max(0) as u64).max().unwrap_or(0)
 }
@@ -268,7 +283,7 @@ fn rle<T: PartialEq + Copy>(xs: impl Iterator<Item = T>) -> Vec<(u32, T)> {
     out
 }
 
-fn trak(t: &MediaTrack, opts: &Mp4Options, movie_ts: u32, chunk_offsets: &[u64], progressive: bool) -> Vec<u8> {
+fn trak(t: &MediaTrack, opts: &Mp4Options, x: &Mp4Extras, movie_ts: u32, chunk_offsets: &[u64], progressive: bool) -> Vec<u8> {
     let s = &t.spec;
     let media_dur = if progressive { track_duration(t) } else { 0 };
     let movie_dur = media_dur * movie_ts as u64 / s.timescale.max(1) as u64;
@@ -393,12 +408,25 @@ fn trak(t: &MediaTrack, opts: &Mp4Options, movie_ts: u32, chunk_offsets: &[u64],
         stss_box = fbx(b"stss", 0, 0, &b);
     }
 
-    let stbl = bx(b"stbl", &cat(&[&stsd, &stts, &ctts_box, &stsc, &stsz, &co, &stss_box]));
+    let mut sdtp_box = Vec::new();
+    if let Some((_, b)) = x.sdtp.iter().find(|e| e.0 == s.id).filter(|_| progressive) {
+        sdtp_box = fbx(b"sdtp", 0, 0, b);
+    }
+    let stbl = bx(b"stbl", &cat(&[&stsd, &stts, &ctts_box, &stsc, &stsz, &co, &stss_box, &sdtp_box]));
     let minf = bx(b"minf", &cat(&[&xmhd, &dinf, &stbl]));
     let mdia = bx(b"mdia", &cat(&[&mdhd, &hdlr, &minf]));
 
     let mut edts = Vec::new();
-    if let Some(&(_, empty, media_time)) = opts.edits.iter().find(|e| e.0 == s.id) {
+    if let Some((_, list)) = x.edit_lists.iter().find(|e| e.0 == s.id) {
+        let mut el = Vec::new();
+        el.u32b(list.len() as u32);
+        for &(seg, media_time, rate) in list {
+            el.u32b(seg);
+            el.u32b(media_time as i32 as u32);
+            el.u32b(rate as u32);
+        }
+        edts = bx(b"edts", &fbx(b"elst", 0, 0, &el));
+    } else if let Some(&(_, empty, media_time)) = opts.edits.iter().find(|e| e.0 == s.id) {
         let mut el = Vec::new();
         let n = if empty > 0 { 2 } else { 1 };
         el.u32b(n);
@@ -434,6 +462,12 @@ fn mvhd(movie_ts: u32, dur: u64, next_id: u32) -> Vec<u8> {
 
 /// Write an MP4 (progressive, or fragmented when `opts.fragment > 0`).
 pub fn mp4(tracks: &[MediaTrack], opts: &Mp4Options) -> Vec<u8> {
+    mp4_with(tracks, opts, &Mp4Extras::default())
+}
+
+/// DEMUXSEEK (SR200): [`mp4`] with [`Mp4Extras`] — the index boxes, whole edit lists and `sdtp`. Default extras write
+/// exactly what [`mp4`] writes.
+pub fn mp4_with(tracks: &[MediaTrack], opts: &Mp4Options, x: &Mp4Extras) -> Vec<u8> {
     let movie_ts = if opts.movie_timescale == 0 { 1000 } else { opts.movie_timescale };
     let next_id = tracks.iter().map(|t| t.spec.id).max().unwrap_or(0) + 1;
     let ftyp = {
@@ -446,7 +480,7 @@ pub fn mp4(tracks: &[MediaTrack], opts: &Mp4Options) -> Vec<u8> {
         bx(b"ftyp", &b)
     };
     if opts.fragment > 0 {
-        return mp4_fragmented(tracks, opts, movie_ts, next_id, ftyp);
+        return mp4_fragmented(tracks, opts, x, movie_ts, next_id, ftyp);
     }
     let movie_dur = tracks
         .iter()
@@ -458,7 +492,7 @@ pub fn mp4(tracks: &[MediaTrack], opts: &Mp4Options) -> Vec<u8> {
     let build_moov = |offsets: &[Vec<u64>]| -> Vec<u8> {
         let mut m = mvhd(movie_ts, movie_dur, next_id);
         for (i, t) in tracks.iter().enumerate() {
-            m.extend_from_slice(&trak(t, opts, movie_ts, &offsets[i], true));
+            m.extend_from_slice(&trak(t, opts, x, movie_ts, &offsets[i], true));
         }
         bx(b"moov", &m)
     };
@@ -484,7 +518,7 @@ pub fn mp4(tracks: &[MediaTrack], opts: &Mp4Options) -> Vec<u8> {
     cat(&[&ftyp, &moov, &bx(b"mdat", &mdat)])
 }
 
-fn mp4_fragmented(tracks: &[MediaTrack], opts: &Mp4Options, movie_ts: u32, next_id: u32, ftyp: Vec<u8>) -> Vec<u8> {
+fn mp4_fragmented(tracks: &[MediaTrack], opts: &Mp4Options, x: &Mp4Extras, movie_ts: u32, next_id: u32, ftyp: Vec<u8>) -> Vec<u8> {
     let movie_dur = tracks
         .iter()
         .map(|t| track_duration(t) * movie_ts as u64 / t.spec.timescale.max(1) as u64)
@@ -492,7 +526,7 @@ fn mp4_fragmented(tracks: &[MediaTrack], opts: &Mp4Options, movie_ts: u32, next_
         .unwrap_or(0);
     let mut moov = mvhd(movie_ts, 0, next_id);
     for t in tracks {
-        moov.extend_from_slice(&trak(t, opts, movie_ts, &[], false));
+        moov.extend_from_slice(&trak(t, opts, x, movie_ts, &[], false));
     }
     let mut mvex = Vec::new();
     let mut mehd = Vec::new();
@@ -508,7 +542,12 @@ fn mp4_fragmented(tracks: &[MediaTrack], opts: &Mp4Options, movie_ts: u32, next_
         mvex.extend_from_slice(&fbx(b"trex", 0, 0, &b));
     }
     moov.extend_from_slice(&bx(b"mvex", &mvex));
-    let mut out = cat(&[&ftyp, &bx(b"moov", &moov)]);
+    let head = cat(&[&ftyp, &bx(b"moov", &moov)]);
+    let mut out: Vec<u8> = Vec::new(); // the fragments, offsets relative to their first byte
+    let mut frag_at: Vec<usize> = Vec::new();
+    let dep = |t: &MediaTrack, i: usize| -> u32 {
+        x.sdtp.iter().find(|e| e.0 == t.spec.id).and_then(|(_, b)| b.get(i)).map_or(0, |&d| (d as u32) << 20)
+    };
 
     let per = opts.fragment;
     let nfrag = tracks.iter().map(|t| t.samples.len().div_ceil(per)).max().unwrap_or(0);
@@ -532,10 +571,11 @@ fn mp4_fragmented(tracks: &[MediaTrack], opts: &Mp4Options, movie_ts: u32, next_
                 let mut trun = Vec::new();
                 trun.u32b(chunk.len() as u32);
                 trun.u32b((moof_len + 8 + data.len()) as u32);
-                for s in &chunk {
+                for (k, s) in chunk.iter().enumerate() {
                     trun.u32b(s.duration);
                     trun.u32b(s.data.len() as u32);
-                    trun.u32b(if s.keyframe { 0x0200_0000 } else { 0x0101_0000 });
+                    let sync = if s.keyframe { 0x0200_0000 } else { 0x0101_0000 };
+                    trun.u32b(if x.sdtp.is_empty() { sync } else { (sync & !0x0FF0_0000) | dep(t, f * per + k) });
                     trun.u32b((s.pts - s.dts) as i32 as u32);
                     data.extend_from_slice(&s.data);
                 }
@@ -549,10 +589,70 @@ fn mp4_fragmented(tracks: &[MediaTrack], opts: &Mp4Options, movie_ts: u32, next_
         };
         let (probe, _) = build(0);
         let (moof, data) = build(probe.len());
+        frag_at.push(out.len());
         out.extend_from_slice(&moof);
         out.extend_from_slice(&bx(b"mdat", &data));
     }
-    out
+    let sidx = if x.sidx && !tracks.is_empty() { sidx_box(&tracks[0], per, &frag_at, out.len()) } else { Vec::new() };
+    let base = head.len() + sidx.len();
+    let mut file = cat(&[&head, &sidx, &out]);
+    if x.mfra {
+        let mfra = mfra_box(tracks, per, &frag_at, base);
+        file.extend_from_slice(&mfra);
+    }
+    file
+}
+
+/// DEMUXSEEK (SR200): a `sidx` (§8.16.3, version 1) over every fragment, the first track as the reference stream: one
+/// type-0 reference per moof+mdat, its duration the track's durations in that fragment, starts_with_SAP when its first
+/// sample is a sync sample, `first_offset` 0 (the fragments follow the box).
+fn sidx_box(t: &MediaTrack, per: usize, frag_at: &[usize], frags_len: usize) -> Vec<u8> {
+    let mut b = Vec::new();
+    b.u32b(t.spec.id);
+    b.u32b(t.spec.timescale);
+    b.u64b(t.samples.iter().map(|s| s.pts).min().unwrap_or(0).max(0) as u64);
+    b.u64b(0);
+    b.u16b(0);
+    b.u16b(frag_at.len() as u16);
+    for (f, &at) in frag_at.iter().enumerate() {
+        let end = frag_at.get(f + 1).copied().unwrap_or(frags_len);
+        let dur: u64 = t.samples.iter().skip(f * per).take(per).map(|s| s.duration as u64).sum();
+        b.u32b((end - at) as u32 & 0x7FFF_FFFF);
+        b.u32b(dur as u32);
+        let sap = t.samples.get(f * per).is_some_and(|s| s.keyframe);
+        b.u32b(if sap { 0x9000_0000 } else { 0 }); // starts_with_SAP + SAP_type 1 when the fragment opens on a sync sample
+    }
+    fbx(b"sidx", 1, 0, &b)
+}
+
+/// DEMUXSEEK (SR200): `mfra` (§8.8.9): a `tfra` per track (version 1, one-byte traf/trun/sample numbers) with an entry for
+/// the first sync sample of each fragment that holds one, then the `mfro` giving the `mfra`'s size.
+fn mfra_box(tracks: &[MediaTrack], per: usize, frag_at: &[usize], base: usize) -> Vec<u8> {
+    let mut body = Vec::new();
+    for t in tracks {
+        let mut entries: Vec<(u64, u64, u8)> = Vec::new();
+        for (f, &at) in frag_at.iter().enumerate() {
+            if let Some((k, s)) = t.samples.iter().skip(f * per).take(per).enumerate().find(|(_, s)| s.keyframe) {
+                entries.push((s.pts.max(0) as u64, (base + at) as u64, k as u8 + 1));
+            }
+        }
+        let mut b = Vec::new();
+        b.u32b(t.spec.id);
+        b.u32b(0); // length_size_of_traf_num / trun_num / sample_num all 0: one byte each
+        b.u32b(entries.len() as u32);
+        for (time, off, sample) in entries {
+            b.u64b(time);
+            b.u64b(off);
+            b.push(1);
+            b.push(1);
+            b.push(sample);
+        }
+        body.extend_from_slice(&fbx(b"tfra", 1, 0, &b));
+    }
+    let mut mfro = Vec::new();
+    mfro.u32b((8 + body.len() + 16) as u32);
+    body.extend_from_slice(&fbx(b"mfro", 0, 0, &mfro));
+    bx(b"mfra", &body)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -587,6 +687,9 @@ pub struct MkvOptions {
     /// VPLAYAUDIO (rmbp B475): > 0 writes the LAST audio block as a BlockGroup carrying this `DiscardPadding` (ns;
     /// RFC 9559 §5.1.3.5.6) — the Opus/Vorbis end trim inside Matroska.
     pub discard_last_ns: u64,
+    /// DEMUXSEEK (SR200): write a SeekHead first in the Segment pointing at Cues written after the Clusters — one CuePoint
+    /// per video keyframe block (CueTime, CueTrack, CueClusterPosition relative to the Segment's body).
+    pub cues: bool,
 }
 
 impl Default for MkvOptions {
@@ -602,6 +705,7 @@ impl Default for MkvOptions {
             lacing: Lacing::Xiph,
             duration: true,
             discard_last_ns: 0,
+            cues: false,
         }
     }
 }
@@ -748,7 +852,9 @@ pub fn mkv(tracks: &[MediaTrack], opts: &MkvOptions) -> Vec<u8> {
     let last_audio = blocks.iter().rposition(|b| tracks[b[0].track].spec.kind != TrackKind::Video);
     let per_cluster = if opts.cluster_blocks == 0 { 30 } else { opts.cluster_blocks };
     let mut clusters = Vec::new();
+    let mut cue_at: Vec<(u64, u32, usize)> = Vec::new(); // DEMUXSEEK (SR200): (block ticks, track id, cluster offset)
     for (gi, group) in blocks.chunks(per_cluster).enumerate() {
+        let cluster_at = clusters.len();
         let cluster_ticks = group.iter().map(|b| b[0].ns / scale as i64).min().unwrap_or(0).max(0);
         let mut body = el_uint(0xE7, cluster_ticks as u64);
         for (bi, b) in group.iter().enumerate() {
@@ -772,6 +878,9 @@ pub fn mkv(tracks: &[MediaTrack], opts: &MkvOptions) -> Vec<u8> {
             let video = t.spec.kind == TrackKind::Video;
             let use_group = opts.block_groups && video;
             let key = b.iter().all(|f| f.s.keyframe);
+            if opts.cues && video && key {
+                cue_at.push(((f0.ns / scale as i64).max(0) as u64, t.spec.id, cluster_at));
+            }
             let flags = lacing_bits | if key && !use_group && pad == 0 { 0x80 } else { 0 };
             blk.push(flags);
             if laced {
@@ -832,7 +941,23 @@ pub fn mkv(tracks: &[MediaTrack], opts: &MkvOptions) -> Vec<u8> {
             clusters.extend_from_slice(&el(0x1F43_B675, &body));
         }
     }
-    let seg_body = cat(&[&info, &tracks_el, &clusters]);
+    let seg_body = if opts.cues {
+        // SeekHead with an 8-byte SeekPosition: its size does not depend on where the Cues land.
+        let seek_head = |cues_pos: u64| -> Vec<u8> {
+            let seek = cat(&[&el(0x53AB, &[0x1C, 0x53, 0xBB, 0x6B]), &el(0x53AC, &cues_pos.to_be_bytes())]);
+            el(0x114D_9B74, &el(0x4DBB, &seek))
+        };
+        let lead = seek_head(0).len() + info.len() + tracks_el.len();
+        let mut cues = Vec::new();
+        for &(ticks, id, at) in &cue_at {
+            let pos = cat(&[&el_uint(0xF7, id as u64), &el_uint(0xF1, (lead + at) as u64)]);
+            cues.extend_from_slice(&el(0xBB, &cat(&[&el_uint(0xB3, ticks), &el(0xB7, &pos)])));
+        }
+        let cues = el(0x1C53_BB6B, &cues);
+        cat(&[&seek_head((lead + clusters.len()) as u64), &info, &tracks_el, &clusters, &cues])
+    } else {
+        cat(&[&info, &tracks_el, &clusters])
+    };
     let seg = if opts.unknown_size_segment { el_unknown(0x1853_8067, &seg_body) } else { el(0x1853_8067, &seg_body) };
     cat(&[&header, &seg])
 }

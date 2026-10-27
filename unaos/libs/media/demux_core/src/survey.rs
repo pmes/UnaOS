@@ -13,7 +13,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use crate::{Codec, Demuxer, Error, Format, Timebase, TrackKind};
+use crate::{Codec, DecodeTime, Demuxer, EditSegment, Error, Format, Timebase, TrackKind};
 
 /// One stream of a [`Survey`]. Times are in the stream's [`Timebase`] ticks unless named `_ns`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,12 +39,20 @@ pub struct StreamSurvey {
     pub frame_count: u64,
     /// The presentation times of the sync samples, ascending — the keyframe index.
     pub keyframes: Vec<i64>,
-    /// pts − dts of every sample, in decode order (MP4 `ctts` / `trun` less the edit shift; 0 in Matroska,
-    /// which stores no decode time).
+    /// pts − dts of every sample, in decode order (MP4 `ctts` / `trun` less the edit shift; in Matroska 0 while
+    /// [`StreamSurvey::decode_time`] is `Presentation`, the derived reorder once it is `Derived`).
     pub composition_offsets: Vec<i64>,
     /// The samples say decode order is not presentation order: some pts − dts is non-zero, or pts is not
     /// monotone in decode order. Read from the samples, never from the codec name.
     pub reordered: bool,
+    /// DEMUXSEEK (SR200): where the decode times come from — `Presentation` says dts = pts (a Matroska track no reorder
+    /// depth was given for), so the composition offsets carry no reorder fact.
+    pub decode_time: DecodeTime,
+    /// DEMUXSEEK (SR200): the file was opened by its index ([`Demuxer::open_indexed`]): `keyframes` are the index's points
+    /// for this stream, and `frame_count`, `first_pts`, `composition_offsets` and `reordered` cover the loaded spans only.
+    pub indexed: bool,
+    /// DEMUXSEEK (SR200): the stream's edit list, every entry ([`Demuxer::edit_list`]).
+    pub edits: Vec<EditSegment>,
 }
 
 /// The editor's probe of one file.
@@ -86,6 +94,10 @@ impl Demuxer {
                     prev_pts = Some(s.pts);
                     first_pts = Some(first_pts.map_or(s.pts, |f| f.min(s.pts)));
                 }
+                let indexed = self.indexed();
+                if indexed {
+                    keyframes = self.index().iter().filter(|x| x.track_index == ti).map(|x| t.timebase.from_ns(x.pts_ns)).collect();
+                }
                 keyframes.sort_unstable();
                 StreamSurvey {
                     track_index: ti,
@@ -100,10 +112,13 @@ impl Demuxer {
                     channels: t.channels,
                     first_pts: first_pts.unwrap_or(0),
                     duration_ns: t.duration_ns,
-                    frame_count: t.sample_count,
+                    frame_count: if self.indexed() { self.track_samples(ti).count() as u64 } else { t.sample_count },
                     keyframes,
                     composition_offsets,
                     reordered,
+                    decode_time: self.decode_time.get(ti).copied().unwrap_or(DecodeTime::Presentation),
+                    indexed,
+                    edits: self.edit_list(ti).to_vec(),
                 }
             })
             .collect();
