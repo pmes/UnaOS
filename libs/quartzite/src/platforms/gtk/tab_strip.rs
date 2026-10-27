@@ -8,8 +8,10 @@
 //! `aether::chrome::sidetabs::TabLayout`), read when the face is built and again on a `PrefChanged` for it on this
 //! bus or a change to the store's folder (the `a11y_prefs` lanes). A switch only shows one strip and hides the
 //! other: no tab, engine or page is touched. The side column ([`bootstrap_side_tabs`], a `GtkListBox` beside the
-//! content) is `SIDE_W` px wide or a `RAIL_W` px icon rail (its one toggle), one row per tab — the letter tile, the
-//! ellipsised title, a close box on hover, the active row selected in the accent — and a `+` row last; it scrolls.
+//! content) is `chrome_rows::SIDE_W` px wide or a `chrome_rows::RAIL_W` px icon rail (its one toggle), one row per
+//! tab — the letter tile, the ellipsised title, a close box on hover, the active row selected in the accent — and a
+//! `+` row last; it scrolls. ONETEXT (SR210): the rows, their verbs, the clip and the widths are
+//! `widgets/chrome_rows.rs`'s, the same ones the AppKit face reads.
 //! Ctrl+Shift+A opens the tab search (a title substring over the strip the shell last sent; picking one sends
 //! `BrowserTabSelect`).
 //!
@@ -32,17 +34,13 @@ use gtk4::{gdk, gio, glib};
 use gtk4::{Box, Button, Orientation, ScrolledWindow};
 
 use super::glyph::GlyphLabel;
+use crate::widgets::chrome_rows::{self, clip, SideRow, SIDE_LABEL_MAX};
 use crate::NativeView;
 use bandy::{BrowserTabGroupRow, BrowserTabRow, PrefValue, PrincipiaCommand, SMessage, Synapse};
 
 /// Principia's namespace and key for where the tabs stand (prefs_core `schema.rs`, docs/dev/PREFS-SCHEMA.md).
 pub const LAYOUT_NS: &str = "aether";
 pub const LAYOUT_KEY: &str = "tabs.layout";
-/// The side column's width open, and collapsed to the icon rail (`aether::chrome::sidetabs::{SIDE_W, RAIL_W}`).
-const SIDE_W: i32 = 240;
-const RAIL_W: i32 = 48;
-/// The longest title a side row shows, in characters.
-const SIDE_LABEL_MAX: usize = 26;
 
 /// The stored value means the side strip (`side`); anything else, and an unset row, is the top strip.
 pub fn layout_is_side(v: &str) -> bool {
@@ -127,17 +125,6 @@ const LABEL_MAX: usize = 24;
 
 fn short(label: &str) -> String {
     clip(label, LABEL_MAX)
-}
-
-/// `label` cut to `max` characters, the last an ellipsis.
-fn clip(label: &str, max: usize) -> String {
-    if label.chars().count() <= max {
-        label.to_string()
-    } else {
-        let mut s: String = label.chars().take(max - 1).collect();
-        s.push('…');
-        s
-    }
 }
 
 // ---- AETHERSIDETABS2 (SR143): the strip as the shell sends it, the favicons, the drag ----------------------------
@@ -523,14 +510,6 @@ pub fn bootstrap_tab_strip(synapse: Synapse) -> NativeView {
 
 // ---- AETHERSIDETABS (SR140, R118): the side column and the tab search -------------------------------------------
 
-/// What a side row stands for.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum SideRow {
-    Tab(u64),
-    Group(u64),
-    New,
-}
-
 /// One side row: the group's stripe, the favicon or the letter tile, the title (hidden on the rail), and the close
 /// box (shown while hovered).
 fn side_row(t: &BrowserTabRow, group: Option<&BrowserTabGroupRow>, rail: bool, synapse: &Synapse) -> gtk4::Widget {
@@ -611,44 +590,42 @@ fn group_row(g: &BrowserTabGroupRow, count: usize, rail: bool, synapse: &Synapse
 fn fill_side(list: &gtk4::ListBox, ids: &RefCell<Vec<SideRow>>, rail: bool, synapse: &Synapse) {
     let s = LAST.with(|l| l.borrow().clone());
     list.remove_all();
-    let mut v = Vec::with_capacity(s.tabs.len() + s.groups.len() + 1);
+    // ONETEXT (SR210): the walk is chrome_rows' (`TabStrip::rows` over the wire); this face only builds each row.
+    let rows = chrome_rows::side_rows(s.active, &s.tabs, &s.groups);
     let mut sel = None;
-    let mut cur: Option<u64> = None;
-    for t in &s.tabs {
-        if t.group != cur {
-            cur = t.group;
-            if let Some(g) = cur.and_then(|g| s.group(g)) {
-                let count = s.tabs.iter().filter(|x| x.group == Some(g.id)).count();
-                list.append(&group_row(g, count, rail, synapse));
-                v.push(SideRow::Group(g.id));
+    for (k, r) in rows.iter().enumerate() {
+        match r {
+            SideRow::Group { id, count, .. } => {
+                if let Some(g) = s.group(*id) {
+                    list.append(&group_row(g, *count, rail, synapse));
+                }
+            }
+            SideRow::Tab { id, active, .. } => {
+                let Some(t) = s.tabs.iter().find(|t| t.id == *id) else { continue };
+                if *active {
+                    sel = Some(k as i32);
+                }
+                list.append(&side_row(t, t.group.and_then(|g| s.group(g)), rail, synapse));
+            }
+            SideRow::New => {
+                let plus = Box::new(Orientation::Horizontal, 8);
+                plus.set_margin_start(6);
+                plus.set_margin_top(4);
+                plus.set_margin_bottom(4);
+                plus.append(&GlyphLabel::new(if rail { "+" } else { "+   New tab" }));
+                plus.set_tooltip_text(Some("New tab (Ctrl+T)"));
+                {
+                    let syn = synapse.clone();
+                    drop_target(&plus, move |id| {
+                        let to = LAST.with(|l| l.borrow().tabs.len()) as u32;
+                        syn.fire(SMessage::BrowserTabMove { id, to });
+                    });
+                }
+                list.append(&plus);
             }
         }
-        let g = t.group.and_then(|g| s.group(g));
-        if g.is_some_and(|g| g.collapsed) {
-            continue;
-        }
-        if t.id == s.active {
-            sel = Some(v.len() as i32);
-        }
-        list.append(&side_row(t, g, rail, synapse));
-        v.push(SideRow::Tab(t.id));
     }
-    let plus = Box::new(Orientation::Horizontal, 8);
-    plus.set_margin_start(6);
-    plus.set_margin_top(4);
-    plus.set_margin_bottom(4);
-    plus.append(&GlyphLabel::new(if rail { "+" } else { "+   New tab" }));
-    plus.set_tooltip_text(Some("New tab (Ctrl+T)"));
-    {
-        let syn = synapse.clone();
-        drop_target(&plus, move |id| {
-            let to = LAST.with(|l| l.borrow().tabs.len()) as u32;
-            syn.fire(SMessage::BrowserTabMove { id, to });
-        });
-    }
-    list.append(&plus);
-    v.push(SideRow::New);
-    *ids.borrow_mut() = v;
+    *ids.borrow_mut() = rows;
     match sel.and_then(|k| list.row_at_index(k)) {
         Some(row) => {
             list.select_row(Some(&row));
@@ -662,7 +639,7 @@ fn fill_side(list: &gtk4::ListBox, ids: &RefCell<Vec<SideRow>>, rail: bool, syna
 pub fn bootstrap_side_tabs(synapse: Synapse, content: &impl IsA<gtk4::Widget>) -> NativeView {
     let body = Box::new(Orientation::Horizontal, 0);
     let column = Box::new(Orientation::Vertical, 0);
-    column.set_size_request(SIDE_W, -1);
+    column.set_size_request(chrome_rows::SIDE_W as i32, -1);
     column.add_css_class("sidebar");
     let rail = Rc::new(Cell::new(false));
     let toggle = Button::new();
@@ -691,12 +668,9 @@ pub fn bootstrap_side_tabs(synapse: Synapse, content: &impl IsA<gtk4::Widget>) -
         let (ids, syn) = (ids.clone(), synapse.clone());
         list.connect_row_activated(move |_, row| {
             let i = row.index();
-            let what = if i >= 0 { ids.borrow().get(i as usize).copied() } else { None };
-            match what {
-                Some(SideRow::Tab(id)) => syn.fire(SMessage::BrowserTabSelect(id)),
-                Some(SideRow::Group(g)) => syn.fire(SMessage::BrowserTabGroupToggle(g)),
-                Some(SideRow::New) => syn.fire(SMessage::BrowserTabNew),
-                None => {}
+            let verb = if i >= 0 { ids.borrow().get(i as usize).map(|r| chrome_rows::row_verb(r, false)) } else { None };
+            if let Some(m) = verb {
+                syn.fire(m);
             }
         });
     }
@@ -709,7 +683,7 @@ pub fn bootstrap_side_tabs(synapse: Synapse, content: &impl IsA<gtk4::Widget>) -
         toggle.connect_clicked(move |b| {
             let now = !rail.get();
             rail.set(now);
-            column.set_size_request(if now { RAIL_W } else { SIDE_W }, -1);
+            column.set_size_request((if now { chrome_rows::RAIL_W } else { chrome_rows::SIDE_W }) as i32, -1);
             b.set_child(Some(&GlyphLabel::new(if now { "»" } else { "«" })));
             b.set_halign(if now { gtk4::Align::Center } else { gtk4::Align::End });
             b.set_tooltip_text(Some(if now { "Expand the tabs" } else { "Collapse the tabs to icons" }));

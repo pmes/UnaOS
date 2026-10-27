@@ -8,6 +8,11 @@
 //! the verb a row's click fires, the label clip, the find count, the status line and a download row's text and
 //! fraction. Quartzite does not link `aether`; the side column's widths are mirrored here and a host KAT in
 //! aether-shell holds them equal to `aether::chrome::sidetabs`.
+//!
+//! ONETEXT (SR210): the GTK face reads it too (`platforms/gtk/tab_strip.rs` `fill_side` walks [`side_rows`] and
+//! fires [`row_verb`], with [`clip`], [`SIDE_W`], [`RAIL_W`] and [`SIDE_LABEL_MAX`]; `platforms/gtk/image_view.rs`
+//! `bootstrap_page_view` takes [`find_msg`], [`find_count`], [`download_text`] and [`download_fraction`]): these
+//! widths are the one face copy, and no face keeps a second walk or a second text.
 
 use bandy::{BrowserTabGroupRow, BrowserTabRow, SMessage};
 
@@ -16,7 +21,7 @@ use bandy::{BrowserTabGroupRow, BrowserTabRow, SMessage};
 pub const SIDE_W: u32 = 240;
 pub const RAIL_W: u32 = 48;
 pub const ROW_H: u32 = 32;
-/// The longest title a side row shows, in characters (the GTK side column's `SIDE_LABEL_MAX`).
+/// The longest title a side row shows, in characters (both faces' side column).
 pub const SIDE_LABEL_MAX: usize = 26;
 
 /// One row of the side column, in the order the model's `TabStrip::rows` gives.
@@ -203,5 +208,45 @@ mod tests {
         assert_eq!(download_fraction(5, Some(0), false, false), None);
         assert_eq!(download_fraction(5, None, true, false), Some(1.0));
         assert_eq!(download_fraction(5, Some(10), true, true), Some(0.0));
+    }
+
+    /// ONETEXT (SR210): the edges the GTK face's own copies carried, held on the one copy both faces now read.
+    #[test]
+    fn chrome_rows_gtk_edges_kat() {
+        let ids = |rows: &[SideRow]| -> Vec<String> {
+            rows.iter()
+                .map(|r| match r {
+                    SideRow::Group { id, count, .. } => format!("g{id}:{count}"),
+                    SideRow::Tab { id, active: true, .. } => format!("*t{id}"),
+                    SideRow::Tab { id, .. } => format!("t{id}"),
+                    SideRow::New => "+".into(),
+                })
+                .collect()
+        };
+        // A tab naming a group the wire does not carry: shown, no header (GTK drew no stripe for it).
+        let rows = side_rows(1, &[tab(1, "a", Some(99))], &[grp(7, "w", false)]);
+        assert_eq!(ids(&rows), ["*t1", "+"]);
+        assert!(matches!(rows[0], SideRow::Tab { grouped: true, .. }));
+        // A group split into two runs: a header at each run, each the group's whole count; an empty group: none.
+        let tabs = [tab(1, "a", Some(7)), tab(2, "b", None), tab(3, "c", Some(7))];
+        assert_eq!(ids(&side_rows(2, &tabs, &[grp(7, "w", false), grp(8, "empty", false)])), ["g7:2", "t1", "*t2", "g7:2", "t3", "+"]);
+        // The active tab inside a collapsed group: no row is marked (the GTK column unselects).
+        assert_eq!(ids(&side_rows(3, &tabs, &[grp(7, "w", true)])), ["g7:2", "t2", "g7:2", "+"]);
+        // The clip at the GTK widths: the boundary, multibyte titles, the top strip's 24.
+        assert_eq!(clip("abcd", 4), "abcd");
+        assert_eq!(clip("abcde", 4), "abc…");
+        assert_eq!(clip("ééééé", 3), "éé…");
+        assert_eq!(clip(&"x".repeat(30), 24).chars().count(), 24);
+        assert_eq!(clip(&"y".repeat(SIDE_LABEL_MAX), SIDE_LABEL_MAX), "y".repeat(SIDE_LABEL_MAX));
+        // human_bytes at the unit edges and the GB cap.
+        assert_eq!(human_bytes(0), "0 B");
+        assert_eq!(human_bytes(1000), "1.0 KB");
+        assert_eq!(human_bytes(999_999), "1000.0 KB");
+        assert_eq!(human_bytes(5_000_000_000_000), "5000.0 GB");
+        // The GTK bar: a failure before the end keeps the byte fraction (failed = done && error); after it, empty.
+        assert_eq!(download_fraction(5, Some(10), false, false), Some(0.5));
+        assert_eq!(download_fraction(5, Some(10), true, true), Some(0.0));
+        assert_eq!(download_fraction(15, Some(10), false, false), Some(1.0));
+        assert_eq!(download_text("f", 5, Some(10), false, Some("io")), "f — failed: io");
     }
 }
