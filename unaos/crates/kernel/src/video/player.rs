@@ -1114,7 +1114,7 @@ mod vid {
         let audio = if busy && st.playing && pos != u64::MAX && pos > 0 { Some(st.base_ms + pos) } else { None };
         let (w, oy) = (st.w, st.oy);
         let (shown, clock) = if st.err.is_none() { vplay::present(&mut st.surf, w, oy, audio, st.playing) } else { (false, st.shown_ms) };
-        dirty |= shown;
+        dirty |= shown; let band = if shown || st.err.is_some() { None } else { vplay::band_repaint(&mut st.surf, w, oy) }; // NLE6DRAGSNAP (rmbp-ledger B977): no frame this pass: the EDL's view band repainted when a drag marked it (vplay.rs tail)
         let mut controls = false;
         if st.playing && st.vsaid && st.err.is_none() && vplay::finished() && !busy {
             st.playing = false;
@@ -1134,7 +1134,7 @@ mod vid {
         if controls {
             paint(st);
         }
-        if dirty || controls {
+        if let (false, false, Some((y0, y1))) = (dirty, controls, band) { drop(g); let _ = wm::present_rows(id, y0, y1); return; } if dirty || controls { // NLE6DRAGSNAP (rmbp-ledger B977): a band-only repaint presents its rows alone
             drop(g);
             let _ = wm::present(id);
         }
@@ -1789,15 +1789,17 @@ mod nle_fx {
     // window hit and the capture seam, which a headless test does not hold) drags the clip body +3 ticks (`move_clip(0, 0, 0,
     // 3)`), then its out handle -5 ticks (`trim_out(0, 0, 15)`); after each the Player's editor timeline must be that op applied
     // by hand, and the saved file is `DRAG_EDL`, pinned on the host by timeline_core `view::drag_tests::kernel_drag_pin` through
-    // the SAME `view::Drag` and `edl::write`.
-    const DRAG_EDL: &str = "TITLE: NLEDRG\nFCM: NON-DROP FRAME\n* UNA FPS 25\n* UNA SOURCE NLEFXA 00:00:01:15\n\n001  NLEFXA   V     C        00:00:00:00 00:00:00:15 00:00:00:03 00:00:00:18\n";
+    // the SAME `view::Drag` and `edl::write`. NLE6DRAGSNAP (rmbp-ledger B977): the press snaps, so NLEDRG.EDL carries a second
+    // clip (NLEFXA 20..30 at 30) and a third drag, a body press at `x_of(5) + 1` moved +94 px (a raw 11 ticks), lands the first
+    // clip's out edge 2 px short of the second's `at` 30 and snaps to it: `move_clip(0, 0, 0, 15)`, `snapped=edge`.
+    const DRAG_EDL: &str = "TITLE: NLEDRG\nFCM: NON-DROP FRAME\n* UNA FPS 25\n* UNA SOURCE NLEFXA 00:00:01:15\n\n001  NLEFXA   V     C        00:00:00:00 00:00:00:15 00:00:00:15 00:00:01:05\n002  NLEFXA   V     C        00:00:00:20 00:00:01:05 00:00:01:05 00:00:01:15\n";
 
     /// The drag leg's verdict and its wire word (`ok`, `FAIL`); the detail line always.
     fn drag_leg(dir: &str, put: &dyn Fn(&str, &[u8]) -> bool) -> (bool, &'static str) {
         let mut tl = Timeline::new(FPS);
         let a = tl.add_source(REELS[0], FRAMES as i64);
         tl.add_track(Kind::Video);
-        tl.tracks[0].clips = alloc::vec![Clip::new(a, 0, 20, 0)];
+        tl.tracks[0].clips = alloc::vec![Clip::new(a, 0, 20, 0), Clip::new(a, 20, 30, 30)];
         let path = alloc::format!("{}/NLEDRG.EDL", dir);
         let wrote = timeline_core::edl::write(&tl, "NLEDRG").map(|t| put(&path, t.as_bytes())).unwrap_or(false);
         let Some(id) = (if wrote { super::open(&path).ok() } else { None }) else {
@@ -1822,13 +1824,18 @@ mod nle_fx {
         };
         let want_move = tl.move_clip(0, 0, 0, 3).ok();
         let want_trim = want_move.as_ref().and_then(|t| t.trim_out(0, 0, 15).ok());
+        let want_snap = want_trim.as_ref().and_then(|t| t.move_clip(0, 0, 0, 15).ok());
         let mut drags = 0usize;
         if let Some((y0, l)) = band {
             let z = l.zoom as isize;
-            let y = y0 + (l.row_y(0) + timeline_core::view::ROW_H as i64 / 2) as usize;
-            let body = (l.x_of(5) + l.zoom as i64 / 2) as usize;
-            let edge = (l.x_of(23) - 2) as usize;
-            for (x, dx, w) in [(body, 3 * z, &want_move), (edge, -5 * z, &want_trim)] {
+            for (step, w) in [(0usize, &want_move), (1, &want_trim), (2, &want_snap)] {
+                let (y0, l) = vplay::band_layout(&path).unwrap_or((y0, l));
+                let y = y0 + (l.row_y(0) + timeline_core::view::ROW_H as i64 / 2) as usize;
+                let (x, dx) = match step {
+                    0 => ((l.x_of(5) + l.zoom as i64 / 2) as usize, 3 * z),
+                    1 => ((l.x_of(23) - 2) as usize, -5 * z),
+                    _ => ((l.x_of(5) + 1) as usize, 94),
+                };
                 let pressed = super::edit_press_at(x, y);
                 let to = (x as isize + dx).max(0) as usize;
                 super::edit_motion_at(to, y);
@@ -1841,9 +1848,9 @@ mod nle_fx {
         }
         let saved_ok = vplay::read_all(&path).ok().as_deref() == Some(DRAG_EDL.as_bytes());
         super::close("fixture");
-        let ok = tab && drags == 2 && saved_ok;
+        let ok = tab && drags == 3 && saved_ok;
         serial_println!(
-            "[nle] fixture drag path={} drags={}/2 saved={} tab={} band={} -> {}",
+            "[nle] fixture drag path={} drags={}/3 saved={} tab={} band={} -> {}",
             path, drags, if saved_ok { "ok" } else { "FAIL" }, if tab { "ok" } else { "FAIL" }, band.is_some() as u8, if ok { "ok" } else { "FAIL" }
         );
         (ok, if ok { "ok" } else { "FAIL" })
