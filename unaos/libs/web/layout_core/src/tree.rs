@@ -1209,12 +1209,14 @@ pub(crate) fn is_inline_level<H: Host>(tree: &LayoutTree<H>, id: taffy::NodeId) 
 /// anonymous block boxes. Only containers holding a child whose cascaded
 /// type contradicts its tag are touched; anonymous boxes count as block,
 /// so a second pass finds nothing to do.
+/// AETHERCELLBLOCKIFY (SR447): a td / th is a block container (CSS 2.2 §17.4, the builder's `table_container`), so
+/// it is re-derived too; only the table-structure parts keep the skip (their children are laid out by table rules).
 fn fix_display_contexts<H: Host>(tree: &mut LayoutTree<H>) {
     let ids: Vec<taffy::NodeId> = tree.node_map.keys().copied().collect();
     for id in ids {
         let Some(n) = tree.node_map.get(&id) else { continue };
         let Some(tag) = n.tag() else { continue };
-        if is_table_part(&tag) {
+        if is_table_part(&tag) && !matches!(tag.as_str(), "td" | "th") {
             continue;
         }
         if tree.paint_map.get(&id).and_then(|p| p.flex_container) == Some(true) {
