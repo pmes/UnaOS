@@ -1511,17 +1511,22 @@ impl XhciController {
                 all[0..4].copy_from_slice(&(if total > u32::MAX as usize { u32::MAX } else { total as u32 }).to_le_bytes());
                 let mps = OUT_MPS.load(Ordering::Relaxed) as usize;
                 let (mut sent, mut n) = (first, codec::HDR + first);
+                let mut ty = YieldTally::default(); // XHCILOANPTPYIELDOUT (Z94): this send's yields, Z73's tally
                 loop {
                     let last = sent >= data.len();
                     self.ptp_xfer(slot, false, phys, n, last && mps != 0 && total % mps == 0)?;
                     if last {
                         break;
                     }
+                    ty.step(self)?; // XHCILOANPTPYIELDOUT (Z94): Z73's ONE yield point, between two TDs of the Out data phase (nothing armed; the next chunk is copied after the re-take)
                     let k = (data.len() - sent).min(XFER_MAX);
                     let all = unsafe { core::slice::from_raw_parts_mut(buf, XFER_MAX) };
                     all[..k].copy_from_slice(&data[sent..sent + k]);
                     sent += k;
                     n = k;
+                }
+                if data.len() > (8 << 20) {
+                    ty.say("ptp-out"); // XHCILOANPTPYIELDOUT (Z94): Z73's line for a send (SendObject's data phase)
                 }
             }
             Phase::In { cap, into } => {
@@ -1545,7 +1550,7 @@ impl XhciController {
                 let mut got = n as u64;
                 let mut short = n < XFER_MAX;
                 let mps = (IN_MPS.load(Ordering::Relaxed) as usize).max(64);
-                let (mut yn, mut yt, mut ymax) = (0u32, 0u32, 0u64); let mut yp = 0u32; let mut yq = 0u32; // XHCILOANPTPYIELDPTPTAKE (Z87): `yq` = windows a second PTP claim's take closed. XHCILOANPTPYIELDPOLLTAKE (Z82): `yp` = windows the xhci-poll take closed. XHCILOANPTPYIELD (Z73): this transfer's yields, windows taken, the longest
+                let mut ty = YieldTally::default(); // XHCILOANPTPYIELDOUT (Z94): Z73's tally (yields, windows taken, Z82's poll closes, Z87's PTP closes, the longest), shared with the Out arm
                 while !short && (unknown || got < total) {
                     let want = if unknown {
                         XFER_MAX
@@ -1560,15 +1565,11 @@ impl XhciController {
                     short = k < want;
                     if !short && (unknown || got < total) {
                         // XHCILOANPTPYIELD (Z73): the ONE yield point — between two TDs of the data phase (nothing armed).
-                        if let Some((us, t)) = loan_yield(self, false)? {
-                            yn += 1;
-                            yt += t as u32; yp += (t && crate::drivers::block::xhci_loan_yield_closed_by_poll()) as u32; yq += (t && crate::drivers::block::xhci_loan_yield_closed_by_ptp()) as u32; // XHCILOANPTPYIELDPTPTAKE (Z87): and the PTP closes. XHCILOANPTPYIELDPOLLTAKE (Z82): the window's closer, recorded at the take
-                            ymax = ymax.max(us);
-                        }
+                        ty.step(self)?; // XHCILOANPTPYIELDOUT (Z94): Z73's `loan_yield` and its accrual, in `YieldTally::step`
                     }
                 }
                 if got > (8 << 20) {
-                    serial_println!("[xhci] loan yield who=ptp n={} taken={} taken_poll={}{} waited_us={} yield_skips={}{} (XHCILOANPTPYIELD Z73)", yn, yt.saturating_sub(yp).saturating_sub(yq), yp, if yq > 0 { alloc::format!(" taken_ptp={}", yq) } else { String::new() }, ymax, super::pump_yield_skips(), crate::drivers::block::PollSkips); // XHCILOANPTPYIELDPTPTAKE (Z87): ` taken_ptp=<n>` only when a second PTP claim closed a window (byte-identical at 0). XHCILOANPTPYIELDPOLLTAKE (Z82): taken= the block claimants served, taken_poll= the xhci-poll closes. XHCILOANPTPYIELDPOLLSKIP (Z86): ` poll_skips=<n>` only when the poller was refused in a window
+                    ty.say("ptp"); // XHCILOANPTPYIELDOUT (Z94): Z73's line, byte-identical (`who=ptp`)
                 }
                 if !unknown && got < total {
                     return Err("data phase short");
@@ -2130,4 +2131,32 @@ pub fn selftest() {
         stream,
         if pass { "PASS" } else { "FAIL" }
     );
+}
+
+/// XHCILOANPTPYIELDOUT (zenbook-ledger Z94): one data phase's yield tally — Z73's ONE yield point (`loan_yield`, so
+/// `BlockLoan::yield_due` / `yield_now`, the same window and counters) and its accrual, shared by `ptp_txn_inner`'s In
+/// loop and SendObject's Out loop; `say` is Z73's line, `who=ptp` (In, byte-identical) or `who=ptp-out` (a send).
+#[derive(Default)]
+struct YieldTally {
+    n: u32,
+    t: u32,
+    p: u32,
+    q: u32,
+    max: u64,
+}
+
+impl YieldTally {
+    /// Between two TDs (nothing armed): yield when one is due. `Err` = the loan was not re-taken (`loan_yield`'s).
+    fn step(&mut self, c: &mut XhciController) -> Result<(), &'static str> {
+        if let Some((us, t)) = loan_yield(c, false)? {
+            self.n += 1;
+            self.t += t as u32; self.p += (t && crate::drivers::block::xhci_loan_yield_closed_by_poll()) as u32; self.q += (t && crate::drivers::block::xhci_loan_yield_closed_by_ptp()) as u32; // XHCILOANPTPYIELDPTPTAKE (Z87): and the PTP closes. XHCILOANPTPYIELDPOLLTAKE (Z82): the window's closer, recorded at the take
+            self.max = self.max.max(us);
+        }
+        Ok(())
+    }
+
+    fn say(&self, who: &str) {
+        serial_println!("[xhci] loan yield who={} n={} taken={} taken_poll={}{} waited_us={} yield_skips={}{} (XHCILOANPTPYIELD Z73)", who, self.n, self.t.saturating_sub(self.p).saturating_sub(self.q), self.p, if self.q > 0 { alloc::format!(" taken_ptp={}", self.q) } else { String::new() }, self.max, super::pump_yield_skips(), crate::drivers::block::PollSkips); // XHCILOANPTPYIELDPTPTAKE (Z87): ` taken_ptp=<n>` only when a second PTP claim closed a window (byte-identical at 0). XHCILOANPTPYIELDPOLLTAKE (Z82): taken= the block claimants served, taken_poll= the xhci-poll closes. XHCILOANPTPYIELDPOLLSKIP (Z86): ` poll_skips=<n>` only when the poller was refused in a window
+    }
 }
