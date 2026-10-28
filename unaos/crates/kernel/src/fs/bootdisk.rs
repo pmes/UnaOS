@@ -1295,7 +1295,7 @@ fn unafs_state(_src: BlockSource) -> &'static str {
             return "absent";
         }
         // The disk HAS a volume. Force the shared bind, then ask which disk it settled on.
-        let _ = crate::fs::unafs::with_unafs(|_| ());
+        let _ = crate::fs::unafs::bind_now();
         match crate::fs::unafs::mount_bound_handle() {
             Some(h) if h == handle => "present",
             _ => "present-on-other-handle",
