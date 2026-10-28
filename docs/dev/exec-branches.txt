@@ -1211,7 +1211,7 @@ refs/heads/exec-rmbp-aethercoloruaedges   0a521ea8f FOLDED-BY-HAND (this commit)
 refs/heads/exec-rmbp-preemptoffarmsleepcheckyieldsite   93f9a08e7 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-gen7r8door   d945f3948 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-xhciloanptpyieldwaitcount   6ab4fe420 FOLDED-BY-HAND (this commit) 2026-10-27
-refs/heads/exec-rmbp-preemptoffarmcastsnowinpassleg   a311ee381 IN-FLIGHT cut 2026-10-28
+refs/heads/exec-rmbp-preemptoffarmcastsnowinpassleg   88a4e1d05 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-gen7r8doorkat   a311ee381 IN-FLIGHT cut 2026-10-28
 refs/heads/exec-rmbp-gen7r8dooredge   ae93a6848 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-aetherfileuaedges   a311ee381 IN-FLIGHT cut 2026-10-28

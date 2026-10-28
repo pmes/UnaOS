@@ -695,7 +695,7 @@ pub(super) fn occluder_box(r: &Window, shell: u32, focus: u64) -> (usize, usize,
 /// A copy of the published casts (one short hold: preempt-off with PSTATE.I as the caller had it on aarch64 (`casts_span`),
 /// the mask elsewhere; no aarch64 ISR takes CASTS, so a fill on an interrupt path never spins on a holder it preempted).
 pub fn casts_now() -> Casts {
-    let _span = casts_span(); // PREEMPTOFFARMCASTSNOW (zenbook-ledger Z99): the copy-out takes the SAME span as `track`'s publish (`casts_span`, file tail): nested under COMPGATE in pass, the outermost take out of pass (`bg_expect`, tests.rs); was `IrqMask::new()`. LINE-NEUTRAL
+    let _span = casts_span(); #[cfg(all(target_arch = "aarch64", feature = "witness"))] let _span = crate::arch::sched::preemptoff::casts_now_nest(_span); // PREEMPTOFFARMCASTSNOWINPASSLEG (zenbook-ledger Z109): under witness on aarch64 the copy-out's hold is moved into `preemptoff::casts_now_nest` (Z106's wrapper over its second word), which reads the count inside and after it for the audit's `casts_now_nest=` leg when armed (one relaxed load otherwise). PREEMPTOFFARMCASTSNOW (zenbook-ledger Z99): the copy-out takes the SAME span as `track`'s publish (`casts_span`, file tail): nested under COMPGATE in pass, the outermost take out of pass (`bg_expect`, tests.rs); was `IrqMask::new()`. LINE-NEUTRAL
     *CASTS.lock()
 }
 
