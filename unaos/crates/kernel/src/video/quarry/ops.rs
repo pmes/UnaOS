@@ -1191,7 +1191,7 @@ pub fn restore_refusal(e: &::unafs::fs::FileSystemError) -> Option<&'static str>
 pub fn restore_refused_now(path: &str) -> Option<&'static str> {
     let _np = native_path(path)?;
     #[cfg(any(target_arch = "aarch64", feature = "unafs"))]
-    if crate::fs::unafs::with_unafs(|fs| fs.read_only()).ok() == Some(true) {
+    if crate::fs::unafs::with_unafs_read(|fs| fs.read_only()).ok() == Some(true) {
         return Some(REFUSED_READONLY);
     }
     None
