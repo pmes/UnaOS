@@ -297,6 +297,11 @@ fi
 # Its caller is the registration folded onto `ensure_fpu`'s line under `#[cfg(feature = "tickless")]` inside that fn's
 # `#[cfg(target_arch = "x86_64")]` block, and `ensure_fpu` is called unconditionally by `tests::shell_verb` — so no
 # second knob (rule 7(a)); cond `@arch:x86_64` names the arch gate. unmeasured-here: the seat's fold measures it.
+#
+# `lockreg_census` (LOCKREGXCORECOSTKNOB, rmbp-ledger B1075): token `[lockreg] xcore walks=`, the piece before the first hole
+# of `xcost_say`'s armed line (sync.rs `mod reg`, x86_64; behind `const CENSUS = cfg!(feature = "lockreg_census")`, the off
+# arm returns first with `census=off`); it occurs exactly once in crates/ + libs/. Caller chain `selftest` <- `tests lockreg`
+# <- `ensure_tests` <- stackguard.rs `arm` (unconditional on x86), so cond `@arch:x86_64`. unmeasured-here: the seat's fold measures it.
 # ---------------------------------------------------------------------------------------------
 bc_table() {
 cat <<'TABLE'
@@ -321,6 +326,7 @@ bt|vendor-classed: RF/Bluetooth subclass+protocol|-|measured
 btc|REACHED — a BR/EDR link was established|-|measured
 a2dp|usage: bt audio <aa:bb:cc:dd:ee:ff|-|unmeasured-here
 tickless|[tick] core=|@arch:x86_64|unmeasured-here
+lockreg_census|[lockreg] xcore walks=|@arch:x86_64|unmeasured-here
 smolnet|:: SOCK-1: smoltcp icmp echo|-|measured(1)
 wifi|:: wifi: firmware NOT staged — no program-source block device; searched|-|measured
 wifi2|:: wifi2: upload NOT ATTEMPTED uploaded-bytes=|-|measured
