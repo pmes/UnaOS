@@ -1206,7 +1206,7 @@ refs/heads/exec-rmbp-gen7parkr8   77cb3aa6f FOLDED-BY-HAND (this commit) 2026-10
 refs/heads/exec-rmbp-aethercaptionface   77e07a58c IN-FLIGHT cut 2026-10-28
 refs/heads/exec-rmbp-retiredrainblitkat   5716421d6 IN-FLIGHT cut 2026-10-28
 refs/heads/exec-rmbp-gen7parkunarmedlive   9e55027cd FOLDED-BY-HAND (this commit) 2026-10-27
-refs/heads/exec-rmbp-preemptoffarmcastsinpassleg   5716421d6 IN-FLIGHT cut 2026-10-28
+refs/heads/exec-rmbp-preemptoffarmcastsinpassleg   bb27d06a8 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-aethercoloruaedges   5716421d6 IN-FLIGHT cut 2026-10-28
 refs/heads/exec-rmbp-preemptoffarmsleepcheckyieldsite   d1acac0aa IN-FLIGHT cut 2026-10-28
 refs/heads/exec-rmbp-gen7r8door   d1acac0aa IN-FLIGHT cut 2026-10-28
