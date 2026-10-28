@@ -305,7 +305,7 @@ pub unsafe fn bcs_job(bar0: usize, bar0_size: usize, src: Plane, dst: Plane, rec
     out.bcs_us = kb::cycles_to_us(cyc);
 
     // ---- unwind the window: only behind a quiesced engine (GEN7PARKUNWIND B1073: `window_unwind`, file tail) ----------
-    out.ptes_restored = window_unwind(bar0, win, base_img, all_disabled, !out.disabled && (out.idle || !out.armed)); // GEN7PARKUNARMEDLIVE (B1080): the unarmed stuck candidate keeps in the same class. GEN7PARKNODEMOTE (B1077): stuck = armed, drained, RING_CTL not clear (`held_kept=blit:ring-ctl-stuck`). the PTE restore + read-back + flush, then B1039's ONE release under PAGES
+    out.ptes_restored = window_unwind(bar0, win, base_img, all_disabled, !out.disabled); // GEN7PARKWORD (B1087): stuck = RING_CTL read back set after the disable write, any HEAD (`park_class`, file tail). GEN7PARKUNARMEDLIVE (B1080): the unarmed stuck candidate keeps in the same class. GEN7PARKNODEMOTE (B1077): stuck = armed, drained, RING_CTL not clear (`held_kept=blit:ring-ctl-stuck`). the PTE restore + read-back + flush, then B1039's ONE release under PAGES
     clflush_range(dst.va, dst.len); // the CPU reads what the engine wrote, not a stale line
     if !all_disabled { // GEN7PARKUNARMEDLIVE (B1080): the armed stall/stuck set plus the unarmed stuck break; Park.tail stays the job's computed TAIL (>= 0x40) so `park_quiesced` never passes a dark read
         // GEN7PARKUNWIND (B1073): the stalled window rides the engine lock's payload for `park_unwind` (file tail)
@@ -654,7 +654,7 @@ unsafe fn window_unwind(bar0: usize, win: usize, base_img: u32, quiesced: bool, 
         ptes_restored = (0..win).all(|k| rd(bar0, slot(k)) == base_img) && rd(bar0, prev_off) == base_img && rd(bar0, next_off) == base_img;
         wr(bar0, GFX_FLSH, 1); crate::drivers::gpu::gen7::assert_no_slot_held("blit-unmap"); // GEN7SLOTNOHOLD (B1047): no slot guard live across this GPU op
     }
-    crate::drivers::gpu::gen7::held_release_kept(&crate::drivers::gpu::gen7::BLIT_RING_HELD, "blit", quiesced, ptes_restored, if stuck { "ring-ctl-stuck" } else { "ring-not-disabled" }); // GEN7PARKNODEMOTE (B1077): the keep's word by class. GEN7HELDRELEASE (B1039): the ONE release
+    crate::drivers::gpu::gen7::held_release_kept(&crate::drivers::gpu::gen7::BLIT_RING_HELD, "blit", quiesced, ptes_restored, park_class(quiesced, stuck)); // GEN7PARKWORD (B1087): the keep's word from the one class fn (file tail). GEN7PARKNODEMOTE (B1077): the keep's word by class. GEN7HELDRELEASE (B1039): the ONE release
     ptes_restored
 }
 
@@ -682,15 +682,31 @@ pub(super) fn park_unwind() {
     if quiesced {
         *engine = None;
     }
-    let why = if quiesced {
-        "-"
-    } else if ctl & 1 != 0 {
-        "ring-live"
-    } else {
-        "ring-not-drained"
-    };
+    let why = park_class(quiesced, ctl & 1 != 0); // GEN7PARKWORD (B1087): the reason is the keep's own word (file tail)
     serial_println!(
         "[gen7blit] park unwind cand={} ctl={:08X} head={:08X} tail={:08X} quiesced={} regs_restored={} ptes_restored={} -> {} reason={} held_kb={}",
         cand, ctl, head, p.tail, quiesced as u8, regs as u8, ptes as u8, if quiesced { "unwound" } else { "kept" }, why, super::held_kb()
     );
+}
+
+// =================================================================================
+// GEN7PARKWORD (rmbp-ledger B1087) — FILE-TAIL append. GEN7PARKNODEMOTE (B1077) owed GEN7-PARK-WORD: the park keep
+// and `park_unwind`'s reason named one state two ways (CTL clear, HEAD short: keep `ring-not-disabled`, reason
+// `ring-not-drained`; CTL set: keep `ring-ctl-stuck`, reason `ring-live`), and an armed undrained ring whose CTL would
+// not clear kept as `ring-not-disabled` in bcs_job but `ring-ctl-stuck` at the unwind. The keep's words are the elder
+// (B1039/B1067) and the only two `kept_bit` (gen7.rs) maps, so both prints now take them from ONE fn.
+// =================================================================================
+
+/// The park's one class word, judged after the disable write over the caller's own quiesce reading (`all_disabled` in
+/// bcs_job, `park_quiesced` in `park_unwind`): `-` = quiesced (CTL clear, HEAD == TAIL); `ring-ctl-stuck` = RING_CTL
+/// read back set after the disable (any HEAD); `ring-not-disabled` = CTL clear, HEAD short of TAIL (B1067's class).
+/// `ring-live` is a CTL set before the arm: the entry refusal `bcs-ring-live` only, never a park word. Pure.
+fn park_class(quiesced: bool, stuck: bool) -> &'static str {
+    if quiesced {
+        "-"
+    } else if stuck {
+        "ring-ctl-stuck"
+    } else {
+        "ring-not-disabled"
+    }
 }
