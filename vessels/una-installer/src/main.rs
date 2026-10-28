@@ -78,6 +78,7 @@ fn say(line: &str) {
 }
 
 fn main() {
+    if let Some(rc) = card::open_device_verb(std::env::args().skip(1)) { std::process::exit(rc); } // INSTALLERAUTHOPEN (SR422): the hidden root helper verb (pkexec), before the census or the log touch stdout
     let c = match cli() {
         Ok(c) => c,
         Err(e) => {
