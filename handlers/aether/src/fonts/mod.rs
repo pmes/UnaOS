@@ -87,17 +87,11 @@ impl Generic {
             Generic::SystemUi => "system-ui",
         }
     }
-    /// The family Chromium's Linux defaults name for the generic (`WebFontFamilySettings`); `system-ui` is
-    /// the desktop's font, fontconfig's `sans`.
+    /// The family the generic resolves through on this host (AETHERMACGENERICS, SR418): text_host's ONE per-OS
+    /// table, `db::generics_for` — on Linux Chromium's Linux defaults (`WebFontFamilySettings`; `system-ui` the
+    /// desktop's font, fontconfig's `sans`), on macOS Chromium-mac's (Helvetica, Times, Courier, the SF face).
     pub fn family_name(self) -> &'static str {
-        match self {
-            Generic::Serif => "Times New Roman",
-            Generic::SansSerif => "Arial",
-            Generic::Monospace => "Monospace",
-            Generic::Cursive => "Comic Sans MS",
-            Generic::Fantasy => "Impact",
-            Generic::SystemUi => "sans",
-        }
+        text_host::db::generic_family(self.keyword())
     }
 }
 

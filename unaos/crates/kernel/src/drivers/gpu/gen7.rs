@@ -3411,7 +3411,7 @@ pub unsafe fn execute(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: u8
 
     // ---- Write the two GGTT PTEs (ring first, then target), read back under the hold ------
     wr(bar0, ring_off, ring_pte);
-    wr(bar0, tgt_off, tgt_pte);
+    wr(bar0, tgt_off, tgt_pte); assert_no_slot_held("r5-ptes"); // GEN7SLOTNOHOLDRUNGS (B1050): no slot guard live across this GPU op (gen7.rs tail). LINE-NEUTRAL append
     let ring_slot_held = rd(bar0, ring_off);
     let tgt_slot_held = rd(bar0, tgt_off);
     let prev_held = rd(bar0, prev_off_g);
@@ -3490,7 +3490,7 @@ pub unsafe fn execute(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: u8
         // `clflush`ed each iteration before the read so a stale cached copy cannot fake a miss
         // (MAJOR-1, read direction).
         if armed {
-            core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+            core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst); assert_no_slot_held("r5-kick"); // GEN7SLOTNOHOLDRUNGS (B1050): no slot guard live across this GPU op (gen7.rs tail). LINE-NEUTRAL append
             wr(bar0, g7regs::RCS_RING_TAIL, RING_TAIL_BYTES);
             const EXEC_POLL_MAX: u32 = 1_000_000;
             let t0 = crate::arch::now_cycles();
@@ -3647,7 +3647,7 @@ pub unsafe fn execute(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: u8
         wr(bar0, prev_off_g, base_img);
         wr(bar0, ring_off, base_img);
         wr(bar0, tgt_off, base_img);
-        wr(bar0, next_off_g, base_img);
+        wr(bar0, next_off_g, base_img); assert_no_slot_held("r5-unmap"); // GEN7SLOTNOHOLDRUNGS (B1050): no slot guard live across this GPU op (gen7.rs tail). LINE-NEUTRAL append
         ring_post = rd(bar0, ring_off);
         tgt_post_pte = rd(bar0, tgt_off);
         prev_post = rd(bar0, prev_off_g);
@@ -4150,7 +4150,7 @@ pub unsafe fn rearm(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: u8, 
 
     // ---- Claim the two GGTT slots (once, for the whole candidate loop) ----------------
     wr(bar0, ring_off, ring_pte);
-    wr(bar0, tgt_off, tgt_pte);
+    wr(bar0, tgt_off, tgt_pte); assert_no_slot_held("r6-ptes"); // GEN7SLOTNOHOLDRUNGS (B1050): no slot guard live across this GPU op (gen7.rs tail). LINE-NEUTRAL append
     let ring_slot_held = rd(bar0, ring_off);
     let tgt_slot_held = rd(bar0, tgt_off);
     let prev_held = rd(bar0, prev_off_g);
@@ -4243,7 +4243,7 @@ pub unsafe fn rearm(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: u8, 
             let mut iters = 0u32;
             let mut cyc = 0u64;
             if armed {
-                core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+                core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst); assert_no_slot_held("r6-kick"); // GEN7SLOTNOHOLDRUNGS (B1050): no slot guard live across this GPU op (gen7.rs tail). LINE-NEUTRAL append
                 wr(bar0, g7regs::RCS_RING_TAIL, RING_TAIL_BYTES);
                 let (_hit, it, cy) = poll_cycles(EXEC_BUDGET_CYC, || {
                     head_post = rd(bar0, g7regs::RCS_RING_HEAD) & RING_HEAD_OFF_MASK;
@@ -4426,7 +4426,7 @@ pub unsafe fn rearm(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: u8, 
     } = flush_verdict(
         bar0,
         "r6",
-    );
+    ); assert_no_slot_held("r6-unmap"); // GEN7SLOTNOHOLDRUNGS (B1050): no slot guard live across this GPU op (gen7.rs tail). LINE-NEUTRAL append
 
     // The independent structural leg. If no candidate's enable ever latched, the head never
     // moved and no sentinel ever landed, then no engine access was ever issued through either
@@ -5085,7 +5085,7 @@ pub unsafe fn blit(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: u8, w
     // ---- Claim the three GGTT slots (once, for the whole candidate loop) ---------------
     wr(bar0, ring_off, ring_pte);
     wr(bar0, src_off, src_pte);
-    wr(bar0, dst_off, dst_pte);
+    wr(bar0, dst_off, dst_pte); assert_no_slot_held("r7-ptes"); // GEN7SLOTNOHOLDRUNGS (B1050): no slot guard live across this GPU op (gen7.rs tail). LINE-NEUTRAL append
     let ring_slot_held = rd(bar0, ring_off);
     let src_slot_held = rd(bar0, src_off);
     let dst_slot_held = rd(bar0, dst_off);
@@ -5185,7 +5185,7 @@ pub unsafe fn blit(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: u8, w
             let mut iters = 0u32;
             let mut cyc = 0u64;
             if armed {
-                core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+                core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst); assert_no_slot_held("r7-kick"); // GEN7SLOTNOHOLDRUNGS (B1050): no slot guard live across this GPU op (gen7.rs tail). LINE-NEUTRAL append
                 wr(bar0, g7regs::BCS_RING_TAIL, RING_TAIL_BYTES);
                 let (_hit, it, cy) = poll_cycles(EXEC_BUDGET_CYC, || {
                     head_post = rd(bar0, g7regs::BCS_RING_HEAD) & RING_HEAD_OFF_MASK;
@@ -5486,7 +5486,7 @@ pub unsafe fn blit(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: u8, w
     } = flush_verdict(
         bar0,
         "r7",
-    );
+    ); assert_no_slot_held("r7-unmap"); // GEN7SLOTNOHOLDRUNGS (B1050): no slot guard live across this GPU op (gen7.rs tail). LINE-NEUTRAL append
 
     // The independent structural leg. If no candidate's enable ever latched, the head never
     // moved, no sentinel ever landed and no pixel was ever copied, then no engine access was ever
@@ -6339,7 +6339,7 @@ mod r8 {
         for k in 0..win_slots {
             wr(bar0, GTT_BASE + (R8_BASE_SLOT + k) * 4, ptes[k]);
         }
-        let mut ptes_landed = true;
+        let mut ptes_landed = true; super::assert_no_slot_held("r8-ptes"); // GEN7SLOTNOHOLDRUNGS (B1050): no slot guard live across this GPU op (gen7.rs tail). LINE-NEUTRAL append
         for k in 0..win_slots {
             if rd(bar0, GTT_BASE + (R8_BASE_SLOT + k) * 4) != ptes[k] {
                 ptes_landed = false;
@@ -6456,7 +6456,7 @@ mod r8 {
                 let mut iters = 0u32;
                 let mut cyc = 0u64;
                 if armed {
-                    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+                    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst); super::assert_no_slot_held("r8-kick"); // GEN7SLOTNOHOLDRUNGS (B1050): no slot guard live across this GPU op (gen7.rs tail). LINE-NEUTRAL append
                     wr(bar0, g7regs::BCS_RING_TAIL, RING_TAIL_BYTES);
                     let (_hit, it, cy) = poll_cycles(EXEC_BUDGET_CYC, || {
                         head_post = rd(bar0, g7regs::BCS_RING_HEAD) & RING_HEAD_OFF_MASK;
@@ -6717,7 +6717,7 @@ mod r8 {
         } = flush_verdict(
             bar0,
             "r8",
-        );
+        ); super::assert_no_slot_held("r8-unmap"); // GEN7SLOTNOHOLDRUNGS (B1050): no slot guard live across this GPU op (gen7.rs tail). LINE-NEUTRAL append
         let never_fetched = !any_ctl_enabled && !any_head_moved && !any_sentinel && !any_copy;
         let reversal_clean = r7_reversal_clean(engine_quiesced, ptes_restored, smear_post, all_regs_restored);
         let reclaim = r7_reclaim(reversal_clean, never_fetched, flush_positive);
@@ -7186,7 +7186,7 @@ mod r8 {
             core::ptr::write_volatile(ring_u32.add(16 + k), *v);
         }
         clflush_range(ring_page as usize, 4096);
-        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst); super::assert_no_slot_held("r8b-kick"); // GEN7SLOTNOHOLDRUNGS (B1050): no slot guard live across this GPU op (gen7.rs tail). LINE-NEUTRAL append
 
         let mut head = 0u32;
         let mut sent = R8_DST_SENTINEL_SEED;
@@ -7729,11 +7729,11 @@ fn order_leg() {
     {
         let before = blit::PAGES.order_seen(&BLIT_RING_HELD);
         // One core, one task for both takes: the walk reads only this core's partition. The slot guard drops first.
-        let taken = crate::arch::without_interrupts(|| {
-            let Some(_engine) = blit::PAGES.try_lock() else { return false }; // bcs_job's own take (a live job: busy)
-            let _slot = BLIT_RING_HELD.lock(); // held_take's take; nothing is done under it
-            true
-        });
+        let taken = blit::engine_take(|| {
+            drop(BLIT_RING_HELD.lock()); // held_take's take; nothing is done under it
+        }) // GEN7ORDERMIGRATE (B1053): bcs_job's own door, PAGES then the slot under one mask (a live job: busy)
+        .is_some();
+        // the engine guard came back from the door and dropped at the end of that statement, after the slot's guard
         let after = blit::PAGES.order_seen(&BLIT_RING_HELD);
         let (fwd, rev, i1) = after.unwrap_or((false, false, 0));
         let i0 = before.map(|b| b.2).unwrap_or(i1);

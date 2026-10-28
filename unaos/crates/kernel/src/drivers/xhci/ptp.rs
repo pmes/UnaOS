@@ -1568,7 +1568,7 @@ impl XhciController {
                     }
                 }
                 if got > (8 << 20) {
-                    serial_println!("[xhci] loan yield who=ptp n={} taken={} waited_us={} (XHCILOANPTPYIELD Z73)", yn, yt, ymax);
+                    serial_println!("[xhci] loan yield who=ptp n={} taken={} waited_us={} yield_skips={} (XHCILOANPTPYIELD Z73)", yn, yt, ymax, super::pump_yield_skips());
                 }
                 if !unknown && got < total {
                     return Err("data phase short");
@@ -1876,7 +1876,7 @@ static YIELD_LOAN: core::sync::atomic::AtomicPtr<crate::drivers::block::BlockLoa
     core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
 /// XHCILOANPTPYIELD: a PTP transaction is open across a yield window (the loan is out): `service_ptp` returns at once and
 /// a `with_controller` claim taken in the window is refused.
-static TXN_YIELDED: AtomicBool = AtomicBool::new(false);
+pub(crate) static TXN_YIELDED: AtomicBool = AtomicBool::new(false);
 
 /// XHCILOANPTPYIELD: hand the hold's loan back between two TDs (`BlockLoan::yield_now`) when one is due (or `force`, the
 /// KAT). `Ok(None)` = no yield (no `with_controller` hold, inside a window, masked, not due, or `c` is not the loan's

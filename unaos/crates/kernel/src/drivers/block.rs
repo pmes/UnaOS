@@ -4823,7 +4823,10 @@ pub fn xhci_loan_shed_count() -> u32 {
 // `LOAN_SHED_N`, the contender's `LOAN_MASKED_BUSY`, `LOAN_LAST_WHY`, and neither once-line (`[xhci] loan shed`,
 // `[xhci] loan masked claim`) is said by it. The shed statics are written only by the ONE block-loan holder — the KAT
 // for the whole window. A real masked refusal inside the contender's ~ms window is still counted, but its once-line is
-// silenced if it was the boot's first. Owed: XHCILOAN-SHEDKAT-CONTROL (a pre-shed contender go-red leg).
+// silenced if it was the boot's first. XHCILOANSHEDKATCONTROL (zenbook-ledger Z78) builds the go-red control: the same
+// contender, BEFORE the shed (the loan still published preempt-off), must spin Z62's bounded wait out and answer Busy
+// why=masked-timeout in [8, 20] ms (`loan_shed_control`); both legs share ONE bookkeeping helper (`loan_shed_contend`).
+// XHCILOANSHEDKATCONTROLUS (zenbook-ledger Z80): the control's µs reaches the line as `loan_shed_us=` (`LOAN_SHED_CONTROL_US`).
 
 /// XHCILOANSHEDKAT contender handshake: 0 waiting, then the masked claim's outcome — 1 Ok, 2 Busy, 3 NotReady, 4 error.
 #[cfg(target_arch = "x86_64")]
@@ -4834,6 +4837,11 @@ static LOAN_SHEDKAT_WHY: core::sync::atomic::AtomicU8 = core::sync::atomic::Atom
 /// XHCILOANSHEDKAT: µs the contender's masked claim took.
 #[cfg(target_arch = "x86_64")]
 static LOAN_SHEDKAT_US: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// XHCILOANSHEDKATCONTROLUS (zenbook-ledger Z80): µs the pre-shed control's masked contender took (`loan_shed_us=` on the
+/// PREEMPTAUDIT line); written only by the KAT task — 0 at the KAT's first statement, the control's reading once its
+/// contender came — so 0 means the control did not run.
+#[cfg(target_arch = "x86_64")]
+static LOAN_SHED_CONTROL_US: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 /// XHCILOANSHEDKAT contender (a task on a sibling CPU): one MASKED `claim_xhci_for_io` against the KAT's shed loan,
 /// timed; the outcome, the refusal's why and the µs published for the KAT.
@@ -4859,14 +4867,77 @@ fn loan_shed_contender(_: usize) {
     LOAN_SHEDKAT_STATE.store(code, Ordering::Release);
 }
 
+/// XHCILOANSHEDKATCONTROL: ONE contender run for both KAT legs — spawn [`loan_shed_contender`] on `cpu`, wait for its
+/// outcome (<= 1000 ms), and give back what it spent: its `LOAN_MASKED_BUSY` (Busy) or `LOAN_MASKED_OK` (Ok),
+/// `LOAN_LAST_WHY`, and the once-line latch (its refusal is never the boot's said line). Returns
+/// `(came, code, why, us)` as the contender published them.
+#[cfg(target_arch = "x86_64")]
+fn loan_shed_contend(cpu: usize) -> (bool, u8, u8, u64) {
+    use core::sync::atomic::Ordering;
+    let prior_said = LOAN_REFUSAL_SAID.swap(true, Ordering::AcqRel);
+    let prior_why = LOAN_LAST_WHY.load(Ordering::Relaxed);
+    LOAN_SHEDKAT_STATE.store(0, Ordering::Release);
+    crate::arch::sched::spawn("loanshed-kat", loan_shed_contender, 0, cpu, crate::arch::sched::PRIO_HIGH);
+    let came = wait::bounded(1000, || LOAN_SHEDKAT_STATE.load(Ordering::Acquire) != 0);
+    let code = LOAN_SHEDKAT_STATE.load(Ordering::Acquire);
+    if code == 2 {
+        LOAN_MASKED_BUSY.fetch_sub(1, Ordering::Relaxed);
+    } else if code == 1 {
+        LOAN_MASKED_OK.fetch_sub(1, Ordering::Relaxed);
+    }
+    LOAN_LAST_WHY.store(prior_why, Ordering::Relaxed);
+    if !prior_said {
+        LOAN_REFUSAL_SAID.store(false, Ordering::Release);
+    }
+    let why = LOAN_SHEDKAT_WHY.load(Ordering::Relaxed);
+    let us = LOAN_SHEDKAT_US.load(Ordering::Relaxed);
+    (came, code, why, us)
+}
+
+/// XHCILOANSHEDKATCONTROL: the pre-shed go-red leg. Called while the KAT holds the block loan published preempt-off
+/// on this CPU (no migration: the CPU read here is stable); a MASKED contender on a sibling CPU must spin Z62's
+/// bounded wait out (`masked_loan_wait`, [`LOAN_MASKED_WAIT_MS`]) and answer Busy why=masked-timeout inside
+/// [8, 20] ms. The first failed check: `control-same-cpu` / `control-late` / `control-got` / `control-why` /
+/// `control-early` (the wait path dead) / `control-slow`. XHCILOANSHEDKATCONTROLUS (Z80): a contender that came leaves
+/// its µs in `LOAN_SHED_CONTROL_US` on every outcome.
+#[cfg(target_arch = "x86_64")]
+fn loan_shed_control() -> Result<(), &'static str> {
+    let here = crate::arch::percpu::this_cpu().cpu_index as usize;
+    let cpu = crate::arch::sched::sibling_online_cpu(here);
+    if cpu == here {
+        return Err("control-same-cpu");
+    }
+    let (came, code, why, us) = loan_shed_contend(cpu);
+    if !came {
+        return Err("control-late");
+    }
+    LOAN_SHED_CONTROL_US.store(us.min(u32::MAX as u64) as u32, core::sync::atomic::Ordering::Relaxed);
+    if code == 1 {
+        return Err("control-got");
+    }
+    if code != 2 || why != 3 {
+        return Err("control-why");
+    }
+    if us < 8_000 {
+        return Err("control-early");
+    }
+    if us > 20_000 {
+        return Err("control-slow");
+    }
+    Ok(())
+}
+
 /// XHCILOANSHEDKAT: `tests preemptaudit`'s shed leg (`loan_shed_kat=`): `ok`, `skip(masked|no-xhci|one-cpu)`, or the
 /// first failed check — `claim-busy` / `claim-notready` / `held-before` / `not-held` / `gate-ignored` / `not-released` /
 /// `still-published` / `claim-lost` / `not-counted` / `contender-got` / `contender-waited` / `contender-late` /
-/// `double-release` / `mark-kept`.
+/// `double-release` / `mark-kept`; the pre-shed control (XHCILOANSHEDKATCONTROL Z78) first: `control-same-cpu` /
+/// `control-late` / `control-got` / `control-why` / `control-early` / `control-slow`. XHCILOANSHEDKATCONTROLUS (Z80): the
+/// control's µs reset to 0 first, so `loan_shed_us=` reads 0 on every return before the control's contender came.
 #[cfg(target_arch = "x86_64")]
 pub fn xhci_loan_shed_kat() -> &'static str {
     use core::sync::atomic::Ordering;
     use crate::arch::sched::preemptoff;
+    LOAN_SHED_CONTROL_US.store(0, Ordering::Relaxed);
     if crate::arch::irqs_masked() {
         return "skip(masked)";
     }
@@ -4886,6 +4957,11 @@ pub fn xhci_loan_shed_kat() -> &'static str {
         Err(BlockError::NotReady) => return "claim-notready",
         Err(_) => return "claim-busy",
     };
+    // XHCILOANSHEDKATCONTROL (Z78): the go-red control while the loan is still published; a failure returns its word and
+    // the loan goes back through the normal (unshed) Drop.
+    if let Err(w) = loan_shed_control() {
+        return w;
+    }
     // The take holds the count (no switch, no migration until the shed); the mask keeps the shed and its reads on
     // one CPU. The pre-bump keeps the boot's "first shed, once" line for a real shed; every count is given back.
     let shed: Result<(), &'static str> = crate::arch::without_interrupts(|| {
@@ -4927,21 +5003,7 @@ pub fn xhci_loan_shed_kat() -> &'static str {
         return w;
     }
     // The masked contender on the sibling CPU; this holder waits PREEMPTIBLE (the shed's point).
-    let prior_said = LOAN_REFUSAL_SAID.swap(true, Ordering::AcqRel);
-    let prior_why = LOAN_LAST_WHY.load(Ordering::Relaxed);
-    LOAN_SHEDKAT_STATE.store(0, Ordering::Release);
-    crate::arch::sched::spawn("loanshed-kat", loan_shed_contender, 0, cpu, crate::arch::sched::PRIO_HIGH);
-    let came = wait::bounded(1000, || LOAN_SHEDKAT_STATE.load(Ordering::Acquire) != 0);
-    let code = LOAN_SHEDKAT_STATE.load(Ordering::Acquire);
-    if code == 2 {
-        LOAN_MASKED_BUSY.fetch_sub(1, Ordering::Relaxed);
-    }
-    LOAN_LAST_WHY.store(prior_why, Ordering::Relaxed);
-    if !prior_said {
-        LOAN_REFUSAL_SAID.store(false, Ordering::Release);
-    }
-    let why = LOAN_SHEDKAT_WHY.load(Ordering::Relaxed);
-    let us = LOAN_SHEDKAT_US.load(Ordering::Relaxed);
+    let (came, code, why, us) = loan_shed_contend(cpu);
     if !came {
         return "contender-late";
     }
@@ -4964,6 +5026,13 @@ pub fn xhci_loan_shed_kat() -> &'static str {
         return "mark-kept";
     }
     "ok"
+}
+
+/// XHCILOANSHEDKATCONTROLUS (zenbook-ledger Z80): the pre-shed control's measured µs (`loan_shed_us=` after
+/// `loan_shed_kat=` on the PREEMPTAUDIT line): ~10000 on a live Z62 wait, 0 when the control did not run.
+#[cfg(target_arch = "x86_64")]
+pub fn xhci_loan_shed_control_us() -> u32 {
+    LOAN_SHED_CONTROL_US.load(core::sync::atomic::Ordering::Relaxed)
 }
 
 // ══════════ XHCILOANPOLLCAP (zenbook-ledger Z74) — the xhci-poll task is the block loan's ninth holder ══════════
