@@ -26,6 +26,8 @@ must carry), the xHCI loan yield for PTP (Z73..Z108, `ptp_yield=`), the QEMU lan
 XHCILOANPTPYIELDQEMUMTP (Z105) and its spec routing (Z112). Next id Z116. The seat's four legs and the host suites are
 green at cc16ae6ba; `cd unaos && ./arroyo check && ./arroyo gates` on the bench before the stick is written.
 
+STATE 2026-10-28 (the bench, 18:00Z): IMAGE 1 BUILT AND STAGED, unflown — `./arroyo esp-zenbook` at hw-rmbp@0a2209592 (the cloud's cc16ae6ba/c2d86af47 merged over the bench tree at ffec19c33, then three one-line compile grants the build needed at the cloud's code: fs/unafs.rs:5141 `read_block` with `BlockDevice` in scope (the x86-zenbook-image check row's E0599 since aeeb4db92), `bootfat::key`'s `Nvme => 5` arm (the x86-all row's E0004 since NVMEBOOT), `smolnet::route_view` ungated (wifijoin's s9 line calls it under `smolnet` on a line with `wifi` and no `wifi10`: E0425)); the MT7925 pair from the host's Fedora linux-firmware-20261019 decompressed into ~/unaos-bench/firmware/mediatek-mt7925 and firmware/mt7925.pins RE-PINNED to that drop (the previous rows read MISMATCH; the pins file's own rule). Banner-cert ok=34 missing=0; MT7925-FW MATCH; card image ~/unaos-bench/flash/zenbook/UnaOS-zenbook-card-zb1flight1-20261028T1755Z-0a2209592.card.img (sha256 c0abe85d7cc0319c…, 4234 MiB) with its MANIFEST line; ~/unaos-bench/PLAYBOOK-zenbook.md = um5606w.md §6 as the flight. Waiting on: a USB stick, the external monitor, the FTDI on the picked xHCI (Z7), Peter's go.
+
 ## OWED (in order; each names its ledger id once it has one)
 
 1. **ZENBOOK-FIRSTBOOT** — the card recipe and the bench's first boot. `./arroyo esp-x86` with the ZENBOOK-IMAGELINE
