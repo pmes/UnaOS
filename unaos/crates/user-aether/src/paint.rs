@@ -495,21 +495,20 @@ fn caption(cv: &mut Canvas, cx: &Cx, id: NodeId, ink: &Ink, x: f32, y: f32) {
     if label.is_empty() {
         return;
     }
-    let (w, h) = (l.size.width, l.size.height);
-    let (bd, pd) = (l.border, l.padding);
-    let (cx0, cy0) = (x + bd.left + pd.left, y + bd.top + pd.top);
-    let cw = (w - bd.left - pd.left - pd.right - bd.right).max(0.0);
-    let ch = (h - bd.top - pd.top - pd.bottom - bd.bottom).max(0.0);
     let color = tree.paint_map.get(&id).and_then(|p| p.color).map(rgb).unwrap_or(crate::theme::PAGE_INK);
+    // AETHERCAPTIONCORE (SR438): the geometry is layout_core's `caption_box`, the host push arm's rule (its
+    // content box, centred line, padding-box clip in f32 as the host's `in_clip`); the baseline adds the
+    // half-leading lead from `Fonts::baseline_offset` (read before the borrow_mut below) and rounds as the host.
+    let lead = layout_core::Fonts::baseline_offset(cx.fonts, ink.sel, ink.size, 0.0);
     let mut t = cx.fonts.0.borrow_mut();
     let tw = t.measure(&label, ink.sel, ink.size);
     let (a, d, _) = t.line_metrics(ink.sel, ink.size);
-    let tx = cx0 + (cw - tw) / 2.0;
-    let base = font_core::fmath::round(cy0 + ch / 2.0 - (a + d) / 2.0 + a);
-    // the padding box: the border box less its borders
-    let (px0, py0, px1, py1) = (fl(x + bd.left), fl(y + bd.top), fl(x + w - bd.right), fl(y + h - bd.bottom));
-    t.draw(tx, base, &label, ink.sel, ink.size, color, &mut |gx, gy, cov| {
-        if gx >= px0 && gx < px1 && gy >= py0 && gy < py1 {
+    let c = layout_core::caption_box(x, y, l.size.width, l.size.height, l.border, l.padding, tw, a, d);
+    let base = c.baseline(lead);
+    let (px0, py0, px1, py1) = c.clip;
+    t.draw(c.x, base, &label, ink.sel, ink.size, color, &mut |gx, gy, cov| {
+        let (fx, fy) = (gx as f32, gy as f32);
+        if fx >= px0 && fx < px1 && fy >= py0 && fy < py1 {
             cv.blend(gx, gy, color, cov);
         }
     });

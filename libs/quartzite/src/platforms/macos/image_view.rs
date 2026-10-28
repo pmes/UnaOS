@@ -890,6 +890,12 @@ pub fn bootstrap_image_view(
 }
 
 pub fn bootstrap_image_surface(id: &str, synapse: bandy::Synapse) -> Retained<NSView> {
+    bootstrap_image_surface_held(id, synapse).0
+}
+
+/// FACELIVE-SUBSCRIPTION-DROP (SR441): [`bootstrap_image_surface`] with its bus subscriber's abort handle (the loop runs
+/// through `tetra_eval::face_subscribe`), which the tetra evaluator keeps and aborts when the Surface leaves the tree.
+pub fn bootstrap_image_surface_held(id: &str, synapse: bandy::Synapse) -> (Retained<NSView>, tokio::task::AbortHandle) {
     let mtm = MainThreadMarker::new().expect("bootstrap_image_surface must run on the main thread");
 
     let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(800.0, 600.0));
@@ -901,14 +907,9 @@ pub fn bootstrap_image_surface(id: &str, synapse: bandy::Synapse) -> Retained<NS
 
     let target_id = id.to_string();
     let resend = synapse.clone(); // AETHERMACGPU-ENGINEDAMAGE (SR341): a lagged loop asks for the surface whole
-    // The AppKit main thread has no tokio reactor; give the subscription loop
-    // its own thread + current-thread runtime and hop frames back via GCD.
-    std::thread::Builder::new().name("surface-blit".into()).spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("surface subscription runtime");
-        rt.block_on(async move {
+    // The AppKit main thread has no tokio reactor; the subscription loop gets its own thread + current-thread runtime
+    // (`tetra_eval::face_subscribe`, FACELIVE-SUBSCRIPTION-DROP SR441) and hops frames back via GCD.
+    let abort = super::tetra_eval::face_subscribe("surface-blit", async move {
         loop {
             match rx.recv().await {
                 Ok(bandy::SMessage::BrowserCursorChanged(name)) => {
@@ -960,10 +961,9 @@ pub fn bootstrap_image_surface(id: &str, synapse: bandy::Synapse) -> Retained<NS
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }
         }
-        });
-    }).expect("spawn surface-blit thread");
+    });
 
-    Retained::into_super(view)
+    (Retained::into_super(view), abort)
 }
 
 // AETHERMACGPU-DAMAGE (LEDGER SR320) / -ENGINEDAMAGE (SR341): a damage blit (`SurfaceBlit { damage: Some(rects) }`,

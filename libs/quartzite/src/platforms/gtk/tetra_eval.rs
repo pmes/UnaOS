@@ -27,10 +27,10 @@ pub fn eval_tetra(node: TetraNode, synapse: Synapse) -> NativeView {
             super::text_field::bootstrap_text_field(&placeholder, secret, action, synapse)
         }
         TetraNode::Surface { id } => {
-            super::image_view::bootstrap_image_surface(&id, synapse)
+            face_held(super::image_view::bootstrap_image_surface_held(&id, synapse)) // FACELIVE-SUBSCRIPTION-DROP (SR441): the subscriber's handle kept
         }
         TetraNode::Console(console) => {
-            super::console_view::bootstrap_console(&console, synapse)
+            face_held(super::console_view::bootstrap_console_held(&console, synapse)) // FACELIVE-SUBSCRIPTION-DROP (SR441)
         }
         _ => {
             let container = Box::new(Orientation::Horizontal, 0);
@@ -72,6 +72,7 @@ fn face_widget(root: &gtk4::Widget, path: &[usize]) -> Option<gtk4::Widget> {
 /// Put `new` in `old`'s place in its parent Box.
 fn face_swap(old: &gtk4::Widget, new: &gtk4::Widget) {
     let Some(parent) = old.parent().and_then(|p| p.downcast::<Box>().ok()) else { return };
+    face_drop(old); // FACELIVE-SUBSCRIPTION-DROP (SR441): the leaving widget's subscribers end
     parent.insert_child_after(new, old.prev_sibling().as_ref());
     parent.remove(old);
 }
@@ -113,6 +114,7 @@ fn apply_face() {
                         _ => continue,
                     };
                     while let Some(c) = b.first_child() {
+                        face_drop(&c); // FACELIVE-SUBSCRIPTION-DROP (SR441)
                         b.remove(&c);
                     }
                     b.set_orientation(orientation);
@@ -131,4 +133,48 @@ fn apply_face() {
             }
         }
     });
+}
+
+// FACELIVE-SUBSCRIPTION-DROP (LEDGER SR441): a Console or Surface leaf's bus subscriber (a main-context future) is kept
+// here by its handle beside a weak ref to the widget it feeds; `face_drop` aborts every subscriber at or under a widget
+// leaving the tree (Restack, Replace, Field), and any whose widget is already gone, so a restacking face leaks none.
+
+thread_local! {
+    /// Each subscribed widget (weak: the table pins nothing) and its subscriber's handle (main thread).
+    static FACE_SUBS: std::cell::RefCell<Vec<(gtk4::glib::WeakRef<gtk4::Widget>, gtk4::glib::JoinHandle<()>)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Keep a freshly built widget's subscriber handle; the widget passes through.
+fn face_held((view, task): (NativeView, gtk4::glib::JoinHandle<()>)) -> NativeView {
+    FACE_SUBS.with(|t| t.borrow_mut().push((view.downgrade(), task)));
+    view
+}
+
+/// Abort the subscribers of `old` and everything under it (run before `old` leaves its parent).
+fn face_drop(old: &gtk4::Widget) {
+    let gone: Vec<gtk4::glib::JoinHandle<()>> = FACE_SUBS.with(|t| {
+        let mut t = t.borrow_mut();
+        let mut gone = Vec::new();
+        let mut i = 0;
+        while i < t.len() {
+            let leaving = match t[i].0.upgrade() {
+                Some(w) => w == *old || w.is_ancestor(old),
+                None => true,
+            };
+            if leaving {
+                gone.push(t.swap_remove(i).1);
+            } else {
+                i += 1;
+            }
+        }
+        gone
+    });
+    if gone.is_empty() {
+        return;
+    }
+    let live = FACE_SUBS.with(|t| t.borrow().len());
+    log::debug!("[quartzite] face subscriptions dropped n={} live={}", gone.len(), live);
+    for task in gone {
+        task.abort();
+    }
 }

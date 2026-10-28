@@ -103,6 +103,12 @@ fn set_header(state: &ConsoleState, dropped: u64, paused: bool) {
 
 /// The read-only, live Console view from a `ConsoleTetra` snapshot (the GTK `bootstrap_console`'s counterpart).
 pub fn bootstrap_console(console: &ConsoleTetra, synapse: Synapse) -> Retained<NSView> {
+    bootstrap_console_held(console, synapse).0
+}
+
+/// FACELIVE-SUBSCRIPTION-DROP (SR441): [`bootstrap_console`] with its bus subscriber's abort handle (the loop runs through
+/// `tetra_eval::face_subscribe`), which the tetra evaluator keeps and aborts when the Console leaves the tree.
+pub fn bootstrap_console_held(console: &ConsoleTetra, synapse: Synapse) -> (Retained<NSView>, tokio::task::AbortHandle) {
     let mtm = MainThreadMarker::new().expect("bootstrap_console must run on the main thread");
     let header = label("");
     hug(&header, 1);
@@ -139,33 +145,27 @@ pub fn bootstrap_console(console: &ConsoleTetra, synapse: Synapse) -> Retained<N
 
     let bound = std::sync::Arc::new(dispatch2::MainThreadBound::new(state, mtm));
     let mut rx = synapse.subscribe();
-    std::thread::Builder::new()
-        .name("console-view".into())
-        .spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("console subscription runtime");
-            rt.block_on(async move {
-                loop {
-                    match rx.recv().await {
-                        Ok(SMessage::Logs(LogEvent::LogTail { lines, dropped, paused })) => {
-                            let rows = console_rows::rows_from_tail(&lines);
-                            let bound = bound.clone();
-                            dispatch2::DispatchQueue::main().exec_async(move || {
-                                let mtm = MainThreadMarker::new().unwrap();
-                                let st = bound.get(mtm);
-                                *st.lines.borrow_mut() = rows;
-                                set_header(st, dropped, paused);
-                                show(st);
-                            });
-                        }
-                        Ok(_) => {}
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                    }
+    let abort = super::tetra_eval::face_subscribe("console-view", async move {
+        loop {
+            match rx.recv().await {
+                Ok(SMessage::Logs(LogEvent::LogTail { lines, dropped, paused })) => {
+                    let rows = console_rows::rows_from_tail(&lines);
+                    let bound = bound.clone();
+                    dispatch2::DispatchQueue::main().exec_async(move || {
+                        let mtm = MainThreadMarker::new().unwrap();
+                        let st = bound.get(mtm);
+                        *st.lines.borrow_mut() = rows;
+                        set_header(st, dropped, paused);
+                        show(st);
+                    });
                 }
-            });
-        })
-        .expect("spawn console-view thread");
-    unsafe { Retained::cast_unchecked::<NSView>(root) }
+                Ok(_) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+    (unsafe { Retained::cast_unchecked::<NSView>(root) }, abort)
 }
 
 /// Summon the Console as its own window over the process bus (the GTK `open_console_window`'s counterpart); it seeds

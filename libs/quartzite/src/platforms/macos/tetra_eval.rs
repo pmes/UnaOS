@@ -46,11 +46,11 @@ pub fn eval_tetra(node: TetraNode, synapse: Synapse) -> Retained<NSView> {
         }
         TetraNode::Surface { id } => {
             // Note: SurfaceBlit must target a Surface by id once >1 surface exists
-            stretch(super::image_view::bootstrap_image_surface(&id, synapse), 1)
+            stretch(face_held(super::image_view::bootstrap_image_surface_held(&id, synapse)), 1) // FACELIVE-SUBSCRIPTION-DROP (SR441): the subscriber's handle kept
         }
         TetraNode::Console(console) => {
             // FACELIVE (SR435): the GTK twin's Console arm (the installer's status panes were blank placeholders here)
-            super::console_view::bootstrap_console(&console, synapse)
+            face_held(super::console_view::bootstrap_console_held(&console, synapse)) // FACELIVE-SUBSCRIPTION-DROP (SR441)
         }
         _ => {
             // Placeholder for unsupported nodes
@@ -178,6 +178,7 @@ fn apply_face() {
                         continue;
                     }
                     while let Some(c) = face_child(&stack, 0) {
+                        face_drop(&c); // FACELIVE-SUBSCRIPTION-DROP (SR441): the leaving view's subscribers end
                         unsafe { face_unarrange(&stack, &c) };
                     }
                     unsafe {
@@ -197,6 +198,7 @@ fn apply_face() {
                     };
                     let (Some(parent), Some(old)) = (face_view(&root, parent_path), face_view(&root, &path)) else { continue };
                     let new = eval_tetra(node, synapse.clone());
+                    face_drop(&old); // FACELIVE-SUBSCRIPTION-DROP (SR441)
                     unsafe {
                         let _: () = msg_send![&parent, insertArrangedSubview: &*new, atIndex: last as isize];
                         face_unarrange(&parent, &old);
@@ -205,4 +207,68 @@ fn apply_face() {
             }
         }
     });
+}
+
+// FACELIVE-SUBSCRIPTION-DROP (LEDGER SR441): a Console or Surface leaf's bus subscriber (a task on its own thread's
+// current-thread runtime, started by `face_subscribe`) is kept here by its abort handle beside a weak ref to the view it
+// feeds; `face_drop` aborts every subscriber at or under a view leaving the tree (Restack, Replace), and any whose view
+// is already gone, so a restacking face leaks no thread.
+
+thread_local! {
+    /// Each subscribed view (weak: the table pins nothing) and its subscriber's abort handle (main thread).
+    static FACE_SUBS: std::cell::RefCell<Vec<(objc2::rc::Weak<NSView>, tokio::task::AbortHandle)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Run a bus subscription loop on its own named thread (the AppKit main thread has no tokio reactor; the loop hops back
+/// through GCD). The runtime is built here so the task's abort handle is returned at once; aborting it ends the thread.
+pub(super) fn face_subscribe(name: &str, fut: impl std::future::Future<Output = ()> + Send + 'static) -> tokio::task::AbortHandle {
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("subscription runtime");
+    let task = rt.spawn(fut);
+    let abort = task.abort_handle();
+    std::thread::Builder::new()
+        .name(name.into())
+        .spawn(move || {
+            let _ = rt.block_on(task);
+        })
+        .expect("spawn subscription thread");
+    abort
+}
+
+/// Keep a freshly built view's subscriber handle; the view passes through.
+fn face_held((view, abort): (Retained<NSView>, tokio::task::AbortHandle)) -> Retained<NSView> {
+    FACE_SUBS.with(|t| t.borrow_mut().push((objc2::rc::Weak::from_retained(&view), abort)));
+    view
+}
+
+/// Abort the subscribers of `old` and every view under it (run before `old` leaves its stack).
+fn face_drop(old: &NSView) {
+    let gone: Vec<tokio::task::AbortHandle> = FACE_SUBS.with(|t| {
+        let mut t = t.borrow_mut();
+        let mut gone = Vec::new();
+        let mut i = 0;
+        while i < t.len() {
+            let leaving = match t[i].0.load() {
+                // isDescendantOf: is YES for the view itself too.
+                Some(v) => {
+                    let r: objc2::runtime::Bool = unsafe { msg_send![&v, isDescendantOf: old] };
+                    r.as_bool()
+                }
+                None => true,
+            };
+            if leaving {
+                gone.push(t.swap_remove(i).1);
+            } else {
+                i += 1;
+            }
+        }
+        gone
+    });
+    if gone.is_empty() {
+        return;
+    }
+    let live = FACE_SUBS.with(|t| t.borrow().len());
+    log::debug!("[quartzite] face subscriptions dropped n={} live={}", gone.len(), live);
+    for abort in gone {
+        abort.abort();
+    }
 }
