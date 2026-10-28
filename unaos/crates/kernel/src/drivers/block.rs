@@ -4826,6 +4826,7 @@ pub fn xhci_loan_shed_count() -> u32 {
 // silenced if it was the boot's first. XHCILOANSHEDKATCONTROL (zenbook-ledger Z78) builds the go-red control: the same
 // contender, BEFORE the shed (the loan still published preempt-off), must spin Z62's bounded wait out and answer Busy
 // why=masked-timeout in [8, 20] ms (`loan_shed_control`); both legs share ONE bookkeeping helper (`loan_shed_contend`).
+// XHCILOANSHEDKATCONTROLUS (zenbook-ledger Z80): the control's µs reaches the line as `loan_shed_us=` (`LOAN_SHED_CONTROL_US`).
 
 /// XHCILOANSHEDKAT contender handshake: 0 waiting, then the masked claim's outcome — 1 Ok, 2 Busy, 3 NotReady, 4 error.
 #[cfg(target_arch = "x86_64")]
@@ -4836,6 +4837,11 @@ static LOAN_SHEDKAT_WHY: core::sync::atomic::AtomicU8 = core::sync::atomic::Atom
 /// XHCILOANSHEDKAT: µs the contender's masked claim took.
 #[cfg(target_arch = "x86_64")]
 static LOAN_SHEDKAT_US: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// XHCILOANSHEDKATCONTROLUS (zenbook-ledger Z80): µs the pre-shed control's masked contender took (`loan_shed_us=` on the
+/// PREEMPTAUDIT line); written only by the KAT task — 0 at the KAT's first statement, the control's reading once its
+/// contender came — so 0 means the control did not run.
+#[cfg(target_arch = "x86_64")]
+static LOAN_SHED_CONTROL_US: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 /// XHCILOANSHEDKAT contender (a task on a sibling CPU): one MASKED `claim_xhci_for_io` against the KAT's shed loan,
 /// timed; the outcome, the refusal's why and the µs published for the KAT.
@@ -4892,7 +4898,8 @@ fn loan_shed_contend(cpu: usize) -> (bool, u8, u8, u64) {
 /// on this CPU (no migration: the CPU read here is stable); a MASKED contender on a sibling CPU must spin Z62's
 /// bounded wait out (`masked_loan_wait`, [`LOAN_MASKED_WAIT_MS`]) and answer Busy why=masked-timeout inside
 /// [8, 20] ms. The first failed check: `control-same-cpu` / `control-late` / `control-got` / `control-why` /
-/// `control-early` (the wait path dead) / `control-slow`.
+/// `control-early` (the wait path dead) / `control-slow`. XHCILOANSHEDKATCONTROLUS (Z80): a contender that came leaves
+/// its µs in `LOAN_SHED_CONTROL_US` on every outcome.
 #[cfg(target_arch = "x86_64")]
 fn loan_shed_control() -> Result<(), &'static str> {
     let here = crate::arch::percpu::this_cpu().cpu_index as usize;
@@ -4904,6 +4911,7 @@ fn loan_shed_control() -> Result<(), &'static str> {
     if !came {
         return Err("control-late");
     }
+    LOAN_SHED_CONTROL_US.store(us.min(u32::MAX as u64) as u32, core::sync::atomic::Ordering::Relaxed);
     if code == 1 {
         return Err("control-got");
     }
@@ -4923,11 +4931,13 @@ fn loan_shed_control() -> Result<(), &'static str> {
 /// first failed check — `claim-busy` / `claim-notready` / `held-before` / `not-held` / `gate-ignored` / `not-released` /
 /// `still-published` / `claim-lost` / `not-counted` / `contender-got` / `contender-waited` / `contender-late` /
 /// `double-release` / `mark-kept`; the pre-shed control (XHCILOANSHEDKATCONTROL Z78) first: `control-same-cpu` /
-/// `control-late` / `control-got` / `control-why` / `control-early` / `control-slow`.
+/// `control-late` / `control-got` / `control-why` / `control-early` / `control-slow`. XHCILOANSHEDKATCONTROLUS (Z80): the
+/// control's µs reset to 0 first, so `loan_shed_us=` reads 0 on every return before the control's contender came.
 #[cfg(target_arch = "x86_64")]
 pub fn xhci_loan_shed_kat() -> &'static str {
     use core::sync::atomic::Ordering;
     use crate::arch::sched::preemptoff;
+    LOAN_SHED_CONTROL_US.store(0, Ordering::Relaxed);
     if crate::arch::irqs_masked() {
         return "skip(masked)";
     }
@@ -5016,6 +5026,13 @@ pub fn xhci_loan_shed_kat() -> &'static str {
         return "mark-kept";
     }
     "ok"
+}
+
+/// XHCILOANSHEDKATCONTROLUS (zenbook-ledger Z80): the pre-shed control's measured µs (`loan_shed_us=` after
+/// `loan_shed_kat=` on the PREEMPTAUDIT line): ~10000 on a live Z62 wait, 0 when the control did not run.
+#[cfg(target_arch = "x86_64")]
+pub fn xhci_loan_shed_control_us() -> u32 {
+    LOAN_SHED_CONTROL_US.load(core::sync::atomic::Ordering::Relaxed)
 }
 
 // ══════════ XHCILOANPOLLCAP (zenbook-ledger Z74) — the xhci-poll task is the block loan's ninth holder ══════════

@@ -1122,4 +1122,4 @@ refs/heads/exec-rmbp-masksitescore   df30fb939 FOLDED-BY-HAND (this commit) 2026
 refs/heads/exec-rmbp-preemptoffarmunafs   fc176da55 IN-FLIGHT cut 2026-10-28
 refs/heads/exec-rmbp-unafsreadcensus   fc176da55 IN-FLIGHT cut 2026-10-28
 refs/heads/exec-rmbp-installerudisks   fc176da55 IN-FLIGHT cut 2026-10-28
-refs/heads/exec-rmbp-xhciloanshedkatcontrolus   fc176da55 IN-FLIGHT cut 2026-10-28
+refs/heads/exec-rmbp-xhciloanshedkatcontrolus   1af778bd7 FOLDED-BY-HAND (this commit) 2026-10-27
