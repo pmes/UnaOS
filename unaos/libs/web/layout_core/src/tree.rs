@@ -718,7 +718,8 @@ fn ua_control<N: DomNode>(node: &N, _tag: &str, style: &mut Style) {
         }
         // AETHERIMAGEINPUTBOX (SR455): html.css `input[type="image" i] { padding: initial; border: initial }`, so an
         // image input has no UA edges and its border box is the image (or alt-label) size `control_intrinsic` gives.
-        Control::Button if node.tag().as_deref() == Some("input") && node.attr("type").is_some_and(|t| is_image_type(&t)) => {
+        // AETHERIMAGEINPUTFETCH (SR461): the guard is the ONE node predicate `is_image_input`.
+        Control::Button if is_image_input(node) => {
             style.padding = rect(0.0, 0.0, 0.0, 0.0);
             style.border = rect(0.0, 0.0, 0.0, 0.0);
         }
@@ -773,9 +774,10 @@ fn control_intrinsic<H: Host, F: Fonts + ?Sized>(node: &H::Node, fonts: &F, font
                 // The decoded image's size when the host has it; else a button labelled by Chromium's
                 // HTMLInputElement::AltText: alt, else value when alt is missing, an empty result "Submit"
                 // (IDS_FORM_INPUT_ALT).
+                // AETHERIMAGEINPUTFETCH (SR461): the AltText rule is `image_alt_label`, the host's failure paint's too.
                 "image" => H::img_intrinsic(node).or_else(|| {
-                    let alt = attr("alt").or_else(|| attr("value")).filter(|s| !s.is_empty());
-                    Some((adv(&button_label("submit", alt.as_deref())), line))
+                    let (alt, value) = (attr("alt"), attr("value"));
+                    Some((adv(&image_alt_label(alt.as_deref(), value.as_deref())), line))
                 }),
                 // Chromium LayoutFileUploadControl: ceil(max(34 x "0" (kDefaultWidthNumChars), the button's border
                 // box + 4 (kAfterButtonSpacing) + the status text)). AETHERFILEUAEDGES (SR459): the input has no UA
@@ -848,6 +850,20 @@ pub fn is_push_type(ty: &str) -> bool {
 /// (no control frame, render/mod.rs) both call.
 pub fn is_image_type(ty: &str) -> bool {
     ty.trim().eq_ignore_ascii_case("image")
+}
+
+/// AETHERIMAGEINPUTFETCH (SR461): whether a node is an `<input>` whose type `is_image_type` names: the ONE node predicate
+/// `ua_control`'s image arm, the img sizing rule in `layout` (width / height attributes, else the decoded size), and the
+/// host's image fetch (net `collect_image_urls`) and img paint (render/mod.rs) all call, so an image input rides an img's path.
+pub fn is_image_input<N: DomNode>(node: &N) -> bool {
+    node.tag().as_deref() == Some("input") && node.attr("type").is_some_and(|t| is_image_type(&t))
+}
+
+/// AETHERIMAGEINPUTFETCH (SR461): an image input's label when it has no image (Chromium's HTMLInputElement::AltText): `alt`,
+/// else `value` when alt is missing, an empty result "Submit" (IDS_FORM_INPUT_ALT), through `button_label`. The ONE rule
+/// `control_intrinsic` sizes the box by and the host render paints on a failed or missing image.
+pub fn image_alt_label<'a>(alt: Option<&'a str>, value: Option<&'a str>) -> alloc::borrow::Cow<'a, str> {
+    button_label("submit", alt.or(value).filter(|s| !s.is_empty()))
 }
 
 /// AETHERCONTROLINTRINSIC (SR448): a file input's two UA strings (Chromium's IDS_FORM_FILE_BUTTON_LABEL /
@@ -1885,7 +1901,7 @@ fn prepass<H: Host, F: Fonts + ?Sized>(tree: &mut LayoutTree<H>, fonts: &F) -> P
                 if let Some(wh) = control_intrinsic::<H, F>(dom_node, fonts, (if paint.and_then(|p| p.family).is_some() { size.family } else { 0 }, size.font_size)) {
                     out.imgs.insert(node_id, wh);
                 }
-                if tag == "img" {
+                if tag == "img" || is_image_input(dom_node) { // AETHERIMAGEINPUTFETCH (SR461): an image input sizes as an img
                     // width/height attributes win; else intrinsic dimensions.
                     let intrinsic = H::img_intrinsic(dom_node);
                     let w = attr_px("width").or(intrinsic.map(|(w, _)| w));

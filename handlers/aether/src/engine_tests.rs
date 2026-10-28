@@ -4208,4 +4208,48 @@ mod tests {
             assert!((pn as f64 - tn as f64).abs() <= 0.15 * tn as f64 && ((pcx - pbx) - (tcx - tbx)).abs() <= 1.0, "{padded}: the padded type paints its twin's caption (ink {pn} vs {tn}, offset {} vs {})", pcx - pbx, tcx - tbx);
         }
     }
+
+    /// AETHERIMAGEINPUTFETCH (SR461): an `<input type=image>` rides the img path (layout_core's ONE `is_image_input`): its
+    /// data: src is looked up and blitted as an img's, its box is the decoded size, or its width / height attributes
+    /// (the bitmap scaled into it, no value text over it); with no image it paints its AltText (`image_alt_label`).
+    #[test]
+    fn image_input_paints_src() {
+        use base64::Engine as _;
+        let blue = image::RgbaImage::from_pixel(8, 8, image::Rgba([0, 0, 255, 255]));
+        let mut png = std::io::Cursor::new(Vec::new());
+        blue.write_to(&mut png, image::ImageFormat::Png).unwrap();
+        let src = format!("data:image/png;base64,{}", base64::engine::general_purpose::STANDARD.encode(png.get_ref()));
+        let html = format!(
+            r#"<!doctype html><html><body>
+            <div><input type="image" id="n" src="{src}"></div>
+            <div><input type="image" id="s" width="40" height="30" value="Go" src="{src}"></div>
+            <div><input type="image" id="a" alt="Search the web"></div>
+        </body></html>"#
+        );
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 200));
+        engine.load_html("https://example.com/", &html, true);
+        engine.render_frame();
+        let rect = |e: &mut crate::AetherEngine, id: &str| -> (f64, f64, f64, f64) {
+            let r = |e: &mut crate::AetherEngine, k: &str| js_num(e, &format!("document.getElementById('{id}').getBoundingClientRect().{k}"));
+            (r(e, "left"), r(e, "top"), r(e, "width"), r(e, "height"))
+        };
+        let px = |e: &mut crate::AetherEngine, x: usize, y: usize| -> (u8, u8, u8) {
+            let i = (y * e.width as usize + x) * 4;
+            let s = e.surface();
+            (s[i + 2], s[i + 1], s[i])
+        };
+        let (l, t, w, h) = rect(&mut engine, "n");
+        assert!((w - 8.0).abs() <= 0.5 && (h - 8.0).abs() <= 0.5, "n: the box is the decoded 8 x 8 ({w}x{h})");
+        assert_eq!(px(&mut engine, (l + 4.0) as usize, (t + 4.0) as usize), (0, 0, 255), "n: the bitmap paints");
+        let (l, t, w, h) = rect(&mut engine, "s");
+        assert!((w - 40.0).abs() <= 0.5 && (h - 30.0).abs() <= 0.5, "s: width / height attributes size the box ({w}x{h})");
+        for y in (t.ceil() as usize)..((t + h).floor() as usize) {
+            for x in (l.ceil() as usize)..((l + w).floor() as usize) {
+                assert_eq!(px(&mut engine, x, y), (0, 0, 255), "s: every box pixel is the scaled bitmap, no value text ({x},{y})");
+            }
+        }
+        let (n, _, _) = caption_ink(&mut engine, "a");
+        assert!(n > 0, "a: an image input with no image paints its alt text");
+    }
 }
