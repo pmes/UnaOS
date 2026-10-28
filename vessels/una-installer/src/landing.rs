@@ -304,7 +304,7 @@ pub fn prompt_md(log: &FlightLog, checkout: &Path, dir_rel: &str) -> String {
         log.census.skip
     ));
     s.push_str("4. Name the next arcs: one line each, a NAME, the subsystem, and the wire that will show it fixed, in priority order.\n\n");
-    s.push_str("Nothing here calls a model or leaves this machine (INSTALLER-PROVIDER is owed).\n");
+    s.push_str("Nothing here calls a model on its own: the installer's `provider send` (INSTALLERPROVIDER SR424) posts this file and landing.md to the AI the person chose, and its reply lands as REPLY.md here.\n");
     s
 }
 
