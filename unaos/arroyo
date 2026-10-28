@@ -2931,6 +2931,8 @@ fi
 # row certifies the feature on the ARTIFACT, and `scripts/k8-reach.registry` records why an x86-only
 # USB-host driver has no Pi bare-metal arm.
 # See docs/dev/OS/07_USB_STORAGE/uvc.md.
+# XHCILOANPTPYIELDQEMUMTP (zenbook-ledger Z105): UNAOS_QEMU_MTP_RW=1 attaches QEMU's read-write `usb-mtp` (a fresh empty rootdir target/mtp-rw per invocation, desc UNAMTP) on xhci.0 through UNAOS_QEMU_EXTRA, UACMIC's shape, and arms UNAOS_UVC before its map line below (ptp/mtp ride `uvc`): `tests ptpout` drives Z94's SendObject Out yield over it. Leg: scripts/specs/x86-mtp.spec (knobleg).
+if [ -n "${UNAOS_QEMU_MTP_RW:-}" ]; then export UNAOS_UVC=1; _mtprw="$WORKSPACE_DIR/target/mtp-rw"; rm -rf "$_mtprw"; mkdir -p "$_mtprw"; case " ${UNAOS_QEMU_EXTRA:-} " in *" usb-mtp,"*) ;; *) export UNAOS_QEMU_EXTRA="${UNAOS_QEMU_EXTRA:-} -device usb-mtp,bus=xhci.0,rootdir=${_mtprw},desc=UNAMTP,readonly=false" ;; esac; fi
 [ -n "${UNAOS_UVC:-}" ] && _feats="${_feats}uvc,"
 # UACMIC (rmbp-ledger B723): UNAOS_UAC=1 arms the USB Audio Class 1 driver as a feature of its own (`uac`, which
 # implies `uvc` in Cargo.toml: the class rides the isochronous engine, XHCIISO) AND attaches QEMU's `usb-audio` on the

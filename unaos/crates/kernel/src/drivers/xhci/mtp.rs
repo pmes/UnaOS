@@ -1237,3 +1237,80 @@ pub mod fixture {
         (s, x)
     }
 }
+
+// ── XHCILOANPTPYIELDQEMUMTP (zenbook-ledger Z105): `tests ptpout` — Z94's Out yield over a real MTP responder ───────
+
+/// XHCILOANPTPYIELDQEMUMTP (zenbook-ledger Z105): a PTP/MTP device is known to the controller — `fixture::attach`'s own
+/// refusal read (the synthetic responder cannot be the session's phone while this holds), so `tests mtpphone` SKIPs there.
+pub fn device_known() -> bool {
+    super::STATE.load(Ordering::Relaxed) != super::ST_ABSENT || super::SLOT.load(Ordering::Relaxed) != 0
+}
+
+/// XHCILOANPTPYIELDQEMUMTP (zenbook-ledger Z105): `tests ptpout` — a send over 8 MiB to a REAL responder (QEMU's read-write
+/// `usb-mtp`, arroyo's `UNAOS_QEMU_MTP_RW`) with Z73's block claimant armed, so SendObject's Out data phase
+/// (`ptp_txn_inner`, Z94's `YieldTally`) yields at least once and a block claimant takes the window: Z73's line
+/// `[xhci] loan yield who=ptp-out n=<n> taken=<n> ...` is printed by the send itself. The claimant must be armed INSIDE the
+/// hold (`yield_kat_arm`'s contract), so this runs `write_file`'s transport call itself — `send_object` under
+/// `with_controller` — never a copy of the yield path; the object is deleted after. SKIP at once with no PTP device.
+/// `:: PTPOUT: bytes=<n> handle=<h> yields=<n> taken=<n> claimant=ok deleted=<0|1> -> PASS ::`, or `-> FAIL
+/// reason=<send(<e>)|claimant|no-yield|untaken> ::`, or `-> SKIP(no-device|not-mtp|one-cpu) ::`.
+#[cfg(target_arch = "x86_64")]
+pub fn out_yield_selftest() {
+    const BYTES: usize = (8 << 20) + (64 << 10);
+    const NAME: &str = "PTPOUT.BIN";
+    if !device_known() || FIXTURE.lock().is_some() {
+        serial_println!(":: PTPOUT: -> SKIP(no-device) ::");
+        return;
+    }
+    let t0 = crate::arch::ms();
+    while !super::is_mtp_session() && crate::arch::ms().saturating_sub(t0) < 5000 {
+        crate::arch::sched::yield_now();
+    }
+    let Some(sid) = super::storages().first().copied().filter(|_| super::is_mtp_session()) else {
+        serial_println!(":: PTPOUT: -> SKIP(not-mtp) ::");
+        return;
+    };
+    let data: Vec<u8> = (0..BYTES).map(|i| (i as u8) ^ ((i >> 13) as u8)).collect();
+    let (y0, k0) = crate::drivers::block::xhci_loan_yields();
+    let mut arm: Result<(), &'static str> = Err("skip(not-run)");
+    let sent = super::with_controller(|c| {
+        arm = super::yield_kat_arm(); // inside the hold: the claimant hlt-waits in `claim_xhci_for_io` until a window
+        send_object(c, sid, 0xFFFF_FFFF, NAME, &data)
+    });
+    super::yield_kat_settle(arm != Err("skip(one-cpu)") && arm != Err("skip(not-run)"));
+    let (y1, k1) = crate::drivers::block::xhci_loan_yields();
+    let (yields, taken) = (y1.wrapping_sub(y0), k1.wrapping_sub(k0));
+    if arm == Err("skip(one-cpu)") {
+        serial_println!(":: PTPOUT: -> SKIP(one-cpu) ::");
+        return;
+    }
+    let deleted = match sent {
+        Ok(h) => super::with_controller(|c| delete_object(c, h)).is_ok(),
+        Err(_) => false,
+    };
+    let handle = match sent {
+        Ok(h) => alloc::format!("{:#010x}", h),
+        Err(_) => String::from("-"),
+    };
+    let claimant = match arm {
+        Ok(()) => "ok",
+        Err(s) => s,
+    };
+    let reason: Option<String> = match (sent, arm) {
+        (Err(e), _) => Some(alloc::format!("send({})", e)),
+        (_, Err(_)) => Some(String::from("claimant")),
+        _ if yields == 0 => Some(String::from("no-yield")),
+        _ if taken == 0 => Some(String::from("untaken")),
+        _ => None,
+    };
+    match reason {
+        None => serial_println!(
+            ":: PTPOUT: bytes={} handle={} yields={} taken={} claimant={} deleted={} -> PASS ::",
+            BYTES, handle, yields, taken, claimant, deleted as u8
+        ),
+        Some(r) => serial_println!(
+            ":: PTPOUT: bytes={} handle={} yields={} taken={} claimant={} deleted={} -> FAIL reason={} ::",
+            BYTES, handle, yields, taken, claimant, deleted as u8, r
+        ),
+    }
+}
