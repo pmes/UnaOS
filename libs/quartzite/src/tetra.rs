@@ -1149,4 +1149,41 @@ mod face_door_tests {
         assert!(door.take().is_none());
         assert_eq!(woken.load(Ordering::SeqCst), 1);
     }
+
+    /// FACELIVE-URLBAR (SR443): the url-bar field (an OpenDocument TextField, whose AppKit view owns the "url-bar"
+    /// subscriber recorded by `face_held`) is reached by exactly ONE Restack or Replace at or above it (the one
+    /// `face_drop` that aborts its subscriber) when it leaves the shown tree; a placeholder-only change keeps it.
+    #[test]
+    fn facelive_urlbar_one_drop() {
+        fn url_bar(placeholder: &str, action: TextAction) -> TetraNode {
+            TetraNode::TextField { id: "browser.url".into(), placeholder: placeholder.into(), action, secret: false }
+        }
+        fn chrome(row: TetraNode) -> TetraNode {
+            TetraNode::VStack(vec![row, console("page")])
+        }
+        fn row(bar: TetraNode, extra: usize) -> TetraNode {
+            let mut kids = vec![button("nav.back", "Back"), bar];
+            kids.extend((0..extra).map(|i| button(&format!("nav.extra.{i}"), "x")));
+            TetraNode::HStack(kids)
+        }
+        let at = [0usize, 1];
+        let drops = |p: &[FacePatch]| {
+            p.iter()
+                .filter(|x| matches!(x, FacePatch::Restack { path, .. } | FacePatch::Replace { path, .. } if at.starts_with(path)))
+                .count()
+        };
+        let a = chrome(row(url_bar("Search or enter address", TextAction::OpenDocument), 0));
+        let p = face_diff(&a, &chrome(row(url_bar("Search or enter address", TextAction::ConsoleInput), 0)));
+        assert!(matches!(&p[..], [FacePatch::Replace { path, .. }] if *path == at.to_vec()), "{p:?}");
+        assert_eq!(drops(&p), 1, "the field replaced: one drop");
+        let p = face_diff(&a, &chrome(button("nav.back", "Back")));
+        assert!(matches!(&p[..], [FacePatch::Replace { path, .. }] if *path == vec![0]), "{p:?}");
+        assert_eq!(drops(&p), 1, "its row replaced by a leaf: one drop");
+        let p = face_diff(&a, &chrome(row(url_bar("Search or enter address", TextAction::OpenDocument), 1)));
+        assert!(matches!(&p[..], [FacePatch::Restack { path, .. }] if *path == vec![0]), "{p:?}");
+        assert_eq!(drops(&p), 1, "its row restacked: one drop");
+        let p = face_diff(&a, &chrome(row(url_bar("example.org", TextAction::OpenDocument), 0)));
+        assert!(matches!(&p[..], [FacePatch::Field { path, .. }] if *path == at.to_vec()), "{p:?}");
+        assert_eq!(drops(&p), 0, "a placeholder change keeps the field and its subscriber");
+    }
 }

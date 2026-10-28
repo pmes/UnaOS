@@ -42,7 +42,9 @@ pub fn eval_tetra(node: TetraNode, synapse: Synapse) -> Retained<NSView> {
             super::button::bootstrap_button(&label, action, synapse)
         }
         TetraNode::TextField { id: _, placeholder, action, secret } => {
-            stretch(super::text_field::bootstrap_text_field(&placeholder, secret, action, synapse), 0)
+            // FACELIVE-URLBAR (SR443): the url-bar field's subscriber handle kept beside the Console / Surface ones
+            let (view, abort) = super::text_field::bootstrap_text_field(&placeholder, secret, action, synapse);
+            stretch(match abort { Some(a) => face_held((view, a)), None => view }, 0)
         }
         TetraNode::Surface { id } => {
             // Note: SurfaceBlit must target a Surface by id once >1 surface exists
