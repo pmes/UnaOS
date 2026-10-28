@@ -1545,7 +1545,7 @@ impl XhciController {
                 let mut got = n as u64;
                 let mut short = n < XFER_MAX;
                 let mps = (IN_MPS.load(Ordering::Relaxed) as usize).max(64);
-                let (mut yn, mut yt, mut ymax) = (0u32, 0u32, 0u64); let mut yp = 0u32; // XHCILOANPTPYIELDPOLLTAKE (Z82): `yp` = windows the xhci-poll take closed. XHCILOANPTPYIELD (Z73): this transfer's yields, windows taken, the longest
+                let (mut yn, mut yt, mut ymax) = (0u32, 0u32, 0u64); let mut yp = 0u32; let mut yq = 0u32; // XHCILOANPTPYIELDPTPTAKE (Z87): `yq` = windows a second PTP claim's take closed. XHCILOANPTPYIELDPOLLTAKE (Z82): `yp` = windows the xhci-poll take closed. XHCILOANPTPYIELD (Z73): this transfer's yields, windows taken, the longest
                 while !short && (unknown || got < total) {
                     let want = if unknown {
                         XFER_MAX
@@ -1562,13 +1562,13 @@ impl XhciController {
                         // XHCILOANPTPYIELD (Z73): the ONE yield point — between two TDs of the data phase (nothing armed).
                         if let Some((us, t)) = loan_yield(self, false)? {
                             yn += 1;
-                            yt += t as u32; yp += (t && crate::drivers::block::xhci_loan_yield_closed_by_poll()) as u32; // XHCILOANPTPYIELDPOLLTAKE (Z82): the window's closer, recorded at the take
+                            yt += t as u32; yp += (t && crate::drivers::block::xhci_loan_yield_closed_by_poll()) as u32; yq += (t && crate::drivers::block::xhci_loan_yield_closed_by_ptp()) as u32; // XHCILOANPTPYIELDPTPTAKE (Z87): and the PTP closes. XHCILOANPTPYIELDPOLLTAKE (Z82): the window's closer, recorded at the take
                             ymax = ymax.max(us);
                         }
                     }
                 }
                 if got > (8 << 20) {
-                    serial_println!("[xhci] loan yield who=ptp n={} taken={} taken_poll={} waited_us={} yield_skips={}{} (XHCILOANPTPYIELD Z73)", yn, yt.saturating_sub(yp), yp, ymax, super::pump_yield_skips(), crate::drivers::block::PollSkips); // XHCILOANPTPYIELDPOLLTAKE (Z82): taken= the block claimants served, taken_poll= the xhci-poll closes. XHCILOANPTPYIELDPOLLSKIP (Z86): ` poll_skips=<n>` only when the poller was refused in a window
+                    serial_println!("[xhci] loan yield who=ptp n={} taken={} taken_poll={}{} waited_us={} yield_skips={}{} (XHCILOANPTPYIELD Z73)", yn, yt.saturating_sub(yp).saturating_sub(yq), yp, if yq > 0 { alloc::format!(" taken_ptp={}", yq) } else { String::new() }, ymax, super::pump_yield_skips(), crate::drivers::block::PollSkips); // XHCILOANPTPYIELDPTPTAKE (Z87): ` taken_ptp=<n>` only when a second PTP claim closed a window (byte-identical at 0). XHCILOANPTPYIELDPOLLTAKE (Z82): taken= the block claimants served, taken_poll= the xhci-poll closes. XHCILOANPTPYIELDPOLLSKIP (Z86): ` poll_skips=<n>` only when the poller was refused in a window
                 }
                 if !unknown && got < total {
                     return Err("data phase short");
