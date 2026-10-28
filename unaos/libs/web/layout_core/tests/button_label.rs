@@ -46,3 +46,69 @@ fn button_intrinsic_width_matches_label() {
     assert!(w("b0") > 0.0, "the empty button keeps its padding and border: {}", w("b0"));
     assert_eq!(w("bg"), w("sg"), "a valued button measures its value whatever its type");
 }
+
+// ---- AETHERCONTROLINTRINSIC (SR448): image / file / color intrinsics ------------------------------------------
+
+/// Each input alone in a flex row, so its border box is its intrinsic size.
+fn lone(id: &'static str, attrs: &[(&'static str, &'static str)]) -> Spec {
+    let mut a: Vec<(&'static str, &str)> = vec![("id", id)];
+    a.extend_from_slice(attrs);
+    el("div", &[("style", "display: flex")], vec![el("input", &a, vec![])])
+}
+
+#[test]
+fn file_intrinsic_width() {
+    let doc = page(vec![
+        lone("f", &[("type", "file")]),
+        lone("fm", &[("type", "file"), ("multiple", "")]),
+        lone("f2", &[("type", "file"), ("style", "font-size: 26.666px")]),
+        lone("s", &[("type", "submit")]),
+    ]);
+    let tree = lay(&doc, 800.0, 600.0);
+    let b = |id: &str| box_of(&tree, &doc.by_id(id));
+    // The test font: a character is half the size wide. Chromium's floor, 34 x "0", beats
+    // "Choose File" (button edges 16) + 4 + "No file chosen" at the UA size: 226.66 vs 186.66.
+    let floor = 34.0 * 13.333 * 0.5;
+    // box_of reports the laid box on whole pixels.
+    assert_eq!(b("f").2, f32::round(floor), "file border box is 34 digits wide: {}", b("f").2);
+    assert_eq!(b("fm").2, b("f").2, "multiple keeps the floor while it dominates");
+    assert_eq!(b("f2").2, f32::round(34.0 * 26.666 * 0.5), "the floor is in the element's font: {}", b("f2").2);
+    assert_eq!(b("f").3, b("s").3, "a file input is one button line tall");
+    assert_eq!(layout_core::file_label(false), ("Choose File", "No file chosen"));
+    assert_eq!(layout_core::file_label(true), ("Choose Files", "No file chosen"));
+}
+
+#[test]
+fn color_intrinsic_fixed() {
+    let doc = page(vec![
+        lone("c", &[("type", "color")]),
+        lone("c2", &[("type", "color"), ("style", "font-size: 30px")]),
+    ]);
+    let tree = lay(&doc, 800.0, 600.0);
+    let b = |id: &str| box_of(&tree, &doc.by_id(id));
+    assert_eq!((b("c").2, b("c").3), (50.0, 27.0), "the UA swatch is 50 x 27");
+    assert_eq!((b("c2").2, b("c2").3), (50.0, 27.0), "the swatch does not follow the font");
+}
+
+#[test]
+fn image_intrinsic_alt() {
+    let doc = page(vec![
+        lone("ia", &[("type", "image"), ("alt", "Search")]),
+        lone("sa", &[("type", "submit"), ("value", "Search")]),
+        lone("i0", &[("type", "image")]),
+        lone("s0", &[("type", "submit")]),
+        lone("iv", &[("type", "image"), ("value", "Go")]),
+        lone("sv", &[("type", "submit"), ("value", "Go")]),
+        lone("ie", &[("type", "image"), ("alt", "")]),
+        lone("iev", &[("type", "image"), ("alt", ""), ("value", "Go")]),
+    ]);
+    let tree = lay(&doc, 800.0, 600.0);
+    let b = |id: &str| box_of(&tree, &doc.by_id(id));
+    // The test host has no decoded image, so every image input is its alt-text button.
+    assert_eq!(b("ia"), (b("ia").0, b("ia").1, b("sa").2, b("sa").3), "alt labels the button");
+    assert_eq!(b("i0").2, b("s0").2, "no alt and no value: Submit");
+    assert_eq!(b("iv").2, b("sv").2, "a missing alt falls to the value");
+    assert_eq!(b("ie").2, b("s0").2, "an empty alt and no value: Submit");
+    // Chromium's AltText: the value stands in only for a MISSING alt; an empty alt is Submit.
+    assert_eq!(b("iev").2, b("s0").2, "an empty alt with a value: Submit");
+}

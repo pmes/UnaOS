@@ -703,13 +703,41 @@ fn control_intrinsic<H: Host, F: Fonts + ?Sized>(node: &H::Node, fonts: &F, font
         }
         Control::Button if node.tag().as_deref() == Some("input") => {
             // AETHERBUTTONLABELONE (SR423): a push button's label is the ONE rule, `button_label`, the host paint
-            // calls too; image / file / color keep the Submit stand-in until their own intrinsics (owed
-            // AETHER-CONTROLINTRINSIC).
+            // calls too. AETHERCONTROLINTRINSIC (SR448): image / file / color size by their own measured rules
+            // (Chromium), each in the element's font through the same `text_advance` / `button_line_height`.
             let t = attr("type").unwrap_or_default();
             let value = attr("value");
             let push = is_push_type(&t);
             let label = button_label(if push { t.as_str() } else { "submit" }, value.as_deref());
             Some((text_advance(fonts, &label, font.0, font.1), button_line_height(fonts, font.0, font.1)))
+}
+
+            let adv = |s: &str| text_advance(fonts, s, font.0, font.1);
+            let line = button_line_height(fonts, font.0, font.1);
+            // ua_control's Button edges (padding 1px 6px + border 2px): the border-box rules below subtract them.
+            let (edge_w, edge_h) = (16.0_f32, 6.0_f32);
+            match t.trim().to_ascii_lowercase().as_str() {
+                // The decoded image's size when the host has it; else a button labelled by Chromium's
+                // HTMLInputElement::AltText: alt, else value when alt is missing, an empty result "Submit"
+                // (IDS_FORM_INPUT_ALT).
+                "image" => H::img_intrinsic(node).or_else(|| {
+                    let alt = attr("alt").or_else(|| attr("value")).filter(|s| !s.is_empty());
+                    Some((adv(&button_label("submit", alt.as_deref())), line))
+                }),
+                // Chromium LayoutFileUploadControl: border box = max(34 x "0" (kDefaultWidthNumChars), the
+                // button's border box + 4 (kAfterButtonSpacing) + the status text); the input's own UA edges
+                // stand for the button's.
+                "file" => {
+                    let (button, status) = file_label(attr("multiple").is_some());
+                    Some(((34.0 * adv("0") - edge_w).max(adv(button) + 4.0 + adv(status)), line))
+                }
+                // html.css: a fixed 50 x 27 swatch border box, font-independent.
+                "color" => Some((50.0 - edge_w, 27.0 - edge_h)),
+                _ => {
+                    let value = attr("value");
+                    Some((adv(&button_label(t.as_str(), value.as_deref())), line))
+                }
+            }
         }
         Control::Select => {
             let label = select_selected_option::<H>(node).map(|(_, l)| l).unwrap_or_default();
@@ -753,6 +781,13 @@ pub fn button_label<'a>(ty: &str, value: Option<&'a str>) -> alloc::borrow::Cow<
 pub fn is_push_type(ty: &str) -> bool {
     let ty = ty.trim();
     ty.eq_ignore_ascii_case("submit") || ty.eq_ignore_ascii_case("reset") || ty.eq_ignore_ascii_case("button")
+}
+
+/// AETHERCONTROLINTRINSIC (SR448): a file input's two UA strings (Chromium's IDS_FORM_FILE_BUTTON_LABEL /
+/// IDS_FORM_MULTIPLE_FILES_BUTTON_LABEL and IDS_FORM_FILE_NO_FILE_LABEL): the button's caption, "Choose Files"
+/// with `multiple`, and the status text shown while no file is chosen. Read by `control_intrinsic`.
+pub fn file_label(multiple: bool) -> (&'static str, &'static str) {
+    (if multiple { "Choose Files" } else { "Choose File" }, "No file chosen")
 }
 
 // ---- AETHERCAPTIONCORE (SR438): a push button's caption geometry, one rule for both rings ----------------------
