@@ -1220,7 +1220,7 @@ refs/heads/exec-rmbp-aethercaptionside   a2e6e4e02 FOLDED-BY-HAND (this commit) 
 refs/heads/exec-rmbp-gen7parkword   c0675186a FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-preemptoffarmwmtablerouteleg   eebf6cfa1 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-preemptoffsleepcheckyieldsitewrappers   ec31ee65e FOLDED-BY-HAND (this commit) 2026-10-27
-refs/heads/exec-rmbp-legskipclaim   36ddba81c IN-FLIGHT cut 2026-10-28
+refs/heads/exec-rmbp-legskipclaim   fa285b760 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-xhciloanptpyieldqemumtppick   dd9e55379 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-aetherimageinputfetch   36ddba81c IN-FLIGHT cut 2026-10-28
 refs/heads/exec-rmbp-preemptoffarmirqmarkstaleleg   efbe58be9 IN-FLIGHT cut 2026-10-28
