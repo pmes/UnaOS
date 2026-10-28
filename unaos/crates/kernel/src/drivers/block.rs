@@ -4324,7 +4324,7 @@ fn take_block_loan() -> Result<BlockLoan, XhciClaimError> {
     crate::arch::sched::preemptoff::disable();
     match xhci::claim() {
         Ok(l) => {
-            let tag = crate::arch::percpu::this_cpu().cpu_index.saturating_add(1); loan_shed_arm(); // XHCILOANFAILHOLD (Z66): the loan's age starts here, its shed mark cleared
+            let tag = crate::arch::percpu::this_cpu().cpu_index.saturating_add(1); loan_shed_arm(); loan_yield_close(); // XHCILOANFAILHOLD (Z66): the loan's age starts here, its shed mark cleared. XHCILOANPTPYIELDPOLLTAKE (Z82): an open PTP yield window records its closer BEFORE the publish below
             BLOCK_LOAN_CPU.store(tag, core::sync::atomic::Ordering::Release);
             Ok(BlockLoan { loan: Some(l), tag })
         }
@@ -4580,7 +4580,7 @@ impl BlockLoan {
         }
         let before: *const crate::drivers::xhci::XhciController = &***self;
         let t0 = crate::arch::now_cycles();
-        drop(self.loan.take()); // the PUT: XhciLoan's masked O(1) put
+        LOAN_YIELD_CLOSER.store(LOAN_CLOSER_OPEN, Ordering::Release); drop(self.loan.take()); // the PUT: XhciLoan's masked O(1) put. XHCILOANPTPYIELDPOLLTAKE (Z82): the window is marked open while this hold still has the loan
         let m0 = crate::arch::ms();
         let mut taken = false;
         loop {
@@ -5047,4 +5047,57 @@ pub fn xhci_loan_shed_control_us() -> u32 {
 #[cfg(target_arch = "x86_64")]
 pub fn xhci_poll_loan() -> Result<BlockLoan, XhciClaimError> {
     take_block_loan()
+}
+
+// ══════════ XHCILOANPTPYIELDPOLLTAKE (zenbook-ledger Z82) — a PTP yield window records WHO closed it: a block claimant or the xhci-poll take ══════════
+//
+// TAIL-APPENDED (two LINE-NEUTRAL folds: `take_block_loan`'s x86 Ok arm and `yield_now`'s PUT line). Z73's window ends at
+// the first published take (`BLOCK_LOAN_CPU`), and `take_block_loan` is its ONLY publisher; the xhci-poll task (Z74's
+// `xhci_poll_loan`) takes through it every tick, so `taken=` on the `[xhci] loan yield` line counted the poller's 48 µs
+// hold as a served claimant. The holder marks the window OPEN before its put; the FIRST take after the put swaps OPEN for
+// its class BEFORE it publishes (one CAS: every later take, the re-take included, fails it), so `yield_now` seeing the
+// publish sees the closer. The poll take is told apart by its task, `xhci-poll` (the identity Z76's skip line names).
+// Owed: XHCILOAN-PTPYIELD-POLLSKIP, XHCILOAN-PTPYIELD-KATCLOSER, XHCILOAN-PTPYIELD-PTPTAKE.
+
+/// XHCILOANPTPYIELDPOLLTAKE: the closer word's states — a window open, closed by a block take, closed by the xhci-poll take.
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+const LOAN_CLOSER_OPEN: u8 = 1;
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+const LOAN_CLOSER_BLOCK: u8 = 2;
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+const LOAN_CLOSER_POLL: u8 = 3;
+
+/// XHCILOANPTPYIELDPOLLTAKE: who closed the current / last PTP yield window (written OPEN by the PTP holder before its put,
+/// swapped by the first take after it; read by `ptp` after the re-take). Lock-free.
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+static LOAN_YIELD_CLOSER: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// XHCILOANPTPYIELDPOLLTAKE: called by `take_block_loan` after a successful take and BEFORE its publish: an open window
+/// gets its closer (one load and out for every take outside a window).
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn loan_yield_close() {
+    #[cfg(feature = "uvc")]
+    {
+        use core::sync::atomic::Ordering;
+        if LOAN_YIELD_CLOSER.load(Ordering::Acquire) != LOAN_CLOSER_OPEN {
+            return;
+        }
+        let who = if crate::arch::sched::current_name() == Some("xhci-poll") { LOAN_CLOSER_POLL } else { LOAN_CLOSER_BLOCK };
+        let _ = LOAN_YIELD_CLOSER.compare_exchange(LOAN_CLOSER_OPEN, who, Ordering::AcqRel, Ordering::Relaxed);
+    }
+}
+
+/// XHCILOANPTPYIELDPOLLTAKE: whether the last PTP yield window was closed by the xhci-poll task's take (read by
+/// `ptp_txn_inner` right after a taken yield; one PTP hold at a time). aarch64: never (no publication there).
+#[cfg(feature = "uvc")]
+pub fn xhci_loan_yield_closed_by_poll() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        LOAN_YIELD_CLOSER.load(core::sync::atomic::Ordering::Acquire) == LOAN_CLOSER_POLL
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
 }
