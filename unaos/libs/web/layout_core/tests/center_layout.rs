@@ -167,3 +167,50 @@ fn caption_plain_center_leaves_blocks() {
         assert!((x - cx).abs() < 0.5, "plain text-align: center in a caption does not move the block #{id} (x {x}, caption {cx})");
     }
 }
+
+/// AETHERCAPTIONUAALIGN (SR452): a bare caption takes Blink's html.css `caption { text-align: -webkit-center }` (the
+/// seat's ruling: 5, not the spec's center), so its text line centres in the caption; an author `text-align: left`
+/// (a stylesheet rule or `style=""`) overrides the UA value and the line sits at the caption's start.
+#[test]
+fn caption_ua_centres_text() {
+    fn doc_with(cap_attrs: &[(&'static str, &str)]) -> N {
+        let mut attrs = vec![("id", "cap")];
+        attrs.extend_from_slice(cap_attrs);
+        page(vec![el(
+            "table",
+            &[("style", "width: 600px; border-spacing: 0")],
+            vec![el("caption", &attrs, vec![text("Quarterly results")]), el("tr", &[], vec![el("td", &[], vec![text("row")])])],
+        )])
+    }
+    // The caption's first text fragment: (x, width) in the caption's content box, and the caption's width.
+    fn line(tree: &Tree, doc: &N) -> (f32, f32, f32) {
+        let cap = doc.by_id("cap");
+        let (_, _, cw, _) = box_of(tree, &cap);
+        let il = &tree.inline[&id_of(tree, &cap)];
+        let (x, w) = il
+            .frags
+            .iter()
+            .find_map(|f| match f {
+                layout_core::inline::Frag::Text { x, width, .. } => Some((*x, *width)),
+                _ => None,
+            })
+            .expect("the caption's text line");
+        (x, w, cw)
+    }
+
+    let bare = doc_with(&[]);
+    let (x, w, cw) = line(&lay(&bare, VW, 400.0), &bare);
+    assert!(cw > 400.0 && w > 0.0 && w < cw - 100.0, "bare caption: a short line in a wide caption (w {w} of {cw})");
+    assert!((x + w / 2.0 - cw / 2.0).abs() <= 1.0, "bare caption: the UA -webkit-center centres the text (x {x} w {w} of {cw})");
+
+    let cx = layout_core::css::ParseCx::new(VW, 400.0);
+    let mut s = layout_core::css::SpecifiedStyle::<TH>::default();
+    layout_core::css::apply_declaration("text-align", "left", &mut s, &cx);
+    let sheet = Sheet(vec![(bare.by_id("cap").id, std::rc::Rc::new(s))]);
+    let (x, _, _) = line(&lay_styled(&bare, &sheet, VW, 400.0), &bare);
+    assert_eq!(x, 0.0, "an author rule caption {{ text-align: left }} wins over the UA value");
+
+    let inline = doc_with(&[("style", "text-align: left")]);
+    let (x, _, _) = line(&lay(&inline, VW, 400.0), &inline);
+    assert_eq!(x, 0.0, "style=\"text-align: left\" on the caption wins over the UA value");
+}
