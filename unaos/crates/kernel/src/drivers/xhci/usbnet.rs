@@ -759,8 +759,8 @@ pub fn raw_tx(frame: &[u8]) {
 /// One controller pass for this link, from the stack's context, when the loan is free. NETCLOCK: the
 /// DATA pass only (RX reap/arm, TX reap/issue — no PHY poll, no bring-up, which stay on the main loop's
 /// full `service_usbnet`), so the loan is held for the event drain and one enqueue; the hold is measured.
-fn drive() {
-    let _mask = crate::arch::IrqMask::new(); // USBNETKILLSFTDI (B486): the stack-side loan is a MASKED hold — `net-tick` preempted inside it kept the loan (and the FTDI's drain) from the main loop for good on flight 26
+fn drive() { drive_span(drive_pass) } fn drive_pass() { // PREEMPTOFFARMUSBNETDRIVE (zenbook-ledger Z83): the span is `drive_span`'s (file tail): preempt-off on aarch64, B486's mask elsewhere. LINE-NEUTRAL
+    // USBNETKILLSFTDI (B486): the stack-side loan is a MASKED hold — `net-tick` preempted inside it kept the loan (and the FTDI's drain) from the main loop for good on flight 26
     if let Ok(mut x) = crate::drivers::xhci::claim() {
         let t0 = crate::arch::now_cycles();
         x.poll_events();
@@ -2794,4 +2794,31 @@ pub fn dhcp_selftest() {
 #[cfg(all(target_arch = "x86_64", feature = "lidsleep", feature = "wc"))]
 pub fn link_poll_held(now_ms: u64) {
     POLL_NEXT.store(now_ms + if LINK.load(Ordering::Relaxed) { 2000 } else { 250 }, Ordering::Relaxed);
+}
+
+// ── PREEMPTOFFARMUSBNETDRIVE (zenbook-ledger Z83, BP-cores-23) — `drive`'s span on aarch64 is preempt-off with PSTATE.I as the
+// caller had it (was B486's `IrqMask`). The span holds only the xHCI loan (an unpublished try-claim), and nothing inside yields:
+// `poll_events` drains at most `POLL_DRAIN_CAP` events, and the one wait (`usbnet_rx_reset` -> `run_command_sync` ->
+// `pump_until_cmd_done`) is a CNTPCT-budgeted loop whose `crate::hlt()` is WFI with no scheduler entry (an unmasked caller takes
+// the tick and `timer_preempt` declines on the count). No aarch64 ISR takes the loan, the event/command ring locks or the frame
+// rings (xHCI is polled), and a masked or preempt-off block claimant answers Busy at once (the loan stays unpublished). x86 keeps
+// the mask. The aarch64 audit counts the span in `converted=` (sched.rs `AUDIT_CONVERTED`). No QEMU line reaches `drive` (virt
+// carries no `usb-net`, raspi4b no xHCI): the Orin bench with a dongle is the witness. At the tail: no line above moves.
+
+/// PREEMPTOFFARMUSBNETDRIVE: the converted span counted in the aarch64 audit's `converted=` (every aarch64 build carrying `usbnet`).
+#[cfg(target_arch = "aarch64")]
+pub const CONVERTED_USBNET: u32 = 1;
+
+/// PREEMPTOFFARMUSBNETDRIVE: aarch64 — `drive_pass` under `preemptoff::scoped` (COMPGATE's count, taken masked; PSTATE.I as the
+/// caller had it).
+#[cfg(target_arch = "aarch64")]
+fn drive_span(f: fn()) {
+    crate::arch::sched::preemptoff::scoped(f)
+}
+
+/// PREEMPTOFFARMUSBNETDRIVE: every other arch — B486's masked hold, unchanged.
+#[cfg(not(target_arch = "aarch64"))]
+fn drive_span(f: fn()) {
+    let _mask = crate::arch::IrqMask::new();
+    f()
 }
