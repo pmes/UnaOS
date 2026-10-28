@@ -6,9 +6,10 @@
 // people to connect to their ai of choice". The landing face (INSTALLERLANDING SR415) lands `PROMPT.md` + `landing.md`
 // under docs/dev/evidence/landing-<stamp>/; this face SENDS them. It BUILDS NO PROVIDER and KEEPS NO KEY STORE: the
 // provider is Vein's `ProviderSlot::from_lookup_with` (Principia's `vein` preferences, Holocron's `vein/claude.api_key`
-// first, the env var the preference names as the fallback), the one call is `ModelProvider::generate` (its retry,
-// `send_with_backoff`, rides inside), and the pick is two Principia `PrefSet`s (`menu_choice_prefs`) through
-// `Principia::process_impulse`, as Vein's Settings dropdown writes them.
+// first, the env var the preference names as the fallback), the one call is `ModelProvider::stream` (its retry,
+// `send_with_backoff`, rides inside; `generate` only when the provider answers `Unsupported`), and the pick is two
+// Principia `PrefSet`s (`menu_choice_prefs`) through `Principia::process_impulse`, as Vein's Settings dropdown writes
+// them.
 //
 // The key: Vein never stores one (the preference names an env var; Holocron has custody). A key typed here is HELD in
 // this process only — never written, never printed — and answers exactly the env var `ProviderConfig::key_env` names,
@@ -19,18 +20,28 @@
 //
 // Rung 1 sends PROMPT.md and landing.md's census (about 1k tokens); the boot logs are NAMED, not sent.
 //
+// INSTALLERPROVIDERSTREAM (LEDGER SR429): the send streams. The provider's `DeltaStream` is teed (`Tee`) into gneiss_pal's
+// own fold `sse::collect` (no second fold): each text delta also crosses the SAME std mpsc the verdict uses as
+// `Msg::Delta`, `Provider::poll` keeps the last `LIVE_LINES` of it in `live`, and the face shows that tail in its
+// Console. REPLY.md is written once at the end by the generate path's own lines, so the file is byte-identical.
+// `first_ms` is the time to the first delta (0 = none arrived: refused, `send=-`, or the generate fallback).
+//
 // Wire:
-//   [installer] provider name=<claude|gemini|claudecode|none> key=<set|missing> send=<ok|refused|-> why=<-|no-key|no-landing|network|provider-error> reply_kb=<n> ms=<n>
+//   [installer] provider name=<claude|gemini|claudecode|none> key=<set|missing> send=<ok|refused|-> why=<-|no-key|no-landing|network|provider-error> reply_kb=<n> ms=<n> first_ms=<n>
 
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::mpsc::{Receiver, channel};
+use std::sync::mpsc::{Receiver, Sender, channel};
+use std::task::{Context, Poll};
 use std::time::Instant;
+
+use futures_core::Stream;
 
 use bandy::{PrefValue, PrincipiaCommand, SMessage};
 use gneiss_pal::api::provider::{CLAUDE_DEFAULT_MODEL, GEMINI_DEFAULT_MODEL};
 use gneiss_pal::api::{
-    ChatRequest, ModelProvider, PREF_NS, Part, ProviderConfig, ProviderError, ProviderKind, StopReason, Thread,
+    ChatDelta, ChatRequest, DeltaStream, ModelProvider, PREF_NS, Part, ProviderConfig, ProviderError, ProviderKind, StopReason, Thread,
     menu_choice_prefs,
 };
 use holocron::holocron_core::keysource::KeySource;
@@ -79,10 +90,10 @@ pub fn why_of(e: &ProviderError) -> &'static str {
     }
 }
 
-/// `[installer] provider name= key= send= why= reply_kb= ms=`.
-pub fn line(name: &str, key_set: bool, send: &str, why: &str, reply_kb: u64, ms: u128) -> String {
+/// `[installer] provider name= key= send= why= reply_kb= ms= first_ms=`.
+pub fn line(name: &str, key_set: bool, send: &str, why: &str, reply_kb: u64, ms: u128, first_ms: u128) -> String {
     format!(
-        "[installer] provider name={name} key={} send={send} why={why} reply_kb={reply_kb} ms={ms}",
+        "[installer] provider name={name} key={} send={send} why={why} reply_kb={reply_kb} ms={ms} first_ms={first_ms}",
         if key_set { "set" } else { "missing" }
     )
 }
@@ -97,38 +108,96 @@ pub fn key_shaped(t: &str) -> bool {
     !t.contains(char::is_whitespace) && (t.starts_with("sk-ant-") || t.starts_with("AIza"))
 }
 
-/// The send's verdict: the wire line and the reply's path when one landed.
+/// The send's reports: each text delta as it arrives, then the verdict (the wire line and the reply's path when one
+/// landed).
 enum Msg {
+    Delta(String),
     Done(String, Option<PathBuf>),
 }
 
-/// The send on its own thread: ONE `generate`, the stop reason checked before the text, the reply written.
-fn job(p: Arc<dyn ModelProvider>, req: ChatRequest, dir: PathBuf) -> (String, Option<PathBuf>) {
+/// The provider's `DeltaStream` teed: every item passes through unchanged to `sse::collect`; a text delta is also sent
+/// over the send's channel, and the first one's time is kept.
+struct Tee<'a> {
+    inner: DeltaStream<'a>,
+    tx: Sender<Msg>,
+    t0: Instant,
+    first: &'a mut Option<u128>,
+}
+
+impl Stream for Tee<'_> {
+    type Item = Result<ChatDelta, ProviderError>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        let r = this.inner.as_mut().poll_next(cx);
+        if let Poll::Ready(Some(Ok(ChatDelta::Text(t)))) = &r {
+            if this.first.is_none() {
+                *this.first = Some(this.t0.elapsed().as_millis());
+            }
+            let _ = this.tx.send(Msg::Delta(t.clone()));
+        }
+        r
+    }
+}
+
+/// The send on its own thread: ONE `stream` teed into `sse::collect` (`generate` only on `Unsupported`), the stop
+/// reason checked before the text, the reply written.
+fn job(p: Arc<dyn ModelProvider>, req: ChatRequest, dir: PathBuf, tx: Sender<Msg>) -> (String, Option<PathBuf>) {
     let t0 = Instant::now();
     let name = p.name().to_string();
     let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
         Ok(rt) => rt,
-        Err(_) => return (say(line(&name, true, "refused", "provider-error", 0, 0)), None),
+        Err(_) => return (say(line(&name, true, "refused", "provider-error", 0, 0, 0)), None),
     };
-    let r = rt.block_on(p.generate(&req));
+    let mut first: Option<u128> = None;
+    let r = rt.block_on(async {
+        match p.stream(&req).await {
+            Ok(inner) => gneiss_pal::api::sse::collect(Box::pin(Tee { inner, tx, t0, first: &mut first })).await,
+            Err(ProviderError::Unsupported(_)) => p.generate(&req).await, // STREAM-FALLBACK: the ONE branch
+            Err(e) => Err(e),
+        }
+    });
     let ms = t0.elapsed().as_millis();
+    let first_ms = first.unwrap_or(0);
     let resp = match r {
         Ok(resp) => resp,
-        Err(e) => return (say(line(&name, true, "refused", why_of(&e), 0, ms)), None),
+        Err(e) => return (say(line(&name, true, "refused", why_of(&e), 0, ms, first_ms)), None),
     };
     let cut = match resp.stop {
         StopReason::EndTurn => "",
         StopReason::MaxTokens => "_The reply was cut at the output cap (vein.max_tokens)._\n\n",
         StopReason::Refusal { .. } | StopReason::Other(_) => {
-            return (say(line(&name, true, "refused", "provider-error", 0, ms)), None);
+            return (say(line(&name, true, "refused", "provider-error", 0, ms, first_ms)), None);
         }
     };
     let body = format!("# Reply — {} / {}\n\n{cut}{}\n", name, p.model(), resp.text);
     let path = reply_path(&dir);
     if std::fs::write(&path, &body).is_err() {
-        return (say(line(&name, true, "refused", "no-landing", 0, ms)), None);
+        return (say(line(&name, true, "refused", "no-landing", 0, ms, first_ms)), None);
     }
-    (say(line(&name, true, "ok", "-", (body.len() as u64).div_ceil(1024), ms)), Some(path))
+    (say(line(&name, true, "ok", "-", (body.len() as u64).div_ceil(1024), ms, first_ms)), Some(path))
+}
+
+/// The live tail the face shows: at most this many line breaks …
+const LIVE_LINES: usize = 12;
+/// … and this many bytes.
+const LIVE_BYTES: usize = 4096;
+
+/// Bound the live tail: whole lines dropped from the front past [`LIVE_LINES`], then bytes past [`LIVE_BYTES`] (at a
+/// char boundary).
+fn keep_tail(s: &mut String) {
+    let n = s.matches('\n').count();
+    if n > LIVE_LINES {
+        let cut = s.match_indices('\n').nth(n - LIVE_LINES - 1).map(|(i, _)| i + 1).unwrap_or(0);
+        s.drain(..cut);
+    }
+    if s.len() > LIVE_BYTES {
+        let mut cut = s.len() - LIVE_BYTES;
+        while !s.is_char_boundary(cut) {
+            cut += 1;
+        }
+        s.drain(..cut);
+    }
 }
 
 /// The provider face's state. ONE owner: the vessel's serve task (no lock). The send runs on its own thread, which
@@ -145,6 +214,8 @@ pub struct Provider {
     pub verdict: String,
     /// The Key button armed the next raw line as the key.
     pub arm_key: bool,
+    /// The streaming reply's last lines (bounded by `keep_tail`), cleared by the next send.
+    pub live: String,
     /// The host's env and Holocron answer for the key too (false in tests).
     host_env: bool,
     key: Option<String>,
@@ -173,6 +244,7 @@ impl Provider {
             reply: None,
             verdict: String::from("pick Claude or Gemini, give the key, then Send the newest landing"),
             arm_key: false,
+            live: String::new(),
             host_env,
             key: None,
             rx: None,
@@ -215,19 +287,34 @@ impl Provider {
 
     /// The state line (`send=-`).
     pub fn status(&self) -> String {
-        line(&self.name(), self.slot().provider().is_ok(), "-", "-", 0, 0)
+        line(&self.name(), self.slot().provider().is_ok(), "-", "-", 0, 0, 0)
     }
 
-    /// Drain the send's verdict; true when anything changed.
+    /// Drain the send's deltas into the live tail and its verdict; true when anything changed.
     pub fn poll(&mut self) -> bool {
         let Some(rx) = &self.rx else { return false };
-        let Ok(Msg::Done(l, path)) = rx.try_recv() else { return false };
-        self.rx = None;
-        self.verdict = l;
-        if path.is_some() {
-            self.reply = path;
+        let mut changed = false;
+        let mut done = false;
+        while let Ok(m) = rx.try_recv() {
+            changed = true;
+            match m {
+                Msg::Delta(t) => {
+                    self.live.push_str(&t);
+                    keep_tail(&mut self.live);
+                }
+                Msg::Done(l, path) => {
+                    self.verdict = l;
+                    if path.is_some() {
+                        self.reply = path;
+                    }
+                    done = true;
+                }
+            }
         }
-        true
+        if done {
+            self.rx = None;
+        }
+        changed
     }
 
     /// `provider pick <claude|gemini>`: `vein.provider` + `vein.model` through Principia (and `vein.gemini.auth =
@@ -278,14 +365,14 @@ impl Provider {
             dir.and_then(|d| Some((read(&d, "PROMPT.md")?, read(&d, "landing.md")?)).map(|(p, l)| (d, p, l)))
         else {
             let key_set = self.slot().provider().is_ok();
-            self.verdict = say(line(&name, key_set, "refused", "no-landing", 0, 0));
+            self.verdict = say(line(&name, key_set, "refused", "no-landing", 0, 0, 0));
             return;
         };
         let slot = self.slot();
         let p = match slot.provider() {
             Ok(p) => p,
             Err(_) => {
-                self.verdict = say(line(&name, false, "refused", "no-key", 0, 0));
+                self.verdict = say(line(&name, false, "refused", "no-key", 0, 0, 0));
                 return;
             }
         };
@@ -293,13 +380,15 @@ impl Provider {
         self.start_with(p, req, dir);
     }
 
-    /// The send's tail: ONE `generate` of `req` on `p` on its own thread, the reply into `dir` (the test seam too).
+    /// The send's tail: ONE `stream` of `req` on `p` on its own thread (deltas and the verdict over one channel), the
+    /// reply into `dir` (the test seam too).
     pub fn start_with(&mut self, p: Arc<dyn ModelProvider>, req: ChatRequest, dir: PathBuf) {
         let (tx, rx) = channel();
         self.verdict = format!("sending {} to {} ...", dir.display(), p.name());
+        self.live.clear();
         self.rx = Some(rx);
         std::thread::spawn(move || {
-            let (l, path) = job(p, req, dir);
+            let (l, path) = job(p, req, dir, tx.clone());
             let _ = tx.send(Msg::Done(l, path));
         });
     }
@@ -315,8 +404,9 @@ pub fn face() -> TetraNode {
     face_of(&Provider::probe_in(None))
 }
 
-/// The pane for a given state: the status, the landing that Send takes, the picks, the key field, Key and Send. Every
-/// control speaks `SMessage::ConsoleInput`, routed to [`on_input`]. No line carries the key.
+/// The pane for a given state: the status, the landing that Send takes, the picks, the key field, Key and Send, and
+/// the streaming reply's live tail under the verdict. Every control speaks `SMessage::ConsoleInput`, routed to
+/// [`on_input`]. No line carries the key.
 pub fn face_of(p: &Provider) -> TetraNode {
     let line = |level: &str, text: String| ConsoleLine { level: level.to_string(), source: String::from("provider"), text };
     let mut lines = vec![line("info", p.status())];
@@ -331,6 +421,7 @@ pub fn face_of(p: &Provider) -> TetraNode {
         lines.push(line("info", format!("reply in {}", r.display())));
     }
     lines.push(line("info", p.verdict.clone()));
+    lines.extend(p.live.lines().map(|t| ConsoleLine { level: String::from("info"), source: String::from("reply"), text: t.to_string() }));
     let button = |id: &str, label: &str, cmd: &str| TetraNode::Button { id: id.into(), label: label.into(), action: SMessage::ConsoleInput(cmd.into()) };
     TetraNode::VStack(vec![
         TetraNode::Console(ConsoleTetra { lines, ..Default::default() }),
@@ -382,6 +473,7 @@ pub fn on_input(p: &mut Provider, line: &str) -> bool {
 mod tests {
     use super::*;
     use gneiss_pal::api::{BoxFuture, ChatResponse, DeltaStream, Usage};
+    use std::collections::VecDeque;
     use std::fs;
     use std::sync::Mutex;
 
@@ -389,15 +481,31 @@ mod tests {
     const LANDING: &str = "# Landing — image.img\n\n- verdicts: 3 PASS / 1 FAIL / 0 SKIP\n";
     const SECRETS: [&str; 3] = ["AIzaTEST-SECRET-0001", "sk-ant-TEST-SECRET-0002", "plain-TEST-SECRET-0003"];
 
-    /// A provider that never leaves the process: it records the request and answers `answer`.
+    /// A provider that never leaves the process: it records the request and answers `answer` from `generate`, or
+    /// streams `script` (no script: `stream` is `Unsupported`, the generate fallback).
     struct Fake {
         seen: Mutex<Vec<ChatRequest>>,
         answer: Result<ChatResponse, ProviderError>,
+        script: Option<Vec<ChatDelta>>,
+    }
+
+    /// A scripted delta sequence as a `DeltaStream`.
+    struct Script(VecDeque<ChatDelta>);
+
+    impl Stream for Script {
+        type Item = Result<ChatDelta, ProviderError>;
+        fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            Poll::Ready(self.get_mut().0.pop_front().map(Ok))
+        }
     }
 
     impl Fake {
         fn answering(answer: Result<ChatResponse, ProviderError>) -> Arc<Fake> {
-            Arc::new(Fake { seen: Mutex::new(Vec::new()), answer })
+            Arc::new(Fake { seen: Mutex::new(Vec::new()), answer, script: None })
+        }
+        fn streaming(script: Vec<ChatDelta>) -> Arc<Fake> {
+            let answer = Err(ProviderError::Malformed(String::from("generate is not this fake's call")));
+            Arc::new(Fake { seen: Mutex::new(Vec::new()), answer, script: Some(script) })
         }
         fn text(t: &str, stop: StopReason) -> Result<ChatResponse, ProviderError> {
             Ok(ChatResponse { text: t.to_string(), stop, usage: Usage::default() })
@@ -416,8 +524,12 @@ mod tests {
             let a = self.answer.clone();
             Box::pin(async move { a })
         }
-        fn stream<'a>(&'a self, _req: &'a ChatRequest) -> BoxFuture<'a, Result<DeltaStream<'a>, ProviderError>> {
-            Box::pin(async { Err(ProviderError::Unsupported(String::from("fake"))) })
+        fn stream<'a>(&'a self, req: &'a ChatRequest) -> BoxFuture<'a, Result<DeltaStream<'a>, ProviderError>> {
+            let Some(script) = self.script.clone() else {
+                return Box::pin(async { Err(ProviderError::Unsupported(String::from("fake"))) });
+            };
+            self.seen.lock().unwrap().push(req.clone());
+            Box::pin(async move { Ok(Box::pin(Script(script.into())) as DeltaStream<'a>) })
         }
     }
 
@@ -500,6 +612,64 @@ mod tests {
     }
 
     #[test]
+    fn provider_stream_matches_generate_byte_for_byte() {
+        let (mut p, root) = laid("stream");
+        let checkout = p.checkout.clone();
+        let mk = |stamp: &str| {
+            let d = checkout.join("docs/dev/evidence").join(stamp);
+            fs::create_dir_all(&d).unwrap();
+            d
+        };
+        let (a, b) = (mk("landing-20261028-0001"), mk("landing-20261028-0002"));
+        let pieces = ["Boot 1: ", "3 PASS / 1 FAIL; ", "the FAIL needs the log."];
+        let joined: String = pieces.concat();
+        let mut script: Vec<ChatDelta> = pieces.iter().map(|t| ChatDelta::Text(t.to_string())).collect();
+        script.push(ChatDelta::Stop { stop: StopReason::EndTurn, usage: Usage::default() });
+
+        // The streamed send: ONE stream call, the deltas over the channel into the live tail, REPLY.md at the end.
+        let fake = Fake::streaming(script);
+        p.start_with(fake.clone(), ChatRequest::single(Some(SYSTEM.to_string()), parts(PROMPT, LANDING)), a.clone());
+        settle(&mut p);
+        assert_eq!(fake.seen.lock().unwrap().len(), 1, "ONE stream per send");
+        assert!(p.verdict.starts_with("[installer] provider name=fake key=set send=ok why=- reply_kb=1 ms="), "{}", p.verdict);
+        assert!(p.verdict.contains(" first_ms="), "{}", p.verdict);
+        assert_eq!(p.live, joined);
+        assert_eq!(p.reply.as_deref(), Some(a.join("REPLY.md").as_path()));
+        let TetraNode::VStack(kids) = face_of(&p) else { panic!("face is a VStack") };
+        assert_eq!(kids.len(), 4);
+        let TetraNode::Console(con) = &kids[0] else { panic!("status lines") };
+        assert!(con.lines.iter().any(|l| l.source == "reply" && l.text == joined), "the live tail is in the Console");
+
+        // The same reply through the generate fallback: the file is byte-identical.
+        let fake = Fake::answering(Fake::text(&joined, StopReason::EndTurn));
+        p.start_with(fake.clone(), ChatRequest::single(Some(SYSTEM.to_string()), parts(PROMPT, LANDING)), b.clone());
+        settle(&mut p);
+        assert_eq!(fake.seen.lock().unwrap().len(), 1, "ONE generate on the fallback");
+        assert!(p.verdict.ends_with(" first_ms=0"), "{}", p.verdict);
+        assert!(p.live.is_empty(), "the fallback streams nothing");
+        assert_eq!(fs::read(a.join("REPLY.md")).unwrap(), fs::read(b.join("REPLY.md")).unwrap());
+
+        // A stream that ends without its Stop is collect's Malformed: refused, nothing written.
+        let c = mk("landing-20261028-0003");
+        p.start_with(Fake::streaming(vec![ChatDelta::Text(String::from("half"))]), ChatRequest::single(None, parts(PROMPT, LANDING)), c.clone());
+        settle(&mut p);
+        assert!(p.verdict.contains("send=refused why=provider-error reply_kb=0"), "{}", p.verdict);
+        assert_eq!(p.live, "half");
+        assert!(!c.join("REPLY.md").exists());
+
+        // The live tail is bounded: whole lines from the front, the last line intact.
+        let mut tail: String = (0..40).map(|i| format!("line {i}\n")).collect();
+        tail.push_str("partial");
+        keep_tail(&mut tail);
+        assert_eq!(tail.matches('\n').count(), LIVE_LINES);
+        assert!(tail.starts_with("line 28\n") && tail.ends_with("line 39\npartial"), "{tail}");
+        let mut wide = "é".repeat(LIVE_BYTES);
+        keep_tail(&mut wide);
+        assert!(wide.len() <= LIVE_BYTES && wide.chars().all(|c| c == 'é'));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn provider_refusals_by_name() {
         assert_eq!(why_of(&ProviderError::Config(String::from("set X"))), "no-key");
         assert_eq!(why_of(&ProviderError::Retryable { status: 0, message: String::new() }), "network");
@@ -522,7 +692,7 @@ mod tests {
 
         // No key anywhere (no host env, no Holocron, nothing typed): the live path refuses before any thread.
         assert!(on_input(&mut p, "provider send"));
-        assert_eq!(p.verdict, "[installer] provider name=claude key=missing send=refused why=no-key reply_kb=0 ms=0");
+        assert_eq!(p.verdict, "[installer] provider name=claude key=missing send=refused why=no-key reply_kb=0 ms=0 first_ms=0");
         assert!(!p.busy());
         // A dir without PROMPT.md / landing.md.
         let empty = root.join("empty");
@@ -543,11 +713,11 @@ mod tests {
         assert_eq!(store.get(PREF_NS, "provider"), Some(PrefValue::Str(String::from("gemini"))));
         assert_eq!(store.get(PREF_NS, "model"), Some(PrefValue::Str(GEMINI_DEFAULT_MODEL.to_string())));
         assert_eq!(store.get(PREF_NS, "gemini.auth"), Some(PrefValue::Str(String::from("api_key"))));
-        assert_eq!(p.verdict, "[installer] provider name=gemini key=missing send=- why=- reply_kb=0 ms=0");
+        assert_eq!(p.verdict, "[installer] provider name=gemini key=missing send=- why=- reply_kb=0 ms=0 first_ms=0");
 
         let mut shown = Vec::new();
         assert!(on_input(&mut p, &format!("provider key {}", SECRETS[0])));
-        assert_eq!(p.verdict, "[installer] provider name=gemini key=set send=- why=- reply_kb=0 ms=0");
+        assert_eq!(p.verdict, "[installer] provider name=gemini key=set send=- why=- reply_kb=0 ms=0 first_ms=0");
         shown.push(p.verdict.clone());
 
         // The pick drops the held key; a pasted key-shaped raw line is the key.

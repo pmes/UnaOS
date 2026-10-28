@@ -99,12 +99,13 @@ pub fn style_of(f: &Font) -> Style {
     Style { weight: weight as f32, slant, stretch: width_class_percent(stretch) }
 }
 
-/// Reads every face of one font file.
+/// Indexes every face of one font file from its headers only (AETHER-FONTDB-LAZY (SR419): [`faces_in_header`]);
+/// the full bytes load on first use through [`crate::load_face`].
 pub fn faces_in_file(path: &Path) -> Vec<FaceInfo> {
-    let Ok(data) = std::fs::read(path) else { return Vec::new() };
-    faces_in_bytes(&data, path)
+    faces_in_header(path).0
 }
 
+/// Every face of a font file held whole in memory.
 pub fn faces_in_bytes(data: &[u8], path: &Path) -> Vec<FaceInfo> {
     let mut out = Vec::new();
     for i in 0..Font::face_count(data).min(64) {
@@ -112,15 +113,21 @@ pub fn faces_in_bytes(data: &[u8], path: &Path) -> Vec<FaceInfo> {
         if matches!(f.outlines, font_core::Outlines::None) {
             continue;
         }
-        let families = font_core::name::family_names(&f);
-        if families.is_empty() {
-            continue;
-        }
-        let mut full_names = font_core::name::values(&f, font_core::name::FULL_NAME);
-        full_names.extend(font_core::name::values(&f, font_core::name::POSTSCRIPT));
-        out.push(FaceInfo { path: path.to_path_buf(), index: i, families, full_names, style: style_of(&f) });
+        out.extend(face_record(&f, path, i));
     }
     out
+}
+
+/// The index record of one parsed face (AETHER-FONTDB-LAZY (SR419): the ONE builder both the whole-file and the
+/// header path use): family names (IDs 1 and 16), full and PostScript names, the selection style.
+fn face_record(f: &Font, path: &Path, index: u32) -> Option<FaceInfo> {
+    let families = font_core::name::family_names(f);
+    if families.is_empty() {
+        return None;
+    }
+    let mut full_names = font_core::name::values(f, font_core::name::FULL_NAME);
+    full_names.extend(font_core::name::values(f, font_core::name::POSTSCRIPT));
+    Some(FaceInfo { path: path.to_path_buf(), index, families, full_names, style: style_of(f) })
 }
 
 fn walk_dir(dir: &Path, out: &mut Vec<PathBuf>, depth: u32) {
@@ -247,26 +254,45 @@ pub struct FontDb {
     resolved: Mutex<HashMap<String, Option<String>>>,
     /// The per-character fallback order (face indices): fontconfig's sort of `sans-serif`.
     fallback: OnceLock<Vec<usize>>,
+    /// AETHER-FONTDB-LAZY (SR419): the bytes `discover` read to build the index (0 for [`FontDb::from_faces`]).
+    bytes_read: u64,
 }
 
 impl FontDb {
     /// Builds the database from fontconfig's directories (once per process: [`db`]).
+    /// AETHER-FONTDB-LAZY (SR419): each file is indexed from its headers ([`faces_in_header`]), never read whole.
     pub fn discover(config: Config) -> FontDb {
+        let t0 = std::time::Instant::now();
         let mut files = Vec::new();
         for d in &config.dirs {
             walk_dir(d, &mut files, 0);
         }
         files.dedup();
         let mut faces = Vec::new();
+        let mut bytes_read = 0u64;
         for f in &files {
-            faces.extend(faces_in_file(f));
+            let (v, n) = faces_in_header(f);
+            faces.extend(v);
+            bytes_read += n;
         }
-        FontDb { faces, config, resolved: Mutex::new(HashMap::new()), fallback: OnceLock::new() }
+        eprintln!(
+            "[fonts] discover files={} bytes_read={} faces={} ms={}",
+            files.len(),
+            bytes_read / 1024,
+            faces.len(),
+            t0.elapsed().as_millis()
+        );
+        FontDb { faces, config, resolved: Mutex::new(HashMap::new()), fallback: OnceLock::new(), bytes_read }
     }
 
     /// A database over explicit faces (tests).
     pub fn from_faces(faces: Vec<FaceInfo>, config: Config) -> FontDb {
-        FontDb { faces, config, resolved: Mutex::new(HashMap::new()), fallback: OnceLock::new() }
+        FontDb { faces, config, resolved: Mutex::new(HashMap::new()), fallback: OnceLock::new(), bytes_read: 0 }
+    }
+
+    /// AETHER-FONTDB-LAZY (SR419): the bytes [`FontDb::discover`] read to index the faces.
+    pub fn discover_bytes(&self) -> u64 {
+        self.bytes_read
     }
 
     /// The faces of an installed family (exact name, fontconfig comparison).
@@ -352,6 +378,146 @@ fn latin_rank(f: &FaceInfo) -> usize {
 pub fn db() -> &'static FontDb {
     static DB: OnceLock<FontDb> = OnceLock::new();
     DB.get_or_init(|| FontDb::discover(Config::system()))
+}
+
+// AETHER-FONTDB-LAZY (SR419): discovery from the headers. A face file is indexed from its table directory and the
+// five tables a record needs (`head`, `maxp`, `hhea`, `name`, `OS/2`), each read by offset; font_core parses them
+// from a small sfnt assembled of those tables, so the name / OS/2 / head parsers stay font_core's own. The full
+// bytes load on first use (`crate::load_face` -> `file_bytes`).
+
+/// A table larger than this is treated as absent (a `name` or `OS/2` table is a few KB).
+const HEADER_TABLE_CAP: u32 = 4 << 20;
+
+/// Bounded reads of one font file, counting the bytes read.
+struct HeaderReader {
+    file: std::fs::File,
+    len: u64,
+    read: u64,
+}
+
+impl HeaderReader {
+    fn at(&mut self, off: u64, len: usize) -> Option<Vec<u8>> {
+        use std::io::{Read, Seek, SeekFrom};
+        if off.checked_add(len as u64)? > self.len {
+            return None;
+        }
+        self.file.seek(SeekFrom::Start(off)).ok()?;
+        let mut v = vec![0u8; len];
+        self.file.read_exact(&mut v).ok()?;
+        self.read += len as u64;
+        Some(v)
+    }
+}
+
+fn be16(b: &[u8], o: usize) -> Option<u16> {
+    Some(u16::from_be_bytes(b.get(o..o + 2)?.try_into().ok()?))
+}
+
+fn be32(b: &[u8], o: usize) -> Option<u32> {
+    Some(u32::from_be_bytes(b.get(o..o + 4)?.try_into().ok()?))
+}
+
+/// Every face of one font file, indexed from its headers, and the bytes read to do it. A face is skipped exactly
+/// where `Font::parse_face` and the outline check of [`faces_in_bytes`] skip it, except that the outline tables'
+/// CONTENT is not read: a face whose `CFF ` or glyph data is malformed is indexed and fails at `load_face`.
+pub fn faces_in_header(path: &Path) -> (Vec<FaceInfo>, u64) {
+    let Ok(file) = std::fs::File::open(path) else { return (Vec::new(), 0) };
+    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let mut r = HeaderReader { file, len, read: 0 };
+    let dirs: Vec<u32> = match r.at(0, 12) {
+        Some(h) if be32(&h, 0) == Some(0x7474_6366) => {
+            let n = be32(&h, 8).unwrap_or(0).min(64) as usize;
+            r.at(12, 4 * n).map(|o| (0..n).filter_map(|i| be32(&o, 4 * i)).collect()).unwrap_or_default()
+        }
+        Some(_) => vec![0],
+        None => Vec::new(),
+    };
+    let mut out = Vec::new();
+    for (i, &dir) in dirs.iter().enumerate() {
+        if let Some(face) = face_from_header(&mut r, path, dir as u64, i as u32) {
+            out.push(face);
+        }
+    }
+    (out, r.read)
+}
+
+/// One face of a file from its table directory at `dir`.
+fn face_from_header(r: &mut HeaderReader, path: &Path, dir: u64, index: u32) -> Option<FaceInfo> {
+    let hdr = r.at(dir, 12)?;
+    let version = be32(&hdr, 0)?;
+    let num_tables = be16(&hdr, 4)? as usize;
+    let recs = r.at(dir + 12, 16 * num_tables)?;
+    let file_len = r.len;
+    // (offset, length) of the first record of `tag` whose range lies in the file, as `Font::table` finds it.
+    let entry = |tag: &[u8; 4]| -> Option<(u32, u32)> {
+        let e = (0..num_tables).map(|i| &recs[16 * i..16 * i + 16]).find(|e| &e[..4] == tag)?;
+        let (off, len) = (be32(e, 8)?, be32(e, 12)?);
+        (off as u64 + len as u64 <= file_len).then_some((off, len))
+    };
+    let mut table = |tag: &[u8; 4]| -> Option<Vec<u8>> {
+        let (off, len) = entry(tag)?;
+        if len > HEADER_TABLE_CAP {
+            return None;
+        }
+        r.at(off as u64, len as usize)
+    };
+    let head = table(b"head")?;
+    let maxp = table(b"maxp")?;
+    let mut hhea = table(b"hhea")?;
+    let name = table(b"name");
+    let os2 = table(b"OS/2");
+    // The skips `parse_face` makes beyond what it checks itself below: `hmtx` must hold numberOfHMetrics entries;
+    // outlines are `glyf` + a long-enough `loca`, else `CFF ` (font.rs's outline rule).
+    let num_glyphs = be16(&maxp, 4)? as usize;
+    let num_hmetrics = be16(&hhea, 34)? as usize;
+    if num_hmetrics == 0 || (entry(b"hmtx").map_or(0, |e| e.1) as usize) < 4 * num_hmetrics {
+        return None;
+    }
+    let long = be16(&head, 50)? as i16 == 1;
+    let outlines = match (entry(b"glyf"), entry(b"loca")) {
+        (Some(_), Some(loca)) => loca.1 as usize >= (num_glyphs + 1) * if long { 4 } else { 2 },
+        _ => entry(b"CFF ").is_some(),
+    };
+    if !outlines {
+        return None;
+    }
+    // The header-only sfnt: the real tables, `hhea` claiming one metric and a 4-byte `hmtx` to hold it.
+    hhea[34..36].copy_from_slice(&1u16.to_be_bytes());
+    let hmtx = [0u8; 4];
+    let mut tables: Vec<(&[u8; 4], &[u8])> =
+        vec![(b"head", head.as_slice()), (b"maxp", maxp.as_slice()), (b"hhea", hhea.as_slice()), (b"hmtx", &hmtx[..])];
+    if let Some(n) = &name {
+        tables.push((b"name", n.as_slice()));
+    }
+    if let Some(o) = &os2 {
+        tables.push((b"OS/2", o.as_slice()));
+    }
+    let sfnt = header_sfnt(version, &tables);
+    let f = Font::parse_face(&sfnt, 0).ok()?;
+    face_record(&f, path, index)
+}
+
+/// An sfnt of `tables` (offset table, directory, 4-aligned table data; checksums and the binary-search fields are
+/// zero: `Font::parse_face` reads neither).
+fn header_sfnt(version: u32, tables: &[(&[u8; 4], &[u8])]) -> Vec<u8> {
+    let n = tables.len();
+    let mut out = Vec::new();
+    out.extend_from_slice(&version.to_be_bytes());
+    out.extend_from_slice(&(n as u16).to_be_bytes());
+    out.extend_from_slice(&[0u8; 6]);
+    let mut off = 12 + 16 * n;
+    for (tag, data) in tables {
+        out.extend_from_slice(*tag);
+        out.extend_from_slice(&0u32.to_be_bytes());
+        out.extend_from_slice(&(off as u32).to_be_bytes());
+        out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        off += data.len().next_multiple_of(4);
+    }
+    for (_, data) in tables {
+        out.extend_from_slice(data);
+        out.resize(out.len().next_multiple_of(4), 0);
+    }
+    out
 }
 
 // AETHER-MACGENERICS (SR418): the CSS generic families, ONE table per OS, keyed by the generic's CSS keyword.
@@ -525,6 +691,54 @@ mod tests {
             }
         }
         assert_eq!(&of[..wd.len()], &wd[..], "family order of the first {n} fc-match -s sans-serif faces");
+    }
+
+    // AETHER-FONTDB-LAZY (SR419): header-only discovery.
+    fn same_records(a: &[FaceInfo], b: &[FaceInfo]) -> bool {
+        a.len() == b.len()
+            && a.iter().zip(b).all(|(x, y)| {
+                x.path == y.path
+                    && x.index == y.index
+                    && x.families == y.families
+                    && x.full_names == y.full_names
+                    && x.style == y.style
+            })
+    }
+
+    /// One small real face: indexed from far fewer bytes than the file, the same record as the whole-file read,
+    /// and it still shapes a glyph once `load_face` reads it.
+    #[test]
+    fn fontdb_lazy_fixture_kat() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fonts/jetbrains-mono");
+        let file = dir.join("JetBrainsMono-Variable.ttf");
+        let size = std::fs::metadata(&file).expect("fixture font").len();
+        let db = FontDb::discover(Config { dirs: vec![dir], ..Default::default() });
+        assert_eq!(db.faces.len(), 1, "{:?}", db.faces);
+        assert!(db.faces[0].families.iter().any(|f| f == "JetBrains Mono"), "{:?}", db.faces[0].families);
+        let n = db.discover_bytes();
+        assert!(n > 0 && n < size, "bytes_read {n} vs file {size}");
+        let whole = faces_in_bytes(&std::fs::read(&file).unwrap(), &file);
+        assert!(same_records(&db.faces, &whole), "{:?} vs {:?}", db.faces, whole);
+        let face = crate::load_face(&db.faces[0]).expect("the lazy load");
+        let g = face.glyph_for_char('A').expect("a glyph for A");
+        assert!(face.font.glyph_path(g).is_some_and(|p| !p.is_empty()), "A has an outline");
+    }
+
+    /// Every face file of the host (skipped without /usr/share/fonts): the header index equals the whole-file one.
+    #[test]
+    fn fontdb_lazy_matches_whole_read() {
+        let mut files = Vec::new();
+        walk_dir(Path::new("/usr/share/fonts"), &mut files, 0);
+        let (mut header_bytes, mut whole_bytes) = (0u64, 0u64);
+        for p in &files {
+            let Ok(data) = std::fs::read(p) else { continue };
+            let (head, n) = faces_in_header(p);
+            let whole = faces_in_bytes(&data, p);
+            assert!(same_records(&head, &whole), "{}: {:?} vs {:?}", p.display(), head, whole);
+            header_bytes += n;
+            whole_bytes += data.len() as u64;
+        }
+        assert!(header_bytes * 10 <= whole_bytes, "header reads {header_bytes} of {whole_bytes}");
     }
 
     // AETHER-MACGENERICS (SR418): fake databases (no font files are read: resolution looks at family names only).

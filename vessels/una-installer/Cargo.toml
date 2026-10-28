@@ -38,6 +38,7 @@ holocron = { path = "../../handlers/holocron" }
 # INSTALLERCONTRIBUTE (SR428): the contribute face commits the landing through Vairë's shared core (the object store only) and redacts typed commands through Midden's R65 table.
 git_core = { path = "../../unaos/libs/vcs/git_core", features = ["std"] }
 midden_core = { path = "../../unaos/libs/sys/midden_core" }
+futures-core = "0.3" # INSTALLERPROVIDERSTREAM (SR429): the Stream trait, to tee ModelProvider::stream's DeltaStream into sse::collect
 tokio = { version = "1.53", features = ["rt", "rt-multi-thread", "sync", "macros", "time"] }
 log = "0.4"
 libc = "0.2" # INSTALLERAUTHOPEN (SR422): sendmsg/recvmsg + msghdr for the SCM_RIGHTS fd handoff (authopen / the pkexec helper)

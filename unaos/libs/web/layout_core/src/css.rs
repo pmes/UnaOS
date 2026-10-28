@@ -1164,12 +1164,22 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
         // paint field carries it down (see layout::remeasure); the justify
         // here is the immediate effect on this box's own row.
         "text-align" => match value {
-            "center" | "-webkit-center" | "-moz-center" => {
+            "center" => {
                 style.justify = Some(taffy::style::JustifyContent::CENTER);
                 style.paint.text_align = Some(1);
             }
-            // codes: 0 start, 1 center, 2 right, 3 end, 4 left — start/end resolve against `direction`
-            // (css-text-3 §6.1) where lines are placed (layout::inline).
+            // AETHERCENTERLAYOUT (SR421): -webkit-center (5) / -webkit-right (6) also place narrow block children
+            // (tree.rs `place_narrow_blocks`); the inline formatter reads them as center / right.
+            "-webkit-center" | "-moz-center" => {
+                style.justify = Some(taffy::style::JustifyContent::CENTER);
+                style.paint.text_align = Some(5);
+            }
+            "-webkit-right" | "-moz-right" => {
+                style.justify = Some(taffy::style::JustifyContent::END);
+                style.paint.text_align = Some(6);
+            }
+            // codes: 0 start, 1 center, 2 right, 3 end, 4 left, 5 -webkit-center, 6 -webkit-right — start/end
+            // resolve against `direction` (css-text-3 §6.1) where lines are placed (layout::inline).
             "right" => {
                 style.justify = Some(taffy::style::JustifyContent::END);
                 style.paint.text_align = Some(2);
