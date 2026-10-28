@@ -28,7 +28,7 @@
 ## 3. The manifest (CODEX §2) and where each one is
 | handler | domain | `handlers/` dir | on UnaOS at HEAD |
 |---|---|---|---|
-| Aether | Web | `aether` | `APPS/AETHER.ELF` (both arches) |
+| Aether | Web | `aether` | `APPS/AETHER.ELF` (both arches); AETHERHEADERBAND (SR412): layout_core `measure_text_run` measures a faceless text run 0 wide, as the IFC lays it and the painter draws it, never the available width (`header_band_paints_in_its_box`); owed AETHER-ABSSHRINK, AETHER-CENTERLAYOUT, AETHER-BLOCKIFY-CSSOM, AETHER-PILLTOP, AETHER-RADIUSCALC, AETHER-MACFONTS |
 | Amber Bytes | Disks | `amber_bytes` | `amber_core` (GPT) in kernel; `unaos/crates/kernel/src/video/instgui.rs` charter |
 | Aulë | Forge | `aule` | selfhost (`unaos/crates/kernel/src/selfhost/`) — owner `unverified` |
 | Comscan | Signals | `comscan` | none found |

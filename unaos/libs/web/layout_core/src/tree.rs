@@ -2463,7 +2463,7 @@ impl TextRun {
 /// same line breaker the painter uses.
 fn measure_text_run<F: Fonts + ?Sized>(run: &TextRun, max_width: f32, fonts: &F) -> (f32, f32) {
     if !fonts.has_face(run.sel()) {
-        return (max_width, run.font_size * 1.25);
+        return (0.0, run.font_size * 1.25); // AETHERHEADERBAND (SR412): 0 wide, as the IFC lays it and the painter draws it; never the available width
     }
     let mut mode = run.mode;
     if run.nowrap && mode.white_space == 0 {
