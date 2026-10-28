@@ -7729,11 +7729,11 @@ fn order_leg() {
     {
         let before = blit::PAGES.order_seen(&BLIT_RING_HELD);
         // One core, one task for both takes: the walk reads only this core's partition. The slot guard drops first.
-        let taken = crate::arch::without_interrupts(|| {
-            let Some(_engine) = blit::PAGES.try_lock() else { return false }; // bcs_job's own take (a live job: busy)
-            let _slot = BLIT_RING_HELD.lock(); // held_take's take; nothing is done under it
-            true
-        });
+        let taken = blit::engine_take(|| {
+            drop(BLIT_RING_HELD.lock()); // held_take's take; nothing is done under it
+        }) // GEN7ORDERMIGRATE (B1053): bcs_job's own door, PAGES then the slot under one mask (a live job: busy)
+        .is_some();
+        // the engine guard came back from the door and dropped at the end of that statement, after the slot's guard
         let after = blit::PAGES.order_seen(&BLIT_RING_HELD);
         let (fwd, rev, i1) = after.unwrap_or((false, false, 0));
         let i0 = before.map(|b| b.2).unwrap_or(i1);
