@@ -7920,8 +7920,6 @@ fn park_kat_unwind() -> bool {
 // class: `held_release`'s body is lifted in place as `held_release_kept` (the not-quiesced word a parameter) and this
 // delegate keeps r9/r10/r11's call sites; `kept_bit` gains `ring-ctl-stuck` (`<< 8`, KEPT_SAID widened to u16) and
 // `park_leg` checks its bit distinct. `park_quiesced` is untouched: a CTL that never clears stays GEN7-PARK-FROZEN's.
-// ==========================================================================}
-
 // =================================================================================
 
 /// B1039's ONE release with the not-quiesced keep worded `ring-not-disabled` (every engine's call; gen7blit's CTL-stuck
@@ -7930,7 +7928,9 @@ fn park_kat_unwind() -> bool {
 #[allow(dead_code)]
 pub(crate) fn held_release(slot: &crate::sync::Mutex<(usize, usize)>, engine: &'static str, disabled: bool, ptes_restored: bool) {
     held_release_kept(slot, engine, disabled, ptes_restored, "ring-not-disabled")
-=======
+}
+
+// =================================================================================
 // GEN7PARKR8 (rmbp-ledger B1078) — FILE-TAIL append: nothing above it moves. gpu.md's GEN7-PARK-R8: R8's unarmed re-run
 // armed the BCS over a parked ring. Measured at 77e07a58c: `r8::test` replays only when its first run armed (DONE is set
 // `if w.armed`), and `hold_leg`'s second `ladder::run` reaches it again through `gen7_line` AFTER the first `blit::test`
