@@ -1149,7 +1149,7 @@ refs/heads/exec-rmbp-lockregxcorecost   1ca6f4ad2 FOLDED-BY-HAND (this commit) 2
 refs/heads/exec-rmbp-aethercentercell   871a6b0ca IN-FLIGHT cut 2026-10-28
 refs/heads/exec-rmbp-xhciloanptpyieldpollskip   2a2b8ed7a FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-landingscore   b16e93dd9 IN-FLIGHT cut 2026-10-28
-refs/heads/exec-rmbp-xhciloanptpyieldptptake   b16e93dd9 IN-FLIGHT cut 2026-10-28
+refs/heads/exec-rmbp-xhciloanptpyieldptptake   a446467de FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-unafsflightlist   412e8aba3 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-xhciloanptpyieldkatrule   736f42b84 IN-FLIGHT cut 2026-10-28
 refs/heads/exec-rmbp-preemptoffarmquantum   736f42b84 IN-FLIGHT cut 2026-10-28

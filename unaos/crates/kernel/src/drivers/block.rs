@@ -4490,7 +4490,7 @@ impl BlockLoan {
             ptp_masked_refusal();
             return Err(BlockError::Busy);
         }
-        let mut l = claim_xhci_for_io()?;
+        let _ptp = LoanPtpMark::set(); let mut l = claim_xhci_for_io()?; // XHCILOANPTPYIELDPTPTAKE (Z87): this task is marked a PTP claimant until claim_only returns
         l.demote();
         LOAN_PTP_CLAIMS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         Ok(l)
@@ -5057,7 +5057,8 @@ pub fn xhci_poll_loan() -> Result<BlockLoan, XhciClaimError> {
 // hold as a served claimant. The holder marks the window OPEN before its put; the FIRST take after the put swaps OPEN for
 // its class BEFORE it publishes (one CAS: every later take, the re-take included, fails it), so `yield_now` seeing the
 // publish sees the closer. The poll take is told apart by its task, `xhci-poll` (the identity Z76's skip line names).
-// Owed: XHCILOAN-PTPYIELD-POLLSKIP, XHCILOAN-PTPYIELD-KATCLOSER, XHCILOAN-PTPYIELD-PTPTAKE.
+// Owed: XHCILOAN-PTPYIELD-POLLSKIP, XHCILOAN-PTPYIELD-KATCLOSER, XHCILOAN-PTPYIELD-PTPTAKE (BUILT by XHCILOANPTPYIELDPTPTAKE,
+// zenbook-ledger Z87: a third class, PTP — the take of a task `claim_only` marked, the ONE PTP/MTP entry — in the SAME one CAS).
 
 /// XHCILOANPTPYIELDPOLLTAKE: the closer word's states — a window open, closed by a block take, closed by the xhci-poll take.
 #[cfg(all(feature = "uvc", target_arch = "x86_64"))]
@@ -5066,11 +5067,46 @@ const LOAN_CLOSER_OPEN: u8 = 1;
 const LOAN_CLOSER_BLOCK: u8 = 2;
 #[cfg(all(feature = "uvc", target_arch = "x86_64"))]
 const LOAN_CLOSER_POLL: u8 = 3;
+/// XHCILOANPTPYIELDPTPTAKE (Z87): closed by a second PTP/MTP claim's take (`claim_only`; refused by `with_controller` after it).
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+const LOAN_CLOSER_PTP: u8 = 4;
 
 /// XHCILOANPTPYIELDPOLLTAKE: who closed the current / last PTP yield window (written OPEN by the PTP holder before its put,
 /// swapped by the first take after it; read by `ptp` after the re-take). Lock-free.
 #[cfg(all(feature = "uvc", target_arch = "x86_64"))]
 static LOAN_YIELD_CLOSER: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// XHCILOANPTPYIELDPTPTAKE (Z87): the task id of a `claim_only` caller while it is inside its claim (0 = none). Written only
+/// by that task (`LoanPtpMark`: CAS 0 -> tid, so the holder's own re-take does not overwrite a waiting second claimant; CAS
+/// tid -> 0 on drop); read by `loan_yield_close` while a window is open.
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+static LOAN_PTP_TAKER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// XHCILOANPTPYIELDPTPTAKE (Z87): marks the current task as a PTP/MTP claimant for the span of `claim_only`'s take (the
+/// guard's drop clears it, the `?` return included). A ZST: without `uvc` or off x86 it compiles to nothing.
+struct LoanPtpMark;
+
+impl LoanPtpMark {
+    #[inline(always)]
+    fn set() -> LoanPtpMark {
+        #[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+        {
+            if let Some(t) = crate::arch::sched::current_id() {
+                let _ = LOAN_PTP_TAKER.compare_exchange(0, t, core::sync::atomic::Ordering::AcqRel, core::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        LoanPtpMark
+    }
+}
+
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+impl Drop for LoanPtpMark {
+    fn drop(&mut self) {
+        if let Some(t) = crate::arch::sched::current_id() {
+            let _ = LOAN_PTP_TAKER.compare_exchange(t, 0, core::sync::atomic::Ordering::AcqRel, core::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
 
 /// XHCILOANPTPYIELDPOLLTAKE: called by `take_block_loan` after a successful take and BEFORE its publish: an open window
 /// gets its closer (one load and out for every take outside a window).
@@ -5083,7 +5119,8 @@ fn loan_yield_close() {
         if LOAN_YIELD_CLOSER.load(Ordering::Acquire) != LOAN_CLOSER_OPEN {
             return;
         }
-        let who = if crate::arch::sched::current_name() == Some("xhci-poll") { LOAN_CLOSER_POLL } else { LOAN_CLOSER_BLOCK };
+        let ptp = crate::arch::sched::current_id().is_some_and(|t| t == LOAN_PTP_TAKER.load(Ordering::Acquire)); // XHCILOANPTPYIELDPTPTAKE (Z87): a task `claim_only` marked
+        let who = if crate::arch::sched::current_name() == Some("xhci-poll") { LOAN_CLOSER_POLL } else if ptp { LOAN_CLOSER_PTP } else { LOAN_CLOSER_BLOCK };
         let _ = LOAN_YIELD_CLOSER.compare_exchange(LOAN_CLOSER_OPEN, who, Ordering::AcqRel, Ordering::Relaxed);
     }
 }
@@ -5095,6 +5132,20 @@ pub fn xhci_loan_yield_closed_by_poll() -> bool {
     #[cfg(target_arch = "x86_64")]
     {
         LOAN_YIELD_CLOSER.load(core::sync::atomic::Ordering::Acquire) == LOAN_CLOSER_POLL
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
+/// XHCILOANPTPYIELDPTPTAKE (Z87): whether the last PTP yield window was closed by a second PTP/MTP claim's take (read by
+/// `ptp_txn_inner` right after a taken yield, beside `xhci_loan_yield_closed_by_poll`). aarch64: never.
+#[cfg(feature = "uvc")]
+pub fn xhci_loan_yield_closed_by_ptp() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        LOAN_YIELD_CLOSER.load(core::sync::atomic::Ordering::Acquire) == LOAN_CLOSER_PTP
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
