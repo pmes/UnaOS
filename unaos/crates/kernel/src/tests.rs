@@ -127,7 +127,7 @@ pub fn run(name: Option<&str>) -> usize {
         if let Some(want) = name { if want != n { continue; } }
         serial_println!(":: TESTS: run {} ::", n);
         *CUR.lock() = n;
-        crate::serial_line::tail_arm(); let vb = verdicts(); f(); skip_note(n, vb); verdict_note(n); // QUIETBOOT3 (B352): the fixture's own wire tail, for the glass.
+        crate::serial_line::tail_arm(); let vb = verdicts(); #[cfg(all(target_arch = "x86_64", feature = "wc"))] let _fx = crate::allocator::census::fx_enter(n); /* FIXTURERETAIN (B1017): the fixture's >= 64 KiB blocks are `fx:<n>` in the census (LINE-NEUTRAL) */ f(); skip_note(n, vb); verdict_note(n); #[cfg(all(feature = "witness", target_arch = "x86_64"))] { fixture_stack_note(n); } // QUIETBOOT3 (B352): the fixture's own wire tail, for the glass.
         if RUN_GEN.load(Ordering::Acquire) == my_gen { *CUR.lock() = ""; } // BOOTLIST (B817): a superseded run leaves CUR to the run that replaced it (LINE-NEUTRAL)
         ran += 1;
     }
@@ -146,7 +146,7 @@ pub fn shell_verb(args: &[&str], console: &mut Console) {
         console.println("tests: refused — finish first-boot setup (root password, then create a user) before the desktop suite runs");
         return;
     }
-    ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); ensure_lumen(); ensure_netring3(); ensure_netclock(); crate::pwwire::ensure_tests(); // CONSOLEFIX (B365): `tests pwwire`, `tests notice`. LUMENBIN: `tests lumen`. NETRING3: `tests net` (merge10 fold). NETCLOCK/ARMNET (merge12 fold)
+    #[cfg(all(target_arch = "aarch64", feature = "desktop_firmware"))] { if typed_child::hand(args, console) { return; } } ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); ensure_lumen(); ensure_netring3(); ensure_netclock(); crate::pwwire::ensure_tests(); // CONSOLEFIX (B365): `tests pwwire`, `tests notice`. LUMENBIN: `tests lumen`. NETRING3: `tests net` (merge10 fold). NETCLOCK/ARMNET (merge12 fold)
     ensure_ring3win(); ensure_ring3abi(); ensure_elfbss(); crate::smallfix3::ensure(); crate::smallfix4::ensure(); crate::smallfix5::ensure(); crate::smallfix6::ensure(); crate::smallfix7::ensure(); crate::shelltask::ensure_tests(); crate::serialdoor::ensure_tests(); crate::hidstall::ensure(); ensure_fpu(); #[cfg(any(target_arch = "x86_64", feature = "aarch64_el0"))] { crate::video::cursor::cursorshape::ensure(); } /* CURSORSHAPE: the module is gated so (cursor.rs tail); ARMVIRT found the ungated call reds every aarch64 kernel without el0 */ // SHELLTASK (B458): `tests shelltask`. SMALLFIX3 (B416): `tests smallfix3`. RING3WIN, RING3ABI2 (merge12 fold)
     ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); crate::fs::filetype::ensure_tests(); #[cfg(target_arch = "x86_64")] crate::loaderstage::ensure_tests(); crate::soundopeners::ensure(); // LOADERSTALL (B490): `tests loader`. FILETYPE (B307): `tests filetype`.
     ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); ensure_usbnet(); ensure_kvblank8(); #[cfg(all(target_arch = "x86_64", feature = "wc"))] crate::video::wm::k2p::ensure_tests(); // K2P (B671): `tests k2p` — 200 synthetic reports through the input-to-photon carriers (`video/wm.rs` tail). LINE-NEUTRAL append, code before the comment. 
@@ -158,7 +158,7 @@ pub fn shell_verb(args: &[&str], console: &mut Console) {
         console.println(&format!("{} deferred, {} ran at boot", deferred_count(), AT_BOOT.load(Ordering::Relaxed))); serial_println!(":: TESTS: list n={} deferred={} at_boot={} ::", t.iter().flatten().count(), deferred_count(), AT_BOOT.load(Ordering::Relaxed)); // QEMUSKIP (B558/B613): the list's tail on the wire (LINE-NEUTRAL append, before this comment)
         return;
     }
-    let name = args.first().copied(); *ARG.lock() = args.get(1).map(|a| alloc::string::String::from(*a)); #[cfg(feature = "wifi10")] arg2_set(args.get(2).copied()); // AUDIOCODEC (SR30): `tests play <fmt>` reads its <fmt> via `arg()`
+    let name = args.first().copied(); *ARG.lock() = args.get(1).map(|a| alloc::string::String::from(*a)); #[cfg(feature = "wifi")] arg2_set(args.get(2).copied()); // AUDIOCODEC (SR30): `tests play <fmt>` reads its <fmt> via `arg()`
     let (p0, f0) = (PASS.load(Ordering::Relaxed), FAIL.load(Ordering::Relaxed));
     let ran = run(name);
     let (p, f) = (PASS.load(Ordering::Relaxed).wrapping_sub(p0), FAIL.load(Ordering::Relaxed).wrapping_sub(f0));
@@ -173,8 +173,8 @@ pub fn shell_verb(args: &[&str], console: &mut Console) {
 
 /// SHELLUX (R75): register the `shellux` line-editor fixture exactly once (x86 witness images).
 fn ensure_shellux() {
-    ensure_bootverdicts(); crate::boot::ensure_tests(); crate::help::ensure(); #[cfg(all(feature = "busreg", any(feature = "aarch64_el0", target_arch = "x86_64")))] { static B3: AtomicBool = AtomicBool::new(false); if !B3.swap(true, Ordering::AcqRel) { register("bandy3", crate::arch::syscall::bandy3_selftest); } register("tzlocale", tzlocale_selftest); #[cfg(feature = "uvc")] register("uac1", uac1_fixture); register("mtpphone", mtpphone_selftest); #[cfg(feature = "uac")] register("uacmic", uacmic_fixture); register("clockpainters", clockpainters_selftest); register("hwreport", hwreport_selftest); register("audiomix", audiomix_selftest); register("micring3", micring3_selftest); #[cfg(all(target_arch = "x86_64", feature = "a2dp"))] register("a2dp", a2dp_selftest); register("sinkall", sinkall_selftest); } ensure_attr(); #[cfg(target_arch = "x86_64")] crate::arch::clockcore::ensure_tests(); #[cfg(all(feature = "midden", any(target_arch = "x86_64", feature = "aarch64_el0")))] crate::middenapp::ensure(); #[cfg(all(feature = "aether", any(target_arch = "x86_64", feature = "aarch64_el0")))] crate::aether::ensure(); #[cfg(all(feature = "una", any(target_arch = "x86_64", feature = "aarch64_el0")))] crate::unaapp::ensure(); #[cfg(feature = "sonde")] crate::sonde::ensure(); #[cfg(all(feature = "uvc", target_arch = "aarch64"))] crate::drivers::uvc::ensure_tests(); crate::pointerfeel::ensure(); #[cfg(feature = "installdemo")] crate::install::uninstall::ensure(); #[cfg(all(feature = "stria", any(target_arch = "x86_64", feature = "aarch64_el0")))] crate::striaapp::ensure(); #[cfg(feature = "uvc")] crate::drivers::xhci::uvc::ensure_tests(); #[cfg(all(target_arch = "aarch64", feature = "v3d"))] crate::arch::aarch64::v3d::ensure_tests(); #[cfg(target_arch = "aarch64")] crate::arch::aarch64::mmu_wxn::ensure(); #[cfg(all(target_arch = "aarch64", not(feature = "busreg")))] register("hwreport", hwreport_selftest); // PIEMPTYBIN (PI24): `tests v3d`, the [v3d105] emptybin rung (LINE-NEUTRAL append, before this comment). STRIAMETAL (SR139): `tests stria` (LINE-NEUTRAL append, before this comment). ARMSONDE (SR101): `tests sonde` arch-neutral, and `tests uvc` registered eagerly on aarch64 (LINE-NEUTRAL append, before this comment). CLOCKCORE (B397): `tests clock`. HELPVERB: `tests helpdoc` ATTRSURF: `tests attr`. MIDDENTWIN (SR75): `tests midden` (LINE-NEUTRAL append, before this comment). UNAMETAL (SR90): `tests una` (LINE-NEUTRAL append, before this comment). REALSENSE (SR92): `tests sonde` (LINE-NEUTRAL append, before this comment). // CLOCKCORE (B397): `tests clock`. HELPVERB: `tests helpdoc` ATTRSURF: `tests attr`. MIDDENTWIN (SR75): `tests midden` (LINE-NEUTRAL append, before this comment). UNAMETAL (SR90): `tests una` (LINE-NEUTRAL append, before this comment). POINTERFEEL (B535): `tests pointerfeel` (LINE-NEUTRAL append, before this comment). HWCENSUSARM (SR165): `tests hwreport` on an aarch64 image with no busreg (the tegra line) (LINE-NEUTRAL append, before this comment).
-    crate::help::ensure(); #[cfg(all(feature = "busreg", any(feature = "aarch64_el0", target_arch = "x86_64")))] { static B3: AtomicBool = AtomicBool::new(false); if !B3.swap(true, Ordering::AcqRel) { register("bandy3", crate::arch::syscall::bandy3_selftest); } } ensure_attr(); ensure_brightfloor(); ensure_gen7(); ensure_wifi(); #[cfg(target_arch = "x86_64")] register("kelfhash", kelfhash_selftest); #[cfg(all(target_arch = "x86_64", feature = "installdemo", feature = "wc"))] register("updateui", updateui_selftest); #[cfg(all(feature = "smolnet", target_arch = "x86_64"))] { static SK: AtomicBool = AtomicBool::new(false); if !SK.swap(true, Ordering::AcqRel) { register("sock", crate::drivers::e1000::sock_selftest); } #[cfg(all(target_arch = "x86_64", feature = "ahci"))] register("smartline", smartline_selftest); register("notelemetry", notelemetry_selftest); register("dhcprenew", dhcprenew_selftest); #[cfg(all(feature = "smolnet", target_arch = "x86_64"))] ensure_idlenet(); #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))] register("pinchzoom", pinchzoom_selftest); } #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] register("bootlist", bootlist::selftest); #[cfg(all(target_arch = "x86_64", feature = "nvidia-kepler-cecopy"))] register("keplerce", crate::drivers::gpu::kepler_gpublit::tests_keplerce); /* BOOTLIST (B817, R132): `tests bootlist`, the list runner's probe (file tail; LINE-NEUTRAL) */ /* INPUTSTALL2 M4 (B388, R80): `tests sock` arms the SOCK ladder; it never runs at boot */ // HELPVERB: `tests helpdoc` ATTRSURF: `tests attr`.
+    ensure_bootverdicts(); crate::boot::ensure_tests(); crate::help::ensure(); #[cfg(all(feature = "busreg", any(feature = "aarch64_el0", target_arch = "x86_64")))] { static B3: AtomicBool = AtomicBool::new(false); if !B3.swap(true, Ordering::AcqRel) { register("bandy3", crate::arch::syscall::bandy3_selftest); } register("tzlocale", tzlocale_selftest); #[cfg(feature = "uvc")] register("uac1", uac1_fixture); register("mtpphone", mtpphone_selftest); #[cfg(all(feature = "uvc", target_arch = "x86_64"))] register("ptpout", crate::drivers::xhci::ptp::mtp::out_yield_selftest); #[cfg(feature = "uac")] register("uacmic", uacmic_fixture); register("clockpainters", clockpainters_selftest); register("hwreport", hwreport_selftest); #[cfg(target_arch = "x86_64")] register("platform", crate::hw::platform_selftest); #[cfg(target_arch = "x86_64")] register("ec", crate::drivers::ec::selftest); #[cfg(target_arch = "x86_64")] register("ecbattery", crate::drivers::ec::battery_selftest); #[cfg(target_arch = "x86_64")] register("eclid", crate::drivers::ec::lid_probe); #[cfg(target_arch = "x86_64")] register("dwi2c", crate::drivers::dwi2c::selftest); #[cfg(all(target_arch = "x86_64", feature = "ehcihid"))] register("dwi2ctp", crate::drivers::dwi2c::touchpad::selftest); #[cfg(target_arch = "x86_64")] register("dwi2cacpi", crate::drivers::dwi2c::acpi_selftest); #[cfg(target_arch = "x86_64")] register("suspend", crate::power::suspend::selftest); register("audiomix", audiomix_selftest); register("micring3", micring3_selftest); #[cfg(all(target_arch = "x86_64", feature = "a2dp"))] register("a2dp", a2dp_selftest); register("sinkall", sinkall_selftest); } register("dma", crate::arch::memory::dma::selftest); ensure_attr(); #[cfg(target_arch = "x86_64")] crate::arch::clockcore::ensure_tests(); #[cfg(all(feature = "midden", any(target_arch = "x86_64", feature = "aarch64_el0")))] crate::middenapp::ensure(); #[cfg(all(feature = "aether", any(target_arch = "x86_64", feature = "aarch64_el0")))] crate::aether::ensure(); #[cfg(all(feature = "una", any(target_arch = "x86_64", feature = "aarch64_el0")))] crate::unaapp::ensure(); #[cfg(feature = "sonde")] crate::sonde::ensure(); #[cfg(all(feature = "uvc", target_arch = "aarch64"))] crate::drivers::uvc::ensure_tests(); crate::pointerfeel::ensure(); #[cfg(feature = "installdemo")] crate::install::uninstall::ensure(); #[cfg(all(feature = "stria", any(target_arch = "x86_64", feature = "aarch64_el0")))] crate::striaapp::ensure(); #[cfg(feature = "uvc")] crate::drivers::xhci::uvc::ensure_tests(); #[cfg(all(target_arch = "aarch64", feature = "v3d"))] crate::arch::aarch64::v3d::ensure_tests(); #[cfg(target_arch = "aarch64")] crate::arch::aarch64::mmu_wxn::ensure(); #[cfg(all(target_arch = "aarch64", not(feature = "busreg")))] register("hwreport", hwreport_selftest); #[cfg(all(target_arch = "x86_64", feature = "hda"))] register("hdacensus", crate::drivers::hda::census_selftest); #[cfg(all(target_arch = "x86_64", feature = "hda-tone"))] register("hdapath", crate::drivers::hda::path_selftest); #[cfg(target_arch = "x86_64")] register("ecqnames", crate::drivers::ec::qnames_selftest); #[cfg(target_arch = "x86_64")] register("amlone", crate::arch::acpi_power::amlone_selftest); #[cfg(target_arch = "x86_64")] register("preemptoff", crate::arch::sched::preemptoff::selftest); #[cfg(all(target_arch = "x86_64", any(feature = "ahci", feature = "nvme")))] register("preemptaudit", crate::arch::sched::preemptoff::audit_selftest); #[cfg(target_arch = "aarch64")] register("preemptaudit", crate::arch::sched::preemptoff::audit_selftest); // PREEMPTOFFARM (zenbook-ledger Z67): `tests preemptaudit` on aarch64, the FAT spans' leg (LINE-NEUTRAL append, before this comment). PREEMPTOFFAUDIT (zenbook-ledger Z57): `tests preemptaudit`, the block hold under preempt-off with interrupts on; NVMEPREEMPTOFF (zenbook-ledger Z52): `tests preemptoff`, the sched preempt-off KAT (LINE-NEUTRAL append, before this comment). AMLHELPERSONE (zenbook-ledger Z53): `tests amlone`, the AML byte-scan helpers' KAT at acpi_power.rs's tail (LINE-NEUTRAL append after `ecqnames`, before this comment). ZENBOOKECQNAMES (zenbook-ledger Z51): `tests ecqnames`, the EC `_Qxx` name-scan KAT (LINE-NEUTRAL append, before this comment). ZENBOOKSUSPEND (zenbook-ledger Z48): `tests suspend`, the read-only suspend census and plan (LINE-NEUTRAL append after `dwi2cacpi`, before this comment). ZENBOOKACPCODEC (zenbook-ledger Z43): `tests hdapath`, the HDA path KAT (LINE-NEUTRAL append, before this comment). ZENBOOKACP (zenbook-ledger Z25): `tests hdacensus`, the HDA census KAT (LINE-NEUTRAL append, before this comment). PIEMPTYBIN (PI24): `tests v3d`, the [v3d105] emptybin rung (LINE-NEUTRAL append, before this comment). STRIAMETAL (SR139): `tests stria` (LINE-NEUTRAL append, before this comment). ARMSONDE (SR101): `tests sonde` arch-neutral, and `tests uvc` registered eagerly on aarch64 (LINE-NEUTRAL append, before this comment). CLOCKCORE (B397): `tests clock`. HELPVERB: `tests helpdoc` ATTRSURF: `tests attr`. MIDDENTWIN (SR75): `tests midden` (LINE-NEUTRAL append, before this comment). UNAMETAL (SR90): `tests una` (LINE-NEUTRAL append, before this comment). REALSENSE (SR92): `tests sonde` (LINE-NEUTRAL append, before this comment). // CLOCKCORE (B397): `tests clock`. HELPVERB: `tests helpdoc` ATTRSURF: `tests attr`. MIDDENTWIN (SR75): `tests midden` (LINE-NEUTRAL append, before this comment). UNAMETAL (SR90): `tests una` (LINE-NEUTRAL append, before this comment). POINTERFEEL (B535): `tests pointerfeel` (LINE-NEUTRAL append, before this comment). HWCENSUSARM (SR165): `tests hwreport` on an aarch64 image with no busreg (the tegra line) (LINE-NEUTRAL append, before this comment).
+    crate::help::ensure(); #[cfg(all(feature = "busreg", any(feature = "aarch64_el0", target_arch = "x86_64")))] { static B3: AtomicBool = AtomicBool::new(false); if !B3.swap(true, Ordering::AcqRel) { register("bandy3", crate::arch::syscall::bandy3_selftest); } } ensure_attr(); ensure_brightfloor(); ensure_gen7(); ensure_wifi(); #[cfg(target_arch = "x86_64")] register("kelfhash", kelfhash_selftest); #[cfg(all(target_arch = "x86_64", feature = "installdemo", feature = "wc"))] register("updateui", updateui_selftest); #[cfg(all(feature = "smolnet", target_arch = "x86_64"))] { static SK: AtomicBool = AtomicBool::new(false); if !SK.swap(true, Ordering::AcqRel) { register("sock", crate::drivers::e1000::sock_selftest); } #[cfg(all(target_arch = "x86_64", feature = "ahci"))] register("smartline", smartline_selftest); #[cfg(all(target_arch = "x86_64", feature = "nvme"))] register("nvme", crate::drivers::nvme::selftest); register("notelemetry", notelemetry_selftest); register("dhcprenew", dhcprenew_selftest); #[cfg(all(feature = "smolnet", target_arch = "x86_64"))] ensure_idlenet(); #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))] register("pinchzoom", pinchzoom_selftest); } #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] register("bootlist", bootlist::selftest); #[cfg(all(target_arch = "x86_64", feature = "wc"))] register("gopshot", crate::video::desktop_uefi::gopshot_selftest); #[cfg(all(target_arch = "x86_64", feature = "nvidia-kepler-cecopy"))] register("keplerce", crate::drivers::gpu::kepler_gpublit::tests_keplerce); /* BOOTLIST (B817, R132): `tests bootlist`, the list runner's probe (file tail; LINE-NEUTRAL) */ /* GOPIGNITEPIXEL (Z28): `tests gopshot`, the GopBoot ignite read-back re-reported (desktop_uefi.rs tail; LINE-NEUTRAL) */ /* INPUTSTALL2 M4 (B388, R80): `tests sock` arms the SOCK ladder; it never runs at boot */ // HELPVERB: `tests helpdoc` ATTRSURF: `tests attr`.
     #[cfg(all(feature = "linuxabi", target_arch = "x86_64"))]
     {
         static LDONE: AtomicBool = AtomicBool::new(false);
@@ -324,7 +324,7 @@ fn ensure_brightfloor() {
     #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
     {
         static DONE: AtomicBool = AtomicBool::new(false);
-        if !DONE.swap(true, Ordering::AcqRel) { register("brightfloor", crate::video::backlight::selftest); register("brightstep", crate::video::backlight::brightstep); register("lidsleep", crate::video::lidsleep::selftest); #[cfg(all(target_arch = "x86_64", feature = "lidsleep"))] register("sleep", sleep_usb_selftest); #[cfg(feature = "login")] register("autolock", autolock_selftest); #[cfg(all(target_arch = "x86_64", feature = "lidsleep"))] register("usbsuspend", usbsuspend_selftest); #[cfg(all(target_arch = "x86_64", feature = "lidsleep", feature = "wc", feature = "ehcihid"))] register("ehci", ehci_hub_selftest); #[cfg(all(target_arch = "x86_64", feature = "ehcihid"))] register("trackpadmt", trackpadmt_selftest); #[cfg(all(target_arch = "aarch64", feature = "desktop_firmware"))] register("sleepkey", sleepkey_login_selftest); } // SLEEPRESUME2 (B887): `tests sleepkey` (aarch64 desktop_firmware; the file-tail fn: the login Sleep's waking key). TRACKPADMT (B818): `tests trackpadmt` (the file-tail fn; the Wellspring contacts KAT). EHCIHUBDISC (B801): `tests ehci` (the file-tail fn; the hub status-change leg). USBSUSPEND (B766): `tests usbsuspend` (the file-tail fn; same gate as `sleep`). AUTOLOCK (B712): `tests autolock` (the file-tail fn; same gate, `login`). SLEEP (B691): `tests sleep` enters and leaves the state (same-line fold, code before the comment)
+        if !DONE.swap(true, Ordering::AcqRel) { register("brightfloor", crate::video::backlight::selftest); register("brightstep", crate::video::backlight::brightstep); #[cfg(target_arch = "x86_64")] register("consolepick", crate::drivers::xhci::ftdi::console_watch::fixture); register("lidsleep", crate::video::lidsleep::selftest); #[cfg(all(target_arch = "x86_64", feature = "lidsleep"))] register("sleep", sleep_usb_selftest); #[cfg(feature = "login")] register("autolock", autolock_selftest); #[cfg(all(target_arch = "x86_64", feature = "lidsleep"))] register("usbsuspend", usbsuspend_selftest); #[cfg(all(target_arch = "x86_64", feature = "lidsleep", feature = "wc", feature = "ehcihid"))] register("ehci", ehci_hub_selftest); #[cfg(all(target_arch = "x86_64", feature = "ehcihid"))] register("trackpadmt", trackpadmt_selftest); #[cfg(all(target_arch = "x86_64", feature = "ehcihid"))] register("i8042", crate::drivers::i8042::selftest); /* ZENBOOKI8042 (Z3): the controller init, the set-1 table, the 0xD2 Right Ctrl loopback */ #[cfg(any(all(target_arch = "x86_64", feature = "ehcihid"), target_arch = "aarch64"))] register("hidboot", crate::drivers::hidboot::selftest); /* HIDBOOTLEDSTEST (B995): the boot decoder's LED owe, the slot drain's coalescing and latch over a fake slot owner */ #[cfg(all(target_arch = "aarch64", feature = "desktop_firmware"))] register("sleepkey", sleepkey_login_selftest); #[cfg(all(target_arch = "x86_64", feature = "ehcihid"))] register("intpool", crate::drivers::ehci::intpool_selftest); /* DONGLEBOOT2 (B1007): the int-EP pool's claimants by class, refusals counted */ } // SLEEPRESUME2 (B887): `tests sleepkey` (aarch64 desktop_firmware; the file-tail fn: the login Sleep's waking key). TRACKPADMT (B818): `tests trackpadmt` (the file-tail fn; the Wellspring contacts KAT). EHCIHUBDISC (B801): `tests ehci` (the file-tail fn; the hub status-change leg). USBSUSPEND (B766): `tests usbsuspend` (the file-tail fn; same gate as `sleep`). AUTOLOCK (B712): `tests autolock` (the file-tail fn; same gate, `login`). SLEEP (B691): `tests sleep` enters and leaves the state (same-line fold, code before the comment)
     }
 }
 
@@ -344,7 +344,7 @@ fn ensure_wifi() {
     #[cfg(all(target_arch = "x86_64", feature = "wifi"))]
     {
         static DONE: AtomicBool = AtomicBool::new(false);
-        if !DONE.swap(true, Ordering::AcqRel) { register("wifi", crate::wifi::verb::selftest); }
+        if !DONE.swap(true, Ordering::AcqRel) { register("wifi", crate::wifi::verb::selftest); register("wifiscan", crate::wifi::verb::wifiscan); register("wifijoin", crate::wifi::verb::wifijoin); register("wifileave", crate::wifi::verb::wifileave); register("wpa2", crate::wifi::verb::wpa2); #[cfg(feature = "wifi10")] register("phy", crate::wifi::bringup::phy_tests); } // PHYONCE-TESTS (B954): `tests phy`, wifi10's per-boot one-shots alone (the bringup.rs tail)
     }
 }
 
@@ -2156,7 +2156,7 @@ fn undomove_selftest() {
 fn mtpphone_selftest() {
     use crate::drivers::xhci::ptp::mtp::{self, fixture, Transport};
     use crate::drivers::xhci::ptp::{codec, op, rc, Phase};
-    let t0 = crate::arch::ms();
+    let t0 = crate::arch::ms(); if mtp::device_known() { serial_println!(":: MTPPHONE: -> SKIP(device) ::"); return; } // XHCILOANPTPYIELDQEMUMTP (zenbook-ledger Z105): a real PTP/MTP device holds the session (QEMU's usb-mtp lane), so the fixture cannot be attached as the phone: a named SKIP, never the attach FAIL
     let mut why: Option<&'static str> = None;
     let mut miss = |w: &'static str, ok: bool| {
         if !ok && why.is_none() {
@@ -6228,11 +6228,11 @@ fn sinkall_idle_level(usb: &str) -> &'static str {
 /// WIFIDATA (rmbp-ledger B803) — TAIL-APPENDED: the SECOND word after the fixture name (`tests wifi <ssid> <gw>`:
 /// the gateway S10a's ARP asks for), read by `wifi::verb` through `arg2()`; `None` when absent. Set on `run`'s
 /// argument line beside `ARG`, under the same knob as its one reader.
-#[cfg(feature = "wifi10")]
+#[cfg(feature = "wifi")]
 static ARG2: crate::sync::Mutex<Option<alloc::string::String>> = crate::sync::Mutex::new(None);
-#[cfg(feature = "wifi10")]
+#[cfg(feature = "wifi")]
 fn arg2_set(a: Option<&str>) { *ARG2.lock() = a.map(alloc::string::String::from); }
-#[cfg(feature = "wifi10")]
+#[cfg(feature = "wifi")]
 pub fn arg2() -> Option<alloc::string::String> { ARG2.lock().clone() }
 
 /// TRACKPADMT (rmbp-ledger B818, BP-input-20) — TAIL-APPENDED: `tests trackpadmt` (R80: registered, never at boot). The
@@ -7362,7 +7362,7 @@ fn overlays_say(l: &str, a: &str, rb: usize, lk: usize, v: &str, ext: &OverlaysE
 #[cfg(all(target_arch = "x86_64", feature = "wc"))]
 fn memline_selftest() {
     crate::video::desktopbuild::memline_selftest();
-    memleak();
+    memleak(); fixtureretain(); // FIXTURERETAIN (B1017): the per-fixture attribution's KAT, after MEMLEAK (LINE-NEUTRAL append, code first)
 }
 
 /// MEMLINE3 (B845): wait (yielding) until the desktop is built and its first paint read back, at most `ms`.
@@ -8108,7 +8108,7 @@ fn autolock_root_kept(root0: u8) -> bool {
 // the scheduler's sleep / spawn / placement and TESTWATCH (x86 only). The overrun is ONE path on both arches ([`abandon`]:
 // the run retired, the B817 SKIP line, the child marked abandoned and named); a marked child's return is counted by
 // [`late`] (`[bootlist] late … late=<n>`), and a tally line rides beside every summary (whose format the x86-wc spec pins).
-// A list line's `@<board>` tags are matched against `boot::OLDEST.0` (rmbp12, pi4, orin): no second board identity.
+// A list line's `@<board>` tags are matched against `boot::oldest().0` (rmbp12, zenbook, pi4, orin): no second board identity.
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 mod bootlist_arm {
     //! CHARTER: Kernel — kernel-by-ruling R132 (BOOTLISTARM: the list runner's arch shims and its one overrun path; seam: kernel-only)
@@ -8188,10 +8188,10 @@ mod bootlist_arm {
     #[cfg(target_arch = "aarch64")]
     pub(super) fn watch_disarm() {}
 
-    /// This board's name for the list's `@<board>` tags: `boot::OLDEST.0` (one identity per image line).
+    /// This board's name for the list's `@<board>` tags: `boot::oldest().0` (one identity per boot; ZENBOOKOLDEST Z12: the Zenbook says `zenbook`).
     #[cfg(feature = "login")]
     pub(super) fn board() -> &'static str {
-        crate::boot::OLDEST.0
+        crate::boot::oldest().0
     }
 
     /// No `login`, no OLDEST: no board-tagged line runs.
@@ -8377,4 +8377,229 @@ fn sleepkey_login_selftest() {
         ":: SLEEPKEY: src={} input_wake_key_swallowed={} woke={} -> {} ::{}",
         src, ks as u8, woke as u8, if ok { "PASS" } else { "FAIL" }, if woke { "" } else { " reason=no-drain" }
     );
+}
+
+// PIDESKQEMULIST (rmbp-ledger B894) — TAIL-APPENDED: a `tests` the operator types into the Pi's windowed shell runs on its
+// own `tests-fx` child, in `bootlist-fx`'s shape (`bootlist_arm::go`, a scratch console, `shell_verb`'s own path). On
+// aarch64 `desktop_firmware` the windowed shell IS the `render` task (main.rs `render_pass`), and a fixture that waits for
+// that pass — `textscale_shell_leg`'s 2 s wait for `font_follow` — could never see it run when the fixture ran on it
+// (`rows_ok=0`, a FORBID in pi4-regression.spec). Only the `render` task hands off (bootlist's children and `tests-fx` itself
+// run inline); `tests list` stays inline (its table is for the glass). One typed run at a time; the verdicts are on the wire.
+// The call is folded onto `shell_verb`'s first ensure line, code first (LINE-NEUTRAL).
+#[cfg(all(target_arch = "aarch64", feature = "desktop_firmware"))]
+mod typed_child {
+    //! CHARTER: Kernel — kernel-by-ruling R132 (PIDESKQEMULIST: a typed `tests` run leaves the Pi render task for its own child; seam: kernel-only)
+    use alloc::string::String;
+    use alloc::vec::Vec;
+    use core::sync::atomic::AtomicBool;
+    use core::sync::atomic::Ordering::{AcqRel, Release};
+
+    /// The child's stack, `bootlist-fx`'s size.
+    const STACK: usize = 64 * 1024;
+    /// The words the child runs; written by [`hand`] before the spawn, taken once by [`child`].
+    static WORDS: crate::sync::Mutex<Option<Vec<String>>> = crate::sync::Mutex::new(None);
+    /// A typed run is live on `tests-fx`.
+    static LIVE: AtomicBool = AtomicBool::new(false);
+
+    /// `true` = the run was handed to `tests-fx` (or refused while one is live); `false` = run inline.
+    pub(super) fn hand(args: &[&str], console: &mut crate::console::Console) -> bool {
+        if crate::arch::sched::current_name() != Some("render") || args.first().copied() == Some("list") {
+            return false;
+        }
+        if LIVE.swap(true, AcqRel) {
+            console.println("tests: a typed run is already on its own task (tests-fx)");
+            return true;
+        }
+        *WORDS.lock() = Some(args.iter().map(|a| String::from(*a)).collect());
+        serial_println!("[tests] typed run handed to task=tests-fx words={}", args.join(" "));
+        console.println("tests: running on its own task (tests-fx); the verdicts are on the wire");
+        super::bootlist_arm::go("tests-fx", child, 0, Some(STACK));
+        true
+    }
+
+    /// The `tests-fx` child: the typed words through `shell_verb` on a scratch console.
+    fn child(_arg: usize) {
+        let words = WORDS.lock().take().unwrap_or_default();
+        let args: Vec<&str> = words.iter().map(|s| s.as_str()).collect();
+        let mut con = crate::console::Console::new();
+        super::shell_verb(&args, &mut con);
+        LIVE.store(false, Release);
+    }
+}
+
+// ── PUMPSTACK (rmbp-ledger B1006) — the per-fixture stack witness, called from `run`'s fixture line (one fold). The
+// reading is the RUNNING task's lifetime high-water (`sched::current_stack_high`, RENDSTACK's `stack_high_water`):
+// exact per fixture on a `bootlist-fx` child (one child per list row), cumulative on a `shell-job` running all of
+// `tests`. `on=` names the task, so a capture says which stack each fixture ran on (flight 38: `uvccam` on the list's
+// 64 KiB child, never the pump). x86 `witness` only; the aarch64 line is owed (STACK-POOL-ONE). At the tail. ──
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+fn fixture_stack_note(name: &str) {
+    if let Some((task, high, size)) = crate::arch::sched::current_stack_high() {
+        serial_println!("[tests] fixture={} on={} stack_high={} size={}", name, task, high, size);
+    }
+}
+
+// ── FIXTURERETAIN (rmbp-ledger B1017, BP-video-18, BP-cores-22) — TAIL-APPENDED. Flight 38's census held
+// `task:bootlist-fx +18387` KiB: every list child is named `bootlist-fx`, so the row was the sum over sixteen fixtures
+// (~16252 KiB of it GEN7's GEN7TLB holds, now tagged `gen7-held` and counted once). `tests::run` now arms
+// `census::fx_enter(<fixture>)` around each fixture, so a >= 64 KiB block is `fx:<verb>`. The KAT, inside `tests
+// memline` after MEMLEAK: a 192 KiB probe under `fx_enter("fixtureretain-probe")`, TWICE — held, its row holds it
+// (`attributed`); dropped, the row returns to where the run found it (`delta<k>` = 0); then a 128 KiB block must land
+// under the enclosing run's own `fx:memline` (`nest`: the probe's drop restored the word). x86 `wc`.
+// Wire: `[fixtureretain] top fx:<verb>:<kb>,…` · `:: FIXTURERETAIN: fixtures=<n> freed_kb=<n> once_kb=<n>
+// attributed=<y|n> nest=<ok|bad> surf_ok=<1|0|skip> surf_bypass_ok=<1|0|skip> -> PASS|FAIL :: delta1=<kb> delta2=<kb>` · `-> SKIP :: reason=<census-unarmed|alloc>`.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+fn fixtureretain() {
+    use crate::allocator::census;
+    const PROBE: usize = 192 * 1024;
+    const NEST: usize = 128 * 1024;
+    const ROW: &str = "fx:fixtureretain-probe";
+    if !census::armed() {
+        serial_println!(":: FIXTURERETAIN: -> SKIP :: reason=census-unarmed");
+        return;
+    }
+    let mut attributed = true;
+    let mut deltas = [0i64; 2];
+    for d in deltas.iter_mut() {
+        let b0 = census::snapshot().bytes_of(ROW, true);
+        {
+            let _fx = census::fx_enter("fixtureretain-probe");
+            let mut v: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+            if v.try_reserve_exact(PROBE).is_err() {
+                serial_println!(":: FIXTURERETAIN: -> SKIP :: reason=alloc");
+                return;
+            }
+            attributed &= census::snapshot().bytes_of(ROW, true) >= b0 + PROBE as u64;
+            drop(v);
+        }
+        *d = census::snapshot().bytes_of(ROW, true) as i64 - b0 as i64;
+    }
+    let n0 = census::snapshot().bytes_of("fx:memline", true);
+    let mut v: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    let nest = v.try_reserve_exact(NEST).is_ok() && census::snapshot().bytes_of("fx:memline", true) >= n0 + NEST as u64;
+    drop(v);
+    let s = census::snapshot(); let surf_ok = windowsurftag_leg(); let surf_bypass_ok = closehook_leg(); /* WMCLOSEHOOK (B1038): the bypass-close leg, body at the file tail */ // WINDOWSURFTAG (B1030): the window-surface leg (LINE-NEUTRAL append, code first; body at the file tail)
+    let mut fx: [(&str, u64); census::ROWS] = [("", 0); census::ROWS];
+    let mut n = 0usize;
+    for r in s.rows.iter().flatten() {
+        if r.tagged && r.name.starts_with("fx:") && n < fx.len() {
+            fx[n] = (r.name, r.bytes);
+            n += 1;
+        }
+    }
+    let fx = &mut fx[..n];
+    fx.sort_unstable_by_key(|r| core::cmp::Reverse(r.1));
+    let mut top = alloc::string::String::new();
+    for &(name, bytes) in fx.iter().take(5) {
+        if !top.is_empty() {
+            top.push(',');
+        }
+        top.push_str(name);
+        top.push_str(&alloc::format!(":{}", bytes / 1024));
+    }
+    serial_println!("[fixtureretain] top {}", if top.is_empty() { "-" } else { top.as_str() });
+    let freed = deltas == [0, 0];
+    let pass = attributed && nest && freed && surf_ok != Some(false) && surf_bypass_ok != Some(false);
+    serial_println!(
+        ":: FIXTURERETAIN: fixtures={} freed_kb={} once_kb={} gen7_released_kb={} attributed={} nest={} surf_ok={} surf_bypass_ok={} -> {} :: delta1={} delta2={}",
+        n, if freed { PROBE / 1024 } else { 0 }, s.bytes_of("gen7-held", true) / 1024, { #[cfg(any(feature = "gen7r9", feature = "gen7blit"))] { crate::drivers::gpu::gen7::held_released_kb() } #[cfg(not(any(feature = "gen7r9", feature = "gen7blit")))] { 0usize } }, if attributed { "y" } else { "n" },
+        if nest { "ok" } else { "bad" }, match surf_ok { Some(true) => "1", Some(false) => "0", None => "skip" }, match surf_bypass_ok { Some(true) => "1", Some(false) => "0", None => "skip" }, if pass { "PASS" } else { "FAIL" }, deltas[0] / 1024, deltas[1] / 1024
+    );
+}
+
+// ── DESKTOPHIDGAP (rmbp-ledger B1020) — the verb running now, for the `[lag] stall` line's `fixture=` token. FILE-TAIL. ──
+/// DESKTOPHIDGAP (B1020): the fixture [`run`] is executing now (the existing `CUR`), `-` when none or `CUR` is contended —
+/// read with [`running_is`]'s own bounded try (never a sleep: the lag roll calls it). Flight 38's stall lines could not say
+/// which verb they sat beside (gatesteal2, unafslock, idlenet).
+pub fn running_verb() -> &'static str {
+    for _ in 0..64 {
+        if let Some(c) = CUR.try_lock() {
+            return if c.is_empty() { "-" } else { *c };
+        }
+        core::hint::spin_loop();
+    }
+    "-"
+}
+
+// ── WINDOWSURFTAG (rmbp-ledger B1030, BP-cores-22, BP-video-18) — FILE-TAIL. FIXTURERETAIN's window-surface leg ──
+// A 100 KiB surface (>= BIG, so tracked) handed to `wm::create` is renamed `window-surface` by the create seam
+// (`census::retag_tracked`); closed and dropped, the row returns to where the leg found it. `None` = no window or no
+// memory (`surf_ok=skip`, not a fail). Called from `fixtureretain` (x86 `wc`).
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+fn windowsurftag_leg() -> Option<bool> {
+    use crate::allocator::census;
+    use crate::video::wm;
+    const SURF_OWNER: u64 = 0xF5E;
+    const SURF_WORDS: usize = 160 * 160;
+    let w0 = census::snapshot().bytes_of("window-surface", true);
+    let mut sv: alloc::vec::Vec<u32> = alloc::vec::Vec::new();
+    if sv.try_reserve_exact(SURF_WORDS).is_err() {
+        return None;
+    }
+    sv.resize(SURF_WORDS, 0);
+    let len = SURF_WORDS * 4;
+    let id = wm::create(SURF_OWNER, sv.as_ptr() as usize, len, 8, 8, 32, b"surftag");
+    if id == wm::WIN_NONE {
+        return None;
+    }
+    let open_ok = census::snapshot().bytes_of("window-surface", true) >= w0 + len as u64;
+    wm::close(id);
+    drop(sv);
+    Some(open_ok && census::snapshot().bytes_of("window-surface", true) == w0)
+}
+
+// ── WMCLOSEHOOK (rmbp-ledger B1038, BP-cores-22, BP-video-18) — FILE-TAIL. FIXTURERETAIN's bypass-close leg ──
+// A 100 KiB surface held in a leg-owned static, its id cell registered with a close hook, is closed by a bare `wm::close(id)`
+// — the call every bypass route makes (`close_all_furniture` loops it; running that here would take down the live desktop)
+// — and the leg never frees its own buffer: wm's WINID teardown clears the cell and, after the drain, runs the hook, so the
+// `window-surface` row returns to where the leg found it AND the static's capacity is 0. `None` = no window or no memory
+// (`surf_bypass_ok=skip`). Called from `fixtureretain` (x86 `wc`).
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+static CLOSEHOOK_WIN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(crate::video::wm::WIN_NONE);
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+static CLOSEHOOK_SURF: crate::sync::Mutex<alloc::vec::Vec<u32>> = crate::sync::Mutex::new(alloc::vec::Vec::new());
+
+/// The leg's close-free: what an owner's hook does — drop only the buffer the closed row seated.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+fn closehook_free(_id: crate::video::wm::WinId, surf: usize) {
+    let mut s = CLOSEHOOK_SURF.lock();
+    if s.as_ptr() as usize == surf {
+        *s = alloc::vec::Vec::new();
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+fn closehook_leg() -> Option<bool> {
+    use crate::allocator::census;
+    use crate::video::wm;
+    use core::sync::atomic::Ordering;
+    const HOOK_OWNER: u64 = 0xF5F;
+    const SURF_WORDS: usize = 160 * 160;
+    let w0 = census::snapshot().bytes_of("window-surface", true);
+    let base = {
+        let mut s = CLOSEHOOK_SURF.lock();
+        s.clear();
+        if s.try_reserve_exact(SURF_WORDS).is_err() {
+            return None;
+        }
+        s.resize(SURF_WORDS, 0);
+        s.as_ptr() as usize
+    };
+    let len = SURF_WORDS * 4;
+    let id = wm::create(HOOK_OWNER, base, len, 8, 8, 32, b"closehook");
+    if id == wm::WIN_NONE {
+        *CLOSEHOOK_SURF.lock() = alloc::vec::Vec::new();
+        return None;
+    }
+    CLOSEHOOK_WIN.store(id, Ordering::Release);
+    if !wm::winid_register_close_hook(&CLOSEHOOK_WIN, "closehook-leg", closehook_free) {
+        wm::close(id);
+        *CLOSEHOOK_SURF.lock() = alloc::vec::Vec::new();
+        return None;
+    }
+    let open_ok = census::snapshot().bytes_of("window-surface", true) >= w0 + len as u64;
+    wm::close(id); // the bypass: the leg does not free its buffer; wm clears the cell and runs the hook
+    let cell_cleared = CLOSEHOOK_WIN.load(Ordering::Acquire) == wm::WIN_NONE;
+    let freed = CLOSEHOOK_SURF.lock().capacity() == 0;
+    Some(open_ok && cell_cleared && freed && census::snapshot().bytes_of("window-surface", true) == w0)
 }

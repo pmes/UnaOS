@@ -75,7 +75,7 @@ pub fn rows() -> &'static [MenuItem] {
 
 fn set_active(owner: u64) {
     #[cfg(target_arch = "x86_64")]
-    crate::arch::x86_64::syscall::user_input_set_active(owner);
+    crate::arch::x86_64::syscall::user_input_set_active(if wm::is_kernel_owner(owner) { 0 } else { owner }); // NLE6TAB-WINLIST (rmbp-ledger B977): a listed furniture owner (the NLE) takes no ring slot, appswitch's rule
     #[cfg(not(target_arch = "x86_64"))]
     let _ = owner;
 }

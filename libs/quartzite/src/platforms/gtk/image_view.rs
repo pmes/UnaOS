@@ -6,6 +6,13 @@ use bandy::{SMessage, Synapse};
 use crate::NativeView;
 
 pub fn bootstrap_image_surface(id: &str, synapse: Synapse) -> NativeView {
+    bootstrap_image_surface_held(id, synapse).0
+}
+
+/// FACELIVE-SUBSCRIPTION-DROP (SR441): [`bootstrap_image_surface`] with its bus subscriber's handle, which the tetra
+/// evaluator keeps and aborts when the Surface leaves the tree (dropping the handle only detaches the subscriber).
+pub fn bootstrap_image_surface_held(id: &str, synapse: Synapse) -> (NativeView, gtk4::glib::JoinHandle<()>) {
+    let surface = crate::tetra::surface_number(id); // SURFACEID (SR332): this Surface's number on every pointer message
     let drawing_area = DrawingArea::builder()
         .hexpand(true)
         .vexpand(true)
@@ -46,7 +53,7 @@ pub fn bootstrap_image_surface(id: &str, synapse: Synapse) -> NativeView {
     let motion = gtk4::EventControllerMotion::new();
     let motion_syn = synapse.clone();
     motion.connect_motion(move |_, x, y| {
-        motion_syn.fire(SMessage::BrowserMouseMove(x, y));
+        motion_syn.fire(SMessage::BrowserMouseMove(x, y, surface));
     });
     drawing_area.add_controller(motion);
     // AETHERINPUT (SR68): the surface takes the page's input. A click (fired on release) focuses the
@@ -61,9 +68,9 @@ pub fn bootstrap_image_surface(id: &str, synapse: Synapse) -> NativeView {
         let da = drawing_area.clone();
         click.connect_released(move |_, _n, x, y| {
             da.grab_focus();
-            syn.fire(SMessage::BrowserClick(x, y));
+            syn.fire(SMessage::BrowserClick(x, y, surface));
         });
-        drawing_area.add_controller(click); { let drag = gtk4::GestureDrag::new(); let s = synapse.clone(); drag.connect_drag_begin(move |_, x, y| s.fire(SMessage::BrowserButton { down: true, x, y })); let s = synapse.clone(); drag.connect_drag_end(move |g, dx, dy| { if let Some((x, y)) = g.start_point() { s.fire(SMessage::BrowserButton { down: false, x: x + dx, y: y + dy }); } }); drawing_area.add_controller(drag); } // NLE2B (SR208): the press and the release (BrowserButton) for every drag; GestureClick sends no release past its threshold
+        drawing_area.add_controller(click); { let drag = gtk4::GestureDrag::new(); let s = synapse.clone(); drag.connect_drag_begin(move |g, x, y| s.fire(SMessage::BrowserButton { down: true, x, y, mods: button_mods(g.current_event_state()), surface })); let s = synapse.clone(); drag.connect_drag_end(move |g, dx, dy| { if let Some((x, y)) = g.start_point() { s.fire(SMessage::BrowserButton { down: false, x: x + dx, y: y + dy, mods: button_mods(g.current_event_state()), surface }); } }); drawing_area.add_controller(drag); } // NLE2B (SR208): the press and the release (BrowserButton) for every drag; GestureClick sends no release past its threshold
     }
     {
         let key = gtk4::EventControllerKey::new();
@@ -118,37 +125,56 @@ pub fn bootstrap_image_surface(id: &str, synapse: Synapse) -> NativeView {
 
     let da_clone = drawing_area.clone();
     let mut rx = synapse.subscribe();
+    let resend = synapse.clone();
     
     let target_id = id.to_string();
-    gtk4::glib::spawn_future_local(async move {
-        while let Ok(msg) = rx.recv().await {
-            match msg {
-                SMessage::SurfaceBlit { url, width, height, pixels } if url == target_id => {
-                    *buffer.borrow_mut() = pixels;
-                    *dim.borrow_mut() = (width, height);
+    let task = gtk4::glib::spawn_future_local(async move {
+        loop {
+            match rx.recv().await {
+                Ok(SMessage::SurfaceBlit { url, width, height, pixels, damage, scroll }) if url == target_id => {
+                    // NLE2ORDER (SR227): the Surface takes RGBA (tetra's contract); converted ONCE here to cairo's ARgb32.
+                    match damage {
+                        None => {
+                            *buffer.borrow_mut() = crate::tetra::surface_argb32(&pixels);
+                            *dim.borrow_mut() = (width, height);
+                        }
+                        // AETHERMACGPU-DAMAGE (SR320) / -ENGINEDAMAGE (SR341): only the rects' rows are converted and
+                        // spliced into the kept frame (`damage::spans`, one range per rect); a frame of another size or a
+                        // rect list that does not fit drops the blit (the sender's next whole frame repairs it).
+                        // AETHERMACGPU-SCROLL (SR351): the scroll copy first, then the rects, through the ONE
+                        // `tetra::surface_apply` (the rows converted once: `surface_argb32` is per pixel).
+                        Some(rects) => {
+                            let same = *dim.borrow() == (width, height);
+                            let mut kept = buffer.borrow_mut();
+                            if !same || !crate::tetra::surface_apply(&mut kept, width, height, &rects, &crate::tetra::surface_argb32(&pixels), scroll) {
+                                continue;
+                            }
+                        }
+                    }
                     da_clone.queue_draw();
                 }
                 // SR67: the hovered element's css-ui-4 cursor keyword IS the GTK cursor name
                 // (GTK uses the CSS names, as `glyph.rs` does with "text"); `auto` is the arrow.
-                SMessage::BrowserCursorChanged(name) => {
+                Ok(SMessage::BrowserCursorChanged(name)) => {
                     let name = if name == "auto" { "default" } else { name.as_str() };
                     da_clone.set_cursor_from_name(Some(name));
                 }
-                SMessage::SurfaceBlit { url, width, height, pixels } => {
-                    if url == target_id {
-                        *buffer.borrow_mut() = pixels;
-                        *dim.borrow_mut() = (width, height);
-                        da_clone.queue_draw();
-                    }
-                }
                 // The engine's answer to BrowserCopy: the display's clipboard.
-                SMessage::BrowserClipboardSet(text) => da_clone.clipboard().set_text(&text),
-                _ => {}
+                Ok(SMessage::BrowserClipboardSet(text)) => da_clone.clipboard().set_text(&text),
+                // SAVEDIALOG (SR364): the owner asks THIS surface's window for a path: the platform save dialog.
+                Ok(SMessage::SavePanel { url, name, folder }) if url == target_id => super::save_dialog::run(&da_clone, url, &name, folder.as_deref(), resend.clone()),
+                // OPEN-DIALOG-ONE (SR386): the owner asks THIS surface's window for a file: the platform open dialog.
+                Ok(SMessage::OpenPanel { url, filters, folder }) if url == target_id => super::open_dialog::run(&da_clone, url, filters, folder, resend.clone()), // SAVERECENTOPEN (SR403): opening in `folder`
+                Ok(_) => {}
+                // AETHERMACGPU-ENGINEDAMAGE (SR341): a lagged page no longer ENDS this loop (the page froze); its kept frame
+                // is unknown, so it asks the sender for the surface whole.
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => resend.fire(SMessage::SurfaceResend { url: target_id.clone() }),
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }
         }
     });
 
-    drawing_area.into()
+    (drawing_area.into(), task)
 }
 
 /// AETHERCHROME (SR84): the page surface with the chrome that floats over it — the find bar (Ctrl+F,
@@ -304,4 +330,19 @@ pub fn bootstrap_page_view(id: &str, synapse: Synapse) -> PageView {
     });
 
     PageView { root: overlay.upcast(), surface, find_bar, find_entry }
+}
+
+/// NLE2-MODS (LEDGER SR306): gdk's modifier state as `BrowserButton`'s `mods` bits (bandy's `MOD_*`), read the way the
+/// surface's key handler reads it (Meta or Super is the super bit).
+fn button_mods(m: gtk4::gdk::ModifierType) -> u8 {
+    use gtk4::gdk::ModifierType as M;
+    [
+        (M::SHIFT_MASK, bandy::MOD_SHIFT),
+        (M::CONTROL_MASK, bandy::MOD_CONTROL),
+        (M::ALT_MASK, bandy::MOD_ALT),
+        (M::META_MASK | M::SUPER_MASK, bandy::MOD_SUPER),
+    ]
+    .into_iter()
+    .filter(|(mask, _)| m.intersects(*mask))
+    .fold(0, |bits, (_, bit)| bits | bit)
 }

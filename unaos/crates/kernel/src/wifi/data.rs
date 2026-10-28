@@ -134,13 +134,13 @@ pub struct Link {
     bssid: Mac,
     seq: u16,
     tx_next: usize,
-    pub rx_data: u32,
+    pub rx_data: u32, pub rx_uni: u32, // STATIONROAM-IDLEUNI (B951): `rx_uni`, the delivered frames whose addr1 is our MAC (group frames not counted): the idle gate's receive half
     pub tx_toolong: u32,
 }
 
 impl Link {
     pub fn new(sta: Mac, bssid: Mac) -> Link {
-        Link { sta, bssid, seq: 0, tx_next: FRAME_DATA0, rx_data: 0, tx_toolong: 0 }
+        Link { sta, bssid, seq: 0, tx_next: FRAME_DATA0, rx_data: 0, rx_uni: 0, tx_toolong: 0 }
     }
 
     /// `RawNic::transmit`'s half: the air frame for `eth` and the ring frame number it goes out on.
@@ -167,7 +167,7 @@ impl Link {
         while !q.is_empty() {
             let f = q.remove(0);
             if let Some(eth) = from_air(&f, self.sta, self.bssid) {
-                self.rx_data += 1;
+                self.rx_data += 1; if f[4] & 0x01 == 0 { self.rx_uni += 1; } // STATIONROAM-IDLEUNI (B951): unicast to us (`from_air` passed: addr1 = STA)
                 let n = eth.len().min(out.len());
                 out[..n].copy_from_slice(&eth[..n]);
                 return Some(n);
@@ -373,7 +373,7 @@ pub fn kat() -> (u8, u8, Option<&'static str>) {
         checks.push(("lease", crate::smolnet::lease_of(&ack) == Some(3600) && crate::smolnet::lease_of(&offer).is_none()
             && crate::smolnet::lease_of(&bad).is_none()));
     }
-    ratectl_rows(&mut checks); erp_rows(&mut checks); let mut pass = 0u8; // STATIONRATECTL (B881): `ratectl`, `fallback` at the END of the table (LINE-NEUTRAL); STATIONERP (B884): `erp`, `cts` after them
+    ratectl_rows(&mut checks); erp_rows(&mut checks); rejoin_rows(&mut checks); roam_rows(&mut checks); xchan_rows(&mut checks); active_rows(&mut checks); bg_rows(&mut checks); sweep_rows(&mut checks); band_rows(&mut checks); rate5g_rows(&mut checks); pmu_rows(&mut checks); window_rows(&mut checks); let mut pass = 0u8; // WINDOW-AUDIT (B970): `window` after `pmu`; STATIONROAM-PMU (B967): `pmu` after `rate5g`; STATIONROAM-5G (B962): `band`, `rate5g` after `country`; STATIONROAM-SWEEP (B958): `lostplan`, `country` after `bggate`; STATIONROAM-BGSCAN (B955): `bgplan`, `bggate` after `idleuni`; STATIONROAM-ACTIVE (B951): `probe`, `idleuni` after `idlegate`; STATIONROAM-XCHAN (B898): `dwell`, `idlegate` after `roamwindow`; STATIONROAM (B897): `bsstable`, `roampick`, `roamwindow` after `rejoin`; STATIONREJOIN (B891): `rejoin` after them; STATIONRATECTL (B881): `ratectl`, `fallback` at the END of the table (LINE-NEUTRAL); STATIONERP (B884): `erp`, `cts` after them
     let mut first = None;
     for (name, ok) in checks.iter() {
         if *ok {
@@ -809,4 +809,661 @@ fn erp_rows(checks: &mut Vec<(&'static str, bool)>) {
         && matches!(eb, Some(b) if b.erp.is_none());
     checks.push(("erp", prot && open && none));
     checks.push(("cts", super::bringup::station_kat()[8]));
+}
+
+// ── STATIONREJOIN (rmbp-ledger B891): the lost station's re-join — PURE (`Watch`'s shape), owned by `join::REJOIN` ─────────
+
+pub use super::assoc::{Rejoin, REJOIN_CAP_MS, REJOIN_FIRST_MS}; // S9REJOIN (MT7925S9REJOIN, zenbook-ledger Z59): the backoff MOVED verbatim to wifi/assoc.rs (compiled under `wifi`, so the MT7925 station shares it); every `data::Rejoin` path unchanged
+
+impl Link {
+    /// STATIONREJOIN (B891): the Link's numbering moved `base` frames on (mod `FRAMES`), so a re-join's S10a and data continue
+    /// the kept ring after its S8/S9 (`join::associate`); base 0 (the boot's pass) leaves frame 3.
+    pub fn rebased(mut self, base: usize) -> Link {
+        self.tx_next = (self.tx_next + base) % FRAMES;
+        self
+    }
+}
+
+/// `kat`'s row after B884's (STATIONREJOIN rmbp-ledger B891). `rejoin`: a beacon loss at 1000 ms is due at 2000 (not 1999),
+/// attempt 1 after 1000 ms; failures put the next attempts at 4000, 8000, 16000, 32000, 62000, 92000 (1, 2, 4, 8, 16, 30, 30 s:
+/// the cap), n 2..7; linked: never due again, rejoins 1; a deauth at 200000 resets n and the ladder (due 201000, attempt 1 after
+/// 1000 ms), linked: rejoins 2. `Link::rebased(30)` wraps frame 3 to 1; `rebased(0)` keeps 3. The PHY latch is structural, not a
+/// row: wifi10's `RAN` is never reopened (`join::rejoin` is always `false`).
+fn rejoin_rows(checks: &mut Vec<(&'static str, bool)>) {
+    let mut r = Rejoin::new();
+    r.lose(1000, "beacon-loss");
+    let mut ok = !r.due(1000) && !r.due(1999) && r.due(2000) && r.attempt(2000) == (1, 1000);
+    r.failed(2000);
+    for (k, next) in [4000u64, 8000, 16000, 32000, 62000, 92000].iter().enumerate() {
+        ok &= !r.due(*next - 1) && r.due(*next) && r.attempt(*next) == (k as u32 + 2, *next - 1000);
+        if k < 5 {
+            r.failed(*next);
+        }
+    }
+    r.linked();
+    ok &= r.n == 7 && !r.due(1_000_000) && r.rejoins == 1 && r.why == "beacon-loss";
+    r.lose(200_000, "deauth");
+    ok &= r.n == 0 && !r.due(200_999) && r.due(201_000) && r.attempt(201_000) == (1, 1000) && r.why == "deauth";
+    r.linked();
+    ok &= r.rejoins == 2 && !r.due(300_000);
+    ok &= Link::new(STA, BSSID).rebased(30).tx_next() == 1 && Link::new(STA, BSSID).rebased(0).tx_next() == FRAME_DATA0;
+    checks.push(("rejoin", ok));
+}
+
+// ── STATIONROAM (rmbp-ledger B897): another BSS of the same SSID — PURE (`Rejoin`'s shape), held in `join::Heard.scan` under `STATION` ──
+
+/// BSSes of the SSID remembered (a 9th evicts the one heard longest ago).
+pub const BSS_MAX: usize = 8;
+/// A candidate must beat the current BSS's beacon RSSI by this many dB.
+pub const ROAM_HYST_DB: i16 = 6;
+/// A linked station opens one scan window this often (the first one this long after `keep`).
+pub const ROAM_SCAN_MS: u64 = 60_000;
+/// How long a scan window listens with BEACPROMISC on (`rx::scan_filter`); a re-join's scan listens as long.
+pub const ROAM_WINDOW_MS: u64 = 1000;
+
+/// One received frame's signal in dBm from the FW598 RX header (b43 xmit.h:239-297): the HT-PHY's three per-chain powers at
+/// octets 9, 10 and 11 (`phy_ht_power0..2`, s8), the strongest taken as b43 does for B43_PHYTYPE_HT (xmit.c:721-725). A short
+/// header reads `i8::MIN`.
+pub fn ht_power(hdr: &[u8]) -> i8 {
+    if hdr.len() < 12 {
+        return i8::MIN;
+    }
+    (hdr[9] as i8).max(hdr[10] as i8).max(hdr[11] as i8)
+}
+
+/// One BSS of the SSID as the scan windows heard it: its channel (the DS element; 0 = absent), its beacon RSSI (dBm), when last
+/// heard and how often.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct BssSeen {
+    pub bssid: Mac,
+    pub channel: u8,
+    pub rssi: i8,
+    pub last_ms: u64,
+    pub n: u16,
+}
+
+/// The scan table and its schedule: `arm` (from `keep`) puts the next window `ROAM_SCAN_MS` out; `due` -> `open` (BEACPROMISC on,
+/// the next window scheduled) -> `see` per beacon -> `ended` after `ROAM_WINDOW_MS` -> `close`. An entry is FRESH when heard in
+/// the last window opened (`last_ms >= opened_ms`); older entries age out by eviction.
+#[derive(Default)]
+pub struct BssTable {
+    pub e: [Option<BssSeen>; BSS_MAX],
+    open: bool,
+    opened_ms: u64,
+    next_ms: u64,
+    /// STATIONROAM-XCHAN (B898): the idle gate — the (rx_data, posted) counters last sampled and when they last moved.
+    act: Option<(u32, u32)>,
+    act_ms: u64, pub country: Option<wifi_core::ieee80211::Country>, // STATIONROAM-SWEEP (B958): the home BSS's Country element (802.11d), `join::note`; COUNTRYCOVER reads it
+}
+
+impl BssTable {
+    pub fn arm(&mut self, now_ms: u64) {
+        self.next_ms = now_ms + ROAM_SCAN_MS;
+        self.act = None;
+        self.act_ms = now_ms;
+    }
+
+    /// STATIONROAM-XCHAN (B898): one sample of the station's data counters (`Link.rx_uni` since STATIONROAM-IDLEUNI B951, `tx::Queue.posted`); a change in either
+    /// (or the first sample after `arm`) restarts the clock. `true` = neither moved for `ROAM_IDLE_MS`: an off-channel sweep may stall
+    /// the data path.
+    pub fn quiet(&mut self, rx: u32, tx: u32, now_ms: u64) -> bool {
+        if self.act != Some((rx, tx)) {
+            if self.act.is_some() {
+                self.act_ms = now_ms;
+            }
+            self.act = Some((rx, tx));
+        }
+        now_ms >= self.act_ms + ROAM_IDLE_MS
+    }
+
+    pub fn due(&self, now_ms: u64) -> bool {
+        !self.open && now_ms >= self.next_ms
+    }
+
+    pub fn open(&mut self, now_ms: u64) {
+        self.open = true;
+        self.opened_ms = now_ms;
+        self.next_ms = now_ms + ROAM_SCAN_MS;
+    }
+
+    pub fn ended(&self, now_ms: u64) -> bool {
+        self.open && now_ms >= self.opened_ms + ROAM_WINDOW_MS
+    }
+
+    pub fn close(&mut self) {
+        self.open = false;
+    }
+
+    pub fn is_open(&self) -> bool {
+        self.open
+    }
+
+    fn fresh(&self, s: &BssSeen) -> bool {
+        s.last_ms >= self.opened_ms
+    }
+
+    /// One beacon of the SSID, while a window is open: the first sight in this window is the sample, later ones the mean of the
+    /// held value and the new; a new BSSID takes a free slot, else the entry heard longest ago.
+    pub fn see(&mut self, bssid: Mac, channel: u8, rssi: i8, now_ms: u64) {
+        if !self.open {
+            return;
+        }
+        let opened = self.opened_ms;
+        if let Some(s) = self.e.iter_mut().flatten().find(|s| s.bssid == bssid) {
+            s.rssi = if s.last_ms >= opened { ((s.rssi as i16 + rssi as i16) / 2) as i8 } else { rssi };
+            s.channel = channel;
+            s.last_ms = now_ms;
+            s.n = s.n.saturating_add(1);
+            return;
+        }
+        let slot = match self.e.iter().position(|s| s.is_none()) {
+            Some(i) => i,
+            None => {
+                let mut old = 0;
+                for i in 1..BSS_MAX {
+                    if self.e[i].map_or(0, |s| s.last_ms) < self.e[old].map_or(0, |s| s.last_ms) {
+                        old = i;
+                    }
+                }
+                old
+            }
+        };
+        self.e[slot] = Some(BssSeen { bssid, channel, rssi, last_ms: now_ms, n: 1 });
+    }
+
+    pub fn get(&self, bssid: Mac) -> Option<BssSeen> {
+        self.e.iter().flatten().find(|s| s.bssid == bssid).copied()
+    }
+}
+
+/// The roam's pick over the last window: candidates FRESH, not `current`, on any channel 1..=`ROAM_CH_MAX` (STATIONROAM-XCHAN
+/// B898: the window's dwells heard other channels; no DS element, 0, is taken as `ch`, the channel it was heard on at home).
+/// `Some(cur)` (a linked station): `cur` itself must be fresh (a silent current is the `Watch`'s loss, not a roam) and a candidate
+/// must beat it by `ROAM_HYST_DB`; the strongest such wins. `None` (the re-join after a loss): the strongest fresh BSS.
+/// Returns the BSSID and its channel.
+pub fn roam_pick(current: Option<Mac>, ch: u8, t: &BssTable) -> Option<(Mac, u8)> {
+    let floor = match current {
+        Some(cur) => {
+            let c = t.get(cur).filter(|s| t.fresh(s))?;
+            c.rssi as i16 + ROAM_HYST_DB
+        }
+        None => i16::MIN,
+    };
+    let mut best: Option<BssSeen> = None;
+    for s in t.e.iter().flatten() {
+        if !t.fresh(s) || Some(s.bssid) == current || !roamable(s.channel) || (s.rssi as i16) < floor { // STATIONROAM-5G (B962): 1..=ROAM_CH_MAX or a non-DFS 5 GHz channel (was > ROAM_CH_MAX)
+            continue;
+        }
+        if best.map_or(true, |b| s.rssi > b.rssi) {
+            best = Some(*s);
+        }
+    }
+    best.map(|s| (s.bssid, if s.channel == 0 { ch } else { s.channel }))
+}
+
+/// `kat`'s rows after B891's (STATIONROAM rmbp-ledger B897). `bsstable`: `ht_power` of a header with octets 9/10/11 = -70/-55/-80
+/// reads -55, a short header `i8::MIN`; a closed table ignores `see`; open at 0: BSSID 1 at -60 then -50 holds -55, n 2; seven
+/// more BSSIDs (heard at 20..80) fill the table and a 9th (at 90) evicts BSSID 1, the one heard longest ago (at 5). `roampick`:
+/// current at -60; a candidate at -55 is not picked (+5); once it averages -54 (+6) it is, on 11; a stronger one on channel 13
+/// is, on 13 (STATIONROAM-PMU B967: ROAM_CH_MAX 13; was not, B898's 12); a stronger one on channel 6 is, on 6; one with no DS element resolves to 11;
+/// an entry from the window before is stale and never picked; a silent current picks nothing; no current picks the strongest. `roamwindow`: arm(0): not due at 59 999, due at 60 000; open at 60 000: ended at 61 000 not
+/// 60 999; closed: due again at 120 000 not 119 999.
+fn roam_rows(checks: &mut Vec<(&'static str, bool)>) {
+    let b = |k: u8| -> Mac { [0x00, 0x11, 0x22, 0x33, 0x44, k] };
+    let mut hdr = [0u8; 24];
+    hdr[9] = (-70i8) as u8;
+    hdr[10] = (-55i8) as u8;
+    hdr[11] = (-80i8) as u8;
+    let mut ok = ht_power(&hdr) == -55 && ht_power(&hdr[..11]) == i8::MIN;
+    let mut t = BssTable::default();
+    t.see(b(1), 11, -60, 0);
+    ok &= t.get(b(1)).is_none();
+    t.open(0);
+    t.see(b(1), 11, -60, 0);
+    t.see(b(1), 11, -50, 5);
+    ok &= t.get(b(1)).map_or(false, |s| s.rssi == -55 && s.n == 2 && s.last_ms == 5);
+    for k in 2..=8u8 {
+        t.see(b(k), 11, -70, k as u64 * 10);
+    }
+    ok &= t.e.iter().all(|s| s.is_some());
+    t.see(b(9), 11, -70, 90);
+    ok &= t.get(b(1)).is_none() && t.get(b(9)).is_some() && t.get(b(2)).is_some();
+    checks.push(("bsstable", ok));
+
+    let mut p = BssTable::default();
+    p.see(b(7), 11, -30, 0);
+    p.open(0);
+    p.see(b(7), 11, -30, 0);
+    p.open(1000);
+    p.see(b(1), 11, -60, 1000);
+    p.see(b(2), 11, -55, 1000);
+    let five = roam_pick(Some(b(1)), 11, &p).is_none();
+    p.see(b(2), 11, -53, 1001);
+    let six = roam_pick(Some(b(1)), 11, &p) == Some((b(2), 11));
+    p.see(b(4), 13, -25, 1001);
+    let ch13 = roam_pick(Some(b(1)), 11, &p) == Some((b(4), 13));
+    p.see(b(3), 6, -20, 1001);
+    let other_ch = roam_pick(Some(b(1)), 11, &p) == Some((b(3), 6));
+    p.see(b(6), 0, -10, 1002);
+    let no_ds = roam_pick(Some(b(1)), 11, &p) == Some((b(6), 11));
+    let silent = roam_pick(Some(b(5)), 11, &p).is_none();
+    let none = roam_pick(None, 11, &p) == Some((b(6), 11)) && p.get(b(7)).map_or(false, |e| !p.fresh(&e));
+    checks.push(("roampick", five && six && ch13 && other_ch && no_ds && silent && none));
+
+    let mut s = BssTable::default();
+    s.arm(0);
+    let mut win = !s.due(59_999) && s.due(60_000);
+    s.open(60_000);
+    win &= s.is_open() && !s.due(60_000) && !s.ended(60_999) && s.ended(61_000);
+    s.close();
+    win &= !s.is_open() && !s.ended(61_000) && !s.due(119_999) && s.due(120_000);
+    checks.push(("roamwindow", win));
+}
+
+// ── STATIONROAM-XCHAN (rmbp-ledger B898): the off-channel dwells and the idle gate — PURE, held in `join::Heard.scan` under `STATION` ──
+
+/// One dwell on another channel inside an open scan window: one beacon interval (100 TU = 102.4 ms) and a little, so a BSS beaconing
+/// at the default interval is heard once per dwell (passive; STATIONROAM-ACTIVE owed).
+pub const ROAM_DWELL_MS: u64 = 110;
+/// A linked station sweeps only after its data counters stood still this long (the sweep stalls the data path).
+pub const ROAM_IDLE_MS: u64 = 2000;
+/// The channels swept: the three non-overlapping 2.4 GHz channels (the full 1..13 sweep owed: STATIONROAM-SWEEP).
+pub const ROAM_GRID: [u8; 3] = [1, 6, 11];
+/// The highest channel the switch serves (`htphyinit::switch_channel`: 13 takes spuravoid=1, `phy_ht.c:740-741`, through the PMU
+/// step, STATIONROAM-PMU B967; 14 has no 2059 row).
+pub const ROAM_CH_MAX: u8 = 13;
+
+/// The dwell schedule from `home` (the window already listened on it): `ROAM_GRID` in order without `home` — `(channels, count)`.
+pub fn dwell_plan(home: u8) -> ([u8; 3], usize) {
+    let mut out = [0u8; 3];
+    let mut n = 0;
+    for c in ROAM_GRID.iter() {
+        if *c != home {
+            out[n] = *c;
+            n += 1;
+        }
+    }
+    (out, n)
+}
+
+/// `kat`'s rows after B897's (STATIONROAM-XCHAN rmbp-ledger B898). `dwell`: plan(11) = 1, 6; plan(6) = 1, 11; plan(1) = 6, 11;
+/// plan(3) = 1, 6, 11; the stall is at most 3 x `ROAM_DWELL_MS` = 330 ms, 220 on the grid. `idlegate`: arm(0), counters (5, 7):
+/// not quiet at 1999, quiet at 2000; rx moves at 2250: not quiet at 4249, quiet at 4250; tx moves at 4500: not quiet at 6499;
+/// a re-arm at 7000 restarts the clock (not quiet at 8999, quiet at 9000).
+fn xchan_rows(checks: &mut Vec<(&'static str, bool)>) {
+    let mut ok = dwell_plan(11) == ([1, 6, 0], 2) && dwell_plan(6) == ([1, 11, 0], 2) && dwell_plan(1) == ([6, 11, 0], 2);
+    ok &= dwell_plan(3) == ([1, 6, 11], 3);
+    ok &= dwell_plan(3).1 as u64 * ROAM_DWELL_MS == 330 && dwell_plan(11).1 as u64 * ROAM_DWELL_MS == 220;
+    checks.push(("dwell", ok));
+
+    let mut t = BssTable::default();
+    t.arm(0);
+    let mut q = !t.quiet(5, 7, 0) && !t.quiet(5, 7, 1999) && t.quiet(5, 7, 2000);
+    q &= !t.quiet(6, 7, 2250) && !t.quiet(6, 7, 4249) && t.quiet(6, 7, 4250);
+    q &= !t.quiet(6, 8, 4500) && !t.quiet(6, 8, 6499) && t.quiet(6, 8, 6500);
+    t.arm(7000);
+    q &= !t.quiet(6, 8, 7000) && !t.quiet(6, 8, 8999) && t.quiet(6, 8, 9000);
+    checks.push(("idlegate", q));
+}
+
+// ── STATIONROAM-ACTIVE / STATIONROAM-IDLEUNI (rmbp-ledger B951): the probed dwell's end rule — PURE, read by `join::dwell` ──
+
+/// An answered dwell ends no sooner than this after its probe: mac80211's active-scan channel time (`IEEE80211_CHANNEL_TIME`, HZ/33,
+/// net/mac80211/scan.c), so a second BSS of the SSID on the same channel can answer too.
+pub const ROAM_PROBE_MS: u64 = 30;
+/// The receiver slice inside a probed dwell (`rx::poll` turns are 5 ms).
+pub const ROAM_SLICE_MS: u64 = 10;
+
+/// The `Heard.resp` bit of a probe response's DS channel (0 = no DS element); channels past 15 set none.
+pub fn resp_bit(channel: u8) -> u16 {
+    if channel < 16 { 1u16 << channel } else { 0 }
+}
+
+/// A dwell on `ch` was answered: a probe response to us from a BSS whose DS channel is `ch`, or with no DS element (taken as the channel
+/// it was heard on, `roam_pick`'s rule). An adjacent channel's BSS heard through the 2.4 GHz overlap is not an answer.
+pub fn answered(ch: u8, resp: u16) -> bool {
+    resp & (resp_bit(ch) | 1) != 0
+}
+
+/// The probed dwell ends: `ROAM_DWELL_MS` after the probe either way, or `ROAM_PROBE_MS` after it once answered.
+pub fn dwell_end(ch: u8, resp: u16, elapsed_ms: u64) -> bool {
+    elapsed_ms >= ROAM_DWELL_MS || (answered(ch, resp) && elapsed_ms >= ROAM_PROBE_MS)
+}
+
+/// `kat`'s rows after B898's (STATIONROAM-ACTIVE / -IDLEUNI rmbp-ledger B951). `probe`: resp_bit(6) = 0x40, (0) = 1, (200) = 0;
+/// unanswered on 6: not ended at 109, ended at 110; answered on 6: not ended at 29, ended at 30; no DS element ends at 30; an answer
+/// from channel 5 does not end at 30, ends at 110 (bounded); slice <= floor < dwell. `idleuni`: a FromDS data frame to STA and the
+/// same to broadcast through `Link::recv`: rx_data 2, rx_uni 1; the gate fed rx_uni: arm(0), still quiet at 2000 (not 1999) after the
+/// group frame; after the unicast frame at 2250 not quiet at 4249, quiet at 4250.
+fn active_rows(checks: &mut Vec<(&'static str, bool)>) {
+    let mut ok = resp_bit(6) == 0x40 && resp_bit(0) == 1 && resp_bit(200) == 0;
+    ok &= !dwell_end(6, 0, 109) && dwell_end(6, 0, 110);
+    ok &= !dwell_end(6, resp_bit(6), 29) && dwell_end(6, resp_bit(6), 30);
+    ok &= dwell_end(6, resp_bit(0), 30);
+    ok &= !dwell_end(6, resp_bit(5), 30) && dwell_end(6, resp_bit(5), 110);
+    ok &= ROAM_SLICE_MS <= ROAM_PROBE_MS && ROAM_PROBE_MS < ROAM_DWELL_MS;
+    checks.push(("probe", ok));
+
+    let mut uni = alloc::vec![0x08, 0x02, 0x00, 0x00];
+    uni.extend_from_slice(&STA);
+    uni.extend_from_slice(&BSSID);
+    uni.extend_from_slice(&GW_MAC);
+    uni.extend_from_slice(&[0x10, 0x00, 0xAA, 0xAA, 0x03, 0x00, 0x00, 0x00, 0x08, 0x06]);
+    uni.extend_from_slice(&[0u8; 28]);
+    let mut grp = uni.clone();
+    grp[4..10].copy_from_slice(&[0xFF; 6]);
+    let mut l = Link::new(STA, BSSID);
+    let mut t = BssTable::default();
+    t.arm(0);
+    let mut out = [0u8; 64];
+    let mut g = !t.quiet(l.rx_uni, 7, 0);
+    let mut q: Vec<Vec<u8>> = alloc::vec![grp];
+    g &= l.recv(&mut q, &mut out).is_some();
+    g &= !t.quiet(l.rx_uni, 7, 1999) && t.quiet(l.rx_uni, 7, 2000);
+    let mut q: Vec<Vec<u8>> = alloc::vec![uni];
+    g &= l.recv(&mut q, &mut out).is_some();
+    g &= !t.quiet(l.rx_uni, 7, 2250) && !t.quiet(l.rx_uni, 7, 4249) && t.quiet(l.rx_uni, 7, 4250);
+    g &= l.rx_data == 2 && l.rx_uni == 1;
+    checks.push(("idleuni", g));
+}
+
+// ── STATIONROAM-BGSCAN (rmbp-ledger B955): one PS-announced off-channel dwell per window on a busy station — PURE, held in `join::Heard.bg` under `STATION` ──
+
+/// A linked station that is not quiet opens one background window this often (`join::bg_open`); each window ends in at most ONE dwell.
+pub const ROAM_BG_MS: u64 = 10_000;
+/// A window's dwell is refused when more frames than this are in flight at its end (`tx::Queue::in_flight`, after the reap): they must
+/// drain before the PS Null, since `tx::fire_frame`'s status spin would consume their statuses and a frame left in the ring across the
+/// retune carries the home channel's code.
+pub const ROAM_BG_QMAX: usize = 2;
+/// How long `join::bgscan` reaps the queue empty before the PS Null (else `failed:drain`).
+pub const ROAM_BG_DRAIN_MS: u64 = 30;
+
+/// The background scan's schedule and its round-robin cursor over `dwell_plan(home)`: `arm` (from `keep`) puts the first window
+/// `ROAM_BG_MS` out; `due` -> the window opens (`window` set, `BssTable::open_bg`) -> at its end `gate` decides (the next window
+/// `ROAM_BG_MS` out either way); a go takes `channel`, one channel per dwell. A refusal is counted (`refused`, said on the next dwell's
+/// line) and said only on the first of a streak.
+#[derive(Default, Clone, Copy, Debug)]
+pub struct BgScan {
+    next_ms: u64,
+    cursor: u8,
+    /// The window open now is a background one (a quiet end never becomes the 60 s window's full sweep).
+    pub window: bool,
+    pub refused: u32,
+    streak: bool,
+}
+
+impl BgScan {
+    pub fn arm(&mut self, now_ms: u64) {
+        self.next_ms = now_ms + ROAM_BG_MS;
+        self.window = false;
+    }
+
+    pub fn due(&self, now_ms: u64) -> bool {
+        now_ms >= self.next_ms
+    }
+
+    /// At a window's end: `Ok` = the dwell may run (`in_flight <= ROAM_BG_QMAX`); `Err(say)` = refused, `say` on the first refusal of a
+    /// streak. The window flag clears and the next window is `ROAM_BG_MS` out either way.
+    pub fn gate(&mut self, in_flight: usize, now_ms: u64) -> Result<(), bool> {
+        self.window = false;
+        self.next_ms = now_ms + ROAM_BG_MS;
+        if in_flight <= ROAM_BG_QMAX {
+            self.streak = false;
+            return Ok(());
+        }
+        self.refused += 1;
+        let say = !self.streak;
+        self.streak = true;
+        Err(say)
+    }
+
+    /// The next dwell's channel: `dwell_plan(home)` round robin, the cursor advanced once per call (held mod 6, the plans' 2 and 3).
+    pub fn channel(&mut self, home: u8) -> u8 {
+        let (plan, n) = dwell_plan(home);
+        let c = plan[self.cursor as usize % n.max(1)];
+        self.cursor = (self.cursor + 1) % 6;
+        c
+    }
+}
+
+impl BssTable {
+    /// STATIONROAM-BGSCAN (B955): a background window opens — entries heard before it are stale, the 60 s schedule (`next_ms`) stays
+    /// where `arm` / `open` put it.
+    pub fn open_bg(&mut self, now_ms: u64) {
+        self.open = true;
+        self.opened_ms = now_ms;
+    }
+}
+
+/// `kat`'s rows after B951's (STATIONROAM-BGSCAN rmbp-ledger B955). `bgplan`: arm(0): not due at 9 999, due at 10 000; channel(11) =
+/// 1, 6, 1; a fresh cursor: channel(3) = 1, 6, 11, 1; channel(6) = 1, 11; a gate at 10 000 puts the next window at 20 000; a table
+/// armed at 0 and opened in the background at 5 000 is still due at 60 000 (not 59 999) and an entry heard at 4 999 is stale.
+/// `bggate`: gate(2) Ok, gate(3) Err(true), gate(8) Err(false), refused 2; gate(0) Ok ends the streak, gate(3) Err(true) again; the
+/// window flag clears; drain + dwell <= 150 ms, the period longer than a window; `build_null_data_pm` sets octet 1 to 0x11 and is
+/// byte-identical to `build_null_data` when off.
+fn bg_rows(checks: &mut Vec<(&'static str, bool)>) {
+    let mut b = BgScan::default();
+    b.arm(0);
+    let mut ok = !b.due(9_999) && b.due(10_000);
+    ok &= b.channel(11) == 1 && b.channel(11) == 6 && b.channel(11) == 1;
+    let mut c = BgScan::default();
+    ok &= c.channel(3) == 1 && c.channel(3) == 6 && c.channel(3) == 11 && c.channel(3) == 1;
+    let mut d = BgScan::default();
+    ok &= d.channel(6) == 1 && d.channel(6) == 11;
+    ok &= b.gate(0, 10_000) == Ok(()) && !b.due(19_999) && b.due(20_000);
+    let mut t = BssTable::default();
+    t.arm(0);
+    t.open(0);
+    t.see(BSSID, 11, -60, 4_999);
+    t.close();
+    t.arm(0);
+    t.open_bg(5_000);
+    ok &= t.is_open() && roam_pick(None, 11, &t).is_none();
+    t.close();
+    ok &= !t.due(59_999) && t.due(60_000);
+    checks.push(("bgplan", ok));
+
+    let mut g = BgScan::default();
+    g.window = true;
+    let mut q = g.gate(2, 0) == Ok(()) && !g.window;
+    g.window = true;
+    q &= g.gate(3, 10) == Err(true) && !g.window && g.gate(8, 20) == Err(false) && g.refused == 2;
+    q &= g.gate(0, 30) == Ok(()) && g.gate(3, 40) == Err(true);
+    q &= ROAM_BG_DRAIN_MS + ROAM_DWELL_MS <= 150 && ROAM_BG_MS > ROAM_WINDOW_MS;
+    let on = wifi_core::ieee80211::build_null_data_pm(STA, BSSID, 0, true);
+    let off = wifi_core::ieee80211::build_null_data_pm(STA, BSSID, 0, false);
+    let base = wifi_core::ieee80211::build_null_data(STA, BSSID, 0);
+    q &= on[1] == 0x11 && on[0] == base[0] && on[2..] == base[2..] && off == base;
+    checks.push(("bggate", q));
+}
+
+// ── STATIONROAM-SWEEP (rmbp-ledger B958): the lost station's wide sweep and the 802.11d passive rule — PURE, read by `join::sweep` ──
+
+/// The lost plan's order: the grid first (`ROAM_GRID`), then the rest of 1..=13 ascending. Channels above `ROAM_CH_MAX` are not
+/// planned; STATIONROAM-PMU (B967) lifted it to 13 (`htphyinit::switch_channel` runs the PMU spur-avoid step on ChipCommon through
+/// `window::with_core`), so a lost plan holds 12 channels (1..=13 without the home channel), 12 and 13 passive unless COUNTRYCOVER.
+pub const ROAM_LOST_ORDER: [u8; 13] = [1, 6, 11, 2, 3, 4, 5, 7, 8, 9, 10, 12, 13];
+/// The channels a sweep never probes unless COUNTRYCOVER allows (passive in FCC domains): 12 and 13, as bits.
+pub const ROAM_PASSIVE: u16 = (1 << 12) | (1 << 13);
+
+/// COUNTRYCOVER: `true` = the dwell on `ch` may send its probe request. A channel of `ROAM_PASSIVE` is probed only when the home AP's
+/// Country element (802.11d, `wifi_core::ieee80211::country_ie`) lists it in a subband triplet (an ETSI AP lists 1-13, an FCC one 1-11);
+/// no element = passive. Every other channel is always active.
+pub fn passive_ok(ch: u8, country: Option<&wifi_core::ieee80211::Country>) -> bool {
+    if ch >= 16 || ROAM_PASSIVE & (1u16 << ch) == 0 {
+        return true;
+    }
+    country.map_or(false, |c| c.chans & (1u16 << ch) != 0)
+}
+
+/// The lost station's plan: `ROAM_LOST_ORDER` without `home` and without channels above `ROAM_CH_MAX` — `(channels, count, passive)`,
+/// `passive` bit c set where `passive_ok` refuses the probe.
+pub fn dwell_plan_lost(home: u8, country: Option<&wifi_core::ieee80211::Country>) -> ([u8; 13], usize, u16) {
+    let (mut out, mut n, mut passive) = ([0u8; 13], 0usize, 0u16);
+    for c in ROAM_LOST_ORDER.iter() {
+        if *c == home || *c > ROAM_CH_MAX {
+            continue;
+        }
+        out[n] = *c;
+        n += 1;
+        if !passive_ok(*c, country) {
+            passive |= 1u16 << *c;
+        }
+    }
+    (out, n, passive)
+}
+
+/// `join::sweep`'s ONE plan: lost = `dwell_plan_lost`; otherwise exactly `dwell_plan(home)` (the idle sweep's grid), every dwell active.
+pub fn sweep_plan(home: u8, lost: bool, country: Option<&wifi_core::ieee80211::Country>) -> ([u8; 13], usize, u16) {
+    if home > 14 && !lost { return ([0; 13], 0, 0); } if lost { // STATIONROAM-5G (B962): an idle sweep from a 5 GHz home stays in band (`plan_5g`)
+        return dwell_plan_lost(home, country);
+    }
+    let (plan, n) = dwell_plan(home);
+    let mut out = [0u8; 13];
+    out[..3].copy_from_slice(&plan);
+    (out, n, 0)
+}
+
+/// `kat`'s rows after B955's (STATIONROAM-SWEEP rmbp-ledger B958). `lostplan`: lost plan(11) = 1,6,2,3,4,5,7,8,9,10,12,13 (12 channels:
+/// home excluded, 13 planned since ROAM_CH_MAX is 13, STATIONROAM-PMU B967) with 12 and 13 passive; plan(1) starts 6,11,2; a country
+/// covering 1-13 clears the passive mask; the idle plan(11) is the grid's 1,6 with no passive dwell; 12 dwells x ROAM_DWELL_MS = 1320 ms. `country`: a beacon
+/// announcing "DE " (1, 13, 20) covers 1..13 and allows a probe on 12 and 13; "US " (1, 11, 30) covers 1..11, refuses 12, allows 6; an
+/// operating-extension triplet (201, ..) is skipped; a pad octet is accepted; a truncated element (string + 2 octets) and a probe
+/// request read `None`; no element reads `None` and 12 stays passive.
+fn sweep_rows(checks: &mut Vec<(&'static str, bool)>) {
+    use wifi_core::ieee80211::{country_ie, Country};
+    let de = Country { cc: *b"DE ", chans: 0x3FFE, five: 0 };
+    let (p, n, m) = dwell_plan_lost(11, None);
+    let mut ok = p == [1, 6, 2, 3, 4, 5, 7, 8, 9, 10, 12, 13, 0] && n == 12 && m == (1 << 12) | (1 << 13);
+    let (p1, n1, _) = dwell_plan_lost(1, None);
+    ok &= p1[..3] == [6, 11, 2] && n1 == 12;
+    ok &= dwell_plan_lost(11, Some(&de)).2 == 0;
+    ok &= sweep_plan(11, false, None) == ([1, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 2, 0);
+    ok &= sweep_plan(11, true, None) == (p, n, m);
+    ok &= n as u64 * ROAM_DWELL_MS == 1320;
+    checks.push(("lostplan", ok));
+
+    let frame = |ies: &[u8]| -> Vec<u8> {
+        let mut f = alloc::vec![0x80, 0x00, 0x00, 0x00];
+        f.extend_from_slice(&[0xFF; 6]);
+        f.extend_from_slice(&BSSID);
+        f.extend_from_slice(&BSSID);
+        f.extend_from_slice(&[0u8; 2 + 12]);
+        f.extend_from_slice(&[0, 4, b'U', b'n', b'a', b'N']);
+        f.extend_from_slice(ies);
+        f
+    };
+    let d = country_ie(&frame(&[7, 6, b'D', b'E', b' ', 1, 13, 20]));
+    let mut c = d == Some(de) && passive_ok(12, d.as_ref()) && passive_ok(13, d.as_ref());
+    let u = country_ie(&frame(&[7, 6, b'U', b'S', b' ', 1, 11, 30]));
+    c &= u.map_or(false, |x| x.chans == 0x0FFE) && !passive_ok(12, u.as_ref()) && passive_ok(6, u.as_ref());
+    c &= country_ie(&frame(&[7, 9, b'D', b'E', b' ', 201, 1, 0, 1, 13, 20])) == Some(de);
+    c &= country_ie(&frame(&[7, 7, b'D', b'E', b' ', 1, 13, 20, 0])) == Some(de);
+    c &= country_ie(&frame(&[7, 5, b'D', b'E', b' ', 1, 13])).is_none();
+    let mut req = frame(&[7, 6, b'D', b'E', b' ', 1, 13, 20]);
+    req[0] = 0x40;
+    c &= country_ie(&req).is_none();
+    let none = country_ie(&frame(&[]));
+    c &= none.is_none() && !passive_ok(12, none.as_ref());
+    checks.push(("country", c));
+}
+
+// ── STATIONROAM-5G (rmbp-ledger B962): the 5 GHz plan and the roam's channel rule — PURE, read by `join::sweep5` / `roam_pick` ──
+
+/// A BSS the roam may pick by its channel: 0 (no DS element: the channel it was heard on), 1..=`ROAM_CH_MAX`, or a non-DFS 5 GHz
+/// channel (`wifi_core::ieee80211::NONDFS_5G`). A DFS channel is out: nothing transmits there (`tx::dfs_refused`).
+pub fn roamable(c: u8) -> bool {
+    c <= ROAM_CH_MAX || w::NONDFS_5G.contains(&c)
+}
+
+/// The sweep's 5 GHz dwells: `NONDFS_5G` in order without `home`; an idle sweep from a 2.4 GHz home dwells none (the band switch is a
+/// PHY re-init: only a lost station, or a station already on 5 GHz, pays it). `(channels, count, passive)`, passive bit i = plan[i]:
+/// passive unless the home AP's Country element covers that channel (`Country.five`, a 5 GHz triplet's channels 4 apart); no element =
+/// every 5 GHz dwell passive.
+pub fn plan_5g(home: u8, lost: bool, country: Option<&wifi_core::ieee80211::Country>) -> ([u8; 9], usize, u16) {
+    let (mut out, mut n, mut passive) = ([0u8; 9], 0usize, 0u16);
+    if !lost && home <= 14 {
+        return (out, 0, 0);
+    }
+    for (k, c) in w::NONDFS_5G.iter().enumerate() {
+        if *c == home {
+            continue;
+        }
+        if country.map_or(true, |x| x.five & (1u16 << k) == 0) {
+            passive |= 1u16 << n;
+        }
+        out[n] = *c;
+        n += 1;
+    }
+    (out, n, passive)
+}
+
+/// `kat`'s rows after B958's (STATIONROAM-5G rmbp-ledger B962). `band`: chan_freq 1/11/13/14/36/165 = 2412/2462/2472/2484/5180/5825,
+/// 35 and 169 none; 36 is 5 GHz, 11 is not; DFS 52/64/100/144, not 48/149; every NONDFS_5G channel and 52 has a 2059 row
+/// (`radio_2059.c:58-316`), 144 none; roamable 0/1/12/13/36/165 (13: STATIONROAM-PMU B967), not 14/52/100; plan_5g(11, lost, none) = the nine, all passive; (36, idle)
+/// = eight from 40; (11, idle) none; "US " (36,4)(149,5) covers the nine (no passive); "DE " (1,13)(36,4) covers 36..48, 149..165
+/// passive; the idle sweep_plan from 36 is empty; pwr_block 2462/4920/5180/5320/5500/5825 = 2g/5gl/5g/5g/5gh/5gh. `rate5g`:
+/// `tx::band_kat` (station_kat [9]); a 5 GHz rate set (6*,9,12*,18,24*,36,48,54) builds an 8-rung ladder from OFDM 6 with no CCK rung,
+/// four failures at 6 take no step; ack_rate(it, 6) = 6, (it, 24) = 24, (it, 18) = 12 (the highest basic rate not faster, §10.6.6.5.2).
+fn band_rows(checks: &mut Vec<(&'static str, bool)>) {
+    use wifi_core::ieee80211::{chan_freq, country_ie, dfs, is_5g, pwr_block, NONDFS_5G};
+    let mut ok = chan_freq(1) == Some(2412) && chan_freq(11) == Some(2462) && chan_freq(13) == Some(2472) && chan_freq(14) == Some(2484)
+        && chan_freq(36) == Some(5180) && chan_freq(165) == Some(5825) && chan_freq(35).is_none() && chan_freq(169).is_none();
+    ok &= is_5g(36) && !is_5g(11) && dfs(52) && dfs(64) && dfs(100) && dfs(144) && !dfs(48) && !dfs(149);
+    let row = |c: u8| chan_freq(c).and_then(super::radio2059::chan_entry).is_some();
+    ok &= NONDFS_5G.iter().all(|c| row(*c)) && row(52) && !row(144);
+    ok &= roamable(0) && roamable(1) && roamable(12) && roamable(36) && roamable(165) && roamable(13) && !roamable(14) && !roamable(52) && !roamable(100);
+    let (p, n, m) = plan_5g(11, true, None);
+    ok &= p == NONDFS_5G && n == 9 && m == 0x1FF;
+    let (p36, n36, _) = plan_5g(36, false, None);
+    ok &= n36 == 8 && p36[..8] == [40, 44, 48, 149, 153, 157, 161, 165];
+    ok &= plan_5g(11, false, None).1 == 0 && sweep_plan(36, false, None).1 == 0;
+    let frame = |ies: &[u8]| -> Vec<u8> {
+        let mut f = alloc::vec![0x80, 0x00, 0x00, 0x00];
+        f.extend_from_slice(&[0xFF; 6]);
+        f.extend_from_slice(&BSSID);
+        f.extend_from_slice(&BSSID);
+        f.extend_from_slice(&[0u8; 2 + 12]);
+        f.extend_from_slice(&[0, 4, b'U', b'n', b'a', b'N']);
+        f.extend_from_slice(ies);
+        f
+    };
+    let us = country_ie(&frame(&[7, 9, b'U', b'S', b' ', 36, 4, 23, 149, 5, 30]));
+    ok &= us.map_or(false, |c| c.five == 0x1FF) && plan_5g(11, true, us.as_ref()).2 == 0;
+    let de = country_ie(&frame(&[7, 9, b'D', b'E', b' ', 1, 13, 20, 36, 4, 23]));
+    ok &= de.map_or(false, |c| c.five == 0x00F && c.chans == 0x3FFE) && plan_5g(11, true, de.as_ref()).2 == 0x1F0;
+    ok &= pwr_block(2462) == Some("2g") && pwr_block(4920) == Some("5gl") && pwr_block(5180) == Some("5g") && pwr_block(5320) == Some("5g")
+        && pwr_block(5500) == Some("5gh") && pwr_block(5825) == Some("5gh");
+    checks.push(("band", ok));
+}
+
+fn rate5g_rows(checks: &mut Vec<(&'static str, bool)>) {
+    let s5 = w::RateSet { listed: 0x0FF0, basic: 0x0150 };
+    let mut c = RateCtl::new(Some(s5), false, 12, 0);
+    let mut ok = c.n == 8 && c.ladder[..c.n].iter().all(|r| *r >= 12) && c.rate() == 12;
+    for _ in 0..4 {
+        c.frame(12, false, 11);
+    }
+    ok &= c.decide(1000).is_none() && c.rate() == 12 && c.next_rate() >= 12;
+    ok &= super::assoc::ack_rate(Some(s5), 12) == 12 && super::assoc::ack_rate(Some(s5), w::RATE_24M) == w::RATE_24M && super::assoc::ack_rate(Some(s5), 36) == 24;
+    checks.push(("rate5g", ok && super::bringup::station_kat()[9]));
+}
+
+// ── STATIONROAM-PMU (rmbp-ledger B967): the PMU spur-avoid step's KAT row ──────────────────────────────────────────────────────
+
+/// `kat`'s row after B962's (STATIONROAM-PMU rmbp-ledger B967). `pmu`: `bringup/pmu.rs` `kat` over a mock bus — the capability
+/// decode (no PMU, a separate PMU core, not a 4331, READY with its revision), the BCM4331 PLL rows per spur mode
+/// (`driver_chipcommon_pmu.c:534-551`) and PLL_UPD, the PHY PLL reset's clear/set/clear, a selector that does not take (no MMIO),
+/// and every window move paired [ChipCommon, d11] with nothing read or written off-core.
+fn pmu_rows(checks: &mut Vec<(&'static str, bool)>) {
+    checks.push(("pmu", super::bringup::pmu_kat()));
+}
+
+// ── WINDOW-AUDIT (rmbp-ledger B970): the window helpers' KAT row ─────────────────────────────────────────────────────────────────
+
+/// `kat`'s row after B967's (WINDOW-AUDIT rmbp-ledger B970). `window`: `bringup/window.rs` `kat` over a mock selector — the wifi2
+/// ladder's chain (`move_to` ChipCommon, the EROM page, the d11) closed by ONE `restore` to the d11 pre-image, a refused move that
+/// writes nothing back and reaches no MMIO, `with_core` refused and ok as the pair [ChipCommon, d11], a restore that does not read back.
+fn window_rows(checks: &mut Vec<(&'static str, bool)>) {
+    checks.push(("window", super::bringup::window_kat()));
 }

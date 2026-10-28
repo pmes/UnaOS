@@ -1,35 +1,37 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // Copyright (C) 2026 The Architect & Una
 //
-//! The picture under decoding: three 8-bit planes (4:2:0) and the facts the parser, intra prediction, the deblocking
+//! The picture under decoding: three 16-bit sample planes (4:2:0, and 4:2:2 / 4:4:4 since HEVCREXT SR334; HEVCMAIN10 SR311: every bit depth alike) and the facts the parser, intra prediction, the deblocking
 //! filter and SAO read back — per 4x4 luma block (coding quadtree depth, IntraPredModeY, QpY, pcm / transquant bypass,
 //! transform / coding block edges) and per CTB (its slice, its SAO parameters) — with the z-scan availability
-//! process of 6.4.1, and the conformance-window crop into h264_core's [`Frame`].
+//! process of 6.4.1, and the conformance-window crop into h264_core's [`Frame`]. HEVCINTER (SR216): the per-4x4 motion
+//! field ([`PuMotion`]) that merge / AMVP, the temporal predictor of later pictures and the deblocking filter read.
 
 use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::ps::Geometry;
 use crate::Frame;
+use h264_core::ChromaFormat;
 
 /// One sample plane, row-major, no padding.
 #[derive(Clone, Debug, Default)]
 pub struct Plane {
     pub w: usize,
     pub h: usize,
-    pub data: Vec<u8>,
+    pub data: Vec<u16>,
 }
 
 impl Plane {
-    pub fn new(w: usize, h: usize, fill: u8) -> Plane {
+    pub fn new(w: usize, h: usize, fill: u16) -> Plane {
         Plane { w, h, data: vec![fill; w * h] }
     }
     #[inline]
-    pub fn at(&self, x: usize, y: usize) -> u8 {
+    pub fn at(&self, x: usize, y: usize) -> u16 {
         self.data[y * self.w + x]
     }
     #[inline]
-    pub fn set(&mut self, x: usize, y: usize, v: u8) {
+    pub fn set(&mut self, x: usize, y: usize, v: u16) {
         self.data[y * self.w + x] = v;
     }
 }
@@ -62,8 +64,42 @@ pub const F_BYPASS: u8 = 2;
 /// A transform or coding block edge lies on the left / top of this 4x4 block.
 pub const F_EDGE_V: u8 = 4;
 pub const F_EDGE_H: u8 = 8;
+/// The block lies in a luma transform block with non-zero coefficients (cbf_luma; 8.7.2.4 bS 1).
+pub const F_CBF: u8 = 16;
+/// A prediction block edge (not a transform edge) lies on the left / top of this 4x4 block.
+pub const F_PU_EDGE_V: u8 = 32;
+pub const F_PU_EDGE_H: u8 = 64;
+/// cu_skip_flag of the block's coding unit (9.3.4.2.2 ctxInc of the next cu_skip_flag).
+pub const F_SKIP: u8 = 128;
 /// The block has been parsed (its CU's facts are filled).
 pub const NO_SLICE: u32 = u32::MAX;
+
+/// The motion of one 4x4 luma block (8.5.3.2): predFlagL0 (bit 0) / predFlagL1 (bit 1), refIdxLX, mvLX in quarter
+/// luma samples, and the PicOrderCntVal / long-term marking of each list's reference picture as the block's slice saw
+/// them (the temporal predictor of a later picture and the deblocking filter compare pictures by them). `pred` 0 is an
+/// intra block (or one not yet decoded); an unused list keeps ref_idx -1, mv 0, ref_poc 0, ref_lt false.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PuMotion {
+    pub pred: u8,
+    pub ref_idx: [i8; 2],
+    pub mv: [[i32; 2]; 2],
+    pub ref_poc: [i32; 2],
+    pub ref_lt: [bool; 2],
+}
+
+impl Default for PuMotion {
+    fn default() -> Self {
+        PuMotion { pred: 0, ref_idx: [-1, -1], mv: [[0; 2]; 2], ref_poc: [0; 2], ref_lt: [false; 2] }
+    }
+}
+
+impl PuMotion {
+    /// predFlagLX.
+    #[inline]
+    pub fn uses(&self, x: usize) -> bool {
+        self.pred & (1 << x) != 0
+    }
+}
 
 pub struct Picture {
     pub width: usize,
@@ -79,22 +115,40 @@ pub struct Picture {
     pub ctb_slice: Vec<u32>,
     pub sao: Vec<SaoParams>,
     pub slices: Vec<SliceInfo>,
+    /// The motion of every 4x4 block (HEVCINTER).
+    pub motion: Vec<PuMotion>,
+    /// HEVCREXTSCC (SR357): the block lies in a palette coding unit (8.7.2.5.7: not deblocked).
+    pub palette: Vec<bool>,
     pub poc: i32,
     pub tag: i64,
     pub full_range: bool,
     /// The conformance window in luma samples: (x0, y0, w, h).
     pub crop: (usize, usize, usize, usize),
     pub output: bool,
+    /// BitDepthY: to_frame narrows the luma plane by it (HEVCMAIN10 SR311).
+    pub bit_depth: u32,
+    /// HEVCREXT (SR334): the chroma format (the Cb / Cr planes are width / SubWidthC x height / SubHeightC).
+    pub chroma: ChromaFormat,
+    /// HEVCREXT (SR334): BitDepthC (to_frame narrows the chroma planes by it; the hash SEI reads it).
+    pub bit_depth_c: u32,
 }
 
 impl Picture {
     pub fn new(width: usize, height: usize, geo: &Geometry) -> Picture {
+        Picture::with_chroma(width, height, geo, ChromaFormat::Yuv420)
+    }
+
+    /// HEVCREXT (SR334): a picture whose chroma planes follow `chroma` (Table 6-1); HEVCREXTTOOLS (SR345): monochrome's
+    /// Cb / Cr planes are 0 x 0.
+    pub fn with_chroma(width: usize, height: usize, geo: &Geometry, chroma: ChromaFormat) -> Picture {
+        let (sw, sh) = chroma.sub();
+        let (cw, ch) = if chroma == ChromaFormat::Mono { (0, 0) } else { (width / sw, height / sh) };
         let n4 = geo.w4 * geo.h4;
         let nctb = (geo.width_ctbs * geo.height_ctbs) as usize;
         Picture {
             width,
             height,
-            planes: [Plane::new(width, height, 0), Plane::new(width / 2, height / 2, 0), Plane::new(width / 2, height / 2, 0)],
+            planes: [Plane::new(width, height, 0), Plane::new(cw, ch, 0), Plane::new(cw, ch, 0)],
             w4: geo.w4,
             h4: geo.h4,
             ctdepth: vec![0; n4],
@@ -104,11 +158,16 @@ impl Picture {
             ctb_slice: vec![NO_SLICE; nctb],
             sao: vec![SaoParams::default(); nctb],
             slices: Vec::new(),
+            motion: vec![PuMotion::default(); n4],
+            palette: vec![false; n4],
             poc: 0,
             tag: 0,
             full_range: false,
             crop: (0, 0, width, height),
             output: true,
+            bit_depth: 8,
+            chroma,
+            bit_depth_c: 8,
         }
     }
 
@@ -155,9 +214,16 @@ impl Picture {
         geo.tile_of_rs(cn) == geo.tile_of_rs(cc)
     }
 
-    /// The cropped picture as h264_core's frame type (7.4.3.2.1 conformance window, 4:2:0).
+    /// The cropped picture as h264_core's frame type (7.4.3.2.1 conformance window). HEVCMAIN10 (SR311): above
+    /// 8 bits `planes16` carries the samples as decoded and `planes` holds them narrowed `>> (bit_depth - 8)`; at 8 bits
+    /// the narrow is a shift of 0 and `planes16` is None. HEVCREXT (SR334): the chroma planes are cropped by
+    /// (SubWidthC, SubHeightC) and narrowed by BitDepthC; `planes16` is Some when either depth is above 8 and holds each
+    /// plane at its own depth (`Frame.bit_depth` is BitDepthY); `Frame.chroma` names the format.
     pub fn to_frame(&self) -> Frame {
         let (x0, y0, w, h) = self.crop;
+        let (sw, sh) = self.chroma.sub();
+        // HEVCREXTTOOLS (SR345): a monochrome frame carries empty Cb / Cr planes (the consumer's grey fill is gneiss_pal's).
+        let (cw, ch) = if self.chroma == ChromaFormat::Mono { (0, 0) } else { (w / sw, h / sh) };
         let crop = |pl: &Plane, x0: usize, y0: usize, w: usize, h: usize| {
             let mut v = Vec::with_capacity(w * h);
             for r in 0..h {
@@ -166,17 +232,24 @@ impl Picture {
             }
             v
         };
+        let planes16 = [
+            crop(&self.planes[0], x0, y0, w, h),
+            crop(&self.planes[1], x0 / sw, y0 / sh, cw, ch),
+            crop(&self.planes[2], x0 / sw, y0 / sh, cw, ch),
+        ];
+        let (shift, shift_c) = (self.bit_depth - 8, self.bit_depth_c - 8);
+        let narrow = |p: &Vec<u16>, shift: u32| p.iter().map(|&v| (v >> shift) as u8).collect::<Vec<u8>>();
         Frame {
             width: w as u32,
             height: h as u32,
-            planes: [
-                crop(&self.planes[0], x0, y0, w, h),
-                crop(&self.planes[1], x0 / 2, y0 / 2, w / 2, h / 2),
-                crop(&self.planes[2], x0 / 2, y0 / 2, w / 2, h / 2),
-            ],
+            planes: [narrow(&planes16[0], shift), narrow(&planes16[1], shift_c), narrow(&planes16[2], shift_c)],
             poc: self.poc,
             tag: self.tag,
             full_range: self.full_range,
+            bit_depth: self.bit_depth as u8,
+            planes16: if self.bit_depth > 8 || self.bit_depth_c > 8 { Some(planes16) } else { None },
+            chroma: self.chroma,
+            bit_depth_c: self.bit_depth_c as u8,
         }
     }
 }

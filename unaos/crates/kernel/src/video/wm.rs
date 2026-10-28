@@ -417,7 +417,7 @@ struct TableGuard {
     // the bug, in miniature, at every unlock.
     // `spin 0.12`'s guard is `<'a, T, R>` — the 2-generic form this tree requires.
     inner: MutexGuard<'static, Table, SpinRelax>,
-    _irq: crate::arch::IrqMask,
+    _irq: TableSpan, // PREEMPTOFFARMWMTABLE (zenbook-ledger Z92): the IRQ mask, or the aarch64 preempt-off hold where no ISR can reach TABLE (`TableSpan` / `table_span`, file tail). LINE-NEUTRAL
 }
 
 impl core::ops::Deref for TableGuard {
@@ -440,7 +440,7 @@ impl core::ops::DerefMut for TableGuard {
 fn table() -> TableGuard {
     // Mask BEFORE the acquisition, not after: masking after would leave the spin itself
     // preemptible, and a holder preempted between our acquire and our mask is the same wedge.
-    let _irq = crate::arch::IrqMask::new();
+    let _irq = table_span(); // PREEMPTOFFARMWMTABLE (zenbook-ledger Z92): `table_span` (file tail) — the mask, or on aarch64 without `desktop_firmware` the preempt-off hold with I as the caller had it. LINE-NEUTRAL
     let inner = TABLE.lock();
     // R0 / rtwit — start the TABLE hold timer the instant the lock is held (see `TableGuard`).
     let _hold = crate::rtwit::hold(crate::rtwit::Lock::Table);
@@ -2653,7 +2653,7 @@ pub fn close(id: WinId) -> bool {
     // WMDIRECT — the drag does not survive the window. Ahead of the row free (and of the WEDGE
     // token) so the gesture is cancelled while the id still means something; after this point the
     // slot may be re-issued and a live drag would be steering a stranger's window.
-    #[cfg(all(target_arch = "x86_64", feature = "wc"))] winmemory::closing(id); drag_forget(id); winid_close_teardown(id); #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] scroll_clear(id); // WINID (SO1(b) / A29) — ⚠ SAME-LINE fold, line-NEUTRAL. Every registered id cache is cleared of `id` HERE, beside `drag_forget` and for its stated reason: this is ahead of the table lock and therefore ahead of the row free, so no cache can still be naming this slot when `create_inner` re-issues it. Id-checked per cell, so a cache pointing at another window is untouched. See the WINID block at this file's tail for the defect (render7: the console's win 1 came back as quarry's win 1), for why this is teardown and not a generation in the id, and for the LOCKFIX argument on the input path. RING3SCROLL (B778): `scroll_clear(id)` — the window's scroll model goes with the row (a ring-3 window closes here, never through an owner's own clear), folded before this line's first `//`.
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))] winmemory::closing(id); drag_forget(id); let close_flight = close_flight_enter(id); let close_hooks = winid_close_teardown(id); #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] scroll_clear(id); // WINID (SO1(b) / A29) — ⚠ SAME-LINE fold, line-NEUTRAL. Every registered id cache is cleared of `id` HERE, beside `drag_forget` and for its stated reason: this is ahead of the table lock and therefore ahead of the row free, so no cache can still be naming this slot when `create_inner` re-issues it. Id-checked per cell, so a cache pointing at another window is untouched. See the WINID block at this file's tail for the defect (render7: the console's win 1 came back as quarry's win 1), for why this is teardown and not a generation in the id, and for the LOCKFIX argument on the input path. RING3SCROLL (B778): `scroll_clear(id)` — the window's scroll model goes with the row (a ring-3 window closes here, never through an owner's own clear), folded before this line's first `//`.
     // WEDGE-1r2 `<D1>`/`<d1>` — see `move_to`. `close` reaches its barrier through a `TABLE` critical
     // section, so the token has to precede the lock to cover the death that happens ON it.
     crate::wedge2::mark_composite("<D1>", "<d1>");
@@ -2683,12 +2683,12 @@ pub fn close(id: WinId) -> bool {
     reclaim(&[vacated]); #[cfg(all(target_arch = "x86_64", feature = "wc"))] pool_trim(); // POOLTRIM (B845): the pools past live + 2 trimmed inside the barrier (no pass in flight). LINE-NEUTRAL append, code first
     reclaim(&moved[..nv]);
     // Re-open the barrier before recompositing — a composite under a raised barrier is a no-op.
-    drop(barrier);
+    drop(barrier); close_flight_end(close_flight); // RETIREDRAIN (rmbp-ledger B1055): this close's flight ends with its drain (`close_drain_wait`, file tail). LINE-NEUTRAL append, code first
     // WC-K2 — no CURSOR-14 bracket-closer here any more. `erase` paints nothing and takes the sprite
     // down for nothing, so there is no bracket left to close; a `cursor::repaint()` on this line
     // would be an unbracketed whole-sprite cycle. `drain_deferred`'s masked handback and
     // `composite`'s tail own the sprite through the publish. See [`erase`].
-    composite();
+    composite(); winid_close_hooks_run(id, close_hooks); // WMCLOSEHOOK (rmbp-ledger B1038): an owner whose cell the WINID teardown cleared above (a close behind its back: the furniture disc, `close_all_furniture`, a Log Out) is told HERE — after the row was cleared under TABLE and the drain returned, with no wm lock held — by running its registered close-free (fns at this file's tail). LINE-NEUTRAL append, code first
     true
 }
 
@@ -10108,7 +10108,7 @@ pub fn shell_remint(
     {
         return false;
     }
-    r.surf = surf;
+    r.surf = surf; #[cfg(all(target_arch = "x86_64", feature = "wc"))] { let _ = crate::allocator::census::retag_tracked(surf, crate::allocator::census::WINDOW_SURFACE); } // WINDOWSURFTAG (B1030): the shell's re-pointed surface is the window's (rename-only). SAME-LINE fold, line-NEUTRAL
     r.surf_len = surf_len;
     r.damage_all();
     r.presented = true;
@@ -11654,7 +11654,7 @@ pub fn drain_release_dead(task_id: u64) -> bool {
     if task_id == 0 {
         return false;
     }
-    let mut freed = 0u64;
+    let mut freed = 0u64; close_flight_release_dead(task_id);
     for slot in DRAIN_OWNERS.iter() {
         if slot
             .compare_exchange(task_id, 0, Ordering::AcqRel, Ordering::Relaxed)
@@ -23542,7 +23542,7 @@ fn create_inner(
     row.w = w;
     row.h = h;
     row.stride = stride;
-    row.surf = surf;
+    row.surf = surf; #[cfg(all(target_arch = "x86_64", feature = "wc"))] { let _ = crate::allocator::census::retag_tracked(surf, crate::allocator::census::WINDOW_SURFACE); } // WINDOWSURFTAG (B1030, BP-cores-22): the row's surface is the window's in the census (rename-only: a static or a slot-record interior pointer is not tracked and stays untouched). SAME-LINE fold, line-NEUTRAL
     row.surf_len = surf_len;
     row.z = z;
     row.damage_all();
@@ -25238,7 +25238,7 @@ pub fn hittest_selftest() {
     // `focus_changed(0)` leg pushed EVERY live window below the shell and consumed its damage flag).
     SHELL_Z.store(0, Ordering::Release);
     FOCUS_ASID.store(0, Ordering::Release);
-    repaint(); closemin_selftest(); wintitle_selftest(); #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] wincycle_selftest(); // CLOSEMIN + WINTITLE — ⚠ SAME-LINE fold, line-NEUTRAL. Both fixtures are sited HERE, at the tail of the one window battery BOTH arches drive (x86 `arch/x86_64/syscall.rs` and aarch64 alike), because each pins arch-neutral code reached from two arch routers. `winid_selftest`'s chain was refused for WINTITLE for the same reason: it has exactly one external caller and it is `arch/aarch64`, so a fixture folded there would never run under `UNAOS_WC=1 ./arroyo test`. After this battery's own teardown sweep and focus restore, so neither inherits a synthetic row; each mints, reaps and restores its own.
+    repaint(); closemin_selftest(); wintitle_selftest(); #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] wincycle_selftest(); #[cfg(all(target_arch = "x86_64", feature = "wc"))] winid_selftest(); // RETIREDRAINKAT (rmbp-ledger B1072): x86's first reach of the WINID fixture (its chain was aarch64-only), LINE-NEUTRAL append. CLOSEMIN + WINTITLE — ⚠ SAME-LINE fold, line-NEUTRAL. Both fixtures are sited HERE, at the tail of the one window battery BOTH arches drive (x86 `arch/x86_64/syscall.rs` and aarch64 alike), because each pins arch-neutral code reached from two arch routers. `winid_selftest`'s chain was refused for WINTITLE for the same reason: it has exactly one external caller and it is `arch/aarch64`, so a fixture folded there would never run under `UNAOS_WC=1 ./arroyo test`. After this battery's own teardown sweep and focus restore, so neither inherits a synthetic row; each mints, reaps and restores its own.
 }
 
 /// CLICK-X86 — the restore every selftest that drives [`focus_changed`] with SYNTHETIC owners owes:
@@ -26321,7 +26321,7 @@ pub fn deadman_damage_sample() -> Option<(u32, u32)> {
     all(target_arch = "x86_64", feature = "wc"),
     all(target_arch = "aarch64", feature = "desktop_firmware")
 ))]
-pub const WINID_HOLDER_MAX: usize = 12;
+pub const WINID_HOLDER_MAX: usize = 24; // WMCLOSEHOOK (B1038): 12 -> 24 in the same commit as the quicklook and closehook-leg cells (A29's rule): 16 x86 holder sites already outran 12, and a refused cell's close hook could never fire
 
 /// WINID — one registered id cache: the cell, and the name that goes on the wire when it is cleared.
 #[cfg(any(
@@ -26331,7 +26331,7 @@ pub const WINID_HOLDER_MAX: usize = 12;
 #[derive(Clone, Copy)]
 struct WinIdHolder {
     cell: Option<&'static core::sync::atomic::AtomicU32>,
-    tag: &'static str,
+    tag: &'static str, hook: Option<WinCloseHook>, // WMCLOSEHOOK (B1038): the owner's close-free, run by `close` when THIS cell is the one the teardown cleared (`winid_register_close_hook`)
 }
 
 /// WINID — the registry. A leaf mutex; see this block's LOCKFIX note.
@@ -26340,7 +26340,7 @@ struct WinIdHolder {
     all(target_arch = "aarch64", feature = "desktop_firmware")
 ))]
 static HOLDERS: Mutex<[WinIdHolder; WINID_HOLDER_MAX]> =
-    Mutex::new([WinIdHolder { cell: None, tag: "" }; WINID_HOLDER_MAX]);
+    Mutex::new([WinIdHolder { cell: None, tag: "", hook: None }; WINID_HOLDER_MAX]);
 
 /// WINID — **register an id cache so [`close`] can clear it.** Idempotent by CELL ADDRESS, so the
 /// natural call site (the module's own `WIN.store(id, ...)` line, which runs once per window) costs a
@@ -26369,7 +26369,7 @@ pub fn winid_register_holder(
             }
         }
         if let Some(i) = free {
-            h[i] = WinIdHolder { cell: Some(cell), tag };
+            h[i] = WinIdHolder { cell: Some(cell), tag, hook: None };
         }
     }
     if free.is_none() {
@@ -26403,7 +26403,7 @@ pub fn winid_register_holder(
     all(target_arch = "x86_64", feature = "wc"),
     all(target_arch = "aarch64", feature = "desktop_firmware")
 ))]
-fn winid_holders_clear(id: WinId, names: &mut [&'static str; WINID_HOLDER_MAX]) -> usize {
+fn winid_holders_clear(id: WinId, names: &mut [&'static str; WINID_HOLDER_MAX], hooks: &mut [Option<WinCloseHook>; WINID_HOLDER_MAX]) -> usize { // WMCLOSEHOOK (B1038): each CLEARED cell's hook is copied out beside its tag
     if id == WIN_NONE {
         return 0;
     }
@@ -26419,7 +26419,7 @@ fn winid_holders_clear(id: WinId, names: &mut [&'static str; WINID_HOLDER_MAX]) 
             )
             .is_ok()
             {
-                names[n] = e.tag;
+                names[n] = e.tag; hooks[n] = e.hook;
                 n += 1;
             }
         }
@@ -26529,7 +26529,7 @@ fn winid_close_witness(
     id: WinId,
     cleared: usize,
     names: &[&'static str; WINID_HOLDER_MAX],
-    route: &'static str,
+    route: &'static str, hooked: usize,
 ) {
     if cleared == 0
         && WINID_CLOSE_LOGGED.fetch_add(1, core::sync::atomic::Ordering::Relaxed) >= WINID_LOG_MAX
@@ -26537,7 +26537,7 @@ fn winid_close_witness(
         return;
     }
     crate::bootlog_println!(
-        "[wm] close win={} gen={} route={} holders-cleared={} names={},{},{},{}",
+        "[wm] close win={} gen={} route={} holders-cleared={} names={},{},{},{} hooked={}",
         id,
         winid_gen(id),
         route,
@@ -26545,7 +26545,7 @@ fn winid_close_witness(
         names[0],
         names[1],
         names[2],
-        names[3]
+        names[3], hooked
     );
 }
 
@@ -26554,11 +26554,11 @@ fn winid_close_witness(
     all(target_arch = "x86_64", feature = "wc"),
     all(target_arch = "aarch64", feature = "desktop_firmware")
 ))]
-fn winid_close_teardown(id: WinId) {
+fn winid_close_teardown(id: WinId) -> CloseHooks {
     let route = winid_console_route(id);
     let mut names: [&'static str; WINID_HOLDER_MAX] = [""; WINID_HOLDER_MAX];
-    let cleared = winid_holders_clear(id, &mut names);
-    winid_close_witness(id, cleared, &names, route);
+    let mut hooks = close_hooks_new(); let cleared = winid_holders_clear(id, &mut names, &mut hooks.run); close_hooks_seal(id, &mut hooks, cleared); // WMCLOSEHOOK (B1038): the cleared cells' hooks, and the row's surface when one was collected (file tail)
+    winid_close_witness(id, cleared, &names, route, hooks.hooked); hooks
 }
 
 /// WINID — the erasing twin. No furniture on this image, so a close has nothing to tear down and
@@ -26568,7 +26568,7 @@ fn winid_close_teardown(id: WinId) {
     all(target_arch = "aarch64", feature = "desktop_firmware")
 )))]
 #[inline(always)]
-fn winid_close_teardown(_id: WinId) {}
+fn winid_close_teardown(_id: WinId) -> CloseHooks {}
 
 /// WINID — `route=` for the close witness.
 #[cfg(any(
@@ -26702,12 +26702,60 @@ fn winid_selftest() {
     close(w3);
     let scoped_ok = PROBE_CELL.load(Ordering::Acquire) == w2;
 
-    close(w2);
+    // LEG 5 — RETIREDRAIN (rmbp-ledger B1055): the drain door. A close flight held on THIS task (the fixture
+    // forces the composite race on the sibling core across a real close at LEG 9, RETIREDRAINBLITKAT B1079) must
+    // keep `close_drain_wait_for` from answering drained inside its bound; once the flight ends it must answer.
+    // RETIREDRAINKAT (rmbp-ledger B1072): the door that WAITS on another task's flight and then drains is LEG 6.
+    let flight = close_flight_enter(w2);
+    // CLOSEFLIGHTID (rmbp-ledger B1068): the held flight's own slot word must name w2 while it is held and read
+    // WIN_NONE once it ends (skipped when the flight is unrecorded: untasked fixture or a full registry).
+    let flight_slot = flight.1;
+    let held_word = if flight_slot < DRAIN_OWNER_SLOTS { DRAIN_OWNER_WIN[flight_slot].load(Ordering::Acquire) } else { 0 };
+    // CLOSEFLIGHTOLDEST (rmbp-ledger B1070): the word packs w2 with a non-zero enter sequence.
+    let held_win = close_flight_word_win(held_word);
+    let held_seq = close_flight_word_seq(held_word);
+    let (held_drained, held_inflight, held_us, held_id) = close_drain_wait_for("winid-probe", 2_000, false);
+    close_flight_end(flight);
+    let after_word = if flight_slot < DRAIN_OWNER_SLOTS { DRAIN_OWNER_WIN[flight_slot].load(Ordering::Acquire) } else { 0 };
+    let (free_drained, _, _, _) = close_drain_wait_for("winid-probe", 20_000, false);
+    // CLOSEFLIGHTOLDEST (B1070): the oldest of one is itself (skipped only when a sibling close is also in flight).
+    let id_ok = flight_slot >= DRAIN_OWNER_SLOTS
+        || (held_win == w2 && held_seq != 0 && after_word == 0 && (held_inflight != 1 || held_id == w2));
+    let door_ok = !held_drained && held_inflight >= 1 && free_drained && id_ok;
+
+    // LEG 6 — RETIREDRAINKAT (rmbp-ledger B1072): a drain that WAITS. A helper task holds a close flight for w2 (a
+    // SECOND task's flight, as a sibling close's is) while this task sits in the real door at its real bound; the door
+    // must wait (> 0 us), name w2 as the oldest flight and drain once the helper ends it (`close_drain_kat`, the
+    // RETIREDRAINKAT block after `close_drain_wait_for`). `skip` (the helper never started inside 1 s) fails nothing.
+    let (wait_v, wait_us, wait_id) = close_drain_kat(w2, 0);
+    let wait_ok = wait_v != "0";
+
+    // LEG 7 — RETIREDRAINDEATHKAT (rmbp-ledger B1074): a flight given back at its holder's DEATH. The same helper, in
+    // `KAT_DIE` mode, holds a recorded flight for w2 through the door, forgets its guard and returns; its `exit()` ->
+    // `drain_release_dead` -> `close_flight_release_dead` must drain the door, free the slot and clear the word.
+    // `skip` (unrecorded flight, ended politely; or the helper never started) fails nothing.
+    let (death_v, _, death_id) = close_drain_kat(w2, KAT_DIE);
+    let death_ok = death_v != "0";
+
+    // LEG 8 — RETIREDRAINKILLKAT (rmbp-ledger B1076): a flight given back through a KILL. The same helper, in `KAT_KILL`
+    // mode, holds a recorded flight for w2 yielding until this task kills it (aarch64 `sched::kill` by tid -> its
+    // `yield_now`'s `kill_check_current`; x86 its `KillSwitch` -> `run()`'s `reap_killed`); the death road must drain the
+    // door, free the slot and clear the word. `skip` (unrecorded, the kill table full, or no helper) fails nothing.
+    let (kill_v, _, kill_id) = close_drain_kat(w2, KAT_KILL);
+    let kill_ok = kill_v != "0";
+
+    // LEG 9 — RETIREDRAINBLITKAT (rmbp-ledger B1079): a REAL close's composite race on the sibling core. A helper holds
+    // the pass's own F4 registration (`BlitGuard::enter()` under `table()`, TABLE dropped at once: no CASTS, no COMPGATE)
+    // while THIS task runs the real `close(w2)`; its `DrainBarrier` must wait for that composite (the helper's release is
+    // published before `close` returns), and the door read after the close must drain. This IS w2's close (it closes w2
+    // on every arm). `skip` / `skip(one-core)` (no helper inside 1 s / no sibling core) fails nothing.
+    let (blit_v, blit_us) = close_drain_blit_kat(w2);
+    let blit_ok = blit_v != "0";
     PROBE_CELL.store(WIN_NONE, Ordering::Release);
 
-    let ok = reg_ok && cleared_ok && recycled_ok && scoped_ok;
+    let ok = reg_ok && cleared_ok && recycled_ok && scoped_ok && door_ok && wait_ok && death_ok && kill_ok && blit_ok;
     serial_println!(
-        "[winid] selftest register={} cleared={} (held={} after close win={}) recycled={} (w1={} gen={} -> w2={} gen={}) id-scoped={} -> {}",
+        "[winid] selftest register={} cleared={} (held={} after close win={}) recycled={} (w1={} gen={} -> w2={} gen={}) id-scoped={} drain-door={} (held={}/{}/{}us free={} id={} door_id={}) drain-wait={} (waited={}us id={}) drain-death={} (id={}) drain-kill={} (id={}) drain-blit={} (waited={}us) -> {}",
         reg_ok as u8,
         cleared_ok as u8,
         held_after_close,
@@ -26718,6 +26766,22 @@ fn winid_selftest() {
         w2,
         g2,
         scoped_ok as u8,
+        door_ok as u8,
+        held_drained as u8,
+        held_inflight,
+        held_us,
+        free_drained as u8,
+        held_win,
+        held_id,
+        wait_v,
+        wait_us,
+        wait_id,
+        death_v,
+        death_id,
+        kill_v,
+        kill_id,
+        blit_v,
+        blit_us,
         if ok { "PASS" } else { "FAIL" }
     );
     composite();
@@ -27384,10 +27448,10 @@ static COMPGATE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool
 
 /// COMPGATE — which core holds [`COMPGATE`]. `usize::MAX` = free. Written by the acquire winner and
 /// cleared before the release store, so a reader that sees a core sees a live holder or a stale one,
-/// never a wrong one. Read by the wait arm's futility test.
+/// never a wrong one. Read by the wait arm's futility test, and by `comp_gate_held_here` (Z114).
 #[cfg(not(target_arch = "x86_64"))]
 static COMPGATE_HOLDER_CORE: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(usize::MAX);
+    core::sync::atomic::AtomicUsize::new(usize::MAX); #[cfg(all(target_arch = "aarch64", feature = "desktop_firmware", feature = "witness"))] pub(crate) fn comp_gate_held_here() -> bool { COMPGATE_HOLDER_CORE.load(core::sync::atomic::Ordering::Relaxed) == crate::arch::sched::meter_current_cpu() } // PREEMPTOFFARMCASTSNOWINPASSGUARD (zenbook-ledger Z114): `comp_gate_held_here` = THIS core holds COMPGATE (the holder is stored after the CAS win and cleared before the release, every `composite_once` between, so a same-core read inside the pass is exact; a cross-core reader is never asked). Read by `arch/aarch64/sched.rs` `preemptoff::nest_wrap` so `casts_now_nest` records in-pass takes only; cfg = its sole caller's. LINE-NEUTRAL fold, code first.
 
 /// COMPGATE — when the current held epoch began, in [`crate::arch::now_cycles`] units.
 #[cfg(not(target_arch = "x86_64"))]
@@ -29340,7 +29404,7 @@ pub fn cycle_order(out: &mut alloc::vec::Vec<WinId>) -> usize { // WINDOWCAP-2: 
     let mut zs = alloc::vec::Vec::new(); // WINDOWCAP-2: growable (was a [_; MAX_WINDOWS] scratch)
     let mut n = 0usize;
     for r in t.rows.iter() {
-        if r.used && !r.compat && r.owner_asid != 0 && !is_kernel_owner(r.owner_asid) && r.z != PARKED_Z && above_shell(r, shell) {
+        if r.used && !r.compat && r.owner_asid != 0 && (!is_kernel_owner(r.owner_asid) || listed_furniture(r.owner_asid)) && r.z != PARKED_Z && above_shell(r, shell) {
             zs.push((r.z, r.id));
             n += 1;
         }
@@ -29948,7 +30012,7 @@ pub fn wl_rows(out: &mut alloc::vec::Vec<WlRow>) -> usize { // WINDOWCAP-2: clea
     {
         let t = table();
         for r in t.rows.iter() {
-            if r.used && !r.compat && r.owner_asid != 0 && !is_kernel_owner(r.owner_asid) {
+            if r.used && !r.compat && r.owner_asid != 0 && (!is_kernel_owner(r.owner_asid) || listed_furniture(r.owner_asid)) {
                 out.push(WlRow { id: r.id, owner: r.owner_asid, minimised: r.z == PARKED_Z || !above_shell(r, shell), title: r.title, len: r.title_len.min(MAX_TITLE) });
                 n += 1;
             }
@@ -32332,4 +32396,1187 @@ pub fn resize_kernel_row(id: WinId, w: usize, h: usize) -> Option<bool> {
         (r.owner_asid, r.x, r.y)
     };
     resize_to_inner(id, Some(owner), x, y, w, h)
+}
+
+// ---- NLE6KEYSTAB (rmbp-ledger B975): kernel furniture that asks to be LISTED -----------------------------------------
+//
+// TAIL-APPENDED. The wc window list (`cycle_order`, `wl_rows`: Cmd-Tab's appswitch, the Window menu, WINCYCLE) drops every
+// kernel-owner row. A furniture owner may opt in while it shows an app-like window (the Player on an EDL, titled
+// `NLE - <stem>`): `list_furniture(owner, true)` while open, `false` on close. Atomics only (read under `TABLE`); four slots,
+// one per opting kind (not a window cap, BP-video-7). Not a second window list: the two readers' filters ask it.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+static LISTED: [core::sync::atomic::AtomicU64; 4] = [const { core::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// List (`on`) or unlist a kernel-furniture owner in the wc window list. `false` when `on` found no free slot or `owner` is
+/// not a kernel owner (a ring-3 owner is always listed).
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub fn list_furniture(owner: u64, on: bool) -> bool {
+    use core::sync::atomic::Ordering;
+    if owner == 0 || !is_kernel_owner(owner) {
+        return false;
+    }
+    if !on {
+        for s in LISTED.iter() {
+            let _ = s.compare_exchange(owner, 0, Ordering::AcqRel, Ordering::Acquire);
+        }
+        return true;
+    }
+    if listed_furniture(owner) {
+        return true;
+    }
+    LISTED.iter().any(|s| s.compare_exchange(0, owner, Ordering::AcqRel, Ordering::Acquire).is_ok())
+}
+
+/// Is `owner` a kernel-furniture owner that asked to be listed ([`list_furniture`])?
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub fn listed_furniture(owner: u64) -> bool {
+    owner != 0 && LISTED.iter().any(|s| s.load(core::sync::atomic::Ordering::Acquire) == owner)
+}
+
+// =================================================================================================
+// WMCLOSEHOOK (rmbp-ledger B1038; BP-video-18 kept, the §3 seam sentence) — **an owner whose window is
+// closed behind its back is TOLD, through the WINID registry it already registered with.** TAIL-APPENDED.
+// =================================================================================================
+//
+// Every bypass close ends in [`close`] — `close_all_furniture` (a Log Out, `power::prelude`), the close disc's
+// `wc_close_furniture` on a kernel row — and `close`'s WINID teardown CASes the owner's id cell to `WIN_NONE`
+// ahead of TABLE. That CAS is exactly why the owner's own later `close()` saw `WIN_NONE` and kept its surface
+// (Quarry 7290 KiB, rast_demo's `RW_KEEP` ~300 KiB). The owner identity therefore already lives HERE, in the
+// holder entry, not on the row: the hook is ONE field on [`WinIdHolder`], set by [`winid_register_close_hook`].
+//
+// ORDER (B1033's rule): the hooks are collected by the teardown (ahead of TABLE), and RUN at `close`'s tail —
+// after the row was cleared under TABLE, after the drain returned and the barrier dropped, with no wm lock
+// held. A hook is the owner's existing close-free and NEVER calls `wm::close`. An operator close through the
+// owner's own `close()` swaps the cell to `WIN_NONE` first, so the CAS misses and no hook fires: the owner
+// frees as before, and a bypass close runs the same free — one path.
+//
+// EXACTNESS: a hook is handed the CLOSED ROW's surface address (read under a brief TABLE lock in the teardown,
+// only when a hook was collected) and frees only the buffer that row seated, so a reopened owner's new buffer
+// is never touched. No guard: the kernel is `panic-strategy: abort`, a panicking hook cannot be caught, so no
+// `[wm] close hook` line exists; the count rides `[wm] close … hooked=<n>`. Owed, not built:
+// HOOK-OPEN-INFLIGHT (an owner that reuses its buffer and drops its lock before `create`, Quarry and facet,
+// during an open in flight on another core — B1033's own premise), DRAIN-ABANDON-FREE (a bounded drain that
+// gave up).
+
+/// WMCLOSEHOOK — an owner's close-free: `(the closed id, the closed row's surface address)`.
+#[cfg(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+))]
+pub type WinCloseHook = fn(WinId, usize);
+
+/// WMCLOSEHOOK — what the teardown hands `close`'s tail: the cleared cells' hooks (index-aligned with the
+/// witness's names), how many of them are set, and the closed row's surface.
+#[cfg(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+))]
+#[derive(Clone, Copy)]
+struct CloseHooks {
+    run: [Option<WinCloseHook>; WINID_HOLDER_MAX],
+    hooked: usize,
+    surf: usize,
+}
+
+/// WMCLOSEHOOK — the erasing twin: no furniture, nothing registered, `close` keeps its bytes.
+#[cfg(not(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+)))]
+type CloseHooks = ();
+
+#[cfg(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+))]
+fn close_hooks_new() -> CloseHooks {
+    CloseHooks { run: [None; WINID_HOLDER_MAX], hooked: 0, surf: 0 }
+}
+
+/// WMCLOSEHOOK — count the collected hooks and, only when there is one, read the row's surface under a brief
+/// TABLE lock. Called from the teardown, ahead of `close`'s own TABLE section, so the row is still live.
+#[cfg(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+))]
+fn close_hooks_seal(id: WinId, h: &mut CloseHooks, cleared: usize) {
+    h.hooked = h.run[..cleared.min(WINID_HOLDER_MAX)].iter().filter(|f| f.is_some()).count();
+    if h.hooked > 0 {
+        let t = table();
+        h.surf = row(&t, id).map(|r| r.surf).unwrap_or(0);
+    }
+}
+
+/// WMCLOSEHOOK — **register an id cache WITH its owner's close-free.** The cell is registered through
+/// [`winid_register_holder`] (its scan and its loud REFUSED line, not a copy), then the hook is set on that
+/// entry. `false` = the registry is full (said there).
+#[cfg(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+))]
+pub fn winid_register_close_hook(
+    cell: &'static core::sync::atomic::AtomicU32,
+    tag: &'static str,
+    hook: WinCloseHook,
+) -> bool {
+    if !winid_register_holder(cell, tag) {
+        return false;
+    }
+    let mut h = HOLDERS.lock();
+    for e in h.iter_mut() {
+        if let Some(c) = e.cell {
+            if core::ptr::eq(c, cell) {
+                e.hook = Some(hook);
+                break;
+            }
+        }
+    }
+    true
+}
+
+/// WMCLOSEHOOK — the erasing twin.
+#[cfg(not(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+)))]
+#[inline(always)]
+pub fn winid_register_close_hook(
+    _cell: &'static core::sync::atomic::AtomicU32,
+    _tag: &'static str,
+    _hook: fn(WinId, usize),
+) -> bool {
+    false
+}
+
+/// WMCLOSEHOOK — run the hooks `close`'s teardown collected. Called at `close`'s tail only: after the drain,
+/// barrier down, no TABLE held.
+#[cfg(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+))]
+fn winid_close_hooks_run(id: WinId, h: CloseHooks) {
+    if h.hooked == 0 {
+        return;
+    }
+    for f in h.run.iter().flatten() {
+        f(id, h.surf);
+    }
+}
+
+/// WMCLOSEHOOK — the erasing twin.
+#[cfg(not(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+)))]
+#[inline(always)]
+fn winid_close_hooks_run(_id: WinId, _h: CloseHooks) {}
+
+// =================================================================================================
+// RETIREDRAIN (rmbp-ledger B1055; BP-video-18 kept, the seat's MEASURE line) — **a WINID holder's grown
+// surface is retired only after every close in flight has drained.** TAIL-APPENDED.
+// =================================================================================================
+//
+// LEAKEDSURFGROW (B1043) ordered the free of a grown furniture block after the owner's OWN close (TABLE clear,
+// then the drain). A close BEHIND the holder's back (`close_all_furniture`, the close disc) on another core
+// clears the holder's cell in `close`'s teardown, ahead of TABLE, and drains only later; a holder re-minting
+// inside that window (login's `open_as` / `rescaled`, instgui's `open`) could create and retire while a
+// composite that registered before that close's row clear still blitted the old block (a stale read, no write).
+//
+// THE ONE RULE: `close` counts itself in flight from BEFORE its teardown clears any cell until its drain
+// barrier drops ([`close_flight_enter`] / [`close_flight_end`]); [`close_drain_wait`] is the public door a
+// holder gates its retire on: `true` once no close is in flight, `false` past [`CLOSE_DRAIN_WAIT_US`] — then
+// the block stays queued and the holder's next re-mint retires it (a deferred free, never an early one).
+// The count is GLOBAL per close, not per row: the holder cannot name its row (its cell was cleared).
+// NOT a second barrier and not a blit counter: the close's own `DrainBarrier` already waits out every blit
+// (`BLIT_ACTIVE`); the door only waits for that drain to end. Atomics only, no lock.
+// Wire, once per boot on the first non-zero wait:
+// `[wm] close drain id=<n> inflight=<n> waited_us=<n> who=<owner> drained=<1|0>` (CLOSEFLIGHTID B1068: `id=` is an
+// open recorded flight's window from `DRAIN_OWNER_WIN`, 0 = none recorded; `who=` is the waiter; CLOSEFLIGHTOLDEST
+// B1070: the OLDEST open recorded flight, the smallest enter sequence packed in the slot word).
+// RETIRE-DRAIN-REST BUILT by RETIREDRAINREST (rmbp-ledger B1060): the door now sits inside metrics::leaked_surf_retire for every caller (dialog, notify, bezel, login, instgui); the rest of this note is history (it belonged at
+// their sites or once inside `metrics::leaked_surf_retire`), CLOSE-FLIGHT-RESCUE BUILT by CLOSEFLIGHTRESCUE (B1064: a
+// close killed mid-flight is released at its death by `drain_release_dead`, the CLOSEFLIGHTRESCUE block below),
+// RETIRE-DRAIN-KAT BUILT for the waiting half by RETIREDRAINKAT (rmbp-ledger B1072: the WINID selftest's LEG 6, a helper
+// task's flight the real door waits on and then drains; the RETIREDRAINKAT block below); RETIRE-DRAIN-DEATH-KAT BUILT by
+// RETIREDRAINDEATHKAT (rmbp-ledger B1074: LEG 7, the helper dies holding its flight and its `exit()` gives it back);
+// RETIRE-DRAIN-KILL-KAT BUILT by RETIREDRAINKILLKAT (rmbp-ledger B1076: LEG 8, the helper is KILLED holding its flight); the
+// real-close composite race on the sibling core: RETIRE-DRAIN-BLIT-KAT BUILT by RETIREDRAINBLITKAT (rmbp-ledger B1079: LEG 9,
+// a helper holds the pass's F4 registration while the fixture's real `close` drains on it; the RETIREDRAINBLITKAT block below).
+
+/// RETIREDRAIN — closes between their teardown and their barrier drop.
+#[cfg(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+))]
+static CLOSE_FLIGHT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// CLOSEFLIGHTID (rmbp-ledger B1068) — the window id of the close flight holding each `DRAIN_OWNERS` slot,
+/// parallel to it (32 B). Non-zero ONLY while a close flight occupies that slot: written by the slot's owner
+/// right after its claim, cleared before the slot is freed (Drop before `drain_note_lower`; a death reads it
+/// before the CAS and clears it only if unchanged). Drain raises never write it, so their slots read 0. It
+/// retires `CLOSE_FLIGHT_ID` (the last close entered, which named the wrong close when two overlapped).
+/// CLOSEFLIGHTOLDEST (rmbp-ledger B1070): each word packs the window id (low 32) with the flight's enter
+/// sequence (high 32, from [`CLOSE_FLIGHT_SEQ`], never 0), so a word is non-zero exactly while recorded and the
+/// door can name the OLDEST open flight; the death CAS compares the whole word, so a new occupant closing a
+/// re-issued same id is never erased. 64 B, one array (no parallel age array).
+#[cfg(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+))]
+static DRAIN_OWNER_WIN: [core::sync::atomic::AtomicU64; DRAIN_OWNER_SLOTS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; DRAIN_OWNER_SLOTS];
+
+/// CLOSEFLIGHTOLDEST (rmbp-ledger B1070) — the close flights' enter sequence (the last one handed out). Only
+/// the order matters: the slot word's Release store publishes it. Wraps after 2^32 recorded closes (0 is
+/// skipped); a wrap can misorder one scan, never a free (the door waits on every flight).
+#[cfg(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+))]
+static CLOSE_FLIGHT_SEQ: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// RETIREDRAIN — the once-per-boot latch for the `[wm] close drain` line.
+#[cfg(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+))]
+static CLOSE_DRAIN_SAID: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// RETIREDRAIN — the door's bound. A close's drain is a handful of panel-clipped blits; past this the retire
+/// is deferred to the holder's next re-mint, which is safe (the block stays queued, never freed early).
+#[cfg(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+))]
+const CLOSE_DRAIN_WAIT_US: u64 = 250_000;
+
+/// RETIREDRAIN — one close in flight; dropping it ends the flight (an early `return false` in `close` too).
+#[cfg(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+))]
+struct CloseFlight(u64, usize); // CLOSEFLIGHTRESCUE (B1064): the DRAIN_OWNERS key this flight recorded (`!tid`, 0 = none); CLOSEFLIGHTID (B1068): its slot (`DRAIN_OWNER_SLOTS` = unrecorded)
+
+#[cfg(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+))]
+impl Drop for CloseFlight {
+    fn drop(&mut self) {
+        // CLOSEFLIGHTID (B1068): the slot's window id is cleared BEFORE the slot is freed, so a new occupant's
+        // word is never this flight's.
+        if self.1 < DRAIN_OWNER_SLOTS {
+            DRAIN_OWNER_WIN[self.1].store(0, core::sync::atomic::Ordering::Release); // CLOSEFLIGHTOLDEST (B1070): the whole packed word
+        }
+        drain_note_lower(self.0); // CLOSEFLIGHTRESCUE (B1064): the registry slot BEFORE the count (DrainBarrier::drop's order)
+        CLOSE_FLIGHT.fetch_sub(1, core::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// RETIREDRAIN — the erasing twin: no furniture, no holder, `close` keeps its bytes.
+#[cfg(not(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+)))]
+type CloseFlight = ();
+
+/// RETIREDRAIN — enter a close's flight. Called on `close`'s teardown line BEFORE `winid_close_teardown`, so a
+/// holder that sees its cell cleared also sees the count raised.
+#[cfg(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+))]
+fn close_flight_enter(id: WinId) -> CloseFlight {
+    CLOSE_FLIGHT.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+    // CLOSEFLIGHTRESCUE (B1064): record the flight against its task AFTER the raise, so a death release never
+    // lowers a count the raise had not yet paid for (`drain_bounded`'s order). Untasked (key 0) records nothing.
+    let key = close_flight_key(drain_owner_id());
+    if key == 0 {
+        return CloseFlight(0, DRAIN_OWNER_SLOTS);
+    }
+    drain_note_raise(key);
+    // CLOSEFLIGHTID (B1068): the slot the claim took. Exact: a task holds at most ONE `!tid` slot (nothing inside
+    // `close`'s flight closes again on the same task), and only this task or its own death writes `key`. Not
+    // found = the registry was full (counted unowned): the id stays unrecorded.
+    let slot = DRAIN_OWNERS
+        .iter()
+        .position(|s| s.load(core::sync::atomic::Ordering::Acquire) == key)
+        .unwrap_or(DRAIN_OWNER_SLOTS);
+    if slot < DRAIN_OWNER_SLOTS {
+        // CLOSEFLIGHTOLDEST (B1070): the id packed with this flight's enter sequence.
+        DRAIN_OWNER_WIN[slot].store(close_flight_word(id, close_flight_seq()), core::sync::atomic::Ordering::Release);
+    }
+    CloseFlight(key, slot)
+}
+
+/// RETIREDRAIN — the erasing twin.
+#[cfg(not(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+)))]
+#[inline(always)]
+fn close_flight_enter(_id: WinId) -> CloseFlight {}
+
+/// RETIREDRAIN — end a close's flight: called right after `close` drops its drain barrier.
+#[cfg(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+))]
+fn close_flight_end(f: CloseFlight) {
+    drop(f);
+}
+
+/// RETIREDRAIN — the erasing twin.
+#[cfg(not(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+)))]
+#[inline(always)]
+fn close_flight_end(_f: CloseFlight) {}
+
+/// RETIREDRAIN — **the public drain door.** `true` once no `close` is in flight (every close that could have
+/// cleared the caller's WINID cell has drained); `false` past [`CLOSE_DRAIN_WAIT_US`]. A holder retires a grown
+/// surface only on `true`. Call with no wm lock held.
+#[cfg(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+))]
+pub fn close_drain_wait(who: &'static str) -> bool {
+    close_drain_wait_for(who, CLOSE_DRAIN_WAIT_US, true).0
+}
+
+/// CLOSEFLIGHTOLDEST (rmbp-ledger B1070; was CLOSEFLIGHTID's `close_flight_open_id`, B1068) — the window id of
+/// the OLDEST open recorded close flight (the [`DRAIN_OWNER_WIN`] word with the smallest enter sequence among
+/// the words naming a window), or `WIN_NONE` when every open flight is unrecorded (untasked, or the registry
+/// full). The scan reads eight independent atomics: the oldest flight seen at the wait's entry, one the door
+/// does wait on (it waits on every flight).
+#[cfg(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+))]
+fn close_flight_oldest_id() -> WinId {
+    let mut best: Option<(u32, WinId)> = None;
+    for w in DRAIN_OWNER_WIN.iter() {
+        let word = w.load(core::sync::atomic::Ordering::Acquire);
+        let id = close_flight_word_win(word);
+        if id == WIN_NONE {
+            continue;
+        }
+        let seq = close_flight_word_seq(word);
+        match best {
+            Some((b, _)) if b <= seq => {}
+            _ => best = Some((seq, id)),
+        }
+    }
+    match best {
+        Some((_, id)) => id,
+        None => WIN_NONE,
+    }
+}
+
+/// CLOSEFLIGHTOLDEST (B1070) — the next enter sequence (never 0, so a recorded word is never 0).
+#[cfg(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+))]
+fn close_flight_seq() -> u32 {
+    let s = CLOSE_FLIGHT_SEQ
+        .fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+        .wrapping_add(1);
+    if s == 0 {
+        CLOSE_FLIGHT_SEQ
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+            .wrapping_add(1)
+    } else {
+        s
+    }
+}
+
+/// CLOSEFLIGHTOLDEST (B1070) — a slot word: the window id in the low 32, the enter sequence in the high 32.
+#[cfg(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+))]
+#[inline(always)]
+fn close_flight_word(id: WinId, seq: u32) -> u64 {
+    ((seq as u64) << 32) | (id as u64)
+}
+
+/// CLOSEFLIGHTOLDEST (B1070) — a slot word's window id (`WIN_NONE` for an empty word).
+#[cfg(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+))]
+#[inline(always)]
+fn close_flight_word_win(word: u64) -> WinId {
+    word as u32 as WinId
+}
+
+/// CLOSEFLIGHTOLDEST (B1070) — a slot word's enter sequence (0 for an empty word).
+#[cfg(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+))]
+#[inline(always)]
+fn close_flight_word_seq(word: u64) -> u32 {
+    (word >> 32) as u32
+}
+
+/// RETIREDRAIN — the erasing twin: no furniture, no foreign close can clear a cell.
+#[cfg(not(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+)))]
+#[inline(always)]
+pub fn close_drain_wait(_who: &'static str) -> bool {
+    true
+}
+
+/// RETIREDRAIN — the door's body: `(drained, in flight at entry, waited_us)`. Yields where legal
+/// ([`drain_can_yield`], the drain's own test), else spins; `say` prints the once-line on a non-zero wait.
+#[cfg(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+))]
+fn close_drain_wait_for(who: &'static str, budget_us: u64, say: bool) -> (bool, u32, u64, WinId) {
+    use core::sync::atomic::Ordering;
+    core::sync::atomic::fence(Ordering::SeqCst);
+    let inflight = CLOSE_FLIGHT.load(Ordering::SeqCst);
+    if inflight == 0 {
+        return (true, 0, 0, WIN_NONE);
+    }
+    let id = close_flight_oldest_id(); // CLOSEFLIGHTOLDEST (B1070): the oldest close this wait waits on (0 = none recorded)
+    let t0 = crate::hidstall::now_us();
+    let drained = loop {
+        if CLOSE_FLIGHT.load(Ordering::SeqCst) == 0 {
+            break true;
+        }
+        if crate::hidstall::now_us().saturating_sub(t0) >= budget_us {
+            break false;
+        }
+        if drain_can_yield() {
+            crate::arch::sched::yield_now();
+        } else {
+            core::hint::spin_loop();
+        }
+    };
+    let waited_us = crate::hidstall::now_us().saturating_sub(t0);
+    if say && !CLOSE_DRAIN_SAID.swap(true, Ordering::Relaxed) {
+        serial_println!(
+            "[wm] close drain id={} inflight={} waited_us={} who={} drained={}",
+            id,
+            inflight,
+            waited_us,
+            who,
+            drained as u8
+        );
+    }
+    (drained, inflight, waited_us, id)
+}
+
+// ---- RETIREDRAINKAT (rmbp-ledger B1072; BP-video-18 kept, the seat's MEASURE line) — a drain that WAITS ----
+//
+// RETIREDRAIN (B1055) and every close-flight arc since carried RETIRE-DRAIN-KAT: the WINID selftest's LEG 5 holds a
+// flight on the fixture task itself, so no door ever waited on a flight another task held and then drained. LEG 6
+// spawns a helper (`drain-kat`, on the next online core) that enters a close flight for the fixture's window through
+// [`close_flight_enter`] — recorded against the HELPER's `!tid`, as a sibling close is — and ends it with
+// [`close_flight_end`] ~`KAT_HOLD_MS` after the fixture enters the real door ([`close_drain_wait_for`] at
+// [`CLOSE_DRAIN_WAIT_US`], `say=false` so the boot's once-line latch is never spent by the fixture). Nothing here
+// counts, records or waits on its own: the helper and the fixture call the door's own fns. Atomics only, no lock.
+// Wire: the `[winid] selftest` line's ` drain-wait=<1|0|skip> (waited=<us>us id=<w>)`.
+//
+// RETIREDRAINDEATHKAT (rmbp-ledger B1074; BP-video-18 kept, the seat's MEASURE line) — LEG 7, the death road. The SAME
+// helper, keyed by [`KAT_MODE`] = [`KAT_DIE`], holds its flight through the door exactly as LEG 6's does, then
+// `core::mem::forget`s the guard and RETURNS: no Drop runs, and the task trampoline's `exit()` (both arches) calls
+// [`drain_release_dead`] -> [`close_flight_release_dead`], the release a close killed mid-flight takes. The fixture's
+// door drains on that death; it then waits for the slot to stop holding the helper's key and reads the word 0. Only a
+// RECORDED flight is forgotten (an unrecorded one has no slot for the death road to find and would strand
+// `CLOSE_FLIGHT` for the boot): unrecorded, the helper ends it politely and LEG 7 reads `skip`. Nothing new counts,
+// records or waits. Wire: ` drain-death=<1|0|skip> (id=<w>)`, beside one `[wm] close flight released-on-death by=<tid>
+// id=<w>`. Go-red: make `close_flight_release_dead` a no-op — the door times out and the slot keeps the key.
+//
+// RETIREDRAINKILLKAT (rmbp-ledger B1076; BP-video-18 kept, the seat's MEASURE line) — LEG 8, the KILL road. The SAME
+// helper, keyed by [`KAT_MODE`] = [`KAT_KILL`], holds a RECORDED flight and keeps yielding in [`close_drain_kat_until`]
+// (bounded [`KAT_KILL_MS`]) until it is killed; the fixture kills it through the arch's OWN kill: aarch64 `sched::kill`
+// by tid (`!key`: the key IS `!tid`, asid 0 = a kernel task), delivered at the helper's next `yield_now` ->
+// `kill_check_current` -> `exit()` (or, found READY, the off-CPU `retire_killed`), the ticket always settled before the
+// fixture returns (release on confirm, retract if the helper ended on its own, else detach); x86 has no by-tid kill for a
+// kernel task, so the helper is spawned through SHELLTASK2's `spawn_stack_killable` and the fixture arms its `KillSwitch`,
+// delivered by `run()`'s READY arm -> `reap_killed`. Both roads end in [`drain_release_dead`] ->
+// [`close_flight_release_dead`], untouched. The fixture arms the kill BEFORE it can enter the door, so the death may beat
+// the door's first load: `waited_us > 0` is not required here, `drained` is, with the slot freed, the word 0, the kill
+// confirmed (`kill_confirmed` / `is_reaped`) and the helper never reaching DONE (killed, not ended). Unrecorded, or the
+// aarch64 kill table full, the helper is let go politely ([`KAT_LET_GO`]) and LEG 8 reads `skip`. Wire:
+// ` drain-kill=<1|0|skip> (id=<w>)` beside a second `[wm] close flight released-on-death`. Go-red: as LEG 7's.
+//
+// LEGSKIPLATE (rmbp-ledger B1086; BP-video-18 kept, the seat's MEASURE line) — a leg that skips (no HELD inside 1 s)
+// used to leave its helper runnable: started late, it read the NEXT leg's [`KAT_MODE`], wrote that leg's
+// `KAT_STATE`/`KAT_KEY`/`KAT_SLOT` and could hold a flight for w2 past `close(w2)`. One generation word, [`KAT_GEN`],
+// written by the fixture alone: [`close_drain_kat_arg`] bumps it at every spawn and packs it into the spawn arg's high
+// 32 bits (`WinId` is u32, so the helpers' `arg as WinId` still reads the id), and each skip arm bumps it again; each
+// helper's FIRST line ([`close_drain_kat_mine`]) returns at once when its generation is not the current one — no
+// flight, no guard, no line printed (its `exit()` finds no slot: the death road's no-op). No new wire token.
+//
+// LEGSKIPCLAIM (rmbp-ledger B1088; BP-video-18 kept, the seat's MEASURE line) — that one LOAD left a window: a helper
+// that passed it within instructions of the fixture's 1 s deadline went on to enter a flight (or take a blit
+// registration) under the NEXT leg. The load is now a CLAIM: [`close_drain_kat_mine`] CASes `gen -> gen | KAT_OWNED`
+// (bit 31 of the same word), and each skip arm's bump is [`close_drain_kat_disown`], a CAS `gen -> gen + 1` that fails
+// iff the helper already owns the generation. Disowned: the leg skips and the helper's claim fails, as before. Owned:
+// the fixture waits for HELD (the existing `KAT_STATE` word, the existing 1 s bound) and FALLS THROUGH into the
+// unchanged leg body, whose own DOOR / DONE / kill / death waits see the helper to its end; a claimed helper that never
+// reaches HELD inside that second 1 s reads `0` (a FAIL verdict, never a hang; LEG-SKIP-CLAIM-STUCK owed: it is still
+// live). [`close_drain_kat_bump`] clears the claim bit at the next spawn's bump and masks a wrap away from it.
+// KAT_STATE / KAT_KEY / KAT_SLOT are written only by a helper whose claim succeeded. No new wire token.
+
+/// RETIREDRAINKAT — the helper's progress: 0 idle, then HELD (flight entered), DOOR (the fixture is entering the
+/// door), DONE (flight ended).
+#[cfg(all(
+    feature = "witness",
+    any(
+        all(target_arch = "x86_64", feature = "wc"),
+        all(target_arch = "aarch64", feature = "desktop_firmware")
+    )
+))]
+static KAT_STATE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+/// RETIREDRAINKAT — the helper's `CloseFlight` key (`!tid`) and slot, published before HELD.
+#[cfg(all(
+    feature = "witness",
+    any(
+        all(target_arch = "x86_64", feature = "wc"),
+        all(target_arch = "aarch64", feature = "desktop_firmware")
+    )
+))]
+static KAT_KEY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(all(
+    feature = "witness",
+    any(
+        all(target_arch = "x86_64", feature = "wc"),
+        all(target_arch = "aarch64", feature = "desktop_firmware")
+    )
+))]
+static KAT_SLOT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(DRAIN_OWNER_SLOTS);
+#[cfg(all(
+    feature = "witness",
+    any(
+        all(target_arch = "x86_64", feature = "wc"),
+        all(target_arch = "aarch64", feature = "desktop_firmware")
+    )
+))]
+const KAT_HELD: u8 = 1;
+#[cfg(all(
+    feature = "witness",
+    any(
+        all(target_arch = "x86_64", feature = "wc"),
+        all(target_arch = "aarch64", feature = "desktop_firmware")
+    )
+))]
+const KAT_DOOR: u8 = 2;
+#[cfg(all(
+    feature = "witness",
+    any(
+        all(target_arch = "x86_64", feature = "wc"),
+        all(target_arch = "aarch64", feature = "desktop_firmware")
+    )
+))]
+const KAT_DONE: u8 = 3;
+/// RETIREDRAINKAT — how long the helper keeps its flight open after the fixture enters the door (well inside
+/// [`CLOSE_DRAIN_WAIT_US`], so a healthy door waits > 0 and drains).
+#[cfg(all(
+    feature = "witness",
+    any(
+        all(target_arch = "x86_64", feature = "wc"),
+        all(target_arch = "aarch64", feature = "desktop_firmware")
+    )
+))]
+const KAT_HOLD_MS: u64 = 30;
+/// RETIREDRAINDEATHKAT (rmbp-ledger B1074) — the helper's mode word, written by the fixture before the spawn and
+/// read once by the helper at its start: 0 ends the flight politely (LEG 6), [`KAT_DIE`] dies holding it (LEG 7).
+#[cfg(all(
+    feature = "witness",
+    any(
+        all(target_arch = "x86_64", feature = "wc"),
+        all(target_arch = "aarch64", feature = "desktop_firmware")
+    )
+))]
+static KAT_MODE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+/// LEGSKIPLATE (rmbp-ledger B1086) — the KAT legs' helper generation: bumped by the fixture at every spawn and on every
+/// skip; a helper whose spawn-arg generation is not this one is disowned and returns at its first line.
+/// LEGSKIPCLAIM (B1088): bit 31 ([`KAT_OWNED`]) is set by the current helper's claim CAS, the only non-fixture write.
+#[cfg(all(
+    feature = "witness",
+    any(
+        all(target_arch = "x86_64", feature = "wc"),
+        all(target_arch = "aarch64", feature = "desktop_firmware")
+    )
+))]
+static KAT_GEN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+#[cfg(all(
+    feature = "witness",
+    any(
+        all(target_arch = "x86_64", feature = "wc"),
+        all(target_arch = "aarch64", feature = "desktop_firmware")
+    )
+))]
+const KAT_DIE: u8 = 1;
+/// RETIREDRAINKILLKAT (rmbp-ledger B1076) — LEG 8's mode: hold a recorded flight, yielding, until killed.
+#[cfg(all(
+    feature = "witness",
+    any(
+        all(target_arch = "x86_64", feature = "wc"),
+        all(target_arch = "aarch64", feature = "desktop_firmware")
+    )
+))]
+const KAT_KILL: u8 = 2;
+/// RETIREDRAINKILLKAT (B1076) — the fixture's polite release of a kill-mode helper it could not kill (a `KAT_STATE` value).
+#[cfg(all(
+    feature = "witness",
+    any(
+        all(target_arch = "x86_64", feature = "wc"),
+        all(target_arch = "aarch64", feature = "desktop_firmware")
+    )
+))]
+const KAT_LET_GO: u8 = 4;
+/// RETIREDRAINKILLKAT (B1076) — the kill-mode helper's own bound (past the fixture's door + 1 s + 1 s waits).
+#[cfg(all(
+    feature = "witness",
+    any(
+        all(target_arch = "x86_64", feature = "wc"),
+        all(target_arch = "aarch64", feature = "desktop_firmware")
+    )
+))]
+const KAT_KILL_MS: u64 = 3_000;
+
+/// RETIREDRAINKAT — `true` once `f()` holds, `false` past `bound_ms`; yields where [`drain_can_yield`], else spins.
+#[cfg(all(
+    feature = "witness",
+    any(
+        all(target_arch = "x86_64", feature = "wc"),
+        all(target_arch = "aarch64", feature = "desktop_firmware")
+    )
+))]
+fn close_drain_kat_until(bound_ms: u64, f: impl Fn() -> bool) -> bool {
+    let t0 = crate::arch::ms();
+    loop {
+        if f() {
+            return true;
+        }
+        if crate::arch::ms().saturating_sub(t0) >= bound_ms {
+            return false;
+        }
+        if drain_can_yield() {
+            crate::arch::sched::yield_now();
+        } else {
+            core::hint::spin_loop();
+        }
+    }
+}
+
+/// RETIREDRAINKAT — the helper task: one close flight for window `arg`, held until the fixture is in the door
+/// (bounded 1 s) plus [`KAT_HOLD_MS`], then ended; it returns with its flight already dropped (no death release).
+/// RETIREDRAINDEATHKAT (B1074): in [`KAT_DIE`] mode it forgets a RECORDED flight instead and returns holding it,
+/// so its `exit()` gives the flight back through [`drain_release_dead`] (an unrecorded one is still ended).
+/// RETIREDRAINKILLKAT (B1076): in [`KAT_KILL`] mode it holds a RECORDED flight yielding until the fixture kills it.
+#[cfg(all(
+    feature = "witness",
+    any(
+        all(target_arch = "x86_64", feature = "wc"),
+        all(target_arch = "aarch64", feature = "desktop_firmware")
+    )
+))]
+fn close_drain_kat_helper(arg: usize) {
+    if !close_drain_kat_mine(arg) { return; } // LEGSKIPLATE (B1086): a late helper of a skipped leg is disowned
+    use core::sync::atomic::Ordering;
+    let die = KAT_MODE.load(Ordering::Acquire) == KAT_DIE; // RETIREDRAINDEATHKAT (B1074): LEG 7's arm
+    let kill = KAT_MODE.load(Ordering::Acquire) == KAT_KILL; // RETIREDRAINKILLKAT (B1076): LEG 8's arm
+    let flight = close_flight_enter(arg as WinId);
+    KAT_KEY.store(flight.0, Ordering::Release);
+    KAT_SLOT.store(flight.1, Ordering::Release);
+    KAT_STATE.store(KAT_HELD, Ordering::Release);
+    let _ = close_drain_kat_until(1_000, || KAT_STATE.load(Ordering::Acquire) == KAT_DOOR);
+    let _ = close_drain_kat_until(KAT_HOLD_MS, || false);
+    if kill && flight.1 < DRAIN_OWNER_SLOTS {
+        // RETIREDRAINKILLKAT (B1076): hold the RECORDED flight and yield until killed (a delivered kill never returns
+        // here); bounded, or let go by the fixture, it falls through to the polite end below.
+        let _ = close_drain_kat_until(KAT_KILL_MS, || KAT_STATE.load(Ordering::Acquire) == KAT_LET_GO);
+    }
+    if die && flight.1 < DRAIN_OWNER_SLOTS {
+        // RETIREDRAINDEATHKAT (B1074): die holding the flight — no Drop; the trampoline's `exit()` releases it.
+        core::mem::forget(flight);
+    } else {
+        close_flight_end(flight);
+    }
+    KAT_STATE.store(KAT_DONE, Ordering::Release);
+}
+
+/// RETIREDRAINKAT — LEG 6's body: `(verdict, waited_us, door_id)`, the verdict `"1"` / `"0"` / `"skip"` (the
+/// helper never reported HELD inside 1 s). `"1"` iff a SECOND task's flight (its key is not this task's) kept the
+/// real door waiting (`waited_us > 0`, `inflight >= 1`) and the door then drained, the helper finished, and, when
+/// the flight was recorded, its slot word named `id` while held and read 0 after, with B1070's oldest word naming
+/// `id` (unless a sibling close was also in flight, LEG 5's clause).
+/// RETIREDRAINDEATHKAT (B1074): `die` runs LEG 7 — the helper dies holding its flight; `"1"` additionally needs the
+/// flight recorded (else `"skip"`) and its slot freed of the helper's key by the death inside 1 s, and the third
+/// value is the dead flight's own slot-word id (the `released-on-death` line's `id=`) instead of the door's.
+/// RETIREDRAINKILLKAT (B1076): `mode` is the helper's mode word (0 / [`KAT_DIE`] / [`KAT_KILL`]); [`KAT_KILL`] runs
+/// LEG 8 — the fixture kills the helper holding its flight; `"1"` needs the drain, the slot freed, the word 0, the kill
+/// confirmed and the helper never DONE (not `waited_us > 0`: the death may beat the door's first load).
+#[cfg(all(
+    feature = "witness",
+    any(
+        all(target_arch = "x86_64", feature = "wc"),
+        all(target_arch = "aarch64", feature = "desktop_firmware")
+    )
+))]
+fn close_drain_kat(id: WinId, mode: u8) -> (&'static str, u64, WinId) {
+    use core::sync::atomic::Ordering;
+    let die = mode == KAT_DIE; // RETIREDRAINKILLKAT (B1076): the mode word replaces B1074's bool
+    let kill = mode == KAT_KILL; // RETIREDRAINKILLKAT (B1076): LEG 8
+    KAT_MODE.store(mode, Ordering::Release); // RETIREDRAINDEATHKAT (B1074); RETIREDRAINKILLKAT (B1076): the mode verbatim
+    KAT_STATE.store(0, Ordering::Release);
+    KAT_KEY.store(0, Ordering::Release);
+    KAT_SLOT.store(DRAIN_OWNER_SLOTS, Ordering::Release);
+    let cpu = close_drain_kat_cpu(); // RETIREDRAINBLITKAT (B1079): the pick, shared with LEG 9
+    // RETIREDRAINKILLKAT (B1076): x86 kills a kernel task through its KillSwitch (SHELLTASK2's road), held here.
+    #[cfg(target_arch = "x86_64")]
+    let kill_sw = alloc::sync::Arc::new(crate::arch::sched::KillSwitch::new());
+    #[cfg(target_arch = "x86_64")]
+    {
+        if kill {
+            let _ = crate::arch::sched::spawn_stack_killable("drain-kat", close_drain_kat_helper, close_drain_kat_arg(id), cpu, crate::arch::sched::PRIO_NORMAL, 16 * 1024, kill_sw.clone());
+        }
+    }
+    if !(kill && cfg!(target_arch = "x86_64")) {
+        close_drain_kat_spawn(close_drain_kat_helper, id, cpu); // RETIREDRAINBLITKAT (B1079): the one plain spawn, shared with LEG 9
+    }
+    if !close_drain_kat_until(1_000, || KAT_STATE.load(Ordering::Acquire) >= KAT_HELD) {
+        if close_drain_kat_disown() {
+            return ("skip", 0, WIN_NONE); // LEGSKIPLATE (B1086); LEGSKIPCLAIM (B1088): no claim, the late helper disowned
+        }
+        if !close_drain_kat_until(1_000, || KAT_STATE.load(Ordering::Acquire) >= KAT_HELD) {
+            return ("0", 0, WIN_NONE); // LEGSKIPCLAIM (B1088): claimed, never HELD — a FAIL verdict, not a hang
+        }
+        // LEGSKIPCLAIM (B1088): the claimed helper owns this leg: fall through into the unchanged body.
+    }
+    let key = KAT_KEY.load(Ordering::Acquire);
+    let slot = KAT_SLOT.load(Ordering::Acquire);
+    let held_word = if slot < DRAIN_OWNER_SLOTS { DRAIN_OWNER_WIN[slot].load(Ordering::Acquire) } else { 0 };
+    KAT_STATE.store(KAT_DOOR, Ordering::Release);
+    // RETIREDRAINKILLKAT (B1076): LEG 8 kills only a RECORDED flight (the death road finds it by its slot).
+    if kill && slot >= DRAIN_OWNER_SLOTS {
+        let _ = close_drain_kat_until(1_000, || KAT_STATE.load(Ordering::Acquire) == KAT_DONE);
+        return ("skip", 0, WIN_NONE);
+    }
+    // RETIREDRAINKILLKAT (B1076): aarch64 — the kill by tid (`!key` is the helper's tid); a full table lets it go.
+    #[cfg(target_arch = "aarch64")]
+    let ticket = if kill { crate::arch::sched::kill(!key, 0) } else { None };
+    #[cfg(target_arch = "aarch64")]
+    {
+        if kill && ticket.is_none() {
+            KAT_STATE.store(KAT_LET_GO, Ordering::Release);
+            let _ = close_drain_kat_until(1_000, || KAT_STATE.load(Ordering::Acquire) == KAT_DONE);
+            return ("skip", 0, WIN_NONE);
+        }
+    }
+    // RETIREDRAINKILLKAT (B1076): x86 — arm the helper's KillSwitch.
+    #[cfg(target_arch = "x86_64")]
+    {
+        if kill {
+            kill_sw.request();
+        }
+    }
+    let (drained, inflight, waited_us, door_id) = close_drain_wait_for("drain-kat", CLOSE_DRAIN_WAIT_US, false);
+    let done = kill || close_drain_kat_until(1_000, || KAT_STATE.load(Ordering::Acquire) == KAT_DONE); // RETIREDRAINKILLKAT (B1076): a killed helper never reaches DONE
+    // RETIREDRAINDEATHKAT (B1074): the death frees the slot of the helper's key (LEG 6: freed by the Drop already).
+    let freed = !(die || kill)
+        || (slot < DRAIN_OWNER_SLOTS
+            && close_drain_kat_until(1_000, || DRAIN_OWNERS[slot].load(Ordering::Acquire) != key));
+    // RETIREDRAINKILLKAT (B1076): the kill confirmed by the arch's own fn; the aarch64 ticket is settled here, always.
+    #[cfg(target_arch = "aarch64")]
+    let reaped = match ticket {
+        Some(t) => {
+            let c = close_drain_kat_until(1_000, || crate::arch::sched::kill_confirmed(&t));
+            if c {
+                crate::arch::sched::kill_release(t);
+            } else if KAT_STATE.load(Ordering::Acquire) == KAT_DONE {
+                crate::arch::sched::kill_retract(t);
+            } else {
+                crate::arch::sched::kill_detach(t);
+            }
+            c
+        }
+        None => true,
+    };
+    #[cfg(target_arch = "x86_64")]
+    let reaped = !kill || close_drain_kat_until(1_000, || kill_sw.is_reaped());
+    let died = !kill || (reaped && KAT_STATE.load(Ordering::Acquire) != KAT_DONE); // killed, not ended politely
+    let after_word = if slot < DRAIN_OWNER_SLOTS { DRAIN_OWNER_WIN[slot].load(Ordering::Acquire) } else { 0 };
+    let second = key != 0 && key != close_flight_key(drain_owner_id());
+    let rec_ok = slot >= DRAIN_OWNER_SLOTS
+        || (close_flight_word_win(held_word) == id && after_word == 0 && (inflight != 1 || door_id == id));
+    if die && slot >= DRAIN_OWNER_SLOTS {
+        return ("skip", waited_us, WIN_NONE); // RETIREDRAINDEATHKAT (B1074): unrecorded, ended politely
+    }
+    let ok = second && drained && (kill || (waited_us > 0 && inflight >= 1)) && done && freed && rec_ok && reaped && died; // RETIREDRAINKILLKAT (B1076)
+    (if ok { "1" } else { "0" }, waited_us, if die || kill { close_flight_word_win(held_word) } else { door_id })
+}
+
+// ---- RETIREDRAINBLITKAT (rmbp-ledger B1079; BP-video-18 kept, the seat's MEASURE line) — a real close's composite race ----
+//
+// The door ([`close_drain_wait_for`]) waits on `CLOSE_FLIGHT` alone; `close` holds its flight until its `DrainBarrier`
+// drops, and the barrier waits for `BLIT_ACTIVE == 0`, the composite's in-flight marker (`BlitGuard::enter()`, taken in
+// `composite_inner` under `table()` and held through the stage reads). LEG 6-8 drove only the flight -> door link; LEG 9
+// drives the first: a composite on the sibling core holds a REAL close open. The helper holds the pass's own F4
+// registration OUTSIDE the gate — `{ let _t = table(); BlitGuard::enter() }`, TABLE dropped at once, no CASTS span, no
+// COMPGATE / PreemptHold — because a park inside the real pass is refused as measured: x86 `composite()` never runs
+// `comp_gate_pass` and its COMP_GATE carries WCSER-STEAL (a holder past `COMP_GATE_STEAL_MS` is declared dead); aarch64's
+// pass runs under COMPGATE's PreemptHold (a park there cannot yield and folds every other composite); and
+// `composite_inner` bails before its guard on a headless or busy panel (RETIRE-DRAIN-BLIT-PASS owed). Nothing new counts,
+// records or waits: the real `close`, the real barrier, the real guard, the real door. Ordering: the helper stores
+// [`KAT_RELEASE`] BEFORE its guard's `fetch_sub`, and the barrier reads `BLIT_ACTIVE == 0` with Acquire, so when the
+// fixture's `close` returns it must read RELEASE or DONE. Wire: ` drain-blit=<1|0|skip|skip(one-core)> (waited=<us>us)`.
+// Go-red: make `DrainBarrier::drain_bounded` skip its wait — `close` returns with the helper still holding: `0`.
+
+/// RETIREDRAINBLITKAT — LEG 9's helper state between DOOR and DONE: its composite registration is about to drop.
+/// (4 is [`KAT_LET_GO`].)
+#[cfg(all(
+    feature = "witness",
+    any(
+        all(target_arch = "x86_64", feature = "wc"),
+        all(target_arch = "aarch64", feature = "desktop_firmware")
+    )
+))]
+const KAT_RELEASE: u8 = 5;
+/// RETIREDRAINBLITKAT — LEG 9's helper saw a close of its window IN ITS BARRIER while it held the registration.
+#[cfg(all(
+    feature = "witness",
+    any(
+        all(target_arch = "x86_64", feature = "wc"),
+        all(target_arch = "aarch64", feature = "desktop_firmware")
+    )
+))]
+static KAT_BLIT_SEEN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// RETIREDRAINBLITKAT — the helper's core: the next online core (this core when it is the only one).
+#[cfg(all(
+    feature = "witness",
+    any(
+        all(target_arch = "x86_64", feature = "wc"),
+        all(target_arch = "aarch64", feature = "desktop_firmware")
+    )
+))]
+fn close_drain_kat_cpu() -> usize {
+    let n = crate::arch::sched::online_cpu_count().max(1);
+    let me = crate::arch::sched::meter_current_cpu();
+    if n > 1 { (me + 1) % n } else { me }
+}
+
+/// RETIREDRAINBLITKAT — the plain `drain-kat` spawn of `entry(id)` on `cpu` (LEG 6/7, aarch64 LEG 8, LEG 9).
+#[cfg(all(
+    feature = "witness",
+    any(
+        all(target_arch = "x86_64", feature = "wc"),
+        all(target_arch = "aarch64", feature = "desktop_firmware")
+    )
+))]
+fn close_drain_kat_spawn(entry: fn(usize), id: WinId, cpu: usize) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        crate::arch::sched::spawn("drain-kat", entry, close_drain_kat_arg(id), cpu, crate::arch::sched::PRIO_NORMAL); // LEGSKIPLATE (B1086)
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        let _ = crate::arch::sched::spawn_prio("drain-kat", entry, close_drain_kat_arg(id), cpu, crate::arch::sched::PRIO_NORMAL); // LEGSKIPLATE (B1086)
+    }
+}
+
+/// LEGSKIPLATE (rmbp-ledger B1086) — a helper's spawn arg: bumps [`KAT_GEN`] and packs the new generation into the high
+/// 32 bits above window `id` (the helpers' `arg as WinId` reads the id back).
+#[cfg(all(
+    feature = "witness",
+    any(
+        all(target_arch = "x86_64", feature = "wc"),
+        all(target_arch = "aarch64", feature = "desktop_firmware")
+    )
+))]
+fn close_drain_kat_arg(id: WinId) -> usize {
+    use core::sync::atomic::Ordering;
+    // LEGSKIPCLAIM (B1088): the masked bump clears a previous leg's claim bit.
+    let g = match KAT_GEN.fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| Some(close_drain_kat_bump(v))) {
+        Ok(p) | Err(p) => close_drain_kat_bump(p),
+    };
+    ((g as usize) << 32) | id as usize
+}
+
+/// LEGSKIPLATE (rmbp-ledger B1086) — `true` iff spawn arg `arg` carries the current [`KAT_GEN`] (the helper still
+/// belongs to the leg that spawned it).
+#[cfg(all(
+    feature = "witness",
+    any(
+        all(target_arch = "x86_64", feature = "wc"),
+        all(target_arch = "aarch64", feature = "desktop_firmware")
+    )
+))]
+fn close_drain_kat_mine(arg: usize) -> bool {
+    use core::sync::atomic::Ordering;
+    let g = (arg >> 32) as u32;
+    // LEGSKIPCLAIM (B1088): ONE claim CAS; a failed CAS (stale or disowned generation) is not mine.
+    KAT_GEN.compare_exchange(g, g | KAT_OWNED, Ordering::AcqRel, Ordering::Acquire).is_ok()
+}
+
+/// LEGSKIPCLAIM (rmbp-ledger B1088) — [`KAT_GEN`]'s claim bit, set by the helper that owns the current generation.
+#[cfg(all(
+    feature = "witness",
+    any(
+        all(target_arch = "x86_64", feature = "wc"),
+        all(target_arch = "aarch64", feature = "desktop_firmware")
+    )
+))]
+const KAT_OWNED: u32 = 1 << 31;
+
+/// LEGSKIPCLAIM (B1088) — the next generation after `v`: the claim bit cleared, a wrap masked away from it.
+#[cfg(all(
+    feature = "witness",
+    any(
+        all(target_arch = "x86_64", feature = "wc"),
+        all(target_arch = "aarch64", feature = "desktop_firmware")
+    )
+))]
+fn close_drain_kat_bump(v: u32) -> u32 {
+    (v & !KAT_OWNED).wrapping_add(1) & !KAT_OWNED
+}
+
+/// LEGSKIPCLAIM (B1088) — a skip arm's disown: CAS the current generation to the next one; `false` iff a helper
+/// already claimed it (the helper is live and owns the leg).
+#[cfg(all(
+    feature = "witness",
+    any(
+        all(target_arch = "x86_64", feature = "wc"),
+        all(target_arch = "aarch64", feature = "desktop_firmware")
+    )
+))]
+fn close_drain_kat_disown() -> bool {
+    use core::sync::atomic::Ordering;
+    KAT_GEN
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| if v & KAT_OWNED != 0 { None } else { Some(close_drain_kat_bump(v)) })
+        .is_ok()
+}
+
+/// RETIREDRAINBLITKAT — LEG 9's helper: a composite's F4 registration for window `arg`, held until the fixture is in
+/// its close (bounded 1 s), then until that close is IN ITS BARRIER (flight up, barrier up, the row gone; bounded 1 s),
+/// then [`KAT_HOLD_MS`] more; RELEASE is published before the guard drops, DONE after.
+#[cfg(all(
+    feature = "witness",
+    any(
+        all(target_arch = "x86_64", feature = "wc"),
+        all(target_arch = "aarch64", feature = "desktop_firmware")
+    )
+))]
+fn close_drain_blit_kat_helper(arg: usize) {
+    if !close_drain_kat_mine(arg) { return; } // LEGSKIPLATE (B1086): a late helper of a skipped leg is disowned
+    use core::sync::atomic::Ordering;
+    let id = arg as WinId;
+    let guard = {
+        let _t = table(); // F4's order: the registration under the table lock, as `composite_inner` takes it
+        BlitGuard::enter()
+    };
+    KAT_STATE.store(KAT_HELD, Ordering::Release);
+    let _ = close_drain_kat_until(1_000, || KAT_STATE.load(Ordering::Acquire) == KAT_DOOR);
+    let seen = close_drain_kat_until(1_000, || {
+        CLOSE_FLIGHT.load(Ordering::SeqCst) != 0
+            && DRAIN_PENDING.load(Ordering::Acquire) != 0
+            && info_box(id).is_none()
+    });
+    let _ = close_drain_kat_until(KAT_HOLD_MS, || false);
+    KAT_BLIT_SEEN.store(seen, Ordering::Release);
+    KAT_STATE.store(KAT_RELEASE, Ordering::Release);
+    drop(guard);
+    KAT_STATE.store(KAT_DONE, Ordering::Release);
+}
+
+/// RETIREDRAINBLITKAT — LEG 9's body, and window `id`'s close on every arm: `(verdict, waited_us)`, `waited_us` the real
+/// `close`'s own duration. `"1"` iff the close ran, the helper saw it in its barrier, the helper's release was already
+/// published when `close` returned (its barrier waited for the composite), the helper finished, the door read AFTER
+/// the close drained, and `waited_us > 0`. `"skip"`: `id` not live (nothing closed) or no helper inside 1 s;
+/// `"skip(one-core)"`: no sibling core (the drain's same-core arm would answer, not the race).
+#[cfg(all(
+    feature = "witness",
+    any(
+        all(target_arch = "x86_64", feature = "wc"),
+        all(target_arch = "aarch64", feature = "desktop_firmware")
+    )
+))]
+fn close_drain_blit_kat(id: WinId) -> (&'static str, u64) {
+    use core::sync::atomic::Ordering;
+    if info_box(id).is_none() {
+        return ("skip", 0);
+    }
+    if crate::arch::sched::online_cpu_count() < 2 {
+        close(id);
+        return ("skip(one-core)", 0);
+    }
+    KAT_STATE.store(0, Ordering::Release);
+    KAT_BLIT_SEEN.store(false, Ordering::Release);
+    close_drain_kat_spawn(close_drain_blit_kat_helper, id, close_drain_kat_cpu());
+    if !close_drain_kat_until(1_000, || KAT_STATE.load(Ordering::Acquire) >= KAT_HELD) {
+        let owned = !close_drain_kat_disown(); // LEGSKIPLATE (B1086); LEGSKIPCLAIM (B1088): fails iff a helper claimed
+        if !owned || !close_drain_kat_until(1_000, || KAT_STATE.load(Ordering::Acquire) >= KAT_HELD) {
+            KAT_STATE.store(KAT_DOOR, Ordering::Release); // a late helper skips its DOOR wait
+            close(id);
+            return (if owned { "0" } else { "skip" }, 0); // LEGSKIPCLAIM (B1088): claimed, never HELD — FAIL
+        }
+        // LEGSKIPCLAIM (B1088): the claimed helper owns this leg: fall through into the unchanged body.
+    }
+    let t0 = crate::hidstall::now_us();
+    KAT_STATE.store(KAT_DOOR, Ordering::Release);
+    let closed = close(id);
+    let waited_us = crate::hidstall::now_us().saturating_sub(t0);
+    let st = KAT_STATE.load(Ordering::Acquire);
+    let released = st == KAT_RELEASE || st == KAT_DONE;
+    let done = close_drain_kat_until(1_000, || KAT_STATE.load(Ordering::Acquire) == KAT_DONE);
+    let seen = KAT_BLIT_SEEN.load(Ordering::Acquire);
+    let (drained, _, _, _) = close_drain_wait_for("drain-blit", CLOSE_DRAIN_WAIT_US, false);
+    let ok = closed && seen && released && done && drained && waited_us > 0;
+    (if ok { "1" } else { "0" }, waited_us)
+}
+
+// ---- CLOSEFLIGHTRESCUE (rmbp-ledger B1064) — a close killed mid-flight gives its flight back at its death ----
+//
+// RETIREDRAIN (B1055) owed CLOSE-FLIGHT-RESCUE: `close` counts itself in `CLOSE_FLIGHT` from its teardown to its
+// barrier drop through the RAII [`CloseFlight`], and an aarch64 task killed inside that window (the drain's
+// `yield_now` -> `kill_check_current` -> `exit()`) switches off its stack under `panic-strategy: abort`, so the
+// guard's Drop never runs and the count stays up for the boot: every later [`close_drain_wait`] times out and
+// every grown-surface retire defers forever (a leak, never an early free).
+//
+// THE ONE RESCUE rides DRAINRESCUE, which already cures the same stranding for `DRAIN_PENDING`: the flight is
+// recorded in the SAME registry (`DRAIN_OWNERS`, through `drain_note_raise` / `drain_note_lower`) and released
+// from the SAME death hook (`drain_release_dead`, called at every death site on both arches: aarch64 `exit()`
+// and the off-CPU reap, x86 `exit()` and `terminate`). No second registry, no second hook, no lock. The lock
+// registry (`sync::release_task`) is NOT the door: CLOSE_FLIGHT is a counter, not a `sync::Mutex`.
+//
+// THE KEY is `!tid`, never `tid` (that is a drain raise) and never a top-bit tag (leg 7's `RESCUE_FAKE_TID`
+// already has bit 63 set and would collide). Real task ids are small, so `!tid` never equals a drain entry.
+// A full registry leaves the flight unrecorded and counted in `DRAIN_UNOWNED` (the registry's one scope
+// number); a close holds two of its eight slots while it drains.
+// Wire, one per released flight: `[wm] close flight released-on-death by=<tid> id=<n> inflight=<n>` (`id=` is
+// the dead flight's own slot word in `DRAIN_OWNER_WIN`: CLOSE-FLIGHT-ID BUILT by CLOSEFLIGHTID, rmbp-ledger B1068;
+// CLOSEFLIGHTOLDEST, B1070: the word packs id + enter sequence and the clear compares the whole word).
+
+/// CLOSEFLIGHTRESCUE — the registry key a close flight of task `tid` records: `!tid`, or 0 (record nothing)
+/// outside a scheduled task.
+#[cfg(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+))]
+fn close_flight_key(tid: u64) -> u64 {
+    if tid == 0 { 0 } else { !tid }
+}
+
+/// CLOSEFLIGHTRESCUE — **the cure.** Give back every close flight `task_id` recorded and can no longer end.
+/// Called from [`drain_release_dead`] (line-neutral, after its `task_id == 0` return). Idempotent by the CAS.
+#[cfg(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+))]
+fn close_flight_release_dead(task_id: u64) {
+    use core::sync::atomic::Ordering;
+    let key = close_flight_key(task_id);
+    if key == 0 {
+        return;
+    }
+    for (i, slot) in DRAIN_OWNERS.iter().enumerate() {
+        // CLOSEFLIGHTID (B1068): the dead flight's own window id, read BEFORE the CAS frees the slot (after it a
+        // new occupant may write its own); 0 if the task died between its claim and its store.
+        let word = DRAIN_OWNER_WIN[i].load(Ordering::Acquire); // CLOSEFLIGHTOLDEST (B1070): the packed word
+        let id = close_flight_word_win(word);
+        if slot
+            .compare_exchange(key, 0, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
+            // CLOSEFLIGHTID (B1068): clear the word only if it is still this flight's (never a new occupant's);
+            // CLOSEFLIGHTOLDEST (B1070): the WHOLE word (id + sequence), so a re-issued same id is never erased.
+            let _ = DRAIN_OWNER_WIN[i].compare_exchange(word, 0, Ordering::AcqRel, Ordering::Relaxed);
+            // The slot is ours and no other caller can hold it, so this lower is owed exactly once.
+            CLOSE_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+            serial_println!(
+                "[wm] close flight released-on-death by={} id={} inflight={}",
+                task_id,
+                id,
+                CLOSE_FLIGHT.load(Ordering::SeqCst)
+            );
+        }
+    }
+}
+
+/// CLOSEFLIGHTRESCUE — the erasing twin: no close flight is ever counted off the desktop builds.
+#[cfg(not(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+)))]
+#[inline(always)]
+fn close_flight_release_dead(_task_id: u64) {}
+
+// ══ PREEMPTOFFARMWMTABLE (zenbook-ledger Z92; BP-cores-23, the seat's MEASURE line) — the TABLE bracket ══
+// `table()` is the sole TABLE take (WEDGE-7). Its bracket was the IRQ mask on both arches; on aarch64 without
+// `desktop_firmware` it is now the preempt-off count (COMPGATE's `PreemptHold`, taken masked around the core read, PSTATE.I
+// as the caller had it): WEDGE-7's invariant — no TABLE holder is ever switched out — holds because both aarch64
+// involuntary switch paths decline on the count and no TABLE critical section yields (the 108 takes measured at 9e5a5521f;
+// every DrainBarrier is outside TABLE, B1055's order), and a masked contender still spins masked on a RUNNING holder only.
+// No ISR reaches TABLE. PREEMPTOFFARMWMTABLEROUTE (zenbook-ledger Z97): the desktops (`desktop_firmware`) convert too — the
+// timer ISR's witness print routed into the console window (`fbcon::route_present_banded` -> `present_rows_outcome_owned`
+// -> `table()`) and would have spun on a holder it interrupted on its own core; fbcon now HOLDS its rows in IRQ context
+// (`fbcon::irq_present_hold`, the core's IRQ mark from `exceptions::in_irq`), so the `not(desktop_firmware)` term is gone.
+
+/// PREEMPTOFFARMWMTABLE (Z92): `TableGuard`'s bracket — the preempt-off hold (dropped after the lock); every aarch64 build (Z97).
+#[cfg(target_arch = "aarch64")]
+type TableSpan = crate::arch::sched::PreemptHold;
+/// PREEMPTOFFARMWMTABLE (Z92): `TableGuard`'s bracket — the IRQ mask (x86), as before.
+#[cfg(not(target_arch = "aarch64"))]
+type TableSpan = crate::arch::IrqMask;
+
+/// PREEMPTOFFARMWMTABLE (Z92): take the bracket BEFORE the lock (the spin itself must not be switched out). Masked around
+/// the core read and the increment, as `preemptoff::scoped` takes it; the outermost take records this line as the holder
+/// site (Z89) and the guard keeps its epoch (Z91).
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn table_span() -> TableSpan {
+    crate::arch::without_interrupts(|| crate::arch::sched::preempt_hold())
+}
+/// PREEMPTOFFARMWMTABLE (Z92): the mask, exactly the expression `table()` took before.
+#[cfg(not(target_arch = "aarch64"))]
+#[inline(always)]
+fn table_span() -> TableSpan {
+    crate::arch::IrqMask::new()
+}
+
+/// PREEMPTOFFARMWMTABLE (Z92): the aarch64 audit's `converted=` term — 1 on every aarch64 build since Z97 (the desktops too).
+#[cfg(target_arch = "aarch64")]
+pub const CONVERTED_WMTABLE: u32 = 1;
+
+/// PREEMPTOFFARMWMTABLE (Z92) leg (`wmtable_leg=`, aarch64 `tests preemptaudit`): through the real `table()`, from this
+/// unmasked task: I stays on and the count is held inside; from a masked caller the take leaves it masked; the count is
+/// free after. `skip(masked)` from a masked caller (Z97: no `skip(route)` — the desktops run the real take too).
+#[cfg(target_arch = "aarch64")]
+pub fn wmtable_leg() -> &'static str {
+    if crate::arch::irqs_masked() {
+        return "skip(masked)";
+    }
+    let (irq_on, held) = {
+        let _t = table();
+        (!crate::arch::irqs_masked(), crate::arch::sched::preemptoff::witness().0)
+    };
+    let masked_on = crate::arch::without_interrupts(|| {
+        let _t = table();
+        !crate::arch::irqs_masked()
+    });
+    let released = !crate::arch::sched::preemptoff::witness().0;
+    if !irq_on {
+        "masked"
+    } else if !held {
+        "free"
+    } else if masked_on {
+        "unmasked"
+    } else if !released {
+        "leaked"
+    } else {
+        "ok"
+    }
 }

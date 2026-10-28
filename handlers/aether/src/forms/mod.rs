@@ -518,3 +518,13 @@ pub fn plan_navigation(doc_url: &str, form: &NodeRef, submitter: Option<&NodeRef
         _ => None,
     }
 }
+
+/// AETHERSUBMITCAPTION (SR410): the caption a button-like `<input>` paints (HTML §4.10.5.1.18 / .20 / .21 and
+/// the rendering section's button labels): its `value` attribute when present (an empty value is an empty
+/// caption), else the UA's default label, "Submit" for a submit button, "Reset" for a reset button, nothing
+/// for a plain button. Not the accessible name (a11y's accname skips a whitespace-only value) and not the
+/// submitted value (the entry list's own rule). AETHERBUTTONLABELONE (SR423): the rule is layout_core's
+/// `button_label`, the same one its `control_intrinsic` sizes the box with.
+pub fn button_label(node: &NodeRef) -> String {
+    layout_core::button_label(&input_type(node), attr(node, "value").as_deref()).into_owned()
+}

@@ -50,6 +50,7 @@ pub mod raster;
 mod reader;
 pub mod script;
 pub mod shape;
+pub mod type1;
 pub mod ui;
 pub mod ucd;
 pub mod var;

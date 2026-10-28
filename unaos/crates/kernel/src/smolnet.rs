@@ -85,7 +85,7 @@ impl RawNic for E1000Nic {
         e1000::hw_addr().map(|(mac, _, _)| mac)
     }
     /// NETCLOCK M3: the USB dongle's TX ring is bounded and drained asynchronously; full = back-pressure.
-    fn tx_ready() -> bool { #[cfg(feature = "wifi10")] if crate::wifi::data::bound() { return crate::wifi::data::tx_ready(); } // STATIONTXGATE (B855): the kept station's asynchronous TX ring answers its own room in EVERY wifi10 image, usbnet or not (STATIONTX B843's fold, moved out of the usbnet cfg; LINE-NEUTRAL)
+    fn tx_ready() -> bool { #[cfg(feature = "wifi")] if crate::drivers::mt7925::bound() { return crate::drivers::mt7925::tx_room(); } #[cfg(feature = "wifi10")] if crate::wifi::data::bound() { return crate::wifi::data::tx_ready(); } // MT7925S9 (zenbook-ledger Z46): the MT7925 link answers its TX ring 0 room first (else usbnet's room, false with no dongle, would answer for it; LINE-NEUTRAL). STATIONTXGATE (B855): the kept station's asynchronous TX ring answers its own room in EVERY wifi10 image, usbnet or not (STATIONTX B843's fold, moved out of the usbnet cfg; LINE-NEUTRAL)
         #[cfg(feature = "usbnet")]
         if !e1000::nic_present() {
             return crate::drivers::xhci::usbnet::tx_room(); // NETCLOCK M3: the dongle's room (the Wi-Fi station's fold moved to this fn's first line, STATIONTXGATE B855; LINE-NEUTRAL)
@@ -654,7 +654,7 @@ fn rx_ready(drive: bool) -> bool {
     if crate::drivers::xhci::usbnet::rx_ready(drive) {
         return true;
     }
-    #[cfg(feature = "wifi10")] if crate::wifi::data::rx_ready() { return true; } let _ = drive; // WIFIDHCP (B831): a data frame kept by the Wi-Fi station (LINE-NEUTRAL)
+    #[cfg(feature = "wifi10")] if crate::wifi::data::rx_ready() { return true; } #[cfg(feature = "wifi")] if crate::drivers::mt7925::rx_pending() { return true; } let _ = drive; // MT7925S9 (zenbook-ledger Z46): a frame waiting on the MT7925 link's RX ring 2 (LINE-NEUTRAL). WIFIDHCP (B831): a data frame kept by the Wi-Fi station (LINE-NEUTRAL)
     false
 }
 
@@ -714,7 +714,7 @@ fn pump_until<T>(budget_ms: i64, mut check: impl FnMut(&mut SmolStack) -> Option
 /// NETCLOCK M2: the idle service, once per main-loop pass (`e1000::service_net`). One poll when smoltcp
 /// asked for one or a frame is waiting — never per pass — and a DHCP lease that lands after `dhcp_acquire`
 /// gave up is applied here. Never spins on `STACK` (another core's syscall may hold it: next pass).
-pub fn service_poll() {
+pub fn service_poll() { #[cfg(feature = "wifi")] if crate::drivers::mt7925::down_take() { let _ = dhcp_reset(); } // S9WATCH (zenbook-ledger Z56): the MT7925 link the stack rode ended (deauth, disassoc, beacon loss, a later scan/join): the ONE DHCP socket reset through the existing hook (STATIONREJOIN's), so the held lease is dropped (`dhcp_lost`) — once per loss this waits for STACK (dhcp_reset's lock) (LINE-NEUTRAL)
     if !poll_due(false) {
         return;
     }
@@ -2522,4 +2522,19 @@ pub fn renew_probe(cap_s: u64, budget_ms: i64) -> Result<(bool, u32, u32, u32), 
         }
     }
     Ok((reacquired, first, RENEWS.load(Ordering::Relaxed).wrapping_sub(r0), RENEW_CHANGED.load(Ordering::Relaxed).wrapping_sub(c0)))
+}
+
+/// STATIONREJOIN (rmbp-ledger B891): the link under the stack re-joined (`wifi/bringup/join.rs::restack`), so the one DHCP
+/// socket is reset through smoltcp's PUBLIC `reset()` (`renew_probe`'s call, without its cap): a held lease raises
+/// `Deconfigured` on the next poll, `dhcp_lost` drops it, and the next `Configured` is a first lease through `dhcp_apply`.
+/// `false` = no stack or no DHCP socket. The caller holds no lock of its own (order: `STACK` first).
+pub fn dhcp_reset() -> bool {
+    {
+        let mut g = STACK.lock();
+        let Some(stack) = g.as_mut() else { return false };
+        let Some(h) = stack.dhcp else { return false };
+        stack.sockets.get_mut::<dhcpv4::Socket>(h).reset();
+    }
+    kick();
+    true
 }

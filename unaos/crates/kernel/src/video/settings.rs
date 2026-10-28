@@ -1558,7 +1558,7 @@ pub fn open() -> Result<(), String> {
     if id == wm::WIN_NONE { return Err(String::from("window create failed")); }
     *STATE.lock() = Some(st);
     WIN.store(id, Ordering::Relaxed);
-    wm::winid_register_holder(&WIN, "settings");
+    wm::winid_register_close_hook(&WIN, "settings", close_hook); // WMCLOSEHOOK (rmbp-ledger B1038): a close behind our back frees STATE (file tail)
     wm::focus_changed(OWNER);
     if let Some(st) = STATE.lock().as_mut() { panes_sync(id, st, tab0); } let _ = wm::present(id); // SCROLLVIEW (B764) · SCROLLPANES (B777): a window opens with its panes' models before the first wheel
     serial_println!("[settings] open win={}", id);
@@ -2265,7 +2265,7 @@ fn bus_changes_inner() -> (usize, usize, usize) {
     let mut keys: Vec<&'static str> = Vec::new();
     let mut idle = 0usize;
     let frames = crate::prefs_client::changes_drain(|ns, k| {
-        if ns != crate::prefs::NS { return; } if k.starts_with("appearance.") { super::appearance::mark_dirty(); } if k.starts_with("accessibility.") { A11Y_DIRTY.store(true, Ordering::Release); } if k.starts_with("keyboard.") { KB_DIRTY.store(true, Ordering::Release); } // KEYMAPS (B704): another client chose a layout. A11YPANE (B655): the service pass re-reads and re-latches. APPEARANCE (B408): another client chose
+        if ns != crate::prefs::NS { return; } if k.starts_with("appearance.") { super::appearance::mark_dirty(); } if k.starts_with("accessibility.") { A11Y_DIRTY.store(true, Ordering::Release); } if k.starts_with("keyboard.") { KB_DIRTY.store(true, Ordering::Release); } #[cfg(feature = "dicc")] { if k == crate::prefs::key::DISPLAY_ICC { A11Y_DIRTY.store(true, Ordering::Release); } } // DISPLAYICCFILE (rmbp-ledger B972): the installed display profile key re-latches through the a11y filter's own door (a11y_load -> af::changed -> colour::latch). LINE-NEUTRAL append, code first. KEYMAPS (B704): another client chose a layout. A11YPANE (B655): the service pass re-reads and re-latches. APPEARANCE (B408): another client chose
         if let Some(s) = SHOWN.iter().find(|s| **s == k) {
             if *s == crate::prefs::key::IDLE_MIN { idle += 1; }
             if !keys.contains(s) { keys.push(s); }
@@ -4877,19 +4877,15 @@ fn hw_report_text(c: &crate::hw::Census) -> String {
     s
 }
 
-/// HWTAB2 (B759): write the report through the VFS (an old copy unlinked, then create + write, as `fs/trash.rs` writes
-/// the home). `Ok((path, bytes))`, or the refusal as `-E<errno>`.
+/// HWTAB2 (B759): write the report through the VFS (VFSPUTSWEEP B983: `MountTable::put_file_atomic`, `.new` written, read
+/// back and swapped). `Ok((path, bytes))`, or the refusal as `-E<errno>`.
 fn hw_report_write(c: &crate::hw::Census) -> Result<(String, usize), String> {
-    use crate::fs::vfs::{NodeKind, KERNEL_PRINCIPAL as P};
+    use crate::fs::vfs::KERNEL_PRINCIPAL as P;
     let path = hw_report_path();
     let body = hw_report_text(c);
     let why = |e: crate::fs::vfs::VfsError| alloc::format!("-E{}", crate::fs::attrsys::errno_of(&e).unsigned_abs());
     let mt = crate::shell::vfs_mount_table();
-    if mt.stat(&path).is_ok() {
-        mt.unlink(&path, P).map_err(why)?;
-    }
-    mt.create(&path, NodeKind::File, P).map_err(why)?;
-    mt.write(&path, 0, body.as_bytes(), P).map_err(why)?;
+    mt.put_file_atomic(&path, body.as_bytes(), P).map_err(why)?;
     Ok((path, body.len()))
 }
 
@@ -5963,4 +5959,16 @@ pub fn tabs_probe(write_tab: &dyn Fn(usize)) -> (&'static str, &'static str, Str
     let ok = shown(a, last) && b.map_or(true, |t| shown(t, last));
     let detail = alloc::format!("tab={} switch={} prefchanged={}", TAB_NAMES[last], a, b.map_or(String::from("na"), |t| alloc::format!("{}", t)));
     (if ok { "ok" } else { "bad" }, rule, detail)
+}
+
+// ── WMCLOSEHOOK (rmbp-ledger B1038, BP-video-18 kept) — FILE-TAIL. A close behind this window's back (the furniture disc,
+// `wm::close_all_furniture` at a Log Out) cleared `WIN` through wm's WINID registry, so [`close`] returned at its
+// `WIN_NONE` guard and STATE (with its surface) stayed. `wm::close` now runs this hook after the drain, with no wm lock
+// held: STATE is taken iff its surface is the one the closed row seated (a reopen builds a fresh one), dropped outside the lock.
+fn close_hook(_id: wm::WinId, surf: usize) {
+    let st = {
+        let mut g = STATE.lock();
+        if g.as_ref().map(|s| s.surf.as_ptr() as usize) == Some(surf) { g.take() } else { None }
+    };
+    drop(st);
 }

@@ -52,7 +52,6 @@ name = "aether"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "av1_core",
  "bandy",
  "base64",
  "clap",
@@ -63,12 +62,15 @@ dependencies = [
  "futures-util",
  "gl_core",
  "gneiss_pal",
+ "holocron",
  "html_core",
  "http_core",
+ "icc_core",
  "image",
  "js_core",
  "kvstore_core",
  "layout_core",
+ "pdf_core",
  "pixel_core",
  "psl_core",
  "resvg",
@@ -77,7 +79,9 @@ dependencies = [
  "taffy",
  "text_host",
  "thiserror 2.0.21",
+ "tls_core",
  "tokio",
+ "type_core",
 ]
 
 [[package]]
@@ -315,7 +319,9 @@ dependencies = [
 name = "audio_core"
 version = "0.1.0"
 dependencies = [
+ "crypto_core",
  "demux_core",
+ "libm",
 ]
 
 [[package]]
@@ -361,6 +367,7 @@ name = "av1-check"
 version = "0.1.0"
 dependencies = [
  "av1_core",
+ "demux_core",
 ]
 
 [[package]]
@@ -380,6 +387,10 @@ dependencies = [
 [[package]]
 name = "av1_core"
 version = "0.1.0"
+dependencies = [
+ "demux_core",
+ "yuv_core",
+]
 
 [[package]]
 name = "avif-serialize"
@@ -1509,6 +1520,8 @@ name = "facet"
 version = "0.1.0"
 dependencies = [
  "bandy",
+ "gneiss_pal",
+ "icc_core",
  "image",
  "log",
  "pixel_core",
@@ -1921,6 +1934,9 @@ dependencies = [
 [[package]]
 name = "gl_core"
 version = "0.1.0"
+dependencies = [
+ "libm",
+]
 
 [[package]]
 name = "gl_generator"
@@ -2028,6 +2044,7 @@ dependencies = [
  "futures-core",
  "futures-util",
  "h264_core",
+ "hevc_core",
  "http_core",
  "infer_core",
  "log",
@@ -2037,6 +2054,7 @@ dependencies = [
  "tokio",
  "vp8_core",
  "vp9_core",
+ "yuv_core",
 ]
 
 [[package]]
@@ -2189,6 +2207,7 @@ version = "0.1.0"
 dependencies = [
  "demux_core",
  "h264_core",
+ "yuv_core",
 ]
 
 [[package]]
@@ -2252,6 +2271,7 @@ dependencies = [
 name = "hevc_core"
 version = "0.1.0"
 dependencies = [
+ "crypto_core",
  "h264_core",
 ]
 
@@ -2301,6 +2321,7 @@ version = "0.1.0"
 dependencies = [
  "crypto_core",
  "holocron_core",
+ "tls_core",
 ]
 
 [[package]]
@@ -2355,6 +2376,13 @@ dependencies = [
 [[package]]
 name = "ibus"
 version = "0.1.0"
+
+[[package]]
+name = "icc_core"
+version = "0.1.0"
+dependencies = [
+ "libm",
+]
 
 [[package]]
 name = "ignore"
@@ -2454,6 +2482,7 @@ name = "infer_core"
 version = "0.1.0"
 dependencies = [
  "crypto_core",
+ "libm",
 ]
 
 [[package]]
@@ -3508,6 +3537,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "pdf_core"
+version = "0.1.0"
+dependencies = [
+ "crypto_core",
+ "font_core",
+ "icc_core",
+ "pixel_core",
+ "svg_core",
+ "tls_core",
+]
+
+[[package]]
+name = "pdfprobe"
+version = "0.1.0"
+dependencies = [
+ "pdf_core",
+]
+
+[[package]]
 name = "phonolite"
 version = "0.1.0"
 dependencies = [
@@ -3543,10 +3591,12 @@ dependencies = [
 name = "pixel_core"
 version = "0.1.0"
 dependencies = [
+ "icc_core",
  "image",
  "raw_core",
  "svg_core",
  "vp8_core",
+ "yuv_core",
 ]
 
 [[package]]
@@ -3559,7 +3609,10 @@ checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
 name = "play-check"
 version = "0.1.0"
 dependencies = [
+ "crypto_core",
  "gneiss_pal",
+ "h264_core",
+ "hevc_core",
  "stria",
 ]
 
@@ -3690,6 +3743,9 @@ dependencies = [
 [[package]]
 name = "probe_core"
 version = "0.1.0"
+dependencies = [
+ "yuv_core",
+]
 
 [[package]]
 name = "proc-macro-crate"
@@ -4590,7 +4646,9 @@ name = "stria"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "av1_core",
  "bandy",
+ "demux_core",
  "gneiss_pal",
  "h264enc_core",
  "log",
@@ -4637,6 +4695,7 @@ name = "svg_core"
 version = "0.1.0"
 dependencies = [
  "font_core",
+ "libm",
  "pixel_core",
 ]
 
@@ -4836,6 +4895,9 @@ name = "timeline_core"
 version = "0.1.0"
 dependencies = [
  "demux_core",
+ "libm",
+ "pixel_core",
+ "yuv_core",
 ]
 
 [[package]]
@@ -5031,6 +5093,29 @@ name = "una-card"
 version = "0.1.0"
 dependencies = [
  "amber_core",
+]
+
+[[package]]
+name = "una-installer"
+version = "0.1.0"
+dependencies = [
+ "amber_bytes",
+ "amber_core",
+ "aule",
+ "bandy",
+ "elessar",
+ "futures-core",
+ "git_core",
+ "gneiss_pal",
+ "holocron",
+ "libc",
+ "log",
+ "midden_core",
+ "principia",
+ "quartzite",
+ "tokio",
+ "unafs",
+ "vein",
 ]
 
 [[package]]
@@ -5275,6 +5360,9 @@ dependencies = [
 [[package]]
 name = "vp8_core"
 version = "0.1.0"
+dependencies = [
+ "yuv_core",
+]
 
 [[package]]
 name = "vp9_core"
@@ -5865,6 +5953,10 @@ name = "y4m"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7a5a4b21e1a62b67a2970e6831bc091d7b87e119e7f9791aef9702e3bef04448"
+
+[[package]]
+name = "yuv_core"
+version = "0.1.0"
 
 [[package]]
 name = "zerocopy"

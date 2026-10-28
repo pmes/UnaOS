@@ -505,7 +505,7 @@ static TXN: Mutex<()> = Mutex::new(());
 
 /// One serialized SMC transaction. Every path that talks to the controller goes through here.
 fn read_txn(key: &[u8; 4], out: &mut [u8]) -> Result<usize, SmcError> {
-    let Some(_guard) = txn_acquire() else { return Err(SmcError::Stuck(STEP_TXN)) }; // SESSIONWEDGE (B525): a bounded, yielding take — the usb-pump never spins on a holder another core's scheduler parked (file tail)
+    if !crate::hw::gate(crate::hw::Probe::Smc) { return Err(SmcError::Absent); } let Some(_guard) = txn_acquire() else { return Err(SmcError::Stuck(STEP_TXN)) }; // ZENBOOKSURVEY (zenbook-ledger Z1): no port I/O on a positively identified non-Apple machine, every key answers Absent. SESSIONWEDGE (B525): a bounded, yielding take — the usb-pump never spins on a holder another core's scheduler parked (file tail)
     read_key_inner(key, out)
 }
 

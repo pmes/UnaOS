@@ -1945,7 +1945,7 @@ pub fn open() {
     let Some((_scale, ow, oh)) = wm::spawn_geometry_native(g.w, g.h) else {
         serial_println!("[quarry] DECLINE reason=geometry-unavailable");
         *MODEL.lock() = None;
-        SURF.lock().clear();
+        *SURF.lock() = Vec::new(); // SURFACELEAK (B1033): no window was made, so no capacity is kept
         return;
     };
     // Centred in the WORK AREA — below the menu bar's reservation and above the bottom instrument
@@ -1973,10 +1973,10 @@ pub fn open() {
     if id == wm::WIN_NONE {
         serial_println!("[quarry] DECLINE reason=create-failed");
         *MODEL.lock() = None;
-        SURF.lock().clear();
+        *SURF.lock() = Vec::new(); // SURFACELEAK (B1033): no window was made, so no capacity is kept
         return;
     }
-    WIN.store(id, Ordering::Relaxed); wm::winid_register_holder(&WIN, "quarry"); LAST_PTR.store(u64::MAX, Ordering::Relaxed); // QUARRYHOVER (B647): the hover pass reads the pointer afresh over the new window. WINID (SO1(b)) — ⚠ SAME-LINE fold, line-NEUTRAL. Same argument as pulsewin's: `close()` clears this cell and `press_route` is its only caller, so a close taken by the router's furniture arm would free the row and leave this cell naming a re-issuable slot. render7 is the boot where this window WAS re-issued the console's id (`[quarry] open win=1` after `close-furniture win=1`).
+    WIN.store(id, Ordering::Relaxed); wm::winid_register_close_hook(&WIN, "quarry", close_hook); LAST_PTR.store(u64::MAX, Ordering::Relaxed); // QUARRYHOVER (B647): the hover pass reads the pointer afresh over the new window. WINID (SO1(b)) — ⚠ SAME-LINE fold, line-NEUTRAL. Same argument as pulsewin's: `close()` clears this cell and `press_route` is its only caller, so a close taken by the router's furniture arm would free the row and leave this cell naming a re-issuable slot. render7 is the boot where this window WAS re-issued the console's id (`[quarry] open win=1` after `close-furniture win=1`).
     wm::focus_changed(OWNER);
     let (roots_n, tn, ln) = {
         let gd = MODEL.lock();
@@ -2056,23 +2056,23 @@ pub fn close() {
     // `wm::close` first: the row must stop naming the buffer before the buffer goes away. It spins on
     // the drain barrier, so it is called with no lock of ours held.
     wm::scroll_clear(id); wm::close(id); // SCROLLVIEW (B764): the list's model goes with the window
-    *MODEL.lock() = None;
-    SURF.lock().clear();
+    closed_free(); // WMCLOSEHOOK (rmbp-ledger B1038): MODEL and SURF go in ONE fn (file tail) that this close and wm's close hook both run
+    // SURFACELEAK (B1033): the capacity goes back with the window, after `wm::close` returned (the row cleared under TABLE, then the drain) — facet's close shape; now inside `closed_free`
     // QUITLEAK — latch the SHAPE of this close where a fixture can read it, and count the close. Both
     // cells are RE-READ here, after the teardown, rather than set to a constant because the source
     // above says so: `model_freed`/`surf_released` are the two pieces of heap state `wm::close`
     // provably cannot touch (A29's holder registry clears an id cell), so they are the bits that
     // convict a bypassed `Quit`, and `CLOSES` is the counter that says this path ran at all.
-    let seal = (MODEL.lock().is_none() as u32) | ((SURF.lock().is_empty() as u32) << 1);
+    let seal = (MODEL.lock().is_none() as u32) | ((SURF.lock().is_empty() as u32) << 1); let surf_freed = (SURF.lock().capacity() == 0) as u32; // SURFACELEAK (B1033): `surf_freed` = the capacity itself returned; the seal bits are unchanged (appquit asserts 3)
     LAST_SEAL.store(seal, Ordering::Release);
     CLOSES.fetch_add(1, Ordering::Release);
     serial_println!(
-        "[quarry] closed win={} paints={} model_freed={} surf_released={} closes={}",
+        "[quarry] closed win={} paints={} model_freed={} surf_released={} closes={} surf_freed={}",
         id,
         PAINTS.load(Ordering::Relaxed),
         seal & 1,
         (seal >> 1) & 1,
-        CLOSES.load(Ordering::Relaxed)
+        CLOSES.load(Ordering::Relaxed), surf_freed
     );
 }
 
@@ -5553,4 +5553,25 @@ fn cols_probe() -> Result<usize, &'static str> {
         )?;
     }
     Ok(steps)
+}
+
+// ── WMCLOSEHOOK (rmbp-ledger B1038, BP-video-18 kept) — FILE-TAIL. Quarry is told when its row is closed behind its
+// back (the furniture disc, `wm::close_all_furniture` at a Log Out): `wm::close`'s WINID teardown clears `WIN` and then,
+// after the drain with no wm lock held, runs [`close_hook`], which frees what [`close`] frees — ONE fn, [`closed_free`]
+// (B1033's two statements, moved, not copied). The QUITLEAK seal and `CLOSES` are NOT touched by the hook: they are what
+// convict a bypassed `Quit`.
+
+/// The model and the surface's capacity: what a close frees, on either door.
+fn closed_free() {
+    *MODEL.lock() = None;
+    *SURF.lock() = Vec::new();
+}
+
+/// wm's close hook (`wm::winid_register_close_hook`): free only the buffer the closed row seated, and only while no
+/// reopen has published a new `WIN` (Quarry reuses its buffer; HOOK-OPEN-INFLIGHT is owed).
+fn close_hook(_id: wm::WinId, surf: usize) {
+    let seated = WIN.load(Ordering::Acquire) == wm::WIN_NONE && SURF.lock().as_ptr() as usize == surf;
+    if seated {
+        closed_free();
+    }
 }

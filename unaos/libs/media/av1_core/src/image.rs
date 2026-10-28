@@ -1,8 +1,8 @@
 //! Frame orchestration (§7.4 decode_frame_wrapup for intra frames: deblock → CDEF → loop
-//! restoration → output), and the `pixel_core`-shaped entry point `decode_avif` that converts the
-//! decoded Y'CbCr planes to 8-bit RGBA using the AVIF `colr`/nclx (or sequence header) matrix.
+//! restoration → output), the `av01` item decode `decode_item_planes` (the container read by demux_core's HEIF
+//! reader), and `planes_to_rgba`, which converts the decoded Y'CbCr planes to 8-bit RGBA using the AVIF `colr`/nclx
+//! (or sequence header) matrix.
 
-use crate::avif::avif_payload;
 use crate::cdf::CdfContext;
 use crate::decode::{Dec, FrameState, ToolStats};
 use crate::obu::*;
@@ -96,11 +96,12 @@ pub struct Decoder {
     pub seq: Option<SequenceHeader>,
     pub refs: RefStore,
     pub filters: Filters,
+    pub meta: (Option<(u16, u16)>, Option<([[u16; 2]; 3], [u16; 2], u32, u32)>), // AV1INBANDSWITCH (SR373): the last in-band HDR_CLL / HDR_MDCV
 }
 
 impl Decoder {
     pub fn new() -> Decoder {
-        Decoder { seq: None, refs: RefStore::default(), filters: Filters::default() }
+        Decoder { seq: None, refs: RefStore::default(), filters: Filters::default(), meta: (None, None) }
     }
 
     /// Decode every OBU in `data`; returns the shown frames in output order. With
@@ -115,7 +116,7 @@ impl Decoder {
             match o.obu_type {
                 OBU_SEQUENCE_HEADER_T => {
                     let s = SequenceHeader::parse(o.payload)?;
-                    self.seq = Some(s);
+                    self.sequence(s); // AV1INBANDSIZE (SR379): a really-changed header starts a new coded video sequence (§7.5): the refs drop
                 }
                 OBU_FRAME_T | OBU_FRAME_HEADER_T => {
                     let s = self.seq.clone().ok_or(Error::Invalid("frame before sequence header"))?;
@@ -161,7 +162,7 @@ impl Decoder {
                         }
                     }
                 }
-                _ => {}
+                _ => self.note(&o), // AV1INBANDSWITCH (SR373): METADATA OBUs recorded for `current_codes`
             }
         }
         Ok(out)
@@ -322,13 +323,14 @@ fn tile_group_ends_frame(g: &[u8], hdr: &FrameHeader) -> Result<bool> {
 pub struct StreamDecoder {
     pub dec: Decoder,
     pub filters: Filters,
+    pub inband: InBand, // AV1INBANDSWITCH (SR373): the in-band colour switch state
 }
 
 impl StreamDecoder {
     /// `av1c` is the container's AV1CodecConfigurationRecord body (MP4 `av1C`, Matroska
     /// CodecPrivate) or empty.
     pub fn new(av1c: &[u8]) -> Result<StreamDecoder> {
-        let mut d = StreamDecoder { dec: Decoder::new(), filters: Filters::default() };
+        let mut d = StreamDecoder { dec: Decoder::new(), filters: Filters::default(), inband: InBand::default() };
         if !av1c.is_empty() {
             let cfg = crate::avif::Av1Config::parse(av1c)?;
             for o in split_obus(&cfg.config_obus)? {
@@ -417,12 +419,27 @@ fn output_planes(seq: &SequenceHeader, hdr: &FrameHeader, lr: &[crate::decode::P
     }
 }
 
-/// Decode an AVIF file's primary item to planes (container colour info applied to the fields).
-pub fn decode_avif_planes(file: &[u8], filters: Filters) -> Result<Planes> {
-    let item = avif_payload(file)?;
-    let cfg = item.av1c.as_ref().map(|c| c.config_obus.as_slice()).unwrap_or(&[]);
-    let mut p = decode_obus(&item.data, cfg, filters)?;
-    if item.width != 0 && (item.width != p.width || item.height != p.height) {
+/// HEIFONE (LEDGER SR303): decode one `av01` image item's bytes (a low-overhead OBU stream) to planes, whatever read the
+/// container (demux_core's HEIF reader: HEIFONE-RETIRE SR318 retired this crate's own walk). `av1c` is the item's raw
+/// AV1CodecConfigurationRecord (parsed here for its configOBUs, [`crate::avif::Av1Config`]); `ispe` the item's spatial
+/// extents (a width of 0 is no `ispe`) — when the first shown frame is not that size the item is a layered image and the
+/// last shown frame of the `ispe` size is presented; `nclx` the container's `colr` (primaries, transfer, matrix, full
+/// range), which is authoritative for presentation (AVIF §2.2.1). A container caller only forwards its item's fields.
+pub fn decode_item_planes(
+    data: &[u8],
+    av1c: Option<&[u8]>,
+    ispe: Option<(u32, u32)>,
+    nclx: Option<(u16, u16, u16, bool)>,
+    filters: Filters,
+) -> Result<Planes> {
+    let config_obus = match av1c {
+        Some(rec) => crate::avif::Av1Config::parse(rec)?.config_obus,
+        None => Vec::new(),
+    };
+    let cfg = config_obus.as_slice();
+    let ispe = ispe.filter(|&(w, _)| w != 0);
+    let mut p = decode_obus(data, cfg, filters)?;
+    if let Some((iw, ih)) = ispe.filter(|&(iw, ih)| iw != p.width || ih != p.height) {
         // A layered image (a1lx / a1op / lsel): the item holds several frames, the upper spatial
         // layers predicted from the lower ones. Decode them all (operating point 0) and present the
         // highest layer — the last shown frame at the image's own size (ispe).
@@ -435,19 +452,19 @@ pub fn decode_avif_planes(file: &[u8], filters: Filters) -> Result<Planes> {
                 }
             }
         }
-        let frames = d.decode(&item.data, false)?;
+        let frames = d.decode(data, false)?;
         p = frames
             .into_iter()
-            .filter(|f| f.width == item.width && f.height == item.height)
+            .filter(|f| f.width == iw && f.height == ih)
             .next_back()
             .ok_or(Error::Unsupported("no layer of the image's size (ispe)"))?;
     }
-    if let Some(n) = item.nclx {
+    if let Some((primaries, transfer, matrix, full_range)) = nclx {
         // The container's nclx box is authoritative for presentation (AVIF §2.2.1).
-        p.color_primaries = n.colour_primaries as u8;
-        p.transfer_characteristics = n.transfer_characteristics as u8;
-        p.matrix_coefficients = n.matrix_coefficients as u8;
-        p.full_range = n.full_range;
+        p.color_primaries = primaries as u8;
+        p.transfer_characteristics = transfer as u8;
+        p.matrix_coefficients = matrix as u8;
+        p.full_range = full_range;
     }
     Ok(p)
 }
@@ -462,23 +479,11 @@ pub enum Upsampling {
     Bilinear,
 }
 
-/// Kr, Kb for a matrix_coefficients value (H.273); identity returns None.
-fn kr_kb(mc: u8) -> Option<(f64, f64)> {
-    match mc {
-        0 => None,
-        1 => Some((0.2126, 0.0722)),
-        4 => Some((0.30, 0.11)),
-        5 | 6 | 2 => Some((0.299, 0.114)), // 2 = unspecified: BT.601 like libavif
-        7 => Some((0.212, 0.087)),
-        9 | 10 => Some((0.2627, 0.0593)),
-        _ => Some((0.299, 0.114)),
-    }
-}
-
 /// How the Y'CbCr → R'G'B' matrix is evaluated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Conversion {
-    /// The H.273 equations in floating point (what `decode_avif` uses).
+    /// The H.273 equations through Stria's ONE integer kernel, `yuv_core::to_rgba` (AV1COLOURONE SR340; what the AVIF
+    /// still path, gneiss_pal `decode_heif`, the host Player and the kernel Player use).
     Exact,
     /// ORACLE ONLY: the same equations with the chroma coefficients quantised the way libyuv
     /// (Chromium's converter) stores them — 6 fractional bits in an int8, so a coefficient above
@@ -488,125 +493,72 @@ pub enum Conversion {
     Libyuv,
 }
 
-/// Convert planes to 8-bit RGBA (H.273 equations, floating point).
+/// Convert planes to 8-bit RGBA (H.273 equations, Stria's one integer kernel).
 pub fn planes_to_rgba(p: &Planes, up: Upsampling) -> Image {
     planes_to_rgba_with(p, up, Conversion::Exact)
 }
 
-/// Convert planes to 8-bit RGBA with an explicit [`Conversion`].
+/// Convert planes to 8-bit RGBA with an explicit [`Conversion`]. AV1COLOURONE (LEDGER SR340): the f64 converter retired
+/// onto `yuv_core::to_rgba`, the kernel gneiss_pal's `Frame::to_rgba_colour` runs. The matrix pick is the stills
+/// convention, unchanged: 0 identity (GBR), 8 YCgCo (MATRIX-MORE; before SR340 it fell to BT.601), 10 (BT.2020
+/// constant-luminance) as BT.2020's Kr / Kb, 2 (unspecified) and every matrix without a stated Kr / Kb BT.601 (as libavif).
 pub fn planes_to_rgba_with(p: &Planes, up: Upsampling, conv: Conversion) -> Image {
+    use yuv_core::{Chroma, Matrix};
     let (w, h) = (p.width as usize, p.height as usize);
-    let maxv = ((1u32 << p.bit_depth) - 1) as f64;
-    let half = (1u32 << (p.bit_depth - 1)) as f64;
-    let scale = (1u32 << (p.bit_depth - 8)) as f64;
-    let cw = p.chroma_width() as usize;
-    let ch = p.chroma_height() as usize;
-    let mut rgba = vec![0u8; w * h * 4];
-    let chroma = |plane: &[u16], x: usize, y: usize| -> f64 {
-        if p.ss_x == 0 && p.ss_y == 0 {
-            return plane[y * cw + x] as f64;
-        }
-        match up {
-            Upsampling::Nearest => plane[(y >> p.ss_y) * cw + (x >> p.ss_x)] as f64,
-            Upsampling::Bilinear => {
-                // position of luma sample in chroma coordinates (centre siting)
-                let fx = if p.ss_x != 0 { (x as f64 - 0.5) / 2.0 } else { x as f64 };
-                let fy = if p.ss_y != 0 { (y as f64 - 0.5) / 2.0 } else { y as f64 };
-                let x0 = libm_floor(fx);
-                let y0 = libm_floor(fy);
-                let ax = fx - x0;
-                let ay = fy - y0;
-                let g = |xx: f64, yy: f64| -> f64 {
-                    let xi = (xx as isize).clamp(0, cw as isize - 1) as usize;
-                    let yi = (yy as isize).clamp(0, ch as isize - 1) as usize;
-                    plane[yi * cw + xi] as f64
-                };
-                let a = g(x0, y0) * (1.0 - ax) + g(x0 + 1.0, y0) * ax;
-                let b = g(x0, y0 + 1.0) * (1.0 - ax) + g(x0 + 1.0, y0 + 1.0) * ax;
-                a * (1.0 - ay) + b * ay
+    let m = match p.matrix_coefficients {
+        0 => Matrix::Identity,
+        8 => Matrix::YCgCo,
+        mc => {
+            let kk = yuv_core::kr_kb(if mc == 10 { 9 } else { mc }).unwrap_or(yuv_core::KR_KB_601);
+            match conv {
+                Conversion::Exact => Matrix::Kr(kk),
+                Conversion::Libyuv => Matrix::Table(libyuv_coeffs(kk, p.full_range, p.bit_depth)),
             }
         }
     };
-    let kk = kr_kb(p.matrix_coefficients);
-    for y in 0..h {
-        for x in 0..w {
-            let yv = p.y[y * w + x] as f64;
-            let (r, g, b);
-            if p.mono {
-                let l = if p.full_range { yv / maxv } else { (yv - 16.0 * scale) / (219.0 * scale) };
-                r = l;
-                g = l;
-                b = l;
-            } else {
-                let u = chroma(&p.u, x, y);
-                let v = chroma(&p.v, x, y);
-                match kk {
-                    None => {
-                        // identity (GBR)
-                        let n = |c: f64| if p.full_range { c / maxv } else { (c - 16.0 * scale) / (219.0 * scale) };
-                        g = n(yv);
-                        b = n(u);
-                        r = n(v);
-                    }
-                    Some((kr, kb)) => {
-                        let (yy, cb, cr) = if p.full_range {
-                            (yv / maxv, (u - half) / maxv, (v - half) / maxv)
-                        } else {
-                            ((yv - 16.0 * scale) / (219.0 * scale), (u - half) / (224.0 * scale), (v - half) / (224.0 * scale))
-                        };
-                        let kg = 1.0 - kr - kb;
-                        // R = Y + a*Cr, G = Y - b*Cb - c*Cr, B = Y + d*Cb
-                        let mut a = 2.0 - 2.0 * kr;
-                        let mut d = 2.0 - 2.0 * kb;
-                        let mut bb = kb * d / kg;
-                        let mut c = kr * a / kg;
-                        if conv == Conversion::Libyuv {
-                            // coefficients in 8-bit sample units, 6 fractional bits, int8 storage
-                            let unit = if p.full_range { 1.0 } else { 255.0 / 224.0 };
-                            let qz = |x: f64| -> f64 {
-                                let v = libm_floor(x * unit * 64.0 + 0.5).min(128.0);
-                                v / 64.0 / unit
-                            };
-                            a = qz(a);
-                            d = qz(d);
-                            bb = qz(bb);
-                            c = qz(c);
-                        }
-                        r = yy + a * cr;
-                        b = yy + d * cb;
-                        g = yy - bb * cb - c * cr;
-                    }
-                }
-            }
-            let q = |c: f64| -> u8 {
-                let v = c * 255.0 + 0.5;
-                if v <= 0.0 {
-                    0
-                } else if v >= 255.0 {
-                    255
-                } else {
-                    v as u8
-                }
-            };
-            let o = (y * w + x) * 4;
-            rgba[o] = q(r);
-            rgba[o + 1] = q(g);
-            rgba[o + 2] = q(b);
-            rgba[o + 3] = 255;
-        }
-    }
+    let pic = picture(p);
+    let chroma = match up {
+        Upsampling::Nearest => Chroma::Nearest,
+        Upsampling::Bilinear => Chroma::Bilinear,
+    };
+    let mut rgba = vec![0u8; w * h * 4];
+    yuv_core::to_rgba(&pic, m, chroma, false, &mut rgba);
     Image { w: p.width, h: p.height, rgba }
 }
 
-fn libm_floor(x: f64) -> f64 {
-    let t = x as i64 as f64;
-    if t > x { t - 1.0 } else { t }
+/// AV1COLOURONE (LEDGER SR340): decoded planes as the one kernel's `yuv_core::Picture` (luma `width` per row, chroma
+/// `chroma_width`, the stream's subsampling, mono, depth and range) — the picture `planes_to_rgba_with` converts and the
+/// kernel Player hands `yuv_core::to_rgba` with its own pick.
+pub fn picture(p: &Planes) -> yuv_core::Picture<'_, u16> {
+    yuv_core::Picture {
+        w: p.width as usize,
+        h: p.height as usize,
+        y: &p.y,
+        u: &p.u,
+        v: &p.v,
+        y_stride: p.width as usize,
+        uv_stride: p.chroma_width() as usize,
+        ss: (p.ss_x, p.ss_y),
+        mono: p.mono,
+        bit_depth: p.bit_depth,
+        full: p.full_range,
+    }
 }
 
-/// The `pixel_core` entry point: an AVIF file to 8-bit RGBA.
-pub fn decode_avif(file: &[u8]) -> Result<Image> {
-    let p = decode_avif_planes(file, Filters::default())?;
-    Ok(planes_to_rgba(&p, Upsampling::Bilinear))
+/// ORACLE ONLY ([`Conversion::Libyuv`]): `yuv_core::coeffs` with the four chroma coefficients quantised as libyuv stores
+/// them — q = round(x · unit · 64) capped at 128, unit 255 / 224 limited and 1 full, in 8-bit sample units — then
+/// rescaled to the kernel's shift: limited q << (s - 6 - (n - 8)), full round(q · 255 · 2^s / (64 (2^n - 1))). Luma stays exact.
+fn libyuv_coeffs((kr, kb): (i64, i64), full: bool, n: u32) -> yuv_core::Coeffs {
+    let (s, [yc, _, _, _, _], yoff, coff) = yuv_core::coeffs((kr, kb), full, n);
+    let rnd = |a: i64, b: i64| (2 * a + b) / (2 * b);
+    let kg = 10000 - kr - kb;
+    // Each coefficient as (numerator, denominator) of x, then q.
+    let (num_den, unit) = ([(2 * (10000 - kr), 10000), (2 * kb * (10000 - kb), 10000 * kg), (2 * kr * (10000 - kr), 10000 * kg), (2 * (10000 - kb), 10000)], if full { (1, 1) } else { (255, 224) });
+    let c = num_den.map(|(a, b)| {
+        let q = rnd(a * unit.0 * 64, b * unit.1).min(128);
+        (if full { rnd(q * (255 << s), 64 * ((1i64 << n) - 1)) } else { q << (s - 6 - (n - 8)) }) as i32
+    });
+    (s, [yc, c[0], c[1], c[2], c[3]], yoff, coff)
 }
 
 /// DEMUXSEEK (LEDGER SR200): the reorder depth of an AV1 track from its AV1CodecConfigurationRecord (`av1C`, Matroska
@@ -614,9 +566,159 @@ pub fn decode_avif(file: &[u8]) -> Result<Image> {
 /// exactly one shown frame (AV1 §7.5; AV1-ISOBMFF §2.4), so decode order is presentation order: `Some(0)` when the record's
 /// configOBUs carry a sequence header that parses, `None` otherwise.
 pub fn av1c_reorder_depth(av1c: &[u8]) -> Option<u32> {
-    let cfg = crate::avif::Av1Config::parse(av1c).ok()?;
-    let obus = split_obus(&cfg.config_obus).ok()?;
+    av1c_colour(av1c).map(|_| 0)
+}
+
+/// NLEPROBEHDR (LEDGER SR226): the colour an AV1CodecConfigurationRecord states — the color_config of the sequence header in
+/// its configOBUs (§5.5.2) and every METADATA OBU there that parses ([`parse_metadata`]: HDR_CLL, HDR_MDCV). The one walk of
+/// the configOBUs [`av1c_reorder_depth`] also takes. `None` when the record holds no sequence header that parses.
+pub fn av1c_colour(av1c: &[u8]) -> Option<(ColorConfig, Vec<Metadata>)> {
+    obus_colour(&crate::avif::Av1Config::parse(av1c).ok()?.config_obus) // AV1INBANDCOLOUR (SR366): the one OBU walk, the in-band reading's too
+}
+
+/// KERNELCOLOUR (rmbp-ledger B952): [`av1c_codes`]' answer — `((primaries, transfer, matrix, color_range), the last HDR_CLL
+/// (max_cll, max_fall), the last HDR_MDCV (primaries R G B, white, luminance_max, luminance_min))`, plain values a colour type
+/// that cannot name av1_core's (demux_core links no decoder) maps.
+pub type Av1Codes = ((u8, u8, u8, bool), Option<(u16, u16)>, Option<([[u16; 2]; 3], [u16; 2], u32, u32)>);
+
+/// KERNELCOLOUR (rmbp-ledger B952): [`av1c_colour`] as plain code points — what `demux_core::colour::Colour::from_av1`
+/// maps, for gneiss_pal's `colour_of` and the kernel Player alike (one walk, one mapping).
+pub fn av1c_codes(av1c: &[u8]) -> Option<Av1Codes> {
+    av1c_colour(av1c).map(codes_of) // AV1INBANDCOLOUR (SR366): the one fold, `sequence_codes`' too
+}
+
+// ── AV1INBANDCOLOUR (LEDGER SR366): the in-band sequence header as the AV1 colour fallback ───────────────────────────────
+// An av1C without configOBUs (legal: AV1-ISOBMFF §2.3.3 makes them optional, and some muxers write none) states no colour in
+// the record; the stream then carries its sequence header in-band, in the first temporal unit (§7.5). ONE walk (`obus_colour`)
+// reads either OBU run and ONE fold (`codes_of`) makes the plain codes; `stream_codes` is THE AV1 reading gneiss_pal's
+// `colour_of` and the kernel Player's `bitstream_colour` both call, so the two rings agree. The rule: the container's colour
+// (applied by `demux_core::colour::Colour::or`) > the av1C configOBUs' header > the first temporal unit's header > the size
+// default (`yuv_core::pick`).
+
+/// AV1INBANDCOLOUR (SR366): the color_config of the first sequence header OBU in a low-overhead OBU run (§5.2: an av1C's
+/// configOBUs or a temporal unit as MP4 / Matroska store it) and every METADATA OBU in the run that parses. `None` when the run
+/// does not split or holds no sequence header that parses.
+pub fn obus_colour(obus: &[u8]) -> Option<(ColorConfig, Vec<Metadata>)> {
+    let obus = split_obus(obus).ok()?;
     let o = obus.iter().find(|o| o.obu_type == OBU_SEQUENCE_HEADER_T)?;
-    SequenceHeader::parse(o.payload).ok()?;
-    Some(0)
+    let seq = SequenceHeader::parse(o.payload).ok()?;
+    let meta = obus.iter().filter(|o| o.obu_type == OBU_METADATA_T).filter_map(|o| parse_metadata(o.payload).ok()).collect();
+    Some((seq.color_config, meta))
+}
+
+/// AV1INBANDCOLOUR (SR366): [`obus_colour`]'s answer as plain codes ([`Av1Codes`]): the code points and range, the last
+/// HDR_CLL and the last HDR_MDCV.
+fn codes_of((cc, meta): (ColorConfig, Vec<Metadata>)) -> Av1Codes {
+    let (mut cll, mut mdcv) = (None, None);
+    for m in meta {
+        match m {
+            Metadata::Cll { max_cll, max_fall } => cll = Some((max_cll, max_fall)),
+            Metadata::Mdcv { primaries, white, luminance_max, luminance_min } => mdcv = Some((primaries, white, luminance_max, luminance_min)),
+            Metadata::Other(_) => {}
+        }
+    }
+    ((cc.color_primaries, cc.transfer_characteristics, cc.matrix_coefficients, cc.color_range), cll, mdcv)
+}
+
+/// AV1INBANDCOLOUR (SR366): [`Av1Codes`] of any low-overhead OBU run (the one walk, the one fold).
+pub fn codes_from_obus(obus: &[u8]) -> Option<Av1Codes> {
+    obus_colour(obus).map(codes_of)
+}
+
+/// AV1INBANDCOLOUR (SR366): the codes a temporal unit's in-band sequence header (and its METADATA OBUs) state; `None` when
+/// the unit carries no sequence header.
+pub fn sequence_codes(tu: &[u8]) -> Option<Av1Codes> {
+    codes_from_obus(tu)
+}
+
+/// AV1INBANDCOLOUR (SR366): THE bitstream colour of an AV1 track — the av1C's configOBUs ([`av1c_codes`], byte-identical to
+/// before), else the in-band sequence header of the track's first temporal unit ([`sequence_codes`]; `first_tu` empty when
+/// the caller has none). `demux_core::colour::Colour::from_av1` maps it, for gneiss_pal and the kernel Player alike.
+pub fn stream_codes(av1c: &[u8], first_tu: &[u8]) -> Option<Av1Codes> {
+    av1c_codes(av1c).or_else(|| sequence_codes(first_tu))
+}
+
+// ── AV1INBANDSWITCH (LEDGER SR373): a new sequence header mid-stream re-picks the colour ─────────────────────────────────────
+// The decoder already replaces its sequence header on every in-band OBU_SEQUENCE_HEADER and every `Planes` carries it; the
+// Players converted by the open's colour regardless. ONE rule, on plain values (demux_core's `Colour` maps them on each face): a
+// frame converts by the open's colour until the current header's code points differ from the first decoded one's (the open's
+// bitstream reading); then every field the open took FROM the bitstream (open == base) follows the current header and a field the
+// container stated differently keeps the container's. Back at the base codes = the open's colour again, byte-identical.
+
+/// AV1INBANDSWITCH (SR373): a [`StreamDecoder`]'s switch state (`InBand`) and the container-wins merge (`switch_codes`) live in
+/// yuv_core since VP9INBANDSWITCH (LEDGER SR400) lifted them byte for byte, so VP9 reports by the same rule; these paths stay.
+pub use yuv_core::inband::{switch_codes, InBand};
+
+impl Decoder {
+    /// AV1INBANDSWITCH (SR373): the codes of the sequence header in effect (its color_config) and the last HDR_CLL / HDR_MDCV
+    /// METADATA OBU the stream carried in-band (`None` before any sequence header).
+    pub fn current_codes(&self) -> Option<Av1Codes> {
+        let cc = &self.seq.as_ref()?.color_config;
+        Some(((cc.color_primaries, cc.transfer_characteristics, cc.matrix_coefficients, cc.color_range), self.meta.0, self.meta.1))
+    }
+
+    /// AV1INBANDSWITCH (SR373): a top-level OBU the decode loop does not decode: a METADATA OBU that parses updates `meta`.
+    fn note(&mut self, o: &Obu) {
+        if o.obu_type != OBU_METADATA_T {
+            return;
+        }
+        match parse_metadata(o.payload) {
+            Ok(Metadata::Cll { max_cll, max_fall }) => self.meta.0 = Some((max_cll, max_fall)),
+            Ok(Metadata::Mdcv { primaries, white, luminance_max, luminance_min }) => self.meta.1 = Some((primaries, white, luminance_max, luminance_min)),
+            _ => {}
+        }
+    }
+}
+
+impl StreamDecoder {
+    /// AV1INBANDSWITCH (SR373): after a decode — `open` the open's colour as `(primaries, transfer, matrix, full_range)`. `.0` is
+    /// `None` while the current header's code points equal the first decoded header's (the open's colour applies), else the
+    /// colour to convert by ([`switch_codes`]); `.1` is `Some((matrix before, matrix now))` once per change of `.0`.
+    pub fn switch(&mut self, open: Option<(u8, u8, u8, Option<bool>)>) -> (Option<(u8, u8, u8, Option<bool>)>, Option<(u8, u8)>) {
+        self.inband.switch(self.dec.current_codes().map(|c| c.0), open) // VP9INBANDSWITCH (SR400): the ONE rule, `yuv_core::inband`
+    }
+}
+
+// ── AV1INBANDSIZE (LEDGER SR379): a new coded video sequence mid-stream (handlers.md §5 NLEPROBE-HDR's AV1-INBAND-SIZE) ──────────
+// §7.5: a sequence header whose contents differ from the one in effect (operating_parameters_info aside, the fields it may change
+// within a sequence; dav1d compares the same way) starts a NEW coded video sequence, whose first frame must be a shown key frame:
+// every reference of the old one is invalid. `Decoder::decode` drops them through the existing `RefStore::clear`, so an inter frame
+// across the boundary is refused by the existing "inter frame references an empty slot" (obu.rs) instead of predicting from the old
+// sequence's pictures. No buffer re-sizes: `FrameState::new` and `output_planes` size every frame from its own header, so the
+// `Planes` of the new sequence carry the new width / height. `meta` (the in-band CLL / MDCV) is kept (AV1-INBAND-HDR-WIRE's).
+// `StreamDecoder::size_switch` is the ONE size-change rule both Players print by (`[STRIA] :: video size switch`, `[vplay] size
+// switch`).
+
+impl Decoder {
+    /// AV1INBANDSIZE (SR379): take a parsed sequence header; one that differs from the current header ([`same_sequence`]) drops
+    /// every reference frame (a new coded video sequence). The first header clears nothing.
+    fn sequence(&mut self, s: SequenceHeader) {
+        if self.seq.as_ref().is_some_and(|cur| !same_sequence(cur, &s)) {
+            self.refs.clear();
+        }
+        self.seq = Some(s);
+    }
+}
+
+/// AV1INBANDSIZE (SR379): whether two sequence headers belong to one coded video sequence (§7.5): equal in every field but each
+/// operating point's operating_parameters_info (`decoder_buffer_delay`, `encoder_buffer_delay`, `low_delay_mode_flag`).
+pub fn same_sequence(a: &SequenceHeader, b: &SequenceHeader) -> bool {
+    let strip = |s: &SequenceHeader| {
+        let mut s = s.clone();
+        for op in &mut s.operating_points {
+            op.decoder_buffer_delay = 0;
+            op.encoder_buffer_delay = 0;
+            op.low_delay_mode_flag = false;
+        }
+        s
+    };
+    strip(a) == strip(b)
+}
+
+impl StreamDecoder {
+    /// AV1INBANDSIZE (SR379): after a decode — the shown picture's `w` x `h` against the last shown one: `Some((before, now))` once
+    /// per change, `None` for the first picture and while the size holds. A seek (`reset`) keeps it.
+    pub fn size_switch(&mut self, w: u32, h: u32) -> Option<((u32, u32), (u32, u32))> {
+        self.inband.size_switch(w, h) // VP9INBANDSWITCH (SR400): the ONE size rule, `yuv_core::inband`
+    }
 }

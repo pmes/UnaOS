@@ -926,3 +926,37 @@ pub fn pirq_gsi(bus: u8, dev: u8, func: u8, pin: u8, fw_line: u8) -> Result<u32,
 // interrupt counts moving where flight 13 read `ISRARM REFUSED reason=pirq-disabled`.
 const IOAPIC3_APIC_INPUT: bool = true;
 
+
+// ── ZENBOOKI8042 (zenbook-ledger Z3): THE ISA ROUTE QUESTION ────────────────────────────────────────
+/// Which GSI does ISA IRQ `irq` land on, with what polarity and trigger, and how was that decided?
+/// The MADT Interrupt Source Override for bus 0 / `irq` when firmware declared one (its flags win over
+/// the bus default), else identity. ISA's bus default is EDGE and ACTIVE HIGH (ACPI §5.2.12.5), the
+/// opposite of PCI's INTx default `route_pci_intx` applies. The last field is `iso` or `identity`.
+/// Writes nothing; the caller programs the entry with `route_gsi` and unmasks with `set_mask`.
+pub fn isa_gsi(irq: u8) -> (u32, Polarity, Trigger, &'static str) {
+    iso_gsi(irq, Polarity::ActiveHigh, Trigger::Edge)
+}
+
+// ── ZENBOOKSCI (zenbook-ledger Z41): THE ONE ISO WALK, WITH THE CALLER'S BUS DEFAULT ───────────────
+/// `isa_gsi`'s walk with the default named by the caller: an override's `bus-default` flags and the
+/// identity fallback resolve to `pol_default` / `trig_default`. ISA asks edge / active-high (`isa_gsi`);
+/// the ACPI SCI asks level / active-low (ACPI §5.2.12.5: the SCI is a sharable, level, active-low
+/// interrupt unless an override says otherwise; `drivers::ec`'s SCI arm). Writes nothing.
+pub fn iso_gsi(irq: u8, pol_default: Polarity, trig_default: Trigger) -> (u32, Polarity, Trigger, &'static str) {
+    let c = CENSUS.lock();
+    for i in 0..c.n_isos {
+        let iso = c.isos[i];
+        if iso.bus == 0 && iso.irq == irq {
+            let pol = match Polarity::from_flags(iso.flags) {
+                Polarity::BusDefault => pol_default,
+                p => p,
+            };
+            let trig = match Trigger::from_flags(iso.flags) {
+                Trigger::BusDefault => trig_default,
+                t => t,
+            };
+            return (iso.gsi, pol, trig, "iso");
+        }
+    }
+    (irq as u32, pol_default, trig_default, "identity")
+}

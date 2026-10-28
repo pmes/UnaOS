@@ -4,7 +4,7 @@
 //! `audio_core` — the audio decoders UnaOS owns (AUDIOCODEC, ledger SR30).
 //!
 //! Peter (2026-10-04): "we will need to support more than wav files!" — and "true cutting edge, not chicken
-//! wire": every format here is written from its specification, `no_std` + `alloc`, no dependencies. The
+//! wire": every format here is written from its specification, `no_std` + `alloc`, libm its math. The
 //! kernel's `play` and the host (Gneiss `dsp::audio`, Stria, `tools/audio-check`) link the same code.
 //!
 //! | format | specification | module |
@@ -49,11 +49,15 @@ pub mod flac;
 pub mod io;
 pub mod math;
 pub mod md5;
+/// NLE4C (SR301): the one level meter (peak hold + decay, 50 ms RMS, dBFS).
+pub mod meter;
 pub mod mp3;
 pub mod ogg;
 pub mod opus;
-/// NLE4 (SR203): a LINEAR position-addressed resampler for Stria's editor render (NLE4b owes windowed sinc).
+/// NLE4 (SR203) / NLE4B (SR222): position-addressed resamplers: `Sinc` the windowed-sinc quality path (Stria's editor render), `linear` the cheap one.
 pub mod resample;
+/// NLE6MIXAUDIO (rmbp-ledger B953): the ONE gain curve (in-run envelope interpolation, clip gain), Stria and the kernel mixer.
+pub mod ramp;
 /// AETHERMEDIA2 (SR134): WSOLA time-stretch (playbackRate with the pitch kept).
 pub mod stretch;
 pub mod vorbis;

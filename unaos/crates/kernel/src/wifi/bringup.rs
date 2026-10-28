@@ -1021,13 +1021,13 @@ pub fn bringup_once() {
     //                                     failure — an ADVISORY, printed as `discriminating=0`, so a
     //                                     reader knows the round-trip below is the weaker claim.
     // Anything else, or a final readback that is not the pre-image, is a hard refusal.
-    let probe = pre_win | 0xFFF;
-    unsafe { write_config_32(bus, dev, func, CFG_BAR0_WIN, probe) };
+    let probe = pre_win | 0xFFF; let mut pc = window::Pci { bus, dev, func, bar0 };
+    window::Bus::set_cfg80(&mut pc, probe);
     w.cfg80_selftest += 1;
-    let probe_back = unsafe { read_config_32(bus, dev, func, CFG_BAR0_WIN) };
-    unsafe { write_config_32(bus, dev, func, CFG_BAR0_WIN, pre_win) };
+    let probe_back = window::Bus::cfg80(&mut pc);
+    window::Bus::set_cfg80(&mut pc, pre_win);
     w.cfg80_selftest += 1;
-    let selftest = unsafe { read_config_32(bus, dev, func, CFG_BAR0_WIN) };
+    let selftest = window::Bus::cfg80(&mut pc);
 
     let discriminating = probe_back == probe;
     let probe_sane = discriminating || probe_back == pre_win;
@@ -1060,9 +1060,9 @@ pub fn bringup_once() {
     let (ok, stage, d11_state) = explore(bus, dev, func, bar0, pre_win, pre_win2, &mut w);
 
     // ── R8: RESTORE. Push the value READ at R2, and verify against THAT value. ──────────────────
-    unsafe { write_config_32(bus, dev, func, CFG_BAR0_WIN, pre_win) };
+    let rs = window::restore(&mut pc, pre_win);
     w.cfg80_restore += 1;
-    let back = unsafe { read_config_32(bus, dev, func, CFG_BAR0_WIN) };
+    let back = rs.map_or_else(|rb| rb, |()| pre_win);
     let restored = back == pre_win;
     serial_println!(
         ":: wifi2: RESTORE cfg:0x80 <- pre-image {:#010x} readback={:#010x} restored={} — compared against the RECORDED pre-image, never against 0x18000000 ::",
@@ -1094,9 +1094,9 @@ fn explore(
     bus: u8, dev: u8, func: u8, bar0: u64, pre_win: u32, pre_win2: u32, w: &mut Writes,
 ) -> (bool, &'static str, &'static str) {
     // ── R3: ChipCommon. ─────────────────────────────────────────────────────────────────────────
-    unsafe { write_config_32(bus, dev, func, CFG_BAR0_WIN, BCMA_ADDR_BASE) };
+    let mv = window::move_to(&mut window::Pci { bus, dev, func, bar0 }, BCMA_ADDR_BASE);
     w.cfg80_moves += 1;
-    let win_cc = unsafe { read_config_32(bus, dev, func, CFG_BAR0_WIN) };
+    let win_cc = mv.map_or_else(|e| e.readback, |_| BCMA_ADDR_BASE);
     let cc_took = win_cc == BCMA_ADDR_BASE;
     serial_println!(
         ":: wifi2: WROTE cfg:0x80 pre={:#010x} new={:#010x} readback={:#010x} took={} — window now on ChipCommon ::",
@@ -1177,9 +1177,9 @@ fn explore(
     let erom_base = erom & 0xFFFF_F000;
     let erom_off = (erom & 0x0000_0FFF) as u64;
     let max_entries = erom_max_entries(erom_off);
-    unsafe { write_config_32(bus, dev, func, CFG_BAR0_WIN, erom_base) };
+    let mv = window::move_to(&mut window::Pci { bus, dev, func, bar0 }, erom_base);
     w.cfg80_moves += 1;
-    let win_er = unsafe { read_config_32(bus, dev, func, CFG_BAR0_WIN) };
+    let win_er = mv.map_or_else(|e| e.readback, |_| erom_base);
     let er_took = win_er == erom_base;
     serial_println!(
         ":: wifi2: WROTE cfg:0x80 pre={:#010x} new={:#010x} readback={:#010x} took={} — window now on the EROM (page {:#010x} + offset {:#x}, max-entries={} to the core-window edge); walking READ-ONLY ::",
@@ -1265,9 +1265,9 @@ fn explore(
 /// The caller has already established that the EROM's d11 identity matches four metal boots. This
 /// function opens the core window; every read below is of a status or identity register.
 fn reach_d11(bus: u8, dev: u8, func: u8, bar0: u64, d: &D11, pre_win2: u32, w: &mut Writes) -> bool {
-    unsafe { write_config_32(bus, dev, func, CFG_BAR0_WIN, d.base as u32) };
+    let mv = window::move_to(&mut window::Pci { bus, dev, func, bar0 }, d.base as u32);
     w.cfg80_moves += 1;
-    let win = unsafe { read_config_32(bus, dev, func, CFG_BAR0_WIN) };
+    let win = mv.map_or_else(|e| e.readback, |_| d.base as u32);
     serial_println!(
         ":: wifi2: WROTE cfg:0x80 new={:#010x} readback={:#010x} took={} — window now on the RADIO core; BAR0+0 is d11 register 0 ::",
         d.base as u32, win, (win == d.base as u32) as u8
@@ -2521,7 +2521,7 @@ mod unwind;
 #[cfg(feature = "wifi9")]
 mod htphyinit;
 #[cfg(feature = "wifi9")]
-mod rx;
+mod rx; mod window; #[cfg(feature = "wifi9")] mod pmu; // STATIONROAM-PMU (B967): the scoped cfg:0x80 move and the PMU spur-avoid step (bringup/window.rs, bringup/pmu.rs); WINDOW-AUDIT (B970): `window` under wifi2 (the ladder's move_to/restore)
 
 /// `tests wifi` (verb.rs): WIFI9's three rungs, in b43's order — MAC suspended (`phy_common.c:455`),
 /// the PHY re-init and tune (`htphyinit::run`), the RX ring and the 5 s window (`rx::run`). Once per
@@ -2613,16 +2613,17 @@ mod tx;
 /// MAC re-suspended, the HT-PHY's TX-side sequencing (`htphyinit::tx_prep`), the channel cookie, the
 /// TX ring and the SHM/filter words (`tx::prep`), S6's receiver armed (the MAC enabled), the frame
 /// (`tx::fire`), a 2 s response window, both engines stopped. Once per boot; a second `tests wifi`
-/// prints the recorded verdict.
+/// prints the recorded verdict. PHYONCEFN (B950): the per-boot one-shots are `phy::once`; the per-association half on a
+/// kept station's re-join or roam is `join::associate`. PHYONCE-TESTS (B954): `tests phy` runs `phy::once` alone under the same latch (`PHY_RAN`) and parks its PhyState; this pass takes it.
 #[cfg(feature = "wifi10")]
 pub fn wifi10(ssid: Option<alloc::string::String>, gw: Option<[u8; 4]>) {
-    static RAN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-    if RAN.swap(true, core::sync::atomic::Ordering::Relaxed) && !join::rejoin() {
+    // PHYONCE-TESTS (B954): the latch is PHY_RAN (the file tail), ONE latch with `tests phy`; a parked PhyState lets this pass run once from the probe
+    if PHY_RAN.swap(true, core::sync::atomic::Ordering::Relaxed) && !phy::parked() && !join::rejoin() {
         let (t, h) = super::status::wifi10();
         serial_println!(":: wifi10: already ran this boot tx={} heard={} — one pass per boot ::", t, h);
         return;
     }
-    const CH: u16 = 11;
+    const CH: u16 = PHY_CH;
     const WINDOW_US: u64 = 2_000_000;
     let (_reinit, tune, beacons) = super::status::wifi9();
     if tune != 1 {
@@ -2643,73 +2644,13 @@ pub fn wifi10(ssid: Option<alloc::string::String>, gw: Option<[u8; 4]>) {
             return;
         }
     };
-    let shm_pre = unsafe { r32(bar0, D11_SHM_CONTROL) };
-    let mut w = rx::Writes::default();
-    // 1. The MAC suspended (wifi9's end left it so; re-asserted, main.c:2987-3017), then the PHY's TX side.
-    let suspended = rx::suspend(bar0, &mut w, "wifi10");
-    let mut h = htphyinit::Ht::new(bar0);
-    let tp = htphyinit::tx_prep(&mut h);
-    // WIFI11 (B653): HT-PHY TX power control from the SPROM's per-core PA coefficients — the half WIFI10
-    // designed and did not build (phy_ht.c:1001-1004, after tx_prep's :999-1000). Refused, witnessed, on an
-    // unread / implausible / blank SPROM block: the frame then leaves at WIFI10's fixed index.
-    let pctl = match ident::pwr_2g() {
-        Ok((rev, p)) => {
-            ident::pwr_line(rev, &p);
-            match p.iter().position(ident::pwr_blank) {
-                Some(c) => {
-                    serial_println!(
-                        ":: wifi11: txpctl on=0 target_idx=- sprom=blank(core{} rev={}) -> NOT-SET reason=unprogrammed-pa-block — b43 would drive control from it; the frame leaves at txpctl_cmd=[{:#06x},{:#06x},{:#06x}] ::",
-                        c, rev, tp.txpctl[0], tp.txpctl[1], tp.txpctl[2]
-                    );
-                    None
-                }
-                None => {
-                    let pin = [0usize, 1, 2].map(|c| htphyinit::PwrIn {
-                        target: p[c].maxpwr_2g, a1: p[c].pa_2g[0] as i16, b0: p[c].pa_2g[1] as i16, b1: p[c].pa_2g[2] as i16,
-                    });
-                    let r = htphyinit::tx_pwr_ctl(&mut h, &pin);
-                    serial_println!(
-                        ":: wifi11: txpctl on={} target_idx={:#06x} status=[{:#06x},{:#06x},{:#06x}] targ_pwr=[{},{},{}]dBm/4 idle_tssi=[{},{},{}] tone={} sprom=ok(rev={}) -> {} ::",
-                        r.on as u8, r.status[0], r.status[0], r.status[1], r.status[2], pin[0].target, pin[1].target, pin[2].target,
-                        r.idle[0], r.idle[1], r.idle[2], if r.tone_ok { "ran" } else { "TIMEOUT" }, rev,
-                        if r.on { "SET" } else { "NOT-SET reason=cmd-en-bits-unset" }
-                    );
-                    Some(r)
-                }
-            }
-        }
-        Err(why) => {
-            serial_println!(":: wifi11: txpctl on=0 target_idx=- sprom={} -> NOT-SET reason=sprom-{} — the frame leaves at txpctl_cmd=[{:#06x},{:#06x},{:#06x}] ::", why, why, tp.txpctl[0], tp.txpctl[1], tp.txpctl[2]);
-            None
-        }
-    };
-    let pctl_on = pctl.as_ref().map_or(false, |r| r.on);
-    let cookie_pre = rx::chan_cookie(bar0, CH, &mut w);
-    // 2. The TX ring, the rate memory, the PHY-TX-control words, the station MAC into the filter.
-    let prep = match tx::prep(bar0, mac, &mut w) {
-        Ok(p) => p,
-        Err(why) => {
-            super::status::set_wifi10(3, 0);
-            unsafe { w32(bar0, D11_SHM_CONTROL, shm_pre) };
-            serial_println!(":: wifi10: tx NOT ATTEMPTED reason={} ::", why);
-            return;
-        }
-    };
-    // 3. S6's receiver armed — the MAC enabled, the ucode awake.
+    let (parked, shm_pre) = phy::take(bar0).map_or_else(|| (None, unsafe { r32(bar0, D11_SHM_CONTROL) }), |(p, pre)| (Some(p), pre)); // PHYONCE-TESTS (B954): the state `tests phy` parked and ITS pre-image, else a fresh read
+    // 1.-3. The per-boot one-shots, in b43's order (PHYONCEFN B950, bringup/phy.rs): the MAC re-suspended, `tx_prep`, WIFI11's power control, the cookie, `tx::prep`, `rx::arm`.
+    let Ok(phy::PhyState { suspended, h, tp, pctl, pctl_on, cookie_pre, prep, mut rxr, mut w }) = parked.map_or_else(|| phy::once(bar0, bus, dev, func, mac, CH, shm_pre), Ok) else { return };
     let mut seen = rx::Seen::default();
     seen.me = mac;
     // WIFIAUTH (B788): the target armed BEFORE the probe window, so its beacons / probe responses name the BSS.
     seen.join = join::Heard::new(mac, ssid);
-    let mut rxr = match rx::arm(bar0, bus, dev, func, &mut w, "wifi10") {
-        Ok(r) => r,
-        Err(why) => {
-            super::status::set_wifi10(3, 0);
-            let _ = tx::stop(bar0, &mut w);
-            unsafe { w32(bar0, D11_SHM_CONTROL, shm_pre) };
-            serial_println!(":: wifi10: tx NOT ATTEMPTED reason=rx-{} ::", why);
-            return;
-        }
-    };
     // 4. The frame.
     let r = tx::fire(bar0, &prep, mac, CH, &mut w);
     let sent = r.sent();
@@ -2766,8 +2707,62 @@ pub fn wifi10(ssid: Option<alloc::string::String>, gw: Option<[u8; 4]>) {
 // WIFIAUTH (B788, R110): rungs S8 (open-system auth) and S9 (association) inside wifi10's pass. See bringup/join.rs.
 #[cfg(feature = "wifi10")]
 mod join;
+// PHYONCEFN (B950): wifi10's per-boot PHY/MAC/DMA one-shots as one fn, `phy::once`. See bringup/phy.rs.
+#[cfg(feature = "wifi10")]
+mod phy;
 // WIFIDHCP (B831): the kept station's device fns and the TX ring's caps, for `wifi/data.rs` (the accessor triple).
 #[cfg(feature = "wifi10")]
-pub(super) use join::{station_mac, station_pending, station_rx, station_tx, station_tx_room, station_kat};
+pub(super) use join::{station_mac, station_pending, station_rx, station_tx, station_tx_room, station_kat}; #[cfg(feature = "wifi10")] pub(super) use pmu::kat as pmu_kat; #[cfg(feature = "wifi10")] pub(super) use window::kat as window_kat; // STATIONROAM-PMU (B967): the `pmu` KAT row; WINDOW-AUDIT (B970): the `window` row
 #[cfg(feature = "wifi10")]
 pub(super) use tx::{FRAMES, FRAME_MAX};
+
+// PHYONCE-TESTS (rmbp-ledger B954): `tests phy` — wifi10's per-boot one-shots (`phy::once`) ALONE, under wifi10's own latch.
+// The MAC is suspended again at the end (an enabled ucode would ACK unicast to the station MAC outside the pass and fill
+// the 64-slot ring with no reader) and the PhyState is parked in `phy.rs`; `tests wifi` takes it and runs from the probe.
+
+/// The channel wifi10's pass and `tests phy` share (S5c tuned it; the cookie and every TX header carry it).
+#[cfg(feature = "wifi10")]
+const PHY_CH: u16 = 11;
+
+/// wifi10's once-per-boot latch, shared by `tests phy`: whichever verb runs first spends the one-shots.
+#[cfg(feature = "wifi10")]
+static PHY_RAN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// `tests phy` (tests.rs `ensure_wifi`): wifi9's receive rungs first (their own latch, as `tests wifi` runs them), then
+/// wifi10's gates (the same three reads), then `phy::once` alone and `phy::park`. Transmits nothing.
+#[cfg(feature = "wifi10")]
+pub fn phy_tests() {
+    wifi9();
+    if PHY_RAN.swap(true, core::sync::atomic::Ordering::Relaxed) {
+        serial_println!(":: phy: already ran (one-shots are per boot) ::");
+        return;
+    }
+    let refuse = |why: alloc::string::String| {
+        super::status::set_wifi10(3, 0);
+        serial_println!(":: phy: NOT ATTEMPTED reason={} — the pass is spent this boot, as wifi10's own gate ::", why);
+    };
+    let (_reinit, tune, _beacons) = super::status::wifi9();
+    if tune != 1 {
+        return refuse(alloc::format!("no-tune(wifi9 tune={})", tune));
+    }
+    let Some(mac) = ident::mac() else {
+        return refuse(alloc::string::String::from("no-station-mac"));
+    };
+    let (bar0, bus, dev, func) = match live::handle() {
+        Ok(h) => h,
+        Err(why) => return refuse(why),
+    };
+    let shm_pre = unsafe { r32(bar0, D11_SHM_CONTROL) };
+    match phy::once(bar0, bus, dev, func, mac, PHY_CH, shm_pre) {
+        Ok(p) => {
+            let (suspended, cookie_pre, reset, pctl_on) = (p.suspended, p.cookie_pre, p.prep.reset_ok, p.pctl_on);
+            let (mac_off, drained, shm_ok) = phy::park(bar0, p, PHY_CH, shm_pre);
+            serial_println!(
+                ":: phy: once -> OK suspended={} cookie_pre={:#06x} prep=reset:{} rx=armed tx_pwr_ctl={} then mac-suspended={} drained={} shm-ctl-restored={} parked=1 — `tests wifi` takes it (the MAC resumed) ::",
+                suspended as u8, cookie_pre, reset as u8, if pctl_on { "on" } else { "off" }, mac_off as u8, drained,
+                if shm_ok { "MATCH" } else { "FAILED" }
+            );
+        }
+        Err(step) => serial_println!(":: phy: once -> FAIL step={} — wifi10's NOT ATTEMPTED line above; the pass is spent this boot ::", step),
+    }
+}

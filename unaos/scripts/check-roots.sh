@@ -164,7 +164,7 @@ GATE-ROOTS FAILED — binary target(s) that no leg of \`./arroyo check\` names:$
 
 A binary is its own root: nothing depends on it, so unless a check leg names it, it is never
 type-checked and "check green" says nothing about it.
-  FIX: add a \`cargo +nightly check\` leg for it inside check_both (or a function check_both calls,
+  FIX: add a \`cargo check\` leg for it inside check_both (or a function check_both calls,
        or a USER_CHECK_MATRIX row), for every target it ships on. If it is not a binary, drop its
        src/main.rs / [[bin]]. A media or launch command building it does not count — those are not the gate.
 MSG

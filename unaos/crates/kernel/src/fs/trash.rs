@@ -133,14 +133,7 @@ impl TrashFs for Mt {
         Some(self.read_all(path))
     }
     fn write_file(&mut self, path: &str, bytes: &[u8]) -> Result<(), String> {
-        if self.0.stat(path).is_ok() {
-            self.0.unlink(path, P).map_err(err_s)?;
-        }
-        self.0.create(path, NodeKind::File, P).map_err(err_s)?;
-        if !bytes.is_empty() {
-            self.0.write(path, 0, bytes, P).map_err(err_s)?;
-        }
-        Ok(())
+        self.0.put_file(path, bytes, P).map(|_| ()).map_err(err_s) // VFSPUTONE (rmbp-ledger B964): the ONE VFS whole-file writer
     }
     fn append_file(&mut self, path: &str, bytes: &[u8]) -> Result<(), String> {
         let off = match self.0.stat(path) {
@@ -150,7 +143,7 @@ impl TrashFs for Mt {
                 0
             }
         };
-        self.0.write(path, off, bytes, P).map(|_| ()).map_err(err_s)
+        self.0.write_all_at(path, off, bytes, P).map(|_| ()).map_err(err_s) // VFSPUTREST (rmbp-ledger B969): the append completes or says `short-write`
     }
     fn case_insensitive(&self) -> bool {
         true // FAT homes fold case; the kernel has always compared Trash names without it

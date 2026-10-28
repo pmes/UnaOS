@@ -41,6 +41,10 @@ pub struct Txt {
     mono: bool,
     pub bytes: usize,
     pub faces: usize,
+    /// PDF4KERNEL (rmbp-ledger B999): the regular Sans and Mono faces' bytes (leaked with the engine's), the `Fallback`
+    /// pdf.rs draws a PDF's unembedded fonts with; None when the face is not on the volume.
+    pub sans_face: Option<&'static [u8]>,
+    pub mono_face: Option<&'static [u8]>,
 }
 
 /// Why no face is drawing (the start line's `font_why=`).
@@ -71,6 +75,7 @@ pub fn load() -> (Txt, Option<Why>) {
     let mut faces = 0usize;
     let mut dir: Option<&[u8]> = None;
     let mut first_err = Why::Absent(0);
+    let (mut sans, mut mono_bytes): (Option<&'static [u8]>, Option<&'static [u8]>) = (None, None); // PDF4KERNEL (B999)
     for (k, &(file, role, bold)) in FACES.iter().enumerate() {
         let mut got: Option<Vec<u8>> = None;
         for d in DIRS.iter().filter(|d| dir.map_or(true, |x| x == **d)) {
@@ -98,7 +103,7 @@ pub fn load() -> (Txt, Option<Why>) {
         }
         let Some(v) = got else {
             if k == 0 {
-                return (Txt { eng: None, mono: false, bytes: 0, faces: 0 }, Some(first_err));
+                return (Txt { eng: None, mono: false, bytes: 0, faces: 0, sans_face: None, mono_face: None }, Some(first_err));
             }
             continue; // bold / mono absent: the engine's fallback stack draws them with what is there
         };
@@ -106,16 +111,21 @@ pub fn load() -> (Txt, Option<Why>) {
         let data: &'static [u8] = alloc::boxed::Box::leak(v.into_boxed_slice());
         match Font::parse(data) {
             Ok(f) => {
+                match k {
+                    0 => sans = Some(data), // PDF4KERNEL (B999): the regular faces, pdf.rs's Fallback
+                    2 => mono_bytes = Some(data),
+                    _ => {}
+                }
                 eng.add_face(NAMES[k], role, bold, f);
                 bytes += len;
                 faces += 1;
             }
-            Err(_) if k == 0 => return (Txt { eng: None, mono: false, bytes: 0, faces: 0 }, Some(Why::Parse)),
+            Err(_) if k == 0 => return (Txt { eng: None, mono: false, bytes: 0, faces: 0, sans_face: None, mono_face: None }, Some(Why::Parse)),
             Err(_) => {}
         }
     }
     let mono = eng.has(Role::Mono);
-    (Txt { eng: Some(eng), mono, bytes, faces }, None)
+    (Txt { eng: Some(eng), mono, bytes, faces, sans_face: sans, mono_face: mono_bytes }, None)
 }
 
 impl Txt {
@@ -143,6 +153,24 @@ impl Txt {
                 (r(a), r(d), r(lh - a - d).max(0.0))
             }
             None => (8.0, 2.0, 0.0),
+        }
+    }
+
+    /// AETHER-CAPTIONEXTENTS (SR453): (ascent, descent) in px UNROUNDED — the primary face's browser line metrics as
+    /// `Engine::line_metrics` scales them, before [`Txt::line_metrics`] rounds them: the host render/mod.rs
+    /// `text_extents` on this ring, what a push button's caption centres its line by; the font8x8 grid is (8, 2).
+    /// AETHER-CAPTIONFACE (SR457): read from the face and instance the run DRAWS with — `Engine::primary_instance` of
+    /// `sel`'s style (the weight's face, bold at weight >= 600, at its draw `wght` / `opsz`), not the role's regular
+    /// slot: the host's `text_extents` reads the weight's face it draws, as Chrome reads the used font's metrics.
+    pub fn extents(&self, sel: FontSel, size: f32) -> (f32, f32) {
+        let fs = self.fstyle(sel, size);
+        match self.eng.as_ref().and_then(|e| e.primary_instance(&fs)) {
+            Some(f) => {
+                let (a, d, _) = f.line_metrics();
+                let s = size / f.units_per_em.max(1) as f32;
+                (a as f32 * s, -(d as f32) * s)
+            }
+            None => (8.0, 2.0),
         }
     }
 

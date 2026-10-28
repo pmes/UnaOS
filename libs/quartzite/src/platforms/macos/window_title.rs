@@ -102,7 +102,7 @@ fn scale_nearest(rgba: &[u8], w: u32, h: u32, out: u32) -> Option<Vec<u8>> {
 
 /// Wrap tightly packed 8-bit sRGB RGBA in an AppKit bitmap rep (same idiom as
 /// [`super::image_view::FacetImageView::set_frame`]). Main thread only.
-fn bitmap_rep(rgba: &[u8], size: u32) -> Option<Retained<NSBitmapImageRep>> {
+pub(crate) fn bitmap_rep(rgba: &[u8], size: u32) -> Option<Retained<NSBitmapImageRep>> {
     let expected = size as usize * size as usize * 4;
     if rgba.len() < expected {
         return None;

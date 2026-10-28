@@ -1,27 +1,21 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // Copyright (C) 2026 The Architect & Una
 //
-//! RGBA -> I420 (NLE5B, LEDGER SR206): the tree's ONE forward colour converter, the encoder's input side.
+//! RGBA -> I420 (NLE5B, LEDGER SR206): the encoder's input side, over the tree's ONE forward colour converter.
 //!
 //! CHARTER: Stria (A/V) — seam `shared-core`: the export's RGBA frames become the [`Yuv420`] the encoder codes; the
 //! inverse (I420 -> RGBA) is gneiss_pal's `dsp::video::Frame::to_rgba`.
 //!
-//! ITU-R BT.601, limited range (Y' 16..235, Cb / Cr 16..240), in 16-bit fixed point (the 8-bit 66 / 129 / 25 table
-//! puts pure red at Y' 82, not 81). Chroma is sited at the 2x2 block and computed from the block's RGB sums, so it is
-//! the average of the block; an edge block of an odd-sized frame averages the pixels it has. Each chroma row of
-//! coefficients sums to zero, so any grey has Cb = Cr = 128 exactly. Alpha is ignored.
+//! H264ENCPLANES (rmbp-ledger B973): the conversion is `yuv_core::from_rgba` (beside `yuv_core::to_rgba`, both directions in
+//! one crate); this file's own 16-bit BT.601 table and loop were retired onto it byte for byte (`yuv_core::rgb_coeffs` of
+//! `KR_KB_601` limited is the retired table, pinned there). [`I420::from_rgba`] keeps its meaning: ITU-R BT.601, limited range
+//! (Y' 16..235, Cb / Cr 16..240), chroma the 2x2 block average (an edge block of an odd-sized frame averages the pixels it
+//! has), any grey Cb = Cr = 128, alpha ignored; [`I420::from_rgba_in`] takes the matrix and range.
 
 use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::{Error, Result, Yuv420};
-
-/// Y' coefficients (x 65536) of R, G, B.
-const KY: [i64; 3] = [16829, 33039, 6416];
-/// Cb coefficients (x 65536); they sum to 0.
-const KU: [i64; 3] = [-9714, -19070, 28784];
-/// Cr coefficients (x 65536); they sum to 0.
-const KV: [i64; 3] = [28784, -24103, -4681];
 
 /// One owned 8-bit 4:2:0 frame: Y `width x height`, Cb and Cr `ceil(width/2) x ceil(height/2)`, row-major, no padding.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,40 +30,18 @@ pub struct I420 {
 impl I420 {
     /// Convert straight RGBA (`width * height * 4` bytes, top row first) by BT.601 limited range.
     pub fn from_rgba(width: u32, height: u32, rgba: &[u8]) -> Result<I420> {
+        I420::from_rgba_in(width, height, rgba, yuv_core::KR_KB_601, false)
+    }
+
+    /// Convert straight RGBA by one (Kr, Kb) x 10000 and range (H264ENCPLANES B973: `yuv_core::from_rgba`, the ONE converter).
+    pub fn from_rgba_in(width: u32, height: u32, rgba: &[u8], kr_kb: (i64, i64), full: bool) -> Result<I420> {
         let (w, h) = (width as usize, height as usize);
-        if rgba.len() < w * h * 4 {
-            return Err(Error::FrameSize);
-        }
         let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
         let mut y = vec![0u8; w * h];
         let mut u = vec![128u8; cw * ch];
         let mut v = vec![128u8; cw * ch];
-        for row in 0..h {
-            for col in 0..w {
-                let p = &rgba[(row * w + col) * 4..];
-                let s = KY[0] * p[0] as i64 + KY[1] * p[1] as i64 + KY[2] * p[2] as i64;
-                y[row * w + col] = (16 + ((s + 32768) >> 16)) as u8;
-            }
-        }
-        for by in 0..ch {
-            for bx in 0..cw {
-                let (mut sum, mut n) = ([0i64; 3], 0i64);
-                for row in by * 2..(by * 2 + 2).min(h) {
-                    for col in bx * 2..(bx * 2 + 2).min(w) {
-                        let p = &rgba[(row * w + col) * 4..];
-                        for c in 0..3 {
-                            sum[c] += p[c] as i64;
-                        }
-                        n += 1;
-                    }
-                }
-                let chroma = |k: &[i64; 3]| {
-                    let s = k[0] * sum[0] + k[1] * sum[1] + k[2] * sum[2];
-                    (128 + (s + n * 32768).div_euclid(n * 65536)) as u8
-                };
-                u[by * cw + bx] = chroma(&KU);
-                v[by * cw + bx] = chroma(&KV);
-            }
+        if !yuv_core::from_rgba(rgba, w, h, kr_kb, full, &mut y, &mut u, &mut v) {
+            return Err(Error::FrameSize);
         }
         Ok(I420 { width, height, y, u, v })
     }

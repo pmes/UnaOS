@@ -59,12 +59,15 @@ pub mod fragment;
 pub mod mkv;
 pub mod mime;
 pub mod facts;
+/// HEVCHEIC (SR220): the HEIF image-item reader (ISO/IEC 23008-12) — items, properties, grids; codec-blind.
+pub mod heif;
 pub mod mp4;
 mod read;
 /// NLEPROBE (SR195): the editor's probe of a file — streams, time bases, keyframe index, composition offsets.
 pub mod survey;
 /// AETHERMEDIA2 (SR134): WebVTT for `<track>`.
 pub mod vtt;
+pub mod colour;
 
 /// Why a file could not be demuxed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -191,6 +194,8 @@ pub struct Track {
     /// MP4ONE (rmbp B464): Apple's `iTunSMPB` (priming, total samples) as the file states it, on every
     /// audio track of an MP4 that carries one; `None` elsewhere.
     pub smpb: Option<(u64, u64)>,
+    /// NLEPROBEHDR (SR226): the colour description and HDR metadata the container states ([`colour`]); `None` when it says nothing.
+    pub colour: Option<colour::Colour>,
 }
 
 /// MP4ONE (rmbp B464): the first media edit of an MP4 `elst` (ISO/IEC 14496-12 §8.6.6) — the edit the
@@ -864,5 +869,21 @@ impl Demuxer {
         let len = (*t.config.get(21)? & 3) as usize + 1;
         let b = *self.sample_data(s).get(len)?;
         Some((b >> 1) & 0x3F)
+    }
+}
+
+// AV1INBANDCOLOUR (LEDGER SR366): a track's first sample, read at open by `Demuxer::fill_colour` (an AV1 track whose av1C has
+// no configOBUs states its colour in the first temporal unit's sequence header).
+impl Demuxer {
+    /// AV1INBANDCOLOUR (SR366): the track's first sample in decode order as a slice of the file (no copy, no `frame_prefix`,
+    /// as [`Demuxer::sample_data`]): from the loaded table, else, on an indexed open whose window holds none of it, from the
+    /// first span read through `read_span` — the window and the cursor do not move. `None` when the track has no sample there.
+    pub fn first_sample(&self, track_index: usize) -> Option<&[u8]> {
+        let s = match self.order.iter().find(|s| s.track_index == track_index) {
+            Some(s) => *s,
+            None if self.lazy.is_some() => *self.read_span(0).ok()?.get(track_index)?.first()?,
+            None => return None,
+        };
+        Some(self.sample_data(&s)).filter(|b| !b.is_empty())
     }
 }

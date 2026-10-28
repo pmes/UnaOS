@@ -1289,13 +1289,13 @@ fn u64le(b: &[u8], o: usize) -> u64 {
 fn unafs_state(_src: BlockSource) -> &'static str {
     #[cfg(any(target_arch = "aarch64", feature = "unafs"))]
     {
-        #[cfg(all(target_arch = "x86_64", feature = "ahciroot"))] if let Some(port) = crate::install::ahciroot::ensure_root_grant() { if crate::install::ahciroot::bind_ssd_root(port) { return "present"; } } // AHCIROOT (B332) M4: an OURS SSD's UnaFS is `/` whichever disk the kernel was found on
+        #[cfg(all(target_arch = "x86_64", feature = "ahciroot"))] if let Some(port) = crate::install::ahciroot::ensure_root_grant() { if crate::install::ahciroot::bind_ssd_root(port) { return "present"; } } #[cfg(all(target_arch = "x86_64", feature = "nvme"))] if crate::fs::unafs::ensure_nvme_root_grant() { if crate::fs::unafs::bind_root_on(crate::drivers::block::BlockHandle::Nvme) { return "present"; } } // AHCIROOT (B332) M4: an OURS SSD's UnaFS is `/` whichever disk the kernel was found on
         let handle = fat::handle_of(_src);
         if crate::fs::unafs::locate_on(handle).is_err() {
             return "absent";
         }
         // The disk HAS a volume. Force the shared bind, then ask which disk it settled on.
-        let _ = crate::fs::unafs::with_unafs(|_| ());
+        let _ = crate::fs::unafs::bind_now();
         match crate::fs::unafs::mount_bound_handle() {
             Some(h) if h == handle => "present",
             _ => "present-on-other-handle",
@@ -3030,9 +3030,9 @@ fn root_candidates(disks: &[Disk], root_ix: Option<usize>) {
 /// Decimal only, so one awk reads it.
 #[cfg(feature = "unafs")]
 fn unafsx86_witness(src: BlockSource, native_root: bool) {
-    #[cfg(all(target_arch = "x86_64", feature = "ahciroot"))] if native_root { if let Some(crate::drivers::block::BlockHandle::Ahci { port }) = crate::fs::unafs::mount_bound_handle() { let (blocks, generation) = crate::fs::unafs::with_unafs(|fs| (fs.superblock.block_count, fs.root_generation())).unwrap_or((0, 0)); serial_println!(":: UNAFSX86: root=unafs src=ahci:{} blocks={} gen={} home=/home boot={} -> PASS ::", port, blocks, generation, src.name()); return; } } // AHCIROOT (B332) M4: the SSD root's line — `src=` names the disk `/` rides, `boot=` the ESP that stays `/boot`
+    #[cfg(all(target_arch = "x86_64", feature = "ahciroot"))] if native_root { if let Some(crate::drivers::block::BlockHandle::Ahci { port }) = crate::fs::unafs::mount_bound_handle() { let (blocks, generation) = crate::fs::unafs::with_unafs_read(|fs| (fs.superblock.block_count, fs.root_generation())).unwrap_or((0, 0)); serial_println!(":: UNAFSX86: root=unafs src=ahci:{} blocks={} gen={} home=/home boot={} -> PASS ::", port, blocks, generation, src.name()); return; } } #[cfg(all(target_arch = "x86_64", feature = "nvme"))] if native_root { if crate::fs::unafs::mount_bound_handle() == Some(crate::drivers::block::BlockHandle::Nvme) { let (blocks, generation) = crate::fs::unafs::with_unafs_read(|fs| (fs.superblock.block_count, fs.root_generation())).unwrap_or((0, 0)); serial_println!(":: UNAFSX86: root=unafs src=nvme blocks={} gen={} home=/home boot={} -> PASS ::", blocks, generation, src.name()); return; } } // AHCIROOT (B332) M4: the SSD root's line — `src=` names the disk `/` rides, `boot=` the ESP that stays `/boot`
     let (blocks, generation) = if native_root {
-        crate::fs::unafs::with_unafs(|fs| (fs.superblock.block_count, fs.root_generation())).unwrap_or((0, 0))
+        crate::fs::unafs::with_unafs_read(|fs| (fs.superblock.block_count, fs.root_generation())).unwrap_or((0, 0))
     } else {
         (0, 0)
     };

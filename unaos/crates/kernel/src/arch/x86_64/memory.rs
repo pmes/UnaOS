@@ -611,7 +611,7 @@ fn slot_rec_ensure(s: usize) -> bool {
     }
     // Only the claimant of `s` (its `SLOT_USED` CAS) reaches here, so no second writer races this store.
     SLOT_MEM[s].store(p, Ordering::Release);
-    SLOT_RECORDS.fetch_add(1, Ordering::AcqRel);
+    SLOT_RECORDS.fetch_add(1, Ordering::AcqRel); #[cfg(feature = "wc")] { use crate::allocator::census::{retag, SLOT_RECORD}; retag(p as usize, SLOT_RECORD_BYTES, SLOT_RECORD); } // SLOTRECTAG (B1030, BP-cores-22): the slot pool's record, allocated once per index and never freed — `slot-record`, counted once by desktopbuild (was `task:<launcher>`). SAME-LINE fold, line-NEUTRAL
     true
 }
 
@@ -4996,3 +4996,20 @@ fn reserve2_cut(v: &mut alloc::vec::Vec<(u64, u64)>, s: u64, e: u64) {
         v.push((r1, e));
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+// DMAONEBODY (rmbp-ledger B992) — THE KERNEL'S ONE DMA ALLOCATOR, X86 HOOKS (tail-appended; was DMAALLOCONE B986's body).
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+/// The allocator's ONE body is `crate::dma` (DMAONEBODY B992); re-exported here so every driver's `crate::arch::memory::dma::`
+/// path names it unchanged. This file keeps only x86's two hooks.
+pub use crate::dma;
+
+/// `dma`'s bus address of `[va, va + len)`: through `translate`, this file's one page walk. The heap is identity-mapped
+/// (`init` maps its Usable region VA == PA), so today it is `va` itself; a future IOMMU (ZENBOOK-IOMMU) changes this fn.
+pub fn dma_bus(va: u64, _len: usize) -> Option<u64> {
+    translate(va)
+}
+
+/// `dma`'s settle on a fresh zeroed buffer: x86 DMA is cache-coherent, so there is nothing to clean.
+#[inline(always)]
+pub fn dma_settle(_va: u64, _len: usize) {}

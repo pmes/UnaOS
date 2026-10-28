@@ -1,0 +1,18 @@
+# pi4-desktop.inject — what `./arroyo kernel8-test --desk 300` types at the Pi 4 shell (PIDESKQEMULIST, rmbp-ledger B894).
+#
+# Grammar is mbench.py's inject-script grammar (scripts/k8_type.py reads the same): SLEEP <secs> | WAIT <secs> <regex> |
+# anything else is a line typed, CR-terminated. The `--desk` arm exports UNAOS_K8_SCRIPT=<this file> unless the caller set it
+# (`UNAOS_K8_SCRIPT= ./arroyo kernel8-test --desk 300` is the untyped battery) and UNAOS_K8_SPEC=pi4-desktop.spec, which
+# `k8_desk_replay` asserts once; the base pi4-regression.spec is asserted first, unchanged.
+#
+# WHY ONE LINE. The lane exports `tests-at-boot`, so `tests::register` runs a fixture at registration and tables nothing:
+# the FIRST `tests` verb's `ensure_shellux` runs the whole DONE2 set (textscale and overlays among it) once, and a second
+# typed `tests <v>` would read ran=0. The typed run leaves the shell's `render` task for its own `tests-fx` child
+# (tests.rs `typed_child`), so `textscale_shell_leg` sees the windowed shell repaint.
+#
+# READINESS: `:: BANDY-ACL:` is pi4-regression.spec's last required witness (pi4-barename.inject's argument, kept); waiting on
+# it means the battery has printed, so nothing typed here interleaves with it. The run time of the cascade is unmeasured: the
+# bench's first run is the measure (PIDESK-BUDGET), and the four rows stay OPTIONAL until it shows them (PIDESK-PROMOTE).
+WAIT 240 :: BANDY-ACL:
+SLEEP 12
+tests textscale

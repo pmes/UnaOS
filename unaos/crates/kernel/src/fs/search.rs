@@ -135,7 +135,7 @@ pub fn query(prefix: &str, limit: usize) -> Option<Vec<Hit>> {
         if !mt.volume_name("/").map(|n| n == "native").unwrap_or(false) {
             return None;
         }
-        let f = crate::fs::unafs::with_unafs(|fs| fs.find_names(prefix, limit + 16)).ok()?.ok()?;
+        let f = crate::fs::unafs::with_unafs_read(|fs| fs.find_names(prefix, limit + 16)).ok()?.ok()?;
         if !f.indexed {
             return None;
         }
@@ -154,7 +154,7 @@ pub fn indexed() -> bool {
     #[cfg(any(target_arch = "aarch64", feature = "unafs"))]
     {
         let native = crate::shell::vfs_mount_table().volume_name("/").map(|n| n == "native").unwrap_or(false);
-        return native && matches!(crate::fs::unafs::with_unafs(|fs| fs.name_index_ready()), Ok(Ok(true)));
+        return native && matches!(crate::fs::unafs::with_unafs_read(|fs| fs.name_index_ready()), Ok(Ok(true)));
     }
     #[allow(unreachable_code)]
     false

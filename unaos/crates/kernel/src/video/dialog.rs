@@ -182,7 +182,7 @@ static PRIMARY: AtomicU32 = AtomicU32::new(0);
 static SURF_AT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 fn surf() -> &'static mut [u32] {
     let n = metrics::size(W) * metrics::size(H());
-    metrics::leaked_surf(&SURF_AT, n) // SECREVIEW F1: grows with the live scale (was sized once, then sliced at the new scale)
+    metrics::login_surf(&SURF_AT, n) // SECREVIEW F1: grows with the live scale (was sized once, then sliced at the new scale)
 }
 
 /// Queue a dialog (QUEUE ONLY: `try_lock`, no heap, no `wm`). One pending behind the one on the glass; more are dropped, counted.
@@ -313,7 +313,7 @@ fn open_pending() {
             paint(&d, d.countdown_s);
             let (sw, sh) = (metrics::size(W), metrics::size(H()));
             let start_y = y.saturating_sub(slide as usize * metrics::size(SLIDE_PX));
-            win = wm::create_at_native(OWNER, surf().as_mut_ptr() as usize, sw * metrics::size(DLG_CAP.load(Ordering::Relaxed)) * 4, sw as u32, sh as u32, (sw * 4) as u32, d.title(), x, start_y);
+            win = wm::create_at_native(OWNER, surf().as_mut_ptr() as usize, sw * metrics::size(DLG_CAP.load(Ordering::Relaxed)) * 4, sw as u32, sh as u32, (sw * 4) as u32, d.title(), x, start_y); metrics::leaked_surf_retire(&SURF_AT, "dialog");
             if win != wm::WIN_NONE {
                 if d.screen {
                     wm::set_modal_top(win); // DIALOG2: over the login screen — the ceiling is the dialog's while it is up
@@ -1323,7 +1323,7 @@ fn seat_open() {
 /// Fill the capacity surface from logical row `from` to `DLG_CAP` with the window's surface colour.
 fn band_clear(from: usize) {
     let cap = DLG_CAP.load(Ordering::Relaxed);
-    let px = metrics::leaked_surf(&SURF_AT, metrics::size(W) * metrics::size(cap));
+    let px = metrics::login_surf(&SURF_AT, metrics::size(W) * metrics::size(cap));
     metrics::fill(px, metrics::size(W), 0, from, W, cap.saturating_sub(from), theme::surface_window());
 }
 
@@ -1402,7 +1402,7 @@ fn rescaled(d: &Dlg, win: wm::WinId, shown: u32) -> bool {
     seat_open();
     paint(d, shown);
     let (sw, sh, cap) = (metrics::size(W), metrics::size(H()), DLG_CAP.load(Ordering::Relaxed));
-    let new = wm::create_at_native(OWNER, surf().as_mut_ptr() as usize, sw * metrics::size(cap) * 4, sw as u32, sh as u32, (sw * 4) as u32, d.title(), i.x, i.y);
+    let new = wm::create_at_native(OWNER, surf().as_mut_ptr() as usize, sw * metrics::size(cap) * 4, sw as u32, sh as u32, (sw * 4) as u32, d.title(), i.x, i.y); metrics::leaked_surf_retire(&SURF_AT, "dialog");
     if new != wm::WIN_NONE {
         if d.screen {
             wm::set_modal_top(new);

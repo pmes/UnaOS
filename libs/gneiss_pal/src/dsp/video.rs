@@ -14,16 +14,27 @@
 //! MP4 `vp08`) is real: [`vp8::Vp8Decoder`] over `vp8_core` (VP8CORE, LEDGER SR40). VP9 (WebM
 //! `V_VP9`, MP4 `vp09`, profiles 0 and 2) is real: [`vp9::Vp9Decoder`] over `vp9_core` (VP9CORE,
 //! LEDGER SR116). H.264 / AVC (MP4 `avc1` / `avc3`, Matroska `V_MPEG4/ISO/AVC`; Baseline, Main and
-//! High at 8-bit 4:2:0) is real: [`h264::H264Decoder`] over `h264_core` (H264CORE, LEDGER SR133).
+//! High at 8-bit 4:2:0) is real: [`h264::H264Decoder`] over `h264_core` (H264CORE, LEDGER SR133). H.265 / HEVC (MP4
+//! `hvc1` / `hev1`, Matroska `V_MPEGH/ISO/HEVC`; 8-bit 4:2:0 intra pictures) is real behind the `hevc` feature:
+//! `hevc::HevcDecoder` over `hevc_core` (HEVCPAL, LEDGER SR215).
 
 use super::demux::{Codec, Packet, Track};
 use super::demux::build::TestPatternPacket;
+// AV1COLOURONE (SR340): COLOURONE's kernel lives in yuv_core (no_std, no alloc, zero deps), shared with av1_core.
+pub use yuv_core::Chroma; use yuv_core::{Matrix, Picture, KR_KB_601}; // AV1PLAYERCOLOUR (SR347): Chroma re-exported, `to_rgba_colour`'s upsampler
+#[cfg(test)]
+use yuv_core::{coeffs as yuv_coeffs, KR_KB_709};
 
-/// Decoded pixels: packed 8-bit RGBA, or planar 8-bit 4:2:0 YCbCr (what an AV1 decoder emits).
+/// Decoded pixels: packed 8-bit RGBA, or planar 8-bit 4:2:0 YCbCr (what an AV1 decoder emits), or planar YCbCr above 8 bits
+/// (COLOURONE SR328: `I420Hi`, a Main10 picture's samples as decoded). COLOURONE422 (SR359): `I420Hi` is THE plane shape for
+/// everything else — `ss` the chroma subsampling as yuv_core's `Picture` takes it ((1, 1) 4:2:0, (1, 0) 4:2:2, (0, 0) 4:4:4;
+/// `uv_stride` samples per chroma row), `bit_depth` the luma's and `bit_depth_c` the Cb / Cr planes' (8..=16 each; 8-bit
+/// 4:2:2 / 4:4:4 too). `I420` stays the 8-bit 4:2:0 shape.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Pixels {
     Rgba(Vec<u8>),
     I420 { y: Vec<u8>, u: Vec<u8>, v: Vec<u8>, y_stride: usize, uv_stride: usize },
+    I420Hi { y: Vec<u16>, u: Vec<u16>, v: Vec<u16>, y_stride: usize, uv_stride: usize, bit_depth: u8, ss: (u32, u32), bit_depth_c: u8 },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,33 +46,47 @@ pub struct Frame {
 }
 
 impl Frame {
-    /// Packed RGBA, row-major, top row first. I420 converts with BT.601 limited-range
-    /// coefficients in fixed point (Y 16..235, CbCr 16..240; chroma sited at the 2×2 block).
+    /// Packed RGBA, row-major, top row first. YCbCr converts with BT.601 limited-range coefficients in fixed point
+    /// (Y 16..235, CbCr 16..240 scaled to the sample depth; chroma sited at the 2×2 block) through the ONE kernel
+    /// [`Frame::to_rgba_colour`] uses (COLOURONE SR328); at 8 bits its derived table is the historical 298 / 409 / 100 /
+    /// 208 / 516 at >> 8, so every caller is byte-identical.
     pub fn to_rgba(&self) -> Vec<u8> {
+        self.yuv_rgba(Matrix::Kr(KR_KB_601), false, Chroma::Nearest)
+    }
+
+    /// COLOURONE (LEDGER SR328): packed RGBA converted by the source's colour (`Track::colour`, NLEPROBEHDR SR226) —
+    /// H.273 MatrixCoefficients 1 BT.709, 4 FCC, 5 / 6 BT.601, 7 SMPTE 240M, 9 BT.2020 non-constant-luminance, 0 identity
+    /// (GBR) and 8 YCgCo (MATRIX-MORE, AV1COLOURONE SR340); any other matrix (2 unspecified, 10 BT.2020
+    /// constant-luminance, reserved) and `None` take the size
+    /// default, BT.601 below HD and BT.709 when the frame is at least 1280 wide or 720 high (the industry default for
+    /// untagged video, as ffmpeg's swscale and the browsers do). `full_range == Some(true)` is full range, anything else
+    /// limited. Integer only: a sample above 8 bits (`Pixels::I420Hi`) is narrowed to 8 inside the one rounded multiply,
+    /// after the conversion (no dither: `yuv_core::to_rgba`'s `dither` is false here). No tone mapping: a PQ / HLG picture
+    /// keeps its transfer. The pick (`yuv_core::pick`) and the kernel are `yuv_core`'s (AV1COLOURONE SR340), shared with av1_core
+    /// and the kernel Player. AV1PLAYERCOLOUR (SR347): `chroma` is the upsampler, the track's [`chroma_of`] (AV1 bilinear, as
+    /// the kernel Player's AV1 path; everything else nearest, COLOURONE's bytes).
+    pub fn to_rgba_colour(&self, colour: Option<&super::demux::colour::Colour>, chroma: Chroma) -> Vec<u8> {
+        let (m, full) = yuv_core::pick(colour.map(|c| c.matrix), colour.and_then(|c| c.full_range), self.width, self.height);
+        self.yuv_rgba(m, full, chroma)
+    }
+
+    /// The one kernel, the caller's chroma upsampling (nearest: the 2x2 block at 4:2:0, COLOURONE's bytes), no dither;
+    /// COLOURONE422 (SR359): an `I420Hi` frame at its own subsampling and per-plane depths (`yuv_core::to_rgba_depths`).
+    fn yuv_rgba(&self, m: Matrix, full: bool, up: Chroma) -> Vec<u8> {
+        let (w, h) = (self.width as usize, self.height as usize);
+        let mut out = vec![0u8; w * h * 4];
         match &self.pixels {
-            Pixels::Rgba(p) => p.clone(),
+            Pixels::Rgba(p) => return p.clone(),
             Pixels::I420 { y, u, v, y_stride, uv_stride } => {
-                let (w, h) = (self.width as usize, self.height as usize);
-                let mut out = vec![0u8; w * h * 4];
-                for row in 0..h {
-                    for col in 0..w {
-                        let yy = y[row * y_stride + col] as i32 - 16;
-                        let cb = u[(row / 2) * uv_stride + col / 2] as i32 - 128;
-                        let cr = v[(row / 2) * uv_stride + col / 2] as i32 - 128;
-                        let c = 298 * yy + 128;
-                        let r = (c + 409 * cr) >> 8;
-                        let g = (c - 100 * cb - 208 * cr) >> 8;
-                        let b = (c + 516 * cb) >> 8;
-                        let o = (row * w + col) * 4;
-                        out[o] = r.clamp(0, 255) as u8;
-                        out[o + 1] = g.clamp(0, 255) as u8;
-                        out[o + 2] = b.clamp(0, 255) as u8;
-                        out[o + 3] = 255;
-                    }
-                }
-                out
+                let p = Picture { w, h, y: &y[..], u: &u[..], v: &v[..], y_stride: *y_stride, uv_stride: *uv_stride, ss: (1, 1), mono: false, bit_depth: 8, full };
+                yuv_core::to_rgba(&p, m, up, false, &mut out);
+            }
+            Pixels::I420Hi { y, u, v, y_stride, uv_stride, bit_depth, ss, bit_depth_c } => {
+                let p = Picture { w, h, y: &y[..], u: &u[..], v: &v[..], y_stride: *y_stride, uv_stride: *uv_stride, ss: *ss, mono: false, bit_depth: *bit_depth as u32, full };
+                yuv_core::to_rgba_depths(&p, *bit_depth_c as u32, m, up, false, &mut out);
             }
         }
+        out
     }
 }
 
@@ -106,7 +131,7 @@ pub trait VideoDecoder: Send {
 ///
 /// `utp1` → [`TestPattern`] (real: it is that stream's decoder). VP8 → [`vp8::Vp8Decoder`]. VP9 →
 /// [`vp9::Vp9Decoder`]. H.264 → [`h264::H264Decoder`]. AV1 →
-/// `av1::Av1Decoder` when the `av1` feature is on. Anything else → `Err(Unsupported)`; the caller may then ask for
+/// `av1::Av1Decoder` when the `av1` feature is on. HEVC → `hevc::HevcDecoder` when the `hevc` feature is on. Anything else → `Err(Unsupported)`; the caller may then ask for
 /// [`TestPattern::stand_in`] to keep the pipeline (clock, scheduling, sink) running, which marks
 /// itself `is_real() == false`.
 pub fn decoder_for(track: &Track) -> Result<Box<dyn VideoDecoder>, DecodeError> {
@@ -117,6 +142,8 @@ pub fn decoder_for(track: &Track) -> Result<Box<dyn VideoDecoder>, DecodeError> 
         Codec::Avc => Ok(Box::new(h264::H264Decoder::new(track)?)),
         #[cfg(feature = "av1")]
         Codec::Av1 => Ok(Box::new(av1::Av1Decoder::new(track)?)),
+        #[cfg(feature = "hevc")]
+        Codec::Hevc => Ok(Box::new(hevc::HevcDecoder::new(track)?)),
         other => Err(DecodeError::Unsupported(format!("{other:?} ({})", track.codec_name))),
     }
 }
@@ -124,15 +151,62 @@ pub fn decoder_for(track: &Track) -> Result<Box<dyn VideoDecoder>, DecodeError> 
 /// DEMUXWIRE (LEDGER SR213): the reorder depth of a video track, read by its codec core from the track's decoder
 /// configuration — what `Demuxer::derive_dts` takes to give a Matroska track decode times (demux_core links no decoder).
 /// H.264 → `h264_core::ps::avcc_reorder_depth` (avcC); AV1 → `av1_core::image::av1c_reorder_depth` (av1C) when the `av1`
-/// feature is on. Anything else → `None`: VP9 (exact: a superframe is presented in decode order) and HEVC (no core reads
-/// hvcC yet, DEMUXSEEK-HEVCDTS) stay `DecodeTime::Presentation`. The one dispatch both of Stria's opens (the editor's and
+/// feature is on; HEVC → `hevc::hvcc_reorder_depth` (hvcC's sps_max_num_reorder_pics, HEVCPAL SR215) when the `hevc`
+/// feature is on. Anything else → `None`: VP9 (exact: a superframe is presented in decode order) stays
+/// `DecodeTime::Presentation`. The one dispatch both of Stria's opens (the editor's and
 /// the Player's) pass by name.
 pub fn reorder_depth(track: &Track) -> Option<u32> {
     match &track.codec {
         Codec::Avc => h264_core::ps::avcc_reorder_depth(&track.config),
         #[cfg(feature = "av1")]
         Codec::Av1 => av1_core::image::av1c_reorder_depth(&track.config),
+        #[cfg(feature = "hevc")]
+        Codec::Hevc => hevc::hvcc_reorder_depth(&track.config),
         _ => None,
+    }
+}
+
+/// NLEPROBEHDRWIRE (LEDGER SR305): the bitstream's colour of a video track, read by its codec core from the track's decoder
+/// configuration — what `Demuxer::fill_colour` takes as the fallback for what the container did not say (NLEPROBEHDR SR226;
+/// demux_core links no decoder, the [`reorder_depth`] shape). H.264 → `h264_core::ps::avcc_sps`'s VUI (only when
+/// video_signal_type is present); AV1 → `av1_core::image::stream_codes` (the av1C configOBUs, else `first`'s in-band sequence header, AV1INBANDCOLOUR SR366) mapped by `Colour::from_av1` (KERNELCOLOUR B952; color_config, plus the METADATA OBUs' content light
+/// levels and mastering display) when the `av1` feature is on; VP9 → `vp9_core::header::header_codes` (the first key frame's
+/// color_space / color_range, AV1INBANDSIZE SR379's VP9-INBAND-COLOUR). Anything else → `None` (HEVC-VUI is owed: hevc_core's SPS
+/// carries the VUI colour, but its hvcC SPS reader is still the depth's own walk). Both of Stria's opens pass it by name
+/// beside [`reorder_depth`].
+pub fn colour_of(track: &Track, first: &[u8]) -> Option<super::demux::colour::Colour> {
+    use super::demux::colour::Colour;
+    match &track.codec {
+        Codec::Avc => {
+            let s = h264_core::ps::avcc_sps(&track.config)?;
+            if !s.video_signal_type {
+                return None;
+            }
+            Some(Colour {
+                primaries: s.colour_primaries,
+                transfer: s.transfer_characteristics,
+                matrix: s.matrix_coefficients,
+                full_range: Some(s.full_range),
+                mastering: None,
+                light: None,
+            })
+        }
+        #[cfg(feature = "av1")]
+        Codec::Av1 => av1_core::image::stream_codes(&track.config, first).map(|(c, l, m)| Colour::from_av1(c, l, m)), // KERNELCOLOUR (B952): the one mapping, the kernel Player's too; AV1INBANDCOLOUR (SR366): `first` the track's first sample
+        Codec::Vp9 => vp9_core::header::header_codes(first).map(|(primaries, transfer, matrix, full)| Colour { primaries, transfer, matrix, full_range: Some(full), mastering: None, light: None }), // AV1INBANDSIZE (SR379): VP9-INBAND-COLOUR, host only (the kernel decodes no VP9)
+        _ => None,
+    }
+}
+
+/// AV1PLAYERCOLOUR (LEDGER SR347): the chroma upsampling a video track's frames convert with ([`Frame::to_rgba_colour`]'s
+/// `chroma`), the [`colour_of`] dispatch shape: AV1 -> `Chroma::Bilinear` (9-3-3-1, the kernel Player's `colour_rgba_av1`, so
+/// the two agree pixel for pixel) when the `av1` feature is on; anything else -> `Chroma::Nearest` (COLOURONE's bytes, the
+/// kernel's `colour_rgba_vp8`). Both of Stria's RGBA sinks (`media_bus`'s `BusSink`, `nle`'s `src_rgba`) pass it.
+pub fn chroma_of(track: &Track) -> Chroma {
+    match &track.codec {
+        #[cfg(feature = "av1")]
+        Codec::Av1 => Chroma::Bilinear,
+        _ => Chroma::Nearest,
     }
 }
 
@@ -140,6 +214,8 @@ pub fn reorder_depth(track: &Track) -> Option<u32> {
 pub mod av1;
 pub mod vp8;
 pub mod h264;
+#[cfg(feature = "hevc")]
+pub mod hevc;
 pub mod vp9;
 
 // ---------------------------------------------------------------------------------------------
@@ -162,56 +238,16 @@ pub struct TestPattern {
     stand_in: bool,
 }
 
-pub const COUNTER_DIGITS: usize = 6;
-
-const BARS: [[u8; 3]; 7] = [
-    [191, 191, 191],
-    [191, 191, 0],
-    [0, 191, 191],
-    [0, 191, 0],
-    [191, 0, 191],
-    [191, 0, 0],
-    [0, 0, 191],
-];
-
-/// 5×7 digit glyphs, one row per byte, bit 4 = leftmost column.
-const GLYPHS: [[u8; 7]; 10] = [
-    [0x0E, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0E],
-    [0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E],
-    [0x0E, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1F],
-    [0x1F, 0x02, 0x04, 0x02, 0x01, 0x11, 0x0E],
-    [0x02, 0x06, 0x0A, 0x12, 0x1F, 0x02, 0x02],
-    [0x1F, 0x10, 0x1E, 0x01, 0x01, 0x11, 0x0E],
-    [0x06, 0x08, 0x10, 0x1E, 0x11, 0x11, 0x0E],
-    [0x1F, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08],
-    [0x0E, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x0E],
-    [0x0E, 0x11, 0x11, 0x0F, 0x01, 0x02, 0x0C],
-];
-
-/// Where the counter field sits: (x0, y0, scale) — glyph cells are 6×8 scaled units (5×7 plus a
-/// one-unit gap).
-fn counter_geometry(w: u32, h: u32) -> (u32, u32, u32) {
-    let band_top = h * 2 / 3;
-    let band_h = h - band_top;
-    let scale = ((w * 9 / 10) / (COUNTER_DIGITS as u32 * 6)).min(band_h * 8 / 10 / 8).max(1);
-    let field_w = COUNTER_DIGITS as u32 * 6 * scale;
-    let x0 = (w.saturating_sub(field_w)) / 2;
-    let y0 = band_top + (band_h.saturating_sub(8 * scale)) / 2;
-    (x0, y0, scale)
-}
+/// SWAPBACKVPLAY (rmbp-ledger B956): the painter is demux_core's (`build::test_pattern_rgba`), the kernel's stand-in too.
+pub use super::demux::build::COUNTER_DIGITS;
 
 impl TestPattern {
     pub fn new(track: &Track) -> Self {
-        let frame_ns = if track.sample_count > 0 && track.duration_ns > 0 {
-            (track.duration_ns / track.sample_count) as i64
-        } else {
-            33_333_333
-        };
         TestPattern {
             width: track.width.max(64),
             height: track.height.max(48),
             timebase: track.timebase,
-            frame_ns: frame_ns.max(1),
+            frame_ns: super::demux::build::stand_in_frame_ns(track),
             stand_in: false,
         }
     }
@@ -222,65 +258,14 @@ impl TestPattern {
 
     /// Render frame `n` at `w×h` as packed RGBA.
     pub fn render(w: u32, h: u32, n: u32) -> Vec<u8> {
-        let (wu, hu) = (w as usize, h as usize);
-        let mut px = vec![0u8; wu * hu * 4];
-        let band_top = hu * 2 / 3;
-        for y in 0..hu {
-            for x in 0..wu {
-                let c = if y < band_top { BARS[x * 7 / wu] } else { [0, 0, 0] };
-                let o = (y * wu + x) * 4;
-                px[o..o + 3].copy_from_slice(&c);
-                px[o + 3] = 255;
-            }
-        }
-        let (x0, y0, s) = counter_geometry(w, h);
-        let digits = format!("{:0width$}", n % 10u32.pow(COUNTER_DIGITS as u32), width = COUNTER_DIGITS);
-        for (i, ch) in digits.bytes().enumerate() {
-            let g = &GLYPHS[(ch - b'0') as usize];
-            for (gy, row) in g.iter().enumerate() {
-                for gx in 0..5 {
-                    if row & (0x10 >> gx) == 0 {
-                        continue;
-                    }
-                    for dy in 0..s {
-                        for dx in 0..s {
-                            let x = (x0 + (i as u32 * 6 + gx) * s + dx) as usize;
-                            let y = (y0 + gy as u32 * s + dy) as usize;
-                            if x < wu && y < hu {
-                                let o = (y * wu + x) * 4;
-                                px[o..o + 3].copy_from_slice(&[255, 255, 255]);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        px
+        super::demux::build::test_pattern_rgba(w, h, n)
     }
 
     /// Read the counter back out of a rendered frame (the play-check oracle). Samples the centre
     /// of every glyph cell unit and matches each digit's 5×7 bitmap exactly; `None` if any digit
     /// does not match a glyph.
     pub fn read_counter(rgba: &[u8], w: u32, h: u32) -> Option<u32> {
-        let (x0, y0, s) = counter_geometry(w, h);
-        let mut n = 0u32;
-        for i in 0..COUNTER_DIGITS as u32 {
-            let mut bits = [0u8; 7];
-            for (gy, b) in bits.iter_mut().enumerate() {
-                for gx in 0..5u32 {
-                    let x = x0 + (i * 6 + gx) * s + s / 2;
-                    let y = y0 + gy as u32 * s + s / 2;
-                    let o = ((y * w + x) * 4) as usize;
-                    let p = rgba.get(o..o + 3)?;
-                    if p.iter().all(|&c| c > 127) {
-                        *b |= 0x10 >> gx;
-                    }
-                }
-            }
-            let d = GLYPHS.iter().position(|g| *g == bits)? as u32;
-            n = n * 10 + d;
-        }
-        Some(n)
+        super::demux::build::test_pattern_counter(rgba, w, h)
     }
 }
 
@@ -293,7 +278,7 @@ impl VideoDecoder for TestPattern {
         let (n, w, h) = match TestPatternPacket::decode(&pkt.data) {
             Some(p) if !self.stand_in => (p.frame, p.width as u32, p.height as u32),
             None if !self.stand_in => return Err(DecodeError::Corrupt("not a UTP1 packet".into())),
-            _ => (((pts_ns + self.frame_ns / 2) / self.frame_ns).max(0) as u32, self.width, self.height),
+            _ => (super::demux::build::stand_in_counter(pts_ns, self.frame_ns), self.width, self.height),
         };
         let (w, h) = (w.max(64), h.max(48));
         Ok(Some(Frame { width: w, height: h, pts_ns, pixels: Pixels::Rgba(Self::render(w, h, n)) }))
@@ -301,6 +286,42 @@ impl VideoDecoder for TestPattern {
     fn is_real(&self) -> bool {
         !self.stand_in
     }
+}
+
+/// SWAPBACKSEEK (LEDGER SR353): the parameter-set NAL units of one sample of a video track — what Stria's
+/// `decode_swap::reseed` feeds a fresh decoder before a seek target, so the target decodes with the in-band sets in
+/// effect there instead of the pre-seek ones. Re-framed as the track frames its samples (the length size of its
+/// avcC / hvcC, else Annex B start codes), through h264_core's ONE splitter (`nal::length_prefixed_units` /
+/// `annexb_units`, which hevc_core re-exports); H.264 nal_unit_type 7 / 8, HEVC 32 / 33 / 34 (hevc_core's header read).
+/// `None` = the codec carries no parameter-set NALs (VP8, VP9, AV1, `utp1`; HEVC without the `hevc` feature);
+/// `Some(empty)` = this sample carries none (or does not split). The [`reorder_depth`] / [`colour_of`] dispatch shape.
+pub fn param_sets(track: &Track, data: &[u8]) -> Option<Vec<u8>> {
+    let (is_set, len): (fn(&[u8]) -> bool, Option<usize>) = match &track.codec {
+        Codec::Avc => (
+            |u| matches!(u.first().map(|b| b & 0x1F), Some(7 | 8)),
+            if track.config.is_empty() { None } else { h264_core::nal::parse_avcc(&track.config).ok().map(|c| c.nal_length_size) },
+        ),
+        #[cfg(feature = "hevc")]
+        Codec::Hevc => (
+            |u| hevc_core::nal::parse_header(u).is_ok_and(|h| matches!(h.nal_type, 32..=34)),
+            if track.config.is_empty() { None } else { hevc_core::nal::parse_hvcc(&track.config).ok().map(|c| c.nal_length_size) },
+        ),
+        _ => return None,
+    };
+    let units = match len {
+        Some(n) => h264_core::nal::length_prefixed_units(data, n).unwrap_or_default(),
+        None if track.config.is_empty() => h264_core::nal::annexb_units(data),
+        None => Vec::new(),
+    };
+    let mut out = Vec::new();
+    for u in units.into_iter().filter(|u| is_set(u)) {
+        match len {
+            Some(n) => out.extend_from_slice(&(u.len() as u32).to_be_bytes()[4 - n..]),
+            None => out.extend_from_slice(&[0, 0, 0, 1]),
+        }
+        out.extend_from_slice(u);
+    }
+    Some(out)
 }
 
 #[cfg(test)]
@@ -348,15 +369,32 @@ mod tests {
 
     #[test]
     fn unsupported_codec_is_named_and_stand_in_is_labelled() {
-        // H.264 has a decoder since H264CORE (SR133); HEVC still has none.
+        // HEVC has a decoder since HEVCPAL (SR215); MPEG-4 Part 2 Visual (`mp4v`) is mapped by no demux_core arm
+        // (Codec::Other) and decoded by no core.
         let mut t = build::test_pattern_track(1, 320, 240, 10, 10, 10).spec;
-        t.fourcc = *b"hvc1";
-        t.config_box = Some(*b"hvcC");
+        t.fourcc = *b"mp4v";
+        t.config_box = None;
         let file = build::mp4(&[build::MediaTrack { spec: t, samples: vec![] }], &Mp4Options::default());
         let d = Demuxer::open(file).unwrap();
         assert!(matches!(decoder_for(&d.tracks()[0]), Err(DecodeError::Unsupported(_))));
         let s = TestPattern::stand_in(&d.tracks()[0]);
         assert!(!s.is_real());
+    }
+
+    /// SWAPBACKVPLAY (rmbp-ledger B956): Stria's stand-in paints demux_core's ONE painter — an `mp4v` 64x48 reel's sample 1
+    /// hashes to the kernel's `tests nle` `STANDIN_KAT` (FNV-1a 64), pinned again by demux_core's `build::tests::stand_in_kat`.
+    #[test]
+    fn stand_in_paints_the_shared_kat() {
+        let mut t = build::test_pattern_track(1, 64, 48, 25, 4, 1);
+        t.spec.fourcc = *b"mp4v";
+        t.spec.config_box = None;
+        let d = Demuxer::open(build::mp4(&[t], &Mp4Options::default())).unwrap();
+        let tr = d.tracks()[0].clone();
+        let mut s = TestPattern::stand_in(&tr);
+        let pk = d.packet_at(d.track_samples(0).nth(1).unwrap());
+        let f = s.decode(&pk).unwrap().unwrap();
+        let fnv = f.to_rgba().iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &x| (h ^ x as u64).wrapping_mul(0x0000_0100_0000_01b3));
+        assert_eq!(fnv, 0xdb29_ef26_80d9_5484);
     }
 
     /// VP8CORE (SR40): the WPT VP8 WebM through the registry. Every frame's I420 was byte-identical
@@ -462,4 +500,161 @@ mod tests {
         let red = f(81, 90, 240);
         assert!(red[0] >= 253 && red[1] <= 2 && red[2] <= 2, "{red:?}");
     }
+
+    // COLOURONE (LEDGER SR328): the one parametrised conversion.
+    use crate::dsp::demux::colour::Colour;
+
+    fn colour(matrix: u8, full: Option<bool>) -> Colour {
+        Colour { primaries: 2, transfer: 2, matrix, full_range: full, mastering: None, light: None }
+    }
+    fn px8(w: u32, h: u32, y: u8, u: u8, v: u8, c: Option<&Colour>) -> Vec<u8> {
+        let (cw, ch) = (w.div_ceil(2) as usize, h.div_ceil(2) as usize);
+        let pixels = Pixels::I420 { y: vec![y; (w * h) as usize], u: vec![u; cw * ch], v: vec![v; cw * ch], y_stride: w as usize, uv_stride: cw };
+        Frame { width: w, height: h, pts_ns: 0, pixels }.to_rgba_colour(c, Chroma::Nearest)[..3].to_vec()
+    }
+
+    #[test]
+    fn colourone_the_601_limited_table_is_the_historical_one() {
+        assert_eq!(yuv_coeffs(KR_KB_601, false, 8), (8, [298, 409, 100, 208, 516], 16, 128));
+        // Every caller of to_rgba is byte-identical: None and an explicit BT.601 limited match it on an SD frame.
+        let bt601 = colour(6, Some(false));
+        for y in (0..=255u8).step_by(5) {
+            for u in (0..=255u8).step_by(17) {
+                for v in (0..=255u8).step_by(17) {
+                    let f = Frame { width: 4, height: 2, pts_ns: 0, pixels: Pixels::I420 { y: vec![y; 8], u: vec![u; 2], v: vec![v; 2], y_stride: 4, uv_stride: 2 } };
+                    let old = f.to_rgba();
+                    assert_eq!(f.to_rgba_colour(None, Chroma::Nearest), old);
+                    assert_eq!(f.to_rgba_colour(Some(&bt601), Chroma::Nearest), old);
+                    assert_eq!(f.to_rgba_colour(Some(&colour(2, None)), Chroma::Nearest), old);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn colourone_hand_computed_samples() {
+        // BT.709 limited 8-bit, Y 120 Cb 140 Cr 100: table (298, 459, 55, 136, 541); yy 104, cb 12, cr -28,
+        // c = 298 * 104 + 128 = 31120: R (31120 - 12852) >> 8 = 71, G (31120 - 660 + 3808) >> 8 = 133, B (31120 + 6492) >> 8 = 146.
+        assert_eq!(yuv_coeffs(KR_KB_709, false, 8), (8, [298, 459, 55, 136, 541], 16, 128));
+        assert_eq!(px8(2, 2, 120, 140, 100, Some(&colour(1, Some(false)))), [71, 133, 146]);
+        assert_eq!(px8(2, 2, 120, 140, 100, None), [76, 139, 145], "BT.601 differs");
+        // BT.601 full range 8-bit, Y 100 Cb 150 Cr 60: table (256, 359, 88, 183, 454), offsets 0 / 128; c = 25600 + 128:
+        // R (25728 - 24412) >> 8 = 5, G (25728 - 1936 + 12444) >> 8 = 141, B (25728 + 9988) >> 8 = 139.
+        assert_eq!(yuv_coeffs(KR_KB_601, true, 8), (8, [256, 359, 88, 183, 454], 0, 128));
+        assert_eq!(px8(2, 2, 100, 150, 60, Some(&colour(5, Some(true)))), [5, 141, 139]);
+        // BT.2020 NCL limited 10-bit (I420Hi), Y 400 Cb 600 Cr 300: table (19077, 27503, 3069, 10657, 35091) at >> 16,
+        // offsets 64 / 512; yy 336, cb 88, cr -212, c = 19077 * 336 + 32768 = 6442640:
+        // R (6442640 - 5830636) >> 16 = 9, G (6442640 - 270072 + 2259284) >> 16 = 128, B (6442640 + 3088008) >> 16 = 145.
+        assert_eq!(yuv_coeffs((2627, 593), false, 10), (16, [19077, 27503, 3069, 10657, 35091], 64, 512));
+        let hi = Frame { width: 2, height: 2, pts_ns: 0, pixels: Pixels::I420Hi { y: vec![400; 4], u: vec![600], v: vec![300], y_stride: 2, uv_stride: 1, bit_depth: 10, ss: (1, 1), bit_depth_c: 10 } };
+        assert_eq!(hi.to_rgba_colour(Some(&colour(9, Some(false))), Chroma::Nearest)[..4], [9, 128, 145, 255]);
+        // A Main10 sample narrowed after the conversion, not before: 601 limited Y 515 Cb 600 Cr 400 is (87, 145, 176);
+        // the >> 2 planes (128, 150, 100) through the 8-bit table give (86, 145, 175).
+        let m10 = Frame { width: 2, height: 2, pts_ns: 0, pixels: Pixels::I420Hi { y: vec![515; 4], u: vec![600], v: vec![400], y_stride: 2, uv_stride: 1, bit_depth: 10, ss: (1, 1), bit_depth_c: 10 } };
+        assert_eq!(m10.to_rgba()[..3], [87, 145, 176]);
+        assert_eq!(px8(2, 2, 128, 150, 100, None), [86, 145, 175]);
+    }
+
+    #[test]
+    fn colourone_untagged_hd_is_bt709() {
+        // Matrix 2 (unspecified) and None: BT.601 below HD, BT.709 at 1280 wide or 720 high; to_rgba stays BT.601.
+        let (sd, hd) = (px8(2, 2, 120, 140, 100, Some(&colour(2, None))), px8(1280, 2, 120, 140, 100, Some(&colour(2, None))));
+        assert_eq!((sd, hd), (vec![76, 139, 145], vec![71, 133, 146]));
+        assert_eq!(px8(2, 720, 120, 140, 100, None), [71, 133, 146]);
+        assert_eq!(px8(1280, 2, 120, 140, 100, Some(&colour(6, Some(false)))), [76, 139, 145], "a stated matrix wins at HD");
+        let f = Frame { width: 1280, height: 2, pts_ns: 0, pixels: Pixels::I420 { y: vec![120; 2560], u: vec![140; 640], v: vec![100; 640], y_stride: 1280, uv_stride: 640 } };
+        assert_eq!(f.to_rgba()[..3], [76, 139, 145]);
+        // RGBA frames pass through untouched.
+        let rgba = Frame { width: 1, height: 1, pts_ns: 0, pixels: Pixels::Rgba(vec![1, 2, 3, 4]) };
+        assert_eq!(rgba.to_rgba_colour(Some(&colour(9, Some(true))), Chroma::Nearest), [1, 2, 3, 4]);
+    }
+}
+
+/// HEVCLEVELLINE (LEDGER SR368, HEVC-LEVEL-LINE): a video track's profile, tier and level as the Player's info line
+/// tokens ([`profile_tokens`]), read by its codec core from the track's decoder configuration — the [`reorder_depth`]
+/// dispatch shape. H.264 -> `h264_core::ps::avcc_sps` (profile_idc named per H.264 A.2, level_idc; H.264 has no tier);
+/// HEVC -> `hevc::hvcc_ptl` (hevc_core's A.3 names) when the `hevc` feature is on. Anything else, or a track with no
+/// configuration record (Annex B: the SPS arrives with the first sample), -> `None`.
+pub fn profile_level(track: &Track) -> Option<String> {
+    match &track.codec {
+        Codec::Avc => {
+            let s = h264_core::ps::avcc_sps(&track.config)?;
+            let profile = match s.profile_idc {
+                66 => "Baseline",
+                77 => "Main",
+                88 => "Extended",
+                100 => "High",
+                110 => "High10",
+                122 => "High422",
+                244 => "High444",
+                44 => "CAVLC444",
+                83 => "ScalableBaseline",
+                86 => "ScalableHigh",
+                118 => "MultiviewHigh",
+                128 => "StereoHigh",
+                _ => "Unknown",
+            };
+            // A.3.1 / A.3.2: level 1b is level_idc 9, or 11 with constraint_set3_flag in Baseline / Main / Extended.
+            let one_b = s.level_idc == 9 || (s.level_idc == 11 && s.constraint_set3 && matches!(s.profile_idc, 66 | 77 | 88));
+            let level = if one_b { (1, 0xB) } else { (s.level_idc / 10, s.level_idc % 10) };
+            Some(profile_tokens(profile, None, level))
+        }
+        #[cfg(feature = "hevc")]
+        Codec::Hevc => hevc::hvcc_ptl(&track.config).map(|p| profile_tokens(p.profile, Some(p.tier), p.level)),
+        _ => None,
+    }
+}
+
+/// HEVCLEVELLINE (SR368): THE one formatter of the profile / tier / level tokens, both codecs':
+/// `profile=<name>[ tier=<main|high>] level=<major>[.<minor>]`; minor 0xB is H.264's level "1b".
+pub fn profile_tokens(profile: &str, tier: Option<&str>, level: (u8, u8)) -> String {
+    let mut s = format!("profile={profile}");
+    if let Some(t) = tier {
+        s += &format!(" tier={t}");
+    }
+    match level {
+        (m, 0xB) => s += &format!(" level={m}b"),
+        (m, 0) => s += &format!(" level={m}"),
+        (m, n) => s += &format!(" level={m}.{n}"),
+    }
+    s
+}
+
+#[cfg(test)]
+mod profile_tests {
+    use super::profile_tokens;
+
+    #[test]
+    fn profile_tokens_kat() {
+        assert_eq!(profile_tokens("High", None, (4, 1)), "profile=High level=4.1");
+        assert_eq!(profile_tokens("Baseline", None, (1, 0xB)), "profile=Baseline level=1b");
+        assert_eq!(profile_tokens("Main10", Some("main"), (5, 0)), "profile=Main10 tier=main level=5");
+        assert_eq!(profile_tokens("Main422_10", Some("high"), (6, 2)), "profile=Main422_10 tier=high level=6.2");
+    }
+}
+
+// ── VP9INBANDSWITCH (LEDGER SR400): the ONE host in-band switch step (handlers.md §5 NLEPROBE-HDR's VP9-INBAND-SWITCH) ─────────
+// AV1INBANDSWITCH (SR373) / AV1INBANDSIZE (SR379) wrote this as `Av1Decoder::inband`; it moved here unchanged so the VP9 arm
+// reports by it too. The rule is `yuv_core::inband::InBand` (av1_core's `StreamDecoder::switch` / `size_switch` and the kernel
+// Player's `inband_colour` / `inband_size` delegate to it). `now` is the code points the picture states (AV1: the current sequence
+// header's color_config; VP9: the frame's color_space / color_range by `vp9_core::header::colour_codes`), `open` the open's
+// colour (`Track::colour`), `chroma` the track's (`chroma_of`). While the codes equal the first stated ones the frame leaves as it
+// came, byte-identical; once they differ it leaves CONVERTED by the switched colour through the ONE conversion
+// (`Frame::to_rgba_colour`), so the bus sink, the editor's `src_rgba` and play-check pass it through. Wire, once per change:
+// `[STRIA] :: video size switch at <pts_ns> <w>x<h>-><w>x<h>`, `[STRIA] :: video colour switch at <pts_ns> matrix=<a>-><b> range=<full|limited>`.
+pub(crate) fn inband_frame(st: &mut yuv_core::inband::InBand, now: Option<(u8, u8, u8, bool)>, open: Option<super::demux::colour::Colour>, chroma: Chroma, f: Frame) -> Frame {
+    use super::demux::colour::Colour;
+    if let Some(((w0, h0), (w1, h1))) = st.size_switch(f.width, f.height) {
+        log::info!("[STRIA] :: video size switch at {} {}x{}->{}x{}", f.pts_ns, w0, h0, w1, h1); // AV1INBANDSIZE (SR379): the ONE size rule, once per change; the frame carries its size
+    }
+    let open4 = open.map(|c| (c.primaries, c.transfer, c.matrix, c.full_range));
+    let (now, changed) = st.switch(now, open4);
+    let range = |r: Option<bool>| if r == Some(true) { "full" } else { "limited" };
+    if let Some((a, b)) = changed {
+        log::info!("[STRIA] :: video colour switch at {} matrix={}->{} range={}", f.pts_ns, a, b, range(now.map_or(open.and_then(|c| c.full_range), |n| n.3)));
+    }
+    let Some((primaries, transfer, matrix, full_range)) = now else { return f };
+    let c = Colour { primaries, transfer, matrix, full_range, mastering: open.and_then(|c| c.mastering), light: open.and_then(|c| c.light) };
+    let rgba = f.to_rgba_colour(Some(&c), chroma);
+    Frame { pixels: Pixels::Rgba(rgba), ..f }
 }

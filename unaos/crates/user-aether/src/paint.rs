@@ -20,6 +20,11 @@
 //
 // UNAKEYS (rmbp-ledger B552): no colour is spelled here — the page's initial colours are `theme::PAGE_*` and every
 // colour over the page (the marks, the status line) is a field of the live `theme::cur()` (Principia's appearance).
+//
+// AETHER-ELFCAPTION (LEDGER SR434): a push-button `<input>` (type submit / reset / button) paints its caption — the
+// host forms paint's push arm (handlers/aether render/mod.rs, AETHERSUBMITCAPTION SR410) on this ring, through the
+// SAME `layout_core::button_label` `control_intrinsic` sized the box by: in the element's own font, centred on both
+// axes in the content box, clipped to the padding box ([`caption`]).
 
 use alloc::vec::Vec;
 
@@ -431,6 +436,7 @@ fn paint_box_plain(cv: &mut Canvas, cx: &Cx, id: NodeId, x: f32, y: f32) {
         }
         return;
     }
+    if !hidden && y + h >= 0.0 { caption(cv, cx, id, &ink, x, y); } // AETHER-ELFCAPTION (SR434)
     for k in tree.taffy.children(id).unwrap_or_default() {
         let Ok(kl) = tree.taffy.layout(k) else { continue };
         paint_box(cv, cx, k, x + kl.location.x, y + kl.location.y);
@@ -462,4 +468,102 @@ pub fn status(cv: &mut Canvas, fonts: &Fonts, s: &str, accent: bool) {
     let mut t = fonts.0.borrow_mut();
     let (a, _, _) = t.line_metrics(sel, crate::chrome::font());
     t.draw(4.0, (y + 2) as f32 + a, s, sel, crate::chrome::font(), ink, &mut |gx, gy, cov| cv.blend(gx, gy, ink, cov));
+}
+
+// ---- AETHER-ELFCAPTION (SR434): a push button's caption ------------------------------------------------------
+
+/// AETHER-ELFCAPTION (SR434): the caption of a push-button `<input>` (type submit / reset / button, trimmed and ASCII
+/// case-insensitive as `layout_core::button_label` reads it) with its border box's top-left at (`x`, `y`) — the host
+/// forms paint's push arm (render/mod.rs, AETHERSUBMITCAPTION SR410) on this ring. The label is
+/// `layout_core::button_label` (the rule `control_intrinsic` sized the box by; an empty label paints nothing), measured
+/// and drawn in the element's own font (`ink`: its used size, family and weight, through txt.rs's shaper), centred
+/// on both axes in the content box (an overflowing label stays centred: one line, never wrapped; the inked line,
+/// ascent + descent, centred as the host's `centered_line_origin_y` does) and clipped to the padding box (html.css
+/// `input { overflow: clip }`). Its ink is the element's own `color`, else the page ink (the host's FieldText black).
+fn caption(cv: &mut Canvas, cx: &Cx, id: NodeId, ink: &Ink, x: f32, y: f32) {
+    let tree = cx.tree;
+    let (Some(n), Ok(l)) = (tree.node_map.get(&id), tree.taffy.layout(id)) else { return };
+    if n.tag().as_deref() != Some("input") {
+        return;
+    }
+    let ty = n.attr("type").unwrap_or_default();
+    if !layout_core::is_push_type(&ty) {
+        return file_color(cv, cx, id, ink, x, y, &ty); // AETHERFILECOLORPAINT (SR456)
+    }
+    let value = n.attr("value");
+    let label = layout_core::button_label(&ty, value.as_deref());
+    if label.is_empty() {
+        return;
+    }
+    let color = tree.paint_map.get(&id).and_then(|p| p.color).map(rgb).unwrap_or(crate::theme::PAGE_INK);
+    // AETHERCAPTIONCORE (SR438): the geometry is layout_core's `caption_box`, the host push arm's rule (its
+    // content box, centred line, padding-box clip in f32 as the host's `in_clip`); the baseline adds the
+    // half-leading lead from `Fonts::baseline_offset` (read before the borrow_mut below) and rounds as the host.
+    // AETHERCAPTIONEXTENTS (SR453): the line centres on txt.rs `extents` (raw, unrounded), as the host's `text_extents`.
+    let lead = layout_core::Fonts::baseline_offset(cx.fonts, ink.sel, ink.size, 0.0);
+    let mut t = cx.fonts.0.borrow_mut();
+    let tw = t.measure(&label, ink.sel, ink.size);
+    let (a, d) = t.extents(ink.sel, ink.size);
+    let c = layout_core::caption_box(x, y, l.size.width, l.size.height, l.border, l.padding, tw, a, d);
+    let base = c.baseline(lead);
+    let (px0, py0, px1, py1) = c.clip;
+    t.draw(c.x, base, &label, ink.sel, ink.size, color, &mut |gx, gy, cov| {
+        let (fx, fy) = (gx as f32, gy as f32);
+        if fx >= px0 && fx < px1 && fy >= py0 && fy < py1 {
+            cv.blend(gx, gy, color, cov);
+        }
+    });
+}
+
+// ---- AETHERFILECOLORPAINT (SR456): a file input's button and status, a color input's swatch ----------------------
+
+/// AETHERFILECOLORPAINT (SR456): the host render's `paint_file_color` on this ring, for the `<input>` `id` whose
+/// border box's top-left is (`x`, `y`) and whose raw type is `ty` (any type but file / color paints nothing). File: the
+/// strings from layout_core's `file_label`; the button sub-box (the input's own UA edges round the button caption's
+/// width, as `control_intrinsic` sized it) centres the caption through the push caption's ONE rule `caption_box`, and
+/// the status text follows 4 px after the button's border box on the same line top; both in the element's font and
+/// colour, clipped to the input's padding box, the baseline as `caption` takes it. Color: the `value` attribute (no
+/// dirty value on this ring) through layout_core's `parse_color_str`, black when it does not parse, filled in the
+/// swatch layout_core's `COLOR_SWATCH` places, with its 1 px frame.
+fn file_color(cv: &mut Canvas, cx: &Cx, id: NodeId, ink: &Ink, x: f32, y: f32, ty: &str) {
+    let tree = cx.tree;
+    let (Some(n), Ok(l)) = (tree.node_map.get(&id), tree.taffy.layout(id)) else { return };
+    let ty = ty.trim();
+    if ty.eq_ignore_ascii_case("file") {
+        let (button, status) = layout_core::file_label(n.attr("multiple").is_some());
+        let color = tree.paint_map.get(&id).and_then(|p| p.color).map(rgb).unwrap_or(crate::theme::PAGE_INK);
+        let lead = layout_core::Fonts::baseline_offset(cx.fonts, ink.sel, ink.size, 0.0);
+        let mut t = cx.fonts.0.borrow_mut();
+        let bw = t.measure(button, ink.sel, ink.size);
+        let (a, d) = t.extents(ink.sel, ink.size);
+        // AETHERFILEUAEDGES (SR459): as the host ring: the button sub-box at the input's content origin (the input has no UA
+        // edges), sized and centred by the button's OWN edges, layout_core's `push_button_edges`.
+        let (bb, bp) = layout_core::push_button_edges();
+        let (ox, oy) = (x + l.border.left + l.padding.left, y + l.border.top + l.padding.top);
+        let oh = (l.size.height - l.border.top - l.padding.top - l.border.bottom - l.padding.bottom).max(0.0);
+        let btn_bw = bw + bp.left + bb.left + bp.right + bb.right;
+        let btn = layout_core::caption_box(ox, oy, btn_bw, oh, bb, bp, bw, a, d);
+        let whole = layout_core::caption_box(x, y, l.size.width, l.size.height, l.border, l.padding, 0.0, a, d);
+        let base = btn.baseline(lead);
+        let (px0, py0, px1, py1) = whole.clip;
+        // AETHERFILEFACE (SR463): ButtonFace on the button sub-box only (the input paints none), this ring's push rule: no UA frame.
+        cv.fill(fl(ox), fl(oy), fl(ox + btn_bw) - fl(ox), fl(oy + oh) - fl(oy), rgb(layout_core::BUTTON_FACE));
+        for (sx, s) in [(btn.x, button), (ox + btn_bw + 4.0, status)] {
+            t.draw(sx, base, s, ink.sel, ink.size, color, &mut |gx, gy, cov| {
+                let (fx, fy) = (gx as f32, gy as f32);
+                if fx >= px0 && fx < px1 && fy >= py0 && fy < py1 {
+                    cv.blend(gx, gy, color, cov);
+                }
+            });
+        }
+    } else if ty.eq_ignore_ascii_case("color") {
+        let fill = n.attr("value").and_then(|v| layout_core::css::parse_color_str::<ImgHost>(&v)).unwrap_or((0, 0, 0));
+        let (ix, iy, frame) = layout_core::COLOR_SWATCH;
+        let (x0, y0) = (fl(x + ix), fl(y + iy));
+        let (x1, y1) = (fl(x + l.size.width - ix), fl(y + l.size.height - iy));
+        if x1 > x0 && y1 > y0 {
+            cv.fill(x0, y0, x1 - x0, y1 - y0, rgb(frame));
+            cv.fill(x0 + 1, y0 + 1, x1 - x0 - 2, y1 - y0 - 2, rgb(fill));
+        }
+    }
 }

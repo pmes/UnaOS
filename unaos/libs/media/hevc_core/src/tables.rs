@@ -262,3 +262,72 @@ pub const DEFAULT_8X8_INTER: [u8; 64] = [
     24, 24, 24, 24, 24, 24, 25, 25, 25, 25, 25, 25, 25, 28, 28, 28, 28, 28, 28, 33, 33, 33, 33, 33, 41, 41, 41, 41, 54, 54,
     54, 71, 71, 91,
 ];
+
+/// 8.5.3.3.3.1 Table 8-11: the luma interpolation filter coefficients fL[xFracL][i], taps at xInt + i - 3 (row 0 is
+/// the full-sample position, never filtered).
+pub const LUMA_FILTER: [[i32; 8]; 4] =
+    [[0, 0, 0, 64, 0, 0, 0, 0], [-1, 4, -10, 58, 17, -5, 1, 0], [-1, 4, -11, 40, 40, -11, 4, -1], [0, 1, -5, 17, 58, -10, 4, -1]];
+
+/// 8.5.3.3.3.2 Table 8-12: the chroma interpolation filter coefficients fC[xFracC][i] (eighth samples), taps at
+/// xInt + i - 1 (row 0 is the full-sample position).
+pub const CHROMA_FILTER: [[i32; 4]; 8] = [
+    [0, 64, 0, 0],
+    [-2, 58, 10, -2],
+    [-4, 54, 16, -2],
+    [-6, 46, 28, -4],
+    [-4, 36, 36, -4],
+    [-4, 28, 46, -6],
+    [-2, 16, 54, -4],
+    [-2, 10, 58, -2],
+];
+
+/// 8.5.3.2.4 Table 8-7: (l0CandIdx, l1CandIdx) for combIdx 0..11 of the combined bi-predictive merging candidates.
+pub const COMB_IDX: [(usize, usize); 12] = [(0, 1), (1, 0), (0, 2), (2, 0), (1, 2), (2, 1), (0, 3), (3, 0), (1, 3), (3, 1), (2, 3), (3, 2)];
+
+/// HEVCREXT (SR334) 8.4.3 Table 8-3: the 4:2:2 IntraPredModeC from the mode X of Table 8-2 (ChromaArrayType 2).
+pub const CHROMA_422_MODE: [u8; 35] =
+    [0, 1, 2, 2, 2, 2, 3, 5, 7, 8, 10, 11, 13, 15, 16, 18, 19, 20, 21, 22, 23, 23, 24, 24, 25, 25, 26, 27, 27, 28, 28, 29, 29, 30, 31];
+
+// HEVCREXTTOOLS (LEDGER SR345): the range extension's own syntax elements, in a SECOND table above `CTX_END` so the base
+// layout (and its contiguity KAT) stands; `cabac::initial_contexts` initialises both. sig_coeff_flag's transform_skip
+// contexts (ctxInc 42 / 43) are already the last two of the base sig_coeff_flag table.
+pub const EXPLICIT_RDPCM: usize = CTX_END;
+pub const EXPLICIT_RDPCM_DIR: usize = CTX_END + 2;
+pub const LOG2_RES_SCALE: usize = CTX_END + 4;
+pub const RES_SCALE_SIGN: usize = CTX_END + 12;
+pub const CU_CHROMA_QP_OFFSET_FLAG: usize = CTX_END + 14;
+pub const CU_CHROMA_QP_OFFSET_IDX: usize = CTX_END + 15;
+/// One past the last range extension slot.
+pub const REXT_CTX_END: usize = CTX_END + 16;
+
+pub const REXT_CTX_TABLES: &[CtxTable] = &[
+    // Table 9-x explicit_rdpcm_flag / explicit_rdpcm_dir_flag (ctxInc cIdx == 0 ? 0 : 1; P and B only).
+    CtxTable { name: "explicit_rdpcm_flag", slot: EXPLICIT_RDPCM, init: [&[], &[139, 139], &[139, 139]] },
+    CtxTable { name: "explicit_rdpcm_dir_flag", slot: EXPLICIT_RDPCM_DIR, init: [&[], &[139, 139], &[139, 139]] },
+    // log2_res_scale_abs_plus1 (ctxInc 4 * c + binIdx) and res_scale_sign_flag (ctxInc c).
+    CtxTable { name: "log2_res_scale_abs_plus1", slot: LOG2_RES_SCALE, init: [&[154; 8], &[154; 8], &[154; 8]] },
+    CtxTable { name: "res_scale_sign_flag", slot: RES_SCALE_SIGN, init: [&[154, 154], &[154, 154], &[154, 154]] },
+    // cu_chroma_qp_offset_flag and cu_chroma_qp_offset_idx (every bin one context).
+    CtxTable { name: "cu_chroma_qp_offset_flag", slot: CU_CHROMA_QP_OFFSET_FLAG, init: [&[154], &[154], &[154]] },
+    CtxTable { name: "cu_chroma_qp_offset_idx", slot: CU_CHROMA_QP_OFFSET_IDX, init: [&[154], &[154], &[154]] },
+];
+
+// HEVCREXTSCC (LEDGER SR357): the screen content coding extension's syntax elements, in a THIRD table above
+// `REXT_CTX_END` (the base and range extension layouts stand); `cabac::initial_contexts` initialises all three. Written
+// from H.265 v4 without the reference software: initValue 154 for every initType is a SPEC-CHECK for HEVCCONF-SCC.
+pub const PALETTE_MODE: usize = REXT_CTX_END;
+pub const TU_ACT: usize = REXT_CTX_END + 1;
+pub const PALETTE_COPY_ABOVE: usize = REXT_CTX_END + 2;
+pub const PALETTE_TRANSPOSE: usize = REXT_CTX_END + 3;
+pub const PALETTE_RUN_PREFIX: usize = REXT_CTX_END + 4;
+/// One past the last screen content coding slot.
+pub const SCC_CTX_END: usize = REXT_CTX_END + 12;
+
+pub const SCC_CTX_TABLES: &[CtxTable] = &[
+    CtxTable { name: "palette_mode_flag", slot: PALETTE_MODE, init: [&[154], &[154], &[154]] },
+    CtxTable { name: "tu_residual_act_flag", slot: TU_ACT, init: [&[154], &[154], &[154]] },
+    CtxTable { name: "copy_above_palette_indices_flag", slot: PALETTE_COPY_ABOVE, init: [&[154], &[154], &[154]] },
+    CtxTable { name: "palette_transpose_flag", slot: PALETTE_TRANSPOSE, init: [&[154], &[154], &[154]] },
+    // palette_run_prefix bins 0..4: ctxInc 0..7 (palette::run_ctx).
+    CtxTable { name: "palette_run_prefix", slot: PALETTE_RUN_PREFIX, init: [&[154; 8], &[154; 8], &[154; 8]] },
+];

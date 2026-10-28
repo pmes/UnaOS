@@ -30,6 +30,8 @@ pub mod cache;
 pub mod idb;
 pub mod locks;
 pub mod quota;
+#[cfg(test)]
+pub(crate) mod test_root;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -254,9 +256,7 @@ pub fn root_dir() -> PathBuf {
     if let Some(d) = root_override().lock().unwrap_or_else(|e| e.into_inner()).clone() {
         return d;
     }
-    directories::ProjectDirs::from("", "UnaOS", "Aether")
-        .map(|p| p.data_dir().to_path_buf())
-        .unwrap_or_else(|| PathBuf::from("/tmp/aether_storage"))
+    data_dir()
 }
 
 /// A storage key as one path component: `[A-Za-z0-9.-]` kept, every other byte `_XX` (hex), so two keys
@@ -345,11 +345,9 @@ pub fn worker_client_secure() -> Option<bool> {
 
 /// AETHERCACHE (SR88): the HTTP cache's disk tier — `http-cache/` under the same platform data directory the
 /// localStorage files live in (one file per cached response, written and bounded by gneiss_pal's HttpCache).
+/// AETHER-TESTROOT (SR355): under [`root_dir`], so a process that re-roots its storage re-roots this too.
 pub fn http_cache_dir() -> PathBuf {
-    directories::ProjectDirs::from("", "UnaOS", "Aether")
-        .map(|p| p.data_dir().to_path_buf())
-        .unwrap_or_else(|| PathBuf::from("/tmp/aether_storage"))
-        .join("http-cache")
+    root_dir().join("http-cache")
 }
 
 #[derive(Debug)]
@@ -371,9 +369,7 @@ impl LocalStorage {
     /// The store file for `origin` (sanitized to a file name) under the platform data directory.
     pub fn for_origin(origin: &str) -> Self {
         let sanitized = origin.replace(|c: char| !c.is_alphanumeric(), "_");
-        let dir = directories::ProjectDirs::from("", "UnaOS", "Aether")
-            .map(|p| p.data_dir().to_path_buf())
-            .unwrap_or_else(|| PathBuf::from("/tmp/aether_storage"));
+        let dir = data_dir();
         let _ = fs::create_dir_all(&dir);
         Self::new(dir.join(format!("{sanitized}.json")))
     }
@@ -406,4 +402,31 @@ impl LocalStorage {
             let _ = fs::write(&self.path, content);
         }
     }
+}
+
+/// AETHER-TESTROOT (LEDGER SR355): the platform data directory (`ProjectDirs` "UnaOS"/"Aether") — the ONE
+/// lookup the storage buckets, the HTTP cache and the localStorage files resolve through (via [`data_dir`]).
+pub fn platform_data_dir() -> PathBuf {
+    directories::ProjectDirs::from("", "UnaOS", "Aether")
+        .map(|p| p.data_dir().to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("/tmp/aether_storage"))
+}
+
+/// Where storage lives when no test re-rooted it: the platform data directory.
+#[cfg(not(test))]
+fn data_dir() -> PathBuf {
+    platform_data_dir()
+}
+
+/// A lib-test build's default storage directory: the test process's own ([`test_root::process_dir`]), so no
+/// `cargo test -p aether --lib` reaches the person's data directory, guard held or not.
+#[cfg(test)]
+fn data_dir() -> PathBuf {
+    test_root::process_dir()
+}
+
+/// AETHER-TESTROOT: empties the process-wide `localStorage` areas (`test_root::TestRoot` on acquire and drop).
+#[cfg(test)]
+pub(crate) fn reset_local_areas_for_test() {
+    local_areas().lock().unwrap_or_else(|e| e.into_inner()).clear();
 }

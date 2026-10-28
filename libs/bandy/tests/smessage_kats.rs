@@ -282,8 +282,21 @@ kat!(
         width: 2,
         height: 1,
         pixels: vec![1, 2, 3, 4, 5, 6, 7, 8],
+        damage: None, scroll: None,
     },
     r#"{"SurfaceBlit":{"url":"https://una.os/","width":2,"height":1,"pixels":[1,2,3,4,5,6,7,8]}}"#
+);
+// AETHERMACGPU-DAMAGE (SR320): a damage blit carries only the rect's rows (here row 1 of a 2x2 frame) and names the rect.
+kat!(
+    kat_surface_blit_damage,
+    SMessage::SurfaceBlit {
+        url: "viewport".to_string(),
+        width: 2,
+        height: 2,
+        pixels: vec![5, 6, 7, 8, 1, 2, 3, 4],
+        damage: Some(vec![(0, 1, 2, 1)]), scroll: None,
+    },
+    r#"{"SurfaceBlit":{"url":"viewport","width":2,"height":2,"pixels":[5,6,7,8,1,2,3,4],"damage":[[0,1,2,1]]}}"#
 );
 kat!(
     kat_play_media,
@@ -299,17 +312,17 @@ kat!(kat_browser_nav_forward, SMessage::BrowserNavForward, r#""BrowserNavForward
 kat!(kat_browser_nav_reload, SMessage::BrowserNavReload, r#""BrowserNavReload""#);
 kat!(
     kat_browser_scroll,
-    SMessage::BrowserScroll(0.0, 120.5),
+    SMessage::BrowserScroll(0.0, 120.5, 0),
     r#"{"BrowserScroll":[0.0,120.5]}"#
 );
 kat!(
     kat_browser_click,
-    SMessage::BrowserClick(12.5, 40.0),
+    SMessage::BrowserClick(12.5, 40.0, 0),
     r#"{"BrowserClick":[12.5,40.0]}"#
 );
 kat!(
     kat_browser_resize,
-    SMessage::BrowserResize(800, 600),
+    SMessage::BrowserResize(800, 600, 0),
     r#"{"BrowserResize":[800,600]}"#
 );
 kat!(
@@ -499,9 +512,64 @@ kat!(
 );
 kat!(
     kat_browser_button,
-    SMessage::BrowserButton { down: true, x: 12.5, y: 40.0 },
+    SMessage::BrowserButton { down: true, x: 12.5, y: 40.0, mods: 0, surface: 0 },
     r#"{"BrowserButton":{"down":true,"x":12.5,"y":40.0}}"#
 );
+kat!(
+    kat_browser_button_mods,
+    SMessage::BrowserButton { down: true, x: 12.5, y: 40.0, mods: bandy::MOD_SHIFT | bandy::MOD_ALT, surface: 0 },
+    r#"{"BrowserButton":{"down":true,"x":12.5,"y":40.0,"mods":5}}"#
+);
+// SURFACEID (SR332): a pointer message on a Surface other than the tree's first carries its number; 0 is omitted (the
+// goldens above are unchanged: a one-surface tree's wire is byte-identical).
+kat!(
+    kat_browser_button_surface,
+    SMessage::BrowserButton { down: true, x: 12.5, y: 40.0, mods: 0, surface: 2 },
+    r#"{"BrowserButton":{"down":true,"x":12.5,"y":40.0,"surface":2}}"#
+);
+kat!(
+    kat_browser_mouse_move_surface,
+    SMessage::BrowserMouseMove(1.0, 2.0, 3),
+    r#"{"BrowserMouseMove":[1.0,2.0,3]}"#
+);
+kat!(
+    kat_browser_mouse_move,
+    SMessage::BrowserMouseMove(1.0, 2.0, 0),
+    r#"{"BrowserMouseMove":[1.0,2.0]}"#
+);
+kat!(
+    kat_browser_scroll_surface,
+    SMessage::BrowserScroll(0.0, 120.5, 1),
+    r#"{"BrowserScroll":[0.0,120.5,1]}"#
+);
+kat!(
+    kat_browser_click_surface,
+    SMessage::BrowserClick(12.5, 40.0, 1),
+    r#"{"BrowserClick":[12.5,40.0,1]}"#
+);
+
+/// SURFACEID (SR332): the pre-SR332 forms read back as Surface 0, and `surface()` / `surface_mut()` name exactly the four
+/// pointer messages.
+#[test]
+fn surfaceid_old_forms_are_surface_zero() {
+    for old in [
+        r#"{"BrowserButton":{"down":false,"x":1.0,"y":2.0,"mods":1}}"#,
+        r#"{"BrowserMouseMove":[1.0,2.0]}"#,
+        r#"{"BrowserScroll":[0.0,3.0]}"#,
+        r#"{"BrowserClick":[4.0,5.0]}"#,
+    ] {
+        let m: SMessage = serde_json::from_str(old).expect(old);
+        assert_eq!(m.surface(), Some(0), "{old}");
+        assert_eq!(serde_json::to_string(&m).unwrap(), old);
+    }
+    let mut m = SMessage::BrowserMouseMove(1.0, 2.0, 0);
+    *m.surface_mut().unwrap() = 7;
+    assert_eq!(serde_json::to_string(&m).unwrap(), r#"{"BrowserMouseMove":[1.0,2.0,7]}"#);
+    for other in [SMessage::BrowserKey("a".into()), SMessage::BrowserText("a".into()), SMessage::Ping] {
+        assert_eq!(other.surface(), None);
+    }
+    assert!(SMessage::Ping.surface_mut().is_none());
+}
 
 /// A11YFACE (SR124): the `a11y` verb table reads every spelling back to its verb, a heading level, and nothing else.
 #[test]
@@ -1377,13 +1445,14 @@ fn smessage_variant_name(m: &SMessage) -> &'static str {
         SMessage::ReEmbedDone { .. } => "ReEmbedDone",
         SMessage::OpenDocument { .. } => "OpenDocument",
         SMessage::SurfaceBlit { .. } => "SurfaceBlit",
+        SMessage::SurfaceResend { .. } => "SurfaceResend",
         SMessage::PlayMedia { .. } => "PlayMedia",
         SMessage::BrowserNavBack => "BrowserNavBack",
         SMessage::BrowserNavForward => "BrowserNavForward",
         SMessage::BrowserNavReload => "BrowserNavReload",
-        SMessage::BrowserScroll(_, _) => "BrowserScroll",
-        SMessage::BrowserClick(_, _) => "BrowserClick",
-        SMessage::BrowserResize(_, _) => "BrowserResize",
+        SMessage::BrowserScroll(..) => "BrowserScroll",
+        SMessage::BrowserClick(..) => "BrowserClick",
+        SMessage::BrowserResize(..) => "BrowserResize",
         SMessage::BrowserKey(_) => "BrowserKey",
         SMessage::BrowserText(_) => "BrowserText",
         SMessage::BrowserPaste(_) => "BrowserPaste",
@@ -1443,7 +1512,7 @@ fn smessage_variant_name(m: &SMessage) -> &'static str {
         SMessage::ToggleMatrixNode(_) => "ToggleMatrixNode",
         SMessage::UiReady => "UiReady",
         SMessage::Tabula(_) => "Tabula",
-        SMessage::BrowserMouseMove(_, _) => "BrowserMouseMove",
+        SMessage::BrowserMouseMove(..) => "BrowserMouseMove",
         SMessage::BrowserCursorChanged(_) => "BrowserCursorChanged", // AETHERHOVER (SR67) fold: the exhaustive match gains the two motion variants
         SMessage::BrowserGo { .. } => "BrowserGo", // AETHERCHROME (SR84): the chrome's eighteen verbs
         SMessage::BrowserNavStop => "BrowserNavStop",
@@ -1484,6 +1553,14 @@ fn smessage_variant_name(m: &SMessage) -> &'static str {
         SMessage::BrowserA11yLines(_) => "BrowserA11yLines",
         SMessage::BrowserA11yPrefs { .. } => "BrowserA11yPrefs",
         SMessage::BrowserButton { .. } => "BrowserButton", // NLE2B (SR208): the press / release of a surface's button
+        SMessage::BrowserSave { .. } => "BrowserSave", // PDF4FORMSAVE (SR354): the save verb and its two answers
+        SMessage::BrowserSaved { .. } => "BrowserSaved",
+        SMessage::BrowserSaveFailed { .. } => "BrowserSaveFailed",
+        SMessage::BrowserSaveAs { .. } => "BrowserSaveAs", // SAVEDIALOG (SR364): Save As, and the face's panel ask / answer
+        SMessage::SavePanel { .. } => "SavePanel",
+        SMessage::SavePanelChose { .. } => "SavePanelChose",
+        SMessage::OpenPanel { .. } => "OpenPanel", // OPEN-DIALOG-ONE (SR386): the face's open panel ask / answer
+        SMessage::OpenPanelChose { .. } => "OpenPanelChose",
     }
 }
 
@@ -1624,3 +1701,123 @@ fn context_telemetry_ignores_injected_content_field() {
         "injected content must NOT populate the in-process Arc"
     );
 }
+
+// NLE2-SURFACERESIZE (LEDGER SR339): `BrowserResize` carries the resized Surface's number, omitted when 0.
+kat!(
+    kat_browser_resize_surface,
+    SMessage::BrowserResize(800, 600, 1),
+    r#"{"BrowserResize":[800,600,1]}"#
+);
+
+/// NLE2-SURFACERESIZE (SR339): the pre-SR339 resize reads back as Surface 0, writes back byte-identical, and is stamped
+/// through the one `surface_mut`.
+#[test]
+fn surfaceresize_old_form_is_surface_zero() {
+    let old = r#"{"BrowserResize":[800,600]}"#;
+    let mut m: SMessage = serde_json::from_str(old).expect(old);
+    assert!(matches!(m, SMessage::BrowserResize(800, 600, 0)), "{m:?}");
+    assert_eq!(m.surface(), Some(0));
+    assert_eq!(serde_json::to_string(&m).unwrap(), old);
+    *m.surface_mut().unwrap() = 2;
+    assert_eq!(serde_json::to_string(&m).unwrap(), r#"{"BrowserResize":[800,600,2]}"#);
+}
+
+// AETHERMACGPU-ENGINEDAMAGE (SR341): a blit of two rects carries each rect's rows in list order (pixel (1,0) of a 3x2
+// frame, then the 2x1 run at (0,1)); a face that lagged asks for its surface whole.
+kat!(
+    kat_surface_blit_damage_rects,
+    SMessage::SurfaceBlit {
+        url: "viewport".to_string(),
+        width: 3,
+        height: 2,
+        pixels: vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+        damage: Some(vec![(1, 0, 1, 1), (0, 1, 2, 1)]), scroll: None,
+    },
+    r#"{"SurfaceBlit":{"url":"viewport","width":3,"height":2,"pixels":[1,2,3,4,5,6,7,8,9,10,11,12],"damage":[[1,0,1,1],[0,1,2,1]]}}"#
+);
+kat!(
+    kat_surface_resend,
+    SMessage::SurfaceResend { url: "viewport".to_string() },
+    r#"{"SurfaceResend":{"url":"viewport"}}"#
+);
+// AETHERMACGPU-SCROLL (SR351): a scroll blit moves the kept 2x2 frame up one row, then row 1 lands (its rows only).
+kat!(
+    kat_surface_blit_scroll,
+    SMessage::SurfaceBlit {
+        url: "viewport".to_string(),
+        width: 2,
+        height: 2,
+        pixels: vec![5, 6, 7, 8, 1, 2, 3, 4],
+        damage: Some(vec![(0, 1, 2, 1)]),
+        scroll: Some((0, -1)),
+    },
+    r#"{"SurfaceBlit":{"url":"viewport","width":2,"height":2,"pixels":[5,6,7,8,1,2,3,4],"damage":[[0,1,2,1]],"scroll":[0,-1]}}"#
+);
+
+// PDF4FORMSAVE (SR354): the engine hands bytes + a suggested name to the shell; the shell answers the path, or why not.
+kat!(
+    kat_browser_save,
+    SMessage::BrowserSave { name: "form.pdf".to_string(), mime: "application/pdf".to_string(), bytes: vec![37, 80, 68, 70] },
+    r#"{"BrowserSave":{"name":"form.pdf","mime":"application/pdf","bytes":[37,80,68,70]}}"#
+);
+kat!(
+    kat_browser_saved,
+    SMessage::BrowserSaved { path: "/home/una/Downloads/form (1).pdf".to_string() },
+    r#"{"BrowserSaved":{"path":"/home/una/Downloads/form (1).pdf"}}"#
+);
+kat!(
+    kat_browser_save_failed,
+    SMessage::BrowserSaveFailed { why: "Permission denied".to_string() },
+    r#"{"BrowserSaveFailed":{"why":"Permission denied"}}"#
+);
+
+// SAVEDIALOG (SR364): Save As hands the shell the bytes; the shell asks the face for a path; the face answers it, or null (cancelled).
+kat!(
+    kat_browser_save_as,
+    SMessage::BrowserSaveAs { name: "form.pdf".to_string(), mime: "application/pdf".to_string(), bytes: vec![37, 80, 68, 70] },
+    r#"{"BrowserSaveAs":{"name":"form.pdf","mime":"application/pdf","bytes":[37,80,68,70]}}"#
+);
+kat!(
+    kat_save_panel,
+    SMessage::SavePanel { url: "viewport".to_string(), name: "form.pdf".to_string(), folder: None },
+    r#"{"SavePanel":{"url":"viewport","name":"form.pdf"}}"#
+);
+// SAVERECENT (SR391): the panel opens in the folder the last Save As chose (Principia's `aether.save.folder`).
+kat!(
+    kat_save_panel_folder,
+    SMessage::SavePanel { url: "viewport".to_string(), name: "form.pdf".to_string(), folder: Some("/home/p/Documents".to_string()) },
+    r#"{"SavePanel":{"url":"viewport","name":"form.pdf","folder":"/home/p/Documents"}}"#
+);
+kat!(
+    kat_save_panel_chose,
+    SMessage::SavePanelChose { url: "viewport".to_string(), path: Some("/home/una/form.pdf".to_string()) },
+    r#"{"SavePanelChose":{"url":"viewport","path":"/home/una/form.pdf"}}"#
+);
+kat!(
+    kat_save_panel_cancelled,
+    SMessage::SavePanelChose { url: "viewport".to_string(), path: None },
+    r#"{"SavePanelChose":{"url":"viewport","path":null}}"#
+);
+
+// OPEN-DIALOG-ONE (SR386): the owner asks the face for a file to open; the face answers it, or null (cancelled).
+kat!(
+    kat_open_panel,
+    SMessage::OpenPanel { url: "viewport".to_string(), filters: vec!["pdf".to_string()], folder: None },
+    r#"{"OpenPanel":{"url":"viewport","filters":["pdf"]}}"#
+);
+// SAVERECENTOPEN (SR403): the chrome's Ctrl/Cmd+O opens the panel in the recent folder (any file: no filters).
+kat!(
+    kat_open_panel_folder,
+    SMessage::OpenPanel { url: "viewport".to_string(), filters: vec![], folder: Some("/home/p/Documents".to_string()) },
+    r#"{"OpenPanel":{"url":"viewport","filters":[],"folder":"/home/p/Documents"}}"#
+);
+kat!(
+    kat_open_panel_chose,
+    SMessage::OpenPanelChose { url: "viewport".to_string(), path: Some("/home/una/doc.pdf".to_string()) },
+    r#"{"OpenPanelChose":{"url":"viewport","path":"/home/una/doc.pdf"}}"#
+);
+kat!(
+    kat_open_panel_cancelled,
+    SMessage::OpenPanelChose { url: "viewport".to_string(), path: None },
+    r#"{"OpenPanelChose":{"url":"viewport","path":null}}"#
+);

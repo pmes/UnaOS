@@ -532,7 +532,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
             }
         }
         "gap" | "grid-gap" => {
-            let parts: Vec<&str> = value.split_whitespace().collect();
+            let parts: Vec<&str> = split_top_level(value);
             let row = parts.first().and_then(|v| parse_length_percentage_str(v, cx));
             let col = parts.get(1).and_then(|v| parse_length_percentage_str(v, cx)).or(row);
             match (row, col) {
@@ -612,6 +612,14 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
             "collapse" => style.paint.border_collapse = Some(true),
             "separate" => style.paint.border_collapse = Some(false),
             _ => {}
+        },
+        // AETHERCAPTIONSIDECSS (SR462): caption-side, top | bottom only (Blink's parser); inherited, so inherit / unset /
+        // revert leave it unspecified and the reader walks up (tree.rs `caption_side_order`).
+        "caption-side" => match value {
+            "top" | "initial" => style.paint.caption_side = Some(false),
+            "bottom" => style.paint.caption_side = Some(true),
+            "inherit" | "unset" | "revert" => {}
+            other => H::record_css(&format!("caption-side:{}", clip(other))),
         },
         "border-spacing" => {
             if let Some(px) = split_top_level(value).first().and_then(|v| parse_px(v, cx)) {
@@ -721,7 +729,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
         "scroll-padding" | "scroll-padding-top" | "scroll-padding-right" | "scroll-padding-bottom" | "scroll-padding-left" => {
             let px = |v: &str| if v == "auto" { Some(0.0) } else { parse_px(v, cx).filter(|_| !v.ends_with('%')) };
             let mut sp = style.paint.scroll_padding.unwrap_or([0.0; 4]);
-            let parts: Vec<Option<f32>> = value.split_whitespace().map(px).collect();
+            let parts: Vec<Option<f32>> = split_top_level(value).into_iter().map(px).collect();
             let ok = if prop == "scroll-padding" {
                 match parts.as_slice() {
                     [Some(a)] => { sp = [*a; 4]; true }
@@ -748,7 +756,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
         "scroll-margin" | "scroll-margin-top" | "scroll-margin-right" | "scroll-margin-bottom" | "scroll-margin-left" => {
             let px = |v: &str| parse_px(v, cx).filter(|_| !v.ends_with('%'));
             let mut sm = style.paint.scroll_margin.unwrap_or([0.0; 4]);
-            let parts: Vec<Option<f32>> = value.split_whitespace().map(px).collect();
+            let parts: Vec<Option<f32>> = split_top_level(value).into_iter().map(px).collect();
             let ok = if prop == "scroll-margin" {
                 match parts.as_slice() {
                     [Some(a)] => { sm = [*a; 4]; true }
@@ -782,7 +790,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
             apply_declaration(&format!("scroll-margin-{side}"), value, style, cx);
         }
         "scroll-margin-block" | "scroll-margin-inline" => {
-            let parts: Vec<&str> = value.split_whitespace().collect();
+            let parts: Vec<&str> = split_top_level(value);
             let (a, b) = match parts.as_slice() {
                 [a] => (*a, *a),
                 [a, b] => (*a, *b),
@@ -949,9 +957,9 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
             style.paint.container_name = Some(names);
         }
         "container" => {
-            let (names, ty) = match value.split_once('/') {
-                Some((n, t)) => (n.trim(), Some(t.trim())),
-                None => (value, None),
+            let (names, ty) = match split_top_level_slash(value) { // AETHERCSSSPLITAUDIT (SR426): the depth-0 `/`
+                (n, Some(t)) => (n.trim(), Some(t.trim())),
+                (_, None) => (value, None),
             };
             apply_declaration("container-name", names, style, cx);
             apply_declaration("container-type", ty.unwrap_or("normal"), style, cx);
@@ -1017,7 +1025,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
         "columns" => {
             // `<'column-width'> || <'column-count'>`: an omitted half resets to auto.
             let (mut count, mut width, mut ok) = (None, None, true);
-            for part in value.split_whitespace() {
+            for part in split_top_level(value) {
                 if part == "auto" {
                     continue;
                 }
@@ -1164,12 +1172,22 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
         // paint field carries it down (see layout::remeasure); the justify
         // here is the immediate effect on this box's own row.
         "text-align" => match value {
-            "center" | "-webkit-center" | "-moz-center" => {
+            "center" => {
                 style.justify = Some(taffy::style::JustifyContent::CENTER);
                 style.paint.text_align = Some(1);
             }
-            // codes: 0 start, 1 center, 2 right, 3 end, 4 left — start/end resolve against `direction`
-            // (css-text-3 §6.1) where lines are placed (layout::inline).
+            // AETHERCENTERLAYOUT (SR421): -webkit-center (5) / -webkit-right (6) also place narrow block children
+            // (tree.rs `place_narrow_blocks`); the inline formatter reads them as center / right.
+            "-webkit-center" | "-moz-center" => {
+                style.justify = Some(taffy::style::JustifyContent::CENTER);
+                style.paint.text_align = Some(5);
+            }
+            "-webkit-right" | "-moz-right" => {
+                style.justify = Some(taffy::style::JustifyContent::END);
+                style.paint.text_align = Some(6);
+            }
+            // codes: 0 start, 1 center, 2 right, 3 end, 4 left, 5 -webkit-center, 6 -webkit-right — start/end
+            // resolve against `direction` (css-text-3 §6.1) where lines are placed (layout::inline).
             "right" => {
                 style.justify = Some(taffy::style::JustifyContent::END);
                 style.paint.text_align = Some(2);
@@ -1271,27 +1289,29 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
             // Components outside url(...) — the url may itself hold slashes
             // and keywords, so scan only what is left after removing it.
             let outside = strip_css_urls(value);
-            for part in outside.split_whitespace() {
+            // AETHERCSSSPLITAUDIT (SR426): the components, the position / size `/` and the size pair at paren depth 0
+            // (`rgb(0 0 0 / 50%)`, `calc(10px + 5px) 0 / calc(50% - 2px) auto` stay whole).
+            for part in split_top_level(&outside) {
                 if let Some(r) = parse_repeat(part) {
                     style.paint.bg_repeat = Some(r);
                 }
             }
-            if let Some((pos, size)) = outside.split_once('/') {
-                let pos: String = pos
-                    .split_whitespace()
+            if let (pos, Some(size)) = split_top_level_slash(&outside) {
+                let pos: String = split_top_level(pos)
+                    .into_iter()
                     .filter(|t| is_position_token(t))
                     .collect::<Vec<_>>()
                     .join(" ");
                 if !pos.is_empty() {
                     style.paint.bg_position = Some(pos);
                 }
-                let size = size.split_whitespace().take(2).collect::<Vec<_>>().join(" ");
+                let size = split_top_level(size).into_iter().take(2).collect::<Vec<_>>().join(" ");
                 if !size.is_empty() {
                     style.paint.bg_size = Some(size);
                 }
             } else {
-                let pos: String = outside
-                    .split_whitespace()
+                let pos: String = split_top_level(&outside)
+                    .into_iter()
                     .filter(|t| is_position_token(t))
                     .collect::<Vec<_>>()
                     .join(" ");
@@ -1300,7 +1320,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
                 }
             }
             let mut got_color = false;
-            for part in value.split_whitespace() {
+            for part in split_top_level(value) {
                 if part.starts_with("url(") { continue; }
                 // Non-colour shorthand components (position, repeat,
                 // attachment, origin/clip box, the `/` size separator) are
@@ -1416,15 +1436,12 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
                 }
                 rest = tail.trim_start();
             }
-            // size[/line-height] then the family list.
-            let (size_part, family) = match rest.find(char::is_whitespace) {
-                Some(i) => (&rest[..i], rest[i..].trim()),
-                None => (rest, ""),
-            };
-            let (size, line) = match size_part.split_once('/') {
-                Some((s, l)) => (s, Some(l)),
-                None => (size_part, None),
-            };
+            // size[/line-height] then the family list. AETHERCSSSPLITAUDIT (SR426): the size component and its `/`
+            // at paren depth 0 (`calc(10px + 2px) serif`, `12px/calc(10px + 6px) serif`).
+            let rest = rest.trim_start();
+            let size_part = split_top_level(rest).first().copied().unwrap_or("");
+            let family = rest[size_part.len()..].trim();
+            let (size, line) = split_top_level_slash(size_part);
             match parse_font_size(size, cx) {
                 Some(px) => style.paint.font_size = Some(px),
                 None => {
@@ -1714,9 +1731,11 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
         // At minimum, stops the property from appearing in unsupported ledgers.
         // css-backgrounds-3 §5.1: 1-4 corner radii (the elliptical `/`
         // part takes its horizontal radii), or one corner's longhand.
+        // AETHERRADIUSCALC (SR416): a radius may be a math function (css-values-4 §10): the components and the `/` are
+        // split at paren depth 0, so `calc(10px + 10px)` or `calc(20px / 2)` is one radius, not a dropped declaration.
         "border-radius" => {
-            let horiz = value.split('/').next().unwrap_or(value);
-            let parts: Option<Vec<f32>> = horiz.split_whitespace().map(|v| parse_radius(v, cx)).collect();
+            let horiz = split_top_level_slash(value).0;
+            let parts: Option<Vec<f32>> = split_top_level(horiz).into_iter().map(|v| parse_radius(v, cx)).collect();
             if let Some(p) = parts {
                 let r = match p.as_slice() {
                     [a] => [*a; 4],
@@ -1730,7 +1749,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
         }
         "border-top-left-radius" | "border-top-right-radius"
         | "border-bottom-right-radius" | "border-bottom-left-radius" => {
-            if let Some(v) = value.split_whitespace().next().and_then(|v| parse_radius(v, cx)) {
+            if let Some(v) = split_top_level(value).first().and_then(|v| parse_radius(v, cx)) {
                 let i = match prop {
                     "border-top-left-radius" => 0,
                     "border-top-right-radius" => 1,
@@ -2362,7 +2381,7 @@ pub fn parse_clip_path(value: &str, cx: &ParseCx) -> Option<Option<ClipShape>> {
             };
             let r = parse_sides(ins, |p| len_pct(p, cx))?;
             let rad = match round {
-                Some(r) => len_pct(split_top_level(r.split('/').next().unwrap_or(r)).first()?, cx)?,
+                Some(r) => len_pct(split_top_level(split_top_level_slash(r).0).first()?, cx)?, // AETHERCSSSPLITAUDIT (SR426)
                 None => [0.0, 0.0],
             };
             ClipShape::Inset([r.top, r.right, r.bottom, r.left], rad)
@@ -2516,6 +2535,10 @@ fn is_position_token(t: &str) -> bool {
     if t == "0" {
         return true;
     }
+    // AETHERCSSSPLITAUDIT (SR426): a math function is a <length-percentage> (css-values-4 §10).
+    if let Some(open) = t.find('(') {
+        return t.ends_with(')') && matches!(t[..open].to_ascii_lowercase().as_str(), "calc" | "min" | "max" | "clamp");
+    }
     for unit in ["px", "em", "rem", "pt", "%"] {
         if let Some(n) = t.strip_suffix(unit) {
             return !n.is_empty() && n.trim().parse::<f32>().is_ok();
@@ -2557,7 +2580,7 @@ pub fn merge_paint<H: Host>(dst: &mut PaintStyle<H>, src: &PaintStyle<H>) {
         nowrap, family, italic, text_transform, border_width, bg_repeat, text_hidden,
         mask_repeat, text_align, object_fit, flex_container, border_style, radius,
         white_space, word_break, overflow_wrap, letter_spacing, line_through, display_kind,
-        ua_vmargin, border_collapse, border_spacing, has_width, position_kind, z_index,
+        ua_vmargin, border_collapse, caption_side, border_spacing, has_width, position_kind, z_index,
         list_item, list_style, vertical_align, float, opacity, font_size_rel, table_fixed, bg_alpha, border_alpha,
         stretch, word_spacing, rtl, clear, tf_translate, tf_rotate, tf_scale, transform_origin, inset_px,
         overflow, col_count, col_width, col_gap, col_fill, col_rule_width, col_rule_style, col_rule_color,
@@ -3271,6 +3294,22 @@ pub fn split_top_level(value: &str) -> Vec<&str> {
     out
 }
 
+/// AETHERRADIUSCALC (SR416): splits a value at its first `/` outside parentheses (css-backgrounds-3 §5.1
+/// `border-radius: <radii> / <radii>`): `calc(20px / 2) 4px / 2px` is (`calc(20px / 2) 4px `, Some(` 2px`)), never
+/// a cut inside the function. The paren-depth walk is `split_top_level`'s; None when the value has no top-level `/`.
+pub fn split_top_level_slash(value: &str) -> (&str, Option<&str>) {
+    let mut depth = 0i32;
+    for (i, c) in value.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            '/' if depth == 0 => return (&value[..i], Some(&value[i + 1..])),
+            _ => {}
+        }
+    }
+    (value, None)
+}
+
 /// [top, right, bottom, left] index of a `*-top`/`*-right`/... longhand.
 fn side_index(prop: &str) -> usize {
     if prop.ends_with("-top") { 0 } else if prop.ends_with("-right") { 1 } else if prop.ends_with("-bottom") { 2 } else { 3 }
@@ -3311,7 +3350,7 @@ pub fn parse_flex_shorthand(value: &str, cx: &ParseCx) -> Option<(f32, f32, Dime
     }
     let mut nums: Vec<f32> = Vec::new();
     let mut basis: Option<Dimension> = None;
-    for part in value.split_whitespace() {
+    for part in split_top_level(value) {
         if basis.is_none() && nums.len() < 2 {
             if let Ok(n) = part.parse::<f32>() {
                 nums.push(n);

@@ -1402,6 +1402,7 @@ pub const SECRET_SHAPES: &[(&str, &[&str], usize)] = &[
     ("adduser", &[], 2),
     ("passwd", &[], 1),
     ("su", &[], 1),
+    ("tests", &["wifijoin"], 3), // MT7925S10 (zenbook-ledger Z55): `tests wifijoin <ssid> <passphrase>` keeps the SSID readable
 ];
 
 /// The first word as the table reads it: last path component, ASCII-lowercased, a trailing `.elf` cut.
@@ -1494,6 +1495,8 @@ pub const REDACT_KAT: &[(&str, Option<&str>)] = &[
     ("passwd s3cret", Some("passwd ***")),
     ("adduser peter pw", Some("adduser peter ***")),
     ("ls /home/peter", None),
+    ("tests wifijoin UnaNet hunter22", Some("tests wifijoin UnaNet ***")),
+    ("tests wifijoin UnaNet", None),
 ];
 
 /// Run [`REDACT_KAT`] plus the prefix rule; returns `(passed, total)`.

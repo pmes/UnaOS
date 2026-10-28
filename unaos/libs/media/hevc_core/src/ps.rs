@@ -95,6 +95,9 @@ pub struct ProfileTierLevel {
     pub general_level_idc: u8,
     /// sub_layer_level_idc per sub-layer, when present.
     pub sub_layer_level_idc: Vec<Option<u8>>,
+    /// HEVCLEVELLINE (SR368): the 43 general constraint / reserved bits and general_inbld_flag, read MSB first (bit 43 =
+    /// general_max_12bit_constraint_flag); [`ProfileTierLevel::names`] reads the A.3 profile from them.
+    pub general_constraint_flags: u64,
 }
 
 pub fn parse_ptl(r: &mut BitReader, profile_present: bool, max_sub_layers_minus1: u32) -> ProfileTierLevel {
@@ -108,7 +111,7 @@ pub fn parse_ptl(r: &mut BitReader, profile_present: bool, max_sub_layers_minus1
         p.general_interlaced_source_flag = r.flag();
         p.general_non_packed_constraint_flag = r.flag();
         p.general_frame_only_constraint_flag = r.flag();
-        r.skip(44); // the 43 constraint / reserved bits and general_inbld_flag / reserved
+        p.general_constraint_flags = ((r.u(32) as u64) << 12) | r.u(12) as u64; // the 43 constraint / reserved bits and general_inbld_flag / reserved (HEVCLEVELLINE SR368)
     }
     p.general_level_idc = r.u(8) as u8;
     let n = max_sub_layers_minus1 as usize;
@@ -665,6 +668,10 @@ pub struct Sps {
     pub multilayer_extension_flag: bool,
     pub extension_3d_flag: bool,
     pub scc_extension_flag: bool,
+    /// HEVCREXTSCC (SR357): sps_scc_extension() (7.3.2.2.3); all off without it.
+    pub scc: SpsScc,
+    /// HEVCREXTSCC (SR357): the SCC body follows a 3D extension body this parser does not read (refused by name).
+    pub scc_unparsed: bool,
 }
 
 impl Sps {
@@ -684,9 +691,26 @@ impl Sps {
     pub fn chroma_array_type(&self) -> u32 {
         if self.separate_colour_plane_flag { 0 } else { self.chroma_format_idc }
     }
+    /// HEVCREXT (SR334): the Picture / Frame chroma format of ChromaArrayType 0..3 (HEVCREXTTOOLS SR345: 0 is
+    /// monochrome; None: separate colour planes).
+    pub fn chroma_format(&self) -> Option<h264_core::ChromaFormat> {
+        match self.chroma_array_type() {
+            0 if !self.separate_colour_plane_flag => Some(h264_core::ChromaFormat::Mono),
+            1 => Some(h264_core::ChromaFormat::Yuv420),
+            2 => Some(h264_core::ChromaFormat::Yuv422),
+            3 => Some(h264_core::ChromaFormat::Yuv444),
+            _ => None,
+        }
+    }
     /// The ordering of the highest sub-layer (HighestTid = sps_max_sub_layers_minus1).
     pub fn highest_ordering(&self) -> Ordering {
         self.ordering.last().copied().unwrap_or_default()
+    }
+    /// HEVCREXTTOOLS (SR345): log2TransformRange of component `c` (7.4.3.2.2): Max(15, BitDepth + 6) with
+    /// extended_precision_processing_flag, else 15; CoeffMin / CoeffMax are -(1 << it) / (1 << it) - 1.
+    pub fn log2_transform_range(&self, c: usize) -> u32 {
+        let bd = if c == 0 { self.bit_depth_luma } else { self.bit_depth_chroma };
+        if self.range_ext.extended_precision_processing_flag { (bd + 6).max(15) } else { 15 }
     }
 }
 
@@ -786,8 +810,18 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps> {
                 cabac_bypass_alignment_enabled_flag: f[8],
             };
         }
-        // The multilayer / 3D / SCC extension bodies and sps_extension_data_flag follow; the base layer needs none
-        // of them (SCC is refused at activation).
+        // HEVCREXTSCC (SR357): sps_multilayer_extension() is one flag (inter_view_mv_vert_constraint_flag); the SCC body
+        // follows it unless a 3D body (not read) comes first. sps_extension_data_flag is not read.
+        if s.multilayer_extension_flag {
+            r.skip(1);
+        }
+        if s.scc_extension_flag {
+            if s.extension_3d_flag {
+                s.scc_unparsed = true;
+            } else {
+                s.scc = parse_sps_scc(&mut r, &s)?;
+            }
+        }
         return done(&r, s);
     }
     done(&r, s)
@@ -859,6 +893,10 @@ pub struct Pps {
     pub multilayer_extension_flag: bool,
     pub extension_3d_flag: bool,
     pub scc_extension_flag: bool,
+    /// HEVCREXTSCC (SR357): pps_scc_extension() (7.3.2.3.3); all off without it.
+    pub scc: PpsScc,
+    /// HEVCREXTSCC (SR357): the SCC body follows multilayer / 3D bodies this parser does not read (refused by name).
+    pub scc_unparsed: bool,
 }
 
 pub fn parse_pps(rbsp: &[u8]) -> Result<Pps> {
@@ -949,6 +987,14 @@ pub fn parse_pps(rbsp: &[u8]) -> Result<Pps> {
             }
             e.log2_sao_offset_scale_luma = r.ue();
             e.log2_sao_offset_scale_chroma = r.ue();
+        }
+        // HEVCREXTSCC (SR357): the SCC body, unless multilayer / 3D bodies (not read) come first.
+        if p.scc_extension_flag {
+            if p.multilayer_extension_flag || p.extension_3d_flag {
+                p.scc_unparsed = true;
+            } else {
+                p.scc = parse_pps_scc(&mut r)?;
+            }
         }
     }
     done(&r, p)
@@ -1076,5 +1122,211 @@ impl Geometry {
     /// The raster CTB address holding luma sample (x, y).
     pub fn ctb_rs(&self, x: u32, y: u32) -> u32 {
         (y >> self.log2_ctb) * self.width_ctbs + (x >> self.log2_ctb)
+    }
+}
+
+/// HEVCDEPTH-CORE (LEDGER SR304; HEVCPAL SR215 wrote it in gneiss_pal): the reorder depth of an hvcC
+/// (HEVCDecoderConfigurationRecord, ISO/IEC 14496-15 8.3.3.1) — its first SPS's `sps_max_num_reorder_pics` at the highest
+/// sub-layer ([`Sps::highest_ordering`]), what a demuxer's derived decode times take (h264_core's twin is
+/// `h264_core::ps::avcc_reorder_depth`). `None` when the record or its SPS does not parse.
+pub fn hvcc_reorder_depth(hvcc: &[u8]) -> Option<u32> {
+    let cfg = crate::nal::parse_hvcc(hvcc).ok()?;
+    let nal = cfg.units().find(|u| u.first().is_some_and(|b| (b >> 1) & 0x3f == crate::nal::SPS_NUT))?;
+    let mut rbsp = Vec::new();
+    crate::nal::unescape(nal.get(2..)?, &mut rbsp);
+    let sps = parse_sps(&rbsp).ok()?;
+    Some(sps.highest_ordering().max_num_reorder_pics)
+}
+
+// ---------------------------------------------------------------- screen content coding extension (HEVCREXTSCC)
+
+/// HEVCREXTSCC (LEDGER SR357): sps_scc_extension() (7.3.2.2.3).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SpsScc {
+    pub curr_pic_ref_enabled_flag: bool,
+    pub palette_mode_enabled_flag: bool,
+    pub palette_max_size: u32,
+    pub delta_palette_max_predictor_size: u32,
+    /// sps_palette_predictor_initializer[comp][i] (None: sps_palette_predictor_initializers_present_flag 0).
+    pub palette_predictor_initializers: Option<[Vec<u16>; 3]>,
+    /// 0: quarter-sample vectors; 1: integer vectors; 2: use_integer_mv_flag per slice.
+    pub motion_vector_resolution_control_idc: u32,
+    pub intra_boundary_filtering_disabled_flag: bool,
+}
+
+impl SpsScc {
+    /// PaletteMaxPredictorSize (7-xx): palette_max_size + delta_palette_max_predictor_size.
+    pub fn palette_max_predictor_size(&self) -> u32 {
+        self.palette_max_size + self.delta_palette_max_predictor_size
+    }
+}
+
+fn parse_sps_scc(r: &mut BitReader, s: &Sps) -> Result<SpsScc> {
+    let mut e = SpsScc { curr_pic_ref_enabled_flag: r.flag(), palette_mode_enabled_flag: r.flag(), ..Default::default() };
+    if e.palette_mode_enabled_flag {
+        e.palette_max_size = ue_max(r, 64, "palette_max_size")?;
+        e.delta_palette_max_predictor_size = ue_max(r, 128, "delta_palette_max_predictor_size")?;
+        if e.palette_max_predictor_size() > 128 {
+            return Err(Error::Invalid("PaletteMaxPredictorSize above 128"));
+        }
+        if r.flag() {
+            let n = ue_max(r, 127, "sps_num_palette_predictor_initializers_minus1")? + 1;
+            if n > e.palette_max_predictor_size() {
+                return Err(Error::Invalid("sps_num_palette_predictor_initializers"));
+            }
+            let mut init: [Vec<u16>; 3] = Default::default();
+            let ncomp = if s.chroma_format_idc == 0 { 1 } else { 3 };
+            for (c, row) in init.iter_mut().enumerate().take(ncomp) {
+                let bd = if c == 0 { s.bit_depth_luma } else { s.bit_depth_chroma };
+                for _ in 0..n {
+                    row.push(r.u(bd) as u16);
+                }
+            }
+            e.palette_predictor_initializers = Some(init);
+        }
+    }
+    e.motion_vector_resolution_control_idc = r.u(2);
+    if e.motion_vector_resolution_control_idc == 3 {
+        return Err(Error::Invalid("motion_vector_resolution_control_idc"));
+    }
+    e.intra_boundary_filtering_disabled_flag = r.flag();
+    Ok(e)
+}
+
+/// HEVCREXTSCC (LEDGER SR357): pps_scc_extension() (7.3.2.3.3).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PpsScc {
+    pub curr_pic_ref_enabled_flag: bool,
+    pub residual_adaptive_colour_transform_enabled_flag: bool,
+    pub slice_act_qp_offsets_present_flag: bool,
+    /// PpsActQpOffsetY / Cb / Cr: pps_act_y_qp_offset_plus5 - 5, pps_act_cb_qp_offset_plus5 - 5,
+    /// pps_act_cr_qp_offset_plus3 - 3.
+    pub act_qp_offset: [i32; 3],
+    /// pps_palette_predictor_initializer[comp][i] (None: pps_palette_predictor_initializers_present_flag 0; Some with
+    /// empty rows: pps_num_palette_predictor_initializers 0, an empty predictor).
+    pub palette_predictor_initializers: Option<[Vec<u16>; 3]>,
+    pub monochrome_palette_flag: bool,
+    /// (luma_bit_depth_entry, chroma_bit_depth_entry) of the initializers; (0, 0) without them.
+    pub entry_bit_depth: (u32, u32),
+}
+
+fn parse_pps_scc(r: &mut BitReader) -> Result<PpsScc> {
+    let mut e = PpsScc { curr_pic_ref_enabled_flag: r.flag(), residual_adaptive_colour_transform_enabled_flag: r.flag(), ..Default::default() };
+    if e.residual_adaptive_colour_transform_enabled_flag {
+        e.slice_act_qp_offsets_present_flag = r.flag();
+        let y = r.se() - 5;
+        let cb = r.se() - 5;
+        let cr = r.se() - 3;
+        e.act_qp_offset = [y, cb, cr];
+        if e.act_qp_offset.iter().any(|v| !(-12..=12).contains(v)) {
+            return Err(Error::Invalid("PpsActQpOffset outside -12..12"));
+        }
+    }
+    if r.flag() {
+        let n = ue_max(r, 128, "pps_num_palette_predictor_initializers")?;
+        let mut init: [Vec<u16>; 3] = Default::default();
+        if n > 0 {
+            e.monochrome_palette_flag = r.flag();
+            let bdy = ue_max(r, 8, "luma_bit_depth_entry_minus8")? + 8;
+            let bdc = if e.monochrome_palette_flag { 0 } else { ue_max(r, 8, "chroma_bit_depth_entry_minus8")? + 8 };
+            e.entry_bit_depth = (bdy, bdc);
+            let ncomp = if e.monochrome_palette_flag { 1 } else { 3 };
+            for (c, row) in init.iter_mut().enumerate().take(ncomp) {
+                for _ in 0..n {
+                    row.push(r.u(if c == 0 { bdy } else { bdc }) as u16);
+                }
+            }
+        }
+        e.palette_predictor_initializers = Some(init);
+    }
+    Ok(e)
+}
+
+// ---------------------------------------------------------------- profile names (A.3) — HEVCLEVELLINE (SR368)
+
+/// HEVCLEVELLINE (LEDGER SR368, HEVC-LEVEL-LINE): a profile_tier_level as the Player's info line names it — the A.3
+/// profile (A.3's name with spaces and ':' removed), the tier and the level (major, minor; general_level_idc is 30 times
+/// the level number, 255 is level 8.5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Ptl {
+    pub profile: &'static str,
+    /// "main" or "high".
+    pub tier: &'static str,
+    pub level: (u8, u8),
+}
+
+impl ProfileTierLevel {
+    /// general_max_12bit_constraint_flag (k 0) .. general_lower_bit_rate_constraint_flag (k 8), then
+    /// general_max_14bit_constraint_flag (k 9) for the profiles that carry it.
+    fn constraint(&self, k: u32) -> bool {
+        (self.general_constraint_flags >> (43 - k)) & 1 != 0
+    }
+
+    /// The A.3 names: general_profile_idc (0: the lowest general_profile_compatibility_flag set), the format range
+    /// extensions (4), high throughput (5) and screen content (9, 11) profiles by Table A.2's constraint flags
+    /// (max_12bit, max_10bit, max_8bit, max_422chroma, max_420chroma, max_monochrome, intra, one_picture_only); a
+    /// combination no row names keeps the family's name ("RExt", "HighThroughput", "SCC", "SCC-HT").
+    pub fn names(&self) -> Ptl {
+        let compat = |j: u32| self.general_profile_compatibility_flags & (1 << (31 - j)) != 0;
+        let idc = if self.general_profile_idc != 0 { self.general_profile_idc as u32 } else { (1..32).find(|&j| compat(j)).unwrap_or(0) };
+        let f: [bool; 8] = core::array::from_fn(|k| self.constraint(k as u32));
+        let b = |s: &str| -> bool { s.bytes().zip(f.iter()).all(|(c, &v)| (c == b'1') == v) };
+        let pick = |rows: &[(&'static str, &'static str)], other: &'static str| rows.iter().find(|r| b(r.0)).map_or(other, |r| r.1);
+        let profile = match idc {
+            1 => "Main",
+            2 if f[7] => "Main10Still",
+            2 => "Main10",
+            3 => "MainStill",
+            4 => pick(
+                &[
+                    ("11111100", "Monochrome"),
+                    ("11011100", "Monochrome10"),
+                    ("10011100", "Monochrome12"),
+                    ("00011100", "Monochrome16"),
+                    ("10011000", "Main12"),
+                    ("11010000", "Main422_10"),
+                    ("10010000", "Main422_12"),
+                    ("11100000", "Main444"),
+                    ("11000000", "Main444_10"),
+                    ("10000000", "Main444_12"),
+                    ("11111010", "MainIntra"),
+                    ("11011010", "Main10Intra"),
+                    ("10011010", "Main12Intra"),
+                    ("11010010", "Main422_10Intra"),
+                    ("10010010", "Main422_12Intra"),
+                    ("11100010", "Main444Intra"),
+                    ("11000010", "Main444_10Intra"),
+                    ("10000010", "Main444_12Intra"),
+                    ("00000010", "Main444_16Intra"),
+                    ("11100011", "Main444Still"),
+                    ("00000011", "Main444_16Still"),
+                ],
+                "RExt",
+            ),
+            5 => pick(
+                &[("11100000", "HighThroughput444"), ("11000000", "HighThroughput444_10"), ("00000000", "HighThroughput444_14"), ("00000010", "HighThroughput444_16Intra")],
+                "HighThroughput",
+            ),
+            6 => "MultiviewMain",
+            7 => "ScalableMain",
+            8 => "3DMain",
+            9 => pick(
+                &[("11111000", "ScreenExtendedMain"), ("11011000", "ScreenExtendedMain10"), ("11100000", "ScreenExtendedMain444"), ("11000000", "ScreenExtendedMain444_10")],
+                "SCC",
+            ),
+            10 => "ScalableRExt",
+            11 => pick(
+                &[
+                    ("11100000", "ScreenExtendedHighThroughput444"),
+                    ("11000000", "ScreenExtendedHighThroughput444_10"),
+                    ("00000000", "ScreenExtendedHighThroughput444_14"),
+                ],
+                "SCC-HT",
+            ),
+            _ => "Unknown",
+        };
+        let l = self.general_level_idc;
+        let level = if l == 255 { (8, 5) } else { (l / 30, (l % 30) / 3) };
+        Ptl { profile, tier: if self.general_tier_flag { "high" } else { "main" }, level }
     }
 }

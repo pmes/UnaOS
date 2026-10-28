@@ -52,19 +52,19 @@ fn coalesce(batch: Vec<SMessage>) -> Vec<SMessage> {
     for (i, msg) in batch.into_iter().enumerate() {
         match msg {
             SMessage::BrowserResize(..) if Some(i) != last_resize => continue,
-            SMessage::BrowserScroll(dx, dy) => {
-                if let Some(SMessage::BrowserScroll(px, py)) = out.last_mut() {
+            SMessage::BrowserScroll(dx, dy, s) => {
+                if let Some(SMessage::BrowserScroll(px, py, _)) = out.last_mut() {
                     *px += dx;
                     *py += dy;
                 } else {
-                    out.push(SMessage::BrowserScroll(dx, dy));
+                    out.push(SMessage::BrowserScroll(dx, dy, s));
                 }
             }
-            SMessage::BrowserMouseMove(x, y) => {
-                if let Some(SMessage::BrowserMouseMove(px, py)) = out.last_mut() {
-                    (*px, *py) = (x, y);
+            SMessage::BrowserMouseMove(x, y, s) => {
+                if let Some(SMessage::BrowserMouseMove(px, py, ps)) = out.last_mut() {
+                    (*px, *py, *ps) = (x, y, s);
                 } else {
-                    out.push(SMessage::BrowserMouseMove(x, y));
+                    out.push(SMessage::BrowserMouseMove(x, y, s));
                 }
             }
             other => out.push(other),
@@ -226,6 +226,10 @@ struct Tab {
     devtools: chrome::devtools::DevTools,
     window: (u32, u32),
     last_lines: Option<Vec<String>>,
+    /// AETHERMACGPU-DAMAGE (SR320): the frame last blitted, so the next blit carries only its changed rows.
+    sent: quartzite::tetra::SurfaceDamage,
+    /// AETHERMACGPU-ENGINEDAMAGE (SR341): what that frame was painted at (`aether::render::present_damage`).
+    painted: aether::render::PresentMark,
 }
 
 impl Tab {
@@ -254,6 +258,8 @@ impl Tab {
             devtools: chrome::devtools::DevTools::new(),
             window,
             last_lines: None,
+            sent: quartzite::tetra::SurfaceDamage::default(),
+            painted: aether::render::PresentMark::default(),
         }
     }
 
@@ -275,14 +281,14 @@ impl Tab {
             if self.engine.tick() {
                 let damages = self.engine.render_frame();
                 if !damages.is_empty() {
-                    self.blit();
+                    self.blit(&damages);
                 }
             }
             return;
         }
         let (damage, lines) = chrome::host::devtools_frame(&mut self.engine, &self.devtools_chrome, &mut self.devtools, self.window);
-        if damage.is_some_and(|d| !d.is_empty()) {
-            self.blit();
+        if let Some(d) = damage.filter(|d| !d.is_empty()) {
+            self.blit(&d);
         }
         if let Some(lines) = lines {
             if self.is_active() && self.last_lines.as_ref() != Some(&lines) {
@@ -307,10 +313,19 @@ impl Tab {
         let _ = self.reports.send(r);
     }
 
-    fn blit(&self) {
+    /// AETHERMACGPU-ENGINEDAMAGE (SR341): `damages` is the paint's own list (`render_frame`'s, CSS px): mapped to the
+    /// presented frame's device px (`present_damage`: whole after a scroll), the blit carries only those rects' rows (the
+    /// row diff when they cover most of the frame; whole on the tetra rules).
+    fn blit(&mut self, damages: &[(u32, u32, u32, u32)]) {
         if self.is_active() {
-            let (width, height, pixels) = self.engine.present_rgba();
-            self.bus.fire(SMessage::SurfaceBlit { url: "viewport".into(), width, height, pixels });
+            // AETHERMACGPU-PRESENTRECTS / -SCROLL (SR351): the rects (and a viewport scroll's copy pair) are converted
+            // into the frame `sent` keeps, never the whole device frame; the whole frame only on the tetra rules.
+            let (rects, scroll) = aether::render::present_scroll(&self.engine, damages, &mut self.painted);
+            let (width, height) = self.engine.device_size();
+            let engine = &self.engine;
+            if let Some(m) = self.sent.present("viewport", width, height, &rects, scroll, |f, l| engine.present_rects(f, l), || engine.present_rgba()) {
+                self.bus.fire(m);
+            }
         }
     }
 
@@ -322,7 +337,8 @@ impl Tab {
         let (w, h) = (self.engine.width, self.engine.height);
         self.engine.damage_rects.push((0, 0, w, h));
         let _ = self.engine.render_frame();
-        self.blit();
+        self.sent.forget(); // AETHERMACGPU-DAMAGE (SR320): the face holds another tab's frame: this one goes whole
+        self.blit(&[(0, 0, w, h)]);
         self.bus.fire(SMessage::BrowserUrlChanged(self.engine.current_url()));
         self.bus.fire(SMessage::BrowserTitleChanged(self.engine.title.clone()));
         if let Some((width, height, rgba)) = self.favicon.borrow().clone() {
@@ -475,7 +491,8 @@ impl Tab {
                 }));
             }
             SMessage::Facet(FacetCommand::ImageRendered { receipt_id, width, height, rgba, .. }) if receipt_id >> 56 == FACET_RECEIPT_TAG >> 56 => {
-                self.show(SMessage::SurfaceBlit { url: "viewport".into(), width, height, pixels: rgba });
+                self.sent.forget(); // AETHERMACGPU-DAMAGE (SR320): the image replaces the face's frame; the next page blit goes whole
+                self.show(SMessage::SurfaceBlit { url: "viewport".into(), width, height, pixels: rgba, damage: None, scroll: None });
                 if let Some(u) = self.facet_url.take() {
                     self.show(SMessage::BrowserUrlChanged(u.clone()));
                     self.report(TabReport::Url(self.id, u));
@@ -507,11 +524,11 @@ impl Tab {
             // A stop with no load in flight has nothing to stop.
             SMessage::BrowserNavStop => {}
             // The chrome speaks device pixels; the page lays out in CSS pixels (zoom).
-            SMessage::BrowserScroll(dx, dy) => {
+            SMessage::BrowserScroll(dx, dy, _) => {
                 let (dx, dy) = self.engine.to_css(dx, dy);
-                self.engine.handle_event(aether::api::events::Event::Scroll(dx, dy));
+                if !self.engine.pdf_wheel(dx, dy) { self.engine.handle_event(aether::api::events::Event::Scroll(dx, dy)); } // PDF4-THUMBSCROLL (SR374): a wheel over the PDF strip scrolls the strip
             }
-            SMessage::BrowserClick(x, y) => {
+            SMessage::BrowserClick(x, y, _) => {
                 let (x, y) = self.engine.to_css(x, y);
                 self.engine.handle_event(aether::api::events::Event::MouseDown(x, y));
                 self.engine.handle_event(aether::api::events::Event::MouseUp(x, y));
@@ -521,7 +538,7 @@ impl Tab {
             ref m @ (SMessage::MediaOpened { .. } | SMessage::MediaFrame { .. } | SMessage::MediaEnded { .. } | SMessage::MediaError { .. }) => {
                 self.engine.on_media_message(m);
             }
-            SMessage::BrowserResize(w, h) => {
+            SMessage::BrowserResize(w, h, _) => {
                 self.window = (w, h);
                 self.fit_page();
             }
@@ -541,7 +558,7 @@ impl Tab {
             SMessage::BrowserKey(key) => self.engine.handle_event(aether::api::events::Event::KeyDown(key)),
             SMessage::BrowserText(text) => self.engine.handle_event(aether::api::events::Event::Text(text)),
             // SR67: hover, `:hover` re-style, the page's mouse events.
-            SMessage::BrowserMouseMove(x, y) => {
+            SMessage::BrowserMouseMove(x, y, _) => {
                 let (x, y) = self.engine.to_css(x, y);
                 self.engine.handle_event(aether::api::events::Event::MouseMove(x, y));
             }
@@ -586,6 +603,12 @@ impl Tab {
                     eprintln!("{}", p.witness());
                 }
             }
+            // AETHERMACGPU-ENGINEDAMAGE (SR341): the face lagged on the bus and no longer knows its frame: send it whole.
+            SMessage::SurfaceResend { url } if url == "viewport" => {
+                self.sent.forget();
+                let (w, h) = (self.engine.width, self.engine.height);
+                self.blit(&[(0, 0, w, h)]);
+            }
             _ => {}
         }
         // A link click or form submit staged a navigation; a page's `history.back()` may have staged a
@@ -622,7 +645,7 @@ impl Tab {
             self.last_nav = Some(nav);
             self.bus.fire(SMessage::BrowserNavState { can_back: nav.0, can_forward: nav.1, loading: nav.2, zoom_pct: nav.3 });
         }
-        let link = self.engine.hovered_link().unwrap_or_default();
+        let link = self.engine.hovered_link().or_else(|| self.engine.pdf_status()).unwrap_or_default(); // PDF4 (SR324): "Page p / n"
         if link != self.last_status && self.is_active() {
             self.last_status = link.clone();
             self.bus.fire(SMessage::BrowserStatus(link));
@@ -639,6 +662,10 @@ impl Tab {
         // The hovered element's cursor changed (SR67).
         if let Some(cursor) = self.engine.take_cursor_change() {
             self.show(SMessage::BrowserCursorChanged(cursor));
+        }
+        // PDF4FORMSAVE (SR354): Ctrl/Cmd+S staged the PDF's bytes: the coordinator writes them (`Coordinator::on_save`).
+        if let Some(save) = self.engine.take_pending_save() {
+            self.bus.fire(save);
         }
         // One choke point for the address bar: whatever the turn did — link click, form submit,
         // Back, Forward, Reload, typed url, pushState, or a script-driven navigation run off the tick —
@@ -700,6 +727,8 @@ struct Coordinator {
     devtools: chrome::DevtoolsChrome,
     /// A11YFACE (SR124): the last accessibility rows the face sent (every new tab gets them).
     a11y_prefs: Option<SMessage>,
+    /// SAVEDIALOG (SR364): a `BrowserSaveAs`'s name and bytes, held until the face's save panel answers `SavePanelChose`.
+    save_as: Option<(String, Vec<u8>)>,
 }
 
 /// AETHERDEVTOOLS2 (SR112): the face's layout for the pane — `DevtoolsChrome::split` of the content area
@@ -762,7 +791,7 @@ impl Coordinator {
         self.active.store(id, Ordering::Relaxed);
         self.send(id, TabCmd::Devtools(self.devtools));
         if let Some((w, h)) = self.last_resize {
-            self.send(id, TabCmd::Msg(SMessage::BrowserResize(w, h)));
+            self.send(id, TabCmd::Msg(SMessage::BrowserResize(w, h, 0)));
         }
         self.send(id, TabCmd::Activate);
         self.publish_tabs();
@@ -849,9 +878,9 @@ impl Coordinator {
                     self.publish_bookmarks();
                 }
             }
-            SMessage::BrowserResize(w, h) => {
+            SMessage::BrowserResize(w, h, _) => {
                 self.last_resize = Some((w, h));
-                self.to_active(SMessage::BrowserResize(w, h));
+                self.to_active(SMessage::BrowserResize(w, h, 0));
                 if self.devtools.open {
                     self.bus.fire(devtools_layout(&self.devtools, self.last_resize));
                 }
@@ -883,6 +912,15 @@ impl Coordinator {
                     let _ = tx.send(TabCmd::Msg(m.clone()));
                 }
             }
+            // SAVERECENTOPEN (SR403): Ctrl/Cmd+O is the chrome's open verb, not the page's key: the page surface's face shows
+            // the open panel in the recent folder; the chosen file is recorded (SAVERECENT's one writer) and the active tab
+            // opens it (an image through Facet, a page under the archive's sandbox). A cancel answers nothing.
+            SMessage::BrowserKey(k) if chrome::host::open_key(&k) => self.bus.fire(chrome::host::open_panel(quartzite::widgets::chrome_rows::stored_str)),
+            SMessage::OpenPanelChose { url, path: Some(p) } if url == chrome::host::OPEN_SURFACE => {
+                use quartzite::widgets::chrome_rows::{store_str, stored_str};
+                let url = chrome::host::open_chosen(std::path::Path::new(&p), stored_str, store_str);
+                self.to_active(SMessage::OpenDocument { url });
+            }
             SMessage::OpenDocument { .. }
             | SMessage::BrowserNavBack
             | SMessage::BrowserNavForward
@@ -903,8 +941,73 @@ impl Coordinator {
             | SMessage::BrowserDevtoolsPanel(_)
             | SMessage::BrowserDevtoolsEval(_)
             | SMessage::BrowserDevtoolsGoto { .. }
-            | SMessage::BrowserA11y(_) => self.to_active(m),
+            | SMessage::BrowserA11y(_) | SMessage::SurfaceResend { .. } => self.to_active(m), // SurfaceResend: AETHERMACGPU-ENGINEDAMAGE (SR341)
+            // PDF4FORMSAVE (SR354): a tab's engine handed bytes to save.
+            SMessage::BrowserSave { name, bytes, .. } => self.on_save(&name, &bytes),
+            // SAVEDIALOG (SR364): Save As: hold the bytes, ask the page surface's face for a path; its answer writes them.
+            SMessage::BrowserSaveAs { name, bytes, .. } => self.on_save_as(name, bytes),
+            SMessage::SavePanelChose { url, path } if url == "viewport" => self.on_save_chosen(path),
             _ => {}
+        }
+    }
+
+    /// PDF4FORMSAVE (SR354): land a `BrowserSave` through the ONE downloads writer (`chrome::host::save_bytes`: the
+    /// download's own unique name, `.part` and rename), list it as a finished download row (the one row path,
+    /// `on_report`), and answer `BrowserSaved` / `BrowserSaveFailed`. Written here, synchronously, as the bookmarks are.
+    fn on_save(&mut self, name: &str, bytes: &[u8]) {
+        self.answer_save(name, bytes.len() as u64, chrome::host::save_bytes(name, bytes));
+    }
+
+    /// SAVEDIALOG (SR364): a `BrowserSaveAs`: the bytes wait here (a newer Save As replaces them: the panel is modal) and
+    /// the page surface's face shows the platform save panel seeded with the name.
+    fn on_save_as(&mut self, name: String, bytes: Vec<u8>) {
+        // SAVERECENT (SR391): the panel opens in the folder the last Save As chose (Principia's `aether.save.folder`).
+        let folder = chrome::host::save_folder(quartzite::widgets::chrome_rows::stored_str);
+        self.bus.fire(SMessage::SavePanel { url: "viewport".into(), name: name.clone(), folder });
+        self.save_as = Some((name, bytes));
+    }
+
+    /// SAVEDIALOG (SR364): the panel's answer: a chosen path lands the held bytes through the ONE writer
+    /// (`chrome::host::save_bytes_at`) and answers as a Save does (`answer_save`); a cancel answers
+    /// `BrowserSaveFailed { why: "cancelled" }` and lists no row. No held bytes: nothing to do.
+    fn on_save_chosen(&mut self, path: Option<String>) {
+        let Some((name, bytes)) = self.save_as.take() else { return };
+        match path {
+            Some(p) => {
+                let written = chrome::host::save_bytes_at(std::path::Path::new(&p), &bytes);
+                // SAVERECENT (SR391): a written Save As becomes Principia's `aether.save.folder` and heads `aether.recent`.
+                if let Ok(at) = &written {
+                    use quartzite::widgets::chrome_rows::{store_str, stored_str};
+                    chrome::host::remember_saved(at, stored_str, store_str);
+                }
+                self.answer_save(&name, bytes.len() as u64, written)
+            }
+            None => self.bus.fire(SMessage::BrowserSaveFailed { why: "cancelled".into() }),
+        }
+    }
+
+    /// PDF4FORMSAVE (SR354) / SAVEDIALOG (SR364): a written save's finished download row and its answer, for the
+    /// Downloads save and the Save As alike.
+    fn answer_save(&mut self, name: &str, len: u64, result: Result<std::path::PathBuf, String>) {
+        self.next_download += 1;
+        let shown = match &result {
+            Ok(path) => path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| name.to_string()),
+            Err(_) => name.to_string(),
+        };
+        let mut d = chrome::downloads::Download::new(self.next_download, &shown, "", Some(len));
+        d.done = true;
+        match result {
+            Ok(path) => {
+                d.received = len;
+                self.on_report(TabReport::Download(d));
+                self.bus.fire(SMessage::BrowserSaved { path: path.to_string_lossy().into_owned() });
+            }
+            Err(why) => {
+                eprintln!("[aether] save failed: {why}");
+                d.error = Some(why.clone());
+                self.on_report(TabReport::Download(d));
+                self.bus.fire(SMessage::BrowserSaveFailed { why });
+            }
         }
     }
 
@@ -1023,6 +1126,7 @@ fn main() {
                     last_resize: None,
                     devtools: chrome::DevtoolsChrome::default(),
                     a11y_prefs: None,
+                    save_as: None,
                 };
                 local.block_on(&rt, coordinator.run(bus_rx, reports_rx, atspi_rx));
             })
@@ -1063,6 +1167,7 @@ fn main() {
                     id: "url".into(),
                     placeholder: "Enter URL...".into(),
                     action: quartzite::tetra::TextAction::OpenDocument,
+                    secret: false, // LANDINGSECRETFIELD (SR432)
                 },
             ]);
 
@@ -1103,28 +1208,28 @@ mod tests {
     #[test]
     fn coalesce_keeps_the_last_of_adjacent_pointer_moves() {
         let out = coalesce(vec![
-            SMessage::BrowserMouseMove(1.0, 1.0),
-            SMessage::BrowserMouseMove(2.0, 3.0),
-            SMessage::BrowserMouseMove(5.0, 8.0),
-            SMessage::BrowserClick(5.0, 8.0),
-            SMessage::BrowserMouseMove(9.0, 9.0),
+            SMessage::BrowserMouseMove(1.0, 1.0, 0),
+            SMessage::BrowserMouseMove(2.0, 3.0, 0),
+            SMessage::BrowserMouseMove(5.0, 8.0, 0),
+            SMessage::BrowserClick(5.0, 8.0, 0),
+            SMessage::BrowserMouseMove(9.0, 9.0, 0),
         ]);
         let shape: Vec<String> = out.iter().map(|m| format!("{m:?}")).collect();
-        assert_eq!(shape, ["BrowserMouseMove(5.0, 8.0)", "BrowserClick(5.0, 8.0)", "BrowserMouseMove(9.0, 9.0)"]);
+        assert_eq!(shape, ["BrowserMouseMove(5.0, 8.0, 0)", "BrowserClick(5.0, 8.0, 0)", "BrowserMouseMove(9.0, 9.0, 0)"]);
     }
 
     /// Scroll still sums and resize still keeps only the last geometry alongside pointer motion.
     #[test]
     fn coalesce_pointer_motion_leaves_scroll_and_resize_rules_alone() {
         let out = coalesce(vec![
-            SMessage::BrowserResize(10, 10),
-            SMessage::BrowserScroll(0.0, 1.0),
-            SMessage::BrowserScroll(0.0, 2.0),
-            SMessage::BrowserMouseMove(4.0, 4.0),
-            SMessage::BrowserResize(20, 20),
+            SMessage::BrowserResize(10, 10, 0),
+            SMessage::BrowserScroll(0.0, 1.0, 0),
+            SMessage::BrowserScroll(0.0, 2.0, 0),
+            SMessage::BrowserMouseMove(4.0, 4.0, 0),
+            SMessage::BrowserResize(20, 20, 0),
         ]);
         let shape: Vec<String> = out.iter().map(|m| format!("{m:?}")).collect();
-        assert_eq!(shape, ["BrowserScroll(0.0, 3.0)", "BrowserMouseMove(4.0, 4.0)", "BrowserResize(20, 20)"]);
+        assert_eq!(shape, ["BrowserScroll(0.0, 3.0, 0)", "BrowserMouseMove(4.0, 4.0, 0)", "BrowserResize(20, 20, 0)"]);
     }
 
     /// AETHERDEVTOOLS2 (SR112): the face's split/key path through the shell — F12 from the face's hook
@@ -1237,6 +1342,325 @@ mod tests {
         assert_eq!(strip.len(), 2);
 
         assert_eq!(format!("{:?}", chrome_rows::find_msg("needle", true)), r#"BrowserFind { query: "needle", forward: true }"#);
+    }
+
+    /// STRIP2 (SR219): what chrome_rows derives for both faces' strips is the model's. The tab search over the wire is
+    /// `TabStrip::search`; the top strip's walk is `TabStrip::rows` without `+` (open and collapsed); a drop's verb,
+    /// applied as `Coordinator::on_bus` applies it (`chrome::apply_tab_verb`), lands the tab where the model puts it;
+    /// the layout row and its parse and the favicon tile's side are the model's.
+    #[test]
+    fn aethermacstrip2_model_kat() {
+        use chrome::sidetabs::{self, TabLayout};
+        use chrome::tabs::{GroupColor, Row, TabStrip};
+        use quartzite::widgets::chrome_rows::{self, DropOn, SideRow, TabWire};
+        let mut strip = TabStrip::new();
+        let ids: Vec<u64> = (0..5).map(|_| strip.open()).collect();
+        let pages = [
+            ("Rust Docs", "https://doc.rust-lang.org/"),
+            ("News", "https://news.example/rust"),
+            ("Mail", "https://mail.example/"),
+            ("Maps", "https://maps.example/"),
+            ("Video", "https://video.example/"),
+        ];
+        for (k, (title, url)) in pages.iter().enumerate() {
+            assert!(strip.update(ids[k], Some(title), Some(url), Some(false)));
+        }
+        let g = strip.group_new("work", GroupColor::Blue, &ids[1..3]).expect("group");
+        let wire_of = |strip: &TabStrip| {
+            let mut w = TabWire::default();
+            assert!(w.take(&chrome::tabs_message(strip)));
+            w
+        };
+        let face_of = |w: &TabWire| -> Vec<Row> {
+            chrome_rows::top_rows(w.active, &w.tabs, &w.groups)
+                .iter()
+                .map(|r| match r {
+                    SideRow::Group { id, .. } => Row::Group(*id),
+                    SideRow::Tab { id, .. } => Row::Tab(*id),
+                    SideRow::New => Row::NewTab,
+                })
+                .collect()
+        };
+        let w = wire_of(&strip);
+        for q in ["rust", "  MA ", "", "example/", "nothing"] {
+            assert_eq!(w.search(q).iter().map(|t| t.id).collect::<Vec<_>>(), strip.search(q), "query {q:?}");
+        }
+        for collapse in [false, true] {
+            if collapse {
+                assert_eq!(strip.group_toggle(g), Some(true));
+            }
+            let mut rows = strip.rows();
+            assert_eq!(rows.pop(), Some(Row::NewTab));
+            assert_eq!(face_of(&wire_of(&strip)), rows, "collapsed {collapse}");
+        }
+        assert_eq!(strip.group_toggle(g), Some(false));
+
+        // The drops, applied the shell's way.
+        let drop = |strip: &mut TabStrip, id: u64, on: DropOn| {
+            let verb = wire_of(strip).drop_verb(id, on).expect("a drop verb");
+            assert_eq!(chrome::apply_tab_verb(strip, &verb), Some(true), "{verb:?}");
+        };
+        drop(&mut strip, ids[4], DropOn::Tab(ids[0]));
+        assert_eq!(strip.tabs().first().map(|t| t.id), Some(ids[4]));
+        drop(&mut strip, ids[0], DropOn::End);
+        assert_eq!(strip.tabs().last().map(|t| t.id), Some(ids[0]));
+        drop(&mut strip, ids[3], DropOn::Group(g));
+        assert_eq!(strip.get(ids[3]).and_then(|t| t.group), Some(g));
+        assert!(wire_of(&strip).drop_verb(ids[3], DropOn::Tab(ids[3])).is_none());
+
+        // The layout row, its parse, the favicon tile.
+        assert_eq!((chrome_rows::LAYOUT_NS, chrome_rows::LAYOUT_KEY), (sidetabs::PREF_NS, sidetabs::PREF_KEY));
+        for v in ["side", " SIDE ", "top", "", "left"] {
+            assert_eq!(chrome_rows::layout_is_side(v), TabLayout::parse(v) == TabLayout::Side, "{v:?}");
+        }
+        assert_eq!(chrome_rows::FAVICON_PX, sidetabs::FAVICON_PX);
+        let tile = sidetabs::favicon_tile(32, 32, &vec![200u8; 32 * 32 * 4]).expect("tile");
+        assert_eq!(chrome_rows::favicon_rgba(sidetabs::FAVICON_PX, &tile).map(|p| p.len()), Some(16 * 16 * 4));
+    }
+
+    /// STRIP2 (SR219): the chrome's keys (`chrome_rows::key_verbs`, both faces' table) drive the model the way
+    /// `Coordinator::on_bus` applies them: Ctrl+Tab / Ctrl+PgDn step right, Ctrl+Shift+Tab / Ctrl+PgUp step left
+    /// (`TabStrip::step`, wrapping), Cmd+W closes the active tab, Cmd+T opens one; zoom and the bookmark are the
+    /// shell's existing `BrowserZoom` / `BrowserBookmarkToggle` arms.
+    #[test]
+    fn aethermacstrip2_keys_drive_the_model_kat() {
+        use chrome::tabs::TabStrip;
+        use quartzite::widgets::chrome_rows::{key_verbs, KeyMods};
+        let verb = |key: &str, mods: KeyMods| key_verbs().into_iter().find(|k| k.key == key && k.mods == mods).map(|k| k.msg).expect("a key");
+        let apply = |strip: &mut TabStrip, m: SMessage| match m {
+            SMessage::BrowserTabNew => {
+                strip.open();
+            }
+            SMessage::BrowserTabClose(id) => {
+                let id = id.unwrap_or(strip.active());
+                if strip.get(id).is_some() {
+                    strip.close(id);
+                }
+            }
+            SMessage::BrowserTabStep(n) => {
+                strip.step(n);
+            }
+            other => panic!("not a strip key: {other:?}"),
+        };
+        let mut strip = TabStrip::new();
+        let a = strip.open();
+        let b = strip.open();
+        let c = strip.open();
+        assert!(strip.select(a));
+        apply(&mut strip, verb("Tab", KeyMods::Control));
+        assert_eq!(strip.active(), b);
+        apply(&mut strip, verb("Page_Down", KeyMods::Control));
+        assert_eq!(strip.active(), c);
+        apply(&mut strip, verb("Tab", KeyMods::Control));
+        assert_eq!(strip.active(), a, "wraps");
+        apply(&mut strip, verb("Tab", KeyMods::ControlShift));
+        assert_eq!(strip.active(), c);
+        apply(&mut strip, verb("Page_Up", KeyMods::Control));
+        assert_eq!(strip.active(), b);
+        apply(&mut strip, verb("w", KeyMods::Primary));
+        assert!(strip.get(b).is_none());
+        assert_eq!(strip.len(), 2);
+        apply(&mut strip, verb("t", KeyMods::Primary));
+        assert_eq!(strip.len(), 3);
+        for k in key_verbs() {
+            assert!(
+                matches!(k.msg, SMessage::BrowserTabNew | SMessage::BrowserTabClose(None) | SMessage::BrowserTabStep(_) | SMessage::BrowserZoom(_) | SMessage::BrowserBookmarkToggle),
+                "{:?}",
+                k.msg
+            );
+        }
+    }
+
+    /// AETHERMACDEVTOOLS (SR312): the faces' developer-tools, console and accessibility rows
+    /// (`quartzite::widgets::{devtools_rows, console_rows, a11y_rows}`, both faces' one copy) against the model: the panel
+    /// labels are `Panel::ALL`'s; the face's toggle and GTK's Ctrl+Shift+I are `is_devtools_toggle`'s; AppKit's
+    /// JavaScript Console key opens a closed pane on the Console panel and never closes an open one (applied as
+    /// `Coordinator::on_devtools` and the tab's `BrowserDevtoolsPanel` arm apply them), and the layout the face receives
+    /// reads open / closed; the console filter over a `LogTail`; the face's accessibility rows reach the engine as the
+    /// prefs Principia's values mean (`A11yPrefs::from_rows` == `from_prefs`); F6 alternates the address and the page.
+    #[test]
+    fn aethermacdevtools_model_kat() {
+        use chrome::devtools::Panel;
+        use quartzite::widgets::{a11y_rows, console_rows, devtools_rows};
+        let labels: Vec<&str> = Panel::ALL.iter().map(|p| p.label()).collect();
+        assert_eq!(labels, devtools_rows::PANELS);
+
+        let is_toggle = |m: &SMessage| match m {
+            SMessage::BrowserDevtoolsKey { key, ctrl, shift, alt } => chrome::is_devtools_toggle(key, *ctrl, *shift, *alt),
+            _ => false,
+        };
+        assert!(is_toggle(&devtools_rows::toggle_key()));
+        assert!(is_toggle(&SMessage::BrowserDevtoolsKey { key: "I".into(), ctrl: true, shift: true, alt: false }));
+
+        fn apply(c: &mut chrome::DevtoolsChrome, panel: &mut Panel, msgs: Vec<SMessage>) {
+            for m in msgs {
+                match m {
+                    SMessage::BrowserDevtoolsKey { key, ctrl, shift, alt } => {
+                        c.on_key(&key, ctrl, shift, alt);
+                    }
+                    SMessage::BrowserDevtoolsPanel(label) => {
+                        if let Some(p) = Panel::ALL.iter().find(|p| p.label().eq_ignore_ascii_case(&label)) {
+                            *panel = *p;
+                        }
+                    }
+                    other => panic!("not a pane verb: {other:?}"),
+                }
+            }
+        }
+        let mut c = chrome::DevtoolsChrome::default();
+        let mut panel = Panel::Elements;
+        let area = Some((1000, 800));
+        assert_eq!(devtools_rows::pane_open(&devtools_layout(&c, area)), Some(false));
+        let v = devtools_rows::console_verbs(c.open);
+        apply(&mut c, &mut panel, v);
+        assert!(c.open);
+        assert_eq!(panel, Panel::Console);
+        assert_eq!(devtools_rows::pane_open(&devtools_layout(&c, area)), Some(true));
+        panel = Panel::Network;
+        let v = devtools_rows::console_verbs(c.open);
+        apply(&mut c, &mut panel, v);
+        assert!(c.open, "an open pane stays open");
+        assert_eq!(panel, Panel::Console);
+        apply(&mut c, &mut panel, vec![devtools_rows::toggle_key()]);
+        assert_eq!(devtools_rows::pane_open(&devtools_layout(&c, area)), Some(false));
+
+        let tail = [
+            bandy::state::LogLine { seq: 1, level: "INFO".into(), source: "net".into(), content: "up".into() },
+            bandy::state::LogLine { seq: 2, level: "ERROR".into(), source: "usb".into(), content: "gone".into() },
+        ];
+        let rows = console_rows::rows_from_tail(&tail);
+        assert_eq!(console_rows::render_body(&console_rows::filtered(&rows, console_rows::LevelFilter::All)), "net  up\nusb  gone");
+        assert_eq!(console_rows::render_body(&console_rows::filtered(&rows, console_rows::LevelFilter::Warn)), "usb  gone");
+
+        let stored = |k: &str| match k {
+            "accessibility.reduce_motion" => Some("on".to_string()),
+            "accessibility.contrast" => Some("more".to_string()),
+            "accessibility.forced_colors" => Some("true".to_string()),
+            _ => None,
+        };
+        let face = a11y_rows::A11yRows::from_values(|k| stored(k).map(bandy::PrefValue::Str));
+        let SMessage::BrowserA11yPrefs { reduce_motion, contrast, forced_colors } = face.message() else { panic!("not the rows") };
+        let applied = aether::dom::a11y::prefs::A11yPrefs::from_rows(reduce_motion, &contrast, forced_colors);
+        assert_eq!(applied, aether::dom::a11y::prefs::A11yPrefs::from_prefs(stored));
+        assert!(matches!(
+            a11y_rows::A11yRows::from_values(|_| None).message(),
+            SMessage::BrowserA11yPrefs { reduce_motion: false, ref contrast, forced_colors: false } if contrast == "no-preference"
+        ));
+
+        use a11y_rows::FocusStop::{Address, Page};
+        assert_eq!(a11y_rows::f6_step(Some(Page), false), Address);
+        assert_eq!(a11y_rows::f6_step(Some(Address), false), Page);
+        assert_eq!(a11y_rows::f6_step(None, true), Page);
+}
+
+    /// AETHERMACGPU-DAMAGE (SR320): two frames of a real engine that differ in one row blit as that row alone (the
+    /// shell's `Tab::blit` path: `present_rgba` through `SurfaceDamage`), and the saving is the frame's height.
+    #[test]
+    fn aethermacgpudamage_one_row_kat() {
+        let mut engine = AetherEngine::new();
+        engine.load_html("about:blank", "<html><body><p>damage</p></body></html>", true);
+        let _ = engine.render_frame();
+        let mut sent = quartzite::tetra::SurfaceDamage::default();
+        let (w, h, first) = engine.present_rgba();
+        let Some(SMessage::SurfaceBlit { damage: None, pixels, .. }) = sent.frame("viewport", w, h, first) else { panic!("first blit is whole") };
+        let whole = pixels.len();
+        assert_eq!(whole, (w * h * 4) as usize);
+        let y = h / 2;
+        let at = ((y * w + 3) * 4) as usize;
+        engine.surface[at] ^= 0xFF; // one pixel of row y
+        let (w2, h2, second) = engine.present_rgba();
+        assert_eq!((w2, h2), (w, h));
+        let Some(SMessage::SurfaceBlit { damage, pixels, width, height, .. }) = sent.frame("viewport", w2, h2, second.clone()) else { panic!("a changed frame blits") };
+        assert_eq!((width, height), (w, h));
+        assert_eq!(damage, Some(vec![(0, y, w, 1)]));
+        let stride = (w * 4) as usize;
+        assert_eq!(pixels, second[y as usize * stride..(y as usize + 1) * stride]);
+        assert_eq!(whole / pixels.len(), h as usize, "one row instead of {h}");
+        assert!(sent.frame("viewport", w2, h2, second).is_none(), "an identical frame sends nothing");
+    }
+
+    /// AETHERMACGPU-PRESENTRECTS / -SCROLL (SR351): the shell's `Tab::blit` chain on a real engine at zoom 100 and 200: a
+    /// viewport scroll blits as the copy pair plus the band's rows only (under a quarter of the frame), converted into
+    /// the kept frame, and a receiver applying it (`tetra::surface_apply`) to the frame it held ends on `present_rgba`'s
+    /// whole new frame; a following rect blit does too.
+    #[test]
+    fn presentrects_scroll_chain_kat() {
+        let html = r#"<html><body style="margin:0"><div style="height:3000px;background:linear-gradient(red,blue)"></div>
+            <p style="position:absolute;top:30px;left:10px">scroll</p></body></html>"#;
+        for (zoom, device, dy) in [(100u32, (300u32, 200u32), -40), (200, (600, 400), -80)] {
+            let mut engine = AetherEngine::new();
+            engine.set_device_size(device.0, device.1);
+            engine.set_zoom_pct(zoom);
+            engine.load_html("file:///page/index.html", html, true);
+            let damages = engine.render_frame();
+            let mut sent = quartzite::tetra::SurfaceDamage::default();
+            let mut painted = aether::render::PresentMark::default();
+            let mut blit = |engine: &AetherEngine, damages: &[(u32, u32, u32, u32)]| {
+                let (rects, scroll) = aether::render::present_scroll(engine, damages, &mut painted);
+                let (w, h) = engine.device_size();
+                sent.present("viewport", w, h, &rects, scroll, |f, l| engine.present_rects(f, l), || engine.present_rgba())
+            };
+            let Some(SMessage::SurfaceBlit { damage: None, pixels, .. }) = blit(&engine, &damages) else { panic!("first blit whole") };
+            let mut rx = pixels;
+            engine.handle_event(aether::api::events::Event::Scroll(0.0, 40.0));
+            let damages = engine.render_frame();
+            let Some(SMessage::SurfaceBlit { damage: Some(list), pixels, scroll, width, height, .. }) = blit(&engine, &damages) else {
+                panic!("zoom {zoom}: a scroll blit")
+            };
+            assert_eq!(scroll, Some((0, dy)), "zoom {zoom}: the pair");
+            assert!(pixels.len() * 4 < rx.len(), "zoom {zoom}: the band, not the frame ({} of {})", pixels.len(), rx.len());
+            assert!(quartzite::tetra::surface_apply(&mut rx, width, height, &list, &pixels, scroll));
+            assert_eq!(rx, engine.present_rgba().2, "zoom {zoom}: the receiver's frame is the new frame");
+            engine.damage_rects.push((20, 20, 10, 10));
+            let damages = engine.render_frame();
+            let Some(SMessage::SurfaceBlit { damage: Some(list), pixels, scroll: None, width, height, .. }) = blit(&engine, &damages) else {
+                panic!("zoom {zoom}: a rect blit")
+            };
+            assert!(quartzite::tetra::surface_apply(&mut rx, width, height, &list, &pixels, None));
+            assert_eq!(rx, engine.present_rgba().2, "zoom {zoom}: still the frame");
+        }
+    }
+
+    /// AETHERSURFACEHEIGHT (SR411): the page surface's ONE scale, through the shell's own chain on a fake 1000x800-pt
+    /// view at backing scale 2 (no AppKit: the arithmetic is `quartzite::platforms::page_geometry`'s, which the AppKit
+    /// face's `fire_resize` and `sync_metal_layer` read): the viewport the face sends is the points, the engine's device
+    /// and CSS viewport are 1000x800, the frame and the blit are 1000x800, the quad covers the view and only the
+    /// drawable is 2000x1600; a pixel-sized frame (top-left quarter) and a half-height frame are both flagged; zoom 200
+    /// keeps the device and halves the CSS viewport (the engine's one scale is zoom).
+    #[test]
+    fn surfaceheight_one_scale_chain_kat() {
+        let view = (1000.0, 800.0);
+        let probe = quartzite::platforms::page_geometry(view, 2.0, (0, 0));
+        assert_eq!(probe.viewport, (1000, 800), "BrowserResize carries the view in points");
+        let mut engine = AetherEngine::new();
+        engine.set_device_size(probe.viewport.0, probe.viewport.1); // as `Tab::fit_page` does with the pane closed
+        engine.load_html("about:blank", "<html><body><p>surface</p></body></html>", true);
+        let _ = engine.render_frame();
+        assert_eq!(engine.device_size(), (1000, 800));
+        assert_eq!((engine.width, engine.height), (1000, 800), "CSS viewport = points at zoom 100");
+        let (w, h, frame) = engine.present_rgba();
+        assert_eq!((w, h), (1000, 800));
+        let mut sent = quartzite::tetra::SurfaceDamage::default();
+        let Some(SMessage::SurfaceBlit { width, height, damage: None, .. }) = sent.frame("viewport", w, h, frame) else { panic!("first blit is whole") };
+        assert_eq!((width, height), (1000, 800), "texture = the blit");
+        let g = quartzite::platforms::page_geometry(view, 2.0, (width, height));
+        assert!(g.covers(), "{}", g.witness());
+        assert_eq!(g.drawable, (2000, 1600), "the backing scale enters only at the drawable");
+        assert_eq!(g.witness(), "view=1000x800pt scale=2 viewport=1000x800 frame=1000x800 drawable=2000x1600px covers=yes");
+        // The two wrong shapes: a pixel-sized frame shows the top-left quarter; a half-height frame stops mid-view.
+        let px = quartzite::platforms::page_geometry(view, 2.0, (2000, 1600));
+        assert_eq!(px.quad, Some([-1.0, 1.0, 3.0, -3.0]));
+        assert!(!px.covers());
+        let half = quartzite::platforms::page_geometry(view, 2.0, (1000, 400));
+        assert_eq!(half.quad, Some([-1.0, 1.0, 1.0, 0.0]));
+        assert!(half.witness().ends_with("covers=no"));
+        // Zoom 200 on the same view: the device stays the points, the CSS viewport halves, the frame stays the device.
+        engine.set_zoom_pct(200);
+        let _ = engine.render_frame();
+        assert_eq!(engine.device_size(), (1000, 800));
+        assert_eq!((engine.width, engine.height), (500, 400));
+        let (zw, zh, _) = engine.present_rgba();
+        assert!(quartzite::platforms::page_geometry(view, 2.0, (zw, zh)).covers());
     }
 }
 

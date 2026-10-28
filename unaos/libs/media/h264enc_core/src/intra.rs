@@ -13,11 +13,11 @@
 //! one to the right of the current macroblock or below it never is; one in the macroblock left,
 //! above, above-left or above-right is when that macroblock is inside the picture.
 
-use h264_core::intra::{pred_16x16, pred_chroma, pred_nxn, Edges};
+use h264_core::intra::{filter_8x8_edges, pred_16x16, pred_chroma, pred_nxn, Edges};
 use h264_core::picture::{blk_at, Plane, BLK_X, BLK_Y};
 
-use crate::transform::{fdct16, fdct4, hadamard4, quant4, quant_dc, recon4, recon_i16};
-use crate::{lambda, Encoder, Kind, MbCode, I4_BIAS};
+use crate::transform::{fdct16, fdct4, fdct8, hadamard4, quant4, quant8, quant_dc, recon4, recon8, recon_i16, satd4, satd8};
+use crate::{lambda, Encoder, Kind, MbCode, I4_BIAS, I8_BIAS};
 
 /// Is the luma sample at (x, y), relative to macroblock (mbx, mby), available for predicting the
 /// block whose luma4x4BlkIdx is `limit` (16 for a whole-macroblock prediction)?
@@ -164,6 +164,8 @@ impl Encoder {
         // before it, as the decoder does.
         let mut code = MbCode::new(Kind::I4);
         let mut sad4 = 0u32;
+        let t8 = self.cfg.transform8x8;
+        let mut satd_4 = 0u32; // the I4 residual's SATD, for the 8x8 choice (SR322)
         let mut pred = [0i32; 64];
         let mut bestp = [0i32; 16];
         let mut res = [0i32; 16];
@@ -185,6 +187,9 @@ impl Encoder {
             code.modes[blk] = best.1;
             self.modes[(mby * 4 + BLK_Y[blk]) * w4 + mbx * 4 + BLK_X[blk]] = best.1;
             self.residual(0, px + bx, py + by, 4, &bestp, &mut res);
+            if t8 {
+                satd_4 += satd4(&res);
+            }
             let mut c = fdct4(&res);
             quant4(&mut c, qp, true, false);
             self.write_pred(0, px + bx, py + by, 4, &bestp);
@@ -192,7 +197,16 @@ impl Encoder {
             code.luma[blk] = c;
         }
 
-        if best16.0 <= sad4.saturating_add(I4_BIAS * lambda(qp)) {
+        // SR322: Intra_8x8 replaces the Intra_4x4 candidate when its SATD + bias is lower; the winner
+        // then meets Intra_16x16 by the SAD rule (with the knob off its operands are SR197's).
+        let mut nxn = sad4.saturating_add(I4_BIAS * lambda(qp));
+        if t8 {
+            if let Some((c8, sad8)) = self.intra8_candidate(mbx, mby, &code, satd_4) {
+                code = c8;
+                nxn = sad8.saturating_add(I8_BIAS * lambda(qp));
+            }
+        }
+        if best16.0 <= nxn {
             for blk in 0..16 {
                 self.modes[(mby * 4 + BLK_Y[blk]) * w4 + mbx * 4 + BLK_X[blk]] = 2;
             }
@@ -244,5 +258,68 @@ impl Encoder {
         }
         self.chroma_mb(mbx, mby, &preds, true, &mut code);
         code
+    }
+
+    /// H264ENC8X8 (SR322): the Intra_8x8 candidate of macroblock (mbx, mby), coded over the Intra_4x4
+    /// candidate already reconstructed there (`code4`, its residual's SATD `satd_4`). Each 8x8 block:
+    /// the encoder's edges (n 8, its 8 top-right samples substituted as the decoder substitutes them),
+    /// h264_core's `filter_8x8_edges` (8.3.2.2.1), the SAD-cheapest of the 9 modes through
+    /// `pred_nxn(8, ..)`, the 8x8 transform and quantiser, `recon8` with LevelScale8x8 list 0. Kept
+    /// when SATD + [`I8_BIAS`] x lambda is strictly below the 4x4's SATD + [`I4_BIAS`] x lambda:
+    /// returns the code and its SAD; else the 4x4 reconstruction and modes are restored.
+    fn intra8_candidate(&mut self, mbx: usize, mby: usize, code4: &MbCode, satd_4: u32) -> Option<(MbCode, u32)> {
+        let qp = self.qp;
+        let q6 = (qp % 6) as usize;
+        let (mb_w, w4, stride) = (self.mb_w, self.mb_w * 4, self.rec[0].w);
+        let (px, py) = (mbx * 16, mby * 16);
+        let mut saved = [0u8; 256];
+        for y in 0..16 {
+            saved[y * 16..y * 16 + 16].copy_from_slice(&self.rec[0].data[(py + y) * stride + px..(py + y) * stride + px + 16]);
+        }
+        let mut code = MbCode::new(Kind::I4);
+        code.t8x8 = true;
+        let (mut sad8, mut satd_8) = (0u32, 0u32);
+        let mut pred = [0i32; 64];
+        let mut bestp = [0i32; 64];
+        let mut res = [0i32; 64];
+        for b8 in 0..4 {
+            let (bx, by) = ((b8 % 2) * 8, (b8 / 2) * 8);
+            let e = luma_edges(&self.rec[0], mbx, mby, mb_w, bx, by, 8, 8, b8 * 4);
+            let f = filter_8x8_edges(&e);
+            let mut best = (u32::MAX, 2u8);
+            for mode in 0..9u8 {
+                if allowed4(mode, &e) {
+                    pred_nxn(8, mode, &f, &mut pred);
+                    let s = self.sad(0, px + bx, py + by, 8, &pred);
+                    if s < best.0 {
+                        best = (s, mode);
+                        bestp = pred;
+                    }
+                }
+            }
+            sad8 += best.0;
+            code.modes[b8] = best.1;
+            for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                self.modes[(mby * 4 + by / 4 + dy) * w4 + mbx * 4 + bx / 4 + dx] = best.1;
+            }
+            self.residual(0, px + bx, py + by, 8, &bestp, &mut res);
+            satd_8 += satd8(&res);
+            let mut c = fdct8(&res);
+            quant8(&mut c, qp, true);
+            self.write_pred(0, px + bx, py + by, 8, &bestp);
+            recon8(&c, &self.ls.l8[0][q6], qp, &mut self.rec[0].data, (py + by) * stride + px + bx, stride);
+            code.luma8[b8] = c;
+        }
+        let lam = lambda(qp);
+        if satd_8.saturating_add(I8_BIAS * lam) < satd_4.saturating_add(I4_BIAS * lam) {
+            return Some((code, sad8));
+        }
+        for y in 0..16 {
+            self.rec[0].data[(py + y) * stride + px..(py + y) * stride + px + 16].copy_from_slice(&saved[y * 16..y * 16 + 16]);
+        }
+        for blk in 0..16 {
+            self.modes[(mby * 4 + BLK_Y[blk]) * w4 + mbx * 4 + BLK_X[blk]] = code4.modes[blk];
+        }
+        None
     }
 }

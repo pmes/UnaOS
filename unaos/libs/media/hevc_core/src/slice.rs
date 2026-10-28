@@ -63,6 +63,8 @@ pub struct SliceHeader {
     /// The slice's own set when !short_term_ref_pic_set_sps_flag.
     pub st_rps: Option<StRps>,
     pub long_term: Vec<LongTerm>,
+    /// num_long_term_sps: the first entries of `long_term` that index the SPS candidates (7-52 restarts there).
+    pub num_long_term_sps: u32,
     pub temporal_mvp_enabled_flag: bool,
     pub sao_luma_flag: bool,
     pub sao_chroma_flag: bool,
@@ -77,10 +79,14 @@ pub struct SliceHeader {
     pub collocated_ref_idx: u32,
     pub pred_weights: Option<PredWeights>,
     pub max_num_merge_cand: u32,
+    /// HEVCREXTSCC (SR357): use_integer_mv_flag (inferred motion_vector_resolution_control_idc when absent).
+    pub use_integer_mv_flag: bool,
     pub qp_delta: i32,
     pub cb_qp_offset: i32,
     pub cr_qp_offset: i32,
     pub cu_chroma_qp_offset_enabled_flag: bool,
+    /// HEVCREXTSCC (SR357): slice_act_y_qp_offset / slice_act_cb_qp_offset / slice_act_cr_qp_offset.
+    pub slice_act_qp_offset: [i32; 3],
     pub deblocking_filter_disabled_flag: bool,
     pub beta_offset_div2: i32,
     pub tc_offset_div2: i32,
@@ -101,7 +107,8 @@ impl SliceHeader {
         if self.short_term_ref_pic_set_sps_flag { sps.st_rps.get(self.short_term_ref_pic_set_idx as usize) } else { self.st_rps.as_ref() }
     }
 
-    /// NumPicTotalCurr (7-55) without the screen-content current-picture reference.
+    /// NumPicTotalCurr (7-55) without the screen-content current-picture reference (HEVCREXTSCC SR357: the header
+    /// parser adds pps_curr_pic_ref_enabled_flag).
     pub fn num_pic_total_curr(&self, sps: &Sps) -> u32 {
         let st = self.rps(sps).map_or(0, |r| r.num_used());
         (st + self.long_term.iter().filter(|l| l.used).count()) as u32
@@ -134,16 +141,19 @@ pub fn peek_pps_id(rbsp: &[u8], nal: &NalHeader) -> Result<u32> {
     Ok(id)
 }
 
-fn pred_weight_list(r: &mut BitReader, n: u32, chroma: bool, luma_denom: u32, chroma_denom: u32) -> Result<WeightList> {
+/// One list of pred_weight_table (7.3.6.3). HEVCSCCTAIL (SR365, HEVCREXT-SCC-WP): the flags of an entry `skip` marks (the
+/// current picture) are not present and infer 0 (7.4.7.3: LumaWeight 2^denom, offset 0).
+fn pred_weight_list(r: &mut BitReader, n: u32, chroma: bool, luma_denom: u32, chroma_denom: u32, skip: &[bool]) -> Result<WeightList> {
     let n = n as usize;
+    let present = |i: usize| !skip.get(i).copied().unwrap_or(false);
     let mut lf = Vec::with_capacity(n);
-    for _ in 0..n {
-        lf.push(r.flag());
+    for i in 0..n {
+        lf.push(present(i) && r.flag());
     }
     let mut cf = alloc::vec![false; n];
     if chroma {
-        for f in cf.iter_mut() {
-            *f = r.flag();
+        for (i, f) in cf.iter_mut().enumerate() {
+            *f = present(i) && r.flag();
         }
     }
     let mut w = WeightList::default();
@@ -230,6 +240,7 @@ pub fn parse_slice_header(rbsp: &[u8], nal: &NalHeader, sps: &Sps, pps: &Pps, pr
                 if num_lt_sps > nsps {
                     return Err(Error::Invalid("num_long_term_sps"));
                 }
+                h.num_long_term_sps = num_lt_sps;
                 let num_lt_pics = r.ue();
                 if num_lt_sps + num_lt_pics > 32 {
                     return Err(Error::Invalid("num_long_term_pics"));
@@ -277,7 +288,7 @@ pub fn parse_slice_header(rbsp: &[u8], nal: &NalHeader, sps: &Sps, pps: &Pps, pr
             if h.num_ref_idx_l0_active > 15 || h.num_ref_idx_l1_active > 15 {
                 return Err(Error::Invalid("num_ref_idx_active_minus1 above 14"));
             }
-            let total = h.num_pic_total_curr(sps);
+            let total = h.num_pic_total_curr(sps) + pps.scc.curr_pic_ref_enabled_flag as u32;
             if pps.lists_modification_present_flag && total > 1 {
                 let bits = ceil_log2(total);
                 if r.flag() {
@@ -303,6 +314,8 @@ pub fn parse_slice_header(rbsp: &[u8], nal: &NalHeader, sps: &Sps, pps: &Pps, pr
                 }
             }
             if (pps.weighted_pred_flag && h.slice_type == SliceType::P) || (pps.weighted_bipred_flag && h.slice_type == SliceType::B) {
+                // HEVCSCCTAIL (SR365, HEVCREXT-SCC-WP): 7.3.6.3 skips the weight flags of current-picture entries.
+                let skip = if pps.scc.curr_pic_ref_enabled_flag { curr_entries(&h, sps)? } else { Default::default() };
                 let chroma = sps.chroma_array_type() != 0;
                 let ld = r.ue();
                 if ld > 7 {
@@ -313,9 +326,9 @@ pub fn parse_slice_header(rbsp: &[u8], nal: &NalHeader, sps: &Sps, pps: &Pps, pr
                     return Err(Error::Invalid("delta_chroma_log2_weight_denom"));
                 }
                 let mut w = PredWeights { luma_log2_weight_denom: ld, chroma_log2_weight_denom: cd as u32, ..Default::default() };
-                w.l0 = pred_weight_list(&mut r, h.num_ref_idx_l0_active, chroma, ld, cd as u32)?;
+                w.l0 = pred_weight_list(&mut r, h.num_ref_idx_l0_active, chroma, ld, cd as u32, &skip[0])?;
                 if h.slice_type == SliceType::B {
-                    w.l1 = pred_weight_list(&mut r, h.num_ref_idx_l1_active, chroma, ld, cd as u32)?;
+                    w.l1 = pred_weight_list(&mut r, h.num_ref_idx_l1_active, chroma, ld, cd as u32, &skip[1])?;
                 }
                 h.pred_weights = Some(w);
             }
@@ -324,6 +337,9 @@ pub fn parse_slice_header(rbsp: &[u8], nal: &NalHeader, sps: &Sps, pps: &Pps, pr
                 return Err(Error::Invalid("five_minus_max_num_merge_cand"));
             }
             h.max_num_merge_cand = 5 - five_minus;
+            // HEVCREXTSCC (SR357) 7.3.6.1 / 7.4.7.1.
+            let idc = sps.scc.motion_vector_resolution_control_idc;
+            h.use_integer_mv_flag = if idc == 2 { r.flag() } else { idc == 1 };
         }
         h.qp_delta = r.se();
         let qp = pps.init_qp + h.qp_delta;
@@ -336,6 +352,16 @@ pub fn parse_slice_header(rbsp: &[u8], nal: &NalHeader, sps: &Sps, pps: &Pps, pr
             h.cr_qp_offset = r.se();
             if !(-12..=12).contains(&h.cb_qp_offset) || !(-12..=12).contains(&h.cr_qp_offset) {
                 return Err(Error::Invalid("slice chroma qp offset"));
+            }
+        }
+        // HEVCREXTSCC (SR357) 7.3.6.1: slice_act_{y,cb,cr}_qp_offset.
+        if pps.scc.slice_act_qp_offsets_present_flag {
+            let y = r.se();
+            let cb = r.se();
+            let cr = r.se();
+            h.slice_act_qp_offset = [y, cb, cr];
+            if h.slice_act_qp_offset.iter().any(|v| !(-12..=12).contains(v)) {
+                return Err(Error::Invalid("slice act qp offset"));
             }
         }
         if pps.range_ext.chroma_qp_offset_list_enabled_flag {
@@ -401,4 +427,19 @@ pub fn parse_slice_header(rbsp: &[u8], nal: &NalHeader, sps: &Sps, pps: &Pps, pr
     }
     h.data_offset = r.pos() / 8;
     Ok(h)
+}
+
+/// HEVCSCCTAIL (SR365, HEVCREXT-SCC-WP): which entries of RefPicList0 / RefPicList1 of the slice `h` (header parsed up to
+/// pred_weight_table) are the current picture (PicOrderCnt(RefPicListX[i]) == PicOrderCnt(CurrPic), 7.3.6.3), from the
+/// ONE list builder [`crate::dpb::list_entries`] over the header's own set: only the entries' current-picture flags are
+/// read, so the POCs are relative to 0 and the long-term ones placeholders.
+fn curr_entries(h: &SliceHeader, sps: &Sps) -> Result<[Vec<bool>; 2]> {
+    let mut rps = crate::dpb::Rps { curr: Some(0), ..Default::default() };
+    if let Some(st) = h.rps(sps) {
+        rps.st_curr_before = st.delta_poc_s0.iter().zip(st.used_s0.iter()).filter(|(_, u)| **u).map(|(d, _)| *d).collect();
+        rps.st_curr_after = st.delta_poc_s1.iter().zip(st.used_s1.iter()).filter(|(_, u)| **u).map(|(d, _)| *d).collect();
+    }
+    rps.lt_curr = h.long_term.iter().filter(|l| l.used).map(|_| 0).collect();
+    let mask = |list0: bool| -> Result<Vec<bool>> { Ok(crate::dpb::list_entries(&rps, h, list0)?.iter().map(|e| e.2).collect()) };
+    Ok([mask(true)?, if h.slice_type == SliceType::B { mask(false)? } else { Vec::new() }])
 }

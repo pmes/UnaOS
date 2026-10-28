@@ -56,3 +56,24 @@ pub fn init(boot_info: &'static mut BootInfo) {
 /// FOCUSARM64 (SR180): the caller's address-space slot, at the path x86 names it (`arch::memory::current_slot`) — `wm::focussteal::note_arm` reads it on both desktops. The body is `xwin`'s (TTBR0_EL1's ASID).
 #[cfg(feature = "aarch64_el0")]
 pub use super::xwin::current_slot;
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+// DMAONEBODY (rmbp-ledger B992) — THE KERNEL'S ONE DMA ALLOCATOR, AARCH64 HOOKS (tail-appended; was DMAALLOCXHCI B988's twin).
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+/// The allocator's ONE body is `crate::dma` (DMAONEBODY B992); re-exported here so every driver's `crate::arch::memory::dma::`
+/// path names it unchanged on both arches. This file keeps only aarch64's two hooks.
+pub use crate::dma;
+
+/// `dma`'s bus address of `[va, va + len)`: `va` itself when the span lies inside the identity-mapped heap (`init` hands
+/// the heap to `init_heap_raw` at its PHYSICAL start; tegra: the carveout-clear window's start), `None` otherwise. This
+/// half has no page walk.
+pub fn dma_bus(va: u64, len: usize) -> Option<u64> {
+    let (lo, hi) = crate::allocator::heap_bounds();
+    let end = va.checked_add(len as u64)?;
+    if va >= lo as u64 && end <= hi as u64 { Some(va) } else { None }
+}
+
+/// `dma`'s settle on a fresh zeroed buffer: the BCM2711 PCIe and Tegra XUSB paths do not snoop the data cache, so the
+/// zeros are cleaned and invalidated to the PoC here, the ONE place, before any device can see the buffer.
+pub fn dma_settle(va: u64, len: usize) {
+    super::cache::clean_invalidate_range(va as usize, len);
+}

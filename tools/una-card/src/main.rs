@@ -12,7 +12,7 @@
 // `Plan::gpt` — byte-for-byte the table the retired script wrote (the core's golden KAT pins it) —
 // laid by `amber_core::plan_apply::apply` (AMBER1), the same write list `amber plan` dry-runs.
 //
-// Usage: una-card --esp DIR --data DIR --unafs IMG -o OUT [--fat-mb N] [--skip NAME]...
+// Usage: una-card --esp DIR --data DIR --unafs IMG -o OUT [--fat-mb N] [--skip NAME]... [--lba 512|4096]
 //        una-card show IMG
 //
 // ROOTDISK2 (rmbp-ledger B401, R94): `--skip NAME` leaves a top-level entry of either tree off p1 (arroyo passes
@@ -83,7 +83,7 @@ fn trees_bytes(trees: &[PathBuf], skip: &[String]) -> u64 {
 fn build_fat(path: &Path, sectors: u64, trees: &[PathBuf], skip: &[String]) {
     for t in ["mkfs.vfat", "mcopy"] {
         if !which(t) {
-            die(&format!("'{t}' not found — install dosfstools + mtools"));
+            die(&format!("'{t}' not found — install dosfstools + mtools (macOS: brew install dosfstools mtools; Debian/Ubuntu: apt install dosfstools mtools)"));
         }
     }
     File::create(path).and_then(|f| f.set_len(sectors * SECTOR)).unwrap_or_else(|e| die(&format!("{}: {e}", path.display())));
@@ -137,7 +137,7 @@ fn main() {
             None => die("usage: una-card show IMG"),
         }
     }
-    let (mut esp, mut data, mut unafs, mut out, mut fat_mb) = (None, None, None, None, 0u64);
+    let (mut esp, mut data, mut unafs, mut out, mut fat_mb, mut lba) = (None, None, None, None, 0u64, 512usize);
     let mut skip: Vec<String> = Vec::new();
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -149,11 +149,12 @@ fn main() {
             "-o" | "--out" => out = Some(PathBuf::from(val())),
             "--fat-mb" => fat_mb = val().parse().unwrap_or_else(|_| die("--fat-mb takes a number")),
             "--skip" => skip.push(val()),
-            _ => die("usage: una-card --esp DIR --data DIR --unafs IMG -o OUT [--fat-mb N] [--skip NAME]... | una-card show IMG"),
+            "--lba" => lba = val().parse().ok().filter(|l| amber_core::gpt::lba_ratio(*l).is_ok()).unwrap_or_else(|| die("--lba takes 512, 1024, 2048 or 4096")), // NVME4KN-FIXTURE (Z40)
+            _ => die("usage: una-card --esp DIR --data DIR --unafs IMG -o OUT [--fat-mb N] [--skip NAME]... [--lba 512|4096] | una-card show IMG"),
         }
     }
     let (Some(esp), Some(data), Some(unafs), Some(out)) = (esp, data, unafs, out) else {
-        die("usage: una-card --esp DIR --data DIR --unafs IMG -o OUT [--fat-mb N] [--skip NAME]...");
+        die("usage: una-card --esp DIR --data DIR --unafs IMG -o OUT [--fat-mb N] [--skip NAME]... [--lba 512|4096]");
     };
 
     let trees: Vec<PathBuf> = [esp, data].into_iter().filter(|d| d.is_dir()).collect();
@@ -181,7 +182,10 @@ fn main() {
         File::create(&out)?.set_len(plan.disk_sectors * SECTOR)?;
         // AMBER1 (SR34): the table goes down through `amber_core::plan_apply::apply` — the write
         // list the `amber plan` dry run shows, issued, flushed and verified on read-back.
-        {
+        // NVME4KN-FIXTURE (zenbook-ledger Z40): `--lba 4096` lays the SAME plan's table at 4 KiB LBAs (`lay_lba`).
+        if lba != 512 {
+            lay_lba(&plan, lba, &out)?;
+        } else {
             let mut blk = amber_core::file_block::FileBlock::open_rw(&out)?;
             amber_core::plan_apply::apply(&plan, &mut blk, amber_core::plan_apply::Mode::Write)
                 .map_err(|e| io::Error::other(e.to_string()))?;
@@ -210,4 +214,44 @@ fn main() {
     if !skip.is_empty() {
         println!(":: X86-CARD: p1 skipped={} (ROOTDISK2, R94: they live on the UnaFS volume) ::", skip.join(","));
     }
+    if lba != 512 {
+        let k = (lba / SECTOR as usize) as u64;
+        println!(
+            ":: X86-CARD: lba={} p1 lba={} p2 lba={} total_lbas={} (NVME4KN-FIXTURE: a 4Kn NVMe image, not a 512 B card) ::",
+            lba,
+            p1.first / k,
+            p2.first / k,
+            plan.disk_sectors / k
+        );
+    }
+}
+
+// =================================================================================================
+// NVME4KN-FIXTURE (zenbook-ledger Z40) — the card's table at `lba`-byte LBAs, for the QEMU 4Kn NVMe lane
+// (`UNAOS_NVME_4K=1`: arroyo's `esp_x86_unafs_card` passes `--lba 4096`). The table is amber_core's ONE writer
+// (`Plan::gpt_lba` -> `gpt::Image::build_lba`); its five writes go at `lba * lba_bytes` (the `Block` seam
+// `plan_apply::apply` rides is 512 B sectors: NVME4KN-PLANAPPLY owed), and the read-back is THE reader,
+// `gpt::read_table_with`, at the same byte offsets — the shape the kernel's `nvme_lba_spans` reads a 4Kn
+// namespace with. The partitions' CONTENT is unchanged: p2's UnaFS blocks are 4 KiB already.
+// =================================================================================================
+
+fn lay_lba(plan: &Plan, lba: usize, out: &Path) -> io::Result<()> {
+    let img = plan.gpt_lba(lba).map_err(|e| io::Error::other(format!("4Kn table: {e}")))?;
+    let mut o = std::fs::OpenOptions::new().read(true).write(true).open(out)?;
+    for (l, bytes) in img.writes() {
+        o.seek(SeekFrom::Start(l * lba as u64))?;
+        o.write_all(bytes)?;
+    }
+    o.sync_all()?;
+    let t = amber_core::gpt::read_table_with(img.total_sectors, |l, buf: &mut [u8]| {
+        o.seek(SeekFrom::Start(l * lba as u64)).and_then(|_| o.read_exact(buf)).is_ok()
+    })
+    .map_err(|e| io::Error::other(format!("4Kn read-back: {e}")))?;
+    let k = (lba / SECTOR as usize) as u64;
+    let want: Vec<(u64, u64)> = plan.parts.iter().map(|p| (p.first / k, (p.last + 1) / k - 1)).collect();
+    let got: Vec<(u64, u64)> = t.entries.iter().map(|(_, e)| (e.first_lba, e.last_lba)).collect();
+    if got != want {
+        return Err(io::Error::other(format!("4Kn read-back: entries {got:?} != plan {want:?}")));
+    }
+    Ok(())
 }

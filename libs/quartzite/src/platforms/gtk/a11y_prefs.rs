@@ -18,56 +18,13 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use bandy::{PrefValue, PrincipiaCommand, SMessage, Synapse};
+use bandy::Synapse;
 use gtk4::gio;
 use gtk4::gio::prelude::*;
 
-/// Principia's namespace and the three keys (prefs_core `schema.rs`, docs/dev/PREFS-SCHEMA.md).
-pub const NS: &str = "system";
-pub const KEYS: [&str; 3] = ["accessibility.reduce_motion", "accessibility.contrast", "accessibility.forced_colors"];
-
-/// The three rows as the face sends them.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct A11yRows {
-    pub reduce_motion: bool,
-    pub contrast: String,
-    pub forced_colors: bool,
-}
-
-impl A11yRows {
-    /// From a lookup of a `system` key's value (None: unset — the schema defaults false / `no-preference`).
-    pub fn from_values(get: impl Fn(&str) -> Option<PrefValue>) -> Self {
-        let truthy = |k: &str| match get(k) {
-            Some(PrefValue::Bool(b)) => b,
-            Some(PrefValue::Str(s)) => matches!(s.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes" | "on"),
-            Some(PrefValue::Int(i)) => i != 0,
-            _ => false,
-        };
-        let contrast = match get(KEYS[1]) {
-            Some(PrefValue::Str(s)) if !s.trim().is_empty() => s.trim().to_ascii_lowercase(),
-            _ => "no-preference".to_string(),
-        };
-        A11yRows { reduce_motion: truthy(KEYS[0]), contrast, forced_colors: truthy(KEYS[2]) }
-    }
-
-    pub fn message(&self) -> SMessage {
-        SMessage::BrowserA11yPrefs { reduce_motion: self.reduce_motion, contrast: self.contrast.clone(), forced_colors: self.forced_colors }
-    }
-}
-
-/// The rows in force now: Principia's store (a store that does not load reads as every row unset).
-pub fn read_rows() -> A11yRows {
-    let store = principia::prefs::PrefStore::load(principia::default_prefs_path()).ok();
-    A11yRows::from_values(|k| {
-        let s = store.as_ref()?;
-        s.get(NS, k).or_else(|| s.effective(NS, k, |e| std::env::var(e).ok()).map(|(v, _)| v))
-    })
-}
-
-/// A Principia change to one of the three rows.
-pub fn is_a11y_change(msg: &SMessage) -> bool {
-    matches!(msg, SMessage::Principia(PrincipiaCommand::PrefChanged { ns, key, .. }) if ns == NS && KEYS.contains(&key.as_str()))
-}
+// AETHERMACDEVTOOLS (SR312): the rows are `widgets::a11y_rows`' (both faces read them), re-exported here so the names
+// keep their paths; this face keeps the gio folder watch.
+pub use crate::widgets::a11y_rows::{is_a11y_change, read_rows, A11yRows, KEYS, NS};
 
 thread_local! {
     /// The store folder's monitor, alive for the life of the face.

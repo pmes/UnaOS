@@ -168,10 +168,11 @@ fn poster_is_frame_zero_while_paused() {
 #[test]
 fn codec_without_decoder_plays_the_labelled_stand_in() {
     let mut t = build::test_pattern_track(1, 320, 240, 10, 10, 10);
-    // H.264 has a decoder since H264CORE (SR133); HEVC is the codec with none.
-    t.spec.fourcc = *b"hvc1";
-    t.spec.config_box = Some(*b"hvcC");
-    t.spec.config = vec![1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    // HEVC has a decoder since HEVCPAL (SR215); MPEG-4 Part 2 Visual (`mp4v`) is mapped by no demux_core arm
+    // (Codec::Other) and decoded by no core.
+    t.spec.fourcc = *b"mp4v";
+    t.spec.config_box = None;
+    t.spec.config = Vec::new();
     let file = build::mp4(&[t], &Mp4Options::default());
     let time = ManualTime::new();
     let mut p = Player::open(file, Arc::new(time.clone()), None, 60).unwrap();
@@ -457,4 +458,1260 @@ fn wsola_time_stretch_keeps_the_pitch() {
         let per_sec = zc as f64 * sr as f64 / m as f64;
         assert!((per_sec - 882.0).abs() <= 15.0, "rate {rate}: {per_sec} zero crossings per second (pitch moved)");
     }
+}
+
+// HEVCPAL (LEDGER SR215): HEVC through the registry Stria's Player and editor share. The four NAL units are what
+// hevc_core's own test kit builds for its KAT `all_intra_dc_64x48_is_flat_128` (unaos/libs/media/hevc_core
+// tests/decode.rs `all_dc_stream(false, None)` over tests/common's VPS / SPS / PPS / CABAC builders; that kit is
+// test-local, so the bytes are embedded — HEVCTESTKIT owes one shared kit): Main profile, 64x48, CTB 64, every CU
+// INTRA_DC with no residual, so every sample of every plane is 128 (8.4.4.2.6 DC with no neighbours is
+// 1 << (BitDepth - 1)). The SPS's sps_max_num_reorder_pics is 0.
+const HEVC_VPS: [u8; 23] = [0x40, 0x01, 0x0c, 0x01, 0xff, 0xff, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0x90, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00, 0x3c, 0xac, 0x09];
+const HEVC_SPS: [u8; 27] = [0x42, 0x01, 0x01, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0x90, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00, 0x3c, 0xa0, 0x20, 0x83, 0x16, 0x5f, 0x92, 0x4c, 0x20, 0x80];
+const HEVC_PPS: [u8; 6] = [0x44, 0x01, 0xc0, 0x71, 0x81, 0x12];
+const HEVC_IDR: [u8; 11] = [0x26, 0x01, 0xaf, 0x80, 0x26, 0x1d, 0x2d, 0x2c, 0xbd, 0x47, 0x30];
+
+/// An all-intra HEVC video track of `n` IDR samples (40 ms apart), configured by an hvcC (ISO/IEC 14496-15 8.3.3.1:
+/// Main, level 60, 4:2:0, 8-bit, 4-byte NAL lengths, one VPS / SPS / PPS array each).
+fn hevc_kat_track(n: usize) -> build::MediaTrack {
+    let mut hvcc = vec![1, 0x01, 0x60, 0, 0, 0, 0x90, 0, 0, 0, 0, 0, 60, 0xf0, 0x00, 0xfc, 0xfd, 0xf8, 0xf8, 0, 0, 0x0f, 3];
+    for (ty, unit) in [(32u8, &HEVC_VPS[..]), (33, &HEVC_SPS[..]), (34, &HEVC_PPS[..])] {
+        hvcc.extend_from_slice(&[0x80 | ty, 0, 1]);
+        hvcc.extend_from_slice(&(unit.len() as u16).to_be_bytes());
+        hvcc.extend_from_slice(unit);
+    }
+    let mut sample = (HEVC_IDR.len() as u32).to_be_bytes().to_vec();
+    sample.extend_from_slice(&HEVC_IDR);
+    let mut spec = build::TrackSpec::test_pattern(1, 64, 48, 25);
+    spec.fourcc = *b"hvc1";
+    spec.config_box = Some(*b"hvcC");
+    spec.codec_id = "V_MPEGH/ISO/HEVC";
+    spec.config = hvcc;
+    spec.timescale = 1000;
+    let samples = (0..n)
+        .map(|i| build::SampleSpec { data: sample.clone(), dts: i as i64 * 40, pts: i as i64 * 40, duration: 40, keyframe: true })
+        .collect();
+    build::MediaTrack { spec, samples }
+}
+
+#[test]
+fn hevcpal_intra_mp4_decodes_flat_through_the_registry() {
+    use gneiss_pal::dsp::video::{Pixels, decoder_for};
+    let file = build::mp4(&[hevc_kat_track(3)], &Mp4Options::default());
+    let mut d = gneiss_pal::dsp::demux::Demuxer::open(file.clone()).unwrap();
+    let vt = d.tracks()[0].clone();
+    assert_eq!(vt.codec, gneiss_pal::dsp::demux::Codec::Hevc);
+    let mut dec = decoder_for(&vt).unwrap();
+    assert!(dec.is_real());
+    assert_eq!(dec.name(), "hevc (hevc_core)");
+    let mut frames = Vec::new();
+    while let Some(p) = d.next_packet() {
+        frames.extend(dec.decode(&p).unwrap());
+    }
+    frames.extend(dec.flush());
+    assert_eq!(frames.len(), 3);
+    for (i, f) in frames.iter().enumerate() {
+        assert_eq!((f.width, f.height, f.pts_ns), (64, 48, i as i64 * 40_000_000));
+        let Pixels::I420 { y, u, v, .. } = &f.pixels else { panic!("not I420") };
+        assert_eq!((y.len(), u.len(), v.len()), (64 * 48, 32 * 24, 32 * 24));
+        assert!(y.iter().chain(u).chain(v).all(|&s| s == 128), "frame {i} is not flat 128");
+    }
+    // The Player picks the same decoder: real frames, labelled hevc.
+    let p = Player::open(file, Arc::new(ManualTime::new()), None, 60).unwrap();
+    assert_eq!(p.info().video, "hvc1");
+    assert_eq!(p.info().video_decoder, "hevc (hevc_core)");
+    assert!(p.info().real_video);
+    println!("hevcpal: decoder={} frames={} flat=128", dec.name(), frames.len());
+}
+
+#[test]
+fn hevcpal_editor_derives_hevc_dts() {
+    use timeline_core::{SourceId, Timeline};
+    let file = build::mkv(&[hevc_kat_track(3)], &MkvOptions::default());
+    let d = gneiss_pal::dsp::demux::Demuxer::open(file.clone()).unwrap();
+    assert_eq!(d.tracks()[0].codec, gneiss_pal::dsp::demux::Codec::Hevc);
+    assert_eq!(gneiss_pal::dsp::video::reorder_depth(&d.tracks()[0]), Some(0), "hvcC's sps_max_num_reorder_pics");
+    let tl = Timeline::new(25);
+    let mut src = stria::nle::Sources::new(&tl);
+    src.add(SourceId(0), file).unwrap();
+    let r = src.open_report(SourceId(0)).unwrap();
+    assert_eq!(r.to_string(), "open=full dts=derived:0 edits=0 applied=first-only", "{r:?}");
+    println!("hevcpal: editor {r}");
+}
+
+// HEVCPAL-SWAP (LEDGER SR304): the Player's log lines, captured per thread (the tests of this binary run in parallel and
+// log through the one global logger; a test counts only the lines its own thread wrote).
+struct LogCapture;
+static CAPTURED: Mutex<Vec<(std::thread::ThreadId, String)>> = Mutex::new(Vec::new());
+impl log::Log for LogCapture {
+    fn enabled(&self, _: &log::Metadata) -> bool {
+        true
+    }
+    fn log(&self, r: &log::Record) {
+        CAPTURED.lock().unwrap().push((std::thread::current().id(), r.args().to_string()));
+    }
+    fn flush(&self) {}
+}
+fn capture_logs() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        log::set_logger(&LogCapture).expect("no other logger in this test binary");
+        log::set_max_level(log::LevelFilter::Info);
+    });
+}
+fn my_log_lines(containing: &str) -> Vec<String> {
+    let me = std::thread::current().id();
+    CAPTURED.lock().unwrap().iter().filter(|(t, l)| *t == me && l.contains(containing)).map(|(_, l)| l.clone()).collect()
+}
+
+/// HEVC_SPS re-packed as a stream hevc_core refuses by name. COLOURONE422 (SR359): luma and chroma depths that differ now
+/// decode (was this fixture's trigger, luma 13 / chroma 12), so chroma_format_idc becomes 3 (ue `010` -> `00100`) with
+/// separate_colour_plane_flag 1 after it (RBSP bit 105; depths 13 / 12 kept), re-escaped: "separate colour planes (HEVCREXT)".
+const HEVC_SPS_SEPPLANES: [u8; 28] = [0x42, 0x01, 0x01, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0x90, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00, 0x3c, 0x92, 0x04, 0x10, 0x62, 0x31, 0x4b, 0xf2, 0x49, 0x84, 0x10];
+/// HEVC_IDR with colour_plane_id u(2) = 0 after slice_type (payload bit 6): the slice header parses under
+/// HEVC_SPS_SEPPLANES, so the refusal is the named one (the bare HEVC_IDR there fails its alignment bit, a corrupt stream).
+const HEVC_IDR_SEPPLANES: [u8; 11] = [0x26, 0x01, 0xac, 0xe0, 0x09, 0x87, 0x4b, 0x4b, 0x2f, 0x51, 0xcc];
+
+#[derive(Default)]
+struct CountSink {
+    shown: Vec<(u64, i64)>,
+}
+impl FrameSink for CountSink {
+    fn present(&mut self, f: &Frame, ordinal: u64) {
+        self.shown.push((ordinal, f.pts_ns));
+    }
+}
+
+/// Rule: a decoder that refuses the stream mid-stream (the second sample carries an in-band refused SPS, so every later
+/// IDR activates an unsupported SPS) hands the picture to the labelled stand-in ONCE with one `swapped to stand-in`
+/// line; no per-packet warnings follow, and every sample still presents a frame (0 real, 1-3 the stand-in).
+#[test]
+fn hevcdepthcore_12bit_mid_stream_swaps_to_the_stand_in_once() {
+    capture_logs();
+    let mut t = hevc_kat_track(4);
+    let mut s1 = Vec::new();
+    for unit in [&HEVC_SPS_SEPPLANES[..], &HEVC_PPS[..], &HEVC_IDR_SEPPLANES[..]] {
+        s1.extend_from_slice(&(unit.len() as u32).to_be_bytes());
+        s1.extend_from_slice(unit);
+    }
+    t.samples[1].data = s1;
+    for i in 2..4 {
+        t.samples[i].data = [&(HEVC_IDR_SEPPLANES.len() as u32).to_be_bytes()[..], &HEVC_IDR_SEPPLANES[..]].concat();
+    }
+    let file = build::mp4(&[t], &Mp4Options::default());
+    let time = ManualTime::new();
+    let mut p = Player::open(file, Arc::new(time.clone()), None, 60).unwrap();
+    assert!(p.info().real_video);
+    assert_eq!(p.info().video_decoder, "hevc (hevc_core)");
+    p.play();
+    let mut sink = CountSink::default();
+    for _ in 0..120 {
+        if p.tick(&mut sink) == Tick::Ended {
+            break;
+        }
+        time.advance(16_666_667);
+    }
+    let lines = my_log_lines("[STRIA] :: video decode:");
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert_eq!(lines[0], "[STRIA] :: video decode: swapped to stand-in: no decoder: hevc: unsupported (separate colour planes (HEVCREXT))");
+    assert!(!p.info().real_video);
+    assert_eq!(p.info().video_decoder, "test-pattern (stand-in)");
+    assert_eq!(sink.shown.iter().map(|s| s.1).collect::<Vec<_>>(), [0, 40_000_000, 80_000_000, 120_000_000], "{:?}", sink.shown);
+    println!("hevcpal-swap: {} | frames={}", lines[0], sink.shown.len());
+}
+
+// METERPLAYER (LEDGER SR319): the Player's RMS through `audio_core::meter`, one meter per channel, read at each 50 ms
+// pts window's close and handed to the sink by `FrameSink::levels_rms` beside the unchanged window-max `levels`.
+#[derive(Default)]
+struct RmsSink {
+    peaks: Vec<(i64, [f32; 2])>,
+    rms: Vec<(i64, [f64; 2])>,
+}
+impl FrameSink for RmsSink {
+    fn present(&mut self, _f: &Frame, _ordinal: u64) {}
+    fn levels(&mut self, pts_ns: i64, peaks: &[[f32; 2]]) {
+        for (i, p) in peaks.iter().enumerate() {
+            self.peaks.push((pts_ns + i as i64 * stria::media::LEVEL_WINDOW_NS, *p));
+        }
+    }
+    fn levels_rms(&mut self, pts_ns: i64, rms_db: &[[f64; 2]]) {
+        for (i, r) in rms_db.iter().enumerate() {
+            self.rms.push((pts_ns + i as i64 * stria::media::LEVEL_WINDOW_NS, *r));
+        }
+    }
+}
+
+/// 1 s of 48 kHz stereo PCM16, a 1 kHz sine at 0.5 full scale left and 0.25 right (2400 frames = one 50 ms window =
+/// fifty whole periods): twenty windows, each RMS 20 log10(A / sqrt 2) = -9.031 / -15.051 dBFS, at the peaks' pts.
+#[test]
+fn meterplayer_rms_of_a_stereo_sine_through_the_players_sink() {
+    let rate = 48_000usize;
+    let pcm: Vec<i16> = (0..rate)
+        .flat_map(|i| {
+            let x = (2.0 * std::f64::consts::PI * 1000.0 * i as f64 / rate as f64).sin();
+            [(x * 16384.0).round() as i16, (x * 8192.0).round() as i16]
+        })
+        .collect();
+    let file = build::mkv(&[build::pcm16_track(1, rate as u32, 2, &pcm, 960)], &MkvOptions::default());
+    let time = ManualTime::new();
+    let (src, feed) = stream_pair_channels(rate as u32, 2, rate / 2);
+    let mut graph = AudioGraph::new(rate as f64);
+    graph.add_node(Box::new(src));
+    let mut p = Player::open(file, Arc::new(time.clone()), Some(Box::new(SharedFeed(Arc::new(Mutex::new(feed))))), 60).unwrap();
+    assert!(!p.info().has_video && p.info().audio_clock, "{:?}", p.info());
+    p.play();
+    let mut sink = RmsSink::default();
+    let (mut owed, mut ended) = (0usize, false);
+    for _ in 0..200 {
+        if p.tick(&mut sink) == Tick::Ended {
+            ended = true;
+            break;
+        }
+        time.advance(16_666_667);
+        owed += 800;
+        while owed >= BLOCK_SIZE {
+            graph.process_stereo();
+            owed -= BLOCK_SIZE;
+        }
+    }
+    assert!(ended);
+    assert_eq!(sink.rms.len(), 20, "one RMS per 50 ms window");
+    assert_eq!(sink.peaks.iter().map(|w| w.0).collect::<Vec<_>>(), sink.rms.iter().map(|w| w.0).collect::<Vec<_>>(), "the same windows");
+    let (want_l, want_r) = (20.0 * (0.5f64 / 2f64.sqrt()).log10(), 20.0 * (0.25f64 / 2f64.sqrt()).log10());
+    for (k, (t, r)) in sink.rms.iter().enumerate() {
+        assert_eq!(*t, k as i64 * stria::media::LEVEL_WINDOW_NS);
+        assert!((r[0] - want_l).abs() < 0.02 && (r[1] - want_r).abs() < 0.02, "window {k}: {r:?} want [{want_l}, {want_r}]");
+        let pk = sink.peaks[k].1;
+        assert!((pk[0] - 0.5).abs() < 0.001 && (pk[1] - 0.25).abs() < 0.001, "window {k}: peaks {pk:?}");
+    }
+}
+
+// SWAPBACK (LEDGER SR329): an HEVC reel whose sample 1 turns refused (an in-band HEVC_SPS_SEPPLANES; COLOURONE422 SR359:
+// was 13-bit), sample 2 a bare IDR still inside the refused span, and sample 3 8-bit again (the in-band HEVC_SPS): the one
+// `stria::decode_swap` takes the Player and the editor to the stand-in at sample 1 and back at sample 3's keyframe.
+fn swapback_reel() -> Vec<u8> {
+    let mut t = hevc_kat_track(6);
+    swapback_span(&mut t, 1, 3);
+    build::mp4(&[t], &Mp4Options::default())
+}
+
+/// COLOURONE422 (SR359): sample `from` carries the refused in-band sets, `from + 1 .. back` bare IDRs on them (each with its
+/// colour_plane_id, so each is refused by name), sample `back` the 8-bit HEVC_SPS again.
+fn swapback_span(t: &mut build::MediaTrack, from: usize, back: usize) {
+    for i in from..=back {
+        let units: Vec<&[u8]> = if i == from {
+            vec![&HEVC_SPS_SEPPLANES[..], &HEVC_PPS[..], &HEVC_IDR_SEPPLANES[..]]
+        } else if i == back {
+            vec![&HEVC_SPS[..], &HEVC_PPS[..], &HEVC_IDR[..]]
+        } else {
+            vec![&HEVC_IDR_SEPPLANES[..]]
+        };
+        t.samples[i].data = units.iter().flat_map(|u| [&(u.len() as u32).to_be_bytes()[..], *u].concat()).collect();
+    }
+}
+
+/// The flat-128 KAT picture (Y = U = V = 128) through `Frame::to_rgba`, pinned (BT.601 limited range: (128 - 16) * 255 / 219).
+const SWAPBACK_FLAT: [u8; 4] = [130, 130, 130, 255];
+
+/// Frame `i` of the swapback reel as the rule says it shows: the stand-in's counter for samples 1-2, flat for the rest.
+fn swapback_expected(i: usize, rgba: &[u8]) {
+    if i == 1 || i == 2 {
+        assert_eq!(rgba, &TestPattern::render(64, 48, i as u32)[..], "frame {i} is not the stand-in");
+    } else {
+        assert!(rgba.chunks(4).all(|p| p == SWAPBACK_FLAT), "frame {i} is not flat {:?}", &rgba[..4]);
+    }
+}
+
+#[derive(Default)]
+struct RgbaSink {
+    shown: Vec<(i64, Vec<u8>)>,
+}
+impl FrameSink for RgbaSink {
+    fn present(&mut self, f: &Frame, _ordinal: u64) {
+        self.shown.push((f.pts_ns, f.to_rgba()));
+    }
+}
+
+/// Rule: the Player swaps to the stand-in ONCE at the refused sample and back ONCE at the later 8-bit keyframe (the bare
+/// IDR between is offered to the parked decoder and refused, since it keeps the in-band refused SPS); two log lines, every
+/// sample presents a frame, real pixels after the swap back, and `MediaInfo` names the real decoder again.
+#[test]
+fn swapback_player_returns_to_the_real_decoder_at_the_8bit_keyframe() {
+    capture_logs();
+    let time = ManualTime::new();
+    let mut p = Player::open(swapback_reel(), Arc::new(time.clone()), None, 60).unwrap();
+    assert_eq!(p.info().video_decoder, "hevc (hevc_core)");
+    p.play();
+    let mut sink = RgbaSink::default();
+    for _ in 0..200 {
+        if p.tick(&mut sink) == Tick::Ended {
+            break;
+        }
+        time.advance(16_666_667);
+    }
+    let lines = my_log_lines("[STRIA] :: video decode:");
+    assert_eq!(
+        lines,
+        [
+            "[STRIA] :: video decode: swapped to stand-in: no decoder: hevc: unsupported (separate colour planes (HEVCREXT))",
+            "[STRIA] :: video decode: swapped back at 120000000",
+        ],
+    );
+    assert!(p.info().real_video);
+    assert_eq!(p.info().video_decoder, "hevc (hevc_core)");
+    assert_eq!(sink.shown.iter().map(|s| s.0).collect::<Vec<_>>(), (0..6).map(|i| i * 40_000_000).collect::<Vec<i64>>());
+    for (i, (_, rgba)) in sink.shown.iter().enumerate() {
+        swapback_expected(i, rgba);
+    }
+    println!("swapback: {} | {} | frames={}", lines[0], lines[1], sink.shown.len());
+}
+
+/// Rule: the editor's render over the same reel draws the stand-in for the refused span and real frames after it (today's
+/// render failed whole on the refusal), and the reel's open report says ` decode=stand-in` only once a render drew it.
+#[test]
+fn swapback_editor_renders_the_stand_in_span_and_reports_it() {
+    use stria::nle::{RenderSink, Sources, render};
+    use timeline_core::SourceId;
+    struct Frames(Vec<(i64, Vec<u8>)>);
+    impl RenderSink for Frames {
+        fn frame(&mut self, out_t: i64, w: u32, h: u32, rgba: &[u8]) {
+            assert_eq!((w, h), (64, 48));
+            self.0.push((out_t, rgba.to_vec()));
+        }
+        fn pcm(&mut self, _: i64, _: u32, _: u16, _: &[f32]) {}
+    }
+    let (tl, src) = Sources::from_media("A", &swapback_reel(), 25).unwrap().unwrap();
+    let before = src.open_report(SourceId(0)).unwrap().to_string();
+    assert!(!before.contains("decode="), "{before}");
+    let mut sink = Frames(Vec::new());
+    let r = render(&tl, 0..6, &src, &mut sink).unwrap();
+    assert_eq!(r.frames, 6);
+    assert_eq!(sink.0.iter().map(|f| f.0).collect::<Vec<_>>(), [0, 1, 2, 3, 4, 5]);
+    for (i, (_, rgba)) in sink.0.iter().enumerate() {
+        swapback_expected(i, rgba);
+    }
+    let after = src.open_report(SourceId(0)).unwrap().to_string();
+    assert_eq!(after, format!("{before} decode=stand-in"));
+    println!("swapback: editor {after}");
+}
+
+// COLOURONE (LEDGER SR328): the Player's RGBA path (`media_bus`'s BusSink) converts a Main 10 picture from its 16-bit
+// samples (HEVCMAIN10-PLAYER) and by the Player's colour (`Player::colour`).
+
+/// The first MediaFrame's RGBA of `file` posted through the MediaService (the bus sink's one conversion).
+fn posted_rgba(file: Vec<u8>, name: &str) -> (u32, u32, Vec<u8>) {
+    let dir = std::env::temp_dir().join(format!("stria-colourone-{}-{name}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(format!("{name}.mp4"));
+    std::fs::write(&path, file).unwrap();
+    let url = format!("file://{}", path.display());
+    let synapse = Synapse::new();
+    let mut rx = synapse.subscribe();
+    let svc = MediaService::spawn(synapse.clone(), 120, false);
+    synapse.fire(SMessage::MediaPoster { url: url.clone() });
+    let t0 = Instant::now();
+    let mut got = None;
+    while got.is_none() && t0.elapsed() < Duration::from_secs(20) {
+        match rx.try_recv() {
+            Ok(SMessage::MediaFrame { width, height, rgba, .. }) if width > 0 => got = Some((width, height, rgba)),
+            Ok(_) => {}
+            Err(_) => std::thread::sleep(Duration::from_millis(2)),
+        }
+    }
+    drop(svc);
+    let _ = std::fs::remove_dir_all(&dir);
+    got.expect("a poster frame")
+}
+
+#[test]
+fn colourone_player_main10_converts_from_ten_bits_and_by_its_colour() {
+    use gneiss_pal::dsp::demux::colour::Colour;
+    use gneiss_pal::dsp::image::heic_kat::{access_unit, hvc1_track, main10_hvcc, main10_slice};
+    let track = || hvc1_track(main10_hvcc(), &access_unit(&main10_slice()), 32, 32, 2);
+    // Untagged 32x32: BT.601 limited from Y 515 Cb 600 Cr 400 at 10 bits (the >> 2 planes would give 86, 145, 175).
+    let (w, h, rgba) = posted_rgba(build::mp4(&[track()], &Mp4Options::default()), "plain");
+    assert_eq!((w, h), (32, 32));
+    assert!(rgba.chunks_exact(4).all(|p| p == [87, 145, 176, 255]), "{:?}", &rgba[..4]);
+    // A colr saying BT.709 limited: the 10-bit table (19077, 29372, 3494, 8731, 34610) at >> 16 gives (81, 142, 178).
+    let c709 = Colour { primaries: 1, transfer: 1, matrix: 1, full_range: Some(false), mastering: None, light: None };
+    let x = build::Mp4Extras { colour: vec![(1, c709)], ..Default::default() };
+    let file = build::mp4_with(&[track()], &Mp4Options::default(), &x);
+    assert_eq!(Player::open(file.clone(), Arc::new(ManualTime::new()), None, 60).unwrap().colour(), Some(&c709));
+    let (_, _, tagged) = posted_rgba(file, "bt709");
+    assert!(tagged.chunks_exact(4).all(|p| p == [81, 142, 178, 255]), "{:?}", &tagged[..4]);
+    println!("colourone: player main10 rgba=87,145,176 bt709=81,142,178");
+}
+
+// SWAPBACKSEEK (LEDGER SR353): a seek (the Player's) and a run open (the editor's) restart the decode at the target keyframe
+// with the in-band parameter sets in effect THERE (`DecodeSwap::reseed`). The Player decodes VIDEO_AHEAD (4) frames ahead of
+// the glass, so its reel's refused span outlasts that: s1 carries the in-band refused sets (`HEVC_SPS_SEPPLANES`), s2-s7 are
+// bare IDRs on them, s8 carries the 8-bit `HEVC_SPS` again, s9-s11 are bare IDRs on it, s0 a bare IDR on the container's.
+fn swapbackseek_reel() -> Vec<u8> {
+    let mut t = hevc_kat_track(12);
+    swapback_span(&mut t, 1, 8);
+    build::mp4(&[t], &Mp4Options::default())
+}
+
+/// Tick `p` into `sink` until `stop` holds or the stream ends.
+fn swapbackseek_run(p: &mut Player, time: &ManualTime, sink: &mut RgbaSink, stop: impl Fn(&Player, &RgbaSink) -> bool) {
+    for _ in 0..400 {
+        if stop(p, sink) || p.tick(sink) == Tick::Ended {
+            break;
+        }
+        time.advance(16_666_667);
+    }
+}
+
+/// The reel played straight through: the reference frames (s1-s7 the stand-in's counter, the rest flat).
+fn swapbackseek_straight() -> Vec<(i64, Vec<u8>)> {
+    let time = ManualTime::new();
+    let mut p = Player::open(swapbackseek_reel(), Arc::new(time.clone()), None, 60).unwrap();
+    p.play();
+    let mut sink = RgbaSink::default();
+    swapbackseek_run(&mut p, &time, &mut sink, |_, _| false);
+    assert_eq!(sink.shown.len(), 12);
+    for (i, (_, rgba)) in sink.shown.iter().enumerate() {
+        if (1..=7).contains(&i) {
+            assert_eq!(rgba, &TestPattern::render(64, 48, i as u32), "straight frame {i} is not the stand-in");
+        } else {
+            assert!(rgba.chunks(4).all(|p| p == SWAPBACK_FLAT), "straight frame {i} is not flat");
+        }
+    }
+    sink.shown
+}
+
+/// A Player on the stand-in with the refused decoder parked (it holds s1's refused sets; s8 is past the lookahead).
+fn swapbackseek_parked() -> (Player, ManualTime) {
+    let time = ManualTime::new();
+    let mut p = Player::open(swapbackseek_reel(), Arc::new(time.clone()), None, 60).unwrap();
+    p.play();
+    let mut sink = RgbaSink::default();
+    swapbackseek_run(&mut p, &time, &mut sink, |p, _| !p.info().real_video);
+    assert!(!p.info().real_video, "never swapped to the stand-in");
+    (p, time)
+}
+
+/// Rule: after straight play (the decoder holds s8's 8-bit sets) a seek to s4 decodes it with s1's refused sets: the target
+/// is refused and the stand-in shows AT the target (today: the stale 8-bit sets decode it flat).
+#[test]
+fn swapbackseek_player_seek_into_the_refused_span_starts_on_the_stand_in() {
+    capture_logs();
+    let time = ManualTime::new();
+    let mut p = Player::open(swapbackseek_reel(), Arc::new(time.clone()), None, 60).unwrap();
+    p.play();
+    let mut sink = RgbaSink::default();
+    swapbackseek_run(&mut p, &time, &mut sink, |_, _| false);
+    assert!(p.info().real_video);
+    p.seek(160_000_000);
+    p.play();
+    let mut sink = RgbaSink::default();
+    swapbackseek_run(&mut p, &time, &mut sink, |_, s| !s.shown.is_empty());
+    assert_eq!(sink.shown[0].0, 160_000_000);
+    assert_eq!(sink.shown[0].1, TestPattern::render(64, 48, 4), "the seek target is not the stand-in");
+    assert!(!p.info().real_video);
+    let lines = my_log_lines("[STRIA] :: video decode:");
+    assert_eq!(lines.len(), 3, "{lines:?}");
+    assert!(lines[2].starts_with("[STRIA] :: video decode: swapped to stand-in: "), "{lines:?}");
+    println!("swapbackseek: into the span -> {}", p.info().video_decoder);
+}
+
+/// Rule: parked on the stand-in (refused sets), a seek to s9 decodes it with s8's 8-bit sets on the real decoder at once —
+/// the frames equal the straight-play frames at those pts, and no `swapped back` line (nothing waited for a keyframe); a
+/// seek to s0 decodes on the container's sets (today: both offered to the parked decoder, refused, the stand-in).
+#[test]
+fn swapbackseek_player_seek_out_of_the_span_decodes_the_8bit_keyframe_at_once() {
+    capture_logs();
+    let straight = swapbackseek_straight();
+    let (mut p, time) = swapbackseek_parked();
+    p.seek(360_000_000);
+    p.play();
+    let mut sink = RgbaSink::default();
+    swapbackseek_run(&mut p, &time, &mut sink, |_, s| s.shown.len() >= 2);
+    assert_eq!(sink.shown, straight[9..11].to_vec(), "s9/s10 after the seek are not the straight-play frames");
+    assert!(p.info().real_video);
+    assert_eq!(p.info().video_decoder, "hevc (hevc_core)");
+    let (mut p, time) = swapbackseek_parked();
+    p.seek(0);
+    p.play();
+    let mut sink = RgbaSink::default();
+    swapbackseek_run(&mut p, &time, &mut sink, |_, s| !s.shown.is_empty());
+    assert_eq!(sink.shown[0], straight[0], "s0 after the seek is not the container-set frame"); // (the lookahead has decoded s1 by now: the stand-in again, rightly)
+    let back: Vec<String> = my_log_lines("swapped back").into_iter().filter(|l| !l.ends_with("at 320000000")).collect();
+    assert!(back.is_empty(), "{back:?}");
+    println!("swapbackseek: out of the span -> s9 s10 s0 real, equal to straight play");
+}
+
+/// Rule: the editor's run opened at s2 (a render of tick 2 alone) decodes with s1's refused sets and draws the stand-in; a run
+/// opened at s4 draws the frame the whole render draws there (today: the container's sets decode s2 flat).
+#[test]
+fn swapbackseek_editor_run_opened_inside_the_span_draws_the_stand_in() {
+    use stria::nle::{RenderSink, Sources, render};
+    use timeline_core::SourceId;
+    struct Frames(Vec<Vec<u8>>);
+    impl RenderSink for Frames {
+        fn frame(&mut self, _out_t: i64, _w: u32, _h: u32, rgba: &[u8]) {
+            self.0.push(rgba.to_vec());
+        }
+        fn pcm(&mut self, _: i64, _: u32, _: u16, _: &[f32]) {}
+    }
+    let (tl, src) = Sources::from_media("A", &swapback_reel(), 25).unwrap().unwrap();
+    let mut whole = Frames(Vec::new());
+    render(&tl, 0..6, &src, &mut whole).unwrap();
+    let mut at2 = Frames(Vec::new());
+    render(&tl, 2..3, &src, &mut at2).unwrap();
+    assert_eq!(at2.0, [TestPattern::render(64, 48, 2)], "a run opened at s2 is not the stand-in");
+    let mut at4 = Frames(Vec::new());
+    render(&tl, 4..5, &src, &mut at4).unwrap();
+    assert_eq!(at4.0, whole.0[4..5].to_vec());
+    let report = src.open_report(SourceId(0)).unwrap().to_string();
+    assert!(report.ends_with(" decode=stand-in"), "{report}");
+    println!("swapbackseek: editor {report}");
+}
+
+// AV1PLAYERCOLOUR (LEDGER SR347): an AV1 reel's frames reach the bus sink as planes and convert by the reel's colour and the
+// size default with bilinear chroma (`chroma_of`), the kernel Player's `colour_rgba_av1`. The AV1 pictures are public AVIF
+// vectors' primary items (av1_core's ONE sha256-pinned fetcher, by path; SKIP offline), muxed as an `av01` MP4 track whose
+// av1C is cut to its 4-byte header. AV1INBANDCOLOUR (SR366): the item's in-band sequence header then states the bitstream's
+// colour (measured: kids_720p 2/2/2 limited, so the size default still converts it; kodim23 1/13/6 full, so its in-band range
+// wins over the size default's limited), and a `colr` wins over both.
+#[path = "../../../unaos/libs/media/av1_core/tests/common/mod.rs"]
+mod av1_vectors;
+
+/// `name`'s primary AV1 item as 2 key samples of an `av01` track (`colr` from `colour` when given), and its size.
+fn av1playercolour_reel(name: &str, colour: Option<gneiss_pal::dsp::demux::colour::Colour>) -> Option<(Vec<u8>, u32, u32)> {
+    let item = av1_vectors::avif_item(&av1_vectors::fetch(name)?).unwrap();
+    let (w, h) = item.ispe.unwrap();
+    let mut spec = build::TrackSpec::test_pattern(1, w as u16, h as u16, 25);
+    spec.fourcc = *b"av01";
+    spec.config_box = Some(*b"av1C");
+    spec.codec_id = "V_AV1";
+    spec.config = item.av1c.unwrap()[..4].to_vec();
+    spec.timescale = 1000;
+    let samples = (0..2).map(|i| build::SampleSpec { data: item.data.clone(), dts: i * 40, pts: i * 40, duration: 40, keyframe: true }).collect();
+    let x = build::Mp4Extras { colour: colour.map(|c| vec![(1, c)]).unwrap_or_default(), ..Default::default() };
+    Some((build::mp4_with(&[build::MediaTrack { spec, samples }], &Mp4Options::default(), &x), w, h))
+}
+
+/// The reel's first frame through the registry, converted by an explicit colour with bilinear chroma.
+fn av1playercolour_expect(file: &[u8], c: &gneiss_pal::dsp::demux::colour::Colour) -> Vec<u8> {
+    use gneiss_pal::dsp::video::{Chroma, Pixels, decoder_for};
+    let mut d = gneiss_pal::dsp::demux::Demuxer::open(file.to_vec()).unwrap();
+    let mut dec = decoder_for(&d.tracks()[0].clone()).unwrap();
+    let f = dec.decode(&d.next_packet().unwrap()).unwrap().unwrap();
+    assert!(matches!(f.pixels, Pixels::I420 { .. }), "an 8-bit 4:2:0 AV1 frame leaves as planes");
+    f.to_rgba_colour(Some(c), Chroma::Bilinear)
+}
+
+fn av1playercolour_c(matrix: u8) -> gneiss_pal::dsp::demux::colour::Colour {
+    gneiss_pal::dsp::demux::colour::Colour { primaries: matrix, transfer: matrix, matrix, full_range: Some(false), mastering: None, light: None }
+}
+
+#[test]
+fn av1playercolour_untagged_720p_converts_bt709_by_the_size_default() {
+    let Some((file, w, h)) = av1playercolour_reel("kids_720p", None) else { return };
+    assert_eq!((w, h), (1280, 720));
+    let (e709, e601) = (av1playercolour_expect(&file, &av1playercolour_c(1)), av1playercolour_expect(&file, &av1playercolour_c(6)));
+    assert_ne!(e709, e601, "the vector separates the two matrices");
+    assert_eq!(Player::open(file.clone(), Arc::new(ManualTime::new()), None, 60).unwrap().colour(), Some(&av1playercolour_c(2)), "the in-band header: 2/2/2 limited");
+    let (pw, ph, posted) = posted_rgba(file, "av1-720p");
+    assert_eq!((pw, ph), (1280, 720));
+    assert!(posted == e709, "untagged 1280x720 AV1 is not BT.709 limited bilinear");
+    println!("av1playercolour: kids_720p untagged=bt709 (size default) bilinear");
+}
+
+#[test]
+fn av1playercolour_sd_reel_colr_709_wins_and_untagged_is_bt601() {
+    let Some((plain, w, h)) = av1playercolour_reel("kodim23_yuv420_8bpc", None) else { return };
+    assert_eq!((w, h), (768, 512));
+    let (e709, e601) = (av1playercolour_expect(&plain, &av1playercolour_c(1)), av1playercolour_expect(&plain, &av1playercolour_c(6)));
+    assert_ne!(e709, e601, "the vector separates the two matrices");
+    let inband = gneiss_pal::dsp::demux::colour::Colour { primaries: 1, transfer: 13, full_range: Some(true), ..av1playercolour_c(6) };
+    assert_eq!(Player::open(plain.clone(), Arc::new(ManualTime::new()), None, 60).unwrap().colour(), Some(&inband), "the in-band header: 1/13/6 full");
+    let e601full = av1playercolour_expect(&plain, &inband);
+    assert_ne!(e601full, e601, "the vector separates the two ranges");
+    let (_, _, posted) = posted_rgba(plain, "av1-sd");
+    assert!(posted == e601full, "an av1C-less 768x512 AV1 reel is not converted by its in-band BT.601 full range (bilinear)");
+    let c709 = av1playercolour_c(1);
+    let (tagged, _, _) = av1playercolour_reel("kodim23_yuv420_8bpc", Some(c709)).unwrap();
+    assert_eq!(Player::open(tagged.clone(), Arc::new(ManualTime::new()), None, 60).unwrap().colour(), Some(&c709));
+    let (_, _, posted) = posted_rgba(tagged, "av1-sd-709");
+    assert!(posted == e709, "a colr of BT.709 on an SD AV1 reel does not win over the size default");
+    println!("av1playercolour: kodim23 in-band=bt601-full colr709=bt709 bilinear");
+}
+
+// AV1INBANDCOLOUR (LEDGER SR366): the ONE rule at 720p — container colour > the bitstream (av1C configOBUs, else the first
+// temporal unit's in-band sequence header) > the size default. A 1280x720 av01 reel whose av1C has no configOBUs and whose
+// first sample states BT.601 in-band converts BT.601, not the size default's BT.709 (synthetic, not decodable: Stria's open
+// line drives the colour, `Frame::to_rgba_colour` the pick).
+#[test]
+fn av1inband_720p_in_band_bt601_wins_over_the_size_default() {
+    use gneiss_pal::dsp::demux::Demuxer;
+    use gneiss_pal::dsp::video::{Chroma, Pixels, colour_of, reorder_depth};
+    let mut w = av1_vectors::BitWriter::default();
+    w.put(3, 0); // seq_profile
+    w.flag(true); // still_picture
+    w.flag(true); // reduced_still_picture_header
+    w.put(5, 8); // seq_level_idx[0]
+    w.put(4, 10); // frame_width_bits_minus_1
+    w.put(4, 9); // frame_height_bits_minus_1
+    w.put(11, 1279);
+    w.put(10, 719);
+    for _ in 0..6 {
+        w.flag(false); // 128x128, filter_intra, intra_edge, superres, cdef, restoration
+    }
+    w.flag(false); // high_bitdepth
+    w.flag(false); // mono_chrome
+    w.flag(true); // color_description_present_flag
+    w.put(8, 6);
+    w.put(8, 6);
+    w.put(8, 6);
+    w.flag(false); // color_range: limited
+    w.put(2, 0); // chroma_sample_position
+    w.flag(false); // separate_uv_delta_q
+    w.flag(false); // film_grain_params_present
+    w.trailing();
+    let seq = w.bytes;
+    let mut tu = vec![(2 << 3) | 0x02, 0, (1 << 3) | 0x02, seq.len() as u8];
+    tu.extend_from_slice(&seq);
+    let mut spec = build::TrackSpec::test_pattern(1, 1280, 720, 25);
+    spec.fourcc = *b"av01";
+    spec.config_box = Some(*b"av1C");
+    spec.codec_id = "V_AV1";
+    spec.config = vec![0x81, 0x00, 0x0C, 0x00];
+    spec.timescale = 1000;
+    let samples = (0..2).map(|i| build::SampleSpec { data: if i == 0 { tu.clone() } else { vec![0x12, 0] }, dts: i * 40, pts: i * 40, duration: 40, keyframe: i == 0 }).collect();
+    let file = build::mp4_with(&[build::MediaTrack { spec, samples }], &Mp4Options::default(), &build::Mp4Extras::default());
+    let mut d = Demuxer::open(file).unwrap();
+    assert_eq!(d.tracks()[0].colour, None, "no colr");
+    d.derive_dts(reorder_depth); d.fill_colour(colour_of);
+    let c = d.tracks()[0].colour.expect("the in-band header fills the colour");
+    assert_eq!(c, av1playercolour_c(6), "6/6/6 limited from the first temporal unit");
+    let (y, u, v) = (vec![120u8; 1280 * 720], vec![90u8; 640 * 360], vec![200u8; 640 * 360]);
+    let f = Frame { width: 1280, height: 720, pts_ns: 0, pixels: Pixels::I420 { y, u, v, y_stride: 1280, uv_stride: 640 } };
+    let by_track = f.to_rgba_colour(Some(&c), Chroma::Bilinear);
+    assert_eq!(by_track, f.to_rgba(), "the in-band BT.601 limited converts (flat chroma: bilinear == nearest)");
+    assert_ne!(by_track, f.to_rgba_colour(None, Chroma::Bilinear), "not the 720p size default, BT.709");
+    println!("av1inband: 1280x720 in-band={} beats the size default", c);
+}
+
+// AV1INBANDSWITCH (LEDGER SR373): a new sequence header mid-stream changing color_config re-picks the colour. kids_720p's item
+// header (measured: a full sequence header, color_description_present_flag at bit 79 = 0, so 2/2/2; color_range at bit 80;
+// color_config ends at bit 85) is re-packed with 6/6/6 limited for the reel's last two samples: the same frame decodes, the
+// first two convert by the 720p size default (BT.709 limited), the last two by the new header's BT.601 limited, one log line.
+const AV1INBANDSWITCH_CDP_BIT: usize = 79;
+const AV1INBANDSWITCH_CC_END: usize = 85;
+
+/// kids_720p's sequence header payload (`seq`, the item's first OBU) with color_description 6/6/6 and the range bit `full`.
+fn av1inbandswitch_patch(seq: &[u8], full: bool) -> Vec<u8> {
+    let bit = |i: usize| (seq[i / 8] >> (7 - i % 8)) & 1 == 1;
+    let mut w = av1_vectors::BitWriter::default();
+    for i in 0..AV1INBANDSWITCH_CDP_BIT {
+        w.flag(bit(i));
+    }
+    w.flag(true); // color_description_present_flag
+    for _ in 0..3 {
+        w.put(8, 6);
+    }
+    w.flag(full); // color_range
+    for i in AV1INBANDSWITCH_CDP_BIT + 2..AV1INBANDSWITCH_CC_END {
+        w.flag(bit(i)); // chroma_sample_position, separate_uv_delta_q, film_grain_params_present
+    }
+    w.trailing();
+    w.bytes
+}
+
+/// kids_720p's item as 4 key samples of an `av01` track (av1C cut to its header); samples 2-3 carry the 6/6/6 header.
+fn av1inbandswitch_reel() -> Option<(Vec<u8>, Vec<u8>)> {
+    let item = av1_vectors::avif_item(&av1_vectors::fetch("kids_720p")?).unwrap();
+    let data = item.data.clone();
+    assert_eq!(&data[..2], &[0x0A, 0x0B], "the item opens with its 11-byte sequence header OBU");
+    let seq = av1inbandswitch_patch(&data[2..13], false);
+    let mut switched = vec![0x0A, seq.len() as u8];
+    switched.extend_from_slice(&seq);
+    switched.extend_from_slice(&data[13..]);
+    assert_eq!(av1_core::image::sequence_codes(&data), Some(((2, 2, 2, false), None, None)), "the vector's own header");
+    assert_eq!(av1_core::image::sequence_codes(&switched), Some(((6, 6, 6, false), None, None)), "the re-packed header");
+    let mut spec = build::TrackSpec::test_pattern(1, 1280, 720, 25);
+    spec.fourcc = *b"av01";
+    spec.config_box = Some(*b"av1C");
+    spec.codec_id = "V_AV1";
+    spec.config = item.av1c.unwrap()[..4].to_vec();
+    spec.timescale = 1000;
+    let samples = (0..4).map(|i| build::SampleSpec { data: if i < 2 { data.clone() } else { switched.clone() }, dts: i * 40, pts: i * 40, duration: 40, keyframe: true }).collect();
+    let file = build::mp4_with(&[build::MediaTrack { spec, samples }], &Mp4Options::default(), &build::Mp4Extras::default());
+    Some((file, data))
+}
+
+/// The bus sink's conversion (`media_bus`'s `BusSink`): every presented frame by the open's colour, AV1's bilinear chroma.
+struct Av1InBandSwitchSink {
+    colour: Option<gneiss_pal::dsp::demux::colour::Colour>,
+    shown: Vec<Vec<u8>>,
+}
+impl FrameSink for Av1InBandSwitchSink {
+    fn present(&mut self, f: &Frame, _ordinal: u64) {
+        self.shown.push(f.to_rgba_colour(self.colour.as_ref(), gneiss_pal::dsp::video::Chroma::Bilinear));
+    }
+}
+
+#[test]
+fn av1inbandswitch_player_repicks_bt601_after_the_header_switch() {
+    capture_logs();
+    let Some((file, _)) = av1inbandswitch_reel() else { return };
+    let (e709, e601) = (av1playercolour_expect(&file, &av1playercolour_c(1)), av1playercolour_expect(&file, &av1playercolour_c(6)));
+    assert_ne!(e709, e601, "the vector separates the two matrices");
+    let time = ManualTime::new();
+    let mut p = Player::open(file, Arc::new(time.clone()), None, 60).unwrap();
+    assert_eq!(p.colour(), Some(&av1playercolour_c(2)), "the open's in-band header: 2/2/2 limited");
+    p.play();
+    let mut sink = Av1InBandSwitchSink { colour: p.colour().copied(), shown: Vec::new() };
+    for _ in 0..400 {
+        if sink.shown.len() >= 4 || p.tick(&mut sink) == Tick::Ended {
+            break;
+        }
+        time.advance(16_666_667);
+    }
+    assert_eq!(sink.shown.len(), 4, "every sample presents");
+    assert!(sink.shown[0] == e709 && sink.shown[1] == e709, "before the switch: the 720p size default, BT.709 limited");
+    assert!(sink.shown[2] == e601 && sink.shown[3] == e601, "after the switch: the new header's BT.601 limited");
+    let lines = my_log_lines("video colour switch");
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].contains("matrix=2->6 range=limited"), "{}", lines[0]);
+    println!("av1inbandswitch: {} ; frames 0-1 bt709, 2-3 bt601", lines[0]);
+}
+
+/// HEVCLEVELLINE (LEDGER SR368, HEVC-LEVEL-LINE): the Player's info carries the hvcC SPS's profile / tier / level tokens
+/// (`gneiss_pal::dsp::video::profile_level`, hevc_core's A.3 names): the KAT reel's Main SPS reads `profile=Main
+/// tier=main level=2`; the refused SPS (HEVC_SPS_SEPPLANES, COLOURONE422 SR359: was 13/12-bit) with its profile_tier_level patched (byte 3: tier 1, general_profile_idc 4 with
+/// every constraint flag 0; byte 17: general_level_idc 153), carried by the hvcC, reads `profile=RExt tier=high level=5.1`
+/// (the open reads the record, before any picture: the decode's refusal comes later).
+#[test]
+fn hevclevelline_open_reads_profile_tier_level() {
+    let p = Player::open(build::mp4(&[hevc_kat_track(1)], &Mp4Options::default()), Arc::new(ManualTime::new()), None, 60).unwrap();
+    assert_eq!(p.info().video_profile, "profile=Main tier=main level=2");
+    let mut sps = HEVC_SPS_SEPPLANES;
+    assert_eq!((sps[3], sps[17]), (0x01, 0x3c));
+    sps[3] = 0x24;
+    sps[17] = 0x99;
+    let mut t = hevc_kat_track(1);
+    let at = t.spec.config.windows(HEVC_SPS.len()).position(|w| w == HEVC_SPS).unwrap();
+    let mut hvcc = t.spec.config[..at - 2].to_vec();
+    hvcc.extend_from_slice(&(sps.len() as u16).to_be_bytes());
+    hvcc.extend_from_slice(&sps);
+    hvcc.extend_from_slice(&t.spec.config[at + HEVC_SPS.len()..]);
+    t.spec.config = hvcc;
+    let p = Player::open(build::mp4(&[t], &Mp4Options::default()), Arc::new(ManualTime::new()), None, 60).unwrap();
+    assert_eq!(p.info().video_profile, "profile=RExt tier=high level=5.1");
+    println!("hevclevelline: {} / {}", "profile=Main tier=main level=2", p.info().video_profile);
+}
+
+// SWAPBACKSPANCACHE (LEDGER SR370): a reseed (a Player seek, an editor run open) primes the decoder with EVERY in-band set
+// blob in effect at the target (`decode_swap::SetIndex`, an indexed reel's earlier Clusters read through a share), and keeps
+// two parked decoders keyed by their set state: a seek back into a span reuses its decoder (`video reseed: ... cache=hit`).
+
+/// Rule: after straight play, a seek into the refused span is a miss (the 8-bit decoder parked under its state), a seek out
+/// of it to s9 is a hit (that decoder again; the frames equal straight play), and a seek back to s4 is a hit (the parked
+/// refused decoder; the stand-in at the target).
+#[test]
+fn swapbackspancache_player_seek_back_into_a_parked_span_hits_the_cache() {
+    capture_logs();
+    let straight = swapbackseek_straight();
+    let time = ManualTime::new();
+    let mut p = Player::open(swapbackseek_reel(), Arc::new(time.clone()), None, 60).unwrap();
+    p.play();
+    let mut sink = RgbaSink::default();
+    swapbackseek_run(&mut p, &time, &mut sink, |_, _| false);
+    p.seek(160_000_000);
+    p.play();
+    let mut sink = RgbaSink::default();
+    swapbackseek_run(&mut p, &time, &mut sink, |_, s| !s.shown.is_empty());
+    assert_eq!(sink.shown[0], (160_000_000, TestPattern::render(64, 48, 4)), "the first seek target is not the stand-in");
+    p.seek(360_000_000);
+    p.play();
+    let mut sink = RgbaSink::default();
+    swapbackseek_run(&mut p, &time, &mut sink, |_, s| s.shown.len() >= 2);
+    assert_eq!(sink.shown, straight[9..11].to_vec(), "s9/s10 after the seek are not the straight-play frames");
+    assert!(p.info().real_video);
+    p.seek(160_000_000);
+    p.play();
+    let mut sink = RgbaSink::default();
+    swapbackseek_run(&mut p, &time, &mut sink, |_, s| !s.shown.is_empty());
+    assert_eq!(sink.shown[0], (160_000_000, TestPattern::render(64, 48, 4)), "the seek back is not the stand-in");
+    let lines = my_log_lines("[STRIA] :: video reseed:");
+    assert_eq!(
+        lines,
+        [
+            "[STRIA] :: video reseed: at 160000000 sets=1 cache=miss",
+            "[STRIA] :: video reseed: at 360000000 sets=2 cache=hit",
+            "[STRIA] :: video reseed: at 160000000 sets=1 cache=hit",
+        ],
+    );
+    println!("swapbackspancache: miss hit hit");
+}
+
+/// Rule: `DecodeSwap` alone over the same reel constructs one decoder per set state: reseeds at s9 / s0 / s9 / s4 / s9
+/// build 1, 1, 1, 2, 2 decoders (the open's decoder serves s0, the first fresh one s9), and s9 then decodes flat.
+#[test]
+fn swapbackspancache_decode_swap_builds_one_decoder_per_span() {
+    use gneiss_pal::dsp::demux::Demuxer;
+    use stria::decode_swap::{DecodeSwap, open};
+    let d = Demuxer::open(swapbackseek_reel()).unwrap();
+    let t = d.tracks()[0].clone();
+    let mut dec = open(&t);
+    let mut swap = DecodeSwap::default();
+    let mut built = Vec::new();
+    for ns in [360_000_000i64, 0, 360_000_000, 160_000_000, 360_000_000] {
+        swap.reseed(&mut dec, &t, &d, ns);
+        built.push(swap.built());
+    }
+    assert_eq!(built, [1, 1, 1, 2, 2]);
+    let s9 = d.packet_at(&d.samples()[9]);
+    let out = swap.decode(&mut dec, &t, &s9).unwrap();
+    assert!(dec.is_real() && out.swap.is_none());
+    let mut frames = out.frames;
+    frames.extend(dec.flush());
+    assert!(frames[0].to_rgba().chunks(4).all(|p| p == SWAPBACK_FLAT), "s9 is not flat");
+    println!("swapbackspancache: built={}", swap.built());
+}
+
+/// HEVC_SPS with sps_seq_parameter_set_id 1 (its ue(v) `1` -> `010` at RBSP bit 104, after the PTL) and HEVC_PPS naming
+/// SPS 1 (its second ue(v) `1` -> `010`), re-packed bit-exact (stop bit and emulation prevention re-written).
+const HEVC_SPS_ID1: [u8; 27] = [0x42, 0x01, 0x01, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0x90, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00, 0x3c, 0x48, 0x08, 0x20, 0xc5, 0x97, 0xe4, 0x93, 0x08, 0x20];
+const HEVC_PPS_TO1: [u8; 7] = [0x44, 0x01, 0xa0, 0x1c, 0x60, 0x44, 0x80];
+
+/// SWAPBACK-SEEK-IDS: s1 carries SPS id 1 and a PPS naming it, s4 re-sends only that PPS (the nearer carrier holds no SPS).
+fn swapbackseekids_reel() -> Vec<u8> {
+    let mut t = hevc_kat_track(8);
+    let carriers: [(usize, &[&[u8]]); 2] = [(1, &[&HEVC_SPS_ID1[..], &HEVC_PPS_TO1[..], &HEVC_IDR[..]]), (4, &[&HEVC_PPS_TO1[..], &HEVC_IDR[..]])];
+    for (i, units) in carriers {
+        let mut s = Vec::new();
+        for unit in units {
+            s.extend_from_slice(&(unit.len() as u32).to_be_bytes());
+            s.extend_from_slice(unit);
+        }
+        t.samples[i].data = s;
+    }
+    build::mp4(&[t], &Mp4Options::default())
+}
+
+/// Rule: a fresh Player's seek to s6 replays BOTH carriers (SPS 1 from s1, the PPS from s4): s6 / s7 decode flat as in
+/// straight play, with no decode warning (today: s4's PPS alone, "PPS references a missing SPS", no picture).
+#[test]
+fn swapbackseekids_player_seek_replays_every_set_id_in_effect() {
+    capture_logs();
+    let time = ManualTime::new();
+    let mut p = Player::open(swapbackseekids_reel(), Arc::new(time.clone()), None, 60).unwrap();
+    p.play();
+    let mut straight = RgbaSink::default();
+    swapbackseek_run(&mut p, &time, &mut straight, |_, _| false);
+    assert_eq!(straight.shown.len(), 8);
+    assert!(straight.shown.iter().all(|(_, rgba)| rgba.chunks(4).all(|p| p == SWAPBACK_FLAT)), "straight play is not flat");
+    let time = ManualTime::new();
+    let mut p = Player::open(swapbackseekids_reel(), Arc::new(time.clone()), None, 60).unwrap();
+    p.seek(240_000_000);
+    p.play();
+    let mut sink = RgbaSink::default();
+    swapbackseek_run(&mut p, &time, &mut sink, |_, s| s.shown.len() >= 2);
+    assert_eq!(sink.shown, straight.shown[6..8].to_vec(), "s6/s7 after the seek are not the straight-play frames");
+    assert!(my_log_lines("[STRIA] :: video decode:").is_empty(), "{:?}", my_log_lines("[STRIA] :: video decode:"));
+    assert_eq!(my_log_lines("[STRIA] :: video reseed:"), ["[STRIA] :: video reseed: at 240000000 sets=2 cache=miss"]);
+    println!("swapbackseekids: s6 flat sets=2");
+}
+
+/// SWAPBACK-SEEK-INDEXED: the swapbackseek reel's samples as Matroska with Cues, four blocks a Cluster: the 13/12 carrier s1
+/// is in Cluster 0, s4-s7 in Cluster 1, the 8-bit carrier s8 in Cluster 2.
+fn swapbackseekindexed_reel() -> Vec<u8> {
+    let mp4 = gneiss_pal::dsp::demux::Demuxer::open(swapbackseek_reel()).unwrap();
+    let mut t = hevc_kat_track(12);
+    for (spec, s) in t.samples.iter_mut().zip(mp4.samples()) {
+        spec.data = mp4.packet_at(s).data;
+    }
+    build::mkv(&[t], &MkvOptions { webm: false, cues: true, cluster_blocks: 4, duration: true, ..Default::default() })
+}
+
+/// Rule: the editor opens the reel by its Cues (one Cluster loaded per run); a run opened at tick 5 primes from Cluster 0's
+/// carrier and draws the stand-in, the frame the whole render draws there (today: the container's sets, flat). The stand-in's
+/// counter on this Matroska reel reads one ahead from s3 on (its numbering, not the reseed's), so the oracle is the whole render.
+#[test]
+fn swapbackseekindexed_editor_run_primes_from_an_earlier_cluster() {
+    use stria::nle::{RenderSink, Sources, render};
+    struct Frames(Vec<Vec<u8>>);
+    impl RenderSink for Frames {
+        fn frame(&mut self, _out_t: i64, _w: u32, _h: u32, rgba: &[u8]) {
+            self.0.push(rgba.to_vec());
+        }
+        fn pcm(&mut self, _: i64, _: u32, _: u16, _: &[f32]) {}
+    }
+    let file = swapbackseekindexed_reel();
+    assert!(gneiss_pal::dsp::demux::Demuxer::open_indexed(file.clone()).unwrap().indexed(), "the reel did not open by its Cues");
+    let (tl, src) = Sources::from_media("A", &file, 25).unwrap().unwrap();
+    let mut whole = Frames(Vec::new());
+    render(&tl, 0..8, &src, &mut whole).unwrap();
+    let mut at5 = Frames(Vec::new());
+    render(&tl, 5..6, &src, &mut at5).unwrap();
+    assert!(TestPattern::read_counter(&at5.0[0], 64, 48).is_some(), "a run opened at tick 5 is not the stand-in (a flat decode reads no counter)");
+    assert_eq!(at5.0, whole.0[5..6].to_vec());
+    println!("swapbackseekindexed: tick5 stand-in");
+}
+
+// AV1INBANDSIZE (LEDGER SR379): a size switch mid-stream. kodim23's item (768x512, its own in-band sequence header) for samples
+// 0-1 and kids_720p's (1280x720, another sequence header: a new coded video sequence, av1_core drops the refs) for 2-3, one av01
+// reel. Every presented frame carries its own size (what `BusSink` posts as `MediaFrame { width, height }`, the face building
+// each picture at that size), and the Player says so once.
+fn av1inbandsize_reel() -> Option<Vec<u8>> {
+    let small = av1_vectors::avif_item(&av1_vectors::fetch("kodim23_yuv420_8bpc")?).unwrap();
+    let big = av1_vectors::avif_item(&av1_vectors::fetch("kids_720p")?).unwrap();
+    assert_eq!((small.ispe, big.ispe), (Some((768, 512)), Some((1280, 720))));
+    let mut spec = build::TrackSpec::test_pattern(1, 768, 512, 25);
+    spec.fourcc = *b"av01";
+    spec.config_box = Some(*b"av1C");
+    spec.codec_id = "V_AV1";
+    spec.config = small.av1c.clone().unwrap()[..4].to_vec();
+    spec.timescale = 1000;
+    let samples = (0..4).map(|i| build::SampleSpec { data: if i < 2 { small.data.clone() } else { big.data.clone() }, dts: i * 40, pts: i * 40, duration: 40, keyframe: true }).collect();
+    Some(build::mp4_with(&[build::MediaTrack { spec, samples }], &Mp4Options::default(), &build::Mp4Extras::default()))
+}
+
+/// Each presented frame's size and its RGBA length through the bus sink's conversion.
+struct Av1InBandSizeSink {
+    colour: Option<gneiss_pal::dsp::demux::colour::Colour>,
+    shown: Vec<(u32, u32, usize)>,
+}
+impl FrameSink for Av1InBandSizeSink {
+    fn present(&mut self, f: &Frame, _ordinal: u64) {
+        let rgba = f.to_rgba_colour(self.colour.as_ref(), gneiss_pal::dsp::video::Chroma::Bilinear);
+        self.shown.push((f.width, f.height, rgba.len()));
+    }
+}
+
+#[test]
+fn av1inbandsize_player_presents_the_new_size_once() {
+    capture_logs();
+    let Some(file) = av1inbandsize_reel() else { return };
+    let time = ManualTime::new();
+    let mut p = Player::open(file, Arc::new(time.clone()), None, 60).unwrap();
+    p.play();
+    let mut sink = Av1InBandSizeSink { colour: p.colour().copied(), shown: Vec::new() };
+    for _ in 0..400 {
+        if sink.shown.len() >= 4 || p.tick(&mut sink) == Tick::Ended {
+            break;
+        }
+        time.advance(16_666_667);
+    }
+    let want = |w: u32, h: u32| (w, h, (w * h * 4) as usize);
+    assert_eq!(sink.shown, vec![want(768, 512), want(768, 512), want(1280, 720), want(1280, 720)], "every frame at its own size");
+    let lines = my_log_lines("video size switch");
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].contains("768x512->1280x720"), "{}", lines[0]);
+    println!("av1inbandsize: {} ; frames 768x512 x2, 1280x720 x2", lines[0]);
+}
+
+// VP9INBANDCOLOUR (LEDGER SR379, AV1INBANDSIZE): a VP9 WebM whose key frame states color_space BT.709 (2) and no container Colour:
+// `colour_of`'s VP9 arm (`vp9_core::header::header_codes`) fills `Track::colour` 2/2/1 limited, so the Player converts by BT.709
+// at SD instead of the size default's BT.601. The key frame's uncompressed header (§6.2, profile 0, 8x8) is built here bit by bit.
+fn vp9inbandcolour_key_header(color_space: u64) -> Vec<u8> {
+    let mut w = av1_vectors::BitWriter::default();
+    w.put(2, 2); // frame_marker
+    w.put(2, 0); // profile 0 (low, high)
+    w.flag(false); // show_existing_frame
+    w.flag(false); // frame_type: KEY_FRAME
+    w.flag(true); // show_frame
+    w.flag(false); // error_resilient_mode
+    w.put(24, 0x49_83_42); // frame_sync_code
+    w.put(3, color_space);
+    w.flag(false); // color_range: studio
+    w.put(16, 7); // frame_width_minus_1
+    w.put(16, 7); // frame_height_minus_1
+    w.flag(false); // render_and_frame_size_different
+    w.flag(true); // refresh_frame_context
+    w.flag(false); // frame_parallel_decoding_mode
+    w.put(2, 0); // frame_context_idx
+    w.put(6, 0); // loop_filter_level
+    w.put(3, 0); // loop_filter_sharpness
+    w.flag(false); // loop_filter_delta_enabled
+    w.put(8, 60); // base_q_idx
+    w.put(3, 0); // no delta_q (y dc, uv dc, uv ac)
+    w.flag(false); // segmentation_enabled
+    w.flag(false); // tile_rows_log2 (one 64x64 column: no tile-column bits)
+    w.put(16, 1); // header_size_in_bytes
+    w.trailing();
+    let mut b = w.bytes;
+    b.push(0); // the compressed header's byte (not decoded here)
+    b
+}
+
+#[test]
+fn vp9inbandcolour_webm_bt709_fills_track_colour() {
+    use gneiss_pal::dsp::demux::Demuxer;
+    use gneiss_pal::dsp::video::{colour_of, reorder_depth};
+    let reel = |cs: u64| {
+        let mut spec = build::TrackSpec::test_pattern(1, 8, 8, 25);
+        spec.fourcc = *b"vp09";
+        spec.config_box = None;
+        spec.codec_id = "V_VP9";
+        spec.config = Vec::new();
+        spec.timescale = 1000;
+        let samples = (0..2).map(|i| build::SampleSpec { data: vp9inbandcolour_key_header(cs), dts: i * 40, pts: i * 40, duration: 40, keyframe: true }).collect();
+        build::mkv(&[build::MediaTrack { spec, samples }], &MkvOptions::default())
+    };
+    let mut d = Demuxer::open(reel(2)).unwrap();
+    assert_eq!(d.tracks()[0].colour, None, "no container Colour");
+    d.derive_dts(reorder_depth);
+    d.fill_colour(colour_of);
+    let c709 = gneiss_pal::dsp::demux::colour::Colour { primaries: 2, transfer: 2, matrix: 1, full_range: Some(false), mastering: None, light: None };
+    assert_eq!(d.tracks()[0].colour, Some(c709), "color_space BT.709 -> matrix 1, limited");
+    assert_eq!(Player::open(reel(2), Arc::new(ManualTime::new()), None, 60).unwrap().colour(), Some(&c709), "the Player's open fills it too");
+    let mut d0 = Demuxer::open(reel(0)).unwrap();
+    d0.fill_colour(colour_of);
+    assert_eq!(d0.tracks()[0].colour, None, "CS_UNKNOWN states nothing: the size default stays");
+    println!("vp9inbandcolour: WebM color_space 2 -> {c709}");
+}
+
+// SWAPBACKNLECACHE (LEDGER SR388): the editor holds one DecodeSwap and decoder per reel across its runs (a run's close parks
+// them in the reel's `Media`, the next run open resets and reseeds them, the Player's seek), the set state is keyed by its
+// (kind, id) -> unit map through gneiss_pal's `param_set_ids`, and the parked-decoder depth is `set_cache_depth`.
+
+/// Rule: two renders of tick 2 of the swapback reel (a run opened, closed, reopened at the same span: a preview scrub back)
+/// reseed miss then HIT on reel 0 (today each run built its own decoders: miss, miss), and both draw the stand-in.
+#[test]
+fn swapbacknlecache_editor_run_reopened_at_the_same_span_hits() {
+    use stria::nle::{RenderSink, Sources, render};
+    struct Frames(Vec<Vec<u8>>);
+    impl RenderSink for Frames {
+        fn frame(&mut self, _out_t: i64, _w: u32, _h: u32, rgba: &[u8]) {
+            self.0.push(rgba.to_vec());
+        }
+        fn pcm(&mut self, _: i64, _: u32, _: u16, _: &[f32]) {}
+    }
+    capture_logs();
+    let (tl, src) = Sources::from_media("A", &swapback_reel(), 25).unwrap().unwrap();
+    let mut first = Frames(Vec::new());
+    render(&tl, 2..3, &src, &mut first).unwrap();
+    let mut again = Frames(Vec::new());
+    render(&tl, 2..3, &src, &mut again).unwrap();
+    assert_eq!(first.0, [TestPattern::render(64, 48, 2)], "the first run at s2 is not the stand-in");
+    assert_eq!(again.0, first.0, "the reopened run does not draw the first run's frame");
+    assert_eq!(my_log_lines("[STRIA] :: nle reseed"), ["[STRIA] :: nle reseed reel=0 cache=miss", "[STRIA] :: nle reseed reel=0 cache=hit"]);
+    println!("swapbacknlecache: editor reel=0 miss hit");
+}
+
+/// SWAPBACK-SETIDS: s1 carries [SPS, PPS] and s4 [PPS, SPS] — the same ids and bytes in another blob.
+fn swapbacknlecache_setids_reel() -> Vec<u8> {
+    let mut t = hevc_kat_track(8);
+    let carriers: [(usize, &[&[u8]]); 2] = [(1, &[&HEVC_SPS[..], &HEVC_PPS[..], &HEVC_IDR[..]]), (4, &[&HEVC_PPS[..], &HEVC_SPS[..], &HEVC_IDR[..]])];
+    for (i, units) in carriers {
+        t.samples[i].data = units.iter().flat_map(|u| [&(u.len() as u32).to_be_bytes()[..], *u].concat()).collect();
+    }
+    build::mp4(&[t], &Mp4Options::default())
+}
+
+/// Rule: reseeds at s2 (state [s1's blob]) then s6 ([s1's, s4's]) build ONE decoder — the two states key alike by id, the second
+/// reseed a hit (today the blob lists differ: a second construction, a miss) — and s6 then decodes flat.
+#[test]
+fn swapbacknlecache_setids_equal_states_in_different_blobs_hit() {
+    use gneiss_pal::dsp::demux::Demuxer;
+    use stria::decode_swap::{DecodeSwap, open};
+    capture_logs();
+    let d = Demuxer::open(swapbacknlecache_setids_reel()).unwrap();
+    let t = d.tracks()[0].clone();
+    let mut dec = open(&t);
+    let mut swap = DecodeSwap::default();
+    let mut built = Vec::new();
+    let mut hits = Vec::new();
+    for ns in [80_000_000i64, 240_000_000] {
+        hits.push(swap.reseed(&mut dec, &t, &d, ns));
+        built.push(swap.built());
+    }
+    assert_eq!(built, [1, 1]);
+    assert_eq!(hits, [Some(false), Some(true)]);
+    assert_eq!(
+        my_log_lines("[STRIA] :: video reseed:"),
+        ["[STRIA] :: video reseed: at 80000000 sets=1 cache=miss", "[STRIA] :: video reseed: at 240000000 sets=2 cache=hit"],
+    );
+    let s6 = d.packet_at(&d.samples()[6]);
+    let mut frames = swap.decode(&mut dec, &t, &s6).unwrap().frames;
+    frames.extend(dec.flush());
+    assert!(frames[0].to_rgba().chunks(4).all(|p| p == SWAPBACK_FLAT), "s6 is not flat");
+    println!("swapbacknlecache: setids built={}", swap.built());
+}
+
+/// Rule: reseeds at s9 / s4 / s0 / s9 of the swapbackseek reel build 1, 2, 2, 2 decoders at the default depth (s0 and s9 parked)
+/// and 1, 2, 3, 4 at `set_cache_depth(1)` (each park evicts the span the next reseed wants).
+#[test]
+fn swapbacknlecache_depth_one_cache_evicts() {
+    use gneiss_pal::dsp::demux::Demuxer;
+    use stria::decode_swap::{DecodeSwap, open};
+    let d = Demuxer::open(swapbackseek_reel()).unwrap();
+    let t = d.tracks()[0].clone();
+    let builds = |depth: usize| {
+        let mut dec = open(&t);
+        let mut swap = DecodeSwap::default();
+        swap.set_cache_depth(depth);
+        [360_000_000i64, 160_000_000, 0, 360_000_000].map(|ns| {
+            swap.reseed(&mut dec, &t, &d, ns);
+            swap.built()
+        })
+    };
+    assert_eq!(builds(0), [1, 2, 2, 2]);
+    assert_eq!(builds(1), [1, 2, 3, 4]);
+    println!("swapbacknlecache: depth2 {:?} depth1 {:?}", builds(0), builds(1));
+}
+
+// SWAPBACKSETIDSAVC (LEDGER SR397): an H.264 reel's set state is keyed by ids too (gneiss_pal's `h264::param_set_ids` beside
+// the HEVC one in `SetIndex::scan`), and a same-reel seek step inside one render reopens on the reel's held decoder (`vid_frame`
+// drops the outgoing run, which parks it, before the new run open takes the slot).
+
+/// SPS (Main, 64x48) and PPS of tests/nle.rs's AVCC_REORDER2; a stand-in IDR slice unit (the reseed decodes only set blobs).
+const AVC_SPS: [u8; 12] = [0x67, 0x4D, 0x00, 0x1E, 0xED, 0x88, 0xF4, 0x03, 0xC2, 0x21, 0x16, 0x48];
+const AVC_PPS: [u8; 4] = [0x68, 0xCE, 0x38, 0x80];
+const AVC_IDR: [u8; 3] = [0x65, 0x88, 0x84];
+
+/// An avc1 reel of 8 keyframes (avcC with the SPS and PPS): s1 carries [SPS, PPS], s4 [PPS, SPS] — the same ids and bytes in
+/// another blob.
+fn swapbacksetidsavc_reel() -> Vec<u8> {
+    let mut spec = build::TrackSpec::test_pattern(1, 64, 48, 25);
+    spec.fourcc = *b"avc1";
+    spec.config_box = Some(*b"avcC");
+    spec.codec_id = "V_MPEG4/ISO/AVC";
+    let mut avcc = vec![1, 0x4D, 0x00, 0x1E, 0xFF, 0xE1, 0, AVC_SPS.len() as u8];
+    avcc.extend_from_slice(&AVC_SPS);
+    avcc.extend_from_slice(&[1, 0, AVC_PPS.len() as u8]);
+    avcc.extend_from_slice(&AVC_PPS);
+    spec.config = avcc;
+    spec.timescale = 1000;
+    let lp = |us: &[&[u8]]| us.iter().flat_map(|u| [&(u.len() as u32).to_be_bytes()[..], *u].concat()).collect::<Vec<u8>>();
+    let samples = (0..8)
+        .map(|i| {
+            let data = match i {
+                1 => lp(&[&AVC_SPS[..], &AVC_PPS[..], &AVC_IDR[..]]),
+                4 => lp(&[&AVC_PPS[..], &AVC_SPS[..], &AVC_IDR[..]]),
+                _ => lp(&[&AVC_IDR[..]]),
+            };
+            build::SampleSpec { data, dts: i as i64 * 40, pts: i as i64 * 40, duration: 40, keyframe: true }
+        })
+        .collect();
+    build::mp4(&[build::MediaTrack { spec, samples }], &Mp4Options::default())
+}
+
+/// Rule: reseeds at s2 (state [s1's blob]) then s6 ([s1's, s4's]) of an H.264 reel build ONE decoder — the two states key alike
+/// by id, the second reseed a hit (before SR397 an H.264 blob keyed by blob list: a second construction, a miss).
+#[test]
+fn swapbacksetidsavc_equal_avc_states_in_different_blobs_hit() {
+    use gneiss_pal::dsp::demux::Demuxer;
+    use stria::decode_swap::{DecodeSwap, open};
+    let d = Demuxer::open(swapbacksetidsavc_reel()).unwrap();
+    let t = d.tracks()[0].clone();
+    let mut dec = open(&t);
+    assert!(dec.is_real(), "an avc1 track opens h264_core");
+    let mut swap = DecodeSwap::default();
+    let mut built = Vec::new();
+    let mut hits = Vec::new();
+    for ns in [80_000_000i64, 240_000_000] {
+        hits.push(swap.reseed(&mut dec, &t, &d, ns));
+        built.push(swap.built());
+    }
+    assert_eq!(built, [1, 1]);
+    assert_eq!(hits, [Some(false), Some(true)]);
+    println!("swapbacksetidsavc: avc built={} hits={hits:?}", swap.built());
+}
+
+/// Rule: one render of V1 = A[5,6)@0, A[4,5)@1 over the swapback reel (a same-reel seek step; both ticks in the 8-bit set state)
+/// reseeds miss then HIT on reel 0 (before SR397 the step's open ran before the outgoing run parked: miss, miss), with two
+/// seeks and both frames flat.
+#[test]
+fn swapbacksetidsavc_same_reel_seek_step_in_one_render_hits() {
+    use stria::nle::{RenderSink, Sources, render};
+    use timeline_core::{Clip, Kind, Timeline};
+    struct Frames(Vec<Vec<u8>>);
+    impl RenderSink for Frames {
+        fn frame(&mut self, _out_t: i64, _w: u32, _h: u32, rgba: &[u8]) {
+            self.0.push(rgba.to_vec());
+        }
+        fn pcm(&mut self, _: i64, _: u32, _: u16, _: &[f32]) {}
+    }
+    capture_logs();
+    let mut tl = Timeline::new(25);
+    let a = tl.add_source("A", 6);
+    tl.add_track(Kind::Video);
+    tl.tracks[0].clips = vec![Clip::new(a, 5, 6, 0), Clip::new(a, 4, 5, 1)];
+    let mut src = Sources::new(&tl);
+    src.add(a, swapback_reel()).unwrap();
+    let mut sink = Frames(Vec::new());
+    let r = render(&tl, 0..2, &src, &mut sink).unwrap();
+    assert_eq!((r.frames, r.seeks), (2, 2));
+    assert_eq!(sink.0.len(), 2);
+    for rgba in &sink.0 {
+        assert!(rgba.chunks(4).all(|p| p == SWAPBACK_FLAT), "not flat {:?}", &rgba[..4]);
+    }
+    assert_eq!(my_log_lines("[STRIA] :: nle reseed"), ["[STRIA] :: nle reseed reel=0 cache=miss", "[STRIA] :: nle reseed reel=0 cache=hit"]);
+    println!("swapbacksetidsavc: same-render seek step reel=0 miss hit");
+}
+
+// ── VP9INBANDSWITCH (LEDGER SR400; handlers.md §5 NLEPROBE-HDR's VP9-INBAND-SWITCH) ─────────────────────────────────────────────
+// A VP9 WebM of four decodable key frames: BT.709 8x8, BT.601 6x4 twice, BT.709 6x4. The open fills `Track::colour` 2/2/1 limited
+// from the first (SR379); the VP9 arm hands each picture's own color_space / range and size to gneiss_pal's ONE in-band step
+// (`dsp::video::inband_frame`, AV1's), so the BT.601 frames leave converted (`Pixels::Rgba`), the last is back at the open's
+// colour (planes again), and the colour line fires twice, the size line once. The header is SR379's builder with the size and
+// header_size_in_bytes patched; the bool-coded tail (compressed header + the one 8x8 tile, decodable at any size 1..=8) is the
+// bytes `vp9_core/tests/structure.rs` pins as `VP9INBANDSWITCH_TAIL`.
+const VP9INBANDSWITCH_TAIL: &[u8] = &[0, 0, 59, 0];
+
+fn vp9inbandswitch_key(color_space: u64, w: u32, h: u32) -> Vec<u8> {
+    let mut f = vp9inbandcolour_key_header(color_space);
+    f.truncate(14); // the 112-bit uncompressed header; drop SR379's stand-in compressed byte
+    let mut put = |at: usize, v: u32, n: usize| {
+        for i in 0..n {
+            let (byte, bit) = ((at + i) / 8, 7 - (at + i) % 8);
+            f[byte] = (f[byte] & !(1 << bit)) | ((((v >> (n - 1 - i)) & 1) as u8) << bit);
+        }
+    };
+    put(36, w - 1, 16); // frame_width_minus_1
+    put(52, h - 1, 16); // frame_height_minus_1
+    put(96, 2, 16); // header_size_in_bytes: the tail's compressed header
+    f.extend_from_slice(VP9INBANDSWITCH_TAIL);
+    f
+}
+
+/// Each presented frame's size and whether it left converted (a switched colour) or as planes.
+struct Vp9InBandSwitchSink {
+    shown: Vec<(u32, u32, bool)>,
+}
+impl FrameSink for Vp9InBandSwitchSink {
+    fn present(&mut self, f: &Frame, _ordinal: u64) {
+        self.shown.push((f.width, f.height, matches!(f.pixels, gneiss_pal::dsp::video::Pixels::Rgba(_))));
+    }
+}
+
+#[test]
+fn vp9inbandswitch_player_repicks_and_reports_size() {
+    capture_logs();
+    let keys = [vp9inbandswitch_key(2, 8, 8), vp9inbandswitch_key(1, 6, 4), vp9inbandswitch_key(1, 6, 4), vp9inbandswitch_key(2, 6, 4)];
+    let mut spec = build::TrackSpec::test_pattern(1, 8, 8, 25);
+    spec.fourcc = *b"vp09";
+    spec.config_box = None;
+    spec.codec_id = "V_VP9";
+    spec.config = Vec::new();
+    spec.timescale = 1000;
+    let samples = keys.iter().enumerate().map(|(i, k)| build::SampleSpec { data: k.clone(), dts: i as i64 * 40, pts: i as i64 * 40, duration: 40, keyframe: true }).collect();
+    let file = build::mkv(&[build::MediaTrack { spec, samples }], &MkvOptions::default());
+    let time = ManualTime::new();
+    let mut p = Player::open(file, Arc::new(time.clone()), None, 60).unwrap();
+    let c709 = gneiss_pal::dsp::demux::colour::Colour { primaries: 2, transfer: 2, matrix: 1, full_range: Some(false), mastering: None, light: None };
+    assert_eq!(p.colour(), Some(&c709), "the open's first key frame: BT.709 limited");
+    p.play();
+    let mut sink = Vp9InBandSwitchSink { shown: Vec::new() };
+    for _ in 0..400 {
+        if sink.shown.len() >= 4 || p.tick(&mut sink) == Tick::Ended {
+            break;
+        }
+        time.advance(16_666_667);
+    }
+    assert_eq!(sink.shown, vec![(8, 8, false), (6, 4, true), (6, 4, true), (6, 4, false)], "every frame at its own size; the BT.601 ones re-picked");
+    let colour = my_log_lines("video colour switch");
+    assert_eq!(colour.len(), 2, "{colour:?}");
+    assert!(colour[0].contains("matrix=1->6 range=limited"), "{}", colour[0]);
+    assert!(colour[1].contains("matrix=6->1 range=limited"), "{}", colour[1]);
+    let size = my_log_lines("video size switch");
+    assert_eq!(size.len(), 1, "{size:?}");
+    assert!(size[0].contains("8x8->6x4"), "{}", size[0]);
+    println!("vp9inbandswitch: {} ; {} ; {}", colour[0], colour[1], size[0]);
 }

@@ -1,0 +1,848 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
+// Copyright (C) 2026 The Architect & Una
+//
+//! PDF4 (LEDGER SR324): a PDF response as a document in the engine — the Aether face of the Acrobat line.
+//!
+//! CHARTER: Aether owns the browser and the PDF line (CODEX §2 Web, "Chrome, Acrobat"); this is inside the live
+//! handler, over the shared core pdf_core (BP-handlers-4): no parser, rasterizer or font code lives here.
+//!
+//! A PDF (`application/pdf`, or the `%PDF-` sniff: [`is_pdf`], `net::fetch_page`) is held as [`PdfDocument`] in
+//! `AetherEngine::pdf`, beside an EMPTY DOM document whose `<title>` is the PDF's: `load_impl` still runs, so the
+//! session history, Back / Forward / reload, the title and every per-document reset are the HTML path's own. While
+//! `pdf` is Some the engine's hooks hand five things here:
+//!
+//! * paint: [`PdfDocument::present`] — the pages stacked vertically (8 px gaps, centred; 100 % zoom = 96 dpi, one
+//!   point = 96/72 CSS px), each rendered by PDF2's `Page::render` at 96 dpi x zoom through PDF3's `GlyphSink` (the
+//!   unembedded faces from text_host's font database: [`fallback`]) and cached per (page, dpi): a zoom re-renders crisp
+//!   instead of resampling, and only the pages near the viewport keep a pixmap;
+//! * the scroll extent: [`PdfDocument::max_scroll`] re-binds the one `Event::Scroll` clamp; PDF4-HSCROLL (SR360): the
+//!   pages centre in a lane as wide as the widest page ([`PdfDocument::stack_w`]), and the same clamp moves the
+//!   engine's `scroll_x` over [`PdfDocument::max_scroll_x`] (`pdf_scroll_x`; Left / Right keys, `pdf_view_key`);
+//! * selection: [`select`] — a span-based selection parallel to the DOM one (selection.rs holds DOM boundary points),
+//!   over PDF3's `Page::text` spans, snapped to their glyph boxes (PDF4GLYPHPOS SR360); copy joins them through PDF3's
+//!   `spans_to_string`;
+//! * find: `chrome::find::find_all` over each page's text joined by PDF3's `spans_to_string_mapped` (a match may cross
+//!   spans of one line), the engine's own `FindState`; hits painted as glyph-bounded span sub-boxes;
+//! * the left strip: [`thumbs`] (PDF4-THUMBS SR360, PDF4-OUTLINE / PDF4-THUMBSCROLL SR374) — F4 cycles thumbnails ->
+//!   outline -> off, painted into the same frame; a wheel over it scrolls it (`pdf_wheel`); a click goes to the page;
+//! * the status line: `AetherEngine::pdf_status` ("Page p / n · 100%", the zoom since PDF4-FIT-STATUS-PCT SR395);
+//! * links and form widgets: [`forms`] (PDF4ANNOTS SR343) — /URI, /GoTo and /Named links (hover: the pointer and the
+//!   status line), check boxes and text fields filled through pdf_core's `Form::set_value` + `Edit::save_update`.
+//!
+//! A password-protected file opens a visible page saying so (PDF4-PASSWORD owed: no prompt wire exists — `window.prompt`
+//! is a headless stub and the bus has no dialog message).
+
+pub mod forms;
+pub mod select;
+pub mod sign; // PDF-KEYSTORE (SR382): sign with a key Holocron holds
+pub mod thumbs;
+#[cfg(test)]
+mod tests;
+
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
+use std::rc::Rc;
+use std::sync::OnceLock;
+
+use pdf_core::font::{Fallback, GlyphSink, TextSpan, spans_to_string_mapped};
+use pdf_core::render::Pixmap;
+use pdf_core::{Annot, Document, Form, Page, Ref};
+
+use self::select::{PdfSelection, Pos, Range};
+
+/// The dpi of 100 % zoom: one PDF point is 96/72 CSS px (Chromium's viewer).
+pub const CSS_DPI: f64 = 96.0;
+/// CSS px per point at 100 %.
+pub const PT: f64 = CSS_DPI / 72.0;
+/// CSS px between pages and around the stack.
+pub const GAP: f64 = 8.0;
+/// The backdrop behind the pages (Chromium's PDF viewer grey).
+pub const BACKDROP: (u8, u8, u8) = (82, 86, 89);
+/// The active find hit (Chromium's orange); inactive hits use `selection::FIND_MARK`.
+pub const ACTIVE_MARK: (u8, u8, u8) = (255, 150, 50);
+/// The selection, multiplied over the page so the glyphs stay legible.
+pub const SELECT_MARK: (u8, u8, u8) = (180, 213, 255);
+
+/// The tab's favicon for a PDF: a red page with a folded corner (decoded by `images::get`'s data: path).
+pub const GLYPH_URI: &str = "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' width='32' height='32' viewBox='0 0 32 32'><path d='M6 2h14l6 6v22H6z' fill='%23d93025'/><path d='M20 2v6h6z' fill='%23f6aea9'/><path d='M10 16h12M10 20h12M10 24h8' stroke='%23ffffff' stroke-width='2'/></svg>";
+
+/// Whether a response is a PDF: its Content-Type names one, or (unless it says HTML) its body starts with `%PDF-`.
+pub fn is_pdf(ctype: &str, bytes: &[u8]) -> bool {
+    let t = ctype.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+    t == "application/pdf" || t == "application/x-pdf" || (t != "text/html" && bytes.starts_with(b"%PDF-"))
+}
+
+/// PDF4-SIZE (SR404): the largest PDF a navigation reads (`net::fetch_document_any` chooses it by [`is_pdf`]; every other
+/// document keeps the 10 MiB cap). 64 MiB, SR398's `chrome::host` ARCHIVE_MAX precedent: PDFs are routinely 10-100 MB.
+pub const MAX_BYTES: usize = 64 << 20;
+
+/// PDF4-SIZE (SR404): the refusal of a PDF `n` bytes long (declared, or read so far) over [`MAX_BYTES`], named on the
+/// console (`[pdf] open: <n> MiB over the 64 MiB cap`, the strip's `[pdf]` console shape) and returned as the
+/// navigation's error, which the error page shows.
+pub fn over_cap(n: u64) -> String {
+    let msg = format!("[pdf] open: {} MiB over the {} MiB cap", n.div_ceil(1 << 20), MAX_BYTES >> 20);
+    crate::js::host::console_out(1, &msg);
+    msg
+}
+
+/// One installed face's file for a CSS generic family (a collection's first face only: Fallback takes bytes).
+fn face_file(generic: &str) -> Option<Vec<u8>> {
+    let db = text_host::db::db();
+    let i = match db.resolve_family(generic) {
+        Some(fam) => db.select(&fam, text_host::db::Style::default()).map(|(i, _, _)| i),
+        None => None,
+    }
+    .or_else(|| db.fallback_order().first().copied())?;
+    let f = db.faces.get(i)?;
+    if f.index != 0 {
+        return None;
+    }
+    std::fs::read(&f.path).ok()
+}
+
+/// The faces unembedded fonts are drawn with (pdf_core does no I/O; the caller hands it file bytes), read once.
+pub fn fallback() -> Fallback<'static> {
+    static FACES: OnceLock<[Option<Vec<u8>>; 3]> = OnceLock::new();
+    let f = FACES.get_or_init(|| [face_file("sans-serif"), face_file("monospace"), face_file("serif")]);
+    Fallback { sans: f[0].as_deref(), mono: f[1].as_deref(), serif: f[2].as_deref() }
+}
+
+/// The cache key of a dpi.
+pub fn dpi_key(dpi: f64) -> u32 {
+    (dpi * 1000.0).round() as u32
+}
+
+/// An open PDF.
+pub struct PdfDocument {
+    pub doc: Document,
+    pub pages: Vec<Page>,
+    /// Each page's size in points as rendered (/CropBox, /Rotate applied).
+    pub sizes: Vec<(f64, f64)>,
+    /// Each page's top in document CSS px.
+    tops: Vec<f64>,
+    /// /Info /Title, when it says anything.
+    pub title: Option<String>,
+    /// Each page's text spans (PDF3's `Page::text`), extracted on first use.
+    text: RefCell<Vec<Option<Rc<Vec<TextSpan>>>>>,
+    /// Rendered pages by (page, dpi x 1000); a page the renderer refused is cached as a 0 x 0 pixmap (painted white).
+    cache: RefCell<HashMap<(usize, u32), Rc<Pixmap>>>,
+    pub sel: PdfSelection,
+    /// Find hits, and the active one.
+    pub hits: Vec<Range>,
+    pub cur: Option<usize>,
+    /// PDF4ANNOTS (SR343): the file as open: the fetched bytes, then those plus the form's incremental update(s) — the
+    /// filled form a save writes (PDF4FORMSAVE SR354: Ctrl/Cmd+S hands it to the shell as `BrowserSave`, `save_key`).
+    pub bytes: Vec<u8>,
+    /// Each page's object reference (what a destination names).
+    page_refs: Vec<Option<Ref>>,
+    /// Each page's annotations, read on first use.
+    annots: RefCell<Vec<Option<Rc<Vec<Annot>>>>>,
+    /// The AcroForm.
+    pub form: Option<Form>,
+    /// The link or widget the button went down on, the one under the pointer, and the focused text field.
+    pub pressed: Option<forms::Target>,
+    pub hover: Option<forms::Target>,
+    pub focus: Option<forms::FieldFocus>,
+    /// The last fill's refusal by name (`pdf_core::Error`, Debug: set_value, save_update, or `reload`'s re-parse and page-count check); None after an accepted fill (the page shows the file as it was).
+    pub form_refused: Option<String>,
+    /// PDF4-THUMBS (SR360): the thumbnail strip is open, and its width in CSS px (0 when closed; `thumbs::STRIP_W`
+    /// device px at the zoom), which the page lane starts after.
+    pub thumbs: bool,
+    pub left: f64,
+    /// PDF4-OUTLINE (SR374): the open strip's mode, the outline (pdf_core's `outlines_with`, empty when the file has
+    /// none or it was refused), each item's toggle (open: its children shown), and PDF4-THUMBSCROLL's stored strip
+    /// scroll in device px with the page it last followed (`thumbs::sync`).
+    pub side: thumbs::Side,
+    pub outline: Vec<pdf_core::OutlineItem>,
+    pub outline_open: Vec<bool>,
+    pub strip_off: Cell<f64>,
+    pub strip_cur: Cell<Option<usize>>,
+    /// PDF4-STRIPKEYS (SR389): the strip's keyboard focus (a page index, or an index into `outline`), None while the
+    /// page holds the keys; PDF4-FIT (SR389): the fit mode and the zoom percentage it last set.
+    pub strip_focus: Option<usize>,
+    pub fit: Option<(Fit, u32)>,
+}
+
+impl PdfDocument {
+    /// Parse `bytes` (the empty user password: `pdf_core::Error::Password` when the file needs another); the fetched
+    /// Vec is kept as [`PdfDocument::bytes`] itself, not copied (PDF4-SIZE SR404).
+    pub fn open(bytes: Vec<u8>) -> Result<PdfDocument, pdf_core::Error> {
+        let doc = Document::parse(&bytes)?;
+        let pages = doc.pages()?;
+        if pages.is_empty() {
+            return Err(pdf_core::Error::Missing);
+        }
+        let sizes: Vec<(f64, f64)> = pages
+            .iter()
+            .map(|p| {
+                let [x0, y0, x1, y1] = p.crop_box;
+                if p.rotate == 90 || p.rotate == 270 { (y1 - y0, x1 - x0) } else { (x1 - x0, y1 - y0) }
+            })
+            .collect();
+        let mut tops = Vec::with_capacity(sizes.len());
+        let mut y = GAP;
+        for s in &sizes {
+            tops.push(y);
+            y += s.1 * PT + GAP;
+        }
+        let title = doc.info().title.map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
+        let n = pages.len();
+        let page_refs: Vec<Option<Ref>> = pages.iter().map(|p| p.obj).collect();
+        let form = doc.form();
+        let outline = doc.outlines_with(&page_refs).unwrap_or_default();
+        let outline_open = outline.iter().map(|i| i.open).collect();
+        Ok(PdfDocument {
+            doc,
+            pages,
+            sizes,
+            tops,
+            title,
+            text: RefCell::new(vec![None; n]),
+            cache: RefCell::new(HashMap::new()),
+            sel: PdfSelection::default(),
+            hits: Vec::new(),
+            cur: None,
+            bytes,
+            page_refs,
+            annots: RefCell::new(vec![None; n]),
+            form,
+            pressed: None,
+            hover: None,
+            focus: None,
+            form_refused: None,
+            thumbs: false,
+            left: 0.0,
+            side: thumbs::Side::Thumbs,
+            outline,
+            outline_open,
+            strip_off: Cell::new(0.0),
+            strip_cur: Cell::new(None),
+            strip_focus: None,
+            fit: None,
+        })
+    }
+
+    pub fn page_count(&self) -> usize {
+        self.pages.len()
+    }
+
+    /// Page `i`'s rect in document CSS px `(x, y, w, h)` for a viewport `vw` CSS px wide: centred in the lane right of
+    /// the thumbnail strip, the lane as wide as the widest page when that is wider than the viewport (PDF4-HSCROLL).
+    pub fn page_rect(&self, i: usize, vw: f64) -> (f64, f64, f64, f64) {
+        let (w, h) = (self.sizes[i].0 * PT, self.sizes[i].1 * PT);
+        let lane = (vw - self.left).max(self.stack_w());
+        (self.left + ((lane - w) / 2.0).max(GAP), self.tops[i], w, h)
+    }
+
+    /// PDF4-HSCROLL (SR360): the stack's width in CSS px (the widest page and a GAP each side).
+    pub fn stack_w(&self) -> f64 {
+        self.sizes.iter().fold(0.0f64, |m, s| m.max(s.0)) * PT + 2.0 * GAP
+    }
+
+    /// PDF4-HSCROLL (SR360): the viewport's horizontal scroll range for a viewport `vw` CSS px wide.
+    pub fn max_scroll_x(&self, vw: f64) -> f64 {
+        (self.stack_w() - (vw - self.left)).max(0.0)
+    }
+
+    /// The stack's height in CSS px.
+    pub fn extent(&self) -> f64 {
+        let last = self.pages.len() - 1;
+        self.tops[last] + self.sizes[last].1 * PT + GAP
+    }
+
+    /// The viewport's scroll range for a viewport `vh` CSS px tall.
+    pub fn max_scroll(&self, vh: f64) -> f64 {
+        (self.extent() - vh).max(0.0)
+    }
+
+    /// The page at document y (the last whose top is at or above it).
+    pub fn page_at(&self, y: f64) -> usize {
+        self.tops.partition_point(|&t| t <= y).saturating_sub(1)
+    }
+
+    /// "Page p / n": p is the page under the viewport's vertical centre.
+    pub fn status(&self, scroll_y: f64, vh: f64) -> String {
+        format!("Page {} / {}", self.page_at(scroll_y + vh / 2.0) + 1, self.pages.len())
+    }
+
+    /// Page `i`'s text spans.
+    pub fn spans(&self, i: usize) -> Rc<Vec<TextSpan>> {
+        if let Some(t) = &self.text.borrow()[i] {
+            return t.clone();
+        }
+        let t = Rc::new(self.pages[i].text(&self.doc, &fallback()));
+        self.text.borrow_mut()[i] = Some(t.clone());
+        t
+    }
+
+    /// Page `i` rendered at `dpi` (cached).
+    pub(crate) fn pixmap(&self, i: usize, dpi: f64) -> Rc<Pixmap> {
+        let key = (i, dpi_key(dpi));
+        if let Some(p) = self.cache.borrow().get(&key) {
+            return p.clone();
+        }
+        let mut sink = GlyphSink::new(&self.doc, fallback());
+        let pm = match self.pages[i].render(&self.doc, dpi, &mut sink) {
+            Ok(r) => r.pixmap,
+            Err(_) => Pixmap { w: 0, h: 0, data: Vec::new() },
+        };
+        let rc = Rc::new(pm);
+        self.cache.borrow_mut().insert(key, rc.clone());
+        rc
+    }
+
+    /// The (page, dpi key) pairs the render cache holds, sorted.
+    pub fn cached_keys(&self) -> Vec<(usize, u32)> {
+        let mut k: Vec<(usize, u32)> = self.cache.borrow().keys().copied().collect();
+        k.sort();
+        k
+    }
+
+    /// The pages a viewport at `scroll_y`, `vh` CSS px tall, shows.
+    fn visible(&self, scroll_y: f64, vh: f64) -> std::ops::RangeInclusive<usize> {
+        self.page_at(scroll_y)..=self.page_at(scroll_y + vh)
+    }
+
+    /// The frame for the shell: `device` pixels at `zoom`, for a CSS viewport `vw` wide scrolled to (`scroll_x`,
+    /// `scroll_y`) (`AetherEngine::present_rgba`'s contract: width, height, straight RGBA); the open thumbnail strip last.
+    pub fn present(&self, device: (u32, u32), zoom: f64, vw: f64, scroll_x: f64, scroll_y: f64) -> (u32, u32, Vec<u8>) {
+        let (dw, dh) = (device.0 as usize, device.1 as usize);
+        let mut out = vec![255u8; dw * dh * 4];
+        for p in out.chunks_exact_mut(4) {
+            p[0] = BACKDROP.0;
+            p[1] = BACKDROP.1;
+            p[2] = BACKDROP.2;
+        }
+        let dpi = CSS_DPI * zoom;
+        let vh = dh as f64 / zoom;
+        let vis = self.visible(scroll_y, vh);
+        for i in vis.clone() {
+            let (x, y, w, h) = self.page_rect(i, vw);
+            let (ox, oy) = (((x - scroll_x) * zoom).round() as i64, ((y - scroll_y) * zoom).round() as i64);
+            let pm = self.pixmap(i, dpi);
+            let (pw, ph) = if pm.w > 0 { (pm.w, pm.h) } else { ((w * zoom).ceil() as usize, (h * zoom).ceil() as usize) };
+            // The page's columns that land on the frame.
+            let c0 = (-ox).max(0) as usize;
+            let c1 = ((dw as i64 - ox).max(0) as usize).min(pw);
+            for py in 0..ph {
+                let dy = oy + py as i64;
+                if dy < 0 || dy >= dh as i64 || c0 >= c1 {
+                    continue;
+                }
+                let o = (dy as usize * dw + (ox + c0 as i64) as usize) * 4;
+                let n = (c1 - c0) * 4;
+                if pm.w > 0 {
+                    let s = (py * pm.w + c0) * 4;
+                    out[o..o + n].copy_from_slice(&pm.data[s..s + n]);
+                } else {
+                    out[o..o + n].fill(255);
+                }
+            }
+            // Find marks and the selection, multiplied over the page (clipped to it and to the frame).
+            let s = dpi / 72.0;
+            for (r, col) in self.marks(i) {
+                let x0 = ((r[0] * s).floor() as i64).max(0) + ox;
+                let x1 = ((r[2] * s).ceil() as i64).min(pw as i64) + ox;
+                let y0 = ((r[1] * s).floor() as i64).max(0) + oy;
+                let y1 = ((r[3] * s).ceil() as i64).min(ph as i64) + oy;
+                for yy in y0.max(0)..y1.min(dh as i64) {
+                    for xx in x0.max(0)..x1.min(dw as i64) {
+                        let o = (yy as usize * dw + xx as usize) * 4;
+                        out[o] = (out[o] as u16 * col.0 as u16 / 255) as u8;
+                        out[o + 1] = (out[o + 1] as u16 * col.1 as u16 / 255) as u8;
+                        out[o + 2] = (out[o + 2] as u16 * col.2 as u16 / 255) as u8;
+                    }
+                }
+            }
+        }
+        let strip = if self.thumbs { thumbs::paint(self, &mut out, (dw, dh), zoom, scroll_y) } else { None }; thumbs::focus_paint(self, &mut out, (dw, dh), zoom, scroll_y);
+        // Only the pages at this dpi on (or next to) the screen keep a pixmap, and the strip's visible thumbnails.
+        let (lo, hi) = (vis.start().saturating_sub(1), vis.end() + 1);
+        let (key, tkey) = (dpi_key(dpi), dpi_key(thumbs::THUMB_DPI * zoom));
+        self.cache
+            .borrow_mut()
+            .retain(|k, _| (k.1 == key && k.0 >= lo && k.0 <= hi) || strip.is_some_and(|(a, b)| k.1 == tkey && k.0 >= a && k.0 <= b));
+        (device.0, device.1, out)
+    }
+
+    /// Page `i`'s highlight boxes (72-dpi page space) and their colours.
+    fn marks(&self, i: usize) -> Vec<([f64; 4], (u8, u8, u8))> {
+        let mut out: Vec<([f64; 4], (u8, u8, u8))> = self.focus_box(i).map(|r| (r, SELECT_MARK)).into_iter().collect();
+        let sel = self.sel.ordered().filter(|(a, b)| a.page <= i && i <= b.page && a != b);
+        if sel.is_none() && !self.hits.iter().any(|h| h.page == i) {
+            return out;
+        }
+        let spans = self.spans(i);
+        // The active hit IS the selection: it paints orange, not orange under blue.
+        let active = self.cur.and_then(|k| self.hits.get(k)).map(|h| h.bounds());
+        if let Some(b) = sel {
+            if active != Some(b) {
+                out.extend(select::rects(&self.sel, i, &spans).into_iter().map(|r| (r, SELECT_MARK)));
+            }
+        }
+        for (k, h) in self.hits.iter().enumerate().filter(|(_, h)| h.page == i) {
+            let col = if Some(k) == self.cur { ACTIVE_MARK } else { crate::selection::FIND_MARK };
+            out.extend(select::rects(&range_sel(h), i, &spans).into_iter().map(|r| (r, col)));
+        }
+        out
+    }
+
+    /// The text position under viewport CSS (`x`, `y`), for a viewport `vw` wide scrolled to `scroll` (x, y).
+    pub fn hit_at(&self, x: f64, y: f64, vw: f64, scroll: (f64, f64)) -> Option<Pos> {
+        let (x, dy) = (x + scroll.0, y + scroll.1);
+        let page = self.page_at(dy);
+        let (px, py, _, _) = self.page_rect(page, vw);
+        let spans = self.spans(page);
+        select::hit(&spans, (x - px) / PT, (dy - py) / PT).map(|(span, ch)| Pos { page, span, ch })
+    }
+
+    /// A find hit's box on its page (72-dpi page space): the union of its glyph-bounded span boxes.
+    pub fn range_rect(&self, r: &Range) -> Option<[f64; 4]> {
+        let spans = self.spans(r.page);
+        select::rects(&range_sel(r), r.page, &spans)
+            .into_iter()
+            .reduce(|u, q| [u[0].min(q[0]), u[1].min(q[1]), u[2].max(q[2]), u[3].max(q[3])])
+    }
+
+    /// Every case-insensitive match of `query` (the find bar's matcher) in each page's text as PDF3's one line
+    /// assembler joins it (`spans_to_string_mapped`): a match may cross spans of one line, never a line break.
+    pub fn find_all(&self, query: &str) -> Vec<Range> {
+        let mut out = Vec::new();
+        for page in 0..self.pages.len() {
+            let spans = self.spans(page);
+            let (text, map) = spans_to_string_mapped(&spans);
+            for (a, b) in crate::chrome::find::find_all(&text, query) {
+                if text[a..b].contains('\n') {
+                    continue;
+                }
+                let (ca, cb) = (text[..a].chars().count(), text[..b].chars().count());
+                let cut = &map[ca..cb.min(map.len())];
+                if let (Some(&(span, lo)), Some(&(end, last))) = (cut.iter().flatten().next(), cut.iter().flatten().last()) {
+                    out.push(Range { page, span, lo, end, hi: last + 1 });
+                }
+            }
+        }
+        out
+    }
+
+    /// The selection's text (copy, `BrowserCopy`).
+    pub fn selected_text(&self) -> String {
+        select::text(&self.sel, |i| self.spans(i))
+    }
+
+    /// The word around `p` (whitespace-bounded inside its span).
+    fn word(&self, p: Pos) -> (Pos, Pos) {
+        let spans = self.spans(p.page);
+        let (a, b) = spans.get(p.span).map(|s| select::word(&s.text, p.ch)).unwrap_or((p.ch, p.ch));
+        (Pos { ch: a, ..p }, Pos { ch: b, ..p })
+    }
+
+    /// The whole span around `p`.
+    fn span_range(&self, p: Pos) -> (Pos, Pos) {
+        let n = self.spans(p.page).get(p.span).map(|s| s.text.chars().count()).unwrap_or(0);
+        (Pos { ch: 0, ..p }, Pos { ch: n, ..p })
+    }
+
+    /// The press range at granularity `g` (1 caret, 2 word, 3 span).
+    fn unit(&self, p: Pos, g: u8) -> (Pos, Pos) {
+        match g {
+            2 => self.word(p),
+            3 => self.span_range(p),
+            _ => (p, p),
+        }
+    }
+}
+
+/// A find hit as a selection (its rects come from the selection's per-span path).
+fn range_sel(r: &Range) -> PdfSelection {
+    let (a, b) = r.bounds();
+    PdfSelection { anchor: Some(a), focus: Some(b), drag: None }
+}
+
+/// The last path segment of `url` (the title of a PDF without /Info /Title).
+fn file_name(url: &str) -> String {
+    let path = url.split(['?', '#']).next().unwrap_or("");
+    let seg = path.rsplit('/').next().unwrap_or("");
+    if seg.is_empty() { "PDF".to_string() } else { seg.to_string() }
+}
+
+/// PDF4FORMSAVE (SR354): the file name a save suggests: the /Info /Title, else the URL's last segment (percent-decoded),
+/// sanitized as a download's name is, ending in `.pdf`.
+fn save_name(title: Option<&str>, url: &str) -> String {
+    let base = title
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| crate::chrome::downloads::percent_decode(&file_name(url)));
+    let base = crate::chrome::downloads::sanitize(&base);
+    let base = if base.is_empty() { "PDF".to_string() } else { base };
+    if base.to_ascii_lowercase().ends_with(".pdf") { base } else { format!("{base}.pdf") }
+}
+
+fn escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+}
+
+// =================================================================================================
+// The engine's PDF hooks (lib.rs calls each from one line while `pdf` is Some).
+// =================================================================================================
+
+impl crate::AetherEngine {
+    /// Open a fetched PDF: the empty document carrying its title goes through `load_impl` (history, title, resets),
+    /// then the PDF takes over painting, scrolling, selection and find. A file that needs a password, or that pdf_core
+    /// refuses, is a visible HTML page saying so.
+    pub fn load_pdf(&mut self, url: &str, bytes: Vec<u8>, add_history: bool) {
+        match PdfDocument::open(bytes) {
+            Ok(pdf) => {
+                let title = pdf.title.clone().unwrap_or_else(|| file_name(url));
+                let html = format!("<html><head><title>{}</title></head><body></body></html>", escape(&title));
+                self.load_impl(url, &html, &[], None, add_history);
+                self.pdf = Some(pdf);
+                self.pdf_dirty();
+            }
+            Err(e) => {
+                let msg = match e {
+                    pdf_core::Error::Password => {
+                        "This PDF is password-protected \u{2014} opening it is not supported yet.".to_string()
+                    }
+                    e => format!("Could not open this PDF: {e:?}"),
+                };
+                let html = format!(
+                    "<html><head><title>{}</title></head><body style=\"font-family: sans-serif; padding: 20px;\"><h1>PDF</h1><p>{}</p></body></html>",
+                    escape(&file_name(url)),
+                    escape(&msg)
+                );
+                self.load_impl(url, &html, &[], None, add_history);
+            }
+        }
+    }
+
+    /// The PDF's frame changed: repaint the whole viewport.
+    fn pdf_dirty(&mut self) {
+        self.needs_repaint = true;
+        self.damage_rects.push((0, 0, self.width, self.height));
+    }
+
+    /// `press_at` on a PDF: a caret, the word or the span under the pointer; Shift extends.
+    pub(crate) fn pdf_press(&mut self, x: f64, y: f64, clicks: u8, shift: bool) {
+        let (vw, sy) = (self.width as f64, (self.scroll_x, self.scroll_y));
+        let Some(pdf) = self.pdf.as_mut() else { return };
+        // PDF4-THUMBS (SR360): a press in the open strip jumps to the thumbnail's page.
+        if pdf.in_strip(x) {
+            pdf.pressed = None;
+            pdf.sel.drag = None;
+            return self.pdf_thumb_click(x, y);
+        }
+        // PDF4ANNOTS (SR343): a press on a link or form widget starts no selection (its release activates it); a press
+        // anywhere else blurs the focused text field.
+        pdf.strip_focus = None; let target = pdf.target_at(x, y, vw, sy);
+        pdf.pressed = target;
+        if target.is_some() {
+            pdf.sel.drag = None;
+            if pdf.focus.as_ref().map(|f| f.target) != target && pdf.blur() {
+                self.pdf_dirty();
+            }
+            return;
+        }
+        pdf.blur();
+        match pdf.hit_at(x, y, vw, sy) {
+            None => pdf.sel = PdfSelection::default(),
+            Some(p) => match pdf.sel.anchor.filter(|_| shift) {
+                Some(a) =>pdf.sel = PdfSelection { anchor: Some(a), focus: Some(p), drag: Some((1, a, a)) },
+                _ => {
+                    let g = clicks.clamp(1, 3);
+                    let (lo, hi) = pdf.unit(p, g);
+                    pdf.sel = PdfSelection { anchor: Some(lo), focus: Some(hi), drag: Some((g, lo, hi)) };
+                }
+            },
+        }
+        self.pdf_dirty();
+    }
+
+    /// `selection_pointer_moved` on a PDF (button held): the focus follows the pointer at the press's granularity.
+    pub(crate) fn pdf_drag(&mut self, x: f64, y: f64) {
+        let (vw, sy) = (self.width as f64, (self.scroll_x, self.scroll_y));
+        let Some(pdf) = self.pdf.as_mut() else { return };
+        let Some((g, lo, hi)) = pdf.sel.drag else { return };
+        let Some(p) = pdf.hit_at(x, y, vw, sy) else { return };
+        let (a, b) = pdf.unit(p, g);
+        let (anchor, focus) = if p < lo { (hi, a) } else { (lo, b) };
+        pdf.sel.anchor = Some(anchor);
+        pdf.sel.focus = Some(focus);
+        self.pdf_dirty();
+    }
+
+    /// Ctrl/Cmd+A on a PDF: every span of every page.
+    pub(crate) fn pdf_select_all(&mut self) {
+        let Some(pdf) = self.pdf.as_mut() else { return };
+        let last = (0..pdf.page_count()).rev().find_map(|i| {
+            let sp = pdf.spans(i);
+            sp.last().map(|s| Pos { page: i, span: sp.len() - 1, ch: s.text.chars().count() })
+        });
+        pdf.sel = match last {
+            Some(end) => PdfSelection { anchor: Some(Pos { page: 0, span: 0, ch: 0 }), focus: Some(end), drag: None },
+            None => PdfSelection::default(),
+        };
+        self.pdf_dirty();
+    }
+
+    /// `find` on a PDF: the same `FindState` (a repeat steps), hits over the spans; the active hit becomes the
+    /// selection and is scrolled into view.
+    pub(crate) fn pdf_find(&mut self, query: &str, forward: bool) -> (u32, u32) {
+        let repeat = self.find.is_repeat(query) && self.pdf.as_ref().is_some_and(|p| !p.hits.is_empty());
+        let cur = if repeat {
+            self.find.step(forward)
+        } else {
+            let hits = self.pdf.as_ref().map(|p| p.find_all(query)).unwrap_or_default();
+            let n = hits.len();
+            if let Some(p) = self.pdf.as_mut() {
+                p.hits = hits;
+            }
+            self.find.begin(query, n, forward)
+        };
+        if let Some(p) = self.pdf.as_mut() {
+            p.cur = cur;
+        }
+        if let Some(i) = cur {
+            self.pdf_show_hit(i);
+        }
+        self.pdf_dirty();
+        self.find.result()
+    }
+
+    fn pdf_show_hit(&mut self, i: usize) {
+        let (vw, vh) = (self.width as f64, self.height as f64);
+        let Some(pdf) = self.pdf.as_mut() else { return };
+        let Some(h) = pdf.hits.get(i).copied() else { return };
+        let (a, b) = h.bounds();
+        pdf.sel = PdfSelection { anchor: Some(a), focus: Some(b), drag: None };
+        let Some(r) = pdf.range_rect(&h) else { return };
+        let (px, py, _, _) = pdf.page_rect(h.page, vw);
+        let strip = pdf.left;
+        let (top, bottom) = (py + r[1] * PT, py + r[3] * PT);
+        let dy = if top < self.scroll_y || bottom > self.scroll_y + vh { (top - vh / 3.0).max(0.0) - self.scroll_y } else { 0.0 };
+        // PDF4-HSCROLL (SR360): and sideways, when the hit lies outside the lane's visible columns.
+        let (left, right) = (px + r[0] * PT, px + r[2] * PT);
+        let (lo, hi) = (self.scroll_x + strip, self.scroll_x + vw);
+        let dx = if left < lo { left - GAP - lo } else if right > hi { right + GAP - hi } else { 0.0 };
+        if dx != 0.0 || dy != 0.0 {
+            self.handle_event(crate::api::events::Event::Scroll(dx, dy));
+        }
+    }
+
+    /// The find bar closed on a PDF: the hits go, and the active hit's selection with them.
+    pub(crate) fn pdf_find_close(&mut self) {
+        if let Some(p) = self.pdf.as_mut() {
+            if p.cur.is_some() {
+                p.sel = PdfSelection::default();
+            }
+            p.hits.clear();
+            p.cur = None;
+        }
+        self.pdf_dirty();
+    }
+
+    /// The status line's page indicator while a PDF is open: "Page p / n" and the zoom (PDF4-FIT-STATUS-PCT SR395:
+    /// ` · 125%`, ` · fit-w 87%` in a fit mode; `fit_token`).
+    pub fn pdf_status(&self) -> Option<String> {
+        self.pdf.as_ref().map(|p| p.status(self.scroll_y, self.height as f64) + &p.fit_token(self.zoom_pct))
+    }
+
+    /// PDF4FORMSAVE (SR354): Ctrl/Cmd+S on a PDF stages a `BrowserSave` of the file as it stands (the filled form's
+    /// incremental updates, or the fetched bytes untouched) for the shell to write to the Downloads folder. Runs ahead
+    /// of `pdf_key`, whose focused field would take the `s` as a consumed character; the field keeps its focus. False
+    /// (the key goes on as before) for any other key. PAGESAVE (SR392): on an HTML page the same keys stage the current
+    /// DOM's markup as `<title>.html` (`chrome::host::page_save`; a Save As chosen as `.mhtml` lands the archive). SAVEDIALOG (SR364): with
+    /// Shift (Ctrl/Cmd+Shift+S) the same name / type / bytes stage as `BrowserSaveAs`: the shell asks the face's save
+    /// panel for the path (the staged variant is the Save As flag).
+    pub(crate) fn save_key(&mut self, key: &str) -> bool {
+        use crate::forms::edit::{parse_key, Key};
+        let (m, k) = parse_key(key);
+        if !(m.ctrl || m.meta) || m.alt || !matches!(k, Some(Key::Char('s' | 'S'))) {
+            return false;
+        }
+        let Some(pdf) = self.pdf.as_ref() else {
+            // PAGESAVE (SR392): an HTML tab: the current DOM, staged as the PDF arm stages its bytes.
+            let Some((name, bytes)) = crate::chrome::host::page_save(self, m.shift) else { return false };
+            let mime = "text/html".to_string();
+            self.pending_save = Some(if m.shift { bandy::SMessage::BrowserSaveAs { name, mime, bytes } } else { bandy::SMessage::BrowserSave { name, mime, bytes } });
+            return true;
+        };
+        let name = save_name(pdf.title.as_deref(), &self.current_url());
+        let (mime, bytes) = ("application/pdf".to_string(), pdf.bytes.clone());
+        self.pending_save = Some(if m.shift { bandy::SMessage::BrowserSaveAs { name, mime, bytes } } else { bandy::SMessage::BrowserSave { name, mime, bytes } });
+        true
+    }
+
+    /// PDF4FORMSAVE (SR354): the save Ctrl/Cmd+S staged, once (the shell fires it on the bus after the turn).
+    pub fn take_pending_save(&mut self) -> Option<bandy::SMessage> {
+        self.pending_save.take()
+    }
+}
+
+// =================================================================================================
+// PDF4-HSCROLL / PDF4-THUMBS (SR360): the engine's horizontal scroll and view keys (lib.rs calls the first two from one
+// line each: the `Event::Scroll` clamp and the `Event::Resize` arm; `pdf_key` calls the third).
+// =================================================================================================
+
+impl crate::AetherEngine {
+    /// The x half of the one `Event::Scroll` clamp: `scroll_x` over [0, `max_scroll_x`] (a no-op without a PDF; the
+    /// frame is repainted when it moves).
+    pub(crate) fn pdf_scroll_x(&mut self, dx: f64) {
+        let vw = self.width as f64;
+        let Some(p) = self.pdf.as_ref() else { return };
+        let x = (self.scroll_x + dx).clamp(0.0, p.max_scroll_x(vw));
+        if x != self.scroll_x {
+            self.scroll_x = x;
+            self.pdf_dirty();
+        }
+    }
+
+    /// The viewport was resized (a window resize or a zoom): the strip's CSS width follows the zoom, `scroll_x`
+    /// re-clamps.
+    pub(crate) fn pdf_resized(&mut self) {
+        let z = self.zoom();
+        if let Some(p) = self.pdf.as_mut().filter(|p| p.thumbs) {
+            p.left = thumbs::strip_css(z);
+        }
+        self.pdf_scroll_x(0.0);
+    }
+
+    /// The PDF's view keys when no field takes them: unmodified Left / Right scroll a line sideways, F4 cycles the left
+    /// strip (thumbnails, outline, off: `pdf_strip_cycle`); PDF4-STRIPKEYS (SR389): the strip's keys first
+    /// (`pdf_strip_key`), PDF4-FIT (SR389): `w` / `p` fit the width / the page (`pdf_fit`). False without a PDF and for
+    /// any other key.
+    pub(crate) fn pdf_view_key(&mut self, key: &str) -> bool {
+        use crate::forms::edit::{parse_key, Key};
+        if self.pdf.is_none() {
+            return false;
+        }
+        if key == "F4" {
+            self.pdf_strip_cycle();
+            self.pdf_strip_refocus();
+            self.pdf_refit();
+            return true;
+        }
+        if self.pdf_strip_key(key) {
+            return true;
+        }
+        let (m, k) = parse_key(key);
+        if m.ctrl || m.alt || m.meta || m.shift {
+            return false;
+        }
+        let dx = match k {
+            Some(Key::Left) => -crate::LINE_STEP,
+            Some(Key::Right) => crate::LINE_STEP,
+            Some(Key::Char('w')) => {
+                self.pdf_fit(Fit::Width);
+                return true;
+            }
+            Some(Key::Char('p')) => {
+                self.pdf_fit(Fit::Page);
+                return true;
+            }
+            _ => return false,
+        };
+        self.handle_event(crate::api::events::Event::Scroll(dx, 0.0));
+        true
+    }
+}
+
+// =================================================================================================
+// PDF4-THUMBSCROLL (SR374): the wheel door. The face's wheel (aether-shell's `BrowserScroll` arm) asks here first: the
+// one `Event::Scroll` clamp cannot tell a wheel from a key, find or link scroll, several of which arrive with the pointer
+// resting on the strip.
+// =================================================================================================
+
+impl crate::AetherEngine {
+    /// A wheel of (`dx`, `dy`) CSS px: when a PDF's strip is open and the pointer is over it, the strip's stored
+    /// scroll moves by `dy` (device px at the zoom, clamped to its content) and the frame repaints; true (the pages do
+    /// not move, `dx` is dropped). False otherwise: the caller sends its `Event::Scroll` as before.
+    pub fn pdf_wheel(&mut self, _dx: f64, dy: f64) -> bool {
+        let (z, dh) = (self.zoom(), self.device.1 as f64);
+        let Some((px, _)) = self.pointer else { return false };
+        let Some(pdf) = self.pdf.as_ref().filter(|p| p.in_strip(px)) else { return false };
+        let max = (thumbs::extent(pdf, z) - dh).max(0.0);
+        pdf.strip_off.set((pdf.strip_off.get() + dy * z).clamp(0.0, max));
+        self.pdf_dirty();
+        true
+    }
+}
+
+// =================================================================================================
+// PDF4-FIT (SR389): fit-width and fit-page through the one zoom path (`set_zoom_pct`). Both fit the whole stack (the
+// widest page; the tallest for fit-page), so the mode does not depend on the current page and persists across page
+// changes. lib.rs calls `pdf_refit` after every `Event::Resize` arm (a zoom inside the arm would re-enter it), and
+// PDF4-FIT-ZOOMROUND (SR401): `apply_device_size` calls it when no Resize fired (the CSS size rounded the same).
+// =================================================================================================
+
+/// A fit mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Fit {
+    Width,
+    Page,
+}
+
+impl PdfDocument {
+    /// The zoom percentage that fits the stack to a `device` frame: the frame over the stack's width (`stack_w`) and the
+    /// open strip's (SR387: `thumbs::STRIP_W` CSS px at every zoom, so z = dw / (stack_w + STRIP_W)), and for `Fit::Page`
+    /// no more than the frame's height over the tallest page and its gaps; floored (the stack never overflows), clamped
+    /// to the zoom ladder's ends.
+    pub fn fit_pct(&self, fit: Fit, (dw, dh): (u32, u32)) -> u32 {
+        let w = dw as f64 / (self.stack_w() + if self.thumbs { thumbs::STRIP_W } else { 0.0 });
+        let z = match fit {
+            Fit::Width => w,
+            Fit::Page => w.min(dh as f64 / (self.sizes.iter().fold(0.0f64, |m, s| m.max(s.1)) * PT + 2.0 * GAP)),
+        };
+        let lv = crate::chrome::zoom::LEVELS;
+        ((z * 100.0).floor().max(0.0) as u32).clamp(lv[0], lv[lv.len() - 1])
+    }
+
+    /// The status line's zoom token at `pct` (the engine's one `zoom_pct`; PDF4-FIT-STATUS-PCT SR395): ` · 125%`, or
+    /// with the fit mode named ` · fit-w 87%` / ` · fit-p 87%`. The toolbar's `BrowserNavState.zoom_pct` is unchanged.
+    pub fn fit_token(&self, pct: u32) -> String {
+        match self.fit {
+            Some((Fit::Width, _)) => format!(" \u{b7} fit-w {pct}%"),
+            Some((Fit::Page, _)) => format!(" \u{b7} fit-p {pct}%"),
+            None => format!(" \u{b7} {pct}%"),
+        }
+    }
+}
+
+impl crate::AetherEngine {
+    /// `w` / `p` on a PDF: the fit mode is stored with its percentage, then the one zoom path applies it; fit-page also
+    /// brings the current page's top to the frame's top (the one `Event::Scroll` clamp).
+    fn pdf_fit(&mut self, fit: Fit) {
+        let (dev, vh) = (self.device, self.height as f64);
+        let Some(pdf) = self.pdf.as_mut() else { return };
+        let pct = pdf.fit_pct(fit, dev);
+        let cur = pdf.page_at(self.scroll_y + vh / 2.0);
+        pdf.fit = Some((fit, pct));
+        self.set_zoom_pct(pct);
+        if fit == Fit::Page {
+            let vw = self.width as f64;
+            let top = self.pdf.as_ref().map_or(0.0, |p| p.page_rect(cur, vw).1 - GAP);
+            self.handle_event(crate::api::events::Event::Scroll(0.0, top - self.scroll_y));
+        }
+        self.pdf_dirty();
+    }
+
+    /// After a resize (a window resize, a zoom, the strip opening or closing): a zoom that is not the fit's own (a
+    /// ladder step or reset) drops the mode; else the fit is recomputed and applied when it moved (a second call on the
+    /// settled state is a no-op, so the nested call through `set_zoom_pct` returns).
+    pub(crate) fn pdf_refit(&mut self) {
+        let (dev, now) = (self.device, self.zoom_pct);
+        let Some(pdf) = self.pdf.as_mut() else { return };
+        let Some((fit, pct)) = pdf.fit else { return };
+        if now != pct {
+            pdf.fit = None;
+            return self.pdf_dirty();
+        }
+        let new = pdf.fit_pct(fit, dev);
+        if new != pct {
+            pdf.fit = Some((fit, new));
+            self.set_zoom_pct(new);
+            self.pdf_dirty();
+        }
+    }
+}

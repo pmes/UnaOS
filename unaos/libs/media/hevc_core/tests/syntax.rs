@@ -567,3 +567,30 @@ fn scans_kat() {
     assert_eq!(&SCAN_ORDER[2][2][..5], &[(0, 0), (0, 1), (0, 2), (0, 3), (1, 0)]);
     assert_eq!(SCAN_ORDER[3][0][63], (7, 7));
 }
+
+/// An hvcC (ISO/IEC 14496-15 8.3.3.1: Main, level 60, 4:2:0, 8-bit, 4-byte lengths) over the given (type, NAL unit)
+/// arrays, one unit each.
+fn hvcc_of(units: &[(u8, Vec<u8>)]) -> Vec<u8> {
+    let mut rec = vec![1u8, 0x01, 0x60, 0, 0, 0, 0x90, 0, 0, 0, 0, 0, 60, 0xf0, 0x00, 0xfc, 0xfd, 0xf8, 0xf8, 0, 0, 0x0f];
+    rec.push(units.len() as u8);
+    for (ty, u) in units {
+        rec.extend([0x80 | ty, 0, 1, (u.len() >> 8) as u8, u.len() as u8]);
+        rec.extend(u);
+    }
+    rec
+}
+
+/// HEVCDEPTH-CORE (LEDGER SR304): `ps::hvcc_reorder_depth` reads the hvcC's first SPS's sps_max_num_reorder_pics at the
+/// highest sub-layer through `parse_sps`; a record that does not parse, or carries no SPS, is `None`.
+#[test]
+fn hvcc_reorder_depth_reads_the_first_sps() {
+    use hevc_core::ps::hvcc_reorder_depth;
+    let cfg = SpsCfg::default();
+    let deep = InterSps { max_dec_pic_buffering_minus1: 2, max_num_reorder_pics: 2, ..Default::default() };
+    let pps_unit = nal_bytes(34, &pps_rbsp(&PpsCfg::default()));
+    let rec = hvcc_of(&[(32, unit_payload(&vps(false))), (33, nal_bytes(33, &sps_rbsp_ext(&cfg, &deep))), (34, pps_unit.clone())]);
+    assert_eq!(hvcc_reorder_depth(&rec), Some(2), "sps_max_num_reorder_pics");
+    assert_eq!(hvcc_reorder_depth(&hvcc_of(&[(33, nal_bytes(33, &sps_rbsp(&cfg)))])), Some(0));
+    assert_eq!(hvcc_reorder_depth(&rec[..20]), None, "a truncated record");
+    assert_eq!(hvcc_reorder_depth(&hvcc_of(&[(34, pps_unit)])), None, "no SPS array");
+}

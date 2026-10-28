@@ -97,24 +97,10 @@ impl AesCcm {
         a
     }
 
-    /// XOR `S_1 ‖ S_2 ‖ …` into `data`, four counter blocks per bitsliced pass.
+    /// XOR `S_1 ‖ S_2 ‖ …` into `data`: crate::ctr from `A_1` with an 8·L-bit counter (CRYPTOONE-2, SR342; `params`
+    /// bounds the message below 2^(8L) octets, so the counter never wraps).
     fn ctr(&self, nonce: &[u8], l: usize, data: &mut [u8]) {
-        let mut i = 1u64;
-        for chunk in data.chunks_mut(4 * BLOCK) {
-            let n = chunk.len().div_ceil(BLOCK);
-            let mut ks = [[0u8; BLOCK]; 4];
-            for (k, b) in ks.iter_mut().take(n).enumerate() {
-                *b = Self::a_block(nonce, l, i + k as u64);
-            }
-            self.aes.encrypt_blocks(&mut ks[..n]);
-            for (j, x) in chunk.iter_mut().enumerate() {
-                *x ^= ks[j / BLOCK][j % BLOCK];
-            }
-            i += n as u64;
-            for b in ks.iter_mut() {
-                b.zeroize();
-            }
-        }
+        crate::ctr::ctr(&self.aes, &Self::a_block(nonce, l, 1), (8 * l) as u8, data);
     }
 
     /// The encrypted tag `U = T ⊕ S_0` over (aad, plaintext `msg`), into `u[..m]`.

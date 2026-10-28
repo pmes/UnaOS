@@ -10,8 +10,11 @@
 //!   (Skia's `FontEquivClass`: Arial ≡ Liberation Sans ≡ Arimo, Times New Roman ≡ Liberation Serif ≡ Tinos,
 //!   …), found through fontconfig's alias expansion. Any other substitute is refused, so the next family
 //!   of the CSS list is tried.
-//! - Generic families map to Chromium's Linux defaults (`standard`/`serif` "Times New Roman",
-//!   `sans-serif` "Arial", `monospace` "Monospace", `cursive` "Comic Sans MS", `fantasy` "Impact").
+//! - Generic families map through ONE per-OS table, [`generics_for`] (AETHER-MACGENERICS, SR418): on Linux
+//!   Chromium's Linux defaults (`standard`/`serif` "Times New Roman", `sans-serif` "Arial", `monospace`
+//!   "Monospace", `cursive` "Comic Sans MS", `fantasy` "Impact", `system-ui` "sans"), on macOS Chromium-mac's
+//!   (Times, Helvetica, Courier, Apple Chancery, Papyrus, the SF system face), each a candidate list tried
+//!   through [`FontDb::resolve_family`].
 //! - Face selection inside a family: css-fonts-4 §5.2 (font-stretch, then font-style, then font-weight),
 //!   then synthesis as Blink decides it: bold when the wanted weight exceeds the face's by more than 200,
 //!   oblique when italic/oblique is wanted and the face is upright.
@@ -23,6 +26,7 @@ use crate::fontconfig::{family_eq, Config};
 use font_core::Font;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 /// font-style, as matched (css-fonts-4 §2.4).
@@ -96,12 +100,13 @@ pub fn style_of(f: &Font) -> Style {
     Style { weight: weight as f32, slant, stretch: width_class_percent(stretch) }
 }
 
-/// Reads every face of one font file.
+/// Indexes every face of one font file from its headers only (AETHER-FONTDB-LAZY (SR419): [`faces_in_header`]);
+/// the full bytes load on first use through [`crate::load_face`].
 pub fn faces_in_file(path: &Path) -> Vec<FaceInfo> {
-    let Ok(data) = std::fs::read(path) else { return Vec::new() };
-    faces_in_bytes(&data, path)
+    faces_in_header(path).0
 }
 
+/// Every face of a font file held whole in memory.
 pub fn faces_in_bytes(data: &[u8], path: &Path) -> Vec<FaceInfo> {
     let mut out = Vec::new();
     for i in 0..Font::face_count(data).min(64) {
@@ -109,15 +114,21 @@ pub fn faces_in_bytes(data: &[u8], path: &Path) -> Vec<FaceInfo> {
         if matches!(f.outlines, font_core::Outlines::None) {
             continue;
         }
-        let families = font_core::name::family_names(&f);
-        if families.is_empty() {
-            continue;
-        }
-        let mut full_names = font_core::name::values(&f, font_core::name::FULL_NAME);
-        full_names.extend(font_core::name::values(&f, font_core::name::POSTSCRIPT));
-        out.push(FaceInfo { path: path.to_path_buf(), index: i, families, full_names, style: style_of(&f) });
+        out.extend(face_record(&f, path, i));
     }
     out
+}
+
+/// The index record of one parsed face (AETHER-FONTDB-LAZY (SR419): the ONE builder both the whole-file and the
+/// header path use): family names (IDs 1 and 16), full and PostScript names, the selection style.
+fn face_record(f: &Font, path: &Path, index: u32) -> Option<FaceInfo> {
+    let families = font_core::name::family_names(f);
+    if families.is_empty() {
+        return None;
+    }
+    let mut full_names = font_core::name::values(f, font_core::name::FULL_NAME);
+    full_names.extend(font_core::name::values(f, font_core::name::POSTSCRIPT));
+    Some(FaceInfo { path: path.to_path_buf(), index, families, full_names, style: style_of(f) })
 }
 
 fn walk_dir(dir: &Path, out: &mut Vec<PathBuf>, depth: u32) {
@@ -244,26 +255,51 @@ pub struct FontDb {
     resolved: Mutex<HashMap<String, Option<String>>>,
     /// The per-character fallback order (face indices): fontconfig's sort of `sans-serif`.
     fallback: OnceLock<Vec<usize>>,
+    /// AETHER-FONTDB-LAZY (SR419): the bytes `discover` read to build the index (0 for [`FontDb::from_faces`]).
+    bytes_read: u64,
+    /// AETHERFONTDBFALLBACK (SR425): each face's `cmap` table alone, read on first need by [`FontDb::covers`]
+    /// (None = file unreadable, empty = no cmap), and the bytes those bounded reads took.
+    cmaps: Vec<OnceLock<Option<Box<[u8]>>>>,
+    scan_bytes: AtomicU64,
 }
 
 impl FontDb {
     /// Builds the database from fontconfig's directories (once per process: [`db`]).
+    /// AETHER-FONTDB-LAZY (SR419): each file is indexed from its headers ([`faces_in_header`]), never read whole.
     pub fn discover(config: Config) -> FontDb {
+        let t0 = std::time::Instant::now();
         let mut files = Vec::new();
         for d in &config.dirs {
             walk_dir(d, &mut files, 0);
         }
         files.dedup();
         let mut faces = Vec::new();
+        let mut bytes_read = 0u64;
         for f in &files {
-            faces.extend(faces_in_file(f));
+            let (v, n) = faces_in_header(f);
+            faces.extend(v);
+            bytes_read += n;
         }
-        FontDb { faces, config, resolved: Mutex::new(HashMap::new()), fallback: OnceLock::new() }
+        eprintln!(
+            "[fonts] discover files={} bytes_read={} faces={} ms={}",
+            files.len(),
+            bytes_read / 1024,
+            faces.len(),
+            t0.elapsed().as_millis()
+        );
+        let (cmaps, scan_bytes) = ((0..faces.len()).map(|_| OnceLock::new()).collect(), AtomicU64::new(0)); // AETHERFONTDBFALLBACK (SR425)
+        FontDb { faces, config, resolved: Mutex::new(HashMap::new()), fallback: OnceLock::new(), bytes_read, cmaps, scan_bytes }
     }
 
     /// A database over explicit faces (tests).
     pub fn from_faces(faces: Vec<FaceInfo>, config: Config) -> FontDb {
-        FontDb { faces, config, resolved: Mutex::new(HashMap::new()), fallback: OnceLock::new() }
+        let (cmaps, scan_bytes) = ((0..faces.len()).map(|_| OnceLock::new()).collect(), AtomicU64::new(0)); // AETHERFONTDBFALLBACK (SR425)
+        FontDb { faces, config, resolved: Mutex::new(HashMap::new()), fallback: OnceLock::new(), bytes_read: 0, cmaps, scan_bytes }
+    }
+
+    /// AETHER-FONTDB-LAZY (SR419): the bytes [`FontDb::discover`] read to index the faces.
+    pub fn discover_bytes(&self) -> u64 {
+        self.bytes_read
     }
 
     /// The faces of an installed family (exact name, fontconfig comparison).
@@ -309,6 +345,8 @@ impl FontDb {
     /// test) first, then in discovery order.
     pub fn fallback_order(&self) -> &[usize] {
         self.fallback.get_or_init(|| {
+            let (t0, b0) = (std::time::Instant::now(), self.scan_bytes()); // AETHERFONTDBFALLBACK (SR425)
+            let mut scanned = 0usize;
             let expanded = self.config.expand(&["sans-serif"]);
             let rank = |f: &FaceInfo| -> usize {
                 f.families
@@ -326,22 +364,24 @@ impl FontDb {
                     // inside one family the regular face first (the pattern asks for weight 400, roman)
                     let st =
                         (f.style.weight - 400.0).abs() as usize + if f.style.slant == Slant::Normal { 0 } else { 1000 };
-                    (r, if r == usize::MAX { latin_rank(f) } else { 0 }, st, i)
+                    (r, if r == usize::MAX { scanned += 1; latin_rank(self, i) } else { 0 }, st, i)
                 })
                 .collect();
             idx.sort();
+            let kb = (self.scan_bytes() - b0) / 1024;
+            eprintln!("[fonts] fallback faces={scanned} bytes_read={kb} ms={}", t0.elapsed().as_millis());
             idx.into_iter().map(|t| t.3).collect()
         })
     }
 }
 
-/// 0 when the face's file covers a–z (fontconfig's `en` orthography), else 1.
-fn latin_rank(f: &FaceInfo) -> usize {
-    let Some(face) = crate::load_face(f) else { return 2 };
-    if ('a'..='z').all(|c| face.font.glyph_index(c) != 0) {
-        0
-    } else {
-        1
+/// 0 when the face's cmap covers a–z (fontconfig's `en` orthography), else 1; 2 when its file is unreadable.
+/// AETHERFONTDBFALLBACK (SR425): read through [`FontDb::covers`] (the cmap table alone), never a whole load.
+fn latin_rank(db: &FontDb, i: usize) -> usize {
+    match ('a'..='z').map(|c| db.covers(i, c)).try_fold(true, |all, v| v.map(|v| all && v)) {
+        None => 2,
+        Some(true) => 0,
+        Some(false) => 1,
     }
 }
 
@@ -349,6 +389,271 @@ fn latin_rank(f: &FaceInfo) -> usize {
 pub fn db() -> &'static FontDb {
     static DB: OnceLock<FontDb> = OnceLock::new();
     DB.get_or_init(|| FontDb::discover(Config::system()))
+}
+
+// AETHER-FONTDB-LAZY (SR419): discovery from the headers. A face file is indexed from its table directory and the
+// five tables a record needs (`head`, `maxp`, `hhea`, `name`, `OS/2`), each read by offset; font_core parses them
+// from a small sfnt assembled of those tables, so the name / OS/2 / head parsers stay font_core's own. The full
+// bytes load on first use (`crate::load_face` -> `file_bytes`).
+
+/// A table larger than this is treated as absent (a `name` or `OS/2` table is a few KB).
+const HEADER_TABLE_CAP: u32 = 4 << 20;
+
+/// Bounded reads of one font file, counting the bytes read.
+struct HeaderReader {
+    file: std::fs::File,
+    len: u64,
+    read: u64,
+}
+
+impl HeaderReader {
+    fn open(path: &Path) -> Option<HeaderReader> {
+        let file = std::fs::File::open(path).ok()?;
+        let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+        Some(HeaderReader { file, len, read: 0 })
+    }
+
+    fn at(&mut self, off: u64, len: usize) -> Option<Vec<u8>> {
+        use std::io::{Read, Seek, SeekFrom};
+        if off.checked_add(len as u64)? > self.len {
+            return None;
+        }
+        self.file.seek(SeekFrom::Start(off)).ok()?;
+        let mut v = vec![0u8; len];
+        self.file.read_exact(&mut v).ok()?;
+        self.read += len as u64;
+        Some(v)
+    }
+
+    /// The table-directory offset of every face of the file (a TTC's offset table, at most 64, else the one sfnt
+    /// at 0). AETHERFONTDBFALLBACK (SR425): this, [`Self::directory`], [`Self::entry`] and [`Self::table`] are
+    /// SR419's reads lifted out of `faces_in_header` / `face_from_header` so the fallback scan's cmap read
+    /// ([`face_cmap`]) goes through the same ONE bounded reader.
+    fn face_dirs(&mut self) -> Vec<u32> {
+        match self.at(0, 12) {
+            Some(h) if be32(&h, 0) == Some(0x7474_6366) => {
+                let n = be32(&h, 8).unwrap_or(0).min(64) as usize;
+                self.at(12, 4 * n).map(|o| (0..n).filter_map(|i| be32(&o, 4 * i)).collect()).unwrap_or_default()
+            }
+            Some(_) => vec![0],
+            None => Vec::new(),
+        }
+    }
+
+    /// The face directory at `dir`: its sfnt version and its 16-byte table records.
+    fn directory(&mut self, dir: u64) -> Option<(u32, Vec<u8>)> {
+        let hdr = self.at(dir, 12)?;
+        let version = be32(&hdr, 0)?;
+        let num_tables = be16(&hdr, 4)? as usize;
+        Some((version, self.at(dir + 12, 16 * num_tables)?))
+    }
+
+    /// (offset, length) of the first record of `tag` whose range lies in the file, as `Font::table` finds it.
+    fn entry(&self, recs: &[u8], tag: &[u8; 4]) -> Option<(u32, u32)> {
+        let e = recs.chunks_exact(16).find(|e| &e[..4] == tag)?;
+        let (off, len) = (be32(e, 8)?, be32(e, 12)?);
+        (off as u64 + len as u64 <= self.len).then_some((off, len))
+    }
+
+    /// A table's bytes by `tag`, read by offset (absent, past the file or over [`HEADER_TABLE_CAP`]: None).
+    fn table(&mut self, recs: &[u8], tag: &[u8; 4]) -> Option<Vec<u8>> {
+        let (off, len) = self.entry(recs, tag)?;
+        if len > HEADER_TABLE_CAP {
+            return None;
+        }
+        self.at(off as u64, len as usize)
+    }
+}
+
+fn be16(b: &[u8], o: usize) -> Option<u16> {
+    Some(u16::from_be_bytes(b.get(o..o + 2)?.try_into().ok()?))
+}
+
+fn be32(b: &[u8], o: usize) -> Option<u32> {
+    Some(u32::from_be_bytes(b.get(o..o + 4)?.try_into().ok()?))
+}
+
+/// Every face of one font file, indexed from its headers, and the bytes read to do it. A face is skipped exactly
+/// where `Font::parse_face` and the outline check of [`faces_in_bytes`] skip it, except that the outline tables'
+/// CONTENT is not read: a face whose `CFF ` or glyph data is malformed is indexed and fails at `load_face`.
+pub fn faces_in_header(path: &Path) -> (Vec<FaceInfo>, u64) {
+    let Some(mut r) = HeaderReader::open(path) else { return (Vec::new(), 0) };
+    let dirs = r.face_dirs();
+    let mut out = Vec::new();
+    for (i, &dir) in dirs.iter().enumerate() {
+        if let Some(face) = face_from_header(&mut r, path, dir as u64, i as u32) {
+            out.push(face);
+        }
+    }
+    (out, r.read)
+}
+
+/// One face of a file from its table directory at `dir`.
+fn face_from_header(r: &mut HeaderReader, path: &Path, dir: u64, index: u32) -> Option<FaceInfo> {
+    let (version, recs) = r.directory(dir)?;
+    let entry = |r: &HeaderReader, tag: &[u8; 4]| r.entry(&recs, tag);
+    let head = r.table(&recs, b"head")?;
+    let maxp = r.table(&recs, b"maxp")?;
+    let mut hhea = r.table(&recs, b"hhea")?;
+    let name = r.table(&recs, b"name");
+    let os2 = r.table(&recs, b"OS/2");
+    // The skips `parse_face` makes beyond what it checks itself below: `hmtx` must hold numberOfHMetrics entries;
+    // outlines are `glyf` + a long-enough `loca`, else `CFF ` (font.rs's outline rule).
+    let num_glyphs = be16(&maxp, 4)? as usize;
+    let num_hmetrics = be16(&hhea, 34)? as usize;
+    if num_hmetrics == 0 || (entry(r, b"hmtx").map_or(0, |e| e.1) as usize) < 4 * num_hmetrics {
+        return None;
+    }
+    let long = be16(&head, 50)? as i16 == 1;
+    let outlines = match (entry(r, b"glyf"), entry(r, b"loca")) {
+        (Some(_), Some(loca)) => loca.1 as usize >= (num_glyphs + 1) * if long { 4 } else { 2 },
+        _ => entry(r, b"CFF ").is_some(),
+    };
+    if !outlines {
+        return None;
+    }
+    // The header-only sfnt: the real tables, `hhea` claiming one metric and a 4-byte `hmtx` to hold it.
+    hhea[34..36].copy_from_slice(&1u16.to_be_bytes());
+    let hmtx = [0u8; 4];
+    let mut tables: Vec<(&[u8; 4], &[u8])> =
+        vec![(b"head", head.as_slice()), (b"maxp", maxp.as_slice()), (b"hhea", hhea.as_slice()), (b"hmtx", &hmtx[..])];
+    if let Some(n) = &name {
+        tables.push((b"name", n.as_slice()));
+    }
+    if let Some(o) = &os2 {
+        tables.push((b"OS/2", o.as_slice()));
+    }
+    let sfnt = header_sfnt(version, &tables);
+    let f = Font::parse_face(&sfnt, 0).ok()?;
+    face_record(&f, path, index)
+}
+
+/// An sfnt of `tables` (offset table, directory, 4-aligned table data; checksums and the binary-search fields are
+/// zero: `Font::parse_face` reads neither).
+fn header_sfnt(version: u32, tables: &[(&[u8; 4], &[u8])]) -> Vec<u8> {
+    let n = tables.len();
+    let mut out = Vec::new();
+    out.extend_from_slice(&version.to_be_bytes());
+    out.extend_from_slice(&(n as u16).to_be_bytes());
+    out.extend_from_slice(&[0u8; 6]);
+    let mut off = 12 + 16 * n;
+    for (tag, data) in tables {
+        out.extend_from_slice(*tag);
+        out.extend_from_slice(&0u32.to_be_bytes());
+        out.extend_from_slice(&(off as u32).to_be_bytes());
+        out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        off += data.len().next_multiple_of(4);
+    }
+    for (_, data) in tables {
+        out.extend_from_slice(data);
+        out.resize(out.len().next_multiple_of(4), 0);
+    }
+    out
+}
+
+// AETHERFONTDBFALLBACK (SR425): the per-character fallback's coverage from each face's cmap table alone, read
+// through SR419's bounded reader; the whole file loads (`crate::load_face` -> `file_bytes`) only for the face picked.
+
+/// Face `index`'s `cmap` table alone (its directory, then the table by offset; empty when absent, past the file or
+/// over [`HEADER_TABLE_CAP`]), and the bytes read; None when the file or the face's directory is unreadable.
+pub fn face_cmap(path: &Path, index: u32) -> Option<(Vec<u8>, u64)> {
+    let mut r = HeaderReader::open(path)?;
+    let dir = *r.face_dirs().get(index as usize)?;
+    let (_, recs) = r.directory(dir as u64)?;
+    let cmap = r.table(&recs, b"cmap").unwrap_or_default();
+    Some((cmap, r.read))
+}
+
+impl FontDb {
+    /// The face's cmap table bytes (empty when it has none), read once with [`face_cmap`].
+    fn cmap_of(&self, i: usize) -> Option<std::borrow::Cow<'_, [u8]>> {
+        let read = || -> Option<Box<[u8]>> {
+            let f = self.faces.get(i)?;
+            let (t, n) = face_cmap(&f.path, f.index)?;
+            self.scan_bytes.fetch_add(n, Ordering::Relaxed);
+            Some(t.into_boxed_slice())
+        };
+        match self.cmaps.get(i) {
+            Some(cell) => cell.get_or_init(read).as_deref().map(std::borrow::Cow::Borrowed),
+            None => read().map(|b| std::borrow::Cow::Owned(b.into_vec())),
+        }
+    }
+
+    /// Whether face `i` maps `c` (as `Font::glyph_index(c) != 0` would on the whole face); None when its file
+    /// is unreadable.
+    pub fn covers(&self, i: usize, c: char) -> Option<bool> {
+        let cmap = self.cmap_of(i)?;
+        let st = font_core::cmap::Cmap::parse(&cmap).and_then(|t| t.best());
+        Some(st.is_some_and(|st| st.unicode_glyph(c) != 0))
+    }
+
+    /// The bytes the bounded cmap reads have taken so far.
+    pub fn scan_bytes(&self) -> u64 {
+        self.scan_bytes.load(Ordering::Relaxed)
+    }
+}
+
+// AETHER-MACGENERICS (SR418): the CSS generic families, ONE table per OS, keyed by the generic's CSS keyword.
+// Linux: Chromium Linux's WebFontFamilySettings names, one candidate each (byte-identical to the names Aether
+// handed the resolver before this table). macOS: Chromium-mac's (locale_settings_mac.grd: Times, Helvetica,
+// Courier, Apple Chancery, Papyrus; system-ui the CoreText UI face, SFNS.ttf; ui-monospace SF Mono, then Menlo),
+// each followed by the faces a stock Mac also carries. A stock Mac has no fonts.conf, so no alias rescues a name.
+const LINUX_GENERICS: &[(&str, &[&str])] = &[
+    ("serif", &["Times New Roman"]),
+    ("sans-serif", &["Arial"]),
+    ("monospace", &["Monospace"]),
+    ("cursive", &["Comic Sans MS"]),
+    ("fantasy", &["Impact"]),
+    ("system-ui", &["sans"]),
+];
+
+const MACOS_GENERICS: &[(&str, &[&str])] = &[
+    ("serif", &["Times", "Times New Roman"]),
+    ("sans-serif", &["Helvetica", "Arial"]),
+    ("monospace", &["Courier", "Menlo", "Courier New"]),
+    ("cursive", &["Apple Chancery", "Comic Sans MS"]),
+    ("fantasy", &["Papyrus", "Impact"]),
+    ("system-ui", &["System Font", ".SF NS", "SF Pro", "Helvetica Neue", "Helvetica"]),
+    // reached once Aether parses the ui-* generics (AETHER-UIGENERICS, owed)
+    ("ui-monospace", &["SF Mono", ".SF NS Mono", "Menlo"]),
+];
+
+/// The generic-family table of an OS: (CSS keyword, candidate family names in preference order).
+pub fn generics_for(macos: bool) -> &'static [(&'static str, &'static [&'static str])] {
+    if macos { MACOS_GENERICS } else { LINUX_GENERICS }
+}
+
+impl FontDb {
+    /// The family name a generic keyword hands the resolver on that OS: the first candidate
+    /// [`FontDb::resolve_family`] answers, else the first candidate (a miss stays a miss downstream); a keyword
+    /// the table has no row for is returned as itself (resolved as an ordinary family name).
+    pub fn generic_in(&self, macos: bool, keyword: &'static str) -> &'static str {
+        let Some((_, cands)) = generics_for(macos).iter().find(|(k, _)| k.eq_ignore_ascii_case(keyword)) else {
+            return keyword;
+        };
+        cands.iter().copied().find(|c| self.resolve_family(c).is_some()).unwrap_or(cands[0])
+    }
+}
+
+/// The family name a generic keyword resolves through on this host ([`FontDb::generic_in`] over the process
+/// database). The first call logs the picks once:
+/// `[fonts] generics os=<linux|macos> sans=<face|none> serif=<face|none> mono=<face|none> ui=<face|none>`.
+pub fn generic_family(keyword: &'static str) -> &'static str {
+    let d = db();
+    let macos = cfg!(target_os = "macos");
+    static LOG: std::sync::Once = std::sync::Once::new();
+    LOG.call_once(|| {
+        let pick = |k: &'static str| d.resolve_family(d.generic_in(macos, k)).unwrap_or_else(|| "none".to_string());
+        eprintln!(
+            "[fonts] generics os={} sans={} serif={} mono={} ui={}",
+            if macos { "macos" } else { "linux" },
+            pick("sans-serif"),
+            pick("serif"),
+            pick("monospace"),
+            pick("system-ui")
+        );
+    });
+    d.generic_in(macos, keyword)
 }
 
 #[cfg(test)]
@@ -420,44 +725,268 @@ mod tests {
         assert_eq!(db.resolve_family("Helvetica Neue"), None, "a non-equivalent substitute is refused");
         assert_eq!(db.resolve_family("NoSuchFamily"), None);
         // fc-match -s sans-serif is the oracle for the fallback order (skipped without fontconfig's tools).
-        let Ok(out) = std::process::Command::new("fc-match")
+        let Some((of, wd)) = fallback_vs_fc(db, db.fallback_order()) else { return };
+        assert_eq!(of, wd, "family order (typographic family) of the first fc-match -s sans-serif faces");
+    }
+
+    // AETHERFONTDBORACLE (SR430): the fc-match oracle keyed on the family both sides agree on. fontconfig lists a
+    // face's typographic family (name ID 16) first and the legacy family (ID 1) second, so a static cut
+    // ("Inter Medium", ID 16 "Inter") is grouped under its typographic family; FaceInfo.families[0] is ID 1.
+    /// fontconfig's family[0] for a face: name ID 16 (English first) when present, else name ID 1; the face's
+    /// `families[0]` when it does not load.
+    fn typographic_family(f: &FaceInfo) -> String {
+        crate::load_face(f)
+            .and_then(|face| {
+                font_core::name::values(&face.font, font_core::name::TYPOGRAPHIC_FAMILY)
+                    .into_iter()
+                    .next()
+                    .or_else(|| font_core::name::family(&face.font))
+            })
+            .or_else(|| f.families.first().cloned())
+            .unwrap_or_default()
+    }
+
+    /// The fallback family order `ours` against `fc-match -s sans-serif`: (ours' first families, fc-match's first
+    /// families), both keyed by [`typographic_family`] and consecutive-deduped, over the first six fc-match faces
+    /// this database indexes. None without fontconfig's tools.
+    fn fallback_vs_fc(db: &FontDb, ours: &[usize]) -> Option<(Vec<String>, Vec<String>)> {
+        let out = std::process::Command::new("fc-match")
             .args(["-s", "--format", "%{file}#%{index}\\n", "sans-serif"])
             .output()
-        else {
-            return;
-        };
-        let want: Vec<String> = String::from_utf8_lossy(&out.stdout)
+            .ok()?;
+        let key = |f: &FaceInfo| format!("{}#{}", f.path.display(), f.index);
+        let want: Vec<usize> = String::from_utf8_lossy(&out.stdout)
             .lines()
-            .filter(|l| db.faces.iter().any(|f| format!("{}#{}", f.path.display(), f.index) == *l))
-            .map(str::to_string)
+            .filter_map(|l| db.faces.iter().position(|f| key(f) == l))
             .collect();
-        let ours: Vec<String> = db
-            .fallback_order()
-            .iter()
-            .map(|&i| format!("{}#{}", db.faces[i].path.display(), db.faces[i].index))
-            .collect();
-        let n = 6.min(want.len());
-        let fam = |s: &str| {
-            db.faces
-                .iter()
-                .find(|f| format!("{}#{}", f.path.display(), f.index) == s)
-                .map(|f| f.families[0].clone())
-                .unwrap_or_default()
-        };
-        let wf: Vec<String> = want.iter().take(n).map(|s| fam(s)).collect();
-        let mut of: Vec<String> = Vec::new();
-        for s in &ours {
-            let f = fam(s);
-            if of.last() != Some(&f) {
-                of.push(f);
-            }
-        }
         let mut wd: Vec<String> = Vec::new();
-        for f in wf {
+        for &i in want.iter().take(6) {
+            let f = typographic_family(&db.faces[i]);
             if wd.last() != Some(&f) {
                 wd.push(f);
             }
         }
-        assert_eq!(&of[..wd.len()], &wd[..], "family order of the first {n} fc-match -s sans-serif faces");
+        let mut of: Vec<String> = Vec::new();
+        for &i in ours {
+            if of.len() == wd.len() {
+                break;
+            }
+            let f = typographic_family(&db.faces[i]);
+            if of.last() != Some(&f) {
+                of.push(f);
+            }
+        }
+        Some((of, wd))
+    }
+
+    /// The oracle still fails on a wrong order: the real fallback order with the second family's first face moved
+    /// to the front is rejected by the same comparison (skipped without faces, fontconfig's tools or two families).
+    #[test]
+    fn fontdb_oracle_rejects_swapped_order() {
+        let db = db();
+        if db.faces.is_empty() {
+            return;
+        }
+        let order = db.fallback_order();
+        let Some((_, wd)) = fallback_vs_fc(db, order) else { return };
+        if wd.len() < 2 {
+            return;
+        }
+        let first = typographic_family(&db.faces[order[0]]);
+        let Some(k) = order.iter().position(|&i| typographic_family(&db.faces[i]) != first) else { return };
+        let mut swapped = vec![order[k]];
+        swapped.extend(order.iter().copied().filter(|&i| i != order[k]));
+        let Some((of, wd)) = fallback_vs_fc(db, &swapped) else { return };
+        assert_ne!(of, wd, "a swapped fallback order must fail the fc-match oracle");
+    }
+
+    // AETHER-FONTDB-LAZY (SR419): header-only discovery.
+    fn same_records(a: &[FaceInfo], b: &[FaceInfo]) -> bool {
+        a.len() == b.len()
+            && a.iter().zip(b).all(|(x, y)| {
+                x.path == y.path
+                    && x.index == y.index
+                    && x.families == y.families
+                    && x.full_names == y.full_names
+                    && x.style == y.style
+            })
+    }
+
+    /// One small real face: indexed from far fewer bytes than the file, the same record as the whole-file read,
+    /// and it still shapes a glyph once `load_face` reads it.
+    #[test]
+    fn fontdb_lazy_fixture_kat() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fonts/jetbrains-mono");
+        let file = dir.join("JetBrainsMono-Variable.ttf");
+        let size = std::fs::metadata(&file).expect("fixture font").len();
+        let db = FontDb::discover(Config { dirs: vec![dir], ..Default::default() });
+        assert_eq!(db.faces.len(), 1, "{:?}", db.faces);
+        assert!(db.faces[0].families.iter().any(|f| f == "JetBrains Mono"), "{:?}", db.faces[0].families);
+        let n = db.discover_bytes();
+        assert!(n > 0 && n < size, "bytes_read {n} vs file {size}");
+        let whole = faces_in_bytes(&std::fs::read(&file).unwrap(), &file);
+        assert!(same_records(&db.faces, &whole), "{:?} vs {:?}", db.faces, whole);
+        let face = crate::load_face(&db.faces[0]).expect("the lazy load");
+        let g = face.glyph_for_char('A').expect("a glyph for A");
+        assert!(face.font.glyph_path(g).is_some_and(|p| !p.is_empty()), "A has an outline");
+    }
+
+    /// Every face file of the host (skipped without /usr/share/fonts): the header index equals the whole-file one.
+    #[test]
+    fn fontdb_lazy_matches_whole_read() {
+        let mut files = Vec::new();
+        walk_dir(Path::new("/usr/share/fonts"), &mut files, 0);
+        let (mut header_bytes, mut whole_bytes) = (0u64, 0u64);
+        for p in &files {
+            let Ok(data) = std::fs::read(p) else { continue };
+            let (head, n) = faces_in_header(p);
+            let whole = faces_in_bytes(&data, p);
+            assert!(same_records(&head, &whole), "{}: {:?} vs {:?}", p.display(), head, whole);
+            header_bytes += n;
+            whole_bytes += data.len() as u64;
+        }
+        assert!(header_bytes * 10 <= whole_bytes, "header reads {header_bytes} of {whole_bytes}");
+    }
+
+    // AETHER-MACGENERICS (SR418): fake databases (no font files are read: resolution looks at family names only).
+    fn fake_db(families: &[&str], config: Config) -> FontDb {
+        let faces = families
+            .iter()
+            .map(|f| FaceInfo {
+                path: PathBuf::from(format!("/fake/{f}.ttf")),
+                index: 0,
+                families: vec![f.to_string()],
+                full_names: Vec::new(),
+                style: Style::default(),
+            })
+            .collect();
+        FontDb::from_faces(faces, config)
+    }
+
+    /// The macOS table on a stock Mac (no fonts.conf, so no aliases): Chromium-mac's picks, the next candidate
+    /// when one is absent, and a miss stays a miss.
+    #[test]
+    fn macgenerics_macos_table_kat() {
+        let d = fake_db(&["Helvetica", "Times", "Menlo"], Config::default());
+        assert_eq!(d.generic_in(true, "sans-serif"), "Helvetica");
+        assert_eq!(d.generic_in(true, "serif"), "Times");
+        assert_eq!(d.generic_in(true, "monospace"), "Menlo", "no Courier: Menlo");
+        assert_eq!(d.generic_in(true, "system-ui"), "Helvetica", "no SF face, no Helvetica Neue");
+        assert_eq!(d.generic_in(true, "ui-monospace"), "Menlo");
+        assert_eq!(d.generic_in(true, "cursive"), "Apple Chancery", "none installed: the first candidate");
+        assert_eq!(d.resolve_family(d.generic_in(true, "cursive")), None, "a miss stays a miss");
+        assert_eq!(d.generic_in(true, "math"), "math", "no row: the keyword itself");
+        let d = fake_db(&["Helvetica", "Times", "Menlo", "Courier", "System Font"], Config::default());
+        assert_eq!(d.generic_in(true, "monospace"), "Courier");
+        assert_eq!(d.generic_in(true, "system-ui"), "System Font");
+        assert_eq!(d.resolve_family(d.generic_in(true, "SANS-SERIF")).as_deref(), Some("Helvetica"));
+    }
+
+    /// The Linux table is today's six names exactly, so every Linux pick resolves as before.
+    #[test]
+    fn macgenerics_linux_unchanged_kat() {
+        let today: &[(&'static str, &'static str)] = &[
+            ("serif", "Times New Roman"),
+            ("sans-serif", "Arial"),
+            ("monospace", "Monospace"),
+            ("cursive", "Comic Sans MS"),
+            ("fantasy", "Impact"),
+            ("system-ui", "sans"),
+        ];
+        let t = generics_for(false);
+        assert_eq!(t.len(), today.len());
+        for ((k, cands), (tk, tn)) in t.iter().zip(today) {
+            assert_eq!((*k, *cands), (*tk, &[*tn][..]));
+        }
+        let mut c = Config::default();
+        c.read_str(
+            r#"<fontconfig>
+  <alias><family>sans-serif</family><prefer><family>DejaVu Sans</family></prefer></alias>
+  <alias><family>sans</family><prefer><family>DejaVu Sans</family></prefer></alias>
+  <alias><family>serif</family><prefer><family>DejaVu Serif</family></prefer></alias>
+  <alias><family>monospace</family><prefer><family>DejaVu Sans Mono</family></prefer></alias>
+</fontconfig>"#,
+            Path::new("/etc/fonts"),
+        );
+        let d = fake_db(&["DejaVu Sans", "DejaVu Serif", "DejaVu Sans Mono"], c);
+        for (k, n) in today {
+            assert_eq!(d.generic_in(false, *k), *n, "{k}: today's name");
+        }
+        assert_eq!(d.resolve_family(d.generic_in(false, "monospace")).as_deref(), Some("DejaVu Sans Mono"));
+        assert_eq!(d.resolve_family(d.generic_in(false, "system-ui")).as_deref(), Some("DejaVu Sans"));
+        assert_eq!(d.resolve_family(d.generic_in(false, "sans-serif")), None, "Arial: no metric-compatible face");
+        assert_eq!(d.generic_in(false, "ui-monospace"), "ui-monospace", "no Linux row");
+    }
+
+    /// AETHERFONTDBFALLBACK (SR425) oracle: the fallback order with the Latin rank read from each WHOLE file
+    /// (the pre-SR425 shape), parsed with font_core and dropped (no leak).
+    fn whole_order(db: &FontDb) -> Vec<usize> {
+        let expanded = db.config.expand(&["sans-serif"]);
+        let mut last: Option<(PathBuf, Option<Vec<u8>>)> = None;
+        let mut idx: Vec<(usize, usize, usize, usize)> = Vec::new();
+        for (i, f) in db.faces.iter().enumerate() {
+            let r = f
+                .families
+                .iter()
+                .filter_map(|n| expanded.iter().position(|e| family_eq(e, n)))
+                .min()
+                .unwrap_or(usize::MAX);
+            let st = (f.style.weight - 400.0).abs() as usize + if f.style.slant == Slant::Normal { 0 } else { 1000 };
+            let lr = if r == usize::MAX {
+                if last.as_ref().is_none_or(|(p, _)| *p != f.path) {
+                    last = Some((f.path.clone(), std::fs::read(&f.path).ok()));
+                }
+                let data = last.as_ref().and_then(|(_, d)| d.as_deref());
+                match data.and_then(|d| Font::parse_face(d, f.index).ok()) {
+                    None => 2,
+                    Some(face) if ('a'..='z').all(|c| face.glyph_index(c) != 0) => 0,
+                    Some(_) => 1,
+                }
+            } else {
+                0
+            };
+            idx.push((r, lr, st, i));
+        }
+        idx.sort();
+        idx.into_iter().map(|t| t.3).collect()
+    }
+
+    /// AETHERFONTDBFALLBACK (SR425): over the repo's fixture fonts with no fonts.conf aliases (the stock-Mac
+    /// case: every face unranked, so every face takes the Latin rank), the bounded cmap read gives the same
+    /// fallback order as the whole-file read, reads fewer bytes than the files hold, and answers coverage as
+    /// the whole parsed face does (the Symbol U+F000 rule included).
+    #[test]
+    fn fallback_bounded_rank_kat() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let dirs = vec![root.join("fonts"), root.join("unaos/libs/text/font_core/tests/data")];
+        let db = FontDb::discover(Config { dirs, ..Config::default() });
+        assert!(db.faces.len() >= 3, "the fixture faces (Inter, JetBrains Mono, Noto Sans) are discovered");
+        let order = db.fallback_order().to_vec();
+        assert_eq!(order, whole_order(&db), "the bounded rank keeps the whole-read fallback order");
+        let mut paths: Vec<&PathBuf> = db.faces.iter().map(|f| &f.path).collect();
+        paths.sort();
+        paths.dedup();
+        let total: u64 = paths.iter().filter_map(|p| std::fs::metadata(p).ok()).map(|m| m.len()).sum();
+        let read = db.scan_bytes();
+        assert!(read > 0 && read < total, "bytes_read {read} must be > 0 and < the files' {total}");
+        let chars = ['a', 'Z', '\u{e9}', '\u{416}', '\u{4e2d}', '\u{2603}', '\u{1f600}', '\u{f041}'];
+        for (i, f) in db.faces.iter().enumerate() {
+            let data = std::fs::read(&f.path).unwrap();
+            let face = Font::parse_face(&data, f.index).unwrap();
+            for c in chars {
+                let want = face.glyph_index(c) != 0;
+                assert_eq!(db.covers(i, c), Some(want), "{}#{} U+{:04X}", f.path.display(), f.index, c as u32);
+            }
+        }
+    }
+
+    /// AETHERFONTDBFALLBACK (SR425): on this host's installed set the bounded rank keeps the whole-read order.
+    #[test]
+    fn fallback_order_unchanged_on_host() {
+        let db = db();
+        if db.faces.is_empty() {
+            return;
+        }
+        assert_eq!(db.fallback_order(), &whole_order(db)[..], "the host's fallback order");
     }
 }

@@ -18,6 +18,9 @@
 //!   ([`Demuxer::open_indexed`]) and a Matroska video track gets decode times from its codec's reorder depth
 //!   ([`Demuxer::derive_dts`] through `dsp::video::reorder_depth`); [`Sources::open_report`] says how each reel opened.
 //! * Source time 0 is a stream's first presentation time (vplay's rule).
+//! * A media file is its own timeline (EDITMAP, LEDGER SR223): [`Sources::from_media`] lays each stream's whole edit
+//!   list on its track through `timeline_core`'s `Timeline::lay_edit_list` (each segment a clip, an empty edit a gap),
+//!   so an edit-listed MP4 renders as its author cut it; [`OpenReport`] says `applied=<n>` (else `first-only`).
 //! * Transitions (NLE3, LEDGER SR202): a step carrying `vmix` decodes a second run (the outgoing source, which takes
 //!   over the live run it continues) through the same open-or-continue path ([`vid_frame`]) and mixes the two: a
 //!   dissolve is pixel_core's `blend_nonpremult` of the incoming at alpha `round(255 t)` over the outgoing, a wipe a
@@ -29,9 +32,10 @@
 //!   track) is refused (scaling is owed). A gap is black (opaque) or silence.
 //! * Audio is a MIX (NLE4, LEDGER SR203): each audio step renders its `timeline_core::schedule::audio_runs` run: every
 //!   layer decoded on its own track's decoder, resampled to the project rate when its rate differs
-//!   (`audio_core::resample::linear`; the project rate is [`Sources::set_audio_rate`]'s, else the first scheduled audio
-//!   source's), scaled by its gain and its linear fade envelope, summed in integers and clamped to 16 bits once. Only a
-//!   CHANNEL-count mismatch is refused. One layer at 0 dB with no fade passes through bit for bit. NLE3b (SR209): a
+//!   (`audio_core::resample::Sinc`, NLE4B's windowed sinc; the project rate is [`Sources::set_audio_rate`]'s, else
+//!   the first scheduled audio source's), scaled by its gain and its linear fade envelope, summed in integers and
+//!   clamped to 16 bits once. Only a CHANNEL-count mismatch is refused. One layer at 0 dB with no fade passes through
+//!   bit for bit. NLE3b (SR209): a
 //!   crossfade's UNDER layer (the outgoing's handle, before the incoming layer of the same track) decodes on its own
 //!   slot (`tracks + track`), so the track's own decoder carries the incoming on; the sum is the same `mix_into`.
 //!
@@ -41,12 +45,15 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
+use gneiss_pal::dsp::audio::meter::Meter;
 use gneiss_pal::dsp::audio::resample;
 use gneiss_pal::dsp::audio_track::{AudioTrackDecoder, Timing, audio_decoder_for};
 use gneiss_pal::dsp::demux::{DecodeTime, Demuxer, TrackKind, build};
-use gneiss_pal::dsp::video::{Frame, VideoDecoder, decoder_for, reorder_depth};
+use gneiss_pal::dsp::video::{Frame, VideoDecoder, decoder_for, reorder_depth, colour_of};
 use timeline_core::schedule::{AudioRun, Layer, ScheduleError, audio_runs, schedule};
-use timeline_core::{Kind, SourceId, SourceIndex, Timebase, Timeline};
+use timeline_core::{Kind, SizePolicy, SourceId, SourceIndex, Timebase, Timeline};
+use crate::decode_swap::{DecodeSwap, Swap};
+use gneiss_pal::dsp::demux::Track;
 
 /// Where rendered output goes, in output order.
 pub trait RenderSink {
@@ -54,6 +61,12 @@ pub trait RenderSink {
     fn frame(&mut self, out_t: i64, width: u32, height: u32, rgba: &[u8]);
     /// The PCM of output ticks `out_t..` (one audio step): interleaved `f32`.
     fn pcm(&mut self, out_t: i64, rate: u32, channels: u16, interleaved: &[f32]);
+    /// NLE4C (SR301): true when the sink also wants each audio track's own sum ([`RenderSink::track_pcm`]).
+    fn taps_tracks(&self) -> bool {
+        false
+    }
+    /// NLE4C (SR301): audio track `track`'s share of the [`RenderSink::pcm`] just sent (its layers summed, clamped alone).
+    fn track_pcm(&mut self, _out_t: i64, _track: usize, _rate: u32, _channels: u16, _interleaved: &[f32]) {}
 }
 
 /// What a render did.
@@ -88,6 +101,8 @@ pub enum RenderError {
     Short(SourceId),
     /// Video steps exist but no scheduled source has a video stream to size the frame.
     NoSize,
+    /// EDITMAP (SR223): a media file's edit list could not be laid as a timeline (a rate edit, or a segment past the media).
+    Edit(timeline_core::EditError),
 }
 
 impl std::fmt::Display for RenderError {
@@ -102,6 +117,7 @@ impl std::fmt::Display for RenderError {
             RenderError::Format { src, rate, channels } => write!(f, "source {} audio {rate} Hz x{channels} is not the project format", src.0),
             RenderError::Short(s) => write!(f, "source {} ran out before its clip", s.0),
             RenderError::NoSize => f.write_str("no video source to size the frame"),
+            RenderError::Edit(e) => write!(f, "edit list: {e}"),
         }
     }
 }
@@ -114,6 +130,10 @@ struct Media {
     audio: Option<usize>,
     v0: i64,
     a0: i64,
+    /// SWAPBACKSPANCACHE (SR370): the reel's in-band parameter sets, walked once at the first run open and shared by every run.
+    sets: std::sync::OnceLock<Arc<crate::decode_swap::SetIndex>>,
+    /// SWAPBACK-NLECACHE (SR388): the decoder and swap state the reel's last closed run left ([`Vid`]'s drop), taken by the next run open.
+    park: ReelPark,
 }
 
 impl Media {
@@ -128,7 +148,7 @@ impl Media {
             drop(demux);
             demux = Demuxer::open(Arc::try_unwrap(data).unwrap_or_else(|a| (*a).clone())).map_err(err)?;
         }
-        demux.derive_dts(reorder_depth);
+        demux.derive_dts(reorder_depth); demux.fill_colour(colour_of);
         let find = |k: TrackKind| demux.tracks().iter().position(|t| t.kind == k);
         let (video, audio) = (find(TrackKind::Video), find(TrackKind::Audio));
         if demux.indexed() {
@@ -144,7 +164,7 @@ impl Media {
             .unwrap_or(0)
         };
         let (v0, a0) = (origin(video), origin(audio));
-        Ok(Media { demux, video, audio, v0, a0 })
+        Ok(Media { demux, video, audio, v0, a0, sets: Default::default(), park: Default::default() })
     }
     fn stream(&self, kind: Kind) -> Option<(usize, i64)> {
         match kind {
@@ -160,11 +180,16 @@ pub struct Sources {
     media: Vec<(SourceId, Media)>,
     /// NLE4: the project's audio rate (0 = the first scheduled audio source's).
     audio_rate: u32,
+    /// EDITMAP (SR223): the sources laid from their own edit list ([`Sources::from_media`]) and how many clips it gave.
+    applied: Vec<(SourceId, usize)>,
+    /// SWAPBACK (SR329): the sources a render drew stand-in frames for (a mid-reel decoder refusal); locked only for one
+    /// push ([`Sources::note_stand_in`]) or one read ([`Sources::open_report`]), never across a decode.
+    stand_in: std::sync::Mutex<Vec<SourceId>>,
 }
 
 impl Sources {
     pub fn new(tl: &Timeline) -> Sources {
-        Sources { tb: tl.tb, media: Vec::new(), audio_rate: 0 }
+        Sources { tb: tl.tb, media: Vec::new(), audio_rate: 0, applied: Vec::new(), stand_in: Default::default() }
     }
     /// NLE4: render audio at `hz` (sources at other rates are resampled); 0 = the first scheduled audio source's rate.
     pub fn set_audio_rate(&mut self, hz: u32) {
@@ -172,7 +197,7 @@ impl Sources {
     }
     /// Open `bytes` (MP4 / Matroska / WebM) as source `id`.
     pub fn add(&mut self, id: SourceId, bytes: Vec<u8>) -> Result<(), RenderError> {
-        let m = Media::open(bytes)?;
+        let m = Media::open(bytes)?; self.note_open(id, &m); // NLE-STANDIN-OPEN (SR353): a reel no decoder fits opens as a stand-in reel
         self.media.retain(|(s, _)| *s != id);
         self.media.push((id, m));
         Ok(())
@@ -185,18 +210,28 @@ impl Sources {
         let m = self.get(id).ok()?;
         let i = m.video.or(m.audio)?;
         let s = m.demux.survey().streams.into_iter().nth(i)?;
-        Some(OpenReport { indexed: s.indexed, decode_time: s.decode_time, edits: s.edits.len() })
+        let applied = self.applied.iter().find(|a| a.0 == id).map(|a| a.1);
+        let stand_in = self.stand_in.lock().map(|v| v.contains(&id)).unwrap_or(false);
+        Some(OpenReport { indexed: s.indexed, decode_time: s.decode_time, edits: s.edits.len(), applied, colour: s.colour, stand_in })
     }
 }
 
 /// DEMUXWIRE (SR213): one reel's open, as `nle schedule` prints it:
-/// `open=<full|indexed> dts=<stored|derived:n|presentation> edits=<n>`. Only the first media edit is applied (as
-/// playback does); `edits` counts every `elst` entry (DEMUXSEEK-EDITMAP owes the rest).
+/// `open=<full|indexed> dts=<stored|derived:n|presentation> edits=<n> applied=<n|first-only>`. `edits` counts every `elst`
+/// entry; EDITMAP (SR223): `applied` is the clips a reel opened by [`Sources::from_media`] laid from its whole edit list,
+/// `first-only` a reel an EDL cuts (only the first media edit applies, as playback does). NLEPROBEHDRWIRE (SR305): then
+/// ` colour=<token>` (demux_core's `Colour` Display) only when the video track states a colour.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OpenReport {
     pub indexed: bool,
     pub decode_time: DecodeTime,
     pub edits: usize,
+    /// EDITMAP (SR223): `Some(clips)` when the reel's whole edit list was laid; `None` = the first media edit only.
+    pub applied: Option<usize>,
+    /// NLEPROBEHDRWIRE (SR305): the reel's colour (container, else the bitstream's through `fill_colour(colour_of)`).
+    pub colour: Option<gneiss_pal::dsp::demux::colour::Colour>,
+    /// SWAPBACK (SR329): a render drew stand-in frames for this reel (its decoder refused a span mid-reel); NLE-STANDIN-OPEN (SR353): or no decoder fits it (set at open).
+    pub stand_in: bool,
 }
 
 impl std::fmt::Display for OpenReport {
@@ -208,7 +243,18 @@ impl std::fmt::Display for OpenReport {
             DecodeTime::Derived(d) => write!(f, "derived:{d}")?,
             DecodeTime::Presentation => write!(f, "presentation")?,
         }
-        write!(f, " edits={}", self.edits)
+        write!(f, " edits={}", self.edits)?;
+        match self.applied {
+            Some(n) => write!(f, " applied={n}")?,
+            None => write!(f, " applied=first-only")?,
+        }
+        if let Some(c) = self.colour {
+            write!(f, " {c}")?;
+        }
+        if self.stand_in {
+            write!(f, " decode=stand-in")?;
+        }
+        Ok(())
     }
 }
 
@@ -249,20 +295,38 @@ struct Vid {
     track_id: u32,
     cursor: Demuxer,
     dec: Box<dyn VideoDecoder>,
+    /// SWAPBACK (SR329): the track (the stand-in's size and clock), the run's swap state, and whether it drew the stand-in.
+    track: Track,
+    swap: DecodeSwap,
+    stood_in: bool,
+    /// SWAPBACK-NLECACHE (SR388): the reel's slot this run's decoder and swap go back to when it closes.
+    park: ReelPark,
     pending: VecDeque<Frame>,
     peeked: Option<Frame>,
     last: Option<Frame>,
     done: bool,
+    /// NLESIZESWITCH (SR384): the size of the last frame this run showed (`reel_rgba`'s one line per change).
+    size: Option<(u32, u32)>,
 }
 
 impl Vid {
     fn open(m: &Media, src: SourceId, key_ns: i64) -> Result<Vid, RenderError> {
         let (i, origin) = m.stream(Kind::Video).ok_or(RenderError::NoStream(src, Kind::Video))?;
         let track = &m.demux.tracks()[i];
-        let dec = decoder_for(track).map_err(|e| RenderError::Decode(e.to_string()))?;
+        let held = m.park.lock().ok().and_then(|mut p| p.take()); // SWAPBACK-NLECACHE (SR388): the reel's held swap and decoder, reset as a Player seek resets
+        let (mut swap, mut dec) = match held {
+            Some((swap, mut dec)) => {
+                dec.reset();
+                (swap, dec)
+            }
+            None => (DecodeSwap::with_index(m.sets.get_or_init(|| Arc::new(crate::decode_swap::SetIndex::of(track, &m.demux))).clone()), crate::decode_swap::open(track)), // NLE-STANDIN-OPEN (SR353): the Player's decoder-or-stand-in, never a refused render; SWAPBACKSPANCACHE (SR370): the reel's index walked once
+        };
         let mut cursor = m.demux.share();
         cursor.seek_track(i, origin + key_ns);
-        Ok(Vid { src, origin, track_id: track.id, cursor, dec, pending: VecDeque::new(), peeked: None, last: None, done: false })
+        if let Some(hit) = swap.reseed(&mut dec, track, &cursor, origin + key_ns) { // SWAPBACKSEEK (SR353): the run's keyframe with every set in effect there
+            log::info!("[STRIA] :: nle reseed reel={} cache={}", src.0, if hit { "hit" } else { "miss" });
+        }
+        Ok(Vid { src, origin, track_id: track.id, cursor, track: track.clone(), swap, stood_in: !dec.is_real(), park: m.park.clone(), dec, pending: VecDeque::new(), peeked: None, last: None, done: false, size: None })
     }
     fn pull(&mut self) -> Result<Option<Frame>, RenderError> {
         loop {
@@ -274,9 +338,9 @@ impl Vid {
             }
             match self.cursor.next_packet() {
                 Some(p) if p.track == self.track_id => {
-                    if let Some(f) = self.dec.decode(&p).map_err(|e| RenderError::Decode(e.to_string()))? {
-                        return Ok(Some(f));
-                    }
+                    let d = self.swap.decode(&mut self.dec, &self.track, &p).map_err(|e| RenderError::Decode(e.to_string()))?;
+                    self.stood_in |= d.swap == Some(Swap::ToStandIn);
+                    self.pending.extend(d.frames);
                 }
                 Some(_) => {}
                 None => {
@@ -322,6 +386,8 @@ struct Aud {
     buf_at: i64,
     started: bool,
     done: bool,
+    /// NLE4B: the windowed-sinc converter (its table) for the last output rate asked of `take_at`.
+    rs: Option<resample::Sinc>,
 }
 
 impl Aud {
@@ -337,7 +403,7 @@ impl Aud {
         let mut cursor = m.demux.share();
         cursor.seek_track(i, origin + key_ns);
         let ch = channels.max(1) as usize;
-        Ok(Aud { src, origin, track_id: track.id, rate, ch, cursor, dec, buf: Vec::new(), buf_at: 0, started: false, done: false })
+        Ok(Aud { src, origin, track_id: track.id, rate, ch, cursor, dec, buf: Vec::new(), buf_at: 0, started: false, done: false, rs: None })
     }
     /// Source samples `start..start + n`, interleaved (sample-exact; a hole in the stream is silence).
     fn take(&mut self, start: i64, n: i64) -> Result<Vec<f32>, RenderError> {
@@ -412,7 +478,7 @@ pub fn render(tl: &Timeline, range: std::ops::Range<i64>, sources: &Sources, sin
     let mut r = RenderReport::default();
     let mut afmt: Option<(u32, u16)> = None;
     for s in &steps {
-        let Some(src) = s.src else { continue };
+        let Some(src) = s.src.or(s.vmix.and_then(|m| m.src)) else { continue }; // NLE3cBLACK: a to-black step sizes by its outgoing
         let m = sources.get(src)?;
         match s.kind {
             Kind::Video if r.width == 0 => {
@@ -450,17 +516,18 @@ pub fn render(tl: &Timeline, range: std::ops::Range<i64>, sources: &Sources, sin
     for s in &steps {
         match (s.kind, s.src) {
             (Kind::Video, None) => {
-                vmix_run = None;
-                sink.frame(s.out_t, w, h, &black);
+                vmix_take(s, &mut vid, &mut vmix_run); // NLE3cBLACK: a to-black tick takes the live outgoing run; a gap drops it
+                match s.vmix {
+                    Some(_) => sink.frame(s.out_t, w, h, &vmix_frame(tl, sources, s, &mut vmix_run, &black, w, h, tol, &mut r)?),
+                    None => sink.frame(s.out_t, w, h, &black),
+                }
                 r.frames += 1;
             }
             (Kind::Video, Some(src)) => {
                 vmix_take(s, &mut vid, &mut vmix_run);
                 let f = vid_frame(tl, sources, &mut vid, src, s.src_t, s.seek, tol, &mut r)?;
-                if f.width != w || f.height != h {
-                    return Err(RenderError::Size { src, width: f.width, height: f.height });
-                }
-                sink.frame(s.out_t, w, h, &vmix_frame(tl, sources, s, &mut vmix_run, &f, tol, &mut r)?);
+                let (rgba, fw, fh) = reel_rgba(sources, src, &f, &mut vid, w, h, reel_fit(tl, src, s.vmix.is_none()))?; // NLESIZESWITCH (SR384): a switched frame letterboxed into its reel's first size; NLESIZEPOLICY (SR394): by the reel's size policy
+                sink.frame(s.out_t, fw, fh, &vmix_frame(tl, sources, s, &mut vmix_run, &rgba, w, h, tol, &mut r)?);
                 r.frames += 1;
             }
             (Kind::Audio, _) => {
@@ -468,8 +535,12 @@ pub fn render(tl: &Timeline, range: std::ops::Range<i64>, sources: &Sources, sin
                 let Some((rate, ch)) = afmt else { continue };
                 let s0 = samples(tl.tb.to_ns(s.out_t), rate);
                 let n = samples(tl.tb.to_ns(s.out_t + s.len), rate) - s0;
-                let pcm = mix_run(tl, run, sources, &mut auds, rate, ch, n, &mut r.seeks)?;
+                let mut taps = sink.taps_tracks().then(Vec::new); // NLE4C: the per-track sums, when the sink meters them
+                let pcm = mix_run(tl, run, sources, &mut auds, rate, ch, n, &mut r.seeks, taps.as_mut())?;
                 sink.pcm(s.out_t, rate, ch, &pcm);
+                if let Some(t) = taps {
+                    tap_tracks(tl, sink, s.out_t, rate, ch, t);
+                }
                 r.pcm_frames += n as u64;
             }
         }
@@ -479,7 +550,8 @@ pub fn render(tl: &Timeline, range: std::ops::Range<i64>, sources: &Sources, sin
 
 impl Aud {
     /// NLE4: output samples `out_start..out_start + n` at `out_rate` (counted from the source's origin): the source's
-    /// own samples when the rates agree, else linearly resampled (the neighbour past the media's end holds).
+    /// own samples when the rates agree, else NLE4B's windowed sinc (`resample::Sinc`, its table kept in `rs`; the window's
+    /// neighbours past the media's end hold).
     fn take_at(&mut self, out_start: i64, n: i64, out_rate: u32) -> Result<Vec<f32>, RenderError> {
         if self.rate == out_rate {
             return self.take(out_start, n);
@@ -487,14 +559,16 @@ impl Aud {
         if n <= 0 {
             return Ok(Vec::new());
         }
-        let (i0, _, _) = resample::linear_pos(out_start, self.rate, out_rate);
-        let (i1, f1, _) = resample::linear_pos(out_start + n - 1, self.rate, out_rate);
-        self.fill(i1 + 1, false)?;
-        if f1 != 0 {
-            self.fill(i1 + 2, true)?;
+        if self.rs.as_ref().map(|s| s.rates()) != Some((self.rate, out_rate)) {
+            self.rs = Some(resample::Sinc::new(self.rate, out_rate, self.ch));
         }
-        self.seat(i0);
-        Ok(resample::linear(&self.buf, self.buf_at, self.ch, self.rate, out_rate, out_start, n as usize))
+        let h = self.rs.as_ref().expect("built above").delay() as i64;
+        let (i0, _, _) = resample::linear_pos(out_start, self.rate, out_rate);
+        let (i1, _, _) = resample::linear_pos(out_start + n - 1, self.rate, out_rate);
+        self.fill(i1 + 1, false)?;
+        self.fill(i1 + h + 1, true)?;
+        self.seat(i0 - h + 1);
+        Ok(self.rs.as_ref().expect("built above").at(&self.buf, self.buf_at, out_start, n as usize))
     }
 }
 
@@ -510,13 +584,17 @@ fn mix_run(
     ch: u16,
     n: i64,
     seeks: &mut u64,
+    mut taps: Option<&mut Vec<Vec<i64>>>,
 ) -> Result<Vec<f32>, RenderError> {
     let n = n.max(0);
     let mut acc = vec![0i64; n as usize * ch as usize];
+    if let Some(t) = taps.as_mut() {
+        **t = vec![vec![0i64; acc.len()]; auds.len() / 2]; // NLE4C: one accumulator per track
+    }
     // NLE3b: a layer followed by another of its own track is a crossfade's UNDER layer: its own slot; a track with no
     // under layer in this run drops its under slot.
     let tracks = auds.len() / 2;
-    let under = |li: usize| run.layers.get(li + 1).is_some_and(|m| m.track == run.layers[li].track);
+    let under = |li: usize| run.under(li); // NLE6MIXAUDIO (rmbp-ledger B953): timeline_core's one slot rule
     for t in 0..tracks {
         if !(0..run.layers.len()).any(|li| under(li) && run.layers[li].track == t) {
             auds[tracks + t] = None;
@@ -535,26 +613,24 @@ fn mix_run(
         let start = samples(tl.tb.to_ns(l.src_t), rate);
         let pcm = slot.as_mut().expect("opened above").take_at(start, n, rate)?;
         mix_into(&mut acc, &pcm, l, n, ch.max(1) as usize);
+        if let Some(t) = taps.as_mut() {
+            mix_into(&mut t[l.track], &pcm, l, n, ch.max(1) as usize); // NLE4C: the same terms, the master acc untouched
+        }
     }
-    Ok(acc.into_iter().map(|a| a.clamp(-32768, 32767) as f32 / 32768.0).collect())
+    Ok(out_f32(acc))
 }
 
 /// NLE4: add one layer into the accumulator: each sample as i16, x its gain (Q16) x its envelope (Q16, linear from
 /// `env[0]` at the run's first sample toward `env[1]` at its end edge).
 fn mix_into(acc: &mut [i64], pcm: &[f32], l: &Layer, n: i64, ch: usize) {
-    let g = gain_q16(l.gain_cdb);
+    let g = gneiss_pal::dsp::audio::ramp::gain_q16(l.gain_cdb); // NLE6MIXAUDIO (rmbp-ledger B953): audio_core's one curve
     let (e0, e1) = (l.env[0] as i64, l.env[1] as i64);
     for (j, frame) in pcm.chunks(ch).enumerate() {
-        let e = if n > 0 { e0 + (e1 - e0) * j as i64 / n } else { e0 };
+        let e = gneiss_pal::dsp::audio::ramp::at(e0, e1, j as i64, n);
         for (c, &x) in frame.iter().enumerate() {
             acc[j * ch + c] += (to_i16(x) * g * e) >> 32;
         }
     }
-}
-
-/// NLE4: a gain in centi-dB as a Q16 factor (0 cdB = 65536 exactly).
-fn gain_q16(cdb: i32) -> i64 {
-    (10f64.powf(cdb as f64 / 2000.0) * 65536.0).round() as i64
 }
 
 /// NLE4: an `f32` sample (full scale +-1) as a 16-bit value, rounded and clamped.
@@ -574,6 +650,12 @@ pub fn synth_sample(base: u32, i: u64) -> i16 {
 /// A codec-free test source (MP4): `frames` `utp1` test-pattern frames, 64x48 at `fps`, ordinals `base..`, a keyframe
 /// every 10 frames; plus mono 16-bit PCM at [`SYNTH_RATE`] of [`synth_sample`]s, as long as the video.
 pub fn synth_source(base: u32, frames: u32, fps: u32) -> Vec<u8> {
+    synth_source_with(base, frames, fps, &build::Mp4Extras::default())
+}
+
+/// EDITMAP (SR223): [`synth_source`] written with DEMUXSEEK's [`build::Mp4Extras`] (whole edit lists: track 1 is the video,
+/// track 2 the audio).
+pub fn synth_source_with(base: u32, frames: u32, fps: u32, x: &build::Mp4Extras) -> Vec<u8> {
     let fps = fps.max(1);
     let mut video = build::test_pattern_track(1, 64, 48, fps, frames, 10);
     for (i, s) in video.samples.iter_mut().enumerate() {
@@ -582,7 +664,7 @@ pub fn synth_source(base: u32, frames: u32, fps: u32) -> Vec<u8> {
     let n = frames as u64 * SYNTH_RATE as u64 / fps as u64;
     let pcm: Vec<i16> = (0..n).map(|i| synth_sample(base, i)).collect();
     let audio = build::pcm16_track(2, SYNTH_RATE, 1, &pcm, (SYNTH_RATE / fps / 2).max(1) as usize);
-    build::mp4(&[video, audio], &build::Mp4Options::default())
+    build::mp4_with(&[video, audio], &build::Mp4Options::default(), x)
 }
 
 /// The frame at source tick `src_t` of `src` from the decode run `run`: a step with `seek`, or a run on another
@@ -605,94 +687,271 @@ fn vid_frame(
             Some(k) => k,
             None => sources.keyframe_ns(src, Kind::Video, target).ok_or(RenderError::NoStream(src, Kind::Video))?,
         };
-        *run = Some(Vid::open(sources.get(src)?, src, key)?);
+        *run = None; *run = Some(Vid::open(sources.get(src)?, src, key)?); // SWAPBACK-NLECACHE-SHARED (SR397): the outgoing run parks before the new open takes the reel's slot
         r.seeks += 1;
     }
-    run.as_mut().expect("opened above").show(target, tol, &mut r.runup_frames)
+    let f = run.as_mut().expect("opened above").show(target, tol, &mut r.runup_frames);
+    if run.as_ref().is_some_and(|v| v.stood_in) {
+        sources.note_stand_in(src);
+    }
+    f
 }
 
 /// NLE3: outside a transition the outgoing run is dropped; at a transition tick whose outgoing source continues the
 /// live run (`seek` none) and is not already the mix run, that run becomes the mix run (the step's own source then
 /// opens its run at the cut, as a plain cut does).
 fn vmix_take(s: &timeline_core::schedule::Step, vid: &mut Option<Vid>, vmix_run: &mut Option<Vid>) {
-    let Some(m) = s.vmix else {
-        *vmix_run = None;
-        return;
-    };
-    // NLE3c: a transition from black (`src` none) has no run to take.
-    if m.src.is_some() && m.seek.is_none() && vmix_run.as_ref().map(|v| v.src) != m.src && vid.as_ref().map(|v| v.src) == m.src {
-        *vmix_run = vid.take();
-    }
+    timeline_core::vmix::take_outgoing(s, vid, vmix_run, |v| v.src); // NLE6MIX (B899): the ONE rule, shared with the kernel Player
 }
 
-/// NLE3: the RGBA a video step shows: its own frame `f`, or inside a transition `f` mixed with the outgoing source's
-/// frame from `vmix_run`.
+/// NLE3: the RGBA a video step shows: its own RGBA `b` (`w x h`), or inside a transition `b` mixed with the outgoing
+/// source's frame from `vmix_run` (NLE3cBLACK: `b` is the gap's black for a transition to black).
 #[allow(clippy::too_many_arguments)]
 fn vmix_frame(
     tl: &Timeline,
     sources: &Sources,
     s: &timeline_core::schedule::Step,
     vmix_run: &mut Option<Vid>,
-    f: &Frame,
+    b: &[u8],
+    w: u32,
+    h: u32,
     tol: i64,
     r: &mut RenderReport,
 ) -> Result<Vec<u8>, RenderError> {
-    let Some(m) = s.vmix else { return Ok(f.to_rgba()) };
+    let Some(m) = s.vmix else { return Ok(b.to_vec()) };
     let a = match m.src {
         Some(src) => {
             let a = vid_frame(tl, sources, vmix_run, src, m.src_t, m.seek, tol, r)?;
-            if a.width != f.width || a.height != f.height {
-                return Err(RenderError::Size { src, width: a.width, height: a.height });
-            }
-            a.to_rgba()
+            reel_rgba(sources, src, &a, vmix_run, w, h, reel_fit(tl, src, false))?.0 // NLESIZESWITCH (SR384): the outgoing source's frame, as the step's own
         }
         // NLE3c: from black: the outgoing is opaque black (the gap's black).
-        None => [0u8, 0, 0, 255].repeat(f.width as usize * f.height as usize),
+        None => [0u8, 0, 0, 255].repeat(w as usize * h as usize),
     };
-    Ok(vmix_rgba(m.kind, m.t, &a, &f.to_rgba(), f.width, f.height))
+    Ok(vmix_rgba(m.kind, m.t, &a, b, w, h))
 }
 
 /// NLE3: the outgoing frame `a` and the incoming frame `b` (RGBA, `w x h`) mixed at the incoming's weight `t`.
 fn vmix_rgba(kind: timeline_core::TransitionKind, t: timeline_core::schedule::Frac, a: &[u8], b: &[u8], w: u32, h: u32) -> Vec<u8> {
-    use timeline_core::{TransitionKind, WipeDir};
-    let den = t.den.max(1);
-    let round = |n: i64| (2 * n * t.num + den) / (2 * den);
     let mut out = a.to_vec();
-    match kind {
-        TransitionKind::Dissolve => {
-            let alpha = round(255).clamp(0, 255) as u8;
-            for (o, p) in out.chunks_exact_mut(4).zip(b.chunks_exact(4)) {
-                let px = gneiss_pal::dsp::image::blend_nonpremult([p[0], p[1], p[2], alpha], [o[0], o[1], o[2], o[3]]);
-                o.copy_from_slice(&px);
-            }
-        }
-        TransitionKind::Wipe(dir) => {
-            let (w, h) = (w as usize, h as usize);
-            let (wi, hi, num) = (w as i64, h as i64, t.num);
-            for y in 0..h {
-                for x in 0..w {
-                    let (xi, yi) = (x as i64, y as i64);
-                    let incoming = match dir {
-                        WipeDir::LeftToRight => xi < round(wi),
-                        WipeDir::TopToBottom => yi < round(hi),
-                        // NLE3c: exact fractions of t = num / den.
-                        WipeDir::Diagonal => (xi + yi) * den < (wi + hi) * num,
-                        WipeDir::Box => (2 * xi + 1 - wi).abs() * den < wi * num && (2 * yi + 1 - hi).abs() * den < hi * num,
-                        WipeDir::Clock => clock_angle(x, y, w, h) < std::f64::consts::TAU * num as f64 / den as f64,
-                    };
-                    if incoming {
-                        let i = (y * w + x) * 4;
-                        out[i..i + 4].copy_from_slice(&b[i..i + 4]);
-                    }
-                }
-            }
-        }
-    }
+    timeline_core::vmix::mix_step(kind, t, &mut out, b, w, h); // NLE6MIX (B899): the ONE mix fn, shared with the kernel Player
     out
 }
 
-/// NLE3c: the angle of pixel `(x, y)`'s centre about the frame's centre, clockwise from twelve o'clock, in `[0, 2 pi)`.
-fn clock_angle(x: usize, y: usize, w: usize, h: usize) -> f64 {
-    let (dx, dy) = (x as f64 + 0.5 - w as f64 / 2.0, y as f64 + 0.5 - h as f64 / 2.0);
-    dx.atan2(-dy).rem_euclid(std::f64::consts::TAU)
+/// EDITMAP (LEDGER SR223): a media file as its own timeline.
+impl Sources {
+    /// Open `bytes` as the one source of a new timeline at `fps` (reel `reel`) and lay each stream's whole edit list on
+    /// its own track (video V1, audio A1) through `Timeline::lay_edit_list` (source time 0 = the stream's first pts, the
+    /// origin [`Media::open`] keeps; no edit list = the whole source). `Ok(None)` when the bytes are no container
+    /// demux_core knows (`probe`): the caller reads them as an EDL.
+    pub fn from_media(reel: &str, bytes: &[u8], fps: u32) -> Result<Option<(Timeline, Sources)>, RenderError> {
+        if gneiss_pal::dsp::demux::probe(bytes).is_none() {
+            return Ok(None);
+        }
+        let mut tl = Timeline::new(fps);
+        let mut sources = Sources::new(&tl);
+        let id = SourceId(0);
+        sources.add(id, bytes.to_vec())?;
+        let src = tl.add_source(reel, sources.duration(id).unwrap_or(0));
+        let m = sources.get(id)?;
+        let mut applied = None;
+        for kind in [Kind::Video, Kind::Audio] {
+            let Some((i, origin)) = m.stream(kind) else { continue };
+            let track = tl.add_track(kind);
+            let tb = m.demux.tracks()[i].timebase;
+            tl = tl.lay_edit_list(track, src, m.demux.edit_list(i), tb, origin).map_err(RenderError::Edit)?;
+            applied.get_or_insert(tl.tracks[track].clips.len());
+        }
+        sources.applied.push((src, applied.unwrap_or(0)));
+        Ok(Some((tl, sources)))
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// THE METERS (NLE4C, LEDGER SR301)
+// ---------------------------------------------------------------------------------------------------------------------
+
+/// NLE4: the mix accumulator as the PCM sent: each sum clamped to 16 bits once, as `f32` (full scale +-1).
+fn out_f32(acc: Vec<i64>) -> Vec<f32> {
+    acc.into_iter().map(|a| a.clamp(-32768, 32767) as f32 / 32768.0).collect()
+}
+
+/// NLE4C: hand each AUDIO track's own sum of the run just sent to the sink.
+fn tap_tracks(tl: &Timeline, sink: &mut dyn RenderSink, out_t: i64, rate: u32, ch: u16, taps: Vec<Vec<i64>>) {
+    for (t, acc) in taps.into_iter().enumerate() {
+        if tl.tracks.get(t).is_some_and(|tr| tr.kind == Kind::Audio) {
+            sink.track_pcm(out_t, t, rate, ch, &out_f32(acc));
+        }
+    }
+}
+
+/// NLE4C: one meter's reading. `track` is the audio track's index in [`Timeline::tracks`], `None` the master.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MeterLevel {
+    pub track: Option<usize>,
+    pub peak_db: f64,
+    pub rms_db: f64,
+}
+
+/// NLE4C (SR301): the editor's meters, per audio track and the master, fed by [`render`] itself: the master reads the
+/// PCM [`RenderSink::pcm`] is handed (what is sent), each track its own sum from `mix_run` ([`RenderSink::track_pcm`]).
+/// One `audio_core::meter::Meter` each; no lock (the owner feeds and reads it on one thread).
+#[derive(Debug, Clone, Default)]
+pub struct MixMeters {
+    tracks: Vec<(usize, Meter)>,
+    master: Option<Meter>,
+    /// The output tick the last feed ended at.
+    next: Option<i64>,
+}
+
+impl MixMeters {
+    /// Render `range` of `tl` into the meters. A range that does not continue the last feed (a seek, a restart) starts
+    /// them from silence: the window follows contiguous playback.
+    pub fn feed(&mut self, tl: &Timeline, range: std::ops::Range<i64>, sources: &Sources) -> Result<RenderReport, RenderError> {
+        if self.next != Some(range.start) {
+            self.reset();
+        }
+        let end = range.end;
+        let r = render(tl, range, sources, self)?;
+        self.next = Some(end);
+        Ok(r)
+    }
+    /// Back to silence (no meters until the next feed).
+    pub fn reset(&mut self) {
+        self.tracks.clear();
+        self.master = None;
+        self.next = None;
+    }
+    /// The readings: the audio tracks in order, then the master. Empty before the first feed.
+    pub fn levels(&self) -> Vec<MeterLevel> {
+        let lv = |track: Option<usize>, m: &Meter| MeterLevel { track, peak_db: m.peak_db(), rms_db: m.rms_db() };
+        self.tracks.iter().map(|(t, m)| lv(Some(*t), m)).chain(self.master.iter().map(|m| lv(None, m))).collect()
+    }
+}
+
+/// A meter at `rate`, rebuilt from silence when the rate changes.
+fn meter_at(m: &mut Option<Meter>, rate: u32) -> &mut Meter {
+    if m.as_ref().map(Meter::rate) != Some(rate.max(1)) {
+        *m = Some(Meter::new(rate));
+    }
+    m.as_mut().expect("set above")
+}
+
+impl RenderSink for MixMeters {
+    fn frame(&mut self, _out_t: i64, _width: u32, _height: u32, _rgba: &[u8]) {}
+    fn pcm(&mut self, _out_t: i64, rate: u32, channels: u16, interleaved: &[f32]) {
+        meter_at(&mut self.master, rate).push(interleaved, channels as usize);
+    }
+    fn taps_tracks(&self) -> bool {
+        true
+    }
+    fn track_pcm(&mut self, _out_t: i64, track: usize, rate: u32, channels: u16, interleaved: &[f32]) {
+        let i = match self.tracks.binary_search_by_key(&track, |(t, _)| *t) {
+            Ok(i) => i,
+            Err(i) => {
+                self.tracks.insert(i, (track, Meter::new(rate)));
+                i
+            }
+        };
+        let m = &mut self.tracks[i].1;
+        if m.rate() != rate.max(1) {
+            *m = Meter::new(rate);
+        }
+        m.push(interleaved, channels as usize);
+    }
+}
+
+/// SWAPBACK (LEDGER SR329): the editor's half of [`crate::decode_swap`] — a reel a render drew stand-in frames for says
+/// so in its [`OpenReport`] (` decode=stand-in`).
+impl Sources {
+    fn note_stand_in(&self, id: SourceId) {
+        if let Ok(mut v) = self.stand_in.lock() {
+            if !v.contains(&id) {
+                v.push(id);
+            }
+        }
+    }
+    /// NLE-STANDIN-OPEN (LEDGER SR353): a reel opened as source `id` whose video track no decoder fits is a STAND-IN reel
+    /// from its open (its runs draw the labelled stand-in, [`crate::decode_swap::open`], as the Player plays it); a
+    /// re-added `id` forgets its old mark first.
+    fn note_open(&self, id: SourceId, m: &Media) {
+        if let Ok(mut v) = self.stand_in.lock() {
+            v.retain(|s| *s != id);
+        }
+        if m.video.is_some_and(|i| decoder_for(&m.demux.tracks()[i]).is_err()) {
+            self.note_stand_in(id);
+        }
+    }
+}
+
+/// COLOURONE (LEDGER SR328): a frame of source `src` as RGBA, converted by its reel's colour (`Track::colour`, the
+/// container's else the bitstream's) through `dsp::video::Frame::to_rgba_colour`. Both of the render's frame -> RGBA
+/// lines (a step's own source and a transition's outgoing source) call it. AV1PLAYERCOLOUR (SR347): by the reel track's `chroma_of`.
+fn src_rgba(sources: &Sources, src: SourceId, f: &Frame) -> Vec<u8> {
+    let track = sources.get(src).ok().and_then(|m| m.video.map(|i| &m.demux.tracks()[i]));
+    f.to_rgba_colour(track.and_then(|t| t.colour.as_ref()), track.map_or(gneiss_pal::dsp::video::Chroma::Nearest, gneiss_pal::dsp::video::chroma_of))
+}
+
+// ── NLESIZESWITCH (LEDGER SR384): the editor's run across a mid-stream size switch (handlers.md §5 NLEPROBE-HDR's NLE-SIZE-SWITCH) ──
+/// A frame of source `src` as RGBA at the project size `w x h`, for both of the render's frame -> RGBA sites. The frame is
+/// converted at its own size by [`src_rgba`]; a frame whose size differs from its reel's (the reel track's `width x height`,
+/// the reel's first size, the size the project takes) is LETTERBOXED into the reel's size by the editor's ONE fit,
+/// `timeline_core::view::Canvas::blit_fit` (aspect kept, centred, over the preview band's black `FIELD`), with one
+/// `[STRIA] :: nle size switch reel=<id> <W>x<H>-><w>x<h> scaled` line each time the run `run` sees its frame size change to
+/// a size other than the reel's. A reel whose own size is not the project's stays [`RenderError::Size`].
+/// NLESIZEPOLICY (LEDGER SR394): `fit` is the reel's [`SizePolicy`] ([`reel_fit`]): Letterbox as above, Fill / Stretch
+/// through the same painter's `Canvas::blit_policy` (` fit=<name>` appended to the line), Adopt hands the frame on at its own
+/// size (`[STRIA] :: nle size switch reel=<id> <W>x<H> adopted`); returns the RGBA and its size.
+fn reel_rgba(sources: &Sources, src: SourceId, f: &Frame, run: &mut Option<Vid>, w: u32, h: u32, fit: SizePolicy) -> Result<(Vec<u8>, u32, u32), RenderError> {
+    let now = (f.width, f.height);
+    let reel = sources.get(src).ok().and_then(|m| m.video.map(|i| (m.demux.tracks()[i].width, m.demux.tracks()[i].height))).filter(|&(rw, rh)| rw > 0 && rh > 0).unwrap_or(now);
+    let last = run.as_mut().and_then(|v| v.size.replace(now));
+    if now == (w, h) {
+        return Ok((src_rgba(sources, src, f), w, h));
+    }
+    if reel != (w, h) {
+        return Err(RenderError::Size { src, width: now.0, height: now.1 });
+    }
+    let rgba = src_rgba(sources, src, f);
+    if fit == SizePolicy::Adopt {
+        if last != Some(now) {
+            log::info!("[STRIA] :: nle size switch reel={} {}x{} adopted", src.0, now.0, now.1);
+        }
+        return Ok((rgba, now.0, now.1));
+    }
+    if last != Some(now) {
+        let tok = if fit == SizePolicy::Letterbox { String::new() } else { format!(" fit={}", fit.name()) };
+        log::info!("[STRIA] :: nle size switch reel={} {}x{}->{}x{} scaled{}", src.0, now.0, now.1, reel.0, reel.1, tok);
+    }
+    use timeline_core::view::{Canvas, FIELD, Order, Still};
+    let mut c = Canvas::new(reel.0, reel.1, Order::Rgba);
+    c.rect(0, 0, reel.0 as i64, reel.1 as i64, FIELD);
+    c.blit_policy(&Still { width: now.0, height: now.1, rgba }, 0, 0, reel.0, reel.1, fit);
+    Ok((c.px, reel.0, reel.1))
+}
+
+/// NLESIZEPOLICY (LEDGER SR394): source `src`'s size policy on `tl` (absent: Letterbox). `alone` is false inside a
+/// transition: the mix is one size, so Adopt mixes as Letterbox there.
+fn reel_fit(tl: &Timeline, src: SourceId, alone: bool) -> SizePolicy {
+    match tl.source(src).map_or(SizePolicy::Letterbox, |s| s.size_policy) {
+        SizePolicy::Adopt if !alone => SizePolicy::Letterbox,
+        p => p,
+    }
+}
+
+/// SWAPBACK-NLECACHE (LEDGER SR388): the editor's runs park their decoder across runs. A run's close (a cut, a seek step, the
+/// end of a render: every preview tick is one render) hands its decoder and [`DecodeSwap`] (its parked spans, LRU, keyed by set
+/// state) back to its reel's `Media`, and the reel's next run open takes them, resets the decoder and reseeds it — the
+/// Player's seek, so a scrub back into a span reuses its decoder (`[STRIA] :: nle reseed reel=<id> cache=hit|miss`). The slot
+/// is locked only for that take and this put, never across a decode. A second live run of one reel (a transition between two
+/// of its clips) opens fresh, and its close leaves an occupied slot as it is (SWAPBACK-NLECACHE-SHARED owed).
+type ReelPark = Arc<std::sync::Mutex<Option<(DecodeSwap, Box<dyn VideoDecoder>)>>>;
+
+impl Drop for Vid {
+    fn drop(&mut self) {
+        let Ok(mut slot) = self.park.lock() else { return };
+        if slot.is_none() {
+            let dec = std::mem::replace(&mut self.dec, Box::new(gneiss_pal::dsp::video::TestPattern::stand_in(&self.track)));
+            *slot = Some((std::mem::take(&mut self.swap), dec));
+        }
+    }
 }

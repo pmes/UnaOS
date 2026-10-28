@@ -26,7 +26,7 @@
 #                          and at this tree IN ONE DIRECTORY and compare them, with an armed control
 #                          probe. Exit 0 identical / 1 moved / 2 no verdict. EXECUTOR-BRIEF §5.
 #   ./arroyo knoboff env NAME=VAL[,NAME=VAL...] [baseline-ref]
-#                          The same check for an option_env! knob (UNAOS_PPI, UNAOS_FBW/FBH): both kernels
+#                          The same check for an option_env! knob (UNAOS_PPI, UNAOS_FBW/FBH, UNAOS_GOP): both kernels
 #                          AND both UEFI loaders built with the knob UNSET, SET and EMPTY. See THE ENV FORM.
 #   ./arroyo clean         Purge all build artifacts
 
@@ -113,7 +113,7 @@ esac
 _sha_base="$(git rev-parse --short=8 HEAD 2>/dev/null || echo unknown)"
 _sha_suffix=""
 if [ "$_sha_base" != "unknown" ]; then
-    git diff --quiet HEAD 2>/dev/null || _sha_suffix="-d$(git diff HEAD 2>/dev/null | sha256sum | cut -c1-6)"
+    git diff --quiet HEAD 2>/dev/null || _sha_suffix="-d$(git diff HEAD 2>/dev/null | { sha256sum 2>/dev/null || shasum -a 256; } | cut -c1-6)"
 fi
 export UNAOS_GIT_SHA="${_sha_base}${_sha_suffix}"
 
@@ -166,6 +166,47 @@ if [ -n "${UNAOS_FBW:-}" ] && [ -n "${UNAOS_FBH:-}" ]; then
                    echo "⚡ panel knob: ${UNAOS_FBW}x${UNAOS_FBH} (VGA xres/yres/edid, vgamem ${_panel_mb} MB) ppi=${UNAOS_PPI:-edid}" ;;
             esac ;;
     esac
+fi
+# ZENBOOKGOP (zenbook-ledger Z4): UNAOS_GOP=<handle>:<mode> is the x86 UEFI loader's OUTPUT override (crates/bootloader
+# `mod gopsel`, option_env!, no plumbing: the builder's cargo inherits this environment). Unset, the loader picks the
+# only GOP handle, else the first whose EDID is usable and whose ACPI _ADR is not the internal panel, else handle 0;
+# the indices are the ones its `[boot] gop handle=<i> mode=<m>` lines print. A build made with it is NOT the flashable image.
+if [ -n "${UNAOS_GOP:-}" ]; then
+    case "${UNAOS_GOP}" in
+        *[!0-9:]*|:*|*:|*:*:*) echo "✖ UNAOS_GOP='${UNAOS_GOP}': the gop knob is <handle>:<mode>, decimal"; exit 1 ;;
+        *:*) ;;
+        *) echo "✖ UNAOS_GOP='${UNAOS_GOP}': the gop knob is <handle>:<mode>, decimal"; exit 1 ;;
+    esac
+    echo "⚡ gop knob: handle=${UNAOS_GOP%%:*} mode=${UNAOS_GOP#*:} (x86 loader only; not the flashable image)"
+fi
+# ZENBOOKXHCIPICK (zenbook-ledger Z7): UNAOS_XHCI_PICK=<index|bus:dev.func> (decimal, the numbering of the kernel's
+# `[xhci] controllers=<n> picked=<i> bdf=<b:d.f>` census line) chooses WHICH xHCI the x86 kernel brings up
+# (drivers/xhci/mod.rs `pick`, option_env!, no plumbing: the builder's cargo inherits this environment). Unset, the
+# first 0C/03/30 in walk order, as always. A pick naming no controller is refused on the census line and the first runs.
+if [ -n "${UNAOS_XHCI_PICK:-}" ]; then
+    case "${UNAOS_XHCI_PICK}" in
+        *[!0-9:.]*) echo "✖ UNAOS_XHCI_PICK='${UNAOS_XHCI_PICK}': the xhci pick knob is <index> or <bus>:<dev>.<func>, decimal"; exit 1 ;;
+        *:*:*|*.*.*) echo "✖ UNAOS_XHCI_PICK='${UNAOS_XHCI_PICK}': the xhci pick knob is <index> or <bus>:<dev>.<func>, decimal"; exit 1 ;;
+        [0-9]*:[0-9]*.[0-9]*) ;;
+        *[:.]*) echo "✖ UNAOS_XHCI_PICK='${UNAOS_XHCI_PICK}': the xhci pick knob is <index> or <bus>:<dev>.<func>, decimal"; exit 1 ;;
+        *) ;;
+    esac
+    echo "⚡ xhci pick knob: ${UNAOS_XHCI_PICK} (x86 kernel only; the census line names the controller that ran)"
+fi
+# ZENBOOKLANE (zenbook-ledger Z13): UNAOS_PLATFORM=<token> is a TEST-ONLY platform override (hw.rs `platform_knob`,
+# option_env!, read only in a `witness` build; no plumbing: the builder's cargo inherits this environment). The token is
+# one `hw::Platform::token` prints; the kernel's `[hw] platform=<token> … src=knob` line says it ran. Never media: refused
+# on the card verbs (esp-zenbook unsets every inherited UNAOS_* before it re-enters esp-x86). `./arroyo test-zenbook` sets it.
+if [ -n "${UNAOS_PLATFORM:-}" ]; then
+    case "${UNAOS_PLATFORM}" in
+        macbookpro10_1|zenbook_um5606w|qemu) ;;
+        *) echo "✖ UNAOS_PLATFORM='${UNAOS_PLATFORM}': the platform knob is macbookpro10_1, zenbook_um5606w or qemu"; exit 1 ;;
+    esac
+    case "${1:-}" in
+        esp-*|esp_*|jetson*|kernel8|baremetal|selfup-pak|selfup_pak|vm-image|vm_image|vmimage|vm|fat-img|fat_img|fatimg)
+            echo "✖ UNAOS_PLATFORM is a QEMU-lane override and never rides media ('${1}'): unset it"; exit 1 ;;
+    esac
+    echo "⚡ platform knob: ${UNAOS_PLATFORM} (witness QEMU builds only; never media)"
 fi
 #
 # RTCCLOCK (R75) / CLOCKPAINTERS (B719): the display-offset build knob is RETIRED. The CMOS RTC is read and anchored
@@ -611,6 +652,7 @@ _feats="${_feats}sdw,"
 [ -n "${UNAOS_BTC:-}" ] && _feats="${_feats}btc,"
 [ -n "${UNAOS_A2DP:-}" ] && _feats="${_feats}a2dp,"   # A2DPENV (rmbp-ledger B752): the Bluetooth A2DP source (drivers/bt/*, the BTHID hooks, audio's `bt` sink, `tests a2dp`); implies `btc` in Cargo.toml (A2DPKNOB B750). x86-only: stripped by `arm_features` below. Kept in sync with builder/src/main.rs, banner-cert.sh, k8-reach.registry.
 [ -n "${UNAOS_TICKLESS:-}" ] && _feats="${_feats}tickless,"   # TICKLESSENV (rmbp-ledger B773): an idle core halts to its nearest deadline (one-shot LAPIC timer; TICKLESS B765, cores.md BP-cores-18; `tests tickless`, `[power] sleep … tick=tickless-idle`). x86-only: stripped by `arm_features` below. Kept in sync with builder/src/main.rs, banner-cert.sh, k8-reach.registry.
+[ -n "${UNAOS_LOCKREG_CENSUS:-}" ] && _feats="${_feats}lockreg_census,"   # LOCKREGXCORECOSTKNOB (rmbp-ledger B1075): the lock registry's cross-core walk census (B1062, cores.md BP-cores-20; `tests lockreg` `[lockreg] xcore walks= … avg_cyc=`, else `census=off`). x86-only: stripped by `arm_features`; kept in sync with builder/src/main.rs, banner-cert.sh, k8-reach.registry
 # BT-DIR: UNAOS_BTDIR=1 arms THE DIRECTION TEST. Every BR/EDR attempt this project has ever made
 # tested ONE direction — this host paging the speaker — and all of them ended at Connection Complete
 # status=0x04 PAGE TIMEOUT with the controller certifying the full train. Answering an inquiry only
@@ -941,7 +983,10 @@ _feats="${_feats}sdw,"
 # `:: DIMIDLE: idle_min=N blanked_at_ms=T woke_at_ms=T wake_key_swallowed=1 -> PASS ::` (needs `witness`).
 # SCREENLOCK M3: UNAOS_LOCK_ON_IDLE=1 makes DIMIDLE's wake open the lock screen (`login::lock`), read by rustc at BUILD
 # time via `option_env!` in video/dimidle.rs beside UNAOS_IDLE_MIN; not a cargo feature (needs `login`+`wc`). Default off.
+# KERNELSCALECOLS (rmbp-ledger B978): UNAOS_VPLAY_QUEUE=<1..16> is the kernel Player's decode-ahead queue in frames, read by rustc at BUILD time (`option_env!` + const parse in video/vplay.rs; default 3, empty = unset); not a cargo feature; `[player] ended ... queue=<n>` names it.
 [ -n "${UNAOS_WC:-}" ] && _feats="${_feats}wc,"
+# KERNEL-DISPLAY-ICC (LEDGER SR372): UNAOS_DISPLAY_ICC=1 -> `dicc`: the panel's display transform (sRGB to the EDID's matrix/TRC) as the scanout copy filter's last stage; `[display] icc ...` once at login. Both arches. Default OFF. Kept in sync with builder/src/main.rs and crates/kernel/Cargo.toml.
+[ -n "${UNAOS_DISPLAY_ICC:-}" ] && _feats="${_feats}dicc,"
 # PHASE31ROOT: UNAOS_BAR1EXP=<mode> selects a BAR1-wedge experiment arm (design + evidence:
 # docs/dev/OS/08_VIDEO/phase31-root.md). ONE mode exists today: `uc` -> feature `bar1exp-uc`,
 # which retypes the panel-aperture leaves UC (PAT PA3) instead of WC (PAT PA4) at
@@ -2708,6 +2753,7 @@ fi
 # disabled while the banner claims it is on (the s42/INSTGUI and WXN-M3b lesson), and for this driver
 # a silent no-op is indistinguishable on the wire from a machine with no SATA controller in it.
 [ -n "${UNAOS_AHCI:-}" ] && _feats="${_feats}ahci,"
+[ -n "${UNAOS_NVME:-}" ] && _feats="${_feats}nvme,"   # NVME (zenbook-ledger Z2): drivers/nvme.rs, the polled NVMe controller (probe, identify, `block::register_nvme`, `tests nvme`); the builder also attaches `-device nvme,drive=nvme0,serial=una` on a fresh target/nvmefixture.img (UNAOS_NVME_DISK=<img> to seed it; NVME4KN Z31: UNAOS_NVME_4K=1 makes the namespace 4096-byte LBAs, kept through test-zenbook's scrub; NVME4KN-FIXTURE Z40: UNAOS_NVME_DISK kept too, and `UNAOS_UNAFS=1 UNAOS_NVME_4K=1 ./arroyo esp-x86` lays target/unaos-x86-card.img at 4 KiB LBAs for it). x86-only: stripped by `arm_features` below. Kept in sync with builder/src/main.rs, crates/kernel/Cargo.toml, banner-cert.sh, k8-reach.registry.
 # AHCIWRITE (rmbp-ledger B89, SATA write half): UNAOS_AHCI_WRITE=1 arms the ATA `WRITE DMA EXT`
 # (0x35) path in drivers/ahci.rs. Implies `ahci` (Cargo.toml declares `ahci-write = ["ahci"]`), so
 # this knob alone is sufficient; pairing it with UNAOS_AHCI is harmless and is how the flight lines
@@ -2887,6 +2933,8 @@ fi
 # row certifies the feature on the ARTIFACT, and `scripts/k8-reach.registry` records why an x86-only
 # USB-host driver has no Pi bare-metal arm.
 # See docs/dev/OS/07_USB_STORAGE/uvc.md.
+# XHCILOANPTPYIELDQEMUMTP (zenbook-ledger Z105): UNAOS_QEMU_MTP_RW=1 attaches QEMU's read-write `usb-mtp` (a fresh empty rootdir target/mtp-rw per invocation, desc UNAMTP) on xhci.0 through UNAOS_QEMU_EXTRA, UACMIC's shape, and arms UNAOS_UVC before its map line below (ptp/mtp ride `uvc`): `tests ptpout` drives Z94's SendObject Out yield over it. Leg: scripts/specs/x86-mtp.spec (knobleg).
+if [ -n "${UNAOS_QEMU_MTP_RW:-}" ]; then export UNAOS_UVC=1; _mtprw="$WORKSPACE_DIR/target/mtp-rw"; rm -rf "$_mtprw"; mkdir -p "$_mtprw"; case " ${UNAOS_QEMU_EXTRA:-} " in *" usb-mtp,"*) ;; *) export UNAOS_QEMU_EXTRA="${UNAOS_QEMU_EXTRA:-} -device usb-mtp,bus=xhci.0,rootdir=${_mtprw},desc=UNAMTP,readonly=false" ;; esac; fi
 [ -n "${UNAOS_UVC:-}" ] && _feats="${_feats}uvc,"
 # UACMIC (rmbp-ledger B723): UNAOS_UAC=1 arms the USB Audio Class 1 driver as a feature of its own (`uac`, which
 # implies `uvc` in Cargo.toml: the class rides the isochronous engine, XHCIISO) AND attaches QEMU's `usb-audio` on the
@@ -2904,6 +2952,25 @@ if [ -n "${UNAOS_UAC:-}" ]; then
         *) export UNAOS_QEMU_EXTRA="${UNAOS_QEMU_EXTRA:-} -audiodev none,id=uac0 -device usb-audio,audiodev=uac0,bus=xhci.0" ;;
     esac
 fi
+# DONGLEBOOT2 (rmbp-ledger B1007): UNAOS_USB_EXTRA_INT=<n> attaches n extra interrupt-endpoint devices (QEMU usb-kbd) on
+# the harness EHCI bus (`usb-ehci,id=ehci`, builder/src/main.rs) at enumeration, through UNAOS_QEMU_EXTRA, so the EHCI
+# int-EP pool (`MAX_INT_EPS` = 6 per controller) carries load. QEMU's usb-ehci has six ports and the harness usb-kbd holds
+# one, so n is clamped to 5 (the pool fills 6/6 exactly; QEMU attaches no hub to EHCI and can never refuse a slot: the
+# refusal leg is `tests intpool`'s KAT). Non-numeric is ignored; skipped under UNAOS_NOEHCIHID (no ehci bus).
+# The leg: `UNAOS_USB_EXTRA_INT=4 ./arroyo test` + `tests intpool`:
+#   `:: INTPOOL: slots=6 taken=5 refused=0 hid_armed=5 reserve=owed who_lost=- kat=ok -> PASS ::`
+USB_EXTRA_INT_DEV="usb-kbd,bus=ehci.0"
+case "${UNAOS_USB_EXTRA_INT:-}" in
+    ''|*[!0-9]*) ;;
+    *) if [ -z "${UNAOS_NOEHCIHID:-}" ]; then
+           _xint=0; _xint_n=$(( UNAOS_USB_EXTRA_INT > 5 ? 5 : UNAOS_USB_EXTRA_INT ))
+           while [ "${_xint}" -lt "${_xint_n}" ]; do
+               export UNAOS_QEMU_EXTRA="${UNAOS_QEMU_EXTRA:-} -device ${USB_EXTRA_INT_DEV},id=xint${_xint}"; _xint=$((_xint + 1))
+           done
+       fi ;;
+esac
+# CONSOLEPICK (rmbp-ledger B1014): UNAOS_USB_EXTRA_XHCI=<n> attaches n `usb-net` devices on xhci.0 (enumeration only, no netdev) beside the FTDI (UNAOS_USBSERIAL=1); they take later ports than the builder's usb-serial, so this reproduces the slot count, not a before-the-FTDI order (CONSOLEPICK-ORDER owed). Leg: `tests consolepick`.
+if [ -n "${UNAOS_USB_EXTRA_XHCI:-}" ]; then case "${UNAOS_USB_EXTRA_XHCI}" in *[!0-9]*) echo "✖ UNAOS_USB_EXTRA_XHCI='${UNAOS_USB_EXTRA_XHCI}': a device count (digits)"; exit 1 ;; esac; _cpk=0; while [ "$_cpk" -lt "${UNAOS_USB_EXTRA_XHCI}" ]; do export UNAOS_QEMU_EXTRA="${UNAOS_QEMU_EXTRA:-} -device usb-net,bus=xhci.0"; _cpk=$((_cpk + 1)); done; fi
 # IOAPIC (rmbp-ledger B147): UNAOS_IOAPIC=1 arms arch/x86_64/ioapic.rs — the Intel 82093AA I/O APIC
 # redirection table, WHICH THIS KERNEL HAS NEVER HAD. `arch/x86_64/apic.rs` drives the LOCAL APIC
 # only (xAPIC MMIO + x2APIC MSRs) and `drivers/pci.rs` can enable MSI and MSI-X, so a PCI function
@@ -3162,7 +3229,7 @@ arm_features() {
     # substring (the trailing comma is part of the pattern), so neither line can half-rewrite the
     # other — the same argument the `wifi2`/`wifi` pair above makes about itself.
     f="${f//,ahci-write,/,}"
-    f="${f//,ahciroot,/,}"   # AHCIROOT (B332): x86-only like its parents; stripped for the same -Cmetadata reason.
+    f="${f//,ahciroot,/,}"; f="${f//,nvme,/,}"   # NVME (Z2): x86-only, stripped like ahci.  AHCIROOT (B332): x86-only like its parents; stripped for the same -Cmetadata reason.
     # WIFI-1 (GR25) rides the same strip, for the same reason and by the same mechanism as
     # `bcmarecon` above: `src/wifi/` is declared `#[cfg(all(feature = "wifi", target_arch =
     # "x86_64"))]` and all three main-loop call sites carry the same pair, so `wifi` emits not one
@@ -3240,6 +3307,7 @@ arm_features() {
     # `mod sleep` (target_arch x86_64), tests.rs's `tickless_t`/`tickless_selftest` (x86_64) and its registration inside
     # `ensure_fpu`'s `#[cfg(target_arch = "x86_64")]` block — no aarch64 code, so only the cargo fingerprint would move.
     f="${f//,tickless,/,}"
+    f="${f//,lockreg_census,/,}"   # LOCKREGXCORECOSTKNOB (B1075): every `lockreg_census` site is in sync.rs `mod reg` (target_arch x86_64): only the cargo fingerprint would move
     # BT-DIR rides the same strip, for the same reason and as a consequence of the same fact:
     # `btdir` implies `btc` implies `bt`, whose only code is inside the x86-gated
     # `drivers/ehci/mod.rs`, so `btdir` emits not one byte of aarch64 CODE — but an enabled feature
@@ -3471,7 +3539,7 @@ fi
 gate_x86_rodata_no_code() {
     local elf="$1"
     [ -f "$elf" ] || { echo -e "${COLOR_RED}ERROR: .rodata gate: ${elf} missing — the x86 kernel link produced no ELF${COLOR_RESET}"; exit 1; }
-    local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
+    local TOOLBIN; TOOLBIN="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | awk '/host/{print $2}')/bin"
     local NM="$TOOLBIN/llvm-nm"
     [ -x "$NM" ] || NM="$(command -v llvm-nm 2>/dev/null || true)"
     # No silent downgrade: a gate that cannot read the ELF must fail the build, not wave it through.
@@ -3503,7 +3571,7 @@ gate_x86_rodata_no_code() {
 }
 
 # ⚠ EVERY KERNEL IMAGE IS BUILT `--release`, AND DIAGNOSTIC CODE RELIES ON IT (rmbp 14, 2026-09-06).
-# MEASURED, not assumed: `grep -n "cargo +nightly build" arroyo | grep -v -- "--release"` is EMPTY —
+# MEASURED, not assumed: `grep -n "cargo build --" arroyo | grep -v -- "--release"` is EMPTY —
 # all 15 build legs in this file pass `--release`, and there is no debug leg anywhere. (The first
 # draft of this comment said "this leg and the three below it", which was wrong by a dozen; the check
 # that corrected it is the one written above, so run it rather than trusting this sentence.)
@@ -3669,18 +3737,18 @@ EOF
 # PROFILE (rmbp-ledger B331, M2): the kernel's symbol table, written BESIDE the ELF the link step just produced
 # (address-sorted, demangled, one line per defined symbol) for `tools/flame` to resolve `prof dump` samples
 # against. The kernel embeds nothing; a missing llvm-nm warns and never fails the build.
-emit_kernel_syms() { "$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin/llvm-nm" -n -C --defined-only "$1" > "$2" 2>/dev/null && echo -e "${COLOR_GREEN}  • symbols: $2 ($(wc -l < "$2") lines)${COLOR_RESET}" || echo -e "${COLOR_YELLOW}  • symbols: llvm-nm failed on $1 — no $2 (prof dump stays unresolved)${COLOR_RESET}"; }
+emit_kernel_syms() { "$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | awk '/host/{print $2}')/bin/llvm-nm" -n -C --defined-only "$1" > "$2" 2>/dev/null && echo -e "${COLOR_GREEN}  • symbols: $2 ($(wc -l < "$2") lines)${COLOR_RESET}" || echo -e "${COLOR_YELLOW}  • symbols: llvm-nm failed on $1 — no $2 (prof dump stays unresolved)${COLOR_RESET}"; }
 
 # PROFILE2 (rmbp-ledger B340, M3): a ring-3 program's symbol table, written from the UNSTRIPPED link
 # product (the staged ELF is `--strip-all`ed) to `target/APPS/<NAME>.syms`, NAME = the staged basename
 # without `.ELF` — the program name the kernel's `prof dump` prints (`[prof] prog id= name=`), so
 # `tools/flame` resolves a ring-3 RIP against the right program. Warns, never fails the build.
-emit_user_syms() { mkdir -p "${WORKSPACE_DIR}/target/APPS"; "$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin/llvm-nm" -n -C --defined-only "$1" > "${WORKSPACE_DIR}/target/APPS/$2.syms" 2>/dev/null && echo -e "${COLOR_GREEN}  • symbols: target/APPS/$2.syms ($(wc -l < "${WORKSPACE_DIR}/target/APPS/$2.syms") lines)${COLOR_RESET}" || echo -e "${COLOR_YELLOW}  • symbols: llvm-nm failed on $1 — no APPS/$2.syms (its ring-3 samples stay unresolved)${COLOR_RESET}"; }
+emit_user_syms() { mkdir -p "${WORKSPACE_DIR}/target/APPS"; "$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | awk '/host/{print $2}')/bin/llvm-nm" -n -C --defined-only "$1" > "${WORKSPACE_DIR}/target/APPS/$2.syms" 2>/dev/null && echo -e "${COLOR_GREEN}  • symbols: target/APPS/$2.syms ($(wc -l < "${WORKSPACE_DIR}/target/APPS/$2.syms") lines)${COLOR_RESET}" || echo -e "${COLOR_YELLOW}  • symbols: llvm-nm failed on $1 — no APPS/$2.syms (its ring-3 samples stay unresolved)${COLOR_RESET}"; }
 
 build_kernel_x86_64() {
     echo -e "${COLOR_YELLOW}⚡ Building x86_64 Kernel...${COLOR_RESET}"
     cd "$WORKSPACE_DIR/crates/kernel"
-    RUSTFLAGS="$KERNEL_FP_RUSTFLAGS" cargo +nightly build --release \
+    RUSTFLAGS="$KERNEL_FP_RUSTFLAGS" cargo build --release \
       --target ../../x86_64-unaos.json \
       $NIGHTLY_FLAGS $KERNEL_FEATURES
     cd "$WORKSPACE_DIR"
@@ -3701,12 +3769,12 @@ build_kernel_x86_64() {
 # (RIP-relative + inline message), so it runs wherever the kernel copies it. Fast/incremental — safe
 # to call at the start of every x86 build path.
 build_user_hello_x86() {
-    local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
+    local TOOLBIN; TOOLBIN="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | awk '/host/{print $2}')/bin"
     echo -e "${COLOR_YELLOW}⚡ Building x86 ring-3 user blob (crates/user-blob-x86 → target/hello.bin)...${COLOR_RESET}"
     mkdir -p "${WORKSPACE_DIR}/target"
     cd "$WORKSPACE_DIR/crates/user-blob-x86"
     RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-blob-x86/user-blob-x86.ld" \
-      cargo +nightly build --release -Z json-target-spec
+      cargo build --release -Z json-target-spec
     cd "$WORKSPACE_DIR"
     "$TOOLBIN/llvm-objcopy" -O binary --only-section=.text \
       "${WORKSPACE_DIR}/crates/user-blob-x86/target/x86_64-unknown-none/release/user-blob-x86" \
@@ -3775,12 +3843,12 @@ PY
 # other's artifacts. The output keeps a distinct name (STAT-X86.ELF) for the same reason — both arches'
 # images live in the one shared target/ directory, and the staging steps pick the right one.
 build_user_stat_x86() {
-    local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
+    local TOOLBIN; TOOLBIN="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | awk '/host/{print $2}')/bin"
     echo -e "${COLOR_YELLOW}⚡ Building x86 EL0 persistence static-ELF program (crates/user-stat → target/STAT-X86.ELF)...${COLOR_RESET}"
     mkdir -p "${WORKSPACE_DIR}/target"
     cd "$WORKSPACE_DIR/crates/user-stat"
     RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-stat/user-stat-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000" \
-      cargo +nightly build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json"
+      cargo build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json"
     cd "$WORKSPACE_DIR"
     emit_user_syms "${WORKSPACE_DIR}/crates/user-stat/target/x86_64-unknown-none/release/user-stat" STAT  # PROFILE2 M3: target/APPS/<NAME>.syms, BEFORE the strip
     "$TOOLBIN/llvm-objcopy" --strip-all \
@@ -3835,13 +3903,13 @@ build_user_stat_x86() {
 # up by the objcopy of the NEXT image if a build ever failed after the first.
 build_one_vug_x86() {
     local out="$1" feats="$2"
-    local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
+    local TOOLBIN; TOOLBIN="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | awk '/host/{print $2}')/bin"
     echo -e "${COLOR_YELLOW}⚡ Building x86 EL0 mini-vug static-ELF program (crates/user-vug${feats:+ [$feats]} → target/${out})...${COLOR_RESET}"
     mkdir -p "${WORKSPACE_DIR}/target"
     cd "$WORKSPACE_DIR/crates/user-vug"
     local tdir="${WORKSPACE_DIR}/crates/user-vug/target/x86${feats:+-$feats}"
     RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-vug/user-vug-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000" \
-      cargo +nightly build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json" \
+      cargo build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json" \
       --target-dir "$tdir" ${feats:+--features "$feats"}
     cd "$WORKSPACE_DIR"
     emit_user_syms "${tdir}/x86_64-unknown-none/release/user-vug" "${out%-X86.ELF}"  # PROFILE2 M3: target/APPS/<NAME>.syms, BEFORE the strip
@@ -3879,7 +3947,7 @@ build_user_vug_x86() {
 # unless the kernel carries `linuxabi` and someone runs `linux`/`tests linuxabi`.
 build_user_linux_hello_x86() {
     mkdir -p "${WORKSPACE_DIR}/target"
-    ( cd "$WORKSPACE_DIR/crates/user-linux-hello" && cargo +nightly run --release --quiet -- "${WORKSPACE_DIR}/target/HELLO.LNX" )
+    ( cd "$WORKSPACE_DIR/crates/user-linux-hello" && cargo run --release --quiet -- "${WORKSPACE_DIR}/target/HELLO.LNX" )
     build_selfbuild_x86   # SELFBUILD1: TCC.LNX + HELLO.C + SYSKAT.LNX + PROBE.LNX; SELFBUILD2: SYSKAT2.LNX
 }
 
@@ -3913,23 +3981,24 @@ _sb_skip() { # n product reason
 _sb_missing() { # tool… — prints "tool missing: <first absent>" and succeeds when one is absent; fails (prints nothing) when all are present
     local t; for t in "$@"; do command -v "$t" >/dev/null 2>&1 || { echo "tool missing: $t"; return 0; }; done; return 1
 }
-_sb_musl_selfc() { echo "$(rustc +nightly --print sysroot 2>/dev/null)/lib/rustlib/x86_64-unknown-linux-musl/lib/self-contained"; }
+_sb_musl_selfc() { echo "$(rustc --print sysroot 2>/dev/null)/lib/rustlib/x86_64-unknown-linux-musl/lib/self-contained"; }
 _sb_fetch_why() { # dir url rev step tool… — why a fetch-then-build product is absent: a missing tool, the fetch, or the build step
     local d="$1" u="$2" r="$3" st="$4"; shift 4
     _sb_missing git "$@" && return 0
     if [ -d "$d/.git" ] && [ "$(git -C "$d" rev-parse HEAD 2>/dev/null)" = "$r" ]; then echo "build failed $st"; else echo "fetch failed $u"; fi
 }
 _sb_kat_why() { # binary — a freestanding KAT: gcc absent, the gcc build, or the host-kernel run
-    _sb_missing gcc && return 0
-    if [ -x "$1" ]; then echo "host proof failed (the KAT's own fail line: run $1 on the host)"; else echo "build failed gcc -static -nostdlib"; fi
+    _lnx_why && return 0   # LNXCROSS (B1012): the host toolchain pick's refusal (on linux exactly `_sb_missing gcc`)
+    if [ -x "$1" ]; then echo "host proof failed (the KAT's own fail line: run $1 on the host)"; else echo "build failed $_LNX_CC -static -nostdlib"; fi
 }
 build_selfbuild_x86() {
     local sb="${WORKSPACE_DIR}/target/selfbuild" c="$WORKSPACE_DIR/crates/user-linux-hello/c"
     mkdir -p "$sb"
+    _lnx_pick   # LNXCROSS (B1012): the Linux-target cc/ld/strip for this host, probed once, one [selfbuild] line
     cp "$c/hello.c" "${WORKSPACE_DIR}/target/HELLO.C"
     rm -f "$sb/SYSKAT.LNX"
-    if gcc -static -nostdlib -fno-pie -no-pie -O1 -ffreestanding -fno-stack-protector -fno-builtin -o "$sb/SYSKAT.LNX" "$c/syskat.c" \
-        && "$sb/SYSKAT.LNX" >/dev/null; then
+    if _lnx_kat "$sb/SYSKAT.LNX" "$c/syskat.c" \
+        && { _lnx_deferred 1 SYSKAT.LNX || "$sb/SYSKAT.LNX" >/dev/null; }; then
         cp "$sb/SYSKAT.LNX" "${WORKSPACE_DIR}/target/SYSKAT.LNX"
     else
         _sb_skip 1 SYSKAT.LNX "$(_sb_kat_why "$sb/SYSKAT.LNX")"; rm -f "${WORKSPACE_DIR}/target/SYSKAT.LNX"
@@ -3938,8 +4007,8 @@ build_selfbuild_x86() {
     # fallocate/flock, socketpair, sendfile, one signal through rt_sigreturn. Proven on the host kernel (args: a file, its size,
     # a scratch path — UnaOS passes /apps/HELLO.C, the size its loader sees, <home>/kat2.tmp) before it is staged.
     rm -f "$sb/SYSKAT2.LNX"
-    if gcc -static -nostdlib -fno-pie -no-pie -O1 -ffreestanding -fno-stack-protector -fno-builtin -mno-red-zone -o "$sb/SYSKAT2.LNX" "$c/syskat2.c" \
-        && "$sb/SYSKAT2.LNX" "$c/hello.c" "$(stat -c %s "$c/hello.c")" "$sb/kat2.tmp" | grep -q "^syskat2 ok threads=4 counter=400000 "; then
+    if _lnx_kat "$sb/SYSKAT2.LNX" "$c/syskat2.c" -mno-red-zone \
+        && { _lnx_deferred 2 SYSKAT2.LNX || "$sb/SYSKAT2.LNX" "$c/hello.c" "$(_fsize "$c/hello.c")" "$sb/kat2.tmp" | grep -q "^syskat2 ok threads=4 counter=400000 "; }; then
         cp "$sb/SYSKAT2.LNX" "${WORKSPACE_DIR}/target/SYSKAT2.LNX"
     else
         _sb_skip 2 SYSKAT2.LNX "$(_sb_kat_why "$sb/SYSKAT2.LNX")"; rm -f "${WORKSPACE_DIR}/target/SYSKAT2.LNX"
@@ -3949,7 +4018,7 @@ build_selfbuild_x86() {
     local lib="${WORKSPACE_DIR}/target/LIB"
     if [ ! -f "$lib/libc.a" ]; then
         if _selfbuild_fetch "$sb/musl" "$SELFBUILD_MUSL_URL" "$SELFBUILD_MUSL_REV" \
-            && ( cd "$sb/musl" && ./configure --prefix="$sb/musl-out" --disable-shared CC=gcc CFLAGS="-O2" >/dev/null && make -s -j"$(nproc)" >/dev/null 2>&1 && make -s install >/dev/null 2>&1 ); then
+            && ( cd "$sb/musl" && ./configure --prefix="$sb/musl-out" --disable-shared CC="$_LNX_CC" "${_LNX_TOOLS[@]}" CFLAGS="-O2" >/dev/null && make -s -j"$(_ncpu)" >/dev/null 2>&1 && make -s install >/dev/null 2>&1 ); then
             rm -rf "$lib" && mkdir -p "$lib/include" "$lib/tcc/include" \
                 && cp "$sb/musl-out/lib/crt1.o" "$sb/musl-out/lib/crti.o" "$sb/musl-out/lib/crtn.o" "$sb/musl-out/lib/libc.a" "$lib/" \
                 && cp -r "$sb/musl-out/include/." "$lib/include/" \
@@ -3961,12 +4030,13 @@ build_selfbuild_x86() {
     # SELFBUILD1 tcc; SELFBUILD3 configures its search paths onto the volume: tccdir /lib/tcc ({B}), crt + libs {B}/.. = /lib,
     # headers {B}/../include (musl) then {B}/include (tcc's own) — so on UnaOS a bare `TCC.LNX -static -o prog prog.c` links musl, and
     # on the host `-B target/LIB/tcc` points the SAME binary at the staged tree (the host proof below). Rebuilt when LIB lacks libtcc1.a.
-    if [ ! -f "${WORKSPACE_DIR}/target/TCC.LNX" ] || { [ -f "$lib/libc.a" ] && [ ! -f "$lib/tcc/libtcc1.a" ]; } || LC_ALL=C grep -a -q -F /apps/LIB/tcc "${WORKSPACE_DIR}/target/TCC.LNX"; then  # ROOTDISK (B390, R94): a TCC.LNX configured for /apps/LIB is rebuilt for /lib
+    if ! _lnx_hostruns 1; then :   # LNXCROSS (B1012): a darwin host cannot run TCC.LNX (libtcc1.a, the LIB proof): TCC.LNX + LIB refused by name
+    elif [ ! -f "${WORKSPACE_DIR}/target/TCC.LNX" ] || { [ -f "$lib/libc.a" ] && [ ! -f "$lib/tcc/libtcc1.a" ]; } || LC_ALL=C grep -a -q -F /apps/LIB/tcc "${WORKSPACE_DIR}/target/TCC.LNX"; then  # ROOTDISK (B390, R94): a TCC.LNX configured for /apps/LIB is rebuilt for /lib
         if _selfbuild_fetch "$sb/tinycc" "$SELFBUILD_TCC_URL" "$SELFBUILD_TCC_REV" \
-            && ( cd "$sb/tinycc" && ./configure --cc=gcc --extra-cflags="-O2 -fno-pie" --extra-ldflags="-static -no-pie" \
+            && ( cd "$sb/tinycc" && ./configure --cc="$_LNX_CC" --extra-cflags="-O2 -fno-pie" --extra-ldflags="-static -no-pie" \
                    --tccdir=/lib/tcc --crtprefix='{B}/..' --libpaths='{B}:{B}/..' --sysincludepaths='{B}/../include:{B}/include' --config-musl >/dev/null \
                  && make -s tcc >/dev/null 2>&1 ); then
-            strip -o "${WORKSPACE_DIR}/target/TCC.LNX" "$sb/tinycc/tcc"
+            _lnx_strip -o "${WORKSPACE_DIR}/target/TCC.LNX" "$sb/tinycc/tcc"
             if [ -f "$lib/libc.a" ]; then
                 cp "$sb/tinycc/include/"*.h "$lib/tcc/include/" \
                     && ( cd "$sb/tinycc" && rm -f libtcc1.a && make -s libtcc1.a XFLAGS="-B$lib/tcc" >/dev/null 2>&1; [ -f libtcc1.a ] ) \
@@ -3974,7 +4044,7 @@ build_selfbuild_x86() {
                     || { _sb_skip 3 LIB "build failed tinycc libtcc1.a against the staged musl"; rm -rf "$lib"; }
             fi
         else
-            _sb_skip 1 TCC.LNX "$(_sb_fetch_why "$sb/tinycc" "$SELFBUILD_TCC_URL" "$SELFBUILD_TCC_REV" "tinycc configure/make" make gcc strip)"
+            _sb_skip 1 TCC.LNX "$(_sb_fetch_why "$sb/tinycc" "$SELFBUILD_TCC_URL" "$SELFBUILD_TCC_REV" "tinycc configure/make" make "${_LNX_CC%% *}" "$_LNX_STRIP")"
         fi
     fi
     # SELFBUILD3 host proof: the staged TCC.LNX compiles PRINTF.C against the staged musl and the output prints, or LIB is not staged.
@@ -3990,17 +4060,18 @@ build_selfbuild_x86() {
     # SELFBUILD3: the lazy-memory KAT (mmap of files private/shared, 256 MiB anon touched sparsely + mincore, PROT_NONE, brk 128 MiB,
     # madvise), proven on the host kernel before it is staged.
     rm -f "$sb/SYSKAT3.LNX"
-    if gcc -static -nostdlib -fno-pie -no-pie -O1 -ffreestanding -fno-stack-protector -fno-builtin -mno-red-zone -o "$sb/SYSKAT3.LNX" "$c/syskat3.c" \
-        && "$sb/SYSKAT3.LNX" "$c/hello.c" "$(stat -c %s "$c/hello.c")" "$sb/kat3.tmp" | grep -q "^syskat3 ok mmap=ok shared=ok anon_mib=256 resident_pages=256 "; then
+    if _lnx_kat "$sb/SYSKAT3.LNX" "$c/syskat3.c" -mno-red-zone \
+        && { _lnx_deferred 3 SYSKAT3.LNX || "$sb/SYSKAT3.LNX" "$c/hello.c" "$(_fsize "$c/hello.c")" "$sb/kat3.tmp" | grep -q "^syskat3 ok mmap=ok shared=ok anon_mib=256 resident_pages=256 "; }; then
         cp "$sb/SYSKAT3.LNX" "${WORKSPACE_DIR}/target/SYSKAT3.LNX"
     else
         _sb_skip 3 SYSKAT3.LNX "$(_sb_kat_why "$sb/SYSKAT3.LNX")"; rm -f "${WORKSPACE_DIR}/target/SYSKAT3.LNX"
     fi
-    if [ ! -f "${WORKSPACE_DIR}/target/PROBE.LNX" ]; then
+    if ! _lnx_hostruns probe; then :   # LNXCROSS (B1012): busybox via the gcc driver (libc + libgcc): PROBE.LNX refused by name on darwin
+    elif [ ! -f "${WORKSPACE_DIR}/target/PROBE.LNX" ]; then
         if _selfbuild_fetch "$sb/busybox" "$SELFBUILD_BB_URL" "$SELFBUILD_BB_REV" \
             && ( cd "$sb/busybox" && make -s defconfig >/dev/null 2>&1 \
                  && sed -i 's/^# CONFIG_STATIC is not set/CONFIG_STATIC=y/; s/^CONFIG_TC=y/# CONFIG_TC is not set/; s/^# CONFIG_FEATURE_SH_STANDALONE is not set/CONFIG_FEATURE_SH_STANDALONE=y/; s/^# CONFIG_FEATURE_PREFER_APPLETS is not set/CONFIG_FEATURE_PREFER_APPLETS=y/' .config \
-                 && (yes "" | make -s oldconfig >/dev/null 2>&1) && make -s -j"$(nproc)" >/dev/null 2>&1 ); then
+                 && (yes "" | make -s oldconfig >/dev/null 2>&1) && make -s -j"$(_ncpu)" >/dev/null 2>&1 ); then
             cp "$sb/busybox/busybox" "${WORKSPACE_DIR}/target/PROBE.LNX"
         else
             _sb_skip 1 PROBE.LNX "$(_sb_fetch_why "$sb/busybox" "$SELFBUILD_BB_URL" "$SELFBUILD_BB_REV" "busybox make" make gcc)"
@@ -4009,7 +4080,7 @@ build_selfbuild_x86() {
     build_selfbuild4_x86   # SELFBUILD4 (B356): SYSKAT4.LNX + RUST.LNX
     build_selfbuild5_x86   # SELFBUILD5 (B357): SYSKAT5.LNX + LLD.LNX + LIB/rust (RUST.LNX's objects, std rlibs, musl crt)
     build_selfbuild6_x86   # SELFBUILD6 (B360): LIB/dyn (libc.so, libgcc_s.so.1, the dyn probe) + LIB/rustc (default on, R87; UNAOS_SELFBUILD6_RUSTC=0 opts out)
-    ( cd "${WORKSPACE_DIR}/target" && sha256sum TCC.LNX PROBE.LNX SYSKAT.LNX SYSKAT2.LNX SYSKAT3.LNX SYSKAT4.LNX RUST.LNX HELLO.C PRINTF.C 2>/dev/null | sed 's/^/   SELFBUILD1: sha256 /' )
+    ( cd "${WORKSPACE_DIR}/target" && for _f in TCC.LNX PROBE.LNX SYSKAT.LNX SYSKAT2.LNX SYSKAT3.LNX SYSKAT4.LNX RUST.LNX HELLO.C PRINTF.C; do if [ -f "$_f" ]; then echo "   SELFBUILD1: sha256 $(sha256_of "$_f")  $_f"; fi; done )
     local _p _st="" _ns=""   # SMALLFIX (B380): one summary line; each not_staged entry has its own `not staged … reason=` line above
     for _p in SYSKAT.LNX SYSKAT2.LNX SYSKAT3.LNX SYSKAT4.LNX SYSKAT5.LNX TCC.LNX PROBE.LNX RUST.LNX LLD.LNX LIB/libc.a LIB/rust LIB/dyn LIB/rustc; do
         if [ -e "${WORKSPACE_DIR}/target/$_p" ]; then _st="$_st${_st:+,}$_p"; else _ns="$_ns${_ns:+,}$_p"; fi
@@ -4027,24 +4098,24 @@ build_selfbuild4_x86() {
     local sb="${WORKSPACE_DIR}/target/selfbuild" c="$WORKSPACE_DIR/crates/user-linux-hello/c" rs="$WORKSPACE_DIR/crates/user-linux-rust"
     mkdir -p "$sb"
     rm -f "$sb/SYSKAT4.LNX"
-    if gcc -static -nostdlib -fno-pie -no-pie -O1 -ffreestanding -fno-stack-protector -fno-builtin -mno-red-zone -o "$sb/SYSKAT4.LNX" "$c/syskat4.c" \
-        && "$sb/SYSKAT4.LNX" "$sb/kat4.tmp" | grep -q "^syskat4 ok cow=ok cow_kernel=ok cow_prot=ok shared_fork=ok exec_lazy=ok sigbus=ok "; then
+    if _lnx_kat "$sb/SYSKAT4.LNX" "$c/syskat4.c" -mno-red-zone \
+        && { _lnx_deferred 4 SYSKAT4.LNX || "$sb/SYSKAT4.LNX" "$sb/kat4.tmp" | grep -q "^syskat4 ok cow=ok cow_kernel=ok cow_prot=ok shared_fork=ok exec_lazy=ok sigbus=ok "; }; then
         cp "$sb/SYSKAT4.LNX" "${WORKSPACE_DIR}/target/SYSKAT4.LNX"
     else
         _sb_skip 4 SYSKAT4.LNX "$(_sb_kat_why "$sb/SYSKAT4.LNX")"; rm -f "${WORKSPACE_DIR}/target/SYSKAT4.LNX"
     fi
-    rustup +nightly target list --installed 2>/dev/null | grep -qx x86_64-unknown-linux-musl \
-        || rustup +nightly target add x86_64-unknown-linux-musl >/dev/null 2>&1 || true
+    rustup target list --installed 2>/dev/null | grep -qx x86_64-unknown-linux-musl \
+        || rustup target add x86_64-unknown-linux-musl >/dev/null 2>&1 || true
     local bin="$sb/rust/x86_64-unknown-linux-musl/release/rust-probe"
     rm -f "$bin"
-    if ( cd "$rs" && CARGO_TARGET_DIR="$sb/rust" cargo +nightly build --release --quiet --target x86_64-unknown-linux-musl ) \
+    if ( cd "$rs" && _lnx_cargoenv && CARGO_TARGET_DIR="$sb/rust" cargo build --release --quiet --target x86_64-unknown-linux-musl ) \
         && [ "$(od -An -t u2 -j 16 -N 2 "$bin" | tr -d ' ')" = "2" ] \
-        && "$bin" "$c/hello.c" 2>/dev/null | grep -q "^rust ok threads=4 counter=400000 hashmap=ok fs=ok panic_caught=1 "; then
-        strip -o "${WORKSPACE_DIR}/target/RUST.LNX" "$bin"
+        && { _lnx_deferred 4 RUST.LNX || "$bin" "$c/hello.c" 2>/dev/null | grep -q "^rust ok threads=4 counter=400000 hashmap=ok fs=ok panic_caught=1 "; }; then
+        _lnx_strip -o "${WORKSPACE_DIR}/target/RUST.LNX" "$bin"
     else
         local why4
-        if why4="$(_sb_missing strip)"; then :
-        elif [ ! -f "$(_sb_musl_selfc)/libc.a" ]; then why4="musl target missing (rustup +nightly target add x86_64-unknown-linux-musl refused)"
+        if why4="$(_sb_missing "$_LNX_STRIP")"; then :
+        elif [ ! -f "$(_sb_musl_selfc)/libc.a" ]; then why4="musl target missing (rustup target add x86_64-unknown-linux-musl refused)"
         elif [ ! -f "$bin" ]; then why4="build failed cargo crates/user-linux-rust --target x86_64-unknown-linux-musl"
         elif [ "$(od -An -t u2 -j 16 -N 2 "$bin" | tr -d ' ')" != "2" ]; then why4="build failed not ET_EXEC"
         else why4="host proof failed rust-probe"; fi
@@ -4056,7 +4127,7 @@ build_selfbuild4_x86() {
 # SELFBUILD5 (B357): UnaOS LINKS a Rust program. Three products, each proven on the HOST kernel before it is staged:
 # * SYSKAT5.LNX = crates/user-linux-hello/c/syskat5.c (mremap grow/move/FIXED/DONTUNMAP, the alternate signal stack at delivery,
 #   getcpu, madvise(MADV_HUGEPAGE), sched_yield).
-# * LLD.LNX = LLVM's `lld` at the toolchain's own LLVM release (rustc +nightly -vV: LLVM 22.1.8), built here from the release source
+# * LLD.LNX = LLVM's `lld` at the toolchain's own LLVM release (rustc -vV: LLVM 22.1.8), built here from the release source
 #   tarball (sha256 pinned below) as ONE static-PIE binary (WINDOW2/R85: -fPIE + -static-pie; glibc: the host has no musl C++ runtime; no zlib/zstd, no
 #   plugins, X86 only), stripped. It is a multi-flavour driver: `LLD.LNX -flavor gnu …` is ld.lld. Built ONCE (target/LLD.LNX is
 #   kept; ~1960 ninja steps, about an hour on 4 idle cores). `UNAOS_LLD_LNX=<path>` stages an operator-supplied static ld.lld
@@ -4073,8 +4144,8 @@ build_selfbuild5_x86() {
     local sb="${WORKSPACE_DIR}/target/selfbuild" c="$WORKSPACE_DIR/crates/user-linux-hello/c" rs="$WORKSPACE_DIR/crates/user-linux-rust"
     mkdir -p "$sb"
     rm -f "$sb/SYSKAT5.LNX"
-    if gcc -static -nostdlib -fno-pie -no-pie -O1 -ffreestanding -fno-stack-protector -fno-builtin -mno-red-zone -o "$sb/SYSKAT5.LNX" "$c/syskat5.c" \
-        && "$sb/SYSKAT5.LNX" | grep -q "^syskat5 ok grow=ok move=ok fixed=ok dontunmap=ok errors=ok altstack=ok small=ok "; then
+    if _lnx_kat "$sb/SYSKAT5.LNX" "$c/syskat5.c" -mno-red-zone \
+        && { _lnx_deferred 5 SYSKAT5.LNX || "$sb/SYSKAT5.LNX" | grep -q "^syskat5 ok grow=ok move=ok fixed=ok dontunmap=ok errors=ok altstack=ok small=ok "; }; then
         cp "$sb/SYSKAT5.LNX" "${WORKSPACE_DIR}/target/SYSKAT5.LNX"
     else
         _sb_skip 5 SYSKAT5.LNX "$(_sb_kat_why "$sb/SYSKAT5.LNX")"; rm -f "${WORKSPACE_DIR}/target/SYSKAT5.LNX"
@@ -4119,15 +4190,15 @@ build_selfbuild5_x86() {
     fi
     # LIB/rust: record RUST.LNX's link through a wrapper around rust-lld, then stage its inputs and the response file.
     local out="${WORKSPACE_DIR}/target/LIB/rust" rec="$sb/rust5rec" tgt="$sb/rust5"
-    local sysroot; sysroot="$(rustc +nightly --print sysroot)"
-    local rlld="$sysroot/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin/rust-lld"
+    local sysroot; sysroot="$(rustc --print sysroot)"
+    local rlld="$sysroot/lib/rustlib/$(rustc -vV | awk '/host/{print $2}')/bin/rust-lld"
     local selfc="$sysroot/lib/rustlib/x86_64-unknown-linux-musl/lib/self-contained"
     rm -rf "$out" "$rec" && mkdir -p "$rec/objs"
     printf '#!/bin/sh\nprintf "%%s\\n" "$@" > "%s/args"\nfor a in "$@"; do case "$a" in *.o) cp "$a" "%s/objs/" ;; esac; done\n[ "$1" = "-flavor" ] && exec "%s" "$@"\nexec "%s" -flavor gnu "$@"\n' \
         "$rec" "$rec" "$rlld" "$rlld" > "$rec/lldwrap" && chmod +x "$rec/lldwrap"
     if [ -x "$rlld" ] && [ -d "$selfc" ] \
         && ( cd "$rs" && rm -rf "$tgt" && CARGO_TARGET_DIR="$tgt" RUSTFLAGS="-C relocation-model=static -C target-feature=+crt-static -C linker=$rec/lldwrap -C linker-flavor=ld.lld -C link-self-contained=yes" \
-               cargo +nightly build --release --quiet --target x86_64-unknown-linux-musl ) \
+               cargo build --release --quiet --target x86_64-unknown-linux-musl ) \
         && [ -s "$rec/args" ] \
         && python3 - "$rec" "$out" <<'PY'
 import os, shutil, subprocess, sys
@@ -4180,7 +4251,7 @@ PY
         sed "s|@LIB@|$out|g" "$out/link.rsp.in" > "$rec/host.rsp"
         rm -f "$out/link.rsp.in"
         printf 'RUST.LNX objects + std rlibs (rustc %s, x86_64-unknown-linux-musl; rmeta dropped, --strip-debug) + musl crt/libc.a/libunwind.a\nfrom the Rust target self-contained dir, for LLD.LNX -flavor gnu @/lib/rust/link.rsp -o <out> (SELFBUILD5, B357)\n' \
-            "$(rustc +nightly -V | awk '{print $2, $3, $4}')" > "$out/RUST.TXT"
+            "$(rustc -V | awk '{print $2, $3, $4}')" > "$out/RUST.TXT"
         # Host proof: the staged linker (or rust-lld when LLD.LNX is absent) links the staged inputs into a program that runs.
         local hl="$lld"; [ -f "$hl" ] || hl="$rlld"
         if "$hl" -flavor gnu "@$rec/host.rsp" -o "$rec/rust2" && [ "$(od -An -t u2 -j 16 -N 2 "$rec/rust2" | tr -d ' ')" = "2" ] \
@@ -4197,7 +4268,7 @@ PY
         else whyr="build failed python3 staging of the recorded link"; fi
         _sb_skip 5 LIB/rust "$whyr"; rm -rf "$out"
     fi
-    ( cd "${WORKSPACE_DIR}/target" && sha256sum SYSKAT5.LNX LLD.LNX LIB/rust/link.rsp 2>/dev/null | sed 's/^/   SELFBUILD5: sha256 /' )
+    ( cd "${WORKSPACE_DIR}/target" && for _f in SYSKAT5.LNX LLD.LNX LIB/rust/link.rsp; do if [ -f "$_f" ]; then echo "   SELFBUILD5: sha256 $(sha256_of "$_f")  $_f"; fi; done )
 }
 
 # SELFBUILD6 (B360): DYNAMIC Linux programs through the shared loader core (unaos/libs/sys/ldso_core; the kernel's
@@ -4223,12 +4294,12 @@ SELFBUILD6_STD_SHA256="778d9ca7f9cfed6accc3174e2f75a7a0d670e62d8e010f5cbff59b8af
 build_selfbuild6_x86() {
     local sb="${WORKSPACE_DIR}/target/selfbuild/sb6" core="$WORKSPACE_DIR/libs/sys/ldso_core"
     local dyn="${WORKSPACE_DIR}/target/LIB/dyn" rlib="${WORKSPACE_DIR}/target/LIB/rustc"
-    local selfc; selfc="$(rustc +nightly --print sysroot)/lib/rustlib/x86_64-unknown-linux-musl/lib/self-contained"
-    local tb; tb="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
+    local selfc; selfc="$(rustc --print sysroot)/lib/rustlib/x86_64-unknown-linux-musl/lib/self-contained"
+    local tb; tb="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | awk '/host/{print $2}')/bin"
     mkdir -p "$sb"
     rm -rf "$dyn"
     # The host runner (the R78 execution proof).
-    if ! ( cd "$WORKSPACE_DIR/.." && CARGO_TARGET_DIR="$sb/host" cargo +nightly build --release --quiet -p ldso_core --bin ldrun ); then  # the ROOT workspace
+    if ! ( cd "$WORKSPACE_DIR/.." && CARGO_TARGET_DIR="$sb/host" cargo build --release --quiet -p ldso_core --bin ldrun ); then  # the ROOT workspace
         _sb_skip 6 LIB/dyn "build failed ldso_core ldrun"; _sb_skip 6 LIB/rustc "needs LIB/dyn"; return 0
     fi
     local ldrun="$sb/host/release/ldrun"
@@ -4267,8 +4338,8 @@ build_selfbuild6_x86() {
     cp "$sb/x/$tri/bin/rust-lld" "$rlib/$tri/bin/rust-lld"
     rm -rf "$sb/x"
     # The std rlibs of the same build.
-    local hstd; hstd="$(rustc +nightly --print sysroot)/$tri/lib"
-    if rustc +nightly -vV | grep -q "^commit-hash: ${SELFBUILD6_RUSTC_COMMIT}" && [ -d "$hstd/self-contained" ]; then
+    local hstd; hstd="$(rustc --print sysroot)/$tri/lib"
+    if rustc -vV | grep -q "^commit-hash: ${SELFBUILD6_RUSTC_COMMIT}" && [ -d "$hstd/self-contained" ]; then
         cp -r "$hstd" "$rlib/$tri/lib"
     else
         local stdt="$sb/std.tar.xz"
@@ -4313,12 +4384,12 @@ build_selfbuild6_x86() {
 # and draws is the end-to-end statement that the ring-3 stub in crates/user-pulse and the kernel handler in
 # arch/x86_64/syscall.rs agree about that number AND about the 272-byte payload layout.
 build_user_pulse_x86() {
-    local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
+    local TOOLBIN; TOOLBIN="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | awk '/host/{print $2}')/bin"
     echo -e "${COLOR_YELLOW}⚡ Building x86 EL0 cpu-pulse static-ELF program (crates/user-pulse → target/PULSE-X86.ELF)...${COLOR_RESET}"
     mkdir -p "${WORKSPACE_DIR}/target"
     cd "$WORKSPACE_DIR/crates/user-pulse"
     RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-pulse/user-pulse-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000" \
-      cargo +nightly build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json"
+      cargo build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json"
     cd "$WORKSPACE_DIR"
     emit_user_syms "${WORKSPACE_DIR}/crates/user-pulse/target/x86_64-unknown-none/release/user-pulse" PULSE  # PROFILE2 M3: target/APPS/<NAME>.syms, BEFORE the strip
     "$TOOLBIN/llvm-objcopy" --strip-all \
@@ -4342,12 +4413,12 @@ build_user_pulse_x86() {
 # builder above (bash keeps the last one) and left `build_user_prefs_x86` undefined, so every caller below
 # died on exit 127 under `set -e` and no x86 ESP could be built. Renamed to the name its callers use.
 build_user_prefs_x86() {
-    local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
+    local TOOLBIN; TOOLBIN="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | awk '/host/{print $2}')/bin"
     echo -e "${COLOR_YELLOW}⚡ Building x86 EL0 Principia prefs fulfiller static-ELF program (crates/user-prefs → target/PREFS-X86.ELF)...${COLOR_RESET}"
     mkdir -p "${WORKSPACE_DIR}/target"
     cd "$WORKSPACE_DIR/crates/user-prefs"
     RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-prefs/user-prefs-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000" \
-      cargo +nightly build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json"
+      cargo build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json"
     cd "$WORKSPACE_DIR"
     emit_user_syms "${WORKSPACE_DIR}/crates/user-prefs/target/x86_64-unknown-none/release/user-prefs" PREFS  # PROFILE2 M3: target/APPS/<NAME>.syms, BEFORE the strip
     "$TOOLBIN/llvm-objcopy" --strip-all \
@@ -4382,12 +4453,12 @@ una_res_stamp() {
 }
 
 build_user_lumen_x86() {
-    local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
+    local TOOLBIN; TOOLBIN="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | awk '/host/{print $2}')/bin"
     echo -e "${COLOR_YELLOW}⚡ Building x86 ring-3 Lumen app (crates/user-lumen → target/LUMEN-X86.ELF, ELF window)...${COLOR_RESET}"
     mkdir -p "${WORKSPACE_DIR}/target"
     cd "$WORKSPACE_DIR/crates/user-lumen"
     RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-lumen/user-lumen-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x40000" \
-      cargo +nightly build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json" --features cryptocore   # VEINTLS (SR36): the product crypto provider under tls_core
+      cargo build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json" --features cryptocore   # VEINTLS (SR36): the product crypto provider under tls_core
     cd "$WORKSPACE_DIR"
     emit_user_syms "${WORKSPACE_DIR}/crates/user-lumen/target/x86_64-unknown-none/release/user-lumen" LUMEN  # PROFILE2 M3: target/APPS/<NAME>.syms, BEFORE the strip
     "$TOOLBIN/llvm-objcopy" --strip-all \
@@ -4407,12 +4478,12 @@ build_user_lumen_x86() {
 # window check, APPRES stamp) → target/MIDDEN-X86.ELF, staged by the builder as APPS/MIDDEN.ELF. Inert until
 # launched (`run /apps/MIDDEN.ELF`); UNAOS_MIDDEN=1 adds the `tests midden` fixture (kernel middenapp.rs).
 build_user_midden_x86() {
-    local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
+    local TOOLBIN; TOOLBIN="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | awk '/host/{print $2}')/bin"
     echo -e "${COLOR_YELLOW}⚡ Building x86 ring-3 Midden app (crates/user-midden → target/MIDDEN-X86.ELF, ELF window)...${COLOR_RESET}"
     mkdir -p "${WORKSPACE_DIR}/target"
     cd "$WORKSPACE_DIR/crates/user-midden"
     RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-midden/user-midden-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x40000" \
-      cargo +nightly build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json"
+      cargo build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json"
     cd "$WORKSPACE_DIR"
     emit_user_syms "${WORKSPACE_DIR}/crates/user-midden/target/x86_64-unknown-none/release/user-midden" MIDDEN  # PROFILE2 M3: target/APPS/<NAME>.syms, BEFORE the strip
     "$TOOLBIN/llvm-objcopy" --strip-all \
@@ -4432,12 +4503,12 @@ build_user_midden_x86() {
 # target/UNA-X86.ELF, staged by the builder as APPS/UNA.ELF. Inert until launched (`una [workspace]`, a bare name
 # resolved on /apps); UNAOS_UNA=1 adds the `tests una` fixture (kernel unaapp.rs).
 build_user_una_x86() {
-    local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
+    local TOOLBIN; TOOLBIN="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | awk '/host/{print $2}')/bin"
     echo -e "${COLOR_YELLOW}⚡ Building x86 ring-3 Una IDE (crates/user-una → target/UNA-X86.ELF, ELF window)...${COLOR_RESET}"
     mkdir -p "${WORKSPACE_DIR}/target"
     cd "$WORKSPACE_DIR/crates/user-una"
     RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-una/user-una-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x40000" \
-      cargo +nightly build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json"
+      cargo build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json"
     cd "$WORKSPACE_DIR"
     emit_user_syms "${WORKSPACE_DIR}/crates/user-una/target/x86_64-unknown-none/release/user-una" UNA  # PROFILE2 M3: target/APPS/<NAME>.syms, BEFORE the strip
     "$TOOLBIN/llvm-objcopy" --strip-all \
@@ -4458,12 +4529,12 @@ build_user_una_x86() {
 # target/AETHER-X86.ELF, staged by the builder as APPS/AETHER.ELF with /system/doc/welcome.html. Inert until
 # launched; UNAOS_AETHER=1 adds the `tests aether` fixture.
 build_user_aether_x86() {
-    local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
+    local TOOLBIN; TOOLBIN="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | awk '/host/{print $2}')/bin"
     echo -e "${COLOR_YELLOW}⚡ Building x86 ring-3 Aether app (crates/user-aether → target/AETHER-X86.ELF, ELF window)...${COLOR_RESET}"
     mkdir -p "${WORKSPACE_DIR}/target"
     cd "$WORKSPACE_DIR/crates/user-aether"
     RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-aether/user-aether-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x40000" \
-      cargo +nightly build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json"
+      cargo build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json"
     cd "$WORKSPACE_DIR"
     emit_user_syms "${WORKSPACE_DIR}/crates/user-aether/target/x86_64-unknown-none/release/user-aether" AETHER  # PROFILE2 M3: target/APPS/<NAME>.syms, BEFORE the strip
     "$TOOLBIN/llvm-objcopy" --strip-all \
@@ -4484,12 +4555,12 @@ build_user_aether_x86() {
 # the APPRES stamp (res/: name, icon, signature org.unaos.stria, the media doctypes). target/STRIA-X86.ELF, staged by
 # the builder as APPS/STRIA.ELF. Inert until launched; UNAOS_STRIA=1 adds the `tests stria` fixture.
 build_user_stria_x86() {
-    local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
+    local TOOLBIN; TOOLBIN="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | awk '/host/{print $2}')/bin"
     echo -e "${COLOR_YELLOW}⚡ Building x86 ring-3 Stria app (crates/user-stria → target/STRIA-X86.ELF, ELF window)...${COLOR_RESET}"
     mkdir -p "${WORKSPACE_DIR}/target"
     cd "$WORKSPACE_DIR/crates/user-stria"
     RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-stria/user-stria-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x40000" \
-      cargo +nightly build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json"
+      cargo build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json"
     cd "$WORKSPACE_DIR"
     emit_user_syms "${WORKSPACE_DIR}/crates/user-stria/target/x86_64-unknown-none/release/user-stria" STRIA  # PROFILE2 M3: target/APPS/<NAME>.syms, BEFORE the strip
     "$TOOLBIN/llvm-objcopy" --strip-all \
@@ -4509,12 +4580,12 @@ build_user_stria_x86() {
 # build_user_diag_x86 shape, linked in the ELF window; app note RESIDENT (a bare `holocron …` detaches). Inert
 # until run (or launched by the login path when the user has a ring; UNAOS_LUMEN=1 arms that and SYS_KDF).
 build_user_holocron_x86() {
-    local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
+    local TOOLBIN; TOOLBIN="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | awk '/host/{print $2}')/bin"
     echo -e "${COLOR_YELLOW}⚡ Building x86 ring-3 secrets handler (crates/user-holocron → target/HOLOCRON-X86.ELF, ELF window)...${COLOR_RESET}"
     mkdir -p "${WORKSPACE_DIR}/target"
     cd "$WORKSPACE_DIR/crates/user-holocron"
     RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-holocron/user-holocron-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x40000" \
-      cargo +nightly build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json"
+      cargo build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json"
     cd "$WORKSPACE_DIR"
     emit_user_syms "${WORKSPACE_DIR}/crates/user-holocron/target/x86_64-unknown-none/release/user-holocron" HOLOCRON  # PROFILE2 M3: target/APPS/<NAME>.syms, BEFORE the strip
     "$TOOLBIN/llvm-objcopy" --strip-all \
@@ -4536,12 +4607,12 @@ build_user_holocron_x86() {
 # test), the file within xwin::IMAGE_CAP (12 MiB on the 48 MiB heap) and image + stack within the window.
 USER_XWIN_VA_ARM=$((0x7840200000))
 build_user_holocron_aarch64() {
-    local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
+    local TOOLBIN; TOOLBIN="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | awk '/host/{print $2}')/bin"
     echo -e "${COLOR_YELLOW}⚡ Building aarch64 ring-3 secrets handler (crates/user-holocron → target/HOLOCRON.ELF, ELF window)...${COLOR_RESET}"
     mkdir -p "${WORKSPACE_DIR}/target"
     cd "$WORKSPACE_DIR/crates/user-holocron"
     RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-holocron/user-holocron.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x40000" \
-      cargo +nightly build --release -Z json-target-spec
+      cargo build --release -Z json-target-spec
     cd "$WORKSPACE_DIR"
     "$TOOLBIN/llvm-objcopy" --strip-all \
       "${WORKSPACE_DIR}/crates/user-holocron/target/aarch64-base/release/user-holocron" \
@@ -4584,12 +4655,12 @@ PY
 # cargo args (an explicit --target for a crate whose .cargo/config.toml defaults to x86, --features).
 build_user_xwin_aarch64() {
     local crate="$1" name="$2" what="$3"; shift 3
-    local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
+    local TOOLBIN; TOOLBIN="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | awk '/host/{print $2}')/bin"
     echo -e "${COLOR_YELLOW}⚡ Building aarch64 ring-3 ${what} (crates/${crate} → target/${name}.ELF, ELF window)...${COLOR_RESET}"
     mkdir -p "${WORKSPACE_DIR}/target"
     cd "$WORKSPACE_DIR/crates/${crate}"
     RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/${crate}/${crate}.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x40000" \
-      cargo +nightly build --release -Z json-target-spec "$@"
+      cargo build --release -Z json-target-spec "$@"
     cd "$WORKSPACE_DIR"
     local bin="${WORKSPACE_DIR}/crates/${crate}/target/aarch64-base/release/${crate}" f="${WORKSPACE_DIR}/target/${name}.ELF" out
     # PROFILE2 M3's symbol table, BEFORE the strip — emit_user_syms' llvm-nm line, written to target/APPS-ARM/ and not
@@ -4635,12 +4706,12 @@ build_user_stria_aarch64()  { build_user_xwin_aarch64 user-stria  STRIA  "Stria 
 # resolves api.anthropic.com, connects :80 and prints the status line (UNAOS_NETRING3=1; knob off the two new
 # syscalls answer the unknown-syscall default and it says so in its verdict line).
 build_user_net_x86() {
-    local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
+    local TOOLBIN; TOOLBIN="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | awk '/host/{print $2}')/bin"
     echo -e "${COLOR_YELLOW}⚡ Building x86 ring-3 network client static-ELF program (crates/user-net → target/NET-X86.ELF, ELF window)...${COLOR_RESET}"
     mkdir -p "${WORKSPACE_DIR}/target"
     cd "$WORKSPACE_DIR/crates/user-net"
     RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-net/user-net-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x40000" \
-      cargo +nightly build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json" --features cryptocore   # VEINTLS (SR36): vein_ring3's verified TLS, CRYPTOCORE's provider; 256 KiB stack as LUMEN
+      cargo build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json" --features cryptocore   # VEINTLS (SR36): vein_ring3's verified TLS, CRYPTOCORE's provider; 256 KiB stack as LUMEN
     cd "$WORKSPACE_DIR"
     emit_user_syms "${WORKSPACE_DIR}/crates/user-net/target/x86_64-unknown-none/release/user-net" NET  # PROFILE2 M3: target/APPS/<NAME>.syms, BEFORE the strip
     "$TOOLBIN/llvm-objcopy" --strip-all \
@@ -4662,13 +4733,13 @@ build_user_net_x86() {
 # so the gate is user_elf_window_check (which runs scripts/elf-entry-check.sh). A console program: app note
 # flags 0, a bare `diag` runs it in the foreground. Inert until run; UNAOS_SELFDIAG=1 arms its two syscalls.
 build_user_diag_x86() {
-    local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
+    local TOOLBIN; TOOLBIN="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | awk '/host/{print $2}')/bin"
     echo -e "${COLOR_YELLOW}⚡ Building x86 ring-3 diagnosis program (crates/user-diag → target/DIAG-X86.ELF, ELF window)...${COLOR_RESET}"
     mkdir -p "${WORKSPACE_DIR}/target"
     python3 "${WORKSPACE_DIR}/scripts/witness-owners.py" "${WORKSPACE_DIR}" "${WORKSPACE_DIR}/target/witness-owners.txt" || { echo -e "${COLOR_RED}ERROR: witness-owners.py produced no table${COLOR_RESET}"; exit 1; }
     cd "$WORKSPACE_DIR/crates/user-diag"
     RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-diag/user-diag-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x40000" \
-      cargo +nightly build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json" --features cryptocore   # VEINTLS via vein_ring3 (merge12 fold)
+      cargo build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json" --features cryptocore   # VEINTLS via vein_ring3 (merge12 fold)
     cd "$WORKSPACE_DIR"
     "$TOOLBIN/llvm-objcopy" --strip-all \
       "${WORKSPACE_DIR}/crates/user-diag/target/x86_64-unknown-none/release/user-diag" \
@@ -4687,12 +4758,12 @@ build_user_diag_x86() {
 # the ABSOLUTE ELF-window VA (crates/user-big/user-big-x86.ld, no PHDRS) and declares a 256 KiB stack with
 # `-z stack-size`, which lld writes into PT_GNU_STACK's p_memsz — the kernel's stack request.
 build_user_big_x86() {
-    local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
+    local TOOLBIN; TOOLBIN="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | awk '/host/{print $2}')/bin"
     echo -e "${COLOR_YELLOW}⚡ Building x86 ring-3 ELF-window proof program (crates/user-big → target/BIG-X86.ELF)...${COLOR_RESET}"
     mkdir -p "${WORKSPACE_DIR}/target"
     cd "$WORKSPACE_DIR/crates/user-big"
     RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-big/user-big-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x40000" \
-      cargo +nightly build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json"
+      cargo build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json"
     cd "$WORKSPACE_DIR"
     emit_user_syms "${WORKSPACE_DIR}/crates/user-big/target/x86_64-unknown-none/release/user-big" BIG  # PROFILE2 M3: target/APPS/<NAME>.syms, BEFORE the strip
     "$TOOLBIN/llvm-objcopy" --strip-all \
@@ -4712,12 +4783,12 @@ build_user_big_x86() {
 # runs it under `uac` on an x86 `wc` image; without a microphone capture alternate (QEMU's usb-audio) it SKIPs
 # `reason=no-capture-device`, and without this ELF on the volume it SKIPs `reason=no-fixture`.
 build_user_micring3_x86() {
-    local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
+    local TOOLBIN; TOOLBIN="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | awk '/host/{print $2}')/bin"
     echo -e "${COLOR_YELLOW}⚡ Building x86 ring-3 microphone fixture program (crates/user-micring3 → target/MICRING3-X86.ELF)...${COLOR_RESET}"
     mkdir -p "${WORKSPACE_DIR}/target"
     cd "$WORKSPACE_DIR/crates/user-micring3"
     RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-micring3/user-micring3-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x40000" \
-      cargo +nightly build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json"
+      cargo build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json"
     cd "$WORKSPACE_DIR"
     emit_user_syms "${WORKSPACE_DIR}/crates/user-micring3/target/x86_64-unknown-none/release/user-micring3" MICRING3  # PROFILE2 M3: target/APPS/<NAME>.syms, BEFORE the strip
     "$TOOLBIN/llvm-objcopy" --strip-all \
@@ -4739,12 +4810,12 @@ build_user_micring3_x86() {
 # fixtures/ABIPROBE-v<N>.ELF and `sha256sum` it beside (the old fixtures stay). It prints the committed pin beside
 # the fresh build's for comparison; a differing rebuild is expected across toolchains and is not a verdict.
 build_user_abiprobe_x86() {
-    local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
+    local TOOLBIN; TOOLBIN="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | awk '/host/{print $2}')/bin"
     echo -e "${COLOR_YELLOW}⚡ Building x86 ring-3 ABI probe (crates/user-abiprobe → target/ABIPROBE-X86.ELF)...${COLOR_RESET}"
     mkdir -p "${WORKSPACE_DIR}/target"
     cd "$WORKSPACE_DIR/crates/user-abiprobe"
     RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-abiprobe/user-abiprobe-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x40000" \
-      cargo +nightly build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json"
+      cargo build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json"
     cd "$WORKSPACE_DIR"
     "$TOOLBIN/llvm-objcopy" --strip-all \
       "${WORKSPACE_DIR}/crates/user-abiprobe/target/x86_64-unknown-none/release/user-abiprobe" \
@@ -4768,7 +4839,7 @@ build_kernel_aarch64() {
     # armed esp-jetson already do their own unconditional build; this closes esp-arm/arm/test-arm).
     case ",${_af#--features }," in
         *,baremetal,*|*,tegra_el0,*|*,virt_el0,*|*,virt_tick,*)  # VIRTPREEMPT (orin 17): the virt terms added. JV1 made `virt_el0` a THIRD feature set that compiles syscall.rs's `include_bytes!`, but this case still listed only two — so `UNAOS_GICV3=1 UNAOS_VIRT_EL0=1 ./arroyo test-arm` baked whatever blob a prior `check`/`kernel8` had left, which is exactly the "image whose contents cannot be derived from its stated inputs" BLOBATOMIC exists to forbid (and in a fresh worktree with no blob at all it simply fails to compile). `virt_tick` is listed separately because arroyo appends knob NAMES and lets Cargo resolve the `virt_tick = ["virt_el0"]` implication, so the `--features` string for UNAOS_VIRT_TICK=1 alone does not contain `virt_el0`.
-            local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
+            local TOOLBIN; TOOLBIN="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | awk '/host/{print $2}')/bin"
             ( cd "$WORKSPACE_DIR" && build_user_blob )
             cd "$WORKSPACE_DIR/crates/kernel"
             ;;
@@ -4776,7 +4847,7 @@ build_kernel_aarch64() {
     # Surface the effective aarch64 feature set when it differs from the (x86) banner — makes the
     # SMOLNET-DEFAULT strip visible so an operator doesn't read `smolnet` off the banner for aarch64.
     [ "$_af" != "$KERNEL_FEATURES" ] && echo -e "${COLOR_YELLOW}⚡ aarch64 effective features: ${_af#--features }${COLOR_RESET}"
-    cargo +nightly build --release \
+    cargo build --release \
       --target ../../aarch64-unaos.json \
       $NIGHTLY_FLAGS $_af
     cd "$WORKSPACE_DIR"
@@ -4808,7 +4879,7 @@ launch_x86_64() {
 
     echo -e "${COLOR_CYAN}⚡ Launching x86_64 via Builder (kernel + bootloader + QEMU)...${COLOR_RESET}"
     cd "$WORKSPACE_DIR/builder"
-    cargo +nightly run --release
+    cargo run --release
     cd "$WORKSPACE_DIR"
 }
 
@@ -4825,7 +4896,7 @@ prepare_aarch64() {
 
     echo -e "${COLOR_YELLOW}⚡ Building aarch64 UEFI Bootloader...${COLOR_RESET}"
     cd "$WORKSPACE_DIR/crates/bootloader"
-    cargo +nightly build --release --target aarch64-unknown-uefi \
+    cargo build --release --target aarch64-unknown-uefi \
       $BOOTLOADER_FEATURES \
       -Z build-std=core,compiler_builtins,alloc \
       -Z build-std-features=compiler-builtins-mem
@@ -5282,7 +5353,7 @@ test_aarch64() {
         { cp "$STICK_IMG" "$_apps" && mcopy -o -i "$_apps" "$ESP_DIR_ARM/kernel.elf" ::/kernel.elf; } || { echo -e "${COLOR_RED}test-arm: cannot stage the app stick from ${STICK_IMG} (./arroyo fat-img; mtools)${COLOR_RESET}"; return 2; }
         mmd -i "$_apps" ::/APPS 2>/dev/null; mmd -i "$_apps" ::/system 2>/dev/null; mmd -i "$_apps" ::/system/doc 2>/dev/null
         for _p in midden:MIDDEN una:UNA lumen:LUMEN aether:AETHER stria:STRIA; do case ",${_feats}" in *",${_p%%:*},"*) "build_user_${_p%%:*}_aarch64"; mcopy -o -i "$_apps" "${WORKSPACE_DIR}/target/${_p##*:}.ELF" ::/APPS/ || return 2 ;; esac; done
-        case ",${_feats}" in *",aether,"*) mcopy -o -i "$_apps" "${WORKSPACE_DIR}"/crates/user-aether/doc/*.html ::/system/doc/ || return 2 ;; esac
+        case ",${_feats}" in *",aether,"*) mcopy -o -i "$_apps" "${WORKSPACE_DIR}"/crates/user-aether/doc/*.html "${WORKSPACE_DIR}"/crates/user-aether/doc/*.pdf ::/system/doc/ || return 2 ;; esac  # PDF4KERNEL (B999): + doc/*.pdf (tests aether's fixture.pdf)
         case ",${_feats}" in *",stria,"*) if [ -s "${WORKSPACE_DIR}/target/testf-cache/TEST.WEBM" ]; then mmd -i "$_apps" ::/system/test-f 2>/dev/null; mcopy -o -i "$_apps" "${WORKSPACE_DIR}/target/testf-cache/TEST.WEBM" ::/system/test-f/ || return 2; else echo -e "${COLOR_YELLOW}  ⚠ STRIAMETAL: target/testf-cache/TEST.WEBM absent (the builder fetches it, builder/testf.list) — tests stria SKIPs no-clip on this stick${COLOR_RESET}"; fi ;; esac   # STRIAMETAL (SR139): the clip `tests stria` plays
         STICK_IMG="$_apps"; echo -e "${COLOR_YELLOW}⚡ app stick: ${_apps} (kernel.elf + APPS/ for tests midden/una/lumen/aether):${COLOR_RESET}"; mdir -i "$_apps" ::/APPS
         ;; esac; fi
@@ -5543,11 +5614,19 @@ X86_PTR_SPEC="${WORKSPACE_DIR}/scripts/specs/x86-ptr.spec"
 X86_SPLASH_SPEC="${WORKSPACE_DIR}/scripts/specs/x86-splash.spec"
 X86_USBNET_SPEC="${WORKSPACE_DIR}/scripts/specs/x86-usbnet.spec"
 X86_WC_SPEC="${WORKSPACE_DIR}/scripts/specs/x86-wc.spec"         # WCLANE (B156): the compositor leg, UNAOS_WC=1 UNAOS_QUARRY=1 UNAOS_FTDIRX=1   # USBNET (SO56): the dongle-only leg, UNAOS_USBNET=1 UNAOS_NOE1000=1
+X86_AETHER_SPEC="${WORKSPACE_DIR}/scripts/specs/x86-aether.spec"   # AETHERLANE (rmbp-ledger B1004): `tests aether` at boot, UNAOS_WC=1 UNAOS_AETHER=1 (the kernel drives it: no typist)
 X86_PANEL_SPEC="${WORKSPACE_DIR}/scripts/specs/x86-panel.spec"   # ZOOMPANEL (B842): the WC leg at the rMBP panel, UNAOS_FBW=2880 UNAOS_FBH=1800 UNAOS_PPI=221 + UNAOS_WC/FACET
+X86_ZENBOOK_SPEC="${WORKSPACE_DIR}/scripts/specs/x86-zenbook.spec"   # ZENBOOKLANE (zenbook-ledger Z13): `./arroyo test-zenbook`, the Zenbook line booted as zenbook_um5606w (UNAOS_PLATFORM)
 X86_REPLAY_SPEC=""   # path of the spec to replay, or "" when none describes this capture
 X86_REPLAY_WHY=""    # why there is none — printed verbatim in the skip line
 x86_pick_capture_spec() {
     X86_REPLAY_SPEC=""; X86_REPLAY_WHY=""
+    # ZENBOOKLANE (zenbook-ledger Z13): `UNAOS_ZENBOOKLANE` is set only by `test_zenbook`'s re-exec. Asked FIRST: the Zenbook
+    # line arms UNAOS_SELFHOST, whose arm below would skip the replay; this lane stubs the selfbuild staging and has its own spec.
+    if [ -n "${UNAOS_ZENBOOKLANE:-}" ]; then
+        X86_REPLAY_SPEC="$X86_ZENBOOK_SPEC"
+        return 0
+    fi
     if [ -n "${UNAOS_SELFHOST:-}" ]; then
         X86_REPLAY_WHY="UNAOS_SELFHOST is armed — test-selfhost packs SOURCE-ALONG onto the fixture, so this is not the capture x86-fat.spec was measured against. That lane's verdict is its own 'SELFHOST: src verified … -> PASS ::' witness."
         return 0
@@ -5578,6 +5657,18 @@ x86_pick_capture_spec() {
             X86_REPLAY_SPEC="$X86_PTR_SPEC"
         else
             X86_REPLAY_WHY="UNAOS_PTRLANE is armed without UNAOS_WC — every pin in x86-ptr.spec is a wc-only counter line. Use './arroyo test-ptr' for the gated run."
+        fi
+        return 0
+    fi
+    # XHCILOANPTPYIELDQEMUMTPPICK (zenbook-ledger Z112): THE QEMU usb-mtp LEG. `UNAOS_QEMU_MTP_RW` (Z105, the knob line before
+    # the uvc map line) attaches QEMU's read-write `usb-mtp` and exports UNAOS_UVC; `tests ptpout` (x86 + `uvc`) drives Z94's
+    # SendObject Out yield over it. Asked here by PTRLANE's rule (a leg whose subject is the device its knob attaches, before
+    # the medium and compositor arms, which describe captures without it); the guard names the knob its pins need.
+    if [ -n "${UNAOS_QEMU_MTP_RW:-}" ]; then
+        if [ -n "${UNAOS_UVC:-}" ]; then
+            X86_REPLAY_SPEC="${WORKSPACE_DIR}/scripts/specs/x86-mtp.spec"
+        else
+            X86_REPLAY_WHY="UNAOS_QEMU_MTP_RW is armed without UNAOS_UVC — \`tests ptpout\` is registered only under \`uvc\` (tests.rs), so every pin in x86-mtp.spec is absent by construction. Use 'UNAOS_QEMU_MTP_RW=1 ./arroyo test 240' for the gated run."
         fi
         return 0
     fi
@@ -5634,6 +5725,16 @@ x86_pick_capture_spec() {
         else
             X86_REPLAY_WHY="the panel knobs are armed (UNAOS_FBW='${UNAOS_FBW:-}' UNAOS_FBH='${UNAOS_FBH:-}' UNAOS_PPI='${UNAOS_PPI:-}') but x86-panel.spec was written for UNAOS_FBW+UNAOS_FBH+UNAOS_PPI with UNAOS_WC=1 UNAOS_FACET=1 (zoom/perfhud/shimmeridle/veilcost compile under them); no other spec describes this panel."
         fi
+        return 0
+    fi
+    # AETHERLANE (rmbp-ledger B1004): `tests aether` (crates/kernel/src/aether.rs) runs at boot under tests-at-boot on any
+    # `./arroyo test` with UNAOS_AETHER=1 — the KERNEL drives the program (no QMP typist) through tail 13, the staged
+    # fixture PDF, and prints `:: AETHERPDF: … ::` beside SR109's `:: AETHERAPP: … ::`. Its own spec, asked BEFORE the
+    # WC arm: arming aether on x86-wc would have red that lane (user-aether's favicon `-> FAIL reason=none`, mbench's
+    # default forbid, until B1004) and moves its knob set (selfdiag, TEXTSCALE2's aether leg) under ~1000 lines measured without it.
+    if [ -n "${UNAOS_AETHER:-}" ] && [ -n "${UNAOS_WC:-}" ] && [ -z "${UNAOS_FATIMG:-}" ] \
+       && [ -z "${UNAOS_USBNET:-}" ] && [ -z "${UNAOS_HDA:-}" ] && [ -z "${UNAOS_HDATONE:-}" ] && [ -z "${UNAOS_LOGIN:-}" ]; then
+        X86_REPLAY_SPEC="$X86_AETHER_SPEC"
         return 0
     fi
     # WCLANE (QUEUE.md §5 MENUFIRST finding, rmbp-ledger B156, 2026-09-22: "x86-wc.spec IS NOT IN THE HARNESS'S
@@ -6067,7 +6168,7 @@ test_x86_64() {
     # is passed EXPLICITLY so `QEMU_GRACE_DEFAULT` above stays the single source of that number —
     # the builder carries a 20.0 of its own, but only for a bare `cargo run` with no arroyo.
     UNAOS_SERIAL_LOG="$SERIAL_LOG" UNAOS_TEST_SECS="$secs" UNAOS_TEST_SPEC="$X86_TEST_SPEC" \
-        UNAOS_QEMU_GRACE="${UNAOS_QEMU_GRACE:-$QEMU_GRACE_DEFAULT}" cargo +nightly run --release
+        UNAOS_QEMU_GRACE="${UNAOS_QEMU_GRACE:-$QEMU_GRACE_DEFAULT}" cargo run --release
     cd "$WORKSPACE_DIR"
     if [ -n "$qmp_pid" ]; then wait "$qmp_pid" 2>/dev/null || true; fi
     if [ -n "$typist_pid" ]; then wait "$typist_pid" 2>/dev/null || true; fi
@@ -6340,7 +6441,7 @@ check_user_arch() {
         [ "$_tgt" = "-" ] || _targ_arg="--target $_tgt"
         cd "$WORKSPACE_DIR/crates/$_crate"
         # `|| _rc=...` keeps set -e from aborting the loop; the failure is recorded and reported below.
-        if RUSTFLAGS="$_rustflags" cargo +nightly check --release -Z json-target-spec $_targ_arg; then
+        if RUSTFLAGS="$_rustflags" cargo check --release -Z json-target-spec $_targ_arg; then
             echo -e "${COLOR_GREEN}  ✅ ${_crate} (${_arch})${COLOR_RESET}"
         else
             echo -e "${COLOR_RED}  ❌ ${_crate} (${_arch}) FAILED to compile${COLOR_RESET}"
@@ -6736,7 +6837,7 @@ KERNEL_CFG_MATRIX=(
   # SIDE EFFECT: the table gains one knob and the universe gains one (brand-new, so "unclaimed =>
   # assume x86" either way and naming it here removes nothing); read the live board/mix counts on
   # `./arroyo check`'s own summary line, never from this prose.
-  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,irqstorage,botfaultinject,botring64,botwedge,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,rastmc,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,a2dp,wifi,nvidia-kepler-ce,gen7,wifi2,quarry,livecon,wifival,noaspm,wifi3,holocron,hcronst,deadman,wcdvalve,wedgeinj,btdir,prtscrst,bar1exp-uc,facet,login,loginst,beam,xhcikbd,nvidia-kepler-userdsnoop,nvidia-kepler-pfifoflush,nvidia-kepler-ctrladdr,nvidia-kepler-repoint,nvidia-kepler-latcharm,nvidia-kepler-pitchladder,nvidia-kepler-gopoverlap,ahci,bar1wedge,gen7r8,gen7r9,nvidia-kepler-kfbind,nvidia-kepler-kfctxbind,nvidia-kepler-kdhead,ahci-write,wifi4,wifi5,wifi9,wifi10,nvidia-kepler-ctrlbind,nvidia-kepler-kfunwedge,nvidia-kepler-vblank,uvc,uac,tickless"
+  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,irqstorage,botfaultinject,botring64,botwedge,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,rastmc,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,a2dp,wifi,nvidia-kepler-ce,gen7,wifi2,quarry,livecon,wifival,noaspm,wifi3,holocron,hcronst,deadman,wcdvalve,wedgeinj,btdir,prtscrst,bar1exp-uc,facet,login,loginst,beam,xhcikbd,nvidia-kepler-userdsnoop,nvidia-kepler-pfifoflush,nvidia-kepler-ctrladdr,nvidia-kepler-repoint,nvidia-kepler-latcharm,nvidia-kepler-pitchladder,nvidia-kepler-gopoverlap,ahci,nvme,bar1wedge,gen7r8,gen7r9,nvidia-kepler-kfbind,nvidia-kepler-kfctxbind,nvidia-kepler-kdhead,ahci-write,wifi4,wifi5,wifi9,wifi10,nvidia-kepler-ctrlbind,nvidia-kepler-kfunwedge,nvidia-kepler-vblank,uvc,uac,tickless,lockreg_census"
   # (aarch64 + witness + baremetal), VUG-PAR, the SMP-7/8 + CORE3 probes, the whole V3D battery
   # including its deep/qpu/dispdone/firstkick sub-knobs, PI-USB, GENET + NET-13, NS-SPAN and the
   # three-rung INSTALL-PI ladder, and PI-RAST (`pirast` — the Pi-panel rasterizer call site; this is the
@@ -7983,7 +8084,7 @@ KERNEL_CFG_MATRIX=(
   #     #[cfg(all(feature = "smpmark", feature = "supstate"))]                       let _pb: u32 = "SMPMARKLEG-PROBE-B";
   # both appended after the `:P:` mark inside `start_secondaries` (itself
   # `#[cfg(feature = "tegrasmp")]`, which both new rows carry). Result, each leg run as its own
-  # `cargo +nightly check --release --target ../../aarch64-unaos.json`:
+  # `cargo check --release --target ../../aarch64-unaos.json`:
   #     arm-tegra-furn-vpar-smpmark     EXIT 101   error[E0308] expected `u32`, found `&str`
   #     arm-tegra-supstate-el0-smpmark  EXIT 101   error[E0308] expected `u32`, found `&str`
   #     arm-tegra-smpmark               EXIT 0     smpmark, neither conjunct
@@ -8088,7 +8189,7 @@ KERNEL_CFG_MATRIX=(
   # was planted inside `jd1_dc_probe` (`arch/aarch64/display_tegra.rs`), conjoined so that exactly one
   # row of this matrix reaches it and no existing row does:
   #     #[cfg(all(feature = "jd1dc", feature = "tegra_el0"))] let _pjd: u32 = "EL0JD1DC-PROBE";
-  # Each leg run as its own `cargo +nightly check --release --target ../../aarch64-unaos.json`:
+  # Each leg run as its own `cargo check --release --target ../../aarch64-unaos.json`:
   #     arm-tegra-el0-jd1dc (NEW)       EXIT 101   error[E0308] expected `u32`, found `&str`
   #                                                display_tegra.rs:802:75 — the planted line
   #     arm-tegra-jd1dc                 EXIT 0     jd1dc, no tegra_el0
@@ -8373,6 +8474,12 @@ KERNEL_CFG_MATRIX=(
   # UNIVERSE SIDE EFFECT: none — every feature here is already on an arm-* row and on no x86-* row, so
   # `x86_cfg_universe` and the mix-leg count are unchanged. Board legs +1.
   "arm-tegra-image-supstate ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0,desktop_firmware,livecon,quarry,facet,login,lumen,holocron,selfdiag,midden,una,aether,uvc,sonde,usbnet,stria,orindesk,orinclick,orinconwin,orinrender,supstate"
+  # ── ZENBOOKIMAGELINE (appended 2026-10-27, zenbook-ledger Z6, wave36) — the Zenbook image line ──
+  # scripts/image-line-zenbook.env's 28 kernel knobs (ZENBOOKACP Z25: + hda; ZENBOOKACPCODEC Z43: + hda-tone; MT7925S6 Z29: + wifi, the b43 ladder's wifi2..wifi10 still off), verbatim, in arroyo-map order (FOLDBUILD's lesson: an image
+  # line no leg compiles is a line that may not build — wc, installdemo and unafs WITHOUT ahci*, smc, kepler, ivb, the Broadcom
+  # wifi and bt are named by no other leg together). `./arroyo esp-zenbook` builds this set. UNIVERSE SIDE EFFECT:
+  # none — an x86-* row subtracts nothing from `x86_cfg_universe`. Board legs +1.
+  "x86-zenbook-image ../../x86_64-unaos.json witness,selfhost,wcg-paygo,wcdvalve,logts,tickless,login,installdemo,wifi,wc,deadman,linuxabi,busreg,lumen,stria,netring3,selfdiag,videoplayer,quarry,facet,ftdirx,usbnet,nvme,unafs,hda,hda-tone,uvc,ioapic"
 )
 
 # ── GATE-CFG-MIX: the endpoints are not the configurations we ship ────────────────────────────────
@@ -8654,7 +8761,7 @@ _cfg_slot_worker() {
         # An EMPTY _slotbase means the default target dir (UNAOS_CHECK_P unset): no --target-dir at all,
         # so the leg is the old serial gate's cargo line verbatim and shares the dir every other verb uses.
         local -a _tdarg=(); [ -n "$_slotbase" ] && _tdarg=(--target-dir "${_slotbase}/slot${_s}")
-        if cargo +nightly check --release --target "$_ftgt" $NIGHTLY_FLAGS --features "$_ffeats" \
+        if cargo check --release --target "$_ftgt" $NIGHTLY_FLAGS --features "$_ffeats" \
              "${_tdarg[@]}" > "${_res}/${_fleg}.log" 2>&1; then _lrc=0; else _lrc=$?; fi
         _t1=$(date +%s.%N)
         # `.t` first, `.rc` LAST: the rc file is the "this leg ran" token the count check consumes,
@@ -8959,7 +9066,7 @@ ensure_user_blob() {
     fi
     # Same TOOLBIN computation as `build_user_blob`'s other two callers — it requires the caller to
     # set it, and bash's dynamic scoping hands this `local` down into the call.
-    local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
+    local TOOLBIN; TOOLBIN="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | awk '/host/{print $2}')/bin"
     echo -e "${COLOR_CYAN}  (target/user_blob.bin absent — building it once, for the aarch64 EL0 legs)${COLOR_RESET}"
     build_user_blob
 }
@@ -9146,13 +9253,13 @@ BRACEPY
     ensure_user_blob
     echo -e "${COLOR_YELLOW}⚡ Syntax Check: x86_64...${COLOR_RESET}"
     cd "$WORKSPACE_DIR/crates/kernel"
-    cargo +nightly check --release \
+    cargo check --release \
       --target ../../x86_64-unaos.json \
       $NIGHTLY_FLAGS $KERNEL_FEATURES
     echo -e "${COLOR_GREEN}✅ x86_64 OK${COLOR_RESET}"
 
     echo -e "${COLOR_YELLOW}⚡ Syntax Check: aarch64...${COLOR_RESET}"
-    cargo +nightly check --release \
+    cargo check --release \
       --target ../../aarch64-unaos.json \
       $NIGHTLY_FLAGS $(arm_features)
     cd "$WORKSPACE_DIR"
@@ -9176,12 +9283,12 @@ BRACEPY
     echo -e "${COLOR_YELLOW}⚡ Syntax Check: bootloader (aarch64-unknown-uefi, x86_64-unknown-uefi, +feature leg)...${COLOR_RESET}"
     cd "$WORKSPACE_DIR/crates/bootloader"
     for _bl_target in aarch64-unknown-uefi x86_64-unknown-uefi; do
-        cargo +nightly check --release --target "$_bl_target" \
+        cargo check --release --target "$_bl_target" \
           $BOOTLOADER_FEATURES \
           -Z build-std=core,compiler_builtins,alloc \
           -Z build-std-features=compiler-builtins-mem
     done
-    cargo +nightly check --release --target aarch64-unknown-uefi \
+    cargo check --release --target aarch64-unknown-uefi \
       --features bootdiag,jb8lever \
       -Z build-std=core,compiler_builtins,alloc \
       -Z build-std-features=compiler-builtins-mem
@@ -9193,7 +9300,7 @@ BRACEPY
     # loader half WITHOUT it — the two halves of the shared struct were never checked in agreement by
     # any leg. x86 target only: that is the path that ships it; an aarch64 cross reflects nothing that
     # boots.
-    cargo +nightly check --release --target x86_64-unknown-uefi --features unaos_ivb \
+    cargo check --release --target x86_64-unknown-uefi --features unaos_ivb \
       -Z build-std=core,compiler_builtins,alloc -Z build-std-features=compiler-builtins-mem
     cd "$WORKSPACE_DIR"
     echo -e "${COLOR_GREEN}✅ bootloader OK${COLOR_RESET}"
@@ -9454,14 +9561,14 @@ BRACEPY
     # probe: crates/kernel must be enumerated AND resolved as a root of check_both, or exit 2, no verdict.
     local _rrc=0
     echo -e "${COLOR_YELLOW}⚡ Syntax Check: builder (host)...${COLOR_RESET}"
-    if (cd "$WORKSPACE_DIR/builder" && cargo +nightly check --release); then
+    if (cd "$WORKSPACE_DIR/builder" && cargo check --release); then
         echo -e "${COLOR_GREEN}  ✅ builder (host)${COLOR_RESET}"
     else
         echo -e "${COLOR_RED}  ❌ builder (host) FAILED to compile${COLOR_RESET}"
         _rrc=1
     fi
     echo -e "${COLOR_YELLOW}⚡ Syntax Check: user-linux-hello (host fixture generator, LINUXABI)...${COLOR_RESET}"
-    if (cd "$WORKSPACE_DIR/crates/user-linux-hello" && cargo +nightly check --release); then
+    if (cd "$WORKSPACE_DIR/crates/user-linux-hello" && cargo check --release); then
         echo -e "${COLOR_GREEN}  ✅ user-linux-hello (host)${COLOR_RESET}"
     else
         echo -e "${COLOR_RED}  ❌ user-linux-hello (host) FAILED to compile${COLOR_RESET}"
@@ -9813,85 +9920,27 @@ esp_x86_unafs_card() {
     # build --into` is the one builder `./arroyo jobs-image` runs (records from STATUS.tsv, the ledgers, the queues;
     # `job:*` attributes; `/jobs/queries/Open jobs`); its witness line is printed, its noise kept in the log.
     jobs_into_volume "$vol" || return 1
-    # WIFI-FW (R95/Peter 2026-10-06 "we have the bunker for this"): the BCM4331 b43 firmware set is BENCH-ONLY and never
-    # in-tree (CLEAN_ROOM_POLICY §4; bcm4331.md §S4 option 1). UNAOS_WIFI_FW_PATH=<absolute dir in the bunker> holding
-    # ucode29_mimo.fw + ht0initvals29.fw + ht0bsinitvals29.fw stages the three files onto the UnaFS root at /FIRMWARE/
-    # (one of the three dirs the kernel's WIFI-1 pass searches — /, /B43/, /FIRMWARE/ — on the boot card's own volumes; FWPIN),
-    # so the dd carries them. Unset => nothing staged, the image byte-identical; set but not absolute, unreadable, or a
-    # file missing => the build FAILS LOUDLY naming it (the same rule as UNAOS_XUSB_FW_PATH). No copy lands in the tree.
-    # Re-added at merge17 after ROOTDISK2 rewrote this build (the block had landed at bbecdc12 on the dev branch).
-    if [ -n "${UNAOS_WIFI_FW_PATH:-}" ]; then
-        case "$UNAOS_WIFI_FW_PATH" in /*) ;; *) echo -e "${COLOR_RED}❌ WIFI-FW: UNAOS_WIFI_FW_PATH must be absolute: ${UNAOS_WIFI_FW_PATH}${COLOR_RESET}"; return 1;; esac
-        local fw
-        for fw in ucode29_mimo.fw ht0initvals29.fw ht0bsinitvals29.fw; do
-            [ -r "${UNAOS_WIFI_FW_PATH}/${fw}" ] || { echo -e "${COLOR_RED}❌ WIFI-FW: ${UNAOS_WIFI_FW_PATH}/${fw} missing or unreadable — no card image${COLOR_RESET}"; return 1; }
-        done
-        # FWSTAGE (bench, 2026-10-06, the first run with a real bunker): the single-file `put` creates the entry and refuses an
-        # existing name ("File already exists" on the first file), so the three go in as ONE DIRECTORY source — the directory
-        # form lands its contents in /FIRMWARE (made with its parents) and REPLACES what is there (tools/unafs put, ROOTDISK2).
-        local fwdir="${WORKSPACE_DIR}/target/wifi-fw"
-        rm -rf "$fwdir"; mkdir -p "$fwdir"
-        for fw in ucode29_mimo.fw ht0initvals29.fw ht0bsinitvals29.fw; do cp "${UNAOS_WIFI_FW_PATH}/${fw}" "$fwdir/"; done
-        cargo run -q --manifest-path "$UNAFS_CLI_MANIFEST" -- put "$fwdir" /FIRMWARE -i "$vol" >/dev/null || {
-            echo -e "${COLOR_RED}❌ WIFI-FW: tools/unafs put target/wifi-fw -> /FIRMWARE failed — no card image${COLOR_RESET}"; return 1; }
-        # FWVOL (flight 26, image 19): the kernel's WIFI-1 pass searches /, /B43/, /FIRMWARE/ on the PROGRAM-SOURCE volume —
-        # the FAT boot partition (`source=sdhc label='UNAOS'`), not the UnaFS root — and read `ucode ABSENT` with the set
-        # sitting on p2. Until the pass reads the UnaFS root (FWPIN B455 names the same gap), the set ALSO goes onto the
-        # ESP tree at /FIRMWARE/ so p1 carries it; bench-only, the staged tree, never git.
-        mkdir -p "$esp_t/FIRMWARE" && cp "$fwdir"/*.fw "$esp_t/FIRMWARE/" || {
-            echo -e "${COLOR_RED}❌ WIFI-FW: copying the set onto the ESP tree failed — no card image${COLOR_RESET}"; return 1; }
-        echo -e "${COLOR_YELLOW}⚡ WIFI-FW: b43 set (3 files) from ${UNAOS_WIFI_FW_PATH} onto the UnaFS root at /FIRMWARE/ (bench-only, never in-tree)${COLOR_RESET}"
-        # FWPIN (B455): the kernel stages a member ONLY when its SHA-256 equals its row in firmware/b43.pins (a fact about
-        # the bunker file, never its bytes). Print each digest, and say whether the in-tree pins already match; on the first
-        # build they do not (the file ships with no rows) and the kernel refuses with reason=unpinned until the seat pastes them.
-        local role sum bytes pinned pin_state="MATCH"
-        for fw in ucode29_mimo.fw:ucode ht0initvals29.fw:initvals ht0bsinitvals29.fw:bsinitvals; do
-            role="${fw##*:}"; fw="${fw%%:*}"
-            sum=$(sha256sum "${UNAOS_WIFI_FW_PATH}/${fw}" | cut -d' ' -f1)
-            bytes=$(stat -c %s "${UNAOS_WIFI_FW_PATH}/${fw}")
-            echo -e "${COLOR_YELLOW}⚡ WIFI-FW: ${fw} sha256=${sum} bytes=${bytes} pin-row: ${role} ${sum}${COLOR_RESET}"
-            pinned=$(awk -v r="$role" '$1==r && NF==2 {print tolower($2)}' "${WORKSPACE_DIR}/firmware/b43.pins" 2>/dev/null | head -1)
-            if [ -z "$pinned" ]; then [ "$pin_state" = "MATCH" ] && pin_state="UNPINNED"
-            elif [ "$pinned" != "$sum" ]; then pin_state="MISMATCH"; fi
-        done
-        echo -e "${COLOR_YELLOW}⚡ WIFI-FW: firmware/b43.pins vs the staged set -> ${pin_state} (the kernel stages only a pinned match; UNPINNED/MISMATCH boots read reason=unpinned/pin-mismatch)${COLOR_RESET}"
-    fi
-    # KEPLER-FW (KEPLERUCODE rmbp-ledger B637, R119 "the bunker is the standing answer for every proprietary bit"): the
-    # GK107's FECS/GPCCS context-switch firmware (fuc409c fuc409d fuc41ac fuc41ad — the names nouveau requests behind
-    # NvGrUseFW, gr/gf100.c:2603-2606) is BENCH-ONLY and never in-tree (CLEAN_ROOM_POLICY §4), the WIFI-FW shape exactly:
-    # UNAOS_KEPLER_FW_PATH=<absolute dir in the bunker> stages the four into target/kepler-fw and onto the ESP tree at
-    # FW/KEPLER/ (p1 — R99 keeps firmware blobs there), where `tests kgr` reads them (drivers/gpu/kepler_ucode.rs; never at
-    # boot, R80). Unset => nothing staged, the image byte-identical; set but not absolute, unreadable, or a file missing =>
-    # the build FAILS LOUDLY naming it. Each digest is printed with a ready-to-paste row and compared against
-    # firmware/kepler.pins (-> MATCH / UNPINNED / MISMATCH); the kernel uploads only a set whose four rows match.
-    if [ -n "${UNAOS_KEPLER_FW_PATH:-}" ]; then
-        case "$UNAOS_KEPLER_FW_PATH" in /*) ;; *) echo -e "${COLOR_RED}❌ KEPLER-FW: UNAOS_KEPLER_FW_PATH must be absolute: ${UNAOS_KEPLER_FW_PATH}${COLOR_RESET}"; return 1;; esac
-        local kfw kfwdir="${WORKSPACE_DIR}/target/kepler-fw"
-        for kfw in fuc409c fuc409d fuc41ac fuc41ad; do
-            [ -r "${UNAOS_KEPLER_FW_PATH}/${kfw}" ] || { echo -e "${COLOR_RED}❌ KEPLER-FW: ${UNAOS_KEPLER_FW_PATH}/${kfw} missing or unreadable — no card image${COLOR_RESET}"; return 1; }
-        done
-        rm -rf "$kfwdir"; mkdir -p "$kfwdir"
-        for kfw in fuc409c fuc409d fuc41ac fuc41ad; do cp "${UNAOS_KEPLER_FW_PATH}/${kfw}" "$kfwdir/"; done
-        mkdir -p "$esp_t/FW/KEPLER" && cp "$kfwdir"/fuc4* "$esp_t/FW/KEPLER/" || {
-            echo -e "${COLOR_RED}❌ KEPLER-FW: copying the set onto the ESP tree at FW/KEPLER/ failed — no card image${COLOR_RESET}"; return 1; }
-        echo -e "${COLOR_YELLOW}⚡ KEPLER-FW: GK107 ctxsw set (4 files) from ${UNAOS_KEPLER_FW_PATH} onto the ESP at FW/KEPLER/ (bench-only, never in-tree)${COLOR_RESET}"
-        local krole ksum kbytes kpinned kpin_state="MATCH"
-        for kfw in fuc409c:fecs_code fuc409d:fecs_data fuc41ac:gpccs_code fuc41ad:gpccs_data; do
-            krole="${kfw##*:}"; kfw="${kfw%%:*}"
-            ksum=$(sha256sum "$kfwdir/${kfw}" | cut -d' ' -f1)
-            kbytes=$(stat -c %s "$kfwdir/${kfw}")
-            echo -e "${COLOR_YELLOW}⚡ KEPLER-FW: ${kfw} sha256=${ksum} bytes=${kbytes} pin-row: ${krole} ${ksum}${COLOR_RESET}"
-            kpinned=$(awk -v r="$krole" '$1==r && NF==2 {print tolower($2)}' "${WORKSPACE_DIR}/firmware/kepler.pins" 2>/dev/null | head -1)
-            if [ -z "$kpinned" ]; then [ "$kpin_state" = "MATCH" ] && kpin_state="UNPINNED"
-            elif [ "$kpinned" != "$ksum" ]; then kpin_state="MISMATCH"; fi
-        done
-        echo -e "${COLOR_YELLOW}⚡ KEPLER-FW: firmware/kepler.pins vs the staged set -> ${kpin_state} (the kernel uploads only a pinned match; UNPINNED/MISMATCH reads reason=unpinned/pin-mismatch at tests kgr)${COLOR_RESET}"
-    fi
+    # WIFI-FW (R95/Peter 2026-10-06 "we have the bunker for this"; FWPIN B455): the BCM4331 b43 set is BENCH-ONLY and never
+    # in-tree (CLEAN_ROOM_POLICY §4; bcm4331.md §S4 option 1). UNAOS_WIFI_FW_PATH=<absolute dir in the bunker> stages the three
+    # onto the ESP tree at /FIRMWARE/ (FWVOL: the WIFI-1 pass reads the PROGRAM-SOURCE volume) AND onto the UnaFS root at /FIRMWARE/
+    # (one of the pass's three dirs /, /B43/, /FIRMWARE/), pinned by firmware/b43.pins. Unset => nothing staged, the image
+    # byte-identical; relative, unreadable or a member missing => the build FAILS LOUDLY naming it. FWSTAGEONE (rmbp-ledger B984):
+    # this line and KEPLER-FW below are calls of the ONE stager, `fw_stage_pinned` (+ `fw_stage_unafs`), above the entry point.
+    fw_stage_pinned WIFI-FW "${UNAOS_WIFI_FW_PATH:-}" UNAOS_WIFI_FW_PATH "$esp_t" FIRMWARE b43.pins ucode29_mimo.fw:ucode ht0initvals29.fw:initvals ht0bsinitvals29.fw:bsinitvals || return 1
+    fw_stage_unafs WIFI-FW "${UNAOS_WIFI_FW_PATH:-}" "$vol" /FIRMWARE || return 1
+    fw_stage_pinned MT7925-FW "${UNAOS_MT7925_FW_PATH:-}" UNAOS_MT7925_FW_PATH "$esp_t" FW/MT7925 mt7925.pins WIFI_MT7925_PATCH_MCU_1_1_hdr.bin:patch WIFI_RAM_CODE_MT7925_1_1.bin:ram || return 1  # MT7925-FW (ZENBOOKMT7925, zenbook-ledger Z5): the MediaTek MT7925 pair (linux-firmware mediatek/mt7925/) from UNAOS_MT7925_FW_PATH onto the ESP at FW/MT7925/, pinned by firmware/mt7925.pins; unset => nothing staged. LINE-NEUTRAL fold; the helper sits above the entry point.
+    # KEPLER-FW (KEPLERUCODE rmbp-ledger B637, R119 "the bunker is the standing answer for every proprietary bit"): the GK107's
+    # FECS/GPCCS context-switch firmware (fuc409c fuc409d fuc41ac fuc41ad — the names nouveau requests behind NvGrUseFW,
+    # gr/gf100.c:2603-2606) is BENCH-ONLY and never in-tree (CLEAN_ROOM_POLICY §4). UNAOS_KEPLER_FW_PATH=<absolute dir in the
+    # bunker> stages the four onto the ESP tree at FW/KEPLER/ (p1 — R99), where `tests kgr` reads them (drivers/gpu/kepler_ucode.rs;
+    # never at boot, R80), pinned by firmware/kepler.pins; the kernel uploads only a set whose four rows match. FWSTAGEONE (B984).
+    fw_stage_pinned KEPLER-FW "${UNAOS_KEPLER_FW_PATH:-}" UNAOS_KEPLER_FW_PATH "$esp_t" FW/KEPLER kepler.pins fuc409c:fecs_code fuc409d:fecs_data fuc41ac:gpccs_code fuc41ad:gpccs_data || return 1
     # SELFINSTALL2 (B310): the card's GPT is laid by `tools/una-card` over `amber_core` — the SAME core the
     # kernel's `install ssd --write` lays the SSD with (it replaced scripts/make-x86-card.py, byte-identical).
+    # NVME4KN-FIXTURE (zenbook-ledger Z40): UNAOS_NVME_4K=1 lays the SAME card at 4096-byte LBAs (`--lba 4096`, amber_core `Plan::gpt_lba`) — the QEMU 4Kn NVMe lane's UNAOS_NVME_DISK, never a 512 B card to dd; unset => the token is empty and the card byte-identical.
     cargo run -q --manifest-path "${WORKSPACE_DIR}/../tools/una-card/Cargo.toml" -- \
         --esp "${WORKSPACE_DIR}/target/x86_64_esp" --data "${WORKSPACE_DIR}/target/x86_64_data" \
-        --skip APPS --skip LIB --skip system --unafs "$vol" -o "$card" || {
+        --skip APPS --skip LIB --skip system --unafs "$vol" -o "$card" ${UNAOS_NVME_4K:+--lba 4096} || {
         echo -e "${COLOR_RED}❌ UNAFSX86: tools/una-card failed — no card image${COLOR_RESET}"; return 1; }
     rm -f "$vol"
     echo -e "${COLOR_GREEN}✅ x86 CARD (UnaFS root): ${card}${COLOR_RESET}"
@@ -9917,8 +9966,9 @@ KFONT_NOTO_SHA256=(
     "dfbd5ed0f1e68c3cbc51aa08f646d1ab0e68e7c4ceab70a69e465225ff701f93"
 )
 kfont_noto_missing() {
-    local f d n=0 dirs="${UNAOS_FONT_DIRS:-}:/usr/share/fonts/truetype/noto:/usr/share/fonts/opentype/noto:/usr/share/fonts/google-noto:/usr/share/fonts/TTF:/usr/share/fonts/noto"
-    for f in "${KFONT_NOTO_FACES[@]}"; do
+    local f d n=0 dirs="${UNAOS_FONT_DIRS:-}:/usr/share/fonts/truetype/noto:/usr/share/fonts/opentype/noto:/usr/share/fonts/google-noto:/usr/share/fonts/TTF:/usr/share/fonts/noto" faces=("$@")
+    [ "${#faces[@]}" -gt 0 ] || faces=("${KFONT_NOTO_FACES[@]}")   # GLYPHSCARD (B1010): the faces asked for (ensure_kfont_cjk: the CJK one), else the four
+    for f in "${faces[@]}"; do
         local hit=0 IFS=:
         for d in $dirs; do [ -n "$d" ] && [ -f "$d/$f" ] && { hit=1; break; }; done
         unset IFS
@@ -9936,14 +9986,14 @@ kfont_tree_pins() {
         case "$f" in ''|'#'*) continue ;; esac
         src="$(find "$root" -maxdepth 2 -name "$f" -print -quit 2>/dev/null)"
         if [ -z "$src" ]; then state="ABSENT ${f}"; continue; fi
-        have="$(sha256sum "$src" | cut -d' ' -f1)"
+        have="$(sha256_of "$src")"
         [ "$have" = "$want" ] || state="MISMATCH ${f}"
-        bytes=$((bytes + $(stat -c %s "$src")))
+        bytes=$((bytes + $(_fsize "$src")))
     done < "$pins"
     echo -e "${COLOR_YELLOW}⚡ FONTS: fonts/ vs firmware/fonts.pins -> ${state} (Inter + JetBrains Mono + Noto Sans, ${bytes} B per volume; FONTSCRAFT B640)${COLOR_RESET}"
 }
 ensure_kfont_noto() {
-    kfont_tree_pins   # FONTSCRAFT (B640): the vendored faces' pin verdict, before the Noto script faces
+    kfont_tree_pins; ensure_kfont_cjk   # FONTSCRAFT (B640): the vendored faces' pin verdict, before the Noto script faces. GLYPHSCARD (B1010): the CJK face's own leg first (it always returns 0; the early returns below would skip it)
     local miss; miss="$(kfont_noto_missing)"
     if [ "$miss" = 0 ]; then
         echo -e "${COLOR_GREEN}  • FONTS: the four Noto script faces are on this host (KERNELFONT2)${COLOR_RESET}"
@@ -9955,24 +10005,61 @@ ensure_kfont_noto() {
         echo -e "${COLOR_GREEN}  • FONTS: fonts-noto-core installed by apt${COLOR_RESET}"
         return 0
     fi
-    local dir="${WORKSPACE_DIR}/target/fonts-noto" deb tmp i ok=1
+    local dir="${WORKSPACE_DIR}/target/fonts-noto"
     echo -e "${COLOR_YELLOW}  • FONTS: apt refused or absent — fetching the pinned .deb into ${dir}${COLOR_RESET}"
-    mkdir -p "$dir"; deb="$dir/fonts-noto-core.deb"; tmp="$dir/x"
-    if ! { [ -f "$deb" ] && [ "$(sha512sum "$deb" | cut -d' ' -f1)" = "$KFONT_NOTO_DEB_SHA512" ]; }; then
-        curl -fsSL -m 300 -o "$deb" "$KFONT_NOTO_DEB_URL" || { echo -e "${COLOR_RED}  • FONTS: fetch failed — media builds without the Noto faces (scripts_missing on the wire)${COLOR_RESET}"; return 0; }
+    kfont_deb_stage "four Noto faces" "$KFONT_NOTO_DEB_URL" "$KFONT_NOTO_DEB_SHA512" "$dir" fonts-noto-core \
+        "${KFONT_NOTO_FACES[0]}=${KFONT_NOTO_SHA256[0]}" "${KFONT_NOTO_FACES[1]}=${KFONT_NOTO_SHA256[1]}" \
+        "${KFONT_NOTO_FACES[2]}=${KFONT_NOTO_SHA256[2]}" "${KFONT_NOTO_FACES[3]}=${KFONT_NOTO_SHA256[3]}"   # GLYPHSCARD (B1010): the ONE pinned-.deb leg
+    return 0
+}
+# GLYPHSCARD (rmbp-ledger B1010): the pinned-.deb leg KERNELFONT2 wrote inside ensure_kfont_noto, moved here VERBATIM and
+# parameterised so the Noto script faces and the CJK face share it: <label> <deb url> <deb sha512> <dir> <doc package>
+# <face>=<sha256>... . Fetch (cached in <dir>), SHA-512 the .deb, extract, copy each face only at its SHA-256, the package's
+# copyright as <dir>/LICENSE, append <dir> to UNAOS_FONT_DIRS. Always returns 0 (arroyo runs `set -e`; the media builds
+# without the face and the kernel names it); KFONT_DEB_OK=1 when every face landed.
+kfont_deb_stage() {
+    local label="$1" url="$2" sha512="$3" dir="$4" docpkg="$5" deb tmp pair ok=1
+    shift 5
+    KFONT_DEB_OK=0
+    mkdir -p "$dir"; deb="$dir/${docpkg}.deb"; tmp="$dir/x"
+    if ! { [ -f "$deb" ] && [ "$(sha512_of "$deb")" = "$sha512" ]; }; then
+        curl -fsSL -m 300 -o "$deb" "$url" || { echo -e "${COLOR_RED}  • FONTS: fetch failed — media builds without the ${label} (the kernel names them on the wire)${COLOR_RESET}"; return 0; }
     fi
-    [ "$(sha512sum "$deb" | cut -d' ' -f1)" = "$KFONT_NOTO_DEB_SHA512" ] || { echo -e "${COLOR_RED}  • FONTS: .deb SHA-512 mismatch — refused, not staged${COLOR_RESET}"; rm -f "$deb"; return 0; }
+    [ "$(sha512_of "$deb")" = "$sha512" ] || { echo -e "${COLOR_RED}  • FONTS: .deb SHA-512 mismatch — refused, not staged${COLOR_RESET}"; rm -f "$deb"; return 0; }
     rm -rf "$tmp"; mkdir -p "$tmp"
     # dpkg-deb reads every data.tar compression itself (the 2020 package is zstd); ar + tar where there is no dpkg.
     { if command -v dpkg-deb >/dev/null 2>&1; then dpkg-deb -x "$deb" "$tmp"; else ( cd "$tmp" && ar x "$deb" && tar -xf data.tar.* ); fi; } || { echo -e "${COLOR_RED}  • FONTS: .deb extract failed — not staged${COLOR_RESET}"; return 0; }
-    for i in 0 1 2 3; do
-        local f="${KFONT_NOTO_FACES[$i]}" src; src="$(find "$tmp" -name "${KFONT_NOTO_FACES[$i]}" -print -quit)"
-        if [ -n "$src" ] && [ "$(sha256sum "$src" | cut -d' ' -f1)" = "${KFONT_NOTO_SHA256[$i]}" ]; then cp -f "$src" "$dir/$f"; else ok=0; echo -e "${COLOR_RED}  • FONTS: ${f} absent or SHA-256 mismatch — not staged${COLOR_RESET}"; fi
+    for pair in "$@"; do
+        local f="${pair%%=*}" want="${pair#*=}" src; src="$(find "$tmp" -name "$f" -print -quit)"
+        if [ -n "$src" ] && [ "$(sha256_of "$src")" = "$want" ]; then cp -f "$src" "$dir/$f"; else ok=0; echo -e "${COLOR_RED}  • FONTS: ${f} absent or SHA-256 mismatch — not staged${COLOR_RESET}"; fi
     done
-    [ -f "$tmp/usr/share/doc/fonts-noto-core/copyright" ] && cp -f "$tmp/usr/share/doc/fonts-noto-core/copyright" "$dir/LICENSE"
+    [ -f "$tmp/usr/share/doc/${docpkg}/copyright" ] && cp -f "$tmp/usr/share/doc/${docpkg}/copyright" "$dir/LICENSE"
     rm -rf "$tmp"
     export UNAOS_FONT_DIRS="${UNAOS_FONT_DIRS:+${UNAOS_FONT_DIRS}:}${dir}"
-    [ "$ok" = 1 ] && echo -e "${COLOR_GREEN}  • FONTS: four Noto faces SHA-pinned into ${dir} (UNAOS_FONT_DIRS)${COLOR_RESET}"
+    [ "$ok" = 1 ] && { KFONT_DEB_OK=1; echo -e "${COLOR_GREEN}  • FONTS: ${label} SHA-pinned into ${dir} (UNAOS_FONT_DIRS)${COLOR_RESET}"; }
+    return 0
+}
+# GLYPHSCARD (rmbp-ledger B1010): the CJK face GLYPHS (B676) draws its Han + Hiragana line with — builder/src/main.rs
+# KFONT_FACES' NotoSansCJK-Regular.ttc, the kernel's `noto-cjk` FACES row (video/text.rs; read LATE, 64 KiB per desktop
+# service pass: 19484784 B is over FACE_MAX). Flight 38's Mac host had no package dir, so the card carried no CJK face.
+# (1) the face in UNAOS_FONT_DIRS or a package dir -> nothing to do; (2) else the Ubuntu pool fonts-noto-cjk .deb (jammy),
+# SHA-512 pinned, the face SHA-256 pinned, into the gitignored target/fonts-noto-cjk/ with the package's copyright as LICENSE
+# (the builder stages it as system/fonts/LICENSES/noto-cjk.txt). No apt: no ruling names fonts-noto-cjk on the host. Pins
+# measured 2026-10-27 by the GLYPHSCARD executor (curl of the pool .deb, 61220346 B; sha512sum / dpkg-deb -x / sha256sum).
+KFONT_CJK_FACE="NotoSansCJK-Regular.ttc"
+KFONT_CJK_BYTES=19484784
+KFONT_CJK_DEB_URL="http://archive.ubuntu.com/ubuntu/pool/main/f/fonts-noto-cjk/fonts-noto-cjk_20220127+repack1-1_all.deb"
+KFONT_CJK_DEB_SHA512="7f532d19dbba0cf4c00415c5d9cff90725b754339e89b29be543324f51bc391e21c9834c4cb15011f97684e4349c29629362a0cbbde5a517cec0e4105139b360"
+KFONT_CJK_SHA256="b76b0433203017ca80401b2ee0dd69350349871c4b19d504c34dbdd80541690a"
+ensure_kfont_cjk() {
+    local state="host"
+    if [ "$(kfont_noto_missing "$KFONT_CJK_FACE")" != 0 ]; then
+        echo -e "${COLOR_YELLOW}  • FONTS: ${KFONT_CJK_FACE} not on this host — fetching the pinned fonts-noto-cjk .deb (GLYPHSCARD B1010)${COLOR_RESET}"
+        kfont_deb_stage "CJK face" "$KFONT_CJK_DEB_URL" "$KFONT_CJK_DEB_SHA512" "${WORKSPACE_DIR}/target/fonts-noto-cjk" fonts-noto-cjk \
+            "${KFONT_CJK_FACE}=${KFONT_CJK_SHA256}"
+        if [ "$KFONT_DEB_OK" = 1 ]; then state="MATCH"; else state="ABSENT ${KFONT_CJK_FACE}"; fi
+    fi
+    echo -e "${COLOR_YELLOW}⚡ FONTS: ${KFONT_CJK_FACE} -> ${state} (${KFONT_CJK_BYTES} B per volume that carries system/fonts; GLYPHSCARD B1010)${COLOR_RESET}"
     return 0
 }
 
@@ -9991,8 +10078,8 @@ esp_x86() {
     build_user_diag_x86    # SELFDIAG: target/DIAG-X86.ELF + target/witness-owners.txt — staged as APPS/DIAG.ELF + system/witness-owners.txt
     build_user_holocron_x86   # HOLOCRON2 (B355): target/HOLOCRON-X86.ELF — staged as APPS/HOLOCRON.ELF
     build_user_prefs_x86; build_user_big_x86; build_user_micring3_x86   # BANDY3: target/PREFS-X86.ELF — staged as APPS/PREFS.ELF. RING3WIN: target/BIG-X86.ELF — staged as APPS/BIG.ELF. MICSTAGE (B744): target/MICRING3-X86.ELF — staged as APPS/MICRING3.ELF (tests micring3)
-    ensure_kfont_noto; cd "$WORKSPACE_DIR/builder"   # KERNELFONT2 (B363): the Noto script faces on the builder host first
-    UNAOS_PACKAGE_ONLY=1 cargo +nightly run --release
+    _rustc_floor || exit 1; ensure_kfont_noto; cd "$WORKSPACE_DIR/builder"   # KERNELFONT2 (B363): the Noto script faces on the builder host first
+    UNAOS_PACKAGE_ONLY=1 cargo run --release
     cd "$WORKSPACE_DIR"
     # The media path does NOT go through build_kernel_x86_64 (the builder compiles the kernel
     # itself), so the .rodata gate runs here too — on the STAGED image, which is the ELF the
@@ -10057,7 +10144,7 @@ vm_image() {
     build_user_holocron_x86   # HOLOCRON2 (B355): target/HOLOCRON-X86.ELF — staged as APPS/HOLOCRON.ELF
     build_user_prefs_x86; build_user_big_x86; build_user_micring3_x86   # BANDY3: target/PREFS-X86.ELF — staged as APPS/PREFS.ELF. RING3WIN: target/BIG-X86.ELF — staged as APPS/BIG.ELF. MICSTAGE (B744): target/MICRING3-X86.ELF — staged as APPS/MICRING3.ELF (tests micring3)
     ensure_kfont_noto; cd "$WORKSPACE_DIR/builder"   # KERNELFONT2 (B363)
-    UNAOS_VM_IMAGE=1 UNAOS_VM_GIT7="$git7" cargo +nightly run --release
+    UNAOS_VM_IMAGE=1 UNAOS_VM_GIT7="$git7" cargo run --release
     cd "$WORKSPACE_DIR"
     local img="${WORKSPACE_DIR}/target/vm/unaos-x86-${git7}.img"
     if [ ! -f "$img" ]; then
@@ -10312,7 +10399,7 @@ install_ssd_leg() { # $1 = blank|beside, $2 = wall seconds
     pid=$!
     rm -f "$log"
     echo -e "${COLOR_CYAN}⚡ INSTALL4 ssd-${mode}: booting with the virtual SSD on ide.1 and typing install ssd (${secs}s full wall); serial -> ${log}${COLOR_RESET}"
-    (cd "$WORKSPACE_DIR/builder" && UNAOS_SERIAL_LOG="$log" UNAOS_TEST_SECS="$secs" cargo +nightly run --release) || true
+    (cd "$WORKSPACE_DIR/builder" && UNAOS_SERIAL_LOG="$log" UNAOS_TEST_SECS="$secs" cargo run --release) || true
     wait "$pid" 2>/dev/null || true
     echo -e "${COLOR_PURPLE}──────── ssd-${mode} typist transcript (${tlog}) ────────${COLOR_RESET}"
     cat "$tlog" 2>/dev/null || echo "(no typist transcript)"
@@ -10567,6 +10654,104 @@ test_splash() {
     return $_rc
 }
 
+# ZENBOOKLANE (zenbook-ledger Z13): `./arroyo test-zenbook [secs]` — THE ZENBOOK LINE, BOOTED UNDER QEMU AS THE ZENBOOK.
+# The Zenbook-only kernel arms (Z8's EC census, Z10's gop_ignite, Z11's S2 gate) answer `hw::platform()`, which q35
+# resolves as `qemu`, so no QEMU leg reached them (GOPIGNITE-FIXTURE, Z10). This verb boots scripts/image-line-zenbook.env
+# with UNAOS_PLATFORM=zenbook_um5606w (hw.rs `platform_knob`, witness builds only — the line carries WITNESS).
+# FIRST PASS: esp-zenbook's scrub (every inherited UNAOS_* unset bar the QEMU machine / QMP port), the line sourced minus
+# its `# [media]` rows (the MT7925 firmware path: QEMU stages none), then the re-exec with the lane's four additions —
+# the marker, the platform, UNAOS_CENSUS (gop-ignite's line is census_println) and UNAOS_USBSERIAL (twoboot-knobs.env:
+# QEMU attaches the FTDI the metal wire is). `tests-at-boot` stays OFF (this verb is not in the head arming case): the
+# metal shape, as twoboot boots it.
+# SECOND PASS: twoboot's arm, three idioms: a fresh card (target/sdcard.img deleted, so the store is empty and the boot
+# reaches the first-user form), the lane's own spec as X86_TEST_SPEC (its COMPLETE ends FASTTEST's wall; its REQUIREs are
+# scored by `x86_test_completion` and replayed by `x86_spec_replay`), and SELFBUILD's toolchain staging stubbed (the line
+# arms SELFHOST). Then `test_x86_64`, whose verdict is this verb's.
+# ZENBOOKLANETYPED (zenbook-ledger Z16): THE TYPED SECOND PHASE. The fixtures register only from the `tests` verb, which
+# needs a session, and `tests` runs ONE fixture per line (`tests::shell_verb`: the second word is the fixture's ARG). So
+# ONE typist — scripts/typist.sh, twoboot's `typist_start` lifted (called, never copied) — rides this lane's own QMP port
+# (`-qmp` in UNAOS_QEMU_EXTRA, twoboot's idiom; test_x86_64 arms none for this lane) and types the first-user form, then
+# `tests platform|ec|nvme|i8042|dwi2c|hdacensus|gopshot|eclid|bootlist` one line each (ZENBOOKFLIGHTLIST Z33 added the middle
+# three), every line held on the previous line's verdict. The spec's COMPLETE is the last verdict. The typist connects to QMP before it reads a marker, and the QMP socket exists only after
+# test_x86_64 has removed the old capture, so it never reads a stale log. Transcript: target/zenbook-typist.log (beside it).
+test_zenbook() {
+    local secs="${1:-219}"   # UNAFSLANEQEMU (Z102): 213 -> 219 s, the typed `tests unafs` costs 5.57 s by the Z55 formula (4 s settle + 11 keys x 0.12 + 0.25 poll). WIFILEAVEBUILD (Z75): 206 -> 213 s, the typed `tests wifileave` (Z68) costs 6.17 s by the Z55 formula (4 s settle + 16 keys x 0.12 + 0.25 poll = 4 + 1.92 + 0.25). MT7925S10 (Z55): 200 -> 206 s, the typed `tests wpa2` costs 5.6 s (4 s settle + 11 keys x 0.12 + 0.25 poll). ZENBOOKSPECPINS (Z54): 180 -> 200 s, the three typed verbs added below cost 18.15 s (3 x 4 s settle + 45 keys x 0.12 s + 3 x 0.25 s poll)
+    if [ -z "${UNAOS_ZENBOOKLANE:-}" ]; then
+        local _zk="" _zv
+        for _zv in $(compgen -e); do case "$_zv" in UNAOS_QEMU_MACHINE|UNAOS_QMP_PORT|UNAOS_NVME_4K|UNAOS_NVME_DISK) ;; UNAOS_*) _zk="${_zk} ${_zv#UNAOS_}"; unset "$_zv" ;; esac; done
+        echo -e "${COLOR_CYAN}⚡ test-zenbook: line=scripts/image-line-zenbook.env (minus [media]) scrubbed=[${_zk# }] platform=zenbook_um5606w${COLOR_RESET}"
+        set -a; . <(awk '!index($0, "# [media]")' "$WORKSPACE_DIR/scripts/image-line-zenbook.env") || exit 1; set +a
+        exec env UNAOS_ZENBOOKLANE=1 UNAOS_PLATFORM=zenbook_um5606w UNAOS_CENSUS=1 UNAOS_USBSERIAL=1 "$0" test-zenbook "$secs"
+    fi
+    echo -e "${COLOR_CYAN}⚡ ZENBOOKLANE: the Zenbook line as zenbook_um5606w on a fresh card, the first-user form typed, then twelve typed verbs (${secs}s wall, spec ${X86_ZENBOOK_SPEC#${WORKSPACE_DIR}/})${COLOR_RESET}"
+    rm -f "${WORKSPACE_DIR}/target/sdcard.img"; zenbook_bootlist_carry; zenbook_unafs_root   # ZENBOOKLANELIST (Z19): the lane's own list, staged by the ONE stager, carried onto the ESP by the builder. UNAFSLANEQEMU (Z102): then the lane's native NVMe root, laid over this lane's own ESP (after the carry, so the lane list rides onto p1)
+    X86_TEST_SPEC="$X86_ZENBOOK_SPEC"
+    build_selfbuild_x86() { echo "   ZENBOOKLANE: SELFBUILD staging not entered (build_selfbuild_x86 stubbed, as the twoboot arm does)"; }
+    zenbook_lane_typed "$secs"   # ZENBOOKLANETYPED (Z16): the typist + test_x86_64; its rc is this verb's
+}
+
+# ZENBOOKLANETYPED (zenbook-ledger Z16): `test_zenbook`'s second phase — ONE typist (scripts/typist.sh) on this lane's QMP
+# port, the first-user form then nine `tests <verb>` lines, each held on the verdict before it; then `test_x86_64`.
+zenbook_lane_typed() { # $1 = the wall (s)
+    local secs="$1" rc=0 zport="${UNAOS_QMP_PORT:-4470}" tlog="${WORKSPACE_DIR}/target/zenbook-typist.log" v prev
+    while lsof -iTCP:"$zport" -sTCP:LISTEN >/dev/null 2>&1; do zport=$((zport + 1)); done
+    export UNAOS_QEMU_EXTRA="${UNAOS_QEMU_EXTRA:-} -qmp tcp:127.0.0.1:${zport},server,nowait"
+    . "${WORKSPACE_DIR}/scripts/typist.sh"
+    TYPIST_PORT="$zport" TYPIST_LOG="$SERIAL_LOG"
+    local -a zph=("$FIRSTUSER_PHASE")
+    prev=":: BOOTLIST: ran="   # ZENBOOKLANELIST (Z19): held on the lane list's light summary (it runs at [desktop] built), so no typed `tests` meets a list fixture's RUNNING (`:: TESTS: already running — refused ::`)
+    for v in platform:PLATFORM ec:EC nvme:NVME i8042:I8042 dwi2c:DWI2C hdacensus:HDACENSUS gopshot:GOPSHOT eclid:ECLID suspend:SUSPEND ecqnames:ECQNAMES dwi2cacpi:DWI2CFAST wpa2:WPA2KAT wifileave:WIFILEAVE unafs:UNAFSX86-T bootlist:BOOTLIST; do   # UNAFSLANEQEMU (Z102): unafs typed before bootlist on the native NVMe root (COMPLETE unchanged). ZENBOOKFLIGHTLIST (Z33): hdacensus, gopshot, eclid typed before bootlist (COMPLETE unchanged). ZENBOOKSPECPINS (Z54): suspend, ecqnames, dwi2cacpi (held on DWI2CFAST, its last of three verdicts), each pinned by x86-zenbook.spec §9. SPECCOV (zenbook-ledger Z58): this lane's marker, equal to the loop's own verbs — SPEC-COVERAGE: x86-zenbook.spec platform ec nvme i8042 dwi2c hdacensus gopshot eclid suspend ecqnames dwi2cacpi bootlist wpa2 wifileave unafs
+        local done_mark=":: ${v#*:}: "; [ "${v%%:*}" = bootlist ] && done_mark=":: BOOTLIST: probe"
+        zph+=("${prev}|tests ${v%%:*}|t:tests spc t:${v%%:*} ret|${done_mark}")
+        prev="$done_mark"
+    done
+    mkdir -p "${WORKSPACE_DIR}/target"; rm -f "$tlog"
+    typist_start "$tlog" "$secs" "${zph[@]}"
+    echo -e "${COLOR_CYAN}⚡ ZENBOOKLANE: typist armed on QMP :${zport} — the first-user form, then tests platform/ec/nvme/i8042/dwi2c/hdacensus/gopshot/eclid/suspend/ecqnames/dwi2cacpi/wpa2/bootlist (transcript ${tlog#${WORKSPACE_DIR}/})${COLOR_RESET}"
+    test_x86_64 "$secs" || rc=$?
+    wait "$typist" 2>/dev/null || true
+    awk '/^\[typist\]/ { print "ZENBOOKLANE:   " $0 }' "$tlog" 2>/dev/null || true
+    return "$rc"
+}
+
+# ZENBOOKLANELIST (zenbook-ledger Z19): the lane's boot list. The builder re-creates target/x86_64_esp on every run
+# (builder/src/main.rs, the ESP wipe) and `bootlist_stage` arms only on the media verbs, so the lane read `list=absent`.
+# The ONE stager fills target/bootlist-carry from the LANE list (unaos/fixtures/lanes/zenbook/, not the flight list: its
+# ~70 untagged fixtures would not fit the wall and would refuse the typed verbs), and UNAOS_BOOTLIST_STAGE hands that dir
+# to the builder, whose `stage_bootlist_carry` copies it onto the ESP root (it knows no file name, filters nothing).
+zenbook_bootlist_carry() {
+    local dir="${WORKSPACE_DIR}/target/bootlist-carry"
+    rm -rf "$dir"; mkdir -p "$dir" || exit 1
+    _BOOTLIST_MEDIA=1 bootlist_stage "$dir" "${WORKSPACE_DIR}/fixtures/lanes/zenbook"
+    [ -f "${dir}/TESTS.LIST" ] || { echo -e "${COLOR_RED}✖ ZENBOOKLANELIST: no lane list at fixtures/lanes/zenbook/TESTS.LIST — the lane would read list=absent. rc=1${COLOR_RESET}"; exit 1; }
+    export UNAOS_BOOTLIST_STAGE="$dir"
+}
+
+# UNAFSLANEQEMU (zenbook-ledger Z102): the lane's NATIVE root. The root walk binds only a disk carrying THIS kernel (the code
+# window AND the build stamp, fs/bootdisk.rs `walk_rows`), and on this lane none did: the line's INSTALLDEMO backs the stick
+# with a blank scratch, no `ahci` reads the ESP on ide.0, sdcard.img carries no kernel, the NVMe was zeros — so `/` was never
+# UnaFS and `tests unafs` could only SKIP. The ONE media verb `esp_x86` builds this lane's ESP under the lane's own env (its
+# PACKAGE_ONLY builder run derives the same features, so test_x86_64 boots the same kernel bytes; UNAOS_BOOTLIST_STAGE has
+# already put the lane list on it; UNAOS_NOSRC call-scoped: no SRC.TGZ on a lane card), and the ONE card builder
+# `esp_x86_unafs_card` lays the card over it (`--lba 4096` under UNAOS_NVME_4K). The card is moved to a lane name (a knob
+# kernel never sits at the media card's path) and rides the NVMe through UNAOS_NVME_DISK (the builder attaches a fresh copy):
+# the one disk carrying this kernel, so `/` binds `src=nvme`. ZENBOOKLANE-CARDCOST (the seat's MEASURE condition): the card
+# builder is stubbed for the esp_x86 call (test_zenbook's build_selfbuild_x86 idiom) and run only when the stamp beside the
+# lane card (the kernel.elf sha256 it was laid from + the LBA size) differs from this build's, so repeated runs lay it once.
+zenbook_unafs_root() {
+    local card="${WORKSPACE_DIR}/target/zenbook-lane-card.img" laid="${WORKSPACE_DIR}/target/unaos-x86-card.img" real want how
+    real="$(declare -f esp_x86_unafs_card)"; esp_x86_unafs_card() { echo "   UNAFSLANEQEMU: card step deferred to zenbook_unafs_root (the stamp decides reuse or a fresh lay)"; }
+    UNAOS_NOSRC=1 esp_x86; eval "$real"
+    want="$(sha256_of "${WORKSPACE_DIR}/target/x86_64_esp/kernel.elf") lba=$([ -n "${UNAOS_NVME_4K:-}" ] && echo 4096 || echo 512)"
+    if [ -n "${want%% *}" ] && [ -f "$card" ] && [ "$(cat "${card}.sha" 2>/dev/null)" = "$want" ]; then how="reuse"; else   # no sha (no hash tool) is never a reuse
+        rm -f "$card" "${card}.sha"; esp_x86_unafs_card || exit $?
+        [ -f "$laid" ] || { echo -e "${COLOR_RED}✖ UNAFSLANEQEMU: esp_x86_unafs_card left no card at ${laid#${WORKSPACE_DIR}/} — the lane would have no native root. rc=1${COLOR_RESET}"; exit 1; }
+        mv "$laid" "$card" && printf '%s\n' "$want" > "${card}.sha" || exit 1; how="fresh lay"
+    fi
+    export UNAOS_NVME_DISK="$card"
+    echo -e "${COLOR_CYAN}⚡ UNAFSLANEQEMU: native root — ${how} nvme_disk=${card#${WORKSPACE_DIR}/} kernel=${want%% *} lba=${want##*lba=}${COLOR_RESET}"
+}
+
 # SPLASHGATE — the two splash witnesses are IN THE BOOTED ELF, counted, with both controls.
 #
 # THE SHAPE IS `banner_artifact_check`'s and the controls are the same pair, for its reason: a `grep`
@@ -10638,17 +10823,19 @@ banner_cert_arm() {   # banner_cert_arm <artifact>
 
 # BOOTLISTARM (rmbp-ledger B874, R132): ONE staging fn for the list every media verb carries — `esp-x86`, `esp-arm`,
 # `esp-jetson[-img]`, `kernel8`. It copies unaos/fixtures/TESTS.LIST (and TESTS.HEAVY) VERBATIM into the boot FAT tree:
-# one list for every board; a line's `@<board>` tags (rmbp12 / pi4 / orin = the kernel's `boot::OLDEST`) are filtered by
+# one list for every board; a line's `@<board>` tags (rmbp12 / pi4 / orin / zenbook = the board `boot::oldest()` answers, ZENBOOKOLDEST Z12) are filtered by
 # the kernel's `bootlist::parse`, so a card copy edited by hand reads the same everywhere (grammar: PLAYBOOK §4 item 7).
 # Each verb calls it BEFORE its card image is built from the tree. It stages only when a MEDIA dispatch arm set
 # `_BOOTLIST_MEDIA=1` (a shell variable, not a UNAOS_ knob): the QEMU lanes that reuse these fns (test_fat, test_selfhost,
-# fat_img, run_kernel8, test_kernel8, install_pi) never carry a list.
+# fat_img, run_kernel8, test_kernel8, install_pi) never carry a list. ZENBOOKLANELIST (zenbook-ledger Z19): an optional $2 names the
+# source dir (default unaos/fixtures, what every media verb passes by passing nothing); `test-zenbook` stages its own lane list
+# through it (`zenbook_bootlist_carry`) and the builder carries that onto the ESP it re-creates (UNAOS_BOOTLIST_STAGE).
 bootlist_stage() {
     [ "${_BOOTLIST_MEDIA:-}" = "1" ] || return 0
-    local dir="$1" _bl
+    local dir="$1" src="${2:-${WORKSPACE_DIR}/fixtures}" _bl
     for _bl in TESTS.LIST TESTS.HEAVY; do
-        if [ -f "${WORKSPACE_DIR}/fixtures/${_bl}" ]; then
-            cp "${WORKSPACE_DIR}/fixtures/${_bl}" "${dir}/${_bl}" && echo "   BOOTLIST (B817/B874): staged ${_bl} onto ${dir#${WORKSPACE_DIR}/} (the kernel runs it at [desktop] built; @board lines filtered there)"
+        if [ -f "${src}/${_bl}" ]; then
+            cp "${src}/${_bl}" "${dir}/${_bl}" && echo "   BOOTLIST (B817/B874): staged ${_bl} onto ${dir#${WORKSPACE_DIR}/} (the kernel runs it at [desktop] built; @board lines filtered there)"
         fi
     done
 }
@@ -10755,7 +10942,7 @@ stage_jetson_el0_images() {
             build_user_aether_aarch64
             cp "${WORKSPACE_DIR}/target/AETHER.ELF" "${APPS_DIR_ARM}/AETHER.ELF"
             staged=$((staged + 1))
-            mkdir -p "${ESP_DIR_ARM}/system/doc" && cp "${WORKSPACE_DIR}"/crates/user-aether/doc/*.html "${ESP_DIR_ARM}/system/doc/"
+            mkdir -p "${ESP_DIR_ARM}/system/doc" && cp "${WORKSPACE_DIR}"/crates/user-aether/doc/*.html "${WORKSPACE_DIR}"/crates/user-aether/doc/*.pdf "${ESP_DIR_ARM}/system/doc/"  # PDF4KERNEL (B999): + doc/*.pdf
             ;;
     esac
     # STRIAMETAL (SR139): STRIA.ELF under `stria`, and the clip `tests stria` plays (builder/testf.list's TEST.WEBM, the
@@ -10879,7 +11066,7 @@ esp_jetson() {
         esac
     fi
     echo -e "${COLOR_YELLOW}⚡ kernel features (jetson): ${_feats%,}${COLOR_RESET}"
-    local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
+    local TOOLBIN; TOOLBIN="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | awk '/host/{print $2}')/bin"
     # JETSON-EL0 (M1b): an ARMED jetson image compiles `arch/aarch64/syscall.rs`, which
     # `include_bytes!`es `target/user_blob.bin` (the el0-hello payload). That file is produced by
     # `build_user_blob`, which until this arc ran ONLY from the Pi `kernel8` path — so a first
@@ -11375,9 +11562,9 @@ k8_lock_acquire() {
     mkdir -p "${WORKSPACE_DIR}/target"
     while ! mkdir "$K8_LOCKDIR" 2>/dev/null; do
         holder=$(cat "$K8_LOCKDIR/pid" 2>/dev/null || echo "")
-        # BSD stat first, GNU stat second — the `|| echo 0` fallback alone would make every
-        # contended wait on Linux read age=huge and false-reclaim a live holder's lock
-        mtime=$(stat -f %m "$K8_LOCKDIR" 2>/dev/null || stat -c %Y "$K8_LOCKDIR" 2>/dev/null || echo 0)
+        # K8LOCK-STAT (B1023): GNU stat first, BSD second (_fsize's order) — GNU `stat -f` is the FILESYSTEM mode, prints `?` for
+        # %m and exits 0, so the BSD-first order read mtime=? on Linux; `|| echo 0` alone would read age=huge and false-reclaim
+        mtime=$(stat -c %Y "$K8_LOCKDIR" 2>/dev/null || stat -f %m "$K8_LOCKDIR" 2>/dev/null || echo 0)
         now=$(date +%s); age=$(( now - mtime ))
         if [ -n "$holder" ] && ! kill -0 "$holder" 2>/dev/null; then
             echo -e "${COLOR_YELLOW}kernel8: stale build lock reclaimed — holder PID $holder dead (age ${age}s)${COLOR_RESET}" >&2
@@ -11423,13 +11610,13 @@ k8_lock_acquire() {
 # artifact lands under `<target-dir>/aarch64-base/release/`.
 build_one_vug_aarch64() {
     local out="$1" feats="$2"
-    local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
+    local TOOLBIN; TOOLBIN="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | awk '/host/{print $2}')/bin"
     echo -e "${COLOR_YELLOW}⚡ Building EL0 mini-vug static-ELF program (crates/user-vug${feats:+ [$feats]} → target/${out})...${COLOR_RESET}"
     mkdir -p "${WORKSPACE_DIR}/target"
     cd "$WORKSPACE_DIR/crates/user-vug"
     local tdir="${WORKSPACE_DIR}/crates/user-vug/target/arm${feats:+-$feats}"
     RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-vug/user-vug.ld -C link-arg=-z -C link-arg=max-page-size=0x1000" \
-      cargo +nightly build --release -Z json-target-spec --target-dir "$tdir" ${feats:+--features "$feats"}
+      cargo build --release -Z json-target-spec --target-dir "$tdir" ${feats:+--features "$feats"}
     cd "$WORKSPACE_DIR"
     "$TOOLBIN/llvm-objcopy" --strip-all \
       "${tdir}/aarch64-base/release/user-vug" \
@@ -11520,12 +11707,12 @@ build_user_blob() {
     # own .cargo/config.toml; it is its own workspace. Since TEGRAEL0LEG, `./arroyo check` DOES
     # build the blob once per fresh tree (`ensure_user_blob`) and armed aarch64 runnable images
     # rebuild it unconditionally (BLOBATOMIC); validation runs here, on every build, pre-landing.)
-    local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
+    local TOOLBIN; TOOLBIN="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | awk '/host/{print $2}')/bin"
     echo -e "${COLOR_YELLOW}⚡ Building EL0 user blob (crates/user-blob → target/user_blob.bin)...${COLOR_RESET}"
     mkdir -p "${WORKSPACE_DIR}/target"
     cd "$WORKSPACE_DIR/crates/user-blob"
     RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-blob/user-blob.ld" \
-      cargo +nightly build --release -Z json-target-spec
+      cargo build --release -Z json-target-spec
     cd "$WORKSPACE_DIR"
     # BLOBATOMIC (2026-08-21, peer-ruled): objcopy to a temp name and validate BEFORE the artifact
     # lands, then mv (atomic on one filesystem) — an interrupted build can no longer leave a
@@ -11574,7 +11761,7 @@ build_user_el0_elf_images() {
     echo -e "${COLOR_YELLOW}⚡ Building EL0 static-ELF program (crates/user-elf → target/ELFHELLO.ELF)...${COLOR_RESET}"
     cd "$WORKSPACE_DIR/crates/user-elf"
     RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-elf/user-elf.ld -C link-arg=-z -C link-arg=max-page-size=0x1000" \
-      cargo +nightly build --release -Z json-target-spec
+      cargo build --release -Z json-target-spec
     cd "$WORKSPACE_DIR"
     mkdir -p "${WORKSPACE_DIR}/target"   # a fresh worktree has no target/ yet — two executors hit this 2026-08-25
     "$TOOLBIN/llvm-objcopy" --strip-all \
@@ -11613,7 +11800,7 @@ build_user_el0_elf_images() {
     echo -e "${COLOR_YELLOW}⚡ Building EL0 KERNEL-VUG static-ELF program (crates/user-vug [kvug] → target/VUGK.ELF)...${COLOR_RESET}"
     cd "$WORKSPACE_DIR/crates/user-vug"
     RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-vug/user-vug.ld -C link-arg=-z -C link-arg=max-page-size=0x1000" \
-      cargo +nightly build --release -Z json-target-spec --features kvug \
+      cargo build --release -Z json-target-spec --features kvug \
       --target-dir "${WORKSPACE_DIR}/crates/user-vug/target/a64-kvug"
     cd "$WORKSPACE_DIR"
     "$TOOLBIN/llvm-objcopy" --strip-all \
@@ -11639,7 +11826,7 @@ build_user_el0_elf_images() {
     echo -e "${COLOR_YELLOW}⚡ Building EL0 persistence static-ELF program (crates/user-stat → target/STAT.ELF)...${COLOR_RESET}"
     cd "$WORKSPACE_DIR/crates/user-stat"
     RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-stat/user-stat.ld -C link-arg=-z -C link-arg=max-page-size=0x1000" \
-      cargo +nightly build --release -Z json-target-spec
+      cargo build --release -Z json-target-spec
     cd "$WORKSPACE_DIR"
     "$TOOLBIN/llvm-objcopy" --strip-all \
       "${WORKSPACE_DIR}/crates/user-stat/target/aarch64-base/release/user-stat" \
@@ -11665,7 +11852,7 @@ build_user_el0_elf_images() {
     echo -e "${COLOR_YELLOW}⚡ Building EL0 cpu-pulse static-ELF program (crates/user-pulse → target/PULSE.ELF)...${COLOR_RESET}"
     cd "$WORKSPACE_DIR/crates/user-pulse"
     RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-pulse/user-pulse.ld -C link-arg=-z -C link-arg=max-page-size=0x1000" \
-      cargo +nightly build --release -Z json-target-spec
+      cargo build --release -Z json-target-spec
     cd "$WORKSPACE_DIR"
     "$TOOLBIN/llvm-objcopy" --strip-all \
       "${WORKSPACE_DIR}/crates/user-pulse/target/aarch64-base/release/user-pulse" \
@@ -11680,7 +11867,7 @@ build_user_el0_elf_images() {
 
 kernel8() {
     k8_lock_acquire
-    local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
+    local TOOLBIN; TOOLBIN="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | awk '/host/{print $2}')/bin"
 
     # The hello blob, unconditionally (a kernel8 image must never carry a stale routine). The same
     # `cargo build --release` this runs also links the other [[bin]]s of the crate, which the K2 and
@@ -12692,7 +12879,7 @@ kernel8() {
     echo -e "${COLOR_YELLOW}⚡ Building bare-metal kernel8.img (Pi 4, microSD-slot boot)...${COLOR_RESET}"
     cd "$WORKSPACE_DIR/crates/kernel"
     RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/kernel/pi-baremetal.ld" \
-      cargo +nightly build --release --target ../../aarch64-base.json \
+      cargo build --release --target ../../aarch64-base.json \
       $NIGHTLY_FLAGS --features "$K8_FEATS"
     cd "$WORKSPACE_DIR"
 
@@ -13194,7 +13381,7 @@ test_kernel8() {
         # business reporting "the bare name did not launch" — the typist had nothing to type at.
         # So a non-PASS base verdict short-circuits and is returned unchanged; the typed spec is
         # only ever consulted on a capture the base spec already called complete and clean.
-        if [ -n "$k8_script" ] && [ "$mrc" -eq 0 ]; then
+        if [ -n "$k8_script" ] && [ "$mrc" -eq 0 ] && [ "$k8_spec" != "$PI4_DESKTOP_SPEC" ]; then   # PIDESKQEMULIST (B894): the desk lane's typed spec IS pi4-desktop.spec — k8_desk_replay below asserts it once
             if [ ! -f "$k8_spec" ]; then
                 echo -e "${COLOR_RED}✖ kernel8-test: typed mode armed but ${k8_spec} is missing — nothing gates the typing.${COLOR_RESET}"
                 return 2
@@ -14010,7 +14197,7 @@ battery() {
 #
 # THE ENV FORM (`./arroyo knoboff env NAME=VAL[,NAME=VAL...] [baseline-ref]`, PANELKNOB2 rmbp-ledger B867). A
 # cargo feature is not the only knob: `UNAOS_PPI` (video/dpi.rs `mod panelknob`) and `UNAOS_FBW`/`UNAOS_FBH`
-# (crates/bootloader `mod panelknob`, arch/aarch64/mailbox.rs) are `option_env!` reads, so no feature set names
+# (crates/bootloader `mod panelknob`, arch/aarch64/mailbox.rs) and `UNAOS_GOP` (crates/bootloader `mod gopsel`) are `option_env!` reads, so no feature set names
 # them and the form above has nothing to remove. THE RULE for such a knob: the images built with it UNSET equal
 # the baseline's (the classic claim), an EMPTY value (`NAME=`) builds the same bytes as UNSET (every parser here
 # folds `Some("")` to off, and arroyo's own `[ -n "${UNAOS_X:-}" ]` reads empty as unset), and SET moves at least
@@ -14046,7 +14233,7 @@ _knoboff_arm_csv() {
 _knoboff_flat() {
     local _tree="$1" _tgt="$2" _arch="$3" _feats="$4" _out="$5" _log="$6" _census="${7:-}"
     local _tspec _elf _TOOLBIN _rc=0 _crate=kernel _uefi=0
-    _TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
+    _TOOLBIN="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | awk '/host/{print $2}')/bin"
     case "$_arch" in
         x86) _tspec="../../x86_64-unaos.json"; _elf="$_tgt/x86_64-unaos/release/unaos-kernel" ;;
         arm) _tspec="../../aarch64-unaos.json"; _elf="$_tgt/aarch64-unaos/release/unaos-kernel" ;;
@@ -14061,7 +14248,7 @@ _knoboff_flat() {
     local _step="${_log}.step"
     : > "$_step"
     ( cd "$_tree/unaos/crates/$_crate" \
-      && CARGO_TARGET_DIR="$_tgt" cargo +nightly build --release \
+      && CARGO_TARGET_DIR="$_tgt" cargo build --release \
          --target "$_tspec" $_zflags $_fargs ) >"$_step" 2>&1 || _rc=1
     if [ -n "$_census" ]; then
         awk '$1 == "Compiling" { print $2 }' "$_step" | sort -u | paste -sd, - > "$_census"
@@ -14754,7 +14941,7 @@ jobs_image() {
 # plants GATEREVIEW's table proved each gate catches) in a scratch copy of the tree, runs that gate through
 # `_gates_one` there, and needs a non-zero rc whose log names the plant. Witness (host):
 #   GATEPATH selftest: plants=<n> caught=<n> -> PASS
-GATES_SET="charter:unaos/scripts/charter-check.sh arch:unaos/scripts/arch-check.py attrkeys:unaos/scripts/attrkeys-check.py status:tools/status-check.py prefs:tools/prefs-schema-check.py appearance:unaos/scripts/appearance-check.py deps:tools/deps-audit/run.py knob:unaos/scripts/knob-hygiene.sh verbs:unaos/scripts/verb-roots.sh banner:unaos/scripts/banner-cert.sh k8reach:unaos/scripts/k8-reach.py sanity:unaos/scripts/sanity-legs.py image-line:unaos/scripts/knob-parity.sh knob-parity-orin:unaos/scripts/knob-parity.sh knob-parity-pi:unaos/scripts/knob-parity.sh mbench-selftest:unaos/scripts/mbench.py specscore:unaos/scripts/orin-specscore.py blueprint:unaos/scripts/blueprint-check.py nonet:unaos/scripts/nonet-check.py nonetreach:unaos/scripts/nonet-reach.py neutral:tools/neutral-check.py firmware:tools/firmware-census.py locktype:unaos/scripts/lock-type.py"
+GATES_SET="charter:unaos/scripts/charter-check.sh arch:unaos/scripts/arch-check.py attrkeys:unaos/scripts/attrkeys-check.py status:tools/status-check.py prefs:tools/prefs-schema-check.py appearance:unaos/scripts/appearance-check.py deps:tools/deps-audit/run.py knob:unaos/scripts/knob-hygiene.sh verbs:unaos/scripts/verb-roots.sh banner:unaos/scripts/banner-cert.sh k8reach:unaos/scripts/k8-reach.py sanity:unaos/scripts/sanity-legs.py image-line:unaos/scripts/knob-parity.sh knob-parity-orin:unaos/scripts/knob-parity.sh knob-parity-pi:unaos/scripts/knob-parity.sh mbench-selftest:unaos/scripts/mbench.py specscore:unaos/scripts/orin-specscore.py blueprint:unaos/scripts/blueprint-check.py nonet:unaos/scripts/nonet-check.py nonetreach:unaos/scripts/nonet-reach.py neutral:tools/neutral-check.py firmware:tools/firmware-census.py locktype:unaos/scripts/lock-type.py knob-parity-zenbook:unaos/scripts/knob-parity.sh speccov:unaos/scripts/spec-coverage.sh"
 # NEUTRAL (SR166 GATENEUTRAL, BP-shape-4, R16): no board name (orin/rmbp/pi4/jetson/tegra word parts) in an identifier or a
 # string of a shared kernel file (crates/kernel/src minus arch/); comments, `feature = "…"` gates, arch board-module paths
 # and ledger/round citations excepted; the ruled exceptions are tools/neutral.allow, one row + reason each, shrink-only.
@@ -14763,6 +14950,11 @@ GATES_SET="charter:unaos/scripts/charter-check.sh arch:unaos/scripts/arch-check.
 # LOCKTYPE (SR188 GATELOCKTYPE, BP-cores-20, B414/B823): every kernel spin lock is crate::sync::Mutex (the registry names it by
 # its site); a raw spin::Mutex / MutexGuard / spin::mutex::* / spin::RwLock* in the code of crates/kernel/src reds, save the
 # registry's own inner lock in sync.rs (exact path+line rows in the script, shrink-only); spin::Once and spin::Spin pass.
+# SPECCOV (zenbook-ledger Z58 SPECCOVERAGE, BP-gates-15): every `:: TAG: … ->` verdict a typed lane's verbs print (verb -> its
+# register/defer fn -> that fn's same-file callee closure; tags by witness-owners.py's SITE, bodies by neutral-check.py's lex)
+# is named by a REQUIRE/OPTIONAL/FORBID/PENDING/COMPLETE/COUNT of the lane's spec or skipped there by `# COVERAGE-SKIP TAG why`;
+# the lanes are the SPEC-COVERAGE markers in this file's comments (test-zenbook's typist loop, kernel8-test --desk), each
+# held equal to its line's own verb list (spec-coverage.sh; marker-drift is rc 1, a broken resolver or control rc 2).
 # BLUEPRINT (2026-10-19, Peter: "a set of blueprints … a front-side gate"): docs/dev/blueprint/ sheets — every anchor
 # exists at its line, BP-ids unique and stem-named, every sheet listed and ≤ 120 lines, no claim words (blueprint-check.py).
 # NONET (B672, BP-bar-10): no fn reachable from the video/ furniture (menubar, dock, crystal, notify, strip, settings,
@@ -14786,6 +14978,7 @@ _gates_one() { # $1 = repo root, $2 = gate name, $3 = log; prints the summary li
         image-line) e=(--line "$R/unaos/scripts/image-line.env") ;;   # FOLDBUILD (B517): the image build line's file against arroyo's knob map and the builder's
         knob-parity-orin) e=(--line "$R/unaos/scripts/image-line-orin.env" --board orin) ;;   # ARMPARITY: the Orin line against esp_jetson's top-level map, Cargo, banner-cert; shared knobs also against the x86 maps
         knob-parity-pi)   e=(--line "$R/unaos/scripts/image-line-pi.env" --board pi) ;;       # ARMPARITY: the Pi line against kernel8()'s K8_FEATS arms, Cargo, banner-cert, k8-reach; shared knobs also against the x86 maps
+        knob-parity-zenbook) e=(--line "$R/unaos/scripts/image-line-zenbook.env") ;;   # ZENBOOKLANE (zenbook-ledger Z13): LINEGATE — the Zenbook line (every knob x86) against arroyo's knob map and the builder's, the x86 `--line` mode
         mbench-selftest|specscore) e=(--self-test) ;;   # TOOLING1: the scorers' own self-tests (see GATES_SET)
         blueprint) e=("$R") ;;   # BLUEPRINT: the repo root (the sheets are docs/dev/blueprint/, the anchors are tree paths)
         nonet) e=("$R/unaos") ;;   # NONET (B672): the unaos dir (the walk reads crates/kernel/src)
@@ -14820,6 +15013,7 @@ _gates_plant() { # $1 = scratch repo root, $2 = gate: plants the defect, prints 
         image-line) printf 'export UNAOS_ZZGATEPLANT=1  # GATEPATH plant: a knob no map names\n' >> "$C/unaos/scripts/image-line.env"; echo ZZGATEPLANT ;; # FOLDBUILD (B517); no restore is owed: no later gate reads image-line.env
         knob-parity-orin) printf 'export UNAOS_ZZGATEPLANT=1  # GATEPATH plant: a knob no map names\n' >> "$C/unaos/scripts/image-line-orin.env"; echo ZZGATEPLANT ;; # ARMPARITY; no later gate reads image-line-orin.env
         knob-parity-pi)   printf 'export UNAOS_ZZGATEPLANT=1  # GATEPATH plant: a knob no map names\n' >> "$C/unaos/scripts/image-line-pi.env"; echo ZZGATEPLANT ;;   # ARMPARITY; no later gate reads image-line-pi.env
+        knob-parity-zenbook) printf 'export UNAOS_ZZGATEPLANT=1  # GATEPATH plant: a knob no map names\n' >> "$C/unaos/scripts/image-line-zenbook.env"; echo ZZGATEPLANT ;;   # ZENBOOKLANE (Z13); no later gate reads image-line-zenbook.env
         mbench-selftest) sed -i 's/, r"-> FLICKER"\]/]/' "$C/unaos/scripts/mbench.py"; echo "SELF-TEST FAIL" ;; # TOOLING1: a default FORBID dropped from DEFAULT_FORBIDS — every spec silently stops forbidding it (renaming RC_TRUNCATED was tried first and MISSED: the self-test compares against the constant, so it moves with it)
         specscore)  sed -i 's/^    return DEAD, (f"the only site/    return WIRE, (f"the only site/' "$C/unaos/scripts/orin-specscore.py"; echo "SPECSCORE SELF-TEST FAIL" ;; # TOOLING1: a compiled-out emitter read as reachable — the coverage lie the tool exists to catch
         blueprint)  mkdir -p "$C/docs/dev/blueprint" && printf '| BP-zzgateplant-1 | plant | `unaos/zz_gateplant_nowhere.rs` | - |\n' > "$C/docs/dev/blueprint/zzgateplant.md"; echo zz_gateplant_nowhere ;; # BLUEPRINT: a sheet citing a file that is not in the tree
@@ -14828,6 +15022,7 @@ _gates_plant() { # $1 = scratch repo root, $2 = gate: plants the defect, prints 
         neutral)    printf 'pub fn orinzzgateplant() {}\n' > "$K/video/zz_gateplant_neutral.rs"; echo zz_gateplant_neutral ;; # NEUTRAL (SR166): a board-named fn in a shared file with no allowlist row
         firmware)   printf '\177ELF\000\000zzgateplant' > "$C/unaos/firmware/zz_gateplant.bin"; echo zz_gateplant.bin ;; # FIRMWARE (SR166): a binary blob committed under unaos/firmware (R52)
         locktype)   printf 'pub static P: spin::Mutex<u8> = spin::Mutex::new(0);\n' > "$K/video/zz_gateplant_locktype.rs"; echo zz_gateplant_locktype ;; # LOCKTYPE (SR188): a raw spin::Mutex static outside sync.rs (the 38 LOCKREG2 swept)
+        speccov)    printf 'COMPLETE :: ZZGATEPLANT: nothing ::\n' > "$C/unaos/scripts/specs/zz_gateplant.spec" && printf '# for v in platform:PLATFORM; do :; done # SPEC-%s: zz_gateplant.spec platform\n' COVERAGE >> "$C/unaos/arroyo"; echo zz_gateplant.spec ;; # SPECCOV (Z58): a marked lane whose spec scores none of its verb's verdicts (PLATFORM unscored; the planted comment carries its own `for v in` list, so it is no marker-drift); arroyo is restored from the selftest's backup, the planted spec is read by no later gate (speccov is the set's last row)
         *) return 1 ;;
     esac
 }
@@ -14877,6 +15072,148 @@ gates_selftest() {
     rm -rf "$C.bak"
     echo "GATEPATH selftest: plants=${plants} caught=${caught} -> $([ "$caught" -eq "$plants" ] && echo PASS || echo FAIL)"
     [ "$caught" -eq "$plants" ]
+}
+
+# FWSTAGE (ZENBOOKMT7925, zenbook-ledger Z5): ONE pinned firmware-set stager for the ESP (R52, R99, R119). Its callers are
+# WIFI-FW, MT7925-FW and KEPLER-FW in esp_x86_unafs_card (FWSTAGEONE, rmbp-ledger B984, moved the WIFI-FW and KEPLER-FW bodies
+# onto it). Usage: fw_stage_pinned <TAG> <src dir> <env name> <esp tree> <esp subdir> <pins file under firmware/> <file:role>...
+# An empty <src dir> stages nothing (the image byte-identical); a relative path, or a member missing or unreadable, FAILS LOUDLY
+# naming it; otherwise the members are copied into a fresh target/<tag lowercased> (fw_stage_unafs reads it) and from there onto
+# the ESP at <esp subdir>/ (bench-only, never in-tree), each digest is printed with a ready-to-paste pin row, and the set is
+# compared with the pins file (-> MATCH / UNPINNED / MISMATCH).
+fw_stage_pinned() {
+    local tag="$1" src="$2" envn="$3" esp="$4" sub="$5" pins="$6"; shift 6
+    [ -n "$src" ] || return 0
+    case "$src" in /*) ;; *) echo -e "${COLOR_RED}❌ ${tag}: ${envn} must be absolute: ${src}${COLOR_RESET}"; return 1;; esac
+    local m f role sum bytes pinned state="MATCH"
+    for m in "$@"; do
+        f="${m%%:*}"
+        [ -r "${src}/${f}" ] || { echo -e "${COLOR_RED}❌ ${tag}: ${src}/${f} missing or unreadable — no card image${COLOR_RESET}"; return 1; }
+    done
+    local stage; stage="${WORKSPACE_DIR}/target/$(printf '%s' "$tag" | tr '[:upper:]' '[:lower:]')"
+    rm -rf "$stage"; mkdir -p "$stage" "${esp}/${sub}" || { echo -e "${COLOR_RED}❌ ${tag}: making target/${stage##*/} or ${sub}/ on the ESP tree failed — no card image${COLOR_RESET}"; return 1; }
+    for m in "$@"; do
+        f="${m%%:*}"
+        cp "${src}/${f}" "$stage/" && cp "$stage/${f}" "${esp}/${sub}/" || { echo -e "${COLOR_RED}❌ ${tag}: copying ${f} onto the ESP tree at ${sub}/ failed — no card image${COLOR_RESET}"; return 1; }
+    done
+    echo -e "${COLOR_YELLOW}⚡ ${tag}: $# files from ${src} onto the ESP at ${sub}/ (${envn}; bench-only, never in-tree)${COLOR_RESET}"
+    for m in "$@"; do
+        f="${m%%:*}"; role="${m##*:}"
+        sum=$(sha256_of "${src}/${f}")
+        bytes=$(_fsize "${src}/${f}")
+        echo -e "${COLOR_YELLOW}⚡ ${tag}: ${f} sha256=${sum} bytes=${bytes} pin-row: ${role} ${sum}${COLOR_RESET}"
+        pinned=$(awk -v r="$role" '$1==r && NF==2 {print tolower($2)}' "${WORKSPACE_DIR}/firmware/${pins}" 2>/dev/null | head -1)
+        if [ -z "$pinned" ]; then [ "$state" = "MATCH" ] && state="UNPINNED"
+        elif [ "$pinned" != "$sum" ]; then state="MISMATCH"; fi
+    done
+    echo -e "${COLOR_YELLOW}⚡ ${tag}: firmware/${pins} vs the staged set -> ${state} (the kernel accepts only a pinned match; UNPINNED/MISMATCH read unpinned/mismatch on its wire)${COLOR_RESET}"
+}
+
+# FWSTAGEONE (rmbp-ledger B984): the UnaFS leg of a pinned set — the WIFI-FW set also lands on the card's UnaFS root, where the
+# kernel's WIFI-1 pass searches /FIRMWARE/. Usage: fw_stage_unafs <TAG> <src dir> <unafs image> <unafs dir>; run after
+# fw_stage_pinned with the same TAG and src, it puts target/<tag lowercased> (the fresh staged set) as ONE DIRECTORY source (the
+# single-file `put` refuses an existing name; the directory form lands the contents in <unafs dir>, made with its parents, and
+# REPLACES what is there — tools/unafs put, ROOTDISK2). An empty <src dir> stages nothing.
+fw_stage_unafs() {
+    local tag="$1" src="$2" img="$3" dir="$4"; local ltag; ltag="$(printf '%s' "$tag" | tr '[:upper:]' '[:lower:]')"
+    [ -n "$src" ] || return 0
+    cargo run -q --manifest-path "${WORKSPACE_DIR}/../tools/unafs/Cargo.toml" -- put "${WORKSPACE_DIR}/target/${ltag}" "$dir" -i "$img" >/dev/null || {
+        echo -e "${COLOR_RED}❌ ${tag}: tools/unafs put target/${ltag} -> ${dir} failed — no card image${COLOR_RESET}"; return 1; }
+    echo -e "${COLOR_YELLOW}⚡ ${tag}: target/${ltag} onto the UnaFS root at ${dir}/ (bench-only, never in-tree)${COLOR_RESET}"
+}
+
+# ARROYOMAC (rmbp-ledger B1011): the host-portable helpers, so a macOS bench builds the flight image (`esp-x86`) without
+# shims. GNU FIRST, BSD second: GNU `stat -f` is the FILESYSTEM mode, prints `?` for `%z` and exits 0, so the BSD form tried
+# first never falls through on Linux (media-writer.sh's order; make-pi-img.sh switches on `uname -s`). The sha256 mechanism is
+# `sha256_of` (above, Real-hardware boot media); `sha512_of` is its shape. `_ncpu` is for the self-host fixture builds (LNXCROSS).
+_fsize() { stat -c %s "$1" 2>/dev/null || stat -f %z "$1"; }
+_ncpu() { nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4; }
+sha512_of() {
+    if command -v shasum >/dev/null 2>&1; then shasum -a 512 "$1" | awk '{print $1}'
+    elif command -v sha512sum >/dev/null 2>&1; then sha512sum "$1" | awk '{print $1}'
+    else echo ""; fi
+}
+# TOOLCHAIN-ONE (B1018): rust-toolchain.toml (repo root) is THE one pin. Nothing here passes `+<toolchain>`; `_toml_channel`
+# is the ONE reader of the file (prints `channel`, or with arg `components` the comma-joined list), and its channel is
+# exported as RUSTUP_TOOLCHAIN once at load, so the sysroot/TOOLBIN reads that run in the CALLER's cwd (before any cd, maybe
+# outside the tree, where rustup would fall back to its default) and the builder's child cargo resolve the same toolchain.
+_toml_channel() {
+    awk -v want="${1:-channel}" -F'=' '
+        $1 ~ "^[ \t]*" want "[ \t]*$" { v=$2; sub(/#.*/, "", v); gsub(/[][" \t]/, "", v); print v; exit }
+    ' "$WORKSPACE_DIR/../rust-toolchain.toml" 2>/dev/null
+}
+_tc="$(_toml_channel || true)"; [ -n "$_tc" ] && export RUSTUP_TOOLCHAIN="$_tc"   # TOOLCHAINONE (B1018): the toml's channel, every rustup proxy below
+# The floor is checked on the toml's toolchain (`rustc -V`): its commit date (YYYY-MM-DD, compared as a string — no `date -d`)
+# must be >= the oldest nightly the flights build on. A stale or absent toolchain (flight 38's Mac had a March one) is refused
+# here, not as a compile error deep in a crate; the remedy installs the pinned channel with the toml's components.
+_rustc_floor() {
+    local floor="2026-08-31" have fix
+    fix="rustup toolchain install $(_toml_channel) --component $(_toml_channel components)"
+    have="$(rustc -V 2>/dev/null | awk '{d=$NF; gsub(/[()]/, "", d); print d}')"
+    case "$have" in
+        [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) ;;
+        *) echo -e "${COLOR_RED}❌ TOOLCHAIN: no dated \`rustc -V\` on this host — run: ${fix} (B1018)${COLOR_RESET}"; return 1 ;;
+    esac
+    if [[ "$have" < "$floor" ]]; then
+        echo -e "${COLOR_RED}❌ TOOLCHAIN: nightly ${have} is older than ${floor} — run: ${fix} (B1018)${COLOR_RESET}"; return 1
+    fi
+    return 0
+}
+
+
+# LNXCROSS (B1012, flight 38's medium gap): the Linux-target toolchain build_selfbuild_x86 and build_selfbuild4/5_x86 compile, link
+# and strip with. Linux host: gcc / strip — every argv byte-equal to the pre-LNXCROSS lines, so the staged .LNX files and the
+# `SELFBUILD1: sha256` lines are unchanged. Darwin host (a Mac bench): Apple clang cross-targets x86_64-unknown-linux-musl and links
+# through the Rust toolchain's own ld.lld wrapper (lib/rustlib/<host>/bin/gcc-ld/ld.lld; llvm-strip / llvm-ar from llvm-tools) — no
+# Homebrew. A Mac cannot RUN a Linux ELF, so each host proof is DEFERRED to the card's BOOTLIST row (said on its own line), and the
+# products whose build itself runs a Linux ELF on the host are refused by name: TCC.LNX + LIB (tinycc builds libtcc1.a with itself;
+# the LIB proof runs TCC.LNX: TCC-DARWIN-CROSS owed), PROBE.LNX (busybox links libc + libgcc through the gcc driver; no linux
+# builtins archive on a stock Mac: PROBE-DARWIN-CROSS owed). LLD.LNX, LIB/rust, LIB/dyn, LIB/rustc stay Linux-host products.
+_lnx_pick() {
+    [ -n "${_LNX_HOST:-}" ] && return 0
+    local tb why=""
+    if [ "$(uname -s)" = "Darwin" ]; then
+        _LNX_HOST=darwin
+        tb="$(rustc --print sysroot 2>/dev/null)/lib/rustlib/$(rustc -vV 2>/dev/null | awk '/host/{print $2}')/bin"
+        if [ -x "$tb/gcc-ld/ld.lld" ]; then _LNX_LD="$tb/gcc-ld/ld.lld"; else _LNX_LD="$(command -v ld.lld 2>/dev/null || echo ld.lld)"; fi
+        if [ -x "$tb/llvm-strip" ]; then _LNX_STRIP="$tb/llvm-strip"; else _LNX_STRIP="$(command -v llvm-strip 2>/dev/null || echo llvm-strip)"; fi
+        _LNX_CC="clang --target=x86_64-unknown-linux-musl -fuse-ld=lld --ld-path=$_LNX_LD"
+        _LNX_TOOLS=("AR=$tb/llvm-ar" "RANLIB=$tb/llvm-ar s")
+        if ! command -v clang >/dev/null 2>&1; then why="missing tool: clang (xcode-select --install)"
+        elif ! command -v "$_LNX_LD" >/dev/null 2>&1; then why="missing tool: ld.lld (the Rust toolchain's gcc-ld/ld.lld)"
+        elif ! command -v "$_LNX_STRIP" >/dev/null 2>&1 || [ ! -x "$tb/llvm-ar" ]; then why="missing tool: llvm-strip/llvm-ar (rustup component add llvm-tools)"; fi
+    else
+        _LNX_HOST=linux _LNX_CC=gcc _LNX_LD=gcc _LNX_STRIP=strip
+        _LNX_TOOLS=()
+        why="$(_sb_missing gcc strip || true)"
+    fi
+    _LNX_WHY="$why"
+    echo "   [selfbuild] host=$_LNX_HOST cc=${_LNX_CC%% *} ld=$_LNX_LD strip=$_LNX_STRIP -> ${why:+REFUSED why=}${why:-ok}"
+}
+_lnx_why() { # prints why the Linux-target toolchain is absent and succeeds; fails silently when it is present (linux: `_sb_missing gcc`)
+    if [ "${_LNX_HOST:-linux}" = "linux" ]; then _sb_missing gcc; return; fi
+    [ -n "${_LNX_WHY:-}" ] && { echo "$_LNX_WHY"; return 0; }; return 1
+}
+_lnx_kat() { # out src [extra flag…] — a freestanding static KAT (no libc, no libgcc): the ONE copy of the flag string
+    $_LNX_CC -static -nostdlib -fno-pie -no-pie -O1 -ffreestanding -fno-stack-protector -fno-builtin "${@:3}" -o "$1" "$2"
+}
+_lnx_strip() { "$_LNX_STRIP" "$@"; }
+_lnx_deferred() { # n product — linux: fails silently (the host proof runs as before); darwin: says the proof is the card's and succeeds
+    [ "${_LNX_HOST:-linux}" = "darwin" ] || return 1
+    echo "   SELFBUILD$1: $2 host proof deferred (host=darwin: a Linux ELF does not run here; the card's BOOTLIST row runs it)"
+}
+_lnx_hostruns() { # 1|probe — linux: succeeds; darwin: refuses the products whose BUILD runs a Linux ELF on the host, by name, and fails
+    [ "${_LNX_HOST:-linux}" = "darwin" ] || return 0
+    case "$1" in
+        1) _sb_skip 1 TCC.LNX "host=darwin: tinycc builds libtcc1.a with the fresh TCC.LNX and the LIB proof runs it (TCC-DARWIN-CROSS owed)"
+           [ -d "${WORKSPACE_DIR}/target/LIB" ] && { _sb_skip 3 LIB "needs TCC.LNX (host=darwin, TCC-DARWIN-CROSS owed)"; rm -rf "${WORKSPACE_DIR}/target/LIB"; } ;;
+        probe) _sb_skip 1 PROBE.LNX "host=darwin: busybox links libc + libgcc through the gcc driver (PROBE-DARWIN-CROSS owed)" ;;
+    esac
+    return 1
+}
+_lnx_cargoenv() { # darwin: the musl target's linker is the Rust toolchain's ld.lld (rustc infers the ld.lld flavour from its name); linux: no-op
+    [ "${_LNX_HOST:-linux}" = "darwin" ] && export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER="$_LNX_LD"
+    return 0
 }
 
 # --- Entry Point ---
@@ -14937,6 +15274,17 @@ case "${1:-}" in
     esp-x86|esp_x86)
         _BOOTLIST_MEDIA=1 esp_x86   # BOOTLIST (B817, R132) / BOOTLISTARM (B874): the media verb only arms `bootlist_stage` (inside esp_x86, before the card) — the QEMU lanes never stage a list
         ;;
+    esp-zenbook|esp_zenbook)
+        # ZENBOOKIMAGELINE (zenbook-ledger Z6): the Zenbook card IS esp-x86 built under scripts/image-line-zenbook.env.
+        # `_feats` was composed from the CALLER's env when this script loaded, and the builder arms any knob that merely
+        # EXISTS (`std::env::var(..).is_ok()`; UNAOS_IVB also builds the loader's entry traces), so every inherited
+        # UNAOS_* is UNSET first — bar the four bench values the line does not set — then the line is loaded and arroyo is
+        # re-entered as esp-x86, whose own banner names the line's features (the one above is the caller's).
+        _zk=""; for _zv in $(compgen -e); do case "$_zv" in UNAOS_MT7925_FW_PATH|UNAOS_GOP|UNAOS_NOSRC|UNAOS_X86_UNAFS_MB) ;; UNAOS_*) _zk="${_zk} ${_zv#UNAOS_}"; unset "$_zv" ;; esac; done
+        echo -e "${COLOR_CYAN}⚡ esp-zenbook: line=scripts/image-line-zenbook.env scrubbed=[${_zk# }] gop=${UNAOS_GOP:-auto}${COLOR_RESET}"
+        set -a; . "$WORKSPACE_DIR/scripts/image-line-zenbook.env" || exit 1; set +a
+        exec "$WORKSPACE_DIR/arroyo" esp-x86
+        ;;
     esp-arm|esp_arm)
         _BOOTLIST_MEDIA=1 esp_arm   # BOOTLISTARM (B874): the media verb arms the list
         ;;
@@ -14986,6 +15334,11 @@ case "${1:-}" in
         # entered twice per invocation. Fold-gate command, not a leg of `check`.
         test_splash "${2:-120}"
         ;;
+    test-zenbook|test_zenbook)
+        # ZENBOOKLANE (zenbook-ledger Z13): the Zenbook line under QEMU as zenbook_um5606w. Re-execs itself (see
+        # test_zenbook), so this arm is entered twice per invocation. Fold-gate command, not a leg of `check`.
+        test_zenbook "${2:-219}"   # UNAFSLANEQEMU (Z102): 219 s, the default beside test_zenbook's (213 + 5.57 s for the typed `tests unafs`). WIFILEAVEBUILD (Z75): 213 s, the default beside test_zenbook's (206 + 6.17 s for the typed `tests wifileave`: 4 s settle + 16 keys x 0.12 + 0.25 poll). MT7925S10 (Z55): 206 s, the default beside test_zenbook's (a dispatcher default of 200 would override it). ZENBOOKSPECPINS (Z54): 200 s, twelve typed verbs (+18.15 s measured from typist.sh). ZENBOOKLANETYPED (Z16): 180 s — the run now reaches the desktop and six typed verbs; FASTTEST ends it at COMPLETE
+        ;;
     kernel8|baremetal)
         _BOOTLIST_MEDIA=1 kernel8   # BOOTLISTARM (B874): the Pi card verb arms the list; kernel8-run/-test/-install never do
         ;;
@@ -14993,7 +15346,7 @@ case "${1:-}" in
         run_kernel8
         ;;
     kernel8-test|test-pi)
-        if [ "${2:-}" = "--desk" ]; then export UNAOS_PIDESK=1; set -- "$1" "${@:3}"; fi   # PIDESK-SPEC (B878): `./arroyo kernel8-test --desk 300` = UNAOS_PIDESK=1, scored by pi4-regression.spec then pi4-desktop.spec
+        if [ "${2:-}" = "--desk" ]; then export UNAOS_PIDESK=1; export UNAOS_K8_SCRIPT="${UNAOS_K8_SCRIPT-${WORKSPACE_DIR}/scripts/specs/pi4-desktop.inject}" UNAOS_K8_SPEC="${UNAOS_K8_SPEC:-${PI4_DESKTOP_SPEC}}"; set -- "$1" "${@:3}"; fi   # PIDESKQEMULIST (B894): the desk lane types `tests textscale` (specs/pi4-desktop.inject, `UNAOS_K8_SCRIPT=` opts out) and its typed spec is the desk spec, asserted once by k8_desk_replay. PIDESK-SPEC (B878): `./arroyo kernel8-test --desk 300` = UNAOS_PIDESK=1, scored by pi4-regression.spec then pi4-desktop.spec. SPECCOV (zenbook-ledger Z58): the desk lane's marker, equal to the inject's typed verbs — SPEC-COVERAGE: pi4-desktop.spec textscale
         test_kernel8 "${2:-60}"   # MBENCH-HONEST: 8 s never finished a pi4 boot — see test_kernel8
         ;;
     kernel8-install|install-pi)

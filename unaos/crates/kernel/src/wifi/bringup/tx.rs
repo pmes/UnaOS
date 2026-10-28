@@ -459,7 +459,7 @@ fn plcp(out: &mut [u8], octets: usize, rate: u8) {
 /// codec, no Link) writes a Duration. This divergence from b43 is deliberate: b43 `xmit.c:287` takes the fallback duration
 /// from `ieee80211_generic_frame_duration(fragment_len, fbrate)`, the whole fragment's airtime; we take the ACK's.
 fn txhdr(frame: &[u8], ch: u16, cookie: u16, r: TxRate) -> [u8; TXH_SIZE] {
-    let rate = r.rate;
+    let rate = r.rate; let fbr = fb_band(r, ch); // STATIONROAM-5G (B962): OFDM 6 on 5 GHz, else `fb_of`
     let mut h = [0u8; TXH_SIZE];
     let octets = frame.len() + FCS_LEN;
     let unicast = frame[4] & 0x01 == 0;
@@ -470,14 +470,14 @@ fn txhdr(frame: &[u8], ch: u16, cookie: u16, r: TxRate) -> [u8; TXH_SIZE] {
     let phy_ctl = (if ofdm { TXH_PHY_ENC_OFDM } else { TXH_PHY_ENC_CCK }) | TXH_PHY_ANT01AUTO | if short_ok(r) { TXH_PHY_SHORTPRMBL } else { 0 };
     h[TXH_PHY_CTL..TXH_PHY_CTL + 2].copy_from_slice(&phy_ctl.to_le_bytes());
     h[TXH_PHY_CTL1..TXH_PHY_CTL1 + 2].copy_from_slice(&phy_ctl1(if ratecode(rate).is_some() { rate } else { RATE_1M }).to_le_bytes());
-    h[TXH_PHY_CTL1_FB..TXH_PHY_CTL1_FB + 2].copy_from_slice(&phy_ctl1(RATE_1M).to_le_bytes());
+    h[TXH_PHY_CTL1_FB..TXH_PHY_CTL1_FB + 2].copy_from_slice(&phy_ctl1(fbr).to_le_bytes()); // STATIONROAM-5G (B962): a CCK fbr is BW_20 alone, as CCK 1's
     h[TXH_PHY_RATE] = rc;
-    h[TXH_EXTRA_FT] = TXH_EFT_FB_CCK;
+    h[TXH_EXTRA_FT] = if ch > 14 { TXH_EFT_FB_OFDM } else { TXH_EFT_FB_CCK }; // STATIONROAM-5G (B962): xmit.c:358-361
     h[TXH_CHAN_RADIO_CODE] = ch as u8;
     h[TXH_TX_RECEIVER..TXH_TX_RECEIVER + 6].copy_from_slice(&frame[4..10]);
-    plcp(&mut h[TXH_PLCP_FB..TXH_PLCP_FB + 6], octets, fb_of(r));
+    plcp(&mut h[TXH_PLCP_FB..TXH_PLCP_FB + 6], octets, fbr);
     let dur_fb = match duration(frame, r) {
-        Some(d) if d != 0 && rate != fb_of(r) => nav_us(TxRate::long(fb_of(r))).to_le_bytes(),
+        Some(d) if d != 0 && rate != fbr => nav_us(TxRate::long(fbr)).to_le_bytes(),
         Some(d) => d.to_le_bytes(),
         None => [frame[2], frame[3]],
     };
@@ -494,15 +494,10 @@ fn txhdr(frame: &[u8], ch: u16, cookie: u16, r: TxRate) -> [u8; TXH_SIZE] {
 /// MAC into the filter, the TX engine reset and its ring programmed (`dma.c:681-694`). Nothing is
 /// transmitted here; the engine has no descriptor to read until `fire` pokes `TXINDEX`.
 pub(super) fn prep(bar0: u64, mac: [u8; 6], w: &mut Writes) -> Result<Prep, String> {
-    let ring_l = core::alloc::Layout::from_size_align(RINGMEM, RINGMEM).ok();
-    let buf_l = core::alloc::Layout::from_size_align(BUF_BYTES, 4096).ok();
-    let (Some(rl), Some(bl)) = (ring_l, buf_l) else {
-        return Err(String::from("layout — nothing programmed"));
-    };
     // Deliberately never freed: the engine owns this memory until TXCTL reads DISABLED, and a failed
-    // reset would leave it owning it for the rest of the boot.
-    let ring = unsafe { alloc::alloc::alloc_zeroed(rl) } as u64;
-    let buf = unsafe { alloc::alloc::alloc_zeroed(bl) } as u64;
+    // reset would leave it owning it for the rest of the boot. DMAALLOCONE (B986): the one DMA allocator.
+    let ring = crate::arch::memory::dma::ident(RINGMEM, RINGMEM);
+    let buf = crate::arch::memory::dma::ident(BUF_BYTES, 4096);
     if ring == 0 || buf == 0 {
         return Err(String::from("no-memory — nothing programmed"));
     }
@@ -544,7 +539,7 @@ pub(super) fn fire(bar0: u64, p: &Prep, mac: [u8; 6], ch: u16, w: &mut Writes) -
 /// `TXSTAT_WAIT_MS` and the entry carrying our cookie decoded (`main.c:1334-1360`).
 pub(super) fn fire_frame(bar0: u64, p: &Prep, frame: &[u8], ch: u16, n: usize, kind: &str, rate: u8, w: &mut Writes) -> Report {
     let mut r = Report::default();
-    r.frame_len = frame.len();
+    r.frame_len = frame.len(); if dfs_refused(ch, kind) { r.cookie = 0; return r; } // STATIONROAM-5G (B962): no TX on a DFS channel
     if n >= FRAMES || frame.len() > FRAME_MAX || frame.len() < 24 {
         r.cookie = 0;
         serial_println!("[wifi10] tx-poke kind={} REFUSED reason=frame-slot(n={} len={}) — nothing written", kind, n, frame.len());
@@ -721,7 +716,7 @@ pub(super) fn queue(bar0: u64, p: &Prep, q: &mut Queue, frame: &[u8], ch: u16, n
         q.full += 1;
         return false;
     }
-    if n >= FRAMES || frame.len() > FRAME_MAX || frame.len() < 24 {
+    if n >= FRAMES || frame.len() > FRAME_MAX || frame.len() < 24 || wifi_core::ieee80211::dfs(ch as u8) { // STATIONROAM-5G (B962): no TX on a DFS channel
         return false;
     }
     if q.n == 0 {
@@ -1042,3 +1037,62 @@ pub(super) fn cts_kat() -> bool {
     let grp = gh[TXH_MAC_CTL..TXH_MAC_CTL + 4] == [0x1A, 0x08, 0x00, 0x00] && gh[TXH_RTS_FRAME_598 + 2..TXH_RTS_FRAME_598 + 4] == [0x3C, 0x00];
     slot && rest && cck && grp
 }
+
+// ── STATIONROAM-5G (rmbp-ledger B962): no CCK on 5 GHz, and no TX on a DFS channel ─────────────────────────────────────────────
+
+/// `b43 xmit.h:133` — extra_ft's OFDM fallback encoding.
+const TXH_EFT_FB_OFDM: u8 = 0x01;
+/// OFDM 6 Mbit/s (500 kbit/s units): the OFDM PHY's lowest mandatory rate (IEEE 802.11-2020 §17.3).
+const RATE_6M: u8 = 12;
+
+/// The rate the rungs' frames, the sweep's probe and the PS Nulls leave at on `ch`: CCK 1 on 2.4 GHz (byte-identical), OFDM 6 on 5 GHz
+/// (DSSS/HR-DSSS, the CCK PHYs, are 2.4 GHz only: IEEE 802.11-2020 §15, §16).
+pub(super) fn floor_rate(ch: u16) -> u8 {
+    if ch > 14 { RATE_6M } else { RATE_1M }
+}
+
+/// A chosen rate on `ch`: on 5 GHz a CCK rate (`assoc::station_rate`'s fallback) becomes OFDM 6; otherwise `rate`.
+pub(super) fn band_rate(rate: u8, ch: u16) -> u8 {
+    if ch > 14 && matches!(ratecode(rate), Some((_, false)) | None) { RATE_6M } else { rate }
+}
+
+/// `txhdr`'s fallback rate on `ch`: OFDM 6 on 5 GHz (b43 `xmit.c:354-361` codes an OFDM fallback as FB_OFDM with its own PLCP and
+/// phy_ctl1), else `fb_of(r)` (the CCK fallback, STATIONRATECTL B881).
+fn fb_band(r: TxRate, ch: u16) -> u8 {
+    if ch > 14 { RATE_6M } else { fb_of(r) }
+}
+
+/// A frame on a DFS channel (`wifi_core::ieee80211::dfs`, 52..=144) is refused by name, before any write: no radar detection is built
+/// (STATIONROAM-5GDFS owed). `true` = refused (said).
+fn dfs_refused(ch: u16, kind: &str) -> bool {
+    if ch > 255 || !wifi_core::ieee80211::dfs(ch as u8) {
+        return false;
+    }
+    serial_println!("[wifi10] tx-poke kind={} REFUSED reason=dfs ch={} — no radar detection; nothing written (STATIONROAM-5G B962)", kind, ch);
+    true
+}
+
+/// `tests wifi` (through `join::station_kat`, `data::kat`'s `rate5g` row), hand-computed: floor_rate(36) = 12, (11) = 2; band_rate(22, 36)
+/// = 12, (48, 36) = 48, (22, 11) = 22; a 60-octet unicast ToDS data frame (64 with FCS) at OFDM 24 with fallback CCK 11 on channel 36 ->
+/// plcp_fb 0B 08 00 00 00 00 (rate code 0x0B | 64 << 5), extra_ft 0x01, phy_ctl1_fb = phy_ctl1(OFDM 6), dur_fb 3C 00 (SIFS 10 + the
+/// OFDM-6 ACK 16 + 4 + 4 x 6 + 6 = 50); the same frame on channel 11 keeps `fb_kat`'s bytes (6E 04 2F 00, D5 00, FB_CCK); a DFS channel
+/// is refused, 36 and 11 are not.
+pub(super) fn band_kat() -> bool {
+    use wifi_core::ieee80211::{RATE_11M, RATE_24M};
+    let mut f = alloc::vec![0u8; 60];
+    f[0] = 0x08;
+    f[1] = 0x01;
+    f[4..10].copy_from_slice(&[0x00, 0x11, 0x22, 0x33, 0x44, 0x55]);
+    let r = TxRate { rate: RATE_24M, ack: RATE_24M, short: false, fb: RATE_11M, prot: false };
+    let h5 = txhdr(&f, 36, COOKIE_RING1, r);
+    let h2 = txhdr(&f, 11, COOKIE_RING1, r);
+    let rates = floor_rate(36) == 12 && floor_rate(11) == RATE_1M && band_rate(RATE_11M, 36) == 12 && band_rate(RATE_24M, 36) == RATE_24M
+        && band_rate(RATE_11M, 11) == RATE_11M;
+    let five = h5[TXH_PLCP_FB..TXH_PLCP_FB + 6] == [0x0B, 0x08, 0x00, 0x00, 0, 0] && h5[TXH_EXTRA_FT] == TXH_EFT_FB_OFDM
+        && h5[TXH_PHY_CTL1_FB..TXH_PHY_CTL1_FB + 2] == phy_ctl1(12).to_le_bytes() && h5[TXH_DUR_FB..TXH_DUR_FB + 2] == [0x3C, 0x00];
+    let two = h2[TXH_PLCP_FB..TXH_PLCP_FB + 6] == [0x6E, 0x04, 0x2F, 0x00, 0, 0] && h2[TXH_DUR_FB..TXH_DUR_FB + 2] == [0xD5, 0x00]
+        && h2[TXH_EXTRA_FT] == TXH_EFT_FB_CCK;
+    let dfs = wifi_core::ieee80211::dfs(52) && wifi_core::ieee80211::dfs(144) && !wifi_core::ieee80211::dfs(36) && !wifi_core::ieee80211::dfs(11);
+    rates && five && two && dfs
+}
+

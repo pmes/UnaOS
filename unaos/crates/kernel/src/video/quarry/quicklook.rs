@@ -55,6 +55,9 @@ struct Panel {
 static REQ: crate::sync::Mutex<Option<Req>> = crate::sync::Mutex::new(None);
 static PANEL: crate::sync::Mutex<Option<Panel>> = crate::sync::Mutex::new(None);
 static OPEN: AtomicBool = AtomicBool::new(false);
+/// WMCLOSEHOOK (rmbp-ledger B1038): the panel's row id, registered with wm's WINID registry so a close behind the panel's
+/// back (the furniture disc, `wm::close_all_furniture`) clears it and runs [`close_hook`]; stored under the `PANEL` hold.
+static WIN: AtomicU32 = AtomicU32::new(wm::WIN_NONE);
 static SHOWN: AtomicU32 = AtomicU32::new(0);
 
 pub(super) fn is_open() -> bool {
@@ -303,7 +306,7 @@ pub(super) fn render_into(path: &str, px: &mut [u32], w: usize, h: usize) -> (&'
 }
 
 fn close(by: &str) {
-    let p = PANEL.lock().take();
+    let p = PANEL.lock().take(); WIN.store(wm::WIN_NONE, Ordering::Release); // WMCLOSEHOOK (B1038): our own close clears the cell first, so wm runs no hook for it
     OPEN.store(false, Ordering::Relaxed);
     if let Some(p) = p {
         if p.win != wm::WIN_NONE {
@@ -349,7 +352,7 @@ fn show(path: &str) {
         return;
     }
     // The Vec's heap buffer does not move when the Vec itself moves into the state.
-    *g = Some(Panel { win, surf, w, h, x, y, path: String::from(path) });
+    *g = Some(Panel { win, surf, w, h, x, y, path: String::from(path) }); WIN.store(win, Ordering::Release); wm::winid_register_close_hook(&WIN, "quicklook", close_hook); // WMCLOSEHOOK (B1038): the cell is published under the same PANEL hold as the panel
     drop(g);
     OPEN.store(true, Ordering::Relaxed);
     SHOWN.fetch_add(1, Ordering::Relaxed);
@@ -429,4 +432,20 @@ fn rerender() {
     let win = p.win;
     drop(g);
     let _ = wm::present(win);
+}
+
+// ── WMCLOSEHOOK (rmbp-ledger B1038, BP-video-18 kept) — FILE-TAIL. A Log Out's `wm::close_all_furniture` (or the furniture
+// disc) closed the panel's row behind its back: the panel kept its surface and a STALE `win`, and the service's
+// `close("quarry-closed")` later handed that stale id to `wm::close`, which could name a re-issued stranger's row. `wm::close`
+// now clears [`WIN`] and, after the drain with no wm lock held, runs this hook: under `PANEL`, the panel is taken iff no
+// reopen published a new cell and its surface is the one the closed row seated; the surface is dropped outside the lock.
+fn close_hook(_id: wm::WinId, surf: usize) {
+    let p = {
+        let mut g = PANEL.lock();
+        if WIN.load(Ordering::Acquire) == wm::WIN_NONE && g.as_ref().map(|p| p.surf.as_ptr() as usize) == Some(surf) { g.take() } else { None }
+    };
+    if p.is_some() {
+        OPEN.store(false, Ordering::Relaxed);
+    }
+    drop(p);
 }

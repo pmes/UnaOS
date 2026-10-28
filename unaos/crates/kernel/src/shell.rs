@@ -565,19 +565,12 @@ fn fs_touch(console: &mut Console, arg: &str) {
 /// shrink-by-recreate would drop the per-object ACL), so unlink+create is the one shape that works
 /// on both volumes. Said here rather than discovered later.
 fn fs_write(console: &mut Console, arg: &str, data: &[u8]) {
-    use crate::fs::vfs::NodeKind;
     let Some((mt, path)) = vfs_write_open(console, "write", arg) else { return };
     if vfs_is_dir(&mt, &path) {
         return console.println(&alloc::format!("write: {}: is a directory (-EISDIR)", path));
     }
-    let _ = mt.unlink(&path, SHELL_PRINCIPAL); // drop the old contents if the name was taken
-    if let Err(e) = mt.create(&path, NodeKind::File, SHELL_PRINCIPAL) {
-        return vfs_fail(console, "write", &path, e);
-    }
-    if data.is_empty() {
-        return vfs_say(console, &alloc::format!("wrote 0 bytes to {}", path));
-    }
-    match mt.write(&path, 0, data, SHELL_PRINCIPAL) {
+    match mt.put_file(&path, data, SHELL_PRINCIPAL) { // VFSPUTSWEEP (B983): unlink + create + every byte
+        Ok(0) => vfs_say(console, &alloc::format!("wrote 0 bytes to {}", path)),
         Ok(n) => vfs_say(console, &alloc::format!("wrote {} bytes to {} ({} bytes)", n, path, n)),
         Err(e) => vfs_fail(console, "write", &path, e),
     }
@@ -3577,7 +3570,7 @@ fn shell_relics_native_witness() {
         fs.get_attribute(id, "relic:tag").ok().flatten().map(|_| ())
     }).ok().flatten().is_some();
     let got = say(&|c: &mut Console| setfattr_x(c, "relic:tag", C));
-    let gone = crate::fs::unafs::with_unafs(|fs| {
+    let gone = crate::fs::unafs::with_unafs_read(|fs| {
         let id = fs.resolve_path(C).ok()?;
         fs.get_attribute(id, "relic:tag").ok().flatten()
     }).ok().flatten().is_none();
@@ -3598,7 +3591,7 @@ fn shell_relics_native_witness() {
         .unwrap_or_default();
     let created = say(&|c: &mut Console| snap_cmd(c, &["create", "relics"]));
     let index = unafs_verb_snaps().join(" | ");
-    let snap_gen = crate::fs::unafs::with_unafs(|fs| {
+    let snap_gen = crate::fs::unafs::with_unafs_read(|fs| {
         fs.snapshot_index().ok().and_then(|v| v.iter().find(|s| s.name == "relics").map(|s| s.generation))
     }).ok().flatten();
     let (ok, why) = match snap_gen {
@@ -3607,7 +3600,7 @@ fn shell_relics_native_witness() {
             let ls_ok = unafs_verb_snapls(g, "/").iter().any(|l| l.contains("K3HELLO.TXT"));
             let cat_ok = !live.is_empty() && unafs_verb_snapcat(g, "/K3HELLO.TXT").contains(&live);
             let _ = say(&|c: &mut Console| snap_cmd(c, &["drop", &alloc::format!("{}", g)]));
-            let dropped = crate::fs::unafs::with_unafs(|fs| {
+            let dropped = crate::fs::unafs::with_unafs_read(|fs| {
                 fs.snapshot_index().ok().map(|v| !v.iter().any(|s| s.generation == g))
             }).ok().flatten().unwrap_or(false);
             (in_index && ls_ok && cat_ok && dropped,
@@ -5996,7 +5989,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
         },
         #[cfg(feature = "selfhost")]
         "src" => { shell_src(&args, console); }
-        "hw" => { crate::hw::shell_verb(console); } "trash" => { crate::fs::trash::shell_verb(&args, console); } "shortcuts" => { crate::video::shortcuts::shell_verb(console); } #[cfg(all(target_arch = "x86_64", feature = "hda-tone"))] "play" => { crate::drivers::hda::play::shell_verb(&args, &vfs_path(args.first().copied().unwrap_or("")), console); } "tests" => { crate::tests::shell_verb(&args, console); } "census" => { crate::census::shell_verb(&args, console); } "prof" => { crate::prof::shell_verb(&args, console); } #[cfg(all(feature = "linuxabi", target_arch = "x86_64"))] "linux" => { crate::arch::linuxabi::shell_verb(&args, console); } #[cfg(all(feature = "wifi", target_arch = "x86_64"))] "wifi" => { crate::wifi::verb::shell_verb(&args, console); } "tste" | "selftest" => {
+        "hw" => { crate::hw::shell_verb(console); } "trash" => { crate::fs::trash::shell_verb(&args, console); } "shortcuts" => { crate::video::shortcuts::shell_verb(console); } #[cfg(all(target_arch = "x86_64", feature = "hda-tone"))] "play" => { crate::drivers::hda::play::shell_verb(&args, &vfs_path(args.first().copied().unwrap_or("")), console); } "tests" => { crate::tests::shell_verb(&args, console); } #[cfg(all(target_arch = "x86_64", feature = "wc", feature = "videoplayer"))] "nle" => { crate::video::export::shell_verb(&args, console); } #[cfg(all(target_arch = "x86_64", feature = "wc", feature = "videoplayer"))] "vid" => { crate::video::player::shell_verb(&args, console); } "census" => { crate::census::shell_verb(&args, console); } "prof" => { crate::prof::shell_verb(&args, console); } #[cfg(all(feature = "linuxabi", target_arch = "x86_64"))] "linux" => { crate::arch::linuxabi::shell_verb(&args, console); } #[cfg(all(feature = "wifi", target_arch = "x86_64"))] "wifi" => { crate::wifi::verb::shell_verb(&args, console); } "tste" | "selftest" => {
             // The in-OS self-test suite (TSTE-1). Prints a three-section PASS/FAIL/SKIP table in the
             // console (like `ps` — it does NOT take the screen) and mirrors every line to serial.
             crate::selftest::run(console, pal);
@@ -7701,7 +7694,7 @@ fn snap_cmd(console: &mut Console, _args: &[&str]) {
 /// so the whole snapshot family sits together with its siblings.
 #[cfg(any(target_arch = "aarch64", feature = "unafs"))]
 fn unafs_verb_snaps() -> alloc::vec::Vec<String> {
-    let out = crate::fs::unafs::with_unafs(|fs| match fs.snapshot_index() {
+    let out = crate::fs::unafs::with_unafs_read(|fs| match fs.snapshot_index() {
         Ok(snaps) => {
             let mut lines = alloc::vec::Vec::new();
             if snaps.is_empty() {
@@ -7766,7 +7759,7 @@ fn unafs_verb_snapdrop(generation: u64) -> String {
 #[cfg(any(target_arch = "aarch64", feature = "unafs"))]
 fn unafs_verb_snapls(generation: u64, path: &str) -> alloc::vec::Vec<String> {
     use crate::fs::unafs::{read_authz, ReadAuthz, KERNEL_PRINCIPAL};
-    let out = crate::fs::unafs::with_unafs(|fs| {
+    let out = crate::fs::unafs::with_unafs_read(|fs| {
         // Resolve the directory's logical id in the snapshot (scoped: the view
         // borrows fs; release it so the ACL check can re-borrow).
         let dir_id = {

@@ -131,9 +131,27 @@ pub async fn fetch_document(input: &str) -> Result<String> {
 
 /// [`fetch_document`] that also returns the FINAL response URL — after redirects (and after the
 /// https-then-http guess for a scheme-less input): the document's URL, which its relative URLs resolve
-/// against and the address bar shows (HTML §7.4.1, the response's URL).
+/// against and the address bar shows (HTML §7.4.1, the response's URL). A PDF response is not text: it is refused
+/// here (the page loader takes it through [`fetch_document_any`]).
 pub async fn fetch_document_final(input: &str) -> Result<(String, String)> {
+    match fetch_document_any(input).await? {
+        (Doc::Text(text), url) => Ok((text, url)),
+        (Doc::Pdf(_), _) => anyhow::bail!("not a text document: application/pdf"),
+    }
+}
+
+/// A top-level response's body (PDF4 SR324): text (HTML and everything else the engine parses as a page), or a PDF
+/// ([`crate::pdf::is_pdf`]: its Content-Type, or the `%PDF-` sniff), kept as bytes.
+pub enum Doc {
+    Text(String),
+    Pdf(Vec<u8>),
+}
+
+/// [`fetch_document_final`]'s fetch, with a PDF body kept as bytes instead of refused as non-UTF-8.
+pub async fn fetch_document_any(input: &str) -> Result<(Doc, String)> {
     if input.starts_with("file://") {
+        if let Some(opened) = crate::chrome::host::open_archive(input) { return opened.map(|(html, url)| (Doc::Text(html), url)); } // PAGESAVECOMPLETE (SR398): a .mhtml / .mht file URL opens as its archive (chrome::host); every other file stays refused
+        if let Some(opened) = crate::chrome::host::open_local(input) { return opened; } // SAVERECENTOPEN (SR403): a .html / .htm file URL opens under the archive's sandbox CSP (chrome::host); OPENANYTYPE (SR408): a text, image, media or PDF file too; any other file is named on the console and refused below
         anyhow::bail!("file:// fetches are disabled for security reasons.");
     }
     let urls = normalize_url(input);
@@ -145,7 +163,7 @@ pub async fn fetch_document_final(input: &str) -> Result<(String, String)> {
     for url in urls {
         // AETHERSW (SR104): a navigation under a registered scope is the controlling worker's `fetch` event first.
         if let Some(answer) = sw_navigate(&url).await {
-            return answer;
+            return answer.map(|(text, u)| (Doc::Text(text), u));
         }
         match get(&url, Priority::Document, None).await {
             Ok(response) => {
@@ -159,17 +177,36 @@ pub async fn fetch_document_final(input: &str) -> Result<(String, String)> {
                     response.headers().iter().map(|(k, v)| (k.to_ascii_lowercase(), v.to_string())).collect();
                 crate::security::set_document_headers(&final_url, &doc_headers);
 
-                if response.content_length().unwrap_or(0) > 10 * 1024 * 1024 {
+                // PDF4-SIZE (SR404): the cap is the document type's, chosen by the predicate that picks the PDF arm: a PDF
+                // (its Content-Type, or the `%PDF-` sniff) reads up to `pdf::MAX_BYTES`, every other document 10 MiB. The
+                // Content-Length is held to the most the type can still reach (text/html: 10 MiB, as before), the body is
+                // read once into one buffer sized by it, and refused the moment it passes its cap (a PDF by name).
+                let ctype = header_of(&doc_headers, "content-type").unwrap_or("").to_string();
+                let cap = |head: &[u8]| if crate::pdf::is_pdf(&ctype, head) { crate::pdf::MAX_BYTES } else { 10 * 1024 * 1024 };
+                let declared = response.content_length().unwrap_or(0);
+                if declared > cap(b"%PDF-") as u64 {
+                    if crate::pdf::is_pdf(&ctype, b"") {
+                        anyhow::bail!(crate::pdf::over_cap(declared));
+                    }
                     anyhow::bail!("Response exceeds size limit");
                 }
-                
-                let bytes = response.bytes().await.context("Failed to read body")?;
-                if bytes.len() > 10 * 1024 * 1024 {
-                    anyhow::bail!("Response body exceeds size limit");
+                let mut response = response;
+                let mut bytes: Vec<u8> = Vec::with_capacity(declared.min(cap(b"%PDF-") as u64) as usize);
+                while let Some(chunk) = response.chunk().await.context("Failed to read body")? {
+                    bytes.extend_from_slice(&chunk);
+                    if bytes.len() > cap(&bytes) {
+                        if crate::pdf::is_pdf(&ctype, &bytes) {
+                            anyhow::bail!(crate::pdf::over_cap(bytes.len() as u64));
+                        }
+                        anyhow::bail!("Response body exceeds size limit");
+                    }
+                }
+                if crate::pdf::is_pdf(&ctype, &bytes) {
+                    return Ok((Doc::Pdf(bytes), final_url)); // PDF4 (SR324): the engine opens it as a PDF document
                 }
                 
                 let text = String::from_utf8(bytes).context("Invalid UTF-8")?;
-                return Ok((text, final_url));
+                return Ok((Doc::Text(text), final_url));
             }
             Err(e) => {
                 last_err = Some(anyhow::anyhow!(e).context("Connection failure"));
@@ -358,7 +395,7 @@ pub fn collect_stylesheet_links(base_url: &str, html: &str) -> Vec<SheetLink> {
                 None => Some(href.to_string()),
             };
             if let Some(u) = resolved {
-                if u.starts_with("http://") || u.starts_with("https://") {
+                if u.starts_with("http://") || u.starts_with("https://") || crate::chrome::host::local_part(base_url, &u).is_some() { // OPENANYTYPE (SR408): a local page's own sheet, from its folder
                     out.push(SheetLink {
                         url: u,
                         integrity: attrs.get("integrity").map(str::to_string).filter(|v| !v.trim().is_empty()),
@@ -396,6 +433,9 @@ pub struct Page {
     /// time but NOT fetched here — the shell fetches it after the page is
     /// delivered so chrome decoration never delays a load.
     pub favicon: Option<String>,
+    /// PDF4 (SR324): the response was a PDF ([`Doc::Pdf`]): its bytes, and nothing else of the page is filled
+    /// (`AetherEngine::load_page` opens it through `load_pdf`).
+    pub pdf: Option<Vec<u8>>,
 }
 
 /// One collected script slot: the ordinal of its `<script>` element among
@@ -517,6 +557,7 @@ pub fn favicon_url(base_url: &str, html: &str) -> Option<String> {
 /// the `image` crate behind it (it picks the largest contained image), and an SVG
 /// icon falls back to the rasterizer the page images use.
 pub async fn fetch_favicon(url: &str) -> Option<(u32, u32, Vec<u8>)> {
+    if url.starts_with("data:") { return crate::images::get(url).map(|i| (i.width(), i.height(), i.as_raw().clone())); } // PDF4 (SR324): the PDF glyph
     let bytes = fetch_image_bytes(url).await.ok()?;
     let decoded = crate::images::decode_raster(&bytes).or_else(|| crate::images::decode_svg(&bytes))?;
     let (w, h) = decoded.dimensions();
@@ -530,11 +571,17 @@ pub async fn fetch_favicon(url: &str) -> Option<(u32, u32, Vec<u8>)> {
 pub fn collect_image_urls(base_url: &str, html: &str) -> Vec<String> {
     let document = crate::dom::parse_html(html);
     let mut out = Vec::new();
-    if let Ok(imgs) = document.select("img") {
+    if let Ok(imgs) = document.select("img, input") {
         for img in imgs {
+            // AETHERIMAGEINPUTFETCH (SR461): an image input's src is fetched as an img's (layout_core's ONE `is_image_input`);
+            // `loading` is an img attribute, so the lazy skip stays img-only (the lazy pass never looks at inputs).
+            let image_input = layout_core::is_image_input(img.as_node());
+            if img.name.local.as_ref() != "img" && !image_input {
+                continue;
+            }
             // AETHERMEDIA (SR107): `loading=lazy` waits for its box to near the viewport (the
             // engine's lazy pass fetches it); `<picture>` picks its source by media and type.
-            if crate::images::is_lazy(&img.attributes.borrow()) {
+            if !image_input && crate::images::is_lazy(&img.attributes.borrow()) {
                 continue;
             }
             let Some(src) = crate::images::img_source(img.as_node(), crate::images::SELECTION_VIEWPORT) else { continue };
@@ -543,7 +590,7 @@ pub fn collect_image_urls(base_url: &str, html: &str) -> Vec<String> {
                 continue; // decoded synchronously at load, no fetch needed
             }
             let abs = crate::images::resolve(base_url, src);
-            if (abs.starts_with("http://") || abs.starts_with("https://")) && !out.contains(&abs) {
+            if (abs.starts_with("http://") || abs.starts_with("https://") || crate::chrome::host::local_part(base_url, &abs).is_some()) && !out.contains(&abs) { // OPENANYTYPE (SR408): a local page's own image, from its folder
                 out.push(abs);
             }
             if out.len() >= 30 {
@@ -651,7 +698,7 @@ pub fn collect_css_image_refs(
             continue;
         }
         let fetch_url = crate::images::resolve(fetch_base, inner);
-        if !(fetch_url.starts_with("http://") || fetch_url.starts_with("https://")) {
+        if !(fetch_url.starts_with("http://") || fetch_url.starts_with("https://") || crate::chrome::host::local_part(paint_base, &fetch_url).is_some()) { // OPENANYTYPE (SR408): a local page's own image, from its folder
             continue;
         }
         let key = crate::images::resolve(paint_base, inner);
@@ -886,6 +933,7 @@ type LoadFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Loaded> + S
 
 fn start(load: Load, partition: Option<String>, sw: Option<crate::workers::sw::SwHandle>) -> LoadFuture {
     Box::pin(async move {
+        if let Some(done) = local_loaded(&load) { return done; } // OPENANYTYPE (SR408): a local page's admitted file:// sheet or image is read from disk
         let p = partition.as_deref();
         if let Some(h) = sw.as_ref() {
             let (url, pri) = match &load {
@@ -935,7 +983,12 @@ pub async fn fetch_page(input: &str) -> Result<Page> {
     http_cache().clear_memory();
     // The page's base is the FINAL response URL (after redirects): relative stylesheet, script,
     // image and link URLs resolve against it, and it is the history entry the address bar shows.
-    let (html, base) = fetch_document_final(input).await?;
+    let (html, base) = match fetch_document_any(input).await? {
+        (Doc::Text(html), base) => (html, base),
+        (Doc::Pdf(bytes), base) => {
+            return Ok(Page { base_url: base, pdf: Some(bytes), favicon: Some(crate::pdf::GLYPH_URI.to_string()), ..Default::default() });
+        }
+    };
     let partition = http::site_of(&base);
     // AETHERSW (SR104): the document's controller (decided at navigation, as `workers::sw` decides a client's).
     let sw = {
@@ -1077,7 +1130,7 @@ pub async fn fetch_page(input: &str) -> Result<Page> {
         }
     }
     let favicon = favicon_url(&base, &html);
-    Ok(Page { base_url: base, html, sheets, images, scripts, script_nodes, script_urls, favicon })
+    Ok(Page { base_url: base, html, sheets, images, scripts, script_nodes, script_urls, favicon, pdf: None })
 }
 
 #[cfg(test)]
@@ -1243,5 +1296,22 @@ mod tests {
         assert_eq!(normalize_url("https://example.com"), vec!["https://example.com"]);
         assert_eq!(normalize_url("http://localhost"), vec!["http://localhost"]);
         assert!(normalize_url("file:///etc/passwd").is_empty());
+    }
+}
+
+// ---- OPENANYTYPE (SR408): a local page's own file:// subresources ------------------------------------------------------
+
+/// OPENANYTYPE (SR408): [`start`]'s local arm: a stylesheet or image whose URL is a file URL (admitted at discovery by
+/// `chrome::host::local_part`: the page's own folder) is read from disk by `chrome::host::read_part` (10 MiB); a script
+/// or font is never read here (scripts stay off on a local page; fonts are not admitted), so `None` leaves it to the
+/// network path, which refuses a file URL as before.
+fn local_loaded(load: &Load) -> Option<Loaded> {
+    match load {
+        Load::Sheet(i, u) if u.starts_with("file://") => {
+            let r = crate::chrome::host::read_part(u).and_then(|b| String::from_utf8(b).context("Invalid UTF-8"));
+            Some(Loaded::Sheet(*i, u.clone(), r))
+        }
+        Load::Image(u, key) if u.starts_with("file://") => Some(Loaded::Image(u.clone(), key.clone(), crate::chrome::host::read_part(u))),
+        _ => None,
     }
 }

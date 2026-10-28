@@ -1,0 +1,14 @@
+# MT7925FW (zenbook-ledger Z5, ZENBOOKMT7925; the FWPIN shape of rmbp-ledger B455) — SHA-256 pins for the MediaTek MT7925
+# Wi-Fi 7 firmware pair (drivers/mt7925.rs). NO FIRMWARE BYTES live in this tree (R52, CLEAN_ROOM_POLICY §4). Each row is a
+# fact ABOUT a file the operator fetches from linux-firmware: `<role> <64 lowercase hex>`, roles patch / ram. The probe hashes
+# the pair on the ESP at FW/MT7925/ (arroyo's MT7925-FW line, `fw_stage_pinned`, from UNAOS_MT7925_FW_PATH) and reads
+# patch_sha= / ram_sha= ok|mismatch|unpinned; nothing is uploaded at S1.
+# A newer linux-firmware drop changes both digests: the MT7925-FW build line prints the new rows (`pin-row: <role> <hex>`).
+# Lines starting with `#` and blank lines are ignored.
+
+# rows measured 2026-10-27 from gitlab.com/kernel-firmware/linux-firmware main @ 5a3f625f (2026-10-19, "update firmware for
+# MT7925 WiFi device"); WHENCE: Licence: Redistributable, LICENCE.mediatek.
+# mediatek/mt7925/WIFI_MT7925_PATCH_MCU_1_1_hdr.bin  Version 20261016232915a  188192 bytes
+# mediatek/mt7925/WIFI_RAM_CODE_MT7925_1_1.bin       Version 20261016233029   1390712 bytes
+patch 67ff85f1a39d1a100a51abd8e2a26edd2f198d7052514b6b8981948b231e5016
+ram 329c0e27f780550789e4eba47452731b1723f69f9e67f525d0e50bf3cd2978ac

@@ -78,12 +78,14 @@ fn lossy_vs_chromium() {
         // builds themselves differ by 55.5 dB on t10 (measured with opus_demo; ours vs Chromium: 55.5 dB),
         // so Opus is held to 50 dB and the bit-exact KAT carries the real proof.
         let floor = match info.codec { Codec::Opus => 50.0, _ => 60.0 };
-        // Frame counts: Opus must match exactly. Chromium does not apply Vorbis end trimming (it hands out
-        // every decoded sample; libvorbis and the spec cut the last page to its granule), so for Vorbis ours
-        // may be shorter than Chromium's by less than one long block — and must equal libvorbis's (see
-        // vs_reference_library).
+        // Frame counts: Opus and Vorbis must match exactly — Chromium applies FFmpeg's Ogg end trimming, so its
+        // Vorbis count is the last granule's, as libvorbis's and ours are (VORBISTRIM, LEDGER SR307). The one
+        // measured divergence: when the first audio page is also the EOS page, FFmpeg's vorbis_parser credits the
+        // first packet with (blocksize[0] + its blocksize)/4 frames the decoder never outputs and end-trims that
+        // much too far (chromium-sfx.ogg: ffprobe packet 0 duration=128, discard_padding=629; ours = the granule
+        // 15435, Chromium 15307); ffmpeg_first_page_eos gives both counts for that corner from the file itself.
         let frames_ok = match info.codec {
-            Codec::Vorbis => c.frames_ours <= c.frames_ref && c.frames_ref - c.frames_ours < 8192,
+            Codec::Vorbis => c.frames_ours == c.frames_ref || ffmpeg_first_page_eos(f) == Some((c.frames_ours, c.frames_ref)),
             Codec::Mp3 => c.frames_ours <= c.frames_ref && c.compared == c.frames_ours,
             _ => c.frames_ours == c.frames_ref,
         };
@@ -149,4 +151,31 @@ fn probe_chromium_frames() {
     }
     worst.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
     for w in worst.iter().take(12) { eprintln!("frame {} snr {:.1} rms {:.4}", w.1, w.0, w.2); }
+}
+
+/// VORBISTRIM (LEDGER SR307): an Ogg Vorbis file whose FIRST granule-bearing audio packet is the EOS packet (the
+/// first audio page is the last): (the spec's and libvorbis's frame count, FFmpeg's). Vorbis I §A.2 cuts such a
+/// page at its END, so the count is the granule; FFmpeg's parser starts `previous_blocksize` at blocksize[0], counts
+/// (blocksize[0] + the first packet's blocksize)/4 phantom frames and trims them off the end as well. None for any
+/// other file (a non-Vorbis stream, or a first audio page that is not the last), which must match Chromium exactly.
+fn ffmpeg_first_page_eos(path: &std::path::Path) -> Option<(usize, usize)> {
+    use audio_core::io::{ByteStream, VecReader};
+    use audio_core::vorbis::Setup;
+    let bytes = std::fs::read(path).ok()?;
+    let mut r = audio_core::ogg::OggReader::new(ByteStream::new(Box::new(VecReader::new(bytes))));
+    let ident = r.next_packet().ok()??;
+    let (_, _, [b0, _]) = Setup::parse_ident(&ident.data).ok()?;
+    let _comment = r.next_packet().ok()??;
+    let setup = Setup::parse(&ident.data, &r.next_packet().ok()??.data).ok()?;
+    let mut first_bs = None;
+    while let Some(p) = r.next_packet().ok()? {
+        if p.data.first().is_some_and(|b| b & 1 == 1) { continue; } // a header packet inside the stream
+        if first_bs.is_none() { first_bs = Some(setup.packet_blocksize(&p.data)?); }
+        if let Some(g) = p.granule {
+            if !p.eos { return None; }
+            let phantom = (b0 + first_bs?) as u64 / 4;
+            return Some((g as usize, g.checked_sub(phantom)? as usize));
+        }
+    }
+    None
 }

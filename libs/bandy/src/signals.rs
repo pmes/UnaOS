@@ -147,14 +147,26 @@ pub enum SMessage {
 
     // --- AETHER (The Browser) ---
     OpenDocument { url: String },
-    SurfaceBlit { url: String, width: u32, height: u32, pixels: Vec<u8> },
+    /// A surface's pixels (RGBA8, straight alpha; the contract on quartzite's `TetraNode::Surface`). AETHERMACGPU-DAMAGE
+    /// (LEDGER SR320) / AETHERMACGPU-ENGINEDAMAGE (SR341): `damage = Some(rects)` says `pixels` carries ONLY those rects'
+    /// rows (each rect's `h * w * 4` bytes, stride `w * 4`, concatenated in list order) of a `width x height` frame the
+    /// receiver already holds; `None` (omitted from the wire, so a whole frame keeps its frozen shape, smessage_kats) is the
+    /// whole frame. A sender sends a whole frame at least every [`SURFACE_FULL_EVERY`] blits and on [`SMessage::SurfaceResend`]. AETHERMACGPU-SCROLL (SR351): `scroll: Some((dx, dy))` on a damage blit moves the kept frame's pixels by (dx, dy) BEFORE the rects' rows land (None omitted: the wire unchanged).
+    SurfaceBlit { url: String, width: u32, height: u32, pixels: Vec<u8>, #[serde(default, skip_serializing_if = "Option::is_none")] damage: Option<Vec<(u32, u32, u32, u32)>>, #[serde(default, skip_serializing_if = "Option::is_none")] scroll: Option<(i32, i32)> },
+    /// AETHERMACGPU-ENGINEDAMAGE (SR341): face -> sender: the face's kept frame of surface `url` is unknown (it lagged on the
+    /// bus); the sender's next blit of it goes whole.
+    SurfaceResend { url: String },
     PlayMedia { url: String, title: String, mime: String },
     BrowserNavBack,
     BrowserNavForward,
     BrowserNavReload,
-    BrowserScroll(f64, f64),
-    BrowserClick(f64, f64),
-    BrowserResize(u32, u32),
+    /// SURFACEID (LEDGER SR332): the third field on `BrowserScroll` / `BrowserClick` / `BrowserMouseMove` (and
+    /// `BrowserButton`'s `surface`) is the Surface's number in its tetra tree (quartzite `tetra::SurfaceMap`: depth-first,
+    /// the first or only Surface is 0), omitted from the wire when 0 so a one-surface tree keeps its frozen shape.
+    BrowserScroll(f64, f64, #[serde(default, skip_serializing_if = "no_surface")] u32),
+    BrowserClick(f64, f64, #[serde(default, skip_serializing_if = "no_surface")] u32),
+    /// NLE2-SURFACERESIZE (LEDGER SR339): the third field is the resized Surface's number (as on the pointer messages), omitted when 0.
+    BrowserResize(u32, u32, #[serde(default, skip_serializing_if = "no_surface")] u32),
     BrowserKey(String),
     BrowserText(String),
     /// Chrome → engine: the platform clipboard's text, pasted at the focused field's caret (the shell
@@ -175,7 +187,7 @@ pub enum SMessage {
     /// Chrome → engine: the pointer moved over the page surface, in surface
     /// pixels (top-left origin) — hover, `:hover` style, the cursor shape and
     /// the page's mouseover/mouseout/mouseenter/mouseleave/mousemove (SR67).
-    BrowserMouseMove(f64, f64),
+    BrowserMouseMove(f64, f64, #[serde(default, skip_serializing_if = "no_surface")] u32),
     /// Engine → chrome: the cursor the hovered element asks for changed. A
     /// css-ui-4 `cursor` keyword (`default`, `pointer`, `text`, `wait`, …),
     /// which is also the freedesktop/GTK cursor name; deduped by the engine.
@@ -481,8 +493,53 @@ pub enum SMessage {
     /// Chrome -> owner (NLE2B, LEDGER SR208): the primary button went down (`down: true`) or up on a surface, in
     /// surface pixels (top-left origin). Both ends of a press, so a drag has a start and an end on every face (GTK's
     /// click gesture sends no `BrowserClick` once the pointer passes its drag threshold). `BrowserClick` on release
-    /// and `BrowserMouseMove` are still sent as before. APPENDED so no earlier wire tag moves.
-    BrowserButton { down: bool, x: f64, y: f64 },
+    /// and `BrowserMouseMove` are still sent as before. APPENDED so no earlier wire tag moves. NLE2-MODS (LEDGER SR306):
+    /// `mods` is the modifier state at the press / release ([`MOD_SHIFT`] | [`MOD_CONTROL`] | [`MOD_ALT`] | [`MOD_SUPER`]),
+    /// omitted from the wire when 0 so a press with no modifier keeps its frozen shape (smessage_kats).
+    /// SURFACEID (LEDGER SR332): `surface` is the Surface's number (see `BrowserScroll`), omitted when 0.
+    BrowserButton { down: bool, x: f64, y: f64, #[serde(default, skip_serializing_if = "no_mods")] mods: u8, #[serde(default, skip_serializing_if = "no_surface")] surface: u32 },
+    /// Engine -> shell (PDF4FORMSAVE, LEDGER SR354): save these bytes as a file. `name` is the engine's suggested file
+    /// name (the shell sanitizes it and makes it unique in the Downloads folder), `mime` their type. Ctrl/Cmd+S on a PDF
+    /// tab stages the filled `PdfDocument::bytes` (the original file when nothing was filled). APPENDED so no earlier
+    /// wire tag moves.
+    BrowserSave { name: String, mime: String, bytes: Vec<u8> },
+    /// Shell -> chrome (PDF4FORMSAVE, SR354): the [`SMessage::BrowserSave`] landed at `path`.
+    BrowserSaved { path: String },
+    /// Shell -> chrome (PDF4FORMSAVE, SR354): the [`SMessage::BrowserSave`] could not be written, and why.
+    BrowserSaveFailed { why: String },
+    /// Engine -> shell (SAVEDIALOG, LEDGER SR364): Save As these bytes. Ctrl/Cmd+Shift+S on a PDF tab stages the same
+    /// `name` / `mime` / `bytes` a [`SMessage::BrowserSave`] would; the shell holds them, asks the face for a path
+    /// ([`SMessage::SavePanel`]) and writes them where the person chose. APPENDED so no earlier wire tag moves.
+    BrowserSaveAs { name: String, mime: String, bytes: Vec<u8> },
+    /// Owner -> face (SAVEDIALOG, SR364): show the platform save panel (AppKit NSSavePanel / GTK FileDialog) over the
+    /// surface `url` (the lane that draws that surface answers; every other surface ignores it), seeded with `name`.
+    /// The face writes nothing: it answers [`SMessage::SavePanelChose`]. SAVERECENT (SR391): `folder` is the panel's
+    /// initial directory (Principia's `aether.save.folder`, the folder the last Save As chose); omitted from the wire
+    /// when `None`, so a folderless panel keeps its frozen shape (smessage_kats).
+    SavePanel {
+        url: String,
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        folder: Option<String>,
+    },
+    /// Face -> owner (SAVEDIALOG, SR364): the path the person chose in the [`SMessage::SavePanel`] over `url`, or `None`
+    /// when the panel was cancelled. A chosen path that exists was confirmed as a replace by the panel.
+    SavePanelChose { url: String, path: Option<String> },
+    /// Owner -> face (OPEN-DIALOG-ONE, LEDGER SR386): show the platform open panel (AppKit NSOpenPanel / GTK FileDialog)
+    /// over the surface `url` (the lane that draws that surface answers; every other surface ignores it), offering the
+    /// files whose names end in one of `filters` (extensions without the dot; empty = any file). The face reads nothing:
+    /// it answers [`SMessage::OpenPanelChose`]. APPENDED so no earlier wire tag moves. SAVERECENTOPEN (SR403): `folder` is
+    /// the panel's initial directory (the Aether chrome's Ctrl/Cmd+O sends Principia's `aether.save.folder`, else the
+    /// Downloads folder); omitted from the wire when `None`, so a folderless panel keeps its frozen shape (smessage_kats).
+    OpenPanel {
+        url: String,
+        filters: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        folder: Option<String>,
+    },
+    /// Face -> owner (OPEN-DIALOG-ONE, SR386): the file the person chose in the [`SMessage::OpenPanel`] over `url`, or
+    /// `None` when the panel was cancelled.
+    OpenPanelChose { url: String, path: Option<String> },
 }
 
 /// A typed preference value — the whole value domain of the Principia
@@ -595,6 +652,30 @@ impl A11yVerb {
 fn is_false(b: &bool) -> bool {
     !*b
 }
+
+/// serde helper: omit an empty modifier set from the wire (`BrowserButton`'s `mods`).
+fn no_mods(m: &u8) -> bool {
+    *m == 0
+}
+
+/// serde helper: omit the default Surface (number 0) from the wire (SURFACEID, LEDGER SR332).
+fn no_surface(n: &u32) -> bool {
+    *n == 0
+}
+
+/// `BrowserButton`'s `mods` bits (NLE2-MODS, LEDGER SR306), named once: Shift.
+pub const MOD_SHIFT: u8 = 1 << 0;
+/// Control.
+pub const MOD_CONTROL: u8 = 1 << 1;
+/// Alt / Option.
+pub const MOD_ALT: u8 = 1 << 2;
+/// Super / Command (GTK's Meta or Super).
+pub const MOD_SUPER: u8 = 1 << 3;
+
+/// AETHERMACGPU-DAMAGE (LEDGER SR320): a sender of damage-only `SurfaceBlit`s sends a whole frame (`damage: None`) at
+/// least once every this many blits, so a receiver that missed one on the lossy bus is repaired within that many (a face
+/// that KNOWS it lagged asks at once with `SurfaceResend`, SR341).
+pub const SURFACE_FULL_EVERY: u32 = 60;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum PrincipiaCommand {
@@ -1035,5 +1116,33 @@ impl TabulaCommand {
                 | TabulaCommand::EditorInsert { .. }
                 | TabulaCommand::EditorClosed { .. }
         )
+    }
+}
+
+/// SURFACEID (LEDGER SR332): the ONE list of the messages that carry a Surface number (the four pointer messages and, since
+/// NLE2-SURFACERESIZE SR339, `BrowserResize`). Every receiver that routes
+/// by surface (stria's `nle_face::Face::takes`) and every sender that stamps one (stria-view's witness) reads it here.
+impl SMessage {
+    /// The Surface number a pointer message (or `BrowserResize`) carries; `None` for every other message.
+    pub fn surface(&self) -> Option<u32> {
+        match self {
+            SMessage::BrowserButton { surface, .. }
+            | SMessage::BrowserMouseMove(_, _, surface)
+            | SMessage::BrowserScroll(_, _, surface)
+            | SMessage::BrowserClick(_, _, surface)
+            | SMessage::BrowserResize(_, _, surface) => Some(*surface),
+            _ => None,
+        }
+    }
+    /// The same field, to stamp.
+    pub fn surface_mut(&mut self) -> Option<&mut u32> {
+        match self {
+            SMessage::BrowserButton { surface, .. }
+            | SMessage::BrowserMouseMove(_, _, surface)
+            | SMessage::BrowserScroll(_, _, surface)
+            | SMessage::BrowserClick(_, _, surface)
+            | SMessage::BrowserResize(_, _, surface) => Some(surface),
+            _ => None,
+        }
     }
 }

@@ -1443,3 +1443,35 @@ fn film_grain_params(r: &mut BitReader, seq: &SequenceHeader, h: &mut FrameHeade
 fn _fl(x: u32) -> u32 {
     floor_log2(x)
 }
+
+/// NLEPROBEHDR (LEDGER SR226): one METADATA OBU (§5.8.1), the HDR static types read, spec units kept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Metadata {
+    /// METADATA_TYPE_HDR_CLL (§5.8.2): max_cll, max_fall in cd/m².
+    Cll { max_cll: u16, max_fall: u16 },
+    /// METADATA_TYPE_HDR_MDCV (§5.8.3): primary_chromaticity_x/y[i] for R, G, B and the white point in 0.16 fixed point,
+    /// luminance_max 24.8 and luminance_min 18.14 fixed point (cd/m²).
+    Mdcv { primaries: [[u16; 2]; 3], white: [u16; 2], luminance_max: u32, luminance_min: u32 },
+    /// Any other metadata_type (scalability, ITU-T T.35, timecode): its type, the payload not read.
+    Other(u64),
+}
+
+/// NLEPROBEHDR (LEDGER SR226): parse a METADATA OBU payload (§5.8.1 metadata_type leb128, then §5.8.2 / §5.8.3).
+pub fn parse_metadata(payload: &[u8]) -> Result<Metadata> {
+    let mut r = BitReader::new(payload);
+    let metadata_type = r.leb128()?;
+    match metadata_type {
+        1 => Ok(Metadata::Cll { max_cll: r.f(16)? as u16, max_fall: r.f(16)? as u16 }),
+        2 => {
+            let mut primaries = [[0u16; 2]; 3];
+            for p in primaries.iter_mut() {
+                *p = [r.f(16)? as u16, r.f(16)? as u16];
+            }
+            let white = [r.f(16)? as u16, r.f(16)? as u16];
+            let luminance_max = r.f(32)?;
+            let luminance_min = r.f(32)?;
+            Ok(Metadata::Mdcv { primaries, white, luminance_max, luminance_min })
+        }
+        t => Ok(Metadata::Other(t)),
+    }
+}

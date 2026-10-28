@@ -74,7 +74,7 @@ static SURF_AT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsiz
 /// a composite read only in the benign present-tear sense every app surface
 /// shares (`wm` copies rows; a mid-paint read shows a mixed frame, corrected by
 /// the follow-up present).
-fn surf() -> &'static mut [u32] { super::metrics::leaked_surf(&SURF_AT, super::metrics::size(W) * super::metrics::size(IH())) } // SECREVIEW F1: grows with the live scale (was sized once, then sliced at the new scale)
+fn surf() -> &'static mut [u32] { super::metrics::login_surf(&SURF_AT, super::metrics::size(W) * super::metrics::size(IH())) } // SECREVIEW F1: grows with the live scale (was sized once, then sliced at the new scale)
 
 #[derive(Clone, Copy, PartialEq)]
 enum State {
@@ -772,7 +772,7 @@ pub fn open() {
         b"Install UnaOS",
         ox + wm::BORDER(),
         oy + wm::TITLE_H() + wm::BORDER(),
-    );
+    ); super::metrics::leaked_surf_retire(&SURF_AT, "instgui"); // RETIREDRAIN (rmbp-ledger B1055) / RETIREDRAINREST (B1060): the close-drain door is inside `metrics::leaked_surf_retire` (metrics.rs file tail); a refused wait leaves the block for the next re-mint
     if id == wm::WIN_NONE {
         serial_println!("[wc-x] instgui DECLINE reason=create-failed");
         *STATE.lock() = State::Closed;
@@ -1274,7 +1274,7 @@ fn seat_open() {
 /// Fill the capacity surface from logical row `from` to `INST_CAP` with the window's surface colour.
 fn band_clear(from: usize) {
     let cap = INST_CAP.load(Ordering::Relaxed);
-    let px = super::metrics::leaked_surf(&SURF_AT, super::metrics::size(W) * super::metrics::size(cap));
+    let px = super::metrics::login_surf(&SURF_AT, super::metrics::size(W) * super::metrics::size(cap));
     super::metrics::fill(px, super::metrics::size(W), 0, from, W, cap.saturating_sub(from), theme::surface_window());
 }
 

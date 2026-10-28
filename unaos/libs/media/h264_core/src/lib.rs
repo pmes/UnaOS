@@ -98,7 +98,7 @@ pub type Result<T> = core::result::Result<T, Error>;
 
 pub use decoder::Decoder;
 
-/// A decoded frame in output order, cropped (7.4.2.1.1): 8-bit Y, Cb, Cr planes (4:2:0), each
+/// A decoded frame in output order, cropped (7.4.2.1.1): 8-bit Y, Cb, Cr planes (4:2:0 for h264_core; hevc_core: `chroma`), each
 /// row-major without padding.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Frame {
@@ -111,6 +111,14 @@ pub struct Frame {
     pub tag: i64,
     /// VUI video_full_range_flag.
     pub full_range: bool,
+    /// HEVCMAIN10 (SR311): the bit depth of the decoded samples (8 for every h264_core frame).
+    pub bit_depth: u8,
+    /// HEVCMAIN10 (SR311): above 8 bits, the samples as decoded (`planes` then holds them narrowed `>> (bit_depth - 8)`).
+    pub planes16: Option<[Vec<u16>; 3]>,
+    /// HEVCREXT (SR334): the sampling of the Cb / Cr planes (always 4:2:0 from h264_core).
+    pub chroma: ChromaFormat,
+    /// COLOURONE422 (SR359): the bit depth of the Cb / Cr samples (HEVC BitDepthC; `bit_depth` is the luma's; 8 from h264_core).
+    pub bit_depth_c: u8,
 }
 
 impl Frame {
@@ -136,7 +144,7 @@ impl Frame {
             ],
             poc: p.poc,
             tag: p.tag,
-            full_range: p.full_range,
+            full_range: p.full_range, bit_depth: 8, planes16: None, chroma: ChromaFormat::Yuv420, bit_depth_c: 8,
         }
     }
 
@@ -153,5 +161,27 @@ impl Frame {
             v.extend_from_slice(p);
         }
         v
+    }
+}
+
+/// HEVCREXT (SR334): the sampling of a [`Frame`]'s Cb / Cr planes against its luma plane (H.265 Table 6-1). HEVCREXTTOOLS
+/// (SR345): `Mono` (chroma_format_idc 0) has no Cb / Cr samples; its Frame carries empty chroma planes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ChromaFormat {
+    #[default]
+    Yuv420,
+    Yuv422,
+    Yuv444,
+    Mono,
+}
+
+impl ChromaFormat {
+    /// (SubWidthC, SubHeightC).
+    pub const fn sub(self) -> (usize, usize) {
+        match self {
+            ChromaFormat::Yuv420 => (2, 2),
+            ChromaFormat::Yuv422 => (2, 1),
+            ChromaFormat::Yuv444 | ChromaFormat::Mono => (1, 1),
+        }
     }
 }

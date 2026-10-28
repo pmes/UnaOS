@@ -135,7 +135,7 @@ fn say(bar_ms: u64) {
 
 /// Log Out: the desktop object goes — the bar off, unbuilt, one composite vacates the bar's and the dock's pixels.
 pub fn teardown(why: &'static str) {
-    #[cfg(all(target_arch = "x86_64", feature = "wc"))] memcensus::before(); OWED_AT.store(0, Release); #[cfg(feature = "quarry")] super::quarry::undo::clear(); #[cfg(all(target_arch = "x86_64", feature = "wc"))] super::launcher::filesearch::icon_cache_clear(); // FSEARCHICONS (B760): the Files icons' type cache goes with the session (LINE-NEUTRAL, code before comment). crawl A 1: the undo journal goes with the session
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))] memcensus::before(why); OWED_AT.store(0, Release); #[cfg(feature = "quarry")] super::quarry::undo::clear(); #[cfg(all(target_arch = "x86_64", feature = "wc"))] super::launcher::filesearch::icon_cache_clear(); // FSEARCHICONS (B760): the Files icons' type cache goes with the session (LINE-NEUTRAL, code before comment). crawl A 1: the undo journal goes with the session
     probe_reset();
     PAINT_AT.store(0, Release);
     LAST_BATT.store(u32::MAX, Relaxed);
@@ -536,7 +536,7 @@ pub fn memline_selftest() {
         serial_println!(":: MEMLINE: -> SKIP :: reason=no-desktop-built");
         return;
     }
-    let src = if builds0 >= 2 {
+    let src = if builds0 >= 2 { if memline_logout_refused(builds0) { return; }
         "logout"
     } else {
         if !settled() {
@@ -554,7 +554,7 @@ pub fn memline_selftest() {
         "rebuild"
     };
     let builds = MEM_BUILDS.load(Acquire);
-    let (used, high, furn, delta) = (MEM_USED.load(Relaxed), MEM_HIGH.load(Relaxed), MEM_FURN.load(Relaxed), MEM_DELTA.load(Relaxed)); #[cfg(all(target_arch = "x86_64", feature = "wc"))] let delta = memcensus::report(MEM_FIRST_HIGH.load(Relaxed), high, delta); // MEMLINE2 (B821): the census lines; the delta scored is net of the count-once growth (raw printed beside). LINE-NEUTRAL append, code first
+    let (used, high, furn, delta) = (MEM_USED.load(Relaxed), MEM_HIGH.load(Relaxed), MEM_FURN.load(Relaxed), MEM_DELTA.load(Relaxed)); #[cfg(all(target_arch = "x86_64", feature = "wc"))] let (delta, rl) = memcensus::report(MEM_FIRST_HIGH.load(Relaxed), high, delta, src); #[cfg(all(target_arch = "x86_64", feature = "wc"))] let src = rl.as_str(); // MEMLINE2 (B821): the census lines; the delta scored is net of the count-once growth (raw printed beside). MEMLINEREBUILD (B1009): a rebuild scored net of the session's retained set; `src=` carries `retained_kb= leaked_kb=`. LINE-NEUTRAL append, code first
     let furn_read = furn != u64::MAX;
     let (high_kb, furn_kb) = (high / 1024, if furn_read { furn / 1024 } else { 0 });
     let measured = builds >= 2 && high > 0 && furn_read;
@@ -605,9 +605,12 @@ mod memcensus {
     const BEFORE: usize = 1;
     const AFTER: usize = 2;
     /// The count-once set (census tag names).
-    const ONCE: [&str; 4] = ["stage", "shadow", "wallpaper", "help"];
+    const ONCE: [&str; 7] = ["stage", "shadow", "wallpaper", "help", "gen7-held", "slot-record", "login-surface"]; // SLOTRECTAG (B1030): the slot record joins the count-once set. LOGINFURNITUREONCE (B1041): the login furniture's grow-once surface joins it
     /// FIRST, BEFORE, AFTER. Each snapshot is taken (heap lock) before this lock: the two never nest.
     static SNAPS: crate::sync::Mutex<[Option<Snapshot>; 3]> = crate::sync::Mutex::new([None; 3]);
+    /// MEMLINE-LOGOUT (B1032): BEFORE was taken at the Log Out's first line ([`logout_first`]); the logout's own
+    /// teardown keeps it (one-shot, consumed by `before("logout")`).
+    static LOGOUT_BEFORE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
     /// A build line: the first is the boot's reference, every later one is AFTER.
     pub(super) fn at_build() {
@@ -616,22 +619,37 @@ mod memcensus {
         if g[FIRST].is_none() {
             g[FIRST] = Some(s);
         } else {
-            g[AFTER] = Some(s);
+            g[AFTER] = Some(s); super::MEM_BEFORE_NEWER.store(false, core::sync::atomic::Ordering::Release);
         }
     }
 
-    /// [`super::teardown`]'s first line: what the session held.
-    pub(super) fn before() {
+    /// [`super::teardown`]'s first line: what the session held (a Log Out's BEFORE is its first line's, kept).
+    pub(super) fn before(why: &str) {
+        if why == "logout" && LOGOUT_BEFORE.swap(false, core::sync::atomic::Ordering::AcqRel) {
+            return;
+        }
         let s = census::snapshot();
-        SNAPS.lock()[BEFORE] = Some(s);
+        SNAPS.lock()[BEFORE] = Some(s); super::MEM_BEFORE_NEWER.store(true, core::sync::atomic::Ordering::Release);
     }
 
-    /// `tests memline`: print the census and return the delta net of the count-once growth (`raw` when unread).
-    pub(super) fn report(first_high: u64, high: u64, raw: i64) -> i64 {
+    // MEMLINEREBUILD (rmbp-ledger B1009, BP-video-18). Flight 38 boot 1: `logout_delta_pct=29 -> FAIL :: src=rebuild`
+    // with the round trip FLAT (census BEFORE == AFTER, three rebuilds at one heap_kb, MEMLEAK leak_rows=0) — the 29 %
+    // was the session's growth between the first build and the teardown, held by non-desktop owners (the boot list's
+    // fixture children, the render task, the U5x launcher), charged to the desktop by scoring against FIRST's high.
+    // retained = BEFORE.used - FIRST.used (any owner, the session's growth before the teardown); leaked = AFTER.used -
+    // BEFORE.used, signed (the round trip's net; negative = teardown freed session state). `src=rebuild` (the
+    // fixture's own teardown just took BEFORE) scores delta_pct(first_high, high - retained - once_rt), once_rt = the
+    // count-once tags' growth BEFORE -> AFTER (their FIRST -> BEFORE growth is inside retained): a round-trip leak or a
+    // fatter build transient still lands in `high`. MEMLINE-LOGOUT (B1032): `src=logout` takes the same [`net_high`]; its
+    // BEFORE is the Log Out's first line (login.rs, before `users::logout`; [`logout_first`]), so the per-login state
+    // cancels. The second value is `<src> retained_kb=<n> leaked_kb=<n>` (`?` unread) for the `:: MEMLINE:` line.
+    /// `tests memline`: print the census and return the delta net of the count-once growth (`raw` when unread), with
+    /// the `src=` word carrying `retained_kb= leaked_kb=` (MEMLINEREBUILD B1009).
+    pub(super) fn report(first_high: u64, high: u64, raw: i64, src: &str) -> (i64, alloc::string::String) {
         let snaps = *SNAPS.lock();
         let (Some(f), Some(a)) = (snaps[FIRST], snaps[AFTER]) else {
             serial_println!("[memline] census absent first={} after={} raw_delta_pct={}", snaps[FIRST].is_some() as u8, snaps[AFTER].is_some() as u8, raw);
-            return raw;
+            return (raw, alloc::format!("{} retained_kb=? leaked_kb=?", src));
         };
         let b = snaps[BEFORE].unwrap_or(a);
         // Every owner any of the three saw, with its growth since FIRST; largest |growth| first.
@@ -666,7 +684,60 @@ mod memcensus {
         if top.is_empty() {
             top.push('-');
         }
-        serial_println!("[memline] top {} once_kb={} once=stage,shadow,wallpaper,help raw_delta_pct={}", top, once / 1024, raw);
-        super::delta_pct(first_high, high.saturating_sub(once))
+        serial_println!("[memline] top {} once_kb={} once=stage,shadow,wallpaper,help,gen7-held,slot-record,login-surface raw_delta_pct={}", top, once / 1024, raw);
+        let retained = b.used.saturating_sub(f.used); // MEMLINEREBUILD (B1009): the session's growth before the teardown
+        let leaked = a.used as i64 - b.used as i64;
+        let scored = if snaps[BEFORE].is_some() { net_high(&b, &a, retained, high) } else { high.saturating_sub(once) }; // MEMLINE-LOGOUT (B1032): both arms
+        (super::delta_pct(first_high, scored), alloc::format!("{} retained_kb={} leaked_kb={}", src, retained / 1024, leaked / 1024))
     }
+
+    /// MEMLINE-LOGOUT (rmbp-ledger B1032, BP-video-18): MEMLINEREBUILD's (B1009) arithmetic, ONE fn both `src=` arms
+    /// take: the build's high net of the session's retained growth and the count-once tags' growth BEFORE -> AFTER.
+    fn net_high(b: &Snapshot, a: &Snapshot, retained: u64, high: u64) -> u64 {
+        let once_rt: u64 = ONCE.iter().map(|t| a.bytes_of(t, true).saturating_sub(b.bytes_of(t, true))).sum();
+        high.saturating_sub(retained.saturating_add(once_rt))
+    }
+
+    /// MEMLINE-LOGOUT (B1032): the Log Out's first line (before `users::logout` frees the session): BEFORE is the
+    /// session as held; the logout's own teardown keeps it.
+    pub(super) fn logout_first() {
+        let s = census::snapshot();
+        SNAPS.lock()[BEFORE] = Some(s);
+        LOGOUT_BEFORE.store(true, core::sync::atomic::Ordering::Release); super::MEM_BEFORE_NEWER.store(true, core::sync::atomic::Ordering::Release);
+    }
+}
+
+/// MEMLINE-LOGOUT (rmbp-ledger B1032): `login::reopen_after_logout`'s first line past its refusal check, before
+/// `users::logout` — the memory census's BEFORE for the Log Out round trip (`tests memline` `src=logout`).
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+pub fn logout_census() {
+    memcensus::logout_first();
+}
+
+// LOGINFURNITUREONCE (rmbp-ledger B1041, BP-video-18) — MEMLINE-LOGGEDOUT. `tests memline`'s logout arm (builds >= 2)
+// scored whatever FIRST/BEFORE/AFTER held: run while logged out, BEFORE (the newest Log Out's first line) is NEWER
+// than AFTER (the previous login's build) and the pair is not a round trip. [`MEM_BEFORE_NEWER`] is set where
+// memcensus writes BEFORE (`before`, `logout_first`) and cleared where it writes AFTER (`at_build`); the arm now takes
+// B1009's guard by name ([`settled`]) and refuses as a named SKIP, never a FAIL:
+// `:: MEMLINE: -> SKIP :: src=logout why=<logged-out|build-in-flight> builds=<n>`.
+/// BEFORE was taken after the last AFTER (x86 `wc`: memcensus's three snapshots).
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+static MEM_BEFORE_NEWER: AtomicBool = AtomicBool::new(false);
+
+/// The logout arm's guard: `true` = refused (the SKIP line said). Logged out = torn down with nothing owed.
+fn memline_logout_refused(builds0: u32) -> bool {
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+    let newer = MEM_BEFORE_NEWER.load(Acquire);
+    #[cfg(not(all(target_arch = "x86_64", feature = "wc")))]
+    let newer = false;
+    let down = !BUILT.load(Acquire) && OWED_AT.load(Acquire) == 0;
+    let why = if down {
+        "logged-out"
+    } else if newer || !settled() {
+        "build-in-flight"
+    } else {
+        return false;
+    };
+    serial_println!(":: MEMLINE: -> SKIP :: src=logout why={} builds={}", why, builds0);
+    true
 }

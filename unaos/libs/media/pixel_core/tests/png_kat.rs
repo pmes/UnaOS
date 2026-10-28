@@ -55,3 +55,59 @@ fn encoder_round_trips_through_decoder() {
     let want: Vec<u8> = rgb.chunks(3).flat_map(|p| [p[0], p[1], p[2], 255]).collect();
     assert_eq!(img.rgba, want);
 }
+
+/// PIXEL-UNFILTER (SR316): forward PNG filter of `rows` (each `bpp`-pixel line) with filter type `ft`, the test's
+/// own encoder (§9.2-9.4), so `unfilter_rows` is checked against an independent writer.
+fn png_filter(rows: &[Vec<u8>], bpp: usize, ft: u8) -> Vec<u8> {
+    fn paeth(a: u8, b: u8, c: u8) -> u8 {
+        let p = a as i16 + b as i16 - c as i16;
+        let (pa, pb, pc) = ((p - a as i16).abs(), (p - b as i16).abs(), (p - c as i16).abs());
+        if pa <= pb && pa <= pc { a } else if pb <= pc { b } else { c }
+    }
+    let mut out = Vec::new();
+    let mut prev = vec![0u8; rows[0].len()];
+    for r in rows {
+        out.push(ft);
+        for i in 0..r.len() {
+            let a = if i >= bpp { r[i - bpp] } else { 0 };
+            let b = prev[i];
+            let c = if i >= bpp { prev[i - bpp] } else { 0 };
+            let pred = match ft {
+                0 => 0,
+                1 => a,
+                2 => b,
+                3 => ((a as u16 + b as u16) / 2) as u8,
+                _ => paeth(a, b, c),
+            };
+            out.push(r[i].wrapping_sub(pred));
+        }
+        prev = r.clone();
+    }
+    out
+}
+
+#[test]
+fn unfilter_rows_five_types() {
+    use pixel_core::png::unfilter_rows;
+    // 3x2 RGB, 8 bits: bpp 3, 9 bytes a row, stride 10.
+    let rows = vec![vec![10u8, 20, 30, 40, 50, 60, 70, 80, 90], vec![15u8, 25, 35, 200, 10, 250, 5, 128, 255]];
+    let want = rows.concat();
+    for ft in 0..5u8 {
+        let mut d = png_filter(&rows, 3, ft);
+        unfilter_rows(3, 10, &mut d).unwrap();
+        let got: Vec<u8> = d.chunks(10).flat_map(|l| l[1..].to_vec()).collect();
+        assert_eq!(got, want, "filter type {ft}");
+    }
+    // Hand-written Sub row: x[i] - x[i-3].
+    let mut d = vec![1u8, 10, 20, 30, 30, 30, 30, 30, 30, 30];
+    unfilter_rows(3, 10, &mut d).unwrap();
+    assert_eq!(&d[1..], &rows[0][..]);
+    // A short last row (PDF predictor streams that stop mid-row): Up over the full row before it.
+    let mut d = png_filter(&rows, 3, 2);
+    d.truncate(14);
+    unfilter_rows(3, 10, &mut d).unwrap();
+    assert_eq!(&d[11..14], &rows[1][..3]);
+    // An unknown filter type is refused by name.
+    let mut d = vec![5u8; 10];
+    assert!(matches!(unfilter_rows(3, 10, &mut d), Err(pixel_core::Error::Malformed("png filter type"))));
+}

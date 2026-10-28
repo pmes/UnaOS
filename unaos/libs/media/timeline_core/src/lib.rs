@@ -12,7 +12,8 @@
 //!   [`Track`]s of [`Clip`]s. A clip shows source ticks `src_in..src_out` from timeline tick `at`.
 //! * The operations are pure: each takes `&self` and returns a new, validated `Timeline` or an [`EditError`]
 //!   ([`Timeline::place`], [`Timeline::split`], [`Timeline::trim_in`], [`Timeline::trim_out`],
-//!   [`Timeline::ripple_delete`], [`Timeline::lift`], [`Timeline::move_clip`]).
+//!   [`Timeline::ripple_delete`], [`Timeline::lift`], [`Timeline::move_clip`]; NLE2c LEDGER SR217: over a set of clips
+//!   as ONE edit, [`Timeline::ripple_delete_many`], [`Timeline::lift_many`], [`Timeline::move_many`]).
 //! * The invariants ([`Timeline::validate`]): on every track clips are ordered by `at` and never overlap; `at >= 0`;
 //!   `0 <= src_in < src_out <= source.duration`; every clip names a source that exists.
 //! * [`edl`]: the CMX 3600 text EDL (non-drop frame) — reader and writer.
@@ -20,18 +21,28 @@
 //! * Transitions (NLE3, LEDGER SR202): a [`Transition`] (a dissolve or an edge wipe, `dur` ticks) sits on a cut of a
 //!   video track and STARTS at it (CMX 3600's alignment): ticks `at..at+dur` show the incoming clip's own first `dur`
 //!   ticks mixed with the outgoing source's handle (`src_out..src_out+dur`). [`Timeline::add_transition`] /
-//!   [`Timeline::remove_transition`]; [`Timeline::validate`] refuses a transition off a cut ([`EditError::Transition`],
-//!   so an op that moves or removes a transition's cut is refused until the transition is removed) or longer than the
+//!   [`Timeline::remove_transition`]; [`Timeline::validate`] refuses a transition off a cut ([`EditError::Transition`];
+//!   NLE3E SR225: an op first moves each transition to its surviving cut, refusing one whose cut is gone) or longer than the
 //!   outgoing's handle or the incoming clip ([`EditError::Handle`]).
 //! * NLE3b/NLE3c (LEDGER SR209): a video transition implies the audio crossfade on every audio track whose clips butt
 //!   at the same cut with the same sources ([`Timeline::audio_crossfade`]; `validate` refuses [`EditError::Handle`]
 //!   when the audio clips' handle is short); wipes gain SMPTE W041 / W101 / W201; a transition may come FROM black
-//!   ([`Transition::from_black`], [`Timeline::add_transition_from_black`], CMX's `BL` outgoing line).
+//!   ([`Transition::from_black`], [`Timeline::add_transition_from_black`], CMX's `BL` outgoing line); NLE3cBLACK (LEDGER SR323): or go TO black ([`Transition::to_black`], [`Timeline::add_transition_to_black`], CMX's `BL` incoming line: the outgoing's handle over black in the gap `at..at + dur`), and wipes gain W003-W006 / W021 / W022 / W042 / W202-W204.
 //! * Audio (NLE4, LEDGER SR203): a clip carries a gain in centi-dB ([`Clip::gain_cdb`], 0 = unity) and linear fades in
 //!   ticks ([`Clip::fade_in`], [`Clip::fade_out`], 0 = none; `fade_in + fade_out <= len`); [`Timeline::set_gain`] and
 //!   [`Timeline::set_fades`] edit them; [`schedule::audio_runs`] mixes every audio track.
 //! * [`editor`] (NLE6, LEDGER SR207): the editor's state (`EditorState`: selection, playhead, zoom, undo / redo over the ops), one
 //!   model for the host face (`stria::nle_face`) and the on-UnaOS face (the kernel Player's EDL mode).
+//! * Edit lists (EDITMAP, LEDGER SR223): an MP4 `elst` IS a timeline over one source; [`Timeline::lay_edit_list`] lays
+//!   a stream's segments on a track (each media segment a clip, an empty edit a gap, a repeat two clips over one source
+//!   range) and refuses a rate other than 1 by name ([`EditError::Rate`]).
+//! * [`vmix`] (NLE6MIX, rmbp-ledger B899): the ONE video transition mix ([`vmix::mix_step`]) and outgoing-run rule
+//!   ([`vmix::take_outgoing`]) Stria's render and the kernel Player's EDL mode both call.
+//! * [`view`] (NLE6KEYS, rmbp-ledger B961): the editor's ONE track view — the geometry ([`view::Layout`]) and the painter
+//!   ([`view::paint_in`]) the host face (`stria::nle_face`) and the kernel Player's EDL view band both draw.
+//! * EXPORTCOLOURPRIM (rmbp-ledger B979): [`Timeline::reels_colour`] — the ONE file-colour rule both exports call (Stria's `nle_export::export`, the kernel's EDL export).
+//! * NLESIZEPOLICY (LEDGER SR394): each [`Source`] carries a [`SizePolicy`] (`* UNA SIZE` in the [`edl`]) — how a frame of
+//!   another size than its reel's first fills the reel's box; [`SizePolicy::place`] is the ONE geometry both faces read.
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -44,6 +55,8 @@ use alloc::vec::Vec;
 pub mod edl;
 pub mod editor;
 pub mod schedule;
+pub mod vmix;
+pub mod view;
 
 /// The ONE time-base type (demux_core's): seconds per tick = `num / den`. A timeline's is `1/fps`.
 pub use demux_core::Timebase;
@@ -65,6 +78,8 @@ pub struct Source {
     pub id: SourceId,
     pub reel: String,
     pub duration: i64,
+    /// NLESIZEPOLICY (SR394): how a frame of another size than the reel's first fills it ([`SizePolicy::Letterbox`] by default).
+    pub size_policy: SizePolicy,
 }
 
 /// One event: source ticks `src_in..src_out` (exclusive end) shown from timeline tick `at`.
@@ -136,6 +151,26 @@ pub enum WipeDir {
     Box,
     /// NLE3c `W201` (SMPTE 258M clockWipe clockwiseTwelve): a hand sweeping clockwise from twelve o'clock.
     Clock,
+    /// NLE3cBLACK `W003` (SMPTE 258M boxWipe topLeft): a box growing from the top-left corner (the incoming inside).
+    CornerTopLeft,
+    /// NLE3cBLACK `W004` (boxWipe topRight): a box growing from the top-right corner.
+    CornerTopRight,
+    /// NLE3cBLACK `W005` (boxWipe bottomRight): a box growing from the bottom-right corner.
+    CornerBottomRight,
+    /// NLE3cBLACK `W006` (boxWipe bottomLeft): a box growing from the bottom-left corner.
+    CornerBottomLeft,
+    /// NLE3cBLACK `W021` (barnDoorWipe vertical): two vertical edges opening from the centre column (the incoming between).
+    BarnDoorVertical,
+    /// NLE3cBLACK `W022` (barnDoorWipe horizontal): two horizontal edges opening from the centre row.
+    BarnDoorHorizontal,
+    /// NLE3cBLACK `W042` (diagonalWipe topRight): a diagonal edge from the top-right corner.
+    DiagonalTopRight,
+    /// NLE3cBLACK `W202` (clockWipe clockwiseThree): a hand sweeping clockwise from three o'clock.
+    ClockThree,
+    /// NLE3cBLACK `W203` (clockWipe clockwiseSix): from six o'clock.
+    ClockSix,
+    /// NLE3cBLACK `W204` (clockWipe clockwiseNine): from nine o'clock.
+    ClockNine,
 }
 
 impl WipeDir {
@@ -147,6 +182,16 @@ impl WipeDir {
             WipeDir::Diagonal => 41,
             WipeDir::Box => 101,
             WipeDir::Clock => 201,
+            WipeDir::CornerTopLeft => 3,
+            WipeDir::CornerTopRight => 4,
+            WipeDir::CornerBottomRight => 5,
+            WipeDir::CornerBottomLeft => 6,
+            WipeDir::BarnDoorVertical => 21,
+            WipeDir::BarnDoorHorizontal => 22,
+            WipeDir::DiagonalTopRight => 42,
+            WipeDir::ClockThree => 202,
+            WipeDir::ClockSix => 203,
+            WipeDir::ClockNine => 204,
         }
     }
     pub fn from_code(code: u16) -> Option<WipeDir> {
@@ -156,6 +201,16 @@ impl WipeDir {
             41 => Some(WipeDir::Diagonal),
             101 => Some(WipeDir::Box),
             201 => Some(WipeDir::Clock),
+            3 => Some(WipeDir::CornerTopLeft),
+            4 => Some(WipeDir::CornerTopRight),
+            5 => Some(WipeDir::CornerBottomRight),
+            6 => Some(WipeDir::CornerBottomLeft),
+            21 => Some(WipeDir::BarnDoorVertical),
+            22 => Some(WipeDir::BarnDoorHorizontal),
+            42 => Some(WipeDir::DiagonalTopRight),
+            202 => Some(WipeDir::ClockThree),
+            203 => Some(WipeDir::ClockSix),
+            204 => Some(WipeDir::ClockNine),
             _ => None,
         }
     }
@@ -178,6 +233,9 @@ pub struct Transition {
     pub dur: i64,
     /// NLE3c: the outgoing is BLACK (CMX `BL`): no clip ends at `at`, and the incoming fades / wipes in from black.
     pub from_black: bool,
+    /// NLE3cBLACK (SR323): the incoming is BLACK (CMX `BL` incoming line): no clip starts at `at`; the outgoing's handle
+    /// fades / wipes out to black over `at..at + dur`, the black filling that gap of the track. Never with `from_black`.
+    pub to_black: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -223,6 +281,11 @@ pub enum EditError {
     Fade,
     /// NLE4: a gain outside `GAIN_MIN_CDB..=GAIN_MAX_CDB`.
     Gain,
+    /// EDITMAP (SR223): an edit-list segment at a rate other than 1 (slow / fast motion, or a rate-0 dwell hold): the
+    /// model has no speed op.
+    Rate,
+    /// NLESIZEPOLICYUI (SR402): the editor's `size` verb named no [`SizePolicy`] word (or the wrong number of words).
+    Policy,
 }
 
 impl core::fmt::Display for EditError {
@@ -240,6 +303,8 @@ impl core::fmt::Display for EditError {
             EditError::Handle => "transition is longer than a clip's handle",
             EditError::Fade => "fades longer than the clip",
             EditError::Gain => "gain out of range",
+            EditError::Rate => "edit list rate is not 1 (no speed op)",
+            EditError::Policy => "no such size policy (letterbox, fill, stretch, adopt)",
         })
     }
 }
@@ -266,7 +331,7 @@ impl Timeline {
     /// Add a source (builder); its id is its index.
     pub fn add_source(&mut self, reel: &str, duration: i64) -> SourceId {
         let id = SourceId(self.sources.len() as u32);
-        self.sources.push(Source { id, reel: String::from(reel), duration });
+        self.sources.push(Source { id, reel: String::from(reel), duration, size_policy: SizePolicy::Letterbox });
         id
     }
     /// Add an empty track (builder); returns its index.
@@ -349,6 +414,15 @@ impl Timeline {
             last = Some(x.at);
             let out = t.clips.iter().find(|c| c.end() == x.at);
             let inc = t.clips.iter().find(|c| c.at == x.at);
+            if x.to_black {
+                // NLE3cBLACK: to black: an outgoing clip, NO incoming one, its handle, and nothing starting inside the black.
+                let (Some(o), None, false) = (out, inc, x.from_black) else { return Err(EditError::Transition) };
+                let handle = self.source(o.src).ok_or(EditError::NoSource)?.duration - o.src_out;
+                if x.dur > handle || t.clips.iter().any(|c| c.at > x.at && c.at < x.at + x.dur) {
+                    return Err(EditError::Handle);
+                }
+                continue;
+            }
             if x.from_black {
                 // NLE3c: from black: an incoming clip and NO outgoing one (a cut with an outgoing is a plain transition).
                 let (None, Some(i)) = (out, inc) else { return Err(EditError::Transition) };
@@ -368,12 +442,12 @@ impl Timeline {
 
     /// NLE3: put a transition on the cut at tick `at` of `track` (replacing one already there).
     pub fn add_transition(&self, track: usize, at: i64, kind: TransitionKind, dur: i64) -> Result<Timeline, EditError> {
-        self.put_transition(track, Transition { at, kind, dur, from_black: false })
+        self.put_transition(track, Transition { at, kind, dur, from_black: false, to_black: false })
     }
 
     /// NLE3c: put a transition FROM BLACK on the clip starting at tick `at` of `track` (no clip may end there).
     pub fn add_transition_from_black(&self, track: usize, at: i64, kind: TransitionKind, dur: i64) -> Result<Timeline, EditError> {
-        self.put_transition(track, Transition { at, kind, dur, from_black: true })
+        self.put_transition(track, Transition { at, kind, dur, from_black: true, to_black: false })
     }
 
     /// The one body of the two `add_transition` ops: replace whatever sits at `x.at`, keep `at` order, validate.
@@ -443,7 +517,7 @@ impl Timeline {
         }
         t.clips.push(clip);
         sort(t);
-        tl.validate()?;
+        tl.retarget_transitions(self)?; tl.validate()?;
         Ok(tl)
     }
 
@@ -465,7 +539,7 @@ impl Timeline {
         let c = clip_mut(&mut tl, track, idx)?;
         c.at += src_in - c.src_in;
         c.src_in = src_in;
-        tl.validate()?;
+        tl.retarget_transitions(self)?; tl.validate()?;
         Ok(tl)
     }
 
@@ -473,7 +547,7 @@ impl Timeline {
     pub fn trim_out(&self, track: usize, idx: usize, src_out: i64) -> Result<Timeline, EditError> {
         let mut tl = self.clone();
         clip_mut(&mut tl, track, idx)?.src_out = src_out;
-        tl.validate()?;
+        tl.retarget_transitions(self)?; tl.validate()?;
         Ok(tl)
     }
 
@@ -488,7 +562,7 @@ impl Timeline {
         for c in tr.clips.iter_mut().filter(|c| c.at >= gone.end()) {
             c.at -= gone.len();
         }
-        tl.validate()?;
+        tl.retarget_transitions(self)?; tl.validate()?;
         Ok(tl)
     }
 
@@ -500,7 +574,7 @@ impl Timeline {
             return Err(EditError::NoClip);
         }
         tr.clips.remove(idx);
-        tl.validate()?;
+        tl.retarget_transitions(self)?; tl.validate()?;
         Ok(tl)
     }
 
@@ -522,7 +596,7 @@ impl Timeline {
         c.at = to_at;
         tl.tracks[to_track].clips.push(c);
         sort(&mut tl.tracks[to_track]);
-        tl.validate()?;
+        tl.retarget_transitions(self)?; tl.validate()?;
         Ok(tl)
     }
 
@@ -541,6 +615,128 @@ impl Timeline {
         (c.fade_in, c.fade_out) = (fade_in, fade_out);
         tl.validate()?;
         Ok(tl)
+    }
+
+    /// EDITMAP (LEDGER SR223): lay one stream's edit list (demux_core's [`demux_core::EditSegment`]s, every `elst` entry)
+    /// on `track` as clips of `src`. `media` is the stream's time base and `origin_ns` its first presentation time (source
+    /// tick 0, vplay's rule), so a segment's `media_pts` maps to source tick `from_ns(media.to_ns(media_pts) - origin_ns)`.
+    /// An empty edit is a gap (the later segments' `start_ns` already count it); a media segment is a clip at
+    /// `from_ns(start_ns)` lasting to `from_ns(start_ns + duration_ns)` (duration 0 = the rest of the source; a segment
+    /// rounding to no tick is skipped; a `src_out` one tick past the source, rounding, is clamped to it); a rate other
+    /// than 1 (`0x1_0000`) is [`EditError::Rate`]. An empty list is the identity: the whole source at tick 0.
+    pub fn lay_edit_list(&self, track: usize, src: SourceId, edits: &[demux_core::EditSegment], media: Timebase, origin_ns: i64) -> Result<Timeline, EditError> {
+        let mut tl = self.clone();
+        let dur = tl.source(src).ok_or(EditError::NoSource)?.duration;
+        let tb = tl.tb;
+        let t = tl.tracks.get_mut(track).ok_or(EditError::NoTrack)?;
+        if edits.is_empty() {
+            t.clips.push(Clip::new(src, 0, dur, 0));
+        }
+        for e in edits {
+            let Some(pts) = e.media_pts else { continue };
+            if e.rate != 0x1_0000 {
+                return Err(EditError::Rate);
+            }
+            let at = tb.from_ns(e.start_ns);
+            let src_in = tb.from_ns(media.to_ns(pts).saturating_sub(origin_ns));
+            let mut src_out = if e.duration_ns == 0 {
+                dur
+            } else {
+                let end = tb.from_ns(e.start_ns.saturating_add(i64::try_from(e.duration_ns).unwrap_or(i64::MAX)));
+                src_in + (end - at)
+            };
+            if src_out == dur + 1 {
+                src_out = dur;
+            }
+            if src_out > src_in {
+                t.clips.push(Clip::new(src, src_in, src_out, at));
+            }
+        }
+        sort(t);
+        tl.validate()?;
+        Ok(tl)
+}
+
+    /// NLE3E (LEDGER SR225): after an op moved clips, move every transition of `before` to where its cut now is. A cut
+    /// is known by its clips' SOURCE edges (clips have no ids): the incoming's `(src, src_in)` and the outgoing's
+    /// `(src, src_out)` (from black: no clip ends at the cut). The match nearest the old tick wins (ties: the earlier).
+    /// A cut that no longer exists (a clip deleted, moved or trimmed at the cut, a clip inserted into it) is REFUSED by
+    /// name, `EditError::Transition`, never dropped: the op did not name the transition. `validate` stays the one gate.
+    fn retarget_transitions(&mut self, before: &Timeline) -> Result<(), EditError> {
+        for (k, bt) in before.tracks.iter().enumerate() {
+            if bt.transitions.is_empty() {
+                continue;
+            }
+            let clips = &self.tracks.get(k).ok_or(EditError::NoTrack)?.clips;
+            let mut moved = Vec::with_capacity(bt.transitions.len());
+            for x in &bt.transitions {
+                if x.to_black { moved.push(Transition { at: black_cut(bt, clips, x)?, ..*x }); continue; } // NLE3cBLACK
+                let inc = bt.clips.iter().find(|c| c.at == x.at).ok_or(EditError::Transition)?;
+                let out = bt.clips.iter().find(|c| c.end() == x.at);
+                let at = clips
+                    .iter()
+                    .filter(|i| i.src == inc.src && i.src_in == inc.src_in)
+                    .map(|i| i.at)
+                    .filter(|&at| match (out, clips.iter().find(|c| c.end() == at)) {
+                        (Some(a), Some(b)) => a.src == b.src && a.src_out == b.src_out,
+                        (None, None) => true,
+                        _ => false,
+                    })
+                    .min_by_key(|&at| ((at - x.at).abs(), at))
+                    .ok_or(EditError::Transition)?;
+                moved.push(Transition { at, ..*x });
+            }
+            moved.sort_by_key(|y| y.at);
+            self.tracks[k].transitions = moved;
+        }
+        Ok(())
+    }
+
+    /// NLE2c: ripple-delete every clip in `picks` (`(track, idx)`, indices into `self`) as ONE edit: [`Timeline::ripple_delete`]
+    /// applied per pick in descending `(track, idx)` order on the running value. Any refusal refuses the whole set.
+    pub fn ripple_delete_many(&self, picks: &[(usize, usize)]) -> Result<Timeline, EditError> {
+        let mut tl = self.clone();
+        for (t, i) in picks_desc(self, picks)? {
+            tl = tl.ripple_delete(t, i)?;
+        }
+        Ok(tl)
+    }
+
+    /// NLE2c: lift every clip in `picks` as ONE edit ([`Timeline::lift`] per pick, descending; the holes stay).
+    pub fn lift_many(&self, picks: &[(usize, usize)]) -> Result<Timeline, EditError> {
+        let mut tl = self.clone();
+        for (t, i) in picks_desc(self, picks)? {
+            tl = tl.lift(t, i)?;
+        }
+        Ok(tl)
+    }
+
+    /// NLE2c: move every clip in `picks` by `delta` ticks on its own track as ONE transaction: all leave, all land, ONE
+    /// `validate` (an overlap, a negative `at` or a pinned transition refuses the whole set). Butted clips move together,
+    /// where a sequence of [`Timeline::move_clip`]s would trip on an intermediate overlap.
+    pub fn move_many(&self, picks: &[(usize, usize)], delta: i64) -> Result<Timeline, EditError> {
+        let order = picks_desc(self, picks)?;
+        let mut tl = self.clone();
+        let mut moved: Vec<(usize, Clip)> = Vec::new();
+        for (t, i) in order {
+            let mut c = tl.tracks[t].clips.remove(i);
+            c.at = c.at.saturating_add(delta);
+            moved.push((t, c));
+        }
+        for (t, c) in moved {
+            tl.tracks[t].clips.push(c);
+        }
+        for t in &mut tl.tracks {
+            sort(t);
+        }
+        tl.validate()?;
+        Ok(tl)
+    }
+
+    /// NLE3cBLACK (LEDGER SR323): put a transition TO BLACK on the clip ending at tick `at_end` of `track` (no clip may
+    /// start there): ticks `at_end..at_end + dur` show the outgoing's handle mixed with black, in the track's gap.
+    pub fn add_transition_to_black(&self, track: usize, at_end: i64, kind: TransitionKind, dur: i64) -> Result<Timeline, EditError> {
+        self.put_transition(track, Transition { at: at_end, kind, dur, from_black: false, to_black: true })
     }
 }
 
@@ -573,4 +769,127 @@ fn carve(t: &mut Track, a: i64, b: i64) {
     split_at(t, a);
     split_at(t, b);
     t.clips.retain(|c| !(c.at >= a && c.end() <= b));
+}
+
+/// NLE2c: a set of `(track, idx)` picks checked against `tl` (none -> `NoClip`, a bad track -> `NoTrack`, a bad index ->
+/// `NoClip`), deduped and sorted descending so removing them one by one never shifts a later pick.
+fn picks_desc(tl: &Timeline, picks: &[(usize, usize)]) -> Result<Vec<(usize, usize)>, EditError> {
+    if picks.is_empty() {
+        return Err(EditError::NoClip);
+    }
+    for &(t, i) in picks {
+        if i >= tl.tracks.get(t).ok_or(EditError::NoTrack)?.clips.len() {
+            return Err(EditError::NoClip);
+        }
+    }
+    let mut v = picks.to_vec();
+    v.sort_unstable_by(|a, b| b.cmp(a));
+    v.dedup();
+    Ok(v)
+}
+
+/// NLE3cBLACK (LEDGER SR323): where a transition TO black on track `bt` (before an op) sits after it, among the op's
+/// `clips`: its cut is known by the outgoing's `(src, src_out)` and by nothing starting at that clip's end. The match
+/// nearest the old tick wins (ties: the earlier); none is the cut gone, refused by name like `retarget_transitions`.
+fn black_cut(bt: &Track, clips: &[Clip], x: &Transition) -> Result<i64, EditError> {
+    let out = bt.clips.iter().find(|c| c.end() == x.at).ok_or(EditError::Transition)?;
+    clips
+        .iter()
+        .filter(|o| o.src == out.src && o.src_out == out.src_out)
+        .map(|o| o.end())
+        .filter(|&at| !clips.iter().any(|c| c.at == at))
+        .min_by_key(|&at| ((at - x.at).abs(), at))
+        .ok_or(EditError::Transition)
+}
+
+// ── EXPORTCOLOURPRIM (rmbp-ledger B979): the export's file primaries / transfer (handlers.md §5 NLEPROBE-HDR's EXPORT-COLOUR-PRIM) ──
+// The mix converts each reel to R'G'B' by its own matrix and no primaries conversion exists (MIX-PRIMARIES owed), so an
+// export can state ONE primaries / transfer pair only when every reel it cuts states the same one.
+impl Timeline {
+    /// The H.273 (primaries, transfer) every source a video-track clip cuts states, when all of them state one and the same
+    /// pair; (2, 2) unspecified when one differs, one states no colour, or no video clip exists. `colour` is the face's reel
+    /// colour: Stria's `Sources::open_report(id).colour`, the kernel's EDL reel's opened `Track::colour`.
+    pub fn reels_colour(&self, colour: impl Fn(SourceId) -> Option<demux_core::colour::Colour>) -> (u8, u8) {
+        let mut pair = None;
+        for c in self.tracks.iter().filter(|t| t.kind == Kind::Video).flat_map(|t| t.clips.iter()) {
+            let Some(p) = colour(c.src).map(|k| (k.primaries, k.transfer)) else { return (2, 2) };
+            if *pair.get_or_insert(p) != p {
+                return (2, 2);
+            }
+        }
+        pair.unwrap_or((2, 2))
+    }
+}
+
+// ── NLESIZEPOLICY (LEDGER SR394): a reel's size policy (handlers.md §5 NLEPROBE-HDR's NLE-SIZE-POLICY) ──────────────────────
+// A reel whose frames change size mid-stream (AV1INBANDSIZE SR379) shows each frame in the reel's FIRST size; how is the
+// reel's property, ONE per source, stored by the one EDL codec as `* UNA SIZE <reel> <policy>` (absent = Letterbox, so every
+// EDL written before it is byte-identical). [`SizePolicy::place`] is the ONE geometry over yuv_core::scale's ONE `fit`; the
+// editor's `view::Canvas::blit_policy` samples through yuv_core::scale's `nearest_rows`, Stria's render (`stria::nle`
+// `reel_rgba`) and the kernel's EDL export (`video/export.rs` `Exp::sized`) both read the reel's policy from here.
+
+/// How a frame of another size than its reel's first size is shown in the reel's box.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SizePolicy {
+    /// Aspect kept, centred, bars (SR384's rule): the default.
+    #[default]
+    Letterbox,
+    /// Aspect kept, the box covered, the source's overflow cropped centred.
+    Fill,
+    /// The whole frame scaled to the whole box (aspect not kept).
+    Stretch,
+    /// The frame keeps its own size: honoured by a run whose sink takes any size, refused by name by an export (an mp4
+    /// track holds one size). Placed into a box (a transition's mix), it places as [`SizePolicy::Letterbox`].
+    Adopt,
+}
+
+/// Where a `sw x sh` frame goes in a `dw x dh` box: the source rect sampled and the box rect it fills.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Place {
+    pub src: yuv_core::scale::Rect,
+    pub dst: yuv_core::scale::Rect,
+}
+
+impl SizePolicy {
+    /// NLESIZEPOLICYUI (SR402): every policy, in the face's cycle order (the ONE list `from_name` and `next` read).
+    pub const ALL: [SizePolicy; 4] = [SizePolicy::Letterbox, SizePolicy::Fill, SizePolicy::Stretch, SizePolicy::Adopt];
+    /// NLESIZEPOLICYUI (SR402): the policy after this one in [`SizePolicy::ALL`] (Adopt wraps to Letterbox): the face's cycle.
+    pub fn next(self) -> SizePolicy {
+        let i = SizePolicy::ALL.iter().position(|&p| p == self).unwrap_or(0);
+        SizePolicy::ALL[(i + 1) % SizePolicy::ALL.len()]
+    }
+    /// The policy's word: the EDL's `* UNA SIZE` token and the wire's `fit=`.
+    pub fn name(self) -> &'static str {
+        match self {
+            SizePolicy::Letterbox => "letterbox",
+            SizePolicy::Fill => "fill",
+            SizePolicy::Stretch => "stretch",
+            SizePolicy::Adopt => "adopt",
+        }
+    }
+    /// The policy a word names (ASCII case ignored).
+    pub fn from_name(s: &str) -> Option<SizePolicy> {
+        SizePolicy::ALL.into_iter().find(|p| p.name().eq_ignore_ascii_case(s))
+    }
+    /// THE GEOMETRY: a `sw x sh` frame in a `dw x dh` box (all four > 0). Letterbox: the whole frame into
+    /// `yuv_core::scale::fit(sw, sh, dw, dh)`; Fill: the box's aspect centred inside the frame (`fit(dw, dh, sw, sh)`) into
+    /// the whole box; Stretch: the whole frame into the whole box; Adopt: as Letterbox (see [`SizePolicy::Adopt`]).
+    pub fn place(self, sw: usize, sh: usize, dw: usize, dh: usize) -> Place {
+        let whole = |w, h| yuv_core::scale::Rect { w, h, x: 0, y: 0 };
+        match self {
+            SizePolicy::Letterbox | SizePolicy::Adopt => Place { src: whole(sw, sh), dst: yuv_core::scale::fit(sw, sh, dw, dh) },
+            SizePolicy::Fill => Place { src: yuv_core::scale::fit(dw, dh, sw, sh), dst: whole(dw, dh) },
+            SizePolicy::Stretch => Place { src: whole(sw, sh), dst: whole(dw, dh) },
+        }
+    }
+}
+
+impl Timeline {
+    /// NLESIZEPOLICY (SR394): the same timeline with source `src`'s size policy `p` (the property's edit; the editor's `size`
+    /// verb drives it, NLESIZEPOLICYUI SR402: `editor::EditorState::set_size_policy`). [`EditError::NoSource`] when the timeline holds no such source.
+    pub fn set_size_policy(&self, src: SourceId, p: SizePolicy) -> Result<Timeline, EditError> {
+        let mut tl = self.clone();
+        tl.sources.iter_mut().find(|s| s.id == src).ok_or(EditError::NoSource)?.size_policy = p;
+        Ok(tl)
+    }
 }

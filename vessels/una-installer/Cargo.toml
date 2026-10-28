@@ -1,0 +1,44 @@
+# =====================================================================
+# CRATE: vessels/una-installer/Cargo.toml
+# DESCRIPTION: The UnaOS_Installer vessel (INSTALLERVESSEL, LEDGER SR413;
+#              docs/ROADMAP.md §1c "The deliverable has a name"). Two
+#              faces of one program: install UnaOS onto a machine or card
+#              (the card face, INSTALLERCARD SR414) and build, install
+#              and run individual UnaOS vessels on the foreign host
+#              (macOS, Linux). It owns no domain: Aulë builds, Amber
+#              Bytes writes the card, Quartzite draws the window.
+# =====================================================================
+
+[package]
+name = "una-installer"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+
+[features]
+default = []
+gtk = ["quartzite/gtk"]
+macos = ["quartzite/macos"] # names the run line only; Quartzite selects AppKit by target_os
+
+[dependencies]
+bandy = { path = "../../libs/bandy" }
+quartzite = { path = "../../libs/quartzite", default-features = false }
+gneiss_pal = { path = "../../libs/gneiss_pal" }
+elessar = { path = "../../libs/elessar" }
+aule = { path = "../../handlers/aule" } # the build half: `Aule::forge_in`
+# INSTALLERCARD (SR414): the card face's disk enumeration and the GPT/clone core.
+amber_bytes = { path = "../../handlers/amber_bytes" }
+amber_core = { path = "../../unaos/libs/sys/amber_core" }
+# INSTALLERLANDING (SR415): the landing face reads the card's boot logs through the unafs core's own reader (no_std core only, as amber_bytes links it).
+unafs = { path = "../../unaos/libs/fs/unafs", default-features = false }
+# INSTALLERPROVIDER (SR424): the provider face sends the landing through Vein's provider slot (Principia's `vein` prefs, Holocron, env), the pick through Principia.
+vein = { path = "../../handlers/vein" }
+principia = { path = "../../handlers/principia" }
+holocron = { path = "../../handlers/holocron" }
+# INSTALLERCONTRIBUTE (SR428): the contribute face commits the landing through Vairë's shared core (the object store only) and redacts typed commands through Midden's R65 table.
+git_core = { path = "../../unaos/libs/vcs/git_core", features = ["std"] }
+midden_core = { path = "../../unaos/libs/sys/midden_core" }
+futures-core = "0.3" # INSTALLERPROVIDERSTREAM (SR429): the Stream trait, to tee ModelProvider::stream's DeltaStream into sse::collect
+tokio = { version = "1.53", features = ["rt", "rt-multi-thread", "sync", "macros", "time"] }
+log = "0.4"
+libc = "0.2" # INSTALLERAUTHOPEN (SR422): sendmsg/recvmsg + msghdr for the SCM_RIGHTS fd handoff (authopen / the pkexec helper)

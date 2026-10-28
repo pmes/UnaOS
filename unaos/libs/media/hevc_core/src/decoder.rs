@@ -11,6 +11,9 @@
 //!   are dropped, as C.5.2.2 never outputs them) and the output of prior pictures (C.5.2.2).
 //! - Picture end: deblocking (8.7.2), SAO (8.7.3), the conformance-window crop, and the "bumping" of C.5.2.3 on
 //!   sps_max_num_reorder_pics / SpsMaxLatencyPictures / sps_max_dec_pic_buffering.
+//! - HEVCINTER (SR216): every decoded picture is stored in ONE [`Dpb`] (reference marking and output order); at a
+//!   picture start the reference picture set is applied (8.3.2) before the C.5.2.2 removal, and every independent P
+//!   / B slice gets its reference picture lists (8.3.4, [`Decoder::slice_ref_lists`]) and the collocated picture.
 
 use alloc::collections::VecDeque;
 use alloc::vec;
@@ -18,10 +21,13 @@ use alloc::vec::Vec;
 
 use crate::ctu::{SliceDecoder, Storage};
 use crate::deblock::deblock_picture;
-use crate::nal::{self, NalHeader, AUD_NUT, CRA_NUT, EOB_NUT, EOS_NUT, PPS_NUT, SPS_NUT, VPS_NUT};
+use crate::dpb::{Dpb, RefList, Rps};
+use crate::inter::InterCtx;
+use crate::nal::{self, NalHeader, AUD_NUT, CRA_NUT, EOB_NUT, EOS_NUT, PPS_NUT, SPS_NUT, SUFFIX_SEI_NUT, VPS_NUT};
 use crate::picture::{Picture, SliceInfo};
 use crate::ps::{parse_pps, parse_sps, parse_vps, Geometry, Pps, Sps, Vps};
 use crate::sao::sao_picture;
+use crate::sei::{self, HashCheck, PictureHash};
 use crate::slice::{parse_slice_header, peek_pps_id, SliceHeader, SliceType};
 use crate::{Error, Frame, Result};
 
@@ -33,12 +39,11 @@ struct CurPic {
     store: Storage,
     /// The header of the current slice's independent segment (for dependent segments).
     indep: Option<SliceHeader>,
-}
-
-/// A decoded picture waiting for output (C.5.2: "needed for output").
-struct Pending {
-    frame: Frame,
-    latency: u32,
+    /// The picture's reference picture set (8.3.2) and the current slice's lists (8.3.4).
+    rps: Rps,
+    lists: [RefList; 2],
+    /// HEVCCONF (SR321): the picture's decoded picture hash (a suffix SEI of its access unit), checked at its end.
+    hash: Option<PictureHash>,
 }
 
 /// An H.265 decoder for one stream.
@@ -47,7 +52,14 @@ pub struct Decoder {
     sps: Vec<Option<Sps>>,
     pps: Vec<Option<Pps>>,
     cur: Option<CurPic>,
-    pending: Vec<Pending>,
+    /// The decoded picture buffer: references and pictures waiting for output (HEVCINTER).
+    dpb: Dpb,
+    /// The reference picture lists of each independent P / B slice of the latest picture started.
+    lists_log: Vec<[RefList; 2]>,
+    /// HEVCCONF (SR321): (PicOrderCntVal, verdict) of every picture that carried a decoded picture hash.
+    hashes: Vec<(i32, HashCheck)>,
+    /// HEVCSCCTAIL (SR365): refuse an SPS / PPS above its level by name ([`Decoder::set_strict_levels`]).
+    strict_levels: bool,
     out: VecDeque<Frame>,
     tag: i64,
     nal_length_size: usize,
@@ -60,6 +72,9 @@ pub struct Decoder {
     prev_tid0_poc: i32,
     /// (sps_max_num_reorder_pics, SpsMaxLatencyPictures or 0, sps_max_dec_pic_buffering) of the active SPS.
     bump: (u32, u32, u32),
+    /// HEVCREXT (SR334): a consumer that shows 4:2:0 at one bit depth only refuses 4:2:2 / 4:4:4 and unequal luma / chroma
+    /// depths by name ([`Decoder::set_chroma_420_only`]); no in-tree consumer sets it since COLOURONE422 (SR359).
+    chroma_420_only: bool,
 }
 
 impl Default for Decoder {
@@ -68,19 +83,37 @@ impl Default for Decoder {
     }
 }
 
-/// The refusals by name (the crate doc): what an activated SPS / PPS may not use.
+/// The refusals by name (the crate doc): what an activated SPS / PPS may not use. HEVCREXT (SR334): 4:2:2, 4:4:4, 12
+/// bits and unequal luma / chroma depths decode. HEVCREXTTOOLS (SR345): every range extension tool, monochrome and the
+/// 16-bit profiles decode; separate colour planes are refused by name. HEVCREXTSCC (SR357): the screen content coding
+/// tools decode (palette, intra block copy, the adaptive colour transform); refused by name: an SCC body behind the
+/// multilayer / 3D bodies, and the colour transform at unequal luma / chroma depths.
 fn check_supported(sps: &Sps, pps: &Pps) -> Result<()> {
-    if sps.chroma_format_idc != 1 || sps.separate_colour_plane_flag {
-        return Err(Error::Unsupported("chroma other than 4:2:0"));
+    if sps.separate_colour_plane_flag {
+        return Err(Error::Unsupported("separate colour planes (HEVCREXT)"));
     }
-    if sps.bit_depth_luma != 8 || sps.bit_depth_chroma != 8 {
-        return Err(Error::Unsupported("bit depth above 8 (HEVCMAIN10)"));
+    if sps.bit_depth_luma > 16 || sps.bit_depth_chroma > 16 {
+        return Err(Error::Unsupported("bit depth above 16 (HEVCREXT-TOOLS)"));
     }
-    if sps.range_ext.any() || pps.range_ext.any() {
-        return Err(Error::Unsupported("range extension tools"));
+    if sps.scc_unparsed || pps.scc_unparsed {
+        return Err(Error::Unsupported("screen content coding beside the multilayer / 3D extensions (HEVCREXT-SCC)"));
     }
-    if sps.scc_extension_flag || pps.scc_extension_flag {
-        return Err(Error::Unsupported("screen content coding extension"));
+    if pps.scc.curr_pic_ref_enabled_flag && !sps.scc.curr_pic_ref_enabled_flag {
+        return Err(Error::Invalid("pps_curr_pic_ref_enabled_flag without sps_curr_pic_ref_enabled_flag"));
+    }
+    if pps.scc.residual_adaptive_colour_transform_enabled_flag {
+        if sps.chroma_array_type() != 3 {
+            return Err(Error::Invalid("residual_adaptive_colour_transform_enabled_flag off 4:4:4"));
+        }
+        if sps.bit_depth_luma != sps.bit_depth_chroma {
+            return Err(Error::Unsupported("adaptive colour transform with unequal luma and chroma depths (HEVCREXT-SCC)"));
+        }
+    }
+    if pps.scc.palette_predictor_initializers.as_ref().is_some_and(|r| !r[0].is_empty()) {
+        let (y, c) = pps.scc.entry_bit_depth;
+        if y != sps.bit_depth_luma || (!pps.scc.monochrome_palette_flag && c != sps.bit_depth_chroma) {
+            return Err(Error::Invalid("palette predictor initializer bit depths differ from the SPS"));
+        }
     }
     Ok(())
 }
@@ -92,7 +125,10 @@ impl Decoder {
             sps: vec![None; 16],
             pps: vec![None; 64],
             cur: None,
-            pending: Vec::new(),
+            dpb: Dpb::default(),
+            lists_log: Vec::new(),
+            hashes: Vec::new(),
+            strict_levels: false,
             out: VecDeque::new(),
             tag: 0,
             nal_length_size: 4,
@@ -101,13 +137,24 @@ impl Decoder {
             skip_rasl: false,
             prev_tid0_poc: 0,
             bump: (0, 0, 1),
+            chroma_420_only: false,
         }
+    }
+
+    /// HEVCREXT (SR334): a consumer that can only display 4:2:0 at one bit depth asks for 4:2:2 / 4:4:4 streams and unequal
+    /// luma / chroma depths to be refused by name at SPS activation, so its player keeps the labelled stand-in. COLOURONE422
+    /// (SR359): gneiss_pal's `to_frame` carries every format and both depths, so no in-tree consumer sets it (tests/rext.rs pins it).
+    /// Kept across [`Decoder::reset`].
+    pub fn set_chroma_420_only(&mut self, on: bool) {
+        self.chroma_420_only = on;
     }
 
     /// Forget every picture (after a seek); parameter sets and the hvcC configuration stay.
     pub fn reset(&mut self) {
         self.cur = None;
-        self.pending.clear();
+        self.dpb.clear();
+        self.lists_log.clear();
+        self.hashes.clear();
         self.out.clear();
         self.first_picture = true;
         self.skip_rasl = false;
@@ -191,6 +238,26 @@ impl Decoder {
         self.vps.get(id).and_then(|s| s.as_ref())
     }
 
+    /// RefPicList0 / RefPicList1 (8.3.4) of every independent P / B slice of the latest picture started, in decoding
+    /// order (empty for an I picture): the debug view of the reference lists.
+    pub fn slice_ref_lists(&self) -> &[[RefList; 2]] {
+        &self.lists_log
+    }
+
+    /// HEVCCONF (SR321): the decoded picture hash verdicts (D.3.19) of the pictures finished since the last call, in
+    /// decoding order, as (PicOrderCntVal, verdict); a picture without a hash SEI has no entry.
+    pub fn take_hash_checks(&mut self) -> Vec<(i32, HashCheck)> {
+        core::mem::take(&mut self.hashes)
+    }
+
+    /// HEVCSCCTAIL (SR365, HEVCREXT-SCC-LEVELS): when on, every picture's SPS / PPS is checked against the level its
+    /// profile_tier_level signals ([`crate::level::check_level`], A.4) and a picture above it is refused by name. Off by
+    /// default (streams in the wild violate their levels); the conformance walker turns it on. Kept across
+    /// [`Decoder::reset`].
+    pub fn set_strict_levels(&mut self, on: bool) {
+        self.strict_levels = on;
+    }
+
     /// Decode one NAL unit (two header bytes first, no start code or length prefix).
     pub fn decode_nal(&mut self, data: &[u8]) -> Result<()> {
         if data.is_empty() {
@@ -240,7 +307,18 @@ impl Decoder {
                 self.first_picture = true;
                 Ok(())
             }
-            // SEI, filler data, reserved and unspecified types.
+            // HEVCCONF (SR321): the decoded picture hash of the picture under decoding; SEI is non-normative, so a
+            // malformed message is dropped, never an error. HEVCSCCTAIL (SR365, HEVCREXT-MONOHASH): D.2.19 carries one
+            // component at chroma_format_idc 0, three otherwise.
+            SUFFIX_SEI_NUT => {
+                if let Some(cur) = self.cur.as_mut() {
+                    if let Ok(Some(h)) = sei::picture_hash_n(rbsp, if cur.sps.chroma_format_idc == 0 { 1 } else { 3 }) {
+                        cur.hash = Some(h);
+                    }
+                }
+                Ok(())
+            }
+            // Prefix SEI, filler data, reserved and unspecified types.
             _ => Ok(()),
         }
     }
@@ -262,10 +340,20 @@ impl Decoder {
             let sps = self.sps.get(pps.sps_id as usize).cloned().flatten().ok_or(Error::Invalid("PPS references a missing SPS"))?;
             let sh = parse_slice_header(rbsp, nal, &sps, &pps, None)?;
             let poc = self.picture_order(nal, &sh, &sps);
-            if sh.slice_type != SliceType::I {
-                return Err(Error::Unsupported("inter slices (HEVCINTER)"));
+            if self.strict_levels {
+                crate::level::check_level(&sps, &pps)?;
+            }
+            if sh.slice_type != SliceType::I && pps.constrained_intra_pred_flag {
+                return Err(Error::Unsupported("constrained intra prediction in inter slices (HEVCINTER-CIP)"));
             }
             check_supported(&sps, &pps)?;
+            if self.chroma_420_only && sps.chroma_format_idc > 1 {
+                return Err(Error::Unsupported("chroma 4:2:2 / 4:4:4 not displayable yet (COLOURONE-422)"));
+            }
+            // HEVCREXTTOOLS (SR345): monochrome passes (gneiss_pal's to_frame fills its grey chroma); BitDepthC is unused.
+            if self.chroma_420_only && sps.chroma_format_idc == 1 && sps.bit_depth_luma != sps.bit_depth_chroma {
+                return Err(Error::Unsupported("luma and chroma bit depths differ (COLOURONE-422)"));
+            }
             self.start_picture(nal, &sh, sps, pps, poc)?;
             return self.decode_segment(sh, rbsp);
         }
@@ -283,9 +371,9 @@ impl Decoder {
                 return Err(e);
             }
         };
-        if sh.slice_type != SliceType::I {
+        if sh.slice_type != SliceType::I && cur.pps.constrained_intra_pred_flag {
             self.cur = None;
-            return Err(Error::Unsupported("inter slices (HEVCINTER)"));
+            return Err(Error::Unsupported("constrained intra prediction in inter slices (HEVCINTER-CIP)"));
         }
         self.decode_segment(sh, rbsp)
     }
@@ -319,11 +407,10 @@ impl Decoder {
         if irap && no_rasl && !self.first_picture {
             // C.5.2.2: an IRAP with NoRaslOutputFlag 1 that is not the first picture empties the DPB — by output when
             // NoOutputOfPriorPicsFlag is 0, by discarding otherwise (a CRA infers 1).
-            if nal.nal_type == CRA_NUT || sh.no_output_of_prior_pics_flag {
-                self.pending.clear();
-            } else {
+            if nal.nal_type != CRA_NUT && !sh.no_output_of_prior_pics_flag {
                 self.bump_all();
             }
+            self.dpb.clear();
         }
         self.first_picture = false;
         poc
@@ -331,15 +418,20 @@ impl Decoder {
 
     fn start_picture(&mut self, nal: &NalHeader, sh: &SliceHeader, sps: Sps, pps: Pps, poc: i32) -> Result<()> {
         let geo = Geometry::new(&sps, &pps)?;
-        let mut pic = Picture::new(sps.width as usize, sps.height as usize, &geo);
+        let chroma = sps.chroma_format().ok_or(Error::Unsupported("separate colour planes (HEVCREXT)"))?;
+        let mut pic = Picture::with_chroma(sps.width as usize, sps.height as usize, &geo, chroma);
         pic.poc = poc;
         pic.tag = self.tag;
         pic.full_range = sps.vui.as_ref().is_some_and(|v| v.video_full_range_flag);
+        pic.bit_depth = sps.bit_depth_luma;
+        pic.bit_depth_c = sps.bit_depth_chroma;
         pic.output = sh.pic_output_flag && !(nal.is_rasl() && self.skip_rasl);
+        // 7.4.3.2.1: the offsets are in chroma samples (SubWidthC, SubHeightC).
         let [l, r, t, b] = sps.conf_win;
-        let (x0, y0) = (2 * l as usize, 2 * t as usize);
-        let cw = 2 * (l as usize + r as usize);
-        let chh = 2 * (t as usize + b as usize);
+        let (sub_w, sub_h) = chroma.sub();
+        let (x0, y0) = (sub_w * l as usize, sub_h * t as usize);
+        let cw = sub_w * (l as usize + r as usize);
+        let chh = sub_h * (t as usize + b as usize);
         if cw >= pic.width || chh >= pic.height {
             return Err(Error::Invalid("conformance window empty"));
         }
@@ -347,11 +439,14 @@ impl Decoder {
         let o = sps.highest_ordering();
         let latency = if o.max_latency_increase_plus1 != 0 { o.max_num_reorder_pics + o.max_latency_increase_plus1 - 1 } else { 0 };
         self.bump = (o.max_num_reorder_pics, latency, o.max_dec_pic_buffering_minus1 + 1);
-        // C.5.2.2: before a non-IRAP-with-NoRaslOutputFlag picture, make room in the DPB.
-        while !self.pending.is_empty() && self.pending.len() as u32 >= self.bump.2 {
-            self.bump_one();
-        }
-        self.cur = Some(CurPic { pic, sps, pps, geo, store: Storage::default(), indep: None });
+        // 8.3.2 (an IRAP with NoRaslOutputFlag 1 marks every picture unused), then C.5.2.2: make room in the DPB.
+        let rps = self.dpb.apply_rps(sh, &sps, poc, nal.is_irap() && self.skip_rasl)?.with_curr(pps.scc.curr_pic_ref_enabled_flag, poc);
+        let (reorder, latency, max_dec) = self.bump;
+        // HEVCSCCTAIL (SR365, HEVCREXT-SCC-DPB; SPEC-CHECK): C.5.2.2 with the current picture's own slot when it is a
+        // reference of its own slices (pps_curr_pic_ref_enabled_flag).
+        self.dpb.make_room(reorder, latency, max_dec.saturating_sub(pps.scc.curr_pic_ref_enabled_flag as u32), &mut self.out);
+        self.lists_log.clear();
+        self.cur = Some(CurPic { pic, sps, pps, geo, store: Storage::default(), indep: None, rps, lists: Default::default(), hash: None });
         Ok(())
     }
 
@@ -378,8 +473,22 @@ impl Decoder {
             });
             ((cur.pic.slices.len() - 1) as u32, sh.segment_address)
         };
+        if !sh.dependent_slice_segment_flag && sh.slice_type != SliceType::I {
+            match self.dpb.ref_lists(&cur.rps, &sh) {
+                Ok(l) => {
+                    self.lists_log.push(l.clone());
+                    cur.lists = l;
+                }
+                Err(e) => {
+                    self.cur = None;
+                    return Err(e);
+                }
+            }
+        }
         let r = {
-            let mut d = SliceDecoder::new(&cur.sps, &cur.pps, &cur.geo, &sh, &mut cur.pic, &mut cur.store, rbsp, slice_idx, addr_rs);
+            let poc = cur.pic.poc;
+            let inter = if sh.slice_type != SliceType::I { Some(InterCtx::new(&cur.lists, &self.dpb, poc, &sh)) } else { None };
+            let mut d = SliceDecoder::new(&cur.sps, &cur.pps, &cur.geo, &sh, &mut cur.pic, &mut cur.store, rbsp, slice_idx, addr_rs, inter);
             d.decode()
         };
         if let Err(e) = r {
@@ -396,30 +505,27 @@ impl Decoder {
         let Some(mut cur) = self.cur.take() else { return };
         deblock_picture(&mut cur.pic, &cur.geo, &cur.sps, &cur.pps);
         sao_picture(&mut cur.pic, &cur.geo, &cur.sps, &cur.pps);
-        if !cur.pic.output {
-            return;
+        // HEVCCONF (SR321): D.3.19 over the filtered, uncropped sample arrays.
+        if let Some(h) = &cur.hash {
+            self.hashes.push((cur.pic.poc, sei::check(&cur.pic.planes, cur.pic.bit_depth, cur.pic.bit_depth_c, h)));
         }
-        for p in self.pending.iter_mut() {
-            p.latency += 1;
-        }
-        self.pending.push(Pending { frame: cur.pic.to_frame(), latency: 0 });
+        // C.5.2.3: every picture is stored (a reference even when not output), then bumped as the DPB requires.
         let (reorder, latency, _) = self.bump;
-        while self.pending.len() as u32 > reorder || (latency != 0 && self.pending.iter().any(|p| p.latency >= latency)) {
-            self.bump_one();
-        }
+        self.dpb.store(cur.pic, reorder, latency, &mut self.out);
     }
 
-    /// C.5.2.4 "bumping": output the pending picture with the smallest PicOrderCntVal.
-    fn bump_one(&mut self) {
-        if let Some((i, _)) = self.pending.iter().enumerate().min_by_key(|(_, p)| p.frame.poc) {
-            let p = self.pending.remove(i);
-            self.out.push_back(p.frame);
-        }
-    }
-
+    /// C.5.2.4 "bumping" until nothing waits for output.
     fn bump_all(&mut self) {
-        while !self.pending.is_empty() {
-            self.bump_one();
-        }
+        self.dpb.bump_all(&mut self.out);
+    }
+}
+
+impl Decoder {
+    /// HEVCLEVELLINE (LEDGER SR368, HEVC-LEVEL-LINE): the profile, tier and level ([`crate::ps::Ptl`], A.3) of the SPS of
+    /// the picture under decoding, else of the lowest-id stored SPS (an hvcC's, known from [`Decoder::configure_hvcc`]
+    /// before any picture); `None` before any SPS.
+    pub fn profile_tier_level(&self) -> Option<crate::ps::Ptl> {
+        let sps = self.cur.as_ref().map(|c| &c.sps).or_else(|| self.sps.iter().flatten().next())?;
+        Some(sps.ptl.names())
     }
 }

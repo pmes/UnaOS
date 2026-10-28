@@ -139,6 +139,16 @@ pub static SCHEMA: &[Key] = &[
         doc: "The side the developer-tools pane docks on: beside the page (`right`) or under it (`bottom`) (AETHERDEVTOOLS, SR112).",
     },
     Key {
+        ns: "aether", key: "recent", kind: Kind::Str { max_len: 8192, printable: false }, default: Default::Consumer("empty: nothing saved yet"),
+        writers: OP, reader: "aether-shell Coordinator (`chrome::host::remember_saved` through quartzite `chrome_rows::stored_str` / `store_str`, after a Save As)",
+        doc: "The last ten paths a Save As wrote, newest first, one per line, a repeat moved to the front (SAVERECENT, SR391).",
+    },
+    Key {
+        ns: "aether", key: "save.folder", kind: Kind::Str { max_len: 1024, printable: false }, default: Default::Consumer("the panel's own: the platform's last folder or home"),
+        writers: OP, reader: "aether-shell Coordinator (`chrome::host::save_folder` through quartzite `chrome_rows::stored_str`), sent as `SavePanel.folder` to the faces' save panels",
+        doc: "The folder the last Save As chose: the next save panel opens there while it is still a directory (SAVERECENT, SR391).",
+    },
+    Key {
         ns: "aether", key: "search", kind: Kind::Str { max_len: 512, printable: true }, default: Default::Str("https://html.duckduckgo.com/html/?q=%s"),
         writers: OP, reader: "quartzite GTK url bar (`url_bar::search_template`), aether chrome omnibox",
         doc: "The address bar's search engine: a URL template whose `%s` (or `{searchTerms}`) becomes the urlencoded query when the typed text is not an address (AETHERCHROME).",

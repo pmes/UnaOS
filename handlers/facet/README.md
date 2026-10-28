@@ -83,7 +83,7 @@ against Chromium live (`chromium.toml`), gated on `baseline.json`.
 JPEG, GIF, BMP, QOI and lossless-WebP decoders, written from the specifications, `no_std`, zero
 dependencies (FACETPIXEL, SR43). There is no fallback: what pixel_core does not decode is an
 `ImageError` naming the format — `webp: unsupported: webp lossy (VP8)` until VP8CORE (SR40);
-`tiff`, `ico`, `avif`, `heif`, `jpeg xl`, `psd`, `svg`, ... as "no UnaOS decoder reads X yet".
+`tiff`, `ico`, `avif`, `heif` sequences, `jpeg xl`, `psd`, `svg`, ... as "no UnaOS decoder reads X yet" (8-bit HEIC stills decode through `gneiss_pal::dsp::image::decode_heic`, HEVCHEIC SR220; 10-bit refuses until HEVCMAIN10).
 Orientation and every other declaration come from Facet's own readers (`src/meta.rs`); for JPEG
 a test asserts they agree with pixel_core's EXIF reader. The `image` crate is a dev-dependency
 only — the second-opinion oracle in `tests/oracles.rs`; `cargo tree -p facet -e normal` has none.

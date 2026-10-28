@@ -31,7 +31,7 @@
 //! with alpha 255 is copied (the blend is skipped for it, which is not the same as blending it: the
 //! integer formula would round 255-alpha colours down by one).
 //!
-//! NOT decoded: no ICC profile is applied.
+//! NOT decoded: no ICC profile is applied (an ICCP chunk is surfaced as `Image::icc`).
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -46,24 +46,24 @@ pub fn decode(b: &[u8]) -> Result<Image, Error> {
     let end = (8 + le32(b, 4) as usize).min(b.len());
     let mut p = 12usize;
     let mut canvas: Option<(u32, u32)> = None;
-    let mut alph: Option<&[u8]> = None;
+    let mut alph: Option<&[u8]> = None; let mut icc: Option<Vec<u8>> = None;
     while p + 8 <= end {
         let fourcc = &b[p..p + 4];
         let size = le32(b, p + 4) as usize;
         let data = b.get(p + 8..p + 8 + size).ok_or(Error::Truncated)?;
         match fourcc {
-            b"VP8L" => return decode_vp8l(data),
-            b"VP8 " => return decode_lossy(data, alph, canvas),
+            b"VP8L" => return decode_vp8l(data).map(|i| i.with_icc(icc.clone())),
+            b"VP8 " => return decode_lossy(data, alph, canvas).map(|i| i.with_icc(icc.clone())),
             b"VP8X" => {
                 if data.len() < 10 {
                     return Err(Error::Truncated);
                 }
                 let w = (data[4] as u32 | (data[5] as u32) << 8 | (data[6] as u32) << 16) + 1;
                 let h = (data[7] as u32 | (data[8] as u32) << 8 | (data[9] as u32) << 16) + 1;
-                canvas = Some((w, h));
+                canvas = Some((w, h)); if data[0] & 0x20 != 0 { icc = iccp_after(b, p + 8 + size + (size & 1), end); }
                 // §2.7: the Animation flag (bit 1 of the flags byte) — the rest of the file is ANIM + ANMF.
                 if data[0] & 0x02 != 0 {
-                    return decode_animated(b, p + 8 + size + (size & 1), end, w, h);
+                    return decode_animated(b, p + 8 + size + (size & 1), end, w, h).map(|i| i.with_icc(icc.clone()));
                 }
             }
             b"ALPH" => alph = Some(data),
@@ -976,4 +976,17 @@ fn predict(px: &mut [u32], w: usize, h: usize, bits: u32, img: &[u32]) {
             px[i] = add_pixels(px[i], pred);
         }
     }
+}
+
+/// PDFICC (SR358): the profile of the `ICCP` chunk at `p` — RFC 9649 §2.7 places it directly after VP8X when VP8X's
+/// ICC flag (0x20) is set — or None. One chunk header is read, never a second walk.
+pub(crate) fn iccp_after(b: &[u8], p: usize, end: usize) -> Option<Vec<u8>> {
+    if p + 8 > end || b.get(p..p + 4)? != b"ICCP" {
+        return None;
+    }
+    let size = le32(b, p + 4) as usize;
+    if size > crate::ICC_MAX {
+        return None;
+    }
+    Some(b.get(p + 8..(p + 8).checked_add(size)?.min(end))?.to_vec())
 }

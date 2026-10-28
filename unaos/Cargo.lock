@@ -14,12 +14,17 @@ version = "0.1.0"
 name = "audio_core"
 version = "0.1.0"
 dependencies = [
+ "crypto_core",
  "demux_core",
+ "libm",
 ]
 
 [[package]]
 name = "av1_core"
 version = "0.1.0"
+dependencies = [
+ "yuv_core",
+]
 
 [[package]]
 name = "bit_field"
@@ -140,6 +145,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "h264_core"
+version = "0.1.0"
+
+[[package]]
+name = "h264enc_core"
+version = "0.1.0"
+dependencies = [
+ "h264_core",
+ "yuv_core",
+]
+
+[[package]]
 name = "hash32"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -163,6 +180,13 @@ name = "holocron_core"
 version = "0.1.0"
 dependencies = [
  "crypto_core",
+]
+
+[[package]]
+name = "icc_core"
+version = "0.1.0"
+dependencies = [
+ "libm",
 ]
 
 [[package]]
@@ -249,6 +273,7 @@ dependencies = [
  "raw_core",
  "svg_core",
  "vp8_core",
+ "yuv_core",
 ]
 
 [[package]]
@@ -258,6 +283,9 @@ version = "0.1.0"
 [[package]]
 name = "probe_core"
 version = "0.1.0"
+dependencies = [
+ "yuv_core",
+]
 
 [[package]]
 name = "proc-macro2"
@@ -375,6 +403,7 @@ name = "svg_core"
 version = "0.1.0"
 dependencies = [
  "font_core",
+ "libm",
 ]
 
 [[package]]
@@ -413,6 +442,9 @@ name = "timeline_core"
 version = "0.1.0"
 dependencies = [
  "demux_core",
+ "libm",
+ "pixel_core",
+ "yuv_core",
 ]
 
 [[package]]
@@ -544,7 +576,10 @@ dependencies = [
  "font8x8",
  "font_core",
  "geode_core",
+ "h264_core",
+ "h264enc_core",
  "holocron_core",
+ "icc_core",
  "jobs_core",
  "lazy_static",
  "ldso_core",
@@ -575,6 +610,7 @@ dependencies = [
  "vp8_core",
  "wifi_core",
  "x86_64",
+ "yuv_core",
 ]
 
 [[package]]
@@ -610,6 +646,9 @@ checksum = "af8ca9a5d4debca0633e697c88269395493cebf2e10db21ca2dbde37c1356452"
 [[package]]
 name = "vp8_core"
 version = "0.1.0"
+dependencies = [
+ "yuv_core",
+]
 
 [[package]]
 name = "wifi_core"
@@ -636,6 +675,10 @@ checksum = "18245fcbb8b3de8dd198ce7944fdd4096986fd6cd306b0fcfa27df817bd545d6"
 dependencies = [
  "zero",
 ]
+
+[[package]]
+name = "yuv_core"
+version = "0.1.0"
 
 [[package]]
 name = "zero"

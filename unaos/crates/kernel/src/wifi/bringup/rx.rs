@@ -198,7 +198,7 @@ pub(super) fn suspend(bar0: u64, w: &mut Writes, tag: &str) -> bool {
 /// channel number alone). Returns the pre-image.
 pub(super) fn chan_cookie(bar0: u64, ch: u16, w: &mut Writes) -> u16 {
     let pre = shm_r16(bar0, SHM_SH_CHAN, w);
-    shm_w16(bar0, SHM_SH_CHAN, ch, w);
+    shm_w16(bar0, SHM_SH_CHAN, ch | if ch > 14 { 0x0100 } else { 0 }, w); // STATIONROAM-5G (B962, the seat's grant): B43_SHM_SH_CHAN_5GHZ, phy_common.c:425-427, b43.h:256; the ucode ORs 0x100 into a 5 GHz frame's chan_radio_code, xmit.c:365-367
     pre
 }
 
@@ -329,7 +329,7 @@ fn take(buf: u64, s: &mut Seen, ch: u16, raw_rows: &mut u32, tag: &str) -> usize
     if len < start + 24 + FCS_LEN {
         return 1;
     }
-    let frame = copy_out(buf + (FRAMEOFFSET + start) as u64, len - start - FCS_LEN); #[cfg(feature = "wifi10")] super::join::hear(&frame, &mut s.join); #[cfg(feature = "wifi10")] super::super::data::keep(&frame, s.me, &mut s.data);
+    let frame = copy_out(buf + (FRAMEOFFSET + start) as u64, len - start - FCS_LEN); #[cfg(feature = "wifi10")] super::join::hear(&frame, super::super::data::ht_power(&hdr), &mut s.join); #[cfg(feature = "wifi10")] super::super::data::keep(&frame, s.me, &mut s.data);
     // FC byte 0: type bits 3:2 = 0 (management), subtype bits 7:4 = 8 (beacon) — IEEE 802.11 §9.2.4.1.
     if (frame[0] >> 2) & 0x3 == 0 && (frame[0] >> 4) == 0x8 {
         if let Some(b) = wifi_core::ieee80211::parse_beacon(&frame) {
@@ -389,15 +389,10 @@ pub(super) fn arm(bar0: u64, bus: u8, dev: u8, func: u8, w: &mut Writes, tag: &'
     }
     let cmd_post = unsafe { read_config_16(bus, dev, func, 0x04) };
     // ── Ring + buffers: host memory, VA == PA on this kernel's x86 identity map (ahci.rs's `bus_addr`). ──
-    let ring_l = core::alloc::Layout::from_size_align(RINGMEM, RINGMEM).ok();
-    let bufs_l = core::alloc::Layout::from_size_align(SLOTS * BUFSIZE, 4096).ok();
-    let (Some(rl), Some(bl)) = (ring_l, bufs_l) else {
-        return Err(String::from("layout — nothing programmed"));
-    };
     // Deliberately never freed: the engine owns this memory until RXCTL reads DISABLED, and a failed
-    // reset below would leave it owning it for the rest of the boot.
-    let ring = unsafe { alloc::alloc::alloc_zeroed(rl) } as u64;
-    let bufs = unsafe { alloc::alloc::alloc_zeroed(bl) } as u64;
+    // reset below would leave it owning it for the rest of the boot. DMAALLOCONE (B986): the one DMA allocator.
+    let ring = crate::arch::memory::dma::ident(RINGMEM, RINGMEM);
+    let bufs = crate::arch::memory::dma::ident(SLOTS * BUFSIZE, 4096);
     if ring == 0 || bufs == 0 {
         return Err(String::from("no-memory — nothing programmed"));
     }
@@ -431,13 +426,8 @@ pub(super) fn arm(bar0: u64, bus: u8, dev: u8, func: u8, w: &mut Writes, tag: &'
     }
     w.dma += 4;
     let st0 = unsafe { r32(bar0, RXSTATUS) };
-    // ── MAC enable (main.c:2958-2983): ENABLED, ack MAC_SUSPENDED, flush, awake. ──
-    let v = unsafe { r32(bar0, D11_MACCTL) };
-    macctl_w(bar0, v | MACCTL_ENABLED, w);
-    unsafe { w32(bar0, D11_GEN_IRQ_REASON, IRQ_MAC_SUSPENDED) };
-    w.irq_ack += 1;
-    let _ = unsafe { (r32(bar0, D11_MACCTL), r32(bar0, D11_GEN_IRQ_REASON)) };
-    let _ = awake(bar0, w);
+    // ── MAC enable (main.c:2958-2983): ENABLED, ack MAC_SUSPENDED, flush, awake (`resume`, ROAMXCHAN B898: one enable). ──
+    resume(bar0, w);
     let mac_on = unsafe { r32(bar0, D11_MACCTL) };
     serial_println!(
         "[{}] rx-setup ring={:#x} bufs={:#x} slots={} buf={} fo={} rxctl={:#010x} ringhi={:#010x} rxstatus={:#010x} reset={} pci_cmd={:#06x}->{:#06x} macctl={:#010x}->{:#010x} — dma.c:672-750, main.c:3103-3160, :2958-2983",
@@ -529,4 +519,31 @@ pub(super) fn station_filter(bar0: u64, bssid: [u8; 6], w: &mut Writes) -> (u32,
     macctl_w(bar0, station_macctl(pre), w);
     let post = unsafe { r32(bar0, D11_MACCTL) };
     (pre, post)
+}
+
+// ── STATIONROAM (rmbp-ledger B897): the scan window widens the station's filter to every BSS's beacons ─────────────────
+
+/// From `join::roam_step` / `join::associate`: BEACPROMISC on (`open`) or off, every other MACCTL bit kept — b43's scan shape
+/// (FIF_BCN_PRBRESP_PROMISC, `main.c:3131-3132`): other BSSIDs' beacons pass the BSSID filter while unicast data to us still
+/// passes the station's own filter, so the current association is not dropped; PROMISC and KEEP_BAD stay off. Through the
+/// one MACCTL writer `macctl_w`, read-modify-written live as `station_filter` does. Returns the post-image.
+#[cfg(feature = "wifi10")]
+pub(super) fn scan_filter(bar0: u64, open: bool, w: &mut Writes) -> u32 {
+    let pre = unsafe { r32(bar0, D11_MACCTL) };
+    macctl_w(bar0, if open { pre | MACCTL_BEACPROMISC } else { pre & !MACCTL_BEACPROMISC }, w);
+    unsafe { r32(bar0, D11_MACCTL) }
+}
+
+// ── STATIONROAM-XCHAN (rmbp-ledger B898): the MAC enable as one fn, `suspend`'s other half ─────────────────────────────
+
+/// `main.c:2958-2983` (`b43_mac_enable`): MACCTL.ENABLED on, MAC_SUSPENDED acked, the posting reads, awake. `arm`'s enable and
+/// `join::retune`'s (the channel switch inside suspend/enable, as b43's op_config wraps b43_switch_channel) — the same writes in
+/// the same order.
+pub(super) fn resume(bar0: u64, w: &mut Writes) {
+    let v = unsafe { r32(bar0, D11_MACCTL) };
+    macctl_w(bar0, v | MACCTL_ENABLED, w);
+    unsafe { w32(bar0, D11_GEN_IRQ_REASON, IRQ_MAC_SUSPENDED) };
+    w.irq_ack += 1;
+    let _ = unsafe { (r32(bar0, D11_MACCTL), r32(bar0, D11_GEN_IRQ_REASON)) };
+    let _ = awake(bar0, w);
 }

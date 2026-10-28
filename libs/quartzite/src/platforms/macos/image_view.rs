@@ -113,6 +113,8 @@ pub struct FacetImageIvars {
     /// given size at most once (dedupes the guaranteed end-of-drag fire against
     /// a throttled one that already carried the same size).
     last_resize_sent: Cell<Option<(u32, u32)>>,
+    /// SURFACEID (SR332): this Surface's number in its tetra tree, on every pointer message it fires.
+    surface: Cell<u32>,
 }
 
 /// Coarse tracking cadence during a live-resize drag: one `BrowserResize` per
@@ -143,6 +145,7 @@ define_class!(
                 live_resize: Cell::new(false),
                 last_resize_fire: Cell::new(None),
                 last_resize_sent: Cell::new(None),
+                surface: Cell::new(0),
             });
             unsafe { msg_send![super(this), initWithFrame: frame] }
         }
@@ -231,7 +234,7 @@ define_class!(
                 // fingers-down/content-up in natural scrolling; the engine
                 // wants positive dy = scroll further down the document).
                 if dy != 0.0 {
-                    syn.fire(bandy::SMessage::BrowserScroll(0.0, -dy * 3.0));
+                    syn.fire(bandy::SMessage::BrowserScroll(0.0, -dy * 3.0, self.ivars().surface.get()));
                 }
                 return;
             }
@@ -263,7 +266,7 @@ define_class!(
         fn mouse_down(&self, event: &AnyObject) {
             // Anchor the pan and take key focus for reset-to-fit.
             let win = self.event_window_point(event);
-            self.ivars().drag_anchor.set(Some(win)); let syn = self.ivars().synapse.borrow().clone(); if let (Some(syn), Some((px, py))) = (syn, self.surface_point(event)) { syn.fire(bandy::SMessage::BrowserButton { down: true, x: px, y: py }); } // NLE2B (SR208): the press
+            self.ivars().drag_anchor.set(Some(win)); let syn = self.ivars().synapse.borrow().clone(); if let (Some(syn), Some((px, py))) = (syn, self.surface_point(event)) { syn.fire(bandy::SMessage::BrowserButton { down: true, x: px, y: py, mods: { let f: usize = unsafe { msg_send![event, modifierFlags] }; ((f >> 17) & 0xF) as u8 }, surface: self.ivars().surface.get() }); } // NLE2B (SR208): the press; NLE2-MODS (SR306): modifierFlags bits 17-20 (shift, control, option, command) are bandy's MOD_* bits 0-3
             if let Some(window) = self.window() {
                 let _: bool = unsafe { msg_send![&window, makeFirstResponder: self] };
             }
@@ -271,7 +274,7 @@ define_class!(
 
         #[unsafe(method(mouseDragged:))]
         fn mouse_dragged(&self, event: &AnyObject) {
-            if let Some(syn) = self.ivars().synapse.borrow().clone() { if let Some((px, py)) = self.surface_point(event) { syn.fire(bandy::SMessage::BrowserMouseMove(px, py)); } // NLE2B (SR208): a button-held drag moves too
+            if let Some(syn) = self.ivars().synapse.borrow().clone() { if let Some((px, py)) = self.surface_point(event) { syn.fire(bandy::SMessage::BrowserMouseMove(px, py, self.ivars().surface.get())); } // NLE2B (SR208): a button-held drag moves too
                 return; // browser surface: no picture panning
             }
             let (nx, ny) = self.event_window_point(event);
@@ -302,8 +305,8 @@ define_class!(
                     if dw > 0.0 && dh > 0.0 && iw > 0 && ih > 0 {
                         let px = (vx - dx) / dw * iw as f64;
                         let py = ih as f64 - ((vy - dy) / dh * ih as f64);
-                        syn.fire(bandy::SMessage::BrowserButton { down: false, x: px, y: py }); if px >= 0.0 && px < iw as f64 && py >= 0.0 && py < ih as f64 { // NLE2B (SR208): the release, off the frame too
-                            syn.fire(bandy::SMessage::BrowserClick(px, py));
+                        syn.fire(bandy::SMessage::BrowserButton { down: false, x: px, y: py, mods: { let f: usize = unsafe { msg_send![event, modifierFlags] }; ((f >> 17) & 0xF) as u8 }, surface: self.ivars().surface.get() }); if px >= 0.0 && px < iw as f64 && py >= 0.0 && py < ih as f64 { // NLE2B (SR208): the release, off the frame too
+                            syn.fire(bandy::SMessage::BrowserClick(px, py, self.ivars().surface.get()));
                         }
                     }
                 }
@@ -324,7 +327,7 @@ define_class!(
                 // (hover, `:hover`, the page's mouse events); the page's cursor is re-asserted
                 // (AppKit resets it to the arrow as the pointer crosses views).
                 if let Some((px, py)) = self.surface_point(event) {
-                    syn.fire(bandy::SMessage::BrowserMouseMove(px, py));
+                    syn.fire(bandy::SMessage::BrowserMouseMove(px, py, self.ivars().surface.get()));
                 }
                 self.apply_page_cursor();
                 return;
@@ -353,7 +356,7 @@ define_class!(
                 if flags & (1 << 20) != 0 {
                     match text.as_str() {
                         "c" | "C" => syn.fire(bandy::SMessage::BrowserCopy),
-                        "a" | "A" => syn.fire(bandy::SMessage::BrowserSelectAll),
+                        "a" | "A" => syn.fire(bandy::SMessage::BrowserSelectAll), "s" | "S" => syn.fire(bandy::SMessage::BrowserKey((if flags & (1 << 17) != 0 { "Meta+Shift+s" } else { "Meta+s" }).into())), "o" | "O" => syn.fire(bandy::SMessage::BrowserKey("Meta+o".into())), // SAVERECENTOPEN (SR403): Cmd+O reaches the chrome's open verb; PDF4FORMSAVE (SR354): Cmd+S reaches the engine (a PDF tab saves); SAVEDIALOG (SR364): with Shift (NSEventModifierFlagShift = 1 << 17) it is Save As
                         _ => {}
                     }
                     return;
@@ -414,6 +417,7 @@ impl FacetImageView {
             );
             return;
         }
+        if super::gpu_view::page_frame(self, rgba, width, height) { *self.ivars().size.borrow_mut() = (width, height); *self.ivars().rgba.borrow_mut() = rgba[..expected].to_vec(); return; } // AETHERMACGPU (SR309): the Metal page takes the blit (size kept for the event mapping)
 
         let bytes_per_row = width as usize * 4;
         let rep: Retained<NSBitmapImageRep> = unsafe {
@@ -508,13 +512,13 @@ impl FacetImageView {
     fn fire_resize(&self, size: NSSize) {
         let syn = self.ivars().synapse.borrow().clone();
         let Some(syn) = syn else { return };
-        let (w, h) = (size.width.max(1.0) as u32, size.height.max(1.0) as u32);
+        let (w, h) = crate::platforms::page_geometry((size.width, size.height), 1.0, (0, 0)).viewport; // AETHERSURFACEHEIGHT (SR411): the view in points, the one rule
         if self.ivars().last_resize_sent.get() == Some((w, h)) {
             return;
         }
         self.ivars().last_resize_sent.set(Some((w, h)));
         self.ivars().last_resize_fire.set(Some(std::time::Instant::now()));
-        syn.fire(bandy::SMessage::BrowserResize(w, h));
+        syn.fire(bandy::SMessage::BrowserResize(w, h, self.ivars().surface.get()));
     }
 
     // -- interaction --------------------------------------------------------
@@ -886,24 +890,26 @@ pub fn bootstrap_image_view(
 }
 
 pub fn bootstrap_image_surface(id: &str, synapse: bandy::Synapse) -> Retained<NSView> {
+    bootstrap_image_surface_held(id, synapse).0
+}
+
+/// FACELIVE-SUBSCRIPTION-DROP (SR441): [`bootstrap_image_surface`] with its bus subscriber's abort handle (the loop runs
+/// through `tetra_eval::face_subscribe`), which the tetra evaluator keeps and aborts when the Surface leaves the tree.
+pub fn bootstrap_image_surface_held(id: &str, synapse: bandy::Synapse) -> (Retained<NSView>, tokio::task::AbortHandle) {
     let mtm = MainThreadMarker::new().expect("bootstrap_image_surface must run on the main thread");
 
     let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(800.0, 600.0));
     let view = FacetImageView::new(mtm, frame);
-    *view.ivars().synapse.borrow_mut() = Some(synapse.clone());
+    *view.ivars().synapse.borrow_mut() = Some(synapse.clone()); view.ivars().surface.set(crate::tetra::surface_number(id)); // SURFACEID (SR332)
 
     let bound = std::sync::Arc::new(dispatch2::MainThreadBound::new(view.clone(), mtm));
     let mut rx = synapse.subscribe();
 
     let target_id = id.to_string();
-    // The AppKit main thread has no tokio reactor; give the subscription loop
-    // its own thread + current-thread runtime and hop frames back via GCD.
-    std::thread::Builder::new().name("surface-blit".into()).spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("surface subscription runtime");
-        rt.block_on(async move {
+    let resend = synapse.clone(); // AETHERMACGPU-ENGINEDAMAGE (SR341): a lagged loop asks for the surface whole
+    // The AppKit main thread has no tokio reactor; the subscription loop gets its own thread + current-thread runtime
+    // (`tetra_eval::face_subscribe`, FACELIVE-SUBSCRIPTION-DROP SR441) and hops frames back via GCD.
+    let abort = super::tetra_eval::face_subscribe("surface-blit", async move {
         loop {
             match rx.recv().await {
                 Ok(bandy::SMessage::BrowserCursorChanged(name)) => {
@@ -913,14 +919,28 @@ pub fn bootstrap_image_surface(id: &str, synapse: bandy::Synapse) -> Retained<NS
                         bound.get(mtm).set_page_cursor(&name);
                     });
                 }
-                Ok(bandy::SMessage::SurfaceBlit { url, width, height, pixels }) => {
+                Ok(bandy::SMessage::SurfaceBlit { url, width, height, pixels, damage, scroll }) => {
                     if url == target_id {
                         let bound = bound.clone();
                         dispatch2::DispatchQueue::main().exec_async(move || {
                             let mtm = MainThreadMarker::new().unwrap();
-                            bound.get(mtm).set_frame(&pixels, &[], width, height);
+                            match damage {
+                                None => bound.get(mtm).set_frame(&pixels, &[], width, height),
+                                // AETHERMACGPU-DAMAGE (SR320) / -ENGINEDAMAGE (SR341): the rects' rows only.
+                                Some(rects) => bound.get(mtm).set_damage(&pixels, width, height, &rects, scroll),
+                            }
                         });
                     }
+                }
+                // SAVEDIALOG (SR364): the owner asks THIS surface's window for a path: the platform save panel, on the main thread.
+                Ok(bandy::SMessage::SavePanel { url, name, folder }) if url == target_id => {
+                    let syn = resend.clone();
+                    dispatch2::DispatchQueue::main().exec_async(move || super::save_panel::run(url, &name, folder.as_deref(), &syn));
+                }
+                // OPEN-DIALOG-ONE (SR386): the owner asks THIS surface's window for a file: the platform open panel, on the main thread.
+                Ok(bandy::SMessage::OpenPanel { url, filters, folder }) if url == target_id => {
+                    let syn = resend.clone(); // SAVERECENTOPEN (SR403): the panel opens in `folder`
+                    dispatch2::DispatchQueue::main().exec_async(move || super::open_panel::run(url, &filters, folder.as_deref(), &syn));
                 }
                 // AETHERSELECT (SR69): the engine's copy lands on the general pasteboard as plain text.
                 Ok(bandy::SMessage::BrowserClipboardSet(text)) => {
@@ -936,12 +956,40 @@ pub fn bootstrap_image_surface(id: &str, synapse: bandy::Synapse) -> Retained<NS
                     });
                 }
                 Ok(_) => {}
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                // AETHERMACGPU-ENGINEDAMAGE (SR341): the kept frame missed blits; the sender sends this surface whole.
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => resend.fire(bandy::SMessage::SurfaceResend { url: target_id.clone() }),
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }
         }
-        });
-    }).expect("spawn surface-blit thread");
+    });
 
-    Retained::into_super(view)
+    (Retained::into_super(view), abort)
+}
+
+// AETHERMACGPU-DAMAGE (LEDGER SR320) / -ENGINEDAMAGE (SR341): a damage blit (`SurfaceBlit { damage: Some(rects) }`,
+// `pixels` = the rects' rows in list order).
+impl FacetImageView {
+    /// AETHERMACGPU-SCROLL (SR351): the kept frame (`ivars.rgba`, current on the Metal path too: `set_frame` stores it)
+    /// takes the blit through the ONE `tetra::surface_apply` (the `scroll` copy, then each rect's rows). Without a scroll
+    /// the Metal page takes the rects into its texture (`gpu_view::page_damage`); with one every pixel moved, so the kept
+    /// frame goes up whole through `gpu_view::page_frame` (the one `replace_rect`); the CPU page shows the kept frame
+    /// through `set_frame`. A kept frame of another size, or a blit that does not fit, drops it (the sender's next whole
+    /// frame repairs it). Main thread only.
+    pub fn set_damage(&self, rows: &[u8], width: u32, height: u32, rects: &[(u32, u32, u32, u32)], scroll: Option<(i32, i32)>) {
+        let applied = {
+            let mut kept = self.ivars().rgba.borrow_mut();
+            *self.ivars().size.borrow() == (width, height) && crate::tetra::surface_apply(&mut kept, width, height, rects, rows, scroll)
+        };
+        if scroll.is_none() && super::gpu_view::page_damage(self, rows, width, height, rects) {
+            return;
+        }
+        if !applied {
+            return;
+        }
+        let kept = self.ivars().rgba.borrow().clone();
+        if scroll.is_some() && super::gpu_view::page_frame(self, &kept, width, height) {
+            return;
+        }
+        self.set_frame(&kept, &[], width, height);
+    }
 }

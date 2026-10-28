@@ -4187,7 +4187,7 @@ impl JoinHandle {
     /// parked joiner holds its handle on its frozen stack, and the posting task holds its `done_sem`
     /// clone until the Box is dropped on the Finished path, strictly after the post. So the Arc
     /// refcount substitutes for the `Semaphore`'s `'static` requirement: no UAF, no leak.
-    pub fn join(self) {
+    #[track_caller] pub fn join(self) {
         assert!(
             self.done.wait(),
             "JoinHandle::join() must be called from a scheduled task"
@@ -4467,9 +4467,9 @@ fn make_ready(mut task: Box<Task>) {
 /// Cooperatively give up the CPU: mark this task ready and switch back to the scheduler, which
 /// requeues us and runs the next task. We resume here (IRQ masked, carried by the switch) when
 /// re-dispatched. No-op if called outside a scheduled task.
-pub fn yield_now() {
+#[track_caller] pub fn yield_now() {
     let cpu = percpu::this_cpu().cpu_index as usize;
-    mask_irq();
+    mask_irq(); yieldsite::note(); // PREEMPTOFFARMSLEEPCHECKYIELDSITE (zenbook-ledger Z107): the caller's Location into this core's YIELD_AT, masked, before the switch. LINE-NEUTRAL
     // SKILL-1 on-CPU kill boundary: a cooperative yield is as good a retirement point as a preemption.
     kill_check_current(); // never returns if this task has been killed
     let raw = SCHED[cpu].current.load(Ordering::Acquire) as *mut Task;
@@ -5153,9 +5153,9 @@ pub fn exit() -> ! {
 /// on the real Pi 4 (each core's timer is LIVE). Callers must not depend on it completing where
 /// `timer::is_live()` is false. Interrupts are masked across the state flip + switch (like
 /// `yield_now`) and unmasked on resume — task bodies always run with IRQ unmasked.
-pub fn sleep_ticks(n: u64) {
+#[track_caller] pub fn sleep_ticks(n: u64) {
     let cpu = percpu::this_cpu().cpu_index as usize;
-    mask_irq();
+    mask_irq(); yieldsite::note(); // PREEMPTOFFARMSLEEPCHECKYIELDSITE (zenbook-ledger Z107): the caller's Location into this core's YIELD_AT, masked, before the switch. LINE-NEUTRAL
     let raw = SCHED[cpu].current.load(Ordering::Acquire) as *mut Task;
     if !raw.is_null() {
         let deadline = percpu::this_cpu().ticks.load(Ordering::Relaxed) + n;
@@ -5500,7 +5500,7 @@ fn dispatch_next(cpu: usize) -> bool {
         }
     }
     task.state.store(STATE_RUNNING, Ordering::Release);
-    SCHED[cpu].quantum.store(QUANTUM_TICKS, Ordering::Relaxed);
+    SCHED[cpu].quantum.store(QUANTUM_TICKS, Ordering::Relaxed); preemptoff::on_dispatch(cpu, task.id); // PREEMPTOFFARMQUANTUM (zenbook-ledger Z89): a preempt-off count still held when this core dispatches a task that is not its recorded holder is a leak (a holder that died or yielded inside its span) — reset and named once. LINE-NEUTRAL fold, code first
     let raw = Box::into_raw(task);
     let entry_sp = unsafe { (*raw).ctx_sp };
     // Publish `current` (Release) strictly before switching in — the trampoline reads it Acquire.
@@ -5553,7 +5553,7 @@ fn dispatch_next(cpu: usize) -> bool {
     unsafe {
         switch_context(SCHED[cpu].scheduler_sp.as_ptr(), entry_sp);
     }
-    spin8(cpu, SPIN8_DISPATCH); let lz = unsafe { guard_state(&(&(*raw).stack)[..STACK_REDZONE]) }; if lz != 0 { let (lid, lnm) = unsafe { ((*raw).id, (*raw).name) }; if GUARD_LO_LAST.swap(lid, Ordering::Relaxed) != lid && GUARD_LO_REPORTS.fetch_add(1, Ordering::Relaxed) < 16 { serial_println!("[redzone] cpu={} LOW-REDZONE {} task={}:{} — this task's OWN SP crossed its usable floor into the {} B absorber below it{}", cpu, if lz & 2 != 0 { "TRAVERSED" } else { "entered" }, lid, lnm, STACK_REDZONE, if lz & 2 != 0 { "; the absorber is EXHAUSTED, so the slab BELOW this stack may already hold a SMASHED parked frame — grow this task's stack NOW" } else { ", which ABSORBED it, so no neighbour was reached — grow this task's stack" }); } }
+    super::exceptions::irq_mark(false); spin8(cpu, SPIN8_DISPATCH); let lz = unsafe { guard_state(&(&(*raw).stack)[..STACK_REDZONE]) }; if lz != 0 { let (lid, lnm) = unsafe { ((*raw).id, (*raw).name) }; if GUARD_LO_LAST.swap(lid, Ordering::Relaxed) != lid && GUARD_LO_REPORTS.fetch_add(1, Ordering::Relaxed) < 16 { serial_println!("[redzone] cpu={} LOW-REDZONE {} task={}:{} — this task's OWN SP crossed its usable floor into the {} B absorber below it{}", cpu, if lz & 2 != 0 { "TRAVERSED" } else { "entered" }, lid, lnm, STACK_REDZONE, if lz & 2 != 0 { "; the absorber is EXHAUSTED, so the slab BELOW this stack may already hold a SMASHED parked frame — grow this task's stack NOW" } else { ", which ABSORBED it, so no neighbour was reached — grow this task's stack" }); } } // PREEMPTOFFARMIRQMARKSTALE (zenbook-ledger Z101): every switch-out lands here, so a mark a switch inside the IRQ handler left set is cleared before the scheduler or the next task runs (`exceptions::irq_mark`). LINE-NEUTRAL
     let busy_cyc = now_cyc().wrapping_sub(busy_t0);
     // The switch-back always lands IRQ-masked (yield_now/exit mask first; timer_preempt runs in the
     // auto-masked IRQ handler), so the Box reclaim below can't race a re-entrant preempt on this
@@ -5578,7 +5578,7 @@ fn dispatch_next(cpu: usize) -> bool {
     // can never leak into the next task's switch-back. Only a task that switched back BLOCKED carries
     // a meaningful action.
     let park = SCHED[cpu].park_kind.swap(PARK_NONE, Ordering::Relaxed);
-    let mut task = unsafe { Box::from_raw(raw) };
+    let mut task = unsafe { Box::from_raw(raw) }; preemptoff::sleep_check(cpu, task.id, task.state.load(Ordering::Acquire), park); // PREEMPTOFFARMSLEEPCHECK (zenbook-ledger Z95): every voluntary switch-out lands here (both involuntary paths return at a held count before switching), so a held count whose holder is the outgoing task is a yield or park inside its span — counted and its span site latched, masked, no print (a PARK_WAITQ lock is still handed off here). LINE-NEUTRAL fold, code first
     match task.state.load(Ordering::Acquire) {
         STATE_FINISHED => drop(task), // free the stack
         STATE_BLOCKED => park_blocked(cpu, park, task), // sleeper list / (M4b) a wait queue
@@ -5614,7 +5614,7 @@ fn dispatch_next(cpu: usize) -> bool {
             rq(dest).push(task);
         }
     }
-    true
+    preemptoff::sleep_report(cpu); true // PREEMPTOFFARMSLEEPCHECK (zenbook-ledger Z95): the sleep-in-span once-line, said after park_blocked released any handed-off wait-queue lock. LINE-NEUTRAL
 }
 
 /// VUG-1 M3b: number of CPUs the "CPU pulse" meter should show. Arch-neutral mirror of the x86 accessor.
@@ -6785,8 +6785,8 @@ impl Semaphore {
     /// `current` to block). A caller that hands out a resource on success (e.g. `Mutex::lock`) MUST
     /// check the return: `false` means NO permit was taken, so no resource may be issued.
     #[must_use]
-    pub fn wait(&self) -> bool {
-        let daif = irq_save_mask(); // IRQ masked for the whole critical section; restored on exit
+    #[track_caller] pub fn wait(&self) -> bool {
+        let daif = irq_save_mask(); yieldsite::note(); // IRQ masked for the whole critical section; restored on exit
         self.lock_raw();
 
         if self.count.load(Ordering::Relaxed) > 0 {
@@ -7084,9 +7084,9 @@ pub enum FutexWait {
 /// can never slip between the compare and the park being enqueued (the classic race-free compare-and-block).
 /// `key` MUST be the physical address of `uaddr`. `uaddr` must already be validated (in the caller's user
 /// window) by the syscall layer; this reads it at EL1 (the syscall runs with the caller's TTBR0 live).
-pub fn futex_wait(key: u64, uaddr: u64, expected: u32) -> FutexWait {
+#[track_caller] pub fn futex_wait(key: u64, uaddr: u64, expected: u32) -> FutexWait {
     debug_assert!(key != 0, "futex key must be non-zero");
-    let daif = irq_save_mask();
+    let daif = irq_save_mask(); yieldsite::note(); // PREEMPTOFFARMSLEEPCHECKYIELDSITE (zenbook-ledger Z107): the caller's Location into this core's YIELD_AT, masked, before the switch. LINE-NEUTRAL
     // Select the bucket: an existing one for this key, else claim a free one. Left LOCKED on success.
     let mut chosen: Option<&FutexBucket> = None;
     for b in FUTEX.iter() {
@@ -7444,7 +7444,7 @@ impl<T> Mutex<T> {
     /// — otherwise two callers could hold guards at once (aliased `&mut T` = UB). Off a scheduled
     /// task `wait()` cannot block and so does not acquire, so we panic rather than hand out an
     /// unbacked guard (a sleeping mutex is meaningless off a scheduler context anyway).
-    pub fn lock(&self) -> MutexGuard<'_, T> {
+    #[track_caller] pub fn lock(&self) -> MutexGuard<'_, T> {
         assert!(
             self.sem.wait(),
             "Mutex::lock() called off a scheduled task (a sleeping mutex needs a scheduler context)"
@@ -7525,14 +7525,14 @@ impl<T> Channel<T> {
     }
 
     /// Send a value, blocking while the channel is full. Must be called from a scheduled task.
-    pub fn send(&self, value: T) {
+    #[track_caller] pub fn send(&self, value: T) {
         assert!(self.slots.wait(), "Channel::send() called off a scheduled task");
         self.buffer.lock().push_back(value); // mutex held only across the push (never across a wait)
         self.items.post();
     }
 
     /// Receive a value, blocking while the channel is empty. Must be called from a scheduled task.
-    pub fn recv(&self) -> T {
+    #[track_caller] pub fn recv(&self) -> T {
         assert!(self.items.wait(), "Channel::recv() called off a scheduled task");
         // A permit from `items` guarantees a value was pushed before its matching `post`, and pops
         // are serialised by the mutex, so the buffer is non-empty here.
@@ -7612,9 +7612,9 @@ impl Condvar {
     ///
     /// The lettered step order below is load-bearing for lost-wakeup safety and the lock-ordering
     /// invariant; do not reorder it.
-    pub fn wait<'a, T>(&self, guard: MutexGuard<'a, T>) -> MutexGuard<'a, T> {
+    #[track_caller] pub fn wait<'a, T>(&self, guard: MutexGuard<'a, T>) -> MutexGuard<'a, T> {
         // (a) Mask IRQ for the whole critical section; remember the caller's DAIF to restore.
-        let daif = irq_save_mask();
+        let daif = irq_save_mask(); yieldsite::note(); // PREEMPTOFFARMSLEEPCHECKYIELDSITE (zenbook-ledger Z107): the caller's Location into this core's YIELD_AT, masked, before the switch. LINE-NEUTRAL
 
         // (b) Must be on a scheduled task. Assert BEFORE consuming the guard: were we to forget the
         //     guard first and then panic, the mutex would be permanently locked (its explicit
@@ -11145,27 +11145,41 @@ fn nopreempt_held(cpu: usize) -> bool {
 /// The core index is captured at acquisition and used at release, so a task that MIGRATES between
 /// the two decrements the counter it incremented. That is the same reason `wm::BlitGuard` stores its
 /// enter-core rather than re-reading it at drop.
+///
+/// PREEMPTOFFARMSTALEDROP (zenbook-ledger Z91): the guard also carries its core's preempt-off epoch at the take
+/// (`preemptoff::HOLD_EPOCH`, bumped at every 0 -> 1 take and every dispatch-time reset), so a guard whose count was reset
+/// under it (its holder yielded inside the span) releases nothing when it drops: a later hold's count is never taken.
 pub struct PreemptHold {
     core: usize,
+    epoch: u32,
 }
 
 /// COMPGATE — take a preemption hold on this core. See the ledger above for the contract; the caller
 /// must keep the section BOUNDED and free of voluntary yields.
 #[inline]
+#[track_caller]
 pub fn preempt_hold() -> PreemptHold {
+    hold_at(core::panic::Location::caller())
+}
+
+/// PREEMPTOFFARMQUANTUM (zenbook-ledger Z89): the one take behind [`preempt_hold`] and `preemptoff::scoped`. The
+/// outermost take (count 0 -> 1) records its task and `site` as this core's holder, which `preemptoff::on_dispatch` reads.
+#[inline]
+fn hold_at(site: &'static core::panic::Location<'static>) -> PreemptHold {
     let core = meter_current_cpu().min(NUM_CPUS - 1);
-    NOPREEMPT[core].fetch_add(1, Ordering::AcqRel);
-    PreemptHold { core }
+    let epoch = if NOPREEMPT[core].fetch_add(1, Ordering::AcqRel) == 0 {
+        preemptoff::note_holder(core, site)
+    } else {
+        preemptoff::epoch(core)
+    };
+    PreemptHold { core, epoch }
 }
 
 impl Drop for PreemptHold {
     fn drop(&mut self) {
-        // Saturating rather than a bare `fetch_sub`: an underflow would wrap to `u32::MAX` and
-        // disable preemption on this core for the rest of the boot, which is the one failure mode
-        // this whole block exists to make impossible.
-        let _ = NOPREEMPT[self.core].fetch_update(Ordering::AcqRel, Ordering::Relaxed, |n| {
-            Some(n.saturating_sub(1))
-        });
+        // PREEMPTOFFARMSTALEDROP (Z91): released through `preemptoff::release`, which decrements only when this guard's
+        // epoch is still its core's (else the count is a later hold's: counted, never taken).
+        preemptoff::release(self.core, self.epoch);
     }
 }
 
@@ -11234,4 +11248,957 @@ pub fn spawn_joinable_stack(name: &'static str, entry: fn(usize), arg: usize, cp
     done.init(); // reserve the waiter list BEFORE the task can run + post (alloc-free park)
     let id = spawn_inner(name, entry, arg, cpu, PRIO_NORMAL, Some(done.clone()), stack_bytes);
     JoinHandle { done, id }
+}
+
+// ══ PREEMPTOFFARM (zenbook-ledger Z67) — `preemptoff`, x86's API on the aarch64 count COMPGATE already keeps ══
+// BP-cores-23's preempt-off count exists on this arch: COMPGATE's `NOPREEMPT` (above), honoured by BOTH involuntary switch
+// paths (`timer_preempt`, `ipi_preempt`) through `nopreempt_held`, above `kill_check_current`. This module is x86's
+// `sched::preemptoff` API (`disable` / `enable` / `scoped` / `witness` / `audit_selftest`) over that ONE counter — no
+// second count, so `crate::arch::sched::preemptoff::scoped` compiles on both arches. Every take here is MASKED around the
+// core read and the increment (COMPGATE's `preempt_hold` reads the core unmasked: a migration window this closes for its
+// callers). Holders today: the FAT/DIR RMW spans (`fs/fat.rs` `with_fat_lock` / `with_dir_lock`, were
+// `without_interrupts`), PSTATE.I as the caller had it. Semantics that differ from x86, owed by name (cores.md §5):
+// PREEMPTOFF-ARM-QUANTUM — BUILT by PREEMPTOFFARMQUANTUM (zenbook-ledger Z89): the quantum is PAUSED while held (measured:
+// `timer_preempt` returns at the decline before the countdown, COMPGATE hazard 3; x86 consumes it — the divergence is
+// deliberate: pause charges the holder only the ticks it ran unheld), so there is no FIRED counter (nothing is pending
+// after a decline); the outermost take records its holder (task + site) and `on_dispatch` resets a count the dispatched
+// task does not hold, named once in x86's words. PREEMPTOFF-ARM-STALEDROP — BUILT by PREEMPTOFFARMSTALEDROP (zenbook-ledger
+// Z91): ONE per-core epoch beside the holder record, bumped at the 0 -> 1 take and at that reset, stored in `PreemptHold`
+// and compared in its masked `release`, so a holder that yielded inside its span and drops after a reset takes no later
+// hold's decrement (`stale_drop=`, said once).
+pub mod preemptoff {
+    use super::{current_tid_relaxed, meter_current_cpu, nopreempt_held, NOPREEMPT, NUM_CPUS};
+    use core::panic::Location;
+    use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
+
+    /// The FAT/DIR spans converted from `without_interrupts` (the aarch64 audit's `converted_fat=`).
+    pub const CONVERTED_FAT: u32 = 2;
+
+    static ENABLE_ZERO_SAID: AtomicBool = AtomicBool::new(false);
+
+    /// PREEMPTOFFARMQUANTUM (Z89): this core's holder — the task (0 = no task) and the site of the outermost take. Written
+    /// only by its own core at the 0 -> 1 take; read by `on_dispatch` on the same core, masked.
+    static HOLD_TID: [AtomicU64; NUM_CPUS] = [const { AtomicU64::new(0) }; NUM_CPUS];
+    static HOLD_SITE: [AtomicPtr<Location<'static>>; NUM_CPUS] = [const { AtomicPtr::new(core::ptr::null_mut()) }; NUM_CPUS];
+    /// The holder whose count this core last reset at dispatch (the KAT's witness), and the resets this boot.
+    static LAST_RESET_TID: [AtomicU64; NUM_CPUS] = [const { AtomicU64::new(0) }; NUM_CPUS];
+    static LEAK_RESETS: AtomicU32 = AtomicU32::new(0);
+    static LEAK_SAID: AtomicBool = AtomicBool::new(false);
+    /// PREEMPTOFFARMSTALEDROP (Z91): this core's preempt-off epoch — bumped by its own core at the 0 -> 1 take
+    /// (`note_holder`) and at the dispatch-time reset (`on_dispatch`); a `PreemptHold` keeps the value it took under.
+    static HOLD_EPOCH: [AtomicU32; NUM_CPUS] = [const { AtomicU32::new(0) }; NUM_CPUS];
+    /// Guards dropped with a stale epoch this boot (the KAT's own given back): `stale_drop=`; the once-line's latch.
+    static STALE_DROPS: AtomicU32 = AtomicU32::new(0);
+    static STALE_SAID: AtomicBool = AtomicBool::new(false);
+
+    /// This core's slot, clamped exactly as `preempt_hold` / `preempt_hold_standing` clamp it (the slot read is the slot
+    /// written).
+    #[inline]
+    fn slot() -> usize {
+        meter_current_cpu().min(NUM_CPUS - 1)
+    }
+
+    /// Hold this core's preempt-off count (nests; saturates). Masked so the caller cannot migrate between reading its core
+    /// and writing that core's count.
+    #[track_caller]
+    pub fn disable() {
+        let site = Location::caller();
+        crate::arch::without_interrupts(|| {
+            let c = slot();
+            if let Ok(0) = NOPREEMPT[c].fetch_update(Ordering::AcqRel, Ordering::Relaxed, |n| Some(n.saturating_add(1))) {
+                note_holder(c, site);
+            }
+        });
+    }
+
+    /// Release one hold. An enable with the count already 0 is refused by name (once a boot) and changes nothing.
+    pub fn enable() {
+        let refused = crate::arch::without_interrupts(|| {
+            let c = slot();
+            match NOPREEMPT[c].fetch_update(Ordering::AcqRel, Ordering::Relaxed, |n| n.checked_sub(1)) {
+                Ok(_) => None,
+                Err(_) => Some(c),
+            }
+        });
+        if let Some(cpu) = refused {
+            if !ENABLE_ZERO_SAID.swap(true, Ordering::AcqRel) {
+                serial_println!("[sched] preempt_enable refused cpu={} — count already 0 (unpaired enable)", cpu);
+            }
+        }
+    }
+
+    /// The `without_interrupts`-shaped preempt-off span: COMPGATE's own guard (`preempt_hold`), taken masked, held around
+    /// `f`, interrupts as the caller had them. The guard's Drop releases the core it took, so an unwinding `f` still does.
+    #[track_caller]
+    pub fn scoped<R>(f: impl FnOnce() -> R) -> R {
+        let site = Location::caller();
+        let _hold = crate::arch::without_interrupts(|| super::hold_at(site));
+        f()
+    }
+
+    /// `(this core's preempt-off count is held, the current task id or u64::MAX)`, read masked — x86's signature. The
+    /// block claimants read `.0` as F3's must-not-wait predicate beside `irqs_masked()`.
+    pub fn witness() -> (bool, u64) {
+        crate::arch::without_interrupts(|| {
+            let c = slot();
+            let held = nopreempt_held(c);
+            let tid = match current_tid_relaxed(c) {
+                0 => u64::MAX,
+                id => id,
+            };
+            (held, tid)
+        })
+    }
+
+    /// `tests preemptaudit` (aarch64): from this unmasked task, read PSTATE.I and the count inside both FAT spans
+    /// (`fs::fat::preemptoff_span_probe`, no I/O); again from a masked caller (the span must leave it masked); then the
+    /// count must be free.
+    pub fn audit_selftest() {
+        if crate::arch::irqs_masked() {
+            serial_println!(":: PREEMPTAUDIT: -> SKIP(masked) ::");
+            return;
+        }
+        let ((fat_on, fat_held), (dir_on, dir_held)) = crate::fs::fat::preemptoff_span_probe();
+        let ((m_fat_on, _), (m_dir_on, _)) = crate::arch::without_interrupts(crate::fs::fat::preemptoff_span_probe);
+        let masked_kept = !m_fat_on && !m_dir_on; let ul = crate::fs::unafs::unafs_leg(); let lk = leak_kat(); let sk = stale_kat(); let sl = sleep_kat(); let wl = crate::video::wm::wmtable_leg(); let cl = casts_leg(); let cn = casts_nest_leg(); let cnn = casts_now_nest_leg(); let rl = route_leg(); let il = irqmark_stale_leg(); // PREEMPTOFFARMIRQMARKSTALELEG (zenbook-ledger Z113): the switch-back clear's leg (`irqmark_leg=`) right after the route leg, before `released`. PREEMPTOFFARMCASTSNOWINPASSLEG (zenbook-ledger Z109): `casts_now`'s in-pass nest leg (`casts_now_nest=`) after the in-pass `track` leg, before `released`. PREEMPTOFFARMCASTSINPASSLEG (zenbook-ledger Z106): the in-pass nest leg (`casts_nest=`) after the CASTS leg, before `released`. PREEMPTOFFARMCASTSLEG (zenbook-ledger Z103): the CASTS leg (`casts_leg=`) after the TABLE leg, before `released`. PREEMPTOFFARMSLEEPCHECK (zenbook-ledger Z95): the sleep KAT reads the stale KAT's real in-span yield, right after it. PREEMPTOFFARMWMTABLE (zenbook-ledger Z92): the TABLE leg (`wmtable_leg=`), before `released`. PREEMPTOFFARMSTALEDROP (zenbook-ledger Z91): the stale-drop KAT after the leak KAT. PREEMPTOFFARMQUANTUM (zenbook-ledger Z89): the leak-reset KAT runs before `released` too. PREEMPTOFFARMUNAFS (zenbook-ledger Z79): the UnaFS read-arm leg, before `released` so it also proves the leg gave the count back (LINE-NEUTRAL)
+        let released = !witness().0;
+        let reason = if !fat_on {
+            Some("fat-masked")
+        } else if !dir_on {
+            Some("dir-masked")
+        } else if !fat_held || !dir_held {
+            Some("not-held")
+        } else if !masked_kept {
+            Some("unmasked")
+        } else if !released {
+            Some("leaked") } else if !(ul == "ok" || ul.starts_with("skip")) { Some("unafs-leg") } else if lk != "ok" { Some("leak-kat") } else if sk != "ok" { Some("stale-kat") } else if sl != "ok" { Some("sleep-kat") } else if !(wl == "ok" || wl.starts_with("skip")) { Some("wmtable-leg") } else if !(cl == "ok" || cl.starts_with("skip")) { Some("casts-leg") } else if !(cn == "ok" || cn.starts_with("skip")) { Some("casts-nest") } else if !(cnn == "ok" || cnn.starts_with("skip")) { Some("casts-now-nest") } else if !(rl == "armed-ok" || rl.starts_with("skip")) { Some("route-leg") } else if !(il == "clear-ok" || il.starts_with("skip")) { Some("irqmark-leg")
+        } else {
+            None
+        };
+        let ok = |b: bool, y: &'static str, n: &'static str| if b { y } else { n };
+        match reason {
+            None => serial_println!(
+                ":: PREEMPTAUDIT: arch=aarch64 sites={} isr={} holder={} both={} converted={} converted_fat={} fat_irq_on=ok dir_irq_on=ok fat_held=ok dir_held=ok masked_kept=ok released=ok unafs_leg={} leak_reset={} leak_kat={} stale_drop={} stale_kat={} sleep_in_span={} sleep_kat={} wmtable_leg={} casts_leg={} casts_nest={} casts_now_nest={} route_leg={} irqmark_leg={} -> PASS ::",
+                AUDIT_SITES, AUDIT_ISR, AUDIT_HOLDER, AUDIT_BOTH, AUDIT_CONVERTED, CONVERTED_FAT, ul, leak_resets(), lk, stale_drops(), sk, sleep_in_spans(), sl, wl, cl, cn, cnn, rl, il
+            ),
+            Some(r) => serial_println!(
+                ":: PREEMPTAUDIT: arch=aarch64 sites={} isr={} holder={} both={} converted={} converted_fat={} fat_irq_on={} dir_irq_on={} fat_held={} dir_held={} masked_kept={} released={} unafs_leg={} leak_reset={} leak_kat={} stale_drop={} stale_kat={} sleep_in_span={} sleep_kat={} wmtable_leg={} casts_leg={} casts_nest={} casts_now_nest={} route_leg={} irqmark_leg={} -> FAIL reason={} ::",
+                AUDIT_SITES, AUDIT_ISR, AUDIT_HOLDER, AUDIT_BOTH, AUDIT_CONVERTED, CONVERTED_FAT,
+                ok(fat_on, "ok", "masked"),
+                ok(dir_on, "ok", "masked"),
+                ok(fat_held, "ok", "free"),
+                ok(dir_held, "ok", "free"),
+                ok(masked_kept, "ok", "unmasked"),
+                ok(released, "ok", "leaked"), ul, leak_resets(), lk, stale_drops(), sk, sleep_in_spans(), sl, wl, cl, cn, cnn, rl, il,
+                r
+            ),
+        }
+    }
+
+    /// PREEMPTOFFARMQUANTUM (Z89): record `core`'s holder at its outermost take (the task running there and the take's site).
+    /// PREEMPTOFFARMSTALEDROP (Z91): and bump `core`'s epoch, returning the new value (the outermost guard's).
+    pub(super) fn note_holder(core: usize, site: &'static Location<'static>) -> u32 {
+        if core < NUM_CPUS {
+            HOLD_TID[core].store(current_tid_relaxed(core), Ordering::Relaxed);
+            HOLD_SITE[core].store(site as *const Location<'static> as *mut Location<'static>, Ordering::Relaxed);
+            return HOLD_EPOCH[core].fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+        }
+        0
+    }
+
+    /// PREEMPTOFFARMSTALEDROP (Z91): `core`'s current epoch (a nested take's guard keeps it).
+    pub(super) fn epoch(core: usize) -> u32 {
+        if core < NUM_CPUS { HOLD_EPOCH[core].load(Ordering::Relaxed) } else { 0 }
+    }
+
+    /// PREEMPTOFFARMSTALEDROP (Z91): `PreemptHold`'s release. Masked, so on its own core the compare and the decrement
+    /// cannot straddle a dispatch. Epoch still `core`'s: the saturating decrement (an underflow would wrap to `u32::MAX`
+    /// and disable preemption on that core for the rest of the boot). Stale (the count was reset under this guard, and may
+    /// now be a later hold's): nothing released, counted, said once. A CROSS-core drop (a holder migrated out of a held
+    /// span) reads and decrements another core's slot in two atomics: a reset + retake between them is not closed
+    /// (PREEMPTOFF-ARM-STALEXCORE, owed).
+    pub(super) fn release(core: usize, epoch: u32) {
+        if core >= NUM_CPUS {
+            return;
+        }
+        let stale = crate::arch::without_interrupts(|| {
+            let now = HOLD_EPOCH[core].load(Ordering::Relaxed);
+            if now != epoch {
+                STALE_DROPS.fetch_add(1, Ordering::Relaxed);
+                return Some((now, current_tid_relaxed(slot())));
+            }
+            let _ = NOPREEMPT[core].fetch_update(Ordering::AcqRel, Ordering::Relaxed, |n| Some(n.saturating_sub(1)));
+            None
+        });
+        if let Some((now, tid)) = stale {
+            if !STALE_SAID.swap(true, Ordering::AcqRel) {
+                serial_println!(
+                    "[sched] preempt-off stale drop cpu={} holder={} epoch={}/{} -> not released (PREEMPTOFFARMSTALEDROP Z91)",
+                    core, tid, epoch, now
+                );
+            }
+        }
+    }
+
+    /// PREEMPTOFFARMSTALEDROP (Z91): guards dropped with a stale epoch this boot (the KAT's own given back): `stale_drop=`.
+    pub fn stale_drops() -> u32 {
+        STALE_DROPS.load(Ordering::Relaxed)
+    }
+
+    /// PREEMPTOFFARMQUANTUM (Z89): the dispatch fold (`dispatch_next`, IRQ masked, before `current` is published). A count
+    /// still held on this core when it dispatches a task that is not the recorded holder is a leak — the holder died
+    /// inside its span (no unwinding: its guard never drops) or switched out of it — so it is reset and named once. The
+    /// holder itself re-dispatched with nothing between keeps its count; a dead holder is never dispatched again, so the
+    /// first dispatch after its death resets it. x86's `on_dispatch` words, with the holder and its site.
+    pub(super) fn on_dispatch(cpu: usize, incoming: u64) {
+        if cpu >= NUM_CPUS {
+            return;
+        }
+        let n = NOPREEMPT[cpu].load(Ordering::Relaxed);
+        if n == 0 {
+            return;
+        }
+        let holder = HOLD_TID[cpu].load(Ordering::Relaxed);
+        if holder == incoming {
+            return;
+        }
+        NOPREEMPT[cpu].store(0, Ordering::Relaxed);
+        HOLD_EPOCH[cpu].fetch_add(1, Ordering::Relaxed); // PREEMPTOFFARMSTALEDROP (Z91): every guard taken before the reset is stale
+        LAST_RESET_TID[cpu].store(holder, Ordering::Relaxed);
+        LEAK_RESETS.fetch_add(1, Ordering::Relaxed);
+        if !LEAK_SAID.swap(true, Ordering::AcqRel) {
+            let site = HOLD_SITE[cpu].load(Ordering::Relaxed) as *const Location<'static>;
+            // SAFETY: only ever stored from a `&'static Location<'static>` (`note_holder`); null until the first take.
+            let (file, line) = match unsafe { site.as_ref() } {
+                Some(l) => (l.file(), l.line()),
+                None => ("?", 0),
+            };
+            serial_println!(
+                "[sched] preempt-off leaked cpu={} count={} holder={} site={}:{} -> reset at dispatch (PREEMPTOFFARMQUANTUM Z89)",
+                cpu, n, holder, file, line
+            );
+        }
+    }
+
+    /// PREEMPTOFFARMQUANTUM (Z89): dispatch-time leak resets this boot (the KAT's own given back): `leak_reset=`.
+    pub fn leak_resets() -> u32 {
+        LEAK_RESETS.load(Ordering::Relaxed)
+    }
+
+    /// The KAT's leaker: takes the count and RETURNS holding it — a death inside the span through the real exit path.
+    fn leak_kat_holder(_: usize) {
+        disable();
+    }
+
+    /// The KAT's follower: a no-op task whose dispatch on the leaker's core must find and reset the leak.
+    fn leak_kat_after(_: usize) {}
+
+    /// PREEMPTOFFARMQUANTUM (Z89) KAT (`leak_kat=`): a task pinned to this core dies holding the count; a second task is
+    /// then dispatched there. `ok` when that core's last reset named the dead holder (its one reset given back, so
+    /// `leak_reset=` counts real leaks only), else `not-reset`.
+    pub fn leak_kat() -> &'static str {
+        let c = slot();
+        let leaker = super::spawn_joinable("preemptoff-leak", leak_kat_holder, 0, c);
+        let tid = leaker.id();
+        leaker.join();
+        super::spawn_joinable("preemptoff-after", leak_kat_after, 0, c).join();
+        if LAST_RESET_TID[c].load(Ordering::Relaxed) != tid {
+            return "not-reset";
+        }
+        LEAK_RESETS.fetch_sub(1, Ordering::Relaxed);
+        "ok"
+    }
+
+    /// PREEMPTOFFARMSTALEDROP (Z91) KAT state: the follower ran; the holder's verdict code (0 = the holder never stored one).
+    static STALE_KAT_AFTER_RAN: AtomicBool = AtomicBool::new(false);
+    static STALE_KAT_CODE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+    /// The stale KAT's follower: a task whose dispatch on the holder's core, while the holder is yielded inside its span,
+    /// resets the holder's count (Z89's `on_dispatch`).
+    fn stale_kat_after(_: usize) {
+        super::yieldsite::kat_lock_follow(|| STALE_KAT_AFTER_RAN.store(true, Ordering::Release)); // PREEMPTOFFSLEEPCHECKYIELDSITEWRAPPERSKAT (zenbook-ledger Z115): the follower takes the KAT's lock before its store and holds it until the holder asks (the holder's contended park). LINE-NEUTRAL
+    }
+
+    /// The stale KAT's holder, pinned to core `c`: its verdict code into `STALE_KAT_CODE`.
+    fn stale_kat_holder(c: usize) {
+        let code = stale_kat_run(c);
+        STALE_KAT_CODE.store(code, Ordering::Release);
+    }
+
+    /// Take g1, yield through the real `yield_now` until the follower ran on this core (the reset), take g2 (a LATER
+    /// hold), drop g1: it must be counted stale and leave g2's count held; drop g2: free. Codes: 1 no-yield, 2 not-reset,
+    /// 3 not-counted, 4 stolen, 5 not-released, 6 ok.
+    fn stale_kat_run(c: usize) -> u8 {
+        let site = Location::caller();
+        let g1 = crate::arch::without_interrupts(|| super::hold_at(site));
+        let me = current_tid_relaxed(c); SLEEP_KAT_TID.store(me, Ordering::Relaxed); // PREEMPTOFFARMSLEEPCHECK (zenbook-ledger Z95): the test flag — this holder's in-span yield below is counted apart as the sleep KAT's hit (`sleep_kat=`), never in `sleep_in_span=` or the site latch. LINE-NEUTRAL
+        let follower = super::spawn_joinable("preemptoff-stale-after", stale_kat_after, 0, c);
+        let m0 = crate::arch::ms();
+        while !STALE_KAT_AFTER_RAN.load(Ordering::Acquire) && crate::arch::ms().wrapping_sub(m0) < 1000 {
+            super::yieldsite::kat_mark(line!()); super::yield_now(); // PREEMPTOFFARMSLEEPCHECKYIELDSITE (zenbook-ledger Z107): this line is the yield the sleep KAT must name (`kat_verdict`). LINE-NEUTRAL
+        }
+        let code = if !STALE_KAT_AFTER_RAN.load(Ordering::Acquire) {
+            drop(g1);
+            1
+        } else if LAST_RESET_TID[c].load(Ordering::Relaxed) != me {
+            drop(g1);
+            2
+        } else {
+            let g2 = crate::arch::without_interrupts(|| super::hold_at(site));
+            let s0 = STALE_DROPS.load(Ordering::Relaxed);
+            drop(g1);
+            let counted = STALE_DROPS.load(Ordering::Relaxed) == s0.wrapping_add(1);
+            let held = nopreempt_held(c);
+            drop(g2);
+            let free = !nopreempt_held(c);
+            if !counted {
+                3
+            } else if !held {
+                4
+            } else if !free {
+                5
+            } else {
+                6
+            }
+        };
+        let own = if code == 6 { super::yieldsite::kat_lock_park() } else { super::yieldsite::kat_lock_skip() }; LEAK_RESETS.fetch_sub(own, Ordering::Relaxed); STALE_DROPS.fetch_sub(own, Ordering::Relaxed); follower.join(); // PREEMPTOFFSLEEPCHECKYIELDSITEWRAPPERSKAT (zenbook-ledger Z115): the second in-span park, through a CONTENDED `Mutex::lock` in a fresh span (ok path only); its own reset and stale drop given back. LINE-NEUTRAL
+        code
+    }
+
+    /// PREEMPTOFFARMSTALEDROP (Z91) KAT (`stale_kat=`): the forced-yield holder above, pinned to this core and joined.
+    /// `ok` gives back the KAT's own reset and its own stale drop, so `leak_reset=` and `stale_drop=` count real events only.
+    pub fn stale_kat() -> &'static str {
+        let c = slot();
+        super::yieldsite::kat_lock_arm(); STALE_KAT_AFTER_RAN.store(false, Ordering::Release); // PREEMPTOFFSLEEPCHECKYIELDSITEWRAPPERSKAT (zenbook-ledger Z115): the KAT lock's `init` (before any task can block on it) and its words cleared. LINE-NEUTRAL
+        STALE_KAT_CODE.store(0, Ordering::Release);
+        super::spawn_joinable("preemptoff-stale", stale_kat_holder, c, c).join();
+        match STALE_KAT_CODE.load(Ordering::Acquire) {
+            6 => {
+                LEAK_RESETS.fetch_sub(1, Ordering::Relaxed);
+                STALE_DROPS.fetch_sub(1, Ordering::Relaxed);
+                "ok"
+            }
+            1 => "no-yield",
+            2 => "not-reset",
+            3 => "not-counted",
+            4 => "stolen",
+            5 => "not-released",
+            _ => "not-run",
+        }
+    }
+
+    /// PREEMPTOFFARMCENSUS (zenbook-ledger Z72) M1: the census of the aarch64 kernel's IRQ-mask sites (cores.md §4, the
+    /// PREEMPTOFFARM line), measured at 05beb9fa9 (held at d06742fa1) over FIVE forms — `arch::without_interrupts`, `arch::IrqMask`, this file's
+    /// `mask_irq` / `irq_save_mask`, syscall.rs `IrqGuard::mask_save` / `remask_irq`, raw `msr daifset` (#2, #0xf); NOT the
+    /// SError A-bit `daifset #4` (exceptions.rs). Any site compiled on aarch64 under any feature set counts (Z57's rule).
+    /// The ISR set: GICv2 SGI / `timer::on_tick` (prints) / PL011 RX `serial::on_rx_interrupt` -> `RX_READY.post()` ->
+    /// `make_ready` -> `rq().push`, so the run queue and `Semaphore` are ISR-shared (III); GICv3 SGI / tick. 167 sites — 28 I
+    /// (switch, SVC epilogue, PAR/TTBR0, boot/probe edges, fixtures), 116 II (syscall tables, futex, Condvar, UnaFS, pal,
+    /// WEDGE-10 loans, usbnet, wm/desktop), 23 III (heap, serial `_print`, fbcon, run queue, Semaphore); the two FAT/DIR
+    /// spans (`CONVERTED_FAT`) are converted to preempt-off and counted inside II (Z65's rule).
+    pub const AUDIT_SITES: u32 = 167;
+    pub const AUDIT_ISR: u32 = 28;
+    pub const AUDIT_HOLDER: u32 = 116;
+    pub const AUDIT_BOTH: u32 = 23;
+    pub const AUDIT_CONVERTED: u32 = CONVERTED_FAT + crate::fs::unafs::CONVERTED_UNAFS_ARM + CONVERTED_USBNET + CONVERTED_CURSORMOVE + crate::video::wm::CONVERTED_WMTABLE + CONVERTED_CASTS; #[cfg(feature = "usbnet")] use crate::drivers::xhci::usbnet::CONVERTED_USBNET; #[cfg(not(feature = "usbnet"))] const CONVERTED_USBNET: u32 = 0; const CONVERTED_CURSORMOVE: u32 = cfg!(feature = "baremetal") as u32; const CONVERTED_CASTS: u32 = 2 * (cfg!(feature = "desktop_firmware") as u32); // PREEMPTOFFARMUNAFS (zenbook-ledger Z79): the Pi read arm (1 on baremetal, 0 elsewhere); PREEMPTOFFARMUSBNETDRIVE (zenbook-ledger Z83): usbnet's `drive` span (1 where `usbnet` is compiled, 0 elsewhere); PREEMPTOFFARMCURSORMOVE (zenbook-ledger Z85): the input router's cursor span (`main.rs` `cursormove_span`, 1 on baremetal, 0 elsewhere); PREEMPTOFFARMWMTABLE (zenbook-ledger Z92): the window TABLE take (`video/wm.rs` `table_span`, 1 off `desktop_firmware`, 0 on the desktops); PREEMPTOFFARMCASTS (zenbook-ledger Z93): the shadow pass's CASTS publish span (`video/desktop.rs` `casts_span`, 1 on `desktop_firmware`, 0 elsewhere); PREEMPTOFFARMCASTSNOW (zenbook-ledger Z99): and `casts_now`'s copy-out, the same span (2 on `desktop_firmware`). LINE-NEUTRAL
+
+    // ══ PREEMPTOFFARMSLEEPCHECK (zenbook-ledger Z95) — a voluntary switch-out inside a held span, named at its span site ══
+    // Every voluntary switch-out (`yield_now`, `sleep_ticks`, `Semaphore::wait`, `futex_wait`, `Condvar::wait`; `exit` is
+    // Z89's death) calls `switch_context` itself, and every one comes back through ONE place: `dispatch_next`'s switch-back.
+    // Both involuntary paths (`timer_preempt`, `ipi_preempt`) return at a held count before any switch, so a switch-back with
+    // this core's count held and the outgoing task its recorded holder (Z89's `HOLD_TID`) is a yield or park inside the span.
+    // `sleep_check` runs there, masked, and only counts and latches (a PARK_WAITQ lock is still handed off at that point);
+    // `sleep_report`, at the end of the same pass, says the line once per span site (the first 8 sites; the rest counted).
+    // Z89's `on_dispatch` still resets the count at the next dispatch of another task; this names WHICH span slept.
+
+    /// Z95: real held switch-outs this boot (`sleep_in_span=`); the KAT's own are counted apart (`SLEEP_KAT_HITS`).
+    static SLEEP_IN_SPAN: AtomicU32 = AtomicU32::new(0);
+    /// Z95: span sites already said — the per-site once-latch (CAS into the first null slot).
+    static SLEEP_SITES: [AtomicPtr<Location<'static>>; 8] = [const { AtomicPtr::new(core::ptr::null_mut()) }; 8];
+    /// Z95: this core's pending once-line (site null = none). Written and read only by its own core, masked.
+    static SLEEP_PEND_SITE: [AtomicPtr<Location<'static>>; NUM_CPUS] = [const { AtomicPtr::new(core::ptr::null_mut()) }; NUM_CPUS];
+    static SLEEP_PEND_TID: [AtomicU64; NUM_CPUS] = [const { AtomicU64::new(0) }; NUM_CPUS];
+    static SLEEP_PEND_VIA: [core::sync::atomic::AtomicU8; NUM_CPUS] = [const { core::sync::atomic::AtomicU8::new(0) }; NUM_CPUS];
+    /// Z95 test flag: the stale KAT's holder (0 = none). Its in-span yield counts here, never in `SLEEP_IN_SPAN` or the latch.
+    static SLEEP_KAT_TID: AtomicU64 = AtomicU64::new(0);
+    static SLEEP_KAT_HITS: AtomicU32 = AtomicU32::new(0);
+    static SLEEP_KAT_VIA: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+    const VIA_YIELD: u8 = 1;
+    const VIA_SLEEP: u8 = 2;
+    const VIA_WAITQ: u8 = 3;
+
+    fn via_word(via: u8) -> &'static str {
+        match via {
+            VIA_YIELD => "yield",
+            VIA_SLEEP => "sleep",
+            VIA_WAITQ => "waitq",
+            _ => "?",
+        }
+    }
+
+    /// Z95: the switch-back check (`dispatch_next`, IRQ masked, this core, before `park_blocked` / the requeue). Held count,
+    /// outgoing task == recorded holder, and READY (a yield) or BLOCKED (a sleep or a wait-queue park): counted, its span
+    /// site claimed in the latch; a newly claimed site is stashed for `sleep_report`. No print here.
+    pub(super) fn sleep_check(cpu: usize, outgoing: u64, state: u8, park: u8) {
+        if cpu >= NUM_CPUS || NOPREEMPT[cpu].load(Ordering::Relaxed) == 0 || HOLD_TID[cpu].load(Ordering::Relaxed) != outgoing {
+            return;
+        }
+        let via = if state == super::STATE_READY {
+            VIA_YIELD
+        } else if state == super::STATE_BLOCKED && park == super::PARK_SLEEP {
+            VIA_SLEEP
+        } else if state == super::STATE_BLOCKED && park == super::PARK_WAITQ {
+            VIA_WAITQ
+        } else {
+            return; // FINISHED: a death inside the span is Z89's leak, named by `on_dispatch`
+        };
+        let kat = SLEEP_KAT_TID.load(Ordering::Relaxed);
+        if kat != 0 && kat == outgoing {
+            SLEEP_KAT_HITS.fetch_add(1, Ordering::Relaxed);
+            if super::yieldsite::kat_note(cpu) { SLEEP_KAT_VIA.store(via, Ordering::Relaxed); } // PREEMPTOFFARMSLEEPCHECKYIELDSITE (zenbook-ledger Z107): the KAT's named yield site; PREEMPTOFFSLEEPCHECKYIELDSITEWRAPPERSKAT (zenbook-ledger Z115): the via word is the yield phase's (the lock park is judged by its site). LINE-NEUTRAL
+            return;
+        }
+        SLEEP_IN_SPAN.fetch_add(1, Ordering::Relaxed);
+        let site = HOLD_SITE[cpu].load(Ordering::Relaxed);
+        if site.is_null() {
+            return;
+        }
+        for said in SLEEP_SITES.iter() {
+            match said.compare_exchange(core::ptr::null_mut(), site, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => {
+                    SLEEP_PEND_TID[cpu].store(outgoing, Ordering::Relaxed);
+                    SLEEP_PEND_VIA[cpu].store(via, Ordering::Relaxed);
+                    SLEEP_PEND_SITE[cpu].store(site, Ordering::Relaxed);
+                    return;
+                }
+                Err(cur) if cur == site => return,
+                Err(_) => {}
+            }
+        }
+    }
+
+    /// Z95: say this core's pending sleep-in-span line, once (end of `dispatch_next`, masked, no lock held).
+    pub(super) fn sleep_report(cpu: usize) {
+        if cpu >= NUM_CPUS {
+            return;
+        }
+        let site = SLEEP_PEND_SITE[cpu].swap(core::ptr::null_mut(), Ordering::Relaxed) as *const Location<'static>;
+        // SAFETY: only ever stored from `HOLD_SITE`, itself only from a `&'static Location<'static>` (`note_holder`).
+        let Some(l) = (unsafe { site.as_ref() }) else {
+            return;
+        };
+        serial_println!(
+            "[sched] preempt-off sleep in span cpu={} holder={} site={}:{} via={} yield={} -> switched out holding the count (PREEMPTOFFARMSLEEPCHECK Z95)",
+            cpu,
+            SLEEP_PEND_TID[cpu].load(Ordering::Relaxed),
+            l.file(),
+            l.line(),
+            via_word(SLEEP_PEND_VIA[cpu].load(Ordering::Relaxed)), super::yieldsite::Site(cpu)
+        );
+    }
+
+    /// Z95: real held switch-outs this boot (`sleep_in_span=`).
+    pub fn sleep_in_spans() -> u32 {
+        SLEEP_IN_SPAN.load(Ordering::Relaxed)
+    }
+
+    /// Z95 KAT (`sleep_kat=`): read after `stale_kat`, whose holder (flagged in `stale_kat_run`) yields inside its span
+    /// through the real `yield_now`. `ok` when the switch-back counted that yield (via=yield), `wrong-via`, else
+    /// `not-named`. Clears the flag and the hits.
+    pub fn sleep_kat() -> &'static str {
+        SLEEP_KAT_TID.store(0, Ordering::Relaxed);
+        let hits = SLEEP_KAT_HITS.swap(0, Ordering::Relaxed);
+        let via = SLEEP_KAT_VIA.swap(0, Ordering::Relaxed);
+        if hits == 0 {
+            "not-named"
+        } else if via != VIA_YIELD {
+            "wrong-via"
+        } else {
+            super::yieldsite::kat_verdict() // PREEMPTOFFARMSLEEPCHECKYIELDSITE (zenbook-ledger Z107): ok only when the named yield is stale_kat_run's line (else wrong-site)
+        }
+    }
+
+    // ══ PREEMPTOFFARMCASTSLEG (zenbook-ledger Z103) — the CASTS span's leg on the aarch64 audit (`casts_leg=`) ══
+    // Z92's `wmtable_leg` shape over Z93/Z99's span: from this unmasked task (the audit is the fixture, out of the pass, so
+    // every take here is the outermost — legal since Z99), hold `video/desktop.rs` `casts_span` and read PSTATE.I on and the
+    // count held inside; again under a masked caller (the span must leave it masked); then call the real out-of-pass taker
+    // `casts_now` and see this core's epoch move across it (Z91: bumped only at the 0 -> 1 take, so `casts_now` itself took
+    // the count; a migration between the two reads counts as taken, never a false FAIL), PSTATE.I still on after, the count
+    // free. Off `desktop_firmware` the tracker is not compiled: `skip(no-desk)`, so the token prints on every aarch64 build.
+
+    /// Z103 (`casts_leg=`): `ok`, `skip(masked)`, `held-before`, `masked`, `free`, `unmasked`, `not-taken`, `now-masked`,
+    /// `leaked`.
+    #[cfg(feature = "desktop_firmware")]
+    pub fn casts_leg() -> &'static str {
+        if crate::arch::irqs_masked() {
+            return "skip(masked)";
+        }
+        if witness().0 {
+            return "held-before";
+        }
+        let (irq_on, held) = {
+            let _s = crate::video::wm::desktop::casts_span();
+            (!crate::arch::irqs_masked(), witness().0)
+        };
+        let masked_on = crate::arch::without_interrupts(|| {
+            let _s = crate::video::wm::desktop::casts_span();
+            !crate::arch::irqs_masked()
+        });
+        let c = slot();
+        let e0 = epoch(c);
+        let _ = crate::video::wm::desktop::casts_now();
+        let c1 = slot();
+        let took = c1 != c || epoch(c1) != e0;
+        let now_on = !crate::arch::irqs_masked();
+        let released = !witness().0;
+        if !irq_on {
+            "masked"
+        } else if !held {
+            "free"
+        } else if masked_on {
+            "unmasked"
+        } else if !took {
+            "not-taken"
+        } else if !now_on {
+            "now-masked"
+        } else if !released {
+            "leaked"
+        } else {
+            "ok"
+        }
+    }
+
+    /// Z103: the tracker is not compiled off `desktop_firmware` (default `kernel8-test`, `test-arm`, the plain Orin image).
+    #[cfg(not(feature = "desktop_firmware"))]
+    pub fn casts_leg() -> &'static str {
+        "skip(no-desk)"
+    }
+
+    // ══ PREEMPTOFFARMCASTSINPASSLEG (zenbook-ledger Z106) — the CASTS span's IN-PASS nest on the aarch64 audit (`casts_nest=`) ══
+    // Z103 reads `casts_span` as the outermost take from the audit task; this leg reads the nest inside a REAL pass: it arms
+    // `CASTS_NEST` and drives `video/wm.rs` `composite` (-> `comp_gate_pass`'s own hold -> `composite_inner` ->
+    // `shadow_track` -> `desktop::track`), whose span hold is moved into `casts_nest` under `witness` (`video/desktop.rs`
+    // `track`, one line-neutral fold). The wrapper OWNS the real `PreemptHold` and drops it through its own Drop (Z91's epoch
+    // path, unchanged), reading this core's count inside (after the take) and after (the release, COMPGATE's hold still
+    // standing), written once into the one word, first writer wins (a pass on another core is an equally real in-pass take).
+    // Calling `track` from here is refused: a second CASTS differ beside the render core's pass, and the leg's own hold.
+    // Unarmed, a pass pays one relaxed load. Nominal from an unheld task: inside=2, after=1.
+
+    // ══ PREEMPTOFFARMCASTSNOWINPASSLEG (zenbook-ledger Z109) — `casts_now`'s IN-PASS take on the same wrapper (`casts_now_nest=`) ══
+    // `video/desktop.rs` `casts_now`'s span line moves its hold into `casts_now_nest` under `witness` (one line-neutral fold),
+    // the SAME `CastsNest` over a SECOND word `CASTS_NOW_NEST` (Z106's word is full; the wrapper carries the word it writes,
+    // so each leg's read stays exact). A pass reaches `casts_now` only through a desktop drain fill (`drain_deferred` ->
+    // `stage_fill` -> `shadow_casts_for`), a window chrome repaint (`paint_window` -> `chrome_paint`) or `a11yshadow::said`
+    // (on a looks-epoch move): all need a casting window, so the leg reads `skip(no-casts)` from an out-of-pass `casts_now`
+    // BEFORE it arms (Z103's legal outermost take), then arms and calls `desktop::shadows_stale` (TABLE only, no CASTS) so
+    // the next pass re-fills every cast extent and repaints every window. GUARDED by PREEMPTOFFARMCASTSNOWINPASSGUARD (Z114):
+    // `casts_now_nest` arms its wrap only when `video/wm.rs` `comp_gate_held_here` says THIS core holds COMPGATE, so an
+    // out-of-pass `casts_now` on another core inside the leg's window writes nothing (was a false `outermost`); `track`: none.
+
+    #[cfg(all(feature = "desktop_firmware", feature = "witness"))]
+    static CASTS_NEST: AtomicU32 = AtomicU32::new(0);
+    /// Z109: `casts_now`'s word, the same encoding as `CASTS_NEST`.
+    #[cfg(all(feature = "desktop_firmware", feature = "witness"))]
+    static CASTS_NOW_NEST: AtomicU32 = AtomicU32::new(0);
+    /// Z106: armed by the leg (its task only); a written word carries `NEST_SEEN | core<<16 | inside<<8 | after`.
+    #[cfg(all(feature = "desktop_firmware", feature = "witness"))]
+    const NEST_ARMED: u32 = 1 << 31;
+    #[cfg(all(feature = "desktop_firmware", feature = "witness"))]
+    const NEST_SEEN: u32 = 1 << 30;
+
+    /// Z106: a CASTS span hold, owned; the count read inside at the wrap and after the release in Drop, when armed.
+    /// Z109: `word` is the leg's word the wrap reads armed and the Drop writes (`CASTS_NEST` or `CASTS_NOW_NEST`).
+    #[cfg(all(feature = "desktop_firmware", feature = "witness"))]
+    pub struct CastsNest {
+        hold: core::mem::ManuallyDrop<super::PreemptHold>,
+        inside: u32,
+        armed: bool,
+        word: &'static AtomicU32,
+    }
+
+    /// Z106: wrap the hold `casts_span` returned (taken this instant by `track`); reads the count on the core it took when
+    /// the leg has armed the word.
+    #[cfg(all(feature = "desktop_firmware", feature = "witness"))]
+    #[inline]
+    pub fn casts_nest(hold: super::PreemptHold) -> CastsNest {
+        nest_wrap(hold, &CASTS_NEST, false)
+    }
+
+    /// Z109: the same wrap for `casts_now`'s hold, into `CASTS_NOW_NEST`.
+    #[cfg(all(feature = "desktop_firmware", feature = "witness"))]
+    #[inline]
+    pub fn casts_now_nest(hold: super::PreemptHold) -> CastsNest {
+        nest_wrap(hold, &CASTS_NOW_NEST, true)
+    }
+
+    /// Z106's wrap (moved here by Z109): reads `word` armed (Z114: and, when `guard`, this core holding COMPGATE), and the count inside.
+    #[cfg(all(feature = "desktop_firmware", feature = "witness"))]
+    #[inline]
+    fn nest_wrap(hold: super::PreemptHold, word: &'static AtomicU32, guard: bool) -> CastsNest {
+        let armed = word.load(Ordering::Relaxed) == NEST_ARMED && (!guard || crate::video::wm::comp_gate_held_here());
+        let c = hold.core;
+        let inside = if armed { crate::arch::without_interrupts(|| NOPREEMPT[c].load(Ordering::Relaxed)) } else { 0 };
+        CastsNest { hold: core::mem::ManuallyDrop::new(hold), inside, armed, word }
+    }
+
+    #[cfg(all(feature = "desktop_firmware", feature = "witness"))]
+    impl Drop for CastsNest {
+        fn drop(&mut self) {
+            let c = self.hold.core;
+            // SAFETY: the hold is dropped exactly once, here, and never touched again.
+            unsafe { core::mem::ManuallyDrop::drop(&mut self.hold) };
+            if self.armed {
+                let after = crate::arch::without_interrupts(|| NOPREEMPT[c].load(Ordering::Relaxed));
+                let v = NEST_SEEN | (((c as u32) & 0xff) << 16) | (self.inside.min(0xff) << 8) | after.min(0xff);
+                let _ = self.word.compare_exchange(NEST_ARMED, v, Ordering::AcqRel, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Z106 (`casts_nest=`): `ok`, `skip(masked)`, `skip(no-panel)`, `held-before`, `not-run`, `outermost`, `not-taken`,
+    /// `now-masked`, `leaked`.
+    #[cfg(all(feature = "desktop_firmware", feature = "witness"))]
+    pub fn casts_nest_leg() -> &'static str {
+        nest_leg(&CASTS_NEST, false)
+    }
+
+    /// Z109 (`casts_now_nest=`): Z106's words plus `skip(no-casts)` (no window casts, so no pass reaches `casts_now`).
+    #[cfg(all(feature = "desktop_firmware", feature = "witness"))]
+    pub fn casts_now_nest_leg() -> &'static str {
+        nest_leg(&CASTS_NOW_NEST, true)
+    }
+
+    /// Z106's leg (moved here by Z109): arm `word`, drive `wm::composite` at most 8 times, judge the word. `now` (Z109):
+    /// read `skip(no-casts)` before the arm, and after it prime the pass with `desktop::shadows_stale`.
+    #[cfg(all(feature = "desktop_firmware", feature = "witness"))]
+    fn nest_leg(word: &'static AtomicU32, now: bool) -> &'static str {
+        if crate::arch::irqs_masked() {
+            return "skip(masked)";
+        }
+        if witness().0 {
+            return "held-before";
+        }
+        if crate::video::panel_info_nonblocking().is_none() {
+            return "skip(no-panel)";
+        }
+        if now && crate::video::wm::desktop::casts_now().n == 0 {
+            return "skip(no-casts)";
+        }
+        word.store(NEST_ARMED, Ordering::Release);
+        if now {
+            crate::video::wm::desktop::shadows_stale();
+        }
+        for _ in 0..8 {
+            crate::video::wm::composite();
+            if word.load(Ordering::Acquire) != NEST_ARMED {
+                break;
+            }
+            super::yield_now();
+        }
+        let w = word.swap(0, Ordering::AcqRel);
+        let now_on = !crate::arch::irqs_masked();
+        let released = !witness().0;
+        let (inside, after) = ((w >> 8) & 0xff, w & 0xff);
+        if w & NEST_SEEN == 0 {
+            "not-run"
+        } else if after == 0 {
+            "outermost"
+        } else if inside != after + 1 {
+            "not-taken"
+        } else if !now_on {
+            "now-masked"
+        } else if !released {
+            "leaked"
+        } else {
+            "ok"
+        }
+    }
+
+    /// Z106: the probe rides `witness` (the media desk images leave it off).
+    #[cfg(all(feature = "desktop_firmware", not(feature = "witness")))]
+    pub fn casts_nest_leg() -> &'static str {
+        "skip(no-witness)"
+    }
+
+    /// Z109: `casts_now`'s probe rides `witness` too.
+    #[cfg(all(feature = "desktop_firmware", not(feature = "witness")))]
+    pub fn casts_now_nest_leg() -> &'static str {
+        "skip(no-witness)"
+    }
+
+    /// Z106: the tracker is not compiled off `desktop_firmware` (default `kernel8-test`, `test-arm`, the plain Orin image).
+    #[cfg(not(feature = "desktop_firmware"))]
+    pub fn casts_nest_leg() -> &'static str {
+        "skip(no-desk)"
+    }
+
+    /// Z109: likewise for `casts_now`'s leg.
+    #[cfg(not(feature = "desktop_firmware"))]
+    pub fn casts_now_nest_leg() -> &'static str {
+        "skip(no-desk)"
+    }
+
+    // ══ PREEMPTOFFARMWMTABLEROUTELEG (zenbook-ledger Z110) — the IRQ-context route's leg on the aarch64 audit (`route_leg=`) ══
+    // Z97's route (`video/fbcon.rs` `route_present_banded` returns after its OWE-FIRST block when `exceptions::in_irq` says
+    // this core is in IRQ context) is read by no lane: raspi4b delivers no live timer to a desktop build. The FIXTURE arms
+    // the mark: masked on this core (the vector's and Z101's rule: written only by its own core with IRQ masked, and no
+    // switch can run between the arm and the disarm), it reads `in_irq` false (PSTATE.I alone is not IRQ context), arms
+    // `irq_mark(true)`, reads `in_irq` true, drives the REAL route once with nothing owed (`fbcon::route_leg_probe`: held =
+    // Z97's `IRQ_HELD` moved, the leg's own count given back), disarms and reads `in_irq` false again. The token says
+    // `armed-…`: the mark was armed by this leg, never by the vector. Residual: `IRQ_HELD` is global, so an ISR print on
+    // ANOTHER core inside the window reads as held; the one lane that runs the leg (`kernel8-test --desk`) has no live timer.
+
+    /// Z110 (`route_leg=`): `armed-ok`, `skip(masked)`, `skip(no-fbcon)`, `pre-marked`, `mark-miss`, `stale`, `armed-miss`.
+    #[cfg(all(feature = "desktop_firmware", feature = "witness"))]
+    pub fn route_leg() -> &'static str {
+        if crate::arch::irqs_masked() {
+            return "skip(masked)";
+        }
+        let (pre, armed, routed, post) = crate::arch::without_interrupts(|| {
+            let pre = crate::arch::exceptions::in_irq();
+            super::super::exceptions::irq_mark(true);
+            let armed = crate::arch::exceptions::in_irq();
+            let routed = crate::video::fbcon::route_leg_probe();
+            super::super::exceptions::irq_mark(false);
+            (pre, armed, routed, crate::arch::exceptions::in_irq())
+        });
+        if pre {
+            "pre-marked"
+        } else if !armed {
+            "mark-miss"
+        } else if post {
+            "stale"
+        } else {
+            match routed {
+                None => "skip(no-fbcon)",
+                Some(false) => "armed-miss",
+                Some(true) => "armed-ok",
+            }
+        }
+    }
+
+    /// Z110: the leg rides `witness` (the media desk images leave it off).
+    #[cfg(all(feature = "desktop_firmware", not(feature = "witness")))]
+    pub fn route_leg() -> &'static str {
+        "skip(no-witness)"
+    }
+
+    /// Z110: no mark and no routed console off `desktop_firmware` (default `kernel8-test`, `test-arm`, the plain Orin image).
+    #[cfg(not(feature = "desktop_firmware"))]
+    pub fn route_leg() -> &'static str {
+        "skip(no-desk)"
+    }
+
+    // ══ PREEMPTOFFARMIRQMARKSTALELEG (zenbook-ledger Z113) — the switch-back clear's leg on the aarch64 audit (`irqmark_leg=`) ══
+    // Z101's clear (`dispatch_next`: `exceptions::irq_mark(false)` is the first statement after its `switch_context`, so the
+    // scheduler stack's first act after ANY switch-out on this core is the clear) is read by no leg: Z110's `route_leg` arms
+    // and disarms with no switch between. Here a holder PINNED to this core (`stale_kat`'s spawn shape: a task spawned on an
+    // explicit core never migrates, so the read is on the core that was armed and cleared) arms the mark masked (the vector's
+    // and Z101's rule), reads `in_irq` true, and switches out through the REAL `yield_now` with the mask still held
+    // (`yield_now` always switches to the scheduler stack, so the switch-back runs). No preempt-off count is held, so
+    // `sleep_check` returns at once (no Z95 / Z107 state moves). `yield_now` returns UNMASKED and `in_irq` is false whenever
+    // unmasked, so the read is under a fresh mask, which also clears the mark (never left set). Residual: a real IRQ on this
+    // core in that unmasked instant clears the mark through the vector too (a false `clear-ok`, never a false miss); the lane
+    // that runs the leg with no live timer (`kernel8-test --desk`) has no such IRQ.
+
+    /// Z113 KAT state: the holder's verdict code (0 = the holder never stored one).
+    #[cfg(feature = "desktop_firmware")]
+    static IRQMARK_KAT_CODE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+    /// Z113: the holder, pinned to core `c` (`arg`; the spawn's core): arm masked, switch through `yield_now`, read after the
+    /// return. Codes: 1 pre-marked, 2 mark-miss, 3 clear-miss, 4 clear-ok.
+    #[cfg(feature = "desktop_firmware")]
+    fn irqmark_stale_holder(_c: usize) {
+        let code = crate::arch::without_interrupts(|| {
+            if crate::arch::exceptions::in_irq() {
+                return 1;
+            }
+            super::super::exceptions::irq_mark(true);
+            if !crate::arch::exceptions::in_irq() {
+                super::super::exceptions::irq_mark(false);
+                return 2;
+            }
+            super::yield_now();
+            let stale = crate::arch::without_interrupts(|| {
+                let s = crate::arch::exceptions::in_irq();
+                super::super::exceptions::irq_mark(false);
+                s
+            });
+            if stale { 3 } else { 4 }
+        });
+        IRQMARK_KAT_CODE.store(code, Ordering::Release);
+    }
+
+    /// Z113 (`irqmark_leg=`): `clear-ok`, `skip(masked)`, `clear-miss`, `mark-miss`, `pre-marked`, `not-run`.
+    #[cfg(feature = "desktop_firmware")]
+    pub fn irqmark_stale_leg() -> &'static str {
+        if crate::arch::irqs_masked() {
+            return "skip(masked)";
+        }
+        let c = slot();
+        IRQMARK_KAT_CODE.store(0, Ordering::Release);
+        super::spawn_joinable("preemptoff-irqmark", irqmark_stale_holder, c, c).join();
+        match IRQMARK_KAT_CODE.load(Ordering::Acquire) {
+            4 => "clear-ok",
+            3 => "clear-miss",
+            2 => "mark-miss",
+            1 => "pre-marked",
+            _ => "not-run",
+        }
+    }
+
+    /// Z113: no mark off `desktop_firmware` (default `kernel8-test`, `test-arm`, the plain Orin image).
+    #[cfg(not(feature = "desktop_firmware"))]
+    pub fn irqmark_stale_leg() -> &'static str {
+        "skip(no-desk)"
+    }
+}
+
+// ══ PREEMPTOFFARMSLEEPCHECKYIELDSITE (zenbook-ledger Z107) — the sleep-in-span line names the YIELD CALL too ══
+// CHARTER: kernel-by-ruling (the scheduler's own preempt-off sleep check, aarch64). The five voluntary switch-out
+// entries (`yield_now`, `sleep_ticks`, `Semaphore::wait`, `futex_wait`, `Condvar::wait`) are
+// `#[track_caller]`; each folds `note()` after its own IRQ mask, before its switch, storing the caller's `Location` in
+// this core's ONE word `YIELD_AT`. The owning core writes it masked and reads it in `preemptoff::sleep_report` in the same
+// masked scheduler pass (no task runs between the switch-back's `sleep_check` and `sleep_report`), so no lock. The
+// sleep KAT stashes the yield it was named for (`kat_note`) and asserts it is `stale_kat_run`'s own yield line
+// (`kat_mark(line!())` on that line) in `kat_verdict` (`sleep_kat=ok` | `wrong-site`).
+// PREEMPTOFFSLEEPCHECKYIELDSITEWRAPPERSKAT (zenbook-ledger Z115): the same KAT then parks once more inside a fresh held span through a CONTENDED
+// `Mutex::lock` (`KAT_LOCK`, held by the stale KAT's follower until the holder asks), so `sleep_kat=ok` also asserts
+// Z111's track_caller chain `Mutex::lock` -> `Semaphore::wait` -> `note`: the lock hit (after `kat_mark_lock`) must
+// name `kat_lock_park`'s own lock line (else `wrong-lock-site`).
+mod yieldsite {
+    use core::panic::Location;
+    use core::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
+    use core::sync::atomic::AtomicBool;
+
+    /// Z107: this core's last wait-entry caller (null = none yet). Written and read only by its own core, IRQ masked.
+    static YIELD_AT: [AtomicPtr<Location<'static>>; super::NUM_CPUS] = [const { AtomicPtr::new(core::ptr::null_mut()) }; super::NUM_CPUS];
+    /// Z107 KAT: the yield site the sleep KAT's hit was named for, and the line `stale_kat_run` yields on.
+    static KAT_AT: AtomicPtr<Location<'static>> = AtomicPtr::new(core::ptr::null_mut());
+    static KAT_LINE: AtomicU32 = AtomicU32::new(0);
+    /// Z115 KAT: the lock site the sleep KAT's lock-phase hit was named for, and the line `kat_lock_park` locks on
+    /// (0 = the lock phase not armed: a hit is the yield phase's).
+    static KAT_LOCK_AT: AtomicPtr<Location<'static>> = AtomicPtr::new(core::ptr::null_mut());
+    static KAT_LOCK_LINE: AtomicU32 = AtomicU32::new(0);
+    /// Z115 KAT: the one contended lock (the follower holds it across the holder's park) and the holder's ask.
+    static KAT_LOCK: super::Mutex<()> = super::Mutex::new(());
+    static KAT_LOCK_ASKED: AtomicBool = AtomicBool::new(false);
+
+    /// Z107: called from a `#[track_caller]` wait entry after its IRQ mask; the track_caller chain makes
+    /// `Location::caller()` the ENTRY's caller.
+    #[track_caller]
+    #[inline(always)]
+    pub(super) fn note() {
+        let cpu = crate::arch::percpu::this_cpu().cpu_index as usize;
+        if cpu < super::NUM_CPUS {
+            YIELD_AT[cpu].store(Location::caller() as *const Location<'static> as *mut Location<'static>, Ordering::Relaxed);
+        }
+    }
+
+    /// Z107: this core's last wait-entry caller.
+    pub(super) fn at(cpu: usize) -> Option<&'static Location<'static>> {
+        let p = YIELD_AT.get(cpu)?.load(Ordering::Relaxed) as *const Location<'static>;
+        // SAFETY: only ever stored from a `&'static Location<'static>` (`note`).
+        unsafe { p.as_ref() }
+    }
+
+    /// Z107: the ` yield=<file>:<line>` token's value (`?` if this core never stashed one).
+    pub(super) struct Site(pub usize);
+
+    impl core::fmt::Display for Site {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            match at(self.0) {
+                Some(l) => write!(f, "{}:{}", l.file(), l.line()),
+                None => f.write_str("?"),
+            }
+        }
+    }
+
+    /// Z107 KAT: `stale_kat_run` records the line its in-span `yield_now` sits on (`line!()` on that same line).
+    pub(super) fn kat_mark(line: u32) {
+        KAT_LINE.store(line, Ordering::Relaxed);
+    }
+
+    /// Z107 KAT: `sleep_check`'s KAT branch stashes the yield site it was named for (masked, the holder's core).
+    /// Z115: once the lock line is armed the hit is the lock phase's (into `KAT_LOCK_AT`, returns false); before it, the
+    /// yield phase's (into `KAT_AT`, returns true: the caller keeps its via word for the yield phase only).
+    pub(super) fn kat_note(cpu: usize) -> bool {
+        let p = at(cpu).map_or(core::ptr::null_mut(), |l| l as *const Location<'static> as *mut Location<'static>);
+        if KAT_LOCK_LINE.load(Ordering::Relaxed) != 0 {
+            KAT_LOCK_AT.store(p, Ordering::Relaxed);
+            return false;
+        }
+        KAT_AT.store(p, Ordering::Relaxed);
+        true
+    }
+
+    /// Z115 KAT (`stale_kat`, before the holder and the follower spawn): reserve the lock's waiter list (`Mutex::init`,
+    /// idempotent; before any task can block on it) and clear the lock phase's words.
+    pub(super) fn kat_lock_arm() {
+        KAT_LOCK.init();
+        KAT_LOCK_ASKED.store(false, Ordering::Release);
+        KAT_LOCK_LINE.store(0, Ordering::Relaxed);
+        KAT_LOCK_AT.store(core::ptr::null_mut(), Ordering::Relaxed);
+    }
+
+    /// Z115 KAT: the stale KAT's follower (pinned to the holder's core). Takes the lock (uncontended) BEFORE `ran` (its
+    /// `STALE_KAT_AFTER_RAN` store), so the holder past its yield loop finds it held; yields until the holder asks
+    /// (bounded as the holder's loop, 1000 ms; on one core the ask is seen only once the holder is parked on the lock),
+    /// then gives it back (the `post` readies the holder).
+    pub(super) fn kat_lock_follow(ran: impl FnOnce()) {
+        let g = KAT_LOCK.lock();
+        ran();
+        let m0 = crate::arch::ms();
+        while !KAT_LOCK_ASKED.load(Ordering::Acquire) && crate::arch::ms().wrapping_sub(m0) < 1000 {
+            super::yield_now();
+        }
+        drop(g);
+    }
+
+    /// Z115 KAT: the holder's stale code was not ok, so no lock phase: release the follower (0: nothing to give back).
+    pub(super) fn kat_lock_skip() -> u32 {
+        KAT_LOCK_ASKED.store(true, Ordering::Release);
+        0
+    }
+
+    /// Z115 KAT: the holder's second in-span park. A FRESH hold (the follower's dispatch reset the first one), the ask,
+    /// then the contended `Mutex::lock` on the marked line: the switch-back's `sleep_check` names it (the lock phase) and
+    /// the follower, dispatched on this core, resets the hold and gives the lock back. Returns 1 when the hold came back
+    /// stale (that reset and this stale drop are the KAT's own; the caller gives both back), else 0.
+    pub(super) fn kat_lock_park() -> u32 {
+        let s0 = super::preemptoff::stale_drops();
+        let g3 = crate::arch::without_interrupts(|| super::preempt_hold());
+        KAT_LOCK_ASKED.store(true, Ordering::Release);
+        kat_mark_lock(line!()); let g = KAT_LOCK.lock(); // Z115: this line is the lock park the sleep KAT must name (`kat_verdict`)
+        drop(g);
+        drop(g3);
+        (super::preemptoff::stale_drops() == s0.wrapping_add(1)) as u32
+    }
+
+    /// Z115 KAT: `kat_lock_park` records the line its contended lock sits on (`line!()` on that same line); arms the
+    /// lock phase for `kat_note`.
+    fn kat_mark_lock(line: u32) {
+        KAT_LOCK_LINE.store(line, Ordering::Relaxed);
+    }
+
+    /// Z107 KAT verdict (`sleep_kat=`'s last arm): `ok` when the named yield is this file's `stale_kat_run` yield line,
+    /// else `wrong-site`; Z115: then the lock-phase hit must be `kat_lock_park`'s lock line (else `wrong-lock-site`).
+    /// Clears all four words.
+    pub(super) fn kat_verdict() -> &'static str {
+        let p = KAT_AT.swap(core::ptr::null_mut(), Ordering::Relaxed) as *const Location<'static>;
+        let want = KAT_LINE.swap(0, Ordering::Relaxed);
+        let lp = KAT_LOCK_AT.swap(core::ptr::null_mut(), Ordering::Relaxed) as *const Location<'static>;
+        let lwant = KAT_LOCK_LINE.swap(0, Ordering::Relaxed);
+        // SAFETY: only ever stored from a `&'static Location<'static>` (`kat_note` over `at`).
+        match unsafe { p.as_ref() } {
+            Some(l) if want != 0 && l.line() == want && l.file() == file!() => {}
+            _ => return "wrong-site",
+        }
+        // SAFETY: as above (`kat_note` over `at`).
+        match unsafe { lp.as_ref() } {
+            Some(l) if lwant != 0 && l.line() == lwant && l.file() == file!() => "ok",
+            _ => "wrong-lock-site",
+        }
+    }
 }

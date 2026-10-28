@@ -18,9 +18,15 @@
 //! | 148 | Unlock | `u8 flags (bit0 create), bytes16 password` | empty |
 //! | 149 | Lock | empty | empty |
 //! | 150 | Sign | `str8 key name (ns "ssh"), bytes16 data` | 64-byte Ed25519 signature |
+//! | 150 | Sign (long form, PDF-KEYSTORE SR382) | `str8 key, bytes16 data, str8 ns, u8 alg` ([`sign_alg`]) | `u8 kind` ([`key_kind`]), the signature |
 //! | 151 | Status | empty | `u8 state (0 no ring, 1 locked, 2 unlocked), u8 suite, str8 owner` |
 //!
 //! `str8` = `u8 len, bytes`; `bytes16` = `u16 len (LE), bytes`. A body with trailing bytes is EINVAL.
+//! Sign's long form ([`Request::SignWith`]) carries the namespace and the algorithm after the short form's fields: ns
+//! `ssh` with alg 0 is the short form's Ed25519 key; ns `sign` names a key file (kind `pkcs8`) and `data` is the DIGEST
+//! for RSA / P-256, the MESSAGE for Ed25519. The short form's bytes are unchanged. KEYSIGNONE (SR393): a refused long
+//! form names its reason — `status::WRONG_KIND`, `status::BAD_DIGEST_LEN`, `status::UNSUPPORTED_SCHEME` (`INVALID` the
+//! catch-all); `status::word` is the one word for each status.
 //! An error reply is its status and NO body (the BANDY v1 frozen error-reply rule).
 
 use alloc::string::String;
@@ -84,6 +90,38 @@ pub mod status {
     pub const CORRUPT: i32 = -74;
     /// ENOSYS: unknown verb.
     pub const NO_VERB: i32 = -38;
+    /// KEYSIGNONE (SR393) EPROTOTYPE: Sign's long form asked a scheme the key cannot make (a hash of an Ed25519 key,
+    /// PSS of a P-256 key, no hash of an RSA key).
+    pub const WRONG_KIND: i32 = -91;
+    /// KEYSIGNONE (SR393) EMSGSIZE: Sign's long form sent a digest that is not its hash's length.
+    pub const BAD_DIGEST_LEN: i32 = -90;
+    /// KEYSIGNONE (SR393) EOPNOTSUPP: Sign's long form `alg` byte names no scheme (an unknown bit or hash, PSS without
+    /// a hash).
+    pub const UNSUPPORTED_SCHEME: i32 = -95;
+
+    /// KEYSIGNONE (SR393): the ONE word for a status (user-holocron's `status_name`, the kernel keyring's `status_word`
+    /// and the holocron CLI's `status_name` read it: STATUS-WORDS-ONE SR399); `error` for a code this table does not name.
+    pub fn word(s: i32) -> &'static str {
+        match s {
+            OK => "ok",
+            BAD_PASSWORD => "bad-password",
+            NOT_FOUND => "not-found",
+            IO => "io",
+            RATE_LIMITED => "rate-limited",
+            DENIED => "denied",
+            EXISTS => "exists",
+            NO_RING => "no-ring",
+            INVALID => "invalid",
+            TOO_BIG => "too-big",
+            LOCKED => "locked",
+            CORRUPT => "corrupt",
+            NO_VERB => "no-verb",
+            WRONG_KIND => "wrong-kind",
+            BAD_DIGEST_LEN => "bad-digest-len",
+            UNSUPPORTED_SCHEME => "unsupported-scheme",
+            _ => "error",
+        }
+    }
 }
 
 /// A decoded request (fields as in the module table).
@@ -104,6 +142,9 @@ pub enum Request {
     Lock,
     /// Sign with the Ed25519 key `ssh/<key>`.
     Sign { key: String, data: Vec<u8> },
+    /// PDF-KEYSTORE (SR382): Sign's long form — the key `<ns>/<key>`, `alg` a [`sign_alg`] byte, `data` the digest
+    /// (RSA, P-256) or the message (Ed25519).
+    SignWith { ns: String, key: String, alg: u8, data: Vec<u8> },
     /// Status.
     Status,
 }
@@ -111,7 +152,7 @@ pub enum Request {
 impl Drop for Request {
     fn drop(&mut self) {
         match self {
-            Request::Put { data, .. } | Request::Sign { data, .. } => crate::zero::wipe(data),
+            Request::Put { data, .. } | Request::Sign { data, .. } | Request::SignWith { data, .. } => crate::zero::wipe(data),
             Request::Unlock { password, .. } => crate::zero::wipe(password),
             _ => {}
         }
@@ -185,7 +226,7 @@ impl Request {
             Request::Delete { .. } => VERB_SECRET_DELETE,
             Request::Unlock { .. } => VERB_UNLOCK,
             Request::Lock => VERB_LOCK,
-            Request::Sign { .. } => VERB_SIGN,
+            Request::Sign { .. } | Request::SignWith { .. } => VERB_SIGN,
             Request::Status => VERB_STATUS,
         }
     }
@@ -214,6 +255,12 @@ impl Request {
             Request::Sign { key, data } => {
                 put_str8(&mut v, key);
                 put_bytes16(&mut v, data);
+            }
+            Request::SignWith { ns, key, alg, data } => {
+                put_str8(&mut v, key);
+                put_bytes16(&mut v, data);
+                put_str8(&mut v, ns);
+                v.push(*alg);
             }
         }
         v
@@ -245,7 +292,15 @@ impl Request {
                 Request::Unlock { create: flags & 1 == 1, password: r.bytes16().ok_or(inv)? }
             }
             VERB_LOCK => Request::Lock,
-            VERB_SIGN => Request::Sign { key: r.str8().ok_or(inv)?, data: r.bytes16().ok_or(inv)? },
+            VERB_SIGN => {
+                let key = r.str8().ok_or(inv)?;
+                let data = r.bytes16().ok_or(inv)?;
+                if r.done() {
+                    Request::Sign { key, data }
+                } else {
+                    Request::SignWith { ns: r.str8().ok_or(inv)?, key, alg: r.u8().ok_or(inv)?, data }
+                }
+            }
             VERB_STATUS => Request::Status,
             _ => return Err(status::NO_VERB),
         };
@@ -285,6 +340,50 @@ impl Reply {
     /// An error reply: the status and no body.
     pub fn err(status: i32) -> Self {
         Reply { status, body: Vec::new() }
+    }
+}
+
+/// PDF-KEYSTORE (SR382): Sign's long-form `alg` byte. The low nibble is the hash of the digest the caller sends (0 = none:
+/// Ed25519, pure over the message); [`sign_alg::PSS`] asks RSASSA-PSS (MGF1 with the same hash, salt = the hash length)
+/// instead of PKCS#1 v1.5. Any other bit is EINVAL.
+pub mod sign_alg {
+    /// No hash: Ed25519 over the message.
+    pub const NONE: u8 = 0;
+    /// SHA-256 digest.
+    pub const SHA256: u8 = 1;
+    /// SHA-384 digest.
+    pub const SHA384: u8 = 2;
+    /// SHA-512 digest.
+    pub const SHA512: u8 = 3;
+    /// RSASSA-PSS (RSA keys only).
+    pub const PSS: u8 = 0x10;
+    /// The hash nibble.
+    pub const HASH_MASK: u8 = 0x0f;
+}
+
+/// PDF-KEYSTORE (SR382): the key kind a long-form Sign reply names first.
+pub mod key_kind {
+    /// RSA (PKCS#1 v1.5 or PSS signature, k bytes).
+    pub const RSA: u8 = 1;
+    /// ECDSA P-256 (DER Ecdsa-Sig-Value).
+    pub const P256: u8 = 2;
+    /// Ed25519 (64 bytes).
+    pub const ED25519: u8 = 3;
+}
+
+/// Encode a long-form Sign reply body: `u8 kind, signature`.
+pub fn encode_sign(kind: u8, sig: &[u8]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(1 + sig.len());
+    v.push(kind);
+    v.extend_from_slice(sig);
+    v
+}
+
+/// Decode a long-form Sign reply body: `(kind, signature)`; `None` when empty or the signature is.
+pub fn decode_sign(body: &[u8]) -> Option<(u8, &[u8])> {
+    match body {
+        [kind, sig @ ..] if !sig.is_empty() => Some((*kind, sig)),
+        _ => None,
     }
 }
 

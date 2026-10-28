@@ -510,3 +510,47 @@ pub mod sleep {
         "suspend"
     }
 }
+
+// ── ZENBOOKSUSPEND (zenbook-ledger Z48, docs/dev/blueprint/power.md §5 ZENBOOK-SUSPEND) — the suspend census and plan — FILE TAIL
+//
+// CHARTER: the power verbs' read-only suspend PLAN (`tests suspend`): what the firmware and the tree offer toward a state deeper
+// than `idle`, and the rung reachable today. It ENTERS NOTHING: the sleep state's one owner stays `video::lidsleep` (BP-power-6).
+// Measured at 1f955b273: the idle loop is `enable_and_hlt` (arch/x86_64/sched.rs:6568) and no `mwait` exists in the kernel; `_CST`,
+// `_LPI`, the uPEP `_DSM` and `_PTS`/`_WAK` are AML (BP-power-4: none runs); the Zenbook's external monitor hangs off the GOP
+// framebuffer, which has no DPMS; the EC lid row ships empty (Z27). So the rung is `none` (the floor stays `idle` in `hlt`) and
+// every deeper rung is owed by name with its blocker: S3-RESUME, ZENBOOK-SUSPEND-S0IX, ZENBOOK-PANEL-DPMS, ZENBOOK-EC-LIDROW,
+// ZENBOOK-IDLE-CSTATE. Facts: `acpi_power::suspend_census` (`_S3_`, FADT LOW_POWER_S0, the LPIT), `ec::lid()`, CPUID.01H:ECX[3].
+#[cfg(target_arch = "x86_64")]
+pub mod suspend {
+    /// `tests suspend` (registered, never at boot): the census, the plan line, the owed line and the verdict. Read only.
+    pub fn selftest() {
+        let Some(c) = crate::arch::acpi_power::suspend_census() else {
+            serial_println!(":: SUSPEND: -> SKIP reason=no-fadt ::");
+            return;
+        };
+        let board = crate::hw::platform().token();
+        let lid = crate::drivers::ec::lid().word();
+        let mwait = core::arch::x86_64::__cpuid(1).ecx & (1 << 3) != 0;
+        let s3 = if c.s3.is_some() { "pkg" } else { "absent" };
+        let typ = match c.s3 { Some((a, b)) => alloc::format!("{},{}", a, b), None => alloc::string::String::from("-") };
+        let lpit = match c.lpit { Some(n) => alloc::format!("{}", n), None => alloc::string::String::from("absent") };
+        serial_println!(
+            "[power] suspend plan board={} s3={} slp_typ={} s0ix={} lpit={} lid={} panel=none cpu=hlt mwait={} -> rung=none floor=idle-hlt",
+            board, s3, typ, c.s0ix as u8, lpit, lid, mwait as u8
+        );
+        // The owed rungs: S3 only when the firmware names `_S3_`, S0ix only when the FADT flags it, the lid row only while the
+        // lid reads `?`; the panel and the C-state rungs always.
+        let o_s3 = if c.s3.is_some() { "S3-RESUME(aml-pts-wak,bsp-resume)" } else { "-" };
+        let o_s0ix = if c.s0ix { "ZENBOOK-SUSPEND-S0IX(aml-dsm)" } else { "-" };
+        let o_lid = if lid == "?" { "ZENBOOK-EC-LIDROW(no-row)" } else { "-" };
+        let owed = [o_s3, o_s0ix, o_lid].iter().filter(|o| **o != "-").count() + 2;
+        serial_println!(
+            "[power] suspend owed s3={} s0ix={} panel=ZENBOOK-PANEL-DPMS(gop-no-dpms) lid={} cstate=ZENBOOK-IDLE-CSTATE(aml-cst)",
+            o_s3, o_s0ix, o_lid
+        );
+        serial_println!(
+            ":: SUSPEND: s3={} s0ix={} lpit={} lid={} panel=none rung=none owed={} -> PASS ::",
+            s3, c.s0ix as u8, lpit, lid, owed
+        );
+    }
+}

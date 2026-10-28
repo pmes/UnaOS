@@ -8,8 +8,8 @@
 //! see docs/dev/evidence/media-1004/AVCODEC.md for the per-vector PSNR table. A change that moves
 //! one of these hashes has changed decoded pixels and must be re-proven against the oracle.
 mod common;
-use av1_core::image::{decode_avif, decode_avif_planes, Filters};
-use common::{fetch, fnv64};
+use av1_core::image::{planes_to_rgba, planes_to_rgba_with, Conversion, Filters, Upsampling};
+use common::{avif_planes, fetch, fnv64};
 
 /// name, width, height, bit depth, FNV-1a 64 of Y‖U‖V.
 const PINNED: &[(&str, u32, u32, u32, u64)] = &[
@@ -53,7 +53,7 @@ fn intra_vectors_decode_to_pinned_planes() {
         "sdr_cosmos01000_cicp1-13-6_yuv444_full_qp40",
     ] {
         let Some(file) = fetch(name) else { continue };
-        let p = decode_avif_planes(&file, Filters::default()).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let p = avif_planes(&file, Filters::default()).unwrap_or_else(|e| panic!("{name}: {e}"));
         assert!(p.stats.tiles_exit_ok > 0 && p.stats.tiles_exit_bad == 0, "{name}: exit_symbol padding check failed on {} tile(s)", p.stats.tiles_exit_bad);
         let h = fnv64(&[&p.y, &p.u, &p.v]);
         if print {
@@ -64,7 +64,7 @@ fn intra_vectors_decode_to_pinned_planes() {
         assert_eq!((p.width, p.height, p.bit_depth), (pin.1, pin.2, pin.3), "{name}: geometry");
         assert_eq!(h, pin.4, "{name}: decoded planes changed (FNV-1a 64 0x{h:016x})");
         // The RGBA face is total: one pixel per luma sample.
-        let img = decode_avif(&file).unwrap();
+        let img = planes_to_rgba(&p, Upsampling::Bilinear);
         assert_eq!(img.rgba.len(), (img.w * img.h * 4) as usize);
         checked += 1;
     }
@@ -73,23 +73,73 @@ fn intra_vectors_decode_to_pinned_planes() {
 
 #[test]
 fn stream_decoder_matches_the_still_path() {
-    // The video seam (StreamDecoder): an AV1 key frame fed as one temporal unit, with the av1C
-    // record rebuilt from the container's parsed fields, decodes to the same planes as the AVIF path.
+    // The video seam (StreamDecoder): an AV1 key frame fed as one temporal unit, with the item's own av1C
+    // record (as demux_core's HEIF reader hands it), decodes to the same planes as the AVIF path.
     let Some(file) = fetch("kodim23_yuv420_8bpc") else { return };
-    let item = av1_core::avif_payload(&file).unwrap();
-    let c = item.av1c.clone().unwrap();
-    let mut av1c = vec![
-        0x81,
-        (c.seq_profile << 5) | c.seq_level_idx_0,
-        (c.seq_tier_0 << 7) | ((c.high_bitdepth as u8) << 6) | ((c.twelve_bit as u8) << 5) | ((c.monochrome as u8) << 4) | ((c.chroma_subsampling_x as u8) << 3) | ((c.chroma_subsampling_y as u8) << 2) | c.chroma_sample_position,
-        0,
-    ];
-    av1c.extend_from_slice(&c.config_obus);
-    let mut d = av1_core::image::StreamDecoder::new(&av1c).unwrap();
+    let item = common::avif_item(&file).unwrap();
+    let mut d = av1_core::image::StreamDecoder::new(item.av1c.as_deref().unwrap()).unwrap();
     let p = d.decode_temporal_unit(&item.data).unwrap();
     let pin = PINNED.iter().find(|x| x.0 == "kodim23_yuv420_8bpc").unwrap();
     assert_eq!(fnv64(&[&p.y, &p.u, &p.v]), pin.4);
     // A second unit through the same decoder (state carried) decodes identically.
     let p2 = d.decode_temporal_unit(&item.data).unwrap();
     assert_eq!(fnv64(&[&p2.y, &p2.u, &p2.v]), pin.4);
+}
+
+// AV1COLOURONE (LEDGER SR340): planes_to_rgba runs Stria's ONE integer kernel (yuv_core), the one gneiss_pal's
+// `Frame::to_rgba_colour` runs: the same planes give COLOURONE's (SR328) hand-computed answers.
+fn planes(w: u32, h: u32, n: u32, (ss_x, ss_y): (u32, u32), mono: bool, (y, u, v): (Vec<u16>, Vec<u16>, Vec<u16>), mc: u8, full: bool) -> av1_core::image::Planes {
+    av1_core::image::Planes {
+        width: w,
+        height: h,
+        bit_depth: n,
+        mono,
+        ss_x,
+        ss_y,
+        y,
+        u,
+        v,
+        color_primaries: 2,
+        transfer_characteristics: 2,
+        matrix_coefficients: mc,
+        full_range: full,
+        seq: Default::default(),
+        frame: Default::default(),
+        stats: Default::default(),
+    }
+}
+
+#[test]
+fn colourone_av1_planes_convert_as_gneiss_pal_does() {
+    // 8-bit BT.709 limited Y 120 Cb 140 Cr 100 -> (71, 133, 146); 10-bit BT.2020 limited Y 400 Cb 600 Cr 300 -> (9, 128, 145):
+    // gneiss_pal video.rs `colourone_hand_computed_samples`, the same planes through av1_core.
+    let p8 = planes(2, 2, 8, (1, 1), false, (vec![120; 4], vec![140], vec![100]), 1, false);
+    let p10 = planes(2, 2, 10, (1, 1), false, (vec![400; 4], vec![600], vec![300]), 9, false);
+    for up in [Upsampling::Nearest, Upsampling::Bilinear] {
+        assert_eq!(planes_to_rgba(&p8, up).rgba[..4], [71, 133, 146, 255], "{up:?}");
+        assert_eq!(planes_to_rgba(&p10, up).rgba[..4], [9, 128, 145, 255], "{up:?}");
+    }
+    // The stills convention is unchanged: 2 (unspecified) is BT.601 -> (76, 139, 145), 10 is BT.2020's Kr / Kb.
+    let p2 = planes(2, 2, 8, (1, 1), false, (vec![120; 4], vec![140], vec![100]), 2, false);
+    assert_eq!(planes_to_rgba(&p2, Upsampling::Nearest).rgba[..3], [76, 139, 145]);
+    let p10cl = planes(2, 2, 10, (1, 1), false, (vec![400; 4], vec![600], vec![300]), 10, false);
+    assert_eq!(planes_to_rgba(&p10cl, Upsampling::Nearest).rgba[..3], [9, 128, 145]);
+}
+
+#[test]
+fn colourone_av1_bilinear_mono_and_the_libyuv_oracle() {
+    // 4x2 8-bit 4:2:0 BT.709 limited, Y 120, Cb (100, 180), Cr 128: bilinear 9-3-3-1 gives Cb 100 / 120 / 160 / 180 per column.
+    let p = planes(4, 2, 8, (1, 1), false, (vec![120; 8], vec![100, 180], vec![128; 2]), 1, false);
+    let img = planes_to_rgba(&p, Upsampling::Bilinear);
+    let want = [[121, 127, 62], [121, 123, 104], [121, 114, 189], [121, 110, 231]];
+    for (col, w) in want.iter().enumerate() {
+        assert_eq!(img.rgba[col * 4..][..3], w[..], "col {col}");
+    }
+    // Monochrome 10-bit limited Y 502 is grey 127 (no chroma planes).
+    let m = planes(2, 2, 10, (1, 1), true, (vec![502; 4], vec![], vec![]), 1, false);
+    assert_eq!(planes_to_rgba(&m, Upsampling::Bilinear).rgba[..4], [127, 127, 127, 255]);
+    // ORACLE ONLY: libyuv's quantised chroma (BT.2020 Cb -> B capped at 128/64 in 8-bit units) through the same loop.
+    let o = planes(2, 2, 8, (1, 1), false, (vec![120; 4], vec![170], vec![128]), 9, false);
+    assert_eq!(planes_to_rgba_with(&o, Upsampling::Nearest, Conversion::Exact).rgba[..3], [121, 113, 211]);
+    assert_eq!(planes_to_rgba_with(&o, Upsampling::Nearest, Conversion::Libyuv).rgba[..3], [121, 113, 205]);
 }

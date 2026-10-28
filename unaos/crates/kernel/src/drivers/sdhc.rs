@@ -319,35 +319,9 @@ fn w32(base: u64, off: u64, val: u32) {
 // Bounded waits, in rdtsc units.
 // ===================================================================================
 
-/// `ms` milliseconds expressed in `arch::now_cycles()` (rdtsc) units. The TSC is calibrated against
-/// the ACPI PM timer by `apic::calibrate`, which runs long before `pci::init` (and therefore before
-/// this probe), so the calibrated leg is the one that executes on both QEMU and metal. The fallback
-/// derives from `arch::HW_WAIT_BUDGET`, which is defined as the ~2-second pre-calibration guess.
-#[inline]
-fn cycles_ms(ms: u64) -> u64 {
-    let hz = crate::arch::apic::tsc_hz();
-    if hz != 0 {
-        hz.saturating_mul(ms) / 1000
-    } else {
-        crate::arch::HW_WAIT_BUDGET.saturating_mul(ms) / 2000
-    }
-}
-
-/// Spin until `pred()` holds or `ms` milliseconds elapse. Returns true if the predicate held.
-/// `wrapping_sub` so a 64-bit TSC wrap mid-wait cannot trip the deadline early.
-fn wait_ms<F: Fn() -> bool>(ms: u64, pred: F) -> bool {
-    let start = crate::arch::now_cycles();
-    let budget = cycles_ms(ms);
-    loop {
-        if pred() {
-            return true;
-        }
-        if crate::arch::now_cycles().wrapping_sub(start) >= budget {
-            return false;
-        }
-        core::hint::spin_loop();
-    }
-}
+// Bounded waits in `arch::now_cycles()` (rdtsc) units: the ONE shared wait (BOUNDEDWAIT, rmbp-ledger B981, at the
+// tail of `drivers/block.rs`), calibrated against the ACPI PM timer long before this probe.
+use crate::drivers::block::wait::{bounded as wait_ms, cycles_ms};
 
 // ===================================================================================
 // Decoded controller identity
@@ -1533,7 +1507,7 @@ fn identify(base: u64, caps: &HostCaps, bdf: (u8, u8, u8)) -> Option<SdCard> {
 /// The addressing mode is taken from the card's CCS, which `identify` refused to guess at — an LBA
 /// handed to a byte-addressed card as if it were a block index reads the wrong 512 bytes without
 /// erroring, which is why that cross-check had to pass before this function could exist.
-pub fn read_block_512(lba: u64, buf: &mut [u8]) -> Result<usize, BlockError> { crate::arch::without_interrupts(|| read_block_512_held(lba, buf)) } fn read_block_512_held(lba: u64, buf: &mut [u8]) -> Result<usize, BlockError> { // TRASHLOCK (B523): CARD only under without_interrupts — a CARD holder is never preemptible, so a masked spin on CARD (the UnaFS mount's sector reads) is bounded by one SD command (sched.rs:32's rule for the mount). LINE-NEUTRAL fold
+pub fn read_block_512(lba: u64, buf: &mut [u8]) -> Result<usize, BlockError> { crate::arch::sched::preemptoff::scoped(|| preempt_span(|| read_block_512_held(lba, buf))) } fn read_block_512_held(lba: u64, buf: &mut [u8]) -> Result<usize, BlockError> { // PREEMPTOFFSDHC (Z61): preempt-off, IF as the caller had it (SDHC vector unarmed); was TRASHLOCK (B523): CARD only under without_interrupts — a CARD holder is never preemptible, so a masked spin on CARD (the UnaFS mount's sector reads) is bounded by one SD command (sched.rs:32's rule for the mount). LINE-NEUTRAL fold
     let guard = card_lock(); // STACKGUARD3 (B832): a data-path take checks CARD's poison (file tail)
     let card = guard.as_ref().ok_or(BlockError::NotReady)?;
     if lba >= card.num_blocks {
@@ -1700,7 +1674,7 @@ fn abort_data_transfer(base: u64) {
 ///
 /// Every failure path prints the RAW Interrupt Status word that convicted it and then closes the
 /// card's side with [`abort_data_transfer`], so a failure here cannot poison the next command.
-fn read_blocks_512_pio(lba: u64, count: u16, buf: &mut [u8]) -> Result<usize, BlockError> { crate::arch::without_interrupts(|| read_blocks_512_pio_held(lba, count, buf)) } fn read_blocks_512_pio_held(lba: u64, count: u16, buf: &mut [u8]) -> Result<usize, BlockError> { // TRASHLOCK (B523): CARD only under without_interrupts — a CARD holder is never preemptible, so a masked spin on CARD (the UnaFS mount's sector reads) is bounded by one SD command (sched.rs:32's rule for the mount). LINE-NEUTRAL fold
+fn read_blocks_512_pio(lba: u64, count: u16, buf: &mut [u8]) -> Result<usize, BlockError> { crate::arch::sched::preemptoff::scoped(|| preempt_span(|| read_blocks_512_pio_held(lba, count, buf))) } fn read_blocks_512_pio_held(lba: u64, count: u16, buf: &mut [u8]) -> Result<usize, BlockError> { // PREEMPTOFFSDHC (Z61): preempt-off, IF as the caller had it (SDHC vector unarmed); was TRASHLOCK (B523): CARD only under without_interrupts — a CARD holder is never preemptible, so a masked spin on CARD (the UnaFS mount's sector reads) is bounded by one SD command (sched.rs:32's rule for the mount). LINE-NEUTRAL fold
     let guard = card_lock(); // STACKGUARD3 (B832): a data-path take checks CARD's poison (file tail)
     let card = guard.as_ref().ok_or(BlockError::NotReady)?;
     read_blocks_pio_on(card, lba, count, buf)
@@ -2035,8 +2009,8 @@ fn adma2_init(card: &mut SdCard, caps: &HostCaps) {
         refuse(card, "bounce-buffer layout invalid");
         return;
     };
-    let table = unsafe { alloc::alloc::alloc_zeroed(table_layout) } as u64;
-    let bounce = unsafe { alloc::alloc::alloc_zeroed(bounce_layout) } as u64;
+    let table = crate::arch::memory::dma::ident(table_layout.size(), table_layout.align()); // DMAALLOCXHCI (B988): the one DMA allocator
+    let bounce = crate::arch::memory::dma::ident(bounce_layout.size(), bounce_layout.align());
     if table == 0 || bounce == 0 {
         refuse(card, "dma allocation failed");
         return;
@@ -2227,7 +2201,7 @@ fn read_blocks_adma_on(
 }
 
 /// [`read_blocks_adma_on`] against the published card.
-fn read_blocks_512_adma(lba: u64, count: u16, buf: &mut [u8]) -> Result<(usize, bool), BlockError> { crate::arch::without_interrupts(|| read_blocks_512_adma_held(lba, count, buf)) } fn read_blocks_512_adma_held(lba: u64, count: u16, buf: &mut [u8]) -> Result<(usize, bool), BlockError> { // TRASHLOCK (B523): CARD only under without_interrupts — a CARD holder is never preemptible, so a masked spin on CARD (the UnaFS mount's sector reads) is bounded by one SD command (sched.rs:32's rule for the mount). LINE-NEUTRAL fold
+fn read_blocks_512_adma(lba: u64, count: u16, buf: &mut [u8]) -> Result<(usize, bool), BlockError> { crate::arch::sched::preemptoff::scoped(|| preempt_span(|| read_blocks_512_adma_held(lba, count, buf))) } fn read_blocks_512_adma_held(lba: u64, count: u16, buf: &mut [u8]) -> Result<(usize, bool), BlockError> { // PREEMPTOFFSDHC (Z61): preempt-off, IF as the caller had it (SDHC vector unarmed); was TRASHLOCK (B523): CARD only under without_interrupts — a CARD holder is never preemptible, so a masked spin on CARD (the UnaFS mount's sector reads) is bounded by one SD command (sched.rs:32's rule for the mount). LINE-NEUTRAL fold
     let guard = card_lock(); // STACKGUARD3 (B832): a data-path take checks CARD's poison (file tail)
     let card = guard.as_ref().ok_or(BlockError::NotReady)?;
     if card.adma != Adma2State::Ready {
@@ -2634,7 +2608,7 @@ fn verify_adma_ab(num_blocks: u64) {
 /// rather than re-failing (and re-printing) on every subsequent read.
 ///
 /// Deliberately NOT published into `drivers::block::BLOCK_DEVICE` — see [`card_num_blocks`].
-pub fn read_blocks_512(lba: u64, count: usize, buf: &mut [u8]) -> Result<usize, BlockError> { crate::arch::without_interrupts(|| read_blocks_512_held(lba, count, buf)) } fn read_blocks_512_held(lba: u64, count: usize, buf: &mut [u8]) -> Result<usize, BlockError> { // TRASHLOCK (B523): CARD only under without_interrupts — a CARD holder is never preemptible, so a masked spin on CARD (the UnaFS mount's sector reads) is bounded by one SD command (sched.rs:32's rule for the mount). LINE-NEUTRAL fold
+pub fn read_blocks_512(lba: u64, count: usize, buf: &mut [u8]) -> Result<usize, BlockError> { crate::arch::sched::preemptoff::scoped(|| preempt_span(|| read_blocks_512_held(lba, count, buf))) } fn read_blocks_512_held(lba: u64, count: usize, buf: &mut [u8]) -> Result<usize, BlockError> { // PREEMPTOFFSDHC (Z61): preempt-off, IF as the caller had it (SDHC vector unarmed); was TRASHLOCK (B523): CARD only under without_interrupts — a CARD holder is never preemptible, so a masked spin on CARD (the UnaFS mount's sector reads) is bounded by one SD command (sched.rs:32's rule for the mount). LINE-NEUTRAL fold
     if count == 0 {
         return Ok(0);
     }
@@ -2769,7 +2743,7 @@ pub fn read_blocks_512(lba: u64, count: usize, buf: &mut [u8]) -> Result<usize, 
 ///   a card still programming answers CMD13 with a clean R1 whose state field says `prg`, and a
 ///   check that only masks for errors reads that as success.
 #[cfg(feature = "sdw")]
-pub fn write_block_512(lba: u64, buf: &[u8]) -> Result<(), BlockError> { crate::arch::without_interrupts(|| write_block_512_held(lba, buf)) } #[cfg(feature = "sdw")] fn write_block_512_held(lba: u64, buf: &[u8]) -> Result<(), BlockError> { // TRASHLOCK (B523): CARD only under without_interrupts — a CARD holder is never preemptible, so a masked spin on CARD (the UnaFS mount's sector reads) is bounded by one SD command (sched.rs:32's rule for the mount). LINE-NEUTRAL fold
+pub fn write_block_512(lba: u64, buf: &[u8]) -> Result<(), BlockError> { crate::arch::sched::preemptoff::scoped(|| preempt_span(|| write_block_512_held(lba, buf))) } #[cfg(feature = "sdw")] fn write_block_512_held(lba: u64, buf: &[u8]) -> Result<(), BlockError> { // PREEMPTOFFSDHC (Z61): preempt-off, IF as the caller had it (SDHC vector unarmed); was TRASHLOCK (B523): CARD only under without_interrupts — a CARD holder is never preemptible, so a masked spin on CARD (the UnaFS mount's sector reads) is bounded by one SD command (sched.rs:32's rule for the mount). LINE-NEUTRAL fold
     let guard = card_lock(); // STACKGUARD3 (B832): a data-path take checks CARD's poison (file tail)
     let card = guard.as_ref().ok_or(BlockError::NotReady)?;
     if lba >= card.num_blocks {
@@ -3619,7 +3593,7 @@ fn wait_prog_busy_ms(base: u64, budget_ms: u64) -> Option<u64> {
 /// `abort_data_transfer`'s own doc comment exists to prevent, and the one delta from the `emmc2`
 /// twin that [`write_block_512`] already carries.
 #[cfg(feature = "sdw")]
-pub fn write_blocks_512(lba: u64, count: u16, buf: &[u8]) -> Result<u64, BlockError> { crate::arch::without_interrupts(|| write_blocks_512_held(lba, count, buf)) } #[cfg(feature = "sdw")] fn write_blocks_512_held(lba: u64, count: u16, buf: &[u8]) -> Result<u64, BlockError> { // TRASHLOCK (B523): CARD only under without_interrupts — a CARD holder is never preemptible, so a masked spin on CARD (the UnaFS mount's sector reads) is bounded by one SD command (sched.rs:32's rule for the mount). LINE-NEUTRAL fold
+pub fn write_blocks_512(lba: u64, count: u16, buf: &[u8]) -> Result<u64, BlockError> { crate::arch::sched::preemptoff::scoped(|| preempt_span(|| write_blocks_512_held(lba, count, buf))) } #[cfg(feature = "sdw")] fn write_blocks_512_held(lba: u64, count: u16, buf: &[u8]) -> Result<u64, BlockError> { // PREEMPTOFFSDHC (Z61): preempt-off, IF as the caller had it (SDHC vector unarmed); was TRASHLOCK (B523): CARD only under without_interrupts — a CARD holder is never preemptible, so a masked spin on CARD (the UnaFS mount's sector reads) is bounded by one SD command (sched.rs:32's rule for the mount). LINE-NEUTRAL fold
     let guard = card_lock(); // STACKGUARD3 (B832): a data-path take checks CARD's poison (file tail)
     let card = guard.as_ref().ok_or(BlockError::NotReady)?;
 
@@ -4310,4 +4284,57 @@ pub fn card_leg() -> &'static str {
     });
     let w = &want.b[..want.n];
     if held.b[..held.n].split(|&c| c == b',').any(|t| t == w) { "registered" } else { "unregistered" }
+}
+
+// ===================================================================================
+// PREEMPTOFFSDHC (zenbook-ledger Z61) — FILE-TAIL append: the six CARD transfer spans are preempt-off, not masked.
+// The census (PREEMPTOFFAUDIT Z57) classed them holder-only: the SDHC vector is UNARMED by construction (Signal Enable
+// is written once, 0, by `arm_polled_status`; no vector, no MSI), so no ISR touches CARD, and nothing in this file
+// yields or sleeps, so the count cannot leak. Preempt-off (not merely IF-on) because every wait is TSC-bounded
+// (`block::wait::bounded`): a holder switched out mid-transfer would resume past its bound having polled nothing.
+// Each span is `preemptoff::scoped(|| preempt_span(|| X_held(..)))`, interrupts as the caller had them. Owed:
+// PREEMPTOFF-SDHCFIELDS (the nine one-field CARD reads), SDHC-IRQ (an armed vector so a transfer can sleep).
+// ===================================================================================
+
+/// The once-per-boot `[sdhc] transfer` line is said.
+static PREEMPT_IRQ_SAID: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// `tests preemptaudit`'s sdhc leg: the task whose span is recorded (`u64::MAX` = disarmed), what it saw.
+static AUDIT_TID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+/// 0 = no span recorded, 1 = interrupts on inside the span, 2 = masked.
+static AUDIT_IRQ: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+static AUDIT_HELD: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// PREEMPTOFFSDHC: the inside of every CARD transfer span (already under `preemptoff::scoped`): says the caller's IF
+/// and the count once a boot, records the armed audit task's reading, then runs the transfer.
+fn preempt_span<R>(f: impl FnOnce() -> R) -> R {
+    use core::sync::atomic::Ordering;
+    let on = !crate::arch::irqs_masked();
+    let (held, tid) = crate::arch::sched::preemptoff::witness();
+    if !PREEMPT_IRQ_SAID.swap(true, Ordering::Relaxed) {
+        serial_println!(
+            "[sdhc] transfer irq={} preempt={} (PREEMPTOFFSDHC Z61)",
+            if on { "on" } else { "off" },
+            if held { "held" } else { "free" }
+        );
+    }
+    if tid != u64::MAX && tid == AUDIT_TID.load(Ordering::Relaxed) {
+        AUDIT_IRQ.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+        AUDIT_HELD.store(held, Ordering::Relaxed);
+    }
+    f()
+}
+
+/// PREEMPTOFFSDHC: arm the audit record for task `tid` (cleared first).
+pub fn audit_arm(tid: u64) {
+    use core::sync::atomic::Ordering;
+    AUDIT_IRQ.store(0, Ordering::Relaxed);
+    AUDIT_HELD.store(false, Ordering::Relaxed);
+    AUDIT_TID.store(tid, Ordering::Relaxed);
+}
+
+/// PREEMPTOFFSDHC: the armed task's last span reading `(irq: 0 none | 1 on | 2 masked, preempt-off held)`; disarms.
+pub fn audit_take() -> (u8, bool) {
+    use core::sync::atomic::Ordering;
+    AUDIT_TID.store(u64::MAX, Ordering::Relaxed);
+    (AUDIT_IRQ.load(Ordering::Relaxed), AUDIT_HELD.load(Ordering::Relaxed))
 }

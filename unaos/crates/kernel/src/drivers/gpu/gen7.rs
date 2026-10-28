@@ -3411,7 +3411,7 @@ pub unsafe fn execute(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: u8
 
     // ---- Write the two GGTT PTEs (ring first, then target), read back under the hold ------
     wr(bar0, ring_off, ring_pte);
-    wr(bar0, tgt_off, tgt_pte);
+    wr(bar0, tgt_off, tgt_pte); assert_no_slot_held("r5-ptes"); // GEN7SLOTNOHOLDRUNGS (B1050): no slot guard live across this GPU op (gen7.rs tail). LINE-NEUTRAL append
     let ring_slot_held = rd(bar0, ring_off);
     let tgt_slot_held = rd(bar0, tgt_off);
     let prev_held = rd(bar0, prev_off_g);
@@ -3490,7 +3490,7 @@ pub unsafe fn execute(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: u8
         // `clflush`ed each iteration before the read so a stale cached copy cannot fake a miss
         // (MAJOR-1, read direction).
         if armed {
-            core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+            core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst); assert_no_slot_held("r5-kick"); // GEN7SLOTNOHOLDRUNGS (B1050): no slot guard live across this GPU op (gen7.rs tail). LINE-NEUTRAL append
             wr(bar0, g7regs::RCS_RING_TAIL, RING_TAIL_BYTES);
             const EXEC_POLL_MAX: u32 = 1_000_000;
             let t0 = crate::arch::now_cycles();
@@ -3647,7 +3647,7 @@ pub unsafe fn execute(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: u8
         wr(bar0, prev_off_g, base_img);
         wr(bar0, ring_off, base_img);
         wr(bar0, tgt_off, base_img);
-        wr(bar0, next_off_g, base_img);
+        wr(bar0, next_off_g, base_img); assert_no_slot_held("r5-unmap"); // GEN7SLOTNOHOLDRUNGS (B1050): no slot guard live across this GPU op (gen7.rs tail). LINE-NEUTRAL append
         ring_post = rd(bar0, ring_off);
         tgt_post_pte = rd(bar0, tgt_off);
         prev_post = rd(bar0, prev_off_g);
@@ -4150,7 +4150,7 @@ pub unsafe fn rearm(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: u8, 
 
     // ---- Claim the two GGTT slots (once, for the whole candidate loop) ----------------
     wr(bar0, ring_off, ring_pte);
-    wr(bar0, tgt_off, tgt_pte);
+    wr(bar0, tgt_off, tgt_pte); assert_no_slot_held("r6-ptes"); // GEN7SLOTNOHOLDRUNGS (B1050): no slot guard live across this GPU op (gen7.rs tail). LINE-NEUTRAL append
     let ring_slot_held = rd(bar0, ring_off);
     let tgt_slot_held = rd(bar0, tgt_off);
     let prev_held = rd(bar0, prev_off_g);
@@ -4243,7 +4243,7 @@ pub unsafe fn rearm(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: u8, 
             let mut iters = 0u32;
             let mut cyc = 0u64;
             if armed {
-                core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+                core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst); assert_no_slot_held("r6-kick"); // GEN7SLOTNOHOLDRUNGS (B1050): no slot guard live across this GPU op (gen7.rs tail). LINE-NEUTRAL append
                 wr(bar0, g7regs::RCS_RING_TAIL, RING_TAIL_BYTES);
                 let (_hit, it, cy) = poll_cycles(EXEC_BUDGET_CYC, || {
                     head_post = rd(bar0, g7regs::RCS_RING_HEAD) & RING_HEAD_OFF_MASK;
@@ -4414,19 +4414,19 @@ pub unsafe fn rearm(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: u8, 
     // middle arm is the honest one: a self-clearing flush register and a non-decoding offset
     // BOTH read back their entry value, and nothing readable on this part separates them. The
     // rung says so instead of scoring a silent write as a success.
-    let flsh_pre = rd(bar0, g7regs::HYP_GFX_FLSH_CNTL);
-    let flsh_post = witnessed_write(bar0, "r6", "GFX_FLSH_CNTL", g7regs::HYP_GFX_FLSH_CNTL, 1, "EXT-UNPINNED");
-    witnessed_write(bar0, "r6", "GFX_FLSH_RESTORE", g7regs::HYP_GFX_FLSH_CNTL, flsh_pre, "EXT-UNPINNED");
-    let flsh_rest = rd(bar0, g7regs::HYP_GFX_FLSH_CNTL);
-    let flsh_restored = flsh_rest == flsh_pre;
-    let tlb_verdict = if flsh_post != flsh_pre {
-        "tlb-flush-decodes"
-    } else if flsh_pre == 0xFFFF_FFFF {
-        "tlb-flush-allones"
-    } else {
-        "tlb-flush-write-silent"
-    };
-    let flush_positive = tlb_verdict == "tlb-flush-decodes";
+    // FLUSHVERDICTONE (rmbp-ledger B1045): the read-back and its three-way verdict are ONE fn, `flush_verdict` at the file
+    // tail, which R7 and R8 call too; it banks every reading for `held_release` (GEN7HELDRELEASE B1039).
+    let FlushVerdict {
+        pre: flsh_pre,
+        post: flsh_post,
+        rest: flsh_rest,
+        restored: flsh_restored,
+        verdict: tlb_verdict,
+        positive: flush_positive,
+    } = flush_verdict(
+        bar0,
+        "r6",
+    ); assert_no_slot_held("r6-unmap"); // GEN7SLOTNOHOLDRUNGS (B1050): no slot guard live across this GPU op (gen7.rs tail). LINE-NEUTRAL append
 
     // The independent structural leg. If no candidate's enable ever latched, the head never
     // moved and no sentinel ever landed, then no engine access was ever issued through either
@@ -5085,7 +5085,7 @@ pub unsafe fn blit(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: u8, w
     // ---- Claim the three GGTT slots (once, for the whole candidate loop) ---------------
     wr(bar0, ring_off, ring_pte);
     wr(bar0, src_off, src_pte);
-    wr(bar0, dst_off, dst_pte);
+    wr(bar0, dst_off, dst_pte); assert_no_slot_held("r7-ptes"); // GEN7SLOTNOHOLDRUNGS (B1050): no slot guard live across this GPU op (gen7.rs tail). LINE-NEUTRAL append
     let ring_slot_held = rd(bar0, ring_off);
     let src_slot_held = rd(bar0, src_off);
     let dst_slot_held = rd(bar0, dst_off);
@@ -5185,7 +5185,7 @@ pub unsafe fn blit(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: u8, w
             let mut iters = 0u32;
             let mut cyc = 0u64;
             if armed {
-                core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+                core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst); assert_no_slot_held("r7-kick"); // GEN7SLOTNOHOLDRUNGS (B1050): no slot guard live across this GPU op (gen7.rs tail). LINE-NEUTRAL append
                 wr(bar0, g7regs::BCS_RING_TAIL, RING_TAIL_BYTES);
                 let (_hit, it, cy) = poll_cycles(EXEC_BUDGET_CYC, || {
                     head_post = rd(bar0, g7regs::BCS_RING_HEAD) & RING_HEAD_OFF_MASK;
@@ -5473,20 +5473,20 @@ pub unsafe fn blit(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: u8, w
     }
 
     // ---- The GGTT TLB-invalidation rung, and the reclaim it gates ---------------------
-    // Copied verbatim from rearm()'s R6c, over three pages instead of two.
-    let flsh_pre = rd(bar0, g7regs::HYP_GFX_FLSH_CNTL);
-    let flsh_post = witnessed_write(bar0, "r7", "GFX_FLSH_CNTL", g7regs::HYP_GFX_FLSH_CNTL, 1, "EXT-UNPINNED");
-    witnessed_write(bar0, "r7", "GFX_FLSH_RESTORE", g7regs::HYP_GFX_FLSH_CNTL, flsh_pre, "EXT-UNPINNED");
-    let flsh_rest = rd(bar0, g7regs::HYP_GFX_FLSH_CNTL);
-    let flsh_restored = flsh_rest == flsh_pre;
-    let tlb_verdict = if flsh_post != flsh_pre {
-        "tlb-flush-decodes"
-    } else if flsh_pre == 0xFFFF_FFFF {
-        "tlb-flush-allones"
-    } else {
-        "tlb-flush-write-silent"
-    };
-    let flush_positive = tlb_verdict == "tlb-flush-decodes";
+    // R6c's verdict through its one fn (no copy, FLUSHVERDICTONE B1045), over three pages instead of two.
+    // FLUSHVERDICTONE (rmbp-ledger B1045): R6c's one read-back and verdict (`flush_verdict`, file tail); this reading is
+    // banked for `held_release` too (GEN7HELDRELEASE B1039).
+    let FlushVerdict {
+        pre: flsh_pre,
+        post: flsh_post,
+        rest: flsh_rest,
+        restored: flsh_restored,
+        verdict: tlb_verdict,
+        positive: flush_positive,
+    } = flush_verdict(
+        bar0,
+        "r7",
+    ); assert_no_slot_held("r7-unmap"); // GEN7SLOTNOHOLDRUNGS (B1050): no slot guard live across this GPU op (gen7.rs tail). LINE-NEUTRAL append
 
     // The independent structural leg. If no candidate's enable ever latched, the head never
     // moved, no sentinel ever landed and no pixel was ever copied, then no engine access was ever
@@ -6115,32 +6115,32 @@ mod r8 {
         let ring_layout = Layout::from_size_align(4096, 4096).unwrap();
         let src_layout = Layout::from_size_align(src_bytes, 4096).unwrap();
         let dst_layout = Layout::from_size_align(dst_bytes, 4096).unwrap();
-        let ring_page = alloc_zeroed(ring_layout);
+        let (ring_page, ring_re) = super::held_take(&super::R8_HELD[0], ring_layout.size().div_ceil(4096)); let ring_page = ring_page as *mut u8; super::r8_took(0); // GEN7R8EDGEUNARMED (B1090): the take's bit (gen7.rs tail). GEN7HOLDONCE (B1025): the ring page from its slot (r11's rule, gen7.rs tail)
         if ring_page.is_null() {
             serial_println!(":: gen7: r8 verdict=r8-alloc-failed which=ring bytes=4096 writes=0 note=nothing-written ::");
             serial_println!(":: gen7: r8 next=STOP-no-ring-page note=no-hold-no-ring-armed ::");
             serial_println!(":: gen7: r8 end ::");
             return;
         }
-        let src_page = alloc_zeroed(src_layout);
+        let (src_page, src_re) = super::held_take(&super::R8_HELD[1], src_layout.size().div_ceil(4096)); let src_page = src_page as *mut u8; super::r8_took(1); // GEN7R8EDGEUNARMED (B1090). GEN7HOLDONCE (B1025): the source surface from its slot
         if src_page.is_null() {
-            dealloc(ring_page, ring_layout);
-            serial_println!(":: gen7: r8 verdict=r8-alloc-failed which=source bytes={} writes=0 note=ring-page-freed-nothing-written ::", src_bytes);
+            let _ = (ring_page, ring_layout); // GEN7HOLDONCE (B1025): stays in R8_HELD, never freed (a reused block may carry an earlier run's translation)
+            serial_println!(":: gen7: r8 verdict=r8-alloc-failed which=source bytes={} writes=0 note=ring-page-held-nothing-written ::", src_bytes);
             serial_println!(":: gen7: r8 next=STOP-no-source-surface note=no-hold-no-ring-armed ::");
             serial_println!(":: gen7: r8 end ::");
             return;
         }
-        let dst_page = alloc_zeroed(dst_layout);
+        let (dst_page, dst_re) = super::held_take(&super::R8_HELD[2], dst_layout.size().div_ceil(4096)); let dst_page = dst_page as *mut u8; super::r8_took(2); // GEN7R8EDGEUNARMED (B1090). GEN7HOLDONCE (B1025): the destination surface from its slot
         if dst_page.is_null() {
-            dealloc(src_page, src_layout);
-            dealloc(ring_page, ring_layout);
-            serial_println!(":: gen7: r8 verdict=r8-alloc-failed which=dest bytes={} writes=0 note=ring+source-freed-nothing-written ::", dst_bytes);
+            let _ = (src_page, src_layout); // GEN7HOLDONCE (B1025): stays in R8_HELD, never freed (a reused block may carry an earlier run's translation)
+            let _ = (ring_page, ring_layout); // GEN7HOLDONCE (B1025): stays in R8_HELD, never freed (a reused block may carry an earlier run's translation)
+            serial_println!(":: gen7: r8 verdict=r8-alloc-failed which=dest bytes={} writes=0 note=ring+source-held-nothing-written ::", dst_bytes);
             serial_println!(":: gen7: r8 next=STOP-no-destination-surface note=no-hold-no-ring-armed ::");
             serial_println!(":: gen7: r8 end ::");
             return;
         }
-        // Nothing above this point has touched MMIO state, so the three frees on the failure paths are
-        // safe and the pages do NOT need the reclaim gate: no PTE maps them and no engine has run.
+        // Nothing above this point has touched MMIO state, but the failure paths no longer free (GEN7HOLDONCE, B1025): the
+        // three surfaces stay in R8_HELD, since a REUSED block may carry an earlier run's GGTT translation (GEN7TLB).
 
         // ---- Translate every page of the three surfaces and build its PTE -------------------
         //
@@ -6152,10 +6152,10 @@ mod r8 {
         // the only bound). Reserved fallibly and refused by name, before any page is translated.
         let mut ptes: Vec<u32> = Vec::new();
         if ptes.try_reserve_exact(win_slots).is_err() {
-            dealloc(dst_page, dst_layout);
-            dealloc(src_page, src_layout);
-            dealloc(ring_page, ring_layout);
-            serial_println!(":: gen7: r8 verdict=r8-alloc-failed which=ptes entries={} writes=0 note=all-three-surfaces-freed-nothing-written ::", win_slots);
+            let _ = (dst_page, dst_layout); // GEN7HOLDONCE (B1025): stays in R8_HELD, never freed (a reused block may carry an earlier run's translation)
+            let _ = (src_page, src_layout); // GEN7HOLDONCE (B1025): stays in R8_HELD, never freed (a reused block may carry an earlier run's translation)
+            let _ = (ring_page, ring_layout); // GEN7HOLDONCE (B1025): stays in R8_HELD, never freed (a reused block may carry an earlier run's translation)
+            serial_println!(":: gen7: r8 verdict=r8-alloc-failed which=ptes entries={} writes=0 note=all-three-surfaces-held-nothing-written ::", win_slots);
             serial_println!(":: gen7: r8 next=STOP-no-PTE-table note=no-hold-no-ring-armed ::");
             serial_println!(":: gen7: r8 end ::");
             return;
@@ -6190,11 +6190,11 @@ mod r8 {
             }
         }
         if let Some((v, k, val)) = bad {
-            dealloc(dst_page, dst_layout);
-            dealloc(src_page, src_layout);
-            dealloc(ring_page, ring_layout);
+            let _ = (dst_page, dst_layout); // GEN7HOLDONCE (B1025): stays in R8_HELD, never freed (a reused block may carry an earlier run's translation)
+            let _ = (src_page, src_layout); // GEN7HOLDONCE (B1025): stays in R8_HELD, never freed (a reused block may carry an earlier run's translation)
+            let _ = (ring_page, ring_layout); // GEN7HOLDONCE (B1025): stays in R8_HELD, never freed (a reused block may carry an earlier run's translation)
             serial_println!(
-                ":: gen7: r8 verdict={} win_index={} slot={} value={:016X} base_img={:08X} mode={} writes=0 note=no-GGTT-entry-was-written-all-three-surfaces-freed ::",
+                ":: gen7: r8 verdict={} win_index={} slot={} value={:016X} base_img={:08X} mode={} writes=0 note=no-GGTT-entry-was-written-all-three-surfaces-held ::",
                 v, k, R8_BASE_SLOT + k, val, base_img, mode
             );
             serial_println!(":: gen7: r8 next=STOP-a-scratch-page-could-not-be-given-a-witnessable-PTE-re-run-R4-before-any-further-ring-work note=no-hold-no-ring-armed ::");
@@ -6210,9 +6210,9 @@ mod r8 {
         // strips `r8-ring-addr-illegal` from the artifact — the invariant discharged at COMPILE time,
         // not absent. If `R8_BASE_SLOT` is ever made non-constant, the branch and its token return.
         if ring_gtt_addr & 0xE000_0000 != 0 {
-            dealloc(dst_page, dst_layout);
-            dealloc(src_page, src_layout);
-            dealloc(ring_page, ring_layout);
+            let _ = (dst_page, dst_layout); // GEN7HOLDONCE (B1025): stays in R8_HELD, never freed (a reused block may carry an earlier run's translation)
+            let _ = (src_page, src_layout); // GEN7HOLDONCE (B1025): stays in R8_HELD, never freed (a reused block may carry an earlier run's translation)
+            let _ = (ring_page, ring_layout); // GEN7HOLDONCE (B1025): stays in R8_HELD, never freed (a reused block may carry an earlier run's translation)
             serial_println!(
                 ":: gen7: r8 verdict=r8-ring-addr-illegal ring_gtt_addr={:08X} writes=0 note=RING_START-requires-bits-31:29-zero-IVB-V1P3-1.1.11.3-p77 ::",
                 ring_gtt_addr
@@ -6233,11 +6233,11 @@ mod r8 {
             }
         }
         if drifted {
-            dealloc(dst_page, dst_layout);
-            dealloc(src_page, src_layout);
-            dealloc(ring_page, ring_layout);
+            let _ = (dst_page, dst_layout); // GEN7HOLDONCE (B1025): stays in R8_HELD, never freed (a reused block may carry an earlier run's translation)
+            let _ = (src_page, src_layout); // GEN7HOLDONCE (B1025): stays in R8_HELD, never freed (a reused block may carry an earlier run's translation)
+            let _ = (ring_page, ring_layout); // GEN7HOLDONCE (B1025): stays in R8_HELD, never freed (a reused block may carry an earlier run's translation)
             serial_println!(
-                ":: gen7: r8 verdict=r8-entry-drifted mode={} base_img={:08X} writes=0 note=window-changed-between-census-and-claim-all-three-surfaces-freed-nothing-written ::",
+                ":: gen7: r8 verdict=r8-entry-drifted mode={} base_img={:08X} writes=0 note=window-changed-between-census-and-claim-all-three-surfaces-held-nothing-written ::",
                 mode, base_img
             );
             serial_println!(":: gen7: r8 next=STOP-entry-image-drifted-park-and-report note=no-hold-no-ring-armed ::");
@@ -6339,7 +6339,7 @@ mod r8 {
         for k in 0..win_slots {
             wr(bar0, GTT_BASE + (R8_BASE_SLOT + k) * 4, ptes[k]);
         }
-        let mut ptes_landed = true;
+        let mut ptes_landed = true; super::assert_no_slot_held("r8-ptes"); // GEN7SLOTNOHOLDRUNGS (B1050): no slot guard live across this GPU op (gen7.rs tail). LINE-NEUTRAL append
         for k in 0..win_slots {
             if rd(bar0, GTT_BASE + (R8_BASE_SLOT + k) * 4) != ptes[k] {
                 ptes_landed = false;
@@ -6456,7 +6456,7 @@ mod r8 {
                 let mut iters = 0u32;
                 let mut cyc = 0u64;
                 if armed {
-                    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+                    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst); super::assert_no_slot_held("r8-kick"); // GEN7SLOTNOHOLDRUNGS (B1050): no slot guard live across this GPU op (gen7.rs tail). LINE-NEUTRAL append
                     wr(bar0, g7regs::BCS_RING_TAIL, RING_TAIL_BYTES);
                     let (_hit, it, cy) = poll_cycles(EXEC_BUDGET_CYC, || {
                         head_post = rd(bar0, g7regs::BCS_RING_HEAD) & RING_HEAD_OFF_MASK;
@@ -6705,19 +6705,19 @@ mod r8 {
         }
 
         // ---- The GGTT TLB-invalidation rung, and the reclaim it gates (GEN7TLB) -------------
-        let flsh_pre = rd(bar0, g7regs::HYP_GFX_FLSH_CNTL);
-        let flsh_post = witnessed_write(bar0, "r8", "GFX_FLSH_CNTL", g7regs::HYP_GFX_FLSH_CNTL, 1, "EXT-UNPINNED");
-        witnessed_write(bar0, "r8", "GFX_FLSH_RESTORE", g7regs::HYP_GFX_FLSH_CNTL, flsh_pre, "EXT-UNPINNED");
-        let flsh_rest = rd(bar0, g7regs::HYP_GFX_FLSH_CNTL);
-        let flsh_restored = flsh_rest == flsh_pre;
-        let tlb_verdict = if flsh_post != flsh_pre {
-            "tlb-flush-decodes"
-        } else if flsh_pre == 0xFFFF_FFFF {
-            "tlb-flush-allones"
-        } else {
-            "tlb-flush-write-silent"
-        };
-        let flush_positive = tlb_verdict == "tlb-flush-decodes";
+        // FLUSHVERDICTONE (rmbp-ledger B1045): R6c's one read-back and verdict (`flush_verdict`, file tail); this
+        // reading is banked for `held_release` too (GEN7HELDRELEASE B1039).
+        let FlushVerdict {
+            pre: flsh_pre,
+            post: flsh_post,
+            rest: flsh_rest,
+            restored: flsh_restored,
+            verdict: tlb_verdict,
+            positive: flush_positive,
+        } = flush_verdict(
+            bar0,
+            "r8",
+        ); super::assert_no_slot_held("r8-unmap"); // GEN7SLOTNOHOLDRUNGS (B1050): no slot guard live across this GPU op (gen7.rs tail). LINE-NEUTRAL append
         let never_fetched = !any_ctl_enabled && !any_head_moved && !any_sentinel && !any_copy;
         let reversal_clean = r7_reversal_clean(engine_quiesced, ptes_restored, smear_post, all_regs_restored);
         let reclaim = r7_reclaim(reversal_clean, never_fetched, flush_positive);
@@ -6765,21 +6765,21 @@ mod r8 {
         );
 
         if reclaim {
-            dealloc(dst_page, dst_layout);
-            dealloc(src_page, src_layout);
-            dealloc(ring_page, ring_layout);
+            super::held_end(&super::R8_HELD[2], !dst_re); // GEN7HOLDONCE (B1025): only a block fresh THIS run goes back (never_fetched speaks for this run); a reused one is abandoned
+            super::held_end(&super::R8_HELD[1], !src_re);
+            super::held_end(&super::R8_HELD[0], !ring_re);
             serial_println!(
                 ":: gen7: r8 reclaim=freed pages={} bytes={} reason={} note=the-three-scratch-surfaces-are-back-on-the-heap ::",
                 pages, bytes, reclaim_reason
             );
         } else if reversal_clean {
-            let _ = (ring_page, src_page, dst_page);
+            let _ = (ring_page, src_page, dst_page); #[cfg(all(target_arch = "x86_64", feature = "wc"))] { use crate::allocator::census::{retag, GEN7_HELD}; retag(ring_page as usize, ring_layout.size(), GEN7_HELD); retag(src_page as usize, src_layout.size(), GEN7_HELD); retag(dst_page as usize, dst_layout.size(), GEN7_HELD); } // FIXTURERETAIN (B1017): R8's held surfaces are `gen7-held` (the leaked branch below stays fx:gen7). LINE-NEUTRAL append, code first
             serial_println!(
-                ":: gen7: r8 reclaim=held pages={} bytes={} reason={} note=GEN7TLB-DECIDED-RETENTION-engine-quiesced-every-write-restored-and-NO-GGTT-invalidation-witness-exists-on-this-part-bounded-and-documented-accepted-gen7.md-2.6 ::",
-                pages, bytes, reclaim_reason
+                ":: gen7: r8 reclaim=held pages={} bytes={} reason={} reuse={} held_kb={} note=GEN7TLB-DECIDED-RETENTION-engine-quiesced-every-write-restored-and-NO-GGTT-invalidation-witness-exists-on-this-part-bounded-and-documented-accepted-gen7.md-2.6 ::",
+                pages, bytes, reclaim_reason, if ring_re && src_re && dst_re { "y" } else { "n" }, super::held_kb()
             );
         } else {
-            let _ = (ring_page, src_page, dst_page);
+            let _ = (ring_page, src_page, dst_page); for s in super::R8_HELD.iter() { super::held_end(s, false); } // GEN7HOLDONCE (B1025): a leaked window is never reused: the slots forget it, the pages stay out of the allocator
             serial_println!(
                 ":: gen7: r8 reclaim=leaked pages={} bytes={} reason={} note=SAFETY-REFUSAL-the-engine-was-not-provably-quiesced-or-the-reversal-did-not-verify-a-page-a-GT-may-hold-a-translation-to-never-goes-back-to-the-allocator ::",
                 pages, bytes, reclaim_reason
@@ -6968,7 +6968,7 @@ mod r8 {
     static STASH: crate::sync::Mutex<Option<Ctx>> = crate::sync::Mutex::new(None);
     /// The first armed run's witness. R8's pages are `reclaim=held` (GEN7TLB HOLD, gen7.md §2.6), so a
     /// second armed run would hold another ~1 MiB for an answer this boot already has: it replays.
-    static DONE: crate::sync::Mutex<Option<Witness>> = crate::sync::Mutex::new(None);
+    pub(super) static DONE: crate::sync::Mutex<Option<Witness>> = crate::sync::Mutex::new(None);
 
     fn r8_cycles_to_us(dt: u64) -> u64 {
         let hz = crate::arch::apic::tsc_hz();
@@ -7064,7 +7064,7 @@ mod r8 {
                 );
                 // SAFETY: `bar0` is the IGD BAR0 mapping `igpu::init` published and R1-R7 used on this
                 // boot; it is never unmapped. `fb_blit`'s own contract (the `blit` contract) applies.
-                unsafe { fb_blit(c.bar0, c.bar0_size, c.bus, c.slot, c.func, c.wake, c.r7, c.geo, &mut w) };
+                if let Some(_door) = super::r8_engine_clear() { super::r8door_open_kat(); unsafe { fb_blit(c.bar0, c.bar0_size, c.bus, c.slot, c.func, c.wake, c.r7, c.geo, &mut w) }; } // GEN7R8DOORKAT (B1084): a job raced against the held door (gen7.rs tail). GEN7R8DOOR (B1082): the engine door held across fb_blit (`_door` drops at this block's end). GEN7PARKR8 (B1078): a parked or live gen7blit ring refuses the rung (`r8_engine_clear`, gen7.rs tail). LINE-NEUTRAL append
             }
         }
         let r = print_witness(&w, false);
@@ -7186,7 +7186,7 @@ mod r8 {
             core::ptr::write_volatile(ring_u32.add(16 + k), *v);
         }
         clflush_range(ring_page as usize, 4096);
-        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst); super::assert_no_slot_held("r8b-kick"); // GEN7SLOTNOHOLDRUNGS (B1050): no slot guard live across this GPU op (gen7.rs tail). LINE-NEUTRAL append
 
         let mut head = 0u32;
         let mut sent = R8_DST_SENTINEL_SEED;
@@ -7310,7 +7310,7 @@ pub fn ladder_test() {
     ladder::run();
     #[cfg(feature = "gen7blit")]
     blit::test(); // GEN7B (B422): the BCS job, the display capture, KCOMP's second-blitter decision
-}
+    hold_leg(); #[cfg(feature = "gen7blit")] { blit::park_unwind(); } order_leg(); } // GEN7PARKUNWIND (B1073): the parked window's late re-check (gen7_blit.rs tail). GEN7HOLDONCE (B1025): the second run, asserting no new held page (`:: GEN7HOLD: ::`, body at the file tail). LINE-NEUTRAL append
 
 mod ladder {
     use super::GtWake;
@@ -7496,3 +7496,718 @@ fn wake_decline() -> Option<(u32, u32, u32, &'static str)> {
 #[cfg(feature = "gen7r9")]
 #[path = "gen7_r9.rs"]
 mod r9;
+
+// =================================================================================
+// GEN7HOLDONCE (rmbp-ledger B1025) — FILE-TAIL append: nothing above it moves. THE one GEN7TLB hold rule (gen7.md
+// §2.6: 0x101008 has no read decode, so a page the GT may hold a GGTT translation to never goes back to the allocator),
+// r11's HELD rule hoisted verbatim: a slot is `(base VA, pages)`; a take that fits the held block REUSES it, a bigger
+// take allocates zeroed pages and the smaller block stays held, never freed. r11 (`quad::exec11`), R8's three surfaces
+// (`r8::fb_blit`) and gen7blit's sp/dp take through it. Each slot's own Mutex owns it, taken only inside these fns and
+// never held across a GPU op. The DONE replays (ladder, R8, gen7blit) are untouched: they cache results, slots cache
+// pages. Measured at the cut: a healthy armed boot grew nothing per run already (the replays); the per-run growers
+// were R8's unarmed path (DONE unset, fb_blit re-run, a new ~1 MiB window), gen7blit's heap-short return and r11's
+// bigger-size abandon. `tests gen7` now runs twice and says `:: GEN7HOLD: runs=2 held_kb=<n> growth_kb=0 -> PASS ::`.
+// =================================================================================
+
+/// R8's slots: the ring page, the source surface, the destination surface.
+#[cfg(feature = "gen7r8")]
+static R8_HELD: [crate::sync::Mutex<(usize, usize)>; 3] =
+    [crate::sync::Mutex::new((0, 0)), crate::sync::Mutex::new((0, 0)), crate::sync::Mutex::new((0, 0))];
+/// gen7blit's slots: the job's source `sp` and destination `dp`.
+#[cfg(feature = "gen7blit")]
+static BLIT_HELD: [crate::sync::Mutex<(usize, usize)>; 2] = [crate::sync::Mutex::new((0, 0)), crate::sync::Mutex::new((0, 0))];
+/// Bytes `held_take` has allocated, minus what `held_end` freed (an abandoned block stays counted: it is still held).
+static HELD_BYTES: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// r11's rule: `(base VA, reused)`. A reused block is NOT re-zeroed (every caller seeds what it reads). Base 0 when the
+/// layout or the allocation fails (the caller refuses by name).
+#[allow(dead_code)]
+pub(crate) fn held_take(slot: &crate::sync::Mutex<(usize, usize)>, n: usize) -> (usize, bool) {
+    let mut held = slot.lock();
+    if held.1 < n {
+        let Ok(l) = Layout::from_size_align(n * 4096, 4096) else { return (0, false) };
+        // SAFETY: a non-zero-sized, page-aligned layout (n >= 1 here: held.1 < n).
+        let p = unsafe { alloc_zeroed(l) };
+        if p.is_null() {
+            return (0, false);
+        }
+        *held = (p as usize, n); // a smaller earlier block stays held (GEN7TLB), never freed
+        HELD_BYTES.fetch_add(n * 4096, core::sync::atomic::Ordering::Relaxed);
+        return (p as usize, false);
+    }
+    (held.0, true)
+}
+
+/// End a slot: it forgets its block. `free` (only for a block allocated by THIS run, after R8's reclaim legs fired)
+/// returns it to the heap with the slot's own layout; otherwise the block is abandoned — out of the allocator for the
+/// boot and never reused (R8's `reclaim=leaked`).
+#[allow(dead_code)]
+fn held_end(slot: &crate::sync::Mutex<(usize, usize)>, free: bool) {
+    let mut held = slot.lock();
+    let (p, n) = *held;
+    *held = (0, 0);
+    if free && p != 0 && n != 0 {
+        if let Ok(l) = Layout::from_size_align(n * 4096, 4096) {
+            // SAFETY: `p` came from `held_take`'s `alloc_zeroed` with exactly this layout.
+            unsafe { dealloc(p as *mut u8, l) };
+            HELD_BYTES.fetch_sub(n * 4096, core::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+/// KiB `held_take` holds now.
+pub(crate) fn held_kb() -> usize {
+    HELD_BYTES.load(core::sync::atomic::Ordering::Relaxed) / 1024
+}
+
+/// `tests gen7`'s second run — the ladder and the BCS job again, as an operator's re-typed `tests gen7` would: every
+/// hold through `held_take` reuses, so the held total does not grow. Nothing held before it (QEMU: no IGD bank) is a
+/// SKIP: a zero-compare is never a verdict.
+fn hold_leg() {
+    let k0 = held_kb();
+    ladder::run();
+    #[cfg(feature = "gen7blit")]
+    blit::test();
+    let k1 = held_kb();
+    let growth = k1 as i64 - k0 as i64;
+    if k0 == 0 {
+        serial_println!(":: GEN7HOLD: runs=2 held_kb={} growth_kb={} -> SKIP reason=nothing-held ::", k1, growth);
+    } else {
+        serial_println!(":: GEN7HOLD: runs=2 held_kb={} growth_kb={} -> {} ::", k1, growth, if growth == 0 { "PASS" } else { "FAIL" });
+    }
+}
+
+// =================================================================================
+// GEN7HELDONE (rmbp-ledger B1031) — FILE-TAIL append beside GEN7HOLDONCE's block: nothing above it moves. The three
+// holds that kept their own "allocate once, cache the VA, never free" copy of the GEN7TLB rule now take through
+// `held_take` with a slot each (their per-site VA caches retired). Each site already re-seeds every page it reads and
+// re-derives its PTEs every run, so a reused block needs no new re-init. `held_kb()` now covers all six sites.
+// =================================================================================
+
+/// r9's slot: the ring page + the pinned page (2 pages, `r9::exec`).
+#[cfg(feature = "gen7r9")]
+static R9_HELD: crate::sync::Mutex<(usize, usize)> = crate::sync::Mutex::new((0, 0));
+/// r10's slot: ring, state, kernel and render-target pages (R10_WIN = 4, `r9::draw::exec`).
+#[cfg(feature = "gen7r9")]
+static R10_HELD: crate::sync::Mutex<(usize, usize)> = crate::sync::Mutex::new((0, 0));
+/// gen7blit's ring slot: the ring + sentinel pages (2 pages, `blit::bcs_job`; `blit::PAGES` stays the engine's lock).
+#[cfg(feature = "gen7blit")]
+static BLIT_RING_HELD: crate::sync::Mutex<(usize, usize)> = crate::sync::Mutex::new((0, 0));
+
+// =================================================================================
+// GEN7HELDRELEASE (rmbp-ledger B1039) — FILE-TAIL append beside GEN7HELDONE's block: nothing above it moves. The ONE
+// release path for the ring slots (r9, r10, r11, gen7blit): each engine calls `held_release` at its run's unwind tail,
+// after its own ring-disabled confirm (§1.1.11.2 p.76), its PTE read-back and its post-restore `0x101008` write. The
+// rule is R7's `r7_reclaim` (never_fetched = false: a held block may carry an earlier run's fetch); the witness is R6c's
+// read-back of `0x101008` banked this boot (`flush_bank`), never "the engine is idle" (GEN7TLB, gen7.rs R6c). On a part
+// whose R6c reads `tlb-flush-write-silent` (the RMBP) every engine is refused by name once per boot and its slot stays
+// intact, so reuse is unchanged. GEN7-HELD-PARK: GEN7HELDPARK (B1067) below; GEN7-TLB-WITNESS owed (FLUSH-VERDICT-ONE: built by B1045 below).
+// =================================================================================
+
+/// The boot's `0x101008` read-backs (R6c, R7, R8 via `flush_verdict`): 0 unmeasured, 1 decodes, 2 write-silent, 3 all-ones.
+#[cfg(any(feature = "gen7r9", feature = "gen7blit"))]
+static FLUSH_SEEN: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+/// Bytes `held_release` returned to the heap this boot.
+#[cfg(any(feature = "gen7r9", feature = "gen7blit"))]
+static RELEASED_BYTES: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+/// One bit per engine: its `held_kept=` line was said this boot.
+#[cfg(any(feature = "gen7r9", feature = "gen7blit"))]
+static KEPT_SAID: core::sync::atomic::AtomicU16 = core::sync::atomic::AtomicU16::new(0); // GEN7PARKNODEMOTE (B1077): u16, the third class (`ring-ctl-stuck`, `kept_bit`) had no free bit
+
+/// `flush_verdict` banks each three-way reading (R6c, R7, R8); 0 and 1 take the new reading, 2 and 3 stay for the boot (a contradiction never decodes).
+#[cfg(any(feature = "gen7r9", feature = "gen7blit"))]
+fn flush_bank(verdict: &str) {
+    let v = match verdict {
+        "tlb-flush-decodes" => 1,
+        "tlb-flush-allones" => 3,
+        _ => 2,
+    };
+    let _ = FLUSH_SEEN.fetch_update(core::sync::atomic::Ordering::Relaxed, core::sync::atomic::Ordering::Relaxed, |cur| Some(if cur <= 1 { v } else { cur }));
+}
+
+/// Release `slot`'s held block after a WITNESSED GGTT TLB flush, else keep it (refused by name, once per engine per
+/// boot; the slot stays intact). `disabled` is the engine's ring-disabled confirm, `ptes_restored` its PTE read-back
+/// after the unwind. Called with the engine serialized (the `tests gen7` path; gen7blit under `PAGES`), never across a
+/// GPU op.
+#[cfg(any(feature = "gen7r9", feature = "gen7blit"))]
+pub(crate) fn held_release_kept(slot: &crate::sync::Mutex<(usize, usize)>, engine: &'static str, disabled: bool, ptes_restored: bool, not_disabled: &'static str) { // GEN7PARKNODEMOTE (B1077): held_release's body, lifted in place; `not_disabled` is the not-quiesced keep's word (`held_release`, file tail)
+    let n = slot.lock().1;
+    if n == 0 {
+        return;
+    }
+    let seen = FLUSH_SEEN.load(core::sync::atomic::Ordering::Relaxed);
+    if r7_reclaim(disabled && ptes_restored, false, seen == 1) {
+        held_end(slot, true);
+        RELEASED_BYTES.fetch_add(n * 4096, core::sync::atomic::Ordering::Relaxed);
+        serial_println!("[gen7] held release engine={} kb={} witness=r6-flush-decodes held_kb={}", engine, n * 4, held_kb());
+        return;
+    }
+    let why = if !disabled {
+        not_disabled
+    } else if !ptes_restored {
+        "ptes-not-restored"
+    } else {
+        match seen {
+            0 => "flush-unmeasured",
+            3 => "flush-allones",
+            _ => "flush-write-silent",
+        }
+    };
+    let bit = kept_bit(engine, why); // GEN7HELDPARK (B1067): the not-quiesced keep (the park's) has its own once-bit (gen7.rs tail)
+    if KEPT_SAID.fetch_or(bit, core::sync::atomic::Ordering::Relaxed) & bit == 0 {
+        serial_println!("[gen7] held release engine={} kb={} -> KEPT held_kept={}:{}", engine, n * 4, engine, why);
+    }
+}
+
+/// KiB `held_release` returned to the heap this boot (FIXTURERETAIN's `gen7_released_kb=`).
+#[cfg(any(feature = "gen7r9", feature = "gen7blit"))]
+#[allow(dead_code)]
+pub(crate) fn held_released_kb() -> usize {
+    RELEASED_BYTES.load(core::sync::atomic::Ordering::Relaxed) / 1024
+}
+
+// =================================================================================
+// FLUSHVERDICTONE (rmbp-ledger B1045) — FILE-TAIL append: nothing above it moves. The GGTT TLB-flush read-back of
+// `0x101008` and its three-way verdict lived three times (R6c, R7, R8; B1039 owed FLUSH-VERDICT-ONE); it is now ONE fn,
+// R6c's body verbatim, which R6c, R7 and R8 call with their rung tag (the only drift between the copies: the tag
+// `witnessed_write` prints). Every reading banks for `held_release` (`flush_bank`, sticky on write-silent / all-ones), so
+// the witness gets two more chances per boot and a contradiction never reads as decodes. Same reads in the same order
+// (pre, write 1, restore pre, re-read), same words; each rung keeps its own `tlb verdict=` line.
+// =================================================================================
+
+/// One reading of `0x101008`: captured, written 1, restored, re-read, and judged.
+struct FlushVerdict {
+    pre: u32,
+    post: u32,
+    rest: u32,
+    restored: bool,
+    verdict: &'static str,
+    positive: bool,
+}
+
+/// The ONE `0x101008` read-back and three-way verdict (decodes / allones / write-silent). `tag` is the rung ("r6", "r7",
+/// "r8") its `witnessed_write` step lines carry. Same contract as the rungs: `bar0` is a live MMIO mapping of the IGD's
+/// BAR0 covering `HYP_GFX_FLSH_CNTL`, on a `write_ok()` wake.
+unsafe fn flush_verdict(bar0: usize, tag: &str) -> FlushVerdict {
+    let pre = rd(bar0, g7regs::HYP_GFX_FLSH_CNTL);
+    let post = witnessed_write(bar0, tag, "GFX_FLSH_CNTL", g7regs::HYP_GFX_FLSH_CNTL, 1, "EXT-UNPINNED");
+    witnessed_write(bar0, tag, "GFX_FLSH_RESTORE", g7regs::HYP_GFX_FLSH_CNTL, pre, "EXT-UNPINNED");
+    let rest = rd(bar0, g7regs::HYP_GFX_FLSH_CNTL);
+    let verdict = if post != pre {
+        "tlb-flush-decodes"
+    } else if pre == 0xFFFF_FFFF {
+        "tlb-flush-allones"
+    } else {
+        "tlb-flush-write-silent"
+    };
+    #[cfg(any(feature = "gen7r9", feature = "gen7blit"))]
+    {
+        flush_bank(verdict);
+    }
+    FlushVerdict { pre, post, rest, restored: rest == pre, verdict, positive: verdict == "tlb-flush-decodes" }
+}
+
+// =================================================================================
+// GEN7LOCKHELD (rmbp-ledger B1044) — FILE-TAIL append: nothing above it moves. BP-gpu-9's order (gen7blit's `PAGES`
+// before a slot, never the reverse) held by the lock registry's own walk: every lock here is a `crate::sync::Mutex`, a
+// blocking `lock()` records an order edge from each hold this task has on this core (a `try_lock` records none: it
+// cannot wait, B578), and an edge whose reverse is already recorded counts in LOCKREG's `inversions=` (which FAILs).
+// The only nested pair is `blit::bcs_job` (`PAGES.try_lock()` then `held_take(&BLIT_RING_HELD)`), and it never runs
+// without an IGD bank (QEMU), so this leg makes the production take itself and READS the registry's table: the
+// forward edge must be recorded, the reverse absent, and no inversion counted by the take. Nothing is taken inverted:
+// an inverted take would leave its edge for the boot and silence every later real inversion of the pair.
+// =================================================================================
+
+/// `tests gen7`'s order leg: `:: GEN7ORDER: pair=pages->blit-ring fwd= rev= inversions=<before>-><after> -> <v> gen7_order=<w> ... r8_order=<w> r8_fwd=<k>/3 r8_rev=<k> r8_took=<n> ::` (the r8 term: GEN7R8DOOREDGE B1085, `r8_order_term` at the file tail).
+fn order_leg() {
+    #[cfg(feature = "gen7blit")]
+    {
+        let before = blit::PAGES.order_seen(&BLIT_RING_HELD);
+        // One core, one task for both takes: the walk reads only this core's partition. The slot guard drops first.
+        let taken = blit::engine_take(|| {
+            drop(BLIT_RING_HELD.lock()); // held_take's take; nothing is done under it
+        }) // GEN7ORDERMIGRATE (B1053): bcs_job's own door, PAGES then the slot under one mask (a live job: busy)
+        .is_some();
+        // the engine guard came back from the door and dropped at the end of that statement, after the slot's guard
+        let after = blit::PAGES.order_seen(&BLIT_RING_HELD);
+        let (fwd, rev, i1) = after.unwrap_or((false, false, 0));
+        let i0 = before.map(|b| b.2).unwrap_or(i1);
+        let w = if before.is_none() || after.is_none() {
+            "skip(unarmed)"
+        } else if !taken {
+            "skip(busy)"
+        } else if !fwd {
+            "no-edge"
+        } else if rev {
+            "inverted"
+        } else if i1 != i0 {
+            "rose"
+        } else {
+            "ok"
+        };
+        let v = if w == "ok" { "PASS" } else if w.starts_with("skip") { "SKIP" } else { "FAIL" };
+        let (v, r8w, r8f, r8r) = r8_order_term(v); let (v, n, kat) = nohold_leg(v); let (v, pk) = park_leg(v); let (v, pw) = park_word_leg(v); let (v, rk) = r8door_leg(v); serial_println!(":: GEN7ORDER: pair=pages->blit-ring fwd={} rev={} inversions={}->{} -> {} gen7_order={} slot_nohold={} slot_kat={} park_kat={} park_word_kat={} r8door_kat={} r8_order={} r8_fwd={}/3 r8_rev={} r8_took={} ::", fwd as u8, rev as u8, i0, i1, v, w, n, kat, pk, pw, rk, r8w, r8f, r8r, r8_took_n()); // GEN7R8EDGEUNARMED (B1090): the per-run take count (`r8_took_n`, file tail). GEN7PARKWORDKAT (B1089): the class table's KAT (`park_word_leg`, file tail). GEN7R8DOORKAT (B1084): the raced job (`r8door_leg`, file tail). GEN7R8DOOREDGE (B1085): the PAGES -> R8_HELD term (`r8_order_term`, file tail). LINE-NEUTRAL fold
+    }
+    #[cfg(not(feature = "gen7blit"))]
+    {
+        let (v, n, kat) = nohold_leg("SKIP"); let (v, pk) = park_leg(v); let (v, pw) = park_word_leg(v); let (v, rk) = r8door_leg(v); serial_println!(":: GEN7ORDER: pair=pages->blit-ring fwd=0 rev=0 inversions=0->0 -> {} gen7_order=skip(no-gen7blit) slot_nohold={} slot_kat={} park_kat={} park_word_kat={} r8door_kat={} r8_order=skip(no-gen7blit) r8_fwd=0/3 r8_rev=0 r8_took=0 ::", v, n, kat, pk, pw, rk); // GEN7R8EDGEUNARMED (B1090): no PAGES, no take judged. GEN7PARKWORDKAT (B1089): skip(no-gen7blit) (`park_word_leg`, file tail). GEN7R8DOOREDGE (B1085): no PAGES, no r8 term
+    }
+}
+
+// =================================================================================
+// GEN7SLOTNOHOLD (rmbp-ledger B1047) — FILE-TAIL append: nothing above it moves. BP-gpu-9's second half (a slot's Mutex
+// is never held across a GPU op) witnessed: the four engines (r9, r10, r11, gen7blit) call `assert_no_slot_held` on the
+// existing line of each GPU-op phase (the PTE install flush, the ring kick's fence line before t0, the PTE restore
+// flush: twelve same-line tokens). It READS the lock registry through its existing API (`Mutex::holder` + `sync::here`,
+// B1016; no new registry fn): a slot THIS task holds at the op counts in `SLOT_HELD_N` and says one `[gen7] slot held
+// across op=<what> slot=<name>` per boot; it never panics and takes no lock. The engine lock (gen7blit's `PAGES`) is
+// held across ops by design and is not a slot. `tests gen7`'s GEN7ORDER line carries `slot_nohold=<n>` (0 = pass) and
+// `slot_kat=` (one slot taken by `try_lock`, checked under SLOT_KAT, its own count given back: B1034's shape).
+// GEN7-SLOT-NOHOLD-RUNGS: built by GEN7SLOTNOHOLDRUNGS (B1050): R5-R8's GPU-op lines (and R8b's band kick) carry the token.
+// =================================================================================
+
+/// Slot holds seen live across a GPU op this boot (the KAT's own count given back).
+static SLOT_HELD_N: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+/// The boot's one `[gen7] slot held across` line was said.
+static SLOT_SAID: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// `nohold_leg`'s KAT is checking: count, never say.
+static SLOT_KAT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// BP-gpu-9's witness at a GPU-op site: how many gen7 slots THIS task holds now (each counted in `SLOT_HELD_N`, the
+/// boot's first said by name). 0 while the registry is unarmed or names no caller (nothing attributable). Reads only:
+/// one `is_locked` load per built slot, the registry walk (`holder`) only for a locked one.
+pub(crate) fn assert_no_slot_held(what: &'static str) -> usize {
+    let Some((me, _)) = crate::sync::here() else { return 0 };
+    let mut n = 0usize;
+    #[allow(unused_mut, unused_variables)]
+    let mut chk = |name: &'static str, s: &crate::sync::Mutex<(usize, usize)>| {
+        if s.is_locked() && s.holder().map(|h| h.0) == Some(me) {
+            n += 1;
+            SLOT_HELD_N.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            if !SLOT_KAT.load(core::sync::atomic::Ordering::Relaxed) && !SLOT_SAID.swap(true, core::sync::atomic::Ordering::Relaxed) {
+                serial_println!("[gen7] slot held across op={} slot={}", what, name);
+            }
+        }
+    };
+    #[cfg(feature = "gen7r8")]
+    {
+        chk("r8-ring", &R8_HELD[0]);
+        chk("r8-src", &R8_HELD[1]);
+        chk("r8-dst", &R8_HELD[2]);
+    }
+    #[cfg(feature = "gen7blit")]
+    {
+        chk("blit-sp", &BLIT_HELD[0]);
+        chk("blit-dp", &BLIT_HELD[1]);
+        chk("blit-ring", &BLIT_RING_HELD);
+    }
+    #[cfg(feature = "gen7r9")]
+    {
+        chk("r9", &R9_HELD);
+        chk("r10", &R10_HELD);
+        chk("r11", &r9::draw::quad::HELD);
+    }
+    n
+}
+
+/// The KAT's slot: the first one this build has.
+#[allow(unreachable_code)]
+fn kat_slot() -> Option<&'static crate::sync::Mutex<(usize, usize)>> {
+    #[cfg(feature = "gen7blit")]
+    {
+        return Some(&BLIT_RING_HELD);
+    }
+    #[cfg(feature = "gen7r9")]
+    {
+        return Some(&R9_HELD);
+    }
+    #[cfg(feature = "gen7r8")]
+    {
+        return Some(&R8_HELD[0]);
+    }
+    None
+}
+
+/// GEN7ORDER's nohold terms `(verdict, slot_nohold, slot_kat)`: the KAT holds one slot (`try_lock`: no order edge, it
+/// cannot wait) and asks the helper, which must count exactly it; the count is given back. `slot_nohold` is the boot's
+/// real count after both ladder runs; a non-zero count or a KAT miss FAILs, else `v` stands.
+fn nohold_leg(v: &'static str) -> (&'static str, usize, &'static str) {
+    let kat = crate::arch::without_interrupts(|| {
+        let Some(slot) = kat_slot() else { return "skip(no-slot)" };
+        if crate::sync::here().is_none() {
+            return "skip(unarmed)";
+        }
+        let Some(_g) = slot.try_lock() else { return "skip(busy)" };
+        if slot.holder().is_none() {
+            return "skip(untracked)";
+        }
+        SLOT_KAT.store(true, core::sync::atomic::Ordering::Relaxed);
+        let c = assert_no_slot_held("kat");
+        SLOT_KAT.store(false, core::sync::atomic::Ordering::Relaxed);
+        SLOT_HELD_N.fetch_sub(c, core::sync::atomic::Ordering::Relaxed);
+        if c == 1 { "ok" } else { "miss" }
+    });
+    let n = SLOT_HELD_N.load(core::sync::atomic::Ordering::Relaxed);
+    (if n != 0 || kat == "miss" { "FAIL" } else { v }, n, kat)
+}
+
+// =================================================================================
+// GEN7HELDPARK (rmbp-ledger B1067) — FILE-TAIL append: nothing above it moves. gpu.md's GEN7-HELD-PARK asked for a
+// release at the compositor's engine park if B1039's one release site was not it. Measured at 9e5a5521f: the one park
+// is the stall demote in `blit::BcsBlitter::blit` (`ARMED` false + `demote_bcs`), reached only after `bcs_job`'s tail
+// has run `held_release(&BLIT_RING_HELD, "blit", all_disabled, ..)` with `all_disabled` false (the ring did not drain,
+// its PTEs stay claimed): the release site already runs on the park's path and the rule refuses there, so no second
+// release site is built (a live engine may still DMA the page). `bcs_job` itself never parks (bounded `poll_cycles`
+// only) and no slot guard outlives its fn (BP-gpu-9). The gap was the wire: `held_release`'s once-rule was one bit per
+// engine, so on a part whose healthy jobs are refused `flush-write-silent` first a later stall's `ring-not-disabled`
+// keep (the park's hold for the boot) was never said. `kept_bit` keys the once-bit by (engine, class); `park_leg` is
+// its pure KAT on the GEN7ORDER line (`park_kat=`). GEN7-PARK-UNWIND (recover a stalled window late) owed.
+// =================================================================================
+
+/// `held_release`'s once-bit: one per engine (r9 1, r10 2, r11 4, gen7blit 8) for the flush / PTE refusals, the same
+/// bit `<< 4` for `ring-not-disabled` (the not-quiesced keep the compositor's park follows), so neither silences the other; `<< 8` for `ring-ctl-stuck` (GEN7PARKNODEMOTE B1077: armed, drained, RING_CTL would not clear).
+#[cfg(any(feature = "gen7r9", feature = "gen7blit"))]
+fn kept_bit(engine: &str, why: &str) -> u16 {
+    let b: u16 = match engine {
+        "r9" => 1,
+        "r10" => 2,
+        "r11" => 4,
+        _ => 8,
+    };
+    if why == "ring-not-disabled" { b << 4 } else if why == "ring-ctl-stuck" { b << 8 } else { b }
+}
+
+/// GEN7ORDER's `park_kat=` term `(verdict, word)`: pure (no lock, no print). gen7blit's flush keep and its park keep
+/// must hold distinct non-zero bits, and r9's park keep must not alias gen7blit's; a miss FAILs, else `v` stands.
+#[allow(unreachable_code)]
+fn park_leg(v: &'static str) -> (&'static str, &'static str) {
+    #[cfg(any(feature = "gen7r9", feature = "gen7blit"))]
+    {
+        let (flush, park, other) = (kept_bit("blit", "flush-write-silent"), kept_bit("blit", "ring-not-disabled"), kept_bit("r9", "ring-not-disabled")); let stuck = kept_bit("blit", "ring-ctl-stuck"); // GEN7PARKNODEMOTE (B1077): the CTL-stuck keep's bit, distinct from both blit classes and r9's park
+        let k = if flush != 0 && park != 0 && flush & park == 0 && other & park == 0 && stuck != 0 && stuck & (flush | park | other) == 0 && park_kat_unwind() { "ok" } else { "miss" }; // GEN7PARKUNWIND (B1073): + the unwind predicate's KAT (file tail)
+        return (if k == "miss" { "FAIL" } else { v }, k);
+    }
+    (v, "skip(no-release)")
+}
+
+// =================================================================================
+// GEN7PARKUNWIND (rmbp-ledger B1073) — FILE-TAIL append: nothing above it moves. A stalled gen7blit job's parked
+// window (gen7_blit.rs tail) is re-checked late through R7's own predicate: `r7_engine_quiesced` fed the late readings
+// (RING_CTL bit 0 clear, HEAD at the job's TAIL). R7's go-red region is untouched. A dark read (an unacked forcewake:
+// RING_CTL 0, HEAD 0) cannot pass: a job's TAIL is at least 0x40. `park_kat_unwind` is the predicate's pure KAT on
+// GEN7ORDER's `park_kat=` (a miss FAILs).
+// =================================================================================
+
+/// The parked ring is quiesced: RING_CTL read back disabled AND HEAD reached the job's TAIL (R7's two legs, late).
+#[cfg(any(feature = "gen7r9", feature = "gen7blit"))]
+fn park_quiesced(ctl: u32, head: u32, tail: u32) -> bool {
+    r7_engine_quiesced(ctl & 1 == 0, (head & RING_HEAD_OFF_MASK) == tail)
+}
+
+/// `park_quiesced`'s KAT: a live ring, a dark read and a short HEAD refuse; a disabled, drained ring passes. Pure.
+#[cfg(any(feature = "gen7r9", feature = "gen7blit"))]
+fn park_kat_unwind() -> bool {
+    let t = 0x60;
+    !park_quiesced(1, t, t) && !park_quiesced(0, 0, t) && !park_quiesced(0, t - 8, t) && park_quiesced(0, t, t)
+}
+
+// =================================================================================
+// GEN7PARKNODEMOTE (rmbp-ledger B1077) — FILE-TAIL append: nothing above it moves. GEN7PARKUNWIND (B1073) owed
+// GEN7-PARK-NODEMOTE: a gen7blit job whose ring armed and drained but whose RING_CTL would not clear was already parked
+// (bcs_job's `out.armed && !all_disabled`), yet `BcsBlitter::blit`'s stall arm keyed on `!idle` alone, so it said
+// `Unavailable`, never demoted, and every later frame paid a masked engine take, a slot lock and BAR0 reads for a
+// `window-owned` refusal. The stall arm now also takes `!disabled` (the one demote runs once), and the keep says its own
+// class: `held_release`'s body is lifted in place as `held_release_kept` (the not-quiesced word a parameter) and this
+// delegate keeps r9/r10/r11's call sites; `kept_bit` gains `ring-ctl-stuck` (`<< 8`, KEPT_SAID widened to u16) and
+// `park_leg` checks its bit distinct. `park_quiesced` is untouched: a CTL that never clears stays GEN7-PARK-FROZEN's.
+// =================================================================================
+
+/// B1039's ONE release with the not-quiesced keep worded `ring-not-disabled` (every engine's call; gen7blit's CTL-stuck
+/// keep calls `held_release_kept` with `ring-ctl-stuck`).
+#[cfg(any(feature = "gen7r9", feature = "gen7blit"))]
+#[allow(dead_code)]
+pub(crate) fn held_release(slot: &crate::sync::Mutex<(usize, usize)>, engine: &'static str, disabled: bool, ptes_restored: bool) {
+    held_release_kept(slot, engine, disabled, ptes_restored, "ring-not-disabled")
+}
+
+// =================================================================================
+// GEN7PARKR8 (rmbp-ledger B1078) — FILE-TAIL append: nothing above it moves. gpu.md's GEN7-PARK-R8: R8's unarmed re-run
+// armed the BCS over a parked ring. Measured at 77e07a58c: `r8::test` replays only when its first run armed (DONE is set
+// `if w.armed`), and `hold_leg`'s second `ladder::run` reaches it again through `gen7_line` AFTER the first `blit::test`
+// (which can park a stalled job's window in PAGES' payload, keeping START/HEAD/TAIL) and BEFORE `park_unwind`. `fb_blit`
+// never takes the engine, so it read the parked registers as its entry images and programmed the ring over them (UNDEFINED
+// on a live or undrained ring, §1.1.11.2 p.76), and its own restore left `park_unwind` judging R8's ring, not the job's.
+// The guard reads the park through the ONE engine door (`blit::engine_take`, park_unwind's own read) and drops it before
+// the arm; a refusal says the rung's own verdict line and leaves DONE unset, so the next `tests gen7` arms R8 once
+// `park_unwind` has unwound the window. No unwind here (park_unwind stays the one re-check point). GEN7-R8-DOOR: built by
+// GEN7R8DOOR (B1082), below.
+//
+// GEN7R8DOOR (rmbp-ledger B1082) — in place on B1078's block. B1078 read the park and DROPPED the guard before the arm,
+// so a compositor job starting between that read and `fb_blit` was not excluded. Measured at d1acac0aa: `engine_take`'s
+// interrupt mask spans only `PAGES.try_lock()` and the nested take; `crate::sync::MutexGuard` carries no mask (its Drop is
+// the registry release), so holding the guard is not a masked span (`bcs_job` holds it for a whole job, interrupts on).
+// `fb_blit` is bounded `poll_cycles` (forcewake ack, R8's exec + drain, the R8b band's exec + drain: ~64 ms worst, one-shot
+// under `tests gen7`); its only blocking takes are `held_take`/`held_end` on R8_HELD, so PAGES -> R8_HELD is BP-gpu-9's own
+// direction. `r8_engine_clear` now RETURNS the unparked guard and R8's rung holds it across `fb_blit`: a job started
+// mid-R8 is `busy` -> `Unavailable` (no demote). No new lock, word or door; the refusal line is unchanged.
+// =================================================================================
+
+/// R8's rung guard: the engine door (PAGES' guard) when the BCS engine is free and unparked, held by the rung across
+/// `fb_blit` (GEN7R8DOOR B1082). A parked gen7blit window or a live job refuses with
+/// `:: gen7: r8 verdict=r8-skip(parked|busy) writes=0 ::` and `None`.
+#[cfg(all(feature = "gen7r8", feature = "gen7blit"))]
+fn r8_engine_clear() -> Option<crate::sync::MutexGuard<'static, Option<blit::Park>>> {
+    let why = match blit::engine_take(|| ()) {
+        None => "busy",
+        Some((g, ())) => {
+            if g.is_none() {
+                return Some(g);
+            }
+            "parked"
+        }
+    };
+    serial_println!(":: gen7: r8 verdict=r8-skip({}) writes=0 note=a-parked-or-live-gen7blit-ring-keeps-START-HEAD-TAIL-until-park_unwind-R8-never-programs-the-BCS-over-it ::", why);
+    None
+}
+
+/// Without gen7blit there is no BCS engine lock and no park: R8 is always clear.
+#[cfg(all(feature = "gen7r8", not(feature = "gen7blit")))]
+fn r8_engine_clear() -> Option<()> {
+    Some(())
+}
+
+// =================================================================================
+// GEN7R8DOORKAT (rmbp-ledger B1084) — FILE-TAIL append: nothing above it moves. GEN7R8DOOR (B1082) owed
+// GEN7-R8-DOOR-KAT: R8's rung holds the engine door (PAGES' guard, `_door`) across `fb_blit`, but no leg raced a job
+// against it. Measured at 6836ff5f1: `blit::bcs_job` takes the door through `engine_take` (`PAGES.try_lock`, the nested
+// slot take only after it) and says `Err("busy")`, which `BcsBlitter::blit` maps to `Unavailable` with no demote; the
+// helper calls `bcs_job` itself because `BcsBlitter::blit` refuses on ARMED first and ARMED is set only by `blit::test`,
+// after the ladder. No PAGES take anywhere blocks (every take is `try_lock`), so the rung may yield holding the door.
+// The rung, holding `_door`, opens a one-shot window BEFORE `fb_blit`: ONE helper on the next online core claims it
+// (CAS OPEN -> CLAIMED), runs a real `bcs_job` (two 64-byte heap planes, one 1x1 rect: valid, so it reaches the door) and
+// reads `selected()` before and after (SEL_BCS unchanged). A rung that times out with the word still OPEN CASes it to
+// NO_HELPER before going on, so a late helper never runs a real job after the door drops. GEN7ORDER's `r8door_kat=`.
+// Gated on the knob pair (gen7r8 + gen7blit), the exposure of `park_kat=` / `slot_kat=` (seat ruling). No new lock,
+// door or slot; gen7_blit.rs and blitter.rs untouched. Owed: GEN7-R8-DOOR-KAT-INBLIT (a job raced mid-poll inside
+// `fb_blit` needs a test seam in R8's go-red region).
+// =================================================================================
+
+#[cfg(all(feature = "gen7r8", feature = "gen7blit"))]
+static R8DOOR_KAT: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(R8DOOR_IDLE);
+#[cfg(all(feature = "gen7r8", feature = "gen7blit"))]
+const R8DOOR_IDLE: u8 = 0;
+#[cfg(all(feature = "gen7r8", feature = "gen7blit"))]
+const R8DOOR_OPEN: u8 = 1;
+#[cfg(all(feature = "gen7r8", feature = "gen7blit"))]
+const R8DOOR_CLAIMED: u8 = 2;
+#[cfg(all(feature = "gen7r8", feature = "gen7blit"))]
+const R8DOOR_BUSY: u8 = 3;
+#[cfg(all(feature = "gen7r8", feature = "gen7blit"))]
+const R8DOOR_RAN: u8 = 4;
+#[cfg(all(feature = "gen7r8", feature = "gen7blit"))]
+const R8DOOR_SEL: u8 = 5;
+#[cfg(all(feature = "gen7r8", feature = "gen7blit"))]
+const R8DOOR_NO_HELPER: u8 = 6;
+
+/// R8's rung, holding the engine door: the one-shot race window. Opens once per boot, spawns ONE helper on the next
+/// online core and waits (bounded, yielding) for it to finish its `bcs_job`; a helper that never claims is disowned.
+#[cfg(feature = "gen7r8")]
+fn r8door_open_kat() {
+    #[cfg(feature = "gen7blit")]
+    {
+        use core::sync::atomic::Ordering;
+        if R8DOOR_KAT.compare_exchange(R8DOOR_IDLE, R8DOOR_OPEN, Ordering::AcqRel, Ordering::Acquire).is_err() {
+            return;
+        }
+        let n = crate::arch::sched::online_cpu_count().max(1);
+        let me = crate::arch::sched::meter_current_cpu();
+        let cpu = if n > 1 { (me + 1) % n } else { me };
+        crate::arch::sched::spawn("gen7-r8kat", r8door_kat_helper, 0, cpu, crate::arch::sched::PRIO_NORMAL);
+        if !r8door_until(1_000, || R8DOOR_KAT.load(Ordering::Acquire) != R8DOOR_OPEN)
+            && R8DOOR_KAT.compare_exchange(R8DOOR_OPEN, R8DOOR_NO_HELPER, Ordering::AcqRel, Ordering::Acquire).is_ok()
+        {
+            return;
+        }
+        // CLAIMED (or done): the door stays held until the helper's job attempt has returned.
+        let _ = r8door_until(1_000, || R8DOOR_KAT.load(Ordering::Acquire) >= R8DOOR_BUSY);
+    }
+}
+
+/// The race's helper: claims the open window, then makes a real job attempt through `bcs_job`'s own door while R8
+/// holds it; `Err("busy")` with `selected()` unchanged is the exclusion (BcsBlitter's `Unavailable`, no demote).
+#[cfg(all(feature = "gen7r8", feature = "gen7blit"))]
+fn r8door_kat_helper(_: usize) {
+    use core::sync::atomic::Ordering;
+    let Some(b) = *ladder::BANK.lock() else { return };
+    let src_buf = alloc::vec![0u32; 16];
+    let dst_buf = alloc::vec![0u32; 16];
+    let src = blit::Plane { va: src_buf.as_ptr() as usize, len: 64, pitch: 16 };
+    let dst = blit::Plane { va: dst_buf.as_ptr() as usize, len: 64, pitch: 16 };
+    let rect = crate::video::blitter::Rect { sx: 0, sy: 0, dx: 0, dy: 0, w: 1, h: 1 };
+    if R8DOOR_KAT.compare_exchange(R8DOOR_OPEN, R8DOOR_CLAIMED, Ordering::AcqRel, Ordering::Acquire).is_err() {
+        return; // the rung timed out and disowned this helper: no job
+    }
+    let sel0 = crate::video::blitter::selected().name();
+    // SAFETY: the bank's BAR0 is igpu::init's live mapping; `src`/`dst` are heap buffers this fn owns for the whole
+    // call and nothing else writes; with R8 holding the door the job refuses at `engine_take` before any write.
+    let r = unsafe { blit::bcs_job(b.bar0, b.bar0_size, src, dst, &[rect], "g7k") };
+    let sel1 = crate::video::blitter::selected().name();
+    let word = match r {
+        Err("busy") if sel0 == sel1 => R8DOOR_BUSY,
+        Err("busy") => R8DOOR_SEL,
+        _ => R8DOOR_RAN,
+    };
+    R8DOOR_KAT.store(word, Ordering::Release);
+    drop(src_buf);
+    drop(dst_buf);
+}
+
+/// Bounded wait on `f` over the wall clock: yields when this task may, else spins.
+#[cfg(all(feature = "gen7r8", feature = "gen7blit"))]
+fn r8door_until(bound_ms: u64, f: impl Fn() -> bool) -> bool {
+    let t0 = crate::arch::ms();
+    loop {
+        if f() {
+            return true;
+        }
+        if crate::arch::ms().saturating_sub(t0) >= bound_ms {
+            return false;
+        }
+        if !crate::arch::irqs_masked() && crate::arch::sched::current_name().is_some() {
+            crate::arch::sched::yield_now();
+        } else {
+            core::hint::spin_loop();
+        }
+    }
+}
+
+/// GEN7ORDER's `r8door_kat=` term `(verdict, word)`: a job raced against R8's held door read `busy` with the selection
+/// unchanged -> `ok`; any other reading FAILs; R8 never held the door -> `skip(no-r8)`; no helper claimed ->
+/// `skip(no-helper)`.
+#[allow(unreachable_code)]
+fn r8door_leg(v: &'static str) -> (&'static str, &'static str) {
+    #[cfg(all(feature = "gen7r8", feature = "gen7blit"))]
+    {
+        let w = match R8DOOR_KAT.load(core::sync::atomic::Ordering::Acquire) {
+            R8DOOR_IDLE => "skip(no-r8)",
+            R8DOOR_NO_HELPER => "skip(no-helper)",
+            R8DOOR_BUSY => "ok",
+            _ => "miss",
+        };
+        return (if w == "miss" { "FAIL" } else { v }, w);
+    }
+    #[cfg(all(feature = "gen7r8", not(feature = "gen7blit")))]
+    {
+        return (v, "skip(no-gen7blit)");
+    }
+    (v, "skip(no-r8)")
+}
+
+// =================================================================================
+// GEN7R8DOOREDGE (rmbp-ledger B1085) — FILE-TAIL append: nothing above it moves. GEN7R8DOOR (B1082) made R8's rung hold
+// gen7blit's engine door (PAGES' guard) across `fb_blit`, whose only blocking takes are `held_take`/`held_end` on R8_HELD:
+// each is a `lock()`, so the registry's walk records PAGES -> R8_HELD[i] (the PAGES hold `engine_take`'s `try_lock` made is
+// tracked; R8_HELD's three `Mutex::new` sites are three order classes), exactly as it records PAGES -> blit-ring for
+// `order_leg`'s own take. GEN7ORDER read only the blit-ring pair; `r8_order_term` READS the r8 edges (`Mutex::order_seen`,
+// read-only, nothing planted: an inverted take would poison the pair, B1044) after the main pair's guard has dropped.
+// The edge exists only when fb_blit ran (QEMU has no IGD). GEN7R8EDGEUNARMED (B1090): the witness is `R8_TOOK` (file
+// tail), one bit per slot taken under the door this boot, no longer `r8::DONE` (DONE implies the three takes, not the
+// converse). A taken slot with no edge is `no-edge`, any reverse edge `inverted` (both FAIL); no take is `skip(r8-untaken)`.
+// No `rose`: the edges were recorded during the ladder; the line's `inversions=` is judged by the blit-ring term.
+// =================================================================================
+
+/// GEN7ORDER's r8 term `(verdict, r8_order, fwd, rev)`: PAGES -> each R8_HELD slot recorded (`fwd` of 3), the reverse
+/// (`rev`) absent. `inverted` / `no-edge` FAIL, else `v` stands.
+#[cfg(all(feature = "gen7blit", feature = "gen7r8"))]
+fn r8_order_term(v: &'static str) -> (&'static str, &'static str, usize, usize) {
+    let (mut fwd, mut rev, mut missing) = (0usize, 0usize, false);
+    let took = R8_TOOK.load(core::sync::atomic::Ordering::Acquire); // GEN7R8EDGEUNARMED (B1090): the takes, not DONE
+    for (i, s) in R8_HELD.iter().enumerate() {
+        let Some((f, r, _)) = blit::PAGES.order_seen(s) else { return (v, "skip(unarmed)", 0, 0) };
+        fwd += f as usize;
+        rev += r as usize;
+        missing |= took & (1u8 << i) != 0 && !f; // a slot taken under the door with no PAGES -> slot edge
+    }
+    let w = if rev != 0 {
+        "inverted"
+    } else if missing {
+        "no-edge"
+    } else if took == 0 {
+        "skip(r8-untaken)"
+    } else {
+        "ok"
+    };
+    (if w == "inverted" || w == "no-edge" { "FAIL" } else { v }, w, fwd, rev)
+}
+
+/// Without R8 there is no R8_HELD edge to read.
+#[cfg(all(feature = "gen7blit", not(feature = "gen7r8")))]
+fn r8_order_term(v: &'static str) -> (&'static str, &'static str, usize, usize) {
+    (v, "skip(no-r8)", 0, 0)
+}
+
+// =================================================================================
+// GEN7PARKWORDKAT (rmbp-ledger B1089) — FILE-TAIL append: nothing above it moves. GEN7PARKWORD (B1087) owed
+// GEN7-PARK-WORD-KAT: `park_class` (gen7_blit.rs tail) is the ONE word source for the park keep and `park_unwind`'s
+// reason, but `park_leg` judged only `kept_bit`'s bit distinctness, so a regression of the class table (the keep saying
+// `ring-ctl-stuck` for a CTL-clear park, or a word `kept_bit` does not know, which aliases the flush once-bit and is
+// silenced) passed `park_kat=ok`. `park_word_leg` is the table's pure KAT on GEN7ORDER (`park_word_kat=`), joined to
+// `kept_bit`: each park word keys its own class bit, never the flush bit. No planted park is read: `park_unwind` reads
+// live BAR0 only under a real park (QEMU has no bank). `park_class` gained one visibility token; `park_leg`, `kept_bit`
+// and `KEPT_SAID` are untouched.
+// =================================================================================
+
+/// GEN7ORDER's `park_word_kat=` term `(verdict, word)`: pure (no lock, no print). `park_class` must say `-` for a
+/// quiesce (either stuck), `ring-ctl-stuck` for a stuck CTL and `ring-not-disabled` for a CTL-clear short HEAD, and each
+/// park word must map to its own `kept_bit` class (blit `<< 8` / `<< 4`), never the flush bit; a `word-miss` FAILs.
+#[allow(unreachable_code)]
+fn park_word_leg(v: &'static str) -> (&'static str, &'static str) {
+    #[cfg(feature = "gen7blit")]
+    {
+        let (q0, q1, stuck, short) = (blit::park_class(true, false), blit::park_class(true, true), blit::park_class(false, true), blit::park_class(false, false));
+        let table = q0 == "-" && q1 == "-" && stuck == "ring-ctl-stuck" && short == "ring-not-disabled";
+        let flush = kept_bit("blit", "flush-write-silent");
+        let keyed = kept_bit("blit", stuck) == flush << 8 && kept_bit("blit", short) == flush << 4;
+        let k = if table && keyed { "word-ok" } else { "word-miss" };
+        return (if k == "word-miss" { "FAIL" } else { v }, k);
+    }
+    (v, "skip(no-gen7blit)")
+}
+
+// =================================================================================
+// GEN7R8EDGEUNARMED (rmbp-ledger B1090) — FILE-TAIL append: nothing above it moves. GEN7R8DOOREDGE (B1085) owed
+// GEN7-R8-EDGE-UNARMED: `r8_order_term` judged a missing PAGES -> R8_HELD edge only when `r8::DONE` stood, but DONE is set
+// only after an ARMED fb_blit, and fb_blit takes its slots one by one (`held_take` at the three take lines, each followed
+// by an alloc-failure return; more refusals before the arm), so an R8 that took 1-3 slots and did not arm recorded edges
+// nobody judged. Every take is under the door (fb_blit's one caller holds `r8_engine_clear`'s guard). `R8_TOOK` is the
+// per-run take witness: bit i set by the take line right after `held_take` returns (its lock and edge walk ran, even if
+// the alloc failed), never cleared (one boot; the edges are never cleared either). `r8_order_term` judges per slot and
+// GEN7ORDER composes `r8_took=<n>` after `r8_rev=`. An atomic: no lock owns it.
+// =================================================================================
+
+/// One bit per R8_HELD slot taken under the engine door this boot (bit 0 ring, 1 source, 2 destination).
+#[cfg(all(feature = "gen7r8", feature = "gen7blit"))]
+static R8_TOOK: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// fb_blit's take line: R8_HELD[`i`]'s lock returned under the door.
+#[cfg(all(feature = "gen7r8", feature = "gen7blit"))]
+fn r8_took(i: u8) {
+    R8_TOOK.fetch_or(1 << i, core::sync::atomic::Ordering::Release);
+}
+
+/// Without gen7blit there is no door and no r8 term to judge.
+#[cfg(all(feature = "gen7r8", not(feature = "gen7blit")))]
+#[inline(always)]
+fn r8_took(_i: u8) {}
+
+/// GEN7ORDER's `r8_took=`: how many R8_HELD slots were taken under the door this boot.
+#[cfg(all(feature = "gen7blit", feature = "gen7r8"))]
+fn r8_took_n() -> u32 {
+    R8_TOOK.load(core::sync::atomic::Ordering::Acquire).count_ones()
+}
+
+/// Without R8 nothing is taken.
+#[cfg(all(feature = "gen7blit", not(feature = "gen7r8")))]
+fn r8_took_n() -> u32 {
+    0
+}

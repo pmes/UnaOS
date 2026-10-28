@@ -15,6 +15,7 @@
 //!                       stereo f32 ─▶ AudioOut (resonance stereo StreamSource) ◀───┘
 //!                                     └▶ consumed frames ─▶ AudioClock
 //!                       peak L/R per 50 ms ─▶ FrameSink::levels (the meters)
+//!                       RMS L/R per 50 ms (audio_core::meter) ─▶ FrameSink::levels_rms
 //!  master clock = audio (when an audio track decodes and an output exists) else wall
 //! ```
 //!
@@ -37,7 +38,7 @@ use gneiss_pal::dsp::audio::{self as ac, AudioDecoder};
 use gneiss_pal::dsp::audio_track::{AudioTrackDecoder, Timing, audio_decoder_for};
 use gneiss_pal::dsp::avsync::{Decision, DriftMeter, DriftReport, MasterClock, SchedStats, Scheduler, TimeSource};
 use gneiss_pal::dsp::demux::{Demuxer, Packet, Track, TrackKind};
-use gneiss_pal::dsp::video::{Frame, TestPattern, VideoDecoder, decoder_for, reorder_depth};
+use gneiss_pal::dsp::video::{Frame, VideoDecoder, reorder_depth, colour_of};
 
 /// Where presented frames (and the audio meters) go.
 pub trait FrameSink {
@@ -47,6 +48,9 @@ pub trait FrameSink {
     /// Audio meters that came due: per [`LEVEL_WINDOW_NS`] window from `pts_ns` on, the peak
     /// absolute sample of the left and right channel as played.
     fn levels(&mut self, _pts_ns: i64, _peaks: &[[f32; 2]]) {}
+    /// METERPLAYER (SR319): the same windows as [`FrameSink::levels`] (same `pts_ns`, same count, called right after it):
+    /// the RMS of the left and right channel in dBFS, read from `audio_core::meter` at the window's close (floor -96).
+    fn levels_rms(&mut self, _pts_ns: i64, _rms_db: &[[f64; 2]]) {}
 }
 
 /// The meter window: 50 ms.
@@ -107,6 +111,9 @@ pub struct MediaInfo {
     pub real_video: bool,
     /// The video decoder's name ("test-pattern", "test-pattern (stand-in)", ...; "" audio-only).
     pub video_decoder: String,
+    /// HEVCLEVELLINE (SR368): the video's `profile=<name> tier=<main|high> level=<n>` tokens (H.264: no tier), from its
+    /// configuration record through `gneiss_pal::dsp::video::profile_level`; "" when the codec / record says none.
+    pub video_profile: String,
     /// The audio decoder's name ("opus", "vorbis", "aac-lc", "mp3", "flac", "pcm"; "" none).
     pub audio_decoder: String,
     /// Why audio is silent, when it is (no track / no decoder / no device).
@@ -204,9 +211,11 @@ pub struct Player {
     /// The presentation time of the next queued sample = `audio_base_ns` + `audio_frames`/rate.
     audio_base_ns: i64,
     audio_frames: u64,
-    /// The meter window being accumulated: (index, peak L, peak R), and the finished ones.
+    /// The meter window being accumulated: (index, peak L, peak R), and the finished ones (start, peaks, RMS L/R dBFS).
     level_acc: Option<(i64, f32, f32)>,
-    levels: VecDeque<(i64, [f32; 2])>,
+    levels: VecDeque<(i64, [f32; 2], [f64; 2])>,
+    /// METERPLAYER (SR319): one `audio_core::meter::Meter` per channel (L, R), the windows' RMS; tick thread only, no lock.
+    level_meters: [ac::meter::Meter; 2],
     audio_eof: bool,
     /// Muted: zeros go to the device in place of the samples (the clock keeps running).
     muted: bool,
@@ -247,6 +256,11 @@ pub struct Player {
     eof: bool,
     start_ns: i64,
     info: MediaInfo,
+    /// EDITMAP (SR223): the stream's whole edit list as clips at ns ticks ([`Player::edit_segments`]); playback still
+    /// follows the first media edit.
+    edit_map: Vec<timeline_core::Clip>,
+    /// SWAPBACK (SR329): the video stream's swap state (the parked real decoder while the stand-in plays); tick thread only.
+    vswap: crate::decode_swap::DecodeSwap,
 }
 
 /// AETHERMEDIA2 (SR134): a live session's resume state.
@@ -305,22 +319,16 @@ impl Player {
         let mut audio_start_ns = 0i64;
         let opened = match pre {
             Some(d) => Ok(d),
-            // DEMUXWIRE (SR213): a Matroska video track's decode times from its codec's reorder depth (B-frames play in decode order).
+            // DEMUXWIRE (SR213): a Matroska video track's decode times from its codec's reorder depth (B-frames play in decode order); NLEPROBEHDRWIRE (SR305): the bitstream's colour where the container states none.
             None => Demuxer::open(bytes.clone()).map(|mut d| {
-                d.derive_dts(reorder_depth);
+                d.derive_dts(reorder_depth); d.fill_colour(colour_of);
                 d
             }),
         };
         let (demux, vtrack, vdec, audio, duration_ns, start_ns) = match opened {
             Ok(demux) => {
                 let vtrack = demux.tracks().iter().find(|t| t.kind == TrackKind::Video).cloned();
-                let vdec: Option<Box<dyn VideoDecoder>> = vtrack.as_ref().map(|vt| match decoder_for(vt) {
-                    Ok(d) => d,
-                    Err(e) => {
-                        log::info!("[STRIA] :: {e}; test-pattern stand-in");
-                        Box::new(TestPattern::stand_in(vt)) as Box<dyn VideoDecoder>
-                    }
-                });
+                let vdec: Option<Box<dyn VideoDecoder>> = vtrack.as_ref().map(crate::decode_swap::open); // SWAPBACKSEEK (SR353): the ONE decoder-or-stand-in, shared with the editor's run open
                 let atrack = demux.tracks().iter().find(|t| t.kind == TrackKind::Audio).cloned();
                 let mut audio = None;
                 let mut astart: Option<i64> = None;
@@ -413,6 +421,7 @@ impl Player {
             audio: audio_name,
             real_video,
             video_decoder,
+            video_profile: vtrack.as_ref().and_then(gneiss_pal::dsp::video::profile_level).unwrap_or_default(),
             audio_decoder,
             audio_note,
             audio_clock: clock.is_audio(),
@@ -422,6 +431,7 @@ impl Player {
             audio_start_ns,
         };
         let early = 500_000_000 / display_hz.max(1) as u64;
+        let edit_map = edit_map_of(demux.as_ref(), vtrack.as_ref());
         Ok(Player {
             demux,
             vtrack,
@@ -434,6 +444,7 @@ impl Player {
             audio_frames: 0,
             level_acc: None,
             levels: VecDeque::new(),
+            level_meters: [ac::meter::Meter::new(audio_rate), ac::meter::Meter::new(audio_rate)],
             audio_eof: false,
             muted: false,
             volume: 1.0,
@@ -458,11 +469,19 @@ impl Player {
             eof: false,
             start_ns,
             info,
+            edit_map,
+            vswap: Default::default(),
         })
     }
 
     pub fn info(&self) -> &MediaInfo {
         &self.info
+    }
+    /// EDITMAP (SR223): the file's edit list mapped through `Timeline::lay_edit_list` at ns ticks: each media segment a
+    /// clip (`at` = its movie time, `src_in..src_out` = its media time from the stream's first pts); empty without an edit
+    /// list or when the list was refused. The Player plays the first media edit only (segment playback is owed).
+    pub fn edit_segments(&self) -> &[timeline_core::Clip] {
+        &self.edit_map
     }
     pub fn stats(&self) -> SchedStats {
         self.sched.stats
@@ -481,6 +500,11 @@ impl Player {
     /// times come from (`decode_time`) and the composition offsets the Player decodes by. Read-only.
     pub fn survey(&self) -> Option<gneiss_pal::dsp::demux::survey::Survey> {
         self.demux.as_ref().map(|d| d.survey())
+    }
+    /// NLEPROBEHDRWIRE (SR305): the video track's colour (container, else the bitstream's through `fill_colour(colour_of)`);
+    /// `None` without a video track or a stated colour. COLOURONE (SR328): the bus sink (`media_bus`'s `BusSink`) converts every frame by it.
+    pub fn colour(&self) -> Option<&gneiss_pal::dsp::demux::colour::Colour> {
+        self.vtrack.as_ref()?.colour.as_ref()
     }
     pub fn play(&mut self) {
         self.running = true;
@@ -568,7 +592,7 @@ impl Player {
         }
         if let Some(v) = self.vdec.as_mut() {
             v.reset();
-        }
+        } self.reseed_video(ns); // SWAPBACKSEEK (SR353): the target's in-band parameter sets, the stand-in re-evaluated there
         match self.audio.as_mut() {
             Some(AudioSrc::Track { dec, .. }) => dec.reset(),
             Some(AudioSrc::File { bytes, dec, frames, .. }) => {
@@ -595,6 +619,7 @@ impl Player {
         self.audio_frames = 0;
         self.level_acc = None;
         self.levels.clear();
+        self.level_meters.iter_mut().for_each(ac::meter::Meter::reset);
         self.audio_eof = false;
         self.eof = false;
         self.discard_before = ns;
@@ -678,11 +703,14 @@ impl Player {
                 }
                 _ => {
                     if let Some((idx, l, r)) = self.level_acc.take() {
-                        self.levels.push_back((idx * LEVEL_WINDOW_NS, [l, r]));
+                        let rms = self.window_rms();
+                        self.levels.push_back((idx * LEVEL_WINDOW_NS, [l, r], rms));
                     }
                     self.level_acc = Some((w, fr[0].abs(), fr[1].abs()));
                 }
             }
+            self.level_meters[0].push(&[fr[0]], 1);
+            self.level_meters[1].push(&[fr[1]], 1);
         }
         self.audio_frames += (stereo.len() / 2) as u64;
         self.pending.extend(stereo);
@@ -696,10 +724,9 @@ impl Player {
             }
         }
         if Some(p.track) == self.vtrack.as_ref().map(|t| t.id) {
-            if let Some(v) = self.vdec.as_mut() {
-                match v.decode(&p) {
-                    Ok(Some(f)) => self.insert_frame(f),
-                    Ok(None) => {}
+            if let (Some(v), Some(vt)) = (self.vdec.as_mut(), self.vtrack.as_ref()) {
+                match self.vswap.decode(v, vt, &p) {
+                    Ok(d) => self.video_decoded(d),
                     Err(e) => log::warn!("[STRIA] :: video decode: {e}"),
                 }
             }
@@ -842,23 +869,32 @@ impl Player {
     }
 
     /// The meter windows that are due at `now`.
-    fn due_levels(&mut self, now: i64, eof: bool) -> Option<(i64, Vec<[f32; 2]>)> {
+    fn due_levels(&mut self, now: i64, eof: bool) -> Option<(i64, Vec<[f32; 2]>, Vec<[f64; 2]>)> {
         if eof && self.pending.is_empty() {
             if let Some((idx, l, r)) = self.level_acc.take() {
-                self.levels.push_back((idx * LEVEL_WINDOW_NS, [l, r]));
+                let rms = self.window_rms();
+                self.levels.push_back((idx * LEVEL_WINDOW_NS, [l, r], rms));
             }
         }
         let mut first = None;
         let mut out = Vec::new();
-        while let Some(&(t, p)) = self.levels.front() {
+        let mut rms = Vec::new();
+        while let Some(&(t, p, q)) = self.levels.front() {
             if t > now {
                 break;
             }
             self.levels.pop_front();
             first.get_or_insert(t);
             out.push(p);
+            rms.push(q);
         }
-        first.map(|t| (t, out))
+        first.map(|t| (t, out, rms))
+    }
+
+    /// METERPLAYER (SR319): the closing window's RMS, L and R in dBFS: each channel's meter's 50 ms sliding RMS ending at
+    /// the window's last sample (the window's own RMS when it is full; a partial window counts its missing head as silence).
+    fn window_rms(&self) -> [f64; 2] {
+        [self.level_meters[0].rms_db(), self.level_meters[1].rms_db()]
     }
 
     /// Every queued sample has been played: by the device (all pushed frames consumed), or,
@@ -951,8 +987,9 @@ impl Player {
         let now = self.clock.media_ns();
         self.meter.record(self.time.now_ns() as i64, now);
         let mut presented = false;
-        if let Some((t, peaks)) = self.due_levels(now, self.audio_eof) {
+        if let Some((t, peaks, rms)) = self.due_levels(now, self.audio_eof) {
             sink.levels(t, &peaks);
+            sink.levels_rms(t, &rms);
             if self.vtrack.is_none() {
                 presented = true;
             }
@@ -987,5 +1024,69 @@ impl Player {
         } else {
             Tick::Idle
         }
+    }
+}
+
+/// EDITMAP (LEDGER SR223): the picture's stream (the video, else the first audio stream) and its edit list laid by the
+/// editor's ONE mapping, `Timeline::lay_edit_list`, on a timeline of ns ticks (source time 0 = the stream's first pts).
+fn edit_map_of(demux: Option<&Demuxer>, vtrack: Option<&Track>) -> Vec<timeline_core::Clip> {
+    let Some(d) = demux else { return Vec::new() };
+    let i = match vtrack {
+        Some(vt) => d.track_index(vt.id),
+        None => d.tracks().iter().position(|t| t.kind == TrackKind::Audio),
+    };
+    let Some(i) = i else { return Vec::new() };
+    let edits = d.edit_list(i);
+    if edits.is_empty() {
+        return Vec::new();
+    }
+    let t = &d.tracks()[i];
+    let origin = d.track_samples(i).map(|s| t.to_ns(s.pts)).min().unwrap_or(0);
+    let mut tl = timeline_core::Timeline::new(1_000_000_000);
+    let src = tl.add_source("PLAY", t.duration_ns as i64);
+    let kind = if t.kind == TrackKind::Video { timeline_core::Kind::Video } else { timeline_core::Kind::Audio };
+    let track = tl.add_track(kind);
+    match tl.lay_edit_list(track, src, edits, t.timebase, origin) {
+        Ok(tl) => {
+            let clips = tl.tracks[track].clips.clone();
+            if clips.len() > 1 {
+                log::info!("[STRIA] :: edit list: {} segments mapped; playback follows the first media edit", clips.len());
+            }
+            clips
+        }
+        Err(e) => {
+            log::info!("[STRIA] :: edit list not mapped: {e}");
+            Vec::new()
+        }
+    }
+}
+
+/// HEVCPAL-SWAP (LEDGER SR304) / SWAPBACK (LEDGER SR329): a decoder that refuses the stream MID-STREAM hands the picture to
+/// the labelled stand-in ONCE and takes it back at a later keyframe it decodes — the swap is [`crate::decode_swap`]'s, shared
+/// with the editor; the Player presents the frames it gave in order and, on a swap, `MediaInfo` says which decoder plays
+/// (`real_video`, `video_decoder`). A corrupt packet, or any error once the stand-in plays, keeps the per-packet warning.
+impl Player {
+    fn video_decoded(&mut self, d: crate::decode_swap::Decoded) {
+        for f in d.frames {
+            self.insert_frame(f);
+        }
+        if d.swap.is_some() {
+            if let Some(v) = self.vdec.as_ref() {
+                self.info.real_video = v.is_real();
+                self.info.video_decoder = v.name().to_string();
+            }
+        }
+    }
+}
+
+/// SWAPBACKSEEK (LEDGER SR353): a seek restarts the video decode at the keyframe at or before the target with the in-band
+/// parameter sets in effect there ([`crate::decode_swap::DecodeSwap::reseed`], the one the editor's run open uses), and
+/// `MediaInfo` names the decoder that now plays (a seek out of a refused span plays the real decoder again at once).
+impl Player {
+    fn reseed_video(&mut self, ns: i64) {
+        let (Some(v), Some(vt), Some(d)) = (self.vdec.as_mut(), self.vtrack.as_ref(), self.demux.as_ref()) else { return };
+        self.vswap.reseed(v, vt, d, ns);
+        self.info.real_video = v.is_real();
+        self.info.video_decoder = v.name().to_string();
     }
 }

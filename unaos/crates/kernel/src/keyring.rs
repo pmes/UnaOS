@@ -391,16 +391,12 @@ pub fn door_report(holder: bool, uid: u32, status: i32, mode: u8) -> i64 {
     0
 }
 
+/// STATUS-WORDS-ONE (SR399): the word is holocron_core's ONE table (`wire::status::word`); only the login's bad-password hint is local.
 fn status_word(s: i32) -> &'static str {
     use holocron_core::wire::status as st;
     match s {
         st::BAD_PASSWORD => "bad-password: the ring is under another password (a `holocron init`, or a password reset by the administrator, which cannot re-key it); `holocron unlock <that password>` opens it",
-        st::EXISTS => "exists",
-        st::NO_RING => "no-ring",
-        st::IO => "io",
-        st::CORRUPT => "corrupt",
-        st::INVALID => "invalid",
-        _ => "refused",
+        _ => st::word(s),
     }
 }
 

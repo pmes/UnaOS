@@ -527,9 +527,11 @@ pub fn build_taffy_tree<H: Host>(
             paint.ua_vmargin = Some((k, built));
         }
     }
-    if control_kind(dom_node) == Some(Control::Button) {
+    // AETHERFILEFACE (SR463): html.css gives `input[type="file" i]` no background (initial): Chromium paints ButtonFace on
+    // the inner Choose-File button only, which both rings' file paint draws over the button sub-box (`BUTTON_FACE`).
+    if control_kind(dom_node) == Some(Control::Button) && !dom_node.attr("type").is_some_and(|t| t.trim().eq_ignore_ascii_case("file")) {
         // Chromium's ButtonFace.
-        paint.background = Some((239, 239, 239));
+        paint.background = Some(BUTTON_FACE);
     }
     if tag == "mark" {
         // html.css: `mark { background-color: yellow; color: black }`.
@@ -546,8 +548,15 @@ pub fn build_taffy_tree<H: Host>(
         // UA / presentational alignment defaults, applied BEFORE the
         // author cascade so any real rule wins: <center> and <th> centre
         // their content, and the legacy align="" attribute still aligns.
+        // AETHERCENTERLAYOUT (SR421): html.css `center { text-align: -webkit-center }` and Blink's align=center|middle /
+        // right are -webkit-center (5) / -webkit-right (6), which also place narrow block children
+        // (`propagate_text_align`); `th` is -internal-center, inline content only (1).
+        // AETHERCAPTIONUAALIGN (SR452): html.css `caption { text-align: -webkit-center }` (5, the seat's ruling: Blink over
+        // the spec's center); a stylesheet, style="" or align= on the caption still wins, as for `th`.
         paint.text_align = match tag.as_str() {
-            "center" | "th" => Some(1),
+            "center" => Some(5),
+            "th" => Some(1),
+            "caption" => Some(5),
             // The quirks-mode table quirk: a table does NOT inherit
             // text-align from its ancestors. Every legacy page that
             // wraps its layout table in <center> (Hacker News) relies
@@ -555,13 +564,19 @@ pub fn build_taffy_tree<H: Host>(
             "table" if quirks => Some(0),
             _ => None,
         };
-        if let Some(a) = dom_node.attr("align") {
+        // AETHERCAPTIONSIDE (SR460): a caption's align= is caption-side (`caption_side_attr`), never text-align.
+        if let Some(a) = dom_node.attr("align").filter(|_| tag != "caption") {
             match a.trim().to_ascii_lowercase().as_str() {
-                "center" | "middle" => paint.text_align = Some(1),
-                "right" => paint.text_align = Some(2),
+                "center" | "middle" => paint.text_align = Some(5),
+                "right" => paint.text_align = Some(6),
                 "left" => paint.text_align = Some(4),
                 _ => {}
             }
+        }
+        // AETHERCAPTIONSIDECSS (SR462): align= is the lowest-priority source of caption-side; style="" (below) and the
+        // author cascade (`merge_paint` in `apply_specs`) overlay it.
+        if tag == "caption" {
+            paint.caption_side = caption_side_attr(dom_node);
         }
         if let Some(inline) = dom_node.attr("style") {
             let saved = paint.text_align;
@@ -612,6 +627,61 @@ pub fn control_kind<N: DomNode>(node: &N) -> Option<Control> {
     }
 }
 
+// ---- AETHERCAPTIONSIDE (SR460): a caption's align= is caption-side, never text-align ---------------------------
+
+/// AETHERCAPTIONSIDE (SR460): the caption-side a `<caption>`'s align= presentation attribute maps to (Blink's
+/// HTMLTableCaptionElement::CollectStyleForPresentationAttribute: align -> caption-side, whose parser keeps only
+/// top | bottom, ASCII case-insensitive): Some(false) top, Some(true) bottom, None for any other value (left / right /
+/// center are dropped, and never become text-align). AETHERCAPTIONSIDECSS (SR462): read into
+/// `PaintStyle::caption_side` as the lowest-priority source (the cascade overlays it).
+pub fn caption_side_attr<N: DomNode>(node: &N) -> Option<bool> {
+    match node.attr("align")?.trim().to_ascii_lowercase().as_str() {
+        "top" => Some(false),
+        "bottom" => Some(true),
+        _ => None,
+    }
+}
+
+/// AETHERCAPTIONSIDE (SR460): a table is a flex column whose caption sits where the DOM put it (first); a caption
+/// child whose caption-side is bottom moves after the table's other children, the rest keep their order.
+/// AETHERCAPTIONSIDECSS (SR462): run once the cascade is folded (`apply_specs`), reading `PaintStyle::caption_side`
+/// (align= under style="" under the author cascade); the property inherits, so a caption's used value is the first
+/// one specified on itself or an ancestor box, top when none is. Idempotent: a second fold moves nothing.
+fn caption_side_order<H: Host>(tree: &mut LayoutTree<H>) {
+    if !tree.paint_map.values().any(|p| p.caption_side == Some(true)) {
+        return;
+    }
+    let used_bottom = |tree: &LayoutTree<H>, id: taffy::NodeId| {
+        let mut cur = Some(id);
+        while let Some(b) = cur {
+            if let Some(side) = tree.paint_map.get(&b).and_then(|p| p.caption_side) {
+                return side;
+            }
+            cur = tree.taffy.parent(b);
+        }
+        false
+    };
+    let mut below: BTreeMap<u64, Vec<taffy::NodeId>> = BTreeMap::new();
+    for (id, n) in &tree.node_map {
+        if n.tag().as_deref() != Some("caption") || !used_bottom(tree, *id) {
+            continue;
+        }
+        let Some(table) = tree.taffy.parent(*id) else { continue };
+        if tree.node_map.get(&table).is_some_and(|t| t.tag().as_deref() == Some("table")) {
+            below.entry(u64::from(table)).or_default().push(*id);
+        }
+    }
+    for (table, caps) in below {
+        let table = taffy::NodeId::from(table);
+        let kids = tree.taffy.children(table).unwrap_or_default();
+        let (moved, mut rest): (Vec<taffy::NodeId>, Vec<taffy::NodeId>) = kids.iter().copied().partition(|k| caps.contains(k));
+        rest.extend(moved);
+        if rest != kids {
+            let _ = tree.taffy.set_children(table, &rest);
+        }
+    }
+}
+
 /// Chromium's control font: 13.333px (`font: -webkit-small-control`).
 pub const CONTROL_FONT_PX: f32 = 13.333;
 
@@ -629,11 +699,19 @@ fn control_line_height<F: Fonts + ?Sized>(fonts: &F, family: u16) -> f32 {
     if fonts.has_face(sel) { fonts.line_height(sel, CONTROL_FONT_PX, 0.0) } else { 15.0 }
 }
 
+/// AETHERSUBMITCAPTION (SR410): one line of a button label in `family` at `size` (= `control_line_height`
+/// at family 0 and the control font size).
+fn button_line_height<F: Fonts + ?Sized>(fonts: &F, family: u16, size: f32) -> f32 {
+    let sel = FontSel::new(family, 400, false);
+    if fonts.has_face(sel) { fonts.line_height(sel, size, 0.0) } else { 15.0 * size / CONTROL_FONT_PX }
+}
+
 /// UA (html.css + Chromium's control theme) box metrics of form controls:
 /// text fields `padding: 1px 2px; border: 2px inset` with one line of the
 /// 13.333px control font and the `size=20` default width; checkbox and
 /// radio 13x13 with their 3px/4px (radio 3px 3px 0 5px) margins; buttons
-/// `padding: 1px 6px; border: 2px outset`; select a 1px border around its
+/// `padding: 1px 6px; border: 2px outset` (an image input none, a color input `border: 1px; padding: 1px 2px`,
+/// html.css); select a 1px border around its
 /// label and the arrow; textarea `padding: 2px; border: 1px` sized by
 /// rows x cols of the monospace control font.
 fn ua_control<N: DomNode>(node: &N, _tag: &str, style: &mut Style) {
@@ -658,9 +736,30 @@ fn ua_control<N: DomNode>(node: &N, _tag: &str, style: &mut Style) {
             };
             style.align_self = Some(taffy::style::AlignSelf::CENTER);
         }
+        // AETHERFILEUAEDGES (SR459): html.css `input[type="file" i] { padding: initial; border: initial }`: the input has
+        // no UA edges; its Choose-File button carries the push edges, inside the content `control_intrinsic` gives.
+        Control::Button if node.tag().as_deref() == Some("input") && node.attr("type").is_some_and(|t| t.trim().eq_ignore_ascii_case("file")) => {
+            style.padding = rect(0.0, 0.0, 0.0, 0.0);
+            style.border = rect(0.0, 0.0, 0.0, 0.0);
+        }
+        // AETHERIMAGEINPUTBOX (SR455): html.css `input[type="image" i] { padding: initial; border: initial }`, so an
+        // image input has no UA edges and its border box is the image (or alt-label) size `control_intrinsic` gives.
+        // AETHERIMAGEINPUTFETCH (SR461): the guard is the ONE node predicate `is_image_input`.
+        Control::Button if is_image_input(node) => {
+            style.padding = rect(0.0, 0.0, 0.0, 0.0);
+            style.border = rect(0.0, 0.0, 0.0, 0.0);
+        }
+        // AETHERCOLORUAEDGES (SR458): html.css `input[type="color" i] { border: 1px; padding: 1px 2px }`, not the push
+        // button's edges, so `control_intrinsic`'s 44 x 23 content keeps the 50 x 27 border box on Chromium's edges.
+        Control::Button if node.tag().as_deref() == Some("input") && node.attr("type").is_some_and(|t| t.trim().eq_ignore_ascii_case("color")) => {
+            style.padding = rect(1.0, 2.0, 1.0, 2.0);
+            style.border = rect(1.0, 1.0, 1.0, 1.0);
+        }
         Control::Button => {
-            style.padding = rect(1.0, 6.0, 1.0, 6.0);
-            style.border = rect(2.0, 2.0, 2.0, 2.0);
+            // AETHERFILEUAEDGES (SR459): the push edges from their ONE source, `push_button_edges`.
+            let (b, p) = push_button_edges();
+            style.padding = rect(p.top, p.right, p.bottom, p.left);
+            style.border = rect(b.top, b.right, b.bottom, b.left);
         }
         Control::Select => {
             style.padding = rect(0.0, 0.0, 0.0, 0.0);
@@ -678,7 +777,10 @@ fn ua_control<N: DomNode>(node: &N, _tag: &str, style: &mut Style) {
 /// line by the `size=20` average-character width for a field, the label
 /// for a button-like input, the selected label plus the arrow for a
 /// select, rows x cols of the monospace control font for a textarea.
-fn control_intrinsic<H: Host, F: Fonts + ?Sized>(node: &H::Node, fonts: &F) -> Option<(f32, f32)> {
+/// AETHERSUBMITCAPTION (SR410): a button-like input's label is measured in the element's own font, `font`
+/// = (family, size) — the author's family when one is set, else family 0 as before — so the caption the
+/// painter centres fits the box (byte-identical at the UA defaults).
+fn control_intrinsic<H: Host, F: Fonts + ?Sized>(node: &H::Node, fonts: &F, font: (u16, f32)) -> Option<(f32, f32)> {
     let kind = control_kind(node)?;
     let attr = |name: &str| node.attr(name);
     let lh = control_line_height(fonts, 0);
@@ -688,9 +790,42 @@ fn control_intrinsic<H: Host, F: Fonts + ?Sized>(node: &H::Node, fonts: &F) -> O
             Some((size * 7.45, lh))
         }
         Control::Button if node.tag().as_deref() == Some("input") => {
-            let t = attr("type").unwrap_or_default().to_ascii_lowercase();
-            let label = attr("value").unwrap_or_else(|| if t == "reset" { "Reset".into() } else { "Submit".into() });
-            Some((text_advance(fonts, &label, 0, CONTROL_FONT_PX), lh))
+            // AETHERBUTTONLABELONE (SR423): a push button's label is the ONE rule, `button_label`, the host paint
+            // calls too. AETHERCONTROLINTRINSIC (SR448): image / file / color size by their own measured rules
+            // (Chromium), each in the element's font through the same `text_advance` / `button_line_height`.
+            let t = attr("type").unwrap_or_default();
+            let adv = |s: &str| text_advance(fonts, s, font.0, font.1);
+            let line = button_line_height(fonts, font.0, font.1);
+            match t.trim().to_ascii_lowercase().as_str() {
+                // The decoded image's size when the host has it; else a button labelled by Chromium's
+                // HTMLInputElement::AltText: alt, else value when alt is missing, an empty result "Submit"
+                // (IDS_FORM_INPUT_ALT).
+                // AETHERIMAGEINPUTFETCH (SR461): the AltText rule is `image_alt_label`, the host's failure paint's too.
+                "image" => H::img_intrinsic(node).or_else(|| {
+                    let (alt, value) = (attr("alt"), attr("value"));
+                    Some((adv(&image_alt_label(alt.as_deref(), value.as_deref())), line))
+                }),
+                // Chromium LayoutFileUploadControl: ceil(max(34 x "0" (kDefaultWidthNumChars), the button's border
+                // box + 4 (kAfterButtonSpacing) + the status text)). AETHERFILEUAEDGES (SR459): the input has no UA
+                // edges (ua_control's file arm), so this is the whole border box and the inner button's own edges
+                // (`push_button_edges`) are inside it, the height the button's border box (line + 6).
+                "file" => {
+                    let (button, status) = file_label(attr("multiple").is_some());
+                    let (b, p) = push_button_edges();
+                    let (ew, eh) = (b.left + p.left + p.right + b.right, b.top + p.top + p.bottom + b.bottom);
+                    Some((crate::fmath::ceil((34.0 * adv("0")).max(adv(button) + ew + 4.0 + adv(status))), line + eh))
+                }
+                // html.css: a fixed 50 x 27 swatch border box, font-independent. AETHERCOLORUAEDGES (SR458): over the color
+                // arm's own edges in ua_control (border 1px + padding 1px 2px = 6 x 4), so the content is html.css's 44 x 23.
+                "color" => Some((50.0 - 6.0, 27.0 - 4.0)),
+                // AETHERPUSHTRIM (SR440): the push types through the ONE `is_push_type` predicate (a padded or
+                // mixed-case type is the same push button); anything else keeps the Submit stand-in.
+                _ => {
+                    let value = attr("value");
+                    let push = is_push_type(&t);
+                    Some((adv(&button_label(if push { t.as_str() } else { "submit" }, value.as_deref())), line))
+                }
+            }
         }
         Control::Select => {
             let label = select_selected_option::<H>(node).map(|(_, l)| l).unwrap_or_default();
@@ -703,6 +838,199 @@ fn control_intrinsic<H: Host, F: Fonts + ?Sized>(node: &H::Node, fonts: &F) -> O
             Some((cols * cw + 17.0, rows * control_line_height(fonts, 2)))
         }
         _ => None,
+    }
+}
+
+/// AETHERBUTTONLABELONE (SR423): the caption a push-button `<input>` shows (HTML §4.10.5.1.18 / .20 / .21 and
+/// the rendering section's button labels), the ONE rule both the intrinsic size (`control_intrinsic`) and the
+/// host paint (`forms::button_label`) read: its `value` when present (an empty value is an empty caption), else
+/// the UA default, "Submit" for a submit button, "Reset" for a reset button, nothing for a plain button. `ty` is
+/// the raw type attribute (trimmed and compared ASCII case-insensitively here).
+pub fn button_label<'a>(ty: &str, value: Option<&'a str>) -> alloc::borrow::Cow<'a, str> {
+    use alloc::borrow::Cow;
+    if let Some(v) = value {
+        return Cow::Borrowed(v);
+    }
+    let ty = ty.trim();
+    if ty.eq_ignore_ascii_case("submit") {
+        Cow::Borrowed("Submit")
+    } else if ty.eq_ignore_ascii_case("reset") {
+        Cow::Borrowed("Reset")
+    } else {
+        Cow::Borrowed("")
+    }
+}
+
+/// AETHERPUSHTRIM (SR440): whether an `<input>`'s raw `type` attribute names a push button (submit, reset, button),
+/// trimmed and compared ASCII case-insensitively as `button_label` reads it: the ONE predicate the intrinsic size
+/// (`control_intrinsic`), the host paint's push arm (render/mod.rs) and AETHER.ELF's caption (paint.rs) all call, so a
+/// padded type (`type=" submit "`) is sized, labelled and painted as the same push button. Narrower than
+/// `control_kind`'s `Control::Button` (which also covers image / file / color).
+pub fn is_push_type(ty: &str) -> bool {
+    let ty = ty.trim();
+    ty.eq_ignore_ascii_case("submit") || ty.eq_ignore_ascii_case("reset") || ty.eq_ignore_ascii_case("button")
+}
+
+/// AETHERIMAGEINPUTBOX (SR455): whether an `<input>`'s raw `type` attribute names an image button, trimmed and compared
+/// ASCII case-insensitively as `is_push_type` reads it: the ONE predicate `ua_control` (no UA edges) and the host paint
+/// (no control frame, render/mod.rs) both call.
+pub fn is_image_type(ty: &str) -> bool {
+    ty.trim().eq_ignore_ascii_case("image")
+}
+
+/// AETHERIMAGEINPUTFETCH (SR461): whether a node is an `<input>` whose type `is_image_type` names: the ONE node predicate
+/// `ua_control`'s image arm, the img sizing rule in `layout` (width / height attributes, else the decoded size), and the
+/// host's image fetch (net `collect_image_urls`) and img paint (render/mod.rs) all call, so an image input rides an img's path.
+pub fn is_image_input<N: DomNode>(node: &N) -> bool {
+    node.tag().as_deref() == Some("input") && node.attr("type").is_some_and(|t| is_image_type(&t))
+}
+
+/// AETHERIMAGEINPUTFETCH (SR461): an image input's label when it has no image (Chromium's HTMLInputElement::AltText): `alt`,
+/// else `value` when alt is missing, an empty result "Submit" (IDS_FORM_INPUT_ALT), through `button_label`. The ONE rule
+/// `control_intrinsic` sizes the box by and the host render paints on a failed or missing image.
+pub fn image_alt_label<'a>(alt: Option<&'a str>, value: Option<&'a str>) -> alloc::borrow::Cow<'a, str> {
+    button_label("submit", alt.or(value).filter(|s| !s.is_empty()))
+}
+
+/// AETHERCONTROLINTRINSIC (SR448): a file input's two UA strings (Chromium's IDS_FORM_FILE_BUTTON_LABEL /
+/// IDS_FORM_MULTIPLE_FILES_BUTTON_LABEL and IDS_FORM_FILE_NO_FILE_LABEL): the button's caption, "Choose Files"
+/// with `multiple`, and the status text shown while no file is chosen. Read by `control_intrinsic`.
+pub fn file_label(multiple: bool) -> (&'static str, &'static str) {
+    (if multiple { "Choose Files" } else { "Choose File" }, "No file chosen")
+}
+
+/// AETHERFILEUAEDGES (SR459): html.css's push button edges (`padding: 1px 6px; border: 2px outset`) as taffy
+/// (border, padding): the ONE source `ua_control`'s Button arm, `control_intrinsic`'s file arm (the Choose-File
+/// button inside a file input with no edges of its own) and both rings' file paint read.
+pub fn push_button_edges() -> (taffy::Rect<f32>, taffy::Rect<f32>) {
+    let border = taffy::Rect { left: 2.0, right: 2.0, top: 2.0, bottom: 2.0 };
+    let padding = taffy::Rect { left: 6.0, right: 6.0, top: 1.0, bottom: 1.0 };
+    (border, padding)
+}
+
+/// AETHERFILEFACE (SR463): Chromium's ButtonFace, the ONE source of a push button's UA background (`build_taffy_tree`)
+/// and of the face both rings' file paint draw on a file input's Choose-File button sub-box (the host's
+/// `paint_file_color`, AETHER.ELF's paint.rs `file_color`), the input itself painting none.
+pub const BUTTON_FACE: (u8, u8, u8) = (239, 239, 239);
+
+/// AETHERFILECOLORPAINT (SR456): a color input's swatch (Chromium html.css: the input's 1px border and 1px 2px padding,
+/// `::-webkit-color-swatch-wrapper { padding: 4px 2px }`, `::-webkit-color-swatch { border: 1px solid #777777 }`): the
+/// swatch's border box sits (x, y) px in from the input's border box on each side, with a 1 px frame in the colour
+/// round the value's fill (50 x 27 -> 40 x 15). Read by the host render's file/color arm and AETHER.ELF's paint.rs.
+pub const COLOR_SWATCH: (f32, f32, (u8, u8, u8)) = (5.0, 6.0, (119, 119, 119));
+
+// ---- AETHERCAPTIONCORE (SR438): a push button's caption geometry, one rule for both rings ----------------------
+
+/// AETHERCAPTIONCORE (SR438): where a push button's caption sits: `x` the pen's left edge (sub-pixel, never
+/// rounded), `top` the origin of its one line box, `clip` the padding box as (x0, y0, x1, y1) (html.css `input
+/// { overflow: clip }`; a pixel (x, y) is inside when x >= x0 && x < x1 && y >= y0 && y < y1, in f32).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CaptionBox {
+    pub x: f32,
+    pub top: f32,
+    pub clip: (f32, f32, f32, f32),
+}
+
+impl CaptionBox {
+    /// The baseline row: `top` plus the ring's offset from a line box's top to its baseline (`lead`, the
+    /// half-leading rule `Fonts::baseline_offset` at `line-height: normal`), rounded half away from zero — what
+    /// the host's `draw_lines` + text_host `draw_glyph` produce from `top`.
+    pub fn baseline(&self, lead: f32) -> f32 {
+        crate::fmath::round(self.top + lead)
+    }
+}
+
+/// AETHERCAPTIONCORE (SR438): the ONE caption geometry both rings paint a push button's label by (the host's
+/// render/mod.rs push arm, AETHERSUBMITCAPTION SR410, and AETHER.ELF's paint.rs `caption`, AETHER-ELFCAPTION
+/// SR434): the border box at (`bx`, `by`) sized `bw` x `bh` with its taffy `border` / `padding` edges, the label
+/// `text_w` wide (measured by the ring in the element's font) and the extents `ascent` / `descent` the line is
+/// centred by. The label centres on both axes in the content box (an overflowing label stays centred: one line,
+/// never wrapped), its inked line (ascent + descent) on the content box's middle, and clips to the padding box.
+/// The arithmetic is the host's, expression for expression, so its pixels do not move. Pure, no font.
+/// AETHERCAPTIONEXTENTS (SR453): both rings pass the font's RAW (unrounded) ascent / descent in px — the host's
+/// `text_extents`, AETHER.ELF's txt.rs `extents` — so only the baseline is rounded, once, in [`CaptionBox::baseline`].
+#[allow(clippy::too_many_arguments)]
+pub fn caption_box(
+    bx: f32,
+    by: f32,
+    bw: f32,
+    bh: f32,
+    border: taffy::Rect<f32>,
+    padding: taffy::Rect<f32>,
+    text_w: f32,
+    ascent: f32,
+    descent: f32,
+) -> CaptionBox {
+    let (pad, bord) = (padding, border);
+    let inset_l = pad.left + bord.left;
+    let inset_r = pad.right + bord.right;
+    let content_x = bx + inset_l;
+    let content_y = by + pad.top + bord.top;
+    let content_w = (bw - inset_l - inset_r).max(0.0);
+    let content_h = (bh - pad.top - bord.top - pad.bottom - bord.bottom).max(0.0);
+    let center_y = content_y + content_h / 2.0;
+    CaptionBox {
+        x: content_x + (content_w - text_w) / 2.0,
+        top: center_y - (ascent + descent) / 2.0,
+        clip: (bx + bord.left, by + bord.top, bx + bw - bord.right, by + bh - bord.bottom),
+    }
+}
+
+#[cfg(test)]
+mod caption_box_kat {
+    use super::{caption_box, CaptionBox};
+    use taffy::Rect;
+
+    fn edges(left: f32, right: f32, top: f32, bottom: f32) -> Rect<f32> {
+        Rect { left, right, top, bottom }
+    }
+
+    /// A label narrower than the content box: centred on both axes, clipped to the padding box.
+    #[test]
+    fn captioncore_fits_kat() {
+        let c = caption_box(10.0, 20.0, 100.0, 30.0, edges(2.0, 2.0, 2.0, 2.0), edges(6.0, 6.0, 1.0, 1.0), 40.0, 12.0, 3.0);
+        // content box (18, 23) 84 x 24; x = 18 + (84 - 40) / 2; top = 23 + 12 - 7.5
+        assert_eq!(c, CaptionBox { x: 40.0, top: 27.5, clip: (12.0, 22.0, 108.0, 48.0) });
+        assert_eq!(c.baseline(12.0), 40.0); // 39.5 rounds half away from zero
+        assert_eq!(c.baseline(11.0), 39.0); // 38.5 likewise
+        assert_eq!(c.baseline(10.9), 38.0);
+    }
+
+    /// A label wider than the content box stays centred (its pen left of the content box); the clip is still
+    /// the padding box, not the content box.
+    #[test]
+    fn captioncore_overflow_kat() {
+        let c = caption_box(10.0, 20.0, 100.0, 30.0, edges(2.0, 2.0, 2.0, 2.0), edges(6.0, 6.0, 1.0, 1.0), 120.0, 12.0, 3.0);
+        assert_eq!(c.x, 0.0); // 18 + (84 - 120) / 2
+        assert!(c.x < 18.0);
+        assert_eq!(c.top, 27.5);
+        assert_eq!(c.clip, (12.0, 22.0, 108.0, 48.0));
+    }
+
+    /// Padding wider than the box: the content box clamps to 0 x 0 at its corner and the label centres on that
+    /// point; fractional edges pass through unrounded; a negative baseline rounds away from zero too.
+    #[test]
+    fn captioncore_clamped_kat() {
+        let c = caption_box(0.5, 0.25, 10.0, 6.0, edges(1.0, 1.0, 1.0, 1.0), edges(6.0, 6.0, 3.0, 3.0), 8.0, 4.0, 2.0);
+        // content (7.5, 4.25) 0 x 0; x = 7.5 - 4; top = 4.25 - 3
+        assert_eq!(c, CaptionBox { x: 3.5, top: 1.25, clip: (1.5, 1.25, 9.5, 5.25) });
+        assert_eq!(c.baseline(0.25), 2.0);
+        let n = CaptionBox { x: 0.0, top: -3.0, clip: (0.0, 0.0, 0.0, 0.0) };
+        assert_eq!(n.baseline(0.5), -3.0); // -2.5 rounds away from zero
+    }
+
+    /// AETHERCAPTIONEXTENTS (SR453): a fractional (raw) extent centres the line unrounded; the same box fed the
+    /// rounded extents lands its baseline one pixel higher — the pixel the two rings differed by.
+    #[test]
+    fn captionextents_fractional_kat() {
+        let (b, p) = (edges(2.0, 2.0, 2.0, 2.0), edges(6.0, 6.0, 1.0, 1.0));
+        let raw = caption_box(10.0, 20.0, 100.0, 30.0, b, p, 40.0, 11.75, 2.625);
+        // content box (18, 23) 84 x 24, middle 35; top = 35 - 14.375 / 2
+        assert_eq!(raw, CaptionBox { x: 40.0, top: 27.8125, clip: (12.0, 22.0, 108.0, 48.0) });
+        assert_eq!(raw.baseline(12.75), 41.0); // 40.5625
+        let rounded = caption_box(10.0, 20.0, 100.0, 30.0, b, p, 40.0, 12.0, 3.0);
+        assert_eq!(rounded.top, 27.5);
+        assert_eq!(rounded.baseline(12.75), 40.0); // 40.25
     }
 }
 
@@ -869,22 +1197,26 @@ fn propagate_text_align<H: Host>(tree: &mut LayoutTree<H>) {
                 let row = matches!(st.flex_direction, FlexDirection::Row | FlexDirection::RowReverse);
                 let mut changed = false;
                 if row && st.justify_content == taffy::style::JustifyContent::NORMAL {
-                    st.justify_content = if align == 1 {
+                    st.justify_content = if matches!(align, 1 | 5) {
                         taffy::style::JustifyContent::CENTER
                     } else {
                         taffy::style::JustifyContent::END
                     };
                     changed = true;
                 } else if !row && st.align_items == taffy::style::AlignItems::NORMAL {
-                    st.align_items = if align == 1 {
+                    st.align_items = if matches!(align, 1 | 5) {
                         taffy::style::AlignItems::CENTER
                     } else {
                         taffy::style::AlignItems::END
                     };
                     changed = true;
                 }
+                let block = crate::collapse::is_block_container_pub(tree, id, &st) || cell_block_container(tree, id, &st);
                 if changed {
                     let _ = tree.taffy.set_style(id, st);
+                }
+                if block {
+                    place_narrow_blocks(tree, id, align);
                 }
             }
         }
@@ -895,6 +1227,49 @@ fn propagate_text_align<H: Host>(tree: &mut LayoutTree<H>) {
     }
     let root = tree.root_node;
     walk(tree, root, None);
+}
+
+/// AETHERCENTERLAYOUT (SR421): the ONE horizontal placement of a block container's in-flow block children that do
+/// not stretch (a table, a definite width): `align` -webkit-center (5) centres them and -webkit-right (6) ends them
+/// (HTML rendering §15.3.3, Blink's `-webkit-center`); plain center / right / end align inline content only (CSS 2.2
+/// §16.2), so such a child sits at the start instead of following the column's centred `align_items`. Only a child
+/// with no `align_self` of its own is written (floats, author alignment and table.rs's guard keep theirs), so a second
+/// run changes nothing; stretching children (`width: auto` or the 100% placeholder blockwidth takes) are left alone.
+fn place_narrow_blocks<H: Host>(tree: &mut LayoutTree<H>, id: taffy::NodeId, align: u8) {
+    let to = match align {
+        5 => taffy::style::AlignSelf::CENTER,
+        6 => taffy::style::AlignSelf::END,
+        _ => taffy::style::AlignSelf::START,
+    };
+    for k in tree.taffy.children(id).unwrap_or_default() {
+        let Ok(kst) = tree.taffy.style(k).cloned() else { continue };
+        if kst.align_self.is_some() || !crate::collapse::in_flow_block_pub(tree, k, &kst) {
+            continue;
+        }
+        let Some(tag) = tree.node_map.get(&k).and_then(|n| n.tag()) else { continue };
+        let table = tag == "table";
+        if (!table && is_table_part(&tag)) || (!table && (kst.size.width.is_auto() || kst.size.width == Dimension::percent(1.0))) {
+            continue;
+        }
+        let mut n = kst;
+        n.align_self = Some(to);
+        let _ = tree.taffy.set_style(k, n);
+    }
+}
+
+/// AETHERCENTERCELL (SR436): a table cell (td / th) whose children the builder laid out as a column is a block
+/// container for `place_narrow_blocks` (CSS 2.2 §17.4: a table-cell is a block container; HTML rendering §15.3.3
+/// `align=center` is -webkit-center, so a nested table or a definite-width block centres in the cell, and plain
+/// text-align leaves it at the start). `collapse::is_block_container` keeps refusing table parts: it is margin
+/// collapsing's predicate too, and margins do not collapse through a cell. An author flex / grid cell and an
+/// all-inline cell (a row, the inline formatting context) are not. AETHERCENTERCAPTION (SR446): a caption laid out as
+/// a column is one too (CSS 2.2 §17.4: a table-caption is a block container; HTML rendering §15.3.3 lists caption
+/// among the align= elements), so its narrow blocks follow the same -webkit-center / plain-center rule.
+fn cell_block_container<H: Host>(tree: &LayoutTree<H>, id: taffy::NodeId, st: &Style) -> bool {
+    st.display == Display::Flex
+        && st.flex_direction == FlexDirection::Column
+        && tree.paint_map.get(&id).and_then(|p| p.flex_container) != Some(true)
+        && tree.node_map.get(&id).and_then(|n| n.tag()).is_some_and(|t| matches!(t.as_str(), "td" | "th" | "caption"))
 }
 
 /// Block-level by the cascade (the author's outer display), else by tag; anonymous boxes are block boxes.
@@ -1026,12 +1401,14 @@ pub(crate) fn is_inline_level<H: Host>(tree: &LayoutTree<H>, id: taffy::NodeId) 
 /// anonymous block boxes. Only containers holding a child whose cascaded
 /// type contradicts its tag are touched; anonymous boxes count as block,
 /// so a second pass finds nothing to do.
+/// AETHERCELLBLOCKIFY (SR447): a td / th is a block container (CSS 2.2 §17.4, the builder's `table_container`), so
+/// it is re-derived too; only the table-structure parts keep the skip (their children are laid out by table rules).
 fn fix_display_contexts<H: Host>(tree: &mut LayoutTree<H>) {
     let ids: Vec<taffy::NodeId> = tree.node_map.keys().copied().collect();
     for id in ids {
         let Some(n) = tree.node_map.get(&id) else { continue };
         let Some(tag) = n.tag() else { continue };
-        if is_table_part(&tag) {
+        if is_table_part(&tag) && !matches!(tag.as_str(), "td" | "th") {
             continue;
         }
         if tree.paint_map.get(&id).and_then(|p| p.flex_container) == Some(true) {
@@ -1354,6 +1731,8 @@ pub fn apply_specs<H: Host>(tree: &mut LayoutTree<H>, specs: &[(taffy::NodeId, R
         css::merge_paint(entry, &spec.paint);
     }
     size_flex_items_by_content(tree, specs);
+    // AETHERCAPTIONSIDECSS (SR462): a caption whose cascaded, inherited caption-side is bottom goes after the rows.
+    caption_side_order(tree);
     // Static-position fallback: `position:absolute` with no inset specified
     // keeps its in-flow (static) position in real CSS. Taffy would pin such
     // a box to the parent origin, smearing it over siblings (the wikipedia
@@ -1479,7 +1858,8 @@ fn prepass<H: Host, F: Fonts + ?Sized>(tree: &mut LayoutTree<H>, fonts: &F) -> P
     ) {
         let mut size = inherited.clone();
         if let Some(ta) = tree.paint_map.get(&node_id).and_then(|p| p.text_align) {
-            size.text_align = ta;
+            // AETHERCENTERLAYOUT (SR421): the inline formatter sees -webkit-center / -webkit-right as center / right.
+            size.text_align = match ta { 5 => 1, 6 => 2, a => a };
         }
         if let Some(dom_node) = tree.node_map.get(&node_id) {
             if let Some(tag) = dom_node.tag() {
@@ -1551,10 +1931,10 @@ fn prepass<H: Host, F: Fonts + ?Sized>(tree: &mut LayoutTree<H>, fonts: &F) -> P
                     };
                     out.media.insert(node_id, (w, h, ratio));
                 }
-                if let Some(wh) = control_intrinsic::<H, F>(dom_node, fonts) {
+                if let Some(wh) = control_intrinsic::<H, F>(dom_node, fonts, (if paint.and_then(|p| p.family).is_some() { size.family } else { 0 }, size.font_size)) {
                     out.imgs.insert(node_id, wh);
                 }
-                if tag == "img" {
+                if tag == "img" || is_image_input(dom_node) { // AETHERIMAGEINPUTFETCH (SR461): an image input sizes as an img
                     // width/height attributes win; else intrinsic dimensions.
                     let intrinsic = H::img_intrinsic(dom_node);
                     let w = attr_px("width").or(intrinsic.map(|(w, _)| w));
@@ -2463,7 +2843,7 @@ impl TextRun {
 /// same line breaker the painter uses.
 fn measure_text_run<F: Fonts + ?Sized>(run: &TextRun, max_width: f32, fonts: &F) -> (f32, f32) {
     if !fonts.has_face(run.sel()) {
-        return (max_width, run.font_size * 1.25);
+        return (0.0, run.font_size * 1.25); // AETHERHEADERBAND (SR412): 0 wide, as the IFC lays it and the painter draws it; never the available width
     }
     let mut mode = run.mode;
     if run.nowrap && mode.white_space == 0 {
@@ -2566,9 +2946,12 @@ fn lpa_vp(v: LengthPercentageAuto, basis: f32) -> LengthPercentageAuto {
 /// `width` / `height` / `min-*` / `max-*` (and `fit-content(%)`) resolve against the viewport too — rewritten as
 /// lengths of the viewport axis in the same step. The original values are kept in `saved` and restored by
 /// [`passes`]. True when a style changed (the caller lays out again).
+/// AETHERABSCB (SR431): an absolutely positioned box whose nearest positioned ancestor is not its parent (CSS 2.2
+/// §10.1.4) takes the same rewrite against that ancestor's padding box, or the initial containing block
+/// ([`abs_containing_block`]); one whose parent is its containing block is left to taffy.
 fn fixed_viewport<H: Host>(tree: &mut LayoutTree<H>, saved: &mut Vec<FixedSaved>) -> bool {
     let (vw, vh) = tree.viewport;
-    let mut ids: Vec<taffy::NodeId> = tree.paint_map.iter().filter(|(_, p)| p.position_kind == Some(3)).map(|(id, _)| *id).collect();
+    let mut ids: Vec<taffy::NodeId> = tree.paint_map.iter().filter(|(_, p)| matches!(p.position_kind, Some(2 | 3))).map(|(id, _)| *id).collect();
     ids.sort_by_key(|id| u64::from(*id));
     let mut changed = false;
     for id in ids {
@@ -2579,6 +2962,17 @@ fn fixed_viewport<H: Host>(tree: &mut LayoutTree<H>, saved: &mut Vec<FixedSaved>
         let Some(spec) = specified(tree, id, saved) else { continue };
         let orig = spec.inset;
         let Some(parent) = tree.taffy.parent(id) else { continue };
+        // AETHERABSCB (SR431): the containing-block rectangle — the viewport for a fixed box, else the nearest
+        // positioned ancestor's padding box (None: the parent is it, taffy's own place stands).
+        let fixed = tree.paint_map.get(&id).and_then(|p| p.position_kind) == Some(3);
+        let (cx, cy, cw, ch) = if fixed {
+            (0.0, 0.0, vw, vh)
+        } else {
+            match abs_containing_block(tree, parent) {
+                Some(r) => r,
+                None => continue,
+            }
+        };
         let Ok(pl) = tree.taffy.layout(parent).cloned() else { continue };
         let (px, py) = chain_origin(tree, parent);
         let (ax, ay) = (px + pl.border.left, py + pl.border.top);
@@ -2589,14 +2983,14 @@ fn fixed_viewport<H: Host>(tree: &mut LayoutTree<H>, saved: &mut Vec<FixedSaved>
             None => v,
         };
         let want = taffy::geometry::Rect {
-            left: side(orig.left, vw, ax),
-            right: side(orig.right, vw, vw - (ax + aw)),
-            top: side(orig.top, vh, ay),
-            bottom: side(orig.bottom, vh, vh - (ay + ah)),
+            left: side(orig.left, cw, ax - cx),
+            right: side(orig.right, cw, (cx + cw) - (ax + aw)),
+            top: side(orig.top, ch, ay - cy),
+            bottom: side(orig.bottom, ch, (cy + ch) - (ay + ah)),
         };
-        let size = taffy::geometry::Size { width: dim_vp(spec.size.width, vw), height: dim_vp(spec.size.height, vh) };
-        let min = taffy::geometry::Size { width: lpa_vp(spec.min.width, vw), height: lpa_vp(spec.min.height, vh) };
-        let max = taffy::geometry::Size { width: lpa_vp(spec.max.width, vw), height: lpa_vp(spec.max.height, vh) };
+        let size = taffy::geometry::Size { width: dim_vp(spec.size.width, cw), height: dim_vp(spec.size.height, ch) };
+        let min = taffy::geometry::Size { width: lpa_vp(spec.min.width, cw), height: lpa_vp(spec.min.height, ch) };
+        let max = taffy::geometry::Size { width: lpa_vp(spec.max.width, cw), height: lpa_vp(spec.max.height, ch) };
         if st.inset == want && st.size == size && st.min_size == min && st.max_size == max {
             continue;
         }
@@ -2633,4 +3027,33 @@ fn record_fixed<H: Host>(tree: &mut LayoutTree<H>, saved: &[FixedSaved]) {
             tree.fixed_at.insert(id, (fx, fy));
         }
     }
+}
+
+// ---- AETHERABSCB (SR431): the containing block of an absolutely positioned box ---------------------------------
+
+/// CSS 2.2 §10.1.4: the containing block of a `position: absolute` box is the padding box of its nearest ancestor
+/// whose `position` is not `static`, else the initial containing block (the viewport rectangle at the canvas
+/// origin). Every box's taffy style is `Relative` ([`base_style`]), so the specified kind is read from
+/// `PaintStyle::position_kind` (1 relative, 2 absolute, 3 fixed, 4 sticky) up the taffy parent chain from
+/// `parent` (anonymous boxes carry none and are skipped). Returns that rectangle in document space, as
+/// [`fixed_viewport`] measures its parent's area; None when `parent` itself is positioned (taffy already lays the
+/// box against it).
+fn abs_containing_block<H: Host>(tree: &LayoutTree<H>, parent: taffy::NodeId) -> Option<(f32, f32, f32, f32)> {
+    let positioned = |n: taffy::NodeId| matches!(tree.paint_map.get(&n).and_then(|p| p.position_kind), Some(1..=4));
+    if positioned(parent) {
+        return None;
+    }
+    let mut cur = tree.taffy.parent(parent);
+    while let Some(n) = cur {
+        if positioned(n) {
+            let l = tree.taffy.layout(n).ok()?;
+            let (x, y) = chain_origin(tree, n);
+            let w = l.size.width - l.border.left - l.border.right - l.scrollbar_size.width;
+            let h = l.size.height - l.border.top - l.border.bottom - l.scrollbar_size.height;
+            return Some((x + l.border.left, y + l.border.top, w, h));
+        }
+        cur = tree.taffy.parent(n);
+    }
+    let (vw, vh) = tree.viewport;
+    Some((0.0, 0.0, vw, vh))
 }

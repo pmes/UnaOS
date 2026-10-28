@@ -89,3 +89,10 @@ pub fn dispatch(key: &str, origin: &str, op: &str) -> J {
         _ => J::Null,
     }
 }
+
+/// AETHER-TESTROOT (LEDGER SR355): closes the bucket-mode store (it reopens under the current
+/// `storage::root_dir` on next use) — `storage::test_root::TestRoot` on acquire and drop.
+#[cfg(test)]
+pub(crate) fn reset_for_test() {
+    *modes().lock().unwrap_or_else(|e| e.into_inner()) = None;
+}

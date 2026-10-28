@@ -14,8 +14,8 @@
 // You should have received a copy of the GNU Lesser General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-//! INFERCORE (LEDGER SR57): the inference UnaOS does itself — `no_std` + `alloc`, no
-//! dependencies, no `unsafe`.
+//! INFERCORE (LEDGER SR57): the inference UnaOS does itself — `no_std` + `alloc`, libm
+//! its one dependency, no `unsafe`.
 //!
 //! - [`safetensors`] — the safetensors container (8-byte header length, JSON header, raw
 //!   little-endian tensors), F32 / F16 / BF16 → f32 (other dtypes are listed, not converted).
@@ -29,7 +29,7 @@
 //!   exact per-sequence masking, erf GELU, LayerNorm), mean pooling + L2 normalisation as
 //!   sentence-transformers does, over a packed batch; [`matmul`] is its cache-blocked f32 kernel
 //!   (f32 or f16 weights).
-//! - [`math`] — exp / erf / sqrt of our own, so results do not depend on the platform's libm.
+//! - [`math`] — exp / erf / sqrt from the libm crate (MATH-ONE): the same software on every target.
 //!
 //! **Reproducibility.** Every reduction runs in a fixed, documented order (see [`matmul`] and
 //! [`bert`]); Rust never contracts `a * b + c` into an FMA; the transcendental functions are ours.

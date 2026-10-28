@@ -5,14 +5,26 @@
 # abimage anywhere) run after the light tier's summary — or on a boot after the first-user boot when /boot/TESTS.HEAVY
 # says `boot2`. Edit this file (or the card's copy) to change the list; no rebuild.
 # Flight 37's list (docs/dev/evidence/rmbp-0915/flight37/FLIGHT37.md §4, §7), in the order the bench typed it.
-kgr
+# ZENBOOKFLIGHTLIST (zenbook-ledger Z33): the Zenbook's own verbs, `@zenbook` only (boot::oldest().0; rmbp12, pi4 and orin count them other=), FIRST so a generic overrun cannot hide them; esp-zenbook stages this file (it re-enters esp-x86's one bootlist_stage). eclid is NOT here: it is interactive (close/open the lid), typed on the lane only.
+# FLIGHTLISTBOARDTAGS (zenbook-ledger Z37): a fixture is tagged `@rmbp12` only when every other board SKIPs or FAILs it for lack of the rMBP's hardware (kgr, gen7, wifi, smartline, pointerfeel, a2dp); a fixture that runs on two boards stays untagged; nothing deleted. A verb a board never registers counts skip= there (`tests: no such fixture`). Counts: rmbp12 light=68 heavy=2 other=12; zenbook light=72 heavy=2 other=8; pi4 and orin light=62 heavy=4 other=16.
+platform @zenbook
+ec @zenbook
+ecbattery @zenbook
+nvme @zenbook
+i8042 @zenbook
+dwi2c @zenbook
+dwi2ctp @zenbook
+dma @zenbook
+hdacensus @zenbook
+gopshot @zenbook
+kgr @rmbp12 # NVIDIA Kepler GR (GK107)
 gatesteal2
 unafslock
 hidstall
 fpu
 clock
-gen7
-wifi
+gen7 @rmbp12 # Intel Ivy Bridge HD 4000
+wifi @rmbp12 # Broadcom BCM4331 (the MT7925 has its own verbs)
 startscene
 contrast
 winkey
@@ -39,7 +51,7 @@ kelfhash
 appfault
 tzlocale
 keymaps
-smartline
+smartline @rmbp12 # the AHCI SATA SSD
 notelemetry
 focussteal
 veilcost
@@ -71,8 +83,9 @@ quarryhover
 motion
 stackroom
 lockreg
-pointerfeel
-a2dp
+pointerfeel @rmbp12 # the bcm5974 trackpad on EHCI
+a2dp @rmbp12 # Broadcom BT + A2DP
+unafs # UNAFSFLIGHTLIST (rmbp-ledger B1063): UNAFSX86-T with B1058's bind_now KAT in its verdict; untagged (every flight line arms `unafs` on a native card root); LAST light line: it force-remounts the root, so an overrun hides no other fixture
 HEAVY:
 # The card-heavy fixtures (FLIGHT37 §4): NAMEINDEXTX held MOUNT+CARD 5 min, ABIMAGE copied 2 x 21.8 MB in 9 min.
 nameindextx @600

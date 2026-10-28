@@ -124,3 +124,52 @@ pub fn pbkdf2_kat_ok() -> bool {
     }
     ok
 }
+
+/// FWSTAGEONE (rmbp-ledger B984) — the ONE firmware pins reader. A `.pins` table (`unaos/firmware/*.pins`, compiled in by
+/// each driver with `include_str!`) holds rows `<name> <64 hex>`; `#` lines and blanks are ignored; a malformed row is
+/// skipped. The b43 (wifi/firmware.rs), Kepler ctxsw (drivers/gpu/kepler_ucode.rs) and MT7925 (drivers/mt7925.rs) gates all
+/// read their digests here (FWPIN B455's grammar); arroyo's `fw_stage_pinned` prints the rows they pin.
+pub mod pins {
+    /// A pinned SHA-256.
+    pub type Pin = [u8; 32];
+
+    fn nib(c: u8) -> Option<u8> {
+        match c {
+            b'0'..=b'9' => Some(c - b'0'),
+            b'a'..=b'f' => Some(c - b'a' + 10),
+            b'A'..=b'F' => Some(c - b'A' + 10),
+            _ => None,
+        }
+    }
+
+    /// The pinned SHA-256 for `name` in `table`, or `None` (no row, or a malformed one — both refuse as `unpinned`).
+    pub fn pin_for(table: &str, name: &str) -> Option<Pin> {
+        for line in table.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let mut it = line.split_whitespace();
+            let (Some(r), Some(h), None) = (it.next(), it.next(), it.next()) else { continue };
+            if r != name || h.len() != 64 {
+                continue;
+            }
+            let b = h.as_bytes();
+            let mut out = [0u8; 32];
+            let mut ok = true;
+            for i in 0..32 {
+                match (nib(b[2 * i]), nib(b[2 * i + 1])) {
+                    (Some(hi), Some(lo)) => out[i] = (hi << 4) | lo,
+                    _ => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if ok {
+                return Some(out);
+            }
+        }
+        None
+    }
+}

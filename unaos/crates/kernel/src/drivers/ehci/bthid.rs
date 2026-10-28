@@ -1783,6 +1783,12 @@ impl LedSlot {
 }
 static PENDING_LED: LedSlot = LedSlot(crate::sync::Mutex::new(None));
 
+/// HIDBOOTLEDS (rmbp-ledger B987): the Bluetooth arm of `hidboot::Transport::set_leds` — the decoder's
+/// LED change parked in [`PENDING_LED`] (moved here from `kbd_report`), sent by the pass's existing drain.
+pub(crate) fn queue_led(leds: u8) {
+    PENDING_LED.with(|v| *v = Some(leds));
+}
+
 fn ptr_deliver(l: &mut Link, buttons: u8, x: i32, y: i32, relative: bool, wheel: i8) {
     let changed = buttons != l.prev_btn;
     l.prev_btn = buttons;
@@ -1811,10 +1817,7 @@ fn kbd_report(l: &mut Link, body8: &[u8], _rid: u8) {
             }
         }
     }
-    let led = unsafe { decode_boot_keyboard(&r, &mut l.kprev, &mut l.kmods, &mut l.kleds) };
-    if led {
-        PENDING_LED.with(|v| *v = Some(l.kleds));
-    }
+    let _ = unsafe { decode_boot_keyboard(crate::drivers::hidboot::Transport::Bluetooth, &r, &mut l.kprev, &mut l.kmods, &mut l.kleds) }; // HIDBOOTLEDS (B987): an LED change is queued by the decoder's `Transport::set_leds`
 }
 
 // ── Pure parsers (driven by `tests bt` with no radio) ────────────────────────────────────────────
@@ -2483,8 +2486,7 @@ fn store_write(dir: &str, b: &Bond) {
     }
     let p = format!("{}/{}", dir, addr12(&b.addr));
     let line = format!("addr={} class={:#08x} kind={} name={} keytype={:#04x}\n", fmt_addr(&b.addr), b.cod, cod_kind(b.cod), b.name, b.ktype);
-    let _ = mt.unlink(&p, K);
-    let file = mt.create(&p, NodeKind::File, K).and_then(|_| mt.write(&p, 0, line.as_bytes(), K));
+    let file = mt.put_file(&p, line.as_bytes(), K); // VFSPUTSWEEP (B983)
     if let Err(e) = file {
         serial_println!(":: BTHID: store {} create/write REFUSED ({:?}) — the key is held in RAM for this session ::", p, e);
         return;

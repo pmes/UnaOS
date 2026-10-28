@@ -16,7 +16,11 @@
 //! 4. `SecretGet` answers `NOT_FOUND` when no such file exists (locked or not — existence is not
 //!    secret from the owner, and it is the one answer a consumer may fall back on), `LOCKED` when it
 //!    exists and the key is not in memory;
-//! 5. every mutation (`SecretPut`, `SecretDelete`) and `Sign` needs the ring unlocked.
+//! 5. every mutation (`SecretPut`, `SecretDelete`) and `Sign` needs the ring unlocked;
+//! 6. PDF-KEYSTORE (SR382): a secret in ns [`SIGN_NS`] is a key file of kind [`KIND_PKCS8`], parsed by tls_core's key
+//!    parser before it is sealed (feature `pkcs8`; without it such a put is `INVALID`: never stored unparsed), and
+//!    Sign's long form signs with it inside this service — only the signature leaves; a refused long form names its
+//!    reason (KEYSIGNONE SR393: `WRONG_KIND`, `BAD_DIGEST_LEN`, `UNSUPPORTED_SCHEME`; `INVALID` the catch-all).
 
 use crate::format::{self, Meta};
 use crate::name;
@@ -31,6 +35,11 @@ use alloc::vec::Vec;
 pub const SSH_NS: &str = "ssh";
 /// The `kind` of an Ed25519 key secret (the plaintext is the 32-byte RFC 8032 seed).
 pub const KIND_ED25519: &str = "ssh-ed25519";
+/// PDF-KEYSTORE (SR382): the namespace signing key files live in.
+pub const SIGN_NS: &str = "sign";
+/// PDF-KEYSTORE (SR382): the `kind` of a signing key file (a key file tls_core's `key::parse` reads; PKCS#8 DER by
+/// convention).
+pub const KIND_PKCS8: &str = "pkcs8";
 
 /// A storage failure (the store's own detail stays in the store's log).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -404,6 +413,19 @@ impl<S: Sealer, G: Signer, T: Store, E: Entropy> Holocron<S, G, T, E> {
                 }
             }
             Request::Sign { key, data } => self.sign(key, data).map(|s| s.to_vec()),
+            Request::SignWith { ns, key, alg, data } => {
+                check_names(ns, key)?;
+                self.need_unlocked()?;
+                if ns == SSH_NS && *alg == wire::sign_alg::NONE {
+                    self.sign(key, data).map(|s| wire::encode_sign(wire::key_kind::ED25519, &s))
+                } else if ns == SIGN_NS {
+                    self.sign_key(key, *alg, data)
+                } else if ns == SSH_NS {
+                    Err(status::WRONG_KIND) // KEYSIGNONE (SR393): the ssh keys are Ed25519, pure over the message
+                } else {
+                    Err(status::INVALID)
+                }
+            }
         }
     }
 
@@ -552,6 +574,12 @@ impl<S: Sealer, G: Signer, T: Store, E: Entropy> Holocron<S, G, T, E> {
         if is_key_ns != (kind == KIND_ED25519) {
             return Err(status::INVALID);
         }
+        if (ns == SIGN_NS) != (kind == KIND_PKCS8) {
+            return Err(status::INVALID);
+        }
+        if ns == SIGN_NS {
+            check_key(data)?;
+        }
         let mut seed = [0u8; 32];
         let plaintext: &[u8] = if is_key_ns {
             match data.len() {
@@ -615,6 +643,22 @@ impl<S: Sealer, G: Signer, T: Store, E: Entropy> Holocron<S, G, T, E> {
         Ok(sig)
     }
 
+    /// PDF-KEYSTORE (SR382): Sign's long form with the key file `sign/<key>` — opened, parsed and used here; the
+    /// plaintext wiped before the answer.
+    #[cfg(feature = "pkcs8")]
+    fn sign_key(&mut self, key: &str, alg: u8, tbs: &[u8]) -> Result<Vec<u8>, i32> {
+        let (meta, mut pt) = self.get(SIGN_NS, key)?;
+        let r = if meta.kind == KIND_PKCS8 { crate::pkcs8::sign(&pt, alg, tbs, &mut self.rng) } else { Err(status::CORRUPT) };
+        crate::zero::wipe(&mut pt);
+        r
+    }
+
+    /// PDF-KEYSTORE (SR382): without feature `pkcs8` this service holds no signing key files.
+    #[cfg(not(feature = "pkcs8"))]
+    fn sign_key(&mut self, _key: &str, _alg: u8, _tbs: &[u8]) -> Result<Vec<u8>, i32> {
+        Err(status::INVALID)
+    }
+
     /// The SSH identities in `ssh/` (owner only; empty while locked, as ssh-agent answers when locked).
     pub fn identities(&mut self, caller: Option<&str>) -> Result<Vec<Identity>, i32> {
         self.authorise(caller)?;
@@ -653,6 +697,19 @@ impl<S: Sealer, G: Signer, T: Store, E: Entropy> Holocron<S, G, T, E> {
     pub fn signer_is_real(&self) -> bool {
         G::REAL
     }
+}
+
+/// PDF-KEYSTORE (SR382): a signing key file must parse before it is sealed (tls_core's refusal by name stays here: the
+/// wire answers `INVALID`).
+#[cfg(feature = "pkcs8")]
+fn check_key(data: &[u8]) -> Result<(), i32> {
+    crate::pkcs8::check(data).map(|_| ()).map_err(|_| status::INVALID)
+}
+
+/// PDF-KEYSTORE (SR382): without feature `pkcs8` a key file cannot be checked, so it is never stored.
+#[cfg(not(feature = "pkcs8"))]
+fn check_key(_data: &[u8]) -> Result<(), i32> {
+    Err(status::INVALID)
 }
 
 fn check_names(ns: &str, name_: &str) -> Result<(), i32> {

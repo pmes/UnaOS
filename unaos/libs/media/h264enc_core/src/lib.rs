@@ -6,15 +6,23 @@
 //!
 //! CHARTER: Stria (A/V) — seam `shared-core` (a `no_std` lib both rings link, beside h264_core).
 //!
-//! What it writes: Constrained Baseline (profile_idc 66, constraint_set0/1), CAVLC, frames only,
-//! one slice per picture, constant QP (16..=40). An IDR every `gop` frames, P frames between them
+//! What it writes: Constrained Baseline (profile_idc 66, constraint_set0/1), CAVLC, or Main
+//! (profile_idc 77, constraint_set1) with CABAC ([`Config::entropy`], H264ENCCABAC SR310), frames only,
+//! one slice per picture, constant QP (16..=40) or rate-controlled ([`Config::rate`], H264ENCRC SR218). An IDR every `gop` frames, P frames between them
 //! against the previous reconstruction (one reference frame). Macroblocks: Intra_4x4 and
 //! Intra_16x16 (the SAD-cheapest mode of each, chroma likewise) in I slices; P_Skip and
 //! P_L0_16x16 by an integer-sample full search in a +-8 window in P slices, optionally refined to
 //! half / quarter samples (H264ENC2, SR211). With [`Config::deblock`] the slices carry
 //! disable_deblocking_filter_idc 0 and the reconstruction passes h264_core's in-loop filter
 //! before it becomes the reference (else idc 1, unfiltered). Output as Annex B byte stream or as
-//! avcC samples with the AVCDecoderConfigurationRecord ([`Encoder::avcc`]).
+//! avcC samples with the AVCDecoderConfigurationRecord ([`Encoder::avcc`]). With [`Config::bframes`]
+//! (H264ENCBFRAMES SR333) up to 4 B pictures sit between anchors: Main profile, POC type 0, two
+//! reference frames (L0 the past anchor, L1 the future one), B_Skip / B_Direct_16x16 (spatial direct) /
+//! B_L0 / B_L1 / B_Bi_16x16, coded in decoding order through [`Encoder::push`] / [`Encoder::flush`].
+//! H264ENCPYRAMID (SR349): with bframes >= 2 the middle B of each group is coded first as a reference (the B pyramid:
+//! three reference frames, the outer Bs predicting from it by the default POC lists, VUI reorder 2 at bframes >= 3),
+//! [`Config::direct_temporal`] writes temporal direct where it is decodable, and [`Config::bipred`] picks the
+//! bi-prediction weights (implicit by default under the pyramid, or an explicit offset table).
 //!
 //! | [`Config`] field | range         | default | effect                                                  |
 //! |------------------|---------------|---------|---------------------------------------------------------|
@@ -23,17 +31,27 @@
 //! | `gop`            | >= 1          | (set)   | an IDR every `gop` frames                               |
 //! | `deblock`        | bool          | false   | idc 0 + h264_core's `deblock_picture` over the recon    |
 //! | `subpel`         | 0 / 1 / 2     | 0       | motion refinement: integer / half / quarter (>2 = 2)    |
+//! | `rate`           | `Option<RateControl>` | None | CBR / VBR: `qp` starts, [`rc`] picks each picture's and row's QP; CRF: constant quality (SR383) |
+//! | `entropy`        | [`Entropy`]   | Cavlc   | Cabac: Main profile, entropy_coding_mode_flag 1, [`cabac`] writes the slice data |
+//! | `transform8x8`   | bool          | false   | High (profile_idc 100), transform_8x8_mode_flag: Intra_8x8 in I macroblocks (SR322) |
+//! | `bframes`        | 0..=4         | 0       | B pictures between anchors (SR333): push / flush, VUI reorder 1 (>4 = 4); >= 2 the pyramid (SR349) |
+//! | `direct_temporal`| bool          | false   | temporal direct on the Bs whose L1[0] is an anchor (SR349)          |
+//! | `bipred`         | [`BiPred`]    | Auto    | weighted_bipred_idc: Auto = implicit under the pyramid, else the average (SR349) |
+//! | `colour`         | `Option<(u8, u8, u8, bool)>` | None | VUI video_signal_type + colour_description: primaries, transfer, matrix, full range (SR377) |
+//! | `qp_min`         | `Option<u8>`, 16..=51 | None | the floor of every rate-controlled QP; None = `rc::QP_MIN` 16 (SR383) |
 //!
 //! | module          | Recommendation                                                          |
 //! |-----------------|-------------------------------------------------------------------------|
 //! | [`nal`]         | 7.2 RBSP writing, 9.1 ue / se, 7.3.1 NAL units, emulation prevention, avcC |
 //! | [`sps`]         | 7.3.2.1 SPS (+ VUI E.1.1), 7.3.2.2 PPS, 7.3.3 slice header                |
-//! | [`transform`]   | 8.5 forward: 4x4 core transform, DC Hadamards, quantiser                 |
+//! | [`transform`]   | 8.5 forward: 4x4 / 8x8 core transforms, DC Hadamards, quantisers, SATD   |
 //! | [`intra`]       | 8.3 mode decision over h264_core's predictors, 8.3.1.1 mode coding       |
 //! | [`cavlc`]       | 9.2 residual_block_cavlc written, 9.2.1 nC                               |
+//! | [`cabac`]       | 9.3.4 the arithmetic encoder, 9.3.2 binarizations, 9.3.3.1 ctxIdxInc      |
 //! | [`me`]          | 8.4.1 MV prediction and P_Skip, integer search + sub-sample refinement   |
 //! | [`yuv`]         | RGBA -> I420 input, BT.601 limited range (Rec. ITU-R BT.601), NLE5B      |
 //! | [`deblock`]     | 8.7 the facts h264_core's deblocking filter reads, recorded per MB       |
+//! | [`rc`]          | rate control: picture QP (slice_qp_delta), row QP (7.4.5 mb_qp_delta)   |
 //!
 //! Shared, never copied: h264_core's `transform` (`LevelScale`, `scale4`, `luma_dc`, `chroma_dc`,
 //! `idct4_add`) is the encoder's reconstruction; its `intra` (`pred_nxn`, `pred_16x16`,
@@ -46,9 +64,9 @@
 //! nC, mvp) are decoder-private methods there, so they are mirrored here for one slice per
 //! picture; making them shared free fns is owed (H264ENC-NBSHARE).
 //!
-//! Owed (handlers.md §5): rate control (H264ENC-RC), CABAC / Main / High (H264ENC-CABAC), the
+//! Owed (handlers.md §5): two-pass / scene cuts / activity masking (inside H264ENC-RC), scaling matrices (inside H264ENC-CABAC; High's 8x8 transform is SR322's), the
 //! 16x8 / 8x16 / 8x8 partitions (inside H264ENC-SUBPEL), per-slice filter offsets (inside
-//! H264ENC-DEBLOCK), B-frames (H264ENC-BFRAMES), hardware encode (H264ENC-HW).
+//! H264ENC-DEBLOCK), intra / partitioned B macroblocks and adaptive B placement (inside H264ENC-BFRAMES), hardware encode (H264ENC-HW).
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -56,14 +74,16 @@
 
 extern crate alloc;
 
+pub mod cabac;
 pub mod cavlc;
 pub mod deblock;
 pub mod intra;
 pub mod me;
 pub mod nal;
+pub mod rc;
 pub mod sps;
 pub mod transform;
-pub mod yuv;
+pub mod yuv; pub mod rgba; // NLE6EXPORT (rmbp-ledger B959): the RGBA face both editor exports drive (rgba.rs)
 
 use alloc::boxed::Box;
 use alloc::vec;
@@ -71,25 +91,32 @@ use alloc::vec::Vec;
 
 use h264_core::picture::{MbInfo, Motion, Plane, BLK_X, BLK_Y};
 use h264_core::ps::ScalingMatrices;
-use h264_core::tables::{CBP_INTER, CBP_INTRA, QPC, ZIGZAG4};
+use h264_core::tables::{CBP_INTER, CBP_INTRA, QPC, ZIGZAG4, ZIGZAG8};
 use h264_core::transform::LevelScale;
 
 use crate::cavlc::Nnz;
 use crate::me::MbMotion;
 use crate::nal::BitWriter;
-use crate::sps::SeqParams;
+pub use crate::rc::{RateControl, RcMode};
+use crate::sps::{SeqParams, SliceExtra};
 
 /// Every way the encoder refuses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
     /// Width or height zero, odd (4:2:0 cropping is in units of 2) or above 16384.
     Geometry,
+    /// [`Encoder::encode`] under [`Config::bframes`] above 0: a reordered stream is coded through
+    /// [`Encoder::push`] / [`Encoder::flush`] (SR333).
+    Reorder,
     /// QP outside 16..=40.
     Qp,
     /// A GOP length of 0.
     Gop,
     /// A frame whose size or planes do not match the configuration.
     FrameSize,
+    /// A rate control with a zero bit rate or frame rate, a VBR max below its mean, a CRF above 51 or a QP floor
+    /// ([`Config::qp_min`]) outside 16..=51.
+    Rate,
 }
 
 impl core::fmt::Display for Error {
@@ -99,6 +126,8 @@ impl core::fmt::Display for Error {
             Error::Qp => "h264enc: QP outside 16..=40",
             Error::Gop => "h264enc: GOP length 0",
             Error::FrameSize => "h264enc: frame does not match the configured size",
+            Error::Rate => "h264enc: rate control with a zero bit rate / frame rate, a VBR max below its mean, a CRF above 51 or a QP floor outside 16..=51",
+            Error::Reorder => "h264enc: B pictures are reordered: code through push / flush, not encode",
         })
     }
 }
@@ -121,6 +150,87 @@ pub struct Config {
     /// Motion refinement after the integer search: 0 integer, 1 half, 2 quarter samples (above 2
     /// is read as 2).
     pub subpel: u8,
+    /// Rate control (H264ENCRC, SR218): None codes every macroblock at `qp`; Some starts at `qp`
+    /// and [`rc`] chooses each picture's QP from the bit budget and each macroblock row's from the
+    /// running bit count.
+    pub rate: Option<RateControl>,
+    /// The entropy coder (H264ENCCABAC, SR310): Cavlc (Constrained Baseline, SR197's bytes) or
+    /// Cabac (Main profile).
+    pub entropy: Entropy,
+    /// The 8x8 transform (H264ENC8X8, SR322): High profile (profile_idc 100) with
+    /// transform_8x8_mode_flag 1 under either entropy coder; I macroblocks may take Intra_8x8 (chosen
+    /// against Intra_4x4 by SATD). P macroblocks keep the 4x4 transform (transform_size_8x8_flag 0;
+    /// their 8x8 choice by real bits is owed). false keeps every pinned byte.
+    pub transform8x8: bool,
+    /// B pictures between anchors (H264ENCBFRAMES, SR333): 0 keeps every pinned byte (and [`Encoder::encode`]);
+    /// 1..=4 (above 4 read as 4) codes Main profile with POC type 0 through [`Encoder::push`] / [`Encoder::flush`].
+    pub bframes: u8,
+    /// Temporal direct (H264ENCPYRAMID, SR349): direct_spatial_mv_pred_flag 0 on the B pictures whose L1[0] is an anchor
+    /// (SR333's Bs and the pyramid's middle); the pyramid's outer Bs keep spatial direct. false keeps every pinned byte.
+    pub direct_temporal: bool,
+    /// The bi-prediction weights of B slices (SR349): see [`BiPred`].
+    pub bipred: BiPred,
+    /// H264ENCCOLOURHOST (LEDGER SR377): the stream's colour as H.273 code points (colour_primaries, transfer_characteristics,
+    /// matrix_coefficients, video_full_range_flag), written as the SPS VUI's video_signal_type with its colour_description; the
+    /// exports pass the file's one colour (the same the MP4 `colr` states). None keeps every pinned byte.
+    pub colour: Option<(u8, u8, u8, bool)>,
+    /// H264ENCVBRCRF (LEDGER SR383): the floor of every rate-controlled picture and row QP, 16..=51 (else [`Error::Rate`]);
+    /// None = [`rc::QP_MIN`] (16). Read through [`Config::qp_floor`]; unread without [`Config::rate`].
+    pub qp_min: Option<u8>,
+}
+
+/// weighted_bipred_idc of the stream (H264ENCPYRAMID, SR349); without `bframes` always 0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BiPred {
+    /// Implicit under the pyramid (bframes >= 2), the default average otherwise.
+    #[default]
+    Auto,
+    /// weighted_bipred_idc 0: `(a + b + 1) >> 1`.
+    Average,
+    /// weighted_bipred_idc 2: POC-distance weights (8.4.2.3.1).
+    Implicit,
+    /// weighted_bipred_idc 1: a pred_weight_table per B slice, the luma offsets from the mean-luma difference to each reference.
+    Explicit,
+}
+
+/// The pyramid role of the picture being coded (SR349): an anchor or SR333's B (Plain), the middle B (Ref), an outer B.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Tier {
+    Plain,
+    Ref,
+    Outer,
+}
+
+/// The weights of the B picture being coded (SR349), per component: logWD, w and o per list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BWeights {
+    /// Explicit weights apply to single-list predictions too; implicit ones only to bi-predicted blocks.
+    pub explicit: bool,
+    pub log_wd: [i32; 3],
+    pub w: [[i32; 2]; 3],
+    pub o: [[i32; 2]; 3],
+}
+
+/// The coding type of one picture: an IDR (I slice), a P anchor, or a non-reference B picture (SR333).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pic {
+    Idr,
+    P,
+    B,
+}
+
+/// SliceQPY of a B picture above its picture QP under constant QP (SR333): slice_qp_delta 2.
+pub const B_QP_OFFSET: i32 = 2;
+
+/// SliceQPY of the pyramid's reference B above its picture QP under constant QP (SR349).
+pub const B_REF_QP_OFFSET: i32 = 1;
+
+/// entropy_coding_mode_flag (7.4.2.2): CAVLC (9.2) or CABAC (9.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Entropy {
+    #[default]
+    Cavlc,
+    Cabac,
 }
 
 /// One 8-bit 4:2:0 planar input frame, borrowed: the field names of gneiss_pal's
@@ -143,6 +253,11 @@ pub struct Access {
     /// An IDR picture (the container's sync sample).
     pub keyframe: bool,
     pub nals: Vec<Vec<u8>>,
+    /// Presentation time in frames (SR333): the frame index, or under [`Config::bframes`] the display
+    /// index + the VUI reorder depth (1, or 2 under a pyramid of bframes >= 3, SR349), so `dts <= pts`.
+    pub pts: u64,
+    /// Decoding time in frames: the access unit's index in decoding order.
+    pub dts: u64,
 }
 
 impl Access {
@@ -172,6 +287,9 @@ impl Access {
 /// Intra_16x16's by more than this many bits' worth ([`lambda`]) — the 16 mode fields it spends.
 pub const I4_BIAS: u32 = 24;
 
+/// The intra 8x8 penalty in bits (SR322): the 4 mode fields Intra_8x8 spends, at [`I4_BIAS`]'s rate.
+pub const I8_BIAS: u32 = 6;
+
 /// The SAD cost of one bit at QP `qp`: about 2^((qp - 12) / 6), the growth of the quantiser step.
 pub fn lambda(qp: i32) -> u32 {
     1 << ((qp - 12).max(0) / 6)
@@ -184,18 +302,41 @@ pub(crate) enum Kind {
     I16,
     PSkip,
     P16,
+    /// B pictures (SR333): B_Skip, B_Direct_16x16 (spatial direct), B_L0_16x16, B_L1_16x16, B_Bi_16x16.
+    BSkip,
+    BDirect,
+    BL0,
+    BL1,
+    BBi,
+}
+
+impl Kind {
+    /// An inter macroblock with mb_type and residual syntax (not skipped, not intra).
+    pub(crate) fn inter_coded(self) -> bool {
+        matches!(self, Kind::P16 | Kind::BDirect | Kind::BL0 | Kind::BL1 | Kind::BBi)
+    }
+    /// Carries mvd_l0.
+    pub(crate) fn l0(self) -> bool {
+        matches!(self, Kind::P16 | Kind::BL0 | Kind::BBi)
+    }
+    /// Carries mvd_l1.
+    pub(crate) fn l1(self) -> bool {
+        matches!(self, Kind::BL1 | Kind::BBi)
+    }
 }
 
 /// The decided syntax of one macroblock: modes, motion and levels (raster within each block, as
 /// h264_core's `mb::Mb` holds them).
 pub(crate) struct MbCode {
     pub kind: Kind,
-    /// Intra4x4PredMode by luma4x4BlkIdx.
+    /// Intra4x4PredMode by luma4x4BlkIdx, or Intra8x8PredMode in [0..4] when `t8x8`.
     pub modes: [u8; 16],
     pub i16_mode: u8,
     pub chroma_mode: u8,
-    /// mvd_l0 of P_L0_16x16 (quarter samples).
+    /// mvd_l0 of P_L0_16x16 / B_L0 / B_Bi (quarter samples).
     pub mvd: [i32; 2],
+    /// mvd_l1 of B_L1_16x16 / B_Bi_16x16 (SR333).
+    pub mvd1: [i32; 2],
     /// CodedBlockPatternLuma | CodedBlockPatternChroma << 4.
     pub cbp: u8,
     /// Intra16x16DCLevel (raster 4x4).
@@ -206,18 +347,24 @@ pub(crate) struct MbCode {
     pub cdc: [[i32; 4]; 2],
     /// ChromaACLevel per iCbCr and chroma4x4BlkIdx (raster, [0] = 0).
     pub cac: [[[i32; 16]; 4]; 2],
+    /// transform_size_8x8_flag (SR322): the luma levels are `luma8` (an I4 kind is then I_NxN coded
+    /// Intra_8x8).
+    pub t8x8: bool,
+    /// The 8x8 luma blocks by luma8x8BlkIdx (raster) when `t8x8`.
+    pub luma8: [[i32; 64]; 4],
 }
 
 impl MbCode {
     pub fn new(kind: Kind) -> MbCode {
-        MbCode { kind, modes: [2; 16], i16_mode: 0, chroma_mode: 0, mvd: [0; 2], cbp: 0, dc: [0; 16], luma: [[0; 16]; 16], cdc: [[0; 4]; 2], cac: [[[0; 16]; 4]; 2] }
+        MbCode { kind, modes: [2; 16], i16_mode: 0, chroma_mode: 0, mvd: [0; 2], mvd1: [0; 2], cbp: 0, dc: [0; 16], luma: [[0; 16]; 16], cdc: [[0; 4]; 2], cac: [[[0; 16]; 4]; 2], t8x8: false, luma8: [[0; 64]; 4] }
     }
 
-    /// CodedBlockPatternLuma for 4x4-coded luma: bit b8 when a block of that 8x8 has a level.
+    /// CodedBlockPatternLuma: bit b8 when a block of that 8x8 (or the 8x8 itself, `t8x8`) has a level.
     pub fn luma_cbp(&self) -> u8 {
         let mut cbp = 0u8;
         for blk in 0..16 {
-            if self.luma[blk].iter().any(|&v| v != 0) {
+            let coded = if self.t8x8 { self.luma8[blk / 4].iter().any(|&v| v != 0) } else { self.luma[blk].iter().any(|&v| v != 0) };
+            if coded {
                 cbp |= 1 << (blk / 4);
             }
         }
@@ -243,9 +390,17 @@ pub struct Encoder {
     pub(crate) cfg: Config,
     pub(crate) mb_w: usize,
     pub(crate) mb_h: usize,
+    /// QPY of the macroblocks being coded (the constant QP without rate control).
     pub(crate) qp: i32,
-    /// QPc of the constant QP (chroma_qp_index_offset 0, Table 8-15).
+    /// QPc of `qp` (chroma_qp_index_offset 0, Table 8-15).
     pub(crate) qpc: i32,
+    /// QPY,pred (7.4.5): the QPY of the previous macroblock of the slice, as h264_core's decoder
+    /// tracks it (moved only by a written mb_qp_delta).
+    pub(crate) qp_pred: i32,
+    /// The rate controller ([`Config::rate`]).
+    pub(crate) rc: Option<rc::Rc>,
+    /// SliceQPY of the last encoded picture.
+    last_qp: i32,
     log2_max_frame_num: u32,
     sps: Vec<u8>,
     pps: Vec<u8>,
@@ -254,14 +409,20 @@ pub struct Encoder {
     pub(crate) src: [Plane; 3],
     /// The picture being reconstructed.
     pub(crate) rec: [Plane; 3],
-    /// The previous reconstruction: the reference of a P picture.
+    /// The previous reconstruction: the reference of a P picture (under `bframes` the past anchor, L0).
     pub(crate) refp: [Plane; 3],
+    /// The future anchor, a B picture's L1 reference (SR333; unused without `bframes`).
+    pub(crate) fwd: [Plane; 3],
     crop: [Vec<u8>; 3],
     pub(crate) nnz: Nnz,
     /// Intra4x4PredMode per 4x4 block of the picture (2 for any block not coded Intra_4x4).
     pub(crate) modes: Vec<u8>,
-    /// Motion per macroblock of the current P picture.
+    /// Motion per macroblock of the current P picture (list 0 of a B picture).
     pub(crate) motion: Vec<MbMotion>,
+    /// List-1 motion per macroblock of the current B picture (SR333).
+    pub(crate) motion1: Vec<MbMotion>,
+    /// The last anchor's motion: the co-located macroblocks of spatial direct (NONE after an IDR).
+    pub(crate) col: Vec<MbMotion>,
     /// The deblocking filter's per-macroblock facts of the current picture ([`deblock`]).
     pub(crate) dinfo: Vec<MbInfo>,
     /// The deblocking filter's per-4x4 motion of the current picture ([`deblock`]).
@@ -269,6 +430,36 @@ pub struct Encoder {
     frames: u64,
     idr_count: u32,
     frame_num: u32,
+    /// The padded sources held for B coding, with their display indices (SR333).
+    ahead: Vec<([Plane; 3], u64)>,
+    /// The cropped reconstruction of each access unit the last push / flush returned.
+    recons: Vec<[Vec<u8>; 3]>,
+    /// Access units coded so far (the next one's dts).
+    coded: u64,
+    /// Display index of the last IDR (POC 0).
+    idr_display: u64,
+    /// log2_max_pic_order_cnt_lsb (POC type 0, under `bframes` only).
+    log2_max_poc_lsb: u32,
+    /// The pyramid's middle B reconstruction (SR349): L1 of the Bs before it, L0 of those after it.
+    pub(crate) mid: [Plane; 3],
+    /// The middle B's co-located record (SR349): per macroblock its list-0 motion, else its list-1 motion.
+    pub(crate) col_mid: Vec<MbMotion>,
+    /// Display index of `refp`, `fwd` and `mid` (SR349; swapped with them).
+    pub(crate) disp: [u64; 3],
+    /// Display index of the picture being coded.
+    pub(crate) cur_disp: u64,
+    /// The pyramid role of the picture being coded.
+    pub(crate) tier: Tier,
+    /// A middle B was coded since the last anchor: the next P modifies list 0 and forgets it (SR349).
+    mid_live: bool,
+    /// direct_spatial_mv_pred_flag of the B picture being coded.
+    pub(crate) direct_spatial: bool,
+    /// The weights of the B picture being coded (None = the default average).
+    pub(crate) bw: Option<BWeights>,
+    /// weighted_bipred_idc of the PPS.
+    pub(crate) bipred_idc: u32,
+    /// VUI max_num_reorder_frames: the pts delay.
+    depth: u64,
 }
 
 impl Encoder {
@@ -282,15 +473,34 @@ impl Encoder {
         if cfg.gop == 0 {
             return Err(Error::Gop);
         }
+        let rc = match cfg.rate {
+            Some(r) => Some(rc::Rc::new(r, cfg.gop, cfg.qp as i32, cfg.qp_floor())?.with_bframes(cfg.bframes.min(4))),
+            None => None,
+        };
         let (mb_w, mb_h) = (cfg.width.div_ceil(16) as usize, cfg.height.div_ceil(16) as usize);
         let qp = cfg.qp as i32;
         let mut log2_max_frame_num = 4;
         while log2_max_frame_num < 16 && (1u64 << log2_max_frame_num) < cfg.gop as u64 {
             log2_max_frame_num += 1;
         }
-        let p = SeqParams { width: cfg.width, height: cfg.height, mb_w: mb_w as u32, mb_h: mb_h as u32, log2_max_frame_num, qp };
+        let mut log2_max_poc_lsb = 4;
+        while log2_max_poc_lsb < 16 && (1u64 << log2_max_poc_lsb) < 4 * cfg.gop as u64 {
+            log2_max_poc_lsb += 1;
+        }
+        let cabac = cfg.entropy == Entropy::Cabac;
+        let high = cfg.transform8x8;
+        let reorder = cfg.bframes > 0;
+        let pyramid = cfg.bframes >= 2;
+        let num_reorder = if cfg.bframes >= 3 { 2 } else { reorder as u32 };
+        let bipred_idc = match (reorder, cfg.bipred) {
+            (false, _) | (_, BiPred::Average) => 0,
+            (_, BiPred::Auto) => 2 * pyramid as u32,
+            (_, BiPred::Implicit) => 2,
+            (_, BiPred::Explicit) => 1,
+        };
+        let p = SeqParams { width: cfg.width, height: cfg.height, mb_w: mb_w as u32, mb_h: mb_h as u32, log2_max_frame_num, qp, cabac, high, reorder, log2_max_poc_lsb, pyramid, num_reorder, colour: cfg.colour };
         let sps = nal::nal_unit(3, nal::NAL_SPS, &sps::write_sps(&p));
-        let pps = nal::nal_unit(3, nal::NAL_PPS, &sps::write_pps(qp));
+        let pps = nal::nal_unit(3, nal::NAL_PPS, &sps::write_pps(qp, cabac, high, bipred_idc));
         let planes = || [Plane::new(mb_w * 16, mb_h * 16, 0), Plane::new(mb_w * 8, mb_h * 8, 128), Plane::new(mb_w * 8, mb_h * 8, 128)];
         let (w, h) = (cfg.width as usize, cfg.height as usize);
         Ok(Encoder {
@@ -299,6 +509,9 @@ impl Encoder {
             mb_h,
             qp,
             qpc: QPC[qp as usize] as i32,
+            qp_pred: qp,
+            rc,
+            last_qp: qp,
             log2_max_frame_num,
             sps,
             pps,
@@ -306,20 +519,43 @@ impl Encoder {
             src: planes(),
             rec: planes(),
             refp: planes(),
+            fwd: planes(),
             crop: [vec![0; w * h], vec![128; w * h / 4], vec![128; w * h / 4]],
             nnz: Nnz::new(mb_w, mb_h),
             modes: vec![2; mb_w * mb_h * 16],
             motion: vec![MbMotion::NONE; mb_w * mb_h],
+            motion1: vec![MbMotion::NONE; mb_w * mb_h],
+            col: vec![MbMotion::NONE; mb_w * mb_h],
             dinfo: vec![MbInfo::default(); mb_w * mb_h],
             dmo: Motion::new(mb_w, mb_h),
             frames: 0,
             idr_count: 0,
             frame_num: 0,
+            ahead: Vec::new(),
+            recons: Vec::new(),
+            coded: 0,
+            idr_display: 0,
+            log2_max_poc_lsb,
+            mid: planes(),
+            col_mid: vec![MbMotion::NONE; mb_w * mb_h],
+            disp: [0; 3],
+            cur_disp: 0,
+            tier: Tier::Plain,
+            mid_live: false,
+            direct_spatial: true,
+            bw: None,
+            bipred_idc,
+            depth: num_reorder as u64,
         })
     }
 
     pub fn config(&self) -> Config {
         self.cfg
+    }
+
+    /// SliceQPY of the last encoded picture (the constant QP without rate control).
+    pub fn picture_qp(&self) -> u8 {
+        self.last_qp as u8
     }
 
     /// The SPS NAL unit (header byte first).
@@ -343,27 +579,143 @@ impl Encoder {
         [&self.crop[0], &self.crop[1], &self.crop[2]]
     }
 
+    /// The cropped reconstruction of each access unit the last [`Encoder::push`] / [`Encoder::flush`]
+    /// returned, in the same (decoding) order (SR333).
+    pub fn reconstructions(&self) -> &[[Vec<u8>; 3]] {
+        &self.recons
+    }
+
     /// Encode the next frame: an IDR when the frame index is a multiple of the GOP, else a P frame.
+    /// Under [`Config::bframes`] above 0 it refuses ([`Error::Reorder`]): see [`Encoder::push`].
     pub fn encode(&mut self, f: &Yuv420) -> Result<Access> {
+        if self.cfg.bframes > 0 {
+            return Err(Error::Reorder);
+        }
         self.load(f)?;
         let idr = self.frames.is_multiple_of(self.cfg.gop as u64);
-        self.frame_num = if idr { 0 } else { (self.frame_num + 1) % (1 << self.log2_max_frame_num) };
+        let au = self.code(if idr { Pic::Idr } else { Pic::P }, self.frames);
+        self.frames += 1;
+        Ok(au)
+    }
+
+    /// Take the next frame in output order (SR333) and return the access units it releases, in decoding
+    /// order. Without `bframes` that is [`Encoder::encode`]'s one unit. With `bframes`, display index
+    /// k = frame % gop: k 0 is an IDR; k a multiple of bframes + 1, or the last frame before the next IDR,
+    /// is a P anchor, coded at once and followed by the B pictures held since the previous anchor; any
+    /// other frame is held (no units). [`Encoder::reconstructions`] holds the units' reconstructions.
+    pub fn push(&mut self, f: &Yuv420) -> Result<Vec<Access>> {
+        self.recons.clear();
+        if self.cfg.bframes == 0 {
+            let au = self.encode(f)?;
+            self.recons.push(self.crop.clone());
+            return Ok(vec![au]);
+        }
+        self.load(f)?;
+        let (b, gop) = (self.cfg.bframes.min(4) as u64, self.cfg.gop as u64);
+        let (display, k) = (self.frames, self.frames % gop);
+        self.frames += 1;
+        if k != 0 && k % (b + 1) != 0 && k + 1 != gop {
+            self.ahead.push((self.src.clone(), display));
+            return Ok(Vec::new());
+        }
+        Ok(self.group(if k == 0 { Pic::Idr } else { Pic::P }, display))
+    }
+
+    /// Drain the held frames at the end of the stream (SR333): the last becomes a P anchor, the rest B.
+    pub fn flush(&mut self) -> Result<Vec<Access>> {
+        self.recons.clear();
+        let Some((planes, display)) = self.ahead.pop() else { return Ok(Vec::new()) };
+        self.src = planes;
+        Ok(self.group(Pic::P, display))
+    }
+
+    /// Code the anchor in `src`, then each held frame as a B picture between the previous anchor (L0)
+    /// and it (L1); the new anchor then becomes L0. SR349: with bframes >= 2 and two or more held frames, the held
+    /// frame (n - 1) / 2 is coded first as the reference B (L0 the past anchor, L1 the new one), then the others in
+    /// display order, each between its nearest past and future reference ([`Encoder::pyramid_swap`]).
+    fn group(&mut self, pic: Pic, display: u64) -> Vec<Access> {
+        self.tier = Tier::Plain;
+        let mut out = vec![self.code(pic, display)];
+        self.recons.push(self.crop.clone());
+        let held = core::mem::take(&mut self.ahead);
+        let mid = (self.cfg.bframes >= 2 && held.len() >= 2).then(|| (held.len() - 1) / 2);
+        if let Some(m) = mid {
+            self.src = held[m].0.clone();
+            self.tier = Tier::Ref;
+            out.push(self.code(Pic::B, held[m].1));
+            self.recons.push(self.crop.clone());
+        }
+        for (j, (planes, d)) in held.into_iter().enumerate() {
+            if Some(j) == mid {
+                continue;
+            }
+            self.src = planes;
+            let side = mid.map(|m| j < m);
+            self.tier = if side.is_some() { Tier::Outer } else { Tier::Plain };
+            if let Some(before) = side {
+                self.pyramid_swap(before);
+            }
+            out.push(self.code(Pic::B, d));
+            self.recons.push(self.crop.clone());
+            if let Some(before) = side {
+                self.pyramid_swap(before);
+            }
+        }
+        self.tier = Tier::Plain;
+        core::mem::swap(&mut self.refp, &mut self.fwd);
+        self.disp.swap(0, 1);
+        out
+    }
+
+    /// Code the picture in `src` as `pic` at display index `display`: one slice, its reconstruction
+    /// and (an anchor) the reference update.
+    fn code(&mut self, pic: Pic, display: u64) -> Access {
+        let idr = pic == Pic::Idr;
+        let bpic = pic == Pic::B;
+        // frame_num: PrevRefFrameNum + 1; a B picture (nal_ref_idc 0) does not move PrevRefFrameNum.
+        let frame_num = if idr { 0 } else { (self.frame_num + 1) % (1 << self.log2_max_frame_num) };
+        let reference = !bpic || self.tier == Tier::Ref;
+        if reference {
+            self.frame_num = frame_num;
+        }
+        if idr {
+            self.idr_display = display;
+        }
+        self.cur_disp = display;
+        let extra = self.slice_extra(pic);
+        self.direct_spatial = extra.direct_spatial;
+        self.bw = if bpic { self.b_weights(extra.weights) } else { None };
+        let slice_qp = self.rc_picture(pic);
+        self.set_qp(slice_qp);
+        self.qp_pred = slice_qp;
         self.nnz.reset();
         self.modes.fill(2);
         self.motion.fill(MbMotion::NONE);
+        self.motion1.fill(MbMotion::NONE);
         let mut w = BitWriter::new();
-        sps::write_slice_header(&mut w, idr, self.frame_num, self.log2_max_frame_num, self.idr_count & 0xffff, self.cfg.deblock);
+        let is_cabac = self.cfg.entropy == Entropy::Cabac;
+        let poc = (self.cfg.bframes > 0).then(|| ((2 * (display - self.idr_display) % (1u64 << self.log2_max_poc_lsb)) as u32, self.log2_max_poc_lsb));
+        sps::write_slice_header(&mut w, pic, frame_num, self.log2_max_frame_num, self.idr_count & 0xffff, poc, self.cfg.deblock, slice_qp - self.cfg.qp as i32, is_cabac, &extra);
+        let hdr = w.bits();
+        // CABAC (SR310): the slice data's writer, contexts for I (column 0) or P / B with cabac_init_idc 0.
+        let mut cw = is_cabac.then(|| cabac::Writer::new(&mut w, if idr { 0 } else { 1 }, slice_qp, self.mb_w * self.mb_h));
         let mut run = 0u32;
         for mby in 0..self.mb_h {
+            self.rc_row(mby, w.bits() + cw.as_ref().map_or(0, cabac::Writer::pending) - hdr);
             for mbx in 0..self.mb_w {
                 if idr {
                     let code = self.intra_mb(mbx, mby);
-                    self.write_mb(&mut w, mbx, mby, &code, false);
                     self.note_mb(mbx, mby, &code);
+                    match &mut cw {
+                        Some(c) => self.write_mb_cabac(&mut w, c, mbx, mby, &code, pic),
+                        None => self.write_mb(&mut w, mbx, mby, &code, false),
+                    }
                 } else {
-                    let code = self.inter_mb(mbx, mby);
+                    let code = if bpic { self.b_mb(mbx, mby) } else { self.inter_mb(mbx, mby) };
                     self.note_mb(mbx, mby, &code);
-                    if code.kind == Kind::PSkip {
+                    if let Some(c) = &mut cw {
+                        self.write_mb_cabac(&mut w, c, mbx, mby, &code, pic);
+                    } else if matches!(code.kind, Kind::PSkip | Kind::BSkip) {
                         run += 1;
                     } else {
                         w.ue(run); // mb_skip_run
@@ -373,20 +725,49 @@ impl Encoder {
                 }
             }
         }
-        if run > 0 {
-            w.ue(run);
+        if cw.is_some() {
+            w.u((8 - w.bits() as u32 % 8) % 8, 0); // rbsp_alignment_zero_bit: the flush wrote the stop bit
+        } else {
+            if run > 0 {
+                w.ue(run);
+            }
+            w.trailing();
         }
-        w.trailing();
-        let slice = nal::nal_unit(3, if idr { nal::NAL_IDR } else { nal::NAL_SLICE }, &w.finish());
+        // A B picture is not a reference (nal_ref_idc 0) unless it is the pyramid's middle (1, SR349).
+        let slice = nal::nal_unit(if !bpic { 3 } else { reference as u8 }, if idr { nal::NAL_IDR } else { nal::NAL_SLICE }, &w.finish());
         let nals = if idr { vec![self.sps.clone(), self.pps.clone(), slice] } else { vec![slice] };
+        self.rc_update(nals.iter().map(|n| n.len() as u64 * 8).sum());
+        self.last_qp = slice_qp;
         self.deblock();
         self.store_crop();
-        core::mem::swap(&mut self.rec, &mut self.refp);
-        self.frames += 1;
+        if self.cfg.bframes == 0 {
+            core::mem::swap(&mut self.rec, &mut self.refp);
+        } else if self.tier == Tier::Ref {
+            // The pyramid's middle B (SR349): its reconstruction is `mid`, its motion the outer Bs' co-located record.
+            core::mem::swap(&mut self.rec, &mut self.mid);
+            self.disp[2] = display;
+            for i in 0..self.col_mid.len() {
+                self.col_mid[i] = if self.motion[i].r >= 0 { self.motion[i] } else { self.motion1[i] };
+            }
+            self.mid_live = true;
+        } else if !bpic {
+            self.disp[1] = display;
+            self.mid_live = false;
+            // The new anchor is the held B pictures' L1 (`group` makes it L0 after them); its motion is
+            // their co-located motion.
+            core::mem::swap(&mut self.rec, &mut self.fwd);
+            if idr {
+                self.col.fill(MbMotion::NONE);
+            } else {
+                self.col.copy_from_slice(&self.motion);
+            }
+        }
         if idr {
             self.idr_count = self.idr_count.wrapping_add(1);
         }
-        Ok(Access { keyframe: idr, nals })
+        let au = Access { keyframe: idr, nals, pts: display + self.depth, dts: self.coded };
+        self.coded += 1;
+        au
     }
 
     /// Copy the input into the macroblock-padded source planes, replicating the last column / row.
@@ -497,9 +878,13 @@ impl Encoder {
         match code.kind {
             Kind::I4 => {
                 w.ue(off);
+                if self.cfg.transform8x8 {
+                    w.flag(code.t8x8); // transform_size_8x8_flag
+                }
                 let w4 = self.mb_w * 4;
-                for blk in 0..16 {
-                    let (x4, y4) = (mbx * 4 + BLK_X[blk], mby * 4 + BLK_Y[blk]);
+                for blk in 0..mode_fields(code.t8x8) {
+                    let (bx, by) = mode_at(code.t8x8, blk);
+                    let (x4, y4) = (mbx * 4 + bx, mby * 4 + by);
                     let pred = intra::predicted_mode(&self.modes, w4, x4, y4);
                     let m = code.modes[blk];
                     if m == pred {
@@ -517,16 +902,33 @@ impl Encoder {
                 w.ue(off + 1 + code.i16_mode as u32 + 4 * (code.cbp >> 4) as u32 + luma);
                 w.ue(code.chroma_mode as u32);
             }
-            Kind::P16 => {
-                w.ue(0); // P_L0_16x16; ref_idx_l0 absent (one active reference)
-                w.se(code.mvd[0]);
-                w.se(code.mvd[1]);
+            Kind::P16 | Kind::BDirect | Kind::BL0 | Kind::BL1 | Kind::BBi => {
+                // P_L0_16x16 0 in a P slice; B_Direct_16x16 0, B_L0_16x16 1, B_L1_16x16 2, B_Bi_16x16 3 in a B
+                // slice (Table 7-14); ref_idx absent (one active reference per list); every mvd_l0 before mvd_l1.
+                w.ue(match code.kind {
+                    Kind::BL0 => 1,
+                    Kind::BL1 => 2,
+                    Kind::BBi => 3,
+                    _ => 0,
+                });
+                if code.kind.l0() {
+                    w.se(code.mvd[0]);
+                    w.se(code.mvd[1]);
+                }
+                if code.kind.l1() {
+                    w.se(code.mvd1[0]);
+                    w.se(code.mvd1[1]);
+                }
                 w.ue(cbp_code(&CBP_INTER, code.cbp));
+                if self.cfg.transform8x8 && code.cbp & 15 != 0 {
+                    w.flag(code.t8x8); // transform_size_8x8_flag
+                }
             }
-            Kind::PSkip => return,
+            Kind::PSkip | Kind::BSkip => return,
         }
         if code.cbp != 0 || code.kind == Kind::I16 {
-            w.se(0); // mb_qp_delta: QP is constant
+            w.se(self.qp - self.qp_pred); // mb_qp_delta (0 at constant QP); QPY,pred moves as h264_core's mb.rs moves it
+            self.qp_pred = self.qp;
             self.write_residual(w, mbx, mby, code);
         }
     }
@@ -543,7 +945,13 @@ impl Encoder {
             let mut tc = 0;
             if (code.cbp >> (blk / 4)) & 1 == 1 {
                 let nc = self.nnz.nc_luma(x4, y4);
-                tc = if i16 { cavlc::write_block(w, nc, 15, &scan(&code.luma[blk], 1)) } else { cavlc::write_block(w, nc, 16, &scan(&code.luma[blk], 0)) };
+                tc = if code.t8x8 {
+                    cavlc::write_block(w, nc, 16, &interleave8(&code.luma8[blk / 4], blk % 4)) // 7.3.5.3.2: 4 interleaved 4x4 lists
+                } else if i16 {
+                    cavlc::write_block(w, nc, 15, &scan(&code.luma[blk], 1))
+                } else {
+                    cavlc::write_block(w, nc, 16, &scan(&code.luma[blk], 0))
+                };
             }
             self.nnz.set_luma(x4, y4, tc);
         }
@@ -579,4 +987,79 @@ fn scan(c: &[i32; 16], start: usize) -> [i32; 16] {
 /// codeNum of coded_block_pattern `cbp` in a Table 9-4 column.
 fn cbp_code(table: &[u8; 48], cbp: u8) -> u32 {
     table.iter().position(|&v| v == cbp).expect("coded_block_pattern outside Table 9-4") as u32
+}
+
+/// The number of intra prediction mode fields of an I_NxN macroblock: 16 (Intra_4x4) or 4 (Intra_8x8).
+pub(crate) fn mode_fields(t8x8: bool) -> usize {
+    if t8x8 { 4 } else { 16 }
+}
+
+/// The 4x4 position (x, y) inside the macroblock of mode field `blk`'s top-left 4x4 block: the
+/// luma4x4BlkIdx block, or under the 8x8 transform the luma8x8BlkIdx block (whose mode the
+/// encoder stores on all four of its 4x4s, as h264_core's decoder does).
+pub(crate) fn mode_at(t8x8: bool, blk: usize) -> (usize, usize) {
+    if t8x8 { ((blk % 2) * 2, (blk / 2) * 2) } else { (BLK_X[blk], BLK_Y[blk]) }
+}
+
+/// The CAVLC list of 4x4 block `sub` of a raster 8x8 block (7.3.5.3.2: lumaLevel8x8[4 * k + sub]
+/// over the 8x8 zig-zag of 8.5.7 inverted), as h264_core's `parse_residual` reads it back.
+fn interleave8(c: &[i32; 64], sub: usize) -> [i32; 16] {
+    let mut l = [0i32; 16];
+    for k in 0..16 {
+        l[k] = c[ZIGZAG8[4 * k + sub] as usize];
+    }
+    l
+}
+
+/// The 64 levels of a raster 8x8 block in 8x8 zig-zag scan order (CABAC ctxBlockCat 5).
+pub(crate) fn scan8(c: &[i32; 64]) -> [i32; 64] {
+    let mut l = [0i32; 64];
+    for k in 0..64 {
+        l[k] = c[ZIGZAG8[k] as usize];
+    }
+    l
+}
+
+// H264ENCPYRAMID (SR349): the B pyramid's reference arrangement and per-slice syntax.
+impl Encoder {
+    /// Put an outer B's references in `refp` (L0) / `fwd` (L1) — an involution, called before and after its `code`: a B
+    /// before the middle takes the middle as L1 and its co-located record; one after it takes the middle as L0.
+    fn pyramid_swap(&mut self, before: bool) {
+        if before {
+            core::mem::swap(&mut self.fwd, &mut self.mid);
+            core::mem::swap(&mut self.col, &mut self.col_mid);
+            self.disp.swap(1, 2);
+        } else {
+            core::mem::swap(&mut self.refp, &mut self.mid);
+            self.disp.swap(0, 2);
+        }
+    }
+
+    /// The slice syntax beyond SR333's for the picture about to be coded: a P after a middle B puts the past anchor
+    /// first in list 0 (abs_diff_pic_num_minus1 1: the middle B sits between) and forgets that B (MMCO 1, difference 0);
+    /// a B names its reference role, its direct mode and (weighted_bipred_idc 1) its offsets.
+    fn slice_extra(&self, pic: Pic) -> SliceExtra {
+        match pic {
+            Pic::P if self.mid_live => SliceExtra { l0_reorder: Some(1), forget: Some(0), ..SliceExtra::default() },
+            Pic::B => SliceExtra {
+                reference: self.tier == Tier::Ref,
+                direct_spatial: !(self.cfg.direct_temporal && self.tier != Tier::Outer),
+                weights: (self.bipred_idc == 1).then(|| self.wp_offsets()),
+                ..SliceExtra::default()
+            },
+            _ => SliceExtra::default(),
+        }
+    }
+
+    /// PicOrderCnt of display index `d` (POC type 0: twice the distance from the IDR).
+    pub(crate) fn poc_of(&self, d: u64) -> i32 {
+        2 * (d as i64 - self.idr_display as i64) as i32
+    }
+
+    /// The explicit luma offsets of L0[0] / L1[0]: the source's mean luma minus the reference's, rounded, -128..=127.
+    fn wp_offsets(&self) -> [i32; 2] {
+        let sum = |p: &Plane| p.data.iter().map(|&v| v as i64).sum::<i64>();
+        let (s, n) = (sum(&self.src[0]), self.src[0].data.len() as i64);
+        [&self.refp[0], &self.fwd[0]].map(|r| (2 * (s - sum(r)) + n).div_euclid(2 * n).clamp(-128, 127) as i32)
+    }
 }

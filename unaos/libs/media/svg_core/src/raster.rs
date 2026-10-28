@@ -8,6 +8,7 @@
 
 use crate::fmath::{ceil, floor};
 use crate::geom::{Path, Rect};
+use crate::paint::Shader;
 use alloc::vec;
 use alloc::vec::Vec;
 use font_core::raster::Rasterizer;
@@ -248,6 +249,35 @@ pub fn fill_polys_mode(polys: &[(Vec<(f64, f64)>, bool)], rule: FillRule, w: usi
         return None;
     }
     Some(Coverage { x: bx0 as usize, y: by0 as usize, w: cw, h: ch, data })
+}
+
+/// Fill a coverage region with a shader: source-over each covered pixel, scaled by its coverage and `opacity`. One paint
+/// loop, two users (svg_core's `Renderer::paint_coverage` delegates here; pdf_core's renderer calls it, PDF2 SR313).
+pub fn paint_coverage(canvas: &mut Pixmap, cov: &Coverage, sh: &Shader, opacity: f32) {
+    if opacity <= 0.0 {
+        return;
+    }
+    if let Shader::Solid(c) = sh {
+        for yy in 0..cov.h {
+            for xx in 0..cov.w {
+                let v = cov.data[yy * cov.w + xx];
+                if v != 0 {
+                    canvas.blend(cov.x + xx, cov.y + yy, *c, v as f32 / 255.0 * opacity);
+                }
+            }
+        }
+        return;
+    }
+    for yy in 0..cov.h {
+        for xx in 0..cov.w {
+            let v = cov.data[yy * cov.w + xx];
+            if v != 0 {
+                let (px, py) = (cov.x + xx, cov.y + yy);
+                let c = sh.at(px as f64 + 0.5, py as f64 + 0.5);
+                canvas.blend(px, py, c, v as f32 / 255.0 * opacity);
+            }
+        }
+    }
 }
 
 #[cfg(test)]

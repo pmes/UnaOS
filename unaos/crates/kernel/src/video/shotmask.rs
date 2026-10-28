@@ -411,8 +411,7 @@ fn write_mask(path: &str, dir: &str, m: &[MaskRect], pw: usize, ph: usize) -> Re
     let mt = crate::shell::vfs_mount_table();
     let p = crate::fs::vfs::KERNEL_PRINCIPAL;
     let _ = mt.create(dir, crate::fs::vfs::NodeKind::Dir, p);
-    let _ = mt.unlink(path, p);
-    mt.create(path, crate::fs::vfs::NodeKind::File, p).map_err(|e| format!("create {}: {:?}", path, e))?;
+    mt.put_file(path, &[], p).map_err(|e| format!("create {}: {:?}", path, e))?; // VFSPUTREST (rmbp-ledger B969): put_file empty, the pieces by write_all_at
     let mut enc = PngEncoder::new(pw as u32, ph as u32).map_err(|e| format!("encoder {:?}", e))?;
     let mut row: Vec<u8> = Vec::new();
     if row.try_reserve_exact(pw * 3).is_err() {
@@ -422,11 +421,7 @@ fn write_mask(path: &str, dir: &str, m: &[MaskRect], pw: usize, ph: usize) -> Re
     let mut at = 0usize;
     let flush = |enc: &mut PngEncoder, piece: &mut Vec<u8>, at: &mut usize| -> Result<(), String> {
         while enc.next_piece(piece) {
-            let n = mt.write(path, *at as u64, piece, p).map_err(|e| format!("write {}: {:?}", path, e))?;
-            if n != piece.len() {
-                return Err(format!("short write {} of {}", n, piece.len()));
-            }
-            *at += n;
+            *at += mt.write_all_at(path, *at as u64, piece, p).map_err(|e| format!("write {}: {:?}", path, e))?;
         }
         Ok(())
     };

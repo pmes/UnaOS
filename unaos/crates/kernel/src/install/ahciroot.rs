@@ -107,12 +107,12 @@ pub fn ensure_root_grant() -> Option<u8> {
 /// an earlier lazy bind), then bind — `fs::unafs::bind_mount` tries the root port first. `true` when
 /// the live mount is on `Ahci { port }`.
 pub fn bind_ssd_root(port: u8) -> bool {
-    let want = BlockHandle::Ahci { port };
-    if crate::fs::unafs::mount_bound_handle().is_some_and(|h| h != want) {
-        crate::fs::unafs::force_remount();
-    }
-    let _ = crate::fs::unafs::with_unafs(|_| ());
-    crate::fs::unafs::mount_bound_handle() == Some(want)
+    crate::fs::unafs::bind_root_on(BlockHandle::Ahci { port }) // NVMEBOOT (zenbook-ledger Z9): ONE rebind home, shared with the NVMe root
+    // The body that stood here — drop a mount bound elsewhere (`force_remount`), bind (`with_unafs`), then
+    // ask which handle the live mount settled on — is `fs::unafs::bind_root_on` (fs/unafs.rs tail), which
+    // `bootdisk::unafs_state` also calls for `BlockHandle::Nvme`. Kept as comment lines so no line below
+    // this function moves (panic::Location).
+    //
 }
 
 /// `install ssd --write`'s fresh p2: `UnaFS::format` over `first..` (`mib` MiB) on `port`, through the

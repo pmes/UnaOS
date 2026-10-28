@@ -304,6 +304,10 @@ fi
 # `wc+desktop_firmware` (the `svg` row's shape; rule 7(a)). Its caller chain is live: `facet::service` / `key_route` /
 # `press_route` fold the editor's entries, and quarry drives those. unmeasured-here: no ELF built with the knob armed
 # for this row (the builder does not map UNAOS_FACETEDIT yet); the seat's fold measures it.
+# `lockreg_census` (LOCKREGXCORECOSTKNOB, rmbp-ledger B1075): token `[lockreg] xcore walks=`, the piece before the first hole
+# of `xcost_say`'s armed line (sync.rs `mod reg`, x86_64; behind `const CENSUS = cfg!(feature = "lockreg_census")`, the off
+# arm returns first with `census=off`); it occurs exactly once in crates/ + libs/. Caller chain `selftest` <- `tests lockreg`
+# <- `ensure_tests` <- stackguard.rs `arm` (unconditional on x86), so cond `@arch:x86_64`. unmeasured-here: the seat's fold measures it.
 # ---------------------------------------------------------------------------------------------
 bc_table() {
 cat <<'TABLE'
@@ -329,6 +333,7 @@ btc|REACHED — a BR/EDR link was established|-|measured
 a2dp|usage: bt audio <aa:bb:cc:dd:ee:ff|-|unmeasured-here
 tickless|[tick] core=|@arch:x86_64|unmeasured-here
 facetedit|[facetedit] closed win=|wc+desktop_firmware|unmeasured-here
+lockreg_census|[lockreg] xcore walks=|@arch:x86_64|unmeasured-here
 smolnet|:: SOCK-1: smoltcp icmp echo|-|measured(1)
 wifi|:: wifi: firmware NOT staged — no program-source block device; searched|-|measured
 wifi2|:: wifi2: upload NOT ATTEMPTED uploaded-bytes=|-|measured
@@ -349,6 +354,7 @@ gen7|:: gen7: r6 next=STOP-window-or-register-block-out-of-range|-|measured
 gmux_igd|:: igpu: [GMUX] switched DISPLAY, EXTERNAL, and DDC to IGD|intel-ivb|measured
 unaos_ivb|@boot iGPU trace 1 (pre-EBS) collected.|-|measured
 ahci|AHCI: selfcheck|-|measured
+nvme|[nvme] ctrl mn=|-|unmeasured-here
 bar1wedge|:: BAR1WEDGE: rung=first-stall|-|measured
 bar1exp-uc|:: x86 bar1exp: UC arm ARMED via=|-|measured
 beam|:: BEAMX86: head=|nvidia-kepler,nvidia-kepler-takeover|measured

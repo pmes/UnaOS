@@ -304,13 +304,13 @@ impl E1000 {
     }
 
     /// Allocate the RX descriptor ring + contiguous packet buffers and point each
-    /// descriptor at its buffer. The `alloc_zeroed` pointer doubles as the physical
-    /// address (identity map), matching the xHCI ring allocation.
+    /// descriptor at its buffer. The `arch::memory::dma::ident` address doubles as the bus
+    /// address (identity map), the one DMA allocator the xHCI rings use (DMAALLOCXHCI B988).
     fn alloc_rx(&mut self) {
         let ring_layout = Layout::from_size_align(NUM_RX * core::mem::size_of::<RxDesc>(), 4096).unwrap();
         let buf_layout = Layout::from_size_align(NUM_RX * RX_BUF_SIZE, 4096).unwrap();
-        self.rx_ring = unsafe { alloc::alloc::alloc_zeroed(ring_layout) as *mut RxDesc };
-        self.rx_buffers = unsafe { alloc::alloc::alloc_zeroed(buf_layout) };
+        self.rx_ring = crate::arch::memory::dma::ident(ring_layout.size(), ring_layout.align()) as *mut RxDesc;
+        self.rx_buffers = crate::arch::memory::dma::ident(buf_layout.size(), buf_layout.align()) as *mut u8;
 
         for i in 0..NUM_RX {
             let buf_phys = (self.rx_buffers as u64) + (i * RX_BUF_SIZE) as u64;
@@ -331,8 +331,8 @@ impl E1000 {
     fn alloc_tx(&mut self) {
         let ring_layout = Layout::from_size_align(NUM_TX * core::mem::size_of::<TxDesc>(), 4096).unwrap();
         let buf_layout = Layout::from_size_align(NUM_TX * TX_BUF_SIZE, 4096).unwrap();
-        self.tx_ring = unsafe { alloc::alloc::alloc_zeroed(ring_layout) as *mut TxDesc };
-        self.tx_buffers = unsafe { alloc::alloc::alloc_zeroed(buf_layout) };
+        self.tx_ring = crate::arch::memory::dma::ident(ring_layout.size(), ring_layout.align()) as *mut TxDesc;
+        self.tx_buffers = crate::arch::memory::dma::ident(buf_layout.size(), buf_layout.align()) as *mut u8;
 
         for i in 0..NUM_TX {
             let desc = TxDesc {
@@ -1036,7 +1036,7 @@ impl E1000 {
 /// smolnet poll must not hold the lock across a transmit, so each ring op locks independently).
 #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
 pub fn raw_rx(out: &mut [u8]) -> Option<usize> {
-    let r = NET_DEVICE.lock().as_mut().and_then(|n| n.rx_frame_raw(out)); #[cfg(feature = "usbnet")] let r = r.or_else(|| crate::drivers::xhci::usbnet::raw_rx(out)); #[cfg(feature = "wifi10")] let r = r.or_else(|| crate::wifi::data::raw_rx(out)); r // WIFIDHCP (B831): then the kept Wi-Fi station (bound only when neither answered hw_addr). USBNET (SO56): with no e1000 the smoltcp Device reads the USB Ethernet link through this same accessor — the guard is dropped at the `;` before the fallback runs
+    let r = NET_DEVICE.lock().as_mut().and_then(|n| n.rx_frame_raw(out)); #[cfg(feature = "usbnet")] let r = r.or_else(|| crate::drivers::xhci::usbnet::raw_rx(out)); #[cfg(feature = "wifi10")] let r = r.or_else(|| crate::wifi::data::raw_rx(out)); #[cfg(feature = "wifi")] let r = r.or_else(|| <crate::drivers::mt7925::MtRadio as crate::net_phy::RawNic>::rx_frame_raw(out)); r // MT7925S9 (zenbook-ledger Z46): then the MT7925 link (the firmware's header-translated frames), bound only when its hw_addr answered. WIFIDHCP (B831): then the kept Wi-Fi station (bound only when neither answered hw_addr). USBNET (SO56): with no e1000 the smoltcp Device reads the USB Ethernet link through this same accessor — the guard is dropped at the `;` before the fallback runs
 }
 
 /// SOCK-1: transmit one raw L2 frame from the smoltcp Device. Short-locks `NET_DEVICE`.
@@ -1044,13 +1044,13 @@ pub fn raw_rx(out: &mut [u8]) -> Option<usize> {
 pub fn raw_tx(frame: &[u8]) {
     if let Some(n) = NET_DEVICE.lock().as_mut() {
         n.tx_frame_raw(frame);
-    } else { #[cfg(feature = "wifi10")] if crate::wifi::data::raw_tx(frame) { return; } #[cfg(feature = "usbnet")] crate::drivers::xhci::usbnet::raw_tx(frame); } // WIFIDHCP (B831): the kept Wi-Fi station takes the frame when the stack was built on it. USBNET (SO56): no e1000 -> the frame is queued for the xHCI device-service pass; knob-off the else is empty and folds
+    } else { #[cfg(feature = "wifi10")] if crate::wifi::data::raw_tx(frame) { return; } #[cfg(feature = "wifi")] if crate::drivers::mt7925::bound() { <crate::drivers::mt7925::MtRadio as crate::net_phy::RawNic>::transmit(frame); return; } #[cfg(feature = "usbnet")] crate::drivers::xhci::usbnet::raw_tx(frame); } // MT7925S9 (zenbook-ledger Z46): the MT7925 link takes the frame when the stack was built on it (802.3 TXD on TX ring 0). WIFIDHCP (B831): the kept Wi-Fi station takes the frame when the stack was built on it. USBNET (SO56): no e1000 -> the frame is queued for the xHCI device-service pass; knob-off the else is empty and folds
 }
 
 /// SOCK-1: `(MAC, current IP, link-up)` for the smolnet interface config / `ifconfig`. `None` if no NIC.
 #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
 pub fn hw_addr() -> Option<([u8; 6], [u8; 4], bool)> {
-    let r = NET_DEVICE.lock().as_ref().map(|n| (n.mac, n.our_ip_raw(), n.link_up())); #[cfg(feature = "usbnet")] let r = r.or_else(crate::drivers::xhci::usbnet::hw_addr); #[cfg(feature = "wifi10")] let r = r.or_else(crate::wifi::data::hw_addr); r // WIFIDHCP (B831): the kept Wi-Fi station answers last (and is then the stack's link). USBNET (SO56): every smolnet verb and fixture keys on this triple, so the link answering here is what puts DHCP, ping, arp, dns and the ring-3 sockets on the dongle with no stack edit
+    let r = NET_DEVICE.lock().as_ref().map(|n| (n.mac, n.our_ip_raw(), n.link_up())); #[cfg(feature = "usbnet")] let r = r.or_else(crate::drivers::xhci::usbnet::hw_addr); #[cfg(feature = "wifi10")] let r = r.or_else(crate::wifi::data::hw_addr); #[cfg(feature = "wifi")] let r = r.or_else(crate::drivers::mt7925::hw_addr); r // MT7925S9 (zenbook-ledger Z46): the MT7925 link answers after it (S5's MAC, link up once associated). WIFIDHCP (B831): the kept Wi-Fi station answers last (and is then the stack's link). USBNET (SO56): every smolnet verb and fixture keys on this triple, so the link answering here is what puts DHCP, ping, arp, dns and the ring-3 sockets on the dongle with no stack edit
 }
 
 /// Read-only snapshot of the NIC state for the shell.

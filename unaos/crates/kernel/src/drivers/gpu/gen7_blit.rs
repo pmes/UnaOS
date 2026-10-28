@@ -73,6 +73,7 @@ pub struct JobOut {
     pub ptes_restored: bool,
     pub setup_us: u64,
     pub bcs_us: u64,
+    pub ring_re: bool, pub disabled: bool, // GEN7PARKUNARMEDLIVE (B1080): `disabled` is false only when the candidate the loop ended on left RING_CTL set after the disable write (armed or not); true when none did or none ran. GEN7PARKNODEMOTE (B1077): `disabled` is the armed candidate's RING_CTL read-back after the disable write. GEN7HELDONE (B1031): `held_take` handed back BLIT_RING_HELD's block from an earlier job
 }
 
 impl JobOut {
@@ -81,10 +82,10 @@ impl JobOut {
     }
 }
 
-/// The ring + sentinel pages (8 KiB, allocated once, held for the boot: they are GGTT-reachable and a
-/// register with no read decode is never the sole reason a page goes back to the heap, gen7.md §2.6).
-/// The lock is also the engine's: a second job while one runs is `busy`.
-static PAGES: crate::sync::Mutex<usize> = crate::sync::Mutex::new(0);
+/// The engine's lock: a second job while one runs is `busy`. The ring + sentinel pages (8 KiB, GGTT-reachable,
+/// gen7.md §2.6) are held in gen7.rs's `BLIT_RING_HELD` slot through `held_take` (GEN7HELDONE, B1031), taken under
+/// this lock (PAGES -> slot, never the reverse).
+pub(super) static PAGES: crate::sync::Mutex<Option<Park>> = crate::sync::Mutex::new(None); // GEN7PARKUNWIND (B1073): the payload is a stalled job's window (file tail)
 
 fn span_pages(p: &Plane) -> (usize, usize) {
     let first = p.va & !0xFFF;
@@ -120,15 +121,17 @@ pub unsafe fn bcs_job(bar0: usize, bar0_size: usize, src: Plane, dst: Plane, rec
             return Err("coord-not-16bit"); // DW2/DW3/DW5 carry 16-bit X and Y (§1.9.14 p.63)
         }
     }
-    let Some(mut pages) = PAGES.try_lock() else { return Err("busy") };
-    if *pages == 0 {
-        let p = alloc_zeroed(Layout::from_size_align(8192, 4096).unwrap());
-        if p.is_null() {
+    let Some((mut engine, (ring_va, ring_re))) = engine_take(|| crate::drivers::gpu::gen7::held_take(&crate::drivers::gpu::gen7::BLIT_RING_HELD, 2)) else { return Err("busy") }; // GEN7ORDERMIGRATE (B1053): PAGES then the ring slot on ONE core (file tail)
+    // GEN7HELDONE (B1031): B1025's one hold rule (gen7.rs tail) takes the ring + sentinel pages inside the door above
+    if !ring_re {
+        if ring_va == 0 {
             return Err("alloc-ring");
         }
-        *pages = p as usize; // held for the boot (see PAGES)
-    }
-    let ring_va = *pages;
+        #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+        {
+            crate::allocator::census::retag(ring_va, 2 * 4096, crate::allocator::census::GEN7_HELD); // FIXTURERETAIN (B1017): counted once, never fx:gen7
+        }
+    } // a reused block is not re-zeroed: the ring is NOOP-filled and the sentinel seeded below, every job
     let sent_va = ring_va + 4096;
     let (s0, ns) = span_pages(&src);
     let (d0, nd) = span_pages(&dst);
@@ -239,14 +242,14 @@ pub unsafe fn bcs_job(bar0: usize, bar0_size: usize, src: Plane, dst: Plane, rec
     clflush_range(src.va, src.len);
     clflush_range(dst.va, dst.len);
 
-    let mut out = JobOut { cand: "none", win, tail, ..JobOut::default() };
+    let mut out = JobOut { cand: "none", win, tail, ring_re, disabled: true, ..JobOut::default() }; // GEN7PARKUNARMEDLIVE (B1080): no candidate has left RING_CTL live yet; the loop's two stuck exits overwrite it
 
     // ---- claim: PTEs, landed check, the pinned flush ------------------------------------------------
     for k in 0..win {
         wr(bar0, slot(k), ptes[k]);
     }
     out.landed = (0..win).all(|k| rd(bar0, slot(k)) == ptes[k]) && rd(bar0, prev_off) == prev && rd(bar0, next_off) == next;
-    wr(bar0, GFX_FLSH, 1); // write-any-value: invalidate after a CPU-side GTT update (§1.2.21 p.191)
+    wr(bar0, GFX_FLSH, 1); crate::drivers::gpu::gen7::assert_no_slot_held("blit-ptes"); // GEN7SLOTNOHOLD (B1047): no slot guard live across this GPU op (gen7.rs tail), LINE-NEUTRAL append. write-any-value: invalidate after a CPU-side GTT update (§1.2.21 p.191)
 
     let mut all_disabled = true;
     let mut cyc = 0u64;
@@ -264,7 +267,7 @@ pub unsafe fn bcs_job(bar0: usize, bar0_size: usize, src: Plane, dst: Plane, rec
                 if out.setup_us == 0 {
                     out.setup_us = kb::cycles_to_us(crate::arch::now_cycles().saturating_sub(t_setup));
                 }
-                core::sync::atomic::compiler_fence(AO::SeqCst);
+                core::sync::atomic::compiler_fence(AO::SeqCst); crate::drivers::gpu::gen7::assert_no_slot_held("blit-kick"); // GEN7SLOTNOHOLD (B1047): no slot guard live across this GPU op (gen7.rs tail). LINE-NEUTRAL append
                 let t0 = crate::arch::now_cycles();
                 wr(bar0, g7regs::BCS_RING_TAIL, tail);
                 let (_hit, _it, _cy) = poll_cycles(EXEC_BUDGET_CYC, || {
@@ -281,41 +284,34 @@ pub unsafe fn bcs_job(bar0: usize, bar0_size: usize, src: Plane, dst: Plane, rec
             }
             wr(bar0, g7regs::BCS_RING_CTL, 0);
             let disabled = rd(bar0, g7regs::BCS_RING_CTL) & 1 == 0;
-            if disabled {
-                wr(bar0, g7regs::BCS_RING_TAIL, tail_pre);
-                wr(bar0, g7regs::BCS_RING_HEAD, head_pre);
-                wr(bar0, g7regs::BCS_RING_START, start_pre);
-                wr(bar0, g7regs::BCS_RING_CTL, ctl_pre);
-                out.regs_restored = rd(bar0, g7regs::BCS_RING_START) == start_pre
-                    && rd(bar0, g7regs::BCS_RING_CTL) == ctl_pre
-                    && (rd(bar0, g7regs::BCS_RING_HEAD) & RING_HEAD_OFF_MASK) == (head_pre & RING_HEAD_OFF_MASK)
-                    && rd(bar0, g7regs::BCS_RING_TAIL) == tail_pre;
+            if disabled && idle {
+                // GEN7PARKUNWIND (B1073): an armed ring that did not drain keeps START/HEAD/TAIL for the late re-check (its HEAD is R7's only drain reading)
+                out.regs_restored = ring_restore(bar0, [start_pre, head_pre, tail_pre, ctl_pre]);
             }
             let (fw_ok, _ev) = fw_release(bar0, tag, &hold);
             out.fw_restored = fw_ok;
             all_disabled &= disabled;
             if armed {
-                out.armed = true;
+                out.armed = true; out.disabled = disabled; // GEN7PARKNODEMOTE (B1077): an armed, drained ring whose CTL will not clear takes the stall verdict in `blit`. LINE-NEUTRAL append
                 out.cand = cand;
                 all_disabled &= idle; // a ring that did not drain may still be writing: keep the PTEs
                 break;
             }
-            if !disabled {
+            if !disabled { out.disabled = false; out.cand = cand; // GEN7PARKUNARMEDLIVE (B1080): an unarmed candidate whose RING_CTL will not clear: named for the park's forcewake and the stall verdict in `blit`. LINE-NEUTRAL append
                 break;
             }
         }
     }
     out.bcs_us = kb::cycles_to_us(cyc);
 
-    // ---- unwind the window: only behind a quiesced engine -------------------------------------------
-    if all_disabled {
-        for k in 0..win {
-            wr(bar0, slot(k), base_img);
-        }
-        out.ptes_restored = (0..win).all(|k| rd(bar0, slot(k)) == base_img) && rd(bar0, prev_off) == prev && rd(bar0, next_off) == next;
-        wr(bar0, GFX_FLSH, 1);
-    }
+    // ---- unwind the window: only behind a quiesced engine (GEN7PARKUNWIND B1073: `window_unwind`, file tail) ----------
+    out.ptes_restored = window_unwind(bar0, win, base_img, all_disabled, !out.disabled); // GEN7PARKWORD (B1087): stuck = RING_CTL read back set after the disable write, any HEAD (`park_class`, file tail). GEN7PARKUNARMEDLIVE (B1080): the unarmed stuck candidate keeps in the same class. GEN7PARKNODEMOTE (B1077): stuck = armed, drained, RING_CTL not clear (`held_kept=blit:ring-ctl-stuck`). the PTE restore + read-back + flush, then B1039's ONE release under PAGES
     clflush_range(dst.va, dst.len); // the CPU reads what the engine wrote, not a stale line
+    if !all_disabled { // GEN7PARKUNARMEDLIVE (B1080): the armed stall/stuck set plus the unarmed stuck break; Park.tail stays the job's computed TAIL (>= 0x40) so `park_quiesced` never passes a dark read
+        // GEN7PARKUNWIND (B1073): the stalled window rides the engine lock's payload for `park_unwind` (file tail)
+        let cand = R6_CANDS.iter().position(|c| c.0 == out.cand).unwrap_or(0);
+        *engine = Some(Park { win, base_img, tail, cand, pre: [start_pre, head_pre, tail_pre, ctl_pre] });
+    }
     Ok(out)
 }
 
@@ -359,7 +355,7 @@ impl Blitter for BcsBlitter {
         // caller holds them across blit + wait, the trait's contract).
         match unsafe { bcs_job(b.bar0, b.bar0_size, plane(&job.src), plane(&job.dst), job.rects, "g7b") } {
             Ok(o) if o.clean() => Ok(Fence::DONE),
-            Ok(o) if o.armed && !o.idle => {
+            Ok(o) if !o.disabled || (o.armed && !o.idle) => { // GEN7PARKUNARMEDLIVE (B1080): an unarmed candidate whose CTL will not clear takes the same one demote (its window is parked). GEN7PARKNODEMOTE (B1077): a drained ring whose CTL will not clear is dead too: the one demote runs once (its window is already parked)
                 ARMED.store(false, AO::Release);
                 kb::demote_bcs(); // a stall demotes, as the CE's Timeout does
                 Err(BlitErr::Timeout)
@@ -461,8 +457,8 @@ pub fn test() {
     let (sb, db) = (FW * FH * 4, DW * DH * 4);
     let lay_s = Layout::from_size_align(sb, 4096).unwrap();
     let lay_d = Layout::from_size_align(db, 4096).unwrap();
-    // SAFETY: page-aligned heap scratch, held for the boot once the BCS may have mapped it (gen7.md §2.6).
-    let (sp, dp) = unsafe { (alloc_zeroed(lay_s), alloc_zeroed(lay_d)) };
+    // Page-aligned heap scratch from gen7blit's slots, held for the boot once the BCS may have mapped it (gen7.md §2.6).
+    let ((sp, s_re), (dp, d_re)) = (super::held_take(&super::BLIT_HELD[0], lay_s.size().div_ceil(4096)), super::held_take(&super::BLIT_HELD[1], lay_d.size().div_ceil(4096))); let (sp, dp) = (sp as *mut u8, dp as *mut u8); // GEN7HOLDONCE (B1025): r11's rule (gen7.rs tail); the heap-short return below no longer leaks them
     let (Some(mut dcpu), Some(mut dgpu)) = (heap(db), heap(db)) else {
         serial_println!(":: GEN7BLIT2: impl=bcs selftest=heap-short us=0 -> declined ::");
         return;
@@ -558,9 +554,9 @@ pub fn test() {
         None => alloc::string::String::from("-"),
     };
     let l1 = alloc::format!(
-        "[gen7blit] job rects=2 fixture={}x{}->{}x{} win={} cand={} landed={} armed={} head={:08X} tail={:08X} sentinel={} idle={} regs_restored={} fw_restored={} ptes_restored={} match={}/{} spill={} setup_us={} bcs_us={} cpu_us={} gpu_us={} reclaim=held",
+        "[gen7blit] job rects=2 fixture={}x{}->{}x{} win={} cand={} landed={} armed={} head={:08X} tail={:08X} sentinel={} idle={} regs_restored={} fw_restored={} ptes_restored={} match={}/{} spill={} setup_us={} bcs_us={} cpu_us={} gpu_us={} reclaim=held reuse={} held_kb={}",
         FW, FH, DW, DH, o.win, o.cand, o.landed as u8, o.armed as u8, o.head, o.tail, o.sentinel as u8, o.idle as u8,
-        o.regs_restored as u8, o.fw_restored as u8, o.ptes_restored as u8, matched, total, spill, o.setup_us, o.bcs_us, cpu_us, gpu_tok
+        o.regs_restored as u8, o.fw_restored as u8, o.ptes_restored as u8, matched, total, spill, o.setup_us, o.bcs_us, cpu_us, gpu_tok, if s_re && d_re && o.ring_re { "y" } else { "n" }, super::held_kb()
     );
     let (winner, arm) = decide(ok, o.bcs_us, cpu_us, gpu_us, owner);
     PANEL_IGD.store(owner == "igd", AO::Release);
@@ -582,6 +578,135 @@ pub fn test() {
     for s in [&l1, &l2, &l3] {
         serial_println!("{}", s);
     }
-    *DONE.lock() = Some([l1, l2, l3]);
-    // sp/dp are deliberately not freed (reclaim=held); dcpu/dgpu were never GGTT-mapped and drop here.
+    *DONE.lock() = Some([l1, l2, l3]); #[cfg(all(target_arch = "x86_64", feature = "wc"))] { use crate::allocator::census::{retag, GEN7_HELD}; retag(sp as usize, lay_s.size(), GEN7_HELD); retag(dp as usize, lay_d.size(), GEN7_HELD); } // FIXTURERETAIN (B1017): sp/dp are `gen7-held`. LINE-NEUTRAL append, code first
+    // sp/dp are deliberately not freed (reclaim=held, in BLIT_HELD: a later job reuses them); dcpu/dgpu were never GGTT-mapped and drop here.
+}
+
+// =================================================================================
+// GEN7ORDERMIGRATE (rmbp-ledger B1053) — FILE-TAIL append: nothing above it moves. BP-gpu-9's order edge (PAGES ->
+// BLIT_RING_HELD) is recorded by the lock registry's walk at the slot's blocking `lock()`, and that walk reads ONLY the
+// current core's partition (`sync.rs` `reg::acquire`). `bcs_job` runs with interrupts on, so a timer preemption between
+// `PAGES.try_lock()` and `held_take`'s `slot.lock()` could re-queue the task, an idle core's `try_steal` take it, and the
+// second take then find no PAGES hold on its new core: the run's edge was dropped. The ONE door below makes both takes
+// under `crate::arch::without_interrupts` (one core, no preemption between them); `bcs_job` and `tests gen7`'s
+// `order_leg` both take through it, so GEN7ORDER's `gen7_order=ok` reads the production take. The mask spans only the
+// two takes (and a first job's 8 KiB `alloc_zeroed`, which the allocator itself runs masked); every other holder of
+// BLIT_RING_HELD is under PAGES or masked, so the masked spin never waits on a preempted holder on this core.
+// =================================================================================
+
+/// The engine lock and the take nested under it, on ONE core: `None` = a job is live (`busy`). The PAGES guard is
+/// handed back to the caller (the engine stays locked for the job); whatever `nested` takes it must release itself.
+pub(super) fn engine_take<R>(nested: impl FnOnce() -> R) -> Option<(crate::sync::MutexGuard<'static, Option<Park>>, R)> {
+    crate::arch::without_interrupts(|| {
+        let engine = PAGES.try_lock()?;
+        let r = nested();
+        Some((engine, r))
+    })
+}
+
+// =================================================================================
+// GEN7PARKUNWIND (rmbp-ledger B1073) — FILE-TAIL append: nothing above it moves. GEN7HELDPARK (B1067) owed
+// GEN7-PARK-UNWIND: a stalled job (armed, the ring not drained) left its window's PTEs claimed and the window carried
+// nowhere, and the demote is final (`demote_bcs` clears SEL_BCS; `arm_bcs` is only `test`'s, which replays), so no later
+// frame reaches this file. The stall now parks its window in PAGES' own payload (no new lock, no second slot:
+// BLIT_RING_HELD keeps the pages as before) and keeps the ring's START/HEAD/TAIL (bcs_job's restore rewrote HEAD,
+// R7's only drain reading, and a late compare against head_pre could pass falsely). `tests gen7` re-checks it once per run
+// (`park_unwind`, from `ladder_test`) through R7's own predicate (`park_quiesced`, gen7.rs tail); on a quiesce it runs
+// the SAME register restore and window unwind bcs_job runs (`ring_restore`, `window_unwind`: bcs_job's bodies, lifted).
+// =================================================================================
+
+/// A stalled job's window: the slot count, the census fill image (prev/next equal it, the census's rule), the job's
+/// ring TAIL, its R6_CANDS index and the BCS entry images `[START, HEAD, TAIL, CTL]`. Lives only in PAGES' payload.
+#[derive(Clone, Copy)]
+pub(super) struct Park {
+    win: usize,
+    base_img: u32,
+    tail: u32,
+    cand: usize,
+    pre: [u32; 4],
+}
+
+/// bcs_job's ring-register restore: the entry images written back (TAIL, HEAD, START, CTL) and read back. Called only
+/// behind a ring read back disabled (BP-gpu-5) and, for an armed ring, drained.
+unsafe fn ring_restore(bar0: usize, pre: [u32; 4]) -> bool {
+    let [start_pre, head_pre, tail_pre, ctl_pre] = pre;
+    wr(bar0, g7regs::BCS_RING_TAIL, tail_pre);
+    wr(bar0, g7regs::BCS_RING_HEAD, head_pre);
+    wr(bar0, g7regs::BCS_RING_START, start_pre);
+    wr(bar0, g7regs::BCS_RING_CTL, ctl_pre);
+    rd(bar0, g7regs::BCS_RING_START) == start_pre
+        && rd(bar0, g7regs::BCS_RING_CTL) == ctl_pre
+        && (rd(bar0, g7regs::BCS_RING_HEAD) & RING_HEAD_OFF_MASK) == (head_pre & RING_HEAD_OFF_MASK)
+        && rd(bar0, g7regs::BCS_RING_TAIL) == tail_pre
+}
+
+/// bcs_job's window unwind: behind a quiesced engine the `win` PTEs go back to the fill image, are read back with both
+/// neighbours, and `0x101008` is written; then B1039's ONE release decides the ring slot. Returns the PTE read-back.
+/// Called with PAGES held, no slot held.
+unsafe fn window_unwind(bar0: usize, win: usize, base_img: u32, quiesced: bool, stuck: bool) -> bool { // GEN7PARKNODEMOTE (B1077): `stuck` names the keep `ring-ctl-stuck`
+    let slot = |k: usize| GTT_BASE + (BASE_SLOT + k) * 4;
+    let (prev_off, next_off) = (GTT_BASE + (BASE_SLOT - 1) * 4, slot(win));
+    let mut ptes_restored = false;
+    if quiesced {
+        for k in 0..win {
+            wr(bar0, slot(k), base_img);
+        }
+        ptes_restored = (0..win).all(|k| rd(bar0, slot(k)) == base_img) && rd(bar0, prev_off) == base_img && rd(bar0, next_off) == base_img;
+        wr(bar0, GFX_FLSH, 1); crate::drivers::gpu::gen7::assert_no_slot_held("blit-unmap"); // GEN7SLOTNOHOLD (B1047): no slot guard live across this GPU op
+    }
+    crate::drivers::gpu::gen7::held_release_kept(&crate::drivers::gpu::gen7::BLIT_RING_HELD, "blit", quiesced, ptes_restored, park_class(quiesced, stuck)); // GEN7PARKWORD (B1087): the keep's word from the one class fn (file tail). GEN7PARKNODEMOTE (B1077): the keep's word by class. GEN7HELDRELEASE (B1039): the ONE release
+    ptes_restored
+}
+
+/// `tests gen7`'s late re-check of a parked window (gen7.rs `ladder_test`): under the engine door and the job's own
+/// forcewake candidate, RING_CTL and HEAD are read and judged by R7's predicate; on a quiesce the entry images, the PTEs
+/// and the slot go back by bcs_job's own fns and the park clears. Silent while nothing is parked or a job is live.
+pub(super) fn park_unwind() {
+    let Some(b) = *super::ladder::BANK.lock() else { return };
+    let Some((mut engine, ())) = engine_take(|| ()) else { return };
+    let Some(p) = *engine else { return };
+    let (cand, class_pin, req_off, ack_off, ack_mask, srcp, mask_form) = R6_CANDS[p.cand];
+    // SAFETY: the bank's BAR0 is igpu::init's live mapping; the engine is serialized under PAGES; the only writes (the
+    // forcewake request, the entry images, the PTEs, `0x101008`) are bcs_job's own, the restores only behind a quiesce.
+    let (ctl, head, quiesced, regs) = unsafe {
+        let hold = fw_acquire(b.bar0, "g7b", cand, class_pin, req_off, ack_off, ack_mask, srcp, mask_form, FW_ACK_BUDGET_CYC);
+        let ctl = rd(b.bar0, g7regs::BCS_RING_CTL);
+        let head = rd(b.bar0, g7regs::BCS_RING_HEAD) & RING_HEAD_OFF_MASK;
+        let quiesced = super::park_quiesced(ctl, head, p.tail);
+        let regs = quiesced && ring_restore(b.bar0, p.pre);
+        let _ = fw_release(b.bar0, "g7b", &hold);
+        (ctl, head, quiesced, regs)
+    };
+    // SAFETY: as above; the PTE restore runs only when `quiesced`.
+    let ptes = unsafe { window_unwind(b.bar0, p.win, p.base_img, quiesced, ctl & 1 != 0) }; // GEN7PARKNODEMOTE (B1077): a CTL still set keeps bcs_job's own class (one once-bit)
+    if quiesced {
+        *engine = None;
+    }
+    let why = park_class(quiesced, ctl & 1 != 0); // GEN7PARKWORD (B1087): the reason is the keep's own word (file tail)
+    serial_println!(
+        "[gen7blit] park unwind cand={} ctl={:08X} head={:08X} tail={:08X} quiesced={} regs_restored={} ptes_restored={} -> {} reason={} held_kb={}",
+        cand, ctl, head, p.tail, quiesced as u8, regs as u8, ptes as u8, if quiesced { "unwound" } else { "kept" }, why, super::held_kb()
+    );
+}
+
+// =================================================================================
+// GEN7PARKWORD (rmbp-ledger B1087) — FILE-TAIL append. GEN7PARKNODEMOTE (B1077) owed GEN7-PARK-WORD: the park keep
+// and `park_unwind`'s reason named one state two ways (CTL clear, HEAD short: keep `ring-not-disabled`, reason
+// `ring-not-drained`; CTL set: keep `ring-ctl-stuck`, reason `ring-live`), and an armed undrained ring whose CTL would
+// not clear kept as `ring-not-disabled` in bcs_job but `ring-ctl-stuck` at the unwind. The keep's words are the elder
+// (B1039/B1067) and the only two `kept_bit` (gen7.rs) maps, so both prints now take them from ONE fn.
+// =================================================================================
+
+/// The park's one class word, judged after the disable write over the caller's own quiesce reading (`all_disabled` in
+/// bcs_job, `park_quiesced` in `park_unwind`): `-` = quiesced (CTL clear, HEAD == TAIL); `ring-ctl-stuck` = RING_CTL
+/// read back set after the disable (any HEAD); `ring-not-disabled` = CTL clear, HEAD short of TAIL (B1067's class).
+/// `ring-live` is a CTL set before the arm: the entry refusal `bcs-ring-live` only, never a park word. Pure.
+pub(super) fn park_class(quiesced: bool, stuck: bool) -> &'static str {
+    if quiesced {
+        "-"
+    } else if stuck {
+        "ring-ctl-stuck"
+    } else {
+        "ring-not-disabled"
+    }
 }

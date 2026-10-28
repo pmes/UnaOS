@@ -44,7 +44,7 @@ pub enum BlockError {
     /// or the microSD card mid-CMD17/CMD24 sector transfer. Callers that CAN wait — unmasked,
     /// schedulable contexts — never see this from a healthy device: `claim_xhci_for_io` and
     /// `emmc2::claim_for_io` each retry with a bounded `hlt` wait first. A caller running with IRQs
-    /// MASKED gets it immediately, because a masked wait on a driver lock is exactly the deadlock
+    /// MASKED gets it at once (x86, PREEMPTOFFXHCILOAN Z62: after a <= 10 ms spin only on a RUNNING block holder on another CPU), because a masked wait on a preempted holder is exactly the deadlock
     /// this family is named for; the FAT layer retries OUTSIDE its masked span and surfaces
     /// `-EAGAIN` on exhaustion.
     Busy,
@@ -55,30 +55,30 @@ pub enum BlockError {
 
 /// WEDGE-8 (F3): claim the xHCI controller for one block transaction.
 ///
-/// Masked callers (the FAT/dir RMW spans under `without_interrupts`) get an INSTANT
-/// `BlockError::Busy` when the controller is loaned out — the whole point of F3 is that a masked
-/// context must never wait on a driver lock, because the loan holder is preemptible and, once
-/// preempted on this core, can only run again if this core takes timer IRQs.
+/// Masked callers (the FAT/dir RMW spans, `with_unafs`) get `BlockError::Busy` at once unless the holder is RUNNING:
+/// PREEMPTOFFXHCILOAN (zenbook-ledger Z62, x86) holds the block layer's loan preempt-off and publishes its CPU (`BlockLoan`,
+/// file tail), and a masked caller spins <= `LOAN_MASKED_WAIT_MS` only on a published holder on ANOTHER CPU. F3 kept: a masked
+/// context never waits on a preemptible or same-core holder, which could only run again if this core took timer IRQs.
 ///
 /// Unmasked callers keep the old effectively-blocking semantics, honestly bounded: retry the claim
 /// with a `hlt` between attempts (each wakes on the next IRQ, letting the scheduler run the loan
 /// holder) up to `hw_wait_budget()` wall-clock — long enough for any healthy SERVICE PASS, but NOT for
 /// every healthy BOT transaction: the driver itself budgets a first attempt at 3× this wait (`BOT_BUDGET_SCALE_FIRST` in `xhci/mod.rs`), so a slow-but-healthy transfer can hold the loan past this whole wait, and `Busy` is then a NORMAL, RETRYABLE outcome — not a wedge verdict (`usb_xhci.md` §32.3).
 /// Still short enough that a wedged 25 s failing-transfer hold surfaces as `Busy` instead of hanging the caller forever.
-fn claim_xhci_for_io() -> Result<XhciLoan, BlockError> {
-    match xhci::claim() {
+fn claim_xhci_for_io() -> Result<BlockLoan, BlockError> {
+    match take_block_loan() { // PREEMPTOFFXHCILOAN (Z62): the take holds this CPU's preempt-off count and publishes the holder
         Ok(l) => return Ok(l),
         Err(XhciClaimError::NotReady) => return Err(BlockError::NotReady),
         Err(XhciClaimError::Busy) => {}
     }
-    if crate::arch::irqs_masked() {
-        return Err(BlockError::Busy);
+    if crate::arch::irqs_masked() || (cfg!(target_arch = "aarch64") && crate::arch::sched::preemptoff::witness().0) { // PREEMPTOFFARM (zenbook-ledger Z67): an aarch64 preempt-off holder (the FAT/DIR spans) must not hlt-wait on a preemptible holder either (WEDGE-8 F3); x86 unchanged. LINE-NEUTRAL fold
+        return masked_loan_wait(); // PREEMPTOFFXHCILOAN (Z62): a bounded spin on a RUNNING holder only (was: Busy at once)
     }
     let start = crate::arch::now_cycles();
     let budget = crate::arch::hw_wait_budget();
     loop {
         crate::hlt();
-        match xhci::claim() {
+        match take_block_loan() {
             Ok(l) => return Ok(l),
             Err(XhciClaimError::NotReady) => return Err(BlockError::NotReady),
             Err(XhciClaimError::Busy) => {}
@@ -586,7 +586,7 @@ pub enum BlockHandle {
     /// `sdmmc_arm` ladder in `sdmmc_tegra.rs`; [`write_block_tegra_sd`] exists so the dispatch below
     /// is total and fails CLOSED, not so that anything writes.
     #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
-    SdMmc, #[cfg(all(target_arch = "x86_64", feature = "ahci"))] /** AHCIBOOT: one published SATA disk, keyed on the HBA PORT — the enumerator's key (`drivers::ahci`'s `PI` mask), never anything read off the medium. Reads go through [`read_block_ahci_port`]; every write through it is REFUSED, because `drivers/ahci.rs` compiles no ATA write opcode at all. The installer refuses it by construction (`install/mod.rs`, rmbp-ledger B91). */ Ahci { port: u8 },
+    SdMmc, #[cfg(all(target_arch = "x86_64", feature = "ahci"))] /** AHCIBOOT: one published SATA disk, keyed on the HBA PORT — the enumerator's key (`drivers::ahci`'s `PI` mask), never anything read off the medium. Reads go through [`read_block_ahci_port`]; every write through it is REFUSED, because `drivers/ahci.rs` compiles no ATA write opcode at all. The installer refuses it by construction (`install/mod.rs`, rmbp-ledger B91). */ Ahci { port: u8 }, #[cfg(all(target_arch = "x86_64", feature = "nvme"))] /** NVMEBOOT (zenbook-ledger Z9): the NVMe namespace 1 that `drivers::nvme` published into the NVMe registry (block.rs tail). Reads go through [`read_block_nvme`]; a write is admitted only inside the boot's NVMe root grant (one UnaFS extent), -EPERM elsewhere. */ Nvme,
 }
 
 /// INSTALL-SEL: a durable name for ONE block device, good across frames and across a registry change.
@@ -646,7 +646,7 @@ pub fn lookup(id: BlockDeviceId) -> Option<BlockDeviceInfo> {
         #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
         BlockHandle::Sdhc => sdhc_info(),
         #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
-        BlockHandle::SdMmc => tegra_sd_info(), #[cfg(all(target_arch = "x86_64", feature = "ahci"))] BlockHandle::Ahci { port } => ahci_info_port(port), // AHCIBOOT: the registry row for that port, so an identity captured on a SATA disk re-resolves to the same disk.
+        BlockHandle::SdMmc => tegra_sd_info(), #[cfg(all(target_arch = "x86_64", feature = "ahci"))] BlockHandle::Ahci { port } => ahci_info_port(port), #[cfg(all(target_arch = "x86_64", feature = "nvme"))] BlockHandle::Nvme => nvme_info(), // AHCIBOOT: the registry row for that port, so an identity captured on a SATA disk re-resolves to the same disk.
     };
     match cur {
         Some(d) if d.slot_id == id.slot_id && d.num_blocks == id.num_blocks => Some(d),
@@ -2281,7 +2281,7 @@ pub fn mbr_census(handle: BlockHandle, sec: &[u8], dev_blocks: u64) -> Option<Mb
         // is censused once on its own terms and can neither suppress nor be suppressed by the boot
         // stick's census. Disjoint from bit 4 by construction: no build carries both handles.
         #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
-        BlockHandle::SdMmc => 8, #[cfg(all(target_arch = "x86_64", feature = "ahci"))] BlockHandle::Ahci { .. } => 16, // AHCIBOOT: one latch bit for the whole SATA handle, so a two-disk rMBP censuses once rather than per port.
+        BlockHandle::SdMmc => 8, #[cfg(all(target_arch = "x86_64", feature = "ahci"))] BlockHandle::Ahci { .. } => 16, #[cfg(all(target_arch = "x86_64", feature = "nvme"))] BlockHandle::Nvme => 32, // AHCIBOOT: one latch bit for the whole SATA handle, so a two-disk rMBP censuses once rather than per port.
     };
     let prev = MBR_CENSUS_LATCH.fetch_or(bit, core::sync::atomic::Ordering::Relaxed);
     if prev & bit != 0 || sec.len() < SECTOR_BYTES {
@@ -2293,7 +2293,7 @@ pub fn mbr_census(handle: BlockHandle, sec: &[u8], dev_blocks: u64) -> Option<Mb
         #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
         BlockHandle::Sdhc => "sdhc",
         #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
-        BlockHandle::SdMmc => "tegra-sd", #[cfg(all(target_arch = "x86_64", feature = "ahci"))] BlockHandle::Ahci { .. } => "ahci",
+        BlockHandle::SdMmc => "tegra-sd", #[cfg(all(target_arch = "x86_64", feature = "ahci"))] BlockHandle::Ahci { .. } => "ahci", #[cfg(all(target_arch = "x86_64", feature = "nvme"))] BlockHandle::Nvme => "nvme",
     };
 
     // --- RAW, before decoding anything: the signature word and the four 16-byte entries verbatim.
@@ -2414,7 +2414,7 @@ impl PartitionRange {
             // gate every other handle goes through — no second addressing path, no absolute LBA
             // computed by a caller.
             #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
-            BlockHandle::SdMmc => read_block_tegra_sd(abs, buf), #[cfg(all(target_arch = "x86_64", feature = "ahci"))] BlockHandle::Ahci { port } => read_block_ahci_port(port, abs, buf),
+            BlockHandle::SdMmc => read_block_tegra_sd(abs, buf), #[cfg(all(target_arch = "x86_64", feature = "ahci"))] BlockHandle::Ahci { port } => read_block_ahci_port(port, abs, buf), #[cfg(all(target_arch = "x86_64", feature = "nvme"))] BlockHandle::Nvme => read_block_nvme(abs, buf),
         }
     }
 
@@ -2433,7 +2433,7 @@ impl PartitionRange {
             // one-shot witness + `NotReady`), so the variant cannot become a fourth door past the
             // armed `sdmmc_arm` ladder — a range that carries the card is readable and nothing more.
             #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
-            BlockHandle::SdMmc => write_block_tegra_sd(abs, buf), #[cfg(all(target_arch = "x86_64", feature = "ahci"))] BlockHandle::Ahci { port } => write_block_ahci_port(port, abs, buf), // AHCIBOOT: REFUSES, in every cfg — `write_block_ahci` is the refusal and the image carries no ATA write opcode.
+            BlockHandle::SdMmc => write_block_tegra_sd(abs, buf), #[cfg(all(target_arch = "x86_64", feature = "ahci"))] BlockHandle::Ahci { port } => write_block_ahci_port(port, abs, buf), #[cfg(all(target_arch = "x86_64", feature = "nvme"))] BlockHandle::Nvme => write_block_nvme(abs, buf), // AHCIBOOT: REFUSES, in every cfg — `write_block_ahci` is the refusal and the image carries no ATA write opcode.
         }
     }
 
@@ -2447,7 +2447,7 @@ impl PartitionRange {
             #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
             BlockHandle::Sdhc => read_blocks_sdhc(abs, buf),
             #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
-            BlockHandle::SdMmc => read_blocks_tegra_sd(abs, buf), #[cfg(all(target_arch = "x86_64", feature = "ahci"))] BlockHandle::Ahci { port } => read_blocks_ahci_port(port, abs, buf),
+            BlockHandle::SdMmc => read_blocks_tegra_sd(abs, buf), #[cfg(all(target_arch = "x86_64", feature = "ahci"))] BlockHandle::Ahci { port } => read_blocks_ahci_port(port, abs, buf), #[cfg(all(target_arch = "x86_64", feature = "nvme"))] BlockHandle::Nvme => read_blocks_nvme(abs, buf),
         }
     }
 
@@ -2461,7 +2461,7 @@ impl PartitionRange {
             BlockHandle::Sdhc => write_blocks_sdhc(abs, buf),
             // TEGRA-SDBLK: refuses, as the single-sector twin above does and for the same reason.
             #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
-            BlockHandle::SdMmc => write_blocks_tegra_sd(abs, buf), #[cfg(all(target_arch = "x86_64", feature = "ahci"))] BlockHandle::Ahci { port } => write_blocks_ahci_port(port, abs, buf), // AHCIBOOT: refuses, as the single-sector twin does.
+            BlockHandle::SdMmc => write_blocks_tegra_sd(abs, buf), #[cfg(all(target_arch = "x86_64", feature = "ahci"))] BlockHandle::Ahci { port } => write_blocks_ahci_port(port, abs, buf), #[cfg(all(target_arch = "x86_64", feature = "nvme"))] BlockHandle::Nvme => write_blocks_nvme(abs, buf), // AHCIBOOT: refuses, as the single-sector twin does.
         }
     }
 
@@ -2476,7 +2476,7 @@ impl PartitionRange {
             #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
             BlockHandle::Sdhc => sdhc_info(),
             #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
-            BlockHandle::SdMmc => tegra_sd_info(), #[cfg(all(target_arch = "x86_64", feature = "ahci"))] BlockHandle::Ahci { port } => ahci_info_port(port),
+            BlockHandle::SdMmc => tegra_sd_info(), #[cfg(all(target_arch = "x86_64", feature = "ahci"))] BlockHandle::Ahci { port } => ahci_info_port(port), #[cfg(all(target_arch = "x86_64", feature = "nvme"))] BlockHandle::Nvme => nvme_info(),
         }
         .ok_or(BlockError::NotReady)?;
         let bs = dev.block_size as usize;
@@ -2598,7 +2598,7 @@ pub fn native_mount_write_veto() -> Option<&'static str> {
     let Some(handle) = crate::fs::unafs::mount_bound_handle() else {
         return None;
     };
-    #[cfg(all(target_arch = "x86_64", feature = "ahciroot"))] if let BlockHandle::Ahci { port } = handle { if crate::install::ahciroot::root_port() == Some(port) { return None; } } // AHCIROOT (B332): the native root on a root-granted SSD is writable (the grant bounds it to p2); the per-HANDLE answer below is unchanged, so leg 8's FAT/handle agreement is untouched
+    #[cfg(all(target_arch = "x86_64", feature = "ahciroot"))] if let BlockHandle::Ahci { port } = handle { if crate::install::ahciroot::root_port() == Some(port) { return None; } } #[cfg(all(target_arch = "x86_64", feature = "nvme"))] if handle == BlockHandle::Nvme && nvme_root_grant().is_some() { return None; } // AHCIROOT (B332): the native root on a root-granted SSD is writable (the grant bounds it to p2); the per-HANDLE answer below is unchanged, so leg 8's FAT/handle agreement is untouched
     handle_write_veto(handle)
 }
 
@@ -2634,7 +2634,7 @@ pub fn handle_write_veto(handle: BlockHandle) -> Option<&'static str> {
             } else {
                 Some(NATIVE_TEGRA_SD_VETO)
             }
-        } #[cfg(all(target_arch = "x86_64", feature = "ahci"))] BlockHandle::Ahci { .. } => Some(NATIVE_AHCI_VETO), // AHCIBOOT: a flat NO with no exception to carve — `write_block_ahci` refuses in every cfg and the image compiles no ATA write opcode. A forward to that standing answer, not a second policy.
+        } #[cfg(all(target_arch = "x86_64", feature = "ahci"))] BlockHandle::Ahci { .. } => Some(NATIVE_AHCI_VETO), #[cfg(all(target_arch = "x86_64", feature = "nvme"))] BlockHandle::Nvme => Some(NATIVE_NVME_VETO), // AHCIBOOT: a flat NO with no exception to carve — `write_block_ahci` refuses in every cfg and the image compiles no ATA write opcode. A forward to that standing answer, not a second policy.
     }
 }
 
@@ -3860,4 +3860,1660 @@ pub fn boot_medium_not_sdhc() -> bool {
     }
     #[cfg(not(all(target_arch = "x86_64", feature = "sdhcblk")))]
     false
+}
+
+// ══════════ NVME registry (zenbook-ledger Z2, ZENBOOKNVME) — the NVMe namespace as its own registry ══════════
+//
+// TAIL-APPENDED (no line above moves). The AHCI first rung's shape (`AHCI_DISKS` / `register_ahci` /
+// `read_blocks_ahci_ix` / the refusing `write_block_ahci`), for ONE namespace: `drivers/nvme.rs`
+// publishes namespace 1 here after IDENTIFY. NVMEBOOT (zenbook-ledger Z9) made it a handle
+// (`BlockHandle::Nvme`, `fs::fat::BlockSource::Nvme`) so the root walk sees it, and its writes granted
+// (the NVMEBOOT section below). The global [`BLOCK_DEVICE`] is never touched.
+
+/// NVME: the published namespace's geometry. Never held across I/O.
+#[cfg(all(target_arch = "x86_64", feature = "nvme"))]
+pub static NVME_DISK: Mutex<Option<BlockDeviceInfo>> = Mutex::new(None);
+
+/// NVME: publish namespace 1. Refuses a zero-block namespace or a block size outside 512..4096.
+#[cfg(all(target_arch = "x86_64", feature = "nvme"))]
+pub fn register_nvme(num_blocks: u64, block_size: u32, model: &[u8; 40]) -> bool {
+    if num_blocks == 0 || !(512..=4096).contains(&block_size) {
+        serial_println!(":: [nvme] REFUSED to register ns=1 — blocks={} lba={} ::", num_blocks, block_size);
+        return false;
+    }
+    let mut product = [b' '; 16];
+    product.copy_from_slice(&model[..16]);
+    let dev = BlockDeviceInfo { slot_id: 0, block_size, num_blocks, vendor: *b"NVMe    ", product };
+    crate::arch::without_interrupts(|| *NVME_DISK.lock() = Some(dev));
+    true
+}
+
+/// NVME: geometry of the published namespace, if any.
+#[cfg(all(target_arch = "x86_64", feature = "nvme"))]
+pub fn nvme_info() -> Option<BlockDeviceInfo> {
+    crate::arch::without_interrupts(|| *NVME_DISK.lock())
+}
+
+/// NVME: read `buf.len() / block_size` whole blocks at `lba`, DIRECTLY through the NVMe driver (it
+/// chunks by its own MDTS and re-guards the range against the namespace size one layer down).
+#[cfg(all(target_arch = "x86_64", feature = "nvme"))]
+pub fn read_blocks_nvme(lba: u64, buf: &mut [u8]) -> Result<usize, BlockError> {
+    let dev = nvme_info().ok_or(BlockError::NotReady)?;
+    let count = span_blocks(&dev, lba, buf.len())?;
+    let bs = dev.block_size as usize;
+    crate::drivers::nvme::read_at(lba, &mut buf[..count * bs]).map_err(|_| BlockError::Io)?;
+    Ok(buf.len())
+}
+
+// ══════════ NVMEBOOT (zenbook-ledger Z9) — the NVMe root grant and the granted write ══════════
+//
+// TAIL-APPENDED (no line above moves). AHCIROOT's slot shape (B332, the AHCIROOT section above) for the
+// NVMe namespace: ONE grant, ONE inclusive absolute-LBA range, held for the boot (the root is written
+// until power-off), never cleared. Its ONE minter is `fs::unafs::ensure_nvme_root_grant`, which grants
+// exactly the one UnaFS volume `fs::unafs::locate_on(BlockHandle::Nvme)` finds — the extent the mount
+// rides — so a foreign partition beside it (the Zenbook's Windows) is outside the grant by construction.
+// The audit is `grep -rn hold_nvme_root_grant unaos/crates/kernel/src` -> this declaration + that call.
+//
+// [`write_blocks_nvme`] is the ONLY block-layer path to `drivers::nvme::write_at`: -EPERM unless the
+// live grant covers every block of the run, else written and READ BACK as one run (AHCIROOT's
+// `ahci_port_write` rule; NVMEBATCH zenbook-ledger Z22: one WRITE and one read-back per run, not per block). [`flush_nvme`] is the K8a commit barrier `fs::unafs::SdSectorDevice::flush`
+// calls on an NVMe handle. The slot's lock is taken IRQ-masked, copied out, never held across I/O.
+
+/// NVMEBOOT: THE slot — `(first_lba, last_lba)`, inclusive. `None` = every NVMe write is -EPERM.
+#[cfg(all(target_arch = "x86_64", feature = "nvme"))]
+static NVME_ROOT_GRANT: Mutex<Option<(u64, u64)>> = Mutex::new(None);
+
+/// NVMEBOOT: refusal lines printed so far (the first [`NVME_DENY_LINES`] print; the rest are counted).
+#[cfg(all(target_arch = "x86_64", feature = "nvme"))]
+static NVME_DENIED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+#[cfg(all(target_arch = "x86_64", feature = "nvme"))]
+const NVME_DENY_LINES: u32 = 4;
+
+/// NVMEBOOT: put the boot's root grant in the slot. `false` (and nothing changes) when the slot is already
+/// held, when the range is empty or reversed, starts at LBA 0 (the partition table is never ours to write)
+/// or runs past the namespace. ⚠ ONE caller: `fs::unafs::ensure_nvme_root_grant` — do not add a second.
+#[cfg(all(target_arch = "x86_64", feature = "nvme"))]
+pub fn hold_nvme_root_grant(first: u64, last: u64) -> bool {
+    let Some(dev) = nvme_info() else { return false };
+    if first == 0 || last < first || last >= dev.num_blocks {
+        return false;
+    }
+    crate::arch::without_interrupts(|| {
+        let mut s = NVME_ROOT_GRANT.lock();
+        if s.is_some() {
+            return false;
+        }
+        *s = Some((first, last));
+        true
+    })
+}
+
+// ══════════ BOUNDEDWAIT (rmbp-ledger B981) — ONE bounded wait and ONE masked bounded hold for the block drivers ══════════
+//
+// TAIL-APPENDED (no line above moves). `drivers/ahci.rs`, `drivers/sdhc.rs` and `drivers/nvme.rs` each carried a
+// byte-identical `cycles_ms` + `wait_ms`, and ahci's `dongle::with_port` and nvme's `with_ctrl` the same masked
+// bounded try-lock skeleton; the copies are lifted here, and the drivers keep only their own lines and counters.
+// The clock is the TSC (`arch::now_cycles()` against `arch::apic::tsc_hz()`), NOT `arch::ms()`: the probes run inside
+// `pci::init` with interrupts masked, where the APIC tick does not advance. x86_64 only (every user is).
+
+/// BOUNDEDWAIT: the TSC-unit bounded wait every x86 block driver spins on.
+#[cfg(target_arch = "x86_64")]
+pub mod wait {
+    /// `ms` milliseconds in `arch::now_cycles()` (rdtsc) units. The TSC is calibrated against the ACPI PM timer by
+    /// `apic::calibrate`, long before `pci::init`; the uncalibrated fallback derives from `arch::HW_WAIT_BUDGET`
+    /// (the ~2 s pre-calibration guess).
+    #[inline]
+    pub fn cycles_ms(ms: u64) -> u64 {
+        let hz = crate::arch::apic::tsc_hz();
+        if hz != 0 {
+            hz.saturating_mul(ms) / 1000
+        } else {
+            crate::arch::HW_WAIT_BUDGET.saturating_mul(ms) / 2000
+        }
+    }
+
+    /// Spin until `pred()` holds or `ms` milliseconds elapse. Returns true if the predicate held.
+    /// `wrapping_sub` so a 64-bit TSC wrap mid-wait cannot trip the deadline early.
+    pub fn bounded<F: Fn() -> bool>(ms: u64, pred: F) -> bool {
+        let start = crate::arch::now_cycles();
+        let budget = cycles_ms(ms);
+        loop {
+            if pred() {
+                return true;
+            }
+            if crate::arch::now_cycles().wrapping_sub(start) >= budget {
+                return false;
+            }
+            core::hint::spin_loop();
+        }
+    }
+}
+
+/// BOUNDEDWAIT (DISKHOLD): the ONE masked bounded hold (the DONGLEBOOT B658 shape) a block driver takes its
+/// controller lock through.
+#[cfg(all(target_arch = "x86_64", any(feature = "ahci", feature = "nvme")))]
+pub mod hold {
+    /// Preempt-off for the whole hold (no preemption inside it; interrupts as the caller had them, PREEMPTOFFAUDIT Z57); `take` (the caller's own `try_lock`, so
+    /// LOCKREG names the driver's acquire site) is retried until it yields a guard or `bound_ms` elapses —
+    /// `at_once` refuses on the first miss (a caller that never waits, e.g. the render task). A refusal runs
+    /// `refused(<TSC cycles spun>)` inside the hold (the driver's own line and counters); a taken guard runs
+    /// `held(guard)`. `#[track_caller]` so the masked span (CLOCKCORE) is named at the driver's call.
+    #[track_caller]
+    pub fn with<G, R>(
+        bound_ms: u64,
+        at_once: bool,
+        mut take: impl FnMut() -> Option<G>,
+        refused: impl FnOnce(u64) -> R,
+        held: impl FnOnce(G) -> R,
+    ) -> R {
+        crate::arch::sched::preemptoff::scoped(move || { // PREEMPTOFFAUDIT (zenbook-ledger Z57): preempt-off, interrupts LEFT ON (was without_interrupts; the census: no ISR takes CTRL/PORTS)
+            let t0 = crate::arch::now_cycles();
+            let bound = super::wait::cycles_ms(bound_ms);
+            let guard = loop {
+                if let Some(g) = take() {
+                    break g;
+                }
+                let spun = crate::arch::now_cycles().wrapping_sub(t0);
+                if at_once || spun >= bound {
+                    return refused(spun);
+                }
+                core::hint::spin_loop();
+            };
+            held(guard)
+        })
+    }
+}
+
+/// NVMEBOOT: the live root grant, if any — `(first_lba, last_lba)`.
+#[cfg(all(target_arch = "x86_64", feature = "nvme"))]
+pub fn nvme_root_grant() -> Option<(u64, u64)> {
+    crate::arch::without_interrupts(|| *NVME_ROOT_GRANT.lock())
+}
+
+/// NVMEBOOT: read ONE block at `lba` into the front of `buf` (the single-block twin the handle and source
+/// dispatchers call). Returns the block size read.
+#[cfg(all(target_arch = "x86_64", feature = "nvme"))]
+pub fn read_block_nvme(lba: u64, buf: &mut [u8]) -> Result<usize, BlockError> {
+    let bs = nvme_info().ok_or(BlockError::NotReady)?.block_size as usize;
+    if buf.len() < bs {
+        return Err(BlockError::Io);
+    }
+    read_blocks_nvme(lba, &mut buf[..bs])?;
+    Ok(bs)
+}
+
+/// NVMEBOOT: write ONE block at `lba` from the front of `buf` — through [`write_blocks_nvme`]'s grant check.
+#[cfg(all(target_arch = "x86_64", feature = "nvme"))]
+pub fn write_block_nvme(lba: u64, buf: &[u8]) -> Result<(), BlockError> {
+    let bs = nvme_info().ok_or(BlockError::NotReady)?.block_size as usize;
+    if buf.len() < bs {
+        return Err(BlockError::Io);
+    }
+    write_blocks_nvme(lba, &buf[..bs])
+}
+
+/// NVMEBOOT (NVMEWRITE): THE NVMe block-layer write. -EPERM unless the live root grant covers every block
+/// of the run; otherwise written through `drivers::nvme::write_at` and read back with ONE `read_at` over the
+/// run, compared block by block in memory (NVMEBATCH, zenbook-ledger Z22: `fs::unafs::handle_write_multi` hands a
+/// whole 4 KiB UnaFS block here as one run; the driver chunks by its own MDTS). NVME4KN (zenbook-ledger Z31): `lba` and
+/// the grant are the namespace's OWN LBAs on every LBA size; [`write_sectors_nvme`] maps the 512 B sector view onto them.
+#[cfg(all(target_arch = "x86_64", feature = "nvme"))]
+pub fn write_blocks_nvme(lba: u64, buf: &[u8]) -> Result<(), BlockError> {
+    let dev = nvme_info().ok_or(BlockError::NotReady)?;
+    let count = span_blocks(&dev, lba, buf.len())?;
+    let last = lba + count as u64 - 1;
+    match nvme_root_grant() {
+        Some((a, b)) if lba >= a && last <= b => {}
+        other => {
+            let k = NVME_DENIED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            if k < NVME_DENY_LINES {
+                match other {
+                    None => serial_println!(":: [nvme] write -EPERM lba={} grant=none — nothing written ::", lba),
+                    Some((a, b)) => serial_println!(":: [nvme] write -EPERM lba={} grant={}..{} — nothing written ::", lba, a, b),
+                }
+            }
+            return Err(BlockError::Denied);
+        }
+    }
+    let bs = dev.block_size as usize;
+    crate::drivers::nvme::write_at(lba, buf).map_err(|_| BlockError::Io)?;
+    let mut rb = alloc::vec![0u8; count * bs];
+    crate::drivers::nvme::read_at(lba, &mut rb).map_err(|_| BlockError::Io)?;
+    if let Some(i) = (0..count).find(|&i| rb[i * bs..(i + 1) * bs] != buf[i * bs..(i + 1) * bs]) {
+        serial_println!(":: [nvme] write readback MISMATCH lba={} — the medium does not hold what was written ::", lba + i as u64);
+        return Err(BlockError::Io);
+    }
+    NVME_RUNS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    NVME_RUN_BLOCKS.fetch_add(count as u32, core::sync::atomic::Ordering::Relaxed);
+    Ok(())
+}
+
+/// NVMEBATCH (zenbook-ledger Z22): granted runs written and verified this boot, and the blocks they carried — the
+/// `tests nvme` line's `runs=` / `run_blocks=` (a UnaFS root's run is 8 blocks; before Z22 every run was 1).
+#[cfg(all(target_arch = "x86_64", feature = "nvme"))]
+static NVME_RUNS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+#[cfg(all(target_arch = "x86_64", feature = "nvme"))]
+static NVME_RUN_BLOCKS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// NVMEBATCH: `(runs, blocks)` written through [`write_blocks_nvme`] this boot.
+#[cfg(all(target_arch = "x86_64", feature = "nvme"))]
+pub fn nvme_run_census() -> (u32, u32) {
+    (NVME_RUNS.load(core::sync::atomic::Ordering::Relaxed), NVME_RUN_BLOCKS.load(core::sync::atomic::Ordering::Relaxed))
+}
+
+/// NVMEBOOT: NVM Flush on namespace 1 — the commit barrier (a controller with no volatile write cache
+/// completes it as a no-op, NVMe 1.4).
+#[cfg(all(target_arch = "x86_64", feature = "nvme"))]
+pub fn flush_nvme() -> Result<(), BlockError> {
+    crate::drivers::nvme::flush().map_err(|_| BlockError::Io)
+}
+
+/// NVMEBOOT: the NVMe root's standing write refusal, as [`handle_write_veto`] reports it (the root-granted
+/// namespace is lifted by `native_mount_write_veto`, AHCIROOT's shape).
+#[cfg(all(feature = "sdwrite", target_arch = "x86_64", feature = "nvme"))]
+const NATIVE_NVME_VETO: &str = "the volume rides the NVMe namespace and the block layer refuses every \
+                                write outside the boot's NVMe root grant (one UnaFS extent, NVMEBOOT)";
+
+// ══════════ NVME4KN (zenbook-ledger Z31) — the NVMe namespace as a 512 B sector view, on any LBA size ══════════
+//
+// TAIL-APPENDED. `fs::unafs::SdSectorDevice` (the unafs crate's `SectorDevice`) addresses 512 B sectors on every handle;
+// on the NVMe that space is a VIEW over the namespace: sector `s` is byte `s * 512`, LBA `s >> k` with
+// k = log2(lba_bytes) - 9 (0 on a 512 B namespace, 3 on 4Kn). This section is the ONE place the mapping lives. Every
+// entry point issues only [`read_blocks_nvme`] / [`write_blocks_nvme`] (the grant check and the read-back stay theirs);
+// on k = 0 each one is exactly the call it replaced. A 512 B write on k > 0 (the unafs K8a root flip, the keyslot) is a
+// read-modify-write of its ONE LBA through the granted write: a one-LBA NVMe write is power-fail atomic (AWUPF is
+// 0's-based) and the sibling bytes are rewritten as just read, so the flip stays one device write. The pair runs under
+// the UnaFS MOUNT lock that holds every write of the bound mount (BP-storage-8); `CTRL` is held per command only.
+// Any other sub-LBA write is refused by name, nothing written.
+
+/// NVME4KN: sub-LBA writes served by read-modify-write this boot (`tests nvme`'s `rmw=`).
+#[cfg(all(target_arch = "x86_64", feature = "nvme"))]
+static NVME_RMW: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// NVME4KN: unaligned-write refusals so far (the first [`NVME_DENY_LINES`] print).
+#[cfg(all(target_arch = "x86_64", feature = "nvme"))]
+static NVME_UNALIGNED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// NVME4KN: `k` = log2(LBA size) - 9 of the published namespace (0 for 512 B .. 3 for 4 KiB); `None` with no namespace
+/// or a size that is not a power of two in 512..=4096.
+#[cfg(all(target_arch = "x86_64", feature = "nvme"))]
+pub fn nvme_sector_shift() -> Option<u32> {
+    let bs = nvme_info()?.block_size;
+    if bs.is_power_of_two() && (512..=4096).contains(&bs) { Some(bs.trailing_zeros() - 9) } else { None }
+}
+
+/// NVME4KN: `(k, block size)` of the published namespace, or the refusal the block layer gives.
+#[cfg(all(target_arch = "x86_64", feature = "nvme"))]
+fn nvme_view() -> Result<(u32, usize), BlockError> {
+    let dev = nvme_info().ok_or(BlockError::NotReady)?;
+    let k = nvme_sector_shift().ok_or(BlockError::Io)?;
+    Ok((k, dev.block_size as usize))
+}
+
+/// NVME4KN: read `buf.len() / 512` view sectors from `sector`. Whole LBAs go straight to [`read_blocks_nvme`]
+/// (chunked by `MAX_BLOCKS_PER_OP`, as `fs::unafs::nvme_read_multi` did); a span that is not whole LBAs is served LBA
+/// by LBA through a one-LBA bounce.
+#[cfg(all(target_arch = "x86_64", feature = "nvme"))]
+pub fn read_sectors_nvme(sector: u64, buf: &mut [u8]) -> Result<(), BlockError> {
+    if buf.is_empty() || buf.len() % SECTOR_BYTES != 0 {
+        return Err(BlockError::Io);
+    }
+    let (k, bs) = nvme_view()?;
+    let per = 1u64 << k;
+    if sector % per == 0 && buf.len() % bs == 0 {
+        for (i, c) in buf.chunks_mut(MAX_BLOCKS_PER_OP * bs).enumerate() {
+            read_blocks_nvme((sector >> k) + (i * MAX_BLOCKS_PER_OP) as u64, c)?;
+        }
+        return Ok(());
+    }
+    let mut b = alloc::vec![0u8; bs];
+    let mut done = 0usize;
+    while done < buf.len() {
+        let s = sector.checked_add((done / SECTOR_BYTES) as u64).ok_or(BlockError::BadLba)?;
+        read_blocks_nvme(s >> k, &mut b)?;
+        let off = ((s & (per - 1)) as usize) * SECTOR_BYTES;
+        let n = core::cmp::min(bs - off, buf.len() - done);
+        buf[done..done + n].copy_from_slice(&b[off..off + n]);
+        done += n;
+    }
+    Ok(())
+}
+
+/// NVME4KN: write `buf.len() / 512` view sectors at `sector`. Whole LBAs -> ONE [`write_blocks_nvme`] run (as
+/// `fs::unafs::handle_write_multi` did); exactly one 512 B sector inside a larger LBA -> read-modify-write of that LBA
+/// through the same granted write; anything else is refused by name and nothing is written.
+#[cfg(all(target_arch = "x86_64", feature = "nvme"))]
+pub fn write_sectors_nvme(sector: u64, buf: &[u8]) -> Result<(), BlockError> {
+    if buf.is_empty() || buf.len() % SECTOR_BYTES != 0 {
+        return Err(BlockError::Io);
+    }
+    let (k, bs) = nvme_view()?;
+    let per = 1u64 << k;
+    if sector % per == 0 && buf.len() % bs == 0 {
+        return write_blocks_nvme(sector >> k, buf);
+    }
+    if buf.len() == SECTOR_BYTES {
+        let mut b = alloc::vec![0u8; bs];
+        read_blocks_nvme(sector >> k, &mut b)?;
+        let off = ((sector & (per - 1)) as usize) * SECTOR_BYTES;
+        b[off..off + SECTOR_BYTES].copy_from_slice(buf);
+        write_blocks_nvme(sector >> k, &b)?;
+        NVME_RMW.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        return Ok(());
+    }
+    if NVME_UNALIGNED.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < NVME_DENY_LINES {
+        serial_println!(":: [nvme] write refused sector={} len={} lba={} — not whole LBAs, nothing written ::", sector, buf.len(), bs);
+    }
+    Err(BlockError::Io)
+}
+
+/// NVME4KN: ONE 512 B view sector at `sector` into the front of `buf` (the `fs::unafs::handle_read` arm). Returns 512.
+#[cfg(all(target_arch = "x86_64", feature = "nvme"))]
+pub fn read_sector_nvme(sector: u64, buf: &mut [u8]) -> Result<usize, BlockError> {
+    if buf.len() < SECTOR_BYTES {
+        return Err(BlockError::Io);
+    }
+    read_sectors_nvme(sector, &mut buf[..SECTOR_BYTES])?;
+    Ok(SECTOR_BYTES)
+}
+
+/// NVME4KN: ONE 512 B view sector at `sector` from the front of `buf` (the `fs::unafs::handle_write` arm).
+#[cfg(all(target_arch = "x86_64", feature = "nvme"))]
+pub fn write_sector_nvme(sector: u64, buf: &[u8]) -> Result<(), BlockError> {
+    if buf.len() < SECTOR_BYTES {
+        return Err(BlockError::Io);
+    }
+    write_sectors_nvme(sector, &buf[..SECTOR_BYTES])
+}
+
+/// NVME4KN: sub-LBA writes served by read-modify-write this boot.
+#[cfg(all(target_arch = "x86_64", feature = "nvme"))]
+pub fn nvme_rmw_count() -> u32 {
+    NVME_RMW.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+// ══════════ PREEMPTOFFXHCILOAN (zenbook-ledger Z62) — the block layer's xHCI loan held preempt-off; a masked claimant waits on a RUNNING holder only ══════════
+//
+// TAIL-APPENDED (no line above moves; `claim_xhci_for_io` changed in place, line-neutral). WEDGE-8 F3 gave a MASKED
+// `claim_xhci_for_io` caller (the FAT RMW spans, `with_unafs`) `Busy` at once, because the loan holder was preemptible:
+// a masked spinner could wait on a holder preempted on its own core. The block layer's holders (eight, each a local loan
+// for one BOT transaction) never sleep under the loan (their waits are `crate::hlt()` at IF=1), and no ISR touches the
+// loan's state (`xhci_msi_handler` is MMIO and one atomic), so the take now holds this CPU's preempt-off count
+// (BP-cores-23) from before the take to after the put and publishes the holder's CPU in `BLOCK_LOAN_CPU`. A masked
+// claimant spins (`wait::bounded`, `LOAN_MASKED_WAIT_MS`) only while the published holder is on ANOTHER CPU — a running
+// holder — and answers `Busy` at once for an unpublished holder (the pump, xhci-poll, ftdi, usbnet, ptp: preemptible as
+// before) or a same-CPU one. aarch64 keeps the at-once refusal (PREEMPTOFF-ARM owed). Owed: XHCILOAN-FAILHOLD (a failing
+// BOT ladder holds preempt-off up to 3x `hw_wait_budget`), XHCILOAN-POLL, XHCILOAN-PUMP (refused), XHCILOAN-PTPCOPY.
+
+/// PREEMPTOFFXHCILOAN: the block layer's loan of the xHCI controller. Derefs to [`XhciLoan`]; on x86 it holds this CPU's
+/// preempt-off count from before the take (`take_block_loan`) to after the put (its Drop), and `tag` is the published
+/// holder word (cpu + 1; 0 on aarch64).
+pub struct BlockLoan {
+    loan: Option<XhciLoan>,
+    tag: u32,
+}
+
+impl core::ops::Deref for BlockLoan {
+    type Target = XhciLoan;
+    #[inline]
+    fn deref(&self) -> &XhciLoan {
+        self.loan.as_ref().expect("BlockLoan invariant: Some until drop")
+    }
+}
+
+impl core::ops::DerefMut for BlockLoan {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut XhciLoan {
+        self.loan.as_mut().expect("BlockLoan invariant: Some until drop")
+    }
+}
+
+impl Drop for BlockLoan {
+    fn drop(&mut self) {
+        // The put first (XhciLoan's masked O(1) put), while this CPU is still preempt-off; then the publication is
+        // withdrawn (only if it is still ours) and the count released.
+        #[cfg(target_arch = "x86_64")] let shed = loan_shed_take(); drop(self.loan.take()); // XHCILOANFAILHOLD (Z66): the shed mark is read BEFORE the put (still held: no other block loan can exist to clear it)
+        #[cfg(target_arch = "x86_64")]
+        { if self.tag == 0 { return; } if shed { return; } // XHCILOANPTPCOPY (Z69): a demoted (claim-only) loan holds no count and no publication. XHCILOANFAILHOLD (Z66): a shed loan already withdrew its publication and released its count (`xhci_loan_shed`)
+            let _ = BLOCK_LOAN_CPU.compare_exchange(
+                self.tag,
+                0,
+                core::sync::atomic::Ordering::AcqRel,
+                core::sync::atomic::Ordering::Relaxed,
+            );
+            loan_held_put(); // PREEMPTOFFX86STALEDROP (rmbp-ledger B1069): the take's hold, epoch carried
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = self.tag;
+    }
+}
+
+/// PREEMPTOFFXHCILOAN: the CPU (+1) of the block-layer holder of controller 0's loan, held preempt-off; 0 = none
+/// published. Written by the holder (after its take, cleared by CAS after its put), read by masked claimants. Lock-free.
+#[cfg(target_arch = "x86_64")]
+static BLOCK_LOAN_CPU: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// PREEMPTOFFXHCILOAN: the longest a MASKED claimant spins on a running holder: past a healthy 32 KiB BOT transaction
+/// (~1-2 ms at USB2), and inside the 20 ms masked goal (CLOCKCORE / HIDSTALL `masked_max_ms`).
+pub const LOAN_MASKED_WAIT_MS: u64 = 10;
+
+/// PREEMPTOFFXHCILOAN: masked waits that got the loan, and masked claims refused, this boot; the last refusal's why.
+#[cfg(target_arch = "x86_64")]
+static LOAN_MASKED_OK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+#[cfg(target_arch = "x86_64")]
+static LOAN_MASKED_BUSY: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+#[cfg(target_arch = "x86_64")]
+static LOAN_LAST_WHY: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+#[cfg(target_arch = "x86_64")]
+static LOAN_REFUSAL_SAID: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+#[cfg(target_arch = "x86_64")]
+fn loan_why_word(code: u8) -> &'static str {
+    match code {
+        1 => "holder-preemptible",
+        2 => "same-cpu",
+        3 => "masked-timeout(10ms)",
+        4 => "claimant-long-hold", // XHCILOANPTPCOPY (Z69): a masked PTP/MTP claimant (its transaction hlt-waits) is refused at once
+        _ => "none",
+    }
+}
+
+/// PREEMPTOFFXHCILOAN: take controller 0's loan for the block layer — this CPU's preempt-off count held first, the holder
+/// published on success, the count released on a refusal.
+#[cfg(target_arch = "x86_64")]
+fn take_block_loan() -> Result<BlockLoan, XhciClaimError> {
+    let held = crate::arch::sched::preemptoff::hold(); // PREEMPTOFFX86STALEDROP (rmbp-ledger B1069): the hold carries its CPU and epoch
+    match xhci::claim() {
+        Ok(l) => {
+            if loan_poll_yield_skip() || loan_ptp_yield_wait() { drop(l); crate::arch::sched::preemptoff::put(held); return Err(XhciClaimError::Busy); } let tag = crate::arch::percpu::this_cpu().cpu_index.saturating_add(1); loan_shed_arm(); loan_held_set(held); loan_yield_close(); // XHCILOANPTPYIELDPOLLSKIP (Z86): the xhci-poll take inside an open PTP yield window goes straight back (unpublished, the closer left OPEN). XHCILOANFAILHOLD (Z66): the loan's age starts here, its shed mark cleared. XHCILOANPTPYIELDPOLLTAKE (Z82): an open PTP yield window records its closer BEFORE the publish below. XHCILOANPTPYIELDPTPWAIT (Z90): so does a second PTP claimant's take (claim_only's mark, not the window's holder), which then waits the window out in claim_xhci_for_io's hlt loop
+            BLOCK_LOAN_CPU.store(tag, core::sync::atomic::Ordering::Release);
+            Ok(BlockLoan { loan: Some(l), tag })
+        }
+        Err(e) => {
+            crate::arch::sched::preemptoff::put(held);
+            Err(e)
+        }
+    }
+}
+
+/// PREEMPTOFFXHCILOAN: the aarch64 take is the plain claim (no preempt-off count there yet: PREEMPTOFF-ARM).
+#[cfg(not(target_arch = "x86_64"))]
+fn take_block_loan() -> Result<BlockLoan, XhciClaimError> {
+    xhci::claim().map(|l| BlockLoan { loan: Some(l), tag: 0 })
+}
+
+/// PREEMPTOFFXHCILOAN: a MASKED claimant met a held loan. Spin re-taking it for at most [`LOAN_MASKED_WAIT_MS`], but only
+/// while the published holder is a preempt-off block holder on ANOTHER CPU (running, so it returns the loan); an
+/// unpublished holder (preemptible) or one on this CPU answers `Busy` at once, as WEDGE-8 F3 did. The first refusal is
+/// said once.
+#[cfg(target_arch = "x86_64")]
+fn masked_loan_wait() -> Result<BlockLoan, BlockError> {
+    let me = crate::arch::percpu::this_cpu().cpu_index.saturating_add(1);
+    let got: core::cell::Cell<Option<Result<BlockLoan, BlockError>>> = core::cell::Cell::new(None);
+    let why = core::cell::Cell::new(0u8);
+    let t0 = crate::arch::now_cycles();
+    let _ = wait::bounded(LOAN_MASKED_WAIT_MS, || match take_block_loan() {
+        Ok(l) => {
+            got.set(Some(Ok(l)));
+            true
+        }
+        Err(XhciClaimError::NotReady) => {
+            got.set(Some(Err(BlockError::NotReady)));
+            true
+        }
+        Err(XhciClaimError::Busy) => {
+            let h = BLOCK_LOAN_CPU.load(core::sync::atomic::Ordering::Acquire);
+            if h == 0 {
+                why.set(1);
+                true
+            } else if h == me {
+                why.set(2);
+                true
+            } else {
+                false
+            }
+        }
+    });
+    if let Some(r) = got.into_inner() {
+        if r.is_ok() {
+            LOAN_MASKED_OK.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
+        return r;
+    }
+    let code = if why.get() == 0 { 3 } else { why.get() };
+    LOAN_LAST_WHY.store(code, core::sync::atomic::Ordering::Relaxed);
+    LOAN_MASKED_BUSY.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    say_loan_refusal("block", code, t0); // XHCILOANPTPCOPY (Z69): the ONE refusal line and latch, `who=` named
+    Err(BlockError::Busy)
+}
+
+/// PREEMPTOFFXHCILOAN: aarch64 keeps WEDGE-8's at-once refusal for a masked claimant (PREEMPTOFF-ARM owed).
+#[cfg(not(target_arch = "x86_64"))]
+fn masked_loan_wait() -> Result<BlockLoan, BlockError> {
+    Err(BlockError::Busy)
+}
+
+/// PREEMPTOFFXHCILOAN: `(masked waits that got the loan, masked claims refused)` this boot.
+#[cfg(target_arch = "x86_64")]
+pub fn xhci_loan_masked_census() -> (u32, u32) {
+    (
+        LOAN_MASKED_OK.load(core::sync::atomic::Ordering::Relaxed),
+        LOAN_MASKED_BUSY.load(core::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// PREEMPTOFFXHCILOAN KAT handshake: 0 idle, 1 the holder task holds the loan, 2 the masked claimant is spinning,
+/// 3 the holder put the loan back, 9 the holder never got it.
+#[cfg(target_arch = "x86_64")]
+static LOAN_KAT_STATE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// PREEMPTOFFXHCILOAN KAT holder (a task on a sibling CPU): take the block loan unmasked, hold it until the claimant
+/// spins (<= 200 ms) and 2 ms more, put it back.
+#[cfg(target_arch = "x86_64")]
+fn loan_kat_holder(_: usize) {
+    use core::sync::atomic::Ordering;
+    let Ok(l) = claim_xhci_for_io() else {
+        LOAN_KAT_STATE.store(9, Ordering::Release);
+        return;
+    };
+    LOAN_KAT_STATE.store(1, Ordering::Release);
+    let _ = wait::bounded(200, || LOAN_KAT_STATE.load(Ordering::Acquire) == 2);
+    let _ = wait::bounded(2, || false);
+    drop(l);
+    LOAN_KAT_STATE.store(3, Ordering::Release);
+}
+
+/// PREEMPTOFFXHCILOAN: `tests preemptaudit`'s loan leg — a task on a sibling CPU holds the block loan (preempt-off,
+/// published), and a MASKED claimant on this CPU must get it inside [`LOAN_MASKED_WAIT_MS`]. Returns
+/// `(loan_wait word, µs the masked claim took)`: `ok` / `refused-<why>` / `notready` / `err`, or
+/// `skip(masked|no-xhci|one-cpu|holder-late)`.
+#[cfg(target_arch = "x86_64")]
+pub fn xhci_loan_wait_kat() -> (&'static str, u64) {
+    use core::sync::atomic::Ordering;
+    if crate::arch::irqs_masked() {
+        return ("skip(masked)", 0);
+    }
+    if matches!(xhci::claim(), Err(XhciClaimError::NotReady)) {
+        return ("skip(no-xhci)", 0);
+    }
+    let me = crate::arch::percpu::this_cpu().cpu_index as usize;
+    let cpu = crate::arch::sched::sibling_online_cpu(me);
+    if cpu == me {
+        return ("skip(one-cpu)", 0);
+    }
+    LOAN_KAT_STATE.store(0, Ordering::Release);
+    crate::arch::sched::spawn("loanwait-kat", loan_kat_holder, 0, cpu, crate::arch::sched::PRIO_HIGH);
+    if !wait::bounded(1000, || LOAN_KAT_STATE.load(Ordering::Acquire) == 1) {
+        return ("skip(holder-late)", 0);
+    }
+    let (word, cycles) = crate::arch::without_interrupts(|| {
+        LOAN_KAT_STATE.store(2, Ordering::Release);
+        let t0 = crate::arch::now_cycles();
+        let r = claim_xhci_for_io();
+        let c = crate::arch::now_cycles().wrapping_sub(t0);
+        let w = match &r {
+            Ok(_) => "ok",
+            Err(BlockError::Busy) => match LOAN_LAST_WHY.load(Ordering::Relaxed) {
+                1 => "refused-holder-preemptible",
+                2 => "refused-same-cpu",
+                3 => "refused-masked-timeout",
+                _ => "refused",
+            },
+            Err(BlockError::NotReady) => "notready",
+            Err(_) => "err",
+        };
+        drop(r);
+        (w, c)
+    });
+    let _ = wait::bounded(200, || LOAN_KAT_STATE.load(Ordering::Acquire) >= 3);
+    (word, cycles.saturating_mul(1000) / wait::cycles_ms(1).max(1))
+}
+
+// ══════════ XHCILOANPTPCOPY (zenbook-ledger Z69) — the PTP/MTP controller claim takes the ONE block-loan path, demoted to claim-only ══════════
+//
+// TAIL-APPENDED. `drivers/xhci/ptp.rs` `with_controller` copied `claim_xhci_for_io`'s hlt loop on the same controller-0
+// claim word. A PTP/MTP hold is measured at seconds to minutes (`mtp::READ_CHUNK` 64 MiB, GetObject to `WHOLE_CAP`
+// 128 MiB, the shutter's >= 1 s ObjectAdded watch, a whole-file SendObject), far past the loan's one-BOT-transaction
+// expectation, so it must hold neither the preempt-off count (BP-cores-23) nor the publication: `claim_only` takes the
+// ONE path (`claim_xhci_for_io`) and demotes the loan at once. A masked PTP claimant is refused at once (its transaction
+// `hlt`-waits, which at IF=0 never wakes), counted and said by the one refusal line (`who=ptp`). Owed: XHCILOAN-PTPYIELD.
+
+/// XHCILOANPTPCOPY: PTP/MTP claims that took the loan through [`BlockLoan::claim_only`] this boot.
+static LOAN_PTP_CLAIMS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+impl BlockLoan {
+    /// XHCILOANPTPCOPY: the controller loan for a LONG holder (the PTP/MTP transport): the ONE claim path
+    /// (`claim_xhci_for_io`: its unmasked bounded hlt wait), then demoted — no preempt-off count, no publication — so a
+    /// masked block claimant meets an unpublished holder and is told `Busy` at once (`why=holder-preemptible`). A masked
+    /// caller is refused at once (`why=claimant-long-hold`).
+    pub fn claim_only() -> Result<BlockLoan, BlockError> {
+        if crate::arch::irqs_masked() {
+            ptp_masked_refusal();
+            return Err(BlockError::Busy);
+        }
+        let _ptp = LoanPtpMark::set()?; let mut l = claim_xhci_for_io()?; // XHCILOANPTPYIELDPTPTAKE (Z87): this task is marked a PTP claimant until claim_only returns; XHCILOANPTPYIELDPTPWAIT (Z90): the mark, held across claim_xhci_for_io's wait, refuses this task's take inside a yield window
+        l.demote();
+        LOAN_PTP_CLAIMS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        Ok(l)
+    }
+
+    /// XHCILOANPTPCOPY: withdraw this loan's publication (only if still ours) and release the count its take holds;
+    /// `tag` 0 then tells the Drop there is nothing left to release.
+    fn demote(&mut self) {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if self.tag != 0 {
+                let _ = BLOCK_LOAN_CPU.compare_exchange(
+                    self.tag,
+                    0,
+                    core::sync::atomic::Ordering::AcqRel,
+                    core::sync::atomic::Ordering::Relaxed,
+                );
+                self.tag = 0;
+                loan_held_put(); // PREEMPTOFFX86STALEDROP (rmbp-ledger B1069)
+            }
+        }
+    }
+}
+
+// ══════════ XHCILOANPTPYIELD (zenbook-ledger Z73) — a PTP/MTP data phase hands the loan back to a block claimant between TDs ══════════
+//
+// A claim-only PTP hold (Z69) keeps controller 0 for a whole data phase: a 64 MiB GetPartialObject (`mtp::READ_CHUNK`) is
+// 2048 TDs of 32 KiB (`STORAGE_DATA_BYTES`), seconds at USB2, and a masked block claimant (FAT RMW, `with_unafs`) is told
+// `Busy` at once (why=holder-preemptible) and gives up after its 64 / 8 tick-paced retries. `ptp::loan_yield` calls
+// `yield_now` from the ONE bulk-in loop (`ptp_txn_inner`'s Phase::In) between two TDs (nothing of PTP armed; a bulk
+// transfer has no inter-TD timing): the PUT (`XhciLoan`'s masked O(1) put), a bounded WINDOW in which a block claimant
+// takes it (its take publishes `BLOCK_LOAN_CPU`), the RE-TAKE through `claim_only` again (its bounded wait is the ONE
+// path's), pointer-checked to be the same heap controller. Only a demoted loan (tag 0) yields. Owed: XHCILOAN-PTPYIELD-ARM.
+
+/// XHCILOANPTPYIELD: a periodic yield every this many TDs (4 MiB of 32 KiB TDs) ...
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+pub const LOAN_YIELD_TDS: u32 = 128;
+/// XHCILOANPTPYIELD: ... and no sooner than this many ms after the last (a no-claimant window then costs <= 3/50 of a pull).
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+pub const LOAN_YIELD_MIN_MS: u64 = 50;
+/// XHCILOANPTPYIELD: a masked claimant refused since the last yield makes one due after this many TDs (256 KiB).
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+pub const LOAN_YIELD_DEMAND_TDS: u32 = 8;
+/// XHCILOANPTPYIELD: the window on the ms clock (>= 2 real ms: two 1 kHz ticks on every CPU, so a hlt-waiter retries).
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+pub const LOAN_YIELD_WINDOW_MS: u64 = 3;
+/// XHCILOANPTPYIELD: `claim_only` attempts for the re-take (~8 s at x86's 2 s budget: past a failing BOT ladder's 3x first attempt).
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+const LOAN_YIELD_RETAKES: u32 = 4;
+
+/// XHCILOANPTPYIELD: TDs since the last yield, `arch::ms` at it, `LOAN_MASKED_BUSY` at it (one PTP hold at a time: written
+/// only by the holder).
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+static LOAN_YIELD_TDS_SINCE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+static LOAN_YIELD_LAST_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+static LOAN_YIELD_SEEN_BUSY: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// XHCILOANPTPYIELD: yields this boot, and windows a block claimant took.
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+static LOAN_YIELDS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+static LOAN_YIELD_TAKEN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+impl BlockLoan {
+    /// XHCILOANPTPYIELD: one TD of a PTP data phase passed; a yield is due at >= `LOAN_YIELD_TDS` TDs and
+    /// >= `LOAN_YIELD_MIN_MS` since the last, or at >= `LOAN_YIELD_DEMAND_TDS` when a masked claimant was refused since.
+    pub fn yield_due() -> bool {
+        use core::sync::atomic::Ordering;
+        let n = LOAN_YIELD_TDS_SINCE.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+        let periodic = n >= LOAN_YIELD_TDS
+            && crate::arch::ms().saturating_sub(LOAN_YIELD_LAST_MS.load(Ordering::Relaxed)) >= LOAN_YIELD_MIN_MS;
+        let demand = n >= LOAN_YIELD_DEMAND_TDS
+            && LOAN_MASKED_BUSY.load(Ordering::Relaxed) != LOAN_YIELD_SEEN_BUSY.load(Ordering::Relaxed);
+        periodic || demand
+    }
+
+    /// XHCILOANPTPYIELD: put the loan back, give a block claimant a bounded window, re-take it through `claim_only`.
+    /// `Ok((µs put -> re-take, a block claimant took the window))`; `Ok((0, false))` with nothing moved for a loan that must
+    /// not yield (masked, preempt-off held, published, absent). `Err` leaves the loan EMPTY: the caller must not touch the
+    /// controller again (the Drop of an empty demoted loan does nothing).
+    pub fn yield_now(&mut self) -> Result<(u64, bool), BlockError> {
+        use core::sync::atomic::Ordering;
+        if crate::arch::irqs_masked() || crate::arch::sched::preemptoff::witness().0 || self.tag != 0 || self.loan.is_none() {
+            return Ok((0, false));
+        }
+        let before: *const crate::drivers::xhci::XhciController = &***self;
+        let t0 = crate::arch::now_cycles();
+        loan_yield_holder_set(); LOAN_YIELD_CLOSER.store(LOAN_CLOSER_OPEN, Ordering::Release); drop(self.loan.take()); // the PUT: XhciLoan's masked O(1) put. XHCILOANPTPYIELDPTPWAIT (Z90): this hold is recorded as the window's holder (its own re-take is never the second claimant). XHCILOANPTPYIELDPOLLTAKE (Z82): the window is marked open while this hold still has the loan
+        let m0 = crate::arch::ms();
+        let mut taken = false;
+        loop {
+            if BLOCK_LOAN_CPU.load(Ordering::Acquire) != 0 {
+                taken = true; // a block take published: the re-take below waits out its transaction
+                break;
+            }
+            if crate::arch::ms().saturating_sub(m0) >= LOAN_YIELD_WINDOW_MS {
+                break;
+            }
+            crate::arch::sched::yield_now(); // a same-CPU claimant runs
+        }
+        let mut tries = 0u32;
+        let mut l = loop {
+            match BlockLoan::claim_only() {
+                Ok(l) => break l,
+                Err(BlockError::Busy) => {
+                    tries += 1;
+                    if tries >= LOAN_YIELD_RETAKES {
+                        return Err(BlockError::Busy);
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        };
+        let after: *const crate::drivers::xhci::XhciController = &**l;
+        if !core::ptr::eq(before, after) {
+            return Err(BlockError::Io); // `l` drops: the controller goes back
+        }
+        self.loan = l.loan.take(); // the demoted temporary drops empty (tag 0)
+        LOAN_YIELD_TDS_SINCE.store(0, Ordering::Relaxed);
+        LOAN_YIELD_LAST_MS.store(crate::arch::ms(), Ordering::Relaxed);
+        LOAN_YIELD_SEEN_BUSY.store(LOAN_MASKED_BUSY.load(Ordering::Relaxed), Ordering::Relaxed);
+        LOAN_YIELDS.fetch_add(1, Ordering::Relaxed);
+        if taken {
+            LOAN_YIELD_TAKEN.fetch_add(1, Ordering::Relaxed);
+        }
+        let us = crate::arch::now_cycles().wrapping_sub(t0).saturating_mul(1000) / wait::cycles_ms(1).max(1);
+        Ok((us, taken))
+    }
+}
+
+/// XHCILOANPTPYIELD: aarch64 never yields (no `BLOCK_LOAN_CPU` publication there: XHCILOAN-PTPYIELD-ARM owed).
+#[cfg(all(feature = "uvc", not(target_arch = "x86_64")))]
+impl BlockLoan {
+    pub fn yield_due() -> bool {
+        false
+    }
+    pub fn yield_now(&mut self) -> Result<(u64, bool), BlockError> {
+        Ok((0, false))
+    }
+}
+
+/// XHCILOANPTPYIELD: `(yields, windows a block claimant took)` this boot.
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+pub fn xhci_loan_yields() -> (u32, u32) {
+    (
+        LOAN_YIELDS.load(core::sync::atomic::Ordering::Relaxed),
+        LOAN_YIELD_TAKEN.load(core::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// XHCILOANPTPYIELD KAT handshake: 0 idle, 1 the claimant is about to wait, 2 it holds the loan, 3 it put it back, 9 refused.
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+static LOAN_YIELD_KAT: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// XHCILOANPTPYIELD KAT claimant (a task on a sibling CPU, Z62's `loan_kat_holder` shape): an unmasked block claim that
+/// hlt-waits while the KAT's PTP claim holds the loan, takes it in the yield window, holds 1 ms, puts it back.
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+fn loan_yield_kat_claimant(_: usize) {
+    use core::sync::atomic::Ordering;
+    LOAN_YIELD_KAT.store(1, Ordering::Release); loan_yield_kat_order_wait(); // XHCILOANPTPYIELDWAITCOUNT (Z108): parked until both PTP claimants are refused by Z90 inside the window (LINE-NEUTRAL)
+    match claim_xhci_for_io() {
+        Ok(l) => {
+            LOAN_YIELD_KAT.store(2, Ordering::Release);
+            let _ = wait::bounded(1, || false);
+            drop(l);
+            LOAN_YIELD_KAT.store(3, Ordering::Release);
+        }
+        Err(_) => LOAN_YIELD_KAT.store(9, Ordering::Release),
+    }
+}
+
+/// XHCILOANPTPYIELD: arm the KAT claimant on a sibling CPU and wait until it is in its claim wait (called while the
+/// PTP claim holds the loan). `Err` = `skip(one-cpu)` / `skip(claimant-late)`.
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+pub fn xhci_loan_yield_kat_arm() -> Result<(), &'static str> {
+    use core::sync::atomic::Ordering;
+    let me = crate::arch::percpu::this_cpu().cpu_index as usize;
+    let cpu = crate::arch::sched::sibling_online_cpu(me);
+    if cpu == me {
+        return Err("skip(one-cpu)");
+    }
+    LOAN_YIELD_KAT.store(0, Ordering::Release);
+    crate::arch::sched::spawn("ptpyield-kat", loan_yield_kat_claimant, 0, cpu, crate::arch::sched::PRIO_HIGH);
+    if !wait::bounded(1000, || LOAN_YIELD_KAT.load(Ordering::Acquire) == 1) {
+        return Err("skip(claimant-late)");
+    }
+    loan_yield_kat_ptp_arm(cpu)?; let _ = wait::bounded(2, || false); // it is in `claim_xhci_for_io`'s hlt wait now. XHCILOANPTPYIELDPTPMARKKAT (Z104): the two PTP claimants armed first (LINE-NEUTRAL)
+    Ok(())
+}
+
+/// XHCILOANPTPYIELD: after the KAT's PTP claim is put back, wait (<= 2500 ms) for the claimant to finish.
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+pub fn xhci_loan_yield_kat_settle() {
+    let _ = wait::bounded(2500, || LOAN_YIELD_KAT.load(core::sync::atomic::Ordering::Acquire) >= 3); loan_yield_kat_ptp_settle(); // XHCILOANPTPYIELDPTPMARKKAT (Z104): the two PTP claimants too (LINE-NEUTRAL)
+}
+
+/// XHCILOANPTPCOPY: PTP/MTP claims through the one path this boot (read by `ptp::loan_path_kat`).
+pub fn xhci_loan_ptp_claims() -> u32 {
+    LOAN_PTP_CLAIMS.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// XHCILOANPTPCOPY: whether a preempt-off block holder of controller 0's loan is published right now.
+pub fn xhci_loan_published() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        BLOCK_LOAN_CPU.load(core::sync::atomic::Ordering::Acquire) != 0
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
+/// XHCILOANPTPCOPY: a MASKED PTP/MTP claimant, refused at once: counted with the masked refusals, said once.
+#[cfg(target_arch = "x86_64")]
+fn ptp_masked_refusal() {
+    LOAN_LAST_WHY.store(4, core::sync::atomic::Ordering::Relaxed);
+    LOAN_MASKED_BUSY.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    say_loan_refusal("ptp", 4, crate::arch::now_cycles());
+}
+
+/// XHCILOANPTPCOPY: aarch64 keeps the silent at-once refusal (PREEMPTOFF-ARM owed).
+#[cfg(not(target_arch = "x86_64"))]
+fn ptp_masked_refusal() {}
+
+/// XHCILOANPTPCOPY: the ONE `[xhci] loan` first-refusal line (the boot's first masked refusal, once), naming the
+/// refused claimant (`block` | `ptp`).
+#[cfg(target_arch = "x86_64")]
+fn say_loan_refusal(who: &str, code: u8, t0: u64) {
+    if !LOAN_REFUSAL_SAID.swap(true, core::sync::atomic::Ordering::AcqRel) {
+        let us = crate::arch::now_cycles().wrapping_sub(t0).saturating_mul(1000) / wait::cycles_ms(1).max(1);
+        serial_println!(
+            "[xhci] loan masked claim -> Busy who={} why={} waited_us={} (PREEMPTOFFXHCILOAN Z62, first refusal, once)",
+            who,
+            loan_why_word(code),
+            us
+        );
+    }
+}
+
+// ══════════ XHCILOANFAILHOLD (zenbook-ledger Z66) — a block loan in a BOT wait sheds its non-preemption ══════════
+//
+// TAIL-APPENDED after Z62's KAT (Z62's `Drop` and `take_block_loan` gain one same-line token each, line-neutral). Z62 held
+// the block loan preempt-off from take to put; a FAILING BOT transfer holds that loan through the whole ladder inside one
+// `storage_*10` call (`xhci/mod.rs` `bot_transfer_body`): a 3x `hw_wait_budget` first attempt (6 s on x86) plus a
+// recovery and its rungs, every other task on the holder's CPU stopped with it — on the service core, 3x the pump
+// watch's `WEDGE_MS`. The xHCI layer's hook (`XhciController::loan_shed_hook`, its file tail) calls `xhci_loan_shed` from
+// the holder's own call chain at each stage-wait wake (gate: loan age >= `LOAN_MASKED_WAIT_MS`) and at the ladder entry
+// (gate 0: the recovery's EP0/command waits are unhooked). The shed is Z69's demotion shape on the static path: the
+// publication withdrawn (CAS tag -> 0), the count released (`preemptoff::enable`), then the mark (`LOAN_SHED`) that tells
+// `Drop` not to do either again. The holder KEEPS the claim and is preemptible as before Z62; a masked claimant answers
+// `Busy` at once (unpublished holder), WEDGE-8 F3 restated. All state is lock-free and written only by the holder while
+// it holds the loan (controller 0's single loan: at most one block loan is live). aarch64: no count, nothing to shed.
+
+/// XHCILOANFAILHOLD: the live block loan was shed (set by `xhci_loan_shed`, cleared at the take, read-and-cleared by
+/// `Drop` before the put).
+#[cfg(target_arch = "x86_64")]
+static LOAN_SHED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// XHCILOANFAILHOLD: `now_cycles` at the live block loan's take (its age).
+#[cfg(target_arch = "x86_64")]
+static LOAN_TAKEN_AT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// XHCILOANFAILHOLD: block loans shed this boot.
+#[cfg(target_arch = "x86_64")]
+static LOAN_SHED_N: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// XHCILOANFAILHOLD: at the take (loan held, preempt-off): stamp the loan's age, clear its shed mark.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn loan_shed_arm() {
+    LOAN_TAKEN_AT.store(crate::arch::now_cycles(), core::sync::atomic::Ordering::Relaxed);
+    LOAN_SHED.store(false, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// XHCILOANFAILHOLD: `Drop`'s read of the shed mark, taken (cleared) while the loan is still held.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn loan_shed_take() -> bool {
+    LOAN_SHED.swap(false, core::sync::atomic::Ordering::AcqRel)
+}
+
+/// XHCILOANFAILHOLD: shed THIS CPU's live block loan if it has been held at least `gate_ms` — the publication withdrawn,
+/// the preempt-off count released, the mark set (Z69's `demote` shape). A no-op unless the published block holder is
+/// this CPU (so a non-block xHCI holder, or a loan already shed, never matches). Called only from the holder's own call
+/// chain (`xhci::XhciController::loan_shed_hook`) while it is still preempt-off, so the check and the release cannot
+/// interleave with a switch. The first shed of the boot is said once.
+#[cfg(target_arch = "x86_64")]
+pub fn xhci_loan_shed(rung: &'static str, gate_ms: u64) {
+    use core::sync::atomic::Ordering;
+    let me = crate::arch::percpu::this_cpu().cpu_index.saturating_add(1);
+    if BLOCK_LOAN_CPU.load(Ordering::Acquire) != me || LOAN_SHED.load(Ordering::Relaxed) {
+        return;
+    }
+    let waited_ms = crate::arch::now_cycles().wrapping_sub(LOAN_TAKEN_AT.load(Ordering::Relaxed)) / wait::cycles_ms(1).max(1);
+    if waited_ms < gate_ms {
+        return;
+    }
+    if BLOCK_LOAN_CPU.compare_exchange(me, 0, Ordering::AcqRel, Ordering::Relaxed).is_err() {
+        return;
+    }
+    loan_held_put(); // PREEMPTOFFX86STALEDROP (rmbp-ledger B1069): the take's hold, from the static (the shed never sees the BlockLoan)
+    LOAN_SHED.store(true, Ordering::Release);
+    if LOAN_SHED_N.fetch_add(1, Ordering::Relaxed) == 0 {
+        serial_println!(
+            "[xhci] loan shed cpu={} rung={} waited_ms={} (XHCILOANFAILHOLD Z66, first shed, once)",
+            me - 1,
+            rung,
+            waited_ms
+        );
+    }
+}
+
+/// XHCILOANFAILHOLD: block loans shed this boot (`loan_shed=` on the PREEMPTAUDIT line).
+#[cfg(target_arch = "x86_64")]
+pub fn xhci_loan_shed_count() -> u32 {
+    LOAN_SHED_N.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+// ══════════ XHCILOANSHEDKAT (zenbook-ledger Z71) — `tests preemptaudit` drives the block loan's shed ══════════
+//
+// TAIL-APPENDED after Z66 (no line above moves). `loan_shed=` reads 0 on every healthy boot, so Z66's shed had never run
+// under a test. The honest unit: the KAT takes the block loan through the ONE claim path (`claim_xhci_for_io`) and calls
+// `xhci_loan_shed` on it directly (`XhciController::loan_shed_hook` is a private rung/gate picker over exactly this call
+// and needs a live mid-BOT controller: owed XHCILOAN-SHEDHOOK-KAT). Legs: the gate (a 60 s gate changes nothing), the
+// shed (count back to its pre-take value — 0, read by `preemptoff::witness` false -> true -> false — publication 0, the
+// claim kept, `LOAN_SHED_N` +1), a MASKED contender on a sibling CPU answered Busy why=holder-preemptible inside
+// `LOAN_MASKED_WAIT_MS` while the holder waits preemptible, and the shed-aware Drop under the KAT's own extra `disable`
+// (a double release would read the count free). The KAT gives back what it spent (B1034 `full_kat`'s shape): its
+// `LOAN_SHED_N`, the contender's `LOAN_MASKED_BUSY`, `LOAN_LAST_WHY`, and neither once-line (`[xhci] loan shed`,
+// `[xhci] loan masked claim`) is said by it. The shed statics are written only by the ONE block-loan holder — the KAT
+// for the whole window. A real masked refusal inside the contender's ~ms window is still counted, but its once-line is
+// silenced if it was the boot's first. XHCILOANSHEDKATCONTROL (zenbook-ledger Z78) builds the go-red control: the same
+// contender, BEFORE the shed (the loan still published preempt-off), must spin Z62's bounded wait out and answer Busy
+// why=masked-timeout in [8, 20] ms (`loan_shed_control`); both legs share ONE bookkeeping helper (`loan_shed_contend`).
+// XHCILOANSHEDKATCONTROLUS (zenbook-ledger Z80): the control's µs reaches the line as `loan_shed_us=` (`LOAN_SHED_CONTROL_US`).
+
+/// XHCILOANSHEDKAT contender handshake: 0 waiting, then the masked claim's outcome — 1 Ok, 2 Busy, 3 NotReady, 4 error.
+#[cfg(target_arch = "x86_64")]
+static LOAN_SHEDKAT_STATE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+/// XHCILOANSHEDKAT: the contender's `LOAN_LAST_WHY` read right after its claim.
+#[cfg(target_arch = "x86_64")]
+static LOAN_SHEDKAT_WHY: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+/// XHCILOANSHEDKAT: µs the contender's masked claim took.
+#[cfg(target_arch = "x86_64")]
+static LOAN_SHEDKAT_US: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// XHCILOANSHEDKATCONTROLUS (zenbook-ledger Z80): µs the pre-shed control's masked contender took (`loan_shed_us=` on the
+/// PREEMPTAUDIT line); written only by the KAT task — 0 at the KAT's first statement, the control's reading once its
+/// contender came — so 0 means the control did not run.
+#[cfg(target_arch = "x86_64")]
+static LOAN_SHED_CONTROL_US: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// XHCILOANSHEDKAT contender (a task on a sibling CPU): one MASKED `claim_xhci_for_io` against the KAT's shed loan,
+/// timed; the outcome, the refusal's why and the µs published for the KAT.
+#[cfg(target_arch = "x86_64")]
+fn loan_shed_contender(_: usize) {
+    use core::sync::atomic::Ordering;
+    let (code, why, cycles) = crate::arch::without_interrupts(|| {
+        let t0 = crate::arch::now_cycles();
+        let r = claim_xhci_for_io();
+        let c = crate::arch::now_cycles().wrapping_sub(t0);
+        let code = match &r {
+            Ok(_) => 1u8,
+            Err(BlockError::Busy) => 2,
+            Err(BlockError::NotReady) => 3,
+            Err(_) => 4,
+        };
+        let why = LOAN_LAST_WHY.load(Ordering::Relaxed);
+        drop(r);
+        (code, why, c)
+    });
+    LOAN_SHEDKAT_WHY.store(why, Ordering::Relaxed);
+    LOAN_SHEDKAT_US.store(cycles.saturating_mul(1000) / wait::cycles_ms(1).max(1), Ordering::Relaxed);
+    LOAN_SHEDKAT_STATE.store(code, Ordering::Release);
+}
+
+/// XHCILOANSHEDKATCONTROL: ONE contender run for both KAT legs — spawn [`loan_shed_contender`] on `cpu`, wait for its
+/// outcome (<= 1000 ms), and give back what it spent: its `LOAN_MASKED_BUSY` (Busy) or `LOAN_MASKED_OK` (Ok),
+/// `LOAN_LAST_WHY`, and the once-line latch (its refusal is never the boot's said line). Returns
+/// `(came, code, why, us)` as the contender published them.
+#[cfg(target_arch = "x86_64")]
+fn loan_shed_contend(cpu: usize) -> (bool, u8, u8, u64) {
+    use core::sync::atomic::Ordering;
+    let prior_said = LOAN_REFUSAL_SAID.swap(true, Ordering::AcqRel);
+    let prior_why = LOAN_LAST_WHY.load(Ordering::Relaxed);
+    LOAN_SHEDKAT_STATE.store(0, Ordering::Release);
+    crate::arch::sched::spawn("loanshed-kat", loan_shed_contender, 0, cpu, crate::arch::sched::PRIO_HIGH);
+    let came = wait::bounded(1000, || LOAN_SHEDKAT_STATE.load(Ordering::Acquire) != 0);
+    let code = LOAN_SHEDKAT_STATE.load(Ordering::Acquire);
+    if code == 2 {
+        LOAN_MASKED_BUSY.fetch_sub(1, Ordering::Relaxed);
+    } else if code == 1 {
+        LOAN_MASKED_OK.fetch_sub(1, Ordering::Relaxed);
+    }
+    LOAN_LAST_WHY.store(prior_why, Ordering::Relaxed);
+    if !prior_said {
+        LOAN_REFUSAL_SAID.store(false, Ordering::Release);
+    }
+    let why = LOAN_SHEDKAT_WHY.load(Ordering::Relaxed);
+    let us = LOAN_SHEDKAT_US.load(Ordering::Relaxed);
+    (came, code, why, us)
+}
+
+/// XHCILOANSHEDKATCONTROL: the pre-shed go-red leg. Called while the KAT holds the block loan published preempt-off
+/// on this CPU (no migration: the CPU read here is stable); a MASKED contender on a sibling CPU must spin Z62's
+/// bounded wait out (`masked_loan_wait`, [`LOAN_MASKED_WAIT_MS`]) and answer Busy why=masked-timeout inside
+/// [8, 20] ms. The first failed check: `control-same-cpu` / `control-late` / `control-got` / `control-why` /
+/// `control-early` (the wait path dead) / `control-slow`. XHCILOANSHEDKATCONTROLUS (Z80): a contender that came leaves
+/// its µs in `LOAN_SHED_CONTROL_US` on every outcome.
+#[cfg(target_arch = "x86_64")]
+fn loan_shed_control() -> Result<(), &'static str> {
+    let here = crate::arch::percpu::this_cpu().cpu_index as usize;
+    let cpu = crate::arch::sched::sibling_online_cpu(here);
+    if cpu == here {
+        return Err("control-same-cpu");
+    }
+    let (came, code, why, us) = loan_shed_contend(cpu);
+    if !came {
+        return Err("control-late");
+    }
+    LOAN_SHED_CONTROL_US.store(us.min(u32::MAX as u64) as u32, core::sync::atomic::Ordering::Relaxed);
+    if code == 1 {
+        return Err("control-got");
+    }
+    if code != 2 || why != 3 {
+        return Err("control-why");
+    }
+    if us < 8_000 {
+        return Err("control-early");
+    }
+    if us > 20_000 {
+        return Err("control-slow");
+    }
+    Ok(())
+}
+
+/// XHCILOANSHEDKAT: `tests preemptaudit`'s shed leg (`loan_shed_kat=`): `ok`, `skip(masked|no-xhci|one-cpu)`, or the
+/// first failed check — `claim-busy` / `claim-notready` / `held-before` / `not-held` / `gate-ignored` / `not-released` /
+/// `still-published` / `claim-lost` / `not-counted` / `contender-got` / `contender-waited` / `contender-late` /
+/// `double-release` / `mark-kept`; the pre-shed control (XHCILOANSHEDKATCONTROL Z78) first: `control-same-cpu` /
+/// `control-late` / `control-got` / `control-why` / `control-early` / `control-slow`. XHCILOANSHEDKATCONTROLUS (Z80): the
+/// control's µs reset to 0 first, so `loan_shed_us=` reads 0 on every return before the control's contender came.
+#[cfg(target_arch = "x86_64")]
+pub fn xhci_loan_shed_kat() -> &'static str {
+    use core::sync::atomic::Ordering;
+    use crate::arch::sched::preemptoff;
+    LOAN_SHED_CONTROL_US.store(0, Ordering::Relaxed);
+    if crate::arch::irqs_masked() {
+        return "skip(masked)";
+    }
+    if matches!(xhci::claim(), Err(XhciClaimError::NotReady)) {
+        return "skip(no-xhci)";
+    }
+    let me = crate::arch::percpu::this_cpu().cpu_index as usize;
+    let cpu = crate::arch::sched::sibling_online_cpu(me);
+    if cpu == me {
+        return "skip(one-cpu)";
+    }
+    if preemptoff::witness().0 {
+        return "held-before";
+    }
+    let loan = match claim_xhci_for_io() {
+        Ok(l) => l,
+        Err(BlockError::NotReady) => return "claim-notready",
+        Err(_) => return "claim-busy",
+    };
+    // XHCILOANSHEDKATCONTROL (Z78): the go-red control while the loan is still published; a failure returns its word and
+    // the loan goes back through the normal (unshed) Drop.
+    if let Err(w) = loan_shed_control() {
+        return w;
+    }
+    // The take holds the count (no switch, no migration until the shed); the mask keeps the shed and its reads on
+    // one CPU. The pre-bump keeps the boot's "first shed, once" line for a real shed; every count is given back.
+    let shed: Result<(), &'static str> = crate::arch::without_interrupts(|| {
+        let tag = crate::arch::percpu::this_cpu().cpu_index.saturating_add(1);
+        if !preemptoff::witness().0 || BLOCK_LOAN_CPU.load(Ordering::Acquire) != tag {
+            return Err("not-held");
+        }
+        let n0 = LOAN_SHED_N.fetch_add(1, Ordering::Relaxed);
+        let legs = || -> Result<(), &'static str> {
+            xhci_loan_shed("kat", 60_000);
+            if !preemptoff::witness().0
+                || BLOCK_LOAN_CPU.load(Ordering::Acquire) != tag
+                || LOAN_SHED.load(Ordering::Acquire)
+                || LOAN_SHED_N.load(Ordering::Relaxed) != n0.wrapping_add(1)
+            {
+                return Err("gate-ignored");
+            }
+            xhci_loan_shed("kat", 0);
+            if preemptoff::witness().0 {
+                return Err("not-released");
+            }
+            if BLOCK_LOAN_CPU.load(Ordering::Acquire) != 0 {
+                return Err("still-published");
+            }
+            if !matches!(xhci::claim(), Err(XhciClaimError::Busy)) {
+                return Err("claim-lost");
+            }
+            if LOAN_SHED_N.load(Ordering::Relaxed) != n0.wrapping_add(2) || !LOAN_SHED.load(Ordering::Acquire) {
+                return Err("not-counted");
+            }
+            Ok(())
+        };
+        let r = legs();
+        let n1 = LOAN_SHED_N.load(Ordering::Relaxed);
+        LOAN_SHED_N.fetch_sub(n1.wrapping_sub(n0), Ordering::Relaxed);
+        r
+    });
+    if let Err(w) = shed {
+        return w;
+    }
+    // The masked contender on the sibling CPU; this holder waits PREEMPTIBLE (the shed's point).
+    let (came, code, why, us) = loan_shed_contend(cpu);
+    if !came {
+        return "contender-late";
+    }
+    if code == 1 {
+        return "contender-got";
+    }
+    if !(code == 2 && why == 1 && us < LOAN_MASKED_WAIT_MS.saturating_mul(1000)) {
+        return "contender-waited";
+    }
+    // The shed-aware Drop under this KAT's own hold: the put, and no second release (a double one reads the count free).
+    preemptoff::disable();
+    drop(loan);
+    let (held, _) = preemptoff::witness();
+    let mark = LOAN_SHED.load(Ordering::Acquire);
+    preemptoff::enable();
+    if !held {
+        return "double-release";
+    }
+    if mark {
+        return "mark-kept";
+    }
+    "ok"
+}
+
+/// XHCILOANSHEDKATCONTROLUS (zenbook-ledger Z80): the pre-shed control's measured µs (`loan_shed_us=` after
+/// `loan_shed_kat=` on the PREEMPTAUDIT line): ~10000 on a live Z62 wait, 0 when the control did not run.
+#[cfg(target_arch = "x86_64")]
+pub fn xhci_loan_shed_control_us() -> u32 {
+    LOAN_SHED_CONTROL_US.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+// ══════════ XHCILOANPOLLCAP (zenbook-ledger Z74) — the xhci-poll task is the block loan's ninth holder ══════════
+//
+// TAIL-APPENDED (no line above moves). `xhci::poll_events` now dispatches at most `POLL_DRAIN_CAP` events a pass (6 on
+// x86: 48 µs of MMIO), so the poller's hold is short and never sleeps; it takes controller 0 through Z62's ONE take
+// (`take_block_loan`: this CPU's preempt-off count, the holder published in `BLOCK_LOAN_CPU`, the shed mark armed) and
+// puts it back through `BlockLoan`'s Drop. A masked claimant on another CPU then waits a running holder out
+// (`masked_loan_wait`) instead of `Busy` why=holder-preemptible. No wait here: the poller skips a Busy pass.
+
+/// XHCILOANPOLLCAP: the xhci-poll task's take of controller 0 as a block loan — `take_block_loan`, nothing else.
+#[cfg(target_arch = "x86_64")]
+pub fn xhci_poll_loan() -> Result<BlockLoan, XhciClaimError> {
+    take_block_loan()
+}
+
+// ══════════ XHCILOANPTPYIELDPOLLTAKE (zenbook-ledger Z82) — a PTP yield window records WHO closed it: a block claimant or the xhci-poll take ══════════
+//
+// TAIL-APPENDED (two LINE-NEUTRAL folds: `take_block_loan`'s x86 Ok arm and `yield_now`'s PUT line). Z73's window ends at
+// the first published take (`BLOCK_LOAN_CPU`), and `take_block_loan` is its ONLY publisher; the xhci-poll task (Z74's
+// `xhci_poll_loan`) takes through it every tick, so `taken=` on the `[xhci] loan yield` line counted the poller's 48 µs
+// hold as a served claimant. The holder marks the window OPEN before its put; the FIRST take after the put swaps OPEN for
+// its class BEFORE it publishes (one CAS: every later take, the re-take included, fails it), so `yield_now` seeing the
+// publish sees the closer. The poll take is told apart by its task, `xhci-poll` (the identity Z76's skip line names).
+// Owed: XHCILOAN-PTPYIELD-POLLSKIP, XHCILOAN-PTPYIELD-KATCLOSER, XHCILOAN-PTPYIELD-PTPTAKE (BUILT by XHCILOANPTPYIELDPTPTAKE,
+// zenbook-ledger Z87: a third class, PTP — the take of a task `claim_only` marked, the ONE PTP/MTP entry — in the SAME one CAS).
+
+/// XHCILOANPTPYIELDPOLLTAKE: the closer word's states — a window open, closed by a block take, closed by the xhci-poll take.
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+const LOAN_CLOSER_OPEN: u8 = 1;
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+const LOAN_CLOSER_BLOCK: u8 = 2;
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+const LOAN_CLOSER_POLL: u8 = 3;
+/// XHCILOANPTPYIELDPTPTAKE (Z87): closed by a second PTP/MTP claim's take (`claim_only`; refused by `with_controller` after it).
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+const LOAN_CLOSER_PTP: u8 = 4;
+
+/// XHCILOANPTPYIELDPOLLTAKE: who closed the current / last PTP yield window (written OPEN by the PTP holder before its put,
+/// swapped by the first take after it; read by `ptp` after the re-take). Lock-free.
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+static LOAN_YIELD_CLOSER: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// XHCILOANPTPYIELDPTPTAKE (Z87): the task ids of the `claim_only` callers inside their claim (0 = a free slot).
+/// XHCILOANPTPYIELDPTPMARKMANY (Z100): a set, not one word; each slot written only by the task in it (`loan_ptp_mark_set`:
+/// CAS 0 -> tid; `loan_ptp_mark_clear`: tid -> 0 on drop); read by `loan_yield_close` and Z90 while a window is open.
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+static LOAN_PTP_TAKERS: [core::sync::atomic::AtomicU64; LOAN_PTP_MARKS] = [const { core::sync::atomic::AtomicU64::new(0) }; LOAN_PTP_MARKS];
+
+/// XHCILOANPTPYIELDPTPTAKE (Z87): marks the current task as a PTP/MTP claimant for the span of `claim_only`'s take (the
+/// guard's drop clears it, the `?` return included). A ZST: without `uvc` or off x86 it compiles to nothing.
+struct LoanPtpMark;
+
+impl LoanPtpMark {
+    #[inline(always)]
+    fn set() -> Result<LoanPtpMark, BlockError> {
+        #[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+        {
+            if let Some(t) = crate::arch::sched::current_id() {
+                loan_ptp_mark_set(t)?; // XHCILOANPTPYIELDPTPMARKMANY (Z100): a full mark set refuses Busy at once (the window's holder excepted)
+            }
+        }
+        Ok(LoanPtpMark)
+    }
+}
+
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+impl Drop for LoanPtpMark {
+    fn drop(&mut self) {
+        if let Some(t) = crate::arch::sched::current_id() {
+            loan_ptp_mark_clear(t); // XHCILOANPTPYIELDPTPMARKMANY (Z100)
+        }
+    }
+}
+
+/// XHCILOANPTPYIELDPOLLTAKE: called by `take_block_loan` after a successful take and BEFORE its publish: an open window
+/// gets its closer (one load and out for every take outside a window).
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn loan_yield_close() {
+    #[cfg(feature = "uvc")]
+    {
+        use core::sync::atomic::Ordering;
+        if LOAN_YIELD_CLOSER.load(Ordering::Acquire) != LOAN_CLOSER_OPEN {
+            return;
+        }
+        let ptp = crate::arch::sched::current_id().is_some_and(loan_ptp_marked); // XHCILOANPTPYIELDPTPTAKE (Z87): a task `claim_only` marked. XHCILOANPTPYIELDPTPMARKMANY (Z100): any slot of the set
+        let who = if crate::arch::sched::current_name() == Some("xhci-poll") { LOAN_CLOSER_POLL } else if ptp { LOAN_CLOSER_PTP } else { LOAN_CLOSER_BLOCK };
+        let _ = LOAN_YIELD_CLOSER.compare_exchange(LOAN_CLOSER_OPEN, who, Ordering::AcqRel, Ordering::Relaxed);
+    }
+}
+
+/// XHCILOANPTPYIELDPOLLTAKE: whether the last PTP yield window was closed by the xhci-poll task's take (read by
+/// `ptp_txn_inner` right after a taken yield; one PTP hold at a time). aarch64: never (no publication there).
+#[cfg(feature = "uvc")]
+pub fn xhci_loan_yield_closed_by_poll() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        LOAN_YIELD_CLOSER.load(core::sync::atomic::Ordering::Acquire) == LOAN_CLOSER_POLL
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
+/// XHCILOANPTPYIELDPTPTAKE (Z87): whether the last PTP yield window was closed by a second PTP/MTP claim's take (read by
+/// `ptp_txn_inner` right after a taken yield, beside `xhci_loan_yield_closed_by_poll`). aarch64: never.
+#[cfg(feature = "uvc")]
+pub fn xhci_loan_yield_closed_by_ptp() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        LOAN_YIELD_CLOSER.load(core::sync::atomic::Ordering::Acquire) == LOAN_CLOSER_PTP
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
+// ══════════ XHCILOANPTPYIELDPOLLSKIP (zenbook-ledger Z86) — the xhci-poll take is refused inside a PTP yield window ══════════
+//
+// TAIL-APPENDED (one LINE-NEUTRAL fold: `take_block_loan`'s x86 Ok arm; one in `xhci::poll_loan`). The xhci-poll task takes
+// controller 0 every 1 ms tick through `take_block_loan` (Z74), so it closed a PTP yield window (`ptp::TXN_YIELDED`, Z73;
+// <= 3 ms) before the block claimant the window exists for (Z82's `taken_poll=`). Z76's claim-first-then-refuse rule, moved
+// to where it can still refuse: AFTER `claim()` succeeds (a take after the PTP put sees the flag the holder set before that
+// put) and BEFORE `loan_yield_close` and the publish, so the closer stays OPEN and `yield_now` sees no `BLOCK_LOAN_CPU`: the
+// window serves a block claimant or nobody. Only the task the closer names `xhci-poll` is refused; the loan goes straight
+// back (`XhciLoan`'s Drop), the preempt-off count is released, `Busy`; counted (`poll_skips=`), the first said once, not
+// stamped claim-busy. The cost: <= 3 ms of input latency per window (the PTP holder drains the ring itself during its hold).
+// Owed: XHCILOAN-PTPYIELD-POLLSKIP-KATRULE — BUILT by XHCILOANPTPYIELDKATRULE (zenbook-ledger Z88: `ptp_yield=poll-closed` FAILs).
+
+/// XHCILOANPTPYIELDPOLLSKIP: the xhci-poll take refused inside a PTP yield window (written and read by that one task:
+/// `xhci::poll_loan` takes it to leave the refusal unstamped).
+#[cfg(all(target_arch = "x86_64", feature = "uvc"))]
+static LOAN_POLL_SKIPPED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// XHCILOANPTPYIELDPOLLSKIP: called by `take_block_loan` after a successful `claim()` and BEFORE the closer and the publish:
+/// `true` = this is the xhci-poll take and a PTP yield window is open (the caller puts the loan back and answers `Busy`).
+/// One load and out for every take outside a window; `false`, inlined away, without `uvc` (no window exists).
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn loan_poll_yield_skip() -> bool {
+    #[cfg(feature = "uvc")]
+    {
+        use core::sync::atomic::Ordering;
+        if xhci::ptp::TXN_YIELDED.load(Ordering::Acquire) && crate::arch::sched::current_name() == Some("xhci-poll") {
+            LOAN_POLL_SKIPPED.store(true, Ordering::Relaxed);
+            if POLL_YIELD_SKIPS.fetch_add(1, Ordering::Relaxed) == 0 {
+                serial_println!("[xhci] poll skip why=ptp-yield who=xhci-poll (XHCILOANPTPYIELDPOLLSKIP Z86, first skip, once)");
+            }
+            return true;
+        }
+    }
+    false
+}
+
+/// XHCILOANPTPYIELDPOLLSKIP: whether the xhci-poll task's last refused take was the window skip (cleared by the read).
+#[cfg(all(target_arch = "x86_64", feature = "uvc"))]
+pub fn xhci_poll_skip_take() -> bool {
+    LOAN_POLL_SKIPPED.swap(false, core::sync::atomic::Ordering::Relaxed)
+}
+
+/// XHCILOANPTPYIELDPOLLSKIP: no `uvc`, no window, never a skip (the knob-off image keeps `poll_loan`'s old code).
+#[cfg(all(target_arch = "x86_64", not(feature = "uvc")))]
+#[inline(always)]
+pub fn xhci_poll_skip_take() -> bool {
+    false
+}
+
+/// XHCILOANPTPYIELDPOLLSKIP: xhci-poll takes refused inside a PTP yield window this boot (`poll_skips=`). A twin of Z76's
+/// `PUMP_YIELD_SKIPS`, which stays the pump's alone (Z81's `pump_kat=` reads it as the pump gate's proof).
+#[cfg(feature = "uvc")]
+static POLL_YIELD_SKIPS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// XHCILOANPTPYIELDPOLLSKIP: ` poll_skips=<n>` on the `[xhci] loan yield` line (ptp.rs), NOTHING while 0 (Z73's line
+/// byte-identical on a boot the gate never fired).
+#[cfg(feature = "uvc")]
+pub struct PollSkips;
+
+#[cfg(feature = "uvc")]
+impl core::fmt::Display for PollSkips {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let n = POLL_YIELD_SKIPS.load(core::sync::atomic::Ordering::Relaxed);
+        if n == 0 { Ok(()) } else { write!(f, " poll_skips={}", n) }
+    }
+}
+
+// ══════════ XHCILOANPTPYIELDPTPWAIT (zenbook-ledger Z90) — a second PTP claim waits a PTP yield window out instead of taking it ══════════
+//
+// TAIL-APPENDED (two LINE-NEUTRAL folds: `take_block_loan`'s x86 Ok arm, Z86's gate `if`; `yield_now`'s PUT line). A second
+// PTP/MTP claim (`claim_only`, marked by Z87's `LoanPtpMark`) inside a window (`ptp::TXN_YIELDED`, Z73; <= 3 ms) took the
+// loan, closed the window a block claimant was waiting for (Z87's `taken_ptp=`), and was then refused by `with_controller`
+// anyway. Its take is now refused at Z86's gate site (after `claim()` Ok, before Z82's closer and the publish: the loan goes
+// straight back unpublished, the closer stays OPEN, `Busy`), and `claim_xhci_for_io`'s existing hlt loop (`hw_wait_budget`)
+// is the wait: no second wait loop. A masked claimant never gets here (`claim_only` refuses it at once, before the mark).
+// The window's holder is exempt by identity: `yield_now` re-takes through `claim_only` with `TXN_YIELDED` still set and marks
+// itself when the mark is free, so the holder writes its task id before its put. One gate site, two predicates: Z86's keys
+// on the task name and carries poll-only side effects. XHCILOAN-PTPYIELD-LOOPONE BUILT by Z96 (`YIELD_KAT_WINDOWS` is 1); owed:
+// XHCILOAN-PTPYIELD-PTPMARK-MANY (BUILT by Z100: the mark is a set of `LOAN_PTP_MARKS` task ids), XHCILOAN-PTPYIELD-OUT.
+
+/// XHCILOANPTPYIELDPTPWAIT: the task id of the PTP hold that opened the current yield window. Written only by that holder in
+/// `yield_now`, before its put; meaningful only while `ptp::TXN_YIELDED` is set (rewritten before every window, one yielding
+/// hold at a time), so never cleared. Lock-free.
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+static LOAN_YIELD_HOLDER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// XHCILOANPTPYIELDPTPWAIT: the first refusal of a second PTP claim inside a window was said (once per boot).
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+static PTP_WAIT_SAID: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// XHCILOANPTPYIELDPTPWAIT: record the current task as the window's holder (called by `yield_now` right before its put).
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+#[inline]
+fn loan_yield_holder_set() {
+    LOAN_YIELD_HOLDER.store(crate::arch::sched::current_id().unwrap_or(0), core::sync::atomic::Ordering::Release);
+}
+
+/// XHCILOANPTPYIELDPTPWAIT: called by `take_block_loan` after a successful `claim()` and BEFORE the closer and the publish,
+/// beside Z86's `loan_poll_yield_skip`: `true` = a PTP yield window is open and this is the take of the task `claim_only`
+/// marked, not the window's holder (the caller puts the loan back and answers `Busy`; `claim_xhci_for_io` retries).
+/// One load and out for every take outside a window; `false`, inlined away, without `uvc` (no window exists).
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn loan_ptp_yield_wait() -> bool {
+    #[cfg(feature = "uvc")]
+    {
+        use core::sync::atomic::Ordering;
+        if xhci::ptp::TXN_YIELDED.load(Ordering::Acquire) {
+            if let Some(t) = crate::arch::sched::current_id() {
+                if loan_ptp_marked(t) && t != LOAN_YIELD_HOLDER.load(Ordering::Acquire) { loan_ptp_refused_note(t); // XHCILOANPTPYIELDPTPMARKMANY (Z100): the mark set. XHCILOANPTPYIELDWAITCOUNT (Z108): the refused task's mark slot bit (LINE-NEUTRAL)
+                    if !PTP_WAIT_SAID.swap(true, Ordering::Relaxed) {
+                        serial_println!("[xhci] ptp wait why=ptp-yield who=ptp (XHCILOANPTPYIELDPTPWAIT Z90, first wait, once)");
+                    }
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+// ══════════ PREEMPTOFFX86STALEDROP (rmbp-ledger B1069) — the block loan's hold carries its epoch to every release ══════════
+//
+// `take_block_loan` takes this CPU's preempt-off count as a `preemptoff::Held` (its CPU and that CPU's epoch). The count
+// is given back at one of three places — `BlockLoan`'s Drop, `demote` (Z69), `xhci_loan_shed` (Z66: a static path from
+// the holder's call chain that never sees the `BlockLoan`) — so the hold lives in ONE static word, written by the holder
+// at the take, on the premise `BLOCK_LOAN_CPU` and `LOAN_SHED` already rest on (controller 0's single loan: at most one
+// block loan is live). The release swaps it to 0 first, so a hold is given back at most once; a hold the dispatch reset
+// under it (its holder switched out inside the span) releases nothing and is counted (`stale_drop=`).
+
+/// B1069: the live block loan's hold (`Held::into_word`), 0 = none.
+#[cfg(target_arch = "x86_64")]
+static LOAN_HELD: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// B1069: at the take (loan held, preempt-off): keep the take's hold for the release.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn loan_held_set(h: crate::arch::sched::preemptoff::Held) {
+    LOAN_HELD.store(h.into_word(), core::sync::atomic::Ordering::Release);
+}
+
+/// B1069: give the live block loan's hold back (once: the word is swapped to 0), through `preemptoff::put`.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn loan_held_put() {
+    let w = LOAN_HELD.swap(0, core::sync::atomic::Ordering::AcqRel);
+    if let Some(h) = crate::arch::sched::preemptoff::Held::from_word(w) {
+        crate::arch::sched::preemptoff::put(h);
+    }
+}
+
+// ══════════ XHCILOANPTPYIELDPTPMARKMANY (zenbook-ledger Z100) — the PTP yield mark is a set of task ids, not one word ══════════
+//
+// TAIL-APPENDED (in-place edits line-count neutral: Z87's mark word, `LoanPtpMark`, Z82's closer line, Z90's predicate; one
+// token on `claim_only`'s line). Z87's mark was ONE word (`LOAN_PTP_TAKER`, CAS 0 -> tid): a third concurrent PTP/MTP claim
+// (every `ptp::with_controller` caller: ptpfs reads from any task, the Camera viewer, the `ptp` verb, the MTP transport;
+// nothing serializes them) found it held, stayed unmarked, was not refused by Z90's `loan_ptp_yield_wait` and was classed
+// BLOCK by Z82's closer: it closed a PTP holder's yield window as if it were the block claimant. Now `LOAN_PTP_MARKS` words
+// (2x the four concurrent claimants measured as realistic), each written only by the task in it; a claim that finds the set
+// full is refused `Busy` at once (said once), so no unmarked PTP claim ever reaches `take_block_loan` — except the window's
+// holder re-taking, exempt from Z90 by identity already (its closer class is never read). Owed: XHCILOAN-PTPYIELD-PTPMARK-KAT.
+
+/// XHCILOANPTPYIELDPTPMARKMANY: the PTP claimants that can be marked at once (`LOAN_PTP_TAKERS`).
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+const LOAN_PTP_MARKS: usize = 8;
+
+/// XHCILOANPTPYIELDPTPMARKMANY: the first full-set refusal was said (once per boot).
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+static PTP_MARK_FULL_SAID: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// XHCILOANPTPYIELDPTPMARKMANY: mark task `t` in the first free slot (CAS 0 -> t). A full set: the yield window's holder
+/// re-taking goes on unmarked; any other claim is `Busy` (the first said once).
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+fn loan_ptp_mark_set(t: u64) -> Result<(), BlockError> {
+    use core::sync::atomic::Ordering;
+    for s in LOAN_PTP_TAKERS.iter() {
+        if s.compare_exchange(0, t, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+            return Ok(());
+        }
+    }
+    if xhci::ptp::TXN_YIELDED.load(Ordering::Acquire) && t == LOAN_YIELD_HOLDER.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    if !PTP_MARK_FULL_SAID.swap(true, Ordering::Relaxed) {
+        serial_println!("[xhci] ptp mark full why=ptp-marks({}) who=ptp (XHCILOANPTPYIELDPTPMARKMANY Z100, first refusal, once)", LOAN_PTP_MARKS);
+    }
+    Err(BlockError::Busy)
+}
+
+/// XHCILOANPTPYIELDPTPMARKMANY: clear task `t`'s slot (CAS t -> 0; nothing when it holds none: the holder's unmarked re-take).
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+fn loan_ptp_mark_clear(t: u64) {
+    use core::sync::atomic::Ordering;
+    for s in LOAN_PTP_TAKERS.iter() {
+        if s.compare_exchange(t, 0, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+            return;
+        }
+    }
+}
+
+/// XHCILOANPTPYIELDPTPMARKMANY: whether task `t` is a marked PTP claimant (read by Z82's closer and Z90's refusal, both only
+/// inside an open yield window).
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+fn loan_ptp_marked(t: u64) -> bool {
+    t != 0 && LOAN_PTP_TAKERS.iter().any(|s| s.load(core::sync::atomic::Ordering::Acquire) == t)
+}
+
+// ══════════ XHCILOANPTPYIELDPTPMARKKAT (zenbook-ledger Z104) — the yield KAT arms two PTP claimants in its one window ══════════
+//
+// TAIL-APPENDED (two LINE-NEUTRAL folds: `xhci_loan_yield_kat_arm`'s 2 ms wait line, `xhci_loan_yield_kat_settle`'s wait
+// line). Z100's rule (every concurrent PTP claimant marked, refused inside a window by Z90, the block claimant served) had
+// no KAT case. Beside Z73's block claimant the arm now spawns `LOAN_YIELD_KAT_PTPS` PTP claimants on the same sibling CPU,
+// each through the real `BlockLoan::claim_only` (no camera needed: it takes only controller 0's loan). The count of Z90
+// refusals is NOT judged: the three claimants' takes in the window race on the hlt wake, and when the block claimant wins
+// a PTP claimant meets a raw `Busy`, never Z90's branch. Judged instead, deterministically: (a) both PTP claimants are
+// MARKED before the window opens (`ptp-unmarked` otherwise), (b) neither is served inside a window: a `claim_only` Ok
+// while `ptp::TXN_YIELDED` is set is recorded before its drop, which the holder's re-take waits on (`ptp-took`). Owed:
+// XHCILOAN-PTPYIELD-PTPMARK-KAT-WAITCOUNT (a counted refusal needs the PTP takes ordered ahead of the block claimant's).
+
+/// XHCILOANPTPYIELDPTPMARKKAT: the PTP claimants the yield KAT arms beside its block claimant.
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+const LOAN_YIELD_KAT_PTPS: usize = 2;
+
+/// XHCILOANPTPYIELDPTPMARKKAT: per PTP claimant: 0 idle, 1 about to claim, 3 served after the window, 8 served INSIDE a
+/// window (Z90 / Z100 regressed), 9 refused. Slot i written only by claimant i (and reset by the arm before its spawn).
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+static LOAN_YIELD_KAT_PTP: [core::sync::atomic::AtomicU8; LOAN_YIELD_KAT_PTPS] = [const { core::sync::atomic::AtomicU8::new(0) }; LOAN_YIELD_KAT_PTPS];
+
+/// XHCILOANPTPYIELDPTPMARKKAT: PTP claimant `i` (a task on the block claimant's sibling CPU): one `claim_only`, which marks
+/// it and hlt-waits while the KAT holds the loan; whether it came back inside a yield window is written BEFORE the drop.
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+fn loan_yield_kat_ptp_claimant(i: usize) {
+    use core::sync::atomic::Ordering;
+    LOAN_YIELD_KAT_PTP[i].store(1, Ordering::Release);
+    match BlockLoan::claim_only() {
+        Ok(l) => {
+            let inside = xhci::ptp::TXN_YIELDED.load(Ordering::Acquire);
+            LOAN_YIELD_KAT_PTP[i].store(if inside { 8 } else { 3 }, Ordering::Release);
+            drop(l);
+        }
+        Err(_) => LOAN_YIELD_KAT_PTP[i].store(9, Ordering::Release),
+    }
+}
+
+/// XHCILOANPTPYIELDPTPMARKKAT: spawn the PTP claimants on `cpu`, wait until each has started its claim, then until both
+/// are marked (the KAT holder's own mark was cleared when its `claim_only` returned). `Err` = `skip(claimant-late)` /
+/// `ptp-unmarked` (a FAIL word: Z100's set regressed).
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+fn loan_yield_kat_ptp_arm(cpu: usize) -> Result<(), &'static str> {
+    use core::sync::atomic::Ordering; let cpus = loan_yield_kat_ptp_cpus(cpu).ok_or("skip(order)")?; LOAN_PTP_REFUSED.store(0, Ordering::Release); // XHCILOANPTPYIELDWAITCOUNT (Z108): one cpu per PTP claimant, the refusal bits cleared before the spawns
+    for (i, s) in LOAN_YIELD_KAT_PTP.iter().enumerate() {
+        s.store(0, Ordering::Release);
+        crate::arch::sched::spawn("ptpyield-ptp", loan_yield_kat_ptp_claimant, i, cpus[i], crate::arch::sched::PRIO_HIGH);
+    }
+    if !wait::bounded(1000, || LOAN_YIELD_KAT_PTP.iter().all(|s| s.load(Ordering::Acquire) != 0)) {
+        return Err("skip(claimant-late)");
+    }
+    if !wait::bounded(10, || LOAN_PTP_TAKERS.iter().filter(|s| s.load(Ordering::Acquire) != 0).count() >= LOAN_YIELD_KAT_PTPS) {
+        return Err("ptp-unmarked");
+    }
+    Ok(())
+}
+
+/// XHCILOANPTPYIELDPTPMARKKAT: after the KAT's hold, wait (<= 2500 ms) for the PTP claimants to finish (0 = not spawned).
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+fn loan_yield_kat_ptp_settle() {
+    use core::sync::atomic::Ordering;
+    let _ = wait::bounded(2500, || LOAN_YIELD_KAT_PTP.iter().all(|s| { let v = s.load(Ordering::Acquire); v == 0 || v >= 3 }));
+}
+
+/// XHCILOANPTPYIELDPTPMARKKAT: whether a KAT PTP claimant was served inside a yield window (read by `ptp::loan_yield_kat`
+/// after the re-take, beside `xhci_loan_yield_closed_by_ptp`). aarch64: never (no claimant there).
+#[cfg(feature = "uvc")]
+pub fn xhci_loan_yield_kat_ptp_took() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        LOAN_YIELD_KAT_PTP.iter().any(|s| s.load(core::sync::atomic::Ordering::Acquire) == 8)
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
+// ══════════ XHCILOANPTPYIELDWAITCOUNT (zenbook-ledger Z108) — the yield KAT counts Z90's refusals, the PTP takes ordered first ══════════
+//
+// TAIL-APPENDED (LINE-NEUTRAL folds: `loan_yield_kat_claimant`'s first store, Z90's refusal branch in `loan_ptp_yield_wait`;
+// Z104's `loan_yield_kat_ptp_arm` edited in place). Z104 left the count of Z90 refusals unjudged: its three claimants shared
+// ONE cpu, and with x86's `QUANTUM_TICKS` = 4 (4 ms) against the 3 ms window (`LOAN_YIELD_WINDOW_MS`), a hlt-waiter that is
+// refused does not yield, so it keeps the cpu across the window's ticks and usually only one of the three runs in it — no
+// handshake on that cpu can order them. Now each PTP claimant runs on ITS OWN `smp::xhci_worker_cpu` core (its own 1 kHz tick
+// wakes its hlt, so Z90 refuses it within ~1 ms of the put), and the block claimant is parked BEFORE its claim in a bounded
+// TSC spin (not hlt): until the window opens (`ptp::TXN_YIELDED`), then <= `LOAN_YIELD_KAT_ORDER_MS` until both PTP claimants
+// were refused; it claims either way. Z90's refusal collapses to a plain `Busy` inside `claim_xhci_for_io`'s loop, so it
+// reaches the KAT through ONE word: a bit per `LOAN_PTP_TAKERS` slot, set by the refusal for the refused task's slot; its
+// popcount is the claimants refused at least once (a hlt-looping claimant refused many times sets one bit). The verdict
+// (`ptp::loan_yield_kat`): served with exactly `LOAN_YIELD_KAT_PTPS` = ok, served otherwise = `ptp-unrefused` (FAIL),
+// untaken with fewer = `skip(order)`; fewer than two free cpus = `skip(order)`. Owed: XHCILOAN-PTPYIELD-WAITCOUNT-WORD (the
+// count as a number is a PREEMPTAUDIT format edit), XHCILOAN-PTPYIELD-WAITCOUNT-FOREIGN (a real PTP claimant refused inside
+// the KAT's window sets a third bit: `ptp-unrefused` on metal with a live camera reader).
+
+/// XHCILOANPTPYIELDWAITCOUNT: how long the parked block claimant waits, once the window is open, for both PTP refusals.
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+const LOAN_YIELD_KAT_ORDER_MS: u64 = 10;
+
+/// XHCILOANPTPYIELDWAITCOUNT: one bit per `LOAN_PTP_TAKERS` slot (`LOAN_PTP_MARKS` = 8): the marked task in slot j was refused
+/// by Z90 since the yield KAT's arm cleared it. Written by the refused task (its own slot's bit) and by the arm (store 0, before
+/// its spawns); read by the parked block claimant and the verdict. Lock-free.
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+static LOAN_PTP_REFUSED: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// XHCILOANPTPYIELDWAITCOUNT: Z90 refused marked task `t`: set its mark slot's bit (called only inside an open window).
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+fn loan_ptp_refused_note(t: u64) {
+    use core::sync::atomic::Ordering;
+    if let Some(j) = LOAN_PTP_TAKERS.iter().position(|s| s.load(Ordering::Acquire) == t) {
+        LOAN_PTP_REFUSED.fetch_or(1u8 << j, Ordering::AcqRel);
+    }
+}
+
+/// XHCILOANPTPYIELDWAITCOUNT: one core per PTP claimant, asked by name (`smp::xhci_worker_cpu`, BP-cores-1), never this core
+/// nor the block claimant's `block`; `None` when fewer than `LOAN_YIELD_KAT_PTPS` remain (the arm says `skip(order)`).
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+fn loan_yield_kat_ptp_cpus(block: usize) -> Option<[usize; LOAN_YIELD_KAT_PTPS]> {
+    let me = crate::arch::percpu::this_cpu().cpu_index as usize;
+    let mut out = [0usize; LOAN_YIELD_KAT_PTPS];
+    let mut n = 0usize;
+    for c in (0usize..).map_while(crate::arch::smp::xhci_worker_cpu) {
+        if n == LOAN_YIELD_KAT_PTPS {
+            break;
+        }
+        if c != me && c != block {
+            out[n] = c;
+            n += 1;
+        }
+    }
+    if n == LOAN_YIELD_KAT_PTPS { Some(out) } else { None }
+}
+
+/// XHCILOANPTPYIELDWAITCOUNT: the block claimant's ordering stage, before its claim: a bounded spin (<= 2500 ms, the settle's
+/// budget) until the window opens, then <= `LOAN_YIELD_KAT_ORDER_MS` until both PTP claimants were refused. It claims either
+/// way: a missed order leaves the window untaken, judged `skip(order)`.
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+fn loan_yield_kat_order_wait() {
+    use core::sync::atomic::Ordering;
+    if wait::bounded(2500, || xhci::ptp::TXN_YIELDED.load(Ordering::Acquire)) {
+        let _ = wait::bounded(LOAN_YIELD_KAT_ORDER_MS, || LOAN_PTP_REFUSED.load(Ordering::Acquire).count_ones() as usize >= LOAN_YIELD_KAT_PTPS);
+    }
+}
+
+/// XHCILOANPTPYIELDWAITCOUNT: the PTP claimants Z90 refused this KAT run against the claimants armed (`Equal` = the counted
+/// refusals; read by `ptp::loan_yield_kat` after the re-take). aarch64: `Less` (no claimant there).
+#[cfg(feature = "uvc")]
+pub fn xhci_loan_yield_kat_ptp_refused() -> core::cmp::Ordering {
+    #[cfg(target_arch = "x86_64")]
+    {
+        (LOAN_PTP_REFUSED.load(core::sync::atomic::Ordering::Acquire).count_ones() as usize).cmp(&LOAN_YIELD_KAT_PTPS)
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        core::cmp::Ordering::Less
+    }
 }

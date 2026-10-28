@@ -5,7 +5,7 @@
 //!
 //! HEVCPARSE (LEDGER SR199): an H.265 / HEVC bitstream parser and intra decoder written from ITU-T Rec. H.265
 //! ("High efficiency video coding"), `no_std` + `alloc`. Every iPhone recording is HEVC; this is the first half of the
-//! decoder: the whole bitstream, and pictures made of I slices.
+//! decoder: the whole bitstream, and pictures made of I slices. HEVCINTER (LEDGER SR216) adds P and B slices.
 //!
 //! | module          | Recommendation                                                                  |
 //! |-----------------|---------------------------------------------------------------------------------|
@@ -20,7 +20,11 @@
 //! | [`picture`]     | the picture under decoding and the per-block facts the loop filters read        |
 //! | [`deblock`]     | 8.7.2 deblocking filter                                                         |
 //! | [`sao`]         | 8.7.3 sample adaptive offset                                                    |
+//! | [`sei`]         | 7.3.5 sei_message, D.2.19 / D.3.19 the decoded picture hash (HEVCCONF SR321)     |
+//! | [`dpb`]         | 8.3.2 reference picture set, 8.3.4 reference picture lists, C.5.2 DPB output    |
+//! | [`inter`]       | 8.5.3 merge / AMVP / TMVP, 8-tap / 4-tap interpolation, weighted prediction      |
 //! | [`decoder`]     | access units, 8.3.1 POC, NoRaslOutputFlag, C.5.2 output order, the API          |
+//! | [`level`]       | A.4 tier and level limits, refused by name under `set_strict_levels` (SR365)    |
 //!
 //! REUSED from h264_core, not copied: [`h264_core::cabac::Cabac`] (the arithmetic decoding engine: H.265 Tables 9-46 /
 //! 9-47 and 9.3.4.3.2-5 equal H.264's 9.3.3.2, and 9.3.2.2's preCtxState gives the same state byte),
@@ -52,15 +56,21 @@
 //! The inter elements' slots are already laid out and initialised (initTypes 1 and 2) so the inter arc only adds the
 //! syntax.
 //!
-//! Decoded: Main and Main Still Picture streams at 8-bit 4:2:0 whose pictures are made of I slices — CTB 16/32/64 down
+//! Decoded: Main, Main 10 (HEVCMAIN10 SR311: 16-bit sample planes) and Main Still Picture streams at 8- and 10-bit 4:2:0 made of I, P and B slices — CTB 16/32/64 down
 //! to an 8x8 CU, 2Nx2N and NxN intra, I_PCM, the 35 intra modes with strong intra smoothing, the 4x4 DST and the
 //! 4..32 DCTs with scaling lists, transform skip, cu_transquant_bypass, sign data hiding, cu_qp_delta, chroma QP
 //! offsets, tiles, wavefront (entropy_coding_sync) and dependent slice segments, deblocking, SAO, the conformance
-//! window and POC output order.
+//! window and POC output order; and (HEVCINTER) skip / merge / AMVP prediction units of every PartMode with TMVP,
+//! uni- and bi-prediction with default or explicit weights, the inter residual, short- and long-term references and
+//! deblocking bS 0 / 1 from motion.
 //!
-//! Refused by name ([`Error::Unsupported`]): P and B slices (inter prediction is owed as HEVCINTER), bit depths
-//! above 8 (HEVCMAIN10), chroma other than 4:2:0, separate colour planes, every range-extension and screen-content
-//! tool. Layers above the base (nuh_layer_id > 0) are ignored.
+//! Refused by name ([`Error::Unsupported`]): constrained_intra_pred_flag in P / B slices (HEVCINTER-CIP), separate
+//! colour planes and bit depths above 16 (HEVCREXT SR334 decodes 4:2:2 / 4:4:4, 12-bit, unequal depths; HEVCREXTTOOLS
+//! SR345 every range extension tool, monochrome and 16 bits; HEVCREXTSCC SR357 palette, intra block copy and the
+//! adaptive colour transform), and of the screen content coding extension (HEVCREXT-SCC) an SCC body behind the
+//! multilayer / 3D bodies, the colour transform at unequal luma / chroma depths and intra block copy outside the decoded
+//! region (HEVCSCCTAIL SR365: weighted prediction with the current picture as a reference decodes). Layers above the base (nuh_layer_id > 0) are
+//! ignored.
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -76,11 +86,16 @@ pub mod cabac;
 pub mod ctu;
 pub mod deblock;
 pub mod decoder;
+pub mod dpb;
+pub mod inter;
 pub mod intra;
+pub mod level;
 pub mod nal;
+pub mod palette;
 pub mod picture;
 pub mod ps;
 pub mod sao;
+pub mod sei;
 pub mod slice;
 pub mod tables;
 pub mod transform;
@@ -95,7 +110,8 @@ pub enum Error {
     Truncated,
     /// The bitstream violates the Recommendation.
     Invalid(&'static str),
-    /// A valid stream this decoder refuses by name (inter slices, high bit depth, 4:2:2 / 4:4:4, range extensions).
+    /// A valid stream this decoder refuses by name (high bit depth, 4:2:2 / 4:4:4, range extensions, constrained intra
+    /// prediction in inter slices).
     Unsupported(&'static str),
 }
 
@@ -123,3 +139,19 @@ impl From<h264_core::Error> for Error {
 }
 
 pub type Result<T> = core::result::Result<T, Error>;
+
+/// PLAYCHECKHI (LEDGER SR352): planes above 8 bits as the reference decoder writes them — every sample two bytes, low
+/// first, Y then Cb then Cr at their own sizes (yuv420p10le / yuv422p10le / yuv444p12le ...; COLOURONE422 SR359). ONE layout: HEVCCONF's
+/// md5 (tests/conformance.rs) and tools/play-check's I420Hi oracle and `--md5` hash and compare these bytes.
+pub fn le_bytes(planes: [&[u16]; 3]) -> alloc::vec::Vec<u8> {
+    planes.iter().flat_map(|p| p.iter()).flat_map(|v| v.to_le_bytes()).collect()
+}
+
+/// PLAYCHECKHI (SR352; moved from tests/conformance.rs): a [`Frame`] as the reference decoder writes it — I420 bytes
+/// at 8 bits, [`le_bytes`] above.
+pub fn yuv_bytes(f: &Frame) -> alloc::vec::Vec<u8> {
+    match &f.planes16 {
+        Some([y, u, v]) => le_bytes([y.as_slice(), u.as_slice(), v.as_slice()]),
+        None => f.i420(),
+    }
+}

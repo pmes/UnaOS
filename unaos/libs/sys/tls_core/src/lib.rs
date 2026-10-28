@@ -16,6 +16,7 @@
 //! * [`ct`] — Certificate Transparency (RFC 6962 / 9162): log lists, SCT verification, Chrome's CT policy,
 //!   Merkle inclusion proofs (CTCORE).
 //! * [`x509`] — RFC 5280 DER/certificates/path validation, RFC 6125 names, PEM trust store.
+//! * [`key`] — the ONE private-key file parser (PEM / DER: PKCS#8, PKCS#1, SEC 1, Ed25519) and the key containers (PDFSIGNKEYPARSE).
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -27,6 +28,7 @@ pub mod codec;
 pub mod crypto;
 pub mod ct;
 pub mod error;
+pub mod key; // PDFSIGNKEYPARSE (LEDGER SR361): the one private-key parser
 pub mod key_schedule;
 pub mod msgs;
 pub mod record;

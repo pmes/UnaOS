@@ -151,7 +151,7 @@ static SURF_AT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsiz
 /// SAFETY: written only from `repaint` on the thread that owns keys (the route that called
 /// `consume_key`, or the ignition that called `open_once`), read by `wm`'s composite — the same benign
 /// present-tear every app surface shares (instgui's contract).
-fn surf() -> &'static mut [u32] { super::super::metrics::leaked_surf(&SURF_AT, super::super::metrics::size(W) * super::super::metrics::size(H())) } // SECREVIEW F1: grows with the live scale (was sized once, then sliced at the new scale)
+fn surf() -> &'static mut [u32] { super::super::metrics::login_surf(&SURF_AT, super::super::metrics::size(W) * super::super::metrics::size(H())) } // SECREVIEW F1: grows with the live scale (was sized once, then sliced at the new scale)
 
 #[derive(Clone, Copy, PartialEq)]
 enum State {
@@ -713,7 +713,7 @@ fn open_as(state: State) {
     // screen, no console and a swallowed keyboard. The fixture's CLOSE leg measures it every witness
     // boot, against a control row that differs only here.
     let title: &[u8] = if LOCKED.load(Ordering::Relaxed) { b"Locked" } else if state == State::SetPw { b"Set password" } else if state == State::Unlock { b"Unlock" } else if state == State::CreateUser { b"Create account" } else { b"Log in" }; *CARD_TITLE.lock() = title;
-    let id = wm::create_at_native(OWNER, surf, sw * super::super::metrics::size(CARD_CAP.load(Ordering::Relaxed)) * 4, sw as u32, sh as u32, (sw * 4) as u32, title, ox + wm::BORDER(), oy + wm::TITLE_H() + wm::BORDER());
+    let id = wm::create_at_native(OWNER, surf, sw * super::super::metrics::size(CARD_CAP.load(Ordering::Relaxed)) * 4, sw as u32, sh as u32, (sw * 4) as u32, title, ox + wm::BORDER(), oy + wm::TITLE_H() + wm::BORDER()); super::super::metrics::leaked_surf_retire(&SURF_AT, "login"); // RETIREDRAIN (rmbp-ledger B1055) / RETIREDRAINREST (B1060): the close-drain door is inside `metrics::leaked_surf_retire` (metrics.rs file tail); a refused wait leaves the block for the next re-mint
     if id == wm::WIN_NONE {
         FORM.lock().windowed = false;
         serial_println!("[login] screen open window=no (create refused — headless form)");
@@ -777,7 +777,7 @@ pub fn reopen_after_logout() {
         refused_alert(reason);
         return;
     }
-    users::logout();
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))] crate::video::desktopbuild::logout_census(); users::logout(); // MEMLINE-LOGOUT (B1032): the census's BEFORE at the Log Out's first line (the session as held). LINE-NEUTRAL append, code first
     take_down(); // LOGOUTUI: an alert left up by an earlier refusal goes with the session (no-op with no window)
     let (closed, kernel) = wm::close_all_furniture(); // LOGOUTDESK (R69): the desktop closes down COMPLETELY — every row, kernel furniture included
     crate::video::desktopbuild::teardown("logout"); // DESKTOPBUILT (R93): the desktop object goes with the session; the next login builds it fresh
@@ -2245,7 +2245,7 @@ struct Done {
     kdf_ms: u64,
     adduser_ms: u64,
     on_worker: bool,
-    blocked_ms: u64,
+    blocked_ms: u64, masked_ms: u64, on_cpu: usize, pump_cpu: usize, masked_by: crate::hidstall::MaskedBy, // MASKCENSUS (B1028): `masked_by` = who held that span (`submit_place`). LOGINSTALL (B1008): the submit's longest masked UnaFS span (any core) and where it ran vs the hid pump (`submit_place`, tail)
 }
 
 static WORK: crate::sync::Mutex<Option<Work>> = crate::sync::Mutex::new(None);
@@ -2329,8 +2329,8 @@ fn apply(d: &Done) {
 fn say(d: &Done, job: &str) {
     SUBMITS.fetch_add(1, Ordering::Relaxed);
     serial_println!(
-        "[login] submit kdf_ms={} adduser_ms={} on={} input_blocked_ms={} kind={}",
-        d.kdf_ms, d.adduser_ms, if d.on_worker { "worker" } else { "render" }, d.blocked_ms, job
+        "[login] submit kdf_ms={} adduser_ms={} on={} input_blocked_ms={} kind={} masked_ms={} masked_by={} on_cpu={} pump_cpu={}",
+        d.kdf_ms, d.adduser_ms, if d.on_worker { "worker" } else { "render" }, d.blocked_ms, job, d.masked_ms, d.masked_by, d.on_cpu, PumpCpu(d.pump_cpu)
     );
 }
 
@@ -2371,10 +2371,10 @@ fn dispatch_old(job: Job, n: &[u8], p: &[u8], o: &[u8]) {
         }
         kb_spawn_arm(job); return; // KEYBOOT3 (B856): the Pi's `login-submit` spawn (tail; a no-op on x86, which spawned above). LINE-NEUTRAL
     }
-    let (out, kdf_ms, adduser_ms) = compute(&w);
+    let _ = crate::hidstall::scope_masked_take(); let _ = crate::hidstall::scope_masked_by(); let (out, kdf_ms, adduser_ms) = compute(&w); let (masked_ms, masked_by, on_cpu, pump_cpu) = submit_place(); // MASKCENSUS (B1028): the holder's window opens with the scope's. LOGINSTALL (B1008): the scope opened before the slow half, read after it (LINE-NEUTRAL fold, code first; body at the tail)
     w.pw = [0; FIELD_MAX];
     w.old = [0; FIELD_MAX];
-    let d = Done { out, name: w.name, nlen: w.nlen, kdf_ms, adduser_ms, on_worker: false, blocked_ms: crate::arch::ms().saturating_sub(t0) };
+    let d = Done { out, name: w.name, nlen: w.nlen, kdf_ms, adduser_ms, on_worker: false, blocked_ms: crate::arch::ms().saturating_sub(t0), masked_ms, on_cpu, pump_cpu, masked_by };
     say(&d, job_word(job));
     apply(&d);
 }
@@ -2398,10 +2398,10 @@ fn submit_worker(_: usize) {
         BUSY.store(false, Ordering::Release);
         return;
     };
-    let (out, kdf_ms, adduser_ms) = compute(&w);
+    let _ = crate::hidstall::scope_masked_take(); let _ = crate::hidstall::scope_masked_by(); let (out, kdf_ms, adduser_ms) = compute(&w); let (masked_ms, masked_by, on_cpu, pump_cpu) = submit_place(); // MASKCENSUS (B1028): the holder's window opens with the scope's. LOGINSTALL (B1008): as the inline arm (LINE-NEUTRAL fold, code first; body at the tail)
     w.pw = [0; FIELD_MAX];
     w.old = [0; FIELD_MAX];
-    *DONE.lock() = Some(Done { out, name: w.name, nlen: w.nlen, kdf_ms, adduser_ms, on_worker: true, blocked_ms: 0 }); kb_wake(); // KEYBOOT4 (B864): posted, THEN the render task woken (the Pi's registered hook; none on x86). LINE-NEUTRAL, body at the tail
+    *DONE.lock() = Some(Done { out, name: w.name, nlen: w.nlen, kdf_ms, adduser_ms, on_worker: true, blocked_ms: 0, masked_ms, on_cpu, pump_cpu, masked_by }); kb_wake(); // KEYBOOT4 (B864): posted, THEN the render task woken (the Pi's registered hook; none on x86). LINE-NEUTRAL, body at the tail
 }
 
 /// The render task's drain: apply a landed outcome (called from the render loop's pulse and ahead of every
@@ -3902,7 +3902,7 @@ fn cap_h() -> usize {
 fn seat_open() {
     let cap = cap_h();
     CARD_CAP.store(cap, Ordering::Relaxed); CARD_S2.store(crate::video::dpi::s2(), Ordering::Relaxed);
-    let _ = super::super::metrics::leaked_surf(&SURF_AT, super::super::metrics::size(W) * super::super::metrics::size(cap));
+    let _ = super::super::metrics::login_surf(&SURF_AT, super::super::metrics::size(W) * super::super::metrics::size(cap));
 }
 
 /// The restyle hook's re-seat: when a row is up and the card's `h_at` moved within its capacity, lay out and paint at
@@ -3966,7 +3966,7 @@ fn rescaled(id: wm::WinId) -> bool {
     repaint();
     let (sw, sh, cap) = (super::super::metrics::size(W), super::super::metrics::size(H()), CARD_CAP.load(Ordering::Relaxed));
     let title = *CARD_TITLE.lock();
-    let new = wm::create_at_native(OWNER, surf().as_mut_ptr() as usize, sw * super::super::metrics::size(cap) * 4, sw as u32, sh as u32, (sw * 4) as u32, title, i.x, i.y);
+    let new = wm::create_at_native(OWNER, surf().as_mut_ptr() as usize, sw * super::super::metrics::size(cap) * 4, sw as u32, sh as u32, (sw * 4) as u32, title, i.x, i.y); super::super::metrics::leaked_surf_retire(&SURF_AT, "login"); // RETIREDRAIN (rmbp-ledger B1055) / RETIREDRAINREST (B1060): the close-drain door is inside `metrics::leaked_surf_retire` (metrics.rs file tail); a refused wait leaves the block for the next re-mint
     if new != wm::WIN_NONE {
         WIN.store(new, Ordering::Relaxed);
         wm::set_modal_top(new);
@@ -3977,4 +3977,26 @@ fn rescaled(id: wm::WinId) -> bool {
     RESCALES.fetch_add(1, Ordering::Relaxed);
     serial_println!("[textscale] rescale win=login s2={}->{} old={} new={} cap={}", a, b, id, new, cap);
     true
+}
+
+// ── LOGINSTALL (rmbp-ledger B1008): the submit line says its own masked span and placement ─────────────────────────
+// Flight 38's `masked_max_ms=2940` was read as the login's KDF; the capture put it 31 s later (the `unafslock` fixture's
+// fallback read, task 67 on cpu3). So the submit says what it saw: `masked_ms=` = the longest masked UnaFS attempt on ANY
+// core between the take before `compute` and the take here (`hidstall::scope_masked_take`, REGISTRYCHUNK B508's scope;
+// its other reader, fs/assoc.rs's registry build, runs at the desktop build after the outcome is applied), `on_cpu=` the
+// core that ran the slow half, `pump_cpu=` the hid pump's (`hidstall::pump_cpu`, `none` before it starts).
+// Wire: `[login] submit kdf_ms= adduser_ms= on= input_blocked_ms= kind= masked_ms=<n> masked_by=<task>@<file>:<line>@c<n>|- on_cpu=<c> pump_cpu=<c|none>`.
+
+/// LOGINSTALL: (masked_ms, masked_by, on_cpu, pump_cpu) right after a submit's `compute`, on the task that ran it
+/// (MASKCENSUS B1028: `masked_by` = the holder of the largest scoped span in the same window, `hidstall::scope_masked_by`).
+fn submit_place() -> (u64, crate::hidstall::MaskedBy, usize, usize) {
+    (crate::hidstall::scope_masked_take(), crate::hidstall::scope_masked_by(), crate::arch::percpu::this_cpu().cpu_index as usize, crate::hidstall::pump_cpu())
+}
+
+/// LOGINSTALL: `pump_cpu=` as a core number, `none` while no hid pump has started (`usize::MAX`).
+struct PumpCpu(usize);
+impl core::fmt::Display for PumpCpu {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        if self.0 == usize::MAX { f.write_str("none") } else { write!(f, "{}", self.0) }
+    }
 }

@@ -1004,4 +1004,32 @@ FORBID :: BOOTLIST: .* -> FAIL ::
 # ── LEASERENEW (rmbp-ledger B888), TAIL-APPENDED — `tests dhcprenew`: the smoltcp lease capped at 8 s through the socket's public API and reset, re-acquired, then ONE renewal at T1 said (`[net] dhcp renewed lease= ip=same t1_at=`). OPTIONAL until flown. ASSUMPTION (code-only, unrun): slirp's bootp answers the renewal's UNICAST REQUEST to 10.0.2.2:67 (ciaddr set, no option 50) with an ACK found by MAC; if it does not, the line reads `-> FAIL reason=no-renewal`.
 OPTIONAL :: DHCPRENEW: first=[0-9]+ renewed=[1-9][0-9]* changed=0 -> PASS ::
 # NLE6 (LEDGER SR207): `tests nle` (typed, R80; needs UNAOS_VIDEO=1, which this leg does not set) — the Player's EDL mode over two synthetic utp1 reels.
-OPTIONAL :: NLE: frames=\d+ seeks=\d+ runup=\d+ agree=\d+/\d+ counter=frame-ord -> PASS ::
+OPTIONAL :: NLE: frames=\d+ seeks=\d+ runup=\d+ agree=\d+/\d+ counter=frame-ord .* export=\S+ .* -> PASS ::
+# EXPORTSIZEFIXTURE (rmbp-ledger B990): `tests nle`'s two-size AV1 reel NLEFXE (libaom size-66x66 then size-16x16) exported: the decoder's size switch, the export's letterbox into the first size, the file read back at 66x66 (OPTIONAL as NLE above: this leg sets no UNAOS_VIDEO).
+OPTIONAL \[vplay\] size switch at \d+ 66x66->16x16
+OPTIONAL \[nle\] export size switch 66x66->16x16 scaled
+OPTIONAL \[nle\] fixture export sizes=2 reel=NLEFXE .* samples=4 first=66x66 .* -> ok
+# EXPORTSIZEFIXTUREPOLICIES (rmbp-ledger B993): the same reel under Fill (NLESZF) and Stretch (NLESZS), read back at 66x66, and under Adopt (NLESZA) refused by name with its file gone; `policies=` counts the four legs (OPTIONAL as above).
+OPTIONAL \[nle\] export size switch 66x66->16x16 scaled fit=fill
+OPTIONAL \[nle\] export size switch 66x66->16x16 scaled fit=stretch
+OPTIONAL \[nle\] export refused why=encode-refused .*adopt.*\(NLE-SIZE-POLICY\)
+OPTIONAL \[nle\] fixture export sizes=2 reel=NLEFXE .* samples=4 first=66x66 frames=4 .* fit=fill -> ok
+OPTIONAL \[nle\] fixture export sizes=2 reel=NLEFXE .* samples=4 first=66x66 frames=4 .* fit=stretch -> ok
+OPTIONAL \[nle\] fixture export sizes=2 reel=NLEFXE .* fit=adopt refused=1 gone=1 -> ok
+OPTIONAL \[nle\] fixture export policies=4 -> ok
+FORBID \[nle\] fixture export policies=.* -> FAIL
+FORBID \[nle\] fixture export sizes=.* -> FAIL
+# EXPORTSIZEPOLICYPIXEL (rmbp-ledger B998): a second two-size reel NLEFXG (libaom size-66x66 then the non-square size-16x64) exported under Letterbox (NLEPXL), Fill (NLEPXF) and Stretch (NLEPXS), each export's frame after the switch decoded back through h264_core and its centre row read: Letterbox shows black bars left and right, Fill and Stretch none (OPTIONAL as above).
+OPTIONAL \[nle\] fixture export pixel fit=letterbox bars=yes .* -> ok
+OPTIONAL \[nle\] fixture export pixel fit=fill bars=no .* -> ok
+OPTIONAL \[nle\] fixture export pixel fit=stretch bars=no .* -> ok
+FORBID \[nle\] fixture export pixel.* -> FAIL
+# KERNELSIZEPIN (rmbp-ledger B1001): `tests nle`'s keys leg posts `f` over NLEFXA (Letterbox -> Fill), the saved EDL carries `* UNA SIZE NLEFXA fill`, the Player presents a Fill frame with no black word in its picture rows, then three more `f` restore Letterbox and the EDL byte for byte; the present line is pinned as a prefix (KERNELPRESENTROWS appends `rows=`) (OPTIONAL as NLE above).
+OPTIONAL \[nle\] edit size NLEFXA -> fill at=\d+
+OPTIONAL \[vplay\] present fit=fill reel=NLEFXA
+OPTIONAL \[nle\] fixture keys size reel=NLEFXA fit=fill edl=ok presents=[1-9]\d* bars=0 .* back=ok -> ok
+OPTIONAL \[nle\] fixture keys path=\S+ edits=3/3 plan=ok saved=ok size=ok .* -> ok
+FORBID \[nle\] fixture keys size .* -> FAIL
+# HIDBOOTLEDSTEST (rmbp-ledger B995), TAIL-APPENDED — `tests hidboot`: the boot decoder under Transport::Ehci owes the LED slot on a lock-key press edge only, the ONE slot drain (`hidboot::drain_led_slots`) coalesces four toggles into one send with the latest byte and skips a dead endpoint, a refusing endpoint is latched off after one send; HIDBOOTLEDSHELDKAT (B1013): a `held` refusal is counted, never latched, and sent on the transport's re-dirty (`held=`). OPTIONAL until a typist types it (nothing types it on this lane today).
+OPTIONAL :: HIDBOOT: owed=ok coalesce=ok latch=ok held=ok -> PASS ::
+FORBID :: HIDBOOT: .*-> FAIL

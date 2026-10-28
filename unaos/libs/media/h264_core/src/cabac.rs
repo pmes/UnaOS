@@ -25,9 +25,9 @@ pub const CAT_CHROMA_AC: usize = 4; // ChromaACLevel
 pub const CAT_LUMA_8X8: usize = 5; // LumaLevel8x8
 
 /// ctxBlockCatOffset (Table 9-40) for coded_block_flag, significant / last, coeff_abs_level_minus1.
-const CBF_OFFSET: [usize; 5] = [0, 4, 8, 12, 16];
-const SIG_OFFSET: [usize; 5] = [0, 15, 29, 44, 47];
-const ABS_OFFSET: [usize; 5] = [0, 10, 20, 30, 39];
+pub const CBF_OFFSET: [usize; 5] = [0, 4, 8, 12, 16];
+pub const SIG_OFFSET: [usize; 5] = [0, 15, 29, 44, 47];
+pub const ABS_OFFSET: [usize; 5] = [0, 10, 20, 30, 39];
 
 pub struct Cabac<'a> {
     data: &'a [u8],
@@ -254,5 +254,11 @@ impl<'a> Cabac<'a> {
     /// ctxIdx of coded_block_flag for ctxBlockCat `cat` (< 5) with ctxIdxInc `inc` (9.3.3.1.1.9).
     pub fn cbf_ctx(cat: usize, inc: u32) -> usize {
         85 + CBF_OFFSET[cat] + inc as usize
+    }
+
+    /// H.265 9.3.4.3.6 (HEVCREXTTOOLS SR345): cabac_bypass_alignment_enabled_flag sets ivlCurrRange to 256 before the
+    /// aligned bypass bins (coeff_sign_flag, coeff_abs_level_remaining); `bypass` then reads them as raw bits.
+    pub fn align_bypass(&mut self) {
+        self.range = 256;
     }
 }

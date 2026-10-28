@@ -15,7 +15,7 @@
 //! i.e. bit replication); 16-bit samples are reduced by `(v * 255 + 32895) >> 16`, the correctly
 //! rounded `v / 257`.
 //!
-//! NOT applied: gAMA, cHRM, sRGB, iCCP (colour management, §12) — the samples are returned as stored.
+//! NOT applied: gAMA, cHRM, sRGB, iCCP (colour management, §12) — the samples are returned as stored; iCCP is surfaced as `Image::icc`.
 //! A browser that colour-manages will show a file carrying gAMA != 1/2.2 differently; the oracle
 //! compares with those chunks stripped. sBIT is ignored (it is advisory).
 //!
@@ -105,7 +105,7 @@ pub fn decode(bytes: &[u8]) -> Result<Image, Error> {
             frames.push(Frame { delay_ms, rgba: snap });
         }
         if !frames.is_empty() {
-            let mut img = Image::still(p.h.width as u32, p.h.height as u32, frames[0].rgba.clone());
+            let mut img = Image::still(p.h.width as u32, p.h.height as u32, frames[0].rgba.clone()).with_icc(p.icc.clone());
             if frames.len() > 1 {
                 img.frames = Some(frames);
                 img.loop_count = st.loop_count();
@@ -124,20 +124,24 @@ pub struct Parsed {
     idat: Vec<u8>,
     actl: Option<u32>,
     default_is_frame: bool,
-    afr: Vec<ApngFrame>,
+    afr: Vec<ApngFrame>, icc: Option<Vec<u8>>,
 }
 
 impl Parsed {
     /// The IDAT image (a still, or an APNG shown without its animation).
     pub fn still(&self) -> Result<Image, Error> {
         let rgba = decode_pixels(&self.h, &self.palette, &self.trns, &self.idat)?;
-        Ok(Image::still(self.h.width as u32, self.h.height as u32, rgba))
+        Ok(Image::still(self.h.width as u32, self.h.height as u32, rgba).with_icc(self.icc.clone()))
     }
     pub fn width(&self) -> u32 {
         self.h.width as u32
     }
     pub fn height(&self) -> u32 {
         self.h.height as u32
+    }
+    /// KERNEL-ANIM-ICC (B974): the embedded profile (iCCP inflated; None under a cICP), for `crate::Animation::icc`.
+    pub(crate) fn icc(&self) -> Option<&[u8]> {
+        self.icc.as_deref()
     }
 }
 
@@ -159,7 +163,7 @@ pub fn parse(bytes: &[u8]) -> Result<Parsed, Error> {
     let mut afr: Vec<ApngFrame> = Vec::new();
     let mut default_is_frame = false;
     let mut next_seq = 0u32;
-    let mut anim_broken = false;
+    let mut anim_broken = false; let (mut icc, mut cicp) = (None, false);
 
     while pos + 12 <= bytes.len() {
         let len = be32(bytes, pos) as usize;
@@ -292,7 +296,7 @@ pub fn parse(bytes: &[u8]) -> Result<Parsed, Error> {
                 seen_iend = true;
                 break;
             }
-            _ => {
+            b"iCCP" | b"cICP" => icc_chunk(&mut icc, &mut cicp, kind, data), _ => {
                 if critical {
                     return Err(Error::Unsupported("unknown critical png chunk"));
                 }
@@ -308,7 +312,7 @@ pub fn parse(bytes: &[u8]) -> Result<Parsed, Error> {
         return Err(Error::Malformed("indexed image without PLTE"));
     }
 
-    Ok(Parsed { h, palette, trns, idat, actl, default_is_frame, afr })
+    Ok(Parsed { h, palette, trns, idat, actl, default_is_frame, afr, icc: if cicp { None } else { icc } })
 }
 
 /// Decode one image's zlib stream (the IDAT, or one APNG frame's fdAT data) at the size `h` states,
@@ -537,48 +541,7 @@ fn pass_dims(w: usize, h: usize, x0: usize, y0: usize, dx: usize, dy: usize) -> 
 /// `1 + row_bytes(w)` bytes, each starting with its filter-type byte; the first line's "previous
 /// line" is all zeros.
 fn unfilter(h: &Header, w: usize, rows: usize, data: &mut [u8]) -> Result<(), Error> {
-    let rb = h.row_bytes(w);
-    let stride = rb + 1;
-    let bpp = h.filter_bpp();
-    for y in 0..rows {
-        let (before, cur) = data.split_at_mut(y * stride);
-        let prev: &[u8] = if y == 0 { &[] } else { &before[(y - 1) * stride + 1..y * stride] };
-        let ft = cur[0];
-        let line = &mut cur[1..stride];
-        let up = |i: usize| -> u8 { if prev.is_empty() { 0 } else { prev[i] } };
-        match ft {
-            0 => {}
-            1 => {
-                for i in bpp..rb {
-                    line[i] = line[i].wrapping_add(line[i - bpp]);
-                }
-            }
-            2 => {
-                if !prev.is_empty() {
-                    for i in 0..rb {
-                        line[i] = line[i].wrapping_add(prev[i]);
-                    }
-                }
-            }
-            3 => {
-                for i in 0..rb {
-                    let a = if i >= bpp { line[i - bpp] as u16 } else { 0 };
-                    let b = up(i) as u16;
-                    line[i] = line[i].wrapping_add(((a + b) >> 1) as u8);
-                }
-            }
-            4 => {
-                for i in 0..rb {
-                    let a = if i >= bpp { line[i - bpp] } else { 0 };
-                    let b = up(i);
-                    let c = if i >= bpp { up(i - bpp) } else { 0 };
-                    line[i] = line[i].wrapping_add(paeth(a, b, c));
-                }
-            }
-            _ => return Err(Error::Malformed("png filter type")),
-        }
-    }
-    Ok(())
+    unfilter_rows(h.filter_bpp(), h.row_bytes(w) + 1, &mut data[..rows * (h.row_bytes(w) + 1)])
 }
 
 /// The Paeth predictor (§9.4), exactly as the spec writes it — the tie order is part of the format.
@@ -665,3 +628,87 @@ fn expand_row(h: &Header, pal: &[[u8; 4]], trns: &Trns, line: &[u8], w: usize, o
     }
 }
 
+/// PIXEL-UNFILTER (LEDGER SR316): reverse the PNG per-scanline filters in place (§9.2–9.4), Header-free.
+/// `data` is lines of `stride` bytes (`1 + ` the row's bytes), each starting with its filter-type byte; `bpp` is the
+/// filter's bytes per complete pixel (at least 1). The first line's "previous line" is all zeros. The LAST line may be
+/// short (a filter byte and fewer bytes: a PDF predictor stream that stops mid-row); its "previous line" is the full
+/// line before it. An unknown filter type is `Error::Malformed("png filter type")`. pixel_core's own decoder passes
+/// exactly `rows * stride` bytes; pdf_core's PNG predictor (§7.4.4.4, 10-15) runs on this fn.
+pub fn unfilter_rows(bpp: usize, stride: usize, data: &mut [u8]) -> Result<(), Error> {
+    if stride == 0 {
+        return Ok(());
+    }
+    let mut start = 0usize;
+    while start < data.len() {
+        let end = (start + stride).min(data.len());
+        let (before, rest) = data.split_at_mut(start);
+        let prev: &[u8] = if start == 0 { &[] } else { &before[start - stride + 1..] };
+        let cur = &mut rest[..end - start];
+        let ft = cur[0];
+        let line = &mut cur[1..];
+        let rb = line.len();
+        let up = |i: usize| -> u8 { if prev.is_empty() { 0 } else { prev[i] } };
+        match ft {
+            0 => {}
+            1 => {
+                for i in bpp..rb {
+                    line[i] = line[i].wrapping_add(line[i - bpp]);
+                }
+            }
+            2 => {
+                if !prev.is_empty() {
+                    for i in 0..rb {
+                        line[i] = line[i].wrapping_add(prev[i]);
+                    }
+                }
+            }
+            3 => {
+                for i in 0..rb {
+                    let a = if i >= bpp { line[i - bpp] as u16 } else { 0 };
+                    let b = up(i) as u16;
+                    line[i] = line[i].wrapping_add(((a + b) >> 1) as u8);
+                }
+            }
+            4 => {
+                for i in 0..rb {
+                    let a = if i >= bpp { line[i - bpp] } else { 0 };
+                    let b = up(i);
+                    let c = if i >= bpp { up(i - bpp) } else { 0 };
+                    line[i] = line[i].wrapping_add(paeth(a, b, c));
+                }
+            }
+            _ => return Err(Error::Malformed("png filter type")),
+        }
+        start = end;
+    }
+    Ok(())
+}
+
+/// PDFICC (SR358): an `iCCP` (§11.3.2.4: profile name, NUL, compression method 0, a zlib stream) inflated into `icc`
+/// (the first one wins; a broken one is dropped, as any ancillary chunk error), or a `cICP` noted: cICP outranks iCCP
+/// (§11.3.2.6's precedence), so a file carrying one surfaces no profile.
+fn icc_chunk(icc: &mut Option<Vec<u8>>, cicp: &mut bool, kind: &[u8], data: &[u8]) {
+    if kind == b"cICP" {
+        *cicp = true;
+        return;
+    }
+    if icc.is_some() {
+        return;
+    }
+    *icc = iccp_profile(data);
+}
+
+/// KERNEL-PNG-ICC (rmbp-ledger B974): the profile an `iCCP` chunk's DATA carries — profile name (at most 79 bytes),
+/// NUL, compression method 0, a zlib stream inflated through the one inflater under `ICCP_MAX` — or None (a broken
+/// chunk is dropped). `icc_chunk`'s rule, public so the kernel's streaming PNG path reads iCCP by the same rule.
+pub fn iccp_profile(data: &[u8]) -> Option<Vec<u8>> {
+    let nul = data.iter().take(80).position(|&b| b == 0)?;
+    if data.get(nul + 1) != Some(&0) {
+        return None;
+    }
+    crate::zlib_decompress(&data[nul + 2..], ICCP_MAX).ok()
+}
+
+/// The inflated iCCP cap: 1 MiB, not [`crate::ICC_MAX`], since `zlib_decompress` reserves its whole cap up front (an
+/// RGB / GRAY display profile is a few KB to a few hundred KB).
+const ICCP_MAX: usize = 1 << 20;

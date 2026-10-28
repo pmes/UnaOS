@@ -8,7 +8,7 @@
 # belongs in every fold's legs". The line is now ONE file (scripts/image-line.env); this leg builds under it.
 #
 # WHAT IT RUNS. Exactly the kernel + bootloader cargo builds `./arroyo esp-x86` runs — the builder's OWN env→feature
-# derivation (builder/src/main.rs), invoked the way esp_x86 invokes it (`cargo +nightly run --release` in builder/),
+# derivation (builder/src/main.rs), invoked the way esp_x86 invokes it (`cargo run --release` in builder/),
 # with `--build-only`: the builder stops after the loader build. (The one env difference from esp-x86: arroyo's
 # load-time UNAOS_GIT_SHA stamp is not exported here — an option_env! version string, not a compile input.) No user blobs,
 # no ESP, no card, no QEMU. In particular NOT build_user_vug_x86 -> build_selfbuild_x86 -> SELFBUILD5, the path that
@@ -43,7 +43,7 @@ if [ "${1:-}" = "--inner" ]; then
     # arroyo's banner for THIS env, from the tree's own knob map (printed at load for every verb but the kernel8 family).
     ( cd "$U" && ./arroyo state 2>&1 ) | sed 's/\x1b\[[0-9;]*m//g' | awk 'index($0,"⚡ kernel features:") { print; exit }'
     t0=$(date +%s)
-    ( cd "$U/builder" && env "${extra[@]}" cargo +nightly run --release -- --build-only ) > "$log" 2>&1
+    ( cd "$U/builder" && env "${extra[@]}" cargo run --release -- --build-only ) > "$log" 2>&1
     rc=$?
     secs=$(( $(date +%s) - t0 ))
     feats="$(awk 'index($0,"   kernel features: ") { sub(/^.*   kernel features: /,""); l=$0 } END { print l }' "$log")"

@@ -10,8 +10,9 @@
 //! the live JS value), the request queue and the event model are the prelude below.
 //!
 //! The event loop (§2.7.1 transaction lifecycle): a transaction is ACTIVE in the task that created it and
-//! inactive from the next task on; requests queue in order and a single pump task (`setTimeout(…, 0)`, so
-//! everything stays on the page's event loop and in FIFO order) runs ONE request per task — the engine call,
+//! inactive from the next task on; requests queue in order and a single pump task (a queued page task,
+//! `__idb_task`: no timer, so no HTML §8.6 nesting clamp and no page-clock wait — IDBKATORDER SR346; a worker
+//! realm, whose loop drains no page tasks, falls back to `setTimeout(…, 0)`) runs ONE request per task — the engine call,
 //! then `success` or `error` at the request with the transaction active again during dispatch. A transaction
 //! that is inactive with no request left auto-commits (`complete`); an `error` event not canceled aborts it
 //! (`abort`; pending requests fail with "AbortError"); a transaction the scheduler has not started yet waits
@@ -54,7 +55,7 @@ fn storage_manager_native(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
 
 pub fn install(vm: &mut Vm) {
     let g = vm.realm().global;
-    for (name, len, f) in [("__idb", 2, idb_native as NativeFn), ("__storage_manager", 1, storage_manager_native)] {
+    for (name, len, f) in [("__idb", 2, idb_native as NativeFn), ("__storage_manager", 1, storage_manager_native), ("__idb_task", 1, idb_task_native)] {
         let fo = vm.make_native(name, len, f, false);
         vm.heap.get_mut(g).props.insert(PropertyKey::from_str(name), Prop::data(Value::Object(fo), WC));
     }
@@ -356,11 +357,17 @@ const PRELUDE: &str = r#"
     var TX = new WeakMap();
     var tx = function (o) { var s = TX.get(o); if (!s) { throw new TypeError('Illegal invocation'); } return s; };
     var LIVE = [];
-    var pumping = false;
+    var pumping = false, polling = false;
+    var task = function (f) { if (!__idb_task(f)) { setTimeout(f, 0); } };
     var schedule = function (ms) {
+        if (ms) {
+            // The cross-document poll: its own timer, so a pending poll never swallows an immediate pump.
+            if (!polling) { polling = true; setTimeout(function () { polling = false; schedule(0); }, ms); }
+            return;
+        }
         if (pumping) { return; }
         pumping = true;
-        setTimeout(pump, ms || 0);
+        task(pump);
     };
     var anyWaiting = function () { return LIVE.some(function (t) { return !t.started && t.state !== 'finished'; }); };
     var pump = function () {
@@ -388,7 +395,7 @@ const PRELUDE: &str = r#"
         else if (anyWaiting()) { schedule(10); }
     };
     var deactivateLater = function (t) {
-        setTimeout(function () { if (t.state === 'active') { t.state = 'inactive'; } schedule(0); }, 0);
+        task(function () { if (t.state === 'active') { t.state = 'inactive'; } schedule(0); });
     };
     var runRequest = function (t, r) {
         var result, error = null;
@@ -450,7 +457,7 @@ const PRELUDE: &str = r#"
             try { dbs.schema = call('schema', { conn: dbs.conn }).schema; } catch (e) { dbs.schema = {}; }
             dbs.upgradeTxn = null;
         }
-        setTimeout(function () {
+        task(function () {
             pend.forEach(function (r) {
                 var s = REQ.get(r.req);
                 s.readyState = 'done'; s.result = undefined;
@@ -468,7 +475,7 @@ const PRELUDE: &str = r#"
                 try { call('close', { conn: dbs.conn }); } catch (e) {}
                 t.openRequest.dispatchEvent(new Event('error', { bubbles: true, cancelable: true }));
             }
-        }, 0);
+        });
         schedule(0);
     };
     var activeOrThrow = function (t, iface, m) {
@@ -1103,16 +1110,7 @@ mod tests {
     /// complete in request order; a read-only transaction created after an overlapping read/write one starts
     /// only after it completed (and sees its writes); an `error` not canceled aborts its transaction and its
     /// writes are undone; the upgrade transaction runs before the open request's `success`.
-    #[test]
-    fn transaction_ordering_kat() {
-        let dir = std::env::temp_dir().join(format!("aether_idb_page_kat_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        crate::storage::set_root_dir(Some(dir.clone()));
-        let doc = crate::dom::parse_html("<html><body></body></html>");
-        let mut e = crate::js::Engine::new(doc);
-        e.set_location("https://idb.kat.example/");
-        e.execute(
-            r#"
+    const ORDERING: &str = r#"
             var log = [];
             var r = indexedDB.open('kat', 1);
             r.onupgradeneeded = function () {
@@ -1144,18 +1142,62 @@ mod tests {
                     };
                 };
             };
-            "#,
-        )
-        .unwrap();
+            "#;
+
+    /// Runs [`ORDERING`] at `origin` for at most 400 event-loop turns (on a frozen page clock when `frozen`)
+    /// and answers the log.
+    fn run_ordering(origin: &str, frozen: bool) -> String {
+        let doc = crate::dom::parse_html("<html><body></body></html>");
+        let mut e = crate::js::Engine::new(doc);
+        e.set_location(origin);
+        if frozen {
+            // After `Engine::new`, whose `event_loop::reset` thaws the clock.
+            crate::event_loop::freeze_clock();
+        }
+        e.execute(ORDERING).unwrap();
         for _ in 0..400 {
             e.tick();
             if e.eval_string("String(!!window.__done)").unwrap() == "true" {
                 break;
             }
         }
-        let log = e.eval_string("log.join(',')").unwrap();
-        assert_eq!(log, "upgrade,open,put1,put2,rw-complete,count=2,ro-complete,constraint,abort,keys=[1,2]");
-        crate::storage::set_root_dir(None);
-        let _ = std::fs::remove_dir_all(&dir);
+        if frozen {
+            crate::event_loop::thaw_clock();
+        }
+        e.eval_string("log.join(',')").unwrap()
     }
+
+    #[test]
+    fn transaction_ordering_kat() {
+        let _root = crate::storage::test_root::TestRoot::new("aether_idb_page_kat");
+        let log = run_ordering("https://idb.kat.example/", false);
+        assert_eq!(log, "upgrade,open,put1,put2,rw-complete,count=2,ro-complete,constraint,abort,keys=[1,2]");
+    }
+
+    /// IDBKATORDER (SR346) pins the root cause of the KAT's order- and speed-dependence: the request pump, a
+    /// transaction's deactivation and the abort dispatch are page TASKS (`__idb_task`), not timers. On a frozen
+    /// page clock a timer armed past nesting level 5 is clamped to 4 ms (HTML §8.6) and never comes due, so a
+    /// timer-driven pump stalls at its sixth step; the task-driven one completes in event-loop turns alone.
+    /// A distinct origin: the engine's registry (`storage::idb::reg`) is process-global.
+    #[test]
+    fn transactions_complete_on_a_frozen_page_clock() {
+        let _root = crate::storage::test_root::TestRoot::new("aether_idb_frozen_kat");
+        let log = run_ordering("https://idb.frozen.example/", true);
+        assert_eq!(log, "upgrade,open,put1,put2,rw-complete,count=2,ro-complete,constraint,abort,keys=[1,2]");
+    }
+}
+
+/// `__idb_task(f)`: queues `f` as a task on the page's event loop (Indexed DB 3.0 "queue a database task";
+/// IDBKATORDER, LEDGER SR346) — the `Task::Callback` queue `Engine::run_tasks` drains at the head of every
+/// turn, so no timer nesting clamp and no page-clock wait decides when the pump runs. Answers false off the
+/// page loop (a dedicated worker's thread: its PAGE has no document and its loop drains no page tasks); the
+/// prelude then falls back to `setTimeout(f, 0)`.
+fn idb_task_native(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
+    let f = arg(vm, ctx, 0);
+    if !vm.is_callable(&f) || !super::page(|p| p.doc.is_some()) {
+        return Ok(Value::Bool(false));
+    }
+    let r = idl::root(vm, f);
+    super::page(|p| p.tasks.push_back(super::Task::Callback(r)));
+    Ok(Value::Bool(true))
 }

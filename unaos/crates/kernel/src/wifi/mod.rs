@@ -122,7 +122,7 @@ pub mod bus;
 pub mod firmware;
 pub mod ladder;
 pub mod status;
-pub mod verb; #[cfg(feature = "wifi10")] pub mod assoc; #[cfg(feature = "wifi10")] pub mod data;
+pub mod verb; pub mod assoc; #[cfg(feature = "wifi10")] pub mod data;
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 
@@ -234,7 +234,7 @@ pub fn service() {
         return; // INSTALLBARE (R86): no radio probe under the setter or the login screen
     }
     match STATE.load(Ordering::Relaxed) {
-        S_PARKED => (),
+        S_PARKED => which(), // MT7925S6 (zenbook-ledger Z29): the radio `which` (file tail) names a registered MT7925 once; FOUND untouched
         S_START => {
             if bus::census() {
                 STATE.store(S_WAIT_STORAGE, Ordering::Relaxed);
@@ -393,5 +393,23 @@ fn wait_for_volume() {
         } else {
             ""
         },
+    );
+}
+
+/// MT7925S6 (zenbook-ledger Z29) — the radio `which`. The census (`bus::census`, S_START) chooses the BCM4331 into its one
+/// slot (`bus::FOUND`); the MT7925 registers itself in its own driver (`drivers::mt7925::registered`, its S6, on a pass after
+/// the census ran, so this is said from the parked arm). Once per boot, with no Broadcom chosen and the MT7925 registered,
+/// the stack names it. Nothing else reads the choice yet (S7 scan and S9 data owed); `FOUND` is untouched. The rMBP: the
+/// MT7925 never registers there, so this costs one or two loads per pass and prints nothing.
+fn which() {
+    static SAID: AtomicBool = AtomicBool::new(false);
+    if SAID.load(Ordering::Relaxed) || !crate::drivers::mt7925::registered() || bus::found().is_some() {
+        return;
+    }
+    SAID.store(true, Ordering::Relaxed);
+    let m = crate::drivers::mt7925::mac().unwrap_or([0; 6]);
+    serial_println!(
+        "[wifi] radio=mt7925 mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} via=drivers::mt7925 data=after-join(tests wifijoin) -> registered",
+        m[0], m[1], m[2], m[3], m[4], m[5]
     );
 }

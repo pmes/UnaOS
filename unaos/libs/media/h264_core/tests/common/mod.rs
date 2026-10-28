@@ -13,10 +13,16 @@ pub fn cache_dir() -> PathBuf {
 }
 
 fn entry(rel: &str) -> Option<(String, String)> {
-    include_str!("../vectors.txt").lines().filter(|l| !l.starts_with('#') && !l.trim().is_empty()).find_map(|l| {
+    entry_in(include_str!("../vectors.txt"), rel).map(|(sum, url, _)| (sum, url))
+}
+
+/// The row of `rel` in a vectors list (`<sha256|-> <path> <url> [more columns]`): its digest, its URL and the trailing
+/// columns (HEVCCONF SR321: hevc_core's list carries the reference YUV md5 and the bitstream's name there).
+pub fn entry_in(list: &str, rel: &str) -> Option<(String, String, Vec<String>)> {
+    list.lines().filter(|l| !l.starts_with('#') && !l.trim().is_empty()).find_map(|l| {
         let mut it = l.split_whitespace();
         let (sum, path, url) = (it.next()?, it.next()?, it.next()?);
-        (path == rel).then(|| (sum.to_string(), url.to_string()))
+        (path == rel).then(|| (sum.to_string(), url.to_string(), it.map(str::to_string).collect()))
     })
 }
 
@@ -30,8 +36,14 @@ fn sha256(p: &Path) -> Option<String> {
 /// pin is still owed: it is fetched, its sha256 printed as `UNPINNED <path> <sha256>` for the
 /// vectors.txt row, and used.
 pub fn fetch(rel: &str) -> Option<PathBuf> {
-    let (sum, url) = entry(rel).unwrap_or_else(|| panic!("{rel} is not in vectors.txt"));
-    let path = cache_dir().join(rel);
+    fetch_in(include_str!("../vectors.txt"), cache_dir(), rel)
+}
+
+/// [`fetch`] over any vectors list and cache directory (HEVCCONF SR321: hevc_core's conformance test links this file
+/// by `#[path]` and passes its own list, so there is one fetcher).
+pub fn fetch_in(list: &str, cache: PathBuf, rel: &str) -> Option<PathBuf> {
+    let (sum, url, _) = entry_in(list, rel).unwrap_or_else(|| panic!("{rel} is not in vectors.txt"));
+    let path = cache.join(rel);
     let pinned = sum != "-";
     if path.exists() {
         match sha256(&path) {
@@ -89,17 +101,7 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
 /// .avc / .bit) and its decoded YUV (a .yuv, preferring a name with "dec", then the largest).
 pub fn package(rel: &str) -> Option<Package> {
     let zip = fetch(rel)?;
-    let dir = zip.with_extension("d");
-    if !dir.exists() {
-        let ok = Command::new("unzip").args(["-o", "-q"]).arg(&zip).arg("-d").arg(&dir).status().map(|s| s.success()).unwrap_or(false);
-        if !ok {
-            eprintln!("SKIP {rel}: unzip failed");
-            let _ = std::fs::remove_dir_all(&dir);
-            return None;
-        }
-    }
-    let mut files = Vec::new();
-    walk(&dir, &mut files);
+    let files = unpack(&zip, rel)?;
     let streams: Vec<&PathBuf> = files.iter().filter(|p| matches!(ext_of(p).as_str(), "264" | "h264" | "jsv" | "26l" | "jvt" | "avc" | "bit")).collect();
     let mut yuvs: Vec<&PathBuf> = files.iter().filter(|p| ext_of(p) == "yuv").collect();
     yuvs.sort_by_key(|p| {
@@ -144,4 +146,21 @@ pub fn compare(name: &str, frames: &[h264_core::Frame], yuv: &[u8]) -> usize {
     }
     assert_eq!(frames.len(), want, "{name}: output frame count");
     want
+}
+
+/// Unpack a fetched conformance zip (once, beside it) and list every file in it; `None` (SKIP printed) when `unzip`
+/// fails.
+pub fn unpack(zip: &Path, rel: &str) -> Option<Vec<PathBuf>> {
+    let dir = zip.with_extension("d");
+    if !dir.exists() {
+        let ok = Command::new("unzip").args(["-o", "-q"]).arg(zip).arg("-d").arg(&dir).status().map(|s| s.success()).unwrap_or(false);
+        if !ok {
+            eprintln!("SKIP {rel}: unzip failed");
+            let _ = std::fs::remove_dir_all(&dir);
+            return None;
+        }
+    }
+    let mut files = Vec::new();
+    walk(&dir, &mut files);
+    Some(files)
 }

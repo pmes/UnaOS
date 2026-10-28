@@ -164,7 +164,7 @@ fn handle_info(handle: block::BlockHandle) -> Option<block::BlockDeviceInfo> {
         #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
         block::BlockHandle::Sdhc => block::sdhc_info(),
         #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
-        block::BlockHandle::SdMmc => block::tegra_sd_info(), #[cfg(all(target_arch = "x86_64", feature = "ahci"))] block::BlockHandle::Ahci { port } => block::ahci_info_port(port), // UNAFSX86: the SATA disk's own row
+        block::BlockHandle::SdMmc => block::tegra_sd_info(), #[cfg(all(target_arch = "x86_64", feature = "ahci"))] block::BlockHandle::Ahci { port } => block::ahci_info_port(port), #[cfg(all(target_arch = "x86_64", feature = "nvme"))] block::BlockHandle::Nvme => block::nvme_info(), // UNAFSX86: the SATA disk's own row
     }
 }
 
@@ -185,7 +185,7 @@ fn handle_read(
         #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
         block::BlockHandle::Sdhc => block::read_block_sdhc(lba, buf),
         #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
-        block::BlockHandle::SdMmc => block::read_block_tegra_sd(lba, buf), #[cfg(all(target_arch = "x86_64", feature = "ahci"))] block::BlockHandle::Ahci { port } => block::read_block_ahci_port(port, lba, buf), // UNAFSX86
+        block::BlockHandle::SdMmc => block::read_block_tegra_sd(lba, buf), #[cfg(all(target_arch = "x86_64", feature = "ahci"))] block::BlockHandle::Ahci { port } => block::read_block_ahci_port(port, lba, buf), #[cfg(all(target_arch = "x86_64", feature = "nvme"))] block::BlockHandle::Nvme => block::read_sector_nvme(lba, buf), // UNAFSX86
     }
 }
 
@@ -199,7 +199,7 @@ fn handle_write(handle: block::BlockHandle, lba: u64, buf: &[u8]) -> Result<(), 
         #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
         block::BlockHandle::Sdhc => block::write_block_sdhc(lba, buf),
         #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
-        block::BlockHandle::SdMmc => block::write_block_tegra_sd(lba, buf), #[cfg(all(target_arch = "x86_64", feature = "ahci"))] block::BlockHandle::Ahci { port } => block::write_block_ahci_port(port, lba, buf), // UNAFSX86: refuses unless ahci-write's grant path — the twin of the read arm
+        block::BlockHandle::SdMmc => block::write_block_tegra_sd(lba, buf), #[cfg(all(target_arch = "x86_64", feature = "ahci"))] block::BlockHandle::Ahci { port } => block::write_block_ahci_port(port, lba, buf), #[cfg(all(target_arch = "x86_64", feature = "nvme"))] block::BlockHandle::Nvme => block::write_sector_nvme(lba, buf), // UNAFSX86: refuses unless ahci-write's grant path — the twin of the read arm
     }
 }
 
@@ -230,7 +230,7 @@ impl SdSectorDevice {
     /// clobbered by another device's enumeration, so its own row is already the right answer and it
     /// takes no override.
     pub fn open_on(handle: block::BlockHandle) -> Result<Self, MountError> {
-        let dev = handle_info(handle).ok_or(MountError::NoStorage)?;
+        let dev = handle_info(handle).ok_or(MountError::NoStorage)?; #[cfg(all(target_arch = "x86_64", feature = "nvme"))] if handle == block::BlockHandle::Nvme && dev.block_size != 512 { return nvme_lba_open(&dev); } // NVME4KN (zenbook-ledger Z31): a non-512 namespace as the 512 B sector view (body at the file tail; LINE-NEUTRAL fold)
         if dev.block_size != 512 {
             return Err(MountError::BadSectorSize(dev.block_size));
         }
@@ -256,7 +256,7 @@ impl SdSectorDevice {
             #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
             block::BlockHandle::Sdhc => dev.num_blocks,
             #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
-            block::BlockHandle::SdMmc => dev.num_blocks, #[cfg(all(target_arch = "x86_64", feature = "ahci"))] block::BlockHandle::Ahci { .. } => dev.num_blocks, // UNAFSX86: a dedicated per-port row
+            block::BlockHandle::SdMmc => dev.num_blocks, #[cfg(all(target_arch = "x86_64", feature = "ahci"))] block::BlockHandle::Ahci { .. } => dev.num_blocks, #[cfg(all(target_arch = "x86_64", feature = "nvme"))] block::BlockHandle::Nvme => dev.num_blocks, // UNAFSX86: a dedicated per-port row
         };
         Ok(Self { handle, sectors, ra: RaSet::new(ra_window(handle)) })
     }
@@ -370,7 +370,7 @@ impl SectorDevice for SdSectorDevice {
     /// otherwise the root flip can reach the medium before the tree it points
     /// at, and commit ordering silently breaks.
     fn flush(&mut self) -> Result<(), SectorError> {
-        #[cfg(all(target_arch = "x86_64", feature = "ahciroot"))] if let block::BlockHandle::Ahci { port } = self.handle { return block::flush_ahci_port(port).map_err(|_| SectorError::Io(alloc::string::String::from("ahci: FLUSH CACHE EXT failed"))); } // AHCIROOT (B332): a SATA SSD HAS a write cache — this is the real drain the note above demands
+        #[cfg(all(target_arch = "x86_64", feature = "ahciroot"))] if let block::BlockHandle::Ahci { port } = self.handle { return block::flush_ahci_port(port).map_err(|_| SectorError::Io(alloc::string::String::from("ahci: FLUSH CACHE EXT failed"))); } #[cfg(all(target_arch = "x86_64", feature = "nvme"))] if self.handle == block::BlockHandle::Nvme { return block::flush_nvme().map_err(|_| SectorError::Io(alloc::string::String::from("nvme: FLUSH failed"))); } // AHCIROOT (B332): a SATA SSD HAS a write cache — this is the real drain the note above demands
         Ok(())
     }
 }
@@ -423,7 +423,7 @@ pub fn locate() -> Result<PartitionSpan, MountError> {
 /// probe and the bound the span is checked against all come off the same disk. That is the property
 /// [`locate`] used to get only by luck of the ambient backend agreeing with the ambient registry.
 pub fn locate_on(handle: block::BlockHandle) -> Result<PartitionSpan, MountError> {
-    let mut dev = SdSectorDevice::open_on(handle)?;
+    let mut dev = SdSectorDevice::open_on(handle)?; #[cfg(all(target_arch = "x86_64", feature = "nvme"))] if handle == block::BlockHandle::Nvme && block::nvme_sector_shift().unwrap_or(0) > 0 { return nvme_lba_locate(&mut dev); } // NVME4KN (zenbook-ledger Z31): the 4Kn GPT through amber_core (body at the file tail; LINE-NEUTRAL fold)
     locate_unafs(&mut dev)
         .map_err(MountError::Part)?
         .ok_or(MountError::NoVolume)
@@ -599,7 +599,7 @@ fn bind_probe_admitted(handle: block::BlockHandle) -> bool {
         // TEGRASD merge arm — prescribed by the MERGE NOTE above: the orin's unafs volume rides
         // the card's dedicated handle while `Global` is the USB stick; admit the probe.
         #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
-        block::BlockHandle::SdMmc => true, #[cfg(all(target_arch = "x86_64", feature = "ahci"))] block::BlockHandle::Ahci { .. } => false, // UNAFSX86: NOT probed — the shared mount is read-write and this transport refuses ordinary writes; a SATA volume is reached by `mount_on` read-only, never by the lazy bind
+        block::BlockHandle::SdMmc => true, #[cfg(all(target_arch = "x86_64", feature = "ahci"))] block::BlockHandle::Ahci { .. } => false, #[cfg(all(target_arch = "x86_64", feature = "nvme"))] block::BlockHandle::Nvme => false, // UNAFSX86: NOT probed — the shared mount is read-write and this transport refuses ordinary writes; a SATA volume is reached by `mount_on` read-only, never by the lazy bind
     }
 }
 
@@ -629,7 +629,7 @@ fn handle_kind_name(handle: block::BlockHandle) -> &'static str {
         #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
         block::BlockHandle::Sdhc => "sdhc",
         #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
-        block::BlockHandle::SdMmc => "tegra-sd", #[cfg(all(target_arch = "x86_64", feature = "ahci"))] block::BlockHandle::Ahci { .. } => "ahci", // UNAFSX86
+        block::BlockHandle::SdMmc => "tegra-sd", #[cfg(all(target_arch = "x86_64", feature = "ahci"))] block::BlockHandle::Ahci { .. } => "ahci", #[cfg(all(target_arch = "x86_64", feature = "nvme"))] block::BlockHandle::Nvme => "nvme", // UNAFSX86
     }
 }
 
@@ -662,7 +662,7 @@ pub fn mount_bound_handle() -> Option<block::BlockHandle> { #[cfg(all(target_arc
 /// The successful bind prints the `[unafsbind]` witness: `mount=native` (the native volume's VFS
 /// name of record — vfs.rs mounts `NativeBackend::new("native")`), `handle=` the disk it rode.
 fn bind_mount() -> Result<BoundMount, MountError> { #[cfg(all(target_arch = "x86_64", feature = "wc"))] debug_assert!(crate::arch::sched::current_id().map_or(true, |t| !crate::lockowner::held_by(crate::lockowner::UNAFS, t)), "MOUNTSTACK (B846): bind_mount under the MOUNT hold"); // POISON2 (B846) MOUNTSTACK: with the ticket the bind runs BEFORE the masked hold (`prebind`, file tail); a bind under it is a bug. LINE-NEUTRAL append
-    #[cfg(all(target_arch = "x86_64", feature = "ahciroot"))] if let Some(port) = crate::install::ahciroot::root_port() { if let Ok(fs) = mount_on(block::BlockHandle::Ahci { port }) { return Ok(BoundMount { handle: block::BlockHandle::Ahci { port }, fs }); } } // AHCIROOT (B332) M4: the root-granted SSD binds FIRST — SSD root over card root; silent (the UNAFSX86 line names it)
+    #[cfg(all(target_arch = "x86_64", feature = "ahciroot"))] if let Some(port) = crate::install::ahciroot::root_port() { if let Ok(fs) = mount_on(block::BlockHandle::Ahci { port }) { return Ok(BoundMount { handle: block::BlockHandle::Ahci { port }, fs }); } } #[cfg(all(target_arch = "x86_64", feature = "nvme"))] if block::nvme_root_grant().is_some() { if let Ok(fs) = mount_on(block::BlockHandle::Nvme) { return Ok(BoundMount { handle: block::BlockHandle::Nvme, fs }); } } // AHCIROOT (B332) M4: the root-granted SSD binds FIRST — SSD root over card root; silent (the UNAFSX86 line names it)
     let global_err = match mount_on(block::BlockHandle::Global) {
         Ok(fs) => {
             serial_println!(
@@ -751,10 +751,10 @@ fn note_sector_busy(e: &BlockError) {
 ///   that ends in `Busy` here has ALREADY absorbed a full bounded wait, and multiplying that by an
 ///   attempt count is the thing to prevent — the deadline stops us after roughly one such wait
 ///   rather than eight.
-/// * **The attempt cap binds every instant-refusal backend.** WEDGE-8's xHCI keeps the original
-///   policy (a masked claimant is told `Busy` immediately, `drivers/block.rs::claim_xhci_for_io`),
-///   so on a USB-backed volume the attempts cost nothing but the inter-attempt yield and the
-///   deadline would never fire. The count is what terminates the loop there.
+/// * **The attempt cap binds every near-instant-refusal backend.** xHCI (x86, Z62) spins a masked
+///   claimant <= 10 ms only on a published holder RUNNING on another CPU, `Busy` at once otherwise
+///   (`drivers/block.rs::claim_xhci_for_io`; aarch64 at once), so a USB attempt costs at most ~10 ms
+///   plus the yield and the deadline would never fire. The count is what terminates the loop there.
 ///
 /// EIGHT, not `fat.rs`'s sixty-four, and the difference is deliberate: a restarted FAT RMW re-runs
 /// ONE sector read-modify-write, whereas a restarted unafs transaction re-runs a whole CoW
@@ -789,8 +789,8 @@ enum Attempt<R> {
 ///
 /// UNAFSTXN: `f` is `FnMut` rather than `FnOnce` because a transaction that dies on a transient
 /// `Busy` is RESTARTED — see [`with_unafs`]'s restart loop and [`TXN_BUSY_ATTEMPTS`].
-fn with_unafs_attempt<R>(f: &mut impl FnMut(&mut KernelUnaFS) -> R) -> Attempt<R> {
-    crate::arch::without_interrupts(|| { #[cfg(all(target_arch = "x86_64", feature = "wc"))] { if !crate::video::renderwedge::wait_unlocked(&MOUNT, crate::video::renderwedge::W_UNAFS) { return Attempt::Settled(Err(MountError::Busy)); } } // RENDERWEDGE (B520): the RENDER task's acquire of the mount is bounded (MOUNT_BOUND_MS) — f28's wedge was this masked spin with no bound; past it `[render] wait-timeout what=unafs-mount` and a clean Busy (nothing was touched). Every other caller is unchanged. ⚠ SAME-LINE fold: line :794's `MOUNT.lock()` keeps its line and column (its `#[track_caller]` site)
+fn with_unafs_attempt<R>(f: &mut impl FnMut(&mut KernelUnaFS) -> R, arm: bool) -> Attempt<R> {
+    attempt_span(arm, || { #[cfg(all(target_arch = "x86_64", feature = "wc"))] { if !crate::video::renderwedge::wait_unlocked(&MOUNT, crate::video::renderwedge::W_UNAFS) { return Attempt::Settled(Err(MountError::Busy)); } } // RENDERWEDGE (B520): the RENDER task's acquire of the mount is bounded (MOUNT_BOUND_MS) — f28's wedge was this masked spin with no bound; past it `[render] wait-timeout what=unafs-mount` and a clean Busy (nothing was touched). Every other caller is unchanged. ⚠ SAME-LINE fold: line :794's `MOUNT.lock()` keeps its line and column (its `#[track_caller]` site)
         let mut guard = MOUNT.lock(); let _own = crate::lockowner::own(crate::lockowner::UNAFS); #[cfg(all(target_arch = "x86_64", feature = "wc"))] if splitwrite::ticket_foreign() { return Attempt::Restart; } #[cfg(target_arch = "x86_64")] mount_poison_check(&mut *guard); // POISON2 (B846) MOUNTPOISON: a dead holder's mark discards the in-RAM instance before anything reads it (file tail; LINE-NEUTRAL, before this comment). UNAFSWRITE (B825): another task's commit is writing with MOUNT released — leave MOUNT untouched and restart (LINE-NEUTRAL, before this comment). STACKGUARD2 (B403): the holder, released if it overflows mid-transaction
         // UNAFSTXN: open the attempt's contention window, INSIDE the hold. Clearing it before the
         // acquire would be an SMP bug: a core waiting on `MOUNT` would wipe the latch belonging to
@@ -804,7 +804,7 @@ fn with_unafs_attempt<R>(f: &mut impl FnMut(&mut KernelUnaFS) -> R) -> Attempt<R
             // UNAFSBIND: the lazy bind DISCOVERS its handle (Global first and unchanged; probes only
             // on proven global absence) instead of assuming `Global` — see [`bind_mount`].
             match bind_in_hold() {
-                Ok(m) => { #[cfg(all(target_arch = "x86_64", feature = "wc"))] splitread::note_bound(m.handle); *guard = Some(m) } // HIDSTALL2 (B670): a new bound mount = a new epoch; a split read planned on the old one re-runs under the hold (LINE-NEUTRAL append, before this comment)
+                Ok(m) => { #[cfg(all(target_arch = "x86_64", feature = "wc"))] splitread::note_bound(m.handle); #[cfg(all(target_arch = "aarch64", feature = "baremetal"))] { readarm::note_bound(m.handle); } *guard = Some(m) } // HIDSTALL2 (B670): a new bound mount = a new epoch; a split read planned on the old one re-runs under the hold (LINE-NEUTRAL append, before this comment)
                 Err(e) => {
                     // UNAFSTXN: the MOUNT itself reads sectors (`locate`, the superblock, the
                     // reclaim drain), so contention can defeat it before the closure ever runs.
@@ -892,12 +892,12 @@ fn with_unafs_attempt<R>(f: &mut impl FnMut(&mut KernelUnaFS) -> R) -> Attempt<R
 /// the caller left us unmasked, and spin-hint otherwise. Either way the wait is OUTSIDE the
 /// attempt's own `without_interrupts` span: the F1–F4 rule that no masked span may wait on a driver
 /// lock is not weakened by this loop, it is what the loop is built out of.
-pub fn with_unafs<R>(mut f: impl FnMut(&mut KernelUnaFS) -> R) -> Result<R, MountError> {
+#[track_caller] pub fn with_unafs<R>(f: impl FnMut(&mut KernelUnaFS) -> R) -> Result<R, MountError> { with_unafs_arm(f, false) } #[track_caller] #[inline(always)] fn with_unafs_arm<R>(mut f: impl FnMut(&mut KernelUnaFS) -> R, read: bool) -> Result<R, MountError> { // UNAFSREADUNMASKED (B1035): with_unafs = the masked arm; with_unafs_read (file tail) = the same loop, read = true (LINE-NEUTRAL, code first)
     let start = crate::arch::now_cycles();
     let budget = crate::arch::hw_wait_budget();
     let mut restarts: u32 = 0;
     for _ in 0..TXN_BUSY_ATTEMPTS {
-        #[cfg(all(target_arch = "x86_64", feature = "wc"))] if !splitwrite::ticket_wait() { break; } if let Err(e) = prebind() { note_txn_restarts(restarts, true); return Err(e); } match { let t_mask = crate::hidstall::now_us(); let a = with_unafs_attempt(&mut f); crate::hidstall::note_masked_since(t_mask); a } { // HIDSTALL (B485): the attempt's IRQ-masked span, on the stall line as `masked_ms=`
+        #[cfg(all(target_arch = "x86_64", feature = "wc"))] if !splitwrite::ticket_wait() { break; } if let Err(e) = prebind() { note_txn_restarts(restarts, true); return Err(e); } match { let t_mask = crate::hidstall::now_us(); let arm = attempt_arm(read); let a = with_unafs_attempt(&mut f, arm); note_attempt(arm, t_mask); a } { // HIDSTALL (B485): the attempt's IRQ-masked span, on the stall line as `masked_ms=`
             Attempt::Settled(out) => {
                 if restarts > 0 {
                     note_txn_restarts(restarts, true);
@@ -1076,7 +1076,7 @@ fn is_absent(e: &FileSystemError) -> bool {
 /// drops the revoked edge. `owner`/grant strings are the caller's pre-projected native bytes. Returns
 /// `true` iff every journaled step committed; `false` on any mount or write error (the caller treats a
 /// persist failure as non-fatal for a grow/re-persist, or fail-closed for a create).
-pub fn native_acl_write(
+#[track_caller] pub fn native_acl_write(
     dir_lba: u64,
     dir_off: u32,
     name: &str,
@@ -1229,8 +1229,8 @@ fn native_acl_stage_row(
 /// K6: read back the ACL row for `(dir_lba, dir_off)`, or `None` if there is no row (public) or the
 /// mount fails. The read is pure (no metadata write-back through the coherent mount). Used by the
 /// migration read-back verify and by a native single-row lookup.
-pub fn native_acl_read(dir_lba: u64, dir_off: u32) -> Option<NativeAclRow> {
-    with_unafs(|fs| native_acl_read_on(fs, dir_lba, dir_off)).ok().flatten()
+#[track_caller] pub fn native_acl_read(dir_lba: u64, dir_off: u32) -> Option<NativeAclRow> {
+    with_unafs_read(|fs| native_acl_read_on(fs, dir_lba, dir_off)).ok().flatten()
 }
 
 /// K5B: the body of [`native_acl_read`], against an ALREADY-HELD coherent mount — for callers already
@@ -1269,7 +1269,7 @@ fn native_acl_row_of(fs: &mut KernelUnaFS, id: u64) -> Option<NativeAclRow> {
 /// K6: clear the ACL row for `(dir_lba, dir_off)` — the `atr_clear_row` native successor. Deletes the
 /// unafs ACL file (journaled), reverting the FAT file to public. Idempotent: an absent row is already
 /// clear (`true`); only a real mount/I-O error is `false`.
-pub fn native_acl_clear(dir_lba: u64, dir_off: u32) -> bool {
+#[track_caller] pub fn native_acl_clear(dir_lba: u64, dir_off: u32) -> bool {
     match with_unafs_write(|fs| {
         let root = fs.superblock.root_inode;
         let fname = acl_file_name(dir_lba, dir_off);
@@ -1290,8 +1290,8 @@ pub fn native_acl_clear(dir_lba: u64, dir_off: u32) -> bool {
 /// K6: every ACL row on the volume — the mount-time rebuild source (the `atr_rebuild_into_owned`
 /// native successor reads this and re-resolves each `name` on the FAT volume). Skips non-`acl-` files
 /// and rows without an owner. On a mount error, an empty list (fail-closed: no owners installed).
-pub fn native_acl_list() -> Vec<NativeAclRow> {
-    with_unafs(|fs| {
+#[track_caller] pub fn native_acl_list() -> Vec<NativeAclRow> {
+    with_unafs_read(|fs| {
         let root = fs.superblock.root_inode;
         let mut out = Vec::new();
         let entries = match fs.ls(root) {
@@ -1453,12 +1453,12 @@ pub enum SnapReadResult {
 /// deleted object). Permitted → the snapshot's bytes; refused → the traced
 /// reason (an impostor or rights-lacking grantee is `DenyAcl`, a live-deleted
 /// object is `DenyNoLiveObject`, fail-closed).
-pub fn snapshot_read(
+#[track_caller] pub fn snapshot_read(
     generation: u64,
     path: &str,
     principal: &str,
 ) -> Result<SnapReadResult, MountError> {
-    with_unafs(|fs| {
+    with_unafs_read(|fs| {
         // Phase 1: resolve the object's logical id in the snapshot (frozen view
         // borrows fs; scope it so the ACL check below can re-borrow fs).
         let sid = {
@@ -2764,7 +2764,7 @@ pub fn unafsx86_selftest() {
     let _ = mt.unlink(PATH, KERNEL_PRINCIPAL); // a stale scratch from an interrupted run
     let create = mt.create(PATH, NodeKind::File, KERNEL_PRINCIPAL).is_ok();
     let write = create && mt.write(PATH, 0, BODY, KERNEL_PRINCIPAL).map(|n| n == BODY.len()).unwrap_or(false);
-    force_remount();
+    force_remount(); let kat = bind_now_kat(); // BINDNOWGATE (B1061): the KAT's word joins `pass` below. UNAFSBINDTRIGGER (B1058): the mount was just dropped — bind_now binds it with no masked MOUNT attempt by this task (file tail; LINE-NEUTRAL, before this comment)
     let reread = matches!(
         with_unafs(|fs| match fs.resolve_path(PATH) {
             Ok(id) => fs.read_data(id, 0, BODY.len() as u64).map(|d| d == BODY).unwrap_or(false),
@@ -2785,7 +2785,7 @@ pub fn unafsx86_selftest() {
     );
     let unlink = mt.unlink(PATH, KERNEL_PRINCIPAL).is_ok() && mt.stat(PATH).is_err();
     let w = |b: bool| if b { "ok" } else { "no" };
-    let pass = create && write && reread && owner && unlink;
+    let pass = create && write && reread && owner && unlink && kat; // BINDNOWGATE (B1061): a kat=FAIL reds UNAFSX86-T (the replay's `-> FAIL ::`); skip is not red
     serial_println!(
         ":: UNAFSX86-T: root=unafs create={} write={} remount-read={} owner={} unlink={} -> {} ::",
         w(create), w(write), w(reread), w(owner), w(unlink),
@@ -2806,7 +2806,7 @@ fn ra_window(handle: block::BlockHandle) -> u64 {
     match handle {
         #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
         block::BlockHandle::Sdhc => (crate::drivers::sdhc::MB_MAX_BLOCKS as u64).min(block::MAX_BLOCKS_PER_OP as u64),
-        _ => 0,
+        #[cfg(all(target_arch = "x86_64", feature = "nvme"))] block::BlockHandle::Nvme => (crate::drivers::nvme::xfer_sectors() as u64).min(block::MAX_BLOCKS_PER_OP as u64), _ => 0, // NVMEBATCHREAD (zenbook-ledger Z24): the NVMe window is the MDTS span, so one window fill is ONE READ command; 0 on a non-512 namespace (SAME-LINE fold)
     }
 }
 
@@ -2822,7 +2822,7 @@ fn map_block_err(at: u64, e: BlockError) -> SectorError {
 
 /// `buf.len() / 512` consecutive sectors from `lba`: one counted read per block-layer op on the SD card,
 /// the per-sector loop elsewhere.
-fn handle_read_multi(handle: block::BlockHandle, lba: u64, buf: &mut [u8]) -> Result<(), SectorError> {
+fn handle_read_multi(handle: block::BlockHandle, lba: u64, buf: &mut [u8]) -> Result<(), SectorError> { #[cfg(all(target_arch = "x86_64", feature = "nvme"))] if handle == block::BlockHandle::Nvme { return nvme_read_multi(lba, buf); } // NVMEBATCHREAD (zenbook-ledger Z24): a window fill is ONE read run on the NVMe, never eight 512 B reads (LINE-NEUTRAL fold, before this comment)
     #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
     if let block::BlockHandle::Sdhc = handle {
         let per = block::MAX_BLOCKS_PER_OP * 512;
@@ -2847,7 +2847,7 @@ fn handle_read_multi(handle: block::BlockHandle, lba: u64, buf: &mut [u8]) -> Re
 fn handle_write_multi(handle: block::BlockHandle, lba: u64, buf: &[u8]) -> Result<(), SectorError> {
     if buf.len() % 512 != 0 {
         return Err(SectorError::Io(format!("write span {} not whole sectors", buf.len())));
-    }
+    } #[cfg(all(target_arch = "x86_64", feature = "nvme"))] if handle == block::BlockHandle::Nvme { return block::write_sectors_nvme(lba, buf).map_err(|e| map_block_err(lba, e)); } // NVMEBATCH (zenbook-ledger Z22): a 4 KiB block is ONE granted run on the NVMe (one WRITE, one read-back), never eight 512 B writes (LINE-NEUTRAL fold, before this comment)
     #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
     if let block::BlockHandle::Sdhc = handle {
         let per = block::MAX_BLOCKS_PER_OP * 512;
@@ -3054,7 +3054,7 @@ pub mod splitread {
     pub fn note_bound(handle: block::BlockHandle) {
         let span = SPANS.lock().iter().find(|(h, _)| *h == handle).map(|e| e.1);
         let epoch = EPOCH.fetch_add(1, Ordering::Relaxed) + 1;
-        *BOUND.lock() = span.map(|span| Bound { epoch, handle, span });
+        *BOUND.lock() = span.map(|span| Bound { epoch, handle, span }); super::readarm::note_bound(handle); // UNAFSREADUNMASKED (B1035): every install records whether its medium takes the read arm
     }
 
     /// Why a split read returned no bytes (the caller maps these to its own error type).
@@ -3076,10 +3076,34 @@ pub mod splitread {
     /// Read `len` bytes at `offset` of the file at absolute unafs `path`: the plan and the check hold
     /// MOUNT, the data blocks are read without it. Same bytes and same refusals as the one-hold
     /// `resolve_path` + `read_inode` + `read_data` it replaces.
-    pub fn read(path: &str, offset: u64, len: u64) -> Result<Vec<u8>, ReadMiss> {
+    pub fn read(path: &str, offset: u64, len: u64) -> Result<Vec<u8>, ReadMiss> { read_with(path, offset, len).0 }
+    /// One split try's outcome (UNAFSLOCKHOLD, B1015): bytes or a refusal, the plan went stale, or no split at all.
+    enum Try { Done(Result<Vec<u8>, ReadMiss>), Stale, Whole }
+
+    /// UNAFSLOCKHOLD (B1015): the split read RETRIED with a fresh plan while the check finds the generation or the
+    /// epoch moved (at most `lockhold::TRIES`), then the fallback CHUNKED (`locked`): no hold reads more than one run.
+    pub(super) fn read_with(path: &str, offset: u64, len: u64) -> (Result<Vec<u8>, ReadMiss>, super::lockhold::Stats) {
         OPS.fetch_add(1, Ordering::Relaxed);
-        let t0 = crate::hidstall::now_us();
-        let (plan, held_plan) = with_unafs(|fs| {
+        let mut st = super::lockhold::Stats { how: "split", ..Default::default() };
+        let (t0, mut data_us, mut out) = (crate::hidstall::now_us(), 0u64, None);
+        while out.is_none() && st.tries < super::lockhold::TRIES {
+            st.tries += 1;
+            match try_split(path, offset, len, &mut st, &mut data_us) { Try::Done(r) => out = Some(r), Try::Stale => {} Try::Whole => break }
+        }
+        let out = match out { Some(r) => r, None => locked(path, offset, len, &mut st) };
+        let t3 = crate::hidstall::now_us();
+        if t3.saturating_sub(t0) >= LINE_MS * 1000 || st.tries > 1 || st.how != "split" {
+            serial_println!(
+                "[unafslock] read path={} bytes={} held_us={} data_ms={} total_ms={} tries={} how={} chunks={} restarts={} hold_max_us={} -> {}",
+                path, out.as_ref().map(|d| d.len()).unwrap_or(0), st.held_split_us, data_us / 1000, t3.saturating_sub(t0) / 1000,
+                st.tries, st.how, st.chunks, st.restarts, st.hold_max_us, if st.how == "split" { "split" } else { "fallback" });
+        }
+        (out, st)
+    }
+
+    /// One split try (the B670 body): plan under MOUNT, the data blocks off it, the check under MOUNT.
+    fn try_split(path: &str, offset: u64, len: u64, st: &mut super::lockhold::Stats, data_us: &mut u64) -> Try {
+        let planned = with_unafs_read(|fs| {
             let h0 = crate::hidstall::now_us();
             let r = (|| -> Result<Option<Plan>, ReadMiss> {
                 let id = fs.resolve_path(path).map_err(|_| ReadMiss::NoSuchPath)?;
@@ -3091,55 +3115,31 @@ pub mod splitread {
                 Ok(BOUND.lock().as_ref().copied().map(|bound| Plan { root_gen, bound, chunks: ino.chunks, size: ino.size }))
             })();
             (r, crate::hidstall::now_us().saturating_sub(h0))
-        })
-        .map_err(ReadMiss::Mount)?;
-        HELD_MAX_US.fetch_max(held_plan, Ordering::Relaxed);
-        let Some(plan) = plan? else {
-            return locked(path, offset, len); // no bound identity noted: the one-hold read
-        };
-        let t1 = crate::hidstall::now_us();
-        let data = read_extents(&plan, offset, len);
-        let t2 = crate::hidstall::now_us();
-        let (same, held_check) = with_unafs(|fs| {
+        });
+        let (plan, held_plan) = match planned { Ok(p) => p, Err(e) => return Try::Done(Err(ReadMiss::Mount(e))) };
+        st.split_hold(held_plan); HELD_MAX_US.fetch_max(held_plan, Ordering::Relaxed);
+        let plan = match plan { Ok(Some(p)) => p, Ok(None) => return Try::Whole, Err(e) => return Try::Done(Err(e)) }; // no bound identity noted, or a ciphered root: the fallback
+        let t1 = crate::hidstall::now_us(); let data = read_extents(&plan, offset, len);
+        *data_us += crate::hidstall::now_us().saturating_sub(t1); super::lockhold::kat_inject(); // `tests unafslock` KAT only: a commit between the data and the check
+        let checked = with_unafs_read(|fs| {
             let h0 = crate::hidstall::now_us();
             let same = fs.root_generation() == plan.root_gen && BOUND.lock().as_ref().map(|b| b.epoch) == Some(plan.bound.epoch);
             (same, crate::hidstall::now_us().saturating_sub(h0))
-        })
-        .map_err(ReadMiss::Mount)?;
-        HELD_MAX_US.fetch_max(held_check, Ordering::Relaxed);
-        let (out, how) = match data {
-            Some(d) if same => (Ok(d), "split"),
-            _ => (locked(path, offset, len), "fallback"),
-        };
-        let t3 = crate::hidstall::now_us();
-        if t3.saturating_sub(t0) >= LINE_MS * 1000 {
-            serial_println!(
-                "[unafslock] read path={} bytes={} held_us={} data_ms={} total_ms={} -> {}",
-                path,
-                out.as_ref().map(|d| d.len()).unwrap_or(0),
-                held_plan.max(held_check),
-                t2.saturating_sub(t1) / 1000,
-                t3.saturating_sub(t0) / 1000,
-                how
-            );
-        }
-        out
+        });
+        let (same, held_check) = match checked { Ok(c) => c, Err(e) => return Try::Done(Err(ReadMiss::Mount(e))) };
+        st.split_hold(held_check); HELD_MAX_US.fetch_max(held_check, Ordering::Relaxed);
+        match data { Some(d) if same => Try::Done(Ok(d)), Some(_) => Try::Stale, None => Try::Whole }
     }
 
-    /// The pre-split read: one `with_unafs` hold, data I/O under MOUNT. Counted.
-    fn locked(path: &str, offset: u64, len: u64) -> Result<Vec<u8>, ReadMiss> {
+    /// The fallback (UNAFSLOCKHOLD, B1015): the one-hold read CHUNKED — `lockhold::chunked` takes MOUNT once per run of
+    /// `RUN_BLOCKS` blocks, the root generation re-checked in each hold. Counted; its holds feed `HELD_MAX_US`.
+    fn locked(path: &str, offset: u64, len: u64, st: &mut super::lockhold::Stats) -> Result<Vec<u8>, ReadMiss> {
         FALLBACKS.fetch_add(1, Ordering::Relaxed);
         let (f0, _) = tx_io();
-        let r = with_unafs(|fs| -> Result<Vec<u8>, ReadMiss> {
-            let id = fs.resolve_path(path).map_err(|_| ReadMiss::NoSuchPath)?;
-            let ino = fs.read_inode(id).map_err(|_| ReadMiss::NoSuchPath)?;
-            if ino.kind == ::unafs::FileKind::Directory {
-                return Err(ReadMiss::IsADirectory);
-            }
-            fs.read_data(id, offset, len).map_err(|_| ReadMiss::Failed)
-        });
+        let r = super::lockhold::chunked(path, offset, len, RUN_BLOCKS * ::unafs::BLOCK_SIZE, st);
         IO_UNDER_LOCK.fetch_add(tx_io().0.wrapping_sub(f0), Ordering::Relaxed);
-        r.map_err(ReadMiss::Mount)?
+        HELD_MAX_US.fetch_max(st.hold_max_us, Ordering::Relaxed);
+        r
     }
 
     /// The crate's extent walk (`unafs::fs::read_from_extents_via`), step for step, with the block
@@ -3337,13 +3337,13 @@ pub mod splitread {
         let held_us = read_held.max(meta_held_max);
         let io_under = io1.wrapping_sub(io0);
         let fallbacks = fb1.wrapping_sub(fb0);
-        let same = T_OK.load(Ordering::Relaxed) && T_BYTES.load(Ordering::Relaxed) == len && T_HASH.load(Ordering::Relaxed) == want;
-        let pass = done && same && held_us <= 5000 && io_under == 0 && fallbacks == 0 && ops >= 1;
+        let same = T_OK.load(Ordering::Relaxed) && T_BYTES.load(Ordering::Relaxed) == len && T_HASH.load(Ordering::Relaxed) == want; let (retry, chunked, kat_hold) = super::lockhold::kat(&path, len, |d: &[u8]| fnv(FNV0, d) == want); // UNAFSLOCKHOLD (B1015): the retry + chunked-fallback KAT, after the census (file tail; LINE-NEUTRAL, before this comment)
+        let pass = done && same && held_us <= 5000 && io_under == 0 && fallbacks == 0 && ops >= 1 && retry && chunked;
         serial_println!(
-            ":: UNAFSLOCK: ops={} held_max_ms={} io_under_lock={} -> {} :: path={} bytes={} read_ms={} read_held_us={} meta_held_us={} meta_wait_max_ms={} fallbacks={} match={} done={}",
+            ":: UNAFSLOCK: ops={} held_max_ms={} io_under_lock={} retry={} chunked={} hold_max_us={} -> {} :: path={} bytes={} read_ms={} read_held_us={} meta_held_us={} meta_wait_max_ms={} fallbacks={} match={} done={}",
             ops,
             held_us.div_ceil(1000),
-            io_under,
+            io_under, if retry { "ok" } else { "FAIL" }, if chunked { "ok" } else { "FAIL" }, kat_hold,
             if pass { "PASS" } else { "FAIL" },
             path,
             len,
@@ -3405,7 +3405,7 @@ fn keyboot_candidates() -> Vec<block::BlockHandle> {
     #[cfg(all(target_arch = "x86_64", feature = "ahciroot"))]
     if let Some(port) = crate::install::ahciroot::ensure_root_grant() {
         v.push(block::BlockHandle::Ahci { port });
-    }
+    } #[cfg(all(target_arch = "x86_64", feature = "nvme"))] if ensure_nvme_root_grant() { v.push(block::BlockHandle::Nvme); } // NVMEBOOT (Z9): the root-granted NVMe after the SSD, before the probe walk (LINE-NEUTRAL append)
     for h in bind_probe_candidates() {
         if h == block::BlockHandle::Global || bind_probe_admitted(h) {
             v.push(h);
@@ -3621,7 +3621,7 @@ fn kb_bind_root(handle: block::BlockHandle, key: ::unafs::VolumeKey) -> Result<b
         }
         if let Some(m) = fs.take() {
             #[cfg(all(target_arch = "x86_64", feature = "wc"))]
-            splitread::note_bound(handle);
+            splitread::note_bound(handle); #[cfg(all(target_arch = "aarch64", feature = "baremetal"))] { readarm::note_bound(handle); }
             *g = Some(BoundMount { handle, fs: m });
         }
         Some(true)
@@ -3893,20 +3893,20 @@ pub fn restore_version_on<D: ::unafs::BlockDevice>(fs: &mut UnaFS<D>, path: &str
 }
 
 /// FILEVERSIONS (B714): [`versions_on`] on THE mount (`None`: no volume, or no such file).
-pub fn versions(path: &str) -> Option<Vec<VersionInfo>> {
-    with_unafs(|fs| versions_on(fs, path).ok()).ok().flatten()
+#[track_caller] pub fn versions(path: &str) -> Option<Vec<VersionInfo>> {
+    with_unafs_read(|fs| versions_on(fs, path).ok()).ok().flatten()
 }
 
 /// FILEVERSIONS (B714): [`read_version_on`] on THE mount.
-pub fn read_version(path: &str, n: usize) -> Option<Vec<u8>> {
-    with_unafs(|fs| read_version_on(fs, path, n).ok()).ok().flatten()
+#[track_caller] pub fn read_version(path: &str, n: usize) -> Option<Vec<u8>> {
+    with_unafs_read(|fs| read_version_on(fs, path, n).ok()).ok().flatten()
 }
 
 /// FILEVERSIONS (B714): [`restore_version_on`] on THE mount (`Ok` once committed). RESTORERESULT (SR161): the ONE
 /// restore path, and it keeps the reason — the crate's refusal comes back whole (`ReadOnly`, `CorruptVolume`, ...)
 /// for the caller's classifier (Quarry's `ops::restore_refusal`); a mount that never ran the restore (no volume, the
 /// device `Busy` past the restart budget) is a `Storage(Io("mount: <MountError>"))`, never an `Ok`.
-pub fn restore_version(path: &str, n: usize) -> Result<(), FileSystemError> {
+#[track_caller] pub fn restore_version(path: &str, n: usize) -> Result<(), FileSystemError> {
     match with_unafs(|fs| restore_version_on(fs, path, n).map_err(|e| { request_mount_discard(); e })) { // crawl B 10: a failed restore's in-RAM references are discarded inside the hold, as `diskfull::write_root` does
         Ok(r) => r,
         Err(MountError::Fs(e)) => Err(e),
@@ -4168,7 +4168,7 @@ pub mod splitwrite {
 
     /// Run the write op `f` against the one coherent mount with its commit split (see the banner). Same contract
     /// as [`with_unafs`]; a commit that fails is `MountError::Fs`, and a `Busy` leaves nothing landed.
-    pub fn with_unafs_write<R>(mut f: impl FnMut(&mut KernelUnaFS) -> R) -> Result<R, MountError> {
+    #[track_caller] pub fn with_unafs_write<R>(mut f: impl FnMut(&mut KernelUnaFS) -> R) -> Result<R, MountError> {
         let Some(me) = crate::arch::sched::current_id() else {
             return with_unafs(f); // no task identity to hold the ticket by: the whole commit
         };
@@ -4188,7 +4188,7 @@ pub mod splitwrite {
     /// The ticket is held across ALL of the op's commits; a death between them is TICKETOWNER's release (`release_dead`:
     /// the staged RAM goes with the leaked instance; a drop or chunk already flipped stays landed — correct by K8a, and a
     /// landed chunk is a shorter file, never a torn one). Never an `Ok` for an op that owed more: past the bound, Busy.
-    fn run<R>(f: &mut impl FnMut(&mut KernelUnaFS) -> R) -> Result<R, MountError> {
+    #[track_caller] fn run<R>(f: &mut impl FnMut(&mut KernelUnaFS) -> R) -> Result<R, MountError> {
         let (mut lost, mut again, mut drops, mut chunks) = (0u32, None::<OpAgain>, 0usize, 0u32); // UNAFSWRITE3 (B872)
         while lost < LOST_RUNS {
             // HOLD 1: the op, then the stage.
@@ -4579,7 +4579,7 @@ fn prebind_now() -> Result<(), MountError> {
                 mount_poison_check(&mut *g);
                 if g.is_none() {
                     #[cfg(all(target_arch = "x86_64", feature = "wc"))]
-                    splitread::note_bound(m.handle);
+                    splitread::note_bound(m.handle); #[cfg(all(target_arch = "aarch64", feature = "baremetal"))] { readarm::note_bound(m.handle); }
                     *g = Some(m);
                     None
                 } else {
@@ -4957,4 +4957,706 @@ fn bind_dead_task(_: usize) {
     serial_println!("[unafs] lockreg-bind returned depth={} (the guard did not fire)", n);
     BIND_TID.store(0, Ordering::Release);
     BIND_LIVE.store(false, Ordering::Release);
+}
+
+// =================================================================================================
+// NVMEBOOT (zenbook-ledger Z9) — the NVMe namespace's UnaFS volume as `/`, in AHCIROOT's shape.
+//
+// TAIL-APPENDED; every change above is a LINE-NEUTRAL fold. The block layer owns the grant SLOT
+// (`drivers/block.rs` tail: one inclusive range, -EPERM outside it, never cleared); this section owns the
+// JUDGMENT that fills it, and the one rebind both roots use:
+//
+// * [`ensure_nvme_root_grant`] — the one UnaFS volume `locate_on(BlockHandle::Nvme)` finds (the FIRST
+//   partition carrying UnaFS magic: the very extent `mount_on` will ride) gets the boot's NVMe root grant,
+//   exactly that extent and nothing else; a foreign partition beside it (the Zenbook's Windows) stays
+//   outside it. Silent (R80): the `:: UNAFSX86: root=unafs src=nvme … ::` line is the boot's one line.
+//   Called from `bootdisk::unafs_state` and [`keyboot_candidates`] BEFORE the bind, with no lock of ours
+//   held; [`bind_mount`] only reads the slot.
+// * [`bind_root_on`] — make the shared mount ride `want` (AHCIROOT's rebind; `install::ahciroot::bind_ssd_root`
+//   is this function for `Ahci { port }`).
+
+/// NVMEBOOT: the negative answer, cached (DONGLEBOOT B658's idea): the namespace was read and carries no UnaFS
+/// volume (NVME4KN Z31: any LBA size 512..4096 is served). Never set on an I/O error, nor while no namespace is published.
+#[cfg(all(target_arch = "x86_64", feature = "nvme"))]
+static NVME_ROOT_NONE: AtomicBool = AtomicBool::new(false);
+
+/// NVMEBOOT: mint and hold the boot's NVMe root grant over the namespace's UnaFS volume. Idempotent; silent.
+/// `true` when the grant is live.
+#[cfg(all(target_arch = "x86_64", feature = "nvme"))]
+pub fn ensure_nvme_root_grant() -> bool {
+    if block::nvme_root_grant().is_some() {
+        return true;
+    }
+    // `UNAOS_ROOT_PREFER=sdhc` is the operator's way to boot the card's root over an installed disk (AHCIROOT).
+    if NVME_ROOT_NONE.load(Ordering::Acquire) || cfg!(feature = "root-prefer-sdhc") {
+        return false;
+    }
+    if block::nvme_info().is_none() {
+        return false; // no namespace published (yet): never remembered as absent
+    }
+    let span = match locate_on(block::BlockHandle::Nvme) {
+        Ok(span) => span,
+        Err(MountError::NoVolume) | Err(MountError::BadSectorSize(_)) => {
+            NVME_ROOT_NONE.store(true, Ordering::Release);
+            return false;
+        }
+        Err(_) => return false,
+    };
+    // A UnaFS block is 8 view sectors; the grant is in the namespace's OWN LBAs (NVME4KN Z31: `nvme_grant_lbas`, file tail).
+    let Some((first, last)) = nvme_grant_lbas(&span) else {
+        return false;
+    };
+    if !nvme_root_one(&span) { return false; } block::hold_nvme_root_grant(first, last) // NVMEROOTONE (zenbook-ledger Z22): a namespace with a second UnaFS volume gets no grant (body at the file tail; LINE-NEUTRAL fold)
+}
+
+/// NVMEBOOT: make the shared UnaFS mount ride `want` — drop a mount bound elsewhere (an earlier lazy bind),
+/// then bind ([`bind_mount`] tries the root-granted handles first). `true` when the live mount is on `want`.
+/// The ONE rebind: `install::ahciroot::bind_ssd_root` forwards here for `Ahci { port }`.
+#[cfg(all(target_arch = "x86_64", any(feature = "ahciroot", feature = "nvme")))]
+#[track_caller] pub fn bind_root_on(want: block::BlockHandle) -> bool {
+    if mount_bound_handle().is_some_and(|h| h != want) {
+        force_remount();
+    }
+    let _ = bind_now();
+    mount_bound_handle() == Some(want)
+}
+
+// =================================================================================================
+// NVMEROOTONE (zenbook-ledger Z22) — the NVMe root grant only over a namespace with exactly ONE UnaFS volume.
+//
+// TAIL-APPENDED; the call is a LINE-NEUTRAL fold in `ensure_nvme_root_grant`. AHCIROOT's rule ("exactly one UnaFS
+// partition: two would make the root a guess", `install::ahciroot::ours_unafs_part`) for the NVMe, through the SAME
+// locate the grant rides: the crate's `locate_unafs` is asked a second time over [`HideVolume`], a read-only view of
+// the namespace in which the found volume's superblock sectors read as zeros. Same parser, same magic probe as
+// `locate_on`, so the counted set contains the granted volume by construction; no copy of the locate loop.
+
+/// NVMEROOTONE: the namespace as `locate_unafs` sees it, with the 8 sectors of block 0 at `at` (the volume
+/// already found) reading as zeros. Read-only: every write is refused.
+#[cfg(all(target_arch = "x86_64", feature = "nvme"))]
+struct HideVolume<'a> {
+    dev: &'a mut SdSectorDevice,
+    at: u64,
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "nvme"))]
+impl SectorDevice for HideVolume<'_> {
+    fn read_sector(&mut self, lba: u64, buf: &mut [u8]) -> Result<(), SectorError> {
+        if lba >= self.at && lba < self.at.saturating_add(8) {
+            buf.fill(0);
+            return Ok(());
+        }
+        self.dev.read_sector(lba, buf)
+    }
+
+    fn write_sector(&mut self, _lba: u64, _buf: &[u8]) -> Result<(), SectorError> {
+        Err(SectorError::Io(alloc::string::String::from("NVMEROOTONE: read-only view")))
+    }
+
+    fn sector_count(&self) -> u64 {
+        self.dev.sector_count()
+    }
+}
+
+/// NVMEROOTONE: `true` when the namespace carries no UnaFS volume besides `span`. A second one is refused ONCE on
+/// the wire and cached in `NVME_ROOT_NONE` (a content verdict, as NoVolume is); an I/O error is `false`, never cached.
+#[cfg(all(target_arch = "x86_64", feature = "nvme"))]
+fn nvme_root_one(span: &PartitionSpan) -> bool {
+    let Ok(mut dev) = SdSectorDevice::open_on(block::BlockHandle::Nvme) else { return false }; if block::nvme_sector_shift().unwrap_or(0) > 0 { return nvme_lba_one(&mut dev, span); } // NVME4KN (zenbook-ledger Z31): the 4Kn namespace counts its volumes from the same list it located from (LINE-NEUTRAL fold)
+    let mut view = HideVolume { dev: &mut dev, at: span.base_lba };
+    match locate_unafs(&mut view) {
+        Ok(None) => true,
+        Ok(Some(second)) => {
+            serial_println!("[nvme] root grant refused why=two-volumes first={} second={}", span.base_lba, second.base_lba);
+            NVME_ROOT_NONE.store(true, Ordering::Release);
+            false
+        }
+        Err(_) => false,
+    }
+}
+
+// =================================================================================================
+// NVMEBATCHREAD (zenbook-ledger Z24) — the NVMe read path through the BOOT80 read-ahead window.
+// TAIL-APPENDED (no line above moves). `ra_window`'s Nvme arm (the MDTS span, `drivers::nvme::xfer_sectors`)
+// sends `SdSectorDevice::read_sectors` through the existing `RaSet` (its coherence `splitwrite::ra_sync` is
+// handle-agnostic), and `handle_read_multi`'s Nvme fold lands the window fill here: ONE `block::read_blocks_nvme`
+// per MAX_BLOCKS_PER_OP chunk, which `drivers::nvme::transfer` issues as ONE READ when it fits `max_xfer`.
+// =================================================================================================
+
+/// NVMEBATCHREAD: `buf.len() / 512` consecutive sectors from `lba` on the NVMe — the Sdhc arm's shape.
+#[cfg(all(target_arch = "x86_64", feature = "nvme"))]
+fn nvme_read_multi(lba: u64, buf: &mut [u8]) -> Result<(), SectorError> {
+    block::read_sectors_nvme(lba, buf).map_err(|e| map_block_err(lba, e)) // NVME4KN (Z31): the block layer's sector view chunks by MAX_BLOCKS_PER_OP and maps to the namespace's LBAs
+}
+
+/// NVMEBATCHREAD: `tests nvme`'s `rpath` leg — read `out.len() / 512` sectors at `lba` through a FRESH mount-shaped
+/// device on the NVMe (the read path a UnaFS root rides). `false` when the device has no read-ahead window or the
+/// read fails; the caller counts the READ commands it cost.
+#[cfg(all(target_arch = "x86_64", feature = "nvme"))]
+pub fn nvme_read_leg(lba: u64, out: &mut [u8]) -> bool {
+    match SdSectorDevice::open_on(block::BlockHandle::Nvme) {
+        Ok(mut dev) => dev.ra.window_sectors() > 1 && dev.read_sectors(lba << block::nvme_sector_shift().unwrap_or(0), out).is_ok(), // NVME4KN (Z31): the caller passes a namespace LBA; the device addresses 512 B view sectors
+        Err(_) => false,
+    }
+}
+
+// =================================================================================================
+// NVME4KN (zenbook-ledger Z31) — a UnaFS volume on a namespace whose LBA is not 512 B (4Kn).
+// TAIL-APPENDED; the calls are LINE-NEUTRAL folds in `open_on`, `locate_on` and `nvme_root_one`, and in-place token
+// edits on the already-cfg'd Nvme arms. `SdSectorDevice` keeps its 512 B sector space on every handle (the crate's
+// unit: `PartitionSpan.base_lba`, the RaSet window, `drivers::nvme::xfer_sectors`); on the NVMe it is the block layer's
+// sector view (`block::read_sectors_nvme` / `write_sectors_nvme`, block.rs tail), LBA = sector >> k. The crate's
+// `parse_gpt` reads a 512 B GPT only, so a k > 0 namespace is located through THE GPT reader, amber_core's
+// `gpt::read_table_with`, over native LBAs, each entry magic-probed by the crate's own `BlockAdapter::read_block`
+// (NVME4KN-CRATE owed: the crate's parser taking the LBA size retires this loop).
+// =================================================================================================
+
+/// NVME4KN: the NVMe namespace as a 512 B sector view (`num_blocks << k` sectors).
+#[cfg(all(target_arch = "x86_64", feature = "nvme"))]
+fn nvme_lba_open(dev: &block::BlockDeviceInfo) -> Result<SdSectorDevice, MountError> {
+    let k = block::nvme_sector_shift().ok_or(MountError::BadSectorSize(dev.block_size))?;
+    let sectors = dev.num_blocks.checked_shl(k).ok_or(MountError::BadSectorSize(dev.block_size))?;
+    Ok(SdSectorDevice { handle: block::BlockHandle::Nvme, sectors, ra: RaSet::new(ra_window(block::BlockHandle::Nvme)) })
+}
+
+/// NVME4KN: every UnaFS volume on a k > 0 namespace, in GPT entry order, as 512 B view spans.
+#[cfg(all(target_arch = "x86_64", feature = "nvme"))]
+fn nvme_lba_spans(dev: &mut SdSectorDevice) -> Result<Vec<PartitionSpan>, MountError> {
+    let k = block::nvme_sector_shift().ok_or(MountError::NoStorage)?;
+    let total = dev.sectors >> k;
+    let table = amber_core::gpt::read_table_with(total, |lba, buf: &mut [u8]| block::read_sectors_nvme(lba << k, buf).is_ok())
+        .map_err(|e| match e {
+            amber_core::gpt::GptError::Io => MountError::Part(PartError::Device(SectorError::Io(String::from("NVME4KN: GPT read failed")))),
+            _ => MountError::Part(PartError::Malformed("NVME4KN: no valid GPT at LBA 1")),
+        })?;
+    let mut out = Vec::new();
+    for (_slot, e) in table.entries.iter() {
+        let Some(base) = e.first_lba.checked_shl(k) else { continue };
+        let Some(sectors) = e.last_lba.checked_sub(e.first_lba).and_then(|d| d.checked_add(1)).and_then(|n| n.checked_shl(k)) else { continue };
+        let block_count = sectors / ::unafs::adapter::SECTORS_PER_BLOCK;
+        if block_count == 0 {
+            continue;
+        }
+        let mut adapter = BlockAdapter::new(&mut *dev, base, block_count);
+        let mut b = alloc::vec![0u8; ::unafs::BLOCK_SIZE as usize];
+        if adapter.read_block(0, &mut b).is_ok() && b[..::unafs::superblock::MAGIC.len()] == ::unafs::superblock::MAGIC {
+            out.push(PartitionSpan { base_lba: base, block_count });
+        }
+    }
+    Ok(out)
+}
+
+/// NVME4KN: `locate_on(Nvme)` on a k > 0 namespace — the first UnaFS volume.
+#[cfg(all(target_arch = "x86_64", feature = "nvme"))]
+fn nvme_lba_locate(dev: &mut SdSectorDevice) -> Result<PartitionSpan, MountError> {
+    nvme_lba_spans(dev)?.first().copied().ok_or(MountError::NoVolume)
+}
+
+/// NVME4KN: NVMEROOTONE on a k > 0 namespace — `true` when the list `nvme_lba_locate` took `span` from holds no other
+/// volume; a second one is refused on the same wire line and cached, an I/O error is `false`, never cached.
+#[cfg(all(target_arch = "x86_64", feature = "nvme"))]
+fn nvme_lba_one(dev: &mut SdSectorDevice, span: &PartitionSpan) -> bool {
+    match nvme_lba_spans(dev) {
+        Ok(v) => match v.iter().find(|s| s.base_lba != span.base_lba) {
+            None => true,
+            Some(second) => {
+                serial_println!("[nvme] root grant refused why=two-volumes first={} second={}", span.base_lba, second.base_lba);
+                NVME_ROOT_NONE.store(true, Ordering::Release);
+                false
+            }
+        },
+        Err(_) => false,
+    }
+}
+
+/// NVME4KN: the NVMe root grant for `span` in the namespace's OWN LBAs, inclusive: `base >> k` ..
+/// `+ (block_count << (3 - k)) - 1`. On a 512 B namespace (k = 0) this is NVMEBOOT's `base .. base + blocks*8 - 1`.
+#[cfg(all(target_arch = "x86_64", feature = "nvme"))]
+fn nvme_grant_lbas(span: &PartitionSpan) -> Option<(u64, u64)> {
+    let k = block::nvme_sector_shift()?;
+    if span.base_lba & ((1u64 << k) - 1) != 0 {
+        return None;
+    }
+    let first = span.base_lba >> k;
+    let last = span.block_count.checked_shl(3 - k).and_then(|n| first.checked_add(n)).and_then(|e| e.checked_sub(1))?;
+    Some((first, last))
+}
+
+// ── UNAFSLOCKHOLD (rmbp-ledger B1015, BP-storage-8) — the split read's fallback never reads more than ONE run under the
+// masked MOUNT hold. Flight 38: the write leg's 8 MiB read-back (`splitread::read`, `tests unafslock`) lost its generation
+// check to the desktop's commits during its 3.5 s data read, and the one-hold fallback (`splitread::locked`) read all of it
+// under MOUNT (`[lock] held-too-long name=unafs.rs:567 at=unafs.rs:794 … ms=2939`; render's `wait-timeout what=unafs-mount`).
+// Now `splitread::read_with` retries the split with a fresh plan (`TRIES`), and the fallback is `chunked`: one `with_unafs`
+// hold per `RUN_BLOCKS` run through the crate's `read_data`, the root generation noted in the first hold and re-checked in
+// every later one (a flip restarts from the first run, at most `RESTARTS` times, then `Busy`: never a short Ok). Same
+// generation across every hold = no commit flipped = the bytes the one hold returned (K8a). At the tail: no line above moves.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+pub mod lockhold {
+    use super::*;
+    use super::splitread::ReadMiss;
+    use core::sync::atomic::{AtomicU32, AtomicU64};
+
+    /// Split tries before the fallback (a try that meets a moved generation or epoch plans again).
+    pub const TRIES: u32 = 3;
+    /// Restarts of the chunked fallback on a generation that moved between its holds, then `Busy`.
+    pub const RESTARTS: u32 = 3;
+    /// The KAT's bound on any one hold of its chunked read (the write leg's bound, under lockreg's 50 ms line).
+    const KAT_HOLD_MAX_US: u64 = 20_000;
+
+    /// One read's witness (the `[unafslock] read` line's fields).
+    #[derive(Clone, Copy, Default)]
+    pub struct Stats {
+        pub tries: u32,
+        pub how: &'static str,
+        pub chunks: u32,
+        pub restarts: u32,
+        pub run: u64,
+        pub hold_max_us: u64,
+        pub held_split_us: u64,
+    }
+
+    impl Stats {
+        /// A split try's plan or check hold (`held_us=` on the line) — also a hold of this read.
+        pub fn split_hold(&mut self, us: u64) {
+            self.held_split_us = self.held_split_us.max(us);
+            self.hold_max_us = self.hold_max_us.max(us);
+        }
+    }
+
+    /// The fallback: `len` bytes at `offset` of `path`, `run` bytes per masked MOUNT hold.
+    pub fn chunked(path: &str, offset: u64, len: u64, run: u64, st: &mut Stats) -> Result<Vec<u8>, ReadMiss> {
+        st.how = "fallback-chunked";
+        st.run = run;
+        let run = run.max(::unafs::BLOCK_SIZE);
+        loop {
+            let mut out: Vec<u8> = Vec::new();
+            let (mut id, mut gen0, mut end, mut at) = (0u64, 0u64, 0u64, offset);
+            let mut first = true;
+            let restart = loop {
+                let held = with_unafs_read(|fs| {
+                    let h0 = crate::hidstall::now_us();
+                    let r = (|| -> Result<Option<Vec<u8>>, ReadMiss> {
+                        if first {
+                            id = fs.resolve_path(path).map_err(|_| ReadMiss::NoSuchPath)?;
+                            let ino = fs.read_inode(id).map_err(|_| ReadMiss::NoSuchPath)?;
+                            if ino.kind == ::unafs::FileKind::Directory {
+                                return Err(ReadMiss::IsADirectory);
+                            }
+                            gen0 = fs.root_generation();
+                            end = offset.saturating_add(len.min(ino.size.saturating_sub(offset)));
+                        } else if fs.root_generation() != gen0 {
+                            return Ok(None); // a commit flipped between two holds: restart from the first run
+                        }
+                        let n = run.min(end.saturating_sub(at));
+                        if n == 0 {
+                            return Ok(Some(Vec::new()));
+                        }
+                        fs.read_data(id, at, n).map(Some).map_err(|_| ReadMiss::Failed)
+                    })();
+                    (r, crate::hidstall::now_us().saturating_sub(h0))
+                });
+                let (r, us) = held.map_err(ReadMiss::Mount)?;
+                st.hold_max_us = st.hold_max_us.max(us);
+                match r? {
+                    None => break true,
+                    Some(d) => {
+                        st.chunks += 1;
+                        first = false;
+                        let got = d.len() as u64;
+                        out.extend_from_slice(&d);
+                        at = at.saturating_add(got);
+                        if got == 0 || at >= end {
+                            break false;
+                        }
+                        kat_inject(); // `tests unafslock` KAT only: a commit between two holds
+                    }
+                }
+            };
+            if !restart {
+                return Ok(out);
+            }
+            st.restarts += 1;
+            if st.restarts > RESTARTS {
+                st.how = "busy";
+                return Err(ReadMiss::Mount(MountError::Busy));
+            }
+        }
+    }
+
+    // ── `tests unafslock` KAT: commits injected between a read's phases, in the reader's own task ──
+    static INJECT: AtomicU32 = AtomicU32::new(0);
+    static INJECT_TID: AtomicU64 = AtomicU64::new(0);
+    const KAT_ATTR: &str = "unafslock.kat";
+
+    /// A KAT commit at an injection point: one attribute commit on `/var` through the split commit path (the root
+    /// generation moves). Only the KAT's own task, only while it armed `INJECT`; elsewhere one atomic load.
+    pub fn kat_inject() {
+        if INJECT.load(Ordering::Relaxed) == 0 || crate::arch::sched::current_id() != Some(INJECT_TID.load(Ordering::Relaxed)) {
+            return;
+        }
+        INJECT.fetch_sub(1, Ordering::Relaxed);
+        let v = crate::hidstall::now_us() as i64;
+        let _ = super::splitwrite::with_unafs_write(|fs| fs.resolve_path("/var").and_then(|var| fs.set_attribute(var, String::from(KAT_ATTR), AttributeValue::Int(v))));
+    }
+
+    /// `(retry_ok, chunked_ok, hold_max_us)`: leg 1 injects ONE commit (the split must retry once and land split); leg 2
+    /// injects one per split try plus one between the fallback's first two holds (the split must give up after `TRIES`,
+    /// the chunked fallback restart once when the file spans more than one run, every hold <= `KAT_HOLD_MAX_US`). Both
+    /// legs' bytes must equal the caller's reference (`same`).
+    pub fn kat(path: &str, len: u64, same: impl Fn(&[u8]) -> bool) -> (bool, bool, u64) {
+        let Some(me) = crate::arch::sched::current_id() else {
+            serial_println!("[unafslock] kat -> FAIL why=no-task");
+            return (false, false, 0);
+        };
+        INJECT_TID.store(me, Ordering::Relaxed);
+        INJECT.store(1, Ordering::Relaxed);
+        let (r, a) = super::splitread::read_with(path, 0, len);
+        let a_same = r.is_ok_and(|d| same(&d[..]));
+        let retry = a_same && a.tries == 2 && a.how == "split" && a.chunks == 0;
+        INJECT.store(TRIES + 1, Ordering::Relaxed);
+        let (r, b) = super::splitread::read_with(path, 0, len);
+        let b_same = r.is_ok_and(|d| same(&d[..]));
+        let want_restarts = (len > b.run) as u32;
+        let chunked = b_same && b.tries == TRIES && b.how == "fallback-chunked" && b.restarts == want_restarts && b.chunks >= 1 && b.hold_max_us <= KAT_HOLD_MAX_US;
+        let left = INJECT.swap(0, Ordering::Relaxed);
+        INJECT_TID.store(0, Ordering::Relaxed);
+        let _ = super::splitwrite::with_unafs_write(|fs| fs.resolve_path("/var").and_then(|var| fs.remove_attribute(var, KAT_ATTR)));
+        serial_println!(
+            "[unafslock] kat retry tries={} how={} match={} -> {} · chunked tries={} how={} chunks={} restarts={} hold_max_us={} match={} left={} -> {}",
+            a.tries,
+            a.how,
+            a_same,
+            if retry { "ok" } else { "FAIL" },
+            b.tries,
+            b.how,
+            b.chunks,
+            b.restarts,
+            b.hold_max_us,
+            b_same,
+            left,
+            if chunked { "ok" } else { "FAIL" }
+        );
+        (retry, chunked, b.hold_max_us)
+    }
+}
+
+// ── UNAFSREADUNMASKED (rmbp-ledger B1035, BP-storage-8 / BP-cores-23) — the MOUNT hold for READS runs preempt-off with interrupts
+// ON. Measured: no ISR touches MOUNT (every take is task context), so its mask was holder non-preemption only (PREEMPTAUDIT class
+// II) — what `preemptoff::scoped` gives. `with_unafs_read` is `with_unafs`'s own loop with `read = true` (`with_unafs_arm`, :895);
+// each attempt picks its span ONCE (`attempt_arm`): preempt-off when the read arm is asked for and the bound medium takes it, else
+// the mask exactly as before. The medium is recorded at every install (`splitread::note_bound`, :3057): the card, an AHCI port or
+// the NVMe namespace take it; an xHCI-backed mount (Global / Usb) keeps the mask, because an UNMASKED `claim_xhci_for_io` waits in
+// an `hlt` loop up to `hw_wait_budget()` and, under preempt-off, a preemptible loan holder on the same CPU could never run. The
+// callers are the split read's plan/check holds and the chunked fallback's per-run holds (`splitread`, `lockhold`); writes and every
+// other caller stay masked (UNAFS-WRITE-UNMASKED owed). A read attempt is not a masked span, so it feeds no masked meter; the first
+// one over 10 ms says ONE `[unafs] hold` line. At the tail: no line above moves.
+
+/// UNAFSREADUNMASKED: the attempt's span — preempt-off (interrupts as the caller had them) on the read arm, else the mask. The
+/// `#[track_caller]` keeps CLOCKCORE's masked-span site at the call (`unafs.rs:793`).
+#[track_caller]
+#[inline(always)]
+fn attempt_span<R>(arm: bool, f: impl FnOnce() -> R) -> R {
+    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "baremetal")))]
+    {
+        if arm {
+            return crate::arch::sched::preemptoff::scoped(f);
+        }
+    }
+    let _ = arm;
+    crate::arch::without_interrupts(f)
+}
+
+/// UNAFSREADUNMASKED: does this attempt take the read arm? Asked for (`read`) and the bound medium takes it; false off `wc`.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "baremetal")))]
+#[inline(always)]
+fn attempt_arm(read: bool) -> bool {
+    read && readarm::irq_on()
+}
+
+/// UNAFSREADUNMASKED: off `wc` there is no read arm.
+#[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "baremetal"))))]
+#[inline(always)]
+fn attempt_arm(_read: bool) -> bool {
+    false
+}
+
+/// UNAFSREADUNMASKED: the attempt's span ended — a masked one feeds HIDSTALL's meters at `with_unafs`'s caller (unchanged); a read
+/// arm one is not masked and only says the once-a-boot hold line.
+#[track_caller]
+#[inline(always)]
+fn note_attempt(arm: bool, t0_us: u64) {
+    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "baremetal")))]
+    {
+        if arm {
+            readarm::note_hold(t0_us);
+            return;
+        }
+    }
+    let _ = arm; kat_masked_note();
+    crate::hidstall::note_masked_since(t0_us)
+}
+
+/// UNAFSREADUNMASKED: run a READ-ONLY `f` against the one coherent mount — [`with_unafs`]'s loop (restart, RENDERWEDGE bound,
+/// ticket, poison, lockowner unchanged) with the attempt preempt-off and interrupts ON when the bound medium takes the read arm.
+/// PREEMPTAUDITUNAFSLEG (rmbp-ledger B1048): on EVERY build — off x86 `wc` `attempt_arm` is false, so this is `with_unafs` exactly.
+#[track_caller]
+pub fn with_unafs_read<R>(f: impl FnMut(&mut KernelUnaFS) -> R) -> Result<R, MountError> {
+    with_unafs_arm(f, true)
+}
+
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "baremetal")))]
+pub mod readarm {
+    use super::*;
+    use core::sync::atomic::AtomicBool;
+
+    /// The bound mount's medium takes the read arm. Written only inside a MOUNT hold (every install's `note_bound`); false until
+    /// the first bind (the mask). Stale after a discard until the next bind.
+    static IRQ_ON: AtomicBool = AtomicBool::new(false);
+    /// The `[unafs] hold` line is said (once a boot).
+    static SAID: AtomicBool = AtomicBool::new(false);
+    /// A read attempt longer than this says the hold line.
+    pub const HOLD_LINE_MS: u64 = 10;
+
+    /// `splitread::note_bound`'s fold: a mount was installed on `handle`.
+    pub fn note_bound(handle: block::BlockHandle) {
+        IRQ_ON.store(medium_irq_on(handle), Ordering::Relaxed);
+    }
+
+    /// The read arm may run with interrupts on (the bound medium is not xHCI-backed).
+    pub fn irq_on() -> bool {
+        IRQ_ON.load(Ordering::Relaxed)
+    }
+
+    /// EXHAUSTIVE on purpose (no wildcard, `bind_probe_admitted`'s discipline): a new handle is an E0004 here, so its read-arm
+    /// verdict is decided in the commit that adds it. Global / Usb are xHCI BOT on x86 (`claim_xhci_for_io`): the mask.
+    fn medium_irq_on(handle: block::BlockHandle) -> bool {
+        match handle {
+            #[cfg(target_arch = "x86_64")] block::BlockHandle::Global => false, #[cfg(target_arch = "aarch64")] block::BlockHandle::Global => crate::drivers::emmc2::card_num_blocks().is_some(),
+            block::BlockHandle::Usb => false, #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))] block::BlockHandle::SdMmc => false,
+            #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+            block::BlockHandle::Sdhc => true,
+            #[cfg(all(target_arch = "x86_64", feature = "ahci"))]
+            block::BlockHandle::Ahci { .. } => true,
+            #[cfg(all(target_arch = "x86_64", feature = "nvme"))]
+            block::BlockHandle::Nvme => true,
+        }
+    }
+
+    /// A read-arm attempt that began at `t0_us` ended; the first one over [`HOLD_LINE_MS`] says the line, at `with_unafs_read`'s caller.
+    #[track_caller]
+    pub fn note_hold(t0_us: u64) {
+        let ms = crate::hidstall::now_us().saturating_sub(t0_us) / 1000;
+        if ms > HOLD_LINE_MS && !SAID.swap(true, Ordering::Relaxed) {
+            let site = core::panic::Location::caller();
+            let file = site.file().rsplit('/').next().unwrap_or(site.file());
+            serial_println!("[unafs] hold why=read masked=0 ms={} site={}:{} (UNAFSREADUNMASKED B1035)", ms, file, site.line());
+        }
+    }
+}
+
+// ── PREEMPTAUDITUNAFSLEG (rmbp-ledger B1048, BP-storage-8 / BP-cores-23) — `tests preemptaudit`'s UnaFS LEG. `converted_unafs=`
+// was a constant; this is its witness, Z61's sdhc leg's checks (sched.rs `sdhc_audit_leg`) inside THE read arm: a
+// `with_unafs_read` hold whose body is a stat of the root inode (harmless, read-only). Inside the hold, on a medium that takes the
+// read arm (`readarm::irq_on`), interrupts must be on, this CPU's preempt-off count held by this task (`preemptoff::witness`), a
+// tick must arrive on this CPU within 20 ms, and nothing may switch this task out (the CPU, the ACCT switch count through
+// `core_load`, the current tid). An xHCI-backed mount keeps the mask by design: `skip(medium)`; no UnaFS volume: `skip(no-volume)`.
+// Words: ok | skip(no-wc|medium|no-volume) | masked | not-held | stat | no-tick | switched | mount. At the tail: no line above moves.
+
+/// PREEMPTAUDITUNAFSLEG: the `unafs_leg=` word of `tests preemptaudit` (sched.rs `audit_selftest`, the leg line).
+#[cfg(all(target_arch = "x86_64", any(feature = "ahci", feature = "nvme"), not(feature = "wc")))]
+pub fn unafs_leg() -> &'static str {
+    "skip(no-wc)"
+}
+
+/// PREEMPTAUDITUNAFSLEG: on `wc`, the hold itself.
+#[cfg(all(target_arch = "x86_64", any(feature = "ahci", feature = "nvme"), feature = "wc"))]
+pub fn unafs_leg() -> &'static str {
+    {
+        let r = with_unafs_read(|fs| -> &'static str {
+            if !readarm::irq_on() {
+                return "skip(medium)";
+            }
+            if crate::arch::irqs_masked() {
+                return "masked";
+            }
+            let (held, tid) = crate::arch::sched::preemptoff::witness();
+            let cpu = crate::arch::percpu::this_cpu().cpu_index as usize;
+            let tid0 = crate::arch::sched::current_task_id(cpu);
+            let sw0 = crate::arch::sched::core_load(cpu).ctx_switches;
+            if !held || tid0 != Some(tid) {
+                return "not-held";
+            }
+            let root = fs.superblock.root_inode;
+            if fs.stat(root).is_err() {
+                return "stat";
+            }
+            let t0 = crate::arch::percpu::this_cpu().ticks.load(Ordering::Relaxed);
+            let m0 = crate::arch::ms();
+            while crate::arch::percpu::this_cpu().ticks.load(Ordering::Relaxed).wrapping_sub(t0) < 2
+                && crate::arch::ms().wrapping_sub(m0) < 20
+            {
+                core::hint::spin_loop();
+            }
+            let ticks = crate::arch::percpu::this_cpu().ticks.load(Ordering::Relaxed).wrapping_sub(t0);
+            let cpu1 = crate::arch::percpu::this_cpu().cpu_index as usize;
+            let switched = (cpu1 != cpu) as u64
+                + crate::arch::sched::core_load(cpu).ctx_switches.wrapping_sub(sw0)
+                + (crate::arch::sched::current_task_id(cpu) != tid0) as u64;
+            if ticks == 0 {
+                "no-tick"
+            } else if switched != 0 {
+                "switched"
+            } else {
+                "ok"
+            }
+        });
+        match r {
+            Ok(w) => w,
+            Err(MountError::NoVolume | MountError::NoStorage | MountError::BadSectorSize(_)) => "skip(no-volume)",
+            Err(_) => "mount",
+        }
+    }
+}
+
+// ── PREEMPTOFFARMUNAFS (zenbook-ledger Z79, BP-storage-8 / BP-cores-23) — the aarch64 read arm. B1035's `attempt_span` /
+// `attempt_arm` / `note_attempt` / `readarm` are widened to `all(aarch64, baremetal)` (the Pi): a `with_unafs_read` attempt on
+// the emmc2 card (`Global` with `emmc2::card_num_blocks()` Some, `open_on`'s own predicate) holds MOUNT preempt-off with
+// PSTATE.I ON — every emmc2 wait is a CNTPCT-bounded spin (never wfi / yield) and `emmc2::claim_for_io` already treats a
+// preempt-off holder as masked (Z67); no aarch64 ISR takes MOUNT. An xHCI-backed mount (Usb, or Global with no card) keeps the
+// mask; the Orin's `SdMmc` keeps it (its read holds `SD_BLK`, a plain spin Mutex: PREEMPTOFF-ARM-UNAFS-TEGRASD owed). On a
+// non-baremetal aarch64 build (QEMU virt) nothing here is armed. `tests preemptaudit` (aarch64 `audit_selftest`) reads the leg
+// as `unafs_leg=` and counts the conversion in `converted=`. At the tail: no line above moves.
+
+/// PREEMPTOFFARMUNAFS: the read arm counted in the aarch64 audit's `converted=` (1 where it is armed: baremetal).
+#[cfg(target_arch = "aarch64")]
+pub const CONVERTED_UNAFS_ARM: u32 = cfg!(feature = "baremetal") as u32;
+
+/// PREEMPTOFFARMUNAFS: the aarch64 `unafs_leg=` word off the Pi — the only medium is xHCI, which keeps the mask.
+#[cfg(all(target_arch = "aarch64", not(feature = "baremetal")))]
+pub fn unafs_leg() -> &'static str {
+    "skip(medium)"
+}
+
+/// PREEMPTOFFARMUNAFS: the aarch64 `unafs_leg=` word on the Pi — inside a `with_unafs_read` hold of a root stat, on a medium that
+/// takes the read arm: PSTATE.I on and this core's preempt-off count held by this task (Z67's checks; a live tick and the
+/// no-switch check are PREEMPTOFF-ARM-SELFTEST's, owed). Words: ok | skip(medium|no-volume) | masked | not-held | stat | mount.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+pub fn unafs_leg() -> &'static str {
+    let r = with_unafs_read(|fs| -> &'static str {
+        if !readarm::irq_on() {
+            return "skip(medium)";
+        }
+        if crate::arch::irqs_masked() {
+            return "masked";
+        }
+        let (held, tid) = crate::arch::sched::preemptoff::witness();
+        if !held || crate::arch::sched::current_id() != Some(tid) {
+            return "not-held";
+        }
+        let root = fs.superblock.root_inode;
+        if fs.stat(root).is_err() {
+            return "stat";
+        }
+        "ok"
+    });
+    match r {
+        Ok(w) => w,
+        Err(MountError::NoVolume | MountError::NoStorage | MountError::BadSectorSize(_)) => "skip(no-volume)",
+        Err(_) => "mount",
+    }
+}
+
+// ── UNAFSBINDTRIGGER (rmbp-ledger B1058): a named bind with no MOUNT attempt hold. UNAFSREADCENSUS (B1052) measured the
+// empty-closure idiom `with_unafs(|_| ())` as a bind TRIGGER: a task's pre-bind already binds off the hold, then one EMPTY
+// masked attempt still ran (a HIDSTALL span, a MASKCENSUS site at the caller). `bind_now` is [`with_unafs_arm`]'s sibling:
+// its restart shape around [`prebind`] (the ONE bind path: `prebind_now` -> `bind_sized`), minus the attempt. At the tail:
+// no line above moves. ──
+
+/// Bind the UnaFS mount now if none is bound, with no MOUNT attempt hold: a task caller binds through [`prebind`] (the commit
+/// ticket on x86 `wc`, the [`BIND`] latch elsewhere; one short masked install take) and looks again on contention, bounded
+/// like [`with_unafs`] (`TXN_BUSY_ATTEMPTS`, `hw_wait_budget`). A caller with no task identity has no binder identity for an
+/// off-hold bind: it binds in the hold exactly as before (`bind_in_hold`; BIND-NOW-NOTASK owed). `Err` = the bind's own
+/// verdict, or `Busy` when contention outlasted the bound.
+#[track_caller]
+pub fn bind_now() -> Result<(), MountError> {
+    if crate::arch::sched::current_id().is_none() {
+        return with_unafs(|_| ());
+    }
+    let start = crate::arch::now_cycles();
+    let budget = crate::arch::hw_wait_budget();
+    for _ in 0..TXN_BUSY_ATTEMPTS {
+        #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+        if !splitwrite::ticket_wait() {
+            break;
+        }
+        prebind()?;
+        if mount_state() == Some(true) {
+            return Ok(());
+        }
+        if crate::arch::now_cycles().wrapping_sub(start) >= budget {
+            break;
+        }
+        if crate::arch::irqs_masked() {
+            core::hint::spin_loop();
+        } else {
+            crate::hlt();
+        }
+    }
+    Err(MountError::Busy)
+}
+
+/// `bind_now`'s look: `Some(bound)` with MOUNT free (masked `try_lock`, never spins; poison-checked as [`mount_unbound`]),
+/// `None` while MOUNT is held (its holder may be binding).
+fn mount_state() -> Option<bool> {
+    crate::arch::without_interrupts(|| match MOUNT.try_lock() {
+        #[allow(unused_mut)]
+        Some(mut g) => {
+            #[cfg(target_arch = "x86_64")]
+            mount_poison_check(&mut *g);
+            Some(g.is_some())
+        }
+        None => None,
+    })
+}
+
+/// The KAT's task (0 = unarmed) and its masked MOUNT attempts while armed.
+static KAT_TID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static KAT_MASKED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// `note_attempt`'s masked path (its :5394 fold): count the attempt when it is the armed KAT task's own.
+#[inline(always)]
+fn kat_masked_note() {
+    let t = KAT_TID.load(Ordering::Relaxed);
+    if t != 0 && crate::arch::sched::current_id() == Some(t) {
+        KAT_MASKED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// `tests unafs` (UNAFSX86-T, folded on its `force_remount` line): on the just-dropped mount, one `bind_now` must bind it
+/// with NO masked MOUNT attempt by this task. Words: ok | FAIL | skip(no-task) | skip(bound). Returns false only on FAIL (BINDNOWGATE B1061).
+#[cfg(feature = "unafs")]
+fn bind_now_kat() -> bool {
+    let Some(me) = crate::arch::sched::current_id() else {
+        serial_println!("[unafs] bind_now kat=skip(no-task) (UNAFSBINDTRIGGER B1058)");
+        return true;
+    };
+    if mount_bound_handle().is_some() {
+        serial_println!("[unafs] bind_now kat=skip(bound) (UNAFSBINDTRIGGER B1058)");
+        return true;
+    }
+    KAT_MASKED.store(0, Ordering::Release);
+    KAT_TID.store(me, Ordering::Release);
+    let r = bind_now();
+    KAT_TID.store(0, Ordering::Release);
+    let masked = KAT_MASKED.load(Ordering::Acquire);
+    let bound = mount_bound_handle().is_some();
+    let rw = match r {
+        Ok(()) => "ok",
+        Err(MountError::Busy) => "busy",
+        Err(_) => "err",
+    };
+    let ok = r.is_ok() && bound && masked == 0; let word = if ok { "ok" } else { "FAIL" };
+    serial_println!(
+        "[unafs] bind_now kat={} r={} bound={} masked={} (UNAFSBINDTRIGGER B1058: a bind_now on an unbound mount takes no masked MOUNT attempt)",
+        word, rw, bound as u8, masked
+    ); ok
 }

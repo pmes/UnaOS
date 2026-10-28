@@ -94,7 +94,7 @@ fn the_pane_shows_depth_left_colour_right_and_reads_the_pointer() {
     let mut pane = PaneService::new(256, 96);
     let mut blits = 0;
     for m in s.tick() {
-        if let Some(SMessage::SurfaceBlit { url, width, height, pixels }) = pane.handle(&m) {
+        if let Some(SMessage::SurfaceBlit { url, width, height, pixels, .. }) = pane.handle(&m) {
             assert_eq!((url.as_str(), width, height, pixels.len()), (PANE_URL, 256, 96, 256 * 96 * 4));
             blits += 1;
         }

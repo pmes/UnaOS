@@ -213,6 +213,19 @@ pub fn parse_reason(frame: &[u8]) -> Option<(u8, u16)> {
     Some((sub, u16::from_le_bytes([frame[24], frame[25]])))
 }
 
+/// WIFILEAVEBUILD (zenbook-ledger Z75): Reason Code 3 (§9.4.1.7) — deauthenticated because the sending station is leaving.
+pub const REASON_LEAVING: u16 = 3;
+
+/// WIFILEAVEBUILD (Z75): the station's own Deauthentication (§9.3.3.12) — the 24-octet management header from
+/// `push_mgmt_header` (DA = addr3 = the BSSID, SA = the station, sequence 0) and the Reason Code little-endian: 26 octets,
+/// unprotected. `parse_reason` is its reader; the MT7925 leave (`tests wifileave`) sends it.
+pub fn build_deauth(sta: Mac, bssid: Mac, reason: u16) -> Vec<u8> {
+    let mut f = Vec::with_capacity(26);
+    push_mgmt_header(&mut f, SUBTYPE_DEAUTH, bssid, sta, bssid, 0);
+    f.extend_from_slice(&reason.to_le_bytes()); // Reason Code
+    f
+}
+
 /// LLC/SNAP header for an Ethernet-typed payload (RFC 1042): AA-AA-03-00-00-00 then the EtherType.
 pub const SNAP_PREFIX: [u8; 6] = [0xAA, 0xAA, 0x03, 0x00, 0x00, 0x00];
 
@@ -342,6 +355,27 @@ mod tests {
         assert_eq!(parse_auth(&resp), Some(AuthResult { alg: 0, seq: 2, status: 13 }));
     }
 
+    // WIFILEAVEBUILD (Z75): the deauthentication KAT — the expected octets assembled field by field from §9.3.3.12's layout.
+    #[test]
+    fn deauth_kat() {
+        let sta = [0x02, 0x11, 0x22, 0x33, 0x44, 0x55];
+        let bssid = [0x00, 0xaa, 0xbb, 0xcc, 0xdd, 0xee];
+        let mut want = vec![0xc0, 0x00]; // Frame Control: management (type 0), deauthentication (subtype 12), no flags
+        want.extend_from_slice(&[0x00, 0x00]); // Duration
+        want.extend_from_slice(&bssid); // addr1 = DA = the AP
+        want.extend_from_slice(&sta); // addr2 = SA = the station
+        want.extend_from_slice(&bssid); // addr3 = the BSSID
+        want.extend_from_slice(&[0x00, 0x00]); // Sequence Control: fragment 0, sequence 0
+        want.extend_from_slice(&[0x03, 0x00]); // Reason Code 3, little-endian
+        let f = build_deauth(sta, bssid, REASON_LEAVING);
+        assert_eq!(f.len(), 26);
+        assert_eq!(f, want);
+        assert_eq!(parse_reason(&f), Some((SUBTYPE_DEAUTH, REASON_LEAVING)));
+        let g = build_deauth(sta, bssid, 0x0102);
+        assert_eq!(&g[24..26], &[0x02, 0x01]);
+        assert_eq!(&g[..24], &want[..24]);
+    }
+
     #[test]
     fn data_frame_roundtrip() {
         let sta = [2, 0, 0, 0, 0, 1];
@@ -435,4 +469,228 @@ pub fn build_null_data(sta: Mac, bssid: Mac, seq: u16) -> Vec<u8> {
     f.extend_from_slice(&bssid);
     f.extend_from_slice(&(seq << 4).to_le_bytes());
     f
+}
+
+/// STATIONROAM-BGSCAN (rmbp-ledger B955): the frame control's Power Management bit (IEEE 802.11-2020 §9.2.4.1.7), octet 1.
+pub const FC_FLAG_PM: u8 = 0x10;
+
+/// STATIONROAM-BGSCAN (B955): `build_null_data` with the Power Management bit set (`pm`: the station enters power save, so the AP
+/// buffers its frames while it dwells off-channel) or clear (it leaves power save; byte-identical to `build_null_data`).
+pub fn build_null_data_pm(sta: Mac, bssid: Mac, seq: u16, pm: bool) -> Vec<u8> {
+    let mut f = build_null_data(sta, bssid, seq);
+    if pm {
+        f[1] |= FC_FLAG_PM;
+    }
+    f
+}
+
+/// STATIONROAM-SWEEP (rmbp-ledger B958): the Country element (IEEE 802.11-2020 §9.4.2.8, the 802.11d regulatory domain).
+pub const EID_COUNTRY: u8 = 7;
+
+/// STATIONROAM-SWEEP (B958): a beacon's Country element — the country string (2 letters + the environment octet) and the 2.4 GHz
+/// channels 1..14 its subband triplets cover (bit c = channel c). STATIONROAM-5G (B962): `five`, bit i = `NONDFS_5G[i]` covered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Country {
+    pub cc: [u8; 3],
+    pub chans: u16,
+    pub five: u16,
+}
+
+/// STATIONROAM-SWEEP (B958): the Country element of a beacon / probe response. TOTAL: `None` unless the frame is one, its IE list fits
+/// (a declared IE running past the frame is malformed) and it carries a Country element of at least the 3-octet string whose rest is
+/// whole (first channel, number of channels, max power) triplets plus at most one pad octet. A triplet whose first octet is 201 or more
+/// (an operating extension, §9.4.2.8) is skipped; channels past 14 set no bit.
+pub fn country_ie(frame: &[u8]) -> Option<Country> {
+    if frame.len() < 24 + 12 {
+        return None;
+    }
+    let (ty, sub) = subtype_of(frame[0]);
+    if ty != FC_TYPE_MGMT || (sub != SUBTYPE_BEACON && sub != SUBTYPE_PROBE_RESP) {
+        return None;
+    }
+    let mut found = None;
+    let mut i = 24 + 12;
+    while i < frame.len() {
+        if i + 2 > frame.len() {
+            return None;
+        }
+        let eid = frame[i];
+        let len = frame[i + 1] as usize;
+        if i + 2 + len > frame.len() {
+            return None;
+        }
+        if eid == EID_COUNTRY && found.is_none() {
+            let body = &frame[i + 2..i + 2 + len];
+            if len < 3 || (len - 3) % 3 == 2 {
+                return None;
+            }
+            let mut c = Country { cc: [body[0], body[1], body[2]], chans: 0, five: 0 };
+            let mut k = 3;
+            while k + 3 <= len {
+                let (first, n) = (body[k] as u16, body[k + 1] as u16);
+                if first < 201 {
+                    for ch in first..first + n {
+                        if (1..=14).contains(&ch) {
+                            c.chans |= 1 << ch;
+                        }
+                    }
+                    if first > 14 { for i in 0..n { if let Some(k5) = NONDFS_5G.iter().position(|x| *x as u16 == first + 4 * i) { c.five |= 1 << k5; } } } // STATIONROAM-5G (B962): a 5 GHz triplet counts channels 4 apart (§9.4.2.8)
+                }
+                k += 3;
+            }
+            found = Some(c);
+        }
+        i += 2 + len;
+    }
+    found
+}
+
+// ── STATIONROAM-5G (rmbp-ledger B962): the channel -> band map, the DFS rule, the SPROM power block choice — PURE ──────────────
+
+/// STATIONROAM-5G (B962): the 5 GHz channels the station may transmit on without radar detection (UNII-1 and UNII-3), in plan order.
+pub const NONDFS_5G: [u8; 9] = [36, 40, 44, 48, 149, 153, 157, 161, 165];
+
+/// STATIONROAM-5G (B962): the 5 GHz channels b43's 2059 table carries a row for (`radio_2059.c:58-316`): 36..64, 100..140, 149..165.
+fn row_5g(ch: u8) -> bool {
+    ch % 4 == 0 && ((36..=64).contains(&ch) || (100..=140).contains(&ch)) || (149..=165).contains(&ch) && (ch - 149) % 4 == 0
+}
+
+/// STATIONROAM-5G (B962): a channel's centre frequency (MHz): 1..=13 -> 2407 + 5·ch, 14 -> 2484, a 5 GHz channel on b43's 2059 rows
+/// -> 5000 + 5·ch (IEEE 802.11-2020 §E.1); anything else `None`.
+pub fn chan_freq(ch: u8) -> Option<u16> {
+    match ch {
+        1..=13 => Some(2407 + 5 * ch as u16),
+        14 => Some(2484),
+        _ if row_5g(ch) => Some(5000 + 5 * ch as u16),
+        _ => None,
+    }
+}
+
+/// STATIONROAM-5G (B962): `ch` is a 5 GHz channel number (36 and up).
+pub fn is_5g(ch: u8) -> bool {
+    ch >= 36
+}
+
+/// STATIONROAM-5G (B962): `ch` is a DFS channel (52..=144, UNII-2 and UNII-2e): no radar detection is built, so nothing transmits there.
+pub fn dfs(ch: u8) -> bool {
+    (52..=144).contains(&ch)
+}
+
+/// STATIONROAM-5G (B962): the SPROM per-core power block b43 drives TX power control from for `freq` (`phy_ht.c:633-664`): below
+/// 2500 `2g`; 4900..5100 `5gl`; 5100..5500 `5g`; 5500 and up `5gh`; else `None` (b43's fixed defaults, no channel row reaches them).
+pub fn pwr_block(freq: u16) -> Option<&'static str> {
+    match freq {
+        0..=2499 => Some("2g"),
+        4900..=5099 => Some("5gl"),
+        5100..=5499 => Some("5g"),
+        5500..=u16::MAX => Some("5gh"),
+        _ => None,
+    }
+}
+
+// ── MT7925S10 (zenbook-ledger Z55): the RSN element (IEEE Std 802.11-2020 §9.4.2.24) — the station's WPA2-PSK join ─────────
+// BP-net-15: frames come only from this codec, so the RSN element the association request carries and the judge of the AP's
+// element live here, shared by both radios (the Broadcom's WPA2JOIN is owed). Only WPA2-PSK with CCMP is offered.
+
+/// The RSN element a WPA2-PSK station offers (22 octets): element 48, length 20, version 1, group cipher 00-0F-AC:4 (CCMP),
+/// one pairwise cipher CCMP, one AKM 00-0F-AC:2 (PSK), RSN Capabilities 0 (no MFP). Appended after Extended Supported Rates in
+/// the association request (§9.3.3.6: the RSNE follows the rate elements) and carried as M2's key data.
+pub const RSN_PSK_CCMP: [u8; 22] = [
+    EID_RSN, 20, 1, 0, 0x00, 0x0f, 0xac, 4, 1, 0, 0x00, 0x0f, 0xac, 4, 1, 0, 0x00, 0x0f, 0xac, 2, 0, 0,
+];
+
+/// The suite selector of CCMP-128 and of the PSK AKM (§9.4.2.24.2, Table 9-149; §9.4.2.24.3, Table 9-151).
+const SUITE_CCMP: [u8; 4] = [0x00, 0x0f, 0xac, 4];
+const SUITE_PSK: [u8; 4] = [0x00, 0x0f, 0xac, 2];
+/// RSN Capabilities bit 6 = MFPR (management frame protection required, §9.4.2.24.4).
+const RSN_CAP_MFPR: u16 = 1 << 6;
+
+/// The whole RSN element (id, length and body) of a beacon / probe response, `None` when it carries none or is not one. TOTAL:
+/// an element that runs past the frame ends the walk with `None`.
+pub fn rsn_ie(frame: &[u8]) -> Option<&[u8]> {
+    if frame.len() < 24 + 12 {
+        return None;
+    }
+    let (ty, sub) = subtype_of(frame[0]);
+    if ty != FC_TYPE_MGMT || (sub != SUBTYPE_BEACON && sub != SUBTYPE_PROBE_RESP) {
+        return None;
+    }
+    let mut i = 24 + 12;
+    while i + 2 <= frame.len() {
+        let len = frame[i + 1] as usize;
+        if i + 2 + len > frame.len() {
+            return None;
+        }
+        if frame[i] == EID_RSN {
+            return Some(&frame[i..i + 2 + len]);
+        }
+        i += 2 + len;
+    }
+    None
+}
+
+/// True when the RSN element `elem` (id + length + body) lets a WPA2-PSK CCMP station join: version 1, group cipher CCMP, CCMP
+/// among the pairwise ciphers, PSK among the AKMs, and MFPR clear (absent capabilities read 0). Anything shorter or malformed is
+/// false (a TKIP-only, SAE-only or MFP-required network is refused by its caller by name).
+pub fn rsn_psk_ccmp(elem: &[u8]) -> bool {
+    if elem.len() < 2 || elem[0] != EID_RSN || elem[1] as usize + 2 != elem.len() {
+        return false;
+    }
+    let b = &elem[2..];
+    if b.len() < 8 || u16::from_le_bytes([b[0], b[1]]) != 1 || b[2..6] != SUITE_CCMP {
+        return false;
+    }
+    let np = u16::from_le_bytes([b[6], b[7]]) as usize;
+    let p_end = 8 + 4 * np;
+    if b.len() < p_end + 2 {
+        return false;
+    }
+    let pair_ok = b[8..p_end].chunks(4).any(|s| s == SUITE_CCMP);
+    let na = u16::from_le_bytes([b[p_end], b[p_end + 1]]) as usize;
+    let a_end = p_end + 2 + 4 * na;
+    if b.len() < a_end {
+        return false;
+    }
+    let akm_ok = b[p_end + 2..a_end].chunks(4).any(|s| s == SUITE_PSK);
+    let caps = if b.len() >= a_end + 2 { u16::from_le_bytes([b[a_end], b[a_end + 1]]) } else { 0 };
+    pair_ok && akm_ok && caps & RSN_CAP_MFPR == 0
+}
+
+#[cfg(test)]
+mod rsn_tests {
+    use super::*;
+
+    fn beacon_with(ie: &[u8]) -> Vec<u8> {
+        let mut f = alloc::vec![0u8; 24 + 12];
+        f[0] = SUBTYPE_BEACON << 4;
+        f.extend_from_slice(&[EID_SSID, 3, b'U', b'n', b'a']);
+        f.extend_from_slice(ie);
+        f
+    }
+
+    #[test]
+    fn offer_is_accepted_and_found() {
+        assert!(rsn_psk_ccmp(&RSN_PSK_CCMP));
+        let f = beacon_with(&RSN_PSK_CCMP);
+        assert_eq!(rsn_ie(&f), Some(&RSN_PSK_CCMP[..]));
+        assert_eq!(rsn_ie(&beacon_with(&[])), None);
+    }
+
+    #[test]
+    fn judge_refuses_what_is_not_wpa2_psk_ccmp() {
+        // WPA2/WPA3 transition: AKMs PSK + SAE (00-0F-AC:8), MFPC set (bit 7), MFPR clear: accepted.
+        let mixed = [EID_RSN, 24, 1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 4, 2, 0, 0, 0x0f, 0xac, 2, 0, 0x0f, 0xac, 8, 0x80, 0];
+        assert!(rsn_psk_ccmp(&mixed));
+        let mut mfpr = mixed;
+        mfpr[24] = 0xc0; // MFPR set
+        assert!(!rsn_psk_ccmp(&mfpr));
+        let mut tkip = RSN_PSK_CCMP;
+        tkip[13] = 2; // pairwise TKIP only
+        assert!(!rsn_psk_ccmp(&tkip));
+        let mut sae = RSN_PSK_CCMP;
+        sae[19] = 8; // SAE only
+        assert!(!rsn_psk_ccmp(&sae));
+        assert!(!rsn_psk_ccmp(&RSN_PSK_CCMP[..10]));
+        assert!(!rsn_psk_ccmp(&[]));
+    }
 }

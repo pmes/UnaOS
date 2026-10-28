@@ -206,7 +206,7 @@ struct IntEp {
     /// and two LEDs, and each USB keyboard latches its own. 0 at arm time = all locks off, which is
     /// the state a freshly-configured HID device is in (SET_CONFIGURATION resets its LEDs), so the
     /// software state and the hardware agree from the first report without an explicit sync.
-    kbd_leds: u8,
+    kbd_leds: u8, kbd_led_dirty: bool, // HIDBOOT-LEDS-EHCI (rmbp-ledger B991): this keyboard's LED SLOT is `kbd_leds` + this flag — marked by the walk when `decode_boot_keyboard`'s `Transport::set_leds` Ehci arm owes it, drained after the walk by ONE `set_hid_leds` carrying the latest byte. LINE-NEUTRAL fold, code first
     /// ALLKEYS P1 (EHCITARGET: EVERY interrupt endpoint carries these — hub, pointer, keyboard): the EP0 addressing tuple and interface number for THIS endpoint's device —
     /// everything `set_hid_leds` needs to send SET_REPORT back to it. Captured at arm time because
     /// the service loop, where a lock-key press is detected, has no other route to them: it walks
@@ -708,8 +708,8 @@ fn m8_threshold_cy() -> u64 {
     }
 }
 
-/// One woken, schedule-bearing EHCI function. All DMA structures live in the static
-/// `qh::DMA_POOLS` (kernel image, low physical); every `*_phys` field is the page-table-
+/// One woken, schedule-bearing EHCI function. All DMA structures live in its pool from
+/// `qh::dma_pool` (the one DMA allocator, B989); every `*_phys` field is the page-table-
 /// resolved physical address the controller is actually programmed with (probe-5 discipline —
 /// never the heap virt==phys shortcut).
 pub struct Controller {
@@ -2764,7 +2764,7 @@ fn bt_cfg_has_candidate(cfg: &[u8]) -> bool {
 /// Deliberately NOT pushed into `Controller::int_eps`: that list is drained by `service()`,
 /// which would run HCI event packets through the HID report decoders. This endpoint is read
 /// inline by the L0 sequence and then deactivated. It owns the pool's dedicated `bt_slot` —
-/// NOT one of the `MAX_INT_EPS` (6) HID slots — since MTFIX: on Boot AN it consumed the
+/// NOT one of the `MAX_INT_EPS` (8) HID slots — since MTFIX: on Boot AN it consumed the
 /// fourth of four HID slots and the internal trackpad, enumerated last, fell off the end.
 #[cfg(feature = "bt")]
 struct BtEvtEp {
@@ -5042,7 +5042,7 @@ impl Controller {
     ///
     /// Returns whether the device accepted it, so the caller can latch a refusing keyboard off
     /// (`IntEp::kbd_led_ok`) rather than paying an EP0 timeout on every subsequent lock press.
-    unsafe fn set_hid_leds(&mut self, t: &Target, intf: u8, leds: u8) -> bool {
+    unsafe fn set_hid_leds(&mut self, t: &Target, intf: u8, leds: u8) -> Result<(), &'static str> { // HIDBOOT-LEDS-EHCI (B991): the control fn's own Err, so the drain names why=timeout|ctrl-fail
         self.data_buf.write(leds);
         let caps = (leds >> 1) & 1;
         match self.control(t, 0x21, 0x09, 0x0200, intf as u16, 1, false) {
@@ -5051,7 +5051,7 @@ impl Controller {
                     ":: EHCI-HID: [{}] ALLKEYS caps={} leds={:#04x} SET_REPORT ok addr={} intf={} == witness ::",
                     self.idx, caps, leds, t.addr, intf
                 );
-                true
+                Ok(())
             }
             // F6: a plain NAK/STALL/timeout is a device declining the LED — latch off, keep typing.
             // But `Err("hse")` is NOT that: `control` -> `chain_txn` returns it on a Host System
@@ -5067,14 +5067,14 @@ impl Controller {
                     ":: EHCI-HID: [{}] ALLKEYS caps={} leds={:#04x} SET_REPORT HSE addr={} intf={} — controller wedged (needs HCRESET), NOT a device LED decline ::",
                     self.idx, caps, leds, t.addr, intf
                 );
-                false
+                Err("hse")
             }
             Err(e) => {
                 crate::bootlog_println!(
                     ":: EHCI-HID: [{}] ALLKEYS caps={} leds={:#04x} SET_REPORT nak addr={} intf={} ({}) — LED latched off, case still tracked ::",
                     self.idx, caps, leds, t.addr, intf, e
                 );
-                false
+                Err(e)
             }
         }
     }
@@ -13407,13 +13407,13 @@ impl Controller {
         // just been skipped. A witness that fires when the thing it witnesses did not happen is
         // worse than no witness: it is what made "the trackpad is armed and silent" the working
         // theory for a whole sitting. The verdict now comes from the arming path itself.
-    ) -> bool { #[cfg(all(feature = "lidsleep", feature = "wc"))] { self.int_next = intpool::slot_take(self.int_used).unwrap_or(MAX_INT_EPS); } // EHCIPOOLRECYCLE (B807): under HUBREC `int_next` is the slot THIS arm takes — the lowest free one (`intpool::slot_take`), MAX_INT_EPS when all are held; the bound, the index, `+= 1` and the `isr_slot` derivation below read it unchanged. LINE-NEUTRAL fold, code first
+    ) -> bool { #[cfg(all(feature = "lidsleep", feature = "wc"))] { self.int_next = intpool::slot_take(self.int_used).unwrap_or(MAX_INT_EPS); } let ic = IntClass::of(is_kbd, is_rel, layout.is_some()); // EHCIPOOLRECYCLE (B807): under HUBREC `int_next` is the slot THIS arm takes — the lowest free one (`intpool::slot_take`), MAX_INT_EPS when all are held; the bound, the index, `+= 1` and the `isr_slot` derivation below read it unchanged. LINE-NEUTRAL fold, code first
         if self.int_next >= MAX_INT_EPS {
             serial_println!(
-                ":: EHCI-HID: [{}] STOP-NOTE static int-EP pool exhausted ({}) — addr {} intf {} ep=IN{} NOT armed ::",
-                self.idx, MAX_INT_EPS, t.addr, intf, ep
+                ":: EHCI-HID: [{}] STOP-NOTE static int-EP pool exhausted ({}) — addr {} intf {} ep=IN{} class={} NOT armed ::",
+                self.idx, MAX_INT_EPS, t.addr, intf, ep, ic.word()
             );
-            return false;
+            int_lost(ic, t.addr); return false;
         }
         let slot = &mut (*self.pool()).int_slots[self.int_next];
         let (qh, qtd, buf) = (
@@ -13554,7 +13554,7 @@ impl Controller {
             kbd_prev_mods: 0,
             // ALLKEYS P1: locks off at arm time — the state SET_CONFIGURATION just left the
             // device in, so software and hardware agree without an explicit sync request.
-            kbd_leds: 0,
+            kbd_leds: 0, kbd_led_dirty: false, // HIDBOOT-LEDS-EHCI (B991): no LED owed at arm time. LINE-NEUTRAL fold, code first
             target: *t,
             intf, #[cfg(all(feature = "lidsleep", feature = "wc"))] hub: None, // EHCIHUBDISC (B801): `configure_hub_interrupt_ep` sets it on a hub's status-change endpoint. LINE-NEUTRAL fold, code first
             kbd_led_ok: true,
@@ -13618,9 +13618,9 @@ impl Controller {
         true
     }
 
-    /// The controller's static DMA pool (index-bound checked at construction).
+    /// The controller's DMA pool (Some by construction: the controller exists only after `qh::dma_pool(idx)` answered).
     fn pool(&self) -> *mut qh::DmaPool {
-        unsafe { &mut DMA_POOLS[self.idx] as *mut qh::DmaPool }
+        qh::dma_pool(self.idx).unwrap_or(core::ptr::null_mut()) // DMAALLOCEHCI (B989): was `&mut DMA_POOLS[self.idx]`
     }
 
     /// KBDFLAP — re-arm an interrupt endpoint whose device-side stall has JUST been cleared.
@@ -13685,15 +13685,15 @@ impl Controller {
         let (kw_op, kw_fl) = (self.op, self.frame_list as *const u32);
         // MT-INVESTIGATION (IVY): local mirror of the capture-window counter, so the endpoint
         // iteration below keeps its exclusive borrow of `int_eps` (the EP0 restore runs after).
-        // ALLKEYS P1: lock-LED writes discovered during the endpoint walk, deferred until after it.
-        // A control transfer needs `&mut self`, which the `iter_mut()` borrow below rules out — the
-        // same constraint `mt_dumped` above is working around. Sized `MAX_INT_EPS` so that if two
-        // keyboards toggle a lock in the SAME service pass neither write is dropped; `Target` is
-        // `Copy`, so the array is plain stack scratch and costs nothing when nothing toggles.
-        let mut led_pushes: [Option<(usize, Target, u8, u8)>; MAX_INT_EPS] = [None; MAX_INT_EPS];
-        let mut n_led = 0usize; let mut tp_reassert: Option<(usize, Target, u8)> = None; // POINTERFEEL (B535): a trackpad whose stream contradicted its latched readback, re-asserted after the walk (EP0 needs `&mut self`, as `led_pushes`). LINE-NEUTRAL fold, code first.
+        // HIDBOOT-LEDS-EHCI (rmbp-ledger B991): lock-LED writes discovered during the endpoint walk
+        // no longer ride a stack array here. A control transfer needs `&mut self`, which the
+        // `iter_mut()` borrow below rules out — the same constraint `mt_dumped` above is working
+        // around — so each keyboard's LED SLOT (`IntEp::kbd_leds` + `kbd_led_dirty`) is marked in the
+        // walk and drained after it: one SET_REPORT per dirty slot per pass, toggles coalesced.
+        // (The `led_pushes` array that stood here is deleted: the slot replaced its only use.)
+        let mut tp_reassert: Option<(usize, Target, u8)> = None; // POINTERFEEL (B535): a trackpad whose stream contradicted its latched readback, re-asserted after the walk (EP0 needs `&mut self`, as the LED slot drain). LINE-NEUTRAL fold, code first.
         // KBDFLAP: stalled endpoints discovered during the walk, deferred for the same reason and
-        // in the same shape as `led_pushes` above — `ClearFeature(ENDPOINT_HALT)` is a control
+        // in the same shape as the LED slot drain — `ClearFeature(ENDPOINT_HALT)` is a control
         // transfer and needs `&mut self`. Entries are `(index into int_eps, the device's EP0
         // addressing tuple, the endpoint number)`; the endpoint number is decoded from the QH's own
         // `ep_chars` at the halt, so the wIndex the clear addresses is the one the controller was
@@ -14307,19 +14307,19 @@ impl Controller {
                         // raw pointer with no borrow of `e`, so handing the decoder `&mut e.kbd_prev_keys`
                         // alongside it is not an aliasing violation — the buffer and the diff state are
                         // disjoint memory.
-                        // ALLKEYS P1: the decoder also owns the lock-key state now. It reports back
-                        // whether this report toggled one; the SET_REPORT that lights the key is queued
-                        // for after the loop, where `self` is borrowable again.
-                        if decode_boot_keyboard(
+                        // ALLKEYS P1: the decoder also owns the lock-key state now. HIDBOOT-LEDS-EHCI
+                        // (B991): it returns whether its `Transport::set_leds` Ehci arm owes this
+                        // endpoint's LED slot; the slot is marked here and drained after the loop.
+                        if decode_boot_keyboard(crate::drivers::hidboot::Transport::Ehci,
                             report,
                             &mut e.kbd_prev_keys,
                             &mut e.kbd_prev_mods,
                             &mut e.kbd_leds,
-                        ) && e.kbd_led_ok
-                            && n_led < led_pushes.len()
-                        {
-                            led_pushes[n_led] = Some((ep_i, e.target, e.intf, e.kbd_leds));
-                            n_led += 1;
+                        ) {
+                            // The byte is already in `e.kbd_leds`; a second toggle in this pass only
+                            // rewrites it, so the drain ships the LATEST state once (coalesced).
+                            e.kbd_led_dirty = true;
+                            // `kbd_led_ok` and `dead` are read at the drain, not here.
                         }
                         if e.reports == 1 || e.reports % 32 == 0 {
                             crate::bootlog_println!(
@@ -14380,20 +14380,20 @@ impl Controller {
                 break;
             }
         }
-        // ALLKEYS P1: the endpoint borrow is released here, so EP0 is usable again — light (or
-        // extinguish) the lock LEDs this pass toggled. Best-effort by construction: `set_hid_leds`
-        // swallows a refusal, because a keyboard that will not take an Output report must not cost
-        // the input path anything, and the software state has already been updated either way (the
-        // CASE fold works even on a device with no LED at all).
-        for slot in led_pushes.iter().take(n_led) {
-            if let Some((ep_i, t, intf, leds)) = *slot {
-                if !self.set_hid_leds(&t, intf, leds) {
-                    // Refused: latch this keyboard's LED off so a halted EP0 can never cost a
-                    // `hw_wait_budget()` stall on a later press. The case fold is untouched.
-                    self.int_eps[ep_i].kbd_led_ok = false;
-                }
-            }
-        } if let Some((ep_i, t, intf)) = tp_reassert { self.tp_mode_reassert(ep_i, &t, intf); } // POINTERFEEL (B535): the endpoint borrow is released, EP0 is usable — the trackpad's mode re-assert (FILE-TAIL `impl Controller`). LINE-NEUTRAL fold, code first.
+        // HIDBOOT-LEDS-EHCI (B991): the endpoint borrow is released here, so EP0 is usable again —
+        // drain every keyboard's LED slot this pass marked: ONE SET_REPORT per dirty slot, carrying
+        // the slot's latest byte. Best-effort by construction: a refusal costs a dark key, never a
+        // keystroke (the CASE fold already moved with `kbd_leds`), and latches `kbd_led_ok` off so
+        // a halted EP0 never costs a later press a `hw_wait_budget()` — one refused line per endpoint.
+        crate::drivers::hidboot::drain_led_slots(&mut *self, crate::drivers::hidboot::Transport::Ehci); // HIDBOOTLEDSTEST (B995): the loop that stood here is ONE generic fn now,
+        // `hidboot::drain_led_slots` over `hidboot::LedSlots` (this file's tail implements it for `Controller`: `take` reads
+        // and clears `kbd_led_dirty` with `kbd_led_ok`, `dead`, `kbd_leds`, `target.addr`, `intf`; `send` is `set_hid_leds`;
+        // `latch_off` clears `kbd_led_ok`). The rule is unchanged and lives only there: skip a clean slot, a latched-off LED
+        // or a retired endpoint; ONE SET_REPORT per dirty slot with its latest byte; the `[hidboot] leds` line; a refusal
+        // latches the slot off. Split so `tests hidboot` drives the same drain over a fake slot owner (no live controller).
+        // Lines kept 1:1 with the loop that stood here (panic::Location line numbers below are unchanged).
+        //
+        if let Some((ep_i, t, intf)) = tp_reassert { self.tp_mode_reassert(ep_i, &t, intf); } // POINTERFEEL (B535): the endpoint borrow is released, EP0 is usable — the trackpad's mode re-assert (FILE-TAIL `impl Controller`). LINE-NEUTRAL fold, code first.
         // KBDFLAP: the endpoint borrow is released here, so EP0 is usable — clear the device-side
         // stall on every endpoint the walk classified `stall`, then re-arm it. ORDER IS LOAD-
         // BEARING and is the whole point of doing this here rather than in the walk: the clear
@@ -14557,7 +14557,7 @@ impl Controller {
 //
 // BOUNDS. At most `HALT_CLEARS_MAX` clears per endpoint per boot, one control transfer each,
 // issued only for `class=stall`, and only after the endpoint borrow is released (the same deferred
-// shape ALLKEYS P1's `led_pushes` uses — a control transfer needs `&mut self`). A refused clear
+// shape the LED slot drain (B991) uses — a control transfer needs `&mut self`). A refused clear
 // retires the endpoint exactly as before, held-key flush included. Exhausting the budget retires
 // it too. No loop, no wait, no allocation.
 // ══════════════════════════════════════════════════════════════════════════════════════════════
@@ -14826,7 +14826,7 @@ fn pass_period_selftest() { if crate::tests::defer("passperiod", pass_period_sel
 //   * **No allocation, no `Vec`, no `String`, no formatting.** The registry, the ring and the
 //     counters are `static`. The ISR never prints — every line this block produces is emitted by
 //     the polled pass, which can afford `serial_println!`.
-//   * **Bounded work.** `ISR_MAX_EPS` (12) iterations, each a handful of volatile reads and at most
+//   * **Bounded work.** `ISR_MAX_EPS` (16) iterations, each a handful of volatile reads and at most
 //     an `ISR_SLOT_LEN`-byte copy. No loop here can fail to terminate.
 //   * **Halts are NOT the ISR's business.** A token with `QTD_ERR_MASK` set is left exactly where it
 //     is; the pass retires the endpoint, flushes held key releases and prints the STOP-NOTE, none of
@@ -15301,7 +15301,7 @@ unsafe fn isr_arm_controller(idx: usize, bus: u8, dev: u8, func: u8, op: u64) {
 /// for real — a hand-built completion token, the actual ISR entry point, the actual consumer — so a
 /// regression in the interrupt path fails a QEMU boot instead of waiting for a bench sitting.
 ///
-/// **Why it is safe to run here.** It borrows `DMA_POOLS[0].int_slots[0]` and `ISR_EPS[0]` at a
+/// **Why it is safe to run here.** It borrows `qh::dma_pool(0)`'s `int_slots[0]` and `ISR_EPS[0]` at a
 /// moment when both are provably unowned: no controller has been constructed, no endpoint has been
 /// armed, `USBINTR` is masked on every function and no MSI is routed, so nothing else in the machine
 /// can be looking at either. `arm_interrupt_ep` rewrites both from scratch when the slot is really
@@ -15312,7 +15312,7 @@ unsafe fn isr_arm_controller(idx: usize, bus: u8, dev: u8, func: u8, op: u64) {
 /// the qTD-chain one, so a fixture that tested only the mode it happens to be booting on would be
 /// blind to exactly the half this arc's own risk lives in.
 unsafe fn isr_selftest() {
-    let pool = &mut DMA_POOLS[0] as *mut qh::DmaPool;
+    let Some(pool) = qh::dma_pool(0) else { serial_println!(":: EHCI-HID: ISRARM self-test SKIPPED — the DMA allocator refused the pool (DMAALLOCEHCI B989). Nothing was exercised; treat the ISR path as UNTESTED on this boot == witness ::"); return; };
     let slot0 = &mut (*pool).int_slots[0];
     let (qh, qtd, buf) = (
         &mut slot0.qh as *mut Qh,
@@ -15611,7 +15611,7 @@ fn halt_class(tok: u32) -> (&'static str, bool) {
 //     keyboard and trackpad sit on `tt=(hub 3 port 2)`. Different ports of a multi-TT hub means
 //     different transaction translators, so these endpoints take no bandwidth from the input path
 //     that matters. This cost does not exist.
-//   * An endpoint slot — real but not scarce: `MAX_INT_EPS` is 6 and this bench arms four.
+//   * An endpoint slot — real but not scarce: `MAX_INT_EPS` is 8 and this bench arms four.
 //   * Two halt lines per boot — real, and it WAS the genuine harm, because the old anonymous
 //     `STOP-NOTE (token ...)` made a third halt naming the real keyboard read as "the usual two".
 //     KBDFLAP already paid that off: every halt now carries `addr=`, `ep=`, `kind=` and `class=`,
@@ -15842,7 +15842,7 @@ fn halt_class(tok: u32) -> (&'static str, bool) {
 // that endpoint's own completions.
 //
 // BOUNDS. `kbdwit_fired` latches on the first dump: at most one dump per endpoint per boot, at
-// most `MAX_INT_EPS` (6) per controller for a whole boot. `kbdwit_broke` latches the same way, so
+// most `MAX_INT_EPS` (8) per controller for a whole boot. `kbdwit_broke` latches the same way, so
 // KBDWIT-2 adds at most one further line per endpoint per boot — eight lines, once, per endpoint,
 // for the entire boot. KBDWIT-LATCH adds `kbdwit_cut`, a THIRD independent one-shot, for a ceiling
 // of nine; it is a separate latch and not a third user of `kbdwit_broke` because with KBDFLAP's
@@ -16395,464 +16395,7 @@ unsafe fn kbdwit_probe(e: &mut IntEp, idx: usize, om: bool, op: u64, fl: *const 
     );
 }
 
-/// Boot-keyboard report decode — the same layout, scancode table, and Event delivery as the
-/// xHCI keyboard path (xhci mod.rs event dispatch), so a key is a key whichever controller
-/// carried it. Table shared via pub(crate) rather than duplicated.
-///
-/// EHCI-KEYUP — THIS PATH NOW SYNTHESISES RELEASES, WHICH IS THE HALF IT WAS MISSING.
-///
-/// Boot AJ (`aj-lockout-forensics.md`, Defect 2a) is what a decoder that emits presses only costs:
-/// the rMBP's INTERNAL keyboard is on EHCI, so on that machine no ring-3 app had ever received a
-/// single `INPUT_EV_KEY_UP`. `user-vug` clears a held bit only on a release, so the first SPACE
-/// latched pause on permanently and the arrow/WASD held bits latched with it — the operator's
-/// "the vug froze". The xHCI decoder has always synthesised releases; this is the same logic, and
-/// it is deliberately a MIRROR rather than a variation.
-///
-/// WHAT "MIRROR" MEANS HERE, SCOPED — because the unqualified claim is not true and the difference
-/// is one a bench reading could trip over. The mirror is over the EDGE MODEL: which keycodes produce
-/// a release, when, and in what order. That half is byte-equivalent to xHCI's — same set diff, same
-/// `<= 1` guard, same position-independent `contains` test, same "no `KeyUp` for a modifier", same
-/// shift-at-release-time. It is NOT a mirror over ASCII MAPPING: xHCI computes
-/// `eff_shift = shift ^ (caps & is_letter)` from the device's `keyboard_leds`, and this decoder has
-/// no caps state at all and uses bare `shift`. So under Caps Lock a LETTER's ascii differs between
-/// the two controllers — on the press as much as on the release. That is PRE-EXISTING (the press
-/// loop was already caps-blind before this arc), it is internally consistent here because both loops
-/// share `ascii_of` so a press and its release can never disagree about which character they are
-/// about, and it is being closed by the `seat/gr21-allkeys` arc stacked on this one. It is named
-/// rather than fixed here on purpose: this commit's contract is the edge model, and widening it to
-/// the mapping would put two independent changes in one bisect.
-///
-/// THE DIFF. A USB boot report is a LEVEL, not an edge: bytes 2..8 carry the FULL set of keycodes
-/// currently down (6-key rollover), so any keycode present in the previous report and absent from
-/// this one was released. `prev_keys` carries that previous set per endpoint and is rewritten here.
-/// The press loop reads the SAME diff in the other direction (see DBLSTROKE below): a keycode absent
-/// from the previous report and present in this one is a press EDGE, and only an edge pushes `Key`.
-///
-/// WHY A MISSED RELEASE CANNOT STRAND A KEY HERE. `service_ehci_hid` arms one transfer per service
-/// pass and is polled at frame rate, so reports the device sends between passes are simply never
-/// fetched — the CLICK-3 note above is about exactly that. It cannot cost a release: USB is
-/// host-polled, so a device with a pending state change holds it until the next IN token rather than
-/// losing it, and the re-arm happens in the SAME service pass as this decode. All four poll-gap
-/// cases are symmetric — press+release both inside a gap loses both edges; press seen then release
-/// seen pairs; release+re-press inside a gap collapses to a hold with no fabricated edge. (This is
-/// the property the pointer path lacks, because a button's level can go down again before the next
-/// poll.) **The one ASYMMETRIC case is not a poll gap at all: it is endpoint DEATH, and it is closed
-/// separately by [`flush_held_releases`].**
-///
-/// SHORT REPORTS ARE REFUSED WHOLE, and the `< 8` is load-bearing rather than defensive dressing.
-/// This guard was `< 3` and `cur_keys` zero-fills the slots a short report does not carry, so a full
-/// report followed by a SHORT one emitted a `KeyUp` for everything held in the missing slots — a
-/// FABRICATED release, the exact class this arc exists to remove, arriving by a different door (a
-/// fabricated SPACE release clears `H_PAUSE`, the next full report re-presses it as a fresh edge,
-/// and pause toggles on its own). xHCI cannot do this: it reads a fixed 8-byte staging buffer
-/// UNCONDITIONALLY (`from_raw_parts(data_buf_ptr, 8)`), so a short transfer leaves the previous
-/// bytes in place and reads as STILL HELD — the conservative direction. Refusing the report whole
-/// takes that same direction with no staging buffer: no press, no release, and `prev_keys` is left
-/// untouched, so nothing is invented and the next conforming report resolves the truth. Zero
-/// behavioural cost on any conforming device — the boot protocol is fixed at 8 bytes and this
-/// driver arms these endpoints at `mps=8`.
-///
-/// MODIFIERS GET NO KeyUp, matching xHCI exactly. `report[0]` is a bitmask, not a keycode; neither
-/// decoder has ever pushed `Key` for a bare modifier, so pushing `KeyUp` for one would fabricate a
-/// release edge for a press ring 3 never saw. The ascii of a release is picked by
-/// `xhci::hid_key_release_ascii`, which folds on Shift and Caps only, as on xHCI. The invariant is
-/// exact: **a release resolves to the same ascii its press did** — Shift+`1` that pressed `!`
-/// releases `!`. The earlier gloss "consumers match case-insensitively" was true for letters and
-/// FALSE for shifted symbols (`!` vs `1`), which is the shifted-symbol strand GR21 closed.
-///
-/// ── KEYREPEAT-X86 (Boot AL): THIS DECODER NOW FEEDS THE HOST TYPEMATIC TRACKER ────────────────
-///
-/// The paragraph that stood here said "no typematic interaction exists on this path", called it a
-/// fact about the build rather than a judgement call, and closed with *"repeat on this arch is the
-/// DEVICE's, carried by the re-reported level."* The build fact was true; the closing sentence was
-/// a hypothesis, and Boot AL refuted it — Peter, at the bench: *"so far so good with keys except no
-/// key repeat."* Everything else GR21 landed here passes on metal. Repeat does not, because the
-/// rMBP's internal keyboard does NOT re-report a key that is held still: no SET_IDLE is sent on
-/// this path (see KBDWIT), so the device runs its default report-on-change behaviour and the
-/// "re-reported level" the KeyDown loop below relies on for repeat never arrives. One press report,
-/// one `Event::Key`, and the shell's line editor advances exactly one character — which is the same
-/// symptom, from the same cause, that UVUG-5 was written for on aarch64.
-///
-/// So the tracker's cfg was widened to cover `x86_64 + ehcihid` (see `pal.rs` §KEYREPEAT-X86) and
-/// this decoder feeds it at the REPORT level, exactly as `drivers::xhci` does: the newest ascii
-/// pressed THIS report plus the FULL currently-held ascii set, computed through the same
-/// `ascii_of` fold the `Event::Key` pushes use, so the armed key and the pushed character are the
-/// same byte and a release can never disagree with its press about identity.
-///
-/// WHY THE FEED IS HERE AND NOT AT THE EVENT QUEUE. That is the whole of UVUG-6: `EventQueue::push`
-/// silently DROPS on a full 64-slot ring, so a release learned from the drained event stream can be
-/// lost and the tracker would then repeat a key nobody is holding, forever (the P51 wedge). At the
-/// report level a release is learned from the armed key being ABSENT from the held set — a fact the
-/// queue cannot drop. The three disarm layers and the half-full backpressure guard come with the
-/// shared code, already metal-cured on the Pi.
-///
-/// THE KeyDown/KeyUp EDGES BELOW ARE UNTOUCHED, deliberately: GR21's release synthesis is
-/// metal-proven as of Boot AL (SPACE pauses and unpauses, WASD releases, `!` releases `!`,
-/// modifiers get no `KeyUp`) and nothing in this arc may perturb it. The tracker is a pure OBSERVER
-/// here — it pushes no event from this function; `main`'s x86 pump calls `pal::typematic_tick`.
-///
-/// ── DBLSTROKE (Boot AN): THE PRESS LOOP WAS LEVEL-TRIGGERED, AND ROLLOVER DOUBLED EVERY KEY ──────
-///
-/// Peter, at the bench on Boot AN: *"key repeat good but typing fast causes double stroke."* Held-key
-/// repeat and normal-speed typing are both correct; typing FAST doubles characters. The capture names
-/// the mechanism outright, with no new instrument needed — `EHCI-HID: KEY:` is pushed once per
-/// `Event::Key`, and the word "help" typed quickly reads:
-///
-/// ```text
-/// [1228135ms] KEY: 'h'                      report [h]     — press edge
-/// [1228275ms] KEY: 'h'   KEY: 'e'           report [h,e]   — 'h' RESTATED, 'e' pressed
-/// [1228413ms] KEY: 'e'   KEYUP: 'h'         report [e]     — 'e' RESTATED, 'h' released
-/// [1228427ms] KEY: 'l'                      report [l]     — press edge
-/// ```
-///
-/// Two `Event::Key` pushes for one physical press of `h`, and two for `e`. The cause is that the press
-/// loop was a LEVEL loop: it pushed `Key(ascii)` for every keycode in every report, and a USB boot
-/// report re-states the FULL held set. Fast typing is defined by OVERLAP — the next key goes down
-/// before the last one comes up — so every overlapped pair produces a report that re-states the key
-/// already down, and that re-statement was delivered as a second press. Type slowly enough that each
-/// key is fully released first and every report carries exactly one key, and nothing ever repeats:
-/// precisely the reported symptom, precisely bounded.
-///
-/// It is the PRODUCER, not the console or the line editor: the two pushes are two distinct lines from
-/// this function, at two different report timestamps. It is not the typematic tracker either — the
-/// doubles are 140 ms apart with no 400 ms delay elapsed, `[keystat] typematic hold end` shows
-/// `re-arms=0` for the whole boot, and the tracker pushes nothing from here in any case.
-///
-/// THE FIX is to push on the press EDGE, which is the contract every consumer in the tree was already
-/// written against — `vug.rs` GAME-MODE says so in as many words ("the HID path delivers a Key on the
-/// PRESS edge and a KeyUp on the RELEASE edge"), and this decoder's own release loop has always been
-/// an edge. The two loops now read the same `prev_keys`/`cur_keys` diff in opposite directions, so a
-/// press and its release are the same fact seen twice and cannot disagree about how many there were.
-///
-/// WHAT PAYS FOR THE REPEAT THE LEVEL LOOP USED TO PROVIDE: the host typematic tracker, which this
-/// same function already feeds and which is the ONLY source of repeat that ever reached this machine.
-/// The old note here argued the level loop delivered repeat "on a device that does re-report" and so
-/// should stay. On this hardware there is no such device — no `SET_IDLE` is sent on this path (KBDWIT)
-/// and the internal keyboard runs report-on-change — which is why KEYREPEAT-X86 had to add the tracker
-/// at all. Level-driven repeat was therefore never repeat here; it was only ever the doubling, paced
-/// by the operator's other fingers rather than by any repeat rate. And a hypothetical idle-re-reporting
-/// keyboard is better served by the tracker's 400 ms/40 ms than by an unthrottled poll-rate spew.
-///
-/// WITNESS (`[keystat] ehci press`). Two bounded counters that decide the NEXT boot either way:
-/// `restated=` counts the pushes this edge gate suppressed (non-zero proves the operator typed with
-/// overlap and that the old code WOULD have doubled), and `dbl=` is an independent doubled-push
-/// detector that watches what this function actually pushes — the same ascii twice inside
-/// `DOUBLE_WINDOW_MS`. If Peter still sees doubles with `dbl=0`, the producer is clean and the fault
-/// is downstream (console echo or line editor); if `dbl>0` the producer is still doubling and this
-/// diagnosis was wrong. Either way the boot is decisive, which the previous boot's instruments were
-/// not.
-///
-/// ── ALLKEYS P1 (GR21): CAPS LOCK, THE HALF THIS DECODER WAS STILL MISSING ──────────────────────
-///
-/// Peter, at the bench: *"do we have working shift, caps lock etc — we want all the keys working."*
-/// Shift worked here; Caps Lock did not, and on THIS machine that is the whole story, because the
-/// rMBP's internal keyboard is an EHCI device — so the decoder that had never heard of caps lock
-/// was the only one the operator could reach. The xHCI decoder has read a caps-lock bit since
-/// HID-LED; this path did not, so the key was inert and the LED never lit.
-///
-/// BOTH HALVES OR NEITHER, and that is not a stylistic preference. Case logic without an LED gives
-/// an operator a keyboard that types capitals with an unlit key — indistinguishable from a stuck
-/// Shift. An LED without case logic gives a lit key that types lowercase. Either half alone reads
-/// as a BROKEN keyboard, so this decoder toggles the state and the caller lights the key, both
-/// driven from the single `kbd_leds` byte that the case fold and SET_REPORT each read.
-///
-/// The decoder does not itself send SET_REPORT — it cannot. It is called from inside
-/// `Controller::service`'s `for e in self.int_eps.iter_mut()`, which holds an exclusive borrow of
-/// `int_eps`, while a control transfer needs `&mut self`. So it RETURNS whether the bitmap changed
-/// and the caller issues the request after the loop drops that borrow — the same deferral shape the
-/// `mtraw` capture-window restore already uses at that site.
-///
-/// MODIFIER POLICY is `xhci::hid_key_ascii`'s, not this function's, and deliberately so: Ctrl/Alt/
-/// GUI folding was absent from BOTH decoders (Cmd-Q typed a bare `q` into the shell line), and
-/// fixing it in one place while the other kept a private copy of the fold is exactly how the
-/// caps-lock divergence arose. The whole decision now lives in one function both controllers call.
-///
-/// PER-RELEASE ASCII, and why `prev_mods` exists. A release edge fires exactly once and is never
-/// re-sent, so it MUST resolve to the same ascii FAMILY its press did or it strands the key in every
-/// held-state consumer (Boot AJ). The live release path has the current `report[0]` in hand; the
-/// dead-endpoint flush ([`flush_held_releases`]) does not — the device is gone — so the modifier
-/// byte of the last ACCEPTED report is carried in `prev_mods` for it to fold against. Both paths go
-/// through `xhci::hid_key_release_ascii`, which depends only on Shift and Caps: Shift+`1` that
-/// pressed `!` releases `!`, not `1`.
-///
-/// Returns `true` if this report toggled a lock key — i.e. the caller owes the device a SET_REPORT.
-// ── DBLSTROKE witness state ──────────────────────────────────────────────────────────────────────
-//
-// Boot totals only; no per-endpoint state, because the operator has one pair of hands and the question
-// ("does this decoder push the same character twice for one press?") is about the decoder, not about
-// which endpoint carried it. All of it is dead weight on a boot where nobody types: every counter
-// stays 0 and not one line is emitted.
-//
-// This whole block is x86-only by construction — `drivers/mod.rs` gates `pub mod ehci` on
-// `all(target_arch = "x86_64", feature = "ehcihid")`, so aarch64 never compiles a byte of it and no
-// per-item `#[cfg]` is needed (nor would one be honest: it would imply the file is reachable without
-// the feature).
-
-/// DBLSTROKE — `Event::Key` pushes this decoder made, i.e. genuine press edges.
-static PRESS_EDGES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-/// DBLSTROKE — keycodes seen down in a report that the PREVIOUS report already carried. Under the old
-/// level loop each of these was a second `Event::Key` for a key nobody re-pressed; it is now suppressed
-/// and counted. Non-zero is the positive evidence that the operator typed with OVERLAP during the run,
-/// which is what makes a `dbl=0` result meaningful rather than merely untested.
-static RESTATED_PRESSES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-/// DBLSTROKE — reports carrying two or more character keys down at once: rollover, i.e. "typing fast"
-/// measured rather than inferred from the operator's description.
-static ROLLOVER_REPORTS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-/// DBLSTROKE — the independent detector: the same ascii pushed twice by this decoder inside
-/// [`DOUBLE_WINDOW_MS`]. Survives the fix on purpose — it watches the OUTPUT, so it stays valid however
-/// the input side is rewritten, and it is what distinguishes a producer double from a consumer echo.
-static DOUBLE_PUSHES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-/// DBLSTROKE — ascii of the last `Event::Key` this decoder pushed, +1 (0 = none yet).
-static LAST_PUSH_ASCII: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-/// DBLSTROKE — `arch::ms()` of that push.
-static LAST_PUSH_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-/// DBLSTROKE — inside this window, the same character twice is a machine artefact, not typing. Human
-/// double-letters ("ll" in "help", "ee" in "seen") are two presses with a release between them and are
-/// paced by fingers: the Boot AN capture puts a deliberate re-tap of the same key ~450 ms apart, and
-/// even the machine doubles it exposed were 24..140 ms. 50 ms sits below anything a hand does and above
-/// every duplicate the level loop produced.
-const DOUBLE_WINDOW_MS: u64 = 50;
-/// DBLSTROKE — how many suppressed restatements name themselves individually before the rollup takes
-/// over. Enough to see the shape at the bench; bounded so a stuck endpoint cannot make serial the new
-/// backpressure.
-const RESTATE_LOG_MAX: u32 = 3;
-/// DBLSTROKE — after the individual lines, one rollup per this many suppressions. At a fast typist's
-/// overlap rate this is a line every few seconds of continuous typing.
-const RESTATE_ROLLUP_EVERY: u32 = 32;
-/// DBLSTROKE — individually-named doubled pushes before that detector also falls back to counting.
-const DOUBLE_LOG_MAX: u32 = 8;
-
-/// DBLSTROKE — record one genuine press edge and run the doubled-push detector over it.
-///
-/// Called ONLY from the `push_event(Event::Key(..))` site, so what it measures is what ring 3 actually
-/// received. If this ever fires after the edge gate, the edge gate is not the whole story and the next
-/// boot says so on its own line rather than leaving the bench to re-describe the symptom.
-fn note_press_edge(ascii: u8) {
-    use core::sync::atomic::Ordering;
-    let now = crate::arch::ms();
-    PRESS_EDGES.fetch_add(1, Ordering::Relaxed);
-    let prev = LAST_PUSH_ASCII.swap(ascii as u32 + 1, Ordering::Relaxed);
-    let prev_ms = LAST_PUSH_MS.swap(now, Ordering::Relaxed);
-    if prev == ascii as u32 + 1 && now >= prev_ms && now.wrapping_sub(prev_ms) <= DOUBLE_WINDOW_MS {
-        let n = DOUBLE_PUSHES.fetch_add(1, Ordering::Relaxed) + 1;
-        if n <= DOUBLE_LOG_MAX {
-            serial_println!(
-                "[keystat] ehci double-push — ascii={:#04x} pushed twice {}ms apart (<= {}ms); the PRODUCER is doubling, not the console (boot dbl={})",
-                ascii,
-                now.wrapping_sub(prev_ms),
-                DOUBLE_WINDOW_MS,
-                n
-            );
-        }
-    }
-}
-
-/// DBLSTROKE — fold one report's press accounting and emit the bounded rollup.
-///
-/// `down` counts character keys down in the report (rollover measure); `restated` counts those the
-/// previous report already carried (suppressed doubles).
-fn note_press_report(down: u32, restated: u32) {
-    use core::sync::atomic::Ordering;
-    if down >= 2 {
-        ROLLOVER_REPORTS.fetch_add(1, Ordering::Relaxed);
-    }
-    if restated == 0 {
-        return;
-    }
-    let total = RESTATED_PRESSES.fetch_add(restated, Ordering::Relaxed) + restated;
-    let first_few = total <= RESTATE_LOG_MAX;
-    if first_few || total % RESTATE_ROLLUP_EVERY < restated {
-        serial_println!(
-            "[keystat] ehci press — edges={} restated={} (+{} this report) rollover_reports={} dbl={} window={}ms",
-            PRESS_EDGES.load(Ordering::Relaxed),
-            total,
-            restated,
-            ROLLOVER_REPORTS.load(Ordering::Relaxed),
-            DOUBLE_PUSHES.load(Ordering::Relaxed),
-            DOUBLE_WINDOW_MS
-        );
-    }
-}
-
-unsafe fn decode_boot_keyboard(
-    report: &[u8],
-    prev_keys: &mut [u8; 6],
-    prev_mods: &mut u8,
-    leds: &mut u8,
-) -> bool {
-    if report.len() < 8 {
-        return false; // short/partial boot report — refused whole (keyup F1); see SHORT REPORTS above
-    }
-    let modifiers = report[0]; crate::video::keymap::note_mods(modifiers); // BRIGHTFLOOR M2 — the latest modifier byte (Shift = safe mode at Log In), as the xHCI decoder already records it. SAME-LINE fold.
-    // ALLKEYS P1: the live caps-lock bit feeds the case fold, so the lit key and the typed case
-    // are the same fact read twice rather than two states that can drift apart.
-    let caps = *leds & 0x02 != 0;
-    // The ascii for one keycode under the modifier state in force. One place, so a press and its
-    // release can never disagree about which character they are about.
-    let ascii_of = |keycode: u8| -> u8 { super::xhci::hid_key_ascii(keycode, modifiers, caps) };
-    // ALLKEYS: and the same for a RELEASE, which may never resolve to "no event" for a key that has
-    // a character identity — see `hid_key_release_ascii`. A release edge fires once and is never
-    // re-sent, so suppressing one strands the key in every consumer that tracks held state, which is
-    // the precise failure Boot AJ cost this path.
-    let release_ascii_of =
-        |keycode: u8| -> u8 { super::xhci::hid_key_release_ascii(keycode, modifiers, caps) };
-    // This report's six keycode slots. The `< 8` guard above is what makes this a COMPLETE picture of
-    // what is down — every slot comes from the wire, none is invented — which is the precondition the
-    // release diff below needs to be sound. `report[2 + i]` cannot panic for the same reason.
-    let mut cur_keys = [0u8; 6];
-    for (i, slot) in cur_keys.iter_mut().enumerate() {
-        *slot = report[2 + i];
-    }
-
-    // BT-RETRY — THE PAIRING CHORD. Ctrl+Alt+B, edge-triggered: keycode 0x05 ('b') present in THIS
-    // report and absent from the previous one (the same press-edge test the character loop below
-    // uses), while both a Ctrl bit (LeftCtrl 0x01 / RightCtrl 0x10) and an Alt bit (LeftAlt 0x04 /
-    // RightAlt 0x40) are held. On that edge, request a re-run of the Bluetooth bring-up chain — the
-    // one input affordance a spatial OS with no menu bar has today. It only RECORDS the request; the
-    // drain in `service_ehci_hid` runs the chain under the lock. Ctrl+Alt+b resolves to no printable
-    // character, so `hid_key_ascii` returns 0 for it and the loop below emits nothing for this key —
-    // the chord types nothing. Gated on `bt`: a non-Bluetooth build has no chord and no request path.
-    #[cfg(feature = "bt")]
-    {
-        const CHORD_KEY_B: u8 = 0x05;
-        let ctrl = modifiers & 0x11 != 0;
-        let alt = modifiers & 0x44 != 0;
-        let b_down_now = cur_keys.contains(&CHORD_KEY_B);
-        let b_was_down = prev_keys.contains(&CHORD_KEY_B);
-        if ctrl && alt && b_down_now && !b_was_down {
-            serial_println!(
-                "EHCI-HID: BT pairing chord (Ctrl+Alt+B) — requesting Bluetooth re-trigger == witness ::"
-            );
-            bt_request_retrigger(1);
-        }
-    }
-
-    // DBLSTROKE: PRESS EDGES, NOT LEVELS. `prev_keys` is still the PREVIOUS report here (it is
-    // rewritten at the end of this function), so `!prev_keys.contains(&keycode)` is exactly "this
-    // keycode went down in THIS report". A keycode the previous report already carried is a RESTATED
-    // level, not a new press, and pushing `Event::Key` for it is what doubled characters on metal.
-    let mut restated_this_report = 0u32;
-    let mut down_this_report = 0u32; { let mut lev = [crate::pal::Event::None; 12]; let ln = super::xhci::hid_layout_push(&cur_keys, prev_keys, modifiers, caps, "EHCI-HID", true, &mut lev); for ev in lev[..ln].iter() { if let crate::pal::Event::Key(b) = *ev { note_press_edge(b); } } } // KEYCHARS (B718): the report's ONE layout call (stamped for `[login] key latency`, DBLSTROKE-counted); its claimed usages are skipped below. LINE-NEUTRAL, code first.
-    for &keycode in cur_keys.iter() {
-        if keycode <= 1 {
-            continue; // no key / ErrorRollOver
-        }
-        let ascii = if super::xhci::hid_layout_claim(keycode, modifiers, caps).is_some() { 0 } else { ascii_of(keycode) }; // KEYCHARS (B718): a claimed usage typed through `hid_layout_push`
-        if ascii == 0 {
-            continue;
-        }
-        down_this_report += 1;
-        if prev_keys.contains(&keycode) {
-            // Still held from the previous report. Repeat for a held key is the host typematic
-            // tracker's job on this path (KEYREPEAT-X86, fed below) — at 400 ms / 40 ms, once — and
-            // never the report level's, which is paced by the operator's OTHER fingers.
-            restated_this_report += 1;
-            continue;
-        }
-        if !crate::pwwire::withhold() { serial_println!("EHCI-HID: KEY: class={}", crate::pwwire::key_class(ascii)); let _ = keycode; } else { serial_println!("EHCI-HID: KEY withheld (a secret is being typed)"); } // CONSOLEFIX M3 (B365, R65): flight 22 printed the login password AND `holocron init`'s here, byte by byte
-        crate::boot::key_stamp(); // INSTALLBARE M2: the decode's stamp, read back by `login::consume_key` as `[login] key latency ms=`
-        crate::pal::push_event(crate::pal::Event::Key(ascii));
-        note_press_edge(ascii);
-    }
-    note_press_report(down_this_report, restated_this_report);
-
-    // KEYREPEAT-X86: feed the host-side typematic tracker at the REPORT LEVEL — BEFORE the release
-    // edges below and before anything else this report will push, so a `KeyUp` the 64-slot ring may
-    // later DROP can never strand a held key (UVUG-6's root cause). `newest_press` is the ascii of a
-    // keycode that is down NOW and was NOT down in the previous report; `held` is every ascii down
-    // now. Both resolve through `ascii_of`, the same fold the `Event::Key` pushes above used, so the
-    // tracker arms the exact byte the consumers received. Non-ascii usages (F-keys, the lock keys)
-    // are absent from both, exactly as on the xHCI feed — `IDLE_RUN_TO_LATCH` covers the residue.
-    // Mirrors `drivers::xhci`'s call site one-for-one; the tracker itself is shared code.
-    {
-        let mut held: [u32; 6] = [0; 6];
-        let mut hn = 0usize;
-        let mut newest_press: u32 = 0;
-        for &keycode in cur_keys.iter() {
-            if keycode <= 1 {
-                continue;
-            }
-            let ascii = super::xhci::hid_repeat_key(keycode, modifiers, caps, ascii_of(keycode)); // CHARREPEAT (SR156): the layout's TOKEN — the byte it typed, or a char token so a held `ü` repeats `ü` (never the US `[`); KEYCHARS (B718) handed the claim byte, 0 for `ü`
-            if ascii != 0 {
-                held[hn] = ascii;
-                hn += 1;
-                if !prev_keys.contains(&keycode) {
-                    newest_press = ascii;
-                }
-            }
-        }
-        crate::pal::typematic_note_keys(newest_press, &held[..hn]); for &kc in cur_keys.iter() { if kc > 1 && !prev_keys.contains(&kc) { #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] let _ = crate::video::fnrow::fn_row_usage(crate::video::fnrow::PATH_EHCI, kc, modifiers); } } // XHCIMEDIA (B438): through the one fn-row router. VOLKEYS: F10/F11/F12 press edges -> mute/down/up (codec amp + bar indicator)
-    }
-
-    // The release edges. Bounded by six per report, and a human's key releases are human-rate, so
-    // the serial line is unconditional like its `KEY:` twin rather than hidden behind `usbdebug` —
-    // it is the wire evidence that this path emits releases at all, which is the one thing Boot AJ
-    // could not show.
-    for &keycode in prev_keys.iter() {
-        if keycode <= 1 {
-            continue;
-        }
-        if cur_keys.contains(&keycode) {
-            continue; // still held
-        }
-        let ascii = release_ascii_of(keycode);
-        if ascii != 0 {
-            if !crate::pwwire::withhold() { serial_println!("EHCI-HID: KEYUP: class={}", crate::pwwire::key_class(ascii)); } // CONSOLEFIX M3
-            crate::pal::push_event(crate::pal::Event::KeyUp(ascii));
-        }
-    }
-
-    // ALLKEYS P1: lock-key PRESS edges — a lock usage present now and absent last report. Edge and
-    // not level, because a boot report re-states the full held set: a caps key held down for half a
-    // second is re-reported every poll, and a level test would toggle the state on every one of
-    // those reports, flipping caps tens of times per press and landing on whichever parity the
-    // release happened to fall on. The edge fires exactly once per physical press.
-    //
-    // Note these usages produce NO `Key`/`KeyUp` event and never did — `HID_SCANCODE_TO_ASCII` maps
-    // all three to (0,0), so the loops above skip them. A lock key changes the MEANING of later
-    // keys; it is not itself a character. Mirrors the xHCI toggle loop, sharing its (usage, bit) table.
-    let mut changed = false;
-    for &(usage, bit) in super::xhci::HID_LOCK_KEYS.iter() {
-        if cur_keys.contains(&usage) && !prev_keys.contains(&usage) {
-            *leds ^= bit;
-            changed = true;
-        }
-    }
-
-    // PRTSCR: the Print Screen press edge — the SAME shared predicate the xHCI decoder asks, for the
-    // same reason the lock keys share a table: a key is a key whichever controller carried it. This
-    // is the path that matters on the bench, because the rMBP's INTERNAL keyboard is on EHCI.
-    //
-    // Asked here, BEFORE `*prev_keys = cur_keys` below, so the diff is against the previous report.
-    // We are inside `service()` holding `EHCI_HID`, so this does exactly one thing — set a flag. The
-    // capture runs on the device-service pass; a filesystem write from in here would contend the
-    // xHCI storage loan from inside the EHCI pass and hold the keyboard and trackpad hostage for
-    // seconds, which is the argument `holocron`'s deferred write already makes at its call site.
-    if let Some(act) = super::xhci::hid_print_screen_action_edge(&cur_keys, prev_keys, modifiers) {
-        // KEYMAP (R60): the 0x46 EDGE is detected as it always was; what the usage MEANS comes from
-        // the theme's binding table now, so a theme that drops the row disarms the key here too.
-        serial_println!(":: PRTSCR: PrintScreen (HID 0x46) down on EHCI -> capture armed action={} ::", act.name());
-        if act.is_capture() { crate::video::prtscr::request(); }
-    } else if let Some((act, chord)) =
-        super::xhci::hid_screenshot_chord_edge(&cur_keys, prev_keys, modifiers)
-    {
-        // KEYMAP (R60) — the path that matters on the bench: the rMBP's internal keyboard has no Print
-        // Screen key and so never puts 0x46 on this wire. The chord is no longer TESTED here or in the
-        // shared predicate — `video::keymap::resolve` judges it against the theme's table and this
-        // decoder only asks. Same request, same deferral; `else if` so a report carrying both 0x46 and
-        // a chord arms exactly once. The chord types nothing: `ascii_of` above folds any GUI-held (and
-        // any Alt-held) usage to 0, which covers a PC-shaped table with no new rule.
-        if act.is_capture() { serial_println!(
-            ":: PRTSCR: [prtscr] chord={} (GUI+Shift+digit) down on EHCI -> capture armed action={} ::",
-            chord, act.name()); crate::video::prtscr::request(); } else { serial_println!("[clip] chord={} action={} via={} -> delivered", chord, act.name(), "ehci"); crate::pal::push_event(crate::pal::Event::Action(act)); } } // APPCLIP (R61) — **THE NON-CAPTURE ARM, WHICH UNTIL NOW WENT NOWHERE.** KEYMAP resolved ⌘C/⌘V/⌘X/⌘A here and STOPPED (keymap.md §6: "no consumer and no delivery path"), so the chord was judged and then dropped on the floor. It is now pushed onto the SAME ring the keystrokes from this decoder travel, as `pal::Event::Action` — a third kind of event, neither key nor pointer — and the first thing that acts on it is `video::clipboard::terminal_action`. The capture arm above is byte-for-byte what it was: `is_capture()` still owns `prtscr::request()`, so the PRTSCR wire and flight 11’s two proven chords are untouched, and this `else` can only be reached by an action `is_capture()` refused. No modifier, focus or window test is added here and none may be: R61’s point is that the TABLE decides, which is also why `Ctrl-C` cannot reach this line — no shipped row claims it, so `resolve` returns `None` and `hid_key_ascii` still hands the shell 0x03. ⚠ FOLDED onto the existing statement and given no line of its own — this file is 17k/19k lines of `panic::Location` records that embed line numbers (B94, LEDGER P7); CODE FIRST, then the prose (A10FIX).
-
-    *prev_keys = cur_keys;
-    // ALLKEYS: remember this accepted report's modifier byte, so a later endpoint-death flush can
-    // resolve each stranded key to the same shifted ascii its press produced. Updated ONLY here —
-    // past the `< 8` guard — so a refused short report never overwrites the last true modifier state.
-    *prev_mods = modifiers;
-    changed
-}
+pub use crate::drivers::hidboot::decode_boot_keyboard; // HIDBOOTSHARED (rmbp-ledger B982): the boot-keyboard decoder MOVED to `drivers/hidboot.rs` (transport-neutral; its `Transport` labels the key lines, `EHCI-HID:` byte-identical here); this re-export keeps `use super::*` (bthid) and the `ehci::decode_boot_keyboard` paths resolving.
 
 /// EHCI-KEYUP F2 — release every key this endpoint still believes is DOWN, because no further report
 /// will ever arrive to say otherwise.
@@ -18517,7 +18060,7 @@ pub fn init() {
                         );
                         continue;
                     }
-                    let pool = &mut DMA_POOLS[idx];
+                    let Some(pool) = qh::dma_pool(idx) else { crate::bootlog_println!(":: EHCI-HID: [{}] STOP-NOTE the DMA allocator refused the pool (DMAALLOCEHCI B989) — controller skipped ::", idx); continue; }; let pool = &mut *pool;
                     let (
                         Some(fl_phys),
                         Some(head_phys),
@@ -19051,7 +18594,7 @@ static BT_RETRIGGER_PENDING: core::sync::atomic::AtomicU32 =
 /// decode path already holds, so the actual re-run is deferred to the drain rather than re-entered
 /// here.
 #[cfg(feature = "bt")]
-fn bt_request_retrigger(source: u32) {
+pub(crate) fn bt_request_retrigger(source: u32) {
     BT_RETRIGGER_PENDING.store(source, core::sync::atomic::Ordering::SeqCst);
 }
 
@@ -19069,7 +18612,7 @@ pub fn service_ehci_hid() {
     // passes per second and this measures the gap BETWEEN them, which is the quantity `dark_gap_ms`
     // is made of; stamped here, beside its twin and above the lock, for the identical reason.
     pass_period_note();
-    let mut g = EHCI_HID.lock(); crate::pointerfeel::note_pass(crate::arch::ms()); // PUMPHOLE (B541): the pass cadence `tests pointerfeel` classes each report gap by — stamped AFTER the lock, so a pass that waited on it is charged the wait (LINE-NEUTRAL fold, code first)
+    let mut g = EHCI_HID.lock(); crate::pointerfeel::note_pass(crate::arch::ms()); crate::drivers::i8042::pump(); crate::drivers::dwi2c::touchpad::pump(); // ZENBOOKTOUCHPADREPORTS (zenbook-ledger Z18): the I2C-HID touchpad polls here, under this lock, into `pal::push_pointer_report` (LINE-NEUTRAL fold, code first). ZENBOOKI8042 (Z3): the i8042 transport drains here, under this lock, into the one boot-keyboard decoder (`drivers::hidboot`, HIDBOOTSHARED B982) (LINE-NEUTRAL fold, code first). PUMPHOLE (B541): the pass cadence `tests pointerfeel` classes each report gap by — stamped AFTER the lock, so a pass that waited on it is charged the wait (LINE-NEUTRAL fold, code first)
     let Some(ctrls) = g.as_mut() else { return };
     for c in ctrls.iter_mut() {
         unsafe { c.service() }; #[cfg(all(feature = "lidsleep", feature = "wc"))] c.port_suspend_service(); // USBSUSPEND (B766): the sleep state's SUSPEND/resume of this controller's root ports, under this lock; the body is `suspend` at the file tail. LINE-NEUTRAL fold, code first
@@ -19620,7 +19163,7 @@ pub fn hid_task_start(cpu: usize) {
     if HID_TASK.swap(true, core::sync::atomic::Ordering::AcqRel) {
         return;
     }
-    crate::arch::sched::spawn("hid-pump", hid_task, 0, cpu, crate::arch::sched::PRIO_NORMAL); crate::hidstall::note_pump_cpu(cpu); // HIDSTALL2 (B509): the core whose masked holds the census names
+    crate::drivers::i8042::init(); crate::arch::sched::spawn("hid-pump", hid_task, 0, cpu, crate::arch::sched::PRIO_NORMAL); crate::hidstall::note_pump_cpu(cpu); // ZENBOOKI8042 (Z3): the i8042 controller comes up once, post-ACPI/PCI, before the pass that drains it exists (LINE-NEUTRAL fold, code first). HIDSTALL2 (B509): the core whose masked holds the census names
     serial_println!(
         "[hid] pump task=hid-pump cpu={} cadence=1tick (INPUTSTALL2: the HID pass never waits on the device-service loop)",
         cpu
@@ -19630,7 +19173,7 @@ pub fn hid_task_start(cpu: usize) {
 fn hid_task(_: usize) {
     loop {
         crate::arch::sched::sleep_ticks(1);
-        service_ehci_hid();
+        crate::hidstall::pump_here(); service_ehci_hid(); // DESKTOPHIDGAP (B1020): the census's pump core (and every "apart from the hid pump" rule) follows this task — GATESTEAL's re-home moves a dead core's sleepers; body at hidstall.rs's tail (LINE-NEUTRAL fold, code first)
     }
 }
 
@@ -21018,4 +20561,207 @@ pub mod mtreport {
             if press { "primary" } else { "FAIL" }, lift, tap, tap2, w(rebase12), w(honest), if over { "jump" } else { "FAIL" }, max, if ok { "PASS" } else { "FAIL" }
         );
     }
+}
+
+/// ZENBOOKTOUCHPADREPORTS (zenbook-ledger Z18) — the pointer map's bit reader and the vendor lane's curve, LENT to the
+/// I2C-HID touchpad (`drivers::dwi2c::touchpad`), which rides this file's HID pass. Not copies: the touchpad's packet
+/// fields are read by `extract_bits` and its first finger's step goes through `finemotion::step2`, pre-scaled to the
+/// vendor lane's span. finemotion's own counters (`jump=` / `rebase=`) are not touched. File-tail append.
+pub(crate) mod lend {
+    /// A contact silent this long re-baselines (the vendor lane's re-touch rule).
+    pub(crate) const JUMP_GAP_MS: u64 = super::finemotion::JUMP_GAP_MS;
+
+    /// `size` bits at bit `off` of `data`, little-endian (the pointer map's reader).
+    pub(crate) fn bits(data: &[u8], off: u16, size: u8) -> u32 {
+        super::extract_bits(data, off, size)
+    }
+
+    /// One raw step of a pad whose x range is `span` units, in whole pixels, the Q8 remainder carried in `res`.
+    pub(crate) fn curve(r: (i32, i32), span: i32, res: &mut (i32, i32)) -> (i32, i32) {
+        let (s, k) = (super::finemotion::span() as i64, span.max(1) as i64);
+        let r = ((r.0 as i64 * s / k) as i32, (r.1 as i64 * s / k) as i32);
+        super::finemotion::step2(r, res).0
+    }
+}
+
+// HIDBOOTLEDSTEST (rmbp-ledger B995) — TAIL-APPENDED: the EHCI controller is the slot owner of the ONE LED slot drain
+// (`hidboot::drain_led_slots`, called from `service` where B991's loop stood). Each `IntEp` is one slot; the drain's
+// rule (skip / one send with the latest byte / the line / the latch) is hidboot's, never restated here.
+impl crate::drivers::hidboot::LedSlots for Controller {
+    fn count(&self) -> usize {
+        self.int_eps.len()
+    }
+    fn take(&mut self, i: usize) -> (bool, bool, bool, u8, u8, u8) {
+        let e = &mut self.int_eps[i];
+        let d = e.kbd_led_dirty;
+        e.kbd_led_dirty = false;
+        (d, e.kbd_led_ok, e.dead, e.kbd_leds, e.target.addr, e.intf)
+    }
+    fn send(&mut self, i: usize, leds: u8) -> Result<(), &'static str> {
+        let (t, intf) = (self.int_eps[i].target, self.int_eps[i].intf);
+        unsafe { self.set_hid_leds(&t, intf, leds) }
+    }
+    fn latch_off(&mut self, i: usize) {
+        self.int_eps[i].kbd_led_ok = false; // the case fold is untouched
+    }
+}
+
+// DONGLEBOOT2 (rmbp-ledger B1007, BP-input-21) — TAIL-APPENDED: who claims the fixed `MAX_INT_EPS` pool, by CLASS. The
+// three `arm_interrupt_ep` call sites ARE the claimants (boot HID, the report-protocol pointer, the hub status endpoint;
+// the BT event endpoint has its own `bt_slot`, USBNET-EHCI and UVC arm none), so the class is DERIVED from the arm's own
+// arguments, never passed: `is_kbd` -> kbd, `is_rel` or a report layout -> mouse, neither -> hub (the hub site is the
+// only all-false caller). The exhausted STOP-NOTE names `class=` and every refusal is counted (`int_lost`, under
+// `EHCI_HID`) for `tests intpool`. The take itself (`int_next`, `intpool::slot_take`) is untouched. A class reserve
+// for HID (INTPOOL-RESERVE) is owed: no claimant of another class reaches the pool today.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum IntClass {
+    Kbd,
+    Mouse,
+    Hub,
+}
+
+impl IntClass {
+    /// The class of one `arm_interrupt_ep` claim, from its arguments (exact for the three call sites).
+    fn of(is_kbd: bool, is_rel: bool, has_layout: bool) -> IntClass {
+        if is_kbd {
+            IntClass::Kbd
+        } else if is_rel || has_layout {
+            IntClass::Mouse
+        } else {
+            IntClass::Hub
+        }
+    }
+    fn word(self) -> &'static str {
+        match self {
+            IntClass::Kbd => "kbd",
+            IntClass::Mouse => "mouse",
+            IntClass::Hub => "hub",
+        }
+    }
+    fn is_hid(self) -> bool {
+        matches!(self, IntClass::Kbd | IntClass::Mouse)
+    }
+    /// One loser packed for `INT_LOST`: `class << 8 | addr`, never 0 (the class codes start at 1).
+    fn pack(self, addr: u8) -> u32 {
+        let c = match self {
+            IntClass::Kbd => 1u32,
+            IntClass::Mouse => 2,
+            IntClass::Hub => 3,
+        };
+        (c << 8) | addr as u32
+    }
+    fn unpack(v: u32) -> (IntClass, u8) {
+        let c = match v >> 8 {
+            1 => IntClass::Kbd,
+            2 => IntClass::Mouse,
+            _ => IntClass::Hub,
+        };
+        (c, (v & 0xFF) as u8)
+    }
+}
+
+/// Every pool refusal this boot, the HID ones apart, and the first `INT_LOST.len()` losers (packed, 0 = none).
+static INT_REFUSED: AtomicU32 = AtomicU32::new(0);
+static INT_REFUSED_HID: AtomicU32 = AtomicU32::new(0);
+static INT_LOST: [AtomicU32; 4] = [AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0)];
+
+/// The counting rule, pure: refusal number `n` of `class` at `addr` lands in `lost[n]` while there is room; returns
+/// whether it was a HID loss. `int_lost` (live) and the KAT (synthetic) both go through it.
+fn lost_note(lost: &mut [u32; 4], n: usize, class: IntClass, addr: u8) -> bool {
+    if let Some(s) = lost.get_mut(n) {
+        *s = class.pack(addr);
+    }
+    class.is_hid()
+}
+
+/// INTPOOLGROW (rmbp-ledger B1026): the pool's take-or-refuse rule replayed, pure, over `claims` on a pool of `slots`
+/// (the KAT runs it on the historical six and on the live `MAX_INT_EPS`). Returns (held, refused, refused_hid, lost).
+fn pool_replay(claims: &[(IntClass, u8)], slots: usize) -> (usize, usize, usize, [u32; 4]) {
+    let (mut held, mut refused, mut refused_hid, mut lost) = (0usize, 0usize, 0usize, [0u32; 4]);
+    for &(c, a) in claims.iter() {
+        if held < slots {
+            held += 1;
+        } else {
+            if lost_note(&mut lost, refused, c, a) {
+                refused_hid += 1;
+            }
+            refused += 1;
+        }
+    }
+    (held, refused, refused_hid, lost)
+}
+
+/// Count one refused claim (the exhausted STOP-NOTE's site in `arm_interrupt_ep`, under `EHCI_HID`).
+fn int_lost(class: IntClass, addr: u8) {
+    let n = INT_REFUSED.fetch_add(1, Ordering::Relaxed) as usize;
+    let mut lost = [0u32; 4];
+    if lost_note(&mut lost, n, class, addr) {
+        INT_REFUSED_HID.fetch_add(1, Ordering::Relaxed);
+    }
+    if let (Some(s), Some(&v)) = (INT_LOST.get(n), lost.get(n)) {
+        s.store(v, Ordering::Relaxed);
+    }
+}
+
+impl Controller {
+    /// Slots of this controller's pool held now: the held-mask under HUBREC (slots come back), else the bump index.
+    fn int_held(&self) -> usize {
+        #[cfg(all(feature = "lidsleep", feature = "wc"))]
+        {
+            self.int_used.count_ones() as usize
+        }
+        #[cfg(not(all(feature = "lidsleep", feature = "wc")))]
+        {
+            self.int_next
+        }
+    }
+}
+
+/// `tests intpool` (R80: registered, never at boot): the class rule and the pool-full counting on synthetic claims,
+/// then the live census.
+/// `:: INTPOOL: slots=8 taken=<n> refused=<n> hid_armed=<n> reserve=owed who_lost=<class:addr,...|-> kat=ok|FAIL -> PASS|FAIL ::`
+/// PASS iff the KAT holds and no kbd/mouse claimant was refused. QEMU's EHCI has six ports (UNAOS_USB_EXTRA_INT fills
+/// at most five beside the harness keyboard) and takes no hub, so QEMU never refuses: the refusal leg is the KAT's.
+pub fn intpool_selftest() {
+    let shapes = IntClass::of(true, false, false) == IntClass::Kbd
+        && IntClass::of(false, true, false) == IntClass::Mouse
+        && IntClass::of(false, false, true) == IntClass::Mouse
+        && IntClass::of(false, false, false) == IntClass::Hub;
+    // Flight 38's controller 1 in arm order: four HID (kbd 6, boot-mouse 7, kbd 9, pointer 9), then hubs 5, 4, 1 —
+    // seven claims. On the historical six slots the seventh (hub 1) is the one refusal, and it is not a HID loss;
+    // on the live pool (INTPOOLGROW B1026: `MAX_INT_EPS` 8) all seven hold and nothing is lost.
+    let claims = [(IntClass::Kbd, 6u8), (IntClass::Mouse, 7), (IntClass::Kbd, 9), (IntClass::Mouse, 9), (IntClass::Hub, 5), (IntClass::Hub, 4), (IntClass::Hub, 1)];
+    let (held, refused, refused_hid, lost) = pool_replay(&claims, 6);
+    let six = held == 6 && refused == 1 && refused_hid == 0
+        && IntClass::unpack(lost[0]) == (IntClass::Hub, 1) && lost[1] == 0;
+    let (held, refused, refused_hid, lost) = pool_replay(&claims, MAX_INT_EPS);
+    let live = held == claims.len() && refused == 0 && refused_hid == 0 && lost == [0u32; 4];
+    let counting = six && live
+        && lost_note(&mut [0u32; 4], 4, IntClass::Kbd, 2); // past the record: still counted as a HID loss
+    let kat = shapes && counting;
+    let (mut taken, mut hid_armed) = (0usize, 0usize);
+    if let Some(ctrls) = EHCI_HID.lock().as_ref() {
+        for c in ctrls.iter() {
+            taken += c.int_held();
+            hid_armed += c.int_eps.iter().filter(|e| !e.dead && (e.is_kbd || e.is_rel_mouse || e.layout.is_some())).count();
+        }
+    }
+    let refused = INT_REFUSED.load(Ordering::Relaxed);
+    let refused_hid = INT_REFUSED_HID.load(Ordering::Relaxed);
+    let mut who = alloc::string::String::new();
+    for v in INT_LOST.iter().map(|s| s.load(Ordering::Relaxed)).filter(|&v| v != 0) {
+        let (c, a) = IntClass::unpack(v);
+        if !who.is_empty() {
+            who.push(',');
+        }
+        who.push_str(&alloc::format!("{}:{}", c.word(), a));
+    }
+    if who.is_empty() {
+        who.push('-');
+    }
+    let verdict = if kat && refused_hid == 0 { "PASS" } else { "FAIL" };
+    serial_println!(
+        ":: INTPOOL: slots={} taken={} refused={} hid_armed={} reserve=owed who_lost={} kat={} -> {} ::",
+        MAX_INT_EPS, taken, refused, hid_armed, who, if kat { "ok" } else { "FAIL" }, verdict
+    );
 }

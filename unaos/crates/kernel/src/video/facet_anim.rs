@@ -201,6 +201,8 @@ struct Anim {
     /// `ms()` when a pause began.
     paused_at: Option<u64>,
     steps: u64,
+    /// KERNEL-ANIM-ICC (B974): the ONE transform from the file's embedded profile, built at open, run on every frame.
+    icc: Option<icc_core::Transform>,
 }
 
 static ANIM: crate::sync::Mutex<Option<Anim>> = crate::sync::Mutex::new(None);
@@ -259,6 +261,7 @@ pub(super) fn open_frames(path: &str, bytes: u64, mut src: Stream) -> Result<sup
     }
     first.resize(bw * bh, crate::video::theme::OPAQUE_BLACK);
     reduce_into(src.canvas(), w as usize, k, bw, bh, &mut first);
+    let icc = icc_frame0(path, &src, &mut first); // KERNEL-ANIM-ICC (B974): the transform built once, frame 0 converted
     let ihdr = Ihdr { width: w, height: h, depth: 8, colour: 6, interlaced: false };
     let n = src.frame_count();
     serial_println!(
@@ -278,7 +281,7 @@ pub(super) fn open_frames(path: &str, bytes: u64, mut src: Stream) -> Result<sup
     };
     if n > 1 {
         let due = crate::arch::ms() + played(f0.delay_ms);
-        *ANIM.lock() = Some(Anim { path: String::from(path), src, k, bw, bh, due, plays: 0, rest: false, paused_at: None, steps: 0 });
+        *ANIM.lock() = Some(Anim { path: String::from(path), src, k, bw, bh, due, plays: 0, rest: false, paused_at: None, steps: 0, icc });
     }
     Ok(o)
 }
@@ -294,7 +297,7 @@ fn loop_name(l: Option<u16>) -> String {
 /// Composite the next frame (looping per the loop count) into `px` (`bw x bh`). `Ok(Some(i, delay))`
 /// = frame `i` is up; `Ok(None)` = the animation has played out and rests. Shared by [`tick`] and
 /// `tests facetanim`, so the fixture drives the viewer's own step.
-fn advance(src: &mut Stream, plays: &mut u32, k: usize, bw: usize, bh: usize, px: &mut [u32]) -> Result<Option<(usize, u32)>, FacetError> {
+fn advance(src: &mut Stream, plays: &mut u32, icc: Option<&icc_core::Transform>, k: usize, bw: usize, bh: usize, px: &mut [u32]) -> Result<Option<(usize, u32)>, FacetError> {
     let f = match src.next_frame() {
         Some(Ok(f)) => f,
         Some(Err(e)) => return Err(FacetError::Pixel(e)),
@@ -317,6 +320,9 @@ fn advance(src: &mut Stream, plays: &mut u32, k: usize, bw: usize, bh: usize, px
         }
     };
     reduce_into(src.canvas(), src.width() as usize, k, bw, bh, px);
+    if let Some(xf) = icc {
+        super::icc_xrgb(xf, px); // KERNEL-ANIM-ICC (B974): the open's one transform, per frame
+    }
     Ok(Some((f.index, f.delay_ms)))
 }
 
@@ -354,7 +360,7 @@ pub fn tick() {
     if view.px.len() != a.bw * a.bh {
         return;
     }
-    match advance(&mut a.src, &mut a.plays, a.k, a.bw, a.bh, &mut view.px) {
+    match advance(&mut a.src, &mut a.plays, a.icc.as_ref(), a.k, a.bw, a.bh, &mut view.px) {
         Ok(Some((i, delay))) => {
             // Behind by more than a frame (a long pass): restart the clock instead of racing.
             a.due = if now.saturating_sub(a.due) > 1000 { now } else { a.due } + played(delay);
@@ -474,27 +480,43 @@ fn leg(path: &str) -> Result<(usize, usize), String> {
     let mut base = alloc::vec![crate::video::theme::OPAQUE_BLACK; bw * bh];
     let mut plays = 0u32;
     let mut held = 0usize;
-    fn step(src: &mut Stream, plays: &mut u32, k: usize, bw: usize, bh: usize, base: &mut [u32], held: &mut usize) -> Result<(usize, u32), String> {
-        let r = advance(src, plays, k, bw, bh, base).map_err(|e| e.reason())?;
+    // KERNEL-ANIM-ICC (B974): the viewer's own transform rule (the staged fixtures are untagged: None).
+    let icc = super::icc_xform(src.icc()).0;
+    fn step(src: &mut Stream, plays: &mut u32, icc: Option<&icc_core::Transform>, k: usize, bw: usize, bh: usize, base: &mut [u32], held: &mut usize) -> Result<(usize, u32), String> {
+        let r = advance(src, plays, icc, k, bw, bh, base).map_err(|e| e.reason())?;
         *held = (*held).max(1 + src.buffers_held());
         r.ok_or_else(|| String::from("ended early"))
     }
-    let (i0, d0) = step(&mut src, &mut plays, k, bw, bh, &mut base, &mut held)?;
-    let (i1, _) = step(&mut src, &mut plays, k, bw, bh, &mut base, &mut held)?;
+    let (i0, d0) = step(&mut src, &mut plays, icc.as_ref(), k, bw, bh, &mut base, &mut held)?;
+    let (i1, _) = step(&mut src, &mut plays, icc.as_ref(), k, bw, bh, &mut base, &mut held)?;
     let at = |base: &[u32], x: usize, y: usize| base[y * bw + x] & 0x00FF_FFFF;
     let (g, r) = (at(&base, 3, 3), at(&base, 0, 0));
     serial_println!("[facetanim] {} steps={},{} delay0={} frame1 px(3,3)={:06x} px(0,0)={:06x}", path, i0, i1, d0, g, r);
     if (i0, i1, d0) != (0, 1, 200) || g != crate::video::theme::fixture::RGB_GREEN || r != crate::video::theme::fixture::RGB_RED {
         return Err(alloc::format!("frame 1 read back px(3,3)={:06x} px(0,0)={:06x}", g, r));
     }
-    let (i2, _) = step(&mut src, &mut plays, k, bw, bh, &mut base, &mut held)?;
+    let (i2, _) = step(&mut src, &mut plays, icc.as_ref(), k, bw, bh, &mut base, &mut held)?;
     if i2 != 2 || at(&base, 3, 3) != crate::video::theme::fixture::RGB_BLUE {
         return Err(String::from("frame 2 is not blue"));
     }
     // Loop forever: the fourth step is frame 0 again, after one complete play.
-    let (i3, _) = step(&mut src, &mut plays, k, bw, bh, &mut base, &mut held)?;
+    let (i3, _) = step(&mut src, &mut plays, icc.as_ref(), k, bw, bh, &mut base, &mut held)?;
     if i3 != 0 || plays != 1 || at(&base, 3, 3) != crate::video::theme::fixture::RGB_RED {
         return Err(alloc::format!("the loop did not come back to frame 0 (index {} plays {})", i3, plays));
     }
     Ok((src.frame_count(), held))
+}
+
+/// KERNEL-ANIM-ICC (rmbp-ledger B974): build the ONE transform from the stream's embedded profile (`pixel_core::Animation::icc`,
+/// Facet's verdict rule `icc_xform`), convert frame 0's base `px` with it, and print one
+/// `[image] icc <verdict> bytes=<n> src=anim ms=<n> path=<p>` line (`ms` = frame 0's conversion: the per-frame cost).
+fn icc_frame0(path: &str, src: &Stream, px: &mut [u32]) -> Option<icc_core::Transform> {
+    let t0 = crate::arch::ms();
+    let n = src.icc().map_or(0, |p| p.len());
+    let (xf, verdict) = super::icc_xform(src.icc());
+    if let Some(x) = &xf {
+        super::icc_xrgb(x, px);
+    }
+    serial_println!("[image] icc {} bytes={} src=anim ms={} path={}", verdict, n, crate::arch::ms().saturating_sub(t0), path);
+    xf
 }

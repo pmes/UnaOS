@@ -250,19 +250,20 @@ fn inter_slices_high_bit_depth_and_422_are_refused_by_name() {
     b.trailing();
     b.u(0xff, 8);
     s.extend(nal(1, &b.out));
+    // HEVCINTER (SR216) decodes P slices: this one's RPS names POC 0, which was never decoded (8.3.2).
     let err = Decoder::new().decode_annexb(&s).unwrap_err();
-    assert_eq!(err, Error::Unsupported("inter slices (HEVCINTER)"));
+    assert_eq!(err, Error::Invalid("reference picture set names a missing picture (8.3.2)"));
 
-    for (cfg, want) in [
-        (SpsCfg { bit_depth: 10, ..Default::default() }, "bit depth above 8 (HEVCMAIN10)"),
-        (SpsCfg { chroma_format_idc: 2, ..Default::default() }, "chroma other than 4:2:0"),
+    for (cfg, what) in [
+        (SpsCfg { bit_depth: 13, ..Default::default() }, "13 bits (HEVCREXTTOOLS SR345: up to 16 decode)"),
+        (SpsCfg { chroma_format_idc: 0, ..Default::default() }, "monochrome (HEVCREXTTOOLS SR345: HEVCREXT-MONO built, its picture KAT is rext.rs s)"),
     ] {
         let mut s = headers(&cfg, &PpsCfg { init_qp: 26, ..Default::default() });
         let hdr = idr_slice_header(false, false, false, false);
         let mut e = CabacEnc::new(hdr, 0, 26);
         all_dc_ctu(&mut e, false);
         s.extend(nal(19, &e.finish().out));
-        assert_eq!(Decoder::new().decode_annexb(&s).unwrap_err(), Error::Unsupported(want));
+        assert!(!matches!(Decoder::new().decode_annexb(&s), Err(Error::Unsupported(_))), "{what} is no longer refused by name");
     }
 }
 
@@ -332,10 +333,10 @@ fn intra_predictors_kat() {
     // corner 100; below-left and above-right are later in z-scan order, so they are substituted (40 and 80).
     let setup = || {
         let (_, _, geo, mut pic) = unit(16, 16, 4);
-        for (i, v) in [10u8, 20, 30, 40].iter().enumerate() {
+        for (i, v) in [10u16, 20, 30, 40].iter().enumerate() {
             pic.planes[0].set(3, 4 + i, *v);
         }
-        for (i, v) in [50u8, 60, 70, 80].iter().enumerate() {
+        for (i, v) in [50u16, 60, 70, 80].iter().enumerate() {
             pic.planes[0].set(4 + i, 3, *v);
         }
         pic.planes[0].set(3, 3, 100);
@@ -370,9 +371,9 @@ fn intra_predictors_kat() {
 fn deblocking_strong_and_normal_kat() {
     for (q, want) in [
         // |p0 - q0| = 10 < (5 tC + 1) >> 1 = 13 at QP 37 (beta 36, tC 5): the strong filter.
-        (70u8, [(5usize, 61u8), (6, 63), (7, 64), (8, 66), (9, 68), (10, 69)]),
+        (70u16, [(5usize, 61u16), (6, 63), (7, 64), (8, 66), (9, 68), (10, 69)]),
         // |p0 - q0| = 20: the normal filter, Delta 5 (clipped from 8), dEp / dEq: p1 + 2, q1 - 2.
-        (80u8, [(5, 60), (6, 62), (7, 65), (8, 75), (9, 78), (10, 80)]),
+        (80u16, [(5, 60), (6, 62), (7, 65), (8, 75), (9, 78), (10, 80)]),
     ] {
         let (sps, pps, geo, mut pic) = unit(16, 16, 4);
         for y in 0..16 {
@@ -410,4 +411,63 @@ fn sao_edge_offset_kat() {
     assert_eq!(pic.planes[0].at(10, 10), 108);
     assert_eq!(pic.planes[0].at(4, 5), 100); // edgeIdx 3 (offset 0)
     assert_eq!(pic.planes[0].at(0, 5), 100); // the picture's left column: a neighbour outside, left as is
+}
+
+/// HEVCCONF (SR321): the decoded picture hash SEI (a suffix SEI after the picture's slice) is checked against the
+/// decoded, filtered, uncropped picture: the flat-128 64x48 picture with its true CRCs is a Match, with a checksum one
+/// off in luma a Mismatch(0). The hash functions themselves have KATs in tests/conformance.rs.
+#[test]
+fn picture_hash_sei_checks_the_decoded_picture() {
+    use hevc_core::picture::Plane;
+    use hevc_core::sei::{plane_checksum, plane_crc, HashCheck};
+    let flat = [Plane::new(64, 48, 128), Plane::new(32, 24, 128), Plane::new(32, 24, 128)];
+    let checks = |payload: Vec<u8>| {
+        let mut s = all_dc_stream(false, None);
+        let mut rbsp = vec![132, payload.len() as u8];
+        rbsp.extend(payload);
+        rbsp.push(0x80);
+        s.extend(nal(40, &rbsp));
+        let mut d = Decoder::new();
+        d.decode_annexb(&s).expect("decode");
+        d.flush();
+        assert_eq!(d.take_frames().len(), 1);
+        d.take_hash_checks()
+    };
+    let mut crc = vec![1u8];
+    for p in &flat {
+        crc.extend(plane_crc(p, 8).to_be_bytes());
+    }
+    assert_eq!(checks(crc), [(0, HashCheck::Match)]);
+    let mut sum = vec![2u8];
+    for (c, p) in flat.iter().enumerate() {
+        sum.extend((plane_checksum(p, 8) + u32::from(c == 0)).to_be_bytes());
+    }
+    assert_eq!(checks(sum), [(0, HashCheck::Mismatch(0))]);
+}
+
+/// HEVCLEVELLINE (SR368, HEVCSEI-MD5): the flat-128 64x48 picture's MD5 SEI (hash_type 0, payloadSize 49) through
+/// `Decoder::take_hash_checks`, against the hex of an independent MD5 (Python's hashlib: 3072 and 768 bytes of 0x80):
+/// a Match, and a Cb digest one byte off a Mismatch(1).
+#[test]
+fn picture_md5_sei_checks_the_decoded_picture() {
+    use hevc_core::sei::HashCheck;
+    let digest = |h: &str| -> Vec<u8> { (0..16).map(|i| u8::from_str_radix(&h[2 * i..2 * i + 2], 16).unwrap()).collect() };
+    let checks = |cb_delta: u8| {
+        let mut rbsp = vec![132, 49, 0];
+        rbsp.extend(digest("76210843ab1bb085f7af7523a281b6f6"));
+        let mut cb = digest("e979abdb2b582b325de6f5bb97b0e643");
+        cb[0] = cb[0].wrapping_add(cb_delta);
+        rbsp.extend(cb);
+        rbsp.extend(digest("e979abdb2b582b325de6f5bb97b0e643"));
+        rbsp.push(0x80);
+        let mut s = all_dc_stream(false, None);
+        s.extend(nal(40, &rbsp));
+        let mut d = Decoder::new();
+        d.decode_annexb(&s).expect("decode");
+        d.flush();
+        assert_eq!(d.take_frames().len(), 1);
+        d.take_hash_checks()
+    };
+    assert_eq!(checks(0), [(0, HashCheck::Match)]);
+    assert_eq!(checks(1), [(0, HashCheck::Mismatch(1))]);
 }

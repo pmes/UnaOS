@@ -806,7 +806,7 @@ pub fn init(_dtb_addr: u64, _dtb_size: usize) {
     // step 4e (`apic::report_tick_rate` — a 50 ms PM-timer window) and nothing else, and so a boot
     // that dies anywhere below still shows that it got this far. Everything from here to
     // `pci-usb` used to be one undivided delta; see `docs/dev/OS/01_BOOT_HAL/bootpace.md` §6a.
-    crate::bootpace::record("pci-enter");
+    crate::bootpace::record("pci-enter"); crate::hw::platform_say(); crate::drivers::ec::probe(); crate::drivers::dwi2c::probe(); // ZENBOOKTOUCHPAD (zenbook-ledger Z14): `drivers::dwi2c::probe` — the DesignWare I2C census, silent unless `hw::gate(Probe::I2c)`; LINE-NEUTRAL, the call before this comment. ZENBOOKEC (zenbook-ledger Z8): `drivers::ec::probe` — the ACPI EC census, silent unless `hw::gate(Probe::Ec)`; LINE-NEUTRAL, the call before this comment. ZENBOOKSURVEY (zenbook-ledger Z1): which machine this is, read from SMBIOS ONCE, before any Apple-only probe below asks `hw::gate`; the ZENBOOK sibling arcs hook AFTER this line.
 
     // VPERF (bench builds only): read-only display diagnostics — the effective framebuffer memory
     // type (MTRR + live PTE + PAT) and which class-0x03 device's BAR owns the fb address. Rides
@@ -858,7 +858,7 @@ pub fn init(_dtb_addr: u64, _dtb_size: usize) {
     // value-mutating WRITE_CMD). Knob OFF => this call does not exist and the module is unlinked.
     #[cfg(feature = "smc")]
     {
-        crate::drivers::smc::scout();
+        if crate::hw::gate(crate::hw::Probe::Smc) { crate::drivers::smc::scout(); } // ZENBOOKSURVEY (Z1): the Apple SMC scout runs as today except on a positively identified non-Apple machine (`[hw] skip smc`).
         // M2: take one battery reading at boot so every knob-ON boot log carries a `:: SMC-BATT: ::`
         // witness proving the snapshot read path ran (honest `present=false` on QEMU / a machine
         // without a battery). The main loops + the vug meter cadence keep refreshing it live.
@@ -892,9 +892,9 @@ pub fn init(_dtb_addr: u64, _dtb_size: usize) {
     // controller was found — on a machine with no xHCI the tag is still present and `pci-usb`
     // follows it directly, which is how the ledger distinguishes "no controller" from "the scan
     // hung". Config-space reads only, no waits: a single trailing stamp is sufficient here.
-    crate::bootpace::record("pci-probes"); let xhci_found = crate::drivers::pci::PciScanner::scan(); // BOOTWAITS (rmbp-ledger B152): `pci-scan` is stamped AFTER the walk and BPACE's `d=` is always the delta from the PREVIOUS stamp — which was `ehci-hid-done`, four knob-gated passenger blocks upstream (SMC-SCOUT, PCI-CENSUS, BCMA-RECON, and until this arc the HDA hook inside the walk itself). So the tag reported whatever had been hooked in above it, under a name that promises a config-space walk. Flight 11: `pci-scan d=1315ms`, of which the walk is ~1 ms (it early-returns at 0:20.0) and a full census is 6 ms (bootpace.md §10o) — the other 1314 ms is 104 ms of SMC key sweep (`UNAOS_SMC=1`, 25626->25730 ms) and 1210 ms of HDA. This stamp closes the window: everything between `ehci-hid-done` and here is `pci-probes`, and `pci-scan d=` is the walk. UNCONDITIONAL on purpose — a knob-gated stamp would make the tag mean different things on different builds, which is the exact failure being fixed. Costs one ring slot (flight 11 ran `n=28` of `CAP=64`, drop-NEWEST). ⚠ LINE-NEUTRAL append, statement BEFORE the first `//`.
+    crate::bootpace::record("pci-probes"); record_functions(); let xhci_found = crate::drivers::xhci::pick(crate::drivers::pci::PciScanner::scan(), &functions()); // ZENBOOKXHCIPICK (zenbook-ledger Z7): the registry walk runs once more HERE so `xhci::pick` can count every 0C/03/30 and honour `UNAOS_XHCI_PICK=<index|b:d.f>` (unset = the first, today's tuple unchanged); the :1173 call stays and refreshes the table. ⚠ LINE-NEUTRAL, statement before the first `//`. BOOTWAITS (rmbp-ledger B152): `pci-scan` is stamped AFTER the walk and BPACE's `d=` is always the delta from the PREVIOUS stamp — which was `ehci-hid-done`, four knob-gated passenger blocks upstream (SMC-SCOUT, PCI-CENSUS, BCMA-RECON, and until this arc the HDA hook inside the walk itself). So the tag reported whatever had been hooked in above it, under a name that promises a config-space walk. Flight 11: `pci-scan d=1315ms`, of which the walk is ~1 ms (it early-returns at 0:20.0) and a full census is 6 ms (bootpace.md §10o) — the other 1314 ms is 104 ms of SMC key sweep (`UNAOS_SMC=1`, 25626->25730 ms) and 1210 ms of HDA. This stamp closes the window: everything between `ehci-hid-done` and here is `pci-probes`, and `pci-scan d=` is the walk. UNCONDITIONAL on purpose — a knob-gated stamp would make the tag mean different things on different builds, which is the exact failure being fixed. Costs one ring slot (flight 11 ran `n=28` of `CAP=64`, drop-NEWEST). ⚠ LINE-NEUTRAL append, statement BEFORE the first `//`.
     crate::bootpace::record("pci-scan");
-    if let Some((xhci_phys_addr, bus, dev, func)) = xhci_found {
+    for (xi, (xhci_phys_addr, bus, dev, func)) in crate::drivers::xhci::bring_list(xhci_found, &functions()).into_iter().enumerate() { // ZENBOOKXHCIALL (zenbook-ledger Z21): EVERY 0C/03/30 up, in walk order after the pick (controller 0 = `xhci_found`, every unaddressed `claim()`); the block below runs once per controller, unchanged but for `xi`
         crate::bootlog_println!(":: x86_64 PCI Init: Found xHCI at {:#x} ::", xhci_phys_addr);
 
         // DIAGNOSTIC (read-only): dump interrupt line/pin + capability list to plan
@@ -925,14 +925,14 @@ pub fn init(_dtb_addr: u64, _dtb_size: usize) {
         crate::drivers::xhci::init(xhci_phys_addr); // Reset and command ring
 
         unsafe {
-            let mut xhci = crate::drivers::xhci::XhciController::new(xhci_phys_addr as usize);
+            let mut xhci = crate::drivers::xhci::XhciController::new(xhci_phys_addr as usize); xhci.xi = xi as u8;
 
             // Allocate the global command + event rings, capture their physical
             // addresses, then DROP the guards before start()/poll so nothing can
             // deadlock by re-locking them later.
             let (event_ring_phys, command_ring_phys) = {
-                let mut cmd_ring_guard = crate::drivers::xhci::COMMAND_RING.lock();
-                let mut evt_ring_guard = crate::drivers::xhci::EVENT_RING.lock();
+                let mut cmd_ring_guard = crate::drivers::xhci::command_ring(xi).lock();
+                let mut evt_ring_guard = crate::drivers::xhci::event_ring(xi).lock();
 
                 *cmd_ring_guard = Some(crate::drivers::xhci::ring::TransferRing::new(256));
                 *evt_ring_guard = Some(crate::drivers::xhci::event::EventRing::new());
@@ -953,15 +953,15 @@ pub fn init(_dtb_addr: u64, _dtb_size: usize) {
             // `None` cannot happen on a built kernel (the seed is unconditional); if it ever did,
             // the MSI-X table is left alone rather than pointed at a number with no handler.
             let msg_addr = 0xFEE0_0000u32 | ((crate::arch::apic::apic_id() as u32) << 12);
-            match crate::arch::interrupts::vectors::of("xhci") {
+            match crate::drivers::xhci::msix_vector(xi) {
                 Some(vector) => {
                     let _ = crate::drivers::pci::PciScanner::enable_msix(
                         bus, dev, func, xhci_phys_addr, msg_addr, vector as u32,
                     );
                 }
-                None => crate::bootlog_println!(
+                None => if xi == 0 { crate::bootlog_println!(
                     ":: x86_64 PCI: xHCI MSI-X NOT ARMED — this kernel allocated no `xhci` interrupt vector, so there is no number to program and no handler to deliver to. The event ring stays on the polled drain, unchanged == witness ::"
-                ),
+                ) },
             };
 
             xhci.init_pointers(command_ring_phys);
@@ -1055,7 +1055,7 @@ pub fn init(_dtb_addr: u64, _dtb_size: usize) {
         }
 
         #[cfg(all(feature = "gmux_igd", feature = "intel-ivb"))]
-        unsafe { crate::drivers::gpu::igpu::gmux_igd_switch() };
+        if crate::hw::gate(crate::hw::Probe::Gmux) { unsafe { crate::drivers::gpu::igpu::gmux_igd_switch() }; } // ZENBOOKSURVEY (Z1): the gmux IGD ladder runs as today except on a positively identified non-Apple machine (`[hw] skip gmux`).
     }
 
     // SDHC-1 (milestone 1): storage-class PCI census + the read-only SD Host Controller
@@ -1069,7 +1069,7 @@ pub fn init(_dtb_addr: u64, _dtb_size: usize) {
         let t = crate::arch::now_cycles();
         crate::drivers::sdhc::probe();
         pace.add(G_SDHC, t);
-    } #[cfg(all(target_arch = "x86_64", feature = "ahci"))] crate::drivers::ahci::probe(); // AHCI (rmbp-ledger B89, first rung) — the ONE enumeration hook for the SATA host controller (UNAOS_AHCI=1, default OFF). READ-ONLY: enumerate implemented ports, IDENTIFY, read LBA 0, publish under the AHCI registry in `drivers/block.rs`; no ATA write opcode is compiled into the image and `install/` is never told the handle exists (B91 — the bench rMBP's internal SSD carries Catalina). HERE, immediately after the SDHC block and before the network block, for the SAME reason SDHC sits here: paging and the frame allocator the ABAR mapping needs are long up, and `init_network()`'s non-Intel early exit (which the 2012 rMBP's Broadcom part takes on EVERY boot) is downstream, so the witness cannot be swallowed on the one machine this arc exists for. Deliberately NOT given a GPACE class: the probe runs only under a default-OFF knob, so a tenth accumulator would be `0ms(n=0)` on every shipped boot, and GPACE's `resid` — which already means "unattributed" — absorbs an armed run's cost honestly rather than growing the row a reader has to add up. ⚠ LINE-NEUTRAL append: `panic::Location` records embed line numbers and the knob-off x86 image byte-identity is this arc's stated invariant, so the statement is APPENDED to the existing block's closing brace and is `#[cfg]`-erased knob-off. The append goes BEFORE any `//` on this line (LEDGER P7 — after it the statement is a comment, compiles nothing, and the check stays green).
+    } #[cfg(all(target_arch = "x86_64", feature = "ahci"))] crate::drivers::ahci::probe(); #[cfg(all(target_arch = "x86_64", feature = "nvme"))] crate::drivers::nvme::probe(); // AHCI (rmbp-ledger B89, first rung) — the ONE enumeration hook for the SATA host controller (UNAOS_AHCI=1, default OFF). READ-ONLY: enumerate implemented ports, IDENTIFY, read LBA 0, publish under the AHCI registry in `drivers/block.rs`; no ATA write opcode is compiled into the image and `install/` is never told the handle exists (B91 — the bench rMBP's internal SSD carries Catalina). HERE, immediately after the SDHC block and before the network block, for the SAME reason SDHC sits here: paging and the frame allocator the ABAR mapping needs are long up, and `init_network()`'s non-Intel early exit (which the 2012 rMBP's Broadcom part takes on EVERY boot) is downstream, so the witness cannot be swallowed on the one machine this arc exists for. Deliberately NOT given a GPACE class: the probe runs only under a default-OFF knob, so a tenth accumulator would be `0ms(n=0)` on every shipped boot, and GPACE's `resid` — which already means "unattributed" — absorbs an armed run's cost honestly rather than growing the row a reader has to add up. ⚠ LINE-NEUTRAL append: `panic::Location` records embed line numbers and the knob-off x86 image byte-identity is this arc's stated invariant, so the statement is APPENDED to the existing block's closing brace and is `#[cfg]`-erased knob-off. The append goes BEFORE any `//` on this line (LEDGER P7 — after it the statement is a comment, compiles nothing, and the check stays green).
     // BOOTSLOW (rmbp-ledger B201): `crate::drivers::hda::probe()` STOOD HERE and now runs from the device-service pass as `hda::probe_after_root()` (main.rs, all three x86 loops), after the root pass has its verdict — flight 12 spent 7116 -> 8325 ms of the boot core on the tone at this site, after the SD card had registered and before the service loop that binds the root could start. Nothing in `probe` needs the boot core: it takes its own PCI inventory, maps its own BAR and allocates its own DMA. The history of this site follows, unedited. ⚠ LINE-NEUTRAL: the statement is deleted, the physical line stays. // FC2 (seat, 2026-09-22): the hda hook on its OWN cfg line — fc2-check lexes one cfg per line, so two knob-gated statements on one line read as the second under the first's knob (`all-under=feature = "ahci"`, a FINDING on every check since acd102d7). ⚠ BOOTWAITS (rmbp-ledger B152) MOVED THE HDA HOOK HERE, from the first statement of `drivers/pci.rs::enumerate_buses` where B127 put it and where B127's own comment said it did not belong. It rides the AHCI append for the AHCI append's stated reasons — paging and the frame allocator the BAR mapping needs are long up, and `init_network()`'s non-Intel early exit (which this machine takes on every boot) is downstream, so the witness cannot be swallowed — and for one more: this site is OUTSIDE the BPACE `pci-scan` delta. At the old site an armed `UNAOS_HDA=1` charged 1210 ms of audio bring-up to a tag named for a 6 ms config-space walk (flight 11: `pci-scan t=26941ms d=1315ms`; `[PCI-CENSUS] ... elapsed=6ms`). Like AHCI it is deliberately given NO GPACE class — a default-OFF knob would print `0ms(n=0)` on every shipped boot — so an armed run lands in GPACE `resid`, which already means "unattributed", and the row a reader adds up still closes on `span`. ORDER: HDA now runs after the GPU dispatch and the SDHC probe instead of before the xHCI scan; nothing in `hda::probe` reads xHCI or GPU state, and everything B127 listed as a prerequisite (heap, paging, `map_mmio_window`) is further up here than it was there. ⚠ LINE-NEUTRAL append, statement BEFORE the first `//` (LEDGER P7).
 
     // GPACE: the network block is `init_network()` precisely so its non-Intel early exit cannot

@@ -2816,6 +2816,7 @@ mod tests {
     /// half mixed with white).
     #[test]
     fn test_stacking_context_kat() {
+        // AETHERABSCB (SR431): the cyan box has no positioned ancestor, so its containing block is the ICB (top:100px, was top:0 under the old every-parent-is-a-containing-block rule).
         let t = laid_out(
             r#"<html><body>
             <div style="position:relative;height:100px">
@@ -2824,7 +2825,7 @@ mod tests {
               <div style="position:relative"><div style="position:absolute;left:100px;top:0;width:40px;height:40px;background:#0000ff;z-index:3"></div></div>
               <div style="position:absolute;left:120px;top:20px;width:40px;height:40px;background:#ffff00;z-index:2"></div>
             </div>
-            <div style="height:40px;width:100px;background:#ff00ff"><div style="position:absolute;z-index:-1;left:0;top:0;width:200px;height:40px;background:#00ffff"></div></div>
+            <div style="height:40px;width:100px;background:#ff00ff"><div style="position:absolute;z-index:-1;left:0;top:100px;width:200px;height:40px;background:#00ffff"></div></div>
             <div style="opacity:0.5;position:relative;height:60px"><div style="position:absolute;left:0;top:0;width:40px;height:40px;background:#ff0000"></div><div style="position:absolute;left:20px;top:20px;width:40px;height:40px;background:#0000ff"></div></div>
             </body></html>"#,
             "body{margin:0}",
@@ -3701,5 +3702,580 @@ mod tests {
         assert_eq!(js(&mut engine, "String(document.elementFromPoint(400, 300).id)"), "inner", "still hit at the same viewport point after the scroll");
         assert_eq!(js(&mut engine, "String(document.scrollingElement.scrollHeight)"), "3000", "the document's extent, without the fixed box");
         assert_eq!(js(&mut engine, "String(document.documentElement.clientHeight)"), "600", "the root's clientHeight is the viewport's");
+    }
+
+    /// AETHERSUBMITCAPTION (SR410): (ink pixels, ink x-centre, box x-centre) inside the control `id`'s box, inset
+    /// past a 2px UA border and its padding: a pixel is ink when any channel is darker than 160 (ButtonFace is
+    /// 239, the captions are dark).
+    fn caption_ink(engine: &mut crate::AetherEngine, id: &str) -> (usize, f32, f32) {
+        let r = |e: &mut crate::AetherEngine, k: &str| js_num(e, &format!("document.getElementById('{id}').getBoundingClientRect().{k}"));
+        let (l, t, w, h) = (r(engine, "left"), r(engine, "top"), r(engine, "width"), r(engine, "height"));
+        assert!(w > 14.0 && h > 6.0, "{id}: the control has a box ({w}x{h})");
+        let sw = engine.width as usize;
+        let s = engine.surface();
+        let (x0, x1) = ((l + 7.0).ceil() as usize, (l + w - 7.0).floor() as usize);
+        let (y0, y1) = ((t + 3.0).ceil() as usize, (t + h - 3.0).floor() as usize);
+        let (mut n, mut sx) = (0usize, 0f64);
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let i = (y * sw + x) * 4;
+                if s.get(i..i + 3).is_some_and(|p| p.iter().any(|&c| c < 160)) {
+                    n += 1;
+                    sx += x as f64;
+                }
+            }
+        }
+        let cx = if n > 0 { (sx / n as f64) as f32 } else { 0.0 };
+        (n, cx, (l + w / 2.0) as f32)
+    }
+
+    /// AETHERSUBMITCAPTION (SR410): a submit button paints its caption — the value, the default "Submit" when it
+    /// has none, and Google's home-page buttons (Peter's capture: `.lsb` 15px sans-serif inside `.lsbb`, the
+    /// sprite url left out) centred in their boxes.
+    #[test]
+    fn submit_caption_paints() {
+        let html = r#"<!doctype html><html><head><style>
+            .lsbb{background:#f3f5f6;border:solid 1px;border-color:#d2d2d2 #70757a #70757a #d2d2d2;height:30px}
+            .lsbb{display:block}
+            .lsb{color:#1f1f1f;border:none;cursor:pointer;height:30px;margin:0;outline:0;font:15px sans-serif;vertical-align:top}
+            .ds{display:inline-box;display:inline-block;margin:3px 0 4px;margin-left:4px}
+        </style></head><body><form action="/s">
+            <input type="submit" id="a" value="Go"> <input type="submit" id="b"><br>
+            <span class="ds"><span class="lsbb"><input class="lsb" id="c" value="Google Search" name="btnG" type="submit"></span></span><span class="ds"><span class="lsbb"><input class="lsb" id="d" value="I'm Feeling Lucky" name="btnI" type="submit"></span></span>
+        </form></body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 200));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        for id in ["a", "b", "c", "d"] {
+            let (n, cx, bx) = caption_ink(&mut engine, id);
+            assert!(n > 0, "{id}: the caption paints glyph ink inside the button");
+            if matches!(id, "c" | "d") {
+                assert!((cx - bx).abs() <= 3.0, "{id}: the caption is centred (ink centre {cx}, box centre {bx})");
+            }
+        }
+    }
+
+    /// AETHERSUBMITCAPTION (SR410): a `<button>`'s text child paints inside its box.
+    #[test]
+    fn button_text_paints() {
+        let html = r#"<html><body><button id="r">Run</button></body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 200));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        let (n, _, _) = caption_ink(&mut engine, "r");
+        assert!(n > 0, "the button's text paints glyph ink inside it");
+    }
+
+    /// AETHERFILECOLORPAINT (SR456): (the control `id`'s border box as (left, top, width, height), and the ink pixels
+    /// in its x band [left + `f0` * width, left + `f1` * width) clamped inside SR410's 7 px / 3 px inset), the same
+    /// darker-than-160 ink test as `caption_ink`.
+    fn band_ink(engine: &mut crate::AetherEngine, id: &str, f0: f64, f1: f64) -> usize {
+        let r = |e: &mut crate::AetherEngine, k: &str| js_num(e, &format!("document.getElementById('{id}').getBoundingClientRect().{k}"));
+        let (l, t, w, h) = (r(engine, "left"), r(engine, "top"), r(engine, "width"), r(engine, "height"));
+        assert!(w > 14.0 && h > 6.0, "{id}: the control has a box ({w}x{h})");
+        let sw = engine.width as usize;
+        let s = engine.surface();
+        let x0 = (l + (f0 * w).max(7.0)).ceil() as usize;
+        let x1 = (l + (f1 * w).min(w - 7.0)).floor() as usize;
+        let (y0, y1) = ((t + 3.0).ceil() as usize, (t + h - 3.0).floor() as usize);
+        let mut n = 0usize;
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let i = (y * sw + x) * 4;
+                if s.get(i..i + 3).is_some_and(|p| p.iter().any(|&c| c < 160)) {
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
+
+    /// AETHERFILECOLORPAINT (SR456): a file input paints its Choose-File button caption at its start and the "No file
+    /// chosen" status after it (Chromium's file control; layout_core `file_label`), with and without `multiple`; a
+    /// value attribute is never painted as text. Before, the box was an empty ButtonFace frame.
+    #[test]
+    fn file_caption_paints() {
+        let html = r#"<!doctype html><html><body>
+            <div><input type="file" id="f"></div>
+            <div><input type="file" id="m" multiple value="x.txt"></div>
+        </body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 200));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        for id in ["f", "m"] {
+            assert!(band_ink(&mut engine, id, 0.0, 0.3) > 0, "{id}: the button caption paints ink at the box's start");
+            assert!(band_ink(&mut engine, id, 0.4, 1.0) > 0, "{id}: the status text paints ink after the button");
+        }
+    }
+
+    /// AETHERFILEFACE (SR463): a file input paints ButtonFace and the 1px #767676 frame on its Choose-File button only
+    /// (Chromium: html.css gives the input no background and no border): the button's top-left corner is the frame
+    /// (square, the push rule; before, the input's kept corner), inside it the face, and the input's top-right, right of
+    /// the button, is the page background (before, the input's own frame over a whole-box face).
+    #[test]
+    fn file_face_on_button() {
+        let html = r#"<!doctype html><html><body><div><input type="file" id="f"></div></body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 200));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        let px = |e: &mut crate::AetherEngine, x: f64, y: f64| -> (u8, u8, u8) {
+            let i = (y as usize * e.width as usize + x as usize) * 4;
+            let s = e.surface();
+            (s[i + 2], s[i + 1], s[i])
+        };
+        let r = |e: &mut crate::AetherEngine, k: &str| js_num(e, &format!("document.getElementById('f').getBoundingClientRect().{k}"));
+        let (l, t, w, h) = (r(&mut engine, "left"), r(&mut engine, "top"), r(&mut engine, "width"), r(&mut engine, "height"));
+        assert!(l >= 2.0 && w > 40.0 && h > 14.0, "the file input has a box ({l},{t} {w}x{h})");
+        let (x0, y0) = (l.trunc(), t.trunc());
+        let bg = px(&mut engine, x0 - 2.0, y0);
+        assert_eq!(px(&mut engine, x0, y0), (118, 118, 118), "the button's top-left corner carries the frame colour");
+        assert_eq!(px(&mut engine, x0 + 2.0, y0 + 2.0), layout_core::BUTTON_FACE, "the button is filled with ButtonFace");
+        assert_eq!(px(&mut engine, (l + w).trunc() - 1.0, y0), bg, "right of the button the input paints no face and no frame");
+    }
+
+    /// AETHERFILECOLORPAINT (SR456): a color input paints its value as Chromium's swatch (layout_core `COLOR_SWATCH`: 5 px
+    /// / 6 px in from the border box, a 1 px #777777 frame round the fill): the attribute's colour, black with no
+    /// value, a script-set (dirty) value over the attribute; never the value as text.
+    #[test]
+    fn color_swatch_paints() {
+        let html = r##"<!doctype html><html><body>
+            <div><input type="color" id="r" value="#ff0000"></div>
+            <div><input type="color" id="k"></div>
+            <div><input type="color" id="g" value="#0000ff"></div>
+            <script>document.getElementById('g').value = '#00ff00';</script>
+        </body></html>"##;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 200));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        let px = |e: &mut crate::AetherEngine, x: f64, y: f64| -> (u8, u8, u8) {
+            let i = (y as usize * e.width as usize + x as usize) * 4;
+            let s = e.surface();
+            (s[i + 2], s[i + 1], s[i])
+        };
+        for (id, want) in [("r", (255, 0, 0)), ("k", (0, 0, 0)), ("g", (0, 255, 0))] {
+            let r = |e: &mut crate::AetherEngine, k: &str| js_num(e, &format!("document.getElementById('{id}').getBoundingClientRect().{k}"));
+            let (l, t, w, h) = (r(&mut engine, "left"), r(&mut engine, "top"), r(&mut engine, "width"), r(&mut engine, "height"));
+            assert!(w > 20.0 && h > 14.0, "{id}: the control has a box ({w}x{h})");
+            let (cx, cy) = ((l + w / 2.0).floor(), (t + h / 2.0).floor());
+            assert_eq!(px(&mut engine, cx, cy), want, "{id}: the swatch is filled with the value");
+            assert_eq!(px(&mut engine, cx + 6.0, cy), want, "{id}: the fill is solid, not a glyph");
+            assert_eq!(px(&mut engine, l.ceil() + 5.0, cy), (119, 119, 119), "{id}: the swatch's 1 px #777 frame, 5 px in");
+        }
+    }
+
+    /// AETHERSUBMITCAPTION (SR410): with no fontconfig configuration a Mac walks its CoreText font domains (a stock
+    /// macOS has no /etc/fonts, so the Linux directories found zero faces); every other OS keeps the four.
+    #[test]
+    fn font_dirs_cover_macos() {
+        let home = Some(PathBuf::from("/Users/p"));
+        let mac = crate::fonts::fontconfig::conventional_dirs(true, home.clone());
+        assert_eq!(mac, vec![PathBuf::from("/System/Library/Fonts"), PathBuf::from("/Library/Fonts"), PathBuf::from("/Users/p/Library/Fonts")]);
+        assert!(!mac.contains(&PathBuf::from("/usr/share/fonts")));
+        let other = crate::fonts::fontconfig::conventional_dirs(false, home);
+        assert_eq!(
+            other,
+            vec![
+                PathBuf::from("/usr/share/fonts"),
+                PathBuf::from("/usr/local/share/fonts"),
+                PathBuf::from("/Users/p/.local/share/fonts"),
+                PathBuf::from("/Users/p/.fonts"),
+            ]
+        );
+    }
+
+    /// AETHERRADIUSCALC (SR416): a `border-radius: calc(...)` is one radius (css-backgrounds-3 §5.1 with css-values-4
+    /// §10), so a 100x100 box rounds its corners by the calc's 20px: each corner pixel outside the radius shows the page
+    /// white, the centre and the top edge's middle the box's blue. Before, the calc was cut at its spaces and the whole
+    /// declaration dropped (four square corners).
+    #[test]
+    fn test_aetherradiuscalc_calc_radius_paints() {
+        let t = laid_out(
+            r#"<html><body><div style="width:100px;height:100px;background:#0000ff;border-radius:calc(10px + 10px)"></div></body></html>"#,
+            "body{margin:0}",
+        );
+        let (w, h) = (100u32, 100u32);
+        let mut surface = vec![0u8; (w * h * 4) as usize];
+        crate::render::render_frame(&t, &mut surface, w, h, 0.0, 0.0, &[(0, 0, w, h)]);
+        let px = |x: u32, y: u32| { let i = ((y * w + x) * 4) as usize; (surface[i + 2], surface[i + 1], surface[i]) };
+        for (x, y) in [(1, 1), (98, 1), (1, 98), (98, 98)] {
+            assert_eq!(px(x, y), (255, 255, 255), "corner ({x},{y}) lies outside the 20px calc radius");
+        }
+        assert_eq!(px(50, 50), (0, 0, 255), "the box's centre");
+        assert_eq!(px(50, 1), (0, 0, 255), "the top edge's middle is inside the rounded box");
+    }
+
+    /// AETHERCENTERLAYOUT (SR421): google.com's home form (an inline reduction of its markup: `<center>` > `<form>` >
+    /// the cellpadding=0 layout table with the 25% / `td align=center nowrap` search field and btnG / btnI submits /
+    /// 25% Advanced-search cells) sits centred under `<center>`, as Chrome's `-webkit-center` places it, not at the
+    /// left (Peter's Mac run: x 87-787); getComputedStyle names the UA value.
+    #[test]
+    fn center_form_table_centred() {
+        let html = r#"<!doctype html><html><head><style>
+            .lsbb{background:#f3f5f6;border:solid 1px;border-color:#d2d2d2 #70757a #70757a #d2d2d2;height:30px;display:block}
+            .lsb{color:#1f1f1f;border:none;height:30px;margin:0;outline:0;font:15px sans-serif;vertical-align:top}
+            .ds{display:inline-box;display:inline-block;margin:3px 0 4px;margin-left:4px}
+        </style></head><body><center id="c"><br clear="all"><div id="lga"><img alt="Google" height="92" width="272" style="padding:28px 0 14px"><br><br></div>
+            <form action="/search" name="f"><table id="t" cellpadding="0" cellspacing="0"><tr valign="top"><td width="25%">&nbsp;</td><td align="center" nowrap=""><div class="ds" style="height:32px;margin:4px 0"><input class="lst" style="margin:0;padding:5px 8px 0 6px;vertical-align:top;color:#000" autocomplete="off" value="" title="Google Search" maxlength="2048" name="q" size="57"></div><br style="line-height:0"><span class="ds"><span class="lsbb"><input class="lsb" value="Google Search" name="btnG" type="submit"></span></span><span class="ds"><span class="lsbb"><input class="lsb" value="I'm Feeling Lucky" name="btnI" type="submit"></span></span></td><td class="fl sblc" align="left" nowrap="" width="25%"><a href="/advanced_search?hl=en">Advanced search</a></td></tr></table></form></center></body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(1200, 800));
+        engine.load_html("https://www.google.com/", html, true);
+        engine.render_frame();
+        let r = |e: &mut crate::AetherEngine, k: &str| js_num(e, &format!("document.getElementById('t').getBoundingClientRect().{k}"));
+        let (left, width) = (r(&mut engine, "left"), r(&mut engine, "width"));
+        assert!(width > 0.0 && width < 1100.0, "the form table is narrower than the page ({width})");
+        assert!(left > 40.0, "the form table is not at the left edge (left {left})");
+        assert!((left + width / 2.0 - 600.0).abs() <= 2.0, "the form table is centred (left {left}, width {width})");
+        // AETHERCENTERCELL (SR436): the `td align=center` cell holds inline content only (the inline-block search field), which
+        // the cell rule leaves alone: the field stays centred in its cell.
+        let q = |e: &mut crate::AetherEngine, sel: &str| { let mut b = |k: &str| js_num(e, &format!("document.querySelector('{sel}').getBoundingClientRect().{k}")); (b("left"), b("width")) };
+        let ((cl, cw), (ql, qw)) = (q(&mut engine, "td[align=center]"), q(&mut engine, "input[name=q]"));
+        assert!(qw > 0.0 && (ql + qw / 2.0 - (cl + cw / 2.0)).abs() <= 2.0, "the search field is centred in its align=center cell (field {ql} + {qw}, cell {cl} + {cw})");
+        let ta = engine.js_engine.as_mut().unwrap().eval_string("getComputedStyle(document.getElementById('c')).textAlign").unwrap();
+        assert_eq!(ta, "-webkit-center", "<center>'s computed text-align is the UA's -webkit-center");
+    }
+
+    /// ABSSHRINK (LEDGER SR420): CSS 2.2 §10.3.7 — a `right: 8px` absolutely positioned pill with an auto width is
+    /// shrink-to-fit and paints inside the viewport's right edge (the builder's 100% placeholder laid it out as wide
+    /// as its containing block at x = -8, SR412's header pill).
+    #[test]
+    fn abs_right_pill_paints_inside_the_viewport() {
+        let html = r#"<html><body style="margin: 0"><div id="pill" style="position: absolute; top: 8px; right: 8px; padding: 2px 8px; background: #ff0000">Sign in</div></body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 200));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        let r = |e: &mut crate::AetherEngine, k: &str| js_num(e, &format!("document.getElementById('pill').getBoundingClientRect().{k}"));
+        let (l, t, w, h) = (r(&mut engine, "left"), r(&mut engine, "top"), r(&mut engine, "width"), r(&mut engine, "height"));
+        assert!(w > 16.0 && w < 160.0, "the pill shrinks to its text: w {w}");
+        assert!(l > 200.0 && l + w <= 400.0, "and sits inside the viewport's right edge: left {l} w {w}");
+        let sw = engine.width as usize;
+        let s = engine.surface();
+        let red = |x: usize, y: usize| s.get((y * sw + x) * 4..(y * sw + x) * 4 + 3).is_some_and(|p| p[0] < 40 && p[1] < 40 && p[2] > 215);
+        let (mx, my) = ((l + 2.0).ceil() as usize, (t + h / 2.0) as usize);
+        assert!(red(mx, my), "the pill's background paints inside it at ({mx}, {my})");
+        assert!(!(0..100).any(|x| red(x, my)), "and nothing red at the viewport's left (x < 100)");
+    }
+
+    /// AETHERHEADERBAND (SR412) M1 instrument, #[ignore]d: renders each headerband fixture at 1810x1280 through
+    /// the ordinary load + render_frame path and prints, per blue of the candidate family, the painted extent in the
+    /// top 400 rows, whether its four corner pixels are painted, the CSSOM owner at its centre (elementFromPoint), and
+    /// each candidate element's rect and computed style. `cargo test -p aether --lib header_band_measure -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn header_band_measure() {
+        let fixtures: [(&str, &str, &[&str]); 3] = [
+            ("google-home", include_str!("../tests/data/headerband/google-home.html"), &[]),
+            ("screenshot-facts", include_str!("../tests/data/headerband/screenshot-facts.html"), &["skip", "acct", "signin", "mngb", "gbar", "lga", "hplogo", "f", "ftab", "q"]),
+            ("fixed-nav", include_str!("../tests/data/headerband/fixed-nav.html"), &["nav", "first", "chipbox", "chip"]),
+        ];
+        let blues: [(&str, (u8, u8, u8)); 4] = [("#1a73e8", (0x1a, 0x73, 0xe8)), ("#4285f4", (0x42, 0x85, 0xf4)), ("#0b57d0", (0x0b, 0x57, 0xd0)), ("#c9d7f1", (0xc9, 0xd7, 0xf1))];
+        for (name, html, ids) in fixtures {
+            let mut engine = crate::AetherEngine::new();
+            engine.handle_event(crate::api::events::Event::Resize(1810, 1280));
+            engine.load_html("https://example.com/", html, true);
+            engine.render_frame();
+            let (w, h) = (engine.width, engine.height);
+            let surf = engine.surface().to_vec();
+            let px = |x: u32, y: u32| -> (u8, u8, u8) {
+                let i = ((y * w + x) * 4) as usize;
+                (surf[i + 2], surf[i + 1], surf[i])
+            };
+            println!("[headerband] fixture={} surface={}x{}", name, w, h);
+            for (label, c) in blues {
+                let (mut x0, mut y0, mut x1, mut y1, mut n) = (u32::MAX, u32::MAX, 0u32, 0u32, 0u32);
+                for y in 0..h.min(400) {
+                    for x in 0..w {
+                        if px(x, y) == c {
+                            x0 = x0.min(x);
+                            y0 = y0.min(y);
+                            x1 = x1.max(x);
+                            y1 = y1.max(y);
+                            n += 1;
+                        }
+                    }
+                }
+                if n == 0 {
+                    println!("[headerband] {} blue={} none", name, label);
+                    continue;
+                }
+                let corner = |x: u32, y: u32| if px(x, y) == c { 1 } else { 0 };
+                let (cx, cy) = ((x0 + x1) / 2, (y0 + y1) / 2);
+                let js = |e: &mut crate::AetherEngine, src: &str| e.js_engine.as_mut().unwrap().eval_string(src).unwrap_or_else(|err| format!("ERR {}", err));
+                let owner = js(&mut engine, &format!(
+                    "(function(){{var e=document.elementFromPoint({},{}),o=[];for(var i=0;e&&i<4;i++,e=e.parentElement){{var r=e.getBoundingClientRect(),s=getComputedStyle(e);\
+                     o.push(e.tagName+'#'+e.id+'.'+String(e.className).split(' ').join('.')+' rect='+r.left+','+r.top+','+r.width+'x'+r.height+' display='+s.display+' position='+s.position+\
+                     ' top='+s.top+' right='+s.right+' width='+s.width+' height='+s.height+' overflow='+s.overflow+' radius='+s.borderRadius+' bg='+s.backgroundColor);}}return o.join(' | ');}})()",
+                    cx, cy
+                ));
+                println!(
+                    "[headerband] {} blue={} box=x{}..{} y{}..{} px={} corners(tl,tr,br,bl)={},{},{},{} owner@{},{}={}",
+                    name, label, x0, x1, y0, y1, n, corner(x0, y0), corner(x1, y0), corner(x1, y1), corner(x0, y1), cx, cy, owner
+                );
+            }
+            // Any blue-dominant colour (the band's hex may be none of the four): the five most painted, with extents.
+            let mut hist: std::collections::HashMap<(u8, u8, u8), (u32, u32, u32, u32, u32)> = std::collections::HashMap::new();
+            for y in 0..h.min(400) {
+                for x in 0..w {
+                    let (r, g, b) = px(x, y);
+                    if b as i32 > r as i32 + 40 && b as i32 > g as i32 + 15 {
+                        let e = hist.entry((r, g, b)).or_insert((0, u32::MAX, u32::MAX, 0, 0));
+                        e.0 += 1;
+                        e.1 = e.1.min(x);
+                        e.2 = e.2.min(y);
+                        e.3 = e.3.max(x);
+                        e.4 = e.4.max(y);
+                    }
+                }
+            }
+            let mut top: Vec<_> = hist.into_iter().collect();
+            top.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
+            for ((r, g, b), (n, x0, y0, x1, y1)) in top.into_iter().take(5) {
+                println!("[headerband] {} blueish=#{:02x}{:02x}{:02x} px={} box=x{}..{} y{}..{}", name, r, g, b, n, x0, x1, y0, y1);
+            }
+            for id in ids {
+                let src = format!(
+                    "(function(){{var e=document.getElementById('{}');if(!e)return 'missing';var r=e.getBoundingClientRect();var s=getComputedStyle(e);\
+                     return 'rect='+r.left+','+r.top+','+r.width+'x'+r.height+' display='+s.display+' position='+s.position+' top='+s.top+' left='+s.left+' right='+s.right+\
+                     ' width='+s.width+' height='+s.height+' overflow='+s.overflow+' radius='+s.borderRadius+' margin-top='+s.marginTop+' bg='+s.backgroundColor;}})()",
+                    id
+                );
+                let out = engine.js_engine.as_mut().unwrap().eval_string(&src).unwrap_or_else(|err| format!("ERR {}", err));
+                println!("[headerband] {} #{} {}", name, id, out);
+            }
+            let rects = engine.js_engine.as_mut().unwrap().eval_string(
+                "(function(){var b=document.body.getBoundingClientRect(),h=document.documentElement.getBoundingClientRect();return 'body='+b.left+','+b.top+','+b.width+'x'+b.height+' html='+h.left+','+h.top+','+h.width+'x'+h.height;})()",
+            ).unwrap_or_else(|err| format!("ERR {}", err));
+            println!("[headerband] {} {}", name, rects);
+        }
+    }
+
+    // ---- AETHERHEADERBAND (SR412): header_band_paints_in_its_box ----
+    /// The Mac's empty font database, in-process: no face for any selection (text_host's process-global DB is never
+    /// touched). Only the four required `layout_core::Fonts` methods; the rest are the trait's defaults.
+    struct HeaderBandNoFaces;
+    impl layout_core::Fonts for HeaderBandNoFaces {
+        fn has_face(&self, _sel: layout_core::FontSel) -> bool {
+            false
+        }
+        fn measure(&self, _run: &str, _adv: &layout_core::Adv) -> f32 {
+            0.0
+        }
+        fn line_metrics(&self, _sel: layout_core::FontSel, size: f32) -> (f32, f32, f32) {
+            (size * 0.8, size * 0.2, 0.0)
+        }
+        fn x_height(&self, _sel: layout_core::FontSel, size: f32) -> f32 {
+            size * 0.5
+        }
+    }
+
+    /// The `#pill` box of a laid tree: (x, y, w, h) through `layout_core::scroll::box_origin` and the taffy size.
+    fn header_band_pill_box(tree: &crate::layout::LayoutTree) -> (f32, f32, f32, f32) {
+        let mut work = vec![tree.root_node];
+        while let Some(t) = work.pop() {
+            let is_pill = tree.node_map.get(&t).and_then(|n| n.as_element().map(|e| e.attributes.borrow().get("id").map(|v| v == "pill").unwrap_or(false))).unwrap_or(false);
+            if is_pill {
+                let (x, y) = layout_core::scroll::box_origin(tree, t, (0.0, 0.0)).expect("the pill has a box");
+                let sz = tree.taffy.layout(t).unwrap().size;
+                return (x, y, sz.width, sz.height);
+            }
+            work.extend(tree.taffy.children(t).unwrap_or_default());
+        }
+        panic!("no #pill box");
+    }
+
+    /// The pill's painted extent equals its layout box, and all four corner radii are applied. `surf` is BGRA.
+    fn header_band_check(what: &str, surf: &[u8], w: u32, h: u32, b: (f32, f32, f32, f32)) {
+        let blue = |x: u32, y: u32| {
+            let i = ((y * w + x) * 4) as usize;
+            (surf[i + 2], surf[i + 1], surf[i]) == (0x0b, 0x57, 0xd0)
+        };
+        let (bx, by, bw, bh) = b;
+        assert!(bx >= 0.0 && bx + bw <= w as f32 && by >= 0.0, "{what}: the pill's box {b:?} lies inside the {w}px viewport");
+        let (mut x0, mut y0, mut x1, mut y1) = (u32::MAX, u32::MAX, 0u32, 0u32);
+        for y in 0..h.min(200) {
+            for x in 0..w {
+                if blue(x, y) {
+                    x0 = x0.min(x);
+                    y0 = y0.min(y);
+                    x1 = x1.max(x);
+                    y1 = y1.max(y);
+                }
+            }
+        }
+        assert!(x0 != u32::MAX, "{what}: the pill paints");
+        let near = |a: u32, e: f32| (a as f32 - e).abs() <= 1.0;
+        assert!(
+            near(x0, bx) && near(x1 + 1, bx + bw) && near(y0, by) && near(y1 + 1, by + bh),
+            "{what}: painted x{x0}..{x1} y{y0}..{y1} equals the layout box {b:?}"
+        );
+        let (l, t, r, btm) = (bx.round() as u32, by.round() as u32, (bx + bw).round() as u32 - 1, (by + bh).round() as u32 - 1);
+        for (cx, cy) in [(l, t), (r, t), (r, btm), (l, btm)] {
+            assert!(!blue(cx, cy), "{what}: corner ({cx},{cy}) is outside its radius");
+        }
+        let (mx, my) = ((l + r) / 2, (t + btm) / 2);
+        for (ex, ey) in [(mx, t + 1), (r - 2, my), (mx, btm - 1), (l + 2, my)] {
+            assert!(blue(ex, ey), "{what}: edge midpoint ({ex},{ey}) is painted");
+        }
+    }
+
+    /// AETHERHEADERBAND (SR412): Peter's Mac (zero font faces) painted google.com's Sign-in pill as a band across the
+    /// top, clipped at y=0 and rounded only at its right end: `measure_text_run` gave a faceless run the whole
+    /// available width (the max-content probe's 1810 per run) while the IFC lays and the painter draws it at 0. The
+    /// reduced case is google's header row; laid with no faces the pill is its padding (46 px) inside the viewport,
+    /// painted in its box with four rounded corners; the real fonts are the control.
+    #[test]
+    fn header_band_paints_in_its_box() {
+        let html = r##"<html><head><style>
+            body { margin: 0; font-family: arial, sans-serif; font-size: 16px }
+            #row { display: flex; justify-content: flex-end; align-items: center; height: 48px; padding: 6px }
+            #row a { color: #000; padding: 0 8px; text-decoration: none }
+            #row #pill { background: #0b57d0; color: #fff; border-radius: 100px; padding: 9px 23px }
+        </style></head><body><div id="row"><a href="#">Gmail</a> <a href="#">Images</a> <a id="pill" href="#">Sign in</a></div></body></html>"##;
+        let (vw, vh) = (1810u32, 1280u32);
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(vw, vh));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        // Control: the real fonts.
+        let real = header_band_pill_box(engine.layout_tree.as_ref().expect("laid out"));
+        header_band_check("real fonts", engine.surface(), vw, vh, real);
+        // The Mac's condition: the same document laid with no faces and painted.
+        let doc = engine.document.clone().expect("a document");
+        let mut tree = crate::layout::build_tree(&doc, vw as f32, vh as f32);
+        crate::css::apply_stylesheets(&mut tree, &engine.stylesheets); // the page's cascade, as the nested-frame paint does
+        layout_core::remeasure(&mut tree, &HeaderBandNoFaces);
+        let b = header_band_pill_box(&tree);
+        assert!((b.2 - 46.0).abs() < 0.5, "no faces: the pill is its padding, 46 px wide, not the available width (got {b:?})");
+        let mut buf = vec![255u8; (vw * vh * 4) as usize];
+        crate::render::render_frame(&tree, &mut buf, vw, vh, 0.0, 0.0, &[(0, 0, vw, vh)]);
+        header_band_check("no faces", &buf, vw, vh, b);
+    }
+
+    /// AETHERCSSSPLITAUDIT (SR426): `background: rgb(0 0 0 / 50%)` is one colour layer at half alpha — the slash
+    /// inside the function is not the shorthand's position / size separator — so a 100x100 box over the white page
+    /// paints mid grey, and its paint entry carries no bogus position ("0 0") or size ("50%)").
+    #[test]
+    fn test_aethercsssplitaudit_slash_alpha_background_paints() {
+        let t = laid_out(
+            r#"<html><body><div id="h" style="width:100px;height:100px;background:rgb(0 0 0 / 50%)"></div></body></html>"#,
+            "body{margin:0}",
+        );
+        let p = t
+            .node_map
+            .iter()
+            .find_map(|(id, n)| {
+                let el = n.as_element()?;
+                (el.attributes.borrow().get("id") == Some("h")).then(|| t.paint_map.get(id))?
+            })
+            .expect("the box has a paint entry");
+        assert_eq!(p.bg_position, None, "no position from the colour's inner slash");
+        assert_eq!(p.bg_size, None, "no size from the colour's inner slash");
+        let (w, h) = (100u32, 100u32);
+        let mut surface = vec![0u8; (w * h * 4) as usize];
+        crate::render::render_frame(&t, &mut surface, w, h, 0.0, 0.0, &[(0, 0, w, h)]);
+        let i = ((50 * w + 50) * 4) as usize;
+        for c in [surface[i], surface[i + 1], surface[i + 2]] {
+            assert!((126..=129).contains(&c), "half-alpha black over white is mid grey, got {c}");
+        }
+    }
+
+    // ---- AETHERABSCB (SR431): abs_cb_pill_and_icb_probe ----
+    /// CSS 2.2 §10.1.4 on the SR412 fixtures at 1810x1280: google-home's Sign-in pill (a static inline-block in a
+    /// `float: right` row under `#gb { position: relative }`, no absolute box above it) keeps SR412's with-fonts
+    /// place, right edge 1783 (the float's edge, font-independent); screenshot-facts' `#acct` (`position: absolute;
+    /// top: 6px; right: 8px` under a static `#mngb`) sits against the initial containing block, right 1802, top 6.
+    #[test]
+    fn abs_cb_pill_and_icb_probe() {
+        let rect = |html: &str, sel: &str| -> (f64, f64) {
+            let mut engine = crate::AetherEngine::new();
+            engine.handle_event(crate::api::events::Event::Resize(1810, 1280));
+            engine.load_html("https://example.com/", html, true);
+            engine.render_frame();
+            let src = format!("(function(){{var r=document.querySelector('{}').getBoundingClientRect();return r.right+','+r.top;}})()", sel);
+            let out = engine.js_engine.as_mut().unwrap().eval_string(&src).unwrap_or_else(|e| format!("ERR {}", e));
+            let mut it = out.split(',').map(|v| v.trim().parse::<f64>().unwrap_or(f64::NAN));
+            (it.next().unwrap_or(f64::NAN), it.next().unwrap_or(f64::NAN))
+        };
+        let (right, _) = rect(include_str!("../tests/data/headerband/google-home.html"), "a.gb_6a");
+        assert!((right - 1783.0).abs() <= 1.5, "google-home's Sign-in pill keeps SR412's right edge 1783: got {right}");
+        let (right, top) = rect(include_str!("../tests/data/headerband/screenshot-facts.html"), "#acct");
+        assert!((right - 1802.0).abs() <= 0.5 && (top - 6.0).abs() <= 0.5, "#acct against the initial containing block at right 1802 top 6: got {right}, {top}");
+    }
+
+    /// AETHERPUSHTRIM (SR440): a push button's padded / mixed-case type (`type=" Submit "`) is the same push button as
+    /// its plain twin: layout_core's ONE `is_push_type` (trimmed, as `control_intrinsic` sized it) drives the host
+    /// paint's push arm, so the padded box is as wide as the twin's and paints the same centred caption ink (before,
+    /// the untrimmed host predicate painted it as a text field: a left-aligned value, and nothing for a reset button
+    /// without one).
+    #[test]
+    fn push_trim_caption_paints() {
+        assert!(layout_core::is_push_type(" SUBMIT ") && layout_core::is_push_type("reset") && layout_core::is_push_type("\tButton\n"));
+        assert!(!layout_core::is_push_type(" image ") && !layout_core::is_push_type("text") && !layout_core::is_push_type(""));
+        let html = r#"<!doctype html><html><body>
+            <input type=" Submit " id="ps" value="Go"><br><input type="submit" id="ts" value="Go"><br>
+            <input type=" reset " id="pr"><br><input type="reset" id="tr">
+        </body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 200));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        for (padded, twin) in [("ps", "ts"), ("pr", "tr")] {
+            let w = |e: &mut crate::AetherEngine, id: &str| js_num(e, &format!("document.getElementById('{id}').getBoundingClientRect().width"));
+            let (pw, tw) = (w(&mut engine, padded), w(&mut engine, twin));
+            assert!((pw - tw).abs() <= 0.5, "{padded}: the padded type sizes as its twin ({pw} vs {tw})");
+            let (pn, pcx, pbx) = caption_ink(&mut engine, padded);
+            let (tn, tcx, tbx) = caption_ink(&mut engine, twin);
+            assert!(pn > 0 && tn > 0, "{padded}: both paint caption ink ({pn}, {tn})");
+            assert!((pn as f64 - tn as f64).abs() <= 0.15 * tn as f64 && ((pcx - pbx) - (tcx - tbx)).abs() <= 1.0, "{padded}: the padded type paints its twin's caption (ink {pn} vs {tn}, offset {} vs {})", pcx - pbx, tcx - tbx);
+        }
+    }
+
+    /// AETHERIMAGEINPUTFETCH (SR461): an `<input type=image>` rides the img path (layout_core's ONE `is_image_input`): its
+    /// data: src is looked up and blitted as an img's, its box is the decoded size, or its width / height attributes
+    /// (the bitmap scaled into it, no value text over it); with no image it paints its AltText (`image_alt_label`).
+    #[test]
+    fn image_input_paints_src() {
+        use base64::Engine as _;
+        let blue = image::RgbaImage::from_pixel(8, 8, image::Rgba([0, 0, 255, 255]));
+        let mut png = std::io::Cursor::new(Vec::new());
+        blue.write_to(&mut png, image::ImageFormat::Png).unwrap();
+        let src = format!("data:image/png;base64,{}", base64::engine::general_purpose::STANDARD.encode(png.get_ref()));
+        let html = format!(
+            r#"<!doctype html><html><body>
+            <div><input type="image" id="n" src="{src}"></div>
+            <div><input type="image" id="s" width="40" height="30" value="Go" src="{src}"></div>
+            <div><input type="image" id="a" alt="Search the web"></div>
+        </body></html>"#
+        );
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 200));
+        engine.load_html("https://example.com/", &html, true);
+        engine.render_frame();
+        let rect = |e: &mut crate::AetherEngine, id: &str| -> (f64, f64, f64, f64) {
+            let r = |e: &mut crate::AetherEngine, k: &str| js_num(e, &format!("document.getElementById('{id}').getBoundingClientRect().{k}"));
+            (r(e, "left"), r(e, "top"), r(e, "width"), r(e, "height"))
+        };
+        let px = |e: &mut crate::AetherEngine, x: usize, y: usize| -> (u8, u8, u8) {
+            let i = (y * e.width as usize + x) * 4;
+            let s = e.surface();
+            (s[i + 2], s[i + 1], s[i])
+        };
+        let (l, t, w, h) = rect(&mut engine, "n");
+        assert!((w - 8.0).abs() <= 0.5 && (h - 8.0).abs() <= 0.5, "n: the box is the decoded 8 x 8 ({w}x{h})");
+        assert_eq!(px(&mut engine, (l + 4.0) as usize, (t + 4.0) as usize), (0, 0, 255), "n: the bitmap paints");
+        let (l, t, w, h) = rect(&mut engine, "s");
+        assert!((w - 40.0).abs() <= 0.5 && (h - 30.0).abs() <= 0.5, "s: width / height attributes size the box ({w}x{h})");
+        for y in (t.ceil() as usize)..((t + h).floor() as usize) {
+            for x in (l.ceil() as usize)..((l + w).floor() as usize) {
+                assert_eq!(px(&mut engine, x, y), (0, 0, 255), "s: every box pixel is the scaled bitmap, no value text ({x},{y})");
+            }
+        }
+        let (n, _, _) = caption_ink(&mut engine, "a");
+        assert!(n > 0, "a: an image input with no image paints its alt text");
     }
 }

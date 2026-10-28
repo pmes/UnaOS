@@ -116,7 +116,7 @@ const KFONT_FACES: &[(&str, &str)] = &[
     ("NotoSansHebrew-Regular.ttf", "noto"),
     ("NotoSansDevanagari-Regular.ttf", "noto"),
     ("NotoSansThai-Regular.ttf", "noto"),
-    ("NotoSansCJK-Regular.ttc", "noto"), // GLYPHS (B676): the CJK face; staged when the bench has fonts-noto-cjk (search dir below), else reported absent
+    ("NotoSansCJK-Regular.ttc", "noto-cjk"), // GLYPHS (B676): the CJK face; staged when the bench has fonts-noto-cjk (search dir below), else reported absent
 ];
 const KFONT_DIRS: &[&str] = &[
     "/usr/share/fonts/truetype/dejavu",
@@ -159,10 +159,11 @@ fn stage_welcome(workspace_dir: &std::path::Path, volume: &std::path::Path) -> b
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::copy(&src, dir.join("welcome.html")).unwrap();
     // AETHERMETAL M3 (SR96): every page under doc/ rides too — the click's target (keys.html) must be on the volume.
+    // PDF4KERNEL (rmbp-ledger B999): and its PDFs — `tests aether` types /system/doc/fixture.pdf into the omnibox.
     if let Ok(rd) = std::fs::read_dir(src.parent().unwrap()) {
         for e in rd.flatten() {
             let p = e.path();
-            if p.extension().is_some_and(|x| x == "html") && p.file_name().is_some_and(|n| n != "welcome.html") {
+            if p.extension().is_some_and(|x| x == "html" || x == "pdf") && p.file_name().is_some_and(|n| n != "welcome.html") {
                 let _ = std::fs::copy(&p, dir.join(p.file_name().unwrap()));
             }
         }
@@ -341,7 +342,6 @@ fn main() {
     let mut kernel_cmd = Command::new("cargo");
     kernel_cmd
         .current_dir(workspace_dir.join("crates/kernel"))
-        .arg("+nightly")
         .arg("build")
         .arg("--release")
         .arg("--target").arg("../../x86_64-unaos.json")
@@ -633,6 +633,9 @@ fn main() {
     // AHCIROOT (rmbp-ledger B332): the SSD UnaFS root + the kernel-held SATA write grant. Implies ahci-write,
     // unafs, installdemo in Cargo.toml. Kept in sync with arroyo's mapping and crates/kernel/Cargo.toml.
     if std::env::var("UNAOS_AHCIROOT").is_ok() { feats.push("ahciroot"); }
+    // NVME (zenbook-ledger Z2): UNAOS_NVME=1 arms drivers/nvme.rs (polled NVMe, `tests nvme`). x86 only. Default OFF => module
+    // unlinked, media byte-identical. Kept in sync with arroyo's mapping and crates/kernel/Cargo.toml.
+    if std::env::var("UNAOS_NVME").is_ok() { feats.push("nvme"); }
     // SELFINSTALL M3 (SH-3): UNAOS_ROOT_PREFER=ahci|sdhc picks the bootdisk root when both the card and the SSD carry
     // UnaOS (cargo features root-prefer-ahci / root-prefer-sdhc). Default OFF => first-found. Kept in sync with arroyo.
     match std::env::var("UNAOS_ROOT_PREFER").as_deref() {
@@ -802,6 +805,9 @@ fn main() {
     // its nearest deadline and halts; busy cores, core 0 while it is the clock, and the HID pump core keep the 1 kHz tick.
     // THIS list is what reaches the media kernel, so arroyo's mapping alone would ship it disabled. Kept in sync.
     if std::env::var("UNAOS_TICKLESS").is_ok() { feats.push("tickless"); }
+    // LOCKREGXCORECOSTKNOB (rmbp-ledger B1075): UNAOS_LOCKREG_CENSUS=1 arms the lock registry's cross-core walk census (B1062,
+    // `[lockreg] xcore walks= … avg_cyc=` in `tests lockreg`); off, the census reads no TSC. THIS list reaches the media kernel. Kept in sync.
+    if std::env::var("UNAOS_LOCKREG_CENSUS").is_ok() { feats.push("lockreg_census"); }
     // BT-DIR: UNAOS_BTDIR=1 arms THE DIRECTION TEST — after the outbound page stage has printed its
     // tally, write HCI_Write_Scan_Enable (0x0C1A) = 0x03 so the peer can page THIS host, hold one
     // 6400 ms page window, report whether a Connection Request (event 0x04) arrived, then write
@@ -913,6 +919,7 @@ fn main() {
     // module; DEFAULT OFF => module + call site unlinked => byte-identical media. Needs
     // UNAOS_KEPLER + UNAOS_KEPLER_TAKEOVER to reach its seam. Kept in sync with arroyo's mapping.
     if std::env::var("UNAOS_WC").is_ok() { feats.push("wc"); }
+    if std::env::var("UNAOS_DISPLAY_ICC").is_ok() { feats.push("dicc"); } // KERNEL-DISPLAY-ICC (LEDGER SR372): the display transform at the scanout copy. Kept in sync with arroyo's mapping.
     // PHASE31ROOT: UNAOS_BAR1EXP=<mode> selects a BAR1-wedge experiment arm
     // (docs/dev/OS/08_VIDEO/phase31-root.md). One mode exists: `uc` -> `bar1exp-uc`, retyping the
     // panel-aperture leaves UC (PAT PA3) instead of WC at `set_framebuffer_wc`. Memory TYPE only.
@@ -1223,7 +1230,6 @@ fn main() {
     let mut bootloader_cmd = Command::new("cargo");
     bootloader_cmd
         .current_dir(workspace_dir.join("crates/bootloader"))
-        .arg("+nightly")
         .arg("build")
         .arg("--release")
         .arg("--target").arg("x86_64-unknown-uefi")
@@ -1586,7 +1592,7 @@ fn main() {
     let _ = stage_fonts(&kfont_dirs_env(), &esp_dir);
     // QEMUSKIP (B613, B600): the test-f fixtures on the QEMU root too (the ESP directory IS the root under
     // `fat:rw:`), the way metal gets them on the card's UnaFS /system.
-    let _ = stage_testf(&workspace_dir.join("builder/testf.list"), &target_dir.join("testf-cache"), &esp_dir);
+    let _ = stage_testf(&workspace_dir.join("builder/testf.list"), &target_dir.join("testf-cache"), &esp_dir); stage_bootlist_carry(&esp_dir); // ZENBOOKLANELIST (zenbook-ledger Z19): UNAOS_BOOTLIST_STAGE, a QEMU lane's boot list (file tail)
 
     // -----------------------------------------------------------------------------------------
     // WINX-7 PKG — the DATA tree: the EL0 artifacts staged for the volume the RUNNING KERNEL reads.
@@ -2217,6 +2223,36 @@ fn main() {
         cmd.arg("-drive").arg(format!("if=none,id=sata0,format=raw,file={}", attach.display()))
            .arg("-device").arg("ide-hd,drive=sata0,bus=ide.1");
         println!("   UNAOS_AHCI_DISK: second SATA disk on ide.1 ({}) — AHCI driver target (ESP keeps ide.0 and bootindex=0)", attach.display());
+    }
+    // NVME (zenbook-ledger Z2) fixture: UNAOS_NVME=1 attaches ONE NVMe controller (`-device nvme`, QEMU's default model
+    // "QEMU NVMe Ctrl" — the only model `tests nvme`'s write leg writes on) backed by a FRESH image, target/nvmefixture.img:
+    // a copy of UNAOS_NVME_DISK=<path> when set, else 64 MiB of zeros. Always a fresh copy, never the operator's file —
+    // the AHCIWRITE rule: the guest writes (and restores) 8 scratch blocks. No bootindex: OVMF keeps booting the ESP.
+    // UNSET => not one argument is added.
+    if std::env::var("UNAOS_NVME").is_ok() {
+        let dst = target_dir.join("nvmefixture.img");
+        match std::env::var("UNAOS_NVME_DISK") {
+            Ok(src) => {
+                let src = {
+                    let p = std::path::PathBuf::from(&src);
+                    if p.is_relative() { workspace_dir.join(p) } else { p }
+                };
+                if !src.exists() {
+                    panic!("UNAOS_NVME_DISK set but {} is missing", src.display());
+                }
+                std::fs::copy(&src, &dst).unwrap();
+            }
+            Err(_) => {
+                let f = std::fs::File::create(&dst).unwrap();
+                f.set_len(64 * 1024 * 1024).unwrap();
+            }
+        }
+        // NVME4KN (zenbook-ledger Z31): UNAOS_NVME_4K=1 gives the namespace 4096-byte logical blocks (a 4Kn drive), the
+        // `[nvme] test ... lba=4096 shift=12` leg; unset => the 512-byte namespace, not one argument changes.
+        let nvme4k = std::env::var("UNAOS_NVME_4K").is_ok();
+        cmd.arg("-drive").arg(format!("if=none,id=nvme0,format=raw,file={}", dst.display()))
+           .arg("-device").arg(if nvme4k { "nvme,drive=nvme0,serial=una,logical_block_size=4096,physical_block_size=4096" } else { "nvme,drive=nvme0,serial=una" });
+        println!("   UNAOS_NVME: NVMe controller (serial=una, lba={}) on a fresh {} — NVMe driver target (ESP keeps bootindex=0)", if nvme4k { 4096 } else { 512 }, dst.display());
     }
     // EHCI-3 harness: by default (EHCI-4 M1 driver on) the keyboard rides the EHCI bus (QEMU's usb-kbd is
     // HS-capable, so it trains directly on the EHCI root port — Topology B). It REPLACES the
@@ -3085,4 +3121,33 @@ mod kelfhash_tests {
         assert_eq!(kelfsha::record(Some(&legacy), None), Some(legacy.as_slice()));
         println!("KELFHASH builder: row={} ok=1 torn=mismatch same_kelf=stale other=stale legacy=kelf -> PASS", text.trim_end());
     }
+}
+
+// ZENBOOKLANELIST (zenbook-ledger Z19): UNAOS_BOOTLIST_STAGE=<dir> — a QEMU lane's boot list onto the ESP this run re-created
+// (the wipe above). arroyo's ONE stager (`bootlist_stage`) fills <dir>; this carries every regular file in it onto the ESP
+// root by its own name, so the kernel reads /boot/TESTS.LIST under `fat:rw:`. It knows no file name and filters nothing
+// (the kernel's `bootlist::parse` filters by `@<board>`). Unset: it returns at its first statement — no read, no print.
+fn stage_bootlist_carry(esp_dir: &std::path::Path) {
+    let Ok(dir) = std::env::var("UNAOS_BOOTLIST_STAGE") else { return };
+    let rd = match std::fs::read_dir(&dir) {
+        Ok(rd) => rd,
+        Err(e) => {
+            println!("   BOOTLIST CARRY (Z19): UNAOS_BOOTLIST_STAGE={} unreadable ({}) — nothing carried", dir, e);
+            return;
+        }
+    };
+    let mut names: Vec<String> = Vec::new();
+    for ent in rd.flatten() {
+        let src = ent.path();
+        if !src.is_file() {
+            continue;
+        }
+        let Some(name) = src.file_name() else { continue };
+        match std::fs::copy(&src, esp_dir.join(name)) {
+            Ok(_) => names.push(name.to_string_lossy().into_owned()),
+            Err(e) => println!("   BOOTLIST CARRY (Z19): {} not carried ({})", src.display(), e),
+        }
+    }
+    names.sort();
+    println!("   BOOTLIST CARRY (Z19): UNAOS_BOOTLIST_STAGE={} -> [{}] onto the ESP root", dir, names.join(" "));
 }

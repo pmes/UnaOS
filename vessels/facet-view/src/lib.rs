@@ -12,7 +12,8 @@
 //! Shortcuts (see [`SHORTCUTS`]): view — `+`/`=` zoom in, `-` zoom out, `0` fit, `1` 100 %,
 //! `r`/`R` turn the view clockwise/counter-clockwise, `h`/`v` flip the view, arrows pan; edits —
 //! `]`/`[` rotate the picture, `m` mirror it, `x` crop to what is visible, `b`/`B` darker/brighter,
-//! `c`/`C` less/more contrast, `u`/`U` undo/redo, `!` reset, `e` export PNG beside the file.
+//! `c`/`C` less/more contrast, `u`/`U` undo/redo, `!` reset, `e` export PNG beside the file, Cmd/Ctrl+Shift+S save
+//! as (SAVEDIALOG, SR364: the window's platform save panel — `SavePanel` out, `SavePanelChose` back — then Facet's export).
 
 use bandy::signals::{FacetCommand, FacetEdit, FacetFormat, FacetImageInfo, FacetView, FacetZoom};
 use bandy::{Origin, SMessage};
@@ -40,6 +41,7 @@ pub const SHORTCUTS: &[(&str, &str)] = &[
     ("u / U", "undo / redo"),
     ("!", "reset every edit (undoable)"),
     ("e", "export the edited picture as <name>.facet.png beside it"),
+    ("Cmd/Ctrl+Shift+S", "save the edited picture as… (the platform save panel)"),
 ];
 
 /// Receipts the vessel stamps: `'V'` in the top byte, a counter below.
@@ -60,6 +62,8 @@ pub struct Viewer {
     pub last_error: Option<String>,
     /// The last export written.
     pub exported: Option<String>,
+    /// SAVEDIALOG (SR364): the `SavePanel` a Save As staged, for the controller loop to fire (`take_panel`).
+    panel: Option<SMessage>,
 }
 
 impl Viewer {
@@ -75,6 +79,7 @@ impl Viewer {
             want_frame: None,
             last_error: None,
             exported: None,
+            panel: None,
         }
     }
 
@@ -208,12 +213,15 @@ impl Viewer {
             "U" => return self.edit(FacetEdit::Redo),
             "!" => return self.edit(FacetEdit::Reset),
             "e" => {
-                let Some(handle) = self.handle else { return Vec::new() };
-                let receipt_id = self.receipt();
-                let p = std::path::Path::new(&self.path);
-                let stem = p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "image".into());
-                let out = p.with_file_name(format!("{stem}.facet.png")).to_string_lossy().into_owned();
-                return vec![FacetCommand::ImageExport { receipt_id, handle, path: out, format: FacetFormat::Png, overwrite: true }];
+                let out = std::path::Path::new(&self.path).with_file_name(self.export_name()).to_string_lossy().into_owned();
+                return self.export_to(out);
+            }
+            // SAVEDIALOG (SR364): Save As: the window's save panel asks the path (seeded with the `e` export's name).
+            "Meta+Shift+s" | "Ctrl+Shift+S" | "Ctrl+Shift+s" => {
+                if self.handle.is_some() {
+                    self.panel = Some(SMessage::SavePanel { url: SURFACE.into(), name: self.export_name(), folder: None });
+                }
+                return Vec::new();
             }
             _ => return Vec::new(),
         }
@@ -252,7 +260,7 @@ impl Viewer {
                 (self.render(), None)
             }
             FacetCommand::ImageRendered { receipt_id, width, height, rgba, .. } if self.want_frame == Some(*receipt_id) => {
-                let blit = SMessage::SurfaceBlit { url: SURFACE.into(), width: *width, height: *height, pixels: rgba.clone() };
+                let blit = SMessage::SurfaceBlit { url: SURFACE.into(), width: *width, height: *height, pixels: rgba.clone(), damage: None, scroll: None };
                 (Vec::new(), Some(blit))
             }
             FacetCommand::ImageExported { path, .. } => {
@@ -272,8 +280,10 @@ impl Viewer {
         match msg {
             SMessage::BrowserText(t) => t.chars().flat_map(|c| self.key(&c.to_string())).collect(),
             SMessage::BrowserKey(k) => self.key(k),
-            SMessage::BrowserScroll(_, dy) => self.scroll(*dy),
-            SMessage::BrowserResize(w, h) => self.resize(*w, *h),
+            SMessage::BrowserScroll(_, dy, _) => self.scroll(*dy),
+            SMessage::BrowserResize(w, h, _) => self.resize(*w, *h),
+            // SAVEDIALOG (SR364): the panel's chosen path: Facet exports there (a replace the panel confirmed); a cancel does nothing.
+            SMessage::SavePanelChose { url, path: Some(p) } if url == SURFACE => self.export_to(p.clone()),
             _ => Vec::new(),
         }
     }
@@ -285,5 +295,23 @@ impl Viewer {
             Some(i) => format!("{name} — {}x{} {} — {:.0} %", i.width, i.height, i.format, self.scale() * 100.0),
             None => format!("{name} — facet"),
         }
+    }
+
+    /// SAVEDIALOG (SR364): the `SavePanel` a Save As staged, once.
+    pub fn take_panel(&mut self) -> Option<SMessage> {
+        self.panel.take()
+    }
+
+    /// `<stem>.facet.png`: the `e` export's name, and the save panel's seed.
+    fn export_name(&self) -> String {
+        let stem = std::path::Path::new(&self.path).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "image".into());
+        format!("{stem}.facet.png")
+    }
+
+    /// Facet's PNG export of the edited picture to `path` (replacing a file there).
+    fn export_to(&mut self, path: String) -> Vec<FacetCommand> {
+        let Some(handle) = self.handle else { return Vec::new() };
+        let receipt_id = self.receipt();
+        vec![FacetCommand::ImageExport { receipt_id, handle, path, format: FacetFormat::Png, overwrite: true }]
     }
 }

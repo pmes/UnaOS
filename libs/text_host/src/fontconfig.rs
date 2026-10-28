@@ -279,12 +279,7 @@ impl Config {
         let mut c = Config::default();
         c.read_file(&file, 0);
         if c.dirs.is_empty() {
-            c.dirs.push(PathBuf::from("/usr/share/fonts"));
-            c.dirs.push(PathBuf::from("/usr/local/share/fonts"));
-            if let Some(h) = home() {
-                c.dirs.push(h.join(".local/share/fonts"));
-                c.dirs.push(h.join(".fonts"));
-            }
+            c.dirs = conventional_dirs(cfg!(target_os = "macos"), home()); // AETHERSUBMITCAPTION (SR410): a stock Mac has no fonts.conf
         }
         c
     }
@@ -476,6 +471,30 @@ impl Config {
 pub fn family_eq(a: &str, b: &str) -> bool {
     let norm = |s: &str| s.chars().filter(|c| !c.is_whitespace()).flat_map(char::to_lowercase).collect::<String>();
     norm(a) == norm(b)
+}
+
+/// AETHERSUBMITCAPTION (SR410): the font directories walked when no fontconfig configuration names any. On
+/// macOS (no `/etc/fonts/fonts.conf` on a stock system) they are the CoreText font domains, system
+/// (`/System/Library/Fonts`, whose `Supplementary/` holds Arial and Times New Roman, walked recursively),
+/// local and user; anywhere else the conventional fontconfig directories, in this order. Without the macOS
+/// arm the database found zero faces on a Mac and every system-font run painted blank.
+pub fn conventional_dirs(macos: bool, home: Option<PathBuf>) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if macos {
+        dirs.push(PathBuf::from("/System/Library/Fonts"));
+        dirs.push(PathBuf::from("/Library/Fonts"));
+        if let Some(h) = home {
+            dirs.push(h.join("Library/Fonts"));
+        }
+    } else {
+        dirs.push(PathBuf::from("/usr/share/fonts"));
+        dirs.push(PathBuf::from("/usr/local/share/fonts"));
+        if let Some(h) = home {
+            dirs.push(h.join(".local/share/fonts"));
+            dirs.push(h.join(".fonts"));
+        }
+    }
+    dirs
 }
 
 #[cfg(test)]

@@ -129,6 +129,11 @@ pub struct Sps {
     /// VUI video_full_range_flag and matrix_coefficients (Table E-5), when signalled.
     pub full_range: bool,
     pub matrix_coefficients: u8,
+    /// NLEPROBEHDR (SR226): VUI video_signal_type_present_flag, and colour_primaries / transfer_characteristics (Table E-3,
+    /// E-4; H.273 code points, 2 = unspecified when colour_description_present_flag is 0).
+    pub video_signal_type: bool,
+    pub colour_primaries: u8,
+    pub transfer_characteristics: u8,
 }
 
 impl Sps {
@@ -236,7 +241,7 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps> {
         max_num_reorder: None,
         max_dec_frame_buffering: None,
         full_range: false,
-        matrix_coefficients: 2,
+        matrix_coefficients: 2, video_signal_type: false, colour_primaries: 2, transfer_characteristics: 2,
     };
     if HIGH_PROFILES.contains(&profile_idc) {
         s.chroma_format_idc = r.ue();
@@ -339,11 +344,11 @@ fn vui(r: &mut BitReader, s: &mut Sps) {
         r.bit();
     }
     if r.flag() {
-        r.u(3);
+        r.u(3); s.video_signal_type = true;
         s.full_range = r.flag();
         if r.flag() {
-            r.u(8);
-            r.u(8);
+            s.colour_primaries = r.u(8) as u8;
+            s.transfer_characteristics = r.u(8) as u8;
             s.matrix_coefficients = r.u(8) as u8;
         }
     }
@@ -818,11 +823,7 @@ pub fn check_sps(sps: &Sps) -> Result<()> {
 /// constraint_set3_flag (intra profiles), else MaxDpbFrames ([`Sps::dpb_frames`]); `pic_order_cnt_type` 2 is 0 (8.2.1.3:
 /// output order is decoding order). `None` when the record or its SPS does not parse.
 pub fn avcc_reorder_depth(avcc: &[u8]) -> Option<u32> {
-    let cfg = crate::nal::parse_avcc(avcc).ok()?;
-    let nal = cfg.sps.first()?;
-    let mut rbsp = Vec::new();
-    crate::nal::unescape(nal.get(1..)?, &mut rbsp);
-    let sps = parse_sps(&rbsp).ok()?;
+    let sps = avcc_sps(avcc)?;
     if let Some(n) = sps.max_num_reorder {
         return Some(n);
     }
@@ -833,4 +834,15 @@ pub fn avcc_reorder_depth(avcc: &[u8]) -> Option<u32> {
         return Some(0);
     }
     Some(sps.dpb_frames() as u32)
+}
+
+/// The first SPS of an `avcC` (ISO/IEC 14496-15 §5.3.3.1), parsed — what [`avcc_reorder_depth`] reads its depth from, and
+/// NLEPROBEHDR's (SR226) colour fallback reads the VUI colour description from (`video_signal_type`, `colour_primaries`,
+/// `transfer_characteristics`, `matrix_coefficients`, `full_range`). `None` when the record or its SPS does not parse.
+pub fn avcc_sps(avcc: &[u8]) -> Option<Sps> {
+    let cfg = crate::nal::parse_avcc(avcc).ok()?;
+    let nal = cfg.sps.first()?;
+    let mut rbsp = Vec::new();
+    crate::nal::unescape(nal.get(1..)?, &mut rbsp);
+    parse_sps(&rbsp).ok()
 }

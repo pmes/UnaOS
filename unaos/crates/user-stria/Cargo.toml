@@ -42,6 +42,9 @@ vp9_core = { path = "../../libs/media/vp9_core" }
 av1_core = { path = "../../libs/media/av1_core", optional = true }
 h264_core = { path = "../../libs/media/h264_core", optional = true }
 audio_core = { path = "../../libs/media/audio_core" }
+# USERSTRIACOLOURONE (LEDGER SR363): yuv_core, the ONE YCbCr -> RGB kernel the kernel Player and host Stria convert with
+# (`media.rs` `scale_then_convert`: one `to_rgba` per sampled output row, `pick` of `Track::colour`). no_std, no alloc, no deps.
+yuv_core = { path = "../../libs/media/yuv_core" }
 font8x8 = { version = "0.3.1", default-features = false }
 # BUSKEEPCRATE (LEDGER SR186; BP-ring3-19): the program's ONE bus keep, `vein_ring3::bus::keep()`, read by `notice_path`.
 # `default-features = false` leaves out the `tls` half (tls_core, holocron_core, vein_core): STRIA.ELF links no TLS transport.

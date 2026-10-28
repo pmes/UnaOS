@@ -1,0 +1,15 @@
+:: FR-BOOT: hz=2600000000 cy=118274662 reused=false state=flushed ::
+:: UnaOS flight-recorder boot log (UNAOS.LOG) ::
+:: LOADER: 12659ms/3135ms ::
+:: BOOT: total=20817ms ::
+[desktop] built at=login ok bar_ms=44 pins=11 held_ms=12
+:: OLDEST: board=zenbook year=2024 image=c1d61903 net=none -> BOOTS ::
+:: BOOTLIST: list /boot/TESTS.LIST entries=4 heavy=0 ::
+:: QUIETBOOT: lines=212 bound=400 census=0 -> PASS ::
+[gen7] r10 draw=3dprimitive pixels=496 inside=496/496 -> r10-triangle-landed
+:: MENUBAR: rows=7 -> PASS ::
+:: WIFI10: tx NOT ATTEMPTED reason=no-station-mac -> SKIP reason=no-station-mac ::
+:: STRIA: end -> PASS frames=81 audio=ok drift_ms=2 ::
+:: BOOTLIST: ran=4 pass=3 fail=0 skip=1 heavy=0 ms=48211 ::
+
+:: FLIGHTREC: end of log (1024 captured byte(s); the remainder of this 262656-byte file is reserved padding) ::

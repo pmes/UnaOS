@@ -353,7 +353,7 @@ pub fn fetch_to_cache(src: &str, dest: &Path, chunk: u64) -> Result<FetchReport,
     if let Some(d) = dest.parent() {
         std::fs::create_dir_all(d).map_err(|e| format!("{}: {e}", d.display()))?;
     }
-    let part = dest.with_extension("part");
+    let part = gneiss_pal::fs::part(dest); // WRITEONE (SR386): the ONE writer's `<dest>.part` (== the old `with_extension("part")`: cache names have no extension)
     let client = crate::net::blocking_client_builder().build().map_err(|e| e.to_string())?;
     let mut rep = FetchReport::default();
     let mut have = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
@@ -419,7 +419,7 @@ pub fn fetch_to_cache(src: &str, dest: &Path, chunk: u64) -> Result<FetchReport,
         }
     }
     rep.bytes = have;
-    std::fs::rename(&part, dest).map_err(|e| format!("{}: {e}", dest.display()))?;
+    gneiss_pal::fs::land(dest).map_err(|e| format!("{}: {e}", dest.display()))?; // WRITEONE (SR386): the ONE writer's rename
     Ok(rep)
 }
 
@@ -559,24 +559,10 @@ pub fn source_for(node: &NodeRef, base: &str) -> Option<(String, String)> {
     None
 }
 
-/// MIME type from a url's extension (the `type`-less fallback).
+/// MIME type from a url's extension (the `type`-less fallback). MIMEONE (SR409): TYPECORE's one table
+/// (`type_core::by_extension`), a video or audio type only; any other name answers octet, as before.
 pub fn mime_for(url: &str) -> &'static str {
-    let path = url.split(['?', '#']).next().unwrap_or(url);
-    match path.rsplit('.').next().map(|e| e.to_ascii_lowercase()).as_deref() {
-        Some("mp4") | Some("m4v") => "video/mp4",
-        Some("webm") => "video/webm",
-        Some("mkv") => "video/x-matroska",
-        Some("mov") => "video/quicktime",
-        Some("m4a") => "audio/mp4",
-        Some("mp3") => "audio/mpeg",
-        Some("ogg") => "audio/ogg",
-        Some("wav") => "audio/wav",
-        Some("flac") => "audio/flac",
-        Some("opus") => "audio/ogg",
-        Some("aac") => "audio/aac",
-        Some("aif") | Some("aiff") => "audio/aiff",
-        _ => "application/octet-stream",
-    }
+    type_core::by_extension(url.split(['?', '#']).next().unwrap_or(url)).filter(|m| m.starts_with("video/") || m.starts_with("audio/")).unwrap_or(type_core::OCTET)
 }
 
 fn find(r: &Registry, node: &NodeRef) -> Option<usize> {
@@ -998,7 +984,7 @@ pub fn on_message(msg: &SMessage) -> Effect {
                         fx.relayout = true;
                     }
                     let duration_changed = e.ready_state >= HAVE_METADATA && e.duration_ns != *duration_ns;
-                    e.natural = nat;
+                    if !(e.ready_state >= HAVE_METADATA && nat.is_some_and(|(w, h)| video_resize(e, w, h))) { e.natural = nat; } // NLESIZEPOLICY (SR394) AETHER-RESIZE-REOPEN: a later MediaOpened at another size fires `resize` through the one video_resize
                     e.duration_ns = *duration_ns;
                     e.real_video = *real_video;
                     if e.state == State::Loading {
@@ -1044,6 +1030,7 @@ pub fn on_message(msg: &SMessage) -> Effect {
                         e.natural = Some((f.width(), f.height()));
                         fx.relayout = true;
                     }
+                    fx.relayout |= video_resize(e, f.width(), f.height()); // NLESIZESWITCH (SR384) AETHER-VIDEO-RESIZE: natural follows the frame, `resize` once per change
                     e.frame = Some(f);
                     e.pts_ns = *pts_ns;
                     e.presented += 1;
@@ -1623,3 +1610,19 @@ pub mod tracks;
 
 #[cfg(test)]
 mod tests;
+
+// ── NLESIZESWITCH (LEDGER SR384): AETHER-VIDEO-RESIZE (handlers.md §5 NLEPROBE-HDR) ──
+/// HTML §4.8.12: whenever the video's intrinsic width or height changes and `readyState` is not HAVE_NOTHING, fire `resize`.
+/// A presented MediaFrame of another size than `natural` (a mid-stream size switch: each frame carries its own size) is the
+/// new intrinsic size: `natural`, so videoWidth / videoHeight, `requestVideoFrameCallback`'s width / height and the box's
+/// intrinsic size, follows it, through the ONE event path [`fire`]. True when layout must be rebuilt.
+fn video_resize(e: &mut Element, w: u32, h: u32) -> bool {
+    if e.kind != Kind::Video || e.natural.is_none() || e.natural == Some((w, h)) {
+        return false;
+    }
+    e.natural = Some((w, h));
+    if e.ready_state != HAVE_NOTHING {
+        fire(e, "resize");
+    }
+    true
+}

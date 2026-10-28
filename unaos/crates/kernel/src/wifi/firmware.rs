@@ -171,46 +171,6 @@ const MAX_BLOB_BYTES: u32 = 4 * 1024 * 1024;
 /// EMPTY of rows: the digests come from Peter's bunker copy via arroyo's WIFI-FW build line, never invented.
 const PINS: &str = include_str!("../../../../firmware/b43.pins");
 
-fn nib(c: u8) -> Option<u8> {
-    match c {
-        b'0'..=b'9' => Some(c - b'0'),
-        b'a'..=b'f' => Some(c - b'a' + 10),
-        b'A'..=b'F' => Some(c - b'A' + 10),
-        _ => None,
-    }
-}
-
-/// The pinned SHA-256 for `role`, or `None` (no row, or a malformed one — both refuse as `unpinned`).
-fn pin_for(role: &str) -> Option<[u8; 32]> {
-    for line in PINS.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let mut it = line.split_whitespace();
-        let (Some(r), Some(h), None) = (it.next(), it.next(), it.next()) else { continue };
-        if r != role || h.len() != 64 {
-            continue;
-        }
-        let b = h.as_bytes();
-        let mut out = [0u8; 32];
-        let mut ok = true;
-        for i in 0..32 {
-            match (nib(b[2 * i]), nib(b[2 * i + 1])) {
-                (Some(hi), Some(lo)) => out[i] = (hi << 4) | lo,
-                _ => {
-                    ok = false;
-                    break;
-                }
-            }
-        }
-        if ok {
-            return Some(out);
-        }
-    }
-    None
-}
-
 fn hex32(d: &[u8; 32]) -> String {
     let mut s = String::with_capacity(64);
     for b in d {
@@ -563,7 +523,7 @@ fn admit(spec: &FwSpec, path: String, vol: &str, data: Vec<u8>) -> RoleResult {
         );
         return RoleResult::Rejected;
     }
-    match pin_for(spec.role) {
+    match crate::hash::pins::pin_for(PINS, spec.role) {
         None => {
             refuse(1); refused_ui(spec.role, "unpinned"); // REFUSALUI (B468): the refusal is shown, not only printed
             serial_println!(
@@ -937,7 +897,7 @@ fn source_of_handle(handle: crate::drivers::block::BlockHandle) -> fat::BlockSou
         // `program_source` nor `alternate_program_source` returns it, so no firmware search ever
         // reaches this arm; nothing else in this file changes.
         #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
-        crate::drivers::block::BlockHandle::SdMmc => fat::BlockSource::SdMmc, #[cfg(all(target_arch = "x86_64", feature = "ahci"))] crate::drivers::block::BlockHandle::Ahci { port } => fat::BlockSource::Ahci(port), // AHCIBOOT: mapped only — neither `program_source` nor `alternate_program_source` returns a SATA handle, so no firmware search reaches this arm; nothing else in this file changes.
+        crate::drivers::block::BlockHandle::SdMmc => fat::BlockSource::SdMmc, #[cfg(all(target_arch = "x86_64", feature = "ahci"))] crate::drivers::block::BlockHandle::Ahci { port } => fat::BlockSource::Ahci(port), #[cfg(all(target_arch = "x86_64", feature = "nvme"))] crate::drivers::block::BlockHandle::Nvme => fat::BlockSource::Nvme, // AHCIBOOT: mapped only — neither `program_source` nor `alternate_program_source` returns a SATA handle, so no firmware search reaches this arm; nothing else in this file changes.
     }
 }
 

@@ -1294,3 +1294,14 @@ extern "x86-interrupt" fn simd_fp_handler(stack_frame: InterruptStackFrame) {
     }
     fatal_fault("SIMD FLOATING-POINT EXCEPTION", VEC_XM, 0, &stack_frame);
 }
+
+// --- ZENBOOKI8042 (zenbook-ledger Z3) — IRQ1. The i8042 keyboard's ISR, at a RUNTIME vector (`vectors::alloc("i8042")`
+// from `drivers::i8042::init`, so the IDT-seeded numbers and the knob-off census do not move), reached only through the
+// I/O APIC's ISA IRQ1 route (the 8259 stays masked). The ehci_msi_handler shape: the driver half is lock-free and bounded
+// (bytes out of port 0x60 into the scancode ring), EOI last. ---
+
+#[cfg(feature = "ioapic")]
+pub(crate) extern "x86-interrupt" fn i8042_irq_handler(_stack_frame: InterruptStackFrame) {
+    crate::drivers::i8042::interrupt_ack();
+    crate::arch::apic::eoi();
+}

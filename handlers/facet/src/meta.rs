@@ -10,11 +10,11 @@
 //! | format | spec | read here |
 //! |---|---|---|
 //! | PNG  | W3C PNG 3rd ed. §11 | IHDR, tRNS, sRGB, iCCP (profile name), cICP, gAMA, eXIf, acTL |
-//! | JPEG | ITU-T T.81 Annex B; JFIF 1.02; EXIF 2.3 §4.5.4 (APP1); ICC.1 B.4 (APP2) | SOFn, APP1 Exif, APP2 ICC_PROFILE, APP14 Adobe |
+//! | JPEG | ITU-T T.81 Annex B; JFIF 1.02; EXIF 2.3 §4.5.4 (APP1); ICC.1 B.4 (APP2) | SOFn, APP1 Exif, APP14 Adobe (the APP2 ICC_PROFILE label: [`icc`], from the decoded profile) |
 //! | GIF  | GIF89a §18, §23, §26; NETSCAPE2.0 application extension | screen descriptor, GCE transparency, loop count |
 //! | BMP  | BITMAPINFOHEADER / V4 / V5 | size, bit count, alpha mask, CSType |
 //! | QOI  | qoiformat.org 1.0 header | size, channels, colorspace |
-//! | WebP | RFC 9649 §2.5–2.7 (RIFF, VP8X, VP8L header), RFC 6386 §9.1 (VP8 frame header) | canvas size, alpha, ICCP, EXIF, ANIM |
+//! | WebP | RFC 9649 §2.5–2.7 (RIFF, VP8X, VP8L header), RFC 6386 §9.1 (VP8 frame header) | canvas size, alpha, EXIF, ANIM (the ICCP label: [`icc`], from the decoded profile) |
 //!
 //! Every reader is total: malformed or truncated input yields defaults, never a panic — this runs on
 //! attacker-shaped bytes before any decoder does.
@@ -77,6 +77,7 @@ pub fn read(bytes: &[u8], format: Format) -> Meta {
         Format::Bmp => bmp(bytes),
         Format::Qoi => qoi(bytes),
         Format::WebP => webp(bytes),
+        Format::Heic | Format::Avif => Meta::default(), // HEVCHEIC (SR220) / HEIFONE (SR303): the HEIF Exif item is owed (handlers.md §5)
         Format::Svg => Meta::default(), // markup carries no pixel metadata Facet reads; svg_core renders it
     }
 }
@@ -113,33 +114,7 @@ pub fn exif_orientation(payload: &[u8]) -> u8 {
 /// The profile description of an ICC profile (ICC.1:2010 §9.2.41 `desc` tag: v2 `desc` type or v4
 /// `mluc` type), when it can be read.
 pub fn icc_description(icc: &[u8]) -> Option<String> {
-    let count = be32(icc, 128)? as usize;
-    for i in 0..count.min(256) {
-        let e = 132 + i * 12;
-        if icc.get(e..e + 4)? == b"desc" {
-            let off = be32(icc, e + 4)? as usize;
-            let len = be32(icc, e + 8)? as usize;
-            let tag = icc.get(off..off.checked_add(len)?)?;
-            return match tag.get(0..4)? {
-                b"desc" => {
-                    let n = be32(tag, 8)? as usize;
-                    let s = tag.get(12..12 + n)?;
-                    let s = s.split(|&c| c == 0).next()?;
-                    Some(String::from_utf8_lossy(s).into_owned())
-                }
-                b"mluc" => {
-                    // First record: lang(2) country(2) length(4) offset(4), UTF-16BE.
-                    let rlen = be32(tag, 20)? as usize;
-                    let roff = be32(tag, 24)? as usize;
-                    let raw = tag.get(roff..roff + rlen)?;
-                    let u: Vec<u16> = raw.chunks_exact(2).map(|c| u16::from_be_bytes([c[0], c[1]])).collect();
-                    Some(String::from_utf16_lossy(&u).trim_end_matches('\0').to_string())
-                }
-                _ => None,
-            };
-        }
-    }
-    None
+    icc_core::profile::description(icc) // METAICCONE (SR367): the ONE `desc` reader is icc_core's
 }
 
 fn icc_label(icc: &[u8]) -> String {
@@ -195,7 +170,6 @@ fn png(b: &[u8]) -> Meta {
 
 fn jpeg(b: &[u8]) -> Meta {
     let mut m = Meta::default();
-    let mut icc: Vec<(u8, Vec<u8>)> = Vec::new();
     let mut adobe = false;
     let mut at = 2usize;
     while at + 4 <= b.len() {
@@ -224,17 +198,12 @@ fn jpeg(b: &[u8]) -> Meta {
                 m.width = be16(seg, 3).unwrap_or(0) as u32;
             }
             0xE1 if seg.starts_with(b"Exif\0\0") => m.orientation = exif_orientation(seg),
-            0xE2 if seg.starts_with(b"ICC_PROFILE\0") && seg.len() > 14 => icc.push((seg[12], seg[14..].to_vec())),
             0xEE if seg.starts_with(b"Adobe") => adobe = true,
             _ => {}
         }
         at += 2 + len;
     }
-    if !icc.is_empty() {
-        icc.sort_by_key(|c| c.0);
-        let whole: Vec<u8> = icc.into_iter().flat_map(|c| c.1).collect();
-        m.colour = icc_label(&whole);
-    } else if adobe {
+    if adobe {
         m.colour = "Adobe APP14, no profile (assumed sRGB)".into();
     }
     m
@@ -351,7 +320,6 @@ fn webp(b: &[u8]) -> Meta {
                 m.width = (le16(data, 6).unwrap_or(0) & 0x3FFF) as u32;
                 m.height = (le16(data, 8).unwrap_or(0) & 0x3FFF) as u32;
             }
-            b"ICCP" => m.colour = icc_label(data),
             b"EXIF" => m.orientation = exif_orientation(data),
             b"ANIM" if len >= 6 => m.loop_count = le16(data, 4),
             _ => {}
@@ -359,6 +327,16 @@ fn webp(b: &[u8]) -> Meta {
         at += 8 + len + (len & 1);
     }
     m
+}
+
+/// METAICCONE (LEDGER SR367): label `m`'s colour from the embedded profile the ONE decode surfaced (`pixel_core::Image::icc`
+/// via [`crate::source::Decoded::icc`]: pixel_core joins the JPEG APP2 chunks and reads the WebP ICCP; icc_core reads its
+/// `desc`). JPEG and WebP only, a profile outranking APP14 as before; PNG keeps its iCCP profile-name label (the chunk
+/// field pixel_core does not surface: META-ICCP-NAME owed) and the cICP > iCCP > sRGB > gAMA precedence.
+pub fn icc(m: &mut Meta, format: Format, icc: Option<&[u8]>) {
+    if let (Format::Jpeg | Format::WebP, Some(p)) = (format, icc) {
+        m.colour = icc_label(p);
+    }
 }
 
 #[cfg(test)]
@@ -424,5 +402,27 @@ mod tests {
         icc.extend((tag.len() as u32).to_be_bytes());
         icc.extend(tag);
         assert_eq!(icc_description(&icc).as_deref(), Some("sRGB"));
+    }
+
+    #[test]
+    fn icc_label_from_icc_core_v2_and_v4() {
+        // METAICCONE (SR367): the JPEG / WebP label is icc_core's `desc` (v2 textDescription, v4 mluc) of the decoded
+        // profile, with its byte count; a profile without `desc` keeps the bare label; PNG is not relabelled.
+        use icc_core::kat;
+        let wtpt = (*b"wtpt", kat::xyz_tag([0.9642, 1.0, 0.8249]));
+        let v2 = kat::profile(2, b"mntr", b"GRAY", b"XYZ ", &[wtpt.clone(), (*b"desc", kat::desc_v2("Gray v2"))]);
+        let v4 = kat::profile(4, b"mntr", b"GRAY", b"XYZ ", &[wtpt, (*b"desc", kat::mluc("Gray v4"))]);
+        let bare = kat::adobe_rgb_v2();
+        let mut m = Meta { colour: "Adobe APP14, no profile (assumed sRGB)".into(), ..Meta::default() };
+        icc(&mut m, Format::Jpeg, Some(&v2));
+        assert_eq!(m.colour, format!("ICC profile 'Gray v2' ({} bytes)", v2.len()));
+        icc(&mut m, Format::WebP, Some(&v4));
+        assert_eq!(m.colour, format!("ICC profile 'Gray v4' ({} bytes)", v4.len()));
+        icc(&mut m, Format::Jpeg, Some(&bare));
+        assert_eq!(m.colour, format!("ICC profile ({} bytes)", bare.len()));
+        let mut p = Meta::default();
+        icc(&mut p, Format::Png, Some(&v2));
+        icc(&mut p, Format::Jpeg, None);
+        assert_eq!(p.colour, UNTAGGED);
     }
 }

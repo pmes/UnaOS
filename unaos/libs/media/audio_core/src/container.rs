@@ -16,7 +16,9 @@
 //! video player hands it the picture job's `Demuxer::share` (one parse, no byte copy) — for MP4 (AAC, MP3) and
 //! Matroska/WebM (Opus, Vorbis) alike. The Matroska sound is indexed from its own packets (Opus TOC sample counts,
 //! Vorbis block sizes — no decode), so a seek is exact (`table=matroska`), and `DiscardPadding` trims the tail.
-//! [`plays`] is the predicate a player's facts ask (`audio_ok`).
+//! [`plays`] is the predicate a player's facts ask (`audio_ok`). NLE6MIXAUDIO (rmbp-ledger B953): THE PCM DOOR — an
+//! uncompressed track (MP4 `sowt`/`twos`/`ipcm`/`fpcm`, Matroska `A_PCM/*`) that no codec arm claims plays through
+//! [`PcmSource`] (file tail), its bytes read by [`pcm_sample`], the ONE byte layout (gneiss_pal's `PcmDecoder` calls it).
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -45,8 +47,8 @@ pub fn open(mut s: ByteStream) -> Result<Box<dyn Source>> {
 /// VPLAYAUDIO (rmbp B475): the sound [`open_demuxed`] plays for this container and codec.
 pub fn plays(format: DFormat, codec: &DCodec) -> bool {
     match format {
-        DFormat::Mp4 => matches!(codec, DCodec::Aac | DCodec::Mp3),
-        DFormat::Matroska | DFormat::WebM => matches!(codec, DCodec::Opus | DCodec::Vorbis),
+        DFormat::Mp4 => matches!(codec, DCodec::Aac | DCodec::Mp3 | DCodec::Pcm { .. }),
+        DFormat::Matroska | DFormat::WebM => matches!(codec, DCodec::Opus | DCodec::Vorbis | DCodec::Pcm { .. }),
     }
 }
 
@@ -54,6 +56,9 @@ pub fn plays(format: DFormat, codec: &DCodec) -> bool {
 /// track of a Matroska/WebM file. A player that already demuxed the file hands its `Demuxer` (or a
 /// [`Demuxer::share`] of it) over; the file's bytes are shared, never copied.
 pub fn open_demuxed(d: Demuxer) -> Result<Box<dyn Source>> {
+    if let Some(i) = pcm_track(&d) {
+        return Ok(Box::new(PcmSource::new(d, i)?)); // NLE6MIXAUDIO (B953): the PCM door (file tail)
+    }
     match d.format() {
         DFormat::Mp4 => open_mp4(d),
         DFormat::Matroska | DFormat::WebM => open_mkv(d),
@@ -305,5 +310,113 @@ impl Source for MkvVorbis {
         self.tr.last_discard = 0;
         self.dec.reset();
         Ok(Some(SeekPoint { byte, sample, exact: true, table: "matroska", landed: sample }))
+    }
+}
+
+// ---------------------------------------------------------------- NLE6MIXAUDIO (rmbp-ledger B953): THE PCM DOOR
+
+/// One uncompressed sample (`c` holds at least `bits / 8` bytes) as `f32` full scale +-1: integer 8 (signed when
+/// big-endian, QuickTime `twos`; unsigned otherwise, the Matroska/WAV convention), 16, 24, 32; float 32, 64. The ONE
+/// byte layout: [`PcmSource`] here and gneiss_pal's `PcmDecoder` (moved from it, the arithmetic unchanged).
+pub fn pcm_sample(c: &[u8], bits: u16, float: bool, big_endian: bool) -> f32 {
+    let bps = (bits / 8) as usize;
+    let mut b = [0u8; 8];
+    // Normalise to little-endian in b[..bps].
+    for i in 0..bps {
+        b[i] = if big_endian { c[bps - 1 - i] } else { c[i] };
+    }
+    match (float, bits) {
+        (true, 32) => f32::from_le_bytes([b[0], b[1], b[2], b[3]]),
+        (true, _) => f64::from_le_bytes(b) as f32,
+        (false, 8) => {
+            if big_endian { (b[0] as i8) as f32 / 128.0 } else { (b[0] as f32 - 128.0) / 128.0 }
+        }
+        (false, 16) => i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0,
+        (false, 24) => (((b[0] as i32) | (b[1] as i32) << 8 | (b[2] as i32) << 16) << 8 >> 8) as f32 / 8_388_608.0,
+        (false, _) => i32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f32 / 2_147_483_648.0,
+    }
+}
+
+/// The PCM layouts [`pcm_sample`] reads.
+fn pcm_ok(bits: u16, float: bool) -> bool {
+    if float { matches!(bits, 32 | 64) } else { matches!(bits, 8 | 16 | 24 | 32) }
+}
+
+/// The first PCM audio track, when no codec arm of this container claims a track (an AAC or MP3 track in an MP4, an
+/// Opus or Vorbis one in Matroska/WebM keeps the door it had).
+fn pcm_track(d: &Demuxer) -> Option<usize> {
+    let coded = |c: &DCodec| match d.format() {
+        DFormat::Mp4 => matches!(c, DCodec::Aac | DCodec::Mp3),
+        DFormat::Matroska | DFormat::WebM => matches!(c, DCodec::Opus | DCodec::Vorbis),
+    };
+    let ts = d.tracks();
+    if ts.iter().any(|t| t.kind == TrackKind::Audio && coded(&t.codec)) {
+        return None;
+    }
+    ts.iter().position(|t| t.kind == TrackKind::Audio && matches!(t.codec, DCodec::Pcm { .. }))
+}
+
+/// An uncompressed track as a [`Source`]: one block per container sample (the bytes read in place through the shared
+/// `Demuxer`), float planes; the seek is exact (`table=pcm`: every sample's first frame is counted).
+pub struct PcmSource {
+    d: Demuxer,
+    units: Vec<Sample>,
+    /// `starts[k]`: the frame unit `k` begins at; `starts[units.len()]` the total.
+    starts: Vec<u64>,
+    next: usize,
+    bits: u16,
+    float: bool,
+    big_endian: bool,
+    rate: u32,
+    ch: u16,
+}
+
+impl PcmSource {
+    pub fn new(d: Demuxer, idx: usize) -> Result<PcmSource> {
+        let t = d.tracks()[idx].clone();
+        let DCodec::Pcm { bits, float, big_endian } = t.codec else { return Err(Error::Invalid("pcm: not a PCM track")) };
+        if !pcm_ok(bits, float) || t.channels == 0 || t.sample_rate == 0 {
+            return Err(Error::Unsupported("pcm: sample layout (8/16/24/32-bit integer or 32/64-bit float)"));
+        }
+        let units: Vec<Sample> = d.track_samples(idx).copied().collect();
+        if units.is_empty() {
+            return Err(Error::Invalid("pcm: no samples"));
+        }
+        let frame = (bits / 8) as u64 * t.channels as u64;
+        let mut starts = Vec::with_capacity(units.len() + 1);
+        let mut at = 0u64;
+        for u in &units {
+            starts.push(at);
+            at += u.size as u64 / frame;
+        }
+        starts.push(at);
+        Ok(PcmSource { d, units, starts, next: 0, bits, float, big_endian, rate: t.sample_rate, ch: t.channels })
+    }
+}
+
+impl Source for PcmSource {
+    fn info(&self) -> Info {
+        let total = self.starts.last().copied().unwrap_or(0);
+        Info { rate: self.rate, channels: self.ch, bits: self.bits, frames: Some(total), format: Format::Unknown, codec: Codec::Pcm, float: self.float }
+    }
+    fn block(&mut self, pcm: &mut Pcm) -> Result<bool> {
+        let Some(u) = self.units.get(self.next) else { return Ok(false) };
+        self.next += 1;
+        let data = self.d.packet_at(u).data;
+        let (bps, ch) = ((self.bits / 8) as usize, self.ch as usize);
+        let n = data.len() / (bps * ch);
+        pcm.set_float(ch, n);
+        for i in 0..n {
+            for c in 0..ch {
+                let o = (i * ch + c) * bps;
+                pcm.flt[c][i] = pcm_sample(&data[o..o + bps], self.bits, self.float, self.big_endian);
+            }
+        }
+        Ok(true)
+    }
+    fn seek(&mut self, target: u64) -> Result<Option<SeekPoint>> {
+        let k = self.starts[..self.units.len()].partition_point(|&s| s <= target).saturating_sub(1);
+        self.next = k;
+        Ok(Some(SeekPoint { byte: self.units[k].offset, sample: self.starts[k], exact: true, table: "pcm", landed: 0 }))
     }
 }

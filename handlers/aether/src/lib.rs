@@ -8,6 +8,7 @@ pub mod layout;
 pub mod render;
 pub mod js;
 pub mod images;
+pub mod pdf; // PDF4 (SR324): a PDF response as a document (the page stack, scroll / zoom / find / select)
 pub mod canvas;
 pub mod forms;
 pub mod css;
@@ -61,7 +62,7 @@ pub struct AetherEngine {
     pub pointer: Option<(f64, f64)>,
     /// The cursor keyword the shell was last told about, and one it has not been told about yet.
     cursor: String,
-    pending_cursor: Option<String>,
+    pending_cursor: Option<String>, pending_save: Option<bandy::SMessage>, // PDF4FORMSAVE (SR354): a staged BrowserSave (Ctrl/Cmd+S on a PDF), `take_pending_save`
     /// AETHERSELECT (SR69): the engine's own "button down" flag — motion extends the selection only
     /// while it is set (`pointer_moved`), and release clears it (`pointer_released`).
     button_down: bool,
@@ -114,6 +115,9 @@ pub struct AetherEngine {
     /// Each hit as (start node, UTF-16 offset, end node, UTF-16 offset): a hit may span text nodes.
     find_hits: Vec<(usize, u32, usize, u32)>,
     find_epoch: u64,
+    /// PDF4 (SR324): the open PDF, beside the empty document carrying its title; while Some it paints, scrolls,
+    /// selects and finds (`pdf::PdfDocument`, the hooks in `pdf/mod.rs`).
+    pub pdf: Option<pdf::PdfDocument>,
 }
 
 /// A selection drag (AETHERSELECT).
@@ -153,7 +157,7 @@ impl AetherEngine {
             hover_path: Vec::new(),
             pointer: None,
             cursor: "default".to_string(),
-            pending_cursor: None,
+            pending_cursor: None, pending_save: None,
             button_down: false,
             sel_drag: None,
             last_press: None,
@@ -175,6 +179,7 @@ impl AetherEngine {
             find: chrome::find::FindState::default(),
             find_hits: Vec::new(),
             find_epoch: 0,
+            pdf: None,
         }
     }
 
@@ -343,6 +348,7 @@ impl AetherEngine {
     /// the same granularity while the button is held.
     pub fn press_at(&mut self, x: f64, y: f64, clicks: u8, shift: bool) {
         self.button_down = true;
+        if self.pdf.is_some() { return self.pdf_press(x, y, clicks, shift); } // PDF4 (SR324)
         // AETHERSTYLE3 (SR103): a press on a scroll container's scrollbar drags its thumb, or pages the
         // track toward the press; it starts no selection.
         if self.scrollbar_press(x, y) {
@@ -392,6 +398,7 @@ impl AetherEngine {
         if !self.button_down {
             return;
         }
+        if self.pdf.is_some() { return self.pdf_drag(x, y); } // PDF4 (SR324)
         if self.scrollbar_drag(x, y) {
             return;
         }
@@ -471,6 +478,7 @@ impl AetherEngine {
 
     /// Ctrl/Cmd+A: select the document's contents (the body's children).
     pub fn select_all(&mut self) {
+        if self.pdf.is_some() { return self.pdf_select_all(); } // PDF4 (SR324)
         let Some(doc) = self.document.clone() else { return };
         let root = doc.select_first("body").map(|b| b.as_node().clone()).ok().or_else(|| doc.first_child());
         let Some(root) = root else { return };
@@ -486,6 +494,7 @@ impl AetherEngine {
 
     /// The selected text, serialized per the HTML `innerText` algorithm (`Selection.toString()`).
     pub fn selected_text(&self) -> String {
+        if let Some(p) = &self.pdf { return p.selected_text(); } // PDF4 (SR324)
         match (&self.layout_tree, &self.document) {
             (Some(l), Some(d)) => selection::selection_text(l, d),
             _ => String::new(),
@@ -733,7 +742,7 @@ impl AetherEngine {
     /// is recomputed (a change is staged for [`Self::take_cursor_change`]). A motion that stays on the
     /// same element costs one hit test and one `mousemove`.
     pub fn pointer_moved(&mut self, x: f64, y: f64) {
-        self.selection_pointer_moved(x, y); // AETHERSELECT (SR69): the drag extends while the button is held
+        self.selection_pointer_moved(x, y); if self.pdf.is_some() { return self.pdf_hover(x, y); } // AETHERSELECT (SR69): the drag extends while the button is held
         self.pointer = Some((x, y));
         let hit = self.hit_test_at(x, y);
         // AETHERFIT (SR189): an inert hit is retargeted (HTML §6.3) BEFORE the hover path, so the boundary events
@@ -849,7 +858,8 @@ impl AetherEngine {
                     .and_then(|t| t.taffy.layout(t.root_node).ok().map(|l| l.size.height))
                     .map(|h| (h as f64 - self.height as f64).max(0.0))
                     .unwrap_or(f64::MAX);
-                self.scroll_y = (self.scroll_y + dy).clamp(0.0, max_scroll);
+                let max_scroll = self.pdf.as_ref().map_or(max_scroll, |p| p.max_scroll(self.height as f64)); // PDF4 (SR324)
+                self.scroll_y = (self.scroll_y + dy).clamp(0.0, max_scroll); self.pdf_scroll_x(dx); // PDF4-HSCROLL (SR360): the clamp's x half on a PDF (pdf/mod.rs)
                 self.lazy_images_pass(); // AETHERMEDIA (SR107): loading=lazy images nearing the viewport
                 // Integer shift must equal the difference of the TRUNCATED
                 // positions the renderer will actually paint at — deriving it
@@ -880,12 +890,12 @@ impl AetherEngine {
                 }
             }
             api::events::Event::Resize(w, h) => {
-                self.width = w;
+                self.width = w; self.pdf_resized(); // PDF4-HSCROLL (SR360): the thumbnail strip's CSS width follows the zoom, scroll_x re-clamps
                 self.height = h;
                 self.surface = vec![255; (w * h * 4) as usize];
                 // Real reflow: media queries and wrap widths depend on the
                 // viewport, so relayout — not just repaint.
-                self.relayout();
+                self.relayout(); self.pdf_refit(); // PDF4-FIT (SR389): re-fit after the arm (a zoom inside it re-enters Resize)
             }
             api::events::Event::Text(text) => {
                 // Typed characters land at the caret of the focused text control (input or textarea
@@ -910,7 +920,7 @@ impl AetherEngine {
                 }
             }
             api::events::Event::MouseUp(x, y) => {
-                self.pointer_released(); // AETHERSELECT (SR69): the drag ends before the click is routed
+                self.pointer_released(); if self.pdf.is_some() { return self.pdf_release(x, y); } // AETHERSELECT (SR69): the drag ends before the click is routed
                 css::note_focus_modality(true); // AETHERGEN (SR71): click focus is pointer-modal
                 let Some(node) = self.hit_test(x, y) else {
                     self.set_focus(None);
@@ -1058,7 +1068,7 @@ impl AetherEngine {
     fn key_default(&mut self, key: String) {
         // AETHERA11Y (SR119): sequential focus navigation (Tab, Enter on links, the arrow keys in
         // composite widgets) before the page's own default; a key it handles is consumed.
-        if crate::dom::a11y::keyboard::handle_key(self, &key) {
+        if self.save_key(&key) { return; } if self.pdf_key(&key) { return; } if crate::dom::a11y::keyboard::handle_key(self, &key) {
             return;
         }
         // A focused text control takes its editing keys first (forms::edit); the page only
@@ -1203,7 +1213,7 @@ impl AetherEngine {
     /// Inserts `text` at the focused text control's caret (replacing its selection): line breaks are
     /// stripped in a single-line field and normalized to LF in a textarea; `maxlength` is honored.
     fn insert_text(&mut self, text: &str) {
-        let Some(node) = self.editing_node() else { return };
+        if self.pdf.is_some() { return self.pdf_insert(text); } let Some(node) = self.editing_node() else { return };
         let multiline = Self::is_textarea(&node);
         let mut ins = forms::edit::sanitize_insert(text, multiline);
         let mut value = forms::control_value(&node);
@@ -1627,7 +1637,7 @@ impl AetherEngine {
         let ch = ((self.device.1 as f64 / z).round() as u32).max(1);
         if (cw, ch) != (self.width, self.height) {
             self.handle_event(api::events::Event::Resize(cw, ch));
-        }
+        } else { self.pdf_refit(); } // PDF4-FIT-ZOOMROUND (SR401): no Resize fired (the CSS size rounded the same), so re-fit here; the arm refits otherwise
         self.needs_repaint = true;
         self.damage_rects.push((0, 0, self.width, self.height));
     }
@@ -1642,41 +1652,20 @@ impl AetherEngine {
     /// its channels swapped (quartzite's set_frame contract is RGBA) and, under zoom, resampled
     /// bilinearly from the CSS-size frame.
     pub fn present_rgba(&self) -> (u32, u32, Vec<u8>) {
+        if let Some(p) = &self.pdf { return p.present(self.device, self.zoom(), self.width as f64, self.scroll_x, self.scroll_y); } // PDF4 (SR324)
         let (sw, sh) = (self.width as usize, self.height as usize);
         let (dw, dh) = (self.device.0 as usize, self.device.1 as usize);
         let src = &self.surface;
-        if (sw, sh) == (dw, dh) || sw == 0 || sh == 0 || src.len() < sw * sh * 4 {
+        if sw == 0 || sh == 0 || src.len() < sw * sh * 4 {
             let mut px = src.to_vec();
             for p in px.chunks_exact_mut(4) {
                 p.swap(0, 2);
             }
             return (self.width, self.height, px);
         }
+        // AETHERMACGPU-PRESENTRECTS (SR351): the whole device frame through the ONE per-rect conversion.
         let mut out = vec![0u8; dw * dh * 4];
-        let (rx, ry) = (sw as f64 / dw as f64, sh as f64 / dh as f64);
-        for y in 0..dh {
-            let fy = ((y as f64 + 0.5) * ry - 0.5).clamp(0.0, (sh - 1) as f64);
-            let (y0, ty) = (fy.floor() as usize, fy - fy.floor());
-            let y1 = (y0 + 1).min(sh - 1);
-            for x in 0..dw {
-                let fx = ((x as f64 + 0.5) * rx - 0.5).clamp(0.0, (sw - 1) as f64);
-                let (x0, tx) = (fx.floor() as usize, fx - fx.floor());
-                let x1 = (x0 + 1).min(sw - 1);
-                let o = (y * dw + x) * 4;
-                for c in 0..4 {
-                    let at = |xx: usize, yy: usize| src[(yy * sw + xx) * 4 + c] as f64;
-                    let top = at(x0, y0) * (1.0 - tx) + at(x1, y0) * tx;
-                    let bot = at(x0, y1) * (1.0 - tx) + at(x1, y1) * tx;
-                    // BGRA → RGBA on the way out.
-                    let dc = match c {
-                        0 => 2,
-                        2 => 0,
-                        k => k,
-                    };
-                    out[o + dc] = (top * (1.0 - ty) + bot * ty).round().clamp(0.0, 255.0) as u8;
-                }
-            }
-        }
+        present_rect(src, (sw, sh), &mut out, (dw, dh), (0, 0, self.device.0, self.device.1));
         (self.device.0, self.device.1, out)
     }
 
@@ -1687,6 +1676,7 @@ impl AetherEngine {
     /// current)` (1-based; 0 = none). AETHERDEBT SR93: a hit may span element boundaries inside one
     /// block (`<b>un</b>a` finds "una"), over the text with its white space collapsed.
     pub fn find(&mut self, query: &str, forward: bool) -> (u32, u32) {
+        if self.pdf.is_some() { return self.pdf_find(query, forward); } // PDF4 (SR324)
         let cur = if self.find.is_repeat(query) && self.find_epoch == self.layout_epoch {
             self.find.step(forward)
         } else {
@@ -1709,6 +1699,7 @@ impl AetherEngine {
 
     /// The find bar closed: the active hit's highlight goes.
     pub fn find_close(&mut self) {
+        if self.pdf.is_some() { self.pdf_find_close(); } // PDF4 (SR324)
         if self.find.current.is_some() {
             selection::set(None);
         }
@@ -1815,7 +1806,7 @@ impl AetherEngine {
     /// The URL of the link under the pointer (the nearest `<a href>` / `<area href>` on the hover
     /// path), resolved against the document — the chrome's status line.
     pub fn hovered_link(&self) -> Option<String> {
-        let base = self.current_url();
+        if self.pdf.is_some() { return self.pdf_hovered_link(); } let base = self.current_url();
         self.hover_path.iter().find_map(|n| {
             let e = n.as_element()?;
             if !matches!(e.name.local.as_ref(), "a" | "area") {
@@ -1889,6 +1880,7 @@ impl AetherEngine {
     /// for scripted sites: the page's own JS drives its state; no per-site
     /// code anywhere.
     pub fn load_page(&mut self, page: net::Page, add_history: bool) {
+        if let Some(bytes) = page.pdf { return self.load_pdf(&page.base_url, bytes, add_history); } // PDF4 (SR324)
         images::set_page(&page.base_url, page.images);
         self.load_impl(
             &page.base_url,
@@ -1907,6 +1899,7 @@ impl AetherEngine {
         scripts_override: Option<(&[String], &[String])>,
         add_history: bool,
     ) {
+        self.pdf = None; // PDF4 (SR324): every document load drops the PDF (load_pdf sets it after this runs)
         // AETHERCHROME (SR84): the session history is the truth; `history`/`history_idx` mirror it. A
         // new navigation drops the forward entries and appends one of a new document; a traversal or
         // reload (`add_history = false`) re-commits the current entry with the document it now holds.
@@ -2600,4 +2593,73 @@ impl AetherEngine {
 fn retargeted(n: &crate::dom::NodeRef) -> crate::dom::NodeRef {
     let r = js::toplayer::retarget(n.id().0);
     if r == n.id().0 { n.clone() } else { n.node_at(html_core::NodeId(r)) }
+}
+
+// =================================================================================================
+// AETHERMACGPU-PRESENTRECTS (LEDGER SR351): the presented frame converted per rect.
+// =================================================================================================
+
+impl AetherEngine {
+    /// The frame [`Self::present_rgba`] makes, written ONLY at `rects` (device px) into `frame`, the `device` frame the
+    /// caller keeps (quartzite `tetra::SurfaceDamage`'s kept frame, identical to the face's): the rects' pixels are
+    /// byte-identical to the whole frame's, every other byte of `frame` is untouched. `false`, before any write, for a
+    /// PDF (its frame is `pdf::PdfDocument::present`, not the surface), a degenerate surface or a frame of another size.
+    pub fn present_rects(&self, frame: &mut [u8], rects: &[(u32, u32, u32, u32)]) -> bool {
+        let (sw, sh) = (self.width as usize, self.height as usize);
+        let (dw, dh) = (self.device.0 as usize, self.device.1 as usize);
+        if self.pdf.is_some() || sw == 0 || sh == 0 || self.surface.len() < sw * sh * 4 || frame.len() != dw * dh * 4 {
+            return false;
+        }
+        for &r in rects {
+            present_rect(&self.surface, (sw, sh), frame, (dw, dh), r);
+        }
+        true
+    }
+}
+
+/// The ONE conversion of the presented frame (AETHERMACGPU-PRESENTRECTS, SR351): the device pixels of `rect` (clipped to
+/// the `dw x dh` device) of the BGRA `sw x sh` CSS surface `src`, written as RGBA into `out` (stride `dw * 4`): the
+/// channels swapped when the sizes match, else resampled bilinearly (a device pixel reads its 2x2 CSS footprint), each
+/// pixel's arithmetic independent of the rect, so a rect equals the same pixels of the whole frame.
+fn present_rect(src: &[u8], (sw, sh): (usize, usize), out: &mut [u8], (dw, dh): (usize, usize), rect: (u32, u32, u32, u32)) {
+    let (x0, y0) = (rect.0 as usize, rect.1 as usize);
+    let x1 = (x0 + rect.2 as usize).min(dw);
+    let y1 = (y0 + rect.3 as usize).min(dh);
+    if x0 >= x1 || y0 >= y1 {
+        return;
+    }
+    if (sw, sh) == (dw, dh) {
+        for y in y0..y1 {
+            let row = (y * dw + x0) * 4..(y * dw + x1) * 4;
+            out[row.clone()].copy_from_slice(&src[row.clone()]);
+            for p in out[row].chunks_exact_mut(4) {
+                p.swap(0, 2);
+            }
+        }
+        return;
+    }
+    let (rx, ry) = (sw as f64 / dw as f64, sh as f64 / dh as f64);
+    for y in y0..y1 {
+        let fy = ((y as f64 + 0.5) * ry - 0.5).clamp(0.0, (sh - 1) as f64);
+        let (sy0, ty) = (fy.floor() as usize, fy - fy.floor());
+        let sy1 = (sy0 + 1).min(sh - 1);
+        for x in x0..x1 {
+            let fx = ((x as f64 + 0.5) * rx - 0.5).clamp(0.0, (sw - 1) as f64);
+            let (sx0, tx) = (fx.floor() as usize, fx - fx.floor());
+            let sx1 = (sx0 + 1).min(sw - 1);
+            let o = (y * dw + x) * 4;
+            for c in 0..4 {
+                let at = |xx: usize, yy: usize| src[(yy * sw + xx) * 4 + c] as f64;
+                let top = at(sx0, sy0) * (1.0 - tx) + at(sx1, sy0) * tx;
+                let bot = at(sx0, sy1) * (1.0 - tx) + at(sx1, sy1) * tx;
+                // BGRA → RGBA on the way out.
+                let dc = match c {
+                    0 => 2,
+                    2 => 0,
+                    k => k,
+                };
+                out[o + dc] = (top * (1.0 - ty) + bot * ty).round().clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
 }

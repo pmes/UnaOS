@@ -287,7 +287,7 @@ impl FrameDecoder {
 
     /// Compare the running MD5 with STREAMINFO's (an all-zero signature means "not computed": skipped).
     pub fn verify(&mut self) -> Result<bool> {
-        let m = core::mem::take(&mut self.md5).finish();
+        let m = core::mem::take(&mut self.md5).finalize();
         if self.si.md5 == [0; 16] { return Ok(false); }
         if m != self.si.md5 { return Err(Error::Checksum("FLAC MD5 of the decoded stream")); }
         Ok(true)

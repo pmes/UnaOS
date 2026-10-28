@@ -72,41 +72,34 @@ pub fn luma_to_rgba(frame: &Frame) -> Vec<u8> {
     out
 }
 
-#[inline]
-fn clamp8(v: i32) -> u8 {
-    v.clamp(0, 255) as u8
-}
-
-/// One Y'CbCr sample → RGB by ITU-R BT.601 (studio range: Y' 16..235, Cb/Cr 16..240), in the standard
-/// 8-bit fixed-point form of that recommendation's matrix (coefficients ×256, rounded).
+/// One Y'CbCr sample → RGB by ITU-R BT.601 (studio range: Y' 16..235, Cb/Cr 16..240): yuv_core's ONE converter
+/// (VP8COLOURONE SR356), `Matrix::Kr(KR_KB_601)` limited at 8 bits — the 8-bit fixed-point table (x256, rounded).
 pub fn yuv_to_rgb(y: u8, u: u8, v: u8) -> [u8; 3] {
-    let c = y as i32 - 16;
-    let d = u as i32 - 128;
-    let e = v as i32 - 128;
-    [
-        clamp8((298 * c + 409 * e + 128) >> 8),
-        clamp8((298 * c - 100 * d - 208 * e + 128) >> 8),
-        clamp8((298 * c + 516 * d + 128) >> 8),
-    ]
+    let (yp, up, vp) = ([y], [u], [v]);
+    let p = yuv_core::Picture { w: 1, h: 1, y: &yp[..], u: &up[..], v: &vp[..], y_stride: 1, uv_stride: 1, ss: (0, 0), mono: false, bit_depth: 8, full: false };
+    let mut out = [0u8; 4];
+    yuv_core::to_rgba(&p, yuv_core::Matrix::Kr(yuv_core::KR_KB_601), yuv_core::Chroma::Nearest, false, &mut out);
+    [out[0], out[1], out[2]]
 }
 
-/// YUY2 (Y0 U Y1 V per pixel pair) as RGBA.
+/// YUY2 (Y0 U Y1 V per pixel pair) as RGBA: each row de-interleaved into Y / Cb / Cr and converted as one 4:2:2 row by
+/// yuv_core (BT.601 limited, nearest chroma). An odd width's last pixel stays zero, as the pairs do not cover it.
 pub fn yuy2_to_rgba(frame: &Frame) -> Vec<u8> {
     let (w, h) = (frame.width as usize, frame.height as usize);
     let mut out = vec![0u8; w * h * 4];
     if frame.format != PixelFormat::Yuy2 {
         return out;
     }
+    let pairs = w / 2;
+    let (mut ys, mut us, mut vs) = (vec![0u8; pairs * 2], vec![0u8; pairs], vec![0u8; pairs]);
     for y in 0..h {
         let row = &frame.data[y * frame.stride..];
-        for pair in 0..w / 2 {
-            let (y0, u, y1, v) = (row[pair * 4], row[pair * 4 + 1], row[pair * 4 + 2], row[pair * 4 + 3]);
-            let o = (y * w + pair * 2) * 4;
-            let a = yuv_to_rgb(y0, u, v);
-            let b = yuv_to_rgb(y1, u, v);
-            out[o..o + 4].copy_from_slice(&[a[0], a[1], a[2], 255]);
-            out[o + 4..o + 8].copy_from_slice(&[b[0], b[1], b[2], 255]);
+        for pair in 0..pairs {
+            (ys[pair * 2], us[pair], ys[pair * 2 + 1], vs[pair]) = (row[pair * 4], row[pair * 4 + 1], row[pair * 4 + 2], row[pair * 4 + 3]);
         }
+        let p = yuv_core::Picture { w: pairs * 2, h: 1, y: &ys[..], u: &us[..], v: &vs[..], y_stride: pairs * 2, uv_stride: pairs, ss: (1, 0), mono: false, bit_depth: 8, full: false };
+        let o = y * w * 4;
+        yuv_core::to_rgba(&p, yuv_core::Matrix::Kr(yuv_core::KR_KB_601), yuv_core::Chroma::Nearest, false, &mut out[o..o + pairs * 8]);
     }
     out
 }

@@ -154,7 +154,7 @@ const ENUM_DONE_TAGS: [&str; 17] = [
 /// the serial/FTDI wire and the post-boot log, and a per-phase panel line during enumeration would
 /// perturb the very boot it is measuring.
 pub fn record(tag: &'static str) {
-    let c = crate::arch::now_cycles();
+    let c = crate::arch::now_cycles(); #[cfg(target_arch = "x86_64")] { crate::drivers::xhci::ftdi::console_watch::stamped(tag); }
     let mut r = RING.lock();
     let n = r.len;
     if n == CAP {
@@ -421,6 +421,6 @@ pub fn boot_line() {
     let total = Dur { raw: Some(if fw != 0 { now } else { now.wrapping_sub(start) }), hz };
     serial_println!(":: BOOT: firmware->loader={} loader->desktop={} total={} lines={} {} ::", fw_d, ld, total, lines, crate::fs::bootstep::boot_fields()); // SPLASHSTALL (B510): `steps=<n> slowest=<name>:<ms> over=<n>` — the steps under the splash ended by now (this line prints inside `stage-resolve`; `tests splash` has the whole set)
     crate::perf::note_boot(total.raw.unwrap_or(0), hz); // PERFREVIEW (B443)
-    crate::census::boot_banner(); #[cfg(feature = "selfdiag")] crate::bootwit::mark_desktop(); // SELFDIAG M1 (B324): arm the desktop-ready boot-log write (same-line fold)
+    crate::census::boot_banner(); crate::arch::memory::dma::census(); #[cfg(feature = "selfdiag")] crate::bootwit::mark_desktop(); // SELFDIAG M1 (B324): arm the desktop-ready boot-log write (same-line fold)
     crate::tests::register("quietboot", crate::tests::quietboot_selftest);
 }

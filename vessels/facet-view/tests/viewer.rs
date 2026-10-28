@@ -18,7 +18,7 @@ fn pump(v: &mut Viewer, f: &mut facet::Facet, reqs: Vec<FacetCommand>) -> Option
         for ans in f.dispatch(&r) {
             let (more, b) = v.answer(&ans);
             queue.extend(more);
-            if let Some(SMessage::SurfaceBlit { width, height, pixels, url }) = b {
+            if let Some(SMessage::SurfaceBlit { width, height, pixels, url, .. }) = b {
                 assert_eq!(url, facet_view::SURFACE);
                 blit = Some((width, height, pixels));
             }
@@ -119,4 +119,38 @@ fn export_and_errors() {
     // Answers that are not ours are ignored.
     let foreign = FacetCommand::ImageError { receipt_id: 1, handle: None, message: "x".into() };
     assert_eq!(v.answer(&foreign).0.len(), 0);
+}
+
+/// SAVEDIALOG (SR364): Cmd/Ctrl+Shift+S asks the window's save panel (seeded with the `e` export's name); the panel's
+/// chosen path exports there through Facet (replacing a file); a cancel, or an answer for another surface, does nothing.
+#[test]
+fn savedialog_viewer_save_as() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("pic.png");
+    std::fs::copy(CARD, &src).unwrap();
+    let mut f = facet::Facet::new();
+    let mut v = Viewer::new(src.to_str().unwrap(), Origin::LocalUser("t".into()), (64, 64));
+    let s = v.start();
+    pump(&mut v, &mut f, s);
+    assert!(v.input(&SMessage::BrowserKey("Meta+Shift+s".into())).is_empty(), "the key asks; it exports nothing yet");
+    match v.take_panel() {
+        Some(SMessage::SavePanel { url, name, .. }) => assert_eq!((url.as_str(), name.as_str()), (facet_view::SURFACE, "pic.facet.png")),
+        other => panic!("no SavePanel staged: {other:?}"),
+    }
+    assert!(v.take_panel().is_none(), "taken once");
+    assert!(v.input(&SMessage::BrowserKey("Ctrl+Shift+S".into())).is_empty());
+    assert!(v.take_panel().is_some(), "GTK's spelling asks too");
+    let chosen = dir.path().join("chosen.png");
+    std::fs::write(&chosen, b"old").unwrap();
+    let cancel = SMessage::SavePanelChose { url: facet_view::SURFACE.into(), path: None };
+    assert!(v.input(&cancel).is_empty(), "a cancel exports nothing");
+    let other = SMessage::SavePanelChose { url: "viewport".into(), path: Some(chosen.to_string_lossy().into_owned()) };
+    assert!(v.input(&other).is_empty(), "another surface's answer is not ours");
+    let ours = SMessage::SavePanelChose { url: facet_view::SURFACE.into(), path: Some(chosen.to_string_lossy().into_owned()) };
+    let r = v.input(&ours);
+    assert!(matches!(r.as_slice(), [FacetCommand::ImageExport { overwrite: true, .. }]), "{r:?}");
+    pump(&mut v, &mut f, r);
+    assert_eq!(v.exported.as_deref(), chosen.to_str());
+    assert_eq!(&std::fs::read(&chosen).unwrap()[1..4], b"PNG", "the chosen file was replaced by the PNG");
+    assert!(!dir.path().join("chosen.png.part").exists(), "no .part left behind");
 }

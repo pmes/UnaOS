@@ -1275,9 +1275,7 @@ mod tests {
     /// the same store start in creation order (the read-only one waits); an abort undoes its writes.
     #[test]
     fn scheduler_orders_overlapping_transactions() {
-        let dir = std::env::temp_dir().join(format!("aether_idb_kat_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        crate::storage::set_root_dir(Some(dir.clone()));
+        let _root = crate::storage::test_root::TestRoot::new("aether_idb_kat");
         let key = "https://kat.example";
         let o = open(key, "db", Some(1), 0, false).unwrap();
         let conn = o["conn"].as_u64().unwrap();
@@ -1313,7 +1311,15 @@ mod tests {
         close(conn);
         assert_eq!(databases(key), json!([{ "name": "db", "version": 1 }]));
         assert_eq!(delete_database(key, "db", false).unwrap()["deleted"], json!(1));
-        crate::storage::set_root_dir(None);
-        let _ = std::fs::remove_dir_all(&dir);
     }
+}
+
+/// AETHER-TESTROOT (LEDGER SR355): closes every open database and forgets every connection and transaction
+/// (ids stay monotonic) — `storage::test_root::TestRoot` on acquire and drop.
+#[cfg(test)]
+pub(crate) fn reset_for_test() {
+    let mut r = reg();
+    r.dbs.clear();
+    r.conns.clear();
+    r.txns.clear();
 }

@@ -34,7 +34,7 @@ unsafe impl<T: ?Sized + Send> Send for Mutex<T> {}
 pub struct MutexGuard<'a, T: ?Sized + 'a, R = spin::relax::Spin> {
     /// The registry entry this hold occupies (`u16::MAX` = untracked). Released in `Drop`, BEFORE `_raw`.
     #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))] // aarch64: the wrapper only (no registry)
-    slot: u16,
+    slot: u16, #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))] era: u16, // LOCKREGFORCEUNLOCK (B1036): the slot's generation when this guard was built (`release` compares it). LINE-NEUTRAL fold
     _raw: spin::MutexGuard<'a, ()>,
     data: *mut T,
     _p: PhantomData<(&'a mut T, R)>,
@@ -58,13 +58,13 @@ impl<T> Mutex<T> {
 impl<T: ?Sized> Mutex<T> {
     #[inline]
     fn guard<'a>(&'a self, raw: spin::MutexGuard<'a, ()>, slot: u16) -> MutexGuard<'a, T> {
-        MutexGuard { slot, _raw: raw, data: self.data.get(), _p: PhantomData }
+        MutexGuard { slot, era: slot_era(slot), _raw: raw, data: self.data.get(), _p: PhantomData }
     }
 
     #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))] // aarch64: the wrapper only (no registry)
     #[inline]
     fn addr(&self) -> usize {
-        &self.raw as *const spin::Mutex<()> as usize
+        &self.raw as *const spin::Mutex<()> as usize } #[cfg(target_arch = "x86_64")] #[inline] fn raw_locked(addr: usize) -> bool { unsafe { (*(addr as *const spin::Mutex<()>)).is_locked() } // REGGAP (B1021): the raw lock by address for the walk's intent-gap arm, on the registry's allowed line (seat ruling). LINE-NEUTRAL fold
     }
 
     #[track_caller]
@@ -72,22 +72,22 @@ impl<T: ?Sized> Mutex<T> {
     pub fn lock(&self) -> MutexGuard<'_, T> {
         #[cfg(target_arch = "x86_64")]
         {
-            let at = Location::caller();
+            let at = Location::caller(); let s = reg::acquire(self.addr(), &self.class, self.site, at, true); // REGGAP (B1021): the slot CLAIMED with intent (every call: who, class, edges) BEFORE the raw CAS. LINE-NEUTRAL fold
             if let Some(g) = self.raw.try_lock() {
-                return self.guard(g, reg::acquire(self.addr(), &self.class, self.site, at, true));
+                return self.guard(g, reg::flip(s)); // REGGAP (B1021): held — only inline stores between the winning CAS and the flip
             }
-            // The slow path: say who waits on what, so the 50 ms scan can name a spin past 10 ms.
+            reg::unwin(s); // REGGAP (B1021): the CAS lost — out of the window before any call. The slow path: say who waits on what, so the 50 ms scan can name a spin past 10 ms.
             let w = reg::wait_begin(self.addr(), self.site, at);
             let g = loop {
                 while self.raw.is_locked() {
                     core::hint::spin_loop();
                 }
-                if let Some(g) = self.raw.try_lock() {
-                    break g;
-                }
+                reg::win(s); if let Some(g) = self.raw.try_lock() { // REGGAP (B1021): into the window, call-free, for this CAS only
+                    reg::flip(s); break g;
+                } reg::unwin(s); // REGGAP (B1021): a lost in-loop CAS leaves the window before the next spin
             };
             reg::wait_end(w);
-            self.guard(g, reg::acquire(self.addr(), &self.class, self.site, at, true))
+            self.guard(g, s)
         }
         #[cfg(not(target_arch = "x86_64"))]
         {
@@ -100,8 +100,8 @@ impl<T: ?Sized> Mutex<T> {
     pub fn try_lock(&self) -> Option<MutexGuard<'_, T>> {
         #[cfg(target_arch = "x86_64")]
         {
-            let at = Location::caller();
-            self.raw.try_lock().map(|g| self.guard(g, reg::acquire(self.addr(), &self.class, self.site, at, false))) // KVMLAT (B578): a try can never WAIT, so it closes no deadlock cycle: no order edge (the hold is still tracked). LINE-NEUTRAL fold
+            let at = Location::caller(); if self.raw.is_locked() { return None; } let s = reg::acquire(self.addr(), &self.class, self.site, at, false); // REGGAP (B1021): a held lock answers None for one load; else the slot is CLAIMED with intent before the CAS. LINE-NEUTRAL fold
+            match self.raw.try_lock() { Some(g) => Some(self.guard(g, reg::flip(s))), None => { reg::abandon(s); None } } // KVMLAT (B578): a try can never WAIT, so it closes no deadlock cycle: no order edge (the hold is still tracked). LINE-NEUTRAL fold
         }
         #[cfg(not(target_arch = "x86_64"))]
         {
@@ -155,7 +155,7 @@ impl<T: ?Sized, R> Drop for MutexGuard<'_, T, R> {
     #[inline]
     fn drop(&mut self) {
         #[cfg(target_arch = "x86_64")]
-        reg::release(self.slot);
+        reg::release(self.slot, self.era);
     }
 }
 
@@ -221,7 +221,7 @@ mod reg {
     struct Part {
         mask: AtomicU32,
         /// `tid << 24 | class << 8 | (cpu + 1)` (0 = free).
-        tag: [AtomicU64; PER],
+        tag: [AtomicU64; PER], intent: [AtomicU64; PER], era: [AtomicU16; PER], // REGGAP (B1021): the claimed slot's tag before its raw CAS, + WIN across the CAS window (0 = none); LOCKREGFORCEUNLOCK (B1036): `era` (the slot's generation) bumped by every out-of-band free (`bump`) — LINE-NEUTRAL fold
         lock: [AtomicUsize; PER],
         at: [AtomicPtr<Loc>; PER],
         t0: [AtomicU64; PER],
@@ -242,7 +242,7 @@ mod reg {
         const fn new() -> Self {
             Part {
                 mask: AtomicU32::new(0),
-                tag: [const { AtomicU64::new(0) }; PER],
+                tag: [const { AtomicU64::new(0) }; PER], intent: [const { AtomicU64::new(0) }; PER], era: [const { AtomicU16::new(0) }; PER], // REGGAP (B1021); LOCKREGFORCEUNLOCK (B1036) — LINE-NEUTRAL fold
                 lock: [const { AtomicUsize::new(0) }; PER],
                 at: [const { AtomicPtr::new(core::ptr::null_mut()) }; PER],
                 t0: [const { AtomicU64::new(0) }; PER],
@@ -406,11 +406,11 @@ mod reg {
         }
     }
 
-    /// A hold begins: one CAS (the entry) + four stores; the order edges against this task's other holds on this core.
+    /// A hold is CLAIMED: one CAS (the entry) + four stores, the tag into `intent` with WIN (REGGAP B1021: before the raw CAS; `flip` makes it the tag after it); the order edges against this task's other holds on this core.
     #[inline]
     pub fn acquire(addr: usize, class: &AtomicU16, site: &'static Loc, at: &'static Loc, edges: bool) -> u16 { // KVMLAT (B578): `edges` = this acquire could have waited (`lock`), false for `try_lock`
         let Some((tid, cpu)) = who() else {
-            EARLY.fetch_add(1, Relaxed);
+            if ON.load(Relaxed) { UNGS.fetch_add(1, Relaxed); } else { EARLY.fetch_add(1, Relaxed); } // LOCKREGFULL (B1034): armed but unplaceable (foreign GS, cpu >= MAX_CPUS) counts apart from pre-arm (`untracked_gs=` vs `untracked_early=`). LINE-NEUTRAL fold
             return NONE;
         };
         let p = &PARTS[cpu];
@@ -427,24 +427,11 @@ mod reg {
             c => c,
         };
         let mut m = p.mask.load(Acquire);
-        if c != 0 && edges {
-            let mut bits = m;
-            while bits != 0 {
-                let i = bits.trailing_zeros() as usize;
-                bits &= bits - 1;
-                let t = p.tag[i].load(Relaxed);
-                if t != 0 && tag_tid(t) == tid {
-                    let a = tag_class(t);
-                    if a != 0 && a != c {
-                        edge(a, c, tid, cpu);
-                    }
-                }
-            }
-        }
+        if c != 0 && edges { let x0 = xcost_t0(); task_slots(tid, cpu, m, |_, _, t| { let a = tag_class(t); if a != 0 && a != c { edge(a, c, tid, cpu); } }); xcost_note(tid, cpu, x0); } // LOCKREGXCORECOSTKNOB (B1075): no rdtsc without `lockreg_census` (`xcost_t0`, reg tail). LOCKREGXCORECOST (B1062): the walk's TSC span into this core's census (`xcost_note`, reg tail; tid 0 not counted). LOCKREGOUTERXCORE (B1057): the walk is `task_slots` (after this fn), the ONE walk `outer_site` shares. LOCKREGEDGEXCORE (B1056): EVERY partition for this task — a hold taken before a preemption + steal stays in its old core's partition (release frees it by the guard's slot); tid 0 = a core's scheduler context, this core only. LINE-NEUTRAL rewrite
         let i = loop {
             let free = !m;
             if free == 0 {
-                OVERFLOW.fetch_add(1, Relaxed); // LOCKREG2 (B823): this core's partition is full — this hold goes untimed
+                OVERFLOW.fetch_add(1, Relaxed); full_note(p, cpu, tid, addr, at); // LOCKREGFULL (B1034): counted in `untracked_full=` and the boot's first FULL noted for the scan's one line (reg tail). LOCKREG2 (B823): this core's partition is full — this hold goes untimed
                 return NONE;
             }
             let i = free.trailing_zeros();
@@ -456,15 +443,28 @@ mod reg {
         p.lock[i].store(addr, Relaxed);
         p.at[i].store(at as *const Loc as *mut Loc, Relaxed);
         p.t0[i].store(rdtsc(), Relaxed);
-        p.tag[i].store(tid << 24 | (c as u64) << 8 | (cpu as u64 + 1), Release);
-        p.tracked.store(p.tracked.load(Relaxed) + 1, Relaxed);
+        p.intent[i].store(tid << 24 | (c as u64) << 8 | (cpu as u64 + 1) | WIN, Release); // REGGAP (B1021): CLAIMED with intent, WIN set for the CAS that follows; `flip` makes it the tag. LINE-NEUTRAL fold
+        p.tracked.store(p.tracked.load(Relaxed) + 1, Relaxed); slot_high(cpu, m); // LOCKREGFULL (B1034): this partition's claimed-slot high-water (`slot_high=`; reg tail). LINE-NEUTRAL fold
         (cpu * PER + i) as u16
     }
 
+    /// LOCKREGOUTERXCORE (B1057): `f(partition, slot, tag)` for every slot whose tag names task `tid`, on EVERY partition (B1056's rule: tid 0 = a core's scheduler context, core `cpu` only; `own` = core `cpu`'s mask, already loaded by the caller). The ONE walk `acquire`'s order edges and `outer_site` share.
+    #[inline(always)]
+    fn task_slots(tid: u64, cpu: usize, own: u32, mut f: impl FnMut(&Part, usize, u64)) {
+        for (q, pq) in PARTS.iter().enumerate() { if q != cpu && tid == 0 { continue; }
+            let mut bits = if q == cpu { own } else { pq.mask.load(Acquire) };
+            while bits != 0 {
+                let i = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                let t = pq.tag[i].load(Acquire);
+                if t != 0 && tag_tid(t) == tid { f(pq, i, t); }
+            }
+        } }
+
     /// A hold ends (the guard's `Drop`, before the raw unlock): the held span into this core's max, the entry freed.
     #[inline]
-    pub fn release(slot: u16) {
-        if slot == NONE {
+    pub fn release(slot: u16, era: u16) {
+        if slot == NONE || stale(slot, era) { // LOCKREGFORCEUNLOCK (B1036): a slot freed out of band since this guard was built is counted (`release_stale=`), never cleared. LINE-NEUTRAL fold
             return;
         }
         let (cpu, i) = (slot as usize / PER, slot as usize % PER);
@@ -489,7 +489,7 @@ mod reg {
                 let i = bits.trailing_zeros() as usize;
                 bits &= bits - 1;
                 if p.tag[i].load(Acquire) != 0 && p.lock[i].load(Relaxed) == addr {
-                    p.tag[i].store(0, Release);
+                    bump(p, i); p.tag[i].store(0, Release); // LOCKREGFORCEUNLOCK (B1036): the generation moves BEFORE the mask clear, so a live guard's later release is a no-op. LINE-NEUTRAL fold
                     p.mask.fetch_and(!(1u32 << i), Release);
                 }
             }
@@ -620,26 +620,26 @@ mod reg {
         }
         let name = crate::arch::sched::current_name().or(Some(crate::arch::sched::between_word(cpu))); // KVMLAT (B574): no current task is the scheduler's own context, named `sched:idle`/`sched:switch`, never `?` (LINE-NEUTRAL fold)
         let step = if matches!(name, Some("usb-pump")) { crate::video::lag::pump_step_now() } else { 0 };
-        crate::hidstall::note_hold(gap_ms - 1, name, outer_site(p, tid), step);
+        crate::hidstall::note_hold(gap_ms - 1, name, outer_site(tid, cpu), step);
     }
 
-    /// The acquire site (`&'static Location` as usize, 0 = none) of the OLDEST hold task `tid` has on partition `p`.
-    fn outer_site(p: &Part, tid: u64) -> usize {
+    /// The acquire site (`&'static Location` as usize, 0 = none) of the OLDEST hold task `tid` has on ANY partition.
+    /// LOCKREGOUTERXCORE (B1057): through `task_slots`, `acquire`'s walk (B1056's rule: tid 0 = core `cpu` only), so a hid
+    /// pump preempted and stolen while holding still names the hold it took on its old core (confined to `cpu`'s
+    /// partition, it named no site, or a newer inner hold as the outermost). `t0` is the TSC, one clock on every core
+    /// (the scan already compares it across partitions), so the smallest is the outermost.
+    /// Cost: 7 more remote `mask` loads, only on a charged sample (the pump core's tick gap past
+    /// `hidstall::HOLD_OVER_MS`), never per tick. KAT: `xcore_leg`'s `outer=` (a hold planted in the sibling
+    /// partition comes back as the planted site).
+    fn outer_site(tid: u64, cpu: usize) -> usize {
         let (mut best_t, mut site) = (u64::MAX, 0usize);
-        let mut bits = p.mask.load(Acquire);
-        while bits != 0 {
-            let i = bits.trailing_zeros() as usize;
-            bits &= bits - 1;
-            let tag = p.tag[i].load(Acquire);
-            if tag == 0 || tag_tid(tag) != tid {
-                continue;
-            }
-            let t0 = p.t0[i].load(Relaxed);
+        task_slots(tid, cpu, PARTS[cpu].mask.load(Acquire), |pq, i, _| {
+            let t0 = pq.t0[i].load(Relaxed);
             if t0 < best_t {
                 best_t = t0;
-                site = p.at[i].load(Relaxed) as usize;
+                site = pq.at[i].load(Relaxed) as usize;
             }
-        }
+        });
         site
     }
 
@@ -705,7 +705,7 @@ mod reg {
             let (a, b) = ((v >> 48) as u16, ((v >> 32) & 0xFFFF) as u16);
             serial_println!("[lock] order-inversion a={} b={} by={}@cpu{}", Site(class_site(a)), Site(class_site(b)), (v >> 8) & 0xFF_FFFF, v & 0xFF);
         }
-        drain_long();
+        drain_long(); full_say(); // LOCKREGFULL (B1034): the boot's first partition-full, said once (reg tail). LINE-NEUTRAL fold
     }
 
     /// Up to 16 names for one line.
@@ -745,7 +745,7 @@ mod reg {
     /// M3 — a task that will never run its guards' `Drop`s again (halted by STACKGUARD, a panic) gives back EVERY
     /// lock the registry holds in its name: force-unlocked by address, entry freed, all named on one line. Run AFTER
     /// the special releases (`lockowner`: the sink, the UART, the UnaFS mount — which must be leaked, not dropped).
-    pub fn release_task(tid: u64, why: &str) -> usize { let named = crate::lockowner::release_dead(tid); // STACKGUARD3 (B832): THE one release — lockowner's three first (unpoisoned), then the walk. LINE-NEUTRAL fold
+    pub fn release_task(tid: u64, why: &str) -> usize { let named = crate::lockowner::release_dead(tid); let gap = crate::allocator::heapgap::release_dead(tid, why); // PUMPDEATHREHOME (B1016): a heap hold the registry could not tag (the dead holder was in `Mutex::lock`'s tag gap) released by the heap's in-section marker, BEFORE the walk. STACKGUARD3 (B832): THE one release — lockowner's three first (unpoisoned), then the walk. LINE-NEUTRAL fold
         if tid == 0 || !ON.load(Relaxed) {
             return say_early(tid, why, named); // HEAPREGION (B854) POISONEARLY: the poison table's line too when it named anything (reg tail). STACKGUARD3 (B832): the registry off still releases (and names) lockowner's three
         }
@@ -755,12 +755,12 @@ mod reg {
             while bits != 0 {
                 let i = bits.trailing_zeros() as usize;
                 bits &= bits - 1;
-                let t = p.tag[i].load(Acquire);
+                let t = p.tag[i].load(Acquire); let t = if t == 0 { won_gap(p, i, tid, gap == 0) } else { t }; // REGGAP (B1021): ONE arm — a slot this dead task CLAIMED: its intent when it won the raw CAS and died before the flip (released by the body below), else the slot freed and 0. LINE-NEUTRAL fold
                 if t == 0 || tag_tid(t) != tid {
                     continue;
                 }
                 let addr = p.lock[i].load(Relaxed); let at = p.at[i].load(Relaxed); let poisoned = addr != 0 && mark_poison(addr); // STACKGUARD3 (B832): the acquire site before the slot frees; the POISON mark BEFORE the force-unlock, so the next taker sees it
-                p.tag[i].store(0, Release);
+                bump(p, i); p.tag[i].store(0, Release); // LOCKREGFORCEUNLOCK (B1036): a revenant's later guard release is a no-op. LINE-NEUTRAL fold
                 p.mask.fetch_and(!(1u32 << i), Release);
                 if addr != 0 {
                     // SAFETY: `addr` is the raw `spin::Mutex<()>` of a `sync::Mutex` held by `tid`, which never runs
@@ -770,8 +770,8 @@ mod reg {
                 dead.push(t, at, poisoned);
             }
         }
-        let named_n = say_named(tid, why, named); dead.say(why); if named_n + dead.n + dead.more > 0 { say_poison(); } // POISON2 (B846): the table's fill once per death-release that released anything. STACKGUARD3 (B832): one `[lock] released-on-death` line per lock (nothing when nothing was held); the summary line is gone
-        named_n + dead.n + dead.more
+        let named_n = say_named(tid, why, named); dead.say(why); if named_n + dead.n + dead.more + gap > 0 { say_poison(); } // POISON2 (B846): the table's fill once per death-release that released anything. STACKGUARD3 (B832): one `[lock] released-on-death` line per lock (nothing when nothing was held); the summary line is gone
+        named_n + dead.n + dead.more + gap
     }
 
     /// A LIVE task the kernel has given up on (DECJOB's abort): its holds and its wait NAMED, never released —
@@ -875,7 +875,7 @@ mod reg {
         let freed = if died && tid != 0 { release_task(tid, "tests lockreg") } else { 0 };
         let back = DIE.try_lock().is_some();
         let _ = DIE.take_poison(); let (gword, poisoned, retake_ms) = guard_leg(); let released = died && freed == 1 && back && gword == "ok"; let ((hword, fword), mword) = (heap_leg(), mount_leg()); let rword = crate::allocator::heappoison::reinit_leg(); let cword = if on { crate::drivers::sdhc::card_leg() } else { "skip(unarmed)" }; let bword = bind_leg(); let kword = if on { crate::allocator::heappoison::census_leg() } else { "skip(unarmed)" }; // BINDLIVE (B873): the bind task's real guard death (`bind_dead=`) and the census take's check (`census_check=`). HEAPREGION (B854): the free-first check (`free_first=`) and the scratch re-init (`heap_reinit=`). POISON2 (B846): the heap's and the mount's synthetic deaths, read released and checked (reg tail). STACKGUARD3 (B832): the death leg's mark cleared; the REAL guard leg (file tail) must pass too. LINE-NEUTRAL fold
-        let (mut acq, mut tracked, mut held_max) = (EARLY.load(Relaxed), 0u64, 0u64);
+        let fuw = forceunlock_kat(); let fullw = full_kat(); let sh = slot_high_max(); let (mut acq, mut tracked, mut held_max) = (EARLY.load(Relaxed) + UNGS.load(Relaxed), 0u64, 0u64); // LOCKREGFORCEUNLOCK (B1036): the force_unlock KAT (`forceunlock_kat=`). LOCKREGFULL (B1034): the FULL KAT (its counts taken back out before `overflow` is read), the high-water, every untracked acquire in `wrapped=`. LINE-NEUTRAL fold
         for p in PARTS.iter() {
             acq += p.acq.load(Relaxed);
             tracked += p.tracked.load(Relaxed);
@@ -888,9 +888,9 @@ mod reg {
         let max_at = HELD_MAX_AT.load(Relaxed);
         // SAFETY: `max_at` is a `&'static Location` or null.
         let max_at = if max_at.is_null() { None } else { Some(unsafe { &*max_at }) };
-        let pass = on && held_done && named && released && inv == 0 && overflow == 0 && leg_ok(hword) && leg_ok(mword) && leg_ok(rword) && leg_ok(fword) && (cword == "registered" || cword.starts_with("skip")) && leg_ok(bword) && leg_ok(kword);
+        let pass = on && held_done && named && released && inv == 0 && overflow == 0 && leg_ok(hword) && leg_ok(mword) && leg_ok(rword) && leg_ok(fword) && (cword == "registered" || cword.starts_with("skip")) && leg_ok(bword) && leg_ok(kword) && leg_ok(fullw) && leg_ok(fuw);
         serial_println!(
-            ":: LOCKREG: locks={} wrapped={}/{} held_max_ms={} inversions={} released_on_death={} poisoned={} retake_ms={} heap_check={} mount_poison={} heap_reinit={} free_first={} named={} overflow={} -> {} :: held_max_at={} held_max_via={} held_max_by={}@cpu{} poison_slots={}/16 poison_lost={} card={} bind_dead={} census_check={}",
+            ":: LOCKREG: locks={} wrapped={}/{} held_max_ms={} inversions={} released_on_death={} poisoned={} retake_ms={} heap_check={} mount_poison={} heap_reinit={} free_first={} named={} overflow={} -> {} :: held_max_at={} held_max_via={} held_max_by={}@cpu{} poison_slots={}/16 poison_lost={} card={} bind_dead={} census_check={} untracked_early={} untracked_gs={} untracked_full={} slot_high={}@cpu{} full_kat={} release_stale={} forceunlock_kat={}",
             CLASS_N.load(Relaxed),
             tracked,
             acq,
@@ -902,8 +902,9 @@ mod reg {
             if pass { "PASS" } else { "FAIL" }, Site(class_site(HELD_MAX_CLASS.load(Relaxed))), // KVMLAT (B578): the longest hold's lock, by name (`?` = none recorded)
             Site(max_at),
             tag_tid(max_tag),
-            tag_cpu(max_tag), POISON_N.load(Acquire), POISON_LOST.load(Relaxed), cword, bword, kword
+            tag_cpu(max_tag), POISON_N.load(Acquire), POISON_LOST.load(Relaxed), cword, bword, kword, EARLY.load(Relaxed), UNGS.load(Relaxed), FULL.load(Relaxed), sh.0, sh.1, fullw, STALE.load(Relaxed), fuw
         );
+        reggap_leg(); xcore_leg(); xcost_say(); // LOCKREGXCORECOST (B1062): the walk census's own `[lockreg] xcore` once-line after LOCKXCORE's. LOCKREGEDGEXCORE (B1056): the cross-partition order walk's KAT, its own `:: LOCKXCORE:` line after REGGAP's. REGGAP (B1021): the intent arm's KAT, its own `:: REGGAP:` line after LOCKREG's
     }
 
     // ── LOCKREG2 (B823): every hold past 50 ms is NAMED — in flight by the scan, or at its release through the pending
@@ -1033,6 +1034,11 @@ mod reg {
                 let (tag, at, poisoned) = self.v[k];
                 // SAFETY: `at` is a `&'static Location` or null.
                 let at = if at.is_null() { None } else { Some(unsafe { &*at }) };
+                if tag & WIN != 0 {
+                    let tag = tag & !WIN; // REGGAP (B1021): a slot its dead task CLAIMED and won before the flip (`won_gap`)
+                    serial_println!("[lock] released-on-death name={} at={} by={}@cpu{} why=intent-gap death={} poisoned={}", Site(class_site(tag_class(tag))), Site(at), tag_tid(tag), tag_cpu(tag), why, poisoned as u8);
+                    continue;
+                }
                 serial_println!("[lock] released-on-death name={} at={} by={}@cpu{} why={} poisoned={}", Site(class_site(tag_class(tag))), Site(at), tag_tid(tag), tag_cpu(tag), why, poisoned as u8);
             }
             if self.more > 0 {
@@ -1230,6 +1236,670 @@ mod reg {
             "skip(no-unafs)"
         }
     }
+
+    // ── PUMPDEATHREHOME (rmbp-ledger B1016): the heap's gap release reads the registry (allocator.rs `heapgap`) —
+    // who the caller is, who holds a lock, the oldest spin on it — and its fixture drops a tag without the unlock. ──
+
+    /// The caller as the registry names it (`who`): `(task id, cpu)`, `None` unarmed or with a foreign GS.
+    pub fn here() -> Option<(u64, usize)> {
+        who()
+    }
+
+    /// The tracked holder of lock `addr` (`holder_of`), `None` = no partition entry carries it.
+    pub fn holder_at(addr: usize) -> Option<(u64, usize)> {
+        holder_of(addr)
+    }
+
+    /// The oldest live spin on lock `addr`, in ms (0 = nobody waits): the waiter records the 50 ms scan reads.
+    pub fn wait_ms_at(addr: usize) -> u64 {
+        let hz = crate::arch::apic::tsc_hz().max(1000);
+        let t = rdtsc();
+        let mut span = 0u64;
+        for p in PARTS.iter() {
+            if p.w_lock.load(Acquire) == addr {
+                let s = t.saturating_sub(p.w_t0.load(Relaxed));
+                if s <= (u64::MAX >> 1) {
+                    span = span.max(s);
+                }
+            }
+        }
+        span / (hz / 1000)
+    }
+
+    /// Drop lock `addr`'s entries WITHOUT the unlock (`tests pumpdeath`'s deliberate gap hold only).
+    pub fn untrack(addr: usize) {
+        forget(addr)
+    }
+
+    // ── REGGAP (rmbp-ledger B1021, BP-cores-14): the slot is CLAIMED before the raw CAS (`acquire` writes `intent`, WIN
+    // set) and FLIPPED to the tag right after it. WIN marks only the call-free instructions around a CAS (spin's
+    // `try_lock` is inline(always)), so a task that dies between its winning CAS and the flip is still named, and the walk
+    // releases it (`won_gap`); a task that dies spinning or before its CAS releases nothing. ──
+
+    /// The window bit in an `intent` word (bit 23: above every class, never in a tag).
+    const WIN: u64 = 1 << 23;
+
+    /// The raw CAS won: the claimed slot becomes the hold's tag (t0 re-stamped: the span is the hold, not the spin).
+    /// Inline stores only — no call between the CAS and this. `slot` back for the guard.
+    #[inline(always)]
+    pub fn flip(slot: u16) -> u16 {
+        if slot != NONE {
+            let (p, i) = (&PARTS[slot as usize / PER], slot as usize % PER);
+            let v = p.intent[i].load(Relaxed);
+            p.t0[i].store(unsafe { core::arch::x86_64::_rdtsc() }, Relaxed);
+            p.tag[i].store(v & !WIN, Release);
+            p.intent[i].store(0, Release);
+        }
+        slot
+    }
+
+    /// Into the window for one slow-path CAS (call-free up to the CAS).
+    #[inline(always)]
+    pub fn win(slot: u16) {
+        if slot != NONE {
+            let w = &PARTS[slot as usize / PER].intent[slot as usize % PER];
+            w.store(w.load(Relaxed) | WIN, Release);
+        }
+    }
+
+    /// Out of the window: the CAS lost (before any call: `wait_begin`, the next spin).
+    #[inline(always)]
+    pub fn unwin(slot: u16) {
+        if slot != NONE {
+            let w = &PARTS[slot as usize / PER].intent[slot as usize % PER];
+            w.store(w.load(Relaxed) & !WIN, Release);
+        }
+    }
+
+    /// A `try_lock` that lost its CAS: the claimed slot is freed (no hold began).
+    #[inline(always)]
+    pub fn abandon(slot: u16) {
+        if slot != NONE {
+            let (p, i) = (&PARTS[slot as usize / PER], slot as usize % PER);
+            p.intent[i].store(0, Release);
+            p.mask.fetch_and(!(1u32 << i), Release);
+        }
+    }
+
+    /// `release_task`'s ONE intent arm: slot `i` of `p` was CLAIMED by dead task `tid` (its tag still 0). It won its raw
+    /// CAS and died before the flip when WIN is set, the raw lock is locked, no tracked holder names the lock and the
+    /// heap's gap release took nothing (`may`): its intent (WIN kept, for `Dead::say`) goes back to the walk's body (mark,
+    /// free, force-unlock). Otherwise it never took the lock (spinning, before its CAS, CAS lost): the slot is freed, 0.
+    fn won_gap(p: &Part, i: usize, tid: u64, may: bool) -> u64 {
+        let v = p.intent[i].load(Acquire);
+        if v == 0 || tag_tid(v) != tid {
+            return 0;
+        }
+        let addr = p.lock[i].load(Relaxed);
+        p.intent[i].store(0, Release);
+        if may && v & WIN != 0 && addr != 0 && super::Mutex::<()>::raw_locked(addr) && holder_of(addr).is_none() {
+            return v;
+        }
+        p.mask.fetch_and(!(1u32 << i), Release);
+        0
+    }
+
+    // `tests lockreg`'s REGGAP leg: a death between the CAS and the flip cannot be staged on purpose, so the walk's arm is
+    // asserted directly on a synthetic dead task FAKE (no live task; lockowner and heapgap match nothing).
+    static GAP: super::Mutex<u32> = super::Mutex::new(0);
+    const FAKE: u64 = 0xFF_FFFE;
+
+    /// A GAP slot claimed as dead FAKE would hold it: `acquire`'s intent re-tagged to FAKE, WIN kept. NONE = no slot.
+    fn fake_claim() -> u16 {
+        let s = acquire(GAP.addr(), &GAP.class, GAP.site, GAP.site, false);
+        if s != NONE {
+            let w = &PARTS[s as usize / PER].intent[s as usize % PER];
+            w.store((w.load(Relaxed) & 0xFF_FFFF) | FAKE << 24, Release);
+        }
+        s
+    }
+
+    fn slot_free(s: u16) -> bool {
+        PARTS[s as usize / PER].mask.load(Acquire) & (1u32 << (s as usize % PER)) == 0
+    }
+
+    /// The REGGAP leg, masked on this core: (1) intent — a FAKE slot with WIN and the raw word set is invisible to every
+    /// reader; (2) walk — `release_task(FAKE)` releases it (1), unlocked, poisoned, slot freed, `why=intent-gap`;
+    /// (3) waiter_kept — GAP held tracked by this task and a FAKE WIN slot on it: nothing released, no mark, slot freed;
+    /// (4) flip — `GAP.lock()`'s slot is a tag, its intent cleared, its holder this task.
+    fn reggap_leg() {
+        if !ON.load(Acquire) {
+            serial_println!(":: REGGAP: -> SKIP(unarmed) ::");
+            return;
+        }
+        let _ = GAP.take_poison(); // a mark left by an earlier run
+        let (iword, n, why, kword, fword) = crate::arch::without_interrupts(|| {
+            let s = fake_claim();
+            if s == NONE {
+                return ("no-slot", 0usize, "none", "skip(intent)", "skip(intent)");
+            }
+            let took = GAP.raw.try_lock().map(core::mem::forget).is_some();
+            let v = PARTS[s as usize / PER].intent[s as usize % PER].load(Acquire);
+            let iword = if !took { "busy" } else if v & WIN == 0 { "no-win" } else if holder_of(GAP.addr()).is_some() { "tagged" } else { "ok" };
+            if iword != "ok" {
+                abandon(s);
+                if took {
+                    // SAFETY: this leg took the raw word itself and forgot its guard; nothing else holds it.
+                    unsafe { GAP.force_unlock() };
+                }
+                return (iword, 0, "none", "skip(intent)", "skip(intent)");
+            }
+            let n = release_task(FAKE, "tests lockreg reggap");
+            let (unlocked, poisoned, freed) = (!GAP.is_locked(), GAP.take_poison(), slot_free(s));
+            let why = if n == 1 && unlocked && poisoned && freed { "intent-gap" } else { "none" };
+            let g = GAP.lock();
+            let s2 = fake_claim();
+            let kword = if s2 == NONE {
+                "no-slot"
+            } else {
+                let k = release_task(FAKE, "tests lockreg reggap waiter");
+                if k != 0 || !GAP.is_locked() { "released" } else if GAP.take_poison() { "poisoned" } else if !slot_free(s2) { "slot-kept" } else { "ok" }
+            };
+            let fword = if g.slot == NONE {
+                "untagged"
+            } else {
+                let (p, i) = (&PARTS[g.slot as usize / PER], g.slot as usize % PER);
+                if p.intent[i].load(Acquire) != 0 {
+                    "intent-left"
+                } else if p.tag[i].load(Acquire) == 0 || holder_of(GAP.addr()).map(|(t, _)| t) != Some(here_tid()) {
+                    "untagged"
+                } else {
+                    "ok"
+                }
+            };
+            drop(g);
+            (iword, n, why, kword, fword)
+        });
+        let pass = iword == "ok" && n == 1 && why == "intent-gap" && kword == "ok" && fword == "ok";
+        serial_println!(":: REGGAP: intent={} flip={} walk_released={} why={} waiter_kept={} -> {} ::", iword, fword, n, why, kword, if pass { "PASS" } else { "FAIL" });
+    }
+
+    // ── LOCKREGFULL (rmbp-ledger B1034, BP-cores-20): an acquire the registry could not place is counted by its cause —
+    // pre-arm (`EARLY`), armed but unplaceable (`UNGS`: a foreign GS, cpu >= MAX_CPUS), this core's partition full
+    // (`FULL`, also in `overflow=`) — each partition keeps its claimed-slot high-water, and the boot's FIRST partition-full
+    // is noted lock-free in `acquire` and said ONCE by the scan (never inside `lock`/`release`), naming the refused taker
+    // and the partition's oldest hold (the leaker, if one exists). ──
+
+    /// Acquires taken armed whose caller the registry could not place (a foreign GS, cpu >= MAX_CPUS).
+    static UNGS: AtomicU64 = AtomicU64::new(0);
+    /// Acquires refused a slot because this core's partition was full (each also counted in `OVERFLOW`).
+    static FULL: AtomicU64 = AtomicU64::new(0);
+    /// Per partition: the most slots ever claimed at once (written by the owning core on claim).
+    static SLOT_HIGH: [core::sync::atomic::AtomicU8; MAX_CPUS] = [const { core::sync::atomic::AtomicU8::new(0) }; MAX_CPUS];
+    /// The once note's state: open, being written (`full_note`), pending (the scan says it), said.
+    const FN_OPEN: u8 = 0;
+    const FN_WRITING: u8 = 1;
+    const FN_PENDING: u8 = 2;
+    const FN_SAID: u8 = 3;
+    static FULL_STATE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(FN_OPEN);
+    /// The refused taker (`tid << 24 | (cpu + 1)`), its own slots in that partition, its acquire site.
+    static FULL_TAG: AtomicU64 = AtomicU64::new(0);
+    static FULL_DEPTH: AtomicU32 = AtomicU32::new(0);
+    static FULL_AT: AtomicPtr<Loc> = AtomicPtr::new(core::ptr::null_mut());
+    /// The partition's oldest hold at the refusal: its tag (or claimed intent), acquire site, age (TSC).
+    static FULL_OLD_TAG: AtomicU64 = AtomicU64::new(0);
+    static FULL_OLD_AT: AtomicPtr<Loc> = AtomicPtr::new(core::ptr::null_mut());
+    static FULL_OLD_SPAN: AtomicU64 = AtomicU64::new(0);
+    /// The note is the KAT's own (`kat=1`), and the lines said so far.
+    static FULL_KAT: AtomicBool = AtomicBool::new(false);
+    static FULL_SAID_N: AtomicU32 = AtomicU32::new(0);
+
+    /// A claim won with `m` the mask it CAS'd: this partition's high-water rises when the claim is a new depth.
+    #[inline(always)]
+    fn slot_high(cpu: usize, m: u32) {
+        let d = m.count_ones() as u8 + 1;
+        let h = &SLOT_HIGH[cpu];
+        if d > h.load(Relaxed) {
+            h.fetch_max(d, Relaxed);
+        }
+    }
+
+    /// The highest partition high-water and its cpu (`slot_high=<n>@cpu<c>`).
+    fn slot_high_max() -> (u8, usize) {
+        let mut best = (0u8, 0usize);
+        for (c, h) in SLOT_HIGH.iter().enumerate() {
+            let v = h.load(Relaxed);
+            if v > best.0 {
+                best = (v, c);
+            }
+        }
+        best
+    }
+
+    /// The tag a slot carries, or its claimed intent (WIN cleared) while it has none; 0 = empty.
+    #[inline]
+    fn slot_word(p: &Part, i: usize) -> u64 {
+        match p.tag[i].load(Acquire) {
+            0 => p.intent[i].load(Acquire) & !WIN,
+            t => t,
+        }
+    }
+
+    /// `acquire` found partition `p` full: counted, and the boot's FIRST refusal noted for the scan (atomics only — this
+    /// runs inside `Mutex::lock`/`try_lock`, so it never prints and never takes a lock).
+    #[cold]
+    #[inline(never)]
+    fn full_note(p: &Part, cpu: usize, tid: u64, addr: usize, at: &'static Loc) {
+        FULL.fetch_add(1, Relaxed);
+        if FULL_STATE.compare_exchange(FN_OPEN, FN_WRITING, AcqRel, Relaxed).is_err() {
+            return;
+        }
+        let (mut depth, mut old_i, mut old_t0) = (0u32, PER, u64::MAX);
+        for i in 0..PER {
+            let t = slot_word(p, i);
+            if t == 0 {
+                continue;
+            }
+            if tag_tid(t) == tid {
+                depth += 1;
+            }
+            let t0 = p.t0[i].load(Relaxed);
+            if t0 < old_t0 {
+                old_t0 = t0;
+                old_i = i;
+            }
+        }
+        FULL_TAG.store(tid << 24 | (cpu as u64 + 1), Relaxed);
+        FULL_DEPTH.store(depth, Relaxed);
+        FULL_AT.store(at as *const Loc as *mut Loc, Relaxed);
+        if old_i < PER {
+            FULL_OLD_TAG.store(slot_word(p, old_i), Relaxed);
+            FULL_OLD_AT.store(p.at[old_i].load(Relaxed), Relaxed);
+            FULL_OLD_SPAN.store(rdtsc().wrapping_sub(old_t0), Relaxed);
+        } else {
+            FULL_OLD_TAG.store(0, Relaxed);
+            FULL_OLD_AT.store(core::ptr::null_mut(), Relaxed);
+            FULL_OLD_SPAN.store(0, Relaxed);
+        }
+        FULL_KAT.store(addr == FULLKAT.addr(), Relaxed);
+        FULL_STATE.store(FN_PENDING, Release);
+    }
+
+    /// The scan's tail: a pending note is said ONCE — `[lock] registry full cpu= depth= at= by= oldest= oldest_at=
+    /// oldest_by= oldest_ms=` (+ ` kat=1` for the KAT's own).
+    fn full_say() {
+        if FULL_STATE.load(Acquire) != FN_PENDING || FULL_STATE.compare_exchange(FN_PENDING, FN_SAID, AcqRel, Relaxed).is_err() {
+            return;
+        }
+        let hz = crate::arch::apic::tsc_hz().max(1000);
+        let (tag, old) = (FULL_TAG.load(Relaxed), FULL_OLD_TAG.load(Relaxed));
+        let (at, old_at) = (FULL_AT.load(Relaxed), FULL_OLD_AT.load(Relaxed));
+        // SAFETY: both are `&'static Location`s or null.
+        let (at, old_at) = (if at.is_null() { None } else { Some(unsafe { &*at }) }, if old_at.is_null() { None } else { Some(unsafe { &*old_at }) });
+        let span = FULL_OLD_SPAN.load(Relaxed);
+        let old_ms = if span > (u64::MAX >> 1) { 0 } else { span / (hz / 1000) };
+        serial_println!(
+            "[lock] registry full cpu={} depth={} at={} by={} oldest={} oldest_at={} oldest_by={}@cpu{} oldest_ms={}{}",
+            tag_cpu(tag),
+            FULL_DEPTH.load(Relaxed),
+            Site(at),
+            tag_tid(tag),
+            Site(class_site(tag_class(old))),
+            Site(old_at),
+            tag_tid(old),
+            tag_cpu(old),
+            old_ms,
+            if FULL_KAT.load(Relaxed) { " kat=1" } else { "" }
+        );
+        FULL_SAID_N.fetch_add(1, Release);
+    }
+
+    // `tests lockreg`'s FULL leg: this core's partition filled on purpose with claims on FULLKAT.
+    static FULLKAT: super::Mutex<u32> = super::Mutex::new(0);
+
+    /// The FULL KAT (`full_kat=`), masked on this core: claim FULLKAT slots until `acquire` refuses (the "33rd" take),
+    /// take once more (refused again); both refusals counted, the partition's high-water 32; every claim abandoned and
+    /// the boot's counters (FULL, OVERFLOW, this core's acq/tracked, its high-water) given back. Unmasked: the next take
+    /// is tracked, and the note is said exactly ONCE by the scan; the latch the KAT's note took is re-opened, so a real
+    /// FULL later still gets its one line. A latch a real FULL already took: `skip(latched)`.
+    fn full_kat() -> &'static str {
+        if !ON.load(Acquire) {
+            return "skip(unarmed)";
+        }
+        let open = FULL_STATE.load(Acquire) == FN_OPEN;
+        let said0 = FULL_SAID_N.load(Acquire);
+        let w = crate::arch::without_interrupts(|| {
+            let Some((_, cpu)) = who() else { return "skip(no-cpu)" };
+            let p = &PARTS[cpu];
+            let (high0, f0) = (SLOT_HIGH[cpu].load(Relaxed), FULL.load(Relaxed));
+            let mut s = [NONE; PER];
+            let (mut n, mut refused, mut calls, mut claims) = (0usize, 0u64, 0u64, 0u64);
+            for _ in 0..PER + 2 {
+                let x = acquire(FULLKAT.addr(), &FULLKAT.class, FULLKAT.site, FULLKAT.site, false);
+                calls += 1;
+                if x == NONE {
+                    refused += 1;
+                    if refused == 2 {
+                        break;
+                    }
+                    continue;
+                }
+                claims += 1;
+                if n < PER {
+                    s[n] = x;
+                    n += 1;
+                } else {
+                    abandon(x);
+                }
+            }
+            let counted = refused == 2 && FULL.load(Relaxed) >= f0 + 2;
+            let high = SLOT_HIGH[cpu].load(Relaxed);
+            for &x in &s[..n] {
+                abandon(x);
+            }
+            if refused > 0 {
+                FULL.fetch_sub(refused, Relaxed);
+                OVERFLOW.fetch_sub(refused, Relaxed);
+            }
+            p.acq.store(p.acq.load(Relaxed).wrapping_sub(calls), Relaxed);
+            p.tracked.store(p.tracked.load(Relaxed).wrapping_sub(claims), Relaxed);
+            SLOT_HIGH[cpu].store(high0, Relaxed);
+            if refused == 0 {
+                "no-full"
+            } else if !counted {
+                "not-counted"
+            } else if high != PER as u8 {
+                "high-short"
+            } else {
+                "ok"
+            }
+        });
+        if w != "ok" {
+            return w;
+        }
+        if !FULLKAT.try_lock().map(|g| g.slot != NONE).unwrap_or(false) {
+            return "untracked-after";
+        }
+        if !open {
+            return "skip(latched)";
+        }
+        let t0 = crate::arch::ms();
+        while FULL_SAID_N.load(Acquire) == said0 && crate::arch::ms().saturating_sub(t0) <= 2 * SCAN_MS + 50 {
+            crate::arch::sched::sleep_ms(5);
+        }
+        let said = FULL_SAID_N.load(Acquire).wrapping_sub(said0);
+        if said == 1 && FULL_KAT.load(Relaxed) {
+            let _ = FULL_STATE.compare_exchange(FN_SAID, FN_OPEN, AcqRel, Relaxed);
+        }
+        if said == 0 {
+            "not-said"
+        } else if said > 1 {
+            "said-twice"
+        } else {
+            "ok"
+        }
+    }
+
+    // ── LOCKREGFORCEUNLOCK (rmbp-ledger B1036, BP-cores-20): a slot freed OUT OF BAND — `forget` (`Mutex::force_unlock`,
+    // `untrack`) and `release_task`'s walk — moves its generation (`era`) BEFORE the mask clear; the guard snapshotted the
+    // era when it was built (`era_of`), so its own later release finds a mismatch and is a no-op, counted in
+    // `release_stale=` (a revenant after a pump-dead release, or a force_unlock under a live guard), never freeing a slot a
+    // later acquire re-claimed. A normal release never bumps: `acquire` is untouched. ──
+
+    /// Guard releases that found their slot freed out of band since the guard was built (nothing cleared).
+    static STALE: AtomicU64 = AtomicU64::new(0);
+
+    /// The era slot `slot` carries now (0 for NONE): the guard's snapshot (`Mutex::guard`).
+    #[inline(always)]
+    pub fn era_of(slot: u16) -> u16 {
+        if slot == NONE {
+            return 0;
+        }
+        PARTS[slot as usize / PER].era[slot as usize % PER].load(Acquire)
+    }
+
+    /// `release`'s check: `true` = the slot was freed out of band since the guard's snapshot — counted; the caller
+    /// clears nothing (never printed here: this runs inside a guard's `Drop`).
+    #[inline(always)]
+    fn stale(slot: u16, era: u16) -> bool {
+        if PARTS[slot as usize / PER].era[slot as usize % PER].load(Acquire) == era {
+            return false;
+        }
+        STALE.fetch_add(1, Relaxed);
+        true
+    }
+
+    /// An out-of-band free of slot `i` of `p`: its era moves (the caller clears the mask bit after this).
+    #[inline(always)]
+    fn bump(p: &Part, i: usize) {
+        p.era[i].fetch_add(1, Release);
+    }
+
+    // `tests lockreg`'s force_unlock leg: a live guard on FUKAT force-unlocked, its slot re-claimed by FUKAT2.
+    static FUKAT: super::Mutex<u32> = super::Mutex::new(0);
+    static FUKAT2: super::Mutex<u32> = super::Mutex::new(0);
+
+    /// The force_unlock KAT (`forceunlock_kat=`), masked on this core: take FUKAT (slot s), force-unlock it under its live
+    /// guard (s freed), take FUKAT2 (it lands on s, the lowest free bit), drop the stale FUKAT guard (s must stay
+    /// FUKAT2's, `release_stale` +1), drop FUKAT2's guard (s freed). The KAT's own stale count is given back.
+    fn forceunlock_kat() -> &'static str {
+        if !ON.load(Acquire) {
+            return "skip(unarmed)";
+        }
+        let stale0 = STALE.load(Relaxed);
+        let w = crate::arch::without_interrupts(|| {
+            if who().is_none() {
+                return "skip(no-cpu)";
+            }
+            let g = FUKAT.lock();
+            let s = g.slot;
+            if s == NONE {
+                drop(g);
+                return "untracked";
+            }
+            // SAFETY: this leg holds FUKAT through `g` and never touches its data again; `g` is only dropped below (the
+            // stale release under test, whose raw unlock finds the word already free). Nothing else takes FUKAT.
+            unsafe { FUKAT.force_unlock() };
+            if !slot_free(s) {
+                drop(g);
+                return "not-freed";
+            }
+            let g2 = FUKAT2.lock();
+            if g2.slot != s {
+                drop(g);
+                drop(g2);
+                return "skip(no-reuse)";
+            }
+            let (p, i) = (&PARTS[s as usize / PER], s as usize % PER);
+            drop(g);
+            let live = !slot_free(s) && p.tag[i].load(Acquire) != 0 && p.lock[i].load(Relaxed) == FUKAT2.addr();
+            let counted = STALE.load(Relaxed).wrapping_sub(stale0) == 1;
+            drop(g2);
+            let freed = slot_free(s);
+            if !live {
+                "freed-live"
+            } else if !counted {
+                "not-counted"
+            } else if !freed {
+                "kept"
+            } else {
+                "ok"
+            }
+        });
+        let mine = STALE.load(Relaxed).wrapping_sub(stale0).min(1);
+        if mine > 0 {
+            STALE.fetch_sub(mine, Relaxed);
+        }
+        w
+    }
+
+    // ── GEN7LOCKHELD (rmbp-ledger B1044, BP-gpu-9 / BP-cores-20): the order table READ, never written — a driver's
+    // order KAT asks whether the walk has recorded a->b and b->a, and the inversions so far. Nothing is planted: an
+    // inverted KAT take would leave b->a in `EDGE` for the boot (no removal path) and `edge()` would then return early on
+    // every later real inversion of the pair, uncounted. ──
+
+    /// `(a->b recorded, b->a recorded, inversions so far)` for order classes `a`, `b`; `None` while unarmed. A class 0
+    /// (never acquired, or the class table full) reads as not recorded. The probe is `edge()`'s reverse probe, read-only:
+    /// its hash, 64 slots, stop at an empty slot (a drift in the hash reads every edge absent: never a false "recorded").
+    #[inline]
+    #[allow(dead_code)]
+    pub fn order_seen(a: u16, b: u16) -> Option<(bool, bool, u32)> {
+        if !ON.load(Acquire) {
+            return None;
+        }
+        let has = |x: u16, y: u16| -> bool {
+            if x == 0 || y == 0 || x == y {
+                return false;
+            }
+            let key = (x as u32) << 16 | y as u32;
+            let h = ((key.wrapping_mul(0x9E37_79B1) >> 16) as usize) % EDGES;
+            for n in 0..64 {
+                let cur = EDGE[(h + n) % EDGES].load(Relaxed);
+                if cur == 0 {
+                    return false;
+                }
+                if cur == key {
+                    return true;
+                }
+            }
+            false
+        };
+        Some((has(a, b), has(b, a), INV_N.load(Acquire)))
+    }
+
+    // ── LOCKREGEDGEXCORE (rmbp-ledger B1056, BP-cores-20): `acquire`'s order walk reads EVERY partition for the acquiring
+    // task (tid 0 = this core only), so a nested pair split by a preemption and a steal keeps its edge and a reverse take on
+    // the new core counts in `inversions=`. No door forces a migration (a woken task returns to the core it blocked on;
+    // `try_steal` needs an idle thief past the floor and the cooldown), so the KAT PLANTS the stranded hold in a sibling
+    // partition (the REGGAP `fake_claim` shape) and makes the nested take for real. Owed: LOCKREG-EDGE-XCORE-KAT (a real
+    // migration, GEN7-ORDER-FORCEMIG's door), LOCKREG-XCORE-COST. LOCKREG-OUTER-XCORE BUILT by LOCKREGOUTERXCORE (B1057):
+    // `outer_site` walks through `task_slots` (the walk `acquire` uses), checked here as `outer=`. ──
+    static XA: super::Mutex<u32> = super::Mutex::new(0);
+    static XB: super::Mutex<u32> = super::Mutex::new(0);
+
+    /// The cross-partition KAT (`:: LOCKXCORE:`), masked on this core: a hold of XA by THIS task planted in partition
+    /// (cpu + 1) % MAX_CPUS with `acquire`'s own mask CAS (what a preemption + steal leaves: the hold stays in the partition
+    /// it was taken on), then `XB.lock()` through the real `acquire`; the walk must record XA -> XB. XA's raw lock is never
+    /// taken (a tag only), the planted slot is freed in `release`'s order, nothing reversed is planted (`order_seen`'s rule).
+    /// The old one-partition walk reads fwd=0 (FAIL). LOCKREGXCORECOST (B1062): this core's walk census (`XCOST`) must count
+    /// XB's take as exactly one walk (`walks=<w0>-><w0+1>`; an untimed walk reads `<w0>-><w0>`, FAIL); `walks=off` without `lockreg_census` (B1075).
+    fn xcore_leg() {
+        if !ON.load(Acquire) {
+            serial_println!(":: LOCKXCORE: -> SKIP(unarmed) ::");
+            return;
+        }
+        let r: Result<(usize, usize, bool, bool, u32, u32, Option<bool>, u64, u64), &'static str> = crate::arch::without_interrupts(|| {
+            let Some((tid, cpu)) = who() else { return Err("no-cpu") };
+            if tid == 0 {
+                return Err("no-task");
+            }
+            let (a, b) = (class_of(XA.site), class_of(XB.site));
+            if a == 0 || b == 0 {
+                return Err("classes");
+            }
+            XA.class.store(a, Relaxed);
+            XB.class.store(b, Relaxed);
+            if order_seen(a, b).map(|o| o.0).unwrap_or(false) {
+                return Err("recorded"); // a second `tests lockreg` this boot: the edge is permanent
+            }
+            let before = outer_site(tid, cpu); // LOCKREGOUTERXCORE (B1057): an older tracked hold of this task would be the outermost: `outer=-`
+            let q = (cpu + 1) % MAX_CPUS;
+            let pq = &PARTS[q];
+            let mut m = pq.mask.load(Acquire);
+            let i = loop {
+                let free = !m;
+                if free == 0 {
+                    return Err("full");
+                }
+                let i = free.trailing_zeros();
+                match pq.mask.compare_exchange_weak(m, m | 1 << i, AcqRel, Acquire) {
+                    Ok(_) => break i as usize,
+                    Err(now) => m = now,
+                }
+            };
+            pq.lock[i].store(XA.addr(), Relaxed);
+            pq.at[i].store(XA.site as *const Loc as *mut Loc, Relaxed);
+            pq.t0[i].store(rdtsc(), Relaxed);
+            pq.tag[i].store(tid << 24 | (a as u64) << 8 | (q as u64 + 1), Release);
+            let inv0 = INV_N.load(Acquire);
+            let w0 = XCOST[cpu].walks.load(Relaxed); // LOCKREGXCORECOST (B1062): masked, so XB's take is this core's only acquire between the reads
+            drop(XB.lock());
+            let w1 = XCOST[cpu].walks.load(Relaxed);
+            let outer = if before != 0 { None } else { Some(outer_site(tid, cpu) == XA.site as *const Loc as usize) }; // LOCKREGOUTERXCORE (B1057): the planted sibling hold is this task's outermost
+            pq.tag[i].store(0, Release);
+            pq.mask.fetch_and(!(1u32 << i), Release);
+            let (fwd, rev, inv1) = order_seen(a, b).unwrap_or((false, false, inv0));
+            Ok((q, cpu, fwd, rev, inv0, inv1, outer, w0, w1))
+        });
+        match r {
+            Err(why) => {
+                serial_println!(":: LOCKXCORE: -> SKIP({}) ::", why);
+            }
+            Ok((q, cpu, fwd, rev, inv0, inv1, outer, w0, w1)) => {
+                let pass = fwd && !rev && inv1 == inv0 && outer != Some(false) && (!CENSUS || w1 == w0 + 1); // LOCKREGXCORECOSTKNOB (B1075): without `lockreg_census` nothing counts and the walks are not judged. LOCKREGXCORECOST (B1062): the walk census counted XB's one walk
+                let ow = match outer { Some(true) => "1", Some(false) => "0", None => "-" };
+                serial_println!(":: LOCKXCORE: planted=c{} took=c{} fwd={} rev={} inversions={}->{} outer={} -> {} :: walks={}", q, cpu, fwd as u8, rev as u8, inv0, inv1, ow, if pass { "PASS" } else { "FAIL" }, XWalks(w0, w1));
+            }
+        }
+    }
+
+    // ── LOCKREGXCORECOST (rmbp-ledger B1062, BP-cores-20): B1056's all-partition order walk in `acquire` (`task_slots`)
+    // costs 7 remote `mask` loads per tracked blocking `lock()` by a task; this census COUNTS it: the TSC span of every
+    // walk by a task (tid != 0; tid 0 walks its own core only) — the whole `task_slots` call, its `edge()` inserts
+    // included — into THREE atomics PER CORE (written only by the acquiring core, the `Part::acq` shape: plain load +
+    // store, Relaxed, lossy under a preemption as `acq` is; per core so the census shares no line across cores and does
+    // not perturb what it measures). Gated by `ON` (after `who()`) AND by `lockreg_census` (LOCKREGXCORECOSTKNOB B1075: two `rdtsc` + three
+    // core-local stores per counted walk when armed, nothing when off: `CENSUS`). Said once per `tests lockreg` run by `xcost_say`, never inside `lock`.
+    // `outer_site` (stall samples only) is untimed. Owed: LOCKREG-XCORE-HINT. LOCKREG-XCORE-COST-KNOB BUILT by B1075. ──
+    #[repr(align(64))]
+    struct XCost {
+        walks: AtomicU64,
+        sum: AtomicU64,
+        max: AtomicU64,
+    }
+    static XCOST: [XCost; MAX_CPUS] = [const { XCost { walks: AtomicU64::new(0), sum: AtomicU64::new(0), max: AtomicU64::new(0) } }; MAX_CPUS];
+
+    /// One walk by task `tid` on core `cpu` began at TSC `x0` (from `acquire`, after `task_slots` returns).
+    #[inline(always)]
+    fn xcost_note(tid: u64, cpu: usize, x0: u64) {
+        if !CENSUS || tid == 0 { // LOCKREGXCORECOSTKNOB (B1075): off = no rdtsc, no store
+            return; // a core's scheduler context walks this core only: not the cross-partition walk
+        }
+        let d = rdtsc().wrapping_sub(x0);
+        if d >= u64::MAX / 2 {
+            return;
+        }
+        let s = &XCOST[cpu];
+        s.walks.store(s.walks.load(Relaxed) + 1, Relaxed);
+        s.sum.store(s.sum.load(Relaxed).wrapping_add(d), Relaxed);
+        if d > s.max.load(Relaxed) {
+            s.max.store(d, Relaxed);
+        }
+    }
+
+    /// `[lockreg] xcore walks=<n> sum_cyc=<n> max_cyc=<n> avg_cyc=<n> tsc_mhz=<n>`: every core's census summed (max = the
+    /// highest), in TSC ticks; all 0 when unarmed. Once per `tests lockreg` run (`selftest`), after `:: LOCKXCORE:`.
+    fn xcost_say() {
+        if !CENSUS { serial_println!("[lockreg] xcore census=off"); return; } let (mut walks, mut sum, mut max) = (0u64, 0u64, 0u64); // LOCKREGXCORECOSTKNOB (B1075): the off word, LINE-NEUTRAL fold
+        for s in XCOST.iter() {
+            walks += s.walks.load(Relaxed);
+            sum = sum.wrapping_add(s.sum.load(Relaxed));
+            max = max.max(s.max.load(Relaxed));
+        }
+        let avg = if walks == 0 { 0 } else { sum / walks };
+        let mhz = crate::arch::apic::tsc_hz().max(1000) / 1_000_000;
+        serial_println!("[lockreg] xcore walks={} sum_cyc={} max_cyc={} avg_cyc={} tsc_mhz={}", walks, sum, max, avg, mhz);
+    }
+
+    // ── LOCKREGXCORECOSTKNOB (rmbp-ledger B1075, BP-cores-20): the walk census above is a kernel feature, `lockreg_census`
+    // (UNAOS_LOCKREG_CENSUS), DEFAULT OFF. ONE const read inside the existing fns (no off-arm copies): off, `xcost_t0`
+    // and `xcost_note` fold to nothing (no rdtsc, no store, `XCOST` unreferenced), `xcost_say` says `census=off` and
+    // `xcore_leg` says `walks=off` and does not judge the count. Both polarities type-check on every leg. ──
+    const CENSUS: bool = cfg!(feature = "lockreg_census");
+
+    /// The walk's start stamp for `xcost_note` (from `acquire`): the TSC when the census is armed, 0 (no read) when off.
+    #[inline(always)]
+    fn xcost_t0() -> u64 {
+        if CENSUS { rdtsc() } else { 0 }
+    }
+
+    /// `xcore_leg`'s `walks=` word: `<w0>-><w1>` when the census is armed, `off` when it is not.
+    struct XWalks(u64, u64);
+    impl core::fmt::Display for XWalks {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            if CENSUS { write!(f, "{}->{}", self.0, self.1) } else { f.write_str("off") }
+        }
+    }
 }
 
 // ── STACKGUARD3 (rmbp-ledger B832): the poison check, ADDITIVE (file tail: GATE-LOCKTYPE pins the lines above). ──
@@ -1264,6 +1934,82 @@ impl<T: ?Sized> Mutex<T> {
         #[cfg(not(target_arch = "x86_64"))]
         {
             false
+        }
+    }
+}
+
+// ── PUMPDEATHREHOME (rmbp-ledger B1016): the registry's view of ONE lock, ADDITIVE (file tail: GATE-LOCKTYPE pins the lines above). ──
+impl<T: ?Sized> Mutex<T> {
+    /// The tracked holder `(task id, cpu)`; `None` = free, or held with no registry entry (the tag gap), or aarch64.
+    #[inline]
+    pub fn holder(&self) -> Option<(u64, usize)> {
+        #[cfg(target_arch = "x86_64")]
+        {
+            reg::holder_at(self.addr())
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            None
+        }
+    }
+
+    /// The oldest live spin on this lock in ms (0 = nobody waits, or aarch64).
+    #[inline]
+    pub fn wait_ms(&self) -> u64 {
+        #[cfg(target_arch = "x86_64")]
+        {
+            reg::wait_ms_at(self.addr())
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            0
+        }
+    }
+
+    /// Drop this lock's registry entries without unlocking it: the hold goes untagged (`tests pumpdeath` only).
+    #[inline]
+    pub fn untrack(&self) {
+        #[cfg(target_arch = "x86_64")]
+        reg::untrack(self.addr());
+    }
+}
+
+/// The caller as the registry names it: `(task id, cpu)`, `None` unarmed or with a foreign GS (allocator.rs `heapgap`).
+#[cfg(target_arch = "x86_64")]
+#[inline]
+pub fn here() -> Option<(u64, usize)> {
+    reg::here()
+}
+
+// ── LOCKREGFORCEUNLOCK (rmbp-ledger B1036): the guard's era snapshot, ADDITIVE (file tail: GATE-LOCKTYPE pins the lines above). ──
+/// The era slot `slot` carries now (`reg::era_of`); 0 for an untracked hold and on aarch64 (no registry).
+#[inline(always)]
+fn slot_era(slot: u16) -> u16 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        reg::era_of(slot)
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = slot;
+        0
+    }
+}
+
+// ── GEN7LOCKHELD (rmbp-ledger B1044): the registry's order knowledge of ONE pair, ADDITIVE (file tail: GATE-LOCKTYPE pins the lines above). ──
+impl<T: ?Sized> Mutex<T> {
+    /// `(self->then recorded, then->self recorded, inversions so far)` as the order walk has seen them (`reg::order_seen`):
+    /// read-only, plants nothing. `None` while the registry is unarmed, and on aarch64 (no registry).
+    #[inline]
+    pub fn order_seen<U: ?Sized>(&self, then: &Mutex<U>) -> Option<(bool, bool, u32)> {
+        #[cfg(target_arch = "x86_64")]
+        {
+            reg::order_seen(self.class.load(core::sync::atomic::Ordering::Relaxed), then.class.load(core::sync::atomic::Ordering::Relaxed))
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let _ = then;
+            None
         }
     }
 }

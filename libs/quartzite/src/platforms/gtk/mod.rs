@@ -193,7 +193,7 @@ impl Backend {
         synapse: bandy::Synapse,
     ) -> Self {
         Self::new_vessel(app_id, title, content_size, move |_window| {
-            crate::platforms::gtk::tetra_eval::eval_tetra(tetra_node, synapse.clone())
+            crate::platforms::gtk::tetra_eval::eval_live(tetra_node, synapse.clone()) // SURFACEID (SR332): each Surface leaf reads its number; FACELIVE (SR435): evaluated through the face-push door, so the vessel can patch it in place
         })
     }
 
@@ -209,6 +209,8 @@ pub mod button;
 pub mod text_field;
 pub mod glyph;
 pub mod image_view;
+pub mod save_dialog; // SAVEDIALOG (SR364): the platform save panel the image surface's lane opens
+pub mod open_dialog; // OPEN-DIALOG-ONE (SR386): the platform open panel, the same lane's
 pub mod console_view;
 // AETHERCHROME (SR84): the browser chrome's GTK face.
 pub mod tab_strip;

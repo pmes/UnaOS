@@ -89,6 +89,7 @@ mod txt;
 mod ui;
 mod chrome; // AETHERMETAL4 (SR109): the chrome (tabs, omnibox, history, bookmarks, downloads, zoom)
 mod store; // AETHERMETAL4 (SR109): the chrome's files under the home (SYS_WHOAMI + SYS_PATH_*)
+mod pdf; // PDF4KERNEL (rmbp-ledger B999): a PDF opens over pdf_core — the pdf module's head has the mechanism
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -217,6 +218,8 @@ struct Page {
     box_link: Vec<Option<NodeId>>,
     /// Every `a[href]`, document order (Tab).
     links: Vec<NodeId>,
+    /// PDF4KERNEL (B999): the open PDF this page shows instead of its (empty) document; dropped with the page.
+    pdf: Option<pdf::View>,
 }
 
 impl Page {
@@ -240,6 +243,7 @@ impl Page {
             flat: ui::Flat::default(),
             box_link: Vec::new(),
             links,
+            pdf: None,
         }
     }
 
@@ -347,6 +351,9 @@ fn lay(p: &mut Page, fonts: &mut txt::Fonts, w: i32, h: i32) {
     p.flat = ui::Flat::build(&tree, &p.boxes);
     p.box_link = ui::link_of(p.doc, &tree, &p.boxes);
     p.tree = Some(tree);
+    if let Some(v) = p.pdf.as_mut() {
+        p.doc_h = v.fit(w); // PDF4KERNEL (B999): the page stack, fitted to the width, is what scrolls
+    }
 }
 
 // ---- AETHERMETAL M3 (SR96): the interaction ---------------------------------------------------------------
@@ -451,7 +458,7 @@ fn fetch(path: &str) -> Result<(Vec<u8>, String), i64> {
     let tries: [&str; 2] = [path, if path.starts_with("/system/") { twin.as_str() } else { "" }];
     for t in tries.iter().filter(|t| !t.is_empty()) {
         match sys::read_file(t.as_bytes(), PAGE_MAX) {
-            Ok((v, _)) if !v.is_empty() => return Ok((v, String::from(*t))),
+            Ok((v, _)) if !v.is_empty() => return Ok((pdf::widen(t, v), String::from(*t))), // PDF4KERNEL (B999): a PDF past PAGE_MAX
             Ok(_) => {}
             Err(e) => {
                 if err == 0 {
@@ -466,6 +473,7 @@ fn fetch(path: &str) -> Result<(Vec<u8>, String), i64> {
 /// Load `path` as the page (`push` = a new history entry; Back/Forward move along the list instead).
 fn load(app: &mut App, page: &mut Page, fonts: &mut txt::Fonts, path: &str, how: &[u8], push: bool) {
     let fetched = if path == chrome::NEWTAB { Ok((chrome::newtab_html(app).into_bytes(), String::from(path))) } else { fetch(path) }; // SR109
+    let (fetched, view) = pdf::take(path, fetched, fonts, app.w, app.h - paint::status_h()); // PDF4KERNEL (B999): a PDF opens as a pdf::View
     let (html, got, code) = match fetched {
         Ok((b, got)) => (String::from_utf8_lossy(&b).into_owned(), Some(got), 0),
         Err(e) => (
@@ -481,7 +489,8 @@ fn load(app: &mut App, page: &mut Page, fonts: &mut txt::Fonts, path: &str, how:
         ),
     };
     let read = got.is_some();
-    let new = Page::open(&html, got.unwrap_or_else(|| String::from(path)), app.w, app.h);
+    let mut new = Page::open(&html, got.unwrap_or_else(|| String::from(path)), app.w, app.h);
+    new.pdf = view; // PDF4KERNEL (B999)
     drop(html);
     let old = core::mem::replace(page, new);
     old.free();
@@ -493,7 +502,7 @@ fn load(app: &mut App, page: &mut Page, fonts: &mut txt::Fonts, path: &str, how:
         app.hist.push_document(&page.path);
     }
     let mut l = Line::new(b":: AETHER: nav -> ");
-    if read && page.lines > 0 {
+    if read && (page.lines > 0 || page.pdf.is_some()) {
         l.put(b"PASS how=").put(how);
     } else {
         l.put(b"FAIL reason=").put(if read { b"no-lines" as &[u8] } else { b"no-page" }).put(b" code=").dec(code).put(b" how=").put(how);
@@ -513,7 +522,8 @@ fn load(app: &mut App, page: &mut Page, fonts: &mut txt::Fonts, path: &str, how:
 /// engine's `net::favicon_url` rule) — fetched ONCE through `fetch` (the volume or AETHERNET), decoded by pixel_core
 /// (the still-image core http_core already links: PNG, JPEG, GIF, BMP, QOI, WebP; an ICO is refused, no icon), and
 /// handed to the chrome as `sidetabs::favicon_tile`'s 16 px tile for the active tab — or `None`, the letter tile.
-/// Wire: `:: AETHER: favicon -> PASS w=<w> h=<h> src=<url> ::` / `FAIL reason=<none|fetch|decode> ::`.
+/// Wire: `:: AETHER: favicon -> PASS w=<w> h=<h> src=<url> ::` / `SKIP reason=none ::` (no icon declared: not a failure,
+/// AETHERLANE B1004) / `FAIL reason=<fetch|decode> src=<url> ::`.
 fn favicon(app: &mut App, page: &Page) {
     const RELS: [&str; 4] = ["icon", "shortcut", "apple-touch-icon", "apple-touch-icon-precomposed"];
     let doc = page.doc;
@@ -531,7 +541,7 @@ fn favicon(app: &mut App, page: &Page) {
     let mut l = Line::new(b":: AETHER: favicon -> ");
     let Some(src) = href.and_then(|h| resolve(&page.path, &h).ok()).map(|(p, _)| p) else {
         app.ch.set_icon(id, None);
-        l.put(b"FAIL reason=none ::").wire();
+        l.put(b"SKIP reason=none ::").wire(); // AETHERLANE (rmbp-ledger B1004): a page with no icon is not a failure
         return;
     };
     let tile = match fetch(&src) {
@@ -717,6 +727,8 @@ fn overlay(app: &App, page: &Page, cv: &mut paint::Canvas, fonts: &txt::Fonts) {
         paint::status(cv, fonts, &ui::href(page.doc, l), false);
     } else if let Some((s, _)) = &app.flash {
         paint::status(cv, fonts, s, false);
+    } else if let Some(v) = &page.pdf {
+        paint::status(cv, fonts, &v.status(app.scroll, app.h - paint::status_h()), false); // PDF4KERNEL (B999): "Page p / n"
     }
 }
 
@@ -1017,9 +1029,13 @@ pub extern "C" fn _start() -> ! {
             if cv.w != app.w || cv.h != app.h {
                 cv = paint::Canvas::new(app.w, app.h);
             }
-            match page.tree.as_ref() {
-                Some(t) => paint::paint(&mut cv, t, app.scroll, page.bg, &fonts, &page.inks, &marks(&app, &page)),
-                None => cv.fill(0, 0, cv.w, cv.h, page.bg),
+            if let Some(v) = page.pdf.as_mut() {
+                v.paint(&mut cv, app.scroll); // PDF4KERNEL (B999): the pages in place of the (empty) document
+            } else {
+                match page.tree.as_ref() {
+                    Some(t) => paint::paint(&mut cv, t, app.scroll, page.bg, &fonts, &page.inks, &marks(&app, &page)),
+                    None => cv.fill(0, 0, cv.w, cv.h, page.bg),
+                }
             }
             if !reported {
                 reported = true;

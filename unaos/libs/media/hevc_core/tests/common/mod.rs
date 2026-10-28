@@ -180,6 +180,33 @@ impl CabacEnc {
             self.bypass_bits(v - (((1 << (p - 3)) + 2) << rice), p - 3 + rice);
         }
     }
+    /// HEVCREXTTOOLS (SR345): coeff_abs_level_remaining with extended_precision_processing_flag (the limited EGk of
+    /// 9.3.3.12 at log2TransformRange `log2_range`): below the maximum prefix the unlimited code, at it no separator and
+    /// log2TransformRange suffix bits.
+    pub fn remaining_limited(&mut self, v: u32, rice: u32, log2_range: u32) {
+        if (v >> rice) < 4 {
+            return self.remaining(v, rice);
+        }
+        let max_ext = 28 - log2_range;
+        let mut pre = 0;
+        while pre < max_ext && v >= (((1u32 << (pre + 2)) + 2) << rice) {
+            pre += 1;
+        }
+        for _ in 0..4 + pre {
+            self.bypass(1);
+        }
+        let base = ((1u32 << (pre + 1)) + 2) << rice;
+        if pre < max_ext {
+            self.bypass(0);
+            self.bypass_bits(v - base, pre + 1 + rice);
+        } else {
+            self.bypass_bits(v - base, log2_range);
+        }
+    }
+    /// HEVCREXTTOOLS (SR345): cabac_bypass_alignment (9.3.4.3.6): ivlCurrRange = 256 before the aligned bypass bins.
+    pub fn align(&mut self) {
+        self.range = 256;
+    }
     /// DecodeTerminate's encoder; a 1 flushes (the code word ends with the stop / alignment 1).
     pub fn terminate(&mut self, bin: u32) {
         self.range -= 2;
@@ -230,13 +257,114 @@ impl CabacEnc {
     }
     /// A 2Nx2N intra CU above the minimum size coded as INTRA_DC through mpm_idx `mpm`, no residual.
     pub fn dc_cu(&mut self, mpm: u32) {
+        self.dc_cu_fmt(mpm, 1);
+    }
+    /// HEVCREXT (SR334): [`CabacEnc::dc_cu`] at any chroma_format_idc 1..3 for an unsplit root transform unit: at 4:2:2
+    /// the two cbf_cb then the two cbf_cr (7.3.8.8), else one each.
+    pub fn dc_cu_fmt(&mut self, mpm: u32, chroma_format_idc: u32) {
         self.prev_intra(true);
         self.mpm_idx(mpm);
-        self.chroma_dm();
-        self.cbf_chroma(0, false);
-        self.cbf_chroma(0, false);
+        if chroma_format_idc != 0 {
+            self.chroma_dm(); // HEVCREXTTOOLS (SR345): monochrome codes no chroma syntax
+        }
+        for _ in 0..[0, 2, 4, 2][chroma_format_idc as usize] {
+            self.cbf_chroma(0, false);
+        }
         self.cbf_luma(0, false);
     }
+    // HEVCINTER (SR216) syntax elements.
+    pub fn cu_skip(&mut self, inc: usize, v: bool) {
+        self.decision(CU_SKIP + inc, v as u32);
+    }
+    /// pred_mode_flag 0 (MODE_INTER).
+    pub fn pred_inter(&mut self) {
+        self.decision(PRED_MODE, 0);
+    }
+    pub fn merge_flag(&mut self, v: bool) {
+        self.decision(MERGE_FLAG, v as u32);
+    }
+    /// merge_idx `i` with MaxNumMergeCand `max` (TR, first bin context-coded).
+    pub fn merge_idx(&mut self, i: u32, max: u32) {
+        for k in 0..max - 1 {
+            let bin = (k < i) as u32;
+            if k == 0 { self.decision(MERGE_IDX, bin) } else { self.bypass(bin) }
+            if bin == 0 {
+                break;
+            }
+        }
+    }
+    /// ref_idx_lX `i` with num_ref_idx_lX_active `n` (TR, two context-coded bins).
+    pub fn ref_idx(&mut self, i: u32, n: u32) {
+        for k in 0..n - 1 {
+            let bin = (k < i) as u32;
+            if k < 2 { self.decision(REF_IDX + k as usize, bin) } else { self.bypass(bin) }
+            if bin == 0 {
+                break;
+            }
+        }
+    }
+    /// inter_pred_idc PRED_BI of a prediction block with nPbW + nPbH != 12 at coding quadtree depth `depth`.
+    pub fn pred_bi(&mut self, depth: usize) {
+        self.decision(INTER_PRED_IDC + depth, 1);
+    }
+    /// mvd_coding() (7.3.8.9).
+    pub fn mvd(&mut self, v: [i32; 2]) {
+        for c in v {
+            self.decision(ABS_MVD_GT0, (c != 0) as u32);
+        }
+        for c in v {
+            if c != 0 {
+                self.decision(ABS_MVD_GT1, (c.abs() > 1) as u32);
+            }
+        }
+        for c in v {
+            if c != 0 {
+                if c.abs() > 1 {
+                    self.egk(c.unsigned_abs() - 2, 1);
+                }
+                self.bypass((c < 0) as u32);
+            }
+        }
+    }
+    pub fn mvp_flag(&mut self, v: u32) {
+        self.decision(MVP_FLAG, v);
+    }
+    pub fn rqt_root_cbf(&mut self, v: bool) {
+        self.decision(RQT_ROOT_CBF, v as u32);
+    }
+    /// A 2^log2 coding unit with pcm_flag 1 (its quadtree split flag `split_inc` 0 coded first) holding `y` / `cb` /
+    /// `cr` samples (row-major), the engine restarted after them.
+    pub fn pcm_cu(&mut self, split_inc: usize, log2: u32, y: &[u8], cb: &[u8], cr: &[u8]) {
+        let w = |p: &[u8]| p.iter().map(|&v| v as u16).collect::<Vec<u16>>();
+        self.pcm_cu_bits(split_inc, log2, 8, 8, &w(y), &w(cb), &w(cr));
+    }
+    /// HEVCMAIN10 (SR311): [`CabacEnc::pcm_cu`] with PcmBitDepthY / PcmBitDepthC of `luma_bits` / `chroma_bits`.
+    pub fn pcm_cu_bits(&mut self, split_inc: usize, log2: u32, luma_bits: u32, chroma_bits: u32, y: &[u16], cb: &[u16], cr: &[u16]) {
+        self.pcm_cu_fmt(split_inc, log2, luma_bits, chroma_bits, y, cb, cr, (2, 2));
+    }
+    /// HEVCREXT (SR334): [`CabacEnc::pcm_cu_bits`] with (SubWidthC, SubHeightC) `sub`: each chroma component carries
+    /// (n / SubWidthC) x (n / SubHeightC) samples (7.3.8.7).
+    pub fn pcm_cu_fmt(&mut self, split_inc: usize, log2: u32, luma_bits: u32, chroma_bits: u32, y: &[u16], cb: &[u16], cr: &[u16], sub: (usize, usize)) {
+        self.split_cu(split_inc, false);
+        self.pcm_samples_fmt(log2, luma_bits, chroma_bits, y, cb, cr, sub);
+    }
+    /// HEVCREXT (SR334): pcm_flag 1 and the samples of a 2^log2 coding unit whose split flag (or, at the minimum size,
+    /// part_mode) the caller wrote; the engine restarted after them.
+    pub fn pcm_samples_fmt(&mut self, log2: u32, luma_bits: u32, chroma_bits: u32, y: &[u16], cb: &[u16], cr: &[u16], sub: (usize, usize)) {
+        self.terminate(1);
+        self.zero_align();
+        let n = 1usize << log2;
+        for &v in &y[..n * n] {
+            self.bw.u(v as u64, luma_bits);
+        }
+        for p in [cb, cr].into_iter().filter(|p| !p.is_empty()) {
+            for &v in &p[..(n / sub.0) * (n / sub.1)] {
+                self.bw.u(v as u64, chroma_bits);
+            }
+        }
+        self.restart();
+    }
+
     pub fn finish(mut self) -> BitWriter {
         self.terminate(1);
         self.zero_align();
@@ -353,6 +481,12 @@ pub struct SpsCfg {
     pub pcm: Option<(u32, u32, u32, u32, bool)>,
     pub strong: bool,
     pub conf_win: Option<[u32; 4]>,
+    /// HEVCMAIN10 (SR311): bit_depth_chroma when it differs from `bit_depth` (None: the same).
+    pub chroma_bit_depth: Option<u32>,
+    /// HEVCREXT (SR334): separate_colour_plane_flag (written at chroma_format_idc 3).
+    pub separate_colour_plane: bool,
+    /// HEVCREXT (SR334): the nine sps_range_extension() flags in syntax order (None: no SPS extension).
+    pub range_ext: Option<[bool; 9]>,
 }
 
 impl Default for SpsCfg {
@@ -371,11 +505,33 @@ impl Default for SpsCfg {
             pcm: None,
             strong: false,
             conf_win: None,
+            chroma_bit_depth: None,
+            separate_colour_plane: false,
+            range_ext: None,
         }
     }
 }
 
 pub fn sps_rbsp(c: &SpsCfg) -> Vec<u8> {
+    sps_rbsp_ext(c, &InterSps::default())
+}
+
+/// HEVCINTER (SR216): the SPS fields an inter stream sets; the default writes [`sps_rbsp`]'s bits.
+#[derive(Clone, Default)]
+pub struct InterSps {
+    pub max_dec_pic_buffering_minus1: u32,
+    pub max_num_reorder_pics: u32,
+    pub depth_inter: u32,
+    pub amp: bool,
+    pub temporal_mvp: bool,
+}
+
+pub fn sps_rbsp_ext(c: &SpsCfg, x: &InterSps) -> Vec<u8> {
+    sps_rbsp_scc(c, x, None)
+}
+
+/// HEVCREXTSCC (SR357): [`sps_rbsp_ext`] with sps_scc_extension() (7.3.2.2.3) when `scc` is Some.
+pub fn sps_rbsp_scc(c: &SpsCfg, x: &InterSps, scc: Option<&SpsScc>) -> Vec<u8> {
     let mut b = BitWriter::default();
     b.u(0, 4);
     b.u(0, 3);
@@ -384,7 +540,7 @@ pub fn sps_rbsp(c: &SpsCfg) -> Vec<u8> {
     b.ue(0);
     b.ue(c.chroma_format_idc);
     if c.chroma_format_idc == 3 {
-        b.bit(0);
+        b.flag(c.separate_colour_plane);
     }
     b.ue(c.width);
     b.ue(c.height);
@@ -398,20 +554,20 @@ pub fn sps_rbsp(c: &SpsCfg) -> Vec<u8> {
         None => b.bit(0),
     }
     b.ue(c.bit_depth - 8);
-    b.ue(c.bit_depth - 8);
+    b.ue(c.chroma_bit_depth.unwrap_or(c.bit_depth) - 8);
     b.ue(4); // log2_max_pic_order_cnt_lsb_minus4
     b.bit(1);
-    b.ue(0);
-    b.ue(0);
+    b.ue(x.max_dec_pic_buffering_minus1);
+    b.ue(x.max_num_reorder_pics);
     b.ue(0);
     b.ue(c.log2_min_cb - 3);
     b.ue(c.log2_ctb - c.log2_min_cb);
     b.ue(c.log2_min_tb - 2);
     b.ue(c.log2_max_tb - c.log2_min_tb);
-    b.ue(0);
+    b.ue(x.depth_inter);
     b.ue(c.depth_intra);
     b.bit(0); // scaling_list_enabled_flag
-    b.bit(0); // amp
+    b.flag(x.amp);
     b.flag(c.sao);
     match c.pcm {
         Some((bl, bc, lmin, lmax, lf)) => {
@@ -426,12 +582,82 @@ pub fn sps_rbsp(c: &SpsCfg) -> Vec<u8> {
     }
     b.ue(0); // num_short_term_ref_pic_sets
     b.bit(0); // long_term_ref_pics_present_flag
-    b.bit(0); // sps_temporal_mvp_enabled_flag
+    b.flag(x.temporal_mvp); // sps_temporal_mvp_enabled_flag
     b.flag(c.strong);
     b.bit(0); // vui
-    b.bit(0); // extension
+    if c.range_ext.is_some() || scc.is_some() {
+        b.bit(1); // sps_extension_present_flag
+        b.flag(c.range_ext.is_some()); // sps_range_extension_flag
+        b.u(0, 2); // multilayer, 3d
+        b.flag(scc.is_some()); // sps_scc_extension_flag
+        b.u(0, 4); // sps_extension_4bits
+        if let Some(fl) = c.range_ext {
+            for v in fl {
+                b.flag(v);
+            }
+        }
+        if let Some(s) = scc {
+            b.flag(s.curr_pic_ref);
+            b.flag(s.palette.is_some()); // palette_mode_enabled_flag
+            if let Some((max, delta, init)) = &s.palette {
+                b.ue(*max);
+                b.ue(*delta);
+                b.flag(init.is_some());
+                if let Some(v) = init {
+                    b.ue(v.len() as u32 - 1);
+                    let ncomp = if c.chroma_format_idc == 0 { 1 } else { 3 };
+                    for comp in 0..ncomp {
+                        let bd = if comp == 0 { c.bit_depth } else { c.chroma_bit_depth.unwrap_or(c.bit_depth) };
+                        for e in v {
+                            b.u(e[comp] as u64, bd);
+                        }
+                    }
+                }
+            }
+            b.u(s.mv_res_idc as u64, 2);
+            b.flag(s.intra_boundary_filtering_disabled);
+        }
+    } else {
+        b.bit(0); // extension
+    }
     b.trailing();
     b.out
+}
+
+/// HEVCREXTSCC (SR357): the sps_scc_extension() fields a KAT sets.
+#[derive(Clone, Default)]
+pub struct SpsScc {
+    pub curr_pic_ref: bool,
+    /// palette_mode_enabled_flag: (palette_max_size, delta_palette_max_predictor_size, the initializers (Y, Cb, Cr)).
+    pub palette: Option<(u32, u32, Option<Vec<[u16; 3]>>)>,
+    pub mv_res_idc: u32,
+    pub intra_boundary_filtering_disabled: bool,
+}
+
+/// HEVCREXTSCC (SR357): the pps_scc_extension() fields a KAT sets, and entropy_coding_sync_enabled_flag for the
+/// wavefront KAT.
+#[derive(Clone, Default)]
+pub struct PpsScc {
+    pub curr_pic_ref: bool,
+    /// residual_adaptive_colour_transform_enabled_flag: (pps_slice_act_qp_offsets_present_flag, PpsActQpOffsetY / Cb / Cr).
+    pub act: Option<(bool, [i32; 3])>,
+    /// pps_palette_predictor_initializers_present_flag: the 8-bit (Y, Cb, Cr) initializers (may be empty).
+    pub initializers: Option<Vec<[u16; 3]>>,
+    pub wpp: bool,
+}
+
+/// HEVCREXTSCC (SR357): the slice header fields of the SCC KATs.
+#[derive(Clone, Default)]
+pub struct SliceScc {
+    /// use_integer_mv_flag (written when motion_vector_resolution_control_idc is 2).
+    pub use_integer_mv: Option<bool>,
+    /// slice_act_y / cb / cr_qp_offset (written when pps_slice_act_qp_offsets_present_flag).
+    pub act_qp_offset: Option<[i32; 3]>,
+    /// (offset_len_minus1, entry_point_offset_minus1) of a wavefront slice.
+    pub entry_points: Option<(u32, Vec<u32>)>,
+    /// HEVCSCCTAIL (SR365): the RefPicList0 entries that are the current picture, whose pred_weight_table flags are not
+    /// written (7.3.6.3); empty: every flag written.
+    pub weight_skip: Vec<bool>,
 }
 
 pub fn sps(c: &SpsCfg) -> Vec<u8> {
@@ -447,6 +673,46 @@ pub struct PpsCfg {
 }
 
 pub fn pps_rbsp(c: &PpsCfg) -> Vec<u8> {
+    pps_rbsp_ext(c, &PpsInter::default())
+}
+
+/// HEVCINTER (SR216): the PPS fields an inter stream sets; the default writes [`pps_rbsp`]'s bits.
+#[derive(Clone, Default)]
+pub struct PpsInter {
+    pub weighted_pred: bool,
+    pub weighted_bipred: bool,
+    pub lists_modification: bool,
+}
+
+pub fn pps_rbsp_ext(c: &PpsCfg, x: &PpsInter) -> Vec<u8> {
+    pps_rbsp_rext(c, x, &PpsRext::default())
+}
+
+/// HEVCREXTTOOLS (SR345): pps_range_extension() (7.3.2.3.2).
+#[derive(Clone, Default)]
+pub struct PpsRange {
+    pub log2_max_transform_skip_block_size_minus2: u32,
+    pub cross_component_prediction: bool,
+    /// chroma_qp_offset_list_enabled_flag: (diff_cu_chroma_qp_offset_depth, [(cb_qp_offset_list, cr_qp_offset_list)]).
+    pub chroma_qp_offset_list: Option<(u32, Vec<(i32, i32)>)>,
+    /// (log2_sao_offset_scale_luma, log2_sao_offset_scale_chroma).
+    pub log2_sao_offset_scale: (u32, u32),
+}
+
+/// HEVCREXTTOOLS (SR345): the PPS fields the range extension KATs set; the default writes [`pps_rbsp_ext`]'s bits.
+#[derive(Clone, Default)]
+pub struct PpsRext {
+    pub transform_skip: bool,
+    pub transquant_bypass: bool,
+    pub range: Option<PpsRange>,
+}
+
+pub fn pps_rbsp_rext(c: &PpsCfg, x: &PpsInter, r: &PpsRext) -> Vec<u8> {
+    pps_rbsp_scc(c, x, r, None)
+}
+
+/// HEVCREXTSCC (SR357): [`pps_rbsp_rext`] with pps_scc_extension() (7.3.2.3.3) when `scc` is Some.
+pub fn pps_rbsp_scc(c: &PpsCfg, x: &PpsInter, r: &PpsRext, scc: Option<&PpsScc>) -> Vec<u8> {
     let mut b = BitWriter::default();
     b.ue(0);
     b.ue(0);
@@ -459,16 +725,16 @@ pub fn pps_rbsp(c: &PpsCfg) -> Vec<u8> {
     b.ue(0);
     b.se(c.init_qp - 26);
     b.bit(0); // constrained_intra_pred_flag
-    b.bit(0); // transform_skip_enabled_flag
+    b.flag(r.transform_skip); // transform_skip_enabled_flag
     b.bit(0); // cu_qp_delta_enabled_flag
     b.se(c.cb_qp_offset);
     b.se(0);
     b.bit(0);
-    b.bit(0);
-    b.bit(0);
-    b.bit(0); // transquant_bypass_enabled_flag
+    b.flag(x.weighted_pred);
+    b.flag(x.weighted_bipred);
+    b.flag(r.transquant_bypass); // transquant_bypass_enabled_flag
     b.bit(0); // tiles
-    b.bit(0); // entropy_coding_sync
+    b.flag(scc.is_some_and(|s| s.wpp)); // entropy_coding_sync
     b.bit(1); // pps_loop_filter_across_slices_enabled_flag
     if c.deblocking_disabled {
         b.bit(1); // deblocking_filter_control_present_flag
@@ -478,10 +744,62 @@ pub fn pps_rbsp(c: &PpsCfg) -> Vec<u8> {
         b.bit(0);
     }
     b.bit(0); // pps_scaling_list_data_present_flag
-    b.bit(0); // lists_modification_present_flag
+    b.flag(x.lists_modification); // lists_modification_present_flag
     b.ue(0);
     b.bit(0);
-    b.bit(0);
+    let scc_ext = scc.filter(|s| s.curr_pic_ref || s.act.is_some() || s.initializers.is_some());
+    if r.range.is_some() || scc_ext.is_some() {
+        b.bit(1); // pps_extension_present_flag
+        b.flag(r.range.is_some()); // pps_range_extension_flag
+        b.u(0, 2); // multilayer, 3d
+        b.flag(scc_ext.is_some()); // pps_scc_extension_flag
+        b.u(0, 4); // pps_extension_4bits
+    }
+    match &r.range {
+        Some(e) => {
+            if r.transform_skip {
+                b.ue(e.log2_max_transform_skip_block_size_minus2);
+            }
+            b.flag(e.cross_component_prediction);
+            b.flag(e.chroma_qp_offset_list.is_some());
+            if let Some((depth, list)) = &e.chroma_qp_offset_list {
+                b.ue(*depth);
+                b.ue(list.len() as u32 - 1);
+                for &(cb, cr) in list {
+                    b.se(cb);
+                    b.se(cr);
+                }
+            }
+            b.ue(e.log2_sao_offset_scale.0);
+            b.ue(e.log2_sao_offset_scale.1);
+        }
+        None if scc_ext.is_none() => b.bit(0), // pps_extension_present_flag
+        None => {}
+    }
+    if let Some(s) = scc_ext {
+        b.flag(s.curr_pic_ref);
+        b.flag(s.act.is_some());
+        if let Some((slice, off)) = s.act {
+            b.flag(slice);
+            b.se(off[0] + 5);
+            b.se(off[1] + 5);
+            b.se(off[2] + 3);
+        }
+        b.flag(s.initializers.is_some());
+        if let Some(v) = &s.initializers {
+            b.ue(v.len() as u32);
+            if !v.is_empty() {
+                b.bit(0); // monochrome_palette_flag
+                b.ue(0); // luma_bit_depth_entry_minus8
+                b.ue(0); // chroma_bit_depth_entry_minus8
+                for comp in 0..3 {
+                    for e in v {
+                        b.u(e[comp] as u64, 8);
+                    }
+                }
+            }
+        }
+    }
     b.trailing();
     b.out
 }
@@ -507,4 +825,340 @@ pub fn idr_slice_header(sao_luma: bool, sao_chroma: bool, sao_enabled: bool, deb
     }
     b.trailing();
     b
+}
+
+/// HEVCINTER (SR216): a first slice segment header (PPS 0, slice_qp_delta 0, SAO off) of any type.
+#[derive(Clone, Default)]
+pub struct SliceCfg {
+    pub nal_type: u8,
+    /// slice_type: 0 B, 1 P, 2 I.
+    pub slice_type: u32,
+    pub poc_lsb: u32,
+    /// The slice's own st_ref_pic_set: (DeltaPocS0, used) nearest first, (DeltaPocS1, used) nearest first.
+    pub neg: Vec<(i32, bool)>,
+    pub pos: Vec<(i32, bool)>,
+    /// The SPS enables TMVP (slice_temporal_mvp_enabled_flag is coded) / its value.
+    pub sps_tmvp: bool,
+    pub tmvp: bool,
+    pub collocated_from_l0: bool,
+    pub collocated_ref_idx: u32,
+    /// num_ref_idx_active_override: (l0, l1) active counts.
+    pub num_ref: Option<(u32, u32)>,
+    /// The PPS has lists_modification_present_flag; the entries.
+    pub lists_mod: bool,
+    pub list_entry_l0: Option<Vec<u32>>,
+    pub list_entry_l1: Option<Vec<u32>>,
+    pub mvd_l1_zero: bool,
+    /// pred_weight_table (P with weighted_pred_flag): luma_log2_weight_denom, chroma denom delta 0, and per l0 entry
+    /// Some((delta_luma_weight, luma_offset)) or None; chroma flags all 0.
+    pub weights: Option<(u32, Vec<Option<(i32, i32)>>)>,
+    pub five_minus_max_num_merge_cand: u32,
+    pub deblocking_disabled: bool,
+}
+
+pub fn slice_header(c: &SliceCfg) -> BitWriter {
+    slice_header_scc(c, &SliceScc::default())
+}
+
+/// HEVCREXTSCC (SR357): [`slice_header`] with the SCC fields of `s` and a wavefront slice's entry points.
+pub fn slice_header_scc(c: &SliceCfg, s: &SliceScc) -> BitWriter {
+    let mut b = BitWriter::default();
+    let irap = (16..=23).contains(&c.nal_type);
+    let idr = c.nal_type == 19 || c.nal_type == 20;
+    b.bit(1); // first_slice_segment_in_pic_flag
+    if irap {
+        b.bit(0); // no_output_of_prior_pics_flag
+    }
+    b.ue(0);
+    b.ue(c.slice_type);
+    if !idr {
+        b.u(c.poc_lsb as u64, 8);
+        b.bit(0); // short_term_ref_pic_set_sps_flag
+        b.ue(c.neg.len() as u32);
+        b.ue(c.pos.len() as u32);
+        let mut prev = 0;
+        for &(d, used) in &c.neg {
+            b.ue((prev - d - 1) as u32);
+            b.flag(used);
+            prev = d;
+        }
+        prev = 0;
+        for &(d, used) in &c.pos {
+            b.ue((d - prev - 1) as u32);
+            b.flag(used);
+            prev = d;
+        }
+        if c.sps_tmvp {
+            b.flag(c.tmvp);
+        }
+    }
+    if c.slice_type != 2 {
+        let total = c.neg.iter().chain(c.pos.iter()).filter(|e| e.1).count() as u32;
+        let (l0, l1) = c.num_ref.unwrap_or((1, 1));
+        match c.num_ref {
+            Some((a, bb)) => {
+                b.bit(1);
+                b.ue(a - 1);
+                if c.slice_type == 0 {
+                    b.ue(bb - 1);
+                }
+            }
+            None => b.bit(0),
+        }
+        if c.lists_mod && total > 1 {
+            let bits = 32 - (total - 1).leading_zeros();
+            for (k, e) in [&c.list_entry_l0, &c.list_entry_l1].into_iter().enumerate() {
+                if k == 1 && c.slice_type != 0 {
+                    break;
+                }
+                b.flag(e.is_some());
+                if let Some(v) = e {
+                    for &x in v {
+                        b.u(x as u64, bits);
+                    }
+                }
+            }
+        }
+        if c.slice_type == 0 {
+            b.flag(c.mvd_l1_zero);
+        }
+        if c.tmvp {
+            if c.slice_type == 0 {
+                b.flag(c.collocated_from_l0);
+            }
+            let from_l0 = c.slice_type == 1 || c.collocated_from_l0;
+            if (from_l0 && l0 > 1) || (!from_l0 && l1 > 1) {
+                b.ue(c.collocated_ref_idx);
+            }
+        }
+        if let Some((denom, ws)) = &c.weights {
+            b.ue(*denom);
+            b.se(0); // delta_chroma_log2_weight_denom
+            let written = |i: usize| !s.weight_skip.get(i).copied().unwrap_or(false);
+            for (i, w) in ws.iter().enumerate() {
+                if written(i) {
+                    b.flag(w.is_some());
+                }
+            }
+            for i in 0..ws.len() {
+                if written(i) {
+                    b.bit(0); // chroma_weight_l0_flag
+                }
+            }
+            for (dw, off) in ws.iter().flatten() {
+                b.se(*dw);
+                b.se(*off);
+            }
+        }
+        b.ue(c.five_minus_max_num_merge_cand);
+        if let Some(v) = s.use_integer_mv {
+            b.flag(v);
+        }
+    }
+    b.se(0); // slice_qp_delta
+    if let Some(o) = s.act_qp_offset {
+        for v in o {
+            b.se(v);
+        }
+    }
+    if !c.deblocking_disabled {
+        b.bit(1); // slice_loop_filter_across_slices_enabled_flag
+    }
+    if let Some((len, offsets)) = &s.entry_points {
+        b.ue(offsets.len() as u32);
+        if !offsets.is_empty() {
+            b.ue(*len);
+            for &o in offsets {
+                b.u(o as u64, len + 1);
+            }
+        }
+    }
+    b.trailing();
+    b
+}
+
+// ---------------------------------------------------------------- HEVCREXTSCC (LEDGER SR357)
+
+/// One run of a palette coding unit's index map in traverse scan: `len` samples of one index (`copy` false) or copied
+/// from the row above (`copy` true).
+#[derive(Clone, Copy, Debug)]
+pub struct PalRun {
+    pub copy: bool,
+    pub len: usize,
+}
+
+/// A palette coding unit for [`CabacEnc::palette_coding`]: the predictor size and the predictor entries it reuses
+/// (ascending), its new entries, the escape flag, the index map ([y * n + x]) as runs, the escape values per raster
+/// position, and the format.
+pub struct PalCu<'a> {
+    pub log2: u32,
+    pub max_size: usize,
+    pub pred_size: usize,
+    pub reuse: &'a [usize],
+    pub new: &'a [[u16; 3]],
+    pub escape: bool,
+    pub map: &'a [u8],
+    pub runs: &'a [PalRun],
+    pub transpose: bool,
+    pub esc: &'a [(usize, [u32; 3])],
+    pub bypass_cu: bool,
+    pub sub: (usize, usize),
+    pub bit_depth: u32,
+}
+
+/// The traverse scan of the test kit (rows alternately left to right, right to left; transposed: columns).
+pub fn trav(log2: u32, pos: usize, transpose: bool) -> (usize, usize) {
+    let n = 1usize << log2;
+    let (r, i) = (pos / n, pos % n);
+    let c = if r % 2 == 1 { n - 1 - i } else { i };
+    if transpose { (r, c) } else { (c, r) }
+}
+
+impl CabacEnc {
+    /// Truncated binary of `v` with cMax `cmax` in bypass bins.
+    pub fn tb(&mut self, v: u32, cmax: u32) {
+        let n = cmax + 1;
+        if n <= 1 {
+            return;
+        }
+        let mut k = 0;
+        while (2u32 << k) <= n {
+            k += 1;
+        }
+        let u = (2u32 << k) - n;
+        if v < u { self.bypass_bits(v, k) } else { self.bypass_bits(v + u, k + 1) }
+    }
+
+    /// PaletteRunMinus1 `r` under PaletteMaxRunMinus1 `m` > 0: palette_run_prefix (TR, cMax Floor(Log2(m)) + 1, bins 0..4
+    /// in context: copy-above 5 6 6 7 7, index (idx < 1 ? 0 : idx < 3 ? 1 : 2) 3 3 4 4) and palette_run_suffix (TB).
+    pub fn palette_run(&mut self, r: u32, m: u32, copy: bool, idx: u32) {
+        let log2 = |v: u32| 31 - v.leading_zeros();
+        let cmax = log2(m) + 1;
+        let p = if r < 2 { r } else { log2(r) + 1 };
+        let ctx = |b: u32| -> usize {
+            if copy {
+                [5, 6, 6, 7, 7][b as usize]
+            } else if b == 0 {
+                if idx < 1 { 0 } else if idx < 3 { 1 } else { 2 }
+            } else {
+                [0, 3, 3, 4, 4][b as usize]
+            }
+        };
+        for b in 0..p.min(cmax) + if p < cmax { 1 } else { 0 } {
+            let bin = (b < p) as u32;
+            if b < 5 { self.decision(PALETTE_RUN_PREFIX + ctx(b), bin) } else { self.bypass(bin) }
+        }
+        if p > 1 && m != 1 << (p - 1) {
+            let base = 1 << (p - 1);
+            self.tb(r - base, if p == cmax { m - base } else { base - 1 });
+        }
+    }
+
+    /// palette_coding() (7.3.8.13) of `cu` after its palette_mode_flag, as this kit reads H.265 v4 (cu_qp_delta off).
+    /// Panics if the runs do not reproduce the map.
+    pub fn palette_coding(&mut self, cu: &PalCu) {
+        let n = 1usize << cu.log2;
+        let total = n * n;
+        let at = |p: usize| {
+            let (x, y) = trav(cu.log2, p, cu.transpose);
+            y * n + x
+        };
+        let above = |i: usize| if cu.transpose { i - 1 } else { i - n };
+        // palette_predictor_run, then the terminating 1 while the loop would read on.
+        let mut next = 0;
+        for &r in cu.reuse {
+            self.egk(if r == next { 0 } else { (r - next + 1) as u32 }, 0);
+            next = r + 1;
+        }
+        if next < cu.pred_size && cu.reuse.len() < cu.max_size {
+            self.egk(1, 0);
+        }
+        if cu.reuse.len() < cu.max_size {
+            self.egk(cu.new.len() as u32, 0);
+        }
+        let ncomp = 3;
+        for c in 0..ncomp {
+            for e in cu.new {
+                self.bypass_bits(e[c] as u32, cu.bit_depth);
+            }
+        }
+        let size = cu.reuse.len() + cu.new.len();
+        if size != 0 {
+            self.bypass(cu.escape as u32);
+        }
+        let max_idx = (size + (cu.escape || size == 0) as usize).saturating_sub(1) as u32;
+        // The runs reproduce the map; the indices with their adjustment against adjustedRefPaletteIndex.
+        let (mut pos, mut prev_copy) = (0usize, false);
+        let mut idc = Vec::new();
+        for r in cu.runs {
+            let ic = at(pos);
+            if !r.copy {
+                let v = cu.map[ic] as u32;
+                let refi = if pos == 0 { max_idx + 1 } else if prev_copy { cu.map[above(ic)] as u32 } else { cu.map[at(pos - 1)] as u32 };
+                assert_ne!(v, refi, "an index run repeating its reference at {pos}");
+                idc.push(if v > refi { v - 1 } else { v });
+            }
+            for k in 0..r.len {
+                let i = at(pos + k);
+                let want = if r.copy { cu.map[above(i)] } else { cu.map[ic] };
+                assert_eq!(cu.map[i], want, "runs do not reproduce the map at {}", pos + k);
+            }
+            pos += r.len;
+            prev_copy = r.copy;
+        }
+        assert_eq!(pos, total);
+        let final_copy = cu.runs.last().unwrap().copy;
+        if max_idx > 0 {
+            self.remaining(idc.len() as u32 - 1, 3 + ((max_idx + 1) >> 3));
+            for (k, &v) in idc.iter().enumerate() {
+                let cmax = max_idx - (k > 0) as u32;
+                if cmax > 0 {
+                    self.tb(v, cmax);
+                }
+            }
+            self.bypass(final_copy as u32);
+            self.decision(PALETTE_TRANSPOSE, cu.transpose as u32);
+        }
+        let (mut pos, mut prev_copy, mut remaining) = (0usize, false, idc.len());
+        for r in cu.runs {
+            let ic = at(pos);
+            if max_idx > 0 && pos >= n && !prev_copy {
+                if remaining > 0 && pos < total - 1 {
+                    self.decision(PALETTE_COPY_ABOVE, r.copy as u32);
+                } else {
+                    assert_eq!(r.copy, !(pos == total - 1 && remaining > 0));
+                }
+            } else {
+                assert!(!r.copy, "a copy run where none is allowed at {pos}");
+            }
+            if max_idx > 0 {
+                if !r.copy {
+                    remaining -= 1;
+                }
+                if remaining > 0 || r.copy != final_copy {
+                    let m = (total - pos - 1 - remaining - final_copy as usize) as u32;
+                    if m > 0 {
+                        self.palette_run(r.len as u32 - 1, m, r.copy, if r.copy { 0 } else { cu.map[ic] as u32 });
+                    } else {
+                        assert_eq!(r.len, 1);
+                    }
+                } else {
+                    assert_eq!(r.len, total - pos, "the final run runs to the end");
+                }
+            }
+            pos += r.len;
+            prev_copy = r.copy;
+        }
+        if cu.escape {
+            for c in 0..ncomp {
+                for p in 0..total {
+                    let (x, y) = trav(cu.log2, p, cu.transpose);
+                    if cu.map[y * n + x] as u32 == max_idx && (c == 0 || (x % cu.sub.0 == 0 && y % cu.sub.1 == 0)) {
+                        let v = cu.esc.iter().find(|e| e.0 == y * n + x).expect("escape value").1[c];
+                        if cu.bypass_cu { self.bypass_bits(v, cu.bit_depth) } else { self.egk(v, 3) }
+                    }
+                }
+            }
+        }
+    }
 }

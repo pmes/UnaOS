@@ -1,0 +1,242 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
+// Copyright (C) 2026 The Architect & Una
+//
+//! `pdfprobe` — the headless probe of `pdf_core` (PDF1, LEDGER SR300); `nle` is to `timeline_core` what this is to
+//! `pdf_core`: argument plumbing and printing, no parsing logic.
+//!
+//! ```text
+//! pdfprobe <file>
+//! pdfprobe --render <file> <page> <out.png>
+//! pdfprobe --text <file> <page>
+//! pdfprobe --save <in> <out>
+//! pdfprobe --sign [--pss] [--sha384] <in> <out> <key.pem|der> <cert.der> [<chain.der>...]
+//! ```
+//!
+//! Prints `pages=<n> version=<v> xref=<table|stream|rebuilt> encrypt=<none|rc4-40|rc4-128|aesv2|aesv3|...>
+//! info=<title|->` (encrypt: PDFCRYPT SR315, the file opened with the empty user password), then one line per page:
+//! `page=<i> media=<w>x<h> rotate=<r> ops=<n> fonts=<n> images=<n> annots=<n> fields=<n>` (fonts = the /Resources /Font
+//! entries; images = the /Resources /XObject entries whose /Subtype is /Image, plus the inline images among the page's
+//! ops; annots = the page's /Annots, fields = those that are widgets of a form field: PDFFORMS SR326).
+//! `--render` (PDF2, LEDGER SR313) draws page `<page>` (0-based) at 72 dpi through `Page::render`, writes it as a PNG, and
+//! prints `page=<i> render=<w>x<h> runs=<text runs> refused=<names|->` (text runs: the strings the page shows, each
+//! drawn by PDF3's `GlyphSink`, unembedded fonts on the bundled faces).
+//! A refused file prints `error=<reason>` and exits 1.
+//!
+//! `--text` (PDF3, LEDGER SR314) prints page `<page>`'s extracted text (`Page::text` + `spans_to_string`); unembedded
+//! fonts take their advances from the tree's bundled faces (fonts/ beside this crate: Inter, JetBrains Mono, Noto Sans).
+//!
+//! `--save` (PDF-WRITE, LEDGER SR325) opens `<in>` with the empty user password, writes `Document::save` (every reachable
+//! object, a classic xref, decrypted: no /Encrypt) to `<out>`, re-parses it and prints
+//! `save=<out> bytes=<n> pages=<n> encrypt=<source kind> -> <saved kind>`; a page count that differs is an error.
+//!
+//! `--sign` (PDFSIGN, LEDGER SR350) opens `<in>` with the empty user password and signs it through `Document::sign`
+//! (one incremental update, a new invisible field `Signature<n+1>` on page 0, adbe.pkcs7.detached, now as /M) with a
+//! key file read by tls_core's ONE key parser (PDFSIGNKEYPARSE, LEDGER SR361: PEM or DER — PKCS#8, PKCS#1 RSA, SEC 1
+//! P-256, Ed25519; a raw 32-byte P-256 scalar that is no key file is still read as one) and the DER certificates (the
+//! signer's first); RSA signs PKCS#1 v1.5, or RSASSA-PSS with `--pss`; `--sha384` picks SHA-384 over SHA-256 (Ed25519
+//! always signs with SHA-512, RFC 8419); prints `sign=<out> bytes=<n> field=<name> key=<rsa|rsa-pss|p256|ed25519>
+//! hash=<sha256|sha384|sha512>` and the signed file's `sigs=` line (chains unchecked).
+
+use pdf_core::content::ops;
+use pdf_core::font::{Fallback, GlyphSink, spans_to_string};
+use pdf_core::render::{Glyphs, TextLog, TextRun, TextSink, png};
+use pdf_core::sig::cms::{Key, SecretKey, SignerKey, parse_key};
+use pdf_core::sig::{Hash, SignRequest, SubFilter, probe_line};
+use pdf_core::{Document, Object, Page};
+
+fn usage() -> ! {
+    eprintln!("usage: pdfprobe <file> | pdfprobe --render <file> <page> <out.png> | pdfprobe --text <file> <page> | pdfprobe --save <in> <out> | pdfprobe --sign [--pss] [--sha384] <in> <out> <key.pem|der> <cert.der> [<chain.der>...]");
+    std::process::exit(2)
+}
+
+fn fail(why: impl std::fmt::Display) -> ! {
+    println!("error={why}");
+    std::process::exit(1)
+}
+
+/// A number as the shortest text: `612`, not `612.0`.
+fn num(v: f64) -> String {
+    if (v - v.round()).abs() < 1e-9 { format!("{}", v.round() as i64) } else { format!("{v}") }
+}
+
+/// One-line text: whitespace runs become one space.
+fn one_line(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn page_line(doc: &Document, i: usize, p: &Page) -> String {
+    let o = ops(&p.contents);
+    let dict_len = |key: &[u8]| match doc.get(p.resources.get(key).unwrap_or(&Object::Null)) {
+        Object::Dict(d) => d,
+        _ => Default::default(),
+    };
+    let fonts = dict_len(b"Font").len();
+    let xobjects = dict_len(b"XObject");
+    let images = xobjects.iter().filter(|(_, v)| doc.get(v).as_dict().and_then(|d| d.name(b"Subtype")) == Some(&b"Image"[..])).count()
+        + o.iter().filter(|op| op.operator == b"BI").count();
+    let annots = p.annots_with(doc, &[]);
+    let fields = annots.iter().filter(|a| a.field.is_some()).count();
+    format!(
+        "page={i} media={}x{} rotate={} ops={} fonts={fonts} images={images} annots={} fields={fields}",
+        num(p.media_box[2] - p.media_box[0]),
+        num(p.media_box[3] - p.media_box[1]),
+        p.rotate,
+        o.len(),
+        annots.len()
+    )
+}
+
+/// The tree's bundled faces (fonts/ beside this crate) for unembedded fonts: (sans, mono, serif).
+fn faces() -> [Option<Vec<u8>>; 3] {
+    let face = |rel: &str| std::fs::read(format!("{}/../../fonts/{rel}", env!("CARGO_MANIFEST_DIR"))).ok();
+    [face("inter/InterVariable.ttf"), face("jetbrains-mono/JetBrainsMono-Variable.ttf"), face("noto-sans/NotoSans-Variable.ttf")]
+}
+
+fn fallback(f: &[Option<Vec<u8>>; 3]) -> Fallback<'_> {
+    Fallback { sans: f[0].as_deref(), mono: f[1].as_deref(), serif: f[2].as_deref() }
+}
+
+/// PDF2's recorder and PDF3's glyphs on one run: the `runs=` count stays, the text is drawn.
+struct LogAndDraw<'d, 'f> {
+    log: TextLog,
+    glyphs: GlyphSink<'d, 'f>,
+}
+
+impl TextSink for LogAndDraw<'_, '_> {
+    fn text(&mut self, run: &TextRun) -> Glyphs {
+        self.log.text(run);
+        self.glyphs.text(run)
+    }
+}
+
+/// `--text <file> <page>`: the page's text through pdf_core's extraction.
+fn text(path: &str, page: &str) {
+    let bytes = std::fs::read(path).unwrap_or_else(|e| fail(e));
+    let doc = Document::parse(&bytes).unwrap_or_else(|e| fail(e));
+    let pages = doc.pages().unwrap_or_else(|e| fail(e));
+    let i: usize = page.parse().unwrap_or_else(|_| usage());
+    let p = pages.get(i).unwrap_or_else(|| fail(format!("no page {i}")));
+    let f = faces();
+    println!("{}", spans_to_string(&p.text(&doc, &fallback(&f))));
+}
+
+/// `--render <file> <page> <out.png>`.
+fn render(file: &str, page: &str, out: &str) {
+    let index: usize = page.parse().unwrap_or_else(|_| usage());
+    let bytes = std::fs::read(file).unwrap_or_else(|e| fail(e));
+    let doc = Document::parse(&bytes).unwrap_or_else(|e| fail(e));
+    let pages = doc.pages().unwrap_or_else(|e| fail(e));
+    let p = pages.get(index).unwrap_or_else(|| fail(format!("no page {index} (pages={})", pages.len())));
+    let f = faces();
+    let mut sink = LogAndDraw { log: TextLog::default(), glyphs: GlyphSink::new(&doc, fallback(&f)) };
+    let r = p.render(&doc, 72.0, &mut sink).unwrap_or_else(|e| fail(e));
+    let encoded = png(&r.pixmap).unwrap_or_else(|e| fail(e));
+    std::fs::write(out, encoded).unwrap_or_else(|e| fail(e));
+    let refused = if r.refused.is_empty() { "-".to_string() } else { r.refused.join(",") };
+    println!("page={index} render={}x{} runs={} refused={refused}", r.pixmap.w, r.pixmap.h, sink.log.runs.len());
+}
+
+/// `--save <in> <out>`.
+fn save(input: &str, out: &str) {
+    let bytes = std::fs::read(input).unwrap_or_else(|e| fail(e));
+    let doc = Document::parse(&bytes).unwrap_or_else(|e| fail(e));
+    let pages = doc.pages().unwrap_or_else(|e| fail(e)).len();
+    let saved = doc.save();
+    let back = Document::parse(&saved).unwrap_or_else(|e| fail(format!("the saved file does not parse: {e}")));
+    let again = back.pages().unwrap_or_else(|e| fail(e)).len();
+    if again != pages {
+        fail(format!("the saved file has {again} pages, the source {pages}"));
+    }
+    std::fs::write(out, &saved).unwrap_or_else(|e| fail(e));
+    println!("save={out} bytes={} pages={pages} encrypt={} -> {}", saved.len(), doc.encryption(), back.encryption());
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() >= 6 && args[1] == "--sign" {
+        return sign(&args[2..]);
+    }
+    if args.len() == 4 && args[1] == "--save" {
+        return save(&args[2], &args[3]);
+    }
+    if args.len() == 5 && args[1] == "--render" {
+        render(&args[2], &args[3], &args[4]);
+        return;
+    }
+    if args.len() == 4 && args[1] == "--text" {
+        return text(&args[2], &args[3]);
+    }
+    if args.len() != 2 {
+        usage();
+    }
+    let bytes = std::fs::read(&args[1]).unwrap_or_else(|e| fail(e));
+    let doc = Document::parse(&bytes).unwrap_or_else(|e| fail(e));
+    let pages = doc.pages().unwrap_or_else(|e| fail(e));
+    let title = doc.info().title.map(|t| one_line(&t)).filter(|t| !t.is_empty()).unwrap_or_else(|| "-".into());
+    let version = if doc.version().is_empty() { "-" } else { doc.version() };
+    println!("pages={} version={version} xref={} encrypt={} info={title}", pages.len(), doc.xref_kind().as_str(), doc.encryption());
+    println!("{}", pdf_core::sig::probe_line(&doc, &bytes));
+    for (i, p) in pages.iter().enumerate() {
+        println!("{}", page_line(&doc, i, p));
+    }
+}
+
+/// `--sign [--pss] [--sha384] <in> <out> <key.pem|der> <cert.der> [<chain.der>...]` (PDFSIGN, LEDGER SR350;
+/// PDFSIGNKEYPARSE, LEDGER SR361).
+fn sign(args: &[String]) {
+    use std::io::Read as _;
+    let flags = args.iter().take_while(|a| a.starts_with("--")).count();
+    let (pss, sha384) = (args[..flags].iter().any(|a| a == "--pss"), args[..flags].iter().any(|a| a == "--sha384"));
+    if flags != pss as usize + sha384 as usize || args.len() < flags + 4 {
+        usage();
+    }
+    let args = &args[flags..];
+    let read = |p: &String| std::fs::read(p).unwrap_or_else(|e| fail(format!("{p}: {e}")));
+    let bytes = read(&args[0]);
+    let doc = Document::parse(&bytes).unwrap_or_else(|e| fail(e));
+    let key_file = read(&args[2]);
+    let key = match parse_key(&key_file) {
+        Ok(k) => k,
+        Err(e) => match <[u8; 32]>::try_from(key_file.as_slice()) {
+            Ok(raw) => Key::P256(SecretKey::from_bytes(&raw).unwrap_or_else(|_| fail("the key is not a P-256 private scalar"))),
+            Err(_) => fail(format!("the key is refused: {}", e.why())),
+        },
+    };
+    let hash = if sha384 { Hash::Sha384 } else { Hash::Sha256 };
+    let (signer, kind) = match &key {
+        Key::Rsa(k) if pss => (SignerKey::RsaPss(k, hash), "rsa-pss"),
+        Key::Rsa(k) => (SignerKey::Rsa(k, hash), "rsa"),
+        Key::P256(k) => (SignerKey::P256(k, hash), "p256"),
+        Key::Ed25519(k) => (SignerKey::Ed25519(k), "ed25519"),
+    };
+    let hash_name = match signer.hash() {
+        Hash::Sha256 => "sha256",
+        Hash::Sha384 => "sha384",
+        Hash::Sha512 => "sha512",
+    };
+    let certs: Vec<Vec<u8>> = args[3..].iter().map(read).collect();
+    let chain: Vec<&[u8]> = certs.iter().map(Vec::as_slice).collect();
+    let field = format!("Signature{}", doc.signatures(&bytes).len() + 1);
+    let time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
+    let mut entropy = [0u8; 32];
+    if doc.security().is_some() {
+        std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut entropy)).unwrap_or_else(|e| fail(e));
+    }
+    let req = SignRequest {
+        field: &field,
+        page: 0,
+        key: signer,
+        chain: &chain,
+        subfilter: SubFilter::Pkcs7Detached,
+        name: None,
+        reason: None,
+        location: None,
+        time,
+        certify: None,
+    };
+    let signed = doc.sign(&bytes, &req, &entropy).unwrap_or_else(|e| fail(e));
+    let back = Document::parse(&signed).unwrap_or_else(|e| fail(format!("the signed file does not parse: {e}")));
+    std::fs::write(&args[1], &signed).unwrap_or_else(|e| fail(e));
+    println!("sign={} bytes={} field={field} key={kind} hash={hash_name}", args[1], signed.len());
+    println!("{}", probe_line(&back, &signed));
+}

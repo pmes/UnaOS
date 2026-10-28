@@ -17,17 +17,25 @@
 // libs/gneiss_pal/src/lib.rs (Logic Kernel)
 #![allow(deprecated)]
 
+// GNEISSPAL-NOSTD (SR308): the network face (`api`, `forge`: http_core + tokio) is std-only; `dsp` + `utils` build with --no-default-features.
+#[cfg(feature = "std")]
 pub mod api;
 // DSP (CODEX §2: Gneiss — "The Signal Processing Graph. Audio and Video codecs"): the host face of the
 // codecs UnaOS owns. `dsp::image` re-exports the no_std still-image core `pixel_core` (PIXELCORE, SR25).
 pub mod dsp;
+#[cfg(feature = "std")]
 pub mod forge;
 #[cfg(feature = "std")]
 pub mod io;
+// PAGESAVE (SR392): the ONE MHTML writer (RFC 2557); std-gated: it reuses `api::http::ws::base64`.
+#[cfg(feature = "std")]
+pub mod mhtml;
 #[cfg(feature = "std")]
 pub mod paths;
 #[cfg(feature = "std")]
 pub mod persistence;
+// SAVEDIALOG (SR364): the ONE host file writer (`.part` then rename) — ungated, so Facet's no-default-features build links it.
+pub mod fs;
 pub mod utils;
 #[cfg(feature = "std")]
 pub mod app_handler;

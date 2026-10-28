@@ -1432,6 +1432,71 @@ fn centered_line_origin_y(font: &Font, font_size: f32, center_y: f32) -> f32 {
     center_y - (ascent + descent) / 2.0
 }
 
+// ---- AETHERFILECOLORPAINT (SR456): a file input's button and status, a color input's swatch ----------------------
+
+/// AETHERFILECOLORPAINT (SR456): paints an `<input type=file>` or `<input type=color>` whose border box is at
+/// (`bx`, `by`) sized `bw` x `bh` with its taffy `bord` / `pad` edges, and says whether it did (any other element:
+/// false, nothing touched). File (Chromium LayoutFileUploadControl, the strings layout_core's `file_label`): the
+/// button first, the input's own UA edges standing for the button's as `control_intrinsic` sized them, its caption
+/// centred by the push caption's ONE rule `caption_box` over that button sub-box; then the status text 4 px
+/// (kAfterButtonSpacing) after the button's border box on the same line top; both in the element's font and
+/// `color`, clipped to the input's padding box. Color: the value (`forms::control_value`, the dirty value js
+/// sanitized, else the attribute) through the cascade's own `parse_color_str`, black when it does not parse (the
+/// sanitization default #000000), filled in Chromium's swatch: layout_core `COLOR_SWATCH`'s inset from the border
+/// box, a 1 px frame in its colour round the fill.
+/// AETHERFILEFACE (SR463): the file input itself paints no ButtonFace and no frame; the button sub-box gets both first.
+#[allow(clippy::too_many_arguments)]
+fn paint_file_color(
+    dom_node: &crate::dom::NodeRef, tag: &str, bx: f32, by: f32, bw: f32, bh: f32,
+    bord: taffy::Rect<f32>, pad: taffy::Rect<f32>, inherited: &Inherited, font: Option<&'static Font>, color: (u8, u8, u8),
+    surface: &mut [u8], width: u32, height: u32, damage_rects: &[(u32, u32, u32, u32)], clip: Clip,
+) -> bool {
+    if tag != "input" {
+        return false;
+    }
+    match crate::forms::input_type(dom_node).as_str() {
+        "file" => {
+            let (button, status) = layout_core::file_label(dom_node.as_element().is_some_and(|e| e.attributes.borrow().get("multiple").is_some()));
+            let Some(font) = crate::fonts::face(&inherited.sel()).or(font) else { return true };
+            let adv = inherited.advancer();
+            let (ascent, descent) = text_extents(font, inherited.font_size);
+            let button_w = measure_text_width(button, &adv);
+            // AETHERFILEUAEDGES (SR459): the input has no UA edges (layout_core `ua_control`), so the button sub-box sits at
+            // the input's content origin and takes the button's OWN edges, `push_button_edges`, as `control_intrinsic` sizes it.
+            let (bb, bp) = layout_core::push_button_edges();
+            let (cx0, cy0) = (bx + bord.left + pad.left, by + bord.top + pad.top);
+            let ch = (bh - bord.top - pad.top - bord.bottom - pad.bottom).max(0.0);
+            let btn_bw = button_w + bp.left + bb.left + bp.right + bb.right;
+            let btn = layout_core::caption_box(cx0, cy0, btn_bw, ch, bb, bp, button_w, ascent, descent);
+            let whole = layout_core::caption_box(bx, by, bw, bh, bord, pad, 0.0, ascent, descent);
+            let c = whole.clip;
+            let clip = (clip.0.max(c.0), clip.1.max(c.1), clip.2.min(c.2), clip.3.min(c.3));
+            // AETHERFILEFACE (SR463): the button's face and frame on its sub-box, the push path's pixels (its 1px #767676
+            // control frame, square, over ButtonFace) as the swatch's fill_rect pair draws a framed fill; the input paints none.
+            let (fx0, fy0, fx1, fy1) = (cx0, cy0, cx0 + btn_bw, cy0 + ch);
+            if fx1 > fx0 && fy1 > fy0 {
+                fill_rect(fx0, fy0, fx1, fy1, (118, 118, 118), 255, surface, width, height, damage_rects, clip);
+                fill_rect(fx0 + 1.0, fy0 + 1.0, fx1 - 1.0, fy1 - 1.0, layout_core::BUTTON_FACE, 255, surface, width, height, damage_rects, clip);
+            }
+            draw_text(button, btn.x, btn.top, f32::MAX, &adv, 0.0, color, false, surface, width, height, damage_rects, clip);
+            draw_text(status, cx0 + btn_bw + 4.0, btn.top, f32::MAX, &adv, 0.0, color, false, surface, width, height, damage_rects, clip);
+            true
+        }
+        "color" => {
+            let value = crate::forms::control_value(dom_node);
+            let fill = crate::css::parse_color_str(&value).unwrap_or((0, 0, 0));
+            let (ix, iy, frame) = layout_core::COLOR_SWATCH;
+            let (x0, y0, x1, y1) = (bx + ix, by + iy, bx + bw - ix, by + bh - iy);
+            if x1 > x0 && y1 > y0 {
+                fill_rect(x0, y0, x1, y1, frame, 255, surface, width, height, damage_rects, clip);
+                fill_rect(x0 + 1.0, y0 + 1.0, x1 - 1.0, y1 - 1.0, fill, 255, surface, width, height, damage_rects, clip);
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
 /// UNAOS_LAYOUTDUMP=<max-depth>: writes the computed box tree (tag, id/class,
 /// rect, display, paint gates) to stderr. Diagnostic only — off by default.
 pub fn dump_layout(layout: &LayoutTree) {
@@ -2792,9 +2857,14 @@ fn frame_walk(
                     }
                 }
 
-                if tag == "img" {
+                // AETHERIMAGEINPUTFETCH (SR461): an image input's bitmap is an img's (layout_core's ONE `is_image_input`): the same
+                // source, store and blit; `image_painted` keeps its value text off the bitmap. The SR455 frame / corner sites read it too.
+                let image_input = layout_core::is_image_input(dom_node);
+                let mut image_painted = false;
+                if tag == "img" || image_input {
                     let src = crate::images::img_source(dom_node, crate::images::SELECTION_VIEWPORT); // AETHERMEDIA SR107: <picture>
                     if let Some(img) = src.as_deref().and_then(crate::images::get) {
+                        image_painted = true;
                         // The painted SPAN clamps to the viewport; the box
                         // ORIGIN must not. Clamping the origin re-anchors a
                         // scrolled-off image to the viewport edge, so it
@@ -2905,10 +2975,15 @@ fn frame_walk(
                 let is_control = matches!(tag, "input" | "textarea" | "select" | "button");
                 let kind = crate::layout::control_kind(dom_node);
                 let checkable = matches!(kind, Some(crate::layout::Control::Checkbox | crate::layout::Control::Radio));
+                // AETHERIMAGEINPUTBOX (SR455): an image input has no UA edges (layout_core `ua_control`) and Chromium
+                // paints it no control frame: layout_core's ONE image predicate (`image_input`, bound at the img arm), as the box was sized.
+                // AETHERFILEFACE (SR463): a file input has no UA edges and Chromium frames only its Choose-File button, which
+                // `paint_file_color` draws (the same dispatch): no 1px control frame and no corner keep on the input box.
+                let file_input = tag == "input" && crate::forms::input_type(dom_node) == "file";
                 // Chromium's control theme paints a 1px #767676 frame at the
                 // outer edge of the (2px) UA border; checkboxes and radios
                 // are drawn whole below.
-                let mut border = spec.border.or(if is_control && !checkable {
+                let mut border = spec.border.or(if is_control && !checkable && !image_input && !file_input {
                     Some([Some((1.0, (118, 118, 118))); 4])
                 } else {
                     None
@@ -2943,11 +3018,8 @@ fn frame_walk(
                             .attributes
                             .borrow()
                             .get("type")
-                            .map(|t| {
-                                let t = t.to_ascii_lowercase();
-                                matches!(t.as_str(), "submit" | "button" | "reset")
-                            })
-                            .unwrap_or(false));
+                            // AETHERPUSHTRIM (SR440): layout_core's ONE push predicate (trimmed, as the box was sized).
+                            .is_some_and(|t| layout_core::is_push_type(t)));
                 if is_push_button {
                     inherited.center_box = Some((content_x, content_y, content_w, content_h));
                 }
@@ -3023,7 +3095,9 @@ fn frame_walk(
                         fill_rect(cx, cy, cx + 1.0, cy + lh, color, 255, surface, width, height, damage_rects, clip);
                     }
                 }
-                if is_control && tag != "button" && !checkable && tag != "textarea" {
+                // AETHERFILECOLORPAINT (SR456): a file input's Choose-File button and status, a color input's swatch; never its value as text.
+                let file_color = paint_file_color(dom_node, tag, box_sx, box_sy, bw, bh, bord, pad, &inherited, *font, spec.color.unwrap_or((0, 0, 0)), surface, width, height, damage_rects, clip);
+                if is_control && tag != "button" && !checkable && tag != "textarea" && !file_color && !(image_input && image_painted) { // AETHERIMAGEINPUTFETCH (SR461): a painted image input shows no text
                     let face = crate::fonts::face(&inherited.sel());
                     if let Some(font) = face.or(*font) {
                         let adv = inherited.advancer();
@@ -3033,20 +3107,33 @@ fn frame_walk(
                         let select_label = (tag == "select")
                             .then(|| crate::layout::select_selected_option(dom_node).map(|(_, l)| l))
                             .flatten();
+                        // AETHERSUBMITCAPTION (SR410): a push button paints its label (forms::button_label: the
+                        // value attribute, else "Submit" / "Reset"); it has no dirty value and no placeholder.
+                        // AETHERIMAGEINPUTFETCH (SR461): an image input with no image paints layout_core's `image_alt_label`, the AltText its box was sized by.
+                        let push_label = if image_input {
+                            let a = el.attributes.borrow();
+                            Some(layout_core::image_alt_label(a.get("alt"), a.get("value")).into_owned())
+                        } else {
+                            is_push_button.then(|| crate::forms::button_label(dom_node))
+                        };
                         let attrs = el.attributes.borrow();
                         // A <select> paints the SELECTED OPTION'S TEXT, not
                         // its submit value: layout publishes the visible label
                         // as data-aether-label, so "English" shows where the
                         // value attribute would only say "en".
-                        let shown = select_label
-                            .as_deref()
-                            .filter(|v| !v.is_empty())
-                            .or_else(|| dirty.as_deref())
-                            .or_else(|| attrs.get("value"))
-                            .filter(|v| !v.is_empty());
+                        let shown = if let Some(l) = push_label.as_deref() {
+                            Some(l).filter(|v| !v.is_empty())
+                        } else {
+                            select_label
+                                .as_deref()
+                                .filter(|v| !v.is_empty())
+                                .or_else(|| dirty.as_deref())
+                                .or_else(|| attrs.get("value"))
+                                .filter(|v| !v.is_empty())
+                        };
                         let is_placeholder = shown.is_none();
                         let password = attrs.get("type").is_some_and(|t| t.trim().eq_ignore_ascii_case("password"));
-                        let mut value = shown.or_else(|| attrs.get("placeholder")).unwrap_or("").to_string();
+                        let mut value = shown.or_else(|| attrs.get("placeholder").filter(|_| !is_push_button)).unwrap_or("").to_string();
                         if password && !is_placeholder {
                             value = "\u{2022}".repeat(value.chars().count());
                         }
@@ -3066,11 +3153,19 @@ fn frame_walk(
                             // edit surface: its text starts at the top.
                             let single_line = tag != "textarea" && content_h > 0.0;
                             let lh = crate::fonts::line_height(font, fs, 0.0);
-                            let (tx, ty, max_w) = if is_push_button && text_w <= content_w {
+                            // AETHERSUBMITCAPTION (SR410): a push button's caption is ALWAYS centred (Chromium centres
+                            // an overflowing label) and clipped to its padding box (html.css `input { overflow: clip }`).
+                            // AETHERCAPTIONCORE (SR438): the caption's x, line top and padding-box clip are ONE layout_core
+                            // rule, `caption_box`, the one AETHER.ELF's paint.rs `caption` draws by (raw extents here).
+                            let caption = (is_push_button || image_input).then(|| { // AETHERIMAGEINPUTFETCH (SR461): the alt label centres as a caption
+                                let (ascent, descent) = text_extents(font, fs);
+                                layout_core::caption_box(box_sx, box_sy, bw, bh, bord, pad, text_w, ascent, descent)
+                            });
+                            let (tx, ty, max_w) = if let Some(c) = caption {
                                 (
-                                    content_x + (content_w - text_w) / 2.0,
-                                    centered_line_origin_y(font, fs, content_y + content_h / 2.0),
-                                    content_w.max(1.0),
+                                    c.x,
+                                    c.top,
+                                    if text_w <= content_w { content_w.max(1.0) } else { f32::MAX }, // one line, never wrapped
                                 )
                             } else {
                                 // The value's line box is centred in the
@@ -3111,6 +3206,12 @@ fn frame_walk(
                                     fill_rect(cx, ty, cx + 1.0, ty + lh, color, 255, surface, width, height, damage_rects, clip);
                                 }
                             } else {
+                                // AETHERCAPTIONCORE (SR438): the running clip meets caption_box's padding box.
+                                let caption_clip = if let Some(c) = caption {
+                                    (clip.0.max(c.clip.0), clip.1.max(c.clip.1), clip.2.min(c.clip.2), clip.3.min(c.clip.3))
+                                } else {
+                                    clip
+                                };
                                 draw_text(
                                     &value,
                                     tx,
@@ -3124,7 +3225,7 @@ fn frame_walk(
                                     width,
                                     height,
                                     damage_rects,
-                                    clip,
+                                    caption_clip,
                                 );
                             }
                         }
@@ -3139,7 +3240,7 @@ fn frame_walk(
                 }
                 // Chromium's control frame (fields, selects, textareas) is a rounded rect whose four
                 // corner pixels stay unpainted: keep what is under them.
-                let ua_frame = is_control && !checkable && !is_push_button && spec.border.is_none() && !focused_field;
+                let ua_frame = is_control && !checkable && !is_push_button && !image_input && !file_input && spec.border.is_none() && !focused_field;
                 let corners: Vec<(u32, u32, [u8; 4])> = if ua_frame {
                     let (x0, y0) = (box_sx.round(), box_sy.round());
                     let (x1, y1) = ((box_sx + bw).round() - 1.0, (box_sy + bh).round() - 1.0);
@@ -4024,4 +4125,329 @@ fn frame_walk(
     crate::perf::add_painted(painted, skipped);
     // AETHERA11Y (SR119): `:focus-visible` from the keyboard — the ring over everything.
     focusring::paint(layout, surface, width, height, sx, sy, damage_rects);
+}
+
+// =================================================================================================
+// AETHERMACGPU-ENGINEDAMAGE (LEDGER SR341): the frame's damage on the PRESENTED (device) frame.
+// =================================================================================================
+
+/// A damage rect `(x, y, w, h)`.
+pub type DamageRect = (u32, u32, u32, u32);
+
+/// What the last presented frame was painted at: the truncated scroll `render_frame` used. The caller (aether-shell's
+/// tab, beside its `tetra::SurfaceDamage`) keeps one per surface and hands it to every [`present_damage`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PresentMark {
+    scroll: (i32, i32),
+}
+
+/// The device-pixel rects of `damages` (the list `AetherEngine::render_frame` returned, CSS px of the viewport) on the
+/// frame `present_rgba` makes: the whole device viewport when the viewport scrolled since `mark` (the surface was shifted
+/// by `copy_within` and only the exposed band was damaged: every presented pixel moved), when there is no layout (the
+/// surface was filled whole), or when `damages` is empty or covers the viewport; else [`device_rects`]. Updates `mark`.
+pub fn present_damage(engine: &crate::AetherEngine, damages: &[DamageRect], mark: &mut PresentMark) -> Vec<DamageRect> {
+    let scroll = (engine.scroll_x as i32, engine.scroll_y as i32);
+    let moved = std::mem::replace(&mut mark.scroll, scroll) != scroll;
+    let css = (engine.width, engine.height);
+    let device = engine.device_size();
+    let covers = damages.iter().any(|&(x, y, w, h)| x == 0 && y == 0 && w >= css.0 && h >= css.1);
+    if moved || engine.layout_tree.is_none() || damages.is_empty() || covers {
+        return vec![(0, 0, device.0, device.1)];
+    }
+    device_rects(damages, css, device)
+}
+
+/// CSS-surface rects on a `device` frame resampled from the `css` one (`AetherEngine::present_rgba`'s bilinear: a
+/// device pixel reads a 2x2 CSS footprint): each rect grown one CSS px on every side, scaled outward (floor / ceil) and
+/// clipped to the device; the identity (clipped) when the sizes match. Pure.
+pub fn device_rects(rects: &[DamageRect], css: (u32, u32), device: (u32, u32)) -> Vec<DamageRect> {
+    let clip = |x0: u32, y0: u32, x1: u32, y1: u32| {
+        let (x1, y1) = (x1.min(device.0), y1.min(device.1));
+        (x1 > x0 && y1 > y0).then(|| (x0, y0, x1 - x0, y1 - y0))
+    };
+    if css == device || css.0 == 0 || css.1 == 0 {
+        return rects.iter().filter_map(|&(x, y, w, h)| clip(x, y, x.saturating_add(w), y.saturating_add(h))).collect();
+    }
+    let (sx, sy) = (device.0 as f64 / css.0 as f64, device.1 as f64 / css.1 as f64);
+    rects
+        .iter()
+        .filter_map(|&(x, y, w, h)| {
+            let x0 = ((x as f64 - 1.0) * sx).floor().max(0.0) as u32;
+            let y0 = ((y as f64 - 1.0) * sy).floor().max(0.0) as u32;
+            let x1 = ((x as f64 + w as f64 + 1.0) * sx).ceil().min(device.0 as f64) as u32;
+            let y1 = ((y as f64 + h as f64 + 1.0) * sy).ceil().min(device.1 as f64) as u32;
+            clip(x0, y0, x1, y1)
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod device_damage_tests {
+    use super::{PresentMark, device_rects, present_damage};
+    use crate::AetherEngine;
+
+    fn engine(html: &str, device: (u32, u32), zoom: u32) -> AetherEngine {
+        let mut e = AetherEngine::new();
+        e.set_device_size(device.0, device.1);
+        e.set_zoom_pct(zoom);
+        e.load_html_styled("file:///page/index.html", html, &[], true);
+        let _ = e.render_frame();
+        e
+    }
+
+    /// Every device pixel `present_rgba` changes when a CSS rect changes lies inside `device_rects` of it.
+    fn assert_bilinear_covered(css: (u32, u32), device: (u32, u32), rect: super::DamageRect) {
+        let got = device_rects(&[rect], css, device);
+        assert_eq!(got.len(), 1);
+        let (gx, gy, gw, gh) = got[0];
+        let (rx, ry) = (css.0 as f64 / device.0 as f64, css.1 as f64 / device.1 as f64);
+        let reads = |d: u32, r: f64, n: u32, lo: u32, len: u32| {
+            let f = ((d as f64 + 0.5) * r - 0.5).clamp(0.0, (n - 1) as f64);
+            let (a, b) = (f.floor() as u32, (f.floor() as u32 + 1).min(n - 1));
+            (lo..lo + len).contains(&a) || (lo..lo + len).contains(&b)
+        };
+        for y in 0..device.1 {
+            for x in 0..device.0 {
+                if reads(x, rx, css.0, rect.0, rect.2) && reads(y, ry, css.1, rect.1, rect.3) {
+                    assert!(x >= gx && x < gx + gw && y >= gy && y < gy + gh, "device ({x},{y}) outside {:?}", got[0]);
+                }
+            }
+        }
+    }
+
+    /// The same sizes map to themselves (clipped to the device).
+    #[test]
+    fn device_rects_identity_kat() {
+        assert_eq!(device_rects(&[(10, 20, 30, 40), (90, 90, 50, 50), (200, 0, 1, 1)], (100, 100), (100, 100)), vec![(10, 20, 30, 40), (90, 90, 10, 10)]);
+    }
+
+    /// A style change on ONE element at zoom 150 and at zoom 200 (the page's devicePixelRatio 2: the faces' only scale)
+    /// presents as ONE device rect that holds the element's device box and is smaller than the viewport; the CSS->device
+    /// numbers are exact; and every device pixel the bilinear resample reads from the rect lies inside it.
+    #[test]
+    fn damage_device_style_zoom_kat() {
+        assert_eq!(device_rects(&[(10, 20, 30, 40)], (400, 300), (600, 450)), vec![(13, 28, 49, 64)]);
+        assert_eq!(device_rects(&[(10, 20, 30, 40)], (400, 300), (800, 600)), vec![(18, 38, 64, 84)]);
+        assert_bilinear_covered((400, 300), (600, 450), (10, 20, 30, 40));
+        assert_bilinear_covered((400, 300), (800, 600), (0, 0, 7, 3));
+        assert_bilinear_covered((400, 300), (200, 150), (33, 17, 9, 5));
+        let html = r#"<html><body style="margin:0"><div id="a" style="margin:40px;width:60px;height:30px;background:#00f"></div>
+            <div style="height:2000px"></div></body></html>"#;
+        for (zoom, device) in [(150u32, (600u32, 450u32)), (200, (800, 600))] {
+            let mut e = engine(html, device, zoom);
+            assert_eq!((e.width, e.height), (400, 300), "zoom {zoom}: the CSS viewport");
+            let mut mark = PresentMark::default();
+            let a = e.document.as_ref().and_then(|d| crate::dom::a11y::by_id(d, "a")).expect("#a");
+            e.damage_node(&a); // the element's box, as a restyle of it damages
+            let damages = e.render_frame();
+            let got = present_damage(&e, &damages, &mut mark);
+            assert_eq!(got.len(), 1, "zoom {zoom}: one rect, got {got:?}");
+            let (x, y, w, h) = got[0];
+            let z = zoom as f64 / 100.0;
+            let (bx0, by0, bx1, by1) = ((40.0 * z) as u32, (40.0 * z) as u32, (100.0 * z) as u32, (70.0 * z) as u32);
+            assert!(x <= bx0 && y <= by0 && x + w >= bx1 && y + h >= by1, "zoom {zoom}: {got:?} holds the box");
+            assert!((w as u64) * (h as u64) * 4 < device.0 as u64 * device.1 as u64, "zoom {zoom}: {got:?} is small");
+        }
+    }
+
+    /// A viewport scroll shifts the surface and damages only the exposed band; on the presented frame it is the whole
+    /// viewport. The next unscrolled frame is rects again.
+    #[test]
+    fn damage_device_scroll_kat() {
+        let html = r#"<html><body style="margin:0"><div style="height:3000px;background:linear-gradient(red,blue)"></div></body></html>"#;
+        let mut e = engine(html, (300, 200), 100);
+        let mut mark = PresentMark::default();
+        let damages = vec![(0, 0, e.width, e.height)];
+        assert_eq!(present_damage(&e, &damages, &mut mark), vec![(0, 0, 300, 200)]);
+        e.handle_event(crate::api::events::Event::Scroll(0.0, 40.0));
+        let damages = e.render_frame();
+        assert_eq!(damages, vec![(0, 160, 300, 40)], "the engine damages the exposed band");
+        assert_eq!(present_damage(&e, &damages, &mut mark), vec![(0, 0, 300, 200)], "the presented frame moved whole");
+        e.damage_rects.push((5, 6, 7, 8));
+        let damages = e.render_frame();
+        assert_eq!(present_damage(&e, &damages, &mut mark), vec![(5, 6, 7, 8)], "no scroll since: the rects");
+    }
+
+    /// A playing <video>'s next frame damages its box alone: the presented frame uploads only that rect.
+    #[test]
+    fn damage_device_video_kat() {
+        use bandy::SMessage;
+        let url = "file:///page/clip.webm";
+        let mut e = engine(r#"<html><body style="margin:0"><p>text</p><video src="clip.webm" width="160" height="120"></video></body></html>"#, (640, 480), 100);
+        e.on_media_message(&SMessage::MediaOpened {
+            url: url.into(),
+            duration_ns: 1_000_000_000,
+            width: 160,
+            height: 120,
+            video: "vp8".into(),
+            audio: String::new(),
+            real_video: true,
+            audio_clock: false,
+        });
+        let frame = |n: i64| SMessage::MediaFrame { url: url.into(), pts_ns: n * 40_000_000, width: 160, height: 120, rgba: vec![n as u8; 160 * 120 * 4], levels: vec![] };
+        e.on_media_message(&frame(0));
+        let _ = e.render_frame();
+        let mut mark = PresentMark::default();
+        let _ = present_damage(&e, &[(0, 0, e.width, e.height)], &mut mark);
+        assert!(e.on_media_message(&frame(1)), "a frame repaints");
+        let damages = e.render_frame();
+        let el = &e.media_elements()[0];
+        let (x, y, w, h) = e.box_of(&el.node).expect("video box");
+        let video = (x.floor() as u32, y.floor() as u32, w.ceil() as u32, h.ceil() as u32);
+        assert_eq!(present_damage(&e, &damages, &mut mark), vec![video], "the overlay rect alone");
+    }
+}
+
+// =================================================================================================
+// AETHERMACGPU-SCROLL (LEDGER SR351): a viewport scroll presented as a copy of the kept frame plus the exposed band.
+// =================================================================================================
+
+/// [`present_damage`] with the viewport scroll as a copy-rect: `(rects, Some((0, dy)))` when the presented frame is the
+/// kept one moved `dy` device rows (pixel `(x, y)` to `(x, y + dy)`, quartzite `damage::scroll`) plus `rects` (the damaged
+/// CSS rects on the device, the exposed band among them): only the truncated `scroll_y` moved since `mark` (by `k`, less
+/// than the viewport), a layout and no PDF, a list that is neither empty nor covering, and a device height that is the CSS
+/// one times a power of two (zoom 100 / 200 / 400 when the sizes divide), where `present_rgba`'s bilinear is exact under
+/// the shift (`fy(d + k z) = fy(d) + k` in f64; the clamped edge rows that move inward lie inside the band's one-CSS-px
+/// growth). Every other case is `(present_damage(..), None)`. Updates `mark`.
+pub fn present_scroll(engine: &crate::AetherEngine, damages: &[DamageRect], mark: &mut PresentMark) -> (Vec<DamageRect>, Option<(i32, i32)>) {
+    let scroll = (engine.scroll_x as i32, engine.scroll_y as i32);
+    let k = scroll.1 - mark.scroll.1;
+    let css = (engine.width, engine.height);
+    let device = engine.device_size();
+    let covers = damages.iter().any(|&(x, y, w, h)| x == 0 && y == 0 && w >= css.0 && h >= css.1);
+    let z = (css.1 > 0 && device.1 % css.1 == 0).then(|| device.1 / css.1).filter(|z| z.is_power_of_two());
+    let pair = scroll.0 == mark.scroll.0 && k != 0 && k.unsigned_abs() < css.1;
+    match z {
+        Some(z) if pair && engine.layout_tree.is_some() && engine.pdf.is_none() && !damages.is_empty() && !covers => {
+            mark.scroll = scroll;
+            (device_rects(damages, css, device), Some((0, -k * z as i32)))
+        }
+        _ => (present_damage(engine, damages, mark), None),
+    }
+}
+
+/// PDF1's file builder, for the PDF case of `presentrects_style_rect_kat`.
+#[cfg(test)]
+#[path = "../../../../unaos/libs/web/pdf_core/tests/common/mod.rs"]
+#[allow(dead_code)]
+mod presentrects_builder;
+
+#[cfg(test)]
+mod presentrects_tests {
+    use super::presentrects_builder as builder;
+    use super::{PresentMark, device_rects, present_damage, present_scroll};
+    use crate::AetherEngine;
+
+    fn engine(html: &str, device: (u32, u32), zoom: u32) -> AetherEngine {
+        let mut e = AetherEngine::new();
+        e.set_device_size(device.0, device.1);
+        e.set_zoom_pct(zoom);
+        e.load_html_styled("file:///page/index.html", html, &[], true);
+        let _ = e.render_frame();
+        e
+    }
+
+    fn fnv(bytes: impl Iterator<Item = u8>) -> u64 {
+        bytes.fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3))
+    }
+
+    fn inside(rects: &[super::DamageRect], x: u32, y: u32) -> bool {
+        rects.iter().any(|&(rx, ry, rw, rh)| x >= rx && x < rx + rw && y >= ry && y < ry + rh)
+    }
+
+    /// A one-element style change at zoom 100, 150 and 200 converts only its rect: written into a poisoned frame, every
+    /// pixel outside the rect keeps the poison (the fnv of the rest is unchanged) and every pixel inside equals the whole
+    /// `present_rgba`; written into the frame presented before, the result IS the whole new frame. A PDF refuses.
+    #[test]
+    fn presentrects_style_rect_kat() {
+        let html = r#"<html><body style="margin:0"><div id="a" style="margin:40px;width:60px;height:30px;background:#00f"></div>
+            <div style="height:2000px"></div></body></html>"#;
+        for (zoom, device) in [(100u32, (400u32, 300u32)), (150, (600, 450)), (200, (800, 600))] {
+            let mut e = engine(html, device, zoom);
+            let mut mark = PresentMark::default();
+            let _ = present_damage(&e, &[(0, 0, e.width, e.height)], &mut mark);
+            let (_, _, before) = e.present_rgba();
+            e.js_engine.as_mut().expect("js").eval_string("document.getElementById('a').style.background = '#f00'").expect("restyle");
+            e.tick();
+            let _ = e.render_frame();
+            // The element's box (what `damage_node` damages for a restyle of it), over the repainted surface.
+            let a = e.document.as_ref().and_then(|d| crate::dom::a11y::by_id(d, "a")).expect("#a");
+            let (x, y, w, h) = e.box_of(&a).expect("#a box");
+            let boxed = (x.floor() as u32, y.floor() as u32, w.ceil() as u32 + 1, h.ceil() as u32 + 1);
+            let rects = present_damage(&e, &[boxed], &mut mark);
+            let area: u64 = rects.iter().map(|r| r.2 as u64 * r.3 as u64).sum();
+            assert!(area * 4 < device.0 as u64 * device.1 as u64, "zoom {zoom}: small rects, got {rects:?}");
+            let (w, h, after) = e.present_rgba();
+            assert_eq!((w, h), device);
+            assert_ne!(before, after, "zoom {zoom}: the restyle changed the frame");
+            let mut poisoned = vec![0x5Au8; after.len()];
+            assert!(e.present_rects(&mut poisoned, &rects));
+            let outside = |f: &[u8]| {
+                fnv((0..h).flat_map(|y| (0..w).map(move |x| (x, y))).filter(|&(x, y)| !inside(&rects, x, y)).flat_map(|(x, y)| {
+                    let o = ((y * w + x) * 4) as usize;
+                    f[o..o + 4].to_vec()
+                }))
+            };
+            assert_eq!(outside(&poisoned), outside(&vec![0x5Au8; after.len()]), "zoom {zoom}: the rest untouched");
+            for y in 0..h {
+                for x in (0..w).filter(|&x| inside(&rects, x, y)) {
+                    let o = ((y * w + x) * 4) as usize;
+                    assert_eq!(poisoned[o..o + 4], after[o..o + 4], "zoom {zoom}: ({x},{y}) as the whole frame");
+                }
+            }
+            let mut kept = before.clone();
+            assert!(e.present_rects(&mut kept, &rects));
+            assert_eq!(kept, after, "zoom {zoom}: the kept frame plus the rects is the new frame");
+            assert!(!e.present_rects(&mut vec![0u8; 16], &rects), "a frame of another size refuses");
+        }
+        let mut b = builder::PdfBuilder::new(1);
+        b.obj(1, "<< /Type /Catalog /Pages 2 0 R >>")
+            .obj(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 200 100] >>")
+            .obj(3, "<< /Type /Page /Parent 2 0 R /Contents 4 0 R >>")
+            .stream(4, "", b"1 0 0 rg 0 0 200 100 re f");
+        let mut e = AetherEngine::new();
+        e.set_device_size(300, 200);
+        e.load_pdf("https://example.com/a.pdf", b.classic(), true);
+        assert!(e.pdf.is_some(), "the PDF opened");
+        let mut frame = vec![7u8; 300 * 200 * 4];
+        assert!(!e.present_rects(&mut frame, &[(0, 0, 10, 10)]), "a PDF refuses");
+        assert!(frame.iter().all(|&b| b == 7), "untouched");
+    }
+
+    /// A viewport scroll at zoom 100 and 200 presents as the copy pair `(0, -k z)` plus the exposed band on the device;
+    /// at zoom 150 (no exact shift) and after a zoom change it is the whole frame; an unscrolled frame after is rects.
+    #[test]
+    fn presentrects_scroll_pair_kat() {
+        let html = r#"<html><body style="margin:0"><div style="height:3000px;background:linear-gradient(red,blue)"></div></body></html>"#;
+        for (zoom, device, dy, band) in [(100u32, (300u32, 200u32), -40, (0, 160, 300, 40)), (200, (600, 400), -80, (0, 318, 600, 82))] {
+            let mut e = engine(html, device, zoom);
+            assert_eq!((e.width, e.height), (300, 200));
+            let mut mark = PresentMark::default();
+            assert_eq!(present_scroll(&e, &[(0, 0, 300, 200)], &mut mark), (vec![(0, 0, device.0, device.1)], None));
+            e.handle_event(crate::api::events::Event::Scroll(0.0, 40.0));
+            let damages = e.render_frame();
+            assert_eq!(damages, vec![(0, 160, 300, 40)], "zoom {zoom}: the engine damages the exposed band");
+            assert_eq!(device_rects(&damages, (300, 200), device), vec![band]);
+            assert_eq!(present_scroll(&e, &damages, &mut mark), (vec![band], Some((0, dy))), "zoom {zoom}: the pair");
+            e.damage_rects.push((5, 6, 7, 8));
+            let damages = e.render_frame();
+            let (rects, scroll) = present_scroll(&e, &damages, &mut mark);
+            assert_eq!((rects, scroll), (device_rects(&[(5, 6, 7, 8)], (300, 200), device), None), "zoom {zoom}: no scroll since");
+            e.handle_event(crate::api::events::Event::Scroll(0.0, -25.0));
+            let damages = e.render_frame();
+            assert_eq!(present_scroll(&e, &damages, &mut mark).1, Some((0, 25 * (zoom as i32 / 100))), "zoom {zoom}: up");
+        }
+        let mut e = engine(html, (450, 300), 150);
+        let mut mark = PresentMark::default();
+        let _ = present_scroll(&e, &[(0, 0, e.width, e.height)], &mut mark);
+        e.handle_event(crate::api::events::Event::Scroll(0.0, 40.0));
+        let damages = e.render_frame();
+        assert_eq!(present_scroll(&e, &damages, &mut mark), (vec![(0, 0, 450, 300)], None), "zoom 150: whole");
+        let mut e = engine(html, (600, 400), 100);
+        let mut mark = PresentMark::default();
+        let _ = present_scroll(&e, &[(0, 0, e.width, e.height)], &mut mark);
+        e.set_zoom_pct(200);
+        let damages = e.render_frame();
+        assert_eq!(present_scroll(&e, &damages, &mut mark), (vec![(0, 0, 600, 400)], None), "a zoom change: whole");
+    }
 }

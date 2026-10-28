@@ -18,7 +18,7 @@
 //! element in the first access unit (implicit signalling, [`sbr_probe`]). HE-AAC v2's parametric stereo
 //! (`AacDecoder::ps_seen`, `ps=seen`) is synthesised from the mono core into a stereo pair (HEAACSBR-PS, LEDGER
 //! SR214; a stream whose PS first appears after the probed first access unit stays mono).
-pub mod decoder;
+pub mod decoder; pub mod enc; // NLE6EXPORTAAC (rmbp-ledger B960): the AAC-LC encoder. LINE-NEUTRAL append, code before the comment.
 pub mod sbr;
 pub mod tables;
 

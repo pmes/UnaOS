@@ -172,35 +172,10 @@ const MAX_PORTS: usize = 32;
 /// six AHCI ports of which the fixture uses two.
 pub const MAX_AHCI_DISKS: usize = 4;
 
-// ── Bounded waits, in TSC units. Same construction as `drivers/sdhc.rs`: `arch::apic::tsc_hz()` is
-// calibrated against the ACPI PM timer long before `pci::init` runs, and the uncalibrated fallback
-// derives from `arch::HW_WAIT_BUDGET` (the ~2 s pre-calibration guess). `arch::ms()` is NOT usable
-// here — the APIC tick does not advance with interrupts masked, and this runs inside `pci::init`.
-#[inline]
-fn cycles_ms(ms: u64) -> u64 {
-    let hz = crate::arch::apic::tsc_hz();
-    if hz != 0 {
-        hz.saturating_mul(ms) / 1000
-    } else {
-        crate::arch::HW_WAIT_BUDGET.saturating_mul(ms) / 2000
-    }
-}
-
-/// Spin until `pred()` holds or `ms` milliseconds elapse. `wrapping_sub` so a 64-bit TSC wrap
-/// mid-wait cannot trip the deadline early.
-fn wait_ms<F: Fn() -> bool>(ms: u64, pred: F) -> bool {
-    let start = crate::arch::now_cycles();
-    let budget = cycles_ms(ms);
-    loop {
-        if pred() {
-            return true;
-        }
-        if crate::arch::now_cycles().wrapping_sub(start) >= budget {
-            return false;
-        }
-        core::hint::spin_loop();
-    }
-}
+// ── Bounded waits, in TSC units: the ONE shared wait (BOUNDEDWAIT, rmbp-ledger B981, at the tail of
+// `drivers/block.rs`). `arch::ms()` is NOT usable here — the APIC tick does not advance with interrupts masked,
+// and this runs inside `pci::init`.
+use crate::drivers::block::wait::{bounded as wait_ms, cycles_ms};
 
 /// Port state-machine transitions (`CR`/`FR` following `ST`/`FRE`) are specified to complete in
 /// 500 ms (AHCI 1.3.1 §10.1.2).
@@ -268,12 +243,7 @@ fn bus_addr(p: u64) -> u64 {
 /// to the allocator while the HBA still owns it is the one class of bug a port teardown must get
 /// right, and this arc has no teardown at all.
 fn dma_alloc(size: usize, align: usize) -> u64 {
-    let layout = match core::alloc::Layout::from_size_align(size, align) {
-        Ok(l) => l,
-        Err(_) => return 0,
-    };
-    let p = unsafe { alloc::alloc::alloc_zeroed(layout) };
-    p as u64
+    crate::arch::memory::dma::ident(size, align) // DMAALLOCONE (B986): the kernel's one DMA allocator
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════════════════════
@@ -1153,43 +1123,39 @@ pub mod dongle {
     /// bounded try, never waited for by the render task. `f` runs under the hold with the port's copy.
     pub(super) fn with_port<R>(port_ix: usize, lba: u64, f: impl FnOnce(&AhciPort) -> Result<R, ()>) -> Result<R, ()> {
         let render = on_render();
-        crate::arch::without_interrupts(move || {
-            let t0 = crate::arch::now_cycles();
-            let bound = cycles_ms(T_CMD_MS + T_PORT_MS);
-            let guard = loop {
-                if let Some(g) = PORTS.try_lock() {
-                    break g;
-                }
-                let spun = crate::arch::now_cycles().wrapping_sub(t0);
+        crate::drivers::block::hold::with(
+            T_CMD_MS + T_PORT_MS,
+            render,
+            || PORTS.try_lock(),
+            |spun| {
                 if render {
                     RENDER_SPIN_US.store(cycles_to_us(spun), Relaxed);
                     let n = RENDER_REFUSED.fetch_add(1, Relaxed) + 1;
                     if n <= SAY_CAP {
                         serial_println!("[ahci] render refused ix={} lba={} n={} (DONGLEBOOT: the render task never waits on a disk; the port lock is held — the caller reads it as an unreadable sector)", port_ix, lba, n);
                     }
-                    return Err(());
-                }
-                if spun >= bound {
+                } else {
                     let n = BUSY_REFUSED.fetch_add(1, Relaxed) + 1;
                     if n <= SAY_CAP {
                         serial_println!("[ahci] busy refused ix={} lba={} waited_ms={} bound_ms={} n={} (DONGLEBOOT: the port lock was not free inside the bound)", port_ix, lba, cycles_to_us(spun) / 1000, T_CMD_MS + T_PORT_MS, n);
                     }
-                    return Err(());
                 }
-                core::hint::spin_loop();
-            };
-            let p = match guard[port_ix] {
-                Some(p) => p,
-                None => return Err(()),
-            };
-            let th = crate::arch::now_cycles();
-            let r = f(&p);
-            let held = cycles_to_us(crate::arch::now_cycles().wrapping_sub(th));
-            drop(guard);
-            LAST_HOLD_US.store(held, Relaxed);
-            MAX_HOLD_US.fetch_max(held, Relaxed);
-            r
-        })
+                Err(())
+            },
+            |guard| {
+                let p = match guard[port_ix] {
+                    Some(p) => p,
+                    None => return Err(()),
+                };
+                let th = crate::arch::now_cycles();
+                let r = f(&p);
+                let held = cycles_to_us(crate::arch::now_cycles().wrapping_sub(th));
+                drop(guard);
+                LAST_HOLD_US.store(held, Relaxed);
+                MAX_HOLD_US.fetch_max(held, Relaxed);
+                r
+            },
+        )
     }
 
     /// `tests dongleboot` leg 2: what one forced miss of the real bound did.

@@ -26,7 +26,11 @@
 //! | [`xts`] | XTS-AES-128/256 (ciphertext stealing; whole-block slices of a data unit) | IEEE Std 1619-2007, SP 800-38E |
 //! | [`prf80211`] | the 802.11 PRF-n (HMAC-SHA-1, counter octet) — the RSN key hierarchy's PRF | IEEE Std 802.11-2020 §12.7.1.2 |
 //! | [`ccm`] | AES-CCM (generic M and L; 802.11 CCMP is M=8, L=2) | RFC 3610, SP 800-38C |
+//! | [`ctr`] | CTR mode with an n-bit counter (1..=128 bits) — GCM's GCTR, CCM's A_i, WebCrypto AES-CTR | SP 800-38A §6.5 / B.1 |
 //! | [`keywrap`] | AES Key Wrap (default IV, unwrap integrity check) | RFC 3394 |
+//! | [`cbc`] | CBC mode over AES (whole blocks, PKCS #7 unpad) — PDF's AESV2/AESV3 crypt filters | SP 800-38A §6.2 |
+//! | [`md5`] | MD5 — LEGACY-ONLY (broken): PDF's standard security handler and FLAC's STREAMINFO checksum only | RFC 1321 |
+//! | [`rc4`] | RC4 — LEGACY-ONLY (broken, not constant-time): PDF's standard security handler only | RFC 6229 (vectors) |
 //! | [`x25519`] | X25519 | RFC 7748 |
 //! | [`ed25519`] | Ed25519 | RFC 8032 |
 //! | [`p256`] | P-256 ECDH + ECDSA | SP 800-186, FIPS 186-5, RFC 6979, SEC 1 |
@@ -74,6 +78,9 @@ pub mod xts; // XTS (rmbp-ledger B689): IEEE 1619 XTS-AES over `aes::Aes` — th
 pub mod prf80211; // WPA2CRYPTO (rmbp-ledger B882): the IEEE 802.11 PRF-n over HMAC-SHA-1
 pub mod ccm; // WPA2CRYPTO (rmbp-ledger B882): AES-CCM, RFC 3610 / SP 800-38C (802.11 CCMP: M=8, L=2)
 pub mod keywrap; // WPA2CRYPTO (rmbp-ledger B882): AES Key Wrap, RFC 3394
+pub mod cbc; // PDFCRYPT (LEDGER SR315): AES-CBC, SP 800-38A §6.2 (PDF's AESV2 / AESV3, /UE, the R6 hash)
+pub mod md5; // PDFCRYPT (LEDGER SR315): MD5, RFC 1321 — LEGACY-ONLY, PDF's standard security handler
+pub mod rc4; // PDFCRYPT (LEDGER SR315): RC4 — LEGACY-ONLY, PDF's standard security handler
 mod field25519;
 pub mod x25519;
 pub mod ed25519;
@@ -88,6 +95,7 @@ pub mod argon2;
 pub mod drbg;
 pub mod sha3;
 pub mod mlkem;
+pub mod ctr; // CRYPTOONE-2 (LEDGER SR342): CTR with an n-bit counter, SP 800-38A §6.5 — under gcm, ccm and WebCrypto AES-CTR
 
 pub use sha1::Sha1;
 pub use sha2::{Digest, Sha224, Sha256, Sha384, Sha512};

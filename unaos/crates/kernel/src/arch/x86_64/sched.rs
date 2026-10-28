@@ -2412,13 +2412,13 @@ fn build_initial_frame(stack: &mut [u8], trampoline: extern "C" fn() -> !) -> u6
 /// completion signal for `join`), enqueue it on `target_cpu`'s run queue, and poke that CPU. Returns
 /// the new task's id. `target_cpu` must be an online AP, or [`CPU_AUTO`] to let `pick_cpu` place it
 /// (which also makes it steal-eligible — see `Task::steal_ok`).
-fn spawn_inner(
+fn spawn_inner_with(
     name: &'static str,
     entry: fn(usize),
     arg: usize,
     target_cpu: usize,
     priority: u8,
-    stack_bytes: usize,
+    mut stack: Box<[u8]>, slot: Box<core::mem::MaybeUninit<Task>>, // RESTARTALLOC (B1022): the slab (painted + armed) and the Task's box come in ALLOCATED: `spawn_inner` (file tail) allocates both, the singleton restart hands over its SPARE
     done_sem: Option<Arc<Semaphore>>, kill: Option<Arc<KillSwitch>>, // SHELLTASK2 (B474): a kernel task may carry a TEARDOWN-1 kill switch
 ) -> u64 {
     // SMPBAL-X86: the pin contract is decided from the REQUESTED value, before placement resolves it.
@@ -2430,12 +2430,12 @@ fn spawn_inner(
     // RENDSTACK: the slab is `stack_bytes` USABLE plus the guard span below it. `paint_stack` lays
     // the guard and (under `witness`) the high-water poison; `build_initial_frame` is handed the
     // usable span ONLY, so no frame can be built inside the guard.
-    let mut stack: Box<[u8]> = alloc::vec![0u8; stack_bytes + STACK_GUARD].into_boxed_slice();
-    paint_stack(&mut stack); super::stackguard::arm(stack.as_ptr() as u64, stack.len(), name); // SMALLFIX M6 (STACKGUARD): the guard page goes NOT-PRESENT after the paint. ⚠ SAME-LINE fold, line-neutral.
+    // RESTARTALLOC (B1022): the slab's allocation, paint and guard arm moved verbatim to `spawn_slab` (file tail): a
+    // caller that must not allocate (the singleton restart) passes a slab it built while the heap was free.
     let ctx_rsp = build_initial_frame(&mut stack[STACK_GUARD..], task_trampoline);
 
     let id = NEXT_TID.fetch_add(1, Ordering::Relaxed); crate::prof::note_task(id, name);
-    let task = Box::new(Task {
+    let task = Box::write(slot, Task { // RESTARTALLOC (B1022): the box was allocated by the caller (the restart's spare, or `spawn_inner`); the literal is unchanged
         id,
         name,
         state: AtomicU8::new(STATE_READY),
@@ -3199,7 +3199,7 @@ impl JoinHandle {
     /// `self` (the Arc clone) deliberately stays bound for the whole body: it is the refcount anchor
     /// that keeps the completion semaphore alive while this task is parked in its waiter list. Do not
     /// destructure or move the Arc out before `wait()` returns.
-    pub fn join(self) {
+    #[track_caller] pub fn join(self) {
         assert!(
             self.done.wait(),
             "JoinHandle::join() must be called from a scheduled task"
@@ -3230,7 +3230,7 @@ impl JoinHandle {
     /// live until the task finishes and drops it, so a later `post()` into an empty waiter list is
     /// sound (it just bumps the count on a soon-to-be-freed semaphore); no dangle, no leak.
     #[must_use]
-    pub fn join_timeout(self, timeout_ticks: u64) -> JoinResult {
+    #[track_caller] pub fn join_timeout(self, timeout_ticks: u64) -> JoinResult {
         /// Poll cadence: how many ticks the joiner sleeps between completion checks.
         const JOIN_POLL_TICKS: u64 = 2;
 
@@ -3660,12 +3660,12 @@ fn make_ready(task: Box<Task>) {
 /// Cooperatively give up the CPU. The current task is marked ready and rotated to the back of its
 /// run queue (by the scheduler), and another runnable task runs. Returns when this task is later
 /// rescheduled. No-op if called outside a scheduled task (e.g. on the BSP main loop).
-pub fn yield_now() {
+#[track_caller] pub fn yield_now() {
     // Critical section with IF=0: nothing may preempt us between marking ready and switching.
     // Save the caller's IF and restore exactly that on exit (don't blindly re-enable — a caller
     // could be in its own interrupts-off region).
     let was_enabled = x86_64::instructions::interrupts::are_enabled();
-    x86_64::instructions::interrupts::disable();
+    x86_64::instructions::interrupts::disable(); yieldsite::note(); // PREEMPTOFFARMSLEEPCHECKYIELDSITE (zenbook-ledger Z107): the caller's Location into this core's YIELD_AT, masked, before the switch. LINE-NEUTRAL
     let cpu = percpu::this_cpu().cpu_index as usize;
     let raw = SCHED[cpu].current.load(Ordering::Acquire) as *mut Task;
     if !raw.is_null() {
@@ -3753,9 +3753,9 @@ pub fn exit() -> ! {
 /// loop top, and the timer re-enters that loop every tick, or at this deadline under `tickless` (B765)
 /// (granularity and worst-case wake latency are one tick). `ticks == 0` wakes on the next loop pass (~0–1 tick).
 /// No-op outside a scheduled task (a boot-path caller that is not itself a task), like `yield_now`.
-pub fn sleep_ticks(ticks: u64) {
+#[track_caller] pub fn sleep_ticks(ticks: u64) {
     let was_enabled = x86_64::instructions::interrupts::are_enabled();
-    x86_64::instructions::interrupts::disable();
+    x86_64::instructions::interrupts::disable(); yieldsite::note(); // PREEMPTOFFARMSLEEPCHECKYIELDSITE (zenbook-ledger Z107): the caller's Location into this core's YIELD_AT, masked, before the switch. LINE-NEUTRAL
     let cpu = percpu::this_cpu().cpu_index as usize;
     let raw = SCHED[cpu].current.load(Ordering::Acquire) as *mut Task;
     if !raw.is_null() {
@@ -3784,7 +3784,7 @@ pub fn sleep_ticks(ticks: u64) {
 /// tick of the requested wall-clock delay on any machine. Before calibration the tick is ~0.8 ms
 /// under QEMU, so the sleep runs proportionally short (documented degradation, not a bug). Like
 /// `sleep_ticks`, a no-op outside a scheduled task.
-pub fn sleep_ms(ms: u64) {
+#[track_caller] pub fn sleep_ms(ms: u64) {
     sleep_ticks(crate::arch::ms_to_ticks(ms));
 }
 
@@ -3861,9 +3861,9 @@ impl Semaphore {
     /// caller that issues a resource on success (e.g. `Mutex::lock`) MUST check the return value:
     /// a `false` means NO permit was taken, so no resource may be handed out.
     #[must_use]
-    pub fn wait(&self) -> bool {
+    #[track_caller] pub fn wait(&self) -> bool {
         let was_enabled = x86_64::instructions::interrupts::are_enabled();
-        x86_64::instructions::interrupts::disable(); // IF=0 for the whole critical section
+        x86_64::instructions::interrupts::disable(); yieldsite::note(); // IF=0 for the whole critical section
         self.lock_raw();
 
         if self.count.load(Ordering::Relaxed) > 0 {
@@ -4101,10 +4101,10 @@ pub fn futex_key(slot: usize, uaddr: u64) -> u64 {
 /// CALLER's own ring-3 window, and `key` must be `futex_key(caller_slot, uaddr)`; this function
 /// dereferences `uaddr` at CPL 0 under the caller's still-live CR3 (a syscall runs in the caller's
 /// address space) and performs no validation of its own.
-pub fn futex_wait(key: u64, uaddr: u64, expected: u32) -> FutexWait {
+#[track_caller] pub fn futex_wait(key: u64, uaddr: u64, expected: u32) -> FutexWait {
     debug_assert!(key != 0, "futex key must be non-zero");
     let was_enabled = x86_64::instructions::interrupts::are_enabled();
-    x86_64::instructions::interrupts::disable(); // IF=0 for the whole critical section
+    x86_64::instructions::interrupts::disable(); yieldsite::note(); // IF=0 for the whole critical section
 
     // Select the bucket: an existing one serving this key, else claim a free one. Left LOCKED on
     // success — the compare and the park both happen under that same hold.
@@ -4702,7 +4702,7 @@ impl<T> Mutex<T> {
     /// out an unbacked guard. (A sleeping mutex is meaningless off a scheduler context anyway — a
     /// boot-path caller that is not a task must not block.)
     #[cfg(not(feature = "rtpi"))]
-    pub fn lock(&self) -> MutexGuard<'_, T> {
+    #[track_caller] pub fn lock(&self) -> MutexGuard<'_, T> {
         assert!(
             self.sem.wait(),
             "Mutex::lock() called off a scheduled task (a sleeping mutex needs a scheduler context)"
@@ -4722,7 +4722,7 @@ impl<T> Mutex<T> {
     /// The `sem.wait()`/permit semantics are IDENTICAL to the knob-off path; only the surrounding
     /// bookkeeping differs, so lost-wakeup safety is exactly as before.
     #[cfg(feature = "rtpi")]
-    pub fn lock(&self) -> MutexGuard<'_, T> {
+    #[track_caller] pub fn lock(&self) -> MutexGuard<'_, T> {
         if self.sem.try_wait() {
             // Uncontested: took the permit without blocking. Record ownership; no inversion here.
             self.pi_acquire_uncontended();
@@ -5019,10 +5019,10 @@ impl Condvar {
     ///
     /// The lettered step order below is load-bearing for lost-wakeup safety and the lock-ordering
     /// invariant; do not reorder it (see the type doc and the module header).
-    pub fn wait<'a, T>(&self, guard: MutexGuard<'a, T>) -> MutexGuard<'a, T> {
+    #[track_caller] pub fn wait<'a, T>(&self, guard: MutexGuard<'a, T>) -> MutexGuard<'a, T> {
         // (a) Mask interrupts for the whole critical section; remember the caller's IF to restore.
         let was_enabled = x86_64::instructions::interrupts::are_enabled();
-        x86_64::instructions::interrupts::disable();
+        x86_64::instructions::interrupts::disable(); yieldsite::note(); // PREEMPTOFFARMSLEEPCHECKYIELDSITE (zenbook-ledger Z107): the caller's Location into this core's YIELD_AT, masked, before the switch. LINE-NEUTRAL
 
         // (b) Must be on a scheduled task. Assert BEFORE consuming the guard: were we to forget the
         //     guard first and then panic, the mutex would be permanently locked — the explicit
@@ -5186,14 +5186,14 @@ impl<T> Channel<T> {
     }
 
     /// Send a value, blocking while the channel is full. Must be called from a scheduled task.
-    pub fn send(&self, value: T) {
+    #[track_caller] pub fn send(&self, value: T) {
         assert!(self.slots.wait(), "Channel::send() called off a scheduled task");
         self.buffer.lock().push_back(value); // mutex held only across the push (never across a wait)
         self.items.post();
     }
 
     /// Receive a value, blocking while the channel is empty. Must be called from a scheduled task.
-    pub fn recv(&self) -> T {
+    #[track_caller] pub fn recv(&self) -> T {
         assert!(self.items.wait(), "Channel::recv() called off a scheduled task");
         // A permit from `items` guarantees a value was pushed before its matching `post`, and pops
         // are serialised by the mutex, so the buffer is non-empty here.
@@ -5500,7 +5500,7 @@ pub fn timer_preempt() {
     if remaining <= 1 {
         SCHED[cpu].need_resched.store(true, Ordering::Relaxed);
     }
-    if !SCHED[cpu].need_resched.load(Ordering::Relaxed) {
+    if !SCHED[cpu].need_resched.load(Ordering::Relaxed) || preemptoff::defer(cpu) { // NVMEPREEMPTOFF (zenbook-ledger Z52): a preempt that is DUE while this CPU holds the preempt-off count is deferred (need_resched stays set; the first tick after enable switches). LINE-NEUTRAL fold, code first
         return;
     }
 
@@ -6334,7 +6334,7 @@ fn run() -> ! {
                 task.state.store(STATE_RUNNING, Ordering::Release);
                 // Fresh quantum + clear the reschedule signal, and publish the running priority so a
                 // remote waker/spawner can tell whether a newly-ready task should preempt us.
-                SCHED[cpu].quantum.store(QUANTUM_TICKS, Ordering::Relaxed); #[cfg(feature = "tickless")] tickless::on_dispatch(cpu); // TICKLESS (B765): a core leaving a tickless idle gets its 1 kHz tick back (the quantum counts ticks). LINE-NEUTRAL fold, code first
+                SCHED[cpu].quantum.store(QUANTUM_TICKS, Ordering::Relaxed); #[cfg(feature = "tickless")] tickless::on_dispatch(cpu); preemptoff::on_dispatch(cpu, task.id); // NVMEPREEMPTOFF (Z52): a count left by the task that left this CPU is reset and named once. TICKLESS (B765): a core leaving a tickless idle gets its 1 kHz tick back (the quantum counts ticks). LINE-NEUTRAL fold, code first
                 SCHED[cpu].need_resched.store(false, Ordering::Relaxed);
                 // R1 / rtpi: publish the EFFECTIVE priority so a remote waker cannot preempt a running
                 // boosted holder with a mid-priority task. Knob-off arm is the pre-arc verbatim.
@@ -6497,7 +6497,7 @@ fn run() -> ! {
                 // stale action can never leak into the next task's switch-back. Only a task that
                 // switched back BLOCKED has a meaningful action.
                 let park = SCHED[cpu].park_kind.swap(PARK_NONE, Ordering::Relaxed);
-                let task = unsafe { Box::from_raw(raw) };
+                let task = unsafe { Box::from_raw(raw) }; preemptoff::sleep_check(cpu, task.id, task.state.load(Ordering::Acquire), park); // PREEMPTOFFX86SLEEPCHECK (rmbp-ledger B1071): every voluntary switch-out lands here (timer_preempt returns at a held count before switching), so a held count whose holder is the outgoing task is a yield or park inside its span — counted and its span site latched, IF=0, no print (a PARK_WAITQ lock is still handed off here). LINE-NEUTRAL fold, code first
                 match task.state.load(Ordering::Acquire) {
                     // Frees the stack; for a joinable task this also drops its `done_sem` Arc clone
                     // (possibly the last, freeing the join-sem) — sound: the trampoline already
@@ -6527,7 +6527,7 @@ fn run() -> ! {
                             RUN_QUEUES[cpu].lock().requeue(task);
                         }
                     }
-                }
+                } preemptoff::sleep_report(cpu); // PREEMPTOFFX86SLEEPCHECK (rmbp-ledger B1071): the sleep-in-span once-line, said after park_blocked released any handed-off wait-queue lock. LINE-NEUTRAL
             }
             None => {
                 // SMPBAL-X86: before halting, try to pull one task off the most-loaded core. This is
@@ -7983,7 +7983,7 @@ pub fn rehome_dead_core(dead: usize, live: usize) -> Rehomed {
     if dead >= MAX_CPUS || live >= MAX_CPUS || dead == live || !cpu_dispatching(live) {
         return r;
     }
-    let now_ms = crate::arch::ms();
+    let now_ms = crate::arch::ms(); let hid = hid_rehome_cpu(dead, live); let mut hid_to: Option<usize> = None; // GATESTEALWORKERCORE (B1029): the `hid-pump` leaves a dead core apart from the worker core (body at the file tail; asked before the masked section: `xhci_worker_cpu` allocates)
     let dead_ticks = percpu::cpu(dead).map_or(0, |p| p.ticks.load(Ordering::Relaxed));
     let live_ticks = percpu::cpu(live).map_or(0, |p| p.ticks.load(Ordering::Relaxed));
     x86_64::instructions::interrupts::without_interrupts(|| {
@@ -7997,11 +7997,11 @@ pub fn rehome_dead_core(dead: usize, live: usize) -> Rehomed {
                 keep.push(task);
                 continue;
             }
-            rehome_fields(&mut task, live, now_ms);
+            let dst = hid_dst(task.name, hid, live, &mut hid_to); rehome_fields(&mut task, dst, now_ms); // GATESTEALWORKERCORE (B1029): `dst` is `live` for every task but the hid pump
             sgl_moved |= task.id == sgl;
             let prio = task.priority;
-            RUN_QUEUES[live].lock().push(task);
-            poke_for(live, prio);
+            RUN_QUEUES[dst].lock().push(task);
+            poke_for(dst, prio);
             r.ready += 1;
         }
         for task in keep.drain(..) {
@@ -8017,10 +8017,10 @@ pub fn rehome_dead_core(dead: usize, live: usize) -> Rehomed {
                 keep_s.push(Sleeper { deadline, task });
                 continue;
             }
-            rehome_fields(&mut task, live, now_ms);
+            let dst = hid_dst(task.name, hid, live, &mut hid_to); rehome_fields(&mut task, dst, now_ms); // GATESTEALWORKERCORE (B1029): as the READY loop
             sgl_moved |= task.id == sgl;
             let left = deadline.saturating_sub(dead_ticks);
-            SLEEPERS[live].lock().push_back(Sleeper { deadline: live_ticks.saturating_add(left), task });
+            let dst_ticks = if dst == live { live_ticks } else { percpu::cpu(dst).map_or(live_ticks, |p| p.ticks.load(Ordering::Relaxed)) }; SLEEPERS[dst].lock().push_back(Sleeper { deadline: dst_ticks.saturating_add(left), task }); // GATESTEALWORKERCORE (B1029): re-based on the destination core's tick domain
             r.sleeping += 1;
         }
         for s in keep_s.drain(..) {
@@ -8028,7 +8028,7 @@ pub fn rehome_dead_core(dead: usize, live: usize) -> Rehomed {
             SLEEPERS[dead].lock().push_back(s);
         }
     });
-    let cur = SCHED[dead].current_tid.load(Ordering::Relaxed); #[cfg(feature = "tickless")] poke_cpu(live); // TICKLESS (B765): the moved sleepers' deadlines may be nearer than the live core's armed one-shot; the IPI makes it re-arm. LINE-NEUTRAL fold, code first
+    let cur = SCHED[dead].current_tid.load(Ordering::Relaxed); #[cfg(feature = "tickless")] { poke_cpu(live); if let Some(h) = hid_to { poke_cpu(h); } } // TICKLESS (B765): the moved sleepers' deadlines may be nearer than the live core's armed one-shot; the IPI makes it re-arm. LINE-NEUTRAL fold, code first
     if cur != 0 {
         r.current = Some(cur);
     }
@@ -8044,7 +8044,7 @@ pub fn rehome_dead_core(dead: usize, live: usize) -> Rehomed {
         }
     }
     serial_println!(
-        ":: [smpbal] rehome dead=c{} live=c{} ready={} sleeping={} left={} current={} moved_current={} was={} new={} (GATESTEAL B657: the pin contract is void on a core the steal declared dead; GATESTEAL2 B667: the singleton in no queue restarts at its loop head) ::",
+        ":: [smpbal] rehome dead=c{} live=c{} ready={} sleeping={} left={} current={} moved_current={} was={} new={} pump={} (GATESTEAL B657: the pin contract is void on a core the steal declared dead; GATESTEAL2 B667: the singleton in no queue restarts at its loop head) ::",
         dead,
         live,
         r.ready,
@@ -8053,7 +8053,8 @@ pub fn rehome_dead_core(dead: usize, live: usize) -> Rehomed {
         r.current.map_or(-1i64, |t| t as i64),
         r.moved_current as u8,
         if r.moved_current { was } else { "-" },
-        r.restarted.map_or(-1i64, |t| t as i64)
+        r.restarted.map_or(-1i64, |t| t as i64),
+        HidPumpWord(hid_to, live)
     );
     r
 }
@@ -8347,7 +8348,7 @@ pub fn singleton_register(name: &'static str, entry: fn(usize), prio: u8) {
     SGL_ENTRY.store(entry as usize, Ordering::Release);
     SGL_PRIO.store(prio, Ordering::Relaxed);
     SGL_HOME.store(meter_current_cpu(), Ordering::Release);
-    SGL_TID.store(tid, Ordering::Release);
+    SGL_TID.store(tid, Ordering::Release); singleton_spare_arm(name); // RESTARTALLOC (B1022): the restart's SPARE slab + Task box, built here while the heap is free (the fresh instance re-runs this prologue: the re-arm). LINE-NEUTRAL fold, code first
 }
 
 /// GATESTEAL2 — the revenant fence and the singleton's liveness stamp. `true` = the calling task was superseded by a
@@ -8365,7 +8366,7 @@ pub fn singleton_superseded() -> bool {
         );
         return true;
     }
-    let now = crate::arch::ms().max(1);
+    let now = crate::arch::ms().max(1); if SGL_SPARE_WANT.load(Ordering::Relaxed) { singleton_spare_arm(sgl_name()); } // RESTARTALLOC (B1022): the deferred re-arm retries at the loop top while the heap stayed busy (one load when a spare is held). LINE-NEUTRAL fold, code first
     SGL_LAST_MS.store(now, Ordering::Relaxed);
     SGL_LAST_CPU.store(meter_current_cpu(), Ordering::Relaxed);
     SGL_STAMPS.fetch_add(1, Ordering::Relaxed); singleton_dead_check(now); // PUMPPARK (B839) M3: the fresh instance confirms a noted dead instance (one load when none). LINE-NEUTRAL fold, code first
@@ -8391,18 +8392,18 @@ pub fn singleton_restart(from: usize, live: usize) -> Option<(u64, u64)> {
     // SAFETY: `entry` was stored from a `fn(usize)` in `singleton_register`; fn pointers round-trip through usize.
     let f: fn(usize) = unsafe { core::mem::transmute::<usize, fn(usize)>(entry) };
     let name = sgl_name();
-    let new = spawn_inner(name, f, live, live, SGL_PRIO.load(Ordering::Relaxed), TASK_STACK_SIZE, None, None);
+    let new = singleton_spawn(name, f, live, SGL_PRIO.load(Ordering::Relaxed)); // RESTARTALLOC (B1022): the SPARE when one is held (no allocation on the sick path), else `spawn_inner` as before. PUMPSTACK (B1006): the one registered singleton is the usb-pump (main.rs `usb_pump` prologue), so its fresh instance takes the pump's MEASURED 32 KiB, never the blanket 16 KiB (flight 38: deaths=3; the RENDSTACK precedent sized `render-rehomed` too). LINE-NEUTRAL, in place
     SGL_TID.store(new, Ordering::Release);
     SGL_FRESH_MS.store(0, Ordering::Release);
     SGL_RESTART_OLD.store(old, Ordering::Relaxed);
     SGL_RESTARTS.fetch_add(1, Ordering::AcqRel);
     serial_println!(
-        ":: [sched] RESTART: {} tid={} on c{} in no queue the re-home could drain -> tid={} on c{} at its loop head holds={} (GATESTEAL2 B667: a fresh start, never a frame move; the old instance exits at its next fence) ::",
+        ":: [sched] RESTART: {} tid={} on c{} in no queue the re-home could drain -> tid={} on c{} at its loop head holds={} spare={} (GATESTEAL2 B667: a fresh start, never a frame move; the old instance exits at its next fence) ::",
         name,
         old,
         from,
         new,
-        live, crate::sync::task_holds(old) // POISON2 (B846): the superseded instance's holds NAMED (never released: a restart is not a death)
+        live, crate::sync::task_holds(old), if SGL_SPARE_LAST.load(Ordering::Relaxed) == 1 { "used" } else { "none" } // POISON2 (B846): the superseded instance's holds NAMED (never released: a restart is not a death). RESTARTALLOC (B1022): spare=<used|none>
     );
     Some((old, new))
 }
@@ -8556,7 +8557,7 @@ fn hold2_wait(ms: u64, mut f: impl FnMut() -> bool) -> bool {
 pub fn gatesteal2_ensure_tests() {
     static DONE: AtomicBool = AtomicBool::new(false);
     if !DONE.swap(true, Ordering::AcqRel) {
-        crate::tests::register("gatesteal2", gatesteal2_selftest);
+        crate::tests::register("gatesteal2", gatesteal2_selftest); crate::tests::register("restartalloc", restartalloc_selftest); // RESTARTALLOC (B1022): `tests restartalloc` beside it, same cfg. LINE-NEUTRAL fold, code first
     }
 }
 
@@ -8597,7 +8598,7 @@ fn gatesteal2_selftest() {
     }
     // The park's switch-back clears the core's published tid: wait for it, so the death finds the pump parked.
     let _ = hold2_wait(50, || current_task_id(dead) != Some(old));
-    let t_death = crate::arch::ms();
+    let t_death = crate::arch::ms(); let hid0 = crate::hidstall::pump_cpu(); HID_REHOME.store(usize::MAX, Ordering::Release); // GATESTEALWORKERCORE (B1029): the hid pump's core before the death, and the drain's record cleared
     crate::video::wm::comp_death_publish_fixture(dead);
     let restarted = hold2_wait(1_500, || {
         crate::sessionwedge::look(crate::arch::ms());
@@ -8610,7 +8611,7 @@ fn gatesteal2_selftest() {
     let live_ok = restarted && live != dead && SGL_LAST_CPU.load(Ordering::Relaxed) == live;
     let s1 = SGL_STAMPS.load(Ordering::Relaxed);
     sleep_ms(1_000);
-    let door = SGL_STAMPS.load(Ordering::Relaxed) > s1 && crate::drivers::xhci::poll_task_armed();
+    let door = SGL_STAMPS.load(Ordering::Relaxed) > s1 && crate::drivers::xhci::poll_task_armed(); let apart = pump_apart(hid0, dead); // GATESTEALWORKERCORE (B1029): after leg 1's second the hid pump has re-stamped its core
     HOLD2_SEM.post();
     let revenant = hold2_wait(1_500, || SGL_REVENANTS.load(Ordering::Acquire) != rev0);
     let by1 = crate::sessionwedge::gatesteal2_rehome().0;
@@ -8649,9 +8650,9 @@ fn gatesteal2_selftest() {
     let hdaring = (None::<bool>, alloc::string::String::from("hdaring=skip(not-built) reattach=skip drained=0 parked=0"));
     crate::sessionwedge::gatesteal2_wedge_leg(false);
     let steps = crate::video::wm::pump_gate_released_steps(); let park = pumppark_leg(rd0); // PUMPPARK (B839) LEG 4: a parked step skipped twice, then unparked on its timer. LINE-NEUTRAL fold, code first
-    let ok = moved_current && live_ok && alive_ms <= 500 && door && revenant && steps >= 1 && wedge_ok && revenant2 && hdaring.0 != Some(false) && park.0;
+    let ok = moved_current && live_ok && alive_ms <= 500 && door && revenant && steps >= 1 && wedge_ok && revenant2 && hdaring.0 != Some(false) && park.0 && apart.0;
     serial_println!(
-        ":: GATESTEAL2: death=c{} current={} moved_current={} rehome={} pump_alive_ms={} gate_released_steps={} -> {} :: new_tid={} live=c{} was=parked door={} revenant={} wedge_rehome={} wedge_current={} wedge_from=c{} wedge_live=c{} wedge_restart_ms={} wedge_revenant={} deaths={} {} parked_steps={} released_dead={} {}",
+        ":: GATESTEAL2: death=c{} current={} moved_current={} rehome={} pump_alive_ms={} gate_released_steps={} -> {} :: new_tid={} live=c{} was=parked door={} pump_apart={} revenant={} wedge_rehome={} wedge_current={} wedge_from=c{} wedge_live=c{} wedge_restart_ms={} wedge_revenant={} deaths={} {} parked_steps={} released_dead={} {}",
         dead,
         old,
         moved_current as u8,
@@ -8662,6 +8663,7 @@ fn gatesteal2_selftest() {
         if restarted { new as i64 } else { -1 },
         if restarted { live as i64 } else { -1 },
         if door { "alive" } else { "stale" },
+        apart.1,
         if revenant { "exited" } else { "stuck" },
         if wedge_ok { "wedge" } else if held2 { "none" } else { "unparked" },
         old2,
@@ -9266,4 +9268,1131 @@ pub fn spawn_joinable_stack(
     done.init(); // reserve the waiter list BEFORE the task can run + post (alloc-free park)
     let id = spawn_inner(name, entry, arg, target_cpu, PRIO_NORMAL, stack_bytes, Some(done.clone()), None);
     JoinHandle { done, id }
+}
+
+// ── PUMPSTACK (rmbp-ledger B1006) — THE x86 usb-pump ON A MEASURED STACK, and the per-fixture high-water reading. ──
+// Flight 38 boot 1 (narino, `docs/dev/evidence/rmbp-0915/flight38/FLIGHT38.md` on hw-rmbp, f38-boot1.log:3850-3856):
+// `[stack] guard hit task=usb-pump size=16384 high=17712 holding=2`, the pump in its prtscr step right after
+// `:: SHOTZIP: … -> PASS ::` (the PNG encode, then the shot's UnaFS write under the ticket: the two locks it held were
+// `unafs` and `unafs-ticket`). The 16 KiB was the SOURCE, not a lost request: main.rs spawned the x86 pump through
+// [`spawn`] (TASK_STACK_SIZE); the Pi's `PUMP_PATH_STACK_SIZE` (main.rs tail) is aarch64-only and never reached x86.
+// The cure is RENDSTACK's: [`spawn_stack`] with a measured size, at the primary spawn (main.rs, renamed in place) AND
+// at the singleton restart ([`singleton_restart`], in place), whose one registrant is the pump — sizing only the first
+// would put every re-homed pump (f38: `deaths=3`) back on 16 KiB. 32 KiB: `high=17712` is a FLOOR (the guard stopped
+// the descent), 32768 is 1.85x it, and RENDSTACK read 15536-15600 B on render's comparable pass at 32 KiB. A future
+// reading near the size is answered by a bigger number and the guard's verdict, never a raised TASK_STACK_SIZE.
+// Owed (B1006): PUMP-FIXTURE-AUDIT (every pump step's high-water on metal, prtscr's encode+save first), STACK-POOL-ONE
+// (one size table for both arches). At the tail: no line above moves.
+
+/// PUMPSTACK — the x86 usb-pump's USABLE stack span (the x86 twin of main.rs's aarch64 `PUMP_PATH_STACK_SIZE`).
+pub const PUMP_PATH_STACK_SIZE: usize = 32 * 1024;
+
+/// PUMPSTACK — `(name, lifetime high-water, usable size)` of the task CURRENT on this core: RENDSTACK's
+/// [`stack_high_water`] reading, one more caller (`tests::run`'s per-fixture `[tests] fixture=` line). Read with
+/// interrupts masked so the caller cannot migrate between the core lookup and the scan; `None` off a scheduled task.
+#[cfg(feature = "witness")]
+pub fn current_stack_high() -> Option<(&'static str, usize, usize)> {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let cpu = percpu::this_cpu().cpu_index as usize;
+        if cpu >= MAX_CPUS {
+            return None;
+        }
+        let raw = SCHED[cpu].current.load(Ordering::Acquire) as *const Task;
+        if raw.is_null() {
+            return None;
+        }
+        // SAFETY: the task running on THIS core with IF=0; nothing can free its Box underneath us.
+        let task = unsafe { &*raw };
+        Some((task.name, stack_high_water(task), task.stack.len() - STACK_GUARD))
+    })
+}
+
+// ══ NVMEPREEMPTOFF (zenbook-ledger Z52) — the per-CPU preempt-off count ══
+// A task that must not be switched out while it runs with interrupts ON (nvme's `cq_wait`: the `CTRL` holder asleep in
+// `sti; hlt`) brackets that span with `preemptoff::disable()` / `enable()`. Only `timer_preempt` (the one involuntary
+// switch site) reads the count: a preempt that falls DUE while it is held is deferred — the quantum runs out as usual,
+// `need_resched` stays set — and fires on the first tick after `enable` through the existing switch (no re-arm, no IPI).
+// The count is per CPU (an array beside `SCHED`, not a `SchedCpu` field: at the tail, no line above moves), written only
+// by its own CPU with IF=0. A count still held when the CPU dispatches is a leak (a voluntary switch or a death inside
+// the span): `on_dispatch` resets it and says so once. x86 only; owed: PREEMPTOFF-ARM (the aarch64 twin), PREEMPTOFF-AUDIT
+// (which `without_interrupts` spans become preempt-off), PREEMPTOFF-SLEEPCHECK (name a yield inside the span at its site).
+pub mod preemptoff {
+    use super::{percpu, ACCT, MAX_CPUS, QUANTUM_TICKS, SCHED};
+    use core::panic::Location;
+    use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
+
+    /// The preempt-off count per CPU (0 = preemptible). Written only by its own CPU with interrupts masked.
+    static OFF: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(0) }; MAX_CPUS];
+    /// A preempt fell due while the count was held and is waiting for the first tick after `enable`.
+    static PENDING: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
+    /// Spans that deferred a due preempt (`deferred=` on the nvme test line, summed), and deferred preempts that fired.
+    static DEFERRED: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(0) }; MAX_CPUS];
+    static FIRED: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(0) }; MAX_CPUS];
+    static ENABLE_ZERO_SAID: AtomicBool = AtomicBool::new(false);
+    static LEAK_SAID: AtomicBool = AtomicBool::new(false);
+    /// PREEMPTOFFX86STALEDROP (rmbp-ledger B1069), Z89's holder record on x86: this CPU's holder — the task (0 = no task)
+    /// and the site of the outermost take — written by its own CPU with IF=0 at the 0 -> 1 take; read by `on_dispatch`.
+    static HOLD_TID: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+    static HOLD_SITE: [AtomicPtr<Location<'static>>; MAX_CPUS] = [const { AtomicPtr::new(core::ptr::null_mut()) }; MAX_CPUS];
+    /// B1069, Z91's epoch on x86: bumped by its own CPU at the 0 -> 1 take (`note_holder`) and at the dispatch-time reset
+    /// (`on_dispatch`); a `Held` keeps the value it took under. The holder whose count this CPU last reset (the KAT's witness).
+    static HOLD_EPOCH: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(0) }; MAX_CPUS];
+    static LAST_RESET_TID: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+    /// B1069: holds given back with a stale epoch this boot (the KAT's own given back): `stale_drop=`; the once-line's latch.
+    static STALE_DROPS: AtomicU32 = AtomicU32::new(0);
+    static STALE_SAID: AtomicBool = AtomicBool::new(false);
+
+    #[inline]
+    fn this_cpu() -> usize {
+        percpu::this_cpu().cpu_index as usize
+    }
+
+    /// Hold this CPU's preempt-off count (nests; saturates at `u32::MAX`). Masked around the read so the caller cannot
+    /// migrate between reading its CPU and writing that CPU's count. B1069: the bare take records its holder too (a
+    /// fixture's pair; every non-fixture pair carries a [`Held`] from [`hold`]).
+    #[track_caller]
+    pub fn disable() {
+        let _ = take_at(Location::caller());
+    }
+
+    /// PREEMPTOFFX86STALEDROP (rmbp-ledger B1069): one hold of this CPU's count — the CPU it was taken on and that CPU's
+    /// epoch at the take. Given back only by [`put`], which releases nothing when the count was reset under it.
+    #[must_use = "a preempt-off hold is given back by preemptoff::put"]
+    pub struct Held {
+        cpu: u32,
+        epoch: u32,
+    }
+
+    impl Held {
+        /// One word for a static holder (the block loan's `LOAN_HELD`): `(cpu + 1) << 32 | epoch`, never 0.
+        pub fn into_word(self) -> u64 {
+            ((self.cpu as u64 + 1) << 32) | self.epoch as u64
+        }
+        /// The hold back from [`Held::into_word`]'s word; `None` for 0 (no hold).
+        pub fn from_word(w: u64) -> Option<Held> {
+            if w == 0 {
+                return None;
+            }
+            Some(Held { cpu: ((w >> 32) - 1) as u32, epoch: w as u32 })
+        }
+    }
+
+    /// B1069: take this CPU's count, carrying the epoch to the matching [`put`] (the pair shape: nvme `cq_wait`, the
+    /// block loan). The outermost take records this task and the caller's site as the holder.
+    #[track_caller]
+    pub fn hold() -> Held {
+        take_at(Location::caller())
+    }
+
+    /// B1069: give a [`hold`] back — through [`release`], on the CPU it was taken on.
+    pub fn put(h: Held) {
+        release(h.cpu as usize, h.epoch);
+    }
+
+    /// B1069: the one take (masked): the count +1 (saturating, RMW so a cross-CPU `put` cannot lose it); 0 -> 1 records
+    /// the holder and bumps the epoch (`note_holder`), a nested take keeps the current epoch.
+    fn take_at(site: &'static Location<'static>) -> Held {
+        x86_64::instructions::interrupts::without_interrupts(|| {
+            let cpu = this_cpu();
+            if cpu >= MAX_CPUS {
+                return Held { cpu: MAX_CPUS as u32, epoch: 0 };
+            }
+            let epoch = match OFF[cpu].fetch_update(Ordering::AcqRel, Ordering::Relaxed, |n| Some(n.saturating_add(1))) {
+                Ok(0) => note_holder(cpu, site),
+                _ => HOLD_EPOCH[cpu].load(Ordering::Relaxed),
+            };
+            Held { cpu: cpu as u32, epoch }
+        })
+    }
+
+    /// B1069 (Z89's `note_holder`): record `cpu`'s holder at its outermost take and bump its epoch, returning the new one.
+    fn note_holder(cpu: usize, site: &'static Location<'static>) -> u32 {
+        HOLD_TID[cpu].store(SCHED[cpu].current_tid.load(Ordering::Relaxed), Ordering::Relaxed);
+        HOLD_SITE[cpu].store(site as *const Location<'static> as *mut Location<'static>, Ordering::Relaxed);
+        HOLD_EPOCH[cpu].fetch_add(1, Ordering::Relaxed).wrapping_add(1)
+    }
+
+    /// B1069 (Z91's `release`): masked, so on its own CPU the compare and the decrement cannot straddle a dispatch. Epoch
+    /// still `cpu`'s: one decrement (at 0: the unpaired-enable refusal). Stale (the count was reset under this hold and may
+    /// now be a later hold's): nothing released, counted, said once. A CROSS-CPU put (a holder migrated out of a held
+    /// span) compares and decrements another CPU's slot in two atomics: a reset + retake between them is not closed
+    /// (PREEMPTOFF-ARM-STALEXCORE, owed, both arches).
+    fn release(cpu: usize, epoch: u32) {
+        if cpu >= MAX_CPUS {
+            return;
+        }
+        // 0 = released, 1 = stale, 2 = the count was already 0.
+        let (code, now, tid) = x86_64::instructions::interrupts::without_interrupts(|| {
+            let now = HOLD_EPOCH[cpu].load(Ordering::Relaxed);
+            let me = this_cpu();
+            let tid = if me < MAX_CPUS { SCHED[me].current_tid.load(Ordering::Relaxed) } else { 0 };
+            if now != epoch {
+                STALE_DROPS.fetch_add(1, Ordering::Relaxed);
+                return (1u8, now, tid);
+            }
+            match OFF[cpu].fetch_update(Ordering::AcqRel, Ordering::Relaxed, |n| n.checked_sub(1)) {
+                Ok(_) => (0u8, now, tid),
+                Err(_) => (2u8, now, tid),
+            }
+        });
+        if code == 1 && !STALE_SAID.swap(true, Ordering::AcqRel) {
+            serial_println!(
+                "[sched] preempt-off stale drop cpu={} holder={} epoch={}/{} -> not released (PREEMPTOFFX86STALEDROP B1069)",
+                cpu, tid, epoch, now
+            );
+        }
+        if code == 2 && !ENABLE_ZERO_SAID.swap(true, Ordering::AcqRel) {
+            serial_println!("[sched] preempt_enable refused cpu={} — count already 0 (unpaired enable)", cpu);
+        }
+    }
+
+    /// B1069: holds given back with a stale epoch this boot (the KAT's own given back): `stale_drop=`.
+    pub fn stale_drops() -> u32 {
+        STALE_DROPS.load(Ordering::Relaxed)
+    }
+
+    /// Release one hold. An enable with the count already 0 is refused by name (once a boot) and changes nothing.
+    pub fn enable() {
+        let refused = x86_64::instructions::interrupts::without_interrupts(|| {
+            let cpu = this_cpu();
+            if cpu >= MAX_CPUS {
+                return None;
+            }
+            match OFF[cpu].fetch_update(Ordering::AcqRel, Ordering::Relaxed, |n| n.checked_sub(1)) {
+                Ok(_) => None,
+                Err(_) => Some(cpu),
+            }
+        });
+        if let Some(cpu) = refused {
+            if !ENABLE_ZERO_SAID.swap(true, Ordering::AcqRel) {
+                serial_println!("[sched] preempt_enable refused cpu={} — count already 0 (unpaired enable)", cpu);
+            }
+        }
+    }
+
+    /// `timer_preempt`'s fold (IF=0, reached only when a preempt is DUE): true = defer it (the count is held), false =
+    /// switch. The first due tick after `enable` finds `PENDING` and counts the deferred preempt as fired.
+    pub(super) fn defer(cpu: usize) -> bool {
+        if cpu >= MAX_CPUS {
+            return false;
+        }
+        if OFF[cpu].load(Ordering::Relaxed) > 0 {
+            if !PENDING[cpu].swap(true, Ordering::Relaxed) {
+                DEFERRED[cpu].fetch_add(1, Ordering::Relaxed);
+            }
+            return true;
+        }
+        if PENDING[cpu].swap(false, Ordering::Relaxed) {
+            FIRED[cpu].fetch_add(1, Ordering::Relaxed);
+        }
+        false
+    }
+
+    /// The dispatch fold (IF=0, `run()`): a count the departed task left behind is reset and named once. B1069 (Z89's
+    /// rule): the recorded holder itself re-dispatched keeps its count; any other incoming task resets it, bumps the
+    /// epoch (every hold taken before the reset is stale) and the line names the holder and its site.
+    pub(super) fn on_dispatch(cpu: usize, incoming: u64) {
+        if cpu >= MAX_CPUS {
+            return;
+        }
+        if OFF[cpu].load(Ordering::Relaxed) == 0 {
+            return;
+        }
+        let holder = HOLD_TID[cpu].load(Ordering::Relaxed);
+        if holder == incoming {
+            return;
+        }
+        let n = OFF[cpu].swap(0, Ordering::AcqRel);
+        PENDING[cpu].store(false, Ordering::Relaxed);
+        HOLD_EPOCH[cpu].fetch_add(1, Ordering::Relaxed);
+        LAST_RESET_TID[cpu].store(holder, Ordering::Relaxed);
+        if n != 0 && !LEAK_SAID.swap(true, Ordering::AcqRel) {
+            let site = HOLD_SITE[cpu].load(Ordering::Relaxed) as *const Location<'static>;
+            // SAFETY: only ever stored from a `&'static Location<'static>` (`note_holder`); null until the first take.
+            let (file, line) = match unsafe { site.as_ref() } {
+                Some(l) => (l.file(), l.line()),
+                None => ("?", 0),
+            };
+            serial_println!(
+                "[sched] preempt-off leaked cpu={} count={} holder={} site={}:{} -> reset at dispatch (NVMEPREEMPTOFF Z52)",
+                cpu, n, holder, file, line
+            );
+        }
+    }
+
+    /// Spans that deferred a due preempt this boot, over every CPU.
+    pub fn deferred_total() -> u32 {
+        DEFERRED.iter().fold(0u32, |a, d| a.wrapping_add(d.load(Ordering::Relaxed)))
+    }
+
+    /// `tests preemptoff`: hold the count over more than two quanta with interrupts ON, check nothing switched this
+    /// task out, then release it and check the deferred preempt fired on a following tick.
+    pub fn selftest() {
+        if crate::arch::irqs_masked() {
+            serial_println!(":: PREEMPTOFF: -> SKIP(masked) ::");
+            return;
+        }
+        const BOUND_MS: u64 = 200;
+        let want = 2 * QUANTUM_TICKS as u64 + 1;
+        disable();
+        let cpu = this_cpu();
+        if cpu >= MAX_CPUS {
+            enable();
+            serial_println!(":: PREEMPTOFF: -> SKIP(no-cpu) ::");
+            return;
+        }
+        let tid0 = SCHED[cpu].current_tid.load(Ordering::Relaxed);
+        let sw0 = ACCT[cpu].ctx_switches.load(Ordering::Relaxed);
+        let f0 = FIRED[cpu].load(Ordering::Relaxed);
+        let t0 = percpu::this_cpu().ticks.load(Ordering::Relaxed);
+        let m0 = crate::arch::ms();
+        while percpu::this_cpu().ticks.load(Ordering::Relaxed).wrapping_sub(t0) < want
+            && crate::arch::ms().wrapping_sub(m0) < BOUND_MS
+        {
+            core::hint::spin_loop();
+        }
+        let held_ticks = percpu::this_cpu().ticks.load(Ordering::Relaxed).wrapping_sub(t0);
+        let switched = (this_cpu() != cpu) as u64
+            + ACCT[cpu].ctx_switches.load(Ordering::Relaxed).wrapping_sub(sw0)
+            + (SCHED[cpu].current_tid.load(Ordering::Relaxed) != tid0) as u64;
+        let pending = PENDING[cpu].load(Ordering::Relaxed);
+        enable();
+        let m1 = crate::arch::ms();
+        while FIRED[cpu].load(Ordering::Relaxed) == f0 && crate::arch::ms().wrapping_sub(m1) < BOUND_MS {
+            core::hint::spin_loop();
+        }
+        let deferred = FIRED[cpu].load(Ordering::Relaxed).wrapping_sub(f0);
+        let reason = if held_ticks < 2 * QUANTUM_TICKS as u64 {
+            Some("few-ticks")
+        } else if switched != 0 {
+            Some("switched")
+        } else if !pending {
+            Some("not-held")
+        } else if deferred != 1 {
+            Some("not-fired")
+        } else {
+            None
+        };
+        match reason {
+            None => serial_println!(":: PREEMPTOFF: held_ticks={} switched=0 deferred=1 -> PASS ::", held_ticks),
+            Some(r) => serial_println!(
+                ":: PREEMPTOFF: held_ticks={} switched={} deferred={} -> FAIL reason={} ::",
+                held_ticks, switched, deferred, r
+            ),
+        }
+    }
+
+    // ══════════ PREEMPTOFFAUDIT (zenbook-ledger Z57) — the scoped hold and the census KAT ══════════
+
+    /// PREEMPTOFFAUDIT: the `without_interrupts`-shaped preempt-off span — this CPU's count held around `f`, interrupts
+    /// as the caller had them. The guard's Drop releases the count, so an unwinding `f` still enables.
+    #[track_caller]
+    pub fn scoped<R>(f: impl FnOnce() -> R) -> R {
+        struct Off(Option<Held>);
+        impl Drop for Off {
+            fn drop(&mut self) {
+                if let Some(h) = self.0.take() {
+                    put(h); // B1069: the span's own hold, epoch carried
+                }
+            }
+        }
+        let _off = Off(Some(take_at(Location::caller())));
+        f()
+    }
+
+    /// PREEMPTOFFSDHC (zenbook-ledger Z61): `(this CPU's preempt-off count is held, the current task id or u64::MAX)`,
+    /// read masked so the CPU cannot change between the two words — the sdhc CARD span's witness.
+    pub fn witness() -> (bool, u64) {
+        x86_64::instructions::interrupts::without_interrupts(|| {
+            let cpu = this_cpu();
+            if cpu >= MAX_CPUS {
+                return (false, u64::MAX);
+            }
+            let held = OFF[cpu].load(Ordering::Relaxed) > 0;
+            let tid = match SCHED[cpu].current_tid.load(Ordering::Relaxed) {
+                0 => u64::MAX,
+                id => id,
+            };
+            (held, tid)
+        })
+    }
+
+    /// PREEMPTOFFAUDIT M1: the census of the x86 kernel's `without_interrupts` call sites (cores.md §4, the Z57 row): 178
+    /// sites at 611cf90b9, corrected by PREEMPTOFFFAT Z65: fat.rs:1027/:1133 are aarch64-only, so 176 — 13 I (ISR or CPU
+    /// state), 136 II (holder non-preemption only), 27 III (both); ONE converted to preempt-off (`block::hold::with`); B1035: the MOUNT site READS only.
+    pub const AUDIT_SITES: u32 = 176;
+    pub const AUDIT_ISR: u32 = 13;
+    pub const AUDIT_HOLDER: u32 = 136;
+    pub const AUDIT_BOTH: u32 = 27;
+    pub const AUDIT_CONVERTED: u32 = 1; pub const AUDIT_CONVERTED_UNAFS: u32 = cfg!(feature = "wc") as u32; // UNAFSREADUNMASKED (rmbp-ledger B1035): the MOUNT hold (`fs/unafs.rs` `attempt_span`, was :793) runs preempt-off for READS on a card/AHCI/NVMe medium (`with_unafs_read`); it still masks writes, so the site stays in the census and in II (sites=/holder= unchanged, Z65's rule)
+
+    /// `tests preemptaudit`: take the block hold from a task with interrupts ON; inside it interrupts must still be on,
+    /// a timer tick must arrive on this CPU, and nothing may switch this task out (Z52's reading).
+    #[cfg(any(feature = "ahci", feature = "nvme"))]
+    pub fn audit_selftest() {
+        if crate::arch::irqs_masked() {
+            serial_println!(":: PREEMPTAUDIT: -> SKIP(masked) ::");
+            return;
+        }
+        let (on, ticks, switched) = crate::drivers::block::hold::with(
+            50,
+            false,
+            || Some(()),
+            |_| (false, 0u64, u64::MAX),
+            |()| {
+                let on = !crate::arch::irqs_masked();
+                let cpu = this_cpu();
+                if cpu >= MAX_CPUS {
+                    return (on, 0u64, u64::MAX);
+                }
+                let tid0 = SCHED[cpu].current_tid.load(Ordering::Relaxed);
+                let sw0 = ACCT[cpu].ctx_switches.load(Ordering::Relaxed);
+                let t0 = percpu::this_cpu().ticks.load(Ordering::Relaxed);
+                let c0 = crate::arch::now_cycles();
+                let bound = crate::drivers::block::wait::cycles_ms(20);
+                while percpu::this_cpu().ticks.load(Ordering::Relaxed).wrapping_sub(t0) < 2
+                    && crate::arch::now_cycles().wrapping_sub(c0) < bound
+                {
+                    core::hint::spin_loop();
+                }
+                let ticks = percpu::this_cpu().ticks.load(Ordering::Relaxed).wrapping_sub(t0);
+                let switched = (this_cpu() != cpu) as u64
+                    + ACCT[cpu].ctx_switches.load(Ordering::Relaxed).wrapping_sub(sw0)
+                    + (SCHED[cpu].current_tid.load(Ordering::Relaxed) != tid0) as u64;
+                (on, ticks, switched)
+            },
+        );
+        // PREEMPTOFFSDHC (zenbook-ledger Z61): the sdhc leg, after the hold — `sdhc_audit_leg` below.
+        #[cfg(feature = "sdhcblk")]
+        let (sdhc_word, sdhc_sw): (&'static str, u64) = sdhc_audit_leg();
+        #[cfg(not(feature = "sdhcblk"))]
+        let (sdhc_word, sdhc_sw): (&'static str, u64) = ("skip(no-sdhcblk)", 0);
+        let converted_sdhc = cfg!(feature = "sdhcblk") as u32;
+        let switched = switched.saturating_add(sdhc_sw);
+        let (lw, lw_us) = crate::drivers::block::xhci_loan_wait_kat(); #[cfg(feature = "uvc")] let (pp, py): (&'static str, &'static str) = crate::drivers::xhci::ptp::loan_path_kat(); #[cfg(not(feature = "uvc"))] let (pp, py): (&'static str, &'static str) = ("skip(no-uvc)", "skip(no-uvc)"); let ls = crate::drivers::block::xhci_loan_shed_count(); let lk = crate::drivers::block::xhci_loan_shed_kat(); #[cfg(feature = "unafs")] let ul: &'static str = crate::fs::unafs::unafs_leg(); #[cfg(not(feature = "unafs"))] let ul: &'static str = "skip(no-unafs)"; let pk = crate::drivers::xhci::poll_cap_kat(); let hk = crate::drivers::xhci::pump_holder_kat(); let sk = stale_kat(); let sl = sleep_kat(); let reason = if !on { // PREEMPTOFFXHCILOAN (Z62) leg: the masked claimant on a running block-loan holder (`loan_wait=`)
+            Some("masked")
+        } else if ticks == 0 {
+            Some("no-tick")
+        } else if switched != 0 {
+            Some("switched")
+        } else if sdhc_word == "masked" {
+            Some("sdhc-masked")
+        } else if sdhc_word == "not-held" {
+            Some("sdhc-not-held")
+        } else if sdhc_word == "err" {
+            Some("sdhc-read")
+        } else if !(lw == "ok" || lw.starts_with("skip")) { Some("loan-wait") } else if !(pp == "ok" || pp.starts_with("skip")) { Some("ptp-path") } else if !(py == "ok" || py.starts_with("skip")) { Some("ptp-yield") } else if !(lk == "ok" || lk.starts_with("skip")) { Some("shed-kat") } else if !(ul == "ok" || ul.starts_with("skip")) { Some("unafs-leg") } else if !(pk == "ok" || pk.starts_with("skip")) { Some("poll-cap-kat") } else if !(hk == "ok" || hk.starts_with("skip")) { Some("pump-kat") } else if sk != "ok" { Some("stale-kat") } else if sl != "ok" { Some("sleep-kat") } else {
+            None
+        };
+        match reason {
+            None => serial_println!(
+                ":: PREEMPTAUDIT: sites={} isr={} holder={} both={} converted={} converted_sdhc={} converted_unafs={} unafs_leg={} sdhc_irq_on={} hold_irq_on=ok tick_in_hold=ok switched=0 loan_wait={} loan_wait_us={} ptp_path={} ptp_yield={} ptp_yield_windows={} loan_shed={} loan_shed_kat={} loan_shed_us={} poll_cap={} poll_cap_kat={} pump_kat={} stale_drop={} stale_kat={} sleep_in_span={} sleep_kat={} -> PASS ::",
+                AUDIT_SITES, AUDIT_ISR, AUDIT_HOLDER, AUDIT_BOTH, AUDIT_CONVERTED, converted_sdhc, AUDIT_CONVERTED_UNAFS, ul, sdhc_word, lw, lw_us, pp, py, { #[cfg(feature = "uvc")] let w = crate::drivers::xhci::ptp::loan_yield_kat_windows(); #[cfg(not(feature = "uvc"))] let w = 0u32; w }, ls, lk, crate::drivers::block::xhci_loan_shed_control_us(), crate::drivers::xhci::poll_cap_count(), pk, hk, stale_drops(), sk, sleep_in_spans(), sl // PREEMPTOFFX86SLEEPCHECK (rmbp-ledger B1071): `sleep_in_span=` / `sleep_kat=`; PREEMPTOFFX86STALEDROP (rmbp-ledger B1069): `stale_drop=` / `stale_kat=`; XHCILOANPUMPHOLDERKAT (zenbook-ledger Z81): `pump_kat=` the pump-gate KAT; XHCILOANPOLLCAP (zenbook-ledger Z74): `poll_cap=` capped poll passes, a count; XHCILOANPOLLCAPKAT (zenbook-ledger Z77): `poll_cap_kat=` the capped-pass KAT; XHCILOANSHEDKATCONTROLUS (zenbook-ledger Z80): `loan_shed_us=` the control's masked wait µs; XHCILOANPTPYIELDKATRULE (zenbook-ledger Z88): `ptp_yield_windows=` the windows the KAT offered
+            ),
+            Some(r) => serial_println!(
+                ":: PREEMPTAUDIT: sites={} isr={} holder={} both={} converted={} converted_sdhc={} converted_unafs={} unafs_leg={} sdhc_irq_on={} hold_irq_on={} tick_in_hold={} switched={} loan_wait={} loan_wait_us={} ptp_path={} ptp_yield={} ptp_yield_windows={} loan_shed={} loan_shed_kat={} loan_shed_us={} poll_cap={} poll_cap_kat={} pump_kat={} stale_drop={} stale_kat={} sleep_in_span={} sleep_kat={} -> FAIL reason={} ::",
+                AUDIT_SITES, AUDIT_ISR, AUDIT_HOLDER, AUDIT_BOTH, AUDIT_CONVERTED, converted_sdhc, AUDIT_CONVERTED_UNAFS, ul, sdhc_word,
+                if on { "ok" } else { "masked" }, if ticks > 0 { "ok" } else { "none" }, switched, lw, lw_us, pp, py, { #[cfg(feature = "uvc")] let w = crate::drivers::xhci::ptp::loan_yield_kat_windows(); #[cfg(not(feature = "uvc"))] let w = 0u32; w }, ls, lk, crate::drivers::block::xhci_loan_shed_control_us(), crate::drivers::xhci::poll_cap_count(), pk, hk, stale_drops(), sk, sleep_in_spans(), sl, r // PREEMPTOFFX86SLEEPCHECK (rmbp-ledger B1071): `sleep_in_span=` / `sleep_kat=`; PREEMPTOFFX86STALEDROP (rmbp-ledger B1069): `stale_drop=` / `stale_kat=`; XHCILOANPUMPHOLDERKAT (zenbook-ledger Z81): `pump_kat=`; XHCILOANSHEDKATCONTROLUS (zenbook-ledger Z80): `loan_shed_us=`; XHCILOANPTPYIELDKATRULE (zenbook-ledger Z88): `ptp_yield_windows=` the windows the KAT offered
+            ),
+        }
+    }
+
+    /// PREEMPTOFFSDHC (zenbook-ledger Z61) — `tests preemptaudit`'s SDHC LEG (named: other arcs add their own legs to
+    /// this block): a 64 KiB card read (`sdhc::read_blocks_512`, 128 sectors from LBA 0) from this unmasked task. Inside
+    /// the CARD span interrupts must be on and the preempt-off count held (the span's own record, `sdhc::audit_take`),
+    /// and nothing may switch this task out across the read. `(sdhc_irq_on word, switches)`: ok | masked | not-held |
+    /// err (the read failed) | skip(no-card) (no card bound, or under 128 sectors: QEMU without an sdhci card).
+    #[cfg(all(feature = "sdhcblk", any(feature = "ahci", feature = "nvme")))]
+    fn sdhc_audit_leg() -> (&'static str, u64) {
+        if crate::drivers::sdhc::card_num_blocks().unwrap_or(0) < 128 {
+            return ("skip(no-card)", 0);
+        }
+        let mut buf = alloc::vec![0u8; 128 * 512];
+        let (_, tid) = witness();
+        let cpu = this_cpu();
+        if cpu >= MAX_CPUS || tid == u64::MAX {
+            return ("err", 0);
+        }
+        let tid0 = SCHED[cpu].current_tid.load(Ordering::Relaxed);
+        let sw0 = ACCT[cpu].ctx_switches.load(Ordering::Relaxed);
+        crate::drivers::sdhc::audit_arm(tid);
+        let r = crate::drivers::sdhc::read_blocks_512(0, 128, &mut buf[..]);
+        let (irq, held) = crate::drivers::sdhc::audit_take();
+        let switched = (this_cpu() != cpu) as u64
+            + ACCT[cpu].ctx_switches.load(Ordering::Relaxed).wrapping_sub(sw0)
+            + (SCHED[cpu].current_tid.load(Ordering::Relaxed) != tid0) as u64;
+        let word = if r.is_err() {
+            "err"
+        } else if irq == 2 {
+            "masked"
+        } else if irq != 1 || !held {
+            "not-held"
+        } else {
+            "ok"
+        };
+        (word, switched)
+    }
+
+    // ══════════ PREEMPTOFFX86STALEDROP (rmbp-ledger B1069) — the stale-drop KAT (Z91's, on x86) ══════════
+
+    /// B1069 KAT state: the follower ran; the holder's verdict code (0 = the holder never stored one).
+    #[cfg(any(feature = "ahci", feature = "nvme"))]
+    static STALE_KAT_AFTER_RAN: AtomicBool = AtomicBool::new(false);
+    #[cfg(any(feature = "ahci", feature = "nvme"))]
+    static STALE_KAT_CODE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+    /// The stale KAT's follower: a task whose dispatch on the holder's CPU, while the holder is yielded inside its span,
+    /// resets the holder's count (`on_dispatch`: not the holder).
+    #[cfg(any(feature = "ahci", feature = "nvme"))]
+    fn stale_kat_after(_: usize) {
+        super::yieldsite::kat_lock_follow(|| STALE_KAT_AFTER_RAN.store(true, Ordering::Release)); // PREEMPTOFFSLEEPCHECKYIELDSITEWRAPPERSKAT (zenbook-ledger Z115): the follower takes the KAT's lock before its store and holds it until the holder asks (the holder's contended park). LINE-NEUTRAL
+    }
+
+    /// The stale KAT's holder, pinned to CPU `c`: its verdict code into `STALE_KAT_CODE`.
+    #[cfg(any(feature = "ahci", feature = "nvme"))]
+    fn stale_kat_holder(c: usize) {
+        let code = stale_kat_run(c);
+        STALE_KAT_CODE.store(code, Ordering::Release);
+    }
+
+    /// Take g1, yield through the real `yield_now` until the follower ran on this CPU (the reset), take g2 (a LATER
+    /// hold), put g1: it must be counted stale and leave g2's count held; put g2: free. Codes: 1 no-yield, 2 not-reset,
+    /// 3 not-counted, 4 stolen, 5 not-released, 6 ok.
+    #[cfg(any(feature = "ahci", feature = "nvme"))]
+    fn stale_kat_run(c: usize) -> u8 {
+        let g1 = hold();
+        let me = SCHED[c].current_tid.load(Ordering::Relaxed); SLEEP_KAT_TID.store(me, Ordering::Relaxed); // PREEMPTOFFX86SLEEPCHECK (rmbp-ledger B1071): the test flag — this holder's in-span yield below is counted apart as the sleep KAT's hit (`sleep_kat=`), never in `sleep_in_span=` or the site latch. LINE-NEUTRAL
+        let follower = super::spawn_joinable("preemptoff-stale-after", stale_kat_after, 0, c, super::PRIO_NORMAL);
+        let m0 = crate::arch::ms();
+        while !STALE_KAT_AFTER_RAN.load(Ordering::Acquire) && crate::arch::ms().wrapping_sub(m0) < 1000 {
+            super::yieldsite::kat_mark(line!()); super::yield_now(); // PREEMPTOFFARMSLEEPCHECKYIELDSITE (zenbook-ledger Z107): this line is the yield the sleep KAT must name (`kat_verdict`). LINE-NEUTRAL
+        }
+        let code = if !STALE_KAT_AFTER_RAN.load(Ordering::Acquire) {
+            put(g1);
+            1
+        } else if LAST_RESET_TID[c].load(Ordering::Relaxed) != me {
+            put(g1);
+            2
+        } else {
+            let g2 = hold();
+            let s0 = STALE_DROPS.load(Ordering::Relaxed);
+            put(g1);
+            let counted = STALE_DROPS.load(Ordering::Relaxed) == s0.wrapping_add(1);
+            let held = OFF[c].load(Ordering::Relaxed) > 0;
+            put(g2);
+            let free = OFF[c].load(Ordering::Relaxed) == 0;
+            if !counted {
+                3
+            } else if !held {
+                4
+            } else if !free {
+                5
+            } else {
+                6
+            }
+        };
+        let own = if code == 6 { super::yieldsite::kat_lock_park() } else { super::yieldsite::kat_lock_skip() }; STALE_DROPS.fetch_sub(own, Ordering::Relaxed); follower.join(); // PREEMPTOFFSLEEPCHECKYIELDSITEWRAPPERSKAT (zenbook-ledger Z115): the second in-span park, through a CONTENDED `Mutex::lock` in a fresh span (ok path only); its own reset and stale drop given back. LINE-NEUTRAL
+        code
+    }
+
+    /// B1069 KAT (`stale_kat=`): the forced-yield holder above, pinned to this CPU and joined. `ok` gives back the KAT's
+    /// own stale drop, so `stale_drop=` counts real events only.
+    #[cfg(any(feature = "ahci", feature = "nvme"))]
+    fn stale_kat() -> &'static str {
+        let c = this_cpu();
+        if c >= MAX_CPUS {
+            return "not-run";
+        }
+        super::yieldsite::kat_lock_arm(); STALE_KAT_AFTER_RAN.store(false, Ordering::Release); // PREEMPTOFFSLEEPCHECKYIELDSITEWRAPPERSKAT (zenbook-ledger Z115): the KAT lock's `init` (before any task can block on it) and its words cleared. LINE-NEUTRAL
+        STALE_KAT_CODE.store(0, Ordering::Release);
+        super::spawn_joinable("preemptoff-stale", stale_kat_holder, c, c, super::PRIO_NORMAL).join();
+        match STALE_KAT_CODE.load(Ordering::Acquire) {
+            6 => {
+                STALE_DROPS.fetch_sub(1, Ordering::Relaxed);
+                "ok"
+            }
+            1 => "no-yield",
+            2 => "not-reset",
+            3 => "not-counted",
+            4 => "stolen",
+            5 => "not-released",
+            _ => "not-run",
+        }
+    }
+
+    // ══════════ PREEMPTOFFX86SLEEPCHECK (rmbp-ledger B1071) — a voluntary switch-out inside a held span, named at its span site ══════════
+    // Z95's aarch64 shape on x86. Every voluntary switch-out (`yield_now`, `sleep_ticks`, `Semaphore::wait`, the futex
+    // wait, `Condvar::wait`; `exit` is the leak `on_dispatch` names) calls `switch_context` to the scheduler and comes back
+    // through ONE place: `run()`'s switch-back. The one involuntary path, `timer_preempt`, returns at `defer` (count held)
+    // before any switch, so a switch-back with this CPU's count held and the outgoing task its recorded holder (B1069's
+    // `HOLD_TID`) is a yield or park inside the span. `sleep_check` runs there, IF=0, and only counts and latches (a
+    // PARK_WAITQ lock is still handed off at that point); `sleep_report`, after the switch-back's match, says the line once
+    // per span site (the first 8 sites; the rest counted). `on_dispatch` still resets the count at the next dispatch of
+    // another task; this names WHICH span slept.
+
+    /// B1071: real held switch-outs this boot (`sleep_in_span=`); the KAT's own are counted apart (`SLEEP_KAT_HITS`).
+    static SLEEP_IN_SPAN: AtomicU32 = AtomicU32::new(0);
+    /// B1071: span sites already said — the per-site once-latch (CAS into the first null slot).
+    static SLEEP_SITES: [AtomicPtr<Location<'static>>; 8] = [const { AtomicPtr::new(core::ptr::null_mut()) }; 8];
+    /// B1071: this CPU's pending once-line (site null = none). Written and read only by its own CPU, IF=0.
+    static SLEEP_PEND_SITE: [AtomicPtr<Location<'static>>; MAX_CPUS] = [const { AtomicPtr::new(core::ptr::null_mut()) }; MAX_CPUS];
+    static SLEEP_PEND_TID: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+    static SLEEP_PEND_VIA: [core::sync::atomic::AtomicU8; MAX_CPUS] = [const { core::sync::atomic::AtomicU8::new(0) }; MAX_CPUS];
+    /// B1071 test flag: the stale KAT's holder (0 = none). Its in-span yield counts here, never in `SLEEP_IN_SPAN` or the latch.
+    static SLEEP_KAT_TID: AtomicU64 = AtomicU64::new(0);
+    static SLEEP_KAT_HITS: AtomicU32 = AtomicU32::new(0);
+    static SLEEP_KAT_VIA: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+    const VIA_YIELD: u8 = 1;
+    const VIA_SLEEP: u8 = 2;
+    const VIA_WAITQ: u8 = 3;
+
+    fn via_word(via: u8) -> &'static str {
+        match via {
+            VIA_YIELD => "yield",
+            VIA_SLEEP => "sleep",
+            VIA_WAITQ => "waitq",
+            _ => "?",
+        }
+    }
+
+    /// B1071: the switch-back check (`run()`, IF=0, this CPU, before `park_blocked` / the requeue). Held count, outgoing
+    /// task == recorded holder, and READY (a yield) or BLOCKED (a sleep or a wait-queue park): counted, its span site
+    /// claimed in the latch; a newly claimed site is stashed for `sleep_report`. No print here.
+    pub(super) fn sleep_check(cpu: usize, outgoing: u64, state: u8, park: u8) {
+        if cpu >= MAX_CPUS || OFF[cpu].load(Ordering::Relaxed) == 0 || HOLD_TID[cpu].load(Ordering::Relaxed) != outgoing {
+            return;
+        }
+        let via = if state == super::STATE_READY {
+            VIA_YIELD
+        } else if state == super::STATE_BLOCKED && park == super::PARK_SLEEP {
+            VIA_SLEEP
+        } else if state == super::STATE_BLOCKED && park == super::PARK_WAITQ {
+            VIA_WAITQ
+        } else {
+            return; // FINISHED: a death inside the span is the leak `on_dispatch` names
+        };
+        let kat = SLEEP_KAT_TID.load(Ordering::Relaxed);
+        if kat != 0 && kat == outgoing {
+            SLEEP_KAT_HITS.fetch_add(1, Ordering::Relaxed);
+            if super::yieldsite::kat_note(cpu) { SLEEP_KAT_VIA.store(via, Ordering::Relaxed); } // PREEMPTOFFARMSLEEPCHECKYIELDSITE (zenbook-ledger Z107): the KAT's named yield site; PREEMPTOFFSLEEPCHECKYIELDSITEWRAPPERSKAT (zenbook-ledger Z115): the via word is the yield phase's (the lock park is judged by its site). LINE-NEUTRAL
+            return;
+        }
+        SLEEP_IN_SPAN.fetch_add(1, Ordering::Relaxed);
+        let site = HOLD_SITE[cpu].load(Ordering::Relaxed);
+        if site.is_null() {
+            return;
+        }
+        for said in SLEEP_SITES.iter() {
+            match said.compare_exchange(core::ptr::null_mut(), site, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => {
+                    SLEEP_PEND_TID[cpu].store(outgoing, Ordering::Relaxed);
+                    SLEEP_PEND_VIA[cpu].store(via, Ordering::Relaxed);
+                    SLEEP_PEND_SITE[cpu].store(site, Ordering::Relaxed);
+                    return;
+                }
+                Err(cur) if cur == site => return,
+                Err(_) => {}
+            }
+        }
+    }
+
+    /// B1071: say this CPU's pending sleep-in-span line, once (after the switch-back's match in `run()`, IF=0, no lock held).
+    pub(super) fn sleep_report(cpu: usize) {
+        if cpu >= MAX_CPUS {
+            return;
+        }
+        let site = SLEEP_PEND_SITE[cpu].swap(core::ptr::null_mut(), Ordering::Relaxed) as *const Location<'static>;
+        // SAFETY: only ever stored from `HOLD_SITE`, itself only from a `&'static Location<'static>` (`note_holder`).
+        let Some(l) = (unsafe { site.as_ref() }) else {
+            return;
+        };
+        serial_println!(
+            "[sched] preempt-off sleep in span cpu={} holder={} site={}:{} via={} yield={} -> switched out holding the count (PREEMPTOFFX86SLEEPCHECK B1071)",
+            cpu,
+            SLEEP_PEND_TID[cpu].load(Ordering::Relaxed),
+            l.file(),
+            l.line(),
+            via_word(SLEEP_PEND_VIA[cpu].load(Ordering::Relaxed)), super::yieldsite::Site(cpu)
+        );
+    }
+
+    /// B1071: real held switch-outs this boot (`sleep_in_span=`).
+    pub fn sleep_in_spans() -> u32 {
+        SLEEP_IN_SPAN.load(Ordering::Relaxed)
+    }
+
+    /// B1071 KAT (`sleep_kat=`): read after `stale_kat`, whose holder (flagged in `stale_kat_run`) yields inside its span
+    /// through the real `yield_now`. `ok` when the switch-back counted that yield (via=yield), `wrong-via`, else
+    /// `not-named`. Clears the flag and the hits.
+    #[cfg(any(feature = "ahci", feature = "nvme"))]
+    fn sleep_kat() -> &'static str {
+        SLEEP_KAT_TID.store(0, Ordering::Relaxed);
+        let hits = SLEEP_KAT_HITS.swap(0, Ordering::Relaxed);
+        let via = SLEEP_KAT_VIA.swap(0, Ordering::Relaxed);
+        if hits == 0 {
+            "not-named"
+        } else if via != VIA_YIELD {
+            "wrong-via"
+        } else {
+            super::yieldsite::kat_verdict() // PREEMPTOFFARMSLEEPCHECKYIELDSITE (zenbook-ledger Z107): ok only when the named yield is stale_kat_run's line (else wrong-site)
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+// RESTARTALLOC (rmbp-ledger B1022) — THE SINGLETON RESTART ALLOCATES NOTHING.
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+//
+// PUMPDEATHREHOME (B1016, flight 38): after the pump's death `wedge_rehome -> singleton_restart -> spawn_inner` blocked
+// on the heap lock the dead pump still held — the new Task's box and its 32 KiB slab (PUMPSTACK) are heap allocations,
+// and `stackguard::arm` takes two more heap pages (`memory::stack_guard_frame`) — so no RESTART line ever printed and
+// the glass froze. A path that must run when the system is sick cannot allocate.
+//
+// So the shared spawn path is split at its allocations: [`spawn_inner_with`] (in place, the body unchanged but for
+// `Box::write` on the caller's box) takes an ALLOCATED slab (painted and armed) and an uninit Task box; [`spawn_inner`]
+// below allocates both for every ordinary caller. The singleton holds ONE SPARE pair, built by [`singleton_spare_arm`]
+// from `singleton_register` (the pump's prologue, a healthy boot; the fresh instance re-runs it after every restart: the
+// re-arm) and consumed by [`singleton_spawn`] at the restart with no allocation. The spare's guard is armed ONCE when it
+// is built: `stackguard::arm` is not idempotent (two heap pages and a REG row per call) and the slab is never freed while
+// spare, so its guard stays live. A heap that is busy at the re-arm is refused by name and retried at the loop top
+// (`singleton_superseded`). Owed: RESTARTALLOC-ARM, SPARE-RECLAIM, RESTARTALLOC-RUNQ (cores.md §5).
+
+/// RESTARTALLOC — the shared spawn path's allocating half: the slab ([`spawn_slab`]) and the Task's box, then
+/// [`spawn_inner_with`]. Every caller but the singleton restart's spare path comes through here, as before the split.
+fn spawn_inner(
+    name: &'static str,
+    entry: fn(usize),
+    arg: usize,
+    target_cpu: usize,
+    priority: u8,
+    stack_bytes: usize,
+    done_sem: Option<Arc<Semaphore>>, kill: Option<Arc<KillSwitch>>,
+) -> u64 {
+    let stack = spawn_slab(stack_bytes, name);
+    spawn_inner_with(name, entry, arg, target_cpu, priority, stack, Box::<Task>::new_uninit(), done_sem, kill)
+}
+
+/// RESTARTALLOC — a task slab: `stack_bytes` USABLE plus the guard span below it (RENDSTACK), painted, then its guard
+/// page armed NOT-PRESENT. Moved verbatim from `spawn_inner`'s two lines.
+fn spawn_slab(stack_bytes: usize, name: &'static str) -> Box<[u8]> {
+    let mut stack: Box<[u8]> = alloc::vec![0u8; stack_bytes + STACK_GUARD].into_boxed_slice();
+    paint_stack(&mut stack); super::stackguard::arm(stack.as_ptr() as u64, stack.len(), name); // SMALLFIX M6 (STACKGUARD): the guard page goes NOT-PRESENT after the paint.
+    stack
+}
+
+/// The spare's Task box (`*mut MaybeUninit<Task>`), 0 = none. Written LAST on arm (Release): the commit word.
+static SGL_SPARE_TASK: AtomicUsize = AtomicUsize::new(0);
+/// The spare slab's base and length; written only while `SGL_SPARE_TASK` is 0, read only while it is not.
+static SGL_SPARE_STACK: AtomicUsize = AtomicUsize::new(0);
+static SGL_SPARE_LEN: AtomicUsize = AtomicUsize::new(0);
+/// One arm at a time (the pump's prologue and its loop-top retry may overlap across two fresh instances).
+static SGL_SPARE_ARMING: AtomicBool = AtomicBool::new(false);
+/// A spare is owed (taken by a restart, or refused): the loop-top retry's one load.
+static SGL_SPARE_WANT: AtomicBool = AtomicBool::new(false);
+/// The last restart's spawn: 1 = the spare, 0 = `spawn_inner` (none held). The RESTART line's `spare=`.
+static SGL_SPARE_LAST: AtomicU8 = AtomicU8::new(0);
+/// The heap-dead refusal is said once per restart.
+static SGL_SPARE_SAID: AtomicBool = AtomicBool::new(false);
+
+/// RESTARTALLOC — build the singleton's spare (a `PUMP_PATH_STACK_SIZE` slab, painted and armed once, plus an uninit
+/// Task box) when none is held. Refused by name while the heap lock is held (`allocator::heap_busy`): the restart that
+/// follows allocates as before, and the loop top retries. Silent at the boot arm; a re-arm after a restart says so.
+fn singleton_spare_arm(name: &'static str) {
+    if SGL_SPARE_TASK.load(Ordering::Acquire) != 0 {
+        SGL_SPARE_WANT.store(false, Ordering::Relaxed);
+        return;
+    }
+    if SGL_SPARE_ARMING.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
+        return;
+    }
+    if crate::allocator::heap_busy() {
+        SGL_SPARE_WANT.store(true, Ordering::Relaxed);
+        SGL_SPARE_ARMING.store(false, Ordering::Release);
+        if !SGL_SPARE_SAID.swap(true, Ordering::AcqRel) {
+            serial_println!(
+                "[sched] singleton spare -> REFUSED why=heap-dead (RESTARTALLOC B1022: the heap lock is held; the next restart allocates, the loop top retries) restarts={}",
+                SGL_RESTARTS.load(Ordering::Relaxed)
+            );
+        }
+        return;
+    }
+    let stack = spawn_slab(PUMP_PATH_STACK_SIZE, name);
+    let slot = Box::<Task>::new_uninit();
+    let n = stack.len();
+    SGL_SPARE_STACK.store(Box::into_raw(stack) as *mut u8 as usize, Ordering::Relaxed);
+    SGL_SPARE_LEN.store(n, Ordering::Relaxed);
+    SGL_SPARE_TASK.store(Box::into_raw(slot) as usize, Ordering::Release);
+    SGL_SPARE_WANT.store(false, Ordering::Relaxed);
+    SGL_SPARE_ARMING.store(false, Ordering::Release);
+    let restarts = SGL_RESTARTS.load(Ordering::Relaxed);
+    if restarts != 0 {
+        serial_println!(
+            "[sched] singleton spare -> ARMED size={} restarts={} (RESTARTALLOC B1022: the next restart allocates nothing)",
+            PUMP_PATH_STACK_SIZE,
+            restarts
+        );
+    }
+}
+
+/// RESTARTALLOC — take the spare, or `None`. The slab and length are read while the task word still holds the spare
+/// (nothing writes them then), and the CAS claims it.
+fn singleton_spare_take() -> Option<(Box<[u8]>, Box<core::mem::MaybeUninit<Task>>)> {
+    let t = SGL_SPARE_TASK.load(Ordering::Acquire);
+    if t == 0 {
+        return None;
+    }
+    let p = SGL_SPARE_STACK.load(Ordering::Relaxed);
+    let n = SGL_SPARE_LEN.load(Ordering::Relaxed);
+    if SGL_SPARE_TASK.compare_exchange(t, 0, Ordering::AcqRel, Ordering::Acquire).is_err() {
+        return None;
+    }
+    // SAFETY: `p`/`n` and `t` came from `Box::into_raw` in `singleton_spare_arm`, published before the task word, and the
+    // CAS above made this the one owner.
+    let stack = unsafe { Box::from_raw(core::ptr::slice_from_raw_parts_mut(p as *mut u8, n)) };
+    let slot = unsafe { Box::from_raw(t as *mut core::mem::MaybeUninit<Task>) };
+    Some((stack, slot))
+}
+
+/// RESTARTALLOC — the restart's spawn: the SPARE when one is held (no allocation: the sick path), else `spawn_inner` at
+/// the pump's measured 32 KiB (PUMPSTACK) as before. Either way a new spare is owed.
+fn singleton_spawn(name: &'static str, f: fn(usize), live: usize, prio: u8) -> u64 {
+    SGL_SPARE_SAID.store(false, Ordering::Relaxed);
+    SGL_SPARE_WANT.store(true, Ordering::Release);
+    match singleton_spare_take() {
+        Some((stack, slot)) => {
+            SGL_SPARE_LAST.store(1, Ordering::Relaxed);
+            spawn_inner_with(name, f, live, live, prio, stack, slot, None, None)
+        }
+        None => {
+            SGL_SPARE_LAST.store(0, Ordering::Relaxed);
+            spawn_inner(name, f, live, live, prio, PUMP_PATH_STACK_SIZE, None, None)
+        }
+    }
+}
+
+/// `tests restartalloc` — `:: RESTARTALLOC: spare=<used|none> restart_ms=<n> heap_held=<0|1> -> PASS|FAIL|SKIP :: old=
+/// new= from=c<n> live=c<n> rearmed=<0|1> holder=c<n>`. A `heappoison::hold_task` holder takes the heap lock (masked, on a
+/// worker core that is neither this one, the restart's live core nor core 0); with it HELD this task restarts the
+/// singleton through [`singleton_restart`] and times it, allocating nothing until it claims and ends the hold. PASS iff
+/// the restart completed on the spare within 100 ms with the heap still held, and the fresh instance re-armed a spare
+/// once the heap was free. Go-red by mutation: `singleton_spawn` always takes `spawn_inner` -> the restart blocks on the
+/// heap until the holder's 500 ms self-release -> `spare=none heap_held=0 -> FAIL` (bounded: no wedge).
+#[cfg(feature = "wc")]
+fn restartalloc_selftest() {
+    use crate::allocator::heappoison as hp;
+    let old = SGL_TID.load(Ordering::Acquire);
+    let home = SGL_HOME.load(Ordering::Acquire);
+    if old == 0 || home >= MAX_CPUS {
+        serial_println!(":: RESTARTALLOC: spare=none restart_ms=- heap_held=0 -> SKIP :: reason=no-singleton");
+        return;
+    }
+    let live = sibling_online_cpu(home);
+    if live == home || live >= MAX_CPUS {
+        serial_println!(":: RESTARTALLOC: spare=none restart_ms=- heap_held=0 -> SKIP :: reason=no-sibling-core from=c{}", home);
+        return;
+    }
+    let me = percpu::this_cpu().cpu_index as usize;
+    let Some(hc) = (0..MAX_CPUS).map_while(crate::arch::smp::worker_cpu).find(|&c| c != me && c != live && c != 0) else {
+        serial_println!(":: RESTARTALLOC: spare=none restart_ms=- heap_held=0 -> SKIP :: reason=no-holder-core from=c{} live=c{}", home, live);
+        return;
+    };
+    if SGL_SPARE_TASK.load(Ordering::Acquire) == 0 {
+        serial_println!(":: RESTARTALLOC: spare=none restart_ms=- heap_held=0 -> FAIL :: reason=no-spare old={} from=c{} live=c{}", old, home, live);
+        return;
+    }
+    hp::arm();
+    spawn("restartalloc-heap", hp::hold_task, 0, hc, PRIO_NORMAL);
+    // Spin (never sleep): from `held()` on, nothing here may touch the heap.
+    let tw = crate::arch::ms();
+    while !hp::held() {
+        if crate::arch::ms().saturating_sub(tw) >= 1_000 {
+            serial_println!(":: RESTARTALLOC: spare=none restart_ms=- heap_held=0 -> SKIP :: reason=no-heap-task holder=c{}", hc);
+            return;
+        }
+        core::hint::spin_loop();
+    }
+    let busy0 = crate::allocator::heap_busy();
+    let t0 = crate::arch::ms();
+    let r = singleton_restart(home, live);
+    let restart_ms = crate::arch::ms().saturating_sub(t0);
+    let used = r.is_some() && SGL_SPARE_LAST.load(Ordering::Relaxed) == 1;
+    let held = busy0 && hp::held() && crate::allocator::heap_busy();
+    if hp::claim() {
+        hp::unlock_claimed();
+    }
+    // The heap is free again: the fresh instance's prologue (`singleton_register`) re-arms the spare.
+    let rearmed = r.is_some() && hold2_wait(1_500, || SGL_SPARE_TASK.load(Ordering::Acquire) != 0);
+    let ok = r.is_some() && used && held && restart_ms <= 100 && rearmed;
+    let (o, n) = r.unwrap_or((old, 0));
+    serial_println!(
+        ":: RESTARTALLOC: spare={} restart_ms={} heap_held={} -> {} :: old={} new={} from=c{} live=c{} rearmed={} holder=c{}{}",
+        if used { "used" } else { "none" },
+        restart_ms,
+        held as u8,
+        if ok { "PASS" } else { "FAIL" },
+        o,
+        n,
+        home,
+        live,
+        rearmed as u8,
+        hc,
+        if r.is_none() { " reason=no-restart" } else { "" }
+    );
+}
+
+// ── GATESTEALWORKERCORE (rmbp-ledger B1029) — the hid pump leaves a dead core APART from the worker core. FILE-TAIL append. ──
+// Flight 38 / `tests gatesteal2`: the watch's `sessionwedge::pick_live` answers `smp::xhci_worker_cpu(0)` (c2) and
+// [`rehome_dead_core`] drained EVERY sleeper of the dead service core onto it — the `hid-pump` (spawned on the service core
+// beside the usb-pump, `drivers::ehci::hid_task_start`) among them — the core where bootlog / geodew / dock / flightrec had
+// placed their workers "apart from the hid pump" while it still sat on c7. The drain runs BEFORE the caller re-publishes the
+// split, so at drain time `xhci_worker_cpu(0)` is the pre-steal worker core (= live) and `xhci_worker_cpu(1)` is the one the
+// pool hands out first once the service role follows to live. ONE placement rule: the hid pump (by its spawn name: it
+// publishes no tid and runs at PRIO_NORMAL like every worker) lands on a dispatching, unparked core that is none of 0, the
+// dead core, live, the render core and those two worker cores, the least loaded by `pick_cpu`'s key pair; with none such it
+// shares live as before. Every other task moves exactly as before. `pick_live` (the service role) is unchanged.
+
+/// GATESTEALWORKERCORE (B1029): the `hid-pump` task's spawn name (`drivers::ehci::hid_task_start`) — its identity in the drain.
+const HID_PUMP_TASK: &str = "hid-pump";
+
+/// GATESTEALWORKERCORE (B1029): where the last [`rehome_dead_core`] drain put the hid pump — `usize::MAX` = no drain saw it,
+/// [`HID_REHOME_SHARED`] = onto `live` (no apart core), else that core. Written by the drain only; read by `tests gatesteal2`.
+static HID_REHOME: AtomicUsize = AtomicUsize::new(usize::MAX);
+const HID_REHOME_SHARED: usize = usize::MAX - 1;
+
+/// GATESTEALWORKERCORE (B1029): the hid pump's destination when it lived on `dead` — `None` when it did not, or when no core
+/// is apart from 0 / dead / live / render / `xhci_worker_cpu(0)` / `xhci_worker_cpu(1)` (asked by name, BP-cores-1). The
+/// scan is `pick_cpu`'s: masked, one run-queue lock at a time across `len()`, keys `max(depth, place_credit)` then
+/// `busy_pct`. Called before the drain's masked section (`xhci_worker_cpu` allocates).
+fn hid_rehome_cpu(dead: usize, live: usize) -> Option<usize> {
+    if crate::hidstall::pump_cpu() != dead {
+        return None;
+    }
+    let render = crate::arch::smp::render_cpu();
+    let w0 = crate::arch::smp::xhci_worker_cpu(0);
+    let w1 = crate::arch::smp::xhci_worker_cpu(1);
+    let now_ms = crate::arch::ms();
+    let mut best: Option<(usize, usize, u32)> = None; // (cpu, load, pct)
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        for c in 1..MAX_CPUS {
+            if c == dead || c == live || Some(c) == render || Some(c) == w0 || Some(c) == w1 || !cpu_dispatching(c) || is_dead_core(c) {
+                continue;
+            }
+            let load = RUN_QUEUES[c].lock().len().max(place_credit(c, now_ms) as usize);
+            let pct = ACCT[c].busy_pct(0);
+            let better = match best {
+                None => true,
+                Some((_, bl, bp)) => load < bl || (load == bl && pct < bp),
+            };
+            if better {
+                best = Some((c, load, pct));
+            }
+        }
+    });
+    best.map(|(c, _, _)| c)
+}
+
+/// GATESTEALWORKERCORE (B1029): the drain's destination for one task — `live` for every task but the hid pump, which takes
+/// `hid` (or `live` with none) and is recorded in `hid_to` and [`HID_REHOME`].
+fn hid_dst(name: &'static str, hid: Option<usize>, live: usize, hid_to: &mut Option<usize>) -> usize {
+    if name != HID_PUMP_TASK {
+        return live;
+    }
+    let d = hid.unwrap_or(live);
+    *hid_to = Some(d);
+    HID_REHOME.store(if d == live { HID_REHOME_SHARED } else { d }, Ordering::Release);
+    d
+}
+
+/// GATESTEALWORKERCORE (B1029): the `[smpbal] rehome` line's `pump=` word — `c<n>` (moved apart), `c<live>(shared)` (no apart
+/// core), `-` (the hid pump was not in this drain).
+struct HidPumpWord(Option<usize>, usize);
+
+impl core::fmt::Display for HidPumpWord {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.0 {
+            None => f.write_str("-"),
+            Some(c) if c == self.1 => write!(f, "c{}(shared)", c),
+            Some(c) => write!(f, "c{}", c),
+        }
+    }
+}
+
+/// GATESTEALWORKERCORE (B1029): `tests gatesteal2`'s `pump_apart=` — `(not failing, word)`. `skip(elsewhere)` when the hid
+/// pump was not on the dead core, `skip(no-core)` when the drain had no apart core (a small box), `fail(not-drained)` when no
+/// drain saw it, else `ok` iff the hid pump now stamps from the drain's pick and that core is neither the new service core
+/// (`SGL_HOME`), nor the re-published `xhci_worker_cpu(0)`, nor 0; `fail(c<n>)` otherwise.
+#[cfg(feature = "wc")]
+fn pump_apart(hid0: usize, dead: usize) -> (bool, alloc::string::String) {
+    if hid0 != dead {
+        return (true, alloc::string::String::from("skip(elsewhere)"));
+    }
+    let to = HID_REHOME.load(Ordering::Acquire);
+    if to == usize::MAX {
+        return (false, alloc::string::String::from("fail(not-drained)"));
+    }
+    if to == HID_REHOME_SHARED {
+        return (true, alloc::string::String::from("skip(no-core)"));
+    }
+    let p = crate::hidstall::pump_cpu();
+    let ok = p == to && p != SGL_HOME.load(Ordering::Acquire) && Some(p) != crate::arch::smp::xhci_worker_cpu(0) && p != 0;
+    if ok { (true, alloc::string::String::from("ok")) } else { (false, alloc::format!("fail(c{})", p as i64)) }
+}
+
+// ══ PREEMPTOFFARMSLEEPCHECKYIELDSITE (zenbook-ledger Z107) — the sleep-in-span line names the YIELD CALL too ══
+// CHARTER: kernel-by-ruling (the scheduler's own preempt-off sleep check, x86_64). The five voluntary switch-out
+// entries (`yield_now`, `sleep_ticks`, `Semaphore::wait`, `futex_wait`, `Condvar::wait`, and the `sleep_ms` wrapper) are
+// `#[track_caller]`; each folds `note()` after its own IRQ mask, before its switch, storing the caller's `Location` in
+// this core's ONE word `YIELD_AT`. The owning core writes it masked and reads it in `preemptoff::sleep_report` in the same
+// masked scheduler pass (no task runs between the switch-back's `sleep_check` and `sleep_report`), so no lock. The
+// sleep KAT stashes the yield it was named for (`kat_note`) and asserts it is `stale_kat_run`'s own yield line
+// (`kat_mark(line!())` on that line) in `kat_verdict` (`sleep_kat=ok` | `wrong-site`).
+// PREEMPTOFFSLEEPCHECKYIELDSITEWRAPPERSKAT (zenbook-ledger Z115): the same KAT then parks once more inside a fresh held span through a CONTENDED
+// `Mutex::lock` (`KAT_LOCK`, held by the stale KAT's follower until the holder asks), so `sleep_kat=ok` also asserts
+// Z111's track_caller chain `Mutex::lock` -> `Semaphore::wait` -> `note`: the lock hit (after `kat_mark_lock`) must
+// name `kat_lock_park`'s own lock line (else `wrong-lock-site`).
+mod yieldsite {
+    use core::panic::Location;
+    use core::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
+    #[cfg(any(feature = "ahci", feature = "nvme"))]
+    use core::sync::atomic::AtomicBool;
+
+    /// Z107: this core's last wait-entry caller (null = none yet). Written and read only by its own core, IRQ masked.
+    static YIELD_AT: [AtomicPtr<Location<'static>>; super::MAX_CPUS] = [const { AtomicPtr::new(core::ptr::null_mut()) }; super::MAX_CPUS];
+    /// Z107 KAT: the yield site the sleep KAT's hit was named for, and the line `stale_kat_run` yields on.
+    static KAT_AT: AtomicPtr<Location<'static>> = AtomicPtr::new(core::ptr::null_mut());
+    static KAT_LINE: AtomicU32 = AtomicU32::new(0);
+    /// Z115 KAT: the lock site the sleep KAT's lock-phase hit was named for, and the line `kat_lock_park` locks on
+    /// (0 = the lock phase not armed: a hit is the yield phase's).
+    static KAT_LOCK_AT: AtomicPtr<Location<'static>> = AtomicPtr::new(core::ptr::null_mut());
+    static KAT_LOCK_LINE: AtomicU32 = AtomicU32::new(0);
+    /// Z115 KAT: the one contended lock (the follower holds it across the holder's park) and the holder's ask.
+    #[cfg(any(feature = "ahci", feature = "nvme"))]
+    static KAT_LOCK: super::Mutex<()> = super::Mutex::new(());
+    #[cfg(any(feature = "ahci", feature = "nvme"))]
+    static KAT_LOCK_ASKED: AtomicBool = AtomicBool::new(false);
+
+    /// Z107: called from a `#[track_caller]` wait entry after its IRQ mask; the track_caller chain makes
+    /// `Location::caller()` the ENTRY's caller.
+    #[track_caller]
+    #[inline(always)]
+    pub(super) fn note() {
+        let cpu = crate::arch::percpu::this_cpu().cpu_index as usize;
+        if cpu < super::MAX_CPUS {
+            YIELD_AT[cpu].store(Location::caller() as *const Location<'static> as *mut Location<'static>, Ordering::Relaxed);
+        }
+    }
+
+    /// Z107: this core's last wait-entry caller.
+    pub(super) fn at(cpu: usize) -> Option<&'static Location<'static>> {
+        let p = YIELD_AT.get(cpu)?.load(Ordering::Relaxed) as *const Location<'static>;
+        // SAFETY: only ever stored from a `&'static Location<'static>` (`note`).
+        unsafe { p.as_ref() }
+    }
+
+    /// Z107: the ` yield=<file>:<line>` token's value (`?` if this core never stashed one).
+    pub(super) struct Site(pub usize);
+
+    impl core::fmt::Display for Site {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            match at(self.0) {
+                Some(l) => write!(f, "{}:{}", l.file(), l.line()),
+                None => f.write_str("?"),
+            }
+        }
+    }
+
+    /// Z107 KAT: `stale_kat_run` records the line its in-span `yield_now` sits on (`line!()` on that same line).
+    #[allow(dead_code)]
+    pub(super) fn kat_mark(line: u32) {
+        KAT_LINE.store(line, Ordering::Relaxed);
+    }
+
+    /// Z107 KAT: `sleep_check`'s KAT branch stashes the yield site it was named for (masked, the holder's core).
+    /// Z115: once the lock line is armed the hit is the lock phase's (into `KAT_LOCK_AT`, returns false); before it, the
+    /// yield phase's (into `KAT_AT`, returns true: the caller keeps its via word for the yield phase only).
+    pub(super) fn kat_note(cpu: usize) -> bool {
+        let p = at(cpu).map_or(core::ptr::null_mut(), |l| l as *const Location<'static> as *mut Location<'static>);
+        if KAT_LOCK_LINE.load(Ordering::Relaxed) != 0 {
+            KAT_LOCK_AT.store(p, Ordering::Relaxed);
+            return false;
+        }
+        KAT_AT.store(p, Ordering::Relaxed);
+        true
+    }
+
+    /// Z115 KAT (`stale_kat`, before the holder and the follower spawn): reserve the lock's waiter list (`Mutex::init`,
+    /// idempotent; before any task can block on it) and clear the lock phase's words.
+    #[cfg(any(feature = "ahci", feature = "nvme"))]
+    pub(super) fn kat_lock_arm() {
+        KAT_LOCK.init();
+        KAT_LOCK_ASKED.store(false, Ordering::Release);
+        KAT_LOCK_LINE.store(0, Ordering::Relaxed);
+        KAT_LOCK_AT.store(core::ptr::null_mut(), Ordering::Relaxed);
+    }
+
+    /// Z115 KAT: the stale KAT's follower (pinned to the holder's core). Takes the lock (uncontended) BEFORE `ran` (its
+    /// `STALE_KAT_AFTER_RAN` store), so the holder past its yield loop finds it held; yields until the holder asks
+    /// (bounded as the holder's loop, 1000 ms; on one core the ask is seen only once the holder is parked on the lock),
+    /// then gives it back (the `post` readies the holder).
+    #[cfg(any(feature = "ahci", feature = "nvme"))]
+    pub(super) fn kat_lock_follow(ran: impl FnOnce()) {
+        let g = KAT_LOCK.lock();
+        ran();
+        let m0 = crate::arch::ms();
+        while !KAT_LOCK_ASKED.load(Ordering::Acquire) && crate::arch::ms().wrapping_sub(m0) < 1000 {
+            super::yield_now();
+        }
+        drop(g);
+    }
+
+    /// Z115 KAT: the holder's stale code was not ok, so no lock phase: release the follower (0: nothing to give back).
+    #[cfg(any(feature = "ahci", feature = "nvme"))]
+    pub(super) fn kat_lock_skip() -> u32 {
+        KAT_LOCK_ASKED.store(true, Ordering::Release);
+        0
+    }
+
+    /// Z115 KAT: the holder's second in-span park. A FRESH hold (the follower's dispatch reset the first one), the ask,
+    /// then the contended `Mutex::lock` on the marked line: the switch-back's `sleep_check` names it (the lock phase) and
+    /// the follower, dispatched on this core, resets the hold and gives the lock back. Returns 1 when the hold came back
+    /// stale (that reset and this stale drop are the KAT's own; the caller gives both back), else 0.
+    #[cfg(any(feature = "ahci", feature = "nvme"))]
+    pub(super) fn kat_lock_park() -> u32 {
+        let s0 = super::preemptoff::stale_drops();
+        let g3 = super::preemptoff::hold();
+        KAT_LOCK_ASKED.store(true, Ordering::Release);
+        kat_mark_lock(line!()); let g = KAT_LOCK.lock(); // Z115: this line is the lock park the sleep KAT must name (`kat_verdict`)
+        drop(g);
+        super::preemptoff::put(g3);
+        (super::preemptoff::stale_drops() == s0.wrapping_add(1)) as u32
+    }
+
+    /// Z115 KAT: `kat_lock_park` records the line its contended lock sits on (`line!()` on that same line); arms the
+    /// lock phase for `kat_note`.
+    #[cfg(any(feature = "ahci", feature = "nvme"))]
+    fn kat_mark_lock(line: u32) {
+        KAT_LOCK_LINE.store(line, Ordering::Relaxed);
+    }
+
+    /// Z107 KAT verdict (`sleep_kat=`'s last arm): `ok` when the named yield is this file's `stale_kat_run` yield line,
+    /// else `wrong-site`; Z115: then the lock-phase hit must be `kat_lock_park`'s lock line (else `wrong-lock-site`).
+    /// Clears all four words.
+    #[allow(dead_code)]
+    pub(super) fn kat_verdict() -> &'static str {
+        let p = KAT_AT.swap(core::ptr::null_mut(), Ordering::Relaxed) as *const Location<'static>;
+        let want = KAT_LINE.swap(0, Ordering::Relaxed);
+        let lp = KAT_LOCK_AT.swap(core::ptr::null_mut(), Ordering::Relaxed) as *const Location<'static>;
+        let lwant = KAT_LOCK_LINE.swap(0, Ordering::Relaxed);
+        // SAFETY: only ever stored from a `&'static Location<'static>` (`kat_note` over `at`).
+        match unsafe { p.as_ref() } {
+            Some(l) if want != 0 && l.line() == want && l.file() == file!() => {}
+            _ => return "wrong-site",
+        }
+        // SAFETY: as above (`kat_note` over `at`).
+        match unsafe { lp.as_ref() } {
+            Some(l) if lwant != 0 && l.line() == lwant && l.file() == file!() => "ok",
+            _ => "wrong-lock-site",
+        }
+    }
 }

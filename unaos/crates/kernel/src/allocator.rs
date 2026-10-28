@@ -61,22 +61,22 @@ unsafe impl GlobalAlloc for Locked<Heap> {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let mut result = null_mut();
         arch::without_interrupts(|| {
-            let mut heap = self.inner.lock(); #[cfg(target_arch = "x86_64")] heappoison::check(&self.inner, &mut heap); // HEAPREGION (B854): a torn verdict re-initialises the heap onto its reserve (the guard passed in). POISON2 (B846): a death-released heap lock is CHECKED at its next allocation (body at the tail). LINE-NEUTRAL append
+            #[cfg(target_arch = "x86_64")] let hg = heapgap::enter(); let mut heap = self.inner.lock(); #[cfg(target_arch = "x86_64")] heappoison::check(&self.inner, &mut heap); // HEAPREGION (B854): a torn verdict re-initialises the heap onto its reserve (the guard passed in). POISON2 (B846): a death-released heap lock is CHECKED at its next allocation (body at the tail). LINE-NEUTRAL append
             match { #[cfg(target_arch = "x86_64")] heappoison::op(heappoison::OP_ALLOC); if heap_dead() { Err(()) } else { heap.allocate_first_fit(layout) } } {
                 Ok(ptr) => { result = ptr.as_ptr(); #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] high_note(heap.used()); #[cfg(all(target_arch = "x86_64", feature = "wc"))] census::on_alloc(result as usize, layout.size()); #[cfg(target_arch = "x86_64")] heappoison::op(0); } // MEMLINE (B677): the window's high-water, under the heap lock. LINE-NEUTRAL append, code first; MEMLINE2 (B821): the owner census, same lock
                 Err(_) => { #[cfg(target_arch = "x86_64")] heappoison::op(0); }
             }
-        });
+        #[cfg(target_arch = "x86_64")] heapgap::leave_after(heap, hg); });
         #[cfg(target_arch = "x86_64")] heappoison::say(); result
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         arch::without_interrupts(|| {
-            let mut heap = self.inner.lock(); #[cfg(target_arch = "x86_64")] heappoison::check(&self.inner, &mut heap); // HEAPREGION (B854) HEAPFREEFIRST: a free that is the first take after a death runs the SAME check (and may re-init). LINE-NEUTRAL append
+            #[cfg(target_arch = "x86_64")] let hg = heapgap::enter(); let mut heap = self.inner.lock(); #[cfg(target_arch = "x86_64")] heappoison::check(&self.inner, &mut heap); // HEAPREGION (B854) HEAPFREEFIRST: a free that is the first take after a death runs the SAME check (and may re-init). LINE-NEUTRAL append
             unsafe {
                 #[cfg(target_arch = "x86_64")] heappoison::op(heappoison::OP_FREE); if heap_free_ok(ptr as usize) { heap.deallocate(core::ptr::NonNull::new(ptr).unwrap(), layout); } #[cfg(all(target_arch = "x86_64", feature = "wc"))] census::on_free(ptr as usize); #[cfg(target_arch = "x86_64")] heappoison::op(0); // MEMLINE2 (B821): a tracked block leaves the owner census under the heap lock, whoever frees it. LINE-NEUTRAL append, code first. HEAPREGION (B854): a free into the abandoned range is DROPPED (`heap_free_ok`); the census still forgets it
             }
-        }); #[cfg(target_arch = "x86_64")] heappoison::say(); // HEAPREGION (B854) HEAPFREEFIRST: the free's check is said after the lock drops, as alloc's tail does. LINE-NEUTRAL append
+        #[cfg(target_arch = "x86_64")] heapgap::leave_after(heap, hg); }); #[cfg(target_arch = "x86_64")] heappoison::say(); // HEAPREGION (B854) HEAPFREEFIRST: the free's check is said after the lock drops, as alloc's tail does. LINE-NEUTRAL append
     }
 }
 
@@ -218,7 +218,7 @@ pub fn heap_high() -> usize {
 #[cfg(all(target_arch = "x86_64", feature = "wc"))]
 pub mod census {
     use core::cell::UnsafeCell;
-    use core::sync::atomic::{AtomicBool, AtomicU64, Ordering::{AcqRel, Acquire, Relaxed, Release}};
+    use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::{AcqRel, Acquire, Relaxed, Release}};
 
     pub const STAGE: u8 = 1;
     pub const SHADOW: u8 = 2;
@@ -229,8 +229,16 @@ pub mod census {
     pub const WALLPAPER_RETIRED: u8 = 5;
     pub const APPRES_PIX: u8 = 6;
     pub const TEXT_RESIDENT: u8 = 7;
+    /// FIXTURERETAIN (B1017): the GEN7 pages held for the boot by design (GEN7TLB, gen7.md §2.6: r11's HELD, r8's
+    /// `reclaim=held` surfaces, gen7blit's sp/dp), named by [`retag`] at each hold site; desktopbuild counts it once.
+    pub const GEN7_HELD: u8 = 8;
+    /// WINDOWSURFTAG (B1030): a window's surface, renamed at `wm::create_inner` / `wm::shell_remint` by [`retag_tracked`]
+    /// (the block the owner allocated; one static name, the row's sum and block count carry the windows).
+    pub const WINDOW_SURFACE: u8 = 9;
+    /// SLOTRECTAG (B1030): the WINDOWCAP3 slot record (`memory::slot_rec_ensure`), never freed: desktopbuild counts it once.
+    pub const SLOT_RECORD: u8 = 10; pub const LOGIN_SURFACE: u8 = 11; // LOGINFURNITUREONCE (B1041): the login furniture's grow-once surface (login card, dialog, instgui), tagged at its allocation by `video::metrics::login_surf`; desktopbuild counts it once. LINE-NEUTRAL append, code first
     /// Tag -> its census name (0 = no tag).
-    pub const NAMES: [&str; 8] = ["-", "stage", "shadow", "wallpaper", "help", "wallpaper-retired", "appres-pix", "text-resident"];
+    pub const NAMES: [&str; 12] = ["-", "stage", "shadow", "wallpaper", "help", "wallpaper-retired", "appres-pix", "text-resident", "gen7-held", "window-surface", "slot-record", "login-surface"];
     /// An untagged block this large is tracked under its task's name.
     pub const BIG: usize = 64 * 1024;
     /// Owner rows a [`Snapshot`] carries (the last one becomes `other` on overflow).
@@ -309,7 +317,12 @@ pub mod census {
             return inert;
         }
         let Some(tid) = crate::arch::sched::current_id() else { return inert };
-        let packed = (tid << 8) | tag as u64;
+        claim(tid, (tid << 8) | tag as u64)
+    }
+
+    /// Arm `packed` for task `tid`: its own slot when it has one (the drop restores the word it held), else a free
+    /// one. FIXTURERETAIN (B1017): [`enter`]'s loop, shared with [`fx_enter`]. Inert with all slots taken.
+    fn claim(tid: u64, packed: u64) -> Scope {
         for (i, s) in ARMED.iter().enumerate() {
             let v = s.load(Acquire);
             if v != 0 && v >> 8 == tid {
@@ -322,7 +335,7 @@ pub mod census {
                 return Scope { slot: i, prev: 0, own: packed };
             }
         }
-        inert
+        Scope { slot: SLOTS, prev: 0, own: 0 }
     }
 
     #[inline(always)]
@@ -350,7 +363,13 @@ pub mod census {
                 break;
             }
         }
-        let (name, tagged): (&'static str, bool) = if tag != 0 && (tag as usize) < NAMES.len() {
+        let (name, tagged): (&'static str, bool) = if tag & FX != 0 {
+            // FIXTURERETAIN (B1017): a fixture's word names only the blocks a task name would (>= BIG), as `fx:<verb>`.
+            match fx_name(tag & !FX) {
+                Some(n) if size >= BIG => (n, true),
+                _ => return,
+            }
+        } else if tag != 0 && (tag as usize) < NAMES.len() {
             (NAMES[tag as usize], true)
         } else if size >= BIG {
             (crate::arch::sched::current_name().unwrap_or("-"), false)
@@ -507,7 +526,8 @@ pub mod census {
                 SEEN_MS[i].store(now, Relaxed);
                 continue;
             }
-            if now.saturating_sub(SEEN_MS[i].load(Relaxed)) >= STALE_MS && ARMED[i].compare_exchange(v, 0, AcqRel, Relaxed).is_ok() {
+            let stale = if v as u8 & FX != 0 { STALE_FX_MS } else { STALE_MS }; // FIXTURERETAIN (B1017): a fixture outlives 30 s
+            if now.saturating_sub(SEEN_MS[i].load(Relaxed)) >= stale && ARMED[i].compare_exchange(v, 0, AcqRel, Relaxed).is_ok() {
                 RECLAIMED.fetch_add(1, Relaxed);
                 SEEN[i].store(0, Relaxed);
             }
@@ -526,6 +546,120 @@ pub mod census {
             insert(addr, size, NAMES[tag as usize], true);
             drop(heap);
         });
+    }
+
+    /// WINDOWSURFTAG (B1030) — [`retag`]'s RENAME-ONLY form: name the block STARTING at `addr` `NAMES[tag]` only when the
+    /// census already tracks it (the entry keeps its own size); anything else — a static, an interior pointer (a ring-3
+    /// window's surface inside its slot record), an untracked small block — is left alone, so a seam that sees every
+    /// window's `surf` inserts no phantom entry. `true` = renamed. Inert while unarmed. Takes the heap lock itself: never
+    /// call it from an allocation.
+    pub fn retag_tracked(addr: usize, tag: u8) -> bool {
+        if !ON.load(Acquire) || addr == 0 || tag == 0 || tag as usize >= NAMES.len() {
+            return false;
+        }
+        let name = NAMES[tag as usize];
+        crate::arch::without_interrupts(|| {
+            let heap = super::ALLOCATOR.lock();
+            // SAFETY: the heap lock is held (`heap`), the table's contract.
+            let e = unsafe { &mut *TABLE.e.get() };
+            let mut i = home(addr);
+            let mut hit = false;
+            while e[i].addr != 0 {
+                if e[i].addr == addr {
+                    e[i].nptr = name.as_ptr() as usize;
+                    e[i].nlen = name.len();
+                    e[i].tagged = true;
+                    hit = true;
+                    break;
+                }
+                i = (i + 1) & (CAP - 1);
+            }
+            drop(heap);
+            hit
+        })
+    }
+
+    // FIXTURERETAIN (rmbp-ledger B1017, BP-cores-22) — PER-FIXTURE ATTRIBUTION. Flight 38's census charged +18387 KiB
+    // to `task:bootlist-fx`: every list child carries that task name, so the row was the SUM over sixteen fixtures.
+    // [`fx_enter`] (folded on `tests::run`'s fixture line, around `f()`, with the fixture's registered name) arms the
+    // task with an FX word, `(tid << 8) | FX | idx`: `idx` names an interned `fx:<verb>` string in [`FXP`]/[`FXL`],
+    // so the Entry's existing name field carries the fixture and nesting is exact (a `stage` enter inside a fixture
+    // restores the FX word on its drop). [`note`] tracks such a task's block only when >= [`BIG`] (as a task name
+    // would), `tagged`, so memcensus prints it bare: `[memline] census tag=fx:gen7`. The strings live in a static
+    // arena under [`FXN`], a leaf lock taken only here, never with the heap lock held, never allocating; a name is
+    // published (Release) before its idx is handed out, and [`note`] reads it lock-free (Acquire). Full = inert.
+
+    /// The FX bit of a word's tag byte; the low 7 bits index the intern table.
+    const FX: u8 = 0x80;
+    const FX_MAX: usize = 128;
+    const FX_ARENA: usize = 4096;
+    /// A fixture runs up to the list's longest budget (`bootlist::BUDGET_MAX_S`) before its word is reaped.
+    const STALE_FX_MS: u64 = 3_600_000;
+    static FXP: [AtomicUsize; FX_MAX] = [const { AtomicUsize::new(0) }; FX_MAX];
+    static FXL: [AtomicUsize; FX_MAX] = [const { AtomicUsize::new(0) }; FX_MAX];
+
+    struct FxArena {
+        buf: [u8; FX_ARENA],
+        used: usize,
+        /// `(source name ptr, source len)` per interned idx, `n` of them.
+        src: [(usize, usize); FX_MAX],
+        n: usize,
+    }
+    static FXN: crate::sync::Mutex<FxArena> = crate::sync::Mutex::new(FxArena { buf: [0; FX_ARENA], used: 0, src: [(0, 0); FX_MAX], n: 0 });
+
+    /// The interned `fx:<verb>` for `idx` (lock-free; `None` = not published).
+    fn fx_name(idx: u8) -> Option<&'static str> {
+        let i = idx as usize;
+        if i >= FX_MAX {
+            return None;
+        }
+        let p = FXP[i].load(Acquire);
+        if p == 0 {
+            return None;
+        }
+        // SAFETY: `p`/`FXL[i]` were published by [`fx_intern`] for bytes of the static arena that are never rewritten
+        // once published (the arena only grows), copied from a `&str` behind the literal ASCII `fx:` prefix.
+        Some(unsafe { core::str::from_utf8_unchecked(core::slice::from_raw_parts(p as *const u8, FXL[i].load(Relaxed))) })
+    }
+
+    /// `name`'s idx, interning `fx:<name>` on its first use (`None` = the table or the arena is full).
+    fn fx_intern(name: &'static str) -> Option<u8> {
+        let mut a = FXN.lock();
+        let key = (name.as_ptr() as usize, name.len());
+        if let Some(i) = a.src[..a.n].iter().position(|&k| k == key) {
+            return Some(i as u8);
+        }
+        let len = 3 + name.len();
+        if a.n >= FX_MAX || a.used + len > FX_ARENA {
+            return None;
+        }
+        let (at, i) = (a.used, a.n);
+        a.buf[at..at + 3].copy_from_slice(b"fx:");
+        a.buf[at + 3..at + len].copy_from_slice(name.as_bytes());
+        a.used += len;
+        a.src[i] = key;
+        a.n += 1;
+        let p = a.buf[at..].as_ptr() as usize;
+        FXL[i].store(len, Relaxed);
+        FXP[i].store(p, Release);
+        Some(i as u8)
+    }
+
+    /// Name the calling task's >= [`BIG`] blocks `fx:<name>` until the returned [`Scope`] drops (`name` = a fixture's
+    /// registered name). Inert when the census is not armed, outside a task, or with the table or the slots full.
+    pub fn fx_enter(name: &'static str) -> Scope {
+        let inert = Scope { slot: SLOTS, prev: 0, own: 0 };
+        if !ON.load(Acquire) {
+            return inert;
+        }
+        let Some(tid) = crate::arch::sched::current_id() else { return inert };
+        let Some(idx) = fx_intern(name) else { return inert };
+        claim(tid, (tid << 8) | (FX | idx) as u64)
+    }
+
+    /// The census is counting (armed at the first desktop build's ask).
+    pub fn armed() -> bool {
+        ON.load(Acquire)
     }
 }
 
@@ -887,5 +1021,165 @@ fn heap_free_ok(p: usize) -> bool {
     #[cfg(not(target_arch = "x86_64"))]
     {
         true
+    }
+}
+
+// PUMPDEATHREHOME (rmbp-ledger B1016, BP-cores-14) — THE HEAP'S IN-SECTION MARKER. Flight 38 boot 1: the usb-pump died by
+// its guard inside prtscr's masked UnaFS save and the heap lock stayed held 124 s by a holder the registry could not name
+// (`[lock] spin-wait name=allocator.rs:51 … on=untracked`): `sync::Mutex::lock` takes the RAW lock before `reg::acquire`
+// writes the tag, so a holder that dies in that window (calls pushing onto a stack already in its absorber) holds the
+// heap with no tag and `release_task`'s walk cannot see it. [`IN`] names the task inside alloc's or dealloc's MASKED
+// section per core (stored before the take, cleared after the guard drops: masked, the task neither migrates nor is
+// preempted there); [`release_dead`] — called by `release_task` before its walk — releases such a hold, mark first,
+// exactly as the walk does, so the next take runs `heappoison::check` (OP is 0 in the gap: `torn=0 -> released`; a
+// holder that died inside a list mutation still reads `torn=1` and takes the HEAPREGION path). At the tail: no line
+// above moves but the two lock lines and the two closing lines (same-line prefixes). x86 only (the registry is x86's).
+#[cfg(target_arch = "x86_64")]
+pub mod heapgap {
+    //! CHARTER: Kernel — kernel-by-ruling (B414 LOCKREG): a heap hold the registry could not tag, released at its holder's death (PUMPDEATHREHOME B1016).
+    use core::sync::atomic::{AtomicU64, Ordering::{AcqRel, Acquire, Relaxed, Release}};
+
+    use crate::arch::gdt::MAX_CPUS;
+
+    use super::ALLOCATOR;
+
+    /// Per core: the task id inside alloc's or dealloc's masked section (0 = none). Written only by that core, masked.
+    static IN: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+    /// Gap holds released at a death since boot.
+    static RELEASED: AtomicU64 = AtomicU64::new(0);
+    /// `tests pumpdeath`'s deliberate gap hold is in place (1) — its own bound may end it (`fixture_rescue`).
+    static FIX: AtomicU64 = AtomicU64::new(0);
+
+    /// The section begins (caller masked, before `self.inner.lock()`): `cpu + 1`, or 0 when the registry cannot name
+    /// the caller (unarmed, a foreign GS, the scheduler's own context) — then nothing is stored.
+    #[inline(always)]
+    pub fn enter() -> usize {
+        match crate::sync::here() {
+            Some((tid, cpu)) if tid != 0 && cpu < MAX_CPUS => {
+                IN[cpu].store(tid, Release);
+                cpu + 1
+            }
+            _ => 0,
+        }
+    }
+
+    /// The section ends: the heap guard `g` drops FIRST, then the marker clears (caller still masked).
+    #[inline(always)]
+    pub fn leave_after<G>(g: G, c: usize) {
+        drop(g);
+        leave(c);
+    }
+
+    #[inline(always)]
+    fn leave(c: usize) {
+        if c != 0 && c <= MAX_CPUS {
+            IN[c - 1].store(0, Release);
+        }
+    }
+
+    /// `release_task`'s heap case (before its walk): `tid` died inside the section on some core, the heap is still
+    /// locked, the registry names NO holder (a tracked hold is the walk's, or a live holder's) and `tid` was not
+    /// spinning for it (`sync::waits_on`) — so `tid` holds it untagged. Mark, force-unlock, one line; 1, else 0.
+    pub fn release_dead(tid: u64, why: &str) -> usize {
+        if tid == 0 {
+            return 0;
+        }
+        let Some(c) = (0..MAX_CPUS).find(|&c| IN[c].load(Acquire) == tid) else { return 0 };
+        IN[c].store(0, Release);
+        let m = &ALLOCATOR.inner;
+        if !m.is_locked() || m.holder().is_some() || crate::sync::waits_on(tid as u32).is_some() {
+            return 0;
+        }
+        let poisoned = m.mark_poison(); // BEFORE the force-unlock, so the next take sees it (`heappoison::check`)
+        // SAFETY: `tid` never runs again (a death site calls `release_task`) and holds the raw heap lock with no guard
+        // that could still be used: it took the lock inside this section and died before its tag (no tracked holder,
+        // no wait record).
+        unsafe { m.force_unlock() };
+        RELEASED.fetch_add(1, AcqRel);
+        let site = m.site();
+        let file = site.file();
+        serial_println!(
+            "[lock] released-on-death name={}:{} at=heap-gap by={}@cpu{} why={} poisoned={}",
+            file.rsplit('/').next().unwrap_or(file), site.line(), tid, c, why, poisoned as u8
+        );
+        1
+    }
+
+    /// PUMPWEDGE's `heap_holder=`: the registry's holder `<tid>@cpu<n>`, else a section task not spinning
+    /// `gap:<tid>@cpu<n>`, else `untracked` while locked, else `none`.
+    pub fn holder_word(out: &mut impl core::fmt::Write) {
+        let m = &ALLOCATOR.inner;
+        if let Some((t, c)) = m.holder() {
+            let _ = write!(out, "{}@cpu{}", t, c);
+            return;
+        }
+        if !m.is_locked() {
+            let _ = out.write_str("none");
+            return;
+        }
+        for (c, w) in IN.iter().enumerate() {
+            let t = w.load(Acquire);
+            if t != 0 && crate::sync::waits_on(t as u32).is_none() {
+                let _ = write!(out, "gap:{}@cpu{}", t, c);
+                return;
+            }
+        }
+        let _ = out.write_str("untracked");
+    }
+
+    /// PUMPWEDGE's `heap_spin_ms=`: the oldest live spin on the heap lock (0 = nobody waits).
+    pub fn spin_ms() -> u64 {
+        ALLOCATOR.inner.wait_ms()
+    }
+
+    /// Gap holds released at a death since boot.
+    pub fn released() -> u64 {
+        RELEASED.load(Acquire)
+    }
+
+    /// The heap lock is held right now (anyone).
+    pub fn locked() -> bool {
+        ALLOCATOR.inner.is_locked()
+    }
+
+    /// `tests pumpdeath`'s deliberate gap hold is in place.
+    pub fn fixture_taken() -> bool {
+        FIX.load(Acquire) == 1
+    }
+
+    /// `pumpdeath-die`: masked, enter the section, take the heap, forget the guard and drop the registry's tag (the gap,
+    /// made on purpose), then recurse into this task's guard page — a REAL guard death (`overflow_exit` ->
+    /// `release_task`). Allocates nothing. Returns only if the guard never fired (the marker cleared; the hold stays
+    /// for the fixture's bound).
+    pub fn fixture_die() -> u64 {
+        crate::arch::without_interrupts(|| {
+            let c = enter();
+            core::mem::forget(ALLOCATOR.inner.lock());
+            ALLOCATOR.inner.untrack();
+            FIX.store(1, Release);
+            let n = crate::arch::stackguard::scratch_deep(0);
+            leave(c);
+            n
+        })
+    }
+
+    /// The fixture's bound: its own hold still in place (no release came) — end it, unpoisoned, as `heappoison::hold_task`'s
+    /// bound does. `true` = it rescued the heap.
+    pub fn fixture_rescue() -> bool {
+        if FIX.swap(0, AcqRel) != 1 {
+            return false;
+        }
+        let m = &ALLOCATOR.inner;
+        if m.is_locked() && m.holder().is_none() {
+            // SAFETY: the fixture task took the lock untagged and is dead or returned without its guard; no release ran.
+            unsafe { m.force_unlock() };
+            return true;
+        }
+        false
+    }
+
+    /// The fixture is over (released or rescued): the next run starts clean.
+    pub fn fixture_clear() {
+        FIX.store(0, Relaxed);
     }
 }

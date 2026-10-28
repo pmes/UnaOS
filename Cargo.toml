@@ -45,6 +45,8 @@ members = [
     "unaos/libs/media/probe_core", # REALSENSE (SR92, R112): Sonde's probe core — frames (Z16/Y8/Y16/YUY2), depth model, IMU samples; no_std, both rings
     "unaos/libs/media/vp8_core",
     "unaos/libs/media/av1_core",
+    "unaos/libs/media/yuv_core", # AV1COLOURONE (SR340): Stria's ONE integer YCbCr->RGB kernel (gneiss_pal, av1_core, the kernel through av1_core); no_std, no alloc, zero deps
+    "unaos/libs/media/icc_core", # PDFICC (SR358): Facet's ONE ICC engine (v2/v4 matrix/TRC + lut8/lut16/mAB to sRGB; Facet, Aether <img>, pdf_core /ICCBased + JPX colr); no_std, its one dep libm
     "unaos/libs/media/vp9_core", # VP9CORE (SR116): the from-spec VP9 decoder (profiles 0 and 2) Stria links beside vp8_core; no_std, zero deps
     "unaos/libs/media/h264_core", # H264CORE (SR133): the from-spec H.264/AVC decoder (Baseline/Main/High 8-bit 4:2:0) Stria links beside vp9_core; no_std, zero deps
     "unaos/libs/media/h264enc_core", # H264ENC (SR197): the Constrained Baseline H.264 encoder (CAVLC, I + integer-pel P) over h264_core's inverse side; no_std, Stria's export core
@@ -62,6 +64,7 @@ members = [
     "unaos/libs/web/html_core",
     # CSSCORE (SR47): CSS Syntax 3 + Selectors 4 + the cascade helpers, no_std, zero deps.
     "unaos/libs/web/css_core",
+    "unaos/libs/web/pdf_core", # PDF1 (SR300): Aether's no_std PDF reader (lexer, objects, xref tables/streams, object streams, updates, reconstruction, filters, page tree, content tokenizer); its deps pixel_core's inflater, crypto_core (PDFCRYPT SR315) and svg_core's rasterizer (PDF2 SR313)
     "unaos/libs/web/gl_core", # WEBGL1 (SR136): the no_std software WebGL 1.0 / OpenGL ES 2.0 pipeline (state machine, GLSL ES 1.00 bytecode, rasterizer), zero deps
     # LAYOUTCORE (SR76, AETHERMETAL M2): Aether's layout engine (boxes, taffy mapping, inline formatter, tables),
     # no_std + alloc over the Dom/Fonts traits — the ONE engine the host browser and APPS/AETHER.ELF lay out with.
@@ -98,6 +101,7 @@ members = [
     "tools/play-check",
     "tools/nle", # NLE1 (SR194): the editor's headless face — schedule / render an EDL through stria::nle
     "tools/raster", # RASTERCLI (SR233): the host CLI over raster_core/brush_core/adjust_core — Facet's host witness
+    "tools/pdfprobe", # PDF1 (SR300): pdf_core's headless probe — pages, version, xref kind, title, per-page boxes / ops / fonts / images
     "tools/aethervideo-check",
     "tools/unafs",
     "tools/una-card",
@@ -117,6 +121,7 @@ members = [
     "vessels/facet-view",
     "vessels/stria-view", # NLE2 (SR201): Stria's editor face — one tetra tree on AppKit / GTK, the headless witness
     "vessels/una",
+    "vessels/una-installer", # INSTALLERVESSEL (SR413): the UnaOS_Installer vessel — host probe, the vessel catalog, build (Aulë) + install + run
     "libs/lux",
     "vessels/aether-shell"
 ]

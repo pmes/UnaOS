@@ -412,6 +412,7 @@ mod tt {
         ("NotoSansHebrew-Regular.ttf", "noto-hebrew", Role::Script, false),
         ("NotoSansDevanagari-Regular.ttf", "noto-devanagari", Role::Script, false),
         ("NotoSansThai-Regular.ttf", "noto-thai", Role::Script, false),
+        ("NotoSansCJK-Regular.ttc", "noto-cjk", Role::Script, false), // GLYPHSCARD (B1010): the CJK collection (face 0, JP: Han + kana), 18.6 MiB, over FACE_MAX: read LATE (`late_pass`)
         ("DejaVuSans.ttf", "dejavu-sans", Role::Fallback, false),
         ("DejaVuSans-Bold.ttf", "dejavu-sans-bold", Role::Fallback, true),
         ("DejaVuSansMono.ttf", "dejavu-mono", Role::Mono, false),
@@ -428,6 +429,14 @@ mod tt {
     const PREFS_MS: u64 = 1000;
     /// A face file larger than this is refused (Inter's variable face is 880 KB, DejaVu Sans 760 KB).
     const FACE_MAX: usize = 4 * 1024 * 1024;
+    /// GLYPHSCARD (B1010): a face over FACE_MAX and at most this is read LATE, a chunk per desktop service pass
+    /// ([`late_pass`]), never in [`load`]'s synchronous loop (the card reads ~1-1.7 MB/s: the 18.6 MiB CJK collection would
+    /// hold the service pass ~12-19 s). x86: 32 MiB; aarch64 (48 MiB heap): 6 MiB, so the Pi refuses the CJK face `reason=size`.
+    const FACE_LATE_MAX: usize = crate::allocator::HEAP_SIZE / 8;
+    /// GLYPHSCARD (B1010): one late read per desktop service pass (ONE short VFS read, never a whole-extent hold).
+    const LATE_CHUNK_PASS: usize = 64 * 1024;
+    /// GLYPHSCARD (B1010): one late read per step of `tests glyphs`' bounded wait (the bootlist worker, not the pump).
+    pub const LATE_CHUNK_WAIT: usize = 256 * 1024;
     /// Bounded wait for the engine lock before a call draws with the bitmap face instead.
     const SPIN: u32 = 1 << 14;
 
@@ -625,7 +634,7 @@ mod tt {
         let st = mt.stat(p).map_err(|_| "absent")?;
         let n = st.size as usize;
         if n == 0 || n > FACE_MAX {
-            return Err("size");
+            return Err(if n > FACE_MAX && n <= FACE_LATE_MAX { "late" } else { "size" }); // GLYPHSCARD (B1010): `load` queues a "late" face ([`late_queue`])
         }
         let mut v = Vec::new();
         v.try_reserve_exact(n).map_err(|_| "heap")?;
@@ -640,9 +649,103 @@ mod tt {
         Ok(v)
     }
 
+    /// GLYPHSCARD (B1010): the one face being read late — its path, the buffer reserved whole in [`load`] (under the
+    /// FACELEAK census guard: `text-resident`), the bytes wanted. LATE owns it; it is never held together with TT.
+    struct Late {
+        name: &'static str,
+        path: String,
+        buf: Vec<u8>,
+        n: usize,
+        passes: u32,
+        t0: u64,
+    }
+    static LATE: crate::sync::Mutex<Option<Late>> = crate::sync::Mutex::new(None);
+
+    /// GLYPHSCARD (B1010): queue face `name` at `p` (a "late" verdict from [`read_face`]): reserve its bytes now, read
+    /// them in [`late_pass`]. `None` = queued (not named missing); `Some(reason)` = refused, named like any face.
+    fn late_queue(mt: &crate::fs::vfs::MountTable, name: &'static str, p: &str) -> Option<&'static str> {
+        let n = match mt.stat(p) {
+            Ok(st) => st.size as usize,
+            Err(_) => return Some("absent"),
+        };
+        let mut buf = Vec::new();
+        if buf.try_reserve_exact(n).is_err() {
+            return Some("heap");
+        }
+        let Some(mut g) = LATE.try_lock() else { return Some("late-busy") };
+        if g.is_some() {
+            return Some("late-busy"); // one late face at a time
+        }
+        *g = Some(Late { name, path: String::from(p), buf, n, passes: 0, t0: crate::arch::ms() });
+        serial_println!("[kfont] face {} {} late bytes={} chunk_kib={} (GLYPHSCARD B1010: read across the desktop service passes; the chain gains it when the last chunk lands)", name, p, n, LATE_CHUNK_PASS / 1024);
+        None
+    }
+
+    /// GLYPHSCARD (B1010): advance the late face by ONE short VFS read of at most `chunk` bytes (LATE taken by
+    /// `try_lock`: busy -> nothing). On the last chunk: take it, drop LATE, parse, add it under TT through `load`'s own path
+    /// (`insert_face` at its table row, `font_bytes`, the epoch and the damage, so the windows repaint once), and say so on one line.
+    pub fn late_pass(chunk: usize) {
+        let Some(mut g) = LATE.try_lock() else { return };
+        let Some(l) = g.as_mut() else { return };
+        let mt = crate::shell::vfs_mount_table();
+        let at = l.buf.len();
+        let want = (l.n - at).min(chunk.max(1));
+        match mt.read(&l.path, at as u64, want) {
+            Ok(b) if !b.is_empty() => {
+                let k = b.len().min(l.n - at);
+                l.buf.extend_from_slice(&b[..k]);
+                l.passes += 1;
+            }
+            r => {
+                let why = if r.is_ok() { "late-short" } else { "late-read" };
+                serial_println!("[kfont] face {} {} reason={} at={}/{}", l.name, l.path, why, at, l.n);
+                *g = None;
+                return;
+            }
+        }
+        if l.buf.len() < l.n {
+            return;
+        }
+        let Some(l) = g.take() else { return };
+        drop(g);
+        let len = l.buf.len();
+        let data: &'static [u8] = alloc::boxed::Box::leak(l.buf.into_boxed_slice());
+        let f = match Font::parse(data) {
+            Ok(f) => f,
+            Err(_) => {
+                serial_println!("[kfont] face {} {} reason=parse (late)", l.name, l.path);
+                return;
+            }
+        };
+        #[cfg(feature = "selfdiag")]
+        super::resident_note(&l.path, data);
+        let added = match TT.lock().as_mut() {
+            Some(t) => {
+                t.eng.insert_face(super::late_table_slot(&t.eng, l.name), l.name, Role::Script, false, f);
+                t.font_bytes += len;
+                let mut st = t.styles[2].0;
+                st.bold = false;
+                Some((t.eng.face_count(), t.eng.chain_names(&st).join(">")))
+            }
+            None => None,
+        };
+        let Some((n, chain)) = added else { return };
+        serial_println!(
+            "[kfont] late face={} file={} bytes={} passes={} ms={} faces={}/{} chain={}>font8x8",
+            l.name, l.path, len, l.passes, crate::arch::ms().saturating_sub(l.t0), n, FACES.len(), chain
+        );
+        super::EPOCH.fetch_add(1, Ordering::AcqRel);
+        let _ = crate::video::wm::damage_intersecting(0, 0, 1 << 16, 1 << 16);
+    }
+
+    /// GLYPHSCARD (B1010): the late face in flight: (wire name, bytes read, bytes wanted).
+    pub fn late_status() -> Option<(&'static str, usize, usize)> {
+        LATE.lock().as_ref().map(|l| (l.name, l.buf.len(), l.n))
+    }
+
     pub fn service() {
         if READY.load(Ordering::Acquire) {
-            follow_prefs();
+            late_pass(LATE_CHUNK_PASS); follow_prefs(); // GLYPHSCARD (B1010): the late face's one chunk first
             return;
         }
         if GAVE_UP.load(Ordering::Relaxed) {
@@ -700,6 +803,7 @@ mod tt {
                         Err(_) => Some("parse"),
                     }
                 }
+                Err("late") => late_queue(mt, name, &p), // GLYPHSCARD (B1010): queued (None), or its refusal named below
                 Err(e) => Some(e),
             };
             if let Some(w) = why {
@@ -1203,6 +1307,12 @@ fn glyphs_fixture() {
         serial_println!(":: GLYPHS: arabic=fail devanagari=fail cjk=fail thai=fail notdef=0 rtl=fail pseudo_clipped=0 -> FAIL :: (no face loaded from {}: see the [kfont] load line)", DIR);
         return;
     }
+    // GLYPHSCARD (B1010): a face still being read late (the CJK collection) is driven here, bounded at 20 s, on this worker.
+    let t_late = crate::arch::ms();
+    while tt::late_status().is_some() && crate::arch::ms().saturating_sub(t_late) < 20_000 {
+        tt::late_pass(tt::LATE_CHUNK_WAIT);
+        crate::arch::sched::yield_now();
+    }
     let face = Face::Ui;
     let ch = face.cell_h().max(1);
     const W: usize = 1536;
@@ -1287,11 +1397,42 @@ fn glyphs_fixture() {
         "[glyphs] pseudo labels={} expand=+40% clipped={} worst={}:\"{}\" pseudo_w={} box={} fill={}.{}%",
         boxes.len(), clipped, worst.1, worst.2, worst.3, worst.4, worst.0 / 10, worst.0 % 10
     );
-    let pass = words.iter().all(|&w| w == "ok") && notdef_all == 0 && rtl_ok && clipped == 0 && !boxes.is_empty();
+    let co = chain_order_ok(&chain); let pass = words.iter().all(|&w| w == "ok") && notdef_all == 0 && rtl_ok && clipped == 0 && !boxes.is_empty() && co;
+    let tail = if pass { String::new() } else { glyphs_want_tail(&words, &names) }; // GLYPHSCARD (B1010): FAIL only; the PASS line is unchanged
     serial_println!(
-        ":: GLYPHS: arabic={} devanagari={} cjk={} thai={} notdef={} rtl={} pseudo_clipped={} -> {} ::",
-        words[0], words[1], words[2], words[3], notdef_all, if rtl_ok { "ok" } else { "fail" }, clipped, if pass { "PASS" } else { "FAIL" }
+        ":: GLYPHS: arabic={} devanagari={} cjk={} thai={} notdef={} rtl={} pseudo_clipped={} chain_order={} -> {} ::{}",
+        words[0], words[1], words[2], words[3], notdef_all, if rtl_ok { "ok" } else { "fail" }, clipped, if co { "ok" } else { "bad" }, if pass { "PASS" } else { "FAIL" }, tail
     );
+}
+
+/// GLYPHSCARD (B1010): the `tt::FACES` wire name of the face each [`GLYPH_LINES`] script is drawn with.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+const GLYPH_FACE: [(&str, &str); 4] = [("arabic", "noto-arabic"), ("devanagari", "noto-devanagari"), ("cjk", "noto-cjk"), ("thai", "noto-thai")];
+
+/// GLYPHSCARD (B1010): the GLYPHS FAIL tail — per script that is not `ok`, the face file it wants, whether that file is
+/// on the volume (`DIR` or `DIR_CARD`) and whether the engine holds it (or how far its late read got):
+/// ` cjk want=NotoSansCJK-Regular.ttc found=<y|n> loaded=<y|n|late(<kib>/<kib>)>`.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+fn glyphs_want_tail(words: &[&str; 4], names: &[&'static str]) -> alloc::string::String {
+    let mt = crate::shell::vfs_mount_table();
+    let mut s = alloc::string::String::new();
+    for (i, (key, _)) in GLYPH_LINES.iter().enumerate() {
+        if words.get(i).copied() == Some("ok") {
+            continue;
+        }
+        let Some(&(_, face)) = GLYPH_FACE.iter().find(|g| g.0 == *key) else { continue };
+        let file = tt::FACES.iter().find(|r| r.1 == face).map_or("?", |r| r.0);
+        let found = [DIR, DIR_CARD].iter().any(|d| mt.stat(&alloc::format!("{}/{}", d, file)).is_ok());
+        let loaded = if names.contains(&face) {
+            alloc::string::String::from("y")
+        } else if let Some((_, got, n)) = tt::late_status().filter(|l| l.0 == face) {
+            alloc::format!("late({}/{})", got / 1024, n / 1024)
+        } else {
+            alloc::string::String::from("n")
+        };
+        s.push_str(&alloc::format!(" {} want={} found={} loaded={}", key, file, if found { "y" } else { "n" }, loaded));
+    }
+    s
 }
 
 // ------------------------------------------------------------------------------------------------ FONTKIT (B730)
@@ -1435,4 +1576,32 @@ pub mod textscale {
         }
         None
     }
+}
+
+// ------------------------------------------------------------------------------------------------ GLYPHSCHAINORDER (B1027)
+// The file tail again (no line above moves): the late face's slot at its `tt::FACES` row, and the GLYPHS chain-order leg.
+
+/// GLYPHSCHAINORDER (rmbp-ledger B1027; BP-video-19): the slot a late face `name` takes in the engine — the count of loaded
+/// slots whose `tt::FACES` row comes before `name`'s row — so the chain keeps the table's ORDER (noto-cjk before DejaVu),
+/// never the load's arrival order. A name not in the table goes to the end.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+fn late_table_slot(eng: &font_core::ui::Engine<'_>, name: &str) -> usize {
+    let row = |n: &str| tt::FACES.iter().position(|r| r.1 == n);
+    let Some(at) = row(name) else { return eng.face_count() };
+    eng.slots().iter().filter(|s| row(s.name).is_some_and(|i| i < at)).count()
+}
+
+/// GLYPHSCHAINORDER (B1027): `tests glyphs`' `chain_order=` — the chain after its role primary (`chain[0]`, which may be the
+/// stand-in `dejavu-sans`) names faces in strictly rising `tt::FACES` row order; a name not in the table is out of order.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+fn chain_order_ok(chain: &[&str]) -> bool {
+    let mut last: Option<usize> = None;
+    for n in chain.iter().skip(1) {
+        let Some(i) = tt::FACES.iter().position(|r| r.1 == *n) else { return false };
+        if last.is_some_and(|l| i <= l) {
+            return false;
+        }
+        last = Some(i);
+    }
+    true
 }

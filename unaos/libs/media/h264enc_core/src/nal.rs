@@ -134,6 +134,9 @@ pub fn avcc_record(sps: &[u8], pps: &[u8]) -> Vec<u8> {
     v.push(1);
     v.extend_from_slice(&(pps.len() as u16).to_be_bytes());
     v.extend_from_slice(pps);
+    if matches!(sps[1], 100 | 110 | 122 | 144) {
+        v.extend_from_slice(&[0xFC | 1, 0xF8, 0xF8, 0]); // §5.3.3.1 High: chroma_format 1, bit depths 8, no SPS extensions (SR322)
+    }
     v
 }
 

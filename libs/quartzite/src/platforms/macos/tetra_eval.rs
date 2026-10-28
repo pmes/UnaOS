@@ -41,12 +41,18 @@ pub fn eval_tetra(node: TetraNode, synapse: Synapse) -> Retained<NSView> {
         TetraNode::Button { id: _, label, action } => {
             super::button::bootstrap_button(&label, action, synapse)
         }
-        TetraNode::TextField { id: _, placeholder, action } => {
-            stretch(super::text_field::bootstrap_text_field(&placeholder, action, synapse), 0)
+        TetraNode::TextField { id: _, placeholder, action, secret } => {
+            // FACELIVE-URLBAR (SR443): the url-bar field's subscriber handle kept beside the Console / Surface ones
+            let (view, abort) = super::text_field::bootstrap_text_field(&placeholder, secret, action, synapse);
+            stretch(match abort { Some(a) => face_held((view, a)), None => view }, 0)
         }
         TetraNode::Surface { id } => {
             // Note: SurfaceBlit must target a Surface by id once >1 surface exists
-            stretch(super::image_view::bootstrap_image_surface(&id, synapse), 1)
+            stretch(face_held(super::image_view::bootstrap_image_surface_held(&id, synapse)), 1) // FACELIVE-SUBSCRIPTION-DROP (SR441): the subscriber's handle kept
+        }
+        TetraNode::Console(console) => {
+            // FACELIVE (SR435): the GTK twin's Console arm (the installer's status panes were blank placeholders here)
+            face_held(super::console_view::bootstrap_console_held(&console, synapse)) // FACELIVE-SUBSCRIPTION-DROP (SR441)
         }
         _ => {
             // Placeholder for unsupported nodes
@@ -80,4 +86,243 @@ fn stretch(view: Retained<NSView>, axis: isize) -> Retained<NSView> {
         let _: () = msg_send![&view, setContentCompressionResistancePriority: 1.0f32, forOrientation: axis];
     }
     view
+}
+
+// FACELIVE (LEDGER SR435): the face-push door's AppKit side. `new_tetra_vessel` evaluates through `eval_live`; a vessel's
+// `tetra::push_face` wakes `apply_face` on the main queue, which writes `tetra::take_face`'s patches into the views in
+// place (a Console's text, a field's placeholder with its typed text and focus kept, a stack's children, a leaf).
+
+thread_local! {
+    /// The live tree's root view and the bus its new nodes speak on (main thread).
+    static FACE_ROOT: std::cell::RefCell<Option<(Retained<NSView>, Synapse)>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Evaluate a tetra vessel's tree through the door (a push that beat the window wins) and keep its root for patches.
+pub fn eval_live(node: TetraNode, synapse: Synapse) -> Retained<NSView> {
+    let node = crate::tetra::open_face(node, std::sync::Arc::new(|| dispatch2::DispatchQueue::main().exec_async(apply_face)));
+    let view = crate::tetra::SurfaceMap::of(&node).scope(|| eval_tetra(node, synapse.clone()));
+    FACE_ROOT.with(|r| *r.borrow_mut() = Some((view.clone(), synapse)));
+    view
+}
+
+/// Whether `view` is a stack (it answers `arrangedSubviews`).
+fn face_is_stack(view: &NSView) -> bool {
+    let r: objc2::runtime::Bool = unsafe { msg_send![view, respondsToSelector: objc2::sel!(arrangedSubviews)] };
+    r.as_bool()
+}
+
+/// The `i`-th arranged subview of a stack view (None when `view` is no stack or holds fewer).
+fn face_child(view: &NSView, i: usize) -> Option<Retained<NSView>> {
+    if !face_is_stack(view) {
+        return None;
+    }
+    unsafe {
+        let subs: Retained<objc2_foundation::NSArray<NSView>> = msg_send![view, arrangedSubviews];
+        if i >= subs.count() {
+            return None;
+        }
+        Some(subs.objectAtIndex(i))
+    }
+}
+
+/// The view at `path` under `root`.
+fn face_view(root: &Retained<NSView>, path: &[usize]) -> Option<Retained<NSView>> {
+    let mut cur = root.clone();
+    for &i in path {
+        cur = face_child(&cur, i)?;
+    }
+    Some(cur)
+}
+
+/// Remove one arranged subview from its stack and from the view tree.
+unsafe fn face_unarrange(stack: &NSView, view: &NSView) {
+    unsafe {
+        let _: () = msg_send![stack, removeArrangedSubview: view];
+        let _: () = msg_send![view, removeFromSuperview];
+    }
+}
+
+/// Apply the door's pending tree on the main thread.
+fn apply_face() {
+    let Some((full, patches)) = crate::tetra::take_face() else { return };
+    let Some((root, synapse)) = FACE_ROOT.with(|r| r.borrow().clone()) else { return };
+    crate::tetra::SurfaceMap::of(&full).scope(|| {
+        // FACELIVE-FIELDMOVE (SR451): every patch's kept fields read before the first teardown (a keep's old path may lie
+        // under another patch), written after the last rebuild (patches are disjoint: the new paths hold then).
+        let held = face_keep_read(&root, &crate::tetra::face_keeps(&patches));
+        for patch in patches {
+            match patch {
+                crate::tetra::FacePatch::Lines { path, console } => {
+                    // The console view is a stack of [header label, level filters, scroll view over the text view].
+                    let Some(v) = face_view(&root, &path) else { continue };
+                    let (Some(header), Some(scroll)) = (face_child(&v, 0), face_child(&v, 2)) else { continue };
+                    unsafe {
+                        let s = objc2_foundation::NSString::from_str(&crate::widgets::console_rows::render_header(console.dropped, console.paused));
+                        let _: () = msg_send![&header, setStringValue: &*s];
+                        let doc: Option<Retained<NSView>> = msg_send![&scroll, documentView];
+                        if let Some(doc) = doc {
+                            let text = Retained::cast_unchecked::<objc2_app_kit::NSTextView>(doc);
+                            super::console_view::set_text(&text, &crate::widgets::console_rows::render_body(&console.lines), true);
+                        }
+                    }
+                }
+                crate::tetra::FacePatch::Field { path, node } => {
+                    let TetraNode::TextField { placeholder, .. } = node else { continue };
+                    let Some(field) = face_view(&root, &path) else { continue };
+                    let s = objc2_foundation::NSString::from_str(&placeholder);
+                    let _: () = unsafe { msg_send![&field, setPlaceholderString: &*s] };
+                }
+                crate::tetra::FacePatch::Restack { path, node, keep: _ } => {
+                    let Some(stack) = face_view(&root, &path) else { continue };
+                    let (vertical, children) = match node {
+                        TetraNode::VStack(c) => (true, c),
+                        TetraNode::HStack(c) => (false, c),
+                        _ => continue,
+                    };
+                    if !face_is_stack(&stack) {
+                        continue;
+                    }
+                    while let Some(c) = face_child(&stack, 0) {
+                        face_drop(&c); // FACELIVE-SUBSCRIPTION-DROP (SR441): the leaving view's subscribers end
+                        unsafe { face_unarrange(&stack, &c) };
+                    }
+                    unsafe {
+                        let s = Retained::cast_unchecked::<NSStackView>(stack.clone());
+                        let _: () = msg_send![&s, setOrientation: if vertical { 1isize } else { 0isize }];
+                        fill_stack(&s, if vertical { 7 } else { 0 });
+                        for child in children {
+                            let v = eval_tetra(child, synapse.clone());
+                            let _: () = msg_send![&s, addArrangedSubview: &*v];
+                        }
+                    }
+                }
+                crate::tetra::FacePatch::Replace { path, node, keep: _ } => {
+                    let Some((&last, parent_path)) = path.split_last() else {
+                        log::warn!("[quartzite] face root-leaf unpatched");
+                        continue;
+                    };
+                    let (Some(parent), Some(old)) = (face_view(&root, parent_path), face_view(&root, &path)) else { continue };
+                    let new = eval_tetra(node, synapse.clone());
+                    face_drop(&old); // FACELIVE-SUBSCRIPTION-DROP (SR441)
+                    unsafe {
+                        let _: () = msg_send![&parent, insertArrangedSubview: &*new, atIndex: last as isize];
+                        face_unarrange(&parent, &old);
+                    }
+                }
+            }
+        }
+        face_keep_write(&root, held); // FACELIVE-FIELDMOVE (SR451)
+    });
+}
+
+// FACELIVE-SUBSCRIPTION-DROP (LEDGER SR441): a Console or Surface leaf's bus subscriber (a task on its own thread's
+// current-thread runtime, started by `face_subscribe`) is kept here by its abort handle beside a weak ref to the view it
+// feeds; `face_drop` aborts every subscriber at or under a view leaving the tree (Restack, Replace), and any whose view
+// is already gone, so a restacking face leaks no thread.
+
+thread_local! {
+    /// Each subscribed view (weak: the table pins nothing) and its subscriber's abort handle (main thread).
+    static FACE_SUBS: std::cell::RefCell<Vec<(objc2::rc::Weak<NSView>, tokio::task::AbortHandle)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Run a bus subscription loop on its own named thread (the AppKit main thread has no tokio reactor; the loop hops back
+/// through GCD). The runtime is built here so the task's abort handle is returned at once; aborting it ends the thread.
+pub(super) fn face_subscribe(name: &str, fut: impl std::future::Future<Output = ()> + Send + 'static) -> tokio::task::AbortHandle {
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("subscription runtime");
+    let task = rt.spawn(fut);
+    let abort = task.abort_handle();
+    std::thread::Builder::new()
+        .name(name.into())
+        .spawn(move || {
+            let _ = rt.block_on(task);
+        })
+        .expect("spawn subscription thread");
+    abort
+}
+
+/// Keep a freshly built view's subscriber handle; the view passes through.
+fn face_held((view, abort): (Retained<NSView>, tokio::task::AbortHandle)) -> Retained<NSView> {
+    FACE_SUBS.with(|t| t.borrow_mut().push((objc2::rc::Weak::from_retained(&view), abort)));
+    view
+}
+
+/// Abort the subscribers of `old` and every view under it (run before `old` leaves its stack).
+fn face_drop(old: &NSView) {
+    let gone: Vec<tokio::task::AbortHandle> = FACE_SUBS.with(|t| {
+        let mut t = t.borrow_mut();
+        let mut gone = Vec::new();
+        let mut i = 0;
+        while i < t.len() {
+            let leaving = match t[i].0.load() {
+                // isDescendantOf: is YES for the view itself too.
+                Some(v) => {
+                    let r: objc2::runtime::Bool = unsafe { msg_send![&v, isDescendantOf: old] };
+                    r.as_bool()
+                }
+                None => true,
+            };
+            if leaving {
+                gone.push(t.swap_remove(i).1);
+            } else {
+                i += 1;
+            }
+        }
+        gone
+    });
+    if gone.is_empty() {
+        return;
+    }
+    let live = FACE_SUBS.with(|t| t.borrow().len());
+    log::debug!("[quartzite] face subscriptions dropped n={} live={}", gone.len(), live);
+    for abort in gone {
+        abort.abort();
+    }
+}
+
+// FACELIVE-FIELDKEEP (LEDGER SR444): a field under a Restack or Replace that the new subtree holds again keeps its typed
+// text and focus: the patch's `keep` names each field's old and new path; `stringValue` and a live field editor
+// (`currentEditor`, the url bar's own "user is typing" test) are read off the old view before the rebuild into a
+// ONE per-push local (SR451: every patch read before any teardown), and written into the new view after it (`setStringValue:`, the window's `makeFirstResponder:`).
+
+/// Whether `view` is a text field (it answers `currentEditor`).
+fn face_is_field(view: &NSView) -> bool {
+    let r: objc2::runtime::Bool = unsafe { msg_send![view, respondsToSelector: objc2::sel!(currentEditor)] };
+    r.as_bool()
+}
+
+/// The (new path, text, focused) of each kept field, read before its view leaves.
+fn face_keep_read(root: &Retained<NSView>, keep: &[crate::tetra::FaceKeep]) -> Vec<(Vec<usize>, String, bool)> {
+    keep.iter()
+        .filter_map(|k| {
+            let v = face_view(root, &k.old)?;
+            if !face_is_field(&v) {
+                return None;
+            }
+            unsafe {
+                let s: Retained<objc2_foundation::NSString> = msg_send![&v, stringValue];
+                let editor: *mut objc2::runtime::AnyObject = msg_send![&v, currentEditor];
+                Some((k.new.clone(), s.to_string(), !editor.is_null()))
+            }
+        })
+        .collect()
+}
+
+/// Write each held field's text (and focus) into the rebuilt view at its new path.
+fn face_keep_write(root: &Retained<NSView>, held: Vec<(Vec<usize>, String, bool)>) {
+    for (path, text, focus) in held {
+        let Some(v) = face_view(root, &path) else { continue };
+        if !face_is_field(&v) {
+            continue;
+        }
+        unsafe {
+            let s = objc2_foundation::NSString::from_str(&text);
+            let _: () = msg_send![&v, setStringValue: &*s];
+            if focus {
+                let window: Option<Retained<objc2::runtime::AnyObject>> = msg_send![&v, window];
+                if let Some(window) = window {
+                    let _: objc2::runtime::Bool = msg_send![&window, makeFirstResponder: &*v];
+                }
+            }
+        }
+    }
 }

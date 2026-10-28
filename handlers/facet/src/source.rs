@@ -17,8 +17,14 @@
 //! What pixel_core does not decode is REFUSED, by name, never silently handed to something else: a
 //! container it recognises but cannot read (lossy WebP until VP8CORE, SR40) answers
 //! [`SourceError::Decode`] carrying the format and pixel_core's reason; a container no UnaOS decoder
-//! recognises yet (TIFF, ICO, AVIF, HEIF, JPEG XL, ...) answers [`SourceError::Foreign`] naming it
+//! recognises yet (TIFF, ICO, AVIF and HEIF sequences, JPEG XL, ...) answers [`SourceError::Foreign`] naming it
 //! ([`unrecognised`]).
+//!
+//! HEVCHEIC (SR220): an HEIC still ([`Format::Heic`]: `ftyp` heic / heix, or mif1 without AVIF) is the one container
+//! pixel_core does not own: it decodes through `gneiss_pal::dsp::image::decode_heif` (demux_core's HEIF reader +
+//! hevc_core, 8- and 10-bit intra, COLOURONE SR328), and its refusals name `heic` the same way.
+//! HEIFONE (SR303): an AVIF still ([`Format::Avif`]: `ftyp` avif) decodes through the same `decode_heif` (demux_core's
+//! HEIF reader + av1_core), grids included; its refusals name `avif`.
 
 /// The formats [`ImageSource::sniff`] recognises (PIXELCORE's `Format`, same variants, same order).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -32,6 +38,10 @@ pub enum Format {
     /// SVG markup (pixel_core's `svg` route; the variant exists only when that feature is on, so the
     /// map below takes it through a catch-all — merge19: the workspace test build unifies the feature in).
     Svg,
+    /// HEVCHEIC (SR220): an HEIF still holding HEVC images (not a pixel_core format: [`sniff`] adds it).
+    Heic,
+    /// HEIFONE (SR303): an AVIF still (an HEIF still holding AV1 images; not a pixel_core format: [`sniff`] adds it).
+    Avif,
 }
 
 impl Format {
@@ -45,6 +55,8 @@ impl Format {
             Format::Qoi => "qoi",
             Format::WebP => "webp",
             Format::Svg => "svg",
+            Format::Heic => "heic",
+            Format::Avif => "avif",
         }
     }
 }
@@ -65,9 +77,13 @@ impl From<pixel_core::Format> for Format {
 }
 
 /// Identify a format by its magic bytes — PIXELCORE's own `sniff`, so Facet and its decoder can never
-/// disagree on what a file IS.
+/// disagree on what a file IS; then demux_core's HEIC and AVIF brand tests (HEVCHEIC SR220, HEIFONE SR303).
 pub fn sniff(bytes: &[u8]) -> Option<Format> {
-    pixel_core::sniff(bytes).map(Format::from)
+    use gneiss_pal::dsp::image::{is_avif, is_heic};
+    pixel_core::sniff(bytes)
+        .map(Format::from)
+        .or_else(|| is_heic(bytes).then_some(Format::Heic))
+        .or_else(|| is_avif(bytes).then_some(Format::Avif))
 }
 
 /// The name of a well-known image container that [`sniff`] does NOT accept, from its magic bytes —
@@ -138,6 +154,10 @@ pub struct Decoded {
     /// applies the orientation its own reader ([`crate::meta`]) finds — the authority, which also reads
     /// PNG `eXIf` and WebP `EXIF`; for JPEG the two are asserted to agree.
     pub orientation: u8,
+    /// METAICCONE (SR367): the embedded ICC profile as pixel_core surfaced it (`pixel_core::Image::icc`: PNG iCCP
+    /// inflated, JPEG APP2 joined, WebP ICCP), else `None`. REPORTED: the pixels above are already sRGB
+    /// ([`PixelCoreSource`] converted them); Facet's info label reads it ([`crate::meta::icc`]).
+    pub icc: Option<Vec<u8>>,
 }
 
 impl From<pixel_core::Image> for Decoded {
@@ -149,6 +169,7 @@ impl From<pixel_core::Image> for Decoded {
             frames: i.frames.map(|v| v.into_iter().map(|f| Frame { delay_ms: f.delay_ms, rgba: f.rgba }).collect()),
             loop_count: i.loop_count,
             orientation: i.orientation,
+            icc: i.icc,
         }
     }
 }
@@ -211,7 +232,8 @@ impl ImageSource for PixelCoreSource {
 
     fn decode(&self, bytes: &[u8]) -> Result<Decoded, SourceError> {
         let format = self.sniff(bytes).ok_or_else(|| unrecognised(bytes))?.name();
-        pixel_core::decode(bytes).map(Decoded::from).map_err(|e| match e {
+        let decoded = if format == "heic" || format == "avif" { gneiss_pal::dsp::image::decode_heif(bytes) } else { pixel_core::decode(bytes) };
+        decoded.map(icc_to_srgb).map(Decoded::from).map_err(|e| match e {
             pixel_core::Error::UnknownFormat => unrecognised(bytes),
             pixel_core::Error::TooLarge => SourceError::TooLarge { format },
             e => SourceError::Decode { format, reason: e.to_string() },
@@ -225,10 +247,14 @@ mod tests {
 
     #[test]
     fn foreign_containers_are_named() {
-        let mut avif = vec![0, 0, 0, 0x1C];
-        avif.extend(b"ftypavif\0\0\0\0avifmif1miaf");
-        let mut heic = vec![0, 0, 0, 0x18];
-        heic.extend(b"ftypheic\0\0\0\0mif1heic");
+        // HEIFONE (SR303): an AVIF still is Facet's own now (avif_stills_decode_through_heif); an AVIF image SEQUENCE
+        // (avis without the avif brand) stays foreign.
+        let mut avif = vec![0, 0, 0, 0x18];
+        avif.extend(b"ftypavis\0\0\0\0avismsf1");
+        // HEVCHEIC (SR220): a heic still is Facet's own now (heic_is_sniffed_and_refusals_name_heic); an HEIF image
+        // SEQUENCE stays foreign.
+        let mut heis = vec![0, 0, 0, 0x18];
+        heis.extend(b"ftypmsf1\0\0\0\0heismsf1");
         let mut mp4 = vec![0, 0, 0, 0x14];
         mp4.extend(b"ftypisom\0\0\0\0mp41");
         let cases: &[(&[u8], Option<&str>)] = &[
@@ -237,7 +263,7 @@ mod tests {
             (b"\0\0\x01\0\x01\0\x10\x10", Some("ico")),
             (b"\0\0\x02\0\x01\0\x10\x10", Some("cur")),
             (&avif, Some("avif")),
-            (&heic, Some("heif")),
+            (&heis, Some("heif")),
             (&mp4, None),
             (b"\xFF\x0A\xFA\x7F", Some("jpeg xl")),
             (b"\0\0\0\x0CJXL \r\n\x87\n", Some("jpeg xl")),
@@ -305,4 +331,159 @@ mod tests {
         assert_eq!(e, SourceError::TooLarge { format: "qoi" });
         assert_eq!(e.to_string(), "qoi: dimensions too large");
     }
+
+    #[test]
+    fn heic_is_sniffed_and_refusals_name_heic() {
+        let mut heic = vec![0, 0, 0, 0x18];
+        heic.extend(b"ftypheic\0\0\0\0mif1heic");
+        assert_eq!(foreign_format(&heic), Some("heif"), "the name table still knows the container");
+        assert_eq!(sniff(&heic), Some(Format::Heic));
+        // An ftyp and nothing else: no meta box, refused by name as heic.
+        let e = PixelCoreSource.decode(&heic).unwrap_err();
+        assert!(matches!(&e, SourceError::Decode { format: "heic", reason } if reason.contains("no meta")), "{e:?}");
+        assert!(e.to_string().starts_with("heic: "), "{e}");
+    }
+
+    /// COLOURONE (SR328): Facet opens a 10-bit (Main 10) HEIC, converted from its 16-bit samples (HEVCHEIC-MAIN10).
+    #[test]
+    fn colourone_facet_opens_a_ten_bit_heic() {
+        use gneiss_pal::dsp::image::{decode_heif, heic_kat};
+        let bytes = heic_kat::main10_heic();
+        assert_eq!(sniff(&bytes), Some(Format::Heic));
+        let d = PixelCoreSource.decode(&bytes).unwrap();
+        assert_eq!((d.width, d.height, d.frames.is_none()), (32, 32, true));
+        assert_eq!(d.rgba, decode_heif(&bytes).unwrap().rgba);
+        assert!(d.rgba.chunks_exact(4).all(|p| p == [87, 145, 176, 255]), "{:?}", &d.rgba[..4]);
+        let (_, info) = crate::Facet::new().open_bytes("main10.heic", &bytes).unwrap();
+        assert_eq!((info.width, info.height), (32, 32));
+    }
+
+    #[test]
+    fn heic_stills_decode_through_hevc_core() {
+        use gneiss_pal::dsp::image::{decode_heif, heic_kat};
+        let mut f = crate::Facet::new();
+        for (bytes, w, h) in [(heic_kat::flat_heic(), 64, 48), (heic_kat::pcm_heic(), 64, 48), (heic_kat::grid_2x2_heic(), 120, 90)] {
+            let d = PixelCoreSource.decode(&bytes).unwrap();
+            assert_eq!((d.width, d.height, d.frames.is_none(), d.loop_count, d.orientation), (w, h, true, None, 1));
+            assert_eq!(d.rgba, decode_heif(&bytes).unwrap().rgba);
+            let (_, info) = f.open_bytes("kat.heic", &bytes).unwrap();
+            assert_eq!((info.format.as_str(), info.width, info.height), ("heic", w, h));
+        }
+        // The flat picture: Y = Cb = Cr = 128, BT.601 limited -> grey 130.
+        let flat = PixelCoreSource.decode(&heic_kat::flat_heic()).unwrap();
+        assert!(flat.rgba.chunks_exact(4).all(|p| p == [130, 130, 130, 255]));
+        // The PCM picture's gradient: luma 7x + 3y at the top-left block, e.g. (0,0) Y=0 and (31,31) Y=310 mod 256.
+        let pcm = PixelCoreSource.decode(&heic_kat::pcm_heic()).unwrap();
+        let grid = PixelCoreSource.decode(&heic_kat::grid_2x2_heic()).unwrap();
+        // The grid's top-right quadrant is the PCM tile, its bottom-right the flat one.
+        let at = |d: &Decoded, x: usize, y: usize| d.rgba[(y * d.width as usize + x) * 4..][..4].to_vec();
+        for (x, y) in [(0, 0), (31, 31), (10, 40), (55, 47)] {
+            assert_eq!(at(&grid, 64 + x, y), at(&pcm, x, y), "({x},{y})");
+            assert_eq!(at(&grid, x, 48 + y.min(41)), at(&pcm, x, y.min(41)));
+            assert_eq!(at(&grid, 64 + x, 48 + y.min(41)), at(&flat, x, y.min(41)));
+        }
+        assert_ne!(at(&pcm, 0, 0), at(&pcm, 31, 0), "the PCM block is a gradient, not flat");
+    }
+
+    #[test]
+    fn avif_stills_decode_through_heif() {
+        use gneiss_pal::dsp::image::{avif_kat, decode_heif};
+        let mut f = crate::Facet::new();
+        for (bytes, w, h) in [(avif_kat::white_avif(), 1, 1), (avif_kat::pixi_avif(), 4, 4), (avif_kat::grid_2x2_avif(), 7, 6)] {
+            assert_eq!(sniff(&bytes), Some(Format::Avif));
+            let d = PixelCoreSource.decode(&bytes).unwrap();
+            assert_eq!((d.width, d.height, d.frames.is_none(), d.loop_count, d.orientation), (w, h, true, None, 1));
+            assert_eq!(d.rgba, decode_heif(&bytes).unwrap().rgba);
+            let (_, info) = f.open_bytes("kat.avif", &bytes).unwrap();
+            assert_eq!((info.format.as_str(), info.width, info.height), ("avif", w, h));
+        }
+        // An AVIF ftyp and nothing else: no meta box, refused by name as avif (no longer Foreign).
+        let mut avif = vec![0, 0, 0, 0x1C];
+        avif.extend(b"ftypavif\0\0\0\0avifmif1miaf");
+        assert_eq!(foreign_format(&avif), Some("avif"), "the name table still knows the container");
+        let e = PixelCoreSource.decode(&avif).unwrap_err();
+        assert!(matches!(&e, SourceError::Decode { format: "avif", reason } if reason.contains("no meta")), "{e:?}");
+        assert!(e.to_string().starts_with("avif: "), "{e}");
+    }
+
+    /// A JPEG of a flat (200, 100, 50) 16 x 16 picture (the `image` crate's encoder at quality 100), and the same file
+    /// with `profile` spliced in as one APP2 ICC_PROFILE segment right after SOI.
+    fn pdficc_jpegs(profile: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        let img = image::RgbImage::from_pixel(16, 16, image::Rgb([200, 100, 50]));
+        let mut plain = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut plain, 100).encode_image(&img).unwrap();
+        let mut tagged = plain[..2].to_vec();
+        tagged.extend([0xFF, 0xE2]);
+        tagged.extend(((profile.len() + 16) as u16).to_be_bytes());
+        tagged.extend(b"ICC_PROFILE\0\x01\x01");
+        tagged.extend(profile);
+        tagged.extend(&plain[2..]);
+        (plain, tagged)
+    }
+
+    #[test]
+    fn pdficc_adobe_rgb_jpeg_opens_converted() {
+        // PDFICC (SR358): an Adobe RGB JPEG opens converted to sRGB — every pixel is icc_core's transform of the
+        // untagged decode, and the flat (200, 100, 50) lands on numpy's (227.065, 100.067, 42.350) within the JPEG's own
+        // rounding.
+        let profile = icc_core::kat::adobe_rgb_v2();
+        let (plain, tagged) = pdficc_jpegs(&profile);
+        let raw = PixelCoreSource.decode(&plain).unwrap();
+        let open = PixelCoreSource.decode(&tagged).unwrap();
+        let mut want = raw.rgba.clone();
+        icc_core::Transform::from_icc(&profile).unwrap().apply_rgba(&mut want);
+        assert_eq!(open.rgba, want);
+        assert_ne!(open.rgba, raw.rgba);
+        let c = &open.rgba[(8 * 16 + 8) * 4..][..4];
+        assert!(c[0].abs_diff(227) <= 2 && c[1].abs_diff(100) <= 2 && c[2].abs_diff(42) <= 2 && c[3] == 255, "{c:?}");
+        let (_, info) = crate::Facet::new().open_bytes("adobe.jpg", &tagged).unwrap();
+        assert_eq!((info.format.as_str(), info.width, info.height), ("jpeg", 16, 16));
+    }
+
+    #[test]
+    fn pdficc_untagged_open_is_byte_identical() {
+        // An untagged file and an sRGB-tagged one open exactly as pixel_core decodes them (the is_srgb short-circuit).
+        let (plain, srgb) = pdficc_jpegs(&icc_core::kat::srgb_v2());
+        let raw = pixel_core::decode(&plain).unwrap().rgba;
+        assert_eq!(PixelCoreSource.decode(&plain).unwrap().rgba, raw);
+        assert_eq!(PixelCoreSource.decode(&srgb).unwrap().rgba, raw);
+        // A profile icc_core refuses keeps the decoded pixels (sRGB assumed, as before PDFICC).
+        let (_, named) = pdficc_jpegs(&icc_core::kat::named_colour());
+        assert_eq!(PixelCoreSource.decode(&named).unwrap().rgba, raw);
+    }
+
+    #[test]
+    fn metaiccone_label_from_the_decoded_profile() {
+        // METAICCONE (SR367): the info label of a tagged JPEG comes from the ONE decode's profile (pixel_core's APP2 join,
+        // carried as Decoded::icc) and icc_core's `desc` reader: a v4 `mluc` description, the profile's byte count.
+        use icc_core::kat;
+        let wtpt = (*b"wtpt", kat::xyz_tag([0.9642, 1.0, 0.8249]));
+        let profile = kat::profile(4, b"mntr", b"GRAY", b"XYZ ", &[wtpt, (*b"kTRC", kat::curv_gamma(1.8)), (*b"desc", kat::mluc("Gray 1.8 v4"))]);
+        let (plain, tagged) = pdficc_jpegs(&profile);
+        assert_eq!(PixelCoreSource.decode(&tagged).unwrap().icc.as_deref(), Some(&profile[..]));
+        assert_eq!(PixelCoreSource.decode(&plain).unwrap().icc, None);
+        let (_, info) = crate::Facet::new().open_bytes("gray.jpg", &tagged).unwrap();
+        assert_eq!(info.colour, format!("ICC profile 'Gray 1.8 v4' ({} bytes)", profile.len()));
+        let (_, info) = crate::Facet::new().open_bytes("plain.jpg", &plain).unwrap();
+        assert_eq!(info.colour, "untagged (assumed sRGB)");
+    }
+}
+
+/// PDFICC (SR358): convert a decoded image tagged with an embedded ICC profile to sRGB — the first frame and every
+/// animation frame, through ONE icc_core `Transform` (an sRGB profile is left untouched). A refused profile is logged and
+/// the pixels stay as decoded (sRGB assumed). Facet works in sRGB from here on (view, adjust, the `sRGB`-tagged export).
+fn icc_to_srgb(mut i: pixel_core::Image) -> pixel_core::Image {
+    let Some(icc) = i.icc.take() else { return i };
+    match icc_core::Transform::for_rgba(&icc) {
+        Ok(None) => {}
+        Ok(Some(xf)) => {
+            xf.apply_rgba(&mut i.rgba);
+            for f in i.frames.iter_mut().flatten() {
+                xf.apply_rgba(&mut f.rgba);
+            }
+        }
+        Err(e) => log::warn!("[FACET] :: icc refused: {e} (kept as sRGB)"),
+    }
+    i.icc = Some(icc); // METAICCONE (SR367): the profile stays REPORTED on the decoded image (Decoded::icc, meta's label)
+    i
 }

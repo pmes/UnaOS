@@ -6,6 +6,7 @@
 //! lies outside the picture, across a slice boundary the loop filters may not cross, or across a tile boundary when
 //! loop_filter_across_tiles_enabled_flag is 0, is left as it is). Applied where the CTB's slice has slice_sao_luma_flag /
 //! slice_sao_chroma_flag; pcm (with pcm_loop_filter_disabled_flag) and transquant bypass samples are left as they are.
+//! HEVCREXTTOOLS (SR345): SaoOffsetVal arrives already shifted by log2_sao_offset_scale_luma / _chroma (ctu.rs `sao`).
 
 use crate::picture::{Picture, F_BYPASS, F_PCM, NO_SLICE};
 use crate::ps::{Geometry, Pps, Sps};
@@ -38,20 +39,21 @@ pub fn sao_picture(pic: &mut Picture, geo: &Geometry, sps: &Sps, pps: &Pps) {
             if ty == 0 || (c == 0 && !info.sao_luma) || (c > 0 && !info.sao_chroma) {
                 continue;
             }
-            let scale = if c == 0 { 1 } else { 2 };
+            // HEVCREXT (SR334): the component's CTB is CtbSizeY / SubWidthC x CtbSizeY / SubHeightC.
+            let (sw, sh) = if c == 0 { (1, 1) } else { pic.chroma.sub() };
             let bd = if c == 0 { sps.bit_depth_luma } else { sps.bit_depth_chroma };
             let max = (1i32 << bd) - 1;
             let pl = &src[c];
-            let size = (1usize << log2) / scale;
-            let (x0, y0) = (rx * size, ry * size);
+            let (size_w, size_h) = ((1usize << log2) / sw, (1usize << log2) / sh);
+            let (x0, y0) = (rx * size_w, ry * size_h);
             let mut band_table = [0usize; 32];
             for k in 0..4 {
                 band_table[(k + params.band_position[c] as usize) & 31] = k + 1;
             }
             let off = params.offset_val[c];
-            for y in y0..(y0 + size).min(pl.h) {
-                for x in x0..(x0 + size).min(pl.w) {
-                    let (xl, yl) = (x * scale, y * scale);
+            for y in y0..(y0 + size_h).min(pl.h) {
+                for x in x0..(x0 + size_w).min(pl.w) {
+                    let (xl, yl) = (x * sw, y * sh);
                     let fi = pic.flags[pic.idx4(xl, yl)];
                     if (fi & F_PCM != 0 && pcm_lf_off) || fi & F_BYPASS != 0 {
                         continue;
@@ -68,7 +70,7 @@ pub fn sao_picture(pic: &mut Picture, geo: &Geometry, sps: &Sps, pps: &Pps) {
                                 skip = true;
                                 break;
                             }
-                            let (xnl, ynl) = (xn as usize * scale, yn as usize * scale);
+                            let (xnl, ynl) = (xn as usize * sw, yn as usize * sh);
                             let cn = geo.ctb_rs(xnl as u32, ynl as u32);
                             let sn = pic.ctb_slice[cn as usize];
                             if sn == NO_SLICE {
@@ -104,7 +106,7 @@ pub fn sao_picture(pic: &mut Picture, geo: &Geometry, sps: &Sps, pps: &Pps) {
                         continue;
                     }
                     let v = (cur + off[idx] as i32).clamp(0, max);
-                    pic.planes[c].set(x, y, v as u8);
+                    pic.planes[c].set(x, y, v as u16);
                 }
             }
         }

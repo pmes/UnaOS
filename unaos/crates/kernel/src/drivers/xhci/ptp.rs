@@ -992,7 +992,7 @@ impl XhciController {
     /// bounded chunk per pass. Idempotent no-op without a camera.
     pub fn service_ptp(&mut self) {
         let slot = SLOT.load(Ordering::Relaxed);
-        if slot == 0 {
+        if slot == 0 || TXN_YIELDED.load(Ordering::Acquire) { // XHCILOANPTPYIELD (Z73): a pass that took the controller inside a PTP yield window issues no PTP command
             return;
         }
         match STATE.load(Ordering::Relaxed) {
@@ -1355,7 +1355,7 @@ impl XhciController {
         *EV_RING.lock() = Some(ring);
         if EV_BUF.load(Ordering::Relaxed) == 0 {
             let l = core::alloc::Layout::from_size_align(64, 64).unwrap();
-            let p = unsafe { alloc::alloc::alloc_zeroed(l) };
+            let p = crate::arch::memory::dma::ident(l.size(), l.align()) as *mut u8;
             if p.is_null() {
                 return false;
             }
@@ -1511,17 +1511,22 @@ impl XhciController {
                 all[0..4].copy_from_slice(&(if total > u32::MAX as usize { u32::MAX } else { total as u32 }).to_le_bytes());
                 let mps = OUT_MPS.load(Ordering::Relaxed) as usize;
                 let (mut sent, mut n) = (first, codec::HDR + first);
+                let mut ty = YieldTally::default(); // XHCILOANPTPYIELDOUT (Z94): this send's yields, Z73's tally
                 loop {
                     let last = sent >= data.len();
                     self.ptp_xfer(slot, false, phys, n, last && mps != 0 && total % mps == 0)?;
                     if last {
                         break;
                     }
+                    ty.step(self)?; // XHCILOANPTPYIELDOUT (Z94): Z73's ONE yield point, between two TDs of the Out data phase (nothing armed; the next chunk is copied after the re-take)
                     let k = (data.len() - sent).min(XFER_MAX);
                     let all = unsafe { core::slice::from_raw_parts_mut(buf, XFER_MAX) };
                     all[..k].copy_from_slice(&data[sent..sent + k]);
                     sent += k;
                     n = k;
+                }
+                if data.len() > (8 << 20) {
+                    ty.say("ptp-out"); // XHCILOANPTPYIELDOUT (Z94): Z73's line for a send (SendObject's data phase)
                 }
             }
             Phase::In { cap, into } => {
@@ -1545,6 +1550,7 @@ impl XhciController {
                 let mut got = n as u64;
                 let mut short = n < XFER_MAX;
                 let mps = (IN_MPS.load(Ordering::Relaxed) as usize).max(64);
+                let mut ty = YieldTally::default(); // XHCILOANPTPYIELDOUT (Z94): Z73's tally (yields, windows taken, Z82's poll closes, Z87's PTP closes, the longest), shared with the Out arm
                 while !short && (unknown || got < total) {
                     let want = if unknown {
                         XFER_MAX
@@ -1557,6 +1563,13 @@ impl XhciController {
                     keep(into, b);
                     got += k as u64;
                     short = k < want;
+                    if !short && (unknown || got < total) {
+                        // XHCILOANPTPYIELD (Z73): the ONE yield point — between two TDs of the data phase (nothing armed).
+                        ty.step(self)?; // XHCILOANPTPYIELDOUT (Z94): Z73's `loan_yield` and its accrual, in `YieldTally::step`
+                    }
+                }
+                if got > (8 << 20) {
+                    ty.say("ptp"); // XHCILOANPTPYIELDOUT (Z94): Z73's line, byte-identical (`who=ptp`)
                 }
                 if !unknown && got < total {
                     return Err("data phase short");
@@ -1841,31 +1854,163 @@ pub fn list(storage: Option<u32>, handle: Option<u32>) -> Vec<Row> {
 
 // ── Callers outside the controller: the loan ───────────────────────────────────────────────────────
 
-/// Run `f` with the controller loaned, waiting (bounded, unmasked only) the way the block layer does.
+/// Run `f` with the controller loaned through the block layer's ONE claim path, claim-only (XHCILOANPTPCOPY, zenbook-ledger
+/// Z69: `BlockLoan::claim_only` — the bounded unmasked wait is `claim_xhci_for_io`'s; a PTP hold is never preempt-off).
 fn with_controller<T>(f: impl FnOnce(&mut XhciController) -> Result<T, &'static str>) -> Result<T, &'static str> {
-    let mut loan = match super::claim() {
-        Ok(l) => l,
-        Err(super::XhciClaimError::NotReady) => return Err("no USB controller"),
-        Err(super::XhciClaimError::Busy) => {
-            if crate::arch::irqs_masked() {
-                return Err("USB busy");
-            }
-            let start = crate::arch::now_cycles();
-            let budget = crate::arch::hw_wait_budget();
-            loop {
-                crate::hlt();
-                match super::claim() {
-                    Ok(l) => break l,
-                    Err(super::XhciClaimError::NotReady) => return Err("no USB controller"),
-                    Err(super::XhciClaimError::Busy) => {}
-                }
-                if crate::arch::now_cycles().wrapping_sub(start) >= budget {
-                    return Err("USB busy");
-                }
-            }
-        }
+    let mut loan = crate::drivers::block::BlockLoan::claim_only().map_err(|e| match e {
+        crate::drivers::block::BlockError::NotReady => "no USB controller",
+        crate::drivers::block::BlockError::Busy => "USB busy",
+        _ => "USB error",
+    })?;
+    if TXN_YIELDED.load(Ordering::Acquire) {
+        return Err("USB busy"); // XHCILOANPTPYIELD (Z73): this claim came inside another hold's yield window — the loan goes straight back (its Drop)
+    }
+    YIELD_LOAN.store(&mut loan as *mut crate::drivers::block::BlockLoan, Ordering::Release);
+    let r = f(&mut *loan);
+    YIELD_LOAN.store(core::ptr::null_mut(), Ordering::Release);
+    r
+}
+
+/// XHCILOANPTPYIELD (zenbook-ledger Z73): the live `with_controller` hold's loan (null otherwise), reached by the ONE
+/// yield point in `ptp_txn_inner`'s Phase::In loop.
+static YIELD_LOAN: core::sync::atomic::AtomicPtr<crate::drivers::block::BlockLoan> =
+    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+/// XHCILOANPTPYIELD: a PTP transaction is open across a yield window (the loan is out): `service_ptp` returns at once and
+/// a `with_controller` claim taken in the window is refused.
+pub(crate) static TXN_YIELDED: AtomicBool = AtomicBool::new(false);
+
+/// XHCILOANPTPYIELD: hand the hold's loan back between two TDs (`BlockLoan::yield_now`) when one is due (or `force`, the
+/// KAT). `Ok(None)` = no yield (no `with_controller` hold, inside a window, masked, not due, or `c` is not the loan's
+/// controller); `Ok(Some((µs, taken)))`; `Err` = the loan was not re-taken (the caller must not touch `c` again).
+/// `c` is passed in and this is never inlined, so the controller is treated as touched across the window.
+#[inline(never)]
+fn loan_yield(c: &mut XhciController, force: bool) -> Result<Option<(u64, bool)>, &'static str> {
+    let p = YIELD_LOAN.load(Ordering::Acquire);
+    if p.is_null() || TXN_YIELDED.load(Ordering::Acquire) || crate::arch::irqs_masked() {
+        return Ok(None);
+    }
+    if !force && !crate::drivers::block::BlockLoan::yield_due() {
+        return Ok(None);
+    }
+    // SAFETY: `p` is the loan `with_controller` keeps on this task's stack for the whole of `f`, and this is reached only
+    // from inside `f` (one hold at a time: a claim inside a window is refused before it stores `YIELD_LOAN`).
+    let loan = unsafe { &mut *p };
+    let mine: *const XhciController = &***loan;
+    if !core::ptr::eq(mine, &*c as *const XhciController) {
+        return Ok(None);
+    }
+    TXN_YIELDED.store(true, Ordering::Release);
+    core::sync::atomic::compiler_fence(Ordering::SeqCst);
+    let r = loan.yield_now();
+    core::sync::atomic::compiler_fence(Ordering::SeqCst);
+    TXN_YIELDED.store(false, Ordering::Release);
+    match r {
+        Ok((0, false)) => Ok(None),
+        Ok(v) => Ok(Some(v)),
+        Err(_) => Err("loan not re-taken after yield"),
+    }
+}
+
+/// XHCILOANPTPYIELDKATRULE (Z88): windows the KAT offered (`ptp_yield_windows=` on the PREEMPTAUDIT line). Written only
+/// by the KAT's task: reset at `loan_path_kat`'s start (0 when the KAT did not reach a window), bumped per offered window.
+static YIELD_KAT_SPENT: AtomicU32 = AtomicU32::new(0);
+
+/// XHCILOANPTPYIELD KAT: a block claimant armed on a sibling CPU (x86), then a forced yield that it must take.
+/// XHCILOANPTPYIELDKATCLOSER (Z84) / XHCILOANPTPYIELDKATRULE (Z88): a window counts as the claimant's only when Z82's
+/// closer is neither the xhci-poll take nor a second PTP claim (read after the re-take). A poll-closed window is a Z86
+/// regression and ends `poll-closed` at once (a FAIL, no skip); a PTP-closed window ends `ptp-closed` (a FAIL). Each window
+/// is <= `LOAN_YIELD_WINDOW_MS` (3 ms), far inside the claimant's 2 s `claim_xhci_for_io` wait.
+/// XHCILOANPTPYIELDKATRULE (zenbook-ledger Z88): since Z86 the xhci-poll take never closes a window, so the window is
+/// kept only for Z87's PTP class (a second `claim_only` taking the window before `with_controller` refuses it).
+/// XHCILOANPTPYIELDLOOPONE (zenbook-ledger Z96): one window. The claimant is armed (in `claim_xhci_for_io`'s hlt wait)
+/// before it opens, and since Z90 `loan_ptp_yield_wait` refuses that PTP class before the closer, so no second window was
+/// ever reached; a Z90 regression FAILs `ptp-closed` at window 1.
+/// XHCILOANPTPYIELDKATLOOPDROP (zenbook-ledger Z98): straight-line: the one window, no re-offer; Z88's one-pass loop, its
+/// PTP re-offer break and Z96's `YIELD_KAT_WINDOWS` (1) are retired.
+fn loan_yield_kat(c: &mut XhciController, armed: &mut bool) -> &'static str {
+    let arm = yield_kat_arm();
+    *armed = arm != Err("skip(one-cpu)"); // spawned (a late claimant is settled too)
+    let taken = match loan_yield(c, true) {
+        Err(_) => return "lost",
+        Ok(None) => return "no-yield",
+        Ok(Some((_, taken))) => taken,
     };
-    f(&mut *loan)
+    YIELD_KAT_SPENT.fetch_add(1, Ordering::Relaxed);
+    if crate::drivers::block::xhci_loan_published() {
+        return "published";
+    }
+    if TXN_YIELDED.load(Ordering::Acquire) {
+        return "flag-left";
+    }
+    if taken && crate::drivers::block::xhci_loan_yield_closed_by_poll() {
+        return "poll-closed"; // Z82's closer, valid only after a taken window: Z86 refuses this take, so it is a regression
+    }
+    let ptp = taken && crate::drivers::block::xhci_loan_yield_closed_by_ptp(); let took = crate::drivers::block::xhci_loan_yield_kat_ptp_took(); let order = crate::drivers::block::xhci_loan_yield_kat_ptp_refused(); // XHCILOANPTPYIELDPTPMARKKAT (Z104): a PTP claimant served inside the window. Z87's class: not the claimant's. XHCILOANPTPYIELDWAITCOUNT (Z108): Z90's refusals counted against the claimants armed
+    match arm {
+        Ok(()) if taken && !ptp && !took && order == core::cmp::Ordering::Equal => "ok", Ok(()) if taken && !ptp && !took => "ptp-unrefused",
+        Ok(()) if ptp => "ptp-closed", Ok(()) if took => "ptp-took",
+        Ok(()) if order == core::cmp::Ordering::Less => "skip(order)", Ok(()) => "untaken",
+        Err(skip) => skip,
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn yield_kat_arm() -> Result<(), &'static str> {
+    crate::drivers::block::xhci_loan_yield_kat_arm()
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn yield_kat_arm() -> Result<(), &'static str> {
+    Err("skip(no-claimant)")
+}
+
+#[cfg(target_arch = "x86_64")]
+fn yield_kat_settle(armed: bool) {
+    if armed {
+        crate::drivers::block::xhci_loan_yield_kat_settle();
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn yield_kat_settle(_armed: bool) {}
+
+/// XHCILOANPTPCOPY: `tests preemptaudit`'s `ptp_path=` word — a PTP claim must go through the ONE path (the block
+/// layer's PTP-claim counter moves by one) and must hold no publication: `ok` / `no-bump` / `published` / `busy` /
+/// `err`, or `skip(masked|no-xhci)`. XHCILOANPTPYIELD (Z73): the pair's second word is `ptp_yield=` — inside the same
+/// hold a sibling block claimant is armed and a forced yield must hand it the window and re-take the loan: `ok` /
+/// `untaken` / `no-yield` / `lost` / `published` / `flag-left` / `skip(one-cpu|claimant-late)`, or `ptp_path=`'s word when
+/// the hold itself failed. XHCILOANPTPYIELDKATRULE (Z88): Z84's `skip(poll-closed)` retired: `poll-closed` (a xhci-poll take
+/// closed a window: Z86 regressed) and `ptp-closed` (the windows went to a second PTP claim) are FAIL words; Z104: `ptp-unmarked` / `ptp-took` too; Z108: `ptp-unrefused` (FAIL), `skip(order)`.
+pub fn loan_path_kat() -> (&'static str, &'static str) {
+    YIELD_KAT_SPENT.store(0, Ordering::Relaxed); // XHCILOANPTPYIELDKATRULE (Z88): this run's windows only
+    if crate::arch::irqs_masked() {
+        return ("skip(masked)", "skip(masked)");
+    }
+    let before = crate::drivers::block::xhci_loan_ptp_claims();
+    let mut yw: &'static str = "no-yield";
+    let mut armed = false;
+    let r = with_controller(|c| {
+        if crate::drivers::block::xhci_loan_published() {
+            return Err("published");
+        }
+        yw = loan_yield_kat(c, &mut armed);
+        Ok(())
+    });
+    yield_kat_settle(armed);
+    let pw = match r {
+        Ok(()) if crate::drivers::block::xhci_loan_ptp_claims() != before => "ok",
+        Ok(()) => "no-bump",
+        Err("published") => "published",
+        Err("USB busy") => "busy",
+        Err("no USB controller") => "skip(no-xhci)",
+        Err(_) => "err",
+    };
+    (pw, if r.is_ok() { yw } else { pw })
+}
+
+/// XHCILOANPTPYIELDKATRULE (zenbook-ledger Z88): the windows the last `loan_path_kat` offered (`ptp_yield_windows=`).
+pub fn loan_yield_kat_windows() -> u32 {
+    YIELD_KAT_SPENT.load(Ordering::Relaxed)
 }
 
 /// Object bytes for the volume's `read`.
@@ -1979,4 +2124,32 @@ pub fn selftest() {
         stream,
         if pass { "PASS" } else { "FAIL" }
     );
+}
+
+/// XHCILOANPTPYIELDOUT (zenbook-ledger Z94): one data phase's yield tally — Z73's ONE yield point (`loan_yield`, so
+/// `BlockLoan::yield_due` / `yield_now`, the same window and counters) and its accrual, shared by `ptp_txn_inner`'s In
+/// loop and SendObject's Out loop; `say` is Z73's line, `who=ptp` (In, byte-identical) or `who=ptp-out` (a send).
+#[derive(Default)]
+struct YieldTally {
+    n: u32,
+    t: u32,
+    p: u32,
+    q: u32,
+    max: u64,
+}
+
+impl YieldTally {
+    /// Between two TDs (nothing armed): yield when one is due. `Err` = the loan was not re-taken (`loan_yield`'s).
+    fn step(&mut self, c: &mut XhciController) -> Result<(), &'static str> {
+        if let Some((us, t)) = loan_yield(c, false)? {
+            self.n += 1;
+            self.t += t as u32; self.p += (t && crate::drivers::block::xhci_loan_yield_closed_by_poll()) as u32; self.q += (t && crate::drivers::block::xhci_loan_yield_closed_by_ptp()) as u32; // XHCILOANPTPYIELDPTPTAKE (Z87): and the PTP closes. XHCILOANPTPYIELDPOLLTAKE (Z82): the window's closer, recorded at the take
+            self.max = self.max.max(us);
+        }
+        Ok(())
+    }
+
+    fn say(&self, who: &str) {
+        serial_println!("[xhci] loan yield who={} n={} taken={} taken_poll={}{} waited_us={} yield_skips={}{} (XHCILOANPTPYIELD Z73)", who, self.n, self.t.saturating_sub(self.p).saturating_sub(self.q), self.p, if self.q > 0 { alloc::format!(" taken_ptp={}", self.q) } else { String::new() }, self.max, super::pump_yield_skips(), crate::drivers::block::PollSkips); // XHCILOANPTPYIELDPTPTAKE (Z87): ` taken_ptp=<n>` only when a second PTP claim closed a window (byte-identical at 0). XHCILOANPTPYIELDPOLLTAKE (Z82): taken= the block claimants served, taken_poll= the xhci-poll closes. XHCILOANPTPYIELDPOLLSKIP (Z86): ` poll_skips=<n>` only when the poller was refused in a window
+    }
 }

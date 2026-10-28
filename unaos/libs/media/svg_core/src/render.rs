@@ -503,32 +503,9 @@ impl<'a> Renderer<'a> {
 
     // ------------------------------------------------------------------ painting
 
-    /// Fill a coverage region with a shader.
+    /// Fill a coverage region with a shader ([`crate::raster::paint_coverage`], the one paint loop pdf_core shares).
     pub fn paint_coverage(&self, canvas: &mut Pixmap, cov: &Coverage, sh: &Shader, opacity: f32) {
-        if opacity <= 0.0 {
-            return;
-        }
-        if let Shader::Solid(c) = sh {
-            for yy in 0..cov.h {
-                for xx in 0..cov.w {
-                    let v = cov.data[yy * cov.w + xx];
-                    if v != 0 {
-                        canvas.blend(cov.x + xx, cov.y + yy, *c, v as f32 / 255.0 * opacity);
-                    }
-                }
-            }
-            return;
-        }
-        for yy in 0..cov.h {
-            for xx in 0..cov.w {
-                let v = cov.data[yy * cov.w + xx];
-                if v != 0 {
-                    let (px, py) = (cov.x + xx, cov.y + yy);
-                    let c = sh.at(px as f64 + 0.5, py as f64 + 0.5);
-                    canvas.blend(px, py, c, v as f32 / 255.0 * opacity);
-                }
-            }
-        }
+        crate::raster::paint_coverage(canvas, cov, sh, opacity);
     }
 
     fn resolve_paint<'p>(&self, p: &'p Paint, ctx: &'p Ctx) -> Option<&'p Paint> {

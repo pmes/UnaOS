@@ -13,7 +13,7 @@
 
 use alloc::vec::Vec;
 
-use crate::{Clip, EditError, Timeline, edl};
+use crate::{Clip, EditError, Timeline, Transition, edl};
 
 /// Undo depth kept.
 pub const UNDO_MAX: usize = 256;
@@ -35,16 +35,21 @@ pub struct EditorState {
     pub timeline: Timeline,
     /// `(track, clip index)`.
     pub selection: Option<(usize, usize)>,
+    /// NLE2c (SR217): every selected `(track, clip index)`, sorted and deduped; empty exactly when `selection` (the
+    /// primary) is `None`, and holding it otherwise.
+    pub set: Vec<(usize, usize)>,
     pub playhead: i64,
     /// Pixels per tick, `ZOOM_MIN..=ZOOM_MAX`.
     pub zoom: u32,
     undo: Vec<Timeline>,
     redo: Vec<Timeline>,
+    /// NLE3d (SR302): the selected transition, `(track, index into tracks[track].transitions)`; the face's widget.
+    pub transition: Option<(usize, usize)>,
 }
 
 impl EditorState {
     pub fn new(timeline: Timeline) -> EditorState {
-        EditorState { timeline, selection: None, playhead: 0, zoom: ZOOM_DEFAULT, undo: Vec::new(), redo: Vec::new() }
+        EditorState { timeline, selection: None, set: Vec::new(), playhead: 0, zoom: ZOOM_DEFAULT, undo: Vec::new(), redo: Vec::new(), transition: None }
     }
     /// Open a CMX 3600 EDL (`fps` when it carries no `* UNA FPS` line).
     pub fn open(text: &str, fps: u32) -> Result<EditorState, edl::EdlError> {
@@ -67,6 +72,8 @@ impl EditorState {
             return Err(EditError::NoClip);
         }
         self.selection = Some((track, idx));
+        self.set.clear();
+        self.set.push((track, idx));
         Ok(())
     }
     /// Select the clip on `track` showing tick `t`.
@@ -75,11 +82,11 @@ impl EditorState {
             return Err(EditError::NoTrack);
         }
         let idx = self.timeline.clip_at(track, t).ok_or(EditError::NoClip)?;
-        self.selection = Some((track, idx));
-        Ok(())
+        self.select(track, idx)
     }
     pub fn deselect(&mut self) {
         self.selection = None;
+        self.set.clear();
     }
     /// Move the playhead to `t`, clamped to `0..=timeline.end()`.
     pub fn seek(&mut self, t: i64) {
@@ -93,7 +100,7 @@ impl EditorState {
         let (track, _) = self.selection.ok_or(EditError::NoClip)?;
         let tl = self.timeline.split(track, self.playhead)?;
         self.commit(tl);
-        self.selection = self.timeline.clip_at(track, self.playhead).map(|i| (track, i));
+        self.select_at(track, self.playhead).unwrap_or_else(|_| self.deselect());
         Ok(())
     }
     /// Move the selected clip's in (`Timeline::trim_in`) or out (`Timeline::trim_out`) point by `delta` source ticks.
@@ -113,15 +120,16 @@ impl EditorState {
         let (track, idx) = self.selection.ok_or(EditError::NoClip)?;
         let tl = self.timeline.move_clip(track, idx, to_track, to_at)?;
         self.commit(tl);
-        self.selection = self.timeline.clip_at(to_track, to_at).map(|i| (to_track, i));
+        self.select_at(to_track, to_at).unwrap_or_else(|_| self.deselect());
         Ok(())
     }
-    /// Remove the selected clip and close the hole (`Timeline::ripple_delete`).
+    /// Remove the selected clips and close the holes (NLE2c: `Timeline::ripple_delete_many` over the set, ONE edit; a set
+    /// of one is `Timeline::ripple_delete`).
     pub fn ripple_delete(&mut self) -> Result<(), EditError> {
-        let (track, idx) = self.selection.ok_or(EditError::NoClip)?;
-        let tl = self.timeline.ripple_delete(track, idx)?;
+        self.selection.ok_or(EditError::NoClip)?;
+        let tl = self.timeline.ripple_delete_many(&self.set)?;
         self.commit(tl);
-        self.selection = None;
+        self.deselect();
         Ok(())
     }
     /// Step back one edit; false when there is none.
@@ -160,9 +168,284 @@ impl EditorState {
     }
     /// Keep the selection and the playhead valid for the current timeline.
     fn settle(&mut self) {
+        let tl = &self.timeline;
+        self.set.retain(|&(t, i)| tl.tracks.get(t).is_some_and(|tr| i < tr.clips.len()));
+        self.transition = self.transition.filter(|&(t, i)| tl.tracks.get(t).is_some_and(|tr| i < tr.transitions.len()));
         if self.selected().is_none() {
-            self.selection = None;
+            self.selection = self.set.first().copied();
+        }
+        if let Some(p) = self.selection.filter(|p| !self.set.contains(p)) {
+            self.set.push(p);
+            self.set.sort_unstable();
         }
         self.seek(self.playhead);
+    }
+}
+
+/// NLE2c (LEDGER SR217): the selection as a SET (`set`, with `selection` its primary) and the edits over it, each ONE
+/// `commit` of one of timeline_core's set ops. no_std-clean (it moves with `EditorState` into `timeline_core::editor`).
+impl EditorState {
+    /// Add a clip to the set (a shift-press); it becomes the primary.
+    pub fn select_add(&mut self, track: usize, idx: usize) -> Result<(), EditError> {
+        let tr = self.timeline.tracks.get(track).ok_or(EditError::NoTrack)?;
+        if idx >= tr.clips.len() {
+            return Err(EditError::NoClip);
+        }
+        self.selection = Some((track, idx));
+        if !self.set.contains(&(track, idx)) {
+            self.set.push((track, idx));
+            self.set.sort_unstable();
+        }
+        Ok(())
+    }
+    /// Select `picks` (a marquee): added to the set when `additive`, else replacing it (none -> nothing selected). The
+    /// primary is the first pick unless `additive` keeps one.
+    pub fn select_many(&mut self, picks: &[(usize, usize)], additive: bool) {
+        if !additive {
+            self.deselect();
+        }
+        let keep = self.selection;
+        for &(t, i) in picks {
+            let _ = self.select_add(t, i);
+        }
+        if keep.is_some() {
+            self.selection = keep;
+        } else {
+            self.selection = self.set.first().copied();
+        }
+    }
+    /// Select every clip on every track (Cmd / Ctrl+A).
+    pub fn select_all(&mut self) {
+        let mut all = Vec::new();
+        for (t, tr) in self.timeline.tracks.iter().enumerate() {
+            for i in 0..tr.clips.len() {
+                all.push((t, i));
+            }
+        }
+        self.select_many(&all, false);
+    }
+    /// Remove the selected clips and leave the holes (`Timeline::lift_many`, ONE edit).
+    pub fn lift_selected(&mut self) -> Result<(), EditError> {
+        self.selection.ok_or(EditError::NoClip)?;
+        let tl = self.timeline.lift_many(&self.set)?;
+        self.commit(tl);
+        self.deselect();
+        Ok(())
+    }
+    /// Move every selected clip by `delta` ticks on its own track (`Timeline::move_many`, ONE edit; refused whole if any
+    /// would overlap). The set and the primary follow their clips.
+    pub fn move_set(&mut self, delta: i64) -> Result<(), EditError> {
+        let primary = self.selection.ok_or(EditError::NoClip)?;
+        let tl = self.timeline.move_many(&self.set, delta)?;
+        let at = |st: &EditorState, (t, i): (usize, usize)| st.timeline.tracks[t].clips[i].at + delta;
+        let landed: Vec<(usize, i64)> = self.set.iter().map(|&p| (p.0, at(self, p))).collect();
+        let p_at = (primary.0, at(self, primary));
+        self.commit(tl);
+        self.set.clear();
+        for &(t, a) in &landed {
+            if let Some(i) = self.timeline.clip_at(t, a) {
+                self.set.push((t, i));
+            }
+        }
+        self.set.sort_unstable();
+        self.selection = self.timeline.clip_at(p_at.0, p_at.1).map(|i| (p_at.0, i));
+        self.settle();
+        Ok(())
+    }
+}
+
+/// NLE3d (LEDGER SR302): the transition selection (the face's widget on a cut) and its edits, each ONE `commit` of one of
+/// timeline_core's transition ops: `remove_transition`, and a length change as `add_transition` /
+/// `add_transition_from_black` at the same `at` (the op replaces the transition there and keeps its index).
+impl EditorState {
+    /// Select the transition `idx` of `track` (the clips are deselected).
+    pub fn select_transition(&mut self, track: usize, idx: usize) -> Result<(), EditError> {
+        let tr = self.timeline.tracks.get(track).ok_or(EditError::NoTrack)?;
+        if idx >= tr.transitions.len() {
+            return Err(EditError::Transition);
+        }
+        self.deselect();
+        self.transition = Some((track, idx));
+        Ok(())
+    }
+    /// The selected transition.
+    pub fn selected_transition(&self) -> Option<Transition> {
+        let (t, i) = self.transition?;
+        self.timeline.tracks.get(t)?.transitions.get(i).copied()
+    }
+    /// Take the selected transition off its cut (`Timeline::remove_transition`); the selection goes.
+    pub fn remove_selected_transition(&mut self) -> Result<(), EditError> {
+        let (track, _) = self.transition.ok_or(EditError::Transition)?;
+        let x = self.selected_transition().ok_or(EditError::Transition)?;
+        let tl = self.timeline.remove_transition(track, x.at)?;
+        self.commit(tl);
+        self.transition = None;
+        Ok(())
+    }
+    /// Give the selected transition `dur` ticks (the add op of its kind at the same `at`; `validate` refuses `dur < 1`
+    /// and a handle too short). The selection stays on it.
+    pub fn set_transition_dur(&mut self, dur: i64) -> Result<(), EditError> {
+        let (track, idx) = self.transition.ok_or(EditError::Transition)?;
+        let x = self.selected_transition().ok_or(EditError::Transition)?;
+        let tl = if x.to_black { self.timeline.add_transition_to_black(track, x.at, x.kind, dur)? } else if x.from_black {
+            self.timeline.add_transition_from_black(track, x.at, x.kind, dur)?
+        } else {
+            self.timeline.add_transition(track, x.at, x.kind, dur)?
+        };
+        self.commit(tl);
+        self.transition = Some((track, idx));
+        Ok(())
+    }
+}
+
+/// NLE6KEYS (rmbp-ledger B961): THE verb dispatch both faces call — the host face's buttons and keys (`stria::nle_face`
+/// `Face::verb` / `Face::key`) and the kernel Player's editing keys (`video/vplay.rs` `edit_key`). Each face keeps its own
+/// key BINDINGS (the host's `KEYS` names, the kernel's byte table) and maps them onto these words; the arms are the host
+/// face's, moved here unchanged. `None`: not an editor verb (the face's own transport, e.g. `play`, stays the face's).
+/// NLE6KEYSLABELS (rmbp-ledger B968): `zoom0` puts the zoom back to [`ZOOM_DEFAULT`] (the kernel's `0` key).
+impl EditorState {
+    pub fn verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
+        let ph = self.playhead; if let Some(r) = self.size_verb(v) { return Some(r); } // NLESIZEPOLICYUI (SR402): the `size` words (file tail)
+        Some(match v {
+            "prev" => {
+                self.nudge(-1);
+                Ok(())
+            }
+            "next" => {
+                self.nudge(1);
+                Ok(())
+            }
+            "split" => self.split_at_playhead(),
+            "delete" => self.ripple_delete(),
+            "undo" => {
+                self.undo();
+                Ok(())
+            }
+            "redo" => {
+                self.redo();
+                Ok(())
+            }
+            "zoom-" => {
+                self.zoom_by(-1);
+                Ok(())
+            }
+            "zoom+" => {
+                self.zoom_by(1);
+                Ok(())
+            }
+            "zoom0" => {
+                self.zoom = ZOOM_DEFAULT;
+                Ok(())
+            }
+            "[" => self.trim(Edge::In, -1),
+            "]" => self.trim(Edge::In, 1),
+            "{" => self.trim(Edge::Out, -1),
+            "}" => self.trim(Edge::Out, 1),
+            "lift" => self.lift_selected(),
+            "mark-in" => match self.selected() {
+                Some(c) => self.trim(Edge::In, ph - c.at),
+                None => Err(EditError::NoClip),
+            },
+            "mark-out" => match self.selected() {
+                Some(c) => self.trim(Edge::Out, ph - c.end()),
+                None => Err(EditError::NoClip),
+            },
+            "home" => {
+                self.seek(0);
+                Ok(())
+            }
+            "end" => {
+                let e = self.timeline.end();
+                self.seek(e);
+                Ok(())
+            }
+            "nudge-" => self.move_set(-1),
+            "nudge+" => self.move_set(1),
+            _ => return None,
+        })
+    }
+}
+
+#[cfg(test)]
+mod verb_tests {
+    use super::*;
+    use crate::Kind;
+
+    /// stria::nle_face's `synth_fixture` cut list (A 13..23 at 0, B 0..10 at 10, A 23..33 at 25), video only.
+    fn state() -> EditorState {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("A", 50);
+        let b = tl.add_source("B", 50);
+        tl.add_track(Kind::Video);
+        tl.tracks[0].clips = alloc::vec![Clip::new(a, 13, 23, 0), Clip::new(b, 0, 10, 10), Clip::new(a, 23, 33, 25)];
+        EditorState::new(tl)
+    }
+
+    /// NLE6KEYS: each verb is the op the host face ran by hand; a face word that is not an editor verb is `None`.
+    #[test]
+    fn verb_is_the_host_dispatch() {
+        let mut st = state();
+        let tl0 = st.timeline.clone();
+        st.select(0, 1).unwrap();
+        st.seek(13);
+        assert_eq!(st.verb("mark-in"), Some(Ok(())));
+        let want1 = tl0.trim_in(0, 1, 3).unwrap();
+        assert_eq!(st.timeline, want1);
+        assert_eq!(st.verb("["), Some(Ok(())));
+        assert_eq!(st.timeline, want1.trim_in(0, 1, 2).unwrap());
+        assert_eq!(st.verb("undo"), Some(Ok(())));
+        assert_eq!(st.timeline, want1);
+        st.seek(16);
+        assert_eq!(st.verb("split"), Some(Ok(())));
+        assert_eq!(st.timeline, want1.split(0, 16).unwrap());
+        assert_eq!(st.verb("end"), Some(Ok(())));
+        assert_eq!(st.playhead, st.timeline.end());
+        assert_eq!(st.verb("play"), None);
+        st.deselect();
+        assert_eq!(st.verb("]"), Some(Err(EditError::NoClip)));
+    }
+}
+
+// ── NLESIZEPOLICYUI (LEDGER SR402): the reel's size policy from the editor (handlers.md §5 NLEPROBE-HDR's NLE-SIZE-POLICY-UI) ──
+// The `size` words ride THE verb dispatch ([`EditorState::verb`]) both faces call: `size <reel> <policy>` sets a reel's
+// [`crate::SizePolicy`] through `Timeline::set_size_policy` and the ONE `commit` (undo-able; the EDL's `* UNA SIZE` line is
+// written by `edl::write` wherever a face saves), bare `size` cycles the selected clip's reel through `SizePolicy::next`
+// (the host face's Size button). Refused by name: an unknown reel `EditError::NoSource`, an unknown policy word (or the
+// wrong number of words) `EditError::Policy`, a bare `size` with no clip selected `EditError::NoClip`.
+impl EditorState {
+    /// Reel `reel`'s size policy set to `p` (one commit; the same policy again commits nothing).
+    pub fn set_size_policy(&mut self, reel: &str, p: crate::SizePolicy) -> Result<(), EditError> {
+        let src = self.timeline.source_by_reel(reel).ok_or(EditError::NoSource)?;
+        if src.size_policy == p {
+            return Ok(());
+        }
+        let tl = self.timeline.set_size_policy(src.id, p)?;
+        self.commit(tl);
+        Ok(())
+    }
+    /// The selected clip's reel steps to its next size policy (Letterbox -> Fill -> Stretch -> Adopt -> Letterbox).
+    pub fn cycle_size(&mut self) -> Result<(), EditError> {
+        let c = self.selected().ok_or(EditError::NoClip)?;
+        let src = self.timeline.source(c.src).ok_or(EditError::NoSource)?;
+        let tl = self.timeline.set_size_policy(src.id, src.size_policy.next())?;
+        self.commit(tl);
+        Ok(())
+    }
+    /// The `size` words of [`EditorState::verb`]; `None` when `v` is not a `size` verb.
+    fn size_verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
+        let mut w = v.split_ascii_whitespace();
+        if w.next() != Some("size") {
+            return None;
+        }
+        Some(match (w.next(), w.next(), w.next()) {
+            (None, _, _) => self.cycle_size(),
+            (Some(reel), Some(word), None) => match crate::SizePolicy::from_name(word) {
+                Some(p) => self.set_size_policy(reel, p),
+                None if self.timeline.source_by_reel(reel).is_none() => Err(EditError::NoSource),
+                None => Err(EditError::Policy),
+            },
+            (Some(reel), None, _) if self.timeline.source_by_reel(reel).is_none() => Err(EditError::NoSource),
+            _ => Err(EditError::Policy),
+        })
     }
 }

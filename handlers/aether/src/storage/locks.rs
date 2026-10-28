@@ -162,6 +162,7 @@ mod tests {
 
     #[test]
     fn exclusive_then_shared_queue_in_order() {
+        let _root = crate::storage::test_root::TestRoot::new("aether_locks_kat");
         let k = "https://locks.kat";
         let a = request(k, "n", true, false, false, 9001);
         assert_eq!(a["state"], "granted");
@@ -178,4 +179,11 @@ mod tests {
         doc_gone(9001);
         assert!(query(k)["held"].as_array().unwrap().is_empty());
     }
+}
+
+/// AETHER-TESTROOT (LEDGER SR355): forgets every held and queued lock request (ids stay monotonic) —
+/// `storage::test_root::TestRoot` on acquire and drop.
+#[cfg(test)]
+pub(crate) fn reset_for_test() {
+    mgr().reqs.clear();
 }

@@ -49,6 +49,130 @@ impl TestPatternPacket {
 }
 
 // ---------------------------------------------------------------------------------------------
+// The test pattern's pixels: THE one painter (SWAPBACKVPLAY, rmbp-ledger B956)
+// ---------------------------------------------------------------------------------------------
+// Moved here from gneiss_pal's `TestPattern` (which now delegates) so the kernel Player's stand-in (`video/vplay.rs`
+// `Pic::StandIn`) and Stria's (`TestPattern::stand_in`, used by `handlers/stria/src/decode_swap.rs`) paint the SAME bytes.
+// Layout (any size >= 64x48): seven 75 % bars (white, yellow, cyan, green, magenta, red, blue) over the top 2/3; the
+// bottom 1/3 black with the counter as white 5x7 digits in a [`COUNTER_DIGITS`]-wide field, scale chosen to fit.
+
+/// Digits in the test pattern's counter field.
+pub const COUNTER_DIGITS: usize = 6;
+
+const BARS: [[u8; 3]; 7] = [
+    [191, 191, 191],
+    [191, 191, 0],
+    [0, 191, 191],
+    [0, 191, 0],
+    [191, 0, 191],
+    [191, 0, 0],
+    [0, 0, 191],
+];
+
+/// 5x7 digit glyphs, one row per byte, bit 4 = leftmost column.
+const GLYPHS: [[u8; 7]; 10] = [
+    [0x0E, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0E],
+    [0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E],
+    [0x0E, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1F],
+    [0x1F, 0x02, 0x04, 0x02, 0x01, 0x11, 0x0E],
+    [0x02, 0x06, 0x0A, 0x12, 0x1F, 0x02, 0x02],
+    [0x1F, 0x10, 0x1E, 0x01, 0x01, 0x11, 0x0E],
+    [0x06, 0x08, 0x10, 0x1E, 0x11, 0x11, 0x0E],
+    [0x1F, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08],
+    [0x0E, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x0E],
+    [0x0E, 0x11, 0x11, 0x0F, 0x01, 0x02, 0x0C],
+];
+
+/// Where the counter field sits: (x0, y0, scale) — glyph cells are 6x8 scaled units (5x7 plus a one-unit gap).
+fn counter_geometry(w: u32, h: u32) -> (u32, u32, u32) {
+    let band_top = h * 2 / 3;
+    let band_h = h - band_top;
+    let scale = ((w * 9 / 10) / (COUNTER_DIGITS as u32 * 6)).min(band_h * 8 / 10 / 8).max(1);
+    let field_w = COUNTER_DIGITS as u32 * 6 * scale;
+    let x0 = (w.saturating_sub(field_w)) / 2;
+    let y0 = band_top + (band_h.saturating_sub(8 * scale)) / 2;
+    (x0, y0, scale)
+}
+
+/// Render test-pattern frame `n` at `w x h` as packed straight RGBA (alpha 255).
+pub fn test_pattern_rgba(w: u32, h: u32, n: u32) -> Vec<u8> {
+    let (wu, hu) = (w as usize, h as usize);
+    let mut px = alloc::vec![0u8; wu * hu * 4];
+    let band_top = hu * 2 / 3;
+    for y in 0..hu {
+        for x in 0..wu {
+            let c = if y < band_top { BARS[x * 7 / wu] } else { [0, 0, 0] };
+            let o = (y * wu + x) * 4;
+            px[o..o + 3].copy_from_slice(&c);
+            px[o + 3] = 255;
+        }
+    }
+    let (x0, y0, s) = counter_geometry(w, h);
+    let mut v = n % 10u32.pow(COUNTER_DIGITS as u32);
+    let mut digits = [0u8; COUNTER_DIGITS];
+    for d in digits.iter_mut().rev() {
+        *d = (v % 10) as u8;
+        v /= 10;
+    }
+    for (i, &dg) in digits.iter().enumerate() {
+        let g = &GLYPHS[dg as usize];
+        for (gy, row) in g.iter().enumerate() {
+            for gx in 0..5 {
+                if row & (0x10 >> gx) == 0 {
+                    continue;
+                }
+                for dy in 0..s {
+                    for dx in 0..s {
+                        let x = (x0 + (i as u32 * 6 + gx) * s + dx) as usize;
+                        let y = (y0 + gy as u32 * s + dy) as usize;
+                        if x < wu && y < hu {
+                            let o = (y * wu + x) * 4;
+                            px[o..o + 3].copy_from_slice(&[255, 255, 255]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    px
+}
+
+/// Read the counter back out of a rendered frame (the play-check oracle). Samples the centre of every glyph cell unit
+/// and matches each digit's 5x7 bitmap exactly; `None` if any digit does not match a glyph.
+pub fn test_pattern_counter(rgba: &[u8], w: u32, h: u32) -> Option<u32> {
+    let (x0, y0, s) = counter_geometry(w, h);
+    let mut n = 0u32;
+    for i in 0..COUNTER_DIGITS as u32 {
+        let mut bits = [0u8; 7];
+        for (gy, b) in bits.iter_mut().enumerate() {
+            for gx in 0..5u32 {
+                let x = x0 + (i * 6 + gx) * s + s / 2;
+                let y = y0 + gy as u32 * s + s / 2;
+                let o = ((y * w + x) * 4) as usize;
+                let p = rgba.get(o..o + 3)?;
+                if p.iter().all(|&c| c > 127) {
+                    *b |= 0x10 >> gx;
+                }
+            }
+        }
+        let d = GLYPHS.iter().position(|g| *g == bits)? as u32;
+        n = n * 10 + d;
+    }
+    Some(n)
+}
+
+/// A stand-in's frame duration for `t` (the track's span / its sample count; 33.3 ms when unknown), at least 1 ns.
+pub fn stand_in_frame_ns(t: &crate::Track) -> i64 {
+    let ns = if t.sample_count > 0 && t.duration_ns > 0 { (t.duration_ns / t.sample_count) as i64 } else { 33_333_333 };
+    ns.max(1)
+}
+
+/// A stand-in's counter for a packet at `pts_ns`: `round(pts_ns / frame_ns)`, so frame N of a real file still shows N.
+pub fn stand_in_counter(pts_ns: i64, frame_ns: i64) -> u32 {
+    ((pts_ns + frame_ns / 2) / frame_ns.max(1)).max(0) as u32
+}
+
+// ---------------------------------------------------------------------------------------------
 // Input model
 // ---------------------------------------------------------------------------------------------
 
@@ -116,7 +240,15 @@ impl TrackSpec {
 pub fn pcm16_track(id: u32, sample_rate: u32, channels: u16, pcm: &[i16], frames_per_packet: usize) -> MediaTrack {
     let ch = channels.max(1) as usize;
     let fpp = frames_per_packet.max(1);
-    let spec = TrackSpec {
+    let spec = pcm16_spec(id, sample_rate, channels);
+    let samples = pcm.chunks(fpp * ch).enumerate().map(|(i, c)| pcm16_sample((i * fpp) as u64, c, channels)).collect();
+    MediaTrack { spec, samples }
+}
+
+/// NLE6EXPORT-STREAMPCM (rmbp-ledger B976): [`pcm16_track`]'s sample entry alone (a streamed export declares it before its
+/// packets exist).
+pub fn pcm16_spec(id: u32, sample_rate: u32, channels: u16) -> TrackSpec {
+    TrackSpec {
         id,
         kind: TrackKind::Audio,
         fourcc: *b"sowt",
@@ -130,19 +262,20 @@ pub fn pcm16_track(id: u32, sample_rate: u32, channels: u16, pcm: &[i16], frames
         channels,
         bit_depth: 16,
         default_duration_ns: 0,
-    };
-    let samples = pcm
-        .chunks(fpp * ch)
-        .enumerate()
-        .map(|(i, c)| SampleSpec {
-            data: c.iter().flat_map(|x| x.to_le_bytes()).collect(),
-            dts: (i * fpp) as i64,
-            pts: (i * fpp) as i64,
-            duration: (c.len() / ch) as u32,
-            keyframe: true,
-        })
-        .collect();
-    MediaTrack { spec, samples }
+    }
+}
+
+/// NLE6EXPORT-STREAMPCM (rmbp-ledger B976): one [`pcm16_track`] packet: the interleaved frames `chunk` starting at sample
+/// frame `first_frame` (its dts = pts, in the sample rate's ticks).
+pub fn pcm16_sample(first_frame: u64, chunk: &[i16], channels: u16) -> SampleSpec {
+    let ch = channels.max(1) as usize;
+    SampleSpec {
+        data: chunk.iter().flat_map(|x| x.to_le_bytes()).collect(),
+        dts: first_frame as i64,
+        pts: first_frame as i64,
+        duration: (chunk.len() / ch) as u32,
+        keyframe: true,
+    }
 }
 
 /// `n` test-pattern frames at `fps`, a keyframe every `gop` frames, pts == dts.
@@ -236,13 +369,16 @@ pub struct Mp4Extras {
     /// Per track id, one §8.6.4 `sdtp` byte per sample: an `sdtp` box (progressive) or the sample_flags bits 27..20 of the
     /// `trun` (fragmented).
     pub sdtp: Vec<(u32, Vec<u8>)>,
+    /// NLEPROBEHDR (SR226): per track id, the colour its visual sample entry states: `colr` (`nclx` when `full_range` is
+    /// `Some`, else QuickTime `nclc`), then `mdcv` (G, B, R order) and `clli` when present, after the config box.
+    pub colour: Vec<(u32, crate::colour::Colour)>,
 }
 
 fn track_duration(t: &MediaTrack) -> u64 {
     t.samples.iter().map(|s| (s.pts + s.duration as i64).max(0) as u64).max().unwrap_or(0)
 }
 
-fn sample_entry(t: &TrackSpec) -> Vec<u8> {
+fn sample_entry(t: &TrackSpec, extra: &[u8]) -> Vec<u8> {
     let mut e = alloc::vec![0u8; 6];
     e.u16b(1);
     match t.kind {
@@ -269,6 +405,7 @@ fn sample_entry(t: &TrackSpec) -> Vec<u8> {
     if let Some(k) = t.config_box {
         e.extend_from_slice(&bx(&k, &t.config));
     }
+    e.extend_from_slice(extra);
     bx(&t.fourcc, &e)
 }
 
@@ -283,7 +420,7 @@ fn rle<T: PartialEq + Copy>(xs: impl Iterator<Item = T>) -> Vec<(u32, T)> {
     out
 }
 
-fn trak(t: &MediaTrack, opts: &Mp4Options, x: &Mp4Extras, movie_ts: u32, chunk_offsets: &[u64], progressive: bool) -> Vec<u8> {
+fn trak(t: &MediaTrack, opts: &Mp4Options, x: &Mp4Extras, movie_ts: u32, chunk_offsets: &[u64], progressive: bool, sizes: Option<&[u32]>) -> Vec<u8> {
     let s = &t.spec;
     let media_dur = if progressive { track_duration(t) } else { 0 };
     let movie_dur = media_dur * movie_ts as u64 / s.timescale.max(1) as u64;
@@ -337,7 +474,7 @@ fn trak(t: &MediaTrack, opts: &Mp4Options, x: &Mp4Extras, movie_ts: u32, chunk_o
 
     let mut stsd = Vec::new();
     stsd.u32b(1);
-    stsd.extend_from_slice(&sample_entry(s));
+    stsd.extend_from_slice(&sample_entry(s, &entry_colour(x, s.id)));
     let stsd = fbx(b"stsd", 0, 0, &stsd);
 
     let samples: &[SampleSpec] = if progressive { &t.samples } else { &[] };
@@ -384,8 +521,8 @@ fn trak(t: &MediaTrack, opts: &Mp4Options, x: &Mp4Extras, movie_ts: u32, chunk_o
     let mut stsz = Vec::new();
     stsz.u32b(0);
     stsz.u32b(samples.len() as u32);
-    for x in samples {
-        stsz.u32b(x.data.len() as u32);
+    for (j, x) in samples.iter().enumerate() {
+        stsz.u32b(sizes.map_or(x.data.len() as u32, |z| z[j]));
     }
     let stsz = fbx(b"stsz", 0, 0, &stsz);
 
@@ -492,7 +629,7 @@ pub fn mp4_with(tracks: &[MediaTrack], opts: &Mp4Options, x: &Mp4Extras) -> Vec<
     let build_moov = |offsets: &[Vec<u64>]| -> Vec<u8> {
         let mut m = mvhd(movie_ts, movie_dur, next_id);
         for (i, t) in tracks.iter().enumerate() {
-            m.extend_from_slice(&trak(t, opts, x, movie_ts, &offsets[i], true));
+            m.extend_from_slice(&trak(t, opts, x, movie_ts, &offsets[i], true, None));
         }
         bx(b"moov", &m)
     };
@@ -526,7 +663,7 @@ fn mp4_fragmented(tracks: &[MediaTrack], opts: &Mp4Options, x: &Mp4Extras, movie
         .unwrap_or(0);
     let mut moov = mvhd(movie_ts, 0, next_id);
     for t in tracks {
-        moov.extend_from_slice(&trak(t, opts, x, movie_ts, &[], false));
+        moov.extend_from_slice(&trak(t, opts, x, movie_ts, &[], false, None));
     }
     let mut mvex = Vec::new();
     let mut mehd = Vec::new();
@@ -690,6 +827,8 @@ pub struct MkvOptions {
     /// DEMUXSEEK (SR200): write a SeekHead first in the Segment pointing at Cues written after the Clusters — one CuePoint
     /// per video keyframe block (CueTime, CueTrack, CueClusterPosition relative to the Segment's body).
     pub cues: bool,
+    /// NLEPROBEHDR (SR226): per track id, a Colour master written inside the track's Video master.
+    pub colour: Vec<(u32, crate::colour::Colour)>,
 }
 
 impl Default for MkvOptions {
@@ -706,6 +845,7 @@ impl Default for MkvOptions {
             duration: true,
             discard_last_ns: 0,
             cues: false,
+            colour: Vec::new(),
         }
     }
 }
@@ -765,19 +905,72 @@ fn to_ns(ticks: i64, ts: u32) -> i64 {
     (ticks as i128 * 1_000_000_000 / ts.max(1) as i128) as i64
 }
 
-/// Write a Matroska/WebM file. Frames are written in decode order merged across tracks;
-/// Matroska block times are the presentation times (`pts`).
-pub fn mkv(tracks: &[MediaTrack], opts: &MkvOptions) -> Vec<u8> {
-    let scale = if opts.timestamp_scale == 0 { 1_000_000 } else { opts.timestamp_scale };
+/// The EBML header (`webm` or `matroska` DocType) [`mkv`] and [`MkvStream`] write.
+fn mkv_header(webm: bool) -> Vec<u8> {
     let mut ebml = Vec::new();
     ebml.extend_from_slice(&el_uint(0x4286, 1));
     ebml.extend_from_slice(&el_uint(0x42F7, 1));
     ebml.extend_from_slice(&el_uint(0x42F2, 4));
     ebml.extend_from_slice(&el_uint(0x42F3, 8));
-    ebml.extend_from_slice(&el(0x4282, if opts.webm { b"webm" } else { b"matroska" }));
+    ebml.extend_from_slice(&el(0x4282, if webm { b"webm" } else { b"matroska" }));
     ebml.extend_from_slice(&el_uint(0x4287, 4));
     ebml.extend_from_slice(&el_uint(0x4285, 2));
-    let header = el(0x1A45_DFA3, &ebml);
+    el(0x1A45_DFA3, &ebml)
+}
+
+/// One TrackEntry of `s` with CodecID `codec_id`, CodecPrivate `private` (omitted when empty) and the Video master's
+/// `colour` ([`mkv_colour`]'s bytes, empty for none) — the ONE TrackEntry [`mkv`] and [`MkvStream`] write.
+fn mkv_track_entry(s: &TrackSpec, codec_id: &str, private: &[u8], colour: &[u8]) -> Vec<u8> {
+    let mut e = el_uint(0xD7, s.id as u64);
+    e.extend_from_slice(&el_uint(0x73C5, s.id as u64));
+    e.extend_from_slice(&el_uint(0x83, if s.kind == TrackKind::Video { 1 } else { 2 }));
+    e.extend_from_slice(&el(0x86, codec_id.as_bytes()));
+    if !private.is_empty() {
+        e.extend_from_slice(&el(0x63A2, private));
+    }
+    if s.default_duration_ns > 0 {
+        e.extend_from_slice(&el_uint(0x23_E383, s.default_duration_ns));
+    }
+    if s.kind == TrackKind::Video {
+        let v = cat(&[&el_uint(0xB0, s.width as u64), &el_uint(0xBA, s.height as u64), colour]);
+        e.extend_from_slice(&el(0xE0, &v));
+    } else {
+        let mut a = cat(&[&el_f64(0xB5, s.sample_rate as f64), &el_uint(0x9F, s.channels as u64)]);
+        if s.bit_depth != 0 {
+            a.extend_from_slice(&el_uint(0x6264, s.bit_depth as u64));
+        }
+        e.extend_from_slice(&el(0xE1, &a));
+    }
+    el(0xAE, &e)
+}
+
+/// Every sample as (track index, sample index), merged across tracks in decode order (the earliest dts first; a tie keeps
+/// the lower track) — the ONE merge [`mkv`] and [`mux`] write by.
+fn decode_order(tracks: &[MediaTrack]) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut idx = alloc::vec![0usize; tracks.len()];
+    loop {
+        let mut pick: Option<(usize, i64)> = None;
+        for (i, t) in tracks.iter().enumerate() {
+            if let Some(s) = t.samples.get(idx[i]) {
+                let d = to_ns(s.dts, t.spec.timescale);
+                if pick.is_none_or(|(_, pd)| d < pd) {
+                    pick = Some((i, d));
+                }
+            }
+        }
+        let Some((i, _)) = pick else { break };
+        out.push((i, idx[i]));
+        idx[i] += 1;
+    }
+    out
+}
+
+/// Write a Matroska/WebM file. Frames are written in decode order merged across tracks;
+/// Matroska block times are the presentation times (`pts`).
+pub fn mkv(tracks: &[MediaTrack], opts: &MkvOptions) -> Vec<u8> {
+    let scale = if opts.timestamp_scale == 0 { 1_000_000 } else { opts.timestamp_scale };
+    let header = mkv_header(opts.webm);
 
     let end_ns = tracks
         .iter()
@@ -795,47 +988,15 @@ pub fn mkv(tracks: &[MediaTrack], opts: &MkvOptions) -> Vec<u8> {
     let mut tr = Vec::new();
     for t in tracks {
         let s = &t.spec;
-        let mut e = el_uint(0xD7, s.id as u64);
-        e.extend_from_slice(&el_uint(0x73C5, s.id as u64));
-        e.extend_from_slice(&el_uint(0x83, if s.kind == TrackKind::Video { 1 } else { 2 }));
-        e.extend_from_slice(&el(0x86, s.codec_id.as_bytes()));
-        if !s.config.is_empty() {
-            e.extend_from_slice(&el(0x63A2, &s.config));
-        }
-        if s.default_duration_ns > 0 {
-            e.extend_from_slice(&el_uint(0x23_E383, s.default_duration_ns));
-        }
-        if s.kind == TrackKind::Video {
-            let v = cat(&[&el_uint(0xB0, s.width as u64), &el_uint(0xBA, s.height as u64)]);
-            e.extend_from_slice(&el(0xE0, &v));
-        } else {
-            let mut a = cat(&[&el_f64(0xB5, s.sample_rate as f64), &el_uint(0x9F, s.channels as u64)]);
-            if s.bit_depth != 0 {
-                a.extend_from_slice(&el_uint(0x6264, s.bit_depth as u64));
-            }
-            e.extend_from_slice(&el(0xE1, &a));
-        }
-        tr.extend_from_slice(&el(0xAE, &e));
+        tr.extend_from_slice(&mkv_track_entry(s, s.codec_id, &s.config, &mkv_colour(opts, s.id)));
     }
     let tracks_el = el(0x1654_AE6B, &tr);
 
     // Merge frames in decode order.
     let mut frames: Vec<Frame> = Vec::new();
-    let mut idx = alloc::vec![0usize; tracks.len()];
-    loop {
-        let mut pick: Option<(usize, i64)> = None;
-        for (i, t) in tracks.iter().enumerate() {
-            if let Some(s) = t.samples.get(idx[i]) {
-                let d = to_ns(s.dts, t.spec.timescale);
-                if pick.is_none_or(|(_, pd)| d < pd) {
-                    pick = Some((i, d));
-                }
-            }
-        }
-        let Some((i, _)) = pick else { break };
-        let s = &tracks[i].samples[idx[i]];
+    for (i, k) in decode_order(tracks) {
+        let s = &tracks[i].samples[k];
         frames.push(Frame { track: i, ns: to_ns(s.pts, tracks[i].spec.timescale), s });
-        idx[i] += 1;
     }
 
     // Group into blocks (lacing consecutive non-video frames of one track).
@@ -1028,4 +1189,967 @@ pub fn remux_tracks(d: &crate::Demuxer) -> Option<Vec<MediaTrack>> {
         });
     }
     Some(out)
+}
+
+/// NLEPROBEHDR (SR226): the `colr` / `mdcv` / `clli` boxes [`Mp4Extras::colour`] gives track `id` (empty when none).
+fn entry_colour(x: &Mp4Extras, id: u32) -> Vec<u8> {
+    let mut out = Vec::new();
+    let Some((_, c)) = x.colour.iter().find(|(t, _)| *t == id) else { return out };
+    let mut colr = Vec::new();
+    colr.extend_from_slice(if c.full_range.is_some() { b"nclx" } else { b"nclc" });
+    colr.u16b(c.primaries as u16);
+    colr.u16b(c.transfer as u16);
+    colr.u16b(c.matrix as u16);
+    if let Some(full) = c.full_range {
+        colr.push(if full { 0x80 } else { 0 });
+    }
+    out.extend_from_slice(&bx(b"colr", &colr));
+    if let Some(m) = c.mastering {
+        let mut b = Vec::new();
+        for p in [m.primaries[1], m.primaries[2], m.primaries[0]] {
+            b.u16b(p[0]);
+            b.u16b(p[1]);
+        }
+        b.u16b(m.white[0]);
+        b.u16b(m.white[1]);
+        b.u32b(m.max_lum);
+        b.u32b(m.min_lum);
+        out.extend_from_slice(&bx(b"mdcv", &b));
+    }
+    if let Some(l) = c.light {
+        let mut b = Vec::new();
+        b.u16b(l.max_cll);
+        b.u16b(l.max_fall);
+        out.extend_from_slice(&bx(b"clli", &b));
+    }
+    out
+}
+
+/// NLEPROBEHDR (SR226): the Matroska Colour master [`MkvOptions::colour`] gives track `id` (empty when none): the code
+/// points, Range (1 limited, 2 full; omitted when `None`), MaxCLL / MaxFALL and MasteringMetadata as floats.
+fn mkv_colour(opts: &MkvOptions, id: u32) -> Vec<u8> {
+    let Some((_, c)) = opts.colour.iter().find(|(t, _)| *t == id) else { return Vec::new() };
+    let mut b = cat(&[&el_uint(0x55B1, c.matrix as u64), &el_uint(0x55BA, c.transfer as u64), &el_uint(0x55BB, c.primaries as u64)]);
+    if let Some(full) = c.full_range {
+        b.extend_from_slice(&el_uint(0x55B9, if full { 2 } else { 1 }));
+    }
+    if let Some(l) = c.light {
+        b.extend_from_slice(&el_uint(0x55BC, l.max_cll as u64));
+        b.extend_from_slice(&el_uint(0x55BD, l.max_fall as u64));
+    }
+    if let Some(m) = c.mastering {
+        let mut mm = Vec::new();
+        for (i, v) in m.primaries.iter().flatten().chain(m.white.iter()).enumerate() {
+            mm.extend_from_slice(&el_f64(0x55D1 + i as u32, *v as f64 / 50_000.0));
+        }
+        mm.extend_from_slice(&el_f64(0x55D9, m.max_lum as f64 / 10_000.0));
+        mm.extend_from_slice(&el_f64(0x55DA, m.min_lum as f64 / 10_000.0));
+        b.extend_from_slice(&el(0x55D0, &mm));
+    }
+    el(0x55B0, &b)
+}
+
+/// NLE6EXPORTAAC (rmbp-ledger B960): an AAC track (`mp4a` + `esds`), one raw_data_block per sample of 1024 frames,
+/// timescale = the sample rate. `asc` is the AudioSpecificConfig (audio_core `aac::enc::Encoder::asc`); `config` holds the
+/// whole `esds` body (the full-box word, ES_Descriptor -> DecoderConfigDescriptor (objectTypeIndication 0x40, audio
+/// stream) -> DecoderSpecificInfo = `asc`, SLConfigDescriptor 2), which the reader's `parse_esds` takes back to the ASC.
+/// [`mkv`] does not take this track (it writes `config` verbatim); [`MkvStream`] does (NLE6EXPORTMKV B966, AACENC-MKV:
+/// `A_AAC` with the ASC out of the `esds` as CodecPrivate; the edit list refused under Matroska). The encoder's priming is trimmed by [`mp4a_edit_list`] through [`Mp4Extras::edit_lists`].
+pub fn mp4a_track(id: u32, sample_rate: u32, channels: u16, asc: &[u8], units: Vec<Vec<u8>>, avg_bitrate: u32) -> MediaTrack {
+    let biggest = units.iter().map(|u| u.len()).max().unwrap_or(0) as u32;
+    let spec = mp4a_spec(id, sample_rate, channels, asc, biggest, avg_bitrate);
+    let samples = units.into_iter().enumerate().map(|(i, data)| mp4a_sample(i as u64, data)).collect();
+    MediaTrack { spec, samples }
+}
+
+/// NLE6EXPORT-STREAMPCM (rmbp-ledger B976): [`mp4a_track`]'s sample entry alone, from its biggest unit's size (the esds's
+/// buffer size and max bitrate), so a streamed export states it at the end ([`Mp4Stream::respec`]).
+pub fn mp4a_spec(id: u32, sample_rate: u32, channels: u16, asc: &[u8], biggest: u32, avg_bitrate: u32) -> TrackSpec {
+    let desc = |tag: u8, body: &[u8]| -> Vec<u8> {
+        let mut d = alloc::vec![tag];
+        let n = body.len();
+        d.extend_from_slice(&[0x80 | ((n >> 21) & 0x7F) as u8, 0x80 | ((n >> 14) & 0x7F) as u8, 0x80 | ((n >> 7) & 0x7F) as u8, (n & 0x7F) as u8]);
+        d.extend_from_slice(body);
+        d
+    };
+    let max_bitrate = (biggest as u64 * 8 * sample_rate as u64 / 1024).max(avg_bitrate as u64) as u32;
+    let mut dcd = alloc::vec![0x40u8, 0x15];
+    dcd.extend_from_slice(&biggest.to_be_bytes()[1..]);
+    dcd.u32b(max_bitrate);
+    dcd.u32b(avg_bitrate);
+    dcd.extend_from_slice(&desc(0x05, asc));
+    let mut es = alloc::vec![0u8, 0, 0]; // ES_ID 0, no dependence / URL / OCR
+    es.extend_from_slice(&desc(0x04, &dcd));
+    es.extend_from_slice(&desc(0x06, &[0x02]));
+    let mut config = alloc::vec![0u8; 4]; // the full-box version and flags
+    config.extend_from_slice(&desc(0x03, &es));
+    TrackSpec {
+        id,
+        kind: TrackKind::Audio,
+        fourcc: *b"mp4a",
+        config_box: Some(*b"esds"),
+        codec_id: "A_AAC",
+        config,
+        timescale: sample_rate,
+        width: 0,
+        height: 0,
+        sample_rate,
+        channels,
+        bit_depth: 16,
+        default_duration_ns: 0,
+    }
+}
+
+/// NLE6EXPORT-STREAMPCM (rmbp-ledger B976): [`mp4a_track`]'s unit `index` (1024 samples each).
+pub fn mp4a_sample(index: u64, data: Vec<u8>) -> SampleSpec {
+    SampleSpec { data, dts: index as i64 * 1024, pts: index as i64 * 1024, duration: 1024, keyframe: true }
+}
+
+/// The [`Mp4Extras::edit_lists`] entry of an [`mp4a_track`]: skip `priming` media samples, present `frames` (in the
+/// default movie timescale, 1000).
+pub fn mp4a_edit_list(id: u32, sample_rate: u32, priming: u32, frames: u64) -> (u32, Vec<(u32, i64, i32)>) {
+    let seg = (frames as u128 * 1000 / sample_rate.max(1) as u128) as u32;
+    (id, alloc::vec![(seg, priming as i64, 0x0001_0000)])
+}
+
+#[cfg(test)]
+mod tests {
+    /// SWAPBACKVPLAY (rmbp-ledger B956): the stand-in's pixels, pinned. FNV-1a 64 of `test_pattern_rgba(64, 48, n)`,
+    /// derived off-tree by a line-for-line port of the painter; the kernel's `tests nle` pins frame 1 (`STANDIN_KAT`,
+    /// `unaos/crates/kernel/src/video/player.rs`) and gneiss_pal's stand-in decode is pinned to it too.
+    #[test]
+    fn stand_in_kat() {
+        let fnv = |b: &[u8]| b.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &x| (h ^ x as u64).wrapping_mul(0x0000_0100_0000_01b3));
+        assert_eq!(fnv(&super::test_pattern_rgba(64, 48, 0)), 0x9b3e_eb3c_004c_17a5);
+        assert_eq!(fnv(&super::test_pattern_rgba(64, 48, 1)), 0xdb29_ef26_80d9_5484);
+        for n in [0u32, 1, 42, 999_999] {
+            assert_eq!(super::test_pattern_counter(&super::test_pattern_rgba(64, 48, n), 64, 48), Some(n));
+        }
+    }
+
+    /// NLE6EXPORTAAC (rmbp-ledger B960): the `mp4a` / `esds` track and its priming edit read back through the demuxer.
+    #[test]
+    fn mp4a_track_round_trip() {
+        use alloc::vec;
+        let asc = [0x11u8, 0x90];
+        let units: alloc::vec::Vec<alloc::vec::Vec<u8>> = (0..5u8).map(|i| vec![0x21, i, 0x40]).collect();
+        let t = super::mp4a_track(1, 48000, 2, &asc, units.clone(), 128000);
+        let x = super::Mp4Extras { edit_lists: vec![super::mp4a_edit_list(1, 48000, 1024, 3000)], ..Default::default() };
+        let mp4 = super::mp4_with(&[t], &super::Mp4Options::default(), &x);
+        let d = crate::Demuxer::open(mp4).unwrap();
+        let tr = &d.tracks()[0];
+        assert_eq!(tr.codec, crate::Codec::Aac);
+        assert_eq!(tr.config, asc.to_vec());
+        assert_eq!((tr.sample_rate, tr.channels), (48000, 2));
+        assert_eq!(tr.edit.map(|e| e.media_time), Some(1024));
+        let got: alloc::vec::Vec<_> = d.track_samples(0).map(|s| (s.dts, s.duration, d.packet_at(s).data)).collect();
+        assert_eq!(got.len(), 5);
+        for (i, (dts, dur, data)) in got.into_iter().enumerate() {
+            assert_eq!((dts, dur, data), (i as i64 * 1024, 1024, units[i].clone()));
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// NLE6EXPORTONE (rmbp-ledger B963; handlers.md §5 NLE6's NLE6EXPORT-TRACK / -STREAM, BP-handlers-14): the ONE coded video
+// track both export faces mux, and the streamed MP4 (the classic non-faststart layout: ftyp, a 64-bit mdat written sample
+// by sample, the moov at the end through the same `mvhd` / `trak` [`mp4_with`] writes; the reader finds a moov anywhere).
+// ---------------------------------------------------------------------------------------------
+
+/// NLE6EXPORT-TRACK (B963): the ONE coded-video sample entry both export faces write (Stria's `nle_export` `video_track`
+/// and the kernel's `nle export`): `fourcc` / `config_box` / `config` (e.g. `avc1` / `avcC` / the encoder's avcC),
+/// `width x height`, timescale = `tb.den` (the project's fps), one sample lasting `tb.num` ticks.
+pub fn coded_video_spec(id: u32, fourcc: [u8; 4], config_box: Option<[u8; 4]>, config: Vec<u8>, width: u16, height: u16, tb: crate::Timebase) -> TrackSpec {
+    let num = tb.num.max(1) as u32;
+    TrackSpec {
+        id,
+        kind: TrackKind::Video,
+        fourcc,
+        config_box,
+        codec_id: "",
+        config,
+        timescale: tb.den as u32,
+        width,
+        height,
+        sample_rate: 0,
+        channels: 0,
+        bit_depth: 0,
+        default_duration_ns: num as u64 * 1_000_000_000 / tb.den.max(1),
+    }
+}
+
+/// One coded unit at its (dts, pts) in `tb` ticks (pts != dts writes `ctts`), lasting one tick.
+pub fn coded_video_sample(tb: crate::Timebase, keyframe: bool, data: Vec<u8>, dts: i64, pts: i64) -> SampleSpec {
+    let num = tb.num.max(1) as u32;
+    SampleSpec { data, dts: dts * num as i64, pts: pts * num as i64, duration: num, keyframe }
+}
+
+/// [`coded_video_spec`]'s track with its units `(keyframe, data, dts, pts)` (ticks of `tb`), each a [`coded_video_sample`].
+pub fn coded_video_track(spec: TrackSpec, tb: crate::Timebase, units: impl IntoIterator<Item = (bool, Vec<u8>, i64, i64)>) -> MediaTrack {
+    let samples = units.into_iter().map(|(k, data, dts, pts)| coded_video_sample(tb, k, data, dts, pts)).collect();
+    MediaTrack { spec, samples }
+}
+
+/// Where [`Mp4Stream`] writes: bytes at an absolute file offset (appends at the end, one patch of the mdat size).
+pub trait Sink {
+    type Error;
+    fn write_at(&mut self, off: u64, bytes: &[u8]) -> Result<(), Self::Error>;
+}
+
+impl Sink for Vec<u8> {
+    type Error = core::convert::Infallible;
+    fn write_at(&mut self, off: u64, bytes: &[u8]) -> Result<(), Self::Error> {
+        let (o, e) = (off as usize, off as usize + bytes.len());
+        if self.len() < e {
+            self.resize(e, 0);
+        }
+        self[o..e].copy_from_slice(bytes);
+        Ok(())
+    }
+}
+
+/// One streamed track: its spec, the samples' tables (data emptied once written), sizes and file offsets.
+struct Streamed {
+    spec: TrackSpec,
+    samples: Vec<SampleSpec>,
+    sizes: Vec<u32>,
+    offsets: Vec<u64>,
+}
+
+/// NLE6EXPORT-STREAM (B963): an MP4 written as it is made. [`Mp4Stream::begin`] writes the ftyp and a 64-bit `mdat` header,
+/// [`Mp4Stream::push`] writes each sample's bytes at the end and keeps only its table entry, [`Mp4Stream::finish`] writes
+/// the `moov` (one sample per chunk, `stco` = the recorded offsets, `co64` past 4 GiB) and patches the mdat's size. The
+/// sample tables are the ones [`mp4`] writes for the same tracks (only the chunk offsets differ). Progressive only:
+/// `Mp4Options::fragment` is ignored.
+pub struct Mp4Stream<S: Sink> {
+    sink: S,
+    end: u64,
+    mdat_at: u64,
+    video_bytes: u64,
+    tracks: Vec<Streamed>,
+}
+
+impl<S: Sink> Mp4Stream<S> {
+    /// Start the file at offset 0 of `sink`: [`mp4`]'s ftyp, then `mdat` with a 0 largesize (patched by `finish`).
+    pub fn begin(mut sink: S) -> Result<Self, S::Error> {
+        let one = mp4(&[], &Mp4Options::default());
+        let n = u32::from_be_bytes([one[0], one[1], one[2], one[3]]) as usize;
+        let mut head = Vec::with_capacity(n + 16);
+        head.extend_from_slice(&one[..n]);
+        head.u32b(1);
+        head.extend_from_slice(b"mdat");
+        head.u64b(0);
+        sink.write_at(0, &head)?;
+        Ok(Mp4Stream { sink, end: head.len() as u64, mdat_at: n as u64, video_bytes: 0, tracks: Vec::new() })
+    }
+
+    /// Add a track (any time before `finish`; the moov lists tracks in this order); its index for [`Mp4Stream::push`].
+    pub fn track(&mut self, spec: TrackSpec) -> usize {
+        self.tracks.push(Streamed { spec, samples: Vec::new(), sizes: Vec::new(), offsets: Vec::new() });
+        self.tracks.len() - 1
+    }
+
+    /// NLE6EXPORT-STREAMPCM (rmbp-ledger B976): restate track `track`'s sample entry before `finish` (one known only at the
+    /// end: an `mp4a_spec`'s biggest unit).
+    pub fn respec(&mut self, track: usize, spec: TrackSpec) {
+        self.tracks[track].spec = spec;
+    }
+
+    /// Write sample `s` of track `track` (an index from [`Mp4Stream::track`]) at the end of the file.
+    pub fn push(&mut self, track: usize, mut s: SampleSpec) -> Result<(), S::Error> {
+        self.sink.write_at(self.end, &s.data)?;
+        let n = s.data.len();
+        let t = &mut self.tracks[track];
+        t.offsets.push(self.end);
+        t.sizes.push(n as u32);
+        if t.spec.kind == TrackKind::Video {
+            self.video_bytes += n as u64;
+        }
+        self.end += n as u64;
+        s.data = Vec::new();
+        t.samples.push(s);
+        Ok(())
+    }
+
+    /// The bytes written so far.
+    pub fn len(&self) -> u64 {
+        self.end
+    }
+
+    /// The video tracks' sample bytes written so far.
+    pub fn video_bytes(&self) -> u64 {
+        self.video_bytes
+    }
+
+    /// Write the `moov` at the end and patch the mdat's size; the sink and the file's length. `x` is what [`mp4_with`] takes
+    /// (NLE6EXPORTAAC rmbp-ledger B960: the AAC track's priming edit list), so the one-shot and the stream write one moov.
+    pub fn finish(mut self, opts: &Mp4Options, x: &Mp4Extras) -> Result<(S, u64), S::Error> {
+        let movie_ts = if opts.movie_timescale == 0 { 1000 } else { opts.movie_timescale };
+        let mut o = opts.clone();
+        o.chunk = 1;
+        o.co64 = opts.co64 || self.end > u32::MAX as u64;
+        let built: Vec<(MediaTrack, Vec<u32>, Vec<u64>)> =
+            core::mem::take(&mut self.tracks).into_iter().map(|t| (MediaTrack { spec: t.spec, samples: t.samples }, t.sizes, t.offsets)).collect();
+        let next_id = built.iter().map(|(t, _, _)| t.spec.id).max().unwrap_or(0) + 1;
+        let movie_dur = built.iter().map(|(t, _, _)| track_duration(t) * movie_ts as u64 / t.spec.timescale.max(1) as u64).max().unwrap_or(0);
+        let mut m = mvhd(movie_ts, movie_dur, next_id);
+        for (t, sizes, offsets) in &built {
+            m.extend_from_slice(&trak(t, &o, x, movie_ts, &offsets[..], true, Some(&sizes[..])));
+        }
+        let moov = bx(b"moov", &m);
+        self.sink.write_at(self.end, &moov)?;
+        let mdat_len = self.end - self.mdat_at;
+        self.sink.write_at(self.mdat_at + 8, &mdat_len.to_be_bytes())?;
+        let total = self.end + moov.len() as u64;
+        Ok((self.sink, total))
+    }
+}
+
+#[cfg(test)]
+mod stream_kats {
+    use super::*;
+    use alloc::vec;
+
+    fn units(n: i64) -> Vec<(bool, Vec<u8>, i64, i64)> {
+        // decode order with B pictures: pts = dts + 1 on anchors after the first, dts - 1 on the B between them
+        (0..n).map(|i| (i % 10 == 0, vec![(i * 7) as u8; 40 + (i as usize * 13) % 50], i, if i == 0 { 0 } else if i % 2 == 1 { i + 1 } else { i - 1 })).collect()
+    }
+
+    /// NLE6EXPORT-TRACK (B963): the constructor writes the bytes the retired literal (Stria's `video_track`, the kernel's
+    /// `Exp::write`) wrote, at an integer fps and at 30000/1001.
+    #[test]
+    fn coded_video_track_is_the_retired_literal() {
+        for tb in [crate::Timebase { num: 1, den: 25 }, crate::Timebase { num: 1001, den: 30000 }] {
+            let cfg = vec![1u8, 0x42, 0xc0, 0x1e, 0xff, 0xe1];
+            let u = units(24);
+            let num = tb.num.max(1) as u32;
+            let literal = MediaTrack {
+                spec: TrackSpec {
+                    id: 1,
+                    kind: TrackKind::Video,
+                    fourcc: *b"avc1",
+                    config_box: Some(*b"avcC"),
+                    codec_id: "",
+                    config: cfg.clone(),
+                    timescale: tb.den as u32,
+                    width: 64,
+                    height: 48,
+                    sample_rate: 0,
+                    channels: 0,
+                    bit_depth: 0,
+                    default_duration_ns: num as u64 * 1_000_000_000 / tb.den.max(1),
+                },
+                samples: u.iter().map(|(k, d, dts, pts)| SampleSpec { data: d.clone(), dts: dts * num as i64, pts: pts * num as i64, duration: num, keyframe: *k }).collect(),
+            };
+            let one = coded_video_track(coded_video_spec(1, *b"avc1", Some(*b"avcC"), cfg, 64, 48, tb), tb, u);
+            assert_eq!(mp4(&[one], &Mp4Options::default()), mp4(&[literal], &Mp4Options::default()));
+        }
+    }
+
+    /// The top-level box `kind` of an MP4 (32- or 64-bit sizes).
+    fn top<'a>(b: &'a [u8], kind: &[u8; 4]) -> &'a [u8] {
+        let mut p = 0usize;
+        while p + 8 <= b.len() {
+            let mut n = u32::from_be_bytes([b[p], b[p + 1], b[p + 2], b[p + 3]]) as usize;
+            if n == 1 {
+                n = u64::from_be_bytes(b[p + 8..p + 16].try_into().unwrap()) as usize;
+            }
+            if &b[p + 4..p + 8] == kind {
+                return &b[p..p + n];
+            }
+            p += n.max(8);
+        }
+        panic!("no top-level box");
+    }
+
+    /// NLE6EXPORT-STREAM (B963): the streamed file of {B-ordered video, PCM16} holds the one-shot file's samples, and its
+    /// moov is the one-shot moov byte for byte outside the `stco` entries (the sample tables identical).
+    #[test]
+    fn streamed_moov_is_the_one_shot_moov() {
+        let tb = crate::Timebase { num: 1, den: 25 };
+        let video = coded_video_track(coded_video_spec(1, *b"avc1", Some(*b"avcC"), vec![1, 2, 3], 64, 48, tb), tb, units(30));
+        let pcm: Vec<i16> = (0..48_000 * 2 * 30 / 25).map(|i| (i % 2000) as i16 - 1000).collect();
+        let audio = pcm16_track(2, 48_000, 2, &pcm, 1024);
+        let one = mp4(&[video.clone(), audio.clone()], &Mp4Options::default());
+        let mut st = Mp4Stream::begin(Vec::new()).unwrap();
+        for t in [video, audio] {
+            let i = st.track(t.spec);
+            for s in t.samples {
+                st.push(i, s).unwrap();
+            }
+        }
+        let (file, n) = st.finish(&Mp4Options::default(), &Mp4Extras::default()).unwrap();
+        assert_eq!(n as usize, file.len());
+        let (da, db) = (crate::Demuxer::open(one.clone()).unwrap(), crate::Demuxer::open(file.clone()).unwrap());
+        assert_eq!(da.tracks().len(), 2);
+        assert_eq!(db.tracks().len(), 2);
+        for i in 0..2 {
+            let (a, b): (Vec<_>, Vec<_>) = (da.track_samples(i).collect(), db.track_samples(i).collect());
+            assert_eq!(a.len(), b.len());
+            for (x, y) in a.iter().zip(b.iter()) {
+                assert_eq!((x.size, x.dts, x.pts, x.duration, x.keyframe), (y.size, y.dts, y.pts, y.duration, y.keyframe));
+                assert_eq!(da.sample_data(x), db.sample_data(y));
+            }
+        }
+        let (ma, mb) = (top(&one, b"moov"), top(&file, b"moov"));
+        assert_eq!(ma.len(), mb.len());
+        let mut skip = vec![false; ma.len()];
+        for p in 4..ma.len().saturating_sub(4) {
+            if &ma[p..p + 4] == b"stco" {
+                let size = u32::from_be_bytes([ma[p - 4], ma[p - 3], ma[p - 2], ma[p - 1]]) as usize;
+                for k in p + 12..p - 4 + size {
+                    skip[k] = true;
+                }
+            }
+        }
+        assert!(skip.iter().any(|&s| s));
+        for k in 0..ma.len() {
+            assert!(skip[k] || ma[k] == mb[k], "moov differs at byte {}", k);
+        }
+    }
+
+    /// NLE6EXPORT-STREAMPCM (rmbp-ledger B976): {B-ordered video, PCM16} pushed by the export's ONE interleave rule (a
+    /// 1024-frame packet once it ends by the end of the last video frame pushed; the rest after) demuxes to the one-shot
+    /// file's samples with the one-shot moov outside `stco`, and its mdat interleaves; the split constructors are the old
+    /// builders' bytes.
+    #[test]
+    fn streamed_interleave_is_the_one_shot() {
+        let tb = crate::Timebase { num: 1, den: 25 };
+        let video = coded_video_track(coded_video_spec(1, *b"avc1", Some(*b"avcC"), vec![1, 2, 3], 64, 48, tb), tb, units(30));
+        let pcm: Vec<i16> = (0..48_000 * 2 * 30 / 25 + 2 * 300).map(|i| (i % 1777) as i16 - 888).collect();
+        let audio = pcm16_track(2, 48_000, 2, &pcm, 1024);
+        let one = mp4(&[video.clone(), audio.clone()], &Mp4Options::default());
+        let split = MediaTrack { spec: pcm16_spec(2, 48_000, 2), samples: pcm.chunks(2048).enumerate().map(|(i, c)| pcm16_sample(i as u64 * 1024, c, 2)).collect() };
+        assert_eq!(mp4(&[split], &Mp4Options::default()), mp4(&[audio.clone()], &Mp4Options::default()));
+        let aus: Vec<Vec<u8>> = (0..9u8).map(|i| vec![i; 10 + i as usize * 7]).collect();
+        let a1 = mp4a_track(2, 48_000, 2, &[0x11, 0x90], aus.clone(), 128_000);
+        let a2 = MediaTrack { spec: mp4a_spec(2, 48_000, 2, &[0x11, 0x90], 66, 128_000), samples: aus.into_iter().enumerate().map(|(i, d)| mp4a_sample(i as u64, d)).collect() };
+        assert_eq!(mp4(&[a1], &Mp4Options::default()), mp4(&[a2], &Mp4Options::default()));
+        let mut st = Mp4Stream::begin(Vec::new()).unwrap();
+        let vi = st.track(video.spec.clone());
+        let mut ai = None;
+        let mut next = 0usize;
+        for (k, s) in video.samples.iter().enumerate() {
+            st.push(vi, s.clone()).unwrap();
+            let due = (k as u64 + 1) * 48_000 / 25;
+            while next < audio.samples.len() && (audio.samples[next].dts as u64) + 1024 <= due {
+                let i = *ai.get_or_insert_with(|| st.track(audio.spec.clone()));
+                st.push(i, audio.samples[next].clone()).unwrap();
+                next += 1;
+            }
+        }
+        let i = *ai.get_or_insert_with(|| st.track(audio.spec.clone()));
+        for s in &audio.samples[next..] {
+            st.push(i, s.clone()).unwrap();
+        }
+        let (file, n) = st.finish(&Mp4Options::default(), &Mp4Extras::default()).unwrap();
+        assert_eq!(n as usize, file.len());
+        let (da, db) = (crate::Demuxer::open(one.clone()).unwrap(), crate::Demuxer::open(file.clone()).unwrap());
+        assert_eq!(db.tracks().len(), 2);
+        for t in 0..2 {
+            let (a, b): (Vec<_>, Vec<_>) = (da.track_samples(t).collect(), db.track_samples(t).collect());
+            assert_eq!(a.len(), b.len());
+            for (x, y) in a.iter().zip(b.iter()) {
+                assert_eq!((x.size, x.dts, x.pts, x.duration, x.keyframe), (y.size, y.dts, y.pts, y.duration, y.keyframe));
+                assert_eq!(da.sample_data(x), db.sample_data(y));
+            }
+        }
+        let first_audio = db.track_samples(1).map(|s| s.offset).min().unwrap();
+        let last_video = db.track_samples(0).map(|s| s.offset).max().unwrap();
+        assert!(first_audio < last_video, "the streamed mdat interleaves");
+        let (ma, mb) = (top(&one, b"moov"), top(&file, b"moov"));
+        assert_eq!(ma.len(), mb.len());
+        let mut skip = vec![false; ma.len()];
+        for p in 4..ma.len().saturating_sub(4) {
+            if &ma[p..p + 4] == b"stco" {
+                let size = u32::from_be_bytes([ma[p - 4], ma[p - 3], ma[p - 2], ma[p - 1]]) as usize;
+                for k in p + 12..p - 4 + size {
+                    skip[k] = true;
+                }
+            }
+        }
+        for k in 0..ma.len() {
+            assert!(skip[k] || ma[k] == mb[k], "moov differs at byte {}", k);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// NLE6EXPORTMKV (rmbp-ledger B966; handlers.md §5 NLE6's NLE6EXPORT-MKV, BP-handlers-14): the export's Matroska. ONE
+// container rule (the output file's extension, [`Container::of`]), the streamed Matroska beside B963's [`Mp4Stream`] on the
+// same [`Sink`], the ONE stream type the kernel holds ([`MuxStream`]) and the one-shot over it ([`mux`]). [`mkv`] stays the
+// remux / KAT writer; both write their EBML header, TrackEntry and decode order through the same `mkv_header` /
+// `mkv_track_entry` / `decode_order`.
+// ---------------------------------------------------------------------------------------------
+
+/// NLE6EXPORTMKV (B966): the export's container. THE RULE (both faces): the output file's extension names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Container {
+    Mp4,
+    Mkv,
+}
+
+impl Container {
+    /// `<stem>.mp4` -> MP4, `<stem>.mkv` -> Matroska (ASCII case-insensitive); anything else None (refused).
+    pub fn of(name: &str) -> Option<Container> {
+        let n = name.len();
+        if n <= 4 || !name.is_char_boundary(n - 4) {
+            return None;
+        }
+        let e = &name[n - 4..];
+        if e.eq_ignore_ascii_case(".mp4") {
+            Some(Container::Mp4)
+        } else if e.eq_ignore_ascii_case(".mkv") {
+            Some(Container::Mkv)
+        } else {
+            None
+        }
+    }
+
+    /// The extension a face names its file with (`movie.<ext>`).
+    pub fn ext(self) -> &'static str {
+        match self {
+            Container::Mp4 => "mp4",
+            Container::Mkv => "mkv",
+        }
+    }
+}
+
+/// [`MkvStream`]'s TimestampScale (1 ms ticks: a SimpleBlock's i16 relative time spans 32 s).
+const MKV_SCALE: u64 = 1_000_000;
+/// The bytes reserved after Info for the Tracks (written at `finish`: a track may be declared after the first block).
+const MKV_TRACKS_ROOM: usize = 1024;
+/// A Cluster spans at most this many ticks (5 s).
+const MKV_CLUSTER_TICKS: i64 = 5000;
+/// An 8-byte EBML size of "unknown" (RFC 8794 §6.2): the Segment's and each Cluster's until patched.
+const MKV_UNKNOWN: [u8; 8] = [0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF];
+
+/// A Void element (0xEC) exactly `n` bytes long (`n` >= 2).
+fn mkv_void(n: usize) -> Vec<u8> {
+    let mut v = alloc::vec![0xEC];
+    if n >= 9 {
+        put_vint(&mut v, (n - 9) as u64, 8);
+        v.resize(n, 0);
+    } else {
+        v.push(0x80 | (n.max(2) - 2) as u8);
+        v.resize(n.max(2), 0);
+    }
+    v
+}
+
+/// One Seek (SeekID `id`, an 8-byte SeekPosition `pos`): its size does not depend on `pos`.
+fn mkv_seek(id: [u8; 4], pos: u64) -> Vec<u8> {
+    el(0x4DBB, &cat(&[&el(0x53AB, &id), &el(0x53AC, &pos.to_be_bytes())]))
+}
+
+/// NLE6EXPORTMKV (B966): a Matroska file written as it is made, on the same [`Sink`] as [`Mp4Stream`]. [`MkvStream::begin`]
+/// writes the EBML header (DocType `matroska`), a Segment of unknown size, a SeekHead (Tracks, Cues), Info (TimestampScale
+/// 1 ms, a Duration placeholder) and a Void reserving the Tracks' room; [`MkvStream::push`] writes each sample as a
+/// SimpleBlock (no lacing) at the end, opening a Cluster (unknown size, patched when it closes) on a video keyframe, every
+/// 5 s, or when the block's relative time would leave 0..32767; [`MkvStream::finish`] writes the Cues (one CuePoint per
+/// video keyframe), the Tracks into their room, and patches the Cues' SeekPosition, the Duration and the Segment's size.
+/// Block times are the presentation times; Matroska stores no dts (the reader's dts = pts).
+pub struct MkvStream<S: Sink> {
+    sink: S,
+    end: u64,
+    seg_body: u64,
+    dur_at: u64,
+    cues_seek_at: u64,
+    cues_pos_at: u64,
+    room_at: u64,
+    tracks: Vec<(TrackSpec, Vec<u8>)>,
+    cluster: Option<(u64, i64)>,
+    cluster_blocks: usize,
+    cues: Vec<(u64, u32, u64)>,
+    end_ns: i64,
+    video_bytes: u64,
+}
+
+impl<S: Sink> MkvStream<S> {
+    /// Start the file at offset 0 of `sink`: header, Segment (unknown size), SeekHead, Info, the Tracks' room.
+    pub fn begin(mut sink: S) -> Result<Self, S::Error> {
+        const TRACKS_ID: [u8; 4] = [0x16, 0x54, 0xAE, 0x6B];
+        const CUES_ID: [u8; 4] = [0x1C, 0x53, 0xBB, 0x6B];
+        let mut head = mkv_header(false);
+        put_id(&mut head, 0x1853_8067);
+        head.extend_from_slice(&MKV_UNKNOWN);
+        let seg_body = head.len();
+        let seek_len = mkv_seek(CUES_ID, 0).len();
+        let sh_len = el(0x114D_9B74, &cat(&[&mkv_seek(TRACKS_ID, 0), &mkv_seek(CUES_ID, 0)])).len();
+        let scale = el_uint(0x2A_D7B1, MKV_SCALE);
+        let body = cat(&[&scale, &el_f64(0x4489, 0.0), &el(0x4D80, b"UnaOS demux_core"), &el(0x5741, b"UnaOS demux_core")]);
+        let info = el(0x1549_A966, &body);
+        let room_rel = sh_len + info.len();
+        head.extend_from_slice(&el(0x114D_9B74, &cat(&[&mkv_seek(TRACKS_ID, room_rel as u64), &mkv_seek(CUES_ID, 0)])));
+        head.extend_from_slice(&info);
+        head.extend_from_slice(&mkv_void(MKV_TRACKS_ROOM));
+        sink.write_at(0, &head)?;
+        let cues_seek_at = (seg_body + sh_len - seek_len) as u64;
+        Ok(MkvStream {
+            sink,
+            end: head.len() as u64,
+            seg_body: seg_body as u64,
+            // Info's id + size, the TimestampScale, then Duration's 2-byte id and 1-byte size
+            dur_at: (seg_body + sh_len + (info.len() - body.len()) + scale.len() + 3) as u64,
+            cues_seek_at,
+            cues_pos_at: cues_seek_at + seek_len as u64 - 8,
+            room_at: (seg_body + room_rel) as u64,
+            tracks: Vec::new(),
+            cluster: None,
+            cluster_blocks: 0,
+            cues: Vec::new(),
+            end_ns: 0,
+            video_bytes: 0,
+        })
+    }
+
+    /// Add a track (any time before `finish`; the Tracks list them in this order; TrackNumber = `spec.id`); its index for
+    /// [`MkvStream::push`]. The CodecID comes from the fourcc: `avc1` -> `V_MPEG4/ISO/AVC` (CodecPrivate = the avcC record),
+    /// `sowt` -> `A_PCM/INT/LIT` (BitDepth), `mp4a` -> `A_AAC` (CodecPrivate = the AudioSpecificConfig: `config`, or the
+    /// DecoderSpecificInfo of an `esds` config). Any other codec is refused by name, as are Tracks past the reserved room.
+    pub fn track(&mut self, spec: TrackSpec) -> Result<usize, alloc::string::String> {
+        let entry = self.entry_of(&spec, None)?;
+        self.tracks.push((spec, entry));
+        Ok(self.tracks.len() - 1)
+    }
+
+    /// Restate track `track`'s spec before `finish` (as [`Mp4Stream::respec`]: an `mp4a_spec`'s biggest unit known at the
+    /// end); its TrackEntry is rebuilt (the Tracks are written at `finish`), refused as [`MkvStream::track`] refuses.
+    pub fn respec(&mut self, track: usize, spec: TrackSpec) -> Result<(), alloc::string::String> {
+        let entry = self.entry_of(&spec, Some(track))?;
+        self.tracks[track] = (spec, entry);
+        Ok(())
+    }
+
+    /// `spec`'s TrackEntry (the CodecID from the fourcc), refused by codec name or when the Tracks (with `replacing` left
+    /// out) would pass the reserved room.
+    fn entry_of(&self, spec: &TrackSpec, replacing: Option<usize>) -> Result<Vec<u8>, alloc::string::String> {
+        let (codec, private): (&str, Vec<u8>) = match &spec.fourcc {
+            b"avc1" => ("V_MPEG4/ISO/AVC", spec.config.clone()),
+            b"sowt" => ("A_PCM/INT/LIT", Vec::new()),
+            b"mp4a" if spec.config_box == Some(*b"esds") => {
+                ("A_AAC", crate::mp4::parse_esds(&spec.config).map(|(_, asc)| asc).map_err(|e| alloc::format!("mp4a: esds: {}", e))?)
+            }
+            b"mp4a" => ("A_AAC", spec.config.clone()),
+            f => {
+                return Err(alloc::format!(
+                    "{}: the Matroska export writes avc1, sowt and mp4a only (the WebM profile is owed)",
+                    alloc::string::String::from_utf8_lossy(f)
+                ));
+            }
+        };
+        let entry = mkv_track_entry(spec, codec, &private, &[]);
+        let total = self.tracks.iter().enumerate().filter(|(k, _)| Some(*k) != replacing).map(|(_, (_, e))| e.len()).sum::<usize>() + entry.len();
+        if 4 + vint_len(total as u64) + total + 9 > MKV_TRACKS_ROOM {
+            return Err(alloc::format!("track {}: the Matroska Tracks pass their {} reserved bytes", spec.id, MKV_TRACKS_ROOM));
+        }
+        Ok(entry)
+    }
+
+    /// Close the open Cluster: patch its 8-byte size.
+    fn close_cluster(&mut self) -> Result<(), S::Error> {
+        if let Some((at, _)) = self.cluster.take() {
+            let mut v = Vec::with_capacity(8);
+            put_vint(&mut v, self.end - at - 12, 8);
+            self.sink.write_at(at + 4, &v)?;
+        }
+        Ok(())
+    }
+
+    /// Write sample `s` of track `track` (an index from [`MkvStream::track`]) as a SimpleBlock at the end of the file.
+    pub fn push(&mut self, track: usize, s: SampleSpec) -> Result<(), S::Error> {
+        let (id, ts, video) = {
+            let t = &self.tracks[track].0;
+            (t.id, t.timescale, t.kind == TrackKind::Video)
+        };
+        let ns = to_ns(s.pts, ts);
+        let ticks = (ns / MKV_SCALE as i64).max(0);
+        let open = match self.cluster {
+            None => true,
+            Some((_, c)) => (video && s.keyframe && self.cluster_blocks > 0) || !(0..MKV_CLUSTER_TICKS).contains(&(ticks - c)),
+        };
+        if open {
+            self.close_cluster()?;
+            let mut h = Vec::with_capacity(20);
+            put_id(&mut h, 0x1F43_B675);
+            h.extend_from_slice(&MKV_UNKNOWN);
+            h.extend_from_slice(&el_uint(0xE7, ticks as u64));
+            self.sink.write_at(self.end, &h)?;
+            self.cluster = Some((self.end, ticks));
+            self.cluster_blocks = 0;
+            self.end += h.len() as u64;
+        }
+        let (at, c) = self.cluster.unwrap_or((self.end, ticks));
+        if video && s.keyframe {
+            self.cues.push((ticks as u64, id, at - self.seg_body));
+        }
+        let idl = vint_len(id as u64);
+        let body = (idl + 3 + s.data.len()) as u64;
+        let mut h = Vec::with_capacity(16);
+        h.push(0xA3);
+        put_vint(&mut h, body, vint_len(body));
+        put_vint(&mut h, id as u64, idl);
+        h.extend_from_slice(&((ticks - c) as i16).to_be_bytes());
+        h.push(if s.keyframe { 0x80 } else { 0 });
+        self.sink.write_at(self.end, &h)?;
+        self.end += h.len() as u64;
+        self.sink.write_at(self.end, &s.data)?;
+        self.end += s.data.len() as u64;
+        if video {
+            self.video_bytes += s.data.len() as u64;
+        }
+        self.cluster_blocks += 1;
+        self.end_ns = self.end_ns.max(ns + to_ns(s.duration as i64, ts));
+        Ok(())
+    }
+
+    /// The bytes written so far.
+    pub fn len(&self) -> u64 {
+        self.end
+    }
+
+    /// The video tracks' sample bytes written so far.
+    pub fn video_bytes(&self) -> u64 {
+        self.video_bytes
+    }
+
+    /// Close the Cluster, write the Cues and the Tracks, patch the Cues' SeekPosition, the Duration and the Segment's
+    /// size; the sink and the file's length. With no video keyframe the Cues' Seek becomes a Void.
+    pub fn finish(mut self) -> Result<(S, u64), S::Error> {
+        self.close_cluster()?;
+        if self.cues.is_empty() {
+            let n = (self.cues_pos_at + 8 - self.cues_seek_at) as usize;
+            self.sink.write_at(self.cues_seek_at, &mkv_void(n))?;
+        } else {
+            let mut c = Vec::new();
+            for &(t, id, pos) in &self.cues {
+                let p = cat(&[&el_uint(0xF7, id as u64), &el_uint(0xF1, pos)]);
+                c.extend_from_slice(&el(0xBB, &cat(&[&el_uint(0xB3, t), &el(0xB7, &p)])));
+            }
+            let cues = el(0x1C53_BB6B, &c);
+            self.sink.write_at(self.cues_pos_at, &(self.end - self.seg_body).to_be_bytes())?;
+            self.sink.write_at(self.end, &cues)?;
+            self.end += cues.len() as u64;
+        }
+        let mut tr = Vec::new();
+        for (_, e) in &self.tracks {
+            tr.extend_from_slice(e);
+        }
+        let mut room = el(0x1654_AE6B, &tr);
+        let fill = MKV_TRACKS_ROOM - room.len();
+        room.extend_from_slice(&mkv_void(fill));
+        self.sink.write_at(self.room_at, &room)?;
+        self.sink.write_at(self.dur_at, &(self.end_ns as f64 / MKV_SCALE as f64).to_bits().to_be_bytes())?;
+        let mut v = Vec::with_capacity(8);
+        put_vint(&mut v, self.end - self.seg_body, 8);
+        self.sink.write_at(self.seg_body - 8, &v)?;
+        Ok((self.sink, self.end))
+    }
+}
+
+/// NLE6EXPORTMKV (B966): the ONE stream type an exporter holds, the container chosen at `begin` ([`Container::of`]).
+pub enum MuxStream<S: Sink> {
+    Mp4(Mp4Stream<S>),
+    Mkv(MkvStream<S>),
+}
+
+impl<S: Sink> MuxStream<S> {
+    pub fn begin(c: Container, sink: S) -> Result<Self, S::Error> {
+        Ok(match c {
+            Container::Mp4 => MuxStream::Mp4(Mp4Stream::begin(sink)?),
+            Container::Mkv => MuxStream::Mkv(MkvStream::begin(sink)?),
+        })
+    }
+
+    /// [`Mp4Stream::track`] (never refused) or [`MkvStream::track`] (refuses a codec it does not write, by name).
+    pub fn track(&mut self, spec: TrackSpec) -> Result<usize, alloc::string::String> {
+        match self {
+            MuxStream::Mp4(m) => Ok(m.track(spec)),
+            MuxStream::Mkv(m) => m.track(spec),
+        }
+    }
+
+    /// [`Mp4Stream::respec`] or [`MkvStream::respec`] (which may refuse the restated codec by name).
+    pub fn respec(&mut self, track: usize, spec: TrackSpec) -> Result<(), alloc::string::String> {
+        match self {
+            MuxStream::Mp4(m) => {
+                m.respec(track, spec);
+                Ok(())
+            }
+            MuxStream::Mkv(m) => m.respec(track, spec),
+        }
+    }
+
+    pub fn push(&mut self, track: usize, s: SampleSpec) -> Result<(), S::Error> {
+        match self {
+            MuxStream::Mp4(m) => m.push(track, s),
+            MuxStream::Mkv(m) => m.push(track, s),
+        }
+    }
+
+    pub fn len(&self) -> u64 {
+        match self {
+            MuxStream::Mp4(m) => m.len(),
+            MuxStream::Mkv(m) => m.len(),
+        }
+    }
+
+    pub fn video_bytes(&self) -> u64 {
+        match self {
+            MuxStream::Mp4(m) => m.video_bytes(),
+            MuxStream::Mkv(m) => m.video_bytes(),
+        }
+    }
+
+    /// [`Mp4Stream::finish`] with `opts` and `x`, or [`MkvStream::finish`] (which takes neither: [`mkv_refuses_extras`]
+    /// refuses a non-empty edit list by name — the AAC priming has no Matroska form here — and the other extras are MP4's).
+    pub fn finish(self, opts: &Mp4Options, x: &Mp4Extras) -> Result<(S, u64), S::Error>
+    where
+        S::Error: From<alloc::string::String>,
+    {
+        match self {
+            MuxStream::Mp4(m) => m.finish(opts, x),
+            MuxStream::Mkv(m) => {
+                mkv_refuses_extras(x)?;
+                m.finish()
+            }
+        }
+    }
+}
+
+/// A `Vec<u8>` sink's error (none) as the one-shot's refusal type.
+fn never(e: core::convert::Infallible) -> alloc::string::String {
+    match e {}
+}
+
+/// NLE6EXPORTMKV (B966): an [`Mp4Extras`] edit list under Matroska, refused by name (the AAC priming's Matroska form is
+/// CodecDelay: NLE6EXPORTMKV-AACDELAY owed). The other extras (sidx, mfra, sdtp, colour) are MP4 boxes and are not read.
+fn mkv_refuses_extras(x: &Mp4Extras) -> Result<(), alloc::string::String> {
+    match x.edit_lists.iter().find(|(_, l)| !l.is_empty()) {
+        Some((id, _)) => Err(alloc::format!("track {}: an edit list (the AAC priming) has no Matroska form here (CodecDelay owed)", id)),
+        None => Ok(()),
+    }
+}
+
+/// NLE6EXPORTMKV (B966): the one-shot file of `tracks` in container `c`: MP4 = [`mp4_with`] with the default options and
+/// `x` (the bytes Stria's export wrote before), Matroska = an [`MkvStream`] fed in decode order. Refused: a codec Matroska
+/// does not write, or an edit list in `x` under Matroska ([`mkv_refuses_extras`]).
+pub fn mux(tracks: &[MediaTrack], c: Container, x: &Mp4Extras) -> Result<Vec<u8>, alloc::string::String> {
+    if c == Container::Mp4 {
+        return Ok(mp4_with(tracks, &Mp4Options::default(), x));
+    }
+    mkv_refuses_extras(x)?;
+    let mut st = MkvStream::begin(Vec::new()).map_err(never)?;
+    let ids = tracks.iter().map(|t| st.track(t.spec.clone())).collect::<Result<Vec<usize>, _>>()?;
+    for (i, k) in decode_order(tracks) {
+        st.push(ids[i], tracks[i].samples[k].clone()).map_err(never)?;
+    }
+    Ok(st.finish().map_err(never)?.0)
+}
+
+#[cfg(test)]
+mod mkv_stream_kats {
+    use super::*;
+    use alloc::vec;
+
+    /// {avc1 at 1/25, 30 units in decode order with B pictures (a keyframe every 10), PCM16 48 kHz stereo}.
+    fn tracks() -> Vec<MediaTrack> {
+        let tb = crate::Timebase { num: 1, den: 25 };
+        let units = (0..30i64).map(|i| (i % 10 == 0, vec![(i * 5) as u8; 30 + (i as usize * 11) % 40], i, if i == 0 { 0 } else if i % 2 == 1 { i + 1 } else { i - 1 }));
+        let video = coded_video_track(coded_video_spec(1, *b"avc1", Some(*b"avcC"), vec![1, 0x42, 0xc0, 0x1e, 0xff, 0xe1], 64, 48, tb), tb, units);
+        let pcm: Vec<i16> = (0..48_000 * 2 * 30 / 25).map(|i| (i % 3000) as i16 - 1500).collect();
+        vec![video, pcm16_track(2, 48_000, 2, &pcm, 1024)]
+    }
+
+    /// Track `i` of `d` as (size, keyframe, pts ns, data), in file order.
+    fn rows(d: &crate::Demuxer, i: usize) -> Vec<(u32, bool, i64, Vec<u8>)> {
+        let t = &d.tracks()[i];
+        d.track_samples(i).map(|s| (s.size, s.keyframe, t.to_ns(s.pts), d.sample_data(s).to_vec())).collect()
+    }
+
+    fn same(a: &[(u32, bool, i64, Vec<u8>)], b: &[(u32, bool, i64, Vec<u8>)]) {
+        assert_eq!(a.len(), b.len());
+        for (k, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+            assert_eq!((x.0, x.1, &x.3), (y.0, y.1, &y.3), "sample {}", k);
+            assert!((x.2 - y.2).abs() <= MKV_SCALE as i64, "sample {} pts {} vs {}", k, x.2, y.2);
+        }
+    }
+
+    /// NLE6EXPORTMKV (B966): the Matroska round trip carries the MP4 round trip's samples (size, keyframe, data; pts within
+    /// the 1 ms TimestampScale — Matroska stores no dts), its Cues index the three keyframes, the streamed file pushed in
+    /// decode order is the one-shot's bytes, and pushed in the kernel's order (the video, then the PCM at finish) it holds
+    /// the same samples.
+    #[test]
+    fn mkv_round_trip() {
+        let t = tracks();
+        let none = Mp4Extras::default();
+        let (m4, mk) = (mux(&t, Container::Mp4, &none).unwrap(), mux(&t, Container::Mkv, &none).unwrap());
+        assert_eq!(m4, mp4(&t, &Mp4Options::default()));
+        let (da, db) = (crate::Demuxer::open(m4).unwrap(), crate::Demuxer::open(mk.clone()).unwrap());
+        assert_eq!(db.format(), crate::Format::Matroska);
+        assert_eq!(db.tracks().len(), 2);
+        assert_eq!((db.tracks()[0].codec.clone(), db.tracks()[0].width, db.tracks()[0].height), (crate::Codec::Avc, 64, 48));
+        assert_eq!(db.tracks()[0].config, t[0].spec.config, "CodecPrivate is the avcC record");
+        assert_eq!(db.tracks()[1].codec, crate::Codec::Pcm { bits: 16, float: false, big_endian: false });
+        assert_eq!((db.tracks()[1].sample_rate, db.tracks()[1].channels), (48_000, 2));
+        for i in 0..2 {
+            same(&rows(&da, i), &rows(&db, i));
+        }
+        let ix = crate::Demuxer::open_indexed(mk.clone()).unwrap();
+        assert!(ix.indexed(), "the Cues are found through the SeekHead");
+        assert_eq!(ix.index().len(), 3);
+
+        let mut st = MkvStream::begin(Vec::new()).unwrap();
+        let ids: Vec<usize> = t.iter().map(|x| st.track(x.spec.clone()).unwrap()).collect();
+        for (i, k) in decode_order(&t) {
+            st.push(ids[i], t[i].samples[k].clone()).unwrap();
+        }
+        let (file, n) = st.finish().unwrap();
+        assert_eq!(n as usize, file.len());
+        assert_eq!(file, mk, "the streamed file is the one-shot's bytes");
+
+        let mut st = MkvStream::begin(Vec::new()).unwrap();
+        for x in &t {
+            let i = st.track(x.spec.clone()).unwrap();
+            for s in &x.samples {
+                st.push(i, s.clone()).unwrap();
+            }
+        }
+        let (late, _) = st.finish().unwrap();
+        let dc = crate::Demuxer::open(late).unwrap();
+        for i in 0..2 {
+            same(&rows(&db, i), &rows(&dc, i));
+        }
+    }
+
+    /// NLE6EXPORTMKV (B966): a codec the Matroska export does not write is refused by name; the rule is the extension.
+    #[test]
+    fn mkv_refuses_by_name_and_the_rule() {
+        let mut st = MkvStream::begin(Vec::new()).unwrap();
+        let mut spec = TrackSpec::test_pattern(1, 64, 48, 25);
+        spec.fourcc = *b"av01";
+        let e = st.track(spec).unwrap_err();
+        assert!(e.starts_with("av01:"), "{}", e);
+        assert_eq!(Container::of("OUT/NLEFXK.MKV"), Some(Container::Mkv));
+        assert_eq!(Container::of("movie.mp4"), Some(Container::Mp4));
+        assert_eq!(Container::of("movie.mov"), None);
+        assert_eq!(Container::of(".mkv"), None);
+    }
+
+    /// NLE6EXPORTMKV (B966): an `mp4a` track ([`mp4a_track`], its config the whole `esds` body) is `A_AAC` with the bare
+    /// AudioSpecificConfig as CodecPrivate; its priming edit list is refused under Matroska by name and kept under MP4.
+    #[test]
+    fn mkv_aac_track_and_its_edit_list() {
+        let asc = [0x11u8, 0x90];
+        let aac = mp4a_track(2, 48_000, 2, &asc, vec![vec![0x21, 0x10, 0x04]; 4], 128_000);
+        let mk = mux(&[aac.clone()], Container::Mkv, &Mp4Extras::default()).unwrap();
+        let d = crate::Demuxer::open(mk).unwrap();
+        assert_eq!(d.tracks()[0].codec, crate::Codec::Aac);
+        assert_eq!(d.tracks()[0].config, asc.to_vec(), "CodecPrivate is the ASC");
+        assert_eq!(d.track_samples(0).count(), 4);
+        let x = Mp4Extras { edit_lists: vec![mp4a_edit_list(2, 48_000, 1024, 3 * 1024)], ..Mp4Extras::default() };
+        let e = mux(&[aac.clone()], Container::Mkv, &x).unwrap_err();
+        assert!(e.starts_with("track 2:"), "{}", e);
+        assert_eq!(mux(&[aac.clone()], Container::Mp4, &x).unwrap(), mp4_with(&[aac], &Mp4Options::default(), &x));
+    }
 }

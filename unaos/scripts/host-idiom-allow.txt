@@ -1,0 +1,30 @@
+# host-idiom-allow.txt — HOST-LINT's `hostidiom` allowlist (TOOLCHAINLINT, rmbp-ledger B1023; read by scripts/knob-hygiene.sh).
+# A GNU-only idiom OFF the flight-image path (what `./arroyo esp-x86` runs on a darwin host). One row:
+#   <file relative to unaos/>:<fixed substring of the hit line> — <why>
+# The substring is matched literally against the line's text (no regex); the FIRST ` — ` ends it. SHRINK-ONLY: a row that
+# matches no hit reds the gate as `stale`. A site ON the flight path is ported in place with ARROYOMAC's helpers
+# (_fsize, _ncpu, sha256_of, sha512_of; `tr` for ${v,,}), never listed here.
+arroyo:sed -i 's/^# CONFIG_STATIC is not set/ — busybox .config for PROBE.LNX: a darwin host refuses PROBE.LNX at `_lnx_hostruns probe` (LNXCROSS B1012, PROBE-DARWIN-CROSS owed)
+arroyo:sha256sum libc.a crt1.o crti.o crtn.o — SELFBUILD3 LIB digests: LIB needs TCC.LNX, refused on darwin (LNXCROSS, TCC-DARWIN-CROSS owed)
+arroyo:$ld/src.tar.xz" | sha256sum -c --quiet - — LLD.LNX's LLVM source pin: LLD.LNX stays a Linux-host product (LNXCROSS LLD/LIBDYN-DARWIN; LLD-DARWIN-GUARD owed)
+arroyo:"$SELFBUILD6_RUSTC_SHA256  $tar" | sha256sum -c --quiet — LIB/rustc's tarball pin: behind LIB/dyn's ldrun host proof, a Linux-host product (LNXCROSS)
+arroyo:"$SELFBUILD6_STD_SHA256  $stdt" | sha256sum -c --quiet — LIB/rustc's std pin: as the row above
+arroyo:sha256sum bin/rustc "lib/$drv" — LIB/rustc digests: as the rows above
+arroyo:$(sha256sum "${WORKSPACE_DIR}/target/ABIPROBE-X86.ELF" — build_user_abiprobe_x86 has no caller on any verb (run by name)
+arroyo:printf 'log_sha256=%s\n' "$(sha256sum "$logf" — qemu_run_sidecar: the QEMU legs run on the Linux bench, not the card build
+arroyo:sha256sum GA10B/* GA10BBAD/* — test_aarch64 (QEMU) fixture digests
+arroyo:truncate -s $((64 * 1024 * 1024)) "$fximg" — test_aarch64 (QEMU) fixture image
+arroyo:sha="$(sha256sum "$img" — vm_image: the elif arm after `command -v sha256sum` (shasum tried first on the line above)
+arroyo:truncate -s 6G "$blank" — test_install_ssd (QEMU install leg)
+arroyo:banner)     sed -i — _gates_plant: `gates --selftest` plants on a scratch clone (Linux seat; ARROYO-HOST-KAT owed; this table is SPECCOVERAGE's seam this wave)
+arroyo:k8reach)    sed -i — _gates_plant: as the row above
+arroyo:mbench-selftest) sed -i — _gates_plant: as the row above
+arroyo:specscore)  sed -i — _gates_plant: as the row above
+scripts/charter-check.sh:x=${x,,} — GATE-CHARTER's name fold: a host gate, not the card build; `tr` is not byte-equal to ${x,,} for non-ASCII (ARROYO-HOST-KAT owed)
+scripts/kepler-bunker.sh:sha256sum — the bench's one-time Kepler firmware extraction (the producer of UNAOS_KEPLER_FW_PATH), not run by esp-x86
+scripts/make-fat-img.sh:truncate -s — the test-fat / fat-img QEMU fixtures
+scripts/make-pi-img.sh:fsize() { if [ "$OS" = Darwin ] — ported: switches on `uname -s` (BSD arm first by design)
+scripts/make-pi-img.sh:fmtime() { if [ "$OS" = Darwin ] — ported: switches on `uname -s`
+scripts/media-writer.sh:sha256sum — the Linux bench's card writer (GNU dd iflag=fullblock at its verify); the Mac writes the card with tools/una-card (HOST-PORTABLE)
+scripts/media-writer.sh:truncate -s — media-writer's selftest images: as the row above
+scripts/twoboot.sh:sha256sum "$elf" — the twoboot fold leg (QEMU, Linux seat)
