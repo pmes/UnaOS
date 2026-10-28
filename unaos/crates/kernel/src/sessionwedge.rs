@@ -964,3 +964,16 @@ fn pumpdeath_selftest() {
         released as u8, spin_ms, gap_ms, rescued as u8, if ok { "PASS" } else { "FAIL" }, PD_RETURNED.load(Acquire) as u8, tick_cpu
     );
 }
+
+// ══ XHCILOANPUMPHOLDER (zenbook-ledger Z76, BP-cores-13) — the pump's stamp from inside a BOT stage wait it holds ══════
+/// The usb-pump's liveness from a BOT stage wake (`xhci` `pump_holder_stamp`, one fold on `pump_until_bot_done`'s `hlt`
+/// line): the loop-top [`stamp`] stops for a whole failing ladder the pump holds (3x `hw_wait_budget`, past [`WEDGE_MS`]),
+/// and the PUMPWEDGE edge then restarts the pump mid-transfer. Only the pump stamps (its tid, `gatesteal_long_step_maybe`'s
+/// check); only `LAST_MS` moves — `PASSES` and the ignition record stay the loop-top's (a stage wake is not a pass).
+pub fn stamp_live() {
+    let tid = PUMP_TID.load(Relaxed);
+    if tid == 0 || crate::arch::sched::current_id() != Some(tid) {
+        return;
+    }
+    LAST_MS.store(crate::arch::ms().max(1), Relaxed);
+}
