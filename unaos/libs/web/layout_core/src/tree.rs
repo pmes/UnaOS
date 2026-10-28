@@ -647,7 +647,7 @@ fn button_line_height<F: Fonts + ?Sized>(fonts: &F, family: u16, size: f32) -> f
 /// text fields `padding: 1px 2px; border: 2px inset` with one line of the
 /// 13.333px control font and the `size=20` default width; checkbox and
 /// radio 13x13 with their 3px/4px (radio 3px 3px 0 5px) margins; buttons
-/// `padding: 1px 6px; border: 2px outset`; select a 1px border around its
+/// `padding: 1px 6px; border: 2px outset` (an image input none, html.css); select a 1px border around its
 /// label and the arrow; textarea `padding: 2px; border: 1px` sized by
 /// rows x cols of the monospace control font.
 fn ua_control<N: DomNode>(node: &N, _tag: &str, style: &mut Style) {
@@ -671,6 +671,12 @@ fn ua_control<N: DomNode>(node: &N, _tag: &str, style: &mut Style) {
                 left: LengthPercentageAuto::length(m[3]),
             };
             style.align_self = Some(taffy::style::AlignSelf::CENTER);
+        }
+        // AETHERIMAGEINPUTBOX (SR455): html.css `input[type="image" i] { padding: initial; border: initial }`, so an
+        // image input has no UA edges and its border box is the image (or alt-label) size `control_intrinsic` gives.
+        Control::Button if node.tag().as_deref() == Some("input") && node.attr("type").is_some_and(|t| is_image_type(&t)) => {
+            style.padding = rect(0.0, 0.0, 0.0, 0.0);
+            style.border = rect(0.0, 0.0, 0.0, 0.0);
         }
         Control::Button => {
             style.padding = rect(1.0, 6.0, 1.0, 6.0);
@@ -781,6 +787,13 @@ pub fn button_label<'a>(ty: &str, value: Option<&'a str>) -> alloc::borrow::Cow<
 pub fn is_push_type(ty: &str) -> bool {
     let ty = ty.trim();
     ty.eq_ignore_ascii_case("submit") || ty.eq_ignore_ascii_case("reset") || ty.eq_ignore_ascii_case("button")
+}
+
+/// AETHERIMAGEINPUTBOX (SR455): whether an `<input>`'s raw `type` attribute names an image button, trimmed and compared
+/// ASCII case-insensitively as `is_push_type` reads it: the ONE predicate `ua_control` (no UA edges) and the host paint
+/// (no control frame, render/mod.rs) both call.
+pub fn is_image_type(ty: &str) -> bool {
+    ty.trim().eq_ignore_ascii_case("image")
 }
 
 /// AETHERCONTROLINTRINSIC (SR448): a file input's two UA strings (Chromium's IDS_FORM_FILE_BUTTON_LABEL /
