@@ -35,6 +35,7 @@ unafs = { path = "../../unaos/libs/fs/unafs", default-features = false }
 vein = { path = "../../handlers/vein" }
 principia = { path = "../../handlers/principia" }
 holocron = { path = "../../handlers/holocron" }
+futures-core = "0.3" # INSTALLERPROVIDERSTREAM (SR429): the Stream trait, to tee ModelProvider::stream's DeltaStream into sse::collect
 tokio = { version = "1.53", features = ["rt", "rt-multi-thread", "sync", "macros", "time"] }
 log = "0.4"
 libc = "0.2" # INSTALLERAUTHOPEN (SR422): sendmsg/recvmsg + msghdr for the SCM_RIGHTS fd handoff (authopen / the pkexec helper)
