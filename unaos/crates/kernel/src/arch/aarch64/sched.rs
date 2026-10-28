@@ -5578,7 +5578,7 @@ fn dispatch_next(cpu: usize) -> bool {
     // can never leak into the next task's switch-back. Only a task that switched back BLOCKED carries
     // a meaningful action.
     let park = SCHED[cpu].park_kind.swap(PARK_NONE, Ordering::Relaxed);
-    let mut task = unsafe { Box::from_raw(raw) };
+    let mut task = unsafe { Box::from_raw(raw) }; preemptoff::sleep_check(cpu, task.id, task.state.load(Ordering::Acquire), park); // PREEMPTOFFARMSLEEPCHECK (zenbook-ledger Z95): every voluntary switch-out lands here (both involuntary paths return at a held count before switching), so a held count whose holder is the outgoing task is a yield or park inside its span — counted and its span site latched, masked, no print (a PARK_WAITQ lock is still handed off here). LINE-NEUTRAL fold, code first
     match task.state.load(Ordering::Acquire) {
         STATE_FINISHED => drop(task), // free the stack
         STATE_BLOCKED => park_blocked(cpu, park, task), // sleeper list / (M4b) a wait queue
@@ -5614,7 +5614,7 @@ fn dispatch_next(cpu: usize) -> bool {
             rq(dest).push(task);
         }
     }
-    true
+    preemptoff::sleep_report(cpu); true // PREEMPTOFFARMSLEEPCHECK (zenbook-ledger Z95): the sleep-in-span once-line, said after park_blocked released any handed-off wait-queue lock. LINE-NEUTRAL
 }
 
 /// VUG-1 M3b: number of CPUs the "CPU pulse" meter should show. Arch-neutral mirror of the x86 accessor.
@@ -11360,7 +11360,7 @@ pub mod preemptoff {
         }
         let ((fat_on, fat_held), (dir_on, dir_held)) = crate::fs::fat::preemptoff_span_probe();
         let ((m_fat_on, _), (m_dir_on, _)) = crate::arch::without_interrupts(crate::fs::fat::preemptoff_span_probe);
-        let masked_kept = !m_fat_on && !m_dir_on; let ul = crate::fs::unafs::unafs_leg(); let lk = leak_kat(); let sk = stale_kat(); let wl = crate::video::wm::wmtable_leg(); // PREEMPTOFFARMWMTABLE (zenbook-ledger Z92): the TABLE leg (`wmtable_leg=`), before `released`. PREEMPTOFFARMSTALEDROP (zenbook-ledger Z91): the stale-drop KAT after the leak KAT. PREEMPTOFFARMQUANTUM (zenbook-ledger Z89): the leak-reset KAT runs before `released` too. PREEMPTOFFARMUNAFS (zenbook-ledger Z79): the UnaFS read-arm leg, before `released` so it also proves the leg gave the count back (LINE-NEUTRAL)
+        let masked_kept = !m_fat_on && !m_dir_on; let ul = crate::fs::unafs::unafs_leg(); let lk = leak_kat(); let sk = stale_kat(); let sl = sleep_kat(); let wl = crate::video::wm::wmtable_leg(); // PREEMPTOFFARMSLEEPCHECK (zenbook-ledger Z95): the sleep KAT reads the stale KAT's real in-span yield, right after it. PREEMPTOFFARMWMTABLE (zenbook-ledger Z92): the TABLE leg (`wmtable_leg=`), before `released`. PREEMPTOFFARMSTALEDROP (zenbook-ledger Z91): the stale-drop KAT after the leak KAT. PREEMPTOFFARMQUANTUM (zenbook-ledger Z89): the leak-reset KAT runs before `released` too. PREEMPTOFFARMUNAFS (zenbook-ledger Z79): the UnaFS read-arm leg, before `released` so it also proves the leg gave the count back (LINE-NEUTRAL)
         let released = !witness().0;
         let reason = if !fat_on {
             Some("fat-masked")
@@ -11371,25 +11371,25 @@ pub mod preemptoff {
         } else if !masked_kept {
             Some("unmasked")
         } else if !released {
-            Some("leaked") } else if !(ul == "ok" || ul.starts_with("skip")) { Some("unafs-leg") } else if lk != "ok" { Some("leak-kat") } else if sk != "ok" { Some("stale-kat") } else if !(wl == "ok" || wl.starts_with("skip")) { Some("wmtable-leg")
+            Some("leaked") } else if !(ul == "ok" || ul.starts_with("skip")) { Some("unafs-leg") } else if lk != "ok" { Some("leak-kat") } else if sk != "ok" { Some("stale-kat") } else if sl != "ok" { Some("sleep-kat") } else if !(wl == "ok" || wl.starts_with("skip")) { Some("wmtable-leg")
         } else {
             None
         };
         let ok = |b: bool, y: &'static str, n: &'static str| if b { y } else { n };
         match reason {
             None => serial_println!(
-                ":: PREEMPTAUDIT: arch=aarch64 sites={} isr={} holder={} both={} converted={} converted_fat={} fat_irq_on=ok dir_irq_on=ok fat_held=ok dir_held=ok masked_kept=ok released=ok unafs_leg={} leak_reset={} leak_kat={} stale_drop={} stale_kat={} wmtable_leg={} -> PASS ::",
-                AUDIT_SITES, AUDIT_ISR, AUDIT_HOLDER, AUDIT_BOTH, AUDIT_CONVERTED, CONVERTED_FAT, ul, leak_resets(), lk, stale_drops(), sk, wl
+                ":: PREEMPTAUDIT: arch=aarch64 sites={} isr={} holder={} both={} converted={} converted_fat={} fat_irq_on=ok dir_irq_on=ok fat_held=ok dir_held=ok masked_kept=ok released=ok unafs_leg={} leak_reset={} leak_kat={} stale_drop={} stale_kat={} sleep_in_span={} sleep_kat={} wmtable_leg={} -> PASS ::",
+                AUDIT_SITES, AUDIT_ISR, AUDIT_HOLDER, AUDIT_BOTH, AUDIT_CONVERTED, CONVERTED_FAT, ul, leak_resets(), lk, stale_drops(), sk, sleep_in_spans(), sl, wl
             ),
             Some(r) => serial_println!(
-                ":: PREEMPTAUDIT: arch=aarch64 sites={} isr={} holder={} both={} converted={} converted_fat={} fat_irq_on={} dir_irq_on={} fat_held={} dir_held={} masked_kept={} released={} unafs_leg={} leak_reset={} leak_kat={} stale_drop={} stale_kat={} wmtable_leg={} -> FAIL reason={} ::",
+                ":: PREEMPTAUDIT: arch=aarch64 sites={} isr={} holder={} both={} converted={} converted_fat={} fat_irq_on={} dir_irq_on={} fat_held={} dir_held={} masked_kept={} released={} unafs_leg={} leak_reset={} leak_kat={} stale_drop={} stale_kat={} sleep_in_span={} sleep_kat={} wmtable_leg={} -> FAIL reason={} ::",
                 AUDIT_SITES, AUDIT_ISR, AUDIT_HOLDER, AUDIT_BOTH, AUDIT_CONVERTED, CONVERTED_FAT,
                 ok(fat_on, "ok", "masked"),
                 ok(dir_on, "ok", "masked"),
                 ok(fat_held, "ok", "free"),
                 ok(dir_held, "ok", "free"),
                 ok(masked_kept, "ok", "unmasked"),
-                ok(released, "ok", "leaked"), ul, leak_resets(), lk, stale_drops(), sk, wl,
+                ok(released, "ok", "leaked"), ul, leak_resets(), lk, stale_drops(), sk, sleep_in_spans(), sl, wl,
                 r
             ),
         }
@@ -11531,7 +11531,7 @@ pub mod preemptoff {
     fn stale_kat_run(c: usize) -> u8 {
         let site = Location::caller();
         let g1 = crate::arch::without_interrupts(|| super::hold_at(site));
-        let me = current_tid_relaxed(c);
+        let me = current_tid_relaxed(c); SLEEP_KAT_TID.store(me, Ordering::Relaxed); // PREEMPTOFFARMSLEEPCHECK (zenbook-ledger Z95): the test flag — this holder's in-span yield below is counted apart as the sleep KAT's hit (`sleep_kat=`), never in `sleep_in_span=` or the site latch. LINE-NEUTRAL
         let follower = super::spawn_joinable("preemptoff-stale-after", stale_kat_after, 0, c);
         let m0 = crate::arch::ms();
         while !STALE_KAT_AFTER_RAN.load(Ordering::Acquire) && crate::arch::ms().wrapping_sub(m0) < 1000 {
@@ -11601,4 +11601,121 @@ pub mod preemptoff {
     pub const AUDIT_HOLDER: u32 = 116;
     pub const AUDIT_BOTH: u32 = 23;
     pub const AUDIT_CONVERTED: u32 = CONVERTED_FAT + crate::fs::unafs::CONVERTED_UNAFS_ARM + CONVERTED_USBNET + CONVERTED_CURSORMOVE + crate::video::wm::CONVERTED_WMTABLE + CONVERTED_CASTS; #[cfg(feature = "usbnet")] use crate::drivers::xhci::usbnet::CONVERTED_USBNET; #[cfg(not(feature = "usbnet"))] const CONVERTED_USBNET: u32 = 0; const CONVERTED_CURSORMOVE: u32 = cfg!(feature = "baremetal") as u32; const CONVERTED_CASTS: u32 = cfg!(feature = "desktop_firmware") as u32; // PREEMPTOFFARMUNAFS (zenbook-ledger Z79): the Pi read arm (1 on baremetal, 0 elsewhere); PREEMPTOFFARMUSBNETDRIVE (zenbook-ledger Z83): usbnet's `drive` span (1 where `usbnet` is compiled, 0 elsewhere); PREEMPTOFFARMCURSORMOVE (zenbook-ledger Z85): the input router's cursor span (`main.rs` `cursormove_span`, 1 on baremetal, 0 elsewhere); PREEMPTOFFARMWMTABLE (zenbook-ledger Z92): the window TABLE take (`video/wm.rs` `table_span`, 1 off `desktop_firmware`, 0 on the desktops); PREEMPTOFFARMCASTS (zenbook-ledger Z93): the shadow pass's CASTS publish span (`video/desktop.rs` `casts_span`, 1 on `desktop_firmware`, 0 elsewhere). LINE-NEUTRAL
+
+    // ══ PREEMPTOFFARMSLEEPCHECK (zenbook-ledger Z95) — a voluntary switch-out inside a held span, named at its span site ══
+    // Every voluntary switch-out (`yield_now`, `sleep_ticks`, `Semaphore::wait`, `futex_wait`, `Condvar::wait`; `exit` is
+    // Z89's death) calls `switch_context` itself, and every one comes back through ONE place: `dispatch_next`'s switch-back.
+    // Both involuntary paths (`timer_preempt`, `ipi_preempt`) return at a held count before any switch, so a switch-back with
+    // this core's count held and the outgoing task its recorded holder (Z89's `HOLD_TID`) is a yield or park inside the span.
+    // `sleep_check` runs there, masked, and only counts and latches (a PARK_WAITQ lock is still handed off at that point);
+    // `sleep_report`, at the end of the same pass, says the line once per span site (the first 8 sites; the rest counted).
+    // Z89's `on_dispatch` still resets the count at the next dispatch of another task; this names WHICH span slept.
+
+    /// Z95: real held switch-outs this boot (`sleep_in_span=`); the KAT's own are counted apart (`SLEEP_KAT_HITS`).
+    static SLEEP_IN_SPAN: AtomicU32 = AtomicU32::new(0);
+    /// Z95: span sites already said — the per-site once-latch (CAS into the first null slot).
+    static SLEEP_SITES: [AtomicPtr<Location<'static>>; 8] = [const { AtomicPtr::new(core::ptr::null_mut()) }; 8];
+    /// Z95: this core's pending once-line (site null = none). Written and read only by its own core, masked.
+    static SLEEP_PEND_SITE: [AtomicPtr<Location<'static>>; NUM_CPUS] = [const { AtomicPtr::new(core::ptr::null_mut()) }; NUM_CPUS];
+    static SLEEP_PEND_TID: [AtomicU64; NUM_CPUS] = [const { AtomicU64::new(0) }; NUM_CPUS];
+    static SLEEP_PEND_VIA: [core::sync::atomic::AtomicU8; NUM_CPUS] = [const { core::sync::atomic::AtomicU8::new(0) }; NUM_CPUS];
+    /// Z95 test flag: the stale KAT's holder (0 = none). Its in-span yield counts here, never in `SLEEP_IN_SPAN` or the latch.
+    static SLEEP_KAT_TID: AtomicU64 = AtomicU64::new(0);
+    static SLEEP_KAT_HITS: AtomicU32 = AtomicU32::new(0);
+    static SLEEP_KAT_VIA: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+    const VIA_YIELD: u8 = 1;
+    const VIA_SLEEP: u8 = 2;
+    const VIA_WAITQ: u8 = 3;
+
+    fn via_word(via: u8) -> &'static str {
+        match via {
+            VIA_YIELD => "yield",
+            VIA_SLEEP => "sleep",
+            VIA_WAITQ => "waitq",
+            _ => "?",
+        }
+    }
+
+    /// Z95: the switch-back check (`dispatch_next`, IRQ masked, this core, before `park_blocked` / the requeue). Held count,
+    /// outgoing task == recorded holder, and READY (a yield) or BLOCKED (a sleep or a wait-queue park): counted, its span
+    /// site claimed in the latch; a newly claimed site is stashed for `sleep_report`. No print here.
+    pub(super) fn sleep_check(cpu: usize, outgoing: u64, state: u8, park: u8) {
+        if cpu >= NUM_CPUS || NOPREEMPT[cpu].load(Ordering::Relaxed) == 0 || HOLD_TID[cpu].load(Ordering::Relaxed) != outgoing {
+            return;
+        }
+        let via = if state == super::STATE_READY {
+            VIA_YIELD
+        } else if state == super::STATE_BLOCKED && park == super::PARK_SLEEP {
+            VIA_SLEEP
+        } else if state == super::STATE_BLOCKED && park == super::PARK_WAITQ {
+            VIA_WAITQ
+        } else {
+            return; // FINISHED: a death inside the span is Z89's leak, named by `on_dispatch`
+        };
+        let kat = SLEEP_KAT_TID.load(Ordering::Relaxed);
+        if kat != 0 && kat == outgoing {
+            SLEEP_KAT_HITS.fetch_add(1, Ordering::Relaxed);
+            SLEEP_KAT_VIA.store(via, Ordering::Relaxed);
+            return;
+        }
+        SLEEP_IN_SPAN.fetch_add(1, Ordering::Relaxed);
+        let site = HOLD_SITE[cpu].load(Ordering::Relaxed);
+        if site.is_null() {
+            return;
+        }
+        for said in SLEEP_SITES.iter() {
+            match said.compare_exchange(core::ptr::null_mut(), site, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => {
+                    SLEEP_PEND_TID[cpu].store(outgoing, Ordering::Relaxed);
+                    SLEEP_PEND_VIA[cpu].store(via, Ordering::Relaxed);
+                    SLEEP_PEND_SITE[cpu].store(site, Ordering::Relaxed);
+                    return;
+                }
+                Err(cur) if cur == site => return,
+                Err(_) => {}
+            }
+        }
+    }
+
+    /// Z95: say this core's pending sleep-in-span line, once (end of `dispatch_next`, masked, no lock held).
+    pub(super) fn sleep_report(cpu: usize) {
+        if cpu >= NUM_CPUS {
+            return;
+        }
+        let site = SLEEP_PEND_SITE[cpu].swap(core::ptr::null_mut(), Ordering::Relaxed) as *const Location<'static>;
+        // SAFETY: only ever stored from `HOLD_SITE`, itself only from a `&'static Location<'static>` (`note_holder`).
+        let Some(l) = (unsafe { site.as_ref() }) else {
+            return;
+        };
+        serial_println!(
+            "[sched] preempt-off sleep in span cpu={} holder={} site={}:{} via={} -> switched out holding the count (PREEMPTOFFARMSLEEPCHECK Z95)",
+            cpu,
+            SLEEP_PEND_TID[cpu].load(Ordering::Relaxed),
+            l.file(),
+            l.line(),
+            via_word(SLEEP_PEND_VIA[cpu].load(Ordering::Relaxed))
+        );
+    }
+
+    /// Z95: real held switch-outs this boot (`sleep_in_span=`).
+    pub fn sleep_in_spans() -> u32 {
+        SLEEP_IN_SPAN.load(Ordering::Relaxed)
+    }
+
+    /// Z95 KAT (`sleep_kat=`): read after `stale_kat`, whose holder (flagged in `stale_kat_run`) yields inside its span
+    /// through the real `yield_now`. `ok` when the switch-back counted that yield (via=yield), `wrong-via`, else
+    /// `not-named`. Clears the flag and the hits.
+    pub fn sleep_kat() -> &'static str {
+        SLEEP_KAT_TID.store(0, Ordering::Relaxed);
+        let hits = SLEEP_KAT_HITS.swap(0, Ordering::Relaxed);
+        let via = SLEEP_KAT_VIA.swap(0, Ordering::Relaxed);
+        if hits == 0 {
+            "not-named"
+        } else if via != VIA_YIELD {
+            "wrong-via"
+        } else {
+            "ok"
+        }
+    }
 }
