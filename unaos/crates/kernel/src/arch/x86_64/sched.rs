@@ -6497,7 +6497,7 @@ fn run() -> ! {
                 // stale action can never leak into the next task's switch-back. Only a task that
                 // switched back BLOCKED has a meaningful action.
                 let park = SCHED[cpu].park_kind.swap(PARK_NONE, Ordering::Relaxed);
-                let task = unsafe { Box::from_raw(raw) };
+                let task = unsafe { Box::from_raw(raw) }; preemptoff::sleep_check(cpu, task.id, task.state.load(Ordering::Acquire), park); // PREEMPTOFFX86SLEEPCHECK (rmbp-ledger B1071): every voluntary switch-out lands here (timer_preempt returns at a held count before switching), so a held count whose holder is the outgoing task is a yield or park inside its span — counted and its span site latched, IF=0, no print (a PARK_WAITQ lock is still handed off here). LINE-NEUTRAL fold, code first
                 match task.state.load(Ordering::Acquire) {
                     // Frees the stack; for a joinable task this also drops its `done_sem` Arc clone
                     // (possibly the last, freeing the join-sem) — sound: the trampoline already
@@ -6527,7 +6527,7 @@ fn run() -> ! {
                             RUN_QUEUES[cpu].lock().requeue(task);
                         }
                     }
-                }
+                } preemptoff::sleep_report(cpu); // PREEMPTOFFX86SLEEPCHECK (rmbp-ledger B1071): the sleep-in-span once-line, said after park_blocked released any handed-off wait-queue lock. LINE-NEUTRAL
             }
             None => {
                 // SMPBAL-X86: before halting, try to pull one task off the most-loaded core. This is
@@ -9669,7 +9669,7 @@ pub mod preemptoff {
         let (sdhc_word, sdhc_sw): (&'static str, u64) = ("skip(no-sdhcblk)", 0);
         let converted_sdhc = cfg!(feature = "sdhcblk") as u32;
         let switched = switched.saturating_add(sdhc_sw);
-        let (lw, lw_us) = crate::drivers::block::xhci_loan_wait_kat(); #[cfg(feature = "uvc")] let (pp, py): (&'static str, &'static str) = crate::drivers::xhci::ptp::loan_path_kat(); #[cfg(not(feature = "uvc"))] let (pp, py): (&'static str, &'static str) = ("skip(no-uvc)", "skip(no-uvc)"); let ls = crate::drivers::block::xhci_loan_shed_count(); let lk = crate::drivers::block::xhci_loan_shed_kat(); #[cfg(feature = "unafs")] let ul: &'static str = crate::fs::unafs::unafs_leg(); #[cfg(not(feature = "unafs"))] let ul: &'static str = "skip(no-unafs)"; let pk = crate::drivers::xhci::poll_cap_kat(); let hk = crate::drivers::xhci::pump_holder_kat(); let sk = stale_kat(); let reason = if !on { // PREEMPTOFFXHCILOAN (Z62) leg: the masked claimant on a running block-loan holder (`loan_wait=`)
+        let (lw, lw_us) = crate::drivers::block::xhci_loan_wait_kat(); #[cfg(feature = "uvc")] let (pp, py): (&'static str, &'static str) = crate::drivers::xhci::ptp::loan_path_kat(); #[cfg(not(feature = "uvc"))] let (pp, py): (&'static str, &'static str) = ("skip(no-uvc)", "skip(no-uvc)"); let ls = crate::drivers::block::xhci_loan_shed_count(); let lk = crate::drivers::block::xhci_loan_shed_kat(); #[cfg(feature = "unafs")] let ul: &'static str = crate::fs::unafs::unafs_leg(); #[cfg(not(feature = "unafs"))] let ul: &'static str = "skip(no-unafs)"; let pk = crate::drivers::xhci::poll_cap_kat(); let hk = crate::drivers::xhci::pump_holder_kat(); let sk = stale_kat(); let sl = sleep_kat(); let reason = if !on { // PREEMPTOFFXHCILOAN (Z62) leg: the masked claimant on a running block-loan holder (`loan_wait=`)
             Some("masked")
         } else if ticks == 0 {
             Some("no-tick")
@@ -9681,18 +9681,18 @@ pub mod preemptoff {
             Some("sdhc-not-held")
         } else if sdhc_word == "err" {
             Some("sdhc-read")
-        } else if !(lw == "ok" || lw.starts_with("skip")) { Some("loan-wait") } else if !(pp == "ok" || pp.starts_with("skip")) { Some("ptp-path") } else if !(py == "ok" || py.starts_with("skip")) { Some("ptp-yield") } else if !(lk == "ok" || lk.starts_with("skip")) { Some("shed-kat") } else if !(ul == "ok" || ul.starts_with("skip")) { Some("unafs-leg") } else if !(pk == "ok" || pk.starts_with("skip")) { Some("poll-cap-kat") } else if !(hk == "ok" || hk.starts_with("skip")) { Some("pump-kat") } else if sk != "ok" { Some("stale-kat") } else {
+        } else if !(lw == "ok" || lw.starts_with("skip")) { Some("loan-wait") } else if !(pp == "ok" || pp.starts_with("skip")) { Some("ptp-path") } else if !(py == "ok" || py.starts_with("skip")) { Some("ptp-yield") } else if !(lk == "ok" || lk.starts_with("skip")) { Some("shed-kat") } else if !(ul == "ok" || ul.starts_with("skip")) { Some("unafs-leg") } else if !(pk == "ok" || pk.starts_with("skip")) { Some("poll-cap-kat") } else if !(hk == "ok" || hk.starts_with("skip")) { Some("pump-kat") } else if sk != "ok" { Some("stale-kat") } else if sl != "ok" { Some("sleep-kat") } else {
             None
         };
         match reason {
             None => serial_println!(
-                ":: PREEMPTAUDIT: sites={} isr={} holder={} both={} converted={} converted_sdhc={} converted_unafs={} unafs_leg={} sdhc_irq_on={} hold_irq_on=ok tick_in_hold=ok switched=0 loan_wait={} loan_wait_us={} ptp_path={} ptp_yield={} ptp_yield_windows={} loan_shed={} loan_shed_kat={} loan_shed_us={} poll_cap={} poll_cap_kat={} pump_kat={} stale_drop={} stale_kat={} -> PASS ::",
-                AUDIT_SITES, AUDIT_ISR, AUDIT_HOLDER, AUDIT_BOTH, AUDIT_CONVERTED, converted_sdhc, AUDIT_CONVERTED_UNAFS, ul, sdhc_word, lw, lw_us, pp, py, { #[cfg(feature = "uvc")] let w = crate::drivers::xhci::ptp::loan_yield_kat_windows(); #[cfg(not(feature = "uvc"))] let w = 0u32; w }, ls, lk, crate::drivers::block::xhci_loan_shed_control_us(), crate::drivers::xhci::poll_cap_count(), pk, hk, stale_drops(), sk // PREEMPTOFFX86STALEDROP (rmbp-ledger B1069): `stale_drop=` / `stale_kat=`; XHCILOANPUMPHOLDERKAT (zenbook-ledger Z81): `pump_kat=` the pump-gate KAT; XHCILOANPOLLCAP (zenbook-ledger Z74): `poll_cap=` capped poll passes, a count; XHCILOANPOLLCAPKAT (zenbook-ledger Z77): `poll_cap_kat=` the capped-pass KAT; XHCILOANSHEDKATCONTROLUS (zenbook-ledger Z80): `loan_shed_us=` the control's masked wait µs; XHCILOANPTPYIELDKATRULE (zenbook-ledger Z88): `ptp_yield_windows=` the windows the KAT offered
+                ":: PREEMPTAUDIT: sites={} isr={} holder={} both={} converted={} converted_sdhc={} converted_unafs={} unafs_leg={} sdhc_irq_on={} hold_irq_on=ok tick_in_hold=ok switched=0 loan_wait={} loan_wait_us={} ptp_path={} ptp_yield={} ptp_yield_windows={} loan_shed={} loan_shed_kat={} loan_shed_us={} poll_cap={} poll_cap_kat={} pump_kat={} stale_drop={} stale_kat={} sleep_in_span={} sleep_kat={} -> PASS ::",
+                AUDIT_SITES, AUDIT_ISR, AUDIT_HOLDER, AUDIT_BOTH, AUDIT_CONVERTED, converted_sdhc, AUDIT_CONVERTED_UNAFS, ul, sdhc_word, lw, lw_us, pp, py, { #[cfg(feature = "uvc")] let w = crate::drivers::xhci::ptp::loan_yield_kat_windows(); #[cfg(not(feature = "uvc"))] let w = 0u32; w }, ls, lk, crate::drivers::block::xhci_loan_shed_control_us(), crate::drivers::xhci::poll_cap_count(), pk, hk, stale_drops(), sk, sleep_in_spans(), sl // PREEMPTOFFX86SLEEPCHECK (rmbp-ledger B1071): `sleep_in_span=` / `sleep_kat=`; PREEMPTOFFX86STALEDROP (rmbp-ledger B1069): `stale_drop=` / `stale_kat=`; XHCILOANPUMPHOLDERKAT (zenbook-ledger Z81): `pump_kat=` the pump-gate KAT; XHCILOANPOLLCAP (zenbook-ledger Z74): `poll_cap=` capped poll passes, a count; XHCILOANPOLLCAPKAT (zenbook-ledger Z77): `poll_cap_kat=` the capped-pass KAT; XHCILOANSHEDKATCONTROLUS (zenbook-ledger Z80): `loan_shed_us=` the control's masked wait µs; XHCILOANPTPYIELDKATRULE (zenbook-ledger Z88): `ptp_yield_windows=` the windows the KAT offered
             ),
             Some(r) => serial_println!(
-                ":: PREEMPTAUDIT: sites={} isr={} holder={} both={} converted={} converted_sdhc={} converted_unafs={} unafs_leg={} sdhc_irq_on={} hold_irq_on={} tick_in_hold={} switched={} loan_wait={} loan_wait_us={} ptp_path={} ptp_yield={} ptp_yield_windows={} loan_shed={} loan_shed_kat={} loan_shed_us={} poll_cap={} poll_cap_kat={} pump_kat={} stale_drop={} stale_kat={} -> FAIL reason={} ::",
+                ":: PREEMPTAUDIT: sites={} isr={} holder={} both={} converted={} converted_sdhc={} converted_unafs={} unafs_leg={} sdhc_irq_on={} hold_irq_on={} tick_in_hold={} switched={} loan_wait={} loan_wait_us={} ptp_path={} ptp_yield={} ptp_yield_windows={} loan_shed={} loan_shed_kat={} loan_shed_us={} poll_cap={} poll_cap_kat={} pump_kat={} stale_drop={} stale_kat={} sleep_in_span={} sleep_kat={} -> FAIL reason={} ::",
                 AUDIT_SITES, AUDIT_ISR, AUDIT_HOLDER, AUDIT_BOTH, AUDIT_CONVERTED, converted_sdhc, AUDIT_CONVERTED_UNAFS, ul, sdhc_word,
-                if on { "ok" } else { "masked" }, if ticks > 0 { "ok" } else { "none" }, switched, lw, lw_us, pp, py, { #[cfg(feature = "uvc")] let w = crate::drivers::xhci::ptp::loan_yield_kat_windows(); #[cfg(not(feature = "uvc"))] let w = 0u32; w }, ls, lk, crate::drivers::block::xhci_loan_shed_control_us(), crate::drivers::xhci::poll_cap_count(), pk, hk, stale_drops(), sk, r // PREEMPTOFFX86STALEDROP (rmbp-ledger B1069): `stale_drop=` / `stale_kat=`; XHCILOANPUMPHOLDERKAT (zenbook-ledger Z81): `pump_kat=`; XHCILOANSHEDKATCONTROLUS (zenbook-ledger Z80): `loan_shed_us=`; XHCILOANPTPYIELDKATRULE (zenbook-ledger Z88): `ptp_yield_windows=` the windows the KAT offered
+                if on { "ok" } else { "masked" }, if ticks > 0 { "ok" } else { "none" }, switched, lw, lw_us, pp, py, { #[cfg(feature = "uvc")] let w = crate::drivers::xhci::ptp::loan_yield_kat_windows(); #[cfg(not(feature = "uvc"))] let w = 0u32; w }, ls, lk, crate::drivers::block::xhci_loan_shed_control_us(), crate::drivers::xhci::poll_cap_count(), pk, hk, stale_drops(), sk, sleep_in_spans(), sl, r // PREEMPTOFFX86SLEEPCHECK (rmbp-ledger B1071): `sleep_in_span=` / `sleep_kat=`; PREEMPTOFFX86STALEDROP (rmbp-ledger B1069): `stale_drop=` / `stale_kat=`; XHCILOANPUMPHOLDERKAT (zenbook-ledger Z81): `pump_kat=`; XHCILOANSHEDKATCONTROLUS (zenbook-ledger Z80): `loan_shed_us=`; XHCILOANPTPYIELDKATRULE (zenbook-ledger Z88): `ptp_yield_windows=` the windows the KAT offered
             ),
         }
     }
@@ -9761,7 +9761,7 @@ pub mod preemptoff {
     #[cfg(any(feature = "ahci", feature = "nvme"))]
     fn stale_kat_run(c: usize) -> u8 {
         let g1 = hold();
-        let me = SCHED[c].current_tid.load(Ordering::Relaxed);
+        let me = SCHED[c].current_tid.load(Ordering::Relaxed); SLEEP_KAT_TID.store(me, Ordering::Relaxed); // PREEMPTOFFX86SLEEPCHECK (rmbp-ledger B1071): the test flag — this holder's in-span yield below is counted apart as the sleep KAT's hit (`sleep_kat=`), never in `sleep_in_span=` or the site latch. LINE-NEUTRAL
         let follower = super::spawn_joinable("preemptoff-stale-after", stale_kat_after, 0, c, super::PRIO_NORMAL);
         let m0 = crate::arch::ms();
         while !STALE_KAT_AFTER_RAN.load(Ordering::Acquire) && crate::arch::ms().wrapping_sub(m0) < 1000 {
@@ -9817,6 +9817,125 @@ pub mod preemptoff {
             4 => "stolen",
             5 => "not-released",
             _ => "not-run",
+        }
+    }
+
+    // ══════════ PREEMPTOFFX86SLEEPCHECK (rmbp-ledger B1071) — a voluntary switch-out inside a held span, named at its span site ══════════
+    // Z95's aarch64 shape on x86. Every voluntary switch-out (`yield_now`, `sleep_ticks`, `Semaphore::wait`, the futex
+    // wait, `Condvar::wait`; `exit` is the leak `on_dispatch` names) calls `switch_context` to the scheduler and comes back
+    // through ONE place: `run()`'s switch-back. The one involuntary path, `timer_preempt`, returns at `defer` (count held)
+    // before any switch, so a switch-back with this CPU's count held and the outgoing task its recorded holder (B1069's
+    // `HOLD_TID`) is a yield or park inside the span. `sleep_check` runs there, IF=0, and only counts and latches (a
+    // PARK_WAITQ lock is still handed off at that point); `sleep_report`, after the switch-back's match, says the line once
+    // per span site (the first 8 sites; the rest counted). `on_dispatch` still resets the count at the next dispatch of
+    // another task; this names WHICH span slept.
+
+    /// B1071: real held switch-outs this boot (`sleep_in_span=`); the KAT's own are counted apart (`SLEEP_KAT_HITS`).
+    static SLEEP_IN_SPAN: AtomicU32 = AtomicU32::new(0);
+    /// B1071: span sites already said — the per-site once-latch (CAS into the first null slot).
+    static SLEEP_SITES: [AtomicPtr<Location<'static>>; 8] = [const { AtomicPtr::new(core::ptr::null_mut()) }; 8];
+    /// B1071: this CPU's pending once-line (site null = none). Written and read only by its own CPU, IF=0.
+    static SLEEP_PEND_SITE: [AtomicPtr<Location<'static>>; MAX_CPUS] = [const { AtomicPtr::new(core::ptr::null_mut()) }; MAX_CPUS];
+    static SLEEP_PEND_TID: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+    static SLEEP_PEND_VIA: [core::sync::atomic::AtomicU8; MAX_CPUS] = [const { core::sync::atomic::AtomicU8::new(0) }; MAX_CPUS];
+    /// B1071 test flag: the stale KAT's holder (0 = none). Its in-span yield counts here, never in `SLEEP_IN_SPAN` or the latch.
+    static SLEEP_KAT_TID: AtomicU64 = AtomicU64::new(0);
+    static SLEEP_KAT_HITS: AtomicU32 = AtomicU32::new(0);
+    static SLEEP_KAT_VIA: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+    const VIA_YIELD: u8 = 1;
+    const VIA_SLEEP: u8 = 2;
+    const VIA_WAITQ: u8 = 3;
+
+    fn via_word(via: u8) -> &'static str {
+        match via {
+            VIA_YIELD => "yield",
+            VIA_SLEEP => "sleep",
+            VIA_WAITQ => "waitq",
+            _ => "?",
+        }
+    }
+
+    /// B1071: the switch-back check (`run()`, IF=0, this CPU, before `park_blocked` / the requeue). Held count, outgoing
+    /// task == recorded holder, and READY (a yield) or BLOCKED (a sleep or a wait-queue park): counted, its span site
+    /// claimed in the latch; a newly claimed site is stashed for `sleep_report`. No print here.
+    pub(super) fn sleep_check(cpu: usize, outgoing: u64, state: u8, park: u8) {
+        if cpu >= MAX_CPUS || OFF[cpu].load(Ordering::Relaxed) == 0 || HOLD_TID[cpu].load(Ordering::Relaxed) != outgoing {
+            return;
+        }
+        let via = if state == super::STATE_READY {
+            VIA_YIELD
+        } else if state == super::STATE_BLOCKED && park == super::PARK_SLEEP {
+            VIA_SLEEP
+        } else if state == super::STATE_BLOCKED && park == super::PARK_WAITQ {
+            VIA_WAITQ
+        } else {
+            return; // FINISHED: a death inside the span is the leak `on_dispatch` names
+        };
+        let kat = SLEEP_KAT_TID.load(Ordering::Relaxed);
+        if kat != 0 && kat == outgoing {
+            SLEEP_KAT_HITS.fetch_add(1, Ordering::Relaxed);
+            SLEEP_KAT_VIA.store(via, Ordering::Relaxed);
+            return;
+        }
+        SLEEP_IN_SPAN.fetch_add(1, Ordering::Relaxed);
+        let site = HOLD_SITE[cpu].load(Ordering::Relaxed);
+        if site.is_null() {
+            return;
+        }
+        for said in SLEEP_SITES.iter() {
+            match said.compare_exchange(core::ptr::null_mut(), site, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => {
+                    SLEEP_PEND_TID[cpu].store(outgoing, Ordering::Relaxed);
+                    SLEEP_PEND_VIA[cpu].store(via, Ordering::Relaxed);
+                    SLEEP_PEND_SITE[cpu].store(site, Ordering::Relaxed);
+                    return;
+                }
+                Err(cur) if cur == site => return,
+                Err(_) => {}
+            }
+        }
+    }
+
+    /// B1071: say this CPU's pending sleep-in-span line, once (after the switch-back's match in `run()`, IF=0, no lock held).
+    pub(super) fn sleep_report(cpu: usize) {
+        if cpu >= MAX_CPUS {
+            return;
+        }
+        let site = SLEEP_PEND_SITE[cpu].swap(core::ptr::null_mut(), Ordering::Relaxed) as *const Location<'static>;
+        // SAFETY: only ever stored from `HOLD_SITE`, itself only from a `&'static Location<'static>` (`note_holder`).
+        let Some(l) = (unsafe { site.as_ref() }) else {
+            return;
+        };
+        serial_println!(
+            "[sched] preempt-off sleep in span cpu={} holder={} site={}:{} via={} -> switched out holding the count (PREEMPTOFFX86SLEEPCHECK B1071)",
+            cpu,
+            SLEEP_PEND_TID[cpu].load(Ordering::Relaxed),
+            l.file(),
+            l.line(),
+            via_word(SLEEP_PEND_VIA[cpu].load(Ordering::Relaxed))
+        );
+    }
+
+    /// B1071: real held switch-outs this boot (`sleep_in_span=`).
+    pub fn sleep_in_spans() -> u32 {
+        SLEEP_IN_SPAN.load(Ordering::Relaxed)
+    }
+
+    /// B1071 KAT (`sleep_kat=`): read after `stale_kat`, whose holder (flagged in `stale_kat_run`) yields inside its span
+    /// through the real `yield_now`. `ok` when the switch-back counted that yield (via=yield), `wrong-via`, else
+    /// `not-named`. Clears the flag and the hits.
+    #[cfg(any(feature = "ahci", feature = "nvme"))]
+    fn sleep_kat() -> &'static str {
+        SLEEP_KAT_TID.store(0, Ordering::Relaxed);
+        let hits = SLEEP_KAT_HITS.swap(0, Ordering::Relaxed);
+        let via = SLEEP_KAT_VIA.swap(0, Ordering::Relaxed);
+        if hits == 0 {
+            "not-named"
+        } else if via != VIA_YIELD {
+            "wrong-via"
+        } else {
+            "ok"
         }
     }
 }
