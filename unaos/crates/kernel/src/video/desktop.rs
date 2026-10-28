@@ -775,7 +775,7 @@ pub(super) fn track() {
     };
     let union = |a: (i32, i32, i32, i32), b: (i32, i32, i32, i32)| (a.0.min(b.0), a.1.min(b.1), a.2.max(b.2), a.3.max(b.3));
     {
-        let _span = casts_span(); // PREEMPTOFFARMCASTS (zenbook-ledger Z93): the CASTS publish span is preempt-off with PSTATE.I as the caller had it on aarch64 (`casts_span`, file tail), the mask elsewhere; was `IrqMask::new()`. LINE-NEUTRAL
+        let _span = casts_span(); #[cfg(all(target_arch = "aarch64", feature = "witness"))] let _span = crate::arch::sched::preemptoff::casts_nest(_span); // PREEMPTOFFARMCASTSINPASSLEG (zenbook-ledger Z106): under witness on aarch64 the span's hold is moved into `preemptoff::casts_nest`, which reads the count inside and after it for the audit's `casts_nest=` leg when armed (one relaxed load otherwise). PREEMPTOFFARMCASTS (zenbook-ledger Z93): the CASTS publish span is preempt-off with PSTATE.I as the caller had it on aarch64 (`casts_span`, file tail), the mask elsewhere; was `IrqMask::new()`. LINE-NEUTRAL
         let mut g = CASTS.lock();
         let stale = STALE.swap(false, Ordering::AcqRel);
         for c in now.iter() {
