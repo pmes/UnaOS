@@ -1153,7 +1153,7 @@ refs/heads/exec-rmbp-xhciloanptpyieldptptake   a446467de FOLDED-BY-HAND (this co
 refs/heads/exec-rmbp-unafsflightlist   412e8aba3 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-xhciloanptpyieldkatrule   8978c4c25 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-preemptoffarmquantum   736f42b84 IN-FLIGHT cut 2026-10-28
-refs/heads/exec-rmbp-closeflightrescue   736f42b84 IN-FLIGHT cut 2026-10-28
+refs/heads/exec-rmbp-closeflightrescue   f49043363 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-aethercaptioncore   736f42b84 IN-FLIGHT cut 2026-10-28
 refs/heads/exec-rmbp-installerproviderholocron   736f42b84 IN-FLIGHT cut 2026-10-28
 refs/heads/exec-rmbp-masksiteszeroms   d41baf8ce IN-FLIGHT cut 2026-10-28
