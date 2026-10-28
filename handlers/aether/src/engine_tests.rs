@@ -3807,4 +3807,29 @@ mod tests {
         assert_eq!(px(50, 50), (0, 0, 255), "the box's centre");
         assert_eq!(px(50, 1), (0, 0, 255), "the top edge's middle is inside the rounded box");
     }
+
+    /// AETHERCENTERLAYOUT (SR421): google.com's home form (an inline reduction of its markup: `<center>` > `<form>` >
+    /// the cellpadding=0 layout table with the 25% / `td align=center nowrap` search field and btnG / btnI submits /
+    /// 25% Advanced-search cells) sits centred under `<center>`, as Chrome's `-webkit-center` places it, not at the
+    /// left (Peter's Mac run: x 87-787); getComputedStyle names the UA value.
+    #[test]
+    fn center_form_table_centred() {
+        let html = r#"<!doctype html><html><head><style>
+            .lsbb{background:#f3f5f6;border:solid 1px;border-color:#d2d2d2 #70757a #70757a #d2d2d2;height:30px;display:block}
+            .lsb{color:#1f1f1f;border:none;height:30px;margin:0;outline:0;font:15px sans-serif;vertical-align:top}
+            .ds{display:inline-box;display:inline-block;margin:3px 0 4px;margin-left:4px}
+        </style></head><body><center id="c"><br clear="all"><div id="lga"><img alt="Google" height="92" width="272" style="padding:28px 0 14px"><br><br></div>
+            <form action="/search" name="f"><table id="t" cellpadding="0" cellspacing="0"><tr valign="top"><td width="25%">&nbsp;</td><td align="center" nowrap=""><div class="ds" style="height:32px;margin:4px 0"><input class="lst" style="margin:0;padding:5px 8px 0 6px;vertical-align:top;color:#000" autocomplete="off" value="" title="Google Search" maxlength="2048" name="q" size="57"></div><br style="line-height:0"><span class="ds"><span class="lsbb"><input class="lsb" value="Google Search" name="btnG" type="submit"></span></span><span class="ds"><span class="lsbb"><input class="lsb" value="I'm Feeling Lucky" name="btnI" type="submit"></span></span></td><td class="fl sblc" align="left" nowrap="" width="25%"><a href="/advanced_search?hl=en">Advanced search</a></td></tr></table></form></center></body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(1200, 800));
+        engine.load_html("https://www.google.com/", html, true);
+        engine.render_frame();
+        let r = |e: &mut crate::AetherEngine, k: &str| js_num(e, &format!("document.getElementById('t').getBoundingClientRect().{k}"));
+        let (left, width) = (r(&mut engine, "left"), r(&mut engine, "width"));
+        assert!(width > 0.0 && width < 1100.0, "the form table is narrower than the page ({width})");
+        assert!(left > 40.0, "the form table is not at the left edge (left {left})");
+        assert!((left + width / 2.0 - 600.0).abs() <= 2.0, "the form table is centred (left {left}, width {width})");
+        let ta = engine.js_engine.as_mut().unwrap().eval_string("getComputedStyle(document.getElementById('c')).textAlign").unwrap();
+        assert_eq!(ta, "-webkit-center", "<center>'s computed text-align is the UA's -webkit-center");
+    }
 }
