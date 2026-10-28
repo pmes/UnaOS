@@ -1132,3 +1132,6 @@ refs/heads/exec-rmbp-installerproviderstream   48efd481d FOLDED-BY-HAND (this co
 refs/heads/exec-rmbp-xhciloanpumpholderkat   09f2f46fc IN-FLIGHT cut 2026-10-28
 refs/heads/exec-rmbp-lockregouterxcore   09f2f46fc IN-FLIGHT cut 2026-10-28
 refs/heads/exec-rmbp-unafsbindtrigger   09f2f46fc IN-FLIGHT cut 2026-10-28
+refs/heads/exec-rmbp-xhciloanptpyieldpolltake   296cac776 IN-FLIGHT cut 2026-10-28
+refs/heads/exec-rmbp-masksitesseccore   296cac776 IN-FLIGHT cut 2026-10-28
+refs/heads/exec-rmbp-aetherfontdboracle   296cac776 IN-FLIGHT cut 2026-10-28
