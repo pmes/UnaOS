@@ -4652,7 +4652,7 @@ static LOAN_YIELD_KAT: core::sync::atomic::AtomicU8 = core::sync::atomic::Atomic
 #[cfg(all(feature = "uvc", target_arch = "x86_64"))]
 fn loan_yield_kat_claimant(_: usize) {
     use core::sync::atomic::Ordering;
-    LOAN_YIELD_KAT.store(1, Ordering::Release);
+    LOAN_YIELD_KAT.store(1, Ordering::Release); loan_yield_kat_order_wait(); // XHCILOANPTPYIELDWAITCOUNT (Z108): parked until both PTP claimants are refused by Z90 inside the window (LINE-NEUTRAL)
     match claim_xhci_for_io() {
         Ok(l) => {
             LOAN_YIELD_KAT.store(2, Ordering::Release);
@@ -5263,7 +5263,7 @@ fn loan_ptp_yield_wait() -> bool {
         use core::sync::atomic::Ordering;
         if xhci::ptp::TXN_YIELDED.load(Ordering::Acquire) {
             if let Some(t) = crate::arch::sched::current_id() {
-                if loan_ptp_marked(t) && t != LOAN_YIELD_HOLDER.load(Ordering::Acquire) { // XHCILOANPTPYIELDPTPMARKMANY (Z100): the mark set
+                if loan_ptp_marked(t) && t != LOAN_YIELD_HOLDER.load(Ordering::Acquire) { loan_ptp_refused_note(t); // XHCILOANPTPYIELDPTPMARKMANY (Z100): the mark set. XHCILOANPTPYIELDWAITCOUNT (Z108): the refused task's mark slot bit (LINE-NEUTRAL)
                     if !PTP_WAIT_SAID.swap(true, Ordering::Relaxed) {
                         serial_println!("[xhci] ptp wait why=ptp-yield who=ptp (XHCILOANPTPYIELDPTPWAIT Z90, first wait, once)");
                     }
@@ -5403,10 +5403,10 @@ fn loan_yield_kat_ptp_claimant(i: usize) {
 /// `ptp-unmarked` (a FAIL word: Z100's set regressed).
 #[cfg(all(feature = "uvc", target_arch = "x86_64"))]
 fn loan_yield_kat_ptp_arm(cpu: usize) -> Result<(), &'static str> {
-    use core::sync::atomic::Ordering;
+    use core::sync::atomic::Ordering; let cpus = loan_yield_kat_ptp_cpus(cpu).ok_or("skip(order)")?; LOAN_PTP_REFUSED.store(0, Ordering::Release); // XHCILOANPTPYIELDWAITCOUNT (Z108): one cpu per PTP claimant, the refusal bits cleared before the spawns
     for (i, s) in LOAN_YIELD_KAT_PTP.iter().enumerate() {
         s.store(0, Ordering::Release);
-        crate::arch::sched::spawn("ptpyield-ptp", loan_yield_kat_ptp_claimant, i, cpu, crate::arch::sched::PRIO_HIGH);
+        crate::arch::sched::spawn("ptpyield-ptp", loan_yield_kat_ptp_claimant, i, cpus[i], crate::arch::sched::PRIO_HIGH);
     }
     if !wait::bounded(1000, || LOAN_YIELD_KAT_PTP.iter().all(|s| s.load(Ordering::Acquire) != 0)) {
         return Err("skip(claimant-late)");
@@ -5435,5 +5435,85 @@ pub fn xhci_loan_yield_kat_ptp_took() -> bool {
     #[cfg(not(target_arch = "x86_64"))]
     {
         false
+    }
+}
+
+// ══════════ XHCILOANPTPYIELDWAITCOUNT (zenbook-ledger Z108) — the yield KAT counts Z90's refusals, the PTP takes ordered first ══════════
+//
+// TAIL-APPENDED (LINE-NEUTRAL folds: `loan_yield_kat_claimant`'s first store, Z90's refusal branch in `loan_ptp_yield_wait`;
+// Z104's `loan_yield_kat_ptp_arm` edited in place). Z104 left the count of Z90 refusals unjudged: its three claimants shared
+// ONE cpu, and with x86's `QUANTUM_TICKS` = 4 (4 ms) against the 3 ms window (`LOAN_YIELD_WINDOW_MS`), a hlt-waiter that is
+// refused does not yield, so it keeps the cpu across the window's ticks and usually only one of the three runs in it — no
+// handshake on that cpu can order them. Now each PTP claimant runs on ITS OWN `smp::xhci_worker_cpu` core (its own 1 kHz tick
+// wakes its hlt, so Z90 refuses it within ~1 ms of the put), and the block claimant is parked BEFORE its claim in a bounded
+// TSC spin (not hlt): until the window opens (`ptp::TXN_YIELDED`), then <= `LOAN_YIELD_KAT_ORDER_MS` until both PTP claimants
+// were refused; it claims either way. Z90's refusal collapses to a plain `Busy` inside `claim_xhci_for_io`'s loop, so it
+// reaches the KAT through ONE word: a bit per `LOAN_PTP_TAKERS` slot, set by the refusal for the refused task's slot; its
+// popcount is the claimants refused at least once (a hlt-looping claimant refused many times sets one bit). The verdict
+// (`ptp::loan_yield_kat`): served with exactly `LOAN_YIELD_KAT_PTPS` = ok, served otherwise = `ptp-unrefused` (FAIL),
+// untaken with fewer = `skip(order)`; fewer than two free cpus = `skip(order)`. Owed: XHCILOAN-PTPYIELD-WAITCOUNT-WORD (the
+// count as a number is a PREEMPTAUDIT format edit), XHCILOAN-PTPYIELD-WAITCOUNT-FOREIGN (a real PTP claimant refused inside
+// the KAT's window sets a third bit: `ptp-unrefused` on metal with a live camera reader).
+
+/// XHCILOANPTPYIELDWAITCOUNT: how long the parked block claimant waits, once the window is open, for both PTP refusals.
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+const LOAN_YIELD_KAT_ORDER_MS: u64 = 10;
+
+/// XHCILOANPTPYIELDWAITCOUNT: one bit per `LOAN_PTP_TAKERS` slot (`LOAN_PTP_MARKS` = 8): the marked task in slot j was refused
+/// by Z90 since the yield KAT's arm cleared it. Written by the refused task (its own slot's bit) and by the arm (store 0, before
+/// its spawns); read by the parked block claimant and the verdict. Lock-free.
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+static LOAN_PTP_REFUSED: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// XHCILOANPTPYIELDWAITCOUNT: Z90 refused marked task `t`: set its mark slot's bit (called only inside an open window).
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+fn loan_ptp_refused_note(t: u64) {
+    use core::sync::atomic::Ordering;
+    if let Some(j) = LOAN_PTP_TAKERS.iter().position(|s| s.load(Ordering::Acquire) == t) {
+        LOAN_PTP_REFUSED.fetch_or(1u8 << j, Ordering::AcqRel);
+    }
+}
+
+/// XHCILOANPTPYIELDWAITCOUNT: one core per PTP claimant, asked by name (`smp::xhci_worker_cpu`, BP-cores-1), never this core
+/// nor the block claimant's `block`; `None` when fewer than `LOAN_YIELD_KAT_PTPS` remain (the arm says `skip(order)`).
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+fn loan_yield_kat_ptp_cpus(block: usize) -> Option<[usize; LOAN_YIELD_KAT_PTPS]> {
+    let me = crate::arch::percpu::this_cpu().cpu_index as usize;
+    let mut out = [0usize; LOAN_YIELD_KAT_PTPS];
+    let mut n = 0usize;
+    for c in (0usize..).map_while(crate::arch::smp::xhci_worker_cpu) {
+        if n == LOAN_YIELD_KAT_PTPS {
+            break;
+        }
+        if c != me && c != block {
+            out[n] = c;
+            n += 1;
+        }
+    }
+    if n == LOAN_YIELD_KAT_PTPS { Some(out) } else { None }
+}
+
+/// XHCILOANPTPYIELDWAITCOUNT: the block claimant's ordering stage, before its claim: a bounded spin (<= 2500 ms, the settle's
+/// budget) until the window opens, then <= `LOAN_YIELD_KAT_ORDER_MS` until both PTP claimants were refused. It claims either
+/// way: a missed order leaves the window untaken, judged `skip(order)`.
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+fn loan_yield_kat_order_wait() {
+    use core::sync::atomic::Ordering;
+    if wait::bounded(2500, || xhci::ptp::TXN_YIELDED.load(Ordering::Acquire)) {
+        let _ = wait::bounded(LOAN_YIELD_KAT_ORDER_MS, || LOAN_PTP_REFUSED.load(Ordering::Acquire).count_ones() as usize >= LOAN_YIELD_KAT_PTPS);
+    }
+}
+
+/// XHCILOANPTPYIELDWAITCOUNT: the PTP claimants Z90 refused this KAT run against the claimants armed (`Equal` = the counted
+/// refusals; read by `ptp::loan_yield_kat` after the re-take). aarch64: `Less` (no claimant there).
+#[cfg(feature = "uvc")]
+pub fn xhci_loan_yield_kat_ptp_refused() -> core::cmp::Ordering {
+    #[cfg(target_arch = "x86_64")]
+    {
+        (LOAN_PTP_REFUSED.load(core::sync::atomic::Ordering::Acquire).count_ones() as usize).cmp(&LOAN_YIELD_KAT_PTPS)
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        core::cmp::Ordering::Less
     }
 }
