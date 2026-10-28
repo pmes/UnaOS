@@ -949,9 +949,9 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
             style.paint.container_name = Some(names);
         }
         "container" => {
-            let (names, ty) = match value.split_once('/') {
-                Some((n, t)) => (n.trim(), Some(t.trim())),
-                None => (value, None),
+            let (names, ty) = match split_top_level_slash(value) { // AETHERCSSSPLITAUDIT (SR426): the depth-0 `/`
+                (n, Some(t)) => (n.trim(), Some(t.trim())),
+                (_, None) => (value, None),
             };
             apply_declaration("container-name", names, style, cx);
             apply_declaration("container-type", ty.unwrap_or("normal"), style, cx);
@@ -1271,27 +1271,29 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
             // Components outside url(...) — the url may itself hold slashes
             // and keywords, so scan only what is left after removing it.
             let outside = strip_css_urls(value);
-            for part in outside.split_whitespace() {
+            // AETHERCSSSPLITAUDIT (SR426): the components, the position / size `/` and the size pair at paren depth 0
+            // (`rgb(0 0 0 / 50%)`, `calc(10px + 5px) 0 / calc(50% - 2px) auto` stay whole).
+            for part in split_top_level(&outside) {
                 if let Some(r) = parse_repeat(part) {
                     style.paint.bg_repeat = Some(r);
                 }
             }
-            if let Some((pos, size)) = outside.split_once('/') {
-                let pos: String = pos
-                    .split_whitespace()
+            if let (pos, Some(size)) = split_top_level_slash(&outside) {
+                let pos: String = split_top_level(pos)
+                    .into_iter()
                     .filter(|t| is_position_token(t))
                     .collect::<Vec<_>>()
                     .join(" ");
                 if !pos.is_empty() {
                     style.paint.bg_position = Some(pos);
                 }
-                let size = size.split_whitespace().take(2).collect::<Vec<_>>().join(" ");
+                let size = split_top_level(size).into_iter().take(2).collect::<Vec<_>>().join(" ");
                 if !size.is_empty() {
                     style.paint.bg_size = Some(size);
                 }
             } else {
-                let pos: String = outside
-                    .split_whitespace()
+                let pos: String = split_top_level(&outside)
+                    .into_iter()
                     .filter(|t| is_position_token(t))
                     .collect::<Vec<_>>()
                     .join(" ");
@@ -1416,15 +1418,12 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
                 }
                 rest = tail.trim_start();
             }
-            // size[/line-height] then the family list.
-            let (size_part, family) = match rest.find(char::is_whitespace) {
-                Some(i) => (&rest[..i], rest[i..].trim()),
-                None => (rest, ""),
-            };
-            let (size, line) = match size_part.split_once('/') {
-                Some((s, l)) => (s, Some(l)),
-                None => (size_part, None),
-            };
+            // size[/line-height] then the family list. AETHERCSSSPLITAUDIT (SR426): the size component and its `/`
+            // at paren depth 0 (`calc(10px + 2px) serif`, `12px/calc(10px + 6px) serif`).
+            let rest = rest.trim_start();
+            let size_part = split_top_level(rest).first().copied().unwrap_or("");
+            let family = rest[size_part.len()..].trim();
+            let (size, line) = split_top_level_slash(size_part);
             match parse_font_size(size, cx) {
                 Some(px) => style.paint.font_size = Some(px),
                 None => {
@@ -2364,7 +2363,7 @@ pub fn parse_clip_path(value: &str, cx: &ParseCx) -> Option<Option<ClipShape>> {
             };
             let r = parse_sides(ins, |p| len_pct(p, cx))?;
             let rad = match round {
-                Some(r) => len_pct(split_top_level(r.split('/').next().unwrap_or(r)).first()?, cx)?,
+                Some(r) => len_pct(split_top_level(split_top_level_slash(r).0).first()?, cx)?, // AETHERCSSSPLITAUDIT (SR426)
                 None => [0.0, 0.0],
             };
             ClipShape::Inset([r.top, r.right, r.bottom, r.left], rad)
@@ -2517,6 +2516,10 @@ fn is_position_token(t: &str) -> bool {
     // leaving a one-value position that shifted the sprite in the wrong axis.
     if t == "0" {
         return true;
+    }
+    // AETHERCSSSPLITAUDIT (SR426): a math function is a <length-percentage> (css-values-4 §10).
+    if let Some(open) = t.find('(') {
+        return t.ends_with(')') && matches!(t[..open].to_ascii_lowercase().as_str(), "calc" | "min" | "max" | "clamp");
     }
     for unit in ["px", "em", "rem", "pt", "%"] {
         if let Some(n) = t.strip_suffix(unit) {

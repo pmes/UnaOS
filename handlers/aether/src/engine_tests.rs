@@ -3807,4 +3807,32 @@ mod tests {
         assert_eq!(px(50, 50), (0, 0, 255), "the box's centre");
         assert_eq!(px(50, 1), (0, 0, 255), "the top edge's middle is inside the rounded box");
     }
+
+    /// AETHERCSSSPLITAUDIT (SR426): `background: rgb(0 0 0 / 50%)` is one colour layer at half alpha — the slash
+    /// inside the function is not the shorthand's position / size separator — so a 100x100 box over the white page
+    /// paints mid grey, and its paint entry carries no bogus position ("0 0") or size ("50%)").
+    #[test]
+    fn test_aethercsssplitaudit_slash_alpha_background_paints() {
+        let t = laid_out(
+            r#"<html><body><div id="h" style="width:100px;height:100px;background:rgb(0 0 0 / 50%)"></div></body></html>"#,
+            "body{margin:0}",
+        );
+        let p = t
+            .node_map
+            .iter()
+            .find_map(|(id, n)| {
+                let el = n.as_element()?;
+                (el.attributes.borrow().get("id") == Some("h")).then(|| t.paint_map.get(id))?
+            })
+            .expect("the box has a paint entry");
+        assert_eq!(p.bg_position, None, "no position from the colour's inner slash");
+        assert_eq!(p.bg_size, None, "no size from the colour's inner slash");
+        let (w, h) = (100u32, 100u32);
+        let mut surface = vec![0u8; (w * h * 4) as usize];
+        crate::render::render_frame(&t, &mut surface, w, h, 0.0, 0.0, &[(0, 0, w, h)]);
+        let i = ((50 * w + 50) * 4) as usize;
+        for c in [surface[i], surface[i + 1], surface[i + 2]] {
+            assert!((126..=129).contains(&c), "half-alpha black over white is mid grey, got {c}");
+        }
+    }
 }
