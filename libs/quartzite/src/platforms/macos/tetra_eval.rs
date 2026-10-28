@@ -147,6 +147,9 @@ fn apply_face() {
     let Some((full, patches)) = crate::tetra::take_face() else { return };
     let Some((root, synapse)) = FACE_ROOT.with(|r| r.borrow().clone()) else { return };
     crate::tetra::SurfaceMap::of(&full).scope(|| {
+        // FACELIVE-FIELDMOVE (SR451): every patch's kept fields read before the first teardown (a keep's old path may lie
+        // under another patch), written after the last rebuild (patches are disjoint: the new paths hold then).
+        let held = face_keep_read(&root, &crate::tetra::face_keeps(&patches));
         for patch in patches {
             match patch {
                 crate::tetra::FacePatch::Lines { path, console } => {
@@ -169,7 +172,7 @@ fn apply_face() {
                     let s = objc2_foundation::NSString::from_str(&placeholder);
                     let _: () = unsafe { msg_send![&field, setPlaceholderString: &*s] };
                 }
-                crate::tetra::FacePatch::Restack { path, node, keep } => {
+                crate::tetra::FacePatch::Restack { path, node, keep: _ } => {
                     let Some(stack) = face_view(&root, &path) else { continue };
                     let (vertical, children) = match node {
                         TetraNode::VStack(c) => (true, c),
@@ -179,7 +182,6 @@ fn apply_face() {
                     if !face_is_stack(&stack) {
                         continue;
                     }
-                    let held = face_keep_read(&root, &keep); // FACELIVE-FIELDKEEP (SR444): typed text and focus read before the rebuild
                     while let Some(c) = face_child(&stack, 0) {
                         face_drop(&c); // FACELIVE-SUBSCRIPTION-DROP (SR441): the leaving view's subscribers end
                         unsafe { face_unarrange(&stack, &c) };
@@ -193,25 +195,23 @@ fn apply_face() {
                             let _: () = msg_send![&s, addArrangedSubview: &*v];
                         }
                     }
-                    face_keep_write(&root, held); // FACELIVE-FIELDKEEP (SR444)
                 }
-                crate::tetra::FacePatch::Replace { path, node, keep } => {
+                crate::tetra::FacePatch::Replace { path, node, keep: _ } => {
                     let Some((&last, parent_path)) = path.split_last() else {
                         log::warn!("[quartzite] face root-leaf unpatched");
                         continue;
                     };
                     let (Some(parent), Some(old)) = (face_view(&root, parent_path), face_view(&root, &path)) else { continue };
-                    let held = face_keep_read(&root, &keep); // FACELIVE-FIELDKEEP (SR444)
                     let new = eval_tetra(node, synapse.clone());
                     face_drop(&old); // FACELIVE-SUBSCRIPTION-DROP (SR441)
                     unsafe {
                         let _: () = msg_send![&parent, insertArrangedSubview: &*new, atIndex: last as isize];
                         face_unarrange(&parent, &old);
                     }
-                    face_keep_write(&root, held); // FACELIVE-FIELDKEEP (SR444)
                 }
             }
         }
+        face_keep_write(&root, held); // FACELIVE-FIELDMOVE (SR451)
     });
 }
 
