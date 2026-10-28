@@ -4490,7 +4490,7 @@ impl BlockLoan {
             ptp_masked_refusal();
             return Err(BlockError::Busy);
         }
-        let _ptp = LoanPtpMark::set(); let mut l = claim_xhci_for_io()?; // XHCILOANPTPYIELDPTPTAKE (Z87): this task is marked a PTP claimant until claim_only returns; XHCILOANPTPYIELDPTPWAIT (Z90): the mark, held across claim_xhci_for_io's wait, refuses this task's take inside a yield window
+        let _ptp = LoanPtpMark::set()?; let mut l = claim_xhci_for_io()?; // XHCILOANPTPYIELDPTPTAKE (Z87): this task is marked a PTP claimant until claim_only returns; XHCILOANPTPYIELDPTPWAIT (Z90): the mark, held across claim_xhci_for_io's wait, refuses this task's take inside a yield window
         l.demote();
         LOAN_PTP_CLAIMS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         Ok(l)
@@ -5076,11 +5076,11 @@ const LOAN_CLOSER_PTP: u8 = 4;
 #[cfg(all(feature = "uvc", target_arch = "x86_64"))]
 static LOAN_YIELD_CLOSER: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 
-/// XHCILOANPTPYIELDPTPTAKE (Z87): the task id of a `claim_only` caller while it is inside its claim (0 = none). Written only
-/// by that task (`LoanPtpMark`: CAS 0 -> tid, so the holder's own re-take does not overwrite a waiting second claimant; CAS
-/// tid -> 0 on drop); read by `loan_yield_close` while a window is open.
+/// XHCILOANPTPYIELDPTPTAKE (Z87): the task ids of the `claim_only` callers inside their claim (0 = a free slot).
+/// XHCILOANPTPYIELDPTPMARKMANY (Z100): a set, not one word; each slot written only by the task in it (`loan_ptp_mark_set`:
+/// CAS 0 -> tid; `loan_ptp_mark_clear`: tid -> 0 on drop); read by `loan_yield_close` and Z90 while a window is open.
 #[cfg(all(feature = "uvc", target_arch = "x86_64"))]
-static LOAN_PTP_TAKER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static LOAN_PTP_TAKERS: [core::sync::atomic::AtomicU64; LOAN_PTP_MARKS] = [const { core::sync::atomic::AtomicU64::new(0) }; LOAN_PTP_MARKS];
 
 /// XHCILOANPTPYIELDPTPTAKE (Z87): marks the current task as a PTP/MTP claimant for the span of `claim_only`'s take (the
 /// guard's drop clears it, the `?` return included). A ZST: without `uvc` or off x86 it compiles to nothing.
@@ -5088,14 +5088,14 @@ struct LoanPtpMark;
 
 impl LoanPtpMark {
     #[inline(always)]
-    fn set() -> LoanPtpMark {
+    fn set() -> Result<LoanPtpMark, BlockError> {
         #[cfg(all(feature = "uvc", target_arch = "x86_64"))]
         {
             if let Some(t) = crate::arch::sched::current_id() {
-                let _ = LOAN_PTP_TAKER.compare_exchange(0, t, core::sync::atomic::Ordering::AcqRel, core::sync::atomic::Ordering::Relaxed);
+                loan_ptp_mark_set(t)?; // XHCILOANPTPYIELDPTPMARKMANY (Z100): a full mark set refuses Busy at once (the window's holder excepted)
             }
         }
-        LoanPtpMark
+        Ok(LoanPtpMark)
     }
 }
 
@@ -5103,7 +5103,7 @@ impl LoanPtpMark {
 impl Drop for LoanPtpMark {
     fn drop(&mut self) {
         if let Some(t) = crate::arch::sched::current_id() {
-            let _ = LOAN_PTP_TAKER.compare_exchange(t, 0, core::sync::atomic::Ordering::AcqRel, core::sync::atomic::Ordering::Relaxed);
+            loan_ptp_mark_clear(t); // XHCILOANPTPYIELDPTPMARKMANY (Z100)
         }
     }
 }
@@ -5119,7 +5119,7 @@ fn loan_yield_close() {
         if LOAN_YIELD_CLOSER.load(Ordering::Acquire) != LOAN_CLOSER_OPEN {
             return;
         }
-        let ptp = crate::arch::sched::current_id().is_some_and(|t| t == LOAN_PTP_TAKER.load(Ordering::Acquire)); // XHCILOANPTPYIELDPTPTAKE (Z87): a task `claim_only` marked
+        let ptp = crate::arch::sched::current_id().is_some_and(loan_ptp_marked); // XHCILOANPTPYIELDPTPTAKE (Z87): a task `claim_only` marked. XHCILOANPTPYIELDPTPMARKMANY (Z100): any slot of the set
         let who = if crate::arch::sched::current_name() == Some("xhci-poll") { LOAN_CLOSER_POLL } else if ptp { LOAN_CLOSER_PTP } else { LOAN_CLOSER_BLOCK };
         let _ = LOAN_YIELD_CLOSER.compare_exchange(LOAN_CLOSER_OPEN, who, Ordering::AcqRel, Ordering::Relaxed);
     }
@@ -5232,7 +5232,7 @@ impl core::fmt::Display for PollSkips {
 // The window's holder is exempt by identity: `yield_now` re-takes through `claim_only` with `TXN_YIELDED` still set and marks
 // itself when the mark is free, so the holder writes its task id before its put. One gate site, two predicates: Z86's keys
 // on the task name and carries poll-only side effects. XHCILOAN-PTPYIELD-LOOPONE BUILT by Z96 (`YIELD_KAT_WINDOWS` is 1); owed:
-// XHCILOAN-PTPYIELD-PTPMARK-MANY (one mark word: a third concurrent PTP claimant is unmarked), XHCILOAN-PTPYIELD-OUT.
+// XHCILOAN-PTPYIELD-PTPMARK-MANY (BUILT by Z100: the mark is a set of `LOAN_PTP_MARKS` task ids), XHCILOAN-PTPYIELD-OUT.
 
 /// XHCILOANPTPYIELDPTPWAIT: the task id of the PTP hold that opened the current yield window. Written only by that holder in
 /// `yield_now`, before its put; meaningful only while `ptp::TXN_YIELDED` is set (rewritten before every window, one yielding
@@ -5263,7 +5263,7 @@ fn loan_ptp_yield_wait() -> bool {
         use core::sync::atomic::Ordering;
         if xhci::ptp::TXN_YIELDED.load(Ordering::Acquire) {
             if let Some(t) = crate::arch::sched::current_id() {
-                if t == LOAN_PTP_TAKER.load(Ordering::Acquire) && t != LOAN_YIELD_HOLDER.load(Ordering::Acquire) {
+                if loan_ptp_marked(t) && t != LOAN_YIELD_HOLDER.load(Ordering::Acquire) { // XHCILOANPTPYIELDPTPMARKMANY (Z100): the mark set
                     if !PTP_WAIT_SAID.swap(true, Ordering::Relaxed) {
                         serial_println!("[xhci] ptp wait why=ptp-yield who=ptp (XHCILOANPTPYIELDPTPWAIT Z90, first wait, once)");
                     }
@@ -5303,4 +5303,60 @@ fn loan_held_put() {
     if let Some(h) = crate::arch::sched::preemptoff::Held::from_word(w) {
         crate::arch::sched::preemptoff::put(h);
     }
+}
+
+// ══════════ XHCILOANPTPYIELDPTPMARKMANY (zenbook-ledger Z100) — the PTP yield mark is a set of task ids, not one word ══════════
+//
+// TAIL-APPENDED (in-place edits line-count neutral: Z87's mark word, `LoanPtpMark`, Z82's closer line, Z90's predicate; one
+// token on `claim_only`'s line). Z87's mark was ONE word (`LOAN_PTP_TAKER`, CAS 0 -> tid): a third concurrent PTP/MTP claim
+// (every `ptp::with_controller` caller: ptpfs reads from any task, the Camera viewer, the `ptp` verb, the MTP transport;
+// nothing serializes them) found it held, stayed unmarked, was not refused by Z90's `loan_ptp_yield_wait` and was classed
+// BLOCK by Z82's closer: it closed a PTP holder's yield window as if it were the block claimant. Now `LOAN_PTP_MARKS` words
+// (2x the four concurrent claimants measured as realistic), each written only by the task in it; a claim that finds the set
+// full is refused `Busy` at once (said once), so no unmarked PTP claim ever reaches `take_block_loan` — except the window's
+// holder re-taking, exempt from Z90 by identity already (its closer class is never read). Owed: XHCILOAN-PTPYIELD-PTPMARK-KAT.
+
+/// XHCILOANPTPYIELDPTPMARKMANY: the PTP claimants that can be marked at once (`LOAN_PTP_TAKERS`).
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+const LOAN_PTP_MARKS: usize = 8;
+
+/// XHCILOANPTPYIELDPTPMARKMANY: the first full-set refusal was said (once per boot).
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+static PTP_MARK_FULL_SAID: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// XHCILOANPTPYIELDPTPMARKMANY: mark task `t` in the first free slot (CAS 0 -> t). A full set: the yield window's holder
+/// re-taking goes on unmarked; any other claim is `Busy` (the first said once).
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+fn loan_ptp_mark_set(t: u64) -> Result<(), BlockError> {
+    use core::sync::atomic::Ordering;
+    for s in LOAN_PTP_TAKERS.iter() {
+        if s.compare_exchange(0, t, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+            return Ok(());
+        }
+    }
+    if xhci::ptp::TXN_YIELDED.load(Ordering::Acquire) && t == LOAN_YIELD_HOLDER.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    if !PTP_MARK_FULL_SAID.swap(true, Ordering::Relaxed) {
+        serial_println!("[xhci] ptp mark full why=ptp-marks({}) who=ptp (XHCILOANPTPYIELDPTPMARKMANY Z100, first refusal, once)", LOAN_PTP_MARKS);
+    }
+    Err(BlockError::Busy)
+}
+
+/// XHCILOANPTPYIELDPTPMARKMANY: clear task `t`'s slot (CAS t -> 0; nothing when it holds none: the holder's unmarked re-take).
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+fn loan_ptp_mark_clear(t: u64) {
+    use core::sync::atomic::Ordering;
+    for s in LOAN_PTP_TAKERS.iter() {
+        if s.compare_exchange(t, 0, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+            return;
+        }
+    }
+}
+
+/// XHCILOANPTPYIELDPTPMARKMANY: whether task `t` is a marked PTP claimant (read by Z82's closer and Z90's refusal, both only
+/// inside an open yield window).
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+fn loan_ptp_marked(t: u64) -> bool {
+    t != 0 && LOAN_PTP_TAKERS.iter().any(|s| s.load(core::sync::atomic::Ordering::Acquire) == t)
 }
