@@ -4280,7 +4280,7 @@ impl Drop for BlockLoan {
                 core::sync::atomic::Ordering::AcqRel,
                 core::sync::atomic::Ordering::Relaxed,
             );
-            crate::arch::sched::preemptoff::enable();
+            loan_held_put(); // PREEMPTOFFX86STALEDROP (rmbp-ledger B1069): the take's hold, epoch carried
         }
         #[cfg(not(target_arch = "x86_64"))]
         let _ = self.tag;
@@ -4321,15 +4321,15 @@ fn loan_why_word(code: u8) -> &'static str {
 /// published on success, the count released on a refusal.
 #[cfg(target_arch = "x86_64")]
 fn take_block_loan() -> Result<BlockLoan, XhciClaimError> {
-    crate::arch::sched::preemptoff::disable();
+    let held = crate::arch::sched::preemptoff::hold(); // PREEMPTOFFX86STALEDROP (rmbp-ledger B1069): the hold carries its CPU and epoch
     match xhci::claim() {
         Ok(l) => {
-            if loan_poll_yield_skip() || loan_ptp_yield_wait() { drop(l); crate::arch::sched::preemptoff::enable(); return Err(XhciClaimError::Busy); } let tag = crate::arch::percpu::this_cpu().cpu_index.saturating_add(1); loan_shed_arm(); loan_yield_close(); // XHCILOANPTPYIELDPOLLSKIP (Z86): the xhci-poll take inside an open PTP yield window goes straight back (unpublished, the closer left OPEN). XHCILOANFAILHOLD (Z66): the loan's age starts here, its shed mark cleared. XHCILOANPTPYIELDPOLLTAKE (Z82): an open PTP yield window records its closer BEFORE the publish below. XHCILOANPTPYIELDPTPWAIT (Z90): so does a second PTP claimant's take (claim_only's mark, not the window's holder), which then waits the window out in claim_xhci_for_io's hlt loop
+            if loan_poll_yield_skip() || loan_ptp_yield_wait() { drop(l); crate::arch::sched::preemptoff::put(held); return Err(XhciClaimError::Busy); } let tag = crate::arch::percpu::this_cpu().cpu_index.saturating_add(1); loan_shed_arm(); loan_held_set(held); loan_yield_close(); // XHCILOANPTPYIELDPOLLSKIP (Z86): the xhci-poll take inside an open PTP yield window goes straight back (unpublished, the closer left OPEN). XHCILOANFAILHOLD (Z66): the loan's age starts here, its shed mark cleared. XHCILOANPTPYIELDPOLLTAKE (Z82): an open PTP yield window records its closer BEFORE the publish below. XHCILOANPTPYIELDPTPWAIT (Z90): so does a second PTP claimant's take (claim_only's mark, not the window's holder), which then waits the window out in claim_xhci_for_io's hlt loop
             BLOCK_LOAN_CPU.store(tag, core::sync::atomic::Ordering::Release);
             Ok(BlockLoan { loan: Some(l), tag })
         }
         Err(e) => {
-            crate::arch::sched::preemptoff::enable();
+            crate::arch::sched::preemptoff::put(held);
             Err(e)
         }
     }
@@ -4509,7 +4509,7 @@ impl BlockLoan {
                     core::sync::atomic::Ordering::Relaxed,
                 );
                 self.tag = 0;
-                crate::arch::sched::preemptoff::enable();
+                loan_held_put(); // PREEMPTOFFX86STALEDROP (rmbp-ledger B1069)
             }
         }
     }
@@ -4792,7 +4792,7 @@ pub fn xhci_loan_shed(rung: &'static str, gate_ms: u64) {
     if BLOCK_LOAN_CPU.compare_exchange(me, 0, Ordering::AcqRel, Ordering::Relaxed).is_err() {
         return;
     }
-    crate::arch::sched::preemptoff::enable();
+    loan_held_put(); // PREEMPTOFFX86STALEDROP (rmbp-ledger B1069): the take's hold, from the static (the shed never sees the BlockLoan)
     LOAN_SHED.store(true, Ordering::Release);
     if LOAN_SHED_N.fetch_add(1, Ordering::Relaxed) == 0 {
         serial_println!(
@@ -5273,4 +5273,34 @@ fn loan_ptp_yield_wait() -> bool {
         }
     }
     false
+}
+
+// ══════════ PREEMPTOFFX86STALEDROP (rmbp-ledger B1069) — the block loan's hold carries its epoch to every release ══════════
+//
+// `take_block_loan` takes this CPU's preempt-off count as a `preemptoff::Held` (its CPU and that CPU's epoch). The count
+// is given back at one of three places — `BlockLoan`'s Drop, `demote` (Z69), `xhci_loan_shed` (Z66: a static path from
+// the holder's call chain that never sees the `BlockLoan`) — so the hold lives in ONE static word, written by the holder
+// at the take, on the premise `BLOCK_LOAN_CPU` and `LOAN_SHED` already rest on (controller 0's single loan: at most one
+// block loan is live). The release swaps it to 0 first, so a hold is given back at most once; a hold the dispatch reset
+// under it (its holder switched out inside the span) releases nothing and is counted (`stale_drop=`).
+
+/// B1069: the live block loan's hold (`Held::into_word`), 0 = none.
+#[cfg(target_arch = "x86_64")]
+static LOAN_HELD: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// B1069: at the take (loan held, preempt-off): keep the take's hold for the release.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn loan_held_set(h: crate::arch::sched::preemptoff::Held) {
+    LOAN_HELD.store(h.into_word(), core::sync::atomic::Ordering::Release);
+}
+
+/// B1069: give the live block loan's hold back (once: the word is swapped to 0), through `preemptoff::put`.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn loan_held_put() {
+    let w = LOAN_HELD.swap(0, core::sync::atomic::Ordering::AcqRel);
+    if let Some(h) = crate::arch::sched::preemptoff::Held::from_word(w) {
+        crate::arch::sched::preemptoff::put(h);
+    }
 }

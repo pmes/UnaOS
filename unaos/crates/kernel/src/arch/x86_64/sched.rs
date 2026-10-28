@@ -6334,7 +6334,7 @@ fn run() -> ! {
                 task.state.store(STATE_RUNNING, Ordering::Release);
                 // Fresh quantum + clear the reschedule signal, and publish the running priority so a
                 // remote waker/spawner can tell whether a newly-ready task should preempt us.
-                SCHED[cpu].quantum.store(QUANTUM_TICKS, Ordering::Relaxed); #[cfg(feature = "tickless")] tickless::on_dispatch(cpu); preemptoff::on_dispatch(cpu); // NVMEPREEMPTOFF (Z52): a count left by the task that left this CPU is reset and named once. TICKLESS (B765): a core leaving a tickless idle gets its 1 kHz tick back (the quantum counts ticks). LINE-NEUTRAL fold, code first
+                SCHED[cpu].quantum.store(QUANTUM_TICKS, Ordering::Relaxed); #[cfg(feature = "tickless")] tickless::on_dispatch(cpu); preemptoff::on_dispatch(cpu, task.id); // NVMEPREEMPTOFF (Z52): a count left by the task that left this CPU is reset and named once. TICKLESS (B765): a core leaving a tickless idle gets its 1 kHz tick back (the quantum counts ticks). LINE-NEUTRAL fold, code first
                 SCHED[cpu].need_resched.store(false, Ordering::Relaxed);
                 // R1 / rtpi: publish the EFFECTIVE priority so a remote waker cannot preempt a running
                 // boosted holder with a mid-priority task. Knob-off arm is the pre-arc verbatim.
@@ -9318,7 +9318,8 @@ pub fn current_stack_high() -> Option<(&'static str, usize, usize)> {
 // (which `without_interrupts` spans become preempt-off), PREEMPTOFF-SLEEPCHECK (name a yield inside the span at its site).
 pub mod preemptoff {
     use super::{percpu, ACCT, MAX_CPUS, QUANTUM_TICKS, SCHED};
-    use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use core::panic::Location;
+    use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 
     /// The preempt-off count per CPU (0 = preemptible). Written only by its own CPU with interrupts masked.
     static OFF: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(0) }; MAX_CPUS];
@@ -9329,6 +9330,17 @@ pub mod preemptoff {
     static FIRED: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(0) }; MAX_CPUS];
     static ENABLE_ZERO_SAID: AtomicBool = AtomicBool::new(false);
     static LEAK_SAID: AtomicBool = AtomicBool::new(false);
+    /// PREEMPTOFFX86STALEDROP (rmbp-ledger B1069), Z89's holder record on x86: this CPU's holder — the task (0 = no task)
+    /// and the site of the outermost take — written by its own CPU with IF=0 at the 0 -> 1 take; read by `on_dispatch`.
+    static HOLD_TID: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+    static HOLD_SITE: [AtomicPtr<Location<'static>>; MAX_CPUS] = [const { AtomicPtr::new(core::ptr::null_mut()) }; MAX_CPUS];
+    /// B1069, Z91's epoch on x86: bumped by its own CPU at the 0 -> 1 take (`note_holder`) and at the dispatch-time reset
+    /// (`on_dispatch`); a `Held` keeps the value it took under. The holder whose count this CPU last reset (the KAT's witness).
+    static HOLD_EPOCH: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(0) }; MAX_CPUS];
+    static LAST_RESET_TID: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+    /// B1069: holds given back with a stale epoch this boot (the KAT's own given back): `stale_drop=`; the once-line's latch.
+    static STALE_DROPS: AtomicU32 = AtomicU32::new(0);
+    static STALE_SAID: AtomicBool = AtomicBool::new(false);
 
     #[inline]
     fn this_cpu() -> usize {
@@ -9336,15 +9348,107 @@ pub mod preemptoff {
     }
 
     /// Hold this CPU's preempt-off count (nests; saturates at `u32::MAX`). Masked around the read so the caller cannot
-    /// migrate between reading its CPU and writing that CPU's count.
+    /// migrate between reading its CPU and writing that CPU's count. B1069: the bare take records its holder too (a
+    /// fixture's pair; every non-fixture pair carries a [`Held`] from [`hold`]).
+    #[track_caller]
     pub fn disable() {
+        let _ = take_at(Location::caller());
+    }
+
+    /// PREEMPTOFFX86STALEDROP (rmbp-ledger B1069): one hold of this CPU's count — the CPU it was taken on and that CPU's
+    /// epoch at the take. Given back only by [`put`], which releases nothing when the count was reset under it.
+    #[must_use = "a preempt-off hold is given back by preemptoff::put"]
+    pub struct Held {
+        cpu: u32,
+        epoch: u32,
+    }
+
+    impl Held {
+        /// One word for a static holder (the block loan's `LOAN_HELD`): `(cpu + 1) << 32 | epoch`, never 0.
+        pub fn into_word(self) -> u64 {
+            ((self.cpu as u64 + 1) << 32) | self.epoch as u64
+        }
+        /// The hold back from [`Held::into_word`]'s word; `None` for 0 (no hold).
+        pub fn from_word(w: u64) -> Option<Held> {
+            if w == 0 {
+                return None;
+            }
+            Some(Held { cpu: ((w >> 32) - 1) as u32, epoch: w as u32 })
+        }
+    }
+
+    /// B1069: take this CPU's count, carrying the epoch to the matching [`put`] (the pair shape: nvme `cq_wait`, the
+    /// block loan). The outermost take records this task and the caller's site as the holder.
+    #[track_caller]
+    pub fn hold() -> Held {
+        take_at(Location::caller())
+    }
+
+    /// B1069: give a [`hold`] back — through [`release`], on the CPU it was taken on.
+    pub fn put(h: Held) {
+        release(h.cpu as usize, h.epoch);
+    }
+
+    /// B1069: the one take (masked): the count +1 (saturating, RMW so a cross-CPU `put` cannot lose it); 0 -> 1 records
+    /// the holder and bumps the epoch (`note_holder`), a nested take keeps the current epoch.
+    fn take_at(site: &'static Location<'static>) -> Held {
         x86_64::instructions::interrupts::without_interrupts(|| {
             let cpu = this_cpu();
-            if cpu < MAX_CPUS {
-                let n = OFF[cpu].load(Ordering::Relaxed);
-                OFF[cpu].store(n.saturating_add(1), Ordering::Relaxed);
+            if cpu >= MAX_CPUS {
+                return Held { cpu: MAX_CPUS as u32, epoch: 0 };
+            }
+            let epoch = match OFF[cpu].fetch_update(Ordering::AcqRel, Ordering::Relaxed, |n| Some(n.saturating_add(1))) {
+                Ok(0) => note_holder(cpu, site),
+                _ => HOLD_EPOCH[cpu].load(Ordering::Relaxed),
+            };
+            Held { cpu: cpu as u32, epoch }
+        })
+    }
+
+    /// B1069 (Z89's `note_holder`): record `cpu`'s holder at its outermost take and bump its epoch, returning the new one.
+    fn note_holder(cpu: usize, site: &'static Location<'static>) -> u32 {
+        HOLD_TID[cpu].store(SCHED[cpu].current_tid.load(Ordering::Relaxed), Ordering::Relaxed);
+        HOLD_SITE[cpu].store(site as *const Location<'static> as *mut Location<'static>, Ordering::Relaxed);
+        HOLD_EPOCH[cpu].fetch_add(1, Ordering::Relaxed).wrapping_add(1)
+    }
+
+    /// B1069 (Z91's `release`): masked, so on its own CPU the compare and the decrement cannot straddle a dispatch. Epoch
+    /// still `cpu`'s: one decrement (at 0: the unpaired-enable refusal). Stale (the count was reset under this hold and may
+    /// now be a later hold's): nothing released, counted, said once. A CROSS-CPU put (a holder migrated out of a held
+    /// span) compares and decrements another CPU's slot in two atomics: a reset + retake between them is not closed
+    /// (PREEMPTOFF-ARM-STALEXCORE, owed, both arches).
+    fn release(cpu: usize, epoch: u32) {
+        if cpu >= MAX_CPUS {
+            return;
+        }
+        // 0 = released, 1 = stale, 2 = the count was already 0.
+        let (code, now, tid) = x86_64::instructions::interrupts::without_interrupts(|| {
+            let now = HOLD_EPOCH[cpu].load(Ordering::Relaxed);
+            let me = this_cpu();
+            let tid = if me < MAX_CPUS { SCHED[me].current_tid.load(Ordering::Relaxed) } else { 0 };
+            if now != epoch {
+                STALE_DROPS.fetch_add(1, Ordering::Relaxed);
+                return (1u8, now, tid);
+            }
+            match OFF[cpu].fetch_update(Ordering::AcqRel, Ordering::Relaxed, |n| n.checked_sub(1)) {
+                Ok(_) => (0u8, now, tid),
+                Err(_) => (2u8, now, tid),
             }
         });
+        if code == 1 && !STALE_SAID.swap(true, Ordering::AcqRel) {
+            serial_println!(
+                "[sched] preempt-off stale drop cpu={} holder={} epoch={}/{} -> not released (PREEMPTOFFX86STALEDROP B1069)",
+                cpu, tid, epoch, now
+            );
+        }
+        if code == 2 && !ENABLE_ZERO_SAID.swap(true, Ordering::AcqRel) {
+            serial_println!("[sched] preempt_enable refused cpu={} — count already 0 (unpaired enable)", cpu);
+        }
+    }
+
+    /// B1069: holds given back with a stale epoch this boot (the KAT's own given back): `stale_drop=`.
+    pub fn stale_drops() -> u32 {
+        STALE_DROPS.load(Ordering::Relaxed)
     }
 
     /// Release one hold. An enable with the count already 0 is refused by name (once a boot) and changes nothing.
@@ -9354,12 +9458,10 @@ pub mod preemptoff {
             if cpu >= MAX_CPUS {
                 return None;
             }
-            let n = OFF[cpu].load(Ordering::Relaxed);
-            if n == 0 {
-                return Some(cpu);
+            match OFF[cpu].fetch_update(Ordering::AcqRel, Ordering::Relaxed, |n| n.checked_sub(1)) {
+                Ok(_) => None,
+                Err(_) => Some(cpu),
             }
-            OFF[cpu].store(n - 1, Ordering::Relaxed);
-            None
         });
         if let Some(cpu) = refused {
             if !ENABLE_ZERO_SAID.swap(true, Ordering::AcqRel) {
@@ -9386,18 +9488,35 @@ pub mod preemptoff {
         false
     }
 
-    /// The dispatch fold (IF=0, `run()`): a count the departed task left behind is reset and named once.
-    pub(super) fn on_dispatch(cpu: usize) {
+    /// The dispatch fold (IF=0, `run()`): a count the departed task left behind is reset and named once. B1069 (Z89's
+    /// rule): the recorded holder itself re-dispatched keeps its count; any other incoming task resets it, bumps the
+    /// epoch (every hold taken before the reset is stale) and the line names the holder and its site.
+    pub(super) fn on_dispatch(cpu: usize, incoming: u64) {
         if cpu >= MAX_CPUS {
             return;
         }
-        let n = OFF[cpu].load(Ordering::Relaxed);
-        if n != 0 {
-            OFF[cpu].store(0, Ordering::Relaxed);
-            PENDING[cpu].store(false, Ordering::Relaxed);
-            if !LEAK_SAID.swap(true, Ordering::AcqRel) {
-                serial_println!("[sched] preempt-off leaked cpu={} count={} -> reset at dispatch (NVMEPREEMPTOFF Z52)", cpu, n);
-            }
+        if OFF[cpu].load(Ordering::Relaxed) == 0 {
+            return;
+        }
+        let holder = HOLD_TID[cpu].load(Ordering::Relaxed);
+        if holder == incoming {
+            return;
+        }
+        let n = OFF[cpu].swap(0, Ordering::AcqRel);
+        PENDING[cpu].store(false, Ordering::Relaxed);
+        HOLD_EPOCH[cpu].fetch_add(1, Ordering::Relaxed);
+        LAST_RESET_TID[cpu].store(holder, Ordering::Relaxed);
+        if n != 0 && !LEAK_SAID.swap(true, Ordering::AcqRel) {
+            let site = HOLD_SITE[cpu].load(Ordering::Relaxed) as *const Location<'static>;
+            // SAFETY: only ever stored from a `&'static Location<'static>` (`note_holder`); null until the first take.
+            let (file, line) = match unsafe { site.as_ref() } {
+                Some(l) => (l.file(), l.line()),
+                None => ("?", 0),
+            };
+            serial_println!(
+                "[sched] preempt-off leaked cpu={} count={} holder={} site={}:{} -> reset at dispatch (NVMEPREEMPTOFF Z52)",
+                cpu, n, holder, file, line
+            );
         }
     }
 
@@ -9467,15 +9586,17 @@ pub mod preemptoff {
 
     /// PREEMPTOFFAUDIT: the `without_interrupts`-shaped preempt-off span — this CPU's count held around `f`, interrupts
     /// as the caller had them. The guard's Drop releases the count, so an unwinding `f` still enables.
+    #[track_caller]
     pub fn scoped<R>(f: impl FnOnce() -> R) -> R {
-        struct Off;
+        struct Off(Option<Held>);
         impl Drop for Off {
             fn drop(&mut self) {
-                enable();
+                if let Some(h) = self.0.take() {
+                    put(h); // B1069: the span's own hold, epoch carried
+                }
             }
         }
-        disable();
-        let _off = Off;
+        let _off = Off(Some(take_at(Location::caller())));
         f()
     }
 
@@ -9548,7 +9669,7 @@ pub mod preemptoff {
         let (sdhc_word, sdhc_sw): (&'static str, u64) = ("skip(no-sdhcblk)", 0);
         let converted_sdhc = cfg!(feature = "sdhcblk") as u32;
         let switched = switched.saturating_add(sdhc_sw);
-        let (lw, lw_us) = crate::drivers::block::xhci_loan_wait_kat(); #[cfg(feature = "uvc")] let (pp, py): (&'static str, &'static str) = crate::drivers::xhci::ptp::loan_path_kat(); #[cfg(not(feature = "uvc"))] let (pp, py): (&'static str, &'static str) = ("skip(no-uvc)", "skip(no-uvc)"); let ls = crate::drivers::block::xhci_loan_shed_count(); let lk = crate::drivers::block::xhci_loan_shed_kat(); #[cfg(feature = "unafs")] let ul: &'static str = crate::fs::unafs::unafs_leg(); #[cfg(not(feature = "unafs"))] let ul: &'static str = "skip(no-unafs)"; let pk = crate::drivers::xhci::poll_cap_kat(); let hk = crate::drivers::xhci::pump_holder_kat(); let reason = if !on { // PREEMPTOFFXHCILOAN (Z62) leg: the masked claimant on a running block-loan holder (`loan_wait=`)
+        let (lw, lw_us) = crate::drivers::block::xhci_loan_wait_kat(); #[cfg(feature = "uvc")] let (pp, py): (&'static str, &'static str) = crate::drivers::xhci::ptp::loan_path_kat(); #[cfg(not(feature = "uvc"))] let (pp, py): (&'static str, &'static str) = ("skip(no-uvc)", "skip(no-uvc)"); let ls = crate::drivers::block::xhci_loan_shed_count(); let lk = crate::drivers::block::xhci_loan_shed_kat(); #[cfg(feature = "unafs")] let ul: &'static str = crate::fs::unafs::unafs_leg(); #[cfg(not(feature = "unafs"))] let ul: &'static str = "skip(no-unafs)"; let pk = crate::drivers::xhci::poll_cap_kat(); let hk = crate::drivers::xhci::pump_holder_kat(); let sk = stale_kat(); let reason = if !on { // PREEMPTOFFXHCILOAN (Z62) leg: the masked claimant on a running block-loan holder (`loan_wait=`)
             Some("masked")
         } else if ticks == 0 {
             Some("no-tick")
@@ -9560,18 +9681,18 @@ pub mod preemptoff {
             Some("sdhc-not-held")
         } else if sdhc_word == "err" {
             Some("sdhc-read")
-        } else if !(lw == "ok" || lw.starts_with("skip")) { Some("loan-wait") } else if !(pp == "ok" || pp.starts_with("skip")) { Some("ptp-path") } else if !(py == "ok" || py.starts_with("skip")) { Some("ptp-yield") } else if !(lk == "ok" || lk.starts_with("skip")) { Some("shed-kat") } else if !(ul == "ok" || ul.starts_with("skip")) { Some("unafs-leg") } else if !(pk == "ok" || pk.starts_with("skip")) { Some("poll-cap-kat") } else if !(hk == "ok" || hk.starts_with("skip")) { Some("pump-kat") } else {
+        } else if !(lw == "ok" || lw.starts_with("skip")) { Some("loan-wait") } else if !(pp == "ok" || pp.starts_with("skip")) { Some("ptp-path") } else if !(py == "ok" || py.starts_with("skip")) { Some("ptp-yield") } else if !(lk == "ok" || lk.starts_with("skip")) { Some("shed-kat") } else if !(ul == "ok" || ul.starts_with("skip")) { Some("unafs-leg") } else if !(pk == "ok" || pk.starts_with("skip")) { Some("poll-cap-kat") } else if !(hk == "ok" || hk.starts_with("skip")) { Some("pump-kat") } else if sk != "ok" { Some("stale-kat") } else {
             None
         };
         match reason {
             None => serial_println!(
-                ":: PREEMPTAUDIT: sites={} isr={} holder={} both={} converted={} converted_sdhc={} converted_unafs={} unafs_leg={} sdhc_irq_on={} hold_irq_on=ok tick_in_hold=ok switched=0 loan_wait={} loan_wait_us={} ptp_path={} ptp_yield={} ptp_yield_windows={} loan_shed={} loan_shed_kat={} loan_shed_us={} poll_cap={} poll_cap_kat={} pump_kat={} -> PASS ::",
-                AUDIT_SITES, AUDIT_ISR, AUDIT_HOLDER, AUDIT_BOTH, AUDIT_CONVERTED, converted_sdhc, AUDIT_CONVERTED_UNAFS, ul, sdhc_word, lw, lw_us, pp, py, { #[cfg(feature = "uvc")] let w = crate::drivers::xhci::ptp::loan_yield_kat_windows(); #[cfg(not(feature = "uvc"))] let w = 0u32; w }, ls, lk, crate::drivers::block::xhci_loan_shed_control_us(), crate::drivers::xhci::poll_cap_count(), pk, hk // XHCILOANPUMPHOLDERKAT (zenbook-ledger Z81): `pump_kat=` the pump-gate KAT; XHCILOANPOLLCAP (zenbook-ledger Z74): `poll_cap=` capped poll passes, a count; XHCILOANPOLLCAPKAT (zenbook-ledger Z77): `poll_cap_kat=` the capped-pass KAT; XHCILOANSHEDKATCONTROLUS (zenbook-ledger Z80): `loan_shed_us=` the control's masked wait µs; XHCILOANPTPYIELDKATRULE (zenbook-ledger Z88): `ptp_yield_windows=` the windows the KAT offered
+                ":: PREEMPTAUDIT: sites={} isr={} holder={} both={} converted={} converted_sdhc={} converted_unafs={} unafs_leg={} sdhc_irq_on={} hold_irq_on=ok tick_in_hold=ok switched=0 loan_wait={} loan_wait_us={} ptp_path={} ptp_yield={} ptp_yield_windows={} loan_shed={} loan_shed_kat={} loan_shed_us={} poll_cap={} poll_cap_kat={} pump_kat={} stale_drop={} stale_kat={} -> PASS ::",
+                AUDIT_SITES, AUDIT_ISR, AUDIT_HOLDER, AUDIT_BOTH, AUDIT_CONVERTED, converted_sdhc, AUDIT_CONVERTED_UNAFS, ul, sdhc_word, lw, lw_us, pp, py, { #[cfg(feature = "uvc")] let w = crate::drivers::xhci::ptp::loan_yield_kat_windows(); #[cfg(not(feature = "uvc"))] let w = 0u32; w }, ls, lk, crate::drivers::block::xhci_loan_shed_control_us(), crate::drivers::xhci::poll_cap_count(), pk, hk, stale_drops(), sk // PREEMPTOFFX86STALEDROP (rmbp-ledger B1069): `stale_drop=` / `stale_kat=`; XHCILOANPUMPHOLDERKAT (zenbook-ledger Z81): `pump_kat=` the pump-gate KAT; XHCILOANPOLLCAP (zenbook-ledger Z74): `poll_cap=` capped poll passes, a count; XHCILOANPOLLCAPKAT (zenbook-ledger Z77): `poll_cap_kat=` the capped-pass KAT; XHCILOANSHEDKATCONTROLUS (zenbook-ledger Z80): `loan_shed_us=` the control's masked wait µs; XHCILOANPTPYIELDKATRULE (zenbook-ledger Z88): `ptp_yield_windows=` the windows the KAT offered
             ),
             Some(r) => serial_println!(
-                ":: PREEMPTAUDIT: sites={} isr={} holder={} both={} converted={} converted_sdhc={} converted_unafs={} unafs_leg={} sdhc_irq_on={} hold_irq_on={} tick_in_hold={} switched={} loan_wait={} loan_wait_us={} ptp_path={} ptp_yield={} ptp_yield_windows={} loan_shed={} loan_shed_kat={} loan_shed_us={} poll_cap={} poll_cap_kat={} pump_kat={} -> FAIL reason={} ::",
+                ":: PREEMPTAUDIT: sites={} isr={} holder={} both={} converted={} converted_sdhc={} converted_unafs={} unafs_leg={} sdhc_irq_on={} hold_irq_on={} tick_in_hold={} switched={} loan_wait={} loan_wait_us={} ptp_path={} ptp_yield={} ptp_yield_windows={} loan_shed={} loan_shed_kat={} loan_shed_us={} poll_cap={} poll_cap_kat={} pump_kat={} stale_drop={} stale_kat={} -> FAIL reason={} ::",
                 AUDIT_SITES, AUDIT_ISR, AUDIT_HOLDER, AUDIT_BOTH, AUDIT_CONVERTED, converted_sdhc, AUDIT_CONVERTED_UNAFS, ul, sdhc_word,
-                if on { "ok" } else { "masked" }, if ticks > 0 { "ok" } else { "none" }, switched, lw, lw_us, pp, py, { #[cfg(feature = "uvc")] let w = crate::drivers::xhci::ptp::loan_yield_kat_windows(); #[cfg(not(feature = "uvc"))] let w = 0u32; w }, ls, lk, crate::drivers::block::xhci_loan_shed_control_us(), crate::drivers::xhci::poll_cap_count(), pk, hk, r // XHCILOANPUMPHOLDERKAT (zenbook-ledger Z81): `pump_kat=`; XHCILOANSHEDKATCONTROLUS (zenbook-ledger Z80): `loan_shed_us=`; XHCILOANPTPYIELDKATRULE (zenbook-ledger Z88): `ptp_yield_windows=` the windows the KAT offered
+                if on { "ok" } else { "masked" }, if ticks > 0 { "ok" } else { "none" }, switched, lw, lw_us, pp, py, { #[cfg(feature = "uvc")] let w = crate::drivers::xhci::ptp::loan_yield_kat_windows(); #[cfg(not(feature = "uvc"))] let w = 0u32; w }, ls, lk, crate::drivers::block::xhci_loan_shed_control_us(), crate::drivers::xhci::poll_cap_count(), pk, hk, stale_drops(), sk, r // PREEMPTOFFX86STALEDROP (rmbp-ledger B1069): `stale_drop=` / `stale_kat=`; XHCILOANPUMPHOLDERKAT (zenbook-ledger Z81): `pump_kat=`; XHCILOANSHEDKATCONTROLUS (zenbook-ledger Z80): `loan_shed_us=`; XHCILOANPTPYIELDKATRULE (zenbook-ledger Z88): `ptp_yield_windows=` the windows the KAT offered
             ),
         }
     }
@@ -9610,6 +9731,93 @@ pub mod preemptoff {
             "ok"
         };
         (word, switched)
+    }
+
+    // ══════════ PREEMPTOFFX86STALEDROP (rmbp-ledger B1069) — the stale-drop KAT (Z91's, on x86) ══════════
+
+    /// B1069 KAT state: the follower ran; the holder's verdict code (0 = the holder never stored one).
+    #[cfg(any(feature = "ahci", feature = "nvme"))]
+    static STALE_KAT_AFTER_RAN: AtomicBool = AtomicBool::new(false);
+    #[cfg(any(feature = "ahci", feature = "nvme"))]
+    static STALE_KAT_CODE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+    /// The stale KAT's follower: a task whose dispatch on the holder's CPU, while the holder is yielded inside its span,
+    /// resets the holder's count (`on_dispatch`: not the holder).
+    #[cfg(any(feature = "ahci", feature = "nvme"))]
+    fn stale_kat_after(_: usize) {
+        STALE_KAT_AFTER_RAN.store(true, Ordering::Release);
+    }
+
+    /// The stale KAT's holder, pinned to CPU `c`: its verdict code into `STALE_KAT_CODE`.
+    #[cfg(any(feature = "ahci", feature = "nvme"))]
+    fn stale_kat_holder(c: usize) {
+        let code = stale_kat_run(c);
+        STALE_KAT_CODE.store(code, Ordering::Release);
+    }
+
+    /// Take g1, yield through the real `yield_now` until the follower ran on this CPU (the reset), take g2 (a LATER
+    /// hold), put g1: it must be counted stale and leave g2's count held; put g2: free. Codes: 1 no-yield, 2 not-reset,
+    /// 3 not-counted, 4 stolen, 5 not-released, 6 ok.
+    #[cfg(any(feature = "ahci", feature = "nvme"))]
+    fn stale_kat_run(c: usize) -> u8 {
+        let g1 = hold();
+        let me = SCHED[c].current_tid.load(Ordering::Relaxed);
+        let follower = super::spawn_joinable("preemptoff-stale-after", stale_kat_after, 0, c, super::PRIO_NORMAL);
+        let m0 = crate::arch::ms();
+        while !STALE_KAT_AFTER_RAN.load(Ordering::Acquire) && crate::arch::ms().wrapping_sub(m0) < 1000 {
+            super::yield_now();
+        }
+        let code = if !STALE_KAT_AFTER_RAN.load(Ordering::Acquire) {
+            put(g1);
+            1
+        } else if LAST_RESET_TID[c].load(Ordering::Relaxed) != me {
+            put(g1);
+            2
+        } else {
+            let g2 = hold();
+            let s0 = STALE_DROPS.load(Ordering::Relaxed);
+            put(g1);
+            let counted = STALE_DROPS.load(Ordering::Relaxed) == s0.wrapping_add(1);
+            let held = OFF[c].load(Ordering::Relaxed) > 0;
+            put(g2);
+            let free = OFF[c].load(Ordering::Relaxed) == 0;
+            if !counted {
+                3
+            } else if !held {
+                4
+            } else if !free {
+                5
+            } else {
+                6
+            }
+        };
+        follower.join();
+        code
+    }
+
+    /// B1069 KAT (`stale_kat=`): the forced-yield holder above, pinned to this CPU and joined. `ok` gives back the KAT's
+    /// own stale drop, so `stale_drop=` counts real events only.
+    #[cfg(any(feature = "ahci", feature = "nvme"))]
+    fn stale_kat() -> &'static str {
+        let c = this_cpu();
+        if c >= MAX_CPUS {
+            return "not-run";
+        }
+        STALE_KAT_AFTER_RAN.store(false, Ordering::Release);
+        STALE_KAT_CODE.store(0, Ordering::Release);
+        super::spawn_joinable("preemptoff-stale", stale_kat_holder, c, c, super::PRIO_NORMAL).join();
+        match STALE_KAT_CODE.load(Ordering::Acquire) {
+            6 => {
+                STALE_DROPS.fetch_sub(1, Ordering::Relaxed);
+                "ok"
+            }
+            1 => "no-yield",
+            2 => "not-reset",
+            3 => "not-counted",
+            4 => "stolen",
+            5 => "not-released",
+            _ => "not-run",
+        }
     }
 }
 
