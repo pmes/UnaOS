@@ -416,6 +416,8 @@ pub fn build_taffy_tree<H: Host>(
     } else {
         kids.iter().map(|&(id, _)| id).collect()
     };
+    // AETHERCAPTIONSIDE (SR460): a table's caption with align=bottom is placed after the rows (caption-side: bottom).
+    let child_ids = caption_side_order::<H>(node_tag.as_deref(), child_ids, node_map);
 
     // A text run that is its box's ONLY child may shrink to the box's
     // width and wrap inside it (its min-content is its widest word).
@@ -562,7 +564,8 @@ pub fn build_taffy_tree<H: Host>(
             "table" if quirks => Some(0),
             _ => None,
         };
-        if let Some(a) = dom_node.attr("align") {
+        // AETHERCAPTIONSIDE (SR460): a caption's align= is caption-side (`caption_side_attr`), never text-align.
+        if let Some(a) = dom_node.attr("align").filter(|_| tag != "caption") {
             match a.trim().to_ascii_lowercase().as_str() {
                 "center" | "middle" => paint.text_align = Some(5),
                 "right" => paint.text_align = Some(6),
@@ -617,6 +620,40 @@ pub fn control_kind<N: DomNode>(node: &N) -> Option<Control> {
         }
         _ => None,
     }
+}
+
+// ---- AETHERCAPTIONSIDE (SR460): a caption's align= is caption-side, never text-align ---------------------------
+
+/// AETHERCAPTIONSIDE (SR460): the caption-side a `<caption>`'s align= presentation attribute maps to (Blink's
+/// HTMLTableCaptionElement::CollectStyleForPresentationAttribute: align -> caption-side, whose parser keeps only
+/// top | bottom, ASCII case-insensitive): Some(false) top, Some(true) bottom, None for any other value (left / right /
+/// center are dropped, and never become text-align). The `caption-side` property itself is owed
+/// (AETHER-CAPTION-SIDE-CSS).
+pub fn caption_side_attr<N: DomNode>(node: &N) -> Option<bool> {
+    match node.attr("align")?.trim().to_ascii_lowercase().as_str() {
+        "top" => Some(false),
+        "bottom" => Some(true),
+        _ => None,
+    }
+}
+
+/// AETHERCAPTIONSIDE (SR460): a table is a flex column whose caption sits where the DOM put it (first); a caption
+/// child whose `caption_side_attr` is bottom moves after the table's other children, the rest keep their order.
+/// Any other parent's children are returned unchanged.
+fn caption_side_order<H: Host>(
+    parent_tag: Option<&str>,
+    child_ids: Vec<taffy::NodeId>,
+    node_map: &NodeMap<H::Node>,
+) -> Vec<taffy::NodeId> {
+    if parent_tag != Some("table") {
+        return child_ids;
+    }
+    let bottom = |id: &taffy::NodeId| {
+        node_map.get(id).is_some_and(|n| n.tag().as_deref() == Some("caption") && caption_side_attr(n) == Some(true))
+    };
+    let (below, mut rest): (Vec<taffy::NodeId>, Vec<taffy::NodeId>) = child_ids.into_iter().partition(|id| bottom(id));
+    rest.extend(below);
+    rest
 }
 
 /// Chromium's control font: 13.333px (`font: -webkit-small-control`).
