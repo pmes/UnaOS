@@ -11360,7 +11360,7 @@ pub mod preemptoff {
         }
         let ((fat_on, fat_held), (dir_on, dir_held)) = crate::fs::fat::preemptoff_span_probe();
         let ((m_fat_on, _), (m_dir_on, _)) = crate::arch::without_interrupts(crate::fs::fat::preemptoff_span_probe);
-        let masked_kept = !m_fat_on && !m_dir_on; let ul = crate::fs::unafs::unafs_leg(); let lk = leak_kat(); let sk = stale_kat(); // PREEMPTOFFARMSTALEDROP (zenbook-ledger Z91): the stale-drop KAT after the leak KAT. PREEMPTOFFARMQUANTUM (zenbook-ledger Z89): the leak-reset KAT runs before `released` too. PREEMPTOFFARMUNAFS (zenbook-ledger Z79): the UnaFS read-arm leg, before `released` so it also proves the leg gave the count back (LINE-NEUTRAL)
+        let masked_kept = !m_fat_on && !m_dir_on; let ul = crate::fs::unafs::unafs_leg(); let lk = leak_kat(); let sk = stale_kat(); let wl = crate::video::wm::wmtable_leg(); // PREEMPTOFFARMWMTABLE (zenbook-ledger Z92): the TABLE leg (`wmtable_leg=`), before `released`. PREEMPTOFFARMSTALEDROP (zenbook-ledger Z91): the stale-drop KAT after the leak KAT. PREEMPTOFFARMQUANTUM (zenbook-ledger Z89): the leak-reset KAT runs before `released` too. PREEMPTOFFARMUNAFS (zenbook-ledger Z79): the UnaFS read-arm leg, before `released` so it also proves the leg gave the count back (LINE-NEUTRAL)
         let released = !witness().0;
         let reason = if !fat_on {
             Some("fat-masked")
@@ -11371,25 +11371,25 @@ pub mod preemptoff {
         } else if !masked_kept {
             Some("unmasked")
         } else if !released {
-            Some("leaked") } else if !(ul == "ok" || ul.starts_with("skip")) { Some("unafs-leg") } else if lk != "ok" { Some("leak-kat") } else if sk != "ok" { Some("stale-kat")
+            Some("leaked") } else if !(ul == "ok" || ul.starts_with("skip")) { Some("unafs-leg") } else if lk != "ok" { Some("leak-kat") } else if sk != "ok" { Some("stale-kat") } else if !(wl == "ok" || wl.starts_with("skip")) { Some("wmtable-leg")
         } else {
             None
         };
         let ok = |b: bool, y: &'static str, n: &'static str| if b { y } else { n };
         match reason {
             None => serial_println!(
-                ":: PREEMPTAUDIT: arch=aarch64 sites={} isr={} holder={} both={} converted={} converted_fat={} fat_irq_on=ok dir_irq_on=ok fat_held=ok dir_held=ok masked_kept=ok released=ok unafs_leg={} leak_reset={} leak_kat={} stale_drop={} stale_kat={} -> PASS ::",
-                AUDIT_SITES, AUDIT_ISR, AUDIT_HOLDER, AUDIT_BOTH, AUDIT_CONVERTED, CONVERTED_FAT, ul, leak_resets(), lk, stale_drops(), sk
+                ":: PREEMPTAUDIT: arch=aarch64 sites={} isr={} holder={} both={} converted={} converted_fat={} fat_irq_on=ok dir_irq_on=ok fat_held=ok dir_held=ok masked_kept=ok released=ok unafs_leg={} leak_reset={} leak_kat={} stale_drop={} stale_kat={} wmtable_leg={} -> PASS ::",
+                AUDIT_SITES, AUDIT_ISR, AUDIT_HOLDER, AUDIT_BOTH, AUDIT_CONVERTED, CONVERTED_FAT, ul, leak_resets(), lk, stale_drops(), sk, wl
             ),
             Some(r) => serial_println!(
-                ":: PREEMPTAUDIT: arch=aarch64 sites={} isr={} holder={} both={} converted={} converted_fat={} fat_irq_on={} dir_irq_on={} fat_held={} dir_held={} masked_kept={} released={} unafs_leg={} leak_reset={} leak_kat={} stale_drop={} stale_kat={} -> FAIL reason={} ::",
+                ":: PREEMPTAUDIT: arch=aarch64 sites={} isr={} holder={} both={} converted={} converted_fat={} fat_irq_on={} dir_irq_on={} fat_held={} dir_held={} masked_kept={} released={} unafs_leg={} leak_reset={} leak_kat={} stale_drop={} stale_kat={} wmtable_leg={} -> FAIL reason={} ::",
                 AUDIT_SITES, AUDIT_ISR, AUDIT_HOLDER, AUDIT_BOTH, AUDIT_CONVERTED, CONVERTED_FAT,
                 ok(fat_on, "ok", "masked"),
                 ok(dir_on, "ok", "masked"),
                 ok(fat_held, "ok", "free"),
                 ok(dir_held, "ok", "free"),
                 ok(masked_kept, "ok", "unmasked"),
-                ok(released, "ok", "leaked"), ul, leak_resets(), lk, stale_drops(), sk,
+                ok(released, "ok", "leaked"), ul, leak_resets(), lk, stale_drops(), sk, wl,
                 r
             ),
         }
@@ -11600,5 +11600,5 @@ pub mod preemptoff {
     pub const AUDIT_ISR: u32 = 28;
     pub const AUDIT_HOLDER: u32 = 116;
     pub const AUDIT_BOTH: u32 = 23;
-    pub const AUDIT_CONVERTED: u32 = CONVERTED_FAT + crate::fs::unafs::CONVERTED_UNAFS_ARM + CONVERTED_USBNET + CONVERTED_CURSORMOVE + CONVERTED_CASTS; #[cfg(feature = "usbnet")] use crate::drivers::xhci::usbnet::CONVERTED_USBNET; #[cfg(not(feature = "usbnet"))] const CONVERTED_USBNET: u32 = 0; const CONVERTED_CURSORMOVE: u32 = cfg!(feature = "baremetal") as u32; const CONVERTED_CASTS: u32 = cfg!(feature = "desktop_firmware") as u32; // PREEMPTOFFARMUNAFS (zenbook-ledger Z79): the Pi read arm (1 on baremetal, 0 elsewhere); PREEMPTOFFARMUSBNETDRIVE (zenbook-ledger Z83): usbnet's `drive` span (1 where `usbnet` is compiled, 0 elsewhere); PREEMPTOFFARMCURSORMOVE (zenbook-ledger Z85): the input router's cursor span (`main.rs` `cursormove_span`, 1 on baremetal, 0 elsewhere); PREEMPTOFFARMCASTS (zenbook-ledger Z93): the shadow pass's CASTS publish span (`video/desktop.rs` `casts_span`, 1 on `desktop_firmware`, 0 elsewhere). LINE-NEUTRAL
+    pub const AUDIT_CONVERTED: u32 = CONVERTED_FAT + crate::fs::unafs::CONVERTED_UNAFS_ARM + CONVERTED_USBNET + CONVERTED_CURSORMOVE + crate::video::wm::CONVERTED_WMTABLE + CONVERTED_CASTS; #[cfg(feature = "usbnet")] use crate::drivers::xhci::usbnet::CONVERTED_USBNET; #[cfg(not(feature = "usbnet"))] const CONVERTED_USBNET: u32 = 0; const CONVERTED_CURSORMOVE: u32 = cfg!(feature = "baremetal") as u32; const CONVERTED_CASTS: u32 = cfg!(feature = "desktop_firmware") as u32; // PREEMPTOFFARMUNAFS (zenbook-ledger Z79): the Pi read arm (1 on baremetal, 0 elsewhere); PREEMPTOFFARMUSBNETDRIVE (zenbook-ledger Z83): usbnet's `drive` span (1 where `usbnet` is compiled, 0 elsewhere); PREEMPTOFFARMCURSORMOVE (zenbook-ledger Z85): the input router's cursor span (`main.rs` `cursormove_span`, 1 on baremetal, 0 elsewhere); PREEMPTOFFARMWMTABLE (zenbook-ledger Z92): the window TABLE take (`video/wm.rs` `table_span`, 1 off `desktop_firmware`, 0 on the desktops); PREEMPTOFFARMCASTS (zenbook-ledger Z93): the shadow pass's CASTS publish span (`video/desktop.rs` `casts_span`, 1 on `desktop_firmware`, 0 elsewhere). LINE-NEUTRAL
 }
