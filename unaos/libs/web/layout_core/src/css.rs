@@ -532,7 +532,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
             }
         }
         "gap" | "grid-gap" => {
-            let parts: Vec<&str> = value.split_whitespace().collect();
+            let parts: Vec<&str> = split_top_level(value);
             let row = parts.first().and_then(|v| parse_length_percentage_str(v, cx));
             let col = parts.get(1).and_then(|v| parse_length_percentage_str(v, cx)).or(row);
             match (row, col) {
@@ -721,7 +721,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
         "scroll-padding" | "scroll-padding-top" | "scroll-padding-right" | "scroll-padding-bottom" | "scroll-padding-left" => {
             let px = |v: &str| if v == "auto" { Some(0.0) } else { parse_px(v, cx).filter(|_| !v.ends_with('%')) };
             let mut sp = style.paint.scroll_padding.unwrap_or([0.0; 4]);
-            let parts: Vec<Option<f32>> = value.split_whitespace().map(px).collect();
+            let parts: Vec<Option<f32>> = split_top_level(value).into_iter().map(px).collect();
             let ok = if prop == "scroll-padding" {
                 match parts.as_slice() {
                     [Some(a)] => { sp = [*a; 4]; true }
@@ -748,7 +748,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
         "scroll-margin" | "scroll-margin-top" | "scroll-margin-right" | "scroll-margin-bottom" | "scroll-margin-left" => {
             let px = |v: &str| parse_px(v, cx).filter(|_| !v.ends_with('%'));
             let mut sm = style.paint.scroll_margin.unwrap_or([0.0; 4]);
-            let parts: Vec<Option<f32>> = value.split_whitespace().map(px).collect();
+            let parts: Vec<Option<f32>> = split_top_level(value).into_iter().map(px).collect();
             let ok = if prop == "scroll-margin" {
                 match parts.as_slice() {
                     [Some(a)] => { sm = [*a; 4]; true }
@@ -782,7 +782,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
             apply_declaration(&format!("scroll-margin-{side}"), value, style, cx);
         }
         "scroll-margin-block" | "scroll-margin-inline" => {
-            let parts: Vec<&str> = value.split_whitespace().collect();
+            let parts: Vec<&str> = split_top_level(value);
             let (a, b) = match parts.as_slice() {
                 [a] => (*a, *a),
                 [a, b] => (*a, *b),
@@ -1017,7 +1017,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
         "columns" => {
             // `<'column-width'> || <'column-count'>`: an omitted half resets to auto.
             let (mut count, mut width, mut ok) = (None, None, true);
-            for part in value.split_whitespace() {
+            for part in split_top_level(value) {
                 if part == "auto" {
                     continue;
                 }
@@ -1300,7 +1300,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
                 }
             }
             let mut got_color = false;
-            for part in value.split_whitespace() {
+            for part in split_top_level(value) {
                 if part.starts_with("url(") { continue; }
                 // Non-colour shorthand components (position, repeat,
                 // attachment, origin/clip box, the `/` size separator) are
@@ -1714,9 +1714,11 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
         // At minimum, stops the property from appearing in unsupported ledgers.
         // css-backgrounds-3 §5.1: 1-4 corner radii (the elliptical `/`
         // part takes its horizontal radii), or one corner's longhand.
+        // AETHERRADIUSCALC (SR416): a radius may be a math function (css-values-4 §10): the components and the `/` are
+        // split at paren depth 0, so `calc(10px + 10px)` or `calc(20px / 2)` is one radius, not a dropped declaration.
         "border-radius" => {
-            let horiz = value.split('/').next().unwrap_or(value);
-            let parts: Option<Vec<f32>> = horiz.split_whitespace().map(|v| parse_radius(v, cx)).collect();
+            let horiz = split_top_level_slash(value).0;
+            let parts: Option<Vec<f32>> = split_top_level(horiz).into_iter().map(|v| parse_radius(v, cx)).collect();
             if let Some(p) = parts {
                 let r = match p.as_slice() {
                     [a] => [*a; 4],
@@ -1730,7 +1732,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
         }
         "border-top-left-radius" | "border-top-right-radius"
         | "border-bottom-right-radius" | "border-bottom-left-radius" => {
-            if let Some(v) = value.split_whitespace().next().and_then(|v| parse_radius(v, cx)) {
+            if let Some(v) = split_top_level(value).first().and_then(|v| parse_radius(v, cx)) {
                 let i = match prop {
                     "border-top-left-radius" => 0,
                     "border-top-right-radius" => 1,
@@ -3271,6 +3273,22 @@ pub fn split_top_level(value: &str) -> Vec<&str> {
     out
 }
 
+/// AETHERRADIUSCALC (SR416): splits a value at its first `/` outside parentheses (css-backgrounds-3 §5.1
+/// `border-radius: <radii> / <radii>`): `calc(20px / 2) 4px / 2px` is (`calc(20px / 2) 4px `, Some(` 2px`)), never
+/// a cut inside the function. The paren-depth walk is `split_top_level`'s; None when the value has no top-level `/`.
+pub fn split_top_level_slash(value: &str) -> (&str, Option<&str>) {
+    let mut depth = 0i32;
+    for (i, c) in value.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            '/' if depth == 0 => return (&value[..i], Some(&value[i + 1..])),
+            _ => {}
+        }
+    }
+    (value, None)
+}
+
 /// [top, right, bottom, left] index of a `*-top`/`*-right`/... longhand.
 fn side_index(prop: &str) -> usize {
     if prop.ends_with("-top") { 0 } else if prop.ends_with("-right") { 1 } else if prop.ends_with("-bottom") { 2 } else { 3 }
@@ -3311,7 +3329,7 @@ pub fn parse_flex_shorthand(value: &str, cx: &ParseCx) -> Option<(f32, f32, Dime
     }
     let mut nums: Vec<f32> = Vec::new();
     let mut basis: Option<Dimension> = None;
-    for part in value.split_whitespace() {
+    for part in split_top_level(value) {
         if basis.is_none() && nums.len() < 2 {
             if let Ok(n) = part.parse::<f32>() {
                 nums.push(n);
