@@ -32,6 +32,7 @@ define_class!(
             let text: Retained<NSString> = unsafe { msg_send![sender, stringValue] };
             if let Some(cb) = self.ivars().action.borrow().as_ref() {
                 cb(text.to_string());
+                if unsafe { secure(self) } { let empty = NSString::from_str(""); let _: () = unsafe { msg_send![self, setStringValue: &*empty] }; } // SECRETFIELD-CLEAR (SR449): a secret field clears after its Enter is taken
             }
         }
     }
@@ -143,5 +144,21 @@ unsafe fn secure_cell(field: &UnaTextField) {
         let _: () = msg_send![&cell, setBezeled: objc2::runtime::Bool::YES];
         let _: () = msg_send![&cell, setScrollable: objc2::runtime::Bool::YES];
         let _: () = msg_send![field, setCell: &*cell];
+    }
+}
+
+// SECRETFIELD-CLEAR (LEDGER SR449): a secret field (the cell `secure_cell` installed for `TextField { secret: true }`)
+// clears its text after `on_action` fires its Enter, so a second Enter never resends a consumed secret; the find bar's
+// plain cell and every non-secret field keep their text.
+
+/// Whether `field`'s cell is AppKit's `NSSecureTextFieldCell` (installed by [`secure_cell`] iff the node is secret).
+unsafe fn secure(field: &UnaTextField) -> bool {
+    unsafe {
+        let cell: *mut AnyObject = msg_send![field, cell];
+        if cell.is_null() {
+            return false;
+        }
+        let is: objc2::runtime::Bool = msg_send![cell, isKindOfClass: objc2::class!(NSSecureTextFieldCell)];
+        is.as_bool()
     }
 }

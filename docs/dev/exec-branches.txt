@@ -1174,7 +1174,7 @@ refs/heads/exec-rmbp-contributereview   a3f4ae5ce IN-FLIGHT cut 2026-10-28
 refs/heads/exec-rmbp-aethercentercaption   a3f4ae5ce IN-FLIGHT cut 2026-10-28
 refs/heads/exec-rmbp-aethercellblockify   a3f4ae5ce IN-FLIGHT cut 2026-10-28
 refs/heads/exec-rmbp-aethercontrolintrinsic   a3f4ae5ce IN-FLIGHT cut 2026-10-28
-refs/heads/exec-rmbp-secretfieldclear   a3f4ae5ce IN-FLIGHT cut 2026-10-28
+refs/heads/exec-rmbp-secretfieldclear   bf1ed2fc9 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-preemptoffx86staledrop   5db503c4f FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-closeflightoldest   28e23fbe0 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-preemptoffarmsleepcheck   6b83e3d65 FOLDED-BY-HAND (this commit) 2026-10-27

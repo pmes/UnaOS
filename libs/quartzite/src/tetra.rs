@@ -1255,4 +1255,20 @@ mod face_door_tests {
         assert!(matches!(&p[..], [FacePatch::Field { path, .. }] if *path == at.to_vec()), "{p:?}");
         assert_eq!(drops(&p), 0, "a placeholder change keeps the field and its subscriber");
     }
+
+    /// SECRETFIELD-CLEAR (SR449): the evaluators clear a field after its Enter on the node's `secret` flag alone. A flip
+    /// reaches the rebuilt widget as ONE Field patch carrying it; a secret field's placeholder change stays secret; and
+    /// the node carries no value (the destructure names every field, no `..`), so no push can re-fill a cleared field.
+    #[test]
+    fn secretfield_clear_keys_on_node_flag() {
+        let key = |placeholder: &str, secret: bool| TetraNode::TextField { id: "provider.key".into(), placeholder: placeholder.into(), action: TextAction::ConsoleInput, secret };
+        let tree = |f: TetraNode| TetraNode::VStack(vec![console("idle"), f, button("provider.send", "Send")]);
+        for (old, new) in [(key("API key", false), key("API key", true)), (key("API key", true), key("API key (held)", true))] {
+            let p = face_diff(&tree(old), &tree(new));
+            let [FacePatch::Field { path, node }] = &p[..] else { panic!("{p:?}") };
+            assert_eq!(*path, vec![1]);
+            let TetraNode::TextField { id: _, placeholder: _, action: _, secret } = node else { panic!("{node:?}") };
+            assert!(*secret, "the flag the evaluators key on reaches the patched widget");
+        }
+    }
 }
