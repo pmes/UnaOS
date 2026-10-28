@@ -33091,44 +33091,42 @@ fn close_flight_release_dead(_task_id: u64) {}
 // as the caller had it): WEDGE-7's invariant — no TABLE holder is ever switched out — holds because both aarch64
 // involuntary switch paths decline on the count and no TABLE critical section yields (the 108 takes measured at 9e5a5521f;
 // every DrainBarrier is outside TABLE, B1055's order), and a masked contender still spins masked on a RUNNING holder only.
-// No ISR on those builds reaches TABLE. The desktops KEEP the mask: there the timer ISR's witness print routes into the
-// console window (`fbcon::route_present_banded` -> `present_rows_outcome_owned` -> `table()`), which would spin on a holder
-// it interrupted on its own core. Owed: PREEMPTOFF-ARM-WMTABLE-ROUTE (fbcon must not present from IRQ context).
+// No ISR reaches TABLE. PREEMPTOFFARMWMTABLEROUTE (zenbook-ledger Z97): the desktops (`desktop_firmware`) convert too — the
+// timer ISR's witness print routed into the console window (`fbcon::route_present_banded` -> `present_rows_outcome_owned`
+// -> `table()`) and would have spun on a holder it interrupted on its own core; fbcon now HOLDS its rows in IRQ context
+// (`fbcon::irq_present_hold`, the core's IRQ mark from `exceptions::in_irq`), so the `not(desktop_firmware)` term is gone.
 
-/// PREEMPTOFFARMWMTABLE (Z92): `TableGuard`'s bracket — the preempt-off hold (dropped after the lock).
-#[cfg(all(target_arch = "aarch64", not(feature = "desktop_firmware")))]
+/// PREEMPTOFFARMWMTABLE (Z92): `TableGuard`'s bracket — the preempt-off hold (dropped after the lock); every aarch64 build (Z97).
+#[cfg(target_arch = "aarch64")]
 type TableSpan = crate::arch::sched::PreemptHold;
-/// PREEMPTOFFARMWMTABLE (Z92): `TableGuard`'s bracket — the IRQ mask (x86, the aarch64 desktops), as before.
-#[cfg(not(all(target_arch = "aarch64", not(feature = "desktop_firmware"))))]
+/// PREEMPTOFFARMWMTABLE (Z92): `TableGuard`'s bracket — the IRQ mask (x86), as before.
+#[cfg(not(target_arch = "aarch64"))]
 type TableSpan = crate::arch::IrqMask;
 
 /// PREEMPTOFFARMWMTABLE (Z92): take the bracket BEFORE the lock (the spin itself must not be switched out). Masked around
 /// the core read and the increment, as `preemptoff::scoped` takes it; the outermost take records this line as the holder
 /// site (Z89) and the guard keeps its epoch (Z91).
-#[cfg(all(target_arch = "aarch64", not(feature = "desktop_firmware")))]
+#[cfg(target_arch = "aarch64")]
 #[inline(always)]
 fn table_span() -> TableSpan {
     crate::arch::without_interrupts(|| crate::arch::sched::preempt_hold())
 }
 /// PREEMPTOFFARMWMTABLE (Z92): the mask, exactly the expression `table()` took before.
-#[cfg(not(all(target_arch = "aarch64", not(feature = "desktop_firmware"))))]
+#[cfg(not(target_arch = "aarch64"))]
 #[inline(always)]
 fn table_span() -> TableSpan {
     crate::arch::IrqMask::new()
 }
 
-/// PREEMPTOFFARMWMTABLE (Z92): the aarch64 audit's `converted=` term (1 where `table()` is preempt-off, 0 on the desktops).
+/// PREEMPTOFFARMWMTABLE (Z92): the aarch64 audit's `converted=` term — 1 on every aarch64 build since Z97 (the desktops too).
 #[cfg(target_arch = "aarch64")]
-pub const CONVERTED_WMTABLE: u32 = cfg!(not(feature = "desktop_firmware")) as u32;
+pub const CONVERTED_WMTABLE: u32 = 1;
 
 /// PREEMPTOFFARMWMTABLE (Z92) leg (`wmtable_leg=`, aarch64 `tests preemptaudit`): through the real `table()`, from this
 /// unmasked task: I stays on and the count is held inside; from a masked caller the take leaves it masked; the count is
-/// free after. `skip(route)` on the desktops (the mask is kept), `skip(masked)` from a masked caller.
+/// free after. `skip(masked)` from a masked caller (Z97: no `skip(route)` — the desktops run the real take too).
 #[cfg(target_arch = "aarch64")]
 pub fn wmtable_leg() -> &'static str {
-    if cfg!(feature = "desktop_firmware") {
-        return "skip(route)";
-    }
     if crate::arch::irqs_masked() {
         return "skip(masked)";
     }
