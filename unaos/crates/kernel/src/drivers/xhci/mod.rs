@@ -11638,7 +11638,7 @@ impl XhciController {
             // wall-clock deadline below still bounds. KEPT, and not replaced by the spin above: the
             // spin cannot be the only wait, or TCG would never make progress — past its window this
             // path is byte-identical to what it was.
-            crate::hlt(); self.loan_shed_hook(false); // XHCILOANFAILHOLD (Z66): a block loan held >= LOAN_MASKED_WAIT_MS sheds at this wake (`loan_shed_hook`, the file tail). LINE-NEUTRAL fold, code first
+            crate::hlt(); self.loan_shed_hook(false); pump_holder_stamp(); // XHCILOANFAILHOLD (Z66): a block loan held >= LOAN_MASKED_WAIT_MS sheds at this wake (`loan_shed_hook`, the file tail). LINE-NEUTRAL fold, code first
             let elapsed = crate::arch::now_cycles().wrapping_sub(start);
             if elapsed >= budget {
                 // BOTCLAIM: the expiry-instant peek — taken FIRST, before a single byte of the
@@ -17803,7 +17803,7 @@ pub fn claim_noted() -> Result<XhciLoan, XhciClaimError> {
     if matches!(r, Err(XhciClaimError::Busy)) {
         crate::video::lag::xhci_busy();
     }
-    r
+    pump_yield_gate(r) // XHCILOANPUMPHOLDER (zenbook-ledger Z76): a claim taken inside a PTP yield window goes straight back (`Busy`, counted as `yield_skips`, not stamped claim-busy). LINE-NEUTRAL
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -19525,5 +19525,63 @@ fn poll_loan(round: usize) -> Option<crate::drivers::block::BlockLoan> {
             }
             None
         }
+    }
+}
+
+// ══════════ XHCILOANPUMPHOLDER (zenbook-ledger Z76) — the usb-pump skips its claim inside a PTP yield window, and stamps from a BOT stage wait it holds ══════════
+//
+// TAIL-APPENDED (two LINE-NEUTRAL folds: `claim_noted`'s return and the stage wait's `hlt` in `pump_until_bot_done`).
+// `claim_noted` (the usb-pump's claim, and pal's demo poll) is an unpublished O(1) take, so one taken inside a PTP yield
+// window (`ptp::TXN_YIELDED`, Z73) did not end the window and held a whole pump pass; the PTP re-take then ran out its
+// attempts and the camera transfer was lost. The claim now goes back at once when a window is open — `with_controller`'s
+// claim-first-then-refuse rule: a window opens only while the PTP holder has the loan, so a claim that succeeded with the
+// flag clear has no window under it. And the pump's heartbeat (SESSIONWEDGE's `LAST_MS`) is refreshed from every BOT stage
+// wake while the pump is the holder, so a bounded failing ladder (3x `hw_wait_budget`) is not a PUMPWEDGE and the edge's
+// re-home does not restart the pump mid-transfer. Owed: XHCILOAN-PUMPHOLDER-KAT, XHCILOAN-PTPYIELD-POLLTAKE,
+// XHCILOAN-STAMPLIVE-OTHERS.
+
+/// XHCILOANPUMPHOLDER: `claim_noted`'s result, refused by name inside a PTP yield window (the loan drops straight back,
+/// `XhciLoan`'s Drop). No wait: the caller's pass skips and the next pass claims again.
+#[inline]
+fn pump_yield_gate(r: Result<XhciLoan, XhciClaimError>) -> Result<XhciLoan, XhciClaimError> {
+    #[cfg(feature = "uvc")]
+    {
+        if r.is_ok() && ptp::TXN_YIELDED.load(Ordering::Acquire) {
+            drop(r);
+            pump_yield_skip_note();
+            return Err(XhciClaimError::Busy);
+        }
+    }
+    r
+}
+
+/// XHCILOANPUMPHOLDER: `claim_noted` claims refused inside a PTP yield window this boot (`yield_skips=`).
+#[cfg(feature = "uvc")]
+static PUMP_YIELD_SKIPS: AtomicU32 = AtomicU32::new(0);
+
+/// XHCILOANPUMPHOLDER: count one refused claim (its loan already put back); the first is said once.
+#[cfg(feature = "uvc")]
+fn pump_yield_skip_note() {
+    if PUMP_YIELD_SKIPS.fetch_add(1, Ordering::Relaxed) == 0 {
+        serial_println!(
+            "[xhci] pump skip why=ptp-yield who={} (XHCILOANPUMPHOLDER Z76, first skip, once)",
+            crate::arch::sched::current_name().unwrap_or("-")
+        );
+    }
+}
+
+/// XHCILOANPUMPHOLDER: `yield_skips=` on the `[xhci] loan yield` line (ptp.rs).
+#[cfg(feature = "uvc")]
+pub(crate) fn pump_yield_skips() -> u32 {
+    PUMP_YIELD_SKIPS.load(Ordering::Relaxed)
+}
+
+/// XHCILOANPUMPHOLDER: a BOT stage wake refreshes the usb-pump's liveness stamp when the pump is the task waiting
+/// (`sessionwedge::stamp_live`: `LAST_MS` only, behind its `PUMP_TID` identity). Nothing elsewhere (no watch).
+#[inline]
+fn pump_holder_stamp() {
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+    {
+        crate::sessionwedge::stamp_live();
     }
 }
