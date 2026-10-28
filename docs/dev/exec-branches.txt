@@ -1156,3 +1156,5 @@ refs/heads/exec-rmbp-preemptoffarmquantum   736f42b84 IN-FLIGHT cut 2026-10-28
 refs/heads/exec-rmbp-closeflightrescue   736f42b84 IN-FLIGHT cut 2026-10-28
 refs/heads/exec-rmbp-aethercaptioncore   736f42b84 IN-FLIGHT cut 2026-10-28
 refs/heads/exec-rmbp-installerproviderholocron   736f42b84 IN-FLIGHT cut 2026-10-28
+refs/heads/exec-rmbp-masksiteszeroms   d41baf8ce IN-FLIGHT cut 2026-10-28
+refs/heads/exec-rmbp-xhciloanptpyieldptpwait   d41baf8ce IN-FLIGHT cut 2026-10-28
