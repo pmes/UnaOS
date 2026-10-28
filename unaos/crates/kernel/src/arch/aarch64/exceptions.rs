@@ -816,18 +816,18 @@ extern "C" fn aarch64_el0_fault_handler() -> ! {
 // No in-IRQ flag existed on aarch64, and PSTATE.I alone is not one: the Orin boot core runs the desktop cascade in MASKED
 // process context. So `aarch64_irq_handler` marks its own core around `gic::handle_irq` (inside the vector, which runs
 // masked end to end), and `in_irq` reads the mark AND the mask: a task resumed from a cooperative switch made inside the
-// handler (timer_preempt / ipi_preempt) runs unmasked, so a mark the switch left set cannot fire for it. The residual —
-// masked process code on that core until its next IRQ exit, one tick — only HOLDS fbcon's rows (owed, never lost; owed
-// PREEMPTOFF-ARM-IRQMARK-STALE). Read by `fbcon::irq_present_hold`: the routed console never presents from IRQ context.
+// handler (timer_preempt / ipi_preempt) runs unmasked. The residual is GONE (PREEMPTOFFARMIRQMARKSTALE, zenbook-ledger Z101):
+// `sched::dispatch_next` clears the mark at its switch-back, the one line every switch-out returns to, so neither the
+// scheduler stack nor the next task runs marked. Read by `fbcon::irq_present_hold`: the routed console never presents from IRQ context.
 
-/// PREEMPTOFFARMWMTABLEROUTE (Z97): per-core mark, written only by its own core inside the masked IRQ vector.
+/// PREEMPTOFFARMWMTABLEROUTE (Z97): per-core mark, written only by its own core with IRQ masked (the vector; dispatch_next's switch-back, Z101).
 #[cfg(feature = "desktop_firmware")]
 static IRQ_MARK: [AtomicBool; super::percpu::NUM_CPUS] = [const { AtomicBool::new(false) }; super::percpu::NUM_CPUS];
 
-/// PREEMPTOFFARMWMTABLEROUTE (Z97): set / clear this core's mark (called only from `aarch64_irq_handler`).
+/// PREEMPTOFFARMWMTABLEROUTE (Z97): set / clear this core's mark (from `aarch64_irq_handler`, and the clear from `sched::dispatch_next`'s switch-back, Z101).
 #[cfg(feature = "desktop_firmware")]
 #[inline(always)]
-fn irq_mark(on: bool) {
+pub(super) fn irq_mark(on: bool) {
     if let Some(m) = IRQ_MARK.get(super::percpu::this_cpu().cpu_index as usize) {
         m.store(on, Ordering::Relaxed);
     }
@@ -835,7 +835,7 @@ fn irq_mark(on: bool) {
 /// PREEMPTOFFARMWMTABLEROUTE (Z97): no reader off `desktop_firmware` — nothing is marked.
 #[cfg(not(feature = "desktop_firmware"))]
 #[inline(always)]
-fn irq_mark(_on: bool) {}
+pub(super) fn irq_mark(_on: bool) {}
 
 /// PREEMPTOFFARMWMTABLEROUTE (Z97): is this core in IRQ context? The mark AND PSTATE.I (the vector is masked end to end).
 #[cfg(feature = "desktop_firmware")]
