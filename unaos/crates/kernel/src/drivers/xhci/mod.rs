@@ -19537,7 +19537,7 @@ fn poll_loan(round: usize) -> Option<crate::drivers::block::BlockLoan> {
 // claim-first-then-refuse rule: a window opens only while the PTP holder has the loan, so a claim that succeeded with the
 // flag clear has no window under it. And the pump's heartbeat (SESSIONWEDGE's `LAST_MS`) is refreshed from every BOT stage
 // wake while the pump is the holder, so a bounded failing ladder (3x `hw_wait_budget`) is not a PUMPWEDGE and the edge's
-// re-home does not restart the pump mid-transfer. Owed: XHCILOAN-PUMPHOLDER-KAT, XHCILOAN-PTPYIELD-POLLTAKE,
+// re-home does not restart the pump mid-transfer. Owed: XHCILOAN-PUMPHOLDER-KAT (BUILT by XHCILOANPUMPHOLDERKAT, zenbook-ledger Z81: `pump_holder_kat` below), XHCILOAN-PTPYIELD-POLLTAKE,
 // XHCILOAN-STAMPLIVE-OTHERS.
 
 /// XHCILOANPUMPHOLDER: `claim_noted`'s result, refused by name inside a PTP yield window (the loan drops straight back,
@@ -19584,6 +19584,104 @@ fn pump_holder_stamp() {
     {
         crate::sessionwedge::stamp_live();
     }
+}
+
+/// XHCILOANPUMPHOLDERKAT (zenbook-ledger Z81): `tests preemptaudit`'s pump-gate leg (`pump_kat=`). It opens a PTP yield window
+/// by a direct CAS on `ptp::TXN_YIELDED` (the gate reads only the flag; `loan_yield` needs a live PTP hold), makes the pump's
+/// own claim (`claim_noted`, so Z76's fold is what runs) inside it — Busy with `PUMP_YIELD_SKIPS` moved by >= 1 (a usb-pump
+/// claim gated in the same window moves it too) — closes it, and the next claim must not be refused by the gate. `ok`,
+/// `skip(no-xhci|yielded-already|busy)`, or the failed check: `got` (the claim got the loan inside the window), `nocount`
+/// (Busy, the count unmoved, the controller free), `stuck` (still refused after the window closed). The pre-bump keeps the
+/// boot's once-line armed; every skip since `c0` is the KAT's and is given back. A CAS failure is a real window: never closed here.
+#[cfg(all(target_arch = "x86_64", feature = "uvc"))]
+pub fn pump_holder_kat() -> &'static str {
+    use crate::drivers::block::wait;
+    use core::cell::Cell;
+
+    /// The window is closed: the pump's claim must not be refused by the gate (a Busy with the count unmoved is a real
+    /// holder, retried for 10 ms).
+    fn closed() -> &'static str {
+        let word: Cell<&'static str> = Cell::new("skip(busy)");
+        let _ = wait::bounded(10, || {
+            let s = PUMP_YIELD_SKIPS.load(Ordering::Relaxed);
+            match claim_noted() {
+                Ok(l) => {
+                    drop(l);
+                    word.set("ok");
+                    true
+                }
+                Err(XhciClaimError::NotReady) => {
+                    word.set("ok");
+                    true
+                }
+                Err(XhciClaimError::Busy) => {
+                    if PUMP_YIELD_SKIPS.load(Ordering::Relaxed) != s {
+                        word.set("stuck");
+                        true
+                    } else {
+                        false
+                    }
+                }
+            }
+        });
+        word.get()
+    }
+
+    let c0 = PUMP_YIELD_SKIPS.load(Ordering::Relaxed);
+    PUMP_YIELD_SKIPS.fetch_add(1, Ordering::Relaxed);
+    if ptp::TXN_YIELDED.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
+        PUMP_YIELD_SKIPS.fetch_sub(1, Ordering::Relaxed);
+        return "skip(yielded-already)";
+    }
+    // Inside the window: the gate must refuse the pump's claim (Busy, the count moved). A Busy with the count unmoved is
+    // probed by a raw `claim()`: held = a real holder (retry), free = the gate refused uncounted (retry; `nocount` at expiry).
+    let word: Cell<Option<&'static str>> = Cell::new(None);
+    let free = Cell::new(false);
+    let hit = wait::bounded(10, || {
+        let s = PUMP_YIELD_SKIPS.load(Ordering::Relaxed);
+        match claim_noted() {
+            Ok(l) => {
+                drop(l);
+                word.set(Some("got"));
+                true
+            }
+            Err(XhciClaimError::NotReady) => {
+                word.set(Some("skip(no-xhci)"));
+                true
+            }
+            Err(XhciClaimError::Busy) => {
+                if PUMP_YIELD_SKIPS.load(Ordering::Relaxed) != s {
+                    return true;
+                }
+                if let Ok(l) = claim() {
+                    drop(l);
+                    free.set(true);
+                }
+                false
+            }
+        }
+    });
+    ptp::TXN_YIELDED.store(false, Ordering::Release);
+    let r = match (hit, word.get()) {
+        (true, Some(w)) => w,
+        (true, None) => closed(),
+        (false, _) => {
+            if free.get() {
+                "nocount"
+            } else {
+                "skip(busy)"
+            }
+        }
+    };
+    let n = PUMP_YIELD_SKIPS.load(Ordering::Relaxed);
+    PUMP_YIELD_SKIPS.fetch_sub(n.wrapping_sub(c0), Ordering::Relaxed);
+    r
+}
+
+/// XHCILOANPUMPHOLDERKAT: no `ptp` module, no gate to drive.
+#[cfg(all(target_arch = "x86_64", not(feature = "uvc")))]
+pub fn pump_holder_kat() -> &'static str {
+    "skip(no-uvc)"
 }
 
 // ══════════ XHCILOANPOLLCAPKAT (zenbook-ledger Z77) — `tests preemptaudit` drives the capped poll pass ══════════

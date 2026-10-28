@@ -1,0 +1,13 @@
+<!doctype html><!-- AUTHORED (AETHERHEADERBAND SR412), not a capture: a fixed top nav with rounded lower corners over a body whose first child carries a top margin (the margin-collapse case), and an inline rounded chip that wraps. -->
+<html><head><title>fixed nav</title><style>
+body { margin: 0; font-family: arial, sans-serif }
+#nav { position: fixed; top: 0; left: 0; right: 0; height: 48px; background: #4285f4; border-radius: 0 0 12px 12px }
+#first { margin-top: 80px; height: 40px }
+#chipbox { width: 160px; font-size: 16px; line-height: 24px }
+#chip { background: #1a73e8; color: #fff; border-radius: 12px; padding: 0 8px }
+</style></head><body>
+<nav id="nav"></nav>
+<div id="first">first</div>
+<div id="chipbox">lead words then <span id="chip">a rounded chip that wraps</span></div>
+<div style="height:2000px"></div>
+</body></html>

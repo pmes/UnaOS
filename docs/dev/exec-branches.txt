@@ -1085,7 +1085,7 @@ refs/heads/exec-rmbp-xhciloanptpcopy   edb51e58d FOLDED-BY-HAND (this commit) 20
 refs/heads/exec-rmbp-loginfurnitureonce   eee01749e FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-aethersubmitcaption   9a0fab408 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-aethersurfaceheight   3fbb75c06 FOLDED-BY-HAND (this commit) 2026-10-27
-refs/heads/exec-rmbp-aetherheaderband   a9bb0b749 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-aetherheaderband   c233c8320 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-installervessel   d65915db9 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-installercard   6bc2f17f9 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-s10keyzero   870337caa FOLDED-BY-HAND (this commit) 2026-10-27
@@ -1116,7 +1116,7 @@ refs/heads/exec-rmbp-gen7slotnoholdrungs   2520cc193 FOLDED-BY-HAND (this commit
 refs/heads/exec-rmbp-aetherbuttonlabelone   d2eda07d4 IN-FLIGHT cut 2026-10-28
 refs/heads/exec-rmbp-installerprovider   0c20585aa FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-aetherfontdbfallback   d2eda07d4 IN-FLIGHT cut 2026-10-28
-refs/heads/exec-rmbp-aethercsssplitaudit   d2eda07d4 IN-FLIGHT cut 2026-10-28
+refs/heads/exec-rmbp-aethercsssplitaudit   9c42a228e FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-xhciloanshedkatcontrol   afd48903b FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-masksitescore   df30fb939 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-preemptoffarmunafs   bcfef8395 FOLDED-BY-HAND (this commit) 2026-10-27
@@ -1129,6 +1129,13 @@ refs/heads/exec-rmbp-retiredrain   53f662be2 FOLDED-BY-HAND (this commit) 2026-1
 refs/heads/exec-rmbp-lockregedgexcore   c147f08df FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-installercontribute   88ec9c8d0 IN-FLIGHT cut 2026-10-28
 refs/heads/exec-rmbp-installerproviderstream   48efd481d FOLDED-BY-HAND (this commit) 2026-10-27
-refs/heads/exec-rmbp-xhciloanpumpholderkat   09f2f46fc IN-FLIGHT cut 2026-10-28
-refs/heads/exec-rmbp-lockregouterxcore   09f2f46fc IN-FLIGHT cut 2026-10-28
-refs/heads/exec-rmbp-unafsbindtrigger   09f2f46fc IN-FLIGHT cut 2026-10-28
+refs/heads/exec-rmbp-xhciloanpumpholderkat   a86f4849a FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-lockregouterxcore   7a159e120 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-unafsbindtrigger   9d880fc02 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-xhciloanptpyieldpolltake   296cac776 IN-FLIGHT cut 2026-10-28
+refs/heads/exec-rmbp-masksitesseccore   0d47aac2f FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-aetherfontdboracle   296cac776 IN-FLIGHT cut 2026-10-28
+refs/heads/exec-rmbp-preemptoffarmusbnetdrive   4406f63eb IN-FLIGHT cut 2026-10-28
+refs/heads/exec-rmbp-retiredrainrest   4406f63eb IN-FLIGHT cut 2026-10-28
+refs/heads/exec-rmbp-aetherabscb   4406f63eb IN-FLIGHT cut 2026-10-28
+refs/heads/exec-rmbp-landingsecretfield   4406f63eb IN-FLIGHT cut 2026-10-28

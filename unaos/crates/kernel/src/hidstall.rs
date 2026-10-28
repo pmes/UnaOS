@@ -779,6 +779,7 @@ pub(crate) struct MaskSites {
     sec_other_n: AtomicU32,
     sec_other_sum: AtomicU64,
     core_sum: [[AtomicU64; SITE_CORES]; MASK_SITES_N], // MASKSITESCORE (B1051): each slot's ms per noting core (16 x SITE_CORES x 8 B)
+    sec_base: [[AtomicU64; SITE_CORES]; MASK_SITES_N], // MASKSITESSECCORE (B1059): `core_sum` as the last `take_sec` saw it (16 x SITE_CORES x 8 B; one writer, `take_sec`)
 }
 
 impl MaskSites {
@@ -795,6 +796,7 @@ impl MaskSites {
             sec_other_n: AtomicU32::new(0),
             sec_other_sum: AtomicU64::new(0),
             core_sum: [const { [const { AtomicU64::new(0) }; SITE_CORES] }; MASK_SITES_N],
+            sec_base: [const { [const { AtomicU64::new(0) }; SITE_CORES] }; MASK_SITES_N],
         }
     }
 
@@ -835,7 +837,8 @@ impl MaskSites {
         }
     }
 
-    /// The second's top-3 by sum, its counters taken (reset) — `lag`'s roll, every second.
+    /// The second's top-3 by sum, its counters taken (reset) — `lag`'s roll, every second; each site with the second's ms per
+    /// core (MASKSITESSECCORE B1059: the delta of `core_sum` since the previous take), so it prints `@c<dominant>`.
     pub(crate) fn take_sec(&self) -> SiteTop {
         let mut t = SiteTop::new(3, false);
         for (i, k) in self.site.iter().enumerate() {
@@ -845,7 +848,7 @@ impl MaskSites {
             }
             let n = self.sec_n[i].swap(0, Relaxed);
             let sum = self.sec_sum[i].swap(0, Relaxed);
-            t.offer(p, n, sum, 0);
+            t.offer_on(p, n, sum, 0, &self.sec_cores(i)); // MASKSITESSECCORE (B1059): the second's per-core ms (tail)
         }
         t.set_other(self.sec_other_n.swap(0, Relaxed), self.sec_other_sum.swap(0, Relaxed));
         t
@@ -875,6 +878,9 @@ impl MaskSites {
             self.sec_n[i].store(0, Relaxed);
             self.sec_sum[i].store(0, Relaxed);
             for c in self.core_sum[i].iter() {
+                c.store(0, Relaxed);
+            }
+            for c in self.sec_base[i].iter() {
                 c.store(0, Relaxed);
             }
         }
@@ -1044,7 +1050,9 @@ fn masksites_kat() -> (u32, bool, bool, bool, Option<bool>) {
     let (s1, s2) = (KAT_SITES.take_sec(), KAT_SITES.take_sec());
     let roll_ok = s1.sites() == 2 && s1.entry(0).0 == pa && s1.find(pb).map(|e| (e.0, e.1)) == Some((2, 9)) && s2.sites() == 0 && KAT_SITES.boot().sites() == 2;
     let me = crate::arch::percpu::this_cpu().cpu_index as usize;
-    let sitecore = sib.map(|s| boot.core_of(pa) == Some((me, 1)) && boot.core_of(pb) == Some((s, 2))); // MASKSITESCORE (B1051): A on this core; B dominant on the sibling (5 > 4), two contributors
+    KAT_SITES.note(1, b); // MASKSITESSECCORE (B1059): one more 1 ms span at B HERE, after every boot/roll check above
+    let s3 = KAT_SITES.take_sec(); // the delta's proof: boot-long B is c<me> 5 + c<sib> 5 (two contributors), this second's is c<me> 1 alone
+    let sitecore = sib.map(|s| boot.core_of(pa) == Some((me, 1)) && boot.core_of(pb) == Some((s, 2)) && s1.core_of(pa) == Some((me, 1)) && s1.core_of(pb) == Some((s, 2)) && s3.core_of(pb) == Some((me, 1))); // MASKSITESCORE (B1051): A on this core; B dominant on the sibling (5 > 4), two contributors; MASKSITESSECCORE (B1059): the per-second takes say the same, and s3 only the delta
     (boot.sites(), top_ok, sums_ok, roll_ok, sitecore)
 }
 
@@ -1132,7 +1140,7 @@ fn kat_core_ok(by: &MaskedBy) -> bool {
 // `SEEN_CORE` the same shape, the token's own core). [`SiteTop`], the ONE formatter, prints `@c<dominant>` after a site
 // (dominant = the largest per-core sum, lowest core on a tie; none when no core has a whole ms) and, on the boot-long hidstall
 // line only, `(cores=c<a>:<ms>+c<b>:<ms>)` when more than one core contributed (`+`, not `,`: `top=` is itself a `,`-list).
-// The per-second `take_sec` carries no core (MASK-SITES-SECCORE owed): the `[lag] stall … masked_sites=` line is unchanged.
+// The per-second `take_sec` carried no core (MASK-SITES-SECCORE): BUILT by MASKSITESSECCORE (B1059, tail) — `@c<dominant>` per site.
 
 /// The MASKSCOPE leg's own site table (module scope so the sibling helper task reaches it; a fixture never feeds the boot
 /// table, B1008).
@@ -1257,4 +1265,22 @@ fn kat_sibling_try(b: &'static core::panic::Location<'static>) -> Option<Option<
     }
     let hc = SITE_KAT_CORE.load(Relaxed);
     Some(if hc != me { Some(hc) } else { None })
+}
+
+// ── MASKSITESSECCORE (rmbp-ledger B1059) — the per-second `masked_sites=` names its core. FILE-TAIL append. ──────────────────
+// MASKSITESCORE (B1051) owed MASK-SITES-SECCORE: `core_sum` is boot-long, so `take_sec` (the `[lag] stall … masked_sites=` roll)
+// offered no core and a stall second said WHICH site masked but not on which core. `core_sum` only grows and a slot is never
+// freed, so the second's per-core ms is its delta since the previous take: `sec_base` holds the last take's view (16 x
+// SITE_CORES x 8 B = 1024 B per table on x86, one writer: `take_sec`), `swap` keeps the deltas an exact partition. `note` (the
+// per-span writer) is unchanged. A span landing between the take's `sec_*` swap and this sample counts its core this second and
+// its n/sum the next: one span of skew, the table's existing contract. `take_sec`'s SiteTop keeps `with_cores` off: `@c<d>` only.
+
+impl MaskSites {
+    /// Slot `i`'s ms per core since the previous call (the snapshot delta of `core_sum`), the snapshot moved to now.
+    fn sec_cores(&self, i: usize) -> [u64; SITE_CORES] {
+        core::array::from_fn(|c| {
+            let now = self.core_sum[i][c].load(Relaxed);
+            now.saturating_sub(self.sec_base[i][c].swap(now, Relaxed))
+        })
+    }
 }
