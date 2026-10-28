@@ -7064,7 +7064,7 @@ mod r8 {
                 );
                 // SAFETY: `bar0` is the IGD BAR0 mapping `igpu::init` published and R1-R7 used on this
                 // boot; it is never unmapped. `fb_blit`'s own contract (the `blit` contract) applies.
-                if let Some(_door) = super::r8_engine_clear() { unsafe { fb_blit(c.bar0, c.bar0_size, c.bus, c.slot, c.func, c.wake, c.r7, c.geo, &mut w) }; } // GEN7R8DOOR (B1082): the engine door held across fb_blit (`_door` drops at this block's end). GEN7PARKR8 (B1078): a parked or live gen7blit ring refuses the rung (`r8_engine_clear`, gen7.rs tail). LINE-NEUTRAL append
+                if let Some(_door) = super::r8_engine_clear() { super::r8door_open_kat(); unsafe { fb_blit(c.bar0, c.bar0_size, c.bus, c.slot, c.func, c.wake, c.r7, c.geo, &mut w) }; } // GEN7R8DOORKAT (B1084): a job raced against the held door (gen7.rs tail). GEN7R8DOOR (B1082): the engine door held across fb_blit (`_door` drops at this block's end). GEN7PARKR8 (B1078): a parked or live gen7blit ring refuses the rung (`r8_engine_clear`, gen7.rs tail). LINE-NEUTRAL append
             }
         }
         let r = print_witness(&w, false);
@@ -7746,11 +7746,11 @@ fn order_leg() {
             "ok"
         };
         let v = if w == "ok" { "PASS" } else if w.starts_with("skip") { "SKIP" } else { "FAIL" };
-        let (v, n, kat) = nohold_leg(v); let (v, pk) = park_leg(v); serial_println!(":: GEN7ORDER: pair=pages->blit-ring fwd={} rev={} inversions={}->{} -> {} gen7_order={} slot_nohold={} slot_kat={} park_kat={} ::", fwd as u8, rev as u8, i0, i1, v, w, n, kat, pk);
+        let (v, n, kat) = nohold_leg(v); let (v, pk) = park_leg(v); let (v, rk) = r8door_leg(v); serial_println!(":: GEN7ORDER: pair=pages->blit-ring fwd={} rev={} inversions={}->{} -> {} gen7_order={} slot_nohold={} slot_kat={} park_kat={} r8door_kat={} ::", fwd as u8, rev as u8, i0, i1, v, w, n, kat, pk, rk);
     }
     #[cfg(not(feature = "gen7blit"))]
     {
-        let (v, n, kat) = nohold_leg("SKIP"); let (v, pk) = park_leg(v); serial_println!(":: GEN7ORDER: pair=pages->blit-ring fwd=0 rev=0 inversions=0->0 -> {} gen7_order=skip(no-gen7blit) slot_nohold={} slot_kat={} park_kat={} ::", v, n, kat, pk);
+        let (v, n, kat) = nohold_leg("SKIP"); let (v, pk) = park_leg(v); let (v, rk) = r8door_leg(v); serial_println!(":: GEN7ORDER: pair=pages->blit-ring fwd=0 rev=0 inversions=0->0 -> {} gen7_order=skip(no-gen7blit) slot_nohold={} slot_kat={} park_kat={} r8door_kat={} ::", v, n, kat, pk, rk);
     }
 }
 
@@ -7974,4 +7974,131 @@ fn r8_engine_clear() -> Option<crate::sync::MutexGuard<'static, Option<blit::Par
 #[cfg(all(feature = "gen7r8", not(feature = "gen7blit")))]
 fn r8_engine_clear() -> Option<()> {
     Some(())
+}
+
+// =================================================================================
+// GEN7R8DOORKAT (rmbp-ledger B1084) — FILE-TAIL append: nothing above it moves. GEN7R8DOOR (B1082) owed
+// GEN7-R8-DOOR-KAT: R8's rung holds the engine door (PAGES' guard, `_door`) across `fb_blit`, but no leg raced a job
+// against it. Measured at 6836ff5f1: `blit::bcs_job` takes the door through `engine_take` (`PAGES.try_lock`, the nested
+// slot take only after it) and says `Err("busy")`, which `BcsBlitter::blit` maps to `Unavailable` with no demote; the
+// helper calls `bcs_job` itself because `BcsBlitter::blit` refuses on ARMED first and ARMED is set only by `blit::test`,
+// after the ladder. No PAGES take anywhere blocks (every take is `try_lock`), so the rung may yield holding the door.
+// The rung, holding `_door`, opens a one-shot window BEFORE `fb_blit`: ONE helper on the next online core claims it
+// (CAS OPEN -> CLAIMED), runs a real `bcs_job` (two 64-byte heap planes, one 1x1 rect: valid, so it reaches the door) and
+// reads `selected()` before and after (SEL_BCS unchanged). A rung that times out with the word still OPEN CASes it to
+// NO_HELPER before going on, so a late helper never runs a real job after the door drops. GEN7ORDER's `r8door_kat=`.
+// Gated on the knob pair (gen7r8 + gen7blit), the exposure of `park_kat=` / `slot_kat=` (seat ruling). No new lock,
+// door or slot; gen7_blit.rs and blitter.rs untouched. Owed: GEN7-R8-DOOR-KAT-INBLIT (a job raced mid-poll inside
+// `fb_blit` needs a test seam in R8's go-red region).
+// =================================================================================
+
+#[cfg(all(feature = "gen7r8", feature = "gen7blit"))]
+static R8DOOR_KAT: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(R8DOOR_IDLE);
+#[cfg(all(feature = "gen7r8", feature = "gen7blit"))]
+const R8DOOR_IDLE: u8 = 0;
+#[cfg(all(feature = "gen7r8", feature = "gen7blit"))]
+const R8DOOR_OPEN: u8 = 1;
+#[cfg(all(feature = "gen7r8", feature = "gen7blit"))]
+const R8DOOR_CLAIMED: u8 = 2;
+#[cfg(all(feature = "gen7r8", feature = "gen7blit"))]
+const R8DOOR_BUSY: u8 = 3;
+#[cfg(all(feature = "gen7r8", feature = "gen7blit"))]
+const R8DOOR_RAN: u8 = 4;
+#[cfg(all(feature = "gen7r8", feature = "gen7blit"))]
+const R8DOOR_SEL: u8 = 5;
+#[cfg(all(feature = "gen7r8", feature = "gen7blit"))]
+const R8DOOR_NO_HELPER: u8 = 6;
+
+/// R8's rung, holding the engine door: the one-shot race window. Opens once per boot, spawns ONE helper on the next
+/// online core and waits (bounded, yielding) for it to finish its `bcs_job`; a helper that never claims is disowned.
+#[cfg(feature = "gen7r8")]
+fn r8door_open_kat() {
+    #[cfg(feature = "gen7blit")]
+    {
+        use core::sync::atomic::Ordering;
+        if R8DOOR_KAT.compare_exchange(R8DOOR_IDLE, R8DOOR_OPEN, Ordering::AcqRel, Ordering::Acquire).is_err() {
+            return;
+        }
+        let n = crate::arch::sched::online_cpu_count().max(1);
+        let me = crate::arch::sched::meter_current_cpu();
+        let cpu = if n > 1 { (me + 1) % n } else { me };
+        crate::arch::sched::spawn("gen7-r8kat", r8door_kat_helper, 0, cpu, crate::arch::sched::PRIO_NORMAL);
+        if !r8door_until(1_000, || R8DOOR_KAT.load(Ordering::Acquire) != R8DOOR_OPEN)
+            && R8DOOR_KAT.compare_exchange(R8DOOR_OPEN, R8DOOR_NO_HELPER, Ordering::AcqRel, Ordering::Acquire).is_ok()
+        {
+            return;
+        }
+        // CLAIMED (or done): the door stays held until the helper's job attempt has returned.
+        let _ = r8door_until(1_000, || R8DOOR_KAT.load(Ordering::Acquire) >= R8DOOR_BUSY);
+    }
+}
+
+/// The race's helper: claims the open window, then makes a real job attempt through `bcs_job`'s own door while R8
+/// holds it; `Err("busy")` with `selected()` unchanged is the exclusion (BcsBlitter's `Unavailable`, no demote).
+#[cfg(all(feature = "gen7r8", feature = "gen7blit"))]
+fn r8door_kat_helper(_: usize) {
+    use core::sync::atomic::Ordering;
+    let Some(b) = *ladder::BANK.lock() else { return };
+    let src_buf = alloc::vec![0u32; 16];
+    let dst_buf = alloc::vec![0u32; 16];
+    let src = blit::Plane { va: src_buf.as_ptr() as usize, len: 64, pitch: 16 };
+    let dst = blit::Plane { va: dst_buf.as_ptr() as usize, len: 64, pitch: 16 };
+    let rect = crate::video::blitter::Rect { sx: 0, sy: 0, dx: 0, dy: 0, w: 1, h: 1 };
+    if R8DOOR_KAT.compare_exchange(R8DOOR_OPEN, R8DOOR_CLAIMED, Ordering::AcqRel, Ordering::Acquire).is_err() {
+        return; // the rung timed out and disowned this helper: no job
+    }
+    let sel0 = crate::video::blitter::selected().name();
+    // SAFETY: the bank's BAR0 is igpu::init's live mapping; `src`/`dst` are heap buffers this fn owns for the whole
+    // call and nothing else writes; with R8 holding the door the job refuses at `engine_take` before any write.
+    let r = unsafe { blit::bcs_job(b.bar0, b.bar0_size, src, dst, &[rect], "g7k") };
+    let sel1 = crate::video::blitter::selected().name();
+    let word = match r {
+        Err("busy") if sel0 == sel1 => R8DOOR_BUSY,
+        Err("busy") => R8DOOR_SEL,
+        _ => R8DOOR_RAN,
+    };
+    R8DOOR_KAT.store(word, Ordering::Release);
+    drop(src_buf);
+    drop(dst_buf);
+}
+
+/// Bounded wait on `f` over the wall clock: yields when this task may, else spins.
+#[cfg(all(feature = "gen7r8", feature = "gen7blit"))]
+fn r8door_until(bound_ms: u64, f: impl Fn() -> bool) -> bool {
+    let t0 = crate::arch::ms();
+    loop {
+        if f() {
+            return true;
+        }
+        if crate::arch::ms().saturating_sub(t0) >= bound_ms {
+            return false;
+        }
+        if !crate::arch::irqs_masked() && crate::arch::sched::current_name().is_some() {
+            crate::arch::sched::yield_now();
+        } else {
+            core::hint::spin_loop();
+        }
+    }
+}
+
+/// GEN7ORDER's `r8door_kat=` term `(verdict, word)`: a job raced against R8's held door read `busy` with the selection
+/// unchanged -> `ok`; any other reading FAILs; R8 never held the door -> `skip(no-r8)`; no helper claimed ->
+/// `skip(no-helper)`.
+#[allow(unreachable_code)]
+fn r8door_leg(v: &'static str) -> (&'static str, &'static str) {
+    #[cfg(all(feature = "gen7r8", feature = "gen7blit"))]
+    {
+        let w = match R8DOOR_KAT.load(core::sync::atomic::Ordering::Acquire) {
+            R8DOOR_IDLE => "skip(no-r8)",
+            R8DOOR_NO_HELPER => "skip(no-helper)",
+            R8DOOR_BUSY => "ok",
+            _ => "miss",
+        };
+        return (if w == "miss" { "FAIL" } else { v }, w);
+    }
+    #[cfg(all(feature = "gen7r8", not(feature = "gen7blit")))]
+    {
+        return (v, "skip(no-gen7blit)");
+    }
+    (v, "skip(no-r8)")
 }
