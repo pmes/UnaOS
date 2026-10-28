@@ -1167,4 +1167,4 @@ refs/heads/exec-rmbp-preemptoffarmcasts   9e5a5521f IN-FLIGHT cut 2026-10-28
 refs/heads/exec-rmbp-xhciloanptpyieldout   9e5a5521f IN-FLIGHT cut 2026-10-28
 refs/heads/exec-rmbp-installerprovidercancel   9e5a5521f IN-FLIGHT cut 2026-10-28
 refs/heads/exec-rmbp-gen7heldpark   9e5a5521f IN-FLIGHT cut 2026-10-28
-refs/heads/exec-rmbp-closeflightid   9e5a5521f IN-FLIGHT cut 2026-10-28
+refs/heads/exec-rmbp-closeflightid   7baf4339e FOLDED-BY-HAND (this commit) 2026-10-27
