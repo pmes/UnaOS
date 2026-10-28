@@ -1145,7 +1145,7 @@ refs/heads/exec-rmbp-installerfacelive   94052c5c6 IN-FLIGHT cut 2026-10-28
 refs/heads/exec-rmbp-xhciloanptpyieldkatcloser   52c88407f FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-preemptoffarmcursormove   9ad5a5da8 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-bindnowgate   94708d143 FOLDED-BY-HAND (this commit) 2026-10-27
-refs/heads/exec-rmbp-lockregxcorecost   871a6b0ca IN-FLIGHT cut 2026-10-28
+refs/heads/exec-rmbp-lockregxcorecost   1ca6f4ad2 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-aethercentercell   871a6b0ca IN-FLIGHT cut 2026-10-28
 refs/heads/exec-rmbp-xhciloanptpyieldpollskip   871a6b0ca IN-FLIGHT cut 2026-10-28
 refs/heads/exec-rmbp-landingscore   b16e93dd9 IN-FLIGHT cut 2026-10-28
