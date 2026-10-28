@@ -7310,7 +7310,7 @@ pub fn ladder_test() {
     ladder::run();
     #[cfg(feature = "gen7blit")]
     blit::test(); // GEN7B (B422): the BCS job, the display capture, KCOMP's second-blitter decision
-    hold_leg(); order_leg(); } // GEN7HOLDONCE (B1025): the second run, asserting no new held page (`:: GEN7HOLD: ::`, body at the file tail). LINE-NEUTRAL append
+    hold_leg(); #[cfg(feature = "gen7blit")] { blit::park_unwind(); } order_leg(); } // GEN7PARKUNWIND (B1073): the parked window's late re-check (gen7_blit.rs tail). GEN7HOLDONCE (B1025): the second run, asserting no new held page (`:: GEN7HOLD: ::`, body at the file tail). LINE-NEUTRAL append
 
 mod ladder {
     use super::GtWake;
@@ -7884,8 +7884,29 @@ fn park_leg(v: &'static str) -> (&'static str, &'static str) {
     #[cfg(any(feature = "gen7r9", feature = "gen7blit"))]
     {
         let (flush, park, other) = (kept_bit("blit", "flush-write-silent"), kept_bit("blit", "ring-not-disabled"), kept_bit("r9", "ring-not-disabled"));
-        let k = if flush != 0 && park != 0 && flush & park == 0 && other & park == 0 { "ok" } else { "miss" };
+        let k = if flush != 0 && park != 0 && flush & park == 0 && other & park == 0 && park_kat_unwind() { "ok" } else { "miss" }; // GEN7PARKUNWIND (B1073): + the unwind predicate's KAT (file tail)
         return (if k == "miss" { "FAIL" } else { v }, k);
     }
     (v, "skip(no-release)")
+}
+
+// =================================================================================
+// GEN7PARKUNWIND (rmbp-ledger B1073) — FILE-TAIL append: nothing above it moves. A stalled gen7blit job's parked
+// window (gen7_blit.rs tail) is re-checked late through R7's own predicate: `r7_engine_quiesced` fed the late readings
+// (RING_CTL bit 0 clear, HEAD at the job's TAIL). R7's go-red region is untouched. A dark read (an unacked forcewake:
+// RING_CTL 0, HEAD 0) cannot pass: a job's TAIL is at least 0x40. `park_kat_unwind` is the predicate's pure KAT on
+// GEN7ORDER's `park_kat=` (a miss FAILs).
+// =================================================================================
+
+/// The parked ring is quiesced: RING_CTL read back disabled AND HEAD reached the job's TAIL (R7's two legs, late).
+#[cfg(any(feature = "gen7r9", feature = "gen7blit"))]
+fn park_quiesced(ctl: u32, head: u32, tail: u32) -> bool {
+    r7_engine_quiesced(ctl & 1 == 0, (head & RING_HEAD_OFF_MASK) == tail)
+}
+
+/// `park_quiesced`'s KAT: a live ring, a dark read and a short HEAD refuse; a disabled, drained ring passes. Pure.
+#[cfg(any(feature = "gen7r9", feature = "gen7blit"))]
+fn park_kat_unwind() -> bool {
+    let t = 0x60;
+    !park_quiesced(1, t, t) && !park_quiesced(0, 0, t) && !park_quiesced(0, t - 8, t) && park_quiesced(0, t, t)
 }
