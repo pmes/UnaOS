@@ -2764,7 +2764,7 @@ pub fn unafsx86_selftest() {
     let _ = mt.unlink(PATH, KERNEL_PRINCIPAL); // a stale scratch from an interrupted run
     let create = mt.create(PATH, NodeKind::File, KERNEL_PRINCIPAL).is_ok();
     let write = create && mt.write(PATH, 0, BODY, KERNEL_PRINCIPAL).map(|n| n == BODY.len()).unwrap_or(false);
-    force_remount(); bind_now_kat(); // UNAFSBINDTRIGGER (B1058): the mount was just dropped — bind_now binds it with no masked MOUNT attempt by this task (file tail; LINE-NEUTRAL, before this comment)
+    force_remount(); let kat = bind_now_kat(); // BINDNOWGATE (B1061): the KAT's word joins `pass` below. UNAFSBINDTRIGGER (B1058): the mount was just dropped — bind_now binds it with no masked MOUNT attempt by this task (file tail; LINE-NEUTRAL, before this comment)
     let reread = matches!(
         with_unafs(|fs| match fs.resolve_path(PATH) {
             Ok(id) => fs.read_data(id, 0, BODY.len() as u64).map(|d| d == BODY).unwrap_or(false),
@@ -2785,7 +2785,7 @@ pub fn unafsx86_selftest() {
     );
     let unlink = mt.unlink(PATH, KERNEL_PRINCIPAL).is_ok() && mt.stat(PATH).is_err();
     let w = |b: bool| if b { "ok" } else { "no" };
-    let pass = create && write && reread && owner && unlink;
+    let pass = create && write && reread && owner && unlink && kat; // BINDNOWGATE (B1061): a kat=FAIL reds UNAFSX86-T (the replay's `-> FAIL ::`); skip is not red
     serial_println!(
         ":: UNAFSX86-T: root=unafs create={} write={} remount-read={} owner={} unlink={} -> {} ::",
         w(create), w(write), w(reread), w(owner), w(unlink),
@@ -5632,16 +5632,16 @@ fn kat_masked_note() {
 }
 
 /// `tests unafs` (UNAFSX86-T, folded on its `force_remount` line): on the just-dropped mount, one `bind_now` must bind it
-/// with NO masked MOUNT attempt by this task. Words: ok | FAIL | skip(no-task) | skip(bound).
+/// with NO masked MOUNT attempt by this task. Words: ok | FAIL | skip(no-task) | skip(bound). Returns false only on FAIL (BINDNOWGATE B1061).
 #[cfg(feature = "unafs")]
-fn bind_now_kat() {
+fn bind_now_kat() -> bool {
     let Some(me) = crate::arch::sched::current_id() else {
         serial_println!("[unafs] bind_now kat=skip(no-task) (UNAFSBINDTRIGGER B1058)");
-        return;
+        return true;
     };
     if mount_bound_handle().is_some() {
         serial_println!("[unafs] bind_now kat=skip(bound) (UNAFSBINDTRIGGER B1058)");
-        return;
+        return true;
     }
     KAT_MASKED.store(0, Ordering::Release);
     KAT_TID.store(me, Ordering::Release);
@@ -5654,9 +5654,9 @@ fn bind_now_kat() {
         Err(MountError::Busy) => "busy",
         Err(_) => "err",
     };
-    let word = if r.is_ok() && bound && masked == 0 { "ok" } else { "FAIL" };
+    let ok = r.is_ok() && bound && masked == 0; let word = if ok { "ok" } else { "FAIL" };
     serial_println!(
         "[unafs] bind_now kat={} r={} bound={} masked={} (UNAFSBINDTRIGGER B1058: a bind_now on an unbound mount takes no masked MOUNT attempt)",
         word, rw, bound as u8, masked
-    );
+    ); ok
 }
