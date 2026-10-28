@@ -19527,3 +19527,140 @@ fn poll_loan(round: usize) -> Option<crate::drivers::block::BlockLoan> {
         }
     }
 }
+
+// ══════════ XHCILOANPOLLCAPKAT (zenbook-ledger Z77) — `tests preemptaudit` drives the capped poll pass ══════════
+//
+// TAIL-APPENDED (no line above moves). Z74's `poll_cap=` is a count that reads 0 on a healthy QEMU boot, so the cap had
+// never run under a test. The KAT takes controller 0 through the poller's own take (`block::xhci_poll_loan`: preempt-off,
+// published; Z74's `poll_loan` meets Busy and skips), posts 8 No Op commands through the ONE command chokepoint
+// (`send_command(Trb::new_noop)`; QEMU answers each with a Command Completion Event inside the doorbell write), waits by
+// the cycle bit (`EventRing::peek_slot`, no drain) until they are pending, and runs `poll_events` itself: the first pass
+// must dispatch exactly `POLL_DRAIN_CAP` and count one cap, the following passes the remainder, with the publication held
+// throughout. It neither arms nor says the boot's once-line, and gives back every count it spent (B1034 / Z71's shape).
+// Owed: XHCILOAN-POLLCAP-METAL, XHCILOAN-POLLCAP-OTHERS (a controller 1..3 cap inside the KAT's window loses its once-line
+// arming), XHCILOAN-SHEDKAT-CONTROL.
+
+/// XHCILOANPOLLCAPKAT: `tests preemptaudit`'s capped-poll leg (`poll_cap_kat=`): `ok`, `skip(masked|no-xhci|busy)`, or the
+/// first failed check — `no-noop` / `unpublished` / `not-capped` / `left-wrong`.
+#[cfg(target_arch = "x86_64")]
+pub fn poll_cap_kat() -> &'static str {
+    use crate::drivers::block::{self, wait, BlockLoan};
+
+    /// Events pending in controller `xi`'s ring (the cycle-bit walk from the dequeue slot; nothing popped, ERDP untouched),
+    /// how many of them are slot-0 Command Completion successes (a No Op's), and the ring's consumed count.
+    fn pending(xi: usize) -> (usize, usize, u64) {
+        let g = event_ring(xi).lock();
+        let Some(r) = g.as_ref() else { return (0, 0, 0) };
+        let (mut i, mut c, mut n, mut ok) = (r.dequeue_index, r.cycle_bit, 0usize, 0usize);
+        while n < event::EVENT_RING_SIZE {
+            let t = r.peek_slot(i);
+            let ctl = t.control;
+            let st = t.status;
+            if ((ctl & 1) != 0) != c {
+                break;
+            }
+            if (ctl >> 10) & 0x3F == 33 && (st >> 24) & 0xFF == 1 && (ctl >> 24) & 0xFF == 0 {
+                ok += 1;
+            }
+            n += 1;
+            i += 1;
+            if i >= event::EVENT_RING_SIZE {
+                i = 0;
+                c = !c;
+            }
+        }
+        (n, ok, r.popped)
+    }
+
+    /// The legs under the KAT's loan; `caps` counts the KAT's own capped passes (given back by the caller).
+    fn legs(x: &mut BlockLoan, caps: &mut u32, c0: u32) -> &'static str {
+        let xi = x.xi as usize;
+        let (p0, ok0, _) = pending(xi);
+        for _ in 0..8 {
+            if x.send_command(Trb::new_noop(false)).is_err() {
+                return "no-noop";
+            }
+        }
+        if !wait::bounded(10, || {
+            let (n, ok, _) = pending(xi);
+            n >= p0 + 8 && ok >= ok0 + 8
+        }) {
+            return "no-noop";
+        }
+        if !block::xhci_loan_published() {
+            return "unpublished";
+        }
+        let (p1, _, e1) = pending(xi);
+        x.poll_events();
+        let (_, _, e2) = pending(xi);
+        let d1 = e2.wrapping_sub(e1);
+        if d1 == POLL_DRAIN_CAP as u64 {
+            *caps += 1;
+        }
+        if !block::xhci_loan_published() {
+            return "unpublished";
+        }
+        if d1 != POLL_DRAIN_CAP as u64 || POLL_CAPPED_N.load(Ordering::Relaxed).wrapping_sub(c0) < 1 {
+            return "not-capped";
+        }
+        // The remainder rides the next passes, until one reads the ring empty (dispatches under the cap).
+        let mut left = 0u64;
+        let mut passes = 0usize;
+        loop {
+            let (_, _, a) = pending(xi);
+            x.poll_events();
+            let (_, _, b) = pending(xi);
+            let d = b.wrapping_sub(a);
+            left = left.wrapping_add(d);
+            passes += 1;
+            if d < POLL_DRAIN_CAP as u64 {
+                break;
+            }
+            *caps += 1;
+            if passes.saturating_mul(POLL_DRAIN_CAP) >= event::EVENT_RING_SIZE {
+                return "left-wrong";
+            }
+        }
+        if !block::xhci_loan_published() {
+            return "unpublished";
+        }
+        if left < p1.saturating_sub(POLL_DRAIN_CAP) as u64 {
+            return "left-wrong";
+        }
+        "ok"
+    }
+
+    if crate::arch::irqs_masked() {
+        return "skip(masked)";
+    }
+    if matches!(claim(), Err(XhciClaimError::NotReady)) {
+        return "skip(no-xhci)";
+    }
+    let got: core::cell::Cell<Option<BlockLoan>> = core::cell::Cell::new(None);
+    let gone = core::cell::Cell::new(false);
+    let _ = wait::bounded(50, || match block::xhci_poll_loan() {
+        Ok(l) => {
+            got.set(Some(l));
+            true
+        }
+        Err(XhciClaimError::NotReady) => {
+            gone.set(true);
+            true
+        }
+        Err(XhciClaimError::Busy) => false,
+    });
+    let Some(mut x) = got.into_inner() else {
+        return if gone.get() { "skip(no-xhci)" } else { "skip(busy)" };
+    };
+    // The KAT's passes neither arm nor say the boot's "first cap, once" line; every count is given back below.
+    let st0 = POLL_CAP_ONCE.swap(0xFF, Ordering::AcqRel);
+    let left0 = POLL_CAP_LEFT.load(Ordering::Relaxed);
+    let c0 = POLL_CAPPED_N.load(Ordering::Relaxed);
+    let mut caps = 0u32;
+    let r = legs(&mut x, &mut caps, c0);
+    POLL_CAPPED_N.fetch_sub(caps, Ordering::Relaxed);
+    POLL_CAP_LEFT.store(left0, Ordering::Relaxed);
+    POLL_CAP_ONCE.store(st0, Ordering::Release);
+    drop(x);
+    r
+}
