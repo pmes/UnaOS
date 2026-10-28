@@ -118,3 +118,52 @@ fn cell_plain_center_leaves_blocks() {
         assert!((x - cx).abs() < 0.5, "plain text-align: center in a td does not move the block #{id} (x {x}, cell {cx})");
     }
 }
+
+/// AETHERCENTERCAPTION (SR446): the same narrow children inside the `<caption>` of a 600px table (one row so table.rs
+/// lays the table; the caption fills the table's content box and has no padding).
+fn caption_page(cap_attrs: &[(&'static str, &str)]) -> N {
+    let mut attrs = vec![("id", "cap")];
+    attrs.extend_from_slice(cap_attrs);
+    page(vec![el(
+        "table",
+        &[("style", "width: 600px; border-spacing: 0")],
+        vec![el("caption", &attrs, kids()), el("tr", &[], vec![el("td", &[], vec![text("row")])])],
+    )])
+}
+
+/// AETHERCENTERCAPTION (SR446): a caption is a block container (CSS 2.2 §17.4), so `caption align=center` and
+/// `text-align: -webkit-center` on a caption centre a nested table and a definite-width block in it, as Chrome does;
+/// an auto-width block still fills the caption.
+#[test]
+fn caption_centres_narrow_blocks() {
+    let cases: [(&str, N); 2] = [
+        ("<caption align=center>", caption_page(&[("align", "center")])),
+        ("caption text-align: -webkit-center", caption_page(&[("style", "text-align: -webkit-center")])),
+    ];
+    for (how, doc) in &cases {
+        let tree = lay(doc, VW, 400.0);
+        let (cx, _, cw, _) = box_of(&tree, &doc.by_id("cap"));
+        assert!(cw > 400.0, "{how}: the caption is wide ({cw})");
+        for id in ["t", "d"] {
+            let (x, _, w, _) = box_of(&tree, &doc.by_id(id));
+            assert!(w > 0.0 && w < cw - 100.0, "{how}: #{id} is narrower than the caption ({w} of {cw})");
+            assert!((x + w / 2.0 - (cx + cw / 2.0)).abs() < 0.5, "{how}: #{id} is centred in the caption (x {x} w {w}, caption {cx} + {cw})");
+        }
+        let (x, _, w, _) = box_of(&tree, &doc.by_id("f"));
+        assert!((x - cx).abs() < 0.5 && (w - cw).abs() < 0.5, "{how}: an auto-width block fills the caption (x {x} w {w}, caption {cx} + {cw})");
+    }
+}
+
+/// AETHERCENTERCAPTION (SR446): plain `text-align: center` on a caption aligns inline content only (CSS 2.2 §16.2):
+/// the nested table and the definite-width block sit at the caption's start.
+#[test]
+fn caption_plain_center_leaves_blocks() {
+    let doc = caption_page(&[("style", "text-align: center")]);
+    let tree = lay(&doc, VW, 400.0);
+    let (cx, _, cw, _) = box_of(&tree, &doc.by_id("cap"));
+    for id in ["t", "d"] {
+        let (x, _, w, _) = box_of(&tree, &doc.by_id(id));
+        assert!(w > 0.0 && w < cw - 100.0, "#{id} is narrower than the caption ({w} of {cw})");
+        assert!((x - cx).abs() < 0.5, "plain text-align: center in a caption does not move the block #{id} (x {x}, caption {cx})");
+    }
+}
