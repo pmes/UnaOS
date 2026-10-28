@@ -3811,6 +3811,32 @@ mod tests {
         }
     }
 
+    /// AETHERFILEFACE (SR463): a file input paints ButtonFace and the 1px #767676 frame on its Choose-File button only
+    /// (Chromium: html.css gives the input no background and no border): the button's top-left corner is the frame
+    /// (square, the push rule; before, the input's kept corner), inside it the face, and the input's top-right, right of
+    /// the button, is the page background (before, the input's own frame over a whole-box face).
+    #[test]
+    fn file_face_on_button() {
+        let html = r#"<!doctype html><html><body><div><input type="file" id="f"></div></body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 200));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        let px = |e: &mut crate::AetherEngine, x: f64, y: f64| -> (u8, u8, u8) {
+            let i = (y as usize * e.width as usize + x as usize) * 4;
+            let s = e.surface();
+            (s[i + 2], s[i + 1], s[i])
+        };
+        let r = |e: &mut crate::AetherEngine, k: &str| js_num(e, &format!("document.getElementById('f').getBoundingClientRect().{k}"));
+        let (l, t, w, h) = (r(&mut engine, "left"), r(&mut engine, "top"), r(&mut engine, "width"), r(&mut engine, "height"));
+        assert!(l >= 2.0 && w > 40.0 && h > 14.0, "the file input has a box ({l},{t} {w}x{h})");
+        let (x0, y0) = (l.trunc(), t.trunc());
+        let bg = px(&mut engine, x0 - 2.0, y0);
+        assert_eq!(px(&mut engine, x0, y0), (118, 118, 118), "the button's top-left corner carries the frame colour");
+        assert_eq!(px(&mut engine, x0 + 2.0, y0 + 2.0), layout_core::BUTTON_FACE, "the button is filled with ButtonFace");
+        assert_eq!(px(&mut engine, (l + w).trunc() - 1.0, y0), bg, "right of the button the input paints no face and no frame");
+    }
+
     /// AETHERFILECOLORPAINT (SR456): a color input paints its value as Chromium's swatch (layout_core `COLOR_SWATCH`: 5 px
     /// / 6 px in from the border box, a 1 px #777777 frame round the fill): the attribute's colour, black with no
     /// value, a script-set (dirty) value over the attribute; never the value as text.

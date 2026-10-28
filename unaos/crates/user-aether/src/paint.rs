@@ -546,6 +546,8 @@ fn file_color(cv: &mut Canvas, cx: &Cx, id: NodeId, ink: &Ink, x: f32, y: f32, t
         let whole = layout_core::caption_box(x, y, l.size.width, l.size.height, l.border, l.padding, 0.0, a, d);
         let base = btn.baseline(lead);
         let (px0, py0, px1, py1) = whole.clip;
+        // AETHERFILEFACE (SR463): ButtonFace on the button sub-box only (the input paints none), this ring's push rule: no UA frame.
+        cv.fill(fl(ox), fl(oy), fl(ox + btn_bw) - fl(ox), fl(oy + oh) - fl(oy), rgb(layout_core::BUTTON_FACE));
         for (sx, s) in [(btn.x, button), (ox + btn_bw + 4.0, status)] {
             t.draw(sx, base, s, ink.sel, ink.size, color, &mut |gx, gy, cov| {
                 let (fx, fy) = (gx as f32, gy as f32);
