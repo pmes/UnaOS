@@ -3910,6 +3910,12 @@ dicc = ["dep:icc_core"]
 # Kept in sync with `unaos/arroyo`, `unaos/builder/src/main.rs`, scripts/k8-reach.registry and scripts/banner-cert.sh.
 nvme = []
 
+# LOCKREGXCORECOSTKNOB (rmbp-ledger B1075, blueprint cores.md BP-cores-20): UNAOS_LOCKREG_CENSUS=1 arms the lock registry's
+# cross-core walk census (LOCKREGXCORECOST B1062: two `rdtsc` + three core-local stores per tracked blocking take, said as
+# the `[lockreg] xcore` line, avg_cyc= / max_cyc=, in `tests lockreg`). x86 only (sync.rs `mod reg`). DEFAULT OFF => no rdtsc, no store,
+# `[lockreg] xcore census=off`. Kept in sync with `unaos/arroyo`, `unaos/builder/src/main.rs`, scripts/k8-reach.registry and scripts/banner-cert.sh.
+lockreg_census = []
+
 [dependencies]
 # FIX: Use 'spin_no_std' to explicitly disable Standard Library usage
 lazy_static = { version = "1.5.0", features = ["spin_no_std"] }

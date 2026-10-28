@@ -802,6 +802,9 @@ fn main() {
     // its nearest deadline and halts; busy cores, core 0 while it is the clock, and the HID pump core keep the 1 kHz tick.
     // THIS list is what reaches the media kernel, so arroyo's mapping alone would ship it disabled. Kept in sync.
     if std::env::var("UNAOS_TICKLESS").is_ok() { feats.push("tickless"); }
+    // LOCKREGXCORECOSTKNOB (rmbp-ledger B1075): UNAOS_LOCKREG_CENSUS=1 arms the lock registry's cross-core walk census (B1062,
+    // `[lockreg] xcore walks= … avg_cyc=` in `tests lockreg`); off, the census reads no TSC. THIS list reaches the media kernel. Kept in sync.
+    if std::env::var("UNAOS_LOCKREG_CENSUS").is_ok() { feats.push("lockreg_census"); }
     // BT-DIR: UNAOS_BTDIR=1 arms THE DIRECTION TEST — after the outbound page stage has printed its
     // tally, write HCI_Write_Scan_Enable (0x0C1A) = 0x03 so the peer can page THIS host, hold one
     // 6400 ms page window, report whether a Connection Request (event 0x04) arrived, then write

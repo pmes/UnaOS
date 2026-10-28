@@ -427,7 +427,7 @@ mod reg {
             c => c,
         };
         let mut m = p.mask.load(Acquire);
-        if c != 0 && edges { let x0 = rdtsc(); task_slots(tid, cpu, m, |_, _, t| { let a = tag_class(t); if a != 0 && a != c { edge(a, c, tid, cpu); } }); xcost_note(tid, cpu, x0); } // LOCKREGXCORECOST (B1062): the walk's TSC span into this core's census (`xcost_note`, reg tail; tid 0 not counted). LOCKREGOUTERXCORE (B1057): the walk is `task_slots` (after this fn), the ONE walk `outer_site` shares. LOCKREGEDGEXCORE (B1056): EVERY partition for this task — a hold taken before a preemption + steal stays in its old core's partition (release frees it by the guard's slot); tid 0 = a core's scheduler context, this core only. LINE-NEUTRAL rewrite
+        if c != 0 && edges { let x0 = xcost_t0(); task_slots(tid, cpu, m, |_, _, t| { let a = tag_class(t); if a != 0 && a != c { edge(a, c, tid, cpu); } }); xcost_note(tid, cpu, x0); } // LOCKREGXCORECOSTKNOB (B1075): no rdtsc without `lockreg_census` (`xcost_t0`, reg tail). LOCKREGXCORECOST (B1062): the walk's TSC span into this core's census (`xcost_note`, reg tail; tid 0 not counted). LOCKREGOUTERXCORE (B1057): the walk is `task_slots` (after this fn), the ONE walk `outer_site` shares. LOCKREGEDGEXCORE (B1056): EVERY partition for this task — a hold taken before a preemption + steal stays in its old core's partition (release frees it by the guard's slot); tid 0 = a core's scheduler context, this core only. LINE-NEUTRAL rewrite
         let i = loop {
             let free = !m;
             if free == 0 {
@@ -1772,7 +1772,7 @@ mod reg {
     /// it was taken on), then `XB.lock()` through the real `acquire`; the walk must record XA -> XB. XA's raw lock is never
     /// taken (a tag only), the planted slot is freed in `release`'s order, nothing reversed is planted (`order_seen`'s rule).
     /// The old one-partition walk reads fwd=0 (FAIL). LOCKREGXCORECOST (B1062): this core's walk census (`XCOST`) must count
-    /// XB's take as exactly one walk (`walks=<w0>-><w0+1>`; an untimed walk reads `<w0>-><w0>`, FAIL).
+    /// XB's take as exactly one walk (`walks=<w0>-><w0+1>`; an untimed walk reads `<w0>-><w0>`, FAIL); `walks=off` without `lockreg_census` (B1075).
     fn xcore_leg() {
         if !ON.load(Acquire) {
             serial_println!(":: LOCKXCORE: -> SKIP(unarmed) ::");
@@ -1826,9 +1826,9 @@ mod reg {
                 serial_println!(":: LOCKXCORE: -> SKIP({}) ::", why);
             }
             Ok((q, cpu, fwd, rev, inv0, inv1, outer, w0, w1)) => {
-                let pass = fwd && !rev && inv1 == inv0 && outer != Some(false) && w1 == w0 + 1; // LOCKREGXCORECOST (B1062): the walk census counted XB's one walk
+                let pass = fwd && !rev && inv1 == inv0 && outer != Some(false) && (!CENSUS || w1 == w0 + 1); // LOCKREGXCORECOSTKNOB (B1075): without `lockreg_census` nothing counts and the walks are not judged. LOCKREGXCORECOST (B1062): the walk census counted XB's one walk
                 let ow = match outer { Some(true) => "1", Some(false) => "0", None => "-" };
-                serial_println!(":: LOCKXCORE: planted=c{} took=c{} fwd={} rev={} inversions={}->{} outer={} -> {} :: walks={}->{}", q, cpu, fwd as u8, rev as u8, inv0, inv1, ow, if pass { "PASS" } else { "FAIL" }, w0, w1);
+                serial_println!(":: LOCKXCORE: planted=c{} took=c{} fwd={} rev={} inversions={}->{} outer={} -> {} :: walks={}", q, cpu, fwd as u8, rev as u8, inv0, inv1, ow, if pass { "PASS" } else { "FAIL" }, XWalks(w0, w1));
             }
         }
     }
@@ -1838,9 +1838,9 @@ mod reg {
     // walk by a task (tid != 0; tid 0 walks its own core only) — the whole `task_slots` call, its `edge()` inserts
     // included — into THREE atomics PER CORE (written only by the acquiring core, the `Part::acq` shape: plain load +
     // store, Relaxed, lossy under a preemption as `acq` is; per core so the census shares no line across cores and does
-    // not perturb what it measures). Gated by `ON` (it sits after `who()`); its own cost is two `rdtsc` + three
-    // core-local stores per counted walk. Said once per `tests lockreg` run by `xcost_say`, never inside `lock`.
-    // `outer_site` (stall samples only) is untimed. Owed: LOCKREG-XCORE-HINT, LOCKREG-XCORE-COST-KNOB. ──
+    // not perturb what it measures). Gated by `ON` (after `who()`) AND by `lockreg_census` (LOCKREGXCORECOSTKNOB B1075: two `rdtsc` + three
+    // core-local stores per counted walk when armed, nothing when off: `CENSUS`). Said once per `tests lockreg` run by `xcost_say`, never inside `lock`.
+    // `outer_site` (stall samples only) is untimed. Owed: LOCKREG-XCORE-HINT. LOCKREG-XCORE-COST-KNOB BUILT by B1075. ──
     #[repr(align(64))]
     struct XCost {
         walks: AtomicU64,
@@ -1852,7 +1852,7 @@ mod reg {
     /// One walk by task `tid` on core `cpu` began at TSC `x0` (from `acquire`, after `task_slots` returns).
     #[inline(always)]
     fn xcost_note(tid: u64, cpu: usize, x0: u64) {
-        if tid == 0 {
+        if !CENSUS || tid == 0 { // LOCKREGXCORECOSTKNOB (B1075): off = no rdtsc, no store
             return; // a core's scheduler context walks this core only: not the cross-partition walk
         }
         let d = rdtsc().wrapping_sub(x0);
@@ -1870,7 +1870,7 @@ mod reg {
     /// `[lockreg] xcore walks=<n> sum_cyc=<n> max_cyc=<n> avg_cyc=<n> tsc_mhz=<n>`: every core's census summed (max = the
     /// highest), in TSC ticks; all 0 when unarmed. Once per `tests lockreg` run (`selftest`), after `:: LOCKXCORE:`.
     fn xcost_say() {
-        let (mut walks, mut sum, mut max) = (0u64, 0u64, 0u64);
+        if !CENSUS { serial_println!("[lockreg] xcore census=off"); return; } let (mut walks, mut sum, mut max) = (0u64, 0u64, 0u64); // LOCKREGXCORECOSTKNOB (B1075): the off word, LINE-NEUTRAL fold
         for s in XCOST.iter() {
             walks += s.walks.load(Relaxed);
             sum = sum.wrapping_add(s.sum.load(Relaxed));
@@ -1879,6 +1879,26 @@ mod reg {
         let avg = if walks == 0 { 0 } else { sum / walks };
         let mhz = crate::arch::apic::tsc_hz().max(1000) / 1_000_000;
         serial_println!("[lockreg] xcore walks={} sum_cyc={} max_cyc={} avg_cyc={} tsc_mhz={}", walks, sum, max, avg, mhz);
+    }
+
+    // ── LOCKREGXCORECOSTKNOB (rmbp-ledger B1075, BP-cores-20): the walk census above is a kernel feature, `lockreg_census`
+    // (UNAOS_LOCKREG_CENSUS), DEFAULT OFF. ONE const read inside the existing fns (no off-arm copies): off, `xcost_t0`
+    // and `xcost_note` fold to nothing (no rdtsc, no store, `XCOST` unreferenced), `xcost_say` says `census=off` and
+    // `xcore_leg` says `walks=off` and does not judge the count. Both polarities type-check on every leg. ──
+    const CENSUS: bool = cfg!(feature = "lockreg_census");
+
+    /// The walk's start stamp for `xcost_note` (from `acquire`): the TSC when the census is armed, 0 (no read) when off.
+    #[inline(always)]
+    fn xcost_t0() -> u64 {
+        if CENSUS { rdtsc() } else { 0 }
+    }
+
+    /// `xcore_leg`'s `walks=` word: `<w0>-><w1>` when the census is armed, `off` when it is not.
+    struct XWalks(u64, u64);
+    impl core::fmt::Display for XWalks {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            if CENSUS { write!(f, "{}->{}", self.0, self.1) } else { f.write_str("off") }
+        }
     }
 }
 
