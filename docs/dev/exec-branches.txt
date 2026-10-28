@@ -1208,3 +1208,6 @@ refs/heads/exec-rmbp-retiredrainblitkat   5716421d6 IN-FLIGHT cut 2026-10-28
 refs/heads/exec-rmbp-gen7parkunarmedlive   5716421d6 IN-FLIGHT cut 2026-10-28
 refs/heads/exec-rmbp-preemptoffarmcastsinpassleg   5716421d6 IN-FLIGHT cut 2026-10-28
 refs/heads/exec-rmbp-aethercoloruaedges   5716421d6 IN-FLIGHT cut 2026-10-28
+refs/heads/exec-rmbp-preemptoffarmsleepcheckyieldsite   d1acac0aa IN-FLIGHT cut 2026-10-28
+refs/heads/exec-rmbp-gen7r8door   d1acac0aa IN-FLIGHT cut 2026-10-28
+refs/heads/exec-rmbp-xhciloanptpyieldwaitcount   d1acac0aa IN-FLIGHT cut 2026-10-28
