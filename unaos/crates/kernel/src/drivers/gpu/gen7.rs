@@ -7064,7 +7064,7 @@ mod r8 {
                 );
                 // SAFETY: `bar0` is the IGD BAR0 mapping `igpu::init` published and R1-R7 used on this
                 // boot; it is never unmapped. `fb_blit`'s own contract (the `blit` contract) applies.
-                if super::r8_engine_clear() { unsafe { fb_blit(c.bar0, c.bar0_size, c.bus, c.slot, c.func, c.wake, c.r7, c.geo, &mut w) }; } // GEN7PARKR8 (B1078): a parked or live gen7blit ring refuses the rung (`r8_engine_clear`, gen7.rs tail). LINE-NEUTRAL append
+                if let Some(_door) = super::r8_engine_clear() { unsafe { fb_blit(c.bar0, c.bar0_size, c.bus, c.slot, c.func, c.wake, c.r7, c.geo, &mut w) }; } // GEN7R8DOOR (B1082): the engine door held across fb_blit (`_door` drops at this block's end). GEN7PARKR8 (B1078): a parked or live gen7blit ring refuses the rung (`r8_engine_clear`, gen7.rs tail). LINE-NEUTRAL append
             }
         }
         let r = print_witness(&w, false);
@@ -7939,28 +7939,39 @@ pub(crate) fn held_release(slot: &crate::sync::Mutex<(usize, usize)>, engine: &'
 // on a live or undrained ring, §1.1.11.2 p.76), and its own restore left `park_unwind` judging R8's ring, not the job's.
 // The guard reads the park through the ONE engine door (`blit::engine_take`, park_unwind's own read) and drops it before
 // the arm; a refusal says the rung's own verdict line and leaves DONE unset, so the next `tests gen7` arms R8 once
-// `park_unwind` has unwound the window. No unwind here (park_unwind stays the one re-check point). Owed: GEN7-R8-DOOR
-// (a compositor job that starts between this read and R8's arm is not excluded).
+// `park_unwind` has unwound the window. No unwind here (park_unwind stays the one re-check point). GEN7-R8-DOOR: built by
+// GEN7R8DOOR (B1082), below.
+//
+// GEN7R8DOOR (rmbp-ledger B1082) — in place on B1078's block. B1078 read the park and DROPPED the guard before the arm,
+// so a compositor job starting between that read and `fb_blit` was not excluded. Measured at d1acac0aa: `engine_take`'s
+// interrupt mask spans only `PAGES.try_lock()` and the nested take; `crate::sync::MutexGuard` carries no mask (its Drop is
+// the registry release), so holding the guard is not a masked span (`bcs_job` holds it for a whole job, interrupts on).
+// `fb_blit` is bounded `poll_cycles` (forcewake ack, R8's exec + drain, the R8b band's exec + drain: ~64 ms worst, one-shot
+// under `tests gen7`); its only blocking takes are `held_take`/`held_end` on R8_HELD, so PAGES -> R8_HELD is BP-gpu-9's own
+// direction. `r8_engine_clear` now RETURNS the unparked guard and R8's rung holds it across `fb_blit`: a job started
+// mid-R8 is `busy` -> `Unavailable` (no demote). No new lock, word or door; the refusal line is unchanged.
 // =================================================================================
 
-/// R8's rung guard: true when the BCS engine is free and unparked. A parked gen7blit window or a live job refuses with
-/// `:: gen7: r8 verdict=r8-skip(parked|busy) writes=0 ::`. Without gen7blit no park can exist.
-#[cfg(feature = "gen7r8")]
-#[allow(unreachable_code)]
-fn r8_engine_clear() -> bool {
-    #[cfg(feature = "gen7blit")]
-    {
-        let why = match blit::engine_take(|| ()) {
-            None => "busy",
-            Some((g, ())) => {
-                if g.is_none() {
-                    return true;
-                }
-                "parked"
+/// R8's rung guard: the engine door (PAGES' guard) when the BCS engine is free and unparked, held by the rung across
+/// `fb_blit` (GEN7R8DOOR B1082). A parked gen7blit window or a live job refuses with
+/// `:: gen7: r8 verdict=r8-skip(parked|busy) writes=0 ::` and `None`.
+#[cfg(all(feature = "gen7r8", feature = "gen7blit"))]
+fn r8_engine_clear() -> Option<crate::sync::MutexGuard<'static, Option<blit::Park>>> {
+    let why = match blit::engine_take(|| ()) {
+        None => "busy",
+        Some((g, ())) => {
+            if g.is_none() {
+                return Some(g);
             }
-        };
-        serial_println!(":: gen7: r8 verdict=r8-skip({}) writes=0 note=a-parked-or-live-gen7blit-ring-keeps-START-HEAD-TAIL-until-park_unwind-R8-never-programs-the-BCS-over-it ::", why);
-        return false;
-    }
-    true
+            "parked"
+        }
+    };
+    serial_println!(":: gen7: r8 verdict=r8-skip({}) writes=0 note=a-parked-or-live-gen7blit-ring-keeps-START-HEAD-TAIL-until-park_unwind-R8-never-programs-the-BCS-over-it ::", why);
+    None
+}
+
+/// Without gen7blit there is no BCS engine lock and no park: R8 is always clear.
+#[cfg(all(feature = "gen7r8", not(feature = "gen7blit")))]
+fn r8_engine_clear() -> Option<()> {
+    Some(())
 }
