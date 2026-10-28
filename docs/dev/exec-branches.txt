@@ -1229,4 +1229,4 @@ refs/heads/exec-rmbp-preemptoffarmcastsnowinpassguard   209d2cfad FOLDED-BY-HAND
 refs/heads/exec-rmbp-aethercaptionsidecss   efbe58be9 IN-FLIGHT cut 2026-10-28
 refs/heads/exec-rmbp-aetherfileface   12562cb2b IN-FLIGHT cut 2026-10-28
 refs/heads/exec-rmbp-gen7r8edgeunarmed   a06900ba4 FOLDED-BY-HAND (this commit) 2026-10-27
-refs/heads/exec-rmbp-preemptoffsleepcheckyieldsitewrapperskat   12562cb2b IN-FLIGHT cut 2026-10-28
+refs/heads/exec-rmbp-preemptoffsleepcheckyieldsitewrapperskat   00173eb8f FOLDED-BY-HAND (this commit) 2026-10-27
