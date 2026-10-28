@@ -7064,7 +7064,7 @@ mod r8 {
                 );
                 // SAFETY: `bar0` is the IGD BAR0 mapping `igpu::init` published and R1-R7 used on this
                 // boot; it is never unmapped. `fb_blit`'s own contract (the `blit` contract) applies.
-                unsafe { fb_blit(c.bar0, c.bar0_size, c.bus, c.slot, c.func, c.wake, c.r7, c.geo, &mut w) };
+                if super::r8_engine_clear() { unsafe { fb_blit(c.bar0, c.bar0_size, c.bus, c.slot, c.func, c.wake, c.r7, c.geo, &mut w) }; } // GEN7PARKR8 (B1078): a parked or live gen7blit ring refuses the rung (`r8_engine_clear`, gen7.rs tail). LINE-NEUTRAL append
             }
         }
         let r = print_witness(&w, false);
@@ -7920,6 +7920,8 @@ fn park_kat_unwind() -> bool {
 // class: `held_release`'s body is lifted in place as `held_release_kept` (the not-quiesced word a parameter) and this
 // delegate keeps r9/r10/r11's call sites; `kept_bit` gains `ring-ctl-stuck` (`<< 8`, KEPT_SAID widened to u16) and
 // `park_leg` checks its bit distinct. `park_quiesced` is untouched: a CTL that never clears stays GEN7-PARK-FROZEN's.
+// ==========================================================================}
+
 // =================================================================================
 
 /// B1039's ONE release with the not-quiesced keep worded `ring-not-disabled` (every engine's call; gen7blit's CTL-stuck
@@ -7928,4 +7930,37 @@ fn park_kat_unwind() -> bool {
 #[allow(dead_code)]
 pub(crate) fn held_release(slot: &crate::sync::Mutex<(usize, usize)>, engine: &'static str, disabled: bool, ptes_restored: bool) {
     held_release_kept(slot, engine, disabled, ptes_restored, "ring-not-disabled")
+=======
+// GEN7PARKR8 (rmbp-ledger B1078) — FILE-TAIL append: nothing above it moves. gpu.md's GEN7-PARK-R8: R8's unarmed re-run
+// armed the BCS over a parked ring. Measured at 77e07a58c: `r8::test` replays only when its first run armed (DONE is set
+// `if w.armed`), and `hold_leg`'s second `ladder::run` reaches it again through `gen7_line` AFTER the first `blit::test`
+// (which can park a stalled job's window in PAGES' payload, keeping START/HEAD/TAIL) and BEFORE `park_unwind`. `fb_blit`
+// never takes the engine, so it read the parked registers as its entry images and programmed the ring over them (UNDEFINED
+// on a live or undrained ring, §1.1.11.2 p.76), and its own restore left `park_unwind` judging R8's ring, not the job's.
+// The guard reads the park through the ONE engine door (`blit::engine_take`, park_unwind's own read) and drops it before
+// the arm; a refusal says the rung's own verdict line and leaves DONE unset, so the next `tests gen7` arms R8 once
+// `park_unwind` has unwound the window. No unwind here (park_unwind stays the one re-check point). Owed: GEN7-R8-DOOR
+// (a compositor job that starts between this read and R8's arm is not excluded).
+// =================================================================================
+
+/// R8's rung guard: true when the BCS engine is free and unparked. A parked gen7blit window or a live job refuses with
+/// `:: gen7: r8 verdict=r8-skip(parked|busy) writes=0 ::`. Without gen7blit no park can exist.
+#[cfg(feature = "gen7r8")]
+#[allow(unreachable_code)]
+fn r8_engine_clear() -> bool {
+    #[cfg(feature = "gen7blit")]
+    {
+        let why = match blit::engine_take(|| ()) {
+            None => "busy",
+            Some((g, ())) => {
+                if g.is_none() {
+                    return true;
+                }
+                "parked"
+            }
+        };
+        serial_println!(":: gen7: r8 verdict=r8-skip({}) writes=0 note=a-parked-or-live-gen7blit-ring-keeps-START-HEAD-TAIL-until-park_unwind-R8-never-programs-the-BCS-over-it ::", why);
+        return false;
+    }
+    true
 }
