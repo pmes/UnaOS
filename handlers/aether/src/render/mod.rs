@@ -2844,9 +2844,14 @@ fn frame_walk(
                     }
                 }
 
-                if tag == "img" {
+                // AETHERIMAGEINPUTFETCH (SR461): an image input's bitmap is an img's (layout_core's ONE `is_image_input`): the same
+                // source, store and blit; `image_painted` keeps its value text off the bitmap. The SR455 frame / corner sites read it too.
+                let image_input = layout_core::is_image_input(dom_node);
+                let mut image_painted = false;
+                if tag == "img" || image_input {
                     let src = crate::images::img_source(dom_node, crate::images::SELECTION_VIEWPORT); // AETHERMEDIA SR107: <picture>
                     if let Some(img) = src.as_deref().and_then(crate::images::get) {
+                        image_painted = true;
                         // The painted SPAN clamps to the viewport; the box
                         // ORIGIN must not. Clamping the origin re-anchors a
                         // scrolled-off image to the viewport edge, so it
@@ -2958,8 +2963,7 @@ fn frame_walk(
                 let kind = crate::layout::control_kind(dom_node);
                 let checkable = matches!(kind, Some(crate::layout::Control::Checkbox | crate::layout::Control::Radio));
                 // AETHERIMAGEINPUTBOX (SR455): an image input has no UA edges (layout_core `ua_control`) and Chromium
-                // paints it no control frame: layout_core's ONE image predicate, as the box was sized.
-                let image_input = tag == "input" && el.attributes.borrow().get("type").is_some_and(|t| layout_core::is_image_type(t));
+                // paints it no control frame: layout_core's ONE image predicate (`image_input`, bound at the img arm), as the box was sized.
                 // Chromium's control theme paints a 1px #767676 frame at the
                 // outer edge of the (2px) UA border; checkboxes and radios
                 // are drawn whole below.
@@ -3077,7 +3081,7 @@ fn frame_walk(
                 }
                 // AETHERFILECOLORPAINT (SR456): a file input's Choose-File button and status, a color input's swatch; never its value as text.
                 let file_color = paint_file_color(dom_node, tag, box_sx, box_sy, bw, bh, bord, pad, &inherited, *font, spec.color.unwrap_or((0, 0, 0)), surface, width, height, damage_rects, clip);
-                if is_control && tag != "button" && !checkable && tag != "textarea" && !file_color {
+                if is_control && tag != "button" && !checkable && tag != "textarea" && !file_color && !(image_input && image_painted) { // AETHERIMAGEINPUTFETCH (SR461): a painted image input shows no text
                     let face = crate::fonts::face(&inherited.sel());
                     if let Some(font) = face.or(*font) {
                         let adv = inherited.advancer();
@@ -3089,7 +3093,13 @@ fn frame_walk(
                             .flatten();
                         // AETHERSUBMITCAPTION (SR410): a push button paints its label (forms::button_label: the
                         // value attribute, else "Submit" / "Reset"); it has no dirty value and no placeholder.
-                        let push_label = is_push_button.then(|| crate::forms::button_label(dom_node));
+                        // AETHERIMAGEINPUTFETCH (SR461): an image input with no image paints layout_core's `image_alt_label`, the AltText its box was sized by.
+                        let push_label = if image_input {
+                            let a = el.attributes.borrow();
+                            Some(layout_core::image_alt_label(a.get("alt"), a.get("value")).into_owned())
+                        } else {
+                            is_push_button.then(|| crate::forms::button_label(dom_node))
+                        };
                         let attrs = el.attributes.borrow();
                         // A <select> paints the SELECTED OPTION'S TEXT, not
                         // its submit value: layout publishes the visible label
@@ -3131,7 +3141,7 @@ fn frame_walk(
                             // an overflowing label) and clipped to its padding box (html.css `input { overflow: clip }`).
                             // AETHERCAPTIONCORE (SR438): the caption's x, line top and padding-box clip are ONE layout_core
                             // rule, `caption_box`, the one AETHER.ELF's paint.rs `caption` draws by (raw extents here).
-                            let caption = is_push_button.then(|| {
+                            let caption = (is_push_button || image_input).then(|| { // AETHERIMAGEINPUTFETCH (SR461): the alt label centres as a caption
                                 let (ascent, descent) = text_extents(font, fs);
                                 layout_core::caption_box(box_sx, box_sy, bw, bh, bord, pad, text_w, ascent, descent)
                             });
