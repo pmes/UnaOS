@@ -1163,7 +1163,7 @@ refs/heads/exec-rmbp-masksitesoverflow   9cc29e5cd FOLDED-BY-HAND (this commit) 
 refs/heads/exec-rmbp-aetherpushtrim   bbd0d82b3 IN-FLIGHT cut 2026-10-28
 refs/heads/exec-rmbp-facelivesubscriptiondrop   485bd7a53 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-preemptoffarmwmtable   9e5a5521f IN-FLIGHT cut 2026-10-28
-refs/heads/exec-rmbp-preemptoffarmcasts   9e5a5521f IN-FLIGHT cut 2026-10-28
+refs/heads/exec-rmbp-preemptoffarmcasts   30869b559 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-xhciloanptpyieldout   ebe25e5a3 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-installerprovidercancel   9e5a5521f IN-FLIGHT cut 2026-10-28
 refs/heads/exec-rmbp-gen7heldpark   691d7a415 FOLDED-BY-HAND (this commit) 2026-10-27

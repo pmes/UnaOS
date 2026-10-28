@@ -775,7 +775,7 @@ pub(super) fn track() {
     };
     let union = |a: (i32, i32, i32, i32), b: (i32, i32, i32, i32)| (a.0.min(b.0), a.1.min(b.1), a.2.max(b.2), a.3.max(b.3));
     {
-        let _irq = crate::arch::IrqMask::new();
+        let _span = casts_span(); // PREEMPTOFFARMCASTS (zenbook-ledger Z93): the CASTS publish span is preempt-off with PSTATE.I as the caller had it on aarch64 (`casts_span`, file tail), the mask elsewhere; was `IrqMask::new()`. LINE-NEUTRAL
         let mut g = CASTS.lock();
         let stale = STALE.swap(false, Ordering::AcqRel);
         for c in now.iter() {
@@ -3627,4 +3627,30 @@ pub(super) fn shadows_relay(e: u32) {
 /// Re-lays that took the damage-all since boot.
 pub fn relay_walks() -> u32 {
     RELAY_WALKS.load(Ordering::Relaxed)
+}
+
+// ── PREEMPTOFFARMCASTS (zenbook-ledger Z93, BP-cores-23) — `track`'s CASTS publish span on aarch64 is preempt-off with PSTATE.I
+// as the caller had it (was `IrqMask`). The span holds only CASTS (a spin `sync::Mutex`) over the diff of at most 24 casts
+// against at most 24 published and the copy-out; nothing inside yields, prints or allocates. On aarch64 `track` is reached
+// only from `composite_inner` inside `comp_gate_pass` (`video/wm.rs`), which already holds this same count
+// (`compgate_preempt_hold`), so the take nests. No aarch64 ISR (SGI, `timer::on_tick`, PL011 RX) takes CASTS: an ISR print
+// that asks for a present reaches `comp_gate_pass`, finds COMPGATE held by this core and FOLDS (no `track`, no fill, no
+// `casts_now`). `casts_now` keeps its mask (its out-of-pass callers are not under COMPGATE: PREEMPTOFF-ARM-CASTSNOW owed).
+// Counted in the aarch64 audit's `converted=` (sched.rs `CONVERTED_CASTS`, 1 on `desktop_firmware`). At the tail: no line
+// above moves.
+
+/// PREEMPTOFFARMCASTS: aarch64 — COMPGATE's own guard (`sched::preempt_hold`), taken masked as `preemptoff::scoped` takes it,
+/// held to the end of the caller's block with PSTATE.I as the caller had it; its Drop releases the core it took (Z91's epoch).
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn casts_span() -> crate::arch::sched::PreemptHold {
+    crate::arch::without_interrupts(|| crate::arch::sched::preempt_hold())
+}
+
+/// PREEMPTOFFARMCASTS: every other arch — the masked hold, unchanged (`track_caller`: x86's CLOCKCORE mask site stays `track`'s line).
+#[cfg(not(target_arch = "aarch64"))]
+#[inline]
+#[track_caller]
+fn casts_span() -> crate::arch::IrqMask {
+    crate::arch::IrqMask::new()
 }
