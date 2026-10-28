@@ -104,11 +104,32 @@ fn image_intrinsic_alt() {
     ]);
     let tree = lay(&doc, 800.0, 600.0);
     let b = |id: &str| box_of(&tree, &doc.by_id(id));
-    // The test host has no decoded image, so every image input is its alt-text button.
-    assert_eq!(b("ia"), (b("ia").0, b("ia").1, b("sa").2, b("sa").3), "alt labels the button");
-    assert_eq!(b("i0").2, b("s0").2, "no alt and no value: Submit");
-    assert_eq!(b("iv").2, b("sv").2, "a missing alt falls to the value");
-    assert_eq!(b("ie").2, b("s0").2, "an empty alt and no value: Submit");
+    // The test host has no decoded image, so every image input is its alt-text label. AETHERIMAGEINPUTBOX (SR455):
+    // an image input has no UA edges, so it is the same-labelled submit less its 16 x 6 (padding 1px 6px, border 2px).
+    assert_eq!(b("ia"), (b("ia").0, b("ia").1, b("sa").2 - 16.0, b("sa").3 - 6.0), "alt labels the image input");
+    assert_eq!(b("i0").2, b("s0").2 - 16.0, "no alt and no value: Submit");
+    assert_eq!(b("iv").2, b("sv").2 - 16.0, "a missing alt falls to the value");
+    assert_eq!(b("ie").2, b("s0").2 - 16.0, "an empty alt and no value: Submit");
     // Chromium's AltText: the value stands in only for a MISSING alt; an empty alt is Submit.
-    assert_eq!(b("iev").2, b("s0").2, "an empty alt with a value: Submit");
+    assert_eq!(b("iev").2, b("s0").2 - 16.0, "an empty alt with a value: Submit");
+}
+
+// ---- AETHERIMAGEINPUTBOX (SR455): an image input has no UA edges (html.css) ------------------------------------
+
+#[test]
+fn image_box_has_no_edges() {
+    let doc = page(vec![
+        lone("ia", &[("type", "image"), ("alt", "Search")]),
+        lone("iu", &[("type", " IMAGE "), ("alt", "Search")]),
+        lone("sa", &[("type", "submit"), ("value", "Search")]),
+        lone("ix", &[("type", "image"), ("alt", "Search"), ("style", "padding: 1px 6px; border: 2px solid")]),
+    ]);
+    let tree = lay(&doc, 800.0, 600.0);
+    let b = |id: &str| box_of(&tree, &doc.by_id(id));
+    // The test font: a character is half the size wide, so "Search" is 6 x 13.333 x 0.5 = 40 px of content.
+    assert_eq!(b("ia").2, f32::round(6.0 * 13.333 * 0.5), "the image input is its content, no edges: {}", b("ia").2);
+    assert_eq!((b("ia").2, b("ia").3), (b("sa").2 - 16.0, b("sa").3 - 6.0), "the submit's 16 x 6 UA edges are gone");
+    assert_eq!((b("iu").2, b("iu").3), (b("ia").2, b("ia").3), "the type is trimmed and case-insensitive");
+    assert_eq!((b("ix").2, b("ix").3), (b("sa").2, b("sa").3), "author padding and border still apply");
+    assert!(layout_core::is_image_type(" Image ") && !layout_core::is_image_type("submit"));
 }

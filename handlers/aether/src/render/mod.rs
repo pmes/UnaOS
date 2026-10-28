@@ -2905,10 +2905,13 @@ fn frame_walk(
                 let is_control = matches!(tag, "input" | "textarea" | "select" | "button");
                 let kind = crate::layout::control_kind(dom_node);
                 let checkable = matches!(kind, Some(crate::layout::Control::Checkbox | crate::layout::Control::Radio));
+                // AETHERIMAGEINPUTBOX (SR455): an image input has no UA edges (layout_core `ua_control`) and Chromium
+                // paints it no control frame: layout_core's ONE image predicate, as the box was sized.
+                let image_input = tag == "input" && el.attributes.borrow().get("type").is_some_and(|t| layout_core::is_image_type(t));
                 // Chromium's control theme paints a 1px #767676 frame at the
                 // outer edge of the (2px) UA border; checkboxes and radios
                 // are drawn whole below.
-                let mut border = spec.border.or(if is_control && !checkable {
+                let mut border = spec.border.or(if is_control && !checkable && !image_input {
                     Some([Some((1.0, (118, 118, 118))); 4])
                 } else {
                     None
@@ -3157,7 +3160,7 @@ fn frame_walk(
                 }
                 // Chromium's control frame (fields, selects, textareas) is a rounded rect whose four
                 // corner pixels stay unpainted: keep what is under them.
-                let ua_frame = is_control && !checkable && !is_push_button && spec.border.is_none() && !focused_field;
+                let ua_frame = is_control && !checkable && !is_push_button && !image_input && spec.border.is_none() && !focused_field;
                 let corners: Vec<(u32, u32, [u8; 4])> = if ua_frame {
                     let (x0, y0) = (box_sx.round(), box_sy.round());
                     let (x1, y1) = ((box_sx + bw).round() - 1.0, (box_sy + bh).round() - 1.0);
