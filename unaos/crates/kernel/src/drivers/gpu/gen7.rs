@@ -7612,7 +7612,7 @@ static FLUSH_SEEN: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::
 static RELEASED_BYTES: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 /// One bit per engine: its `held_kept=` line was said this boot.
 #[cfg(any(feature = "gen7r9", feature = "gen7blit"))]
-static KEPT_SAID: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+static KEPT_SAID: core::sync::atomic::AtomicU16 = core::sync::atomic::AtomicU16::new(0); // GEN7PARKNODEMOTE (B1077): u16, the third class (`ring-ctl-stuck`, `kept_bit`) had no free bit
 
 /// `flush_verdict` banks each three-way reading (R6c, R7, R8); 0 and 1 take the new reading, 2 and 3 stay for the boot (a contradiction never decodes).
 #[cfg(any(feature = "gen7r9", feature = "gen7blit"))]
@@ -7630,7 +7630,7 @@ fn flush_bank(verdict: &str) {
 /// after the unwind. Called with the engine serialized (the `tests gen7` path; gen7blit under `PAGES`), never across a
 /// GPU op.
 #[cfg(any(feature = "gen7r9", feature = "gen7blit"))]
-pub(crate) fn held_release(slot: &crate::sync::Mutex<(usize, usize)>, engine: &'static str, disabled: bool, ptes_restored: bool) {
+pub(crate) fn held_release_kept(slot: &crate::sync::Mutex<(usize, usize)>, engine: &'static str, disabled: bool, ptes_restored: bool, not_disabled: &'static str) { // GEN7PARKNODEMOTE (B1077): held_release's body, lifted in place; `not_disabled` is the not-quiesced keep's word (`held_release`, file tail)
     let n = slot.lock().1;
     if n == 0 {
         return;
@@ -7643,7 +7643,7 @@ pub(crate) fn held_release(slot: &crate::sync::Mutex<(usize, usize)>, engine: &'
         return;
     }
     let why = if !disabled {
-        "ring-not-disabled"
+        not_disabled
     } else if !ptes_restored {
         "ptes-not-restored"
     } else {
@@ -7865,16 +7865,16 @@ fn nohold_leg(v: &'static str) -> (&'static str, usize, &'static str) {
 // =================================================================================
 
 /// `held_release`'s once-bit: one per engine (r9 1, r10 2, r11 4, gen7blit 8) for the flush / PTE refusals, the same
-/// bit `<< 4` for `ring-not-disabled` (the not-quiesced keep the compositor's park follows), so neither silences the other.
+/// bit `<< 4` for `ring-not-disabled` (the not-quiesced keep the compositor's park follows), so neither silences the other; `<< 8` for `ring-ctl-stuck` (GEN7PARKNODEMOTE B1077: armed, drained, RING_CTL would not clear).
 #[cfg(any(feature = "gen7r9", feature = "gen7blit"))]
-fn kept_bit(engine: &str, why: &str) -> u8 {
-    let b: u8 = match engine {
+fn kept_bit(engine: &str, why: &str) -> u16 {
+    let b: u16 = match engine {
         "r9" => 1,
         "r10" => 2,
         "r11" => 4,
         _ => 8,
     };
-    if why == "ring-not-disabled" { b << 4 } else { b }
+    if why == "ring-not-disabled" { b << 4 } else if why == "ring-ctl-stuck" { b << 8 } else { b }
 }
 
 /// GEN7ORDER's `park_kat=` term `(verdict, word)`: pure (no lock, no print). gen7blit's flush keep and its park keep
@@ -7883,8 +7883,8 @@ fn kept_bit(engine: &str, why: &str) -> u8 {
 fn park_leg(v: &'static str) -> (&'static str, &'static str) {
     #[cfg(any(feature = "gen7r9", feature = "gen7blit"))]
     {
-        let (flush, park, other) = (kept_bit("blit", "flush-write-silent"), kept_bit("blit", "ring-not-disabled"), kept_bit("r9", "ring-not-disabled"));
-        let k = if flush != 0 && park != 0 && flush & park == 0 && other & park == 0 && park_kat_unwind() { "ok" } else { "miss" }; // GEN7PARKUNWIND (B1073): + the unwind predicate's KAT (file tail)
+        let (flush, park, other) = (kept_bit("blit", "flush-write-silent"), kept_bit("blit", "ring-not-disabled"), kept_bit("r9", "ring-not-disabled")); let stuck = kept_bit("blit", "ring-ctl-stuck"); // GEN7PARKNODEMOTE (B1077): the CTL-stuck keep's bit, distinct from both blit classes and r9's park
+        let k = if flush != 0 && park != 0 && flush & park == 0 && other & park == 0 && stuck != 0 && stuck & (flush | park | other) == 0 && park_kat_unwind() { "ok" } else { "miss" }; // GEN7PARKUNWIND (B1073): + the unwind predicate's KAT (file tail)
         return (if k == "miss" { "FAIL" } else { v }, k);
     }
     (v, "skip(no-release)")
@@ -7909,4 +7909,23 @@ fn park_quiesced(ctl: u32, head: u32, tail: u32) -> bool {
 fn park_kat_unwind() -> bool {
     let t = 0x60;
     !park_quiesced(1, t, t) && !park_quiesced(0, 0, t) && !park_quiesced(0, t - 8, t) && park_quiesced(0, t, t)
+}
+
+// =================================================================================
+// GEN7PARKNODEMOTE (rmbp-ledger B1077) — FILE-TAIL append: nothing above it moves. GEN7PARKUNWIND (B1073) owed
+// GEN7-PARK-NODEMOTE: a gen7blit job whose ring armed and drained but whose RING_CTL would not clear was already parked
+// (bcs_job's `out.armed && !all_disabled`), yet `BcsBlitter::blit`'s stall arm keyed on `!idle` alone, so it said
+// `Unavailable`, never demoted, and every later frame paid a masked engine take, a slot lock and BAR0 reads for a
+// `window-owned` refusal. The stall arm now also takes `!disabled` (the one demote runs once), and the keep says its own
+// class: `held_release`'s body is lifted in place as `held_release_kept` (the not-quiesced word a parameter) and this
+// delegate keeps r9/r10/r11's call sites; `kept_bit` gains `ring-ctl-stuck` (`<< 8`, KEPT_SAID widened to u16) and
+// `park_leg` checks its bit distinct. `park_quiesced` is untouched: a CTL that never clears stays GEN7-PARK-FROZEN's.
+// =================================================================================
+
+/// B1039's ONE release with the not-quiesced keep worded `ring-not-disabled` (every engine's call; gen7blit's CTL-stuck
+/// keep calls `held_release_kept` with `ring-ctl-stuck`).
+#[cfg(any(feature = "gen7r9", feature = "gen7blit"))]
+#[allow(dead_code)]
+pub(crate) fn held_release(slot: &crate::sync::Mutex<(usize, usize)>, engine: &'static str, disabled: bool, ptes_restored: bool) {
+    held_release_kept(slot, engine, disabled, ptes_restored, "ring-not-disabled")
 }

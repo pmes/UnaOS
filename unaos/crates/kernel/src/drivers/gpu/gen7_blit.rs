@@ -73,7 +73,7 @@ pub struct JobOut {
     pub ptes_restored: bool,
     pub setup_us: u64,
     pub bcs_us: u64,
-    pub ring_re: bool, // GEN7HELDONE (B1031): `held_take` handed back BLIT_RING_HELD's block from an earlier job
+    pub ring_re: bool, pub disabled: bool, // GEN7PARKNODEMOTE (B1077): `disabled` is the armed candidate's RING_CTL read-back after the disable write. GEN7HELDONE (B1031): `held_take` handed back BLIT_RING_HELD's block from an earlier job
 }
 
 impl JobOut {
@@ -292,7 +292,7 @@ pub unsafe fn bcs_job(bar0: usize, bar0_size: usize, src: Plane, dst: Plane, rec
             out.fw_restored = fw_ok;
             all_disabled &= disabled;
             if armed {
-                out.armed = true;
+                out.armed = true; out.disabled = disabled; // GEN7PARKNODEMOTE (B1077): an armed, drained ring whose CTL will not clear takes the stall verdict in `blit`. LINE-NEUTRAL append
                 out.cand = cand;
                 all_disabled &= idle; // a ring that did not drain may still be writing: keep the PTEs
                 break;
@@ -305,7 +305,7 @@ pub unsafe fn bcs_job(bar0: usize, bar0_size: usize, src: Plane, dst: Plane, rec
     out.bcs_us = kb::cycles_to_us(cyc);
 
     // ---- unwind the window: only behind a quiesced engine (GEN7PARKUNWIND B1073: `window_unwind`, file tail) ----------
-    out.ptes_restored = window_unwind(bar0, win, base_img, all_disabled); // the PTE restore + read-back + flush, then B1039's ONE release under PAGES
+    out.ptes_restored = window_unwind(bar0, win, base_img, all_disabled, out.armed && out.idle && !out.disabled); // GEN7PARKNODEMOTE (B1077): stuck = armed, drained, RING_CTL not clear (`held_kept=blit:ring-ctl-stuck`). the PTE restore + read-back + flush, then B1039's ONE release under PAGES
     clflush_range(dst.va, dst.len); // the CPU reads what the engine wrote, not a stale line
     if out.armed && !all_disabled {
         // GEN7PARKUNWIND (B1073): the stalled window rides the engine lock's payload for `park_unwind` (file tail)
@@ -355,7 +355,7 @@ impl Blitter for BcsBlitter {
         // caller holds them across blit + wait, the trait's contract).
         match unsafe { bcs_job(b.bar0, b.bar0_size, plane(&job.src), plane(&job.dst), job.rects, "g7b") } {
             Ok(o) if o.clean() => Ok(Fence::DONE),
-            Ok(o) if o.armed && !o.idle => {
+            Ok(o) if o.armed && (!o.idle || !o.disabled) => { // GEN7PARKNODEMOTE (B1077): a drained ring whose CTL will not clear is dead too: the one demote runs once (its window is already parked)
                 ARMED.store(false, AO::Release);
                 kb::demote_bcs(); // a stall demotes, as the CE's Timeout does
                 Err(BlitErr::Timeout)
@@ -643,7 +643,7 @@ unsafe fn ring_restore(bar0: usize, pre: [u32; 4]) -> bool {
 /// bcs_job's window unwind: behind a quiesced engine the `win` PTEs go back to the fill image, are read back with both
 /// neighbours, and `0x101008` is written; then B1039's ONE release decides the ring slot. Returns the PTE read-back.
 /// Called with PAGES held, no slot held.
-unsafe fn window_unwind(bar0: usize, win: usize, base_img: u32, quiesced: bool) -> bool {
+unsafe fn window_unwind(bar0: usize, win: usize, base_img: u32, quiesced: bool, stuck: bool) -> bool { // GEN7PARKNODEMOTE (B1077): `stuck` names the keep `ring-ctl-stuck`
     let slot = |k: usize| GTT_BASE + (BASE_SLOT + k) * 4;
     let (prev_off, next_off) = (GTT_BASE + (BASE_SLOT - 1) * 4, slot(win));
     let mut ptes_restored = false;
@@ -654,7 +654,7 @@ unsafe fn window_unwind(bar0: usize, win: usize, base_img: u32, quiesced: bool) 
         ptes_restored = (0..win).all(|k| rd(bar0, slot(k)) == base_img) && rd(bar0, prev_off) == base_img && rd(bar0, next_off) == base_img;
         wr(bar0, GFX_FLSH, 1); crate::drivers::gpu::gen7::assert_no_slot_held("blit-unmap"); // GEN7SLOTNOHOLD (B1047): no slot guard live across this GPU op
     }
-    crate::drivers::gpu::gen7::held_release(&crate::drivers::gpu::gen7::BLIT_RING_HELD, "blit", quiesced, ptes_restored); // GEN7HELDRELEASE (B1039): the ONE release
+    crate::drivers::gpu::gen7::held_release_kept(&crate::drivers::gpu::gen7::BLIT_RING_HELD, "blit", quiesced, ptes_restored, if stuck { "ring-ctl-stuck" } else { "ring-not-disabled" }); // GEN7PARKNODEMOTE (B1077): the keep's word by class. GEN7HELDRELEASE (B1039): the ONE release
     ptes_restored
 }
 
@@ -678,7 +678,7 @@ pub(super) fn park_unwind() {
         (ctl, head, quiesced, regs)
     };
     // SAFETY: as above; the PTE restore runs only when `quiesced`.
-    let ptes = unsafe { window_unwind(b.bar0, p.win, p.base_img, quiesced) };
+    let ptes = unsafe { window_unwind(b.bar0, p.win, p.base_img, quiesced, ctl & 1 != 0) }; // GEN7PARKNODEMOTE (B1077): a CTL still set keeps bcs_job's own class (one once-bit)
     if quiesced {
         *engine = None;
     }
