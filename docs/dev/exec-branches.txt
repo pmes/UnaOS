@@ -1126,3 +1126,4 @@ refs/heads/exec-rmbp-xhciloanshedkatcontrolus   1af778bd7 FOLDED-BY-HAND (this c
 refs/heads/exec-rmbp-gen7ordermigrate   2b564ce53 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-hidstall25   807ef9888 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-retiredrain   247737d04 IN-FLIGHT cut 2026-10-28
+refs/heads/exec-rmbp-lockregedgexcore   92bea7eb8 IN-FLIGHT cut 2026-10-28
