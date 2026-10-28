@@ -2638,9 +2638,12 @@ fn lpa_vp(v: LengthPercentageAuto, basis: f32) -> LengthPercentageAuto {
 /// `width` / `height` / `min-*` / `max-*` (and `fit-content(%)`) resolve against the viewport too — rewritten as
 /// lengths of the viewport axis in the same step. The original values are kept in `saved` and restored by
 /// [`passes`]. True when a style changed (the caller lays out again).
+/// AETHERABSCB (SR431): an absolutely positioned box whose nearest positioned ancestor is not its parent (CSS 2.2
+/// §10.1.4) takes the same rewrite against that ancestor's padding box, or the initial containing block
+/// ([`abs_containing_block`]); one whose parent is its containing block is left to taffy.
 fn fixed_viewport<H: Host>(tree: &mut LayoutTree<H>, saved: &mut Vec<FixedSaved>) -> bool {
     let (vw, vh) = tree.viewport;
-    let mut ids: Vec<taffy::NodeId> = tree.paint_map.iter().filter(|(_, p)| p.position_kind == Some(3)).map(|(id, _)| *id).collect();
+    let mut ids: Vec<taffy::NodeId> = tree.paint_map.iter().filter(|(_, p)| matches!(p.position_kind, Some(2 | 3))).map(|(id, _)| *id).collect();
     ids.sort_by_key(|id| u64::from(*id));
     let mut changed = false;
     for id in ids {
@@ -2651,6 +2654,17 @@ fn fixed_viewport<H: Host>(tree: &mut LayoutTree<H>, saved: &mut Vec<FixedSaved>
         let Some(spec) = specified(tree, id, saved) else { continue };
         let orig = spec.inset;
         let Some(parent) = tree.taffy.parent(id) else { continue };
+        // AETHERABSCB (SR431): the containing-block rectangle — the viewport for a fixed box, else the nearest
+        // positioned ancestor's padding box (None: the parent is it, taffy's own place stands).
+        let fixed = tree.paint_map.get(&id).and_then(|p| p.position_kind) == Some(3);
+        let (cx, cy, cw, ch) = if fixed {
+            (0.0, 0.0, vw, vh)
+        } else {
+            match abs_containing_block(tree, parent) {
+                Some(r) => r,
+                None => continue,
+            }
+        };
         let Ok(pl) = tree.taffy.layout(parent).cloned() else { continue };
         let (px, py) = chain_origin(tree, parent);
         let (ax, ay) = (px + pl.border.left, py + pl.border.top);
@@ -2661,14 +2675,14 @@ fn fixed_viewport<H: Host>(tree: &mut LayoutTree<H>, saved: &mut Vec<FixedSaved>
             None => v,
         };
         let want = taffy::geometry::Rect {
-            left: side(orig.left, vw, ax),
-            right: side(orig.right, vw, vw - (ax + aw)),
-            top: side(orig.top, vh, ay),
-            bottom: side(orig.bottom, vh, vh - (ay + ah)),
+            left: side(orig.left, cw, ax - cx),
+            right: side(orig.right, cw, (cx + cw) - (ax + aw)),
+            top: side(orig.top, ch, ay - cy),
+            bottom: side(orig.bottom, ch, (cy + ch) - (ay + ah)),
         };
-        let size = taffy::geometry::Size { width: dim_vp(spec.size.width, vw), height: dim_vp(spec.size.height, vh) };
-        let min = taffy::geometry::Size { width: lpa_vp(spec.min.width, vw), height: lpa_vp(spec.min.height, vh) };
-        let max = taffy::geometry::Size { width: lpa_vp(spec.max.width, vw), height: lpa_vp(spec.max.height, vh) };
+        let size = taffy::geometry::Size { width: dim_vp(spec.size.width, cw), height: dim_vp(spec.size.height, ch) };
+        let min = taffy::geometry::Size { width: lpa_vp(spec.min.width, cw), height: lpa_vp(spec.min.height, ch) };
+        let max = taffy::geometry::Size { width: lpa_vp(spec.max.width, cw), height: lpa_vp(spec.max.height, ch) };
         if st.inset == want && st.size == size && st.min_size == min && st.max_size == max {
             continue;
         }
@@ -2705,4 +2719,33 @@ fn record_fixed<H: Host>(tree: &mut LayoutTree<H>, saved: &[FixedSaved]) {
             tree.fixed_at.insert(id, (fx, fy));
         }
     }
+}
+
+// ---- AETHERABSCB (SR431): the containing block of an absolutely positioned box ---------------------------------
+
+/// CSS 2.2 §10.1.4: the containing block of a `position: absolute` box is the padding box of its nearest ancestor
+/// whose `position` is not `static`, else the initial containing block (the viewport rectangle at the canvas
+/// origin). Every box's taffy style is `Relative` ([`base_style`]), so the specified kind is read from
+/// `PaintStyle::position_kind` (1 relative, 2 absolute, 3 fixed, 4 sticky) up the taffy parent chain from
+/// `parent` (anonymous boxes carry none and are skipped). Returns that rectangle in document space, as
+/// [`fixed_viewport`] measures its parent's area; None when `parent` itself is positioned (taffy already lays the
+/// box against it).
+fn abs_containing_block<H: Host>(tree: &LayoutTree<H>, parent: taffy::NodeId) -> Option<(f32, f32, f32, f32)> {
+    let positioned = |n: taffy::NodeId| matches!(tree.paint_map.get(&n).and_then(|p| p.position_kind), Some(1..=4));
+    if positioned(parent) {
+        return None;
+    }
+    let mut cur = tree.taffy.parent(parent);
+    while let Some(n) = cur {
+        if positioned(n) {
+            let l = tree.taffy.layout(n).ok()?;
+            let (x, y) = chain_origin(tree, n);
+            let w = l.size.width - l.border.left - l.border.right - l.scrollbar_size.width;
+            let h = l.size.height - l.border.top - l.border.bottom - l.scrollbar_size.height;
+            return Some((x + l.border.left, y + l.border.top, w, h));
+        }
+        cur = tree.taffy.parent(n);
+    }
+    let (vw, vh) = tree.viewport;
+    Some((0.0, 0.0, vw, vh))
 }
