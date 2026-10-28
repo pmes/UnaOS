@@ -1199,7 +1199,7 @@ refs/heads/exec-rmbp-unafslaneqemu   d4bc338d2 FOLDED-BY-HAND (this commit) 2026
 refs/heads/exec-rmbp-retiredrainkillkat   bdee7e25a FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-gen7parknodemote   beae77145 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-preemptoffarmcastsleg   b3d8f0682 FOLDED-BY-HAND (this commit) 2026-10-27
-refs/heads/exec-rmbp-xhciloanptpyieldptpmarkkat   cbf2963b5 IN-FLIGHT cut 2026-10-28
+refs/heads/exec-rmbp-xhciloanptpyieldptpmarkkat   e29e771b2 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-aetherfilecolorpaint   cbf2963b5 IN-FLIGHT cut 2026-10-28
 refs/heads/exec-rmbp-xhciloanptpyieldqemumtp   77e07a58c IN-FLIGHT cut 2026-10-28
 refs/heads/exec-rmbp-gen7parkr8   77cb3aa6f FOLDED-BY-HAND (this commit) 2026-10-27

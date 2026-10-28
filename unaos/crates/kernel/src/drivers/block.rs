@@ -4679,14 +4679,14 @@ pub fn xhci_loan_yield_kat_arm() -> Result<(), &'static str> {
     if !wait::bounded(1000, || LOAN_YIELD_KAT.load(Ordering::Acquire) == 1) {
         return Err("skip(claimant-late)");
     }
-    let _ = wait::bounded(2, || false); // it is in `claim_xhci_for_io`'s hlt wait now
+    loan_yield_kat_ptp_arm(cpu)?; let _ = wait::bounded(2, || false); // it is in `claim_xhci_for_io`'s hlt wait now. XHCILOANPTPYIELDPTPMARKKAT (Z104): the two PTP claimants armed first (LINE-NEUTRAL)
     Ok(())
 }
 
 /// XHCILOANPTPYIELD: after the KAT's PTP claim is put back, wait (<= 2500 ms) for the claimant to finish.
 #[cfg(all(feature = "uvc", target_arch = "x86_64"))]
 pub fn xhci_loan_yield_kat_settle() {
-    let _ = wait::bounded(2500, || LOAN_YIELD_KAT.load(core::sync::atomic::Ordering::Acquire) >= 3);
+    let _ = wait::bounded(2500, || LOAN_YIELD_KAT.load(core::sync::atomic::Ordering::Acquire) >= 3); loan_yield_kat_ptp_settle(); // XHCILOANPTPYIELDPTPMARKKAT (Z104): the two PTP claimants too (LINE-NEUTRAL)
 }
 
 /// XHCILOANPTPCOPY: PTP/MTP claims through the one path this boot (read by `ptp::loan_path_kat`).
@@ -5359,4 +5359,81 @@ fn loan_ptp_mark_clear(t: u64) {
 #[cfg(all(feature = "uvc", target_arch = "x86_64"))]
 fn loan_ptp_marked(t: u64) -> bool {
     t != 0 && LOAN_PTP_TAKERS.iter().any(|s| s.load(core::sync::atomic::Ordering::Acquire) == t)
+}
+
+// ══════════ XHCILOANPTPYIELDPTPMARKKAT (zenbook-ledger Z104) — the yield KAT arms two PTP claimants in its one window ══════════
+//
+// TAIL-APPENDED (two LINE-NEUTRAL folds: `xhci_loan_yield_kat_arm`'s 2 ms wait line, `xhci_loan_yield_kat_settle`'s wait
+// line). Z100's rule (every concurrent PTP claimant marked, refused inside a window by Z90, the block claimant served) had
+// no KAT case. Beside Z73's block claimant the arm now spawns `LOAN_YIELD_KAT_PTPS` PTP claimants on the same sibling CPU,
+// each through the real `BlockLoan::claim_only` (no camera needed: it takes only controller 0's loan). The count of Z90
+// refusals is NOT judged: the three claimants' takes in the window race on the hlt wake, and when the block claimant wins
+// a PTP claimant meets a raw `Busy`, never Z90's branch. Judged instead, deterministically: (a) both PTP claimants are
+// MARKED before the window opens (`ptp-unmarked` otherwise), (b) neither is served inside a window: a `claim_only` Ok
+// while `ptp::TXN_YIELDED` is set is recorded before its drop, which the holder's re-take waits on (`ptp-took`). Owed:
+// XHCILOAN-PTPYIELD-PTPMARK-KAT-WAITCOUNT (a counted refusal needs the PTP takes ordered ahead of the block claimant's).
+
+/// XHCILOANPTPYIELDPTPMARKKAT: the PTP claimants the yield KAT arms beside its block claimant.
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+const LOAN_YIELD_KAT_PTPS: usize = 2;
+
+/// XHCILOANPTPYIELDPTPMARKKAT: per PTP claimant: 0 idle, 1 about to claim, 3 served after the window, 8 served INSIDE a
+/// window (Z90 / Z100 regressed), 9 refused. Slot i written only by claimant i (and reset by the arm before its spawn).
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+static LOAN_YIELD_KAT_PTP: [core::sync::atomic::AtomicU8; LOAN_YIELD_KAT_PTPS] = [const { core::sync::atomic::AtomicU8::new(0) }; LOAN_YIELD_KAT_PTPS];
+
+/// XHCILOANPTPYIELDPTPMARKKAT: PTP claimant `i` (a task on the block claimant's sibling CPU): one `claim_only`, which marks
+/// it and hlt-waits while the KAT holds the loan; whether it came back inside a yield window is written BEFORE the drop.
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+fn loan_yield_kat_ptp_claimant(i: usize) {
+    use core::sync::atomic::Ordering;
+    LOAN_YIELD_KAT_PTP[i].store(1, Ordering::Release);
+    match BlockLoan::claim_only() {
+        Ok(l) => {
+            let inside = xhci::ptp::TXN_YIELDED.load(Ordering::Acquire);
+            LOAN_YIELD_KAT_PTP[i].store(if inside { 8 } else { 3 }, Ordering::Release);
+            drop(l);
+        }
+        Err(_) => LOAN_YIELD_KAT_PTP[i].store(9, Ordering::Release),
+    }
+}
+
+/// XHCILOANPTPYIELDPTPMARKKAT: spawn the PTP claimants on `cpu`, wait until each has started its claim, then until both
+/// are marked (the KAT holder's own mark was cleared when its `claim_only` returned). `Err` = `skip(claimant-late)` /
+/// `ptp-unmarked` (a FAIL word: Z100's set regressed).
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+fn loan_yield_kat_ptp_arm(cpu: usize) -> Result<(), &'static str> {
+    use core::sync::atomic::Ordering;
+    for (i, s) in LOAN_YIELD_KAT_PTP.iter().enumerate() {
+        s.store(0, Ordering::Release);
+        crate::arch::sched::spawn("ptpyield-ptp", loan_yield_kat_ptp_claimant, i, cpu, crate::arch::sched::PRIO_HIGH);
+    }
+    if !wait::bounded(1000, || LOAN_YIELD_KAT_PTP.iter().all(|s| s.load(Ordering::Acquire) != 0)) {
+        return Err("skip(claimant-late)");
+    }
+    if !wait::bounded(10, || LOAN_PTP_TAKERS.iter().filter(|s| s.load(Ordering::Acquire) != 0).count() >= LOAN_YIELD_KAT_PTPS) {
+        return Err("ptp-unmarked");
+    }
+    Ok(())
+}
+
+/// XHCILOANPTPYIELDPTPMARKKAT: after the KAT's hold, wait (<= 2500 ms) for the PTP claimants to finish (0 = not spawned).
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+fn loan_yield_kat_ptp_settle() {
+    use core::sync::atomic::Ordering;
+    let _ = wait::bounded(2500, || LOAN_YIELD_KAT_PTP.iter().all(|s| { let v = s.load(Ordering::Acquire); v == 0 || v >= 3 }));
+}
+
+/// XHCILOANPTPYIELDPTPMARKKAT: whether a KAT PTP claimant was served inside a yield window (read by `ptp::loan_yield_kat`
+/// after the re-take, beside `xhci_loan_yield_closed_by_ptp`). aarch64: never (no claimant there).
+#[cfg(feature = "uvc")]
+pub fn xhci_loan_yield_kat_ptp_took() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        LOAN_YIELD_KAT_PTP.iter().any(|s| s.load(core::sync::atomic::Ordering::Acquire) == 8)
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
 }
