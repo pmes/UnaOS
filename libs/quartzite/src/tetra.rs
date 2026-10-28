@@ -847,3 +847,232 @@ mod surface_present_tests {
         assert!(matches!(m, Some(SMessage::SurfaceBlit { scroll: None, .. })));
     }
 }
+
+// ---------------------------------------------------------------------------------------------------------------------
+// FACELIVE (LEDGER SR435): the face-push door — a running tetra vessel's tree replaced in place
+// ---------------------------------------------------------------------------------------------------------------------
+
+/// FACELIVE (SR435): the ONE key of a tree (a hash of its `Debug` form): a push whose key equals the newest is a no-op.
+pub fn face_key(node: &TetraNode) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    format!("{node:?}").hash(&mut h);
+    h.finish()
+}
+
+/// FACELIVE (SR435): one in-place change an embassy makes to the tree it shows. `path` is the child indices from the
+/// root (empty = the root). Only the smallest changed node is touched, so a Console keeps its widget (and its bus
+/// subscriber) and a field keeps its typed text and focus.
+#[derive(Clone, Debug)]
+pub enum FacePatch {
+    /// A Console's lines / header changed: written into the existing view.
+    Lines { path: Vec<usize>, console: ConsoleTetra },
+    /// A TextField with the same id and action changed only its placeholder: the field's typed text and focus kept.
+    Field { path: Vec<usize>, node: TetraNode },
+    /// A stack changed its kind or child count: the container kept, its children evaluated afresh.
+    Restack { path: Vec<usize>, node: TetraNode },
+    /// Any other changed node: evaluated afresh in its parent's slot.
+    Replace { path: Vec<usize>, node: TetraNode },
+}
+
+fn face_same(a: &TetraNode, b: &TetraNode) -> bool {
+    format!("{a:?}") == format!("{b:?}")
+}
+
+/// FACELIVE (SR435): the patches that turn the shown tree `old` into `new` (empty when they are equal).
+pub fn face_diff(old: &TetraNode, new: &TetraNode) -> Vec<FacePatch> {
+    fn walk(old: &TetraNode, new: &TetraNode, path: &mut Vec<usize>, out: &mut Vec<FacePatch>) {
+        match (old, new) {
+            (TetraNode::VStack(a), TetraNode::VStack(b)) | (TetraNode::HStack(a), TetraNode::HStack(b)) if a.len() == b.len() => {
+                for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+                    path.push(i);
+                    walk(x, y, path, out);
+                    path.pop();
+                }
+            }
+            (TetraNode::VStack(_) | TetraNode::HStack(_), TetraNode::VStack(_) | TetraNode::HStack(_)) => {
+                out.push(FacePatch::Restack { path: path.clone(), node: new.clone() });
+            }
+            (TetraNode::Console(a), TetraNode::Console(b)) => {
+                if a != b {
+                    out.push(FacePatch::Lines { path: path.clone(), console: b.clone() });
+                }
+            }
+            (TetraNode::TextField { id: ia, action: aa, .. }, TetraNode::TextField { id: ib, action: ab, .. })
+                if ia == ib && format!("{aa:?}") == format!("{ab:?}") =>
+            {
+                if !face_same(old, new) {
+                    out.push(FacePatch::Field { path: path.clone(), node: new.clone() });
+                }
+            }
+            _ => {
+                if !face_same(old, new) {
+                    out.push(FacePatch::Replace { path: path.clone(), node: new.clone() });
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(old, new, &mut Vec::new(), &mut out);
+    out
+}
+
+/// FACELIVE (SR435): how an embassy asks its main thread to apply the door's pending tree.
+pub type FaceWaker = std::sync::Arc<dyn Fn() + Send + Sync>;
+
+/// FACELIVE (SR435): the door's state: the newest key, the tree the embassy shows, the newest pushed tree not yet
+/// applied (latest wins), and the embassy's waker (none until the window opens).
+pub struct FaceDoor {
+    key: Option<u64>,
+    shown: Option<TetraNode>,
+    pending: Option<TetraNode>,
+    waker: Option<FaceWaker>,
+}
+
+impl Default for FaceDoor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FaceDoor {
+    pub const fn new() -> Self {
+        FaceDoor { key: None, shown: None, pending: None, waker: None }
+    }
+
+    /// The embassy evaluates the tree this returns: a push that beat the window's opening wins over `initial`.
+    pub fn open(&mut self, initial: TetraNode, waker: FaceWaker) -> TetraNode {
+        let node = self.pending.take().unwrap_or(initial);
+        self.key = Some(face_key(&node));
+        self.shown = Some(node.clone());
+        self.waker = Some(waker);
+        node
+    }
+
+    /// Store `node` as the pending tree unless its key equals the newest (then nothing changes: `false`); `true` with
+    /// the waker the caller calls once the door's lock is dropped.
+    pub fn push(&mut self, node: TetraNode) -> (bool, Option<FaceWaker>) {
+        let key = face_key(&node);
+        if self.key == Some(key) {
+            return (false, None);
+        }
+        self.key = Some(key);
+        self.pending = Some(node);
+        (true, self.waker.clone())
+    }
+
+    /// The pending tree and the patches from the shown one (the shown tree becomes it); `None` when nothing is pending.
+    pub fn take(&mut self) -> Option<(TetraNode, Vec<FacePatch>)> {
+        let new = self.pending.take()?;
+        let patches = match &self.shown {
+            Some(old) => face_diff(old, &new),
+            None => vec![FacePatch::Restack { path: Vec::new(), node: new.clone() }],
+        };
+        self.shown = Some(new.clone());
+        Some((new, patches))
+    }
+}
+
+/// FACELIVE (SR435): the process's ONE door (one tetra vessel per process), locked briefly by [`push_face`] (any
+/// thread) and [`take_face`] (the embassy's main thread).
+static FACE_DOOR: std::sync::Mutex<FaceDoor> = std::sync::Mutex::new(FaceDoor::new());
+
+fn face_door() -> std::sync::MutexGuard<'static, FaceDoor> {
+    FACE_DOOR.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// FACELIVE (SR435): the embassy's side at `new_tetra_vessel`: the tree to evaluate, and its waker installed.
+pub fn open_face(initial: TetraNode, waker: FaceWaker) -> TetraNode {
+    face_door().open(initial, waker)
+}
+
+/// FACELIVE (SR435): the vessel's side: hand the running window a new tree. `false` (a no-op) when its key equals the
+/// newest pushed or shown tree; else the window is woken to patch itself in place.
+pub fn push_face(node: TetraNode) -> bool {
+    let (pushed, waker) = face_door().push(node);
+    if let Some(wake) = waker {
+        wake();
+    }
+    pushed
+}
+
+/// FACELIVE (SR435): the embassy's main thread: the pending tree (for its SurfaceMap) and the patches to apply.
+pub fn take_face() -> Option<(TetraNode, Vec<FacePatch>)> {
+    face_door().take()
+}
+
+#[cfg(test)]
+mod face_door_tests {
+    use super::{ConsoleLine, ConsoleTetra, FaceDoor, FacePatch, TetraNode, TextAction, face_diff};
+    use bandy::SMessage;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn console(text: &str) -> TetraNode {
+        TetraNode::Console(ConsoleTetra { lines: vec![ConsoleLine { level: "info".into(), source: "card".into(), text: text.into() }], ..Default::default() })
+    }
+    fn button(id: &str, label: &str) -> TetraNode {
+        TetraNode::Button { id: id.into(), label: label.into(), action: SMessage::ConsoleInput(id.into()) }
+    }
+    fn field(placeholder: &str) -> TetraNode {
+        TetraNode::TextField { id: "card.confirm".into(), placeholder: placeholder.into(), action: TextAction::ConsoleInput }
+    }
+    /// The installer's shape: a header beside a pane of console, picks, field, button.
+    fn face(status: &str, picks: usize, placeholder: &str, write: &str) -> TetraNode {
+        TetraNode::HStack(vec![
+            button("installer.unaos", "Install UnaOS"),
+            TetraNode::VStack(vec![
+                console(status),
+                TetraNode::HStack((0..picks).map(|i| button(&format!("card.pick.{i}"), "pick")).collect()),
+                field(placeholder),
+                button("card.write", write),
+            ]),
+        ])
+    }
+
+    /// The diff names only the smallest changed node, by kind.
+    #[test]
+    fn facelive_diff_kinds() {
+        let a = face("idle", 1, "pick a card", "Write");
+        assert!(face_diff(&a, &a.clone()).is_empty());
+        let p = face_diff(&a, &face("written 4 / 8 MiB", 1, "pick a card", "Write"));
+        assert!(matches!(&p[..], [FacePatch::Lines { path, console }] if *path == vec![1, 0] && console.lines[0].text == "written 4 / 8 MiB"), "{p:?}");
+        let p = face_diff(&a, &face("idle", 1, "8 GB sdb", "Write"));
+        assert!(matches!(&p[..], [FacePatch::Field { path, .. }] if *path == vec![1, 2]), "{p:?}");
+        let p = face_diff(&a, &face("idle", 2, "pick a card", "Write"));
+        assert!(matches!(&p[..], [FacePatch::Restack { path, node: TetraNode::HStack(k) }] if *path == vec![1, 1] && k.len() == 2), "{p:?}");
+        let p = face_diff(&a, &face("idle", 1, "pick a card", "Writing"));
+        assert!(matches!(&p[..], [FacePatch::Replace { path, .. }] if *path == vec![1, 3]), "{p:?}");
+        let p = face_diff(&a, &TetraNode::VStack(vec![button("x", "x")]));
+        assert!(matches!(&p[..], [FacePatch::Restack { path, .. }] if path.is_empty()), "{p:?}");
+    }
+
+    /// A same-key push is a no-op (no wake); a changed one pushes once and wakes once; a push before the window opens
+    /// wins its first evaluation; take yields the patches once.
+    #[test]
+    fn facelive_door_push_once() {
+        let woken = Arc::new(AtomicUsize::new(0));
+        let w = woken.clone();
+        let mut door = FaceDoor::new();
+        let early = face("early", 1, "pick a card", "Write");
+        assert_eq!(door.push(early.clone()).0, true);
+        let shown = door.open(face("probe", 1, "pick a card", "Write"), Arc::new(move || {
+            w.fetch_add(1, Ordering::SeqCst);
+        }));
+        assert_eq!(format!("{shown:?}"), format!("{early:?}"), "the early push wins the first evaluation");
+        assert!(door.take().is_none());
+        let (pushed, waker) = door.push(early.clone());
+        assert!(!pushed && waker.is_none(), "same key: a no-op");
+        let next = face("written 1 / 8 MiB", 1, "pick a card", "Write");
+        let (pushed, waker) = door.push(next.clone());
+        assert!(pushed);
+        waker.expect("the window's waker")();
+        assert_eq!(woken.load(Ordering::SeqCst), 1);
+        assert!(!door.push(next.clone()).0, "the pending key is the newest");
+        let (full, patches) = door.take().expect("pending");
+        assert_eq!(format!("{full:?}"), format!("{next:?}"));
+        assert!(matches!(&patches[..], [FacePatch::Lines { .. }]), "{patches:?}");
+        assert!(door.take().is_none());
+        assert_eq!(woken.load(Ordering::SeqCst), 1);
+    }
+}
