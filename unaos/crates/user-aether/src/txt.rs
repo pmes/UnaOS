@@ -156,6 +156,17 @@ impl Txt {
         }
     }
 
+    /// AETHER-CAPTIONEXTENTS (SR453): (ascent, descent) in px UNROUNDED — the primary face's browser line metrics as
+    /// `Engine::line_metrics` scales them, before [`Txt::line_metrics`] rounds them: the host render/mod.rs
+    /// `text_extents` on this ring, what a push button's caption centres its line by; the font8x8 grid is (8, 2).
+    pub fn extents(&self, sel: FontSel, size: f32) -> (f32, f32) {
+        let fs = self.fstyle(sel, size);
+        match self.eng.as_ref().and_then(|e| e.line_metrics(fs.role, fs.size)) {
+            Some((a, d, _)) => (a, d),
+            None => (8.0, 2.0),
+        }
+    }
+
     /// The x-height in px (OS/2 sxHeight of the role's regular face; half the size without one).
     pub fn x_height(&self, sel: FontSel, size: f32) -> f32 {
         let fs = self.fstyle(sel, size);

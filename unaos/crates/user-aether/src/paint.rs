@@ -499,10 +499,11 @@ fn caption(cv: &mut Canvas, cx: &Cx, id: NodeId, ink: &Ink, x: f32, y: f32) {
     // AETHERCAPTIONCORE (SR438): the geometry is layout_core's `caption_box`, the host push arm's rule (its
     // content box, centred line, padding-box clip in f32 as the host's `in_clip`); the baseline adds the
     // half-leading lead from `Fonts::baseline_offset` (read before the borrow_mut below) and rounds as the host.
+    // AETHERCAPTIONEXTENTS (SR453): the line centres on txt.rs `extents` (raw, unrounded), as the host's `text_extents`.
     let lead = layout_core::Fonts::baseline_offset(cx.fonts, ink.sel, ink.size, 0.0);
     let mut t = cx.fonts.0.borrow_mut();
     let tw = t.measure(&label, ink.sel, ink.size);
-    let (a, d, _) = t.line_metrics(ink.sel, ink.size);
+    let (a, d) = t.extents(ink.sel, ink.size);
     let c = layout_core::caption_box(x, y, l.size.width, l.size.height, l.border, l.padding, tw, a, d);
     let base = c.baseline(lead);
     let (px0, py0, px1, py1) = c.clip;
