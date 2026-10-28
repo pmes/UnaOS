@@ -1183,7 +1183,7 @@ refs/heads/exec-rmbp-providercancelwake   469b16733 IN-FLIGHT cut 2026-10-28
 refs/heads/exec-rmbp-facelivefieldmove   9ec9cb41a FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-aethercaptionuaalign   469b16733 IN-FLIGHT cut 2026-10-28
 refs/heads/exec-rmbp-aethercaptionextents   469b16733 IN-FLIGHT cut 2026-10-28
-refs/heads/exec-rmbp-contributereviewstale   469b16733 IN-FLIGHT cut 2026-10-28
+refs/heads/exec-rmbp-contributereviewstale   5b390947b FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-preemptoffarmwmtableroute   169080ce5 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-preemptoffx86sleepcheck   e65af1532 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-xhciloanptpyieldkatloopdrop   117668d5d FOLDED-BY-HAND (this commit) 2026-10-27
