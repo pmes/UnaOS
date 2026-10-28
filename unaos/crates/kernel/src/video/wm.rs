@@ -26703,7 +26703,7 @@ fn winid_selftest() {
     let scoped_ok = PROBE_CELL.load(Ordering::Acquire) == w2;
 
     // LEG 5 — RETIREDRAIN (rmbp-ledger B1055): the drain door. A close flight held on THIS task (the fixture
-    // cannot force a composite in flight on the sibling core across a real close: RETIRE-DRAIN-BLIT-KAT owed) must
+    // forces the composite race on the sibling core across a real close at LEG 9, RETIREDRAINBLITKAT B1079) must
     // keep `close_drain_wait_for` from answering drained inside its bound; once the flight ends it must answer.
     // RETIREDRAINKAT (rmbp-ledger B1072): the door that WAITS on another task's flight and then drains is LEG 6.
     let flight = close_flight_enter(w2);
@@ -26744,12 +26744,18 @@ fn winid_selftest() {
     let (kill_v, _, kill_id) = close_drain_kat(w2, KAT_KILL);
     let kill_ok = kill_v != "0";
 
-    close(w2);
+    // LEG 9 — RETIREDRAINBLITKAT (rmbp-ledger B1079): a REAL close's composite race on the sibling core. A helper holds
+    // the pass's own F4 registration (`BlitGuard::enter()` under `table()`, TABLE dropped at once: no CASTS, no COMPGATE)
+    // while THIS task runs the real `close(w2)`; its `DrainBarrier` must wait for that composite (the helper's release is
+    // published before `close` returns), and the door read after the close must drain. This IS w2's close (it closes w2
+    // on every arm). `skip` / `skip(one-core)` (no helper inside 1 s / no sibling core) fails nothing.
+    let (blit_v, blit_us) = close_drain_blit_kat(w2);
+    let blit_ok = blit_v != "0";
     PROBE_CELL.store(WIN_NONE, Ordering::Release);
 
-    let ok = reg_ok && cleared_ok && recycled_ok && scoped_ok && door_ok && wait_ok && death_ok && kill_ok;
+    let ok = reg_ok && cleared_ok && recycled_ok && scoped_ok && door_ok && wait_ok && death_ok && kill_ok && blit_ok;
     serial_println!(
-        "[winid] selftest register={} cleared={} (held={} after close win={}) recycled={} (w1={} gen={} -> w2={} gen={}) id-scoped={} drain-door={} (held={}/{}/{}us free={} id={} door_id={}) drain-wait={} (waited={}us id={}) drain-death={} (id={}) drain-kill={} (id={}) -> {}",
+        "[winid] selftest register={} cleared={} (held={} after close win={}) recycled={} (w1={} gen={} -> w2={} gen={}) id-scoped={} drain-door={} (held={}/{}/{}us free={} id={} door_id={}) drain-wait={} (waited={}us id={}) drain-death={} (id={}) drain-kill={} (id={}) drain-blit={} (waited={}us) -> {}",
         reg_ok as u8,
         cleared_ok as u8,
         held_after_close,
@@ -26774,6 +26780,8 @@ fn winid_selftest() {
         death_id,
         kill_v,
         kill_id,
+        blit_v,
+        blit_us,
         if ok { "PASS" } else { "FAIL" }
     );
     composite();
@@ -32592,7 +32600,8 @@ fn winid_close_hooks_run(_id: WinId, _h: CloseHooks) {}
 // task's flight the real door waits on and then drains; the RETIREDRAINKAT block below); RETIRE-DRAIN-DEATH-KAT BUILT by
 // RETIREDRAINDEATHKAT (rmbp-ledger B1074: LEG 7, the helper dies holding its flight and its `exit()` gives it back);
 // RETIRE-DRAIN-KILL-KAT BUILT by RETIREDRAINKILLKAT (rmbp-ledger B1076: LEG 8, the helper is KILLED holding its flight); the
-// real-close composite race on the sibling core is still forced by no `tests` door (RETIRE-DRAIN-BLIT-KAT).
+// real-close composite race on the sibling core: RETIRE-DRAIN-BLIT-KAT BUILT by RETIREDRAINBLITKAT (rmbp-ledger B1079: LEG 9,
+// a helper holds the pass's F4 registration while the fixture's real `close` drains on it; the RETIREDRAINBLITKAT block below).
 
 /// RETIREDRAIN — closes between their teardown and their barrier drop.
 #[cfg(any(
@@ -33094,9 +33103,7 @@ fn close_drain_kat(id: WinId, mode: u8) -> (&'static str, u64, WinId) {
     KAT_STATE.store(0, Ordering::Release);
     KAT_KEY.store(0, Ordering::Release);
     KAT_SLOT.store(DRAIN_OWNER_SLOTS, Ordering::Release);
-    let n = crate::arch::sched::online_cpu_count().max(1);
-    let me = crate::arch::sched::meter_current_cpu();
-    let cpu = if n > 1 { (me + 1) % n } else { me };
+    let cpu = close_drain_kat_cpu(); // RETIREDRAINBLITKAT (B1079): the pick, shared with LEG 9
     // RETIREDRAINKILLKAT (B1076): x86 kills a kernel task through its KillSwitch (SHELLTASK2's road), held here.
     #[cfg(target_arch = "x86_64")]
     let kill_sw = alloc::sync::Arc::new(crate::arch::sched::KillSwitch::new());
@@ -33104,13 +33111,10 @@ fn close_drain_kat(id: WinId, mode: u8) -> (&'static str, u64, WinId) {
     {
         if kill {
             let _ = crate::arch::sched::spawn_stack_killable("drain-kat", close_drain_kat_helper, id as usize, cpu, crate::arch::sched::PRIO_NORMAL, 16 * 1024, kill_sw.clone());
-        } else {
-            crate::arch::sched::spawn("drain-kat", close_drain_kat_helper, id as usize, cpu, crate::arch::sched::PRIO_NORMAL);
         }
     }
-    #[cfg(target_arch = "aarch64")]
-    {
-        let _ = crate::arch::sched::spawn_prio("drain-kat", close_drain_kat_helper, id as usize, cpu, crate::arch::sched::PRIO_NORMAL);
+    if !(kill && cfg!(target_arch = "x86_64")) {
+        close_drain_kat_spawn(close_drain_kat_helper, id, cpu); // RETIREDRAINBLITKAT (B1079): the one plain spawn, shared with LEG 9
     }
     if !close_drain_kat_until(1_000, || KAT_STATE.load(Ordering::Acquire) >= KAT_HELD) {
         return ("skip", 0, WIN_NONE);
@@ -33176,6 +33180,148 @@ fn close_drain_kat(id: WinId, mode: u8) -> (&'static str, u64, WinId) {
     }
     let ok = second && drained && (kill || (waited_us > 0 && inflight >= 1)) && done && freed && rec_ok && reaped && died; // RETIREDRAINKILLKAT (B1076)
     (if ok { "1" } else { "0" }, waited_us, if die || kill { close_flight_word_win(held_word) } else { door_id })
+}
+
+// ---- RETIREDRAINBLITKAT (rmbp-ledger B1079; BP-video-18 kept, the seat's MEASURE line) — a real close's composite race ----
+//
+// The door ([`close_drain_wait_for`]) waits on `CLOSE_FLIGHT` alone; `close` holds its flight until its `DrainBarrier`
+// drops, and the barrier waits for `BLIT_ACTIVE == 0`, the composite's in-flight marker (`BlitGuard::enter()`, taken in
+// `composite_inner` under `table()` and held through the stage reads). LEG 6-8 drove only the flight -> door link; LEG 9
+// drives the first: a composite on the sibling core holds a REAL close open. The helper holds the pass's own F4
+// registration OUTSIDE the gate — `{ let _t = table(); BlitGuard::enter() }`, TABLE dropped at once, no CASTS span, no
+// COMPGATE / PreemptHold — because a park inside the real pass is refused as measured: x86 `composite()` never runs
+// `comp_gate_pass` and its COMP_GATE carries WCSER-STEAL (a holder past `COMP_GATE_STEAL_MS` is declared dead); aarch64's
+// pass runs under COMPGATE's PreemptHold (a park there cannot yield and folds every other composite); and
+// `composite_inner` bails before its guard on a headless or busy panel (RETIRE-DRAIN-BLIT-PASS owed). Nothing new counts,
+// records or waits: the real `close`, the real barrier, the real guard, the real door. Ordering: the helper stores
+// [`KAT_RELEASE`] BEFORE its guard's `fetch_sub`, and the barrier reads `BLIT_ACTIVE == 0` with Acquire, so when the
+// fixture's `close` returns it must read RELEASE or DONE. Wire: ` drain-blit=<1|0|skip|skip(one-core)> (waited=<us>us)`.
+// Go-red: make `DrainBarrier::drain_bounded` skip its wait — `close` returns with the helper still holding: `0`.
+
+/// RETIREDRAINBLITKAT — LEG 9's helper state between DOOR and DONE: its composite registration is about to drop.
+/// (4 is [`KAT_LET_GO`].)
+#[cfg(all(
+    feature = "witness",
+    any(
+        all(target_arch = "x86_64", feature = "wc"),
+        all(target_arch = "aarch64", feature = "desktop_firmware")
+    )
+))]
+const KAT_RELEASE: u8 = 5;
+/// RETIREDRAINBLITKAT — LEG 9's helper saw a close of its window IN ITS BARRIER while it held the registration.
+#[cfg(all(
+    feature = "witness",
+    any(
+        all(target_arch = "x86_64", feature = "wc"),
+        all(target_arch = "aarch64", feature = "desktop_firmware")
+    )
+))]
+static KAT_BLIT_SEEN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// RETIREDRAINBLITKAT — the helper's core: the next online core (this core when it is the only one).
+#[cfg(all(
+    feature = "witness",
+    any(
+        all(target_arch = "x86_64", feature = "wc"),
+        all(target_arch = "aarch64", feature = "desktop_firmware")
+    )
+))]
+fn close_drain_kat_cpu() -> usize {
+    let n = crate::arch::sched::online_cpu_count().max(1);
+    let me = crate::arch::sched::meter_current_cpu();
+    if n > 1 { (me + 1) % n } else { me }
+}
+
+/// RETIREDRAINBLITKAT — the plain `drain-kat` spawn of `entry(id)` on `cpu` (LEG 6/7, aarch64 LEG 8, LEG 9).
+#[cfg(all(
+    feature = "witness",
+    any(
+        all(target_arch = "x86_64", feature = "wc"),
+        all(target_arch = "aarch64", feature = "desktop_firmware")
+    )
+))]
+fn close_drain_kat_spawn(entry: fn(usize), id: WinId, cpu: usize) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        crate::arch::sched::spawn("drain-kat", entry, id as usize, cpu, crate::arch::sched::PRIO_NORMAL);
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        let _ = crate::arch::sched::spawn_prio("drain-kat", entry, id as usize, cpu, crate::arch::sched::PRIO_NORMAL);
+    }
+}
+
+/// RETIREDRAINBLITKAT — LEG 9's helper: a composite's F4 registration for window `arg`, held until the fixture is in
+/// its close (bounded 1 s), then until that close is IN ITS BARRIER (flight up, barrier up, the row gone; bounded 1 s),
+/// then [`KAT_HOLD_MS`] more; RELEASE is published before the guard drops, DONE after.
+#[cfg(all(
+    feature = "witness",
+    any(
+        all(target_arch = "x86_64", feature = "wc"),
+        all(target_arch = "aarch64", feature = "desktop_firmware")
+    )
+))]
+fn close_drain_blit_kat_helper(arg: usize) {
+    use core::sync::atomic::Ordering;
+    let id = arg as WinId;
+    let guard = {
+        let _t = table(); // F4's order: the registration under the table lock, as `composite_inner` takes it
+        BlitGuard::enter()
+    };
+    KAT_STATE.store(KAT_HELD, Ordering::Release);
+    let _ = close_drain_kat_until(1_000, || KAT_STATE.load(Ordering::Acquire) == KAT_DOOR);
+    let seen = close_drain_kat_until(1_000, || {
+        CLOSE_FLIGHT.load(Ordering::SeqCst) != 0
+            && DRAIN_PENDING.load(Ordering::Acquire) != 0
+            && info_box(id).is_none()
+    });
+    let _ = close_drain_kat_until(KAT_HOLD_MS, || false);
+    KAT_BLIT_SEEN.store(seen, Ordering::Release);
+    KAT_STATE.store(KAT_RELEASE, Ordering::Release);
+    drop(guard);
+    KAT_STATE.store(KAT_DONE, Ordering::Release);
+}
+
+/// RETIREDRAINBLITKAT — LEG 9's body, and window `id`'s close on every arm: `(verdict, waited_us)`, `waited_us` the real
+/// `close`'s own duration. `"1"` iff the close ran, the helper saw it in its barrier, the helper's release was already
+/// published when `close` returned (its barrier waited for the composite), the helper finished, the door read AFTER
+/// the close drained, and `waited_us > 0`. `"skip"`: `id` not live (nothing closed) or no helper inside 1 s;
+/// `"skip(one-core)"`: no sibling core (the drain's same-core arm would answer, not the race).
+#[cfg(all(
+    feature = "witness",
+    any(
+        all(target_arch = "x86_64", feature = "wc"),
+        all(target_arch = "aarch64", feature = "desktop_firmware")
+    )
+))]
+fn close_drain_blit_kat(id: WinId) -> (&'static str, u64) {
+    use core::sync::atomic::Ordering;
+    if info_box(id).is_none() {
+        return ("skip", 0);
+    }
+    if crate::arch::sched::online_cpu_count() < 2 {
+        close(id);
+        return ("skip(one-core)", 0);
+    }
+    KAT_STATE.store(0, Ordering::Release);
+    KAT_BLIT_SEEN.store(false, Ordering::Release);
+    close_drain_kat_spawn(close_drain_blit_kat_helper, id, close_drain_kat_cpu());
+    if !close_drain_kat_until(1_000, || KAT_STATE.load(Ordering::Acquire) >= KAT_HELD) {
+        KAT_STATE.store(KAT_DOOR, Ordering::Release); // a late helper skips its DOOR wait
+        close(id);
+        return ("skip", 0);
+    }
+    let t0 = crate::hidstall::now_us();
+    KAT_STATE.store(KAT_DOOR, Ordering::Release);
+    let closed = close(id);
+    let waited_us = crate::hidstall::now_us().saturating_sub(t0);
+    let st = KAT_STATE.load(Ordering::Acquire);
+    let released = st == KAT_RELEASE || st == KAT_DONE;
+    let done = close_drain_kat_until(1_000, || KAT_STATE.load(Ordering::Acquire) == KAT_DONE);
+    let seen = KAT_BLIT_SEEN.load(Ordering::Acquire);
+    let (drained, _, _, _) = close_drain_wait_for("drain-blit", CLOSE_DRAIN_WAIT_US, false);
+    let ok = closed && seen && released && done && drained && waited_us > 0;
+    (if ok { "1" } else { "0" }, waited_us)
 }
 
 // ---- CLOSEFLIGHTRESCUE (rmbp-ledger B1064) — a close killed mid-flight gives its flight back at its death ----
