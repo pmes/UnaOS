@@ -106,13 +106,14 @@ fn apply_face() {
                         new.grab_focus();
                     }
                 }
-                crate::tetra::FacePatch::Restack { path, node } => {
+                crate::tetra::FacePatch::Restack { path, node, keep } => {
                     let Some(b) = face_widget(&root, &path).and_then(|w| w.downcast::<Box>().ok()) else { continue };
                     let (orientation, children) = match node {
                         TetraNode::VStack(c) => (Orientation::Vertical, c),
                         TetraNode::HStack(c) => (Orientation::Horizontal, c),
                         _ => continue,
                     };
+                    let held = face_keep_read(&root, &keep); // FACELIVE-FIELDKEEP (SR444): typed text and focus read before the rebuild
                     while let Some(c) = b.first_child() {
                         face_drop(&c); // FACELIVE-SUBSCRIPTION-DROP (SR441)
                         b.remove(&c);
@@ -121,14 +122,17 @@ fn apply_face() {
                     for child in children {
                         b.append(&eval_tetra(child, synapse.clone()));
                     }
+                    face_keep_write(&root, held); // FACELIVE-FIELDKEEP (SR444)
                 }
-                crate::tetra::FacePatch::Replace { path, node } => {
+                crate::tetra::FacePatch::Replace { path, node, keep } => {
                     if path.is_empty() {
                         log::warn!("[quartzite] face root-leaf unpatched");
                         continue;
                     }
                     let Some(old) = face_widget(&root, &path) else { continue };
+                    let held = face_keep_read(&root, &keep); // FACELIVE-FIELDKEEP (SR444)
                     face_swap(&old, &eval_tetra(node, synapse.clone()));
+                    face_keep_write(&root, held); // FACELIVE-FIELDKEEP (SR444)
                 }
             }
         }
@@ -176,5 +180,33 @@ fn face_drop(old: &gtk4::Widget) {
     log::debug!("[quartzite] face subscriptions dropped n={} live={}", gone.len(), live);
     for task in gone {
         task.abort();
+    }
+}
+
+// FACELIVE-FIELDKEEP (LEDGER SR444): a field under a Restack or Replace that the new subtree holds again keeps its typed
+// text and focus: the patch's `keep` names each field's old and new path; the text and focus are read off the old
+// GlyphEntry before the rebuild into a per-patch local and written into the new one after it (the Field arm's calls).
+
+/// The (new path, text, focused) of each kept field, read before its widget leaves.
+fn face_keep_read(root: &gtk4::Widget, keep: &[crate::tetra::FaceKeep]) -> Vec<(Vec<usize>, String, bool)> {
+    keep.iter()
+        .filter_map(|k| {
+            let w = face_widget(root, &k.old)?;
+            let entry = w.downcast_ref::<super::glyph::GlyphEntry>()?;
+            Some((k.new.clone(), entry.text(), w.has_focus()))
+        })
+        .collect()
+}
+
+/// Write each held field's text (and focus) into the rebuilt widget at its new path.
+fn face_keep_write(root: &gtk4::Widget, held: Vec<(Vec<usize>, String, bool)>) {
+    for (path, text, focus) in held {
+        let Some(w) = face_widget(root, &path) else { continue };
+        if let Some(entry) = w.downcast_ref::<super::glyph::GlyphEntry>() {
+            entry.set_text(&text);
+            if focus {
+                w.grab_focus();
+            }
+        }
     }
 }

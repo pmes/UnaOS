@@ -32,6 +32,7 @@ define_class!(
             let text: Retained<NSString> = unsafe { msg_send![sender, stringValue] };
             if let Some(cb) = self.ivars().action.borrow().as_ref() {
                 cb(text.to_string());
+                if unsafe { secure(self) } { let empty = NSString::from_str(""); let _: () = unsafe { msg_send![self, setStringValue: &*empty] }; } // SECRETFIELD-CLEAR (SR449): a secret field clears after its Enter is taken
             }
         }
     }
@@ -42,7 +43,7 @@ pub fn bootstrap_text_field(
     secret: bool,
     text_action: TextAction,
     synapse: Synapse,
-) -> Retained<NSView> {
+) -> (Retained<NSView>, Option<tokio::task::AbortHandle>) {
     unsafe {
         let is_url_bar = matches!(text_action, TextAction::OpenDocument);
         let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(600.0, 24.0));
@@ -74,51 +75,43 @@ pub fn bootstrap_text_field(
         // responder, so this never steals focus from the page surface; while
         // the user is actually typing in the bar (a live field editor) the
         // update is skipped rather than stomping the in-progress text.
-        if is_url_bar {
+        // FACELIVE-URLBAR (LEDGER SR443): the subscription runs through SR441's `tetra_eval::face_subscribe` (its own
+        // named thread + current-thread runtime, hopping back via GCD), so its abort handle goes back to the tetra
+        // evaluator, which records it with `face_held` and aborts it when a face Restack or Replace drops the field.
+        let abort = is_url_bar.then(|| {
             let mtm = MainThreadMarker::new()
                 .expect("bootstrap_text_field must run on the main thread");
             let bound = std::sync::Arc::new(dispatch2::MainThreadBound::new(field.clone(), mtm));
             let mut rx = synapse.subscribe();
-            // AppKit's main thread has no tokio reactor; the subscription gets
-            // its own thread + current-thread runtime and hops back via GCD.
-            std::thread::Builder::new()
-                .name("url-bar".into())
-                .spawn(move || {
-                    let rt = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .expect("url bar subscription runtime");
-                    rt.block_on(async move {
-                        loop {
-                            match rx.recv().await {
-                                Ok(SMessage::BrowserUrlChanged(url)) => {
-                                    let bound = bound.clone();
-                                    dispatch2::DispatchQueue::main().exec_async(move || {
-                                        let mtm = MainThreadMarker::new().unwrap();
-                                        let field = bound.get(mtm);
-                                        let editor: *mut AnyObject =
-                                            msg_send![&*field, currentEditor];
-                                        if !editor.is_null() {
-                                            // User is typing — leave it alone.
-                                            return;
-                                        }
-                                        let s = NSString::from_str(&url);
-                                        let _: () = msg_send![&*field, setStringValue: &*s];
-                                    });
+            super::tetra_eval::face_subscribe("url-bar", async move {
+                loop {
+                    match rx.recv().await {
+                        Ok(SMessage::BrowserUrlChanged(url)) => {
+                            let bound = bound.clone();
+                            dispatch2::DispatchQueue::main().exec_async(move || {
+                                let mtm = MainThreadMarker::new().unwrap();
+                                let field = bound.get(mtm);
+                                let editor: *mut AnyObject =
+                                    msg_send![&*field, currentEditor];
+                                if !editor.is_null() {
+                                    // User is typing — leave it alone.
+                                    return;
                                 }
-                                Ok(_) => {}
-                                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                                    continue
-                                }
-                                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                            }
+                                let s = NSString::from_str(&url);
+                                let _: () = msg_send![&*field, setStringValue: &*s];
+                            });
                         }
-                    });
-                })
-                .expect("spawn url-bar thread");
-        }
+                        Ok(_) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            continue
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            })
+        });
 
-        Retained::cast_unchecked::<NSView>(field)
+        (Retained::cast_unchecked::<NSView>(field), abort)
     }
 }
 
@@ -151,5 +144,21 @@ unsafe fn secure_cell(field: &UnaTextField) {
         let _: () = msg_send![&cell, setBezeled: objc2::runtime::Bool::YES];
         let _: () = msg_send![&cell, setScrollable: objc2::runtime::Bool::YES];
         let _: () = msg_send![field, setCell: &*cell];
+    }
+}
+
+// SECRETFIELD-CLEAR (LEDGER SR449): a secret field (the cell `secure_cell` installed for `TextField { secret: true }`)
+// clears its text after `on_action` fires its Enter, so a second Enter never resends a consumed secret; the find bar's
+// plain cell and every non-secret field keep their text.
+
+/// Whether `field`'s cell is AppKit's `NSSecureTextFieldCell` (installed by [`secure_cell`] iff the node is secret).
+unsafe fn secure(field: &UnaTextField) -> bool {
+    unsafe {
+        let cell: *mut AnyObject = msg_send![field, cell];
+        if cell.is_null() {
+            return false;
+        }
+        let is: objc2::runtime::Bool = msg_send![cell, isKindOfClass: objc2::class!(NSSecureTextFieldCell)];
+        is.as_bool()
     }
 }

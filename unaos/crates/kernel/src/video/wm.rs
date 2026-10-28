@@ -417,7 +417,7 @@ struct TableGuard {
     // the bug, in miniature, at every unlock.
     // `spin 0.12`'s guard is `<'a, T, R>` — the 2-generic form this tree requires.
     inner: MutexGuard<'static, Table, SpinRelax>,
-    _irq: crate::arch::IrqMask,
+    _irq: TableSpan, // PREEMPTOFFARMWMTABLE (zenbook-ledger Z92): the IRQ mask, or the aarch64 preempt-off hold where no ISR can reach TABLE (`TableSpan` / `table_span`, file tail). LINE-NEUTRAL
 }
 
 impl core::ops::Deref for TableGuard {
@@ -440,7 +440,7 @@ impl core::ops::DerefMut for TableGuard {
 fn table() -> TableGuard {
     // Mask BEFORE the acquisition, not after: masking after would leave the spin itself
     // preemptible, and a holder preempted between our acquire and our mask is the same wedge.
-    let _irq = crate::arch::IrqMask::new();
+    let _irq = table_span(); // PREEMPTOFFARMWMTABLE (zenbook-ledger Z92): `table_span` (file tail) — the mask, or on aarch64 without `desktop_firmware` the preempt-off hold with I as the caller had it. LINE-NEUTRAL
     let inner = TABLE.lock();
     // R0 / rtwit — start the TABLE hold timer the instant the lock is held (see `TableGuard`).
     let _hold = crate::rtwit::hold(crate::rtwit::Lock::Table);
@@ -26709,12 +26709,17 @@ fn winid_selftest() {
     // CLOSEFLIGHTID (rmbp-ledger B1068): the held flight's own slot word must name w2 while it is held and read
     // WIN_NONE once it ends (skipped when the flight is unrecorded: untasked fixture or a full registry).
     let flight_slot = flight.1;
-    let held_word = if flight_slot < DRAIN_OWNER_SLOTS { DRAIN_OWNER_WIN[flight_slot].load(Ordering::Acquire) } else { WIN_NONE };
+    let held_word = if flight_slot < DRAIN_OWNER_SLOTS { DRAIN_OWNER_WIN[flight_slot].load(Ordering::Acquire) } else { 0 };
+    // CLOSEFLIGHTOLDEST (rmbp-ledger B1070): the word packs w2 with a non-zero enter sequence.
+    let held_win = close_flight_word_win(held_word);
+    let held_seq = close_flight_word_seq(held_word);
     let (held_drained, held_inflight, held_us, held_id) = close_drain_wait_for("winid-probe", 2_000, false);
     close_flight_end(flight);
-    let after_word = if flight_slot < DRAIN_OWNER_SLOTS { DRAIN_OWNER_WIN[flight_slot].load(Ordering::Acquire) } else { WIN_NONE };
+    let after_word = if flight_slot < DRAIN_OWNER_SLOTS { DRAIN_OWNER_WIN[flight_slot].load(Ordering::Acquire) } else { 0 };
     let (free_drained, _, _, _) = close_drain_wait_for("winid-probe", 20_000, false);
-    let id_ok = flight_slot >= DRAIN_OWNER_SLOTS || (held_word == w2 && after_word == WIN_NONE);
+    // CLOSEFLIGHTOLDEST (B1070): the oldest of one is itself (skipped only when a sibling close is also in flight).
+    let id_ok = flight_slot >= DRAIN_OWNER_SLOTS
+        || (held_win == w2 && held_seq != 0 && after_word == 0 && (held_inflight != 1 || held_id == w2));
     let door_ok = !held_drained && held_inflight >= 1 && free_drained && id_ok;
 
     close(w2);
@@ -26738,7 +26743,7 @@ fn winid_selftest() {
         held_inflight,
         held_us,
         free_drained as u8,
-        held_word,
+        held_win,
         held_id,
         if ok { "PASS" } else { "FAIL" }
     );
@@ -32549,7 +32554,8 @@ fn winid_close_hooks_run(_id: WinId, _h: CloseHooks) {}
 // (`BLIT_ACTIVE`); the door only waits for that drain to end. Atomics only, no lock.
 // Wire, once per boot on the first non-zero wait:
 // `[wm] close drain id=<n> inflight=<n> waited_us=<n> who=<owner> drained=<1|0>` (CLOSEFLIGHTID B1068: `id=` is an
-// open recorded flight's window from `DRAIN_OWNER_WIN`, 0 = none recorded; `who=` is the waiter).
+// open recorded flight's window from `DRAIN_OWNER_WIN`, 0 = none recorded; `who=` is the waiter; CLOSEFLIGHTOLDEST
+// B1070: the OLDEST open recorded flight, the smallest enter sequence packed in the slot word).
 // RETIRE-DRAIN-REST BUILT by RETIREDRAINREST (rmbp-ledger B1060): the door now sits inside metrics::leaked_surf_retire for every caller (dialog, notify, bezel, login, instgui); the rest of this note is history (it belonged at
 // their sites or once inside `metrics::leaked_surf_retire`), CLOSE-FLIGHT-RESCUE BUILT by CLOSEFLIGHTRESCUE (B1064: a
 // close killed mid-flight is released at its death by `drain_release_dead`, the CLOSEFLIGHTRESCUE block below),
@@ -32567,12 +32573,25 @@ static CLOSE_FLIGHT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU
 /// right after its claim, cleared before the slot is freed (Drop before `drain_note_lower`; a death reads it
 /// before the CAS and clears it only if unchanged). Drain raises never write it, so their slots read 0. It
 /// retires `CLOSE_FLIGHT_ID` (the last close entered, which named the wrong close when two overlapped).
+/// CLOSEFLIGHTOLDEST (rmbp-ledger B1070): each word packs the window id (low 32) with the flight's enter
+/// sequence (high 32, from [`CLOSE_FLIGHT_SEQ`], never 0), so a word is non-zero exactly while recorded and the
+/// door can name the OLDEST open flight; the death CAS compares the whole word, so a new occupant closing a
+/// re-issued same id is never erased. 64 B, one array (no parallel age array).
 #[cfg(any(
     all(target_arch = "x86_64", feature = "wc"),
     all(target_arch = "aarch64", feature = "desktop_firmware")
 ))]
-static DRAIN_OWNER_WIN: [core::sync::atomic::AtomicU32; DRAIN_OWNER_SLOTS] =
-    [const { core::sync::atomic::AtomicU32::new(WIN_NONE) }; DRAIN_OWNER_SLOTS];
+static DRAIN_OWNER_WIN: [core::sync::atomic::AtomicU64; DRAIN_OWNER_SLOTS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; DRAIN_OWNER_SLOTS];
+
+/// CLOSEFLIGHTOLDEST (rmbp-ledger B1070) — the close flights' enter sequence (the last one handed out). Only
+/// the order matters: the slot word's Release store publishes it. Wraps after 2^32 recorded closes (0 is
+/// skipped); a wrap can misorder one scan, never a free (the door waits on every flight).
+#[cfg(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+))]
+static CLOSE_FLIGHT_SEQ: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 /// RETIREDRAIN — the once-per-boot latch for the `[wm] close drain` line.
 #[cfg(any(
@@ -32605,7 +32624,7 @@ impl Drop for CloseFlight {
         // CLOSEFLIGHTID (B1068): the slot's window id is cleared BEFORE the slot is freed, so a new occupant's
         // word is never this flight's.
         if self.1 < DRAIN_OWNER_SLOTS {
-            DRAIN_OWNER_WIN[self.1].store(WIN_NONE, core::sync::atomic::Ordering::Release);
+            DRAIN_OWNER_WIN[self.1].store(0, core::sync::atomic::Ordering::Release); // CLOSEFLIGHTOLDEST (B1070): the whole packed word
         }
         drain_note_lower(self.0); // CLOSEFLIGHTRESCUE (B1064): the registry slot BEFORE the count (DrainBarrier::drop's order)
         CLOSE_FLIGHT.fetch_sub(1, core::sync::atomic::Ordering::SeqCst);
@@ -32642,7 +32661,8 @@ fn close_flight_enter(id: WinId) -> CloseFlight {
         .position(|s| s.load(core::sync::atomic::Ordering::Acquire) == key)
         .unwrap_or(DRAIN_OWNER_SLOTS);
     if slot < DRAIN_OWNER_SLOTS {
-        DRAIN_OWNER_WIN[slot].store(id, core::sync::atomic::Ordering::Release);
+        // CLOSEFLIGHTOLDEST (B1070): the id packed with this flight's enter sequence.
+        DRAIN_OWNER_WIN[slot].store(close_flight_word(id, close_flight_seq()), core::sync::atomic::Ordering::Release);
     }
     CloseFlight(key, slot)
 }
@@ -32683,22 +32703,81 @@ pub fn close_drain_wait(who: &'static str) -> bool {
     close_drain_wait_for(who, CLOSE_DRAIN_WAIT_US, true).0
 }
 
-/// CLOSEFLIGHTID (rmbp-ledger B1068) — the window id of an open recorded close flight (the first slot whose
-/// [`DRAIN_OWNER_WIN`] word is set), or `WIN_NONE` when every open flight is unrecorded (untasked, or the
-/// registry full). The registry keeps no age (slots are lowest-free-first), so this is AN open flight, not the
-/// oldest (owed CLOSE-FLIGHT-OLDEST); the door waits on every flight, so any one is honest.
+/// CLOSEFLIGHTOLDEST (rmbp-ledger B1070; was CLOSEFLIGHTID's `close_flight_open_id`, B1068) — the window id of
+/// the OLDEST open recorded close flight (the [`DRAIN_OWNER_WIN`] word with the smallest enter sequence among
+/// the words naming a window), or `WIN_NONE` when every open flight is unrecorded (untasked, or the registry
+/// full). The scan reads eight independent atomics: the oldest flight seen at the wait's entry, one the door
+/// does wait on (it waits on every flight).
 #[cfg(any(
     all(target_arch = "x86_64", feature = "wc"),
     all(target_arch = "aarch64", feature = "desktop_firmware")
 ))]
-fn close_flight_open_id() -> WinId {
+fn close_flight_oldest_id() -> WinId {
+    let mut best: Option<(u32, WinId)> = None;
     for w in DRAIN_OWNER_WIN.iter() {
-        let id = w.load(core::sync::atomic::Ordering::Acquire);
-        if id != WIN_NONE {
-            return id;
+        let word = w.load(core::sync::atomic::Ordering::Acquire);
+        let id = close_flight_word_win(word);
+        if id == WIN_NONE {
+            continue;
+        }
+        let seq = close_flight_word_seq(word);
+        match best {
+            Some((b, _)) if b <= seq => {}
+            _ => best = Some((seq, id)),
         }
     }
-    WIN_NONE
+    match best {
+        Some((_, id)) => id,
+        None => WIN_NONE,
+    }
+}
+
+/// CLOSEFLIGHTOLDEST (B1070) — the next enter sequence (never 0, so a recorded word is never 0).
+#[cfg(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+))]
+fn close_flight_seq() -> u32 {
+    let s = CLOSE_FLIGHT_SEQ
+        .fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+        .wrapping_add(1);
+    if s == 0 {
+        CLOSE_FLIGHT_SEQ
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+            .wrapping_add(1)
+    } else {
+        s
+    }
+}
+
+/// CLOSEFLIGHTOLDEST (B1070) — a slot word: the window id in the low 32, the enter sequence in the high 32.
+#[cfg(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+))]
+#[inline(always)]
+fn close_flight_word(id: WinId, seq: u32) -> u64 {
+    ((seq as u64) << 32) | (id as u64)
+}
+
+/// CLOSEFLIGHTOLDEST (B1070) — a slot word's window id (`WIN_NONE` for an empty word).
+#[cfg(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+))]
+#[inline(always)]
+fn close_flight_word_win(word: u64) -> WinId {
+    word as u32 as WinId
+}
+
+/// CLOSEFLIGHTOLDEST (B1070) — a slot word's enter sequence (0 for an empty word).
+#[cfg(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+))]
+#[inline(always)]
+fn close_flight_word_seq(word: u64) -> u32 {
+    (word >> 32) as u32
 }
 
 /// RETIREDRAIN — the erasing twin: no furniture, no foreign close can clear a cell.
@@ -32724,7 +32803,7 @@ fn close_drain_wait_for(who: &'static str, budget_us: u64, say: bool) -> (bool, 
     if inflight == 0 {
         return (true, 0, 0, WIN_NONE);
     }
-    let id = close_flight_open_id(); // CLOSEFLIGHTID (B1068): a close this wait actually waits on (0 = none recorded)
+    let id = close_flight_oldest_id(); // CLOSEFLIGHTOLDEST (B1070): the oldest close this wait waits on (0 = none recorded)
     let t0 = crate::hidstall::now_us();
     let drained = loop {
         if CLOSE_FLIGHT.load(Ordering::SeqCst) == 0 {
@@ -32772,7 +32851,8 @@ fn close_drain_wait_for(who: &'static str, budget_us: u64, say: bool) -> (bool, 
 // A full registry leaves the flight unrecorded and counted in `DRAIN_UNOWNED` (the registry's one scope
 // number); a close holds two of its eight slots while it drains.
 // Wire, one per released flight: `[wm] close flight released-on-death by=<tid> id=<n> inflight=<n>` (`id=` is
-// the dead flight's own slot word in `DRAIN_OWNER_WIN`: CLOSE-FLIGHT-ID BUILT by CLOSEFLIGHTID, rmbp-ledger B1068).
+// the dead flight's own slot word in `DRAIN_OWNER_WIN`: CLOSE-FLIGHT-ID BUILT by CLOSEFLIGHTID, rmbp-ledger B1068;
+// CLOSEFLIGHTOLDEST, B1070: the word packs id + enter sequence and the clear compares the whole word).
 
 /// CLOSEFLIGHTRESCUE — the registry key a close flight of task `tid` records: `!tid`, or 0 (record nothing)
 /// outside a scheduled task.
@@ -32799,13 +32879,15 @@ fn close_flight_release_dead(task_id: u64) {
     for (i, slot) in DRAIN_OWNERS.iter().enumerate() {
         // CLOSEFLIGHTID (B1068): the dead flight's own window id, read BEFORE the CAS frees the slot (after it a
         // new occupant may write its own); 0 if the task died between its claim and its store.
-        let id = DRAIN_OWNER_WIN[i].load(Ordering::Acquire);
+        let word = DRAIN_OWNER_WIN[i].load(Ordering::Acquire); // CLOSEFLIGHTOLDEST (B1070): the packed word
+        let id = close_flight_word_win(word);
         if slot
             .compare_exchange(key, 0, Ordering::AcqRel, Ordering::Relaxed)
             .is_ok()
         {
-            // CLOSEFLIGHTID (B1068): clear the word only if it is still this flight's (never a new occupant's).
-            let _ = DRAIN_OWNER_WIN[i].compare_exchange(id, WIN_NONE, Ordering::AcqRel, Ordering::Relaxed);
+            // CLOSEFLIGHTID (B1068): clear the word only if it is still this flight's (never a new occupant's);
+            // CLOSEFLIGHTOLDEST (B1070): the WHOLE word (id + sequence), so a re-issued same id is never erased.
+            let _ = DRAIN_OWNER_WIN[i].compare_exchange(word, 0, Ordering::AcqRel, Ordering::Relaxed);
             // The slot is ours and no other caller can hold it, so this lower is owed exactly once.
             CLOSE_FLIGHT.fetch_sub(1, Ordering::SeqCst);
             serial_println!(
@@ -32825,3 +32907,72 @@ fn close_flight_release_dead(task_id: u64) {
 )))]
 #[inline(always)]
 fn close_flight_release_dead(_task_id: u64) {}
+
+// ══ PREEMPTOFFARMWMTABLE (zenbook-ledger Z92; BP-cores-23, the seat's MEASURE line) — the TABLE bracket ══
+// `table()` is the sole TABLE take (WEDGE-7). Its bracket was the IRQ mask on both arches; on aarch64 without
+// `desktop_firmware` it is now the preempt-off count (COMPGATE's `PreemptHold`, taken masked around the core read, PSTATE.I
+// as the caller had it): WEDGE-7's invariant — no TABLE holder is ever switched out — holds because both aarch64
+// involuntary switch paths decline on the count and no TABLE critical section yields (the 108 takes measured at 9e5a5521f;
+// every DrainBarrier is outside TABLE, B1055's order), and a masked contender still spins masked on a RUNNING holder only.
+// No ISR on those builds reaches TABLE. The desktops KEEP the mask: there the timer ISR's witness print routes into the
+// console window (`fbcon::route_present_banded` -> `present_rows_outcome_owned` -> `table()`), which would spin on a holder
+// it interrupted on its own core. Owed: PREEMPTOFF-ARM-WMTABLE-ROUTE (fbcon must not present from IRQ context).
+
+/// PREEMPTOFFARMWMTABLE (Z92): `TableGuard`'s bracket — the preempt-off hold (dropped after the lock).
+#[cfg(all(target_arch = "aarch64", not(feature = "desktop_firmware")))]
+type TableSpan = crate::arch::sched::PreemptHold;
+/// PREEMPTOFFARMWMTABLE (Z92): `TableGuard`'s bracket — the IRQ mask (x86, the aarch64 desktops), as before.
+#[cfg(not(all(target_arch = "aarch64", not(feature = "desktop_firmware"))))]
+type TableSpan = crate::arch::IrqMask;
+
+/// PREEMPTOFFARMWMTABLE (Z92): take the bracket BEFORE the lock (the spin itself must not be switched out). Masked around
+/// the core read and the increment, as `preemptoff::scoped` takes it; the outermost take records this line as the holder
+/// site (Z89) and the guard keeps its epoch (Z91).
+#[cfg(all(target_arch = "aarch64", not(feature = "desktop_firmware")))]
+#[inline(always)]
+fn table_span() -> TableSpan {
+    crate::arch::without_interrupts(|| crate::arch::sched::preempt_hold())
+}
+/// PREEMPTOFFARMWMTABLE (Z92): the mask, exactly the expression `table()` took before.
+#[cfg(not(all(target_arch = "aarch64", not(feature = "desktop_firmware"))))]
+#[inline(always)]
+fn table_span() -> TableSpan {
+    crate::arch::IrqMask::new()
+}
+
+/// PREEMPTOFFARMWMTABLE (Z92): the aarch64 audit's `converted=` term (1 where `table()` is preempt-off, 0 on the desktops).
+#[cfg(target_arch = "aarch64")]
+pub const CONVERTED_WMTABLE: u32 = cfg!(not(feature = "desktop_firmware")) as u32;
+
+/// PREEMPTOFFARMWMTABLE (Z92) leg (`wmtable_leg=`, aarch64 `tests preemptaudit`): through the real `table()`, from this
+/// unmasked task: I stays on and the count is held inside; from a masked caller the take leaves it masked; the count is
+/// free after. `skip(route)` on the desktops (the mask is kept), `skip(masked)` from a masked caller.
+#[cfg(target_arch = "aarch64")]
+pub fn wmtable_leg() -> &'static str {
+    if cfg!(feature = "desktop_firmware") {
+        return "skip(route)";
+    }
+    if crate::arch::irqs_masked() {
+        return "skip(masked)";
+    }
+    let (irq_on, held) = {
+        let _t = table();
+        (!crate::arch::irqs_masked(), crate::arch::sched::preemptoff::witness().0)
+    };
+    let masked_on = crate::arch::without_interrupts(|| {
+        let _t = table();
+        !crate::arch::irqs_masked()
+    });
+    let released = !crate::arch::sched::preemptoff::witness().0;
+    if !irq_on {
+        "masked"
+    } else if !held {
+        "free"
+    } else if masked_on {
+        "unmasked"
+    } else if !released {
+        "leaked"
+    } else {
+        "ok"
+    }
+}
