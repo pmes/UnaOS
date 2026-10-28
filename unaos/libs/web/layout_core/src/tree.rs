@@ -707,7 +707,7 @@ fn control_intrinsic<H: Host, F: Fonts + ?Sized>(node: &H::Node, fonts: &F, font
             // AETHER-CONTROLINTRINSIC).
             let t = attr("type").unwrap_or_default();
             let value = attr("value");
-            let push = matches!(t.trim().to_ascii_lowercase().as_str(), "submit" | "reset" | "button");
+            let push = is_push_type(&t);
             let label = button_label(if push { t.as_str() } else { "submit" }, value.as_deref());
             Some((text_advance(fonts, &label, font.0, font.1), button_line_height(fonts, font.0, font.1)))
         }
@@ -743,6 +743,16 @@ pub fn button_label<'a>(ty: &str, value: Option<&'a str>) -> alloc::borrow::Cow<
     } else {
         Cow::Borrowed("")
     }
+}
+
+/// AETHERPUSHTRIM (SR440): whether an `<input>`'s raw `type` attribute names a push button (submit, reset, button),
+/// trimmed and compared ASCII case-insensitively as `button_label` reads it: the ONE predicate the intrinsic size
+/// (`control_intrinsic`), the host paint's push arm (render/mod.rs) and AETHER.ELF's caption (paint.rs) all call, so a
+/// padded type (`type=" submit "`) is sized, labelled and painted as the same push button. Narrower than
+/// `control_kind`'s `Control::Button` (which also covers image / file / color).
+pub fn is_push_type(ty: &str) -> bool {
+    let ty = ty.trim();
+    ty.eq_ignore_ascii_case("submit") || ty.eq_ignore_ascii_case("reset") || ty.eq_ignore_ascii_case("button")
 }
 
 /// Controls the UA sheet sizes as border-box: buttons, selects, and the

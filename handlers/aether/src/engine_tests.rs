@@ -4101,4 +4101,32 @@ mod tests {
         let (right, top) = rect(include_str!("../tests/data/headerband/screenshot-facts.html"), "#acct");
         assert!((right - 1802.0).abs() <= 0.5 && (top - 6.0).abs() <= 0.5, "#acct against the initial containing block at right 1802 top 6: got {right}, {top}");
     }
+
+    /// AETHERPUSHTRIM (SR440): a push button's padded / mixed-case type (`type=" Submit "`) is the same push button as
+    /// its plain twin: layout_core's ONE `is_push_type` (trimmed, as `control_intrinsic` sized it) drives the host
+    /// paint's push arm, so the padded box is as wide as the twin's and paints the same centred caption ink (before,
+    /// the untrimmed host predicate painted it as a text field: a left-aligned value, and nothing for a reset button
+    /// without one).
+    #[test]
+    fn push_trim_caption_paints() {
+        assert!(layout_core::is_push_type(" SUBMIT ") && layout_core::is_push_type("reset") && layout_core::is_push_type("\tButton\n"));
+        assert!(!layout_core::is_push_type(" image ") && !layout_core::is_push_type("text") && !layout_core::is_push_type(""));
+        let html = r#"<!doctype html><html><body>
+            <input type=" Submit " id="ps" value="Go"><br><input type="submit" id="ts" value="Go"><br>
+            <input type=" reset " id="pr"><br><input type="reset" id="tr">
+        </body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 200));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        for (padded, twin) in [("ps", "ts"), ("pr", "tr")] {
+            let w = |e: &mut crate::AetherEngine, id: &str| js_num(e, &format!("document.getElementById('{id}').getBoundingClientRect().width"));
+            let (pw, tw) = (w(&mut engine, padded), w(&mut engine, twin));
+            assert!((pw - tw).abs() <= 0.5, "{padded}: the padded type sizes as its twin ({pw} vs {tw})");
+            let (pn, pcx, pbx) = caption_ink(&mut engine, padded);
+            let (tn, tcx, tbx) = caption_ink(&mut engine, twin);
+            assert!(pn > 0 && tn > 0, "{padded}: both paint caption ink ({pn}, {tn})");
+            assert!((pn as f64 - tn as f64).abs() <= 0.15 * tn as f64 && ((pcx - pbx) - (tcx - tbx)).abs() <= 1.0, "{padded}: the padded type paints its twin's caption (ink {pn} vs {tn}, offset {} vs {})", pcx - pbx, tcx - tbx);
+        }
+    }
 }

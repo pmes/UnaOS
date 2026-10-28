@@ -2943,11 +2943,8 @@ fn frame_walk(
                             .attributes
                             .borrow()
                             .get("type")
-                            .map(|t| {
-                                let t = t.to_ascii_lowercase();
-                                matches!(t.as_str(), "submit" | "button" | "reset")
-                            })
-                            .unwrap_or(false));
+                            // AETHERPUSHTRIM (SR440): layout_core's ONE push predicate (trimmed, as the box was sized).
+                            .is_some_and(|t| layout_core::is_push_type(t)));
                 if is_push_button {
                     inherited.center_box = Some((content_x, content_y, content_w, content_h));
                 }
