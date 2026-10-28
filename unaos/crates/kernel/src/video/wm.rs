@@ -26706,17 +26706,23 @@ fn winid_selftest() {
     // cannot force a composite in flight on the sibling core across a real close: RETIRE-DRAIN-KAT owed) must
     // keep `close_drain_wait_for` from answering drained inside its bound; once the flight ends it must answer.
     let flight = close_flight_enter(w2);
-    let (held_drained, held_inflight, held_us) = close_drain_wait_for("winid-probe", 2_000, false);
+    // CLOSEFLIGHTID (rmbp-ledger B1068): the held flight's own slot word must name w2 while it is held and read
+    // WIN_NONE once it ends (skipped when the flight is unrecorded: untasked fixture or a full registry).
+    let flight_slot = flight.1;
+    let held_word = if flight_slot < DRAIN_OWNER_SLOTS { DRAIN_OWNER_WIN[flight_slot].load(Ordering::Acquire) } else { WIN_NONE };
+    let (held_drained, held_inflight, held_us, held_id) = close_drain_wait_for("winid-probe", 2_000, false);
     close_flight_end(flight);
-    let (free_drained, _, _) = close_drain_wait_for("winid-probe", 20_000, false);
-    let door_ok = !held_drained && held_inflight >= 1 && free_drained;
+    let after_word = if flight_slot < DRAIN_OWNER_SLOTS { DRAIN_OWNER_WIN[flight_slot].load(Ordering::Acquire) } else { WIN_NONE };
+    let (free_drained, _, _, _) = close_drain_wait_for("winid-probe", 20_000, false);
+    let id_ok = flight_slot >= DRAIN_OWNER_SLOTS || (held_word == w2 && after_word == WIN_NONE);
+    let door_ok = !held_drained && held_inflight >= 1 && free_drained && id_ok;
 
     close(w2);
     PROBE_CELL.store(WIN_NONE, Ordering::Release);
 
     let ok = reg_ok && cleared_ok && recycled_ok && scoped_ok && door_ok;
     serial_println!(
-        "[winid] selftest register={} cleared={} (held={} after close win={}) recycled={} (w1={} gen={} -> w2={} gen={}) id-scoped={} drain-door={} (held={}/{}/{}us free={}) -> {}",
+        "[winid] selftest register={} cleared={} (held={} after close win={}) recycled={} (w1={} gen={} -> w2={} gen={}) id-scoped={} drain-door={} (held={}/{}/{}us free={} id={} door_id={}) -> {}",
         reg_ok as u8,
         cleared_ok as u8,
         held_after_close,
@@ -26732,6 +26738,8 @@ fn winid_selftest() {
         held_inflight,
         held_us,
         free_drained as u8,
+        held_word,
+        held_id,
         if ok { "PASS" } else { "FAIL" }
     );
     composite();
@@ -32540,7 +32548,8 @@ fn winid_close_hooks_run(_id: WinId, _h: CloseHooks) {}
 // NOT a second barrier and not a blit counter: the close's own `DrainBarrier` already waits out every blit
 // (`BLIT_ACTIVE`); the door only waits for that drain to end. Atomics only, no lock.
 // Wire, once per boot on the first non-zero wait:
-// `[wm] close drain id=<n> inflight=<n> waited_us=<n> who=<owner> drained=<1|0>`.
+// `[wm] close drain id=<n> inflight=<n> waited_us=<n> who=<owner> drained=<1|0>` (CLOSEFLIGHTID B1068: `id=` is an
+// open recorded flight's window from `DRAIN_OWNER_WIN`, 0 = none recorded; `who=` is the waiter).
 // RETIRE-DRAIN-REST BUILT by RETIREDRAINREST (rmbp-ledger B1060): the door now sits inside metrics::leaked_surf_retire for every caller (dialog, notify, bezel, login, instgui); the rest of this note is history (it belonged at
 // their sites or once inside `metrics::leaked_surf_retire`), CLOSE-FLIGHT-RESCUE BUILT by CLOSEFLIGHTRESCUE (B1064: a
 // close killed mid-flight is released at its death by `drain_release_dead`, the CLOSEFLIGHTRESCUE block below),
@@ -32553,12 +32562,17 @@ fn winid_close_hooks_run(_id: WinId, _h: CloseHooks) {}
 ))]
 static CLOSE_FLIGHT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
-/// RETIREDRAIN — the id of the last close that entered its flight (for the once-line only).
+/// CLOSEFLIGHTID (rmbp-ledger B1068) — the window id of the close flight holding each `DRAIN_OWNERS` slot,
+/// parallel to it (32 B). Non-zero ONLY while a close flight occupies that slot: written by the slot's owner
+/// right after its claim, cleared before the slot is freed (Drop before `drain_note_lower`; a death reads it
+/// before the CAS and clears it only if unchanged). Drain raises never write it, so their slots read 0. It
+/// retires `CLOSE_FLIGHT_ID` (the last close entered, which named the wrong close when two overlapped).
 #[cfg(any(
     all(target_arch = "x86_64", feature = "wc"),
     all(target_arch = "aarch64", feature = "desktop_firmware")
 ))]
-static CLOSE_FLIGHT_ID: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(WIN_NONE);
+static DRAIN_OWNER_WIN: [core::sync::atomic::AtomicU32; DRAIN_OWNER_SLOTS] =
+    [const { core::sync::atomic::AtomicU32::new(WIN_NONE) }; DRAIN_OWNER_SLOTS];
 
 /// RETIREDRAIN — the once-per-boot latch for the `[wm] close drain` line.
 #[cfg(any(
@@ -32580,7 +32594,7 @@ const CLOSE_DRAIN_WAIT_US: u64 = 250_000;
     all(target_arch = "x86_64", feature = "wc"),
     all(target_arch = "aarch64", feature = "desktop_firmware")
 ))]
-struct CloseFlight(u64); // CLOSEFLIGHTRESCUE (B1064): the DRAIN_OWNERS key this flight recorded (`!tid`, 0 = none)
+struct CloseFlight(u64, usize); // CLOSEFLIGHTRESCUE (B1064): the DRAIN_OWNERS key this flight recorded (`!tid`, 0 = none); CLOSEFLIGHTID (B1068): its slot (`DRAIN_OWNER_SLOTS` = unrecorded)
 
 #[cfg(any(
     all(target_arch = "x86_64", feature = "wc"),
@@ -32588,6 +32602,11 @@ struct CloseFlight(u64); // CLOSEFLIGHTRESCUE (B1064): the DRAIN_OWNERS key this
 ))]
 impl Drop for CloseFlight {
     fn drop(&mut self) {
+        // CLOSEFLIGHTID (B1068): the slot's window id is cleared BEFORE the slot is freed, so a new occupant's
+        // word is never this flight's.
+        if self.1 < DRAIN_OWNER_SLOTS {
+            DRAIN_OWNER_WIN[self.1].store(WIN_NONE, core::sync::atomic::Ordering::Release);
+        }
         drain_note_lower(self.0); // CLOSEFLIGHTRESCUE (B1064): the registry slot BEFORE the count (DrainBarrier::drop's order)
         CLOSE_FLIGHT.fetch_sub(1, core::sync::atomic::Ordering::SeqCst);
     }
@@ -32607,15 +32626,25 @@ type CloseFlight = ();
     all(target_arch = "aarch64", feature = "desktop_firmware")
 ))]
 fn close_flight_enter(id: WinId) -> CloseFlight {
-    CLOSE_FLIGHT_ID.store(id, core::sync::atomic::Ordering::Relaxed);
     CLOSE_FLIGHT.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
     // CLOSEFLIGHTRESCUE (B1064): record the flight against its task AFTER the raise, so a death release never
     // lowers a count the raise had not yet paid for (`drain_bounded`'s order). Untasked (key 0) records nothing.
     let key = close_flight_key(drain_owner_id());
-    if key != 0 {
-        drain_note_raise(key);
+    if key == 0 {
+        return CloseFlight(0, DRAIN_OWNER_SLOTS);
     }
-    CloseFlight(key)
+    drain_note_raise(key);
+    // CLOSEFLIGHTID (B1068): the slot the claim took. Exact: a task holds at most ONE `!tid` slot (nothing inside
+    // `close`'s flight closes again on the same task), and only this task or its own death writes `key`. Not
+    // found = the registry was full (counted unowned): the id stays unrecorded.
+    let slot = DRAIN_OWNERS
+        .iter()
+        .position(|s| s.load(core::sync::atomic::Ordering::Acquire) == key)
+        .unwrap_or(DRAIN_OWNER_SLOTS);
+    if slot < DRAIN_OWNER_SLOTS {
+        DRAIN_OWNER_WIN[slot].store(id, core::sync::atomic::Ordering::Release);
+    }
+    CloseFlight(key, slot)
 }
 
 /// RETIREDRAIN — the erasing twin.
@@ -32654,6 +32683,24 @@ pub fn close_drain_wait(who: &'static str) -> bool {
     close_drain_wait_for(who, CLOSE_DRAIN_WAIT_US, true).0
 }
 
+/// CLOSEFLIGHTID (rmbp-ledger B1068) — the window id of an open recorded close flight (the first slot whose
+/// [`DRAIN_OWNER_WIN`] word is set), or `WIN_NONE` when every open flight is unrecorded (untasked, or the
+/// registry full). The registry keeps no age (slots are lowest-free-first), so this is AN open flight, not the
+/// oldest (owed CLOSE-FLIGHT-OLDEST); the door waits on every flight, so any one is honest.
+#[cfg(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+))]
+fn close_flight_open_id() -> WinId {
+    for w in DRAIN_OWNER_WIN.iter() {
+        let id = w.load(core::sync::atomic::Ordering::Acquire);
+        if id != WIN_NONE {
+            return id;
+        }
+    }
+    WIN_NONE
+}
+
 /// RETIREDRAIN — the erasing twin: no furniture, no foreign close can clear a cell.
 #[cfg(not(any(
     all(target_arch = "x86_64", feature = "wc"),
@@ -32670,14 +32717,14 @@ pub fn close_drain_wait(_who: &'static str) -> bool {
     all(target_arch = "x86_64", feature = "wc"),
     all(target_arch = "aarch64", feature = "desktop_firmware")
 ))]
-fn close_drain_wait_for(who: &'static str, budget_us: u64, say: bool) -> (bool, u32, u64) {
+fn close_drain_wait_for(who: &'static str, budget_us: u64, say: bool) -> (bool, u32, u64, WinId) {
     use core::sync::atomic::Ordering;
     core::sync::atomic::fence(Ordering::SeqCst);
     let inflight = CLOSE_FLIGHT.load(Ordering::SeqCst);
     if inflight == 0 {
-        return (true, 0, 0);
+        return (true, 0, 0, WIN_NONE);
     }
-    let id = CLOSE_FLIGHT_ID.load(Ordering::Relaxed);
+    let id = close_flight_open_id(); // CLOSEFLIGHTID (B1068): a close this wait actually waits on (0 = none recorded)
     let t0 = crate::hidstall::now_us();
     let drained = loop {
         if CLOSE_FLIGHT.load(Ordering::SeqCst) == 0 {
@@ -32703,7 +32750,7 @@ fn close_drain_wait_for(who: &'static str, budget_us: u64, say: bool) -> (bool, 
             drained as u8
         );
     }
-    (drained, inflight, waited_us)
+    (drained, inflight, waited_us, id)
 }
 
 // ---- CLOSEFLIGHTRESCUE (rmbp-ledger B1064) — a close killed mid-flight gives its flight back at its death ----
@@ -32725,7 +32772,7 @@ fn close_drain_wait_for(who: &'static str, budget_us: u64, say: bool) -> (bool, 
 // A full registry leaves the flight unrecorded and counted in `DRAIN_UNOWNED` (the registry's one scope
 // number); a close holds two of its eight slots while it drains.
 // Wire, one per released flight: `[wm] close flight released-on-death by=<tid> id=<n> inflight=<n>` (`id=` is
-// `CLOSE_FLIGHT_ID`, the last close that entered: exact when one close is in flight; owed CLOSE-FLIGHT-ID).
+// the dead flight's own slot word in `DRAIN_OWNER_WIN`: CLOSE-FLIGHT-ID BUILT by CLOSEFLIGHTID, rmbp-ledger B1068).
 
 /// CLOSEFLIGHTRESCUE — the registry key a close flight of task `tid` records: `!tid`, or 0 (record nothing)
 /// outside a scheduled task.
@@ -32749,17 +32796,22 @@ fn close_flight_release_dead(task_id: u64) {
     if key == 0 {
         return;
     }
-    for slot in DRAIN_OWNERS.iter() {
+    for (i, slot) in DRAIN_OWNERS.iter().enumerate() {
+        // CLOSEFLIGHTID (B1068): the dead flight's own window id, read BEFORE the CAS frees the slot (after it a
+        // new occupant may write its own); 0 if the task died between its claim and its store.
+        let id = DRAIN_OWNER_WIN[i].load(Ordering::Acquire);
         if slot
             .compare_exchange(key, 0, Ordering::AcqRel, Ordering::Relaxed)
             .is_ok()
         {
+            // CLOSEFLIGHTID (B1068): clear the word only if it is still this flight's (never a new occupant's).
+            let _ = DRAIN_OWNER_WIN[i].compare_exchange(id, WIN_NONE, Ordering::AcqRel, Ordering::Relaxed);
             // The slot is ours and no other caller can hold it, so this lower is owed exactly once.
             CLOSE_FLIGHT.fetch_sub(1, Ordering::SeqCst);
             serial_println!(
                 "[wm] close flight released-on-death by={} id={} inflight={}",
                 task_id,
-                CLOSE_FLIGHT_ID.load(Ordering::Relaxed),
+                id,
                 CLOSE_FLIGHT.load(Ordering::SeqCst)
             );
         }
