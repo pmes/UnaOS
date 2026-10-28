@@ -173,10 +173,10 @@ pub fn platform_fallback(c: char, want: Style) -> Option<&'static Face> {
     let d = db::db();
     for &i in d.fallback_order() {
         let info = &d.faces[i];
-        let Some(f) = load_face(info) else { continue };
-        if f.font.glyph_index(c) == 0 {
-            continue;
+        if d.covers(i, c) != Some(true) {
+            continue; // AETHERFONTDBFALLBACK (SR425): the bounded cmap read decides; only the face that has `c` loads whole
         }
+        let Some(f) = load_face(info) else { continue };
         let picked = d
             .select(&info.families[0], want)
             .and_then(|(k, b, o)| load_face_synth(d.faces.get(k)?, b, o))

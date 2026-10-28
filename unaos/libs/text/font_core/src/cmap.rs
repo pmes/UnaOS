@@ -65,6 +65,20 @@ impl<'a> CmapSubtable<'a> {
         if g == 0 { None } else { Some(g) }
     }
 
+    /// A Unicode code point's glyph as `Font::glyph_index` gives it (0 = .notdef / unmapped), with the Symbol
+    /// (3,0) rule: Symbol fonts park their repertoire at U+F000. AETHERFONTDBFALLBACK (SR425): one rule for a
+    /// parsed face and for a cmap table read alone (text_host's bounded fallback scan).
+    pub fn unicode_glyph(&self, c: char) -> u16 {
+        let cp = c as u32;
+        if let Some(g) = self.glyph(cp) {
+            return g;
+        }
+        if self.platform_id == 3 && self.encoding_id == 0 && cp < 0x100 {
+            return self.glyph(0xF000 | cp).unwrap_or(0);
+        }
+        0
+    }
+
     /// Every (code point, glyph) pair this subtable maps, in code point order (format 4/6/12/0 only).
     /// Used by the KATs to compare whole-table contents with the fontTools oracle.
     pub fn for_each(&self, mut f: impl FnMut(u32, u16)) {

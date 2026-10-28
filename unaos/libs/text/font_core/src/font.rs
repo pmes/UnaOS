@@ -381,16 +381,7 @@ impl<'a> Font<'a> {
 
     /// Unicode code point → glyph id (0 = .notdef / unmapped).
     pub fn glyph_index(&self, c: char) -> u16 {
-        let Some(st) = self.best_cmap else { return 0 };
-        let cp = c as u32;
-        if let Some(g) = st.glyph(cp) {
-            return g;
-        }
-        if st.platform_id == 3 && st.encoding_id == 0 && cp < 0x100 {
-            // Symbol fonts park their repertoire at U+F000.
-            return st.glyph(0xF000 | cp).unwrap_or(0);
-        }
-        0
+        self.best_cmap.map_or(0, |st| st.unicode_glyph(c))
     }
 
     /// Every (code point, glyph) pair of the Unicode cmap, sorted by code point (empty when the face has no

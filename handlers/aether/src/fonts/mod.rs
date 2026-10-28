@@ -353,10 +353,10 @@ pub fn fallback_for(c: char, sel: &FontSel) -> Option<&'static Face> {
     let mut found = None;
     for &i in d.fallback_order() {
         let info = &d.faces[i];
-        let Some(f) = load_face(info) else { continue };
-        if f.font.glyph_index(c) == 0 {
-            continue;
+        if d.covers(i, c) != Some(true) {
+            continue; // AETHERFONTDBFALLBACK (SR425): the bounded cmap read decides; only the face that has `c` loads whole
         }
+        let Some(f) = load_face(info) else { continue };
         let fam = info.families[0].clone();
         found = d.select(&fam, sel.style()).and_then(db_face).filter(|g| g.font.glyph_index(c) != 0).or(Some(f));
         break;
