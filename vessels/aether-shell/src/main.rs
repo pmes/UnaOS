@@ -1167,6 +1167,7 @@ fn main() {
                     id: "url".into(),
                     placeholder: "Enter URL...".into(),
                     action: quartzite::tetra::TextAction::OpenDocument,
+                    secret: false, // LANDINGSECRETFIELD (SR432)
                 },
             ]);
 

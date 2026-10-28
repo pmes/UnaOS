@@ -11654,7 +11654,7 @@ pub fn drain_release_dead(task_id: u64) -> bool {
     if task_id == 0 {
         return false;
     }
-    let mut freed = 0u64;
+    let mut freed = 0u64; close_flight_release_dead(task_id);
     for slot in DRAIN_OWNERS.iter() {
         if slot
             .compare_exchange(task_id, 0, Ordering::AcqRel, Ordering::Relaxed)
@@ -32542,8 +32542,8 @@ fn winid_close_hooks_run(_id: WinId, _h: CloseHooks) {}
 // Wire, once per boot on the first non-zero wait:
 // `[wm] close drain id=<n> inflight=<n> waited_us=<n> who=<owner> drained=<1|0>`.
 // RETIRE-DRAIN-REST BUILT by RETIREDRAINREST (rmbp-ledger B1060): the door now sits inside metrics::leaked_surf_retire for every caller (dialog, notify, bezel, login, instgui); the rest of this note is history (it belonged at
-// their sites or once inside `metrics::leaked_surf_retire`), CLOSE-FLIGHT-RESCUE (a task killed inside the
-// drain's aarch64 yield strands the count as it strands `DRAIN_PENDING`: retires defer, never free early),
+// their sites or once inside `metrics::leaked_surf_retire`), CLOSE-FLIGHT-RESCUE BUILT by CLOSEFLIGHTRESCUE (B1064: a
+// close killed mid-flight is released at its death by `drain_release_dead`, the CLOSEFLIGHTRESCUE block below),
 // RETIRE-DRAIN-KAT (the sibling-core race is not forced by any `tests` door).
 
 /// RETIREDRAIN — closes between their teardown and their barrier drop.
@@ -32580,7 +32580,7 @@ const CLOSE_DRAIN_WAIT_US: u64 = 250_000;
     all(target_arch = "x86_64", feature = "wc"),
     all(target_arch = "aarch64", feature = "desktop_firmware")
 ))]
-struct CloseFlight;
+struct CloseFlight(u64); // CLOSEFLIGHTRESCUE (B1064): the DRAIN_OWNERS key this flight recorded (`!tid`, 0 = none)
 
 #[cfg(any(
     all(target_arch = "x86_64", feature = "wc"),
@@ -32588,6 +32588,7 @@ struct CloseFlight;
 ))]
 impl Drop for CloseFlight {
     fn drop(&mut self) {
+        drain_note_lower(self.0); // CLOSEFLIGHTRESCUE (B1064): the registry slot BEFORE the count (DrainBarrier::drop's order)
         CLOSE_FLIGHT.fetch_sub(1, core::sync::atomic::Ordering::SeqCst);
     }
 }
@@ -32608,7 +32609,13 @@ type CloseFlight = ();
 fn close_flight_enter(id: WinId) -> CloseFlight {
     CLOSE_FLIGHT_ID.store(id, core::sync::atomic::Ordering::Relaxed);
     CLOSE_FLIGHT.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
-    CloseFlight
+    // CLOSEFLIGHTRESCUE (B1064): record the flight against its task AFTER the raise, so a death release never
+    // lowers a count the raise had not yet paid for (`drain_bounded`'s order). Untasked (key 0) records nothing.
+    let key = close_flight_key(drain_owner_id());
+    if key != 0 {
+        drain_note_raise(key);
+    }
+    CloseFlight(key)
 }
 
 /// RETIREDRAIN — the erasing twin.
@@ -32698,3 +32705,71 @@ fn close_drain_wait_for(who: &'static str, budget_us: u64, say: bool) -> (bool, 
     }
     (drained, inflight, waited_us)
 }
+
+// ---- CLOSEFLIGHTRESCUE (rmbp-ledger B1064) — a close killed mid-flight gives its flight back at its death ----
+//
+// RETIREDRAIN (B1055) owed CLOSE-FLIGHT-RESCUE: `close` counts itself in `CLOSE_FLIGHT` from its teardown to its
+// barrier drop through the RAII [`CloseFlight`], and an aarch64 task killed inside that window (the drain's
+// `yield_now` -> `kill_check_current` -> `exit()`) switches off its stack under `panic-strategy: abort`, so the
+// guard's Drop never runs and the count stays up for the boot: every later [`close_drain_wait`] times out and
+// every grown-surface retire defers forever (a leak, never an early free).
+//
+// THE ONE RESCUE rides DRAINRESCUE, which already cures the same stranding for `DRAIN_PENDING`: the flight is
+// recorded in the SAME registry (`DRAIN_OWNERS`, through `drain_note_raise` / `drain_note_lower`) and released
+// from the SAME death hook (`drain_release_dead`, called at every death site on both arches: aarch64 `exit()`
+// and the off-CPU reap, x86 `exit()` and `terminate`). No second registry, no second hook, no lock. The lock
+// registry (`sync::release_task`) is NOT the door: CLOSE_FLIGHT is a counter, not a `sync::Mutex`.
+//
+// THE KEY is `!tid`, never `tid` (that is a drain raise) and never a top-bit tag (leg 7's `RESCUE_FAKE_TID`
+// already has bit 63 set and would collide). Real task ids are small, so `!tid` never equals a drain entry.
+// A full registry leaves the flight unrecorded and counted in `DRAIN_UNOWNED` (the registry's one scope
+// number); a close holds two of its eight slots while it drains.
+// Wire, one per released flight: `[wm] close flight released-on-death by=<tid> id=<n> inflight=<n>` (`id=` is
+// `CLOSE_FLIGHT_ID`, the last close that entered: exact when one close is in flight; owed CLOSE-FLIGHT-ID).
+
+/// CLOSEFLIGHTRESCUE — the registry key a close flight of task `tid` records: `!tid`, or 0 (record nothing)
+/// outside a scheduled task.
+#[cfg(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+))]
+fn close_flight_key(tid: u64) -> u64 {
+    if tid == 0 { 0 } else { !tid }
+}
+
+/// CLOSEFLIGHTRESCUE — **the cure.** Give back every close flight `task_id` recorded and can no longer end.
+/// Called from [`drain_release_dead`] (line-neutral, after its `task_id == 0` return). Idempotent by the CAS.
+#[cfg(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+))]
+fn close_flight_release_dead(task_id: u64) {
+    use core::sync::atomic::Ordering;
+    let key = close_flight_key(task_id);
+    if key == 0 {
+        return;
+    }
+    for slot in DRAIN_OWNERS.iter() {
+        if slot
+            .compare_exchange(key, 0, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
+            // The slot is ours and no other caller can hold it, so this lower is owed exactly once.
+            CLOSE_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+            serial_println!(
+                "[wm] close flight released-on-death by={} id={} inflight={}",
+                task_id,
+                CLOSE_FLIGHT_ID.load(Ordering::Relaxed),
+                CLOSE_FLIGHT.load(Ordering::SeqCst)
+            );
+        }
+    }
+}
+
+/// CLOSEFLIGHTRESCUE — the erasing twin: no close flight is ever counted off the desktop builds.
+#[cfg(not(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+)))]
+#[inline(always)]
+fn close_flight_release_dead(_task_id: u64) {}

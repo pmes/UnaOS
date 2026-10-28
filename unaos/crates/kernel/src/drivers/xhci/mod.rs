@@ -19520,7 +19520,7 @@ fn poll_loan(round: usize) -> Option<crate::drivers::block::BlockLoan> {
     match crate::drivers::block::xhci_poll_loan() {
         Ok(l) => Some(l),
         Err(e) => {
-            if round == 0 && matches!(e, XhciClaimError::Busy) {
+            if !crate::drivers::block::xhci_poll_skip_take() && round == 0 && matches!(e, XhciClaimError::Busy) { // XHCILOANPTPYIELDPOLLSKIP (zenbook-ledger Z86): a take refused inside a PTP yield window is not stamped claim-busy (Z76's rule). LINE-NEUTRAL
                 crate::video::lag::xhci_busy();
             }
             None

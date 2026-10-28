@@ -111,8 +111,14 @@ fn list(host: &Host) {
     }
 }
 
-/// THE window: the Install UnaOS pane beside the Install apps pane.
+/// THE window as it opens: the four panes from fresh probes (FACELIVE SR435: the serve task pushes the live ones).
 fn tree() -> TetraNode {
+    tree_of([card::face(), landing::face(), provider::face(), contribute::face()])
+}
+
+/// THE window: the Install UnaOS pane (the header over the card, landing, provider and contribute panes) beside the
+/// Install apps pane.
+fn tree_of(panes: [TetraNode; 4]) -> TetraNode {
     let os = Os::this();
     let header = |id: &str, label: &str| TetraNode::Button {
         id: id.into(),
@@ -134,7 +140,7 @@ fn tree() -> TetraNode {
         ])
     });
     TetraNode::HStack(vec![
-        TetraNode::VStack(vec![header("installer.unaos", "Install UnaOS"), card::face(), landing::face(), provider::face(), contribute::face()]), // INSTALLERLANDING (SR415): the landing pane under the card pane; INSTALLERPROVIDER (SR424): the provider pane under it; INSTALLERCONTRIBUTE (SR428): the contribute pane under that
+        TetraNode::VStack(std::iter::once(header("installer.unaos", "Install UnaOS")).chain(panes).collect()), // INSTALLERLANDING (SR415): the landing pane under the card pane; INSTALLERPROVIDER (SR424): the provider pane under it; INSTALLERCONTRIBUTE (SR428): the contribute pane under that
         TetraNode::VStack(std::iter::once(header("installer.apps", "Install apps")).chain(rows).collect()),
     ])
 }
@@ -155,6 +161,7 @@ async fn serve(mut rx: tokio::sync::broadcast::Receiver<SMessage>, host: Host) {
     use tokio::sync::broadcast::error::RecvError;
     let host = std::sync::Arc::new(host);
     let mut card = card::Card::probe(); let mut landing = landing::Landing::probe_in(host.checkout.clone()); let mut provider = provider::Provider::probe_in(host.checkout.clone()); let mut contribute = contribute::Contribute::probe_in(host.checkout.clone()); // INSTALLERLANDING (SR415): the landing face's state, landing under the probed checkout (LINE-NEUTRAL); INSTALLERPROVIDER (SR424): the provider face's state; INSTALLERCONTRIBUTE (SR428): the contribute face's state
+    let mut face_dirty = false; // FACELIVE (SR435): an input or a poll changed a pane: rebuild the face once and push it to the open window
     let mut tick = tokio::time::interval(CARD_TICK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -165,8 +172,9 @@ async fn serve(mut rx: tokio::sync::broadcast::Receiver<SMessage>, host: Host) {
                     tokio::task::spawn_blocking(move || verb(&host, &text));
                 }
                 Ok(SMessage::ConsoleInput(line)) => {
+                    face_dirty = true; // FACELIVE (SR435)
                     if !card::on_input(&mut card, &line) && !provider::on_input(&mut provider, &line) && !contribute::on_input(&mut contribute, &line) && !landing::on_input(&mut landing, &line) { // INSTALLERLANDING (SR415): the card face first, then the landing face; INSTALLERPROVIDER (SR424): the provider face before landing, so a pasted key never reaches the unafs mount as a card password; INSTALLERCONTRIBUTE (SR428): contribute takes only `contribute …` lines, before landing
-                        say(&format!("[installer] input ignored line={line}"));
+                        say(&format!("[installer] input ignored bytes={}", line.len())); // LANDINGSECRETFIELD (SR432): an untaken line may be a secret field's: its length, never its text
                     }
                 }
                 Ok(_) | Err(RecvError::Lagged(_)) => {}
@@ -174,7 +182,10 @@ async fn serve(mut rx: tokio::sync::broadcast::Receiver<SMessage>, host: Host) {
             },
             _ = tick.tick() => {}
         }
-        card::poll(&mut card); landing::poll(&mut landing); provider::poll(&mut provider); contribute::poll(&mut contribute); // INSTALLERLANDING (SR415): drain the landing read beside the card write (LINE-NEUTRAL); INSTALLERPROVIDER (SR424): and the provider's reply; INSTALLERCONTRIBUTE (SR428): and the contribute commit's verdict
+        face_dirty |= card.poll() | landing.poll() | provider.poll() | contribute.poll(); // INSTALLERLANDING (SR415): drain the landing read beside the card write (LINE-NEUTRAL); INSTALLERPROVIDER (SR424): and the provider's reply; INSTALLERCONTRIBUTE (SR428): and the contribute commit's verdict; FACELIVE (SR435): the methods' "changed" bools, all four drained (no short circuit)
+        if std::mem::take(&mut face_dirty) {
+            quartzite::tetra::push_face(tree_of([card::face_of(&card), landing::face_of(&landing), provider::face_of(&provider), contribute::face_of(&contribute)])); // FACELIVE (SR435): the door drops an unchanged face (one key) and patches the window in place
+        }
     }
 }
 
@@ -422,5 +433,26 @@ mod tests {
         assert!(entry.starts_with("[Desktop Entry]\nType=Application\n"), "{entry}");
         assert!(entry.contains("\nName=Aether\n") && entry.contains("\nExec=/home/u/.local/bin/aether-shell\n"), "{entry}");
         assert_eq!(aether.run_line(Os::MacOs).unwrap(), "cargo run -p aether-shell --features macos --release");
+    }
+
+    /// FACELIVE (SR435): the serve task's live face (its own states, as `serve` probes them) patches the window
+    /// `tree()` opened in place: nothing at the root, a pane or a pane's own stack is restacked or replaced, and a face
+    /// diffed with itself is no patch at all (the door's same-key push is a no-op).
+    #[test]
+    fn installer_face_live_patches_in_place() {
+        use quartzite::tetra::{FacePatch, face_diff};
+        let checkout = Some(root());
+        let live = crate::tree_of([
+            crate::card::face_of(&crate::card::Card::probe()),
+            crate::landing::face_of(&crate::landing::Landing::probe_in(checkout.clone())),
+            crate::provider::face_of(&crate::provider::Provider::probe_in(checkout.clone())),
+            crate::contribute::face_of(&crate::contribute::Contribute::probe_in(checkout)),
+        ]);
+        for p in face_diff(&crate::tree(), &live) {
+            if let FacePatch::Restack { path, .. } | FacePatch::Replace { path, .. } = &p {
+                assert!(path.len() >= 3, "the window was restacked above a pane's controls: {p:?}");
+            }
+        }
+        assert!(face_diff(&live, &live.clone()).is_empty());
     }
 }

@@ -427,7 +427,7 @@ mod reg {
             c => c,
         };
         let mut m = p.mask.load(Acquire);
-        if c != 0 && edges { task_slots(tid, cpu, m, |_, _, t| { let a = tag_class(t); if a != 0 && a != c { edge(a, c, tid, cpu); } }); } // LOCKREGOUTERXCORE (B1057): the walk is `task_slots` (after this fn), the ONE walk `outer_site` shares. LOCKREGEDGEXCORE (B1056): EVERY partition for this task — a hold taken before a preemption + steal stays in its old core's partition (release frees it by the guard's slot); tid 0 = a core's scheduler context, this core only. LINE-NEUTRAL rewrite
+        if c != 0 && edges { let x0 = rdtsc(); task_slots(tid, cpu, m, |_, _, t| { let a = tag_class(t); if a != 0 && a != c { edge(a, c, tid, cpu); } }); xcost_note(tid, cpu, x0); } // LOCKREGXCORECOST (B1062): the walk's TSC span into this core's census (`xcost_note`, reg tail; tid 0 not counted). LOCKREGOUTERXCORE (B1057): the walk is `task_slots` (after this fn), the ONE walk `outer_site` shares. LOCKREGEDGEXCORE (B1056): EVERY partition for this task — a hold taken before a preemption + steal stays in its old core's partition (release frees it by the guard's slot); tid 0 = a core's scheduler context, this core only. LINE-NEUTRAL rewrite
         let i = loop {
             let free = !m;
             if free == 0 {
@@ -904,7 +904,7 @@ mod reg {
             tag_tid(max_tag),
             tag_cpu(max_tag), POISON_N.load(Acquire), POISON_LOST.load(Relaxed), cword, bword, kword, EARLY.load(Relaxed), UNGS.load(Relaxed), FULL.load(Relaxed), sh.0, sh.1, fullw, STALE.load(Relaxed), fuw
         );
-        reggap_leg(); xcore_leg(); // LOCKREGEDGEXCORE (B1056): the cross-partition order walk's KAT, its own `:: LOCKXCORE:` line after REGGAP's. REGGAP (B1021): the intent arm's KAT, its own `:: REGGAP:` line after LOCKREG's
+        reggap_leg(); xcore_leg(); xcost_say(); // LOCKREGXCORECOST (B1062): the walk census's own `[lockreg] xcore` once-line after LOCKXCORE's. LOCKREGEDGEXCORE (B1056): the cross-partition order walk's KAT, its own `:: LOCKXCORE:` line after REGGAP's. REGGAP (B1021): the intent arm's KAT, its own `:: REGGAP:` line after LOCKREG's
     }
 
     // ── LOCKREG2 (B823): every hold past 50 ms is NAMED — in flight by the scan, or at its release through the pending
@@ -1771,13 +1771,14 @@ mod reg {
     /// (cpu + 1) % MAX_CPUS with `acquire`'s own mask CAS (what a preemption + steal leaves: the hold stays in the partition
     /// it was taken on), then `XB.lock()` through the real `acquire`; the walk must record XA -> XB. XA's raw lock is never
     /// taken (a tag only), the planted slot is freed in `release`'s order, nothing reversed is planted (`order_seen`'s rule).
-    /// The old one-partition walk reads fwd=0 (FAIL).
+    /// The old one-partition walk reads fwd=0 (FAIL). LOCKREGXCORECOST (B1062): this core's walk census (`XCOST`) must count
+    /// XB's take as exactly one walk (`walks=<w0>-><w0+1>`; an untimed walk reads `<w0>-><w0>`, FAIL).
     fn xcore_leg() {
         if !ON.load(Acquire) {
             serial_println!(":: LOCKXCORE: -> SKIP(unarmed) ::");
             return;
         }
-        let r: Result<(usize, usize, bool, bool, u32, u32, Option<bool>), &'static str> = crate::arch::without_interrupts(|| {
+        let r: Result<(usize, usize, bool, bool, u32, u32, Option<bool>, u64, u64), &'static str> = crate::arch::without_interrupts(|| {
             let Some((tid, cpu)) = who() else { return Err("no-cpu") };
             if tid == 0 {
                 return Err("no-task");
@@ -1811,23 +1812,73 @@ mod reg {
             pq.t0[i].store(rdtsc(), Relaxed);
             pq.tag[i].store(tid << 24 | (a as u64) << 8 | (q as u64 + 1), Release);
             let inv0 = INV_N.load(Acquire);
+            let w0 = XCOST[cpu].walks.load(Relaxed); // LOCKREGXCORECOST (B1062): masked, so XB's take is this core's only acquire between the reads
             drop(XB.lock());
+            let w1 = XCOST[cpu].walks.load(Relaxed);
             let outer = if before != 0 { None } else { Some(outer_site(tid, cpu) == XA.site as *const Loc as usize) }; // LOCKREGOUTERXCORE (B1057): the planted sibling hold is this task's outermost
             pq.tag[i].store(0, Release);
             pq.mask.fetch_and(!(1u32 << i), Release);
             let (fwd, rev, inv1) = order_seen(a, b).unwrap_or((false, false, inv0));
-            Ok((q, cpu, fwd, rev, inv0, inv1, outer))
+            Ok((q, cpu, fwd, rev, inv0, inv1, outer, w0, w1))
         });
         match r {
             Err(why) => {
                 serial_println!(":: LOCKXCORE: -> SKIP({}) ::", why);
             }
-            Ok((q, cpu, fwd, rev, inv0, inv1, outer)) => {
-                let pass = fwd && !rev && inv1 == inv0 && outer != Some(false);
+            Ok((q, cpu, fwd, rev, inv0, inv1, outer, w0, w1)) => {
+                let pass = fwd && !rev && inv1 == inv0 && outer != Some(false) && w1 == w0 + 1; // LOCKREGXCORECOST (B1062): the walk census counted XB's one walk
                 let ow = match outer { Some(true) => "1", Some(false) => "0", None => "-" };
-                serial_println!(":: LOCKXCORE: planted=c{} took=c{} fwd={} rev={} inversions={}->{} outer={} -> {} ::", q, cpu, fwd as u8, rev as u8, inv0, inv1, ow, if pass { "PASS" } else { "FAIL" });
+                serial_println!(":: LOCKXCORE: planted=c{} took=c{} fwd={} rev={} inversions={}->{} outer={} -> {} :: walks={}->{}", q, cpu, fwd as u8, rev as u8, inv0, inv1, ow, if pass { "PASS" } else { "FAIL" }, w0, w1);
             }
         }
+    }
+
+    // ── LOCKREGXCORECOST (rmbp-ledger B1062, BP-cores-20): B1056's all-partition order walk in `acquire` (`task_slots`)
+    // costs 7 remote `mask` loads per tracked blocking `lock()` by a task; this census COUNTS it: the TSC span of every
+    // walk by a task (tid != 0; tid 0 walks its own core only) — the whole `task_slots` call, its `edge()` inserts
+    // included — into THREE atomics PER CORE (written only by the acquiring core, the `Part::acq` shape: plain load +
+    // store, Relaxed, lossy under a preemption as `acq` is; per core so the census shares no line across cores and does
+    // not perturb what it measures). Gated by `ON` (it sits after `who()`); its own cost is two `rdtsc` + three
+    // core-local stores per counted walk. Said once per `tests lockreg` run by `xcost_say`, never inside `lock`.
+    // `outer_site` (stall samples only) is untimed. Owed: LOCKREG-XCORE-HINT, LOCKREG-XCORE-COST-KNOB. ──
+    #[repr(align(64))]
+    struct XCost {
+        walks: AtomicU64,
+        sum: AtomicU64,
+        max: AtomicU64,
+    }
+    static XCOST: [XCost; MAX_CPUS] = [const { XCost { walks: AtomicU64::new(0), sum: AtomicU64::new(0), max: AtomicU64::new(0) } }; MAX_CPUS];
+
+    /// One walk by task `tid` on core `cpu` began at TSC `x0` (from `acquire`, after `task_slots` returns).
+    #[inline(always)]
+    fn xcost_note(tid: u64, cpu: usize, x0: u64) {
+        if tid == 0 {
+            return; // a core's scheduler context walks this core only: not the cross-partition walk
+        }
+        let d = rdtsc().wrapping_sub(x0);
+        if d >= u64::MAX / 2 {
+            return;
+        }
+        let s = &XCOST[cpu];
+        s.walks.store(s.walks.load(Relaxed) + 1, Relaxed);
+        s.sum.store(s.sum.load(Relaxed).wrapping_add(d), Relaxed);
+        if d > s.max.load(Relaxed) {
+            s.max.store(d, Relaxed);
+        }
+    }
+
+    /// `[lockreg] xcore walks=<n> sum_cyc=<n> max_cyc=<n> avg_cyc=<n> tsc_mhz=<n>`: every core's census summed (max = the
+    /// highest), in TSC ticks; all 0 when unarmed. Once per `tests lockreg` run (`selftest`), after `:: LOCKXCORE:`.
+    fn xcost_say() {
+        let (mut walks, mut sum, mut max) = (0u64, 0u64, 0u64);
+        for s in XCOST.iter() {
+            walks += s.walks.load(Relaxed);
+            sum = sum.wrapping_add(s.sum.load(Relaxed));
+            max = max.max(s.max.load(Relaxed));
+        }
+        let avg = if walks == 0 { 0 } else { sum / walks };
+        let mhz = crate::arch::apic::tsc_hz().max(1000) / 1_000_000;
+        serial_println!("[lockreg] xcore walks={} sum_cyc={} max_cyc={} avg_cyc={} tsc_mhz={}", walks, sum, max, avg, mhz);
     }
 }
 

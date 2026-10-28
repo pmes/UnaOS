@@ -39,6 +39,7 @@ define_class!(
 
 pub fn bootstrap_text_field(
     placeholder: &str,
+    secret: bool,
     text_action: TextAction,
     synapse: Synapse,
 ) -> Retained<NSView> {
@@ -47,6 +48,7 @@ pub fn bootstrap_text_field(
         let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(600.0, 24.0));
         let field: Allocated<UnaTextField> = msg_send![UnaTextField::class(), alloc];
         let field: Retained<UnaTextField> = msg_send![field, initWithFrame: frame];
+        if secret { secure_cell(&field); } // LANDINGSECRETFIELD (SR432): before the placeholder, target and action land on the cell
         
         let placeholder_str = NSString::from_str(placeholder);
         let _: () = msg_send![&field, setPlaceholderString: &*placeholder_str];
@@ -133,5 +135,21 @@ pub fn bootstrap_text_field_with(placeholder: &str, action: Box<dyn Fn(String)>)
         let _: () = msg_send![&field, setAction: objc2::sel!(onAction:)];
         *field.ivars().action.borrow_mut() = Some(action);
         field
+    }
+}
+
+/// LANDINGSECRETFIELD (SR432): a secret field's cell is AppKit's `NSSecureTextFieldCell` (bullets drawn, the field
+/// editor secure, copy refused), swapped in before the caller sets the placeholder, target and action on it; the
+/// field keeps its `UnaTextField` class and ivars.
+unsafe fn secure_cell(field: &UnaTextField) {
+    unsafe {
+        let cell: Allocated<AnyObject> = msg_send![objc2::class!(NSSecureTextFieldCell), alloc];
+        let empty = NSString::from_str("");
+        let cell: Retained<AnyObject> = msg_send![cell, initTextCell: &*empty];
+        let _: () = msg_send![&cell, setEditable: objc2::runtime::Bool::YES];
+        let _: () = msg_send![&cell, setSelectable: objc2::runtime::Bool::YES];
+        let _: () = msg_send![&cell, setBezeled: objc2::runtime::Bool::YES];
+        let _: () = msg_send![&cell, setScrollable: objc2::runtime::Bool::YES];
+        let _: () = msg_send![field, setCell: &*cell];
     }
 }

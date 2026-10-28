@@ -33,6 +33,15 @@
 //   [installer] contribute next: <command>                                  (three, after ok=1)
 //   [installer] contribute redact-check landing=<stamp> files=<n> redacted=<n> unredactable=<n>
 //   [installer] contribute redact file=<name> line=<n> class=<class>        (first 20, then `redact more=<n>`)
+//   [installer] contribute bugreport landing=<stamp|-> fails=<n> redacted=<n> ok=<1|0> why=<-|no-landing|unredactable|write-error>
+//   [installer] contribute next: (cd <landing dir> && gh issue create --repo <owner/repo> --title '<title>' --body-file BUGREPORT.md)
+//
+// INSTALLERBUGREPORT (LEDGER SR433): `contribute bugreport [<dir>]` writes BUGREPORT.md beside the landing (on disk, for
+// the person to read before filing) from the SAME redacted plan: the title (board, image, the first FAIL verdict's
+// name), the environment table, the verdict counts, the failing verdict lines quoted (redacted, first 20), the landing
+// files; an unredactable landing refuses and writes nothing. It prints the `gh issue create` command and never calls
+// the network (INSTALLER-BUGREPORT-GH owed). The repo slug is git_core's `remote.origin.url` on github.com, else the
+// placeholder `<owner>/<repo>`; the URL itself is never printed.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -44,11 +53,18 @@ use git_core::index::{Entry, Index};
 use git_core::object::{Commit, Kind, Signature, mode};
 use quartzite::tetra::{ConsoleLine, ConsoleTetra, TetraNode};
 
+use crate::landing::verdict_name; // LANDINGSCORE (SR437): the verdict-name rule moved beside landing::verdict, body unchanged
+
 /// The identity a commit takes when the person's git names none.
 pub const FALLBACK_NAME: &str = "UnaOS Contributor";
 pub const FALLBACK_EMAIL: &str = "contrib@unaos.invalid";
 /// The generated census, committed beside the logs (never written on disk).
 pub const CONTRIBUTION: &str = "CONTRIBUTION.md";
+/// The generated bug report, written beside the landing (never read back by `plan`).
+pub const BUGREPORT: &str = "BUGREPORT.md";
+/// How many failing verdict lines a bug report quotes, and how long a quoted line may be.
+const QUOTED: usize = 20;
+const QUOTE_CHARS: usize = 240;
 /// How many redaction hits a check prints before `more=`.
 const SHOWN: usize = 20;
 
@@ -447,8 +463,8 @@ impl Plan {
     }
 }
 
-/// Read every regular, non-dot file directly in `dir` (sorted; an on-disk CONTRIBUTION.md is the commit's own, skipped)
-/// and redact it.
+/// Read every regular, non-dot file directly in `dir` (sorted; an on-disk CONTRIBUTION.md is the commit's own and
+/// BUGREPORT.md the bug report's own, both skipped) and redact it.
 pub fn plan(dir: &Path, r: &Redactor) -> Result<Plan, &'static str> {
     let name = dir.file_name().map(|n| n.to_string_lossy().into_owned()).ok_or("no-landing")?;
     let mut names: Vec<String> = std::fs::read_dir(dir)
@@ -456,7 +472,7 @@ pub fn plan(dir: &Path, r: &Redactor) -> Result<Plan, &'static str> {
         .flatten()
         .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
         .map(|e| e.file_name().to_string_lossy().into_owned())
-        .filter(|n| !n.starts_with('.') && n != CONTRIBUTION)
+        .filter(|n| !n.starts_with('.') && n != CONTRIBUTION && n != BUGREPORT)
         .collect();
     names.sort();
     if names.is_empty() {
@@ -471,10 +487,17 @@ pub fn plan(dir: &Path, r: &Redactor) -> Result<Plan, &'static str> {
     Ok(Plan { dir: dir.to_path_buf(), name, files })
 }
 
-/// A `- <key>: <value>` line of landing.md, backticks trimmed.
+/// A `- <key>: <value>` line of landing.md, backticks trimmed; a value that opens with a backtick is its first
+/// backticked span (landing.md's `- image: `<sha>` (the booted kernel's … sha)` is the bare sha).
 fn landing_field(md: &str, key: &str) -> Option<String> {
     let p = format!("- {key}: ");
-    md.lines().find_map(|l| l.strip_prefix(&p)).map(|v| v.trim().trim_matches('`').to_string())
+    md.lines().find_map(|l| l.strip_prefix(&p)).map(|v| {
+        let v = v.trim();
+        match v.strip_prefix('`').and_then(|r| r.split_once('`')) {
+            Some((span, _)) => span.to_string(),
+            None => v.trim_matches('`').to_string(),
+        }
+    })
 }
 
 /// `<pass>/<fail>/<skip>` from landing.md's verdicts line.
@@ -497,7 +520,7 @@ pub fn contribution_md(p: &Plan, os: &str, arch: &str, card_model: Option<&str>)
     let mut s = format!("# Contribution — {}\n\n", p.name);
     s.push_str("INSTALLER-CONTRIBUTE (SR428): the UnaOS_Installer committed this landing on a local `contrib/` branch after one redaction pass. Nothing was pushed; the person pushes it.\n\n");
     s.push_str("## Machine\n\n");
-    s.push_str(&format!("- board: `{board}`\n- image: `{image}`\n- boots: {}\n- verdicts: {v} (PASS/FAIL/SKIP)\n", landing_field(&md, "boots").unwrap_or_else(|| String::from("-"))));
+    s.push_str(&format!("- board: `{board}`\n- image: `{image}`\n- boots: {}\n- verdicts: {v} (PASS/FAIL/SKIP)\n- score: {}\n", landing_field(&md, "boots").unwrap_or_else(|| String::from("-")), landing_field(&md, "score").unwrap_or_else(|| String::from("-")))); // LANDINGSCORE (SR437): the grade line, read from landing.md like the census
     s.push_str(&format!("- host: {os} {arch}\n- card: {}\n\n", card_model.filter(|m| !m.trim().is_empty()).unwrap_or("-")));
     s.push_str("## Files\n\n");
     for f in &p.files {
@@ -669,6 +692,178 @@ pub fn git_cli() -> bool {
     std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).any(|d| d.join("git").is_file() || d.join("git.exe").is_file()))
 }
 
+// ── the bug report ──────────────────────────────────────────────────────────────────────────────
+
+/// The boot number of `boot<n>.log` (so boot10 sorts after boot2); other names sort after every boot.
+fn boot_order(name: &str) -> (u32, String) {
+    let n = name.strip_prefix("boot").and_then(|r| r.strip_suffix(".log")).and_then(|d| d.parse().ok()).unwrap_or(u32::MAX);
+    (n, name.to_string())
+}
+
+/// Every FAIL verdict (landing.rs `verdict`, the one rule) in the plan's redacted `*.log` files, by boot: the total and
+/// the first [`QUOTED`] as `<file>:<line>: <line>` (trailing NULs and spaces trimmed, capped at [`QUOTE_CHARS`]).
+pub fn failing(p: &Plan) -> (usize, Vec<String>) {
+    let mut logs: Vec<&FileOut> = p.files.iter().filter(|f| f.name.ends_with(".log")).collect();
+    logs.sort_by_key(|f| boot_order(&f.name));
+    let mut total = 0;
+    let mut quoted = Vec::new();
+    for f in logs {
+        for (i, raw) in f.bytes.split(|&b| b == b'\n').enumerate() {
+            let text = String::from_utf8_lossy(raw);
+            let l = text.trim_end_matches(|c: char| c == '\0' || c.is_whitespace());
+            if crate::landing::verdict(l) != Some("FAIL") {
+                continue;
+            }
+            total += 1;
+            if quoted.len() < QUOTED {
+                let cut: String = l.chars().take(QUOTE_CHARS).collect();
+                let more = if l.chars().count() > QUOTE_CHARS { " …" } else { "" };
+                quoted.push(format!("{}:{}: {cut}{more}", f.name, i + 1));
+            }
+        }
+    }
+    (total, quoted)
+}
+
+/// `owner/repo` of a github.com remote URL (`https://[userinfo@]github.com/o/r[.git]`, `ssh://git@github.com/o/r.git`,
+/// `git@github.com:o/r.git`); anything else is None.
+pub fn slug_of(url: &str) -> Option<String> {
+    let u = url.trim();
+    let (host, path) = if let Some((_, rest)) = u.split_once("://") {
+        let (auth, path) = rest.split_once('/')?;
+        (auth.rsplit('@').next().unwrap_or(auth), path)
+    } else {
+        let (auth, path) = u.split_once(':')?;
+        if auth.contains('/') || !auth.contains('@') {
+            return None;
+        }
+        (auth.rsplit('@').next().unwrap_or(auth), path)
+    };
+    let host = host.split(':').next().unwrap_or(host);
+    if !host.eq_ignore_ascii_case("github.com") {
+        return None;
+    }
+    let segs: Vec<&str> = path.trim_matches('/').split('/').filter(|s| !s.is_empty()).collect();
+    if segs.len() != 2 {
+        return None;
+    }
+    let repo = segs[1].strip_suffix(".git").unwrap_or(segs[1]);
+    let ok = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b));
+    (ok(segs[0]) && ok(repo)).then(|| format!("{}/{repo}", segs[0]))
+}
+
+/// The repo slug for `gh issue create --repo`: git_core's `remote.origin.url` on github.com, else `<owner>/<repo>`.
+/// The URL is never printed (a token in it never leaves).
+pub fn repo_slug(checkout: &Path) -> String {
+    Repository::discover(checkout)
+        .ok()
+        .and_then(|r| r.config.get(b"remote.origin.url").map(|u| String::from_utf8_lossy(u).into_owned()))
+        .and_then(|u| slug_of(&u))
+        .unwrap_or_else(|| String::from("<owner>/<repo>"))
+}
+
+/// The checkout's HEAD commit, 9 hex digits, else `-`.
+fn checkout_head(checkout: &Path) -> String {
+    Repository::discover(checkout)
+        .ok()
+        .and_then(|r| r.head().ok())
+        .and_then(|(_, id)| id)
+        .map(|id| id.to_hex().chars().take(9).collect())
+        .unwrap_or_else(|| String::from("-"))
+}
+
+/// One shell word in single quotes.
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// The bug report: (title, BUGREPORT.md), every byte from the redacted plan.
+pub fn bugreport_md(p: &Plan, os: &str, arch: &str, card_model: Option<&str>, head: &str) -> (String, String) {
+    let md = p.landing_md();
+    let (board, image, v, _) = census_of(&md);
+    let (fails, quoted) = failing(p);
+    let title = match quoted.first() {
+        Some(q) => format!("{board} {image}: {} FAIL", verdict_name(q.splitn(3, ':').nth(2).unwrap_or(q))),
+        None => format!("{board} {image}: no FAIL verdict ({v})"),
+    };
+    let mut s = format!("# {title}\n\n");
+    s.push_str("INSTALLER-BUGREPORT (SR433): written by the UnaOS_Installer from a landed boot log after the contribute redaction pass. Nothing was sent; read it, then file it.\n\n");
+    s.push_str("## Environment\n\n| | |\n|---|---|\n");
+    s.push_str(&format!("| board | `{board}` |\n| image | `{image}` |\n| verdicts | {v} (PASS/FAIL/SKIP) |\n| score | {} |\n", landing_field(&md, "score").unwrap_or_else(|| String::from("-")))); // LANDINGSCORE (SR437): the grade line, read from landing.md like the census
+    s.push_str(&format!("| host | {os} {arch} |\n| card | {} |\n", card_model.filter(|m| !m.trim().is_empty()).unwrap_or("-")));
+    s.push_str(&format!("| UnaOS commit | `{head}` |\n| landing | `{}` |\n\n", p.name));
+    s.push_str(&format!("## Failing verdicts ({fails})\n\n"));
+    if quoted.is_empty() {
+        s.push_str("none\n\n");
+    } else {
+        s.push_str("```text\n");
+        for q in &quoted {
+            s.push_str(q);
+            s.push('\n');
+        }
+        s.push_str("```\n");
+        if fails > quoted.len() {
+            s.push_str(&format!("… and {} more\n", fails - quoted.len()));
+        }
+        s.push('\n');
+    }
+    s.push_str("## Landing files\n\n");
+    for f in &p.files {
+        s.push_str(&format!("- `{}`: {} bytes, {} value(s) redacted\n", f.name, f.bytes.len(), f.hits.len()));
+    }
+    s.push_str("\n## Redacted, by class\n\n");
+    for c in CLASSES.iter().filter(|c| !c.unredactable()) {
+        s.push_str(&format!("- {}: {}\n", c.name(), p.count(*c)));
+    }
+    s.push_str("\nNever in this report: a serial, a MAC, a Wi-Fi name, a username or home path, a public IP, a typed secret, a key (a key or a password field refuses the report).\n");
+    (title, s)
+}
+
+/// `[installer] contribute bugreport landing= fails= redacted= ok= why=`.
+pub fn bugreport_line(landing: &str, fails: usize, redacted: usize, ok: bool, why: &str) -> String {
+    format!("[installer] contribute bugreport landing={landing} fails={fails} redacted={redacted} ok={} why={why}", ok as u8)
+}
+
+/// The whole bug-report verb, synchronous: the landing (`dir`, else the newest), the plan, BUGREPORT.md written beside
+/// it. Returns the printed lines: the wire line, then the `gh issue create` line or the unredactable hit lines.
+pub fn bugreport_at(checkout: &Path, dir: Option<PathBuf>, r: &Redactor, card_model: &dyn Fn(&str) -> Option<String>, slug: &str) -> Vec<String> {
+    let Some(dir) = dir.or_else(|| crate::provider::newest_landing(checkout)).filter(|d| d.is_dir()) else {
+        return vec![bugreport_line("-", 0, 0, false, "no-landing")];
+    };
+    let p = match plan(&dir, r) {
+        Ok(p) => p,
+        Err(why) => return vec![bugreport_line("-", 0, 0, false, why)],
+    };
+    if p.unredactable() > 0 {
+        let mut v = vec![bugreport_line(p.stamp(), 0, p.redacted(), false, "unredactable")];
+        v.extend(p.hit_lines(true));
+        return v;
+    }
+    let (_, _, _, device) = census_of(&p.landing_md());
+    let model = card_model(&device);
+    let (title, body) = bugreport_md(&p, crate::host::Os::this().name(), std::env::consts::ARCH, model.as_deref(), &checkout_head(checkout));
+    let (fails, _) = failing(&p);
+    if std::fs::write(dir.join(BUGREPORT), body).is_err() {
+        return vec![bugreport_line(p.stamp(), fails, p.redacted(), false, "write-error")];
+    }
+    vec![
+        bugreport_line(p.stamp(), fails, p.redacted(), true, "-"),
+        format!(
+            "[installer] contribute next: (cd {} && gh issue create --repo {slug} --title {} --body-file {BUGREPORT})",
+            dir.display(),
+            shell_quote(&title)
+        ),
+    ]
+}
+
+/// The card model for a landing's device id through the card face's devices (none in tests, or for `-`).
+fn card_model(host_devices: bool, id: &str) -> Option<String> {
+    if !host_devices || id == "-" {
+        return None;
+    }
+    crate::card::devices().into_iter().find(|d| d.id == id).map(|d| d.model)
+}
+
 // ── the face ────────────────────────────────────────────────────────────────────────────────────
 
 enum Msg {
@@ -769,6 +964,16 @@ impl Contribute {
         self.verdict = lines.first().cloned().unwrap_or_default();
     }
 
+    /// `contribute bugreport [<dir>]`, synchronous: BUGREPORT.md beside the landing and the `gh issue create` line.
+    pub fn bugreport(&mut self, arg: &str) {
+        let host_devices = self.host_devices;
+        let model = |id: &str| card_model(host_devices, id);
+        let lines = bugreport_at(&self.checkout, (!arg.is_empty()).then(|| PathBuf::from(arg)), &self.redactor(), &model, &repo_slug(&self.checkout));
+        say_all(&lines);
+        self.verdict = lines.first().cloned().unwrap_or_default();
+        self.next = lines.into_iter().skip(1).filter(|l| l.starts_with("[installer] contribute next:")).collect();
+    }
+
     /// `contribute [<dir>]` on its own thread.
     pub fn start(&mut self, arg: &str) {
         if self.busy() {
@@ -783,12 +988,7 @@ impl Contribute {
         self.next.clear();
         self.rx = Some(rx);
         std::thread::spawn(move || {
-            let model = |id: &str| -> Option<String> {
-                if !host_devices || id == "-" {
-                    return None;
-                }
-                crate::card::devices().into_iter().find(|d| d.id == id).map(|d| d.model)
-            };
+            let model = |id: &str| card_model(host_devices, id);
             let lines = contribute_at(&checkout, dir, &r, &model, now_secs());
             say_all(&lines);
             let _ = tx.send(Msg::Done(lines));
@@ -806,7 +1006,8 @@ pub fn face() -> TetraNode {
     face_of(&Contribute::probe_in(None))
 }
 
-/// The pane for a given state: the status, the verdict, the three next steps after a commit, Check and Contribute.
+/// The pane for a given state: the status, the verdict, the next steps after a commit or a report, Check, Contribute and
+/// Report bug.
 pub fn face_of(c: &Contribute) -> TetraNode {
     let line = |level: &str, text: String| ConsoleLine { level: level.to_string(), source: String::from("contribute"), text };
     let mut lines = vec![line("info", c.status()), line("info", c.verdict.clone())];
@@ -820,12 +1021,13 @@ pub fn face_of(c: &Contribute) -> TetraNode {
         TetraNode::HStack(vec![
             button("contribute.check", "Check", "contribute redact-check"),
             button("contribute.commit", "Contribute", "contribute"),
+            button("contribute.bugreport", "Report bug", "contribute bugreport"),
         ]),
     ])
 }
 
 /// Route one `SMessage::ConsoleInput` line: `contribute [<landing dir>]`, `contribute redact-check [<landing dir>]`,
-/// `contribute status`. False = not the contribute face's line.
+/// `contribute bugreport [<landing dir>]`, `contribute status`. False = not the contribute face's line.
 pub fn on_input(c: &mut Contribute, line: &str) -> bool {
     c.poll();
     let t = line.trim();
@@ -835,6 +1037,7 @@ pub fn on_input(c: &mut Contribute, line: &str) -> bool {
     let (verb, arg) = rest.split_once(' ').map(|(v, a)| (v, a.trim())).unwrap_or((rest, ""));
     match verb {
         "redact-check" => c.check(arg),
+        "bugreport" => c.bugreport(arg),
         "status" => c.verdict = c.status(),
         _ if c.busy() => c.verdict = String::from("busy committing — wait for the verdict"),
         _ => c.start(rest),
@@ -1105,6 +1308,148 @@ mod tests {
         let TetraNode::VStack(kids) = face_of(&c) else { panic!("the face is a VStack") };
         let TetraNode::Console(con) = &kids[0] else { panic!("the console first") };
         assert!(con.lines.iter().any(|l| l.text.contains("push origin")));
+        let _ = fs::remove_dir_all(&root);
+    }
+    // ── INSTALLERBUGREPORT (SR433) ──────────────────────────────────────────────────────────────
+
+    const FAIL3: &str = ":: WIFIJOIN: bssid=a4:5e:60:12:34:56 cfg=/home/tester/wifi.conf -> FAIL ::\n";
+
+    #[test]
+    fn bugreport_writes_a_redacted_report() {
+        let root = scratch("bugreport");
+        let checkout = repo_at(&root);
+        let dir = lay(&checkout, &[("boot3.log", FAIL3)]);
+        let repo = Repository::discover(&checkout).unwrap();
+        let head0 = repo.head().unwrap();
+        let files0 = snapshot(&dir);
+
+        let lines = bugreport_at(&checkout, None, &redactor(&checkout), &none, "<owner>/<repo>");
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[0].starts_with("[installer] contribute bugreport landing=20261027-2340 fails=2 redacted=") && lines[0].ends_with(" ok=1 why=-"), "{lines:?}");
+        assert!(
+            lines[1].starts_with("[installer] contribute next: (cd ")
+                && lines[1].ends_with(" && gh issue create --repo <owner>/<repo> --title 'zenbook c1d61903: PUMPWEDGE FAIL' --body-file BUGREPORT.md)"),
+            "{lines:?}"
+        );
+
+        let body = fs::read_to_string(dir.join(BUGREPORT)).unwrap();
+        assert!(body.starts_with("# zenbook c1d61903: PUMPWEDGE FAIL\n"), "{body}");
+        assert!(body.contains("| image | `c1d61903` |") && body.contains("| verdicts | 4/1/2 (PASS/FAIL/SKIP) |"), "{body}");
+        assert!(body.contains("| UnaOS commit | `") && !body.contains("| UnaOS commit | `-` |"), "{body}");
+        assert!(body.contains("## Failing verdicts (2)"), "{body}");
+        assert!(body.contains("boot2.log:7: [00:12:01.500] PUMPWEDGE: age_ms=2171"), "{body}");
+        assert!(body.contains("boot3.log:1: :: WIFIJOIN: bssid=xx:xx:xx:xx:xx:xx cfg=~/wifi.conf -> FAIL ::"), "{body}");
+        assert!(body.find("boot2.log:7:").unwrap() < body.find("boot3.log:1:").unwrap(), "boot order");
+        for f in ["boot1.log", "boot2.log", "boot3.log", "landing.md", "PROMPT.md"] {
+            assert!(body.contains(&format!("- `{f}`: ")), "{f} not listed: {body}");
+        }
+        assert!(body.contains("- mac: 3"), "{body}");
+        for v in PLANTED.iter().chain([checkout.display().to_string().as_str()].iter()) {
+            assert!(!body.contains(v), "{v} reached BUGREPORT.md");
+            assert!(!lines[0].contains(v), "{v} printed");
+        }
+        // The `next:` line names the landing dir to cd into (the person's own path, as contribute's next steps do), and
+        // no planted value.
+        assert!(PLANTED.iter().all(|v| !lines[1].contains(v)), "{lines:?}");
+
+        // The landing's originals byte-identical, no branch made, HEAD unchanged.
+        let mut after = snapshot(&dir);
+        after.retain(|(n, _)| n != BUGREPORT);
+        assert_eq!(after, files0);
+        let repo = Repository::discover(&checkout).unwrap();
+        assert_eq!(repo.head().unwrap(), head0);
+        assert!(!matches!(repo.resolve_ref(&format!("refs/heads/contrib/{NAME}")), Ok(Some((_, Some(_))))));
+
+        // A re-run never reads its own report: the same plan, the same report.
+        let p = plan(&dir, &redactor(&checkout)).unwrap();
+        assert!(p.files.iter().all(|f| f.name != BUGREPORT));
+        let again = bugreport_at(&checkout, Some(dir.clone()), &redactor(&checkout), &none, "<owner>/<repo>");
+        assert_eq!(again, lines);
+        assert_eq!(fs::read_to_string(dir.join(BUGREPORT)).unwrap(), body);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn bugreport_refuses_unredactable_and_writes_nothing() {
+        let root = scratch("bugreport-unredactable");
+        let checkout = repo_at(&root);
+        let dir = lay(&checkout, &[("REPLY.md", &format!("# Reply\n\nYour key {KEY} works.\n"))]);
+        let lines = bugreport_at(&checkout, None, &redactor(&checkout), &none, "<owner>/<repo>");
+        assert!(lines[0].starts_with("[installer] contribute bugreport landing=20261027-2340 fails=0 ") && lines[0].ends_with("ok=0 why=unredactable"), "{lines:?}");
+        assert!(lines.iter().any(|l| l == "[installer] contribute redact file=REPLY.md line=3 class=key"), "{lines:?}");
+        assert!(lines.iter().all(|l| !l.contains("TESTSECRET") && !l.contains("gh issue")), "{lines:?}");
+        assert!(!dir.join(BUGREPORT).exists(), "an unredactable landing wrote a report");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn bugreport_no_landing() {
+        let root = scratch("bugreport-none");
+        let checkout = repo_at(&root);
+        let l = bugreport_at(&checkout, None, &redactor(&checkout), &none, "<owner>/<repo>");
+        assert_eq!(l, vec![String::from("[installer] contribute bugreport landing=- fails=0 redacted=0 ok=0 why=no-landing")]);
+        let l = bugreport_at(&checkout, Some(root.join("nowhere")), &redactor(&checkout), &none, "<owner>/<repo>");
+        assert!(l[0].ends_with("why=no-landing"), "{l:?}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn bugreport_repo_slug() {
+        for (url, want) in [
+            ("https://github.com/unaos-dev/UnaOS.git", Some("unaos-dev/UnaOS")),
+            ("https://github.com/unaos-dev/UnaOS", Some("unaos-dev/UnaOS")),
+            ("https://ghtoken123@github.com/unaos-dev/UnaOS.git/", Some("unaos-dev/UnaOS")),
+            ("ssh://git@github.com:22/unaos-dev/UnaOS.git", Some("unaos-dev/UnaOS")),
+            ("git@github.com:unaos-dev/UnaOS.git", Some("unaos-dev/UnaOS")),
+            ("https://gitlab.com/unaos-dev/UnaOS.git", None),
+            ("/srv/git/UnaOS", None),
+            ("file:///srv/git/UnaOS", None),
+            ("https://github.com/unaos-dev", None),
+        ] {
+            assert_eq!(slug_of(url).as_deref(), want, "{url}");
+        }
+        let root = scratch("bugreport-slug");
+        let checkout = repo_at(&root);
+        assert_eq!(repo_slug(&checkout), "<owner>/<repo>");
+        assert_eq!(repo_slug(&root.join("nowhere")), "<owner>/<repo>");
+        let cfg = checkout.join(".git/config");
+        let mut c = fs::read_to_string(&cfg).unwrap();
+        c.push_str("\n[remote \"origin\"]\n\turl = https://ghtoken123@github.com/unaos-dev/UnaOS.git\n");
+        fs::write(&cfg, c).unwrap();
+        assert_eq!(repo_slug(&checkout), "unaos-dev/UnaOS");
+        let dir = lay(&checkout, &[]);
+        let lines = bugreport_at(&checkout, None, &redactor(&checkout), &none, &repo_slug(&checkout));
+        assert!(lines[1].contains("gh issue create --repo unaos-dev/UnaOS --title 'zenbook c1d61903: PUMPWEDGE FAIL' "), "{lines:?}");
+        assert!(lines.iter().all(|l| !l.contains("ghtoken123")), "{lines:?}");
+        assert!(!fs::read_to_string(dir.join(BUGREPORT)).unwrap().contains("ghtoken123"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn bugreport_input_route_and_title_rules() {
+        let root = scratch("bugreport-face");
+        let checkout = repo_at(&root);
+        lay(&checkout, &[]);
+        let mut c = Contribute::probe_at(checkout.clone(), Some(String::from("/home/tester")));
+        assert!(on_input(&mut c, "contribute bugreport"));
+        assert!(c.verdict.starts_with("[installer] contribute bugreport landing=20261027-2340 fails=1 ") && c.verdict.ends_with("ok=1 why=-"), "{}", c.verdict);
+        assert_eq!(c.next.len(), 1);
+        assert!(c.next[0].contains("--body-file BUGREPORT.md"), "{:?}", c.next);
+        assert!(!c.busy());
+        let TetraNode::VStack(kids) = face_of(&c) else { panic!("the face is a VStack") };
+        let TetraNode::HStack(buttons) = &kids[1] else { panic!("the buttons second") };
+        assert!(buttons.iter().any(|b| matches!(b, TetraNode::Button { id, .. } if id == "contribute.bugreport")));
+        let TetraNode::Console(con) = &kids[0] else { panic!("the console first") };
+        assert!(con.lines.iter().any(|l| l.text.contains("gh issue create")));
+
+        assert_eq!(verdict_name("[00:12:01.500] PUMPWEDGE: age_ms=2171 -> FAIL :: pump=9@cpu7"), "PUMPWEDGE");
+        assert_eq!(verdict_name(":: WIFIJOIN: tx -> FAIL ::"), "WIFIJOIN");
+        assert_eq!(verdict_name(":: odd line -> FAIL ::"), "odd line -> FAIL ::");
+        assert_eq!(shell_quote("it's"), "'it'\\''s'");
+        assert_eq!(boot_order("boot10.log").0, 10);
+        assert!(boot_order("boot2.log") < boot_order("boot10.log"));
+        assert_eq!(landing_field("- image: `c1d61903` (the booted kernel's sha)\n", "image").as_deref(), Some("c1d61903"));
+        assert_eq!(landing_field("- board: `zenbook`\n", "board").as_deref(), Some("zenbook"));
         let _ = fs::remove_dir_all(&root);
     }
 }

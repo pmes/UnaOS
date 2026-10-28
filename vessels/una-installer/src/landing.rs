@@ -21,6 +21,7 @@
 //
 // Wire:
 //   [installer] landing device=<id|image> boots=<k> log_kb=<n> verdicts=<pass>/<fail>/<skip> dir=<evidence dir>
+//   [installer] landing score reached=<n>/<m> pass=<n> fail=<n> missing=<n> last=<NAME|-> grade=<green|amber|red> list=<zenbook-flight-1|none>
 //   [installer] landing refused why=<no-log|no-unafs|no-checkout|windows-unbuilt|keyed|unreadable> device=<id|->
 
 use std::path::{Path, PathBuf};
@@ -92,6 +93,8 @@ pub struct FlightLog {
     pub bootlist: Option<String>,
     /// Bytes the ring left out of the files (the FLIGHTRING markers, summed).
     pub elided: u64,
+    /// LANDINGSCORE (SR437): the boot scored against its expected verdicts ([`score`], computed once by [`flight_log`]).
+    pub score: Score,
 }
 
 impl FlightLog {
@@ -132,6 +135,144 @@ pub fn census(text: &str) -> Census {
     c
 }
 
+/// The NAME of a verdict line: a `[hh:mm:ss.mmm] ` stamp and a leading `:: ` stripped, the token before the first `:`;
+/// else its first 48 characters.
+pub fn verdict_name(line: &str) -> String {
+    let mut l = line.trim();
+    if l.starts_with('[') {
+        if let Some((_, r)) = l.split_once("] ") {
+            l = r.trim_start();
+        }
+    }
+    l = l.strip_prefix(":: ").unwrap_or(l);
+    match l.split_once(':') {
+        Some((n, _)) if !n.is_empty() && !n.contains(char::is_whitespace) => n.to_string(),
+        _ => l.chars().take(48).collect(),
+    }
+}
+
+// ── LANDINGSCORE (SR437): the landing scored against the verdicts the boot was expected to print ─────────────────────
+
+/// The flight brief the expected list is read from (§2: the verbs the card runs by itself, no hand typing).
+pub const FLIGHT_BRIEF: &str = "docs/dev/OS/zenbook-flight-1.md";
+/// The NAMES those verbs print, measured at their kernel print sites (`dwi2ctp` prints `DWI2C-TP`; `unafs`, the card
+/// list's last light line on every board since UNAFSFLIGHTLIST B1063, prints `UNAFSX86-T`). The card's own TESTS.LIST sits
+/// on the boot FAT (p1), which the landing never mounts: LANDING-CARDLIST owed.
+pub const BRIEF_VERDICTS: &[&str] = &["PLATFORM", "EC", "ECBATTERY", "NVME", "I8042", "DWI2C", "DWI2C-TP", "DMA", "HDACENSUS", "GOPSHOT", "UNAFSX86-T"];
+
+/// One landing's score: each expected name's outcome (PASS / FAIL / SKIP / missing, in list order), the counts, the
+/// last verdict seen, the first fault line and the grade.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Score {
+    /// Where the expected list came from (`zenbook-flight-1`, or `none`).
+    pub list: &'static str,
+    pub rows: Vec<(String, &'static str)>,
+    pub reached: u32,
+    pub pass: u32,
+    pub fail: u32,
+    pub missing: u32,
+    /// The NAME of the last verdict line in the files: where the boot was when the log ends.
+    pub last: Option<String>,
+    /// The first fault line (a panic, a CPU exception, a FAIL naming a WEDGE).
+    pub fault: Option<String>,
+    /// green | amber | red.
+    pub grade: &'static str,
+}
+
+/// A line that says the boot itself broke: the gate's non-verdict forbids (mbench.py DEFAULT_FORBIDS `PANIC`; arroyo
+/// FAULT_PATTERNS `panicked at `, `EXCEPTION:`), or a FAIL verdict whose NAME names a WEDGE (PUMPWEDGE, RENDERWEDGE: the
+/// boot hung). A bare `WEDGE` is not one: `:: SESSIONWEDGE: … -> SKIP ::` and the SETTERWEDGE rescue line are benign.
+pub fn fault(line: &str) -> bool {
+    line.contains("PANIC") || line.contains("panicked at ") || line.contains("EXCEPTION:") || (verdict(line) == Some("FAIL") && verdict_name(line).contains("WEDGE"))
+}
+
+/// The expected list for a board: the Zenbook flight brief's names, else none (a board with no brief in hand).
+pub fn expected_for(board: Option<&str>) -> (&'static str, &'static [&'static str]) {
+    match board {
+        Some("zenbook") => ("zenbook-flight-1", BRIEF_VERDICTS),
+        _ => ("none", &[]),
+    }
+}
+
+/// Score `boots` (oldest first) against `expected`. A name's outcome is its LAST verdict line. Red: an expected name never
+/// printed, a fault line, or no verdict at all; amber: every name reached but a FAIL or SKIP among them (with no list: any
+/// FAIL); green otherwise.
+pub fn score(boots: &[Boot], list: &'static str, expected: &[&str]) -> Score {
+    let mut sc = Score { list, rows: expected.iter().map(|n| (n.to_string(), "missing")).collect(), ..Default::default() };
+    let (mut any, mut any_fail) = (false, false);
+    for b in boots {
+        for line in String::from_utf8_lossy(&b.bytes).lines() {
+            if sc.fault.is_none() && fault(line) {
+                sc.fault = Some(line.trim_end().to_string());
+            }
+            let Some(v) = verdict(line) else { continue };
+            any = true;
+            any_fail |= v == "FAIL";
+            let name = verdict_name(line);
+            if let Some(row) = sc.rows.iter_mut().find(|r| r.0 == name) {
+                row.1 = v;
+            }
+            if !name.contains(char::is_whitespace) {
+                sc.last = Some(name);
+            }
+        }
+    }
+    for (_, o) in &sc.rows {
+        match *o {
+            "missing" => sc.missing += 1,
+            "PASS" => sc.pass += 1,
+            "FAIL" => sc.fail += 1,
+            _ => {}
+        }
+    }
+    sc.reached = sc.rows.len() as u32 - sc.missing;
+    sc.grade = if sc.missing > 0 || sc.fault.is_some() || !any {
+        "red"
+    } else if (sc.rows.is_empty() && any_fail) || sc.pass < sc.reached {
+        "amber"
+    } else {
+        "green"
+    };
+    sc
+}
+
+/// `reached=<n>/<m> pass= fail= missing= last= grade= list=` (the wire's tail, landing.md's `- score:` field).
+pub fn score_tail(sc: &Score) -> String {
+    format!(
+        "reached={}/{} pass={} fail={} missing={} last={} grade={} list={}",
+        sc.reached,
+        sc.rows.len(),
+        sc.pass,
+        sc.fail,
+        sc.missing,
+        sc.last.as_deref().unwrap_or("-"),
+        sc.grade,
+        sc.list
+    )
+}
+
+/// `[installer] landing score reached=<n>/<m> pass= fail= missing= last= grade= list=`.
+pub fn score_line(sc: &Score) -> String {
+    format!("[installer] landing score {}", score_tail(sc))
+}
+
+/// The first expected name, in list order, that is missing or FAILed.
+fn first_gap(sc: &Score) -> Option<(&str, &str)> {
+    sc.rows.iter().find(|r| r.1 == "missing" || r.1 == "FAIL").map(|r| (r.0.as_str(), r.1))
+}
+
+/// The expected-verdict table (empty when there is no list).
+fn score_table(sc: &Score) -> String {
+    if sc.rows.is_empty() {
+        return String::new();
+    }
+    let mut s = format!("\nExpected verdicts (`{FLIGHT_BRIEF}` §2, the names the card prints by itself):\n\n| expected verdict | outcome |\n|---|---|\n");
+    for (n, o) in &sc.rows {
+        s.push_str(&format!("| {n} | {o} |\n"));
+    }
+    s
+}
+
 fn field<'a>(s: &'a str, key: &str) -> Option<&'a str> {
     let i = s.find(key)?;
     s[i + key.len()..].split_whitespace().next()
@@ -139,7 +280,7 @@ fn field<'a>(s: &'a str, key: &str) -> Option<&'a str> {
 
 /// The census and the identity lines of a set of boots (oldest first).
 pub fn flight_log(source: &str, boots: Vec<Boot>) -> FlightLog {
-    let mut log = FlightLog { source: source.to_string(), boots: Vec::new(), census: Census::default(), build: None, board: None, bootlist: None, elided: 0 };
+    let mut log = FlightLog { source: source.to_string(), boots: Vec::new(), census: Census::default(), build: None, board: None, bootlist: None, elided: 0, score: Score::default() };
     for b in &boots {
         let text = String::from_utf8_lossy(&b.bytes);
         log.census.merge(census(&text));
@@ -160,6 +301,8 @@ pub fn flight_log(source: &str, boots: Vec<Boot>) -> FlightLog {
         }
     }
     log.boots = boots;
+    let (list, exp) = expected_for(log.board.as_deref());
+    log.score = score(&log.boots, list, exp);
     log
 }
 
@@ -273,10 +416,15 @@ pub fn landing_md(log: &FlightLog, dir_rel: &str, now: u64) -> String {
         "- verdicts: {} PASS / {} FAIL / {} SKIP (the `::` lines whose last `->` says PASS, FAIL or SKIP)\n",
         log.census.pass, log.census.fail, log.census.skip
     ));
+    s.push_str(&format!("- score: `{}`\n", score_tail(&log.score)));
+    if let Some(f) = &log.score.fault {
+        s.push_str(&format!("- fault: `{f}`\n"));
+    }
     s.push_str(&format!("- the kernel's list tally: {}\n", log.bootlist.as_deref().map(|l| format!("`{l}`")).unwrap_or_else(|| String::from("none in the files"))));
     s.push_str(&format!("- left out by the ring: {} byte(s) (the FLIGHTRING cut; the census counts only what the files hold)\n", log.elided));
     s.push_str(&format!("- first verdict: {}\n", log.census.first.as_deref().map(|l| format!("`{l}`")).unwrap_or_else(|| String::from("none"))));
     s.push_str(&format!("- last verdict: {}\n", log.census.last.as_deref().map(|l| format!("`{l}`")).unwrap_or_else(|| String::from("none"))));
+    s.push_str(&score_table(&log.score));
     s.push_str("\nHonest limits: the kernel rewrites the log every ~4 s (4096 passes) while the capture grows, so the last seconds before power-off may be missing; a long boot's middle is left out of the file by the ring's 256 KiB budget.\n");
     s
 }
@@ -289,6 +437,20 @@ pub fn prompt_md(log: &FlightLog, checkout: &Path, dir_rel: &str) -> String {
         checkout.display(),
         log.source
     ));
+    let sc = &log.score;
+    let ask = match (first_gap(sc), &sc.fault) {
+        (Some((n, "FAIL")), _) => format!("why did `{n}` FAIL? Quote its line (file:line) and find the cause in the code."),
+        (Some((n, _)), _) => format!(
+            "why did the boot never print `{n}`? The last verdict seen was `{}`: the boot died or wedged after it.",
+            sc.last.as_deref().unwrap_or("-")
+        ),
+        (None, Some(f)) => format!("what broke the boot at `{f}`?"),
+        (None, None) if sc.rows.is_empty() => String::from("no expected list for this board: start from the first FAIL in the census, if any."),
+        (None, None) => String::from("every expected verdict passed: go straight to step 2."),
+    };
+    s.push_str(&format!("0. Start from the gap: this landing scores `{}`. The first question: {ask}\n", score_tail(sc)));
+    s.push_str(&score_table(sc));
+    s.push('\n');
     s.push_str(&format!("1. Read `CLAUDE.md` and `docs/dev/LAWS.md` first. Then read `{dir_rel}/landing.md`, then every log whole:\n"));
     for b in &log.boots {
         s.push_str(&format!("   - `{dir_rel}/boot{}.log`\n", b.n));
@@ -404,6 +566,7 @@ fn job(src: Source, key: Option<String>, checkout: PathBuf) -> Result<(String, P
     let dir = land(&log, &checkout).map_err(fail)?;
     let l = line(&log, &dir);
     println!("{l}");
+    println!("{}", score_line(&log.score)); // LANDINGSCORE (SR437)
     Ok((l, dir))
 }
 
@@ -555,7 +718,7 @@ pub fn face_of(l: &Landing) -> TetraNode {
     TetraNode::VStack(vec![
         TetraNode::Console(ConsoleTetra { lines, ..Default::default() }),
         TetraNode::HStack(picks),
-        TetraNode::TextField { id: String::from("landing.key"), placeholder: String::from("password (a keyed card root)"), action: TextAction::ConsoleInput },
+        TetraNode::TextField { id: String::from("landing.key"), placeholder: String::from("password (a keyed card root)"), action: TextAction::ConsoleInput, secret: true }, // LANDINGSECRETFIELD (SR432): drawn as bullets
         TetraNode::HStack(vec![button("landing.read", "Read", "landing read"), button("landing.open", "Open", "landing open")]),
     ])
 }
@@ -809,6 +972,90 @@ mod tests {
         assert_eq!(refused_line("no-checkout", None), "[installer] landing refused why=no-checkout device=-");
     }
 
+    // LANDINGSCORE (SR437): the score over the fixtures.
+    fn boots_of(texts: &[&[u8]]) -> Vec<Boot> {
+        texts.iter().enumerate().map(|(i, t)| Boot { n: i as u32 + 1, bytes: t.to_vec(), ctime: 0 }).collect()
+    }
+
+    #[test]
+    fn score_names_and_faults() {
+        assert_eq!(verdict_name("[00:12:01.500] PUMPWEDGE: age_ms=2171 -> FAIL :: pump=9@cpu7"), "PUMPWEDGE");
+        assert_eq!(verdict_name("[00:11:49.020] :: DOCKPINS: pins=9 direct=9 -> PASS ::"), "DOCKPINS");
+        assert_eq!(verdict_name(":: DWI2C-TP: rdesc=ok -> PASS ::"), "DWI2C-TP");
+        assert!(fault("=== KERNEL PANIC ==="));
+        assert!(fault("panicked at src/main.rs:1:1"));
+        assert!(fault("EXCEPTION: PAGE FAULT"));
+        assert!(fault("[00:12:01.500] PUMPWEDGE: age_ms=2171 last_step=net-hda holder=- rehome=none -> FAIL :: pump=9@cpu7"));
+        assert!(!fault(":: SESSIONWEDGE: bare_to_built_ms=- -> SKIP :: reason=no-session-ignition"), "a bare WEDGE is not a fault");
+        assert!(!fault("[pump] cable rescue n=1 (SETTERWEDGE B553: the watch drains the FTDI)"));
+        assert!(!fault(":: EC: proto=fail case=x -> FAIL ::"), "a fixture's FAIL is a fail, not a fault");
+        assert_eq!(expected_for(Some("zenbook")), ("zenbook-flight-1", BRIEF_VERDICTS));
+        assert_eq!(BRIEF_VERDICTS.len(), 11);
+        assert_eq!(expected_for(Some("rmbp12")).1.len(), 0);
+        assert_eq!(expected_for(None).0, "none");
+    }
+
+    #[test]
+    fn score_boot1() {
+        let b = boots_of(&[BOOT1]);
+        let sc = score(&b, "t", &["QUIETBOOT", "MENUBAR", "STRIA"]);
+        assert_eq!((sc.reached, sc.pass, sc.fail, sc.missing, sc.grade), (3, 3, 0, 0, "green"));
+        assert_eq!(sc.last.as_deref(), Some("STRIA"), "the last verdict line (BOOTLIST's tally is not a verdict)");
+        let sc = score(&b, "t", &["QUIETBOOT", "MENUBAR", "WIFI10", "STRIA"]);
+        assert_eq!((sc.reached, sc.pass, sc.fail, sc.missing, sc.grade), (4, 3, 0, 0, "amber"), "a SKIP is reached, not passed");
+        assert_eq!(sc.rows[2], (String::from("WIFI10"), "SKIP"));
+        assert_eq!(score_line(&sc), "[installer] landing score reached=4/4 pass=3 fail=0 missing=0 last=STRIA grade=amber list=t");
+    }
+
+    #[test]
+    fn score_boot2_wedge() {
+        let sc = score(&boots_of(&[BOOT2]), "t", &["DOCKPINS", "PUMPWEDGE", "NAMEINDEXTX"]);
+        assert_eq!((sc.reached, sc.pass, sc.fail, sc.missing), (3, 1, 1, 0));
+        assert!(sc.fault.as_deref().unwrap().contains("PUMPWEDGE: age_ms=2171"));
+        assert_eq!(sc.grade, "red", "a wedge is red even with every name reached");
+        assert_eq!(sc.last.as_deref(), Some("NAMEINDEXTX"));
+        assert_eq!(first_gap(&sc), Some(("PUMPWEDGE", "FAIL")));
+    }
+
+    #[test]
+    fn score_truncated() {
+        let text = std::str::from_utf8(BOOT1).unwrap();
+        let cut = text.find(":: MENUBAR: rows=7 -> PASS ::\n").unwrap() + ":: MENUBAR: rows=7 -> PASS ::\n".len();
+        let sc = score(&boots_of(&[&BOOT1[..cut]]), "t", &["QUIETBOOT", "MENUBAR", "WIFI10", "STRIA"]);
+        assert_eq!((sc.reached, sc.pass, sc.missing, sc.grade), (2, 2, 2, "red"));
+        assert_eq!(sc.last.as_deref(), Some("MENUBAR"), "last= names where the boot died");
+        assert_eq!(first_gap(&sc), Some(("WIFI10", "missing")));
+    }
+
+    #[test]
+    fn score_panic_and_silence() {
+        let sc = score(&boots_of(&[b":: MENUBAR: rows=7 -> PASS ::\n=== KERNEL PANIC ===\n"]), "none", &[]);
+        assert_eq!((sc.grade, sc.fault.as_deref()), ("red", Some("=== KERNEL PANIC ===")));
+        let sc = score(&boots_of(&[b":: BOOT: total=1ms ::\n"]), "none", &[]);
+        assert_eq!((sc.grade, sc.last.as_deref()), ("red", None), "no verdict at all is red");
+        assert!(score_line(&sc).ends_with("reached=0/0 pass=0 fail=0 missing=0 last=- grade=red list=none"));
+        let sc = score(&boots_of(&[BOOT1]), "none", &[]);
+        assert_eq!(sc.grade, "green", "no list, no FAIL, no fault");
+    }
+
+    #[test]
+    fn score_flight_log_and_writers() {
+        let log = flight_log("mmcblk0", boots_of(&[BOOT1, BOOT2]));
+        assert_eq!(score_line(&log.score), "[installer] landing score reached=0/11 pass=0 fail=0 missing=11 last=NAMEINDEXTX grade=red list=zenbook-flight-1");
+        let root = scratch("score");
+        fs::create_dir_all(root.join("docs/dev/evidence")).unwrap();
+        let dir = land_at(&log, &root, CTIME).unwrap();
+        let md = fs::read_to_string(dir.join("landing.md")).unwrap();
+        assert!(md.contains("- score: `reached=0/11 pass=0 fail=0 missing=11 last=NAMEINDEXTX grade=red list=zenbook-flight-1`"), "{md}");
+        assert!(md.contains("- fault: `[00:12:01.500] PUMPWEDGE: "), "{md}");
+        assert!(md.contains("| PLATFORM | missing |") && md.contains("| UNAFSX86-T | missing |") && md.contains(FLIGHT_BRIEF), "{md}");
+        let p = fs::read_to_string(dir.join("PROMPT.md")).unwrap();
+        assert!(p.contains("0. Start from the gap: this landing scores `reached=0/11 "), "{p}");
+        assert!(p.contains("why did the boot never print `PLATFORM`? The last verdict seen was `NAMEINDEXTX`"), "{p}");
+        assert!(p.find("0. Start from the gap").unwrap() < p.find("1. Read `CLAUDE.md`").unwrap());
+        let _ = fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn civil_dates() {
         assert_eq!(civil(0), (1970, 1, 1, 0, 0));
@@ -865,5 +1112,8 @@ mod tests {
         let TetraNode::Console(con) = &kids[0] else { panic!("list") };
         assert!(con.lines.iter().any(|x| x.text.starts_with("> mmcblk0")));
         assert!(con.lines.iter().all(|x| !x.text.contains("hunter2")));
+        // LANDINGSECRETFIELD (SR432): the password field is secret, and no node of the face carries the password.
+        assert!(matches!(&kids[2], TetraNode::TextField { id, secret: true, .. } if id == "landing.key"));
+        assert!(!format!("{:?}", face_of(&l)).contains("hunter2"));
     }
 }

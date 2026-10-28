@@ -1137,11 +1137,28 @@ refs/heads/exec-rmbp-masksitesseccore   0d47aac2f FOLDED-BY-HAND (this commit) 2
 refs/heads/exec-rmbp-aetherfontdboracle   53745b67c FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-preemptoffarmusbnetdrive   aaa7c1ae2 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-retiredrainrest   236f69d36 FOLDED-BY-HAND (this commit) 2026-10-27
-refs/heads/exec-rmbp-aetherabscb   4406f63eb IN-FLIGHT cut 2026-10-28
-refs/heads/exec-rmbp-landingsecretfield   4406f63eb IN-FLIGHT cut 2026-10-28
-refs/heads/exec-rmbp-installerbugreport   94052c5c6 IN-FLIGHT cut 2026-10-28
-refs/heads/exec-rmbp-aetherelfcaption   94052c5c6 IN-FLIGHT cut 2026-10-28
-refs/heads/exec-rmbp-installerfacelive   94052c5c6 IN-FLIGHT cut 2026-10-28
+refs/heads/exec-rmbp-aetherabscb   5aa79872e FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-landingsecretfield   d3751b40a FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-installerbugreport   00658319a FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-aetherelfcaption   c34345bbc FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-installerfacelive   f837ad588 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-xhciloanptpyieldkatcloser   52c88407f FOLDED-BY-HAND (this commit) 2026-10-27
-refs/heads/exec-rmbp-preemptoffarmcursormove   94052c5c6 IN-FLIGHT cut 2026-10-28
-refs/heads/exec-rmbp-bindnowgate   94052c5c6 IN-FLIGHT cut 2026-10-28
+refs/heads/exec-rmbp-preemptoffarmcursormove   9ad5a5da8 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-bindnowgate   94708d143 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-lockregxcorecost   1ca6f4ad2 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-aethercentercell   871a6b0ca IN-FLIGHT cut 2026-10-28
+refs/heads/exec-rmbp-xhciloanptpyieldpollskip   2a2b8ed7a FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-landingscore   1af57a39d FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-xhciloanptpyieldptptake   a446467de FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-unafsflightlist   412e8aba3 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-xhciloanptpyieldkatrule   8978c4c25 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-preemptoffarmquantum   d523b41e3 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-closeflightrescue   f49043363 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-aethercaptioncore   736f42b84 IN-FLIGHT cut 2026-10-28
+refs/heads/exec-rmbp-installerproviderholocron   736f42b84 IN-FLIGHT cut 2026-10-28
+refs/heads/exec-rmbp-masksiteszeroms   d41baf8ce IN-FLIGHT cut 2026-10-28
+refs/heads/exec-rmbp-xhciloanptpyieldptpwait   d41baf8ce IN-FLIGHT cut 2026-10-28
+refs/heads/exec-rmbp-preemptoffarmstaledrop   bbd0d82b3 IN-FLIGHT cut 2026-10-28
+refs/heads/exec-rmbp-masksitesoverflow   bbd0d82b3 IN-FLIGHT cut 2026-10-28
+refs/heads/exec-rmbp-aetherpushtrim   bbd0d82b3 IN-FLIGHT cut 2026-10-28
+refs/heads/exec-rmbp-facelivesubscriptiondrop   bbd0d82b3 IN-FLIGHT cut 2026-10-28
