@@ -11360,7 +11360,7 @@ pub mod preemptoff {
         }
         let ((fat_on, fat_held), (dir_on, dir_held)) = crate::fs::fat::preemptoff_span_probe();
         let ((m_fat_on, _), (m_dir_on, _)) = crate::arch::without_interrupts(crate::fs::fat::preemptoff_span_probe);
-        let masked_kept = !m_fat_on && !m_dir_on; let ul = crate::fs::unafs::unafs_leg(); let lk = leak_kat(); let sk = stale_kat(); let sl = sleep_kat(); let wl = crate::video::wm::wmtable_leg(); let cl = casts_leg(); let cn = casts_nest_leg(); let cnn = casts_now_nest_leg(); // PREEMPTOFFARMCASTSNOWINPASSLEG (zenbook-ledger Z109): `casts_now`'s in-pass nest leg (`casts_now_nest=`) after the in-pass `track` leg, before `released`. PREEMPTOFFARMCASTSINPASSLEG (zenbook-ledger Z106): the in-pass nest leg (`casts_nest=`) after the CASTS leg, before `released`. PREEMPTOFFARMCASTSLEG (zenbook-ledger Z103): the CASTS leg (`casts_leg=`) after the TABLE leg, before `released`. PREEMPTOFFARMSLEEPCHECK (zenbook-ledger Z95): the sleep KAT reads the stale KAT's real in-span yield, right after it. PREEMPTOFFARMWMTABLE (zenbook-ledger Z92): the TABLE leg (`wmtable_leg=`), before `released`. PREEMPTOFFARMSTALEDROP (zenbook-ledger Z91): the stale-drop KAT after the leak KAT. PREEMPTOFFARMQUANTUM (zenbook-ledger Z89): the leak-reset KAT runs before `released` too. PREEMPTOFFARMUNAFS (zenbook-ledger Z79): the UnaFS read-arm leg, before `released` so it also proves the leg gave the count back (LINE-NEUTRAL)
+        let masked_kept = !m_fat_on && !m_dir_on; let ul = crate::fs::unafs::unafs_leg(); let lk = leak_kat(); let sk = stale_kat(); let sl = sleep_kat(); let wl = crate::video::wm::wmtable_leg(); let cl = casts_leg(); let cn = casts_nest_leg(); let cnn = casts_now_nest_leg(); let rl = route_leg(); // PREEMPTOFFARMCASTSNOWINPASSLEG (zenbook-ledger Z109): `casts_now`'s in-pass nest leg (`casts_now_nest=`) after the in-pass `track` leg, before `released`. PREEMPTOFFARMCASTSINPASSLEG (zenbook-ledger Z106): the in-pass nest leg (`casts_nest=`) after the CASTS leg, before `released`. PREEMPTOFFARMCASTSLEG (zenbook-ledger Z103): the CASTS leg (`casts_leg=`) after the TABLE leg, before `released`. PREEMPTOFFARMSLEEPCHECK (zenbook-ledger Z95): the sleep KAT reads the stale KAT's real in-span yield, right after it. PREEMPTOFFARMWMTABLE (zenbook-ledger Z92): the TABLE leg (`wmtable_leg=`), before `released`. PREEMPTOFFARMSTALEDROP (zenbook-ledger Z91): the stale-drop KAT after the leak KAT. PREEMPTOFFARMQUANTUM (zenbook-ledger Z89): the leak-reset KAT runs before `released` too. PREEMPTOFFARMUNAFS (zenbook-ledger Z79): the UnaFS read-arm leg, before `released` so it also proves the leg gave the count back (LINE-NEUTRAL)
         let released = !witness().0;
         let reason = if !fat_on {
             Some("fat-masked")
@@ -11371,25 +11371,25 @@ pub mod preemptoff {
         } else if !masked_kept {
             Some("unmasked")
         } else if !released {
-            Some("leaked") } else if !(ul == "ok" || ul.starts_with("skip")) { Some("unafs-leg") } else if lk != "ok" { Some("leak-kat") } else if sk != "ok" { Some("stale-kat") } else if sl != "ok" { Some("sleep-kat") } else if !(wl == "ok" || wl.starts_with("skip")) { Some("wmtable-leg") } else if !(cl == "ok" || cl.starts_with("skip")) { Some("casts-leg") } else if !(cn == "ok" || cn.starts_with("skip")) { Some("casts-nest") } else if !(cnn == "ok" || cnn.starts_with("skip")) { Some("casts-now-nest")
+            Some("leaked") } else if !(ul == "ok" || ul.starts_with("skip")) { Some("unafs-leg") } else if lk != "ok" { Some("leak-kat") } else if sk != "ok" { Some("stale-kat") } else if sl != "ok" { Some("sleep-kat") } else if !(wl == "ok" || wl.starts_with("skip")) { Some("wmtable-leg") } else if !(cl == "ok" || cl.starts_with("skip")) { Some("casts-leg") } else if !(cn == "ok" || cn.starts_with("skip")) { Some("casts-nest") } else if !(cnn == "ok" || cnn.starts_with("skip")) { Some("casts-now-nest") } else if !(rl == "armed-ok" || rl.starts_with("skip")) { Some("route-leg")
         } else {
             None
         };
         let ok = |b: bool, y: &'static str, n: &'static str| if b { y } else { n };
         match reason {
             None => serial_println!(
-                ":: PREEMPTAUDIT: arch=aarch64 sites={} isr={} holder={} both={} converted={} converted_fat={} fat_irq_on=ok dir_irq_on=ok fat_held=ok dir_held=ok masked_kept=ok released=ok unafs_leg={} leak_reset={} leak_kat={} stale_drop={} stale_kat={} sleep_in_span={} sleep_kat={} wmtable_leg={} casts_leg={} casts_nest={} casts_now_nest={} -> PASS ::",
-                AUDIT_SITES, AUDIT_ISR, AUDIT_HOLDER, AUDIT_BOTH, AUDIT_CONVERTED, CONVERTED_FAT, ul, leak_resets(), lk, stale_drops(), sk, sleep_in_spans(), sl, wl, cl, cn, cnn
+                ":: PREEMPTAUDIT: arch=aarch64 sites={} isr={} holder={} both={} converted={} converted_fat={} fat_irq_on=ok dir_irq_on=ok fat_held=ok dir_held=ok masked_kept=ok released=ok unafs_leg={} leak_reset={} leak_kat={} stale_drop={} stale_kat={} sleep_in_span={} sleep_kat={} wmtable_leg={} casts_leg={} casts_nest={} casts_now_nest={} route_leg={} -> PASS ::",
+                AUDIT_SITES, AUDIT_ISR, AUDIT_HOLDER, AUDIT_BOTH, AUDIT_CONVERTED, CONVERTED_FAT, ul, leak_resets(), lk, stale_drops(), sk, sleep_in_spans(), sl, wl, cl, cn, cnn, rl
             ),
             Some(r) => serial_println!(
-                ":: PREEMPTAUDIT: arch=aarch64 sites={} isr={} holder={} both={} converted={} converted_fat={} fat_irq_on={} dir_irq_on={} fat_held={} dir_held={} masked_kept={} released={} unafs_leg={} leak_reset={} leak_kat={} stale_drop={} stale_kat={} sleep_in_span={} sleep_kat={} wmtable_leg={} casts_leg={} casts_nest={} casts_now_nest={} -> FAIL reason={} ::",
+                ":: PREEMPTAUDIT: arch=aarch64 sites={} isr={} holder={} both={} converted={} converted_fat={} fat_irq_on={} dir_irq_on={} fat_held={} dir_held={} masked_kept={} released={} unafs_leg={} leak_reset={} leak_kat={} stale_drop={} stale_kat={} sleep_in_span={} sleep_kat={} wmtable_leg={} casts_leg={} casts_nest={} casts_now_nest={} route_leg={} -> FAIL reason={} ::",
                 AUDIT_SITES, AUDIT_ISR, AUDIT_HOLDER, AUDIT_BOTH, AUDIT_CONVERTED, CONVERTED_FAT,
                 ok(fat_on, "ok", "masked"),
                 ok(dir_on, "ok", "masked"),
                 ok(fat_held, "ok", "free"),
                 ok(dir_held, "ok", "free"),
                 ok(masked_kept, "ok", "unmasked"),
-                ok(released, "ok", "leaked"), ul, leak_resets(), lk, stale_drops(), sk, sleep_in_spans(), sl, wl, cl, cn, cnn,
+                ok(released, "ok", "leaked"), ul, leak_resets(), lk, stale_drops(), sk, sleep_in_spans(), sl, wl, cl, cn, cnn, rl,
                 r
             ),
         }
@@ -11936,6 +11936,57 @@ pub mod preemptoff {
     /// Z109: likewise for `casts_now`'s leg.
     #[cfg(not(feature = "desktop_firmware"))]
     pub fn casts_now_nest_leg() -> &'static str {
+        "skip(no-desk)"
+    }
+
+    // ══ PREEMPTOFFARMWMTABLEROUTELEG (zenbook-ledger Z110) — the IRQ-context route's leg on the aarch64 audit (`route_leg=`) ══
+    // Z97's route (`video/fbcon.rs` `route_present_banded` returns after its OWE-FIRST block when `exceptions::in_irq` says
+    // this core is in IRQ context) is read by no lane: raspi4b delivers no live timer to a desktop build. The FIXTURE arms
+    // the mark: masked on this core (the vector's and Z101's rule: written only by its own core with IRQ masked, and no
+    // switch can run between the arm and the disarm), it reads `in_irq` false (PSTATE.I alone is not IRQ context), arms
+    // `irq_mark(true)`, reads `in_irq` true, drives the REAL route once with nothing owed (`fbcon::route_leg_probe`: held =
+    // Z97's `IRQ_HELD` moved, the leg's own count given back), disarms and reads `in_irq` false again. The token says
+    // `armed-…`: the mark was armed by this leg, never by the vector. Residual: `IRQ_HELD` is global, so an ISR print on
+    // ANOTHER core inside the window reads as held; the one lane that runs the leg (`kernel8-test --desk`) has no live timer.
+
+    /// Z110 (`route_leg=`): `armed-ok`, `skip(masked)`, `skip(no-fbcon)`, `pre-marked`, `mark-miss`, `stale`, `armed-miss`.
+    #[cfg(all(feature = "desktop_firmware", feature = "witness"))]
+    pub fn route_leg() -> &'static str {
+        if crate::arch::irqs_masked() {
+            return "skip(masked)";
+        }
+        let (pre, armed, routed, post) = crate::arch::without_interrupts(|| {
+            let pre = crate::arch::exceptions::in_irq();
+            super::super::exceptions::irq_mark(true);
+            let armed = crate::arch::exceptions::in_irq();
+            let routed = crate::video::fbcon::route_leg_probe();
+            super::super::exceptions::irq_mark(false);
+            (pre, armed, routed, crate::arch::exceptions::in_irq())
+        });
+        if pre {
+            "pre-marked"
+        } else if !armed {
+            "mark-miss"
+        } else if post {
+            "stale"
+        } else {
+            match routed {
+                None => "skip(no-fbcon)",
+                Some(false) => "armed-miss",
+                Some(true) => "armed-ok",
+            }
+        }
+    }
+
+    /// Z110: the leg rides `witness` (the media desk images leave it off).
+    #[cfg(all(feature = "desktop_firmware", not(feature = "witness")))]
+    pub fn route_leg() -> &'static str {
+        "skip(no-witness)"
+    }
+
+    /// Z110: no mark and no routed console off `desktop_firmware` (default `kernel8-test`, `test-arm`, the plain Orin image).
+    #[cfg(not(feature = "desktop_firmware"))]
+    pub fn route_leg() -> &'static str {
         "skip(no-desk)"
     }
 }

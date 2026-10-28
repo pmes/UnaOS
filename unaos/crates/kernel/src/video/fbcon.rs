@@ -3698,3 +3698,26 @@ fn irq_present_hold() -> bool {
 fn irq_present_hold() -> bool {
     false
 }
+
+// ══ PREEMPTOFFARMWMTABLEROUTELEG (zenbook-ledger Z110) — the route's leg door ══
+// The aarch64 audit's `route_leg` (sched.rs `preemptoff`) arms this core's IRQ mark masked and calls here: the REAL
+// `route_present_banded`, once, with nothing owed (no rows recorded, so a held call leaves `PEND` as it found it). Its one
+// read of IRQ context is `irq_present_hold`, whose only trace is `IRQ_HELD`: held = the count moved across this call, and
+// the leg's own count is given back. No console window: the route returns before its read, so `None` (`skip(no-fbcon)`).
+// Residual: `IRQ_HELD` is global, so an ISR print on ANOTHER core inside the window reads as held (the one lane that runs
+// the leg, `kernel8-test --desk`, delivers no live timer).
+
+/// PREEMPTOFFARMWMTABLEROUTELEG (Z110): did the route HOLD this call? `None` = no console window.
+#[cfg(all(target_arch = "aarch64", feature = "desktop_firmware", feature = "witness"))]
+pub(crate) fn route_leg_probe() -> Option<bool> {
+    if CONSOLE_WIN.load(Ordering::Relaxed) == wm::WIN_NONE {
+        return None;
+    }
+    let h0 = IRQ_HELD.load(Ordering::Relaxed);
+    route_present_banded(Owed::Nothing, true);
+    let held = IRQ_HELD.load(Ordering::Relaxed) != h0;
+    if held {
+        IRQ_HELD.fetch_sub(1, Ordering::Relaxed);
+    }
+    Some(held)
+}

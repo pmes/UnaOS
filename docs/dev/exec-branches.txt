@@ -1218,7 +1218,7 @@ refs/heads/exec-rmbp-aetherfileuaedges   a311ee381 IN-FLIGHT cut 2026-10-28
 refs/heads/exec-rmbp-legskiplate   b01095609 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-aethercaptionside   a1315f5c6 IN-FLIGHT cut 2026-10-28
 refs/heads/exec-rmbp-gen7parkword   c0675186a FOLDED-BY-HAND (this commit) 2026-10-27
-refs/heads/exec-rmbp-preemptoffarmwmtablerouteleg   a1315f5c6 IN-FLIGHT cut 2026-10-28
+refs/heads/exec-rmbp-preemptoffarmwmtablerouteleg   eebf6cfa1 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-preemptoffsleepcheckyieldsitewrappers   36ddba81c IN-FLIGHT cut 2026-10-28
 refs/heads/exec-rmbp-legskipclaim   36ddba81c IN-FLIGHT cut 2026-10-28
 refs/heads/exec-rmbp-xhciloanptpyieldqemumtppick   36ddba81c IN-FLIGHT cut 2026-10-28
