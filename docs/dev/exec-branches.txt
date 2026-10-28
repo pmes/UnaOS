@@ -1133,7 +1133,7 @@ refs/heads/exec-rmbp-xhciloanpumpholderkat   a86f4849a FOLDED-BY-HAND (this comm
 refs/heads/exec-rmbp-lockregouterxcore   7a159e120 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-unafsbindtrigger   9d880fc02 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-xhciloanptpyieldpolltake   296cac776 IN-FLIGHT cut 2026-10-28
-refs/heads/exec-rmbp-masksitesseccore   296cac776 IN-FLIGHT cut 2026-10-28
+refs/heads/exec-rmbp-masksitesseccore   0d47aac2f FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-aetherfontdboracle   296cac776 IN-FLIGHT cut 2026-10-28
 refs/heads/exec-rmbp-preemptoffarmusbnetdrive   4406f63eb IN-FLIGHT cut 2026-10-28
 refs/heads/exec-rmbp-retiredrainrest   4406f63eb IN-FLIGHT cut 2026-10-28
