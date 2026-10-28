@@ -745,6 +745,105 @@ pub fn button_label<'a>(ty: &str, value: Option<&'a str>) -> alloc::borrow::Cow<
     }
 }
 
+// ---- AETHERCAPTIONCORE (SR438): a push button's caption geometry, one rule for both rings ----------------------
+
+/// AETHERCAPTIONCORE (SR438): where a push button's caption sits: `x` the pen's left edge (sub-pixel, never
+/// rounded), `top` the origin of its one line box, `clip` the padding box as (x0, y0, x1, y1) (html.css `input
+/// { overflow: clip }`; a pixel (x, y) is inside when x >= x0 && x < x1 && y >= y0 && y < y1, in f32).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CaptionBox {
+    pub x: f32,
+    pub top: f32,
+    pub clip: (f32, f32, f32, f32),
+}
+
+impl CaptionBox {
+    /// The baseline row: `top` plus the ring's offset from a line box's top to its baseline (`lead`, the
+    /// half-leading rule `Fonts::baseline_offset` at `line-height: normal`), rounded half away from zero — what
+    /// the host's `draw_lines` + text_host `draw_glyph` produce from `top`.
+    pub fn baseline(&self, lead: f32) -> f32 {
+        crate::fmath::round(self.top + lead)
+    }
+}
+
+/// AETHERCAPTIONCORE (SR438): the ONE caption geometry both rings paint a push button's label by (the host's
+/// render/mod.rs push arm, AETHERSUBMITCAPTION SR410, and AETHER.ELF's paint.rs `caption`, AETHER-ELFCAPTION
+/// SR434): the border box at (`bx`, `by`) sized `bw` x `bh` with its taffy `border` / `padding` edges, the label
+/// `text_w` wide (measured by the ring in the element's font) and the extents `ascent` / `descent` the line is
+/// centred by. The label centres on both axes in the content box (an overflowing label stays centred: one line,
+/// never wrapped), its inked line (ascent + descent) on the content box's middle, and clips to the padding box.
+/// The arithmetic is the host's, expression for expression, so its pixels do not move. Pure, no font.
+#[allow(clippy::too_many_arguments)]
+pub fn caption_box(
+    bx: f32,
+    by: f32,
+    bw: f32,
+    bh: f32,
+    border: taffy::Rect<f32>,
+    padding: taffy::Rect<f32>,
+    text_w: f32,
+    ascent: f32,
+    descent: f32,
+) -> CaptionBox {
+    let (pad, bord) = (padding, border);
+    let inset_l = pad.left + bord.left;
+    let inset_r = pad.right + bord.right;
+    let content_x = bx + inset_l;
+    let content_y = by + pad.top + bord.top;
+    let content_w = (bw - inset_l - inset_r).max(0.0);
+    let content_h = (bh - pad.top - bord.top - pad.bottom - bord.bottom).max(0.0);
+    let center_y = content_y + content_h / 2.0;
+    CaptionBox {
+        x: content_x + (content_w - text_w) / 2.0,
+        top: center_y - (ascent + descent) / 2.0,
+        clip: (bx + bord.left, by + bord.top, bx + bw - bord.right, by + bh - bord.bottom),
+    }
+}
+
+#[cfg(test)]
+mod caption_box_kat {
+    use super::{caption_box, CaptionBox};
+    use taffy::Rect;
+
+    fn edges(left: f32, right: f32, top: f32, bottom: f32) -> Rect<f32> {
+        Rect { left, right, top, bottom }
+    }
+
+    /// A label narrower than the content box: centred on both axes, clipped to the padding box.
+    #[test]
+    fn captioncore_fits_kat() {
+        let c = caption_box(10.0, 20.0, 100.0, 30.0, edges(2.0, 2.0, 2.0, 2.0), edges(6.0, 6.0, 1.0, 1.0), 40.0, 12.0, 3.0);
+        // content box (18, 23) 84 x 24; x = 18 + (84 - 40) / 2; top = 23 + 12 - 7.5
+        assert_eq!(c, CaptionBox { x: 40.0, top: 27.5, clip: (12.0, 22.0, 108.0, 48.0) });
+        assert_eq!(c.baseline(12.0), 40.0); // 39.5 rounds half away from zero
+        assert_eq!(c.baseline(11.0), 39.0); // 38.5 likewise
+        assert_eq!(c.baseline(10.9), 38.0);
+    }
+
+    /// A label wider than the content box stays centred (its pen left of the content box); the clip is still
+    /// the padding box, not the content box.
+    #[test]
+    fn captioncore_overflow_kat() {
+        let c = caption_box(10.0, 20.0, 100.0, 30.0, edges(2.0, 2.0, 2.0, 2.0), edges(6.0, 6.0, 1.0, 1.0), 120.0, 12.0, 3.0);
+        assert_eq!(c.x, 0.0); // 18 + (84 - 120) / 2
+        assert!(c.x < 18.0);
+        assert_eq!(c.top, 27.5);
+        assert_eq!(c.clip, (12.0, 22.0, 108.0, 48.0));
+    }
+
+    /// Padding wider than the box: the content box clamps to 0 x 0 at its corner and the label centres on that
+    /// point; fractional edges pass through unrounded; a negative baseline rounds away from zero too.
+    #[test]
+    fn captioncore_clamped_kat() {
+        let c = caption_box(0.5, 0.25, 10.0, 6.0, edges(1.0, 1.0, 1.0, 1.0), edges(6.0, 6.0, 3.0, 3.0), 8.0, 4.0, 2.0);
+        // content (7.5, 4.25) 0 x 0; x = 7.5 - 4; top = 4.25 - 3
+        assert_eq!(c, CaptionBox { x: 3.5, top: 1.25, clip: (1.5, 1.25, 9.5, 5.25) });
+        assert_eq!(c.baseline(0.25), 2.0);
+        let n = CaptionBox { x: 0.0, top: -3.0, clip: (0.0, 0.0, 0.0, 0.0) };
+        assert_eq!(n.baseline(0.5), -3.0); // -2.5 rounds away from zero
+    }
+}
+
 /// Controls the UA sheet sizes as border-box: buttons, selects, and the
 /// button-like / checkable inputs.
 fn ua_border_box<N: DomNode>(node: &N, tag: &str) -> bool {
