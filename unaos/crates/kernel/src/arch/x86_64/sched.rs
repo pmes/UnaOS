@@ -3660,12 +3660,12 @@ fn make_ready(task: Box<Task>) {
 /// Cooperatively give up the CPU. The current task is marked ready and rotated to the back of its
 /// run queue (by the scheduler), and another runnable task runs. Returns when this task is later
 /// rescheduled. No-op if called outside a scheduled task (e.g. on the BSP main loop).
-pub fn yield_now() {
+#[track_caller] pub fn yield_now() {
     // Critical section with IF=0: nothing may preempt us between marking ready and switching.
     // Save the caller's IF and restore exactly that on exit (don't blindly re-enable — a caller
     // could be in its own interrupts-off region).
     let was_enabled = x86_64::instructions::interrupts::are_enabled();
-    x86_64::instructions::interrupts::disable();
+    x86_64::instructions::interrupts::disable(); yieldsite::note(); // PREEMPTOFFARMSLEEPCHECKYIELDSITE (zenbook-ledger Z107): the caller's Location into this core's YIELD_AT, masked, before the switch. LINE-NEUTRAL
     let cpu = percpu::this_cpu().cpu_index as usize;
     let raw = SCHED[cpu].current.load(Ordering::Acquire) as *mut Task;
     if !raw.is_null() {
@@ -3753,9 +3753,9 @@ pub fn exit() -> ! {
 /// loop top, and the timer re-enters that loop every tick, or at this deadline under `tickless` (B765)
 /// (granularity and worst-case wake latency are one tick). `ticks == 0` wakes on the next loop pass (~0–1 tick).
 /// No-op outside a scheduled task (a boot-path caller that is not itself a task), like `yield_now`.
-pub fn sleep_ticks(ticks: u64) {
+#[track_caller] pub fn sleep_ticks(ticks: u64) {
     let was_enabled = x86_64::instructions::interrupts::are_enabled();
-    x86_64::instructions::interrupts::disable();
+    x86_64::instructions::interrupts::disable(); yieldsite::note(); // PREEMPTOFFARMSLEEPCHECKYIELDSITE (zenbook-ledger Z107): the caller's Location into this core's YIELD_AT, masked, before the switch. LINE-NEUTRAL
     let cpu = percpu::this_cpu().cpu_index as usize;
     let raw = SCHED[cpu].current.load(Ordering::Acquire) as *mut Task;
     if !raw.is_null() {
@@ -3784,7 +3784,7 @@ pub fn sleep_ticks(ticks: u64) {
 /// tick of the requested wall-clock delay on any machine. Before calibration the tick is ~0.8 ms
 /// under QEMU, so the sleep runs proportionally short (documented degradation, not a bug). Like
 /// `sleep_ticks`, a no-op outside a scheduled task.
-pub fn sleep_ms(ms: u64) {
+#[track_caller] pub fn sleep_ms(ms: u64) {
     sleep_ticks(crate::arch::ms_to_ticks(ms));
 }
 
@@ -3861,9 +3861,9 @@ impl Semaphore {
     /// caller that issues a resource on success (e.g. `Mutex::lock`) MUST check the return value:
     /// a `false` means NO permit was taken, so no resource may be handed out.
     #[must_use]
-    pub fn wait(&self) -> bool {
+    #[track_caller] pub fn wait(&self) -> bool {
         let was_enabled = x86_64::instructions::interrupts::are_enabled();
-        x86_64::instructions::interrupts::disable(); // IF=0 for the whole critical section
+        x86_64::instructions::interrupts::disable(); yieldsite::note(); // IF=0 for the whole critical section
         self.lock_raw();
 
         if self.count.load(Ordering::Relaxed) > 0 {
@@ -4101,10 +4101,10 @@ pub fn futex_key(slot: usize, uaddr: u64) -> u64 {
 /// CALLER's own ring-3 window, and `key` must be `futex_key(caller_slot, uaddr)`; this function
 /// dereferences `uaddr` at CPL 0 under the caller's still-live CR3 (a syscall runs in the caller's
 /// address space) and performs no validation of its own.
-pub fn futex_wait(key: u64, uaddr: u64, expected: u32) -> FutexWait {
+#[track_caller] pub fn futex_wait(key: u64, uaddr: u64, expected: u32) -> FutexWait {
     debug_assert!(key != 0, "futex key must be non-zero");
     let was_enabled = x86_64::instructions::interrupts::are_enabled();
-    x86_64::instructions::interrupts::disable(); // IF=0 for the whole critical section
+    x86_64::instructions::interrupts::disable(); yieldsite::note(); // IF=0 for the whole critical section
 
     // Select the bucket: an existing one serving this key, else claim a free one. Left LOCKED on
     // success — the compare and the park both happen under that same hold.
@@ -5019,10 +5019,10 @@ impl Condvar {
     ///
     /// The lettered step order below is load-bearing for lost-wakeup safety and the lock-ordering
     /// invariant; do not reorder it (see the type doc and the module header).
-    pub fn wait<'a, T>(&self, guard: MutexGuard<'a, T>) -> MutexGuard<'a, T> {
+    #[track_caller] pub fn wait<'a, T>(&self, guard: MutexGuard<'a, T>) -> MutexGuard<'a, T> {
         // (a) Mask interrupts for the whole critical section; remember the caller's IF to restore.
         let was_enabled = x86_64::instructions::interrupts::are_enabled();
-        x86_64::instructions::interrupts::disable();
+        x86_64::instructions::interrupts::disable(); yieldsite::note(); // PREEMPTOFFARMSLEEPCHECKYIELDSITE (zenbook-ledger Z107): the caller's Location into this core's YIELD_AT, masked, before the switch. LINE-NEUTRAL
 
         // (b) Must be on a scheduled task. Assert BEFORE consuming the guard: were we to forget the
         //     guard first and then panic, the mutex would be permanently locked — the explicit
@@ -9765,7 +9765,7 @@ pub mod preemptoff {
         let follower = super::spawn_joinable("preemptoff-stale-after", stale_kat_after, 0, c, super::PRIO_NORMAL);
         let m0 = crate::arch::ms();
         while !STALE_KAT_AFTER_RAN.load(Ordering::Acquire) && crate::arch::ms().wrapping_sub(m0) < 1000 {
-            super::yield_now();
+            super::yieldsite::kat_mark(line!()); super::yield_now(); // PREEMPTOFFARMSLEEPCHECKYIELDSITE (zenbook-ledger Z107): this line is the yield the sleep KAT must name (`kat_verdict`). LINE-NEUTRAL
         }
         let code = if !STALE_KAT_AFTER_RAN.load(Ordering::Acquire) {
             put(g1);
@@ -9875,7 +9875,7 @@ pub mod preemptoff {
         let kat = SLEEP_KAT_TID.load(Ordering::Relaxed);
         if kat != 0 && kat == outgoing {
             SLEEP_KAT_HITS.fetch_add(1, Ordering::Relaxed);
-            SLEEP_KAT_VIA.store(via, Ordering::Relaxed);
+            SLEEP_KAT_VIA.store(via, Ordering::Relaxed); super::yieldsite::kat_note(cpu); // PREEMPTOFFARMSLEEPCHECKYIELDSITE (zenbook-ledger Z107): the KAT's named yield site. LINE-NEUTRAL
             return;
         }
         SLEEP_IN_SPAN.fetch_add(1, Ordering::Relaxed);
@@ -9908,12 +9908,12 @@ pub mod preemptoff {
             return;
         };
         serial_println!(
-            "[sched] preempt-off sleep in span cpu={} holder={} site={}:{} via={} -> switched out holding the count (PREEMPTOFFX86SLEEPCHECK B1071)",
+            "[sched] preempt-off sleep in span cpu={} holder={} site={}:{} via={} yield={} -> switched out holding the count (PREEMPTOFFX86SLEEPCHECK B1071)",
             cpu,
             SLEEP_PEND_TID[cpu].load(Ordering::Relaxed),
             l.file(),
             l.line(),
-            via_word(SLEEP_PEND_VIA[cpu].load(Ordering::Relaxed))
+            via_word(SLEEP_PEND_VIA[cpu].load(Ordering::Relaxed)), super::yieldsite::Site(cpu)
         );
     }
 
@@ -9935,7 +9935,7 @@ pub mod preemptoff {
         } else if via != VIA_YIELD {
             "wrong-via"
         } else {
-            "ok"
+            super::yieldsite::kat_verdict() // PREEMPTOFFARMSLEEPCHECKYIELDSITE (zenbook-ledger Z107): ok only when the named yield is stale_kat_run's line (else wrong-site)
         }
     }
 }
@@ -10237,4 +10237,78 @@ fn pump_apart(hid0: usize, dead: usize) -> (bool, alloc::string::String) {
     let p = crate::hidstall::pump_cpu();
     let ok = p == to && p != SGL_HOME.load(Ordering::Acquire) && Some(p) != crate::arch::smp::xhci_worker_cpu(0) && p != 0;
     if ok { (true, alloc::string::String::from("ok")) } else { (false, alloc::format!("fail(c{})", p as i64)) }
+}
+
+// ══ PREEMPTOFFARMSLEEPCHECKYIELDSITE (zenbook-ledger Z107) — the sleep-in-span line names the YIELD CALL too ══
+// CHARTER: kernel-by-ruling (the scheduler's own preempt-off sleep check, x86_64). The five voluntary switch-out
+// entries (`yield_now`, `sleep_ticks`, `Semaphore::wait`, `futex_wait`, `Condvar::wait`, and the `sleep_ms` wrapper) are
+// `#[track_caller]`; each folds `note()` after its own IRQ mask, before its switch, storing the caller's `Location` in
+// this core's ONE word `YIELD_AT`. The owning core writes it masked and reads it in `preemptoff::sleep_report` in the same
+// masked scheduler pass (no task runs between the switch-back's `sleep_check` and `sleep_report`), so no lock. The
+// sleep KAT stashes the yield it was named for (`kat_note`) and asserts it is `stale_kat_run`'s own yield line
+// (`kat_mark(line!())` on that line) in `kat_verdict` (`sleep_kat=ok` | `wrong-site`).
+mod yieldsite {
+    use core::panic::Location;
+    use core::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
+
+    /// Z107: this core's last wait-entry caller (null = none yet). Written and read only by its own core, IRQ masked.
+    static YIELD_AT: [AtomicPtr<Location<'static>>; super::MAX_CPUS] = [const { AtomicPtr::new(core::ptr::null_mut()) }; super::MAX_CPUS];
+    /// Z107 KAT: the yield site the sleep KAT's hit was named for, and the line `stale_kat_run` yields on.
+    static KAT_AT: AtomicPtr<Location<'static>> = AtomicPtr::new(core::ptr::null_mut());
+    static KAT_LINE: AtomicU32 = AtomicU32::new(0);
+
+    /// Z107: called from a `#[track_caller]` wait entry after its IRQ mask; the track_caller chain makes
+    /// `Location::caller()` the ENTRY's caller.
+    #[track_caller]
+    #[inline(always)]
+    pub(super) fn note() {
+        let cpu = crate::arch::percpu::this_cpu().cpu_index as usize;
+        if cpu < super::MAX_CPUS {
+            YIELD_AT[cpu].store(Location::caller() as *const Location<'static> as *mut Location<'static>, Ordering::Relaxed);
+        }
+    }
+
+    /// Z107: this core's last wait-entry caller.
+    pub(super) fn at(cpu: usize) -> Option<&'static Location<'static>> {
+        let p = YIELD_AT.get(cpu)?.load(Ordering::Relaxed) as *const Location<'static>;
+        // SAFETY: only ever stored from a `&'static Location<'static>` (`note`).
+        unsafe { p.as_ref() }
+    }
+
+    /// Z107: the ` yield=<file>:<line>` token's value (`?` if this core never stashed one).
+    pub(super) struct Site(pub usize);
+
+    impl core::fmt::Display for Site {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            match at(self.0) {
+                Some(l) => write!(f, "{}:{}", l.file(), l.line()),
+                None => f.write_str("?"),
+            }
+        }
+    }
+
+    /// Z107 KAT: `stale_kat_run` records the line its in-span `yield_now` sits on (`line!()` on that same line).
+    #[allow(dead_code)]
+    pub(super) fn kat_mark(line: u32) {
+        KAT_LINE.store(line, Ordering::Relaxed);
+    }
+
+    /// Z107 KAT: `sleep_check`'s KAT branch stashes the yield site it was named for (masked, the holder's core).
+    pub(super) fn kat_note(cpu: usize) {
+        let p = at(cpu).map_or(core::ptr::null_mut(), |l| l as *const Location<'static> as *mut Location<'static>);
+        KAT_AT.store(p, Ordering::Relaxed);
+    }
+
+    /// Z107 KAT verdict (`sleep_kat=`'s last arm): `ok` when the named yield is this file's `stale_kat_run` yield line,
+    /// else `wrong-site`. Clears both words.
+    #[allow(dead_code)]
+    pub(super) fn kat_verdict() -> &'static str {
+        let p = KAT_AT.swap(core::ptr::null_mut(), Ordering::Relaxed) as *const Location<'static>;
+        let want = KAT_LINE.swap(0, Ordering::Relaxed);
+        // SAFETY: only ever stored from a `&'static Location<'static>` (`kat_note` over `at`).
+        match unsafe { p.as_ref() } {
+            Some(l) if want != 0 && l.line() == want && l.file() == file!() => "ok",
+            _ => "wrong-site",
+        }
+    }
 }
