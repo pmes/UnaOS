@@ -1156,7 +1156,7 @@ refs/heads/exec-rmbp-preemptoffarmquantum   d523b41e3 FOLDED-BY-HAND (this commi
 refs/heads/exec-rmbp-closeflightrescue   f49043363 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-aethercaptioncore   736f42b84 IN-FLIGHT cut 2026-10-28
 refs/heads/exec-rmbp-installerproviderholocron   736f42b84 IN-FLIGHT cut 2026-10-28
-refs/heads/exec-rmbp-masksiteszeroms   d41baf8ce IN-FLIGHT cut 2026-10-28
+refs/heads/exec-rmbp-masksiteszeroms   edee181ea FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-xhciloanptpyieldptpwait   d41baf8ce IN-FLIGHT cut 2026-10-28
 refs/heads/exec-rmbp-preemptoffarmstaledrop   bbd0d82b3 IN-FLIGHT cut 2026-10-28
 refs/heads/exec-rmbp-masksitesoverflow   bbd0d82b3 IN-FLIGHT cut 2026-10-28

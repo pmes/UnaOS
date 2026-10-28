@@ -410,7 +410,7 @@ fn census_say() {
     for (i, slot) in SEEN.iter().enumerate() {
         let p = slot.load(Acquire);
         if !p.is_null() {
-            let cores: [u64; MAX_CPUS] = core::array::from_fn(|c| SEEN_CORE[i][c].load(Relaxed).saturating_mul(1000) / hz); // MASKSITESCORE (B1051): ms per core -> `@c<dominant>`
+            let cores: [u64; MAX_CPUS] = core::array::from_fn(|c| SEEN_CORE[i][c].load(Relaxed) / (hz / 1_000_000).max(1)); // MASKSITESCORE (B1051): per core -> `@c<dominant>`; MASKSITESZEROMS (B1065): µs, SiteTop's per-core unit
             top.offer_on(p as usize, SEEN_CNT[i].load(Relaxed), SEEN_SUM[i].load(Relaxed).saturating_mul(1000) / hz, 0, &cores);
         }
     }
