@@ -1129,7 +1129,7 @@ refs/heads/exec-rmbp-retiredrain   53f662be2 FOLDED-BY-HAND (this commit) 2026-1
 refs/heads/exec-rmbp-lockregedgexcore   c147f08df FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-installercontribute   88ec9c8d0 IN-FLIGHT cut 2026-10-28
 refs/heads/exec-rmbp-installerproviderstream   48efd481d FOLDED-BY-HAND (this commit) 2026-10-27
-refs/heads/exec-rmbp-xhciloanpumpholderkat   09f2f46fc IN-FLIGHT cut 2026-10-28
+refs/heads/exec-rmbp-xhciloanpumpholderkat   a86f4849a FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-lockregouterxcore   09f2f46fc IN-FLIGHT cut 2026-10-28
 refs/heads/exec-rmbp-unafsbindtrigger   09f2f46fc IN-FLIGHT cut 2026-10-28
 refs/heads/exec-rmbp-xhciloanptpyieldpolltake   296cac776 IN-FLIGHT cut 2026-10-28
