@@ -427,20 +427,7 @@ mod reg {
             c => c,
         };
         let mut m = p.mask.load(Acquire);
-        if c != 0 && edges { for (q, pq) in PARTS.iter().enumerate() { if q != cpu && tid == 0 { continue; } // LOCKREGEDGEXCORE (B1056): EVERY partition for this task — a hold taken before a preemption + steal stays in its old core's partition (release frees it by the guard's slot); tid 0 = a core's scheduler context, this core only. LINE-NEUTRAL rewrite
-            let mut bits = if q == cpu { m } else { pq.mask.load(Acquire) };
-            while bits != 0 {
-                let i = bits.trailing_zeros() as usize;
-                bits &= bits - 1;
-                let t = pq.tag[i].load(Relaxed);
-                if t != 0 && tag_tid(t) == tid {
-                    let a = tag_class(t);
-                    if a != 0 && a != c {
-                        edge(a, c, tid, cpu);
-                    }
-                }
-            } }
-        }
+        if c != 0 && edges { task_slots(tid, cpu, m, |_, _, t| { let a = tag_class(t); if a != 0 && a != c { edge(a, c, tid, cpu); } }); } // LOCKREGOUTERXCORE (B1057): the walk is `task_slots` (after this fn), the ONE walk `outer_site` shares. LOCKREGEDGEXCORE (B1056): EVERY partition for this task — a hold taken before a preemption + steal stays in its old core's partition (release frees it by the guard's slot); tid 0 = a core's scheduler context, this core only. LINE-NEUTRAL rewrite
         let i = loop {
             let free = !m;
             if free == 0 {
@@ -460,6 +447,19 @@ mod reg {
         p.tracked.store(p.tracked.load(Relaxed) + 1, Relaxed); slot_high(cpu, m); // LOCKREGFULL (B1034): this partition's claimed-slot high-water (`slot_high=`; reg tail). LINE-NEUTRAL fold
         (cpu * PER + i) as u16
     }
+
+    /// LOCKREGOUTERXCORE (B1057): `f(partition, slot, tag)` for every slot whose tag names task `tid`, on EVERY partition (B1056's rule: tid 0 = a core's scheduler context, core `cpu` only; `own` = core `cpu`'s mask, already loaded by the caller). The ONE walk `acquire`'s order edges and `outer_site` share.
+    #[inline(always)]
+    fn task_slots(tid: u64, cpu: usize, own: u32, mut f: impl FnMut(&Part, usize, u64)) {
+        for (q, pq) in PARTS.iter().enumerate() { if q != cpu && tid == 0 { continue; }
+            let mut bits = if q == cpu { own } else { pq.mask.load(Acquire) };
+            while bits != 0 {
+                let i = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                let t = pq.tag[i].load(Acquire);
+                if t != 0 && tag_tid(t) == tid { f(pq, i, t); }
+            }
+        } }
 
     /// A hold ends (the guard's `Drop`, before the raw unlock): the held span into this core's max, the entry freed.
     #[inline]
@@ -620,26 +620,26 @@ mod reg {
         }
         let name = crate::arch::sched::current_name().or(Some(crate::arch::sched::between_word(cpu))); // KVMLAT (B574): no current task is the scheduler's own context, named `sched:idle`/`sched:switch`, never `?` (LINE-NEUTRAL fold)
         let step = if matches!(name, Some("usb-pump")) { crate::video::lag::pump_step_now() } else { 0 };
-        crate::hidstall::note_hold(gap_ms - 1, name, outer_site(p, tid), step);
+        crate::hidstall::note_hold(gap_ms - 1, name, outer_site(tid, cpu), step);
     }
 
-    /// The acquire site (`&'static Location` as usize, 0 = none) of the OLDEST hold task `tid` has on partition `p`.
-    fn outer_site(p: &Part, tid: u64) -> usize {
+    /// The acquire site (`&'static Location` as usize, 0 = none) of the OLDEST hold task `tid` has on ANY partition.
+    /// LOCKREGOUTERXCORE (B1057): through `task_slots`, `acquire`'s walk (B1056's rule: tid 0 = core `cpu` only), so a hid
+    /// pump preempted and stolen while holding still names the hold it took on its old core (confined to `cpu`'s
+    /// partition, it named no site, or a newer inner hold as the outermost). `t0` is the TSC, one clock on every core
+    /// (the scan already compares it across partitions), so the smallest is the outermost.
+    /// Cost: 7 more remote `mask` loads, only on a charged sample (the pump core's tick gap past
+    /// `hidstall::HOLD_OVER_MS`), never per tick. KAT: `xcore_leg`'s `outer=` (a hold planted in the sibling
+    /// partition comes back as the planted site).
+    fn outer_site(tid: u64, cpu: usize) -> usize {
         let (mut best_t, mut site) = (u64::MAX, 0usize);
-        let mut bits = p.mask.load(Acquire);
-        while bits != 0 {
-            let i = bits.trailing_zeros() as usize;
-            bits &= bits - 1;
-            let tag = p.tag[i].load(Acquire);
-            if tag == 0 || tag_tid(tag) != tid {
-                continue;
-            }
-            let t0 = p.t0[i].load(Relaxed);
+        task_slots(tid, cpu, PARTS[cpu].mask.load(Acquire), |pq, i, _| {
+            let t0 = pq.t0[i].load(Relaxed);
             if t0 < best_t {
                 best_t = t0;
-                site = p.at[i].load(Relaxed) as usize;
+                site = pq.at[i].load(Relaxed) as usize;
             }
-        }
+        });
         site
     }
 
@@ -1762,7 +1762,8 @@ mod reg {
     // the new core counts in `inversions=`. No door forces a migration (a woken task returns to the core it blocked on;
     // `try_steal` needs an idle thief past the floor and the cooldown), so the KAT PLANTS the stranded hold in a sibling
     // partition (the REGGAP `fake_claim` shape) and makes the nested take for real. Owed: LOCKREG-EDGE-XCORE-KAT (a real
-    // migration, GEN7-ORDER-FORCEMIG's door), LOCKREG-OUTER-XCORE (`outer_site`), LOCKREG-XCORE-COST. ──
+    // migration, GEN7-ORDER-FORCEMIG's door), LOCKREG-XCORE-COST. LOCKREG-OUTER-XCORE BUILT by LOCKREGOUTERXCORE (B1057):
+    // `outer_site` walks through `task_slots` (the walk `acquire` uses), checked here as `outer=`. ──
     static XA: super::Mutex<u32> = super::Mutex::new(0);
     static XB: super::Mutex<u32> = super::Mutex::new(0);
 
@@ -1776,7 +1777,7 @@ mod reg {
             serial_println!(":: LOCKXCORE: -> SKIP(unarmed) ::");
             return;
         }
-        let r: Result<(usize, usize, bool, bool, u32, u32), &'static str> = crate::arch::without_interrupts(|| {
+        let r: Result<(usize, usize, bool, bool, u32, u32, Option<bool>), &'static str> = crate::arch::without_interrupts(|| {
             let Some((tid, cpu)) = who() else { return Err("no-cpu") };
             if tid == 0 {
                 return Err("no-task");
@@ -1790,6 +1791,7 @@ mod reg {
             if order_seen(a, b).map(|o| o.0).unwrap_or(false) {
                 return Err("recorded"); // a second `tests lockreg` this boot: the edge is permanent
             }
+            let before = outer_site(tid, cpu); // LOCKREGOUTERXCORE (B1057): an older tracked hold of this task would be the outermost: `outer=-`
             let q = (cpu + 1) % MAX_CPUS;
             let pq = &PARTS[q];
             let mut m = pq.mask.load(Acquire);
@@ -1810,18 +1812,20 @@ mod reg {
             pq.tag[i].store(tid << 24 | (a as u64) << 8 | (q as u64 + 1), Release);
             let inv0 = INV_N.load(Acquire);
             drop(XB.lock());
+            let outer = if before != 0 { None } else { Some(outer_site(tid, cpu) == XA.site as *const Loc as usize) }; // LOCKREGOUTERXCORE (B1057): the planted sibling hold is this task's outermost
             pq.tag[i].store(0, Release);
             pq.mask.fetch_and(!(1u32 << i), Release);
             let (fwd, rev, inv1) = order_seen(a, b).unwrap_or((false, false, inv0));
-            Ok((q, cpu, fwd, rev, inv0, inv1))
+            Ok((q, cpu, fwd, rev, inv0, inv1, outer))
         });
         match r {
             Err(why) => {
                 serial_println!(":: LOCKXCORE: -> SKIP({}) ::", why);
             }
-            Ok((q, cpu, fwd, rev, inv0, inv1)) => {
-                let pass = fwd && !rev && inv1 == inv0;
-                serial_println!(":: LOCKXCORE: planted=c{} took=c{} fwd={} rev={} inversions={}->{} -> {} ::", q, cpu, fwd as u8, rev as u8, inv0, inv1, if pass { "PASS" } else { "FAIL" });
+            Ok((q, cpu, fwd, rev, inv0, inv1, outer)) => {
+                let pass = fwd && !rev && inv1 == inv0 && outer != Some(false);
+                let ow = match outer { Some(true) => "1", Some(false) => "0", None => "-" };
+                serial_println!(":: LOCKXCORE: planted=c{} took=c{} fwd={} rev={} inversions={}->{} outer={} -> {} ::", q, cpu, fwd as u8, rev as u8, inv0, inv1, ow, if pass { "PASS" } else { "FAIL" });
             }
         }
     }
