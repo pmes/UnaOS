@@ -549,9 +549,12 @@ pub fn build_taffy_tree<H: Host>(
         // AETHERCENTERLAYOUT (SR421): html.css `center { text-align: -webkit-center }` and Blink's align=center|middle /
         // right are -webkit-center (5) / -webkit-right (6), which also place narrow block children
         // (`propagate_text_align`); `th` is -internal-center, inline content only (1).
+        // AETHERCAPTIONUAALIGN (SR452): html.css `caption { text-align: -webkit-center }` (5, the seat's ruling: Blink over
+        // the spec's center); a stylesheet, style="" or align= on the caption still wins, as for `th`.
         paint.text_align = match tag.as_str() {
             "center" => Some(5),
             "th" => Some(1),
+            "caption" => Some(5),
             // The quirks-mode table quirk: a table does NOT inherit
             // text-align from its ancestors. Every legacy page that
             // wraps its layout table in <center> (Hacker News) relies
