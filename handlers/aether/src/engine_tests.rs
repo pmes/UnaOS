@@ -3786,4 +3786,25 @@ mod tests {
             ]
         );
     }
+
+    /// AETHERRADIUSCALC (SR416): a `border-radius: calc(...)` is one radius (css-backgrounds-3 §5.1 with css-values-4
+    /// §10), so a 100x100 box rounds its corners by the calc's 20px: each corner pixel outside the radius shows the page
+    /// white, the centre and the top edge's middle the box's blue. Before, the calc was cut at its spaces and the whole
+    /// declaration dropped (four square corners).
+    #[test]
+    fn test_aetherradiuscalc_calc_radius_paints() {
+        let t = laid_out(
+            r#"<html><body><div style="width:100px;height:100px;background:#0000ff;border-radius:calc(10px + 10px)"></div></body></html>"#,
+            "body{margin:0}",
+        );
+        let (w, h) = (100u32, 100u32);
+        let mut surface = vec![0u8; (w * h * 4) as usize];
+        crate::render::render_frame(&t, &mut surface, w, h, 0.0, 0.0, &[(0, 0, w, h)]);
+        let px = |x: u32, y: u32| { let i = ((y * w + x) * 4) as usize; (surface[i + 2], surface[i + 1], surface[i]) };
+        for (x, y) in [(1, 1), (98, 1), (1, 98), (98, 98)] {
+            assert_eq!(px(x, y), (255, 255, 255), "corner ({x},{y}) lies outside the 20px calc radius");
+        }
+        assert_eq!(px(50, 50), (0, 0, 255), "the box's centre");
+        assert_eq!(px(50, 1), (0, 0, 255), "the top edge's middle is inside the rounded box");
+    }
 }

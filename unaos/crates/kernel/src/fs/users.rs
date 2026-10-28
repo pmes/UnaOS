@@ -3935,7 +3935,7 @@ fn keyboot_key_root(name: &[u8], password: &[u8]) {
         let Some(h) = crate::fs::unafs::mount_bound_handle() else {
             return why("no-bound-root");
         };
-        match crate::fs::unafs::with_unafs(|fs| fs.key_slot().is_some()) {
+        match crate::fs::unafs::with_unafs_read(|fs| fs.key_slot().is_some()) {
             Ok(false) => {}
             Ok(true) => return why("already-keyed"),
             Err(_) => return why("mount"),
@@ -3995,7 +3995,7 @@ pub fn keyboot_rekey(name: &[u8], old: &[u8], new: &[u8]) {
         if role_of(name) != Some(Role::Admin) || !crate::fs::sysleaf::active() {
             return;
         }
-        let Ok(Some(slot)) = crate::fs::unafs::with_unafs(|fs| fs.key_slot().cloned()) else {
+        let Ok(Some(slot)) = crate::fs::unafs::with_unafs_read(|fs| fs.key_slot().cloned()) else {
             return; // unkeyed (or no mount): nothing follows the password
         };
         let t0 = crate::arch::ms();
