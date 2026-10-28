@@ -5138,7 +5138,7 @@ fn nvme_lba_spans(dev: &mut SdSectorDevice) -> Result<Vec<PartitionSpan>, MountE
         }
         let mut adapter = BlockAdapter::new(&mut *dev, base, block_count);
         let mut b = alloc::vec![0u8; ::unafs::BLOCK_SIZE as usize];
-        if adapter.read_block(0, &mut b).is_ok() && b[..::unafs::superblock::MAGIC.len()] == ::unafs::superblock::MAGIC {
+        if <_ as ::unafs::BlockDevice>::read_block(&mut adapter, 0, &mut b).is_ok() && b[..::unafs::superblock::MAGIC.len()] == ::unafs::superblock::MAGIC {
             out.push(PartitionSpan { base_lba: base, block_count });
         }
     }

@@ -5,10 +5,12 @@
 # patch_sha= / ram_sha= ok|mismatch|unpinned; nothing is uploaded at S1.
 # A newer linux-firmware drop changes both digests: the MT7925-FW build line prints the new rows (`pin-row: <role> <hex>`).
 # Lines starting with `#` and blank lines are ignored.
+# 2026-10-28 (the bench): re-pinned to the bench's drop, Fedora linux-firmware-20261019-1.fc44 (/lib/firmware/mediatek/mt7925, the
+# .xz pair decompressed into ~/unaos-bench/firmware/mediatek-mt7925); the previous rows were another drop's (the build line read MISMATCH).
 
 # rows measured 2026-10-27 from gitlab.com/kernel-firmware/linux-firmware main @ 5a3f625f (2026-10-19, "update firmware for
 # MT7925 WiFi device"); WHENCE: Licence: Redistributable, LICENCE.mediatek.
 # mediatek/mt7925/WIFI_MT7925_PATCH_MCU_1_1_hdr.bin  Version 20261016232915a  188192 bytes
 # mediatek/mt7925/WIFI_RAM_CODE_MT7925_1_1.bin       Version 20261016233029   1390712 bytes
-patch 67ff85f1a39d1a100a51abd8e2a26edd2f198d7052514b6b8981948b231e5016
-ram 329c0e27f780550789e4eba47452731b1723f69f9e67f525d0e50bf3cd2978ac
+patch 8eb46014d2a6b4124472eee7476d995008a6f40b1daffef87eb42f30d98699e1
+ram 23ff53b4bb639b30481e2e06bb1688569ad1ba971b897936db539882abfbd120
