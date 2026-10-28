@@ -894,11 +894,11 @@ fn cq_wait(may_sleep: bool) {
         core::hint::spin_loop();
         return;
     }
-    let was_on = x86_64::instructions::interrupts::are_enabled(); x86_64::instructions::interrupts::disable(); crate::arch::sched::preemptoff::disable(); // PREEMPTOFFAUDIT (Z57): masked for the check-then-sti;hlt whatever the caller's IF; NVMEPREEMPTOFF (Z52): the holder sleeps with interrupts ON but is never switched out
+    let was_on = x86_64::instructions::interrupts::are_enabled(); x86_64::instructions::interrupts::disable(); let held = crate::arch::sched::preemptoff::hold(); // PREEMPTOFFX86STALEDROP (rmbp-ledger B1069): the hold carries its CPU and epoch to the put below. PREEMPTOFFAUDIT (Z57): masked for the check-then-sti;hlt whatever the caller's IF; NVMEPREEMPTOFF (Z52): the holder sleeps with interrupts ON but is never switched out
     let waits = IRQ_WAITS.fetch_add(1, Ordering::Relaxed) + 1;
     if !CQ_PENDING.load(Ordering::Acquire) { x86_64::instructions::interrupts::enable_and_hlt(); } // PREEMPTOFFAUDIT (Z57): a completion taken unmasked before the mask skips the sleep
     x86_64::instructions::interrupts::disable();
-    crate::arch::sched::preemptoff::enable(); if was_on { x86_64::instructions::interrupts::enable(); } // PREEMPTOFFAUDIT (Z57): IF back as the caller had it; NVMEPREEMPTOFF (Z52): masked again; a preempt deferred during the sleep fires after the hold
+    crate::arch::sched::preemptoff::put(held); if was_on { x86_64::instructions::interrupts::enable(); } // PREEMPTOFFX86STALEDROP (B1069): a hold the dispatch reset under it releases nothing. PREEMPTOFFAUDIT (Z57): IF back as the caller had it; NVMEPREEMPTOFF (Z52): masked again; a preempt deferred during the sleep fires after the hold
     if CQ_PENDING.load(Ordering::Acquire) {
         IRQ_WAKES.fetch_add(1, Ordering::Relaxed);
     } else if waits >= WAIT_OFF_AFTER && IRQ_WAKES.load(Ordering::Relaxed) == 0 && !WAIT_OFF.swap(true, Ordering::AcqRel) {
