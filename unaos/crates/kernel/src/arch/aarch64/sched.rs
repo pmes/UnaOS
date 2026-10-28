@@ -5500,7 +5500,7 @@ fn dispatch_next(cpu: usize) -> bool {
         }
     }
     task.state.store(STATE_RUNNING, Ordering::Release);
-    SCHED[cpu].quantum.store(QUANTUM_TICKS, Ordering::Relaxed);
+    SCHED[cpu].quantum.store(QUANTUM_TICKS, Ordering::Relaxed); preemptoff::on_dispatch(cpu, task.id); // PREEMPTOFFARMQUANTUM (zenbook-ledger Z89): a preempt-off count still held when this core dispatches a task that is not its recorded holder is a leak (a holder that died or yielded inside its span) — reset and named once. LINE-NEUTRAL fold, code first
     let raw = Box::into_raw(task);
     let entry_sp = unsafe { (*raw).ctx_sp };
     // Publish `current` (Release) strictly before switching in — the trampoline reads it Acquire.
@@ -11152,9 +11152,19 @@ pub struct PreemptHold {
 /// COMPGATE — take a preemption hold on this core. See the ledger above for the contract; the caller
 /// must keep the section BOUNDED and free of voluntary yields.
 #[inline]
+#[track_caller]
 pub fn preempt_hold() -> PreemptHold {
+    hold_at(core::panic::Location::caller())
+}
+
+/// PREEMPTOFFARMQUANTUM (zenbook-ledger Z89): the one take behind [`preempt_hold`] and `preemptoff::scoped`. The
+/// outermost take (count 0 -> 1) records its task and `site` as this core's holder, which `preemptoff::on_dispatch` reads.
+#[inline]
+fn hold_at(site: &'static core::panic::Location<'static>) -> PreemptHold {
     let core = meter_current_cpu().min(NUM_CPUS - 1);
-    NOPREEMPT[core].fetch_add(1, Ordering::AcqRel);
+    if NOPREEMPT[core].fetch_add(1, Ordering::AcqRel) == 0 {
+        preemptoff::note_holder(core, site);
+    }
     PreemptHold { core }
 }
 
@@ -11244,15 +11254,29 @@ pub fn spawn_joinable_stack(name: &'static str, entry: fn(usize), arg: usize, cp
 // core read and the increment (COMPGATE's `preempt_hold` reads the core unmasked: a migration window this closes for its
 // callers). Holders today: the FAT/DIR RMW spans (`fs/fat.rs` `with_fat_lock` / `with_dir_lock`, were
 // `without_interrupts`), PSTATE.I as the caller had it. Semantics that differ from x86, owed by name (cores.md §5):
-// PREEMPTOFF-ARM-QUANTUM (the quantum is not consumed while held; no FIRED counter; no dispatch-time leak reset).
+// PREEMPTOFF-ARM-QUANTUM — BUILT by PREEMPTOFFARMQUANTUM (zenbook-ledger Z89): the quantum is PAUSED while held (measured:
+// `timer_preempt` returns at the decline before the countdown, COMPGATE hazard 3; x86 consumes it — the divergence is
+// deliberate: pause charges the holder only the ticks it ran unheld), so there is no FIRED counter (nothing is pending
+// after a decline); the outermost take records its holder (task + site) and `on_dispatch` resets a count the dispatched
+// task does not hold, named once in x86's words.
 pub mod preemptoff {
     use super::{current_tid_relaxed, meter_current_cpu, nopreempt_held, NOPREEMPT, NUM_CPUS};
-    use core::sync::atomic::{AtomicBool, Ordering};
+    use core::panic::Location;
+    use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 
     /// The FAT/DIR spans converted from `without_interrupts` (the aarch64 audit's `converted_fat=`).
     pub const CONVERTED_FAT: u32 = 2;
 
     static ENABLE_ZERO_SAID: AtomicBool = AtomicBool::new(false);
+
+    /// PREEMPTOFFARMQUANTUM (Z89): this core's holder — the task (0 = no task) and the site of the outermost take. Written
+    /// only by its own core at the 0 -> 1 take; read by `on_dispatch` on the same core, masked.
+    static HOLD_TID: [AtomicU64; NUM_CPUS] = [const { AtomicU64::new(0) }; NUM_CPUS];
+    static HOLD_SITE: [AtomicPtr<Location<'static>>; NUM_CPUS] = [const { AtomicPtr::new(core::ptr::null_mut()) }; NUM_CPUS];
+    /// The holder whose count this core last reset at dispatch (the KAT's witness), and the resets this boot.
+    static LAST_RESET_TID: [AtomicU64; NUM_CPUS] = [const { AtomicU64::new(0) }; NUM_CPUS];
+    static LEAK_RESETS: AtomicU32 = AtomicU32::new(0);
+    static LEAK_SAID: AtomicBool = AtomicBool::new(false);
 
     /// This core's slot, clamped exactly as `preempt_hold` / `preempt_hold_standing` clamp it (the slot read is the slot
     /// written).
@@ -11263,9 +11287,14 @@ pub mod preemptoff {
 
     /// Hold this core's preempt-off count (nests; saturates). Masked so the caller cannot migrate between reading its core
     /// and writing that core's count.
+    #[track_caller]
     pub fn disable() {
+        let site = Location::caller();
         crate::arch::without_interrupts(|| {
-            let _ = NOPREEMPT[slot()].fetch_update(Ordering::AcqRel, Ordering::Relaxed, |n| Some(n.saturating_add(1)));
+            let c = slot();
+            if let Ok(0) = NOPREEMPT[c].fetch_update(Ordering::AcqRel, Ordering::Relaxed, |n| Some(n.saturating_add(1))) {
+                note_holder(c, site);
+            }
         });
     }
 
@@ -11287,8 +11316,10 @@ pub mod preemptoff {
 
     /// The `without_interrupts`-shaped preempt-off span: COMPGATE's own guard (`preempt_hold`), taken masked, held around
     /// `f`, interrupts as the caller had them. The guard's Drop releases the core it took, so an unwinding `f` still does.
+    #[track_caller]
     pub fn scoped<R>(f: impl FnOnce() -> R) -> R {
-        let _hold = crate::arch::without_interrupts(super::preempt_hold);
+        let site = Location::caller();
+        let _hold = crate::arch::without_interrupts(|| super::hold_at(site));
         f()
     }
 
@@ -11316,7 +11347,7 @@ pub mod preemptoff {
         }
         let ((fat_on, fat_held), (dir_on, dir_held)) = crate::fs::fat::preemptoff_span_probe();
         let ((m_fat_on, _), (m_dir_on, _)) = crate::arch::without_interrupts(crate::fs::fat::preemptoff_span_probe);
-        let masked_kept = !m_fat_on && !m_dir_on; let ul = crate::fs::unafs::unafs_leg(); // PREEMPTOFFARMUNAFS (zenbook-ledger Z79): the UnaFS read-arm leg, before `released` so it also proves the leg gave the count back (LINE-NEUTRAL)
+        let masked_kept = !m_fat_on && !m_dir_on; let ul = crate::fs::unafs::unafs_leg(); let lk = leak_kat(); // PREEMPTOFFARMQUANTUM (zenbook-ledger Z89): the leak-reset KAT runs before `released` too. PREEMPTOFFARMUNAFS (zenbook-ledger Z79): the UnaFS read-arm leg, before `released` so it also proves the leg gave the count back (LINE-NEUTRAL)
         let released = !witness().0;
         let reason = if !fat_on {
             Some("fat-masked")
@@ -11327,28 +11358,99 @@ pub mod preemptoff {
         } else if !masked_kept {
             Some("unmasked")
         } else if !released {
-            Some("leaked") } else if !(ul == "ok" || ul.starts_with("skip")) { Some("unafs-leg")
+            Some("leaked") } else if !(ul == "ok" || ul.starts_with("skip")) { Some("unafs-leg") } else if lk != "ok" { Some("leak-kat")
         } else {
             None
         };
         let ok = |b: bool, y: &'static str, n: &'static str| if b { y } else { n };
         match reason {
             None => serial_println!(
-                ":: PREEMPTAUDIT: arch=aarch64 sites={} isr={} holder={} both={} converted={} converted_fat={} fat_irq_on=ok dir_irq_on=ok fat_held=ok dir_held=ok masked_kept=ok released=ok unafs_leg={} -> PASS ::",
-                AUDIT_SITES, AUDIT_ISR, AUDIT_HOLDER, AUDIT_BOTH, AUDIT_CONVERTED, CONVERTED_FAT, ul
+                ":: PREEMPTAUDIT: arch=aarch64 sites={} isr={} holder={} both={} converted={} converted_fat={} fat_irq_on=ok dir_irq_on=ok fat_held=ok dir_held=ok masked_kept=ok released=ok unafs_leg={} leak_reset={} leak_kat={} -> PASS ::",
+                AUDIT_SITES, AUDIT_ISR, AUDIT_HOLDER, AUDIT_BOTH, AUDIT_CONVERTED, CONVERTED_FAT, ul, leak_resets(), lk
             ),
             Some(r) => serial_println!(
-                ":: PREEMPTAUDIT: arch=aarch64 sites={} isr={} holder={} both={} converted={} converted_fat={} fat_irq_on={} dir_irq_on={} fat_held={} dir_held={} masked_kept={} released={} unafs_leg={} -> FAIL reason={} ::",
+                ":: PREEMPTAUDIT: arch=aarch64 sites={} isr={} holder={} both={} converted={} converted_fat={} fat_irq_on={} dir_irq_on={} fat_held={} dir_held={} masked_kept={} released={} unafs_leg={} leak_reset={} leak_kat={} -> FAIL reason={} ::",
                 AUDIT_SITES, AUDIT_ISR, AUDIT_HOLDER, AUDIT_BOTH, AUDIT_CONVERTED, CONVERTED_FAT,
                 ok(fat_on, "ok", "masked"),
                 ok(dir_on, "ok", "masked"),
                 ok(fat_held, "ok", "free"),
                 ok(dir_held, "ok", "free"),
                 ok(masked_kept, "ok", "unmasked"),
-                ok(released, "ok", "leaked"), ul,
+                ok(released, "ok", "leaked"), ul, leak_resets(), lk,
                 r
             ),
         }
+    }
+
+    /// PREEMPTOFFARMQUANTUM (Z89): record `core`'s holder at its outermost take (the task running there and the take's site).
+    pub(super) fn note_holder(core: usize, site: &'static Location<'static>) {
+        if core < NUM_CPUS {
+            HOLD_TID[core].store(current_tid_relaxed(core), Ordering::Relaxed);
+            HOLD_SITE[core].store(site as *const Location<'static> as *mut Location<'static>, Ordering::Relaxed);
+        }
+    }
+
+    /// PREEMPTOFFARMQUANTUM (Z89): the dispatch fold (`dispatch_next`, IRQ masked, before `current` is published). A count
+    /// still held on this core when it dispatches a task that is not the recorded holder is a leak — the holder died
+    /// inside its span (no unwinding: its guard never drops) or switched out of it — so it is reset and named once. The
+    /// holder itself re-dispatched with nothing between keeps its count; a dead holder is never dispatched again, so the
+    /// first dispatch after its death resets it. x86's `on_dispatch` words, with the holder and its site.
+    pub(super) fn on_dispatch(cpu: usize, incoming: u64) {
+        if cpu >= NUM_CPUS {
+            return;
+        }
+        let n = NOPREEMPT[cpu].load(Ordering::Relaxed);
+        if n == 0 {
+            return;
+        }
+        let holder = HOLD_TID[cpu].load(Ordering::Relaxed);
+        if holder == incoming {
+            return;
+        }
+        NOPREEMPT[cpu].store(0, Ordering::Relaxed);
+        LAST_RESET_TID[cpu].store(holder, Ordering::Relaxed);
+        LEAK_RESETS.fetch_add(1, Ordering::Relaxed);
+        if !LEAK_SAID.swap(true, Ordering::AcqRel) {
+            let site = HOLD_SITE[cpu].load(Ordering::Relaxed) as *const Location<'static>;
+            // SAFETY: only ever stored from a `&'static Location<'static>` (`note_holder`); null until the first take.
+            let (file, line) = match unsafe { site.as_ref() } {
+                Some(l) => (l.file(), l.line()),
+                None => ("?", 0),
+            };
+            serial_println!(
+                "[sched] preempt-off leaked cpu={} count={} holder={} site={}:{} -> reset at dispatch (PREEMPTOFFARMQUANTUM Z89)",
+                cpu, n, holder, file, line
+            );
+        }
+    }
+
+    /// PREEMPTOFFARMQUANTUM (Z89): dispatch-time leak resets this boot (the KAT's own given back): `leak_reset=`.
+    pub fn leak_resets() -> u32 {
+        LEAK_RESETS.load(Ordering::Relaxed)
+    }
+
+    /// The KAT's leaker: takes the count and RETURNS holding it — a death inside the span through the real exit path.
+    fn leak_kat_holder(_: usize) {
+        disable();
+    }
+
+    /// The KAT's follower: a no-op task whose dispatch on the leaker's core must find and reset the leak.
+    fn leak_kat_after(_: usize) {}
+
+    /// PREEMPTOFFARMQUANTUM (Z89) KAT (`leak_kat=`): a task pinned to this core dies holding the count; a second task is
+    /// then dispatched there. `ok` when that core's last reset named the dead holder (its one reset given back, so
+    /// `leak_reset=` counts real leaks only), else `not-reset`.
+    pub fn leak_kat() -> &'static str {
+        let c = slot();
+        let leaker = super::spawn_joinable("preemptoff-leak", leak_kat_holder, 0, c);
+        let tid = leaker.id();
+        leaker.join();
+        super::spawn_joinable("preemptoff-after", leak_kat_after, 0, c).join();
+        if LAST_RESET_TID[c].load(Ordering::Relaxed) != tid {
+            return "not-reset";
+        }
+        LEAK_RESETS.fetch_sub(1, Ordering::Relaxed);
+        "ok"
     }
 
     /// PREEMPTOFFARMCENSUS (zenbook-ledger Z72) M1: the census of the aarch64 kernel's IRQ-mask sites (cores.md §4, the
