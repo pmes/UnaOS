@@ -169,7 +169,7 @@ pub fn boot80_selftest() {
     let t0 = crate::arch::ms();
     let io0 = io();
     crate::fs::unafs::force_remount();
-    let mounted = crate::fs::unafs::with_unafs(|fs| fs.root_generation()).is_ok();
+    let mounted = crate::fs::unafs::with_unafs_read(|fs| fs.root_generation()).is_ok();
     let mount_ms = crate::arch::ms().saturating_sub(t0);
     let mio = io().since(io0);
     let t1 = crate::arch::ms();
@@ -190,7 +190,7 @@ pub fn boot80_selftest() {
     // 26 types in 34 blocks) — an inode read and a directory read per level, each at most one read-ahead window.
     // SMALLFIX5 (B480) item 6: the leg is ASSOCSTAMP's own read — the directory resolved and its ONE stamp attribute
     // (what a login build reads when nothing changed), no longer an `ls` of every type. `types` is the stamp's count.
-    let (have, tio) = crate::fs::unafs::with_unafs(|fs| {
+    let (have, tio) = crate::fs::unafs::with_unafs_read(|fs| {
         let i0 = io();
         let v = fs.resolve_path(crate::fs::assoc::TYPES_DIR).ok().and_then(|id| fs.get_attribute(id, crate::fs::assoc::STAMP_KEY).ok().flatten());
         let s = match v { Some(::unafs::inode::AttributeValue::String(s)) => Some(s), _ => None };

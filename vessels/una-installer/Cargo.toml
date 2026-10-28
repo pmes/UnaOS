@@ -29,5 +29,12 @@ aule = { path = "../../handlers/aule" } # the build half: `Aule::forge_in`
 # INSTALLERCARD (SR414): the card face's disk enumeration and the GPT/clone core.
 amber_bytes = { path = "../../handlers/amber_bytes" }
 amber_core = { path = "../../unaos/libs/sys/amber_core" }
+# INSTALLERLANDING (SR415): the landing face reads the card's boot logs through the unafs core's own reader (no_std core only, as amber_bytes links it).
+unafs = { path = "../../unaos/libs/fs/unafs", default-features = false }
+# INSTALLERPROVIDER (SR424): the provider face sends the landing through Vein's provider slot (Principia's `vein` prefs, Holocron, env), the pick through Principia.
+vein = { path = "../../handlers/vein" }
+principia = { path = "../../handlers/principia" }
+holocron = { path = "../../handlers/holocron" }
 tokio = { version = "1.53", features = ["rt", "rt-multi-thread", "sync", "macros", "time"] }
 log = "0.4"
+libc = "0.2" # INSTALLERAUTHOPEN (SR422): sendmsg/recvmsg + msghdr for the SCM_RIGHTS fd handoff (authopen / the pkexec helper)

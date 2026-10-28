@@ -33,7 +33,7 @@
 
 mod card;
 mod catalog;
-mod host;
+mod host; mod landing; mod provider; // INSTALLERLANDING (SR415): the landing face — the card's boot logs read back into docs/dev/evidence (LINE-NEUTRAL); INSTALLERPROVIDER (SR424): the provider face — the landing sent to the person's own AI
 
 use bandy::{SMessage, Synapse, telemetry};
 use catalog::{CATALOG, Face, Vessel};
@@ -78,6 +78,7 @@ fn say(line: &str) {
 }
 
 fn main() {
+    if let Some(rc) = card::open_device_verb(std::env::args().skip(1)) { std::process::exit(rc); } // INSTALLERAUTHOPEN (SR422): the hidden root helper verb (pkexec), before the census or the log touch stdout
     let c = match cli() {
         Ok(c) => c,
         Err(e) => {
@@ -133,7 +134,7 @@ fn tree() -> TetraNode {
         ])
     });
     TetraNode::HStack(vec![
-        TetraNode::VStack(vec![header("installer.unaos", "Install UnaOS"), card::face()]),
+        TetraNode::VStack(vec![header("installer.unaos", "Install UnaOS"), card::face(), landing::face(), provider::face()]), // INSTALLERLANDING (SR415): the landing pane under the card pane; INSTALLERPROVIDER (SR424): the provider pane under it
         TetraNode::VStack(std::iter::once(header("installer.apps", "Install apps")).chain(rows).collect()),
     ])
 }
@@ -153,7 +154,7 @@ fn window(host: Host) {
 async fn serve(mut rx: tokio::sync::broadcast::Receiver<SMessage>, host: Host) {
     use tokio::sync::broadcast::error::RecvError;
     let host = std::sync::Arc::new(host);
-    let mut card = card::Card::probe();
+    let mut card = card::Card::probe(); let mut landing = landing::Landing::probe_in(host.checkout.clone()); let mut provider = provider::Provider::probe_in(host.checkout.clone()); // INSTALLERLANDING (SR415): the landing face's state, landing under the probed checkout (LINE-NEUTRAL); INSTALLERPROVIDER (SR424): the provider face's state
     let mut tick = tokio::time::interval(CARD_TICK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -164,7 +165,7 @@ async fn serve(mut rx: tokio::sync::broadcast::Receiver<SMessage>, host: Host) {
                     tokio::task::spawn_blocking(move || verb(&host, &text));
                 }
                 Ok(SMessage::ConsoleInput(line)) => {
-                    if !card::on_input(&mut card, &line) {
+                    if !card::on_input(&mut card, &line) && !provider::on_input(&mut provider, &line) && !landing::on_input(&mut landing, &line) { // INSTALLERLANDING (SR415): the card face first, then the landing face; INSTALLERPROVIDER (SR424): the provider face before landing, so a pasted key never reaches the unafs mount as a card password
                         say(&format!("[installer] input ignored line={line}"));
                     }
                 }
@@ -173,7 +174,7 @@ async fn serve(mut rx: tokio::sync::broadcast::Receiver<SMessage>, host: Host) {
             },
             _ = tick.tick() => {}
         }
-        card::poll(&mut card);
+        card::poll(&mut card); landing::poll(&mut landing); provider::poll(&mut provider); // INSTALLERLANDING (SR415): drain the landing read beside the card write (LINE-NEUTRAL); INSTALLERPROVIDER (SR424): and the provider's reply
     }
 }
 

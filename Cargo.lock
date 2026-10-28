@@ -5073,9 +5073,14 @@ dependencies = [
  "bandy",
  "elessar",
  "gneiss_pal",
+ "holocron",
+ "libc",
  "log",
+ "principia",
  "quartzite",
  "tokio",
+ "unafs",
+ "vein",
 ]
 
 [[package]]
