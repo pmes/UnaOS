@@ -1179,7 +1179,7 @@ refs/heads/exec-rmbp-preemptoffx86staledrop   5db503c4f FOLDED-BY-HAND (this com
 refs/heads/exec-rmbp-closeflightoldest   28e23fbe0 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-preemptoffarmsleepcheck   6b83e3d65 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-xhciloanptpyieldloopone   629ccdf12 FOLDED-BY-HAND (this commit) 2026-10-27
-refs/heads/exec-rmbp-providercancelwake   469b16733 IN-FLIGHT cut 2026-10-28
+refs/heads/exec-rmbp-providercancelwake   81e1a681e FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-facelivefieldmove   9ec9cb41a FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-aethercaptionuaalign   469b16733 IN-FLIGHT cut 2026-10-28
 refs/heads/exec-rmbp-aethercaptionextents   469b16733 IN-FLIGHT cut 2026-10-28

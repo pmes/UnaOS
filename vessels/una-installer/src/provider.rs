@@ -38,14 +38,22 @@
 // FIRST on every poll and, when set, yields ONE synthetic `ChatDelta::Stop` (`StopReason::Other(STOPPED)`) instead of
 // polling the provider, so `sse::collect`'s own fold returns exactly the text that arrived (no second accumulator). What
 // arrived lands as REPLY-partial.md under a `# Reply (stopped)` header (nothing when no text arrived): never REPLY.md,
-// since contribute's `plan` commits every file in the landing dir. The pane frees through the same `poll` Done path. A
-// stop while the stream is pending (connect, backoff, a silent server) takes effect at the next delta
-// (PROVIDER-CANCEL-WAKE owed); a stop during the `generate` fallback lets that one call finish.
+// since contribute's `plan` commits every file in the landing dir. The pane frees through the same `poll` Done path.
+//
+// PROVIDERCANCELWAKE (LEDGER SR450): a stop while the send is PENDING takes effect at the stop, not at the next delta.
+// `Provider::stop` sets the flag THEN fires the send's `Notify` (`notify_one` keeps a permit when nothing waits yet). The
+// three waits are sorted by whether text can exist: while the provider's stream is pending inside `collect` (a server
+// gone quiet) the `Tee` polls a `Notified` beside it, and on the wake reads the flag and yields the ONE synthetic Stop,
+// so `collect`'s own fold returns what arrived; the stream connect (`send_with_backoff`'s retries ride inside it) and
+// the `generate` fallback hold no text, so `until_stop` races each against the wake and a cut becomes `stop_response`,
+// routed through the SAME `stopped` tail (nothing written, `why=stop reply_kb=0 first_ms=0`). No select around
+// `collect` and no `AbortHandle`: either would drop the fold. The flag stays the delta-side truth.
 //
 // Wire:
 //   [installer] provider name=<claude|gemini|claudecode|none> key=<set|missing> send=<ok|refused|cancelled|-> why=<-|no-key|no-landing|network|provider-error|stop> reply_kb=<n> ms=<n> first_ms=<n>
 //   [installer] provider save name=<claude|gemini|claudecode|none> ok=<1|0> why=<-|no-key|no-name|no-holocron|holocron-error> status=<-|word>
 
+use std::future::Future; // PROVIDERCANCELWAKE (SR450)
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -55,11 +63,13 @@ use std::task::{Context, Poll};
 use std::time::Instant;
 
 use futures_core::Stream;
+use tokio::sync::Notify; // PROVIDERCANCELWAKE (SR450)
+use tokio::sync::futures::Notified;
 
 use bandy::{PrefValue, PrincipiaCommand, SMessage};
 use gneiss_pal::api::provider::{CLAUDE_DEFAULT_MODEL, GEMINI_DEFAULT_MODEL};
 use gneiss_pal::api::{
-    AuthMode, ChatDelta, ChatRequest, DeltaStream, ModelProvider, PREF_NS, Part, ProviderConfig, ProviderError, ProviderKind, StopReason,
+    AuthMode, ChatDelta, ChatRequest, ChatResponse, DeltaStream, ModelProvider, PREF_NS, Part, ProviderConfig, ProviderError, ProviderKind, StopReason,
     Thread, Usage, menu_choice_prefs,
 };
 use holocron::holocron_core::keysource::{CLAUDE_API_KEY, KeySource, VEIN_NS};
@@ -158,6 +168,9 @@ struct Tee<'a> {
     first: &'a mut Option<u128>,
     /// INSTALLERPROVIDERCANCEL (SR442): the person's stop, read first on every poll.
     cancel: &'a AtomicBool,
+    /// PROVIDERCANCELWAKE (SR450): the stop's wake, polled while the provider is pending.
+    wake: &'a Notify,
+    armed: Option<Pin<Box<Notified<'a>>>>,
 }
 
 impl Stream for Tee<'_> {
@@ -167,9 +180,21 @@ impl Stream for Tee<'_> {
         let this = self.get_mut();
         if this.cancel.load(Ordering::SeqCst) {
             // INSTALLERPROVIDERCANCEL (SR442): ONE synthetic Stop, so collect's own fold returns what arrived.
-            return Poll::Ready(Some(Ok(ChatDelta::Stop { stop: StopReason::Other(STOPPED.to_string()), usage: Usage::default() })));
+            return Poll::Ready(Some(Ok(stop_delta())));
         }
         let r = this.inner.as_mut().poll_next(cx);
+        if r.is_pending() {
+            // PROVIDERCANCELWAKE (SR450): the provider is quiet; the stop's wake re-polls us, the flag says why.
+            let wake = this.wake;
+            let n = this.armed.get_or_insert_with(|| Box::pin(wake.notified()));
+            if n.as_mut().poll(cx).is_ready() {
+                this.armed = None;
+                if this.cancel.load(Ordering::SeqCst) {
+                    return Poll::Ready(Some(Ok(stop_delta())));
+                }
+            }
+            return Poll::Pending;
+        }
         if let Poll::Ready(Some(Ok(ChatDelta::Text(t)))) = &r {
             if this.first.is_none() {
                 *this.first = Some(this.t0.elapsed().as_millis());
@@ -182,7 +207,7 @@ impl Stream for Tee<'_> {
 
 /// The send on its own thread: ONE `stream` teed into `sse::collect` (`generate` only on `Unsupported`), the stop
 /// reason checked before the text, the reply written.
-fn job(p: Arc<dyn ModelProvider>, req: ChatRequest, dir: PathBuf, tx: Sender<Msg>, cancel: Arc<AtomicBool>) -> (String, Option<PathBuf>) {
+fn job(p: Arc<dyn ModelProvider>, req: ChatRequest, dir: PathBuf, tx: Sender<Msg>, cancel: Arc<AtomicBool>, wake: Arc<Notify>) -> (String, Option<PathBuf>) {
     let t0 = Instant::now();
     let name = p.name().to_string();
     let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
@@ -191,10 +216,13 @@ fn job(p: Arc<dyn ModelProvider>, req: ChatRequest, dir: PathBuf, tx: Sender<Msg
     };
     let mut first: Option<u128> = None;
     let r = rt.block_on(async {
-        match p.stream(&req).await {
-            Ok(inner) => gneiss_pal::api::sse::collect(Box::pin(Tee { inner, tx, t0, first: &mut first, cancel: &cancel })).await,
-            Err(ProviderError::Unsupported(_)) => p.generate(&req).await, // STREAM-FALLBACK: the ONE branch
-            Err(e) => Err(e),
+        match until_stop(p.stream(&req), &wake).await {
+            Some(Ok(inner)) => {
+                gneiss_pal::api::sse::collect(Box::pin(Tee { inner, tx, t0, first: &mut first, cancel: &cancel, wake: &wake, armed: None })).await
+            }
+            Some(Err(ProviderError::Unsupported(_))) => until_stop(p.generate(&req), &wake).await.unwrap_or_else(stop_response), // STREAM-FALLBACK: the ONE branch
+            Some(Err(e)) => Err(e),
+            None => stop_response(), // PROVIDERCANCELWAKE (SR450): cut while connecting, no text
         }
     });
     let ms = t0.elapsed().as_millis();
@@ -233,6 +261,26 @@ fn stopped(name: &str, model: &str, text: &str, dir: &Path, ms: u128, first_ms: 
         return (say(line(name, true, "cancelled", "stop", 0, ms, first_ms)), None);
     }
     (say(line(name, true, "cancelled", "stop", (body.len() as u64).div_ceil(1024), ms, first_ms)), Some(path))
+}
+
+/// INSTALLERPROVIDERCANCEL (SR442): the ONE synthetic Stop the person's stop becomes.
+fn stop_delta() -> ChatDelta {
+    ChatDelta::Stop { stop: StopReason::Other(STOPPED.to_string()), usage: Usage::default() }
+}
+
+/// PROVIDERCANCELWAKE (SR450): a wait cut before any text, as the response `job`'s tail routes through [`stopped`].
+fn stop_response() -> Result<ChatResponse, ProviderError> {
+    Ok(ChatResponse { text: String::new(), stop: StopReason::Other(STOPPED.to_string()), usage: Usage::default() })
+}
+
+/// PROVIDERCANCELWAKE (SR450): `fut` raced against the stop's wake (`None` = stopped first); only for the waits that
+/// hold no text (the stream connect, the `generate` call).
+async fn until_stop<T>(fut: impl Future<Output = T>, wake: &Notify) -> Option<T> {
+    tokio::select! {
+        biased;
+        r = fut => Some(r),
+        _ = wake.notified() => None,
+    }
 }
 
 /// The live tail the face shows: at most this many line breaks …
@@ -281,6 +329,8 @@ pub struct Provider {
     rx: Option<Receiver<Msg>>,
     /// INSTALLERPROVIDERCANCEL (SR442): the running send's stop flag (fresh per send; the send thread reads it).
     cancel: Arc<AtomicBool>,
+    /// PROVIDERCANCELWAKE (SR450): the running send's wake (fresh per send; fired by `stop` after the flag).
+    wake: Arc<Notify>,
 }
 
 impl Provider {
@@ -311,6 +361,7 @@ impl Provider {
             key: None,
             rx: None,
             cancel: Arc::new(AtomicBool::new(false)),
+            wake: Arc::new(Notify::new()),
         }
     }
 
@@ -318,12 +369,13 @@ impl Provider {
         self.rx.is_some()
     }
 
-    /// INSTALLERPROVIDERCANCEL (SR442): `provider stop`: the running send's flag set; the pane frees when its verdict
-    /// arrives through `poll` (the thread ends at its next delta).
+    /// INSTALLERPROVIDERCANCEL (SR442): `provider stop`: the running send's flag set, then (PROVIDERCANCELWAKE SR450) its
+    /// wake fired, so a pending wait ends now; the pane frees when its verdict arrives through `poll`.
     fn stop(&mut self) {
         if self.busy() {
             self.cancel.store(true, Ordering::SeqCst);
-            self.verdict = String::from("stopping — the reply ends at its next delta");
+            self.wake.notify_one();
+            self.verdict = String::from("stopping");
         } else {
             self.verdict = String::from("nothing to stop");
         }
@@ -496,8 +548,10 @@ impl Provider {
         self.rx = Some(rx);
         self.cancel = Arc::new(AtomicBool::new(false)); // INSTALLERPROVIDERCANCEL (SR442)
         let cancel = self.cancel.clone();
+        self.wake = Arc::new(Notify::new()); // PROVIDERCANCELWAKE (SR450)
+        let wake = self.wake.clone();
         std::thread::spawn(move || {
-            let (l, path) = job(p, req, dir, tx.clone(), cancel);
+            let (l, path) = job(p, req, dir, tx.clone(), cancel, wake);
             let _ = tx.send(Msg::Done(l, path));
         });
     }
@@ -602,19 +656,24 @@ mod tests {
         script: Option<Vec<ChatDelta>>,
         /// INSTALLERPROVIDERCANCEL (SR442): the scripted stream holds (pending) after this many items.
         hold: Option<usize>,
+        /// PROVIDERCANCELWAKE (SR450): the hold never re-wakes (a quiet socket); with no hold, `stream` never answers.
+        silent: bool,
     }
 
-    /// A scripted delta sequence as a `DeltaStream`; past `hold` items it stays pending (re-woken every 2 ms), as a
-    /// provider that has gone quiet mid-reply.
-    struct Script(VecDeque<ChatDelta>, Option<usize>);
+    /// A scripted delta sequence as a `DeltaStream`; past `hold` items it stays pending (re-woken every 2 ms when the
+    /// third field is true; never woken when false: PROVIDERCANCELWAKE SR450), as a provider that has gone quiet
+    /// mid-reply.
+    struct Script(VecDeque<ChatDelta>, Option<usize>, bool);
 
     impl Stream for Script {
         type Item = Result<ChatDelta, ProviderError>;
         fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
             let this = self.get_mut();
             if this.1 == Some(0) {
-                std::thread::sleep(std::time::Duration::from_millis(2));
-                cx.waker().wake_by_ref();
+                if this.2 {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                    cx.waker().wake_by_ref();
+                }
                 return Poll::Pending;
             }
             if let Some(n) = this.1.as_mut() {
@@ -626,16 +685,22 @@ mod tests {
 
     impl Fake {
         fn answering(answer: Result<ChatResponse, ProviderError>) -> Arc<Fake> {
-            Arc::new(Fake { seen: Mutex::new(Vec::new()), answer, script: None, hold: None })
+            Arc::new(Fake { seen: Mutex::new(Vec::new()), answer, script: None, hold: None, silent: false })
         }
         fn streaming(script: Vec<ChatDelta>) -> Arc<Fake> {
             let answer = Err(ProviderError::Malformed(String::from("generate is not this fake's call")));
-            Arc::new(Fake { seen: Mutex::new(Vec::new()), answer, script: Some(script), hold: None })
+            Arc::new(Fake { seen: Mutex::new(Vec::new()), answer, script: Some(script), hold: None, silent: false })
         }
         /// INSTALLERPROVIDERCANCEL (SR442): `script` that holds after `hold` items.
         fn holding(script: Vec<ChatDelta>, hold: usize) -> Arc<Fake> {
             let answer = Err(ProviderError::Malformed(String::from("generate is not this fake's call")));
-            Arc::new(Fake { seen: Mutex::new(Vec::new()), answer, script: Some(script), hold: Some(hold) })
+            Arc::new(Fake { seen: Mutex::new(Vec::new()), answer, script: Some(script), hold: Some(hold), silent: false })
+        }
+        /// PROVIDERCANCELWAKE (SR450): the never-yielding arm: `hold` None, `stream` never answers (a connect that hangs);
+        /// `Some(n)`, n items and then pending with no wake (a server gone quiet).
+        fn silent(script: Vec<ChatDelta>, hold: Option<usize>) -> Arc<Fake> {
+            let answer = Err(ProviderError::Malformed(String::from("generate is not this fake's call")));
+            Arc::new(Fake { seen: Mutex::new(Vec::new()), answer, script: Some(script), hold, silent: true })
         }
         fn text(t: &str, stop: StopReason) -> Result<ChatResponse, ProviderError> {
             Ok(ChatResponse { text: t.to_string(), stop, usage: Usage::default() })
@@ -660,7 +725,11 @@ mod tests {
             };
             self.seen.lock().unwrap().push(req.clone());
             let hold = self.hold;
-            Box::pin(async move { Ok(Box::pin(Script(script.into(), hold)) as DeltaStream<'a>) })
+            if self.silent && hold.is_none() {
+                return Box::pin(std::future::pending::<Result<DeltaStream<'a>, ProviderError>>());
+            }
+            let rewake = !self.silent;
+            Box::pin(async move { Ok(Box::pin(Script(script.into(), hold, rewake)) as DeltaStream<'a>) })
         }
     }
 
@@ -859,6 +928,53 @@ mod tests {
         assert_eq!(kids.len(), 4);
         let TetraNode::HStack(row) = &kids[3] else { panic!("the button row") };
         assert!(row.iter().any(|b| matches!(b, TetraNode::Button { id, action: SMessage::ConsoleInput(c), .. } if id == "provider.stop" && c == "provider stop")), "the Stop button");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// PROVIDERCANCELWAKE (SR450): a stop while the send is pending with no wake from the provider (a connect that never
+    /// answers; a server gone quiet after two deltas) frees the pane at the stop: nothing written when no text arrived,
+    /// the arrived text as REPLY-partial.md otherwise.
+    #[test]
+    fn provider_stop_wakes_a_pending_stream() {
+        let (mut p, root) = laid("wake");
+        let dir = newest_landing(&p.checkout).unwrap();
+        let mut script: Vec<ChatDelta> = ["one ", "two ", "three"].iter().map(|t| ChatDelta::Text(t.to_string())).collect();
+        script.push(ChatDelta::Stop { stop: StopReason::EndTurn, usage: Usage::default() });
+
+        // The connect never answers: the stop cuts the wait, nothing arrived, nothing written.
+        p.start_with(Fake::silent(script.clone(), None), ChatRequest::single(None, parts(PROMPT, LANDING)), dir.clone());
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert!(p.busy());
+        assert!(on_input(&mut p, "provider stop"));
+        assert_eq!(p.verdict, "stopping");
+        settle(&mut p);
+        assert!(p.verdict.starts_with("[installer] provider name=fake key=set send=cancelled why=stop reply_kb=0 ms="), "{}", p.verdict);
+        assert!(p.verdict.ends_with(" first_ms=0"), "{}", p.verdict);
+        assert_eq!(p.reply, None);
+        assert!(!dir.join("REPLY-partial.md").exists());
+        assert!(!dir.join("REPLY.md").exists());
+
+        // Two deltas, then the server goes quiet and never wakes the stream: the stop keeps collect's fold.
+        p.start_with(Fake::silent(script, Some(2)), ChatRequest::single(None, parts(PROMPT, LANDING)), dir.clone());
+        for _ in 0..1000 {
+            p.poll();
+            if p.live == "one two " {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(p.live, "one two ");
+        assert!(p.busy());
+        assert!(on_input(&mut p, "provider stop"));
+        settle(&mut p);
+        assert!(p.verdict.starts_with("[installer] provider name=fake key=set send=cancelled why=stop reply_kb=1 ms="), "{}", p.verdict);
+        let partial = dir.join("REPLY-partial.md");
+        assert_eq!(p.reply.as_deref(), Some(partial.as_path()));
+        let body = fs::read_to_string(&partial).unwrap();
+        assert!(body.ends_with(" ms: the part that arrived, not the whole reply._\n\none two \n"), "{body}");
+        assert!(!body.contains("three"));
+        assert!(!dir.join("REPLY.md").exists());
+        assert!(!p.busy());
         let _ = fs::remove_dir_all(root);
     }
 
