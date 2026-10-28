@@ -29,7 +29,7 @@
 // `passphrase=`, `psk=` field with a value. The kernel knows no host hostname: no file class of a landing carries one.
 //
 // Wire:
-//   [installer] contribute landing=<stamp|-> branch=<contrib/landing-…|-> files=<n> redacted=<n> ok=<1|0> why=<-|no-git|no-landing|branch-exists|unredactable|git-error>
+//   [installer] contribute landing=<stamp|-> branch=<contrib/landing-…|-> files=<n> redacted=<n> ok=<1|0> why=<-|review-pending|no-git|no-landing|branch-exists|unredactable|git-error>
 //   [installer] contribute next: <command>                                  (three, after ok=1)
 //   [installer] contribute redact-check landing=<stamp> files=<n> redacted=<n> unredactable=<n>
 //   [installer] contribute redact file=<name> line=<n> class=<class>        (first 20, then `redact more=<n>`)
@@ -42,6 +42,15 @@
 // files; an unredactable landing refuses and writes nothing. It prints the `gh issue create` command and never calls
 // the network (INSTALLER-BUGREPORT-GH owed). The repo slug is git_core's `remote.origin.url` on github.com, else the
 // placeholder `<owner>/<repo>`; the URL itself is never printed.
+//
+// CONTRIBUTEREVIEW (LEDGER SR445): the commit waits for a yes. The first `contribute [<dir>]` plans, redacts and HOLDS
+// the plan in memory (the scratch copy: the redacted bytes exist only there and then in the commit, never on disk),
+// prints the wire line with `ok=0 why=review-pending` (files= the blobs the confirm would commit) and shows the review
+// in the pane: per file its name, bytes and redacted count with its first redacted lines, and the confirm phrase. The
+// confirm commits exactly the reviewed plan: the Confirm button (`contribute confirm`) or the phrase
+// `contribute yes <stamp>` typed in the field (the card's confirm door: a TextField whose placeholder is the phrase,
+// routed back through `on_input`) or inline. `contribute cancel` drops it; `contribute --yes [<dir>]` is the one-shot
+// path for scripts. A landing whose branch exists, or that lies outside the repo, refuses before any review.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -51,7 +60,7 @@ use bandy::SMessage;
 use git_core::Repository;
 use git_core::index::{Entry, Index};
 use git_core::object::{Commit, Kind, Signature, mode};
-use quartzite::tetra::{ConsoleLine, ConsoleTetra, TetraNode};
+use quartzite::tetra::{ConsoleLine, ConsoleTetra, TetraNode, TextAction};
 
 use crate::landing::verdict_name; // LANDINGSCORE (SR437): the verdict-name rule moved beside landing::verdict, body unchanged
 
@@ -67,6 +76,8 @@ const QUOTED: usize = 20;
 const QUOTE_CHARS: usize = 240;
 /// How many redaction hits a check prints before `more=`.
 const SHOWN: usize = 20;
+/// CONTRIBUTEREVIEW (SR445): how many redacted lines per file the review quotes.
+const REVIEWED: usize = 3;
 
 // ── the redaction ───────────────────────────────────────────────────────────────────────────────
 
@@ -551,13 +562,10 @@ pub struct Landed {
     pub files: usize,
 }
 
-/// Commit `p` (redacted) + `contribution` on `contrib/<landing dir>` in the repository holding `checkout`, in the object
-/// store only: HEAD, the index and the working tree are never touched.
-pub fn commit(checkout: &Path, p: &Plan, contribution: &str, now: i64) -> Result<Landed, &'static str> {
-    if p.unredactable() > 0 {
-        return Err("unredactable");
-    }
-    let repo = Repository::discover(checkout).map_err(|_| "no-git")?;
+/// Where `p` lands in `repo`: (the canonical working tree, the landing dir's path prefix in the tree, the branch's ref).
+/// A landing outside the working tree refuses `no-git`, an existing branch `branch-exists` (CONTRIBUTEREVIEW SR445: the
+/// review asks this before it shows anything; `commit` asks it again before it writes).
+fn target(repo: &Repository, p: &Plan) -> Result<(PathBuf, String, String), &'static str> {
     let wt = repo.work_tree.clone().ok_or("no-git")?;
     let wt = wt.canonicalize().unwrap_or(wt);
     let dir = p.dir.canonicalize().map_err(|_| "no-landing")?;
@@ -567,11 +575,22 @@ pub fn commit(checkout: &Path, p: &Plan, contribution: &str, now: i64) -> Result
         return Err("no-git");
     }
     let prefix = format!("{}/", rel.join("/"));
-    let branch = p.branch();
-    let refname = format!("refs/heads/{branch}");
+    let refname = format!("refs/heads/{}", p.branch());
     if matches!(repo.resolve_ref(&refname), Ok(Some((_, Some(_))))) {
         return Err("branch-exists");
     }
+    Ok((wt, prefix, refname))
+}
+
+/// Commit `p` (redacted) + `contribution` on `contrib/<landing dir>` in the repository holding `checkout`, in the object
+/// store only: HEAD, the index and the working tree are never touched.
+pub fn commit(checkout: &Path, p: &Plan, contribution: &str, now: i64) -> Result<Landed, &'static str> {
+    if p.unredactable() > 0 {
+        return Err("unredactable");
+    }
+    let repo = Repository::discover(checkout).map_err(|_| "no-git")?;
+    let (wt, prefix, refname) = target(&repo, p)?;
+    let branch = p.branch();
     let (_, head) = repo.head().map_err(git)?;
     let mut tree: BTreeMap<Vec<u8>, (u32, git_core::ObjectId)> = match head {
         Some(h) => {
@@ -635,25 +654,77 @@ fn now_secs() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
 }
 
-/// The whole verb, synchronous (the face runs it on its own thread): the landing (`dir`, else the newest), the plan,
-/// the census, the commit. Returns the printed lines: the wire line first, then the next steps or the hit lines.
+/// The whole verb, synchronous (the face runs it on its own thread): the review then the commit, no yes asked (the
+/// one-shot `contribute --yes` path). Returns the printed lines: the wire line first, then the next steps or the hit lines.
 pub fn contribute_at(checkout: &Path, dir: Option<PathBuf>, r: &Redactor, card_model: &dyn Fn(&str) -> Option<String>, now: i64) -> Vec<String> {
+    match review_at(checkout, dir, r) {
+        Ok(p) => commit_plan(checkout, &p, card_model, now),
+        Err(lines) => lines,
+    }
+}
+
+/// CONTRIBUTEREVIEW (SR445): the first half of the verb, nothing written: the landing (`dir`, else the newest), the plan
+/// (redacted), the unredactable refusal, and where it would land (`target`: no-git / branch-exists refuse here). Err is
+/// the printed refusal: the wire line first, then the hit lines.
+pub fn review_at(checkout: &Path, dir: Option<PathBuf>, r: &Redactor) -> Result<Plan, Vec<String>> {
     let Some(dir) = dir.or_else(|| crate::provider::newest_landing(checkout)).filter(|d| d.is_dir()) else {
-        return vec![line("-", "-", 0, 0, false, "no-landing")];
+        return Err(vec![line("-", "-", 0, 0, false, "no-landing")]);
     };
-    let p = match plan(&dir, r) {
-        Ok(p) => p,
-        Err(why) => return vec![line("-", "-", 0, 0, false, why)],
-    };
+    let p = plan(&dir, r).map_err(|why| vec![line("-", "-", 0, 0, false, why)])?;
     if p.unredactable() > 0 {
         let mut v = vec![line(p.stamp(), "-", 0, p.redacted(), false, "unredactable")];
         v.extend(p.hit_lines(true));
-        return v;
+        return Err(v);
     }
+    let landing = Repository::discover(checkout).map_err(|_| "no-git").and_then(|repo| target(&repo, &p).map(|_| ()));
+    if let Err(why) = landing {
+        let branch = if why == "branch-exists" { p.branch() } else { String::from("-") };
+        return Err(vec![line(p.stamp(), &branch, 0, p.redacted(), false, why)]);
+    }
+    Ok(p)
+}
+
+/// CONTRIBUTEREVIEW (SR445): the review the face shows before a commit (face rows, not wire lines), every byte from the
+/// redacted plan: per file its name, bytes and redacted count, then its first [`REVIEWED`] redacted lines as
+/// `  <file>:<line>: <line>` (trailing NULs and spaces trimmed, capped at [`QUOTE_CHARS`]); the census note; the phrase.
+pub fn review_lines(p: &Plan) -> Vec<String> {
+    let mut v = Vec::new();
+    for f in &p.files {
+        v.push(format!("{}: {} bytes, {} redacted", f.name, f.bytes.len(), f.hits.len()));
+        let lines: Vec<&[u8]> = f.bytes.split(|&b| b == b'\n').collect();
+        let mut shown: Vec<usize> = Vec::new();
+        for &(n, _) in &f.hits {
+            if shown.len() == REVIEWED {
+                break;
+            }
+            if shown.contains(&n) {
+                continue;
+            }
+            shown.push(n);
+            let text = lines.get(n.wrapping_sub(1)).map(|l| String::from_utf8_lossy(l).into_owned()).unwrap_or_default();
+            let l = text.trim_end_matches(|c: char| c == '\0' || c.is_whitespace());
+            let cut: String = l.chars().take(QUOTE_CHARS).collect();
+            let more = if l.chars().count() > QUOTE_CHARS { " …" } else { "" };
+            v.push(format!("  {}:{n}: {cut}{more}", f.name));
+        }
+    }
+    v.push(format!("{CONTRIBUTION}: generated at the commit (the census and the counts by class, never a value)"));
+    v.push(format!("type `{}` or press Confirm to commit on {}; Cancel drops it", phrase(p), p.branch()));
+    v
+}
+
+/// CONTRIBUTEREVIEW (SR445): the confirm phrase of a reviewed plan, `contribute yes <stamp>`.
+pub fn phrase(p: &Plan) -> String {
+    format!("contribute yes {}", p.stamp())
+}
+
+/// The second half of the verb: the census (the card model through `card_model`), CONTRIBUTION.md, the commit. Returns
+/// the printed lines: the wire line first, then the next steps.
+pub fn commit_plan(checkout: &Path, p: &Plan, card_model: &dyn Fn(&str) -> Option<String>, now: i64) -> Vec<String> {
     let (_, _, _, device) = census_of(&p.landing_md());
     let model = card_model(&device);
-    let md = contribution_md(&p, crate::host::Os::this().name(), std::env::consts::ARCH, model.as_deref());
-    match commit(checkout, &p, &md, now) {
+    let md = contribution_md(p, crate::host::Os::this().name(), std::env::consts::ARCH, model.as_deref());
+    match commit(checkout, p, &md, now) {
         Ok(l) => {
             let mut v = vec![line(p.stamp(), &l.branch, l.files, p.redacted(), true, "-")];
             v.extend(next_steps(&l.root, &l.branch));
@@ -887,6 +958,9 @@ pub struct Contribute {
     /// Look the card model up through the card face's devices (false in tests).
     host_devices: bool,
     rx: Option<Receiver<Msg>>,
+    /// CONTRIBUTEREVIEW (SR445): the reviewed, redacted plan the confirm commits (in memory only), and its review rows.
+    pending: Option<Plan>,
+    review: Vec<String>,
 }
 
 impl Contribute {
@@ -909,6 +983,8 @@ impl Contribute {
             next: Vec::new(),
             host_devices,
             rx: None,
+            pending: None,
+            review: Vec::new(),
         }
     }
 
@@ -952,6 +1028,7 @@ impl Contribute {
         let Some(rx) = &self.rx else { return false };
         let Ok(Msg::Done(lines)) = rx.try_recv() else { return false };
         self.rx = None;
+        self.review.clear();
         self.verdict = lines.first().cloned().unwrap_or_default();
         self.next = lines.into_iter().skip(1).filter(|l| l.starts_with("[installer] contribute next:")).collect();
         true
@@ -974,25 +1051,80 @@ impl Contribute {
         self.next = lines.into_iter().skip(1).filter(|l| l.starts_with("[installer] contribute next:")).collect();
     }
 
-    /// `contribute [<dir>]` on its own thread.
+    /// `contribute --yes [<dir>]` on its own thread: the one-shot path (review and commit, no yes asked).
     pub fn start(&mut self, arg: &str) {
         if self.busy() {
             return;
         }
-        let (tx, rx) = channel();
         let checkout = self.checkout.clone();
         let dir = (!arg.is_empty()).then(|| PathBuf::from(arg));
         let r = self.redactor();
+        self.pending = None;
+        self.review.clear();
+        self.run(move |model| contribute_at(&checkout, dir, &r, model, now_secs()));
+    }
+
+    /// The commit job on its own thread (it opens the repository there), its lines printed and drained by `poll`.
+    fn run<F>(&mut self, job: F)
+    where
+        F: FnOnce(&dyn Fn(&str) -> Option<String>) -> Vec<String> + Send + 'static,
+    {
+        let (tx, rx) = channel();
         let host_devices = self.host_devices;
         self.verdict = String::from("committing the landing ...");
         self.next.clear();
         self.rx = Some(rx);
         std::thread::spawn(move || {
             let model = |id: &str| card_model(host_devices, id);
-            let lines = contribute_at(&checkout, dir, &r, &model, now_secs());
+            let lines = job(&model);
             say_all(&lines);
             let _ = tx.send(Msg::Done(lines));
         });
+    }
+
+    /// CONTRIBUTEREVIEW (SR445): `contribute [<dir>]`, synchronous: the plan redacted and held (in memory only), the review
+    /// rows, the wire line with `ok=0 why=review-pending`. Nothing is committed until the confirm.
+    pub fn review(&mut self, arg: &str) {
+        self.next.clear();
+        self.review.clear();
+        self.pending = None;
+        match review_at(&self.checkout, (!arg.is_empty()).then(|| PathBuf::from(arg)), &self.redactor()) {
+            Ok(p) => {
+                let l = line(p.stamp(), &p.branch(), p.files.len() + 1, p.redacted(), false, "review-pending");
+                say_all(std::slice::from_ref(&l));
+                self.verdict = l;
+                self.review = review_lines(&p);
+                self.pending = Some(p);
+            }
+            Err(lines) => {
+                say_all(&lines);
+                self.verdict = lines.first().cloned().unwrap_or_default();
+            }
+        }
+    }
+
+    /// CONTRIBUTEREVIEW (SR445): the confirm: the Confirm button (`stamp` None) or the phrase `contribute yes <stamp>`
+    /// (the pending stamp, case ignored). The reviewed plan moves to the commit thread; nothing pending, or another
+    /// stamp, runs nothing.
+    pub fn confirm(&mut self, stamp: Option<&str>) {
+        let Some(p) = self.pending.as_ref() else {
+            self.verdict = String::from("nothing to confirm — press Contribute to review first");
+            return;
+        };
+        if stamp.is_some_and(|s| !s.eq_ignore_ascii_case(p.stamp())) {
+            self.verdict = format!("type `{}`", phrase(p));
+            return;
+        }
+        let Some(p) = self.pending.take() else { return };
+        let checkout = self.checkout.clone();
+        self.run(move |model| commit_plan(&checkout, &p, model, now_secs()));
+    }
+
+    /// CONTRIBUTEREVIEW (SR445): `contribute cancel`: the reviewed plan dropped, nothing committed.
+    pub fn cancel(&mut self) {
+        self.pending = None;
+        self.review.clear();
+        self.verdict = String::from("review dropped — nothing was committed");
     }
 }
 
@@ -1006,11 +1138,13 @@ pub fn face() -> TetraNode {
     face_of(&Contribute::probe_in(None))
 }
 
-/// The pane for a given state: the status, the verdict, the next steps after a commit or a report, Check, Contribute and
-/// Report bug.
+/// The pane for a given state: the status, the verdict, the review before a commit (CONTRIBUTEREVIEW SR445), the next
+/// steps after a commit or a report, Check, Contribute, Confirm, Cancel and Report bug, and the confirm field (the card's
+/// door: its placeholder is the phrase). The shape is the same with or without a review, so a live face patches leaves.
 pub fn face_of(c: &Contribute) -> TetraNode {
     let line = |level: &str, text: String| ConsoleLine { level: level.to_string(), source: String::from("contribute"), text };
     let mut lines = vec![line("info", c.status()), line("info", c.verdict.clone())];
+    lines.extend(c.review.iter().map(|n| line("info", n.clone())));
     lines.extend(c.next.iter().map(|n| line("info", n.clone())));
     if !git_cli() {
         lines.push(line("warn", String::from("no git on PATH: the commit works, the push needs git")));
@@ -1021,13 +1155,23 @@ pub fn face_of(c: &Contribute) -> TetraNode {
         TetraNode::HStack(vec![
             button("contribute.check", "Check", "contribute redact-check"),
             button("contribute.commit", "Contribute", "contribute"),
+            button("contribute.confirm.yes", "Confirm", "contribute confirm"),
+            button("contribute.cancel", "Cancel", "contribute cancel"),
             button("contribute.bugreport", "Report bug", "contribute bugreport"),
         ]),
+        TetraNode::TextField {
+            id: String::from("contribute.confirm"),
+            placeholder: c.pending.as_ref().map(phrase).unwrap_or_else(|| String::from("Contribute first: the review names the phrase")),
+            action: TextAction::ConsoleInput,
+            secret: false,
+        },
     ])
 }
 
-/// Route one `SMessage::ConsoleInput` line: `contribute [<landing dir>]`, `contribute redact-check [<landing dir>]`,
-/// `contribute bugreport [<landing dir>]`, `contribute status`. False = not the contribute face's line.
+/// Route one `SMessage::ConsoleInput` line: `contribute [<landing dir>]` (the review), `contribute confirm`,
+/// `contribute yes <stamp>` (the phrase), `contribute cancel`, `contribute --yes [<landing dir>]` (one-shot),
+/// `contribute redact-check [<landing dir>]`, `contribute bugreport [<landing dir>]`, `contribute status`. False = not the
+/// contribute face's line.
 pub fn on_input(c: &mut Contribute, line: &str) -> bool {
     c.poll();
     let t = line.trim();
@@ -1040,7 +1184,11 @@ pub fn on_input(c: &mut Contribute, line: &str) -> bool {
         "bugreport" => c.bugreport(arg),
         "status" => c.verdict = c.status(),
         _ if c.busy() => c.verdict = String::from("busy committing — wait for the verdict"),
-        _ => c.start(rest),
+        "confirm" => c.confirm(None),
+        "yes" => c.confirm(Some(arg)),
+        "cancel" => c.cancel(),
+        "--yes" => c.start(arg),
+        _ => c.review(rest),
     }
     true
 }
@@ -1294,6 +1442,8 @@ mod tests {
         assert!(on_input(&mut c, "contribute redact-check"));
         assert!(c.verdict.starts_with("[installer] contribute redact-check landing=20261027-2340 files=4 "), "{}", c.verdict);
         assert!(on_input(&mut c, "contribute"));
+        assert!(c.verdict.ends_with("ok=0 why=review-pending") && !c.busy(), "{}", c.verdict); // CONTRIBUTEREVIEW (SR445)
+        assert!(on_input(&mut c, "contribute confirm"));
         for _ in 0..2000 {
             if !c.busy() {
                 break;
@@ -1308,6 +1458,113 @@ mod tests {
         let TetraNode::VStack(kids) = face_of(&c) else { panic!("the face is a VStack") };
         let TetraNode::Console(con) = &kids[0] else { panic!("the console first") };
         assert!(con.lines.iter().any(|l| l.text.contains("push origin")));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // ── CONTRIBUTEREVIEW (SR445) ────────────────────────────────────────────────────────────────
+
+    fn settle(c: &mut Contribute) {
+        for _ in 0..2000 {
+            if !c.busy() {
+                break;
+            }
+            c.poll();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!c.busy(), "the commit never answered");
+    }
+
+    fn has_branch(checkout: &Path, branch: &str) -> bool {
+        let repo = Repository::discover(checkout).unwrap();
+        matches!(repo.resolve_ref(&format!("refs/heads/{branch}")), Ok(Some((_, Some(_)))))
+    }
+
+    /// The first `contribute` reviews (redacted, held in memory, no branch, no value shown); the confirm commits exactly
+    /// the reviewed plan; a review of a committed landing refuses before it shows anything.
+    #[test]
+    fn contribute_plan_then_confirm_commits() {
+        let root = scratch("review-confirm");
+        let checkout = repo_at(&root);
+        let dir = lay(&checkout, &[]);
+        let files0 = snapshot(&dir);
+        let mut c = Contribute::probe_at(checkout.clone(), Some(String::from("/home/tester")));
+        assert!(on_input(&mut c, "contribute"));
+        assert!(!c.busy());
+        let redacted = c.pending.as_ref().expect("the plan is held").redacted();
+        assert_eq!(c.verdict, line("20261027-2340", &format!("contrib/{NAME}"), 5, redacted, false, "review-pending"));
+        assert!(c.review.iter().any(|l| l.starts_with("boot2.log: ") && l.ends_with(" redacted")), "{:?}", c.review);
+        assert!(c.review.iter().any(|l| l.starts_with("  boot2.log:") && l.contains("ssid=<ssid>")), "{:?}", c.review);
+        assert!(c.review.iter().any(|l| l.contains("`contribute yes 20261027-2340`")), "{:?}", c.review);
+        let checkout_s = checkout.display().to_string();
+        for v in PLANTED.iter().chain([checkout_s.as_str()].iter()) {
+            assert!(c.review.iter().chain([&c.verdict]).all(|l| !l.contains(v)), "{v} shown in the review");
+        }
+        let TetraNode::VStack(kids) = face_of(&c) else { panic!("the face is a VStack") };
+        let TetraNode::TextField { placeholder, .. } = &kids[2] else { panic!("the confirm field third") };
+        assert_eq!(placeholder.as_str(), "contribute yes 20261027-2340");
+        let TetraNode::Console(con) = &kids[0] else { panic!("the console first") };
+        assert!(con.lines.iter().any(|l| l.text.contains("ssid=<ssid>")));
+        assert!(!has_branch(&checkout, &format!("contrib/{NAME}")), "the review committed");
+
+        assert!(on_input(&mut c, "contribute confirm"));
+        settle(&mut c);
+        assert!(c.verdict.ends_with("ok=1 why=-") && c.verdict.contains(&format!("branch=contrib/{NAME} files=5 redacted={redacted} ")), "{}", c.verdict);
+        assert_eq!(c.next.len(), 3);
+        assert!(c.pending.is_none() && c.review.is_empty());
+        assert!(has_branch(&checkout, &format!("contrib/{NAME}")));
+        assert_eq!(snapshot(&dir), files0, "the landing on disk is untouched");
+
+        assert!(on_input(&mut c, "contribute"));
+        assert!(c.verdict.ends_with("ok=0 why=branch-exists") && c.pending.is_none() && c.review.is_empty(), "{}", c.verdict);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A review never commits: cancel drops it, a wrong stamp runs nothing, a confirm with nothing pending runs nothing.
+    #[test]
+    fn contribute_plan_without_confirm_leaves_no_branch() {
+        let root = scratch("review-cancel");
+        let checkout = repo_at(&root);
+        lay(&checkout, &[]);
+        let mut c = Contribute::probe_at(checkout.clone(), Some(String::from("/home/tester")));
+        assert!(on_input(&mut c, "contribute confirm"));
+        assert!(!c.busy() && c.verdict.starts_with("nothing to confirm"), "{}", c.verdict);
+        assert!(on_input(&mut c, "contribute"));
+        assert!(c.verdict.ends_with("why=review-pending"), "{}", c.verdict);
+        assert!(on_input(&mut c, "contribute yes 20261027-0000"));
+        assert!(!c.busy() && c.pending.is_some(), "a wrong stamp confirmed");
+        assert_eq!(c.verdict, "type `contribute yes 20261027-2340`");
+        assert!(on_input(&mut c, "contribute cancel"));
+        assert!(!c.busy() && c.pending.is_none() && c.review.is_empty());
+        assert!(on_input(&mut c, "contribute confirm"));
+        assert!(!c.busy() && c.verdict.starts_with("nothing to confirm"), "{}", c.verdict);
+        assert!(!has_branch(&checkout, &format!("contrib/{NAME}")), "a review without a yes committed");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// `contribute --yes` is the one-shot path (no review step); the typed phrase after a review commits too.
+    #[test]
+    fn contribute_yes_is_one_shot() {
+        let root = scratch("yes");
+        let checkout = repo_at(&root);
+        lay(&checkout, &[]);
+        let mut c = Contribute::probe_at(checkout.clone(), Some(String::from("/home/tester")));
+        assert!(on_input(&mut c, "contribute --yes"));
+        settle(&mut c);
+        assert!(c.verdict.ends_with("ok=1 why=-") && c.verdict.contains(&format!("branch=contrib/{NAME} files=5 ")), "{}", c.verdict);
+        assert!(c.review.is_empty() && c.pending.is_none());
+        assert_eq!(c.next.len(), 3);
+        assert!(has_branch(&checkout, &format!("contrib/{NAME}")));
+
+        let second = checkout.join("docs/dev/evidence/landing-20261028-0100");
+        fs::create_dir_all(&second).unwrap();
+        fs::write(second.join("landing.md"), landing_md()).unwrap();
+        assert!(on_input(&mut c, &format!("contribute {}", second.display())));
+        assert!(c.verdict.contains("branch=contrib/landing-20261028-0100 files=2 ") && c.verdict.ends_with("ok=0 why=review-pending"), "{}", c.verdict);
+        assert!(!has_branch(&checkout, "contrib/landing-20261028-0100"));
+        assert!(on_input(&mut c, "contribute yes 20261028-0100"));
+        settle(&mut c);
+        assert!(c.verdict.ends_with("ok=1 why=-") && c.verdict.contains("branch=contrib/landing-20261028-0100 files=2 "), "{}", c.verdict);
+        assert!(has_branch(&checkout, "contrib/landing-20261028-0100"));
         let _ = fs::remove_dir_all(&root);
     }
     // ── INSTALLERBUGREPORT (SR433) ──────────────────────────────────────────────────────────────
