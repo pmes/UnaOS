@@ -11360,7 +11360,7 @@ pub mod preemptoff {
         }
         let ((fat_on, fat_held), (dir_on, dir_held)) = crate::fs::fat::preemptoff_span_probe();
         let ((m_fat_on, _), (m_dir_on, _)) = crate::arch::without_interrupts(crate::fs::fat::preemptoff_span_probe);
-        let masked_kept = !m_fat_on && !m_dir_on; let ul = crate::fs::unafs::unafs_leg(); let lk = leak_kat(); let sk = stale_kat(); let sl = sleep_kat(); let wl = crate::video::wm::wmtable_leg(); let cl = casts_leg(); let cn = casts_nest_leg(); let cnn = casts_now_nest_leg(); let rl = route_leg(); // PREEMPTOFFARMCASTSNOWINPASSLEG (zenbook-ledger Z109): `casts_now`'s in-pass nest leg (`casts_now_nest=`) after the in-pass `track` leg, before `released`. PREEMPTOFFARMCASTSINPASSLEG (zenbook-ledger Z106): the in-pass nest leg (`casts_nest=`) after the CASTS leg, before `released`. PREEMPTOFFARMCASTSLEG (zenbook-ledger Z103): the CASTS leg (`casts_leg=`) after the TABLE leg, before `released`. PREEMPTOFFARMSLEEPCHECK (zenbook-ledger Z95): the sleep KAT reads the stale KAT's real in-span yield, right after it. PREEMPTOFFARMWMTABLE (zenbook-ledger Z92): the TABLE leg (`wmtable_leg=`), before `released`. PREEMPTOFFARMSTALEDROP (zenbook-ledger Z91): the stale-drop KAT after the leak KAT. PREEMPTOFFARMQUANTUM (zenbook-ledger Z89): the leak-reset KAT runs before `released` too. PREEMPTOFFARMUNAFS (zenbook-ledger Z79): the UnaFS read-arm leg, before `released` so it also proves the leg gave the count back (LINE-NEUTRAL)
+        let masked_kept = !m_fat_on && !m_dir_on; let ul = crate::fs::unafs::unafs_leg(); let lk = leak_kat(); let sk = stale_kat(); let sl = sleep_kat(); let wl = crate::video::wm::wmtable_leg(); let cl = casts_leg(); let cn = casts_nest_leg(); let cnn = casts_now_nest_leg(); let rl = route_leg(); let il = irqmark_stale_leg(); // PREEMPTOFFARMIRQMARKSTALELEG (zenbook-ledger Z113): the switch-back clear's leg (`irqmark_leg=`) right after the route leg, before `released`. PREEMPTOFFARMCASTSNOWINPASSLEG (zenbook-ledger Z109): `casts_now`'s in-pass nest leg (`casts_now_nest=`) after the in-pass `track` leg, before `released`. PREEMPTOFFARMCASTSINPASSLEG (zenbook-ledger Z106): the in-pass nest leg (`casts_nest=`) after the CASTS leg, before `released`. PREEMPTOFFARMCASTSLEG (zenbook-ledger Z103): the CASTS leg (`casts_leg=`) after the TABLE leg, before `released`. PREEMPTOFFARMSLEEPCHECK (zenbook-ledger Z95): the sleep KAT reads the stale KAT's real in-span yield, right after it. PREEMPTOFFARMWMTABLE (zenbook-ledger Z92): the TABLE leg (`wmtable_leg=`), before `released`. PREEMPTOFFARMSTALEDROP (zenbook-ledger Z91): the stale-drop KAT after the leak KAT. PREEMPTOFFARMQUANTUM (zenbook-ledger Z89): the leak-reset KAT runs before `released` too. PREEMPTOFFARMUNAFS (zenbook-ledger Z79): the UnaFS read-arm leg, before `released` so it also proves the leg gave the count back (LINE-NEUTRAL)
         let released = !witness().0;
         let reason = if !fat_on {
             Some("fat-masked")
@@ -11371,25 +11371,25 @@ pub mod preemptoff {
         } else if !masked_kept {
             Some("unmasked")
         } else if !released {
-            Some("leaked") } else if !(ul == "ok" || ul.starts_with("skip")) { Some("unafs-leg") } else if lk != "ok" { Some("leak-kat") } else if sk != "ok" { Some("stale-kat") } else if sl != "ok" { Some("sleep-kat") } else if !(wl == "ok" || wl.starts_with("skip")) { Some("wmtable-leg") } else if !(cl == "ok" || cl.starts_with("skip")) { Some("casts-leg") } else if !(cn == "ok" || cn.starts_with("skip")) { Some("casts-nest") } else if !(cnn == "ok" || cnn.starts_with("skip")) { Some("casts-now-nest") } else if !(rl == "armed-ok" || rl.starts_with("skip")) { Some("route-leg")
+            Some("leaked") } else if !(ul == "ok" || ul.starts_with("skip")) { Some("unafs-leg") } else if lk != "ok" { Some("leak-kat") } else if sk != "ok" { Some("stale-kat") } else if sl != "ok" { Some("sleep-kat") } else if !(wl == "ok" || wl.starts_with("skip")) { Some("wmtable-leg") } else if !(cl == "ok" || cl.starts_with("skip")) { Some("casts-leg") } else if !(cn == "ok" || cn.starts_with("skip")) { Some("casts-nest") } else if !(cnn == "ok" || cnn.starts_with("skip")) { Some("casts-now-nest") } else if !(rl == "armed-ok" || rl.starts_with("skip")) { Some("route-leg") } else if !(il == "clear-ok" || il.starts_with("skip")) { Some("irqmark-leg")
         } else {
             None
         };
         let ok = |b: bool, y: &'static str, n: &'static str| if b { y } else { n };
         match reason {
             None => serial_println!(
-                ":: PREEMPTAUDIT: arch=aarch64 sites={} isr={} holder={} both={} converted={} converted_fat={} fat_irq_on=ok dir_irq_on=ok fat_held=ok dir_held=ok masked_kept=ok released=ok unafs_leg={} leak_reset={} leak_kat={} stale_drop={} stale_kat={} sleep_in_span={} sleep_kat={} wmtable_leg={} casts_leg={} casts_nest={} casts_now_nest={} route_leg={} -> PASS ::",
-                AUDIT_SITES, AUDIT_ISR, AUDIT_HOLDER, AUDIT_BOTH, AUDIT_CONVERTED, CONVERTED_FAT, ul, leak_resets(), lk, stale_drops(), sk, sleep_in_spans(), sl, wl, cl, cn, cnn, rl
+                ":: PREEMPTAUDIT: arch=aarch64 sites={} isr={} holder={} both={} converted={} converted_fat={} fat_irq_on=ok dir_irq_on=ok fat_held=ok dir_held=ok masked_kept=ok released=ok unafs_leg={} leak_reset={} leak_kat={} stale_drop={} stale_kat={} sleep_in_span={} sleep_kat={} wmtable_leg={} casts_leg={} casts_nest={} casts_now_nest={} route_leg={} irqmark_leg={} -> PASS ::",
+                AUDIT_SITES, AUDIT_ISR, AUDIT_HOLDER, AUDIT_BOTH, AUDIT_CONVERTED, CONVERTED_FAT, ul, leak_resets(), lk, stale_drops(), sk, sleep_in_spans(), sl, wl, cl, cn, cnn, rl, il
             ),
             Some(r) => serial_println!(
-                ":: PREEMPTAUDIT: arch=aarch64 sites={} isr={} holder={} both={} converted={} converted_fat={} fat_irq_on={} dir_irq_on={} fat_held={} dir_held={} masked_kept={} released={} unafs_leg={} leak_reset={} leak_kat={} stale_drop={} stale_kat={} sleep_in_span={} sleep_kat={} wmtable_leg={} casts_leg={} casts_nest={} casts_now_nest={} route_leg={} -> FAIL reason={} ::",
+                ":: PREEMPTAUDIT: arch=aarch64 sites={} isr={} holder={} both={} converted={} converted_fat={} fat_irq_on={} dir_irq_on={} fat_held={} dir_held={} masked_kept={} released={} unafs_leg={} leak_reset={} leak_kat={} stale_drop={} stale_kat={} sleep_in_span={} sleep_kat={} wmtable_leg={} casts_leg={} casts_nest={} casts_now_nest={} route_leg={} irqmark_leg={} -> FAIL reason={} ::",
                 AUDIT_SITES, AUDIT_ISR, AUDIT_HOLDER, AUDIT_BOTH, AUDIT_CONVERTED, CONVERTED_FAT,
                 ok(fat_on, "ok", "masked"),
                 ok(dir_on, "ok", "masked"),
                 ok(fat_held, "ok", "free"),
                 ok(dir_held, "ok", "free"),
                 ok(masked_kept, "ok", "unmasked"),
-                ok(released, "ok", "leaked"), ul, leak_resets(), lk, stale_drops(), sk, sleep_in_spans(), sl, wl, cl, cn, cnn, rl,
+                ok(released, "ok", "leaked"), ul, leak_resets(), lk, stale_drops(), sk, sleep_in_spans(), sl, wl, cl, cn, cnn, rl, il,
                 r
             ),
         }
@@ -11987,6 +11987,70 @@ pub mod preemptoff {
     /// Z110: no mark and no routed console off `desktop_firmware` (default `kernel8-test`, `test-arm`, the plain Orin image).
     #[cfg(not(feature = "desktop_firmware"))]
     pub fn route_leg() -> &'static str {
+        "skip(no-desk)"
+    }
+
+    // ══ PREEMPTOFFARMIRQMARKSTALELEG (zenbook-ledger Z113) — the switch-back clear's leg on the aarch64 audit (`irqmark_leg=`) ══
+    // Z101's clear (`dispatch_next`: `exceptions::irq_mark(false)` is the first statement after its `switch_context`, so the
+    // scheduler stack's first act after ANY switch-out on this core is the clear) is read by no leg: Z110's `route_leg` arms
+    // and disarms with no switch between. Here a holder PINNED to this core (`stale_kat`'s spawn shape: a task spawned on an
+    // explicit core never migrates, so the read is on the core that was armed and cleared) arms the mark masked (the vector's
+    // and Z101's rule), reads `in_irq` true, and switches out through the REAL `yield_now` with the mask still held
+    // (`yield_now` always switches to the scheduler stack, so the switch-back runs). No preempt-off count is held, so
+    // `sleep_check` returns at once (no Z95 / Z107 state moves). `yield_now` returns UNMASKED and `in_irq` is false whenever
+    // unmasked, so the read is under a fresh mask, which also clears the mark (never left set). Residual: a real IRQ on this
+    // core in that unmasked instant clears the mark through the vector too (a false `clear-ok`, never a false miss); the lane
+    // that runs the leg with no live timer (`kernel8-test --desk`) has no such IRQ.
+
+    /// Z113 KAT state: the holder's verdict code (0 = the holder never stored one).
+    #[cfg(feature = "desktop_firmware")]
+    static IRQMARK_KAT_CODE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+    /// Z113: the holder, pinned to core `c` (`arg`; the spawn's core): arm masked, switch through `yield_now`, read after the
+    /// return. Codes: 1 pre-marked, 2 mark-miss, 3 clear-miss, 4 clear-ok.
+    #[cfg(feature = "desktop_firmware")]
+    fn irqmark_stale_holder(_c: usize) {
+        let code = crate::arch::without_interrupts(|| {
+            if crate::arch::exceptions::in_irq() {
+                return 1;
+            }
+            super::super::exceptions::irq_mark(true);
+            if !crate::arch::exceptions::in_irq() {
+                super::super::exceptions::irq_mark(false);
+                return 2;
+            }
+            super::yield_now();
+            let stale = crate::arch::without_interrupts(|| {
+                let s = crate::arch::exceptions::in_irq();
+                super::super::exceptions::irq_mark(false);
+                s
+            });
+            if stale { 3 } else { 4 }
+        });
+        IRQMARK_KAT_CODE.store(code, Ordering::Release);
+    }
+
+    /// Z113 (`irqmark_leg=`): `clear-ok`, `skip(masked)`, `clear-miss`, `mark-miss`, `pre-marked`, `not-run`.
+    #[cfg(feature = "desktop_firmware")]
+    pub fn irqmark_stale_leg() -> &'static str {
+        if crate::arch::irqs_masked() {
+            return "skip(masked)";
+        }
+        let c = slot();
+        IRQMARK_KAT_CODE.store(0, Ordering::Release);
+        super::spawn_joinable("preemptoff-irqmark", irqmark_stale_holder, c, c).join();
+        match IRQMARK_KAT_CODE.load(Ordering::Acquire) {
+            4 => "clear-ok",
+            3 => "clear-miss",
+            2 => "mark-miss",
+            1 => "pre-marked",
+            _ => "not-run",
+        }
+    }
+
+    /// Z113: no mark off `desktop_firmware` (default `kernel8-test`, `test-arm`, the plain Orin image).
+    #[cfg(not(feature = "desktop_firmware"))]
+    pub fn irqmark_stale_leg() -> &'static str {
         "skip(no-desk)"
     }
 }
