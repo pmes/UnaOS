@@ -529,9 +529,11 @@ pub fn build_taffy_tree<H: Host>(
             paint.ua_vmargin = Some((k, built));
         }
     }
-    if control_kind(dom_node) == Some(Control::Button) {
+    // AETHERFILEFACE (SR463): html.css gives `input[type="file" i]` no background (initial): Chromium paints ButtonFace on
+    // the inner Choose-File button only, which both rings' file paint draws over the button sub-box (`BUTTON_FACE`).
+    if control_kind(dom_node) == Some(Control::Button) && !dom_node.attr("type").is_some_and(|t| t.trim().eq_ignore_ascii_case("file")) {
         // Chromium's ButtonFace.
-        paint.background = Some((239, 239, 239));
+        paint.background = Some(BUTTON_FACE);
     }
     if tag == "mark" {
         // html.css: `mark { background-color: yellow; color: black }`.
@@ -865,6 +867,11 @@ pub fn push_button_edges() -> (taffy::Rect<f32>, taffy::Rect<f32>) {
     let padding = taffy::Rect { left: 6.0, right: 6.0, top: 1.0, bottom: 1.0 };
     (border, padding)
 }
+
+/// AETHERFILEFACE (SR463): Chromium's ButtonFace, the ONE source of a push button's UA background (`build_taffy_tree`)
+/// and of the face both rings' file paint draw on a file input's Choose-File button sub-box (the host's
+/// `paint_file_color`, AETHER.ELF's paint.rs `file_color`), the input itself painting none.
+pub const BUTTON_FACE: (u8, u8, u8) = (239, 239, 239);
 
 /// AETHERFILECOLORPAINT (SR456): a color input's swatch (Chromium html.css: the input's 1px border and 1px 2px padding,
 /// `::-webkit-color-swatch-wrapper { padding: 4px 2px }`, `::-webkit-color-swatch { border: 1px solid #777777 }`): the

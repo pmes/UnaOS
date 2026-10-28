@@ -1444,6 +1444,7 @@ fn centered_line_origin_y(font: &Font, font_size: f32, center_y: f32) -> f32 {
 /// sanitized, else the attribute) through the cascade's own `parse_color_str`, black when it does not parse (the
 /// sanitization default #000000), filled in Chromium's swatch: layout_core `COLOR_SWATCH`'s inset from the border
 /// box, a 1 px frame in its colour round the fill.
+/// AETHERFILEFACE (SR463): the file input itself paints no ButtonFace and no frame; the button sub-box gets both first.
 #[allow(clippy::too_many_arguments)]
 fn paint_file_color(
     dom_node: &crate::dom::NodeRef, tag: &str, bx: f32, by: f32, bw: f32, bh: f32,
@@ -1470,6 +1471,13 @@ fn paint_file_color(
             let whole = layout_core::caption_box(bx, by, bw, bh, bord, pad, 0.0, ascent, descent);
             let c = whole.clip;
             let clip = (clip.0.max(c.0), clip.1.max(c.1), clip.2.min(c.2), clip.3.min(c.3));
+            // AETHERFILEFACE (SR463): the button's face and frame on its sub-box, the push path's pixels (its 1px #767676
+            // control frame, square, over ButtonFace) as the swatch's fill_rect pair draws a framed fill; the input paints none.
+            let (fx0, fy0, fx1, fy1) = (cx0, cy0, cx0 + btn_bw, cy0 + ch);
+            if fx1 > fx0 && fy1 > fy0 {
+                fill_rect(fx0, fy0, fx1, fy1, (118, 118, 118), 255, surface, width, height, damage_rects, clip);
+                fill_rect(fx0 + 1.0, fy0 + 1.0, fx1 - 1.0, fy1 - 1.0, layout_core::BUTTON_FACE, 255, surface, width, height, damage_rects, clip);
+            }
             draw_text(button, btn.x, btn.top, f32::MAX, &adv, 0.0, color, false, surface, width, height, damage_rects, clip);
             draw_text(status, cx0 + btn_bw + 4.0, btn.top, f32::MAX, &adv, 0.0, color, false, surface, width, height, damage_rects, clip);
             true
@@ -2965,10 +2973,13 @@ fn frame_walk(
                 // AETHERIMAGEINPUTBOX (SR455): an image input has no UA edges (layout_core `ua_control`) and Chromium
                 // paints it no control frame: layout_core's ONE image predicate, as the box was sized.
                 let image_input = tag == "input" && el.attributes.borrow().get("type").is_some_and(|t| layout_core::is_image_type(t));
+                // AETHERFILEFACE (SR463): a file input has no UA edges and Chromium frames only its Choose-File button, which
+                // `paint_file_color` draws (the same dispatch): no 1px control frame and no corner keep on the input box.
+                let file_input = tag == "input" && crate::forms::input_type(dom_node) == "file";
                 // Chromium's control theme paints a 1px #767676 frame at the
                 // outer edge of the (2px) UA border; checkboxes and radios
                 // are drawn whole below.
-                let mut border = spec.border.or(if is_control && !checkable && !image_input {
+                let mut border = spec.border.or(if is_control && !checkable && !image_input && !file_input {
                     Some([Some((1.0, (118, 118, 118))); 4])
                 } else {
                     None
@@ -3219,7 +3230,7 @@ fn frame_walk(
                 }
                 // Chromium's control frame (fields, selects, textareas) is a rounded rect whose four
                 // corner pixels stay unpainted: keep what is under them.
-                let ua_frame = is_control && !checkable && !is_push_button && !image_input && spec.border.is_none() && !focused_field;
+                let ua_frame = is_control && !checkable && !is_push_button && !image_input && !file_input && spec.border.is_none() && !focused_field;
                 let corners: Vec<(u32, u32, [u8; 4])> = if ua_frame {
                     let (x0, y0) = (box_sx.round(), box_sy.round());
                     let (x1, y1) = ((box_sx + bw).round() - 1.0, (box_sy + bh).round() - 1.0);
