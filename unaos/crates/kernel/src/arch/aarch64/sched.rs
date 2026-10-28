@@ -4187,7 +4187,7 @@ impl JoinHandle {
     /// parked joiner holds its handle on its frozen stack, and the posting task holds its `done_sem`
     /// clone until the Box is dropped on the Finished path, strictly after the post. So the Arc
     /// refcount substitutes for the `Semaphore`'s `'static` requirement: no UAF, no leak.
-    pub fn join(self) {
+    #[track_caller] pub fn join(self) {
         assert!(
             self.done.wait(),
             "JoinHandle::join() must be called from a scheduled task"
@@ -7444,7 +7444,7 @@ impl<T> Mutex<T> {
     /// — otherwise two callers could hold guards at once (aliased `&mut T` = UB). Off a scheduled
     /// task `wait()` cannot block and so does not acquire, so we panic rather than hand out an
     /// unbacked guard (a sleeping mutex is meaningless off a scheduler context anyway).
-    pub fn lock(&self) -> MutexGuard<'_, T> {
+    #[track_caller] pub fn lock(&self) -> MutexGuard<'_, T> {
         assert!(
             self.sem.wait(),
             "Mutex::lock() called off a scheduled task (a sleeping mutex needs a scheduler context)"
@@ -7525,14 +7525,14 @@ impl<T> Channel<T> {
     }
 
     /// Send a value, blocking while the channel is full. Must be called from a scheduled task.
-    pub fn send(&self, value: T) {
+    #[track_caller] pub fn send(&self, value: T) {
         assert!(self.slots.wait(), "Channel::send() called off a scheduled task");
         self.buffer.lock().push_back(value); // mutex held only across the push (never across a wait)
         self.items.post();
     }
 
     /// Receive a value, blocking while the channel is empty. Must be called from a scheduled task.
-    pub fn recv(&self) -> T {
+    #[track_caller] pub fn recv(&self) -> T {
         assert!(self.items.wait(), "Channel::recv() called off a scheduled task");
         // A permit from `items` guarantees a value was pushed before its matching `post`, and pops
         // are serialised by the mutex, so the buffer is non-empty here.
