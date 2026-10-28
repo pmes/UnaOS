@@ -15,8 +15,9 @@
 //   [installer] card devices n=<n> writable=<n>
 //   [installer] card device=<id> size=<bytes> image=<path> written_mb=<n> readback=1|0 ejected=1|0 ms=<n>
 //   [installer] card refused why=<system-disk|mounted|too-small|no-image|windows-unbuilt|elevation-denied|elevation-unavailable> device=<id|->
-//   [installer] card elevate how=<authopen|pkexec> ok=1|0 why=<-|elevation-denied|elevation-unavailable>
-//     (INSTALLERAUTHOPEN SR422: once per write, only when the plain open was refused for permission)
+//   [installer] card elevate how=<authopen|pkexec|udisks> ok=1|0 why=<-|elevation-denied|elevation-unavailable>
+//     (INSTALLERAUTHOPEN SR422: once per write, only when the plain open was refused for permission;
+//      INSTALLERUDISKS SR427: `udisks` = udisks2's Block.OpenDevice over the system D-Bus, Linux without pkexec)
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -347,8 +348,15 @@ pub fn write(image: &Path, dev: &Device, typed: &str, progress: &mut dyn FnMut(u
 // Linux `pkexec <self> --open-device <node>` (pkexec marks every fd >= 3 close-on-exec, so stdout is the only
 // channel that survives it). The helper re-runs Amber's policy and judgment, opens, sends and exits; nothing else
 // runs as root, and every byte is written by the unprivileged write thread through the received fd.
+// INSTALLERUDISKS (SR427): a Linux host without pkexec takes the second route, udisks2's
+// `org.freedesktop.UDisks2.Block.OpenDevice("rw", {flags: O_EXCL})` over the system bus (`card/udisks.rs`): udisksd
+// opens the node as root under polkit's `org.freedesktop.udisks2.open-device` consent and returns the fd in the
+// reply's SCM_RIGHTS (`recv_chunk`). Only pkexec's absence falls through: a pkexec denial is the answer.
 
-/// `[installer] card elevate how=<authopen|pkexec> ok=1|0 why=<why>`.
+#[cfg(target_os = "linux")]
+mod udisks;
+
+/// `[installer] card elevate how=<authopen|pkexec|udisks> ok=1|0 why=<why>`.
 pub fn elevate_line(how: &str, ok: bool, why: &str) -> String {
     format!("[installer] card elevate how={how} ok={} why={why}", ok as u8)
 }
@@ -366,8 +374,8 @@ pub fn elevation_argv(macos: bool, node: &Path, exe: &Path) -> (String, Vec<Stri
 /// The plain open was refused for permission: elevate, print the elevate line once, and take the fd into a
 /// `FileBlock` (macOS at diskutil's size, as `open_device` sizes it; Linux at the measured length).
 fn elevated_block(dev: &Device, canon: &Path) -> Result<FileBlock, String> {
-    let how = if cfg!(target_os = "macos") { "authopen" } else { "pkexec" };
-    match elevated_open(canon) {
+    let (how, opened) = elevated_open(canon);
+    match opened {
         Ok(file) => {
             println!("{}", elevate_line(how, true, "-"));
             let sized = cfg!(target_os = "macos").then_some(dev.bytes / SECTOR);
@@ -380,10 +388,25 @@ fn elevated_block(dev: &Device, canon: &Path) -> Result<FileBlock, String> {
     }
 }
 
-/// Run the elevated opener on `canon` and receive its fd. `elevation-unavailable` = the tool is not here;
-/// `elevation-denied` = dismissed, not authorized, or no fd came back.
+/// The ONE route chooser (INSTALLERUDISKS SR427): `(how, fd)`. macOS: authopen. Linux: pkexec first; only its
+/// `elevation-unavailable` (not installed) falls to udisks2 over the system bus; a pkexec denial is final (one
+/// consent dialog per write). `elevation-unavailable` = no route is here; `elevation-denied` = dismissed, not
+/// authorized, or no fd came back.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-pub fn elevated_open(canon: &Path) -> Result<File, &'static str> {
+pub fn elevated_open(canon: &Path) -> (&'static str, Result<File, &'static str>) {
+    if cfg!(target_os = "macos") {
+        return ("authopen", spawn_open(canon));
+    }
+    match spawn_open(canon) {
+        #[cfg(target_os = "linux")]
+        Err("elevation-unavailable") => ("udisks", udisks::open_device(udisks::system_bus().as_deref(), canon)),
+        r => ("pkexec", r),
+    }
+}
+
+/// Run the elevated opener (authopen / pkexec, `elevation_argv`) on `canon` and receive its fd.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn spawn_open(canon: &Path) -> Result<File, &'static str> {
     use std::os::fd::OwnedFd;
     use std::os::unix::net::UnixStream;
     use std::process::{Command, Stdio};
@@ -404,8 +427,8 @@ pub fn elevated_open(canon: &Path) -> Result<File, &'static str> {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-pub fn elevated_open(_canon: &Path) -> Result<File, &'static str> {
-    Err("windows-unbuilt")
+pub fn elevated_open(_canon: &Path) -> (&'static str, Result<File, &'static str>) {
+    ("-", Err("windows-unbuilt"))
 }
 
 const SCM_RIGHTS: i32 = 1;
@@ -478,10 +501,16 @@ pub fn control_for_fd(fd: i32, l: CmsgLayout) -> Vec<u8> {
 /// Receive one fd sent as SCM_RIGHTS (authopen's `-stdoutpipe` message, or the helper's [`send_fd`]).
 #[cfg(unix)]
 pub fn recv_fd(sock: &std::os::unix::net::UnixStream) -> Option<File> {
+    recv_chunk(sock, &mut [0u8; 1]).and_then(|(_, fd)| fd)
+}
+
+/// One `recvmsg` into `buf`: `(bytes read, the first SCM_RIGHTS fd that came with them)`; `None` on an error
+/// (0 bytes = end of stream). The ONE receive: [`recv_fd`] is its one-byte call, the udisks reader its stream.
+#[cfg(unix)]
+pub fn recv_chunk(sock: &std::os::unix::net::UnixStream, buf: &mut [u8]) -> Option<(usize, Option<File>)> {
     use std::os::fd::{AsRawFd, FromRawFd};
-    let mut byte = [0u8; 1];
     let mut ctrl = [0u64; 8];
-    let mut iov = libc::iovec { iov_base: byte.as_mut_ptr().cast(), iov_len: 1 };
+    let mut iov = libc::iovec { iov_base: buf.as_mut_ptr().cast(), iov_len: buf.len() };
     // SAFETY: an all-zero msghdr is valid (null name, no flags); the pointers set below outlive the call.
     let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
     msg.msg_iov = &mut iov;
@@ -506,27 +535,35 @@ pub fn recv_fd(sock: &std::os::unix::net::UnixStream) -> Option<File> {
     let clen = (msg.msg_controllen as usize).min(std::mem::size_of_val(&ctrl));
     // SAFETY: the first `clen` bytes of `ctrl` are initialised (it was zeroed and the kernel wrote into it).
     let bytes = unsafe { std::slice::from_raw_parts(ctrl.as_ptr().cast::<u8>(), clen) };
-    let fd = fd_from_control(bytes, CmsgLayout::NATIVE)?;
+    let fd = fd_from_control(bytes, CmsgLayout::NATIVE).filter(|fd| *fd >= 0);
     // SAFETY: the kernel installed `fd` in this process for us; nothing else owns it.
-    (fd >= 0).then(|| unsafe { File::from_raw_fd(fd) })
+    Some((n as usize, fd.map(|fd| unsafe { File::from_raw_fd(fd) })))
 }
 
 /// Send `file`'s fd as one SCM_RIGHTS message (the helper's half of the handoff).
 #[cfg(unix)]
 pub fn send_fd(sock: &std::os::unix::net::UnixStream, file: &File) -> std::io::Result<()> {
+    send_chunk(sock, &[0u8], Some(file)).map(|_| ())
+}
+
+/// One `sendmsg` of `bytes`, with `file`'s fd as SCM_RIGHTS when given; answers the bytes sent. The ONE send:
+/// [`send_fd`] is its one-byte call, the udisks tests' fake bus replies through it.
+#[cfg(unix)]
+pub fn send_chunk(sock: &std::os::unix::net::UnixStream, bytes: &[u8], file: Option<&File>) -> std::io::Result<usize> {
     use std::os::fd::AsRawFd;
-    let mut byte = [0u8; 1];
-    let mut ctrl = control_for_fd(file.as_raw_fd(), CmsgLayout::NATIVE);
-    let mut iov = libc::iovec { iov_base: byte.as_mut_ptr().cast(), iov_len: 1 };
-    // SAFETY: as in `recv_fd`.
+    let mut ctrl = file.map(|f| control_for_fd(f.as_raw_fd(), CmsgLayout::NATIVE)).unwrap_or_default();
+    let mut iov = libc::iovec { iov_base: bytes.as_ptr() as *mut libc::c_void, iov_len: bytes.len() };
+    // SAFETY: as in `recv_chunk`.
     let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
-    msg.msg_control = ctrl.as_mut_ptr().cast();
-    msg.msg_controllen = ctrl.len() as _;
-    // SAFETY: `msg` points at live buffers of the stated lengths.
+    if !ctrl.is_empty() {
+        msg.msg_control = ctrl.as_mut_ptr().cast();
+        msg.msg_controllen = ctrl.len() as _;
+    }
+    // SAFETY: `msg` points at live buffers of the stated lengths; sendmsg only reads `bytes`.
     let n = unsafe { libc::sendmsg(sock.as_raw_fd(), &msg, 0) };
-    if n < 0 { Err(std::io::Error::last_os_error()) } else { Ok(()) }
+    if n < 0 { Err(std::io::Error::last_os_error()) } else { Ok(n as usize) }
 }
 
 /// The helper's open, as root: the node must be a block device Amber's policy admits (not mounted) AND a disk
@@ -1055,6 +1092,7 @@ mod tests {
         let (p, a) = elevation_argv(true, Path::new("/dev/disk4"), Path::new("/Users/u/Applications/una-installer"));
         assert_eq!(p, "/usr/libexec/authopen");
         assert_eq!(a, ["-stdoutpipe", "-o", "2", "/dev/disk4"]);
+        assert_eq!(elevate_line("udisks", false, "elevation-unavailable"), "[installer] card elevate how=udisks ok=0 why=elevation-unavailable");
         let (p, a) = elevation_argv(false, Path::new("/dev/sdb"), Path::new("/home/u/.local/bin/una-installer"));
         assert_eq!(p, "pkexec");
         assert_eq!(a, ["/home/u/.local/bin/una-installer", "--open-device", "/dev/sdb"]);
