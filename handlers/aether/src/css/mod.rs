@@ -1421,7 +1421,7 @@ pub fn computed_report(tree: &LayoutTree) -> std::collections::HashMap<html_core
                 if me.italic { "italic" } else { "normal" }.to_string(),
                 crate::fonts::serialize_family_list(&crate::fonts::family_list(me.family)),
                 lh,
-                match me.text_align { 1 => "center", 2 => "right", 3 => "end", 4 => "left", _ => "start" }.to_string(),
+                match me.text_align { 1 => "center", 2 => "right", 3 => "end", 4 => "left", 5 => "-webkit-center", 6 => "-webkit-right", _ => "start" }.to_string(),
                 if me.underline { "underline" } else { "none" }.to_string(),
                 if me.nowrap { "nowrap" } else { "normal" }.to_string(),
                 if me.hidden { "hidden" } else { "visible" }.to_string(),

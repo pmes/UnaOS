@@ -546,8 +546,12 @@ pub fn build_taffy_tree<H: Host>(
         // UA / presentational alignment defaults, applied BEFORE the
         // author cascade so any real rule wins: <center> and <th> centre
         // their content, and the legacy align="" attribute still aligns.
+        // AETHERCENTERLAYOUT (SR421): html.css `center { text-align: -webkit-center }` and Blink's align=center|middle /
+        // right are -webkit-center (5) / -webkit-right (6), which also place narrow block children
+        // (`propagate_text_align`); `th` is -internal-center, inline content only (1).
         paint.text_align = match tag.as_str() {
-            "center" | "th" => Some(1),
+            "center" => Some(5),
+            "th" => Some(1),
             // The quirks-mode table quirk: a table does NOT inherit
             // text-align from its ancestors. Every legacy page that
             // wraps its layout table in <center> (Hacker News) relies
@@ -557,8 +561,8 @@ pub fn build_taffy_tree<H: Host>(
         };
         if let Some(a) = dom_node.attr("align") {
             match a.trim().to_ascii_lowercase().as_str() {
-                "center" | "middle" => paint.text_align = Some(1),
-                "right" => paint.text_align = Some(2),
+                "center" | "middle" => paint.text_align = Some(5),
+                "right" => paint.text_align = Some(6),
                 "left" => paint.text_align = Some(4),
                 _ => {}
             }
@@ -879,22 +883,26 @@ fn propagate_text_align<H: Host>(tree: &mut LayoutTree<H>) {
                 let row = matches!(st.flex_direction, FlexDirection::Row | FlexDirection::RowReverse);
                 let mut changed = false;
                 if row && st.justify_content == taffy::style::JustifyContent::NORMAL {
-                    st.justify_content = if align == 1 {
+                    st.justify_content = if matches!(align, 1 | 5) {
                         taffy::style::JustifyContent::CENTER
                     } else {
                         taffy::style::JustifyContent::END
                     };
                     changed = true;
                 } else if !row && st.align_items == taffy::style::AlignItems::NORMAL {
-                    st.align_items = if align == 1 {
+                    st.align_items = if matches!(align, 1 | 5) {
                         taffy::style::AlignItems::CENTER
                     } else {
                         taffy::style::AlignItems::END
                     };
                     changed = true;
                 }
+                let block = crate::collapse::is_block_container_pub(tree, id, &st);
                 if changed {
                     let _ = tree.taffy.set_style(id, st);
+                }
+                if block {
+                    place_narrow_blocks(tree, id, align);
                 }
             }
         }
@@ -905,6 +913,34 @@ fn propagate_text_align<H: Host>(tree: &mut LayoutTree<H>) {
     }
     let root = tree.root_node;
     walk(tree, root, None);
+}
+
+/// AETHERCENTERLAYOUT (SR421): the ONE horizontal placement of a block container's in-flow block children that do
+/// not stretch (a table, a definite width): `align` -webkit-center (5) centres them and -webkit-right (6) ends them
+/// (HTML rendering §15.3.3, Blink's `-webkit-center`); plain center / right / end align inline content only (CSS 2.2
+/// §16.2), so such a child sits at the start instead of following the column's centred `align_items`. Only a child
+/// with no `align_self` of its own is written (floats, author alignment and table.rs's guard keep theirs), so a second
+/// run changes nothing; stretching children (`width: auto` or the 100% placeholder blockwidth takes) are left alone.
+fn place_narrow_blocks<H: Host>(tree: &mut LayoutTree<H>, id: taffy::NodeId, align: u8) {
+    let to = match align {
+        5 => taffy::style::AlignSelf::CENTER,
+        6 => taffy::style::AlignSelf::END,
+        _ => taffy::style::AlignSelf::START,
+    };
+    for k in tree.taffy.children(id).unwrap_or_default() {
+        let Ok(kst) = tree.taffy.style(k).cloned() else { continue };
+        if kst.align_self.is_some() || !crate::collapse::in_flow_block_pub(tree, k, &kst) {
+            continue;
+        }
+        let Some(tag) = tree.node_map.get(&k).and_then(|n| n.tag()) else { continue };
+        let table = tag == "table";
+        if (!table && is_table_part(&tag)) || (!table && (kst.size.width.is_auto() || kst.size.width == Dimension::percent(1.0))) {
+            continue;
+        }
+        let mut n = kst;
+        n.align_self = Some(to);
+        let _ = tree.taffy.set_style(k, n);
+    }
 }
 
 /// Block-level by the cascade (the author's outer display), else by tag; anonymous boxes are block boxes.
@@ -1489,7 +1525,8 @@ fn prepass<H: Host, F: Fonts + ?Sized>(tree: &mut LayoutTree<H>, fonts: &F) -> P
     ) {
         let mut size = inherited.clone();
         if let Some(ta) = tree.paint_map.get(&node_id).and_then(|p| p.text_align) {
-            size.text_align = ta;
+            // AETHERCENTERLAYOUT (SR421): the inline formatter sees -webkit-center / -webkit-right as center / right.
+            size.text_align = match ta { 5 => 1, 6 => 2, a => a };
         }
         if let Some(dom_node) = tree.node_map.get(&node_id) {
             if let Some(tag) = dom_node.tag() {
