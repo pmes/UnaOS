@@ -1123,3 +1123,6 @@ refs/heads/exec-rmbp-preemptoffarmunafs   fc176da55 IN-FLIGHT cut 2026-10-28
 refs/heads/exec-rmbp-unafsreadcensus   b29a743c5 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-installerudisks   fc176da55 IN-FLIGHT cut 2026-10-28
 refs/heads/exec-rmbp-xhciloanshedkatcontrolus   1af778bd7 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-gen7ordermigrate   247737d04 IN-FLIGHT cut 2026-10-28
+refs/heads/exec-rmbp-hidstall25   247737d04 IN-FLIGHT cut 2026-10-28
+refs/heads/exec-rmbp-retiredrain   247737d04 IN-FLIGHT cut 2026-10-28
