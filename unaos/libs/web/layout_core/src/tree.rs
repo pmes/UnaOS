@@ -673,6 +673,12 @@ fn ua_control<N: DomNode>(node: &N, _tag: &str, style: &mut Style) {
             };
             style.align_self = Some(taffy::style::AlignSelf::CENTER);
         }
+        // AETHERFILEUAEDGES (SR459): html.css `input[type="file" i] { padding: initial; border: initial }`: the input has
+        // no UA edges; its Choose-File button carries the push edges, inside the content `control_intrinsic` gives.
+        Control::Button if node.tag().as_deref() == Some("input") && node.attr("type").is_some_and(|t| t.trim().eq_ignore_ascii_case("file")) => {
+            style.padding = rect(0.0, 0.0, 0.0, 0.0);
+            style.border = rect(0.0, 0.0, 0.0, 0.0);
+        }
         // AETHERIMAGEINPUTBOX (SR455): html.css `input[type="image" i] { padding: initial; border: initial }`, so an
         // image input has no UA edges and its border box is the image (or alt-label) size `control_intrinsic` gives.
         Control::Button if node.tag().as_deref() == Some("input") && node.attr("type").is_some_and(|t| is_image_type(&t)) => {
@@ -686,8 +692,10 @@ fn ua_control<N: DomNode>(node: &N, _tag: &str, style: &mut Style) {
             style.border = rect(1.0, 1.0, 1.0, 1.0);
         }
         Control::Button => {
-            style.padding = rect(1.0, 6.0, 1.0, 6.0);
-            style.border = rect(2.0, 2.0, 2.0, 2.0);
+            // AETHERFILEUAEDGES (SR459): the push edges from their ONE source, `push_button_edges`.
+            let (b, p) = push_button_edges();
+            style.padding = rect(p.top, p.right, p.bottom, p.left);
+            style.border = rect(b.top, b.right, b.bottom, b.left);
         }
         Control::Select => {
             style.padding = rect(0.0, 0.0, 0.0, 0.0);
@@ -724,8 +732,6 @@ fn control_intrinsic<H: Host, F: Fonts + ?Sized>(node: &H::Node, fonts: &F, font
             let t = attr("type").unwrap_or_default();
             let adv = |s: &str| text_advance(fonts, s, font.0, font.1);
             let line = button_line_height(fonts, font.0, font.1);
-            // ua_control's Button edges (padding 1px 6px + border 2px, 16 wide): the file rule below subtracts them.
-            let edge_w = 16.0_f32;
             match t.trim().to_ascii_lowercase().as_str() {
                 // The decoded image's size when the host has it; else a button labelled by Chromium's
                 // HTMLInputElement::AltText: alt, else value when alt is missing, an empty result "Submit"
@@ -734,12 +740,15 @@ fn control_intrinsic<H: Host, F: Fonts + ?Sized>(node: &H::Node, fonts: &F, font
                     let alt = attr("alt").or_else(|| attr("value")).filter(|s| !s.is_empty());
                     Some((adv(&button_label("submit", alt.as_deref())), line))
                 }),
-                // Chromium LayoutFileUploadControl: border box = max(34 x "0" (kDefaultWidthNumChars), the
-                // button's border box + 4 (kAfterButtonSpacing) + the status text); the input's own UA edges
-                // stand for the button's.
+                // Chromium LayoutFileUploadControl: ceil(max(34 x "0" (kDefaultWidthNumChars), the button's border
+                // box + 4 (kAfterButtonSpacing) + the status text)). AETHERFILEUAEDGES (SR459): the input has no UA
+                // edges (ua_control's file arm), so this is the whole border box and the inner button's own edges
+                // (`push_button_edges`) are inside it, the height the button's border box (line + 6).
                 "file" => {
                     let (button, status) = file_label(attr("multiple").is_some());
-                    Some(((34.0 * adv("0") - edge_w).max(adv(button) + 4.0 + adv(status)), line))
+                    let (b, p) = push_button_edges();
+                    let (ew, eh) = (b.left + p.left + p.right + b.right, b.top + p.top + p.bottom + b.bottom);
+                    Some((crate::fmath::ceil((34.0 * adv("0")).max(adv(button) + ew + 4.0 + adv(status))), line + eh))
                 }
                 // html.css: a fixed 50 x 27 swatch border box, font-independent. AETHERCOLORUAEDGES (SR458): over the color
                 // arm's own edges in ua_control (border 1px + padding 1px 2px = 6 x 4), so the content is html.css's 44 x 23.
@@ -809,6 +818,15 @@ pub fn is_image_type(ty: &str) -> bool {
 /// with `multiple`, and the status text shown while no file is chosen. Read by `control_intrinsic`.
 pub fn file_label(multiple: bool) -> (&'static str, &'static str) {
     (if multiple { "Choose Files" } else { "Choose File" }, "No file chosen")
+}
+
+/// AETHERFILEUAEDGES (SR459): html.css's push button edges (`padding: 1px 6px; border: 2px outset`) as taffy
+/// (border, padding): the ONE source `ua_control`'s Button arm, `control_intrinsic`'s file arm (the Choose-File
+/// button inside a file input with no edges of its own) and both rings' file paint read.
+pub fn push_button_edges() -> (taffy::Rect<f32>, taffy::Rect<f32>) {
+    let border = taffy::Rect { left: 2.0, right: 2.0, top: 2.0, bottom: 2.0 };
+    let padding = taffy::Rect { left: 6.0, right: 6.0, top: 1.0, bottom: 1.0 };
+    (border, padding)
 }
 
 /// AETHERFILECOLORPAINT (SR456): a color input's swatch (Chromium html.css: the input's 1px border and 1px 2px padding,

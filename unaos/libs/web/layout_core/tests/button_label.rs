@@ -63,17 +63,25 @@ fn file_intrinsic_width() {
         lone("fm", &[("type", "file"), ("multiple", "")]),
         lone("f2", &[("type", "file"), ("style", "font-size: 26.666px")]),
         lone("s", &[("type", "submit")]),
+        // AETHERFILEUAEDGES (SR459): html.css gives the file input no padding and no border (its inner button has them).
+        lone("f0", &[("type", "file"), ("style", "padding: 0; border: 0")]),
+        lone("fx", &[("type", "file"), ("style", "padding: 1px 6px; border: 2px solid")]),
+        lone("fs", &[("type", "file"), ("style", "font-size: 4px")]),
     ]);
     let tree = lay(&doc, 800.0, 600.0);
     let b = |id: &str| box_of(&tree, &doc.by_id(id));
     // The test font: a character is half the size wide. Chromium's floor, 34 x "0", beats
-    // "Choose File" (button edges 16) + 4 + "No file chosen" at the UA size: 226.66 vs 186.66.
+    // "Choose File" (button edges 16) + 4 + "No file chosen" at the UA size: 226.66 vs 186.66,
+    // and the border box is whole pixels (Chromium's ceilf).
     let floor = 34.0 * 13.333 * 0.5;
-    // box_of reports the laid box on whole pixels.
-    assert_eq!(b("f").2, f32::round(floor), "file border box is 34 digits wide: {}", b("f").2);
+    assert_eq!(b("f").2, f32::ceil(floor), "file border box is 34 digits wide: {}", b("f").2);
     assert_eq!(b("fm").2, b("f").2, "multiple keeps the floor while it dominates");
-    assert_eq!(b("f2").2, f32::round(34.0 * 26.666 * 0.5), "the floor is in the element's font: {}", b("f2").2);
+    assert_eq!(b("f2").2, f32::ceil(34.0 * 26.666 * 0.5), "the floor is in the element's font: {}", b("f2").2);
     assert_eq!(b("f").3, b("s").3, "a file input is one button line tall");
+    assert_eq!((b("f0").2, b("f0").3), (b("f").2, b("f").3), "the input has no UA edges: 34 digits is the whole box");
+    assert_eq!((b("fx").2, b("fx").3), (b("f").2 + 16.0, b("f").3 + 6.0), "author padding and border still apply");
+    // At 4px the button (11 x 2 + its own 16 edges) + 4 + the status (14 x 2) = 70 beats 34 x 2 = 68.
+    assert_eq!(b("fs").2, 70.0, "the inner button's edges are inside the content: {}", b("fs").2);
     assert_eq!(layout_core::file_label(false), ("Choose File", "No file chosen"));
     assert_eq!(layout_core::file_label(true), ("Choose Files", "No file chosen"));
 }
