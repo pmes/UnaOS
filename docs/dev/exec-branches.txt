@@ -1169,7 +1169,7 @@ refs/heads/exec-rmbp-installerprovidercancel   2caaf25e4 FOLDED-BY-HAND (this co
 refs/heads/exec-rmbp-gen7heldpark   691d7a415 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-closeflightid   7baf4339e FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-faceliveurlbar   e89d2f07c FOLDED-BY-HAND (this commit) 2026-10-27
-refs/heads/exec-rmbp-facelivefieldkeep   a3f4ae5ce IN-FLIGHT cut 2026-10-28
+refs/heads/exec-rmbp-facelivefieldkeep   609585cab FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-contributereview   a3f4ae5ce IN-FLIGHT cut 2026-10-28
 refs/heads/exec-rmbp-aethercentercaption   a3f4ae5ce IN-FLIGHT cut 2026-10-28
 refs/heads/exec-rmbp-aethercellblockify   a3f4ae5ce IN-FLIGHT cut 2026-10-28

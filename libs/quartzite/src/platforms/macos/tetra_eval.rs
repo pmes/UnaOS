@@ -169,7 +169,7 @@ fn apply_face() {
                     let s = objc2_foundation::NSString::from_str(&placeholder);
                     let _: () = unsafe { msg_send![&field, setPlaceholderString: &*s] };
                 }
-                crate::tetra::FacePatch::Restack { path, node } => {
+                crate::tetra::FacePatch::Restack { path, node, keep } => {
                     let Some(stack) = face_view(&root, &path) else { continue };
                     let (vertical, children) = match node {
                         TetraNode::VStack(c) => (true, c),
@@ -179,6 +179,7 @@ fn apply_face() {
                     if !face_is_stack(&stack) {
                         continue;
                     }
+                    let held = face_keep_read(&root, &keep); // FACELIVE-FIELDKEEP (SR444): typed text and focus read before the rebuild
                     while let Some(c) = face_child(&stack, 0) {
                         face_drop(&c); // FACELIVE-SUBSCRIPTION-DROP (SR441): the leaving view's subscribers end
                         unsafe { face_unarrange(&stack, &c) };
@@ -192,19 +193,22 @@ fn apply_face() {
                             let _: () = msg_send![&s, addArrangedSubview: &*v];
                         }
                     }
+                    face_keep_write(&root, held); // FACELIVE-FIELDKEEP (SR444)
                 }
-                crate::tetra::FacePatch::Replace { path, node } => {
+                crate::tetra::FacePatch::Replace { path, node, keep } => {
                     let Some((&last, parent_path)) = path.split_last() else {
                         log::warn!("[quartzite] face root-leaf unpatched");
                         continue;
                     };
                     let (Some(parent), Some(old)) = (face_view(&root, parent_path), face_view(&root, &path)) else { continue };
+                    let held = face_keep_read(&root, &keep); // FACELIVE-FIELDKEEP (SR444)
                     let new = eval_tetra(node, synapse.clone());
                     face_drop(&old); // FACELIVE-SUBSCRIPTION-DROP (SR441)
                     unsafe {
                         let _: () = msg_send![&parent, insertArrangedSubview: &*new, atIndex: last as isize];
                         face_unarrange(&parent, &old);
                     }
+                    face_keep_write(&root, held); // FACELIVE-FIELDKEEP (SR444)
                 }
             }
         }
@@ -272,5 +276,53 @@ fn face_drop(old: &NSView) {
     log::debug!("[quartzite] face subscriptions dropped n={} live={}", gone.len(), live);
     for abort in gone {
         abort.abort();
+    }
+}
+
+// FACELIVE-FIELDKEEP (LEDGER SR444): a field under a Restack or Replace that the new subtree holds again keeps its typed
+// text and focus: the patch's `keep` names each field's old and new path; `stringValue` and a live field editor
+// (`currentEditor`, the url bar's own "user is typing" test) are read off the old view before the rebuild into a
+// per-patch local, and written into the new view after it (`setStringValue:`, the window's `makeFirstResponder:`).
+
+/// Whether `view` is a text field (it answers `currentEditor`).
+fn face_is_field(view: &NSView) -> bool {
+    let r: objc2::runtime::Bool = unsafe { msg_send![view, respondsToSelector: objc2::sel!(currentEditor)] };
+    r.as_bool()
+}
+
+/// The (new path, text, focused) of each kept field, read before its view leaves.
+fn face_keep_read(root: &Retained<NSView>, keep: &[crate::tetra::FaceKeep]) -> Vec<(Vec<usize>, String, bool)> {
+    keep.iter()
+        .filter_map(|k| {
+            let v = face_view(root, &k.old)?;
+            if !face_is_field(&v) {
+                return None;
+            }
+            unsafe {
+                let s: Retained<objc2_foundation::NSString> = msg_send![&v, stringValue];
+                let editor: *mut objc2::runtime::AnyObject = msg_send![&v, currentEditor];
+                Some((k.new.clone(), s.to_string(), !editor.is_null()))
+            }
+        })
+        .collect()
+}
+
+/// Write each held field's text (and focus) into the rebuilt view at its new path.
+fn face_keep_write(root: &Retained<NSView>, held: Vec<(Vec<usize>, String, bool)>) {
+    for (path, text, focus) in held {
+        let Some(v) = face_view(root, &path) else { continue };
+        if !face_is_field(&v) {
+            continue;
+        }
+        unsafe {
+            let s = objc2_foundation::NSString::from_str(&text);
+            let _: () = msg_send![&v, setStringValue: &*s];
+            if focus {
+                let window: Option<Retained<objc2::runtime::AnyObject>> = msg_send![&v, window];
+                if let Some(window) = window {
+                    let _: objc2::runtime::Bool = msg_send![&window, makeFirstResponder: &*v];
+                }
+            }
+        }
     }
 }
