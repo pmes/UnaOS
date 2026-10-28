@@ -13,9 +13,9 @@
 //
 // The key: Vein never stores one (the preference names an env var; Holocron has custody). A key typed here is HELD in
 // this process only — never written, never printed — and answers exactly the env var `ProviderConfig::key_env` names,
-// through the slot's own env closure. Quartzite has no secret field (LANDING-SECRETFIELD owed), so a raw line is this
-// face's only when the Key button armed it or it has a provider key's shape (`sk-ant-`, `AIza`): a pasted key never
-// reaches the vessel's `input ignored` print, nor the landing face as a card password (main routes card, provider,
+// through the slot's own env closure. The key field is secret (LANDINGSECRETFIELD SR432: bullets, `input ignored` prints
+// bytes only), and still a raw line is this face's only when the Key button armed it or it has a provider key's shape
+// (`sk-ant-`, `AIza`): defence in depth, so a pasted key never reaches the landing face as a card password (main routes card, provider,
 // landing).
 //
 // Rung 1 sends PROMPT.md and landing.md's census (about 1k tokens); the boot logs are NAMED, not sent.
@@ -429,7 +429,7 @@ pub fn face_of(p: &Provider) -> TetraNode {
             button("provider.pick.claude", "Claude", "provider pick claude"),
             button("provider.pick.gemini", "Gemini", "provider pick gemini"),
         ]),
-        TetraNode::TextField { id: String::from("provider.key"), placeholder: String::from("API key (held for this session, never written)"), action: TextAction::ConsoleInput },
+        TetraNode::TextField { id: String::from("provider.key"), placeholder: String::from("API key (held for this session, never written)"), action: TextAction::ConsoleInput, secret: true }, // LANDINGSECRETFIELD (SR432): drawn as bullets
         TetraNode::HStack(vec![button("provider.key", "Key", "provider key"), button("provider.send", "Send", "provider send")]),
     ])
 }
@@ -743,7 +743,8 @@ mod tests {
         assert_eq!(kids.len(), 4);
         let TetraNode::Console(con) = &kids[0] else { panic!("status lines") };
         shown.extend(con.lines.iter().map(|l| l.text.clone()));
-        assert!(matches!(&kids[2], TetraNode::TextField { id, .. } if id == "provider.key"));
+        assert!(matches!(&kids[2], TetraNode::TextField { id, secret: true, .. } if id == "provider.key")); // LANDINGSECRETFIELD (SR432)
+        shown.push(format!("{:?}", face_of(&p)));
 
         let mut files = Vec::new();
         files_under(&root, &mut files);

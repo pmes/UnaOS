@@ -1113,10 +1113,10 @@ refs/heads/exec-rmbp-xhciloanpumpholder   2826ab77b FOLDED-BY-HAND (this commit)
 refs/heads/exec-rmbp-xhciloanpollcapkat   613da4450 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-unafsreadcallersrest   4b6d18070 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-gen7slotnoholdrungs   2520cc193 FOLDED-BY-HAND (this commit) 2026-10-27
-refs/heads/exec-rmbp-aetherbuttonlabelone   d2eda07d4 IN-FLIGHT cut 2026-10-28
+refs/heads/exec-rmbp-aetherbuttonlabelone   87e3a6f7e FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-installerprovider   0c20585aa FOLDED-BY-HAND (this commit) 2026-10-27
-refs/heads/exec-rmbp-aetherfontdbfallback   d2eda07d4 IN-FLIGHT cut 2026-10-28
-refs/heads/exec-rmbp-aethercsssplitaudit   d2eda07d4 IN-FLIGHT cut 2026-10-28
+refs/heads/exec-rmbp-aetherfontdbfallback   ab97f115d FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-aethercsssplitaudit   9c42a228e FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-xhciloanshedkatcontrol   afd48903b FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-masksitescore   df30fb939 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-preemptoffarmunafs   bcfef8395 FOLDED-BY-HAND (this commit) 2026-10-27
@@ -1127,11 +1127,32 @@ refs/heads/exec-rmbp-gen7ordermigrate   2b564ce53 FOLDED-BY-HAND (this commit) 2
 refs/heads/exec-rmbp-hidstall25   807ef9888 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-retiredrain   53f662be2 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-lockregedgexcore   c147f08df FOLDED-BY-HAND (this commit) 2026-10-27
-refs/heads/exec-rmbp-installercontribute   88ec9c8d0 IN-FLIGHT cut 2026-10-28
+refs/heads/exec-rmbp-installercontribute   373cbc2e4 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-installerproviderstream   48efd481d FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-xhciloanpumpholderkat   a86f4849a FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-lockregouterxcore   7a159e120 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-unafsbindtrigger   9d880fc02 FOLDED-BY-HAND (this commit) 2026-10-27
-refs/heads/exec-rmbp-xhciloanptpyieldpolltake   296cac776 IN-FLIGHT cut 2026-10-28
-refs/heads/exec-rmbp-masksitesseccore   296cac776 IN-FLIGHT cut 2026-10-28
-refs/heads/exec-rmbp-aetherfontdboracle   296cac776 IN-FLIGHT cut 2026-10-28
+refs/heads/exec-rmbp-xhciloanptpyieldpolltake   53a0f50b9 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-masksitesseccore   0d47aac2f FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-aetherfontdboracle   53745b67c FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-preemptoffarmusbnetdrive   aaa7c1ae2 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-retiredrainrest   236f69d36 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-aetherabscb   4406f63eb IN-FLIGHT cut 2026-10-28
+refs/heads/exec-rmbp-landingsecretfield   d3751b40a FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-installerbugreport   00658319a FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-aetherelfcaption   c34345bbc FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-installerfacelive   94052c5c6 IN-FLIGHT cut 2026-10-28
+refs/heads/exec-rmbp-xhciloanptpyieldkatcloser   52c88407f FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-preemptoffarmcursormove   9ad5a5da8 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-bindnowgate   94708d143 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-lockregxcorecost   1ca6f4ad2 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-aethercentercell   871a6b0ca IN-FLIGHT cut 2026-10-28
+refs/heads/exec-rmbp-xhciloanptpyieldpollskip   2a2b8ed7a FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-landingscore   b16e93dd9 IN-FLIGHT cut 2026-10-28
+refs/heads/exec-rmbp-xhciloanptpyieldptptake   a446467de FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-unafsflightlist   412e8aba3 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-xhciloanptpyieldkatrule   736f42b84 IN-FLIGHT cut 2026-10-28
+refs/heads/exec-rmbp-preemptoffarmquantum   736f42b84 IN-FLIGHT cut 2026-10-28
+refs/heads/exec-rmbp-closeflightrescue   736f42b84 IN-FLIGHT cut 2026-10-28
+refs/heads/exec-rmbp-aethercaptioncore   736f42b84 IN-FLIGHT cut 2026-10-28
+refs/heads/exec-rmbp-installerproviderholocron   736f42b84 IN-FLIGHT cut 2026-10-28

@@ -702,8 +702,13 @@ fn control_intrinsic<H: Host, F: Fonts + ?Sized>(node: &H::Node, fonts: &F, font
             Some((size * 7.45, lh))
         }
         Control::Button if node.tag().as_deref() == Some("input") => {
-            let t = attr("type").unwrap_or_default().to_ascii_lowercase();
-            let label = attr("value").unwrap_or_else(|| if t == "reset" { "Reset".into() } else { "Submit".into() });
+            // AETHERBUTTONLABELONE (SR423): a push button's label is the ONE rule, `button_label`, the host paint
+            // calls too; image / file / color keep the Submit stand-in until their own intrinsics (owed
+            // AETHER-CONTROLINTRINSIC).
+            let t = attr("type").unwrap_or_default();
+            let value = attr("value");
+            let push = matches!(t.trim().to_ascii_lowercase().as_str(), "submit" | "reset" | "button");
+            let label = button_label(if push { t.as_str() } else { "submit" }, value.as_deref());
             Some((text_advance(fonts, &label, font.0, font.1), button_line_height(fonts, font.0, font.1)))
         }
         Control::Select => {
@@ -717,6 +722,26 @@ fn control_intrinsic<H: Host, F: Fonts + ?Sized>(node: &H::Node, fonts: &F, font
             Some((cols * cw + 17.0, rows * control_line_height(fonts, 2)))
         }
         _ => None,
+    }
+}
+
+/// AETHERBUTTONLABELONE (SR423): the caption a push-button `<input>` shows (HTML §4.10.5.1.18 / .20 / .21 and
+/// the rendering section's button labels), the ONE rule both the intrinsic size (`control_intrinsic`) and the
+/// host paint (`forms::button_label`) read: its `value` when present (an empty value is an empty caption), else
+/// the UA default, "Submit" for a submit button, "Reset" for a reset button, nothing for a plain button. `ty` is
+/// the raw type attribute (trimmed and compared ASCII case-insensitively here).
+pub fn button_label<'a>(ty: &str, value: Option<&'a str>) -> alloc::borrow::Cow<'a, str> {
+    use alloc::borrow::Cow;
+    if let Some(v) = value {
+        return Cow::Borrowed(v);
+    }
+    let ty = ty.trim();
+    if ty.eq_ignore_ascii_case("submit") {
+        Cow::Borrowed("Submit")
+    } else if ty.eq_ignore_ascii_case("reset") {
+        Cow::Borrowed("Reset")
+    } else {
+        Cow::Borrowed("")
     }
 }
 

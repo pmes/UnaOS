@@ -772,7 +772,7 @@ pub fn parse_value<H: Host>(prop: &str, text: &str, cx: &ParseCx) -> AnimValue {
     if matches!(prop, "visibility" | "filter" | "backdrop-filter" | "clip-path") {
         return AnimValue::Discrete(t.to_string());
     }
-    let parts: Option<Vec<Num>> = t.split_whitespace().map(|p| parse_num(p, cx)).collect();
+    let parts: Option<Vec<Num>> = css::split_top_level(t).into_iter().map(|p| parse_num(p, cx)).collect(); // AETHERCSSSPLITAUDIT (SR426)
     match parts {
         Some(v) if !v.is_empty() => AnimValue::Nums(v),
         _ => AnimValue::Discrete(t.to_string()),
