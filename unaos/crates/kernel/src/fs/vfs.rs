@@ -1842,7 +1842,7 @@ impl VfsBackend for NativeBackend {
     fn authorize_write(&self, rel: &str, principal: &str) -> Result<(), VfsError> {
         // NATIVE WRITE POSTURE (VFS-2): per-object owner/grants ACL, WRITE right.
         let path = native_abs(rel);
-        crate::fs::unafs::with_unafs(|fs| {
+        crate::fs::unafs::with_unafs_read(|fs| {
             let id = fs.resolve_path(&path).map_err(|_| VfsError::NoSuchPath)?;
             native_write_authz(fs, id, principal)
         })
@@ -2168,7 +2168,7 @@ impl VfsBackend for NativeBackend {
     }
 
     fn query(&self, expr: &str, principal: &str) -> Result<Vec<(u64, String)>, VfsError> {
-        crate::fs::unafs::with_unafs(|fs| {
+        crate::fs::unafs::with_unafs_read(|fs| {
             let hits = fs.query(expr).map_err(|e| match e {
                 ::unafs::fs::FileSystemError::Query(_) => VfsError::Backend("bad-query"),
                 _ => VfsError::Backend("unafs-query"),

@@ -504,7 +504,7 @@ pub fn section(q: &str, walk: &[search::Hit]) -> Vec<Row> {
     let mut got: Option<Answer> = None;
     #[cfg(feature = "unafs")]
     if native_root() {
-        if let Ok(Ok(Some(a))) = crate::fs::unafs::with_unafs(|fs| answer(fs, &p, &recent)) {
+        if let Ok(Ok(Some(a))) = crate::fs::unafs::with_unafs_read(|fs| answer(fs, &p, &recent)) {
             got = Some(a);
         }
     }

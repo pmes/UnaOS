@@ -46,7 +46,7 @@ pub fn service() {
         return;
     }
     if !STARTED.swap(true, Ordering::AcqRel) {
-        match crate::fs::unafs::with_unafs(|fs| fs.name_index_ready()) {
+        match crate::fs::unafs::with_unafs_read(|fs| fs.name_index_ready()) {
             Ok(Ok(true)) => {
                 serial_println!("[unafs] name-index ready (marked)");
                 OWED.store(false, Ordering::Release);
@@ -106,15 +106,15 @@ pub fn selftest() {
         serial_println!(":: NAMEINDEX: names=0 prefix_ms=0 src=none -> SKIP :: reason=root-not-unafs ::");
         return;
     }
-    let ready = matches!(crate::fs::unafs::with_unafs(|fs| fs.name_index_ready()), Ok(Ok(true)));
+    let ready = matches!(crate::fs::unafs::with_unafs_read(|fs| fs.name_index_ready()), Ok(Ok(true)));
     if !ready {
         let owed = OWED.load(Ordering::Acquire);
         serial_println!(":: NAMEINDEX: names=0 prefix_ms=0 src=none -> FAIL :: reason={} next={} ::", if owed { "building" } else { "unbuilt" }, NEXT.load(Ordering::Acquire));
         return;
     }
-    let names = crate::fs::unafs::with_unafs(|fs| fs.name_index_count()).ok().and_then(|r| r.ok()).unwrap_or(0);
+    let names = crate::fs::unafs::with_unafs_read(|fs| fs.name_index_count()).ok().and_then(|r| r.ok()).unwrap_or(0);
     let t0 = crate::arch::ms();
-    let probe = crate::fs::unafs::with_unafs(|fs| fs.find_names("test", 64)).ok().and_then(|r| r.ok());
+    let probe = crate::fs::unafs::with_unafs_read(|fs| fs.find_names("test", 64)).ok().and_then(|r| r.ok());
     let prefix_ms = crate::arch::ms().saturating_sub(t0);
     let (hits, scanned) = probe.as_ref().map(|f| (f.hits.len(), f.scanned)).unwrap_or((0, 0));
     let testf = crate::shell::vfs_mount_table().stat("/system/test-f").is_ok();
@@ -224,7 +224,7 @@ pub fn tx_selftest() {
         serial_println!(":: NAMEINDEXTX: created=0 renamed=0 deleted=0 hits=0 misses=0 stale=0 per_op_us=0 -> SKIP :: reason=root-not-unafs ::");
         return;
     }
-    let ready = || matches!(crate::fs::unafs::with_unafs(|fs| fs.name_index_ready()), Ok(Ok(true)));
+    let ready = || matches!(crate::fs::unafs::with_unafs_read(|fs| fs.name_index_ready()), Ok(Ok(true)));
     let fail = |reason: &str| serial_println!(":: NAMEINDEXTX: created=0 renamed=0 deleted=0 hits=0 misses=0 stale=0 per_op_us=0 -> FAIL reason={} ::", reason);
     if !ready() {
         fail(if OWED.load(Ordering::Acquire) { "index-building" } else { "index-unbuilt" });
@@ -279,7 +279,7 @@ pub fn tx_selftest() {
     let q0 = crate::arch::ms();
     let (mut hits, mut misses, mut stale) = (0usize, 0usize, 0usize);
     let ask = |leaf: &str| -> Option<alloc::vec::Vec<alloc::string::String>> {
-        crate::fs::unafs::with_unafs(|fs| fs.find_names(leaf, 4)).ok().and_then(|r| r.ok()).map(|f| f.hits.into_iter().map(|h| h.path).filter(|p| p.contains("/nixtx/")).collect())
+        crate::fs::unafs::with_unafs_read(|fs| fs.find_names(leaf, 4)).ok().and_then(|r| r.ok()).map(|f| f.hits.into_iter().map(|h| h.path).filter(|p| p.contains("/nixtx/")).collect())
     };
     for i in 0..TOTAL {
         let dir = tx_dir(i);

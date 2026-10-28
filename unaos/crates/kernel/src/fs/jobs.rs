@@ -203,7 +203,7 @@ impl Pager {
     fn page(&mut self, want: &mut u64, on: &mut dyn FnMut(&str, u64, u32)) -> Result<bool, ()> {
         let (id, off, size0, first, w) = (self.id, self.off, self.size, self.pages == 0, *want);
         let c0 = crate::arch::ms();
-        let got = crate::fs::unafs::with_unafs(|fs| -> Result<(u64, Vec<u8>), ()> {
+        let got = crate::fs::unafs::with_unafs_read(|fs| -> Result<(u64, Vec<u8>), ()> {
             let ino = fs.read_inode(id).map_err(|_| ())?;
             if ino.kind != ::unafs::FileKind::Directory || (!first && ino.size != size0) {
                 return Err(());
