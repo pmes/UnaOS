@@ -1215,7 +1215,7 @@ refs/heads/exec-rmbp-preemptoffarmcastsnowinpassleg   a311ee381 IN-FLIGHT cut 20
 refs/heads/exec-rmbp-gen7r8doorkat   a311ee381 IN-FLIGHT cut 2026-10-28
 refs/heads/exec-rmbp-gen7r8dooredge   a311ee381 IN-FLIGHT cut 2026-10-28
 refs/heads/exec-rmbp-aetherfileuaedges   a311ee381 IN-FLIGHT cut 2026-10-28
-refs/heads/exec-rmbp-legskiplate   a311ee381 IN-FLIGHT cut 2026-10-28
+refs/heads/exec-rmbp-legskiplate   b01095609 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-aethercaptionside   a1315f5c6 IN-FLIGHT cut 2026-10-28
 refs/heads/exec-rmbp-gen7parkword   a1315f5c6 IN-FLIGHT cut 2026-10-28
 refs/heads/exec-rmbp-preemptoffarmwmtablerouteleg   a1315f5c6 IN-FLIGHT cut 2026-10-28
