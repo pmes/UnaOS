@@ -3643,7 +3643,7 @@ pub fn relay_walks() -> u32 {
 /// held to the end of the caller's block with PSTATE.I as the caller had it; its Drop releases the core it took (Z91's epoch).
 #[cfg(target_arch = "aarch64")]
 #[inline]
-fn casts_span() -> crate::arch::sched::PreemptHold {
+pub(crate) fn casts_span() -> crate::arch::sched::PreemptHold {
     crate::arch::without_interrupts(|| crate::arch::sched::preempt_hold())
 }
 
