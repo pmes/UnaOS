@@ -73,7 +73,7 @@ pub struct JobOut {
     pub ptes_restored: bool,
     pub setup_us: u64,
     pub bcs_us: u64,
-    pub ring_re: bool, pub disabled: bool, // GEN7PARKNODEMOTE (B1077): `disabled` is the armed candidate's RING_CTL read-back after the disable write. GEN7HELDONE (B1031): `held_take` handed back BLIT_RING_HELD's block from an earlier job
+    pub ring_re: bool, pub disabled: bool, // GEN7PARKUNARMEDLIVE (B1080): `disabled` is false only when the candidate the loop ended on left RING_CTL set after the disable write (armed or not); true when none did or none ran. GEN7PARKNODEMOTE (B1077): `disabled` is the armed candidate's RING_CTL read-back after the disable write. GEN7HELDONE (B1031): `held_take` handed back BLIT_RING_HELD's block from an earlier job
 }
 
 impl JobOut {
@@ -242,7 +242,7 @@ pub unsafe fn bcs_job(bar0: usize, bar0_size: usize, src: Plane, dst: Plane, rec
     clflush_range(src.va, src.len);
     clflush_range(dst.va, dst.len);
 
-    let mut out = JobOut { cand: "none", win, tail, ring_re, ..JobOut::default() };
+    let mut out = JobOut { cand: "none", win, tail, ring_re, disabled: true, ..JobOut::default() }; // GEN7PARKUNARMEDLIVE (B1080): no candidate has left RING_CTL live yet; the loop's two stuck exits overwrite it
 
     // ---- claim: PTEs, landed check, the pinned flush ------------------------------------------------
     for k in 0..win {
@@ -297,7 +297,7 @@ pub unsafe fn bcs_job(bar0: usize, bar0_size: usize, src: Plane, dst: Plane, rec
                 all_disabled &= idle; // a ring that did not drain may still be writing: keep the PTEs
                 break;
             }
-            if !disabled {
+            if !disabled { out.disabled = false; out.cand = cand; // GEN7PARKUNARMEDLIVE (B1080): an unarmed candidate whose RING_CTL will not clear: named for the park's forcewake and the stall verdict in `blit`. LINE-NEUTRAL append
                 break;
             }
         }
@@ -305,9 +305,9 @@ pub unsafe fn bcs_job(bar0: usize, bar0_size: usize, src: Plane, dst: Plane, rec
     out.bcs_us = kb::cycles_to_us(cyc);
 
     // ---- unwind the window: only behind a quiesced engine (GEN7PARKUNWIND B1073: `window_unwind`, file tail) ----------
-    out.ptes_restored = window_unwind(bar0, win, base_img, all_disabled, out.armed && out.idle && !out.disabled); // GEN7PARKNODEMOTE (B1077): stuck = armed, drained, RING_CTL not clear (`held_kept=blit:ring-ctl-stuck`). the PTE restore + read-back + flush, then B1039's ONE release under PAGES
+    out.ptes_restored = window_unwind(bar0, win, base_img, all_disabled, !out.disabled && (out.idle || !out.armed)); // GEN7PARKUNARMEDLIVE (B1080): the unarmed stuck candidate keeps in the same class. GEN7PARKNODEMOTE (B1077): stuck = armed, drained, RING_CTL not clear (`held_kept=blit:ring-ctl-stuck`). the PTE restore + read-back + flush, then B1039's ONE release under PAGES
     clflush_range(dst.va, dst.len); // the CPU reads what the engine wrote, not a stale line
-    if out.armed && !all_disabled {
+    if !all_disabled { // GEN7PARKUNARMEDLIVE (B1080): the armed stall/stuck set plus the unarmed stuck break; Park.tail stays the job's computed TAIL (>= 0x40) so `park_quiesced` never passes a dark read
         // GEN7PARKUNWIND (B1073): the stalled window rides the engine lock's payload for `park_unwind` (file tail)
         let cand = R6_CANDS.iter().position(|c| c.0 == out.cand).unwrap_or(0);
         *engine = Some(Park { win, base_img, tail, cand, pre: [start_pre, head_pre, tail_pre, ctl_pre] });
@@ -355,7 +355,7 @@ impl Blitter for BcsBlitter {
         // caller holds them across blit + wait, the trait's contract).
         match unsafe { bcs_job(b.bar0, b.bar0_size, plane(&job.src), plane(&job.dst), job.rects, "g7b") } {
             Ok(o) if o.clean() => Ok(Fence::DONE),
-            Ok(o) if o.armed && (!o.idle || !o.disabled) => { // GEN7PARKNODEMOTE (B1077): a drained ring whose CTL will not clear is dead too: the one demote runs once (its window is already parked)
+            Ok(o) if !o.disabled || (o.armed && !o.idle) => { // GEN7PARKUNARMEDLIVE (B1080): an unarmed candidate whose CTL will not clear takes the same one demote (its window is parked). GEN7PARKNODEMOTE (B1077): a drained ring whose CTL will not clear is dead too: the one demote runs once (its window is already parked)
                 ARMED.store(false, AO::Release);
                 kb::demote_bcs(); // a stall demotes, as the CE's Timeout does
                 Err(BlitErr::Timeout)
