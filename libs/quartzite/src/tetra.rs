@@ -1089,7 +1089,7 @@ mod face_door_tests {
         TetraNode::Button { id: id.into(), label: label.into(), action: SMessage::ConsoleInput(id.into()) }
     }
     fn field(placeholder: &str) -> TetraNode {
-        TetraNode::TextField { id: "card.confirm".into(), placeholder: placeholder.into(), action: TextAction::ConsoleInput }
+        TetraNode::TextField { id: "card.confirm".into(), placeholder: placeholder.into(), action: TextAction::ConsoleInput, secret: false }
     }
     /// The installer's shape: a header beside a pane of console, picks, field, button.
     fn face(status: &str, picks: usize, placeholder: &str, write: &str) -> TetraNode {
