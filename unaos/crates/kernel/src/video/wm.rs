@@ -32541,7 +32541,7 @@ fn winid_close_hooks_run(_id: WinId, _h: CloseHooks) {}
 // (`BLIT_ACTIVE`); the door only waits for that drain to end. Atomics only, no lock.
 // Wire, once per boot on the first non-zero wait:
 // `[wm] close drain id=<n> inflight=<n> waited_us=<n> who=<owner> drained=<1|0>`.
-// Owed, not built: RETIRE-DRAIN-REST (dialog, notify and bezel retire after a create too; the door belongs at
+// RETIRE-DRAIN-REST BUILT by RETIREDRAINREST (rmbp-ledger B1060): the door now sits inside metrics::leaked_surf_retire for every caller (dialog, notify, bezel, login, instgui); the rest of this note is history (it belonged at
 // their sites or once inside `metrics::leaked_surf_retire`), CLOSE-FLIGHT-RESCUE (a task killed inside the
 // drain's aarch64 yield strands the count as it strands `DRAIN_PENDING`: retires defer, never free early),
 // RETIRE-DRAIN-KAT (the sibling-core race is not forced by any `tests` door).

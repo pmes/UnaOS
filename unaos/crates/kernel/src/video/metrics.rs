@@ -405,16 +405,41 @@ pub fn leaked_surf_retire(at: &core::sync::atomic::AtomicUsize, who: &'static st
     use core::sync::atomic::Ordering;
     let Some(s) = surf_retiring_slot(at as *const core::sync::atomic::AtomicUsize as usize, false) else { return };
     let q = s.old.swap(0, Ordering::AcqRel);
-    if q == 0 {
+    if q == 0 || !surf_retire_drained(s, q, who) {
         return;
     }
     // SAFETY: `q` is a block `leaked_surf` published (`vec![0u32; cap + 1].into_boxed_slice()`, word 0 = `cap`), queued
-    // once and swapped out once here, so it is freed once; the caller's row on it was closed (and drained) before the
-    // create that precedes this call, so no row names it and no composite reads it.
+    // once and swapped out once here, so it is freed once; the caller's row on it was closed (and drained, past
+    // `wm::close_drain_wait`) before the free, so no row names it and no composite reads it.
     let from = unsafe { *(q as *const u32) } as usize;
     let cur = at.load(Ordering::Acquire);
     let to = if cur != 0 { (unsafe { *(cur as *const u32) }) as usize } else { 0 };
     drop(unsafe { alloc::boxed::Box::from_raw(core::ptr::slice_from_raw_parts_mut(q as *mut u32, from + 1)) });
     let ab = s.abandoned.swap(0, Ordering::Relaxed);
     serial_println!("[metrics] surf grow who={} from_kb={} to_kb={} retired=1 abandoned={}", who, from * 4 / 1024, to * 4 / 1024, ab);
+}
+
+// ── RETIREDRAINREST (rmbp-ledger B1060, BP-video-18 kept) — every grown-block retire waits out a foreign close ──────
+// RETIREDRAIN (B1055) gated login's and instgui's retires on `wm::close_drain_wait`; dialog, notify and bezel retire
+// after a create too, and a close in flight on another core (its teardown ahead of its drain) could leave a composite
+// still reading the queued block. The ONE rule: the door is consulted INSIDE [`leaked_surf_retire`], for every owner,
+// and only when a block is queued (nothing queued: no wait, no line). Drained: the free runs as before. Not drained
+// (past the door's bound): the block goes back into its slot and the owner's next re-mint retires it; a grow queued
+// in between abandons it (the existing abandon rule, counted) — a deferred free or a leak, never an early one.
+// Every caller is the desktop pass or a `tests` fixture, unmasked task context with no wm lock held; where a caller
+// cannot yield the door spins, bounded, as the `wm::close` drain that same caller already runs. No second count,
+// bound or line: the door, its once-line and its `who=` word (the owner's name passed here) are B1055's.
+
+/// RETIREDRAINREST — `true`: no close in flight, free `q` now. `false`: `q` re-queued for `s`'s next retire. Off the
+/// desktop family the door is an inline `true` and this folds away.
+#[inline(always)]
+fn surf_retire_drained(s: &SurfRetiring, q: usize, who: &'static str) -> bool {
+    use core::sync::atomic::Ordering;
+    if crate::video::wm::close_drain_wait(who) {
+        return true;
+    }
+    if s.old.compare_exchange(0, q, Ordering::AcqRel, Ordering::Acquire).is_err() {
+        s.abandoned.fetch_add(1, Ordering::Relaxed);
+    }
+    false
 }

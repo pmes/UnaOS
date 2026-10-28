@@ -1136,7 +1136,7 @@ refs/heads/exec-rmbp-xhciloanptpyieldpolltake   53a0f50b9 FOLDED-BY-HAND (this c
 refs/heads/exec-rmbp-masksitesseccore   0d47aac2f FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-aetherfontdboracle   53745b67c FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-preemptoffarmusbnetdrive   4406f63eb IN-FLIGHT cut 2026-10-28
-refs/heads/exec-rmbp-retiredrainrest   4406f63eb IN-FLIGHT cut 2026-10-28
+refs/heads/exec-rmbp-retiredrainrest   236f69d36 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-aetherabscb   4406f63eb IN-FLIGHT cut 2026-10-28
 refs/heads/exec-rmbp-landingsecretfield   4406f63eb IN-FLIGHT cut 2026-10-28
 refs/heads/exec-rmbp-installerbugreport   94052c5c6 IN-FLIGHT cut 2026-10-28
