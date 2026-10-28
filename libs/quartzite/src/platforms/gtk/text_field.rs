@@ -24,6 +24,7 @@ pub fn bootstrap_text_field(
             TextAction::BrowserText => SMessage::BrowserText(text),
         };
         syn.fire(msg);
+        if secret { e.set_text(""); } // SECRETFIELD-CLEAR (SR449): a secret field's text is gone once its Enter is taken (the String above already moved into msg)
     });
     
     entry.into()
