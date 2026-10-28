@@ -692,10 +692,10 @@ pub(super) fn occluder_box(r: &Window, shell: u32, focus: u64) -> (usize, usize,
     (x0, y0, b.0 + b.2 + s as usize - x0, b.1 + b.3 + bo as usize - y0)
 }
 
-/// A copy of the published casts (one short hold, IRQs masked so a fill on an interrupt path cannot spin on a
-/// holder it preempted).
+/// A copy of the published casts (one short hold: preempt-off with PSTATE.I as the caller had it on aarch64 (`casts_span`),
+/// the mask elsewhere; no aarch64 ISR takes CASTS, so a fill on an interrupt path never spins on a holder it preempted).
 pub fn casts_now() -> Casts {
-    let _irq = crate::arch::IrqMask::new();
+    let _span = casts_span(); // PREEMPTOFFARMCASTSNOW (zenbook-ledger Z99): the copy-out takes the SAME span as `track`'s publish (`casts_span`, file tail): nested under COMPGATE in pass, the outermost take out of pass (`bg_expect`, tests.rs); was `IrqMask::new()`. LINE-NEUTRAL
     *CASTS.lock()
 }
 
@@ -3635,8 +3635,8 @@ pub fn relay_walks() -> u32 {
 // only from `composite_inner` inside `comp_gate_pass` (`video/wm.rs`), which already holds this same count
 // (`compgate_preempt_hold`), so the take nests. No aarch64 ISR (SGI, `timer::on_tick`, PL011 RX) takes CASTS: an ISR print
 // that asks for a present reaches `comp_gate_pass`, finds COMPGATE held by this core and FOLDS (no `track`, no fill, no
-// `casts_now`). `casts_now` keeps its mask (its out-of-pass callers are not under COMPGATE: PREEMPTOFF-ARM-CASTSNOW owed).
-// Counted in the aarch64 audit's `converted=` (sched.rs `CONVERTED_CASTS`, 1 on `desktop_firmware`). At the tail: no line
+// `casts_now`). `casts_now` takes the same span (PREEMPTOFFARMCASTSNOW Z99: out of pass its take is the outermost; the count forbids a same-core preempt of the holder).
+// Counted in the aarch64 audit's `converted=` (sched.rs `CONVERTED_CASTS`, 1 on `desktop_firmware`, 2 since Z99). At the tail: no line
 // above moves.
 
 /// PREEMPTOFFARMCASTS: aarch64 — COMPGATE's own guard (`sched::preempt_hold`), taken masked as `preemptoff::scoped` takes it,
@@ -3647,7 +3647,7 @@ fn casts_span() -> crate::arch::sched::PreemptHold {
     crate::arch::without_interrupts(|| crate::arch::sched::preempt_hold())
 }
 
-/// PREEMPTOFFARMCASTS: every other arch — the masked hold, unchanged (`track_caller`: x86's CLOCKCORE mask site stays `track`'s line).
+/// PREEMPTOFFARMCASTS: every other arch — the masked hold, unchanged (`track_caller`: x86's CLOCKCORE mask site stays the caller's line, `track`'s and `casts_now`'s).
 #[cfg(not(target_arch = "aarch64"))]
 #[inline]
 #[track_caller]
