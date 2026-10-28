@@ -18,6 +18,14 @@ ZENBOOK-FIRSTBOOT below. The x86 kernel identifies the machine from SMBIOS (`[hw
 the Apple SMC and the gmux off it; the HDA codec drive is gated (`[hw] skip hda`) and the read-only census runs (Z25). BUILT,
 fixed-unflown: the image line `esp-zenbook` (Z6, 27 kernel knobs) and its QEMU lane `test-zenbook` (Z13); NVMe (Z2/Z9/Z22/Z24/Z31), i8042 (Z3), GOP (Z4/Z10/Z28), xHCI (Z7/Z21), EC (Z8/Z20/Z27/Z30), touchpad (Z14/Z18/Z26/Z32), MT7925 S1-S6 (Z5..Z29), the flight list (Z33).
 
+STATE 2026-10-28 (cloud session close, tip cc16ae6ba): still image 0 — nothing flown; ZENBOOK-FIRSTBOOT below is the plan.
+Since Z35: Z36..Z115 BUILT, every one `fixed-unflown` (zenbook-ledger, each row's wire in its cell): the x86 preempt-off
+audit and its KATs (NVMEPREEMPTOFF Z52 / PREEMPTOFFAUDIT Z57, then the stale / leak / sleep / casts / wmtable / route /
+irqmark legs through Z115, both arches — `:: PREEMPTAUDIT: arch=x86_64 ... -> PASS ::` is the line the first Zenbook serial
+must carry), the xHCI loan yield for PTP (Z73..Z108, `ptp_yield=`), the QEMU lanes UNAFSLANEQEMU (Z102),
+XHCILOANPTPYIELDQEMUMTP (Z105) and its spec routing (Z112). Next id Z116. The seat's four legs and the host suites are
+green at cc16ae6ba; `cd unaos && ./arroyo check && ./arroyo gates` on the bench before the stick is written.
+
 ## OWED (in order; each names its ledger id once it has one)
 
 1. **ZENBOOK-FIRSTBOOT** — the card recipe and the bench's first boot. `./arroyo esp-x86` with the ZENBOOK-IMAGELINE
