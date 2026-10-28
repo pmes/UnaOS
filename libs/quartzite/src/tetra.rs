@@ -943,10 +943,21 @@ pub enum FacePatch {
     Lines { path: Vec<usize>, console: ConsoleTetra },
     /// A TextField with the same id and action changed only its placeholder: the field's typed text and focus kept.
     Field { path: Vec<usize>, node: TetraNode },
-    /// A stack changed its kind or child count: the container kept, its children evaluated afresh.
-    Restack { path: Vec<usize>, node: TetraNode },
-    /// Any other changed node: evaluated afresh in its parent's slot.
-    Replace { path: Vec<usize>, node: TetraNode },
+    /// A stack changed its kind or child count: the container kept, its children evaluated afresh. `keep`
+    /// (FACELIVE-FIELDKEEP, SR444): the fields under it whose typed text and focus move into the rebuilt ones.
+    Restack { path: Vec<usize>, node: TetraNode, keep: Vec<FaceKeep> },
+    /// Any other changed node: evaluated afresh in its parent's slot (`keep` as for Restack).
+    Replace { path: Vec<usize>, node: TetraNode, keep: Vec<FaceKeep> },
+}
+
+/// FACELIVE-FIELDKEEP (SR444): a TextField under a Restack or Replace that the new subtree holds again (the same id
+/// and action, the Field patch's own identity): the embassy reads the widget at `old` (absolute path, before the
+/// rebuild) and writes its typed text and focus into the widget at `new` (after it).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FaceKeep {
+    pub id: String,
+    pub old: Vec<usize>,
+    pub new: Vec<usize>,
 }
 
 fn face_same(a: &TetraNode, b: &TetraNode) -> bool {
@@ -965,7 +976,7 @@ pub fn face_diff(old: &TetraNode, new: &TetraNode) -> Vec<FacePatch> {
                 }
             }
             (TetraNode::VStack(_) | TetraNode::HStack(_), TetraNode::VStack(_) | TetraNode::HStack(_)) => {
-                out.push(FacePatch::Restack { path: path.clone(), node: new.clone() });
+                out.push(FacePatch::Restack { path: path.clone(), node: new.clone(), keep: face_keep(old, new, path) });
             }
             (TetraNode::Console(a), TetraNode::Console(b)) => {
                 if a != b {
@@ -981,7 +992,7 @@ pub fn face_diff(old: &TetraNode, new: &TetraNode) -> Vec<FacePatch> {
             }
             _ => {
                 if !face_same(old, new) {
-                    out.push(FacePatch::Replace { path: path.clone(), node: new.clone() });
+                    out.push(FacePatch::Replace { path: path.clone(), node: new.clone(), keep: face_keep(old, new, path) });
                 }
             }
         }
@@ -989,6 +1000,37 @@ pub fn face_diff(old: &TetraNode, new: &TetraNode) -> Vec<FacePatch> {
     let mut out = Vec::new();
     walk(old, new, &mut Vec::new(), &mut out);
     out
+}
+
+/// FACELIVE-FIELDKEEP (SR444): the fields of `old` (rooted at `path`) that `new` holds again: each old field paired
+/// with the FIRST new field of the same id and action, one keep per id. A keep stays inside its own patch's subtree.
+fn face_keep(old: &TetraNode, new: &TetraNode, path: &[usize]) -> Vec<FaceKeep> {
+    fn face_fields(node: &TetraNode, path: &mut Vec<usize>, out: &mut Vec<(String, String, Vec<usize>)>) {
+        match node {
+            TetraNode::VStack(c) | TetraNode::HStack(c) => {
+                for (i, child) in c.iter().enumerate() {
+                    path.push(i);
+                    face_fields(child, path, out);
+                    path.pop();
+                }
+            }
+            TetraNode::TextField { id, action, .. } => out.push((id.clone(), format!("{action:?}"), path.clone())),
+            _ => {}
+        }
+    }
+    let (mut a, mut b) = (Vec::new(), Vec::new());
+    face_fields(old, &mut path.to_vec(), &mut a);
+    face_fields(new, &mut path.to_vec(), &mut b);
+    let mut keep: Vec<FaceKeep> = Vec::new();
+    for (id, action, old_path) in a {
+        if keep.iter().any(|k| k.id == id) {
+            continue;
+        }
+        if let Some((_, _, new_path)) = b.iter().find(|(i, act, _)| *i == id && *act == action) {
+            keep.push(FaceKeep { id, old: old_path, new: new_path.clone() });
+        }
+    }
+    keep
 }
 
 /// FACELIVE (SR435): how an embassy asks its main thread to apply the door's pending tree.
@@ -1040,7 +1082,7 @@ impl FaceDoor {
         let new = self.pending.take()?;
         let patches = match &self.shown {
             Some(old) => face_diff(old, &new),
-            None => vec![FacePatch::Restack { path: Vec::new(), node: new.clone() }],
+            None => vec![FacePatch::Restack { path: Vec::new(), node: new.clone(), keep: Vec::new() }],
         };
         self.shown = Some(new.clone());
         Some((new, patches))
@@ -1077,7 +1119,7 @@ pub fn take_face() -> Option<(TetraNode, Vec<FacePatch>)> {
 
 #[cfg(test)]
 mod face_door_tests {
-    use super::{ConsoleLine, ConsoleTetra, FaceDoor, FacePatch, TetraNode, TextAction, face_diff};
+    use super::{ConsoleLine, ConsoleTetra, FaceDoor, FaceKeep, FacePatch, TetraNode, TextAction, face_diff};
     use bandy::SMessage;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1114,11 +1156,38 @@ mod face_door_tests {
         let p = face_diff(&a, &face("idle", 1, "8 GB sdb", "Write"));
         assert!(matches!(&p[..], [FacePatch::Field { path, .. }] if *path == vec![1, 2]), "{p:?}");
         let p = face_diff(&a, &face("idle", 2, "pick a card", "Write"));
-        assert!(matches!(&p[..], [FacePatch::Restack { path, node: TetraNode::HStack(k) }] if *path == vec![1, 1] && k.len() == 2), "{p:?}");
+        assert!(matches!(&p[..], [FacePatch::Restack { path, node: TetraNode::HStack(k), .. }] if *path == vec![1, 1] && k.len() == 2), "{p:?}");
         let p = face_diff(&a, &face("idle", 1, "pick a card", "Writing"));
         assert!(matches!(&p[..], [FacePatch::Replace { path, .. }] if *path == vec![1, 3]), "{p:?}");
         let p = face_diff(&a, &TetraNode::VStack(vec![button("x", "x")]));
         assert!(matches!(&p[..], [FacePatch::Restack { path, .. }] if path.is_empty()), "{p:?}");
+    }
+
+    /// FACELIVE-FIELDKEEP (SR444): a field under a Replace or a Restack that the new subtree holds again is kept (its
+    /// old and new paths); a field whose action changed is not.
+    #[test]
+    fn facelive_keep_field_under_restack_replace() {
+        let old = TetraNode::HStack(vec![button("installer.unaos", "Install UnaOS"), TetraNode::VStack(vec![console("idle"), field("pick a card")])]);
+        let new = TetraNode::HStack(vec![button("installer.unaos", "Install UnaOS"), field("pick a card")]);
+        let p = face_diff(&old, &new);
+        let want = vec![FaceKeep { id: "card.confirm".into(), old: vec![1, 1], new: vec![1] }];
+        assert!(matches!(&p[..], [FacePatch::Replace { path, keep, .. }] if *path == vec![1] && *keep == want), "{p:?}");
+        let a = face("idle", 1, "pick a card", "Write");
+        let mut b = a.clone();
+        if let TetraNode::HStack(top) = &mut b {
+            if let TetraNode::VStack(pane) = &mut top[1] {
+                pane.insert(0, console("written 1 / 8 MiB"));
+            }
+        }
+        let p = face_diff(&a, &b);
+        let want = vec![FaceKeep { id: "card.confirm".into(), old: vec![1, 2], new: vec![1, 3] }];
+        assert!(matches!(&p[..], [FacePatch::Restack { path, keep, .. }] if *path == vec![1] && *keep == want), "{p:?}");
+        let other = TetraNode::HStack(vec![
+            button("installer.unaos", "Install UnaOS"),
+            TetraNode::TextField { id: "card.confirm".into(), placeholder: "pick a card".into(), action: TextAction::OpenDocument, secret: false },
+        ]);
+        let p = face_diff(&old, &other);
+        assert!(matches!(&p[..], [FacePatch::Replace { keep, .. }] if keep.is_empty()), "{p:?}");
     }
 
     /// A same-key push is a no-op (no wake); a changed one pushes once and wakes once; a push before the window opens
