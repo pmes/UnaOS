@@ -55,6 +55,12 @@ use crate::NativeView;
 /// vertical box — header label over a scrolled, non-editable monospace text
 /// view.
 pub fn bootstrap_console(console: &ConsoleTetra, synapse: Synapse) -> NativeView {
+    bootstrap_console_held(console, synapse).0
+}
+
+/// FACELIVE-SUBSCRIPTION-DROP (SR441): [`bootstrap_console`] with its bus subscriber's handle, which the tetra evaluator
+/// keeps and aborts when the Console leaves the tree (dropping the handle only detaches the subscriber).
+pub fn bootstrap_console_held(console: &ConsoleTetra, synapse: Synapse) -> (NativeView, gtk4::glib::JoinHandle<()>) {
     let container = Box::new(Orientation::Vertical, 0);
 
     let header = Label::builder()
@@ -91,7 +97,7 @@ pub fn bootstrap_console(console: &ConsoleTetra, synapse: Synapse) -> NativeView
     let header_live = header.clone();
     let buffer_live = buffer.clone();
     let mut rx = synapse.subscribe();
-    gtk4::glib::spawn_future_local(async move {
+    let task = gtk4::glib::spawn_future_local(async move {
         while let Ok(msg) = rx.recv().await {
             if let SMessage::Logs(LogEvent::LogTail { lines, dropped, paused }) = msg {
                 let rendered = rows_from_tail(&lines);
@@ -101,7 +107,7 @@ pub fn bootstrap_console(console: &ConsoleTetra, synapse: Synapse) -> NativeView
         }
     });
 
-    container.into()
+    (container.into(), task)
 }
 
 /// Summon the Console app as its own top-level window, rendering the live log.
