@@ -1910,23 +1910,41 @@ fn loan_yield(c: &mut XhciController, force: bool) -> Result<Option<(u64, bool)>
     }
 }
 
+/// XHCILOANPTPYIELDKATCLOSER (zenbook-ledger Z84): forced windows the KAT offers its armed claimant while the xhci-poll
+/// take (every 1 ms tick) keeps closing them first; each window is <= `LOAN_YIELD_WINDOW_MS` (3 ms), all of them far inside
+/// the claimant's 2 s `claim_xhci_for_io` wait.
+const YIELD_KAT_WINDOWS: u32 = 4;
+
 /// XHCILOANPTPYIELD KAT: a block claimant armed on a sibling CPU (x86), then a forced yield that it must take.
+/// XHCILOANPTPYIELDKATCLOSER (Z84): a window counts as the claimant's only when Z82's closer is not the xhci-poll take
+/// (`taken && closed_by_poll()`, read after the re-take); a poll-closed window is offered again, at most
+/// `YIELD_KAT_WINDOWS` in all, and only poll-closed windows end as `skip(poll-closed)` (visible, not a FAIL).
 fn loan_yield_kat(c: &mut XhciController, armed: &mut bool) -> &'static str {
     let arm = yield_kat_arm();
     *armed = arm != Err("skip(one-cpu)"); // spawned (a late claimant is settled too)
-    let taken = match loan_yield(c, true) {
-        Err(_) => return "lost",
-        Ok(None) => return "no-yield",
-        Ok(Some((_, taken))) => taken,
-    };
-    if crate::drivers::block::xhci_loan_published() {
-        return "published";
-    }
-    if TXN_YIELDED.load(Ordering::Acquire) {
-        return "flag-left";
+    let (mut served, mut polled) = (false, false);
+    for _ in 0..YIELD_KAT_WINDOWS {
+        let taken = match loan_yield(c, true) {
+            Err(_) => return "lost",
+            Ok(None) => return "no-yield",
+            Ok(Some((_, taken))) => taken,
+        };
+        if crate::drivers::block::xhci_loan_published() {
+            return "published";
+        }
+        if TXN_YIELDED.load(Ordering::Acquire) {
+            return "flag-left";
+        }
+        let poll = taken && crate::drivers::block::xhci_loan_yield_closed_by_poll(); // Z82's closer: valid only after a taken window
+        served = taken && !poll;
+        polled |= poll;
+        if !poll || arm.is_err() {
+            break; // served, untaken, or no claimant to offer another window to
+        }
     }
     match arm {
-        Ok(()) if taken => "ok",
+        Ok(()) if served => "ok",
+        Ok(()) if polled => "skip(poll-closed)",
         Ok(()) => "untaken",
         Err(skip) => skip,
     }
@@ -1957,7 +1975,7 @@ fn yield_kat_settle(_armed: bool) {}
 /// `err`, or `skip(masked|no-xhci)`. XHCILOANPTPYIELD (Z73): the pair's second word is `ptp_yield=` — inside the same
 /// hold a sibling block claimant is armed and a forced yield must hand it the window and re-take the loan: `ok` /
 /// `untaken` / `no-yield` / `lost` / `published` / `flag-left` / `skip(one-cpu|claimant-late)`, or `ptp_path=`'s word when
-/// the hold itself failed.
+/// the hold itself failed. XHCILOANPTPYIELDKATCLOSER (Z84): `skip(poll-closed)` when only the xhci-poll take closed the windows.
 pub fn loan_path_kat() -> (&'static str, &'static str) {
     if crate::arch::irqs_masked() {
         return ("skip(masked)", "skip(masked)");
