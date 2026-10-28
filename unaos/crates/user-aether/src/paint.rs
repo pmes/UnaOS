@@ -488,7 +488,7 @@ fn caption(cv: &mut Canvas, cx: &Cx, id: NodeId, ink: &Ink, x: f32, y: f32) {
     }
     let ty = n.attr("type").unwrap_or_default();
     if !layout_core::is_push_type(&ty) {
-        return;
+        return file_color(cv, cx, id, ink, x, y, &ty); // AETHERFILECOLORPAINT (SR456)
     }
     let value = n.attr("value");
     let label = layout_core::button_label(&ty, value.as_deref());
@@ -513,4 +513,50 @@ fn caption(cv: &mut Canvas, cx: &Cx, id: NodeId, ink: &Ink, x: f32, y: f32) {
             cv.blend(gx, gy, color, cov);
         }
     });
+}
+
+// ---- AETHERFILECOLORPAINT (SR456): a file input's button and status, a color input's swatch ----------------------
+
+/// AETHERFILECOLORPAINT (SR456): the host render's `paint_file_color` on this ring, for the `<input>` `id` whose
+/// border box's top-left is (`x`, `y`) and whose raw type is `ty` (any type but file / color paints nothing). File: the
+/// strings from layout_core's `file_label`; the button sub-box (the input's own UA edges round the button caption's
+/// width, as `control_intrinsic` sized it) centres the caption through the push caption's ONE rule `caption_box`, and
+/// the status text follows 4 px after the button's border box on the same line top; both in the element's font and
+/// colour, clipped to the input's padding box, the baseline as `caption` takes it. Color: the `value` attribute (no
+/// dirty value on this ring) through layout_core's `parse_color_str`, black when it does not parse, filled in the
+/// swatch layout_core's `COLOR_SWATCH` places, with its 1 px frame.
+fn file_color(cv: &mut Canvas, cx: &Cx, id: NodeId, ink: &Ink, x: f32, y: f32, ty: &str) {
+    let tree = cx.tree;
+    let (Some(n), Ok(l)) = (tree.node_map.get(&id), tree.taffy.layout(id)) else { return };
+    let ty = ty.trim();
+    if ty.eq_ignore_ascii_case("file") {
+        let (button, status) = layout_core::file_label(n.attr("multiple").is_some());
+        let color = tree.paint_map.get(&id).and_then(|p| p.color).map(rgb).unwrap_or(crate::theme::PAGE_INK);
+        let lead = layout_core::Fonts::baseline_offset(cx.fonts, ink.sel, ink.size, 0.0);
+        let mut t = cx.fonts.0.borrow_mut();
+        let bw = t.measure(button, ink.sel, ink.size);
+        let (a, d) = t.extents(ink.sel, ink.size);
+        let btn_bw = bw + l.padding.left + l.border.left + l.padding.right + l.border.right;
+        let btn = layout_core::caption_box(x, y, btn_bw, l.size.height, l.border, l.padding, bw, a, d);
+        let whole = layout_core::caption_box(x, y, l.size.width, l.size.height, l.border, l.padding, 0.0, a, d);
+        let base = btn.baseline(lead);
+        let (px0, py0, px1, py1) = whole.clip;
+        for (sx, s) in [(btn.x, button), (x + btn_bw + 4.0, status)] {
+            t.draw(sx, base, s, ink.sel, ink.size, color, &mut |gx, gy, cov| {
+                let (fx, fy) = (gx as f32, gy as f32);
+                if fx >= px0 && fx < px1 && fy >= py0 && fy < py1 {
+                    cv.blend(gx, gy, color, cov);
+                }
+            });
+        }
+    } else if ty.eq_ignore_ascii_case("color") {
+        let fill = n.attr("value").and_then(|v| layout_core::css::parse_color_str::<ImgHost>(&v)).unwrap_or((0, 0, 0));
+        let (ix, iy, frame) = layout_core::COLOR_SWATCH;
+        let (x0, y0) = (fl(x + ix), fl(y + iy));
+        let (x1, y1) = (fl(x + l.size.width - ix), fl(y + l.size.height - iy));
+        if x1 > x0 && y1 > y0 {
+            cv.fill(x0, y0, x1 - x0, y1 - y0, rgb(frame));
+            cv.fill(x0 + 1, y0 + 1, x1 - x0 - 2, y1 - y0 - 2, rgb(fill));
+        }
+    }
 }

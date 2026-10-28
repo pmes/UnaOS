@@ -3768,6 +3768,80 @@ mod tests {
         assert!(n > 0, "the button's text paints glyph ink inside it");
     }
 
+    /// AETHERFILECOLORPAINT (SR456): (the control `id`'s border box as (left, top, width, height), and the ink pixels
+    /// in its x band [left + `f0` * width, left + `f1` * width) clamped inside SR410's 7 px / 3 px inset), the same
+    /// darker-than-160 ink test as `caption_ink`.
+    fn band_ink(engine: &mut crate::AetherEngine, id: &str, f0: f64, f1: f64) -> usize {
+        let r = |e: &mut crate::AetherEngine, k: &str| js_num(e, &format!("document.getElementById('{id}').getBoundingClientRect().{k}"));
+        let (l, t, w, h) = (r(engine, "left"), r(engine, "top"), r(engine, "width"), r(engine, "height"));
+        assert!(w > 14.0 && h > 6.0, "{id}: the control has a box ({w}x{h})");
+        let sw = engine.width as usize;
+        let s = engine.surface();
+        let x0 = (l + (f0 * w).max(7.0)).ceil() as usize;
+        let x1 = (l + (f1 * w).min(w - 7.0)).floor() as usize;
+        let (y0, y1) = ((t + 3.0).ceil() as usize, (t + h - 3.0).floor() as usize);
+        let mut n = 0usize;
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let i = (y * sw + x) * 4;
+                if s.get(i..i + 3).is_some_and(|p| p.iter().any(|&c| c < 160)) {
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
+
+    /// AETHERFILECOLORPAINT (SR456): a file input paints its Choose-File button caption at its start and the "No file
+    /// chosen" status after it (Chromium's file control; layout_core `file_label`), with and without `multiple`; a
+    /// value attribute is never painted as text. Before, the box was an empty ButtonFace frame.
+    #[test]
+    fn file_caption_paints() {
+        let html = r#"<!doctype html><html><body>
+            <div><input type="file" id="f"></div>
+            <div><input type="file" id="m" multiple value="x.txt"></div>
+        </body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 200));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        for id in ["f", "m"] {
+            assert!(band_ink(&mut engine, id, 0.0, 0.3) > 0, "{id}: the button caption paints ink at the box's start");
+            assert!(band_ink(&mut engine, id, 0.4, 1.0) > 0, "{id}: the status text paints ink after the button");
+        }
+    }
+
+    /// AETHERFILECOLORPAINT (SR456): a color input paints its value as Chromium's swatch (layout_core `COLOR_SWATCH`: 5 px
+    /// / 6 px in from the border box, a 1 px #777777 frame round the fill): the attribute's colour, black with no
+    /// value, a script-set (dirty) value over the attribute; never the value as text.
+    #[test]
+    fn color_swatch_paints() {
+        let html = r##"<!doctype html><html><body>
+            <div><input type="color" id="r" value="#ff0000"></div>
+            <div><input type="color" id="k"></div>
+            <div><input type="color" id="g" value="#0000ff"></div>
+            <script>document.getElementById('g').value = '#00ff00';</script>
+        </body></html>"##;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 200));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        let px = |e: &mut crate::AetherEngine, x: f64, y: f64| -> (u8, u8, u8) {
+            let i = (y as usize * e.width as usize + x as usize) * 4;
+            let s = e.surface();
+            (s[i + 2], s[i + 1], s[i])
+        };
+        for (id, want) in [("r", (255, 0, 0)), ("k", (0, 0, 0)), ("g", (0, 255, 0))] {
+            let r = |e: &mut crate::AetherEngine, k: &str| js_num(e, &format!("document.getElementById('{id}').getBoundingClientRect().{k}"));
+            let (l, t, w, h) = (r(&mut engine, "left"), r(&mut engine, "top"), r(&mut engine, "width"), r(&mut engine, "height"));
+            assert!(w > 20.0 && h > 14.0, "{id}: the control has a box ({w}x{h})");
+            let (cx, cy) = ((l + w / 2.0).floor(), (t + h / 2.0).floor());
+            assert_eq!(px(&mut engine, cx, cy), want, "{id}: the swatch is filled with the value");
+            assert_eq!(px(&mut engine, cx + 6.0, cy), want, "{id}: the fill is solid, not a glyph");
+            assert_eq!(px(&mut engine, l.ceil() + 5.0, cy), (119, 119, 119), "{id}: the swatch's 1 px #777 frame, 5 px in");
+        }
+    }
+
     /// AETHERSUBMITCAPTION (SR410): with no fontconfig configuration a Mac walks its CoreText font domains (a stock
     /// macOS has no /etc/fonts, so the Linux directories found zero faces); every other OS keeps the four.
     #[test]
