@@ -701,11 +701,11 @@ fn maskscope_kat() {
     let (line, ms) = (line!(), kat_hold(&KAT_MAX, &KAT_WHO, 30));
     let by = KAT_WHO.read(false); let core_ok = kat_core_ok(&by); // HIDMASKCORE (B1042): the KAT's span names the KAT's own core (tail)
     let site_ok = by.site().is_some_and(|l| l.file() == file!() && l.line() == line);
-    let (sites, top_ok, sums_ok, roll_ok, sitecore, zeroms) = masksites_kat(); let wrap = wrapsite_kat(); // MASKCENSUS (B1028): the site table's leg, on its own instance (tail); MASKWRITESITE (B1037): the third site, THROUGH the write wrapper (tail)
-    let pass = me.is_some() && by.name() == me && site_ok && ms >= 29 && KAT_MAX.load(Relaxed) == ms && sites == 2 && top_ok && sums_ok && roll_ok && wrap != Some(false) && core_ok && sitecore != Some(false) && zeroms; // MASKSITESCORE (B1051): `sitecore_ok=`; MASKSITESZEROMS (B1065): `zeroms_ok=`
+    let (sites, top_ok, sums_ok, roll_ok, sitecore, zeroms) = masksites_kat(); let wrap = wrapsite_kat(); let over = masksites_overflow_kat(); // MASKCENSUS (B1028): the site table's leg, on its own instance (tail); MASKWRITESITE (B1037): the third site, THROUGH the write wrapper (tail)
+    let pass = me.is_some() && by.name() == me && site_ok && ms >= 29 && KAT_MAX.load(Relaxed) == ms && sites == 2 && top_ok && sums_ok && roll_ok && wrap != Some(false) && core_ok && sitecore != Some(false) && zeroms && over; // MASKSITESCORE (B1051): `sitecore_ok=`; MASKSITESZEROMS (B1065): `zeroms_ok=`
     serial_println!(
-        ":: MASKSCOPE: who={} ms={} -> {} :: task={} site_ok={} sites={} top_ok={} sums_ok={} roll_ok={} wrapsite_ok={} sitecore_ok={} zeroms_ok={} core_ok={} boot_by={}",
-        by, ms, if pass { "PASS" } else { "FAIL" }, me.unwrap_or("?"), site_ok as u8, sites, top_ok as u8, sums_ok as u8, roll_ok as u8, match wrap { Some(true) => "1", Some(false) => "0", None => "-" }, match sitecore { Some(true) => "1", Some(false) => "0", None => "-" }, zeroms as u8, core_ok as u8, masked_by()
+        ":: MASKSCOPE: who={} ms={} -> {} :: task={} site_ok={} sites={} top_ok={} sums_ok={} roll_ok={} wrapsite_ok={} sitecore_ok={} zeroms_ok={} overflow_ok={} core_ok={} boot_by={}",
+        by, ms, if pass { "PASS" } else { "FAIL" }, me.unwrap_or("?"), site_ok as u8, sites, top_ok as u8, sums_ok as u8, roll_ok as u8, match wrap { Some(true) => "1", Some(false) => "0", None => "-" }, match sitecore { Some(true) => "1", Some(false) => "0", None => "-" }, zeroms as u8, over as u8, core_ok as u8, masked_by()
     );
     crate::tests::tally(pass);
 }
@@ -781,6 +781,9 @@ pub(crate) struct MaskSites {
     sec_other_sum: AtomicU64,
     core_sum: [[AtomicU64; SITE_CORES]; MASK_SITES_N], // MASKSITESCORE (B1051): each slot's µs per noting core (16 x SITE_CORES x 8 B; µs since MASKSITESZEROMS B1065)
     sec_base: [[AtomicU64; SITE_CORES]; MASK_SITES_N], // MASKSITESSECCORE (B1059): `core_sum` as the last `take_sec` saw it (16 x SITE_CORES x 8 B, µs; one writer, `take_sec`)
+    drop_key: [AtomicUsize; MASK_SITES_N], // MASKSITESOVERFLOW (B1066): the distinct sites the full table dropped, claimed by `key_claim` (16 x 8 B)
+    drop_full: AtomicBool, // MASKSITESOVERFLOW (B1066): a dropped site found `drop_key` full too (`dropped=16+`)
+    drop_last: AtomicUsize, // MASKSITESOVERFLOW (B1066): the last dropped span's site (0 = none)
 }
 
 impl MaskSites {
@@ -798,25 +801,15 @@ impl MaskSites {
             sec_other_sum: AtomicU64::new(0),
             core_sum: [const { [const { AtomicU64::new(0) }; SITE_CORES] }; MASK_SITES_N],
             sec_base: [const { [const { AtomicU64::new(0) }; SITE_CORES] }; MASK_SITES_N],
+            drop_key: [const { AtomicUsize::new(0) }; MASK_SITES_N],
+            drop_full: AtomicBool::new(false),
+            drop_last: AtomicUsize::new(0),
         }
     }
 
     /// The slot keyed `p`, claimed by CAS when first seen (`None` = the table is full).
     fn slot(&self, p: usize) -> Option<usize> {
-        for (i, k) in self.site.iter().enumerate() {
-            let cur = k.load(Acquire);
-            if cur == p {
-                return Some(i);
-            }
-            if cur == 0 {
-                match k.compare_exchange(0, p, core::sync::atomic::Ordering::AcqRel, Acquire) {
-                    Ok(_) => return Some(i),
-                    Err(now) if now == p => return Some(i),
-                    Err(_) => {}
-                }
-            }
-        }
-        None
+        key_claim(&self.site, p) // MASKSITESOVERFLOW (B1066): the claim loop, shared with the dropped keys (tail)
     }
 
     /// One masked span of `us` µs at `site`: n/sum/max in whole ms (the span floored), the per-core sum in µs (MASKSITESZEROMS
@@ -832,7 +825,7 @@ impl MaskSites {
                 self.sec_sum[i].fetch_add(ms, Relaxed);
             }
             None => {
-                self.other_n.fetch_add(1, Relaxed);
+                self.other_n.fetch_add(1, Relaxed); self.drop_note(site); // MASKSITESOVERFLOW (B1066): the dropped site, kept (tail)
                 self.other_sum.fetch_add(ms, Relaxed);
                 self.sec_other_n.fetch_add(1, Relaxed);
                 self.sec_other_sum.fetch_add(ms, Relaxed);
@@ -867,7 +860,7 @@ impl MaskSites {
                 t.offer_on(p, self.n[i].load(Relaxed), self.sum[i].load(Relaxed), self.max[i].load(Relaxed), &cores);
             }
         }
-        t.set_other(self.other_n.load(Relaxed), self.other_sum.load(Relaxed));
+        t.set_other(self.other_n.load(Relaxed), self.other_sum.load(Relaxed)); t.set_dropped(self.dropped(), self.drop_full.load(Relaxed), self.drop_last.load(Relaxed)); // MASKSITESOVERFLOW (B1066): `dropped=` `last=` (tail)
         t
     }
 
@@ -887,7 +880,7 @@ impl MaskSites {
                 c.store(0, Relaxed);
             }
         }
-        self.other_n.store(0, Relaxed);
+        self.other_n.store(0, Relaxed); self.drop_clear(); // MASKSITESOVERFLOW (B1066): the dropped keys (tail)
         self.other_sum.store(0, Relaxed);
         self.sec_other_n.store(0, Relaxed);
         self.sec_other_sum.store(0, Relaxed);
@@ -905,12 +898,13 @@ pub struct SiteTop {
     other: (u32, u64),
     c: [[u64; SITE_CORES]; SITE_TOP_N], // MASKSITESCORE (B1051): each kept entry's µs per core (all 0 = no core known; µs since MASKSITESZEROMS B1065)
     with_cores: bool,
+    drop: (u32, bool, usize), // MASKSITESOVERFLOW (B1066): (distinct dropped sites, more than `drop_key` held, the last dropped site)
 }
 
 impl SiteTop {
     /// Keep the top `cap` (at most 5); `with_max` prints `/<max_ms>` per site.
     pub const fn new(cap: usize, with_max: bool) -> Self {
-        SiteTop { e: [(0, 0, 0, 0); SITE_TOP_N], cap: if cap < SITE_TOP_N { cap } else { SITE_TOP_N }, with_max, k: 0, other: (0, 0), c: [[0; SITE_CORES]; SITE_TOP_N], with_cores: false }
+        SiteTop { e: [(0, 0, 0, 0); SITE_TOP_N], cap: if cap < SITE_TOP_N { cap } else { SITE_TOP_N }, with_max, k: 0, other: (0, 0), c: [[0; SITE_CORES]; SITE_TOP_N], with_cores: false, drop: (0, false, 0) }
     }
 
     /// Offer one site (`site` = a `&'static Location` as usize); a site with no span is not counted.
@@ -1028,10 +1022,9 @@ pub fn scope_masked_by() -> MaskedBy {
 /// `tests hidstall`: the boot site table, ONE line after the HIDSTALL verdict.
 fn mask_sites_say() {
     let t = MASK_SITES.boot();
-    let (on, os) = t.other();
     serial_println!(
-        "[hidstall] masked sites n={} other={}x{} top={} (MASKCENSUS B1028: every masked UnaFS span by its with_unafs caller, boot-long, <n>x<sum_ms>/<max_ms>, top-5 by sum; MASKSITESCORE B1051: @c<dominant core by sum>, (cores=c<a>:<ms>+c<b>:<ms>) when several)",
-        t.sites(), on, os, t
+        "[hidstall] masked sites n={} other={} top={} (MASKCENSUS B1028: every masked UnaFS span by its with_unafs caller, boot-long, <n>x<sum_ms>/<max_ms>, top-5 by sum; MASKSITESCORE B1051: @c<dominant core by sum>, (cores=c<a>:<ms>+c<b>:<ms>) when several; MASKSITESOVERFLOW B1066: dropped=<distinct sites past the 16 slots>[+] last=<the last dropped span's site>)",
+        t.sites(), t.other_say(), t
     );
 }
 
@@ -1307,3 +1300,131 @@ impl MaskSites {
 // whole ms) and lists each such core's µs floored to ms, which may exceed the per-span-floored `<sum>` by under n ms. clockcore's
 // `census_say` offers SEEN_CORE's cycles as µs (every SEEN span is over 10 ms: its line reads as before). On aarch64 and on x86
 // without a µs TSC `now_us` is `ms() * 1000`, so a sub-tick span still reads 0 µs there (MASK-SITES-ARMUS, owed).
+
+// ── MASKSITESOVERFLOW (rmbp-ledger B1066) — the overflow row names what it dropped. FILE-TAIL append. ──────────────────────
+// MASKCENSUS (B1028) owed MASK-SITES-OVERFLOW: a span whose site finds the 16 slots full counted only into `other=<n>x<ms>`,
+// so the late sites (the ones a flight is likely looking for) lost their names and nothing said how many were dropped. The
+// full-table path now keeps the dropped site: `drop_key` (16 x 8 B per table) is claimed by the SAME CAS scan as the slots
+// ([`key_claim`], the loop `slot` carried, moved here verbatim), so `dropped=<k>` counts DISTINCT dropped sites exactly up to
+// 16, then reads `16+` (`drop_full`); `last=<file>:<line>` is the last dropped span's site (`drop_last`, last writer wins
+// across cores). A last-seen count-on-change rule was refused: it counts transitions (two dropped sites alternating would read
+// thousands). Cost only on the full-table path: <= 16 loads, one CAS on a dropped site's first span, one store. The raise to
+// 32 slots is REFUSED: no capture under docs/dev/evidence carries the `[hidstall] masked sites` line, so 16 was never shown
+// exceeded (MASK-SITES-RAISE, owed: +2688 B per table on x86 at 168 B per slot). `take_sec` and the stall line are unchanged.
+
+/// The key equal to `p` in `keys`, else the first free one claimed by CAS (0 -> `p`); `None` = every key is taken by another.
+fn key_claim(keys: &[AtomicUsize], p: usize) -> Option<usize> {
+    for (i, k) in keys.iter().enumerate() {
+        let cur = k.load(Acquire);
+        if cur == p {
+            return Some(i);
+        }
+        if cur == 0 {
+            match k.compare_exchange(0, p, core::sync::atomic::Ordering::AcqRel, Acquire) {
+                Ok(_) => return Some(i),
+                Err(now) if now == p => return Some(i),
+                Err(_) => {}
+            }
+        }
+    }
+    None
+}
+
+impl MaskSites {
+    /// A span the full table dropped: its site becomes `last`, and is claimed in `drop_key` (or marks `drop_full`).
+    fn drop_note(&self, site: &'static core::panic::Location<'static>) {
+        let p = site as *const core::panic::Location<'static> as usize;
+        self.drop_last.store(p, Relaxed);
+        if key_claim(&self.drop_key, p).is_none() {
+            self.drop_full.store(true, Relaxed);
+        }
+    }
+
+    /// The distinct dropped sites held in `drop_key`.
+    fn dropped(&self) -> u32 {
+        self.drop_key.iter().filter(|k| k.load(Acquire) != 0).count() as u32
+    }
+
+    /// Empty the dropped keys (from [`clear`](Self::clear): the KAT's own instance only).
+    fn drop_clear(&self) {
+        for k in self.drop_key.iter() {
+            k.store(0, Relaxed);
+        }
+        self.drop_full.store(false, Relaxed);
+        self.drop_last.store(0, Relaxed);
+    }
+}
+
+impl SiteTop {
+    /// The overflow row's dropped sites: `k` distinct, `full` = more than `drop_key` held, `last` = the last one's site.
+    pub fn set_dropped(&mut self, k: u32, full: bool, last: usize) {
+        self.drop = (k, full, last);
+    }
+
+    /// `(distinct dropped sites, more than 16, the last dropped site as usize)`.
+    pub fn dropped(&self) -> (u32, bool, usize) {
+        self.drop
+    }
+
+    /// The overflow row as the boot-long line prints it: `<n>x<ms> dropped=<k>[+] last=<file>:<line>|-`.
+    pub fn other_say(&self) -> OtherSay {
+        OtherSay { other: self.other, drop: self.drop }
+    }
+}
+
+/// [`SiteTop::other_say`]'s words.
+pub struct OtherSay {
+    other: (u32, u64),
+    drop: (u32, bool, usize),
+}
+
+impl core::fmt::Display for OtherSay {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let (k, full, last) = self.drop;
+        write!(f, "{}x{} dropped={}{} last=", self.other.0, self.other.1, k, if full { "+" } else { "" })?;
+        if last == 0 {
+            return f.write_str("-");
+        }
+        // SAFETY: `last` is a `&'static Location` (from `#[track_caller]` / `Location::caller`), stored whole by `drop_note`.
+        let l: &'static core::panic::Location<'static> = unsafe { &*(last as *const core::panic::Location<'static>) };
+        let file = l.file();
+        write!(f, "{}:{}", file.rsplit('/').next().unwrap_or(file), l.line())
+    }
+}
+
+/// MASKSCOPE's `overflow_ok=`, on the KAT's OWN table after [`masksites_kat`] (A, B, C claimed; a late x86 helper only
+/// touches B's slot): 13 synthetic sites fill the rest; the 17th site, noted twice, must read `dropped=1 last=<the 17th>`
+/// with `other` n=2 and no slot; an 18th once and the 17th once more must read `dropped=2` (a transition rule would say 3).
+fn masksites_overflow_kat() -> bool {
+    let fill: [&'static core::panic::Location<'static>; 13] = [
+        core::panic::Location::caller(),
+        core::panic::Location::caller(),
+        core::panic::Location::caller(),
+        core::panic::Location::caller(),
+        core::panic::Location::caller(),
+        core::panic::Location::caller(),
+        core::panic::Location::caller(),
+        core::panic::Location::caller(),
+        core::panic::Location::caller(),
+        core::panic::Location::caller(),
+        core::panic::Location::caller(),
+        core::panic::Location::caller(),
+        core::panic::Location::caller(),
+    ];
+    for l in fill {
+        KAT_SITES.note(1_000, l);
+    }
+    let full = KAT_SITES.site.iter().all(|k| k.load(Acquire) != 0);
+    let s17: &'static core::panic::Location<'static> = core::panic::Location::caller();
+    let s18: &'static core::panic::Location<'static> = core::panic::Location::caller();
+    let (p17, p18) = (s17 as *const core::panic::Location<'static> as usize, s18 as *const core::panic::Location<'static> as usize);
+    KAT_SITES.note(1_000, s17);
+    KAT_SITES.note(1_000, s17);
+    let b1 = KAT_SITES.boot();
+    let one = b1.dropped() == (1, false, p17) && b1.other().0 == 2 && KAT_SITES.site.iter().all(|k| k.load(Acquire) != p17);
+    KAT_SITES.note(1_000, s18);
+    KAT_SITES.note(1_000, s17);
+    let b2 = KAT_SITES.boot();
+    let two = b2.dropped() == (2, false, p17) && b2.other().0 == 4 && KAT_SITES.site.iter().all(|k| k.load(Acquire) != p18);
+    full && p17 != p18 && one && two
+}
