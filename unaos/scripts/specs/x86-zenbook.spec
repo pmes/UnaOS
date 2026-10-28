@@ -9,7 +9,7 @@
 #          `test_x86_64` as X86_TEST_SPEC (its COMPLETE ends the wall, its REQUIREs are scored by `x86_test_completion`)
 #          and `x86_pick_capture_spec` replays it (the ZENBOOKLANE arm, asked before the SELFHOST skip).
 #          ZENBOOKLANETYPED (zenbook-ledger Z16): `zenbook_lane_typed` arms ONE typist (scripts/typist.sh, twoboot's) on the
-#          lane's QMP port: the first-user form, then `tests platform|ec|nvme|i8042|dwi2c|hdacensus|gopshot|eclid|suspend|ecqnames|dwi2cacpi|wpa2|wifileave|bootlist`
+#          lane's QMP port: the first-user form, then `tests platform|ec|nvme|i8042|dwi2c|hdacensus|gopshot|eclid|suspend|ecqnames|dwi2cacpi|wpa2|wifileave|unafs|bootlist`
 #          (ZENBOOKFLIGHTLIST Z33 added hdacensus, gopshot, eclid; ZENBOOKSPECPINS Z54 suspend, ecqnames, dwi2cacpi), one line each (`tests`
 #          runs ONE fixture per line), each held on the verdict before it; transcript target/zenbook-typist.log (beside).
 #
@@ -40,7 +40,7 @@ OPTIONAL :: ECLID: -> SKIP reason=no-ecdt ::
 
 # ── 3. Z2: the NVMe controller (UNAOS_NVME on the line; the builder attaches the QEMU nvme device) ─────────────────────
 REQUIRE \[nvme\] ctrl mn=".*" ns=1 lba=\d+ blocks=\d+ -> ready
-# NVME4KN-FIXTURE (zenbook-ledger Z40): the 4Kn root lane — `UNAOS_UNAFS=1 UNAOS_NVME_4K=1 ./arroyo esp-x86`, then `UNAOS_NVME_4K=1 UNAOS_NVME_DISK=target/unaos-x86-card.img ./arroyo test-zenbook`: the root flip a one-LBA read-modify-write
+# NVME4KN-FIXTURE (zenbook-ledger Z40): the 4Kn root lane — UNAFSLANEQEMU (Z102): the lane lays its own card over its own ESP, so it is `UNAOS_NVME_4K=1 ./arroyo test-zenbook` (an esp-x86 card is another build's kernel): the root flip a one-LBA read-modify-write
 OPTIONAL \[nvme\] test identify=ok sector0=GPT .* rw=ok .* lba=4096 shift=12 rmw=[1-9]\d*
 # NVMEMSIX (zenbook-ledger Z45): q35's nvme has MSI-X in BAR0 — the I/O CQ's completion vector fired during the rw leg
 OPTIONAL \[nvme\] test identify=ok .* irqs=[1-9]\d*
@@ -94,6 +94,11 @@ FORBID :: WPA2KAT: .*-> FAIL
 # WIFILEAVE (zenbook-ledger Z68): `tests wifileave`, the operator-leave KAT (the kept plan dropped, nothing due after it, the PMK read back zero, the 26-octet deauthentication bytes); pure, so QEMU runs it with no radio (`radio=absent`); the typist line carries it in arroyo test-zenbook (the 4.5 s it costs against the 206 s budget is owed: ZENBOOKLANE-SECS)
 REQUIRE :: WIFILEAVE: kat=ok .*-> PASS ::
 FORBID :: WIFILEAVE: .*-> FAIL
+# UNAFSLANEQEMU (zenbook-ledger Z102): the lane's NATIVE root — test_zenbook's zenbook_unafs_root lays the card over THIS lane's ESP (esp_x86 -> esp_x86_unafs_card) and the builder attaches it as the NVMe (UNAOS_NVME_DISK); the stick is INSTALLDEMO's blank scratch, so the NVMe is the one disk carrying this kernel. `tests unafs` typed before bootlist: the seam on the root and UNAFSBINDTRIGGER's bind_now KAT (B1061: its FAIL ends the verdict in FAIL); the skip arm is FORBIDden, so the lane cannot pass by skipping
+REQUIRE :: UNAFSX86: root=unafs src=nvme blocks=\d+ gen=\d+ home=/home boot=\S+ -> PASS ::
+REQUIRE \[unafs\] bind_now kat=ok r=ok bound=1 masked=0\b
+REQUIRE :: UNAFSX86-T: root=unafs create=ok write=ok remount-read=ok owner=ok unlink=ok -> PASS ::
+FORBID :: UNAFSX86-T: .*-> (SKIP|FAIL)
 
 # ── 10. ZENBOOKACP (Z25): the HDA census on q35's intel-hda + hda-duplex (UNAOS_HDA), the drive path skipped ───────────
 REQUIRE \[hw\] skip hda platform=zenbook_um5606w

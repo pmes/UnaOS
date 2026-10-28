@@ -10659,7 +10659,7 @@ test_splash() {
 # three), every line held on the previous line's verdict. The spec's COMPLETE is the last verdict. The typist connects to QMP before it reads a marker, and the QMP socket exists only after
 # test_x86_64 has removed the old capture, so it never reads a stale log. Transcript: target/zenbook-typist.log (beside it).
 test_zenbook() {
-    local secs="${1:-213}"   # WIFILEAVEBUILD (Z75): 206 -> 213 s, the typed `tests wifileave` (Z68) costs 6.17 s by the Z55 formula (4 s settle + 16 keys x 0.12 + 0.25 poll = 4 + 1.92 + 0.25). MT7925S10 (Z55): 200 -> 206 s, the typed `tests wpa2` costs 5.6 s (4 s settle + 11 keys x 0.12 + 0.25 poll). ZENBOOKSPECPINS (Z54): 180 -> 200 s, the three typed verbs added below cost 18.15 s (3 x 4 s settle + 45 keys x 0.12 s + 3 x 0.25 s poll)
+    local secs="${1:-219}"   # UNAFSLANEQEMU (Z102): 213 -> 219 s, the typed `tests unafs` costs 5.57 s by the Z55 formula (4 s settle + 11 keys x 0.12 + 0.25 poll). WIFILEAVEBUILD (Z75): 206 -> 213 s, the typed `tests wifileave` (Z68) costs 6.17 s by the Z55 formula (4 s settle + 16 keys x 0.12 + 0.25 poll = 4 + 1.92 + 0.25). MT7925S10 (Z55): 200 -> 206 s, the typed `tests wpa2` costs 5.6 s (4 s settle + 11 keys x 0.12 + 0.25 poll). ZENBOOKSPECPINS (Z54): 180 -> 200 s, the three typed verbs added below cost 18.15 s (3 x 4 s settle + 45 keys x 0.12 s + 3 x 0.25 s poll)
     if [ -z "${UNAOS_ZENBOOKLANE:-}" ]; then
         local _zk="" _zv
         for _zv in $(compgen -e); do case "$_zv" in UNAOS_QEMU_MACHINE|UNAOS_QMP_PORT|UNAOS_NVME_4K|UNAOS_NVME_DISK) ;; UNAOS_*) _zk="${_zk} ${_zv#UNAOS_}"; unset "$_zv" ;; esac; done
@@ -10668,7 +10668,7 @@ test_zenbook() {
         exec env UNAOS_ZENBOOKLANE=1 UNAOS_PLATFORM=zenbook_um5606w UNAOS_CENSUS=1 UNAOS_USBSERIAL=1 "$0" test-zenbook "$secs"
     fi
     echo -e "${COLOR_CYAN}⚡ ZENBOOKLANE: the Zenbook line as zenbook_um5606w on a fresh card, the first-user form typed, then twelve typed verbs (${secs}s wall, spec ${X86_ZENBOOK_SPEC#${WORKSPACE_DIR}/})${COLOR_RESET}"
-    rm -f "${WORKSPACE_DIR}/target/sdcard.img"; zenbook_bootlist_carry   # ZENBOOKLANELIST (Z19): the lane's own list, staged by the ONE stager, carried onto the ESP by the builder
+    rm -f "${WORKSPACE_DIR}/target/sdcard.img"; zenbook_bootlist_carry; zenbook_unafs_root   # ZENBOOKLANELIST (Z19): the lane's own list, staged by the ONE stager, carried onto the ESP by the builder. UNAFSLANEQEMU (Z102): then the lane's native NVMe root, laid over this lane's own ESP (after the carry, so the lane list rides onto p1)
     X86_TEST_SPEC="$X86_ZENBOOK_SPEC"
     build_selfbuild_x86() { echo "   ZENBOOKLANE: SELFBUILD staging not entered (build_selfbuild_x86 stubbed, as the twoboot arm does)"; }
     zenbook_lane_typed "$secs"   # ZENBOOKLANETYPED (Z16): the typist + test_x86_64; its rc is this verb's
@@ -10684,7 +10684,7 @@ zenbook_lane_typed() { # $1 = the wall (s)
     TYPIST_PORT="$zport" TYPIST_LOG="$SERIAL_LOG"
     local -a zph=("$FIRSTUSER_PHASE")
     prev=":: BOOTLIST: ran="   # ZENBOOKLANELIST (Z19): held on the lane list's light summary (it runs at [desktop] built), so no typed `tests` meets a list fixture's RUNNING (`:: TESTS: already running — refused ::`)
-    for v in platform:PLATFORM ec:EC nvme:NVME i8042:I8042 dwi2c:DWI2C hdacensus:HDACENSUS gopshot:GOPSHOT eclid:ECLID suspend:SUSPEND ecqnames:ECQNAMES dwi2cacpi:DWI2CFAST wpa2:WPA2KAT wifileave:WIFILEAVE bootlist:BOOTLIST; do   # ZENBOOKFLIGHTLIST (Z33): hdacensus, gopshot, eclid typed before bootlist (COMPLETE unchanged). ZENBOOKSPECPINS (Z54): suspend, ecqnames, dwi2cacpi (held on DWI2CFAST, its last of three verdicts), each pinned by x86-zenbook.spec §9. SPECCOV (zenbook-ledger Z58): this lane's marker, equal to the loop's own verbs — SPEC-COVERAGE: x86-zenbook.spec platform ec nvme i8042 dwi2c hdacensus gopshot eclid suspend ecqnames dwi2cacpi bootlist wpa2 wifileave
+    for v in platform:PLATFORM ec:EC nvme:NVME i8042:I8042 dwi2c:DWI2C hdacensus:HDACENSUS gopshot:GOPSHOT eclid:ECLID suspend:SUSPEND ecqnames:ECQNAMES dwi2cacpi:DWI2CFAST wpa2:WPA2KAT wifileave:WIFILEAVE unafs:UNAFSX86-T bootlist:BOOTLIST; do   # UNAFSLANEQEMU (Z102): unafs typed before bootlist on the native NVMe root (COMPLETE unchanged). ZENBOOKFLIGHTLIST (Z33): hdacensus, gopshot, eclid typed before bootlist (COMPLETE unchanged). ZENBOOKSPECPINS (Z54): suspend, ecqnames, dwi2cacpi (held on DWI2CFAST, its last of three verdicts), each pinned by x86-zenbook.spec §9. SPECCOV (zenbook-ledger Z58): this lane's marker, equal to the loop's own verbs — SPEC-COVERAGE: x86-zenbook.spec platform ec nvme i8042 dwi2c hdacensus gopshot eclid suspend ecqnames dwi2cacpi bootlist wpa2 wifileave unafs
         local done_mark=":: ${v#*:}: "; [ "${v%%:*}" = bootlist ] && done_mark=":: BOOTLIST: probe"
         zph+=("${prev}|tests ${v%%:*}|t:tests spc t:${v%%:*} ret|${done_mark}")
         prev="$done_mark"
@@ -10709,6 +10709,31 @@ zenbook_bootlist_carry() {
     _BOOTLIST_MEDIA=1 bootlist_stage "$dir" "${WORKSPACE_DIR}/fixtures/lanes/zenbook"
     [ -f "${dir}/TESTS.LIST" ] || { echo -e "${COLOR_RED}✖ ZENBOOKLANELIST: no lane list at fixtures/lanes/zenbook/TESTS.LIST — the lane would read list=absent. rc=1${COLOR_RESET}"; exit 1; }
     export UNAOS_BOOTLIST_STAGE="$dir"
+}
+
+# UNAFSLANEQEMU (zenbook-ledger Z102): the lane's NATIVE root. The root walk binds only a disk carrying THIS kernel (the code
+# window AND the build stamp, fs/bootdisk.rs `walk_rows`), and on this lane none did: the line's INSTALLDEMO backs the stick
+# with a blank scratch, no `ahci` reads the ESP on ide.0, sdcard.img carries no kernel, the NVMe was zeros — so `/` was never
+# UnaFS and `tests unafs` could only SKIP. The ONE media verb `esp_x86` builds this lane's ESP under the lane's own env (its
+# PACKAGE_ONLY builder run derives the same features, so test_x86_64 boots the same kernel bytes; UNAOS_BOOTLIST_STAGE has
+# already put the lane list on it; UNAOS_NOSRC call-scoped: no SRC.TGZ on a lane card), and the ONE card builder
+# `esp_x86_unafs_card` lays the card over it (`--lba 4096` under UNAOS_NVME_4K). The card is moved to a lane name (a knob
+# kernel never sits at the media card's path) and rides the NVMe through UNAOS_NVME_DISK (the builder attaches a fresh copy):
+# the one disk carrying this kernel, so `/` binds `src=nvme`. ZENBOOKLANE-CARDCOST (the seat's MEASURE condition): the card
+# builder is stubbed for the esp_x86 call (test_zenbook's build_selfbuild_x86 idiom) and run only when the stamp beside the
+# lane card (the kernel.elf sha256 it was laid from + the LBA size) differs from this build's, so repeated runs lay it once.
+zenbook_unafs_root() {
+    local card="${WORKSPACE_DIR}/target/zenbook-lane-card.img" laid="${WORKSPACE_DIR}/target/unaos-x86-card.img" real want how
+    real="$(declare -f esp_x86_unafs_card)"; esp_x86_unafs_card() { echo "   UNAFSLANEQEMU: card step deferred to zenbook_unafs_root (the stamp decides reuse or a fresh lay)"; }
+    UNAOS_NOSRC=1 esp_x86; eval "$real"
+    want="$(sha256_of "${WORKSPACE_DIR}/target/x86_64_esp/kernel.elf") lba=$([ -n "${UNAOS_NVME_4K:-}" ] && echo 4096 || echo 512)"
+    if [ -n "${want%% *}" ] && [ -f "$card" ] && [ "$(cat "${card}.sha" 2>/dev/null)" = "$want" ]; then how="reuse"; else   # no sha (no hash tool) is never a reuse
+        rm -f "$card" "${card}.sha"; esp_x86_unafs_card || exit $?
+        [ -f "$laid" ] || { echo -e "${COLOR_RED}✖ UNAFSLANEQEMU: esp_x86_unafs_card left no card at ${laid#${WORKSPACE_DIR}/} — the lane would have no native root. rc=1${COLOR_RESET}"; exit 1; }
+        mv "$laid" "$card" && printf '%s\n' "$want" > "${card}.sha" || exit 1; how="fresh lay"
+    fi
+    export UNAOS_NVME_DISK="$card"
+    echo -e "${COLOR_CYAN}⚡ UNAFSLANEQEMU: native root — ${how} nvme_disk=${card#${WORKSPACE_DIR}/} kernel=${want%% *} lba=${want##*lba=}${COLOR_RESET}"
 }
 
 # SPLASHGATE — the two splash witnesses are IN THE BOOTED ELF, counted, with both controls.
@@ -15296,7 +15321,7 @@ case "${1:-}" in
     test-zenbook|test_zenbook)
         # ZENBOOKLANE (zenbook-ledger Z13): the Zenbook line under QEMU as zenbook_um5606w. Re-execs itself (see
         # test_zenbook), so this arm is entered twice per invocation. Fold-gate command, not a leg of `check`.
-        test_zenbook "${2:-213}"   # WIFILEAVEBUILD (Z75): 213 s, the default beside test_zenbook's (206 + 6.17 s for the typed `tests wifileave`: 4 s settle + 16 keys x 0.12 + 0.25 poll). MT7925S10 (Z55): 206 s, the default beside test_zenbook's (a dispatcher default of 200 would override it). ZENBOOKSPECPINS (Z54): 200 s, twelve typed verbs (+18.15 s measured from typist.sh). ZENBOOKLANETYPED (Z16): 180 s — the run now reaches the desktop and six typed verbs; FASTTEST ends it at COMPLETE
+        test_zenbook "${2:-219}"   # UNAFSLANEQEMU (Z102): 219 s, the default beside test_zenbook's (213 + 5.57 s for the typed `tests unafs`). WIFILEAVEBUILD (Z75): 213 s, the default beside test_zenbook's (206 + 6.17 s for the typed `tests wifileave`: 4 s settle + 16 keys x 0.12 + 0.25 poll). MT7925S10 (Z55): 206 s, the default beside test_zenbook's (a dispatcher default of 200 would override it). ZENBOOKSPECPINS (Z54): 200 s, twelve typed verbs (+18.15 s measured from typist.sh). ZENBOOKLANETYPED (Z16): 180 s — the run now reaches the desktop and six typed verbs; FASTTEST ends it at COMPLETE
         ;;
     kernel8|baremetal)
         _BOOTLIST_MEDIA=1 kernel8   # BOOTLISTARM (B874): the Pi card verb arms the list; kernel8-run/-test/-install never do
