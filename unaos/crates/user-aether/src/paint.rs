@@ -20,6 +20,11 @@
 //
 // UNAKEYS (rmbp-ledger B552): no colour is spelled here — the page's initial colours are `theme::PAGE_*` and every
 // colour over the page (the marks, the status line) is a field of the live `theme::cur()` (Principia's appearance).
+//
+// AETHER-ELFCAPTION (LEDGER SR434): a push-button `<input>` (type submit / reset / button) paints its caption — the
+// host forms paint's push arm (handlers/aether render/mod.rs, AETHERSUBMITCAPTION SR410) on this ring, through the
+// SAME `layout_core::button_label` `control_intrinsic` sized the box by: in the element's own font, centred on both
+// axes in the content box, clipped to the padding box ([`caption`]).
 
 use alloc::vec::Vec;
 
@@ -431,6 +436,7 @@ fn paint_box_plain(cv: &mut Canvas, cx: &Cx, id: NodeId, x: f32, y: f32) {
         }
         return;
     }
+    if !hidden && y + h >= 0.0 { caption(cv, cx, id, &ink, x, y); } // AETHER-ELFCAPTION (SR434)
     for k in tree.taffy.children(id).unwrap_or_default() {
         let Ok(kl) = tree.taffy.layout(k) else { continue };
         paint_box(cv, cx, k, x + kl.location.x, y + kl.location.y);
@@ -462,4 +468,49 @@ pub fn status(cv: &mut Canvas, fonts: &Fonts, s: &str, accent: bool) {
     let mut t = fonts.0.borrow_mut();
     let (a, _, _) = t.line_metrics(sel, crate::chrome::font());
     t.draw(4.0, (y + 2) as f32 + a, s, sel, crate::chrome::font(), ink, &mut |gx, gy, cov| cv.blend(gx, gy, ink, cov));
+}
+
+// ---- AETHER-ELFCAPTION (SR434): a push button's caption ------------------------------------------------------
+
+/// AETHER-ELFCAPTION (SR434): the caption of a push-button `<input>` (type submit / reset / button, trimmed and ASCII
+/// case-insensitive as `layout_core::button_label` reads it) with its border box's top-left at (`x`, `y`) — the host
+/// forms paint's push arm (render/mod.rs, AETHERSUBMITCAPTION SR410) on this ring. The label is
+/// `layout_core::button_label` (the rule `control_intrinsic` sized the box by; an empty label paints nothing), measured
+/// and drawn in the element's own font (`ink`: its used size, family and weight, through txt.rs's shaper), centred
+/// on both axes in the content box (an overflowing label stays centred: one line, never wrapped; the inked line,
+/// ascent + descent, centred as the host's `centered_line_origin_y` does) and clipped to the padding box (html.css
+/// `input { overflow: clip }`). Its ink is the element's own `color`, else the page ink (the host's FieldText black).
+fn caption(cv: &mut Canvas, cx: &Cx, id: NodeId, ink: &Ink, x: f32, y: f32) {
+    let tree = cx.tree;
+    let (Some(n), Ok(l)) = (tree.node_map.get(&id), tree.taffy.layout(id)) else { return };
+    if n.tag().as_deref() != Some("input") {
+        return;
+    }
+    let ty = n.attr("type").unwrap_or_default();
+    if !matches!(ty.trim().to_ascii_lowercase().as_str(), "submit" | "reset" | "button") {
+        return;
+    }
+    let value = n.attr("value");
+    let label = layout_core::button_label(&ty, value.as_deref());
+    if label.is_empty() {
+        return;
+    }
+    let (w, h) = (l.size.width, l.size.height);
+    let (bd, pd) = (l.border, l.padding);
+    let (cx0, cy0) = (x + bd.left + pd.left, y + bd.top + pd.top);
+    let cw = (w - bd.left - pd.left - pd.right - bd.right).max(0.0);
+    let ch = (h - bd.top - pd.top - pd.bottom - bd.bottom).max(0.0);
+    let color = tree.paint_map.get(&id).and_then(|p| p.color).map(rgb).unwrap_or(crate::theme::PAGE_INK);
+    let mut t = cx.fonts.0.borrow_mut();
+    let tw = t.measure(&label, ink.sel, ink.size);
+    let (a, d, _) = t.line_metrics(ink.sel, ink.size);
+    let tx = cx0 + (cw - tw) / 2.0;
+    let base = font_core::fmath::round(cy0 + ch / 2.0 - (a + d) / 2.0 + a);
+    // the padding box: the border box less its borders
+    let (px0, py0, px1, py1) = (fl(x + bd.left), fl(y + bd.top), fl(x + w - bd.right), fl(y + h - bd.bottom));
+    t.draw(tx, base, &label, ink.sel, ink.size, color, &mut |gx, gy, cov| {
+        if gx >= px0 && gx < px1 && gy >= py0 && gy < py1 {
+            cv.blend(gx, gy, color, cov);
+        }
+    });
 }
