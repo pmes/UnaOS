@@ -32915,9 +32915,18 @@ fn close_drain_wait_for(who: &'static str, budget_us: u64, say: bool) -> (bool, 
 // written by the fixture alone: [`close_drain_kat_arg`] bumps it at every spawn and packs it into the spawn arg's high
 // 32 bits (`WinId` is u32, so the helpers' `arg as WinId` still reads the id), and each skip arm bumps it again; each
 // helper's FIRST line ([`close_drain_kat_mine`]) returns at once when its generation is not the current one — no
-// flight, no guard, no line printed (its `exit()` finds no slot: the death road's no-op). Residual: a helper passing
-// that one load within instructions of the fixture's 1 s deadline-and-bump is still live (LEG-SKIP-CLAIM owed: a claim
-// CAS). No new wire token.
+// flight, no guard, no line printed (its `exit()` finds no slot: the death road's no-op). No new wire token.
+//
+// LEGSKIPCLAIM (rmbp-ledger B1088; BP-video-18 kept, the seat's MEASURE line) — that one LOAD left a window: a helper
+// that passed it within instructions of the fixture's 1 s deadline went on to enter a flight (or take a blit
+// registration) under the NEXT leg. The load is now a CLAIM: [`close_drain_kat_mine`] CASes `gen -> gen | KAT_OWNED`
+// (bit 31 of the same word), and each skip arm's bump is [`close_drain_kat_disown`], a CAS `gen -> gen + 1` that fails
+// iff the helper already owns the generation. Disowned: the leg skips and the helper's claim fails, as before. Owned:
+// the fixture waits for HELD (the existing `KAT_STATE` word, the existing 1 s bound) and FALLS THROUGH into the
+// unchanged leg body, whose own DOOR / DONE / kill / death waits see the helper to its end; a claimed helper that never
+// reaches HELD inside that second 1 s reads `0` (a FAIL verdict, never a hang; LEG-SKIP-CLAIM-STUCK owed: it is still
+// live). [`close_drain_kat_bump`] clears the claim bit at the next spawn's bump and masks a wrap away from it.
+// KAT_STATE / KAT_KEY / KAT_SLOT are written only by a helper whose claim succeeded. No new wire token.
 
 /// RETIREDRAINKAT — the helper's progress: 0 idle, then HELD (flight entered), DOOR (the fixture is entering the
 /// door), DONE (flight ended).
@@ -32992,6 +33001,7 @@ const KAT_HOLD_MS: u64 = 30;
 static KAT_MODE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 /// LEGSKIPLATE (rmbp-ledger B1086) — the KAT legs' helper generation: bumped by the fixture at every spawn and on every
 /// skip; a helper whose spawn-arg generation is not this one is disowned and returns at its first line.
+/// LEGSKIPCLAIM (B1088): bit 31 ([`KAT_OWNED`]) is set by the current helper's claim CAS, the only non-fixture write.
 #[cfg(all(
     feature = "witness",
     any(
@@ -33138,8 +33148,13 @@ fn close_drain_kat(id: WinId, mode: u8) -> (&'static str, u64, WinId) {
         close_drain_kat_spawn(close_drain_kat_helper, id, cpu); // RETIREDRAINBLITKAT (B1079): the one plain spawn, shared with LEG 9
     }
     if !close_drain_kat_until(1_000, || KAT_STATE.load(Ordering::Acquire) >= KAT_HELD) {
-        KAT_GEN.fetch_add(1, Ordering::AcqRel); // LEGSKIPLATE (B1086): disown the late helper
-        return ("skip", 0, WIN_NONE);
+        if close_drain_kat_disown() {
+            return ("skip", 0, WIN_NONE); // LEGSKIPLATE (B1086); LEGSKIPCLAIM (B1088): no claim, the late helper disowned
+        }
+        if !close_drain_kat_until(1_000, || KAT_STATE.load(Ordering::Acquire) >= KAT_HELD) {
+            return ("0", 0, WIN_NONE); // LEGSKIPCLAIM (B1088): claimed, never HELD — a FAIL verdict, not a hang
+        }
+        // LEGSKIPCLAIM (B1088): the claimed helper owns this leg: fall through into the unchanged body.
     }
     let key = KAT_KEY.load(Ordering::Acquire);
     let slot = KAT_SLOT.load(Ordering::Acquire);
@@ -33283,7 +33298,11 @@ fn close_drain_kat_spawn(entry: fn(usize), id: WinId, cpu: usize) {
     )
 ))]
 fn close_drain_kat_arg(id: WinId) -> usize {
-    let g = KAT_GEN.fetch_add(1, core::sync::atomic::Ordering::AcqRel).wrapping_add(1);
+    use core::sync::atomic::Ordering;
+    // LEGSKIPCLAIM (B1088): the masked bump clears a previous leg's claim bit.
+    let g = match KAT_GEN.fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| Some(close_drain_kat_bump(v))) {
+        Ok(p) | Err(p) => close_drain_kat_bump(p),
+    };
     ((g as usize) << 32) | id as usize
 }
 
@@ -33297,7 +33316,48 @@ fn close_drain_kat_arg(id: WinId) -> usize {
     )
 ))]
 fn close_drain_kat_mine(arg: usize) -> bool {
-    KAT_GEN.load(core::sync::atomic::Ordering::Acquire) == (arg >> 32) as u32
+    use core::sync::atomic::Ordering;
+    let g = (arg >> 32) as u32;
+    // LEGSKIPCLAIM (B1088): ONE claim CAS; a failed CAS (stale or disowned generation) is not mine.
+    KAT_GEN.compare_exchange(g, g | KAT_OWNED, Ordering::AcqRel, Ordering::Acquire).is_ok()
+}
+
+/// LEGSKIPCLAIM (rmbp-ledger B1088) — [`KAT_GEN`]'s claim bit, set by the helper that owns the current generation.
+#[cfg(all(
+    feature = "witness",
+    any(
+        all(target_arch = "x86_64", feature = "wc"),
+        all(target_arch = "aarch64", feature = "desktop_firmware")
+    )
+))]
+const KAT_OWNED: u32 = 1 << 31;
+
+/// LEGSKIPCLAIM (B1088) — the next generation after `v`: the claim bit cleared, a wrap masked away from it.
+#[cfg(all(
+    feature = "witness",
+    any(
+        all(target_arch = "x86_64", feature = "wc"),
+        all(target_arch = "aarch64", feature = "desktop_firmware")
+    )
+))]
+fn close_drain_kat_bump(v: u32) -> u32 {
+    (v & !KAT_OWNED).wrapping_add(1) & !KAT_OWNED
+}
+
+/// LEGSKIPCLAIM (B1088) — a skip arm's disown: CAS the current generation to the next one; `false` iff a helper
+/// already claimed it (the helper is live and owns the leg).
+#[cfg(all(
+    feature = "witness",
+    any(
+        all(target_arch = "x86_64", feature = "wc"),
+        all(target_arch = "aarch64", feature = "desktop_firmware")
+    )
+))]
+fn close_drain_kat_disown() -> bool {
+    use core::sync::atomic::Ordering;
+    KAT_GEN
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| if v & KAT_OWNED != 0 { None } else { Some(close_drain_kat_bump(v)) })
+        .is_ok()
 }
 
 /// RETIREDRAINBLITKAT — LEG 9's helper: a composite's F4 registration for window `arg`, held until the fixture is in
@@ -33357,10 +33417,13 @@ fn close_drain_blit_kat(id: WinId) -> (&'static str, u64) {
     KAT_BLIT_SEEN.store(false, Ordering::Release);
     close_drain_kat_spawn(close_drain_blit_kat_helper, id, close_drain_kat_cpu());
     if !close_drain_kat_until(1_000, || KAT_STATE.load(Ordering::Acquire) >= KAT_HELD) {
-        KAT_GEN.fetch_add(1, Ordering::AcqRel); // LEGSKIPLATE (B1086): disown the late helper
-        KAT_STATE.store(KAT_DOOR, Ordering::Release); // a late helper skips its DOOR wait
-        close(id);
-        return ("skip", 0);
+        let owned = !close_drain_kat_disown(); // LEGSKIPLATE (B1086); LEGSKIPCLAIM (B1088): fails iff a helper claimed
+        if !owned || !close_drain_kat_until(1_000, || KAT_STATE.load(Ordering::Acquire) >= KAT_HELD) {
+            KAT_STATE.store(KAT_DOOR, Ordering::Release); // a late helper skips its DOOR wait
+            close(id);
+            return (if owned { "0" } else { "skip" }, 0); // LEGSKIPCLAIM (B1088): claimed, never HELD — FAIL
+        }
+        // LEGSKIPCLAIM (B1088): the claimed helper owns this leg: fall through into the unchanged body.
     }
     let t0 = crate::hidstall::now_us();
     KAT_STATE.store(KAT_DOOR, Ordering::Release);
