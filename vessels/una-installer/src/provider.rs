@@ -34,13 +34,22 @@
 // refusing Holocron keeps the key held for the session (the fallback). Vein reads no Holocron name for Gemini (its slot
 // asks only for Claude's api-key mode), so a Gemini save refuses `no-name` (VEIN-GEMINI-HOLOCRON owed).
 //
+// INSTALLERPROVIDERCANCEL (LEDGER SR442): `provider stop` (the Stop button) sets the send's cancel flag; the `Tee` reads it
+// FIRST on every poll and, when set, yields ONE synthetic `ChatDelta::Stop` (`StopReason::Other(STOPPED)`) instead of
+// polling the provider, so `sse::collect`'s own fold returns exactly the text that arrived (no second accumulator). What
+// arrived lands as REPLY-partial.md under a `# Reply (stopped)` header (nothing when no text arrived): never REPLY.md,
+// since contribute's `plan` commits every file in the landing dir. The pane frees through the same `poll` Done path. A
+// stop while the stream is pending (connect, backoff, a silent server) takes effect at the next delta
+// (PROVIDER-CANCEL-WAKE owed); a stop during the `generate` fallback lets that one call finish.
+//
 // Wire:
-//   [installer] provider name=<claude|gemini|claudecode|none> key=<set|missing> send=<ok|refused|-> why=<-|no-key|no-landing|network|provider-error> reply_kb=<n> ms=<n> first_ms=<n>
+//   [installer] provider name=<claude|gemini|claudecode|none> key=<set|missing> send=<ok|refused|cancelled|-> why=<-|no-key|no-landing|network|provider-error|stop> reply_kb=<n> ms=<n> first_ms=<n>
 //   [installer] provider save name=<claude|gemini|claudecode|none> ok=<1|0> why=<-|no-key|no-name|no-holocron|holocron-error> status=<-|word>
 
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering}; // INSTALLERPROVIDERCANCEL (SR442)
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::task::{Context, Poll};
 use std::time::Instant;
@@ -51,7 +60,7 @@ use bandy::{PrefValue, PrincipiaCommand, SMessage};
 use gneiss_pal::api::provider::{CLAUDE_DEFAULT_MODEL, GEMINI_DEFAULT_MODEL};
 use gneiss_pal::api::{
     AuthMode, ChatDelta, ChatRequest, DeltaStream, ModelProvider, PREF_NS, Part, ProviderConfig, ProviderError, ProviderKind, StopReason,
-    Thread, menu_choice_prefs,
+    Thread, Usage, menu_choice_prefs,
 };
 use holocron::holocron_core::keysource::{CLAUDE_API_KEY, KeySource, VEIN_NS};
 use holocron::holocron_core::wire::{Request, status};
@@ -82,14 +91,23 @@ pub fn newest_landing(checkout: &Path) -> Option<PathBuf> {
 
 /// Where the reply lands: `REPLY.md` beside PROMPT.md, `REPLY-2.md`, `REPLY-3.md` … when taken.
 pub fn reply_path(dir: &Path) -> PathBuf {
-    let mut p = dir.join("REPLY.md");
+    free_path(dir, "REPLY")
+}
+
+/// `<stem>.md` in `dir`, `<stem>-2.md`, `<stem>-3.md` … when taken (INSTALLERPROVIDERCANCEL SR442: the reply and the
+/// stopped partial share it).
+pub fn free_path(dir: &Path, stem: &str) -> PathBuf {
+    let mut p = dir.join(format!("{stem}.md"));
     let mut k = 2;
     while p.exists() {
-        p = dir.join(format!("REPLY-{k}.md"));
+        p = dir.join(format!("{stem}-{k}.md"));
         k += 1;
     }
     p
 }
+
+/// INSTALLERPROVIDERCANCEL (SR442): the stop reason the `Tee` synthesizes when the person stopped the send.
+const STOPPED: &str = "installer-stop";
 
 /// A provider error as the wire's `why=`.
 pub fn why_of(e: &ProviderError) -> &'static str {
@@ -138,6 +156,8 @@ struct Tee<'a> {
     tx: Sender<Msg>,
     t0: Instant,
     first: &'a mut Option<u128>,
+    /// INSTALLERPROVIDERCANCEL (SR442): the person's stop, read first on every poll.
+    cancel: &'a AtomicBool,
 }
 
 impl Stream for Tee<'_> {
@@ -145,6 +165,10 @@ impl Stream for Tee<'_> {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
+        if this.cancel.load(Ordering::SeqCst) {
+            // INSTALLERPROVIDERCANCEL (SR442): ONE synthetic Stop, so collect's own fold returns what arrived.
+            return Poll::Ready(Some(Ok(ChatDelta::Stop { stop: StopReason::Other(STOPPED.to_string()), usage: Usage::default() })));
+        }
         let r = this.inner.as_mut().poll_next(cx);
         if let Poll::Ready(Some(Ok(ChatDelta::Text(t)))) = &r {
             if this.first.is_none() {
@@ -158,7 +182,7 @@ impl Stream for Tee<'_> {
 
 /// The send on its own thread: ONE `stream` teed into `sse::collect` (`generate` only on `Unsupported`), the stop
 /// reason checked before the text, the reply written.
-fn job(p: Arc<dyn ModelProvider>, req: ChatRequest, dir: PathBuf, tx: Sender<Msg>) -> (String, Option<PathBuf>) {
+fn job(p: Arc<dyn ModelProvider>, req: ChatRequest, dir: PathBuf, tx: Sender<Msg>, cancel: Arc<AtomicBool>) -> (String, Option<PathBuf>) {
     let t0 = Instant::now();
     let name = p.name().to_string();
     let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
@@ -168,7 +192,7 @@ fn job(p: Arc<dyn ModelProvider>, req: ChatRequest, dir: PathBuf, tx: Sender<Msg
     let mut first: Option<u128> = None;
     let r = rt.block_on(async {
         match p.stream(&req).await {
-            Ok(inner) => gneiss_pal::api::sse::collect(Box::pin(Tee { inner, tx, t0, first: &mut first })).await,
+            Ok(inner) => gneiss_pal::api::sse::collect(Box::pin(Tee { inner, tx, t0, first: &mut first, cancel: &cancel })).await,
             Err(ProviderError::Unsupported(_)) => p.generate(&req).await, // STREAM-FALLBACK: the ONE branch
             Err(e) => Err(e),
         }
@@ -179,6 +203,9 @@ fn job(p: Arc<dyn ModelProvider>, req: ChatRequest, dir: PathBuf, tx: Sender<Msg
         Ok(resp) => resp,
         Err(e) => return (say(line(&name, true, "refused", why_of(&e), 0, ms, first_ms)), None),
     };
+    if matches!(&resp.stop, StopReason::Other(s) if s == STOPPED) {
+        return stopped(&name, p.model(), &resp.text, &dir, ms, first_ms); // INSTALLERPROVIDERCANCEL (SR442)
+    }
     let cut = match resp.stop {
         StopReason::EndTurn => "",
         StopReason::MaxTokens => "_The reply was cut at the output cap (vein.max_tokens)._\n\n",
@@ -192,6 +219,20 @@ fn job(p: Arc<dyn ModelProvider>, req: ChatRequest, dir: PathBuf, tx: Sender<Msg
         return (say(line(&name, true, "refused", "no-landing", 0, ms, first_ms)), None);
     }
     (say(line(&name, true, "ok", "-", (body.len() as u64).div_ceil(1024), ms, first_ms)), Some(path))
+}
+
+/// INSTALLERPROVIDERCANCEL (SR442): a stopped send's verdict: what arrived as REPLY-partial.md under a header that says it
+/// was stopped (nothing written when no text arrived), `send=cancelled why=stop reply_kb=<the file's kb, 0 = none>`.
+fn stopped(name: &str, model: &str, text: &str, dir: &Path, ms: u128, first_ms: u128) -> (String, Option<PathBuf>) {
+    if text.is_empty() {
+        return (say(line(name, true, "cancelled", "stop", 0, ms, first_ms)), None);
+    }
+    let body = format!("# Reply (stopped) — {name} / {model}\n\n_Stopped by the person after {ms} ms: the part that arrived, not the whole reply._\n\n{text}\n");
+    let path = free_path(dir, "REPLY-partial");
+    if std::fs::write(&path, &body).is_err() {
+        return (say(line(name, true, "cancelled", "stop", 0, ms, first_ms)), None);
+    }
+    (say(line(name, true, "cancelled", "stop", (body.len() as u64).div_ceil(1024), ms, first_ms)), Some(path))
 }
 
 /// The live tail the face shows: at most this many line breaks …
@@ -238,6 +279,8 @@ pub struct Provider {
     sock: Option<PathBuf>,
     key: Option<String>,
     rx: Option<Receiver<Msg>>,
+    /// INSTALLERPROVIDERCANCEL (SR442): the running send's stop flag (fresh per send; the send thread reads it).
+    cancel: Arc<AtomicBool>,
 }
 
 impl Provider {
@@ -267,11 +310,23 @@ impl Provider {
             sock,
             key: None,
             rx: None,
+            cancel: Arc::new(AtomicBool::new(false)),
         }
     }
 
     pub fn busy(&self) -> bool {
         self.rx.is_some()
+    }
+
+    /// INSTALLERPROVIDERCANCEL (SR442): `provider stop`: the running send's flag set; the pane frees when its verdict
+    /// arrives through `poll` (the thread ends at its next delta).
+    fn stop(&mut self) {
+        if self.busy() {
+            self.cancel.store(true, Ordering::SeqCst);
+            self.verdict = String::from("stopping — the reply ends at its next delta");
+        } else {
+            self.verdict = String::from("nothing to stop");
+        }
     }
 
     /// Vein's slot over Principia's `vein` preferences; a held key answers the configured key env var.
@@ -439,8 +494,10 @@ impl Provider {
         self.verdict = format!("sending {} to {} ...", dir.display(), p.name());
         self.live.clear();
         self.rx = Some(rx);
+        self.cancel = Arc::new(AtomicBool::new(false)); // INSTALLERPROVIDERCANCEL (SR442)
+        let cancel = self.cancel.clone();
         std::thread::spawn(move || {
-            let (l, path) = job(p, req, dir, tx.clone());
+            let (l, path) = job(p, req, dir, tx.clone(), cancel);
             let _ = tx.send(Msg::Done(l, path));
         });
     }
@@ -482,12 +539,12 @@ pub fn face_of(p: &Provider) -> TetraNode {
             button("provider.pick.gemini", "Gemini", "provider pick gemini"),
         ]),
         TetraNode::TextField { id: String::from("provider.key"), placeholder: String::from("API key (held for this session; Save keeps it in Holocron)"), action: TextAction::ConsoleInput, secret: true }, // LANDINGSECRETFIELD (SR432): drawn as bullets
-        TetraNode::HStack(vec![button("provider.key", "Key", "provider key"), button("provider.save", "Save", "provider save"), button("provider.send", "Send", "provider send")]), // INSTALLERPROVIDERHOLOCRON (SR439): Save
+        TetraNode::HStack(vec![button("provider.key", "Key", "provider key"), button("provider.save", "Save", "provider save"), button("provider.send", "Send", "provider send"), button("provider.stop", "Stop", "provider stop")]), // INSTALLERPROVIDERHOLOCRON (SR439): Save; INSTALLERPROVIDERCANCEL (SR442): Stop
     ])
 }
 
 /// Route one `SMessage::ConsoleInput` line: `provider pick <claude|gemini>`, `provider key [<key>]`, `provider save`,
-/// `provider send [<landing dir>]`, `provider status`, or a raw line the Key button armed / with a key's shape (the key). False = not
+/// `provider send [<landing dir>]`, `provider stop`, `provider status`, or a raw line the Key button armed / with a key's shape (the key). False = not
 /// the provider face's line.
 pub fn on_input(p: &mut Provider, line: &str) -> bool {
     p.poll();
@@ -513,9 +570,10 @@ pub fn on_input(p: &mut Provider, line: &str) -> bool {
         "key" => p.hold_key(arg),
         "save" if !p.busy() => p.save(), // INSTALLERPROVIDERHOLOCRON (SR439)
         "send" if !p.busy() => p.start_send(arg),
+        "stop" => p.stop(), // INSTALLERPROVIDERCANCEL (SR442)
         "status" => p.verdict = say(p.status()),
         _ if p.busy() => p.verdict = String::from("busy sending — wait for the reply"),
-        _ => p.verdict = format!("unknown provider verb `{verb}` (pick / key / save / send / status)"),
+        _ => p.verdict = format!("unknown provider verb `{verb}` (pick / key / save / send / stop / status)"),
     }
     true
 }
@@ -542,25 +600,42 @@ mod tests {
         seen: Mutex<Vec<ChatRequest>>,
         answer: Result<ChatResponse, ProviderError>,
         script: Option<Vec<ChatDelta>>,
+        /// INSTALLERPROVIDERCANCEL (SR442): the scripted stream holds (pending) after this many items.
+        hold: Option<usize>,
     }
 
-    /// A scripted delta sequence as a `DeltaStream`.
-    struct Script(VecDeque<ChatDelta>);
+    /// A scripted delta sequence as a `DeltaStream`; past `hold` items it stays pending (re-woken every 2 ms), as a
+    /// provider that has gone quiet mid-reply.
+    struct Script(VecDeque<ChatDelta>, Option<usize>);
 
     impl Stream for Script {
         type Item = Result<ChatDelta, ProviderError>;
-        fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-            Poll::Ready(self.get_mut().0.pop_front().map(Ok))
+        fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            let this = self.get_mut();
+            if this.1 == Some(0) {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            if let Some(n) = this.1.as_mut() {
+                *n -= 1;
+            }
+            Poll::Ready(this.0.pop_front().map(Ok))
         }
     }
 
     impl Fake {
         fn answering(answer: Result<ChatResponse, ProviderError>) -> Arc<Fake> {
-            Arc::new(Fake { seen: Mutex::new(Vec::new()), answer, script: None })
+            Arc::new(Fake { seen: Mutex::new(Vec::new()), answer, script: None, hold: None })
         }
         fn streaming(script: Vec<ChatDelta>) -> Arc<Fake> {
             let answer = Err(ProviderError::Malformed(String::from("generate is not this fake's call")));
-            Arc::new(Fake { seen: Mutex::new(Vec::new()), answer, script: Some(script) })
+            Arc::new(Fake { seen: Mutex::new(Vec::new()), answer, script: Some(script), hold: None })
+        }
+        /// INSTALLERPROVIDERCANCEL (SR442): `script` that holds after `hold` items.
+        fn holding(script: Vec<ChatDelta>, hold: usize) -> Arc<Fake> {
+            let answer = Err(ProviderError::Malformed(String::from("generate is not this fake's call")));
+            Arc::new(Fake { seen: Mutex::new(Vec::new()), answer, script: Some(script), hold: Some(hold) })
         }
         fn text(t: &str, stop: StopReason) -> Result<ChatResponse, ProviderError> {
             Ok(ChatResponse { text: t.to_string(), stop, usage: Usage::default() })
@@ -584,7 +659,8 @@ mod tests {
                 return Box::pin(async { Err(ProviderError::Unsupported(String::from("fake"))) });
             };
             self.seen.lock().unwrap().push(req.clone());
-            Box::pin(async move { Ok(Box::pin(Script(script.into())) as DeltaStream<'a>) })
+            let hold = self.hold;
+            Box::pin(async move { Ok(Box::pin(Script(script.into(), hold)) as DeltaStream<'a>) })
         }
     }
 
@@ -721,6 +797,68 @@ mod tests {
         let mut wide = "é".repeat(LIVE_BYTES);
         keep_tail(&mut wide);
         assert!(wide.len() <= LIVE_BYTES && wide.chars().all(|c| c == 'é'));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// INSTALLERPROVIDERCANCEL (SR442): a stop mid-stream lands exactly the deltas before it as REPLY-partial.md, says
+    /// `send=cancelled why=stop`, keeps the live tail and frees the pane for the next send.
+    #[test]
+    fn provider_stop_writes_the_partial_and_frees_the_pane() {
+        let (mut p, root) = laid("stop");
+        let dir = newest_landing(&p.checkout).unwrap();
+        let mut script: Vec<ChatDelta> = ["one ", "two ", "three"].iter().map(|t| ChatDelta::Text(t.to_string())).collect();
+        script.push(ChatDelta::Stop { stop: StopReason::EndTurn, usage: Usage::default() });
+
+        // Idle: nothing to stop, no wire line.
+        assert!(on_input(&mut p, "provider stop"));
+        assert_eq!(p.verdict, "nothing to stop");
+
+        // Two deltas arrive, the stream holds, the person stops it.
+        p.start_with(Fake::holding(script.clone(), 2), ChatRequest::single(Some(SYSTEM.to_string()), parts(PROMPT, LANDING)), dir.clone());
+        for _ in 0..1000 {
+            p.poll();
+            if p.live == "one two " {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(p.live, "one two ");
+        assert!(on_input(&mut p, "provider send"));
+        assert_eq!(p.verdict, "busy sending — wait for the reply");
+        assert!(on_input(&mut p, "provider stop"));
+        assert!(p.busy() || p.verdict.contains("send=cancelled"), "{}", p.verdict);
+        settle(&mut p);
+        assert!(p.verdict.starts_with("[installer] provider name=fake key=set send=cancelled why=stop reply_kb=1 ms="), "{}", p.verdict);
+        assert!(p.verdict.contains(" first_ms="), "{}", p.verdict);
+        let partial = dir.join("REPLY-partial.md");
+        assert_eq!(p.reply.as_deref(), Some(partial.as_path()));
+        let body = fs::read_to_string(&partial).unwrap();
+        assert!(body.starts_with("# Reply (stopped) — fake / fake-1\n\n_Stopped by the person after "), "{body}");
+        assert!(body.ends_with(" ms: the part that arrived, not the whole reply._\n\none two \n"), "{body}");
+        assert!(!body.contains("three"));
+        assert!(!dir.join("REPLY.md").exists(), "a stopped send never writes REPLY.md");
+        assert_eq!(p.live, "one two ", "the live tail is kept");
+        assert!(!p.busy());
+
+        // A stop before any delta: nothing arrived, nothing written.
+        p.start_with(Fake::holding(script.clone(), 0), ChatRequest::single(None, parts(PROMPT, LANDING)), dir.clone());
+        assert!(on_input(&mut p, "provider stop"));
+        settle(&mut p);
+        assert!(p.verdict.contains("send=cancelled why=stop reply_kb=0 ms="), "{}", p.verdict);
+        assert!(p.verdict.ends_with(" first_ms=0"), "{}", p.verdict);
+        assert!(!dir.join("REPLY-partial-2.md").exists());
+
+        // The busy refusal is lifted: the next send streams to its end and lands REPLY.md.
+        p.start_with(Fake::streaming(script), ChatRequest::single(None, parts(PROMPT, LANDING)), dir.clone());
+        settle(&mut p);
+        assert!(p.verdict.contains("send=ok why=-"), "{}", p.verdict);
+        assert_eq!(p.reply.as_deref(), Some(dir.join("REPLY.md").as_path()));
+        assert_eq!(p.live, "one two three");
+
+        let TetraNode::VStack(kids) = face_of(&p) else { panic!("face is a VStack") };
+        assert_eq!(kids.len(), 4);
+        let TetraNode::HStack(row) = &kids[3] else { panic!("the button row") };
+        assert!(row.iter().any(|b| matches!(b, TetraNode::Button { id, action: SMessage::ConsoleInput(c), .. } if id == "provider.stop" && c == "provider stop")), "the Stop button");
         let _ = fs::remove_dir_all(root);
     }
 
