@@ -1151,7 +1151,7 @@ fn route_present_banded(owed_now: Owed, coalesce: bool) {
         Owed::Whole => PEND_FULL.store(true, Ordering::Release),
         Owed::Nothing => {}
     }
-    if CONSOLE_PRESENT_SUSPENDED.load(Ordering::Relaxed) {
+    if irq_present_hold() || CONSOLE_PRESENT_SUSPENDED.load(Ordering::Relaxed) { // PREEMPTOFFARMWMTABLEROUTE (zenbook-ledger Z97): from IRQ context the rows owed above are HELD, never presented (`irq_present_hold`, file tail). LINE-NEUTRAL
         return;
     }
     // FBCON-PACE: the gate. Rows stay owed; the next present carries them. The clock is read only on
@@ -3667,4 +3667,34 @@ pub fn regrid_panel() -> Option<(usize, usize, usize, usize)> {
         out = Some((oc, or, nc, nr));
     });
     out
+}
+
+// ══ PREEMPTOFFARMWMTABLEROUTE (zenbook-ledger Z97; BP-cores-23, the seat's MEASURE line) — no present from IRQ context ══
+// The aarch64 timer ISR prints (`load_witness_tick`, `on_tick`), and a routed print presents into the console window
+// through `wm::present_rows_outcome_owned` -> `table()`: from IRQ context that would spin on a TABLE holder it interrupted
+// on its own core once TABLE is preempt-off (Z92 kept the desktops masked for exactly this). The ONE rule: in IRQ context
+// `route_present_banded` returns after its OWE-FIRST block, so the rows stay in `PEND` — LIVECON's deferral write, reached
+// unarmed — and the next ordinary print's take, `console_service` / `console_live_service` or `console_flush` carries
+// them. The panic road is exempt (`PANIC_MIRROR`, the belt; `panic_screen` clears `CONSOLE_WIN` first, the braces).
+
+/// PREEMPTOFFARMWMTABLEROUTE (Z97): presents held from IRQ context this boot (evidence; never reset).
+#[cfg(all(target_arch = "aarch64", feature = "desktop_firmware"))]
+pub static IRQ_HELD: AtomicU64 = AtomicU64::new(0);
+
+/// PREEMPTOFFARMWMTABLEROUTE (Z97): hold this present? IRQ context (`exceptions::in_irq`: the core's mark AND PSTATE.I),
+/// never on the panic path.
+#[cfg(all(target_arch = "aarch64", feature = "desktop_firmware"))]
+#[inline]
+fn irq_present_hold() -> bool {
+    let hold = crate::arch::exceptions::in_irq() && !PANIC_MIRROR.load(Ordering::Relaxed);
+    if hold {
+        IRQ_HELD.fetch_add(1, Ordering::Relaxed);
+    }
+    hold
+}
+/// PREEMPTOFFARMWMTABLEROUTE (Z97): x86 keeps TABLE masked (no ISR can interrupt a holder) — never held.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+#[inline(always)]
+fn irq_present_hold() -> bool {
+    false
 }

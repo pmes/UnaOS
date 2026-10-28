@@ -487,7 +487,7 @@ fn caption(cv: &mut Canvas, cx: &Cx, id: NodeId, ink: &Ink, x: f32, y: f32) {
         return;
     }
     let ty = n.attr("type").unwrap_or_default();
-    if !matches!(ty.trim().to_ascii_lowercase().as_str(), "submit" | "reset" | "button") {
+    if !layout_core::is_push_type(&ty) {
         return;
     }
     let value = n.attr("value");

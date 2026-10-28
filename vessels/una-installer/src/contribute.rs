@@ -29,7 +29,7 @@
 // `passphrase=`, `psk=` field with a value. The kernel knows no host hostname: no file class of a landing carries one.
 //
 // Wire:
-//   [installer] contribute landing=<stamp|-> branch=<contrib/landing-…|-> files=<n> redacted=<n> ok=<1|0> why=<-|review-pending|no-git|no-landing|branch-exists|unredactable|git-error>
+//   [installer] contribute landing=<stamp|-> branch=<contrib/landing-…|-> files=<n> redacted=<n> ok=<1|0> why=<-|review-pending|review-stale|no-git|no-landing|branch-exists|unredactable|git-error>
 //   [installer] contribute next: <command>                                  (three, after ok=1)
 //   [installer] contribute redact-check landing=<stamp> files=<n> redacted=<n> unredactable=<n>
 //   [installer] contribute redact file=<name> line=<n> class=<class>        (first 20, then `redact more=<n>`)
@@ -51,15 +51,21 @@
 // `contribute yes <stamp>` typed in the field (the card's confirm door: a TextField whose placeholder is the phrase,
 // routed back through `on_input`) or inline. `contribute cancel` drops it; `contribute --yes [<dir>]` is the one-shot
 // path for scripts. A landing whose branch exists, or that lies outside the repo, refuses before any review.
+//
+// CONTRIBUTEREVIEWSTALE (LEDGER SR454): the review is of the bytes on disk at that moment. Each reviewed file keeps the
+// digest of its SOURCE bytes (`FileOut::src`, git_core's own blob hasher `object::hash_object`, the one the commit's
+// blobs go through), and the confirm, on the commit thread right before the commit, lists the landing dir again by the
+// same rule (`landing_names`) and hashes it again (`Plan::stale`): a changed, missing or new file refuses with
+// `ok=0 why=review-stale` and commits nothing; the reviewed plan is already dropped, so the next `contribute` reviews again.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, channel};
 
 use bandy::SMessage;
-use git_core::Repository;
+use git_core::{HashKind, ObjectId, Repository}; // CONTRIBUTEREVIEWSTALE (SR454): HashKind, ObjectId for the source digest
 use git_core::index::{Entry, Index};
-use git_core::object::{Commit, Kind, Signature, mode};
+use git_core::object::{Commit, Kind, Signature, hash_object, mode}; // CONTRIBUTEREVIEWSTALE (SR454): hash_object
 use quartzite::tetra::{ConsoleLine, ConsoleTetra, TetraNode, TextAction};
 
 use crate::landing::verdict_name; // LANDINGSCORE (SR437): the verdict-name rule moved beside landing::verdict, body unchanged
@@ -427,6 +433,9 @@ pub struct FileOut {
     pub name: String,
     pub bytes: Vec<u8>,
     pub hits: Vec<(usize, Class)>,
+    /// CONTRIBUTEREVIEWSTALE (SR454): the digest of the SOURCE bytes (before redaction) the review read, re-checked at the
+    /// confirm by [`Plan::stale`]. A change stamp only (SHA-1 blob hash, `plan` runs without a repository), never a git id.
+    pub src: ObjectId,
 }
 
 /// A landing dir read and redacted (nothing written).
@@ -472,12 +481,37 @@ impl Plan {
         }
         v
     }
+
+    /// CONTRIBUTEREVIEWSTALE (SR454): the landing on disk no longer matches this plan: the dir is gone, its file names
+    /// (by `landing_names`, the rule `plan` listed by) differ (a new, removed or renamed file), or a file is unreadable or
+    /// its source digest differs from the reviewed one.
+    pub fn stale(&self) -> bool {
+        let Ok(names) = landing_names(&self.dir) else { return true };
+        if names.len() != self.files.len() || names.iter().zip(&self.files).any(|(n, f)| *n != f.name) {
+            return true;
+        }
+        self.files.iter().any(|f| std::fs::read(self.dir.join(&f.name)).map(|raw| hash_object(HashKind::Sha1, Kind::Blob, &raw) != f.src).unwrap_or(true))
+    }
 }
 
 /// Read every regular, non-dot file directly in `dir` (sorted; an on-disk CONTRIBUTION.md is the commit's own and
 /// BUGREPORT.md the bug report's own, both skipped) and redact it.
 pub fn plan(dir: &Path, r: &Redactor) -> Result<Plan, &'static str> {
     let name = dir.file_name().map(|n| n.to_string_lossy().into_owned()).ok_or("no-landing")?;
+    let names = landing_names(dir)?; // CONTRIBUTEREVIEWSTALE (SR454): the listing rule moved, body unchanged
+    let mut files = Vec::with_capacity(names.len());
+    for n in names {
+        let raw = std::fs::read(dir.join(&n)).map_err(|_| "no-landing")?;
+        let (bytes, hits) = r.redact(&raw);
+        let src = hash_object(HashKind::Sha1, Kind::Blob, &raw); // CONTRIBUTEREVIEWSTALE (SR454)
+        files.push(FileOut { name: n, bytes, hits, src });
+    }
+    Ok(Plan { dir: dir.to_path_buf(), name, files })
+}
+
+/// CONTRIBUTEREVIEWSTALE (SR454): the landing's file names, sorted (moved from `plan`, body unchanged; the confirm's
+/// re-check lists by the same rule).
+fn landing_names(dir: &Path) -> Result<Vec<String>, &'static str> {
     let mut names: Vec<String> = std::fs::read_dir(dir)
         .map_err(|_| "no-landing")?
         .flatten()
@@ -489,13 +523,7 @@ pub fn plan(dir: &Path, r: &Redactor) -> Result<Plan, &'static str> {
     if names.is_empty() {
         return Err("no-landing");
     }
-    let mut files = Vec::with_capacity(names.len());
-    for n in names {
-        let raw = std::fs::read(dir.join(&n)).map_err(|_| "no-landing")?;
-        let (bytes, hits) = r.redact(&raw);
-        files.push(FileOut { name: n, bytes, hits });
-    }
-    Ok(Plan { dir: dir.to_path_buf(), name, files })
+    Ok(names)
 }
 
 /// A `- <key>: <value>` line of landing.md, backticks trimmed; a value that opens with a backtick is its first
@@ -1105,7 +1133,8 @@ impl Contribute {
 
     /// CONTRIBUTEREVIEW (SR445): the confirm: the Confirm button (`stamp` None) or the phrase `contribute yes <stamp>`
     /// (the pending stamp, case ignored). The reviewed plan moves to the commit thread; nothing pending, or another
-    /// stamp, runs nothing.
+    /// stamp, runs nothing. CONTRIBUTEREVIEWSTALE (SR454): on the commit thread, right before the commit, a landing that
+    /// changed since the review (`Plan::stale`) refuses `why=review-stale` and commits nothing; the plan is dropped.
     pub fn confirm(&mut self, stamp: Option<&str>) {
         let Some(p) = self.pending.as_ref() else {
             self.verdict = String::from("nothing to confirm — press Contribute to review first");
@@ -1117,7 +1146,12 @@ impl Contribute {
         }
         let Some(p) = self.pending.take() else { return };
         let checkout = self.checkout.clone();
-        self.run(move |model| commit_plan(&checkout, &p, model, now_secs()));
+        self.run(move |model| {
+            if p.stale() {
+                return vec![line(p.stamp(), "-", 0, p.redacted(), false, "review-stale")];
+            }
+            commit_plan(&checkout, &p, model, now_secs())
+        });
     }
 
     /// CONTRIBUTEREVIEW (SR445): `contribute cancel`: the reviewed plan dropped, nothing committed.
@@ -1565,6 +1599,42 @@ mod tests {
         settle(&mut c);
         assert!(c.verdict.ends_with("ok=1 why=-") && c.verdict.contains("branch=contrib/landing-20261028-0100 files=2 "), "{}", c.verdict);
         assert!(has_branch(&checkout, "contrib/landing-20261028-0100"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// CONTRIBUTEREVIEWSTALE (SR454): a log appended between the review and the confirm refuses `review-stale` and drops
+    /// the plan; a new file does too; a fresh review then commits the landing as it now is.
+    #[test]
+    fn contribute_stale_review_refuses_then_reviews_again() {
+        let root = scratch("stale");
+        let checkout = repo_at(&root);
+        let dir = lay(&checkout, &[]);
+        let mut c = Contribute::probe_at(checkout.clone(), Some(String::from("/home/tester")));
+        assert!(on_input(&mut c, "contribute"));
+        assert!(c.verdict.ends_with("ok=0 why=review-pending"), "{}", c.verdict);
+        let mut b2 = fs::read(dir.join("boot2.log")).unwrap();
+        b2.extend_from_slice(b":: late: appended after the review -> PASS ::\n");
+        fs::write(dir.join("boot2.log"), &b2).unwrap();
+        assert!(on_input(&mut c, "contribute confirm"));
+        settle(&mut c);
+        assert!(c.verdict.starts_with("[installer] contribute landing=20261027-2340 branch=- files=0 ") && c.verdict.ends_with("ok=0 why=review-stale"), "{}", c.verdict);
+        assert!(c.pending.is_none() && c.review.is_empty() && c.next.is_empty());
+        assert!(!has_branch(&checkout, &format!("contrib/{NAME}")), "a stale review committed");
+
+        assert!(on_input(&mut c, "contribute"));
+        assert!(c.verdict.ends_with("ok=0 why=review-pending") && c.verdict.contains(" files=5 "), "{}", c.verdict);
+        fs::write(dir.join("REPLY-partial.md"), "# Reply (stopped)\n\npartial\n").unwrap();
+        assert!(on_input(&mut c, "contribute confirm"));
+        settle(&mut c);
+        assert!(c.verdict.ends_with("ok=0 why=review-stale"), "{}", c.verdict);
+        assert!(!has_branch(&checkout, &format!("contrib/{NAME}")), "a review missing a new file committed");
+
+        assert!(on_input(&mut c, "contribute"));
+        assert!(c.verdict.ends_with("ok=0 why=review-pending") && c.verdict.contains(" files=6 "), "{}", c.verdict);
+        assert!(on_input(&mut c, "contribute confirm"));
+        settle(&mut c);
+        assert!(c.verdict.ends_with("ok=1 why=-") && c.verdict.contains(&format!("branch=contrib/{NAME} files=6 ")), "{}", c.verdict);
+        assert!(has_branch(&checkout, &format!("contrib/{NAME}")));
         let _ = fs::remove_dir_all(&root);
     }
     // ── INSTALLERBUGREPORT (SR433) ──────────────────────────────────────────────────────────────
