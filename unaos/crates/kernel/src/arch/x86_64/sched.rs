@@ -3199,7 +3199,7 @@ impl JoinHandle {
     /// `self` (the Arc clone) deliberately stays bound for the whole body: it is the refcount anchor
     /// that keeps the completion semaphore alive while this task is parked in its waiter list. Do not
     /// destructure or move the Arc out before `wait()` returns.
-    pub fn join(self) {
+    #[track_caller] pub fn join(self) {
         assert!(
             self.done.wait(),
             "JoinHandle::join() must be called from a scheduled task"
@@ -3230,7 +3230,7 @@ impl JoinHandle {
     /// live until the task finishes and drops it, so a later `post()` into an empty waiter list is
     /// sound (it just bumps the count on a soon-to-be-freed semaphore); no dangle, no leak.
     #[must_use]
-    pub fn join_timeout(self, timeout_ticks: u64) -> JoinResult {
+    #[track_caller] pub fn join_timeout(self, timeout_ticks: u64) -> JoinResult {
         /// Poll cadence: how many ticks the joiner sleeps between completion checks.
         const JOIN_POLL_TICKS: u64 = 2;
 
@@ -4702,7 +4702,7 @@ impl<T> Mutex<T> {
     /// out an unbacked guard. (A sleeping mutex is meaningless off a scheduler context anyway — a
     /// boot-path caller that is not a task must not block.)
     #[cfg(not(feature = "rtpi"))]
-    pub fn lock(&self) -> MutexGuard<'_, T> {
+    #[track_caller] pub fn lock(&self) -> MutexGuard<'_, T> {
         assert!(
             self.sem.wait(),
             "Mutex::lock() called off a scheduled task (a sleeping mutex needs a scheduler context)"
@@ -4722,7 +4722,7 @@ impl<T> Mutex<T> {
     /// The `sem.wait()`/permit semantics are IDENTICAL to the knob-off path; only the surrounding
     /// bookkeeping differs, so lost-wakeup safety is exactly as before.
     #[cfg(feature = "rtpi")]
-    pub fn lock(&self) -> MutexGuard<'_, T> {
+    #[track_caller] pub fn lock(&self) -> MutexGuard<'_, T> {
         if self.sem.try_wait() {
             // Uncontested: took the permit without blocking. Record ownership; no inversion here.
             self.pi_acquire_uncontended();
@@ -5186,14 +5186,14 @@ impl<T> Channel<T> {
     }
 
     /// Send a value, blocking while the channel is full. Must be called from a scheduled task.
-    pub fn send(&self, value: T) {
+    #[track_caller] pub fn send(&self, value: T) {
         assert!(self.slots.wait(), "Channel::send() called off a scheduled task");
         self.buffer.lock().push_back(value); // mutex held only across the push (never across a wait)
         self.items.post();
     }
 
     /// Receive a value, blocking while the channel is empty. Must be called from a scheduled task.
-    pub fn recv(&self) -> T {
+    #[track_caller] pub fn recv(&self) -> T {
         assert!(self.items.wait(), "Channel::recv() called off a scheduled task");
         // A permit from `items` guarantees a value was pushed before its matching `post`, and pops
         // are serialised by the mutex, so the buffer is non-empty here.
