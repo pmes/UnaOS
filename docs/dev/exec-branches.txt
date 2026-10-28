@@ -1148,3 +1148,6 @@ refs/heads/exec-rmbp-bindnowgate   94708d143 FOLDED-BY-HAND (this commit) 2026-1
 refs/heads/exec-rmbp-lockregxcorecost   871a6b0ca IN-FLIGHT cut 2026-10-28
 refs/heads/exec-rmbp-aethercentercell   871a6b0ca IN-FLIGHT cut 2026-10-28
 refs/heads/exec-rmbp-xhciloanptpyieldpollskip   871a6b0ca IN-FLIGHT cut 2026-10-28
+refs/heads/exec-rmbp-landingscore   b16e93dd9 IN-FLIGHT cut 2026-10-28
+refs/heads/exec-rmbp-xhciloanptpyieldptptake   b16e93dd9 IN-FLIGHT cut 2026-10-28
+refs/heads/exec-rmbp-unafsflightlist   b16e93dd9 IN-FLIGHT cut 2026-10-28
