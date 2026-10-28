@@ -647,7 +647,8 @@ fn button_line_height<F: Fonts + ?Sized>(fonts: &F, family: u16, size: f32) -> f
 /// text fields `padding: 1px 2px; border: 2px inset` with one line of the
 /// 13.333px control font and the `size=20` default width; checkbox and
 /// radio 13x13 with their 3px/4px (radio 3px 3px 0 5px) margins; buttons
-/// `padding: 1px 6px; border: 2px outset` (an image input none, html.css); select a 1px border around its
+/// `padding: 1px 6px; border: 2px outset` (an image input none, a color input `border: 1px; padding: 1px 2px`,
+/// html.css); select a 1px border around its
 /// label and the arrow; textarea `padding: 2px; border: 1px` sized by
 /// rows x cols of the monospace control font.
 fn ua_control<N: DomNode>(node: &N, _tag: &str, style: &mut Style) {
@@ -677,6 +678,12 @@ fn ua_control<N: DomNode>(node: &N, _tag: &str, style: &mut Style) {
         Control::Button if node.tag().as_deref() == Some("input") && node.attr("type").is_some_and(|t| is_image_type(&t)) => {
             style.padding = rect(0.0, 0.0, 0.0, 0.0);
             style.border = rect(0.0, 0.0, 0.0, 0.0);
+        }
+        // AETHERCOLORUAEDGES (SR458): html.css `input[type="color" i] { border: 1px; padding: 1px 2px }`, not the push
+        // button's edges, so `control_intrinsic`'s 44 x 23 content keeps the 50 x 27 border box on Chromium's edges.
+        Control::Button if node.tag().as_deref() == Some("input") && node.attr("type").is_some_and(|t| t.trim().eq_ignore_ascii_case("color")) => {
+            style.padding = rect(1.0, 2.0, 1.0, 2.0);
+            style.border = rect(1.0, 1.0, 1.0, 1.0);
         }
         Control::Button => {
             style.padding = rect(1.0, 6.0, 1.0, 6.0);
@@ -717,8 +724,8 @@ fn control_intrinsic<H: Host, F: Fonts + ?Sized>(node: &H::Node, fonts: &F, font
             let t = attr("type").unwrap_or_default();
             let adv = |s: &str| text_advance(fonts, s, font.0, font.1);
             let line = button_line_height(fonts, font.0, font.1);
-            // ua_control's Button edges (padding 1px 6px + border 2px): the border-box rules below subtract them.
-            let (edge_w, edge_h) = (16.0_f32, 6.0_f32);
+            // ua_control's Button edges (padding 1px 6px + border 2px, 16 wide): the file rule below subtracts them.
+            let edge_w = 16.0_f32;
             match t.trim().to_ascii_lowercase().as_str() {
                 // The decoded image's size when the host has it; else a button labelled by Chromium's
                 // HTMLInputElement::AltText: alt, else value when alt is missing, an empty result "Submit"
@@ -734,8 +741,9 @@ fn control_intrinsic<H: Host, F: Fonts + ?Sized>(node: &H::Node, fonts: &F, font
                     let (button, status) = file_label(attr("multiple").is_some());
                     Some(((34.0 * adv("0") - edge_w).max(adv(button) + 4.0 + adv(status)), line))
                 }
-                // html.css: a fixed 50 x 27 swatch border box, font-independent.
-                "color" => Some((50.0 - edge_w, 27.0 - edge_h)),
+                // html.css: a fixed 50 x 27 swatch border box, font-independent. AETHERCOLORUAEDGES (SR458): over the color
+                // arm's own edges in ua_control (border 1px + padding 1px 2px = 6 x 4), so the content is html.css's 44 x 23.
+                "color" => Some((50.0 - 6.0, 27.0 - 4.0)),
                 // AETHERPUSHTRIM (SR440): the push types through the ONE `is_push_type` predicate (a padded or
                 // mixed-case type is the same push button); anything else keeps the Submit stand-in.
                 _ => {

@@ -83,11 +83,18 @@ fn color_intrinsic_fixed() {
     let doc = page(vec![
         lone("c", &[("type", "color")]),
         lone("c2", &[("type", "color"), ("style", "font-size: 30px")]),
+        // AETHERCOLORUAEDGES (SR458): html.css's color edges (border 1px, padding 1px 2px), not the push button's.
+        lone("c0", &[("type", "color"), ("style", "padding: 0; border: 0")]),
+        lone("cu", &[("type", " COLOR ")]),
+        lone("cx", &[("type", "color"), ("style", "padding: 1px 6px; border: 2px solid")]),
     ]);
     let tree = lay(&doc, 800.0, 600.0);
     let b = |id: &str| box_of(&tree, &doc.by_id(id));
     assert_eq!((b("c").2, b("c").3), (50.0, 27.0), "the UA swatch is 50 x 27");
     assert_eq!((b("c2").2, b("c2").3), (50.0, 27.0), "the swatch does not follow the font");
+    assert_eq!((b("c0").2, b("c0").3), (44.0, 23.0), "the content is html.css's 44 x 23 (edges 6 x 4)");
+    assert_eq!((b("cu").2, b("cu").3), (50.0, 27.0), "the type is trimmed and case-insensitive");
+    assert_eq!((b("cx").2, b("cx").3), (60.0, 29.0), "author padding and border still apply");
 }
 
 #[test]
