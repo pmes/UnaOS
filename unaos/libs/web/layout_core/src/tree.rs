@@ -1072,12 +1072,14 @@ fn place_narrow_blocks<H: Host>(tree: &mut LayoutTree<H>, id: taffy::NodeId, ali
 /// `align=center` is -webkit-center, so a nested table or a definite-width block centres in the cell, and plain
 /// text-align leaves it at the start). `collapse::is_block_container` keeps refusing table parts: it is margin
 /// collapsing's predicate too, and margins do not collapse through a cell. An author flex / grid cell and an
-/// all-inline cell (a row, the inline formatting context) are not.
+/// all-inline cell (a row, the inline formatting context) are not. AETHERCENTERCAPTION (SR446): a caption laid out as
+/// a column is one too (CSS 2.2 §17.4: a table-caption is a block container; HTML rendering §15.3.3 lists caption
+/// among the align= elements), so its narrow blocks follow the same -webkit-center / plain-center rule.
 fn cell_block_container<H: Host>(tree: &LayoutTree<H>, id: taffy::NodeId, st: &Style) -> bool {
     st.display == Display::Flex
         && st.flex_direction == FlexDirection::Column
         && tree.paint_map.get(&id).and_then(|p| p.flex_container) != Some(true)
-        && tree.node_map.get(&id).and_then(|n| n.tag()).is_some_and(|t| matches!(t.as_str(), "td" | "th"))
+        && tree.node_map.get(&id).and_then(|n| n.tag()).is_some_and(|t| matches!(t.as_str(), "td" | "th" | "caption"))
 }
 
 /// Block-level by the cascade (the author's outer display), else by tag; anonymous boxes are block boxes.
