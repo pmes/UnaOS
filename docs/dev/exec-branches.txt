@@ -1188,3 +1188,8 @@ refs/heads/exec-rmbp-preemptoffarmwmtableroute   169080ce5 FOLDED-BY-HAND (this 
 refs/heads/exec-rmbp-preemptoffx86sleepcheck   e65af1532 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-xhciloanptpyieldkatloopdrop   117668d5d FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-retiredrainkat   3233f32fe FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-gen7parkunwind   d89340213 IN-FLIGHT cut 2026-10-28
+refs/heads/exec-rmbp-retiredraindeathkat   d89340213 IN-FLIGHT cut 2026-10-28
+refs/heads/exec-rmbp-preemptoffarmcastsnow   d89340213 IN-FLIGHT cut 2026-10-28
+refs/heads/exec-rmbp-xhciloanptpyieldptpmarkmany   d89340213 IN-FLIGHT cut 2026-10-28
+refs/heads/exec-rmbp-aetherimageinputbox   d89340213 IN-FLIGHT cut 2026-10-28
