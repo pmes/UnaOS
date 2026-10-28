@@ -27448,10 +27448,10 @@ static COMPGATE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool
 
 /// COMPGATE — which core holds [`COMPGATE`]. `usize::MAX` = free. Written by the acquire winner and
 /// cleared before the release store, so a reader that sees a core sees a live holder or a stale one,
-/// never a wrong one. Read by the wait arm's futility test.
+/// never a wrong one. Read by the wait arm's futility test, and by `comp_gate_held_here` (Z114).
 #[cfg(not(target_arch = "x86_64"))]
 static COMPGATE_HOLDER_CORE: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(usize::MAX);
+    core::sync::atomic::AtomicUsize::new(usize::MAX); #[cfg(all(target_arch = "aarch64", feature = "desktop_firmware", feature = "witness"))] pub(crate) fn comp_gate_held_here() -> bool { COMPGATE_HOLDER_CORE.load(core::sync::atomic::Ordering::Relaxed) == crate::arch::sched::meter_current_cpu() } // PREEMPTOFFARMCASTSNOWINPASSGUARD (zenbook-ledger Z114): `comp_gate_held_here` = THIS core holds COMPGATE (the holder is stored after the CAS win and cleared before the release, every `composite_once` between, so a same-core read inside the pass is exact; a cross-core reader is never asked). Read by `arch/aarch64/sched.rs` `preemptoff::nest_wrap` so `casts_now_nest` records in-pass takes only; cfg = its sole caller's. LINE-NEUTRAL fold, code first.
 
 /// COMPGATE — when the current held epoch began, in [`crate::arch::now_cycles`] units.
 #[cfg(not(target_arch = "x86_64"))]
