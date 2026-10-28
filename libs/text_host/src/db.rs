@@ -652,45 +652,79 @@ mod tests {
         assert_eq!(db.resolve_family("Helvetica Neue"), None, "a non-equivalent substitute is refused");
         assert_eq!(db.resolve_family("NoSuchFamily"), None);
         // fc-match -s sans-serif is the oracle for the fallback order (skipped without fontconfig's tools).
-        let Ok(out) = std::process::Command::new("fc-match")
+        let Some((of, wd)) = fallback_vs_fc(db, db.fallback_order()) else { return };
+        assert_eq!(of, wd, "family order (typographic family) of the first fc-match -s sans-serif faces");
+    }
+
+    // AETHERFONTDBORACLE (SR430): the fc-match oracle keyed on the family both sides agree on. fontconfig lists a
+    // face's typographic family (name ID 16) first and the legacy family (ID 1) second, so a static cut
+    // ("Inter Medium", ID 16 "Inter") is grouped under its typographic family; FaceInfo.families[0] is ID 1.
+    /// fontconfig's family[0] for a face: name ID 16 (English first) when present, else name ID 1; the face's
+    /// `families[0]` when it does not load.
+    fn typographic_family(f: &FaceInfo) -> String {
+        crate::load_face(f)
+            .and_then(|face| {
+                font_core::name::values(&face.font, font_core::name::TYPOGRAPHIC_FAMILY)
+                    .into_iter()
+                    .next()
+                    .or_else(|| font_core::name::family(&face.font))
+            })
+            .or_else(|| f.families.first().cloned())
+            .unwrap_or_default()
+    }
+
+    /// The fallback family order `ours` against `fc-match -s sans-serif`: (ours' first families, fc-match's first
+    /// families), both keyed by [`typographic_family`] and consecutive-deduped, over the first six fc-match faces
+    /// this database indexes. None without fontconfig's tools.
+    fn fallback_vs_fc(db: &FontDb, ours: &[usize]) -> Option<(Vec<String>, Vec<String>)> {
+        let out = std::process::Command::new("fc-match")
             .args(["-s", "--format", "%{file}#%{index}\\n", "sans-serif"])
             .output()
-        else {
-            return;
-        };
-        let want: Vec<String> = String::from_utf8_lossy(&out.stdout)
+            .ok()?;
+        let key = |f: &FaceInfo| format!("{}#{}", f.path.display(), f.index);
+        let want: Vec<usize> = String::from_utf8_lossy(&out.stdout)
             .lines()
-            .filter(|l| db.faces.iter().any(|f| format!("{}#{}", f.path.display(), f.index) == *l))
-            .map(str::to_string)
+            .filter_map(|l| db.faces.iter().position(|f| key(f) == l))
             .collect();
-        let ours: Vec<String> = db
-            .fallback_order()
-            .iter()
-            .map(|&i| format!("{}#{}", db.faces[i].path.display(), db.faces[i].index))
-            .collect();
-        let n = 6.min(want.len());
-        let fam = |s: &str| {
-            db.faces
-                .iter()
-                .find(|f| format!("{}#{}", f.path.display(), f.index) == s)
-                .map(|f| f.families[0].clone())
-                .unwrap_or_default()
-        };
-        let wf: Vec<String> = want.iter().take(n).map(|s| fam(s)).collect();
-        let mut of: Vec<String> = Vec::new();
-        for s in &ours {
-            let f = fam(s);
-            if of.last() != Some(&f) {
-                of.push(f);
-            }
-        }
         let mut wd: Vec<String> = Vec::new();
-        for f in wf {
+        for &i in want.iter().take(6) {
+            let f = typographic_family(&db.faces[i]);
             if wd.last() != Some(&f) {
                 wd.push(f);
             }
         }
-        assert_eq!(&of[..wd.len()], &wd[..], "family order of the first {n} fc-match -s sans-serif faces");
+        let mut of: Vec<String> = Vec::new();
+        for &i in ours {
+            if of.len() == wd.len() {
+                break;
+            }
+            let f = typographic_family(&db.faces[i]);
+            if of.last() != Some(&f) {
+                of.push(f);
+            }
+        }
+        Some((of, wd))
+    }
+
+    /// The oracle still fails on a wrong order: the real fallback order with the second family's first face moved
+    /// to the front is rejected by the same comparison (skipped without faces, fontconfig's tools or two families).
+    #[test]
+    fn fontdb_oracle_rejects_swapped_order() {
+        let db = db();
+        if db.faces.is_empty() {
+            return;
+        }
+        let order = db.fallback_order();
+        let Some((_, wd)) = fallback_vs_fc(db, order) else { return };
+        if wd.len() < 2 {
+            return;
+        }
+        let first = typographic_family(&db.faces[order[0]]);
+        let Some(k) = order.iter().position(|&i| typographic_family(&db.faces[i]) != first) else { return };
+        let mut swapped = vec![order[k]];
+        swapped.extend(order.iter().copied().filter(|&i| i != order[k]));
+        let Some((of, wd)) = fallback_vs_fc(db, &swapped) else { return };
+        assert_ne!(of, wd, "a swapped fallback order must fail the fc-match oracle");
     }
 
     // AETHER-FONTDB-LAZY (SR419): header-only discovery.
