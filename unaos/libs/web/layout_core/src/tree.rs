@@ -706,12 +706,6 @@ fn control_intrinsic<H: Host, F: Fonts + ?Sized>(node: &H::Node, fonts: &F, font
             // calls too. AETHERCONTROLINTRINSIC (SR448): image / file / color size by their own measured rules
             // (Chromium), each in the element's font through the same `text_advance` / `button_line_height`.
             let t = attr("type").unwrap_or_default();
-            let value = attr("value");
-            let push = is_push_type(&t);
-            let label = button_label(if push { t.as_str() } else { "submit" }, value.as_deref());
-            Some((text_advance(fonts, &label, font.0, font.1), button_line_height(fonts, font.0, font.1)))
-}
-
             let adv = |s: &str| text_advance(fonts, s, font.0, font.1);
             let line = button_line_height(fonts, font.0, font.1);
             // ua_control's Button edges (padding 1px 6px + border 2px): the border-box rules below subtract them.
@@ -733,9 +727,12 @@ fn control_intrinsic<H: Host, F: Fonts + ?Sized>(node: &H::Node, fonts: &F, font
                 }
                 // html.css: a fixed 50 x 27 swatch border box, font-independent.
                 "color" => Some((50.0 - edge_w, 27.0 - edge_h)),
+                // AETHERPUSHTRIM (SR440): the push types through the ONE `is_push_type` predicate (a padded or
+                // mixed-case type is the same push button); anything else keeps the Submit stand-in.
                 _ => {
                     let value = attr("value");
-                    Some((adv(&button_label(t.as_str(), value.as_deref())), line))
+                    let push = is_push_type(&t);
+                    Some((adv(&button_label(if push { t.as_str() } else { "submit" }, value.as_deref())), line))
                 }
             }
         }
