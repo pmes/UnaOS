@@ -1,4 +1,4 @@
-// CHARTER: Facet — shared-core face (Images; FACETEDIT, rmbp-ledger B900)
+// CHARTER: Kernel — wm (the editor window's paint and its hit table over the glass kit, video/draw.rs; the cores are named by facetedit.rs; FACETEDIT, rmbp-ledger B900)
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 The Architect & Una
 //
