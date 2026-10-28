@@ -12,9 +12,9 @@
 // them.
 //
 // The key: Vein never stores one (the preference names an env var; Holocron has custody). A key typed here is HELD in
-// this process only — never written, never printed — and answers exactly the env var `ProviderConfig::key_env` names,
-// through the slot's own env closure. The key field is secret (LANDINGSECRETFIELD SR432: bullets, `input ignored` prints
-// bytes only), and still a raw line is this face's only when the Key button armed it or it has a provider key's shape
+// this process — never printed — and answers exactly the env var `ProviderConfig::key_env` names, through the slot's own
+// env closure, until Save writes it to Holocron (INSTALLERPROVIDERHOLOCRON SR439, below). The key field is secret
+// (LANDINGSECRETFIELD SR432: bullets, `input ignored` prints bytes only), and still a raw line is this face's only when the Key button armed it or it has a provider key's shape
 // (`sk-ant-`, `AIza`): defence in depth, so a pasted key never reaches the landing face as a card password (main routes card, provider,
 // landing).
 //
@@ -26,8 +26,17 @@
 // Console. REPLY.md is written once at the end by the generate path's own lines, so the file is byte-identical.
 // `first_ms` is the time to the first delta (0 = none arrived: refused, `send=-`, or the generate fallback).
 //
+// INSTALLERPROVIDERHOLOCRON (LEDGER SR439): `provider save` (the Save button) puts the held key into Holocron under the
+// ONE name Vein reads (`keysource::VEIN_NS` / `CLAUDE_API_KEY`, kind `api-key`, label `Claude`: the shape `holocron put`
+// and Vein's own e2e test use) through Holocron's own client (`Client::connect` + `Client::call`, SecretPut overwrites),
+// so the installer and Vein share one custody and the key is never retyped. An OK put wipes and clears the held key; the
+// probe then reads key=set FROM HOLOCRON (the slot asks it whenever no key is held). No socket, a dead socket or a
+// refusing Holocron keeps the key held for the session (the fallback). Vein reads no Holocron name for Gemini (its slot
+// asks only for Claude's api-key mode), so a Gemini save refuses `no-name` (VEIN-GEMINI-HOLOCRON owed).
+//
 // Wire:
 //   [installer] provider name=<claude|gemini|claudecode|none> key=<set|missing> send=<ok|refused|-> why=<-|no-key|no-landing|network|provider-error> reply_kb=<n> ms=<n> first_ms=<n>
+//   [installer] provider save name=<claude|gemini|claudecode|none> ok=<1|0> why=<-|no-key|no-name|no-holocron|holocron-error> status=<-|word>
 
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -41,10 +50,11 @@ use futures_core::Stream;
 use bandy::{PrefValue, PrincipiaCommand, SMessage};
 use gneiss_pal::api::provider::{CLAUDE_DEFAULT_MODEL, GEMINI_DEFAULT_MODEL};
 use gneiss_pal::api::{
-    ChatDelta, ChatRequest, DeltaStream, ModelProvider, PREF_NS, Part, ProviderConfig, ProviderError, ProviderKind, StopReason, Thread,
-    menu_choice_prefs,
+    AuthMode, ChatDelta, ChatRequest, DeltaStream, ModelProvider, PREF_NS, Part, ProviderConfig, ProviderError, ProviderKind, StopReason,
+    Thread, menu_choice_prefs,
 };
-use holocron::holocron_core::keysource::KeySource;
+use holocron::holocron_core::keysource::{CLAUDE_API_KEY, KeySource, VEIN_NS};
+use holocron::holocron_core::wire::{Request, status};
 use quartzite::tetra::{ConsoleLine, ConsoleTetra, TetraNode, TextAction};
 use vein::provider::{ProviderSlot, is_vein_pref_change};
 
@@ -96,6 +106,12 @@ pub fn line(name: &str, key_set: bool, send: &str, why: &str, reply_kb: u64, ms:
         "[installer] provider name={name} key={} send={send} why={why} reply_kb={reply_kb} ms={ms} first_ms={first_ms}",
         if key_set { "set" } else { "missing" }
     )
+}
+
+/// INSTALLERPROVIDERHOLOCRON (SR439): `[installer] provider save name= ok= why= status=` (`status` is Holocron's
+/// `wire::status::word`, `-` when no reply was read).
+pub fn save_line(name: &str, ok: bool, why: &str, status: &str) -> String {
+    format!("[installer] provider save name={name} ok={} why={why} status={status}", if ok { 1 } else { 0 })
 }
 
 fn say(l: String) -> String {
@@ -216,8 +232,10 @@ pub struct Provider {
     pub arm_key: bool,
     /// The streaming reply's last lines (bounded by `keep_tail`), cleared by the next send.
     pub live: String,
-    /// The host's env and Holocron answer for the key too (false in tests).
+    /// The host's env answers for the key too (false in tests).
     host_env: bool,
+    /// Holocron's bus socket (`holocron::client::default_socket`; None in tests unless a fake is spawned).
+    sock: Option<PathBuf>,
     key: Option<String>,
     rx: Option<Receiver<Msg>>,
 }
@@ -227,16 +245,16 @@ impl Provider {
     pub fn probe_in(checkout: Option<PathBuf>) -> Self {
         let prefs = principia::default_prefs_path();
         let home = prefs.parent().map(Path::to_path_buf).unwrap_or_default();
-        Self::with(checkout.unwrap_or_else(crate::landing::default_checkout), home, prefs, true)
+        Self::with(checkout.unwrap_or_else(crate::landing::default_checkout), home, prefs, true, holocron::client::default_socket())
     }
 
     /// A HOME of its own, no host env, no Holocron (tests).
     pub fn probe_at(checkout: PathBuf, home: PathBuf) -> Self {
         let prefs = principia::Principia::with_home(&home).prefs().path().to_path_buf();
-        Self::with(checkout, home, prefs, false)
+        Self::with(checkout, home, prefs, false, None)
     }
 
-    fn with(checkout: PathBuf, home: PathBuf, prefs: PathBuf, host_env: bool) -> Self {
+    fn with(checkout: PathBuf, home: PathBuf, prefs: PathBuf, host_env: bool, sock: Option<PathBuf>) -> Self {
         Provider {
             checkout,
             home,
@@ -246,6 +264,7 @@ impl Provider {
             arm_key: false,
             live: String::new(),
             host_env,
+            sock,
             key: None,
             rx: None,
         }
@@ -268,13 +287,8 @@ impl Provider {
             _ => None,
         };
         let held = self.key.is_some();
-        ProviderSlot::from_lookup_with(get, env, || {
-            if held || !host_env {
-                KeySource::Fallback
-            } else {
-                holocron::client::claude_api_key(holocron::client::default_socket().as_deref())
-            }
-        })
+        let sock = self.sock.as_deref();
+        ProviderSlot::from_lookup_with(get, env, || if held { KeySource::Fallback } else { holocron::client::claude_api_key(sock) })
     }
 
     /// The configured provider's name (`none` when the preferences do not parse).
@@ -353,6 +367,44 @@ impl Provider {
         self.verdict = say(self.status());
     }
 
+    /// INSTALLERPROVIDERHOLOCRON (SR439): `provider save`: the held key into Holocron as Vein's `vein/claude.api_key`
+    /// (one SecretPut through `holocron::client::Client::call`), wiped and cleared on OK; refused in order `no-name` (the
+    /// config is not Claude's api-key mode: Vein reads no other Holocron name), `no-key`, `no-holocron` (no socket or no
+    /// answer on it), `holocron-error` (an io failure, or Holocron's status by its word). Never prints the key.
+    fn save(&mut self) {
+        let name = self.name();
+        let store = principia::PrefStore::load(&self.prefs).ok();
+        let cfg = ProviderConfig::from_prefs(|k| store.as_ref().and_then(|s| s.get(PREF_NS, k))).ok();
+        let claude_key = cfg.is_some_and(|c| matches!((&c.kind, &c.auth), (ProviderKind::Claude, AuthMode::ApiKeyEnv(_))));
+        let refuse = |why: &str| save_line(&name, false, why, "-");
+        let l = if !claude_key {
+            refuse("no-name")
+        } else if self.key.is_none() {
+            refuse("no-key")
+        } else {
+            match self.sock.as_deref().map(holocron::client::Client::connect) {
+                None | Some(Err(_)) => refuse("no-holocron"),
+                Some(Ok(mut c)) => {
+                    let data = self.key.as_deref().unwrap_or_default().as_bytes().to_vec();
+                    let put = Request::Put { ns: VEIN_NS.into(), name: CLAUDE_API_KEY.into(), kind: "api-key".into(), label: "Claude".into(), data };
+                    match c.call(&put) {
+                        Err(_) => refuse("holocron-error"),
+                        Ok(r) if r.status != status::OK => save_line(&name, false, "holocron-error", status::word(r.status)),
+                        Ok(_) => {
+                            if let Some(k) = self.key.take() {
+                                let mut b = k.into_bytes();
+                                holocron::holocron_core::zero::wipe(&mut b);
+                            }
+                            self.arm_key = false;
+                            save_line(&name, true, "-", status::word(status::OK))
+                        }
+                    }
+                }
+            }
+        };
+        self.verdict = say(l);
+    }
+
     /// `provider send [<landing dir>]`: the slot's provider, PROMPT.md + landing.md under [`SYSTEM`], on its thread.
     pub fn start_send(&mut self, arg: &str) {
         if self.busy() {
@@ -415,7 +467,7 @@ pub fn face_of(p: &Provider) -> TetraNode {
         None => lines.push(line("warn", String::from("no landing yet — Read a card first"))),
     }
     if p.arm_key {
-        lines.push(line("warn", String::from("type the key in the field: held for this session, never written, never shown")));
+        lines.push(line("warn", String::from("type the key in the field: held for this session, never shown; Save writes it to Holocron")));
     }
     if let Some(r) = &p.reply {
         lines.push(line("info", format!("reply in {}", r.display())));
@@ -429,13 +481,13 @@ pub fn face_of(p: &Provider) -> TetraNode {
             button("provider.pick.claude", "Claude", "provider pick claude"),
             button("provider.pick.gemini", "Gemini", "provider pick gemini"),
         ]),
-        TetraNode::TextField { id: String::from("provider.key"), placeholder: String::from("API key (held for this session, never written)"), action: TextAction::ConsoleInput, secret: true }, // LANDINGSECRETFIELD (SR432): drawn as bullets
-        TetraNode::HStack(vec![button("provider.key", "Key", "provider key"), button("provider.send", "Send", "provider send")]),
+        TetraNode::TextField { id: String::from("provider.key"), placeholder: String::from("API key (held for this session; Save keeps it in Holocron)"), action: TextAction::ConsoleInput, secret: true }, // LANDINGSECRETFIELD (SR432): drawn as bullets
+        TetraNode::HStack(vec![button("provider.key", "Key", "provider key"), button("provider.save", "Save", "provider save"), button("provider.send", "Send", "provider send")]), // INSTALLERPROVIDERHOLOCRON (SR439): Save
     ])
 }
 
-/// Route one `SMessage::ConsoleInput` line: `provider pick <claude|gemini>`, `provider key [<key>]`, `provider send
-/// [<landing dir>]`, `provider status`, or a raw line the Key button armed / with a key's shape (the key). False = not
+/// Route one `SMessage::ConsoleInput` line: `provider pick <claude|gemini>`, `provider key [<key>]`, `provider save`,
+/// `provider send [<landing dir>]`, `provider status`, or a raw line the Key button armed / with a key's shape (the key). False = not
 /// the provider face's line.
 pub fn on_input(p: &mut Provider, line: &str) -> bool {
     p.poll();
@@ -459,10 +511,11 @@ pub fn on_input(p: &mut Provider, line: &str) -> bool {
             p.verdict = String::from("type the key in the field");
         }
         "key" => p.hold_key(arg),
+        "save" if !p.busy() => p.save(), // INSTALLERPROVIDERHOLOCRON (SR439)
         "send" if !p.busy() => p.start_send(arg),
         "status" => p.verdict = say(p.status()),
         _ if p.busy() => p.verdict = String::from("busy sending — wait for the reply"),
-        _ => p.verdict = format!("unknown provider verb `{verb}` (pick / key / send / status)"),
+        _ => p.verdict = format!("unknown provider verb `{verb}` (pick / key / save / send / status)"),
     }
     true
 }
@@ -473,8 +526,10 @@ pub fn on_input(p: &mut Provider, line: &str) -> bool {
 mod tests {
     use super::*;
     use gneiss_pal::api::{BoxFuture, ChatResponse, DeltaStream, Usage};
-    use std::collections::VecDeque;
+    use std::collections::{HashMap, VecDeque};
     use std::fs;
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixListener;
     use std::sync::Mutex;
 
     const PROMPT: &str = "# Landing prompt — docs/dev/evidence/landing-20261027-2340\n\n1. Read `CLAUDE.md` first.\n";
@@ -758,5 +813,147 @@ mod tests {
             }
         }
         let _ = fs::remove_dir_all(root);
+    }
+
+    /// INSTALLERPROVIDERHOLOCRON (SR439): a fake Holocron on `sock` (SR427's fake-bus shape: a listener the test spawns,
+    /// never the real store): every frame decoded by holocron_core's `Request::decode` and recorded; a Put answers
+    /// `put_status` (its data kept on OK), a Get answers the kept data or NOT_FOUND, anything else NO_VERB.
+    fn fake_holocron(sock: &Path, put_status: i32) -> Arc<Mutex<Vec<Request>>> {
+        let listener = UnixListener::bind(sock).unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        std::thread::spawn(move || {
+            let mut kept: HashMap<(String, String), Vec<u8>> = HashMap::new();
+            for st in listener.incoming() {
+                let Ok(mut st) = st else { return };
+                loop {
+                    let mut len = [0u8; 4];
+                    if st.read_exact(&mut len).is_err() {
+                        break;
+                    }
+                    let mut frame = vec![0u8; u32::from_le_bytes(len) as usize];
+                    if st.read_exact(&mut frame).is_err() || frame.is_empty() {
+                        break;
+                    }
+                    let (code, body) = match Request::decode(frame[0], &frame[1..]) {
+                        Err(code) => (code, Vec::new()),
+                        Ok(req) => {
+                            let answer = match &req {
+                                Request::Put { ns, name, data, .. } => {
+                                    if put_status == status::OK {
+                                        kept.insert((ns.clone(), name.clone()), data.clone());
+                                    }
+                                    (put_status, Vec::new())
+                                }
+                                Request::Get { ns, name } => match kept.get(&(ns.clone(), name.clone())) {
+                                    Some(v) => (status::OK, v.clone()),
+                                    None => (status::NOT_FOUND, Vec::new()),
+                                },
+                                _ => (status::NO_VERB, Vec::new()),
+                            };
+                            log.lock().unwrap().push(req);
+                            answer
+                        }
+                    };
+                    let mut out = ((4 + body.len()) as u32).to_le_bytes().to_vec();
+                    out.extend_from_slice(&code.to_le_bytes());
+                    out.extend_from_slice(&body);
+                    if st.write_all(&out).is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+        seen
+    }
+
+    fn puts(seen: &Arc<Mutex<Vec<Request>>>) -> Vec<Request> {
+        seen.lock().unwrap().iter().filter(|r| matches!(r, Request::Put { .. })).cloned().collect()
+    }
+
+    #[test]
+    fn provider_save_writes_holocron_under_veins_name() {
+        let (mut p, root) = laid("save");
+        let mut shown = Vec::new();
+
+        // No key held: refused before any socket is opened.
+        let seen = fake_holocron(&root.join("h.sock"), status::OK);
+        p.sock = Some(root.join("h.sock"));
+        assert!(on_input(&mut p, "provider save"));
+        assert_eq!(p.verdict, "[installer] provider save name=claude ok=0 why=no-key status=-");
+        assert!(puts(&seen).is_empty());
+
+        // The held key goes in as Vein's name, the slot is cleared, and the probe reads the key back FROM HOLOCRON.
+        assert!(on_input(&mut p, &format!("provider key {}", SECRETS[1])));
+        shown.push(p.verdict.clone());
+        assert!(on_input(&mut p, "provider save"));
+        assert_eq!(p.verdict, "[installer] provider save name=claude ok=1 why=- status=ok");
+        shown.push(p.verdict.clone());
+        let put = puts(&seen);
+        assert_eq!(put.len(), 1, "ONE SecretPut per save");
+        assert!(
+            matches!(&put[0], Request::Put { ns, name, kind, label, data }
+                if ns == "vein" && name == "claude.api_key" && kind == "api-key" && label == "Claude" && data.as_slice() == SECRETS[1].as_bytes()),
+            "the put carries Vein's name and the key"
+        );
+        assert!(p.key.is_none(), "the held key is cleared after an OK save");
+        assert!(p.status().contains("name=claude key=set"), "{}", p.status());
+        shown.push(p.status());
+        shown.extend(face_texts(&p));
+
+        // A locked Holocron refuses by its word; the key stays held (the fallback).
+        let locked = fake_holocron(&root.join("l.sock"), status::LOCKED);
+        p.sock = Some(root.join("l.sock"));
+        assert!(on_input(&mut p, &format!("provider key {}", SECRETS[2])));
+        assert!(on_input(&mut p, "provider save"));
+        assert_eq!(p.verdict, "[installer] provider save name=claude ok=0 why=holocron-error status=locked");
+        shown.push(p.verdict.clone());
+        assert_eq!(puts(&locked).len(), 1);
+        assert!(p.key.is_some(), "a refused save keeps the key for the session");
+        assert!(p.status().contains("key=set"), "{}", p.status());
+
+        // No one on the socket: no-holocron, key still held.
+        p.sock = Some(root.join("nobody.sock"));
+        assert!(on_input(&mut p, "provider save"));
+        assert_eq!(p.verdict, "[installer] provider save name=claude ok=0 why=no-holocron status=-");
+        assert!(p.key.is_some());
+        p.sock = None;
+        assert!(on_input(&mut p, "provider save"));
+        assert_eq!(p.verdict, "[installer] provider save name=claude ok=0 why=no-holocron status=-");
+
+        // Gemini: Vein reads no Holocron name for it, so nothing is put.
+        p.sock = Some(root.join("h.sock"));
+        assert!(on_input(&mut p, "provider pick gemini"));
+        assert!(on_input(&mut p, &format!("provider key {}", SECRETS[0])));
+        assert!(on_input(&mut p, "provider save"));
+        assert_eq!(p.verdict, "[installer] provider save name=gemini ok=0 why=no-name status=-");
+        assert_eq!(puts(&seen).len(), 1, "no put for gemini");
+        shown.push(p.verdict.clone());
+        shown.extend(face_texts(&p));
+
+        let mut files = Vec::new();
+        files_under(&root, &mut files);
+        for f in files.iter().filter(|f| f.is_file()) {
+            shown.push(String::from_utf8_lossy(&fs::read(f).unwrap_or_default()).into_owned());
+        }
+        for s in SECRETS {
+            for text in &shown {
+                assert!(!text.contains(s), "the key appeared: {text}");
+            }
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Every Console line of the face, its Save button's presence checked, and the face's Debug.
+    fn face_texts(p: &Provider) -> Vec<String> {
+        let face = face_of(p);
+        let TetraNode::VStack(kids) = &face else { panic!("face is a VStack") };
+        assert_eq!(kids.len(), 4);
+        let TetraNode::Console(con) = &kids[0] else { panic!("status lines") };
+        let TetraNode::HStack(row) = &kids[3] else { panic!("the button row") };
+        assert!(row.iter().any(|b| matches!(b, TetraNode::Button { id, .. } if id == "provider.save")), "the Save button");
+        let mut out: Vec<String> = con.lines.iter().map(|l| l.text.clone()).collect();
+        out.push(format!("{face:?}"));
+        out
     }
 }
