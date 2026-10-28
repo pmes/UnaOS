@@ -804,7 +804,7 @@ fn with_unafs_attempt<R>(f: &mut impl FnMut(&mut KernelUnaFS) -> R, arm: bool) -
             // UNAFSBIND: the lazy bind DISCOVERS its handle (Global first and unchanged; probes only
             // on proven global absence) instead of assuming `Global` — see [`bind_mount`].
             match bind_in_hold() {
-                Ok(m) => { #[cfg(all(target_arch = "x86_64", feature = "wc"))] splitread::note_bound(m.handle); *guard = Some(m) } // HIDSTALL2 (B670): a new bound mount = a new epoch; a split read planned on the old one re-runs under the hold (LINE-NEUTRAL append, before this comment)
+                Ok(m) => { #[cfg(all(target_arch = "x86_64", feature = "wc"))] splitread::note_bound(m.handle); #[cfg(all(target_arch = "aarch64", feature = "baremetal"))] { readarm::note_bound(m.handle); } *guard = Some(m) } // HIDSTALL2 (B670): a new bound mount = a new epoch; a split read planned on the old one re-runs under the hold (LINE-NEUTRAL append, before this comment)
                 Err(e) => {
                     // UNAFSTXN: the MOUNT itself reads sectors (`locate`, the superblock, the
                     // reclaim drain), so contention can defeat it before the closure ever runs.
@@ -3621,7 +3621,7 @@ fn kb_bind_root(handle: block::BlockHandle, key: ::unafs::VolumeKey) -> Result<b
         }
         if let Some(m) = fs.take() {
             #[cfg(all(target_arch = "x86_64", feature = "wc"))]
-            splitread::note_bound(handle);
+            splitread::note_bound(handle); #[cfg(all(target_arch = "aarch64", feature = "baremetal"))] { readarm::note_bound(handle); }
             *g = Some(BoundMount { handle, fs: m });
         }
         Some(true)
@@ -4579,7 +4579,7 @@ fn prebind_now() -> Result<(), MountError> {
                 mount_poison_check(&mut *g);
                 if g.is_none() {
                     #[cfg(all(target_arch = "x86_64", feature = "wc"))]
-                    splitread::note_bound(m.handle);
+                    splitread::note_bound(m.handle); #[cfg(all(target_arch = "aarch64", feature = "baremetal"))] { readarm::note_bound(m.handle); }
                     *g = Some(m);
                     None
                 } else {
@@ -5355,7 +5355,7 @@ pub mod lockhold {
 #[track_caller]
 #[inline(always)]
 fn attempt_span<R>(arm: bool, f: impl FnOnce() -> R) -> R {
-    #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "baremetal")))]
     {
         if arm {
             return crate::arch::sched::preemptoff::scoped(f);
@@ -5366,14 +5366,14 @@ fn attempt_span<R>(arm: bool, f: impl FnOnce() -> R) -> R {
 }
 
 /// UNAFSREADUNMASKED: does this attempt take the read arm? Asked for (`read`) and the bound medium takes it; false off `wc`.
-#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "baremetal")))]
 #[inline(always)]
 fn attempt_arm(read: bool) -> bool {
     read && readarm::irq_on()
 }
 
 /// UNAFSREADUNMASKED: off `wc` there is no read arm.
-#[cfg(not(all(target_arch = "x86_64", feature = "wc")))]
+#[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "baremetal"))))]
 #[inline(always)]
 fn attempt_arm(_read: bool) -> bool {
     false
@@ -5384,7 +5384,7 @@ fn attempt_arm(_read: bool) -> bool {
 #[track_caller]
 #[inline(always)]
 fn note_attempt(arm: bool, t0_us: u64) {
-    #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "baremetal")))]
     {
         if arm {
             readarm::note_hold(t0_us);
@@ -5403,7 +5403,7 @@ pub fn with_unafs_read<R>(f: impl FnMut(&mut KernelUnaFS) -> R) -> Result<R, Mou
     with_unafs_arm(f, true)
 }
 
-#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "baremetal")))]
 pub mod readarm {
     use super::*;
     use core::sync::atomic::AtomicBool;
@@ -5430,13 +5430,13 @@ pub mod readarm {
     /// verdict is decided in the commit that adds it. Global / Usb are xHCI BOT on x86 (`claim_xhci_for_io`): the mask.
     fn medium_irq_on(handle: block::BlockHandle) -> bool {
         match handle {
-            block::BlockHandle::Global => false,
-            block::BlockHandle::Usb => false,
-            #[cfg(feature = "sdhcblk")]
+            #[cfg(target_arch = "x86_64")] block::BlockHandle::Global => false, #[cfg(target_arch = "aarch64")] block::BlockHandle::Global => crate::drivers::emmc2::card_num_blocks().is_some(),
+            block::BlockHandle::Usb => false, #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))] block::BlockHandle::SdMmc => false,
+            #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
             block::BlockHandle::Sdhc => true,
-            #[cfg(feature = "ahci")]
+            #[cfg(all(target_arch = "x86_64", feature = "ahci"))]
             block::BlockHandle::Ahci { .. } => true,
-            #[cfg(feature = "nvme")]
+            #[cfg(all(target_arch = "x86_64", feature = "nvme"))]
             block::BlockHandle::Nvme => true,
         }
     }
@@ -5514,5 +5514,53 @@ pub fn unafs_leg() -> &'static str {
             Err(MountError::NoVolume | MountError::NoStorage | MountError::BadSectorSize(_)) => "skip(no-volume)",
             Err(_) => "mount",
         }
+    }
+}
+
+// ── PREEMPTOFFARMUNAFS (zenbook-ledger Z79, BP-storage-8 / BP-cores-23) — the aarch64 read arm. B1035's `attempt_span` /
+// `attempt_arm` / `note_attempt` / `readarm` are widened to `all(aarch64, baremetal)` (the Pi): a `with_unafs_read` attempt on
+// the emmc2 card (`Global` with `emmc2::card_num_blocks()` Some, `open_on`'s own predicate) holds MOUNT preempt-off with
+// PSTATE.I ON — every emmc2 wait is a CNTPCT-bounded spin (never wfi / yield) and `emmc2::claim_for_io` already treats a
+// preempt-off holder as masked (Z67); no aarch64 ISR takes MOUNT. An xHCI-backed mount (Usb, or Global with no card) keeps the
+// mask; the Orin's `SdMmc` keeps it (its read holds `SD_BLK`, a plain spin Mutex: PREEMPTOFF-ARM-UNAFS-TEGRASD owed). On a
+// non-baremetal aarch64 build (QEMU virt) nothing here is armed. `tests preemptaudit` (aarch64 `audit_selftest`) reads the leg
+// as `unafs_leg=` and counts the conversion in `converted=`. At the tail: no line above moves.
+
+/// PREEMPTOFFARMUNAFS: the read arm counted in the aarch64 audit's `converted=` (1 where it is armed: baremetal).
+#[cfg(target_arch = "aarch64")]
+pub const CONVERTED_UNAFS_ARM: u32 = cfg!(feature = "baremetal") as u32;
+
+/// PREEMPTOFFARMUNAFS: the aarch64 `unafs_leg=` word off the Pi — the only medium is xHCI, which keeps the mask.
+#[cfg(all(target_arch = "aarch64", not(feature = "baremetal")))]
+pub fn unafs_leg() -> &'static str {
+    "skip(medium)"
+}
+
+/// PREEMPTOFFARMUNAFS: the aarch64 `unafs_leg=` word on the Pi — inside a `with_unafs_read` hold of a root stat, on a medium that
+/// takes the read arm: PSTATE.I on and this core's preempt-off count held by this task (Z67's checks; a live tick and the
+/// no-switch check are PREEMPTOFF-ARM-SELFTEST's, owed). Words: ok | skip(medium|no-volume) | masked | not-held | stat | mount.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+pub fn unafs_leg() -> &'static str {
+    let r = with_unafs_read(|fs| -> &'static str {
+        if !readarm::irq_on() {
+            return "skip(medium)";
+        }
+        if crate::arch::irqs_masked() {
+            return "masked";
+        }
+        let (held, tid) = crate::arch::sched::preemptoff::witness();
+        if !held || crate::arch::sched::current_id() != Some(tid) {
+            return "not-held";
+        }
+        let root = fs.superblock.root_inode;
+        if fs.stat(root).is_err() {
+            return "stat";
+        }
+        "ok"
+    });
+    match r {
+        Ok(w) => w,
+        Err(MountError::NoVolume | MountError::NoStorage | MountError::BadSectorSize(_)) => "skip(no-volume)",
+        Err(_) => "mount",
     }
 }

@@ -1104,12 +1104,31 @@ refs/heads/exec-rmbp-gen7slotnohold   59915baad FOLDED-BY-HAND (this commit) 202
 refs/heads/exec-rmbp-preemptauditunafsleg   55b7df91d FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-wifileavebuild   ac9fa5580 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-amberplist   d62533d98 FOLDED-BY-HAND (this commit) 2026-10-27
-refs/heads/exec-rmbp-aethermacgenerics   03c5964fb IN-FLIGHT cut 2026-10-27
-refs/heads/exec-rmbp-aetherfontdblazy   03c5964fb IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-aethermacgenerics   0070f20d9 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-aetherfontdblazy   c6bd40f76 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-aetherabsshrink   03c5964fb IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-aethercenterlayout   03c5964fb IN-FLIGHT cut 2026-10-27
-refs/heads/exec-rmbp-installerauthopen   03c5964fb IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-installerauthopen   3e1019997 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-xhciloanpumpholder   2826ab77b FOLDED-BY-HAND (this commit) 2026-10-27
-refs/heads/exec-rmbp-xhciloanpollcapkat   03c5964fb IN-FLIGHT cut 2026-10-27
-refs/heads/exec-rmbp-unafsreadcallersrest   03c5964fb IN-FLIGHT cut 2026-10-27
-refs/heads/exec-rmbp-gen7slotnoholdrungs   03c5964fb IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-xhciloanpollcapkat   613da4450 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-unafsreadcallersrest   4b6d18070 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-gen7slotnoholdrungs   2520cc193 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-aetherbuttonlabelone   d2eda07d4 IN-FLIGHT cut 2026-10-28
+refs/heads/exec-rmbp-installerprovider   0c20585aa FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-aetherfontdbfallback   d2eda07d4 IN-FLIGHT cut 2026-10-28
+refs/heads/exec-rmbp-aethercsssplitaudit   d2eda07d4 IN-FLIGHT cut 2026-10-28
+refs/heads/exec-rmbp-xhciloanshedkatcontrol   afd48903b FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-masksitescore   df30fb939 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-preemptoffarmunafs   bcfef8395 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-unafsreadcensus   b29a743c5 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-installerudisks   7f028cb14 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-xhciloanshedkatcontrolus   1af778bd7 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-gen7ordermigrate   2b564ce53 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-hidstall25   807ef9888 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-retiredrain   53f662be2 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-lockregedgexcore   c147f08df FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-installercontribute   88ec9c8d0 IN-FLIGHT cut 2026-10-28
+refs/heads/exec-rmbp-installerproviderstream   88ec9c8d0 IN-FLIGHT cut 2026-10-28
+refs/heads/exec-rmbp-xhciloanpumpholderkat   09f2f46fc IN-FLIGHT cut 2026-10-28
+refs/heads/exec-rmbp-lockregouterxcore   09f2f46fc IN-FLIGHT cut 2026-10-28
+refs/heads/exec-rmbp-unafsbindtrigger   09f2f46fc IN-FLIGHT cut 2026-10-28

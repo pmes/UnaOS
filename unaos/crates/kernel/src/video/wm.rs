@@ -2653,7 +2653,7 @@ pub fn close(id: WinId) -> bool {
     // WMDIRECT — the drag does not survive the window. Ahead of the row free (and of the WEDGE
     // token) so the gesture is cancelled while the id still means something; after this point the
     // slot may be re-issued and a live drag would be steering a stranger's window.
-    #[cfg(all(target_arch = "x86_64", feature = "wc"))] winmemory::closing(id); drag_forget(id); let close_hooks = winid_close_teardown(id); #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] scroll_clear(id); // WINID (SO1(b) / A29) — ⚠ SAME-LINE fold, line-NEUTRAL. Every registered id cache is cleared of `id` HERE, beside `drag_forget` and for its stated reason: this is ahead of the table lock and therefore ahead of the row free, so no cache can still be naming this slot when `create_inner` re-issues it. Id-checked per cell, so a cache pointing at another window is untouched. See the WINID block at this file's tail for the defect (render7: the console's win 1 came back as quarry's win 1), for why this is teardown and not a generation in the id, and for the LOCKFIX argument on the input path. RING3SCROLL (B778): `scroll_clear(id)` — the window's scroll model goes with the row (a ring-3 window closes here, never through an owner's own clear), folded before this line's first `//`.
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))] winmemory::closing(id); drag_forget(id); let close_flight = close_flight_enter(id); let close_hooks = winid_close_teardown(id); #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] scroll_clear(id); // WINID (SO1(b) / A29) — ⚠ SAME-LINE fold, line-NEUTRAL. Every registered id cache is cleared of `id` HERE, beside `drag_forget` and for its stated reason: this is ahead of the table lock and therefore ahead of the row free, so no cache can still be naming this slot when `create_inner` re-issues it. Id-checked per cell, so a cache pointing at another window is untouched. See the WINID block at this file's tail for the defect (render7: the console's win 1 came back as quarry's win 1), for why this is teardown and not a generation in the id, and for the LOCKFIX argument on the input path. RING3SCROLL (B778): `scroll_clear(id)` — the window's scroll model goes with the row (a ring-3 window closes here, never through an owner's own clear), folded before this line's first `//`.
     // WEDGE-1r2 `<D1>`/`<d1>` — see `move_to`. `close` reaches its barrier through a `TABLE` critical
     // section, so the token has to precede the lock to cover the death that happens ON it.
     crate::wedge2::mark_composite("<D1>", "<d1>");
@@ -2683,7 +2683,7 @@ pub fn close(id: WinId) -> bool {
     reclaim(&[vacated]); #[cfg(all(target_arch = "x86_64", feature = "wc"))] pool_trim(); // POOLTRIM (B845): the pools past live + 2 trimmed inside the barrier (no pass in flight). LINE-NEUTRAL append, code first
     reclaim(&moved[..nv]);
     // Re-open the barrier before recompositing — a composite under a raised barrier is a no-op.
-    drop(barrier);
+    drop(barrier); close_flight_end(close_flight); // RETIREDRAIN (rmbp-ledger B1055): this close's flight ends with its drain (`close_drain_wait`, file tail). LINE-NEUTRAL append, code first
     // WC-K2 — no CURSOR-14 bracket-closer here any more. `erase` paints nothing and takes the sprite
     // down for nothing, so there is no bracket left to close; a `cursor::repaint()` on this line
     // would be an unbracketed whole-sprite cycle. `drain_deferred`'s masked handback and
@@ -26702,12 +26702,21 @@ fn winid_selftest() {
     close(w3);
     let scoped_ok = PROBE_CELL.load(Ordering::Acquire) == w2;
 
+    // LEG 5 — RETIREDRAIN (rmbp-ledger B1055): the drain door. A close flight held on THIS task (the fixture
+    // cannot force a composite in flight on the sibling core across a real close: RETIRE-DRAIN-KAT owed) must
+    // keep `close_drain_wait_for` from answering drained inside its bound; once the flight ends it must answer.
+    let flight = close_flight_enter(w2);
+    let (held_drained, held_inflight, held_us) = close_drain_wait_for("winid-probe", 2_000, false);
+    close_flight_end(flight);
+    let (free_drained, _, _) = close_drain_wait_for("winid-probe", 20_000, false);
+    let door_ok = !held_drained && held_inflight >= 1 && free_drained;
+
     close(w2);
     PROBE_CELL.store(WIN_NONE, Ordering::Release);
 
-    let ok = reg_ok && cleared_ok && recycled_ok && scoped_ok;
+    let ok = reg_ok && cleared_ok && recycled_ok && scoped_ok && door_ok;
     serial_println!(
-        "[winid] selftest register={} cleared={} (held={} after close win={}) recycled={} (w1={} gen={} -> w2={} gen={}) id-scoped={} -> {}",
+        "[winid] selftest register={} cleared={} (held={} after close win={}) recycled={} (w1={} gen={} -> w2={} gen={}) id-scoped={} drain-door={} (held={}/{}/{}us free={}) -> {}",
         reg_ok as u8,
         cleared_ok as u8,
         held_after_close,
@@ -26718,6 +26727,11 @@ fn winid_selftest() {
         w2,
         g2,
         scoped_ok as u8,
+        door_ok as u8,
+        held_drained as u8,
+        held_inflight,
+        held_us,
+        free_drained as u8,
         if ok { "PASS" } else { "FAIL" }
     );
     composite();
@@ -32506,3 +32520,181 @@ fn winid_close_hooks_run(id: WinId, h: CloseHooks) {
 )))]
 #[inline(always)]
 fn winid_close_hooks_run(_id: WinId, _h: CloseHooks) {}
+
+// =================================================================================================
+// RETIREDRAIN (rmbp-ledger B1055; BP-video-18 kept, the seat's MEASURE line) — **a WINID holder's grown
+// surface is retired only after every close in flight has drained.** TAIL-APPENDED.
+// =================================================================================================
+//
+// LEAKEDSURFGROW (B1043) ordered the free of a grown furniture block after the owner's OWN close (TABLE clear,
+// then the drain). A close BEHIND the holder's back (`close_all_furniture`, the close disc) on another core
+// clears the holder's cell in `close`'s teardown, ahead of TABLE, and drains only later; a holder re-minting
+// inside that window (login's `open_as` / `rescaled`, instgui's `open`) could create and retire while a
+// composite that registered before that close's row clear still blitted the old block (a stale read, no write).
+//
+// THE ONE RULE: `close` counts itself in flight from BEFORE its teardown clears any cell until its drain
+// barrier drops ([`close_flight_enter`] / [`close_flight_end`]); [`close_drain_wait`] is the public door a
+// holder gates its retire on: `true` once no close is in flight, `false` past [`CLOSE_DRAIN_WAIT_US`] — then
+// the block stays queued and the holder's next re-mint retires it (a deferred free, never an early one).
+// The count is GLOBAL per close, not per row: the holder cannot name its row (its cell was cleared).
+// NOT a second barrier and not a blit counter: the close's own `DrainBarrier` already waits out every blit
+// (`BLIT_ACTIVE`); the door only waits for that drain to end. Atomics only, no lock.
+// Wire, once per boot on the first non-zero wait:
+// `[wm] close drain id=<n> inflight=<n> waited_us=<n> who=<owner> drained=<1|0>`.
+// Owed, not built: RETIRE-DRAIN-REST (dialog, notify and bezel retire after a create too; the door belongs at
+// their sites or once inside `metrics::leaked_surf_retire`), CLOSE-FLIGHT-RESCUE (a task killed inside the
+// drain's aarch64 yield strands the count as it strands `DRAIN_PENDING`: retires defer, never free early),
+// RETIRE-DRAIN-KAT (the sibling-core race is not forced by any `tests` door).
+
+/// RETIREDRAIN — closes between their teardown and their barrier drop.
+#[cfg(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+))]
+static CLOSE_FLIGHT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// RETIREDRAIN — the id of the last close that entered its flight (for the once-line only).
+#[cfg(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+))]
+static CLOSE_FLIGHT_ID: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(WIN_NONE);
+
+/// RETIREDRAIN — the once-per-boot latch for the `[wm] close drain` line.
+#[cfg(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+))]
+static CLOSE_DRAIN_SAID: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// RETIREDRAIN — the door's bound. A close's drain is a handful of panel-clipped blits; past this the retire
+/// is deferred to the holder's next re-mint, which is safe (the block stays queued, never freed early).
+#[cfg(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+))]
+const CLOSE_DRAIN_WAIT_US: u64 = 250_000;
+
+/// RETIREDRAIN — one close in flight; dropping it ends the flight (an early `return false` in `close` too).
+#[cfg(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+))]
+struct CloseFlight;
+
+#[cfg(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+))]
+impl Drop for CloseFlight {
+    fn drop(&mut self) {
+        CLOSE_FLIGHT.fetch_sub(1, core::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// RETIREDRAIN — the erasing twin: no furniture, no holder, `close` keeps its bytes.
+#[cfg(not(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+)))]
+type CloseFlight = ();
+
+/// RETIREDRAIN — enter a close's flight. Called on `close`'s teardown line BEFORE `winid_close_teardown`, so a
+/// holder that sees its cell cleared also sees the count raised.
+#[cfg(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+))]
+fn close_flight_enter(id: WinId) -> CloseFlight {
+    CLOSE_FLIGHT_ID.store(id, core::sync::atomic::Ordering::Relaxed);
+    CLOSE_FLIGHT.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+    CloseFlight
+}
+
+/// RETIREDRAIN — the erasing twin.
+#[cfg(not(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+)))]
+#[inline(always)]
+fn close_flight_enter(_id: WinId) -> CloseFlight {}
+
+/// RETIREDRAIN — end a close's flight: called right after `close` drops its drain barrier.
+#[cfg(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+))]
+fn close_flight_end(f: CloseFlight) {
+    drop(f);
+}
+
+/// RETIREDRAIN — the erasing twin.
+#[cfg(not(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+)))]
+#[inline(always)]
+fn close_flight_end(_f: CloseFlight) {}
+
+/// RETIREDRAIN — **the public drain door.** `true` once no `close` is in flight (every close that could have
+/// cleared the caller's WINID cell has drained); `false` past [`CLOSE_DRAIN_WAIT_US`]. A holder retires a grown
+/// surface only on `true`. Call with no wm lock held.
+#[cfg(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+))]
+pub fn close_drain_wait(who: &'static str) -> bool {
+    close_drain_wait_for(who, CLOSE_DRAIN_WAIT_US, true).0
+}
+
+/// RETIREDRAIN — the erasing twin: no furniture, no foreign close can clear a cell.
+#[cfg(not(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+)))]
+#[inline(always)]
+pub fn close_drain_wait(_who: &'static str) -> bool {
+    true
+}
+
+/// RETIREDRAIN — the door's body: `(drained, in flight at entry, waited_us)`. Yields where legal
+/// ([`drain_can_yield`], the drain's own test), else spins; `say` prints the once-line on a non-zero wait.
+#[cfg(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+))]
+fn close_drain_wait_for(who: &'static str, budget_us: u64, say: bool) -> (bool, u32, u64) {
+    use core::sync::atomic::Ordering;
+    core::sync::atomic::fence(Ordering::SeqCst);
+    let inflight = CLOSE_FLIGHT.load(Ordering::SeqCst);
+    if inflight == 0 {
+        return (true, 0, 0);
+    }
+    let id = CLOSE_FLIGHT_ID.load(Ordering::Relaxed);
+    let t0 = crate::hidstall::now_us();
+    let drained = loop {
+        if CLOSE_FLIGHT.load(Ordering::SeqCst) == 0 {
+            break true;
+        }
+        if crate::hidstall::now_us().saturating_sub(t0) >= budget_us {
+            break false;
+        }
+        if drain_can_yield() {
+            crate::arch::sched::yield_now();
+        } else {
+            core::hint::spin_loop();
+        }
+    };
+    let waited_us = crate::hidstall::now_us().saturating_sub(t0);
+    if say && !CLOSE_DRAIN_SAID.swap(true, Ordering::Relaxed) {
+        serial_println!(
+            "[wm] close drain id={} inflight={} waited_us={} who={} drained={}",
+            id,
+            inflight,
+            waited_us,
+            who,
+            drained as u8
+        );
+    }
+    (drained, inflight, waited_us)
+}

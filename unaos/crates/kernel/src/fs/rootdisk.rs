@@ -340,7 +340,7 @@ fn rootdisk2(mt: &MountTable, made: Option<&str>) {
         },
     };
     #[cfg(any(target_arch = "aarch64", feature = "unafs"))]
-    let image_mb = crate::fs::unafs::with_unafs(|fs| fs.superblock.block_count).map(|b| (b * 4096) >> 20).unwrap_or(0);
+    let image_mb = crate::fs::unafs::with_unafs_read(|fs| fs.superblock.block_count).map(|b| (b * 4096) >> 20).unwrap_or(0);
     #[cfg(not(any(target_arch = "aarch64", feature = "unafs")))]
     let image_mb = 0u64;
     let var = home_of(mt, "/var");

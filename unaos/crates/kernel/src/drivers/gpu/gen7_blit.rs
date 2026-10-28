@@ -121,8 +121,8 @@ pub unsafe fn bcs_job(bar0: usize, bar0_size: usize, src: Plane, dst: Plane, rec
             return Err("coord-not-16bit"); // DW2/DW3/DW5 carry 16-bit X and Y (§1.9.14 p.63)
         }
     }
-    let Some(_engine) = PAGES.try_lock() else { return Err("busy") };
-    let (ring_va, ring_re) = crate::drivers::gpu::gen7::held_take(&crate::drivers::gpu::gen7::BLIT_RING_HELD, 2); // GEN7HELDONE (B1031): B1025's one hold rule (gen7.rs tail)
+    let Some((_engine, (ring_va, ring_re))) = engine_take(|| crate::drivers::gpu::gen7::held_take(&crate::drivers::gpu::gen7::BLIT_RING_HELD, 2)) else { return Err("busy") }; // GEN7ORDERMIGRATE (B1053): PAGES then the ring slot on ONE core (file tail)
+    // GEN7HELDONE (B1031): B1025's one hold rule (gen7.rs tail) takes the ring + sentinel pages inside the door above
     if !ring_re {
         if ring_va == 0 {
             return Err("alloc-ring");
@@ -587,4 +587,26 @@ pub fn test() {
     }
     *DONE.lock() = Some([l1, l2, l3]); #[cfg(all(target_arch = "x86_64", feature = "wc"))] { use crate::allocator::census::{retag, GEN7_HELD}; retag(sp as usize, lay_s.size(), GEN7_HELD); retag(dp as usize, lay_d.size(), GEN7_HELD); } // FIXTURERETAIN (B1017): sp/dp are `gen7-held`. LINE-NEUTRAL append, code first
     // sp/dp are deliberately not freed (reclaim=held, in BLIT_HELD: a later job reuses them); dcpu/dgpu were never GGTT-mapped and drop here.
+}
+
+// =================================================================================
+// GEN7ORDERMIGRATE (rmbp-ledger B1053) — FILE-TAIL append: nothing above it moves. BP-gpu-9's order edge (PAGES ->
+// BLIT_RING_HELD) is recorded by the lock registry's walk at the slot's blocking `lock()`, and that walk reads ONLY the
+// current core's partition (`sync.rs` `reg::acquire`). `bcs_job` runs with interrupts on, so a timer preemption between
+// `PAGES.try_lock()` and `held_take`'s `slot.lock()` could re-queue the task, an idle core's `try_steal` take it, and the
+// second take then find no PAGES hold on its new core: the run's edge was dropped. The ONE door below makes both takes
+// under `crate::arch::without_interrupts` (one core, no preemption between them); `bcs_job` and `tests gen7`'s
+// `order_leg` both take through it, so GEN7ORDER's `gen7_order=ok` reads the production take. The mask spans only the
+// two takes (and a first job's 8 KiB `alloc_zeroed`, which the allocator itself runs masked); every other holder of
+// BLIT_RING_HELD is under PAGES or masked, so the masked spin never waits on a preempted holder on this core.
+// =================================================================================
+
+/// The engine lock and the take nested under it, on ONE core: `None` = a job is live (`busy`). The PAGES guard is
+/// handed back to the caller (the engine stays locked for the job); whatever `nested` takes it must release itself.
+pub(super) fn engine_take<R>(nested: impl FnOnce() -> R) -> Option<(crate::sync::MutexGuard<'static, ()>, R)> {
+    crate::arch::without_interrupts(|| {
+        let engine = PAGES.try_lock()?;
+        let r = nested();
+        Some((engine, r))
+    })
 }

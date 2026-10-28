@@ -72,4 +72,12 @@ impl FileBlock {
     pub fn open_rw_sectors(path: &Path, sectors: u64) -> std::io::Result<Self> {
         Ok(Self { file: OpenOptions::new().read(true).write(true).open(path)?, sectors, writable: true })
     }
+    /// INSTALLERAUTHOPEN (LEDGER SR422): a read-write `File` someone else opened (an elevated helper's fd received over
+    /// a socket), at `Some(sectors)` or, with `None`, at its measured length (the caller has already applied its policy).
+    pub fn from_file(file: File, sectors: Option<u64>) -> std::io::Result<Self> {
+        match sectors {
+            Some(sectors) => Ok(Self { file, sectors, writable: true }),
+            None => Self::with(file, true),
+        }
+    }
 }

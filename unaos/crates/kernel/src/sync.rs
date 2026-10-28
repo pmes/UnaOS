@@ -427,19 +427,19 @@ mod reg {
             c => c,
         };
         let mut m = p.mask.load(Acquire);
-        if c != 0 && edges {
-            let mut bits = m;
+        if c != 0 && edges { for (q, pq) in PARTS.iter().enumerate() { if q != cpu && tid == 0 { continue; } // LOCKREGEDGEXCORE (B1056): EVERY partition for this task — a hold taken before a preemption + steal stays in its old core's partition (release frees it by the guard's slot); tid 0 = a core's scheduler context, this core only. LINE-NEUTRAL rewrite
+            let mut bits = if q == cpu { m } else { pq.mask.load(Acquire) };
             while bits != 0 {
                 let i = bits.trailing_zeros() as usize;
                 bits &= bits - 1;
-                let t = p.tag[i].load(Relaxed);
+                let t = pq.tag[i].load(Relaxed);
                 if t != 0 && tag_tid(t) == tid {
                     let a = tag_class(t);
                     if a != 0 && a != c {
                         edge(a, c, tid, cpu);
                     }
                 }
-            }
+            } }
         }
         let i = loop {
             let free = !m;
@@ -904,7 +904,7 @@ mod reg {
             tag_tid(max_tag),
             tag_cpu(max_tag), POISON_N.load(Acquire), POISON_LOST.load(Relaxed), cword, bword, kword, EARLY.load(Relaxed), UNGS.load(Relaxed), FULL.load(Relaxed), sh.0, sh.1, fullw, STALE.load(Relaxed), fuw
         );
-        reggap_leg(); // REGGAP (B1021): the intent arm's KAT, its own `:: REGGAP:` line after LOCKREG's
+        reggap_leg(); xcore_leg(); // LOCKREGEDGEXCORE (B1056): the cross-partition order walk's KAT, its own `:: LOCKXCORE:` line after REGGAP's. REGGAP (B1021): the intent arm's KAT, its own `:: REGGAP:` line after LOCKREG's
     }
 
     // ── LOCKREG2 (B823): every hold past 50 ms is NAMED — in flight by the scan, or at its release through the pending
@@ -1755,6 +1755,75 @@ mod reg {
             false
         };
         Some((has(a, b), has(b, a), INV_N.load(Acquire)))
+    }
+
+    // ── LOCKREGEDGEXCORE (rmbp-ledger B1056, BP-cores-20): `acquire`'s order walk reads EVERY partition for the acquiring
+    // task (tid 0 = this core only), so a nested pair split by a preemption and a steal keeps its edge and a reverse take on
+    // the new core counts in `inversions=`. No door forces a migration (a woken task returns to the core it blocked on;
+    // `try_steal` needs an idle thief past the floor and the cooldown), so the KAT PLANTS the stranded hold in a sibling
+    // partition (the REGGAP `fake_claim` shape) and makes the nested take for real. Owed: LOCKREG-EDGE-XCORE-KAT (a real
+    // migration, GEN7-ORDER-FORCEMIG's door), LOCKREG-OUTER-XCORE (`outer_site`), LOCKREG-XCORE-COST. ──
+    static XA: super::Mutex<u32> = super::Mutex::new(0);
+    static XB: super::Mutex<u32> = super::Mutex::new(0);
+
+    /// The cross-partition KAT (`:: LOCKXCORE:`), masked on this core: a hold of XA by THIS task planted in partition
+    /// (cpu + 1) % MAX_CPUS with `acquire`'s own mask CAS (what a preemption + steal leaves: the hold stays in the partition
+    /// it was taken on), then `XB.lock()` through the real `acquire`; the walk must record XA -> XB. XA's raw lock is never
+    /// taken (a tag only), the planted slot is freed in `release`'s order, nothing reversed is planted (`order_seen`'s rule).
+    /// The old one-partition walk reads fwd=0 (FAIL).
+    fn xcore_leg() {
+        if !ON.load(Acquire) {
+            serial_println!(":: LOCKXCORE: -> SKIP(unarmed) ::");
+            return;
+        }
+        let r: Result<(usize, usize, bool, bool, u32, u32), &'static str> = crate::arch::without_interrupts(|| {
+            let Some((tid, cpu)) = who() else { return Err("no-cpu") };
+            if tid == 0 {
+                return Err("no-task");
+            }
+            let (a, b) = (class_of(XA.site), class_of(XB.site));
+            if a == 0 || b == 0 {
+                return Err("classes");
+            }
+            XA.class.store(a, Relaxed);
+            XB.class.store(b, Relaxed);
+            if order_seen(a, b).map(|o| o.0).unwrap_or(false) {
+                return Err("recorded"); // a second `tests lockreg` this boot: the edge is permanent
+            }
+            let q = (cpu + 1) % MAX_CPUS;
+            let pq = &PARTS[q];
+            let mut m = pq.mask.load(Acquire);
+            let i = loop {
+                let free = !m;
+                if free == 0 {
+                    return Err("full");
+                }
+                let i = free.trailing_zeros();
+                match pq.mask.compare_exchange_weak(m, m | 1 << i, AcqRel, Acquire) {
+                    Ok(_) => break i as usize,
+                    Err(now) => m = now,
+                }
+            };
+            pq.lock[i].store(XA.addr(), Relaxed);
+            pq.at[i].store(XA.site as *const Loc as *mut Loc, Relaxed);
+            pq.t0[i].store(rdtsc(), Relaxed);
+            pq.tag[i].store(tid << 24 | (a as u64) << 8 | (q as u64 + 1), Release);
+            let inv0 = INV_N.load(Acquire);
+            drop(XB.lock());
+            pq.tag[i].store(0, Release);
+            pq.mask.fetch_and(!(1u32 << i), Release);
+            let (fwd, rev, inv1) = order_seen(a, b).unwrap_or((false, false, inv0));
+            Ok((q, cpu, fwd, rev, inv0, inv1))
+        });
+        match r {
+            Err(why) => {
+                serial_println!(":: LOCKXCORE: -> SKIP({}) ::", why);
+            }
+            Ok((q, cpu, fwd, rev, inv0, inv1)) => {
+                let pass = fwd && !rev && inv1 == inv0;
+                serial_println!(":: LOCKXCORE: planted=c{} took=c{} fwd={} rev={} inversions={}->{} -> {} ::", q, cpu, fwd as u8, rev as u8, inv0, inv1, if pass { "PASS" } else { "FAIL" });
+            }
+        }
     }
 }
 

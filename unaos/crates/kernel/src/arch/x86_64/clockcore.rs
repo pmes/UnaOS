@@ -180,7 +180,7 @@ pub fn mask_exit(tok: (u64, u32), site: &'static Location<'static>) {
     let span = tsc_global().saturating_sub(t0);
     if span > THRESH.load(Relaxed) {
         if MASKED_MAX.fetch_max(span, Relaxed) < span { MAX_WHO.note_at(crate::arch::sched::current_name(), site, cpu as usize); } // HIDSTALLMASKSCOPE (B1019): the max names its holder (the masking task is current here); CLOCKCOREMASKCORE (B1046): the masking core is the token's own (read under this mask)
-        name_once(site, span, cpu, false); site_tally(site, span); // MASKCENSUS (B1028): every span over 10 ms counted by its SEEN slot (tail); the live scan below is not counted (one span, many scans)
+        name_once(site, span, cpu, false); site_tally(site, span, cpu); // MASKSITESCORE (B1051): and its core; MASKCENSUS (B1028): every span over 10 ms counted by its SEEN slot (tail); the live scan below is not counted (one span, many scans)
     }
 }
 
@@ -383,15 +383,19 @@ static SEEN_CNT: [AtomicU32; SEEN_CAP] = [const { AtomicU32::new(0) }; SEEN_CAP]
 static SEEN_SUM: [AtomicU64; SEEN_CAP] = [const { AtomicU64::new(0) }; SEEN_CAP];
 static OTHER_CNT: AtomicU32 = AtomicU32::new(0);
 static OTHER_SUM: AtomicU64 = AtomicU64::new(0);
+static SEEN_CORE: [[AtomicU64; MAX_CPUS]; SEEN_CAP] = [const { [const { AtomicU64::new(0) }; MAX_CPUS] }; SEEN_CAP]; // MASKSITESCORE (B1051): each SEEN slot's cycles per masking core (48 x MAX_CPUS x 8 B = 3072 B)
 
 /// One masked span over 10 ms (`span` cycles) at `site`, after `name_once` claimed its slot (if SEEN had room).
 #[inline]
-fn site_tally(site: &'static Location<'static>, span: u64) {
+fn site_tally(site: &'static Location<'static>, span: u64, cpu: u32) {
     let p = site as *const _ as *mut Location<'static>;
     for (i, slot) in SEEN.iter().enumerate() {
         if slot.load(Acquire) == p {
             SEEN_CNT[i].fetch_add(1, Relaxed);
             SEEN_SUM[i].fetch_add(span, Relaxed);
+            if (cpu as usize) < MAX_CPUS {
+                SEEN_CORE[i][cpu as usize].fetch_add(span, Relaxed); // MASKSITESCORE (B1051): the token's own core (mask_enter's this_cpu)
+            }
             return;
         }
     }
@@ -406,13 +410,14 @@ fn census_say() {
     for (i, slot) in SEEN.iter().enumerate() {
         let p = slot.load(Acquire);
         if !p.is_null() {
-            top.offer(p as usize, SEEN_CNT[i].load(Relaxed), SEEN_SUM[i].load(Relaxed).saturating_mul(1000) / hz, 0);
+            let cores: [u64; MAX_CPUS] = core::array::from_fn(|c| SEEN_CORE[i][c].load(Relaxed).saturating_mul(1000) / hz); // MASKSITESCORE (B1051): ms per core -> `@c<dominant>`
+            top.offer_on(p as usize, SEEN_CNT[i].load(Relaxed), SEEN_SUM[i].load(Relaxed).saturating_mul(1000) / hz, 0, &cores);
         }
     }
     top.set_other(OTHER_CNT.load(Relaxed), OTHER_SUM.load(Relaxed).saturating_mul(1000) / hz);
     let (on, os) = top.other();
     serial_println!(
-        "[clockcore] masked sites n={} other={}x{} over_ms=10 top={} (MASKCENSUS B1028: every IRQ-masked section over 10 ms by its mask site, <n>x<sum_ms>, top-5 by sum)",
+        "[clockcore] masked sites n={} other={}x{} over_ms=10 top={} (MASKCENSUS B1028: every IRQ-masked section over 10 ms by its mask site, <n>x<sum_ms>, top-5 by sum; MASKSITESCORE B1051: @c<dominant core by sum>)",
         top.sites(), on, os, top
     );
 }
@@ -422,7 +427,7 @@ fn census_say() {
 // it for free: `mask_exit` runs still masked, so its token's `cpu` (mask_enter's `this_cpu` read) is the masking core;
 // `isr_tick`'s live scan reads the per-CPU `MASK_T0`/`MASK_SITE` by index, so the scanned index IS the masked core. They now
 // call `note_at`, and the CLOCKCORE verdict's `masked_by=` prints `MaskedBy`'s ONE Display, `<task|?>@<file>:<line>@c<n>`.
-// `SEEN` is site-indexed (one site masks on many cores), so `[clockcore] masked sites` carries no core (MASK-SITES-CORE owed).
+// `SEEN` is site-indexed (one site masks on many cores): MASK-SITES-CORE BUILT by MASKSITESCORE (B1051), `SEEN_CORE` per slot, `@c<dominant>`.
 
 /// `tests clock`'s `core_ok=`: the boot max's holder (`by`) names a valid core whenever it names a site, and when that max
 /// is the selftest's own masked spin (this file's only masked site) its core is `spin_core`, read inside that mask.
