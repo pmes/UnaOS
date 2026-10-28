@@ -536,12 +536,17 @@ fn file_color(cv: &mut Canvas, cx: &Cx, id: NodeId, ink: &Ink, x: f32, y: f32, t
         let mut t = cx.fonts.0.borrow_mut();
         let bw = t.measure(button, ink.sel, ink.size);
         let (a, d) = t.extents(ink.sel, ink.size);
-        let btn_bw = bw + l.padding.left + l.border.left + l.padding.right + l.border.right;
-        let btn = layout_core::caption_box(x, y, btn_bw, l.size.height, l.border, l.padding, bw, a, d);
+        // AETHERFILEUAEDGES (SR459): as the host ring: the button sub-box at the input's content origin (the input has no UA
+        // edges), sized and centred by the button's OWN edges, layout_core's `push_button_edges`.
+        let (bb, bp) = layout_core::push_button_edges();
+        let (ox, oy) = (x + l.border.left + l.padding.left, y + l.border.top + l.padding.top);
+        let oh = (l.size.height - l.border.top - l.padding.top - l.border.bottom - l.padding.bottom).max(0.0);
+        let btn_bw = bw + bp.left + bb.left + bp.right + bb.right;
+        let btn = layout_core::caption_box(ox, oy, btn_bw, oh, bb, bp, bw, a, d);
         let whole = layout_core::caption_box(x, y, l.size.width, l.size.height, l.border, l.padding, 0.0, a, d);
         let base = btn.baseline(lead);
         let (px0, py0, px1, py1) = whole.clip;
-        for (sx, s) in [(btn.x, button), (x + btn_bw + 4.0, status)] {
+        for (sx, s) in [(btn.x, button), (ox + btn_bw + 4.0, status)] {
             t.draw(sx, base, s, ink.sel, ink.size, color, &mut |gx, gy, cov| {
                 let (fx, fy) = (gx as f32, gy as f32);
                 if fx >= px0 && fx < px1 && fy >= py0 && fy < py1 {

@@ -1460,13 +1460,18 @@ fn paint_file_color(
             let adv = inherited.advancer();
             let (ascent, descent) = text_extents(font, inherited.font_size);
             let button_w = measure_text_width(button, &adv);
-            let btn_bw = button_w + pad.left + bord.left + pad.right + bord.right;
-            let btn = layout_core::caption_box(bx, by, btn_bw, bh, bord, pad, button_w, ascent, descent);
+            // AETHERFILEUAEDGES (SR459): the input has no UA edges (layout_core `ua_control`), so the button sub-box sits at
+            // the input's content origin and takes the button's OWN edges, `push_button_edges`, as `control_intrinsic` sizes it.
+            let (bb, bp) = layout_core::push_button_edges();
+            let (cx0, cy0) = (bx + bord.left + pad.left, by + bord.top + pad.top);
+            let ch = (bh - bord.top - pad.top - bord.bottom - pad.bottom).max(0.0);
+            let btn_bw = button_w + bp.left + bb.left + bp.right + bb.right;
+            let btn = layout_core::caption_box(cx0, cy0, btn_bw, ch, bb, bp, button_w, ascent, descent);
             let whole = layout_core::caption_box(bx, by, bw, bh, bord, pad, 0.0, ascent, descent);
             let c = whole.clip;
             let clip = (clip.0.max(c.0), clip.1.max(c.1), clip.2.min(c.2), clip.3.min(c.3));
             draw_text(button, btn.x, btn.top, f32::MAX, &adv, 0.0, color, false, surface, width, height, damage_rects, clip);
-            draw_text(status, bx + btn_bw + 4.0, btn.top, f32::MAX, &adv, 0.0, color, false, surface, width, height, damage_rects, clip);
+            draw_text(status, cx0 + btn_bw + 4.0, btn.top, f32::MAX, &adv, 0.0, color, false, surface, width, height, damage_rects, clip);
             true
         }
         "color" => {
