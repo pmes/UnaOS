@@ -1193,3 +1193,6 @@ refs/heads/exec-rmbp-retiredraindeathkat   d89340213 IN-FLIGHT cut 2026-10-28
 refs/heads/exec-rmbp-preemptoffarmcastsnow   d89340213 IN-FLIGHT cut 2026-10-28
 refs/heads/exec-rmbp-xhciloanptpyieldptpmarkmany   d89340213 IN-FLIGHT cut 2026-10-28
 refs/heads/exec-rmbp-aetherimageinputbox   d89340213 IN-FLIGHT cut 2026-10-28
+refs/heads/exec-rmbp-preemptoffarmirqmarkstale   49828aec6 IN-FLIGHT cut 2026-10-28
+refs/heads/exec-rmbp-lockregxcorecostknob   49828aec6 IN-FLIGHT cut 2026-10-28
+refs/heads/exec-rmbp-unafslaneqemu   49828aec6 IN-FLIGHT cut 2026-10-28
