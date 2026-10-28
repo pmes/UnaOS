@@ -6,6 +6,12 @@ use bandy::{SMessage, Synapse};
 use crate::NativeView;
 
 pub fn bootstrap_image_surface(id: &str, synapse: Synapse) -> NativeView {
+    bootstrap_image_surface_held(id, synapse).0
+}
+
+/// FACELIVE-SUBSCRIPTION-DROP (SR441): [`bootstrap_image_surface`] with its bus subscriber's handle, which the tetra
+/// evaluator keeps and aborts when the Surface leaves the tree (dropping the handle only detaches the subscriber).
+pub fn bootstrap_image_surface_held(id: &str, synapse: Synapse) -> (NativeView, gtk4::glib::JoinHandle<()>) {
     let surface = crate::tetra::surface_number(id); // SURFACEID (SR332): this Surface's number on every pointer message
     let drawing_area = DrawingArea::builder()
         .hexpand(true)
@@ -122,7 +128,7 @@ pub fn bootstrap_image_surface(id: &str, synapse: Synapse) -> NativeView {
     let resend = synapse.clone();
     
     let target_id = id.to_string();
-    gtk4::glib::spawn_future_local(async move {
+    let task = gtk4::glib::spawn_future_local(async move {
         loop {
             match rx.recv().await {
                 Ok(SMessage::SurfaceBlit { url, width, height, pixels, damage, scroll }) if url == target_id => {
@@ -168,7 +174,7 @@ pub fn bootstrap_image_surface(id: &str, synapse: Synapse) -> NativeView {
         }
     });
 
-    drawing_area.into()
+    (drawing_area.into(), task)
 }
 
 /// AETHERCHROME (SR84): the page surface with the chrome that floats over it — the find bar (Ctrl+F,

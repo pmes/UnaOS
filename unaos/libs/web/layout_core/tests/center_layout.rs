@@ -64,3 +64,57 @@ fn plain_center_leaves_blocks() {
         .expect("the 200px block's text line");
     assert!((x + w / 2.0 - 100.0).abs() <= 1.0, "inline text centred inside the block: x {x} w {w}");
 }
+
+/// AETHERCENTERCELL (SR436): the same narrow children inside ONE cell of a 600px table (`td, th { padding: 1px }`).
+fn cell_page(td_attrs: &[(&'static str, &str)]) -> N {
+    let mut attrs = vec![("id", "cell")];
+    attrs.extend_from_slice(td_attrs);
+    page(vec![el(
+        "table",
+        &[("style", "width: 600px; border-spacing: 0")],
+        vec![el("tr", &[], vec![el("td", &attrs, kids())])],
+    )])
+}
+
+/// The cell's content box: (left, width).
+fn cell_content(tree: &Tree, doc: &N) -> (f32, f32) {
+    let (x, _, w, _) = box_of(tree, &doc.by_id("cell"));
+    (x + 1.0, w - 2.0)
+}
+
+/// AETHERCENTERCELL (SR436): a table cell is a block container (CSS 2.2 §17.4), so `td align=center` and
+/// `text-align: -webkit-center` on a td centre a nested table and a definite-width block in the cell, as Chrome does;
+/// an auto-width block still fills the cell.
+#[test]
+fn cell_centres_narrow_blocks() {
+    let cases: [(&str, N); 2] = [
+        ("<td align=center>", cell_page(&[("align", "center")])),
+        ("td text-align: -webkit-center", cell_page(&[("style", "text-align: -webkit-center")])),
+    ];
+    for (how, doc) in &cases {
+        let tree = lay(doc, VW, 400.0);
+        let (cx, cw) = cell_content(&tree, doc);
+        assert!(cw > 400.0, "{how}: the cell is wide ({cw})");
+        for id in ["t", "d"] {
+            let (x, _, w, _) = box_of(&tree, &doc.by_id(id));
+            assert!(w > 0.0 && w < cw - 100.0, "{how}: #{id} is narrower than the cell ({w} of {cw})");
+            assert!((x + w / 2.0 - (cx + cw / 2.0)).abs() < 0.5, "{how}: #{id} is centred in the cell (x {x} w {w}, cell {cx} + {cw})");
+        }
+        let (x, _, w, _) = box_of(&tree, &doc.by_id("f"));
+        assert!((x - cx).abs() < 0.5 && (w - cw).abs() < 0.5, "{how}: an auto-width block fills the cell (x {x} w {w}, cell {cx} + {cw})");
+    }
+}
+
+/// AETHERCENTERCELL (SR436): plain `text-align: center` on a td aligns inline content only (CSS 2.2 §16.2): the
+/// nested table and the definite-width block sit at the cell's content-box start.
+#[test]
+fn cell_plain_center_leaves_blocks() {
+    let doc = cell_page(&[("style", "text-align: center")]);
+    let tree = lay(&doc, VW, 400.0);
+    let (cx, cw) = cell_content(&tree, &doc);
+    for id in ["t", "d"] {
+        let (x, _, w, _) = box_of(&tree, &doc.by_id(id));
+        assert!(w > 0.0 && w < cw - 100.0, "#{id} is narrower than the cell ({w} of {cw})");
+        assert!((x - cx).abs() < 0.5, "plain text-align: center in a td does not move the block #{id} (x {x}, cell {cx})");
+    }
+}

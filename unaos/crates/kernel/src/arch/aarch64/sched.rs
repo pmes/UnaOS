@@ -11145,8 +11145,13 @@ fn nopreempt_held(cpu: usize) -> bool {
 /// The core index is captured at acquisition and used at release, so a task that MIGRATES between
 /// the two decrements the counter it incremented. That is the same reason `wm::BlitGuard` stores its
 /// enter-core rather than re-reading it at drop.
+///
+/// PREEMPTOFFARMSTALEDROP (zenbook-ledger Z91): the guard also carries its core's preempt-off epoch at the take
+/// (`preemptoff::HOLD_EPOCH`, bumped at every 0 -> 1 take and every dispatch-time reset), so a guard whose count was reset
+/// under it (its holder yielded inside the span) releases nothing when it drops: a later hold's count is never taken.
 pub struct PreemptHold {
     core: usize,
+    epoch: u32,
 }
 
 /// COMPGATE — take a preemption hold on this core. See the ledger above for the contract; the caller
@@ -11162,20 +11167,19 @@ pub fn preempt_hold() -> PreemptHold {
 #[inline]
 fn hold_at(site: &'static core::panic::Location<'static>) -> PreemptHold {
     let core = meter_current_cpu().min(NUM_CPUS - 1);
-    if NOPREEMPT[core].fetch_add(1, Ordering::AcqRel) == 0 {
-        preemptoff::note_holder(core, site);
-    }
-    PreemptHold { core }
+    let epoch = if NOPREEMPT[core].fetch_add(1, Ordering::AcqRel) == 0 {
+        preemptoff::note_holder(core, site)
+    } else {
+        preemptoff::epoch(core)
+    };
+    PreemptHold { core, epoch }
 }
 
 impl Drop for PreemptHold {
     fn drop(&mut self) {
-        // Saturating rather than a bare `fetch_sub`: an underflow would wrap to `u32::MAX` and
-        // disable preemption on this core for the rest of the boot, which is the one failure mode
-        // this whole block exists to make impossible.
-        let _ = NOPREEMPT[self.core].fetch_update(Ordering::AcqRel, Ordering::Relaxed, |n| {
-            Some(n.saturating_sub(1))
-        });
+        // PREEMPTOFFARMSTALEDROP (Z91): released through `preemptoff::release`, which decrements only when this guard's
+        // epoch is still its core's (else the count is a later hold's: counted, never taken).
+        preemptoff::release(self.core, self.epoch);
     }
 }
 
@@ -11258,7 +11262,10 @@ pub fn spawn_joinable_stack(name: &'static str, entry: fn(usize), arg: usize, cp
 // `timer_preempt` returns at the decline before the countdown, COMPGATE hazard 3; x86 consumes it — the divergence is
 // deliberate: pause charges the holder only the ticks it ran unheld), so there is no FIRED counter (nothing is pending
 // after a decline); the outermost take records its holder (task + site) and `on_dispatch` resets a count the dispatched
-// task does not hold, named once in x86's words.
+// task does not hold, named once in x86's words. PREEMPTOFF-ARM-STALEDROP — BUILT by PREEMPTOFFARMSTALEDROP (zenbook-ledger
+// Z91): ONE per-core epoch beside the holder record, bumped at the 0 -> 1 take and at that reset, stored in `PreemptHold`
+// and compared in its masked `release`, so a holder that yielded inside its span and drops after a reset takes no later
+// hold's decrement (`stale_drop=`, said once).
 pub mod preemptoff {
     use super::{current_tid_relaxed, meter_current_cpu, nopreempt_held, NOPREEMPT, NUM_CPUS};
     use core::panic::Location;
@@ -11277,6 +11284,12 @@ pub mod preemptoff {
     static LAST_RESET_TID: [AtomicU64; NUM_CPUS] = [const { AtomicU64::new(0) }; NUM_CPUS];
     static LEAK_RESETS: AtomicU32 = AtomicU32::new(0);
     static LEAK_SAID: AtomicBool = AtomicBool::new(false);
+    /// PREEMPTOFFARMSTALEDROP (Z91): this core's preempt-off epoch — bumped by its own core at the 0 -> 1 take
+    /// (`note_holder`) and at the dispatch-time reset (`on_dispatch`); a `PreemptHold` keeps the value it took under.
+    static HOLD_EPOCH: [AtomicU32; NUM_CPUS] = [const { AtomicU32::new(0) }; NUM_CPUS];
+    /// Guards dropped with a stale epoch this boot (the KAT's own given back): `stale_drop=`; the once-line's latch.
+    static STALE_DROPS: AtomicU32 = AtomicU32::new(0);
+    static STALE_SAID: AtomicBool = AtomicBool::new(false);
 
     /// This core's slot, clamped exactly as `preempt_hold` / `preempt_hold_standing` clamp it (the slot read is the slot
     /// written).
@@ -11347,7 +11360,7 @@ pub mod preemptoff {
         }
         let ((fat_on, fat_held), (dir_on, dir_held)) = crate::fs::fat::preemptoff_span_probe();
         let ((m_fat_on, _), (m_dir_on, _)) = crate::arch::without_interrupts(crate::fs::fat::preemptoff_span_probe);
-        let masked_kept = !m_fat_on && !m_dir_on; let ul = crate::fs::unafs::unafs_leg(); let lk = leak_kat(); // PREEMPTOFFARMQUANTUM (zenbook-ledger Z89): the leak-reset KAT runs before `released` too. PREEMPTOFFARMUNAFS (zenbook-ledger Z79): the UnaFS read-arm leg, before `released` so it also proves the leg gave the count back (LINE-NEUTRAL)
+        let masked_kept = !m_fat_on && !m_dir_on; let ul = crate::fs::unafs::unafs_leg(); let lk = leak_kat(); let sk = stale_kat(); // PREEMPTOFFARMSTALEDROP (zenbook-ledger Z91): the stale-drop KAT after the leak KAT. PREEMPTOFFARMQUANTUM (zenbook-ledger Z89): the leak-reset KAT runs before `released` too. PREEMPTOFFARMUNAFS (zenbook-ledger Z79): the UnaFS read-arm leg, before `released` so it also proves the leg gave the count back (LINE-NEUTRAL)
         let released = !witness().0;
         let reason = if !fat_on {
             Some("fat-masked")
@@ -11358,36 +11371,78 @@ pub mod preemptoff {
         } else if !masked_kept {
             Some("unmasked")
         } else if !released {
-            Some("leaked") } else if !(ul == "ok" || ul.starts_with("skip")) { Some("unafs-leg") } else if lk != "ok" { Some("leak-kat")
+            Some("leaked") } else if !(ul == "ok" || ul.starts_with("skip")) { Some("unafs-leg") } else if lk != "ok" { Some("leak-kat") } else if sk != "ok" { Some("stale-kat")
         } else {
             None
         };
         let ok = |b: bool, y: &'static str, n: &'static str| if b { y } else { n };
         match reason {
             None => serial_println!(
-                ":: PREEMPTAUDIT: arch=aarch64 sites={} isr={} holder={} both={} converted={} converted_fat={} fat_irq_on=ok dir_irq_on=ok fat_held=ok dir_held=ok masked_kept=ok released=ok unafs_leg={} leak_reset={} leak_kat={} -> PASS ::",
-                AUDIT_SITES, AUDIT_ISR, AUDIT_HOLDER, AUDIT_BOTH, AUDIT_CONVERTED, CONVERTED_FAT, ul, leak_resets(), lk
+                ":: PREEMPTAUDIT: arch=aarch64 sites={} isr={} holder={} both={} converted={} converted_fat={} fat_irq_on=ok dir_irq_on=ok fat_held=ok dir_held=ok masked_kept=ok released=ok unafs_leg={} leak_reset={} leak_kat={} stale_drop={} stale_kat={} -> PASS ::",
+                AUDIT_SITES, AUDIT_ISR, AUDIT_HOLDER, AUDIT_BOTH, AUDIT_CONVERTED, CONVERTED_FAT, ul, leak_resets(), lk, stale_drops(), sk
             ),
             Some(r) => serial_println!(
-                ":: PREEMPTAUDIT: arch=aarch64 sites={} isr={} holder={} both={} converted={} converted_fat={} fat_irq_on={} dir_irq_on={} fat_held={} dir_held={} masked_kept={} released={} unafs_leg={} leak_reset={} leak_kat={} -> FAIL reason={} ::",
+                ":: PREEMPTAUDIT: arch=aarch64 sites={} isr={} holder={} both={} converted={} converted_fat={} fat_irq_on={} dir_irq_on={} fat_held={} dir_held={} masked_kept={} released={} unafs_leg={} leak_reset={} leak_kat={} stale_drop={} stale_kat={} -> FAIL reason={} ::",
                 AUDIT_SITES, AUDIT_ISR, AUDIT_HOLDER, AUDIT_BOTH, AUDIT_CONVERTED, CONVERTED_FAT,
                 ok(fat_on, "ok", "masked"),
                 ok(dir_on, "ok", "masked"),
                 ok(fat_held, "ok", "free"),
                 ok(dir_held, "ok", "free"),
                 ok(masked_kept, "ok", "unmasked"),
-                ok(released, "ok", "leaked"), ul, leak_resets(), lk,
+                ok(released, "ok", "leaked"), ul, leak_resets(), lk, stale_drops(), sk,
                 r
             ),
         }
     }
 
     /// PREEMPTOFFARMQUANTUM (Z89): record `core`'s holder at its outermost take (the task running there and the take's site).
-    pub(super) fn note_holder(core: usize, site: &'static Location<'static>) {
+    /// PREEMPTOFFARMSTALEDROP (Z91): and bump `core`'s epoch, returning the new value (the outermost guard's).
+    pub(super) fn note_holder(core: usize, site: &'static Location<'static>) -> u32 {
         if core < NUM_CPUS {
             HOLD_TID[core].store(current_tid_relaxed(core), Ordering::Relaxed);
             HOLD_SITE[core].store(site as *const Location<'static> as *mut Location<'static>, Ordering::Relaxed);
+            return HOLD_EPOCH[core].fetch_add(1, Ordering::Relaxed).wrapping_add(1);
         }
+        0
+    }
+
+    /// PREEMPTOFFARMSTALEDROP (Z91): `core`'s current epoch (a nested take's guard keeps it).
+    pub(super) fn epoch(core: usize) -> u32 {
+        if core < NUM_CPUS { HOLD_EPOCH[core].load(Ordering::Relaxed) } else { 0 }
+    }
+
+    /// PREEMPTOFFARMSTALEDROP (Z91): `PreemptHold`'s release. Masked, so on its own core the compare and the decrement
+    /// cannot straddle a dispatch. Epoch still `core`'s: the saturating decrement (an underflow would wrap to `u32::MAX`
+    /// and disable preemption on that core for the rest of the boot). Stale (the count was reset under this guard, and may
+    /// now be a later hold's): nothing released, counted, said once. A CROSS-core drop (a holder migrated out of a held
+    /// span) reads and decrements another core's slot in two atomics: a reset + retake between them is not closed
+    /// (PREEMPTOFF-ARM-STALEXCORE, owed).
+    pub(super) fn release(core: usize, epoch: u32) {
+        if core >= NUM_CPUS {
+            return;
+        }
+        let stale = crate::arch::without_interrupts(|| {
+            let now = HOLD_EPOCH[core].load(Ordering::Relaxed);
+            if now != epoch {
+                STALE_DROPS.fetch_add(1, Ordering::Relaxed);
+                return Some((now, current_tid_relaxed(slot())));
+            }
+            let _ = NOPREEMPT[core].fetch_update(Ordering::AcqRel, Ordering::Relaxed, |n| Some(n.saturating_sub(1)));
+            None
+        });
+        if let Some((now, tid)) = stale {
+            if !STALE_SAID.swap(true, Ordering::AcqRel) {
+                serial_println!(
+                    "[sched] preempt-off stale drop cpu={} holder={} epoch={}/{} -> not released (PREEMPTOFFARMSTALEDROP Z91)",
+                    core, tid, epoch, now
+                );
+            }
+        }
+    }
+
+    /// PREEMPTOFFARMSTALEDROP (Z91): guards dropped with a stale epoch this boot (the KAT's own given back): `stale_drop=`.
+    pub fn stale_drops() -> u32 {
+        STALE_DROPS.load(Ordering::Relaxed)
     }
 
     /// PREEMPTOFFARMQUANTUM (Z89): the dispatch fold (`dispatch_next`, IRQ masked, before `current` is published). A count
@@ -11408,6 +11463,7 @@ pub mod preemptoff {
             return;
         }
         NOPREEMPT[cpu].store(0, Ordering::Relaxed);
+        HOLD_EPOCH[cpu].fetch_add(1, Ordering::Relaxed); // PREEMPTOFFARMSTALEDROP (Z91): every guard taken before the reset is stale
         LAST_RESET_TID[cpu].store(holder, Ordering::Relaxed);
         LEAK_RESETS.fetch_add(1, Ordering::Relaxed);
         if !LEAK_SAID.swap(true, Ordering::AcqRel) {
@@ -11453,6 +11509,84 @@ pub mod preemptoff {
         "ok"
     }
 
+    /// PREEMPTOFFARMSTALEDROP (Z91) KAT state: the follower ran; the holder's verdict code (0 = the holder never stored one).
+    static STALE_KAT_AFTER_RAN: AtomicBool = AtomicBool::new(false);
+    static STALE_KAT_CODE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+    /// The stale KAT's follower: a task whose dispatch on the holder's core, while the holder is yielded inside its span,
+    /// resets the holder's count (Z89's `on_dispatch`).
+    fn stale_kat_after(_: usize) {
+        STALE_KAT_AFTER_RAN.store(true, Ordering::Release);
+    }
+
+    /// The stale KAT's holder, pinned to core `c`: its verdict code into `STALE_KAT_CODE`.
+    fn stale_kat_holder(c: usize) {
+        let code = stale_kat_run(c);
+        STALE_KAT_CODE.store(code, Ordering::Release);
+    }
+
+    /// Take g1, yield through the real `yield_now` until the follower ran on this core (the reset), take g2 (a LATER
+    /// hold), drop g1: it must be counted stale and leave g2's count held; drop g2: free. Codes: 1 no-yield, 2 not-reset,
+    /// 3 not-counted, 4 stolen, 5 not-released, 6 ok.
+    fn stale_kat_run(c: usize) -> u8 {
+        let site = Location::caller();
+        let g1 = crate::arch::without_interrupts(|| super::hold_at(site));
+        let me = current_tid_relaxed(c);
+        let follower = super::spawn_joinable("preemptoff-stale-after", stale_kat_after, 0, c);
+        let m0 = crate::arch::ms();
+        while !STALE_KAT_AFTER_RAN.load(Ordering::Acquire) && crate::arch::ms().wrapping_sub(m0) < 1000 {
+            super::yield_now();
+        }
+        let code = if !STALE_KAT_AFTER_RAN.load(Ordering::Acquire) {
+            drop(g1);
+            1
+        } else if LAST_RESET_TID[c].load(Ordering::Relaxed) != me {
+            drop(g1);
+            2
+        } else {
+            let g2 = crate::arch::without_interrupts(|| super::hold_at(site));
+            let s0 = STALE_DROPS.load(Ordering::Relaxed);
+            drop(g1);
+            let counted = STALE_DROPS.load(Ordering::Relaxed) == s0.wrapping_add(1);
+            let held = nopreempt_held(c);
+            drop(g2);
+            let free = !nopreempt_held(c);
+            if !counted {
+                3
+            } else if !held {
+                4
+            } else if !free {
+                5
+            } else {
+                6
+            }
+        };
+        follower.join();
+        code
+    }
+
+    /// PREEMPTOFFARMSTALEDROP (Z91) KAT (`stale_kat=`): the forced-yield holder above, pinned to this core and joined.
+    /// `ok` gives back the KAT's own reset and its own stale drop, so `leak_reset=` and `stale_drop=` count real events only.
+    pub fn stale_kat() -> &'static str {
+        let c = slot();
+        STALE_KAT_AFTER_RAN.store(false, Ordering::Release);
+        STALE_KAT_CODE.store(0, Ordering::Release);
+        super::spawn_joinable("preemptoff-stale", stale_kat_holder, c, c).join();
+        match STALE_KAT_CODE.load(Ordering::Acquire) {
+            6 => {
+                LEAK_RESETS.fetch_sub(1, Ordering::Relaxed);
+                STALE_DROPS.fetch_sub(1, Ordering::Relaxed);
+                "ok"
+            }
+            1 => "no-yield",
+            2 => "not-reset",
+            3 => "not-counted",
+            4 => "stolen",
+            5 => "not-released",
+            _ => "not-run",
+        }
+    }
+
     /// PREEMPTOFFARMCENSUS (zenbook-ledger Z72) M1: the census of the aarch64 kernel's IRQ-mask sites (cores.md §4, the
     /// PREEMPTOFFARM line), measured at 05beb9fa9 (held at d06742fa1) over FIVE forms — `arch::without_interrupts`, `arch::IrqMask`, this file's
     /// `mask_irq` / `irq_save_mask`, syscall.rs `IrqGuard::mask_save` / `remask_irq`, raw `msr daifset` (#2, #0xf); NOT the
@@ -11466,5 +11600,5 @@ pub mod preemptoff {
     pub const AUDIT_ISR: u32 = 28;
     pub const AUDIT_HOLDER: u32 = 116;
     pub const AUDIT_BOTH: u32 = 23;
-    pub const AUDIT_CONVERTED: u32 = CONVERTED_FAT + crate::fs::unafs::CONVERTED_UNAFS_ARM + CONVERTED_USBNET + CONVERTED_CURSORMOVE; #[cfg(feature = "usbnet")] use crate::drivers::xhci::usbnet::CONVERTED_USBNET; #[cfg(not(feature = "usbnet"))] const CONVERTED_USBNET: u32 = 0; const CONVERTED_CURSORMOVE: u32 = cfg!(feature = "baremetal") as u32; // PREEMPTOFFARMUNAFS (zenbook-ledger Z79): the Pi read arm (1 on baremetal, 0 elsewhere); PREEMPTOFFARMUSBNETDRIVE (zenbook-ledger Z83): usbnet's `drive` span (1 where `usbnet` is compiled, 0 elsewhere); PREEMPTOFFARMCURSORMOVE (zenbook-ledger Z85): the input router's cursor span (`main.rs` `cursormove_span`, 1 on baremetal, 0 elsewhere). LINE-NEUTRAL
+    pub const AUDIT_CONVERTED: u32 = CONVERTED_FAT + crate::fs::unafs::CONVERTED_UNAFS_ARM + CONVERTED_USBNET + CONVERTED_CURSORMOVE + CONVERTED_CASTS; #[cfg(feature = "usbnet")] use crate::drivers::xhci::usbnet::CONVERTED_USBNET; #[cfg(not(feature = "usbnet"))] const CONVERTED_USBNET: u32 = 0; const CONVERTED_CURSORMOVE: u32 = cfg!(feature = "baremetal") as u32; const CONVERTED_CASTS: u32 = cfg!(feature = "desktop_firmware") as u32; // PREEMPTOFFARMUNAFS (zenbook-ledger Z79): the Pi read arm (1 on baremetal, 0 elsewhere); PREEMPTOFFARMUSBNETDRIVE (zenbook-ledger Z83): usbnet's `drive` span (1 where `usbnet` is compiled, 0 elsewhere); PREEMPTOFFARMCURSORMOVE (zenbook-ledger Z85): the input router's cursor span (`main.rs` `cursormove_span`, 1 on baremetal, 0 elsewhere); PREEMPTOFFARMCASTS (zenbook-ledger Z93): the shadow pass's CASTS publish span (`video/desktop.rs` `casts_span`, 1 on `desktop_firmware`, 0 elsewhere). LINE-NEUTRAL
 }

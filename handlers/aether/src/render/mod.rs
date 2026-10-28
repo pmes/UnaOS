@@ -3072,10 +3072,16 @@ fn frame_walk(
                             let lh = crate::fonts::line_height(font, fs, 0.0);
                             // AETHERSUBMITCAPTION (SR410): a push button's caption is ALWAYS centred (Chromium centres
                             // an overflowing label) and clipped to its padding box (html.css `input { overflow: clip }`).
-                            let (tx, ty, max_w) = if is_push_button {
+                            // AETHERCAPTIONCORE (SR438): the caption's x, line top and padding-box clip are ONE layout_core
+                            // rule, `caption_box`, the one AETHER.ELF's paint.rs `caption` draws by (raw extents here).
+                            let caption = is_push_button.then(|| {
+                                let (ascent, descent) = text_extents(font, fs);
+                                layout_core::caption_box(box_sx, box_sy, bw, bh, bord, pad, text_w, ascent, descent)
+                            });
+                            let (tx, ty, max_w) = if let Some(c) = caption {
                                 (
-                                    content_x + (content_w - text_w) / 2.0,
-                                    centered_line_origin_y(font, fs, content_y + content_h / 2.0),
+                                    c.x,
+                                    c.top,
                                     if text_w <= content_w { content_w.max(1.0) } else { f32::MAX }, // one line, never wrapped
                                 )
                             } else {
@@ -3117,13 +3123,9 @@ fn frame_walk(
                                     fill_rect(cx, ty, cx + 1.0, ty + lh, color, 255, surface, width, height, damage_rects, clip);
                                 }
                             } else {
-                                let caption_clip = if is_push_button {
-                                    (
-                                        clip.0.max(box_sx + bord.left),
-                                        clip.1.max(box_sy + bord.top),
-                                        clip.2.min(box_sx + bw - bord.right),
-                                        clip.3.min(box_sy + bh - bord.bottom),
-                                    )
+                                // AETHERCAPTIONCORE (SR438): the running clip meets caption_box's padding box.
+                                let caption_clip = if let Some(c) = caption {
+                                    (clip.0.max(c.clip.0), clip.1.max(c.clip.1), clip.2.min(c.clip.2), clip.3.min(c.clip.3))
                                 } else {
                                     clip
                                 };

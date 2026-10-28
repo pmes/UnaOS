@@ -4324,7 +4324,7 @@ fn take_block_loan() -> Result<BlockLoan, XhciClaimError> {
     crate::arch::sched::preemptoff::disable();
     match xhci::claim() {
         Ok(l) => {
-            if loan_poll_yield_skip() { drop(l); crate::arch::sched::preemptoff::enable(); return Err(XhciClaimError::Busy); } let tag = crate::arch::percpu::this_cpu().cpu_index.saturating_add(1); loan_shed_arm(); loan_yield_close(); // XHCILOANPTPYIELDPOLLSKIP (Z86): the xhci-poll take inside an open PTP yield window goes straight back (unpublished, the closer left OPEN). XHCILOANFAILHOLD (Z66): the loan's age starts here, its shed mark cleared. XHCILOANPTPYIELDPOLLTAKE (Z82): an open PTP yield window records its closer BEFORE the publish below
+            if loan_poll_yield_skip() || loan_ptp_yield_wait() { drop(l); crate::arch::sched::preemptoff::enable(); return Err(XhciClaimError::Busy); } let tag = crate::arch::percpu::this_cpu().cpu_index.saturating_add(1); loan_shed_arm(); loan_yield_close(); // XHCILOANPTPYIELDPOLLSKIP (Z86): the xhci-poll take inside an open PTP yield window goes straight back (unpublished, the closer left OPEN). XHCILOANFAILHOLD (Z66): the loan's age starts here, its shed mark cleared. XHCILOANPTPYIELDPOLLTAKE (Z82): an open PTP yield window records its closer BEFORE the publish below. XHCILOANPTPYIELDPTPWAIT (Z90): so does a second PTP claimant's take (claim_only's mark, not the window's holder), which then waits the window out in claim_xhci_for_io's hlt loop
             BLOCK_LOAN_CPU.store(tag, core::sync::atomic::Ordering::Release);
             Ok(BlockLoan { loan: Some(l), tag })
         }
@@ -4490,7 +4490,7 @@ impl BlockLoan {
             ptp_masked_refusal();
             return Err(BlockError::Busy);
         }
-        let _ptp = LoanPtpMark::set(); let mut l = claim_xhci_for_io()?; // XHCILOANPTPYIELDPTPTAKE (Z87): this task is marked a PTP claimant until claim_only returns
+        let _ptp = LoanPtpMark::set(); let mut l = claim_xhci_for_io()?; // XHCILOANPTPYIELDPTPTAKE (Z87): this task is marked a PTP claimant until claim_only returns; XHCILOANPTPYIELDPTPWAIT (Z90): the mark, held across claim_xhci_for_io's wait, refuses this task's take inside a yield window
         l.demote();
         LOAN_PTP_CLAIMS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         Ok(l)
@@ -4580,7 +4580,7 @@ impl BlockLoan {
         }
         let before: *const crate::drivers::xhci::XhciController = &***self;
         let t0 = crate::arch::now_cycles();
-        LOAN_YIELD_CLOSER.store(LOAN_CLOSER_OPEN, Ordering::Release); drop(self.loan.take()); // the PUT: XhciLoan's masked O(1) put. XHCILOANPTPYIELDPOLLTAKE (Z82): the window is marked open while this hold still has the loan
+        loan_yield_holder_set(); LOAN_YIELD_CLOSER.store(LOAN_CLOSER_OPEN, Ordering::Release); drop(self.loan.take()); // the PUT: XhciLoan's masked O(1) put. XHCILOANPTPYIELDPTPWAIT (Z90): this hold is recorded as the window's holder (its own re-take is never the second claimant). XHCILOANPTPYIELDPOLLTAKE (Z82): the window is marked open while this hold still has the loan
         let m0 = crate::arch::ms();
         let mut taken = false;
         loop {
@@ -5219,4 +5219,58 @@ impl core::fmt::Display for PollSkips {
         let n = POLL_YIELD_SKIPS.load(core::sync::atomic::Ordering::Relaxed);
         if n == 0 { Ok(()) } else { write!(f, " poll_skips={}", n) }
     }
+}
+
+// ══════════ XHCILOANPTPYIELDPTPWAIT (zenbook-ledger Z90) — a second PTP claim waits a PTP yield window out instead of taking it ══════════
+//
+// TAIL-APPENDED (two LINE-NEUTRAL folds: `take_block_loan`'s x86 Ok arm, Z86's gate `if`; `yield_now`'s PUT line). A second
+// PTP/MTP claim (`claim_only`, marked by Z87's `LoanPtpMark`) inside a window (`ptp::TXN_YIELDED`, Z73; <= 3 ms) took the
+// loan, closed the window a block claimant was waiting for (Z87's `taken_ptp=`), and was then refused by `with_controller`
+// anyway. Its take is now refused at Z86's gate site (after `claim()` Ok, before Z82's closer and the publish: the loan goes
+// straight back unpublished, the closer stays OPEN, `Busy`), and `claim_xhci_for_io`'s existing hlt loop (`hw_wait_budget`)
+// is the wait: no second wait loop. A masked claimant never gets here (`claim_only` refuses it at once, before the mark).
+// The window's holder is exempt by identity: `yield_now` re-takes through `claim_only` with `TXN_YIELDED` still set and marks
+// itself when the mark is free, so the holder writes its task id before its put. One gate site, two predicates: Z86's keys
+// on the task name and carries poll-only side effects. Owed: XHCILOAN-PTPYIELD-LOOPONE (Z88's `YIELD_KAT_WINDOWS` to 1),
+// XHCILOAN-PTPYIELD-PTPMARK-MANY (one mark word: a third concurrent PTP claimant is unmarked), XHCILOAN-PTPYIELD-OUT.
+
+/// XHCILOANPTPYIELDPTPWAIT: the task id of the PTP hold that opened the current yield window. Written only by that holder in
+/// `yield_now`, before its put; meaningful only while `ptp::TXN_YIELDED` is set (rewritten before every window, one yielding
+/// hold at a time), so never cleared. Lock-free.
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+static LOAN_YIELD_HOLDER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// XHCILOANPTPYIELDPTPWAIT: the first refusal of a second PTP claim inside a window was said (once per boot).
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+static PTP_WAIT_SAID: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// XHCILOANPTPYIELDPTPWAIT: record the current task as the window's holder (called by `yield_now` right before its put).
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+#[inline]
+fn loan_yield_holder_set() {
+    LOAN_YIELD_HOLDER.store(crate::arch::sched::current_id().unwrap_or(0), core::sync::atomic::Ordering::Release);
+}
+
+/// XHCILOANPTPYIELDPTPWAIT: called by `take_block_loan` after a successful `claim()` and BEFORE the closer and the publish,
+/// beside Z86's `loan_poll_yield_skip`: `true` = a PTP yield window is open and this is the take of the task `claim_only`
+/// marked, not the window's holder (the caller puts the loan back and answers `Busy`; `claim_xhci_for_io` retries).
+/// One load and out for every take outside a window; `false`, inlined away, without `uvc` (no window exists).
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn loan_ptp_yield_wait() -> bool {
+    #[cfg(feature = "uvc")]
+    {
+        use core::sync::atomic::Ordering;
+        if xhci::ptp::TXN_YIELDED.load(Ordering::Acquire) {
+            if let Some(t) = crate::arch::sched::current_id() {
+                if t == LOAN_PTP_TAKER.load(Ordering::Acquire) && t != LOAN_YIELD_HOLDER.load(Ordering::Acquire) {
+                    if !PTP_WAIT_SAID.swap(true, Ordering::Relaxed) {
+                        serial_println!("[xhci] ptp wait why=ptp-yield who=ptp (XHCILOANPTPYIELDPTPWAIT Z90, first wait, once)");
+                    }
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }

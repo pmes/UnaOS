@@ -7601,7 +7601,7 @@ static BLIT_RING_HELD: crate::sync::Mutex<(usize, usize)> = crate::sync::Mutex::
 // rule is R7's `r7_reclaim` (never_fetched = false: a held block may carry an earlier run's fetch); the witness is R6c's
 // read-back of `0x101008` banked this boot (`flush_bank`), never "the engine is idle" (GEN7TLB, gen7.rs R6c). On a part
 // whose R6c reads `tlb-flush-write-silent` (the RMBP) every engine is refused by name once per boot and its slot stays
-// intact, so reuse is unchanged. GEN7-HELD-PARK / GEN7-TLB-WITNESS owed (FLUSH-VERDICT-ONE: built by B1045 below).
+// intact, so reuse is unchanged. GEN7-HELD-PARK: GEN7HELDPARK (B1067) below; GEN7-TLB-WITNESS owed (FLUSH-VERDICT-ONE: built by B1045 below).
 // =================================================================================
 
 /// The boot's `0x101008` read-backs (R6c, R7, R8 via `flush_verdict`): 0 unmeasured, 1 decodes, 2 write-silent, 3 all-ones.
@@ -7653,12 +7653,7 @@ pub(crate) fn held_release(slot: &crate::sync::Mutex<(usize, usize)>, engine: &'
             _ => "flush-write-silent",
         }
     };
-    let bit: u8 = match engine {
-        "r9" => 1,
-        "r10" => 2,
-        "r11" => 4,
-        _ => 8,
-    };
+    let bit = kept_bit(engine, why); // GEN7HELDPARK (B1067): the not-quiesced keep (the park's) has its own once-bit (gen7.rs tail)
     if KEPT_SAID.fetch_or(bit, core::sync::atomic::Ordering::Relaxed) & bit == 0 {
         serial_println!("[gen7] held release engine={} kb={} -> KEPT held_kept={}:{}", engine, n * 4, engine, why);
     }
@@ -7751,11 +7746,11 @@ fn order_leg() {
             "ok"
         };
         let v = if w == "ok" { "PASS" } else if w.starts_with("skip") { "SKIP" } else { "FAIL" };
-        let (v, n, kat) = nohold_leg(v); serial_println!(":: GEN7ORDER: pair=pages->blit-ring fwd={} rev={} inversions={}->{} -> {} gen7_order={} slot_nohold={} slot_kat={} ::", fwd as u8, rev as u8, i0, i1, v, w, n, kat);
+        let (v, n, kat) = nohold_leg(v); let (v, pk) = park_leg(v); serial_println!(":: GEN7ORDER: pair=pages->blit-ring fwd={} rev={} inversions={}->{} -> {} gen7_order={} slot_nohold={} slot_kat={} park_kat={} ::", fwd as u8, rev as u8, i0, i1, v, w, n, kat, pk);
     }
     #[cfg(not(feature = "gen7blit"))]
     {
-        let (v, n, kat) = nohold_leg("SKIP"); serial_println!(":: GEN7ORDER: pair=pages->blit-ring fwd=0 rev=0 inversions=0->0 -> {} gen7_order=skip(no-gen7blit) slot_nohold={} slot_kat={} ::", v, n, kat);
+        let (v, n, kat) = nohold_leg("SKIP"); let (v, pk) = park_leg(v); serial_println!(":: GEN7ORDER: pair=pages->blit-ring fwd=0 rev=0 inversions=0->0 -> {} gen7_order=skip(no-gen7blit) slot_nohold={} slot_kat={} park_kat={} ::", v, n, kat, pk);
     }
 }
 
@@ -7768,7 +7763,7 @@ fn order_leg() {
 // across op=<what> slot=<name>` per boot; it never panics and takes no lock. The engine lock (gen7blit's `PAGES`) is
 // held across ops by design and is not a slot. `tests gen7`'s GEN7ORDER line carries `slot_nohold=<n>` (0 = pass) and
 // `slot_kat=` (one slot taken by `try_lock`, checked under SLOT_KAT, its own count given back: B1034's shape).
-// GEN7-SLOT-NOHOLD-RUNGS owed: R5-R8's `witnessed_write` sites in this file carry no token.
+// GEN7-SLOT-NOHOLD-RUNGS: built by GEN7SLOTNOHOLDRUNGS (B1050): R5-R8's GPU-op lines (and R8b's band kick) carry the token.
 // =================================================================================
 
 /// Slot holds seen live across a GPU op this boot (the KAT's own count given back).
@@ -7854,4 +7849,43 @@ fn nohold_leg(v: &'static str) -> (&'static str, usize, &'static str) {
     });
     let n = SLOT_HELD_N.load(core::sync::atomic::Ordering::Relaxed);
     (if n != 0 || kat == "miss" { "FAIL" } else { v }, n, kat)
+}
+
+// =================================================================================
+// GEN7HELDPARK (rmbp-ledger B1067) — FILE-TAIL append: nothing above it moves. gpu.md's GEN7-HELD-PARK asked for a
+// release at the compositor's engine park if B1039's one release site was not it. Measured at 9e5a5521f: the one park
+// is the stall demote in `blit::BcsBlitter::blit` (`ARMED` false + `demote_bcs`), reached only after `bcs_job`'s tail
+// has run `held_release(&BLIT_RING_HELD, "blit", all_disabled, ..)` with `all_disabled` false (the ring did not drain,
+// its PTEs stay claimed): the release site already runs on the park's path and the rule refuses there, so no second
+// release site is built (a live engine may still DMA the page). `bcs_job` itself never parks (bounded `poll_cycles`
+// only) and no slot guard outlives its fn (BP-gpu-9). The gap was the wire: `held_release`'s once-rule was one bit per
+// engine, so on a part whose healthy jobs are refused `flush-write-silent` first a later stall's `ring-not-disabled`
+// keep (the park's hold for the boot) was never said. `kept_bit` keys the once-bit by (engine, class); `park_leg` is
+// its pure KAT on the GEN7ORDER line (`park_kat=`). GEN7-PARK-UNWIND (recover a stalled window late) owed.
+// =================================================================================
+
+/// `held_release`'s once-bit: one per engine (r9 1, r10 2, r11 4, gen7blit 8) for the flush / PTE refusals, the same
+/// bit `<< 4` for `ring-not-disabled` (the not-quiesced keep the compositor's park follows), so neither silences the other.
+#[cfg(any(feature = "gen7r9", feature = "gen7blit"))]
+fn kept_bit(engine: &str, why: &str) -> u8 {
+    let b: u8 = match engine {
+        "r9" => 1,
+        "r10" => 2,
+        "r11" => 4,
+        _ => 8,
+    };
+    if why == "ring-not-disabled" { b << 4 } else { b }
+}
+
+/// GEN7ORDER's `park_kat=` term `(verdict, word)`: pure (no lock, no print). gen7blit's flush keep and its park keep
+/// must hold distinct non-zero bits, and r9's park keep must not alias gen7blit's; a miss FAILs, else `v` stands.
+#[allow(unreachable_code)]
+fn park_leg(v: &'static str) -> (&'static str, &'static str) {
+    #[cfg(any(feature = "gen7r9", feature = "gen7blit"))]
+    {
+        let (flush, park, other) = (kept_bit("blit", "flush-write-silent"), kept_bit("blit", "ring-not-disabled"), kept_bit("r9", "ring-not-disabled"));
+        let k = if flush != 0 && park != 0 && flush & park == 0 && other & park == 0 { "ok" } else { "miss" };
+        return (if k == "miss" { "FAIL" } else { v }, k);
+    }
+    (v, "skip(no-release)")
 }
