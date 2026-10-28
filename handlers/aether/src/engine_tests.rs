@@ -3854,4 +3854,199 @@ mod tests {
         assert!(red(mx, my), "the pill's background paints inside it at ({mx}, {my})");
         assert!(!(0..100).any(|x| red(x, my)), "and nothing red at the viewport's left (x < 100)");
     }
+
+    /// AETHERHEADERBAND (SR412) M1 instrument, #[ignore]d: renders each headerband fixture at 1810x1280 through
+    /// the ordinary load + render_frame path and prints, per blue of the candidate family, the painted extent in the
+    /// top 400 rows, whether its four corner pixels are painted, the CSSOM owner at its centre (elementFromPoint), and
+    /// each candidate element's rect and computed style. `cargo test -p aether --lib header_band_measure -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn header_band_measure() {
+        let fixtures: [(&str, &str, &[&str]); 3] = [
+            ("google-home", include_str!("../tests/data/headerband/google-home.html"), &[]),
+            ("screenshot-facts", include_str!("../tests/data/headerband/screenshot-facts.html"), &["skip", "acct", "signin", "mngb", "gbar", "lga", "hplogo", "f", "ftab", "q"]),
+            ("fixed-nav", include_str!("../tests/data/headerband/fixed-nav.html"), &["nav", "first", "chipbox", "chip"]),
+        ];
+        let blues: [(&str, (u8, u8, u8)); 4] = [("#1a73e8", (0x1a, 0x73, 0xe8)), ("#4285f4", (0x42, 0x85, 0xf4)), ("#0b57d0", (0x0b, 0x57, 0xd0)), ("#c9d7f1", (0xc9, 0xd7, 0xf1))];
+        for (name, html, ids) in fixtures {
+            let mut engine = crate::AetherEngine::new();
+            engine.handle_event(crate::api::events::Event::Resize(1810, 1280));
+            engine.load_html("https://example.com/", html, true);
+            engine.render_frame();
+            let (w, h) = (engine.width, engine.height);
+            let surf = engine.surface().to_vec();
+            let px = |x: u32, y: u32| -> (u8, u8, u8) {
+                let i = ((y * w + x) * 4) as usize;
+                (surf[i + 2], surf[i + 1], surf[i])
+            };
+            println!("[headerband] fixture={} surface={}x{}", name, w, h);
+            for (label, c) in blues {
+                let (mut x0, mut y0, mut x1, mut y1, mut n) = (u32::MAX, u32::MAX, 0u32, 0u32, 0u32);
+                for y in 0..h.min(400) {
+                    for x in 0..w {
+                        if px(x, y) == c {
+                            x0 = x0.min(x);
+                            y0 = y0.min(y);
+                            x1 = x1.max(x);
+                            y1 = y1.max(y);
+                            n += 1;
+                        }
+                    }
+                }
+                if n == 0 {
+                    println!("[headerband] {} blue={} none", name, label);
+                    continue;
+                }
+                let corner = |x: u32, y: u32| if px(x, y) == c { 1 } else { 0 };
+                let (cx, cy) = ((x0 + x1) / 2, (y0 + y1) / 2);
+                let js = |e: &mut crate::AetherEngine, src: &str| e.js_engine.as_mut().unwrap().eval_string(src).unwrap_or_else(|err| format!("ERR {}", err));
+                let owner = js(&mut engine, &format!(
+                    "(function(){{var e=document.elementFromPoint({},{}),o=[];for(var i=0;e&&i<4;i++,e=e.parentElement){{var r=e.getBoundingClientRect(),s=getComputedStyle(e);\
+                     o.push(e.tagName+'#'+e.id+'.'+String(e.className).split(' ').join('.')+' rect='+r.left+','+r.top+','+r.width+'x'+r.height+' display='+s.display+' position='+s.position+\
+                     ' top='+s.top+' right='+s.right+' width='+s.width+' height='+s.height+' overflow='+s.overflow+' radius='+s.borderRadius+' bg='+s.backgroundColor);}}return o.join(' | ');}})()",
+                    cx, cy
+                ));
+                println!(
+                    "[headerband] {} blue={} box=x{}..{} y{}..{} px={} corners(tl,tr,br,bl)={},{},{},{} owner@{},{}={}",
+                    name, label, x0, x1, y0, y1, n, corner(x0, y0), corner(x1, y0), corner(x1, y1), corner(x0, y1), cx, cy, owner
+                );
+            }
+            // Any blue-dominant colour (the band's hex may be none of the four): the five most painted, with extents.
+            let mut hist: std::collections::HashMap<(u8, u8, u8), (u32, u32, u32, u32, u32)> = std::collections::HashMap::new();
+            for y in 0..h.min(400) {
+                for x in 0..w {
+                    let (r, g, b) = px(x, y);
+                    if b as i32 > r as i32 + 40 && b as i32 > g as i32 + 15 {
+                        let e = hist.entry((r, g, b)).or_insert((0, u32::MAX, u32::MAX, 0, 0));
+                        e.0 += 1;
+                        e.1 = e.1.min(x);
+                        e.2 = e.2.min(y);
+                        e.3 = e.3.max(x);
+                        e.4 = e.4.max(y);
+                    }
+                }
+            }
+            let mut top: Vec<_> = hist.into_iter().collect();
+            top.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
+            for ((r, g, b), (n, x0, y0, x1, y1)) in top.into_iter().take(5) {
+                println!("[headerband] {} blueish=#{:02x}{:02x}{:02x} px={} box=x{}..{} y{}..{}", name, r, g, b, n, x0, x1, y0, y1);
+            }
+            for id in ids {
+                let src = format!(
+                    "(function(){{var e=document.getElementById('{}');if(!e)return 'missing';var r=e.getBoundingClientRect();var s=getComputedStyle(e);\
+                     return 'rect='+r.left+','+r.top+','+r.width+'x'+r.height+' display='+s.display+' position='+s.position+' top='+s.top+' left='+s.left+' right='+s.right+\
+                     ' width='+s.width+' height='+s.height+' overflow='+s.overflow+' radius='+s.borderRadius+' margin-top='+s.marginTop+' bg='+s.backgroundColor;}})()",
+                    id
+                );
+                let out = engine.js_engine.as_mut().unwrap().eval_string(&src).unwrap_or_else(|err| format!("ERR {}", err));
+                println!("[headerband] {} #{} {}", name, id, out);
+            }
+            let rects = engine.js_engine.as_mut().unwrap().eval_string(
+                "(function(){var b=document.body.getBoundingClientRect(),h=document.documentElement.getBoundingClientRect();return 'body='+b.left+','+b.top+','+b.width+'x'+b.height+' html='+h.left+','+h.top+','+h.width+'x'+h.height;})()",
+            ).unwrap_or_else(|err| format!("ERR {}", err));
+            println!("[headerband] {} {}", name, rects);
+        }
+    }
+
+    // ---- AETHERHEADERBAND (SR412): header_band_paints_in_its_box ----
+    /// The Mac's empty font database, in-process: no face for any selection (text_host's process-global DB is never
+    /// touched). Only the four required `layout_core::Fonts` methods; the rest are the trait's defaults.
+    struct HeaderBandNoFaces;
+    impl layout_core::Fonts for HeaderBandNoFaces {
+        fn has_face(&self, _sel: layout_core::FontSel) -> bool {
+            false
+        }
+        fn measure(&self, _run: &str, _adv: &layout_core::Adv) -> f32 {
+            0.0
+        }
+        fn line_metrics(&self, _sel: layout_core::FontSel, size: f32) -> (f32, f32, f32) {
+            (size * 0.8, size * 0.2, 0.0)
+        }
+        fn x_height(&self, _sel: layout_core::FontSel, size: f32) -> f32 {
+            size * 0.5
+        }
+    }
+
+    /// The `#pill` box of a laid tree: (x, y, w, h) through `layout_core::scroll::box_origin` and the taffy size.
+    fn header_band_pill_box(tree: &crate::layout::LayoutTree) -> (f32, f32, f32, f32) {
+        let mut work = vec![tree.root_node];
+        while let Some(t) = work.pop() {
+            let is_pill = tree.node_map.get(&t).and_then(|n| n.as_element().map(|e| e.attributes.borrow().get("id").map(|v| v == "pill").unwrap_or(false))).unwrap_or(false);
+            if is_pill {
+                let (x, y) = layout_core::scroll::box_origin(tree, t, (0.0, 0.0)).expect("the pill has a box");
+                let sz = tree.taffy.layout(t).unwrap().size;
+                return (x, y, sz.width, sz.height);
+            }
+            work.extend(tree.taffy.children(t).unwrap_or_default());
+        }
+        panic!("no #pill box");
+    }
+
+    /// The pill's painted extent equals its layout box, and all four corner radii are applied. `surf` is BGRA.
+    fn header_band_check(what: &str, surf: &[u8], w: u32, h: u32, b: (f32, f32, f32, f32)) {
+        let blue = |x: u32, y: u32| {
+            let i = ((y * w + x) * 4) as usize;
+            (surf[i + 2], surf[i + 1], surf[i]) == (0x0b, 0x57, 0xd0)
+        };
+        let (bx, by, bw, bh) = b;
+        assert!(bx >= 0.0 && bx + bw <= w as f32 && by >= 0.0, "{what}: the pill's box {b:?} lies inside the {w}px viewport");
+        let (mut x0, mut y0, mut x1, mut y1) = (u32::MAX, u32::MAX, 0u32, 0u32);
+        for y in 0..h.min(200) {
+            for x in 0..w {
+                if blue(x, y) {
+                    x0 = x0.min(x);
+                    y0 = y0.min(y);
+                    x1 = x1.max(x);
+                    y1 = y1.max(y);
+                }
+            }
+        }
+        assert!(x0 != u32::MAX, "{what}: the pill paints");
+        let near = |a: u32, e: f32| (a as f32 - e).abs() <= 1.0;
+        assert!(
+            near(x0, bx) && near(x1 + 1, bx + bw) && near(y0, by) && near(y1 + 1, by + bh),
+            "{what}: painted x{x0}..{x1} y{y0}..{y1} equals the layout box {b:?}"
+        );
+        let (l, t, r, btm) = (bx.round() as u32, by.round() as u32, (bx + bw).round() as u32 - 1, (by + bh).round() as u32 - 1);
+        for (cx, cy) in [(l, t), (r, t), (r, btm), (l, btm)] {
+            assert!(!blue(cx, cy), "{what}: corner ({cx},{cy}) is outside its radius");
+        }
+        let (mx, my) = ((l + r) / 2, (t + btm) / 2);
+        for (ex, ey) in [(mx, t + 1), (r - 2, my), (mx, btm - 1), (l + 2, my)] {
+            assert!(blue(ex, ey), "{what}: edge midpoint ({ex},{ey}) is painted");
+        }
+    }
+
+    /// AETHERHEADERBAND (SR412): Peter's Mac (zero font faces) painted google.com's Sign-in pill as a band across the
+    /// top, clipped at y=0 and rounded only at its right end: `measure_text_run` gave a faceless run the whole
+    /// available width (the max-content probe's 1810 per run) while the IFC lays and the painter draws it at 0. The
+    /// reduced case is google's header row; laid with no faces the pill is its padding (46 px) inside the viewport,
+    /// painted in its box with four rounded corners; the real fonts are the control.
+    #[test]
+    fn header_band_paints_in_its_box() {
+        let html = r##"<html><head><style>
+            body { margin: 0; font-family: arial, sans-serif; font-size: 16px }
+            #row { display: flex; justify-content: flex-end; align-items: center; height: 48px; padding: 6px }
+            #row a { color: #000; padding: 0 8px; text-decoration: none }
+            #row #pill { background: #0b57d0; color: #fff; border-radius: 100px; padding: 9px 23px }
+        </style></head><body><div id="row"><a href="#">Gmail</a> <a href="#">Images</a> <a id="pill" href="#">Sign in</a></div></body></html>"##;
+        let (vw, vh) = (1810u32, 1280u32);
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(vw, vh));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        // Control: the real fonts.
+        let real = header_band_pill_box(engine.layout_tree.as_ref().expect("laid out"));
+        header_band_check("real fonts", engine.surface(), vw, vh, real);
+        // The Mac's condition: the same document laid with no faces and painted.
+        let doc = engine.document.clone().expect("a document");
+        let mut tree = crate::layout::build_tree(&doc, vw as f32, vh as f32);
+        crate::css::apply_stylesheets(&mut tree, &engine.stylesheets); // the page's cascade, as the nested-frame paint does
+        layout_core::remeasure(&mut tree, &HeaderBandNoFaces);
+        let b = header_band_pill_box(&tree);
+        assert!((b.2 - 46.0).abs() < 0.5, "no faces: the pill is its padding, 46 px wide, not the available width (got {b:?})");
+        let mut buf = vec![255u8; (vw * vh * 4) as usize];
+        crate::render::render_frame(&tree, &mut buf, vw, vh, 0.0, 0.0, &[(0, 0, vw, vh)]);
+        header_band_check("no faces", &buf, vw, vh, b);
+    }
 }
