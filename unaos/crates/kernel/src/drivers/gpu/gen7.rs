@@ -6968,7 +6968,7 @@ mod r8 {
     static STASH: crate::sync::Mutex<Option<Ctx>> = crate::sync::Mutex::new(None);
     /// The first armed run's witness. R8's pages are `reclaim=held` (GEN7TLB HOLD, gen7.md §2.6), so a
     /// second armed run would hold another ~1 MiB for an answer this boot already has: it replays.
-    static DONE: crate::sync::Mutex<Option<Witness>> = crate::sync::Mutex::new(None);
+    pub(super) static DONE: crate::sync::Mutex<Option<Witness>> = crate::sync::Mutex::new(None);
 
     fn r8_cycles_to_us(dt: u64) -> u64 {
         let hz = crate::arch::apic::tsc_hz();
@@ -7718,7 +7718,7 @@ unsafe fn flush_verdict(bar0: usize, tag: &str) -> FlushVerdict {
 // an inverted take would leave its edge for the boot and silence every later real inversion of the pair.
 // =================================================================================
 
-/// `tests gen7`'s order leg: `:: GEN7ORDER: pair=pages->blit-ring fwd= rev= inversions=<before>-><after> -> <v> gen7_order=<w> ::`.
+/// `tests gen7`'s order leg: `:: GEN7ORDER: pair=pages->blit-ring fwd= rev= inversions=<before>-><after> -> <v> gen7_order=<w> ... r8_order=<w> r8_fwd=<k>/3 r8_rev=<k> ::` (the r8 term: GEN7R8DOOREDGE B1085, `r8_order_term` at the file tail).
 fn order_leg() {
     #[cfg(feature = "gen7blit")]
     {
@@ -7746,11 +7746,11 @@ fn order_leg() {
             "ok"
         };
         let v = if w == "ok" { "PASS" } else if w.starts_with("skip") { "SKIP" } else { "FAIL" };
-        let (v, n, kat) = nohold_leg(v); let (v, pk) = park_leg(v); let (v, rk) = r8door_leg(v); serial_println!(":: GEN7ORDER: pair=pages->blit-ring fwd={} rev={} inversions={}->{} -> {} gen7_order={} slot_nohold={} slot_kat={} park_kat={} r8door_kat={} ::", fwd as u8, rev as u8, i0, i1, v, w, n, kat, pk, rk);
+        let (v, r8w, r8f, r8r) = r8_order_term(v); let (v, n, kat) = nohold_leg(v); let (v, pk) = park_leg(v); let (v, rk) = r8door_leg(v); serial_println!(":: GEN7ORDER: pair=pages->blit-ring fwd={} rev={} inversions={}->{} -> {} gen7_order={} slot_nohold={} slot_kat={} park_kat={} r8door_kat={} r8_order={} r8_fwd={}/3 r8_rev={} ::", fwd as u8, rev as u8, i0, i1, v, w, n, kat, pk, rk, r8w, r8f, r8r); // GEN7R8DOORKAT (B1084): the raced job (`r8door_leg`, file tail). GEN7R8DOOREDGE (B1085): the PAGES -> R8_HELD term (`r8_order_term`, file tail). LINE-NEUTRAL fold
     }
     #[cfg(not(feature = "gen7blit"))]
     {
-        let (v, n, kat) = nohold_leg("SKIP"); let (v, pk) = park_leg(v); let (v, rk) = r8door_leg(v); serial_println!(":: GEN7ORDER: pair=pages->blit-ring fwd=0 rev=0 inversions=0->0 -> {} gen7_order=skip(no-gen7blit) slot_nohold={} slot_kat={} park_kat={} r8door_kat={} ::", v, n, kat, pk, rk);
+        let (v, n, kat) = nohold_leg("SKIP"); let (v, pk) = park_leg(v); let (v, rk) = r8door_leg(v); serial_println!(":: GEN7ORDER: pair=pages->blit-ring fwd=0 rev=0 inversions=0->0 -> {} gen7_order=skip(no-gen7blit) slot_nohold={} slot_kat={} park_kat={} r8door_kat={} r8_order=skip(no-gen7blit) r8_fwd=0/3 r8_rev=0 ::", v, n, kat, pk, rk); // GEN7R8DOOREDGE (B1085): no PAGES, no r8 term
     }
 }
 
@@ -8101,4 +8101,46 @@ fn r8door_leg(v: &'static str) -> (&'static str, &'static str) {
         return (v, "skip(no-gen7blit)");
     }
     (v, "skip(no-r8)")
+}
+
+// =================================================================================
+// GEN7R8DOOREDGE (rmbp-ledger B1085) — FILE-TAIL append: nothing above it moves. GEN7R8DOOR (B1082) made R8's rung hold
+// gen7blit's engine door (PAGES' guard) across `fb_blit`, whose only blocking takes are `held_take`/`held_end` on R8_HELD:
+// each is a `lock()`, so the registry's walk records PAGES -> R8_HELD[i] (the PAGES hold `engine_take`'s `try_lock` made is
+// tracked; R8_HELD's three `Mutex::new` sites are three order classes), exactly as it records PAGES -> blit-ring for
+// `order_leg`'s own take. GEN7ORDER read only the blit-ring pair; `r8_order_term` READS the r8 edges (`Mutex::order_seen`,
+// read-only, nothing planted: an inverted take would poison the pair, B1044) after the main pair's guard has dropped.
+// The edge exists only when fb_blit ran (QEMU has no IGD): `r8::DONE` is the witness that R8 armed this boot, so all three
+// slots were taken under the door. A missing edge on an armed R8 is `no-edge`, any reverse edge `inverted` (both FAIL);
+// an unarmed R8 says `skip(r8-unarmed)` (GEN7-R8-EDGE-UNARMED owed: an unarmed run that took its slots is not judged).
+// No `rose`: the edges were recorded during the ladder; the line's `inversions=` is judged by the blit-ring term.
+// =================================================================================
+
+/// GEN7ORDER's r8 term `(verdict, r8_order, fwd, rev)`: PAGES -> each R8_HELD slot recorded (`fwd` of 3), the reverse
+/// (`rev`) absent. `inverted` / `no-edge` FAIL, else `v` stands.
+#[cfg(all(feature = "gen7blit", feature = "gen7r8"))]
+fn r8_order_term(v: &'static str) -> (&'static str, &'static str, usize, usize) {
+    let (mut fwd, mut rev) = (0usize, 0usize);
+    for s in R8_HELD.iter() {
+        let Some((f, r, _)) = blit::PAGES.order_seen(s) else { return (v, "skip(unarmed)", 0, 0) };
+        fwd += f as usize;
+        rev += r as usize;
+    }
+    let armed = r8::DONE.lock().is_some(); // nothing is held here: a blocking take with no edge
+    let w = if rev != 0 {
+        "inverted"
+    } else if fwd == R8_HELD.len() {
+        "ok"
+    } else if !armed {
+        "skip(r8-unarmed)"
+    } else {
+        "no-edge"
+    };
+    (if w == "inverted" || w == "no-edge" { "FAIL" } else { v }, w, fwd, rev)
+}
+
+/// Without R8 there is no R8_HELD edge to read.
+#[cfg(all(feature = "gen7blit", not(feature = "gen7r8")))]
+fn r8_order_term(v: &'static str) -> (&'static str, &'static str, usize, usize) {
+    (v, "skip(no-r8)", 0, 0)
 }
