@@ -53,6 +53,8 @@ use git_core::index::{Entry, Index};
 use git_core::object::{Commit, Kind, Signature, mode};
 use quartzite::tetra::{ConsoleLine, ConsoleTetra, TetraNode};
 
+use crate::landing::verdict_name; // LANDINGSCORE (SR437): the verdict-name rule moved beside landing::verdict, body unchanged
+
 /// The identity a commit takes when the person's git names none.
 pub const FALLBACK_NAME: &str = "UnaOS Contributor";
 pub const FALLBACK_EMAIL: &str = "contrib@unaos.invalid";
@@ -518,7 +520,7 @@ pub fn contribution_md(p: &Plan, os: &str, arch: &str, card_model: Option<&str>)
     let mut s = format!("# Contribution — {}\n\n", p.name);
     s.push_str("INSTALLER-CONTRIBUTE (SR428): the UnaOS_Installer committed this landing on a local `contrib/` branch after one redaction pass. Nothing was pushed; the person pushes it.\n\n");
     s.push_str("## Machine\n\n");
-    s.push_str(&format!("- board: `{board}`\n- image: `{image}`\n- boots: {}\n- verdicts: {v} (PASS/FAIL/SKIP)\n", landing_field(&md, "boots").unwrap_or_else(|| String::from("-"))));
+    s.push_str(&format!("- board: `{board}`\n- image: `{image}`\n- boots: {}\n- verdicts: {v} (PASS/FAIL/SKIP)\n- score: {}\n", landing_field(&md, "boots").unwrap_or_else(|| String::from("-")), landing_field(&md, "score").unwrap_or_else(|| String::from("-")))); // LANDINGSCORE (SR437): the grade line, read from landing.md like the census
     s.push_str(&format!("- host: {os} {arch}\n- card: {}\n\n", card_model.filter(|m| !m.trim().is_empty()).unwrap_or("-")));
     s.push_str("## Files\n\n");
     for f in &p.files {
@@ -723,22 +725,6 @@ pub fn failing(p: &Plan) -> (usize, Vec<String>) {
     (total, quoted)
 }
 
-/// The NAME of a verdict line: a `[hh:mm:ss.mmm] ` stamp and a leading `:: ` stripped, the token before the first `:`;
-/// else its first 48 characters.
-fn verdict_name(line: &str) -> String {
-    let mut l = line.trim();
-    if l.starts_with('[') {
-        if let Some((_, r)) = l.split_once("] ") {
-            l = r.trim_start();
-        }
-    }
-    l = l.strip_prefix(":: ").unwrap_or(l);
-    match l.split_once(':') {
-        Some((n, _)) if !n.is_empty() && !n.contains(char::is_whitespace) => n.to_string(),
-        _ => l.chars().take(48).collect(),
-    }
-}
-
 /// `owner/repo` of a github.com remote URL (`https://[userinfo@]github.com/o/r[.git]`, `ssh://git@github.com/o/r.git`,
 /// `git@github.com:o/r.git`); anything else is None.
 pub fn slug_of(url: &str) -> Option<String> {
@@ -803,7 +789,7 @@ pub fn bugreport_md(p: &Plan, os: &str, arch: &str, card_model: Option<&str>, he
     let mut s = format!("# {title}\n\n");
     s.push_str("INSTALLER-BUGREPORT (SR433): written by the UnaOS_Installer from a landed boot log after the contribute redaction pass. Nothing was sent; read it, then file it.\n\n");
     s.push_str("## Environment\n\n| | |\n|---|---|\n");
-    s.push_str(&format!("| board | `{board}` |\n| image | `{image}` |\n| verdicts | {v} (PASS/FAIL/SKIP) |\n"));
+    s.push_str(&format!("| board | `{board}` |\n| image | `{image}` |\n| verdicts | {v} (PASS/FAIL/SKIP) |\n| score | {} |\n", landing_field(&md, "score").unwrap_or_else(|| String::from("-")))); // LANDINGSCORE (SR437): the grade line, read from landing.md like the census
     s.push_str(&format!("| host | {os} {arch} |\n| card | {} |\n", card_model.filter(|m| !m.trim().is_empty()).unwrap_or("-")));
     s.push_str(&format!("| UnaOS commit | `{head}` |\n| landing | `{}` |\n\n", p.name));
     s.push_str(&format!("## Failing verdicts ({fails})\n\n"));
