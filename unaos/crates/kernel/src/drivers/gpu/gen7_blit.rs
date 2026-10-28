@@ -701,7 +701,7 @@ pub(super) fn park_unwind() {
 /// bcs_job, `park_quiesced` in `park_unwind`): `-` = quiesced (CTL clear, HEAD == TAIL); `ring-ctl-stuck` = RING_CTL
 /// read back set after the disable (any HEAD); `ring-not-disabled` = CTL clear, HEAD short of TAIL (B1067's class).
 /// `ring-live` is a CTL set before the arm: the entry refusal `bcs-ring-live` only, never a park word. Pure.
-fn park_class(quiesced: bool, stuck: bool) -> &'static str {
+pub(super) fn park_class(quiesced: bool, stuck: bool) -> &'static str {
     if quiesced {
         "-"
     } else if stuck {

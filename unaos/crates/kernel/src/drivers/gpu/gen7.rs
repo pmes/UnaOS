@@ -7746,11 +7746,11 @@ fn order_leg() {
             "ok"
         };
         let v = if w == "ok" { "PASS" } else if w.starts_with("skip") { "SKIP" } else { "FAIL" };
-        let (v, r8w, r8f, r8r) = r8_order_term(v); let (v, n, kat) = nohold_leg(v); let (v, pk) = park_leg(v); let (v, rk) = r8door_leg(v); serial_println!(":: GEN7ORDER: pair=pages->blit-ring fwd={} rev={} inversions={}->{} -> {} gen7_order={} slot_nohold={} slot_kat={} park_kat={} r8door_kat={} r8_order={} r8_fwd={}/3 r8_rev={} ::", fwd as u8, rev as u8, i0, i1, v, w, n, kat, pk, rk, r8w, r8f, r8r); // GEN7R8DOORKAT (B1084): the raced job (`r8door_leg`, file tail). GEN7R8DOOREDGE (B1085): the PAGES -> R8_HELD term (`r8_order_term`, file tail). LINE-NEUTRAL fold
+        let (v, r8w, r8f, r8r) = r8_order_term(v); let (v, n, kat) = nohold_leg(v); let (v, pk) = park_leg(v); let (v, pw) = park_word_leg(v); let (v, rk) = r8door_leg(v); serial_println!(":: GEN7ORDER: pair=pages->blit-ring fwd={} rev={} inversions={}->{} -> {} gen7_order={} slot_nohold={} slot_kat={} park_kat={} park_word_kat={} r8door_kat={} r8_order={} r8_fwd={}/3 r8_rev={} ::", fwd as u8, rev as u8, i0, i1, v, w, n, kat, pk, pw, rk, r8w, r8f, r8r); // GEN7PARKWORDKAT (B1089): the class table's KAT (`park_word_leg`, file tail). GEN7R8DOORKAT (B1084): the raced job (`r8door_leg`, file tail). GEN7R8DOOREDGE (B1085): the PAGES -> R8_HELD term (`r8_order_term`, file tail). LINE-NEUTRAL fold
     }
     #[cfg(not(feature = "gen7blit"))]
     {
-        let (v, n, kat) = nohold_leg("SKIP"); let (v, pk) = park_leg(v); let (v, rk) = r8door_leg(v); serial_println!(":: GEN7ORDER: pair=pages->blit-ring fwd=0 rev=0 inversions=0->0 -> {} gen7_order=skip(no-gen7blit) slot_nohold={} slot_kat={} park_kat={} r8door_kat={} r8_order=skip(no-gen7blit) r8_fwd=0/3 r8_rev=0 ::", v, n, kat, pk, rk); // GEN7R8DOOREDGE (B1085): no PAGES, no r8 term
+        let (v, n, kat) = nohold_leg("SKIP"); let (v, pk) = park_leg(v); let (v, pw) = park_word_leg(v); let (v, rk) = r8door_leg(v); serial_println!(":: GEN7ORDER: pair=pages->blit-ring fwd=0 rev=0 inversions=0->0 -> {} gen7_order=skip(no-gen7blit) slot_nohold={} slot_kat={} park_kat={} park_word_kat={} r8door_kat={} r8_order=skip(no-gen7blit) r8_fwd=0/3 r8_rev=0 ::", v, n, kat, pk, pw, rk); // GEN7PARKWORDKAT (B1089): skip(no-gen7blit) (`park_word_leg`, file tail). GEN7R8DOOREDGE (B1085): no PAGES, no r8 term
     }
 }
 
@@ -8143,4 +8143,32 @@ fn r8_order_term(v: &'static str) -> (&'static str, &'static str, usize, usize) 
 #[cfg(all(feature = "gen7blit", not(feature = "gen7r8")))]
 fn r8_order_term(v: &'static str) -> (&'static str, &'static str, usize, usize) {
     (v, "skip(no-r8)", 0, 0)
+}
+
+// =================================================================================
+// GEN7PARKWORDKAT (rmbp-ledger B1089) — FILE-TAIL append: nothing above it moves. GEN7PARKWORD (B1087) owed
+// GEN7-PARK-WORD-KAT: `park_class` (gen7_blit.rs tail) is the ONE word source for the park keep and `park_unwind`'s
+// reason, but `park_leg` judged only `kept_bit`'s bit distinctness, so a regression of the class table (the keep saying
+// `ring-ctl-stuck` for a CTL-clear park, or a word `kept_bit` does not know, which aliases the flush once-bit and is
+// silenced) passed `park_kat=ok`. `park_word_leg` is the table's pure KAT on GEN7ORDER (`park_word_kat=`), joined to
+// `kept_bit`: each park word keys its own class bit, never the flush bit. No planted park is read: `park_unwind` reads
+// live BAR0 only under a real park (QEMU has no bank). `park_class` gained one visibility token; `park_leg`, `kept_bit`
+// and `KEPT_SAID` are untouched.
+// =================================================================================
+
+/// GEN7ORDER's `park_word_kat=` term `(verdict, word)`: pure (no lock, no print). `park_class` must say `-` for a
+/// quiesce (either stuck), `ring-ctl-stuck` for a stuck CTL and `ring-not-disabled` for a CTL-clear short HEAD, and each
+/// park word must map to its own `kept_bit` class (blit `<< 8` / `<< 4`), never the flush bit; a `word-miss` FAILs.
+#[allow(unreachable_code)]
+fn park_word_leg(v: &'static str) -> (&'static str, &'static str) {
+    #[cfg(feature = "gen7blit")]
+    {
+        let (q0, q1, stuck, short) = (blit::park_class(true, false), blit::park_class(true, true), blit::park_class(false, true), blit::park_class(false, false));
+        let table = q0 == "-" && q1 == "-" && stuck == "ring-ctl-stuck" && short == "ring-not-disabled";
+        let flush = kept_bit("blit", "flush-write-silent");
+        let keyed = kept_bit("blit", stuck) == flush << 8 && kept_bit("blit", short) == flush << 4;
+        let k = if table && keyed { "word-ok" } else { "word-miss" };
+        return (if k == "word-miss" { "FAIL" } else { v }, k);
+    }
+    (v, "skip(no-gen7blit)")
 }
