@@ -582,7 +582,7 @@ extern "C" fn aarch64_irq_handler() {
             super::syscall::note_el0_irq();
         }
     }
-    super::gic::handle_irq();
+    irq_mark(true); super::gic::handle_irq(); irq_mark(false); // PREEMPTOFFARMWMTABLEROUTE (zenbook-ledger Z97): this core is in IRQ context for the dispatch (`IRQ_MARK`, file tail; empty off `desktop_firmware`). LINE-NEUTRAL
 }
 
 /// JB1e: heals applied to the A78AE erratum-1941500 phantom this boot (bounded so a genuinely
@@ -810,4 +810,44 @@ extern "C" fn aarch64_el0_fault_handler() -> ! {
     }
     super::syscall::record_el0_kill(name, ec, far, far_valid); #[cfg(feature = "orintenant")] super::display_tegra::orin_tenant_note_el0_fault(name, pid, esr, elr, far, far_valid); // ORIN-TENANTFAULT: the tenant-rung witness, so a crashed WINDOW OWNER is discriminable from a graceful exit (`orin_tenant_census`'s TENANT-EXITED-CLEAN fired on closes=0 reaped=1 either way). Placed AFTER `record_el0_kill` — that call's early-return arms are what route each fixture family to its own counter, and this one must not perturb them — and BEFORE `sched::exit()`, which never returns. Reads TTBR0_EL1/SPSR_EL1/CurrentEL and one atomic; takes no lock (see its doc). Line-NEUTRAL per this file's PANIC-Location rule.
     super::sched::exit()
+}
+
+// ══ PREEMPTOFFARMWMTABLEROUTE (zenbook-ledger Z97; BP-cores-23, the seat's MEASURE line) — the IRQ-context mark ══
+// No in-IRQ flag existed on aarch64, and PSTATE.I alone is not one: the Orin boot core runs the desktop cascade in MASKED
+// process context. So `aarch64_irq_handler` marks its own core around `gic::handle_irq` (inside the vector, which runs
+// masked end to end), and `in_irq` reads the mark AND the mask: a task resumed from a cooperative switch made inside the
+// handler (timer_preempt / ipi_preempt) runs unmasked, so a mark the switch left set cannot fire for it. The residual —
+// masked process code on that core until its next IRQ exit, one tick — only HOLDS fbcon's rows (owed, never lost; owed
+// PREEMPTOFF-ARM-IRQMARK-STALE). Read by `fbcon::irq_present_hold`: the routed console never presents from IRQ context.
+
+/// PREEMPTOFFARMWMTABLEROUTE (Z97): per-core mark, written only by its own core inside the masked IRQ vector.
+#[cfg(feature = "desktop_firmware")]
+static IRQ_MARK: [AtomicBool; super::percpu::NUM_CPUS] = [const { AtomicBool::new(false) }; super::percpu::NUM_CPUS];
+
+/// PREEMPTOFFARMWMTABLEROUTE (Z97): set / clear this core's mark (called only from `aarch64_irq_handler`).
+#[cfg(feature = "desktop_firmware")]
+#[inline(always)]
+fn irq_mark(on: bool) {
+    if let Some(m) = IRQ_MARK.get(super::percpu::this_cpu().cpu_index as usize) {
+        m.store(on, Ordering::Relaxed);
+    }
+}
+/// PREEMPTOFFARMWMTABLEROUTE (Z97): no reader off `desktop_firmware` — nothing is marked.
+#[cfg(not(feature = "desktop_firmware"))]
+#[inline(always)]
+fn irq_mark(_on: bool) {}
+
+/// PREEMPTOFFARMWMTABLEROUTE (Z97): is this core in IRQ context? The mark AND PSTATE.I (the vector is masked end to end).
+#[cfg(feature = "desktop_firmware")]
+pub fn in_irq() -> bool {
+    super::irqs_masked()
+        && IRQ_MARK
+            .get(super::percpu::this_cpu().cpu_index as usize)
+            .is_some_and(|m| m.load(Ordering::Relaxed))
+}
+/// PREEMPTOFFARMWMTABLEROUTE (Z97): never marked off `desktop_firmware`.
+#[cfg(not(feature = "desktop_firmware"))]
+#[inline(always)]
+pub fn in_irq() -> bool {
+    false
 }
