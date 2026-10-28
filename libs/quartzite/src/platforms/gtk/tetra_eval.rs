@@ -23,8 +23,8 @@ pub fn eval_tetra(node: TetraNode, synapse: Synapse) -> NativeView {
         TetraNode::Button { id: _, label, action } => {
             super::button::bootstrap_button(&label, action, synapse)
         }
-        TetraNode::TextField { id: _, placeholder, action } => {
-            super::text_field::bootstrap_text_field(&placeholder, action, synapse)
+        TetraNode::TextField { id: _, placeholder, action, secret } => {
+            super::text_field::bootstrap_text_field(&placeholder, secret, action, synapse)
         }
         TetraNode::Surface { id } => {
             super::image_view::bootstrap_image_surface(&id, synapse)

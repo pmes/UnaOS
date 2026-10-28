@@ -222,6 +222,8 @@ mod imp_entry {
         pub drag_from: Cell<f64>,
         pub im: RefCell<Option<gtk4::IMMulticontext>>,
         pub on_activate: RefCell<Vec<Box<dyn Fn(&super::GlyphEntry)>>>,
+        /// LANDINGSECRETFIELD (SR432): draw `tetra::secret_mask` of the text, never the text; copy refused.
+        pub secret: Cell<bool>,
     }
 
     #[glib::object_subclass]
@@ -328,7 +330,7 @@ mod imp_entry {
             let s = canvas.scale;
             let (w, h) = (widget.width() as f32, widget.height() as f32);
             let color = widget.color();
-            let text = self.text.borrow().clone();
+            let text = obj.shown(); // LANDINGSECRETFIELD (SR432): the mask on a secret field
             let dev = scaled(&style, s);
             if text.is_empty() {
                 let ph = self.placeholder.borrow().clone();
@@ -344,7 +346,7 @@ mod imp_entry {
                 return;
             }
             let line = dev.shape(&text);
-            let caret_x = line.caret_x(&text, self.caret.get()) / s;
+            let caret_x = line.caret_x(&text, obj.to_shown(self.caret.get())) / s;
             // keep the caret inside the box
             let mut scroll = self.scroll.get().clamp(0.0, (line.width / s - w + 1.0).max(0.0));
             if caret_x - scroll > w - 1.0 {
@@ -356,7 +358,7 @@ mod imp_entry {
             self.scroll.set(scroll);
             let baseline = baseline_in(&line, s, h);
             let (top, bottom) = (baseline - line.ascent / s, baseline + line.descent / s);
-            let (a, c) = (self.anchor.get(), self.caret.get());
+            let (a, c) = (obj.to_shown(self.anchor.get()), obj.to_shown(self.caret.get()));
             if a != c {
                 let (x0, x1) = (line.caret_x(&text, a.min(c)) / s, line.caret_x(&text, a.max(c)) / s);
                 canvas.fill(x0.min(x1) - scroll, x0.max(x1) - scroll, top, bottom, rgba8(&color, 0.25));
@@ -411,14 +413,14 @@ impl GlyphEntry {
     }
 
     fn line(&self) -> (String, Line) {
-        let t = self.text();
+        let t = self.shown();
         let l = style_for(self).shape(&t);
         (t, l)
     }
 
     fn hit(&self, x: f32) -> usize {
         let (t, l) = self.line();
-        l.hit(&t, x + self.imp().scroll.get())
+        self.from_shown(l.hit(&t, x + self.imp().scroll.get()))
     }
 
     fn set_caret(&self, at: usize, extend: bool) {
@@ -499,7 +501,7 @@ impl GlyphEntry {
             gdk::Key::End | gdk::Key::KP_End => self.set_caret(len, shift),
             gdk::Key::a | gdk::Key::A if ctrl => self.select_all(),
             gdk::Key::c | gdk::Key::C | gdk::Key::x | gdk::Key::X if ctrl => {
-                if a != b {
+                if a != b && !self.imp().secret.get() {
                     let t = self.text();
                     self.clipboard().set_text(&t[a..b]);
                     if matches!(key, gdk::Key::x | gdk::Key::X) {
@@ -518,5 +520,31 @@ impl GlyphEntry {
             _ => return glib::Propagation::Proceed,
         }
         glib::Propagation::Stop
+    }
+}
+
+/// LANDINGSECRETFIELD (SR432): a secret GlyphEntry paints, traces and hit-tests `tetra::secret_mask` of its text
+/// through the one editor path; editing (insert, Backspace, Delete, grapheme steps) acts on the real text.
+impl GlyphEntry {
+    /// Draw this field's text as bullets (`TetraNode::TextField { secret: true }`).
+    pub fn set_secret(&self, on: bool) {
+        self.imp().secret.set(on);
+        self.queue_draw();
+    }
+
+    /// The text as drawn: the mask on a secret field, else the text.
+    fn shown(&self) -> String {
+        let t = self.text();
+        if self.imp().secret.get() { crate::tetra::secret_mask(&t) } else { t }
+    }
+
+    /// A byte offset of the text as its offset in [`shown`](Self::shown).
+    fn to_shown(&self, i: usize) -> usize {
+        if self.imp().secret.get() { crate::tetra::secret_offset(&self.text(), i) } else { i }
+    }
+
+    /// A byte offset of [`shown`](Self::shown) back to the text's.
+    fn from_shown(&self, m: usize) -> usize {
+        if self.imp().secret.get() { crate::tetra::secret_unoffset(&self.text(), m) } else { m }
     }
 }

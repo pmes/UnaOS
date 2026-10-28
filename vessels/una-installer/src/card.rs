@@ -771,7 +771,7 @@ pub fn face_of(card: &Card) -> TetraNode {
     TetraNode::VStack(vec![
         TetraNode::Console(ConsoleTetra { lines, ..Default::default() }),
         TetraNode::HStack(picks),
-        TetraNode::TextField { id: String::from("card.confirm"), placeholder, action: TextAction::ConsoleInput },
+        TetraNode::TextField { id: String::from("card.confirm"), placeholder, action: TextAction::ConsoleInput, secret: false }, // LANDINGSECRETFIELD (SR432): the typed phrase is not a secret
         TetraNode::Button { id: String::from("card.write"), label: String::from("Write"), action: bandy::SMessage::ConsoleInput(String::from("card write")) },
     ])
 }

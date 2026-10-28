@@ -166,7 +166,7 @@ async fn serve(mut rx: tokio::sync::broadcast::Receiver<SMessage>, host: Host) {
                 }
                 Ok(SMessage::ConsoleInput(line)) => {
                     if !card::on_input(&mut card, &line) && !provider::on_input(&mut provider, &line) && !contribute::on_input(&mut contribute, &line) && !landing::on_input(&mut landing, &line) { // INSTALLERLANDING (SR415): the card face first, then the landing face; INSTALLERPROVIDER (SR424): the provider face before landing, so a pasted key never reaches the unafs mount as a card password; INSTALLERCONTRIBUTE (SR428): contribute takes only `contribute …` lines, before landing
-                        say(&format!("[installer] input ignored line={line}"));
+                        say(&format!("[installer] input ignored bytes={}", line.len())); // LANDINGSECRETFIELD (SR432): an untaken line may be a secret field's: its length, never its text
                     }
                 }
                 Ok(_) | Err(RecvError::Lagged(_)) => {}
