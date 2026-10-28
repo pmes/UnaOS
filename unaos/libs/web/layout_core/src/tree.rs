@@ -922,7 +922,7 @@ fn propagate_text_align<H: Host>(tree: &mut LayoutTree<H>) {
                     };
                     changed = true;
                 }
-                let block = crate::collapse::is_block_container_pub(tree, id, &st);
+                let block = crate::collapse::is_block_container_pub(tree, id, &st) || cell_block_container(tree, id, &st);
                 if changed {
                     let _ = tree.taffy.set_style(id, st);
                 }
@@ -966,6 +966,19 @@ fn place_narrow_blocks<H: Host>(tree: &mut LayoutTree<H>, id: taffy::NodeId, ali
         n.align_self = Some(to);
         let _ = tree.taffy.set_style(k, n);
     }
+}
+
+/// AETHERCENTERCELL (SR436): a table cell (td / th) whose children the builder laid out as a column is a block
+/// container for `place_narrow_blocks` (CSS 2.2 §17.4: a table-cell is a block container; HTML rendering §15.3.3
+/// `align=center` is -webkit-center, so a nested table or a definite-width block centres in the cell, and plain
+/// text-align leaves it at the start). `collapse::is_block_container` keeps refusing table parts: it is margin
+/// collapsing's predicate too, and margins do not collapse through a cell. An author flex / grid cell and an
+/// all-inline cell (a row, the inline formatting context) are not.
+fn cell_block_container<H: Host>(tree: &LayoutTree<H>, id: taffy::NodeId, st: &Style) -> bool {
+    st.display == Display::Flex
+        && st.flex_direction == FlexDirection::Column
+        && tree.paint_map.get(&id).and_then(|p| p.flex_container) != Some(true)
+        && tree.node_map.get(&id).and_then(|n| n.tag()).is_some_and(|t| matches!(t.as_str(), "td" | "th"))
 }
 
 /// Block-level by the cascade (the author's outer display), else by tag; anonymous boxes are block boxes.

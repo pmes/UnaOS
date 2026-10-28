@@ -3829,6 +3829,11 @@ mod tests {
         assert!(width > 0.0 && width < 1100.0, "the form table is narrower than the page ({width})");
         assert!(left > 40.0, "the form table is not at the left edge (left {left})");
         assert!((left + width / 2.0 - 600.0).abs() <= 2.0, "the form table is centred (left {left}, width {width})");
+        // AETHERCENTERCELL (SR436): the `td align=center` cell holds inline content only (the inline-block search field), which
+        // the cell rule leaves alone: the field stays centred in its cell.
+        let q = |e: &mut crate::AetherEngine, sel: &str| { let mut b = |k: &str| js_num(e, &format!("document.querySelector('{sel}').getBoundingClientRect().{k}")); (b("left"), b("width")) };
+        let ((cl, cw), (ql, qw)) = (q(&mut engine, "td[align=center]"), q(&mut engine, "input[name=q]"));
+        assert!(qw > 0.0 && (ql + qw / 2.0 - (cl + cw / 2.0)).abs() <= 2.0, "the search field is centred in its align=center cell (field {ql} + {qw}, cell {cl} + {cw})");
         let ta = engine.js_engine.as_mut().unwrap().eval_string("getComputedStyle(document.getElementById('c')).textAlign").unwrap();
         assert_eq!(ta, "-webkit-center", "<center>'s computed text-align is the UA's -webkit-center");
     }
