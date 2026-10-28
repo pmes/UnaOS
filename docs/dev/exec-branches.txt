@@ -1106,7 +1106,7 @@ refs/heads/exec-rmbp-wifileavebuild   ac9fa5580 FOLDED-BY-HAND (this commit) 202
 refs/heads/exec-rmbp-amberplist   d62533d98 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-aethermacgenerics   0070f20d9 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-aetherfontdblazy   c6bd40f76 FOLDED-BY-HAND (this commit) 2026-10-27
-refs/heads/exec-rmbp-aetherabsshrink   03c5964fb IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-aetherabsshrink   b7f037e76 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-aethercenterlayout   a0fcff8f5 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-installerauthopen   3e1019997 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-xhciloanpumpholder   2826ab77b FOLDED-BY-HAND (this commit) 2026-10-27

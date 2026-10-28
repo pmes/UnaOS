@@ -3832,4 +3832,26 @@ mod tests {
         let ta = engine.js_engine.as_mut().unwrap().eval_string("getComputedStyle(document.getElementById('c')).textAlign").unwrap();
         assert_eq!(ta, "-webkit-center", "<center>'s computed text-align is the UA's -webkit-center");
     }
+
+    /// ABSSHRINK (LEDGER SR420): CSS 2.2 §10.3.7 — a `right: 8px` absolutely positioned pill with an auto width is
+    /// shrink-to-fit and paints inside the viewport's right edge (the builder's 100% placeholder laid it out as wide
+    /// as its containing block at x = -8, SR412's header pill).
+    #[test]
+    fn abs_right_pill_paints_inside_the_viewport() {
+        let html = r#"<html><body style="margin: 0"><div id="pill" style="position: absolute; top: 8px; right: 8px; padding: 2px 8px; background: #ff0000">Sign in</div></body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 200));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        let r = |e: &mut crate::AetherEngine, k: &str| js_num(e, &format!("document.getElementById('pill').getBoundingClientRect().{k}"));
+        let (l, t, w, h) = (r(&mut engine, "left"), r(&mut engine, "top"), r(&mut engine, "width"), r(&mut engine, "height"));
+        assert!(w > 16.0 && w < 160.0, "the pill shrinks to its text: w {w}");
+        assert!(l > 200.0 && l + w <= 400.0, "and sits inside the viewport's right edge: left {l} w {w}");
+        let sw = engine.width as usize;
+        let s = engine.surface();
+        let red = |x: usize, y: usize| s.get((y * sw + x) * 4..(y * sw + x) * 4 + 3).is_some_and(|p| p[0] < 40 && p[1] < 40 && p[2] > 215);
+        let (mx, my) = ((l + 2.0).ceil() as usize, (t + h / 2.0) as usize);
+        assert!(red(mx, my), "the pill's background paints inside it at ({mx}, {my})");
+        assert!(!(0..100).any(|x| red(x, my)), "and nothing red at the viewport's left (x < 100)");
+    }
 }
