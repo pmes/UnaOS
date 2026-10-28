@@ -803,6 +803,12 @@ pub fn file_label(multiple: bool) -> (&'static str, &'static str) {
     (if multiple { "Choose Files" } else { "Choose File" }, "No file chosen")
 }
 
+/// AETHERFILECOLORPAINT (SR456): a color input's swatch (Chromium html.css: the input's 1px border and 1px 2px padding,
+/// `::-webkit-color-swatch-wrapper { padding: 4px 2px }`, `::-webkit-color-swatch { border: 1px solid #777777 }`): the
+/// swatch's border box sits (x, y) px in from the input's border box on each side, with a 1 px frame in the colour
+/// round the value's fill (50 x 27 -> 40 x 15). Read by the host render's file/color arm and AETHER.ELF's paint.rs.
+pub const COLOR_SWATCH: (f32, f32, (u8, u8, u8)) = (5.0, 6.0, (119, 119, 119));
+
 // ---- AETHERCAPTIONCORE (SR438): a push button's caption geometry, one rule for both rings ----------------------
 
 /// AETHERCAPTIONCORE (SR438): where a push button's caption sits: `x` the pen's left edge (sub-pixel, never

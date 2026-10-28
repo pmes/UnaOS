@@ -1432,6 +1432,58 @@ fn centered_line_origin_y(font: &Font, font_size: f32, center_y: f32) -> f32 {
     center_y - (ascent + descent) / 2.0
 }
 
+// ---- AETHERFILECOLORPAINT (SR456): a file input's button and status, a color input's swatch ----------------------
+
+/// AETHERFILECOLORPAINT (SR456): paints an `<input type=file>` or `<input type=color>` whose border box is at
+/// (`bx`, `by`) sized `bw` x `bh` with its taffy `bord` / `pad` edges, and says whether it did (any other element:
+/// false, nothing touched). File (Chromium LayoutFileUploadControl, the strings layout_core's `file_label`): the
+/// button first, the input's own UA edges standing for the button's as `control_intrinsic` sized them, its caption
+/// centred by the push caption's ONE rule `caption_box` over that button sub-box; then the status text 4 px
+/// (kAfterButtonSpacing) after the button's border box on the same line top; both in the element's font and
+/// `color`, clipped to the input's padding box. Color: the value (`forms::control_value`, the dirty value js
+/// sanitized, else the attribute) through the cascade's own `parse_color_str`, black when it does not parse (the
+/// sanitization default #000000), filled in Chromium's swatch: layout_core `COLOR_SWATCH`'s inset from the border
+/// box, a 1 px frame in its colour round the fill.
+#[allow(clippy::too_many_arguments)]
+fn paint_file_color(
+    dom_node: &crate::dom::NodeRef, tag: &str, bx: f32, by: f32, bw: f32, bh: f32,
+    bord: taffy::Rect<f32>, pad: taffy::Rect<f32>, inherited: &Inherited, font: Option<&'static Font>, color: (u8, u8, u8),
+    surface: &mut [u8], width: u32, height: u32, damage_rects: &[(u32, u32, u32, u32)], clip: Clip,
+) -> bool {
+    if tag != "input" {
+        return false;
+    }
+    match crate::forms::input_type(dom_node).as_str() {
+        "file" => {
+            let (button, status) = layout_core::file_label(dom_node.as_element().is_some_and(|e| e.attributes.borrow().get("multiple").is_some()));
+            let Some(font) = crate::fonts::face(&inherited.sel()).or(font) else { return true };
+            let adv = inherited.advancer();
+            let (ascent, descent) = text_extents(font, inherited.font_size);
+            let button_w = measure_text_width(button, &adv);
+            let btn_bw = button_w + pad.left + bord.left + pad.right + bord.right;
+            let btn = layout_core::caption_box(bx, by, btn_bw, bh, bord, pad, button_w, ascent, descent);
+            let whole = layout_core::caption_box(bx, by, bw, bh, bord, pad, 0.0, ascent, descent);
+            let c = whole.clip;
+            let clip = (clip.0.max(c.0), clip.1.max(c.1), clip.2.min(c.2), clip.3.min(c.3));
+            draw_text(button, btn.x, btn.top, f32::MAX, &adv, 0.0, color, false, surface, width, height, damage_rects, clip);
+            draw_text(status, bx + btn_bw + 4.0, btn.top, f32::MAX, &adv, 0.0, color, false, surface, width, height, damage_rects, clip);
+            true
+        }
+        "color" => {
+            let value = crate::forms::control_value(dom_node);
+            let fill = crate::css::parse_color_str(&value).unwrap_or((0, 0, 0));
+            let (ix, iy, frame) = layout_core::COLOR_SWATCH;
+            let (x0, y0, x1, y1) = (bx + ix, by + iy, bx + bw - ix, by + bh - iy);
+            if x1 > x0 && y1 > y0 {
+                fill_rect(x0, y0, x1, y1, frame, 255, surface, width, height, damage_rects, clip);
+                fill_rect(x0 + 1.0, y0 + 1.0, x1 - 1.0, y1 - 1.0, fill, 255, surface, width, height, damage_rects, clip);
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
 /// UNAOS_LAYOUTDUMP=<max-depth>: writes the computed box tree (tag, id/class,
 /// rect, display, paint gates) to stderr. Diagnostic only — off by default.
 pub fn dump_layout(layout: &LayoutTree) {
@@ -3023,7 +3075,9 @@ fn frame_walk(
                         fill_rect(cx, cy, cx + 1.0, cy + lh, color, 255, surface, width, height, damage_rects, clip);
                     }
                 }
-                if is_control && tag != "button" && !checkable && tag != "textarea" {
+                // AETHERFILECOLORPAINT (SR456): a file input's Choose-File button and status, a color input's swatch; never its value as text.
+                let file_color = paint_file_color(dom_node, tag, box_sx, box_sy, bw, bh, bord, pad, &inherited, *font, spec.color.unwrap_or((0, 0, 0)), surface, width, height, damage_rects, clip);
+                if is_control && tag != "button" && !checkable && tag != "textarea" && !file_color {
                     let face = crate::fonts::face(&inherited.sel());
                     if let Some(font) = face.or(*font) {
                         let adv = inherited.advancer();
