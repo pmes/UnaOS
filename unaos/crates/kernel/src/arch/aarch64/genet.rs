@@ -1837,7 +1837,7 @@ Connection: close\r\nServer: UnaOS/genet\r\n\r\n",
         let cap = fs_cap() as u64;
         let path = alloc::format!("/{}", name);
         let t0 = cntpct();
-        let r = crate::fs::unafs::with_unafs(|fs| {
+        let r = crate::fs::unafs::with_unafs_read(|fs| {
             let id = match fs.resolve_path(&path) {
                 Ok(id) => id,
                 Err(_) => return FsFileResult::NotFound,
@@ -1866,7 +1866,7 @@ Connection: close\r\nServer: UnaOS/genet\r\n\r\n",
     #[allow(clippy::type_complexity)]
     fn fs_read_dir() -> (Result<alloc::vec::Vec<(alloc::string::String, u64, bool)>, ()>, u64, i64) {
         let t0 = cntpct();
-        let r = crate::fs::unafs::with_unafs(|fs| {
+        let r = crate::fs::unafs::with_unafs_read(|fs| {
             let root = fs.resolve_path("/").map_err(|_| ())?;
             let entries = fs.ls(root).map_err(|_| ())?;
             let mut out = alloc::vec::Vec::with_capacity(entries.len());
