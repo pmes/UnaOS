@@ -11516,7 +11516,7 @@ pub mod preemptoff {
     /// The stale KAT's follower: a task whose dispatch on the holder's core, while the holder is yielded inside its span,
     /// resets the holder's count (Z89's `on_dispatch`).
     fn stale_kat_after(_: usize) {
-        STALE_KAT_AFTER_RAN.store(true, Ordering::Release);
+        super::yieldsite::kat_lock_follow(|| STALE_KAT_AFTER_RAN.store(true, Ordering::Release)); // PREEMPTOFFSLEEPCHECKYIELDSITEWRAPPERSKAT (zenbook-ledger Z115): the follower takes the KAT's lock before its store and holds it until the holder asks (the holder's contended park). LINE-NEUTRAL
     }
 
     /// The stale KAT's holder, pinned to core `c`: its verdict code into `STALE_KAT_CODE`.
@@ -11561,7 +11561,7 @@ pub mod preemptoff {
                 6
             }
         };
-        follower.join();
+        let own = if code == 6 { super::yieldsite::kat_lock_park() } else { super::yieldsite::kat_lock_skip() }; LEAK_RESETS.fetch_sub(own, Ordering::Relaxed); STALE_DROPS.fetch_sub(own, Ordering::Relaxed); follower.join(); // PREEMPTOFFSLEEPCHECKYIELDSITEWRAPPERSKAT (zenbook-ledger Z115): the second in-span park, through a CONTENDED `Mutex::lock` in a fresh span (ok path only); its own reset and stale drop given back. LINE-NEUTRAL
         code
     }
 
@@ -11569,7 +11569,7 @@ pub mod preemptoff {
     /// `ok` gives back the KAT's own reset and its own stale drop, so `leak_reset=` and `stale_drop=` count real events only.
     pub fn stale_kat() -> &'static str {
         let c = slot();
-        STALE_KAT_AFTER_RAN.store(false, Ordering::Release);
+        super::yieldsite::kat_lock_arm(); STALE_KAT_AFTER_RAN.store(false, Ordering::Release); // PREEMPTOFFSLEEPCHECKYIELDSITEWRAPPERSKAT (zenbook-ledger Z115): the KAT lock's `init` (before any task can block on it) and its words cleared. LINE-NEUTRAL
         STALE_KAT_CODE.store(0, Ordering::Release);
         super::spawn_joinable("preemptoff-stale", stale_kat_holder, c, c).join();
         match STALE_KAT_CODE.load(Ordering::Acquire) {
@@ -11656,7 +11656,7 @@ pub mod preemptoff {
         let kat = SLEEP_KAT_TID.load(Ordering::Relaxed);
         if kat != 0 && kat == outgoing {
             SLEEP_KAT_HITS.fetch_add(1, Ordering::Relaxed);
-            SLEEP_KAT_VIA.store(via, Ordering::Relaxed); super::yieldsite::kat_note(cpu); // PREEMPTOFFARMSLEEPCHECKYIELDSITE (zenbook-ledger Z107): the KAT's named yield site. LINE-NEUTRAL
+            if super::yieldsite::kat_note(cpu) { SLEEP_KAT_VIA.store(via, Ordering::Relaxed); } // PREEMPTOFFARMSLEEPCHECKYIELDSITE (zenbook-ledger Z107): the KAT's named yield site; PREEMPTOFFSLEEPCHECKYIELDSITEWRAPPERSKAT (zenbook-ledger Z115): the via word is the yield phase's (the lock park is judged by its site). LINE-NEUTRAL
             return;
         }
         SLEEP_IN_SPAN.fetch_add(1, Ordering::Relaxed);
@@ -12063,15 +12063,27 @@ pub mod preemptoff {
 // masked scheduler pass (no task runs between the switch-back's `sleep_check` and `sleep_report`), so no lock. The
 // sleep KAT stashes the yield it was named for (`kat_note`) and asserts it is `stale_kat_run`'s own yield line
 // (`kat_mark(line!())` on that line) in `kat_verdict` (`sleep_kat=ok` | `wrong-site`).
+// PREEMPTOFFSLEEPCHECKYIELDSITEWRAPPERSKAT (zenbook-ledger Z115): the same KAT then parks once more inside a fresh held span through a CONTENDED
+// `Mutex::lock` (`KAT_LOCK`, held by the stale KAT's follower until the holder asks), so `sleep_kat=ok` also asserts
+// Z111's track_caller chain `Mutex::lock` -> `Semaphore::wait` -> `note`: the lock hit (after `kat_mark_lock`) must
+// name `kat_lock_park`'s own lock line (else `wrong-lock-site`).
 mod yieldsite {
     use core::panic::Location;
     use core::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
+    use core::sync::atomic::AtomicBool;
 
     /// Z107: this core's last wait-entry caller (null = none yet). Written and read only by its own core, IRQ masked.
     static YIELD_AT: [AtomicPtr<Location<'static>>; super::NUM_CPUS] = [const { AtomicPtr::new(core::ptr::null_mut()) }; super::NUM_CPUS];
     /// Z107 KAT: the yield site the sleep KAT's hit was named for, and the line `stale_kat_run` yields on.
     static KAT_AT: AtomicPtr<Location<'static>> = AtomicPtr::new(core::ptr::null_mut());
     static KAT_LINE: AtomicU32 = AtomicU32::new(0);
+    /// Z115 KAT: the lock site the sleep KAT's lock-phase hit was named for, and the line `kat_lock_park` locks on
+    /// (0 = the lock phase not armed: a hit is the yield phase's).
+    static KAT_LOCK_AT: AtomicPtr<Location<'static>> = AtomicPtr::new(core::ptr::null_mut());
+    static KAT_LOCK_LINE: AtomicU32 = AtomicU32::new(0);
+    /// Z115 KAT: the one contended lock (the follower holds it across the holder's park) and the holder's ask.
+    static KAT_LOCK: super::Mutex<()> = super::Mutex::new(());
+    static KAT_LOCK_ASKED: AtomicBool = AtomicBool::new(false);
 
     /// Z107: called from a `#[track_caller]` wait entry after its IRQ mask; the track_caller chain makes
     /// `Location::caller()` the ENTRY's caller.
@@ -12109,20 +12121,84 @@ mod yieldsite {
     }
 
     /// Z107 KAT: `sleep_check`'s KAT branch stashes the yield site it was named for (masked, the holder's core).
-    pub(super) fn kat_note(cpu: usize) {
+    /// Z115: once the lock line is armed the hit is the lock phase's (into `KAT_LOCK_AT`, returns false); before it, the
+    /// yield phase's (into `KAT_AT`, returns true: the caller keeps its via word for the yield phase only).
+    pub(super) fn kat_note(cpu: usize) -> bool {
         let p = at(cpu).map_or(core::ptr::null_mut(), |l| l as *const Location<'static> as *mut Location<'static>);
+        if KAT_LOCK_LINE.load(Ordering::Relaxed) != 0 {
+            KAT_LOCK_AT.store(p, Ordering::Relaxed);
+            return false;
+        }
         KAT_AT.store(p, Ordering::Relaxed);
+        true
+    }
+
+    /// Z115 KAT (`stale_kat`, before the holder and the follower spawn): reserve the lock's waiter list (`Mutex::init`,
+    /// idempotent; before any task can block on it) and clear the lock phase's words.
+    pub(super) fn kat_lock_arm() {
+        KAT_LOCK.init();
+        KAT_LOCK_ASKED.store(false, Ordering::Release);
+        KAT_LOCK_LINE.store(0, Ordering::Relaxed);
+        KAT_LOCK_AT.store(core::ptr::null_mut(), Ordering::Relaxed);
+    }
+
+    /// Z115 KAT: the stale KAT's follower (pinned to the holder's core). Takes the lock (uncontended) BEFORE `ran` (its
+    /// `STALE_KAT_AFTER_RAN` store), so the holder past its yield loop finds it held; yields until the holder asks
+    /// (bounded as the holder's loop, 1000 ms; on one core the ask is seen only once the holder is parked on the lock),
+    /// then gives it back (the `post` readies the holder).
+    pub(super) fn kat_lock_follow(ran: impl FnOnce()) {
+        let g = KAT_LOCK.lock();
+        ran();
+        let m0 = crate::arch::ms();
+        while !KAT_LOCK_ASKED.load(Ordering::Acquire) && crate::arch::ms().wrapping_sub(m0) < 1000 {
+            super::yield_now();
+        }
+        drop(g);
+    }
+
+    /// Z115 KAT: the holder's stale code was not ok, so no lock phase: release the follower (0: nothing to give back).
+    pub(super) fn kat_lock_skip() -> u32 {
+        KAT_LOCK_ASKED.store(true, Ordering::Release);
+        0
+    }
+
+    /// Z115 KAT: the holder's second in-span park. A FRESH hold (the follower's dispatch reset the first one), the ask,
+    /// then the contended `Mutex::lock` on the marked line: the switch-back's `sleep_check` names it (the lock phase) and
+    /// the follower, dispatched on this core, resets the hold and gives the lock back. Returns 1 when the hold came back
+    /// stale (that reset and this stale drop are the KAT's own; the caller gives both back), else 0.
+    pub(super) fn kat_lock_park() -> u32 {
+        let s0 = super::preemptoff::stale_drops();
+        let g3 = crate::arch::without_interrupts(|| super::preempt_hold());
+        KAT_LOCK_ASKED.store(true, Ordering::Release);
+        kat_mark_lock(line!()); let g = KAT_LOCK.lock(); // Z115: this line is the lock park the sleep KAT must name (`kat_verdict`)
+        drop(g);
+        drop(g3);
+        (super::preemptoff::stale_drops() == s0.wrapping_add(1)) as u32
+    }
+
+    /// Z115 KAT: `kat_lock_park` records the line its contended lock sits on (`line!()` on that same line); arms the
+    /// lock phase for `kat_note`.
+    fn kat_mark_lock(line: u32) {
+        KAT_LOCK_LINE.store(line, Ordering::Relaxed);
     }
 
     /// Z107 KAT verdict (`sleep_kat=`'s last arm): `ok` when the named yield is this file's `stale_kat_run` yield line,
-    /// else `wrong-site`. Clears both words.
+    /// else `wrong-site`; Z115: then the lock-phase hit must be `kat_lock_park`'s lock line (else `wrong-lock-site`).
+    /// Clears all four words.
     pub(super) fn kat_verdict() -> &'static str {
         let p = KAT_AT.swap(core::ptr::null_mut(), Ordering::Relaxed) as *const Location<'static>;
         let want = KAT_LINE.swap(0, Ordering::Relaxed);
+        let lp = KAT_LOCK_AT.swap(core::ptr::null_mut(), Ordering::Relaxed) as *const Location<'static>;
+        let lwant = KAT_LOCK_LINE.swap(0, Ordering::Relaxed);
         // SAFETY: only ever stored from a `&'static Location<'static>` (`kat_note` over `at`).
         match unsafe { p.as_ref() } {
-            Some(l) if want != 0 && l.line() == want && l.file() == file!() => "ok",
-            _ => "wrong-site",
+            Some(l) if want != 0 && l.line() == want && l.file() == file!() => {}
+            _ => return "wrong-site",
+        }
+        // SAFETY: as above (`kat_note` over `at`).
+        match unsafe { lp.as_ref() } {
+            Some(l) if lwant != 0 && l.line() == lwant && l.file() == file!() => "ok",
+            _ => "wrong-lock-site",
         }
     }
 }
