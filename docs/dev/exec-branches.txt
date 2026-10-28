@@ -1201,3 +1201,6 @@ refs/heads/exec-rmbp-gen7parknodemote   cbf2963b5 IN-FLIGHT cut 2026-10-28
 refs/heads/exec-rmbp-preemptoffarmcastsleg   cbf2963b5 IN-FLIGHT cut 2026-10-28
 refs/heads/exec-rmbp-xhciloanptpyieldptpmarkkat   cbf2963b5 IN-FLIGHT cut 2026-10-28
 refs/heads/exec-rmbp-aetherfilecolorpaint   cbf2963b5 IN-FLIGHT cut 2026-10-28
+refs/heads/exec-rmbp-xhciloanptpyieldqemumtp   77e07a58c IN-FLIGHT cut 2026-10-28
+refs/heads/exec-rmbp-gen7parkr8   77e07a58c IN-FLIGHT cut 2026-10-28
+refs/heads/exec-rmbp-aethercaptionface   77e07a58c IN-FLIGHT cut 2026-10-28
