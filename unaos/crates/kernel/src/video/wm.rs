@@ -32908,6 +32908,16 @@ fn close_drain_wait_for(who: &'static str, budget_us: u64, say: bool) -> (bool, 
 // confirmed (`kill_confirmed` / `is_reaped`) and the helper never reaching DONE (killed, not ended). Unrecorded, or the
 // aarch64 kill table full, the helper is let go politely ([`KAT_LET_GO`]) and LEG 8 reads `skip`. Wire:
 // ` drain-kill=<1|0|skip> (id=<w>)` beside a second `[wm] close flight released-on-death`. Go-red: as LEG 7's.
+//
+// LEGSKIPLATE (rmbp-ledger B1086; BP-video-18 kept, the seat's MEASURE line) — a leg that skips (no HELD inside 1 s)
+// used to leave its helper runnable: started late, it read the NEXT leg's [`KAT_MODE`], wrote that leg's
+// `KAT_STATE`/`KAT_KEY`/`KAT_SLOT` and could hold a flight for w2 past `close(w2)`. One generation word, [`KAT_GEN`],
+// written by the fixture alone: [`close_drain_kat_arg`] bumps it at every spawn and packs it into the spawn arg's high
+// 32 bits (`WinId` is u32, so the helpers' `arg as WinId` still reads the id), and each skip arm bumps it again; each
+// helper's FIRST line ([`close_drain_kat_mine`]) returns at once when its generation is not the current one — no
+// flight, no guard, no line printed (its `exit()` finds no slot: the death road's no-op). Residual: a helper passing
+// that one load within instructions of the fixture's 1 s deadline-and-bump is still live (LEG-SKIP-CLAIM owed: a claim
+// CAS). No new wire token.
 
 /// RETIREDRAINKAT — the helper's progress: 0 idle, then HELD (flight entered), DOOR (the fixture is entering the
 /// door), DONE (flight ended).
@@ -32980,6 +32990,16 @@ const KAT_HOLD_MS: u64 = 30;
     )
 ))]
 static KAT_MODE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+/// LEGSKIPLATE (rmbp-ledger B1086) — the KAT legs' helper generation: bumped by the fixture at every spawn and on every
+/// skip; a helper whose spawn-arg generation is not this one is disowned and returns at its first line.
+#[cfg(all(
+    feature = "witness",
+    any(
+        all(target_arch = "x86_64", feature = "wc"),
+        all(target_arch = "aarch64", feature = "desktop_firmware")
+    )
+))]
+static KAT_GEN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 #[cfg(all(
     feature = "witness",
     any(
@@ -33054,6 +33074,7 @@ fn close_drain_kat_until(bound_ms: u64, f: impl Fn() -> bool) -> bool {
     )
 ))]
 fn close_drain_kat_helper(arg: usize) {
+    if !close_drain_kat_mine(arg) { return; } // LEGSKIPLATE (B1086): a late helper of a skipped leg is disowned
     use core::sync::atomic::Ordering;
     let die = KAT_MODE.load(Ordering::Acquire) == KAT_DIE; // RETIREDRAINDEATHKAT (B1074): LEG 7's arm
     let kill = KAT_MODE.load(Ordering::Acquire) == KAT_KILL; // RETIREDRAINKILLKAT (B1076): LEG 8's arm
@@ -33110,13 +33131,14 @@ fn close_drain_kat(id: WinId, mode: u8) -> (&'static str, u64, WinId) {
     #[cfg(target_arch = "x86_64")]
     {
         if kill {
-            let _ = crate::arch::sched::spawn_stack_killable("drain-kat", close_drain_kat_helper, id as usize, cpu, crate::arch::sched::PRIO_NORMAL, 16 * 1024, kill_sw.clone());
+            let _ = crate::arch::sched::spawn_stack_killable("drain-kat", close_drain_kat_helper, close_drain_kat_arg(id), cpu, crate::arch::sched::PRIO_NORMAL, 16 * 1024, kill_sw.clone());
         }
     }
     if !(kill && cfg!(target_arch = "x86_64")) {
         close_drain_kat_spawn(close_drain_kat_helper, id, cpu); // RETIREDRAINBLITKAT (B1079): the one plain spawn, shared with LEG 9
     }
     if !close_drain_kat_until(1_000, || KAT_STATE.load(Ordering::Acquire) >= KAT_HELD) {
+        KAT_GEN.fetch_add(1, Ordering::AcqRel); // LEGSKIPLATE (B1086): disown the late helper
         return ("skip", 0, WIN_NONE);
     }
     let key = KAT_KEY.load(Ordering::Acquire);
@@ -33243,12 +33265,39 @@ fn close_drain_kat_cpu() -> usize {
 fn close_drain_kat_spawn(entry: fn(usize), id: WinId, cpu: usize) {
     #[cfg(target_arch = "x86_64")]
     {
-        crate::arch::sched::spawn("drain-kat", entry, id as usize, cpu, crate::arch::sched::PRIO_NORMAL);
+        crate::arch::sched::spawn("drain-kat", entry, close_drain_kat_arg(id), cpu, crate::arch::sched::PRIO_NORMAL); // LEGSKIPLATE (B1086)
     }
     #[cfg(target_arch = "aarch64")]
     {
-        let _ = crate::arch::sched::spawn_prio("drain-kat", entry, id as usize, cpu, crate::arch::sched::PRIO_NORMAL);
+        let _ = crate::arch::sched::spawn_prio("drain-kat", entry, close_drain_kat_arg(id), cpu, crate::arch::sched::PRIO_NORMAL); // LEGSKIPLATE (B1086)
     }
+}
+
+/// LEGSKIPLATE (rmbp-ledger B1086) — a helper's spawn arg: bumps [`KAT_GEN`] and packs the new generation into the high
+/// 32 bits above window `id` (the helpers' `arg as WinId` reads the id back).
+#[cfg(all(
+    feature = "witness",
+    any(
+        all(target_arch = "x86_64", feature = "wc"),
+        all(target_arch = "aarch64", feature = "desktop_firmware")
+    )
+))]
+fn close_drain_kat_arg(id: WinId) -> usize {
+    let g = KAT_GEN.fetch_add(1, core::sync::atomic::Ordering::AcqRel).wrapping_add(1);
+    ((g as usize) << 32) | id as usize
+}
+
+/// LEGSKIPLATE (rmbp-ledger B1086) — `true` iff spawn arg `arg` carries the current [`KAT_GEN`] (the helper still
+/// belongs to the leg that spawned it).
+#[cfg(all(
+    feature = "witness",
+    any(
+        all(target_arch = "x86_64", feature = "wc"),
+        all(target_arch = "aarch64", feature = "desktop_firmware")
+    )
+))]
+fn close_drain_kat_mine(arg: usize) -> bool {
+    KAT_GEN.load(core::sync::atomic::Ordering::Acquire) == (arg >> 32) as u32
 }
 
 /// RETIREDRAINBLITKAT — LEG 9's helper: a composite's F4 registration for window `arg`, held until the fixture is in
@@ -33262,6 +33311,7 @@ fn close_drain_kat_spawn(entry: fn(usize), id: WinId, cpu: usize) {
     )
 ))]
 fn close_drain_blit_kat_helper(arg: usize) {
+    if !close_drain_kat_mine(arg) { return; } // LEGSKIPLATE (B1086): a late helper of a skipped leg is disowned
     use core::sync::atomic::Ordering;
     let id = arg as WinId;
     let guard = {
@@ -33307,6 +33357,7 @@ fn close_drain_blit_kat(id: WinId) -> (&'static str, u64) {
     KAT_BLIT_SEEN.store(false, Ordering::Release);
     close_drain_kat_spawn(close_drain_blit_kat_helper, id, close_drain_kat_cpu());
     if !close_drain_kat_until(1_000, || KAT_STATE.load(Ordering::Acquire) >= KAT_HELD) {
+        KAT_GEN.fetch_add(1, Ordering::AcqRel); // LEGSKIPLATE (B1086): disown the late helper
         KAT_STATE.store(KAT_DOOR, Ordering::Release); // a late helper skips its DOOR wait
         close(id);
         return ("skip", 0);
