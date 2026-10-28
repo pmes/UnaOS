@@ -228,6 +228,8 @@ fn key(s: crate::fs::fat::BlockSource) -> u16 {
         B::SdMmc => 4,
         #[cfg(all(target_arch = "x86_64", feature = "ahci"))]
         B::Ahci(p) => 0x400 | p as u16,
+        #[cfg(all(target_arch = "x86_64", feature = "nvme"))]
+        B::Nvme => 5, // NVMEBOOT (Z9): namespace 1 of the one NVMe disk — one medium, one number (the x86-all row read it uncovered)
     }
 }
 

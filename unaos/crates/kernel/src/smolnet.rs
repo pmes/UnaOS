@@ -2328,8 +2328,9 @@ fn connect_said(own: Option<crate::net_tick::Who>, ip: [u8; 4], port: u16) {
 }
 
 /// WIFIDHCP (rmbp-ledger B831) — TAIL-APPENDED. The live default gateway and DNS server (big-endian octets, 0 = none),
-/// for `tests wifi`'s S10b line (`wifi/verb.rs::wifidhcp`) after a lease over the kept station.
-#[cfg(feature = "wifi10")]
+/// for `tests wifi`'s S10b line (`wifi/verb.rs::wifidhcp`) after a lease over the kept station. Ungated (2026-10-28, the
+/// bench): it reads two unconditional atomics, and `wifijoin`'s s9 line (verb.rs, under `smolnet`) calls it on the Zenbook
+/// line, which carries `wifi` without `wifi10` — the esp-zenbook build read E0425 there.
 pub fn route_view() -> ([u8; 4], [u8; 4]) {
     (CURRENT_GW.load(Ordering::Relaxed).to_be_bytes(), CURRENT_DNS.load(Ordering::Relaxed).to_be_bytes())
 }
