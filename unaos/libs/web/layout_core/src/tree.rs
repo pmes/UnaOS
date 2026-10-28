@@ -773,6 +773,8 @@ impl CaptionBox {
 /// centred by. The label centres on both axes in the content box (an overflowing label stays centred: one line,
 /// never wrapped), its inked line (ascent + descent) on the content box's middle, and clips to the padding box.
 /// The arithmetic is the host's, expression for expression, so its pixels do not move. Pure, no font.
+/// AETHERCAPTIONEXTENTS (SR453): both rings pass the font's RAW (unrounded) ascent / descent in px — the host's
+/// `text_extents`, AETHER.ELF's txt.rs `extents` — so only the baseline is rounded, once, in [`CaptionBox::baseline`].
 #[allow(clippy::too_many_arguments)]
 pub fn caption_box(
     bx: f32,
@@ -841,6 +843,20 @@ mod caption_box_kat {
         assert_eq!(c.baseline(0.25), 2.0);
         let n = CaptionBox { x: 0.0, top: -3.0, clip: (0.0, 0.0, 0.0, 0.0) };
         assert_eq!(n.baseline(0.5), -3.0); // -2.5 rounds away from zero
+    }
+
+    /// AETHERCAPTIONEXTENTS (SR453): a fractional (raw) extent centres the line unrounded; the same box fed the
+    /// rounded extents lands its baseline one pixel higher — the pixel the two rings differed by.
+    #[test]
+    fn captionextents_fractional_kat() {
+        let (b, p) = (edges(2.0, 2.0, 2.0, 2.0), edges(6.0, 6.0, 1.0, 1.0));
+        let raw = caption_box(10.0, 20.0, 100.0, 30.0, b, p, 40.0, 11.75, 2.625);
+        // content box (18, 23) 84 x 24, middle 35; top = 35 - 14.375 / 2
+        assert_eq!(raw, CaptionBox { x: 40.0, top: 27.8125, clip: (12.0, 22.0, 108.0, 48.0) });
+        assert_eq!(raw.baseline(12.75), 41.0); // 40.5625
+        let rounded = caption_box(10.0, 20.0, 100.0, 30.0, b, p, 40.0, 12.0, 3.0);
+        assert_eq!(rounded.top, 27.5);
+        assert_eq!(rounded.baseline(12.75), 40.0); // 40.25
     }
 }
 
