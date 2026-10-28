@@ -1096,7 +1096,7 @@ refs/heads/exec-rmbp-hidmaskcore   2ab1b5c93 FOLDED-BY-HAND (this commit) 2026-1
 refs/heads/exec-rmbp-leakedsurfgrow   039ba6743 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-gen7lockheld   3948ba9a5 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-flushverdictone   225bddeba FOLDED-BY-HAND (this commit) 2026-10-27
-refs/heads/exec-rmbp-installerlanding   b1942a9da IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-installerlanding   b08b8942b FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-aetherradiuscalc   b1942a9da IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-xhciloanpollcap   7d78633d6 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-clockcoremaskcore   b2cdaad4d FOLDED-BY-HAND (this commit) 2026-10-27

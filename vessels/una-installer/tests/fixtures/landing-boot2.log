@@ -1,0 +1,12 @@
+:: FR-BOOT: hz=2600000000 cy=99812733 reused=false state=flushed ::
+:: UnaOS flight-recorder boot log (UNAOS.LOG) ::
+[00:00:01.204] :: BOOT: total=19950ms ::
+[00:00:09.877] :: OLDEST: board=zenbook year=2024 image=c1d61903 net=ax88179 -> BOOTS ::
+:: FLIGHTRING: ---- pinned head ends (64 KiB); 51234 byte(s) of the ring left out of this file; the newest 190000 byte(s) follow ---- ::
+[00:11:49.020] :: DOCKPINS: pins=9 direct=9 -> PASS ::
+[00:12:01.500] PUMPWEDGE: age_ms=2171 last_step=net-hda holder=- rehome=none -> FAIL :: pump=9@cpu7
+[00:12:30.000] :: NAMEINDEXTX: -> SKIP(budget 60s) ::
+[00:12:31.000] [boot] log path=/var/log/boot-2.log volume=unafs bytes=2048 -> written ::
+[00:12:40.000] :: BOOTLIST: ran=3 pass=1 fail=1 skip=1 heavy=0 ms=51002 ::
+
+:: FLIGHTREC: end of log (241234 captured byte(s); the remainder of this 262656-byte file is reserved padding) ::

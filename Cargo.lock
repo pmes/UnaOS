@@ -5076,6 +5076,7 @@ dependencies = [
  "log",
  "quartzite",
  "tokio",
+ "unafs",
 ]
 
 [[package]]
