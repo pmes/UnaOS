@@ -38,6 +38,7 @@ In this order, each a `tests <verb>` at the shell:
 | `wifijoin <ssid> <pass>` | Z38/Z46/Z55/Z56/Z59/Z63/Z64 | `s8 join`, `s9 dhcp`, `s10 wpa2 … -> SECURED`, then the watch; power-cycle the AP once: `s9 rejoin … secured=1`; wait for a group rekey: `rekeys=` |
 | `wifileave` | Z68 | `[mt7925] s9 left reason=operator keys=cleared pmk=zeroized deauth=sent …` |
 | `lockreg`, `hidstall`, `memline` | B1034/B1036, B1028/B1037, B1032/B1041 | the LOCKREG tail (`release_stale=0 forceunlock_kat=ok`), MASKSCOPE `wrapsite_ok=`, the MEMLINE logout leg |
+| `unafs` | B1058/B1061/B1063 | `[unafs] bind_now kat=ok r=ok bound=1 masked=0 …` then `:: UNAFSX86-T: root=unafs … -> PASS ::` (also the card list's last light line since B1063: type it only when the list's line is missing) |
 
 ## 4. What to bring back
 
