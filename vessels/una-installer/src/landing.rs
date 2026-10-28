@@ -13,7 +13,7 @@
 // bridge is `amber_bytes::ops::Sectors`, and the filesystem is the `unafs` core's own reader (`locate_unafs`,
 // `BlockAdapter::for_partition`, `UnaFS::mount` / `mount_with` for a keyed root, BP-storage-17, then `resolve_path`,
 // `ls`, `stat`, `read_data`). The AI hand-off at rung 1 is a file, `PROMPT.md`, never a model call
-// (INSTALLER-PROVIDER owed).
+// (INSTALLER-PROVIDER built by SR424: `provider send` posts it through Vein's provider seam).
 //
 // Evidence: `<checkout>/docs/dev/evidence/landing-<yyyymmdd-hhmm>/` (UTC) holding `boot<n>.log` per log found,
 // `landing.md` (the device, the booted image's sha from its `:: OLDEST:` line, the boot dates, the verdict census, the
@@ -304,7 +304,7 @@ pub fn prompt_md(log: &FlightLog, checkout: &Path, dir_rel: &str) -> String {
         log.census.skip
     ));
     s.push_str("4. Name the next arcs: one line each, a NAME, the subsystem, and the wire that will show it fixed, in priority order.\n\n");
-    s.push_str("Nothing here calls a model or leaves this machine (INSTALLER-PROVIDER is owed).\n");
+    s.push_str("Nothing here calls a model on its own: the installer's `provider send` (INSTALLERPROVIDER SR424) posts this file and landing.md to the AI the person chose, and its reply lands as REPLY.md here.\n");
     s
 }
 

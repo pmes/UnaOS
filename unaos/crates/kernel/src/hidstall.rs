@@ -196,7 +196,7 @@ fn selftest() {
     let k = KEYQ_MAX_MS.load(Relaxed);
     serial_println!(
         ":: HIDSTALL: halted_at_login={} recovered={} proxy_retired={} hid_stall_s={} key_queue_max_ms={} dock_timeouts={} masked_max_ms={} masked_by={} -> {} :: hid_gap_bound_ms={} key_bound_ms={} release_timeout_ms={} holders={} hold_worst_ms={} hold_worst={} releases_waited={} lane_max_ms={} pump_cpu={} held_stall_s={} stall_gap_max_ms={} dock_held={} timeout_release_ms={} dock_undecoded={} fr={}",
-        h, RECOVERED.load(Relaxed), PROXY_RETIRED.load(Relaxed), s, k, DOCK_TIMEOUTS.load(Relaxed), MASKED_MAX_MS.load(Relaxed), masked_by().three(), // HIDMASKCORE (B1042): the verdict's holder stays three words (HIDSTALL-25, owed)
+        h, RECOVERED.load(Relaxed), PROXY_RETIRED.load(Relaxed), s, k, DOCK_TIMEOUTS.load(Relaxed), MASKED_MAX_MS.load(Relaxed), masked_by(), // HIDSTALL25 (B1054): the holder's four words, `@c<n>` inside the one token (the key count stays 25)
         if verdict(h, s, k) { "PASS" } else { "FAIL" }, HID_GAP_STALL_MS, KEY_QUEUE_BOUND_MS, DOCK_RELEASE_TIMEOUT_MS,
         holders_seen(), session_worst().1, HolderName(session_worst().0), RELEASES_WAITED.load(Relaxed), LANE_MAX_MS.load(Relaxed), CpuWord(pump_cpu()),
         HID_STALL_HELD_S.load(Relaxed), STALL_GAP_MAX_MS.load(Relaxed), DOCK_HELD.load(Relaxed), TIMEOUT_RELEASE_MS.load(Relaxed), DOCK_UNDECODED.load(Relaxed), FrPlace
@@ -633,7 +633,7 @@ impl MaskWho {
 #[derive(Clone, Copy)] pub struct MaskedBy { // MASKCENSUS (B1028): Copy (four plain usizes) so login's `Done` (Copy) carries one; same-line token
     name_p: usize,
     name_l: usize,
-    site: usize, core: usize, // HIDMASKCORE (B1042): the noting core (`usize::MAX` = unknown: clockcore's `note`, a busy read, [`MaskedBy::three`]); same-line token
+    site: usize, core: usize, // HIDMASKCORE (B1042): the noting core (`usize::MAX` = unknown: clockcore's `note`, a busy read); same-line token
 }
 
 impl MaskedBy {
@@ -752,7 +752,7 @@ pub fn pump_here() {
 // HIDSTALLMASKSCOPE (B1019) named only the MAX; flight 38's `hid_stall_s=5` came from many 65-129 ms spans, not one.
 // [`MaskSites`] counts every span [`note_masked`] sees by its site (`with_unafs`'s `#[track_caller]` caller): per second for
 // the `[lag] stall` line's `masked_sites=` (top-3 by the second's sum) and boot-long for `[hidstall] masked sites` after the
-// HIDSTALL verdict (top-5 by sum; the verdict itself is at its 25-field cap). A key is claimed once by CAS (0 -> the
+// HIDSTALL verdict (top-5 by sum; the verdict keeps its 25 keys). A key is claimed once by CAS (0 -> the
 // `&'static Location`) and never freed; the counters are independent atomics, so there is no lock and nothing is skipped — a
 // reader may see a span's `n` before its `sum` (one span skew, benign). A full table counts `other`. Cost per span: <= 16
 // relaxed loads, one CAS on a site's first span, five RMW atomics; per second, one 16-slot scan in `lag`'s roll.
@@ -1094,8 +1094,8 @@ fn site_n(line: u32) -> u32 {
 // is [`MaskWho`]'s fourth word, under its existing try-lock: [`masked_into`] passes `percpu::this_cpu().cpu_index` (the same read
 // `sched::current_name` makes). The note runs right AFTER the attempt's unmask (`with_unafs`'s `note_attempt`), so a re-home in
 // that instant names the new core (benign, said). The ONE `Display` prints `@c<n>` after the site, so the `[lag] stall`,
-// `[filetypes] built` and `[login] submit` lines carry it with no edit of their own. The HIDSTALL verdict (at its 25-field cap)
-// prints [`MaskedBy::three`] (HIDSTALL-25 owed); clockcore's two writers pass their core too (CLOCKCOREMASKCORE B1046).
+// `[filetypes] built` and `[login] submit` lines carry it with no edit of their own. The HIDSTALL verdict prints the whole holder
+// too (HIDSTALL25 B1054: `MaskedBy::three` retired, the key count unchanged); clockcore's two writers pass their core as well (CLOCKCOREMASKCORE B1046).
 
 impl MaskWho {
     /// The max this record names was just won by `name` at `site`, core unknown (no caller since CLOCKCOREMASKCORE B1046).
@@ -1108,11 +1108,6 @@ impl MaskedBy {
     /// The core that noted the span, if one was recorded.
     pub fn core(&self) -> Option<usize> {
         if self.core == usize::MAX { None } else { Some(self.core) }
-    }
-
-    /// The same holder without its core: `<task>@<file>:<line>` (the HIDSTALL verdict's three words).
-    pub fn three(self) -> Self {
-        MaskedBy { core: usize::MAX, ..self }
     }
 
     /// `@c<n>` when the core is known, nothing otherwise ([`Display`](core::fmt::Display)'s last word).

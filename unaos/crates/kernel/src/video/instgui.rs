@@ -772,7 +772,7 @@ pub fn open() {
         b"Install UnaOS",
         ox + wm::BORDER(),
         oy + wm::TITLE_H() + wm::BORDER(),
-    ); super::metrics::leaked_surf_retire(&SURF_AT, "instgui");
+    ); if wm::close_drain_wait("instgui") { super::metrics::leaked_surf_retire(&SURF_AT, "instgui"); } // RETIREDRAIN (rmbp-ledger B1055): retire the grown block only after every close in flight drained (wm.rs file tail); else the next re-mint retires it
     if id == wm::WIN_NONE {
         serial_println!("[wc-x] instgui DECLINE reason=create-failed");
         *STATE.lock() = State::Closed;

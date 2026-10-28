@@ -198,7 +198,7 @@ impl Pager {
         Pager { id, size: 0, off: 0, left: 0, head: false, carry: Vec::new(), pages: 0, max_ms: 0 }
     }
 
-    /// One page: one masked transaction (the inode, then `want` bytes from the cursor), decoded outside it.
+    /// One page: one MOUNT transaction (`with_unafs_read`: masked on an xHCI-backed mount, before the first bind or off x86 `wc`; preempt-off with interrupts on on a card/AHCI/NVMe one) — the inode, then `want` bytes from the cursor — decoded outside it.
     /// `Ok(true)` once every entry is decoded; `Err` = fall back to the whole blob.
     fn page(&mut self, want: &mut u64, on: &mut dyn FnMut(&str, u64, u32)) -> Result<bool, ()> {
         let (id, off, size0, first, w) = (self.id, self.off, self.size, self.pages == 0, *want);

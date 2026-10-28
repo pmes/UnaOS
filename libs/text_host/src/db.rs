@@ -10,8 +10,11 @@
 //!   (Skia's `FontEquivClass`: Arial ≡ Liberation Sans ≡ Arimo, Times New Roman ≡ Liberation Serif ≡ Tinos,
 //!   …), found through fontconfig's alias expansion. Any other substitute is refused, so the next family
 //!   of the CSS list is tried.
-//! - Generic families map to Chromium's Linux defaults (`standard`/`serif` "Times New Roman",
-//!   `sans-serif` "Arial", `monospace` "Monospace", `cursive` "Comic Sans MS", `fantasy` "Impact").
+//! - Generic families map through ONE per-OS table, [`generics_for`] (AETHER-MACGENERICS, SR418): on Linux
+//!   Chromium's Linux defaults (`standard`/`serif` "Times New Roman", `sans-serif` "Arial", `monospace`
+//!   "Monospace", `cursive` "Comic Sans MS", `fantasy` "Impact", `system-ui` "sans"), on macOS Chromium-mac's
+//!   (Times, Helvetica, Courier, Apple Chancery, Papyrus, the SF system face), each a candidate list tried
+//!   through [`FontDb::resolve_family`].
 //! - Face selection inside a family: css-fonts-4 §5.2 (font-stretch, then font-style, then font-weight),
 //!   then synthesis as Blink decides it: bold when the wanted weight exceeds the face's by more than 200,
 //!   oblique when italic/oblique is wanted and the face is upright.
@@ -351,6 +354,69 @@ pub fn db() -> &'static FontDb {
     DB.get_or_init(|| FontDb::discover(Config::system()))
 }
 
+// AETHER-MACGENERICS (SR418): the CSS generic families, ONE table per OS, keyed by the generic's CSS keyword.
+// Linux: Chromium Linux's WebFontFamilySettings names, one candidate each (byte-identical to the names Aether
+// handed the resolver before this table). macOS: Chromium-mac's (locale_settings_mac.grd: Times, Helvetica,
+// Courier, Apple Chancery, Papyrus; system-ui the CoreText UI face, SFNS.ttf; ui-monospace SF Mono, then Menlo),
+// each followed by the faces a stock Mac also carries. A stock Mac has no fonts.conf, so no alias rescues a name.
+const LINUX_GENERICS: &[(&str, &[&str])] = &[
+    ("serif", &["Times New Roman"]),
+    ("sans-serif", &["Arial"]),
+    ("monospace", &["Monospace"]),
+    ("cursive", &["Comic Sans MS"]),
+    ("fantasy", &["Impact"]),
+    ("system-ui", &["sans"]),
+];
+
+const MACOS_GENERICS: &[(&str, &[&str])] = &[
+    ("serif", &["Times", "Times New Roman"]),
+    ("sans-serif", &["Helvetica", "Arial"]),
+    ("monospace", &["Courier", "Menlo", "Courier New"]),
+    ("cursive", &["Apple Chancery", "Comic Sans MS"]),
+    ("fantasy", &["Papyrus", "Impact"]),
+    ("system-ui", &["System Font", ".SF NS", "SF Pro", "Helvetica Neue", "Helvetica"]),
+    // reached once Aether parses the ui-* generics (AETHER-UIGENERICS, owed)
+    ("ui-monospace", &["SF Mono", ".SF NS Mono", "Menlo"]),
+];
+
+/// The generic-family table of an OS: (CSS keyword, candidate family names in preference order).
+pub fn generics_for(macos: bool) -> &'static [(&'static str, &'static [&'static str])] {
+    if macos { MACOS_GENERICS } else { LINUX_GENERICS }
+}
+
+impl FontDb {
+    /// The family name a generic keyword hands the resolver on that OS: the first candidate
+    /// [`FontDb::resolve_family`] answers, else the first candidate (a miss stays a miss downstream); a keyword
+    /// the table has no row for is returned as itself (resolved as an ordinary family name).
+    pub fn generic_in(&self, macos: bool, keyword: &'static str) -> &'static str {
+        let Some((_, cands)) = generics_for(macos).iter().find(|(k, _)| k.eq_ignore_ascii_case(keyword)) else {
+            return keyword;
+        };
+        cands.iter().copied().find(|c| self.resolve_family(c).is_some()).unwrap_or(cands[0])
+    }
+}
+
+/// The family name a generic keyword resolves through on this host ([`FontDb::generic_in`] over the process
+/// database). The first call logs the picks once:
+/// `[fonts] generics os=<linux|macos> sans=<face|none> serif=<face|none> mono=<face|none> ui=<face|none>`.
+pub fn generic_family(keyword: &'static str) -> &'static str {
+    let d = db();
+    let macos = cfg!(target_os = "macos");
+    static LOG: std::sync::Once = std::sync::Once::new();
+    LOG.call_once(|| {
+        let pick = |k: &'static str| d.resolve_family(d.generic_in(macos, k)).unwrap_or_else(|| "none".to_string());
+        eprintln!(
+            "[fonts] generics os={} sans={} serif={} mono={} ui={}",
+            if macos { "macos" } else { "linux" },
+            pick("sans-serif"),
+            pick("serif"),
+            pick("monospace"),
+            pick("system-ui")
+        );
+    });
+    d.generic_in(macos, keyword)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -459,5 +525,75 @@ mod tests {
             }
         }
         assert_eq!(&of[..wd.len()], &wd[..], "family order of the first {n} fc-match -s sans-serif faces");
+    }
+
+    // AETHER-MACGENERICS (SR418): fake databases (no font files are read: resolution looks at family names only).
+    fn fake_db(families: &[&str], config: Config) -> FontDb {
+        let faces = families
+            .iter()
+            .map(|f| FaceInfo {
+                path: PathBuf::from(format!("/fake/{f}.ttf")),
+                index: 0,
+                families: vec![f.to_string()],
+                full_names: Vec::new(),
+                style: Style::default(),
+            })
+            .collect();
+        FontDb::from_faces(faces, config)
+    }
+
+    /// The macOS table on a stock Mac (no fonts.conf, so no aliases): Chromium-mac's picks, the next candidate
+    /// when one is absent, and a miss stays a miss.
+    #[test]
+    fn macgenerics_macos_table_kat() {
+        let d = fake_db(&["Helvetica", "Times", "Menlo"], Config::default());
+        assert_eq!(d.generic_in(true, "sans-serif"), "Helvetica");
+        assert_eq!(d.generic_in(true, "serif"), "Times");
+        assert_eq!(d.generic_in(true, "monospace"), "Menlo", "no Courier: Menlo");
+        assert_eq!(d.generic_in(true, "system-ui"), "Helvetica", "no SF face, no Helvetica Neue");
+        assert_eq!(d.generic_in(true, "ui-monospace"), "Menlo");
+        assert_eq!(d.generic_in(true, "cursive"), "Apple Chancery", "none installed: the first candidate");
+        assert_eq!(d.resolve_family(d.generic_in(true, "cursive")), None, "a miss stays a miss");
+        assert_eq!(d.generic_in(true, "math"), "math", "no row: the keyword itself");
+        let d = fake_db(&["Helvetica", "Times", "Menlo", "Courier", "System Font"], Config::default());
+        assert_eq!(d.generic_in(true, "monospace"), "Courier");
+        assert_eq!(d.generic_in(true, "system-ui"), "System Font");
+        assert_eq!(d.resolve_family(d.generic_in(true, "SANS-SERIF")).as_deref(), Some("Helvetica"));
+    }
+
+    /// The Linux table is today's six names exactly, so every Linux pick resolves as before.
+    #[test]
+    fn macgenerics_linux_unchanged_kat() {
+        let today: &[(&'static str, &'static str)] = &[
+            ("serif", "Times New Roman"),
+            ("sans-serif", "Arial"),
+            ("monospace", "Monospace"),
+            ("cursive", "Comic Sans MS"),
+            ("fantasy", "Impact"),
+            ("system-ui", "sans"),
+        ];
+        let t = generics_for(false);
+        assert_eq!(t.len(), today.len());
+        for ((k, cands), (tk, tn)) in t.iter().zip(today) {
+            assert_eq!((*k, *cands), (*tk, &[*tn][..]));
+        }
+        let mut c = Config::default();
+        c.read_str(
+            r#"<fontconfig>
+  <alias><family>sans-serif</family><prefer><family>DejaVu Sans</family></prefer></alias>
+  <alias><family>sans</family><prefer><family>DejaVu Sans</family></prefer></alias>
+  <alias><family>serif</family><prefer><family>DejaVu Serif</family></prefer></alias>
+  <alias><family>monospace</family><prefer><family>DejaVu Sans Mono</family></prefer></alias>
+</fontconfig>"#,
+            Path::new("/etc/fonts"),
+        );
+        let d = fake_db(&["DejaVu Sans", "DejaVu Serif", "DejaVu Sans Mono"], c);
+        for (k, n) in today {
+            assert_eq!(d.generic_in(false, *k), *n, "{k}: today's name");
+        }
+        assert_eq!(d.resolve_family(d.generic_in(false, "monospace")).as_deref(), Some("DejaVu Sans Mono"));
+        assert_eq!(d.resolve_family(d.generic_in(false, "system-ui")).as_deref(), Some("DejaVu Sans"));
+        assert_eq!(d.resolve_family(d.generic_in(false, "sans-serif")), None, "Arial: no metric-compatible face");
+        assert_eq!(d.generic_in(false, "ui-monospace"), "ui-monospace", "no Linux row");
     }
 }
