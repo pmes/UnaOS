@@ -1085,7 +1085,7 @@ refs/heads/exec-rmbp-xhciloanptpcopy   edb51e58d FOLDED-BY-HAND (this commit) 20
 refs/heads/exec-rmbp-loginfurnitureonce   eee01749e FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-aethersubmitcaption   9a0fab408 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-aethersurfaceheight   3fbb75c06 FOLDED-BY-HAND (this commit) 2026-10-27
-refs/heads/exec-rmbp-aetherheaderband   a9bb0b749 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-aetherheaderband   c233c8320 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-installervessel   d65915db9 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-installercard   6bc2f17f9 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-s10keyzero   870337caa FOLDED-BY-HAND (this commit) 2026-10-27
