@@ -4324,7 +4324,7 @@ fn take_block_loan() -> Result<BlockLoan, XhciClaimError> {
     crate::arch::sched::preemptoff::disable();
     match xhci::claim() {
         Ok(l) => {
-            let tag = crate::arch::percpu::this_cpu().cpu_index.saturating_add(1); loan_shed_arm(); loan_yield_close(); // XHCILOANFAILHOLD (Z66): the loan's age starts here, its shed mark cleared. XHCILOANPTPYIELDPOLLTAKE (Z82): an open PTP yield window records its closer BEFORE the publish below
+            if loan_poll_yield_skip() { drop(l); crate::arch::sched::preemptoff::enable(); return Err(XhciClaimError::Busy); } let tag = crate::arch::percpu::this_cpu().cpu_index.saturating_add(1); loan_shed_arm(); loan_yield_close(); // XHCILOANPTPYIELDPOLLSKIP (Z86): the xhci-poll take inside an open PTP yield window goes straight back (unpublished, the closer left OPEN). XHCILOANFAILHOLD (Z66): the loan's age starts here, its shed mark cleared. XHCILOANPTPYIELDPOLLTAKE (Z82): an open PTP yield window records its closer BEFORE the publish below
             BLOCK_LOAN_CPU.store(tag, core::sync::atomic::Ordering::Release);
             Ok(BlockLoan { loan: Some(l), tag })
         }
@@ -5099,5 +5099,73 @@ pub fn xhci_loan_yield_closed_by_poll() -> bool {
     #[cfg(not(target_arch = "x86_64"))]
     {
         false
+    }
+}
+
+// ══════════ XHCILOANPTPYIELDPOLLSKIP (zenbook-ledger Z86) — the xhci-poll take is refused inside a PTP yield window ══════════
+//
+// TAIL-APPENDED (one LINE-NEUTRAL fold: `take_block_loan`'s x86 Ok arm; one in `xhci::poll_loan`). The xhci-poll task takes
+// controller 0 every 1 ms tick through `take_block_loan` (Z74), so it closed a PTP yield window (`ptp::TXN_YIELDED`, Z73;
+// <= 3 ms) before the block claimant the window exists for (Z82's `taken_poll=`). Z76's claim-first-then-refuse rule, moved
+// to where it can still refuse: AFTER `claim()` succeeds (a take after the PTP put sees the flag the holder set before that
+// put) and BEFORE `loan_yield_close` and the publish, so the closer stays OPEN and `yield_now` sees no `BLOCK_LOAN_CPU`: the
+// window serves a block claimant or nobody. Only the task the closer names `xhci-poll` is refused; the loan goes straight
+// back (`XhciLoan`'s Drop), the preempt-off count is released, `Busy`; counted (`poll_skips=`), the first said once, not
+// stamped claim-busy. The cost: <= 3 ms of input latency per window (the PTP holder drains the ring itself during its hold).
+// Owed: XHCILOAN-PTPYIELD-POLLSKIP-KATRULE (Z84's `skip(poll-closed)` arm deleted: ok-or-FAIL).
+
+/// XHCILOANPTPYIELDPOLLSKIP: the xhci-poll take refused inside a PTP yield window (written and read by that one task:
+/// `xhci::poll_loan` takes it to leave the refusal unstamped).
+#[cfg(all(target_arch = "x86_64", feature = "uvc"))]
+static LOAN_POLL_SKIPPED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// XHCILOANPTPYIELDPOLLSKIP: called by `take_block_loan` after a successful `claim()` and BEFORE the closer and the publish:
+/// `true` = this is the xhci-poll take and a PTP yield window is open (the caller puts the loan back and answers `Busy`).
+/// One load and out for every take outside a window; `false`, inlined away, without `uvc` (no window exists).
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn loan_poll_yield_skip() -> bool {
+    #[cfg(feature = "uvc")]
+    {
+        use core::sync::atomic::Ordering;
+        if xhci::ptp::TXN_YIELDED.load(Ordering::Acquire) && crate::arch::sched::current_name() == Some("xhci-poll") {
+            LOAN_POLL_SKIPPED.store(true, Ordering::Relaxed);
+            if POLL_YIELD_SKIPS.fetch_add(1, Ordering::Relaxed) == 0 {
+                serial_println!("[xhci] poll skip why=ptp-yield who=xhci-poll (XHCILOANPTPYIELDPOLLSKIP Z86, first skip, once)");
+            }
+            return true;
+        }
+    }
+    false
+}
+
+/// XHCILOANPTPYIELDPOLLSKIP: whether the xhci-poll task's last refused take was the window skip (cleared by the read).
+#[cfg(all(target_arch = "x86_64", feature = "uvc"))]
+pub fn xhci_poll_skip_take() -> bool {
+    LOAN_POLL_SKIPPED.swap(false, core::sync::atomic::Ordering::Relaxed)
+}
+
+/// XHCILOANPTPYIELDPOLLSKIP: no `uvc`, no window, never a skip (the knob-off image keeps `poll_loan`'s old code).
+#[cfg(all(target_arch = "x86_64", not(feature = "uvc")))]
+#[inline(always)]
+pub fn xhci_poll_skip_take() -> bool {
+    false
+}
+
+/// XHCILOANPTPYIELDPOLLSKIP: xhci-poll takes refused inside a PTP yield window this boot (`poll_skips=`). A twin of Z76's
+/// `PUMP_YIELD_SKIPS`, which stays the pump's alone (Z81's `pump_kat=` reads it as the pump gate's proof).
+#[cfg(feature = "uvc")]
+static POLL_YIELD_SKIPS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// XHCILOANPTPYIELDPOLLSKIP: ` poll_skips=<n>` on the `[xhci] loan yield` line (ptp.rs), NOTHING while 0 (Z73's line
+/// byte-identical on a boot the gate never fired).
+#[cfg(feature = "uvc")]
+pub struct PollSkips;
+
+#[cfg(feature = "uvc")]
+impl core::fmt::Display for PollSkips {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let n = POLL_YIELD_SKIPS.load(core::sync::atomic::Ordering::Relaxed);
+        if n == 0 { Ok(()) } else { write!(f, " poll_skips={}", n) }
     }
 }

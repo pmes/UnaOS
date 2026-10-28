@@ -1568,7 +1568,7 @@ impl XhciController {
                     }
                 }
                 if got > (8 << 20) {
-                    serial_println!("[xhci] loan yield who=ptp n={} taken={} taken_poll={} waited_us={} yield_skips={} (XHCILOANPTPYIELD Z73)", yn, yt.saturating_sub(yp), yp, ymax, super::pump_yield_skips()); // XHCILOANPTPYIELDPOLLTAKE (Z82): taken= the block claimants served, taken_poll= the xhci-poll closes
+                    serial_println!("[xhci] loan yield who=ptp n={} taken={} taken_poll={} waited_us={} yield_skips={}{} (XHCILOANPTPYIELD Z73)", yn, yt.saturating_sub(yp), yp, ymax, super::pump_yield_skips(), crate::drivers::block::PollSkips); // XHCILOANPTPYIELDPOLLTAKE (Z82): taken= the block claimants served, taken_poll= the xhci-poll closes. XHCILOANPTPYIELDPOLLSKIP (Z86): ` poll_skips=<n>` only when the poller was refused in a window
                 }
                 if !unknown && got < total {
                     return Err("data phase short");
