@@ -713,7 +713,7 @@ fn open_as(state: State) {
     // screen, no console and a swallowed keyboard. The fixture's CLOSE leg measures it every witness
     // boot, against a control row that differs only here.
     let title: &[u8] = if LOCKED.load(Ordering::Relaxed) { b"Locked" } else if state == State::SetPw { b"Set password" } else if state == State::Unlock { b"Unlock" } else if state == State::CreateUser { b"Create account" } else { b"Log in" }; *CARD_TITLE.lock() = title;
-    let id = wm::create_at_native(OWNER, surf, sw * super::super::metrics::size(CARD_CAP.load(Ordering::Relaxed)) * 4, sw as u32, sh as u32, (sw * 4) as u32, title, ox + wm::BORDER(), oy + wm::TITLE_H() + wm::BORDER()); super::super::metrics::leaked_surf_retire(&SURF_AT, "login");
+    let id = wm::create_at_native(OWNER, surf, sw * super::super::metrics::size(CARD_CAP.load(Ordering::Relaxed)) * 4, sw as u32, sh as u32, (sw * 4) as u32, title, ox + wm::BORDER(), oy + wm::TITLE_H() + wm::BORDER()); if wm::close_drain_wait("login") { super::super::metrics::leaked_surf_retire(&SURF_AT, "login"); } // RETIREDRAIN (rmbp-ledger B1055): retire the grown block only after every close in flight drained (wm.rs file tail); else the next re-mint retires it
     if id == wm::WIN_NONE {
         FORM.lock().windowed = false;
         serial_println!("[login] screen open window=no (create refused — headless form)");
@@ -3966,7 +3966,7 @@ fn rescaled(id: wm::WinId) -> bool {
     repaint();
     let (sw, sh, cap) = (super::super::metrics::size(W), super::super::metrics::size(H()), CARD_CAP.load(Ordering::Relaxed));
     let title = *CARD_TITLE.lock();
-    let new = wm::create_at_native(OWNER, surf().as_mut_ptr() as usize, sw * super::super::metrics::size(cap) * 4, sw as u32, sh as u32, (sw * 4) as u32, title, i.x, i.y); super::super::metrics::leaked_surf_retire(&SURF_AT, "login");
+    let new = wm::create_at_native(OWNER, surf().as_mut_ptr() as usize, sw * super::super::metrics::size(cap) * 4, sw as u32, sh as u32, (sw * 4) as u32, title, i.x, i.y); if wm::close_drain_wait("login") { super::super::metrics::leaked_surf_retire(&SURF_AT, "login"); } // RETIREDRAIN (rmbp-ledger B1055): retire the grown block only after every close in flight drained (wm.rs file tail); else the next re-mint retires it
     if new != wm::WIN_NONE {
         WIN.store(new, Ordering::Relaxed);
         wm::set_modal_top(new);
