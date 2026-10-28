@@ -5163,7 +5163,7 @@ pub fn xhci_loan_yield_closed_by_ptp() -> bool {
 // window serves a block claimant or nobody. Only the task the closer names `xhci-poll` is refused; the loan goes straight
 // back (`XhciLoan`'s Drop), the preempt-off count is released, `Busy`; counted (`poll_skips=`), the first said once, not
 // stamped claim-busy. The cost: <= 3 ms of input latency per window (the PTP holder drains the ring itself during its hold).
-// Owed: XHCILOAN-PTPYIELD-POLLSKIP-KATRULE (Z84's `skip(poll-closed)` arm deleted: ok-or-FAIL).
+// Owed: XHCILOAN-PTPYIELD-POLLSKIP-KATRULE — BUILT by XHCILOANPTPYIELDKATRULE (zenbook-ledger Z88: `ptp_yield=poll-closed` FAILs).
 
 /// XHCILOANPTPYIELDPOLLSKIP: the xhci-poll take refused inside a PTP yield window (written and read by that one task:
 /// `xhci::poll_loan` takes it to leave the refusal unstamped).
