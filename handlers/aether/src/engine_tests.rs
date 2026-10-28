@@ -2816,6 +2816,7 @@ mod tests {
     /// half mixed with white).
     #[test]
     fn test_stacking_context_kat() {
+        // AETHERABSCB (SR431): the cyan box has no positioned ancestor, so its containing block is the ICB (top:100px, was top:0 under the old every-parent-is-a-containing-block rule).
         let t = laid_out(
             r#"<html><body>
             <div style="position:relative;height:100px">
@@ -2824,7 +2825,7 @@ mod tests {
               <div style="position:relative"><div style="position:absolute;left:100px;top:0;width:40px;height:40px;background:#0000ff;z-index:3"></div></div>
               <div style="position:absolute;left:120px;top:20px;width:40px;height:40px;background:#ffff00;z-index:2"></div>
             </div>
-            <div style="height:40px;width:100px;background:#ff00ff"><div style="position:absolute;z-index:-1;left:0;top:0;width:200px;height:40px;background:#00ffff"></div></div>
+            <div style="height:40px;width:100px;background:#ff00ff"><div style="position:absolute;z-index:-1;left:0;top:100px;width:200px;height:40px;background:#00ffff"></div></div>
             <div style="opacity:0.5;position:relative;height:60px"><div style="position:absolute;left:0;top:0;width:40px;height:40px;background:#ff0000"></div><div style="position:absolute;left:20px;top:20px;width:40px;height:40px;background:#0000ff"></div></div>
             </body></html>"#,
             "body{margin:0}",
@@ -4048,5 +4049,28 @@ mod tests {
         let mut buf = vec![255u8; (vw * vh * 4) as usize];
         crate::render::render_frame(&tree, &mut buf, vw, vh, 0.0, 0.0, &[(0, 0, vw, vh)]);
         header_band_check("no faces", &buf, vw, vh, b);
+    }
+
+    // ---- AETHERABSCB (SR431): abs_cb_pill_and_icb_probe ----
+    /// CSS 2.2 §10.1.4 on the SR412 fixtures at 1810x1280: google-home's Sign-in pill (a static inline-block in a
+    /// `float: right` row under `#gb { position: relative }`, no absolute box above it) keeps SR412's with-fonts
+    /// place, right edge 1783 (the float's edge, font-independent); screenshot-facts' `#acct` (`position: absolute;
+    /// top: 6px; right: 8px` under a static `#mngb`) sits against the initial containing block, right 1802, top 6.
+    #[test]
+    fn abs_cb_pill_and_icb_probe() {
+        let rect = |html: &str, sel: &str| -> (f64, f64) {
+            let mut engine = crate::AetherEngine::new();
+            engine.handle_event(crate::api::events::Event::Resize(1810, 1280));
+            engine.load_html("https://example.com/", html, true);
+            engine.render_frame();
+            let src = format!("(function(){{var r=document.querySelector('{}').getBoundingClientRect();return r.right+','+r.top;}})()", sel);
+            let out = engine.js_engine.as_mut().unwrap().eval_string(&src).unwrap_or_else(|e| format!("ERR {}", e));
+            let mut it = out.split(',').map(|v| v.trim().parse::<f64>().unwrap_or(f64::NAN));
+            (it.next().unwrap_or(f64::NAN), it.next().unwrap_or(f64::NAN))
+        };
+        let (right, _) = rect(include_str!("../tests/data/headerband/google-home.html"), "a.gb_6a");
+        assert!((right - 1783.0).abs() <= 1.5, "google-home's Sign-in pill keeps SR412's right edge 1783: got {right}");
+        let (right, top) = rect(include_str!("../tests/data/headerband/screenshot-facts.html"), "#acct");
+        assert!((right - 1802.0).abs() <= 0.5 && (top - 6.0).abs() <= 0.5, "#acct against the initial containing block at right 1802 top 6: got {right}, {top}");
     }
 }
