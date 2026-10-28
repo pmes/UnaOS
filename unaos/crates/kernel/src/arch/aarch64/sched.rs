@@ -11792,9 +11792,9 @@ pub mod preemptoff {
     // `stage_fill` -> `shadow_casts_for`), a window chrome repaint (`paint_window` -> `chrome_paint`) or `a11yshadow::said`
     // (on a looks-epoch move): all need a casting window, so the leg reads `skip(no-casts)` from an out-of-pass `casts_now`
     // BEFORE it arms (Z103's legal outermost take), then arms and calls `desktop::shadows_stale` (TABLE only, no CASTS) so
-    // the next pass re-fills every cast extent and repaints every window. NOT guarded: an out-of-pass `casts_now` on another
-    // core inside the leg's window (none runs during `tests preemptaudit`) would write `after=0` and read `outermost` — a
-    // false FAIL, never a false PASS (a COMPGATE-holder test needs a `wm` accessor: PREEMPTOFF-ARM-CASTSNOW-INPASS-GUARD).
+    // the next pass re-fills every cast extent and repaints every window. GUARDED by PREEMPTOFFARMCASTSNOWINPASSGUARD (Z114):
+    // `casts_now_nest` arms its wrap only when `video/wm.rs` `comp_gate_held_here` says THIS core holds COMPGATE, so an
+    // out-of-pass `casts_now` on another core inside the leg's window writes nothing (was a false `outermost`); `track`: none.
 
     #[cfg(all(feature = "desktop_firmware", feature = "witness"))]
     static CASTS_NEST: AtomicU32 = AtomicU32::new(0);
@@ -11822,21 +11822,21 @@ pub mod preemptoff {
     #[cfg(all(feature = "desktop_firmware", feature = "witness"))]
     #[inline]
     pub fn casts_nest(hold: super::PreemptHold) -> CastsNest {
-        nest_wrap(hold, &CASTS_NEST)
+        nest_wrap(hold, &CASTS_NEST, false)
     }
 
     /// Z109: the same wrap for `casts_now`'s hold, into `CASTS_NOW_NEST`.
     #[cfg(all(feature = "desktop_firmware", feature = "witness"))]
     #[inline]
     pub fn casts_now_nest(hold: super::PreemptHold) -> CastsNest {
-        nest_wrap(hold, &CASTS_NOW_NEST)
+        nest_wrap(hold, &CASTS_NOW_NEST, true)
     }
 
-    /// Z106's wrap (moved here by Z109): reads `word` armed, and the count inside on the core the hold took.
+    /// Z106's wrap (moved here by Z109): reads `word` armed (Z114: and, when `guard`, this core holding COMPGATE), and the count inside.
     #[cfg(all(feature = "desktop_firmware", feature = "witness"))]
     #[inline]
-    fn nest_wrap(hold: super::PreemptHold, word: &'static AtomicU32) -> CastsNest {
-        let armed = word.load(Ordering::Relaxed) == NEST_ARMED;
+    fn nest_wrap(hold: super::PreemptHold, word: &'static AtomicU32, guard: bool) -> CastsNest {
+        let armed = word.load(Ordering::Relaxed) == NEST_ARMED && (!guard || crate::video::wm::comp_gate_held_here());
         let c = hold.core;
         let inside = if armed { crate::arch::without_interrupts(|| NOPREEMPT[c].load(Ordering::Relaxed)) } else { 0 };
         CastsNest { hold: core::mem::ManuallyDrop::new(hold), inside, armed, word }
