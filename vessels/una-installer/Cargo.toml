@@ -33,3 +33,4 @@ amber_core = { path = "../../unaos/libs/sys/amber_core" }
 unafs = { path = "../../unaos/libs/fs/unafs", default-features = false }
 tokio = { version = "1.53", features = ["rt", "rt-multi-thread", "sync", "macros", "time"] }
 log = "0.4"
+libc = "0.2" # INSTALLERAUTHOPEN (SR422): sendmsg/recvmsg + msghdr for the SCM_RIGHTS fd handoff (authopen / the pkexec helper)

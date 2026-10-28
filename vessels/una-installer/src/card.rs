@@ -14,8 +14,11 @@
 // Wire:
 //   [installer] card devices n=<n> writable=<n>
 //   [installer] card device=<id> size=<bytes> image=<path> written_mb=<n> readback=1|0 ejected=1|0 ms=<n>
-//   [installer] card refused why=<system-disk|mounted|too-small|no-image|windows-unbuilt> device=<id|->
+//   [installer] card refused why=<system-disk|mounted|too-small|no-image|windows-unbuilt|elevation-denied|elevation-unavailable> device=<id|->
+//   [installer] card elevate how=<authopen|pkexec> ok=1|0 why=<-|elevation-denied|elevation-unavailable>
+//     (INSTALLERAUTHOPEN SR422: once per write, only when the plain open was refused for permission)
 
+use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, channel};
 use std::time::Instant;
@@ -289,7 +292,10 @@ fn open_device(dev: &Device) -> Result<FileBlock, String> {
     } else {
         FileBlock::open_rw(&canon)
     };
-    fb.map_err(|e| format!("{}: {e}", canon.display()))
+    match fb {
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => elevated_block(dev, &canon),
+        fb => fb.map_err(|e| format!("{}: {e}", canon.display())),
+    }
 }
 
 /// Write `image` onto `dev` after the operator typed its phrase: refuse by name, unmount, write, verify, eject.
@@ -331,6 +337,252 @@ pub fn write(image: &Path, dev: &Device, typed: &str, progress: &mut dyn FnMut(u
     };
     println!("{}", r.line());
     Ok(r)
+}
+
+// ── elevation (INSTALLERAUTHOPEN SR422) ─────────────────────────────────────────────────────────
+//
+// A removable disk node opens only as root (macOS `/dev/diskN`; Linux `/dev/sdX` without the disk group). The
+// elevated process opens ONE fd and hands it back over a socketpair end that is its STDOUT, as one SCM_RIGHTS
+// message: macOS `/usr/libexec/authopen -stdoutpipe -o 2 <node>` (O_RDWR: `verify` reads back through the same fd),
+// Linux `pkexec <self> --open-device <node>` (pkexec marks every fd >= 3 close-on-exec, so stdout is the only
+// channel that survives it). The helper re-runs Amber's policy and judgment, opens, sends and exits; nothing else
+// runs as root, and every byte is written by the unprivileged write thread through the received fd.
+
+/// `[installer] card elevate how=<authopen|pkexec> ok=1|0 why=<why>`.
+pub fn elevate_line(how: &str, ok: bool, why: &str) -> String {
+    format!("[installer] card elevate how={how} ok={} why={why}", ok as u8)
+}
+
+/// The elevated command for `node`: authopen on macOS, `pkexec <exe> --open-device <node>` elsewhere.
+pub fn elevation_argv(macos: bool, node: &Path, exe: &Path) -> (String, Vec<String>) {
+    let node = node.to_string_lossy().into_owned();
+    if macos {
+        (String::from("/usr/libexec/authopen"), vec!["-stdoutpipe".into(), "-o".into(), "2".into(), node])
+    } else {
+        (String::from("pkexec"), vec![exe.to_string_lossy().into_owned(), "--open-device".into(), node])
+    }
+}
+
+/// The plain open was refused for permission: elevate, print the elevate line once, and take the fd into a
+/// `FileBlock` (macOS at diskutil's size, as `open_device` sizes it; Linux at the measured length).
+fn elevated_block(dev: &Device, canon: &Path) -> Result<FileBlock, String> {
+    let how = if cfg!(target_os = "macos") { "authopen" } else { "pkexec" };
+    match elevated_open(canon) {
+        Ok(file) => {
+            println!("{}", elevate_line(how, true, "-"));
+            let sized = cfg!(target_os = "macos").then_some(dev.bytes / SECTOR);
+            FileBlock::from_file(file, sized).map_err(|e| format!("{}: {e}", canon.display()))
+        }
+        Err(why) => {
+            println!("{}", elevate_line(how, false, why));
+            Err(refuse(why, Some(&dev.id)))
+        }
+    }
+}
+
+/// Run the elevated opener on `canon` and receive its fd. `elevation-unavailable` = the tool is not here;
+/// `elevation-denied` = dismissed, not authorized, or no fd came back.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub fn elevated_open(canon: &Path) -> Result<File, &'static str> {
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
+    use std::process::{Command, Stdio};
+    let exe = std::env::current_exe().map_err(|_| "elevation-unavailable")?;
+    let (prog, args) = elevation_argv(cfg!(target_os = "macos"), canon, &exe);
+    let (ours, theirs) = UnixStream::pair().map_err(|_| "elevation-unavailable")?;
+    // The temporary Command (and its copy of `theirs`) drops at the end of this statement: the child then holds
+    // the only other end, so a child that exits without sending reads as end-of-file below.
+    let mut child = Command::new(&prog)
+        .args(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(OwnedFd::from(theirs)))
+        .spawn()
+        .map_err(|_| "elevation-unavailable")?;
+    let fd = recv_fd(&ours);
+    let _ = child.wait();
+    fd.ok_or("elevation-denied")
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn elevated_open(_canon: &Path) -> Result<File, &'static str> {
+    Err("windows-unbuilt")
+}
+
+const SCM_RIGHTS: i32 = 1;
+
+/// The `cmsghdr` layout of one OS: Linux `{ size_t len; int level; int type; }` aligned to `size_t`, SOL_SOCKET 1;
+/// macOS `{ socklen_t len; int level; int type; }` aligned to 4, SOL_SOCKET 0xffff. The parser takes it as data so
+/// a canned macOS message is tested on Linux.
+#[derive(Clone, Copy, Debug)]
+pub struct CmsgLayout {
+    pub len_bytes: usize,
+    pub align: usize,
+    pub sol_socket: i32,
+}
+
+impl CmsgLayout {
+    pub const LINUX: Self = Self { len_bytes: 8, align: 8, sol_socket: 1 };
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub const MACOS: Self = Self { len_bytes: 4, align: 4, sol_socket: 0xffff };
+    #[cfg(target_os = "macos")]
+    pub const NATIVE: Self = Self::MACOS;
+    #[cfg(not(target_os = "macos"))]
+    pub const NATIVE: Self = Self { len_bytes: std::mem::size_of::<usize>(), align: std::mem::size_of::<usize>(), sol_socket: 1 };
+
+    fn up(&self, n: usize) -> usize {
+        (n + self.align - 1) & !(self.align - 1)
+    }
+    /// The header's aligned size: where the data starts (`CMSG_DATA`).
+    fn hdr(&self) -> usize {
+        self.up(self.len_bytes + 8)
+    }
+}
+
+/// The first SCM_RIGHTS fd in a received control buffer; `None` when there is none or the buffer is malformed.
+pub fn fd_from_control(buf: &[u8], l: CmsgLayout) -> Option<i32> {
+    let int = |at: usize| -> Option<i32> { Some(i32::from_ne_bytes(buf.get(at..at + 4)?.try_into().ok()?)) };
+    let mut off = 0usize;
+    while off + l.hdr() <= buf.len() {
+        let len = if l.len_bytes == 4 {
+            u32::from_ne_bytes(buf.get(off..off + 4)?.try_into().ok()?) as usize
+        } else {
+            u64::from_ne_bytes(buf.get(off..off + 8)?.try_into().ok()?) as usize
+        };
+        if len < l.hdr() || len > buf.len() - off {
+            return None;
+        }
+        let (level, ty) = (int(off + l.len_bytes)?, int(off + l.len_bytes + 4)?);
+        if level == l.sol_socket && ty == SCM_RIGHTS && len >= l.hdr() + 4 {
+            return int(off + l.hdr());
+        }
+        off += l.up(len);
+    }
+    None
+}
+
+/// One SCM_RIGHTS control message carrying `fd` (`CMSG_SPACE(4)` bytes, `cmsg_len = CMSG_LEN(4)`).
+pub fn control_for_fd(fd: i32, l: CmsgLayout) -> Vec<u8> {
+    let mut v = vec![0u8; l.hdr() + l.up(4)];
+    let len = l.hdr() + 4;
+    if l.len_bytes == 4 {
+        v[..4].copy_from_slice(&(len as u32).to_ne_bytes());
+    } else {
+        v[..8].copy_from_slice(&(len as u64).to_ne_bytes());
+    }
+    v[l.len_bytes..l.len_bytes + 4].copy_from_slice(&l.sol_socket.to_ne_bytes());
+    v[l.len_bytes + 4..l.len_bytes + 8].copy_from_slice(&SCM_RIGHTS.to_ne_bytes());
+    v[l.hdr()..l.hdr() + 4].copy_from_slice(&fd.to_ne_bytes());
+    v
+}
+
+/// Receive one fd sent as SCM_RIGHTS (authopen's `-stdoutpipe` message, or the helper's [`send_fd`]).
+#[cfg(unix)]
+pub fn recv_fd(sock: &std::os::unix::net::UnixStream) -> Option<File> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    let mut byte = [0u8; 1];
+    let mut ctrl = [0u64; 8];
+    let mut iov = libc::iovec { iov_base: byte.as_mut_ptr().cast(), iov_len: 1 };
+    // SAFETY: an all-zero msghdr is valid (null name, no flags); the pointers set below outlive the call.
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = ctrl.as_mut_ptr().cast();
+    msg.msg_controllen = std::mem::size_of_val(&ctrl) as _;
+    #[cfg(target_os = "linux")]
+    let flags = libc::MSG_CMSG_CLOEXEC;
+    #[cfg(not(target_os = "linux"))]
+    let flags = 0;
+    let n = loop {
+        // SAFETY: `msg` points at live buffers of the stated lengths.
+        let n = unsafe { libc::recvmsg(sock.as_raw_fd(), &mut msg, flags) };
+        if n < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        break n;
+    };
+    if n < 0 {
+        return None;
+    }
+    let clen = (msg.msg_controllen as usize).min(std::mem::size_of_val(&ctrl));
+    // SAFETY: the first `clen` bytes of `ctrl` are initialised (it was zeroed and the kernel wrote into it).
+    let bytes = unsafe { std::slice::from_raw_parts(ctrl.as_ptr().cast::<u8>(), clen) };
+    let fd = fd_from_control(bytes, CmsgLayout::NATIVE)?;
+    // SAFETY: the kernel installed `fd` in this process for us; nothing else owns it.
+    (fd >= 0).then(|| unsafe { File::from_raw_fd(fd) })
+}
+
+/// Send `file`'s fd as one SCM_RIGHTS message (the helper's half of the handoff).
+#[cfg(unix)]
+pub fn send_fd(sock: &std::os::unix::net::UnixStream, file: &File) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let mut byte = [0u8; 1];
+    let mut ctrl = control_for_fd(file.as_raw_fd(), CmsgLayout::NATIVE);
+    let mut iov = libc::iovec { iov_base: byte.as_mut_ptr().cast(), iov_len: 1 };
+    // SAFETY: as in `recv_fd`.
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = ctrl.as_mut_ptr().cast();
+    msg.msg_controllen = ctrl.len() as _;
+    // SAFETY: `msg` points at live buffers of the stated lengths.
+    let n = unsafe { libc::sendmsg(sock.as_raw_fd(), &msg, 0) };
+    if n < 0 { Err(std::io::Error::last_os_error()) } else { Ok(()) }
+}
+
+/// The helper's open, as root: the node must be a block device Amber's policy admits (not mounted) AND a disk
+/// Amber lists and judges a writable card. A regular file, a system disk or an unlisted node is refused.
+#[cfg(unix)]
+pub fn helper_open(node: &Path) -> Result<File, String> {
+    use amber_bytes::policy::{Policy, TargetKind};
+    let canon = node.canonicalize().map_err(|e| format!("{}: {e}", node.display()))?;
+    let pol = Policy { yes_i_mean_it: true, allow: vec![canon.clone()], mounts: None };
+    let (kind, canon) = pol.check_write(&canon)?;
+    if kind != TargetKind::BlockDevice {
+        return Err(format!("{}: not a block device — refused", canon.display()));
+    }
+    let dev = host_devices()
+        .into_iter()
+        .find(|d| d.node.canonicalize().map(|c| c == canon).unwrap_or(false))
+        .ok_or_else(|| format!("{}: not a disk Amber lists — refused", canon.display()))?;
+    if let Some(why) = dev.refusal(0) {
+        return Err(format!("{}: not a card ({why}) — refused", canon.display()));
+    }
+    let mut oo = std::fs::OpenOptions::new();
+    oo.read(true).write(true);
+    #[cfg(target_os = "linux")]
+    {
+        // O_EXCL on a block device: EBUSY while anything holds or mounts it.
+        use std::os::unix::fs::OpenOptionsExt;
+        oo.custom_flags(libc::O_EXCL);
+    }
+    oo.open(&canon).map_err(|e| format!("{}: {e}", canon.display()))
+}
+
+/// The hidden helper verb `--open-device <node>` (what `elevated_open` runs under pkexec): `None` for any other
+/// argv; else open through [`helper_open`], send the fd on stdout, and answer the exit code (0 sent, 1 refused).
+#[cfg(unix)]
+pub fn open_device_verb(args: impl Iterator<Item = String>) -> Option<i32> {
+    use std::os::fd::AsFd;
+    let a: Vec<String> = args.collect();
+    if a.len() != 2 || a[0] != "--open-device" {
+        return None;
+    }
+    let served = helper_open(Path::new(&a[1])).and_then(|file| {
+        let out = std::io::stdout().as_fd().try_clone_to_owned().map_err(|e| format!("stdout: {e}"))?;
+        send_fd(&std::os::unix::net::UnixStream::from(out), &file).map_err(|e| format!("send fd: {e}"))
+    });
+    Some(match served {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("una-installer --open-device: {e}");
+            1
+        }
+    })
+}
+
+#[cfg(not(unix))]
+pub fn open_device_verb(_args: impl Iterator<Item = String>) -> Option<i32> {
+    None
 }
 
 // ── the face ────────────────────────────────────────────────────────────────────────────────────
@@ -711,5 +963,103 @@ mod tests {
         let TetraNode::Console(con) = &kids[0] else { panic!("list") };
         assert!(con.lines.iter().any(|l| l.text.contains("disk0") && l.text.contains("[refused system-disk]")));
         assert!(con.lines.iter().any(|l| l.text.starts_with("> disk4")));
+    }
+
+    // INSTALLERAUTHOPEN (SR422): the helper's half sends a real fd over a real socketpair (on a thread: a bin crate's
+    // unit test has no CARGO_BIN_EXE to spawn), the receiver takes it into a FileBlock, and the ONE writer runs.
+    #[test]
+    fn elevate_fd_handoff_over_socketpair() {
+        use std::os::unix::net::UnixStream;
+        let dir = scratch("elevate");
+        let sectors = (3 << 20) / SECTOR + 7;
+        let img: Vec<u8> = (0..sectors * SECTOR).map(|i| (i.wrapping_mul(2246822519) >> 11) as u8).collect();
+        let (ip, dp) = (dir.join("card.img"), dir.join("device.bin"));
+        fs::write(&ip, &img).unwrap();
+        fs::File::create(&dp).unwrap().set_len(16 << 20).unwrap();
+        let (a, b) = UnixStream::pair().unwrap();
+        let dev_file = fs::OpenOptions::new().read(true).write(true).open(&dp).unwrap();
+        let sender = std::thread::spawn(move || send_fd(&a, &dev_file));
+        let got = recv_fd(&b).expect("an fd over the socketpair");
+        sender.join().unwrap().unwrap();
+        let mut dst = FileBlock::from_file(got, None).unwrap();
+        assert_eq!(dst.sectors(), (16 << 20) / SECTOR);
+        assert!(dst.writable());
+        let mut src = FileBlock::open(&ip).unwrap();
+        write_to(&mut src, &mut dst, sectors, &mut |_, _| {}).unwrap();
+        assert!(verify(&mut src, &mut dst, sectors));
+        drop(dst);
+        assert_eq!(&fs::read(&dp).unwrap()[..img.len()], &img[..]);
+        // The sized take (macOS: diskutil's size, seek(End) answers 0 on a disk node).
+        let (a, b) = UnixStream::pair().unwrap();
+        send_fd(&a, &fs::OpenOptions::new().read(true).write(true).open(&dp).unwrap()).unwrap();
+        let sized = FileBlock::from_file(recv_fd(&b).unwrap(), Some(4096)).unwrap();
+        assert_eq!(sized.sectors(), 4096);
+        // Denied: the elevated end closes without sending (dismissed, not authorized): no fd.
+        let (a, b) = UnixStream::pair().unwrap();
+        drop(a);
+        assert!(recv_fd(&b).is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn helper_refuses_a_regular_file() {
+        let dir = scratch("helper");
+        let f = dir.join("passwd");
+        fs::write(&f, b"root:x:0:0\n").unwrap();
+        let e = helper_open(&f).unwrap_err();
+        assert!(e.contains("not a block device") && e.contains("refused"), "{e}");
+        assert!(helper_open(&dir.join("absent")).is_err());
+        // The verb: any other argv is not the helper's; a refused node answers 1 before stdout is touched.
+        assert_eq!(open_device_verb(["census".to_string()].into_iter()), None);
+        assert_eq!(open_device_verb(["--open-device".to_string()].into_iter()), None);
+        assert_eq!(open_device_verb(["--open-device", "/dev/sdb", "x"].map(String::from).into_iter()), None);
+        assert_eq!(open_device_verb(["--open-device".to_string(), f.to_string_lossy().into_owned()].into_iter()), Some(1));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cmsg_parser_canned() {
+        // authopen's message on macOS: cmsg_len (u32) 16, SOL_SOCKET 0xffff, SCM_RIGHTS 1, fd 7 at offset 12.
+        let mut mac = Vec::new();
+        mac.extend(16u32.to_ne_bytes());
+        mac.extend(0xffffi32.to_ne_bytes());
+        mac.extend(1i32.to_ne_bytes());
+        mac.extend(7i32.to_ne_bytes());
+        assert_eq!(fd_from_control(&mac, CmsgLayout::MACOS), Some(7));
+        assert_eq!(fd_from_control(&mac, CmsgLayout::LINUX), None, "the wrong layout reads a bogus length");
+        assert_eq!(fd_from_control(&mac[..10], CmsgLayout::MACOS), None, "truncated");
+        let mut lvl = mac.clone();
+        lvl[4..8].copy_from_slice(&1i32.to_ne_bytes());
+        assert_eq!(fd_from_control(&lvl, CmsgLayout::MACOS), None, "not SOL_SOCKET on macOS");
+        // Linux: cmsg_len (u64) 20, SOL_SOCKET 1, SCM_RIGHTS 1, fd 9 at offset 16, padded to 24.
+        let mut lin = Vec::new();
+        lin.extend(20u64.to_ne_bytes());
+        lin.extend(1i32.to_ne_bytes());
+        lin.extend(1i32.to_ne_bytes());
+        lin.extend(9i32.to_ne_bytes());
+        lin.extend([0u8; 4]);
+        assert_eq!(fd_from_control(&lin, CmsgLayout::LINUX), Some(9));
+        let mut cred = lin.clone();
+        cred[12..16].copy_from_slice(&2i32.to_ne_bytes());
+        assert_eq!(fd_from_control(&cred, CmsgLayout::LINUX), None, "SCM_CREDENTIALS is not rights");
+        assert_eq!(fd_from_control(&[], CmsgLayout::LINUX), None);
+        assert_eq!(control_for_fd(7, CmsgLayout::MACOS), mac);
+        assert_eq!(control_for_fd(9, CmsgLayout::LINUX), lin);
+        for l in [CmsgLayout::LINUX, CmsgLayout::MACOS, CmsgLayout::NATIVE] {
+            assert_eq!(fd_from_control(&control_for_fd(5, l), l), Some(5));
+        }
+    }
+
+    #[test]
+    fn elevation_argv_and_wire() {
+        let (p, a) = elevation_argv(true, Path::new("/dev/disk4"), Path::new("/Users/u/Applications/una-installer"));
+        assert_eq!(p, "/usr/libexec/authopen");
+        assert_eq!(a, ["-stdoutpipe", "-o", "2", "/dev/disk4"]);
+        let (p, a) = elevation_argv(false, Path::new("/dev/sdb"), Path::new("/home/u/.local/bin/una-installer"));
+        assert_eq!(p, "pkexec");
+        assert_eq!(a, ["/home/u/.local/bin/una-installer", "--open-device", "/dev/sdb"]);
+        assert_eq!(elevate_line("authopen", false, "elevation-denied"), "[installer] card elevate how=authopen ok=0 why=elevation-denied");
+        assert_eq!(elevate_line("pkexec", true, "-"), "[installer] card elevate how=pkexec ok=1 why=-");
+        assert_eq!(refused_line("elevation-unavailable", Some("sdb")), "[installer] card refused why=elevation-unavailable device=sdb");
     }
 }

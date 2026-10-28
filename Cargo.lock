@@ -5073,6 +5073,7 @@ dependencies = [
  "bandy",
  "elessar",
  "gneiss_pal",
+ "libc",
  "log",
  "quartzite",
  "tokio",
