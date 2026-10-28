@@ -26727,15 +26727,22 @@ fn winid_selftest() {
     // SECOND task's flight, as a sibling close's is) while this task sits in the real door at its real bound; the door
     // must wait (> 0 us), name w2 as the oldest flight and drain once the helper ends it (`close_drain_kat`, the
     // RETIREDRAINKAT block after `close_drain_wait_for`). `skip` (the helper never started inside 1 s) fails nothing.
-    let (wait_v, wait_us, wait_id) = close_drain_kat(w2);
+    let (wait_v, wait_us, wait_id) = close_drain_kat(w2, false);
     let wait_ok = wait_v != "0";
+
+    // LEG 7 — RETIREDRAINDEATHKAT (rmbp-ledger B1074): a flight given back at its holder's DEATH. The same helper, in
+    // `KAT_DIE` mode, holds a recorded flight for w2 through the door, forgets its guard and returns; its `exit()` ->
+    // `drain_release_dead` -> `close_flight_release_dead` must drain the door, free the slot and clear the word.
+    // `skip` (unrecorded flight, ended politely; or the helper never started) fails nothing.
+    let (death_v, _, death_id) = close_drain_kat(w2, true);
+    let death_ok = death_v != "0";
 
     close(w2);
     PROBE_CELL.store(WIN_NONE, Ordering::Release);
 
-    let ok = reg_ok && cleared_ok && recycled_ok && scoped_ok && door_ok && wait_ok;
+    let ok = reg_ok && cleared_ok && recycled_ok && scoped_ok && door_ok && wait_ok && death_ok;
     serial_println!(
-        "[winid] selftest register={} cleared={} (held={} after close win={}) recycled={} (w1={} gen={} -> w2={} gen={}) id-scoped={} drain-door={} (held={}/{}/{}us free={} id={} door_id={}) drain-wait={} (waited={}us id={}) -> {}",
+        "[winid] selftest register={} cleared={} (held={} after close win={}) recycled={} (w1={} gen={} -> w2={} gen={}) id-scoped={} drain-door={} (held={}/{}/{}us free={} id={} door_id={}) drain-wait={} (waited={}us id={}) drain-death={} (id={}) -> {}",
         reg_ok as u8,
         cleared_ok as u8,
         held_after_close,
@@ -26756,6 +26763,8 @@ fn winid_selftest() {
         wait_v,
         wait_us,
         wait_id,
+        death_v,
+        death_id,
         if ok { "PASS" } else { "FAIL" }
     );
     composite();
@@ -32571,8 +32580,9 @@ fn winid_close_hooks_run(_id: WinId, _h: CloseHooks) {}
 // their sites or once inside `metrics::leaked_surf_retire`), CLOSE-FLIGHT-RESCUE BUILT by CLOSEFLIGHTRESCUE (B1064: a
 // close killed mid-flight is released at its death by `drain_release_dead`, the CLOSEFLIGHTRESCUE block below),
 // RETIRE-DRAIN-KAT BUILT for the waiting half by RETIREDRAINKAT (rmbp-ledger B1072: the WINID selftest's LEG 6, a helper
-// task's flight the real door waits on and then drains; the RETIREDRAINKAT block below); the real-close composite race on
-// the sibling core and a death mid-close are still forced by no `tests` door (RETIRE-DRAIN-BLIT-KAT, RETIRE-DRAIN-DEATH-KAT).
+// task's flight the real door waits on and then drains; the RETIREDRAINKAT block below); RETIRE-DRAIN-DEATH-KAT BUILT by
+// RETIREDRAINDEATHKAT (rmbp-ledger B1074: LEG 7, the helper dies holding its flight and its `exit()` gives it back); the
+// real-close composite race on the sibling core is still forced by no `tests` door (RETIRE-DRAIN-BLIT-KAT).
 
 /// RETIREDRAIN — closes between their teardown and their barrier drop.
 #[cfg(any(
@@ -32855,6 +32865,16 @@ fn close_drain_wait_for(who: &'static str, budget_us: u64, say: bool) -> (bool, 
 // [`CLOSE_DRAIN_WAIT_US`], `say=false` so the boot's once-line latch is never spent by the fixture). Nothing here
 // counts, records or waits on its own: the helper and the fixture call the door's own fns. Atomics only, no lock.
 // Wire: the `[winid] selftest` line's ` drain-wait=<1|0|skip> (waited=<us>us id=<w>)`.
+//
+// RETIREDRAINDEATHKAT (rmbp-ledger B1074; BP-video-18 kept, the seat's MEASURE line) — LEG 7, the death road. The SAME
+// helper, keyed by [`KAT_MODE`] = [`KAT_DIE`], holds its flight through the door exactly as LEG 6's does, then
+// `core::mem::forget`s the guard and RETURNS: no Drop runs, and the task trampoline's `exit()` (both arches) calls
+// [`drain_release_dead`] -> [`close_flight_release_dead`], the release a close killed mid-flight takes. The fixture's
+// door drains on that death; it then waits for the slot to stop holding the helper's key and reads the word 0. Only a
+// RECORDED flight is forgotten (an unrecorded one has no slot for the death road to find and would strand
+// `CLOSE_FLIGHT` for the boot): unrecorded, the helper ends it politely and LEG 7 reads `skip`. Nothing new counts,
+// records or waits. Wire: ` drain-death=<1|0|skip> (id=<w>)`, beside one `[wm] close flight released-on-death by=<tid>
+// id=<w>`. Go-red: make `close_flight_release_dead` a no-op — the door times out and the slot keeps the key.
 
 /// RETIREDRAINKAT — the helper's progress: 0 idle, then HELD (flight entered), DOOR (the fixture is entering the
 /// door), DONE (flight ended).
@@ -32917,6 +32937,24 @@ const KAT_DONE: u8 = 3;
     )
 ))]
 const KAT_HOLD_MS: u64 = 30;
+/// RETIREDRAINDEATHKAT (rmbp-ledger B1074) — the helper's mode word, written by the fixture before the spawn and
+/// read once by the helper at its start: 0 ends the flight politely (LEG 6), [`KAT_DIE`] dies holding it (LEG 7).
+#[cfg(all(
+    feature = "witness",
+    any(
+        all(target_arch = "x86_64", feature = "wc"),
+        all(target_arch = "aarch64", feature = "desktop_firmware")
+    )
+))]
+static KAT_MODE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+#[cfg(all(
+    feature = "witness",
+    any(
+        all(target_arch = "x86_64", feature = "wc"),
+        all(target_arch = "aarch64", feature = "desktop_firmware")
+    )
+))]
+const KAT_DIE: u8 = 1;
 
 /// RETIREDRAINKAT — `true` once `f()` holds, `false` past `bound_ms`; yields where [`drain_can_yield`], else spins.
 #[cfg(all(
@@ -32945,6 +32983,8 @@ fn close_drain_kat_until(bound_ms: u64, f: impl Fn() -> bool) -> bool {
 
 /// RETIREDRAINKAT — the helper task: one close flight for window `arg`, held until the fixture is in the door
 /// (bounded 1 s) plus [`KAT_HOLD_MS`], then ended; it returns with its flight already dropped (no death release).
+/// RETIREDRAINDEATHKAT (B1074): in [`KAT_DIE`] mode it forgets a RECORDED flight instead and returns holding it,
+/// so its `exit()` gives the flight back through [`drain_release_dead`] (an unrecorded one is still ended).
 #[cfg(all(
     feature = "witness",
     any(
@@ -32954,13 +32994,19 @@ fn close_drain_kat_until(bound_ms: u64, f: impl Fn() -> bool) -> bool {
 ))]
 fn close_drain_kat_helper(arg: usize) {
     use core::sync::atomic::Ordering;
+    let die = KAT_MODE.load(Ordering::Acquire) == KAT_DIE; // RETIREDRAINDEATHKAT (B1074): LEG 7's arm
     let flight = close_flight_enter(arg as WinId);
     KAT_KEY.store(flight.0, Ordering::Release);
     KAT_SLOT.store(flight.1, Ordering::Release);
     KAT_STATE.store(KAT_HELD, Ordering::Release);
     let _ = close_drain_kat_until(1_000, || KAT_STATE.load(Ordering::Acquire) == KAT_DOOR);
     let _ = close_drain_kat_until(KAT_HOLD_MS, || false);
-    close_flight_end(flight);
+    if die && flight.1 < DRAIN_OWNER_SLOTS {
+        // RETIREDRAINDEATHKAT (B1074): die holding the flight — no Drop; the trampoline's `exit()` releases it.
+        core::mem::forget(flight);
+    } else {
+        close_flight_end(flight);
+    }
     KAT_STATE.store(KAT_DONE, Ordering::Release);
 }
 
@@ -32969,6 +33015,9 @@ fn close_drain_kat_helper(arg: usize) {
 /// real door waiting (`waited_us > 0`, `inflight >= 1`) and the door then drained, the helper finished, and, when
 /// the flight was recorded, its slot word named `id` while held and read 0 after, with B1070's oldest word naming
 /// `id` (unless a sibling close was also in flight, LEG 5's clause).
+/// RETIREDRAINDEATHKAT (B1074): `die` runs LEG 7 — the helper dies holding its flight; `"1"` additionally needs the
+/// flight recorded (else `"skip"`) and its slot freed of the helper's key by the death inside 1 s, and the third
+/// value is the dead flight's own slot-word id (the `released-on-death` line's `id=`) instead of the door's.
 #[cfg(all(
     feature = "witness",
     any(
@@ -32976,8 +33025,9 @@ fn close_drain_kat_helper(arg: usize) {
         all(target_arch = "aarch64", feature = "desktop_firmware")
     )
 ))]
-fn close_drain_kat(id: WinId) -> (&'static str, u64, WinId) {
+fn close_drain_kat(id: WinId, die: bool) -> (&'static str, u64, WinId) {
     use core::sync::atomic::Ordering;
+    KAT_MODE.store(if die { KAT_DIE } else { 0 }, Ordering::Release); // RETIREDRAINDEATHKAT (B1074)
     KAT_STATE.store(0, Ordering::Release);
     KAT_KEY.store(0, Ordering::Release);
     KAT_SLOT.store(DRAIN_OWNER_SLOTS, Ordering::Release);
@@ -33001,12 +33051,19 @@ fn close_drain_kat(id: WinId) -> (&'static str, u64, WinId) {
     KAT_STATE.store(KAT_DOOR, Ordering::Release);
     let (drained, inflight, waited_us, door_id) = close_drain_wait_for("drain-kat", CLOSE_DRAIN_WAIT_US, false);
     let done = close_drain_kat_until(1_000, || KAT_STATE.load(Ordering::Acquire) == KAT_DONE);
+    // RETIREDRAINDEATHKAT (B1074): the death frees the slot of the helper's key (LEG 6: freed by the Drop already).
+    let freed = !die
+        || (slot < DRAIN_OWNER_SLOTS
+            && close_drain_kat_until(1_000, || DRAIN_OWNERS[slot].load(Ordering::Acquire) != key));
     let after_word = if slot < DRAIN_OWNER_SLOTS { DRAIN_OWNER_WIN[slot].load(Ordering::Acquire) } else { 0 };
     let second = key != 0 && key != close_flight_key(drain_owner_id());
     let rec_ok = slot >= DRAIN_OWNER_SLOTS
         || (close_flight_word_win(held_word) == id && after_word == 0 && (inflight != 1 || door_id == id));
-    let ok = second && drained && waited_us > 0 && inflight >= 1 && done && rec_ok;
-    (if ok { "1" } else { "0" }, waited_us, door_id)
+    if die && slot >= DRAIN_OWNER_SLOTS {
+        return ("skip", waited_us, WIN_NONE); // RETIREDRAINDEATHKAT (B1074): unrecorded, ended politely
+    }
+    let ok = second && drained && waited_us > 0 && inflight >= 1 && done && freed && rec_ok;
+    (if ok { "1" } else { "0" }, waited_us, if die { close_flight_word_win(held_word) } else { door_id })
 }
 
 // ---- CLOSEFLIGHTRESCUE (rmbp-ledger B1064) — a close killed mid-flight gives its flight back at its death ----
