@@ -28,7 +28,7 @@
 ## 3. The manifest (CODEX §2) and where each one is
 | handler | domain | `handlers/` dir | on UnaOS at HEAD |
 |---|---|---|---|
-| Aether | Web | `aether` | `APPS/AETHER.ELF` (both arches) |
+| Aether | Web | `aether` | `APPS/AETHER.ELF` (both arches); layout_core's box shorthands read their components with `split_top_level` (border-radius and its `/` through `split_top_level_slash`, the corner longhands, gap, scroll-padding / -margin, columns, flex, background's colour) so a math function is one component (AETHERRADIUSCALC SR416, `unaos/libs/web/layout_core/tests/radius_calc.rs`); owed AETHER-CENTERLAYOUT (SR410) and AETHER-CSSSPLIT-AUDIT (the background shorthand's position / size / repeat scans, the depth-0 `/` of container, font and clip-path `round`, anim.rs's splits, a %-calc radius); layout_core's box shorthands read their components with `split_top_level` (border-radius and its `/` through `split_top_level_slash`, the corner longhands, gap, scroll-padding / -margin, columns, flex, background's colour) so a math function is one component (AETHERRADIUSCALC SR416, `unaos/libs/web/layout_core/tests/radius_calc.rs`); owed AETHER-CENTERLAYOUT (SR410) and AETHER-CSSSPLIT-AUDIT (the background shorthand's position / size / repeat scans, the depth-0 `/` of container, font and clip-path `round`, anim.rs's splits, a %-calc radius) |
 | Amber Bytes | Disks | `amber_bytes` | `amber_core` (GPT) in kernel; `unaos/crates/kernel/src/video/instgui.rs` charter; host enumeration `amber_bytes::disks::list()` on Linux (sysfs) and macOS (`diskutil -plist`, the plist subset in `disks::plist`, AMBERPLIST SR417) |
 | Aulë | Forge | `aule` | selfhost (`unaos/crates/kernel/src/selfhost/`) — owner `unverified` |
 | Comscan | Signals | `comscan` | none found |

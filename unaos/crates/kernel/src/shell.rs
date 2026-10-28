@@ -3570,7 +3570,7 @@ fn shell_relics_native_witness() {
         fs.get_attribute(id, "relic:tag").ok().flatten().map(|_| ())
     }).ok().flatten().is_some();
     let got = say(&|c: &mut Console| setfattr_x(c, "relic:tag", C));
-    let gone = crate::fs::unafs::with_unafs(|fs| {
+    let gone = crate::fs::unafs::with_unafs_read(|fs| {
         let id = fs.resolve_path(C).ok()?;
         fs.get_attribute(id, "relic:tag").ok().flatten()
     }).ok().flatten().is_none();
@@ -3591,7 +3591,7 @@ fn shell_relics_native_witness() {
         .unwrap_or_default();
     let created = say(&|c: &mut Console| snap_cmd(c, &["create", "relics"]));
     let index = unafs_verb_snaps().join(" | ");
-    let snap_gen = crate::fs::unafs::with_unafs(|fs| {
+    let snap_gen = crate::fs::unafs::with_unafs_read(|fs| {
         fs.snapshot_index().ok().and_then(|v| v.iter().find(|s| s.name == "relics").map(|s| s.generation))
     }).ok().flatten();
     let (ok, why) = match snap_gen {
@@ -3600,7 +3600,7 @@ fn shell_relics_native_witness() {
             let ls_ok = unafs_verb_snapls(g, "/").iter().any(|l| l.contains("K3HELLO.TXT"));
             let cat_ok = !live.is_empty() && unafs_verb_snapcat(g, "/K3HELLO.TXT").contains(&live);
             let _ = say(&|c: &mut Console| snap_cmd(c, &["drop", &alloc::format!("{}", g)]));
-            let dropped = crate::fs::unafs::with_unafs(|fs| {
+            let dropped = crate::fs::unafs::with_unafs_read(|fs| {
                 fs.snapshot_index().ok().map(|v| !v.iter().any(|s| s.generation == g))
             }).ok().flatten().unwrap_or(false);
             (in_index && ls_ok && cat_ok && dropped,
@@ -7694,7 +7694,7 @@ fn snap_cmd(console: &mut Console, _args: &[&str]) {
 /// so the whole snapshot family sits together with its siblings.
 #[cfg(any(target_arch = "aarch64", feature = "unafs"))]
 fn unafs_verb_snaps() -> alloc::vec::Vec<String> {
-    let out = crate::fs::unafs::with_unafs(|fs| match fs.snapshot_index() {
+    let out = crate::fs::unafs::with_unafs_read(|fs| match fs.snapshot_index() {
         Ok(snaps) => {
             let mut lines = alloc::vec::Vec::new();
             if snaps.is_empty() {
@@ -7759,7 +7759,7 @@ fn unafs_verb_snapdrop(generation: u64) -> String {
 #[cfg(any(target_arch = "aarch64", feature = "unafs"))]
 fn unafs_verb_snapls(generation: u64, path: &str) -> alloc::vec::Vec<String> {
     use crate::fs::unafs::{read_authz, ReadAuthz, KERNEL_PRINCIPAL};
-    let out = crate::fs::unafs::with_unafs(|fs| {
+    let out = crate::fs::unafs::with_unafs_read(|fs| {
         // Resolve the directory's logical id in the snapshot (scoped: the view
         // borrows fs; release it so the ACL check can re-borrow).
         let dir_id = {
