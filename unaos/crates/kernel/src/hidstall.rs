@@ -145,14 +145,15 @@ pub fn now_us() -> u64 {
 
 /// One UnaFS transaction attempt began at `t0_us` ([`now_us`]) and its IRQ-masked span just ended; the site is `with_unafs`'s caller (HIDSTALLMASKSCOPE B1019: both `#[track_caller]`).
 #[track_caller] pub fn note_masked_since(t0_us: u64) {
-    note_masked(now_us().saturating_sub(t0_us) / 1000, core::panic::Location::caller());
+    note_masked(now_us().saturating_sub(t0_us), core::panic::Location::caller()); // MASKSITESZEROMS (B1065): the span in µs; `note_masked` floors the maxima to ms
 }
 
-/// One UnaFS transaction attempt's IRQ-masked span (ms), at `site`; a new max names its holder ([`masked_into`], tail).
-pub fn note_masked(ms: u64, site: &'static core::panic::Location<'static>) {
+/// One UnaFS transaction attempt's IRQ-masked span (`us`, µs), at `site`; a new max names its holder ([`masked_into`], tail).
+pub fn note_masked(us: u64, site: &'static core::panic::Location<'static>) {
+    let ms = us / 1000; // MASKSITESZEROMS (B1065): the maxima stay whole ms; the site table takes the µs (its per-core sums)
     masked_into(&SEC_MASKED_MS, &SEC_MASKED_WHO, ms, site);
     masked_into(&MASKED_MAX_MS, &MASKED_MAX_WHO, ms, site);
-    SCOPE_MASKED_MS.fetch_max(ms, Relaxed); masked_into(&SCOPE_BY_MS, &SCOPE_MASKED_WHO, ms, site); MASK_SITES.note(ms, site); // REGISTRYCHUNK (B508): the scoped max ([`scope_masked_take`]); MASKCENSUS (B1028): its holder on the printing line's cadence ([`scope_masked_by`]) and every span's site ([`MaskSites`]), tail
+    SCOPE_MASKED_MS.fetch_max(ms, Relaxed); masked_into(&SCOPE_BY_MS, &SCOPE_MASKED_WHO, ms, site); MASK_SITES.note(us, site); // REGISTRYCHUNK (B508): the scoped max ([`scope_masked_take`]); MASKCENSUS (B1028): its holder on the printing line's cadence ([`scope_masked_by`]) and every span's site ([`MaskSites`]), tail
 }
 
 /// The second's longest masked UnaFS span and its holder, taken (reset) at `lag`'s roll (who first: a winner between the two is the next second's).
@@ -700,11 +701,11 @@ fn maskscope_kat() {
     let (line, ms) = (line!(), kat_hold(&KAT_MAX, &KAT_WHO, 30));
     let by = KAT_WHO.read(false); let core_ok = kat_core_ok(&by); // HIDMASKCORE (B1042): the KAT's span names the KAT's own core (tail)
     let site_ok = by.site().is_some_and(|l| l.file() == file!() && l.line() == line);
-    let (sites, top_ok, sums_ok, roll_ok, sitecore) = masksites_kat(); let wrap = wrapsite_kat(); // MASKCENSUS (B1028): the site table's leg, on its own instance (tail); MASKWRITESITE (B1037): the third site, THROUGH the write wrapper (tail)
-    let pass = me.is_some() && by.name() == me && site_ok && ms >= 29 && KAT_MAX.load(Relaxed) == ms && sites == 2 && top_ok && sums_ok && roll_ok && wrap != Some(false) && core_ok && sitecore != Some(false); // MASKSITESCORE (B1051): `sitecore_ok=`
+    let (sites, top_ok, sums_ok, roll_ok, sitecore, zeroms) = masksites_kat(); let wrap = wrapsite_kat(); // MASKCENSUS (B1028): the site table's leg, on its own instance (tail); MASKWRITESITE (B1037): the third site, THROUGH the write wrapper (tail)
+    let pass = me.is_some() && by.name() == me && site_ok && ms >= 29 && KAT_MAX.load(Relaxed) == ms && sites == 2 && top_ok && sums_ok && roll_ok && wrap != Some(false) && core_ok && sitecore != Some(false) && zeroms; // MASKSITESCORE (B1051): `sitecore_ok=`; MASKSITESZEROMS (B1065): `zeroms_ok=`
     serial_println!(
-        ":: MASKSCOPE: who={} ms={} -> {} :: task={} site_ok={} sites={} top_ok={} sums_ok={} roll_ok={} wrapsite_ok={} sitecore_ok={} core_ok={} boot_by={}",
-        by, ms, if pass { "PASS" } else { "FAIL" }, me.unwrap_or("?"), site_ok as u8, sites, top_ok as u8, sums_ok as u8, roll_ok as u8, match wrap { Some(true) => "1", Some(false) => "0", None => "-" }, match sitecore { Some(true) => "1", Some(false) => "0", None => "-" }, core_ok as u8, masked_by()
+        ":: MASKSCOPE: who={} ms={} -> {} :: task={} site_ok={} sites={} top_ok={} sums_ok={} roll_ok={} wrapsite_ok={} sitecore_ok={} zeroms_ok={} core_ok={} boot_by={}",
+        by, ms, if pass { "PASS" } else { "FAIL" }, me.unwrap_or("?"), site_ok as u8, sites, top_ok as u8, sums_ok as u8, roll_ok as u8, match wrap { Some(true) => "1", Some(false) => "0", None => "-" }, match sitecore { Some(true) => "1", Some(false) => "0", None => "-" }, zeroms as u8, core_ok as u8, masked_by()
     );
     crate::tests::tally(pass);
 }
@@ -778,8 +779,8 @@ pub(crate) struct MaskSites {
     other_sum: AtomicU64,
     sec_other_n: AtomicU32,
     sec_other_sum: AtomicU64,
-    core_sum: [[AtomicU64; SITE_CORES]; MASK_SITES_N], // MASKSITESCORE (B1051): each slot's ms per noting core (16 x SITE_CORES x 8 B)
-    sec_base: [[AtomicU64; SITE_CORES]; MASK_SITES_N], // MASKSITESSECCORE (B1059): `core_sum` as the last `take_sec` saw it (16 x SITE_CORES x 8 B; one writer, `take_sec`)
+    core_sum: [[AtomicU64; SITE_CORES]; MASK_SITES_N], // MASKSITESCORE (B1051): each slot's µs per noting core (16 x SITE_CORES x 8 B; µs since MASKSITESZEROMS B1065)
+    sec_base: [[AtomicU64; SITE_CORES]; MASK_SITES_N], // MASKSITESSECCORE (B1059): `core_sum` as the last `take_sec` saw it (16 x SITE_CORES x 8 B, µs; one writer, `take_sec`)
 }
 
 impl MaskSites {
@@ -818,13 +819,15 @@ impl MaskSites {
         None
     }
 
-    /// One masked span of `ms` at `site`. Atomics only (any core, right after the span).
-    pub(crate) fn note(&self, ms: u64, site: &'static core::panic::Location<'static>) {
+    /// One masked span of `us` µs at `site`: n/sum/max in whole ms (the span floored), the per-core sum in µs (MASKSITESZEROMS
+    /// B1065). Atomics only (any core, right after the span).
+    pub(crate) fn note(&self, us: u64, site: &'static core::panic::Location<'static>) {
+        let ms = us / 1000;
         match self.slot(site as *const core::panic::Location<'static> as usize) {
             Some(i) => {
                 self.n[i].fetch_add(1, Relaxed);
                 self.sum[i].fetch_add(ms, Relaxed);
-                self.max[i].fetch_max(ms, Relaxed); self.core_on(i, ms); // MASKSITESCORE (B1051): the noting core's sum (tail)
+                self.max[i].fetch_max(ms, Relaxed); self.core_on(i, us); // MASKSITESCORE (B1051): the noting core's sum (tail); MASKSITESZEROMS (B1065): in µs
                 self.sec_n[i].fetch_add(1, Relaxed);
                 self.sec_sum[i].fetch_add(ms, Relaxed);
             }
@@ -837,7 +840,7 @@ impl MaskSites {
         }
     }
 
-    /// The second's top-3 by sum, its counters taken (reset) — `lag`'s roll, every second; each site with the second's ms per
+    /// The second's top-3 by sum, its counters taken (reset) — `lag`'s roll, every second; each site with the second's µs per
     /// core (MASKSITESSECCORE B1059: the delta of `core_sum` since the previous take), so it prints `@c<dominant>`.
     pub(crate) fn take_sec(&self) -> SiteTop {
         let mut t = SiteTop::new(3, false);
@@ -900,7 +903,7 @@ pub struct SiteTop {
     with_max: bool,
     k: u32,
     other: (u32, u64),
-    c: [[u32; SITE_CORES]; SITE_TOP_N], // MASKSITESCORE (B1051): each kept entry's ms per core (all 0 = no core known)
+    c: [[u64; SITE_CORES]; SITE_TOP_N], // MASKSITESCORE (B1051): each kept entry's µs per core (all 0 = no core known; µs since MASKSITESZEROMS B1065)
     with_cores: bool,
 }
 
@@ -915,9 +918,9 @@ impl SiteTop {
         self.offer_on(site, n, sum_ms, max_ms, &[]) // MASKSITESCORE (B1051): no core known
     }
 
-    /// [`offer`](Self::offer) with the site's ms per core (`core_ms[c]`; empty = no core known): the entry prints
-    /// `@c<dominant>` (and, with [`cores`](Self::cores), the breakdown when more than one core contributed).
-    pub fn offer_on(&mut self, site: usize, n: u32, sum_ms: u64, max_ms: u64, core_ms: &[u64]) {
+    /// [`offer`](Self::offer) with the site's µs per core (`core_us[c]`; empty = no core known): the entry prints
+    /// `@c<dominant>` (and, with [`cores`](Self::cores), the breakdown when more than one core has a whole ms).
+    pub fn offer_on(&mut self, site: usize, n: u32, sum_ms: u64, max_ms: u64, core_us: &[u64]) {
         if site == 0 || n == 0 {
             return;
         }
@@ -936,7 +939,7 @@ impl SiteTop {
             j -= 1;
         }
         self.e[i] = (site, n, sum_ms, max_ms);
-        self.c[i] = core::array::from_fn(|c| core_ms.get(c).map_or(0, |&v| v.min(u32::MAX as u64) as u32));
+        self.c[i] = core::array::from_fn(|c| core_us.get(c).copied().unwrap_or(0)); // MASKSITESZEROMS (B1065): µs, stored whole
     }
 
     /// The overflow row (spans whose site found the table full).
@@ -1036,12 +1039,12 @@ fn mask_sites_say() {
 /// spans' worth of sites (A: one 20 ms span; B: 4 + 5 ms) — no extra IRQ mask, `kat_hold` already drives the masked path.
 /// `(sites, top_ok, sums_ok, roll_ok)`: top = A then B by sum; sums = each site's (n, sum, max); roll = the per-second
 /// take returns both and a second take is empty while the boot counts stay.
-fn masksites_kat() -> (u32, bool, bool, bool, Option<bool>) {
+fn masksites_kat() -> (u32, bool, bool, bool, Option<bool>, bool) {
     KAT_SITES.clear();
     let a: &'static core::panic::Location<'static> = core::panic::Location::caller();
     let b: &'static core::panic::Location<'static> = core::panic::Location::caller();
-    KAT_SITES.note(20, a);
-    KAT_SITES.note(4, b);
+    KAT_SITES.note(20_000, a); // MASKSITESZEROMS (B1065): `note` takes µs
+    KAT_SITES.note(4_000, b);
     let sib = kat_sibling_note(b); // MASKSITESCORE (B1051): B's 5 ms on a sibling CPU (x86 helper task, tail), else here
     let (pa, pb) = (a as *const core::panic::Location<'static> as usize, b as *const core::panic::Location<'static> as usize);
     let boot = KAT_SITES.boot();
@@ -1050,10 +1053,15 @@ fn masksites_kat() -> (u32, bool, bool, bool, Option<bool>) {
     let (s1, s2) = (KAT_SITES.take_sec(), KAT_SITES.take_sec());
     let roll_ok = s1.sites() == 2 && s1.entry(0).0 == pa && s1.find(pb).map(|e| (e.0, e.1)) == Some((2, 9)) && s2.sites() == 0 && KAT_SITES.boot().sites() == 2;
     let me = crate::arch::percpu::this_cpu().cpu_index as usize;
-    KAT_SITES.note(1, b); // MASKSITESSECCORE (B1059): one more 1 ms span at B HERE, after every boot/roll check above
+    KAT_SITES.note(1_000, b); // MASKSITESSECCORE (B1059): one more 1 ms span at B HERE, after every boot/roll check above
     let s3 = KAT_SITES.take_sec(); // the delta's proof: boot-long B is c<me> 5 + c<sib> 5 (two contributors), this second's is c<me> 1 alone
     let sitecore = sib.map(|s| boot.core_of(pa) == Some((me, 1)) && boot.core_of(pb) == Some((s, 2)) && s1.core_of(pa) == Some((me, 1)) && s1.core_of(pb) == Some((s, 2)) && s3.core_of(pb) == Some((me, 1))); // MASKSITESCORE (B1051): A on this core; B dominant on the sibling (5 > 4), two contributors; MASKSITESSECCORE (B1059): the per-second takes say the same, and s3 only the delta
-    (boot.sites(), top_ok, sums_ok, roll_ok, sitecore)
+    let c: &'static core::panic::Location<'static> = core::panic::Location::caller(); // MASKSITESZEROMS (B1065): site C, one sub-ms span HERE, after every check above
+    KAT_SITES.note(400, c);
+    let pc = c as *const core::panic::Location<'static> as usize;
+    let (s4, b4) = (KAT_SITES.take_sec(), KAT_SITES.boot()); // C floors to 0 ms (n=1, sum 0, max 0) yet names this core: `@c<me>`, no whole-ms contributor
+    let zeroms = b4.find(pc) == Some((1, 0, 0)) && b4.core_of(pc) == Some((me, 0)) && s4.core_of(pc) == Some((me, 0)) && s4.sites() == 1;
+    (boot.sites(), top_ok, sums_ok, roll_ok, sitecore, zeroms)
 }
 
 // ── MASKWRITESITE (rmbp-ledger B1037) — a masked span's SITE is the op's caller, not a wrapper's line. FILE-TAIL append. ─────
@@ -1138,7 +1146,7 @@ fn kat_core_ok(by: &MaskedBy) -> bool {
 // site masks on, while `masked_by=` carries `@c<n>`. Each slot now keeps its ms PER CORE (`core_sum`: 16 x SITE_CORES x 8 B =
 // 1024 B per table on x86, one more relaxed `fetch_add` per span, the core read `masked_into` already makes; clockcore's
 // `SEEN_CORE` the same shape, the token's own core). [`SiteTop`], the ONE formatter, prints `@c<dominant>` after a site
-// (dominant = the largest per-core sum, lowest core on a tie; none when no core has a whole ms) and, on the boot-long hidstall
+// (dominant = the largest per-core sum, lowest core on a tie; none when no core has a whole ms — µs since MASKSITESZEROMS B1065, tail) and, on the boot-long hidstall
 // line only, `(cores=c<a>:<ms>+c<b>:<ms>)` when more than one core contributed (`+`, not `,`: `top=` is itself a `,`-list).
 // The per-second `take_sec` carried no core (MASK-SITES-SECCORE): BUILT by MASKSITESSECCORE (B1059, tail) — `@c<dominant>` per site.
 
@@ -1147,29 +1155,30 @@ fn kat_core_ok(by: &MaskedBy) -> bool {
 static KAT_SITES: MaskSites = MaskSites::new();
 
 impl MaskSites {
-    /// One span's `ms` on the noting core (`percpu::this_cpu`, the read [`masked_into`] makes), slot `i` already claimed.
-    fn core_on(&self, i: usize, ms: u64) {
+    /// One span's `us` µs on the noting core (`percpu::this_cpu`, the read [`masked_into`] makes), slot `i` already claimed.
+    fn core_on(&self, i: usize, us: u64) {
         let c = crate::arch::percpu::this_cpu().cpu_index as usize;
         if c < SITE_CORES {
-            self.core_sum[i][c].fetch_add(ms, Relaxed);
+            self.core_sum[i][c].fetch_add(us, Relaxed);
         }
     }
 }
 
 impl SiteTop {
-    /// Print each entry's per-core breakdown when more than one core contributed (the boot-long hidstall line).
+    /// Print each entry's per-core breakdown when more than one core has a whole ms (the boot-long hidstall line).
     pub fn cores(mut self, on: bool) -> Self {
         self.with_cores = on;
         self
     }
 
-    /// The kept entry for `site`: `(dominant core, contributing cores)`; `None` when no core has a nonzero sum.
+    /// The kept entry for `site`: `(dominant core, cores with a whole ms)`; `None` only when no core has a nonzero µs sum.
     pub fn core_of(&self, site: usize) -> Option<(usize, u32)> {
         let i = self.e[..self.cap].iter().position(|e| e.0 == site && site != 0)?;
         self.dominant(i)
     }
 
-    /// Entry `i`'s dominant core (the largest per-core sum, the lowest core on a tie) and how many cores have a sum.
+    /// Entry `i`'s dominant core (the largest per-core µs sum, the lowest core on a tie; any nonzero µs counts) and how many
+    /// cores have a whole ms (the breakdown's contributors, MASKSITESZEROMS B1065).
     fn dominant(&self, i: usize) -> Option<(usize, u32)> {
         let mut best: Option<usize> = None;
         let mut k = 0u32;
@@ -1177,7 +1186,9 @@ impl SiteTop {
             if v == 0 {
                 continue;
             }
-            k += 1;
+            if v >= 1000 {
+                k += 1;
+            }
             if best.map_or(true, |b| v > self.c[i][b]) {
                 best = Some(c);
             }
@@ -1185,7 +1196,8 @@ impl SiteTop {
         best.map(|b| (b, k))
     }
 
-    /// `@c<dominant>` and, with [`cores`](Self::cores) and more than one contributor, `(cores=c<a>:<ms>+c<b>:<ms>)`.
+    /// `@c<dominant>` whenever any core has a µs and, with [`cores`](Self::cores) and more than one core with a whole ms,
+    /// `(cores=c<a>:<ms>+c<b>:<ms>)` (each core's µs floored to ms; a sub-ms core is not listed).
     fn core_say(&self, f: &mut core::fmt::Formatter<'_>, i: usize) -> core::fmt::Result {
         let Some((d, k)) = self.dominant(i) else { return Ok(()) };
         write!(f, "@c{}", d)?;
@@ -1193,13 +1205,13 @@ impl SiteTop {
             f.write_str("(cores=")?;
             let mut first = true;
             for (c, &v) in self.c[i].iter().enumerate() {
-                if v == 0 {
+                if v < 1000 {
                     continue;
                 }
                 if !first {
                     f.write_str("+")?;
                 }
-                write!(f, "c{}:{}", c, v)?;
+                write!(f, "c{}:{}", c, v / 1000)?;
                 first = false;
             }
             f.write_str(")")?;
@@ -1218,7 +1230,7 @@ fn kat_sibling_note(b: &'static core::panic::Location<'static>) -> Option<usize>
             return c;
         }
     }
-    KAT_SITES.note(5, b);
+    KAT_SITES.note(5_000, b);
     None
 }
 
@@ -1237,7 +1249,7 @@ fn site_core_helper(site: usize) {
     // SAFETY: `site` is the KAT's `&'static Location` (from `Location::caller`), passed whole as the task argument.
     let l: &'static core::panic::Location<'static> = unsafe { &*(site as *const core::panic::Location<'static>) };
     SITE_KAT_CORE.store(crate::arch::percpu::this_cpu().cpu_index as usize, Relaxed);
-    KAT_SITES.note(5, l);
+    KAT_SITES.note(5_000, l);
     SITE_KAT_STATE.store(2, Release);
 }
 
@@ -1276,7 +1288,7 @@ fn kat_sibling_try(b: &'static core::panic::Location<'static>) -> Option<Option<
 // its n/sum the next: one span of skew, the table's existing contract. `take_sec`'s SiteTop keeps `with_cores` off: `@c<d>` only.
 
 impl MaskSites {
-    /// Slot `i`'s ms per core since the previous call (the snapshot delta of `core_sum`), the snapshot moved to now.
+    /// Slot `i`'s µs per core since the previous call (the snapshot delta of `core_sum`), the snapshot moved to now.
     fn sec_cores(&self, i: usize) -> [u64; SITE_CORES] {
         core::array::from_fn(|c| {
             let now = self.core_sum[i][c].load(Relaxed);
@@ -1284,3 +1296,14 @@ impl MaskSites {
         })
     }
 }
+
+// ── MASKSITESZEROMS (rmbp-ledger B1065) — a sub-ms site names its core. FILE-TAIL append. ─────────────────────────────────────
+// MASKSITESCORE (B1051) and MASKSITESSECCORE (B1059) owed MASK-SITES-ZEROMS: `note_masked_since` measured each span in µs
+// (`now_us`) and floored it to ms BEFORE [`MaskSites::note`], so `core_sum` summed whole ms and a site whose every span was
+// under 1 ms summed 0 on every core: `SiteTop`'s dominant was `None` and no `@c<d>` printed, however often it fired. The writer
+// already has µs, so `core_sum` / `sec_base` now hold µs (no new array; u64 µs does not overflow) and `SiteTop::c` carries them
+// whole (u64); n / sum / max / sec_n / sec_sum keep each span floored to ms exactly as before (`<n>x<sum>[/<max>]` unchanged).
+// The formatter divides for display: `@c<d>` whenever any core has a µs; the breakdown keeps its rule (more than one core with a
+// whole ms) and lists each such core's µs floored to ms, which may exceed the per-span-floored `<sum>` by under n ms. clockcore's
+// `census_say` offers SEEN_CORE's cycles as µs (every SEEN span is over 10 ms: its line reads as before). On aarch64 and on x86
+// without a µs TSC `now_us` is `ms() * 1000`, so a sub-tick span still reads 0 µs there (MASK-SITES-ARMUS, owed).
