@@ -2764,7 +2764,7 @@ pub fn unafsx86_selftest() {
     let _ = mt.unlink(PATH, KERNEL_PRINCIPAL); // a stale scratch from an interrupted run
     let create = mt.create(PATH, NodeKind::File, KERNEL_PRINCIPAL).is_ok();
     let write = create && mt.write(PATH, 0, BODY, KERNEL_PRINCIPAL).map(|n| n == BODY.len()).unwrap_or(false);
-    force_remount();
+    force_remount(); bind_now_kat(); // UNAFSBINDTRIGGER (B1058): the mount was just dropped — bind_now binds it with no masked MOUNT attempt by this task (file tail; LINE-NEUTRAL, before this comment)
     let reread = matches!(
         with_unafs(|fs| match fs.resolve_path(PATH) {
             Ok(id) => fs.read_data(id, 0, BODY.len() as u64).map(|d| d == BODY).unwrap_or(false),
@@ -5017,7 +5017,7 @@ pub fn ensure_nvme_root_grant() -> bool {
     if mount_bound_handle().is_some_and(|h| h != want) {
         force_remount();
     }
-    let _ = with_unafs(|_| ());
+    let _ = bind_now();
     mount_bound_handle() == Some(want)
 }
 
@@ -5391,7 +5391,7 @@ fn note_attempt(arm: bool, t0_us: u64) {
             return;
         }
     }
-    let _ = arm;
+    let _ = arm; kat_masked_note();
     crate::hidstall::note_masked_since(t0_us)
 }
 
@@ -5563,4 +5563,100 @@ pub fn unafs_leg() -> &'static str {
         Err(MountError::NoVolume | MountError::NoStorage | MountError::BadSectorSize(_)) => "skip(no-volume)",
         Err(_) => "mount",
     }
+}
+
+// ── UNAFSBINDTRIGGER (rmbp-ledger B1058): a named bind with no MOUNT attempt hold. UNAFSREADCENSUS (B1052) measured the
+// empty-closure idiom `with_unafs(|_| ())` as a bind TRIGGER: a task's pre-bind already binds off the hold, then one EMPTY
+// masked attempt still ran (a HIDSTALL span, a MASKCENSUS site at the caller). `bind_now` is [`with_unafs_arm`]'s sibling:
+// its restart shape around [`prebind`] (the ONE bind path: `prebind_now` -> `bind_sized`), minus the attempt. At the tail:
+// no line above moves. ──
+
+/// Bind the UnaFS mount now if none is bound, with no MOUNT attempt hold: a task caller binds through [`prebind`] (the commit
+/// ticket on x86 `wc`, the [`BIND`] latch elsewhere; one short masked install take) and looks again on contention, bounded
+/// like [`with_unafs`] (`TXN_BUSY_ATTEMPTS`, `hw_wait_budget`). A caller with no task identity has no binder identity for an
+/// off-hold bind: it binds in the hold exactly as before (`bind_in_hold`; BIND-NOW-NOTASK owed). `Err` = the bind's own
+/// verdict, or `Busy` when contention outlasted the bound.
+#[track_caller]
+pub fn bind_now() -> Result<(), MountError> {
+    if crate::arch::sched::current_id().is_none() {
+        return with_unafs(|_| ());
+    }
+    let start = crate::arch::now_cycles();
+    let budget = crate::arch::hw_wait_budget();
+    for _ in 0..TXN_BUSY_ATTEMPTS {
+        #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+        if !splitwrite::ticket_wait() {
+            break;
+        }
+        prebind()?;
+        if mount_state() == Some(true) {
+            return Ok(());
+        }
+        if crate::arch::now_cycles().wrapping_sub(start) >= budget {
+            break;
+        }
+        if crate::arch::irqs_masked() {
+            core::hint::spin_loop();
+        } else {
+            crate::hlt();
+        }
+    }
+    Err(MountError::Busy)
+}
+
+/// `bind_now`'s look: `Some(bound)` with MOUNT free (masked `try_lock`, never spins; poison-checked as [`mount_unbound`]),
+/// `None` while MOUNT is held (its holder may be binding).
+fn mount_state() -> Option<bool> {
+    crate::arch::without_interrupts(|| match MOUNT.try_lock() {
+        #[allow(unused_mut)]
+        Some(mut g) => {
+            #[cfg(target_arch = "x86_64")]
+            mount_poison_check(&mut *g);
+            Some(g.is_some())
+        }
+        None => None,
+    })
+}
+
+/// The KAT's task (0 = unarmed) and its masked MOUNT attempts while armed.
+static KAT_TID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static KAT_MASKED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// `note_attempt`'s masked path (its :5394 fold): count the attempt when it is the armed KAT task's own.
+#[inline(always)]
+fn kat_masked_note() {
+    let t = KAT_TID.load(Ordering::Relaxed);
+    if t != 0 && crate::arch::sched::current_id() == Some(t) {
+        KAT_MASKED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// `tests unafs` (UNAFSX86-T, folded on its `force_remount` line): on the just-dropped mount, one `bind_now` must bind it
+/// with NO masked MOUNT attempt by this task. Words: ok | FAIL | skip(no-task) | skip(bound).
+#[cfg(feature = "unafs")]
+fn bind_now_kat() {
+    let Some(me) = crate::arch::sched::current_id() else {
+        serial_println!("[unafs] bind_now kat=skip(no-task) (UNAFSBINDTRIGGER B1058)");
+        return;
+    };
+    if mount_bound_handle().is_some() {
+        serial_println!("[unafs] bind_now kat=skip(bound) (UNAFSBINDTRIGGER B1058)");
+        return;
+    }
+    KAT_MASKED.store(0, Ordering::Release);
+    KAT_TID.store(me, Ordering::Release);
+    let r = bind_now();
+    KAT_TID.store(0, Ordering::Release);
+    let masked = KAT_MASKED.load(Ordering::Acquire);
+    let bound = mount_bound_handle().is_some();
+    let rw = match r {
+        Ok(()) => "ok",
+        Err(MountError::Busy) => "busy",
+        Err(_) => "err",
+    };
+    let word = if r.is_ok() && bound && masked == 0 { "ok" } else { "FAIL" };
+    serial_println!(
+        "[unafs] bind_now kat={} r={} bound={} masked={} (UNAFSBINDTRIGGER B1058: a bind_now on an unbound mount takes no masked MOUNT attempt)",
+        word, rw, bound as u8, masked
+    );
 }

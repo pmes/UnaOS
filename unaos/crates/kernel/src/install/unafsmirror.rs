@@ -60,7 +60,7 @@ pub fn source() -> Option<Source> {
     let h = match kunafs::mount_bound_handle() {
         Some(h) => h,
         None => {
-            let _ = kunafs::with_unafs(|_| ());
+            let _ = kunafs::bind_now();
             kunafs::mount_bound_handle()?
         }
     };
