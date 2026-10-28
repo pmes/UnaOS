@@ -42,7 +42,7 @@ pub fn build_a11y_tree(node: &NodeRef) -> Option<A11yNode> {
                         match ty {
                             "checkbox" => "checkbox".to_string(),
                             "radio" => "radio".to_string(),
-                            "submit" | "button" | "reset" => "button".to_string(),
+                            t if layout_core::is_push_type(t) => "button".to_string(), // AETHER-A11YPUSHTRIM: the SR440 predicate (trimmed, case-insensitive), not a raw match
                             _ => "textbox".to_string(),
                         }
                     },

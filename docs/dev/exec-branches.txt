@@ -1160,7 +1160,7 @@ refs/heads/exec-rmbp-masksiteszeroms   edee181ea FOLDED-BY-HAND (this commit) 20
 refs/heads/exec-rmbp-xhciloanptpyieldptpwait   cf273696b FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-preemptoffarmstaledrop   9a8240212 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-masksitesoverflow   9cc29e5cd FOLDED-BY-HAND (this commit) 2026-10-27
-refs/heads/exec-rmbp-aetherpushtrim   bbd0d82b3 IN-FLIGHT cut 2026-10-28
+refs/heads/exec-rmbp-aetherpushtrim   b83c33bfb FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-facelivesubscriptiondrop   485bd7a53 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-preemptoffarmwmtable   39f725ff2 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-preemptoffarmcasts   30869b559 FOLDED-BY-HAND (this commit) 2026-10-27
@@ -1171,11 +1171,20 @@ refs/heads/exec-rmbp-closeflightid   7baf4339e FOLDED-BY-HAND (this commit) 2026
 refs/heads/exec-rmbp-faceliveurlbar   e89d2f07c FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-facelivefieldkeep   609585cab FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-contributereview   ae63443a2 FOLDED-BY-HAND (this commit) 2026-10-27
-refs/heads/exec-rmbp-aethercentercaption   a3f4ae5ce IN-FLIGHT cut 2026-10-28
-refs/heads/exec-rmbp-aethercellblockify   a3f4ae5ce IN-FLIGHT cut 2026-10-28
-refs/heads/exec-rmbp-aethercontrolintrinsic   a3f4ae5ce IN-FLIGHT cut 2026-10-28
+refs/heads/exec-rmbp-aethercentercaption   eb5957f49 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-aethercellblockify   80c407eff FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-aethercontrolintrinsic   ddea9c84d FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-secretfieldclear   bf1ed2fc9 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-preemptoffx86staledrop   5db503c4f FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-closeflightoldest   28e23fbe0 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-preemptoffarmsleepcheck   6b83e3d65 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-xhciloanptpyieldloopone   629ccdf12 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-providercancelwake   469b16733 IN-FLIGHT cut 2026-10-28
+refs/heads/exec-rmbp-facelivefieldmove   469b16733 IN-FLIGHT cut 2026-10-28
+refs/heads/exec-rmbp-aethercaptionuaalign   469b16733 IN-FLIGHT cut 2026-10-28
+refs/heads/exec-rmbp-aethercaptionextents   469b16733 IN-FLIGHT cut 2026-10-28
+refs/heads/exec-rmbp-contributereviewstale   469b16733 IN-FLIGHT cut 2026-10-28
+refs/heads/exec-rmbp-preemptoffarmwmtableroute   469b16733 IN-FLIGHT cut 2026-10-28
+refs/heads/exec-rmbp-preemptoffx86sleepcheck   469b16733 IN-FLIGHT cut 2026-10-28
+refs/heads/exec-rmbp-xhciloanptpyieldkatloopdrop   117668d5d FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-retiredrainkat   469b16733 IN-FLIGHT cut 2026-10-28
