@@ -613,6 +613,14 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
             "separate" => style.paint.border_collapse = Some(false),
             _ => {}
         },
+        // AETHERCAPTIONSIDECSS (SR462): caption-side, top | bottom only (Blink's parser); inherited, so inherit / unset /
+        // revert leave it unspecified and the reader walks up (tree.rs `caption_side_order`).
+        "caption-side" => match value {
+            "top" | "initial" => style.paint.caption_side = Some(false),
+            "bottom" => style.paint.caption_side = Some(true),
+            "inherit" | "unset" | "revert" => {}
+            other => H::record_css(&format!("caption-side:{}", clip(other))),
+        },
         "border-spacing" => {
             if let Some(px) = split_top_level(value).first().and_then(|v| parse_px(v, cx)) {
                 style.paint.border_spacing = Some(px.max(0.0));
@@ -2572,7 +2580,7 @@ pub fn merge_paint<H: Host>(dst: &mut PaintStyle<H>, src: &PaintStyle<H>) {
         nowrap, family, italic, text_transform, border_width, bg_repeat, text_hidden,
         mask_repeat, text_align, object_fit, flex_container, border_style, radius,
         white_space, word_break, overflow_wrap, letter_spacing, line_through, display_kind,
-        ua_vmargin, border_collapse, border_spacing, has_width, position_kind, z_index,
+        ua_vmargin, border_collapse, caption_side, border_spacing, has_width, position_kind, z_index,
         list_item, list_style, vertical_align, float, opacity, font_size_rel, table_fixed, bg_alpha, border_alpha,
         stretch, word_spacing, rtl, clear, tf_translate, tf_rotate, tf_scale, transform_origin, inset_px,
         overflow, col_count, col_width, col_gap, col_fill, col_rule_width, col_rule_style, col_rule_color,

@@ -58,3 +58,39 @@ fn caption_align_is_caption_side() {
     assert!(cw > 400.0 && w > 0.0 && w < cw - 100.0, "align=left: a short line in a wide caption (w {w} of {cw})");
     assert!((x + w / 2.0 - cw / 2.0).abs() <= 1.0, "align=left: the caption's text stays centred (x {x} w {w} of {cw})");
 }
+
+/// AETHERCAPTIONSIDECSS (SR462): the `caption-side` property, carried in `PaintStyle::caption_side`; align= is its
+/// lowest-priority source, so style="" and the author cascade beat it, and the property inherits from the table.
+#[test]
+fn caption_side_property_beats_align() {
+    let placed = |tree: &Tree, doc: &N| {
+        let (_, cy, _, ch) = box_of(tree, &doc.by_id("cap"));
+        let (_, ty, _, th) = box_of(tree, &doc.by_id("cell"));
+        assert!(ch > 0.0 && th > 0.0, "both boxes have height (caption {ch}, cell {th})");
+        (cy >= ty + th - 0.5, cy + ch <= ty + 0.5)
+    };
+
+    let doc = doc_with(&[("style", "caption-side: bottom")]);
+    let (below, _) = placed(&lay(&doc, VW, 400.0), &doc);
+    assert!(below, "style=\"caption-side: bottom\" places the caption below the row");
+
+    let doc = doc_with(&[("align", "bottom"), ("style", "caption-side: top")]);
+    let (_, above) = placed(&lay(&doc, VW, 400.0), &doc);
+    assert!(above, "style=\"caption-side: top\" beats align=bottom: the caption stays above the row");
+
+    // An author rule on the TABLE: the bare caption inherits bottom (the cascade folded in `apply_specs`).
+    let doc = page(vec![el(
+        "table",
+        &[("id", "tbl"), ("style", "width: 600px; border-spacing: 0")],
+        vec![
+            el("caption", &[("id", "cap")], vec![text("Quarterly results")]),
+            el("tr", &[], vec![el("td", &[("id", "cell")], vec![text("row")])]),
+        ],
+    )]);
+    let cx = layout_core::css::ParseCx::new(VW, 400.0);
+    let mut s = layout_core::css::SpecifiedStyle::<TH>::default();
+    layout_core::css::apply_declaration("caption-side", "bottom", &mut s, &cx);
+    let sheet = Sheet(vec![(doc.by_id("tbl").id, std::rc::Rc::new(s))]);
+    let (below, _) = placed(&lay_styled(&doc, &sheet, VW, 400.0), &doc);
+    assert!(below, "an author rule table {{ caption-side: bottom }} is inherited: the caption sits below the row");
+}
