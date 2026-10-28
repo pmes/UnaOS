@@ -106,6 +106,9 @@ pub struct PaintStyle<H: Host> {
     pub pct_math: Option<[Option<String>; 3]>,
     /// border-collapse: collapse (true) / separate (false). On tables.
     pub border_collapse: Option<bool>,
+    /// AETHERCAPTIONSIDECSS (SR462): caption-side: bottom (true) / top (false). INHERITED, resolved where it is read
+    /// (tree.rs `caption_side_order`); a caption's align= is written here first, the cascade overlays it.
+    pub caption_side: Option<bool>,
     /// border-spacing in px (horizontal = vertical here). On tables.
     pub border_spacing: Option<f32>,
     /// The author gave this box a `width` (any value).
@@ -290,6 +293,7 @@ impl<H: Host> Default for PaintStyle<H> {
             ua_vmargin: None,
             pct_math: None,
             border_collapse: None,
+            caption_side: None,
             border_spacing: None,
             has_width: None,
             position_kind: None,

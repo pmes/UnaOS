@@ -416,8 +416,6 @@ pub fn build_taffy_tree<H: Host>(
     } else {
         kids.iter().map(|&(id, _)| id).collect()
     };
-    // AETHERCAPTIONSIDE (SR460): a table's caption with align=bottom is placed after the rows (caption-side: bottom).
-    let child_ids = caption_side_order::<H>(node_tag.as_deref(), child_ids, node_map);
 
     // A text run that is its box's ONLY child may shrink to the box's
     // width and wrap inside it (its min-content is its widest word).
@@ -573,6 +571,11 @@ pub fn build_taffy_tree<H: Host>(
                 _ => {}
             }
         }
+        // AETHERCAPTIONSIDECSS (SR462): align= is the lowest-priority source of caption-side; style="" (below) and the
+        // author cascade (`merge_paint` in `apply_specs`) overlay it.
+        if tag == "caption" {
+            paint.caption_side = caption_side_attr(dom_node);
+        }
         if let Some(inline) = dom_node.attr("style") {
             let saved = paint.text_align;
             apply_inline_style::<H>(&inline, &mut style, &mut paint, cx);
@@ -627,8 +630,8 @@ pub fn control_kind<N: DomNode>(node: &N) -> Option<Control> {
 /// AETHERCAPTIONSIDE (SR460): the caption-side a `<caption>`'s align= presentation attribute maps to (Blink's
 /// HTMLTableCaptionElement::CollectStyleForPresentationAttribute: align -> caption-side, whose parser keeps only
 /// top | bottom, ASCII case-insensitive): Some(false) top, Some(true) bottom, None for any other value (left / right /
-/// center are dropped, and never become text-align). The `caption-side` property itself is owed
-/// (AETHER-CAPTION-SIDE-CSS).
+/// center are dropped, and never become text-align). AETHERCAPTIONSIDECSS (SR462): read into
+/// `PaintStyle::caption_side` as the lowest-priority source (the cascade overlays it).
 pub fn caption_side_attr<N: DomNode>(node: &N) -> Option<bool> {
     match node.attr("align")?.trim().to_ascii_lowercase().as_str() {
         "top" => Some(false),
@@ -638,22 +641,43 @@ pub fn caption_side_attr<N: DomNode>(node: &N) -> Option<bool> {
 }
 
 /// AETHERCAPTIONSIDE (SR460): a table is a flex column whose caption sits where the DOM put it (first); a caption
-/// child whose `caption_side_attr` is bottom moves after the table's other children, the rest keep their order.
-/// Any other parent's children are returned unchanged.
-fn caption_side_order<H: Host>(
-    parent_tag: Option<&str>,
-    child_ids: Vec<taffy::NodeId>,
-    node_map: &NodeMap<H::Node>,
-) -> Vec<taffy::NodeId> {
-    if parent_tag != Some("table") {
-        return child_ids;
+/// child whose caption-side is bottom moves after the table's other children, the rest keep their order.
+/// AETHERCAPTIONSIDECSS (SR462): run once the cascade is folded (`apply_specs`), reading `PaintStyle::caption_side`
+/// (align= under style="" under the author cascade); the property inherits, so a caption's used value is the first
+/// one specified on itself or an ancestor box, top when none is. Idempotent: a second fold moves nothing.
+fn caption_side_order<H: Host>(tree: &mut LayoutTree<H>) {
+    if !tree.paint_map.values().any(|p| p.caption_side == Some(true)) {
+        return;
     }
-    let bottom = |id: &taffy::NodeId| {
-        node_map.get(id).is_some_and(|n| n.tag().as_deref() == Some("caption") && caption_side_attr(n) == Some(true))
+    let used_bottom = |tree: &LayoutTree<H>, id: taffy::NodeId| {
+        let mut cur = Some(id);
+        while let Some(b) = cur {
+            if let Some(side) = tree.paint_map.get(&b).and_then(|p| p.caption_side) {
+                return side;
+            }
+            cur = tree.taffy.parent(b);
+        }
+        false
     };
-    let (below, mut rest): (Vec<taffy::NodeId>, Vec<taffy::NodeId>) = child_ids.into_iter().partition(|id| bottom(id));
-    rest.extend(below);
-    rest
+    let mut below: BTreeMap<u64, Vec<taffy::NodeId>> = BTreeMap::new();
+    for (id, n) in &tree.node_map {
+        if n.tag().as_deref() != Some("caption") || !used_bottom(tree, *id) {
+            continue;
+        }
+        let Some(table) = tree.taffy.parent(*id) else { continue };
+        if tree.node_map.get(&table).is_some_and(|t| t.tag().as_deref() == Some("table")) {
+            below.entry(u64::from(table)).or_default().push(*id);
+        }
+    }
+    for (table, caps) in below {
+        let table = taffy::NodeId::from(table);
+        let kids = tree.taffy.children(table).unwrap_or_default();
+        let (moved, mut rest): (Vec<taffy::NodeId>, Vec<taffy::NodeId>) = kids.iter().copied().partition(|k| caps.contains(k));
+        rest.extend(moved);
+        if rest != kids {
+            let _ = tree.taffy.set_children(table, &rest);
+        }
+    }
 }
 
 /// Chromium's control font: 13.333px (`font: -webkit-small-control`).
@@ -1700,6 +1724,8 @@ pub fn apply_specs<H: Host>(tree: &mut LayoutTree<H>, specs: &[(taffy::NodeId, R
         css::merge_paint(entry, &spec.paint);
     }
     size_flex_items_by_content(tree, specs);
+    // AETHERCAPTIONSIDECSS (SR462): a caption whose cascaded, inherited caption-side is bottom goes after the rows.
+    caption_side_order(tree);
     // Static-position fallback: `position:absolute` with no inset specified
     // keeps its in-flow (static) position in real CSS. Taffy would pin such
     // a box to the parent origin, smearing it over siblings (the wikipedia
