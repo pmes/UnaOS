@@ -126,6 +126,11 @@ pub enum TetraNode {
         id: String,
         placeholder: String,
         action: TextAction,
+        /// LANDINGSECRETFIELD (SR432): a secret field never draws its text: AppKit's NSSecureTextFieldCell, GTK's
+        /// GlyphEntry one [`SECRET_BULLET`] per grapheme cluster ([`secret_mask`]), copy refused. Default false: every
+        /// existing field and serialized tree unchanged.
+        #[serde(default)]
+        secret: bool,
     },
     /// NLE2ORDER (SR227): the Surface pixel contract. Every `SurfaceBlit { url == id }` carries RGBA8, straight
     /// (non-premultiplied) alpha, row-major, stride `width * 4`, on every embassy; an embassy whose native buffer
@@ -845,5 +850,74 @@ mod surface_present_tests {
         assert!(tx.present("viewport", w, h, &[], None, |_, _| panic!("nothing to convert"), || panic!("no frame")).is_none());
         let m = tx.present("viewport", w, h, &[(0, 0, 8, 8)], None, |_, _| panic!("merge goes whole"), || (w, h, painter(4)));
         assert!(matches!(m, Some(SMessage::SurfaceBlit { scroll: None, .. })));
+    }
+}
+
+// LANDINGSECRETFIELD (SR432): the secret TextField's mask, the ONE rule GTK's GlyphEntry paints, traces and hit-tests
+// through (AppKit draws its own bullets). One bullet per grapheme cluster, on font_core's boundaries (the ones
+// GlyphEntry's caret steps), so the caret and selection map exactly between the text and what is drawn.
+
+/// The one glyph a secret field draws per grapheme cluster (U+2022 BULLET).
+pub const SECRET_BULLET: char = '•';
+
+/// What a secret field draws for `text`: one [`SECRET_BULLET`] per grapheme cluster, nothing of `text` itself.
+pub fn secret_mask(text: &str) -> String {
+    std::iter::repeat(SECRET_BULLET).take(text_host::font_core::grapheme::clusters(text).len()).collect()
+}
+
+/// Byte offset `i` of `text` (a cluster boundary) as its byte offset in [`secret_mask`]`(text)`.
+pub fn secret_offset(text: &str, i: usize) -> usize {
+    text_host::font_core::grapheme::clusters(text).iter().take_while(|&&(a, _)| a < i).count() * SECRET_BULLET.len_utf8()
+}
+
+/// Byte offset `m` of [`secret_mask`]`(text)` back to the cluster boundary of `text` it stands for (past the end:
+/// `text.len()`).
+pub fn secret_unoffset(text: &str, m: usize) -> usize {
+    text_host::font_core::grapheme::clusters(text).get(m / SECRET_BULLET.len_utf8()).map_or(text.len(), |&(a, _)| a)
+}
+
+#[cfg(test)]
+mod secret_field_tests {
+    use super::{secret_mask, secret_offset, secret_unoffset, TetraNode, TextAction, SECRET_BULLET};
+
+    /// The mask carries nothing of the secret: one bullet per cluster, a combining pair and a ZWJ family one each.
+    #[test]
+    fn secret_mask_draws_one_bullet_per_cluster() {
+        let m = secret_mask("hunter2");
+        assert_eq!(m, "•••••••");
+        assert!("hunter2".chars().all(|c| !m.contains(c)));
+        assert_eq!(secret_mask(""), "");
+        assert_eq!(secret_mask("e\u{301}x").chars().count(), 2, "a combining pair is one cluster");
+        assert_eq!(secret_mask("\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}").chars().count(), 1, "a ZWJ family is one cluster");
+        assert!(m.chars().all(|c| c == SECRET_BULLET));
+    }
+
+    /// Every cluster boundary of the text maps into the mask and back to itself; past the end clamps to the text.
+    #[test]
+    fn secret_offsets_round_trip_on_every_boundary() {
+        for t in ["sk-ant-TEST-SECRET", "e\u{301}a\u{1F468}\u{200D}\u{1F469}z", ""] {
+            let mask = secret_mask(t);
+            let mut bounds: Vec<usize> = text_host::font_core::grapheme::clusters(t).iter().map(|&(a, _)| a).collect();
+            bounds.push(t.len());
+            for (n, &b) in bounds.iter().enumerate() {
+                let m = secret_offset(t, b);
+                assert_eq!(m, n * SECRET_BULLET.len_utf8());
+                assert!(mask.is_char_boundary(m));
+                assert_eq!(secret_unoffset(t, m), b, "{t:?} boundary {b}");
+            }
+            assert_eq!(secret_offset(t, t.len() + 9), mask.len());
+            assert_eq!(secret_unoffset(t, mask.len() + 9), t.len());
+        }
+    }
+
+    /// The wire: a tree serialized before the field existed reads `secret: false`; a secret field round-trips.
+    #[test]
+    fn secret_field_serde_default_and_round_trip() {
+        let old = r#"{"TextField":{"id":"url","placeholder":"Enter URL...","action":"OpenDocument"}}"#;
+        let n: TetraNode = serde_json::from_str(old).unwrap();
+        assert!(matches!(n, TetraNode::TextField { secret: false, .. }));
+        let s = TetraNode::TextField { id: "k".into(), placeholder: "key".into(), action: TextAction::ConsoleInput, secret: true };
+        let back: TetraNode = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert!(matches!(back, TetraNode::TextField { secret: true, ref id, .. } if id == "k"));
     }
 }

@@ -6,11 +6,13 @@ use crate::tetra::TextAction;
 
 pub fn bootstrap_text_field(
     placeholder: &str,
+    secret: bool,
     text_action: TextAction,
     synapse: Synapse,
 ) -> NativeView {
     // QUARTZFONT (SR64): the field is quartzite's own editor, its text measured and painted by font_core.
     let entry = GlyphEntry::new(placeholder);
+    entry.set_secret(secret); // LANDINGSECRETFIELD (SR432): a secret field draws bullets, refuses copy
     entry.set_hexpand(true);
     
     let syn = synapse.clone();

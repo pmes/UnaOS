@@ -41,8 +41,8 @@ pub fn eval_tetra(node: TetraNode, synapse: Synapse) -> Retained<NSView> {
         TetraNode::Button { id: _, label, action } => {
             super::button::bootstrap_button(&label, action, synapse)
         }
-        TetraNode::TextField { id: _, placeholder, action } => {
-            stretch(super::text_field::bootstrap_text_field(&placeholder, action, synapse), 0)
+        TetraNode::TextField { id: _, placeholder, action, secret } => {
+            stretch(super::text_field::bootstrap_text_field(&placeholder, secret, action, synapse), 0)
         }
         TetraNode::Surface { id } => {
             // Note: SurfaceBlit must target a Surface by id once >1 surface exists

@@ -555,7 +555,7 @@ pub fn face_of(l: &Landing) -> TetraNode {
     TetraNode::VStack(vec![
         TetraNode::Console(ConsoleTetra { lines, ..Default::default() }),
         TetraNode::HStack(picks),
-        TetraNode::TextField { id: String::from("landing.key"), placeholder: String::from("password (a keyed card root)"), action: TextAction::ConsoleInput },
+        TetraNode::TextField { id: String::from("landing.key"), placeholder: String::from("password (a keyed card root)"), action: TextAction::ConsoleInput, secret: true }, // LANDINGSECRETFIELD (SR432): drawn as bullets
         TetraNode::HStack(vec![button("landing.read", "Read", "landing read"), button("landing.open", "Open", "landing open")]),
     ])
 }
@@ -865,5 +865,8 @@ mod tests {
         let TetraNode::Console(con) = &kids[0] else { panic!("list") };
         assert!(con.lines.iter().any(|x| x.text.starts_with("> mmcblk0")));
         assert!(con.lines.iter().all(|x| !x.text.contains("hunter2")));
+        // LANDINGSECRETFIELD (SR432): the password field is secret, and no node of the face carries the password.
+        assert!(matches!(&kids[2], TetraNode::TextField { id, secret: true, .. } if id == "landing.key"));
+        assert!(!format!("{:?}", face_of(&l)).contains("hunter2"));
     }
 }
