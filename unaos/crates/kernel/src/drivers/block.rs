@@ -5231,7 +5231,7 @@ impl core::fmt::Display for PollSkips {
 // is the wait: no second wait loop. A masked claimant never gets here (`claim_only` refuses it at once, before the mark).
 // The window's holder is exempt by identity: `yield_now` re-takes through `claim_only` with `TXN_YIELDED` still set and marks
 // itself when the mark is free, so the holder writes its task id before its put. One gate site, two predicates: Z86's keys
-// on the task name and carries poll-only side effects. Owed: XHCILOAN-PTPYIELD-LOOPONE (Z88's `YIELD_KAT_WINDOWS` to 1),
+// on the task name and carries poll-only side effects. XHCILOAN-PTPYIELD-LOOPONE BUILT by Z96 (`YIELD_KAT_WINDOWS` is 1); owed:
 // XHCILOAN-PTPYIELD-PTPMARK-MANY (one mark word: a third concurrent PTP claimant is unmarked), XHCILOAN-PTPYIELD-OUT.
 
 /// XHCILOANPTPYIELDPTPWAIT: the task id of the PTP hold that opened the current yield window. Written only by that holder in

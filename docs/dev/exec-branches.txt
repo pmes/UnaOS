@@ -1178,4 +1178,4 @@ refs/heads/exec-rmbp-secretfieldclear   a3f4ae5ce IN-FLIGHT cut 2026-10-28
 refs/heads/exec-rmbp-preemptoffx86staledrop   a3f4ae5ce IN-FLIGHT cut 2026-10-28
 refs/heads/exec-rmbp-closeflightoldest   a3f4ae5ce IN-FLIGHT cut 2026-10-28
 refs/heads/exec-rmbp-preemptoffarmsleepcheck   a3f4ae5ce IN-FLIGHT cut 2026-10-28
-refs/heads/exec-rmbp-xhciloanptpyieldloopone   a3f4ae5ce IN-FLIGHT cut 2026-10-28
+refs/heads/exec-rmbp-xhciloanptpyieldloopone   629ccdf12 FOLDED-BY-HAND (this commit) 2026-10-27

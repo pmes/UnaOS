@@ -1915,7 +1915,10 @@ fn loan_yield(c: &mut XhciController, force: bool) -> Result<Option<(u64, bool)>
 /// `LOAN_YIELD_WINDOW_MS` (3 ms), all of them far inside the claimant's 2 s `claim_xhci_for_io` wait.
 /// XHCILOANPTPYIELDKATRULE (zenbook-ledger Z88): since Z86 the xhci-poll take never closes a window, so the windows are
 /// kept only for Z87's PTP class (a second `claim_only` taking the window before `with_controller` refuses it).
-const YIELD_KAT_WINDOWS: u32 = 4;
+/// XHCILOANPTPYIELDLOOPONE (zenbook-ledger Z96): one window. The claimant is armed (in `claim_xhci_for_io`'s hlt wait)
+/// before it opens, and since Z90 `loan_ptp_yield_wait` refuses that PTP class before the closer, so no second window was
+/// ever reached; a Z90 regression now FAILs `ptp-closed` at window 1. Owed: XHCILOAN-PTPYIELD-KATLOOPDROP (the dead loop).
+const YIELD_KAT_WINDOWS: u32 = 1;
 
 /// XHCILOANPTPYIELDKATRULE (Z88): windows the KAT offered (`ptp_yield_windows=` on the PREEMPTAUDIT line). Written only
 /// by the KAT's task: reset at `loan_path_kat`'s start (0 when the KAT did not reach a window), bumped per offered window.
