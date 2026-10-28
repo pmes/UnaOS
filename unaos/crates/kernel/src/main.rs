@@ -3898,7 +3898,7 @@ fn route_input_to_active_el0() -> usize {
             // `WRITER.lock()` is blocking, and `repair` takes the window TABLE lock. Both are now
             // handed back as a `RepaintTail` and run BELOW, with interrupts restored. What remains
             // inside the mask is pixels and atomics — no blocking lock, no printing.
-            let tail = unaos_kernel::arch::without_interrupts(|| match ev {
+            let tail = cursormove_span(|| match ev { // PREEMPTOFFARMCURSORMOVE (zenbook-ledger Z85): the span is preempt-off with PSTATE.I as the caller had it (`cursormove_span`, file tail), was `without_interrupts`. LINE-NEUTRAL
                 unaos_kernel::pal::Event::Mouse { x, y } if x != 0 || y != 0 => {
                     unaos_kernel::pal::cursor::move_rel(
                         x,
@@ -10690,3 +10690,22 @@ const RAST_TASK_STACK_SIZE: usize = 32 * 1024;
 #[cfg(all(target_arch = "aarch64", feature = "baremetal", feature = "desktop_firmware", not(feature = "pirast")))]
 #[inline(always)]
 fn rast_demo_armed_once() {}
+
+// ── PREEMPTOFFARMCURSORMOVE (zenbook-ledger Z85, BP-cores-23) — the router's cursor span on the Pi is preempt-off with PSTATE.I as
+// the caller had it (was `without_interrupts`). The mask existed only so the router could not be switched out while it held a
+// panel lock (INWEDGE / LOCKFIX, above). Inside: `pal::cursor::move_rel` / `set_abs` (POS under its own mask), the
+// `pal_*_hint` reads (`panel_info_nonblocking`, masked try_lock), `video::cursor::repaint_deferred` (SPRITE through
+// `claim_bounded`, a 2 ms bounded retry; WRITER through `panel_snapshot`, the copy only). Nothing yields: on `desktop_firmware`
+// `repaint_on_move`'s `repaint()` prints (fbcon try_lock, a present through `comp_gate_pass`, a bounded spin then a fold) and
+// `repair` takes TABLE (masked holders). No aarch64 ISR (SGI, `timer::on_tick`, PL011 RX) waits on SPRITE or WRITER: in IRQ
+// context those doors try once. The inner acquires run exactly as they already do inside COMPGATE's pass, which holds this same
+// count at I=1 (`video/wm.rs` `comp_gate_pass`). Counted in the aarch64 audit's `converted=` (sched.rs `CONVERTED_CURSORMOVE`).
+// No QEMU line reaches the span (virt does not compile the router; raspi4b has no HID; `input_router_selftest` skips it via
+// `ROUTER_SELFTEST`): the Pi bench with a USB mouse under a focused EL0 app is the witness. At the tail: no line above moves.
+
+/// PREEMPTOFFARMCURSORMOVE: `f` under `preemptoff::scoped` (COMPGATE's count, taken masked; PSTATE.I as the caller had it). One
+/// fn, not Z83's pair: the router is compiled only on aarch64 + `baremetal`, so a masked arm would have no caller.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+fn cursormove_span<R>(f: impl FnOnce() -> R) -> R {
+    unaos_kernel::arch::sched::preemptoff::scoped(f)
+}
