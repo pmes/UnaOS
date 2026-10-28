@@ -5658,6 +5658,18 @@ x86_pick_capture_spec() {
         fi
         return 0
     fi
+    # XHCILOANPTPYIELDQEMUMTPPICK (zenbook-ledger Z112): THE QEMU usb-mtp LEG. `UNAOS_QEMU_MTP_RW` (Z105, the knob line before
+    # the uvc map line) attaches QEMU's read-write `usb-mtp` and exports UNAOS_UVC; `tests ptpout` (x86 + `uvc`) drives Z94's
+    # SendObject Out yield over it. Asked here by PTRLANE's rule (a leg whose subject is the device its knob attaches, before
+    # the medium and compositor arms, which describe captures without it); the guard names the knob its pins need.
+    if [ -n "${UNAOS_QEMU_MTP_RW:-}" ]; then
+        if [ -n "${UNAOS_UVC:-}" ]; then
+            X86_REPLAY_SPEC="${WORKSPACE_DIR}/scripts/specs/x86-mtp.spec"
+        else
+            X86_REPLAY_WHY="UNAOS_QEMU_MTP_RW is armed without UNAOS_UVC — \`tests ptpout\` is registered only under \`uvc\` (tests.rs), so every pin in x86-mtp.spec is absent by construction. Use 'UNAOS_QEMU_MTP_RW=1 ./arroyo test 240' for the gated run."
+        fi
+        return 0
+    fi
     # INSTALLTYPIST: THE TYPED INSTALLER LEG, ASKED BEFORE THE SATA ARM — and the order is
     # load-bearing, not stylistic. This leg arms UNAOS_AHCI (so the arm below would claim it) and
     # UNAOS_PART_DISK (so that arm would then REFUSE it and print a skip line), and the capture
