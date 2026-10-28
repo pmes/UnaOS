@@ -1146,7 +1146,7 @@ refs/heads/exec-rmbp-xhciloanptpyieldkatcloser   52c88407f FOLDED-BY-HAND (this 
 refs/heads/exec-rmbp-preemptoffarmcursormove   9ad5a5da8 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-bindnowgate   94708d143 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-lockregxcorecost   1ca6f4ad2 FOLDED-BY-HAND (this commit) 2026-10-27
-refs/heads/exec-rmbp-aethercentercell   871a6b0ca IN-FLIGHT cut 2026-10-28
+refs/heads/exec-rmbp-aethercentercell   67c2a7bb9 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-xhciloanptpyieldpollskip   2a2b8ed7a FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-landingscore   1af57a39d FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-xhciloanptpyieldptptake   a446467de FOLDED-BY-HAND (this commit) 2026-10-27
