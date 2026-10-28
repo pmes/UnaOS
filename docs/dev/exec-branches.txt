@@ -1151,7 +1151,7 @@ refs/heads/exec-rmbp-xhciloanptpyieldpollskip   2a2b8ed7a FOLDED-BY-HAND (this c
 refs/heads/exec-rmbp-landingscore   b16e93dd9 IN-FLIGHT cut 2026-10-28
 refs/heads/exec-rmbp-xhciloanptpyieldptptake   a446467de FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-unafsflightlist   412e8aba3 FOLDED-BY-HAND (this commit) 2026-10-27
-refs/heads/exec-rmbp-xhciloanptpyieldkatrule   736f42b84 IN-FLIGHT cut 2026-10-28
+refs/heads/exec-rmbp-xhciloanptpyieldkatrule   8978c4c25 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-preemptoffarmquantum   736f42b84 IN-FLIGHT cut 2026-10-28
 refs/heads/exec-rmbp-closeflightrescue   736f42b84 IN-FLIGHT cut 2026-10-28
 refs/heads/exec-rmbp-aethercaptioncore   736f42b84 IN-FLIGHT cut 2026-10-28

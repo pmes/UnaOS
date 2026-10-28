@@ -1910,41 +1910,51 @@ fn loan_yield(c: &mut XhciController, force: bool) -> Result<Option<(u64, bool)>
     }
 }
 
-/// XHCILOANPTPYIELDKATCLOSER (zenbook-ledger Z84): forced windows the KAT offers its armed claimant while the xhci-poll
-/// take (every 1 ms tick) keeps closing them first; each window is <= `LOAN_YIELD_WINDOW_MS` (3 ms), all of them far inside
-/// the claimant's 2 s `claim_xhci_for_io` wait.
+/// XHCILOANPTPYIELDKATCLOSER (zenbook-ledger Z84): forced windows the KAT offers its armed claimant; each window is <=
+/// `LOAN_YIELD_WINDOW_MS` (3 ms), all of them far inside the claimant's 2 s `claim_xhci_for_io` wait.
+/// XHCILOANPTPYIELDKATRULE (zenbook-ledger Z88): since Z86 the xhci-poll take never closes a window, so the windows are
+/// kept only for Z87's PTP class (a second `claim_only` taking the window before `with_controller` refuses it).
 const YIELD_KAT_WINDOWS: u32 = 4;
 
+/// XHCILOANPTPYIELDKATRULE (Z88): windows the KAT offered (`ptp_yield_windows=` on the PREEMPTAUDIT line). Written only
+/// by the KAT's task: reset at `loan_path_kat`'s start (0 when the KAT did not reach a window), bumped per offered window.
+static YIELD_KAT_SPENT: AtomicU32 = AtomicU32::new(0);
+
 /// XHCILOANPTPYIELD KAT: a block claimant armed on a sibling CPU (x86), then a forced yield that it must take.
-/// XHCILOANPTPYIELDKATCLOSER (Z84): a window counts as the claimant's only when Z82's closer is not the xhci-poll take
-/// (`taken && closed_by_poll()`, read after the re-take); a poll-closed window is offered again, at most
-/// `YIELD_KAT_WINDOWS` in all, and only poll-closed windows end as `skip(poll-closed)` (visible, not a FAIL).
+/// XHCILOANPTPYIELDKATCLOSER (Z84) / XHCILOANPTPYIELDKATRULE (Z88): a window counts as the claimant's only when Z82's
+/// closer is neither the xhci-poll take nor a second PTP claim (read after the re-take). A poll-closed window is a Z86
+/// regression and ends `poll-closed` at once (a FAIL, no skip); a PTP-closed window is offered again, at most
+/// `YIELD_KAT_WINDOWS` in all, and a KAT whose windows went to PTP claims ends `ptp-closed` (a FAIL).
 fn loan_yield_kat(c: &mut XhciController, armed: &mut bool) -> &'static str {
     let arm = yield_kat_arm();
     *armed = arm != Err("skip(one-cpu)"); // spawned (a late claimant is settled too)
-    let (mut served, mut polled) = (false, false);
+    let (mut served, mut ptpd) = (false, false);
     for _ in 0..YIELD_KAT_WINDOWS {
         let taken = match loan_yield(c, true) {
             Err(_) => return "lost",
             Ok(None) => return "no-yield",
             Ok(Some((_, taken))) => taken,
         };
+        YIELD_KAT_SPENT.fetch_add(1, Ordering::Relaxed);
         if crate::drivers::block::xhci_loan_published() {
             return "published";
         }
         if TXN_YIELDED.load(Ordering::Acquire) {
             return "flag-left";
         }
-        let poll = taken && crate::drivers::block::xhci_loan_yield_closed_by_poll(); // Z82's closer: valid only after a taken window
-        served = taken && !poll;
-        polled |= poll;
-        if !poll || arm.is_err() {
+        if taken && crate::drivers::block::xhci_loan_yield_closed_by_poll() {
+            return "poll-closed"; // Z82's closer, valid only after a taken window: Z86 refuses this take, so it is a regression
+        }
+        let ptp = taken && crate::drivers::block::xhci_loan_yield_closed_by_ptp(); // Z87's class: not the claimant's
+        served = taken && !ptp;
+        ptpd |= ptp;
+        if !ptp || arm.is_err() {
             break; // served, untaken, or no claimant to offer another window to
         }
     }
     match arm {
         Ok(()) if served => "ok",
-        Ok(()) if polled => "skip(poll-closed)",
+        Ok(()) if ptpd => "ptp-closed",
         Ok(()) => "untaken",
         Err(skip) => skip,
     }
@@ -1975,8 +1985,10 @@ fn yield_kat_settle(_armed: bool) {}
 /// `err`, or `skip(masked|no-xhci)`. XHCILOANPTPYIELD (Z73): the pair's second word is `ptp_yield=` — inside the same
 /// hold a sibling block claimant is armed and a forced yield must hand it the window and re-take the loan: `ok` /
 /// `untaken` / `no-yield` / `lost` / `published` / `flag-left` / `skip(one-cpu|claimant-late)`, or `ptp_path=`'s word when
-/// the hold itself failed. XHCILOANPTPYIELDKATCLOSER (Z84): `skip(poll-closed)` when only the xhci-poll take closed the windows.
+/// the hold itself failed. XHCILOANPTPYIELDKATRULE (Z88): Z84's `skip(poll-closed)` retired: `poll-closed` (a xhci-poll take
+/// closed a window: Z86 regressed) and `ptp-closed` (the windows went to a second PTP claim) are FAIL words.
 pub fn loan_path_kat() -> (&'static str, &'static str) {
+    YIELD_KAT_SPENT.store(0, Ordering::Relaxed); // XHCILOANPTPYIELDKATRULE (Z88): this run's windows only
     if crate::arch::irqs_masked() {
         return ("skip(masked)", "skip(masked)");
     }
@@ -2000,6 +2012,11 @@ pub fn loan_path_kat() -> (&'static str, &'static str) {
         Err(_) => "err",
     };
     (pw, if r.is_ok() { yw } else { pw })
+}
+
+/// XHCILOANPTPYIELDKATRULE (zenbook-ledger Z88): the windows the last `loan_path_kat` offered (`ptp_yield_windows=`).
+pub fn loan_yield_kat_windows() -> u32 {
+    YIELD_KAT_SPENT.load(Ordering::Relaxed)
 }
 
 /// Object bytes for the volume's `read`.
