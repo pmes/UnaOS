@@ -23,7 +23,7 @@ fn drag_one_corner_keeps_the_rest_still() {
     sk.add(Constraint::Fix(PointRef::Point(p[0]), Vec2::new(0.0, 0.0))).unwrap();
     let loose = sk.add_point(50.0, 50.0);
     let s = drag(&mut sk, PointRef::Point(p[2]), Vec2::new(20.0, 8.0), T).expect("drags");
-    assert_eq!(s.dof, 2);
+    assert_eq!(s.dof, 4, "the rectangle's width and height, and the loose point's x and y");
     let at = |id, x: f64, y: f64| {
         let v = pt(&sk, id);
         assert!((v.x - x).abs() <= T.lin && (v.y - y).abs() <= T.lin, "{id:?} at {v:?}, want ({x}, {y})");

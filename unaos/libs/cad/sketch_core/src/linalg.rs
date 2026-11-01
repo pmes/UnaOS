@@ -26,15 +26,8 @@ pub struct Mat {
 }
 
 impl Mat {
-    pub fn zeros(rows: usize, cols: usize) -> Self {
-        Mat { rows, cols, a: vec![0.0; rows * cols] }
-    }
     pub fn row(&self, i: usize) -> &[f64] {
         &self.a[i * self.cols..(i + 1) * self.cols]
-    }
-    pub fn row_mut(&mut self, i: usize) -> &mut [f64] {
-        let c = self.cols;
-        &mut self.a[i * c..(i + 1) * c]
     }
 }
 
