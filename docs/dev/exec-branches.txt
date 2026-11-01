@@ -1232,7 +1232,7 @@ refs/heads/exec-rmbp-gen7r8edgeunarmed   a06900ba4 FOLDED-BY-HAND (this commit) 
 refs/heads/exec-rmbp-preemptoffsleepcheckyieldsitewrapperskat   00173eb8f FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-vuggeom   c572faa34 IN-FLIGHT cut 2026-11-01
 refs/heads/exec-rmbp-vugsketch   c572faa34 IN-FLIGHT cut 2026-11-01
-refs/heads/exec-rmbp-vugmesh   c572faa34 IN-FLIGHT cut 2026-11-01
+refs/heads/exec-rmbp-vugmesh   3190df0af FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-vugmake   c572faa34 IN-FLIGHT cut 2026-11-01
 refs/heads/exec-rmbp-vugbrep1   0ef553321 IN-FLIGHT cut 2026-11-01
 refs/heads/exec-rmbp-vugscan1   0ef553321 IN-FLIGHT cut 2026-11-01
