@@ -7,7 +7,7 @@ invariants: `docs/dev/blueprint/vug.md` (f64 geometry, one `Tol`, pure cores, th
 | crate | owns | ledger |
 |---|---|---|
 | `geom_core` | f64 vectors, matrices, transforms, `Tol`, AABB, exact orientation predicates, closed-form intersections | SR464 |
-| `sketch_core` | 2D entities, constraints, the solver, DOF/redundancy, the drag solve, profiles | SR465 |
+| `sketch_core` | 2D entities, constraints, the solver, DOF/redundancy, the drag solve, profiles (VUGSKETCH: one weighted min-norm LM for solve and drag; redundancy named by the ordered rank, conflicts refused by name) | SR465 |
 | `mesh_core` | the triangle mesh, half-edge adjacency, normals, BVH pick, manifold check, weld, STL/OBJ/PLY | SR466 |
 | `make_core` | Machine, Tool, Stock, fixtures, Op, the `Program` IR, G-code dialects, `review` for Helm | SR467 |
 | `brep_core`, `scan_core` | owed (VUG-BREP, VUG-SCAN in the sheet) | — |
