@@ -7,16 +7,29 @@
 //! The camera is euclase's f32 math; the picks are the model seam's (mesh_core's BVH).
 
 use crate::model::Model;
-use bandy::{MOD_ALT, MOD_CONTROL, MOD_SHIFT};
+use bandy::{BUTTON_MIDDLE, BUTTON_RIGHT, MOD_ALT, MOD_CONTROL, MOD_SHIFT};
 use euclase::{Mat4, Vec3};
 
-/// A mouse button. Today's surface wire (quartzite image_view `mouseDown:`) carries the LEFT button only; Middle and
-/// Right reach the view through Alt+Left (Middle) until VUG-FACE-BUTTONS forwards them.
+/// A mouse button. The surface wire carries the left button as `BrowserButton` and the right and middle as
+/// `BrowserAuxButton` (VUG-FACE-BUTTONS, LEDGER SR477: quartzite image_view's `rightMouse*:` / `otherMouse*:`); Alt+Left
+/// stays the middle button for a trackpad or a one-button mouse (`Preset::resolve`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Button {
     Left,
     Middle,
     Right,
+}
+
+impl Button {
+    /// The button a `BrowserButton` (0) or `BrowserAuxButton` number names; `None` for the extra buttons (3 and up).
+    pub fn from_wire(button: u8) -> Option<Button> {
+        match button {
+            0 => Some(Button::Left),
+            BUTTON_RIGHT => Some(Button::Right),
+            BUTTON_MIDDLE => Some(Button::Middle),
+            _ => None,
+        }
+    }
 }
 
 /// What a drag (or a click) does.
@@ -311,17 +324,34 @@ impl View {
         if dy == 0.0 {
             return false;
         }
+        let target = self.zoom_target(model);
+        self.dolly(target, ((dy as f32) * 0.01).exp().clamp(0.5, 2.0));
+        true
+    }
+
+    /// A pinch at (x, y) (VUG-FACE-BUTTONS, LEDGER SR477): `scale` above 1 spreads the fingers and zooms in toward the
+    /// same point the wheel would (`zoom_target`), by 1 / `scale` per event, clamped as the wheel's step.
+    pub fn pinch(&mut self, model: &Model, scale: f64, x: f64, y: f64) -> bool {
+        self.cursor = (x, y);
+        if !(scale.is_finite() && scale > 0.0) || scale == 1.0 {
+            return false;
+        }
+        let target = self.zoom_target(model);
+        self.dolly(target, (1.0 / scale as f32).clamp(0.5, 2.0));
+        true
+    }
+
+    /// The point a zoom at the cursor moves toward: the model point under it, else the cursor ray at the centre's depth.
+    fn zoom_target(&self, model: &Model) -> Vec3 {
         let (x, y) = self.cursor;
-        let target = match self.hit(model, x, y) {
+        match self.hit(model, x, y) {
             Some((p, _)) => p,
             None => {
                 let (o, d) = self.ray(x, y);
                 let depth = (Self::centre(model) - o).dot(self.camera.basis().2).max(model.radius() * 0.01);
                 o + d * depth
             }
-        };
-        self.dolly(target, ((dy as f32) * 0.01).exp().clamp(0.5, 2.0));
-        true
+        }
     }
 
     /// Orbit about `pivot`: the camera frame turns rigidly about it, so the pivot's place on the surface is fixed.

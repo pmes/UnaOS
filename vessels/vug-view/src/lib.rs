@@ -5,8 +5,9 @@
 //! picks with mesh_core's BVH; holds no geometry.
 //!
 //! `vug-view` (VUGFACE1, LEDGER SR470) is Vug's first face, in facet-view's shape: a controller between quartzite's
-//! image surface and the model. [`Viewer`] turns window input (the left button with its modifiers as `BrowserButton`,
-//! the pointer as `BrowserMouseMove`, the wheel as `BrowserScroll`, keys as `BrowserText` / `BrowserKey`, size as
+//! image surface and the model. [`Viewer`] turns window input (the left button with its modifiers as `BrowserButton`, the
+//! right and middle as `BrowserAuxButton` and the pinch as `BrowserPinch` (VUG-FACE-BUTTONS, LEDGER SR477), the pointer
+//! as `BrowserMouseMove`, the wheel as `BrowserScroll`, keys as `BrowserText` / `BrowserKey`, size as
 //! `BrowserResize` — what quartzite's image surface emits) into view changes and answers with one `SurfaceBlit` per
 //! settled burst of input. `model` is the ONE seam to mesh_core, `view` the navigation, `raster` the drawing.
 
@@ -29,8 +30,9 @@ pub const SHORTCUTS: &[(&str, &str)] = &[
     ("7", "top view"),
     ("p", "next navigation preset"),
     ("click", "pick a face"),
-    ("Alt+drag", "the middle button (orbit / pan / zoom per the preset)"),
-    ("wheel", "zoom to the cursor"),
+    ("middle / right drag", "orbit / pan / zoom per the preset"),
+    ("Alt+drag", "the middle button, for a trackpad (orbit / pan / zoom per the preset)"),
+    ("wheel / pinch", "zoom to the cursor"),
 ];
 
 /// The controller: owns the model and the view (one task, no lock).
@@ -54,9 +56,16 @@ impl Viewer {
     /// One window message; true when the frame must be redrawn (or resent).
     pub fn input(&mut self, msg: &SMessage) -> bool {
         match msg {
-            // Today's wire is the left button only (VUG-FACE-BUTTONS owed): Alt+Left is the middle button.
+            // The left button (Alt+Left is still the middle one, for a trackpad: `Preset::resolve`).
             SMessage::BrowserButton { down: true, x, y, mods, .. } => self.view.press(&self.model, Button::Left, *mods, *x, *y),
             SMessage::BrowserButton { down: false, x, y, .. } => self.view.release(&self.model, *x, *y),
+            // VUG-FACE-BUTTONS (SR477): the right and middle buttons; an extra button (3 and up) does nothing.
+            SMessage::BrowserAuxButton { button, down: true, x, y, mods, .. } => match Button::from_wire(*button) {
+                Some(b) => self.view.press(&self.model, b, *mods, *x, *y),
+                None => false,
+            },
+            SMessage::BrowserAuxButton { button, down: false, x, y, .. } => Button::from_wire(*button).is_some() && self.view.release(&self.model, *x, *y),
+            SMessage::BrowserPinch { scale, x, y, .. } => self.view.pinch(&self.model, *scale, *x, *y),
             SMessage::BrowserMouseMove(x, y, _) => self.view.motion(*x, *y),
             SMessage::BrowserScroll(_, dy, _) => self.view.wheel(&self.model, *dy),
             SMessage::BrowserText(t) => t.chars().fold(false, |acc, c| self.key(&c.to_string()) | acc),
