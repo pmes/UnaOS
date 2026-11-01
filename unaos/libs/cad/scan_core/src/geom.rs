@@ -141,3 +141,8 @@ impl Transform {
         Transform { rot: rt, trans: -t }
     }
 }
+
+/// geom_core's swap exports this free spelling (VUGSHIMSWAP SR473); VUGSCANPOSE (SR478) calls it so pose.rs is unchanged by the swap.
+pub fn from_axes(x: Vec3, y: Vec3, z: Vec3, origin: Vec3) -> Transform {
+    Transform::from_axes(x, y, z, origin)
+}
