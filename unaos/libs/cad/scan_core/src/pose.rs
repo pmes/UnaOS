@@ -16,10 +16,10 @@
 //!    normals within [`TrackParams::normal_cos`].
 //! 3. Point-to-plane: `r = n·(q − p)`, the left perturbation `q' = q + ω×q + τ` gives the row `[q × n, n]`; the 6x6
 //!    normal equations are solved by Cholesky and the estimate moves by Rodrigues' exact rotation of `ω` then `τ`.
-//! 4. Three levels, coarse to fine (pixel strides 4 / 2 / 1); a level stops when the step is inside the [`Tol`].
+//! 4. KinFu's pyramid: the depth bilateral-filtered once (5x5, σs 4.5 px, σr 30 mm), halved twice by a 2x2 mean
+//!    that skips depths past 3·σr (no averaging across an edge), normals by central differences on each filtered
+//!    level; coarse to fine, a level stops when the step is inside the [`Tol`].
 //! 5. Lost, by name, when too few pixels pair or the residual is too large; a refusal leaves the tracker as it was.
-//!
-//! Not reproduced: KinFu's depth-aware pyrDown and bilateral filter (the levels here are plain pixel strides).
 //!
 //! The IMU (probe_core::imu) gives gravity, a 2-DOF fact (roll and pitch about down), never yaw or translation.
 //! Measured (SR478's design): as a soft term in the 6x6 at honest variances it carries ~1e-6 of the point data's
@@ -92,7 +92,7 @@ pub struct TrackParams {
     pub min_inlier_frac: f64,
     /// Lost when the rms point-to-plane residual is above this.
     pub max_rms_mm: f64,
-    /// (pixel stride, iterations), coarse to fine (KinFu: 4 / 5 / 10 iterations).
+    /// (pyramid scale 4 / 2 / 1, iterations), coarse to fine (KinFu: 4 / 5 / 10 iterations).
     pub levels: [(u32, u32); 3],
     /// Refused when the tracked pose tilts the frame's gravity off the anchored down by more than this.
     pub tilt_rad: f64,
@@ -107,7 +107,7 @@ impl TrackParams {
             normal_cos: libm::cos(20.0 * DEG),
             min_inlier_frac: 0.25,
             max_rms_mm: t.trunc_mm(),
-            levels: [(4, 4), (2, 5), (1, 10)],
+            levels: [(4, 4), (2, 5), (1, 30)],
             tilt_rad: 5.0 * DEG,
         }
     }
@@ -120,6 +120,8 @@ pub struct Tracked {
     pub valid: u32,
     pub rms_mm: f64,
     pub iterations: u32,
+    /// Iterations spent per level, in `TrackParams::levels` order (coarse to fine).
+    pub level_iterations: [u32; 3],
     /// The angle between the frame's gravity carried by the pose and the anchored down; `None` without gravity.
     pub tilt_deg: Option<f64>,
 }
@@ -226,74 +228,64 @@ impl Tracker {
             return Err(TrackError::Scan(ScanError::IntrinsicsChanged));
         }
 
-        // The frame's camera points (mm), once.
+        // The frame's depth (mm, 0 = hole), bilateral-filtered once, then the pyramid by guarded pyrDown; each
+        // level's camera points and normals (central differences on the filtered level), once per frame.
         let (w, h) = (frame.width, frame.height);
-        let mut pts: Vec<Option<Vec3>> = Vec::with_capacity(w as usize * h as usize);
+        let mut raw = vec![0.0f64; w as usize * h as usize];
         let mut any = false;
         for y in 0..h {
             for x in 0..w {
-                let p = metres_at(frame, scale, x, y)
-                    .and_then(|m| intr.deproject(x as f32 + 0.5, y as f32 + 0.5, m))
-                    .map(|c| Vec3::new(c[0] as f64 * 1000.0, c[1] as f64 * 1000.0, c[2] as f64 * 1000.0));
-                any |= p.is_some();
-                pts.push(p);
+                if let Some(m) = metres_at(frame, scale, x, y) {
+                    raw[y as usize * w as usize + x as usize] = m as f64 * 1000.0;
+                    any = true;
+                }
             }
         }
         if !any {
             return Err(TrackError::Scan(ScanError::NoDepth));
         }
+        let mut depth = vec![(bilateral(&raw, w, h), w, h)];
+        for _ in 1..PYRAMID {
+            let (d, lw, lh) = depth.last().map(|(d, lw, lh)| (d, *lw, *lh)).unwrap_or((&raw, w, h));
+            let down = pyr_down(d, lw, lh);
+            depth.push(down);
+        }
+        let levels: Vec<Level> = depth.iter().enumerate().map(|(l, (d, lw, lh))| Level::new(d, *lw, *lh, intr, l)).collect();
 
         let reference = Axes::of(&model.pose);
         let prm = self.params;
         let mut pose = self.pose;
         let (mut iterations, mut inliers, mut valid, mut rms) = (0u32, 0u32, 0u32, f64::INFINITY);
-        for &(stride, iters) in prm.levels.iter() {
-            let s = stride.max(1);
+        let mut level_iterations = [0u32; 3];
+        for (li, &(scale_px, iters)) in prm.levels.iter().enumerate() {
+            let lvl = &levels[(scale_px.max(1).ilog2() as usize).min(PYRAMID - 1)];
             for _ in 0..iters {
                 let mut ata = [[0.0f64; 6]; 6];
                 let mut atb = [0.0f64; 6];
                 let (mut n_in, mut n_valid, mut sse) = (0u32, 0u32, 0.0f64);
-                // The normal by central differences at a baseline of at least 4 pixels: KinFu takes it from a
-                // bilateral-filtered map (not reproduced); at 1 pixel the D435i's noise scatters it past the gate.
-                let b = s.max(4);
-                let (bu, bw) = (b as usize, (b * w) as usize);
-                let mut y = b;
-                while y + b < h {
-                    let mut x = b;
-                    while x + b < w {
-                        let i = y as usize * w as usize + x as usize;
-                        let (Some(p), Some(pl), Some(pr), Some(pu), Some(pd)) =
-                            (pts[i], pts[i - bu], pts[i + bu], pts[i - bw], pts[i + bw])
-                        else {
-                            x += s;
-                            continue;
-                        };
-                        n_valid += 1;
-                        x += s;
-                        let Some(nc) = unit((pr - pl).cross(pd - pu)) else { continue };
-                        let nc = if nc.dot(p) > 0.0 { -nc } else { nc };
-                        let q = pose.apply_point(p);
-                        let nq = pose.apply_vector(nc);
-                        let Some(m) = lookup(model, intr, reference.local(q)) else { continue };
-                        let diff = q - m.p;
-                        if diff.mag() > prm.dist_mm || nq.dot(m.n) < prm.normal_cos {
-                            continue;
-                        }
-                        let r = m.n.dot(diff);
-                        let jw = q.cross(m.n);
-                        let j = [jw.x, jw.y, jw.z, m.n.x, m.n.y, m.n.z];
-                        for a in 0..6 {
-                            for c in 0..6 {
-                                ata[a][c] += j[a] * j[c];
-                            }
-                            atb[a] -= j[a] * r;
-                        }
-                        n_in += 1;
-                        sse += r * r;
+                for &(p, nc) in lvl.points.iter().flatten() {
+                    n_valid += 1;
+                    let q = pose.apply_point(p);
+                    let nq = pose.apply_vector(nc);
+                    let Some(m) = lookup(model, intr, reference.local(q)) else { continue };
+                    let diff = q - m.p;
+                    if diff.mag() > prm.dist_mm || nq.dot(m.n) < prm.normal_cos {
+                        continue;
                     }
-                    y += s;
+                    let r = m.n.dot(diff);
+                    let jw = q.cross(m.n);
+                    let j = [jw.x, jw.y, jw.z, m.n.x, m.n.y, m.n.z];
+                    for a in 0..6 {
+                        for c in 0..6 {
+                            ata[a][c] += j[a] * j[c];
+                        }
+                        atb[a] -= j[a] * r;
+                    }
+                    n_in += 1;
+                    sse += r * r;
                 }
                 iterations += 1;
+                level_iterations[li] += 1;
                 inliers = n_in;
                 valid = n_valid;
                 rms = if n_in > 0 { libm::sqrt(sse / n_in as f64) } else { f64::INFINITY };
@@ -325,7 +317,7 @@ impl Tracker {
         }
 
         self.pose = pose;
-        self.last = Some(Tracked { inliers, valid, rms_mm: rms, iterations, tilt_deg });
+        self.last = Some(Tracked { inliers, valid, rms_mm: rms, iterations, level_iterations, tilt_deg });
         if self.down.is_none() {
             if let Some(g) = g {
                 self.down = Some(pose.apply_vector(g));
@@ -366,6 +358,112 @@ pub fn raycast(t: &Tsdf, intr: &Intrinsics, pose: &Transform) -> ModelMap {
         }
     }
     ModelMap { width: w, height: h, intrinsics: *intr, pose: *pose, surfels }
+}
+
+/// Pyramid levels (KinFu's three).
+const PYRAMID: usize = 3;
+/// The bilateral filter (PCL KinFu `bilateralFilter`, kinfu.cpp / bilateral_pyrdown.cu: sigma_space 4.5 px,
+/// sigma_color 30 mm), over a 5x5 window.
+const BILATERAL_SIGMA_S: f64 = 4.5;
+const BILATERAL_SIGMA_R: f64 = 30.0;
+const BILATERAL_R: i32 = 2;
+
+/// One pyramid level's camera points with their normals (mm, camera axes), row-major; `None` = no depth or no
+/// normal.
+struct Level {
+    points: Vec<Option<(Vec3, Vec3)>>,
+}
+
+impl Level {
+    /// Level `l` of the pyramid: `d` is its depth (mm) at `w` x `h`, its intrinsics `intr` scaled by 2^-l (a level
+    /// pixel's centre is its 2^l block's centre, so probe_core's pixel-centre deproject holds at every level).
+    fn new(d: &[f64], w: u32, h: u32, intr: &Intrinsics, l: usize) -> Level {
+        let k = (1u32 << l) as f32;
+        let li = Intrinsics { width: w, height: h, ppx: intr.ppx / k, ppy: intr.ppy / k, fx: intr.fx / k, fy: intr.fy / k };
+        let at = |x: u32, y: u32| -> Option<Vec3> {
+            let z = d[y as usize * w as usize + x as usize];
+            if !(z > 0.0) {
+                return None;
+            }
+            let c = li.deproject(x as f32 + 0.5, y as f32 + 0.5, (z / 1000.0) as f32)?;
+            Some(Vec3::new(c[0] as f64 * 1000.0, c[1] as f64 * 1000.0, z))
+        };
+        let mut points = vec![None; w as usize * h as usize];
+        for y in 1..h.saturating_sub(1) {
+            for x in 1..w.saturating_sub(1) {
+                let (Some(p), Some(pl), Some(pr), Some(pu), Some(pd)) =
+                    (at(x, y), at(x - 1, y), at(x + 1, y), at(x, y - 1), at(x, y + 1))
+                else {
+                    continue;
+                };
+                let Some(n) = unit((pr - pl).cross(pd - pu)) else { continue };
+                let n = if n.dot(p) > 0.0 { -n } else { n };
+                points[y as usize * w as usize + x as usize] = Some((p, n));
+            }
+        }
+        Level { points }
+    }
+}
+
+/// The bilateral filter of a depth map (mm, 0 = hole): each valid pixel becomes the mean of the valid pixels of its
+/// 5x5 window weighted by `exp(-r²/2σs² - Δz²/2σr²)`; holes stay holes.
+fn bilateral(d: &[f64], w: u32, h: u32) -> Vec<f64> {
+    let mut out = vec![0.0f64; d.len()];
+    let (ks, kr) = (0.5 / (BILATERAL_SIGMA_S * BILATERAL_SIGMA_S), 0.5 / (BILATERAL_SIGMA_R * BILATERAL_SIGMA_R));
+    let (wi, hi) = (w as i32, h as i32);
+    for y in 0..hi {
+        for x in 0..wi {
+            let c = d[(y * wi + x) as usize];
+            if !(c > 0.0) {
+                continue;
+            }
+            let (mut sw, mut sd) = (0.0f64, 0.0f64);
+            for dy in -BILATERAL_R..=BILATERAL_R {
+                for dx in -BILATERAL_R..=BILATERAL_R {
+                    let (xx, yy) = (x + dx, y + dy);
+                    if xx < 0 || yy < 0 || xx >= wi || yy >= hi {
+                        continue;
+                    }
+                    let v = d[(yy * wi + xx) as usize];
+                    if !(v > 0.0) {
+                        continue;
+                    }
+                    let wt = libm::exp(-((dx * dx + dy * dy) as f64) * ks - (v - c) * (v - c) * kr);
+                    sw += wt;
+                    sd += wt * v;
+                }
+            }
+            out[(y * wi + x) as usize] = sd / sw;
+        }
+    }
+    out
+}
+
+/// KinFu's pyrDown: half the size, each pixel the mean of its 2x2 block's valid depths within 3·σr of the block's
+/// first pixel (a depth discontinuity is not averaged across); a hole there is a hole.
+fn pyr_down(d: &[f64], w: u32, h: u32) -> (Vec<f64>, u32, u32) {
+    let (lw, lh) = (w / 2, h / 2);
+    let mut out = vec![0.0f64; lw as usize * lh as usize];
+    let guard = 3.0 * BILATERAL_SIGMA_R;
+    for y in 0..lh {
+        for x in 0..lw {
+            let at = |i: u32, j: u32| d[(2 * y + j) as usize * w as usize + (2 * x + i) as usize];
+            let c = at(0, 0);
+            if !(c > 0.0) {
+                continue;
+            }
+            let (mut n, mut sum) = (0.0f64, 0.0f64);
+            for (i, j) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                let v = at(i, j);
+                if v > 0.0 && (v - c).abs() <= guard {
+                    n += 1.0;
+                    sum += v;
+                }
+            }
+            out[y as usize * lw as usize + x as usize] = sum / n;
+        }
+    }
+    (out, lw, lh)
 }
 
 /// A rigid pose's frame: its axes (columns) and origin, read through `apply_vector`, so its inverse is applied

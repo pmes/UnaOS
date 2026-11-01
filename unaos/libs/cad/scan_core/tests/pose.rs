@@ -67,7 +67,7 @@ fn tracked_orbit_meets_the_truth_and_the_fits() {
     let mut tr = Tracker::new(&t, TOL);
     let p0 = truth(0);
     let frames = 31;
-    let (mut max_t, mut max_deg) = (0.0f64, 0.0f64);
+    let (mut max_t, mut max_deg, mut fine_iters) = (0.0f64, 0.0f64, 0u32);
     for k in 0..frames {
         let f = render(k, Noise::D435I);
         let (e, _) =
@@ -76,6 +76,7 @@ fn tracked_orbit_meets_the_truth_and_the_fits() {
         assert!(dt <= 2.0 && dd <= 0.5, "frame {k}: {dt:.3} mm {dd:.3} deg ({:?})", tr.last());
         max_t = max_t.max(dt);
         max_deg = max_deg.max(dd);
+        fine_iters = fine_iters.max(tr.last().map_or(0, |l| l.level_iterations[2]));
     }
 
     // The mesh fused from the TRACKED poses, carried by P_0 into the scene's coordinates.
@@ -114,8 +115,8 @@ fn tracked_orbit_meets_the_truth_and_the_fits() {
     assert!(axis_off < 4.0, "cylinder axis {axis_off} mm off");
 
     println!(
-        "pose: frames={} max_t_mm={:.3} max_deg={:.3} plane rms={:.3} normal_deg={:.3} off_mm={:.3} cyl r={:.3} axis_deg={:.3} axis_mm={:.3}",
-        frames, max_t, max_deg, fp.rms_mm, normal_deg, off, fc.shape.radius, axis_deg, axis_off
+        "pose: frames={} max_t_mm={:.3} max_deg={:.3} fine_iters_max={} plane rms={:.3} normal_deg={:.3} off_mm={:.3} cyl r={:.3} axis_deg={:.3} axis_mm={:.3}",
+        frames, max_t, max_deg, fine_iters, fp.rms_mm, normal_deg, off, fc.shape.radius, axis_deg, axis_off
     );
 }
 
