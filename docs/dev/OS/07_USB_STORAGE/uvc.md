@@ -482,6 +482,27 @@ that failed (`selftest=FAIL` / `stream_selftest=FAIL`, the first failing field o
 `tests sonde`'s `frames_2s>0` (the row's last item) is REALSENSE's fixture and reads this stream
 only once the seat folds the two branches.
 
+SONDE-RECORD (LEDGER SR472): `tests sonde` keeps its one frame in memory (`/dev/probe/depth0`), so no real frame left
+the machine. `UNAOS_SONDE_RECORD=<n>` (kernel feature `sonderec`, implies `sonde`; the count is the knob's value,
+clamped 1..=30, else 12) adds `tests sonderec` (kernel `sonde.rs` tail): n consecutive Z16 frames of the armed depth
+stream, each as `probe_core::wire::encode`'s 80-byte PRB1 header + the frame bytes, back to back (the recording
+`tools/scan` reads, VUGSCANTOOL SR471), captured into one buffer reserved up front and written ONCE through
+`MountTable::put_file` as `/probe-<n>.prb` on the boot volume, `<n>` the card's next free sequence (bootwit's boot
+number is UnaFS-only). Each record carries the depth units and, when the census read the camera's coefficients table
+(`GETINTCAL(25)`, `uvc::hwmon::intcal` beside the depth-units read; the table, CRC and `rect_params` layout cited to
+librealsense v2.55.1 in `drivers/realsense_xu.rs`), the depth stream's rectified fx, fy, ppx, ppy; a row with no
+calibration, an EP0 under 1 KiB (EHCI) or a failed exchange leaves them out (`[sonde] intcal=` names the stage) and the
+line says `intr=none`. It is its own verb because the rMBP card's only measured write rate (rmbp A2, ~220 KB/s) puts
+12 frames (9.77 MB) at about 44 s. The wire: `[sonde] rec captured=<n> bytes=<b> seq=<a>..<b> capture_ms=<t> writing
+path=/probe-<n>.prb`, then `:: SONDEREC: frames=<n> bytes=<b> path=<p> write_ms=<t> want=<n> w=848 h=480 seq=<a>..<b>
+kbps=<k> depth_scale=<m>(device|default) intr=<fx>,<fy>,<ppx>,<ppy>|none -> PASS ::`; `-> SKIP(no-device)` on QEMU;
+`-> FAIL reason=<name>` otherwise (`intcal-fixture(<field>)`, the three armed-stream reasons, `heap`,
+`frame-timeout(at=k)`, `frame-size(...)`, `frame-geometry`, `wire-encode`, `no-root-volume`, `root-read-only(<veto>)`,
+`names-exhausted`, `write(<err>)`, `short-write(<size>/<want>)`). First metal: `UNAOS_SONDE=1 UNAOS_SONDE_RECORD=12
+./arroyo esp-x86`, the camera on a USB 3 port, `tests sonderec`, then the .prb on the card for `tools/scan`. Owed:
+VUG-PROBE, VUG-SCAN-TOOL, SONDE-RECORD-TURNTABLE, SONDE-RECORD-IMU, SONDE-RECORD-INTRINSICS (the non-enum resolution
+scaling), SONDE-RECORD-ONEENC, SONDE-RECORD-STREAM.
+
 ## 12. UVCCAM (rmbp-ledger B686, R130) — the picture: frames to a window
 
 R130's second law (no paternalism): Peter's Sony mirrorless shows live view on no Apple machine. The class
