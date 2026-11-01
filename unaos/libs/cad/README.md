@@ -11,3 +11,4 @@ invariants: `docs/dev/blueprint/vug.md` (f64 geometry, one `Tol`, pure cores, th
 | `mesh_core` | the triangle mesh, half-edge adjacency, normals, BVH pick, manifold check, weld, STL/OBJ/PLY | SR466 |
 | `make_core` | Machine, Tool, Stock, fixtures, Op, the `Program` IR, G-code dialects, `review` for Helm | SR467 |
 | `brep_core`, `scan_core` | owed (VUG-BREP, VUG-SCAN in the sheet) | — |
+| `scan_core` | TSDF fusion of probe_core depth frames, marching cubes with per-vertex confidence, plane / cylinder RANSAC with residuals, the synthetic depth fixture | SR469 |

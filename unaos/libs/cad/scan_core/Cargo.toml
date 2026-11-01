@@ -1,0 +1,20 @@
+[package]
+name = "scan_core"
+version = "0.1.0"
+edition = "2024"
+license = "LGPL-3.0-or-later"
+description = "Vug's scan core: probe_core depth frames with given poses fused into a block-sparse TSDF, marching cubes into a mesh with per-vertex confidence, plane / cylinder RANSAC with residuals, and the synthetic depth fixture — shared by Ring 0 and Ring 3."
+
+# VUGSCAN1 (LEDGER SR469): `#![no_std]` + `alloc`, `#![forbid(unsafe_code)]`, the midden_core / timeline_core shape: a shared
+# core under `unaos/libs/cad/`, a member of the ROOT host workspace, linkable by path with `default-features = false`.
+# probe_core gives the frames and the ONE pinhole model (`Intrinsics::project` / `deproject`, `metres_at`); libm the
+# sqrt / log / trig no_std lacks. geom_core (SR464) and mesh_core (SR466) were not on their branches at build time:
+# src/geom.rs and src/mesh.rs are SHIMs the seat swaps for `pub use` re-exports, adding their two path deps here.
+[dependencies]
+probe_core = { path = "../../media/probe_core" }
+libm = { version = "0.2", default-features = false }
+
+[features]
+default = ["std"]
+# The seam only: nothing in `src/` is std-gated (midden_core's spelling, so a kernel `default-features = false` is honest).
+std = []
