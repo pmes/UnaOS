@@ -5376,6 +5376,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "vug-view"
+version = "0.1.0"
+dependencies = [
+ "bandy",
+ "euclase",
+ "gneiss_pal",
+ "log",
+ "mesh_core",
+ "palette_core",
+ "pixel_core",
+ "quartzite",
+ "tokio",
+]
+
+[[package]]
 name = "walkdir"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
