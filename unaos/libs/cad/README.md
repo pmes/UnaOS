@@ -9,5 +9,5 @@ invariants: `docs/dev/blueprint/vug.md` (f64 geometry, one `Tol`, pure cores, th
 | `geom_core` | f64 vectors, matrices, transforms, `Tol`, AABB, exact orientation predicates, closed-form intersections | SR464 |
 | `sketch_core` | 2D entities, constraints, the solver, DOF/redundancy, the drag solve, profiles | SR465 |
 | `mesh_core` | the triangle mesh, half-edge adjacency, normals, BVH pick, manifold check, weld, STL/OBJ/PLY | SR466 |
-| `make_core` | Machine, Tool, Stock, fixtures, Op, the `Program` IR, G-code dialects, `review` for Helm | SR467 |
+| `make_core` | Machine, Tool, Stock, fixtures, Op, the `Program` IR, G-code dialects, `review` for Helm — built: the planner (kinematic pass, refusals by name, grbl / Marlin / LinuxCNC), geom shim until SR464 folds | SR467 |
 | `brep_core`, `scan_core` | owed (VUG-BREP, VUG-SCAN in the sheet) | — |
