@@ -52,7 +52,9 @@ pub(crate) fn pieces(a: f64, b: f64, max_piece: f64) -> impl Iterator<Item = (f6
     (0..n).map(move |k| (a + step * k as f64, if k + 1 == n { b } else { a + step * (k + 1) as f64 }))
 }
 
-/// 16-point Gauss-Legendre of `f` over [a, b] split into pieces of at most `max_piece`.
+/// 16-point Gauss-Legendre of `f` over [a, b] split into pieces of at most `max_piece` (the unit tests' witness of the
+/// tables; mass.rs walks the nodes itself).
+#[cfg(test)]
 pub(crate) fn integrate(a: f64, b: f64, max_piece: f64, mut f: impl FnMut(f64) -> f64) -> f64 {
     let mut s = 0.0;
     for (p, q) in pieces(a, b, max_piece) {

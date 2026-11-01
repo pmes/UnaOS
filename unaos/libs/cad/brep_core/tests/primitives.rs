@@ -5,7 +5,7 @@ mod common;
 use brep_core::dep::Tol;
 use brep_core::primitives::{box_, cone, cylinder, sphere, torus};
 use brep_core::{Brep, Entity, Report, properties, tessellate, validate};
-use common::{close, manifold_chi, max_deviation, mesh_volume, rel};
+use common::{close, manifold_chi, max_deviation, mesh_volume};
 use std::f64::consts::PI;
 
 const T: Tol = Tol::DEFAULT;
@@ -27,8 +27,10 @@ fn mesh_checks(b: &Brep, chord: f64, chi: i64, volume: f64) {
     assert_eq!(manifold_chi(&t.mesh).expect("manifold"), chi);
     let dev = max_deviation(b, &t);
     assert!(dev <= chord, "deviation {dev} > chord {chord}");
+    // Every mesh point lies within `chord` of the surface, so the volumes differ by at most chord x area.
     let mv = mesh_volume(&t.mesh);
-    assert!(mv > 0.0 && rel(mv, volume) < 0.02, "mesh volume {mv} vs {volume}");
+    let area = brep_core::area(b).unwrap();
+    assert!(mv > 0.0 && (mv - volume).abs() <= chord * area, "mesh volume {mv} vs {volume}");
 }
 
 #[test]

@@ -37,9 +37,15 @@ impl Ctx {
         if p1 == q1 || p1 == q2 || p2 == q1 || p2 == q2 {
             return false;
         }
-        let (Some(d1), Some(d2), Some(d3), Some(d4)) =
-            (self.o(q1, q2, p1), self.o(q1, q2, p2), self.o(p1, p2, q1), self.o(p1, p2, q2))
-        else {
+        let (d1, d2, d3, d4) = (self.o(q1, q2, p1), self.o(q1, q2, p2), self.o(p1, p2, q1), self.o(p1, p2, q2));
+        // Both ends of one segment strictly on one side of the other: no crossing, whatever the rest says.
+        let one_side = |x: Option<Predicate>, y: Option<Predicate>| {
+            x == y && matches!(x, Some(Predicate::Positive) | Some(Predicate::Negative))
+        };
+        if one_side(d1, d2) || one_side(d3, d4) {
+            return false;
+        }
+        let (Some(d1), Some(d2), Some(d3), Some(d4)) = (d1, d2, d3, d4) else {
             return true;
         };
         if d1 == Predicate::Zero || d2 == Predicate::Zero || d3 == Predicate::Zero || d4 == Predicate::Zero {
@@ -147,8 +153,12 @@ pub(crate) fn earcut(outer: &[Node], holes: &[Vec<Node>]) -> Result<Vec<[u32; 3]
                 if k == i || k == ip || k == inx || p.1 == a.1 || p.1 == b.1 || p.1 == c.1 {
                     continue;
                 }
-                let (Some(s1), Some(s2), Some(s3)) = (ctx.o(a.1, b.1, p.1), ctx.o(b.1, c.1, p.1), ctx.o(c.1, a.1, p.1))
-                else {
+                let s = [ctx.o(a.1, b.1, p.1), ctx.o(b.1, c.1, p.1), ctx.o(c.1, a.1, p.1)];
+                // One decided Negative puts p outside the triangle, whatever the others say.
+                if s.contains(&Some(Predicate::Negative)) {
+                    continue;
+                }
+                let (Some(s1), Some(s2), Some(s3)) = (s[0], s[1], s[2]) else {
                     ok = false;
                     break;
                 };
