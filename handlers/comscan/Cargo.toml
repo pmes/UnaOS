@@ -6,7 +6,10 @@ license = "LGPL-3.0-or-later"
 
 [dependencies]
 bandy = { path = "../../libs/bandy" }
-tokio = { version = "1.53", features = ["sync", "rt", "macros"] }
+tokio = { version = "1.53", features = ["sync", "rt", "macros", "time"] }
+# VUGCOMSCAN1 (SR476): the pump core and make_core's Program / Dialect (helm by path when VUGHELM SR475 folds: src/pump.rs helm_shim)
+pump_core = { path = "../../unaos/libs/cad/pump_core" }
+make_core = { path = "../../unaos/libs/cad/make_core" }
 
 [dev-dependencies]
 tokio = { version = "1.53", features = ["sync", "rt", "rt-multi-thread", "macros", "time"] }
