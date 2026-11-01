@@ -58,6 +58,7 @@ members = [
     "unaos/libs/cad/make_core", # VUGMAKE (SR467): Vug's no_std Make core (machine model, Ops, the Program IR + kinematic pass, grbl / Marlin / LinuxCNC dialects, the review Helm reads); its one dep libm (geom_core by path when VUGGEOM folds)
     "unaos/libs/cad/geom_core", # VUGGEOM (SR464): Vug's no_std f64 geometry core (Tol, vectors/matrices/transforms, AABB, exact predicates, closed-form intersections), the timeline_core shape
     "unaos/libs/cad/scan_core", # VUGSCAN1 (SR469): the no_std scan core (TSDF fusion of probe_core depth frames, marching cubes with per-vertex confidence, plane / cylinder RANSAC with residuals, the synthetic depth fixture); deps probe_core + libm (geom_core + mesh_core shimmed until folded)
+    "unaos/libs/cad/pump_core", # VUGCOMSCAN1 (SR476): Comscan's no_std pump (grbl 1.1 character counting, Marlin send-response, realtime bytes out of band, the status report and error / alarm tables, MockGrbl under std); its one dep make_core
     "unaos/libs/cad/brep_core", # VUGBREP1 (SR468): Vug's no_std B-rep core (topology + Ids, analytic surfaces, validate, primitives, extrude / revolve, mass, chord-bounded tessellation into mesh_core)
     # SVGCORE (SR52): the no_std SVG renderer (XML, paths, painting, text via font_core) behind pixel_core's `svg` format.
     "unaos/libs/media/svg_core",

@@ -5,7 +5,7 @@
 //! navigation invariants (orbit about the cursor, zoom to the cursor), the preset rules, the pick, the file open
 //! through mesh_core's readers, and the 100k-triangle frame time.
 
-use bandy::{SMessage, MOD_ALT, MOD_SHIFT};
+use bandy::{SMessage, BUTTON_MIDDLE, BUTTON_RIGHT, MOD_ALT, MOD_SHIFT};
 use mesh_core::{stl, Mesh, Tol, Vec3 as MVec3};
 use vug_view::model::Model;
 use vug_view::raster::{self, rgba, ACCENT, BACKGROUND};
@@ -206,6 +206,49 @@ fn viewer_takes_the_surface_wire() {
         }
         _ => panic!("frame() is a SurfaceBlit"),
     }
+}
+
+/// VUG-FACE-BUTTONS (LEDGER SR477): the real right and middle buttons and the pinch, through the public entry only.
+#[test]
+fn viewer_takes_the_real_buttons() {
+    let aux = |button: u8, down: bool, x: f64, y: f64| SMessage::BrowserAuxButton { button, down, x, y, mods: 0, surface: 0 };
+    let (x, y) = (100.0, 50.0);
+    // Onshape orbits on the right button (SolidWorks on the middle): the pressed model point stays under the cursor.
+    for (preset, button) in [(Preset::Onshape, BUTTON_RIGHT), (Preset::SolidWorks, BUTTON_MIDDLE)] {
+        let mut vw = Viewer::new(cube_model(), "cube", (W, H), preset);
+        assert!(vw.input(&SMessage::BrowserText("1".into())));
+        let (pivot, _) = vw.view.hit(&vw.model, x, y).expect("the press hits the cube");
+        let before = vw.view.camera;
+        vw.input(&aux(button, true, x, y));
+        assert!(vw.input(&SMessage::BrowserMouseMove(130.0, 70.0, 0)), "{}: the drag moves the frame", preset.name());
+        assert!(vw.input(&SMessage::BrowserMouseMove(60.0, 90.0, 0)));
+        vw.input(&aux(button, false, 60.0, 90.0));
+        assert_ne!(vw.view.camera, before, "{}: the camera orbited", preset.name());
+        let (sx, sy) = vw.view.project(pivot).expect("in front");
+        assert!((sx - x as f32).abs() < 0.5 && (sy - y as f32).abs() < 0.5, "{}: pivot at ({sx}, {sy})", preset.name());
+    }
+    // The una preset keeps the right button for the menu: a right drag leaves the camera; an extra button does nothing.
+    let mut vw = Viewer::new(cube_model(), "cube", (W, H), Preset::Una);
+    assert!(vw.input(&SMessage::BrowserText("1".into())));
+    let before = vw.view.camera;
+    vw.input(&aux(BUTTON_RIGHT, true, x, y));
+    assert!(!vw.input(&SMessage::BrowserMouseMove(140.0, 80.0, 0)));
+    vw.input(&aux(BUTTON_RIGHT, false, 140.0, 80.0));
+    assert!(!vw.input(&aux(4, true, x, y)));
+    assert!(!vw.input(&SMessage::BrowserMouseMove(20.0, 20.0, 0)));
+    assert!(!vw.input(&aux(4, false, 20.0, 20.0)));
+    // A wheel tilt (dx only) zooms nothing.
+    assert!(!vw.input(&SMessage::BrowserScroll(5.0, 0.0, 0)));
+    assert_eq!(vw.view.camera, before);
+    // The pinch zooms in toward the model point under the fingers and keeps it there.
+    let (p, _) = vw.view.hit(&vw.model, x, y).expect("hit");
+    let d0 = (p - vw.view.camera.eye).magnitude();
+    assert!(vw.input(&SMessage::BrowserPinch { scale: 1.25, x, y, surface: 0 }));
+    let d1 = (p - vw.view.camera.eye).magnitude();
+    assert!(d1 < d0, "a spread pinch zooms in ({d0} -> {d1})");
+    let (sx, sy) = vw.view.project(p).expect("in front");
+    assert!((sx - x as f32).abs() < 0.5 && (sy - y as f32).abs() < 0.5, "pinch ({sx}, {sy})");
+    assert!(!vw.input(&SMessage::BrowserPinch { scale: 1.0, x, y, surface: 0 }), "a still pinch changes nothing");
 }
 
 #[test]
