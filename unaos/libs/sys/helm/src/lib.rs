@@ -27,6 +27,7 @@
 //! "retract and stop the spindle" — so control lives in **per-machine domain
 //! modules**, one machine class each. [`rover`] is the first: TALUS's
 //! receiver→actuator safety state machine.
+//! [`machine`] is the second: the gate a make_core program passes before any machine moves (CODEX §5).
 //!
 //! # `no_std`
 //!
@@ -37,4 +38,5 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 #![forbid(unsafe_code)]
 
+pub mod machine;
 pub mod rover;

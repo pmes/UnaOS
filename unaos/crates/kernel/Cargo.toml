@@ -3767,6 +3767,14 @@ uac = ["uvc"]
 # `uvc::probe`, so a D400 on xHCI (every board's USB-A ports) is recorded too. FIVE places (LAWS §4): this line, `unaos/arroyo`'s `_feats`,
 # `unaos/builder/src/main.rs`, `scripts/banner-cert.sh`, `scripts/k8-reach.registry`.
 sonde = ["uvc", "dep:probe_core"] # SONDE2 (LEDGER SR105): + probe_core — the census's stream classification, the Z16 statistics and the `/dev/probe/depth0` record are the shared core's; a `dep:` so a knob-off image carries none of it
+# SONDERECORD (LEDGER SR472): UNAOS_SONDE_RECORD=<n> arms `tests sonderec` (kernel sonde.rs tail): n consecutive Z16 depth
+# frames of the armed D435i stream as probe_core PRB1 records back to back, written ONCE through the VFS's whole-file writer
+# as `/probe-<n>.prb` on the boot volume (tools/scan reads it), plus the camera's GETINTCAL coefficients table (drivers/uvc.rs
+# `hwmon::intcal`, drivers/realsense_xu.rs) so each record carries the rectified intrinsics. The count is the knob's value,
+# read with option_env! inside the gated items (decimal, clamped 1..=30, else 12). Implies sonde; both arches. DEFAULT OFF =>
+# every item is cfg-erased and a sonde image is byte-identical. Kept in sync with `unaos/arroyo` (knob map, K8_FEATS arm, the
+# x86-image / arm-pi-image rows), `unaos/builder/src/main.rs` and scripts/banner-cert.sh (the K8 arm answers k8-reach).
+sonderec = ["sonde"]
 # IOAPIC (rmbp-ledger B147): `UNAOS_IOAPIC=1` arms `arch/x86_64/ioapic.rs` — the Intel 82093AA
 # I/O APIC redirection table, which this kernel has never had. Until this feature, `apic.rs` drove
 # the LOCAL APIC only and `drivers/pci.rs` could enable MSI/MSI-X, so a PCI function offering no

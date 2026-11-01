@@ -14,8 +14,13 @@
 //! the head on the other, so the segments chain into loops; each loop is fanned into triangles whose normals point
 //! out of the inside (toward positive distance). `edge_mask` is Bourke's edgeTable, computed; its first sixteen
 //! published entries are pinned by a test.
+//!
+//! The rim (VUGSCANRIM, SR474): a cube with an unobserved corner is not marched, so around one voxel edge only a
+//! diagonal pair of the four cubes can be marched; their two sectors would meet at the edge's one vertex with no shared
+//! edge (a bowtie). [`rim_sheet`] gives each cube of such a pair its own copy of that vertex, and the rim is named as
+//! boundary loops.
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 
 use crate::geom::Vec3;
@@ -126,6 +131,8 @@ fn add(a: Key, d: [i32; 3]) -> Key {
 
 /// March the cubes whose origins `origins` yields, over the sample field `sample` (`(sdf, weight)` of voxel `g`;
 /// `None` or weight 0 = unobserved, and a cube with such a corner is skipped). Voxel `g` sits at `g · voxel_mm`.
+/// Two passes: the marched cubes are collected first, so an edge vertex shared by a diagonal pair only is split
+/// ([`rim_sheet`]).
 pub fn march_cells<F>(origins: impl Iterator<Item = Key>, sample: F, voxel_mm: f64) -> Surface
 where
     F: Fn(Key) -> Option<(f32, f32)>,
@@ -152,7 +159,10 @@ where
         Vec3::new(out[0], out[1], out[2])
     };
     let mut s = Surface::default();
-    let mut verts: BTreeMap<(i32, i32, i32, u8), u32> = BTreeMap::new();
+    let mut verts: BTreeMap<(i32, i32, i32, u8, u8), u32> = BTreeMap::new();
+    // VUGSCANRIM pass 1: every marchable cube (all eight corners observed, a crossing), and the set of their origins.
+    let mut cells: Vec<(Key, [f32; 8], [f32; 8], u8)> = Vec::new();
+    let mut marched: BTreeSet<Key> = BTreeSet::new();
     for o in origins {
         let mut sd = [0f32; 8];
         let mut wt = [0f32; 8];
@@ -181,6 +191,11 @@ where
         if case == 0 || case == 255 {
             continue;
         }
+        cells.push((o, sd, wt, case));
+        marched.insert(o);
+    }
+    // VUGSCANRIM pass 2: the triangles, one vertex per voxel edge and rim sheet.
+    for (o, sd, wt, case) in cells {
         for tri in table.tris(case) {
             let mut idx = [0u32; 3];
             for (k, e) in tri.iter().enumerate() {
@@ -188,7 +203,7 @@ where
                 let (ga, gb) = (add(o, CORNER[a]), add(o, CORNER[b]));
                 let lo = if ga <= gb { ga } else { gb };
                 let axis = if ga.0 != gb.0 { 0 } else if ga.1 != gb.1 { 1 } else { 2 };
-                let key = (lo.0, lo.1, lo.2, axis);
+                let key = (lo.0, lo.1, lo.2, axis, rim_sheet(&marched, lo, axis, o));
                 idx[k] = match verts.get(&key) {
                     Some(v) => *v,
                     None => {
@@ -218,6 +233,30 @@ pub fn march_tsdf(t: &Tsdf) -> Surface {
         }
     });
     march_cells(origins.into_iter(), |g| t.voxel(g).map(|v| (v.sdf, v.weight)), t.voxel_mm())
+}
+
+/// VUGSCANRIM (SR474): the sheet of edge `(lo, axis)`'s vertex as seen from marched cube `o`. 0 (one shared vertex)
+/// unless the marched cubes around the edge are exactly a diagonal pair; then 1 + `o`'s quadrant, so each cube of
+/// the pair keeps its own copy (same position, weight and normal) and the vertex is no bowtie.
+fn rim_sheet(marched: &BTreeSet<Key>, lo: Key, axis: u8, o: Key) -> u8 {
+    let (p, q) = match axis {
+        0 => (1, 2),
+        1 => (0, 2),
+        _ => (0, 1),
+    };
+    let at = |a: i32, b: i32| {
+        let mut d = [0i32; 3];
+        d[p] = a;
+        d[q] = b;
+        marched.contains(&add(lo, d))
+    };
+    let (c00, c10, c11, c01) = (at(0, 0), at(-1, 0), at(-1, -1), at(0, -1));
+    let diagonal = (c00 && c11 && !c10 && !c01) || (c10 && c01 && !c00 && !c11);
+    if !diagonal {
+        return 0;
+    }
+    let (lo3, o3) = ([lo.0, lo.1, lo.2], [o.0, o.1, o.2]);
+    1 + (lo3[p] - o3[p]) as u8 + 2 * (lo3[q] - o3[q]) as u8
 }
 
 #[cfg(test)]

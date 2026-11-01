@@ -71,6 +71,8 @@ fn one_prb_frame_meshes_and_fits_its_plane() {
     assert_eq!(mesh.positions.len(), verts);
     let rms: f64 = field(&report, "plane:", "rms_mm").parse().unwrap();
     assert!(rms <= 2.0, "plane rms {rms}");
+    let loops: usize = field(&report, "boundary_loops=", "boundary_loops").parse().expect("rim named as loops (VUGSCANRIM SR474)");
+    assert!(loops >= 1, "an open scan has a rim");
     assert!(report.lines().any(|l| l.starts_with("scan: frames=1 ")));
 }
 

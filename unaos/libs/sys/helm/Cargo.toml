@@ -6,12 +6,14 @@ license = "LGPL-3.0-or-later"
 description = "Kernel helm core: the hard control interlock (DISARM/MANUAL/AUTO + FAILSAFE), per-machine domains."
 
 # The core is `#![no_std]`, `#![forbid(unsafe_code)]`, and depends only on our
-# own `ibus` crate (a workspace path dep — no crates.io dependencies). The
+# own `ibus` and `make_core` crates (workspace path deps; make_core with
+# `default-features = false`, for `machine`'s gate over its Review). The
 # default-on `std` feature adds the `rover::sim` simulation harness (FakeClock +
 # MockSink) used by the invariant tests; the kernel embeds the crate with
 # `default-features = false`.
 [dependencies]
 ibus = { path = "../../../../libs/input/ibus" }
+make_core = { path = "../../cad/make_core", default-features = false }
 
 [features]
 default = ["std"]
