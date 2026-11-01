@@ -197,3 +197,88 @@ pub fn hwmon_reply_depth_units(reply: &[u8]) -> Option<u32> {
 /// The D400 depth scale when the depth table is not read: 1000 µm = 0.001 m
 /// (`src/ds/d400/d400-device.cpp:910-917`).
 pub const DEPTH_UNITS_DEFAULT_UM: u32 = 1000;
+
+// ── SONDE-RECORD (LEDGER SR472): the coefficients table (GETINTCAL) — the depth stream's rectified intrinsics ──────
+//
+// APPENDED at the file tail and `#[cfg(feature = "sonderec")]`-erased item by item (sonderec implies sonde, this
+// file's own gate): no line above moves and a sonde image without sonderec carries this file exactly as before.
+// Hardware facts and their readers only (R110), librealsense v2.55.1, file:line:
+// - the request: `command cmd(ds::GETINTCAL, static_cast<int>(table_id))` (`src/ds/d400/d400-device.cpp:416`),
+//   `coefficients_table_id = 25` (`src/ds/d400/d400-private.h:183`); the reply is `hwmon_reply`'s data bytes.
+// - the table: `d400_coefficients_table` (`d400-private.h:219-231`) = `table_header` (`src/ds/ds-private.h:259-266`,
+//   16 bytes: version u16 big-endian, table_type u16, table_size u32, param u32, crc32 u32), four `float3x3` (36 bytes
+//   each, rsutils `number/float3.h:35-59`), `baseline` f32, `brown_model` u32, `reserved1[88]` — so `rect_params`
+//   (`float4` = fx, fy, ppx, ppy as f32, `float3.h:47-49`) starts at byte 256, one per `ds_rect_resolutions`
+//   (`ds-private.h:268-286`, 16 entries), then `reserved2[64]`: 576 bytes.
+// - the check: `check_calib` (`ds-private.h:302-325`) refuses a table whose header crc32 differs from the CRC-32 of
+//   every byte after the 16-byte header (rsutils `src/crc32.cpp` `calc_crc32`: poly 0xEDB88320, init and final
+//   inverted — CRC-32/ISO-HDLC, the kernel's `crate::hash::crc32`).
+// - the intrinsics: `get_d400_intrinsic_by_resolution_coefficients_table` (`src/ds/d400/d400-private.cpp:148-175`):
+//   fx, fy, ppx, ppy = `rect_params[resolution]` as stored; when x == y and z == w (:163-169) the table holds no
+//   calibration for it (DS5U) and librealsense substitutes the ideal — `rect_is_ideal` names that case so a caller
+//   says "none" instead of writing the ideal as if measured.
+
+/// `d400-private.h:183` — `coefficients_table_id = 25`, GETINTCAL's param1.
+#[cfg(feature = "sonderec")]
+pub const COEFFICIENTS_TABLE_ID: u32 = 25;
+/// `sizeof(table_header)` (`ds-private.h:259-266`): 2 + 2 + 4 + 4 + 4.
+#[cfg(feature = "sonderec")]
+pub const CALIB_HEADER_LEN: usize = 16;
+/// The header's `crc32` field: the last u32 of the 16-byte header.
+#[cfg(feature = "sonderec")]
+pub const CALIB_CRC_OFFSET: usize = 12;
+/// `rect_params`' offset in the table: 16 (header) + 4 x 36 (float3x3) + 4 (baseline) + 4 (brown_model) + 88.
+#[cfg(feature = "sonderec")]
+pub const RECT_PARAMS_OFFSET: usize = 256;
+/// The table's full length: `RECT_PARAMS_OFFSET` + 16 x 16 (`rect_params`) + 64 (`reserved2`).
+#[cfg(feature = "sonderec")]
+pub const COEFFICIENTS_TABLE_LEN: usize = 576;
+/// `enum ds_rect_resolutions` (`ds-private.h:268-286`) in order, width x height; `reserved_1` / `reserved_2` are (0, 0).
+#[cfg(feature = "sonderec")]
+pub const RECT_RESOLUTIONS: [(u16, u16); 16] = [
+    (1920, 1080), (1280, 720), (640, 480), (848, 480), (640, 360), (424, 240), (320, 240), (480, 270),
+    (1280, 800), (960, 540), (0, 0), (0, 0), (640, 400), (576, 576), (720, 720), (1152, 1152),
+];
+
+/// The command that reads the coefficients table: `GETINTCAL(coefficients_table_id)` (`d400-device.cpp:416`).
+#[cfg(feature = "sonderec")]
+pub fn hwmon_build_intcal(out: &mut [u8]) -> usize {
+    hwmon_build(OP_GETINTCAL, [COEFFICIENTS_TABLE_ID, 0, 0, 0], out)
+}
+
+/// The `ds_rect_resolutions` index of a `w` x `h` stream, or `None` when the enum has no such row (librealsense then
+/// scales the 1920x1080 row, `d400-private.cpp:186-215` — not done here).
+#[cfg(feature = "sonderec")]
+pub fn rect_index(w: u16, h: u16) -> Option<usize> {
+    if w == 0 || h == 0 {
+        return None;
+    }
+    RECT_RESOLUTIONS.iter().position(|&(rw, rh)| rw == w && rh == h)
+}
+
+/// Every `rect_params` row (fx, fy, ppx, ppy) of a coefficients table — `table` is the reply's data bytes (from the
+/// header on). Refused by name: `short-table` (fewer bytes than the rows need), `crc` (`check_calib`'s refusal).
+#[cfg(feature = "sonderec")]
+pub fn coefficients_rects(table: &[u8]) -> Result<[[f32; 4]; 16], &'static str> {
+    if table.len() < RECT_PARAMS_OFFSET + 16 * 16 {
+        return Err("short-table");
+    }
+    let le32 = |o: usize| u32::from_le_bytes([table[o], table[o + 1], table[o + 2], table[o + 3]]);
+    if le32(CALIB_CRC_OFFSET) != crate::hash::crc32(&table[CALIB_HEADER_LEN..]) {
+        return Err("crc");
+    }
+    let mut rows = [[0f32; 4]; 16];
+    for (i, row) in rows.iter_mut().enumerate() {
+        for (j, v) in row.iter_mut().enumerate() {
+            *v = f32::from_bits(le32(RECT_PARAMS_OFFSET + i * 16 + j * 4));
+        }
+    }
+    Ok(rows)
+}
+
+/// `d400-private.cpp:163-169`: a row with fx == fy and ppx == ppy carries no calibration (librealsense substitutes
+/// the ideal 1.5 x width focal length and the centre).
+#[cfg(feature = "sonderec")]
+pub fn rect_is_ideal(r: &[f32; 4]) -> bool {
+    r[0] == r[1] && r[2] == r[3]
+}

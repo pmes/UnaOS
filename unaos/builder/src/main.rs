@@ -1089,6 +1089,7 @@ fn main() {
     if std::env::var("UNAOS_MIDDEN").is_ok() { feats.push("midden"); } // MIDDENTWIN (LEDGER SR75): `tests midden` (kernel middenapp.rs). Kept in sync with arroyo.
     if std::env::var("UNAOS_UNA").is_ok() { feats.push("una"); } // UNAMETAL (LEDGER SR90): `tests una` (kernel unaapp.rs). Kept in sync with arroyo.
     if std::env::var("UNAOS_SONDE").is_ok() { feats.push("sonde"); } // REALSENSE (LEDGER SR92): `tests sonde` (kernel sonde.rs; implies uvc in Cargo.toml). Kept in sync with arroyo.
+    if std::env::var("UNAOS_SONDE_RECORD").is_ok() { feats.push("sonderec"); } // SONDERECORD (LEDGER SR472): `tests sonderec` (kernel sonde.rs tail; implies sonde in Cargo.toml; the count is the knob's value, read by option_env! in the kernel, which this process's env carries to cargo). Kept in sync with arroyo.
     // AETHERMETAL (SR66): UNAOS_AETHER=1 arms `tests aether` (APPS/AETHER.ELF validated, spawned, its page report read). Kept in sync with arroyo.
     if std::env::var("UNAOS_AETHER").is_ok() { feats.push("aether"); }
     if std::env::var("UNAOS_STRIA").is_ok() { feats.push("stria"); } // STRIAMETAL (LEDGER SR139): `tests stria` (kernel striaapp.rs: APPS/STRIA.ELF spawned on system/test-f/TEST.WEBM) and STRIA.ELF first for its media types (fs/assoc.rs). Kept in sync with arroyo.

@@ -1335,6 +1335,7 @@ fi
 [ -n "${UNAOS_MIDDEN:-}" ] && _feats="${_feats}midden,"   # MIDDENTWIN (LEDGER SR75): `tests midden` (kernel middenapp.rs: MIDDEN.ELF spawned, `help` + `ls` typed into it, its exit read back). x86. Kept in sync with builder/src/main.rs, banner-cert.sh, k8-reach.registry.
 [ -n "${UNAOS_UNA:-}" ] && _feats="${_feats}una,"   # UNAMETAL (LEDGER SR90): `tests una` (kernel unaapp.rs: UNA.ELF spawned, Ctrl+3 + `help` typed into its console, Ctrl+Q, its exit read back). x86. Kept in sync with builder/src/main.rs, banner-cert.sh, k8-reach.registry.
 [ -n "${UNAOS_SONDE:-}" ] && _feats="${_feats}sonde,"   # REALSENSE (LEDGER SR92, R112): `tests sonde` (kernel sonde.rs: the D435i census fixture, then the boot's D400 record — SKIP(no-device) without the camera) + drivers/uvc.rs `multi` + drivers/realsense_xu.rs; implies uvc. x86. Kept in sync with builder/src/main.rs, banner-cert.sh, k8-reach.registry.
+[ -n "${UNAOS_SONDE_RECORD:-}" ] && _feats="${_feats}sonderec,"   # SONDERECORD (LEDGER SR472): `tests sonderec` (kernel sonde.rs tail: N depth frames of the D435i as PRB1 records to `/probe-<n>.prb` on the boot volume, N = the knob's value, read with option_env! inside the gated items, clamped 1..=30, else 12; + uvc.rs hwmon::intcal, the GETINTCAL intrinsics); implies sonde. Both arches. Kept in sync with builder/src/main.rs, banner-cert.sh and the K8_FEATS arm (k8-reach).
 # AETHERMETAL (SR66): UNAOS_AETHER=1 arms `tests aether` (crate::aether: APPS/AETHER.ELF validated, spawned, its page report read; implies selfdiag for SYS_PATH_READ). x86 (no K8_FEATS arm: scripts/k8-reach.registry NA row). Kept in sync with builder/src/main.rs.
 [ -n "${UNAOS_AETHER:-}" ] && _feats="${_feats}aether,"
 # STRIAMETAL (LEDGER SR139): UNAOS_STRIA=1 arms `tests stria` (crate::striaapp: APPS/STRIA.ELF validated, spawned on system/test-f/TEST.WEBM, its end line read) and STRIA.ELF first for the media types it declares (fs/assoc.rs); implies selfdiag for SYS_PATH_READ. Both arches (the K8_FEATS arm is in kernel8(); esp_jetson builds from this line). Kept in sync with builder/src/main.rs, banner-cert.sh and the three image-line env files.
@@ -8452,8 +8453,8 @@ KERNEL_CFG_MATRIX=(
   # every x86 mix leg. `x86-image` names all ten on a literal x86 leg, so the universe is unchanged
   # (+0 features) and the armed x86 polarity of the set is compiled by construction. Board legs +3.
   "arm-tegra-image ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0,desktop_firmware,livecon,quarry,facet,login,lumen,holocron,selfdiag,midden,una,aether,uvc,sonde,usbnet,stria"
-  "arm-pi-image ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,skip_xhci,bootlog,pi,baremetal,vugpar,smp7,smp7_retry,k2_leave,smp8,core3probe,v3d,v3d_deep,v3d_qpu,v3d_dispdone,v3d69_reenable,v3d79_minimal,v3d81,v3d81_qpu,v3d81_display,v3d_firstkick,piusb,genet,nettest,nsspan,piinstall,piinstall_arm,piinstall_confirm,pirast,desktop_firmware,v3d_unarmclose,quarry,v3d_basedaim,v3d_tsaim,v3d_armedclose,v3d_bincontent,v3d_dispatchdisc,v3d_hfirst,v3d_vpmprobe,fatperf,livecon,holocron,hcronst,deadman,wcg-paygo,prtscrst,facet,v3d_singleseg,login,loginst,lumen,selfdiag,midden,una,aether,uvc,sonde,usbnet,stria"
-  "x86-image ../../x86_64-unaos.json witness,unafs,login,holocron,lumen,selfdiag,midden,una,aether,uvc,sonde,usbnet,stria"   # STRIAMETAL (SR139): + stria on the three image legs (the image lines carry UNAOS_STRIA)
+  "arm-pi-image ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,skip_xhci,bootlog,pi,baremetal,vugpar,smp7,smp7_retry,k2_leave,smp8,core3probe,v3d,v3d_deep,v3d_qpu,v3d_dispdone,v3d69_reenable,v3d79_minimal,v3d81,v3d81_qpu,v3d81_display,v3d_firstkick,piusb,genet,nettest,nsspan,piinstall,piinstall_arm,piinstall_confirm,pirast,desktop_firmware,v3d_unarmclose,quarry,v3d_basedaim,v3d_tsaim,v3d_armedclose,v3d_bincontent,v3d_dispatchdisc,v3d_hfirst,v3d_vpmprobe,fatperf,livecon,holocron,hcronst,deadman,wcg-paygo,prtscrst,facet,v3d_singleseg,login,loginst,lumen,selfdiag,midden,una,aether,uvc,sonde,usbnet,stria,sonderec"
+  "x86-image ../../x86_64-unaos.json witness,unafs,login,holocron,lumen,selfdiag,midden,una,aether,uvc,sonde,usbnet,stria,sonderec"   # STRIAMETAL (SR139): + stria on the three image legs (the image lines carry UNAOS_STRIA)
   # ── SUPSTATELEG (appended 2026-10-21, LEDGER SR168, wave36) — the Orin image line WITH `supstate` ──
   #
   # THE HOLE, MEASURED (awk over this matrix's third field at e3c98fcd): seven rows carry `supstate`
@@ -12850,6 +12851,10 @@ kernel8() {
     if [ -n "${UNAOS_SONDE:-}" ]; then
         K8_FEATS="${K8_FEATS},sonde"
         echo -e "${COLOR_YELLOW}  • UNAOS_SONDE: REALSENSE — tests sonde (the D435i census; SKIP(no-device) without the camera); implies uvc${COLOR_RESET}"
+    fi
+    if [ -n "${UNAOS_SONDE_RECORD:-}" ]; then
+        K8_FEATS="${K8_FEATS},sonderec"
+        echo -e "${COLOR_YELLOW}  • UNAOS_SONDE_RECORD: SONDERECORD — tests sonderec (N depth frames as PRB1 records to /probe-<n>.prb; SKIP(no-device) without the camera); implies sonde${COLOR_RESET}"
     fi
     if [ -n "${UNAOS_AETHER:-}" ]; then
         K8_FEATS="${K8_FEATS},aether"
