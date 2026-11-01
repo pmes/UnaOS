@@ -30,6 +30,7 @@
 //! | [`imu`] | an [`ImuSample`] and the D400 HID motion report it is read from |
 //! | [`replay`] | deterministic synthetic frames — the fixture a host without a camera is fed |
 //! | [`wire`] | one frame as bytes: the 80-byte `PRB1` header + data the kernel publishes at `/dev/probe/depth0` (SONDE2, SR105) |
+//! | [`recording`] | records back to back: the `.prb` file the kernel writes and `tools/scan` reads (VUGSCANTOOL, SR471) |
 //!
 //! The first probe is the Intel RealSense D435i (REALSENSE, LEDGER SR92). Every hardware fact taken from
 //! librealsense (Apache-2.0, v2.55.1) is cited by file and line where it is used, R110's shape: the fact
@@ -50,6 +51,7 @@ pub mod imu;
 pub mod ramp;
 pub mod replay;
 pub mod wire;
+pub mod recording; // VUGSCANTOOL (SR471): PRB1 records back to back, the .prb a scan reads
 
 pub use depth::{DepthScale, Intrinsics, Point3, Z16Stats};
 pub use frame::{Frame, FrameError, PixelFormat, StreamKind};
