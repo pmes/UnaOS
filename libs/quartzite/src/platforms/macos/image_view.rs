@@ -233,8 +233,9 @@ define_class!(
                 // Browser surface: wheel scrolls the page (deltaY > 0 is
                 // fingers-down/content-up in natural scrolling; the engine
                 // wants positive dy = scroll further down the document).
-                if dy != 0.0 {
-                    syn.fire(bandy::SMessage::BrowserScroll(0.0, -dy * 3.0, self.ivars().surface.get()));
+                let dx: f64 = unsafe { msg_send![event, scrollingDeltaX] }; // VUG-FACE-BUTTONS (SR477): the horizontal axis too, on dy's convention
+                if dx != 0.0 || dy != 0.0 {
+                    syn.fire(bandy::SMessage::BrowserScroll(-dx * 3.0, -dy * 3.0, self.ivars().surface.get()));
                 }
                 return;
             }
@@ -255,7 +256,14 @@ define_class!(
         fn magnify_with_event(&self, event: &AnyObject) {
             // `magnification` is the incremental pinch delta for this event.
             let mag: f64 = unsafe { msg_send![event, magnification] };
-            if mag == 0.0 || self.ivars().synapse.borrow().is_some() {
+            if mag == 0.0 {
+                return;
+            }
+            // VUG-FACE-BUTTONS (SR477): a browser-mode surface sends the pinch to its owner at the cursor (none off the frame).
+            if let Some(syn) = self.ivars().synapse.borrow().clone() {
+                if let Some((x, y)) = self.surface_point(event) {
+                    syn.fire(bandy::SMessage::BrowserPinch { scale: 1.0 + mag, x, y, surface: self.ivars().surface.get() });
+                }
                 return;
             }
             let at = self.event_point(event);
@@ -310,6 +318,51 @@ define_class!(
                         }
                     }
                 }
+            }
+        }
+
+        // VUG-FACE-BUTTONS (SR477): the right and the other buttons. A browser-mode surface sends them as
+        // `BrowserAuxButton` (drags as `BrowserMouseMove`) through the helpers at the file tail; in facet mode each goes
+        // to NSView as before.
+        #[unsafe(method(rightMouseDown:))]
+        fn right_mouse_down(&self, event: &AnyObject) {
+            if !self.aux_button(event, true) {
+                let _: () = unsafe { msg_send![super(self), rightMouseDown: event] };
+            }
+        }
+
+        #[unsafe(method(rightMouseDragged:))]
+        fn right_mouse_dragged(&self, event: &AnyObject) {
+            if !self.aux_drag(event) {
+                let _: () = unsafe { msg_send![super(self), rightMouseDragged: event] };
+            }
+        }
+
+        #[unsafe(method(rightMouseUp:))]
+        fn right_mouse_up(&self, event: &AnyObject) {
+            if !self.aux_button(event, false) {
+                let _: () = unsafe { msg_send![super(self), rightMouseUp: event] };
+            }
+        }
+
+        #[unsafe(method(otherMouseDown:))]
+        fn other_mouse_down(&self, event: &AnyObject) {
+            if !self.aux_button(event, true) {
+                let _: () = unsafe { msg_send![super(self), otherMouseDown: event] };
+            }
+        }
+
+        #[unsafe(method(otherMouseDragged:))]
+        fn other_mouse_dragged(&self, event: &AnyObject) {
+            if !self.aux_drag(event) {
+                let _: () = unsafe { msg_send![super(self), otherMouseDragged: event] };
+            }
+        }
+
+        #[unsafe(method(otherMouseUp:))]
+        fn other_mouse_up(&self, event: &AnyObject) {
+            if !self.aux_button(event, false) {
+                let _: () = unsafe { msg_send![super(self), otherMouseUp: event] };
             }
         }
 
@@ -612,15 +665,8 @@ impl FacetImageView {
     /// Browser mode (SR67): an event's location in surface pixels (top-left origin, the engine's
     /// space) through the same 1:1 top-pinned placement `image_dest` draws with; `None` off the frame.
     fn surface_point(&self, event: &AnyObject) -> Option<(f64, f64)> {
-        let (vx, vy) = self.event_point(event);
-        let (dx, dy, dw, dh) = self.image_dest(self.bounds())?;
         let (iw, ih) = *self.ivars().size.borrow();
-        if dw <= 0.0 || dh <= 0.0 || iw == 0 || ih == 0 {
-            return None;
-        }
-        let px = (vx - dx) / dw * iw as f64;
-        let py = ih as f64 - ((vy - dy) / dh * ih as f64);
-        (px >= 0.0 && px < iw as f64 && py >= 0.0 && py < ih as f64).then_some((px, py))
+        self.surface_point_unclamped(event).filter(|&(px, py)| px >= 0.0 && px < iw as f64 && py >= 0.0 && py < ih as f64)
     }
 
     /// Browser mode (SR67): the page asked for cursor `name` (a css-ui-4 keyword). Main thread only.
@@ -991,5 +1037,55 @@ impl FacetImageView {
             return;
         }
         self.set_frame(&kept, &[], width, height);
+    }
+}
+
+// VUG-FACE-BUTTONS (LEDGER SR477): the non-primary buttons on a browser-mode surface. The `rightMouse*:` /
+// `otherMouse*:` methods call these; each answers false in facet mode (no synapse), where the method forwards to NSView.
+impl FacetImageView {
+    /// An event's location in surface pixels through the 1:1 top-pinned placement `image_dest` draws with, off the frame
+    /// too (`surface_point` keeps only the frame's); `None` with no frame.
+    fn surface_point_unclamped(&self, event: &AnyObject) -> Option<(f64, f64)> {
+        let (vx, vy) = self.event_point(event);
+        let (dx, dy, dw, dh) = self.image_dest(self.bounds())?;
+        let (iw, ih) = *self.ivars().size.borrow();
+        if dw <= 0.0 || dh <= 0.0 || iw == 0 || ih == 0 {
+            return None;
+        }
+        Some(((vx - dx) / dw * iw as f64, ih as f64 - ((vy - dy) / dh * ih as f64)))
+    }
+
+    /// NLE2-MODS (SR306): `modifierFlags` bits 17-20 (shift, control, option, command) as bandy's `MOD_*` bits 0-3.
+    fn event_mods(event: &AnyObject) -> u8 {
+        let f: usize = unsafe { msg_send![event, modifierFlags] };
+        ((f >> 17) & 0xF) as u8
+    }
+
+    /// A press (`down`) or release of a non-primary button as `BrowserAuxButton`, `button` being AppKit's `buttonNumber`.
+    /// The press goes only on the frame and takes key focus (as `mouseDown:`); the release goes off the frame too (as
+    /// `mouseUp:`), and no `BrowserClick` follows it (a click stays the primary button's). False in facet mode.
+    fn aux_button(&self, event: &AnyObject, down: bool) -> bool {
+        let Some(syn) = self.ivars().synapse.borrow().clone() else { return false };
+        let at = if down { self.surface_point(event) } else { self.surface_point_unclamped(event) };
+        if let Some((x, y)) = at {
+            let n: isize = unsafe { msg_send![event, buttonNumber] };
+            let button = n.clamp(0, u8::MAX as isize) as u8;
+            syn.fire(bandy::SMessage::BrowserAuxButton { button, down, x, y, mods: Self::event_mods(event), surface: self.ivars().surface.get() });
+        }
+        if down {
+            if let Some(window) = self.window() {
+                let _: bool = unsafe { msg_send![&window, makeFirstResponder: self] };
+            }
+        }
+        true
+    }
+
+    /// A non-primary drag moves the pointer, as `mouseDragged:` does. False in facet mode.
+    fn aux_drag(&self, event: &AnyObject) -> bool {
+        let Some(syn) = self.ivars().synapse.borrow().clone() else { return false };
+        if let Some((x, y)) = self.surface_point(event) {
+            syn.fire(bandy::SMessage::BrowserMouseMove(x, y, self.ivars().surface.get()));
+        }
+        true
     }
 }
