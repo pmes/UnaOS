@@ -540,6 +540,32 @@ pub enum SMessage {
     /// Face -> owner (OPEN-DIALOG-ONE, SR386): the file the person chose in the [`SMessage::OpenPanel`] over `url`, or
     /// `None` when the panel was cancelled.
     OpenPanelChose { url: String, path: Option<String> },
+    /// Chrome -> owner (VUG-FACE-BUTTONS, LEDGER SR477): a NON-primary pointer button went down (`down: true`) or up on a
+    /// surface, in surface pixels (top-left origin). `button` is the platform's button number past the primary one
+    /// ([`BUTTON_RIGHT`], [`BUTTON_MIDDLE`], 3 and up the extra buttons: AppKit's `buttonNumber`). The primary button stays
+    /// [`SMessage::BrowserButton`] (its receivers never see these presses); a drag still moves as `BrowserMouseMove`, and
+    /// no `BrowserClick` follows the release. `mods` and `surface` as on `BrowserButton`, each omitted when 0. APPENDED so
+    /// no earlier wire tag moves.
+    BrowserAuxButton {
+        button: u8,
+        down: bool,
+        x: f64,
+        y: f64,
+        #[serde(default, skip_serializing_if = "no_mods")]
+        mods: u8,
+        #[serde(default, skip_serializing_if = "no_surface")]
+        surface: u32,
+    },
+    /// Chrome -> owner (VUG-FACE-BUTTONS, SR477): a pinch on a surface. `scale` is this event's incremental factor (1 +
+    /// AppKit's `magnification`: above 1 spreads the fingers, zooms in), `x` / `y` the cursor in surface pixels; `surface`
+    /// omitted when 0. APPENDED so no earlier wire tag moves.
+    BrowserPinch {
+        scale: f64,
+        x: f64,
+        y: f64,
+        #[serde(default, skip_serializing_if = "no_surface")]
+        surface: u32,
+    },
 }
 
 /// A typed preference value — the whole value domain of the Principia
@@ -671,6 +697,11 @@ pub const MOD_CONTROL: u8 = 1 << 1;
 pub const MOD_ALT: u8 = 1 << 2;
 /// Super / Command (GTK's Meta or Super).
 pub const MOD_SUPER: u8 = 1 << 3;
+
+/// `BrowserAuxButton`'s `button` numbers (VUG-FACE-BUTTONS, LEDGER SR477), named once: the right (secondary) button.
+pub const BUTTON_RIGHT: u8 = 1;
+/// The middle button (the wheel pressed).
+pub const BUTTON_MIDDLE: u8 = 2;
 
 /// AETHERMACGPU-DAMAGE (LEDGER SR320): a sender of damage-only `SurfaceBlit`s sends a whole frame (`damage: None`) at
 /// least once every this many blits, so a receiver that missed one on the lossy bus is repaired within that many (a face
@@ -1120,13 +1151,15 @@ impl TabulaCommand {
 }
 
 /// SURFACEID (LEDGER SR332): the ONE list of the messages that carry a Surface number (the four pointer messages and, since
-/// NLE2-SURFACERESIZE SR339, `BrowserResize`). Every receiver that routes
+/// NLE2-SURFACERESIZE SR339, `BrowserResize`; since VUG-FACE-BUTTONS SR477, `BrowserAuxButton` and `BrowserPinch`). Every receiver that routes
 /// by surface (stria's `nle_face::Face::takes`) and every sender that stamps one (stria-view's witness) reads it here.
 impl SMessage {
     /// The Surface number a pointer message (or `BrowserResize`) carries; `None` for every other message.
     pub fn surface(&self) -> Option<u32> {
         match self {
             SMessage::BrowserButton { surface, .. }
+            | SMessage::BrowserAuxButton { surface, .. }
+            | SMessage::BrowserPinch { surface, .. }
             | SMessage::BrowserMouseMove(_, _, surface)
             | SMessage::BrowserScroll(_, _, surface)
             | SMessage::BrowserClick(_, _, surface)
@@ -1138,6 +1171,8 @@ impl SMessage {
     pub fn surface_mut(&mut self) -> Option<&mut u32> {
         match self {
             SMessage::BrowserButton { surface, .. }
+            | SMessage::BrowserAuxButton { surface, .. }
+            | SMessage::BrowserPinch { surface, .. }
             | SMessage::BrowserMouseMove(_, _, surface)
             | SMessage::BrowserScroll(_, _, surface)
             | SMessage::BrowserClick(_, _, surface)
