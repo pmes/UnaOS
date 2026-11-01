@@ -1,0 +1,19 @@
+# =====================================================================
+# CRATE: tools/scan/Cargo.toml
+# DESCRIPTION: VUGSCANTOOL (LEDGER SR471) headless face of Vug's scan:
+#              a probe_core .prb recording, an rs-convert depth CSV or
+#              a realsense-viewer .raw snapshot in; scan_core fusion and
+#              fits, a mesh_core PLY and a residual report out. No logic
+#              of its own; no third-party crates.
+# =====================================================================
+
+[package]
+name = "scan"
+version = "0.1.0"
+edition = "2024"
+license = "LGPL-3.0-or-later"
+
+[dependencies]
+probe_core = { path = "../../unaos/libs/media/probe_core" }
+scan_core = { path = "../../unaos/libs/cad/scan_core" }
+mesh_core = { path = "../../unaos/libs/cad/mesh_core" }

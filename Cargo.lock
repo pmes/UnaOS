@@ -4331,6 +4331,15 @@ name = "sbc_core"
 version = "0.1.0"
 
 [[package]]
+name = "scan"
+version = "0.1.0"
+dependencies = [
+ "mesh_core",
+ "probe_core",
+ "scan_core",
+]
+
+[[package]]
 name = "scan_core"
 version = "0.1.0"
 dependencies = [

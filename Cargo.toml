@@ -102,6 +102,7 @@ members = [
     "tools/vertex",
     "tools/play-check",
     "tools/nle", # NLE1 (SR194): the editor's headless face — schedule / render an EDL through stria::nle
+    "tools/scan", # VUGSCANTOOL (SR471): Vug's headless scan face — a .prb recording, an rs-convert CSV or a realsense-viewer .raw in; scan_core fusion + fits, mesh_core PLY and a residual report out
     "tools/pdfprobe", # PDF1 (SR300): pdf_core's headless probe — pages, version, xref kind, title, per-page boxes / ops / fonts / images
     "tools/aethervideo-check",
     "tools/unafs",
