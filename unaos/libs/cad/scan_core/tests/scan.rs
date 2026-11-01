@@ -238,3 +238,38 @@ fn cylinder_fit_exact_with_outliers() {
         Err(FitError::NormalsMismatch { points: pts.len(), normals: 3 })
     );
 }
+
+/// VUGSCANRIM (SR474): one frame's open scan is a manifold whose rim is named as boundary loops, not a bowtie
+/// (the cube set's diagonal pair at the observation rim; mc.rs `rim_sheet`). On a refusal the vertex's star is dumped.
+/// The frame is integrated from the IDENTITY pose, tools/scan's one-frame road (the grid on the camera axes): the
+/// bowtie depends on the grid's orientation, and the orbit pose `fuse` uses did not reproduce it before the fix.
+#[test]
+fn single_frame_rim_is_named_loops() {
+    let (scene, intr, scale) = (Scene::bench(), fixture::bench_intrinsics(), DepthScale::D400_DEFAULT);
+    let f = fixture::render_depth(&scene, &intr, scale, &pose(0, 1), &Noise::NONE, 0);
+    let mut t = Tsdf::new(4.0, 12.0, Tol::DEFAULT).expect("volume");
+    t.integrate(&f, scale, &intr, &Transform::IDENTITY).expect("frame integrates");
+    let sm = extract(&t).expect("surface");
+    let m = &sm.mesh;
+    let loops = match m.boundary_loops() {
+        Ok(l) => l,
+        Err(Topo::NonManifoldVertex { v }) => {
+            let mut star = String::new();
+            for (i, tri) in m.triangles.iter().enumerate().filter(|(_, tri)| tri.contains(&v)) {
+                let p = tri.map(|k| m.positions[k as usize]);
+                star += &format!("\n  tri {i} {tri:?} {:?} {:?} {:?}", p[0], p[1], p[2]);
+            }
+            panic!("bowtie at vertex {v} {:?} (voxel 4 mm), its star:{star}", m.positions[v as usize]);
+        }
+        Err(e) => panic!("single-frame topology refused: {e:?}"),
+    };
+    assert!(!loops.is_empty(), "an open scan has a rim");
+    assert!(loops.iter().all(|l| l.len() >= 3), "every loop is a cycle");
+    println!(
+        "scan-rim: verts={} tris={} loops={} (longest {})",
+        m.positions.len(),
+        m.triangles.len(),
+        loops.len(),
+        loops.iter().map(|l| l.len()).max().unwrap_or(0)
+    );
+}
