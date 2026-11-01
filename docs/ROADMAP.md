@@ -181,20 +181,19 @@ projection codec (pi4, 2026-07-12) is the layer that migrate pass will call.
 The three K-numbering schemes are distinct — this is BeFS-K1, not the security
 ACL K1 (survive-reboot) nor the U-chain.
 
-## 3. Design → Make (printer)
+## 3. Design → Make (the CAD program; Vug)
 
-Canon: [`CODEX.md`](CODEX.md) §5 — Vug computes toolpaths, Comscan pumps
-G-code to hardware. Sequenced routes:
-
-1. **PrusaLink HTTP** (~2 arcs): HTTP client grows PUT + API-key auth over the
-   TCP stack (now the smoltcp line — §1b) → upload G-code to the Prusa CORE
-   One+ and start a print. *"UnaOS prints a part"* early.
-2. **USB CDC-ACM + Comscan** (2 arcs): modest USB class driver (two bulk
-   endpoints + SET_LINE_CODING) on the existing xHCI stack; stream G-code with
-   ok/ack flow control from the rMBP on metal. Comscan's first real capability.
-3. **Vug native CAM**: full slicing is far-future; the Vug→Comscan G-code
-   interface gets defined during (1)/(2) so they remain the permanent "Make"
-   backend. Optional interim: 2.5D polygon-extrusion slicing for flat parts.
+Canon: [`CODEX.md`](CODEX.md) §5 — Vug computes toolpaths, Helm holds the wheel, Comscan
+pumps the stream. **Direction set 2026-11-01 (Peter: "making sure UnaOS becomes people's
+go-to for CAD … bake the concept of direct manufacturing in")**: the program, the research and
+the principles are [`dev/USERLAND/VUG.md`](dev/USERLAND/VUG.md); the sheet is
+[`dev/blueprint/vug.md`](dev/blueprint/vug.md). The CAD cores under `unaos/libs/cad/`
+(`geom_core`, `sketch_core`, `mesh_core`, `make_core` cut 2026-11-01 as SR464-SR467; then
+`brep_core`, `scan_core`, the faces, the document) own the geometry; the design holds its
+Make (an operation on a feature, never an exported file); a machine stream leaves only as
+`make_core::Program` through Helm to Comscan. The earlier printer routes stand as the first
+machine targets once a Program exists: PrusaLink HTTP upload, USB CDC-ACM + Comscan with
+ok/ack flow control.
 
 ## 3a. The creative lane (host-native A/V userspace)
 
@@ -370,9 +369,11 @@ FlySky NB4 Plus ──AFHDS3──▶ FGr8B ──i-BUS (UART 115200)──▶ U
 Tegra XUSB as a platform (non-PCI) xHCI controller — *unknown: whether UEFI
 leaves the XUSB firmware loaded* → SuperSpeed enumeration (the rMBP
 SS-recovery machinery reuses directly) → UVC class driver (D400-series
-RealSense streams over **bulk** endpoints on USB3, so isochronous support is
-likely deferrable — verify for the D435i) → depth frames + IMU → obstacle-stop
-and follow-me demos feeding the drive service's AUTO mode.
+the tree's UVC driver streams the D435i over the xHCI **isochronous** pipe (XHCIISO
+B534; REALSENSE SR92, ARMSONDE SR101, SONDE2 SR105: the first depth frame reaches Sonde with
+`probe_core`'s scale, intrinsics and point cloud — all fixed-unflown, no metal frame yet) →
+depth frames + IMU → Vug's `scan_core` (§3) and the obstacle-stop / follow-me demos feeding
+the drive service's AUTO mode.
 
 ## 6. Other load-bearing gaps (honest inventory)
 
