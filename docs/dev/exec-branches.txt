@@ -1237,3 +1237,5 @@ refs/heads/exec-rmbp-vugmake   c572faa34 IN-FLIGHT cut 2026-11-01
 refs/heads/exec-rmbp-vugbrep1   0ef553321 IN-FLIGHT cut 2026-11-01
 refs/heads/exec-rmbp-vugscan1   0ef553321 IN-FLIGHT cut 2026-11-01
 refs/heads/exec-rmbp-vugface1   0ef553321 IN-FLIGHT cut 2026-11-01
+refs/heads/exec-rmbp-vugscantool   3377d2d13 IN-FLIGHT cut 2026-11-01
+refs/heads/exec-rmbp-sonderecord   3377d2d13 IN-FLIGHT cut 2026-11-01
