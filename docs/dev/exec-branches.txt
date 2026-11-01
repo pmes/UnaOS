@@ -1234,7 +1234,7 @@ refs/heads/exec-rmbp-vuggeom   8f068ef3b FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-vugsketch   fd7ef3b4c FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-vugmesh   3190df0af FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-vugmake   b7152a30a FOLDED-BY-HAND (this commit) 2026-10-27
-refs/heads/exec-rmbp-vugbrep1   0ef553321 IN-FLIGHT cut 2026-11-01
+refs/heads/exec-rmbp-vugbrep1   dbf66bd4c FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-vugscan1   ff2ceac56 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-vugface1   eea57d656 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-vugscantool   524e34ff9 FOLDED-BY-HAND (this commit) 2026-10-27

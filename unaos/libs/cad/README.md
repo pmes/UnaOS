@@ -10,7 +10,9 @@ invariants: `docs/dev/blueprint/vug.md` (f64 geometry, one `Tol`, pure cores, th
 | `sketch_core` | 2D entities, constraints, the solver, DOF/redundancy, the drag solve, profiles (VUGSKETCH: one weighted min-norm LM for solve and drag; redundancy named by the ordered rank, conflicts refused by name) | SR465 |
 | `mesh_core` | the triangle mesh (`Mesh`, `validate`), half-edge adjacency (`HalfEdge`), angle-weighted normals, BVH pick (`Bvh`), manifold check, weld, `to_f32_buffers` (the one render conversion), `stl` / `obj` / `ply` read and write | SR466 |
 | `make_core` | Machine, Tool, Stock, fixtures, Op, the `Program` IR, G-code dialects, `review` for Helm — built: the planner (kinematic pass, refusals by name, grbl / Marlin / LinuxCNC), geom shim until SR464 folds | SR467 |
-| `brep_core` | owed (VUG-BREP-1, LEDGER SR468, in flight) | — |
+| `brep_core` | B-rep topology with persistent Ids, analytic surfaces, validate, primitives, extrude / revolve, closed-form mass, chord-bounded tessellation | SR468 |
 | `scan_core` | TSDF fusion of probe_core depth frames, marching cubes with per-vertex confidence, plane / cylinder RANSAC with residuals, the synthetic depth fixture | SR469 |
+
+
 
 The headless face over `scan_core` + `mesh_core` is `tools/scan` (VUGSCANTOOL, LEDGER SR471): a `.prb` recording (`probe_core::recording`), an rs-convert CSV or a realsense-viewer `.raw` in, a PLY and a residual report out.
