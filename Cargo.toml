@@ -54,6 +54,7 @@ members = [
     "unaos/libs/media/sbc_core", # A2DP (B739): the SBC encoder (the A2DP mandatory codec) from the specification; no_std, no alloc, zero deps; the kernel includes src/sbc.rs by #[path]
     "unaos/libs/media/timeline_core", # NLE1 (SR194): the no_std timeline core (EDL model, pure edit ops, CMX 3600 text, keyframe-aware render schedule) Stria's render links
     "unaos/libs/cad/mesh_core", # VUGMESH (SR466): the no_std triangle mesh (half-edge, normals, BVH pick, weld, STL/OBJ/PLY) and the viewport's f32 buffers; geom_core's seam is src/geom.rs (a shim until SR464 folds), its one dep libm
+    "unaos/libs/cad/sketch_core", # VUGSKETCH (SR465): the no_std 2D constraint solver (entities, constraints, weighted min-norm LM, DOF / redundancy / conflict named, drag solve, profiles) Vug's sketch links
     # SVGCORE (SR52): the no_std SVG renderer (XML, paths, painting, text via font_core) behind pixel_core's `svg` format.
     "unaos/libs/media/svg_core",
     "unaos/libs/sys/holocron_core",

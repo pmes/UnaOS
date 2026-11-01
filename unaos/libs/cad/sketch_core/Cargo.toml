@@ -1,0 +1,19 @@
+[package]
+name = "sketch_core"
+version = "0.1.0"
+edition = "2024"
+license = "LGPL-3.0-or-later"
+description = "Vug's 2D sketch core: entities, constraints, the Levenberg-Marquardt solver with DOF, redundancy and conflict named, the drag solve and profile extraction — shared by Ring 0 and Ring 3."
+
+# VUGSKETCH (LEDGER SR465): `#![no_std]` + `alloc`, `#![forbid(unsafe_code)]`, the timeline_core / midden_core shape: a
+# shared core under `unaos/libs/cad/`, a member of the ROOT host workspace, linkable by the kernel by path with
+# `default-features = false`. libm gives sqrt / sin / cos / atan2 in no_std. geom_core (SR464, cut beside) is held by
+# the private `src/geom.rs` shim until it folds: the seat's swap is `mod geom;` -> `use geom_core as geom;`, the line
+# `geom_core = { path = "../geom_core", default-features = false }` here, and deleting src/geom.rs.
+[dependencies]
+libm = { version = "0.2", default-features = false }
+
+[features]
+default = ["std"]
+# The seam only: nothing in `src/` is std-gated (midden_core's spelling, so a kernel `default-features = false` is honest).
+std = []
