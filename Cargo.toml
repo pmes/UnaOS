@@ -116,6 +116,7 @@ members = [
     "vessels/pulse",
     "vessels/phonolite",
     "vessels/facet-view",
+    "vessels/vug-view", # VUGFACE1 (SR470): Vug's first face — a software-rasterised viewport over mesh_core (orbit about the cursor, presets, BVH pick)
     "vessels/stria-view", # NLE2 (SR201): Stria's editor face — one tetra tree on AppKit / GTK, the headless witness
     "vessels/una",
     "vessels/una-installer", # INSTALLERVESSEL (SR413): the UnaOS_Installer vessel — host probe, the vessel catalog, build (Aulë) + install + run

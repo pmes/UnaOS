@@ -1,0 +1,29 @@
+# =====================================================================
+# CRATE: vessels/vug-view/Cargo.toml
+# DESCRIPTION: Vug's first face (VUGFACE1, LEDGER SR470). A window over a
+#              mesh_core mesh: a software-rasterised viewport (flat shade,
+#              z-buffer, ground grid, axis triad) that orbits about the
+#              cursor with remappable presets and picks with mesh_core's
+#              BVH. It holds no geometry of its own (BP-vug-4).
+# =====================================================================
+
+[package]
+name = "vug-view"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+
+[dependencies]
+# The ONE geometry: mesh_core (VUGMESH SR466) — readers, weld, bounds, the f32 buffers, the BVH pick; named only in src/model.rs.
+mesh_core = { path = "../../unaos/libs/cad/mesh_core" }
+euclase = { path = "../../libs/euclase" }
+palette_core = { path = "../../unaos/libs/sys/palette_core" }
+pixel_core = { path = "../../unaos/libs/media/pixel_core" }
+bandy = { path = "../../libs/bandy" }
+tokio = { version = "1.53", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
+log = "0.4"
+
+# The window: quartzite's AppKit image surface (macOS first; other backends follow quartzite).
+[target.'cfg(target_os = "macos")'.dependencies]
+quartzite = { path = "../../libs/quartzite", default-features = false }
+gneiss_pal = { path = "../../libs/gneiss_pal" }
