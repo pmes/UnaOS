@@ -253,19 +253,24 @@ impl Tracker {
                 let mut ata = [[0.0f64; 6]; 6];
                 let mut atb = [0.0f64; 6];
                 let (mut n_in, mut n_valid, mut sse) = (0u32, 0u32, 0.0f64);
-                let mut y = 0;
-                while y + s < h {
-                    let mut x = 0;
-                    while x + s < w {
+                // The normal by central differences at a baseline of at least 4 pixels: KinFu takes it from a
+                // bilateral-filtered map (not reproduced); at 1 pixel the D435i's noise scatters it past the gate.
+                let b = s.max(4);
+                let (bu, bw) = (b as usize, (b * w) as usize);
+                let mut y = b;
+                while y + b < h {
+                    let mut x = b;
+                    while x + b < w {
                         let i = y as usize * w as usize + x as usize;
-                        let (Some(p), Some(px), Some(py)) = (pts[i], pts[i + s as usize], pts[i + (s * w) as usize])
+                        let (Some(p), Some(pl), Some(pr), Some(pu), Some(pd)) =
+                            (pts[i], pts[i - bu], pts[i + bu], pts[i - bw], pts[i + bw])
                         else {
                             x += s;
                             continue;
                         };
                         n_valid += 1;
                         x += s;
-                        let Some(nc) = unit((px - p).cross(py - p)) else { continue };
+                        let Some(nc) = unit((pr - pl).cross(pd - pu)) else { continue };
                         let nc = if nc.dot(p) > 0.0 { -nc } else { nc };
                         let q = pose.apply_point(p);
                         let nq = pose.apply_vector(nc);
@@ -278,8 +283,8 @@ impl Tracker {
                         let jw = q.cross(m.n);
                         let j = [jw.x, jw.y, jw.z, m.n.x, m.n.y, m.n.z];
                         for a in 0..6 {
-                            for b in 0..6 {
-                                ata[a][b] += j[a] * j[b];
+                            for c in 0..6 {
+                                ata[a][c] += j[a] * j[c];
                             }
                             atb[a] -= j[a] * r;
                         }
@@ -537,11 +542,15 @@ fn march(t: &Tsdf, o: Vec3, d: Vec3, s0: f64, s1: f64) -> Option<Surfel> {
     let mut s = s0;
     let mut prev: Option<(f64, f64)> = None;
     while s <= s1 {
-        let Some(f) = nearest(t, o + d * s) else {
+        let p = o + d * s;
+        let Some(f) = nearest(t, p) else {
             prev = None;
             s += 0.8 * trunc / dn;
             continue;
         };
+        // Inside the band the sign change and the refine read the SAME field (trilinear; the nearest voxel can sit
+        // ~3.5 mm from the sample and fire the change early, which put SR478's first KAT surface 2.1 mm in front).
+        let f = if f.abs() < trunc { trilinear(t, p).map(|x| x.0).unwrap_or(f) } else { f };
         if let Some((sp, fp)) = prev {
             if fp > 0.0 && f < 0.0 {
                 return refine(t, o, d, (sp, fp), (s, f));
