@@ -8,6 +8,6 @@ invariants: `docs/dev/blueprint/vug.md` (f64 geometry, one `Tol`, pure cores, th
 |---|---|---|
 | `geom_core` | f64 vectors, matrices, transforms, `Tol`, AABB, exact orientation predicates, closed-form intersections | SR464 |
 | `sketch_core` | 2D entities, constraints, the solver, DOF/redundancy, the drag solve, profiles | SR465 |
-| `mesh_core` | the triangle mesh, half-edge adjacency, normals, BVH pick, manifold check, weld, STL/OBJ/PLY | SR466 |
+| `mesh_core` | the triangle mesh (`Mesh`, `validate`), half-edge adjacency (`HalfEdge`), angle-weighted normals, BVH pick (`Bvh`), manifold check, weld, `to_f32_buffers` (the one render conversion), `stl` / `obj` / `ply` read and write | SR466 |
 | `make_core` | Machine, Tool, Stock, fixtures, Op, the `Program` IR, G-code dialects, `review` for Helm | SR467 |
 | `brep_core`, `scan_core` | owed (VUG-BREP, VUG-SCAN in the sheet) | — |

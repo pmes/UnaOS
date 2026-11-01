@@ -1,0 +1,19 @@
+[package]
+name = "mesh_core"
+version = "0.1.0"
+edition = "2024"
+license = "LGPL-3.0-or-later"
+description = "Vug's mesh core: the indexed triangle mesh, half-edge adjacency, normals, BVH pick, manifold check, weld, STL / OBJ / PLY, and the viewport's f32 buffers — shared by Ring 0 and Ring 3."
+
+# VUGMESH (LEDGER SR466): `#![no_std]` + `alloc`, `#![forbid(unsafe_code)]`, the timeline_core shape: a shared core under
+# `unaos/libs/cad/`, a member of the ROOT host workspace, linkable by a kernel face by path with `default-features = false`.
+# The geometry (Vec3, Tol, Ray, Aabb3, ray/triangle, ray/aabb) is geom_core's (SR464) through ONE seam, `src/geom.rs`;
+# geom_core was not on its branch when this arc built, so that file is a marked SHIM and this manifest names no
+# geom_core dep yet: the swap is `geom_core = { path = "../geom_core", default-features = false }` + geom.rs re-exports.
+[dependencies]
+libm = { version = "0.2", default-features = false }
+
+[features]
+default = ["std"]
+# The seam only: nothing in `src/` is std-gated (midden_core's spelling, so a kernel `default-features = false` is honest).
+std = []
