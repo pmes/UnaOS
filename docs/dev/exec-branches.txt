@@ -1234,3 +1234,6 @@ refs/heads/exec-rmbp-vuggeom   c572faa34 IN-FLIGHT cut 2026-11-01
 refs/heads/exec-rmbp-vugsketch   c572faa34 IN-FLIGHT cut 2026-11-01
 refs/heads/exec-rmbp-vugmesh   c572faa34 IN-FLIGHT cut 2026-11-01
 refs/heads/exec-rmbp-vugmake   c572faa34 IN-FLIGHT cut 2026-11-01
+refs/heads/exec-rmbp-vugbrep1   0ef553321 IN-FLIGHT cut 2026-11-01
+refs/heads/exec-rmbp-vugscan1   0ef553321 IN-FLIGHT cut 2026-11-01
+refs/heads/exec-rmbp-vugface1   0ef553321 IN-FLIGHT cut 2026-11-01
