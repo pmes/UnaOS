@@ -2264,6 +2264,7 @@ name = "helm"
 version = "0.1.0"
 dependencies = [
  "ibus",
+ "make_core",
 ]
 
 [[package]]
