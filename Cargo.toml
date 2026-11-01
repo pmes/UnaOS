@@ -55,6 +55,7 @@ members = [
     "unaos/libs/media/timeline_core", # NLE1 (SR194): the no_std timeline core (EDL model, pure edit ops, CMX 3600 text, keyframe-aware render schedule) Stria's render links
     "unaos/libs/cad/mesh_core", # VUGMESH (SR466): the no_std triangle mesh (half-edge, normals, BVH pick, weld, STL/OBJ/PLY) and the viewport's f32 buffers; geom_core's seam is src/geom.rs (a shim until SR464 folds), its one dep libm
     "unaos/libs/cad/sketch_core", # VUGSKETCH (SR465): the no_std 2D constraint solver (entities, constraints, weighted min-norm LM, DOF / redundancy / conflict named, drag solve, profiles) Vug's sketch links
+    "unaos/libs/cad/make_core", # VUGMAKE (SR467): Vug's no_std Make core (machine model, Ops, the Program IR + kinematic pass, grbl / Marlin / LinuxCNC dialects, the review Helm reads); its one dep libm (geom_core by path when VUGGEOM folds)
     # SVGCORE (SR52): the no_std SVG renderer (XML, paths, painting, text via font_core) behind pixel_core's `svg` format.
     "unaos/libs/media/svg_core",
     "unaos/libs/sys/holocron_core",
