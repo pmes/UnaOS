@@ -49,6 +49,7 @@ Failsafes do not generalize: a rover's safe state is "stop"; a mill's is
   writes. Its safety invariants **I1–I8** are proven by the named tests in
   `tests/rover_invariants.rs` and cross-referenced from
   [`docs/dev/USERLAND/TALUS_SAFETY.md`](../../../../docs/dev/USERLAND/TALUS_SAFETY.md).
+- **`machine`** (second domain, VUGHELM SR475) — the gate a make_core program passes before any machine moves: make_core's `Review` against a `Policy` of Principia's levels (never / ask / pass, per ask kind; a refusal is never overridable) and the caller-persisted `Approved` first-run record, to one `Verdict`; invariants G1–G7 in `tests/machine_invariants.rs`.
 
 ## `no_std` and features
 
