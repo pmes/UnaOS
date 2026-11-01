@@ -124,11 +124,11 @@ pub struct Stock {
 impl Stock {
     pub fn aabb(&self) -> Aabb3 {
         match self.shape {
-            StockShape::Box { size } => Aabb3::new(self.origin, self.origin + size),
-            StockShape::Cylinder { radius, height } => Aabb3::new(
-                self.origin - Vec3::new(radius, radius, 0.0),
-                self.origin + Vec3::new(radius, radius, height),
-            ),
+            StockShape::Box { size } => Aabb3 { min: self.origin, max: self.origin + size },
+            StockShape::Cylinder { radius, height } => Aabb3 {
+                min: self.origin - Vec3::new(radius, radius, 0.0),
+                max: self.origin + Vec3::new(radius, radius, height),
+            },
         }
     }
 }

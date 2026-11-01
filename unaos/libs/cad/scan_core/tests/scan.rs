@@ -27,7 +27,7 @@ fn fuse(noise: Noise, frames: u32) -> Tsdf {
 }
 
 fn angle_deg(a: Vec3, b: Vec3) -> f64 {
-    libm::acos((a.normalize().dot(b.normalize())).abs().min(1.0)) / DEG
+    libm::acos((a.normalize().unwrap().dot(b.normalize().unwrap())).abs().min(1.0)) / DEG
 }
 
 #[test]
@@ -52,7 +52,7 @@ fn fused_scene_recovers_box_top_and_cylinder() {
     assert!(top.len() > 200, "box top vertices: {}", top.len());
     let fp = fit_plane(&top, Tol { lin: 3.0, ang: 10.0 * DEG }).expect("plane");
     let normal_deg = angle_deg(fp.shape.normal, Vec3::new(0.0, 0.0, 1.0));
-    let off = fp.shape.distance(Vec3::new(-80.0, 0.0, 100.0)).abs();
+    let off = fp.shape.signed_distance(Vec3::new(-80.0, 0.0, 100.0)).abs();
     assert!(normal_deg < 0.5, "box top normal {normal_deg} deg");
     assert!(off < 2.0, "box top height off by {off} mm");
     assert!(fp.rms_mm <= 2.0, "box top rms {}", fp.rms_mm);
@@ -161,7 +161,7 @@ fn refusals_are_named() {
 #[test]
 fn render_depth_kat() {
     // A camera 600 mm above the origin looking straight down (+x right, image +y = world -y).
-    let p = Transform::from_axes(
+    let p = fixture::from_axes(
         Vec3::new(1.0, 0.0, 0.0),
         Vec3::new(0.0, -1.0, 0.0),
         Vec3::new(0.0, 0.0, -1.0),
@@ -196,9 +196,9 @@ fn plane_fit_exact_with_outliers() {
     }
     let band = Tol { lin: 0.5, ang: 0.1 };
     let f = fit_plane(&pts, band).expect("plane");
-    let want = Vec3::new(-0.5, 0.25, 1.0).normalize();
+    let want = Vec3::new(-0.5, 0.25, 1.0).normalize().unwrap();
     assert!((f.shape.normal - want).mag() < 1e-6, "{:?}", f.shape.normal);
-    assert!(f.shape.distance(Vec3::new(0.0, 0.0, 10.0)).abs() < 1e-6);
+    assert!(f.shape.signed_distance(Vec3::new(0.0, 0.0, 10.0)).abs() < 1e-6);
     assert!(f.rms_mm < 1e-6 && f.max_mm < 1e-6);
     assert_eq!((f.inliers, f.outliers), (400, 100));
     assert_eq!(fit_plane(&pts, band), Ok(f), "deterministic");
@@ -207,9 +207,9 @@ fn plane_fit_exact_with_outliers() {
 
 #[test]
 fn cylinder_fit_exact_with_outliers() {
-    let a = Vec3::new(0.2, 0.1, 1.0).normalize();
+    let a = Vec3::new(0.2, 0.1, 1.0).normalize().unwrap();
     let c0 = Vec3::new(10.0, -5.0, 3.0);
-    let u = a.cross(Vec3::new(1.0, 0.0, 0.0)).normalize();
+    let u = a.cross(Vec3::new(1.0, 0.0, 0.0)).normalize().unwrap();
     let w = a.cross(u);
     let (mut pts, mut nrm) = (Vec::new(), Vec::new());
     for k in 0..36 {

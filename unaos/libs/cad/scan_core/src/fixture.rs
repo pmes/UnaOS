@@ -21,6 +21,7 @@ use alloc::vec::Vec;
 use probe_core::{DepthScale, Frame, Intrinsics, PixelFormat, StreamKind};
 
 use crate::fit::SplitMix;
+pub use crate::geom::from_axes;
 use crate::geom::{Transform, Vec3};
 
 /// An axis-aligned box (world mm).
@@ -166,15 +167,15 @@ pub fn bench_intrinsics() -> Intrinsics {
 
 /// A camera on an orbit around `centre`: `standoff_mm` away, `elevation_rad` above the horizontal, at `azimuth_rad`
 /// about +z, looking at `centre` with the world's +z up. Camera → world, probe_core's axes (+x right, +y down,
-/// +z forward). An elevation of ±90° has no "right" and is the caller's to build with `Transform::from_axes`.
+/// +z forward). An elevation of ±90° has no "right" and is the caller's to build with [`from_axes`].
 pub fn orbit(centre: Vec3, standoff_mm: f64, elevation_rad: f64, azimuth_rad: f64) -> Transform {
     let (ce, se) = (libm::cos(elevation_rad), libm::sin(elevation_rad));
     let (ca, sa) = (libm::cos(azimuth_rad), libm::sin(azimuth_rad));
     let eye = centre + Vec3::new(ce * ca, ce * sa, se) * standoff_mm;
-    let fwd = (centre - eye).normalize();
-    let right = fwd.cross(Vec3::new(0.0, 0.0, 1.0)).normalize();
+    let fwd = (centre - eye).normalize().unwrap_or(Vec3::ZERO);
+    let right = fwd.cross(Vec3::new(0.0, 0.0, 1.0)).normalize().unwrap_or(Vec3::ZERO);
     let down = fwd.cross(right);
-    Transform::from_axes(right, down, fwd, eye)
+    from_axes(right, down, fwd, eye)
 }
 
 /// Render the Z16 depth frame `scene` shows a camera at `pose`, with `noise` drawn from its seed and `seq` (frame

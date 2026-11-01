@@ -14,7 +14,7 @@ use alloc::{format, string::String, string::ToString, vec::Vec};
 use core::fmt::Write;
 use libm::{fabs, round, sqrt};
 
-use crate::geom::{Vec2, Vec3};
+use crate::geom::{Length, Vec2, Vec3, Xy};
 use crate::machine::Units;
 use crate::program::{Coolant, Heater, Move, Program, Spin};
 use crate::validate::Refusal;
