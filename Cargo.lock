@@ -802,6 +802,8 @@ name = "comscan"
 version = "0.1.0"
 dependencies = [
  "bandy",
+ "make_core",
+ "pump_core",
  "tokio",
 ]
 
@@ -3834,6 +3836,13 @@ dependencies = [
  "quartzite",
  "sysinfo",
  "tokio",
+]
+
+[[package]]
+name = "pump_core"
+version = "0.1.0"
+dependencies = [
+ "make_core",
 ]
 
 [[package]]
