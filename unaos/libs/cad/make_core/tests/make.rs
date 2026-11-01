@@ -19,7 +19,7 @@ fn mill() -> Machine {
     Machine {
         kind: MachineKind::Mill3,
         kinematics: Kinematics::Cartesian,
-        axes: vec![axis(AxisId::X, 0.0, 200.0), axis(AxisId::Y, 0.0, 200.0), axis(AxisId::Z, -50.0, 60.0)],
+        axes: vec![axis(AxisId::X, -50.0, 200.0), axis(AxisId::Y, -50.0, 200.0), axis(AxisId::Z, -50.0, 60.0)],
         power: Power { kind: PowerKind::Spindle, max: 24000.0, ask_above: 18000.0 },
         envelope: Aabb3::new(Vec3::new(-20.0, -20.0, -20.0), Vec3::new(100.0, 100.0, 50.0)),
         safe_z: 5.0,
