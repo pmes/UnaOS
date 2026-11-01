@@ -1230,7 +1230,7 @@ refs/heads/exec-rmbp-aethercaptionsidecss   30919af81 FOLDED-BY-HAND (this commi
 refs/heads/exec-rmbp-aetherfileface   37cfc9c5b FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-gen7r8edgeunarmed   a06900ba4 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-preemptoffsleepcheckyieldsitewrapperskat   00173eb8f FOLDED-BY-HAND (this commit) 2026-10-27
-refs/heads/exec-rmbp-vuggeom   c572faa34 IN-FLIGHT cut 2026-11-01
+refs/heads/exec-rmbp-vuggeom   8f068ef3b FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-vugsketch   fd7ef3b4c FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-vugmesh   3190df0af FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-vugmake   b7152a30a FOLDED-BY-HAND (this commit) 2026-10-27
