@@ -962,7 +962,7 @@ pub fn consume_key(c: u8) -> bool {
     // mutex take and one relaxed load, and it answers `false`.
     heal_if_row_gone();
     crate::boot::key_taken(); // INSTALLBARE M2 (R86): `[login] key latency ms=` — the EHCI decode's stamp to here
-    kb_drain_key(); // INPUTSTALL M5: an outcome that landed since the last pass applies before this key is read. KEYBOOT4 (B864): `submit_drain` labelled `on=key` (tail)
+    kb_drain_key(); kb_words_key_gap(); // WORDSPOINTER (B1094): the gap before this key, stamped on EVERY key incl. a busy one (tail). LINE-NEUTRAL fold, code first. INPUTSTALL M5: an outcome that landed since the last pass applies before this key is read. KEYBOOT4 (B864): `submit_drain` labelled `on=key` (tail)
     if submit_busy() {
         return true; // INPUTSTALL M5: a submit is on the worker — the form takes no keys until its outcome lands
     }
@@ -3270,7 +3270,7 @@ fn kb_toggle() {
 fn kb_key(c: u8) -> bool {
     let st = FORM.lock().state;
     match st {
-        State::Words => true, // every key is swallowed: Continue needs a click, so the words are seen, never skipped
+        State::Words => { kb_words_key(c); true } // WORDSPOINTER (B1094): Enter/Space after the dwell and a key-quiet gap is Continue (a held key never passes, so the words are seen, never skipped); every other key is withheld (tail)
         State::Unlock => {
             match c {
                 b'\t' => kb_toggle(),
@@ -3442,14 +3442,14 @@ fn kb_words_pending(after: u8) -> bool {
             return false;
         }
         *KB_SHOWN.lock() = Some(w);
-        KB.lock().after = after;
+        KB.lock().after = after; kb_words_up(true); // WORDSPOINTER (B1094): the sheet's clock, the once-per-sheet line reset, the pointer pinned visible (tail). LINE-NEUTRAL
         {
             let mut f = FORM.lock();
             f.state = State::Words;
             f.message = "";
             clear_passwords(&mut f);
         }
-        serial_println!("[login] recovery words shown (KEYBOOT: 24 words, once, on the glass only; Continue needs a click)");
+        serial_println!("[login] recovery words shown (KEYBOOT: 24 words, once, on the glass only; Continue: a click, or Enter/Space after 2 s; the pointer held visible)");
         repaint();
         return true;
     }
@@ -3465,7 +3465,7 @@ pub fn words_up() -> bool {
 /// KEYBOOT: Continue — the drawn words are wiped off the RAM surface (it outlives the row), the words dropped
 /// (wiped), and the session the create-user form opened is closed into.
 fn kb_continue() {
-    fill(surf(), 0, 0, W, H(), theme::surface_window());
+    if FORM.lock().windowed { fill(surf(), 0, 0, W, H(), theme::surface_window()); } crate::pal::cursor_pin(false); // WORDSPOINTER (B1094): headless drew nothing (the witness mints no login surface); the pointer pin drops on the one exit from the sheet. LINE-NEUTRAL
     #[cfg(any(target_arch = "aarch64", feature = "unafs"))]
     drop(KB_SHOWN.lock().take());
     let after = core::mem::replace(&mut KB.lock().after, 0);
@@ -3999,4 +3999,134 @@ impl core::fmt::Display for PumpCpu {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         if self.0 == usize::MAX { f.write_str("none") } else { write!(f, "{}", self.0) }
     }
+}
+
+// =================================================================================================
+// WORDSPOINTER (rmbp-ledger B1094) — THE RECOVERY-WORDS SHEET TAKES A KEY AND KEEPS ITS POINTER. TAIL-APPENDED; the
+// call sites above are same-line folds (`consume_key`'s `kb_words_key_gap`, `kb_key`'s Words arm, `kb_words_pending`'s
+// `kb_words_up`, `kb_continue`'s windowed wipe and unpin).
+//
+// Flight 39 boot 1: the sheet withheld every key and the pointer was off the glass, so Continue was found blind after
+// three minutes. The pointer was hidden by CURSOR-HIDE (`pal::cursor::visible`, 1.5 s after the last report), not by
+// the sheet or the modal; while the sheet is on the glass that idle expiry is suspended (`pal::cursor_pin`) — once a
+// pointer has reported, the arrow stays until Continue (no arrow is invented before the first report).
+//
+// THE KEY: Enter or Space is the Continue press — the SAME `kb_continue` the click runs — only when the sheet has been
+// up [`KB_WORDS_DWELL_MS`] AND the key follows [`KB_WORDS_QUIET_MS`] of no key offered to the screen. A held key reaches
+// the screen as a typematic stream ~40 ms apart and never a release (a KeyUp is swallowed before the screen), so a held
+// Enter from the create-user form never passes: KEYBOOT's "seen, never skipped" stands. Every other key is withheld and
+// nothing typed is printed (BP-security-5).
+// =================================================================================================
+
+/// WORDSPOINTER: how long the sheet is up before a key may press Continue.
+const KB_WORDS_DWELL_MS: u64 = 2000;
+/// WORDSPOINTER: the key-quiet gap before a Continue key (a typematic stream is ~40 ms apart).
+const KB_WORDS_QUIET_MS: u64 = 600;
+
+/// WORDSPOINTER: when the sheet went up (ms).
+static KB_WORDS_AT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// WORDSPOINTER: when the last key was offered to the screen (ms; 0 = never).
+static KB_KEY_LAST: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// WORDSPOINTER: the gap before the key being read now (ms; `u64::MAX` = the first key of the boot).
+static KB_KEY_GAP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+/// WORDSPOINTER: the held-back line is said once per sheet.
+static KB_HELD_SAID: AtomicBool = AtomicBool::new(false);
+
+/// WORDSPOINTER: stamp the gap before this key (`consume_key`, on every key, a busy one too).
+fn kb_words_key_gap() {
+    let now = crate::arch::ms().max(1);
+    let last = KB_KEY_LAST.swap(now, Ordering::Relaxed);
+    KB_KEY_GAP.store(if last == 0 { u64::MAX } else { now.saturating_sub(last) }, Ordering::Relaxed);
+}
+
+/// WORDSPOINTER: the sheet is up — its clock, the once-per-sheet line, and (on the glass only) the pointer pin.
+fn kb_words_up(windowed: bool) {
+    KB_WORDS_AT.store(crate::arch::ms(), Ordering::Relaxed);
+    KB_HELD_SAID.store(false, Ordering::Relaxed);
+    if windowed {
+        crate::pal::cursor_pin(true);
+    }
+}
+
+/// WORDSPOINTER: a key on the sheet (`kb_key`'s Words arm). Enter/Space past the dwell and the quiet gap is Continue;
+/// a held-back Enter/Space says why once per sheet; every other key is withheld silently.
+fn kb_words_key(c: u8) {
+    let key = match c {
+        b'\n' | b'\r' => "enter",
+        b' ' => "space",
+        _ => return,
+    };
+    let up_ms = crate::arch::ms().saturating_sub(KB_WORDS_AT.load(Ordering::Relaxed));
+    let gap = KB_KEY_GAP.load(Ordering::Relaxed);
+    let why = if up_ms < KB_WORDS_DWELL_MS {
+        "dwell"
+    } else if gap < KB_WORDS_QUIET_MS {
+        "repeat"
+    } else {
+        ""
+    };
+    if !why.is_empty() {
+        if !KB_HELD_SAID.swap(true, Ordering::Relaxed) {
+            serial_println!(
+                "[login] words key held back why={} (WORDSPOINTER: Enter/Space is Continue only after the sheet has been up {} ms and {} ms after the previous key, so a held key never skips the words)",
+                why, KB_WORDS_DWELL_MS, KB_WORDS_QUIET_MS
+            );
+        }
+        return;
+    }
+    PRESS_ANSWERED.fetch_add(1, Ordering::Relaxed);
+    serial_println!(
+        "[login] press key={} control={} answered={} swallowed={} via=key (WORDSPOINTER: Enter/Space on the recovery-words sheet is its Continue; nothing typed is printed)",
+        key,
+        ctl_name(Some(Ctl::Kb(1))),
+        PRESS_ANSWERED.load(Ordering::Relaxed),
+        PRESS_SWALLOWED.load(Ordering::Relaxed)
+    );
+    kb_continue();
+}
+
+/// WORDSPOINTER: `tests keyboot`'s door — the sheet's key path, headless, through [`consume_key`] (the key routes'
+/// entry). Runs only on a Closed screen; never a window, never the pin, never words. Returns (held, letter, enter,
+/// pin_released): held 1 = ten back-to-back Enters inside the dwell AND an Enter right after another key both left the
+/// sheet up (2 = SKIP, the screen is up); letter 1 = `a` past the dwell left it up; enter 1 = an Enter after the quiet
+/// gap pressed Continue. The form is put back to Closed whatever happened.
+pub fn words_key_leg() -> (u8, u8, u8, bool) {
+    {
+        let mut f = FORM.lock();
+        if f.state != State::Closed {
+            return (2, 0, 0, false);
+        }
+        f.state = State::Words;
+        f.windowed = false;
+        f.message = "";
+    }
+    KB.lock().after = 0;
+    kb_words_up(false);
+    let up = || FORM.lock().state == State::Words;
+    let wait = |ms: u64| {
+        let t = crate::arch::ms();
+        while crate::arch::ms().saturating_sub(t) < ms {
+            core::hint::spin_loop();
+        }
+    };
+    for _ in 0..10 {
+        let _ = consume_key(b'\n');
+    }
+    let held_dwell = up();
+    wait(KB_WORDS_DWELL_MS + KB_WORDS_QUIET_MS + 100);
+    let _ = consume_key(b'a');
+    let letter = up();
+    let _ = consume_key(b'\n');
+    let held_repeat = up();
+    wait(KB_WORDS_QUIET_MS + 100);
+    let _ = consume_key(b'\n');
+    let enter = !up();
+    let pin_released = !crate::pal::cursor_pin_held();
+    {
+        let mut f = FORM.lock();
+        if f.state == State::Words {
+            f.state = State::Closed;
+        }
+    }
+    ((held_dwell && held_repeat) as u8, letter as u8, enter as u8, pin_released)
 }
