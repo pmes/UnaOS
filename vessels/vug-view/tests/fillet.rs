@@ -7,6 +7,9 @@
 //! chamfers it to 970. VUGFACETREEFILLET (LEDGER SR518): on a 10 mm box drawn and pulled through the face (so the
 //! document holds `x0`), `f 2 Enter` records ONE `fillet f0 on=x0` whose replay volume is the body's; `u` restores 1000
 //! and drops the row (`U` brings it back as one solid); deleting the fillet row in the panel restores the body.
+//! VUGFACETREEEDITR (LEDGER SR528): the fillet row's value edited in the panel from 2 to 3 re-fillets through replay
+//! to the SR502 closed form at r 3; 12 is refused by the row's line with the document and the r 2 body kept; a chamfer
+//! row edited to `2,4` (the edge tool's pair road) gives 960.
 
 use bandy::SMessage;
 use brep_core::Tol;
@@ -254,4 +257,69 @@ fn deleting_the_fillet_row_restores_the_body() {
     assert!(fillets(&vw).is_empty());
     let v = body(&vw).volume().expect("volume");
     assert!((v - 1000.0).abs() <= 1e-6 * 1000.0, "volume {v}");
+}
+
+// ---- VUGFACETREEEDITR (SR528): the fillet / chamfer row's value edit re-fillets ----
+
+/// The panel open, the cursor on the first row `is` matches, Enter (the edit opens empty), `t` typed: the row's index.
+fn edit_row(vw: &mut Viewer, is: impl Fn(&doc_core::Stmt) -> bool, t: &str) -> usize {
+    assert!(typed(vw, "t"));
+    let i = vw.view.design.journal.doc.stmts.iter().position(is).expect("the row");
+    vw.view.design.journal.cursor = i;
+    assert!(key(vw, "Return"));
+    assert_eq!(vw.view.design.journal.edit.as_deref(), Some(""), "Enter opens the row's edit");
+    assert!(typed(vw, t));
+    assert_eq!(vw.view.design.journal.edit.as_deref(), Some(t), "the typed value");
+    i
+}
+
+fn is_fillet(s: &doc_core::Stmt) -> bool {
+    matches!(s, doc_core::Stmt::Fillet { .. })
+}
+
+#[test]
+fn editing_the_fillet_row_to_three_refillets_to_the_closed_form() {
+    let (mut vw, _) = filleted();
+    edit_row(&mut vw, is_fillet, "3");
+    assert!(key(&mut vw, "Return"));
+    assert_eq!(vw.view.design.journal.note, None);
+    let f = fillets(&vw);
+    assert_eq!(f.len(), 1);
+    assert!(matches!(&f[0], doc_core::Stmt::Fillet { id, r, .. } if id == "f0" && *r == 3.0), "{:?}", f[0]);
+    let b = body(&vw);
+    assert_eq!(b.breps.len(), 1, "one solid");
+    let want = 1000.0 - (4.0 - PI) * 9.0 / 4.0 * 10.0;
+    let v = b.volume().expect("volume");
+    assert!((v - want).abs() <= 1e-6 * want, "r 3: volume {v} vs {want}");
+}
+
+#[test]
+fn editing_the_fillet_row_to_twelve_is_refused_by_line_and_the_body_kept() {
+    let (mut vw, _) = filleted();
+    let before = vw.view.design.journal.doc.clone();
+    let i = edit_row(&mut vw, is_fillet, "12");
+    assert!(key(&mut vw, "Return"));
+    let note = vw.view.design.journal.note.clone().expect("refused");
+    assert!(note.starts_with(&format!("line {}:", i + 2)), "the fillet's line named: {note}");
+    assert!(note.contains("RadiusTooLarge"), "{note}");
+    assert_eq!(vw.view.design.journal.doc, before, "the document is unchanged");
+    let v = body(&vw).volume().expect("volume");
+    assert!((v - FILLETED).abs() <= 1e-6 * FILLETED, "the r 2 body is kept: volume {v}");
+}
+
+#[test]
+fn editing_a_chamfer_row_to_two_comma_four_gives_960() {
+    let mut vw = drawn();
+    picked(&mut vw, "F", Mode::Chamfer);
+    assert!(typed(&mut vw, "2,3"));
+    assert!(key(&mut vw, "Return"));
+    assert!((body(&vw).volume().expect("volume") - 970.0).abs() <= 1e-6 * 970.0);
+    edit_row(&mut vw, |s| matches!(s, doc_core::Stmt::Chamfer { .. }), "2,4");
+    assert!(key(&mut vw, "Return"));
+    assert_eq!(vw.view.design.journal.note, None);
+    let c: Vec<&doc_core::Stmt> = vw.view.design.journal.doc.stmts.iter().filter(|s| matches!(s, doc_core::Stmt::Chamfer { .. })).collect();
+    assert_eq!(c.len(), 1);
+    assert!(matches!(c[0], doc_core::Stmt::Chamfer { d1, d2, .. } if *d1 == 2.0 && *d2 == 4.0), "{:?}", c[0]);
+    let v = body(&vw).volume().expect("volume");
+    assert!((v - 960.0).abs() <= 1e-6 * 960.0, "2 x 4 chamfer: volume {v}");
 }
