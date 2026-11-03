@@ -348,6 +348,15 @@ pub fn segment_loop(pts: &[Vec2], sigma: f64, pitch: f64) -> Result<Vec<Prim>, R
         })
         .collect();
     let mut corners: Vec<usize> = (0..m).filter(|&k| turn[k] >= CORNER_DEG).collect();
+    // Two corners closer than the morphology's rounding (pitch / 8) are ONE corner seen as two half turns (the crack
+    // midpoints cut a square corner's tip): keep the sharper.
+    let trim = pitch / 8.0;
+    while corners.len() >= 2 {
+        let nc = corners.len();
+        let Some(q) = (0..nc).find(|&q| pts[idx[corners[q]]].dist(pts[idx[corners[(q + 1) % nc]]]) < trim) else { break };
+        let drop = if turn[corners[q]] >= turn[corners[(q + 1) % nc]] { (q + 1) % nc } else { q };
+        corners.remove(drop);
+    }
     if corners.is_empty() {
         if let Some(c) = fit_circle(pts).filter(|c| c.max <= band) {
             return Ok(vec![Prim::Circle { centre: c.c, r: c.r, rms: c.rms }]);
@@ -364,7 +373,6 @@ pub fn segment_loop(pts: &[Vec2], sigma: f64, pitch: f64) -> Result<Vec<Prim>, R
     let mut cpos: Vec<usize> = corners.iter().map(|&c| (c + m - corners[0]) % m).collect();
     cpos.sort_unstable();
     cpos.push(m);
-    let trim = pitch / 8.0;
     let mut pieces: Vec<Piece> = Vec::new();
     for w in cpos.windows(2) {
         pieces.extend(segment_run(&ring, &dpo[w[0]..=w[1]], band, pitch, trim));
