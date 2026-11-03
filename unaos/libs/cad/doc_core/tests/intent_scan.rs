@@ -199,6 +199,15 @@ fn suggest_reads_the_plate_and_every_proposal_is_accepted() {
             "distance i6 sketch=s a=p2 b=p3 d=30",
             "diameter i7 sketch=s circle=k1 d=6.6",
             "equal_radius i8 sketch=s a=k1 b=k2",
+            // VUGINTENTPOSITIONS (SR527): the holes mirror about the l2 / l4 midline; h1 sits on the datum grid.
+            "point i9 sketch=s x=24.85 y=0",
+            "midpoint i10 sketch=s p=i9 line=l1",
+            "point i11 sketch=s x=24.85 y=30.2",
+            "midpoint i12 sketch=s p=i11 line=l3",
+            "line i13 sketch=s a=i9 b=i11",
+            "symmetric i14 sketch=s a=h1 b=h2 line=i13",
+            "distance_point_line i15 sketch=s p=h1 line=l4 d=10",
+            "distance_point_line i16 sketch=s p=h1 line=l1 d=15",
         ]
     );
     assert!(ps[6].why.contains("ISO 273 medium clearance for M6"), "{}", ps[6].why);
@@ -254,6 +263,87 @@ fn a_bolt_circle_is_one_statement_set_and_accepted() {
     assert_eq!(first + 5, ps.len());
     let b = verify_all(&d, &ps, &m, d.tol);
     assert_eq!(b.accepted(), ps.len(), "{}", b.text());
+}
+
+// ---- VUGINTENTPOSITIONS (SR527): round hole positions, edge distances, symmetry about the midline ----
+
+/// A 50 x 30 x 6 plate drawn at round values with two r 3.2 holes measured at (12.4, 10.1) and (37.6, 10.1).
+const POSITIONS: &str = "vug-doc version=1 lin=1e-6 ang=1e-9
+sketch s o=[0 0 0] z=[0 0 1] x=[1 0 0]
+point p1 sketch=s x=0 y=0
+point p2 sketch=s x=50 y=0
+point p3 sketch=s x=50 y=30
+point p4 sketch=s x=0 y=30
+line l1 sketch=s a=p1 b=p2
+line l2 sketch=s a=p2 b=p3
+line l3 sketch=s a=p3 b=p4
+line l4 sketch=s a=p4 b=p1
+point h1 sketch=s x=12.4 y=10.1
+point h2 sketch=s x=37.6 y=10.1
+circle k1 sketch=s centre=h1 r=3.2
+circle k2 sketch=s centre=h2 r=3.2
+extrude e1 sketch=s outer=l1 dir=[0 0 1] length=6
+";
+
+#[test]
+fn positions_propose_the_mirror_pair_and_round_edge_distances() {
+    let d = doc(POSITIONS);
+    let mut s = box_planes(50.0, 30.0, 6.0);
+    s.push(cyl(v(12.4, 10.1, 3.0), 3.2, 400, 0.3));
+    s.push(cyl(v(37.6, 10.1, 3.0), 3.2, 400, 0.3));
+    let m = Measurement::Shapes { shapes: s, sigma_mm: 0.5, sigma_deg: SIGMA_DEG };
+    let ps = suggest(&d, &m);
+    let pos: Vec<&Proposal> = ps
+        .iter()
+        .filter(|p| p.why.starts_with("symmetric") || p.why.starts_with("datum grid") || p.why.starts_with("edge distance"))
+        .collect();
+    let got: Vec<&str> = pos.iter().map(|p| p.stmt.as_str()).collect();
+    // The midline set (ONE why), then h1's two edge distances; h2 is the mirror member and gets none.
+    let n = ps.len();
+    assert_eq!(
+        got,
+        [
+            format!("point i{} sketch=s x=25 y=0", n - 7),
+            format!("midpoint i{} sketch=s p=i{} line=l1", n - 6, n - 7),
+            format!("point i{} sketch=s x=25 y=30", n - 5),
+            format!("midpoint i{} sketch=s p=i{} line=l3", n - 4, n - 5),
+            format!("line i{} sketch=s a=i{} b=i{}", n - 3, n - 7, n - 5),
+            format!("symmetric i{} sketch=s a=h1 b=h2 line=i{}", n - 2, n - 3),
+            format!("distance_point_line i{} sketch=s p=h1 line=l4 d=12.5", n - 1),
+            format!("distance_point_line i{} sketch=s p=h1 line=l1 d=10", n),
+        ],
+        "{:?}",
+        stmts(&ps)
+    );
+    assert!(pos[..6].iter().all(|p| p.why == pos[0].why), "one set shares one why");
+    assert!(pos[0].why.starts_with("symmetric: h1 h2 mirror about the midline of l2 l4"), "{}", pos[0].why);
+    assert!(pos[6].why.starts_with("datum grid: h1"), "{}", pos[6].why);
+    assert!(pos.iter().all(|p| p.confidence > 0.5), "{:?}", pos.iter().map(|p| p.confidence).collect::<Vec<_>>());
+    assert!((pos[6].confidence - 0.8).abs() < 1e-9 && (pos[7].confidence - 0.8).abs() < 1e-9);
+    let b = verify_all(&d, &ps, &m, d.tol);
+    assert_eq!(b.accepted(), ps.len(), "{}", b.text());
+}
+
+/// One r 3.2 hole at (13.37, 9.2) read at sigma 0.1: neither its coordinates nor its edge distances are round.
+#[test]
+fn an_unround_position_proposes_nothing() {
+    let text = POSITIONS
+        .replace("point h1 sketch=s x=12.4 y=10.1", "point h1 sketch=s x=13.37 y=9.2")
+        .replace("point h2 sketch=s x=37.6 y=10.1\n", "")
+        .replace("circle k2 sketch=s centre=h2 r=3.2\n", "");
+    let d = doc(&text);
+    let mut s = box_planes(50.0, 30.0, 6.0);
+    s.push(cyl(v(13.37, 9.2, 3.0), 3.2, 400, 0.3));
+    let m = Measurement::Shapes { shapes: s, sigma_mm: 0.1, sigma_deg: SIGMA_DEG };
+    let ps = suggest(&d, &m);
+    assert!(ps.iter().all(|p| !p.stmt.contains("p=h1") && !p.stmt.contains("a=h1")), "{:?}", stmts(&ps));
+    assert!(
+        ps.iter().all(|p| !p.why.starts_with("symmetric") && !p.why.starts_with("datum grid") && !p.why.starts_with("edge distance")),
+        "{:?}",
+        stmts(&ps)
+    );
+    // The plate's own round proposals still come.
+    assert!(stmts(&ps).contains(&"distance i5 sketch=s a=p1 b=p2 d=50"), "{:?}", stmts(&ps));
 }
 
 #[test]
