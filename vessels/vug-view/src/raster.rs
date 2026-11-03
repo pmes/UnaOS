@@ -102,6 +102,9 @@ pub fn tri_colour(model: &Model, view: &View, tri: u32) -> Option<[u8; 4]> {
 
 /// Render the model under the view.
 pub fn render(model: &Model, view: &View) -> Frame {
+    // VUGFACE2 (SR485): the design's body (or the pull's preview) replaces the opened mesh.
+    let shown = view.design.shown();
+    let model = shown.as_deref().unwrap_or(model);
     let (w, h) = view.size;
     let n = w as usize * h as usize;
     let bg = rgba(BACKGROUND);
@@ -109,6 +112,8 @@ pub fn render(model: &Model, view: &View) -> Frame {
     fill(model, view, &mut fr);
     grid(model, view, &mut fr);
     triad(view, &mut fr);
+    // VUGFACE2 (SR485): the sketch overlay (profile tint, entities, glyphs, dof) over everything.
+    view.overlay(&mut fr);
     fr
 }
 
@@ -265,8 +270,8 @@ fn triad(view: &View, fr: &mut Frame) {
     }
 }
 
-/// A 1-pixel line (DDA), clipped to the frame.
-fn line(fr: &mut Frame, a: (f32, f32), b: (f32, f32), col: [u8; 4]) {
+/// A 1-pixel line (DDA), clipped to the frame (public for the sketch overlay, VUGFACE2 SR485).
+pub fn line(fr: &mut Frame, a: (f32, f32), b: (f32, f32), col: [u8; 4]) {
     let steps = (b.0 - a.0).abs().max((b.1 - a.1).abs()).ceil().max(1.0) as i32;
     for s in 0..=steps {
         let t = s as f32 / steps as f32;
@@ -275,5 +280,102 @@ fn line(fr: &mut Frame, a: (f32, f32), b: (f32, f32), col: [u8; 4]) {
             let i = (y as u32 * fr.width + x as u32) as usize * 4;
             fr.rgba[i..i + 4].copy_from_slice(&col);
         }
+    }
+}
+
+// ---- VUGFACE2 (SR485): the sketch overlay's primitives: the profile tint and the glyph font ----
+
+/// Tint the region the closed `rings` bound (even-odd over all of them, so a hole stays clear): `col` blended at
+/// `alpha` into every pixel whose centre is inside, clipped to the frame.
+pub fn tint(fr: &mut Frame, rings: &[Vec<(f32, f32)>], col: [u8; 4], alpha: f32) {
+    let (w, h) = (fr.width as i32, fr.height as i32);
+    let mut ys = rings.iter().flatten().map(|p| p.1);
+    let Some(first) = ys.next() else { return };
+    let (lo, hi) = ys.fold((first, first), |(a, b), y| (a.min(y), b.max(y)));
+    if !(lo.is_finite() && hi.is_finite()) {
+        return;
+    }
+    let y0 = (lo.floor() as i32).max(0);
+    let y1 = (hi.ceil() as i32).min(h - 1);
+    let mut xs: Vec<f32> = Vec::new();
+    for y in y0..=y1 {
+        let py = y as f32 + 0.5;
+        xs.clear();
+        for r in rings {
+            let n = r.len();
+            for i in 0..n {
+                let (a, b) = (r[i], r[(i + 1) % n]);
+                if (a.1 <= py) != (b.1 <= py) {
+                    xs.push(a.0 + (py - a.1) / (b.1 - a.1) * (b.0 - a.0));
+                }
+            }
+        }
+        xs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(core::cmp::Ordering::Equal));
+        for pair in xs.chunks(2) {
+            if pair.len() < 2 {
+                break;
+            }
+            let xa = ((pair[0] - 0.5).ceil() as i32).max(0);
+            let xb = ((pair[1] - 0.5).floor() as i32).min(w - 1);
+            for x in xa..=xb {
+                let i = (y * w + x) as usize * 4;
+                blend(&mut fr.rgba[i..i + 4], col, alpha);
+            }
+        }
+    }
+}
+
+/// A 3x5 bitmap per character (bit 4 the left column): digits, the constraint marks and the dof label's letters.
+const FONT: &[(char, [u8; 5])] = &[
+    ('0', [7, 5, 5, 5, 7]),
+    ('1', [2, 6, 2, 2, 7]),
+    ('2', [7, 1, 7, 4, 7]),
+    ('3', [7, 1, 7, 1, 7]),
+    ('4', [5, 5, 7, 1, 1]),
+    ('5', [7, 4, 7, 1, 7]),
+    ('6', [7, 4, 7, 5, 7]),
+    ('7', [7, 1, 1, 1, 1]),
+    ('8', [7, 5, 7, 5, 7]),
+    ('9', [7, 5, 7, 1, 7]),
+    ('H', [5, 5, 7, 5, 5]),
+    ('V', [5, 5, 5, 5, 2]),
+    ('=', [0, 7, 0, 7, 0]),
+    ('⟂', [2, 2, 2, 2, 7]),
+    ('T', [7, 2, 2, 2, 2]),
+    ('M', [5, 7, 7, 5, 5]),
+    ('o', [0, 2, 5, 2, 0]),
+    ('d', [1, 1, 7, 5, 7]),
+    ('f', [3, 2, 7, 2, 2]),
+    ('!', [2, 2, 2, 0, 2]),
+];
+
+/// One character of the bitmap font at (x, y) (its top-left), each bit a 2x2 block; an unknown character (and the
+/// space) draws nothing. Returns the advance (8 px).
+pub fn glyph(fr: &mut Frame, ch: char, x: f32, y: f32, col: [u8; 4]) -> f32 {
+    if let Some((_, rows)) = FONT.iter().find(|(c, _)| *c == ch) {
+        let (x0, y0) = (x.round() as i32, y.round() as i32);
+        for (r, bits) in rows.iter().enumerate() {
+            for c in 0..3 {
+                if bits & (4 >> c) == 0 {
+                    continue;
+                }
+                for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                    let (px, py) = (x0 + c * 2 + dx, y0 + r as i32 * 2 + dy);
+                    if px >= 0 && py >= 0 && (px as u32) < fr.width && (py as u32) < fr.height {
+                        let i = (py as u32 * fr.width + px as u32) as usize * 4;
+                        fr.rgba[i..i + 4].copy_from_slice(&col);
+                    }
+                }
+            }
+        }
+    }
+    8.0
+}
+
+/// A string of the bitmap font from (x, y).
+pub fn text(fr: &mut Frame, s: &str, x: f32, y: f32, col: [u8; 4]) {
+    let mut at = x;
+    for ch in s.chars() {
+        at += glyph(fr, ch, at, y, col);
     }
 }

@@ -168,13 +168,15 @@ pub struct View {
     pub picked: Option<u32>,
     pub cursor: (f64, f64),
     drag: Option<Drag>,
+    /// VUGFACE2 (SR485): the sketch face, the body and the pull (sketch.rs); the drawn model is `design.shown()`.
+    pub design: crate::sketch::Design,
 }
 
 impl View {
     /// A view at Home over `model`.
     pub fn new(model: &Model, size: (u32, u32), preset: Preset) -> View {
         let camera = Camera { eye: Vec3::zero(), yaw: 0.0, pitch: 0.0, fov_y: 30f32.to_radians() };
-        let mut v = View { camera, preset, size: (size.0.max(1), size.1.max(1)), picked: None, cursor: (0.0, 0.0), drag: None };
+        let mut v = View { camera, preset, size: (size.0.max(1), size.1.max(1)), picked: None, cursor: (0.0, 0.0), drag: None, design: Default::default() };
         v.home(model);
         v
     }
@@ -204,6 +206,47 @@ impl View {
         }
         let fp = self.focal_px();
         Some((self.size.0 as f32 * 0.5 + d.dot(r) / z * fp, self.size.1 as f32 * 0.5 - d.dot(u) / z * fp))
+    }
+
+    /// VUGFACE2 (SR485): the camera basis and focal length evaluated in f64 from the f32 camera's yaw, pitch and field
+    /// of view (the same formula as `Camera::basis` / `focal_px`, orthonormal to f64), for the sketch plane's hit.
+    fn basis_f64(&self) -> ([f64; 3], [f64; 3], [f64; 3], f64) {
+        let (sy, cy) = (self.camera.yaw as f64).sin_cos();
+        let (sp, cp) = (self.camera.pitch as f64).sin_cos();
+        let f = [cp * cy, cp * sy, sp];
+        let n = f[0].hypot(f[1]).max(1e-300);
+        let r = [f[1] / n, -f[0] / n, 0.0];
+        let u = [r[1] * f[2] - r[2] * f[1], r[2] * f[0] - r[0] * f[2], r[0] * f[1] - r[1] * f[0]];
+        let fp = (self.size.1 as f64 * 0.5) / (self.camera.fov_y as f64 * 0.5).tan();
+        (r, u, f, fp)
+    }
+
+    /// VUGFACE2 (SR485): `ray` in f64 — origin the eye, `dir . forward = 1` — so a plane hit and its `project_f64`
+    /// round-trip to 1e-9 mm (an f32 ray quantises a 100 mm hit near 1e-3 mm).
+    pub fn ray_f64(&self, px: f64, py: f64) -> ([f64; 3], [f64; 3]) {
+        let (r, u, f, fp) = self.basis_f64();
+        let e = self.camera.eye;
+        let a = (px - self.size.0 as f64 * 0.5) / fp;
+        let b = -(py - self.size.1 as f64 * 0.5) / fp;
+        ([e.x as f64, e.y as f64, e.z as f64], [0, 1, 2].map(|k| f[k] + r[k] * a + u[k] * b))
+    }
+
+    /// VUGFACE2 (SR485): `project` in f64, the exact inverse of `ray_f64` (`None` behind the eye).
+    pub fn project_f64(&self, p: [f64; 3]) -> Option<(f64, f64)> {
+        let (r, u, f, fp) = self.basis_f64();
+        let e = self.camera.eye;
+        let d = [p[0] - e.x as f64, p[1] - e.y as f64, p[2] - e.z as f64];
+        let dot = |a: [f64; 3]| a[0] * d[0] + a[1] * d[1] + a[2] * d[2];
+        let z = dot(f);
+        if z <= 0.0 {
+            return None;
+        }
+        Some((self.size.0 as f64 * 0.5 + dot(r) / z * fp, self.size.1 as f64 * 0.5 - dot(u) / z * fp))
+    }
+
+    /// VUGFACE2 (SR485): the sketch overlay, drawn by `raster::render` over the frame.
+    pub fn overlay(&self, fr: &mut crate::raster::Frame) {
+        crate::sketch::overlay(self, fr);
     }
 
     /// The model point under (px, py), if the ray hits it.
@@ -251,6 +294,12 @@ impl View {
 
     /// A shortcut key; true when the frame changed. `h`/`0` Home, `1` front, `3` right, `7` top, `p` next preset.
     pub fn key(&mut self, model: &Model, k: &str) -> bool {
+        // VUGFACE2 (SR485): the body replaces the drawn model; the sketch face takes its keys first (l c a p e Esc).
+        let shown = self.design.shown();
+        let model = shown.as_deref().unwrap_or(model);
+        if let Some(r) = crate::sketch::key(self, model, k) {
+            return r;
+        }
         match k {
             "h" | "H" | "0" | "Home" => self.home(model),
             "1" => self.front(model),
@@ -272,7 +321,13 @@ impl View {
     /// A press: resolve the action; a navigation press picks its pivot at the cursor (else the model's centre) — the
     /// ONE pick of a drag (bounded: one BVH query per press, none per move).
     pub fn press(&mut self, model: &Model, button: Button, mods: u8, x: f64, y: f64) -> bool {
+        // VUGFACE2 (SR485): the body replaces the drawn model; a bare left press is the sketch face's first.
+        let shown = self.design.shown();
+        let model = shown.as_deref().unwrap_or(model);
         self.cursor = (x, y);
+        if let Some(r) = crate::sketch::press(self, button, mods, x, y) {
+            return r;
+        }
         let action = self.preset.resolve(button, mods);
         let pivot = match action {
             Action::Orbit | Action::Pan | Action::Zoom => self.hit(model, x, y).map(|(p, _)| p).unwrap_or_else(|| Self::centre(model)),
@@ -286,6 +341,12 @@ impl View {
     /// Pointer motion; true when the frame changed.
     pub fn motion(&mut self, x: f64, y: f64) -> bool {
         self.cursor = (x, y);
+        // VUGFACE2 (SR485): with no navigation drag, the sketch face's gesture / hover / pull first.
+        if self.drag.is_none() {
+            if let Some(r) = crate::sketch::motion(self, x, y) {
+                return r;
+            }
+        }
         let Some(mut d) = self.drag else { return false };
         if !d.moved {
             if (x - d.start.0).hypot(y - d.start.1) < CLICK_PX {
@@ -308,6 +369,12 @@ impl View {
     /// A release: a click picks (Pick) or would open the menu (Menu, owed); true when the frame changed.
     pub fn release(&mut self, model: &Model, x: f64, y: f64) -> bool {
         self.cursor = (x, y);
+        // VUGFACE2 (SR485): with no navigation drag, the sketch face's release first.
+        if self.drag.is_none() {
+            if let Some(r) = crate::sketch::release(self, x, y) {
+                return r;
+            }
+        }
         let Some(d) = self.drag.take() else { return false };
         let click = (x - d.start.0).hypot(y - d.start.1) < CLICK_PX;
         if click && d.action == Action::Pick {
@@ -343,6 +410,9 @@ impl View {
 
     /// The point a zoom at the cursor moves toward: the model point under it, else the cursor ray at the centre's depth.
     fn zoom_target(&self, model: &Model) -> Vec3 {
+        // VUGFACE2 (SR485): zoom toward the body when it replaces the drawn model.
+        let shown = self.design.shown();
+        let model = shown.as_deref().unwrap_or(model);
         let (x, y) = self.cursor;
         match self.hit(model, x, y) {
             Some((p, _)) => p,

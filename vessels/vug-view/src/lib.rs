@@ -11,8 +11,10 @@
 //! `BrowserResize` — what quartzite's image surface emits) into view changes and answers with one `SurfaceBlit` per
 //! settled burst of input. `model` is the ONE seam to mesh_core, `view` the navigation, `raster` the drawing.
 
+pub mod extrude;
 pub mod model;
 pub mod raster;
+pub mod sketch;
 pub mod view;
 
 use bandy::SMessage;
@@ -28,7 +30,11 @@ pub const SHORTCUTS: &[(&str, &str)] = &[
     ("1", "front view"),
     ("3", "right view"),
     ("7", "top view"),
-    ("p", "next navigation preset"),
+    ("p", "next navigation preset (inside a sketch: the point tool)"),
+    // VUGFACE2 (SR485): the sketch face's keys.
+    ("l / c / a", "sketch a line / circle / arc (opens a sketch on the face under the cursor, else the plane facing you)"),
+    ("e", "extrude the profile under the cursor: drag the distance, click to commit"),
+    ("Esc", "back to select (again: clear the selection; cancels a pull)"),
     ("click", "pick a face"),
     ("middle / right drag", "orbit / pan / zoom per the preset"),
     ("Alt+drag", "the middle button, for a trackpad (orbit / pan / zoom per the preset)"),
