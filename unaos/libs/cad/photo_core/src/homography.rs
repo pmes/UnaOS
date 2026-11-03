@@ -1,0 +1,385 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
+// Copyright (C) 2026 The Architect & Una
+
+//! Step 3: the lattice homography. H maps paper millimetres (i · pitch, j · pitch) to photo pixels, `px ~ H [x, y, 1]`
+//! (row-major). The normalised DLT (Hartley, "In defense of the eight-point algorithm", IEEE PAMI 1997; Hartley &
+//! Zisserman, Multiple View Geometry 2nd ed., Alg 4.2): each point set translated to its centroid and scaled to a
+//! mean distance of √2, two rows of A per correspondence (H&Z eq 4.3), H's nine entries the eigenvector of AᵀA with
+//! the smallest eigenvalue (cyclic Jacobi, Numerical Recipes §11.1 — scan_core's `eigen_sym3` is its n = 3 case and
+//! is private to scan_core; VUG-GEOM-LINALG owes the one shared copy). RANSAC (Fischler & Bolles, CACM 1981; H&Z
+//! Alg 4.6) over 4-intersection minimal sets: a set with three points collinear IN PAPER coordinates is skipped by
+//! geom_core's exact `orient2d` (lattice points are exactly collinear, and the predicate says so exactly); inliers
+//! within [`BAND_PX`]; the adaptive count `T = ln(1 − 0.99) / ln(1 − w⁴)` under a cap; a fixed-seed splitmix64 (the
+//! scan_core fit.rs pattern, mirrored), so a measurement is bit-reproducible; the consensus refit twice.
+//!
+//! The paper frame is y-up as seen from above, so paper → photo (y down) must reverse orientation: when the
+//! lattice's local Jacobian has a positive determinant the j axis is negated (H ← H · diag(1, −1, 1)). The tilt
+//! off square is read from the same Jacobian J at the inliers' centroid: with singular values s1 ≥ s2, a camera
+//! square to the paper gives a similarity (s2 = s1) and a tilt t gives s2 / s1 ≈ cos t, skew included, so
+//! `tilt_deg = acos(s2 / s1)`. (A full 8-dof H absorbs any tilt of a flat sheet: the lattice is perpendicular after
+//! H by construction, so that cannot be the test.)
+
+use alloc::vec::Vec;
+
+use geom_core::{Mat3, Predicate, Vec3, orient2d};
+
+use crate::grid::Grid;
+use crate::{Degenerate, MIN_INTERSECTIONS, Refusal, Vec2};
+
+/// A homography, row-major.
+pub type H = [[f64; 3]; 3];
+
+/// The RANSAC inlier band (px).
+pub const BAND_PX: f64 = 2.0;
+/// The probability a run draws at least one all-inlier minimal set.
+pub const CONFIDENCE: f64 = 0.99;
+/// The trial cap.
+pub const MAX_TRIALS: u32 = 2000;
+const SEED: u64 = 0x9A9E_4D06_0503_0001;
+
+/// splitmix64 (Steele, Lea & Flood 2014): the deterministic sampler and the fixture's noise source (scan_core
+/// fit.rs's is crate-private; VUG-GEOM-LINALG owes the one copy).
+pub(crate) struct SplitMix(u64);
+
+impl SplitMix {
+    pub(crate) fn new(seed: u64) -> SplitMix {
+        SplitMix(seed)
+    }
+
+    pub(crate) fn next_u64(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// Uniform in [0, 1).
+    pub(crate) fn next_f64(&mut self) -> f64 {
+        (self.next_u64() >> 11) as f64 * (1.0 / (1u64 << 53) as f64)
+    }
+
+    fn below(&mut self, n: usize) -> usize {
+        (self.next_u64() % n as u64) as usize
+    }
+}
+
+fn trials_for(inliers: usize, n: usize) -> u32 {
+    let w = inliers as f64 / n as f64;
+    let wk = libm::pow(w, 4.0);
+    if wk >= 1.0 {
+        return 1;
+    }
+    if wk <= 0.0 {
+        return MAX_TRIALS;
+    }
+    let t = libm::ceil(libm::log(1.0 - CONFIDENCE) / libm::log(1.0 - wk));
+    if t.is_finite() && t < MAX_TRIALS as f64 { (t as u32).max(1) } else { MAX_TRIALS }
+}
+
+fn to_mat3(h: &H) -> Mat3 {
+    Mat3::from_cols(
+        Vec3::new(h[0][0], h[1][0], h[2][0]),
+        Vec3::new(h[0][1], h[1][1], h[2][1]),
+        Vec3::new(h[0][2], h[1][2], h[2][2]),
+    )
+}
+
+fn from_mat3(m: Mat3) -> H {
+    let c = m.cols;
+    [[c[0].x, c[1].x, c[2].x], [c[0].y, c[1].y, c[2].y], [c[0].z, c[1].z, c[2].z]]
+}
+
+/// `a · b` (geom_core's Mat3 product).
+pub fn mul(a: &H, b: &H) -> H {
+    from_mat3(to_mat3(a) * to_mat3(b))
+}
+
+/// H⁻¹ (geom_core's Mat3 inverse).
+pub fn invert(h: &H) -> Result<H, Degenerate> {
+    Ok(from_mat3(to_mat3(h).inverse()?))
+}
+
+/// The image of `p`; None at the line at infinity.
+pub fn apply(h: &H, p: Vec2) -> Option<Vec2> {
+    let w = h[2][0] * p.x + h[2][1] * p.y + h[2][2];
+    if !(w.abs() > 1e-300) {
+        return None;
+    }
+    let q = Vec2::new((h[0][0] * p.x + h[0][1] * p.y + h[0][2]) / w, (h[1][0] * p.x + h[1][1] * p.y + h[1][2]) / w);
+    if q.is_finite() { Some(q) } else { None }
+}
+
+/// The 2x2 Jacobian of `p ↦ apply(h, p)` at `p`, row-major.
+pub fn jacobian(h: &H, p: Vec2) -> [[f64; 2]; 2] {
+    let x = h[0][0] * p.x + h[0][1] * p.y + h[0][2];
+    let y = h[1][0] * p.x + h[1][1] * p.y + h[1][2];
+    let w = h[2][0] * p.x + h[2][1] * p.y + h[2][2];
+    let w2 = w * w;
+    [
+        [(h[0][0] * w - x * h[2][0]) / w2, (h[0][1] * w - x * h[2][1]) / w2],
+        [(h[1][0] * w - y * h[2][0]) / w2, (h[1][1] * w - y * h[2][1]) / w2],
+    ]
+}
+
+/// The tilt off square (degrees) of a local affine: acos of its singular-value ratio.
+pub fn tilt_deg(j: &[[f64; 2]; 2]) -> f64 {
+    let (a, b, c, d) = (j[0][0], j[0][1], j[1][0], j[1][1]);
+    let s = a * a + b * b + c * c + d * d;
+    let det = (a * d - b * c).abs();
+    let disc = libm::sqrt((s * s - 4.0 * det * det).max(0.0));
+    let s1 = libm::sqrt((s + disc) * 0.5);
+    if !(s1 > 0.0) {
+        return 90.0;
+    }
+    let ratio = (det / s1 / s1).clamp(0.0, 1.0);
+    libm::acos(ratio) * 180.0 / core::f64::consts::PI
+}
+
+/// Eigen-decomposition of a symmetric n x n (row-major `a`, destroyed) by cyclic Jacobi rotations: the eigenvalues
+/// and the eigenvectors as the COLUMNS of the returned row-major matrix.
+pub fn eigen_sym(a: &mut [f64], n: usize) -> (Vec<f64>, Vec<f64>) {
+    let mut v: Vec<f64> = (0..n * n).map(|k| if k / n == k % n { 1.0 } else { 0.0 }).collect();
+    for _ in 0..100 {
+        let mut off = 0.0;
+        let mut norm = 0.0;
+        for p in 0..n {
+            for q in 0..n {
+                let x = a[p * n + q];
+                norm += x * x;
+                if p < q {
+                    off += x * x;
+                }
+            }
+        }
+        if !(off > norm * (f64::EPSILON * f64::EPSILON)) {
+            break;
+        }
+        for p in 0..n {
+            for q in p + 1..n {
+                let apq = a[p * n + q];
+                if apq == 0.0 {
+                    continue;
+                }
+                let theta = (a[q * n + q] - a[p * n + p]) / (2.0 * apq);
+                let t = if theta >= 0.0 {
+                    1.0 / (theta + libm::sqrt(theta * theta + 1.0))
+                } else {
+                    -1.0 / (-theta + libm::sqrt(theta * theta + 1.0))
+                };
+                let c = 1.0 / libm::sqrt(t * t + 1.0);
+                let s = t * c;
+                for k in 0..n {
+                    let akp = a[k * n + p];
+                    let akq = a[k * n + q];
+                    a[k * n + p] = c * akp - s * akq;
+                    a[k * n + q] = s * akp + c * akq;
+                }
+                for k in 0..n {
+                    let apk = a[p * n + k];
+                    let aqk = a[q * n + k];
+                    a[p * n + k] = c * apk - s * aqk;
+                    a[q * n + k] = s * apk + c * aqk;
+                }
+                for k in 0..n {
+                    let vkp = v[k * n + p];
+                    let vkq = v[k * n + q];
+                    v[k * n + p] = c * vkp - s * vkq;
+                    v[k * n + q] = s * vkp + c * vkq;
+                }
+            }
+        }
+    }
+    ((0..n).map(|i| a[i * n + i]).collect(), v)
+}
+
+/// Hartley's normalisation: the similarity taking `pts` to centroid 0 and mean distance √2, and the moved points.
+fn normalise(pts: &[Vec2]) -> Result<(H, Vec<Vec2>), Degenerate> {
+    let n = pts.len() as f64;
+    let c = pts.iter().fold(Vec2::ZERO, |a, &p| a + p) / n;
+    let md = pts.iter().map(|&p| p.dist(c)).sum::<f64>() / n;
+    if !(md > 0.0 && md.is_finite()) {
+        return Err(Degenerate::Collinear);
+    }
+    let s = core::f64::consts::SQRT_2 / md;
+    let t = [[s, 0.0, -s * c.x], [0.0, s, -s * c.y], [0.0, 0.0, 1.0]];
+    Ok((t, pts.iter().map(|&p| (p - c) * s).collect()))
+}
+
+/// The normalised DLT from `paper` to `px` (at least four correspondences).
+pub fn dlt(paper: &[Vec2], px: &[Vec2]) -> Result<H, Degenerate> {
+    if paper.len() < 4 || paper.len() != px.len() {
+        return Err(Degenerate::Collinear);
+    }
+    let (tp, p) = normalise(paper)?;
+    let (tx, x) = normalise(px)?;
+    let mut ata = [0.0f64; 81];
+    for k in 0..p.len() {
+        let (xx, yy) = (p[k].x, p[k].y);
+        let (u, v) = (x[k].x, x[k].y);
+        let r1 = [0.0, 0.0, 0.0, -xx, -yy, -1.0, v * xx, v * yy, v];
+        let r2 = [xx, yy, 1.0, 0.0, 0.0, 0.0, -u * xx, -u * yy, -u];
+        for r in [r1, r2] {
+            for i in 0..9 {
+                for j in 0..9 {
+                    ata[i * 9 + j] += r[i] * r[j];
+                }
+            }
+        }
+    }
+    let (vals, vecs) = eigen_sym(&mut ata, 9);
+    let mut k = 0;
+    for i in 1..9 {
+        if vals[i] < vals[k] {
+            k = i;
+        }
+    }
+    let mut hn = [[0.0; 3]; 3];
+    for i in 0..9 {
+        hn[i / 3][i % 3] = vecs[i * 9 + k];
+    }
+    let mut h = mul(&mul(&invert(&tx)?, &hn), &tp);
+    let s = if h[2][2].abs() > 1e-12 {
+        h[2][2]
+    } else {
+        libm::sqrt(h.iter().flatten().map(|v| v * v).sum::<f64>())
+    };
+    for row in &mut h {
+        for v in row {
+            *v /= s;
+        }
+    }
+    if h.iter().flatten().all(|v| v.is_finite()) { Ok(h) } else { Err(Degenerate::NonFinite) }
+}
+
+fn inliers(h: &H, paper: &[Vec2], px: &[Vec2], band: f64) -> Vec<usize> {
+    (0..paper.len()).filter(|&k| apply(h, paper[k]).is_some_and(|q| q.dist(px[k]) <= band)).collect()
+}
+
+fn pick<T: Copy>(v: &[T], idx: &[usize]) -> Vec<T> {
+    idx.iter().map(|&k| v[k]).collect()
+}
+
+/// RANSAC around the normalised DLT: the refitted H and its inliers.
+pub fn ransac(paper: &[Vec2], px: &[Vec2], band: f64) -> Result<(H, Vec<usize>), Refusal> {
+    let n = paper.len();
+    if n < MIN_INTERSECTIONS {
+        return Err(Refusal::TooFewIntersections { have: n, need: MIN_INTERSECTIONS });
+    }
+    let mut rng = SplitMix::new(SEED);
+    let mut best: Vec<usize> = Vec::new();
+    let mut cap = MAX_TRIALS;
+    let mut trials = 0u32;
+    while trials < cap {
+        trials += 1;
+        let mut s = [0usize; 4];
+        let mut k = 0;
+        while k < 4 {
+            let c = rng.below(n);
+            if !s[..k].contains(&c) {
+                s[k] = c;
+                k += 1;
+            }
+        }
+        let triples = [(0, 1, 2), (0, 1, 3), (0, 2, 3), (1, 2, 3)];
+        let general = triples.iter().all(|&(a, b, c)| {
+            matches!(orient2d(paper[s[a]], paper[s[b]], paper[s[c]]), Predicate::Positive | Predicate::Negative)
+        });
+        if !general {
+            continue;
+        }
+        let Ok(h) = dlt(&pick(paper, &s), &pick(px, &s)) else { continue };
+        let inl = inliers(&h, paper, px, band);
+        if inl.len() > best.len() {
+            best = inl;
+            cap = trials_for(best.len(), n).max(trials.min(MAX_TRIALS));
+        }
+    }
+    if best.len() < MIN_INTERSECTIONS {
+        return Err(Refusal::TooFewIntersections { have: best.len(), need: MIN_INTERSECTIONS });
+    }
+    let mut h = dlt(&pick(paper, &best), &pick(px, &best)).map_err(Refusal::Degenerate)?;
+    for _ in 0..2 {
+        let inl = inliers(&h, paper, px, band);
+        if inl.len() < MIN_INTERSECTIONS {
+            break;
+        }
+        best = inl;
+        h = dlt(&pick(paper, &best), &pick(px, &best)).map_err(Refusal::Degenerate)?;
+    }
+    Ok((h, best))
+}
+
+/// The fitted lattice: H (paper mm → px), its residuals, the tilt, the local scale, the radial hint and the paper
+/// bounding box of the inliers.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Lattice {
+    pub h: H,
+    pub inliers: usize,
+    pub residual_px: f64,
+    pub residual_mm: f64,
+    pub tilt_deg: f64,
+    pub px_per_mm: f64,
+    pub lens_hint: f64,
+    pub x0: f64,
+    pub y0: f64,
+    pub x1: f64,
+    pub y1: f64,
+}
+
+/// Fit the lattice of `grid` at `pitch` mm in a photo `w` x `h` px.
+pub fn fit_lattice(grid: &Grid, pitch: f64, w: usize, h: usize) -> Result<Lattice, Refusal> {
+    let mut paper: Vec<Vec2> = grid.inter.iter().map(|q| Vec2::new(q.i as f64 * pitch, q.j as f64 * pitch)).collect();
+    let px: Vec<Vec2> = grid.inter.iter().map(|q| q.px).collect();
+    let (mut hm, inl) = ransac(&paper, &px, BAND_PX)?;
+    let centroid = |paper: &[Vec2]| inl.iter().fold(Vec2::ZERO, |a, &k| a + paper[k]) / inl.len() as f64;
+    let j = jacobian(&hm, centroid(&paper[..]));
+    if j[0][0] * j[1][1] - j[0][1] * j[1][0] > 0.0 {
+        for p in &mut paper {
+            p.y = -p.y;
+        }
+        hm = mul(&hm, &[[1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, 1.0]]);
+    }
+    let pc = centroid(&paper[..]);
+    let j = jacobian(&hm, pc);
+    let tilt = tilt_deg(&j);
+    let px_per_mm = libm::sqrt((j[0][0] * j[1][1] - j[0][1] * j[1][0]).abs());
+    let hinv = invert(&hm).map_err(Refusal::Degenerate)?;
+    let (mut e_px, mut e_mm) = (0.0, 0.0);
+    let centre = Vec2::new(w as f64 * 0.5, h as f64 * 0.5);
+    let r_max = libm::hypot(w as f64 * 0.5, h as f64 * 0.5);
+    let (mut num, mut den) = (0.0, 0.0);
+    let (mut x0, mut y0, mut x1, mut y1) = (f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
+    for &k in &inl {
+        let q = apply(&hm, paper[k]).ok_or(Refusal::Degenerate(Degenerate::NonFinite))?;
+        let e = px[k] - q;
+        e_px += e.mag_sq();
+        let back = apply(&hinv, px[k]).ok_or(Refusal::Degenerate(Degenerate::NonFinite))?;
+        e_mm += back.dist(paper[k]) * back.dist(paper[k]);
+        let rv = px[k] - centre;
+        let r = rv.mag();
+        if r > 0.0 {
+            let s = libm::pow(r / r_max, 3.0);
+            num += e.dot(rv / r) * s;
+            den += s * s;
+        }
+        x0 = x0.min(paper[k].x);
+        y0 = y0.min(paper[k].y);
+        x1 = x1.max(paper[k].x);
+        y1 = y1.max(paper[k].y);
+    }
+    let m = inl.len() as f64;
+    Ok(Lattice {
+        h: hm,
+        inliers: inl.len(),
+        residual_px: libm::sqrt(e_px / m),
+        residual_mm: libm::sqrt(e_mm / m),
+        tilt_deg: tilt,
+        px_per_mm,
+        lens_hint: if den > 0.0 { num / den } else { 0.0 },
+        x0,
+        y0,
+        x1,
+        y1,
+    })
+}

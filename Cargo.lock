@@ -3604,6 +3604,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "photo"
+version = "0.1.0"
+dependencies = [
+ "doc_core",
+ "photo_core",
+ "pixel_core",
+ "sketch_core",
+]
+
+[[package]]
+name = "photo_core"
+version = "0.1.0"
+dependencies = [
+ "geom_core",
+ "libm",
+ "pixel_core",
+ "sketch_core",
+]
+
+[[package]]
 name = "pico-args"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
