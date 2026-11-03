@@ -64,7 +64,7 @@ impl Seg2 {
     }
     /// The segment's share of the loop's signed area (Green): the chord's shoelace term, plus the circular segment
     /// r²/2 (φ − sin φ) for an arc of signed sweep φ.
-    fn area_term(&self) -> f64 {
+    pub(crate) fn area_term(&self) -> f64 {
         let chord = self.start().cross(self.end()) * 0.5;
         match self {
             Seg2::Line(..) => chord,

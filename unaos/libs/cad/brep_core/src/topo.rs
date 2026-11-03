@@ -23,6 +23,8 @@ pub struct Id(pub u64);
 pub enum OpKind {
     Extrude,
     Revolve,
+    /// VUGBREP2 (SR481): made by a boolean (`union` / `difference` / `intersection`).
+    Boolean,
 }
 
 /// The entity's role in its operation.
@@ -38,6 +40,9 @@ pub enum Role {
     Seam,
     /// An edge swept by a profile vertex (extrude: the straight edge; revolve: the circle).
     Sweep,
+    /// VUGBREP2 (SR481): where two operands' faces meet. A section edge names (a, b) = the two source face Ids, a
+    /// pierce vertex (the source edge Id, the face Id it crosses); each a per-operand Id (past u32::MAX refuses).
+    Section,
 }
 
 /// What generated an entity: `a` is the profile loop index (0 = outer), `b` the segment (or vertex) index in it.
