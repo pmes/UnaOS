@@ -136,6 +136,10 @@ fn the_rest_cut_validates_stays_inside_the_walls_and_round_trips_grbl() {
         }
     }
     assert!(cutting > 0);
+    // grbl 1.1 cannot say M6: the grbl leg runs with the rest tool already loaded, the program regenerated.
+    let loaded = Machine { loaded: Some(2), ..m.clone() };
+    let p = generate(&rest_op(rect(5.0, 5.0, 45.0, 45.0), 4.0, 2), &loaded, T).expect("rest with tool 2 loaded");
+    assert!(!p.moves.iter().any(|mv| matches!(mv, Move::ToolChange { .. })));
     let d = Dialect::Grbl { laser: false };
     let text = gcode::write(&p, d).unwrap();
     let back = gcode::read(&text, d).unwrap();
