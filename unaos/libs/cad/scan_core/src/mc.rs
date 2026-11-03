@@ -212,7 +212,7 @@ where
                         let v = s.positions.len() as u32;
                         s.positions.push(pos(ga).lerp(pos(gb), t));
                         s.weights.push(wt[a] + (wt[b] - wt[a]) * t as f32);
-                        s.normals.push(grad(ga).lerp(grad(gb), t).normalize());
+                        s.normals.push(grad(ga).lerp(grad(gb), t).normalize().unwrap_or(Vec3::ZERO));
                         verts.insert(key, v);
                         v
                     }
@@ -326,7 +326,7 @@ mod tests {
         assert!(vol > 0.0, "outward orientation");
         assert!((vol - exact).abs() / exact < 0.03, "volume {vol} vs {exact}");
         for (p, nrm) in s.positions.iter().zip(&s.normals) {
-            assert!(nrm.dot(p.normalize()) > 0.9, "normal points out");
+            assert!(nrm.dot(p.normalize().unwrap()) > 0.9, "normal points out");
         }
         assert!(s.weights.iter().all(|w| *w == 1.0));
     }

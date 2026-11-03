@@ -9,7 +9,7 @@
 use alloc::vec::Vec;
 use libm::ceil;
 
-use crate::geom::{Tol, Vec2, Vec3, line_line2, seg_seg2, signed_area2};
+use crate::geom::{Length, Tol, Vec2, Vec3, line_line2, seg_seg2, signed_area2};
 use crate::machine::{Machine, Tool};
 use crate::program::{Move, Program, Spin};
 use crate::validate::Refusal;

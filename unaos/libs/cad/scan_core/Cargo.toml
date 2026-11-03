@@ -8,9 +8,11 @@ description = "Vug's scan core: probe_core depth frames with given poses fused i
 # VUGSCAN1 (LEDGER SR469): `#![no_std]` + `alloc`, `#![forbid(unsafe_code)]`, the midden_core / timeline_core shape: a shared
 # core under `unaos/libs/cad/`, a member of the ROOT host workspace, linkable by path with `default-features = false`.
 # probe_core gives the frames and the ONE pinhole model (`Intrinsics::project` / `deproject`, `metres_at`); libm the
-# sqrt / log / trig no_std lacks. geom_core (SR464) and mesh_core (SR466) were not on their branches at build time:
-# src/geom.rs and src/mesh.rs are SHIMs the seat swaps for `pub use` re-exports, adding their two path deps here.
+# sqrt / log / trig no_std lacks. geom_core (SR464) and mesh_core (SR466) by path since VUGSHIMSWAP (SR473): src/geom.rs
+# and src/mesh.rs are their re-exports (plus geom.rs's one adapter, `from_axes`).
 [dependencies]
+geom_core = { path = "../geom_core", default-features = false }
+mesh_core = { path = "../mesh_core", default-features = false }
 probe_core = { path = "../../media/probe_core" }
 libm = { version = "0.2", default-features = false }
 

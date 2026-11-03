@@ -144,7 +144,7 @@ impl Mesh {
     pub fn normals_face(&self, tol: Tol) -> Vec<Vec3> {
         (0..self.triangles.len())
             .map(|t| match self.corners(t) {
-                Some([a, b, c]) if !degenerate(a, b, c, tol) => (b - a).cross(c - a).normalize(),
+                Some([a, b, c]) if !degenerate(a, b, c, tol) => (b - a).cross(c - a).normalize().unwrap_or(Vec3::ZERO),
                 _ => Vec3::ZERO,
             })
             .collect()
@@ -159,7 +159,7 @@ impl Mesh {
             if degenerate(p[0], p[1], p[2], tol) {
                 continue;
             }
-            let n = (p[1] - p[0]).cross(p[2] - p[0]).normalize();
+            let n = (p[1] - p[0]).cross(p[2] - p[0]).normalize().unwrap_or(Vec3::ZERO);
             let tri = self.triangles[t];
             for k in 0..3 {
                 let u = p[(k + 1) % 3] - p[k];
@@ -169,7 +169,7 @@ impl Mesh {
                 acc[i] = acc[i] + n * angle;
             }
         }
-        acc.into_iter().map(Vec3::normalize).collect()
+        acc.into_iter().map(|v| v.normalize().unwrap_or(Vec3::ZERO)).collect()
     }
 
     /// The box of every position (`None` for no positions).

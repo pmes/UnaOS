@@ -26,7 +26,7 @@
 
 extern crate alloc;
 
-mod geom;
+use geom_core as geom;
 pub use geom::{Arc2, Tol, Vec2};
 
 mod constraint;

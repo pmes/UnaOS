@@ -277,7 +277,7 @@ fn turntable_pose(k: usize, deg: f64, radius_mm: f64) -> Transform {
     let y = Vec3::new(0.0, 1.0, 0.0);
     let z = Vec3::new(s, 0.0, c);
     let origin = Vec3::new(-radius_mm * s, 0.0, radius_mm - radius_mm * c);
-    Transform::from_axes(x, y, z, origin)
+    scan_core::fixture::from_axes(x, y, z, origin)
 }
 
 /// `--poses`: 12 numbers per line, the 3x4 camera → world `[R | t]` row-major.
@@ -313,7 +313,7 @@ fn load_poses(path: &str) -> Result<Vec<Transform>, Refusal> {
             return Err(Refusal::PoseNotRigid { line });
         }
         let col = |j: usize| Vec3::new(r[0][j], r[1][j], r[2][j]);
-        out.push(Transform::from_axes(col(0), col(1), col(2), Vec3::new(v[3], v[7], v[11])));
+        out.push(scan_core::fixture::from_axes(col(0), col(1), col(2), Vec3::new(v[3], v[7], v[11])));
     }
     Ok(out)
 }
@@ -386,21 +386,16 @@ fn run(a: &Args) -> Result<String, Refusal> {
     let plane: Result<Fit<Plane>, FitError> = fit_plane(&sm.mesh.positions, band);
     let (mut cp, mut cn) = (Vec::new(), Vec::new());
     for (i, &p) in sm.mesh.positions.iter().enumerate() {
-        if plane.as_ref().map_or(true, |f| f.shape.distance(p).abs() > a.band) {
+        if plane.as_ref().map_or(true, |f| f.shape.signed_distance(p).abs() > a.band) {
             cp.push(p);
             cn.push(sm.normals[i]);
         }
     }
     let cyl: Result<Fit<Cylinder>, FitError> = fit_cylinder(&cp, &cn, band);
 
-    // The PLY: scan_core's mesh into mesh_core's writer (one field-wise copy while scan_core carries its own
-    // geom/mesh seam; the seat's shim swap makes both the same geom_core types).
-    let mesh = mesh_core::Mesh {
-        positions: sm.mesh.positions.iter().map(|p| mesh_core::Vec3::new(p.x, p.y, p.z)).collect(),
-        triangles: sm.mesh.triangles.clone(),
-    };
+    // The PLY: scan_core's mesh IS mesh_core's (VUGSHIMSWAP SR473), straight into mesh_core's writer.
     let out = a.out.as_deref().unwrap_or_default();
-    std::fs::write(out, mesh_core::ply::write(&mesh)).map_err(|e| Refusal::Io { path: out.into(), error: e.to_string() })?;
+    std::fs::write(out, mesh_core::ply::write(&sm.mesh)).map_err(|e| Refusal::Io { path: out.into(), error: e.to_string() })?;
 
     let k0 = intr[0];
     let (cmin, cmean) = if sm.confidence.is_empty() {
@@ -509,7 +504,7 @@ mod tests {
     #[test]
     fn turntable_is_the_orbit_seen_from_frame_zero() {
         let (c, r, d) = (Vec3::new(-20.0, 30.0, 50.0), 600.0, 25.0f64);
-        let p0 = orbit(c, r, 0.0, 0.0).inverse();
+        let p0 = orbit(c, r, 0.0, 0.0).invert().unwrap();
         let probes = [Vec3::new(0.0, 0.0, 0.0), Vec3::new(10.0, -20.0, 300.0), Vec3::new(-50.0, 40.0, 900.0)];
         for k in 0..5usize {
             let pk = orbit(c, r, 0.0, -(k as f64 * d).to_radians());

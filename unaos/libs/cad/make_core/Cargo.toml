@@ -8,9 +8,10 @@ description = "Vug's Make core: the machine model (MDES-shaped kinematics, ISO 1
 # VUGMAKE (LEDGER SR467): `#![no_std]` + `alloc`, `#![forbid(unsafe_code)]`, the timeline_core shape (BP-vug-4): a shared
 # core under `unaos/libs/cad/`, a member of the ROOT host workspace, linkable by the kernel by path with
 # `default-features = false`. libm is the one f64 math (MATH-ONE, the timeline_core / icc_core line).
-# GEOM SHIM: geom_core (VUGGEOM SR464) was unfolded when this crate was cut; `src/geom.rs` is a one-file shim. The swap
-# is that file's bodies -> `pub use geom_core::{..}` + adapters, and this line: geom_core = { path = "../geom_core" }
+# THE GEOM SEAM: geom_core (VUGGEOM SR464) by path since VUGSHIMSWAP (SR473); `src/geom.rs` is its re-exports plus the
+# adapters make_core's call sites use.
 [dependencies]
+geom_core = { path = "../geom_core", default-features = false }
 libm = { version = "0.2", default-features = false }
 
 [features]
