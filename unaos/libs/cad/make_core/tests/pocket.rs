@@ -391,6 +391,13 @@ fn slot() -> Vec<Vec2> {
     rect(10.0, 20.0, 18.0, 25.0)
 }
 
+/// The mill with the ramp tool loaded, so its program needs no tool change (grbl 1.1 rejects M6).
+fn ramp_mill() -> Machine {
+    let mut m = mill();
+    m.loaded = Some(4);
+    m
+}
+
 fn pos_of(mv: &Move) -> Option<Vec3> {
     match mv {
         Move::Rapid { to } | Move::Linear { to, .. } | Move::Arc { to, .. } => Some(*to),
@@ -419,8 +426,8 @@ fn plunged(p: &Program) -> Program {
 #[test]
 fn a_flat_end_with_a_ramp_angle_ramps_along_the_first_ring() {
     // The SR479 square pocket at 0.5 deep: the innermost ring is the square of half side 2 (length 16); the ramp's run
-    // is 0.5 / tan 3 deg = 9.54, so it ramps.
-    let m = mill();
+    // is 0.5 / tan 3 deg = 9.54, so it ramps. Tool 4 is loaded: grbl 1.1 says no M6.
+    let m = ramp_mill();
     let outline = rect(5.0, 5.0, 45.0, 45.0);
     let p = generate(&pocket(outline.clone(), vec![], 0.5, false, 4), &m, T).unwrap();
     // After the feed to the top, the first move descends along the ring at exactly tan 3 deg.
@@ -447,7 +454,7 @@ fn a_flat_end_with_a_ramp_angle_ramps_along_the_first_ring() {
 fn a_narrow_slot_enters_by_a_helix_at_the_ramp_angle() {
     // 1 deep: the run (19.08) is longer than the ring (10), so a helix about the ring's deepest point, radius
     // min(0.5, r - tol) = 0.5 (the ring's half width), descending no steeper than tan 3 deg.
-    let m = mill();
+    let m = ramp_mill();
     let p = generate(&pocket(slot(), vec![], 1.0, false, 4), &m, T).unwrap();
     let mut pos: Option<Vec3> = None;
     let mut helical = 0;
