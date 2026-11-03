@@ -303,6 +303,21 @@ pub fn inset(lp: &[Vec2], d: f64, tol: Tol) -> Option<Vec<Vec2>> {
     while pts.len() > 1 && (pts[0] - pts[pts.len() - 1]).length() <= tol.lin {
         pts.pop();
     }
+    // Vertices collinear within tol.ang drop: a straight-through vertex moved along its normal would sit past the
+    // neighbouring miter when it is closer to a corner than `d`, reversing that edge (a section carries such points
+    // wherever a wall's triangulation diagonal crosses the plane).
+    let mut j = 0;
+    while pts.len() >= 3 && j < pts.len() {
+        let n = pts.len();
+        let (a, b, c) = (pts[(j + n - 1) % n], pts[j], pts[(j + 1) % n]);
+        let (u, v) = (b - a, c - b);
+        if libm::fabs(u.cross(v)) <= tol.ang * u.length() * v.length() && u.dot(v) > 0.0 {
+            pts.remove(j);
+            j = j.saturating_sub(1);
+        } else {
+            j += 1;
+        }
+    }
     let n = pts.len();
     if n < 3 {
         return None;
