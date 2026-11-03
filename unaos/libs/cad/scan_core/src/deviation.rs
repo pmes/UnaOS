@@ -22,7 +22,8 @@
 //!    agrees: the signed distance, positive where the scan stands proud of the design (material outside), negative
 //!    where it falls short; `None` for a vertex that is not the part (the fixture, the floor, clutter).
 //! 4. [`Stats`] (rms, max, the 95th percentile, the fraction inside the band) and one [`FaceReport`] per design face
-//!    (its signed mean is a plane's offset or a cylinder's radius error), worst first.
+//!    (its signed mean is a plane's offset or a cylinder's radius error), by rms, worst first: a systematic offset over a
+//!    whole face outranks one edge-rounding or noise vertex (the signed max is still each face's).
 //! 5. [`shade`]: the band classifier a face colours from (no colour here).
 //!
 //! The start is the caller's (`init`): a world-posed scan starts at the identity; a global coarse registration is
@@ -153,7 +154,7 @@ pub struct FaceReport {
 }
 
 /// The measured part: the registration, the signed deviation of each scan vertex (`None`: not the part), the
-/// statistics, and every design face worst first (faces no vertex matched last, `n` 0).
+/// statistics, and every design face by rms, worst first (faces no vertex matched last, `n` 0).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Deviation {
     pub aligned: Aligned,
@@ -340,7 +341,7 @@ pub fn deviations(scan: &ScanMesh, design: &Design, bvh: &Bvh, aligned: Aligned,
             }
         })
         .collect();
-    faces.sort_by(|a, b| (b.n > 0).cmp(&(a.n > 0)).then(b.max_mm.abs().total_cmp(&a.max_mm.abs())).then(a.face.cmp(&b.face)));
+    faces.sort_by(|a, b| (b.n > 0).cmp(&(a.n > 0)).then(b.rms_mm.total_cmp(&a.rms_mm)).then(a.face.cmp(&b.face)));
     Deviation { aligned, per_vertex, stats, faces }
 }
 

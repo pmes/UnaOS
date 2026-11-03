@@ -68,7 +68,7 @@
 //! `float deviation` (mm, NaN off the design) and `uchar red green blue` from scan_core's `shade` in palette_core's
 //! status colours (inside the band POSITIVE, short toward INFO, proud toward CRITICAL, off the design TEXT_SECONDARY).
 //! The report adds `deviation: aligned rms= max= p95= inside= faces=<seen>/<total> ...` and one
-//! `face: <solid>/<op>.<role>.<a>.<b>:<kind> n= max= rms= mean=` line per design face, worst first; a refused
+//! `face: <solid>/<op>.<role>.<a>.<b>:<kind> n= max= rms= mean=` line per design face, by rms, worst first; a refused
 //! registration prints `deviation: refused <Name> {..}` and the run exits 1. Without `--against` nothing changes.
 
 use std::collections::HashMap;
@@ -749,7 +749,7 @@ fn colour(s: Shade) -> [u8; 3] {
     }
 }
 
-/// VUGSCANDEVIATION (SR510): `deviation: aligned ...` and one `face:` line per design face, worst first.
+/// VUGSCANDEVIATION (SR510): `deviation: aligned ...` and one `face:` line per design face, by rms, worst first.
 fn deviation_report(r: &mut String, d: &Deviation, names: &[String]) {
     let s = &d.stats;
     let seen = d.faces.iter().filter(|f| f.n > 0).count();
