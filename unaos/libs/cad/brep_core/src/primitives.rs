@@ -5,7 +5,7 @@
 use crate::Refusal;
 use crate::build::{Seg2, check_loops, extrude_loops, revolve_loops};
 use crate::curve::Frame;
-use crate::dep::{Arc2, Tol, Vec2, Vec3};
+use geom_core::{Arc2, Tol, Vec2, Vec3};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::f64::consts::{FRAC_PI_2, PI, TAU};

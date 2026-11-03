@@ -33,7 +33,7 @@ use crate::classify::{
     line_cylinder, outward, plane_frame, seg2, start_angle, where2,
 };
 use crate::curve::Curve;
-use crate::dep::{Tol, Vec3};
+use geom_core::{Line, LinePlane, Plane, Tol, Vec3, line_plane};
 use crate::mass::shell_volume;
 use crate::surface::{Intersection, Surface, intersect};
 use crate::topo::{Brep, Id, Name, OpKind, Role, UvBox};
@@ -206,13 +206,13 @@ enum Meet {
 /// `surface::intersect` (the circle read as the cylinder of its own axis).
 fn curve_surface(c: &Curve, s: &Surface, tol: Tol) -> Result<Meet, Refusal> {
     match (c, s) {
+        // VUGBREPSWAP (SR492): geom_core's `line_plane` (the edge's `dir` is unit, so its `t` is the curve parameter).
         (Curve::Line { o, dir }, Surface::Plane { f }) => {
-            let dn = f.z.dot(*dir);
-            let dist = f.z.dot(*o - f.o);
-            if libm::fabs(dn) <= tol.ang {
-                return Ok(if libm::fabs(dist) <= tol.lin { Meet::On } else { Meet::At(Vec::new()) });
-            }
-            Ok(Meet::At(vec![(-dist / dn, false)]))
+            Ok(match line_plane(&Line::new(*o, *dir)?, &Plane::from_point_normal(f.o, f.z)?, tol) {
+                LinePlane::Point { t, .. } => Meet::At(vec![(t, false)]),
+                LinePlane::Parallel => Meet::At(Vec::new()),
+                LinePlane::InPlane => Meet::On,
+            })
         }
         (Curve::Line { o, dir }, Surface::Cylinder { f, r }) => Ok(match line_cylinder(*o, *dir, f, *r, tol) {
             LineCyl::None => Meet::At(Vec::new()),
@@ -240,6 +240,8 @@ fn curve_surface(c: &Curve, s: &Surface, tol: Tol) -> Result<Meet, Refusal> {
         }
         (Curve::Circle { f: cf, r }, Surface::Cylinder { .. }) => {
             let own = Surface::Cylinder { f: *cf, r: *r };
+            // VUGBREPSWAP (SR492): each generator's foot on the circle's plane is geom_core's `line_plane`.
+            let cp = Plane::from_point_normal(cf.o, cf.z)?;
             Ok(match intersect(&own, s, tol)? {
                 Intersection::Coincident => Meet::On,
                 Intersection::Curves(ls) => {
@@ -247,10 +249,10 @@ fn curve_surface(c: &Curve, s: &Surface, tol: Tol) -> Result<Meet, Refusal> {
                     let mut v = Vec::new();
                     for l in ls {
                         if let Curve::Line { o, dir } = l {
-                            let den = dir.dot(cf.z);
-                            let p = o + dir * ((cf.o - o).dot(cf.z) / den);
-                            let (x, y, _) = cf.local(p);
-                            v.push((libm::atan2(y, x), tangent));
+                            if let LinePlane::Point { p, .. } = line_plane(&Line::new(o, dir)?, &cp, tol) {
+                                let (x, y, _) = cf.local(p);
+                                v.push((libm::atan2(y, x), tangent));
+                            }
                         }
                     }
                     Meet::At(v)

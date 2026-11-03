@@ -86,52 +86,22 @@ impl Work {
     }
 }
 
-/// The document's Tol for the cores that do not yet share sketch_core's type (field-wise: compiles before and after
-/// the geom_core swaps).
-fn brep_tol(t: Tol) -> brep_core::dep::Tol {
-    brep_core::dep::Tol { lin: t.lin, ang: t.ang }
-}
-
 fn make_tol(t: Tol) -> make_core::Tol {
     make_core::Tol { lin: t.lin, ang: t.ang }
 }
 
-fn bv2(x: f64, y: f64) -> brep_core::dep::Vec2 {
-    brep_core::dep::Vec2::new(x, y)
+fn bv2(x: f64, y: f64) -> brep_core::Vec2 {
+    brep_core::Vec2::new(x, y)
 }
 
-fn bv3(v: [f64; 3]) -> brep_core::dep::Vec3 {
-    brep_core::dep::Vec3::new(v[0], v[1], v[2])
+fn bv3(v: [f64; 3]) -> brep_core::Vec3 {
+    brep_core::Vec3::new(v[0], v[1], v[2])
 }
 
-fn brep_loop(l: &sketch_core::Loop) -> brep_core::dep::Loop {
-    let edges = l
-        .edges
-        .iter()
-        .map(|e| match *e {
-            sketch_core::Edge::Line { from, to, src } => brep_core::dep::Edge::Line {
-                from: bv2(from.x, from.y),
-                to: bv2(to.x, to.y),
-                src: brep_core::dep::EntityId(src.0),
-            },
-            sketch_core::Edge::Arc { arc, src } => brep_core::dep::Edge::Arc {
-                arc: brep_core::dep::Arc2 {
-                    centre: bv2(arc.centre.x, arc.centre.y),
-                    radius: arc.radius,
-                    start: arc.start,
-                    sweep: arc.sweep,
-                },
-                src: brep_core::dep::EntityId(src.0),
-            },
-        })
-        .collect();
-    brep_core::dep::Loop { edges, area: l.area }
-}
-
-/// THE seam from sketch_core's profile to the one brep_core takes (a field-wise copy; an identity copy once brep_core's
-/// dep.rs takes sketch_core by path).
-pub fn brep_profile(p: &sketch_core::Profile) -> brep_core::dep::Profile {
-    brep_core::dep::Profile { outer: brep_loop(&p.outer), holes: p.holes.iter().map(brep_loop).collect() }
+/// THE seam from sketch_core's profile to the one brep_core takes: since VUGBREPSWAP (SR492) brep_core takes
+/// sketch_core's `Profile` itself, so this is the identity (kept public for callers that named it).
+pub fn brep_profile(p: &sketch_core::Profile) -> brep_core::Profile {
+    p.clone()
 }
 
 /// A text point reference to sketch_core's, or the id it waited on.
@@ -287,7 +257,7 @@ pub fn replay(doc: &Doc, tol: Tol) -> Replay {
     }
 
     // 3. Features, in document order.
-    let bt = brep_tol(tol);
+    let bt = tol; // VUGBREPSWAP (SR492): the document's Tol is brep_core's (geom_core's one Tol).
     let mut built: BTreeSet<String> = BTreeSet::new();
     for (i, s) in doc.stmts.iter().enumerate() {
         let line = doc.line(i);
@@ -318,11 +288,10 @@ pub fn replay(doc: &Doc, tol: Tol) -> Replay {
                 continue;
             }
         };
-        let bp = brep_profile(&p);
         let got = match s {
-            Stmt::Extrude { dir, length, .. } => brep_core::extrude(&bp, &frame, bv3(*dir), *length, bt),
+            Stmt::Extrude { dir, length, .. } => brep_core::extrude(&p, &frame, bv3(*dir), *length, bt),
             Stmt::Revolve { axis_o, axis_d, angle, .. } => brep_core::revolve(
-                &bp,
+                &p,
                 &frame,
                 bv2(axis_o[0], axis_o[1]),
                 bv2(axis_d[0], axis_d[1]),

@@ -10,7 +10,7 @@
 //! EntityId (VUG-BREP-NAMES owed).
 
 use crate::curve::Curve;
-use crate::dep::Vec3;
+use geom_core::Vec3;
 use crate::surface::Surface;
 use alloc::vec::Vec;
 

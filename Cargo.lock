@@ -519,7 +519,10 @@ dependencies = [
 name = "brep_core"
 version = "0.1.0"
 dependencies = [
+ "geom_core",
  "libm",
+ "mesh_core",
+ "sketch_core",
 ]
 
 [[package]]

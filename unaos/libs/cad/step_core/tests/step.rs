@@ -3,7 +3,8 @@
 //! CYLINDRICAL_SURFACE and two CIRCLE edges; the writer is deterministic; an unsupported entity refuses by name and
 //! instance; a mangled file refuses by line and column.
 
-use brep_core::dep::{Arc2, Edge as PEdge, EntityId, Loop as PLoop, Profile, Tol, Vec2, Vec3};
+use brep_core::sketch_core::{Edge as PEdge, Loop as PLoop};
+use brep_core::{Arc2, EntityId, Profile, Tol, Vec2, Vec3};
 use brep_core::primitives::{box_, cone, cylinder, sphere, torus};
 use brep_core::{Brep, Curve, Frame, OpKind, Role, extrude, properties, revolve, validate};
 use std::f64::consts::{PI, TAU};

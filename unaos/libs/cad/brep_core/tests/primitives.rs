@@ -2,7 +2,7 @@
 //! relative, and tessellates to a closed manifold mesh within the stated chord.
 
 mod common;
-use brep_core::dep::Tol;
+use brep_core::Tol;
 use brep_core::primitives::{box_, cone, cylinder, sphere, torus};
 use brep_core::{Brep, Entity, Report, properties, tessellate, validate};
 use common::{close, manifold_chi, max_deviation, mesh_volume};

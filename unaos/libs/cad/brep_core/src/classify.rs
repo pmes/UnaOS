@@ -10,13 +10,18 @@
 //! - A curved face is its uv box; only the cylinder's (u, v) is inverted here (cone / sphere / torus: VUG-BREP-SSI).
 //! - In-solid: `On` when the point lies on a face, else ray parity over the faces: a plane by its parameter, a
 //!   cylinder by the quadratic (`line_cylinder`, also the booleans' edge/cylinder pierce), each hit then in-face.
-//!   orient3d is not in the dep seam, so the ray's side of a plane is the closed-form parameter with the Tol band
-//!   (VUG-BREP-SEAM owed).
+//!   VUGBREPSWAP (SR492, VUG-BREP-SEAM): the ray / plane parameter is geom_core's `line_plane` and the point's side of
+//!   the plane is geom_core's exact `orient3d`; an `Uncertain` side, or one that disagrees with the parameter's sign,
+//!   makes the direction ambiguous. In-face, the ray / line and ray / arc solves are geom_core's `line_line2` and
+//!   `line_circle2`.
 
 use crate::Refusal;
 use crate::build::Seg2;
 use crate::curve::{Curve, Frame};
-use crate::dep::{Arc2, Predicate, Tol, Vec2, Vec3, orient2d};
+use geom_core::{
+    Arc2, Circle2, Line, Line2, LineCircle, LineLine2, LinePlane, Plane, Predicate, Tol, Vec2, Vec3, line_circle2, line_line2,
+    line_plane, orient2d, orient3d,
+};
 use crate::surface::Surface;
 use crate::topo::{Brep, Face, UvBox};
 use alloc::vec::Vec;
@@ -143,6 +148,8 @@ fn sign(p: Predicate) -> Option<i8> {
 /// ambiguous at this piece: through or within Tol of one of its ends, tangent to an arc, along a line, starting on it,
 /// or an `Uncertain` predicate.
 fn ray_hits(seg: &Seg2, q: Vec2, d: Vec2, tol: Tol, out: &mut Vec<f64>) -> bool {
+    let Ok(ray) = Line2::new(q, d) else { return false };
+    let d = ray.dir;
     match seg {
         Seg2::Line(a, b) => {
             let q2 = q + d;
@@ -158,9 +165,8 @@ fn ray_hits(seg: &Seg2, q: Vec2, d: Vec2, tol: Tol, out: &mut Vec<f64>) -> bool 
                 return true;
             }
             let Some(so) = sign(orient2d(q, *a, *b)) else { return false };
-            let e = *b - *a;
-            let den = d.cross(e);
-            let s = (*a - q).cross(e) / den;
+            let Ok(edge) = Line2::through(*a, *b) else { return false };
+            let LineLine2::Point { t: s, .. } = line_line2(&ray, &edge, tol) else { return false };
             if so != sb {
                 return true;
             }
@@ -175,9 +181,7 @@ fn ray_hits(seg: &Seg2, q: Vec2, d: Vec2, tol: Tol, out: &mut Vec<f64>) -> bool 
             true
         }
         Seg2::Arc(k) => {
-            let w = q - k.centre;
-            let bb = d.dot(w);
-            let perp = libm::fabs(d.cross(w));
+            let Ok(circle) = Circle2::new(k.centre, k.radius) else { return false };
             let tu = tol.lin / k.radius;
             let full = libm::fabs(k.sweep) >= TAU - tu;
             let in_arc = |s: f64| {
@@ -186,17 +190,18 @@ fn ray_hits(seg: &Seg2, q: Vec2, d: Vec2, tol: Tol, out: &mut Vec<f64>) -> bool 
                 let near_end = rel <= tu || rel >= TAU - tu || libm::fabs(rel - libm::fabs(k.sweep)) <= tu;
                 (rel <= libm::fabs(k.sweep), near_end && (!full || rel <= tu || rel >= TAU - tu))
             };
-            if libm::fabs(perp - k.radius) <= tol.lin {
-                // Tangent: ambiguous when the touch point is ahead and on the arc.
-                let s = -bb;
-                return !(s > -tol.lin && (in_arc(s).0 || in_arc(s).1));
-            }
-            if perp > k.radius {
-                return true;
-            }
-            let half = libm::sqrt(k.radius * k.radius - perp * perp);
+            let at = |p: Vec2| (p - q).dot(d);
+            let (p0, p1) = match line_circle2(&ray, &circle, tol) {
+                LineCircle::Miss => return true,
+                LineCircle::Tangent(p) => {
+                    // Tangent: ambiguous when the touch point is ahead and on the arc.
+                    let s = at(p);
+                    return !(s > -tol.lin && (in_arc(s).0 || in_arc(s).1));
+                }
+                LineCircle::Two(p0, p1) => (p0, p1),
+            };
             let mut clean = true;
-            for s in [-bb - half, -bb + half] {
+            for s in [at(p0), at(p1)] {
                 if s <= -tol.lin {
                     continue;
                 }
@@ -424,22 +429,34 @@ impl<'a> Body<'a> {
             }
         }
         'dirs: for &(x, y, z) in &DIRS3 {
-            let d = Vec3::new(x, y, z).normalize()?;
+            let ray = Line::new(p, Vec3::new(x, y, z))?;
+            let d = ray.dir;
             let mut n = 0u32;
             for (fi, g) in &self.faces {
                 let mut cand: [Option<f64>; 2] = [None, None];
                 match self.b.faces[*fi as usize].surface {
-                    Surface::Plane { f } => {
-                        let dn = f.z.dot(d);
-                        let dist = f.z.dot(p - f.o);
-                        if libm::fabs(dn) <= tol.ang {
-                            if libm::fabs(dist) <= tol.lin {
+                    Surface::Plane { f } => match line_plane(&ray, &Plane::from_point_normal(f.o, f.z)?, tol) {
+                        LinePlane::InPlane => continue 'dirs,
+                        LinePlane::Parallel => continue,
+                        LinePlane::Point { t, .. } => {
+                            // The Tol band, as before: a hit at t <= tol.lin is behind or at the start, never counted.
+                            if t <= tol.lin {
+                                continue;
+                            }
+                            // The exact side of p (orient3d is positive below the plane through o, o + x, o + y,
+                            // i.e. against z): the hit is ahead only when p lies on the side d leaves from. An
+                            // `Uncertain` side, or one that disagrees with the parameter, is ambiguous.
+                            let ahead = match orient3d(f.o, f.o + f.x, f.o + f.y, p) {
+                                Predicate::Positive => f.z.dot(d) > 0.0,
+                                Predicate::Negative => f.z.dot(d) < 0.0,
+                                Predicate::Zero | Predicate::Uncertain(_) => false,
+                            };
+                            if !ahead {
                                 continue 'dirs;
                             }
-                            continue;
+                            cand[0] = Some(t);
                         }
-                        cand[0] = Some(-dist / dn);
-                    }
+                    },
                     Surface::Cylinder { f, r } => match line_cylinder(p, d, &f, r, tol) {
                         LineCyl::None => continue,
                         LineCyl::On => continue 'dirs,

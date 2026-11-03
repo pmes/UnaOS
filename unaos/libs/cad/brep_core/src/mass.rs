@@ -13,7 +13,7 @@
 
 use crate::Refusal;
 use crate::curve::Curve;
-use crate::dep::{Tol, Vec3};
+use geom_core::{Tol, Vec3};
 use crate::quad::{nodes4, nodes16, pieces};
 use crate::surface::Surface;
 use crate::topo::Brep;

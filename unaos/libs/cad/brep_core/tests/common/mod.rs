@@ -1,8 +1,9 @@
-//! Test helpers. `manifold_chi` is a TEST-ONLY stand-in for mesh_core's `HalfEdge::build` + `euler_characteristic`
-//! (mesh_core is shimmed at the VUGBREP1 build); the fold replaces it with the real calls.
+//! Test helpers. `manifold_chi` is a TEST-ONLY edge-pair check (written while mesh_core was shimmed, VUGBREP1); kept at
+//! VUGBREPSWAP (SR492) because mesh_core's `HalfEdge::build` adds a vertex-fan refusal these counts were never measured
+//! against (VUG-BREP-TESTCHI owed).
 #![allow(dead_code)]
 
-use brep_core::dep::{Mesh, Vec3};
+use brep_core::{Mesh, Vec3};
 use brep_core::{Brep, Entity, Tessellation};
 use std::collections::{HashMap, HashSet};
 

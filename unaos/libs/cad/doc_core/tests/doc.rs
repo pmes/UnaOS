@@ -162,9 +162,9 @@ fn direct_s1() -> f64 {
     solve(&mut sk, Tol { lin: 1e-6, ang: 1e-9 }).unwrap();
     let pr = profiles(&sk, Tol { lin: 1e-6, ang: 1e-9 });
     let pr = pr.iter().find(|q| q.outer.edges.iter().any(|e| e.src() == l[0])).unwrap();
-    let bt = brep_core::dep::Tol { lin: 1e-6, ang: 1e-9 };
-    let fr = Frame::new(brep_core::dep::Vec3::ZERO, brep_core::dep::Vec3::Z, brep_core::dep::Vec3::X).unwrap();
-    let b = extrude(&brep_profile(pr), &fr, brep_core::dep::Vec3::Z, 5.0, bt).unwrap();
+    let bt = brep_core::Tol { lin: 1e-6, ang: 1e-9 };
+    let fr = Frame::new(brep_core::Vec3::ZERO, brep_core::Vec3::Z, brep_core::Vec3::X).unwrap();
+    let b = extrude(&brep_profile(pr), &fr, brep_core::Vec3::Z, 5.0, bt).unwrap();
     properties(&b, bt).unwrap().volume
 }
 
@@ -182,13 +182,13 @@ fn direct_s2() -> f64 {
     solve(&mut sk, t).unwrap();
     let pr = profiles(&sk, t);
     let pr = pr.iter().find(|p| p.outer.edges.iter().any(|e| e.src() == m[0])).unwrap();
-    let bt = brep_core::dep::Tol { lin: 1e-6, ang: 1e-9 };
-    let fr = Frame::new(brep_core::dep::Vec3::ZERO, -brep_core::dep::Vec3::Y, brep_core::dep::Vec3::X).unwrap();
+    let bt = brep_core::Tol { lin: 1e-6, ang: 1e-9 };
+    let fr = Frame::new(brep_core::Vec3::ZERO, -brep_core::Vec3::Y, brep_core::Vec3::X).unwrap();
     let b = revolve(
         &brep_profile(pr),
         &fr,
-        brep_core::dep::Vec2::new(0.0, 0.0),
-        brep_core::dep::Vec2::new(0.0, 1.0),
+        brep_core::Vec2::new(0.0, 0.0),
+        brep_core::Vec2::new(0.0, 1.0),
         6.283185307179586,
         bt,
     )
@@ -204,7 +204,7 @@ fn replay_gives_the_volume_the_direct_call_gives() {
     assert_eq!(r.sketches.len(), 2);
     let ids: Vec<&str> = r.solids.iter().map(|s| s.id.as_str()).collect();
     assert_eq!(ids, ["e1", "e2"]);
-    let bt = brep_core::dep::Tol { lin: 1e-6, ang: 1e-9 };
+    let bt = brep_core::Tol { lin: 1e-6, ang: 1e-9 };
     let v1 = properties(&r.solids[0].brep, bt).unwrap().volume;
     let v2 = properties(&r.solids[1].brep, bt).unwrap().volume;
     assert_eq!(v1, direct_s1(), "extrude: replay == direct, bit for bit");

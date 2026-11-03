@@ -33,7 +33,7 @@ use alloc::format;
 use alloc::string::ToString;
 use alloc::vec;
 use alloc::vec::Vec;
-use brep_core::dep::{Tol, Vec3};
+use brep_core::{Tol, Vec3};
 use brep_core::{Brep, Curve, Frame, Name, NurbsCurve, OpKind, Role, Surface, UvBox};
 use core::f64::consts::{FRAC_PI_2, TAU};
 

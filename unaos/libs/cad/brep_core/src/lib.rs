@@ -20,6 +20,9 @@
 //!
 //! VUGBREP2 (LEDGER SR481) builds [`union`] / [`difference`] / [`intersection`] over plane and cylinder faces
 //! (src/bool.rs) and point classification by exact ray parity ([`point_in_solid`], src/classify.rs).
+//!
+//! VUGBREPSWAP (LEDGER SR492): the siblings are the real crates by path, re-exported here (the crates themselves for
+//! sketch_core's `Edge` / `Loop`, which share names with this crate's topology); src/dep.rs and its shims are gone.
 #![no_std]
 #![forbid(unsafe_code)]
 
@@ -32,7 +35,6 @@ pub mod build;
 pub mod boolean;
 pub mod classify;
 pub mod curve;
-pub mod dep;
 mod earcut;
 pub mod mass;
 pub mod primitives;
@@ -52,11 +54,18 @@ pub use tess::{Tessellation, tessellate};
 pub use topo::{Brep, CoEdge, Edge, Entity, Face, Id, Loop, Name, OpKind, Role, Shell, Solid, UvBox, Vertex};
 pub use validate::{Report, validate};
 
+pub use geom_core;
+pub use geom_core::{Arc2, Degenerate, Tol, Vec2, Vec3};
+pub use mesh_core;
+pub use mesh_core::Mesh;
+pub use sketch_core;
+pub use sketch_core::{EntityId, Profile};
+
 /// Every way brep_core says no. Each variant names what was refused, and where an entity is at fault, its [`Id`].
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Refusal {
     /// A geometric input geom_core calls degenerate (zero vector, zero radius, non-finite, ...).
-    Degenerate(dep::Degenerate),
+    Degenerate(geom_core::Degenerate),
     /// An exact predicate could not decide (geom_core's `Predicate::Uncertain`), so the operation does not guess.
     Undecidable,
     /// A construction outside what this crate builds (named).
@@ -101,8 +110,8 @@ pub enum Refusal {
     NotClosed { edge: Id },
 }
 
-impl From<dep::Degenerate> for Refusal {
-    fn from(d: dep::Degenerate) -> Self {
+impl From<geom_core::Degenerate> for Refusal {
+    fn from(d: geom_core::Degenerate) -> Self {
         Refusal::Degenerate(d)
     }
 }

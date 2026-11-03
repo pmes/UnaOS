@@ -3,7 +3,7 @@
 //! volume is within chord x area of the exact one; the persistent face Name survives a cut; contacts refuse by name.
 
 mod common;
-use brep_core::dep::{Tol, Vec3};
+use brep_core::{Tol, Vec3};
 use brep_core::primitives::{box_, cylinder};
 use brep_core::{
     Brep, Curve, OpKind, Refusal, Report, Role, Surface, SurfaceKind, difference, faces_named, intersection, properties,

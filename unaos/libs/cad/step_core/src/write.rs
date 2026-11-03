@@ -14,7 +14,7 @@ use crate::p21::{real, string};
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
-use brep_core::dep::{Tol, Vec3};
+use brep_core::{Tol, Vec3};
 use brep_core::{Brep, Curve, Frame, NurbsCurve, Surface};
 use core::fmt::Write as _;
 

@@ -12,7 +12,7 @@
 
 use crate::Refusal;
 use crate::curve::{Curve, Frame};
-use crate::dep::{Circle2, CircleCircle, Plane, PlanePlane, Tol, Vec2, Vec3, circle_circle2, plane_plane};
+use geom_core::{Circle2, CircleCircle, Plane, PlanePlane, Tol, Vec2, Vec3, circle_circle2, plane_plane};
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -148,7 +148,7 @@ pub fn intersect(a: &Surface, b: &Surface, tol: Tol) -> Result<Intersection, Ref
         (Surface::Plane { f: p }, Surface::Plane { f: q }) => {
             let pa = Plane::from_point_normal(p.o, p.z)?;
             let pb = Plane::from_point_normal(q.o, q.z)?;
-            Ok(match plane_plane(&pa, &pb, tol)? {
+            Ok(match plane_plane(&pa, &pb, tol) {
                 PlanePlane::Line(l) => Intersection::Curves(vec![Curve::Line { o: l.point, dir: l.dir }]),
                 PlanePlane::Parallel => Intersection::Empty,
                 PlanePlane::Coincident => Intersection::Coincident,
@@ -173,10 +173,11 @@ pub fn intersect(a: &Surface, b: &Surface, tol: Tol) -> Result<Intersection, Ref
                 return Err(Refusal::NotClosedForm { a: SurfaceKind::Cylinder, b: SurfaceKind::Cylinder });
             }
             let (x, y, _) = c1.local(c2.o);
-            let k1 = Circle2 { centre: Vec2::new(0.0, 0.0), radius: *r1 };
-            let k2 = Circle2 { centre: Vec2::new(x, y), radius: *r2 };
+            // VUGBREPSWAP (SR492): geom_core's circle_circle2 takes the circles as built; `Circle2::new` keeps a zero radius refused.
+            let k1 = Circle2::new(Vec2::new(0.0, 0.0), *r1)?;
+            let k2 = Circle2::new(Vec2::new(x, y), *r2)?;
             let line = |q: Vec2| Curve::Line { o: c1.at(q.x, q.y, 0.0), dir: c1.z };
-            Ok(match circle_circle2(&k1, &k2, tol)? {
+            Ok(match circle_circle2(&k1, &k2, tol) {
                 CircleCircle::Two(p, q) => Intersection::Curves(vec![line(p), line(q)]),
                 CircleCircle::Tangent(p) => Intersection::Curves(vec![line(p)]),
                 CircleCircle::Separate | CircleCircle::Contained => Intersection::Empty,

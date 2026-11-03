@@ -2,7 +2,8 @@
 //! revolved rectangle is the cylinder, partial revolves validate, and the refusals are named.
 
 mod common;
-use brep_core::dep::{Arc2, Edge as PEdge, EntityId, Loop as PLoop, Profile, Tol, Vec2, Vec3};
+use brep_core::sketch_core::{Edge as PEdge, Loop as PLoop};
+use brep_core::{Arc2, EntityId, Profile, Tol, Vec2, Vec3};
 use brep_core::primitives::cylinder;
 use brep_core::{Frame, Refusal, Role, extrude, properties, revolve, tessellate, validate};
 use common::{close, manifold_chi};
