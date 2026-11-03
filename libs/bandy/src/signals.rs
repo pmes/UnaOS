@@ -1247,6 +1247,10 @@ pub enum IntentEvent {
     Proposals { request: u64, proposals: Vec<IntentProposal> },
     /// A refused request, with the reason by name (`ImageTooLarge(0)`, `ProseAroundJson`, `NoProvider: ...`).
     Refused { request: u64, why: String },
+    // VUG-VEIN-STREAM (SR531): one proposal as soon as it parses, `index` from 0 in the model's order. A preview: the one
+    // terminal answer (`Proposals`, the whole list, or `Refused`, which withdraws the streamed ones) always follows.
+    /// One streamed proposal (Vein's answer, inert as input); the terminal `Proposals` or `Refused` follows.
+    Proposal { request: u64, index: u32, proposal: IntentProposal },
 }
 
 /// One photo on the bus: `image/png`, `image/jpeg` or `image/webp`, its encoded bytes.

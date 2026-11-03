@@ -562,7 +562,7 @@ fn ask(view: &mut View) -> bool {
 pub fn answer(view: &mut View, ev: &IntentEvent) -> bool {
     let Some(ph) = view.photo.as_mut() else { return false };
     let request = match ev {
-        IntentEvent::Propose { .. } => return false,
+        IntentEvent::Propose { .. } | IntentEvent::Proposal { .. } => return false,
         IntentEvent::Proposals { request, .. } | IntentEvent::Refused { request, .. } => *request,
     };
     if ph.asked != Some(request) {
@@ -580,6 +580,6 @@ pub fn answer(view: &mut View, ev: &IntentEvent) -> bool {
             ph.note = Some(format!("Vein refused: {why}"));
             true
         }
-        IntentEvent::Propose { .. } => false,
+        IntentEvent::Propose { .. } | IntentEvent::Proposal { .. } => false,
     }
 }

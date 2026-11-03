@@ -1909,3 +1909,17 @@ kat!(
     SMessage::Intent(bandy::IntentEvent::Refused { request: 7, why: "ProseAroundJson".to_string() }),
     r#"{"Intent":{"Refused":{"request":7,"why":"ProseAroundJson"}}}"#
 );
+// VUG-VEIN-STREAM (SR531): one proposal streamed as it parses; the terminal Proposals / Refused follows.
+kat!(
+    kat_intent_proposal,
+    SMessage::Intent(bandy::IntentEvent::Proposal {
+        request: 7,
+        index: 1,
+        proposal: bandy::IntentProposal {
+            stmt: "parallel c8 sketch=s1 a=l1 b=l3".to_string(),
+            confidence: 0.93,
+            why: "The two long edges measure 0.3 deg apart.".to_string(),
+        },
+    }),
+    r#"{"Intent":{"Proposal":{"request":7,"index":1,"proposal":{"stmt":"parallel c8 sketch=s1 a=l1 b=l3","confidence":0.93,"why":"The two long edges measure 0.3 deg apart."}}}}"#
+);

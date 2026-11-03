@@ -202,3 +202,79 @@ fn objects_keys_and_values_are_refused_by_name() {
     assert_eq!(parse(&many(PROPOSALS_MAX)).unwrap().len(), PROPOSALS_MAX);
     assert_eq!(refused(&many(PROPOSALS_MAX + 1)), Refusal::TooMany);
 }
+
+// --- VUG-VEIN-STREAM (SR531): the incremental parse, KATs over every split point ---
+
+/// `answer` pushed as `pieces`: every item yielded in order, the count after each piece, and the verdict.
+fn stream(pieces: &[&str]) -> (Vec<Proposal>, Vec<usize>, Result<Vec<Proposal>, Refusal>) {
+    let mut inc = Incremental::new();
+    let (mut got, mut counts) = (Vec::new(), Vec::new());
+    for p in pieces {
+        got.extend(inc.push(p));
+        counts.push(inc.yielded());
+    }
+    let fin = inc.finish();
+    (got, counts, fin)
+}
+
+/// Every two-piece split at a char boundary, and one char at a time: the yield and the verdict never change.
+fn every_split(answer: &str, want_items: &[Proposal], want_fin: &Result<Vec<Proposal>, Refusal>) {
+    for i in (0..=answer.len()).filter(|&i| answer.is_char_boundary(i)) {
+        let (got, _, fin) = stream(&[&answer[..i], &answer[i..]]);
+        assert_eq!(&got, want_items, "split at {i}");
+        assert_eq!(&fin, want_fin, "split at {i}");
+    }
+    let chars: Vec<String> = answer.chars().map(String::from).collect();
+    let refs: Vec<&str> = chars.iter().map(String::as_str).collect();
+    let (got, _, fin) = stream(&refs);
+    assert_eq!(&got, want_items, "one char at a time");
+    assert_eq!(&fin, want_fin, "one char at a time");
+}
+
+#[test]
+fn the_fixture_answer_streams_its_two_proposals_at_every_split() {
+    let whole = parse(fixture::PROPOSE_TEXT).unwrap();
+    assert_eq!(whole.len(), 2);
+    every_split(fixture::PROPOSE_TEXT, &whole, &Ok(whole.clone()));
+    // The first proposal is out the moment its closing brace arrives, before the second begins.
+    let cut = fixture::PROPOSE_TEXT.find("},{").unwrap() + 1;
+    let (got, counts, _) = stream(&[&fixture::PROPOSE_TEXT[..cut], &fixture::PROPOSE_TEXT[cut..]]);
+    assert_eq!(counts, vec![1, 2]);
+    assert_eq!(got, whole);
+    let (_, counts, _) = stream(&[&fixture::PROPOSE_TEXT[..cut - 1]]);
+    assert_eq!(counts, vec![0], "not before the brace");
+}
+
+#[test]
+fn escaped_quotes_and_braces_inside_strings_do_not_cut_early() {
+    let w = r#""Brace \"}\" and [ { ] kept \\""#;
+    let a = format!(" [ {} , {} ] \n", el(S, "0.5", w), good());
+    let whole = parse(&a).unwrap();
+    assert_eq!(whole[0].why, r#"Brace "}" and [ { ] kept \"#);
+    every_split(&a, &whole, &Ok(whole.clone()));
+}
+
+#[test]
+fn prose_and_bad_elements_are_refused_after_what_streamed() {
+    let g = good();
+    let one_item = parse(&format!("[{g}]")).unwrap();
+    let two = parse(&format!("[{g},{g}]")).unwrap();
+    // Prose after the array: both items streamed, then the bare refusal parse gives.
+    every_split(&format!("[{g},{g}] Hope this helps."), &two, &Err(Refusal::ProseAroundJson));
+    // Prose before it: nothing streams.
+    every_split(&format!("Here are my proposals: [{g}]"), &[], &Err(Refusal::ProseAroundJson));
+    every_split("I see a bracket.", &[], &Err(Refusal::NotAnArray));
+    // A bad element: what came before it streamed, then its refusal by index.
+    let bad = el(r#""Parallel c8""#, "0.5", W);
+    every_split(&format!("[{g},{bad},{g}]"), &one_item, &Err(Refusal::BadStmt(1)));
+    every_split(&format!("[{g},{g},]"), &two, &Err(Refusal::BadJson));
+    every_split(&format!("[{g},,{g}]"), &one_item, &Err(Refusal::BadJson));
+    every_split(&format!("[{g},\"x\"]"), &one_item, &Err(Refusal::NotAnObject(1)));
+    every_split(&format!("[{g},{g}"), &two, &Err(Refusal::BadJson));
+    every_split(" \n[ ]\n", &[], &Ok(vec![]));
+    // Past PROPOSALS_MAX: PROPOSALS_MAX streamed, then TooMany.
+    let many = format!("[{}]", vec![g.clone(); PROPOSALS_MAX + 1].join(","));
+    let (got, _, fin) = stream(&[&many]);
+    assert_eq!(got.len(), PROPOSALS_MAX);
+    assert_eq!(fin, Err(Refusal::TooMany));
+}
