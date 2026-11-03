@@ -1,0 +1,17 @@
+[package]
+name = "pump_core"
+version = "0.1.0"
+edition = "2024"
+license = "LGPL-3.0-or-later"
+description = "Comscan's pump core: streams make_core's dialect text to a controller over a caller-supplied transport (grbl 1.1 character counting, Marlin send-response), the realtime bytes out of band, the grbl status report and error / alarm tables — shared by Ring 0 and Ring 3."
+
+# VUGCOMSCAN1 (LEDGER SR476): `#![no_std]` + `alloc`, `#![forbid(unsafe_code)]`, the make_core shape (BP-vug-4): no clock
+# (the caller passes now_us), no I/O (the caller's `Transport`). make_core is taken by path with default-features = false
+# for `Dialect`, `Realtime` and `gcode::write` (one dialect enum, one realtime table, one writer in the tree).
+[dependencies]
+make_core = { path = "../make_core", default-features = false }
+
+[features]
+default = ["std"]
+# Gates the scripted `MockGrbl` only; nothing else in `src/` is std-gated, so a kernel `default-features = false` is honest.
+std = []

@@ -1594,6 +1594,7 @@ fn smessage_variant_name(m: &SMessage) -> &'static str {
         SMessage::OpenPanelChose { .. } => "OpenPanelChose",
         SMessage::BrowserAuxButton { .. } => "BrowserAuxButton", // VUG-FACE-BUTTONS (SR477): the right / middle / extra buttons and the pinch
         SMessage::BrowserPinch { .. } => "BrowserPinch",
+        SMessage::Pump(_) => "Pump", // VUGCOMSCAN1 (SR476): Comscan's pump channel
     }
 }
 
@@ -1853,4 +1854,28 @@ kat!(
     kat_open_panel_cancelled,
     SMessage::OpenPanelChose { url: "viewport".to_string(), path: None },
     r#"{"OpenPanelChose":{"url":"viewport","path":null}}"#
+);
+// VUGCOMSCAN1 (SR476): Comscan's pump channel; a start names an armed program by digest, and Squawk leaves its absent
+// status and event off the wire.
+kat!(
+    kat_pump_start,
+    SMessage::Pump(bandy::PumpEvent::PumpStart {
+        principal: Origin::LocalUser("una".to_string()),
+        program: "00000000deadbeef".to_string(),
+        dialect: "grbl".to_string(),
+        port: "mock".to_string(),
+    }),
+    r#"{"Pump":{"PumpStart":{"principal":{"LocalUser":"una"},"program":"00000000deadbeef","dialect":"grbl","port":"mock"}}}"#
+);
+kat!(
+    kat_pump_squawk,
+    SMessage::Pump(bandy::PumpEvent::Squawk {
+        sent: 12,
+        acked: 9,
+        total: 40,
+        state: "streaming".to_string(),
+        status: None,
+        event: None,
+    }),
+    r#"{"Pump":{"Squawk":{"sent":12,"acked":9,"total":40,"state":"streaming"}}}"#
 );

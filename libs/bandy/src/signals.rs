@@ -566,6 +566,10 @@ pub enum SMessage {
         #[serde(default, skip_serializing_if = "no_surface")]
         surface: u32,
     },
+    /// VUGCOMSCAN1 (LEDGER SR476): Comscan's pump channel — start / hold / resume / stop a program armed in process
+    /// through Helm's `Verdict::Pass`, and the Squawk telemetry it answers with. APPENDED so no earlier wire tag moves;
+    /// the [`SMessage::Logs`] sub-enum shape.
+    Pump(PumpEvent),
 }
 
 /// A typed preference value — the whole value domain of the Principia
@@ -1179,5 +1183,48 @@ impl SMessage {
             | SMessage::BrowserResize(_, _, surface) => Some(surface),
             _ => None,
         }
+    }
+}
+
+// --- VUGCOMSCAN1 (LEDGER SR476): Comscan's pump vocabulary (named tail hunk) ---
+/// Comscan's pump channel (`handlers/comscan` `pump`). A bus message cannot carry Helm's verdict (any sender could
+/// forge a pass), so a program is ARMED in process through `comscan::pump::PumpDesk::arm`, whose only entry is
+/// `Verdict::Pass`; [`PumpEvent::PumpStart`] names an armed program by its digest. Requests carry `principal` (the
+/// Finder / Facet / Tabula message-security law); every refused request is answered by [`PumpEvent::PumpRefused`].
+/// Comscan's own answers ([`PumpEvent::Squawk`], [`PumpEvent::PumpRefused`]) are inert as input.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum PumpEvent {
+    /// Start the armed program whose `make_core::Program::digest` is `program` (16 hex digits), in `dialect`
+    /// (`grbl`, `grbl-laser`, `marlin`), on `port` (the host opener's name for the link).
+    PumpStart { principal: Origin, program: String, dialect: String, port: String },
+    /// grbl feed hold (`!`).
+    PumpHold { principal: Origin },
+    /// grbl cycle start (`~`).
+    PumpResume { principal: Origin },
+    /// Stop: a feed hold, then a soft reset once the hold is complete.
+    PumpStop { principal: Origin },
+    /// Telemetry (CODEX §5 Squawk): lines sent / acknowledged / total, the pump's state word, the last status report in
+    /// grbl's own `<...>` grammar, and the named event that moved it (an error or alarm with its code and name, `done`, `timeout`).
+    Squawk {
+        sent: u32,
+        acked: u32,
+        total: u32,
+        state: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        event: Option<String>,
+    },
+    /// A refused request, with the reason by name.
+    PumpRefused { why: String },
+}
+
+impl PumpEvent {
+    /// True for what Comscan consumes; its answers are inert as input.
+    pub fn is_request(&self) -> bool {
+        matches!(
+            self,
+            PumpEvent::PumpStart { .. } | PumpEvent::PumpHold { .. } | PumpEvent::PumpResume { .. } | PumpEvent::PumpStop { .. }
+        )
     }
 }
