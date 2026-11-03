@@ -1004,19 +1004,19 @@ fn ccw(sk: &Sketch, l1: EntityId, l2: EntityId) -> Option<f64> {
 }
 
 /// A value as drawn: three decimals, trailing zeros dropped ("16", "10.5").
-fn fmt_value(v: f64) -> String {
+pub(crate) fn fmt_value(v: f64) -> String {
     let s = format!("{v:.3}");
     let s = if s.contains('.') { s.trim_end_matches('0').trim_end_matches('.').to_string() } else { s };
     if s == "-0" { "0".to_string() } else { s }
 }
 
 /// A refusal's name: the text before its `(` ("Conflicting([..])" -> "Conflicting").
-fn refusal_word(e: &str) -> String {
+pub(crate) fn refusal_word(e: &str) -> String {
     e.split('(').next().unwrap_or(e).to_string()
 }
 
 /// A typed key into a number's text: digits, one `.`, a leading `-`, Backspace. False when the key is none of them.
-fn type_into(buf: &mut String, ch: Option<char>, back: bool) -> bool {
+pub(crate) fn type_into(buf: &mut String, ch: Option<char>, back: bool) -> bool {
     if back {
         buf.pop();
         return true;
