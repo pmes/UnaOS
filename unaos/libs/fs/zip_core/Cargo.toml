@@ -1,0 +1,19 @@
+[package]
+name = "zip_core"
+version = "0.1.0"
+edition = "2024"
+license = "LGPL-3.0-or-later"
+description = "The ZIP container (APPNOTE.TXT methods 0 and 8, no ZIP64, no encryption): read with entries by name and inflate on demand, write stored or deflated entries with the central directory — shared by Ring 0 and Ring 3."
+
+# VUG3MF (LEDGER SR486): `#![no_std]` + `alloc`, `#![forbid(unsafe_code)]`, the timeline_core shape: a shared core under
+# `unaos/libs/`, a member of the ROOT host workspace (mesh_core's 3MF links it), linkable by a kernel face by path with
+# `default-features = false`. Nothing here is a codec of its own: the inflater and the CRC-32 are pixel_core's
+# (`inflate::inflate_raw`, `crc::crc32`), the deflate encoder is git_core's (`deflate::deflate`).
+[dependencies]
+pixel_core = { path = "../../media/pixel_core" }
+git_core = { path = "../../vcs/git_core", default-features = false }
+
+[features]
+default = ["std"]
+# The seam only: nothing in `src/` is std-gated (mesh_core's spelling, so a kernel `default-features = false` is honest).
+std = []

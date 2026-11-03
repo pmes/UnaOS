@@ -4,7 +4,8 @@
 //! VUGMESH (LEDGER SR466). Geometry is `f64` (BP-vug-1); the one `f32` conversion is [`Mesh::to_f32_buffers`] (STL's
 //! on-disk `f32` is that file format's, named in [`stl`]). Every threshold is a [`Tol`] field (BP-vug-2): the ONE
 //! degenerate definition is [`degenerate`]. Every core fn is pure: a value in, a value or a named refusal out (BP-vug-4).
-//! The formats are read from their specifications: [`stl`] (binary + ASCII), [`obj`] (Wavefront), [`ply`] (Stanford).
+//! The formats are read from their specifications: [`stl`] (binary + ASCII), [`obj`] (Wavefront), [`ply`] (Stanford), [`threemf`]
+//! (3MF over zip_core, VUG3MF SR486).
 #![no_std]
 #![forbid(unsafe_code)]
 
@@ -21,10 +22,12 @@ pub mod halfedge;
 pub mod obj;
 pub mod ply;
 pub mod stl;
+pub mod threemf;
 
 pub use bvh::{Bvh, Hit};
-pub use geom::{Aabb3, Ray, Tol, Vec3};
+pub use geom::{Aabb3, Mat4, Ray, Tol, Vec3};
 pub use halfedge::{HalfEdge, Topo};
+pub use threemf::{read as read_3mf, write as write_3mf};
 
 /// An indexed triangle mesh: positions in millimetres and counter-clockwise (outward) triangles.
 #[derive(Clone, Debug, Default, PartialEq)]

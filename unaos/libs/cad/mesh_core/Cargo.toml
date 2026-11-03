@@ -12,6 +12,10 @@ description = "Vug's mesh core: the indexed triangle mesh, half-edge adjacency, 
 [dependencies]
 geom_core = { path = "../geom_core", default-features = false }
 libm = { version = "0.2", default-features = false }
+# VUG3MF (SR486): 3MF is a ZIP (zip_core: pixel_core's inflater and CRC, git_core's deflate) holding XML read by svg_core's
+# reader (`svg_core::xml`, the one no_std XML reader in the tree; deps font_core + libm), both by path.
+zip_core = { path = "../../fs/zip_core", default-features = false }
+svg_core = { path = "../../media/svg_core" }
 
 [features]
 default = ["std"]
