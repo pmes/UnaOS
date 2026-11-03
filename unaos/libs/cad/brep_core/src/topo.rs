@@ -28,6 +28,10 @@ pub enum OpKind {
     /// VUGSTEP (SR482): read from an exchange file by step_core: `Name::a` is the entity's instance number in the
     /// file, `Name::b` the solid's index in its shape representation.
     Import,
+    /// VUGBREP3 (SR502): made by `fillet`: `Name::a` is the source edge's Id.
+    Fillet,
+    /// VUGBREP3 (SR502): made by `chamfer`: `Name::a` is the source edge's Id.
+    Chamfer,
 }
 
 /// The entity's role in its operation.
@@ -48,6 +52,10 @@ pub enum Role {
     Section,
     /// VUGSTEP (SR482): an entity read from a file (`OpKind::Import`); it had no generator role.
     Entity,
+    /// VUGBREP3 (SR502): a fillet's cylinder or a chamfer's plane (b 0), or its edge on an end face (b 1 / 2).
+    Blend,
+    /// VUGBREP3 (SR502): where a face was trimmed back: the trim line on F1 / F2 (b 1 / 2), a trim vertex (b 0..3).
+    Trim,
 }
 
 /// What generated an entity: `a` is the profile loop index (0 = outer), `b` the segment (or vertex) index in it.

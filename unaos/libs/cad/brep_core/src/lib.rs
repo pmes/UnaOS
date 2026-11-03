@@ -16,13 +16,16 @@
 //!
 //! Refuse, don't guess: an input the arithmetic cannot decide, or a construction outside the analytic set, returns a
 //! named [`Refusal`]. Coordinates are f64 (BP-vug-1). Every comparison takes the caller's `Tol` (BP-vug-2). The crate
-//! is pure: no I/O, no clock, no global state (BP-vug-4). Booleans are `boolean` (SR481) and STEP is `step_core` (SR482); fillets (VUG-BREP-3), NURBS surfaces and 3MF (VUG-3MF, mesh_core) are owed.
+//! is pure: no I/O, no clock, no global state (BP-vug-4). Booleans are `boolean` (SR481) and STEP is `step_core` (SR482); fillets and chamfers are `fillet` (SR502); NURBS surfaces and 3MF (VUG-3MF, mesh_core) are owed.
 //!
 //! VUGBREP2 (LEDGER SR481) builds [`union`] / [`difference`] / [`intersection`] over plane and cylinder faces
 //! (src/bool.rs) and point classification by exact ray parity ([`point_in_solid`], src/classify.rs).
 //!
 //! VUGBREPSWAP (LEDGER SR492): the siblings are the real crates by path, re-exported here (the crates themselves for
 //! sketch_core's `Edge` / `Loop`, which share names with this crate's topology); src/dep.rs and its shims are gone.
+//!
+//! VUGBREP3 (LEDGER SR502) builds [`fillet`] / [`chamfer`] of straight edges between two planar faces, convex or
+//! concave (src/fillet.rs: the cylinder blend, the chamfer plane; `RadiusTooLarge` and `CornerNotBlended` by name).
 #![no_std]
 #![forbid(unsafe_code)]
 
@@ -36,6 +39,8 @@ pub mod boolean;
 pub mod classify;
 pub mod curve;
 mod earcut;
+// VUGBREP3 (SR502): fillets and chamfers.
+pub mod fillet;
 pub mod mass;
 pub mod primitives;
 mod quad;
@@ -48,6 +53,7 @@ pub use boolean::{Op, difference, faces_named, intersection, union};
 pub use build::{extrude, revolve};
 pub use classify::{Class, Where, point_in_solid};
 pub use curve::{Curve, Frame, NurbsCurve};
+pub use fillet::{chamfer, fillet};
 pub use mass::{Mass, area, centroid, inertia, properties, volume};
 pub use surface::{Intersection, Surface, SurfaceKind, intersect};
 pub use tess::{Tessellation, tessellate};
@@ -108,6 +114,13 @@ pub enum Refusal {
     Contact { what: &'static str, a: Id, b: Id },
     /// VUGBREP2 (SR481): the kept faces of a boolean do not sew: this result edge is not used exactly once each way.
     NotClosed { edge: Id },
+    /// VUGBREP3 (SR502): a fillet or chamfer this large would reach past a neighbour edge's far end, over another
+    /// feature of a face it trims, or into another listed edge's trim; `max` is the bound it reaches (the radius; for a
+    /// chamfer d1 at the given d2/d1), and a result needs the parameter below it by more than Tol.lin.
+    RadiusTooLarge { edge: Id, max: f64 },
+    /// VUGBREP3 (SR502): two or more listed edges meet at this vertex; the corner blend (and a chamfer's mitre) is
+    /// VUG-BREP-3-CORNER, owed.
+    CornerNotBlended { vertex: Id },
 }
 
 impl From<geom_core::Degenerate> for Refusal {
