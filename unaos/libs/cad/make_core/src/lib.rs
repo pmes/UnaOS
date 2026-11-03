@@ -42,6 +42,7 @@ pub mod plan;
 pub mod program;
 pub mod review;
 pub mod slice; // VUGMAKESLICE (SR483)
+pub mod sim; // VUGMAKESIM (SR496)
 pub mod validate;
 
 pub use geom::{Aabb3, Tol, Vec2, Vec3};
@@ -54,3 +55,4 @@ pub use program::{Coolant, Heater, Move, Program, Spin};
 pub use review::{Ask, Review, review};
 pub use validate::{Refusal, Stats};
 pub use slice::{Island, Layer, SliceParams}; // VUGMAKESLICE (SR483)
+pub use sim::{Gouge, MoveSim, RapidCut, Sim, SimParams, SimRefusal, StockSdf, simulate}; // VUGMAKESIM (SR496)

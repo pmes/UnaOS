@@ -92,3 +92,14 @@ pub fn circle_circle2(c1: Vec2, r1: f64, c2: Vec2, r2: f64, tol: Tol) -> ([Vec2;
         _ => ([c1; 2], 0),
     }
 }
+
+// ---- VUGMAKESIM (LEDGER SR496): the plan-view distance the sim's swept volume is measured by. ----
+
+/// The distance from `p` to the closed segment `ab` in the plane (geom_core's `closest_point_segment` at z = 0; a
+/// zero-length segment answers the distance to `a`).
+pub fn seg_dist2(p: Vec2, a: Vec2, b: Vec2) -> f64 {
+    let s = geom_core::Segment { a: Vec3::new(a.x, a.y, 0.0), b: Vec3::new(b.x, b.y, 0.0) };
+    let q = Vec3::new(p.x, p.y, 0.0);
+    let (c, _) = geom_core::closest_point_segment(q, &s);
+    (q - c).magnitude()
+}

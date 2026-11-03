@@ -2878,6 +2878,7 @@ version = "0.1.0"
 dependencies = [
  "geom_core",
  "libm",
+ "scan_core",
 ]
 
 [[package]]
