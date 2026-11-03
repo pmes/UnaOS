@@ -157,7 +157,7 @@ fn smallest_eigvec(m: [[f64; 3]; 3]) -> Vec3 {
             k = i;
         }
     }
-    Vec3::new(v[0][k], v[1][k], v[2][k]).normalize()
+    Vec3::new(v[0][k], v[1][k], v[2][k]).normalize().unwrap_or(Vec3::ZERO)
 }
 
 /// Sign convention for a direction: its largest-magnitude component is positive (a deterministic orientation).
@@ -201,7 +201,7 @@ fn residuals(res: impl Iterator<Item = f64>) -> (f64, f64, u32) {
 // ---- plane ----
 
 fn plane_inliers(points: &[Vec3], pl: &Plane, band: Tol) -> Vec<usize> {
-    (0..points.len()).filter(|&i| pl.distance(points[i]).abs() <= band.lin).collect()
+    (0..points.len()).filter(|&i| pl.signed_distance(points[i]).abs() <= band.lin).collect()
 }
 
 fn plane_tls(points: &[Vec3], idx: &[usize]) -> Plane {
@@ -231,9 +231,9 @@ pub fn fit_plane(points: &[Vec3], band: Tol) -> Result<Fit<Plane>, FitError> {
         if !(nrm.mag() > band.lin * longest) {
             continue; // collinear within the band: no plane
         }
-        let u = nrm.normalize();
+        let u = nrm.normalize().unwrap_or(Vec3::ZERO);
         let pl = Plane { normal: u, d: u.dot(a) };
-        let count = (0..n).filter(|&q| pl.distance(points[q]).abs() <= band.lin).count();
+        let count = (0..n).filter(|&q| pl.signed_distance(points[q]).abs() <= band.lin).count();
         if count > best_count {
             best_count = count;
             best = Some(pl);
@@ -252,7 +252,7 @@ pub fn fit_plane(points: &[Vec3], band: Tol) -> Result<Fit<Plane>, FitError> {
     if idx.len() <= 3 {
         return Err(FitError::NoConsensus);
     }
-    let (rms, mx, cnt) = residuals(idx.iter().map(|&i| pl.distance(points[i])));
+    let (rms, mx, cnt) = residuals(idx.iter().map(|&i| pl.signed_distance(points[i])));
     Ok(Fit { shape: pl, rms_mm: rms, max_mm: mx, inliers: cnt, outliers: (n - idx.len()) as u32 })
 }
 
@@ -290,7 +290,7 @@ fn cyl_candidate(p1: Vec3, n1: Vec3, p2: Vec3, n2: Vec3, band: Tol) -> Option<Cy
     if !(a.mag() > libm::sin(band.ang)) {
         return None; // parallel normals: no axis
     }
-    let a = a.normalize();
+    let a = a.normalize().unwrap_or(Vec3::ZERO);
     let (q1, q2) = (p1 - a * a.dot(p1), p2 - a * a.dot(p2));
     let b = n1.dot(n2);
     let w = q1 - q2;
@@ -331,13 +331,13 @@ fn solve3(m: [[f64; 3]; 3], r: [f64; 3]) -> Option<[f64; 3]> {
 }
 
 fn cyl_refine(points: &[Vec3], normals: &[Vec3], idx: &[usize], prev: &Cylinder) -> Cylinder {
-    let mut axis = canonical(smallest_eigvec(outer_sum(idx.iter().map(|&i| normals[i].normalize()))));
+    let mut axis = canonical(smallest_eigvec(outer_sum(idx.iter().map(|&i| normals[i].normalize().unwrap_or(Vec3::ZERO)))));
     if axis.mag() == 0.0 {
         axis = prev.axis;
     }
     // An orthonormal basis (u, w) across the axis.
     let helper = if axis.x.abs() < 0.9 { Vec3::new(1.0, 0.0, 0.0) } else { Vec3::new(0.0, 1.0, 0.0) };
-    let u = axis.cross(helper).normalize();
+    let u = axis.cross(helper).normalize().unwrap_or(Vec3::ZERO);
     let w = axis.cross(u);
     let m = centroid(points, idx);
     let (mut sxx, mut sxy, mut syy, mut sx, mut sy, mut sxz, mut syz, mut sz) = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
@@ -384,9 +384,9 @@ pub fn fit_cylinder(points: &[Vec3], normals: &[Vec3], band: Tol) -> Result<Fit<
         if i == j {
             continue;
         }
-        let (n1, n2) = (normals[i].normalize(), normals[j].normalize());
+        let (n1, n2) = (normals[i].normalize().unwrap_or(Vec3::ZERO), normals[j].normalize().unwrap_or(Vec3::ZERO));
         let Some(cy) = cyl_candidate(points[i], n1, points[j], n2, band) else { continue };
-        let count = (0..n).filter(|&q| cyl_inlier(&cy, points[q], normals[q].normalize(), band).is_some()).count();
+        let count = (0..n).filter(|&q| cyl_inlier(&cy, points[q], normals[q].normalize().unwrap_or(Vec3::ZERO), band).is_some()).count();
         if count > best_count {
             best_count = count;
             best = Some(cy);
@@ -394,7 +394,7 @@ pub fn fit_cylinder(points: &[Vec3], normals: &[Vec3], band: Tol) -> Result<Fit<
         }
     }
     let Some(mut cy) = best else { return Err(FitError::NoConsensus) };
-    let unit: Vec<Vec3> = normals.iter().map(|v| v.normalize()).collect();
+    let unit: Vec<Vec3> = normals.iter().map(|v| v.normalize().unwrap_or(Vec3::ZERO)).collect();
     let mut idx = cyl_inliers(points, &unit, &cy, band);
     for _ in 0..REFINE {
         if idx.len() < 3 {

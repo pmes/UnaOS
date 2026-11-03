@@ -7,10 +7,10 @@ description = "Vug's mesh core: the indexed triangle mesh, half-edge adjacency, 
 
 # VUGMESH (LEDGER SR466): `#![no_std]` + `alloc`, `#![forbid(unsafe_code)]`, the timeline_core shape: a shared core under
 # `unaos/libs/cad/`, a member of the ROOT host workspace, linkable by a kernel face by path with `default-features = false`.
-# The geometry (Vec3, Tol, Ray, Aabb3, ray/triangle, ray/aabb) is geom_core's (SR464) through ONE seam, `src/geom.rs`;
-# geom_core was not on its branch when this arc built, so that file is a marked SHIM and this manifest names no
-# geom_core dep yet: the swap is `geom_core = { path = "../geom_core", default-features = false }` + geom.rs re-exports.
+# The geometry (Vec3, Tol, Ray, Aabb3, ray/triangle, ray/aabb) is geom_core's (SR464) through ONE seam, `src/geom.rs`:
+# re-exports plus thin adapters, by path since VUGSHIMSWAP (SR473).
 [dependencies]
+geom_core = { path = "../geom_core", default-features = false }
 libm = { version = "0.2", default-features = false }
 
 [features]

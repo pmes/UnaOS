@@ -84,7 +84,7 @@ fn a_posed_prb_recording_fuses_every_frame() {
     let mut text = String::from("# camera -> world, row-major [R | t], mm\n");
     for k in 0..3 {
         let p = pose(k);
-        let (r, t) = (p.rot, p.trans);
+        let (m, t) = (p.rot.to_mat3(), p.trans); let r = [[m.cols[0].x, m.cols[1].x, m.cols[2].x], [m.cols[0].y, m.cols[1].y, m.cols[2].y], [m.cols[0].z, m.cols[1].z, m.cols[2].z]];
         text += &format!(
             "{:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?}\n",
             r[0][0], r[0][1], r[0][2], t.x, r[1][0], r[1][1], r[1][2], t.y, r[2][0], r[2][1], r[2][2], t.z

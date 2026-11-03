@@ -235,7 +235,7 @@ impl Tsdf {
         for k in &active {
             self.blocks.entry(*k).or_insert_with(|| Box::new([Voxel::EMPTY; BLOCK_VOXELS]));
         }
-        let inv = pose.inverse();
+        let inv = pose.invert().unwrap_or(Transform::IDENTITY);
         let (voxel_mm, trunc) = (self.voxel_mm, self.trunc_mm);
         let mut updated = 0u32;
         for k in &active {
