@@ -439,7 +439,9 @@ fn the_redial_after_a_renamed_node_relinks_the_same_device() {
     let pass = Verdict::Pass { digest: p.digest(), machine: machine().digest() };
     let digest = desk.arm(&pass, &p, GRBL).expect("armed by a pass");
     let mut open = opener_in(sys.clone(), dev.clone(), Baud::B115200, Flow::None, GRBL);
-    let fake1 = fake_grbl(m1, false, 2);
+    // Both fakes keep silent until the soft reset: open_flow's tcflush drops a banner said before the open, and the
+    // desk opens and waits in one call, so only a banner on the reset is said after the port is open.
+    let fake1 = fake_grbl(m1, true, 2);
     let start = PumpEvent::PumpStart {
         principal: Origin::LocalUser("una".to_string()),
         program: digest_hex(digest),
@@ -467,7 +469,7 @@ fn the_redial_after_a_renamed_node_relinks_the_same_device() {
     std::fs::remove_file(dev.join("ttyACM0")).unwrap();
     std::fs::remove_dir_all(sys.join("class/tty/ttyACM0")).unwrap();
     tty_node(&sys, "ttyACM1", Some(&interface));
-    let fake2 = fake_grbl(m2, false, 0);
+    let fake2 = fake_grbl(m2, true, 0);
     drop(m1);
     drop(s1);
 
