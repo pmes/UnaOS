@@ -6,7 +6,7 @@
 //! are geom_core's definitions (BP-vug-2): a triangle hit within `tol.lin` of an edge counts, `t >= -tol.lin` counts,
 //! a triangle whose height is at most `tol.lin` is no hit; a box entry is clamped at `t = 0`.
 
-pub use geom_core::{Aabb3, Ray, Tol, Vec3};
+pub use geom_core::{Aabb3, Mat4, Ray, Tol, Vec3};
 
 use geom_core::{RayBox, RayTri};
 
