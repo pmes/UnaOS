@@ -255,3 +255,81 @@ fn a_tracked_prb_recording_fuses_without_poses() {
     assert_eq!(o.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&o.stderr).contains("PoseFlags"));
 }
+
+/// VUGSCANDEVIATION (SR510): a world-posed 12-frame orbit `--against` a design document built to the fixture's box and
+/// cylinder: the scan registers from the identity, the report names the deviation and every design face, and the PLY
+/// carries the `deviation` scalar and the band's colours.
+#[test]
+fn an_against_design_prints_the_deviation_and_its_ply() {
+    const DOC: &str = r#"vug-doc version=1 lin=1e-6 ang=1e-9
+sketch s1 o=[0 0 0] z=[0 0 1] x=[1 0 0]
+point p1 sketch=s1 x=-230 y=-100
+point p2 sketch=s1 x=70 y=-100
+point p3 sketch=s1 x=70 y=100
+point p4 sketch=s1 x=-230 y=100
+line l1 sketch=s1 a=p1 b=p2
+line l2 sketch=s1 a=p2 b=p3
+line l3 sketch=s1 a=p3 b=p4
+line l4 sketch=s1 a=p4 b=p1
+fix f1 sketch=s1 p=p1 at=[-230 -100]
+fix f2 sketch=s1 p=p2 at=[70 -100]
+fix f3 sketch=s1 p=p3 at=[70 100]
+fix f4 sketch=s1 p=p4 at=[-230 100]
+sketch s2 o=[0 0 0] z=[0 0 1] x=[1 0 0]
+point c0 sketch=s2 x=160 y=0
+circle c1 sketch=s2 centre=c0 r=40
+fix g1 sketch=s2 p=c0 at=[160 0]
+radius r1 sketch=s2 circle=c1 r=40
+extrude body sketch=s1 outer=l1 dir=[0 0 1] length=100
+extrude post sketch=s2 outer=c1 dir=[0 0 1] length=150
+"#;
+    let d = dir("against");
+    let (inp, ply, poses, doc) = (d.join("orbit.prb"), d.join("orbit.ply"), d.join("poses.txt"), d.join("part.vugdoc"));
+    let intr = fixture::bench_intrinsics();
+    let truth = |k: u32| fixture::orbit(CENTRE, 600.0, 40.0 * DEG, k as f64 * 30.0 * DEG);
+    let recs: Vec<Record> = (0..12u32)
+        .map(|k| {
+            let f = fixture::render_depth(&Scene::bench(), &intr, DepthScale::D400_DEFAULT, &truth(k), &Noise::NONE, k as u64);
+            Record::new(f, "replay:d435i", 1000, Some(k4())).unwrap()
+        })
+        .collect();
+    std::fs::write(&inp, recording::write(&recs).unwrap()).unwrap();
+    let mut text = String::new();
+    for k in 0..12 {
+        let p = truth(k);
+        let (m, t) = (p.rot.to_mat3(), p.trans);
+        let r = [[m.cols[0].x, m.cols[1].x, m.cols[2].x], [m.cols[0].y, m.cols[1].y, m.cols[2].y], [m.cols[0].z, m.cols[1].z, m.cols[2].z]];
+        text += &format!(
+            "{:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?}\n",
+            r[0][0], r[0][1], r[0][2], t.x, r[1][0], r[1][1], r[1][2], t.y, r[2][0], r[2][1], r[2][2], t.z
+        );
+    }
+    std::fs::write(&poses, text).unwrap();
+    std::fs::write(&doc, DOC).unwrap();
+    let o = scan(&[
+        inp.to_str().unwrap(),
+        "-o",
+        ply.to_str().unwrap(),
+        "--poses",
+        poses.to_str().unwrap(),
+        "--band",
+        "1",
+        "--against",
+        doc.to_str().unwrap(),
+    ]);
+    let report = String::from_utf8_lossy(&o.stdout).into_owned();
+    assert!(o.status.success(), "stderr: {}", String::from_utf8_lossy(&o.stderr));
+    println!("{report}");
+    let rms: f64 = field(&report, "deviation: aligned", "rms").parse().unwrap();
+    assert!(rms < 1.0, "deviation rms {rms}");
+    let faces = field(&report, "deviation: aligned", "faces");
+    let total: usize = faces.split('/').nth(1).unwrap().parse().unwrap();
+    assert_eq!(report.lines().filter(|l| l.starts_with("face: ")).count(), total, "one face line per design face");
+    assert!(report.lines().any(|l| l.starts_with("face: post/") && l.contains(":cylinder ")), "the post's cylinder is named");
+    let verts: usize = field(&report, "vertices=", "vertices").parse().unwrap();
+    let bytes = std::fs::read(&ply).unwrap();
+    let mesh = mesh_core::ply::read(&bytes).unwrap();
+    assert_eq!(mesh.positions.len(), verts);
+    let head = String::from_utf8_lossy(&bytes[..bytes.windows(10).position(|w| w == b"end_header").unwrap()]).into_owned();
+    assert!(head.contains("property float deviation") && head.contains("property uchar red"), "{head}");
+}

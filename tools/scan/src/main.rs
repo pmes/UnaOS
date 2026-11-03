@@ -11,6 +11,7 @@
 //!      [--meta <x_Depth_metadata.csv>] [--width W --height H] [--csv-raw]
 //!      [--fx F --fy F --ppx F --ppy F] [--units-um N] [--frame N]
 //!      [--turntable DEG --radius MM | --poses <file> | --track] [--voxel MM] [--trunc MM] [--band MM]
+//!      [--against <design.vugdoc>]
 //! ```
 //!
 //! Inputs (the measured roads from a D435i to this machine; librealsense v2.55.1):
@@ -57,13 +58,27 @@
 //! number for a cylinder the cloud does not support), `shapes: n=` and one `shape:` line per detected shape with its
 //! support, fraction and rms, and a `scan:` line in scan_core's own test token shape. A refusal prints
 //! `scan: refused <Name> {..}` and exits 1; usage exits 2.
+//!
+//! `--against <design.vugdoc>` (VUGSCANDEVIATION, LEDGER SR510): the made part against its model. doc_core reads and
+//! replays the document (a failing statement refuses `Design`, none built `DesignEmpty`); every solid is tessellated by
+//! brep_core at [`CHORD_MM`] into one design mesh with each triangle's face; scan_core's `measure` registers the scan to
+//! it from the identity (the scan's world is the design's: a `--poses` / `--turntable` / one-frame scan; a coarse start
+//! for a `--track` scan is owed, VUG-SCAN-DEVIATION-COARSE) and measures each vertex's signed deviation (positive proud,
+//! negative short), the band being `--band`. The PLY then carries the ALIGNED positions (the design's frame), a
+//! `float deviation` (mm, NaN off the design) and `uchar red green blue` from scan_core's `shade` in palette_core's
+//! status colours (inside the band POSITIVE, short toward INFO, proud toward CRITICAL, off the design TEXT_SECONDARY).
+//! The report adds `deviation: aligned rms= max= p95= inside= faces=<seen>/<total> ...` and one
+//! `face: <solid>/<op>.<role>.<a>.<b>:<kind> n= max= rms= mean=` line per design face, by rms, worst first; a refused
+//! registration prints `deviation: refused <Name> {..}` and the run exits 1. Without `--against` nothing changes.
 
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::path::Path;
 
 use probe_core::recording::{self, RecordingError};
 use probe_core::{FrameError, StreamKind};
 use scan_core::{
+    AlignParams, Deviation, Design, DeviationError, ScanMesh, Shade, measure, shade, // VUGSCANDEVIATION (SR510)
     DepthScale, Fit, FitError, Floor, Frame, Gap, Intrinsics, Keyframes, LoopParams, PixelFormat, Plane, Primitive,
     Reintegrate, ScanError, Shape, Shot, Tol, Topo, TrackError, Tracker, Transform, Tsdf, Vec3, close_loop, detect, extract,
     fit_plane, reintegrate,
@@ -75,6 +90,9 @@ const POSE_RIGID: f64 = 1e-6;
 const BAND_DEG: f64 = 15.0;
 /// The D400 depth unit when nothing states one (`DepthScale::D400_DEFAULT`, d400-device.cpp:912).
 const D400_UNITS_UM: u32 = 1000;
+/// VUGSCANDEVIATION (SR510): the design's tessellation chord (mm): its sagitta bias (at most half of it) is far
+/// under the scan's noise.
+const CHORD_MM: f64 = 0.05;
 
 #[derive(Debug)]
 #[allow(dead_code)] // the fields are read through Debug: a refusal is printed with them
@@ -107,6 +125,13 @@ enum Refusal {
     Integrate { frame: usize, error: ScanError },
     Track { frame: usize, error: TrackError },
     Extract(ScanError),
+    // VUGSCANDEVIATION (SR510): the `--against` road's refusals.
+    DesignRead(doc_core::Refusal),
+    Design { line: u32, id: String, fault: doc_core::Fault },
+    DesignEmpty,
+    Tessellate { solid: String, error: brep_core::Refusal },
+    DesignFaceId { solid: String, id: u64 },
+    Deviation(DeviationError),
 }
 
 fn usage() -> ! {
@@ -114,6 +139,7 @@ fn usage() -> ! {
     eprintln!("            [--meta <x_Depth_metadata.csv>] [--width W --height H] [--csv-raw]");
     eprintln!("            [--fx F --fy F --ppx F --ppy F] [--units-um N] [--frame N]");
     eprintln!("            [--turntable DEG --radius MM | --poses <file> | --track] [--voxel MM] [--trunc MM] [--band MM]");
+    eprintln!("            [--against <design.vugdoc>]");
     std::process::exit(2)
 }
 
@@ -136,6 +162,7 @@ struct Args {
     voxel: f64,
     trunc: Option<f64>,
     band: f64,
+    against: Option<String>, // VUGSCANDEVIATION (SR510)
 }
 
 fn num<T: std::str::FromStr>(it: &mut impl Iterator<Item = String>) -> T {
@@ -166,6 +193,7 @@ fn parse_args() -> Args {
             "--voxel" => a.voxel = num(&mut it),
             "--trunc" => a.trunc = Some(num(&mut it)),
             "--band" => a.band = num(&mut it),
+            "--against" => a.against = Some(it.next().unwrap_or_else(|| usage())),
             _ if s.starts_with('-') => usage(),
             _ if a.input.is_none() => a.input = Some(s),
             _ => usage(),
@@ -510,9 +538,19 @@ fn run(a: &Args) -> Result<String, Refusal> {
     let shapes: &[Shape] = detected.as_deref().unwrap_or(&[]);
     let cyl = shapes.iter().find_map(|s| if let Primitive::Cylinder(c) = s.kind { Some((c, s)) } else { None });
 
+    // VUGSCANDEVIATION (SR510): the made part against its model, before anything is written.
+    let dev = match &a.against {
+        Some(p) => Some(against(p, &sm, a.band)?),
+        None => None,
+    };
+
     // The PLY: scan_core's mesh IS mesh_core's (VUGSHIMSWAP SR473), straight into mesh_core's writer.
     let out = a.out.as_deref().unwrap_or_default();
-    std::fs::write(out, mesh_core::ply::write(&sm.mesh)).map_err(|e| Refusal::Io { path: out.into(), error: e.to_string() })?;
+    let ply = match &dev {
+        Some((d, _)) => deviation_ply(&sm, d, a.band),
+        None => mesh_core::ply::write(&sm.mesh),
+    };
+    std::fs::write(out, ply).map_err(|e| Refusal::Io { path: out.into(), error: e.to_string() })?;
 
     let k0 = intr[0];
     let (cmin, cmean) = if sm.confidence.is_empty() {
@@ -590,6 +628,9 @@ fn run(a: &Args) -> Result<String, Refusal> {
         }
     }
     shapes_report(&mut r, &detected);
+    if let Some((d, names)) = &dev {
+        deviation_report(&mut r, d, names);
+    }
     let plane_s = plane.as_ref().map_or("refused".into(), |f| format!("{:.3} normal={}", f.rms_mm, v3(f.shape.normal)));
     let cyl_s = cyl.as_ref().map_or("none".into(), |(c, s)| format!("{:.3} rms={:.3}", c.radius, s.rms_mm));
     let _ = writeln!(
@@ -622,6 +663,114 @@ fn shapes_report(r: &mut String, detected: &Result<Vec<Shape>, FitError>) {
             }
         };
         let _ = writeln!(r, "shape: {} support={} frac={:.4} rms={:.3} {params}", s.kind.name(), s.support, s.fraction, s.rms_mm);
+    }
+}
+
+/// VUGSCANDEVIATION (SR510): the document replayed, every solid tessellated into one design with each triangle's face
+/// (named `<solid>/<op>.<role>.<a>.<b>:<kind>`), and the scan measured against it from the identity.
+fn against(path: &str, sm: &ScanMesh, band: f64) -> Result<(Deviation, Vec<String>), Refusal> {
+    let text = String::from_utf8(read(path)?).map_err(|e| Refusal::Io { path: path.into(), error: e.to_string() })?;
+    let doc = doc_core::read(&text).map_err(Refusal::DesignRead)?;
+    let rp = doc_core::replay(&doc, doc.tol);
+    if let Some(f) = rp.failures.first() {
+        return Err(Refusal::Design { line: f.line, id: f.id.clone(), fault: f.fault.clone() });
+    }
+    if rp.solids.is_empty() {
+        return Err(Refusal::DesignEmpty);
+    }
+    let mut mesh = mesh_core::Mesh::default();
+    let mut face_of: Vec<u32> = Vec::new();
+    let mut names: Vec<String> = Vec::new();
+    for s in &rp.solids {
+        let t = brep_core::tessellate(&s.brep, CHORD_MM, doc.tol).map_err(|error| Refusal::Tessellate { solid: s.id.clone(), error })?;
+        let mut index: HashMap<brep_core::Id, u32> = HashMap::new();
+        for f in &s.brep.faces {
+            index.insert(f.id, names.len() as u32);
+            names.push(face_name(&s.id, f));
+        }
+        let base = mesh.positions.len() as u32;
+        mesh.positions.extend_from_slice(&t.mesh.positions);
+        for (tri, id) in t.mesh.triangles.iter().zip(&t.face_of) {
+            let Some(&f) = index.get(id) else {
+                return Err(Refusal::DesignFaceId { solid: s.id.clone(), id: id.0 });
+            };
+            mesh.triangles.push([tri[0] + base, tri[1] + base, tri[2] + base]);
+            face_of.push(f);
+        }
+    }
+    let design = Design::new(mesh, face_of, names.len() as u32).map_err(Refusal::Deviation)?;
+    match measure(sm, &design, Transform::IDENTITY, &AlignParams::DEFAULT, band, Tol::DEFAULT) {
+        Ok(d) => Ok((d, names)),
+        Err(e) => {
+            eprintln!("deviation: refused {e:?}");
+            Err(Refusal::Deviation(e))
+        }
+    }
+}
+
+/// `<solid>/<op>.<role>.<a>.<b>:<kind>`, brep_core's persistent name of a face, lower case.
+fn face_name(solid: &str, f: &brep_core::Face) -> String {
+    let n = f.name;
+    format!(
+        "{solid}/{}.{}.{}.{}:{}",
+        format!("{:?}", n.op).to_ascii_lowercase(),
+        format!("{:?}", n.role).to_ascii_lowercase(),
+        n.a,
+        n.b,
+        format!("{:?}", f.surface.kind()).to_ascii_lowercase()
+    )
+}
+
+/// The PLY of the aligned scan with its `deviation` scalar and the band's colours.
+fn deviation_ply(sm: &ScanMesh, d: &Deviation, band: f64) -> Vec<u8> {
+    let moved = mesh_core::Mesh {
+        positions: sm.mesh.positions.iter().map(|p| d.aligned.pose.apply_point(*p)).collect(),
+        triangles: sm.mesh.triangles.clone(),
+    };
+    let scalar: Vec<f32> = d.per_vertex.iter().map(|x| x.map_or(f32::NAN, |v| v as f32)).collect();
+    let rgb: Vec<[u8; 3]> = d.per_vertex.iter().map(|x| colour(shade(*x, band))).collect();
+    mesh_core::ply::write_scalars(&moved, Some(("deviation", &scalar)), Some(&rgb))
+}
+
+/// scan_core's band class in palette_core's status colours: inside POSITIVE, short toward INFO, proud toward CRITICAL
+/// (by the class's fraction), off the design TEXT_SECONDARY (the dark row, vug-view's albedo).
+fn colour(s: Shade) -> [u8; 3] {
+    let rgb = |c: u32| [(c >> 16) as u8, (c >> 8) as u8, c as u8];
+    let mix = |a: u32, b: u32, k: f64| {
+        let (a, b) = (rgb(a), rgb(b));
+        let m = |i: usize| (a[i] as f64 + (b[i] as f64 - a[i] as f64) * k.clamp(0.0, 1.0)).round() as u8;
+        [m(0), m(1), m(2)]
+    };
+    match s {
+        Shade::Inside => rgb(palette_core::STATUS_POSITIVE),
+        Shade::Under(k) => mix(palette_core::STATUS_POSITIVE, palette_core::STATUS_INFO, k),
+        Shade::Over(k) => mix(palette_core::STATUS_POSITIVE, palette_core::STATUS_CRITICAL, k),
+        Shade::Off => rgb(palette_core::TEXT_SECONDARY.1),
+    }
+}
+
+/// VUGSCANDEVIATION (SR510): `deviation: aligned ...` and one `face:` line per design face, by rms, worst first.
+fn deviation_report(r: &mut String, d: &Deviation, names: &[String]) {
+    let s = &d.stats;
+    let seen = d.faces.iter().filter(|f| f.n > 0).count();
+    let _ = writeln!(
+        r,
+        "deviation: aligned rms={:.3} max={:.3} p95={:.3} inside={:.4} faces={seen}/{} matched={} unmatched={} band={} align_rms={:.3} pairs={} iters={}",
+        s.rms_mm,
+        s.max_mm,
+        s.p95_mm,
+        s.inside,
+        d.faces.len(),
+        s.matched,
+        s.unmatched,
+        s.band_mm,
+        d.aligned.rms_mm,
+        d.aligned.pairs,
+        d.aligned.iters
+    );
+    for f in &d.faces {
+        let name = names.get(f.face as usize).map(String::as_str).unwrap_or("?");
+        let _ = writeln!(r, "face: {name} n={} max={:.3} rms={:.3} mean={:.3}", f.n, f.max_mm, f.rms_mm, f.mean_mm);
     }
 }
 

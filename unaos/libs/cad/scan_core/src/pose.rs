@@ -515,7 +515,7 @@ fn rotate(w: Vec3, v: Vec3) -> Vec3 {
 }
 
 /// `exp(ω, τ) ∘ t`: rotate the pose's axes and origin by `ω`, then translate by `τ`.
-fn left_step(t: &Transform, w: Vec3, tau: Vec3) -> Transform {
+pub(crate) fn left_step(t: &Transform, w: Vec3, tau: Vec3) -> Transform {
     let a = Axes::of(t);
     geom::from_axes(rotate(w, a.x), rotate(w, a.y), rotate(w, a.z), rotate(w, a.o) + tau)
 }
@@ -532,7 +532,7 @@ fn lookup(model: &ModelMap, intr: &Intrinsics, l: Vec3) -> Option<Surfel> {
 /// The 6x6 symmetric positive-definite solve `a·x = b` by Cholesky (sketch_core's `linalg::cholesky_solve` loop
 /// at a fixed size; that one is private to its crate). `None` on a pivot that is not positive: the pairs do not
 /// constrain all six directions.
-fn solve6(mut a: [[f64; 6]; 6], mut b: [f64; 6]) -> Option<[f64; 6]> {
+pub(crate) fn solve6(mut a: [[f64; 6]; 6], mut b: [f64; 6]) -> Option<[f64; 6]> {
     for j in 0..6 {
         let mut d = a[j][j];
         for k in 0..j {

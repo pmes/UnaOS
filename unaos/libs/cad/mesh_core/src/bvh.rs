@@ -135,4 +135,56 @@ impl Bvh {
         }
         best
     }
+
+    // VUGSCANDEVIATION (SR510): the closest-point query beside the ray pick, over the same nodes.
+    /// The point of `mesh` (the mesh this BVH was built from) nearest `p` within `reach` mm: branch and bound on the
+    /// squared point-box distance against the best so far (starting at `reach²`), triangles through geom_core's
+    /// closest point (a degenerate triangle is skipped, as `pick` skips a miss). `None` when nothing is within reach.
+    pub fn closest(&self, mesh: &Mesh, p: Vec3, reach: f64, tol: Tol) -> Option<Near> {
+        if self.nodes.is_empty() || !p.is_finite() || !(reach >= 0.0) {
+            return None;
+        }
+        let mut best_sq = reach * reach;
+        let mut best: Option<Near> = None;
+        let mut stack: Vec<usize> = alloc::vec![0];
+        while let Some(ni) = stack.pop() {
+            let Some(node) = self.nodes.get(ni) else { continue };
+            if geom::aabb_dist_sq(p, &node.bb) > best_sq {
+                continue;
+            }
+            if node.count == 0 {
+                let (l, r) = (node.first as usize, node.first as usize + 1);
+                let dl = self.nodes.get(l).map_or(f64::INFINITY, |n| geom::aabb_dist_sq(p, &n.bb));
+                let dr = self.nodes.get(r).map_or(f64::INFINITY, |n| geom::aabb_dist_sq(p, &n.bb));
+                // The nearer child is popped first, so its triangles tighten the bound before the farther is opened.
+                if dl <= dr {
+                    stack.push(r);
+                    stack.push(l);
+                } else {
+                    stack.push(l);
+                    stack.push(r);
+                }
+                continue;
+            }
+            let s = node.first as usize;
+            for &t in self.order.get(s..s + node.count as usize).unwrap_or(&[]) {
+                let Some([a, b, c]) = mesh.corners(t as usize) else { continue };
+                let Some(q) = geom::closest_on_triangle(p, a, b, c, tol) else { continue };
+                let d2 = (q - p).mag_sq();
+                if d2 <= best_sq && best.map_or(true, |n| d2 < n.dist * n.dist) {
+                    best_sq = d2;
+                    best = Some(Near { tri: t, point: q, dist: libm::sqrt(d2) });
+                }
+            }
+        }
+        best
+    }
+}
+
+/// VUGSCANDEVIATION (SR510): a closest-point answer: the triangle, the point on it and its distance (mm).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Near {
+    pub tri: u32,
+    pub point: Vec3,
+    pub dist: f64,
 }

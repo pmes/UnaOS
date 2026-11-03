@@ -16,6 +16,11 @@ mesh_core = { path = "../mesh_core", default-features = false }
 probe_core = { path = "../../media/probe_core" }
 libm = { version = "0.2", default-features = false }
 
+# VUGSCANDEVIATION (SR510): the deviation tests build the design with brep_core (box, cylinder, tessellate); the core
+# itself takes a mesh and a face index, so brep_core is a dev-dependency only.
+[dev-dependencies]
+brep_core = { path = "../brep_core" }
+
 [features]
 default = ["std"]
 # The seam only: nothing in `src/` is std-gated (midden_core's spelling, so a kernel `default-features = false` is honest).

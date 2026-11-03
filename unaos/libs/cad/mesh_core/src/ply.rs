@@ -320,3 +320,43 @@ pub fn write(mesh: &Mesh) -> Vec<u8> {
     }
     o
 }
+
+// VUGSCANDEVIATION (SR510): the attributed writer beside `write` (whose bytes are unchanged).
+/// [`write`] with per-vertex attributes: after double x / y / z, `property float <name>` for the scalar and
+/// `property uchar red / green / blue` for the colour, each only when given. A NaN scalar is "no value" (the reader
+/// of this crate skips unknown properties, so the file reads back as its mesh). A slice shorter than the vertex count
+/// writes 0 (NaN for the scalar) for the missing vertices, never a short record.
+pub fn write_scalars(mesh: &Mesh, scalar: Option<(&str, &[f32])>, rgb: Option<&[[u8; 3]]>) -> Vec<u8> {
+    let mut props = alloc::string::String::from("property double x\nproperty double y\nproperty double z\n");
+    if let Some((name, _)) = scalar {
+        props.push_str(&alloc::format!("property float {name}\n"));
+    }
+    if rgb.is_some() {
+        props.push_str("property uchar red\nproperty uchar green\nproperty uchar blue\n");
+    }
+    let head = alloc::format!(
+        "ply\nformat binary_little_endian 1.0\ncomment mesh_core (VUGMESH SR466, attributes VUGSCANDEVIATION SR510)\nelement vertex {}\n{props}element face {}\nproperty list uchar uint vertex_indices\nend_header\n",
+        mesh.positions.len(),
+        mesh.triangles.len()
+    );
+    let mut o = Vec::new();
+    o.extend_from_slice(head.as_bytes());
+    for (v, p) in mesh.positions.iter().enumerate() {
+        for x in [p.x, p.y, p.z] {
+            o.extend_from_slice(&x.to_le_bytes());
+        }
+        if let Some((_, s)) = scalar {
+            o.extend_from_slice(&s.get(v).copied().unwrap_or(f32::NAN).to_le_bytes());
+        }
+        if let Some(c) = rgb {
+            o.extend_from_slice(&c.get(v).copied().unwrap_or([0, 0, 0]));
+        }
+    }
+    for t in &mesh.triangles {
+        o.push(3);
+        for &i in t {
+            o.extend_from_slice(&i.to_le_bytes());
+        }
+    }
+    o
+}
