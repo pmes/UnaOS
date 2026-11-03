@@ -28,7 +28,7 @@ pub enum OpKind {
     /// VUGSTEP (SR482): read from an exchange file by step_core: `Name::a` is the entity's instance number in the
     /// file, `Name::b` the solid's index in its shape representation.
     Import,
-    /// VUGBREP3 (SR502): made by `fillet`: `Name::a` is the source edge's Id.
+    /// VUGBREP3 (SR502): made by `fillet`: `Name::a` is the source edge's Id (a corner's patch and trim vertices: the corner vertex's Id, SR512).
     Fillet,
     /// VUGBREP3 (SR502): made by `chamfer`: `Name::a` is the source edge's Id.
     Chamfer,

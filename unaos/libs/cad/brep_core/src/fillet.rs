@@ -4,9 +4,20 @@
 //!
 //! The road, in order (each step's refusal is the answer; nothing is nudged):
 //! 1. The input validates; r (or d1, d2) is positive and finite; the list is non-empty, without repeats, of edge Ids.
-//! 2. A vertex at the end of two or more listed edges refuses `CornerNotBlended { vertex }`: the vertex blend (and a
-//!    chamfer's planar mitre) is VUG-BREP-3-CORNER, owed. Listed edges are therefore vertex-disjoint and are all
-//!    planned against the INPUT before anything is built.
+//! 2. VUGBREPCORNER (SR512): a vertex at the end of two or more listed edges is a CORNER. It is blended only when it
+//!    is the standard convex box corner: all three of its edges listed (two refuse `CornerNotBlended { vertex,
+//!    reason: "partial" }`: the two cylinders would meet along an ellipse on trimmed cylinders), degree 3 ("degree"),
+//!    its three faces planes with mutually perpendicular normals within Tol.ang ("oblique"), each face's outward
+//!    normal against the listed edge it does not hold ("concave": the seven-octant corner is
+//!    VUG-BREP-3-CORNER-CONCAVE), and for a chamfer d1 == d2 within Tol.lin ("unequal-radii"; the fillet takes one r).
+//!    Such a corner V with edge directions d0, d1, d2 (from V, list order) and setback s (r, or d) trims every edge
+//!    back by s and every face to its trim vertex V + s (d_a + d_b); the fillet's patch is the sphere octant centred
+//!    at c = V + r (d0 + d1 + d2) in the frame z = -d2, x = -d0 (or -d1, so y is minus the other), u and v in
+//!    [0, pi/2]: a uv rectangle whose equator and meridians are the three cylinders' end arcs and whose pole is the
+//!    trim vertex of the face holding e0 and e1 (a corner plan's arcs take alpha = pi/2 exactly, so tess.rs cuts the
+//!    arcs and the sphere's u and v into the same pieces); the chamfer's patch is the planar mitre triangle through
+//!    the three trim vertices (normal -(d0 + d1 + d2)). Every other vertex carries at most one listed edge; all
+//!    listed edges are planned against the INPUT before anything is built.
 //! 3. Per edge e (v0 -> v1 along its line direction t): F1 is the face whose co-edge runs along t, F2 the other; both
 //!    must be planes (`NotClosedForm` by pair name: the plane / cylinder edge is the torus blend, VUG-BREP-3-TORUS).
 //!    The in-face direction w_i = n_i x d_i (the face lies left of its loop about its outward normal n_i); the edge
@@ -31,7 +42,9 @@
 //!
 //! Names: `OpKind::Fillet` / `OpKind::Chamfer` with `a` = the source edge's Id: the blend face `Role::Blend` b 0, the
 //! end edges `Role::Blend` b 1 / 2, the trim lines `Role::Trim` b 1 (on F1) / 2 (on F2), the trim vertices
-//! `Role::Trim` b 0 (P1) 1 (P2) 2 (Q1) 3 (Q2). The blend is found by `faces_named`.
+//! `Role::Trim` b 0 (P1) 1 (P2) 2 (Q1) 3 (Q2). The blend is found by `faces_named`. A corner (SR512) names by the
+//! corner VERTEX's Id: its patch `Role::Blend` b 0, its shared trim vertices `Role::Trim` b 0 / 1 / 2 in mint order
+//! (Ids are unique across vertices, edges and faces, so no corner Name meets an edge's).
 
 use crate::Refusal;
 use crate::build::Seg2;
@@ -42,7 +55,7 @@ use crate::topo::{Brep, CoEdge, Entity, Id, Loop, Name, OpKind, Role, UvBox};
 use crate::validate::validate;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::f64::consts::TAU;
+use core::f64::consts::{FRAC_PI_2, TAU};
 use geom_core::{SegSeg2, Segment2, Tol, Vec2, Vec3, segment_segment2};
 
 /// Fillet each listed edge with radius `r` (the cylinder blend of a plane / plane edge).
@@ -80,6 +93,8 @@ struct End {
     dir: [Vec3; 2],
     /// Distance along each neighbour per unit of the parameter.
     k: [f64; 2],
+    /// VUGBREPCORNER (SR512): the vertex is a blended corner (no end face: `face` is u32::MAX and never read).
+    corner: bool,
 }
 
 /// One listed edge, measured against the input.
@@ -103,7 +118,9 @@ impl Plan {
     /// The trim point at end `j` on side `i` for parameter `rho`.
     fn point(&self, b: &Brep, j: usize, i: usize, rho: f64) -> Vec3 {
         let end = &self.ends[j];
-        b.vertices[end.v as usize].p + end.dir[i] * (end.k[i] * rho)
+        let p = b.vertices[end.v as usize].p + end.dir[i] * (end.k[i] * rho);
+        // VUGBREPCORNER (SR512): at a corner the edge is trimmed back by the setback too (equal and perpendicular).
+        if end.corner { p + self.t * (if j == 0 { rho } else { -rho }) } else { p }
     }
 }
 
@@ -131,19 +148,6 @@ fn edit(b: &Brep, ids: &[Id], kind: Kind, tol: Tol) -> Result<Brep, Refusal> {
             _ => return Err(Refusal::BadRef { what: "fillet edge" }),
         }
     }
-    let mut seen = vec![false; b.vertices.len()];
-    for &e in &es {
-        // A closed edge (a cap circle) has one vertex at both ends: it is counted once.
-        let ev = b.edges[e as usize].v;
-        let ends: &[u32] = if ev[0] == ev[1] { &ev[..1] } else { &ev };
-        for &v in ends {
-            if seen[v as usize] {
-                return Err(Refusal::CornerNotBlended { vertex: b.vertices[v as usize].id });
-            }
-            seen[v as usize] = true;
-        }
-    }
-
     // Each edge's (face, co-edge) uses and each vertex's edge count.
     let mut uses: Vec<Vec<(u32, u32)>> = vec![Vec::new(); b.edges.len()];
     for (ci, c) in b.coedges.iter().enumerate() {
@@ -157,9 +161,10 @@ fn edit(b: &Brep, ids: &[Id], kind: Kind, tol: Tol) -> Result<Brep, Refusal> {
         }
     }
 
+    let corner_at = corners(b, &uses, &degree, &es, kind, tol)?;
     let mut plans = Vec::new();
     for &e in &es {
-        plans.push(plan(b, &uses, &degree, e, kind, tol)?);
+        plans.push(plan(b, &uses, &degree, &corner_at, e, kind, tol)?);
     }
     let rho = match kind {
         Kind::Fillet { r } => r,
@@ -171,7 +176,15 @@ fn edit(b: &Brep, ids: &[Id], kind: Kind, tol: Tol) -> Result<Brep, Refusal> {
 }
 
 /// Measure one listed edge (steps 3 and 4 of the module doc).
-fn plan(b: &Brep, uses: &[Vec<(u32, u32)>], degree: &[u32], e: u32, kind: Kind, tol: Tol) -> Result<Plan, Refusal> {
+fn plan(
+    b: &Brep,
+    uses: &[Vec<(u32, u32)>],
+    degree: &[u32],
+    corner_at: &[bool],
+    e: u32,
+    kind: Kind,
+    tol: Tol,
+) -> Result<Plan, Refusal> {
     let edge = &b.edges[e as usize];
     let u = &uses[e as usize];
     if u.len() != 2 {
@@ -239,6 +252,10 @@ fn plan(b: &Brep, uses: &[Vec<(u32, u32)>], degree: &[u32], e: u32, kind: Kind, 
             dir[i] = d;
             k[i] = kappa[i] / along;
         }
+        if corner_at[v as usize] {
+            ends.push(End { v, face: u32::MAX, adj, dir, k, corner: true });
+            continue;
+        }
         // The end face: the neighbours' other face, the same one on both sides.
         let other = |a: u32, not: u32| uses[a as usize].iter().map(|x| x.0).find(|&x| x != not);
         let face = match (other(adj[0], f[0]), other(adj[1], f[1])) {
@@ -259,7 +276,7 @@ fn plan(b: &Brep, uses: &[Vec<(u32, u32)>], degree: &[u32], e: u32, kind: Kind, 
                 return Err(Refusal::Unsupported("fillet end face oblique to the edge"));
             }
         }
-        ends.push(End { v, face, adj, dir, k });
+        ends.push(End { v, face, adj, dir, k, corner: false });
     }
     let e1 = ends.pop().ok_or(Refusal::BadRef { what: "fillet end" })?;
     let e0 = ends.pop().ok_or(Refusal::BadRef { what: "fillet end" })?;
@@ -307,7 +324,7 @@ fn cross2(a: Vec2, b: Vec2) -> f64 {
 fn size(b: &Brep, plans: &[Plan], rho: f64, tol: Tol) -> Result<(), Refusal> {
     let mut cons = vec![0.0f64; b.edges.len()];
     for p in plans {
-        for end in &p.ends {
+        for end in p.ends.iter().filter(|x| !x.corner) {
             for i in 0..2 {
                 cons[end.adj[i] as usize] += end.k[i];
             }
@@ -315,8 +332,13 @@ fn size(b: &Brep, plans: &[Plan], rho: f64, tol: Tol) -> Result<(), Refusal> {
     }
     for p in plans {
         let mut bound = f64::INFINITY;
+        // VUGBREPCORNER (SR512): the edge outlasts its corner setbacks (s = the parameter at a corner).
+        let nc = p.ends.iter().filter(|x| x.corner).count();
+        if nc > 0 {
+            bound = bound.min(p.len / nc as f64);
+        }
         // (i) the neighbours' lengths.
-        for end in &p.ends {
+        for end in p.ends.iter().filter(|x| !x.corner) {
             for i in 0..2 {
                 let a = &b.edges[end.adj[i] as usize];
                 bound = bound.min((a.t1 - a.t0) / cons[end.adj[i] as usize]);
@@ -343,7 +365,7 @@ fn size(b: &Brep, plans: &[Plan], rho: f64, tol: Tol) -> Result<(), Refusal> {
             }
         }
         // (ii) the corner triangles in E: q - V = alpha A + beta B with A, B the trim vectors per unit parameter.
-        for end in &p.ends {
+        for end in p.ends.iter().filter(|x| !x.corner) {
             let vp = b.vertices[end.v as usize].p;
             let (aa, bb) = (end.dir[0] * end.k[0], end.dir[1] * end.k[1]);
             let ne = plane_frame(&b.faces[end.face as usize]).ok_or(Refusal::BadRef { what: "fillet face" })?.z;
@@ -385,6 +407,9 @@ fn meet(b: &Brep, plans: &[Plan], rho: f64, tol: Tol) -> Result<(), Refusal> {
             regs.push((p.f[i], pi, vec![v0, v1, p.point(b, 1, i, rho), p.point(b, 0, i, rho)]));
         }
         for (j, end) in p.ends.iter().enumerate() {
+            if end.corner {
+                continue;
+            }
             let vp = b.vertices[end.v as usize].p;
             regs.push((end.face, pi, vec![vp, p.point(b, j, 0, rho), p.point(b, j, 1, rho)]));
         }
@@ -394,6 +419,11 @@ fn meet(b: &Brep, plans: &[Plan], rho: f64, tol: Tol) -> Result<(), Refusal> {
             let (fx, px, cx) = (regs[x].0, regs[x].1, &regs[x].2);
             let (fy, py, cy) = (regs[y].0, regs[y].1, &regs[y].2);
             if fx != fy || px == py {
+                continue;
+            }
+            // VUGBREPCORNER (SR512): two strips of one corner share its diagonal V - T by construction.
+            let share = plans[px].ends.iter().any(|a| a.corner && plans[py].ends.iter().any(|c| c.corner && c.v == a.v));
+            if share {
                 continue;
             }
             let fr = plane_frame(&b.faces[fx as usize]).ok_or(Refusal::BadRef { what: "fillet face" })?;
@@ -489,26 +519,43 @@ fn build(b: &Brep, plans: &[Plan], kind: Kind, rho: f64, tol: Tol) -> Result<Bre
     // (neighbour edge, the vertex it leaves, the new vertex) for the shortening pass.
     let mut moves: Vec<(u32, u32, u32)> = Vec::new();
     let mut blends: Vec<(u32, u32)> = Vec::new();
+    // VUGBREPCORNER (SR512): (corner vertex, face, trim vertex) minted once; per corner (vertex, the patch's co-edges,
+    // the edge directions from the vertex in list order, a face of the corner for the shell).
+    let mut cmap: Vec<(u32, u32, u32)> = Vec::new();
+    let mut patches: Vec<(u32, Vec<(u32, bool)>, Vec<Vec3>, u32)> = Vec::new();
     for p in plans {
         let src = u32::try_from(p.id.0).map_err(|_| Refusal::BadParam("an Id past u32 in a fillet name"))?;
         let nm = |role: Role, k: u32| Name { op, role, a: src, b: k };
         let (p1, p2, q1, q2) = (p.point(b, 0, 0, rho), p.point(b, 0, 1, rho), p.point(b, 1, 0, rho), p.point(b, 1, 1, rho));
-        let vp1 = w.add_vertex(nm(Role::Trim, 0), p1);
-        let vp2 = w.add_vertex(nm(Role::Trim, 1), p2);
-        let vq1 = w.add_vertex(nm(Role::Trim, 2), q1);
-        let vq2 = w.add_vertex(nm(Role::Trim, 3), q2);
+        // A corner end's trim vertex is the corner's, shared with the other plan trimming that face.
+        let tv = |w: &mut Brep, cmap: &mut Vec<(u32, u32, u32)>, j: usize, i: usize, k: u32, q: Vec3| {
+            let end = &p.ends[j];
+            if end.corner {
+                corner_vertex(w, cmap, op, b.vertices[end.v as usize].id, end.v, p.f[i], q)
+            } else {
+                Ok(w.add_vertex(nm(Role::Trim, k), q))
+            }
+        };
+        let vp1 = tv(&mut w, &mut cmap, 0, 0, 0, p1)?;
+        let vp2 = tv(&mut w, &mut cmap, 0, 1, 1, p2)?;
+        let vq1 = tv(&mut w, &mut cmap, 1, 0, 2, q1)?;
+        let vq2 = tv(&mut w, &mut cmap, 1, 1, 3, q2)?;
         let l1 = line(&mut w, nm(Role::Trim, 1), p1, q1, vp1, vq1)?;
         let l2 = line(&mut w, nm(Role::Trim, 2), p2, q2, vp2, vq2)?;
         let v0 = b.vertices[p.ends[0].v as usize].p;
         let (a0, a1, surface, reversed, uv) = match kind {
             Kind::Fillet { r } => {
-                let c0 = v0 + (p.w[0] + p.w[1]).normalize()? * (r / libm::sin(p.phi * 0.5));
+                // VUGBREPCORNER (SR512): the axis is trimmed back by r at a corner end, and a corner plan's arcs
+                // span exactly pi/2 (the corner is perpendicular within Tol.ang).
+                let (s0, s1) = (if p.ends[0].corner { r } else { 0.0 }, if p.ends[1].corner { r } else { 0.0 });
+                let cb = v0 + (p.w[0] + p.w[1]).normalize()? * (r / libm::sin(p.phi * 0.5));
+                let c0 = cb + p.t * s0;
                 let x = p1 - c0;
                 let z = if (p2 - c0).dot(p.t.cross(x)) < 0.0 { -p.t } else { p.t };
                 let f0 = Frame::new(c0, z, x)?;
                 let (lx, ly, _) = f0.local(p2);
-                let alpha = libm::atan2(ly, lx);
-                let c1 = c0 + p.t * p.len;
+                let alpha = if s0 > 0.0 || s1 > 0.0 { FRAC_PI_2 } else { libm::atan2(ly, lx) };
+                let c1 = cb + p.t * (p.len - s1);
                 let a0 = w.add_edge(nm(Role::Blend, 1), Curve::Circle { f: f0, r }, 0.0, alpha, vp1, vp2);
                 let a1 = w.add_edge(nm(Role::Blend, 2), Curve::Circle { f: f0.moved(c1), r }, 0.0, alpha, vq1, vq2);
                 let vz = (c1 - c0).dot(f0.z);
@@ -536,6 +583,19 @@ fn build(b: &Brep, plans: &[Plan], kind: Kind, rho: f64, tol: Tol) -> Result<Bre
         let mut end_sense = [false; 2];
         for (j, aj) in [a0, a1].into_iter().enumerate() {
             let end = &p.ends[j];
+            if end.corner {
+                // VUGBREPCORNER (SR512): the corner patch takes the end face's role, in the sense the blend forces.
+                end_sense[j] = j == 0;
+                let d = if j == 0 { p.t } else { -p.t };
+                match patches.iter_mut().find(|x| x.0 == end.v) {
+                    Some(x) => {
+                        x.1.push((aj, end_sense[j]));
+                        x.2.push(d);
+                    }
+                    None => patches.push((end.v, vec![(aj, end_sense[j])], vec![d], p.f[0])),
+                }
+                continue;
+            }
             let mut placed = false;
             for l in lists[end.face as usize].iter_mut() {
                 let n = l.len();
@@ -558,6 +618,9 @@ fn build(b: &Brep, plans: &[Plan], kind: Kind, rho: f64, tol: Tol) -> Result<Bre
         blends.push((bf, p.f[0]));
         for (j, (va, vb)) in [(vp1, vp2), (vq1, vq2)].into_iter().enumerate() {
             let end = &p.ends[j];
+            if end.corner {
+                continue;
+            }
             moves.push((end.adj[0], end.v, va));
             moves.push((end.adj[1], end.v, vb));
         }
@@ -565,6 +628,7 @@ fn build(b: &Brep, plans: &[Plan], kind: Kind, rho: f64, tol: Tol) -> Result<Bre
         dead_v[p.ends[1].v as usize] = true;
         dead_e[p.e as usize] = true;
     }
+    corner_patches(b, &mut w, &mut lists, &mut blends, patches, kind, rho, op)?;
 
     // Shorten the neighbours: the end at the dropped vertex moves to its trim vertex.
     for (a, old, new) in moves {
@@ -637,4 +701,161 @@ fn build(b: &Brep, plans: &[Plan], kind: Kind, rho: f64, tol: Tol) -> Result<Bre
     }
     validate(&out, tol)?;
     Ok(out)
+}
+
+// VUGBREPCORNER (SR512): the corner classification, the shared trim vertex mint, the sphere octant and the chamfer
+// mitre (module doc step 2).
+
+/// Classify every vertex carrying two or more listed edges (in list order); the blended corners come back flagged.
+fn corners(
+    b: &Brep,
+    uses: &[Vec<(u32, u32)>],
+    degree: &[u32],
+    es: &[u32],
+    kind: Kind,
+    tol: Tol,
+) -> Result<Vec<bool>, Refusal> {
+    let once = |e: u32| {
+        // A closed edge (a cap circle) has one vertex at both ends: it is counted once.
+        let ev = b.edges[e as usize].v;
+        if ev[0] == ev[1] { vec![ev[0]] } else { vec![ev[0], ev[1]] }
+    };
+    let mut count = vec![0u32; b.vertices.len()];
+    for &e in es {
+        for v in once(e) {
+            count[v as usize] += 1;
+        }
+    }
+    let mut at = vec![false; b.vertices.len()];
+    let mut done = vec![false; b.vertices.len()];
+    for &e in es {
+        for v in once(e) {
+            if done[v as usize] || count[v as usize] < 2 {
+                continue;
+            }
+            done[v as usize] = true;
+            if count[v as usize] == 2 {
+                return Err(Refusal::CornerNotBlended { vertex: b.vertices[v as usize].id, reason: "partial" });
+            }
+            corner(b, uses, degree, es, v, kind, tol)?;
+            at[v as usize] = true;
+        }
+    }
+    Ok(at)
+}
+
+/// The unit direction from `v` along the line edge `e`.
+fn away(b: &Brep, e: u32, v: u32) -> Result<Vec3, Refusal> {
+    let ev = b.edges[e as usize].v;
+    let far = if ev[0] == v { ev[1] } else { ev[0] };
+    Ok((b.vertices[far as usize].p - b.vertices[v as usize].p).normalize()?)
+}
+
+/// One corner with three or more listed edges: the box corner, or a refusal by reason.
+fn corner(
+    b: &Brep,
+    uses: &[Vec<(u32, u32)>],
+    degree: &[u32],
+    es: &[u32],
+    v: u32,
+    kind: Kind,
+    tol: Tol,
+) -> Result<(), Refusal> {
+    let refuse = |reason: &'static str| Refusal::CornerNotBlended { vertex: b.vertices[v as usize].id, reason };
+    let at: Vec<u32> = es.iter().copied().filter(|&e| b.edges[e as usize].v.contains(&v)).collect();
+    if degree[v as usize] != 3 || at.len() != 3 {
+        return Err(refuse("degree"));
+    }
+    let mut faces: Vec<u32> = Vec::new();
+    for &e in &at {
+        for &(f, _) in &uses[e as usize] {
+            if !faces.contains(&f) {
+                faces.push(f);
+            }
+        }
+    }
+    if faces.len() != 3 {
+        return Err(refuse("oblique"));
+    }
+    let mut n = [Vec3::ZERO; 3];
+    for (k, &f) in faces.iter().enumerate() {
+        n[k] = plane_frame(&b.faces[f as usize]).ok_or(refuse("oblique"))?.z;
+    }
+    for (x, y) in [(0, 1), (0, 2), (1, 2)] {
+        if libm::fabs(n[x].dot(n[y])) > tol.ang {
+            return Err(refuse("oblique"));
+        }
+    }
+    for (k, &f) in faces.iter().enumerate() {
+        let e = at.iter().copied().find(|&e| !uses[e as usize].iter().any(|u| u.0 == f)).ok_or(refuse("oblique"))?;
+        if !(n[k].dot(away(b, e, v)?) < 0.0) {
+            return Err(refuse("concave"));
+        }
+    }
+    if let Kind::Chamfer { d1, d2 } = kind {
+        if libm::fabs(d1 - d2) > tol.lin {
+            return Err(refuse("unequal-radii"));
+        }
+    }
+    Ok(())
+}
+
+/// The trim vertex of `face` at corner `v`, minted on first use and named by the corner vertex's Id.
+fn corner_vertex(
+    w: &mut Brep,
+    cmap: &mut Vec<(u32, u32, u32)>,
+    op: OpKind,
+    src: Id,
+    v: u32,
+    face: u32,
+    p: Vec3,
+) -> Result<u32, Refusal> {
+    if let Some(&(_, _, x)) = cmap.iter().find(|c| c.0 == v && c.1 == face) {
+        return Ok(x);
+    }
+    let a = u32::try_from(src.0).map_err(|_| Refusal::BadParam("an Id past u32 in a fillet name"))?;
+    let k = cmap.iter().filter(|c| c.0 == v).count() as u32;
+    let x = w.add_vertex(Name { op, role: Role::Trim, a, b: k }, p);
+    cmap.push((v, face, x));
+    Ok(x)
+}
+
+/// Each corner's patch: the sphere octant (fillet) or the mitre triangle (chamfer), bounded by its three end edges.
+#[allow(clippy::too_many_arguments)]
+fn corner_patches(
+    b: &Brep,
+    w: &mut Brep,
+    lists: &mut Vec<Vec<Vec<(u32, bool)>>>,
+    blends: &mut Vec<(u32, u32)>,
+    patches: Vec<(u32, Vec<(u32, bool)>, Vec<Vec3>, u32)>,
+    kind: Kind,
+    rho: f64,
+    op: OpKind,
+) -> Result<(), Refusal> {
+    for (v, ces, d, f1) in patches {
+        if ces.len() != 3 || d.len() != 3 {
+            return Err(Refusal::BadRef { what: "fillet corner patch" });
+        }
+        let vx = &b.vertices[v as usize];
+        let a = u32::try_from(vx.id.0).map_err(|_| Refusal::BadParam("an Id past u32 in a fillet name"))?;
+        let lp = chain(w, ces)?;
+        let (surface, uv) = match kind {
+            Kind::Fillet { r } => {
+                let c = vx.p + (d[0] + d[1] + d[2]) * r;
+                let mut f = Frame::new(c, -d[2], -d[0])?;
+                if f.y.dot(d[1]) > 0.0 {
+                    f = Frame::new(c, -d[2], -d[1])?;
+                }
+                (Surface::Sphere { f, r }, Some(UvBox { u0: 0.0, u1: FRAC_PI_2, v0: 0.0, v1: FRAC_PI_2 }))
+            }
+            Kind::Chamfer { .. } => {
+                let o = vx.p + (d[0] + d[1]) * rho;
+                (Surface::Plane { f: Frame::new(o, -(d[0] + d[1] + d[2]), d[0] - d[1])? }, None)
+            }
+        };
+        let pf = w.add_face(Name { op, role: Role::Blend, a, b: 0 }, surface, false, uv, &[]);
+        lists.push(vec![lp]);
+        blends.push((pf, f1));
+    }
+    Ok(())
 }

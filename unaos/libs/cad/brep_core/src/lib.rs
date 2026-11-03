@@ -118,9 +118,12 @@ pub enum Refusal {
     /// feature of a face it trims, or into another listed edge's trim; `max` is the bound it reaches (the radius; for a
     /// chamfer d1 at the given d2/d1), and a result needs the parameter below it by more than Tol.lin.
     RadiusTooLarge { edge: Id, max: f64 },
-    /// VUGBREP3 (SR502): two or more listed edges meet at this vertex; the corner blend (and a chamfer's mitre) is
-    /// VUG-BREP-3-CORNER, owed.
-    CornerNotBlended { vertex: Id },
+    /// VUGBREP3 (SR502): two or more listed edges meet at this vertex and the corner is not blended. VUGBREPCORNER
+    /// (SR512) blends the convex box corner (all three edges, three mutually perpendicular planes, one radius or equal
+    /// chamfer distances); `reason` names the rest: "partial" (two of its edges listed), "degree" (not three edges),
+    /// "oblique" (not three perpendicular planes), "concave", "unequal-radii" (a chamfer's d1 != d2). The general
+    /// vertex blend is VUG-BREP-3-CORNER-UNEQUAL, owed.
+    CornerNotBlended { vertex: Id, reason: &'static str },
 }
 
 impl From<geom_core::Degenerate> for Refusal {
