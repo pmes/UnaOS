@@ -46,6 +46,7 @@
 
 pub mod logview;
 pub mod pump; // VUGCOMSCAN1 (SR476): the pump, whose only entry is Helm's Verdict::Pass
+#[cfg(any(target_os = "linux", target_os = "macos"))] pub mod tty; // VUGCOMSCANTTY (SR484): the host serial port (termios) as the pump's Transport
 
 pub use logview::LogView;
 
