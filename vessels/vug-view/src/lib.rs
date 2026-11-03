@@ -55,6 +55,7 @@ pub const SHORTCUTS: &[(&str, &str)] = &[
     ("u / U", "undo / redo (the document's snapshots; the face regenerates)"),
     ("Up / Down, Delete, Enter", "in the tree panel: move, delete the row with its dependants, edit its value (type, Enter)"),
     ("s / Cmd+S", "save the document: the opened .vug, else <file stem>.vug beside the opened file (a sibling .tmp renamed over it); the title shows * while unsaved; a write error is named in the corner"), // VUGFACESAVE (SR534)
+    ("Cmd+Shift+S", "save as: type a path (relative: beside the opened file; no extension: .vug), Enter; an existing file is refused once, Enter again overwrites; Esc or Cmd+Shift+S cancels"), // VUGFACESAVEAS (SR539)
     ("d (outside a sketch)", "the deviation map on / off (a scan opened with --against <design.vugdoc>; the corner names the worst faces)"), // VUGFACEDEVIATION (SR525)
 ];
 
@@ -142,6 +143,7 @@ impl Viewer {
     /// A shortcut key; true when the frame changed. VUGFACESAVE (SR534): Cmd+S (`Meta+s` on the bus) saves, and a
     /// plain `s` when no edit, pull or gesture holds the keys; the title follows the document.
     pub fn key(&mut self, k: &str) -> bool {
+        if let Some(r) = self.save_as_key(k) { self.retitle(); return r; } // VUGFACESAVEAS (SR539): the open Save As field takes every key first
         let save = k == "Meta+s" || (k == "s" && !journal::busy(&self.view.design) && self.view.fillet.is_none());
         let r = if save {
             let _ = self.save();
@@ -231,7 +233,7 @@ impl Viewer {
     }
 
     /// Write the document (doc_core's writer) to `save_to` atomically: no target names "no file"; an existing file the
-    /// face neither opened nor wrote is refused by name (Save As is owed). The outcome is the corner line.
+    /// face neither opened nor wrote is refused by name (Save As chooses another: VUGFACESAVEAS). The outcome is the corner line.
     pub fn save(&mut self) -> Result<std::path::PathBuf, String> {
         let out = self.save_inner();
         self.view.design.journal.disk = Some(match &out {
@@ -243,7 +245,7 @@ impl Viewer {
     }
 
     fn save_inner(&mut self) -> Result<std::path::PathBuf, String> {
-        let path = self.save_to.clone().ok_or("no file: Save As is owed")?;
+        let path = self.save_to.clone().ok_or("no file: Cmd+Shift+S saves as")?;
         if !self.claimed && path.exists() {
             return Err(format!("{} exists: open it to change it", path.display()));
         }
@@ -278,4 +280,90 @@ fn write_atomic(path: &std::path::Path, text: &str) -> Result<(), String> {
         let _ = std::fs::remove_file(&tmp);
         named(path, e)
     })
+}
+
+// ---- VUGFACESAVEAS (SR539): the chosen path ----
+
+impl Viewer {
+    /// The Save As field's keys: `Meta+Shift+s` opens it; while it is open it takes every key — a character is typed
+    /// (sketch.rs `type_text`), Backspace pops, Esc or the chord again closes it with nothing written, Enter saves to
+    /// the typed path, any other key does nothing. None when it is closed and the key is not the chord.
+    pub fn save_as_key(&mut self, k: &str) -> Option<bool> {
+        let chord = matches!(k, "Meta+Shift+s" | "Meta+Shift+S");
+        let j = &mut self.view.design.journal;
+        let Some(f) = j.save_as.as_mut() else {
+            if chord {
+                j.save_as = Some(journal::SaveAs::default());
+                return Some(true);
+            }
+            return None;
+        };
+        if chord || matches!(k, "Escape" | "\u{1b}") {
+            j.save_as = None;
+            return Some(true);
+        }
+        if matches!(k, "Return" | "KP_Enter" | "\r" | "\n") {
+            let (typed, armed) = (f.text.clone(), f.armed);
+            self.save_as_enter(&typed, armed);
+            return Some(true);
+        }
+        let back = matches!(k, "BackSpace" | "Backspace" | "\u{8}" | "\u{7f}");
+        let ch = {
+            let mut it = k.chars();
+            match (it.next(), it.next()) {
+                (Some(c), None) => Some(c),
+                _ => None,
+            }
+        };
+        if !sketch::type_text(&mut f.text, ch, back) {
+            return Some(false);
+        }
+        if f.armed {
+            f.armed = false;
+            j.disk = None; // the "exists" line named the old text
+        }
+        Some(true)
+    }
+
+    /// Enter in the field: the typed path (relative: beside the opened file; no extension: `.vug`). An existing file
+    /// that is not the face's own target is refused once by name (the field armed: the next Enter overwrites); else
+    /// the path becomes the target and the SAME [`Viewer::save`] writes it — on success the title follows the new name
+    /// and the field closes, on an error the old target is restored and the field stays.
+    fn save_as_enter(&mut self, typed: &str, armed: bool) {
+        if typed.is_empty() {
+            self.view.design.journal.disk = Some(Err("save as: no path typed".to_string()));
+            return;
+        }
+        let mut p = std::path::PathBuf::from(typed);
+        if p.is_relative() {
+            if let Some(dir) = self.save_to.as_deref().and_then(|s| s.parent()) {
+                p = dir.join(p);
+            }
+        }
+        if p.extension().is_none() {
+            p.set_extension("vug");
+        }
+        let own = self.claimed && self.save_to.as_deref() == Some(p.as_path());
+        if p.exists() && !armed && !own {
+            let j = &mut self.view.design.journal;
+            j.disk = Some(Err(format!("{} exists: Enter again overwrites", p.display())));
+            if let Some(f) = j.save_as.as_mut() {
+                f.armed = true;
+            }
+            return;
+        }
+        let was = (self.save_to.replace(p.clone()), self.claimed);
+        self.claimed = true;
+        match self.save() {
+            Ok(_) => {
+                self.name = p.file_name().and_then(|s| s.to_str()).unwrap_or("vug").to_string();
+                self.view.design.journal.save_as = None;
+            }
+            Err(_) => {
+                self.save_to = was.0;
+                self.claimed = was.1;
+            }
+        }
+        self.retitle();
+    }
 }

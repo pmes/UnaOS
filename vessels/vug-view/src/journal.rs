@@ -260,11 +260,13 @@ pub struct Journal {
     saved: Option<String>,
     /// VUGFACESAVE (SR534): the corner line: `saved <name>`, or the write error by name.
     pub disk: Option<Result<String, String>>,
+    /// VUGFACESAVEAS (SR539): the Save As field while it is open (Cmd+Shift+S; lib.rs `Viewer::save_as_key`).
+    pub save_as: Option<SaveAs>,
 }
 
 impl Default for Journal {
     fn default() -> Journal {
-        Journal { doc: Doc::new(Tol::DEFAULT), closed: 0, open: None, undo: Vec::new(), redo: Vec::new(), panel: false, cursor: 0, edit: None, note: None, saved: None, disk: None }
+        Journal { doc: Doc::new(Tol::DEFAULT), closed: 0, open: None, undo: Vec::new(), redo: Vec::new(), panel: false, cursor: 0, edit: None, note: None, saved: None, disk: None, save_as: None }
     }
 }
 
@@ -510,7 +512,7 @@ pub fn key(d: &mut Design, k: &str) -> Option<bool> {
 /// The panel: the right quarter of the frame, a row per statement (the cursor row tinted, an edit shown as
 /// `<verb> <id> = <typed>`), the note at the bottom (a refusal in the refusal colour).
 pub fn overlay(view: &View, fr: &mut Raster) {
-    disk_overlay(view, fr); let j = &view.design.journal; // VUGFACESAVE (SR534): the save's corner line, panel or not
+    disk_overlay(view, fr); save_as_overlay(view, fr); let j = &view.design.journal; // VUGFACESAVEAS (SR539): the Save As field; VUGFACESAVE (SR534): the save's corner line, panel or not
     if !j.panel {
         return;
     }
@@ -699,4 +701,26 @@ fn disk_overlay(view: &View, fr: &mut Raster) {
     let x = (w - 6.0 - 8.0 * text.chars().count() as f32).max(6.0);
     let y = h - ROW_PX - if j.panel { ROW_PX } else { 0.0 };
     raster::text(fr, &text, x, y, col);
+}
+
+// ---- VUGFACESAVEAS (SR539): the Save As field ----
+
+/// The Save As field: the typed path, and whether the existing file it names was refused once (the next Enter
+/// overwrites; any edit to the text disarms it).
+#[derive(Clone, Debug, Default)]
+pub struct SaveAs {
+    pub text: String,
+    pub armed: bool,
+}
+
+/// The open field, bottom left, one row above the corner line: `SAVE AS: <TEXT>_` (upper-cased: the font's case),
+/// clipped to the frame's width.
+fn save_as_overlay(view: &View, fr: &mut Raster) {
+    let j = &view.design.journal;
+    let Some(f) = &j.save_as else { return };
+    let (w, h) = (fr.width as f32, fr.height as f32);
+    let cols = ((w - 12.0) / 8.0).floor().max(1.0) as usize;
+    let text: String = format!("SAVE AS: {}_", f.text.to_uppercase()).chars().take(cols).collect();
+    let y = h - 2.0 * ROW_PX - if j.panel { ROW_PX } else { 0.0 };
+    raster::text(fr, &text, 6.0, y, rgba(ACTIVE));
 }

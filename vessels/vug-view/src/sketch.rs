@@ -1043,6 +1043,20 @@ pub(crate) fn type_into(buf: &mut String, ch: Option<char>, back: bool) -> bool 
     true
 }
 
+/// VUGFACESAVEAS (SR539): a typed key into a free text (the Save As path): any non-control character, Backspace pops.
+/// False when the key is none of them (a key name such as `Shift_L`); the caller owns Enter and Esc, as with [`type_into`].
+pub(crate) fn type_text(buf: &mut String, ch: Option<char>, back: bool) -> bool {
+    if back {
+        buf.pop();
+        return true;
+    }
+    match ch {
+        Some(c) if !c.is_control() => buf.push(c),
+        _ => return false,
+    }
+    true
+}
+
 impl Dim {
     /// The value now: mm, or degrees (the magnitude) for an angle; None when an entity it names is gone.
     pub fn measure(self, sk: &Sketch) -> Option<f64> {
