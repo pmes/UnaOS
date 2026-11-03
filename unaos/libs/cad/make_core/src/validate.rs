@@ -52,6 +52,11 @@ pub enum Refusal {
     // bridged), and slice parameters or a machine the slicer cannot take.
     OpenLoop { layer: usize, gap: f64 },
     SliceInvalid { what: &'static str },
+    // VUGMAKEREST (SR517): a stepover past the first tool's diameter leaves a core between every pair of rings; a rest
+    // region the smaller tool has no way into (no ring reaches it, or every start of a closed path is in material and
+    // the tool is not centre-cutting), by its index in `rest::regions`.
+    StepoverLeavesCore { tool: u32 },
+    RestNoEntry { region: usize, tool: u32 },
 }
 
 /// The planner's numbers for a program.

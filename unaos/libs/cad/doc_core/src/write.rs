@@ -485,6 +485,22 @@ fn write_op(w: &mut W, id: &str, on: &str, op: &Op) {
             w.out.push(']');
             w.u("tool", *tool as u64);
         }
+        // VUGMAKEREST (SR517): the rest a pocket with `after` at `stepover` left, cut with `tool`.
+        Op::Rest { outline, islands, top, depth, after, stepover, climb, tool, feeds } => {
+            w.head("rest", id);
+            w.w("on", on);
+            w.pts("outline", outline);
+            w.polys("islands", islands);
+            w.f("top", *top);
+            w.f("depth", *depth);
+            w.u("after", *after as u64);
+            w.f("stepover", *stepover);
+            w.w("climb", word_of(&YESNO, *climb));
+            w.u("tool", *tool as u64);
+            w.f("feed", feeds.feed);
+            w.f("plunge", feeds.plunge);
+            w.f("rpm", feeds.rpm);
+        }
         Op::LaserCut { polylines, passes } => {
             w.head("laser_cut", id);
             w.w("on", on);
