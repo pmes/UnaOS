@@ -13608,7 +13608,7 @@ impl XhciController {
             crate::bootpace::record("ftdi-up");
             ftdi::set_live(true);
         }
-        self.drain_ftdi(); #[cfg(feature = "ftdirx")] self.service_ftdi_rx(); if self.xi != 0 { return; } #[cfg(feature = "usbnet")] self.service_usbnet(); #[cfg(feature = "uvc")] self.service_uvc(); #[cfg(feature = "uvc")] uvc::pump(); #[cfg(feature = "uvc")] self.service_ptp(); // XHCIISO: one camera candidate per pass (never mid-enumeration). // USBNET: the link's pass rides the same ladder slot — one call, all four x86 ladders. // FTDIRX (rmbp A9) — THE RX HALF OF THE CONSOLE, the one statement this path never had. TX-first on purpose: the drain above is the console's own output and stays ahead of the input that provokes it, so an echoed prompt reaches the wire before the next typed byte is taken off it. Arms one Normal TRB on bulk-IN once the sink is live (the `set_live(true)` directly above), consumes each completion, strips the FT232's TWO modem-status bytes and pushes the rest as `Event::Key` — the same queue the xHCI HID decoder feeds, so `input_service`'s `next_event` drain sees a cable byte exactly as it sees a keystroke. Same shape as `serialrx::drain` on the Orin (arch/aarch64/serial.rs), one pass per device-service pass. DEFAULT OFF. ⚠ LINE-NEUTRAL append: panic `Location` records embed line numbers and this file is compiled into the Pi kernel8.img.
+        self.drain_ftdi(); #[cfg(feature = "ftdirx")] { if !ftdi::door::claim_rx() { self.service_ftdi_rx(); } } if self.xi != 0 { return; } #[cfg(feature = "usbnet")] self.service_usbnet(); #[cfg(feature = "uvc")] self.service_uvc(); #[cfg(feature = "uvc")] uvc::pump(); #[cfg(feature = "uvc")] self.service_ptp(); // XHCIISO: one camera candidate per pass (never mid-enumeration). // USBNET: the link's pass rides the same ladder slot — one call, all four x86 ladders. // FTDIRX (rmbp A9) — THE RX HALF OF THE CONSOLE, the one statement this path never had. TX-first on purpose: the drain above is the console's own output and stays ahead of the input that provokes it, so an echoed prompt reaches the wire before the next typed byte is taken off it. Arms one Normal TRB on bulk-IN once the sink is live (the `set_live(true)` directly above), consumes each completion, strips the FT232's TWO modem-status bytes and pushes the rest as `Event::Key` — the same queue the xHCI HID decoder feeds, so `input_service`'s `next_event` drain sees a cable byte exactly as it sees a keystroke. Same shape as `serialrx::drain` on the Orin (arch/aarch64/serial.rs), one pass per device-service pass. DEFAULT OFF. ⚠ LINE-NEUTRAL append: panic `Location` records embed line numbers and this file is compiled into the Pi kernel8.img. DOORONPUMP (rmbp-ledger B1095): while the `ftdi-door` task is up it is the ONE owner of the RX consume + re-arm (`ftdi::door`, `ftdi_door_pass` at this file's tail), so the pump skips its own call; `claim_rx` starts the door once and answers false (the pump keeps the job, as before) when there is no scheduled task or no other core. ⚠ LINE-NEUTRAL, in place.
     }
 
     /// PTBURST — bytes staged into ONE bulk-OUT transfer. **64, the FT232's full-speed bulk max packet
@@ -19819,4 +19819,26 @@ pub fn poll_cap_kat() -> &'static str {
     POLL_CAP_ONCE.store(st0, Ordering::Release);
     drop(x);
     r
+}
+
+// ── DOORONPUMP (rmbp-ledger B1095, FLIGHT 39 boot 1) — the FTDI RX door's controller half, off the usb-pump ─────────────
+//
+// Flight 39 boot 1: the usb-pump died 42 times in its hda step and the serial door died with it — `service_ftdi_rx` had ONE
+// caller, `service_ftdi`, whose only rMBP caller is the pump's xHCI step, so a typed verb waited on a pump that was parked or
+// dead (FTDIRX=0 all boot). The completion is already latched off the pump (`xhci-poll`'s `poll_events`, the one dispatch);
+// this is the other half: ONE pass of the existing `service_ftdi_rx` under the FTDI controller's loan, taken non-blocking
+// (`claim_at` never waits: a Busy loan is a skipped pass), for the `ftdi-door` task (`ftdi::door`). No poll, no second TRB path.
+//
+// ⚠ TAIL BLOCK ON PURPOSE (LINE-NEUTRAL): nothing below it shifts, so no panic `Location` above moves.
+/// DOORONPUMP — one door pass: `true` = the loan was taken and the RX consume + re-arm ran, `false` = the loan was busy or no
+/// controller is installed.
+#[cfg(feature = "ftdirx")]
+pub fn ftdi_door_pass() -> bool {
+    match claim_at(ftdi_ctrl()) {
+        Ok(mut loan) => {
+            loan.service_ftdi_rx();
+            true
+        }
+        Err(_) => false,
+    }
 }
