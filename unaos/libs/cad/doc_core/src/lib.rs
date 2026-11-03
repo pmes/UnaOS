@@ -18,6 +18,9 @@
 //!   reported by its line ([`Failure`]), never dropped.
 //! * [`diff`] — two [`Doc`]s to what changed in design terms ([`Diff`]: statements Added / Removed / Changed by field
 //!   within the Tol / Moved in the replay order), with a deterministic one-line-per-change text (VUGDOCDIFF, SR501).
+//! * [`verify`] — a [`Proposal`] (one statement line) applied to a copy, replayed, and its residual checked against a
+//!   [`Measurement`] within [`K_SIGMA`] x sigma ([`Verdict`]); [`apply`] the one road into the document, [`verify_all`]
+//!   a batch in order (VUGINTENT, SR505; BP-vug-7: AI proposes, geometry disposes).
 //!
 //! The grammar: `<verb> <id>? <key>=<value>...`; `#` starts a comment (outside a string) that runs to the end of the
 //! line; the first statement is the header `vug-doc version=1 lin=<f64> ang=<f64>` (the format, its version and the
@@ -36,11 +39,13 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 mod diff;
+mod intent;
 mod lex;
 mod replay;
 mod write;
 
 pub use diff::{Diff, Entry, Field, HEADER_ID, diff};
+pub use intent::{Batch, K_SIGMA, Measurement, Proposal, Reason, Verdict, apply, verify, verify_all};
 pub use lex::read;
 pub use replay::{Failure, Fault, Replay, SketchOut, SolidOut, brep_profile, replay};
 pub use write::{escape, f64_text, write};
