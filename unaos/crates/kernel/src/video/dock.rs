@@ -4219,7 +4219,7 @@ fn trash_read_off_pump(first: bool) -> bool {
         if TRASH_READER.swap(true, Ordering::AcqRel) {
             return true;
         }
-        crate::arch::sched::spawn("dock-trash", trash_reader, first as usize, cpu, crate::arch::sched::PRIO_NORMAL);
+        crate::arch::sched::spawn_stack("dock-trash", trash_reader, first as usize, cpu, crate::arch::sched::PRIO_NORMAL, crate::arch::sched::DOCK_TRASH_STACK_SIZE); // UNLOCKSTACK (B1092): off the blanket 16 KiB (flight 39: high=21576 in the keyed walk); the numbers are at sched.rs's tail
         true
     }
     #[cfg(not(target_arch = "x86_64"))]

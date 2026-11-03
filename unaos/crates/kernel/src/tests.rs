@@ -439,7 +439,7 @@ fn ensure_fpu() {
     #[cfg(target_arch = "x86_64")]
     {
         static DONE: AtomicBool = AtomicBool::new(false);
-        if !DONE.swap(true, Ordering::AcqRel) { register("fpu", crate::arch::sched::fpu::selftest); register("abielf", abielf_selftest); #[cfg(feature = "tickless")] register("tickless", tickless_selftest); } // TICKLESS (B765): `tests tickless` (the file-tail fn), same x86 block. ABIELF (B693): `tests abielf` beside it, same cfg (the file-tail fn). LINE-NEUTRAL fold, code before the comment.
+        if !DONE.swap(true, Ordering::AcqRel) { register("fpu", crate::arch::sched::fpu::selftest); register("abielf", abielf_selftest); #[cfg(feature = "tickless")] register("tickless", tickless_selftest); #[cfg(feature = "witness")] register("stackhigh", crate::arch::sched::stackhigh_selftest); } // UNLOCKSTACK (B1092): `tests stackhigh`, same x86 block. TICKLESS (B765): `tests tickless` (the file-tail fn), same x86 block. ABIELF (B693): `tests abielf` beside it, same cfg (the file-tail fn). LINE-NEUTRAL fold, code before the comment.
     }
 }
 
