@@ -86,7 +86,7 @@ fn an_armed_program_streams_to_done_over_tcp_through_the_scheme_arm() {
     let fake = fake_grbl(l, false, None);
     let p = program();
     let mut desk = PumpDesk::new();
-    let digest = desk.arm(&Verdict::Pass, &p, GRBL).expect("armed by a pass");
+    let digest = desk.arm(&Verdict::Pass { digest: p.digest() }, &p, GRBL).expect("armed by a pass");
     let mut open = by_scheme(no_serial(), opener(GRBL, CONNECT_WAIT));
     let start = PumpEvent::PumpStart {
         principal: Origin::LocalUser("una".to_string()),
