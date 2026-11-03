@@ -34,6 +34,7 @@ pub const SHORTCUTS: &[(&str, &str)] = &[
     // VUGFACE2 (SR485): the sketch face's keys.
     ("l / c / a", "sketch a line / circle / arc (opens a sketch on the face under the cursor, else the plane facing you)"),
     ("e", "extrude the profile under the cursor: drag the distance, click to commit"),
+    ("d", "dimension: a line, two points, a point and a line, two lines, a circle (d again: radius / diameter); type the value, Enter; while pulling, type the distance, Enter"), // VUGFACEDIMENSION (SR494)
     ("Esc", "back to select (again: clear the selection; cancels a pull)"),
     ("click", "pick a face"),
     ("middle / right drag", "orbit / pan / zoom per the preset"),

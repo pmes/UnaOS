@@ -347,6 +347,22 @@ const FONT: &[(char, [u8; 5])] = &[
     ('d', [1, 1, 7, 5, 7]),
     ('f', [3, 2, 7, 2, 2]),
     ('!', [2, 2, 2, 0, 2]),
+    // VUGFACEDIMENSION (SR494): a dimension's value (the point, the sign, the degree, R / D) and the refusal words.
+    ('.', [0, 0, 0, 0, 2]),
+    ('-', [0, 0, 7, 0, 0]),
+    ('°', [2, 5, 2, 0, 0]),
+    ('A', [2, 5, 7, 5, 5]),
+    ('C', [7, 4, 4, 4, 7]),
+    ('D', [6, 5, 5, 5, 6]),
+    ('E', [7, 4, 6, 4, 7]),
+    ('F', [7, 4, 6, 4, 4]),
+    ('G', [7, 4, 5, 5, 7]),
+    ('I', [7, 2, 2, 2, 7]),
+    ('L', [4, 4, 4, 4, 7]),
+    ('N', [6, 5, 5, 5, 5]),
+    ('O', [2, 5, 5, 5, 2]),
+    ('R', [6, 5, 6, 5, 5]),
+    ('U', [5, 5, 5, 5, 7]),
 ];
 
 /// One character of the bitmap font at (x, y) (its top-left), each bit a 2x2 block; an unknown character (and the

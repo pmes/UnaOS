@@ -16,6 +16,12 @@
 //! profiles are tinted, the constraints drawn as glyphs, the dof in the corner. `e` pulls the profile under the cursor
 //! along the plane normal (extrude.rs), a click commits it.
 //!
+//! VUGFACEDIMENSION (LEDGER SR494): `d` is the dimension tool — a line gives its length, two points their distance, a
+//! point and a line their distance, two lines their angle, a circle its diameter and an arc its radius (`d` again
+//! toggles, the SolidWorks / Onshape defaults); the dimension is placed at the cursor and editable at once: the typed
+//! value becomes the sketch_core Constraint on Enter, a refusal rolls back exactly that one and shows its name at the
+//! dimension. A pull takes a typed distance the same way (type-to-override, Enter commits).
+//!
 //! The plane hit: the view's camera widened to f64 (`View::ray_f64`), geom_core's `line_plane`, the frame's local
 //! coordinates; `to_screen` is the exact inverse (`View::project_f64`).
 
@@ -50,6 +56,8 @@ pub enum Tool {
     Circle,
     Arc,
     Point,
+    // VUGFACEDIMENSION (SR494): the dimension tool (`d`).
+    Dimension,
 }
 
 /// What a cursor snapped to.
@@ -139,6 +147,10 @@ pub struct SketchFace {
     pub origin: EntityId,
     /// One past the highest constraint id this face has added (the glyph walk's bound).
     issued: u32,
+    // VUGFACEDIMENSION (SR494): the placed dimensions, the one being edited, a first point waiting for its second.
+    pub dims: Vec<Dimension>,
+    pub edit: Option<DimEdit>,
+    pub pick: Option<PointRef>,
 }
 
 /// The design the view carries: the open sketch, the body, the pull in progress, the last refusal (named).
@@ -148,6 +160,8 @@ pub struct Design {
     pub body: Option<Body>,
     pub pull: Option<Pull>,
     pub refusal: Option<String>,
+    // VUGFACEDIMENSION (SR494): the pull's typed distance (empty: the cursor drives it).
+    pub pull_text: String,
 }
 
 /// The three world planes as right-handed sketch frames: XY (normal +Z), XZ (the front plane, normal -Y), YZ (the
@@ -251,6 +265,10 @@ impl SketchFace {
             dof: 0,
             origin,
             issued,
+            // VUGFACEDIMENSION (SR494)
+            dims: Vec::new(),
+            edit: None,
+            pick: None,
         };
         f.settle();
         f
@@ -272,6 +290,13 @@ impl SketchFace {
     /// Add the inferred constraints and solve: a refusal removes exactly these again (the geometry stays as drawn)
     /// and is returned by name; a redundant one among them is removed.
     fn apply(&mut self, cs: Vec<Constraint>) -> Result<(), String> {
+        self.apply_as(cs, false).map(|_| ())
+    }
+
+    /// VUGFACEDIMENSION (SR494): `apply`'s one road, returning the ids kept. With `refuse_redundant` (a typed
+    /// dimension) a redundant one among the added is a refusal like a conflict: exactly the added ids are removed
+    /// again and `Redundant([..])` is returned by name; without it (inference) the redundant ones are dropped.
+    fn apply_as(&mut self, cs: Vec<Constraint>, refuse_redundant: bool) -> Result<Vec<ConstraintId>, String> {
         let mut ids: Vec<ConstraintId> = Vec::new();
         for c in cs {
             if let Ok(id) = self.sketch.add(c) {
@@ -279,12 +304,19 @@ impl SketchFace {
                 ids.push(id);
             }
         }
-        let out = match sketch_core::solve(&mut self.sketch, Tol::DEFAULT) {
+        let solved = match sketch_core::solve(&mut self.sketch, Tol::DEFAULT) {
             Ok(s) => {
-                for id in s.redundant.iter().filter(|id| ids.contains(*id)) {
+                let red: Vec<ConstraintId> = s.redundant.iter().copied().filter(|id| ids.contains(id)).collect();
+                if refuse_redundant && !red.is_empty() { Err(sketch_core::Refusal::Redundant(red)) } else { Ok(red) }
+            }
+            Err(e) => Err(e),
+        };
+        let out = match solved {
+            Ok(red) => {
+                for id in &red {
                     self.sketch.remove(*id);
                 }
-                Ok(())
+                Ok(ids.into_iter().filter(|id| !red.contains(id)).collect())
             }
             Err(e) => {
                 for id in ids.iter().rev() {
@@ -493,6 +525,7 @@ impl Design {
     }
 
     fn key(&mut self, view: &View, model: &Model, k: &str) -> Option<bool> {
+        if let Some(r) = self.typed_key(k) { return Some(r); } // VUGFACEDIMENSION (SR494): an open edit / pull takes its keys first
         let tool = match k {
             "Escape" | "\u{1b}" => {
                 if self.pull.take().is_some() {
@@ -514,6 +547,7 @@ impl Design {
             "a" | "A" => Tool::Arc,
             // Outside a sketch `p` stays the next preset (the view's key).
             "p" | "P" if self.face.is_some() => Tool::Point,
+            "d" | "D" if self.face.is_some() => Tool::Dimension, // VUGFACEDIMENSION (SR494)
             _ => return None,
         };
         if self.face.is_none() {
@@ -523,6 +557,7 @@ impl Design {
         face.tool = tool;
         face.gesture = None;
         face.hover = None;
+        face.pick = None; // VUGFACEDIMENSION (SR494)
         Some(true)
     }
 
@@ -548,13 +583,17 @@ impl Design {
         let c = centroid(&polygon(&profile.outer));
         let centroid = face.world(c);
         self.pull = Some(Pull { profile, plane: face.plane, centroid, distance: 0.0, start: (x, y), preview: None });
+        self.pull_text.clear(); // VUGFACEDIMENSION (SR494)
         Some(true)
     }
 
     /// The pull follows the cursor: the distance along the normal line through the centroid at the cursor ray's
     /// closest approach (screen dy times mm/px when the view looks along the normal), the preview rebuilt.
     fn pull_motion(&mut self, view: &View, x: f64, y: f64) -> bool {
-        let breps: Vec<brep_core::Brep> = self.body.as_ref().map(|b| b.breps.clone()).unwrap_or_default();
+        // VUGFACEDIMENSION (SR494): a typed distance overrides the cursor.
+        if !self.pull_text.is_empty() {
+            return false;
+        }
         let face_mm = self.face.as_ref().map(|f| f.mm_per_px(view, x, y));
         let Some(pull) = self.pull.as_mut() else { return false };
         let (o, d) = view.ray_f64(x, y);
@@ -566,14 +605,7 @@ impl Design {
         let (b, dd, e) = (dot(d, n), dot(d, w), dot(n, w));
         let denom = 1.0 - b * b;
         pull.distance = if denom > 1e-3 { (e - b * dd) / denom } else { -(y - pull.start.1) * face_mm.unwrap_or(1.0) };
-        let mut all = breps;
-        pull.preview = match extrude::extrude(&pull.profile, &pull.plane, pull.distance, bd::Tol::DEFAULT) {
-            Ok(b) => {
-                all.push(b);
-                Body::from_breps(all, bd::Tol::DEFAULT).ok()
-            }
-            Err(_) => None,
-        };
+        self.pull_preview();
         true
     }
 
@@ -581,17 +613,19 @@ impl Design {
         if view.preset.resolve(button, mods) != Action::Pick {
             return None;
         }
-        if let Some(pull) = self.pull.take() {
+        if self.pull.is_some() {
             // A click commits the pull (a pull that never left the plane is dropped).
-            if let Some(b) = pull.preview {
-                self.body = Some(b);
-                self.face = None;
-            }
+            self.commit_pull();
             return Some(true);
         }
         let face = self.face.as_mut()?;
         let q = face.unproject(view, x, y)?;
+        // VUGFACEDIMENSION (SR494): a click on a dimension's value re-opens it (the dimension and select tools).
+        if matches!(face.tool, Tool::Select | Tool::Dimension) && face.reopen_at(view, x, y) {
+            return Some(true);
+        }
         match face.tool {
+            Tool::Dimension => Some(face.dim_press(view, x, y, q)), // VUGFACEDIMENSION (SR494)
             Tool::Select => match face.snap_at(view, x, y, &[], false) {
                 Some((Snap::Point(id), _)) => {
                     face.selection = Some(id);
@@ -863,6 +897,509 @@ pub fn overlay(view: &View, fr: &mut Raster) {
     for g in face.glyphs(view) {
         raster::glyph(fr, g.mark.ch(), g.at.0, g.at.1, rgba(GLYPH));
     }
+    dimension_overlay(view, face, fr); // VUGFACEDIMENSION (SR494): the dimensions and the typed pull
     let label = if view.design.refusal.is_some() { rgba(REFUSED) } else { ink };
     raster::text(fr, &format!("dof {}", face.dof), 6.0, 6.0, label);
+}
+
+// ---- VUGFACEDIMENSION (SR494): the dimension tool, the typed value, the typed pull ----
+
+/// A click within this many surface pixels of a placed dimension's value re-opens it.
+pub const REOPEN_PX: f64 = 12.0;
+
+/// What a dimension measures: the sketch_core constraint it becomes on Enter.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Dim {
+    /// A line's length: `Distance` between its two points.
+    Length(EntityId),
+    /// Two points' distance.
+    Points(PointRef, PointRef),
+    /// A point's distance to a line (on the side it is drawn).
+    PointLine(PointRef, EntityId),
+    /// The angle between two lines (typed in degrees, kept with the sign of the drawn CCW angle).
+    Angle(EntityId, EntityId),
+    Radius(EntityId),
+    Diameter(EntityId),
+}
+
+/// A placed dimension: its constraint, what it measures, where its value sits on the plane (mm).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Dimension {
+    pub constraint: ConstraintId,
+    pub dim: Dim,
+    pub anchor: Vec2,
+}
+
+/// The dimension being edited: the typed text, the dimension it re-opened (an index in `dims`), the refusal's name
+/// after a refused Enter (cleared by the next key).
+#[derive(Clone, Debug, PartialEq)]
+pub struct DimEdit {
+    pub dim: Dim,
+    pub anchor: Vec2,
+    pub buffer: String,
+    pub reopened: Option<usize>,
+    pub refusal: Option<String>,
+}
+
+/// A dimension as drawn, beside the inference glyphs: the value (or the typed text, or the refusal's name) at the
+/// anchor and a leader to the foot on the measured geometry (surface pixels).
+#[derive(Clone, Debug, PartialEq)]
+pub struct DimensionGlyph {
+    pub constraint: Option<ConstraintId>,
+    pub anchor: (f32, f32),
+    pub foot: (f32, f32),
+    pub text: String,
+    pub editing: bool,
+    pub refused: bool,
+}
+
+fn line_ends(sk: &Sketch, l: EntityId) -> Option<(Vec2, Vec2)> {
+    match sk.entity(l)? {
+        Entity::Line { a, b } => Some((sk.point(PointRef::Point(*a))?, sk.point(PointRef::Point(*b))?)),
+        _ => None,
+    }
+}
+
+fn midway(p: Vec2, q: Vec2) -> Vec2 {
+    Vec2::new(0.5 * (p.x + q.x), 0.5 * (p.y + q.y))
+}
+
+/// The signed CCW angle from line `l1` to line `l2` (radians), as sketch_core's `Angle` measures it.
+fn ccw(sk: &Sketch, l1: EntityId, l2: EntityId) -> Option<f64> {
+    let (a1, b1) = line_ends(sk, l1)?;
+    let (a2, b2) = line_ends(sk, l2)?;
+    let (u, v) = (sub(b1, a1), sub(b2, a2));
+    Some((u.x * v.y - u.y * v.x).atan2(u.x * v.x + u.y * v.y))
+}
+
+/// A value as drawn: three decimals, trailing zeros dropped ("16", "10.5").
+fn fmt_value(v: f64) -> String {
+    let s = format!("{v:.3}");
+    let s = if s.contains('.') { s.trim_end_matches('0').trim_end_matches('.').to_string() } else { s };
+    if s == "-0" { "0".to_string() } else { s }
+}
+
+/// A refusal's name: the text before its `(` ("Conflicting([..])" -> "Conflicting").
+fn refusal_word(e: &str) -> String {
+    e.split('(').next().unwrap_or(e).to_string()
+}
+
+/// A typed key into a number's text: digits, one `.`, a leading `-`, Backspace. False when the key is none of them.
+fn type_into(buf: &mut String, ch: Option<char>, back: bool) -> bool {
+    if back {
+        buf.pop();
+        return true;
+    }
+    match ch {
+        Some(c) if c.is_ascii_digit() => buf.push(c),
+        Some('.') => {
+            if !buf.contains('.') {
+                buf.push('.');
+            }
+        }
+        Some('-') => {
+            if buf.is_empty() {
+                buf.push('-');
+            }
+        }
+        _ => return false,
+    }
+    true
+}
+
+impl Dim {
+    /// The value now: mm, or degrees (the magnitude) for an angle; None when an entity it names is gone.
+    pub fn measure(self, sk: &Sketch) -> Option<f64> {
+        match self {
+            Dim::Length(l) => line_ends(sk, l).map(|(p, q)| len(sub(q, p))),
+            Dim::Points(a, b) => Some(len(sub(sk.point(b)?, sk.point(a)?))),
+            Dim::PointLine(p, l) => {
+                let pp = sk.point(p)?;
+                let (a, b) = line_ends(sk, l)?;
+                let d = sub(b, a);
+                let n = len(d);
+                if !(n > 0.0) {
+                    return None;
+                }
+                Some((d.x * (pp.y - a.y) - d.y * (pp.x - a.x)).abs() / n)
+            }
+            Dim::Angle(l1, l2) => ccw(sk, l1, l2).map(|t| t.abs().to_degrees()),
+            Dim::Radius(c) => sk.radius(c),
+            Dim::Diameter(c) => sk.radius(c).map(|r| 2.0 * r),
+        }
+    }
+
+    /// The constraint for the typed value `v` (mm, or degrees): a length not above `Tol.lin` or a non-finite value is
+    /// refused `Invalid`.
+    pub fn constraint(self, v: f64, sk: &Sketch) -> Result<Constraint, String> {
+        let invalid = || String::from("Invalid");
+        if !v.is_finite() {
+            return Err(invalid());
+        }
+        let pos = |v: f64| if v > Tol::DEFAULT.lin { Ok(v) } else { Err(invalid()) };
+        match self {
+            Dim::Angle(l1, l2) => {
+                let th = v.to_radians();
+                let th = if ccw(sk, l1, l2).ok_or_else(invalid)? < 0.0 { -th } else { th };
+                Ok(Constraint::Angle(l1, l2, th))
+            }
+            Dim::Length(l) => match sk.entity(l) {
+                Some(Entity::Line { a, b }) => Ok(Constraint::Distance(PointRef::Point(*a), PointRef::Point(*b), pos(v)?)),
+                _ => Err(invalid()),
+            },
+            Dim::Points(a, b) => Ok(Constraint::Distance(a, b, pos(v)?)),
+            Dim::PointLine(p, l) => Ok(Constraint::DistancePointLine(p, l, pos(v)?)),
+            Dim::Radius(c) => Ok(Constraint::Radius(c, pos(v)?)),
+            Dim::Diameter(c) => Ok(Constraint::Diameter(c, pos(v)?)),
+        }
+    }
+
+    /// The leader's end on the measured geometry: a segment's midpoint, the point, the rim toward the anchor.
+    pub fn foot(self, sk: &Sketch, anchor: Vec2) -> Option<Vec2> {
+        match self {
+            Dim::Length(l) | Dim::Angle(l, _) => line_ends(sk, l).map(|(p, q)| midway(p, q)),
+            Dim::Points(a, b) => Some(midway(sk.point(a)?, sk.point(b)?)),
+            Dim::PointLine(p, _) => sk.point(p),
+            Dim::Radius(c) | Dim::Diameter(c) => {
+                let (o, r) = (sk.point(PointRef::Centre(c))?, sk.radius(c)?);
+                let d = sub(anchor, o);
+                let n = len(d);
+                Some(if n > 0.0 { Vec2::new(o.x + d.x / n * r, o.y + d.y / n * r) } else { Vec2::new(o.x + r, o.y) })
+            }
+        }
+    }
+
+    /// The dimension a sketch_core constraint is, when it is one.
+    pub fn of(c: &Constraint) -> Option<Dim> {
+        match *c {
+            Constraint::Distance(a, b, _) => Some(Dim::Points(a, b)),
+            Constraint::DistancePointLine(p, l, _) => Some(Dim::PointLine(p, l)),
+            Constraint::Angle(a, b, _) => Some(Dim::Angle(a, b)),
+            Constraint::Radius(c, _) => Some(Dim::Radius(c)),
+            Constraint::Diameter(c, _) => Some(Dim::Diameter(c)),
+            _ => None,
+        }
+    }
+
+    /// The value as drawn: "16", "R5", "D10", "90°".
+    pub fn label(self, v: f64) -> String {
+        let n = fmt_value(v);
+        match self {
+            Dim::Radius(_) => format!("R{n}"),
+            Dim::Diameter(_) => format!("D{n}"),
+            Dim::Angle(..) => format!("{n}°"),
+            _ => n,
+        }
+    }
+}
+
+impl SketchFace {
+    /// The line whose drawn segment passes within `SNAP_PX` of (x, y) (the nearest).
+    fn line_at(&self, view: &View, x: f64, y: f64) -> Option<EntityId> {
+        let mut best: Option<(f64, EntityId)> = None;
+        for (i, e) in self.sketch.entities().iter().enumerate() {
+            let id = EntityId(i as u32);
+            if !matches!(e, Entity::Line { .. }) {
+                continue;
+            }
+            let Some((p, q)) = line_ends(&self.sketch, id) else { continue };
+            let (Some(a), Some(b)) = (self.to_screen(view, p), self.to_screen(view, q)) else { continue };
+            let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+            let l2 = dx * dx + dy * dy;
+            let t = if l2 > 0.0 { (((x - a.0) * dx + (y - a.1) * dy) / l2).clamp(0.0, 1.0) } else { 0.0 };
+            let d = (a.0 + t * dx - x).hypot(a.1 + t * dy - y);
+            if d <= SNAP_PX && best.map_or(true, |(d0, _)| d < d0) {
+                best = Some((d, id));
+            }
+        }
+        best.map(|(_, id)| id)
+    }
+
+    /// The circle or arc whose rim passes within `SNAP_PX` of plane point `q` (the nearest; `line_marks`'s reach).
+    fn round_at(&self, view: &View, x: f64, y: f64, q: Vec2) -> Option<EntityId> {
+        let reach = SNAP_PX * self.mm_per_px(view, x, y);
+        let mut best: Option<(f64, EntityId)> = None;
+        for (i, e) in self.sketch.entities().iter().enumerate() {
+            let id = EntityId(i as u32);
+            if !matches!(e, Entity::Circle { .. } | Entity::Arc { .. }) {
+                continue;
+            }
+            let (Some(c), Some(r)) = (self.sketch.point(PointRef::Centre(id)), self.sketch.radius(id)) else { continue };
+            let d = (len(sub(q, c)) - r).abs();
+            if d <= reach && best.map_or(true, |(d0, _)| d < d0) {
+                best = Some((d, id));
+            }
+        }
+        best.map(|(_, id)| id)
+    }
+
+    /// A press on a placed dimension's value re-opens it for editing; false when none is there.
+    fn reopen_at(&mut self, view: &View, x: f64, y: f64) -> bool {
+        let hit = self.dims.iter().position(|d| {
+            self.sketch.constraint(d.constraint).is_some() && self.px_dist(view, d.anchor, x, y).is_some_and(|p| p <= REOPEN_PX)
+        });
+        let Some(i) = hit else { return false };
+        let d = self.dims[i];
+        self.edit = Some(DimEdit { dim: d.dim, anchor: d.anchor, buffer: String::new(), reopened: Some(i), refusal: None });
+        self.pick = None;
+        true
+    }
+
+    /// The dimension tool's press: a point, else a line, else a rim. A fresh length not yet typed becomes the angle
+    /// (a second line) or the point-to-line distance (a point), else is placed at the click; a first point waits for a
+    /// second point (distance) or a line; a circle opens its diameter, an arc its radius, a line its length.
+    fn dim_press(&mut self, view: &View, x: f64, y: f64, q: Vec2) -> bool {
+        let point = match self.snap_at(view, x, y, &[], false) {
+            Some((Snap::Point(id), _)) => Some(PointRef::Point(id)),
+            _ => None,
+        };
+        let line = if point.is_none() { self.line_at(view, x, y) } else { None };
+        let round = if point.is_none() && line.is_none() { self.round_at(view, x, y, q) } else { None };
+        let fresh = match &self.edit {
+            Some(DimEdit { dim: Dim::Length(l), reopened: None, buffer, refusal: None, .. }) if buffer.is_empty() => Some(*l),
+            _ => None,
+        };
+        if let Some(l) = fresh {
+            let dim = match (point, line) {
+                (Some(p), _) => Some(Dim::PointLine(p, l)),
+                (None, Some(l2)) if l2 != l => Some(Dim::Angle(l, l2)),
+                _ => None,
+            };
+            if let Some(e) = self.edit.as_mut() {
+                if let Some(d) = dim {
+                    e.dim = d;
+                }
+                e.anchor = q;
+            }
+            return true;
+        }
+        let open = |dim: Dim| DimEdit { dim, anchor: q, buffer: String::new(), reopened: None, refusal: None };
+        if let Some(p0) = self.pick.take() {
+            let dim = match (point, line) {
+                (Some(p), _) if p != p0 => Some(Dim::Points(p0, p)),
+                (None, Some(l)) => Some(Dim::PointLine(p0, l)),
+                _ => None,
+            };
+            self.edit = dim.map(open);
+            return true;
+        }
+        let dim = match (point, line, round) {
+            (Some(p), _, _) => {
+                self.edit = None;
+                self.pick = Some(p);
+                return true;
+            }
+            (None, Some(l), _) => Some(Dim::Length(l)),
+            (None, None, Some(c)) => Some(match self.sketch.entity(c) {
+                Some(Entity::Circle { .. }) => Dim::Diameter(c),
+                _ => Dim::Radius(c),
+            }),
+            _ => None,
+        };
+        self.edit = dim.map(open);
+        true
+    }
+
+    /// The refusal stays at the dimension: its name, the typed text cleared.
+    fn refuse(&mut self, err: String) -> Result<(), String> {
+        if let Some(e) = self.edit.as_mut() {
+            e.refusal = Some(refusal_word(&err));
+            e.buffer.clear();
+        }
+        Err(err)
+    }
+
+    /// Enter: the typed value (else the value now) as the edit's constraint through `apply_as` with redundancy
+    /// refused; a re-opened dimension's old constraint is removed first and put back when the new one is refused.
+    fn commit_edit(&mut self) -> Result<(), String> {
+        let Some(e) = self.edit.clone() else { return Ok(()) };
+        let v = if e.buffer.is_empty() { e.dim.measure(&self.sketch) } else { e.buffer.parse::<f64>().ok() };
+        let c = match v.ok_or_else(|| String::from("Invalid")).and_then(|v| e.dim.constraint(v, &self.sketch)) {
+            Ok(c) => c,
+            Err(w) => return self.refuse(w),
+        };
+        let old = e.reopened.and_then(|i| self.dims.get(i).copied()).and_then(|d| self.sketch.constraint(d.constraint).copied().map(|oc| (d.constraint, oc)));
+        if let Some((id, _)) = old {
+            self.sketch.remove(id);
+        }
+        let r = match self.apply_as(vec![c], true) {
+            Ok(ids) if !ids.is_empty() => Ok(ids[0]),
+            Ok(_) => Err(String::from("Invalid")),
+            Err(err) => Err(err),
+        };
+        match r {
+            Ok(id) => {
+                let d = Dimension { constraint: id, dim: e.dim, anchor: e.anchor };
+                match e.reopened.and_then(|i| self.dims.get_mut(i)) {
+                    Some(slot) => *slot = d,
+                    None => self.dims.push(d),
+                }
+                self.edit = None;
+                Ok(())
+            }
+            Err(err) => {
+                if let Some((_, oc)) = old {
+                    if let Ok(id) = self.sketch.add(oc) {
+                        self.issued = self.issued.max(id.0 + 1);
+                        if let Some(slot) = e.reopened.and_then(|i| self.dims.get_mut(i)) {
+                            slot.constraint = id;
+                        }
+                    }
+                    let _ = self.solve();
+                }
+                self.refuse(err)
+            }
+        }
+    }
+
+    /// The dimension glyphs: every placed dimension whose constraint stands (the re-opened one as the edit), then
+    /// the edit (its typed text, else its value now, else the refusal's name).
+    pub fn dimension_glyphs(&self, view: &View) -> Vec<DimensionGlyph> {
+        let scr = |q: Vec2| self.to_screen(view, q).map(|(x, y)| (x as f32, y as f32));
+        let mut out = Vec::new();
+        let reopened = self.edit.as_ref().and_then(|e| e.reopened);
+        for (i, d) in self.dims.iter().enumerate() {
+            if reopened == Some(i) || self.sketch.constraint(d.constraint).is_none() {
+                continue;
+            }
+            let (Some(v), Some(f)) = (d.dim.measure(&self.sketch), d.dim.foot(&self.sketch, d.anchor)) else { continue };
+            let (Some(a), Some(f)) = (scr(d.anchor), scr(f)) else { continue };
+            out.push(DimensionGlyph { constraint: Some(d.constraint), anchor: a, foot: f, text: d.dim.label(v), editing: false, refused: false });
+        }
+        if let Some(e) = &self.edit {
+            if let (Some(a), Some(f)) = (scr(e.anchor), e.dim.foot(&self.sketch, e.anchor).and_then(scr)) {
+                let text = match (&e.refusal, e.buffer.is_empty()) {
+                    (Some(w), _) => w.to_uppercase(),
+                    (None, false) => e.buffer.clone(),
+                    (None, true) => e.dim.measure(&self.sketch).map(|v| e.dim.label(v)).unwrap_or_default(),
+                };
+                let constraint = e.reopened.and_then(|i| self.dims.get(i)).map(|d| d.constraint);
+                out.push(DimensionGlyph { constraint, anchor: a, foot: f, text, editing: true, refused: e.refusal.is_some() });
+            }
+        }
+        out
+    }
+}
+
+impl Design {
+    /// The keys an open pull or dimension edit takes first: digits, `.`, a leading `-`, Backspace, Enter, Esc (and `d`
+    /// toggling a round dimension). Any other key closes an edit uncommitted and falls through.
+    fn typed_key(&mut self, k: &str) -> Option<bool> {
+        let enter = matches!(k, "Return" | "KP_Enter" | "\r" | "\n");
+        let back = matches!(k, "BackSpace" | "\u{8}" | "\u{7f}");
+        let ch = {
+            let mut it = k.chars();
+            match (it.next(), it.next()) {
+                (Some(c), None) => Some(c),
+                _ => None,
+            }
+        };
+        if self.pull.is_some() {
+            if enter {
+                self.commit_pull();
+                return Some(true);
+            }
+            if !type_into(&mut self.pull_text, ch, back) {
+                return None;
+            }
+            if let Ok(v) = self.pull_text.parse::<f64>() {
+                if v.is_finite() {
+                    if let Some(p) = self.pull.as_mut() {
+                        p.distance = v;
+                    }
+                    self.pull_preview();
+                }
+            }
+            return Some(true);
+        }
+        let face = self.face.as_mut()?;
+        let edit = face.edit.as_mut()?;
+        if matches!(k, "Escape" | "\u{1b}") {
+            face.edit = None;
+            return Some(true);
+        }
+        if enter {
+            let r = face.commit_edit();
+            self.note(r);
+            return Some(true);
+        }
+        if matches!(k, "d" | "D") {
+            let toggled = match edit.dim {
+                Dim::Radius(c) => Some(Dim::Diameter(c)),
+                Dim::Diameter(c) => Some(Dim::Radius(c)),
+                _ => None,
+            };
+            if let Some(d) = toggled {
+                edit.dim = d;
+                edit.refusal = None;
+                return Some(true);
+            }
+        }
+        if type_into(&mut edit.buffer, ch, back) {
+            edit.refusal = None;
+            return Some(true);
+        }
+        face.edit = None;
+        None
+    }
+
+    /// The pull's preview at its distance: every Brep of the design plus this extrude (`pull_motion` and the typed
+    /// pull, the one extrude road).
+    fn pull_preview(&mut self) {
+        let mut all: Vec<brep_core::Brep> = self.body.as_ref().map(|b| b.breps.clone()).unwrap_or_default();
+        let Some(pull) = self.pull.as_mut() else { return };
+        pull.preview = match extrude::extrude(&pull.profile, &pull.plane, pull.distance, bd::Tol::DEFAULT) {
+            Ok(b) => {
+                all.push(b);
+                Body::from_breps(all, bd::Tol::DEFAULT).ok()
+            }
+            Err(_) => None,
+        };
+    }
+
+    /// Commit the pull (a click or Enter): its preview becomes the body and the sketch closes; a pull that never left
+    /// the plane is dropped.
+    fn commit_pull(&mut self) {
+        if let Some(pull) = self.pull.take() {
+            if let Some(b) = pull.preview {
+                self.body = Some(b);
+                self.face = None;
+            }
+        }
+        self.pull_text.clear();
+    }
+}
+
+/// The dimensions (leader, tick, value; the edit underlined in the accent, a refusal in the refusal colour) and the
+/// typed pull distance at the pulled centroid.
+fn dimension_overlay(view: &View, face: &SketchFace, fr: &mut Raster) {
+    for g in face.dimension_glyphs(view) {
+        let col = rgba(if g.refused {
+            REFUSED
+        } else if g.editing {
+            ACTIVE
+        } else {
+            INK
+        });
+        raster::line(fr, g.anchor, g.foot, col);
+        let (dx, dy) = (g.foot.0 - g.anchor.0, g.foot.1 - g.anchor.1);
+        let l = dx.hypot(dy);
+        if l > 0.0 {
+            let (nx, ny) = (-dy / l * 3.0, dx / l * 3.0);
+            raster::line(fr, (g.foot.0 - nx, g.foot.1 - ny), (g.foot.0 + nx, g.foot.1 + ny), col);
+        }
+        let (tx, ty) = (g.anchor.0 + 3.0, g.anchor.1 - 5.0);
+        raster::text(fr, &g.text, tx, ty, col);
+        if g.editing {
+            let w = 8.0 * g.text.chars().count().max(1) as f32;
+            raster::line(fr, (tx, ty + 12.0), (tx + w, ty + 12.0), col);
+        }
+    }
+    if let Some(p) = view.design.pull.as_ref() {
+        if !view.design.pull_text.is_empty() {
+            if let Some((x, y)) = view.project_f64(p.centroid) {
+                raster::text(fr, &view.design.pull_text, x as f32 + 6.0, y as f32 - 14.0, rgba(ACTIVE));
+            }
+        }
+    }
 }
