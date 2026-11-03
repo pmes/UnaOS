@@ -43,6 +43,7 @@ pub mod fixture;
 mod geom;
 pub mod mc;
 mod mesh;
+pub mod pose;
 pub mod tsdf;
 
 use alloc::vec::Vec;
@@ -50,6 +51,7 @@ use alloc::vec::Vec;
 pub use fit::{Cylinder, Fit, FitError, fit_cylinder, fit_plane};
 pub use geom::{Plane, Tol, Transform, Vec3};
 pub use mesh::{Mesh, Topo};
+pub use pose::{ModelMap, Surfel, TrackError, TrackParams, Tracked, Tracker, raycast};
 pub use probe_core::{DepthScale, Frame, Intrinsics, PixelFormat};
 pub use tsdf::{Integrated, Tsdf, Voxel, integrate};
 
