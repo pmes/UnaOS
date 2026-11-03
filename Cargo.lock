@@ -1303,6 +1303,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "doc_core"
+version = "0.1.0"
+dependencies = [
+ "brep_core",
+ "make_core",
+ "sketch_core",
+]
+
+[[package]]
 name = "document-features"
 version = "0.2.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"

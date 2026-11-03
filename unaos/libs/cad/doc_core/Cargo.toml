@@ -1,0 +1,20 @@
+[package]
+name = "doc_core"
+version = "0.1.0"
+edition = "2024"
+license = "LGPL-3.0-or-later"
+description = "Vug's design document: the text form (one statement per line, git-diffable) that stores intent — sketches, constraints, features, the Make — and regenerates the geometry and the Program by replay through the CAD cores — shared by Ring 0 and Ring 3."
+
+# VUGDOC (LEDGER SR480): `#![no_std]` + `alloc`, `#![forbid(unsafe_code)]`, the timeline_core shape (BP-vug-4): a shared
+# core under `unaos/libs/cad/`, a member of the ROOT host workspace, linkable by the kernel by path with
+# `default-features = false`. It holds no geometry: sketch_core solves, brep_core builds the solids, make_core generates the
+# Program. The f64 text is core::fmt's shortest round-trip form (no ryu); the parse is core's.
+[dependencies]
+sketch_core = { path = "../sketch_core", default-features = false }
+brep_core = { path = "../brep_core", default-features = false }
+make_core = { path = "../make_core", default-features = false }
+
+[features]
+default = ["std"]
+# The seam only: nothing in `src/` is std-gated (midden_core's spelling, so a kernel `default-features = false` is honest).
+std = []
