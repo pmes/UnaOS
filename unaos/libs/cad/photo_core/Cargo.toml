@@ -1,0 +1,23 @@
+[package]
+name = "photo_core"
+version = "0.1.0"
+edition = "2024"
+license = "LGPL-3.0-or-later"
+description = "Vug's photo core: a photo of a flat part on graph paper to a measured outline (grid lines, the lattice homography with its residual as the uncertainty, the silhouette, the contour, fitted lines / arcs / circles) and a sketch_core sketch with inferred constraints — shared by Ring 0 and Ring 3."
+
+# VUGPHOTOGRID (LEDGER SR503): `#![no_std]` + `alloc`, `#![forbid(unsafe_code)]`, the timeline_core manifest shape: a
+# shared core under `unaos/libs/cad/`, a member of the ROOT host workspace, linkable by the kernel by path with
+# `default-features = false`. geom_core is the one geometry (Tol, Vec2, Mat3, the exact predicates, the closed-form
+# intersections); sketch_core the one sketch and solver; pixel_core the one `Image` (and `png::encode::encode_rgba`
+# for the synthetic fixture; its default feature set is empty, so `default-features = false` changes nothing);
+# libm the one f64 math (MATH-ONE SR362).
+[dependencies]
+geom_core = { path = "../geom_core", default-features = false }
+sketch_core = { path = "../sketch_core", default-features = false }
+pixel_core = { path = "../../media/pixel_core", default-features = false }
+libm = { version = "0.2", default-features = false }
+
+[features]
+default = ["std"]
+# The seam only: nothing in `src/` is std-gated (midden_core's spelling, so a kernel `default-features = false` is honest).
+std = []

@@ -1,0 +1,13 @@
+[package]
+name = "photo"
+version = "0.1.0"
+edition = "2024"
+license = "LGPL-3.0-or-later"
+
+# VUGPHOTOGRID (LEDGER SR503): Vug's headless photo face (the tools/scan shape): a photo of a flat part on graph
+# paper in, photo_core's measurement out as a doc_core document (the sketch, and an extrude with --thickness).
+[dependencies]
+photo_core = { path = "../../unaos/libs/cad/photo_core" }
+pixel_core = { path = "../../unaos/libs/media/pixel_core" }
+sketch_core = { path = "../../unaos/libs/cad/sketch_core" }
+doc_core = { path = "../../unaos/libs/cad/doc_core" }
