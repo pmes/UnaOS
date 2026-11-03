@@ -12,6 +12,7 @@
 //! settled burst of input. `model` is the ONE seam to mesh_core, `view` the navigation, `raster` the drawing.
 
 pub mod extrude;
+pub mod journal; // VUGFACETREE (SR513): the document, undo / redo, the tree panel
 pub mod model;
 pub mod raster;
 pub mod sketch;
@@ -40,6 +41,10 @@ pub const SHORTCUTS: &[(&str, &str)] = &[
     ("middle / right drag", "orbit / pan / zoom per the preset"),
     ("Alt+drag", "the middle button, for a trackpad (orbit / pan / zoom per the preset)"),
     ("wheel / pinch", "zoom to the cursor"),
+    // VUGFACETREE (SR513): the feature tree over doc_core.
+    ("t", "the feature tree panel (the document's statements)"),
+    ("u / U", "undo / redo (the document's snapshots; the face regenerates)"),
+    ("Up / Down, Delete, Enter", "in the tree panel: move, delete the row with its dependants, edit its value (type, Enter)"),
 ];
 
 /// The controller: owns the model and the view (one task, no lock).

@@ -247,6 +247,8 @@ impl View {
     /// VUGFACE2 (SR485): the sketch overlay, drawn by `raster::render` over the frame.
     pub fn overlay(&self, fr: &mut crate::raster::Frame) {
         crate::sketch::overlay(self, fr);
+        // VUGFACETREE (SR513): the tree panel over everything.
+        crate::journal::overlay(self, fr);
     }
 
     /// The model point under (px, py), if the ray hits it.
@@ -297,6 +299,10 @@ impl View {
         // VUGFACE2 (SR485): the body replaces the drawn model; the sketch face takes its keys first (l c a p e Esc).
         let shown = self.design.shown();
         let model = shown.as_deref().unwrap_or(model);
+        // VUGFACETREE (SR513): the tree's keys (u / U undo / redo, t the panel, its rows) before the sketch's.
+        if let Some(r) = crate::journal::key(&mut self.design, k) {
+            return r;
+        }
         if let Some(r) = crate::sketch::key(self, model, k) {
             return r;
         }

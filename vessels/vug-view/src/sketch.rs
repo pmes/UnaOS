@@ -145,7 +145,7 @@ pub struct SketchFace {
     /// The fixed origin point.
     pub origin: EntityId,
     /// One past the highest constraint id this face has added (the glyph walk's bound).
-    issued: u32,
+    pub(crate) issued: u32, // VUGFACETREE (SR513): the journal walks ConstraintId 0..issued
     // VUGFACEDIMENSION (SR494): the placed dimensions, the one being edited, a first point waiting for its second.
     pub dims: Vec<Dimension>,
     pub edit: Option<DimEdit>,
@@ -161,6 +161,8 @@ pub struct Design {
     pub refusal: Option<String>,
     // VUGFACEDIMENSION (SR494): the pull's typed distance (empty: the cursor drives it).
     pub pull_text: String,
+    // VUGFACETREE (SR513): the document, its snapshots and the tree panel (journal.rs).
+    pub journal: crate::journal::Journal,
 }
 
 /// The three world planes as right-handed sketch frames: XY (normal +Z), XZ (the front plane, normal -Y), YZ (the
@@ -612,6 +614,7 @@ impl Design {
         face.hover = None;
         let r = face.solve().map(|_| ()).map_err(|e| format!("{e:?}"));
         self.note(r);
+        self.journal.record(self.face.as_ref(), None); // VUGFACETREE (SR513): an erase commits
         Some(true)
     }
 
@@ -668,6 +671,7 @@ impl Design {
             Tool::Arc if matches!(face.gesture, Some(Gesture::ArcEnd { .. })) => {
                 face.gesture = None;
                 face.hover = None;
+                self.journal.record(self.face.as_ref(), None); // VUGFACETREE (SR513): the arc's end click commits
                 Some(true)
             }
             Tool::Point => {
@@ -824,6 +828,7 @@ impl Design {
         };
         face.hover = None;
         self.note(r);
+        self.journal.record(self.face.as_ref(), None); // VUGFACETREE (SR513): a released gesture commits
         Some(true)
     }
 }
@@ -1016,7 +1021,7 @@ fn refusal_word(e: &str) -> String {
 }
 
 /// A typed key into a number's text: digits, one `.`, a leading `-`, Backspace. False when the key is none of them.
-fn type_into(buf: &mut String, ch: Option<char>, back: bool) -> bool {
+pub(crate) fn type_into(buf: &mut String, ch: Option<char>, back: bool) -> bool { // VUGFACETREE (SR513): the row edit's buffer road
     if back {
         buf.pop();
         return true;
@@ -1352,6 +1357,7 @@ impl Design {
         if enter {
             let r = face.commit_edit();
             self.note(r);
+            self.journal.record(self.face.as_ref(), None); // VUGFACETREE (SR513): a dimension's Enter commits
             return Some(true);
         }
         if matches!(k, "d" | "D") {
@@ -1392,6 +1398,7 @@ impl Design {
     /// the plane is dropped.
     fn commit_pull(&mut self) {
         if let Some(pull) = self.pull.take() {
+            if pull.preview.is_some() { self.journal.record(self.face.as_ref(), Some(&pull)); } // VUGFACETREE (SR513): the pull's extrude
             if let Some(b) = pull.preview {
                 self.body = Some(b);
                 self.face = None;

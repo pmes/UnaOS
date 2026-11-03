@@ -363,6 +363,29 @@ const FONT: &[(char, [u8; 5])] = &[
     ('O', [2, 5, 5, 5, 2]),
     ('R', [6, 5, 6, 5, 5]),
     ('U', [5, 5, 5, 5, 7]),
+    // VUGFACETREE (SR513): the tree panel's statements are drawn upper-cased — the rest of the capitals and the
+    // statement punctuation (VUGFACEPHOTO adds the same sixteen B..',' with the same bitmaps: the fold keeps ONE copy)
+    // and the list brackets, the edit's mark and the plus (this arc's).
+    ('B', [6, 5, 6, 5, 6]),
+    ('J', [1, 1, 1, 5, 7]),
+    ('K', [5, 5, 6, 5, 5]),
+    ('P', [6, 5, 6, 4, 4]),
+    ('Q', [2, 5, 5, 6, 3]),
+    ('S', [3, 4, 2, 1, 6]),
+    ('W', [5, 5, 7, 7, 5]),
+    ('X', [5, 5, 2, 5, 5]),
+    ('Y', [5, 5, 2, 2, 2]),
+    ('Z', [7, 1, 2, 4, 7]),
+    (':', [0, 2, 0, 2, 0]),
+    ('_', [0, 0, 0, 0, 7]),
+    ('/', [1, 1, 2, 4, 4]),
+    ('(', [1, 2, 2, 2, 1]),
+    (')', [4, 2, 2, 2, 4]),
+    (',', [0, 0, 0, 2, 4]),
+    ('[', [3, 2, 2, 2, 3]),
+    (']', [6, 2, 2, 2, 6]),
+    ('>', [4, 2, 1, 2, 4]),
+    ('+', [0, 2, 7, 2, 0]),
 ];
 
 /// One character of the bitmap font at (x, y) (its top-left), each bit a 2x2 block; an unknown character (and the
