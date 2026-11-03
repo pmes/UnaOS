@@ -10396,3 +10396,19 @@ mod yieldsite {
         }
     }
 }
+
+// ── PUMPHDA (rmbp-ledger B1091) — two singleton accessors — TAIL-APPENDED ────────────────────────────────────────────
+// `hda::start_off_pump` posts a stream start off the pump only when the CALLER is the pump (a fixture's or the shell's
+// `service` keeps its inline start), and `tests pumphda` reads the restarts across its forced-slow start. The identity is
+// the one `singleton_superseded` reads (SGL_TID against `current_id`); the RESTART road itself is unchanged.
+
+/// PUMPHDA — the calling task is the registered singleton's current instance (the usb-pump).
+pub fn singleton_is_current() -> bool {
+    let t = SGL_TID.load(Ordering::Acquire);
+    t != 0 && current_id() == Some(t)
+}
+
+/// PUMPHDA — the singleton's restarts since boot (`singleton_restart`'s count).
+pub fn singleton_restarts() -> u32 {
+    SGL_RESTARTS.load(Ordering::Acquire)
+}
