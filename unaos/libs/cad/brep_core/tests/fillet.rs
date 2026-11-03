@@ -1,12 +1,14 @@
 //! VUGBREP3 (SR502): fillets and chamfers of plane / plane edges. Each result validates, its mass.rs volume equals the
 //! hand value to 1e-9 relative, and it tessellates to a closed manifold mesh (chi 2) whose volume is within chord x
 //! area of the exact one; the blend is found by its Name; oversize, cornered and curved-pair edges refuse by name.
+//! VUGBREP3TORUS (SR519): the plane / cylinder circle edge of a boss or a hole, its torus fillet and cone chamfer
+//! against Pappus.
 
 mod common;
-use brep_core::primitives::{box_, cylinder};
+use brep_core::primitives::{box_, cone, cylinder};
 use brep_core::{
     Brep, Curve, Entity, Id, Name, OpKind, Refusal, Report, Role, Surface, SurfaceKind, chamfer, difference, faces_named,
-    fillet, properties, tessellate, validate,
+    fillet, properties, tessellate, union, validate,
 };
 use brep_core::{Tol, Vec3};
 use common::{close, manifold_chi, mesh_volume};
@@ -194,9 +196,10 @@ fn two_edges_at_one_vertex_refuse_by_vertex() {
     assert_eq!(got, Err(Refusal::CornerNotBlended { vertex: corner, reason: "partial" }));
 }
 
+// VUGBREP3TORUS (SR519): the plane / cylinder circle is the torus blend now; a plane / cone circle still refuses.
 #[test]
-fn a_plane_cylinder_edge_refuses_by_pair() {
-    let c = cylinder(2.0, 5.0, T).unwrap();
+fn a_plane_cone_edge_refuses_by_pair() {
+    let c = cone(2.0, 1.0, 5.0, T).unwrap();
     let cap = c
         .edges
         .iter()
@@ -207,8 +210,8 @@ fn a_plane_cylinder_edge_refuses_by_pair() {
     assert!(
         matches!(
             got,
-            Err(Refusal::NotClosedForm { a: SurfaceKind::Plane, b: SurfaceKind::Cylinder })
-                | Err(Refusal::NotClosedForm { a: SurfaceKind::Cylinder, b: SurfaceKind::Plane })
+            Err(Refusal::NotClosedForm { a: SurfaceKind::Plane, b: SurfaceKind::Cone })
+                | Err(Refusal::NotClosedForm { a: SurfaceKind::Cone, b: SurfaceKind::Plane })
         ),
         "{got:?}"
     );
@@ -295,4 +298,128 @@ fn oblique_corner_refuses_by_reason() {
     assert_eq!(ids.len(), 3);
     let got = fillet(&c, &ids, 0.5, T);
     assert_eq!(got, Err(Refusal::CornerNotBlended { vertex: corner, reason: "oblique" }));
+}
+
+// VUGBREP3TORUS (SR519): the plane / cylinder circle edge. The spandrel (the r x r corner square less the quarter disc)
+// has area (1 - pi/4) r^2 and its centroid d = r (10 - 3 pi) / (12 - 3 pi) from the corner; Pappus sweeps it about the
+// axis at R -/+ d.
+
+/// The 10 R x 20 boss on the 40 x 40 x 10 plate: the cylinder R 10 from z 5 to 30 at (20, 20) united with the plate.
+fn boss() -> Brep {
+    let plate = box_(40.0, 40.0, 10.0, T).unwrap();
+    let tool = moved(cylinder(10.0, 25.0, T).unwrap(), Vec3::new(20.0, 20.0, 5.0));
+    union(&plate, &tool, T).expect("union")
+}
+
+/// The 40 x 40 x 10 plate with the R 10 through hole at (20, 20).
+fn holed() -> Brep {
+    let plate = box_(40.0, 40.0, 10.0, T).unwrap();
+    let tool = moved(cylinder(10.0, 12.0, T).unwrap(), Vec3::new(20.0, 20.0, -1.0));
+    difference(&plate, &tool, T).expect("difference")
+}
+
+/// The Id of the one radius-`r` circle edge at height `z`.
+fn circle_at(b: &Brep, z: f64, r: f64) -> Id {
+    let hits: Vec<Id> = b
+        .edges
+        .iter()
+        .filter(|e| matches!(e.curve, Curve::Circle { r: cr, .. } if near(cr, r)))
+        .filter(|e| near(b.vertices[e.v[0] as usize].p.z, z))
+        .map(|e| e.id)
+        .collect();
+    assert_eq!(hits.len(), 1, "one circle edge matches");
+    hits[0]
+}
+
+fn spandrel(r: f64) -> (f64, f64) {
+    ((1.0 - PI / 4.0) * r * r, r * (10.0 - 3.0 * PI) / (12.0 - 3.0 * PI))
+}
+
+/// Validate, face count, the volume to 1e-6 relative, genus, and the tessellation witness.
+fn check_ring(r: &Brep, volume: f64, faces: usize, genus: i64) {
+    let rep = validate(r, T).expect("validate");
+    assert_eq!(rep.faces, faces, "face count");
+    assert_eq!(rep.genus, vec![genus], "genus");
+    let m = properties(r, T).expect("mass");
+    assert!(((m.volume - volume) / volume).abs() < 1e-6, "volume {} vs {volume}", m.volume);
+    let t = tessellate(r, CHORD, T).expect("tessellate");
+    assert_eq!(manifold_chi(&t.mesh).expect("manifold"), 2 - 2 * genus);
+    let mv = mesh_volume(&t.mesh);
+    let area = brep_core::area(r).unwrap();
+    assert!((mv - volume).abs() <= CHORD * area, "mesh volume {mv} vs {volume}");
+}
+
+/// The one blend face named by `edge`: its (major, minor, reversed) when it is a torus.
+fn torus_of(b: &Brep, op: OpKind, edge: Id) -> (f64, f64, bool) {
+    let found = faces_named(b, blend_name(op, edge));
+    assert_eq!(found.len(), 1, "one blend face carries the edge's Name");
+    let f = &b.faces[found[0] as usize];
+    match f.surface {
+        Surface::Torus { major, minor, .. } => (major, minor, f.reversed),
+        other => panic!("not a torus: {other:?}"),
+    }
+}
+
+#[test]
+fn boss_top_rim_filleted_is_a_torus_quarter() {
+    let a = boss();
+    check_ring(&a, 16000.0 + 2000.0 * PI, 8, 0);
+    let e = circle_at(&a, 30.0, 10.0);
+    let r = fillet(&a, &[e], 2.0, T).expect("fillet");
+    let (area, d) = spandrel(2.0);
+    check_ring(&r, 16000.0 + 2000.0 * PI - 2.0 * PI * (10.0 - d) * area, 9, 0);
+    let (major, minor, reversed) = torus_of(&r, OpKind::Fillet, e);
+    assert!(near(major, 8.0) && near(minor, 2.0), "major {major} minor {minor}");
+    assert!(!reversed, "a convex blend faces away from its tube centre");
+    assert_eq!(r.find(e), None);
+}
+
+#[test]
+fn hole_rim_filleted_is_the_outer_torus() {
+    let a = holed();
+    let e = circle_at(&a, 10.0, 10.0);
+    let r = fillet(&a, &[e], 2.0, T).expect("fillet");
+    let (area, d) = spandrel(2.0);
+    check_ring(&r, 16000.0 - 1000.0 * PI - 2.0 * PI * (10.0 + d) * area, 8, 1);
+    let (major, minor, reversed) = torus_of(&r, OpKind::Fillet, e);
+    assert!(near(major, 12.0) && near(minor, 2.0), "major {major} minor {minor}");
+    assert!(!reversed, "the hole rim is convex");
+}
+
+#[test]
+fn boss_base_filleted_adds_the_concave_torus() {
+    let a = boss();
+    let e = circle_at(&a, 10.0, 10.0);
+    let r = fillet(&a, &[e], 2.0, T).expect("fillet");
+    let (area, d) = spandrel(2.0);
+    check_ring(&r, 16000.0 + 2000.0 * PI + 2.0 * PI * (10.0 + d) * area, 9, 0);
+    let (major, _, reversed) = torus_of(&r, OpKind::Fillet, e);
+    assert!(near(major, 12.0), "major {major}");
+    assert!(reversed, "a concave blend faces its tube centre");
+}
+
+#[test]
+fn boss_top_rim_chamfered_is_a_cone_frustum() {
+    let a = boss();
+    let e = circle_at(&a, 30.0, 10.0);
+    let (d1, d2) = (2.0, 3.0);
+    let r = chamfer(&a, &[e], d1, d2, T).expect("chamfer");
+    // The d1 x d2 triangle, its centroid d1 / 3 in from the rim.
+    check_ring(&r, 16000.0 + 2000.0 * PI - 2.0 * PI * (10.0 - d1 / 3.0) * (d1 * d2 / 2.0), 9, 0);
+    let found = faces_named(&r, blend_name(OpKind::Chamfer, e));
+    assert_eq!(found.len(), 1);
+    assert_eq!(r.faces[found[0] as usize].surface.kind(), SurfaceKind::Cone);
+}
+
+#[test]
+fn boss_rim_radius_at_r_refuses() {
+    let a = boss();
+    let e = circle_at(&a, 30.0, 10.0);
+    match fillet(&a, &[e], 10.0, T) {
+        Err(Refusal::RadiusTooLarge { edge, max }) => {
+            assert_eq!(edge, e);
+            close(max, 10.0, "max");
+        }
+        other => panic!("{other:?}"),
+    }
 }

@@ -19,7 +19,8 @@
 //!    the three trim vertices (normal -(d0 + d1 + d2)). Every other vertex carries at most one listed edge; all
 //!    listed edges are planned against the INPUT before anything is built.
 //! 3. Per edge e (v0 -> v1 along its line direction t): F1 is the face whose co-edge runs along t, F2 the other; both
-//!    must be planes (`NotClosedForm` by pair name: the plane / cylinder edge is the torus blend, VUG-BREP-3-TORUS).
+//!    must be planes (`NotClosedForm` by pair name; the closed plane / cylinder circle edge takes the ring road below,
+//!    VUGBREP3TORUS SR519).
 //!    The in-face direction w_i = n_i x d_i (the face lies left of its loop about its outward normal n_i); the edge
 //!    is convex when n1 . w2 < 0, concave when > 0. phi = acos(w1 . w2). A fillet of radius r sets each face back by
 //!    r / tan(phi / 2) and its ball centre sits on the bisector at r / sin(phi / 2) (the cylinder blend: its axis
@@ -45,6 +46,22 @@
 //! `Role::Trim` b 0 (P1) 1 (P2) 2 (Q1) 3 (Q2). The blend is found by `faces_named`. A corner (SR512) names by the
 //! corner VERTEX's Id: its patch `Role::Blend` b 0, its shared trim vertices `Role::Trim` b 0 / 1 / 2 in mint order
 //! (Ids are unique across vertices, edges and faces, so no corner Name meets an edge's).
+//!
+//! VUGBREP3TORUS (SR519), the ring road: a listed CLOSED circle edge e (one vertex V, span TAU) between a plane P and a
+//! coaxial cylinder C of the same radius R (a uv box of u span TAU, the circle at one v end, V the end of C's one seam
+//! line and nothing else) is a ring; `plan` keeps every other edge. With n P's outward normal, es the unit direction
+//! from the centre c0 to V, sc = +1 when C is not reversed (a boss) else -1 (a hole), h = +1 when C runs from P along
+//! +n else -1 (convex iff h = -1: a boss top or a hole rim; concave: a boss base or a pocket floor), and rho the
+//! parameter (r; a chamfer's d1 on the plane, d2 on the cylinder): P is trimmed to the circle rp = R + h sc rho, C by
+//! r (d2) away from P. The fillet's patch is the torus in the frame (c0 + n h r, z = n, x = es), major rp, minor r,
+//! u in [0, TAU] and v the exact quarter between the plane contact -h pi/2 and the cylinder contact (0 when h sc = -1,
+//! else pi); the chamfer's the cone frustum (c0, z = h n, x = es), r0 = rp, k = (R - rp) / d2, v in [0, d2]; each
+//! reversed when its normal opposes the sum of P's and C's outward normals. `RadiusTooLarge { edge, max }`: a shrinking
+//! ring max = R and R less the furthest other edge of P from c0, a growing ring the nearest less R, and C's length
+//! over its listed circles (in d1 for a chamfer); two rings, or a ring and a straight edge's region, meeting on one
+//! plane refuse `Contact "fillet regions meet"`. Names by e's Id: the patch `Role::Blend` b 0, its seam (the meridian
+//! circle, t = the torus v; the chamfer's line) `Role::Blend` b 1, the trim circles `Role::Trim` b 1 (on P) / 2 (on C),
+//! the trim vertices `Role::Trim` b 0 (on P) / 1 (on C); C's seam is shortened in place and keeps its Id.
 
 use crate::Refusal;
 use crate::build::Seg2;
@@ -55,10 +72,11 @@ use crate::topo::{Brep, CoEdge, Entity, Id, Loop, Name, OpKind, Role, UvBox};
 use crate::validate::validate;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::f64::consts::{FRAC_PI_2, TAU};
+use core::f64::consts::{FRAC_PI_2, PI, TAU};
 use geom_core::{SegSeg2, Segment2, Tol, Vec2, Vec3, segment_segment2};
 
-/// Fillet each listed edge with radius `r` (the cylinder blend of a plane / plane edge).
+/// Fillet each listed edge with radius `r` (the cylinder blend of a plane / plane edge; VUGBREP3TORUS (SR519): the
+/// torus blend of a closed plane / cylinder circle edge).
 pub fn fillet(b: &Brep, edges: &[Id], r: f64, tol: Tol) -> Result<Brep, Refusal> {
     if !(r > 0.0) || !r.is_finite() {
         return Err(Refusal::BadParam("fillet radius"));
@@ -67,7 +85,8 @@ pub fn fillet(b: &Brep, edges: &[Id], r: f64, tol: Tol) -> Result<Brep, Refusal>
 }
 
 /// Chamfer each listed edge: `d1` back along the face whose co-edge runs along the edge's own direction, `d2` along
-/// the other face; the two trim lines joined by a plane.
+/// the other face; the two trim lines joined by a plane (VUGBREP3TORUS (SR519): a closed plane / cylinder circle edge
+/// takes `d1` on the plane, `d2` on the cylinder, joined by a cone frustum).
 pub fn chamfer(b: &Brep, edges: &[Id], d1: f64, d2: f64, tol: Tol) -> Result<Brep, Refusal> {
     if !(d1 > 0.0) || !d1.is_finite() || !(d2 > 0.0) || !d2.is_finite() {
         return Err(Refusal::BadParam("chamfer distance"));
@@ -163,16 +182,23 @@ fn edit(b: &Brep, ids: &[Id], kind: Kind, tol: Tol) -> Result<Brep, Refusal> {
 
     let corner_at = corners(b, &uses, &degree, &es, kind, tol)?;
     let mut plans = Vec::new();
+    // VUGBREP3TORUS (SR519): a closed plane / cylinder circle edge is a ring; every other edge is `plan`'s.
+    let mut rings = Vec::new();
     for &e in &es {
-        plans.push(plan(b, &uses, &degree, &corner_at, e, kind, tol)?);
+        match ring(b, &uses, &degree, e, tol)? {
+            Some(g) => rings.push(g),
+            None => plans.push(plan(b, &uses, &degree, &corner_at, e, kind, tol)?),
+        }
     }
     let rho = match kind {
         Kind::Fillet { r } => r,
         Kind::Chamfer { d1, .. } => d1,
     };
     size(b, &plans, rho, tol)?;
+    ring_size(b, &rings, kind, rho, tol)?;
     meet(b, &plans, rho, tol)?;
-    build(b, &plans, kind, rho, tol)
+    ring_meet(b, &rings, &plans, rho, tol)?;
+    build(b, &plans, &rings, kind, rho, tol)
 }
 
 /// Measure one listed edge (steps 3 and 4 of the module doc).
@@ -491,7 +517,7 @@ fn chain(w: &Brep, mut rest: Vec<(u32, bool)>) -> Result<Vec<(u32, bool)>, Refus
 }
 
 /// Step 6: edit a clone through the arena's own mint, then rebuild it compacted and validate.
-fn build(b: &Brep, plans: &[Plan], kind: Kind, rho: f64, tol: Tol) -> Result<Brep, Refusal> {
+fn build(b: &Brep, plans: &[Plan], rings: &[Ring], kind: Kind, rho: f64, tol: Tol) -> Result<Brep, Refusal> {
     let op = match kind {
         Kind::Fillet { .. } => OpKind::Fillet,
         Kind::Chamfer { .. } => OpKind::Chamfer,
@@ -629,6 +655,8 @@ fn build(b: &Brep, plans: &[Plan], kind: Kind, rho: f64, tol: Tol) -> Result<Bre
         dead_e[p.e as usize] = true;
     }
     corner_patches(b, &mut w, &mut lists, &mut blends, patches, kind, rho, op)?;
+    // VUGBREP3TORUS (SR519): the rings, through the same clone, lists, moves and blends.
+    ring_build(&mut w, &mut lists, &mut moves, &mut blends, &mut dead_v, &mut dead_e, rings, kind, rho, op)?;
 
     // Shorten the neighbours: the end at the dropped vertex moves to its trim vertex.
     for (a, old, new) in moves {
@@ -856,6 +884,330 @@ fn corner_patches(
         let pf = w.add_face(Name { op, role: Role::Blend, a, b: 0 }, surface, false, uv, &[]);
         lists.push(vec![lp]);
         blends.push((pf, f1));
+    }
+    Ok(())
+}
+
+// VUGBREP3TORUS (SR519): the ring road (module doc, the VUGBREP3TORUS paragraph): the closed plane / cylinder circle
+// edge, its torus fillet and its cone-frustum chamfer.
+
+/// One listed closed circle edge between a plane and a coaxial cylinder, measured against the input.
+struct Ring {
+    e: u32,
+    id: Id,
+    /// The plane face P, the cylinder face C, C's seam line, the circle's one vertex V.
+    p: u32,
+    c: u32,
+    seam: u32,
+    v: u32,
+    /// The circle's centre and frame axis, P's outward normal, the unit direction from the centre to V.
+    c0: Vec3,
+    az: Vec3,
+    n: Vec3,
+    es: Vec3,
+    /// The circle radius R; h = +1 when C runs from P along +n (concave) else -1; sc = +1 when C is not reversed.
+    rr: f64,
+    h: f64,
+    sc: f64,
+    /// The `reversed` of e's co-edge on P, on C.
+    sense: [bool; 2],
+    /// The circle is at C's uv v0 (else v1); C's uv length.
+    at_v0: bool,
+    len: f64,
+}
+
+impl Ring {
+    /// The radius P is trimmed to.
+    fn rp(&self, rho: f64) -> f64 {
+        self.rr + self.h * self.sc * rho
+    }
+}
+
+/// How far C is trimmed back: r, or a chamfer's d2.
+fn cyl_trim(kind: Kind) -> f64 {
+    match kind {
+        Kind::Fillet { r } => r,
+        Kind::Chamfer { d2, .. } => d2,
+    }
+}
+
+/// The ring of edge `e`, `None` when e is not a circle between a plane and a cylinder (then `plan` answers).
+fn ring(b: &Brep, uses: &[Vec<(u32, u32)>], degree: &[u32], e: u32, tol: Tol) -> Result<Option<Ring>, Refusal> {
+    let edge = &b.edges[e as usize];
+    let Curve::Circle { f: cf, r: rr } = edge.curve else { return Ok(None) };
+    let u = &uses[e as usize];
+    if u.len() != 2 {
+        return Ok(None);
+    }
+    let (ip, ic) = match (kind_of(b, u[0].0), kind_of(b, u[1].0)) {
+        (SurfaceKind::Plane, SurfaceKind::Cylinder) => (0, 1),
+        (SurfaceKind::Cylinder, SurfaceKind::Plane) => (1, 0),
+        _ => return Ok(None),
+    };
+    let (p, c) = (u[ip].0, u[ic].0);
+    let sense = [b.coedges[u[ip].1 as usize].reversed, b.coedges[u[ic].1 as usize].reversed];
+    let v = edge.v[0];
+    if edge.v[1] != v || libm::fabs(edge.t1 - edge.t0 - TAU) > tol.ang {
+        return Err(Refusal::Unsupported("fillet of a partial circle edge"));
+    }
+    let oblique = Refusal::Unsupported("oblique plane / cylinder edge");
+    let partial = Refusal::Unsupported("partial cylinder face");
+    let n = plane_frame(&b.faces[p as usize]).ok_or(Refusal::BadRef { what: "fillet face" })?.z;
+    let (Surface::Cylinder { f: yf, r: yr }, Some(uv)) = (b.faces[c as usize].surface, b.faces[c as usize].uv) else {
+        return Err(partial);
+    };
+    let az = cf.z;
+    if n.cross(az).mag() > tol.ang || yf.z.cross(az).mag() > tol.ang || libm::fabs(yr - rr) > tol.lin {
+        return Err(oblique);
+    }
+    let d = cf.o - yf.o;
+    let along = d.dot(yf.z);
+    if (d - yf.z * along).mag() > tol.lin {
+        return Err(oblique);
+    }
+    if libm::fabs(uv.u1 - uv.u0 - TAU) > tol.ang {
+        return Err(partial);
+    }
+    let at_v0 = if libm::fabs(along - uv.v0) <= tol.lin {
+        true
+    } else if libm::fabs(along - uv.v1) <= tol.lin {
+        false
+    } else {
+        return Err(partial);
+    };
+    let other = if at_v0 { uv.v1 } else { uv.v0 };
+    let h = if (yf.z * (other - along)).dot(n) > 0.0 { 1.0 } else { -1.0 };
+    let sc = if b.faces[c as usize].reversed { -1.0 } else { 1.0 };
+    if degree[v as usize] != 2 {
+        return Err(Refusal::Unsupported("circle edge vertex past its seam"));
+    }
+    let mut seam = None;
+    for lp in b.face_loops(c) {
+        for &ce in &b.loops[lp as usize].coedges {
+            let x = b.coedges[ce as usize].edge;
+            let xe = &b.edges[x as usize];
+            let ux = &uses[x as usize];
+            let twice = ux.len() == 2 && ux.iter().all(|y| y.0 == c);
+            if x != e && twice && xe.v.contains(&v) && matches!(xe.curve, Curve::Line { .. }) {
+                seam = Some(x);
+            }
+        }
+    }
+    let seam = seam.ok_or(Refusal::Unsupported("cylinder face without one seam"))?;
+    let es = (b.vertices[v as usize].p - cf.o).normalize()?;
+    Ok(Some(Ring {
+        e,
+        id: edge.id,
+        p,
+        c,
+        seam,
+        v,
+        c0: cf.o,
+        az,
+        n,
+        es,
+        rr,
+        h,
+        sc,
+        sense,
+        at_v0,
+        len: uv.v1 - uv.v0,
+    }))
+}
+
+/// The distance from `c` to the segment `a`-`q`.
+fn seg_dist(c: Vec3, a: Vec3, q: Vec3) -> f64 {
+    let d = q - a;
+    let l = d.dot(d);
+    let t = if l > 0.0 { ((c - a).dot(d) / l).clamp(0.0, 1.0) } else { 0.0 };
+    (a + d * t).dist(c)
+}
+
+/// The nearest and furthest distance from `c0` over the edges of `face` other than `skip` (all in the face's plane):
+/// a line's foot and ends, a circle arc's ends and its points toward and away from `c0` inside the arc.
+fn radial_range(b: &Brep, face: u32, skip: u32, c0: Vec3, tol: Tol) -> Result<Option<(f64, f64)>, Refusal> {
+    let (mut lo, mut hi, mut any) = (f64::INFINITY, f64::NEG_INFINITY, false);
+    for lp in b.face_loops(face) {
+        for &ce in &b.loops[lp as usize].coedges {
+            let ei = b.coedges[ce as usize].edge;
+            if ei == skip {
+                continue;
+            }
+            any = true;
+            let e = &b.edges[ei as usize];
+            let mut pts: Vec<Vec3> = e.v.iter().map(|&x| b.vertices[x as usize].p).collect();
+            match &e.curve {
+                Curve::Line { .. } => lo = lo.min(seg_dist(c0, pts[0], pts[1])),
+                Curve::Circle { f, .. } => {
+                    let d = c0 - f.o;
+                    let d = d - f.z * d.dot(f.z);
+                    if d.mag() > tol.lin {
+                        let th = libm::atan2(d.dot(f.y), d.dot(f.x));
+                        for a in [th, th + PI] {
+                            let dt = wrap(a - e.t0);
+                            if dt <= e.t1 - e.t0 {
+                                pts.push(e.curve.point(e.t0 + dt));
+                            }
+                        }
+                    }
+                }
+                _ => return Err(Refusal::Unsupported("fillet beside an ellipse or NURBS edge")),
+            }
+            for q in pts {
+                let dq = q.dist(c0);
+                lo = lo.min(dq);
+                hi = hi.max(dq);
+            }
+        }
+    }
+    Ok(if any { Some((lo, hi)) } else { None })
+}
+
+/// RadiusTooLarge for the rings, in list order (max in the parameter rho: r, or a chamfer's d1).
+fn ring_size(b: &Brep, rings: &[Ring], kind: Kind, rho: f64, tol: Tol) -> Result<(), Refusal> {
+    let kc = cyl_trim(kind) / rho;
+    for g in rings {
+        let mut bound = f64::INFINITY;
+        let range = radial_range(b, g.p, g.e, g.c0, tol)?;
+        if g.h * g.sc < 0.0 {
+            bound = bound.min(g.rr);
+            if let Some((_, hi)) = range {
+                bound = bound.min(g.rr - hi);
+            }
+        } else if let Some((lo, _)) = range {
+            bound = bound.min(lo - g.rr);
+        }
+        // The cylinder shorter than its trims (one per listed circle on it).
+        let cnt = rings.iter().filter(|x| x.c == g.c).count() as f64;
+        bound = bound.min(g.len / cnt / kc);
+        if rho > bound - tol.lin {
+            return Err(Refusal::RadiusTooLarge { edge: g.id, max: bound });
+        }
+    }
+    Ok(())
+}
+
+/// Two rings, or a ring and a straight edge's region, that meet on one plane face.
+fn ring_meet(b: &Brep, rings: &[Ring], plans: &[Plan], rho: f64, tol: Tol) -> Result<(), Refusal> {
+    let hit = |x: Id, y: Id| Refusal::Contact { what: "fillet regions meet", a: x, b: y };
+    for (i, g) in rings.iter().enumerate() {
+        let (rp, grow) = (g.rp(rho), g.h * g.sc > 0.0);
+        for k in rings.iter().skip(i + 1).filter(|k| k.p == g.p) {
+            let (rk, gk) = (k.rp(rho), k.h * k.sc > 0.0);
+            let d = g.c0.dist(k.c0);
+            let meets = match (grow, gk) {
+                (true, true) => d <= rp + rk + tol.lin,
+                (false, true) => d + rk >= rp - tol.lin,
+                (true, false) => d + rp >= rk - tol.lin,
+                (false, false) => true,
+            };
+            if meets {
+                return Err(hit(g.id, k.id));
+            }
+        }
+        for p in plans {
+            let (v0, v1) = (b.vertices[p.ends[0].v as usize].p, b.vertices[p.ends[1].v as usize].p);
+            let mut polys: Vec<Vec<Vec3>> = Vec::new();
+            for side in 0..2 {
+                if p.f[side] == g.p {
+                    polys.push(vec![v0, v1, p.point(b, 1, side, rho), p.point(b, 0, side, rho)]);
+                }
+            }
+            for (j, end) in p.ends.iter().enumerate() {
+                if !end.corner && end.face == g.p {
+                    polys.push(vec![b.vertices[end.v as usize].p, p.point(b, j, 0, rho), p.point(b, j, 1, rho)]);
+                }
+            }
+            for poly in polys {
+                let m = poly.len();
+                let meets = if grow {
+                    (0..m).any(|x| seg_dist(g.c0, poly[x], poly[(x + 1) % m]) <= rp + tol.lin)
+                } else {
+                    poly.iter().any(|q| q.dist(g.c0) >= rp - tol.lin)
+                };
+                if meets {
+                    return Err(hit(g.id, p.id));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Each ring's topology on the clone (mint order: the trim vertices on P and C, the trim circles, the patch's seam, the
+/// patch); the seam of C is shortened by `build`'s own pass through `moves`.
+#[allow(clippy::too_many_arguments)]
+fn ring_build(
+    w: &mut Brep,
+    lists: &mut Vec<Vec<Vec<(u32, bool)>>>,
+    moves: &mut Vec<(u32, u32, u32)>,
+    blends: &mut Vec<(u32, u32)>,
+    dead_v: &mut [bool],
+    dead_e: &mut [bool],
+    rings: &[Ring],
+    kind: Kind,
+    rho: f64,
+    op: OpKind,
+) -> Result<(), Refusal> {
+    let dc = cyl_trim(kind);
+    for g in rings {
+        let src = u32::try_from(g.id.0).map_err(|_| Refusal::BadParam("an Id past u32 in a fillet name"))?;
+        let nm = |role: Role, k: u32| Name { op, role, a: src, b: k };
+        let rp = g.rp(rho);
+        let lift = g.n * (g.h * dc);
+        let (pp, pc) = (g.c0 + g.es * rp, g.c0 + lift + g.es * g.rr);
+        let vp = w.add_vertex(nm(Role::Trim, 0), pp);
+        let vc = w.add_vertex(nm(Role::Trim, 1), pc);
+        let ep = w.add_edge(nm(Role::Trim, 1), Curve::Circle { f: Frame::new(g.c0, g.az, g.es)?, r: rp }, 0.0, TAU, vp, vp);
+        let fc = Frame::new(g.c0 + lift, g.az, g.es)?;
+        let ec = w.add_edge(nm(Role::Trim, 2), Curve::Circle { f: fc, r: g.rr }, 0.0, TAU, vc, vc);
+        let (seam, surface, uv) = match kind {
+            Kind::Fillet { r } => {
+                let o = g.c0 + g.n * (g.h * r);
+                let vcy = if g.h * g.sc < 0.0 { 0.0 } else { PI };
+                let vpl = -g.h * FRAC_PI_2;
+                let vpl = if libm::fabs(vpl - vcy) > PI { vpl + TAU } else { vpl };
+                let (lo, hi) = (vpl.min(vcy), vpl.max(vcy));
+                // The meridian circle at u = 0: x = es, y = n, so its t is the torus's v.
+                let mf = Frame::new(o + g.es * rp, g.es.cross(g.n), g.es)?;
+                let (va, vb) = if vpl < vcy { (vp, vc) } else { (vc, vp) };
+                let x = w.add_edge(nm(Role::Blend, 1), Curve::Circle { f: mf, r }, lo, hi, va, vb);
+                let s = Surface::Torus { f: Frame::new(o, g.n, g.es)?, major: rp, minor: r };
+                (x, s, UvBox { u0: 0.0, u1: TAU, v0: lo, v1: hi })
+            }
+            Kind::Chamfer { d2, .. } => {
+                let x = line(w, nm(Role::Blend, 1), pp, pc, vp, vc)?;
+                let s = Surface::Cone { f: Frame::new(g.c0, g.n * g.h, g.es)?, r0: rp, k: (g.rr - rp) / d2 };
+                (x, s, UvBox { u0: 0.0, u1: TAU, v0: 0.0, v1: d2 })
+            }
+        };
+        // At u = pi the point is toward -es: P's outward n plus C's outward -es sc.
+        let vm = (uv.v0 + uv.v1) * 0.5;
+        let want = g.n - g.es * g.sc;
+        let reversed = surface.du(PI, vm).cross(surface.dv(PI, vm)).dot(want) < 0.0;
+        // P and C: the circle's co-edge becomes the trim circle, in the same sense.
+        for (face, new, s) in [(g.p, ep, g.sense[0]), (g.c, ec, g.sense[1])] {
+            let at = lists[face as usize].iter_mut().flatten().find(|x| x.0 == g.e);
+            let at = at.ok_or(Refusal::BadRef { what: "fillet ring loop" })?;
+            *at = (new, s);
+        }
+        if let Some(bx) = w.faces[g.c as usize].uv.as_mut() {
+            if g.at_v0 {
+                bx.v0 += dc;
+            } else {
+                bx.v1 -= dc;
+            }
+        }
+        // The patch loop in order (two co-edges start at the C side's vertex, so not `chain`): P's circle, the seam
+        // from P to C, C's circle, the seam back.
+        let up = w.edges[seam as usize].v[0] == vp;
+        let lp = vec![(ep, !g.sense[0]), (seam, !up), (ec, !g.sense[1]), (seam, up)];
+        let bf = w.add_face(nm(Role::Blend, 0), surface, reversed, Some(uv), &[]);
+        lists.push(vec![lp]);
+        blends.push((bf, g.p));
+        moves.push((g.seam, g.v, vc));
+        dead_v[g.v as usize] = true;
+        dead_e[g.e as usize] = true;
     }
     Ok(())
 }
