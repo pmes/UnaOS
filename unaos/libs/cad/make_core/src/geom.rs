@@ -68,3 +68,27 @@ pub fn seg_aabb3(a: Vec3, b: Vec3, bx: &Aabb3) -> bool {
         RayBox::Miss => false,
     }
 }
+
+// ---- VUGMAKEARCFIT (LEDGER SR490): the circle crossings offset.rs's arc pieces are split at. ----
+
+/// Where the line through `a` and `b` meets the circle about `c` of radius `r` (geom_core's `line_circle2`): the first
+/// `n` points, in the line's direction order, a tangent counted once; none for a degenerate line or circle.
+pub fn line_circle2(a: Vec2, b: Vec2, c: Vec2, r: f64, tol: Tol) -> ([Vec2; 2], usize) {
+    let (Ok(l), Ok(k)) = (Line2::through(a, b), geom_core::Circle2::new(c, r)) else { return ([a; 2], 0) };
+    match geom_core::line_circle2(&l, &k, tol) {
+        geom_core::LineCircle::Two(p, q) => ([p, q], 2),
+        geom_core::LineCircle::Tangent(p) => ([p, p], 1),
+        geom_core::LineCircle::Miss => ([a; 2], 0),
+    }
+}
+
+/// Where the circles about `c1` (radius `r1`) and `c2` (radius `r2`) meet (geom_core's `circle_circle2`): the first `n`
+/// points, a tangent counted once; none when apart, nested, coincident or degenerate.
+pub fn circle_circle2(c1: Vec2, r1: f64, c2: Vec2, r2: f64, tol: Tol) -> ([Vec2; 2], usize) {
+    let (Ok(a), Ok(b)) = (geom_core::Circle2::new(c1, r1), geom_core::Circle2::new(c2, r2)) else { return ([c1; 2], 0) };
+    match geom_core::circle_circle2(&a, &b, tol) {
+        geom_core::CircleCircle::Two(p, q) => ([p, q], 2),
+        geom_core::CircleCircle::Tangent(p) => ([p, p], 1),
+        _ => ([c1; 2], 0),
+    }
+}

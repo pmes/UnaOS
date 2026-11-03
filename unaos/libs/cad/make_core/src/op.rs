@@ -10,8 +10,9 @@
 use alloc::vec::Vec;
 use libm::ceil;
 
-use crate::geom::{Length, Tol, Vec2, Vec3, line_line2, seg_seg2, signed_area2};
+use crate::geom::{Length, Tol, Vec2, Vec3};
 use crate::machine::{Machine, Tool};
+use crate::offset::El; // VUGMAKEARCFIT (SR490): the one offset's pieces
 use crate::program::{Move, Program, Spin};
 use crate::slice::SliceParams; // VUGMAKESLICE (SR483)
 use crate::validate::Refusal;
@@ -35,7 +36,9 @@ pub struct Feeds {
 pub enum Op {
     Drill { points: Vec<Vec2>, top: f64, depth: f64, peck: f64, tool: u32, feeds: Feeds },
     Contour { profile: Vec<Vec2>, top: f64, depth: f64, side: Side, tool: u32, feeds: Feeds },
-    /// `chord`: the most material a flattened corner arc may leave; `climb`: climb milling with the M3 spindle.
+    /// `chord`: the most material a flattened corner arc may leave (validated positive; the pocket emits its corner
+    /// arcs exact as G2 / G3 since VUGMAKEARCFIT SR490, so it bounds only a consumer that flattens); `climb`: climb
+    /// milling with the M3 spindle.
     Pocket2_5D {
         outline: Vec<Vec2>,
         islands: Vec<Vec<Vec2>>,
@@ -126,103 +129,33 @@ fn drill(
     Ok(p)
 }
 
-/// One element of an offset path.
-#[derive(Clone, Copy)]
-enum El {
-    Line { from: Vec2, to: Vec2 },
-    Arc { from: Vec2, to: Vec2, centre: Vec2, cw: bool },
-}
+// ---- VUGMAKEARCFIT (LEDGER SR490): Contour through the one offset (`offset::rings` at d = r). ----
 
-impl El {
-    fn chord(&self) -> (Vec2, Vec2) {
-        match *self {
-            El::Line { from, to } | El::Arc { from, to, .. } => (from, to),
-        }
-    }
-}
+/// An arc whose chord is no longer than this is emitted as a line: on the dialect writers' 1e-4 grid its two ends
+/// could round together and a controller would read a FULL turn (the sagitta at r >= 2 is under 1e-7).
+const ARC_MIN_CHORD: f64 = 1e-3;
 
-/// The closed profile (made counter-clockwise) offset by the tool radius to `side`: the side's corners that turn
-/// away from the tool get an arc about the vertex (outside: convex corners, CCW arcs), the others the offset lines'
-/// intersection. A collapsed edge refuses `ToolTooLarge`; crossing elements refuse `ContourSelfIntersects` (arcs are
-/// tested by their chords).
-fn offset_path(profile: &[Vec2], r: f64, side: Side, tool: u32, tol: Tol) -> Result<Vec<El>, Refusal> {
-    let mut pts: Vec<Vec2> = profile.to_vec();
-    if pts.len() >= 2 && (pts[0] - pts[pts.len() - 1]).length() <= tol.lin {
-        pts.pop();
-    }
-    if pts.len() < 3 {
-        return Err(Refusal::ContourDegenerate { what: "fewer than 3 points" });
-    }
-    let area = signed_area2(&pts);
-    if libm::fabs(area) <= tol.lin * tol.lin {
-        return Err(Refusal::ContourDegenerate { what: "zero area" });
-    }
-    if area < 0.0 {
-        pts.reverse();
-    }
-    let n = pts.len();
-    let mut dir = Vec::with_capacity(n);
-    for i in 0..n {
-        let d = pts[(i + 1) % n] - pts[i];
-        let l = d.length();
-        if l <= tol.lin {
-            return Err(Refusal::ContourDegenerate { what: "zero-length edge" });
-        }
-        dir.push(d * (1.0 / l));
-    }
-    let s = if side == Side::Outside { 1.0 } else { -1.0 };
-    // The outward normal of a CCW edge is its right-hand side.
-    let off = |i: usize| Vec2::new(dir[i].y, -dir[i].x) * (s * r);
-    let mut start = alloc::vec![Vec2::default(); n];
-    let mut end = alloc::vec![Vec2::default(); n];
-    let mut corner: Vec<Option<El>> = alloc::vec![None; n];
-    for j in 0..n {
-        let i = (j + n - 1) % n; // the edge into vertex j
-        let v = pts[j];
-        let turn = dir[i].cross(dir[j]);
-        if libm::fabs(turn) <= tol.ang {
-            if dir[i].dot(dir[j]) < 0.0 {
-                return Err(Refusal::ContourDegenerate { what: "edge reverses" });
+/// The ring's pieces at `z`: a segment as `Move::Linear`, an arc as `Move::Arc` (G2 / G3).
+fn emit(p: &mut Program, ring: &[El], z: f64, feed: f64) {
+    for e in ring {
+        match *e {
+            El::Arc { from, to, centre, cw } if (to - from).length() > ARC_MIN_CHORD => {
+                p.moves.push(Move::Arc { to: Vec3::new(to.x, to.y, z), centre, cw, feed })
             }
-            end[i] = v + off(j);
-            start[j] = v + off(j);
-        } else if (s > 0.0 && turn > 0.0) || (s < 0.0 && turn < 0.0) {
-            end[i] = v + off(i);
-            start[j] = v + off(j);
-            corner[j] = Some(El::Arc { from: end[i], to: start[j], centre: v, cw: s < 0.0 });
-        } else {
-            let q = line_line2(pts[i] + off(i), dir[i], pts[j] + off(j), dir[j], tol)
-                .ok_or(Refusal::ContourDegenerate { what: "parallel corner" })?;
-            end[i] = q;
-            start[j] = q;
-        }
-    }
-    let mut els = Vec::with_capacity(2 * n);
-    for i in 0..n {
-        if (end[i] - start[i]).dot(dir[i]) <= tol.lin {
-            return Err(Refusal::ToolTooLarge { tool });
-        }
-        els.push(El::Line { from: start[i], to: end[i] });
-        if let Some(c) = corner[(i + 1) % n] {
-            els.push(c);
-        }
-    }
-    let k = els.len();
-    for a in 0..k {
-        for b in (a + 2)..k {
-            if a == 0 && b == k - 1 {
-                continue; // the closing pair is adjacent
-            }
-            let (p1, p2) = els[a].chord();
-            let (p3, p4) = els[b].chord();
-            if seg_seg2(p1, p2, p3, p4, tol) {
-                return Err(Refusal::ContourSelfIntersects);
+            _ => {
+                let to = e.end();
+                p.moves.push(Move::Linear { to: Vec3::new(to.x, to.y, z), feed })
             }
         }
     }
-    Ok(els)
 }
 
+/// The closed profile cut along the rings at the tool radius on `side` ([`crate::offset::rings`] over
+/// [`crate::offset::side_loop`]): the corners that turn away from the tool get an exact arc about the vertex
+/// (outside: convex corners), the others the offset lines' intersection; each ring run counter-clockwise from the
+/// piece nearest the profile's first vertex offset along its first edge. No ring refuses `ToolTooLarge`; a feature
+/// narrower than DC is not entered (what it leaves is VUG-MAKE-REST's); a self-crossing profile refuses
+/// `ContourSelfIntersects`.
 #[allow(clippy::too_many_arguments)]
 fn contour(
     m: &Machine,
@@ -238,23 +171,40 @@ fn contour(
         return Err(Refusal::DepthAboveTop);
     }
     let t = *m.tool(tool).ok_or(Refusal::UnknownTool { at: 0, tool })?;
-    let els = offset_path(profile, t.radius(), side, tool, tol)?;
-    let (mut p, _) = prelude(m, tool, f.rpm)?;
-    let passes = if t.apmx > tol.lin { ceil((depth - tol.lin) / t.apmx).max(1.0) as usize } else { 1 };
-    let start = els[0].chord().0;
-    p.moves.push(Move::Rapid { to: Vec3::new(start.x, start.y, m.safe_z) });
-    for k in 1..=passes {
-        let z = top - depth * (k as f64) / (passes as f64);
-        p.moves.push(Move::Linear { to: Vec3::new(start.x, start.y, z), feed: f.plunge });
-        for e in &els {
-            match *e {
-                El::Line { to, .. } => p.moves.push(Move::Linear { to: Vec3::new(to.x, to.y, z), feed: f.feed }),
-                El::Arc { to, centre, cw, .. } => {
-                    p.moves.push(Move::Arc { to: Vec3::new(to.x, to.y, z), centre, cw, feed: f.feed })
-                }
+    let r = t.radius();
+    let outside = side == Side::Outside;
+    let lps = crate::offset::side_loop(profile, outside, tol)?;
+    let mut rs = crate::offset::rings(&lps, r, tol)?;
+    if rs.is_empty() {
+        return Err(Refusal::ToolTooLarge { tool });
+    }
+    // The outside loop is clockwise (the cut side on its left); Contour runs counter-clockwise on both sides.
+    let ccw: Vec<Vec2> = if outside { lps[0].iter().rev().copied().collect() } else { lps[0].clone() };
+    let e0 = ccw[1] - ccw[0];
+    let aim = ccw[0] + Vec2::new(e0.y, -e0.x) * ((if outside { r } else { -r }) / e0.length());
+    for ring in rs.iter_mut() {
+        if outside {
+            *ring = crate::offset::reversed_ring(ring);
+        }
+        let mut k = 0;
+        for i in 1..ring.len() {
+            if (ring[i].start() - aim).length() < (ring[k].start() - aim).length() {
+                k = i;
             }
         }
+        ring.rotate_left(k);
+    }
+    let (mut p, _) = prelude(m, tool, f.rpm)?;
+    let n = passes(&t, depth, tol);
+    for ring in &rs {
+        let start = ring[0].start();
         p.moves.push(Move::Rapid { to: Vec3::new(start.x, start.y, m.safe_z) });
+        for k in 1..=n {
+            let z = top - depth * (k as f64) / (n as f64);
+            p.moves.push(Move::Linear { to: Vec3::new(start.x, start.y, z), feed: f.plunge });
+            emit(&mut p, ring, z, f.feed);
+            p.moves.push(Move::Rapid { to: Vec3::new(start.x, start.y, m.safe_z) });
+        }
     }
     p.moves.push(Move::Spindle(Spin::Off));
     Ok(p)
@@ -360,10 +310,10 @@ fn pocket(
         return Err(Refusal::BadParameter { what: "chord not positive" });
     }
     let lps = crate::offset::loops(outline, islands, tol)?;
-    let mut levels: Vec<Vec<Vec<Vec2>>> = Vec::new();
+    let mut levels: Vec<Vec<Vec<El>>> = Vec::new();
     loop {
         let d = r + stepover * (levels.len() as f64);
-        let rs = crate::offset::rings(&lps, d, chord, tol)?;
+        let rs = crate::offset::rings(&lps, d, tol)?;
         if rs.is_empty() {
             break;
         }
@@ -375,7 +325,7 @@ fn pocket(
     if climb {
         for lv in levels.iter_mut() {
             for ring in lv.iter_mut() {
-                ring.reverse();
+                *ring = crate::offset::reversed_ring(ring);
             }
         }
     }
@@ -385,14 +335,14 @@ fn pocket(
     for j in 1..=n {
         let z = top - depth * (j as f64) / (n as f64);
         let mut at: Option<Vec2> = None;
-        let mut cut: Vec<Vec<Vec2>> = Vec::new();
+        let mut cut: Vec<Vec<El>> = Vec::new();
         for k in (0..levels.len()).rev() {
-            let mut left: Vec<Vec<Vec2>> = levels[k].clone();
+            let mut left: Vec<Vec<El>> = levels[k].clone();
             while !left.is_empty() {
-                let mut best = (0usize, 0usize, left[0][0], f64::INFINITY);
+                let mut best = (0usize, 0usize, left[0][0].start(), f64::INFINITY);
                 if let Some(a) = at {
                     for (i, ring) in left.iter().enumerate() {
-                        let (dd, e, q) = crate::offset::nearest(a, ring);
+                        let (dd, e, q) = crate::offset::nearest(a, ring, tol);
                         if dd < best.3 {
                             best = (i, e, q, dd);
                         }
@@ -402,11 +352,12 @@ fn pocket(
                 let orig = left.swap_remove(ri);
                 let mut ring = crate::offset::start_at(&orig, e, q, tol);
                 let linked = match at {
-                    Some(a) => dd <= t.dc + tol.lin && crate::offset::clearance(a, ring[0], &lps, tol) >= r - tol.lin,
+                    Some(a) => dd <= t.dc + tol.lin && crate::offset::clearance(a, ring[0].start(), &lps, tol) >= r - tol.lin,
                     None => false,
                 };
                 if linked {
-                    p.moves.push(Move::Linear { to: Vec3::new(ring[0].x, ring[0].y, z), feed: f.feed });
+                    let s0 = ring[0].start();
+                    p.moves.push(Move::Linear { to: Vec3::new(s0.x, s0.y, z), feed: f.feed });
                 } else {
                     if let Some(a) = at {
                         p.moves.push(Move::Rapid { to: Vec3::new(a.x, a.y, m.safe_z) });
@@ -418,14 +369,11 @@ fn pocket(
                             p.moves.push(Move::Linear { to: Vec3::new(pd.x, pd.y, z), feed: f.plunge });
                             p.moves.push(Move::Linear { to: Vec3::new(q2.x, q2.y, z), feed: f.feed });
                         }
-                        None => enter(&mut p, m, &t, ring[0], stepover * (k as f64), floor, z, climb, f, tol)?,
+                        None => enter(&mut p, m, &t, ring[0].start(), stepover * (k as f64), floor, z, climb, f, tol)?,
                     }
                 }
-                let c = ring[0];
-                for v in &ring[1..] {
-                    p.moves.push(Move::Linear { to: Vec3::new(v.x, v.y, z), feed: f.feed });
-                }
-                p.moves.push(Move::Linear { to: Vec3::new(c.x, c.y, z), feed: f.feed });
+                let c = ring[0].start();
+                emit(&mut p, &ring, z, f.feed); // VUGMAKEARCFIT (SR490): segments and exact corner arcs
                 cut.push(ring);
                 at = Some(c);
             }
@@ -440,9 +388,10 @@ fn pocket(
 }
 
 /// The cleared drop to `target`: the closest pair of a point on a ring already cut at this depth pass (`cut`) and a
-/// point on `target` (a closest pair of two polylines has a vertex of one of them), whose link is no longer than DC
-/// and keeps the tool radius from the boundary: (the drop point, the target edge, the target point).
-fn cleared_drop(cut: &[Vec<Vec2>], target: &[Vec2], lps: &[Vec<Vec2>], t: &Tool, tol: Tol) -> Option<(Vec2, usize, Vec2)> {
+/// point on `target` (a closest pair of two polylines has a vertex of one of them; with arcs the piece starts are the
+/// candidates, VUG-MAKE-ARCFIT-DROP owed), whose link is no longer than DC and keeps the tool radius from the
+/// boundary: (the drop point, the target piece, the target point).
+fn cleared_drop(cut: &[Vec<El>], target: &[El], lps: &[Vec<Vec2>], t: &Tool, tol: Tol) -> Option<(Vec2, usize, Vec2)> {
     let r = t.radius();
     let mut best: Option<(f64, Vec2, usize, Vec2)> = None;
     let mut consider = |dd: f64, pd: Vec2, e: usize, q: Vec2| {
@@ -455,12 +404,12 @@ fn cleared_drop(cut: &[Vec<Vec2>], target: &[Vec2], lps: &[Vec<Vec2>], t: &Tool,
     };
     for done in cut {
         for v in done {
-            let (dd, e, q) = crate::offset::nearest(*v, target);
-            consider(dd, *v, e, q);
+            let (dd, e, q) = crate::offset::nearest(v.start(), target, tol);
+            consider(dd, v.start(), e, q);
         }
         for (e, u) in target.iter().enumerate() {
-            let (dd, _, pd) = crate::offset::nearest(*u, done);
-            consider(dd, pd, e, *u);
+            let (dd, _, pd) = crate::offset::nearest(u.start(), done, tol);
+            consider(dd, pd, e, u.start());
         }
     }
     best.map(|b| (b.1, b.2, b.3))

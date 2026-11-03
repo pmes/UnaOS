@@ -14,7 +14,7 @@
 //!   from the edge's endpoints ordered by z, so the two triangles that share an edge produce the same bits, and the
 //!   segments chain into loops by EXACT endpoint equality; a dead end refuses `OpenLoop { layer, gap }`.
 //! - [`islands`]: even-odd nesting; even depth made CCW, odd CW; an island is an outer loop and its direct holes.
-//! - perimeters by [`inset`] to the LEFT of each loop (into the material for outers and holes alike), infill by
+//! - perimeters by `offset::rings` to the LEFT of each loop (into the material for outers and holes alike), infill by
 //!   [`infill`] (rectilinear, 45 / 135 degrees alternating, even-odd scanline), E by [`extrusion`].
 //!
 //! The caller hands over triangles: make_core does not depend on mesh_core. From a `mesh_core::Mesh` the caller
@@ -26,7 +26,7 @@ use alloc::{format, vec::Vec};
 use core::f64::consts::PI;
 use libm::{ceil, cos, sin};
 
-use crate::geom::{Length, Tol, Vec2, Vec3, Xy, line_line2, signed_area2}; // Length / Xy: the SR473 traits (geom_core has mag; the fold composed SR483 onto the swap)
+use crate::geom::{Length, Tol, Vec2, Vec3, Xy, signed_area2}; // Length / Xy: the SR473 traits (geom_core has mag; the fold composed SR483 onto the swap)
 use crate::machine::{Machine, MachineKind};
 use crate::program::{Heater, Move, Program};
 use crate::validate::Refusal;
@@ -286,74 +286,6 @@ pub fn islands(loops: Vec<Vec<Vec2>>) -> Vec<Island> {
     out
 }
 
-/// The loop moved `d` to the LEFT of its direction (into the material for a CCW outer and a CW hole alike), mitred at
-/// each vertex; `None` when it collapses (an edge reverses, or the signed area changes sign).
-///
-/// PRIVATE-MINIMAL: VUGMAKEPOCKET's `offset::rings` was unfolded at this cut; this single-loop inset is owed to
-/// collapse into it at the fold (rings also splits a loop that pinches, which this one only reports as collapsed).
-pub fn inset(lp: &[Vec2], d: f64, tol: Tol) -> Option<Vec<Vec2>> {
-    // Vertices closer than tol.lin to the last kept one drop (a sliver edge would read as reversed).
-    let mut pts: Vec<Vec2> = Vec::with_capacity(lp.len());
-    for &q in lp {
-        let keep = pts.last().map_or(true, |l| (q - *l).length() > tol.lin);
-        if keep {
-            pts.push(q);
-        }
-    }
-    while pts.len() > 1 && (pts[0] - pts[pts.len() - 1]).length() <= tol.lin {
-        pts.pop();
-    }
-    // Vertices collinear within tol.ang drop: a straight-through vertex moved along its normal would sit past the
-    // neighbouring miter when it is closer to a corner than `d`, reversing that edge (a section carries such points
-    // wherever a wall's triangulation diagonal crosses the plane).
-    let mut j = 0;
-    while pts.len() >= 3 && j < pts.len() {
-        let n = pts.len();
-        let (a, b, c) = (pts[(j + n - 1) % n], pts[j], pts[(j + 1) % n]);
-        let (u, v) = (b - a, c - b);
-        if libm::fabs(u.cross(v)) <= tol.ang * u.length() * v.length() && u.dot(v) > 0.0 {
-            pts.remove(j);
-            j = j.saturating_sub(1);
-        } else {
-            j += 1;
-        }
-    }
-    let n = pts.len();
-    if n < 3 {
-        return None;
-    }
-    let a0 = signed_area2(&pts);
-    let mut dir = Vec::with_capacity(n);
-    for i in 0..n {
-        let e = pts[(i + 1) % n] - pts[i];
-        dir.push(e * (1.0 / e.length()));
-    }
-    let off = |i: usize| Vec2::new(-dir[i].y, dir[i].x) * d;
-    let mut out = Vec::with_capacity(n);
-    for j in 0..n {
-        let i = (j + n - 1) % n;
-        let q = match line_line2(pts[i] + off(i), dir[i], pts[j] + off(j), dir[j], tol) {
-            Some(q) => q,
-            None => {
-                if dir[i].dot(dir[j]) < 0.0 {
-                    return None; // the loop doubles back on itself
-                }
-                pts[j] + off(j)
-            }
-        };
-        out.push(q);
-    }
-    for i in 0..n {
-        if (out[(i + 1) % n] - out[i]).dot(dir[i]) <= tol.lin {
-            return None;
-        }
-    }
-    if signed_area2(&out) * a0 <= 0.0 {
-        return None;
-    }
-    Some(out)
-}
-
 /// Rectilinear infill of the region the loops bound (even-odd) at `angle` (radians): the span across the lines is cut
 /// into `n = max(1, ceil(span * density / width))` equal cells and a line laid at each cell's middle, clipped by the
 /// scanline, rows alternating direction. Returns the chords and the bead width `pitch * density`, so the deposited
@@ -412,8 +344,17 @@ struct Walls {
 }
 
 fn walls(isl: &Island, p: &SliceParams, tol: Tol) -> Walls {
-    let all: Vec<&Vec<Vec2>> = core::iter::once(&isl.outer).chain(isl.holes.iter()).collect();
-    let inset_all = |d: f64| -> Option<Vec<Vec<Vec2>>> { all.iter().map(|l| inset(l, d, tol)).collect() };
+    // VUGMAKEARCFIT (SR490): the perimeters are the one offset's rings at (k - 1/2)·width, flattened at SLICE_CHORD
+    // (the slice says no arcs: Extrude moves only); an island the offset refuses, or an empty set, is collapsed.
+    let collapsed_walls = Walls { perimeters: Vec::new(), boundary: Vec::new(), collapsed: true };
+    let Ok(lps) = crate::offset::loops(&isl.outer, &isl.holes, tol) else { return collapsed_walls };
+    let chord = p.width * SLICE_CHORD;
+    let inset_all = |d: f64| -> Option<Vec<Vec<Vec2>>> {
+        match crate::offset::rings(&lps, d, tol) {
+            Ok(rs) if !rs.is_empty() => Some(rs.iter().map(|r| crate::offset::flatten(r, chord, tol)).collect()),
+            _ => None,
+        }
+    };
     let mut rings: Vec<Vec<Vec<Vec2>>> = Vec::new();
     let mut collapsed = false;
     for k in 1..=p.perimeters {
@@ -429,6 +370,9 @@ fn walls(isl: &Island, p: &SliceParams, tol: Tol) -> Walls {
     let perimeters = rings.into_iter().rev().flatten().collect();
     Walls { perimeters, boundary, collapsed }
 }
+
+/// The most a flattened perimeter corner arc bulges past the arc, as a fraction of the bead width (VUGMAKEARCFIT SR490).
+const SLICE_CHORD: f64 = 0.05;
 
 /// The soup's layers with their islands and named degenerates.
 pub fn layers(tris: &[[Vec3; 3]], p: &SliceParams, tol: Tol) -> Result<Vec<Layer>, Refusal> {

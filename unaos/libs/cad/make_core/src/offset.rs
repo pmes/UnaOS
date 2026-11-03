@@ -1,28 +1,30 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // Copyright (C) 2026 The Architect & Una
 //
-//! CHARTER: Vug (CODEX §2), seam shared-core — the polygon offset of a pocket's loops (VUGMAKEPOCKET, LEDGER SR479).
+//! CHARTER: Vug (CODEX §2), seam shared-core — the polygon offset of a pocket's loops (VUGMAKEPOCKET, LEDGER SR479), the ONE offset in make_core (VUGMAKEARCFIT, LEDGER SR490: Contour and slice's perimeters ride it too).
 //!
 //! A level `d` is the set of points at distance `d` from the WHOLE boundary (the outline and every island), built
 //! from the original loops each time (no error accumulates ring to ring) without a polygon clipper:
-//! 1. the raw offset of every loop by Contour's corner rule (`op::offset_path`: the offset lines' intersection at a
-//!    corner that turns toward the offset, an arc about the vertex at one that turns away), the arc flattened as a
-//!    CIRCUMSCRIBED tangent polyline, so every point of it is at least `d` from the vertex (it never gouges and leaves
-//!    at most `chord` of material in a reflex corner);
-//! 2. every raw segment split at every crossing with every other one (the one crossing point handed to both);
-//! 3. a piece kept iff its midpoint is no nearer than `d` to the boundary edges — the distance form of the winding
-//!    rule on a validated domain (islands strictly inside the outline, no loop crossing another), so swallowtails, the
-//!    pieces past a collapse and the pieces outside the domain all go, and outline and island rings merge with no
-//!    special case;
-//! 4. the kept pieces chained into closed rings by their shared end points; a chain that does not close refuses
-//!    `NoRings` (never an open path).
+//! 1. the raw offset of every loop by the corner rule (the offset lines' intersection at a corner that turns toward
+//!    the offset, an arc about the vertex at one that turns away), the arc kept EXACT as an [`El::Arc`] (centre the
+//!    vertex, radius `d`, from one tangent point to the other); [`flatten`] gives the circumscribed polyline (every
+//!    point at least `d` from the vertex, at most `chord` of bulge) to a caller that cannot say an arc;
+//! 2. every raw piece split at every crossing with every other one — segment / segment, segment / circle and circle /
+//!    circle through geom_core's closed forms — the one crossing point handed to both;
+//! 3. a piece kept iff its midpoint is no nearer than `d` to the boundary edges (an arc's midpoint is exactly `d` from
+//!    its vertex) — the distance form of the winding rule on a validated domain (islands strictly inside the outline,
+//!    no loop crossing another), so swallowtails, the pieces past a collapse and the pieces outside the domain all go,
+//!    and outline and island rings merge with no special case;
+//! 4. the kept pieces chained into closed rings of segments and arcs by their shared end points; a chain that does not
+//!    close refuses `NoRings` (never an open path).
 //!
 //! Every ring keeps the domain on its left. Only geom names valid on both sides of the geom_core swap are used.
 
 use alloc::vec::Vec;
-use libm::{acos, atan2, ceil, cos, fabs, sin, sqrt};
+use libm::{acos, ceil, cos, fabs, sin, sqrt};
 
-use crate::geom::{Tol, Vec2, line_line2, seg_seg2, signed_area2};
+use crate::geom::{Tol, Vec2, circle_circle2, line_circle2, line_line2, seg_seg2, signed_area2};
+use crate::plan::arc_sweep; // VUGMAKEARCFIT (SR490): the one angle fold for every arc parameter
 use crate::validate::Refusal;
 
 fn len(v: Vec2) -> f64 {
@@ -172,8 +174,129 @@ pub(crate) fn loops(outline: &[Vec2], islands: &[Vec<Vec2>], tol: Tol) -> Result
     Ok(out)
 }
 
-/// The raw offset of one loop to its left by `d`, as a closed polyline.
-fn raw(lp: &[Vec2], d: f64, chord: f64, tol: Tol) -> Vec<Vec2> {
+// ---- VUGMAKEARCFIT (LEDGER SR490): the offset's pieces are segments and exact arcs. ----
+
+/// One piece of an offset ring: a segment, or an arc about `centre` (clockwise when `cw`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum El {
+    Line { from: Vec2, to: Vec2 },
+    Arc { from: Vec2, to: Vec2, centre: Vec2, cw: bool },
+}
+
+fn rot(w: Vec2, th: f64) -> Vec2 {
+    Vec2::new(w.x * cos(th) - w.y * sin(th), w.x * sin(th) + w.y * cos(th))
+}
+
+impl El {
+    pub(crate) fn start(&self) -> Vec2 {
+        match *self {
+            El::Line { from, .. } | El::Arc { from, .. } => from,
+        }
+    }
+
+    pub(crate) fn end(&self) -> Vec2 {
+        match *self {
+            El::Line { to, .. } | El::Arc { to, .. } => to,
+        }
+    }
+
+    /// The same carrier from `q` (a point on it).
+    pub(crate) fn with_from(self, q: Vec2) -> El {
+        match self {
+            El::Line { to, .. } => El::Line { from: q, to },
+            El::Arc { to, centre, cw, .. } => El::Arc { from: q, to, centre, cw },
+        }
+    }
+
+    /// The same carrier to `q` (a point on it).
+    pub(crate) fn with_to(self, q: Vec2) -> El {
+        match self {
+            El::Line { from, .. } => El::Line { from, to: q },
+            El::Arc { from, centre, cw, .. } => El::Arc { from, to: q, centre, cw },
+        }
+    }
+
+    pub(crate) fn reversed(self) -> El {
+        match self {
+            El::Line { from, to } => El::Line { from: to, to: from },
+            El::Arc { from, to, centre, cw } => El::Arc { from: to, to: from, centre, cw: !cw },
+        }
+    }
+
+    /// An arc's swept angle (0 for a segment).
+    fn sweep(&self, tol: Tol) -> f64 {
+        match *self {
+            El::Line { .. } => 0.0,
+            El::Arc { from, to, centre, cw } => arc_sweep(from, to, centre, cw, tol),
+        }
+    }
+
+    fn length(&self, tol: Tol) -> f64 {
+        match *self {
+            El::Line { from, to } => len(to - from),
+            El::Arc { from, centre, .. } => len(from - centre) * self.sweep(tol),
+        }
+    }
+
+    fn mid(&self, tol: Tol) -> Vec2 {
+        match *self {
+            El::Line { from, to } => (from + to) * 0.5,
+            El::Arc { from, centre, cw, .. } => {
+                let h = 0.5 * self.sweep(tol);
+                centre + rot(from - centre, if cw { -h } else { h })
+            }
+        }
+    }
+
+    /// The parameter of `q` (a point on this piece's carrier) when it lies on the closed piece: `t` along a segment,
+    /// the angle swept from `from` along an arc.
+    fn param(&self, q: Vec2, tol: Tol) -> Option<f64> {
+        match *self {
+            El::Line { from, to } => {
+                let e = to - from;
+                if pt_seg(q, from, to) <= tol.lin { Some((q - from).dot(e) / e.dot(e)) } else { None }
+            }
+            El::Arc { from, to, centre, cw } => {
+                if len(q - from) <= tol.lin {
+                    return Some(0.0);
+                }
+                let phi = arc_sweep(from, to, centre, cw, tol);
+                if len(q - to) <= tol.lin {
+                    return Some(phi);
+                }
+                let s = arc_sweep(from, q, centre, cw, tol);
+                if s <= phi { Some(s) } else { None }
+            }
+        }
+    }
+
+    /// Whether `q` is more than `tol.lin` from both ends.
+    fn interior(&self, q: Vec2, tol: Tol) -> bool {
+        len(q - self.start()) > tol.lin && len(q - self.end()) > tol.lin
+    }
+
+    /// The point of the closed piece nearest `p`.
+    fn closest(&self, p: Vec2, tol: Tol) -> Vec2 {
+        match *self {
+            El::Line { from, to } => foot(p, from, to),
+            El::Arc { from, to, centre, .. } => {
+                let w = p - centre;
+                let l = len(w);
+                if l > tol.lin {
+                    let q = centre + w * (len(from - centre) / l);
+                    if self.param(q, tol).is_some() {
+                        return q;
+                    }
+                }
+                if len(p - from) <= len(p - to) { from } else { to }
+            }
+        }
+    }
+}
+
+/// The raw offset of one loop to its left by `d`, as a closed chain of pieces: per edge `i` the segment from vertex
+/// i's exit to vertex i+1's entry, then vertex i+1's corner arc when it turns away from the offset (edge 0 first).
+fn raw(lp: &[Vec2], d: f64, tol: Tol) -> Vec<El> {
     let n = lp.len();
     let dir: Vec<Vec2> = (0..n)
         .map(|i| {
@@ -182,55 +305,92 @@ fn raw(lp: &[Vec2], d: f64, chord: f64, tol: Tol) -> Vec<Vec2> {
         })
         .collect();
     let nor = |i: usize| Vec2::new(-dir[i].y, dir[i].x) * d;
-    // The half angle of one circumscribed chord whose bulge past the arc is `chord`.
-    let h = acos(d / (d + chord));
-    let mut out = Vec::new();
+    let mut entry = alloc::vec![Vec2::default(); n];
+    let mut exit = alloc::vec![Vec2::default(); n];
+    let mut arc = alloc::vec![false; n];
     for j in 0..n {
         let i = (j + n - 1) % n; // the edge into vertex j
         let v = lp[j];
         let turn = dir[i].cross(dir[j]);
         if fabs(turn) <= tol.ang {
-            out.push(v + nor(j));
+            entry[j] = v + nor(j);
+            exit[j] = entry[j];
         } else if turn > 0.0 {
             // Toward the offset: the offset lines' intersection (past a collapse the edge reverses; step 3 drops it).
             match line_line2(lp[i] + nor(i), dir[i], v + nor(j), dir[j], tol) {
-                Some(q) => out.push(q),
+                Some(q) => {
+                    entry[j] = q;
+                    exit[j] = q;
+                }
                 None => {
-                    out.push(v + nor(i));
-                    out.push(v + nor(j));
+                    entry[j] = v + nor(i);
+                    exit[j] = v + nor(j);
                 }
             }
         } else {
-            // Away from the offset: the clockwise arc about v from nor(i) to nor(j), circumscribed.
-            let phi = atan2(-turn, dir[i].dot(dir[j]));
-            let m = ceil(phi / (2.0 * h)).max(1.0);
-            let step = phi / m;
-            let k_out = 1.0 / cos(0.5 * step);
-            let w = nor(i);
-            out.push(v + w);
-            let mut k = 1.0;
-            while k <= m {
-                let th = -(k - 0.5) * step;
-                let r = Vec2::new(w.x * cos(th) - w.y * sin(th), w.x * sin(th) + w.y * cos(th));
-                out.push(v + r * k_out);
-                k += 1.0;
-            }
-            out.push(v + nor(j));
+            // Away from the offset: the clockwise arc about v from nor(i) to nor(j), exact.
+            entry[j] = v + nor(i);
+            exit[j] = v + nor(j);
+            arc[j] = true;
+        }
+    }
+    let mut out = Vec::with_capacity(2 * n);
+    for i in 0..n {
+        let j = (i + 1) % n;
+        out.push(El::Line { from: exit[i], to: entry[j] });
+        if arc[j] {
+            out.push(El::Arc { from: entry[j], to: exit[j], centre: lp[j], cw: true });
+        } else if len(exit[j] - entry[j]) > 0.0 {
+            out.push(El::Line { from: entry[j], to: exit[j] });
         }
     }
     out
 }
 
-/// The rings at distance `d` from the boundary `lps` (from [`loops`]), each closed and with the domain on its left;
-/// empty when nothing of the pocket is that far from its boundary.
-pub(crate) fn rings(lps: &[Vec<Vec2>], d: f64, chord: f64, tol: Tol) -> Result<Vec<Vec<Vec2>>, Refusal> {
-    let mut segs: Vec<(Vec2, Vec2)> = Vec::new();
+/// Where two pieces' carriers meet (segment / segment only when the closed segments touch).
+fn crossings(x: El, y: El, tol: Tol) -> ([Vec2; 2], usize) {
+    match (x, y) {
+        (El::Line { from: p1, to: p2 }, El::Line { from: p3, to: p4 }) => {
+            if !seg_seg2(p1, p2, p3, p4, tol) {
+                return ([p1; 2], 0);
+            }
+            match line_line2(p1, p2 - p1, p3, p4 - p3, tol) {
+                Some(q) => ([q, q], 1),
+                None => ([p1; 2], 0),
+            }
+        }
+        (El::Line { from, to }, El::Arc { from: s, centre, .. })
+        | (El::Arc { from: s, centre, .. }, El::Line { from, to }) => line_circle2(from, to, centre, len(s - centre), tol),
+        (El::Arc { from: s1, centre: c1, .. }, El::Arc { from: s2, centre: c2, .. }) => {
+            circle_circle2(c1, len(s1 - c1), c2, len(s2 - c2), tol)
+        }
+    }
+}
+
+/// A closed ring's exact signed area (the chord polygon plus each arc's circular segment) and its length.
+fn measure(ring: &[El], tol: Tol) -> (f64, f64) {
+    let (mut a, mut per) = (0.0, 0.0);
+    for e in ring {
+        a += 0.5 * e.start().cross(e.end());
+        per += e.length(tol);
+        if let El::Arc { from, centre, cw, .. } = *e {
+            let w = from - centre;
+            let th = e.sweep(tol);
+            let seg = 0.5 * w.dot(w) * (th - sin(th));
+            a += if cw { -seg } else { seg };
+        }
+    }
+    (a, per)
+}
+
+/// The rings at distance `d` from the boundary `lps` (from [`loops`] or [`side_loop`]), each closed, of segments and
+/// exact arcs, with the domain on its left; empty when nothing of the domain is that far from its boundary.
+pub(crate) fn rings(lps: &[Vec<Vec2>], d: f64, tol: Tol) -> Result<Vec<Vec<El>>, Refusal> {
+    let mut segs: Vec<El> = Vec::new();
     for lp in lps {
-        let r = raw(lp, d, chord, tol);
-        for i in 0..r.len() {
-            let (a, b) = edge(&r, i);
-            if len(b - a) > tol.lin {
-                segs.push((a, b));
+        for e in raw(lp, d, tol) {
+            if len(e.end() - e.start()) > tol.lin {
+                segs.push(e);
             }
         }
     }
@@ -238,31 +398,28 @@ pub(crate) fn rings(lps: &[Vec<Vec2>], d: f64, chord: f64, tol: Tol) -> Result<V
     let mut cuts: Vec<Vec<(f64, Vec2)>> = alloc::vec![Vec::new(); k];
     for a in 0..k {
         for b in (a + 1)..k {
-            let ((p1, p2), (p3, p4)) = (segs[a], segs[b]);
-            if !seg_seg2(p1, p2, p3, p4, tol) {
-                continue;
-            }
-            let Some(q) = line_line2(p1, p2 - p1, p3, p4 - p3, tol) else { continue };
-            for s in [a, b] {
-                let (x, y) = segs[s];
-                let e = y - x;
-                let t = (q - x).dot(e) / e.dot(e);
-                if t > 0.0 && t < 1.0 && len(q - x) > tol.lin && len(q - y) > tol.lin {
-                    cuts[s].push((t, q));
+            let (pts, m) = crossings(segs[a], segs[b], tol);
+            for &q in &pts[..m] {
+                let (Some(ta), Some(tb)) = (segs[a].param(q, tol), segs[b].param(q, tol)) else { continue };
+                if segs[a].interior(q, tol) {
+                    cuts[a].push((ta, q));
+                }
+                if segs[b].interior(q, tol) {
+                    cuts[b].push((tb, q));
                 }
             }
         }
     }
-    let mut pieces: Vec<(Vec2, Vec2)> = Vec::new();
+    let mut pieces: Vec<El> = Vec::new();
     for (s, c) in cuts.iter_mut().enumerate() {
-        let (x, y) = segs[s];
+        let e = segs[s];
         c.sort_by(|p, q| p.0.partial_cmp(&q.0).unwrap_or(core::cmp::Ordering::Equal));
-        c.push((1.0, y));
-        let mut from = x;
-        for &(_, q) in c.iter() {
+        let mut from = e.start();
+        for q in c.iter().map(|&(_, q)| q).chain(core::iter::once(e.end())) {
             if len(q - from) > tol.lin {
-                if dist((from + q) * 0.5, lps) >= d - tol.lin {
-                    pieces.push((from, q));
+                let piece = e.with_from(from).with_to(q);
+                if dist(piece.mid(tol), lps) >= d - tol.lin {
+                    pieces.push(piece);
                 }
                 from = q;
             }
@@ -275,38 +432,71 @@ pub(crate) fn rings(lps: &[Vec<Vec2>], d: f64, chord: f64, tol: Tol) -> Result<V
             continue;
         }
         used[s] = true;
-        let start = pieces[s].0;
-        let mut ring = alloc::vec![start];
-        let mut at = pieces[s].1;
-        loop {
-            if near(at, start, tol) {
-                break;
-            }
-            ring.push(at);
-            let Some(nx) = (0..pieces.len()).find(|&c| !used[c] && near(pieces[c].0, at, tol)) else {
+        let start = pieces[s].start();
+        let mut ring = alloc::vec![pieces[s]];
+        let mut at = pieces[s].end();
+        while !near(at, start, tol) {
+            let Some(nx) = (0..pieces.len()).find(|&c| !used[c] && near(pieces[c].start(), at, tol)) else {
                 return Err(Refusal::NoRings);
             };
             used[nx] = true;
-            at = pieces[nx].1;
+            ring.push(pieces[nx]);
+            at = pieces[nx].end();
         }
-        let mut per = 0.0;
-        for i in 0..ring.len() {
-            let (a, b) = edge(&ring, i);
-            per += len(b - a);
-        }
-        if ring.len() >= 3 && fabs(signed_area2(&ring)) > tol.lin * per {
+        let (area, per) = measure(&ring, tol);
+        if ring.len() >= 2 && fabs(area) > tol.lin * per {
             out.push(ring);
         }
     }
     Ok(out)
 }
 
-/// The nearest point of the closed `ring` to `p`: (its distance, the edge index, the point).
-pub(crate) fn nearest(p: Vec2, ring: &[Vec2]) -> (f64, usize, Vec2) {
-    let mut best = (f64::INFINITY, 0, ring[0]);
-    for i in 0..ring.len() {
-        let (a, b) = edge(ring, i);
-        let q = foot(p, a, b);
+/// Contour's one loop: the profile oriented so the side to cut is on its left (Inside counter-clockwise, Outside
+/// clockwise); a profile that crosses itself refuses `ContourSelfIntersects`.
+pub(crate) fn side_loop(profile: &[Vec2], outside: bool, tol: Tol) -> Result<Vec<Vec<Vec2>>, Refusal> {
+    let l = normalise(profile, !outside, tol)?;
+    if self_crosses(&l, tol) {
+        return Err(Refusal::ContourSelfIntersects);
+    }
+    Ok(alloc::vec![l])
+}
+
+/// The ring as a closed polyline, each arc CIRCUMSCRIBED (every point at least its radius from the centre, at most
+/// `chord` of bulge past the arc): for a consumer that cannot say an arc (slice's perimeters).
+pub(crate) fn flatten(ring: &[El], chord: f64, tol: Tol) -> Vec<Vec2> {
+    let mut out = Vec::new();
+    for e in ring {
+        out.push(e.start());
+        if let El::Arc { from, centre, cw, .. } = *e {
+            let w = from - centre;
+            let r = len(w);
+            let phi = e.sweep(tol);
+            // The half angle of one circumscribed chord whose bulge past the arc is `chord`.
+            let h = acos(r / (r + chord));
+            let m = ceil(phi / (2.0 * h)).max(1.0);
+            let step = phi / m;
+            let k_out = 1.0 / cos(0.5 * step);
+            let sg = if cw { -1.0 } else { 1.0 };
+            let mut k = 1.0;
+            while k <= m {
+                out.push(centre + rot(w, sg * (k - 0.5) * step) * k_out);
+                k += 1.0;
+            }
+        }
+    }
+    out
+}
+
+/// The same ring run the other way.
+pub(crate) fn reversed_ring(ring: &[El]) -> Vec<El> {
+    ring.iter().rev().map(|e| e.reversed()).collect()
+}
+
+/// The nearest point of the closed `ring` to `p`: (its distance, the piece index, the point).
+pub(crate) fn nearest(p: Vec2, ring: &[El], tol: Tol) -> (f64, usize, Vec2) {
+    let mut best = (f64::INFINITY, 0, ring[0].start());
+    for (i, e) in ring.iter().enumerate() {
+        let q = e.closest(p, tol);
         let dd = len(p - q);
         if dd < best.0 {
             best = (dd, i, q);
@@ -315,19 +505,25 @@ pub(crate) fn nearest(p: Vec2, ring: &[Vec2]) -> (f64, usize, Vec2) {
     best
 }
 
-/// The same closed ring, in the same direction, starting at `q` on its edge `e`.
-pub(crate) fn start_at(ring: &[Vec2], e: usize, q: Vec2, tol: Tol) -> Vec<Vec2> {
+/// The same closed ring, in the same direction, starting at `q` on its piece `e` and ending exactly at `q`.
+pub(crate) fn start_at(ring: &[El], e: usize, q: Vec2, tol: Tol) -> Vec<El> {
     let n = ring.len();
     let mut out = Vec::with_capacity(n + 1);
-    out.push(q);
-    for k in 1..=n {
-        let v = ring[(e + k) % n];
-        if len(v - out[out.len() - 1]) > tol.lin {
-            out.push(v);
-        }
+    let head = ring[e].with_from(q);
+    if len(head.end() - q) > tol.lin {
+        out.push(head);
     }
-    while out.len() > 1 && len(out[out.len() - 1] - q) <= tol.lin {
-        out.pop();
+    for k in 1..n {
+        out.push(ring[(e + k) % n]);
+    }
+    let tail = ring[e].with_to(q);
+    if len(q - tail.start()) > tol.lin {
+        out.push(tail);
+    } else if let Some(l) = out.last_mut() {
+        *l = l.with_to(q);
+    }
+    if let Some(f) = out.first_mut() {
+        *f = f.with_from(q);
     }
     out
 }
