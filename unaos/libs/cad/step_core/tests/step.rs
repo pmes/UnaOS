@@ -234,3 +234,210 @@ fn string_escapes_round_trip() {
     let t = p21::parse(&s).unwrap();
     assert_eq!(t.header("FILE_DESCRIPTION").unwrap().params[0], p21::Param::List(vec![p21::Param::Str("\u{e4}\u{e9}".into())]));
 }
+
+// VUGBREP3TORUSSTEP (SR530): the torus fillet (VUGBREP3TORUS SR519) and the cone chamfer of a boss / hole rim meet
+// STEP. write -> read keeps validate, the genus, the arena counts, the mass (`round_trip`), every vertex and edge, and per
+// face its surface (radii, frame) and uv spans; the Names (Import / Entity), the face order and a whole turn of a
+// parameter start (the seam's placement in u, a torus's v) may change.
+
+use brep_core::{Id, Surface, chamfer, difference, fillet, union};
+use std::collections::{BTreeMap, BTreeSet};
+
+/// An angle start compared modulo TAU: T.lin per millimetre of radius (every radius here is 2 mm or more).
+const ANG: f64 = 1e-6;
+
+/// The radius `r` cylinder from `at` up `h` along +z: `primitives::cylinder`'s own revolve, placed by its frame.
+fn placed_cylinder(r: f64, h: f64, at: Vec3) -> Brep {
+    let p = Profile { outer: lines(&rect(0.0, 0.0, r, h)), holes: vec![] };
+    let f = Frame::new(at, -Vec3::Y, Vec3::X).unwrap();
+    revolve(&p, &f, Vec2::new(0.0, 0.0), Vec2::new(0.0, 1.0), TAU, T).unwrap()
+}
+
+/// brep_core tests/fillet.rs `boss`: the R 10 cylinder from z 5 to 30 at (20, 20) united with the 40 x 40 x 10 plate.
+fn boss() -> Brep {
+    let tool = placed_cylinder(10.0, 25.0, Vec3::new(20.0, 20.0, 5.0));
+    union(&box_(40.0, 40.0, 10.0, T).unwrap(), &tool, T).expect("union")
+}
+
+/// brep_core tests/fillet.rs `holed`: the 40 x 40 x 10 plate with the R 10 through hole at (20, 20).
+fn holed() -> Brep {
+    let tool = placed_cylinder(10.0, 12.0, Vec3::new(20.0, 20.0, -1.0));
+    difference(&box_(40.0, 40.0, 10.0, T).unwrap(), &tool, T).expect("difference")
+}
+
+/// The Id of the one radius-`r` circle edge at height `z`.
+fn rim(b: &Brep, z: f64, r: f64) -> Id {
+    let hits: Vec<Id> = b
+        .edges
+        .iter()
+        .filter(|e| matches!(e.curve, Curve::Circle { r: cr, .. } if (cr - r).abs() < 1e-9))
+        .filter(|e| (b.vertices[e.v[0] as usize].p.z - z).abs() < 1e-9)
+        .map(|e| e.id)
+        .collect();
+    assert_eq!(hits.len(), 1, "one radius {r} circle edge at z {z}");
+    hits[0]
+}
+
+/// The spandrel (the r x r corner square less the quarter disc): its area and its centroid's distance from the corner.
+fn spandrel(r: f64) -> (f64, f64) {
+    ((1.0 - PI / 4.0) * r * r, r * (10.0 - 3.0 * PI) / (12.0 - 3.0 * PI))
+}
+
+fn same_mod_tau(a: f64, b: f64, eps: f64) -> bool {
+    let d = (a - b) / TAU;
+    ((d - d.round()) * TAU).abs() <= eps
+}
+
+fn near12(a: f64, b: f64) -> bool {
+    (a - b).abs() <= 1e-12 * a.abs().max(1.0)
+}
+
+fn frame_eq(a: &Frame, b: &Frame) -> bool {
+    a.o.dist(b.o) < 1e-9 && a.z.dot(b.z) > 1.0 - 1e-12 && a.x.dot(b.x) > 1.0 - 1e-12
+}
+
+fn surface_eq(a: &Surface, b: &Surface) -> bool {
+    match (a, b) {
+        (Surface::Plane { f: fa }, Surface::Plane { f: fb }) => frame_eq(fa, fb),
+        (Surface::Cylinder { f: fa, r: ra }, Surface::Cylinder { f: fb, r: rb }) => frame_eq(fa, fb) && near12(*ra, *rb),
+        (Surface::Cone { f: fa, r0: ra, k: ka }, Surface::Cone { f: fb, r0: rb, k: kb }) => {
+            frame_eq(fa, fb) && near12(*ra, *rb) && near12(*ka, *kb)
+        }
+        (Surface::Sphere { f: fa, r: ra }, Surface::Sphere { f: fb, r: rb }) => frame_eq(fa, fb) && near12(*ra, *rb),
+        (Surface::Torus { f: fa, major: ma, minor: na }, Surface::Torus { f: fb, major: mb, minor: nb }) => {
+            frame_eq(fa, fb) && near12(*ma, *mb) && near12(*na, *nb)
+        }
+        _ => false,
+    }
+}
+
+/// The edge indices a face's loops use (faces mint in shell order, edges in arena order: this matches a face across
+/// the round trip).
+fn face_key(b: &Brep, fi: usize) -> BTreeSet<u32> {
+    let mut k = BTreeSet::new();
+    for l in b.face_loops(fi as u32) {
+        for &c in &b.loops[l as usize].coedges {
+            k.insert(b.coedges[c as usize].edge);
+        }
+    }
+    k
+}
+
+/// The measured list beyond `round_trip`: the genus, every vertex and edge by arena index, every face (matched by its
+/// edges) with its `reversed`, surface and uv spans; a parameter start may move by a whole turn.
+fn compare(src: &Brep, back: &Brep, what: &str) {
+    assert_eq!(validate(src, T).unwrap().genus, validate(back, T).unwrap().genus, "{what}: genus");
+    for (i, (a, b)) in src.vertices.iter().zip(&back.vertices).enumerate() {
+        assert!(a.p.dist(b.p) < 1e-9, "{what}: vertex {i} {:?} vs {:?}", a.p, b.p);
+    }
+    for (i, (a, b)) in src.edges.iter().zip(&back.edges).enumerate() {
+        assert_eq!(a.v, b.v, "{what}: edge {i} vertices");
+        let (sa, sb) = (a.t1 - a.t0, b.t1 - b.t0);
+        assert!((sa - sb).abs() < 1e-9, "{what}: edge {i} span {sa} vs {sb}");
+        match (&a.curve, &b.curve) {
+            (Curve::Line { o: oa, dir: da }, Curve::Line { o: ob, dir: db }) => {
+                assert!(oa.dist(*ob) < 1e-9 && da.dot(*db) > 1.0 - 1e-12, "{what}: edge {i} line");
+            }
+            (Curve::Circle { f: fa, r: ra }, Curve::Circle { f: fb, r: rb }) => {
+                assert!(near12(*ra, *rb), "{what}: edge {i} radius {ra} vs {rb}");
+                assert!(fa.o.dist(fb.o) < 1e-9 && fa.z.dot(fb.z) > 1.0 - 1e-12, "{what}: edge {i} circle frame");
+                assert!(same_mod_tau(a.t0, b.t0, T.lin / ra), "{what}: edge {i} start {} vs {}", a.t0, b.t0);
+            }
+            (x, y) => panic!("{what}: edge {i} curve {x:?} vs {y:?}"),
+        }
+    }
+    let mut by_key: BTreeMap<BTreeSet<u32>, usize> = BTreeMap::new();
+    for fi in 0..back.faces.len() {
+        assert!(by_key.insert(face_key(back, fi), fi).is_none(), "{what}: read face {fi} shares its edges");
+    }
+    for (fi, f) in src.faces.iter().enumerate() {
+        let k = face_key(src, fi);
+        let Some(&bi) = by_key.get(&k) else { panic!("{what}: no read face over the edges {k:?} of face {fi}") };
+        let g = &back.faces[bi];
+        assert_eq!(f.reversed, g.reversed, "{what}: face {fi} reversed");
+        assert!(surface_eq(&f.surface, &g.surface), "{what}: face {fi} surface {:?} vs {:?}", f.surface, g.surface);
+        match (f.uv, g.uv) {
+            (None, None) => {}
+            (Some(a), Some(b)) => {
+                assert!(((a.u1 - a.u0) - (b.u1 - b.u0)).abs() < 1e-9, "{what}: face {fi} u span {a:?} vs {b:?}");
+                assert!(((a.v1 - a.v0) - (b.v1 - b.v0)).abs() < 1e-9, "{what}: face {fi} v span {a:?} vs {b:?}");
+                assert!(same_mod_tau(a.u0, b.u0, ANG), "{what}: face {fi} u0 {a:?} vs {b:?}");
+                let v0 = if matches!(f.surface, Surface::Torus { .. }) {
+                    same_mod_tau(a.v0, b.v0, ANG)
+                } else {
+                    (a.v0 - b.v0).abs() < 1e-9
+                };
+                assert!(v0, "{what}: face {fi} v0 {a:?} vs {b:?}");
+            }
+            (a, b) => panic!("{what}: face {fi} uv {a:?} vs {b:?}"),
+        }
+    }
+}
+
+/// write (exactly one `entity` in the text) -> read -> `round_trip` -> `compare`; the read Brep.
+fn blend_round_trip(src: &Brep, entity: &str, what: &str) -> Brep {
+    let text = write(std::slice::from_ref(src), &hdr(), T).unwrap_or_else(|e| panic!("{what}: write: {e:?}"));
+    assert_eq!(text.matches(entity).count(), 1, "{what}: one {entity}");
+    let back = round_trip(src, what);
+    compare(src, &back, what);
+    back
+}
+
+/// The one face of `b` on a surface `pick` accepts; its Name is the import's (the blend's Fillet / Chamfer Name is a
+/// legitimate change).
+fn the_face<'a>(b: &'a Brep, pick: impl Fn(&Surface) -> bool, what: &str) -> &'a brep_core::Face {
+    let hits: Vec<&brep_core::Face> = b.faces.iter().filter(|f| pick(&f.surface)).collect();
+    assert_eq!(hits.len(), 1, "{what}: one blend face");
+    assert_eq!((hits[0].name.op, hits[0].name.role), (OpKind::Import, Role::Entity), "{what}: the import's Name");
+    hits[0]
+}
+
+fn torus_check(b: &Brep, major: f64, minor: f64, reversed: bool, what: &str) {
+    let f = the_face(b, |s| matches!(s, Surface::Torus { .. }), what);
+    let Surface::Torus { major: m, minor: n, .. } = f.surface else { unreachable!() };
+    assert!(near12(m, major) && near12(n, minor), "{what}: major {m} minor {n}");
+    assert_eq!(f.reversed, reversed, "{what}: reversed");
+    let uv = f.uv.expect("a torus uv box");
+    assert!((uv.v1 - uv.v0 - PI / 2.0).abs() < 1e-9, "{what}: the quarter {uv:?}");
+}
+
+#[test]
+fn filleted_boss_rims_round_trip_their_torus_quarters() {
+    let (area, d) = spandrel(2.0);
+    let a = boss();
+    // (rim height, -1 convex / +1 concave, major, reversed)
+    for (z, s, major, reversed, what) in [(30.0, -1.0, 8.0, false, "boss top rim"), (10.0, 1.0, 12.0, true, "boss base rim")] {
+        let r = fillet(&a, &[rim(&a, z, 10.0)], 2.0, T).expect(what);
+        let back = blend_round_trip(&r, "TOROIDAL_SURFACE(", what);
+        torus_check(&back, major, 2.0, reversed, what);
+        let want = 16000.0 + 2000.0 * PI + s * 2.0 * PI * (10.0 + s * d) * area;
+        assert!(rel(properties(&back, T).unwrap().volume, want) < 1e-6, "{what}: Pappus");
+    }
+}
+
+#[test]
+fn filleted_hole_rim_round_trips_the_outer_torus() {
+    let (area, d) = spandrel(2.0);
+    let a = holed();
+    let r = fillet(&a, &[rim(&a, 10.0, 10.0)], 2.0, T).expect("fillet");
+    let back = blend_round_trip(&r, "TOROIDAL_SURFACE(", "hole rim");
+    torus_check(&back, 12.0, 2.0, false, "hole rim");
+    assert_eq!(validate(&back, T).unwrap().genus, vec![1]);
+    let want = 16000.0 - 1000.0 * PI - 2.0 * PI * (10.0 + d) * area;
+    assert!(rel(properties(&back, T).unwrap().volume, want) < 1e-6, "hole rim: Pappus");
+}
+
+#[test]
+fn chamfered_boss_rim_round_trips_its_cone_frustum() {
+    let a = boss();
+    let (d1, d2) = (2.0, 3.0);
+    let r = chamfer(&a, &[rim(&a, 30.0, 10.0)], d1, d2, T).expect("chamfer");
+    let back = blend_round_trip(&r, "CONICAL_SURFACE(", "boss rim chamfer");
+    let f = the_face(&back, |s| matches!(s, Surface::Cone { .. }), "boss rim chamfer");
+    let Surface::Cone { r0, k, .. } = f.surface else { unreachable!() };
+    assert!(near12(r0, 8.0) && near12(k, 2.0 / 3.0), "r0 {r0} k {k}");
+    let uv = f.uv.expect("a cone uv box");
+    assert!((uv.v1 - uv.v0 - d2).abs() < 1e-9, "the frustum {uv:?}");
+    let want = 16000.0 + 2000.0 * PI - 2.0 * PI * (10.0 - d1 / 3.0) * (d1 * d2 / 2.0);
+    assert!(rel(properties(&back, T).unwrap().volume, want) < 1e-6, "boss rim chamfer: Pappus");
+}
