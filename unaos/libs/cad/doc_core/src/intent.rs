@@ -555,7 +555,7 @@ impl ShapeRef {
 const DEG: f64 = 180.0 / PI;
 
 /// The unsigned angle between two axes (degrees, 0..=90); a zero axis is 90.
-fn axis_deg(a: Vec3, b: Vec3) -> f64 {
+pub(crate) fn axis_deg(a: Vec3, b: Vec3) -> f64 {
     match (a.normalize(), b.normalize()) {
         (Ok(a), Ok(b)) => libm::atan2(a.cross(b).mag(), a.dot(b).abs()) * DEG,
         _ => 90.0,
@@ -564,7 +564,7 @@ fn axis_deg(a: Vec3, b: Vec3) -> f64 {
 
 /// (distance in mm, angle in degrees) between a measured shape and a face surface of the same kind; None for another
 /// kind (a cone face with no slope is no cone partner).
-fn pair(s: &ShapeParams, f: &brep_core::Surface) -> Option<(f64, f64)> {
+pub(crate) fn pair(s: &ShapeParams, f: &brep_core::Surface) -> Option<(f64, f64)> {
     use brep_core::Surface;
     match (s, f) {
         (ShapeParams::Plane { normal, d }, Surface::Plane { f }) => {

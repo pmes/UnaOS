@@ -361,3 +361,102 @@ fn the_iso_tables() {
     assert_eq!(nearest_standard(7.7, 0.1), None);
     assert_eq!(nearest_standard(6.4, f64::NAN), None);
 }
+
+// ---- VUGINTENTFEATURES (SR536): a boss or a pocket from a cylinder standing on a document face ----
+
+/// A `w` x `h` x `t` plate with no holes, drawn at round values.
+fn plate(w: f64, h: f64, t: f64) -> String {
+    format!(
+        "vug-doc version=1 lin=1e-6 ang=1e-9
+sketch s o=[0 0 0] z=[0 0 1] x=[1 0 0]
+point p1 sketch=s x=0 y=0
+point p2 sketch=s x={w} y=0
+point p3 sketch=s x={w} y={h}
+point p4 sketch=s x=0 y={h}
+line l1 sketch=s a=p1 b=p2
+line l2 sketch=s a=p2 b=p3
+line l3 sketch=s a=p3 b=p4
+line l4 sketch=s a=p4 b=p1
+extrude e1 sketch=s outer=l1 dir=[0 0 1] length={t}
+"
+    )
+}
+
+/// The proposals whose why starts with `kind:` (a feature set: four statements sharing one why).
+fn feature_set<'a>(ps: &'a [Proposal], kind: &str) -> Vec<&'a Proposal> {
+    ps.iter().filter(|p| p.why.starts_with(kind)).collect()
+}
+
+#[test]
+fn a_boss_on_the_plate_proposes_one_extrude_set() {
+    let d = doc(&plate(80.0, 60.0, 10.0));
+    // The boss: r 7.95, its support centroid 6.05 mm above the plate top (a 12.1 mm boss); no boss-top plane (option C:
+    // a face only the set models would refuse its leading lines by Residual, VUG-INTENT-SET-VERIFY owed).
+    let mut s = box_planes(80.0, 60.0, 10.0);
+    s.push(cyl(v(40.0, 30.0, 16.05), 7.95, 900, 0.2));
+    let m = shapes(s);
+    let ps = suggest(&d, &m);
+    let set = feature_set(&ps, "boss:");
+    assert_eq!(set.len(), 4, "{:?}", stmts(&ps));
+    assert!(feature_set(&ps, "pocket:").is_empty(), "{:?}", stmts(&ps));
+    let a = set[0].stmt.split(' ').nth(1).unwrap();
+    let n: u32 = a[1..].parse().unwrap();
+    let (b, c, x) = (format!("i{}", n + 1), format!("i{}", n + 2), format!("i{}", n + 3));
+    assert_eq!(
+        set.iter().map(|p| p.stmt.as_str()).collect::<Vec<_>>(),
+        [
+            format!("sketch {a} o=[40 30 10] z=[0 0 1] x=[1 0 0]"),
+            format!("point {b} sketch={a} x=0 y=0"),
+            format!("circle {c} sketch={a} centre={b} r=8"),
+            format!("extrude {x} sketch={a} outer={c} dir=[0 0 1] length=12"),
+        ]
+    );
+    assert!(set.iter().all(|p| p.why == set[0].why), "one set shares one why");
+    assert!(set[0].why.contains("the support centroid"), "{}", set[0].why);
+    assert!(set.iter().all(|p| p.confidence > 0.5), "{}", set[0].confidence);
+    let len: f64 = set[3].stmt.rsplit("length=").next().unwrap().parse().unwrap();
+    assert!((len - 12.1).abs() <= SIGMA, "the boss height {} within sigma of the measured 12.1", len);
+    // The set comes after every sketch rule.
+    assert_eq!(ps.iter().position(|p| p.why.starts_with("boss:")).unwrap() + 4, ps.len());
+    let bt = verify_all(&d, &ps, &m, d.tol);
+    assert_eq!(bt.accepted(), ps.len(), "{}", bt.text());
+    // Refused: a pin whose span a measured plane crosses (centroid at z=30, a face at z=20) has no end on the plate top
+    // within 3 sigma, so no feature is proposed.
+    let mut s = box_planes(80.0, 60.0, 10.0);
+    s.push(plane(v(0.0, 0.0, 1.0), 20.0, 300, 0.2));
+    s.push(cyl(v(40.0, 30.0, 30.0), 4.0, 600, 0.2));
+    let ps = suggest(&d, &shapes(s));
+    assert!(feature_set(&ps, "boss:").is_empty() && feature_set(&ps, "pocket:").is_empty(), "{:?}", stmts(&ps));
+}
+
+#[test]
+fn a_through_hole_proposes_the_pocket_set_with_the_plate_thickness() {
+    let d = doc(&plate(60.0, 40.0, 8.0));
+    // The top seen more than the bottom; the r 3.28 hole's support centroid mid-plate, below the top plane.
+    let mut s = box_planes(60.0, 40.0, 8.0);
+    s[0] = plane(v(0.0, 0.0, 1.0), 0.0, 3000, 0.2);
+    s[1] = plane(v(0.0, 0.0, 1.0), 8.0, 5000, 0.2);
+    s.push(cyl(v(30.0, 20.0, 4.0), 3.28, 500, 0.2));
+    let m = shapes(s);
+    let ps = suggest(&d, &m);
+    let set = feature_set(&ps, "pocket:");
+    assert_eq!(set.len(), 4, "{:?}", stmts(&ps));
+    assert!(feature_set(&ps, "boss:").is_empty(), "{:?}", stmts(&ps));
+    let a = set[0].stmt.split(' ').nth(1).unwrap();
+    let n: u32 = a[1..].parse().unwrap();
+    let (b, c, x) = (format!("i{}", n + 1), format!("i{}", n + 2), format!("i{}", n + 3));
+    assert_eq!(
+        set.iter().map(|p| p.stmt.as_str()).collect::<Vec<_>>(),
+        [
+            format!("sketch {a} o=[30 20 8] z=[0 0 -1] x=[1 0 0]"),
+            format!("point {b} sketch={a} x=0 y=0"),
+            format!("circle {c} sketch={a} centre={b} r=3.3"),
+            format!("extrude {x} sketch={a} outer={c} dir=[0 0 -1] length=8"),
+        ]
+    );
+    assert!(set[0].why.contains("on plane #1") && set[0].why.contains("far-end plane #0"), "{}", set[0].why);
+    assert!(set[0].why.contains("ISO 273 medium clearance for M6"), "{}", set[0].why);
+    assert!((set[0].confidence - (1.0 - 0.04 / SIGMA)).abs() < 1e-9, "{}", set[0].confidence);
+    let bt = verify_all(&d, &ps, &m, d.tol);
+    assert_eq!(bt.accepted(), ps.len(), "{}", bt.text());
+}
