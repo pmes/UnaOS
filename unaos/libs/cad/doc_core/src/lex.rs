@@ -645,7 +645,8 @@ fn statement(t: Toks, line: u32, st: &mut State) -> Result<Stmt, Refusal> {
                     let nv = f.req("nof")?;
                     let nof = int_max(&nv, "nof", line, u8::MAX as u64)? as u8;
                     let sig = f.f64("sig")?;
-                    Stmt::Tool(Tool { number, kind, dc, lf, apmx, nof, sig })
+                    // VUGMAKERAMP (SR532): the grammar carries no ramp angle yet (VUG-MAKE-RAMP-DOC).
+                    Stmt::Tool(Tool { number, kind, dc, lf, apmx, nof, sig, ramp_deg: None })
                 }
                 "stock" => {
                     if st.stock {

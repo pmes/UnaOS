@@ -4,7 +4,8 @@
 //! The manufacturing intent attached to the design (BP-vug-3) and the toolpath generators for it.
 //!
 //! Generated today: `Drill` (a peck cycle as explicit moves), `Contour` (one closed profile offset by the tool
-//! radius), `Pocket2_5D` (level-set rings inside-out, islands merged, a helical entry) and `Face` (zigzag passes over
+//! radius), `Pocket2_5D` (level-set rings inside-out, islands merged, a helical entry, or the tool's ramp or helix at
+//! its `ramp_deg`: VUGMAKERAMP SR532) and `Face` (zigzag passes over
 //! a rectangle, entered from the side). The rest refuse by name with their owed id.
 
 use alloc::vec::Vec;
@@ -37,8 +38,8 @@ pub enum Op {
     Drill { points: Vec<Vec2>, top: f64, depth: f64, peck: f64, tool: u32, feeds: Feeds },
     Contour { profile: Vec<Vec2>, top: f64, depth: f64, side: Side, tool: u32, feeds: Feeds },
     /// `chord`: the most material a flattened corner arc may leave (validated positive; the pocket emits its corner
-    /// arcs exact as G2 / G3 since VUGMAKEARCFIT SR490, so it bounds only a consumer that flattens); `climb`: climb
-    /// milling with the M3 spindle.
+    /// arcs exact as G2 / G3 since VUGMAKEARCFIT SR490, so it bounds only a consumer that flattens: the ramp entry
+    /// rides the first ring flattened at `chord`, VUGMAKERAMP SR532); `climb`: climb milling with the M3 spindle.
     Pocket2_5D {
         outline: Vec<Vec2>,
         islands: Vec<Vec<Vec2>>,
@@ -252,14 +253,18 @@ pub(crate) fn centre_cutting(t: &Tool) -> bool {
 
 /// Down from the safe Z into the cut at `z` beside ring point `c`: fed to the cleared `floor`, then a helix of radius
 /// min(r/2, `room`) about `c` at the plunge feed (full turns to `z`, one flat turn, a line to `c`), or, with less than
-/// r/4 of room, a straight plunge for a centre-cutting tool and `NoEntry` for any other.
+/// r/4 of room, a straight plunge for a centre-cutting tool and `NoEntry` for any other. A tool with a `ramp_deg`
+/// enters by [`ramp_entry`] instead (VUGMAKERAMP SR532: a ramp along `ring`, which starts at `c`, or a helix at the
+/// angle), falling back to the plunge or `NoEntry` only when neither fits.
 #[allow(clippy::too_many_arguments)]
 fn enter(
     p: &mut Program,
     m: &Machine,
     t: &Tool,
     c: Vec2,
+    ring: &[El],
     room: f64,
+    chord: f64,
     floor: f64,
     z: f64,
     cw: bool,
@@ -268,18 +273,15 @@ fn enter(
 ) -> Result<(), Refusal> {
     let r = t.radius();
     let rh = (0.5 * r).min(room);
-    if rh >= 0.25 * r {
-        let s = c + Vec2::new(rh, 0.0);
-        p.moves.push(Move::Rapid { to: Vec3::new(s.x, s.y, m.safe_z) });
-        p.moves.push(Move::Linear { to: Vec3::new(s.x, s.y, floor), feed: f.plunge });
-        let pitch = 2.0 * core::f64::consts::PI * rh * HELIX_SLOPE;
-        let turns = ceil((floor - z - tol.lin) / pitch).max(1.0) as usize;
-        for k in 1..=turns {
-            let zk = floor - (floor - z) * (k as f64) / (turns as f64);
-            p.moves.push(Move::Arc { to: Vec3::new(s.x, s.y, zk), centre: c, cw, feed: f.plunge });
-        }
-        p.moves.push(Move::Arc { to: Vec3::new(s.x, s.y, z), centre: c, cw, feed: f.plunge });
-        p.moves.push(Move::Linear { to: Vec3::new(c.x, c.y, z), feed: f.feed });
+    // VUGMAKERAMP (SR532): the entry chooser — the maker's angle governs when the tool carries one.
+    let ramped = match t.ramp_deg {
+        Some(a) => ramp_entry(p, m, t, ring, a, chord, floor, z, cw, f, tol)?,
+        None => false,
+    };
+    if ramped {
+        // Entered at the ramp angle: ramped along the ring or helixed about its deepest point.
+    } else if t.ramp_deg.is_none() && rh >= 0.25 * r {
+        helix(p, m, c, rh, HELIX_SLOPE, floor, z, cw, c, f, tol); // VUGMAKERAMP (SR532): the one helix
     } else if centre_cutting(t) {
         p.moves.push(Move::Rapid { to: Vec3::new(c.x, c.y, m.safe_z) });
         p.moves.push(Move::Linear { to: Vec3::new(c.x, c.y, floor), feed: f.plunge });
@@ -325,6 +327,12 @@ fn pocket(
     }
     if !(chord > tol.lin) {
         return Err(Refusal::BadParameter { what: "chord not positive" });
+    }
+    if let Some(a) = t.ramp_deg {
+        // VUGMAKERAMP (SR532): the ramp angle a maker can mean.
+        if !(a > 0.0 && a < 90.0) {
+            return Err(Refusal::BadParameter { what: "ramp angle outside (0, 90) degrees" });
+        }
     }
     let lps = crate::offset::loops(outline, islands, tol)?;
     let mut levels = levels(&lps, r, stepover, tool, tol)?; // VUGMAKEREST (SR517): the ring set, shared with the rest
@@ -375,7 +383,7 @@ fn pocket(
                             p.moves.push(Move::Linear { to: Vec3::new(pd.x, pd.y, z), feed: f.plunge });
                             p.moves.push(Move::Linear { to: Vec3::new(q2.x, q2.y, z), feed: f.feed });
                         }
-                        None => enter(&mut p, m, &t, ring[0].start(), stepover * (k as f64), floor, z, climb, f, tol)?,
+                        None => enter(&mut p, m, &t, ring[0].start(), &ring, stepover * (k as f64), chord, floor, z, climb, f, tol)?,
                     }
                 }
                 let c = ring[0].start();
@@ -508,4 +516,138 @@ pub(crate) fn levels(
         return Err(Refusal::ToolTooLarge { tool });
     }
     Ok(levels)
+}
+
+// ---- VUGMAKERAMP (LEDGER SR532): the ramp and helix entry at the tool's ramp angle. ----
+
+/// The helix down into the cut at `z`: a rapid to `c` + (rh, 0) at the safe Z, fed to the cleared `floor`, full turns
+/// about `c` at the plunge feed with a rise of `slope` over the run (pitch 2π·rh·slope) to `z`, one flat turn, and a
+/// line at the cutting feed to `then`. `enter`'s helix about the ring point and the ramp angle's helix about the ring's
+/// deepest point are both this one.
+#[allow(clippy::too_many_arguments)]
+fn helix(
+    p: &mut Program,
+    m: &Machine,
+    c: Vec2,
+    rh: f64,
+    slope: f64,
+    floor: f64,
+    z: f64,
+    cw: bool,
+    then: Vec2,
+    f: &Feeds,
+    tol: Tol,
+) {
+    let s = c + Vec2::new(rh, 0.0);
+    p.moves.push(Move::Rapid { to: Vec3::new(s.x, s.y, m.safe_z) });
+    p.moves.push(Move::Linear { to: Vec3::new(s.x, s.y, floor), feed: f.plunge });
+    let pitch = 2.0 * core::f64::consts::PI * rh * slope;
+    let turns = ceil((floor - z - tol.lin) / pitch).max(1.0) as usize;
+    for k in 1..=turns {
+        let zk = floor - (floor - z) * (k as f64) / (turns as f64);
+        p.moves.push(Move::Arc { to: Vec3::new(s.x, s.y, zk), centre: c, cw, feed: f.plunge });
+    }
+    p.moves.push(Move::Arc { to: Vec3::new(s.x, s.y, z), centre: c, cw, feed: f.plunge });
+    p.moves.push(Move::Linear { to: Vec3::new(then.x, then.y, z), feed: f.feed });
+}
+
+/// The entry at the tool's ramp angle `deg` into `ring` (which the caller then cuts whole at `z`): with the ring
+/// flattened at `chord` ([`crate::offset::flatten`], arcs circumscribed: never toward the boundary) of length P and the
+/// ramp's run L = (floor - z) / tan(deg), a RAMP when P >= L (G1 with Z down the ring from its start, then the lap
+/// flat); else a HELIX about the ring's deepest point at radius min(rho, r - tol) (under the tool radius: no post is
+/// left at its centre) when that is at least `ARC_MIN_CHORD` (a smaller full-turn arc's centre offset is under the
+/// writers' 1e-4 grid); else false (the caller plunges a centre-cutting tool or refuses `NoEntry`).
+#[allow(clippy::too_many_arguments)]
+fn ramp_entry(
+    p: &mut Program,
+    m: &Machine,
+    t: &Tool,
+    ring: &[El],
+    deg: f64,
+    chord: f64,
+    floor: f64,
+    z: f64,
+    cw: bool,
+    f: &Feeds,
+    tol: Tol,
+) -> Result<bool, Refusal> {
+    let poly = crate::offset::flatten(ring, chord, tol);
+    let n = poly.len();
+    let per: f64 = (0..n).map(|i| (poly[(i + 1) % n] - poly[i]).length()).sum();
+    let slope = libm::tan(deg * (core::f64::consts::PI / 180.0));
+    let run = (floor - z) / slope;
+    if per >= run - tol.lin {
+        let s0 = poly[0];
+        p.moves.push(Move::Rapid { to: Vec3::new(s0.x, s0.y, m.safe_z) });
+        p.moves.push(Move::Linear { to: Vec3::new(s0.x, s0.y, floor), feed: f.plunge });
+        ramp_emit(p, &poly, floor, z, run, f, tol);
+        return Ok(true);
+    }
+    let (c, rho) = inscribed(&poly, per, tol)?;
+    let rh = rho.min(t.radius() - tol.lin);
+    if rh >= ARC_MIN_CHORD {
+        helix(p, m, c, rh, slope, floor, z, cw, ring[0].start(), f, tol);
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+/// The ramp along the closed polyline `poly` from its first point at `floor`: G1 with Z falling linearly with the
+/// path length (|dz / dxy| = (floor - z) / `run`), wrapping the ring if `run` asks for it, the segment where it
+/// reaches `z` split there, then the rest of that lap flat at `z` back to the first point at the cutting feed.
+fn ramp_emit(p: &mut Program, poly: &[Vec2], floor: f64, z: f64, run: f64, f: &Feeds, tol: Tol) {
+    let n = poly.len();
+    let (mut s, mut i, mut at) = (0.0, 0usize, poly[0]);
+    while s < run {
+        let b = poly[(i + 1) % n];
+        let l = (b - at).length();
+        if s + l >= run {
+            let q = at + (b - at) * ((run - s) / l);
+            p.moves.push(Move::Linear { to: Vec3::new(q.x, q.y, z), feed: f.plunge });
+            at = q;
+            break;
+        }
+        s += l;
+        p.moves.push(Move::Linear { to: Vec3::new(b.x, b.y, floor - (floor - z) * s / run), feed: f.plunge });
+        at = b;
+        i += 1;
+    }
+    loop {
+        i += 1;
+        let b = poly[i % n];
+        if (b - at).length() > tol.lin {
+            p.moves.push(Move::Linear { to: Vec3::new(b.x, b.y, z), feed: f.feed });
+        }
+        at = b;
+        if i % n == 0 {
+            break;
+        }
+    }
+}
+
+/// The deepest point of the region inside the closed polyline `poly` (length `per`) and its distance to `poly`: the
+/// offset ([`crate::offset::rings`], the one offset) bisected on d in [0, per / 2π] (no inscribed circle is longer
+/// than its ring) to `tol.lin`, the point a vertex of the deepest non-empty ring, so its distance is exactly that d.
+fn inscribed(poly: &[Vec2], per: f64, tol: Tol) -> Result<(Vec2, f64), Refusal> {
+    let mut lp = poly.to_vec();
+    if crate::geom::signed_area2(&lp) < 0.0 {
+        lp.reverse();
+    }
+    let lps = alloc::vec![lp];
+    let (mut lo, mut hi) = (0.0, per / (2.0 * core::f64::consts::PI));
+    let mut best = (poly[0], 0.0);
+    let mut k = 0;
+    while hi - lo > tol.lin && k < 64 {
+        let d = 0.5 * (lo + hi);
+        let rs = crate::offset::rings(&lps, d, tol)?;
+        match rs.first() {
+            Some(ring) => {
+                lo = d;
+                best = (ring[0].start(), d);
+            }
+            None => hi = d,
+        }
+        k += 1;
+    }
+    Ok(best)
 }

@@ -4,6 +4,8 @@
 //! VUGMAKEPOCKET (LEDGER SR479): the pocket's ring count against a hand computation, every move of a pocket inside
 //! the outline inset by the tool radius and outside every island inset, a face covering its rectangle, the
 //! refusals by name, climb against conventional, and each program validated and round-tripped through grbl.
+//! VUGMAKERAMP (LEDGER SR532): a flat end with a ramp angle enters by a ramp along its first ring or a helix at that
+//! angle, removing what the centre-cutting program removes; without the angle the flat end still refuses `NoEntry`.
 
 use std::collections::BTreeSet;
 
@@ -28,8 +30,10 @@ fn mill() -> Machine {
         safe_z: 5.0,
         units: Units::Mm,
         tools: vec![
-            Tool { number: 2, kind: ToolKind::FlatEnd, dc: 4.0, lf: 20.0, apmx: 2.0, nof: 3, sig: 0.0 },
-            Tool { number: 3, kind: ToolKind::BallEnd, dc: 4.0, lf: 20.0, apmx: 2.0, nof: 2, sig: 0.0 },
+            Tool { number: 2, kind: ToolKind::FlatEnd, dc: 4.0, lf: 20.0, apmx: 2.0, nof: 3, sig: 0.0, ramp_deg: None },
+            Tool { number: 3, kind: ToolKind::BallEnd, dc: 4.0, lf: 20.0, apmx: 2.0, nof: 2, sig: 0.0, ramp_deg: None },
+            // VUGMAKERAMP (SR532): a flat end whose maker allows a 3 degree ramp.
+            Tool { number: 4, kind: ToolKind::FlatEnd, dc: 4.0, lf: 20.0, apmx: 2.0, nof: 3, sig: 0.0, ramp_deg: Some(3.0) },
         ],
         stock: Some(Stock { shape: StockShape::Box { size: Vec3::new(50.0, 50.0, 10.0) }, origin: Vec3::new(0.0, 0.0, -10.0) }),
         fixtures: vec![],
@@ -378,4 +382,125 @@ fn pocket_and_face_refusals_by_name() {
         feeds: feeds(),
     };
     assert_eq!(generate(&flipped, &m, T), Err(Refusal::BadParameter { what: "face rectangle min above max" }));
+}
+
+// ---- VUGMAKERAMP (LEDGER SR532): the ramp and helix entry at the tool's ramp angle. ----
+
+/// A slot 8 x 5: with DC 4 its one ring is the 4 x 1 rectangle (12..16, 22..23), length 10.
+fn slot() -> Vec<Vec2> {
+    rect(10.0, 20.0, 18.0, 25.0)
+}
+
+/// The mill with the ramp tool loaded, so its program needs no tool change (grbl 1.1 rejects M6).
+fn ramp_mill() -> Machine {
+    let mut m = mill();
+    m.loaded = Some(4);
+    m
+}
+
+fn pos_of(mv: &Move) -> Option<Vec3> {
+    match mv {
+        Move::Rapid { to } | Move::Linear { to, .. } | Move::Arc { to, .. } => Some(*to),
+        _ => None,
+    }
+}
+
+/// The program a centre-cutting tool would be given: `p` with its entry (the first rapid up to the first move at the
+/// cutting feed) replaced by a straight plunge at that move's start.
+fn plunged(p: &Program) -> Program {
+    let cut = p
+        .moves
+        .iter()
+        .position(|mv| matches!(mv, Move::Linear { feed, .. } | Move::Arc { feed, .. } if *feed == 600.0))
+        .expect("a cutting move");
+    let at = pos_of(&p.moves[cut - 1]).expect("the cutting move's start");
+    let lead = p.moves.iter().position(|mv| matches!(mv, Move::Rapid { .. })).expect("the first rapid");
+    let mut q = p.clone();
+    q.moves.splice(
+        lead..cut,
+        [Move::Rapid { to: Vec3::new(at.x, at.y, 5.0) }, Move::Linear { to: at, feed: 120.0 }],
+    );
+    q
+}
+
+#[test]
+fn a_flat_end_with_a_ramp_angle_ramps_along_the_first_ring() {
+    // The SR479 square pocket at 0.5 deep: the innermost ring is the square of half side 2 (length 16); the ramp's run
+    // is 0.5 / tan 3 deg = 9.54, so it ramps. Tool 4 is loaded: grbl 1.1 says no M6.
+    let m = ramp_mill();
+    let outline = rect(5.0, 5.0, 45.0, 45.0);
+    let p = generate(&pocket(outline.clone(), vec![], 0.5, false, 4), &m, T).unwrap();
+    // After the feed to the top, the first move descends along the ring at exactly tan 3 deg.
+    let top = p
+        .moves
+        .iter()
+        .position(|mv| matches!(mv, Move::Linear { to, feed } if *feed == 120.0 && to.z == 0.0))
+        .expect("the feed to the top");
+    let (a, b) = (pos_of(&p.moves[top]).unwrap(), &p.moves[top + 1]);
+    let Move::Linear { to: b, feed } = b else { panic!("the ramp is a G1: {b:?}") };
+    assert_eq!(*feed, 120.0);
+    assert!(b.z < 0.0, "the first move after the top descends: {b:?}");
+    let dxy = ((b.x - a.x).powi(2) + (b.y - a.y).powi(2)).sqrt();
+    let slope = (b.z - a.z).abs() / dxy;
+    assert!((slope - 3f64.to_radians().tan()).abs() < 1e-9, "slope {slope}");
+    // No helix: every arc (the corner arcs, none on a plain square) is flat.
+    assert!(!p.moves.iter().any(|mv| matches!(mv, Move::Arc { feed, .. } if *feed == 120.0)));
+    assert_inset(&p, &outline, &[], 2.0);
+    assert!(p.validate(&m, T).is_ok());
+    grbl_round_trip(&p);
+}
+
+#[test]
+fn a_narrow_slot_enters_by_a_helix_at_the_ramp_angle() {
+    // 1 deep: the run (19.08) is longer than the ring (10), so a helix about the ring's deepest point, radius
+    // min(0.5, r - tol) = 0.5 (the ring's half width), descending no steeper than tan 3 deg.
+    let m = ramp_mill();
+    let p = generate(&pocket(slot(), vec![], 1.0, false, 4), &m, T).unwrap();
+    let mut pos: Option<Vec3> = None;
+    let mut helical = 0;
+    for mv in &p.moves {
+        if let Move::Arc { to, centre, feed, .. } = mv {
+            let s = pos.unwrap();
+            if *feed == 120.0 && to.z < s.z {
+                let rh = ((s.x - centre.x).powi(2) + (s.y - centre.y).powi(2)).sqrt();
+                assert!(rh <= 0.5 + 1e-9 && rh < 2.0, "helix radius {rh}");
+                let rise = (s.z - to.z) / (2.0 * std::f64::consts::PI * rh);
+                assert!(rise <= 3f64.to_radians().tan() + 1e-9, "helix rise {rise}");
+                helical += 1;
+            }
+        }
+        pos = pos_of(mv).or(pos);
+    }
+    assert!(helical > 0, "no helical G2 / G3");
+    assert_inset(&p, &slot(), &[], 2.0);
+    assert!(p.validate(&m, T).is_ok());
+    grbl_round_trip(&p);
+}
+
+#[test]
+fn the_ramp_and_the_helix_remove_what_the_centre_cutting_program_removes() {
+    let m = mill();
+    let stock = m.stock.unwrap();
+    for op in [pocket(rect(5.0, 5.0, 45.0, 45.0), vec![], 0.5, false, 4), pocket(slot(), vec![], 1.0, false, 4)] {
+        let p = generate(&op, &m, T).unwrap();
+        let q = plunged(&p);
+        assert_ne!(p, q);
+        let a = simulate(&p, &m, &stock, &[], SimParams::default(), T).unwrap().removed_mm3;
+        let b = simulate(&q, &m, &stock, &[], SimParams::default(), T).unwrap().removed_mm3;
+        assert!(b > 0.0 && ((a - b) / b).abs() <= 1e-3, "entered {a} vs plunged {b}");
+    }
+}
+
+#[test]
+fn without_a_ramp_angle_the_flat_end_still_has_no_way_in() {
+    let m = mill();
+    assert_eq!(generate(&pocket(slot(), vec![], 1.0, false, 2), &m, T), Err(Refusal::NoEntry { tool: 2 }));
+    for bad in [0.0, 90.0, f64::NAN] {
+        let mut m2 = mill();
+        m2.tools[2].ramp_deg = Some(bad);
+        assert_eq!(
+            generate(&pocket(slot(), vec![], 1.0, false, 4), &m2, T),
+            Err(Refusal::BadParameter { what: "ramp angle outside (0, 90) degrees" })
+        );
+    }
 }

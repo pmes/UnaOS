@@ -99,6 +99,10 @@ pub struct Tool {
     pub nof: u8,
     /// SIG — point angle, radians (drills).
     pub sig: f64,
+    /// VUGMAKERAMP (SR532): the maker's maximum ramp angle, degrees, in (0, 90): a pocket entry ramps along its first
+    /// ring or helixes no steeper ([`crate::op`]); None keeps the centre-cutting rule only (a ball end or a drill
+    /// plunges, a flat end with no room for the helix refuses `NoEntry`).
+    pub ramp_deg: Option<f64>,
 }
 
 impl Tool {
