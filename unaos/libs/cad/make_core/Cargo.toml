@@ -13,6 +13,9 @@ description = "Vug's Make core: the machine model (MDES-shaped kinematics, ISO 1
 [dependencies]
 geom_core = { path = "../geom_core", default-features = false }
 libm = { version = "0.2", default-features = false }
+# VUGMAKESIM (SR496): `sim` marches the simulated stock through scan_core's `mc::march_cells` (no second marcher). The cost: make_core
+# now pulls scan_core -> probe_core -> yuv_core and mesh_core (all no_std + alloc, all root members, no cycle); no kernel lock pins make_core.
+scan_core = { path = "../scan_core", default-features = false }
 
 [features]
 default = ["std"]
