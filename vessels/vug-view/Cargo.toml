@@ -20,6 +20,10 @@ mesh_core = { path = "../../unaos/libs/cad/mesh_core" }
 sketch_core = { path = "../../unaos/libs/cad/sketch_core" }
 brep_core = { path = "../../unaos/libs/cad/brep_core" }
 geom_core = { path = "../../unaos/libs/cad/geom_core" }
+# VUGFACEPHOTO (SR506): photo_core measures the photo (src/photo.rs), doc_core::intent verifies a proposal. Vein is NOT
+# linked: the provider, the key and the TLS road are handlers/vein's (the bus; VUG-VEIN-BUS owed).
+photo_core = { path = "../../unaos/libs/cad/photo_core" }
+doc_core = { path = "../../unaos/libs/cad/doc_core" }
 euclase = { path = "../../libs/euclase" }
 palette_core = { path = "../../unaos/libs/sys/palette_core" }
 pixel_core = { path = "../../unaos/libs/media/pixel_core" }
