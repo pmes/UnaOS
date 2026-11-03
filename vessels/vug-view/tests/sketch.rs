@@ -245,3 +245,105 @@ fn a_circle_grows_live_and_backspace_erases_it() {
     vw.input(&SMessage::BrowserKey("BackSpace".into()));
     assert!(matches!(face(&vw).sketch.entity(origin), Some(Entity::Point { .. })), "the origin stays");
 }
+
+// ---- VUGFACEDIMENSION (LEDGER SR494): the dimension tool and the typed value, by events ----
+
+fn key(vw: &mut Viewer, k: &str) -> bool {
+    vw.input(&SMessage::BrowserKey(k.into()))
+}
+
+fn typed(vw: &mut Viewer, t: &str) -> bool {
+    vw.input(&SMessage::BrowserText(t.into()))
+}
+
+fn click(vw: &mut Viewer, q: (f64, f64)) {
+    let p = screen(vw, q);
+    assert!(button(vw, true, p), "the dimension tool takes the press at {q:?}");
+    button(vw, false, p);
+}
+
+/// The SR485 rectangle dimensioned by the TOOL: `d`, click the bottom line, type 16, Enter; click the right line, type
+/// 10, Enter.
+fn dimensioned_by_tool() -> Viewer {
+    let mut vw = rectangle();
+    assert!(typed(&mut vw, "d"));
+    assert_eq!(face(&vw).tool, Tool::Dimension);
+    click(&mut vw, (8.0, 0.0));
+    assert!(face(&vw).edit.is_some(), "a click on a line opens its length for editing");
+    assert!(typed(&mut vw, "16"));
+    assert_eq!(face(&vw).edit.as_ref().unwrap().buffer, "16");
+    assert!(key(&mut vw, "Return"));
+    assert!(face(&vw).edit.is_none(), "Enter commits and closes: {:?}", vw.view.design.refusal);
+    click(&mut vw, (16.0, 5.0));
+    assert!(typed(&mut vw, "10"));
+    assert!(key(&mut vw, "Return"));
+    vw
+}
+
+fn live_constraints(f: &SketchFace) -> Vec<(u32, Constraint)> {
+    (0..256).filter_map(|i| f.sketch.constraint(ConstraintId(i)).map(|c| (i, *c))).collect()
+}
+
+#[test]
+fn dimension_tool_makes_the_rectangle_exact() {
+    let vw = dimensioned_by_tool();
+    let f = face(&vw);
+    assert_eq!(vw.view.design.refusal, None);
+    assert!(f.edit.is_none());
+    assert_eq!(f.dims.len(), 2);
+    assert_eq!(f.dof, 0);
+    assert_eq!(f.profiles.len(), 1);
+    assert!(f.profiles[0].holes.is_empty());
+    assert!((f.profiles[0].outer.area - 160.0).abs() < 1e-5, "area {}", f.profiles[0].outer.area);
+    // Both dimensions are Distance constraints with the typed values, drawn as glyphs with their labels.
+    let mut vals: Vec<f64> = f.dims.iter().map(|d| match f.sketch.constraint(d.constraint) {
+        Some(Constraint::Distance(_, _, v)) => *v,
+        c => panic!("a dimension is not a Distance: {c:?}"),
+    }).collect();
+    vals.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    assert_eq!(vals, vec![10.0, 16.0]);
+    let mut labels: Vec<String> = f.dimension_glyphs(&vw.view).into_iter().map(|g| g.text).collect();
+    labels.sort();
+    assert_eq!(labels, vec!["10".to_string(), "16".to_string()]);
+}
+
+#[test]
+fn a_conflicting_dimension_is_refused_and_the_sketch_is_unchanged() {
+    let mut vw = dimensioned_by_tool();
+    let (params, cons) = (face(&vw).sketch.params().to_vec(), live_constraints(face(&vw)));
+    // A third dimension on the bottom line, 17 against its 16.
+    click(&mut vw, (12.0, 0.0));
+    assert!(typed(&mut vw, "17"));
+    assert!(key(&mut vw, "Return"));
+    let refusal = vw.view.design.refusal.clone().expect("refused");
+    assert!(refusal.starts_with("Conflicting"), "refused by name: {refusal}");
+    let f = face(&vw);
+    let edit = f.edit.as_ref().expect("the refused dimension stays open");
+    assert_eq!(edit.refusal.as_deref(), Some("Conflicting"));
+    let g = f.dimension_glyphs(&vw.view).into_iter().find(|g| g.editing).expect("the edit is drawn");
+    assert!(g.refused && g.text == "CONFLICTING", "{g:?}");
+    // Exactly that constraint rolled back: the same constraints, the same geometry, still exact.
+    assert_eq!(live_constraints(f), cons);
+    let moved = f.sketch.params().iter().zip(&params).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max);
+    assert!(moved <= 1e-12, "the sketch moved {moved} mm");
+    assert_eq!(f.sketch.params().len(), params.len());
+    assert_eq!(f.dof, 0);
+    assert_eq!(f.dims.len(), 2);
+}
+
+#[test]
+fn a_typed_pull_gives_the_box_volume() {
+    let mut vw = dimensioned_by_tool();
+    assert!(typed(&mut vw, "h"));
+    assert!(typed(&mut vw, "e"));
+    assert!(vw.view.design.pull.is_some(), "e starts a pull");
+    assert!(typed(&mut vw, "10"));
+    let pull = vw.view.design.pull.as_ref().unwrap();
+    assert_eq!(pull.distance, 10.0, "the typed distance drives the pull");
+    assert!(pull.preview.is_some(), "a live preview at the typed distance");
+    assert!(key(&mut vw, "Return"));
+    let design = &vw.view.design;
+    assert!(design.pull.is_none() && design.face.is_none(), "Enter commits the pull and closes the sketch");
+    let vol = design.body.as_ref().expect("a body").volume().expect("volume");
+    assert!((vol - 1600.0).abs() < 1e-4, "volume {vol}");
+}
