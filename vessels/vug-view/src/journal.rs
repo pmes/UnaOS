@@ -246,11 +246,15 @@ pub struct Journal {
     pub edit: Option<String>,
     /// The last panel message: a refusal names its line (`line N: ...`), a delete names what went.
     pub note: Option<String>,
+    // VUGFACESAVE (SR534): the text last written or read (None: never saved, dirty iff there are statements).
+    saved: Option<String>,
+    /// VUGFACESAVE (SR534): the corner line: `saved <name>`, or the write error by name.
+    pub disk: Option<Result<String, String>>,
 }
 
 impl Default for Journal {
     fn default() -> Journal {
-        Journal { doc: Doc::new(Tol::DEFAULT), closed: 0, open: None, undo: Vec::new(), redo: Vec::new(), panel: false, cursor: 0, edit: None, note: None }
+        Journal { doc: Doc::new(Tol::DEFAULT), closed: 0, open: None, undo: Vec::new(), redo: Vec::new(), panel: false, cursor: 0, edit: None, note: None, saved: None, disk: None }
     }
 }
 
@@ -411,7 +415,7 @@ impl Journal {
 /// Delete / BackSpace (the cursor row) and Enter (its value; then digits, Enter, Esc). None while a pull, a dimension
 /// edit or a gesture is open, and for every other key.
 pub fn key(d: &mut Design, k: &str) -> Option<bool> {
-    if d.pull.is_some() || d.face.as_ref().is_some_and(|f| f.edit.is_some() || f.gesture.is_some()) {
+    if gesturing(d) {
         return None;
     }
     let enter = matches!(k, "Return" | "KP_Enter" | "\r" | "\n");
@@ -490,7 +494,7 @@ pub fn key(d: &mut Design, k: &str) -> Option<bool> {
 /// The panel: the right quarter of the frame, a row per statement (the cursor row tinted, an edit shown as
 /// `<verb> <id> = <typed>`), the note at the bottom (a refusal in the refusal colour).
 pub fn overlay(view: &View, fr: &mut Raster) {
-    let j = &view.design.journal;
+    disk_overlay(view, fr); let j = &view.design.journal; // VUGFACESAVE (SR534): the save's corner line, panel or not
     if !j.panel {
         return;
     }
@@ -578,4 +582,65 @@ impl Journal {
         self.cursor = at;
         Some(new_id)
     }
+}
+
+// ---- VUGFACESAVE (SR534): the save road's document side ----
+
+/// A pull, a dimension edit or a gesture is open: the tree's keys wait (`key`'s guard).
+fn gesturing(d: &Design) -> bool {
+    d.pull.is_some() || d.face.as_ref().is_some_and(|f| f.edit.is_some() || f.gesture.is_some())
+}
+
+/// [`gesturing`], or a row edit is open: a plain `s` belongs to the open edit (the save key in lib.rs).
+pub fn busy(d: &Design) -> bool {
+    gesturing(d) || d.journal.edit.is_some()
+}
+
+impl Journal {
+    /// The document differs from the text last written or read (never saved: it holds a statement).
+    pub fn dirty(&self) -> bool {
+        match &self.saved {
+            Some(t) => *t != doc_core::write(&self.doc),
+            None => !self.doc.stmts.is_empty(),
+        }
+    }
+
+    /// `text` (doc_core's writer's output) is on disk now.
+    pub fn mark_saved(&mut self, text: String) {
+        self.saved = Some(text);
+    }
+
+    /// An opened document: regenerated first (a replay failure names its line and nothing changes), then it is
+    /// the face's truth with no snapshots, and clean (the saved text is the writer's, so comments in the file do
+    /// not make it dirty).
+    pub fn load(&mut self, doc: Doc) -> Result<Regen, String> {
+        let mut r = regenerate(&doc)?;
+        self.saved = Some(doc_core::write(&doc));
+        self.doc = doc;
+        self.open = r.open.take();
+        self.closed = r.closed;
+        self.undo.clear();
+        self.redo.clear();
+        self.cursor = self.doc.stmts.len().saturating_sub(1);
+        self.edit = None;
+        self.note = None;
+        Ok(r)
+    }
+}
+
+/// The save's corner line, bottom right (one row up while the panel's note row is shown): upper-cased, an error in
+/// the refusal colour.
+fn disk_overlay(view: &View, fr: &mut Raster) {
+    let j = &view.design.journal;
+    let Some(d) = &j.disk else { return };
+    let (text, col) = match d {
+        Ok(t) => (t.to_uppercase(), rgba(INK)),
+        Err(e) => (e.to_uppercase(), rgba(REFUSED)),
+    };
+    let (w, h) = (fr.width as f32, fr.height as f32);
+    let cols = ((w - 12.0) / 8.0).floor().max(1.0) as usize;
+    let text: String = text.chars().take(cols).collect();
+    let x = (w - 6.0 - 8.0 * text.chars().count() as f32).max(6.0);
+    let y = h - ROW_PX - if j.panel { ROW_PX } else { 0.0 };
+    raster::text(fr, &text, x, y, col);
 }

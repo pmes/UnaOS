@@ -53,19 +53,26 @@ pub const SHORTCUTS: &[(&str, &str)] = &[
     ("t", "the feature tree panel (the document's statements)"),
     ("u / U", "undo / redo (the document's snapshots; the face regenerates)"),
     ("Up / Down, Delete, Enter", "in the tree panel: move, delete the row with its dependants, edit its value (type, Enter)"),
+    ("s / Cmd+S", "save the document: the opened .vug, else <file stem>.vug beside the opened file (a sibling .tmp renamed over it); the title shows * while unsaved; a write error is named in the corner"), // VUGFACESAVE (SR534)
 ];
 
 /// The controller: owns the model and the view (one task, no lock).
 pub struct Viewer {
     pub model: Model,
     pub view: View,
+    /// The window title: the file name, with `*` while the document differs from the last saved text (VUGFACESAVE).
     pub title: String,
+    // VUGFACESAVE (SR534): where `s` writes (the opened .vug, else `<stem>.vug` beside the opened file), whether the
+    // face opened or wrote that file (an existing file it did not is refused by name), the bare title.
+    pub save_to: Option<std::path::PathBuf>,
+    claimed: bool,
+    name: String,
 }
 
 impl Viewer {
     pub fn new(model: Model, title: &str, size: (u32, u32), preset: Preset) -> Viewer {
         let view = View::new(&model, size, preset);
-        Viewer { model, view, title: title.to_string() }
+        Viewer { model, view, title: title.to_string(), save_to: None, claimed: false, name: title.to_string() }
     }
 
     /// VUGFACEPHOTO (SR506): THE open road — a .png / .jpg / .jpeg (else any file pixel_core recognises that is not a
@@ -75,14 +82,24 @@ impl Viewer {
         let p = std::path::Path::new(path);
         let title = p.file_name().and_then(|s| s.to_str()).unwrap_or("vug").to_string();
         let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+        // VUGFACESAVE (SR534): a .vug document opens as itself (and saves back over itself).
+        if ext == "vug" {
+            return Viewer::open_vug(path, &title, size, preset);
+        }
         let mesh = matches!(ext.as_str(), "stl" | "ply" | "obj");
+        let mut v = None;
         if !mesh {
             let bytes = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
             if matches!(ext.as_str(), "png" | "jpg" | "jpeg") || pixel_core::sniff(&bytes).is_some() {
-                return Viewer::open_photo(&bytes, &title, size, preset, photo::PITCH_MM).map_err(|e| format!("{path}: {e}"));
+                v = Some(Viewer::open_photo(&bytes, &title, size, preset, photo::PITCH_MM).map_err(|e| format!("{path}: {e}"))?);
             }
         }
-        Ok(Viewer::new(Model::open(path)?, &title, size, preset))
+        let mut v = match v {
+            Some(v) => v,
+            None => Viewer::new(Model::open(path)?, &title, size, preset),
+        };
+        v.save_to = Some(p.with_extension("vug")); // VUGFACESAVE (SR534): `<stem>.vug` beside a mesh / photo
+        Ok(v)
     }
 
     /// VUGFACEPHOTO (SR506): a photo's bytes on `pitch_mm` graph paper: photo_core measures it, the paper is the drawn
@@ -96,14 +113,23 @@ impl Viewer {
         Ok(v)
     }
 
-    /// A shortcut key; true when the frame changed.
+    /// A shortcut key; true when the frame changed. VUGFACESAVE (SR534): Cmd+S (`Meta+s` on the bus) saves, and a
+    /// plain `s` when no edit, pull or gesture holds the keys; the title follows the document.
     pub fn key(&mut self, k: &str) -> bool {
-        self.view.key(&self.model, k)
+        let save = k == "Meta+s" || (k == "s" && !journal::busy(&self.view.design) && self.view.fillet.is_none());
+        let r = if save {
+            let _ = self.save();
+            true
+        } else {
+            self.view.key(&self.model, k)
+        };
+        self.retitle();
+        r
     }
 
     /// One window message; true when the frame must be redrawn (or resent).
     pub fn input(&mut self, msg: &SMessage) -> bool {
-        match msg {
+        let r = match msg {
             // The left button (Alt+Left is still the middle one, for a trackpad: `Preset::resolve`).
             SMessage::BrowserButton { down: true, x, y, mods, .. } => self.view.press(&self.model, Button::Left, *mods, *x, *y),
             SMessage::BrowserButton { down: false, x, y, .. } => self.view.release(&self.model, *x, *y),
@@ -127,7 +153,9 @@ impl Viewer {
             // VUGFACEINTENTSEND (SR514): Vein's answer to the face's ask (photo::answer matches the live request id).
             SMessage::Intent(ev) => photo::answer(&mut self.view, ev),
             _ => false,
-        }
+        };
+        self.retitle(); // VUGFACESAVE (SR534): a release commits a stroke; the title's mark follows the document
+        r
     }
 
     /// Render the current view as the surface's whole frame.
@@ -141,4 +169,87 @@ impl Viewer {
     pub fn outbox(&mut self) -> Vec<SMessage> {
         self.view.photo.as_mut().map(|ph| ph.outbox.drain(..).map(SMessage::Intent).collect()).unwrap_or_default()
     }
+}
+
+// ---- VUGFACESAVE (SR534): the save road ----
+
+/// Half the side of the ground quad a document opens over (mm): the photo paper's shape, a base model for the view.
+pub const GROUND_MM: f64 = 50.0;
+
+impl Viewer {
+    /// A .vug document: doc_core's reader (a refusal named by line), then [`Viewer::open_doc`]; `s` writes it back.
+    fn open_vug(path: &str, title: &str, size: (u32, u32), preset: Preset) -> Result<Viewer, String> {
+        let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
+        let doc = doc_core::read(&text).map_err(|r| format!("{path}: line {}: {:?}", r.line, r.what))?;
+        let mut v = Viewer::open_doc(doc, title, size, preset).map_err(|e| format!("{path}: {e}"))?;
+        v.save_to = Some(std::path::PathBuf::from(path));
+        v.claimed = true;
+        Ok(v)
+    }
+
+    /// A document as the face: regenerated through the journal (a replay failure named by line), over a ground quad
+    /// at z = 0; the open sketch is the face, the solids the body, the camera homed on what is shown. Clean.
+    pub fn open_doc(doc: doc_core::Doc, title: &str, size: (u32, u32), preset: Preset) -> Result<Viewer, String> {
+        let g = GROUND_MM;
+        let ground = Model::from_triangles(&[[-g, -g, 0.0], [g, -g, 0.0], [g, g, 0.0], [-g, g, 0.0]], &[[0, 1, 2], [0, 2, 3]])?;
+        let mut v = Viewer::new(ground, title, size, preset);
+        let r = v.view.design.journal.load(doc)?;
+        v.view.design.face = r.face;
+        v.view.design.body = r.body;
+        match v.view.design.shown() {
+            Some(m) => v.view.home(&m),
+            None => v.view.home(&v.model),
+        }
+        v.retitle();
+        Ok(v)
+    }
+
+    /// Write the document (doc_core's writer) to `save_to` atomically: no target names "no file"; an existing file the
+    /// face neither opened nor wrote is refused by name (Save As is owed). The outcome is the corner line.
+    pub fn save(&mut self) -> Result<std::path::PathBuf, String> {
+        let out = self.save_inner();
+        self.view.design.journal.disk = Some(match &out {
+            Ok(p) => Ok(format!("saved {}", p.file_name().and_then(|s| s.to_str()).unwrap_or(""))),
+            Err(e) => Err(e.clone()),
+        });
+        self.retitle();
+        out
+    }
+
+    fn save_inner(&mut self) -> Result<std::path::PathBuf, String> {
+        let path = self.save_to.clone().ok_or("no file: Save As is owed")?;
+        if !self.claimed && path.exists() {
+            return Err(format!("{} exists: open it to change it", path.display()));
+        }
+        let text = doc_core::write(&self.view.design.journal.doc);
+        write_atomic(&path, &text)?;
+        self.view.design.journal.mark_saved(text);
+        self.claimed = true;
+        Ok(path)
+    }
+
+    /// The title: the bare name, with `*` while the document differs from the last saved text.
+    fn retitle(&mut self) {
+        self.title = if self.view.design.journal.dirty() { format!("{}*", self.name) } else { self.name.clone() };
+    }
+}
+
+/// `text` to `<path>.tmp` (created, written, synced), then renamed over `path`; a failed rename removes the .tmp.
+/// Either error names its file.
+fn write_atomic(path: &std::path::Path, text: &str) -> Result<(), String> {
+    use std::io::Write;
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = std::path::PathBuf::from(tmp);
+    let named = |p: &std::path::Path, e: std::io::Error| format!("{}: {e}", p.display());
+    let mut f = std::fs::File::create(&tmp).map_err(|e| named(tmp.as_path(), e))?;
+    f.write_all(text.as_bytes()).and_then(|()| f.sync_all()).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        named(tmp.as_path(), e)
+    })?;
+    drop(f);
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        named(path, e)
+    })
 }
