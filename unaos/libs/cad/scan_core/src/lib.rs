@@ -29,6 +29,7 @@
 //! | [`tsdf`] | the block-sparse truncated signed distance volume and one frame's integration | Curless & Levoy 1996; KinectFusion (Newcombe et al. 2011); Open3D's VoxelBlockGrid |
 //! | [`mc`] | marching cubes over the volume, one vertex per voxel edge, confidence and normals carried | Lorensen & Cline 1987; Bourke 1994 numbering |
 //! | [`fit`] | plane and cylinder RANSAC with residuals | Schnabel, Wahl & Klein 2007; Fischler & Bolles 1981 |
+//! | [`graph`] | keyframes, the pose graph and loop closure over the tracked poses (VUGSCANLOOP SR500) | Kintinuous / ElasticFusion (Whelan et al.); g2o (Kümmerle et al. 2011) |
 //! | [`fixture`] | synthetic Z16 frames of a known scene through probe_core's pinhole model | the inverse of `Intrinsics::deproject` |
 //!
 //! Units: millimetres in the world (BP-vug-2's `Tol` is linear in mm), metres only at probe_core's seam.
@@ -41,6 +42,7 @@ extern crate alloc;
 pub mod fit;
 pub mod fixture;
 mod geom;
+pub mod graph;
 pub mod mc;
 mod mesh;
 pub mod pose;
@@ -50,6 +52,10 @@ use alloc::vec::Vec;
 
 pub use fit::{Cylinder, Fit, FitError, fit_cylinder, fit_plane};
 pub use geom::{Plane, Tol, Transform, Vec3};
+pub use graph::{
+    Candidate, Closed, Edge, EdgeKind, Gap, GraphError, Keyframe, Keyframes, Loop, LoopParams, PoseGraph, Refused,
+    Reintegrate, Shot, Solved, close_loop, gap, match_keyframe, reintegrate,
+};
 pub use mesh::{Mesh, Topo};
 pub use pose::{ModelMap, Surfel, TrackError, TrackParams, Tracked, Tracker, raycast};
 pub use probe_core::{DepthScale, Frame, Intrinsics, PixelFormat};
