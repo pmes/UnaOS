@@ -175,3 +175,51 @@ draft, sheet metal, assemblies.
 
 Each arc is measured (R131) before it builds; each new crate is a root-workspace member with its own suite as the
 witness; nothing here touches the kernel until a core is linked by a kernel face.
+
+## 7. Vein in the loop (2026-11-03)
+
+Peter: "we need vein integrated into the CAD operations because it seems ai could make up the difference where the
+d435i and other cameras lack precision. apparently plain photos with graph paper in the background are enough for
+simple parts."
+
+**The honest reading.** A model cannot add precision to a measurement; what it adds is *intent*. A D435i edge
+measured at 49.7 ± 1.5 mm, or a photographed outline at 49.7 ± 0.4 mm, was almost certainly designed as 50; two
+edges 0.3° apart were designed parallel; four holes 0.2 mm off a circle were designed on a bolt circle; a 6.4 mm
+hole is an M6 clearance. Recognising that is what a person does when they reverse-engineer a part, and it is what a
+vision-language model is good at. Enforcing it is what the sketch solver does: once the constraint is in the sketch
+the model is exact where the measurement was fuzzy. That is how AI "makes up the difference" without ever being
+trusted with a number. The principle, added to §3:
+
+11. **AI proposes, geometry disposes.** Vein never writes a coordinate. It proposes design intent (a constraint, a
+    round dimension, a standard size, a symmetry, a feature name) as a `Proposal { statement, confidence, why }`;
+    the proposal is applied to a copy of the document, replayed through the cores, and its residual against the
+    measurement (the photo outline, the scan points) is computed; it is accepted into the document only when the
+    residual lies inside the measurement's own confidence, and only after the person sees it. A proposal that the
+    geometry refuses is shown refused, by name. Offline (the Echo provider, no key, no network) the whole road still
+    works by hand: the AI is a convenience on top of a measurement, never a dependency of one.
+
+**The photo road (the graph paper).** The paper is the metrology, not the AI. A photo of a flat part on 5 mm graph
+paper gives: the grid's two line families (gradient + RANSAC line fits), the lattice intersections, a homography to
+the paper's millimetre frame (DLT over hundreds of intersections, residual in pixels → the outline's uncertainty in
+mm), lens distortion as the residual's spatial pattern (owed: a radial term), the part's silhouette against the paper
+(threshold, morphology, largest component, its holes), the contour, a polyline at the measured uncertainty, and
+primitives fitted with the exact predicates (lines, arcs, circles) into a `sketch_core` sketch with inferred
+constraints — then extrude by a typed or second-photo thickness. Prior art agrees on each step and on the limits:
+the grid corrects the perspective only if the part lies flat on it, paper moves with humidity, the camera should be
+square to the paper, and the accuracy is about a tenth of the grid pitch at phone resolution (so 0.5 mm; good enough
+for a bracket, a plate, a gasket, a cover, not a bearing seat). Sources: the Hackaday reference-photo and caliper
+threads, the OpenCV shape-to-DXF thread, the quadrille-paper CAD patent (`docs/dev/evidence/vug/research-photo-and-intent.md`).
+
+**The scan road.** `scan_core` detects planes, cylinders, spheres and cones with support and residuals (SR497);
+Vein is handed the shapes and the document and proposes the design (a plate 50 × 30 × 6 with four Ø6.6 holes on a
+40 mm bolt circle); each proposal is verified against the scan's deviation map before it is offered. The research
+(CAD-Assistant, ICCV 2025; DAVINCI; CReFT-CAD) says the same thing from the other side: vision-language models
+cannot reliably predict geometric constraints on their own, and the working systems give them tools — a constraint
+checker, a solver, a residual — and keep a person in the loop.
+
+**The seam.** `vein_core` (the provider abstraction: Claude / Gemini by key over verified TLS, Echo offline, the
+fixture provider for tests) gains image content blocks and one structured exchange, `propose`, with a JSON contract
+the parser enforces (refused by name on any deviation); `doc_core` gains `Proposal` and `verify`; the face gains the
+photo underlay and the proposal glyphs. The ladder: VUG-PHOTO (SR503), VUG-VEIN-ASK (SR504), VUG-INTENT (SR505),
+VUG-FACE-PHOTO (SR506).
+
