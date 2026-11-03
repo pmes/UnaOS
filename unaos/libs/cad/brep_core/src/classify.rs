@@ -237,40 +237,56 @@ pub(crate) fn where2(segs: &[Seg2], q: Vec2, tol: Tol) -> Result<Where, Refusal>
     Err(Refusal::Undecidable)
 }
 
-/// A point strictly inside the region the pieces bound: from the midpoint of the longest piece, half way along its
-/// inward normal to the nearest boundary hit.
+/// A point strictly inside the region the pieces bound: from a point of a piece, half way along its inward normal to
+/// the nearest boundary hit. The longest piece's midpoint first; a ray that is ambiguous (through a vertex) moves to
+/// the next fixed fraction along the piece, then to the next piece by length, and only when every ray is ambiguous is
+/// the first one with a hit taken.
 pub(crate) fn inner_point(segs: &[Seg2], tol: Tol) -> Result<Vec2, Refusal> {
-    let mut best: Option<(f64, Vec2, Vec2)> = None;
-    for s in segs {
-        let (len, m, n) = match s {
-            Seg2::Line(a, b) => {
-                let d = *b - *a;
-                let l = d.mag();
-                if l <= tol.lin {
-                    continue;
+    const FRACS: [f64; 5] = [0.5, 0.381966, 0.618034, 0.271, 0.729];
+    let len = |s: &Seg2| match s {
+        Seg2::Line(a, b) => (*b - *a).mag(),
+        Seg2::Arc(k) => k.radius * libm::fabs(k.sweep),
+    };
+    let mut order: Vec<usize> = (0..segs.len()).filter(|&i| len(&segs[i]) > tol.lin).collect();
+    order.sort_by(|&x, &y| len(&segs[y]).partial_cmp(&len(&segs[x])).unwrap_or(core::cmp::Ordering::Equal));
+    let mut fallback: Option<Vec2> = None;
+    let mut hits = Vec::new();
+    for &i in &order {
+        for &fr in &FRACS {
+            let (m, n) = match &segs[i] {
+                Seg2::Line(a, b) => {
+                    let d = *b - *a;
+                    (*a + d * fr, Vec2::new(-d.y, d.x) * (1.0 / d.mag()))
                 }
-                (l, (*a + *b) * 0.5, Vec2::new(-d.y, d.x) * (1.0 / l))
+                Seg2::Arc(k) => {
+                    let th = k.start + k.sweep * fr;
+                    let e = Vec2::new(libm::cos(th), libm::sin(th));
+                    (k.centre + e * k.radius, if k.sweep > 0.0 { -e } else { e })
+                }
+            };
+            hits.clear();
+            let mut clean = true;
+            for (j, s) in segs.iter().enumerate() {
+                // The ray starts on its own piece: a line cannot be hit again, an arc only at its far side.
+                let ok = ray_hits(s, m, n, tol, &mut hits);
+                if j != i && !ok {
+                    clean = false;
+                }
             }
-            Seg2::Arc(k) => {
-                let th = k.start + k.sweep * 0.5;
-                let e = Vec2::new(libm::cos(th), libm::sin(th));
-                (k.radius * libm::fabs(k.sweep), k.centre + e * k.radius, if k.sweep > 0.0 { -e } else { e })
+            let near = hits.iter().copied().fold(f64::INFINITY, f64::min);
+            if !near.is_finite() {
+                continue;
             }
-        };
-        if best.map_or(true, |b| len > b.0) {
-            best = Some((len, m, n));
+            let p = m + n * (near * 0.5);
+            if clean {
+                return Ok(p);
+            }
+            if fallback.is_none() {
+                fallback = Some(p);
+            }
         }
     }
-    let (_, m, n) = best.ok_or(Refusal::BadRef { what: "empty boolean region" })?;
-    let mut hits = Vec::new();
-    for s in segs {
-        let _ = ray_hits(s, m, n, tol, &mut hits);
-    }
-    let near = hits.iter().copied().fold(f64::INFINITY, f64::min);
-    if !near.is_finite() {
-        return Err(Refusal::BadRef { what: "boolean region without a far side" });
-    }
-    Ok(m + n * (near * 0.5))
+    fallback.ok_or(Refusal::BadRef { what: "boolean region without a far side" })
 }
 
 /// The signed area of a cycle of pieces (build.rs's term).
