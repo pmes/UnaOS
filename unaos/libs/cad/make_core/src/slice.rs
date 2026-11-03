@@ -26,7 +26,7 @@ use alloc::{format, vec::Vec};
 use core::f64::consts::PI;
 use libm::{ceil, cos, sin};
 
-use crate::geom::{Tol, Vec2, Vec3, line_line2, signed_area2};
+use crate::geom::{Length, Tol, Vec2, Vec3, Xy, line_line2, signed_area2}; // Length / Xy: the SR473 traits (geom_core has mag; the fold composed SR483 onto the swap)
 use crate::machine::{Machine, MachineKind};
 use crate::program::{Heater, Move, Program};
 use crate::validate::Refusal;

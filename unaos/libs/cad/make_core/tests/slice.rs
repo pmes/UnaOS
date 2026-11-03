@@ -24,7 +24,7 @@ fn printer() -> Machine {
         kinematics: Kinematics::Cartesian,
         axes: vec![axis(AxisId::X, 0.0, 220.0), axis(AxisId::Y, 0.0, 220.0), axis(AxisId::Z, 0.0, 250.0)],
         power: Power { kind: PowerKind::Extruder, max: 280.0, ask_above: 260.0 },
-        envelope: Aabb3::new(Vec3::new(0.0, 0.0, 0.0), Vec3::new(220.0, 220.0, 250.0)),
+        envelope: Aabb3 { min: Vec3::new(0.0, 0.0, 0.0), max: Vec3::new(220.0, 220.0, 250.0) },
         safe_z: 5.0,
         units: Units::Mm,
         tools: vec![Tool { number: 0, kind: ToolKind::Nozzle, dc: 0.4, lf: 0.0, apmx: 0.0, nof: 0, sig: 0.0 }],
