@@ -7,8 +7,10 @@
 //! VUGSCANDEVIATION (LEDGER SR510); VUG.md §3 principle 9 (measure the result). BP-vug-5: the deviation is a printed
 //! residual of a measurement against the design, never a change to either.
 //!
-//! 1. The design is a mesh with the face index of each triangle ([`Design`]); the face (tools/scan) replays the
-//!    document and tessellates it, so this core takes no document and no B-rep.
+//! 1. The design is a mesh with the face index of each triangle ([`Design`]); the caller (tools/scan, vug-view) replays
+//!    the document and hands [`design_of`] its solids, which tessellates them at [`DESIGN_CHORD_MM`] and names every
+//!    face (VUGFACEDEVIATION, SR525: the ONE builder, lifted from tools/scan) — this core takes brep_core for that, and
+//!    still no document (no doc_core).
 //! 2. [`align`]: point-to-plane ICP (Chen & Medioni 1992; Low 2004's linearisation) of the scan to the design over
 //!    mesh_core's `Bvh::closest`: each scan vertex (a deterministic stride subsample of at most
 //!    [`AlignParams::max_points`]) carried by the estimate is paired with its nearest design point when it is within
@@ -24,11 +26,15 @@
 //! 4. [`Stats`] (rms, max, the 95th percentile, the fraction inside the band) and one [`FaceReport`] per design face
 //!    (its signed mean is a plane's offset or a cylinder's radius error), by rms, worst first: a systematic offset over a
 //!    whole face outranks one edge-rounding or noise vertex (the signed max is still each face's).
-//! 5. [`shade`]: the band classifier a face colours from (no colour here).
+//! 5. [`shade`]: the band classifier, and [`colour`] the ONE ramp both faces colour from (palette_core's status rows;
+//!    VUGFACEDEVIATION, SR525, lifted from tools/scan).
 //!
 //! The start is the caller's (`init`): a world-posed scan starts at the identity; a global coarse registration is
 //! owed (VUG-SCAN-DEVIATION-COARSE).
 
+use alloc::collections::BTreeMap;
+use alloc::format;
+use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -350,4 +356,80 @@ pub fn measure(scan: &ScanMesh, design: &Design, init: Transform, p: &AlignParam
     let bvh = Bvh::build(&design.mesh);
     let aligned = align(scan, design, &bvh, init, p, tol)?;
     Ok(deviations(scan, design, &bvh, aligned, p, band_mm, tol))
+}
+
+// ---- VUGFACEDEVIATION (LEDGER SR525): the ONE design builder and the ONE ramp, lifted from tools/scan ----
+
+/// The design's tessellation chord (mm): its sagitta bias (at most half of it) is far under the scan's noise.
+pub const DESIGN_CHORD_MM: f64 = 0.05;
+
+/// Why [`design_of`] refused the solids.
+#[derive(Clone, Debug, PartialEq)]
+pub enum DesignError {
+    /// brep_core could not tessellate a solid.
+    Tessellate { solid: String, error: brep_core::Refusal },
+    /// A tessellated triangle names a face the solid does not hold.
+    FaceId { solid: String, id: u64 },
+    /// The assembled design was refused ([`Design::new`]).
+    Design(DeviationError),
+}
+
+/// Every solid tessellated at [`DESIGN_CHORD_MM`] into ONE design with each triangle's face, and the faces' names
+/// (`<solid>/<op>.<role>.<a>.<b>:<kind>`, brep_core's persistent name, lower case) in face-index order.
+pub fn design_of<'a>(solids: impl IntoIterator<Item = (&'a str, &'a brep_core::Brep)>, tol: Tol) -> Result<(Design, Vec<String>), DesignError> {
+    let mut mesh = Mesh::default();
+    let mut face_of: Vec<u32> = Vec::new();
+    let mut names: Vec<String> = Vec::new();
+    for (id, brep) in solids {
+        let t = brep_core::tessellate(brep, DESIGN_CHORD_MM, tol).map_err(|error| DesignError::Tessellate { solid: id.into(), error })?;
+        let mut index: BTreeMap<brep_core::Id, u32> = BTreeMap::new();
+        for f in &brep.faces {
+            index.insert(f.id, names.len() as u32);
+            names.push(face_name(id, f));
+        }
+        let base = mesh.positions.len() as u32;
+        mesh.positions.extend_from_slice(&t.mesh.positions);
+        for (tri, fid) in t.mesh.triangles.iter().zip(&t.face_of) {
+            let Some(&f) = index.get(fid) else {
+                return Err(DesignError::FaceId { solid: id.into(), id: fid.0 });
+            };
+            mesh.triangles.push([tri[0] + base, tri[1] + base, tri[2] + base]);
+            face_of.push(f);
+        }
+    }
+    let faces = names.len() as u32;
+    let design = Design::new(mesh, face_of, faces).map_err(DesignError::Design)?;
+    Ok((design, names))
+}
+
+/// `<solid>/<op>.<role>.<a>.<b>:<kind>`, brep_core's persistent name of a face, lower case.
+fn face_name(solid: &str, f: &brep_core::Face) -> String {
+    let n = f.name;
+    format!(
+        "{solid}/{}.{}.{}.{}:{}",
+        format!("{:?}", n.op).to_ascii_lowercase(),
+        format!("{:?}", n.role).to_ascii_lowercase(),
+        n.a,
+        n.b,
+        format!("{:?}", f.surface.kind()).to_ascii_lowercase()
+    )
+}
+
+/// The band class in palette_core's status colours (`0x00RRGGBB`): inside POSITIVE, short toward INFO, proud toward
+/// CRITICAL (by the class's fraction), off the design TEXT_SECONDARY (the dark row, vug-view's albedo).
+pub fn colour(s: Shade) -> u32 {
+    let ch = |c: u32, i: u32| ((c >> (16 - 8 * i)) & 0xff) as f64;
+    let mix = |a: u32, b: u32, k: f64| {
+        let k = k.clamp(0.0, 1.0);
+        (0..3u32).fold(0u32, |acc, i| {
+            let m = libm::round(ch(a, i) + (ch(b, i) - ch(a, i)) * k) as u32 & 0xff;
+            acc | (m << (16 - 8 * i))
+        })
+    };
+    match s {
+        Shade::Inside => palette_core::STATUS_POSITIVE,
+        Shade::Under(k) => mix(palette_core::STATUS_POSITIVE, palette_core::STATUS_INFO, k),
+        Shade::Over(k) => mix(palette_core::STATUS_POSITIVE, palette_core::STATUS_CRITICAL, k),
+        Shade::Off => palette_core::TEXT_SECONDARY.1,
+    }
 }

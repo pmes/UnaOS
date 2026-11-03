@@ -15,11 +15,11 @@ geom_core = { path = "../geom_core", default-features = false }
 mesh_core = { path = "../mesh_core", default-features = false }
 probe_core = { path = "../../media/probe_core" }
 libm = { version = "0.2", default-features = false }
-
-# VUGSCANDEVIATION (SR510): the deviation tests build the design with brep_core (box, cylinder, tessellate); the core
-# itself takes a mesh and a face index, so brep_core is a dev-dependency only.
-[dev-dependencies]
-brep_core = { path = "../brep_core" }
+# VUGFACEDEVIATION (SR525): the ONE design builder (`deviation::design_of`: brep_core tessellates the replayed solids,
+# lifted from tools/scan) and the ONE deviation ramp (`deviation::colour`: palette_core's status rows) live beside
+# `measure` / `shade`, so tools/scan and vug-view share them. Still no doc_core: the callers replay the document.
+brep_core = { path = "../brep_core", default-features = false }
+palette_core = { path = "../../sys/palette_core" }
 
 [features]
 default = ["std"]

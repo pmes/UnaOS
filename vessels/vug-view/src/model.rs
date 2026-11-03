@@ -23,18 +23,7 @@ impl Model {
     /// An STL is a triangle soup: it is welded (mesh_core's `weld`, `Tol::DEFAULT`) so the pick and the bounds see
     /// one vertex per corner.
     pub fn open(path: &str) -> Result<Model, String> {
-        let bytes = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
-        let ext = std::path::Path::new(path).extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
-        let stl_mesh = |b: &[u8]| stl::read(b).map(|s| s.to_mesh().weld(Tol::DEFAULT).mesh).map_err(|e| format!("{path}: STL {e:?}"));
-        let ply_mesh = |b: &[u8]| ply::read(b).map_err(|e| format!("{path}: PLY {e:?}"));
-        let obj_mesh = |b: &[u8]| obj::read_bytes(b).map(|o| o.mesh).map_err(|e| format!("{path}: OBJ {e:?}"));
-        let mesh = match ext.as_str() {
-            "stl" => stl_mesh(&bytes)?,
-            "ply" => ply_mesh(&bytes)?,
-            "obj" => obj_mesh(&bytes)?,
-            _ if bytes.starts_with(b"ply") => ply_mesh(&bytes)?,
-            _ => stl_mesh(&bytes).or_else(|_| obj_mesh(&bytes))?,
-        };
+        let mesh = read_mesh(path)?;
         Model::from_mesh(mesh).map_err(|e| format!("{path}: {e}"))
     }
 
@@ -105,4 +94,23 @@ impl Model {
         let ray = Ray { origin: v(origin), dir: v(dir) };
         self.bvh.pick(&self.mesh, &ray, Tol::DEFAULT).map(|h| (h.t as f32, h.tri))
     }
+}
+
+/// VUGFACEDEVIATION (SR525): the readers of [`Model::open`] alone — an STL / OBJ / PLY file to mesh_core's `Mesh` (by
+/// extension, else by the PLY / STL magic, else OBJ; an STL welded at `Tol::DEFAULT`), for a face that needs the f64
+/// mesh itself (the deviation map's scan).
+pub fn read_mesh(path: &str) -> Result<Mesh, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
+    let ext = std::path::Path::new(path).extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    let stl_mesh = |b: &[u8]| stl::read(b).map(|s| s.to_mesh().weld(Tol::DEFAULT).mesh).map_err(|e| format!("{path}: STL {e:?}"));
+    let ply_mesh = |b: &[u8]| ply::read(b).map_err(|e| format!("{path}: PLY {e:?}"));
+    let obj_mesh = |b: &[u8]| obj::read_bytes(b).map(|o| o.mesh).map_err(|e| format!("{path}: OBJ {e:?}"));
+    let mesh = match ext.as_str() {
+        "stl" => stl_mesh(&bytes)?,
+        "ply" => ply_mesh(&bytes)?,
+        "obj" => obj_mesh(&bytes)?,
+        _ if bytes.starts_with(b"ply") => ply_mesh(&bytes)?,
+        _ => stl_mesh(&bytes).or_else(|_| obj_mesh(&bytes))?,
+    };
+    Ok(mesh)
 }

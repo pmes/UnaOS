@@ -174,13 +174,15 @@ pub struct View {
     pub fillet: Option<crate::fillet::EdgeTool>,
     /// VUGFACEPHOTO (SR506): the opened photo — its underlay, the measured outline and the offered proposals (photo.rs).
     pub photo: Option<crate::photo::Photo>,
+    /// VUGFACEDEVIATION (SR525): the opened scan measured against its design — the band's colours and the corner (deviation.rs).
+    pub deviation: Option<crate::deviation::Map>,
 }
 
 impl View {
     /// A view at Home over `model`.
     pub fn new(model: &Model, size: (u32, u32), preset: Preset) -> View {
         let camera = Camera { eye: Vec3::zero(), yaw: 0.0, pitch: 0.0, fov_y: 30f32.to_radians() };
-        let mut v = View { camera, preset, size: (size.0.max(1), size.1.max(1)), picked: None, cursor: (0.0, 0.0), drag: None, design: Default::default(), photo: None, fillet: None }; // VUGFACEFILLET (SR511): fillet
+        let mut v = View { camera, preset, size: (size.0.max(1), size.1.max(1)), picked: None, cursor: (0.0, 0.0), drag: None, design: Default::default(), photo: None, fillet: None, deviation: None }; // VUGFACEFILLET (SR511): fillet; VUGFACEDEVIATION (SR525): deviation
         v.home(model);
         v
     }
@@ -252,7 +254,7 @@ impl View {
     pub fn overlay(&self, fr: &mut crate::raster::Frame) {
         crate::sketch::overlay(self, fr); crate::fillet::overlay(self, fr); // VUGFACEFILLET (SR511): the edge tool over the sketch
         // VUGFACEPHOTO (SR506): the proposal glyphs and the corner note over the sketch.
-        crate::photo::overlay(self, fr);
+        crate::photo::overlay(self, fr); crate::deviation::overlay(self, fr); // VUGFACEDEVIATION (SR525): the map's corner, top-right
         // VUGFACETREE (SR513): the tree panel over everything.
         crate::journal::overlay(self, fr);
     }
@@ -316,7 +318,7 @@ impl View {
         if let Some(r) = crate::sketch::key(self, model, k) {
             return r;
         }
-        match k {
+        if let Some(r) = crate::deviation::key(self, k) { return r; } match k { // VUGFACEDEVIATION (SR525): `d` outside a sketch toggles the map
             "h" | "H" | "0" | "Home" => self.home(model),
             "1" => self.front(model),
             "3" => self.right(model),

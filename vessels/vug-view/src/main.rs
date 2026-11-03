@@ -12,6 +12,7 @@
 //! ```text
 //! vug-view <file.stl|obj|ply> [--preset una|solidworks|fusion|blender|onshape]    # the window (macOS)
 //! vug-view <file> --size 320x240 --keys "17h" --out shot.png                      # headless witness
+//! vug-view scan.ply --against part.vugdoc --out map.png                              # the deviation map (SR525)
 //! ```
 //! Key script: one character per shortcut; `{Name}` for a named key.
 
@@ -25,13 +26,14 @@ struct Cli {
     preset: Preset,
     keys: Option<String>,
     out: Option<String>,
+    against: Option<String>, // VUGFACEDEVIATION (SR525): the design document a scan is measured against
 }
 
-const USAGE: &str = "usage: vug-view <file.stl|obj|ply|png|jpg> [--preset una|solidworks|fusion|blender|onshape] [--size WxH] [--keys SCRIPT] [--out shot.png]";
+const USAGE: &str = "usage: vug-view <file.stl|obj|ply|png|jpg> [--preset una|solidworks|fusion|blender|onshape] [--size WxH] [--keys SCRIPT] [--out shot.png] [--against design.vugdoc]";
 
 fn cli() -> Cli {
     let mut a = std::env::args().skip(1);
-    let mut c = Cli { path: String::new(), size: (800, 600), preset: Preset::Una, keys: None, out: None };
+    let mut c = Cli { path: String::new(), size: (800, 600), preset: Preset::Una, keys: None, out: None, against: None };
     while let Some(arg) = a.next() {
         match arg.as_str() {
             "--size" => {
@@ -48,6 +50,7 @@ fn cli() -> Cli {
             }
             "--keys" => c.keys = a.next(),
             "--out" => c.out = a.next(),
+            "--against" => c.against = a.next(), // VUGFACEDEVIATION (SR525)
             "--help" | "-h" => {
                 eprintln!("{USAGE}");
                 for (k, what) in vug_view::SHORTCUTS {
@@ -82,7 +85,8 @@ fn keys(script: &str) -> Vec<String> {
 fn main() {
     let cli = cli();
     // VUGFACEPHOTO (SR506): the one open road — a mesh, or a photo on graph paper measured into a sketch.
-    let mut viewer = match Viewer::open(&cli.path, cli.size, cli.preset) {
+    let opened = match &cli.against { Some(d) => Viewer::open_against(&cli.path, d, cli.size, cli.preset), None => Viewer::open(&cli.path, cli.size, cli.preset) }; // VUGFACEDEVIATION (SR525): a scan against its design
+    let mut viewer = match opened {
         Ok(v) => v,
         Err(e) => {
             eprintln!("vug-view: {e}");

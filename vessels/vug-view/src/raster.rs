@@ -72,6 +72,11 @@ fn corners(model: &Model, tri: u32) -> Option<[Vec3; 3]> {
 /// (ground 0.22 to sky 0.38 on n.Z) + a key light from the camera's upper left (0.62 n.L) times the silhouette term
 /// 1 - 0.45 (1 - |n.dir|)^2 (grazing faces darken), on `ALBEDO`.
 pub fn shade(view: &View, n: Vec3, dir: Vec3) -> [u8; 4] {
+    shade_on(view, n, dir, ALBEDO)
+}
+
+/// VUGFACEDEVIATION (SR525): [`shade`] on any albedo (`0x00RRGGBB`): the deviation map's per-triangle colour.
+pub fn shade_on(view: &View, n: Vec3, dir: Vec3, albedo: u32) -> [u8; 4] {
     let (r, u, f) = view.camera.basis();
     let light = (r * -0.45 + u * 0.75 - f * 0.5).normalize();
     let hemi = 0.22 + 0.16 * (n.z * 0.5 + 0.5);
@@ -79,7 +84,7 @@ pub fn shade(view: &View, n: Vec3, dir: Vec3) -> [u8; 4] {
     let g = 1.0 - n.dot(dir).abs();
     let sil = 1.0 - 0.45 * g * g;
     let k = (hemi + key) * sil;
-    let a = rgba(ALBEDO);
+    let a = rgba(albedo);
     let c = [0, 1, 2].map(|i| (a[i] as f32 * k).round().clamp(0.0, 255.0) as u8);
     [c[0], c[1], c[2], 255]
 }
@@ -97,7 +102,7 @@ pub fn tri_colour(model: &Model, view: &View, tri: u32) -> Option<[u8; 4]> {
     }
     let centroid = (a + b + c) / 3.0;
     let dir = (centroid - view.camera.eye).normalize();
-    Some(shade(view, n, dir))
+    Some(shade_on(view, n, dir, crate::deviation::albedo(view, tri).unwrap_or(ALBEDO))) // VUGFACEDEVIATION (SR525): the map's albedo
 }
 
 /// Render the model under the view.

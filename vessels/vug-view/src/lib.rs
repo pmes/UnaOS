@@ -20,6 +20,7 @@ pub mod sketch;
 pub mod view;
 // VUGFACEFILLET (SR511): the edge tool — fillet / chamfer an edge of the body.
 pub mod fillet;
+pub mod deviation; // VUGFACEDEVIATION (SR525): a scan against its design document, in the band's colours
 
 use bandy::SMessage;
 use model::Model;
@@ -54,6 +55,7 @@ pub const SHORTCUTS: &[(&str, &str)] = &[
     ("u / U", "undo / redo (the document's snapshots; the face regenerates)"),
     ("Up / Down, Delete, Enter", "in the tree panel: move, delete the row with its dependants, edit its value (type, Enter)"),
     ("s / Cmd+S", "save the document: the opened .vug, else <file stem>.vug beside the opened file (a sibling .tmp renamed over it); the title shows * while unsaved; a write error is named in the corner"), // VUGFACESAVE (SR534)
+    ("d (outside a sketch)", "the deviation map on / off (a scan opened with --against <design.vugdoc>; the corner names the worst faces)"), // VUGFACEDEVIATION (SR525)
 ];
 
 /// The controller: owns the model and the view (one task, no lock).
@@ -110,6 +112,30 @@ impl Viewer {
         v.view.top(&v.model);
         v.view.design.face = Some(face);
         v.view.photo = Some(photo);
+        Ok(v)
+    }
+
+    /// VUGFACEDEVIATION (SR525): THE deviation road — a scan mesh (.ply / .stl / .obj through model.rs's readers; a
+    /// .prb is refused by name: fusion is tools/scan's) measured against a design document (doc_core `read`), drawn at
+    /// the aligned pose in the band's colours. The title is the scan's file name.
+    pub fn open_against(scan: &str, design: &str, size: (u32, u32), preset: Preset) -> Result<Viewer, String> {
+        let p = std::path::Path::new(scan);
+        let title = p.file_name().and_then(|s| s.to_str()).unwrap_or("vug").to_string();
+        if p.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("prb")) {
+            return Err(format!("{scan}: ScanPrb (fuse it first: `scan {scan} -o scan.ply`)"));
+        }
+        let mesh = model::read_mesh(scan)?;
+        let text = std::fs::read_to_string(design).map_err(|e| format!("{design}: {e}"))?;
+        let doc = doc_core::read(&text).map_err(|e| format!("{design}: {e:?}"))?;
+        Viewer::open_deviation(deviation::scan_mesh(mesh), &doc, &title, size, preset).map_err(|e| format!("{design}: {e}"))
+    }
+
+    /// VUGFACEDEVIATION (SR525): a scan measured against `doc` at `deviation::BAND_MM` (the test door): the model is the
+    /// scan at the aligned pose (as read on a refusal), the map the view's.
+    pub fn open_deviation(scan: scan_core::ScanMesh, doc: &doc_core::Doc, title: &str, size: (u32, u32), preset: Preset) -> Result<Viewer, String> {
+        let (model, map) = deviation::open(&scan, doc, deviation::BAND_MM)?;
+        let mut v = Viewer::new(model, title, size, preset);
+        v.view.deviation = Some(map);
         Ok(v)
     }
 
