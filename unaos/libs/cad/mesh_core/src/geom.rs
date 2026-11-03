@@ -46,3 +46,17 @@ pub(crate) fn ray_aabb(ray: &Ray, b: &Aabb3) -> Option<(f64, f64)> {
         RayBox::Miss => None,
     }
 }
+
+// VUGSCANDEVIATION (SR510): the closest-point query's two geometry calls (`Bvh::closest`), through this seam.
+
+/// geom_core's closest point of triangle `abc` to `p` (Ericson §5.1.5); a degenerate or non-finite triangle is `None`.
+pub(crate) fn closest_on_triangle(p: Vec3, a: Vec3, b: Vec3, c: Vec3, tol: Tol) -> Option<Vec3> {
+    geom_core::closest_point_triangle(p, a, b, c, tol).ok().map(|(q, _)| q)
+}
+
+/// The squared distance from `p` to the box (0 inside it).
+pub(crate) fn aabb_dist_sq(p: Vec3, b: &Aabb3) -> f64 {
+    let d = |x: f64, lo: f64, hi: f64| if x < lo { lo - x } else if x > hi { x - hi } else { 0.0 };
+    let (dx, dy, dz) = (d(p.x, b.min.x, b.max.x), d(p.y, b.min.y, b.max.y), d(p.z, b.min.z, b.max.z));
+    dx * dx + dy * dy + dz * dz
+}

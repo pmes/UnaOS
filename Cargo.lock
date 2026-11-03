@@ -4391,7 +4391,10 @@ version = "0.1.0"
 name = "scan"
 version = "0.1.0"
 dependencies = [
+ "brep_core",
+ "doc_core",
  "mesh_core",
+ "palette_core",
  "probe_core",
  "scan_core",
 ]
@@ -4400,6 +4403,7 @@ dependencies = [
 name = "scan_core"
 version = "0.1.0"
 dependencies = [
+ "brep_core",
  "geom_core",
  "libm",
  "mesh_core",

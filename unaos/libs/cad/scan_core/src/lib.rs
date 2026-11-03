@@ -30,6 +30,7 @@
 //! | [`mc`] | marching cubes over the volume, one vertex per voxel edge, confidence and normals carried | Lorensen & Cline 1987; Bourke 1994 numbering |
 //! | [`fit`] | plane and cylinder RANSAC with residuals | Schnabel, Wahl & Klein 2007; Fischler & Bolles 1981 |
 //! | [`graph`] | keyframes, the pose graph and loop closure over the tracked poses (VUGSCANLOOP SR500) | Kintinuous / ElasticFusion (Whelan et al.); g2o (Kümmerle et al. 2011) |
+//! | [`deviation`] | the scan registered to the design (point-to-plane ICP over mesh_core's `Bvh::closest`) and its signed deviation, stats and faces ranked (VUGSCANDEVIATION SR510) | Chen & Medioni 1992; Low 2004 |
 //! | [`fixture`] | synthetic Z16 frames of a known scene through probe_core's pinhole model | the inverse of `Intrinsics::deproject` |
 //!
 //! Units: millimetres in the world (BP-vug-2's `Tol` is linear in mm), metres only at probe_core's seam.
@@ -39,6 +40,7 @@
 
 extern crate alloc;
 
+pub mod deviation;
 pub mod fit;
 pub mod fixture;
 mod geom;
@@ -50,6 +52,7 @@ pub mod tsdf;
 
 use alloc::vec::Vec;
 
+pub use deviation::{AlignParams, Aligned, Design, Deviation, DeviationError, FaceReport, Shade, Stats, align, deviations, measure, shade};
 pub use fit::{Cone, Cylinder, Fit, FitError, Floor, Primitive, Shape, Sphere, detect, fit_cylinder, fit_plane};
 pub use geom::{Plane, Tol, Transform, Vec3};
 pub use graph::{

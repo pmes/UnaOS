@@ -17,3 +17,8 @@ license = "LGPL-3.0-or-later"
 probe_core = { path = "../../unaos/libs/media/probe_core" }
 scan_core = { path = "../../unaos/libs/cad/scan_core" }
 mesh_core = { path = "../../unaos/libs/cad/mesh_core" }
+# VUGSCANDEVIATION (SR510): `--against <design.vugdoc>`: doc_core reads and replays the design, brep_core tessellates
+# its solids, palette_core gives the deviation map's colours.
+doc_core = { path = "../../unaos/libs/cad/doc_core" }
+brep_core = { path = "../../unaos/libs/cad/brep_core" }
+palette_core = { path = "../../unaos/libs/sys/palette_core" }
