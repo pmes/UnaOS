@@ -14,9 +14,11 @@
 //! to the Body), so the tree never shows something the geometry is not; a replay failure names its line in the panel
 //! and keeps the last good geometry and document. A deleted statement takes its dependants with it through doc_core's
 //! own reader (`What::UnknownRef` by line) and replay (`Fault::Upstream` by line); `diff`'s Removed names them.
+//! A committed fillet / chamfer of the face (fillet.rs) enters by [`Journal::record_edit`] after the frozen features
+//! (VUGFACETREEFILLET, SR518); in the Body an edit's solid stands in its `on` solid's place ([`live_solids`]).
 //!
 //! Ids: sketch 0 is `s` with entities `e<n>` and constraints `k<n>`, sketch j > 0 is `s<j>` with `s<j>e<n>` /
-//! `s<j>k<n>`, extrudes `x<n>`; a face slot keeps its name across regenerates (the slot maps in `Open`).
+//! `s<j>k<n>`, extrudes `x<n>`, fillets `f<n>`, chamfers `c<n>`; a face slot keeps its name across regenerates (the slot maps in `Open`).
 
 use crate::extrude::{Body, Pull};
 use crate::raster::{self, Frame as Raster, rgba};
@@ -181,7 +183,7 @@ pub fn regenerate(doc: &Doc) -> Result<Regen, String> {
     if let Some(f) = rep.failures.first() {
         return Err(format!("line {}: {:?} {}", f.line, f.fault, f.id));
     }
-    let breps: Vec<brep_core::Brep> = rep.solids.iter().map(|s| s.brep.clone()).collect();
+    let breps = live_breps(doc, &rep.solids); // VUGFACETREEFILLET (SR518): an edit's solid stands in its on solid's place
     let body = if breps.is_empty() { None } else { Some(Body::from_breps(breps, doc.tol)?) };
     let Some(j) = open_sketch(doc) else {
         return Ok(Regen { face: None, body, open: None, closed: doc.stmts.len() });
@@ -558,5 +560,62 @@ pub fn overlay(view: &View, fr: &mut Raster) {
     if let Some(n) = &j.note {
         let col = if n.starts_with("line ") { rgba(REFUSED) } else { rgba(INK) };
         raster::text(fr, &clip(&n.to_uppercase()), x0 + 4.0, h - ROW_PX, col);
+    }
+}
+
+// ---- VUGFACETREEFILLET (SR518): an edge edit enters the document ----
+
+/// The Body's solids as document ids, in Body order: THE body-index rule the face (fillet.rs, `Picked::brep`) and
+/// [`regenerate`] share. An extrude / revolve appends its id (the pull's brep is appended, its statement too); a
+/// fillet / chamfer replaces the id equal to its `on` in place (the face's edit replaces `breps[k]`; replay keeps the
+/// `on` solid and pushes the edit's at the end, so the order is the document's, not replay's).
+fn live_solids(doc: &Doc) -> Vec<String> {
+    let mut ids: Vec<String> = Vec::new();
+    for s in &doc.stmts {
+        match s {
+            Stmt::Extrude { id, .. } | Stmt::Revolve { id, .. } => ids.push(id.clone()),
+            Stmt::Fillet { id, on, .. } | Stmt::Chamfer { id, on, .. } => {
+                if let Some(slot) = ids.iter_mut().find(|i| i.as_str() == on.as_str()) {
+                    *slot = id.clone();
+                }
+            }
+            _ => {}
+        }
+    }
+    ids
+}
+
+/// The replayed Breps in Body order ([`live_solids`]): each id's LAST solid (as replay's `edit_step` reads its `on`).
+fn live_breps(doc: &Doc, solids: &[doc_core::SolidOut]) -> Vec<brep_core::Brep> {
+    live_solids(doc).iter().filter_map(|id| solids.iter().rev().find(|o| o.id == *id).map(|o| o.brep.clone())).collect()
+}
+
+impl Journal {
+    /// A committed edge edit of the face: `stmt` (a `Fillet` / `Chamfer`, its `id` and `on` left empty) gets `on` =
+    /// the document id of the Body's solid `brep` ([`live_solids`]) and a free id (`f<n>` / `c<n>`), and is inserted
+    /// after the frozen features (an open sketch stays the tail) as a snapshot; the cursor moves to its row. Returns
+    /// the id; None when the Body's solid is not the document's (a body set from outside) or `stmt` is no edit.
+    pub fn record_edit(&mut self, brep: u32, stmt: Stmt) -> Option<String> {
+        let on = live_solids(&self.doc).get(brep as usize)?.clone();
+        let at = self.closed.min(self.doc.stmts.len());
+        let mut stmts = self.doc.stmts.clone();
+        let mut stmt = stmt;
+        let new_id = match &stmt {
+            Stmt::Fillet { .. } => free(&stmts, |n| format!("f{n}")),
+            Stmt::Chamfer { .. } => free(&stmts, |n| format!("c{n}")),
+            _ => return None,
+        };
+        match &mut stmt {
+            Stmt::Fillet { id, on: o, .. } | Stmt::Chamfer { id, on: o, .. } => {
+                *id = new_id.clone();
+                *o = on;
+            }
+            _ => return None,
+        }
+        stmts.insert(at, stmt);
+        self.closed = at + 1;
+        self.commit(Doc { tol: self.doc.tol, stmts, lines: Vec::new() });
+        self.cursor = at;
+        Some(new_id)
     }
 }
