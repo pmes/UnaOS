@@ -37,6 +37,10 @@ pub enum Refusal {
     /// A word the reader does not take, by name.
     Unsupported { line: usize, word: String },
     Parse { line: usize, what: &'static str },
+    // VUGMAKESLICE (SR483): a section whose segments do not close (the gap to the nearest free start; nothing is
+    // bridged), and slice parameters or a machine the slicer cannot take.
+    OpenLoop { layer: usize, gap: f64 },
+    SliceInvalid { what: &'static str },
 }
 
 /// The planner's numbers for a program.

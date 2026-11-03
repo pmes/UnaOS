@@ -12,6 +12,7 @@ use libm::ceil;
 use crate::geom::{Tol, Vec2, Vec3, line_line2, seg_seg2, signed_area2};
 use crate::machine::{Machine, Tool};
 use crate::program::{Move, Program, Spin};
+use crate::slice::SliceParams; // VUGMAKESLICE (SR483)
 use crate::validate::Refusal;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -37,6 +38,7 @@ pub enum Op {
     Face { area: Vec<Vec2>, depth: f64 },
     PrintLayers { slices: Vec<(f64, Vec<Vec<Vec2>>)>, tool: u32 },
     LaserCut { polylines: Vec<Vec<Vec2>>, passes: u32 },
+    Slice { triangles: Vec<[Vec3; 3]>, params: SliceParams }, // VUGMAKESLICE (SR483): FDM slicing of a triangle soup
 }
 
 /// The toolpath for `op` on `m`, or the refusal by name.
@@ -50,6 +52,7 @@ pub fn generate(op: &Op, m: &Machine, tol: Tol) -> Result<Program, Refusal> {
         Op::Face { .. } => Err(Refusal::OpOwed { op: "Face", owed: "VUG-MAKE-POCKET" }),
         Op::PrintLayers { .. } => Err(Refusal::OpOwed { op: "PrintLayers", owed: "VUG-MAKE-SLICE" }),
         Op::LaserCut { .. } => Err(Refusal::OpOwed { op: "LaserCut", owed: "VUG-MAKE-LASER" }),
+        Op::Slice { triangles, params } => crate::slice::slice(triangles, params, m, tol), // VUGMAKESLICE (SR483)
     }
 }
 
