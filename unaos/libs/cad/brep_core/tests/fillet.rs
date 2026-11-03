@@ -187,10 +187,11 @@ fn two_edges_at_one_vertex_refuse_by_vertex() {
     let front = top_front(&a);
     let left = edge_where(&a, |p| near(p.x, 0.0) && near(p.z, 10.0));
     let corner = a.vertices.iter().find(|v| near(v.p.x, 0.0) && near(v.p.y, 0.0) && near(v.p.z, 10.0)).unwrap().id;
+    // VUGBREPCORNER (SR512): two of the corner's three edges listed is "partial".
     let got = fillet(&a, &[front, left], 1.0, T);
-    assert_eq!(got, Err(Refusal::CornerNotBlended { vertex: corner }));
+    assert_eq!(got, Err(Refusal::CornerNotBlended { vertex: corner, reason: "partial" }));
     let got = chamfer(&a, &[front, left], 1.0, 1.0, T);
-    assert_eq!(got, Err(Refusal::CornerNotBlended { vertex: corner }));
+    assert_eq!(got, Err(Refusal::CornerNotBlended { vertex: corner, reason: "partial" }));
 }
 
 #[test]
@@ -211,4 +212,87 @@ fn a_plane_cylinder_edge_refuses_by_pair() {
         ),
         "{got:?}"
     );
+}
+
+// VUGBREPCORNER (SR512): the box corner — the sphere octant for a fillet, the mitre triangle for a chamfer.
+
+/// The vertex at `p` and the Ids of the edges ending there.
+fn at_vertex(b: &Brep, p: Vec3) -> (Id, Vec<Id>) {
+    let vi = b.vertices.iter().position(|v| v.p.dist(p) < 1e-9).expect("the vertex");
+    let edges = b.edges.iter().filter(|e| e.v.contains(&(vi as u32))).map(|e| e.id).collect();
+    (b.vertices[vi].id, edges)
+}
+
+fn corner_name(op: OpKind, vertex: Id) -> Name {
+    Name { op, role: Role::Blend, a: vertex.0 as u32, b: 0 }
+}
+
+#[test]
+fn all_twelve_edges_filleted_is_the_minkowski_box() {
+    let a = cube();
+    let ids: Vec<Id> = a.edges.iter().map(|e| e.id).collect();
+    assert_eq!(ids.len(), 12);
+    let (av, r) = (10.0, 1.0);
+    let s = av - 2.0 * r;
+    let vol = s * s * s + 3.0 * s * s * (2.0 * r) + 3.0 * s * (PI * r * r) + 4.0 / 3.0 * PI * r * r * r;
+    let out = fillet(&a, &ids, r, T).expect("fillet");
+    let rep = check(&out, vol, 26);
+    assert_eq!((rep.vertices, rep.edges, rep.genus.clone()), (24, 48, vec![0]));
+    let (corner, _) = at_vertex(&a, Vec3::new(0.0, 0.0, 0.0));
+    let found = faces_named(&out, corner_name(OpKind::Fillet, corner));
+    assert_eq!(found.len(), 1, "one patch carries the corner vertex's Name");
+    let f = &out.faces[found[0] as usize];
+    assert_eq!(f.surface.kind(), SurfaceKind::Sphere);
+    assert!(!f.reversed, "a convex corner faces away from its centre");
+    let spheres = out.faces.iter().filter(|f| f.surface.kind() == SurfaceKind::Sphere).count();
+    let cylinders = out.faces.iter().filter(|f| f.surface.kind() == SurfaceKind::Cylinder).count();
+    assert_eq!((spheres, cylinders), (8, 12));
+}
+
+#[test]
+fn three_edges_at_one_vertex_filleted_r2() {
+    let a = cube();
+    let (_, ids) = at_vertex(&a, Vec3::new(0.0, 0.0, 0.0));
+    assert_eq!(ids.len(), 3);
+    let (av, r) = (10.0, 2.0);
+    // Each edge loses (1 - pi/4) r^2 over a - r (from the corner setback to its far end); the corner cube r^3 keeps
+    // the ball's eighth.
+    let vol = av * av * av - 3.0 * (av - r) * (1.0 - PI / 4.0) * r * r - (1.0 - PI / 6.0) * r * r * r;
+    let out = fillet(&a, &ids, r, T).expect("fillet");
+    check(&out, vol, 10);
+}
+
+#[test]
+fn all_twelve_edges_chamfered_cut_the_corners_with_triangles() {
+    let a = cube();
+    let ids: Vec<Id> = a.edges.iter().map(|e| e.id).collect();
+    let (av, d) = (10.0, 1.0);
+    // Each edge loses d^2 / 2 over a - 2d; each corner cube d^3 keeps the tetrahedron d^3 / 6.
+    let vol = av * av * av - 12.0 * (d * d / 2.0) * (av - 2.0 * d) - 8.0 * (5.0 / 6.0) * d * d * d;
+    let out = chamfer(&a, &ids, d, d, T).expect("chamfer");
+    let rep = check(&out, vol, 26);
+    assert_eq!((rep.vertices, rep.edges), (24, 48));
+    let (corner, _) = at_vertex(&a, Vec3::new(10.0, 10.0, 10.0));
+    let found = faces_named(&out, corner_name(OpKind::Chamfer, corner));
+    assert_eq!(found.len(), 1);
+    assert_eq!(out.faces[found[0] as usize].surface.kind(), SurfaceKind::Plane);
+}
+
+#[test]
+fn unequal_chamfer_at_a_corner_refuses_by_reason() {
+    let a = cube();
+    let (corner, ids) = at_vertex(&a, Vec3::new(0.0, 0.0, 0.0));
+    let got = chamfer(&a, &ids, 1.0, 2.0, T);
+    assert_eq!(got, Err(Refusal::CornerNotBlended { vertex: corner, reason: "unequal-radii" }));
+}
+
+#[test]
+fn oblique_corner_refuses_by_reason() {
+    let a = cube();
+    let c = chamfer(&a, &[top_front(&a)], 2.0, 2.0, T).expect("chamfer");
+    // The chamfer plane meets the top face at 135 degrees at its trim vertex (0, 2, 10).
+    let (corner, ids) = at_vertex(&c, Vec3::new(0.0, 2.0, 10.0));
+    assert_eq!(ids.len(), 3);
+    let got = fillet(&c, &ids, 0.5, T);
+    assert_eq!(got, Err(Refusal::CornerNotBlended { vertex: corner, reason: "oblique" }));
 }
