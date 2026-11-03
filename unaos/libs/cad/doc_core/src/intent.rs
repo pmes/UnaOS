@@ -15,6 +15,11 @@
 //! that does, called by the person's accept (and by [`verify_all`], which shows a batch in order, each later proposal
 //! seeing the earlier accepted ones). The proposer's confidence is reported, never a gate.
 //!
+//! VUGINTENTHOLES (LEDGER SR507): the Outline is LOOPS (the outer, then every hole, as photo_core's `Measured.loops`
+//! gives them). Each replayed profile loop (outer and each hole) is paired one-to-one with the measured loop whose
+//! centroid is nearest within the larger loop's extent (`pair_loops`); a loop left without a partner on either side
+//! is refused by name ([`Reason::UnmatchedLoop`]); the two-sided residual runs per pair, max and RMS over all pairs.
+//!
 //! doc_core takes no libm: the one square root is geom_core's `Vec2::mag` (the RMS as a hypot accumulation).
 
 use alloc::format;
@@ -23,7 +28,7 @@ use alloc::vec::Vec;
 use core::f64::consts::{PI, TAU};
 
 use brep_core::geom_core::{Segment, Vec2, Vec3, closest_point_segment, closest_point_triangle};
-use sketch_core::{Arc2, Edge, profiles};
+use sketch_core::{Arc2, Edge, Loop, profiles};
 
 use crate::lex::read;
 use crate::replay::{Failure, Fault, Replay, replay};
@@ -45,13 +50,19 @@ pub struct Proposal {
 /// What the geometry is checked against. Scan shapes (SR497) are VUG-INTENT-SCAN's (owed).
 #[derive(Clone, Debug, PartialEq)]
 pub enum Measurement {
-    /// A CLOSED polyline in the plane of the document's first solved sketch (a photo outline), mm.
-    Outline { pts: Vec<Vec2>, sigma_mm: f64 },
+    /// CLOSED polylines in the plane of the document's first solved sketch (a photo outline), mm: the outer, then
+    /// every hole (photo_core `Measured.loops`). One loop: [`Measurement::outline`].
+    Outline { loops: Vec<Vec<Vec2>>, sigma_mm: f64 },
     /// Points on the part's surface (a scan), mm, in the document's world frame.
     Points { pts: Vec<Vec3>, sigma_mm: f64 },
 }
 
 impl Measurement {
+    /// VUGINTENTHOLES (SR507): ONE closed polyline (a part without holes) as an Outline of one loop.
+    pub fn outline(pts: Vec<Vec2>, sigma_mm: f64) -> Measurement {
+        Measurement::Outline { loops: alloc::vec![pts], sigma_mm }
+    }
+
     pub fn sigma_mm(&self) -> f64 {
         match self {
             Measurement::Outline { sigma_mm, .. } | Measurement::Points { sigma_mm, .. } => *sigma_mm,
@@ -60,13 +71,14 @@ impl Measurement {
 
     pub fn len(&self) -> usize {
         match self {
-            Measurement::Outline { pts, .. } => pts.len(),
+            Measurement::Outline { loops, .. } => loops.iter().map(|l| l.len()).sum(),
             Measurement::Points { pts, .. } => pts.len(),
         }
     }
 
+    /// No points, or an Outline loop with no points (VUGINTENTHOLES SR507).
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.len() == 0 || matches!(self, Measurement::Outline { loops, .. } if loops.iter().any(|l| l.is_empty()))
     }
 }
 
@@ -90,6 +102,9 @@ pub enum Reason {
     Residual { max_mm: f64, limit_mm: f64 },
     /// The RMS grew past the document's own by more than sigma.
     Worse { rms_mm: f64, before_mm: f64, sigma_mm: f64 },
+    /// VUGINTENTHOLES (SR507): a replayed profile loop or a measured loop has no partner (no loop of the other side
+    /// whose centroid is within the larger extent, one-to-one); the counts are the replayed and measured loops.
+    UnmatchedLoop { replayed: usize, measured: usize },
 }
 
 impl Reason {
@@ -115,6 +130,9 @@ impl Reason {
                 f64_text(*before_mm),
                 f64_text(*sigma_mm)
             ),
+            Reason::UnmatchedLoop { replayed, measured } => {
+                format!("unmatched-loop replayed={} measured={}", replayed, measured)
+            }
         }
     }
 }
@@ -283,25 +301,32 @@ struct Fit {
 fn residual(r: &Replay, m: &Measurement, tol: Tol) -> Result<Fit, Reason> {
     let mut d: Vec<f64> = Vec::new();
     match m {
-        Measurement::Outline { pts, .. } => {
+        Measurement::Outline { loops, .. } => {
             let Some(s) = r.sketches.first() else { return Err(Reason::NoGeometry) };
-            let mut edges: Vec<Edge> = Vec::new();
-            for p in profiles(&s.sketch, tol) {
-                edges.extend(p.outer.edges.iter().copied());
-                for h in &p.holes {
-                    edges.extend(h.edges.iter().copied());
-                }
+            // VUGINTENTHOLES (SR507): every replayed profile loop (outer, then each hole), paired with a measured loop.
+            let ps = profiles(&s.sketch, tol);
+            let mut mine: Vec<&Loop> = Vec::new();
+            for p in &ps {
+                mine.push(&p.outer);
+                mine.extend(p.holes.iter());
             }
-            if edges.is_empty() {
+            mine.retain(|l| !l.edges.is_empty());
+            if mine.is_empty() {
                 return Err(Reason::NoGeometry);
             }
-            for &q in pts {
-                d.push(edges.iter().map(|e| to_edge(q, e, tol)).fold(f64::INFINITY, f64::min));
-            }
-            for e in &edges {
-                d.push(to_polyline(e.start(), pts));
-                if let Edge::Arc { arc, .. } = e {
-                    d.push(to_polyline(arc.point_at(0.5), pts));
+            let Some(pairs) = pair_loops(&mine, loops) else {
+                return Err(Reason::UnmatchedLoop { replayed: mine.len(), measured: loops.len() });
+            };
+            for (i, j) in pairs {
+                let (edges, pts) = (&mine[i].edges, &loops[j]);
+                for &q in pts {
+                    d.push(edges.iter().map(|e| to_edge(q, e, tol)).fold(f64::INFINITY, f64::min));
+                }
+                for e in edges {
+                    d.push(to_polyline(e.start(), pts));
+                    if let Edge::Arc { arc, .. } = e {
+                        d.push(to_polyline(arc.point_at(0.5), pts));
+                    }
                 }
             }
         }
@@ -381,4 +406,77 @@ fn to_arc(q: Vec2, arc: &Arc2, s: Vec2, e: Vec2, tol: Tol) -> f64 {
         !(b.cross(v) > 0.0 && v.cross(a) > 0.0)
     };
     if inside { (v.mag() - arc.radius).abs() } else { q.dist(s).min(q.dist(e)) }
+}
+
+// VUGINTENTHOLES (SR507): loop pairing for the Outline residual.
+
+/// Arc samples per edge for the pairing centroid only (never a distance).
+const PAIR_SAMPLES: usize = 8;
+
+/// A loop's key: its shoelace area centroid (the vertex mean when the area vanishes) and its extent (the largest
+/// distance from that centroid to a vertex).
+fn loop_key(pts: &[Vec2]) -> (Vec2, f64) {
+    let n = pts.len();
+    let (mut a2, mut cx, mut cy) = (0.0, 0.0, 0.0);
+    let (mut mx, mut my) = (0.0, 0.0);
+    for i in 0..n {
+        let (p, q) = (pts[i], pts[(i + 1) % n]);
+        let c = p.cross(q);
+        a2 += c;
+        cx += (p.x + q.x) * c;
+        cy += (p.y + q.y) * c;
+        mx += p.x;
+        my += p.y;
+    }
+    let c = if a2.abs() > 2e-12 {
+        Vec2::new(cx / (3.0 * a2), cy / (3.0 * a2))
+    } else if n > 0 {
+        Vec2::new(mx / n as f64, my / n as f64)
+    } else {
+        Vec2::new(0.0, 0.0)
+    };
+    let e = pts.iter().map(|&p| p.dist(c)).fold(0.0, f64::max);
+    (c, e)
+}
+
+/// The points of a replayed loop for its key: each edge's start, and on an arc `PAIR_SAMPLES` points along it.
+fn replayed_pts(l: &Loop) -> Vec<Vec2> {
+    let mut out = Vec::new();
+    for e in &l.edges {
+        out.push(e.start());
+        if let Edge::Arc { arc, .. } = e {
+            for k in 1..PAIR_SAMPLES {
+                out.push(arc.point_at(k as f64 / PAIR_SAMPLES as f64));
+            }
+        }
+    }
+    out
+}
+
+/// One-to-one (replayed, measured) pairs: a candidate's centroids are within the larger loop's extent; candidates
+/// are taken greedily by centroid distance plus extent difference (the extent term only orders). `None` when any
+/// loop on either side is left without a partner.
+fn pair_loops(mine: &[&Loop], measured: &[Vec<Vec2>]) -> Option<Vec<(usize, usize)>> {
+    let a: Vec<(Vec2, f64)> = mine.iter().map(|l| loop_key(&replayed_pts(l))).collect();
+    let b: Vec<(Vec2, f64)> = measured.iter().map(|m| loop_key(m)).collect();
+    let mut cand: Vec<(f64, usize, usize)> = Vec::new();
+    for (i, &(ci, ei)) in a.iter().enumerate() {
+        for (j, &(cj, ej)) in b.iter().enumerate() {
+            let dc = ci.dist(cj);
+            if dc <= ei.max(ej) {
+                cand.push((dc + (ei - ej).abs(), i, j));
+            }
+        }
+    }
+    cand.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap_or(core::cmp::Ordering::Equal));
+    let (mut used_a, mut used_b) = (alloc::vec![false; a.len()], alloc::vec![false; b.len()]);
+    let mut pairs = Vec::new();
+    for (_, i, j) in cand {
+        if !used_a[i] && !used_b[j] {
+            used_a[i] = true;
+            used_b[j] = true;
+            pairs.push((i, j));
+        }
+    }
+    if pairs.len() == a.len() && pairs.len() == b.len() { Some(pairs) } else { None }
 }
