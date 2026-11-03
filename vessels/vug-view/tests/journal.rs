@@ -4,7 +4,8 @@
 //! VUGFACETREE (LEDGER SR513): the feature tree's host witness — the SR485 rectangle drawn by events and dimensioned by
 //! the tool is a doc_core document that reads back and replays to the face's dof; `u` / `U` step the snapshots and the
 //! face regenerates; deleting the extrude row removes the body; editing the width row regenerates the body; a refused
-//! edit keeps the geometry and names its line.
+//! edit keeps the geometry and names its line. VUGFACESAVE (SR534): a saved document reopens through `Viewer::open` to the
+//! same text and volume; the title's `*` follows an edit and clears on save; a path that cannot be written is named.
 
 use bandy::SMessage;
 use doc_core::{Cons, Stmt};
@@ -206,4 +207,76 @@ fn a_refused_edit_keeps_the_geometry_and_names_the_line() {
     assert!(note.starts_with(&format!("line {}:", x + 2)), "the extrude's line named: {note}");
     assert_eq!(doc(&vw), &before);
     assert!((volume(&vw) - 1600.0).abs() < 1e-4);
+}
+
+// ---- VUGFACESAVE (SR534): the save road ----
+
+/// A fresh path under cargo's per-test scratch dir (the private target), nothing left from an earlier run.
+fn scratch(name: &str) -> std::path::PathBuf {
+    let p = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
+    let _ = std::fs::remove_file(&p);
+    p
+}
+
+#[test]
+fn a_saved_document_reopens_to_the_same_text_and_volume() {
+    let mut vw = extruded();
+    let path = scratch("vugfacesave-reopen.vug");
+    vw.save_to = Some(path.clone());
+    assert!(typed(&mut vw, "s"));
+    assert_eq!(vw.view.design.journal.disk, Some(Ok("saved vugfacesave-reopen.vug".to_string())));
+    assert!(path.exists());
+    assert!(!std::path::Path::new(&format!("{}.tmp", path.display())).exists(), "the temp file was renamed away");
+    let back = Viewer::open(path.to_str().expect("utf-8 path"), (W, H), Preset::Una).expect("the saved document opens");
+    assert_eq!(doc_core::write(doc(&back)), doc_core::write(doc(&vw)));
+    assert!((volume(&back) - 1600.0).abs() < 1e-4, "volume {}", volume(&back));
+    assert_eq!(back.title, "vugfacesave-reopen.vug", "a just-opened document is clean");
+    assert!(!back.view.design.journal.dirty());
+    // Opened from the file, the face writes back over it.
+    let mut back = back;
+    assert!(typed(&mut back, "s"));
+    assert!(matches!(back.view.design.journal.disk, Some(Ok(_))), "{:?}", back.view.design.journal.disk);
+}
+
+#[test]
+fn the_title_marks_an_edit_and_a_save_clears_it() {
+    let mut vw = dimensioned();
+    assert_eq!(vw.title, "tree*");
+    assert!(vw.view.design.journal.dirty());
+    vw.save_to = Some(scratch("vugfacesave-title.vug"));
+    assert!(key(&mut vw, "Meta+s"));
+    assert_eq!(vw.title, "tree", "{:?}", vw.view.design.journal.disk);
+    assert!(typed(&mut vw, "u"));
+    assert_eq!(vw.title, "tree*", "an undo differs from the saved text");
+    assert!(typed(&mut vw, "U"));
+    assert_eq!(vw.title, "tree", "redo is the saved text again");
+}
+
+#[test]
+fn a_path_that_cannot_be_written_names_the_error() {
+    let mut vw = dimensioned();
+    let before = doc(&vw).clone();
+    // A regular file where the directory should be: refused even for root (a chmod'ed read-only dir is not).
+    let file = scratch("vugfacesave-not-a-dir");
+    std::fs::write(&file, b"x").expect("scratch file");
+    vw.save_to = Some(file.join("part.vug"));
+    assert!(typed(&mut vw, "s"));
+    let err = match &vw.view.design.journal.disk {
+        Some(Err(e)) => e.clone(),
+        other => panic!("refused by name, got {other:?}"),
+    };
+    assert!(err.contains("part.vug.tmp"), "{err}");
+    assert_eq!(doc(&vw), &before);
+    assert_eq!(vw.title, "tree*");
+    // A face opened from no file has nowhere to write.
+    let mut bare = Viewer::new(cube(), "bare", (W, H), Preset::Una);
+    assert!(typed(&mut bare, "s"));
+    assert!(matches!(&bare.view.design.journal.disk, Some(Err(e)) if e.starts_with("no file")), "{:?}", bare.view.design.journal.disk);
+    // An existing document the face did not open is not overwritten.
+    let other = scratch("vugfacesave-other.vug");
+    std::fs::write(&other, "vug-doc version=1\n").expect("scratch doc");
+    vw.save_to = Some(other.clone());
+    assert!(typed(&mut vw, "s"));
+    assert!(matches!(&vw.view.design.journal.disk, Some(Err(e)) if e.contains("exists")), "{:?}", vw.view.design.journal.disk);
+    assert_eq!(std::fs::read_to_string(&other).expect("untouched"), "vug-doc version=1\n");
 }
