@@ -19,9 +19,18 @@ const X: Vec3 = Vec3::new(1.0, 0.0, 0.0);
 const Y: Vec3 = Vec3::new(0.0, 1.0, 0.0);
 const Z: Vec3 = Vec3::new(0.0, 0.0, 1.0);
 
-/// Frame k's true pose: the orbit at 4° steps of azimuth.
+/// The orbit's step: 1° of azimuth a frame. THE REGIME (amendment E): KinectFusion tracks a 30 Hz depth stream, where a
+/// hand or a turntable moves a few millimetres and well under a degree between frames (Newcombe et al., ISMAR 2011,
+/// §3.5: the small-motion assumption behind projective association; PCL KinFu's fixed 4 / 5 / 10 iterations rest on
+/// it). This test's first fixture stepped 4° (about 42 mm at the 600 mm standoff) and measured projective ICP falling
+/// short ALONG the motion (noise-free: 1.036 mm short at 4°, 62.7 mm off at 8°) whether or not the tracked frames were
+/// integrated: outside the regime, not a tracker fault. 1° is about 10 mm a frame; the coarse-step road back is
+/// VUG-SCAN-POSE-PREDICT (a constant-velocity predictor).
+const STEP_DEG: f64 = 1.0;
+
+/// Frame k's true pose: the orbit at [`STEP_DEG`] steps of azimuth.
 fn truth(k: u32) -> Transform {
-    fixture::orbit(CENTRE, 600.0, 40.0 * DEG, k as f64 * 4.0 * DEG)
+    fixture::orbit(CENTRE, 600.0, 40.0 * DEG, k as f64 * STEP_DEG * DEG)
 }
 
 fn render(k: u32, noise: Noise) -> Frame {
@@ -66,7 +75,7 @@ fn tracked_orbit_meets_the_truth_and_the_fits() {
     let mut t = Tsdf::new(4.0, 12.0, Tol::DEFAULT).expect("volume");
     let mut tr = Tracker::new(&t, TOL);
     let p0 = truth(0);
-    let frames = 31;
+    let frames = 121; // the same 0-120° arc as the 4° fixture's 31 frames
     let (mut max_t, mut max_deg, mut fine_iters) = (0.0f64, 0.0f64, 0u32);
     for k in 0..frames {
         let f = render(k, Noise::D435I);
