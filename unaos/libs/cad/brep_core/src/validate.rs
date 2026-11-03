@@ -11,7 +11,7 @@
 //! 8. each solid's first shell encloses positive volume (`InsideOut`).
 
 use crate::Refusal;
-use crate::dep::Tol;
+use geom_core::Tol;
 use crate::mass::{loop_area, shell_volume};
 use crate::surface::Surface;
 use crate::topo::Brep;

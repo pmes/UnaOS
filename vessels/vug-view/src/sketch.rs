@@ -24,7 +24,6 @@ use crate::model::Model;
 use crate::raster::{self, Frame as Raster, rgba};
 use crate::view::{Action, Button, CLICK_PX, View};
 use brep_core::Frame;
-use brep_core::dep as bd;
 use sketch_core::{Constraint, ConstraintId, Entity, EntityId, Loop, PointRef, Profile, Sketch, Tol, Vec2};
 use std::f64::consts::{FRAC_PI_2, TAU};
 use std::sync::Arc;
@@ -153,7 +152,7 @@ pub struct Design {
 /// The three world planes as right-handed sketch frames: XY (normal +Z), XZ (the front plane, normal -Y), YZ (the
 /// right plane, normal +X).
 pub fn world_planes() -> [(&'static str, Frame); 3] {
-    let v = |x: f64, y: f64, z: f64| bd::Vec3::new(x, y, z);
+    let v = |x: f64, y: f64, z: f64| geom_core::Vec3::new(x, y, z);
     let o = v(0.0, 0.0, 0.0);
     [
         ("XY", Frame { o, x: v(1.0, 0.0, 0.0), y: v(0.0, 1.0, 0.0), z: v(0.0, 0.0, 1.0) }),
@@ -317,12 +316,11 @@ impl SketchFace {
     pub fn unproject(&self, view: &View, x: f64, y: f64) -> Option<Vec2> {
         let (o, d) = view.ray_f64(x, y);
         let g = |a: [f64; 3]| geom_core::Vec3::new(a[0], a[1], a[2]);
-        let gb = |a: bd::Vec3| geom_core::Vec3::new(a.x, a.y, a.z);
         let line = geom_core::Line::new(g(o), g(d)).ok()?;
-        let plane = geom_core::Plane::from_point_normal(gb(self.plane.o), gb(self.plane.z)).ok()?;
+        let plane = geom_core::Plane::from_point_normal(self.plane.o, self.plane.z).ok()?;
         match geom_core::line_plane(&line, &plane, geom_core::Tol::DEFAULT) {
             geom_core::LinePlane::Point { p, t } if t > 0.0 => {
-                let (a, b, _) = self.plane.local(bd::Vec3::new(p.x, p.y, p.z));
+                let (a, b, _) = self.plane.local(p);
                 Some(Vec2::new(a, b))
             }
             _ => None,
@@ -567,10 +565,10 @@ impl Design {
         let denom = 1.0 - b * b;
         pull.distance = if denom > 1e-3 { (e - b * dd) / denom } else { -(y - pull.start.1) * face_mm.unwrap_or(1.0) };
         let mut all = breps;
-        pull.preview = match extrude::extrude(&pull.profile, &pull.plane, pull.distance, bd::Tol::DEFAULT) {
+        pull.preview = match extrude::extrude(&pull.profile, &pull.plane, pull.distance, geom_core::Tol::DEFAULT) {
             Ok(b) => {
                 all.push(b);
-                Body::from_breps(all, bd::Tol::DEFAULT).ok()
+                Body::from_breps(all, geom_core::Tol::DEFAULT).ok()
             }
             Err(_) => None,
         };

@@ -9,46 +9,20 @@
 //! mesh that enters the view through model.rs's `Model::from_triangles` (so mesh_core stays named in model.rs alone);
 //! the Breps are kept beside it, with the per-triangle face map a sketch-on-face pick reads.
 //!
-//! brep_core's `Profile` / `Mesh` / vectors were still its private `dep.rs` shims at this build (VUGSHIMSWAP in
-//! flight), so [`profile`] rebuilds the sketch_core profile field by field and [`Body::from_breps`] reads the
-//! tessellation's positions field by field: the field names are the real crates' too, so the same lines compile after
-//! the swap (where they become same-type rebuilds).
+//! brep_core takes sketch_core's `Profile` itself since VUGBREPSWAP (SR492: its `dep.rs` shims are gone), so a profile
+//! passes straight through; [`Body::from_breps`] copies the tessellation's positions into model.rs's `[f64; 3]` seam.
 
 use crate::model::Model;
-use brep_core::dep as bd;
 use brep_core::{Brep, Entity, Frame, Id, Refusal, Surface};
-use sketch_core::{Edge, Loop, Profile};
+use sketch_core::Profile;
 use std::fmt;
 use std::sync::Arc;
 
-fn v2(v: sketch_core::Vec2) -> bd::Vec2 {
-    bd::Vec2::new(v.x, v.y)
-}
-
-fn edge(e: &Edge) -> bd::Edge {
-    match *e {
-        Edge::Line { from, to, src } => bd::Edge::Line { from: v2(from), to: v2(to), src: bd::EntityId(src.0) },
-        Edge::Arc { arc, src } => bd::Edge::Arc {
-            arc: bd::Arc2 { centre: v2(arc.centre), radius: arc.radius, start: arc.start, sweep: arc.sweep },
-            src: bd::EntityId(src.0),
-        },
-    }
-}
-
-fn ring(l: &Loop) -> bd::Loop {
-    bd::Loop { edges: l.edges.iter().map(edge).collect(), area: l.area }
-}
-
-/// sketch_core's profile as brep_core takes it (outer CCW, holes CW: sketch_core's orientation, kept).
-pub fn profile(p: &Profile) -> bd::Profile {
-    bd::Profile { outer: ring(&p.outer), holes: p.holes.iter().map(ring).collect() }
-}
-
 /// Extrude `p` (sketch coordinates of `plane`) along the plane's normal by `distance` mm; a negative distance goes
 /// against the normal (brep_core mirrors the working frame below the plane).
-pub fn extrude(p: &Profile, plane: &Frame, distance: f64, tol: bd::Tol) -> Result<Brep, Refusal> {
+pub fn extrude(p: &Profile, plane: &Frame, distance: f64, tol: brep_core::Tol) -> Result<Brep, Refusal> {
     let dir = if distance < 0.0 { -plane.z } else { plane.z };
-    brep_core::extrude(&profile(p), plane, dir, distance.abs(), tol)
+    brep_core::extrude(p, plane, dir, distance.abs(), tol)
 }
 
 /// The chord a Brep is tessellated to: a thousandth of its vertex bounds' diagonal, never under 1e-3 mm.
@@ -83,7 +57,7 @@ impl fmt::Debug for Body {
 
 impl Body {
     /// Tessellate every Brep (brep_core's `tessellate`, its chord from `chord_for`) into one model.
-    pub fn from_breps(breps: Vec<Brep>, tol: bd::Tol) -> Result<Body, String> {
+    pub fn from_breps(breps: Vec<Brep>, tol: brep_core::Tol) -> Result<Body, String> {
         let mut pos: Vec<[f64; 3]> = Vec::new();
         let mut tris: Vec<[u32; 3]> = Vec::new();
         let mut face_of = Vec::new();

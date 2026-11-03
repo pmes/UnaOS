@@ -7,13 +7,12 @@ description = "Vug's B-rep core: topology with persistent Ids over the analytic 
 
 # VUGBREP1 (LEDGER SR468): `#![no_std]` + `alloc`, `#![forbid(unsafe_code)]`, the timeline_core shape: a shared core under
 # `unaos/libs/cad/`, a member of the ROOT host workspace, linkable by the kernel by path with `default-features = false`.
-# Its siblings come in through ONE module, src/dep.rs. At this build none of geom_core (SR464), sketch_core (SR465) or
-# mesh_core (SR466) had committed on its branch, so dep.rs carries a named SHIM of each. The fold swaps each shim for
-# `pub use <crate>::...` and adds the dep line here:
-#   geom_core = { path = "../geom_core", default-features = false }
-#   sketch_core = { path = "../sketch_core", default-features = false }
-#   mesh_core = { path = "../mesh_core", default-features = false }
+# Its siblings are the real crates by path (VUGBREPSWAP, LEDGER SR492: src/dep.rs and its shims are gone): geom_core the
+# one Vec / Tol / predicates / closed forms, sketch_core the Profile, mesh_core the Mesh.
 [dependencies]
+geom_core = { path = "../geom_core", default-features = false }
+sketch_core = { path = "../sketch_core", default-features = false }
+mesh_core = { path = "../mesh_core", default-features = false }
 libm = { version = "0.2", default-features = false }
 
 [features]

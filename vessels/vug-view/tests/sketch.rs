@@ -121,13 +121,13 @@ fn extrude_ten_gives_the_box_volume() {
     let vw = dimensioned();
     let f = face(&vw);
     let p = &f.profiles[0];
-    let b = extrude::extrude(p, &f.plane, 10.0, brep_core::dep::Tol::DEFAULT).expect("extrude");
+    let b = extrude::extrude(p, &f.plane, 10.0, brep_core::Tol::DEFAULT).expect("extrude");
     let vol = brep_core::volume(&b).expect("volume");
     let want = p.outer.area * 10.0;
     assert!((vol - want).abs() <= 1e-9 * want, "volume {vol} vs area x 10 {want}");
     assert!((vol - 1600.0).abs() < 1e-4, "volume {vol}");
     // A negative distance goes the other way with the same volume.
-    let down = extrude::extrude(p, &f.plane, -10.0, brep_core::dep::Tol::DEFAULT).expect("extrude down");
+    let down = extrude::extrude(p, &f.plane, -10.0, brep_core::Tol::DEFAULT).expect("extrude down");
     assert!((brep_core::volume(&down).unwrap() - want).abs() <= 1e-9 * want);
 }
 

@@ -2,7 +2,7 @@
 //! VUG-BREP-NURBS-SURF, owed) and `Frame`, the orthonormal placement every curve and surface is written in.
 
 use crate::Refusal;
-use crate::dep::{Degenerate, Vec3};
+use geom_core::{Degenerate, Vec3};
 use alloc::vec::Vec;
 
 /// A right-handed orthonormal frame: origin `o`, axes `x`, `y`, `z` (z = x × y).

@@ -1,6 +1,6 @@
 //! VUGBREP1: mangled Breps are refused by name.
 
-use brep_core::dep::Tol;
+use brep_core::Tol;
 use brep_core::primitives::{box_, sphere};
 use brep_core::{Refusal, validate};
 

@@ -1,7 +1,7 @@
 //! VUGBREP1: the NURBS curve and the closed-form surface intersections (every intersection point lies on both
 //! surfaces).
 
-use brep_core::dep::{Tol, Vec3};
+use brep_core::{Tol, Vec3};
 use brep_core::{Curve, Frame, Intersection, NurbsCurve, Refusal, Surface, SurfaceKind, intersect};
 use std::f64::consts::{FRAC_1_SQRT_2, PI};
 

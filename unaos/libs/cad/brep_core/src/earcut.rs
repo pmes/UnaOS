@@ -3,7 +3,7 @@
 //! `Uncertain` is never read as an answer: it blocks the candidate (the conservative side), and a polygon that
 //! cannot then be clipped returns `Undecided`, not a guessed mesh.
 
-use crate::dep::{Predicate, Vec2, orient2d};
+use geom_core::{Predicate, Vec2, orient2d};
 use alloc::vec::Vec;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

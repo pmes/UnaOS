@@ -16,7 +16,8 @@
 
 use crate::Refusal;
 use crate::curve::Curve;
-use crate::dep::{Mesh, Tol, Vec2, Vec3};
+use geom_core::{Tol, Vec2, Vec3};
+use mesh_core::Mesh;
 use crate::earcut::{EarFail, earcut};
 use crate::surface::Surface;
 use crate::topo::{Brep, Id};

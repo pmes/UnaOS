@@ -14,7 +14,8 @@
 
 use crate::Refusal;
 use crate::curve::{Curve, Frame};
-use crate::dep::{Arc2, Edge as PEdge, Loop as PLoop, Profile, Tol, Vec2, Vec3};
+use geom_core::{Arc2, Tol, Vec2, Vec3};
+use sketch_core::{Edge as PEdge, Loop as PLoop, Profile};
 use crate::surface::Surface;
 use crate::topo::{Brep, Name, OpKind, Role, UvBox};
 use alloc::vec;
