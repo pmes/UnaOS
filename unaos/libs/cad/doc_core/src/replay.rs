@@ -388,7 +388,7 @@ pub fn replay(doc: &Doc, tol: Tol) -> Replay {
 
 /// The fillet / chamfer statement `s` (true; any other statement is false and untouched): its `on` solid must have
 /// replayed (else `Upstream(on)`); each edge `Name` resolves to the ONE edge of that solid carrying it (`NoSuchEdge` /
-/// `AmbiguousEdge` by its words; brep_core has no edges-by-name lookup, VUG-BREP-EDGES-NAMED owed), and brep_core's
+/// `AmbiguousEdge` by its words; through brep_core's `Brep::edges_named`, VUGBREPEDGESNAMED SR524), and brep_core's
 /// `fillet` / `chamfer` runs on the resolved Ids. The result is this statement's own solid; the `on` solid stays.
 fn edit_step(r: &mut Replay, built: &mut BTreeSet<String>, s: &Stmt, line: u32, tol: Tol) -> bool {
     let (id, on, edges) = match s {
@@ -402,7 +402,7 @@ fn edit_step(r: &mut Replay, built: &mut BTreeSet<String>, s: &Stmt, line: u32, 
     };
     let mut ids = Vec::new();
     for n in edges {
-        let hits: Vec<brep_core::Id> = src.edges.iter().filter(|e| e.name == *n).map(|e| e.id).collect();
+        let hits: Vec<brep_core::Id> = src.edges_named(*n).map(|i| src.edges[i as usize].id).collect();
         match hits.len() {
             1 => ids.push(hits[0]),
             0 => {

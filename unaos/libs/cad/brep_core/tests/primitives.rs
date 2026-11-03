@@ -158,3 +158,24 @@ fn bad_primitive_parameters_are_refused() {
     assert_eq!(torus(1.0, 2.0, T), Err(Refusal::BadParam("torus major <= minor")));
     assert_eq!(sphere(-1.0, T), Err(Refusal::BadParam("sphere r")));
 }
+
+// VUGBREPEDGESNAMED (LEDGER SR524): `Brep::edges_named`, the edge sibling of `faces_named`.
+#[test]
+fn edges_named_finds_one_edge_per_box_name() {
+    use brep_core::{Name, OpKind, Role};
+    let b = box_(2.0, 3.0, 4.0, T).unwrap();
+    assert_eq!(b.edges.len(), 12);
+    for (i, e) in b.edges.iter().enumerate() {
+        let hits: Vec<u32> = b.edges_named(e.name).collect();
+        assert_eq!(hits, vec![i as u32], "edge {i} named {:?}", e.name);
+    }
+    for (i, e) in b.edges.iter().enumerate() {
+        for f in &b.edges[i + 1..] {
+            assert_ne!(e.name, f.name, "twelve distinct Names");
+        }
+    }
+    let foreign = Name { op: OpKind::Fillet, role: Role::Blend, a: 0, b: 0 };
+    assert_eq!(b.edges_named(foreign).count(), 0);
+    let gone = Name { op: OpKind::Extrude, role: Role::CapEnd, a: 9, b: 9 };
+    assert_eq!(b.edges_named(gone).count(), 0);
+}
