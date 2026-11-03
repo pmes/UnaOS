@@ -406,3 +406,27 @@ extrude boss sketch=b outer=c1 dir=[0 0 1] length=500
     assert!(count(&report, "intent: shapes: n=") == 1 && count(&report, "intent: cylinder ") == 1, "{report}");
     assert_eq!(count(&report, "intent: proposed="), 0, "{report}");
 }
+
+/// VUGSCANSHAPESPREAD (SR526): every `shape:` line carries its measured `spread_deg=`, and `--intent` hands doc_core
+/// the largest as sigma_deg (doc_core prints it to 2 places and the shape line to 3: within 0.0055), no longer the 0.5
+/// default.
+#[test]
+fn the_intent_sigma_deg_is_the_largest_shape_spread() {
+    let d = dir("spread");
+    let (inp, ply) = (d.join("one.prb"), d.join("one.ply"));
+    prb(&inp, 1, true);
+    let o = scan(&[inp.to_str().unwrap(), "-o", ply.to_str().unwrap(), "--intent"]);
+    let report = String::from_utf8_lossy(&o.stdout).into_owned();
+    assert!(o.status.success(), "stderr: {}", String::from_utf8_lossy(&o.stderr));
+    println!("{report}");
+    let spreads: Vec<f64> = report
+        .lines()
+        .filter(|l| l.starts_with("shape: "))
+        .map(|l| field(l, "shape: ", "spread_deg").parse::<f64>().unwrap())
+        .collect();
+    assert!(!spreads.is_empty(), "a shape\n{report}");
+    assert!(spreads.iter().all(|s| s.is_finite() && *s >= 0.0), "{spreads:?}");
+    let largest = spreads.iter().cloned().fold(0.0, f64::max);
+    let sigma: f64 = field(&report, "intent: shapes:", "sigma_deg").parse().unwrap();
+    assert!((sigma - largest).abs() <= 0.0055 + 1e-9, "sigma_deg {sigma} vs the largest spread {largest}\n{report}");
+}

@@ -464,7 +464,7 @@ fn cone_inlier(c: &Cone, p: Vec3, n: Vec3, band: Tol) -> Option<f64> {
     if res.abs() > band.lin {
         return None;
     }
-    let nc = radial * (ca / rho) - c.axis * sa;
+    let nc = cone_normal(c, p)?; // VUGSCANSHAPESPREAD (SR526): the same operations in the same order
     if n.dot(nc).abs() < libm::cos(band.ang) {
         return None;
     }
@@ -624,6 +624,9 @@ pub struct Shape {
     pub fraction: f64,
     pub rms_mm: f64,
     pub max_mm: f64,
+    /// VUGSCANSHAPESPREAD (LEDGER SR526): the RMS angle (degrees) between each of `inliers`' normals and the fitted
+    /// surface's normal at that point ([`spread`]'s first value; unsigned, as the inlier test is).
+    pub spread_deg: f64,
 }
 
 impl Shape {
@@ -902,15 +905,73 @@ pub fn detect(points: &[Vec3], normals: &[Vec3], band: Tol, floor: Floor) -> Res
         for &i in &idx {
             alive[i] = false;
         }
+        let inliers: Vec<u32> = idx.iter().map(|&i| i as u32).collect();
+        let (spread_deg, _) = spread(&k, points, normals, &inliers); // VUGSCANSHAPESPREAD (SR526): the same inliers
         out.push(Shape {
             kind: k,
-            inliers: idx.iter().map(|&i| i as u32).collect(),
+            inliers,
             support: cnt,
             fraction: cnt as f64 / n as f64,
             rms_mm: rms,
             max_mm: mx,
+            spread_deg,
         });
     }
     out.sort_by(|a, b| b.support.cmp(&a.support));
     Ok(out)
+}
+
+// ---- normal spread (VUGSCANSHAPESPREAD, LEDGER SR526) ----
+
+/// The cone's unit outward normal at `p` (perpendicular to the generator through `p`'s radial plane): `cone_inlier`'s
+/// own expression, the same operations in the same order; `None` on the axis.
+fn cone_normal(c: &Cone, p: Vec3) -> Option<Vec3> {
+    let v = p - c.apex;
+    let h = v.dot(c.axis);
+    let radial = v - c.axis * h;
+    let rho = radial.mag();
+    if !(rho > 0.0) {
+        return None;
+    }
+    let (sa, ca) = (libm::sin(c.half_angle), libm::cos(c.half_angle));
+    Some(radial * (ca / rho) - c.axis * sa)
+}
+
+impl Primitive {
+    /// The fitted surface's unit normal at `p`: the plane's normal, the cylinder's radial direction (`radial`), the
+    /// direction from the sphere's centre, the cone's (`cone_normal`). `None` on an axis, at a centre or an apex.
+    pub fn normal_at(&self, p: Vec3) -> Option<Vec3> {
+        match self {
+            Primitive::Plane(pl) => pl.normal.normalize().ok(),
+            Primitive::Cylinder(cy) => radial(cy, p).normalize().ok(),
+            Primitive::Sphere(s) => (p - s.centre).normalize().ok(),
+            Primitive::Cone(c) => cone_normal(c, p),
+        }
+    }
+}
+
+/// The normal spread of a shape over `inliers`: (RMS, p95 by nearest rank), in degrees, of the unsigned angle
+/// `acos(min(1, |n̂ · normal_at(p)|))` between each inlier's normal and the fitted surface's normal at that point
+/// (unsigned because a scan normal's sign is arbitrary, as in the inlier test). An index with no point, no normal or no
+/// surface normal is skipped; no angle at all is (0, 0). The RMS is `Shape::spread_deg`, the sigma doc_core's 3-sigma
+/// gate takes; the p95 shows the tail that sigma must cover.
+pub fn spread(kind: &Primitive, points: &[Vec3], normals: &[Vec3], inliers: &[u32]) -> (f64, f64) {
+    let to_deg = 180.0 / core::f64::consts::PI;
+    let mut a: Vec<f64> = inliers
+        .iter()
+        .filter_map(|&i| {
+            let i = i as usize;
+            let n = normals.get(i)?.normalize().ok()?;
+            let s = kind.normal_at(*points.get(i)?)?;
+            Some(libm::acos(n.dot(s).abs().min(1.0)) * to_deg)
+        })
+        .collect();
+    if a.is_empty() {
+        return (0.0, 0.0);
+    }
+    let ss: f64 = a.iter().map(|x| x * x).sum();
+    let rms = libm::sqrt(ss / a.len() as f64);
+    a.sort_unstable_by(|x, y| x.total_cmp(y));
+    let rank = libm::ceil(0.95 * a.len() as f64) as usize;
+    (rms, a[rank.clamp(1, a.len()) - 1])
 }
