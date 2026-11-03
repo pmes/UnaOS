@@ -1273,3 +1273,10 @@ exec-rmbp-vugphotogrid | /home/user/exec/vugphotogrid | cut 195bac794 | VUGPHOTO
 exec-rmbp-vugveinask | /home/user/exec/vugveinask | cut 195bac794 | VUGVEINASK | wave36
 exec-rmbp-vugintent | /home/user/exec/vugintent | cut 195bac794 | VUGINTENT | wave36
 exec-rmbp-vugfacephoto | /home/user/exec/vugfacephoto | cut 195bac794 | VUGFACEPHOTO | wave36
+exec-rmbp-vugintentholes | /home/user/exec/vugintentholes | cut 1dae9b466 | VUGINTENTHOLES | wave36
+exec-rmbp-vugintentscan | /home/user/exec/vugintentscan | cut 1dae9b466 | VUGINTENTSCAN | wave36
+exec-rmbp-vugveinbus | /home/user/exec/vugveinbus | cut 1dae9b466 | VUGVEINBUS | wave36
+exec-rmbp-vugscandeviation | /home/user/exec/vugscandeviation | cut 1dae9b466 | VUGSCANDEVIATION | wave36
+exec-rmbp-vugfacefillet | /home/user/exec/vugfacefillet | cut 1dae9b466 | VUGFACEFILLET | wave36
+exec-rmbp-vugbrepcorner | /home/user/exec/vugbrepcorner | cut 1dae9b466 | VUGBREPCORNER | wave36
+exec-rmbp-vugfacetree | /home/user/exec/vugfacetree | cut 1dae9b466 | VUGFACETREE | wave36
