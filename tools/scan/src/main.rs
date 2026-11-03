@@ -11,7 +11,7 @@
 //!      [--meta <x_Depth_metadata.csv>] [--width W --height H] [--csv-raw]
 //!      [--fx F --fy F --ppx F --ppy F] [--units-um N] [--frame N]
 //!      [--turntable DEG --radius MM | --poses <file> | --track] [--voxel MM] [--trunc MM] [--band MM]
-//!      [--against <design.vugdoc>]
+//!      [--against <design.vugdoc>] [--intent [<doc.vug>]]
 //! ```
 //!
 //! Inputs (the measured roads from a D435i to this machine; librealsense v2.55.1):
@@ -69,7 +69,7 @@
 //! status colours (inside the band POSITIVE, short toward INFO, proud toward CRITICAL, off the design TEXT_SECONDARY).
 //! The report adds `deviation: aligned rms= max= p95= inside= faces=<seen>/<total> ...` and one
 //! `face: <solid>/<op>.<role>.<a>.<b>:<kind> n= max= rms= mean=` line per design face, by rms, worst first; a refused
-//! registration prints `deviation: refused <Name> {..}` and the run exits 1. Without `--against` nothing changes.
+//! registration prints `deviation: refused <Name> {..}` and the run exits 1. Without `--against` nothing changes. `--intent [<doc.vug>]` (VUGINTENTSCANWIRE, LEDGER SR515): [`intent_road`].
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -139,7 +139,7 @@ fn usage() -> ! {
     eprintln!("            [--meta <x_Depth_metadata.csv>] [--width W --height H] [--csv-raw]");
     eprintln!("            [--fx F --fy F --ppx F --ppy F] [--units-um N] [--frame N]");
     eprintln!("            [--turntable DEG --radius MM | --poses <file> | --track] [--voxel MM] [--trunc MM] [--band MM]");
-    eprintln!("            [--against <design.vugdoc>]");
+    eprintln!("            [--against <design.vugdoc>] [--intent [<doc.vug>]]");
     std::process::exit(2)
 }
 
@@ -162,7 +162,7 @@ struct Args {
     voxel: f64,
     trunc: Option<f64>,
     band: f64,
-    against: Option<String>, // VUGSCANDEVIATION (SR510)
+    against: Option<String>, intent: Option<Option<String>>, // VUGSCANDEVIATION (SR510)
 }
 
 fn num<T: std::str::FromStr>(it: &mut impl Iterator<Item = String>) -> T {
@@ -171,7 +171,7 @@ fn num<T: std::str::FromStr>(it: &mut impl Iterator<Item = String>) -> T {
 
 fn parse_args() -> Args {
     let mut a = Args { voxel: 4.0, band: 3.0, ..Args::default() };
-    let mut it = std::env::args().skip(1);
+    let mut it = std::env::args().skip(1).peekable();
     while let Some(s) = it.next() {
         match s.as_str() {
             "-o" => a.out = Some(it.next().unwrap_or_else(|| usage())),
@@ -193,7 +193,7 @@ fn parse_args() -> Args {
             "--voxel" => a.voxel = num(&mut it),
             "--trunc" => a.trunc = Some(num(&mut it)),
             "--band" => a.band = num(&mut it),
-            "--against" => a.against = Some(it.next().unwrap_or_else(|| usage())),
+            "--against" => a.against = Some(it.next().unwrap_or_else(|| usage())), "--intent" => a.intent = Some(intent_doc(&mut it)),
             _ if s.starts_with('-') => usage(),
             _ if a.input.is_none() => a.input = Some(s),
             _ => usage(),
@@ -542,7 +542,7 @@ fn run(a: &Args) -> Result<String, Refusal> {
     let dev = match &a.against {
         Some(p) => Some(against(p, &sm, a.band)?),
         None => None,
-    };
+    }; let intent = intent_road(a, &detected)?; // VUGINTENTSCANWIRE (SR515): before anything is written
 
     // The PLY: scan_core's mesh IS mesh_core's (VUGSHIMSWAP SR473), straight into mesh_core's writer.
     let out = a.out.as_deref().unwrap_or_default();
@@ -630,7 +630,7 @@ fn run(a: &Args) -> Result<String, Refusal> {
     shapes_report(&mut r, &detected);
     if let Some((d, names)) = &dev {
         deviation_report(&mut r, d, names);
-    }
+    } r.push_str(&intent); // VUGINTENTSCANWIRE (SR515)
     let plane_s = plane.as_ref().map_or("refused".into(), |f| format!("{:.3} normal={}", f.rms_mm, v3(f.shape.normal)));
     let cyl_s = cyl.as_ref().map_or("none".into(), |(c, s)| format!("{:.3} rms={:.3}", c.radius, s.rms_mm));
     let _ = writeln!(
@@ -815,5 +815,109 @@ mod tests {
                 assert!((a - b).mag() < 1e-9, "k={k} p={p:?}: {a:?} vs {b:?}");
             }
         }
+    }
+}
+
+// ---- VUGINTENTSCANWIRE (LEDGER SR515): --intent, the scan's shapes as design intent ----
+
+/// The angular sigma (degrees) `--intent` hands doc_core: scan_core's `Shape` carries no normal spread to measure (its
+/// normals only pass detect's ±band inlier test), so the documented default (doc_core tests/intent_scan.rs's SIGMA_DEG);
+/// VUG-SCAN-SHAPE-SPREAD owes the measured one.
+const INTENT_SIGMA_DEG: f64 = 0.5;
+
+/// `--intent`'s optional document: the next argument, unless it is a flag or one of the inputs `run` reads.
+fn intent_doc(it: &mut std::iter::Peekable<impl Iterator<Item = String>>) -> Option<String> {
+    let take = it.peek().is_some_and(|s| {
+        let ext = Path::new(s).extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+        !s.starts_with('-') && !matches!(ext.as_str(), "prb" | "csv" | "raw")
+    });
+    if take { it.next() } else { None }
+}
+
+/// The caller's copy the SR508 clause names (doc_core takes no scan_core): a detected `Shape` as a doc_core `ShapeRef`,
+/// field for field. Nothing is flipped: the plane is `normal . p = d` on both sides (geom_core's `Plane`; doc_core
+/// takes |n.o - d| and the unsigned axis angle, so detect's arbitrary normal sign is carried as is), the cylinder a
+/// point on its axis, the axis and the radius, the cone its apex, its axis into the opening and its half-angle in
+/// radians; mm throughout; one geom_core `Vec3`. support and rms_mm are carried; fraction, max_mm and inliers have no
+/// field.
+fn shape_ref(s: &Shape) -> doc_core::ShapeRef {
+    use doc_core::ShapeParams;
+    let params = match s.kind {
+        Primitive::Plane(p) => ShapeParams::Plane { normal: p.normal, d: p.d },
+        Primitive::Cylinder(c) => ShapeParams::Cylinder { point: c.point, axis: c.axis, radius: c.radius },
+        Primitive::Sphere(p) => ShapeParams::Sphere { centre: p.centre, radius: p.radius },
+        Primitive::Cone(c) => ShapeParams::Cone { apex: c.apex, axis: c.axis, half_angle: c.half_angle },
+    };
+    doc_core::ShapeRef { params, support: s.support, rms_mm: s.rms_mm }
+}
+
+/// (sigma_mm, sigma_deg): the largest shape fit rms (scan_core's own residual; the worst-fitting shape sets the one
+/// number every shape is judged under; 0 with no shape) and [`INTENT_SIGMA_DEG`].
+fn intent_sigma(shapes: &[Shape]) -> (f64, f64) {
+    (shapes.iter().map(|s| s.rms_mm).fold(0.0, f64::max), INTENT_SIGMA_DEG)
+}
+
+/// `--intent [<doc.vug>]` (VUGINTENTSCANWIRE, LEDGER SR515): detect's shapes (the run's own, never a second detect)
+/// copied by [`shape_ref`] into doc_core's `Measurement::Shapes` at [`intent_sigma`], printed as
+/// `doc_core::measurements_text` with every line prefixed `intent: ` (its `shapes: n=` header is not the report's).
+/// With a document: doc_core reads it (`DesignRead` refuses), `suggest` proposes against the measurement's sigma,
+/// `verify_all` disposes each in order (BP-vug-7), and `Batch::text` is appended verbatim (`intent: proposed= accepted=
+/// refused=`, then one `accept` / `refuse` line per proposal). A detect refusal prints `intent: refused`. Without
+/// `--intent`, empty.
+fn intent_road(a: &Args, detected: &Result<Vec<Shape>, FitError>) -> Result<String, Refusal> {
+    let Some(doc_path) = &a.intent else { return Ok(String::new()) };
+    let shapes = match detected {
+        Ok(s) => s,
+        Err(e) => return Ok(format!("intent: refused {e:?}\n")),
+    };
+    let (sigma_mm, sigma_deg) = intent_sigma(shapes);
+    let m = doc_core::Measurement::Shapes { shapes: shapes.iter().map(shape_ref).collect(), sigma_mm, sigma_deg };
+    let mut out = String::new();
+    for l in doc_core::measurements_text(&m).lines() {
+        let _ = writeln!(out, "intent: {l}");
+    }
+    let Some(path) = doc_path else { return Ok(out) };
+    let text = String::from_utf8(read(path)?).map_err(|e| Refusal::Io { path: path.clone(), error: e.to_string() })?;
+    let doc = doc_core::read(&text).map_err(Refusal::DesignRead)?;
+    let ps = doc_core::suggest(&doc, &m);
+    out.push_str(&doc_core::verify_all(&doc, &ps, &m, doc.tol).text());
+    Ok(out)
+}
+
+#[cfg(test)]
+mod intent_tests {
+    use super::{INTENT_SIGMA_DEG, intent_sigma, shape_ref};
+    use doc_core::ShapeParams;
+    use scan_core::fixture::Scene;
+    use scan_core::{Cone, Cylinder, Plane, Primitive, Shape, Vec3};
+
+    fn shape(kind: Primitive, support: u32, rms_mm: f64) -> Shape {
+        Shape { kind, inliers: Vec::new(), support, fraction: 0.5, rms_mm, max_mm: 2.0 * rms_mm }
+    }
+
+    /// The fixture's cylinder (Scene::bench's r 40 post at (160, 0), axis +z) copied to doc_core and read back to 1e-9;
+    /// a plane with a downward normal is carried unflipped, a cone keeps its half-angle in radians; the sigma is the
+    /// largest rms.
+    #[test]
+    fn the_copy_round_trips_the_fixture_shapes() {
+        let post = Scene::bench().cylinders[0];
+        let z = Vec3::new(0.0, 0.0, 1.0);
+        let c = Cylinder { point: post.base, axis: z, radius: post.radius };
+        let r = shape_ref(&shape(Primitive::Cylinder(c), 1234, 0.21));
+        let ShapeParams::Cylinder { point, axis, radius } = r.params else { panic!("not a cylinder: {:?}", r.params) };
+        assert!((point - post.base).mag() < 1e-9, "point {point:?}");
+        assert!((axis - z).mag() < 1e-9, "axis {axis:?}");
+        assert!((radius - post.radius).abs() < 1e-9, "radius {radius}");
+        assert_eq!((r.support, r.rms_mm, r.kind()), (1234, 0.21, "cylinder"));
+        let pl = Plane { normal: Vec3::new(0.0, 0.0, -1.0), d: -100.0 };
+        assert_eq!(shape_ref(&shape(Primitive::Plane(pl), 9, 0.1)).params, ShapeParams::Plane { normal: pl.normal, d: -100.0 });
+        let k = Cone { apex: Vec3::new(1.0, 2.0, 3.0), axis: Vec3::new(0.0, 1.0, 0.0), half_angle: 0.3 };
+        assert_eq!(
+            shape_ref(&shape(Primitive::Cone(k), 7, 0.05)).params,
+            ShapeParams::Cone { apex: k.apex, axis: k.axis, half_angle: 0.3 }
+        );
+        let ss = [shape(Primitive::Plane(pl), 9, 0.1), shape(Primitive::Cylinder(c), 1234, 0.21)];
+        assert_eq!(intent_sigma(&ss), (0.21, INTENT_SIGMA_DEG));
+        assert_eq!(intent_sigma(&[]), (0.0, INTENT_SIGMA_DEG));
     }
 }
