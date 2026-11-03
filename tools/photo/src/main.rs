@@ -11,10 +11,10 @@
 //! ```
 //!
 //! The photo is decoded by pixel_core (PNG / JPEG / BMP / QOI / GIF / WebP), measured by `photo_core::measure`
-//! (pitch default 5 mm; the sketch at `Tol::DEFAULT`) and written as a vug-doc: `sketch s1` on the XY plane, one
-//! statement per sketch_core entity (`p<n>` points, `l<n>` lines, `a<n>` arcs, `c<n>` circles, n the entity index)
-//! and per constraint (`k<n>`), and with `--thickness` an `extrude e1` of the profile along +Z. The face writes the
-//! statements itself (VUG-DOC-FROMSKETCH owes the writer in doc_core). stdout carries one line:
+//! (pitch default 5 mm; the sketch at `Tol::DEFAULT`) and written as a vug-doc: `sketch s` on the XY plane, one
+//! statement per sketch_core entity (`e<n>`, n the entity slot) and per constraint (`k<n>`), and with `--thickness`
+//! an `extrude x0` of the profile along +Z. The sketch's statements are doc_core's one writer, `from_sketch` with
+//! `PlainNames` (VUGDOCFROMSKETCH, SR516: the face's names, one namespace). stdout carries one line:
 //! `photo: w= h= grid=<n>x<m> pitch= residual_px= sigma_mm= outline=<n> holes=<k> primitives=<lines>/<arcs>/<circles> dof=`;
 //! `--report` adds the residual / tilt / lens line and one line per primitive. A refusal prints
 //! `photo: refused <Name> {..}` and exits 1; usage exits 2.
@@ -22,9 +22,9 @@
 use std::fmt::Write as _;
 use std::process::ExitCode;
 
-use doc_core::{Cons, Doc, PRef, Stmt};
+use doc_core::{Doc, PlainNames, SketchNames, Stmt};
 use photo_core::{Measured, PhotoParams, Prim, Tol, measure};
-use sketch_core::{Constraint, ConstraintId, Entity, EntityId, PointRef};
+use sketch_core::ConstraintId;
 
 const USAGE: &str = "usage: photo <in.png|jpg> --pitch <mm> -o <out.vugdoc> [--thickness <mm>] [--report]";
 
@@ -66,86 +66,18 @@ fn parse(argv: &[String]) -> Option<Args> {
     Some(Args { input: input?, output: output?, pitch, thickness, report })
 }
 
-fn name(sk: &sketch_core::Sketch, id: EntityId) -> String {
-    let p = match sk.entity(id) {
-        Some(Entity::Point { .. }) => 'p',
-        Some(Entity::Line { .. }) => 'l',
-        Some(Entity::Arc { .. }) => 'a',
-        Some(Entity::Circle { .. }) => 'c',
-        _ => 'x',
-    };
-    format!("{p}{}", id.0)
-}
-
-fn pref(sk: &sketch_core::Sketch, r: PointRef) -> PRef {
-    match r {
-        PointRef::Point(e) => PRef::Point(name(sk, e)),
-        PointRef::Centre(e) => PRef::Centre(name(sk, e)),
-        PointRef::Start(e) => PRef::Start(name(sk, e)),
-        PointRef::End(e) => PRef::End(name(sk, e)),
-    }
-}
-
-fn cons(sk: &sketch_core::Sketch, c: &Constraint) -> Cons {
-    let n = |e: &EntityId| name(sk, *e);
-    let p = |r: &PointRef| pref(sk, *r);
-    match c {
-        Constraint::Coincident(a, b) => Cons::Coincident(p(a), p(b)),
-        Constraint::PointOnLine(a, l) => Cons::PointOnLine(p(a), n(l)),
-        Constraint::PointOnCircle(a, l) => Cons::PointOnCircle(p(a), n(l)),
-        Constraint::Horizontal(l) => Cons::Horizontal(n(l)),
-        Constraint::Vertical(l) => Cons::Vertical(n(l)),
-        Constraint::Parallel(a, b) => Cons::Parallel(n(a), n(b)),
-        Constraint::Perpendicular(a, b) => Cons::Perpendicular(n(a), n(b)),
-        Constraint::TangentLineCircle(a, b) => Cons::TangentLineCircle(n(a), n(b)),
-        Constraint::TangentCircles(a, b) => Cons::TangentCircles(n(a), n(b)),
-        Constraint::EqualLength(a, b) => Cons::EqualLength(n(a), n(b)),
-        Constraint::EqualRadius(a, b) => Cons::EqualRadius(n(a), n(b)),
-        Constraint::Distance(a, b, d) => Cons::Distance(p(a), p(b), *d),
-        Constraint::DistancePointLine(a, l, d) => Cons::DistancePointLine(p(a), n(l), *d),
-        Constraint::Angle(a, b, v) => Cons::Angle(n(a), n(b), *v),
-        Constraint::Radius(a, v) => Cons::Radius(n(a), *v),
-        Constraint::Diameter(a, v) => Cons::Diameter(n(a), *v),
-        Constraint::Fix(a, v) => Cons::Fix(p(a), [v.x, v.y]),
-        Constraint::Midpoint(a, l) => Cons::Midpoint(p(a), n(l)),
-        Constraint::Symmetric(a, b, l) => Cons::Symmetric(p(a), p(b), n(l)),
-    }
-}
-
-/// The measurement as a vug-doc.
+/// The measurement as a vug-doc: the sketch through doc_core's `from_sketch` (`PlainNames`), then the extrude.
 fn document(m: &Measured, thickness: Option<f64>) -> Doc {
     let sk = &m.sketch;
-    let x = sk.params();
-    let s = "s1".to_string();
+    // photo_core's sketch is fresh (no constraint was ever removed): the issued constraints are the dense run from 0
+    // (VUG-SKETCH-ISSUED owes `Sketch::issued`).
+    let issued = (0u32..).take_while(|k| sk.constraint(ConstraintId(*k)).is_some()).count() as u32;
     let mut doc = Doc::new(Tol::DEFAULT);
-    doc.stmts.push(Stmt::Sketch { id: s.clone(), o: [0.0, 0.0, 0.0], z: [0.0, 0.0, 1.0], x: [1.0, 0.0, 0.0] });
-    for (i, e) in sk.entities().iter().enumerate() {
-        let id = EntityId(i as u32);
-        let me = name(sk, id);
-        let st = match *e {
-            Entity::Point { x: k } => Stmt::Point { id: me, sketch: s.clone(), at: [x[k], x[k + 1]] },
-            Entity::Line { a, b } => Stmt::Line { id: me, sketch: s.clone(), a: name(sk, a), b: name(sk, b) },
-            Entity::Circle { centre, r } => Stmt::Circle { id: me, sketch: s.clone(), centre: name(sk, centre), r: x[r] },
-            Entity::Arc { centre, r } => Stmt::Arc {
-                id: me,
-                sketch: s.clone(),
-                centre: name(sk, centre),
-                r: x[r],
-                start: x[r + 1],
-                end: x[r + 2],
-            },
-            Entity::Removed => continue,
-        };
-        doc.stmts.push(st);
-    }
-    let mut k = 0u32;
-    while let Some(c) = sk.constraint(ConstraintId(k)) {
-        doc.stmts.push(Stmt::Constraint { id: format!("k{k}"), sketch: s.clone(), c: cons(sk, c) });
-        k += 1;
-    }
+    doc.stmts = doc_core::from_sketch(sk, ([0.0, 0.0, 0.0], [0.0, 0.0, 1.0], [1.0, 0.0, 0.0]), issued, &PlainNames);
     if let (Some(t), Some(p)) = (thickness, m.profiles.first()) {
         if let Some(e) = p.outer.edges.first() {
-            doc.stmts.push(Stmt::Extrude { id: "e1".into(), sketch: s, outer: name(sk, e.src()), dir: [0.0, 0.0, 1.0], length: t });
+            let outer = PlainNames.entity(e.src());
+            doc.stmts.push(Stmt::Extrude { id: "x0".into(), sketch: PlainNames.sketch(), outer, dir: [0.0, 0.0, 1.0], length: t });
         }
     }
     doc

@@ -25,8 +25,8 @@ use crate::raster::{self, Frame as Raster, rgba};
 use crate::sketch::{ACTIVE, Design, Dim, Dimension, INK, REFUSED, SketchFace, type_into};
 use crate::view::View;
 use brep_core::Frame;
-use doc_core::{Cons, Doc, Entry, Fault, PRef, Stmt, Tol, What};
-use sketch_core::{Constraint, ConstraintId, Entity, EntityId, PointRef, Vec2};
+use doc_core::{Cons, Doc, Entry, Fault, PRef, PlainNames, SketchNames, Stmt, Tol, What};
+use sketch_core::{ConstraintId, EntityId, Vec2};
 
 /// The snapshots kept for undo (and for redo): one per committed action that changed the document, the oldest
 /// dropped. Memory is this many documents (a document is its statements: a few hundred bytes a statement).
@@ -73,78 +73,38 @@ impl Open {
     }
 }
 
-/// A sketch_core point reference as doc_core's, entities named by `name`.
-pub fn pref(p: PointRef, name: &dyn Fn(EntityId) -> String) -> PRef {
-    match p {
-        PointRef::Point(e) => PRef::Point(name(e)),
-        PointRef::Centre(e) => PRef::Centre(name(e)),
-        PointRef::Start(e) => PRef::Start(name(e)),
-        PointRef::End(e) => PRef::End(name(e)),
-    }
-}
+// VUGDOCFROMSKETCH (SR516): THE sketch_core -> text constraint map is doc_core's `sketch_cons` / `sketch_pref`; the
+// names `journal::cons` / `journal::pref` stay for their callers.
+pub use doc_core::{sketch_cons as cons, sketch_pref as pref};
 
-/// A sketch_core constraint as doc_core's text form, entities named by `name` (THE map; VUGFACEPHOTO's `photo::cons`
-/// is this with `e<n>` names).
-pub fn cons(c: &Constraint, name: &dyn Fn(EntityId) -> String) -> Cons {
-    let p = |r: PointRef| pref(r, name);
-    match *c {
-        Constraint::Coincident(a, b) => Cons::Coincident(p(a), p(b)),
-        Constraint::PointOnLine(q, l) => Cons::PointOnLine(p(q), name(l)),
-        Constraint::PointOnCircle(q, r) => Cons::PointOnCircle(p(q), name(r)),
-        Constraint::Horizontal(l) => Cons::Horizontal(name(l)),
-        Constraint::Vertical(l) => Cons::Vertical(name(l)),
-        Constraint::Parallel(a, b) => Cons::Parallel(name(a), name(b)),
-        Constraint::Perpendicular(a, b) => Cons::Perpendicular(name(a), name(b)),
-        Constraint::TangentLineCircle(l, r) => Cons::TangentLineCircle(name(l), name(r)),
-        Constraint::TangentCircles(a, b) => Cons::TangentCircles(name(a), name(b)),
-        Constraint::EqualLength(a, b) => Cons::EqualLength(name(a), name(b)),
-        Constraint::EqualRadius(a, b) => Cons::EqualRadius(name(a), name(b)),
-        Constraint::Distance(a, b, d) => Cons::Distance(p(a), p(b), d),
-        Constraint::DistancePointLine(q, l, d) => Cons::DistancePointLine(p(q), name(l), d),
-        Constraint::Angle(a, b, t) => Cons::Angle(name(a), name(b), t),
-        Constraint::Radius(r, v) => Cons::Radius(name(r), v),
-        Constraint::Diameter(r, v) => Cons::Diameter(name(r), v),
-        Constraint::Fix(q, at) => Cons::Fix(p(q), [at.x, at.y]),
-        Constraint::Midpoint(q, l) => Cons::Midpoint(p(q), name(l)),
-        Constraint::Symmetric(a, b, l) => Cons::Symmetric(p(a), p(b), name(l)),
+// VUGDOCFROMSKETCH (SR516): the open sketch names its slots for doc_core's one writer (`from_sketch`).
+impl SketchNames for Open {
+    fn sketch(&self) -> String {
+        self.sketch.clone()
+    }
+    fn entity(&self, slot: EntityId) -> String {
+        self.ent(slot)
+    }
+    fn constraint(&self, id: ConstraintId) -> String {
+        self.cons.get(id.0 as usize).cloned().unwrap_or_default()
     }
 }
 
 /// The face's sketch statements: the sketch on the face's plane, every live entity in face-id order, every live
 /// constraint below `issued` in id order.
 fn write_face(open: &Open, f: &SketchFace, out: &mut Vec<Stmt>) {
+    // VUGDOCFROMSKETCH (SR516): doc_core's one writer, named by the open sketch's slot maps.
     let v3 = |p: brep_core::Vec3| [p.x, p.y, p.z];
-    let s = open.sketch.clone();
-    out.push(Stmt::Sketch { id: s.clone(), o: v3(f.plane.o), z: v3(f.plane.z), x: v3(f.plane.x) });
-    let pr = f.sketch.params();
-    let name = |e: EntityId| open.ent(e);
-    for (i, e) in f.sketch.entities().iter().enumerate() {
-        let id = open.ents[i].clone();
-        let st = match *e {
-            Entity::Point { x } => Stmt::Point { id, sketch: s.clone(), at: [pr[x], pr[x + 1]] },
-            Entity::Line { a, b } => Stmt::Line { id, sketch: s.clone(), a: name(a), b: name(b) },
-            Entity::Circle { centre, r } => Stmt::Circle { id, sketch: s.clone(), centre: name(centre), r: pr[r] },
-            Entity::Arc { centre, r } => {
-                Stmt::Arc { id, sketch: s.clone(), centre: name(centre), r: pr[r], start: pr[r + 1], end: pr[r + 2] }
-            }
-            Entity::Removed => continue,
-        };
-        out.push(st);
-    }
-    for i in 0..f.issued {
-        if let Some(c) = f.sketch.constraint(ConstraintId(i)) {
-            out.push(Stmt::Constraint { id: open.cons[i as usize].clone(), sketch: s.clone(), c: cons(c, &name) });
-        }
-    }
+    out.extend(doc_core::from_sketch(&f.sketch, (v3(f.plane.o), v3(f.plane.z), v3(f.plane.x)), f.issued, open));
 }
 
 /// A face's sketch alone as a document (sketch `s`, `e<n>` / `k<n>` by face id): the text a proposal names its
 /// references in (VUGFACEPHOTO's `photo::doc_of` retires onto this at the fold).
 pub fn sketch_doc(face: &SketchFace) -> Doc {
-    let mut open = Open::fresh(FIRST_SKETCH.to_string());
-    open.name_slots(face);
+    // VUGDOCFROMSKETCH (SR516): `PlainNames` is exactly `Open::fresh("s")` + `name_slots` (`s` / `e<slot>` / `k<id>`).
+    let v3 = |p: brep_core::Vec3| [p.x, p.y, p.z];
     let mut doc = Doc::new(Tol::DEFAULT);
-    write_face(&open, face, &mut doc.stmts);
+    doc.stmts = doc_core::from_sketch(&face.sketch, (v3(face.plane.o), v3(face.plane.z), v3(face.plane.x)), face.issued, &PlainNames);
     doc
 }
 
