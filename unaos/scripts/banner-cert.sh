@@ -302,6 +302,12 @@ fi
 # of `xcost_say`'s armed line (sync.rs `mod reg`, x86_64; behind `const CENSUS = cfg!(feature = "lockreg_census")`, the off
 # arm returns first with `census=off`); it occurs exactly once in crates/ + libs/. Caller chain `selftest` <- `tests lockreg`
 # <- `ensure_tests` <- stackguard.rs `arm` (unconditional on x86), so cond `@arch:x86_64`. unmeasured-here: the seat's fold measures it.
+#
+# `sonderec` (SONDERECORD, LEDGER SR472): token `:: SONDEREC: frames=`, the piece before the first hole of `record_selftest`'s
+# FAIL / PASS format strings and a prefix of its SKIP literal (sonde.rs tail, every occurrence `#[cfg(feature = "sonderec")]`).
+# Caller chain `record_selftest` <- the `tests sonderec` registration folded onto `sonde::ensure`'s line (cfg sonderec) <-
+# `ensure` <- tests.rs (cfg sonde, implied by sonderec in Cargo.toml) — no second knob (rule 7(a)); cond copies the `sonde`
+# row's `@arch:x86_64`. unmeasured-here: the seat's fold measures it.
 # ---------------------------------------------------------------------------------------------
 bc_table() {
 cat <<'TABLE'
@@ -403,6 +409,7 @@ lumen|:: LUMENAPP:|-|measured
 midden|:: MIDDENAPP: image=|@arch:x86_64|measured(1)
 una|:: UNAAPP: image=|@arch:x86_64|measured(1)
 sonde|:: SONDE:|@arch:x86_64|measured(5)
+sonderec|:: SONDEREC: frames=|@arch:x86_64|unmeasured-here
 aether|:: AETHERAPP:|-|measured
 stria|:: STRIAAPP: image=|-|unmeasured-here
 netring3|:: ENTROPY:|-|measured

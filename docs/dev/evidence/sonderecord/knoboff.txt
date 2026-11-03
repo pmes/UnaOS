@@ -1,0 +1,13 @@
+# ./arroyo knoboff sonderec 9033e50df — seat, 2026-11-01, UNAOS_KNOBOFF_WITH_ENV=1 UNAOS_SONDE=1, tip 1af892778 (kernel tree = f89569a2d)
+   knoboff: warm=yes compiled_baseline=[unaos-kernel|unaos-kernel] compiled_tree=[unaos-kernel|unaos-kernel]   (x86|arm)
+   user_blob  baseline absent   tree absent   (include_bytes! payload, arch/aarch64/syscall.rs)
+   control    x86 armed≠off: YES   arm armed≠off: YES
+   ✅ x86 knob-off image BYTE-IDENTICAL to baseline — 45303e53075ea3212ab2a64455f6caaf6e7bb59eadd760ad087d2513141c7824 5865424
+   ✅ arm knob-off image BYTE-IDENTICAL to baseline — 0ef5e50af0d904f2d47b37c87c0aa9e01626b4ceb1cd1e7f3c158bb163585a9b 5661504
+knoboff: PASS — 'sonderec' OFF is byte-identical to 9033e50d on both arches; control fired, cache warm.
+   Scope of that PASS: the x86_64 and aarch64-virt KERNEL images. NOT kernel8.img (built
+   from K8_FEATS, a separate curated list) and NOT any staged media. A pi ack is still a pi ack.
+   This PASS GUARDS A BASELINE. It is not evidence the feature WORKS — score that on the
+   armed artifact or by strings at the site (SP2). The control above is what keeps the two apart.
+   run directory removed (clean pass); build cache kept at /root/unaos-bench/scratch/knoboff/caller-UnaOS-bbc2194accb6
+rc=0

@@ -540,6 +540,36 @@ pub enum SMessage {
     /// Face -> owner (OPEN-DIALOG-ONE, SR386): the file the person chose in the [`SMessage::OpenPanel`] over `url`, or
     /// `None` when the panel was cancelled.
     OpenPanelChose { url: String, path: Option<String> },
+    /// Chrome -> owner (VUG-FACE-BUTTONS, LEDGER SR477): a NON-primary pointer button went down (`down: true`) or up on a
+    /// surface, in surface pixels (top-left origin). `button` is the platform's button number past the primary one
+    /// ([`BUTTON_RIGHT`], [`BUTTON_MIDDLE`], 3 and up the extra buttons: AppKit's `buttonNumber`). The primary button stays
+    /// [`SMessage::BrowserButton`] (its receivers never see these presses); a drag still moves as `BrowserMouseMove`, and
+    /// no `BrowserClick` follows the release. `mods` and `surface` as on `BrowserButton`, each omitted when 0. APPENDED so
+    /// no earlier wire tag moves.
+    BrowserAuxButton {
+        button: u8,
+        down: bool,
+        x: f64,
+        y: f64,
+        #[serde(default, skip_serializing_if = "no_mods")]
+        mods: u8,
+        #[serde(default, skip_serializing_if = "no_surface")]
+        surface: u32,
+    },
+    /// Chrome -> owner (VUG-FACE-BUTTONS, SR477): a pinch on a surface. `scale` is this event's incremental factor (1 +
+    /// AppKit's `magnification`: above 1 spreads the fingers, zooms in), `x` / `y` the cursor in surface pixels; `surface`
+    /// omitted when 0. APPENDED so no earlier wire tag moves.
+    BrowserPinch {
+        scale: f64,
+        x: f64,
+        y: f64,
+        #[serde(default, skip_serializing_if = "no_surface")]
+        surface: u32,
+    },
+    /// VUGCOMSCAN1 (LEDGER SR476): Comscan's pump channel — start / hold / resume / stop a program armed in process
+    /// through Helm's `Verdict::Pass`, and the Squawk telemetry it answers with. APPENDED so no earlier wire tag moves;
+    /// the [`SMessage::Logs`] sub-enum shape.
+    Pump(PumpEvent),
 }
 
 /// A typed preference value — the whole value domain of the Principia
@@ -671,6 +701,11 @@ pub const MOD_CONTROL: u8 = 1 << 1;
 pub const MOD_ALT: u8 = 1 << 2;
 /// Super / Command (GTK's Meta or Super).
 pub const MOD_SUPER: u8 = 1 << 3;
+
+/// `BrowserAuxButton`'s `button` numbers (VUG-FACE-BUTTONS, LEDGER SR477), named once: the right (secondary) button.
+pub const BUTTON_RIGHT: u8 = 1;
+/// The middle button (the wheel pressed).
+pub const BUTTON_MIDDLE: u8 = 2;
 
 /// AETHERMACGPU-DAMAGE (LEDGER SR320): a sender of damage-only `SurfaceBlit`s sends a whole frame (`damage: None`) at
 /// least once every this many blits, so a receiver that missed one on the lossy bus is repaired within that many (a face
@@ -1120,13 +1155,15 @@ impl TabulaCommand {
 }
 
 /// SURFACEID (LEDGER SR332): the ONE list of the messages that carry a Surface number (the four pointer messages and, since
-/// NLE2-SURFACERESIZE SR339, `BrowserResize`). Every receiver that routes
+/// NLE2-SURFACERESIZE SR339, `BrowserResize`; since VUG-FACE-BUTTONS SR477, `BrowserAuxButton` and `BrowserPinch`). Every receiver that routes
 /// by surface (stria's `nle_face::Face::takes`) and every sender that stamps one (stria-view's witness) reads it here.
 impl SMessage {
     /// The Surface number a pointer message (or `BrowserResize`) carries; `None` for every other message.
     pub fn surface(&self) -> Option<u32> {
         match self {
             SMessage::BrowserButton { surface, .. }
+            | SMessage::BrowserAuxButton { surface, .. }
+            | SMessage::BrowserPinch { surface, .. }
             | SMessage::BrowserMouseMove(_, _, surface)
             | SMessage::BrowserScroll(_, _, surface)
             | SMessage::BrowserClick(_, _, surface)
@@ -1138,11 +1175,56 @@ impl SMessage {
     pub fn surface_mut(&mut self) -> Option<&mut u32> {
         match self {
             SMessage::BrowserButton { surface, .. }
+            | SMessage::BrowserAuxButton { surface, .. }
+            | SMessage::BrowserPinch { surface, .. }
             | SMessage::BrowserMouseMove(_, _, surface)
             | SMessage::BrowserScroll(_, _, surface)
             | SMessage::BrowserClick(_, _, surface)
             | SMessage::BrowserResize(_, _, surface) => Some(surface),
             _ => None,
         }
+    }
+}
+
+// --- VUGCOMSCAN1 (LEDGER SR476): Comscan's pump vocabulary (named tail hunk) ---
+/// Comscan's pump channel (`handlers/comscan` `pump`). A bus message cannot carry Helm's verdict (any sender could
+/// forge a pass), so a program is ARMED in process through `comscan::pump::PumpDesk::arm`, whose only entry is
+/// `Verdict::Pass`; [`PumpEvent::PumpStart`] names an armed program by its digest. Requests carry `principal` (the
+/// Finder / Facet / Tabula message-security law); every refused request is answered by [`PumpEvent::PumpRefused`].
+/// Comscan's own answers ([`PumpEvent::Squawk`], [`PumpEvent::PumpRefused`]) are inert as input.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum PumpEvent {
+    /// Start the armed program whose `make_core::Program::digest` is `program` (16 hex digits), in `dialect`
+    /// (`grbl`, `grbl-laser`, `marlin`), on `port` (the host opener's name for the link).
+    PumpStart { principal: Origin, program: String, dialect: String, port: String },
+    /// grbl feed hold (`!`).
+    PumpHold { principal: Origin },
+    /// grbl cycle start (`~`).
+    PumpResume { principal: Origin },
+    /// Stop: a feed hold, then a soft reset once the hold is complete.
+    PumpStop { principal: Origin },
+    /// Telemetry (CODEX §5 Squawk): lines sent / acknowledged / total, the pump's state word, the last status report in
+    /// grbl's own `<...>` grammar, and the named event that moved it (an error or alarm with its code and name, `done`, `timeout`).
+    Squawk {
+        sent: u32,
+        acked: u32,
+        total: u32,
+        state: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        event: Option<String>,
+    },
+    /// A refused request, with the reason by name.
+    PumpRefused { why: String },
+}
+
+impl PumpEvent {
+    /// True for what Comscan consumes; its answers are inert as input.
+    pub fn is_request(&self) -> bool {
+        matches!(
+            self,
+            PumpEvent::PumpStart { .. } | PumpEvent::PumpHold { .. } | PumpEvent::PumpResume { .. } | PumpEvent::PumpStop { .. }
+        )
     }
 }

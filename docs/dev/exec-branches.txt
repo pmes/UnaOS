@@ -1234,15 +1234,21 @@ refs/heads/exec-rmbp-vuggeom   8f068ef3b FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-vugsketch   fd7ef3b4c FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-vugmesh   3190df0af FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-vugmake   b7152a30a FOLDED-BY-HAND (this commit) 2026-10-27
-refs/heads/exec-rmbp-vugbrep1   0ef553321 IN-FLIGHT cut 2026-11-01
+refs/heads/exec-rmbp-vugbrep1   dbf66bd4c FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-vugscan1   ff2ceac56 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-vugface1   eea57d656 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-vugscantool   524e34ff9 FOLDED-BY-HAND (this commit) 2026-10-27
-refs/heads/exec-rmbp-sonderecord   3377d2d13 IN-FLIGHT cut 2026-11-01
+refs/heads/exec-rmbp-sonderecord   be17c8d24 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-vugshimswap   46dbdb9d4 IN-FLIGHT cut 2026-11-01
-refs/heads/exec-rmbp-vugscanrim   3d8399c55 IN-FLIGHT cut 2026-11-01
+refs/heads/exec-rmbp-vugscanrim   38c628bbe FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-vugscanpose   3d8399c55 IN-FLIGHT cut 2026-11-01
-refs/heads/exec-rmbp-vughelm   3d8399c55 IN-FLIGHT cut 2026-11-01
-refs/heads/exec-rmbp-vugcomscan1   3d8399c55 IN-FLIGHT cut 2026-11-01
-refs/heads/exec-rmbp-vugfacebuttons   3d8399c55 IN-FLIGHT cut 2026-11-01
+refs/heads/exec-rmbp-vughelm   04f96c128 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-vugcomscan1   c571c10a9 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-vugfacebuttons   c508d798f FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-vugmakepocket   3d8399c55 IN-FLIGHT cut 2026-11-01
+exec-rmbp-vugdoc | /home/user/exec/vugdoc | cut f89569a2d | VUGDOC | wave36
+exec-rmbp-vugbrep2 | /home/user/exec/vugbrep2 | cut f89569a2d | VUGBREP2 | wave36
+exec-rmbp-vugstep | /home/user/exec/vugstep | cut f89569a2d | VUGSTEP | wave36
+exec-rmbp-vugmakeslice | /home/user/exec/vugmakeslice | cut f89569a2d | VUGMAKESLICE | wave36
+exec-rmbp-vugcomscantty | /home/user/exec/vugcomscantty | cut f89569a2d | VUGCOMSCANTTY | wave36
+exec-rmbp-vugface2 | /home/user/exec/vugface2 | cut f89569a2d | VUGFACE2 | wave36

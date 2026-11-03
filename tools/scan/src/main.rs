@@ -16,7 +16,8 @@
 //! Inputs (the measured roads from a D435i to this machine; librealsense v2.55.1):
 //! - `.prb`: probe_core's recording (`probe_core::recording`: PRB1 records back to back, what the kernel's
 //!   `/dev/probe/depth0` record is); the depth (Z16) records are fused, intrinsics and units from each record.
-//!   The kernel writes no intrinsics today (sonde.rs `wire::encode(.., None)`), so the four flags supply them.
+//!   The kernel's `tests sonderec` (SONDERECORD, LEDGER SR472) writes the rectified intrinsics into each record when
+//!   the D435i's coefficients table parsed (`intr=<fx>,<fy>,<ppx>,<ppy>` on its wire); on `intr=none` the four flags supply them.
 //! - `.csv`: rs-convert's depth CSV (`tools/convert/converters/converter-csv.cpp:83-90`): one line per image row,
 //!   comma-separated `depth_frame::get_distance` values in METRES, 0 for a hole, no header, no intrinsics (the four
 //!   flags are required). `--csv-raw` reads integer Z16 units instead. Quantised at `--units-um` (default 1000).

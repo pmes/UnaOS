@@ -85,7 +85,7 @@ pub fn ensure() {
     use core::sync::atomic::{AtomicBool, Ordering};
     static DONE: AtomicBool = AtomicBool::new(false);
     if !DONE.swap(true, Ordering::AcqRel) {
-        crate::tests::register("sonde", selftest);
+        crate::tests::register("sonde", selftest); #[cfg(feature = "sonderec")] crate::tests::register("sonderec", record_selftest);
     }
 }
 
@@ -589,4 +589,198 @@ pub fn tap_service() {
     } else if cost.saturating_mul(2) < budget && t.every > 1 {
         t.every -= 1;
     }
+}
+
+// ── SONDE-RECORD (LEDGER SR472): `tests sonderec` — N depth frames to the boot volume as PRB1 records ─────────────────
+//
+// `tests sonde` publishes ONE frame in memory (`/dev/probe/depth0`); nothing wrote a frame to the card, so no real
+// frame could reach the Mac. `tests sonderec` (feature `sonderec`, knob `UNAOS_SONDE_RECORD=<n>`, implies `sonde`)
+// takes N consecutive Z16 frames of the armed depth stream (`depth_tap`), each as `probe_core::wire::encode`'s PRB1
+// header + the frame bytes, back to back — the recording tools/scan reads (VUGSCANTOOL SR471: ONE format) — into ONE
+// buffer reserved up front, then writes it as `/probe-<n>.prb` on the boot volume through the VFS's ONE whole-file
+// writer (`MountTable::put_file`, the kernel principal), `<n>` the card's next free sequence (nothing is overwritten).
+// Each record carries the depth units (`depth_scale`) and, when this boot read the camera's coefficients table
+// (`uvc::hwmon::intcal`, GETINTCAL), the depth stream's rectified intrinsics; `intr=none` otherwise, never the ideal.
+// Capture first (N at 30 fps is under half a second for 12), then one write: the rMBP card's measured rate (rmbp
+// A2, ~220 KB/s) puts 12 frames (9.77 MB) at about 44 s, so this is its own verb, not an arm of `tests sonde`'s 2 s
+// window; N is clamped to 1..=REC_MAX. Every item below is `#[cfg(feature = "sonderec")]`, appended at the file tail:
+// no line above moves, and a sonde image without the feature is byte-identical.
+//
+//   `:: SONDEREC: frames=<n> bytes=<b> path=/probe-<n>.prb write_ms=<t> want=<n> w= h= seq=<a>..<b> kbps=<k>
+//    depth_scale=<m>(device|default) intr=<fx>,<fy>,<ppx>,<ppy>|none -> PASS ::`
+//   `-> SKIP(no-device)` with no D400 (every QEMU run); `-> FAIL reason=<name>` otherwise, the reason by name.
+
+/// The frame count when `UNAOS_SONDE_RECORD` is not a decimal number.
+#[cfg(feature = "sonderec")]
+const REC_DEFAULT: u32 = 12;
+/// The ceiling on N: 30 records = 24.4 MB, about 111 s at the A2 card rate, under half the aarch64 heap.
+#[cfg(feature = "sonderec")]
+const REC_MAX: u32 = 30;
+
+/// The intrinsics a `w` x `h` depth record carries: the camera's coefficients-table row, or `None`.
+#[cfg(feature = "sonderec")]
+fn rec_intrinsics(w: u16, h: u16) -> Option<[f32; 4]> {
+    crate::drivers::uvc::hwmon::depth_rect(w, h)
+}
+
+#[cfg(feature = "sonderec")]
+fn record_selftest() {
+    let want = match option_env!("UNAOS_SONDE_RECORD").map(|v| v.trim().parse::<u32>()) {
+        Some(Ok(n)) => n.clamp(1, REC_MAX),
+        _ => REC_DEFAULT,
+    };
+    let fail = |k: u32, b: usize, p: &str, ms: u64, why: &str| {
+        serial_println!(":: SONDEREC: frames={} bytes={} path={} write_ms={} want={} -> FAIL reason={} ::", k, b, p, ms, want, why);
+    };
+
+    // ── 1. the coefficients-table reader against a hand-laid table (row 3 = 848x480 calibrated, row 0 all zero) ──
+    let fixture: Option<&'static str> = {
+        let mut t = [0u8; rs::COEFFICIENTS_TABLE_LEN];
+        t[2] = rs::COEFFICIENTS_TABLE_ID as u8;
+        let row: [f32; 4] = [421.25, 420.5, 425.75, 238.125];
+        for (j, v) in row.iter().enumerate() {
+            let o = rs::RECT_PARAMS_OFFSET + 3 * 16 + j * 4;
+            t[o..o + 4].copy_from_slice(&v.to_bits().to_le_bytes());
+        }
+        let crc = crate::hash::crc32(&t[rs::CALIB_HEADER_LEN..]);
+        t[rs::CALIB_CRC_OFFSET..rs::CALIB_CRC_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
+        let mut bad = t;
+        bad[400] ^= 1;
+        if crate::hash::crc32(b"123456789") != 0xCBF4_3926 {
+            Some("crc32.check")
+        } else if rs::rect_index(848, 480) != Some(3) {
+            Some("rect_index.848x480")
+        } else if rs::rect_index(800, 600).is_some() {
+            Some("rect_index.unlisted")
+        } else if rs::coefficients_rects(&bad) != Err("crc") {
+            Some("crc.refused")
+        } else if rs::coefficients_rects(&t[..300]) != Err("short-table") {
+            Some("short.refused")
+        } else {
+            match rs::coefficients_rects(&t) {
+                Err(_) => Some("parse"),
+                Ok(rows) if rows[3] != row => Some("rect.848x480"),
+                Ok(rows) if !rs::rect_is_ideal(&rows[0]) => Some("ideal.zero-row"),
+                Ok(rows) if rs::rect_is_ideal(&rows[3]) => Some("ideal.calibrated-row"),
+                Ok(_) => None,
+            }
+        }
+    };
+    if let Some(field) = fixture {
+        fail(0, 0, "-", 0, &alloc::format!("intcal-fixture({})", field));
+        return;
+    }
+
+    // ── 2. the device and its armed depth stream ──
+    let Some(r) = multi::record() else {
+        serial_println!(":: SONDEREC: frames=0 bytes=0 path=- write_ms=0 want={} -> SKIP(no-device) ::", want);
+        return;
+    };
+    let (w, h) = match depth_tap::armed() {
+        Some((addr, w, h, cc)) if addr == r.addr && cc == *b"Z16 " && w != 0 && h != 0 => (w, h),
+        None => return fail(0, 0, "-", 0, "no-armed-stream(see-[uvc]-commit=)"),
+        Some((a, _, _, _)) if a != r.addr => return fail(0, 0, "-", 0, "armed-stream-is-another-device"),
+        Some((_, _, _, cc)) if cc != *b"Z16 " => return fail(0, 0, "-", 0, "armed-stream-is-not-z16"),
+        Some(_) => return fail(0, 0, "-", 0, "armed-stream-geometry-zero"),
+    };
+
+    // ── 3. capture: N consecutive frames into one buffer reserved up front ──
+    let row = w as usize * 2;
+    let need = row * h as usize;
+    let total = (wire::HEADER_LEN + need) * want as usize;
+    let mut out: Vec<u8> = Vec::new();
+    let mut frame: Vec<u8> = Vec::new();
+    if out.try_reserve_exact(total).is_err() || frame.try_reserve_exact(need).is_err() {
+        return fail(0, 0, "-", 0, "heap");
+    }
+    let (um, um_src) = depth_scale();
+    let intr = rec_intrinsics(w, h);
+    let id = alloc::format!("uvc:{:04x}:{:04x}", r.vid, r.pid);
+    let hz = tick_hz();
+    let span = crate::arch::hw_wait_budget();
+    let c0 = crate::arch::ms();
+    let mut last = depth_tap::latest_seq();
+    let (mut seq_a, mut seq_b, mut taken) = (0u32, 0u32, 0u32);
+    while taken < want {
+        let t0 = crate::arch::now_cycles();
+        while depth_tap::latest_seq() == last && crate::arch::now_cycles().wrapping_sub(t0) < span {
+            #[cfg(target_arch = "x86_64")]
+            crate::arch::sched::sleep_ticks(1);
+            // aarch64: the wait drives the event ring itself (the selftest's window, uvc.rs `stream_fixture`).
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                if let Ok(mut x) = crate::drivers::xhci::claim() {
+                    x.poll_events();
+                }
+                crate::arch::sched::yield_now();
+            }
+            core::hint::spin_loop();
+        }
+        let (fseq, len) = match depth_tap::copy_latest(&mut frame) {
+            Some((s, l)) if s != last => (s, l),
+            _ => return fail(taken, out.len(), "-", 0, &alloc::format!("frame-timeout(at={})", taken)),
+        };
+        if len != need || frame.len() != need {
+            return fail(taken, out.len(), "-", 0, &alloc::format!("frame-size(at={},len={},need={})", taken, len, need));
+        }
+        let ts_us = if hz != 0 { (crate::arch::now_cycles() as u128 * 1_000_000 / hz as u128) as u64 } else { 0 };
+        let f = match Frame::new(StreamKind::Depth, PixelFormat::Z16, w as u32, h as u32, row, ts_us, fseq as u64, core::mem::take(&mut frame)) {
+            Ok(f) => f,
+            Err(_) => return fail(taken, out.len(), "-", 0, "frame-geometry"),
+        };
+        match wire::encode(&f, &id, um, intr) {
+            Ok(hd) => {
+                out.extend_from_slice(&hd);
+                out.extend_from_slice(&f.data);
+            }
+            Err(_) => return fail(taken, out.len(), "-", 0, "wire-encode"),
+        }
+        frame = f.data; // the staging buffer comes back for the next frame
+        if taken == 0 {
+            seq_a = fseq;
+        }
+        seq_b = fseq;
+        last = fseq;
+        taken += 1;
+    }
+    let capture_ms = crate::arch::ms().saturating_sub(c0);
+    let bytes = out.len();
+
+    // ── 4. the write: the boot volume's posture, the next free name, ONE put_file, the size read back ──
+    let mt = crate::shell::vfs_mount_table();
+    let kp = crate::fs::vfs::KERNEL_PRINCIPAL;
+    match mt.write_veto("/") {
+        Err(_) => return fail(taken, bytes, "-", 0, "no-root-volume"),
+        Ok(Some(v)) => return fail(taken, bytes, "-", 0, &alloc::format!("root-read-only({})", v)),
+        Ok(None) => {}
+    }
+    let Some(path) = (1..=999u32).map(|n| alloc::format!("/probe-{}.prb", n)).find(|p| mt.stat(p).is_err()) else {
+        return fail(taken, bytes, "-", 0, "names-exhausted");
+    };
+    serial_println!("[sonde] rec captured={} bytes={} seq={}..{} capture_ms={} writing path={}", taken, bytes, seq_a, seq_b, capture_ms, path);
+    let t0 = crate::arch::ms();
+    let put = mt.put_file(&path, &out, kp);
+    let write_ms = crate::arch::ms().saturating_sub(t0);
+    if let Err(e) = put {
+        return fail(taken, bytes, &path, write_ms, &alloc::format!("write({:?})", e));
+    }
+    let size = mt.stat(&path).map(|s| s.size as u64).unwrap_or(0);
+    if size != bytes as u64 {
+        return fail(taken, bytes, &path, write_ms, &alloc::format!("short-write({}/{})", size, bytes));
+    }
+    let kbps = (bytes as u64).saturating_mul(1000) / write_ms.max(1) / 1024;
+    let (ip, fp) = um_parts(um);
+    let f3 = |v: f32| -> alloc::string::String {
+        let m = (v * 1000.0) as i64;
+        let a = m.unsigned_abs();
+        alloc::format!("{}{}.{:03}", if m < 0 { "-" } else { "" }, a / 1000, a % 1000)
+    };
+    let intr_s = match intr {
+        Some(k) => alloc::format!("{},{},{},{}", f3(k[0]), f3(k[1]), f3(k[2]), f3(k[3])),
+        None => alloc::string::String::from("none"),
+    };
+    serial_println!(
+        ":: SONDEREC: frames={} bytes={} path={} write_ms={} want={} w={} h={} seq={}..{} kbps={} depth_scale={}.{:06}({}) intr={} -> PASS ::",
+        taken, bytes, path, write_ms, want, w, h, seq_a, seq_b, kbps, ip, fp, um_src, intr_s
+    );
 }

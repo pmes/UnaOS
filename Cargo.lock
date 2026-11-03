@@ -516,6 +516,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "brep_core"
+version = "0.1.0"
+dependencies = [
+ "libm",
+]
+
+[[package]]
 name = "bstr"
 version = "1.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -795,6 +802,9 @@ name = "comscan"
 version = "0.1.0"
 dependencies = [
  "bandy",
+ "helm",
+ "make_core",
+ "pump_core",
  "tokio",
 ]
 
@@ -2257,6 +2267,7 @@ name = "helm"
 version = "0.1.0"
 dependencies = [
  "ibus",
+ "make_core",
 ]
 
 [[package]]
@@ -3827,6 +3838,13 @@ dependencies = [
  "quartzite",
  "sysinfo",
  "tokio",
+]
+
+[[package]]
+name = "pump_core"
+version = "0.1.0"
+dependencies = [
+ "make_core",
 ]
 
 [[package]]

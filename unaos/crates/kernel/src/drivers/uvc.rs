@@ -2559,7 +2559,7 @@ pub mod multi {
         // The depth scale's own read is the HW-monitor GET_ADV(etDepthTableControl) — a 1024-byte XU
         // SET_CUR/GET_CUR pair (realsense_xu::hwmon_*). SONDE3 (SR108): sent when `cap` carries it (the
         // xHCI 4 KiB EP0); EHCI's 256-byte buffer keeps `[sonde] hwmon=withheld reason=ep0-buf-256-lt-1024`.
-        super::hwmon::depth_units(addr, unit, vc, buf, cap, xfer);
+        super::hwmon::depth_units(addr, unit, vc, buf, cap, xfer); #[cfg(feature = "sonderec")] super::hwmon::intcal(addr, unit, vc, buf, cap, xfer);
         // (The exchange lives in `super::hwmon`, appended at the file tail, so this module keeps its line
         // count and nothing below it — `ensure_tests` is compiled with `uvc` alone — moves.)
     }
@@ -2711,6 +2711,111 @@ pub mod hwmon {
                 "[sonde] hwmon=failed addr={} stage=reply echo={:#x} want_echo={:#x} size={} reason={} depth_scale=default({} um)",
                 addr, echo, rs::OP_GET_ADV, size, if echo != rs::OP_GET_ADV as u32 { "error-echo" } else { "short-table" }, rs::DEPTH_UNITS_DEFAULT_UM
             ),
+        }
+    }
+
+    // ── SONDE-RECORD (LEDGER SR472): the coefficients table — the depth stream's rectified intrinsics ──────────────
+    //
+    // APPENDED inside this module's tail, every item `#[cfg(feature = "sonderec")]` (sonderec implies sonde): no code
+    // line above moves, and a sonde image without sonderec compiles this module exactly as before. The table read is
+    // `realsense_xu::hwmon_build_intcal` / `coefficients_rects` (librealsense file:line there); the exchange is
+    // `depth_units`' shape verbatim, after it on the same `after_census` line.
+
+    #[cfg(feature = "sonderec")]
+    #[allow(clippy::declare_interior_mutable_const)]
+    const RZ: AtomicU32 = AtomicU32::new(0);
+    /// Every `rect_params` row (fx, fy, ppx, ppy as f32 bit patterns, row-major, `ds_rect_resolutions` order), valid
+    /// once [`RECT_OK`] is set. Written once per D400 census.
+    #[cfg(feature = "sonderec")]
+    static DEPTH_RECT: [AtomicU32; 64] = [RZ; 64];
+    #[cfg(feature = "sonderec")]
+    static RECT_OK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+    /// The camera's rectified depth intrinsics `[fx, fy, ppx, ppy]` for a `w` x `h` stream, or `None` when this boot did
+    /// not read the table (EHCI's 256-byte EP0, a failed exchange: its `[sonde] intcal=` line names the stage), the
+    /// resolution has no row, or the row is the no-calibration case (`realsense_xu::rect_is_ideal`).
+    #[cfg(feature = "sonderec")]
+    pub fn depth_rect(w: u16, h: u16) -> Option<[f32; 4]> {
+        if !RECT_OK.load(Ordering::Acquire) {
+            return None;
+        }
+        let i = rs::rect_index(w, h)?;
+        let mut r = [0f32; 4];
+        for (j, v) in r.iter_mut().enumerate() {
+            *v = f32::from_bits(DEPTH_RECT[i * 4 + j].load(Ordering::Relaxed));
+        }
+        if rs::rect_is_ideal(&r) {
+            return None;
+        }
+        Some(r)
+    }
+
+    /// `GETINTCAL(coefficients_table)` over the HW-monitor channel: `SET_CUR(DS5_HWMONITOR)` with the command, then
+    /// `GET_CUR(DS5_HWMONITOR)` of 1024 bytes, the reply's data parsed by `realsense_xu::coefficients_rects` (the CRC
+    /// checked). ONE attempt each, never retried; a failure names its stage and the intrinsics stay unread. The command
+    /// READS the calibration table. `buf` is the live EP0 data buffer of the controller `xfer` drives, valid for `cap`.
+    #[cfg(feature = "sonderec")]
+    pub fn intcal(addr: u8, unit: u8, vc: u8, buf: *mut u8, cap: usize, xfer: Xfer) {
+        RECT_OK.store(false, Ordering::Release);
+        if !rs::hwmon_fits(cap) {
+            serial_println!("[sonde] intcal=withheld reason=ep0-buf-{}-lt-{} intrinsics=none", cap, rs::HWMON_BUF);
+            return;
+        }
+        let (wv, wi) = (rs::xu_wvalue(rs::CTRL_HWMONITOR), rs::xu_windex(unit, vc));
+        let len = rs::HWMON_BUF as u16;
+        let built = {
+            // SAFETY: `buf` holds `cap` >= HWMON_BUF bytes (checked above) and no transfer is in flight while this
+            // slice lives; it ends before the SET_CUR below hands the buffer to the controller.
+            let b = unsafe { core::slice::from_raw_parts_mut(buf, rs::HWMON_BUF) };
+            rs::hwmon_build_intcal(b)
+        };
+        if built == 0 {
+            serial_println!("[sonde] intcal=failed addr={} stage=build reason=buffer-short intrinsics=none", addr);
+            return;
+        }
+        if let Err(e) = xfer(rs::BM_CLASS_INTF_OUT, rs::RQ_SET_CUR, wv, wi, len, false) {
+            serial_println!("[sonde] intcal=failed addr={} stage=set-cur unit={} len={} reason={} intrinsics=none — NOT retried", addr, unit, len, e);
+            return;
+        }
+        let got = match xfer(rs::BM_CLASS_INTF_IN, rs::RQ_GET_CUR, wv, wi, len, true) {
+            Ok(got) => got as usize,
+            Err(e) => {
+                serial_println!("[sonde] intcal=failed addr={} stage=get-cur unit={} len={} reason={} intrinsics=none — NOT retried", addr, unit, len, e);
+                return;
+            }
+        };
+        if got < rs::HWMON_BUF {
+            serial_println!("[sonde] intcal=failed addr={} stage=get-cur got={} need={} reason=runt intrinsics=none", addr, got, rs::HWMON_BUF);
+            return;
+        }
+        // SAFETY: the GET_CUR just wrote `got` >= HWMON_BUF bytes into the live EP0 buffer; the next transfer is the
+        // caller's, after this function returns.
+        let r = unsafe { core::slice::from_raw_parts(buf as *const u8, rs::HWMON_BUF) };
+        let le32 = |o: usize| u32::from_le_bytes([r[o], r[o + 1], r[o + 2], r[o + 3]]);
+        let (echo, size) = (le32(0), le32(rs::HWMON_DATA_SIZE_OFFSET));
+        let Some(range) = rs::hwmon_reply(r, rs::OP_GETINTCAL) else {
+            serial_println!(
+                "[sonde] intcal=failed addr={} stage=reply echo={:#x} want_echo={:#x} size={} reason={} intrinsics=none",
+                addr, echo, rs::OP_GETINTCAL, size, if echo != rs::OP_GETINTCAL as u32 { "error-echo" } else { "size" }
+            );
+            return;
+        };
+        match rs::coefficients_rects(&r[range]) {
+            Ok(rows) => {
+                for (i, row) in rows.iter().enumerate() {
+                    for (j, v) in row.iter().enumerate() {
+                        DEPTH_RECT[i * 4 + j].store(v.to_bits(), Ordering::Relaxed);
+                    }
+                }
+                RECT_OK.store(true, Ordering::Release);
+                let d = rows[3]; // ds_rect_resolutions::res_848_480, the depth function's default frame
+                let m = |v: f32| -> i64 { (v * 1000.0) as i64 };
+                crate::census_println!(
+                    "[sonde] intcal op=GETINTCAL(coefficients_table) unit={} get_cur={} echo={:#x} size={} crc=ok rect_848x480_milli={},{},{},{}{}",
+                    unit, got, echo, size, m(d[0]), m(d[1]), m(d[2]), m(d[3]), if rs::rect_is_ideal(&d) { " (no-calibration)" } else { "" }
+                );
+            }
+            Err(why) => serial_println!("[sonde] intcal=failed addr={} stage=table size={} reason={} intrinsics=none", addr, size, why),
         }
     }
 }
