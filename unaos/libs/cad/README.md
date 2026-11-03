@@ -12,6 +12,7 @@ invariants: `docs/dev/blueprint/vug.md` (f64 geometry, one `Tol`, pure cores, th
 | `make_core` | Machine, Tool, Stock, fixtures, Op, the `Program` IR, G-code dialects, `review` for Helm — built: the planner (kinematic pass, refusals by name, grbl / Marlin / LinuxCNC), geom_core by path: BUILT by SR473 | SR467 |
 | `brep_core` | B-rep topology with persistent Ids, analytic surfaces, validate, primitives, extrude / revolve, closed-form mass, chord-bounded tessellation | SR468 |
 | `scan_core` | TSDF fusion of probe_core depth frames, marching cubes with per-vertex confidence, plane / cylinder RANSAC with residuals, the synthetic depth fixture | SR469 |
+| `doc_core` | the design document: text, one statement per line (sketches, constraints, features, the Make, scan references), `read` / `write` (byte-deterministic) / `replay` through the cores with each failing statement named by its line | SR480 |
 
 Every core takes `geom_core` by path for its geometry (one `Tol`, BP-vug-2), and `scan_core` also takes `mesh_core`; no core carries a private stand-in (VUGSHIMSWAP, LEDGER SR473).
 
