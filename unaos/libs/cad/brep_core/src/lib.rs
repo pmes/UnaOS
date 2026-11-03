@@ -16,7 +16,7 @@
 //!
 //! Refuse, don't guess: an input the arithmetic cannot decide, or a construction outside the analytic set, returns a
 //! named [`Refusal`]. Coordinates are f64 (BP-vug-1). Every comparison takes the caller's `Tol` (BP-vug-2). The crate
-//! is pure: no I/O, no clock, no global state (BP-vug-4). Fillets (VUG-BREP-3), NURBS surfaces, STEP and 3MF are owed.
+//! is pure: no I/O, no clock, no global state (BP-vug-4). Booleans are `boolean` (SR481) and STEP is `step_core` (SR482); fillets (VUG-BREP-3), NURBS surfaces and 3MF (VUG-3MF, mesh_core) are owed.
 //!
 //! VUGBREP2 (LEDGER SR481) builds [`union`] / [`difference`] / [`intersection`] over plane and cylinder faces
 //! (src/bool.rs) and point classification by exact ray parity ([`point_in_solid`], src/classify.rs).
