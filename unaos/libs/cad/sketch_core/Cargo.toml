@@ -7,10 +7,10 @@ description = "Vug's 2D sketch core: entities, constraints, the Levenberg-Marqua
 
 # VUGSKETCH (LEDGER SR465): `#![no_std]` + `alloc`, `#![forbid(unsafe_code)]`, the timeline_core / midden_core shape: a
 # shared core under `unaos/libs/cad/`, a member of the ROOT host workspace, linkable by the kernel by path with
-# `default-features = false`. libm gives sqrt / sin / cos / atan2 in no_std. geom_core (SR464, cut beside) is held by
-# the private `src/geom.rs` shim until it folds: the seat's swap is `mod geom;` -> `use geom_core as geom;`, the line
-# `geom_core = { path = "../geom_core", default-features = false }` here, and deleting src/geom.rs.
+# `default-features = false`. libm gives sqrt / sin / cos / atan2 in no_std. geom_core (SR464) is the geometry, by path
+# (VUGSHIMSWAP SR473): lib.rs `use geom_core as geom;` (Tol, Vec2, Arc2, area); no private stand-in remains.
 [dependencies]
+geom_core = { path = "../geom_core", default-features = false }
 libm = { version = "0.2", default-features = false }
 
 [features]

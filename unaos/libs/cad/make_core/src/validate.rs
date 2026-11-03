@@ -7,7 +7,7 @@ use alloc::{string::String, vec::Vec};
 use libm::fabs;
 
 use crate::gcode::Dialect;
-use crate::geom::{Aabb3, Tol, Vec3, seg_aabb3};
+use crate::geom::{Aabb3, Length, Tol, Vec3, Xy, seg_aabb3};
 use crate::machine::{Machine, Units};
 use crate::plan::{arc_bbox, arc_caps, caps, durations};
 use crate::program::{Move, Program};
@@ -86,7 +86,7 @@ pub fn check(p: &Program, m: &Machine, tol: Tol, out: &mut Vec<Refusal>) -> Stat
             Move::Arc { to, centre, cw, feed } => {
                 let s = pos.unwrap_or(*to);
                 let (lo, hi) = arc_bbox(s.xy(), to.xy(), *centre, *cw, tol);
-                let b = Aabb3::new(Vec3::new(lo.x, lo.y, s.z.min(to.z)), Vec3::new(hi.x, hi.y, s.z.max(to.z)));
+                let b = Aabb3 { min: Vec3::new(lo.x, lo.y, s.z.min(to.z)), max: Vec3::new(hi.x, hi.y, s.z.max(to.z)) };
                 (*to, Some(b), Some(*feed), false)
             }
             Move::ToolChange { tool: n } => {
@@ -106,21 +106,21 @@ pub fn check(p: &Program, m: &Machine, tol: Tol, out: &mut Vec<Refusal>) -> Stat
             _ => continue,
         };
         let from = pos.unwrap_or(to);
-        let swept = sweep_box.unwrap_or(Aabb3::from_point(from).union(&Aabb3::from_point(to)));
+        let swept = sweep_box.unwrap_or(Aabb3 { min: from, max: from }.union(Aabb3 { min: to, max: to }));
 
         // The envelope: the end point, then the arc's extremes.
-        if !m.envelope.contains(to, tol) {
+        if !m.envelope.contains_point(to, tol) {
             out.push(Refusal::OutsideEnvelope { at: i, x: to.x, y: to.y, z: to.z });
         } else if let Some(b) = sweep_box {
             for c in [b.min, b.max] {
-                if !m.envelope.contains(c, tol) {
+                if !m.envelope.contains_point(c, tol) {
                     out.push(Refusal::OutsideEnvelope { at: i, x: c.x, y: c.y, z: c.z });
                     break;
                 }
             }
         }
         bbox = Some(match bbox {
-            Some(b) => b.union(&swept),
+            Some(b) => b.union(swept),
             None => swept,
         });
 
@@ -149,10 +149,10 @@ pub fn check(p: &Program, m: &Machine, tol: Tol, out: &mut Vec<Refusal>) -> Stat
                 let low = from.z.min(to.z);
                 let retract = fabs(to.x - from.x) <= tol.lin && fabs(to.y - from.y) <= tol.lin && to.z > from.z;
                 if low < m.safe_z - tol.lin && !retract {
-                    let foot = Aabb3::new(
-                        Vec3::new(st.min.x, st.min.y, low - 1.0),
-                        Vec3::new(st.max.x, st.max.y, from.z.max(to.z) + 1.0),
-                    );
+                    let foot = Aabb3 {
+                        min: Vec3::new(st.min.x, st.min.y, low - 1.0),
+                        max: Vec3::new(st.max.x, st.max.y, from.z.max(to.z) + 1.0),
+                    };
                     if seg_aabb3(from, to, &foot) {
                         out.push(Refusal::RapidIntoStock { at: i });
                     }
@@ -164,12 +164,12 @@ pub fn check(p: &Program, m: &Machine, tol: Tol, out: &mut Vec<Refusal>) -> Stat
         let (r, lf) = tool.map(|t| (t.radius(), t.lf)).unwrap_or((0.0, 0.0));
         'fx: for fx in &m.fixtures {
             for b in &fx.keepout {
-                let grown = Aabb3::new(
-                    Vec3::new(b.min.x - r, b.min.y - r, b.min.z - lf),
-                    Vec3::new(b.max.x + r, b.max.y + r, b.max.z),
-                );
+                let grown = Aabb3 {
+                    min: Vec3::new(b.min.x - r, b.min.y - r, b.min.z - lf),
+                    max: Vec3::new(b.max.x + r, b.max.y + r, b.max.z),
+                };
                 let hit = match sweep_box {
-                    Some(sb) => sb.intersects(&grown),
+                    Some(sb) => sb.intersect(grown).is_some(),
                     None => seg_aabb3(from, to, &grown),
                 };
                 if hit {

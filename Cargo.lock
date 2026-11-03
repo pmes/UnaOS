@@ -2863,6 +2863,7 @@ checksum = "dae608c151f68243f2b000364e1f7b186d9c29845f7d2d85bd31b9ad77ad552b"
 name = "make_core"
 version = "0.1.0"
 dependencies = [
+ "geom_core",
  "libm",
 ]
 
@@ -2928,6 +2929,7 @@ dependencies = [
 name = "mesh_core"
 version = "0.1.0"
 dependencies = [
+ "geom_core",
  "libm",
 ]
 
@@ -4361,7 +4363,9 @@ dependencies = [
 name = "scan_core"
 version = "0.1.0"
 dependencies = [
+ "geom_core",
  "libm",
+ "mesh_core",
  "probe_core",
 ]
 
@@ -4562,6 +4566,7 @@ checksum = "33f4fe9184a62d842c9ef383018f3306d8ba224fd9d836f56d7288308847c256"
 name = "sketch_core"
 version = "0.1.0"
 dependencies = [
+ "geom_core",
  "libm",
 ]
 

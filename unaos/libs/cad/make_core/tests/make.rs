@@ -21,7 +21,7 @@ fn mill() -> Machine {
         kinematics: Kinematics::Cartesian,
         axes: vec![axis(AxisId::X, -50.0, 200.0), axis(AxisId::Y, -50.0, 200.0), axis(AxisId::Z, -50.0, 60.0)],
         power: Power { kind: PowerKind::Spindle, max: 24000.0, ask_above: 18000.0 },
-        envelope: Aabb3::new(Vec3::new(-20.0, -20.0, -20.0), Vec3::new(100.0, 100.0, 50.0)),
+        envelope: Aabb3 { min: Vec3::new(-20.0, -20.0, -20.0), max: Vec3::new(100.0, 100.0, 50.0) },
         safe_z: 5.0,
         units: Units::Mm,
         tools: vec![
@@ -31,7 +31,7 @@ fn mill() -> Machine {
         stock: Some(Stock { shape: StockShape::Box { size: Vec3::new(50.0, 50.0, 10.0) }, origin: Vec3::new(0.0, 0.0, -10.0) }),
         fixtures: vec![Fixture {
             name: "vise jaw".to_string(),
-            keepout: vec![Aabb3::new(Vec3::new(60.0, 0.0, -10.0), Vec3::new(70.0, 50.0, 10.0))],
+            keepout: vec![Aabb3 { min: Vec3::new(60.0, 0.0, -10.0), max: Vec3::new(70.0, 50.0, 10.0) }],
         }],
         loaded: Some(1),
     }

@@ -14,7 +14,7 @@ use alloc::vec::Vec;
 use core::f64::consts::{FRAC_PI_2, PI, TAU};
 use libm::{atan2, fabs, hypot, sqrt};
 
-use crate::geom::{Tol, Vec2, Vec3};
+use crate::geom::{Length, Tol, Vec2, Vec3, Xy};
 use crate::machine::{AxisId, Machine};
 use crate::program::{Move, Program};
 
