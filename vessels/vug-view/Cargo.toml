@@ -16,6 +16,10 @@ license = "GPL-3.0-or-later"
 [dependencies]
 # The ONE geometry: mesh_core (VUGMESH SR466) — readers, weld, bounds, the f32 buffers, the BVH pick; named only in src/model.rs.
 mesh_core = { path = "../../unaos/libs/cad/mesh_core" }
+# VUGFACE2 (SR485): the sketch face — sketch_core holds the sketch (src/sketch.rs), brep_core the body (src/extrude.rs), geom_core the plane hit.
+sketch_core = { path = "../../unaos/libs/cad/sketch_core" }
+brep_core = { path = "../../unaos/libs/cad/brep_core" }
+geom_core = { path = "../../unaos/libs/cad/geom_core" }
 euclase = { path = "../../libs/euclase" }
 palette_core = { path = "../../unaos/libs/sys/palette_core" }
 pixel_core = { path = "../../unaos/libs/media/pixel_core" }

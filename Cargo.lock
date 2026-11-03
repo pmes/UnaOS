@@ -4688,6 +4688,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
+name = "step_core"
+version = "0.1.0"
+dependencies = [
+ "brep_core",
+ "libm",
+]
+
+[[package]]
 name = "stria"
 version = "0.1.0"
 dependencies = [
@@ -5422,13 +5430,16 @@ name = "vug-view"
 version = "0.1.0"
 dependencies = [
  "bandy",
+ "brep_core",
  "euclase",
+ "geom_core",
  "gneiss_pal",
  "log",
  "mesh_core",
  "palette_core",
  "pixel_core",
  "quartzite",
+ "sketch_core",
  "tokio",
 ]
 

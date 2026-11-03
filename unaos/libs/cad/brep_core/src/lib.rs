@@ -16,14 +16,21 @@
 //!
 //! Refuse, don't guess: an input the arithmetic cannot decide, or a construction outside the analytic set, returns a
 //! named [`Refusal`]. Coordinates are f64 (BP-vug-1). Every comparison takes the caller's `Tol` (BP-vug-2). The crate
-//! is pure: no I/O, no clock, no global state (BP-vug-4). Booleans (VUG-BREP-2), fillets (VUG-BREP-3), NURBS surfaces,
-//! STEP and 3MF are owed.
+//! is pure: no I/O, no clock, no global state (BP-vug-4). Booleans are `boolean` (SR481) and STEP is `step_core` (SR482); fillets (VUG-BREP-3), NURBS surfaces and 3MF (VUG-3MF, mesh_core) are owed.
+//!
+//! VUGBREP2 (LEDGER SR481) builds [`union`] / [`difference`] / [`intersection`] over plane and cylinder faces
+//! (src/bool.rs) and point classification by exact ray parity ([`point_in_solid`], src/classify.rs).
 #![no_std]
 #![forbid(unsafe_code)]
 
 extern crate alloc;
 
 pub mod build;
+// VUGBREP2 (SR481): the file is src/bool.rs, the module `boolean`: a root `mod bool` would share the type namespace
+// with the primitive `bool` that this file's derive expansions name.
+#[path = "bool.rs"]
+pub mod boolean;
+pub mod classify;
 pub mod curve;
 pub mod dep;
 mod earcut;
@@ -35,7 +42,9 @@ pub mod tess;
 pub mod topo;
 pub mod validate;
 
+pub use boolean::{Op, difference, faces_named, intersection, union};
 pub use build::{extrude, revolve};
+pub use classify::{Class, Where, point_in_solid};
 pub use curve::{Curve, Frame, NurbsCurve};
 pub use mass::{Mass, area, centroid, inertia, properties, volume};
 pub use surface::{Intersection, Surface, SurfaceKind, intersect};
@@ -84,6 +93,12 @@ pub enum Refusal {
     Triangulation { face: Id },
     /// The chord bound was not met after the step was halved six times.
     ChordUnreachable { face: Id },
+    /// VUGBREP2 (SR481): a boolean met a contact the closed-form road does not settle (coincident faces, a vertex on a
+    /// face, an edge meeting an edge, tangency), named by `what`; `a` is the first operand's entity, `b` the second's
+    /// (Ids are per operand).
+    Contact { what: &'static str, a: Id, b: Id },
+    /// VUGBREP2 (SR481): the kept faces of a boolean do not sew: this result edge is not used exactly once each way.
+    NotClosed { edge: Id },
 }
 
 impl From<dep::Degenerate> for Refusal {

@@ -19,8 +19,9 @@
 //!   The desk sits behind a `std::sync::Mutex` that the caller's arming code and [`serve_pump`] share; the lock is
 //!   taken only inside the synchronous calls and never held across an await.
 //!
-//! VUG-HELM-BIND (owed): `Verdict::Pass` carries no digest, so the caller pairs a verdict with its program; once Helm's
-//! pass names the digest it passed, [`start`] checks it against `Program::digest()`.
+//! VUG-HELM-BIND (LEDGER SR489): Helm's `Verdict::Pass { digest }` names the program it passed, and [`start`] checks
+//! it against `Program::digest()`, refusing [`Refused::Unbound`] by both digests: a pass issued for one program never
+//! pumps another. The machine is not in the pass yet (VUG-HELM-BIND-MACHINE owed).
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -44,12 +45,18 @@ pub enum Refused {
     RefusedByHelm { refusals: usize, never: usize },
     /// The pump would not take the program.
     Pump(PumpRefusal),
+    /// VUG-HELM-BIND (SR489): the pass was issued for the program `passed` (or names none: Helm's `Unbound`), not
+    /// for `program`, the one asked to start.
+    Unbound { passed: Option<u64>, program: u64 },
 }
 
-/// The only way Comscan makes a pump: a `Verdict::Pass`, then make_core's text for `p` in `d`.
+/// The only way Comscan makes a pump: a `Verdict::Pass` for `p` (VUG-HELM-BIND: by digest), then make_core's text
+/// for `p` in `d`.
 pub fn start(v: &Verdict, p: &Program, d: Dialect) -> Result<Pump, Refused> {
     match v {
-        Verdict::Pass => Pump::from_program(p, d).map_err(Refused::Pump),
+        Verdict::Pass { digest } if *digest == p.digest() => Pump::from_program(p, d).map_err(Refused::Pump),
+        Verdict::Pass { digest } => Err(Refused::Unbound { passed: Some(*digest), program: p.digest() }),
+        Verdict::Unbound => Err(Refused::Unbound { passed: None, program: p.digest() }),
         Verdict::Ask(a) => Err(Refused::Asked(a.len())),
         Verdict::Refuse { refusals, never } => {
             Err(Refused::RefusedByHelm { refusals: refusals.len(), never: never.len() })
@@ -481,14 +488,35 @@ mod tests {
         assert_eq!(start(&Verdict::Ask(vec![Ask::FirstRun { digest: p.digest() }]), &p, GRBL).err(), Some(Refused::Asked(1)));
         let never = Verdict::Refuse { refusals: vec![], never: vec![Ask::ToolChange { at: 0, tool: 2 }] };
         assert_eq!(start(&never, &p, GRBL).err(), Some(Refused::RefusedByHelm { refusals: 0, never: 1 }));
-        assert!(start(&Verdict::Pass, &p, GRBL).is_ok());
+        assert!(start(&Verdict::Pass { digest: p.digest() }, &p, GRBL).is_ok());
         assert_eq!(
-            start(&Verdict::Pass, &p, Dialect::LinuxCnc).err(),
+            start(&Verdict::Pass { digest: p.digest() }, &p, Dialect::LinuxCnc).err(),
             Some(Refused::Pump(PumpRefusal::DialectNotStreamed { dialect: Dialect::LinuxCnc }))
         );
         let mut desk = PumpDesk::new();
         assert_eq!(desk.arm(&never, &p, GRBL), Err(Refused::RefusedByHelm { refusals: 0, never: 1 }));
         assert!(desk.armed().is_empty());
+    }
+
+    // VUG-HELM-BIND (SR489): a pass names its program; it never starts another.
+    #[test]
+    fn a_pass_for_one_program_refuses_another_by_name() {
+        let a = program();
+        let mut b = program();
+        b.moves.push(Move::Rapid { to: Vec3::new(0.0, 0.0, 10.0) });
+        assert_ne!(a.digest(), b.digest());
+        let pass_a = Verdict::Pass { digest: a.digest() };
+        let unbound = Refused::Unbound { passed: Some(a.digest()), program: b.digest() };
+        assert_eq!(start(&pass_a, &b, GRBL).err(), Some(unbound.clone()));
+        let mut desk = PumpDesk::new();
+        assert_eq!(desk.arm(&pass_a, &b, GRBL), Err(unbound));
+        assert!(desk.armed().is_empty(), "a pass for another program arms nothing");
+        assert_eq!(
+            start(&Verdict::Unbound, &a, GRBL).err(),
+            Some(Refused::Unbound { passed: None, program: a.digest() })
+        );
+        assert!(start(&pass_a, &a, GRBL).is_ok(), "the pass still starts the program it names");
+        assert_eq!(desk.arm(&pass_a, &a, GRBL), Ok(a.digest()));
     }
 
     #[test]
@@ -504,7 +532,7 @@ mod tests {
         // Nothing armed: refused by name, whatever the sender claims.
         assert!(why(&desk.apply(&start_msg(p.digest(), "grbl"), &mut open)).contains("is not armed"));
 
-        let digest = desk.arm(&Verdict::Pass, &p, GRBL).unwrap();
+        let digest = desk.arm(&Verdict::Pass { digest: p.digest() }, &p, GRBL).unwrap();
         assert_eq!(digest, p.digest());
         assert!(why(&desk.apply(&start_msg(digest, "marlin"), &mut open)).contains("dialect mismatch"));
         assert!(why(&desk.apply(&start_msg(digest, "fanuc"), &mut open)).contains("unknown dialect"));
@@ -554,7 +582,7 @@ mod tests {
         let mut open = move |_: &str| -> Result<Box<dyn Transport + Send>, String> { Ok(Box::new(m2.clone())) };
         let mut desk = PumpDesk::new();
         assert_eq!(why(&desk.apply(&PumpEvent::PumpHold { principal: who() }, &mut open)), "nothing is streaming");
-        let d = desk.arm(&Verdict::Pass, &p, GRBL).unwrap();
+        let d = desk.arm(&Verdict::Pass { digest: p.digest() }, &p, GRBL).unwrap();
         desk.apply(&start_msg(d, "grbl"), &mut open);
         desk.tick(1000);
         let out = desk.apply(&PumpEvent::PumpHold { principal: who() }, &mut open);
