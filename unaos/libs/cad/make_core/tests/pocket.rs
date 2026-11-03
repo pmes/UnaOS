@@ -190,6 +190,57 @@ fn a_pocket_with_an_island_never_enters_the_island_inset() {
 }
 
 #[test]
+fn island_rings_carry_their_corner_arcs_as_g2_g3() {
+    // VUGMAKEARCFIT (SR490). A pocket's convex corners take the mitre (the plain square's rings are sharp squares);
+    // arcs come where the boundary turns AWAY from the offset: the island's corners. By hand, DC 4, stepover 2, the
+    // 40 mm square with the central 10 mm island: d = 2, 4, 6 each hold the wall ring and the island ring (four quarter
+    // arcs of radius d about the island corners); d = 8 holds four corner rings, each two wall-offset lines closed by
+    // ONE arc of radius 8 about an island corner, from (13, 20 - sqrt 15) to (20 - sqrt 15, 13) for the corner (20, 20):
+    // sweep 2 (atan(7 / sqrt 15) - pi/4); nothing is 10 from the boundary (the corner clearance peaks at 8.79).
+    let m = mill();
+    let outline = rect(5.0, 5.0, 45.0, 45.0);
+    let island = rect(20.0, 20.0, 30.0, 30.0);
+    let p = generate(&pocket(outline.clone(), vec![island.clone()], 1.0, false, 2), &m, T).unwrap();
+    let mut sweep: std::collections::BTreeMap<(usize, i64), f64> = std::collections::BTreeMap::new();
+    let mut pos: Option<Vec3> = None;
+    for mv in &p.moves {
+        match mv {
+            Move::Arc { to, centre, cw, feed } => {
+                let s = pos.unwrap();
+                if *feed == 600.0 {
+                    assert!(s.z == -1.0 && to.z == -1.0, "a fed arc off the floor: {mv:?}");
+                    let c = island
+                        .iter()
+                        .position(|q| (q.x - centre.x).abs() < 1e-9 && (q.y - centre.y).abs() < 1e-9)
+                        .unwrap_or_else(|| panic!("a fed arc about no island corner: {mv:?}"));
+                    let r = ((s.x - centre.x).powi(2) + (s.y - centre.y).powi(2)).sqrt();
+                    let sw = arc_sweep(Vec2::new(s.x, s.y), Vec2::new(to.x, to.y), *centre, *cw, T);
+                    *sweep.entry((c, (r * 1e6).round() as i64)).or_insert(0.0) += sw;
+                }
+                pos = Some(*to);
+            }
+            Move::Rapid { to } | Move::Linear { to, .. } => pos = Some(*to),
+            _ => {}
+        }
+    }
+    let radii: BTreeSet<i64> = sweep.keys().map(|k| k.1).collect();
+    assert_eq!(radii, [2, 4, 6, 8].iter().map(|d| d * 1_000_000).collect::<BTreeSet<i64>>());
+    let r8 = 2.0 * ((7.0 / 15f64.sqrt()).atan() - std::f64::consts::FRAC_PI_4);
+    for c in 0..4 {
+        for (d, want) in [(2, std::f64::consts::FRAC_PI_2), (4, std::f64::consts::FRAC_PI_2), (6, std::f64::consts::FRAC_PI_2), (8, r8)] {
+            let got = sweep.get(&(c, d * 1_000_000)).copied().unwrap_or(0.0);
+            assert!((got - want).abs() < 1e-3, "corner {c} radius {d}: sweep {got} vs {want}");
+        }
+    }
+    let text = gcode::write(&p, Dialect::Grbl { laser: false }).unwrap();
+    let fed = text.lines().filter(|l| (l.starts_with("G2") || l.starts_with("G3")) && l.ends_with("F600")).count();
+    assert!(fed >= 16, "{fed} fed G2 / G3 lines");
+    assert_inset(&p, &outline, &[island], 2.0);
+    assert!(p.validate(&m, T).is_ok());
+    grbl_round_trip(&p);
+}
+
+#[test]
 fn an_island_near_the_wall_merges_with_the_outline_rings() {
     // The island stands 3 mm off the left wall: narrower than DC 4, so from the first ring on the outline's ring and
     // the island's are one ring around the island's right side, and the channel is never entered.
