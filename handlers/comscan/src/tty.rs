@@ -24,7 +24,8 @@
 //! - Candidates by readdir of `/dev` (no daemon): macOS `cu.usbserial*` / `cu.usbmodem*`, Linux `ttyUSB*` / `ttyACM*`.
 //! - A port lost mid-stream (EIO, end of file) is dropped by the desk, which releases the TIOCEXCL fd, and reopened
 //!   by path through [`opener`] with the desk lock released, 250 ms doubling to 4 s (VUGCOMSCANRECONNECT, SR521); a
-//!   device that comes back under another name is owed as VUG-COMSCAN-TTY-USBID.
+//!   device whose sysfs gave a VID:PID[:serial] at the first open is reopened by that identity wherever it came back
+//!   ([`UsbId`], [`enumerate`], the `tty:usb:` scheme: VUGCOMSCANTTYUSBID, SR529).
 //!
 //! `unsafe` lives in four private fns, each with its SAFETY line: `termios_get`, `termios_set`, `exclusive`,
 //! `nonstandard_speed`.
@@ -137,6 +138,10 @@ pub enum Refusal {
     Disconnected { path: PathBuf },
     /// Any other errno.
     Io { path: PathBuf, errno: i32 },
+    /// VUGCOMSCANTTYUSBID (SR529): `n` ttys carry the asked VID:PID (and serial, when one was asked); never guessed.
+    AmbiguousDevice { vid: u16, pid: u16, n: usize },
+    /// VUGCOMSCANTTYUSBID (SR529): a `tty:usb:` port string that does not parse.
+    BadUsbId { text: String },
 }
 
 impl fmt::Display for Refusal {
@@ -152,6 +157,10 @@ impl fmt::Display for Refusal {
             }
             Refusal::Disconnected { path } => write!(f, "disconnected: {}", path.display()),
             Refusal::Io { path, errno } => write!(f, "i/o error {errno}: {}", path.display()),
+            Refusal::AmbiguousDevice { vid, pid, n } => {
+                write!(f, "ambiguous device {vid:04x}:{pid:04x}: {n} ttys match (name the serial)")
+            }
+            Refusal::BadUsbId { text } => write!(f, "bad usb id: {text:?} (tty:usb:<vid>:<pid>[:<serial>])"),
         }
     }
 }
@@ -271,11 +280,7 @@ pub fn list_in(dir: &Path) -> Vec<PathBuf> {
 /// The host's opener for `crate::pump::serve_pump`: a port name opened at `baud` / `flow` and made ready for
 /// `dialect`; a refusal is its name.
 pub fn opener(baud: Baud, flow: Flow, dialect: Dialect) -> Box<crate::pump::Opener> {
-    Box::new(move |port: &str| -> Result<Box<dyn Transport + Send>, String> {
-        let mut p = Port::open_flow(Path::new(port), baud, flow).map_err(|r| r.to_string())?;
-        p.ready(dialect, READY_WAIT).map_err(|r| r.to_string())?;
-        Ok(Box::new(p))
-    })
+    opener_in(PathBuf::from("/sys"), PathBuf::from("/dev"), baud, flow, dialect) // VUGCOMSCANTTYUSBID (SR529)
 }
 
 /// The flags `cfmakeraw` leaves alone: the receiver on, modem lines ignored, one stop bit, the flow control, no
@@ -351,4 +356,136 @@ fn nonstandard_speed(fd: RawFd, rate: u32) -> Result<(), i32> {
     // the caller's File owns.
     let rc = unsafe { libc::ioctl(fd, IOSSIOSPEED, &speed as *const libc::speed_t) };
     if rc != 0 { Err(errno()) } else { Ok(()) }
+}
+
+// --- VUGCOMSCANTTYUSBID (LEDGER SR529): the device by VID:PID[:serial] from sysfs, reopened wherever it came back (named tail hunk) ---
+
+/// The port scheme that names a USB serial device by identity: `tty:usb:<vid>:<pid>[:<serial>]` (hex vid / pid).
+pub const USB_SCHEME: &str = "tty:usb:";
+
+/// A USB serial device's identity as sysfs gives it: `idVendor`, `idProduct` and, when the device has one, `serial`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UsbId {
+    pub vid: u16,
+    pub pid: u16,
+    pub serial: Option<String>,
+}
+
+impl UsbId {
+    /// The identity a `tty:usb:<vid>:<pid>[:<serial>]` string names (the serial is the rest, colons kept; empty is
+    /// none), or `BadUsbId` by name.
+    pub fn parse(text: &str) -> Result<UsbId, Refusal> {
+        let bad = || Refusal::BadUsbId { text: text.to_string() };
+        let rest = text.strip_prefix(USB_SCHEME).ok_or_else(bad)?;
+        let mut it = rest.splitn(3, ':');
+        let vid = it.next().and_then(hex16).ok_or_else(bad)?;
+        let pid = it.next().and_then(hex16).ok_or_else(bad)?;
+        let serial = it.next().filter(|s| !s.is_empty()).map(|s| s.to_string());
+        Ok(UsbId { vid, pid, serial })
+    }
+
+    /// The port string that names this identity on the bus.
+    pub fn scheme(&self) -> String {
+        match &self.serial {
+            Some(s) => format!("{USB_SCHEME}{:04x}:{:04x}:{s}", self.vid, self.pid),
+            None => format!("{USB_SCHEME}{:04x}:{:04x}", self.vid, self.pid),
+        }
+    }
+}
+
+impl fmt::Display for UsbId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.scheme())
+    }
+}
+
+/// One to four hex digits as a u16 (sysfs writes `idVendor` as `2341`).
+fn hex16(s: &str) -> Option<u16> {
+    let s = s.trim();
+    if s.is_empty() || s.len() > 4 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    u16::from_str_radix(s, 16).ok()
+}
+
+/// The identity of the tty `name` under the sysfs root `sys`: `sys/class/tty/<name>/device` resolved, then that dir,
+/// its parent (cdc_acm: `device` is the interface) and its grandparent (usb-serial: `device` is the port under the
+/// interface) searched for the first holding `idVendor`. `None` for a tty with no USB device (a pty, ttyS, macOS).
+pub fn usb_id(sys: &Path, name: &str) -> Option<UsbId> {
+    if name.is_empty() || name.contains('/') {
+        return None;
+    }
+    let mut d = std::fs::canonicalize(sys.join("class/tty").join(name).join("device")).ok()?;
+    for _ in 0..3 {
+        if d.join("idVendor").is_file() {
+            let vid = hex16(&std::fs::read_to_string(d.join("idVendor")).ok()?)?;
+            let pid = hex16(&std::fs::read_to_string(d.join("idProduct")).ok()?)?;
+            let serial = std::fs::read_to_string(d.join("serial"))
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            return Some(UsbId { vid, pid, serial });
+        }
+        if !d.pop() {
+            return None;
+        }
+    }
+    None
+}
+
+/// The node under `dev` that carries `want`, by reading `sys/class/tty` (sorted): its VID:PID and, when `want` names
+/// one, its serial. None is `NoSuchPort` by the scheme string; more than one is `AmbiguousDevice` (a serial-less
+/// pair, or two ttys sharing a serial), never a guess.
+pub fn enumerate(sys: &Path, dev: &Path, want: &UsbId) -> Result<PathBuf, Refusal> {
+    let mut names: Vec<String> = match std::fs::read_dir(sys.join("class/tty")) {
+        Ok(rd) => rd.filter_map(|e| e.ok()).filter_map(|e| e.file_name().to_str().map(|n| n.to_string())).collect(),
+        Err(_) => Vec::new(),
+    };
+    names.sort();
+    let hits: Vec<String> = names
+        .into_iter()
+        .filter(|n| {
+            usb_id(sys, n).is_some_and(|u| {
+                u.vid == want.vid && u.pid == want.pid && (want.serial.is_none() || u.serial == want.serial)
+            })
+        })
+        .collect();
+    match hits.len() {
+        0 => Err(Refusal::NoSuchPort { path: PathBuf::from(want.scheme()) }),
+        1 => Ok(dev.join(&hits[0])),
+        n => Err(Refusal::AmbiguousDevice { vid: want.vid, pid: want.pid, n }),
+    }
+}
+
+/// The desk's identity hook (`crate::pump::PumpDesk::identify_by`) over the host's `/sys`.
+pub fn identify() -> Box<crate::pump::Identify> {
+    identify_in(PathBuf::from("/sys"))
+}
+
+/// The identity hook over the sysfs root `sys`: a port path's file name looked up as a tty, its [`UsbId`] as the
+/// `tty:usb:` string the redial opens; `None` for a port already named by identity or a tty with no USB device.
+pub fn identify_in(sys: PathBuf) -> Box<crate::pump::Identify> {
+    Box::new(move |port: &str| -> Option<String> {
+        if port.starts_with(USB_SCHEME) {
+            return None;
+        }
+        let name = Path::new(port).file_name()?.to_str()?;
+        usb_id(&sys, name).map(|u| u.scheme())
+    })
+}
+
+/// [`opener`] over the roots `sys` and `dev`: a port starting [`USB_SCHEME`] is resolved by [`enumerate`] to its node
+/// first, any other port is a path; then opened at `baud` / `flow` and made ready for `dialect`.
+pub fn opener_in(sys: PathBuf, dev: PathBuf, baud: Baud, flow: Flow, dialect: Dialect) -> Box<crate::pump::Opener> {
+    Box::new(move |port: &str| -> Result<Box<dyn Transport + Send>, String> {
+        let path = if port.starts_with(USB_SCHEME) {
+            let id = UsbId::parse(port).map_err(|r| r.to_string())?;
+            enumerate(&sys, &dev, &id).map_err(|r| r.to_string())?
+        } else {
+            PathBuf::from(port)
+        };
+        let mut p = Port::open_flow(&path, baud, flow).map_err(|r| r.to_string())?;
+        p.ready(dialect, READY_WAIT).map_err(|r| r.to_string())?;
+        Ok(Box::new(p))
+    })
 }

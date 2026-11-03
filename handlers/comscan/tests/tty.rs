@@ -15,9 +15,15 @@ use std::path::{Path, PathBuf};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use bandy::{Origin, PumpEvent}; // VUGCOMSCANTTYUSBID (SR529): the desk road for the renamed-node redial
+use comscan::pump::{Opener, PumpDesk, Verdict, digest_hex};
 use comscan::tty::{Baud, CANDIDATES, Flow, Port, Refusal, list, list_in, opener, refusal_of};
+use comscan::tty::{USB_SCHEME, UsbId, enumerate, identify_in, opener_in, usb_id};
 use make_core::gcode::Dialect;
-use pump_core::{Event, LinkError, Pump, Transport};
+use make_core::{
+    Aabb3, Axis, AxisId, Kinematics, Machine, MachineKind, Move, Power, PowerKind, Program, Tool, ToolKind, Units, Vec3,
+};
+use pump_core::{Event, LinkError, Pump, PumpState, Transport};
 
 const GRBL: Dialect = Dialect::Grbl { laser: false };
 const BANNER: &[u8] = b"Grbl 1.1h ['$' for help]\r\n";
@@ -259,4 +265,232 @@ fn errnos_map_to_refusals_by_name() {
     assert_eq!(refusal_of(libc::EIO, p), Refusal::Disconnected { path: path.clone() });
     assert_eq!(refusal_of(libc::EINVAL, p), Refusal::Io { path, errno: libc::EINVAL });
     assert!(refusal_of(libc::EBUSY, p).to_string().contains("busy"));
+}
+
+// --- VUGCOMSCANTTYUSBID (LEDGER SR529): the device by VID:PID[:serial] over a fake sysfs tree (named tail hunk) ---
+//
+// The tree copies the kernel's layout: `devices/usb1/<dev>/{idVendor,idProduct,serial}` with its interface
+// `<dev>:1.0`; `class/tty/ttyACM<n>/device` -> the interface (cdc_acm: the ids on its PARENT), `class/tty/ttyUSB<n>/
+// device` -> `<dev>:1.0/ttyUSB<n>` (usb-serial: the ids on its GRANDPARENT), and a virtual tty with no `device`.
+
+/// A fresh empty dir under the cargo target's tmp, named for the test.
+fn fresh(name: &str) -> PathBuf {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// A USB device `usbdev` under the fake `sys` with its ids; the path of its interface `<usbdev>:1.0`.
+fn usb_device(sys: &Path, usbdev: &str, vid: &str, pid: &str, serial: Option<&str>) -> PathBuf {
+    let d = sys.join("devices/usb1").join(usbdev);
+    let interface = d.join(format!("{usbdev}:1.0"));
+    std::fs::create_dir_all(&interface).unwrap();
+    std::fs::write(d.join("idVendor"), format!("{vid}\n")).unwrap();
+    std::fs::write(d.join("idProduct"), format!("{pid}\n")).unwrap();
+    if let Some(s) = serial {
+        std::fs::write(d.join("serial"), format!("{s}\n")).unwrap();
+    }
+    interface
+}
+
+/// The tty `name` in the fake `sys/class/tty`, its `device` link pointing at `target` (none: a virtual tty).
+fn tty_node(sys: &Path, name: &str, target: Option<&PathBuf>) {
+    let n = sys.join("class/tty").join(name);
+    std::fs::create_dir_all(&n).unwrap();
+    if let Some(t) = target {
+        std::fs::create_dir_all(t).unwrap();
+        std::os::unix::fs::symlink(t, n.join("device")).unwrap();
+    }
+}
+
+#[test]
+fn two_boards_on_one_vid_pid_resolve_by_serial() {
+    let root = fresh("comscan-usbid-serial");
+    let (sys, dev) = (root.join("sys"), root.join("dev"));
+    let a = usb_device(&sys, "1-1", "2341", "0043", Some("A1"));
+    let b = usb_device(&sys, "1-2", "2341", "0043", Some("B2"));
+    let f = usb_device(&sys, "1-3", "0403", "6001", Some("FT9X"));
+    tty_node(&sys, "ttyACM0", Some(&a));
+    tty_node(&sys, "ttyACM1", Some(&b));
+    tty_node(&sys, "ttyUSB0", Some(&f.join("ttyUSB0")));
+    tty_node(&sys, "tty0", None);
+
+    let id = |vid, pid, s: &str| UsbId { vid, pid, serial: Some(s.to_string()) };
+    assert_eq!(usb_id(&sys, "ttyACM0"), Some(id(0x2341, 0x0043, "A1")));
+    assert_eq!(usb_id(&sys, "ttyACM1"), Some(id(0x2341, 0x0043, "B2")));
+    assert_eq!(usb_id(&sys, "ttyUSB0"), Some(id(0x0403, 0x6001, "FT9X")), "the grandparent walk");
+    assert_eq!(usb_id(&sys, "tty0"), None, "a virtual tty has no USB identity");
+    assert_eq!(usb_id(&sys, "ttyACM7"), None);
+
+    assert_eq!(enumerate(&sys, &dev, &id(0x2341, 0x0043, "B2")), Ok(dev.join("ttyACM1")));
+    assert_eq!(enumerate(&sys, &dev, &id(0x2341, 0x0043, "A1")), Ok(dev.join("ttyACM0")));
+    assert_eq!(enumerate(&sys, &dev, &id(0x0403, 0x6001, "FT9X")), Ok(dev.join("ttyUSB0")));
+    let gone = id(0x2341, 0x0043, "C3");
+    assert_eq!(enumerate(&sys, &dev, &gone), Err(Refusal::NoSuchPort { path: PathBuf::from(gone.scheme()) }));
+
+    // The scheme string round-trips (the serial keeps its colons), and a malformed one is refused by name.
+    let s = id(0x2341, 0x0043, "B2").scheme();
+    assert_eq!(s, format!("{USB_SCHEME}2341:0043:B2"));
+    assert_eq!(UsbId::parse(&s), Ok(id(0x2341, 0x0043, "B2")));
+    assert_eq!(UsbId::parse("tty:usb:1a86:7523"), Ok(UsbId { vid: 0x1a86, pid: 0x7523, serial: None }));
+    assert_eq!(UsbId::parse("tty:usb:1a86:7523:a:b"), Ok(id(0x1a86, 0x7523, "a:b")));
+    for bad in ["tty:usb:", "tty:usb:2341", "tty:usb:zz:0043", "tty:usb:12345:0043", "/dev/ttyACM0"] {
+        assert_eq!(UsbId::parse(bad), Err(Refusal::BadUsbId { text: bad.to_string() }), "{bad}");
+    }
+    let mut open = opener_in(sys.clone(), dev.clone(), Baud::B115200, Flow::None, GRBL);
+    match open("tty:usb:2341:0043:C3") {
+        Err(why) => assert_eq!(why, "no such port: tty:usb:2341:0043:C3"),
+        Ok(_) => panic!("opened an absent device"),
+    }
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn a_serial_less_vid_pid_on_two_boards_is_refused_ambiguous_by_name() {
+    let root = fresh("comscan-usbid-ambiguous");
+    let (sys, dev) = (root.join("sys"), root.join("dev"));
+    let a = usb_device(&sys, "1-1", "1a86", "7523", None);
+    tty_node(&sys, "ttyUSB0", Some(&a.join("ttyUSB0")));
+    let want = UsbId { vid: 0x1a86, pid: 0x7523, serial: None };
+    assert_eq!(usb_id(&sys, "ttyUSB0"), Some(want.clone()));
+    assert_eq!(enumerate(&sys, &dev, &want), Ok(dev.join("ttyUSB0")), "exactly one: taken");
+
+    let b = usb_device(&sys, "1-2", "1a86", "7523", None);
+    tty_node(&sys, "ttyUSB1", Some(&b.join("ttyUSB1")));
+    let r = enumerate(&sys, &dev, &want);
+    assert_eq!(r, Err(Refusal::AmbiguousDevice { vid: 0x1a86, pid: 0x7523, n: 2 }));
+    assert_eq!(r.unwrap_err().to_string(), "ambiguous device 1a86:7523: 2 ttys match (name the serial)");
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
+fn program() -> Program {
+    let mut p = Program::new(Units::Mm);
+    p.moves.push(Move::Rapid { to: Vec3::new(0.0, 0.0, 5.0) });
+    for i in 0..20 {
+        p.moves.push(Move::Linear { to: Vec3::new(i as f64, (i * 2) as f64, -1.0), feed: 300.0 });
+    }
+    p
+}
+
+fn axis(id: AxisId, min: f64, max: f64) -> Axis {
+    Axis { id, min, max, max_feed: 3000.0, max_accel: 100.0, rapid: 6000.0 }
+}
+
+/// The desk's declared machine (the tests/tcp.rs one): a small mill.
+fn machine() -> Machine {
+    Machine {
+        kind: MachineKind::Mill3,
+        kinematics: Kinematics::Cartesian,
+        axes: vec![axis(AxisId::X, -50.0, 300.0), axis(AxisId::Y, -50.0, 300.0), axis(AxisId::Z, -50.0, 60.0)],
+        power: Power { kind: PowerKind::Spindle, max: 24000.0, ask_above: 18000.0 },
+        envelope: Aabb3 { min: Vec3::new(-20.0, -20.0, -20.0), max: Vec3::new(300.0, 300.0, 50.0) },
+        safe_z: 5.0,
+        units: Units::Mm,
+        tools: vec![Tool { number: 1, kind: ToolKind::FlatEnd, dc: 4.0, lf: 20.0, apmx: 2.0, nof: 3, sig: 0.0 }],
+        stock: None,
+        fixtures: Vec::new(),
+        loaded: Some(1),
+    }
+}
+
+/// Tick the desk and run its redials (as `serve_pump` does) until a Squawk word satisfies `want`.
+fn drive_until(
+    desk: &mut PumpDesk,
+    open: &mut Opener,
+    t0: Instant,
+    words: &mut Vec<String>,
+    want: impl Fn(&str) -> bool,
+) -> String {
+    let end = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < end {
+        let now = t0.elapsed().as_micros() as u64;
+        let mut out = desk.tick(now);
+        if let Some(port) = desk.redial_due(now) {
+            let res = open(&port);
+            out.extend(desk.relinked(t0.elapsed().as_micros() as u64, res));
+        }
+        for s in out {
+            if let PumpEvent::Squawk { event: Some(e), .. } = &s {
+                words.push(e.clone());
+                if want(e) {
+                    return e.clone();
+                }
+            }
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+    panic!("no wanted squawk in 10 s; saw {words:?}");
+}
+
+#[test]
+fn the_redial_after_a_renamed_node_relinks_the_same_device() {
+    let root = fresh("comscan-usbid-rename");
+    let (sys, dev) = (root.join("sys"), root.join("dev"));
+    std::fs::create_dir_all(&dev).unwrap();
+    let interface = usb_device(&sys, "1-1", "2341", "0043", Some("UNA0001"));
+    let (m1, slave1, s1) = pty();
+    std::os::unix::fs::symlink(&slave1, dev.join("ttyACM0")).unwrap();
+    tty_node(&sys, "ttyACM0", Some(&interface));
+
+    let p = program();
+    let mut desk = PumpDesk::new(machine());
+    desk.identify_by(identify_in(sys.clone()));
+    let pass = Verdict::Pass { digest: p.digest(), machine: machine().digest() };
+    let digest = desk.arm(&pass, &p, GRBL).expect("armed by a pass");
+    let mut open = opener_in(sys.clone(), dev.clone(), Baud::B115200, Flow::None, GRBL);
+    // Both fakes keep silent until the soft reset: open_flow's tcflush drops a banner said before the open, and the
+    // desk opens and waits in one call, so only a banner on the reset is said after the port is open.
+    let fake1 = fake_grbl(m1, true, 2);
+    let start = PumpEvent::PumpStart {
+        principal: Origin::LocalUser("una".to_string()),
+        program: digest_hex(digest),
+        dialect: "grbl".to_string(),
+        port: dev.join("ttyACM0").to_str().unwrap().to_string(),
+    };
+    let out = desk.apply(&start, &mut *open);
+    assert!(matches!(&out[..], [PumpEvent::Squawk { event: Some(e), .. }] if e == "started"), "{out:?}");
+
+    // Stream until the first fake has its two lines, then let the desk read their oks.
+    let t0 = Instant::now();
+    while !fake1.is_finished() && t0.elapsed() < Duration::from_secs(5) {
+        desk.tick(t0.elapsed().as_micros() as u64);
+        thread::sleep(Duration::from_millis(2));
+    }
+    for _ in 0..20 {
+        desk.tick(t0.elapsed().as_micros() as u64);
+        thread::sleep(Duration::from_millis(2));
+    }
+    let (_lines, m1) = fake1.join().unwrap();
+
+    // The replug: the same board comes back as ttyACM1 (a second pty), ttyACM0 is gone from /dev and from sysfs.
+    let (m2, slave2, _s2) = pty();
+    std::os::unix::fs::symlink(&slave2, dev.join("ttyACM1")).unwrap();
+    std::fs::remove_file(dev.join("ttyACM0")).unwrap();
+    std::fs::remove_dir_all(sys.join("class/tty/ttyACM0")).unwrap();
+    tty_node(&sys, "ttyACM1", Some(&interface));
+    let fake2 = fake_grbl(m2, true, 0);
+    drop(m1);
+    drop(s1);
+
+    let mut words = Vec::new();
+    let lost = drive_until(&mut desk, &mut *open, t0, &mut words, |e| e.starts_with("link lost"));
+    let at: usize = lost
+        .strip_prefix("link lost at line ")
+        .and_then(|r| r.split(';').next())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("{lost}"));
+    assert!(lost.ends_with("reconnect attempt 1 in 250 ms"), "{lost}");
+    assert!(matches!(desk.state(), Some(PumpState::LinkLost { at_line, .. }) if at_line == at));
+    let due = desk.redial_due(u64::MAX);
+    assert_eq!(due, Some("tty:usb:2341:0043:UNA0001".to_string()), "by identity, not the old name");
+
+    let relinked =
+        drive_until(&mut desk, &mut *open, t0, &mut words, |e| e.starts_with("relinked") || e.contains("failed"));
+    assert_eq!(relinked, format!("relinked on attempt 1; re-arm to resume from line {at}"), "{words:?}");
+    assert_eq!(desk.rearm(&pass, &p, GRBL), Ok(at), "the renamed node carries the re-armed run");
+    drop(desk);
+    drop(open);
+    let _ = fake2.join().unwrap();
+    std::fs::remove_dir_all(&root).unwrap();
 }
