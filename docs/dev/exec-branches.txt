@@ -1269,3 +1269,7 @@ exec-rmbp-vugcomscanws | /home/user/exec/vugcomscanws | cut 69aff329b | VUGCOMSC
 exec-rmbp-vugscanloop | /home/user/exec/vugscanloop | cut 69aff329b | VUGSCANLOOP | wave36
 exec-rmbp-vugdocdiff | /home/user/exec/vugdocdiff | cut 69aff329b | VUGDOCDIFF | wave36
 exec-rmbp-vugbrep3 | /home/user/exec/vugbrep3 | cut 69aff329b | VUGBREP3 | wave36
+exec-rmbp-vugphotogrid | /home/user/exec/vugphotogrid | cut 195bac794 | VUGPHOTOGRID | wave36
+exec-rmbp-vugveinask | /home/user/exec/vugveinask | cut 195bac794 | VUGVEINASK | wave36
+exec-rmbp-vugintent | /home/user/exec/vugintent | cut 195bac794 | VUGINTENT | wave36
+exec-rmbp-vugfacephoto | /home/user/exec/vugfacephoto | cut 195bac794 | VUGFACEPHOTO | wave36
