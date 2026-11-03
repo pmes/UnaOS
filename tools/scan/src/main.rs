@@ -188,9 +188,14 @@ fn units(a: &Args) -> Result<u32, Refusal> {
     }
 }
 
-/// `.prb`: the recording's depth records.
-fn load_prb(a: &Args, b: &[u8]) -> Result<Vec<Loaded>, Refusal> {
+/// SONDE-RECORD-IMU (SR491): a recording's motion records — (accel, gyro, an extrinsic carried) — read, not fused.
+type MotionCount = (usize, usize, bool);
+
+/// `.prb`: the recording's depth records, and its motion records counted.
+fn load_prb(a: &Args, b: &[u8]) -> Result<(Vec<Loaded>, MotionCount), Refusal> {
     let rec = recording::read(b).map_err(Refusal::Recording)?;
+    let accel = rec.motion.iter().filter(|m| m.record.kind == probe_core::ImuKind::Accel).count();
+    let motion = (accel, rec.motion.len() - accel, rec.extrinsic().is_some());
     let mut out = Vec::new();
     for (index, r) in rec.depth().enumerate() {
         let scale = match (a.units_um, r.depth_scale()) {
@@ -201,7 +206,7 @@ fn load_prb(a: &Args, b: &[u8]) -> Result<Vec<Loaded>, Refusal> {
         };
         out.push(Loaded { frame: r.frame.clone(), scale, intrinsics: r.intrinsics() });
     }
-    Ok(out)
+    Ok((out, motion))
 }
 
 /// `.csv`: rs-convert's metres (or, `--csv-raw`, integer Z16 units), one line per row.
@@ -380,8 +385,13 @@ fn run(a: &Args) -> Result<String, Refusal> {
     let input = a.input.as_deref().unwrap_or_default();
     let kind = Path::new(input).extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
     let bytes = read(input)?;
+    let mut motion: MotionCount = (0, 0, false);
     let mut frames = match kind.as_str() {
-        "prb" => load_prb(a, &bytes)?,
+        "prb" => {
+            let (f, m) = load_prb(a, &bytes)?;
+            motion = m;
+            f
+        }
         "csv" => load_csv(a, &bytes)?,
         "raw" => load_raw(a, &bytes)?,
         _ => return Err(Refusal::InputKind { path: input.into() }),
@@ -488,6 +498,7 @@ fn run(a: &Args) -> Result<String, Refusal> {
     };
     let _ = writeln!(r, "frames={} poses={pose_src} voxel_mm={} trunc_mm={}", sm.frames, a.voxel, trunc);
     r.push_str(track.as_deref().unwrap_or(""));
+    let _ = writeln!(r, "motion={} accel={} gyro={} extr={} (read, not fused)", motion.0 + motion.1, motion.0, motion.1, if motion.2 { "yes" } else { "none" });
     let _ = writeln!(r, "vertices={}", sm.mesh.positions.len());
     let _ = writeln!(r, "triangles={}", sm.mesh.triangles.len());
     let _ = writeln!(r, "confidence: min={cmin:.3} mean={cmean:.3}");

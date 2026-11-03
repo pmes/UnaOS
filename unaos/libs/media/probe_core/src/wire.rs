@@ -28,11 +28,17 @@
 //! | 44 | 4 | flags: bit 0 = intrinsics present |
 //! | 48 | 16 | intrinsics `fx, fy, ppx, ppy` as `f32` bit patterns (zero when absent) |
 //! | 64 | 16 | probe id, UTF-8, NUL-padded (`uvc:8086:0b3a`) |
+//!
+//! SONDE-RECORD-IMU (LEDGER SR491): format code 4 ([`FORMAT_MOTION`]) is a MOTION record on the same header, never a
+//! [`PixelFormat`]: stream 3 (accel) or 4 (gyro), width 1, height 1, stride = data length, offset 20 = the per-LSB scale
+//! in SI units as `f32` bits (0 = unscaled), flags bit 1 = [`FLAG_EXTRINSIC`]; see [`MotionRecord`]. [`decode`] refuses
+//! it as [`WireError::Format`], so a frame reader is never handed one.
 
 use alloc::vec::Vec;
 
 use crate::depth::DepthScale;
 use crate::frame::{Frame, FrameError, PixelFormat, StreamKind};
+use crate::imu::{ImuKind, ImuSample};
 
 pub const MAGIC: [u8; 4] = *b"PRB1";
 pub const HEADER_LEN: usize = 80;
@@ -221,6 +227,188 @@ pub fn decode(b: &[u8]) -> Result<Header, WireError> {
         timestamp_us: get64(b, 32),
         data_len,
         intrinsics,
+        id,
+    })
+}
+
+// ── SONDE-RECORD-IMU (LEDGER SR491): the motion record — one IMU sample on the PRB1 header ─────────────────────────────
+//
+// The D435i's IMU (its HID interface; the report is `imu::parse_raw`'s, librealsense `src/hid/hid-types.h:56-70`) is
+// recorded beside the depth frames in arrival order. A sample is not a picture, so it is not a `PixelFormat`: the header
+// is the frames' own 80 bytes with format code 4 and this payload, little-endian:
+//
+// | off | size | field |
+// |---|---|---|
+// | 0 | 6 | raw x, y, z as `i16`, as the device sent them |
+// | 6 | 2 | zero |
+// | 8 | 8 | the device's own timestamp (`u64`, the report's) |
+// | 16 | 48 | only with [`FLAG_EXTRINSIC`]: depth-to-IMU rotation (9 `f32`, librealsense's `rs2_extrinsics` order) then translation (3 `f32`, metres) |
+//
+// Header offset 20 (a frame's depth units) carries the per-LSB scale in SI units (m/s² or rad/s) as `f32` bits; 0 means
+// the writer did not know it (the gyro's scale needs the firmware version, `src/ds/ds-motion-common.cpp:520`), and the
+// raw counts are all a reader gets ([`MotionRecord::sample`] is `None`). `timestamp_us` is the WRITER's clock (the same
+// clock as its depth records), `seq` counts each stream on its own.
+
+/// The motion record's format code (wire-only; never a [`PixelFormat`]).
+pub const FORMAT_MOTION: u8 = 4;
+/// Flags bit 1: the record carries the depth-to-IMU extrinsic after the sample.
+pub const FLAG_EXTRINSIC: u32 = 2;
+/// The sample's payload bytes.
+pub const MOTION_LEN: usize = 16;
+/// The extrinsic's payload bytes: 12 `f32`.
+pub const EXTRINSIC_LEN: usize = 48;
+/// The longest motion record: header + sample + extrinsic.
+pub const MOTION_RECORD_MAX: usize = HEADER_LEN + MOTION_LEN + EXTRINSIC_LEN;
+
+/// One IMU sample as recorded.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MotionRecord {
+    pub kind: ImuKind,
+    /// x, y, z as the device sent them.
+    pub raw: [i16; 3],
+    /// The report's own timestamp.
+    pub device_ts: u64,
+    /// SI units per LSB (m/s² for accel, rad/s for gyro); 0 = unscaled.
+    pub scale: f32,
+    pub seq: u64,
+    /// The writer's clock, the same one its depth records carry.
+    pub timestamp_us: u64,
+    /// Depth-to-IMU: rotation (9, `rs2_extrinsics` order) then translation (3, metres).
+    pub extrinsic: Option<[f32; 12]>,
+    pub id: [u8; ID_MAX],
+}
+
+impl MotionRecord {
+    /// The id as text (up to its first NUL).
+    pub fn id_str(&self) -> &str {
+        let n = self.id.iter().position(|&b| b == 0).unwrap_or(ID_MAX);
+        core::str::from_utf8(&self.id[..n]).unwrap_or("")
+    }
+
+    /// The sample in SI units, or `None` when the record is unscaled.
+    pub fn sample(&self) -> Option<ImuSample> {
+        if self.scale == 0.0 {
+            return None;
+        }
+        let k = self.scale;
+        Some(ImuSample {
+            kind: self.kind,
+            timestamp: self.device_ts,
+            xyz: [self.raw[0] as f32 * k, self.raw[1] as f32 * k, self.raw[2] as f32 * k],
+        })
+    }
+}
+
+/// Is `b` the start of a motion record (the magic, and format code 4)?
+pub fn is_motion(b: &[u8]) -> bool {
+    b.len() >= 8 && b[0..4] == MAGIC && b[7] == FORMAT_MOTION
+}
+
+/// A probe id as the record's NUL-padded field; longer than [`ID_MAX`] bytes is refused (a cut id names another probe).
+pub fn motion_id(id: &str) -> Result<[u8; ID_MAX], WireError> {
+    if id.len() > ID_MAX {
+        return Err(WireError::Id);
+    }
+    let mut b = [0u8; ID_MAX];
+    b[..id.len()].copy_from_slice(id.as_bytes());
+    Ok(b)
+}
+
+/// The record for `m`: its bytes are the first `.1` bytes of `.0` (no allocation). An id that is not UTF-8 is refused.
+pub fn encode_motion(m: &MotionRecord) -> Result<([u8; MOTION_RECORD_MAX], usize), WireError> {
+    if core::str::from_utf8(&m.id[..m.id.iter().position(|&c| c == 0).unwrap_or(ID_MAX)]).is_err() {
+        return Err(WireError::Id);
+    }
+    let data_len = MOTION_LEN + if m.extrinsic.is_some() { EXTRINSIC_LEN } else { 0 };
+    let mut b = [0u8; MOTION_RECORD_MAX];
+    b[0..4].copy_from_slice(&MAGIC);
+    b[4..6].copy_from_slice(&(HEADER_LEN as u16).to_le_bytes());
+    b[6] = match m.kind {
+        ImuKind::Accel => stream_code(StreamKind::Accel),
+        ImuKind::Gyro => stream_code(StreamKind::Gyro),
+    };
+    b[7] = FORMAT_MOTION;
+    put32(&mut b, 8, 1);
+    put32(&mut b, 12, 1);
+    put32(&mut b, 16, data_len as u32);
+    put32(&mut b, 20, m.scale.to_bits());
+    put64(&mut b, 24, m.seq);
+    put64(&mut b, 32, m.timestamp_us);
+    put32(&mut b, 40, data_len as u32);
+    if m.extrinsic.is_some() {
+        put32(&mut b, 44, FLAG_EXTRINSIC);
+    }
+    b[64..80].copy_from_slice(&m.id);
+    let p = HEADER_LEN;
+    for (i, v) in m.raw.iter().enumerate() {
+        b[p + 2 * i..p + 2 * i + 2].copy_from_slice(&v.to_le_bytes());
+    }
+    put64(&mut b, p + 8, m.device_ts);
+    if let Some(e) = m.extrinsic {
+        for (i, v) in e.iter().enumerate() {
+            put32(&mut b, p + MOTION_LEN + 4 * i, v.to_bits());
+        }
+    }
+    Ok((b, HEADER_LEN + data_len))
+}
+
+/// A motion header's (header length, data length), validated: magic, header length, stream (accel or gyro, else
+/// [`WireError::Stream`]), format, the geometry and data length against the extrinsic flag ([`WireError::Geometry`]), id.
+pub fn decode_motion_lengths(b: &[u8]) -> Result<(usize, usize), WireError> {
+    if b.len() < HEADER_LEN {
+        return Err(WireError::Short);
+    }
+    if b[0..4] != MAGIC {
+        return Err(WireError::Magic);
+    }
+    let header_len = u16::from_le_bytes([b[4], b[5]]) as usize;
+    if header_len < HEADER_LEN {
+        return Err(WireError::HeaderLen);
+    }
+    match stream_of_code(b[6]) {
+        Some(StreamKind::Accel) | Some(StreamKind::Gyro) => {}
+        _ => return Err(WireError::Stream),
+    }
+    if b[7] != FORMAT_MOTION {
+        return Err(WireError::Format);
+    }
+    let data_len = get32(b, 40) as usize;
+    let want = MOTION_LEN + if get32(b, 44) & FLAG_EXTRINSIC != 0 { EXTRINSIC_LEN } else { 0 };
+    if get32(b, 8) != 1 || get32(b, 12) != 1 || get32(b, 16) as usize != data_len || data_len != want {
+        return Err(WireError::Geometry);
+    }
+    if core::str::from_utf8(&b[64..64 + b[64..80].iter().position(|&c| c == 0).unwrap_or(ID_MAX)]).is_err() {
+        return Err(WireError::Id);
+    }
+    Ok((header_len, data_len))
+}
+
+/// Decode one whole motion record (`b` holds at least its header length + data length, else [`WireError::Short`]).
+pub fn decode_motion(b: &[u8]) -> Result<MotionRecord, WireError> {
+    let (hl, dl) = decode_motion_lengths(b)?;
+    if b.len() < hl + dl {
+        return Err(WireError::Short);
+    }
+    let kind = if stream_of_code(b[6]) == Some(StreamKind::Accel) { ImuKind::Accel } else { ImuKind::Gyro };
+    let p = hl;
+    let r = |o: usize| i16::from_le_bytes([b[p + o], b[p + o + 1]]);
+    let extrinsic = (dl == MOTION_LEN + EXTRINSIC_LEN).then(|| {
+        let mut e = [0f32; 12];
+        for (i, v) in e.iter_mut().enumerate() {
+            *v = f32::from_bits(get32(b, p + MOTION_LEN + 4 * i));
+        }
+        e
+    });
+    let mut id = [0u8; ID_MAX];
+    id.copy_from_slice(&b[64..80]);
+    Ok(MotionRecord {
+        kind,
+        raw: [r(0), r(2), r(4)],
+        device_ts: get64(b, p + 8),
+        scale: f32::from_bits(get32(b, 20)),
+        seq: get64(b, 24),
+        timestamp_us: get64(b, 32),
+        extrinsic,
         id,
     })
 }

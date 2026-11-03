@@ -503,6 +503,35 @@ kbps=<k> depth_scale=<m>(device|default) intr=<fx>,<fy>,<ppx>,<ppy>|none -> PASS
 VUG-PROBE, VUG-SCAN-TOOL, SONDE-RECORD-TURNTABLE, SONDE-RECORD-IMU, SONDE-RECORD-INTRINSICS (the non-enum resolution
 scaling), SONDE-RECORD-ONEENC, SONDE-RECORD-STREAM.
 
+SONDE-RECORD-IMU (LEDGER SR491) adds the D435i's IMU to the same recording, under the same `sonderec` feature. At
+census `drivers/realsense_imu.rs` reads the HID interface's interrupt-IN (`note_cfg`), the IMU calibration table over
+the HW-monitor channel (MMER 0x4F, offset 0, 520 bytes; `realsense_xu::imu_calibration`, the dm_v2 layout, its CRC)
+through `uvc::hwmon::exchange` (which GETINTCAL now shares), and both HID feature reports. On the xHCI path,
+`realsense_imu::arm` then powers each sensor to D0 at its rate (librealsense's `set_feature_report`: GET, SET, GET;
+accel 63 Hz = code 1 and gyro 200 Hz = code 2, `report = 1000 / code`) and arms the fifth isoch.rs pipe, `IPIPE`
+(Interrupt IN, EP Type 7, eight Normal TRBs outstanding, `claim_int` on the transfer-event line). Each 32-byte report
+goes to `realsense_imu::push_report` (`probe_core::imu::parse_raw`). `tests sonderec` drains the samples ahead of every
+depth frame as `probe_core::wire` motion records: format 4, the raw counts, the device timestamp, accel scaled and
+gyro unscaled (owed SONDE-RECORD-IMU-GVD), and the extrinsic on the first record of each sensor when
+`extrinsic_valid == 1`. It then asks the service pass for D4. The next flight reads, after the census lines:
+
+```
+[sonde] imucal op=MMER(0,520) unit=3 get_cur=1024 echo=0x4f size=<n> id=0x0101 crc=ok extrinsic_valid=<0|1> intrinsic_valid=<0|1> t_um=<x>,<y>,<z>
+[sonde] imu addr=<slot> hid_intf=<n> ep=0x8<n> mps=<n> interval=<n> ss=<b> accel_feature=<18 hex> power=<n> report=<n> gyro_feature=<18 hex> power=<n> report=<n>
+[sonde-imu] cfg-ep slot=<n> dci=<n> speed=<n> type=int-in ep=0x8<n> mps=<n> burst=<n> esit=<n> interval_enc=<n> ring=0x… slots=16 epstate=0(Disabled)->1(Running) result=cc=1 (Success)
+[sonde-imu] start slot=<n> dci=<n> tds=8 slack=8 stride=<n> td_len=<n> ring=0x…
+[sonde] imu arm slot=<n> ep=0x8<n> accel=D0(report=1000)@63Hz gyro=D0(report=500)@200Hz pipe=armed tds=8
+[sonde-imu] event n=0 slot=<n> dci=<n> cc=<1|13> (…) trb=0x… residual=<n> outstanding=<n>
+[sonde] rec imu=<n> accel=<a> gyro=<g> dropped=0 stale=<n> ring_over=0 pipe=armed hid_ep=0x8<n> extr=<yes|none>
+:: SONDEREC: … intr=<…> imu=<n> rate=<hz> extr=<yes|none> -> PASS ::
+[sonde] imu power=D4 slot=<n> accel=ok gyro=ok pushed=<n> ring_over=<n> other_id=<n> short=<n> events=<n> reports=<n> err=<n> dup=<n>
+```
+
+A new FAIL reason is `imu-fixture(<field>)`, which runs before the device check, so QEMU shows it too. Owed:
+SONDE-RECORD-IMU-GVD (the gyro scale needs the firmware version, GVD 0x10), SONDE-RECORD-IMU-INTR (sensitivity and
+bias into the record), SONDE-RECORD-IMU-HALT (a halted interrupt endpoint is counted, not reset), SONDE-HWMON-ONE
+(`depth_units` onto `hwmon::exchange`), SCAN-IMU (tools/scan reads the motion records, does not fuse them).
+
 ## 12. UVCCAM (rmbp-ledger B686, R130) — the picture: frames to a window
 
 R130's second law (no paternalism): Peter's Sony mirrorless shows live view on no Apple machine. The class

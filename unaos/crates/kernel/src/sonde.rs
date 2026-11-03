@@ -607,7 +607,16 @@ pub fn tap_service() {
 // no line above moves, and a sonde image without the feature is byte-identical.
 //
 //   `:: SONDEREC: frames=<n> bytes=<b> path=/probe-<n>.prb write_ms=<t> want=<n> w= h= seq=<a>..<b> kbps=<k>
-//    depth_scale=<m>(device|default) intr=<fx>,<fy>,<ppx>,<ppy>|none -> PASS ::`
+//    depth_scale=<m>(device|default) intr=<fx>,<fy>,<ppx>,<ppy>|none imu=<n> rate=<hz> extr=yes|none -> PASS ::`
+//
+// SONDE-RECORD-IMU (LEDGER SR491): the D435i's IMU samples ride the same recording. `drivers::realsense_imu` powers the
+// sensors and arms their interrupt-IN at census (xHCI); its claim queues each report; this recorder drops what queued
+// before the capture, then before EVERY depth frame's encode writes every queued sample as a `probe_core::wire` motion
+// record (format 4) into the same buffer — arrival order on the same clock as the frames' `timestamp_us`; the first
+// accel and the first gyro record carry the depth-to-IMU extrinsic when the camera's table holds a valid one
+// (`extr=yes`). At most REC_IMU_MAX motion records (reserved up front with the frames; past it `dropped=`); after the
+// capture the sensors' D4 power-down is asked of the xHCI service pass. `imu=0` means no pipe was armed (EHCI, no HID
+// endpoint) or nothing arrived; the `[sonde] rec imu=` line says which.
 //   `-> SKIP(no-device)` with no D400 (every QEMU run); `-> FAIL reason=<name>` otherwise, the reason by name.
 
 /// The frame count when `UNAOS_SONDE_RECORD` is not a decimal number.
@@ -616,6 +625,10 @@ const REC_DEFAULT: u32 = 12;
 /// The ceiling on N: 30 records = 24.4 MB, about 111 s at the A2 card rate, under half the aarch64 heap.
 #[cfg(feature = "sonderec")]
 const REC_MAX: u32 = 30;
+/// SR491: the motion records one recording holds (reserved up front: 2048 x 144 B = 288 KiB; 30 frames at 30 fps are
+/// 1 s, about 263 samples at 63 + 200 Hz).
+#[cfg(feature = "sonderec")]
+const REC_IMU_MAX: usize = 2048;
 
 /// The intrinsics a `w` x `h` depth record carries: the camera's coefficients-table row, or `None`.
 #[cfg(feature = "sonderec")]
@@ -630,6 +643,7 @@ fn record_selftest() {
         _ => REC_DEFAULT,
     };
     let fail = |k: u32, b: usize, p: &str, ms: u64, why: &str| {
+        crate::drivers::realsense_imu::request_power_down(); // SR491: a failed record powers the IMU down too (no-op unarmed)
         serial_println!(":: SONDEREC: frames={} bytes={} path={} write_ms={} want={} -> FAIL reason={} ::", k, b, p, ms, want, why);
     };
 
@@ -670,6 +684,11 @@ fn record_selftest() {
         fail(0, 0, "-", 0, &alloc::format!("intcal-fixture({})", field));
         return;
     }
+    // SR491: the IMU driver's pure pieces and the IMU table reader (a local ring: a live pipe's samples never reach it).
+    if let Some(field) = crate::drivers::realsense_imu::fixture() {
+        fail(0, 0, "-", 0, &alloc::format!("imu-fixture({})", field));
+        return;
+    }
 
     // ── 2. the device and its armed depth stream ──
     let Some(r) = multi::record() else {
@@ -687,7 +706,7 @@ fn record_selftest() {
     // ── 3. capture: N consecutive frames into one buffer reserved up front ──
     let row = w as usize * 2;
     let need = row * h as usize;
-    let total = (wire::HEADER_LEN + need) * want as usize;
+    let total = (wire::HEADER_LEN + need) * want as usize + REC_IMU_MAX * wire::MOTION_RECORD_MAX; // SR491: + the motion records
     let mut out: Vec<u8> = Vec::new();
     let mut frame: Vec<u8> = Vec::new();
     if out.try_reserve_exact(total).is_err() || frame.try_reserve_exact(need).is_err() {
@@ -698,6 +717,13 @@ fn record_selftest() {
     let id = alloc::format!("uvc:{:04x}:{:04x}", r.vid, r.pid);
     let hz = tick_hz();
     let span = crate::arch::hw_wait_budget();
+    // SR491: the motion records' id, the extrinsic for the first of each sensor, and the samples that queued before now.
+    let Ok(mid) = wire::motion_id(&id) else { return fail(0, 0, "-", 0, "wire-motion-id") };
+    let extr = crate::drivers::realsense_imu::extrinsic();
+    let (mut extr_acc, mut extr_gyr) = (extr, extr);
+    let (mut n_acc, mut n_gyr, mut imu_drop) = (0u64, 0u64, 0u32);
+    let imu_stale = crate::drivers::realsense_imu::reset();
+    let over0 = crate::drivers::realsense_imu::counts().1;
     let c0 = crate::arch::ms();
     let mut last = depth_tap::latest_seq();
     let (mut seq_a, mut seq_b, mut taken) = (0u32, 0u32, 0u32);
@@ -724,6 +750,28 @@ fn record_selftest() {
             return fail(taken, out.len(), "-", 0, &alloc::format!("frame-size(at={},len={},need={})", taken, len, need));
         }
         let ts_us = if hz != 0 { (crate::arch::now_cycles() as u128 * 1_000_000 / hz as u128) as u64 } else { 0 };
+        // SR491: every sample that arrived before this frame, in arrival order, ahead of the frame's record.
+        while let Some(smp) = crate::drivers::realsense_imu::pop() {
+            if (n_acc + n_gyr) as usize >= REC_IMU_MAX {
+                imu_drop += 1;
+                continue;
+            }
+            let (seq, e) = match smp.kind {
+                probe_core::ImuKind::Accel => {
+                    n_acc += 1;
+                    (n_acc - 1, extr_acc.take())
+                }
+                probe_core::ImuKind::Gyro => {
+                    n_gyr += 1;
+                    (n_gyr - 1, extr_gyr.take())
+                }
+            };
+            let sts = if hz != 0 { (smp.cycles as u128 * 1_000_000 / hz as u128) as u64 } else { 0 };
+            match wire::encode_motion(&crate::drivers::realsense_imu::motion_record(&smp, seq, sts, e, mid)) {
+                Ok((mb, mn)) => out.extend_from_slice(&mb[..mn]),
+                Err(_) => return fail(taken, out.len(), "-", 0, "wire-encode-motion"),
+            }
+        }
         let f = match Frame::new(StreamKind::Depth, PixelFormat::Z16, w as u32, h as u32, row, ts_us, fseq as u64, core::mem::take(&mut frame)) {
             Ok(f) => f,
             Err(_) => return fail(taken, out.len(), "-", 0, "frame-geometry"),
@@ -745,6 +793,19 @@ fn record_selftest() {
     }
     let capture_ms = crate::arch::ms().saturating_sub(c0);
     let bytes = out.len();
+    // SR491: the sensors are done — their D4 is the xHCI service pass's (EP0); the motion side of the capture, by line.
+    crate::drivers::realsense_imu::request_power_down();
+    let n_imu = n_acc + n_gyr;
+    let imu_rate = n_imu * 1000 / capture_ms.max(1);
+    let hid_ep_s = match crate::drivers::realsense_imu::hid_ep() {
+        Some(e) => alloc::format!("{:#04x}", e.addr),
+        None => alloc::string::String::from("none"),
+    };
+    serial_println!(
+        "[sonde] rec imu={} accel={} gyro={} dropped={} stale={} ring_over={} pipe={} hid_ep={} extr={}",
+        n_imu, n_acc, n_gyr, imu_drop, imu_stale, crate::drivers::realsense_imu::counts().1.wrapping_sub(over0),
+        if crate::drivers::realsense_imu::armed() { "armed" } else { "none" }, hid_ep_s, if extr.is_some() { "yes" } else { "none" }
+    );
 
     // ── 4. the write: the boot volume's posture, the next free name, ONE put_file, the size read back ──
     let mt = crate::shell::vfs_mount_table();
@@ -780,7 +841,7 @@ fn record_selftest() {
         None => alloc::string::String::from("none"),
     };
     serial_println!(
-        ":: SONDEREC: frames={} bytes={} path={} write_ms={} want={} w={} h={} seq={}..{} kbps={} depth_scale={}.{:06}({}) intr={} -> PASS ::",
-        taken, bytes, path, write_ms, want, w, h, seq_a, seq_b, kbps, ip, fp, um_src, intr_s
+        ":: SONDEREC: frames={} bytes={} path={} write_ms={} want={} w={} h={} seq={}..{} kbps={} depth_scale={}.{:06}({}) intr={} imu={} rate={} extr={} -> PASS ::",
+        taken, bytes, path, write_ms, want, w, h, seq_a, seq_b, kbps, ip, fp, um_src, intr_s, n_imu, imu_rate, if extr.is_some() { "yes" } else { "none" }
     );
 }

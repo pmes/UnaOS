@@ -282,3 +282,95 @@ pub fn coefficients_rects(table: &[u8]) -> Result<[[f32; 4]; 16], &'static str> 
 pub fn rect_is_ideal(r: &[f32; 4]) -> bool {
     r[0] == r[1] && r[2] == r[3]
 }
+
+// ── SONDE-RECORD-IMU (LEDGER SR491): the IMU calibration table (MMER) — the depth-to-IMU extrinsic ─────────────────────
+//
+// APPENDED at the file tail and `#[cfg(feature = "sonderec")]`-erased item by item, like the GETINTCAL block above: no
+// line above moves. Hardware facts and their readers only (R110), librealsense v2.55.1, file:line:
+// - the request: `command cmd(MMER, offset, size)` with offset 0 and size `eeprom_imu_table_size`
+//   (`src/ds/ds-calib-parsers.cpp:56-62`), `MMER = 0x4F` "MM EEPROM read (from DS5 cache)" (`src/ds/ds-private.h:108`);
+//   `eeprom_imu_table_size` = sizeof(union { tm1_eeprom, dm_v2_eeprom }) (`ds-private.h:474-479`) = 520 (tm1_eeprom:
+//   16 + 80 + 424; dm_v2_eeprom: 16 + 308 = 324). The reply is `hwmon_reply`'s data bytes.
+// - the platform: the table's first u16 is the eeprom id (`ds-calib-parsers.cpp:29`); the D435i's Depth Module V2 is
+//   `dm_v2_eeprom_id = 0x0101` (`ds-private.h:483`); any other id is not this layout.
+// - the check: `check_calib` (`ds-private.h:302-325`): the header's crc32 against the CRC-32 of every reply byte after
+//   the 16-byte header (the same CRC as the coefficients table, `crate::hash::crc32`).
+// - the layout: `dm_v2_eeprom` = header (16) + `dm_v2_calib_info` { header (16), `dm_v2_calibration_table` { header (16),
+//   extrinsic_valid u8, intrinsic_valid u8, reserved[2], `depth_to_imu` (`extrinsics_table`: float3x3 rotation + float3
+//   translation, metres), accel `dm_v2_imu_intrinsic` (float3x3 sensitivity + float3 bias), gyro the same } }
+//   (`ds-private.h:436-470`). So, from the reply's data: valid flags @48 / @49, rotation @52, translation @88, accel
+//   @100 (sensitivity) / @136 (bias), gyro @148 / @184 (its bias in deg/s, `ds-calib-parsers.cpp:223`).
+// - when `extrinsic_valid != 1` librealsense uses CAD values instead (`ds-calib-parsers.cpp:182-192`); this reader
+//   reports the flag and never writes the CAD values as measured.
+
+/// `ds-private.h:108` — `MMER = 0x4F`.
+#[cfg(feature = "sonderec")]
+pub const OP_MMER: u8 = 0x4F;
+/// `eeprom_imu_table_size` (`ds-private.h:479`): the bytes MMER is asked for.
+#[cfg(feature = "sonderec")]
+pub const IMU_EEPROM_LEN: u32 = 520;
+/// `ds-private.h:483` — `dm_v2_eeprom_id`.
+#[cfg(feature = "sonderec")]
+pub const DM_V2_EEPROM_ID: u16 = 0x0101;
+/// The dm_v2 field offsets in the reply's data (see the block comment).
+#[cfg(feature = "sonderec")]
+pub const DM_V2_EXTRINSIC_VALID: usize = 48;
+#[cfg(feature = "sonderec")]
+pub const DM_V2_INTRINSIC_VALID: usize = 49;
+#[cfg(feature = "sonderec")]
+pub const DM_V2_DEPTH_TO_IMU: usize = 52;
+#[cfg(feature = "sonderec")]
+pub const DM_V2_ACCEL: usize = 100;
+#[cfg(feature = "sonderec")]
+pub const DM_V2_GYRO: usize = 148;
+/// The bytes the reader needs: through the gyro bias.
+#[cfg(feature = "sonderec")]
+pub const DM_V2_NEED: usize = DM_V2_GYRO + 48;
+
+/// The IMU calibration a dm_v2 table carries: the two valid flags, depth-to-IMU (rotation 9 then translation 3, metres)
+/// and each sensor's sensitivity (9) then bias (3), as stored.
+#[cfg(feature = "sonderec")]
+#[derive(Clone, Copy, PartialEq)]
+pub struct ImuCal {
+    pub extrinsic_valid: bool,
+    pub intrinsic_valid: bool,
+    pub depth_to_imu: [f32; 12],
+    pub accel: [f32; 12],
+    pub gyro: [f32; 12],
+}
+
+/// The command that reads the IMU table: `MMER(0, eeprom_imu_table_size)` (`ds-calib-parsers.cpp:58-61`).
+#[cfg(feature = "sonderec")]
+pub fn hwmon_build_mmer(out: &mut [u8]) -> usize {
+    hwmon_build(OP_MMER, [0, IMU_EEPROM_LEN, 0, 0], out)
+}
+
+/// The dm_v2 IMU table out of MMER's reply data (`table` from its first byte). Refused by name: `short-table`,
+/// `not-dm-v2` (another eeprom id), `crc` (`check_calib`'s refusal).
+#[cfg(feature = "sonderec")]
+pub fn imu_calibration(table: &[u8]) -> Result<ImuCal, &'static str> {
+    if table.len() < DM_V2_NEED {
+        return Err("short-table");
+    }
+    if u16::from_le_bytes([table[0], table[1]]) != DM_V2_EEPROM_ID {
+        return Err("not-dm-v2");
+    }
+    let le32 = |o: usize| u32::from_le_bytes([table[o], table[o + 1], table[o + 2], table[o + 3]]);
+    if le32(CALIB_CRC_OFFSET) != crate::hash::crc32(&table[CALIB_HEADER_LEN..]) {
+        return Err("crc");
+    }
+    let twelve = |o: usize| {
+        let mut v = [0f32; 12];
+        for (i, x) in v.iter_mut().enumerate() {
+            *x = f32::from_bits(le32(o + 4 * i));
+        }
+        v
+    };
+    Ok(ImuCal {
+        extrinsic_valid: table[DM_V2_EXTRINSIC_VALID] == 1,
+        intrinsic_valid: table[DM_V2_INTRINSIC_VALID] == 1,
+        depth_to_imu: twelve(DM_V2_DEPTH_TO_IMU),
+        accel: twelve(DM_V2_ACCEL),
+        gyro: twelve(DM_V2_GYRO),
+    })
+}
