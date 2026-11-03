@@ -662,7 +662,7 @@ fn shapes_report(r: &mut String, detected: &Result<Vec<Shape>, FitError>) {
                 format!("apex={} axis={} half_angle_deg={:.3}", v3(c.apex), v3(c.axis), c.half_angle.to_degrees())
             }
         };
-        let _ = writeln!(r, "shape: {} support={} frac={:.4} rms={:.3} {params}", s.kind.name(), s.support, s.fraction, s.rms_mm);
+        let _ = writeln!(r, "shape: {} support={} frac={:.4} rms={:.3} spread_deg={:.3} {params}", s.kind.name(), s.support, s.fraction, s.rms_mm, s.spread_deg);
     }
 }
 
@@ -820,9 +820,9 @@ mod tests {
 
 // ---- VUGINTENTSCANWIRE (LEDGER SR515): --intent, the scan's shapes as design intent ----
 
-/// The angular sigma (degrees) `--intent` hands doc_core: scan_core's `Shape` carries no normal spread to measure (its
-/// normals only pass detect's ±band inlier test), so the documented default (doc_core tests/intent_scan.rs's SIGMA_DEG);
-/// VUG-SCAN-SHAPE-SPREAD owes the measured one.
+/// The angular sigma (degrees) `--intent` hands doc_core when no shape carries a measured normal spread (no shape, or
+/// none with a finite `spread_deg` > 0): the documented default (doc_core tests/intent_scan.rs's SIGMA_DEG). Otherwise
+/// [`intent_sigma`] takes the measured one (VUGSCANSHAPESPREAD, LEDGER SR526).
 const INTENT_SIGMA_DEG: f64 = 0.5;
 
 /// `--intent`'s optional document: the next argument, unless it is a flag or one of the inputs `run` reads.
@@ -852,9 +852,12 @@ fn shape_ref(s: &Shape) -> doc_core::ShapeRef {
 }
 
 /// (sigma_mm, sigma_deg): the largest shape fit rms (scan_core's own residual; the worst-fitting shape sets the one
-/// number every shape is judged under; 0 with no shape) and [`INTENT_SIGMA_DEG`].
+/// number every shape is judged under; 0 with no shape) and the largest shape `spread_deg` (VUGSCANSHAPESPREAD SR526:
+/// scan_core's RMS normal angle over the same inliers, like for like with the rms), [`INTENT_SIGMA_DEG`] only when no
+/// shape has a finite spread above 0 (doc_core refuses a sigma_deg that is not > 0).
 fn intent_sigma(shapes: &[Shape]) -> (f64, f64) {
-    (shapes.iter().map(|s| s.rms_mm).fold(0.0, f64::max), INTENT_SIGMA_DEG)
+    let spread = shapes.iter().map(|s| s.spread_deg).filter(|d| d.is_finite() && *d > 0.0).fold(0.0, f64::max);
+    (shapes.iter().map(|s| s.rms_mm).fold(0.0, f64::max), if spread > 0.0 { spread } else { INTENT_SIGMA_DEG })
 }
 
 /// `--intent [<doc.vug>]` (VUGINTENTSCANWIRE, LEDGER SR515): detect's shapes (the run's own, never a second detect)
@@ -892,7 +895,7 @@ mod intent_tests {
     use scan_core::{Cone, Cylinder, Plane, Primitive, Shape, Vec3};
 
     fn shape(kind: Primitive, support: u32, rms_mm: f64) -> Shape {
-        Shape { kind, inliers: Vec::new(), support, fraction: 0.5, rms_mm, max_mm: 2.0 * rms_mm }
+        Shape { kind, inliers: Vec::new(), support, fraction: 0.5, rms_mm, max_mm: 2.0 * rms_mm, spread_deg: 0.0 }
     }
 
     /// The fixture's cylinder (Scene::bench's r 40 post at (160, 0), axis +z) copied to doc_core and read back to 1e-9;
@@ -919,5 +922,9 @@ mod intent_tests {
         let ss = [shape(Primitive::Plane(pl), 9, 0.1), shape(Primitive::Cylinder(c), 1234, 0.21)];
         assert_eq!(intent_sigma(&ss), (0.21, INTENT_SIGMA_DEG));
         assert_eq!(intent_sigma(&[]), (0.0, INTENT_SIGMA_DEG));
+        // VUGSCANSHAPESPREAD (SR526): the largest measured spread is the sigma_deg.
+        let spread = |s: Shape, d: f64| Shape { spread_deg: d, ..s };
+        let ss = [spread(shape(Primitive::Plane(pl), 9, 0.1), 0.4), spread(shape(Primitive::Cylinder(c), 1234, 0.21), 1.7)];
+        assert_eq!(intent_sigma(&ss), (0.21, 1.7));
     }
 }
