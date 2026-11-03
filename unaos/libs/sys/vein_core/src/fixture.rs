@@ -77,6 +77,47 @@ impl Transport for Replay<'_> {
 /// The plain (Content-Length-free, `Connection: close`) response head both fixtures are served under.
 pub const HEAD_200: &str = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n";
 
+/// VUGVEINASK (LEDGER SR504): the answer both recorded propose streams decode to — two proposals in the contract
+/// [`crate::propose::parse`] takes (real vug-doc constraint statements: doc_core's `diameter` and `parallel`). The
+/// streams below are hand-written fixtures in each dialect's recorded shape, the array split across three pieces.
+pub const PROPOSE_TEXT: &str = r#"[{"stmt":"diameter c7 sketch=s1 circle=h1 d=6.6","confidence":0.86,"why":"The hole measures 6.58 +/- 0.4 mm, the M6 clearance diameter."},{"stmt":"parallel c8 sketch=s1 a=l1 b=l3","confidence":0.93,"why":"The two long edges measure 0.3 deg apart, inside the outline's 0.5 deg uncertainty."}]"#;
+
+/// VUGVEINASK: Claude's stream for [`PROPOSE_TEXT`] (hand-written fixture).
+pub const PROPOSE_CLAUDE_SSE: &str = r#"event: message_start
+data: {"type":"message_start","message":{"id":"fxp","usage":{"input_tokens":1650,"output_tokens":1}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"[{\"stmt\":\"diameter c7 sketch=s1 circle=h1 d=6.6\",\"confidence\":0.86,"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"\"why\":\"The hole measures 6.58 +/- 0.4 mm, the M6 clearance diameter.\"},{\"stmt\":\"parallel c8 sketch=s1 a=l1 b=l3\","}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"\"confidence\":0.93,\"why\":\"The two long edges measure 0.3 deg apart, inside the outline's 0.5 deg uncertainty.\"}]"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":71}}
+
+event: message_stop
+data: {"type":"message_stop"}
+
+"#;
+
+/// VUGVEINASK: Gemini's stream (`alt=sse`, `responseMimeType: application/json`) for [`PROPOSE_TEXT`] (hand-written fixture).
+pub const PROPOSE_GEMINI_SSE: &str = r#"data: {"candidates":[{"content":{"parts":[{"text":"[{\"stmt\":\"diameter c7 sketch=s1 circle=h1 d=6.6\",\"confidence\":0.86,"}],"role":"model"}}]}
+
+data: {"candidates":[{"content":{"parts":[{"text":"\"why\":\"The hole measures 6.58 +/- 0.4 mm, the M6 clearance diameter.\"},{\"stmt\":\"parallel c8 sketch=s1 a=l1 b=l3\","}],"role":"model"}}]}
+
+data: {"candidates":[{"content":{"parts":[{"text":"\"confidence\":0.93,\"why\":\"The two long edges measure 0.3 deg apart, inside the outline's 0.5 deg uncertainty.\"}]"}],"role":"model"},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1650,"candidatesTokenCount":71,"totalTokenCount":1721}}
+
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -138,6 +138,43 @@ pub fn plan(key: KeyState, verify: Verify) -> Plan {
     }
 }
 
+/// VUGVEINASK (LEDGER SR504): ONE user turn carrying images, beside [`encode_body`] (which stays text-only):
+/// `{["systemInstruction":{"parts":[{"text":".."}]},]"contents":[{"role":"user","parts":[{"inlineData":{"mimeType":
+/// ..,"data":..}}...,{"text":".."}]}],"generationConfig":{"maxOutputTokens":N[,"responseMimeType":"application/json"]}}`
+/// — each image an `inlineData` part (base64), before the text; `json_answer` asks for a JSON response. `None` =
+/// `out` too small, or every text empty. The limits are [`crate::propose::check`]'s.
+pub fn encode_image_body(p: &Params<'_>, images: &[crate::propose::ImageRef<'_>], texts: &[&str], json_answer: bool, out: &mut [u8]) -> Option<usize> {
+    if texts.iter().all(|t| t.is_empty()) {
+        return None;
+    }
+    let mut o = Out::new(out);
+    o.put(b"{");
+    if !p.system.is_empty() {
+        o.put(b"\"systemInstruction\":{\"parts\":[{\"text\":\"");
+        json::escape_into(p.system.as_bytes(), &mut o);
+        o.put(b"\"}]},");
+    }
+    o.put(b"\"contents\":[{\"role\":\"user\",\"parts\":[");
+    for im in images {
+        o.put(b"{\"inlineData\":{\"mimeType\":\"");
+        json::escape_into(im.media_type.as_bytes(), &mut o);
+        o.put(b"\",\"data\":\"");
+        crate::propose::base64_into(im.bytes, &mut o);
+        o.put(b"\"}},");
+    }
+    o.put(b"{\"text\":\"");
+    for t in texts {
+        json::escape_into(t.as_bytes(), &mut o);
+    }
+    o.put(b"\"}]}],\"generationConfig\":{\"maxOutputTokens\":");
+    o.dec(p.max_tokens as u64);
+    if json_answer {
+        o.put(b",\"responseMimeType\":\"application/json\"");
+    }
+    o.put(b"}}");
+    o.done()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
