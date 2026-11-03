@@ -37,6 +37,17 @@ pub enum Refusal {
     /// A word the reader does not take, by name.
     Unsupported { line: usize, word: String },
     Parse { line: usize, what: &'static str },
+    // VUGMAKEPOCKET (SR479): the pocket and face generators' refusals.
+    /// An island not strictly inside the outline, crossing it, or inside another island (`island` is its index).
+    IslandOutsideOutline { island: usize },
+    /// A pocket loop crosses itself, or one island crosses another.
+    OutlineSelfIntersects,
+    /// The offset's pieces did not chain into closed rings (refused, never an open toolpath).
+    NoRings,
+    /// No way into the cut: no room for the helix and the tool is not centre-cutting (the ramp entry is owed).
+    NoEntry { tool: u32 },
+    /// An Op parameter out of its range, by name.
+    BadParameter { what: &'static str },
 }
 
 /// The planner's numbers for a program.

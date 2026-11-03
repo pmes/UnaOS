@@ -1245,7 +1245,7 @@ refs/heads/exec-rmbp-vugscanpose   3d8399c55 IN-FLIGHT cut 2026-11-01
 refs/heads/exec-rmbp-vughelm   04f96c128 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-vugcomscan1   c571c10a9 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-vugfacebuttons   c508d798f FOLDED-BY-HAND (this commit) 2026-10-27
-refs/heads/exec-rmbp-vugmakepocket   3d8399c55 IN-FLIGHT cut 2026-11-01
+refs/heads/exec-rmbp-vugmakepocket   f60797706 FOLDED-BY-HAND (this commit) 2026-10-27
 exec-rmbp-vugdoc | /home/user/exec/vugdoc | cut f89569a2d | VUGDOC | wave36
 exec-rmbp-vugbrep2 | /home/user/exec/vugbrep2 | cut f89569a2d | VUGBREP2 | wave36
 exec-rmbp-vugstep | /home/user/exec/vugstep | cut f89569a2d | VUGSTEP | wave36
