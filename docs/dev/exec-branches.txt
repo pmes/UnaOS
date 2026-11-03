@@ -1291,3 +1291,13 @@ exec-rmbp-vugcomscanreconnect e08d144b2 wave36 cut45
 exec-rmbp-vugscansubmap e08d144b2 wave36 cut45
 exec-rmbp-vugintentpoints e08d144b2 wave36 cut45
 exec-rmbp-vugbrepedgesnamed e08d144b2 wave36 cut45
+exec-rmbp-vugfacedeviation 7e8cbc770 wave36 cut46
+exec-rmbp-vugscanshapespread 7e8cbc770 wave36 cut46
+exec-rmbp-vugintentpositions 7e8cbc770 wave36 cut46
+exec-rmbp-vugfacetreeeditr 7e8cbc770 wave36 cut46
+exec-rmbp-vugcomscanttyusbid 7e8cbc770 wave36 cut46
+exec-rmbp-vugbrep3torusstep 7e8cbc770 wave36 cut46
+exec-rmbp-vugveinstream 7e8cbc770 wave36 cut46
+exec-rmbp-vugmakeramp 7e8cbc770 wave36 cut46
+exec-rmbp-vugphotolens 7e8cbc770 wave36 cut46
+exec-rmbp-vugfacesave 7e8cbc770 wave36 cut46
