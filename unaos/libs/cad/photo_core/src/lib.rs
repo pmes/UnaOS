@@ -149,8 +149,8 @@ pub struct Measured {
     /// The radial residual pattern LEFT after the lens term: k in e_radial = k (r / r_max)³ (px at the photo's corner).
     pub lens_hint: f64,
     /// VUG-PHOTO-LENS (SR533): the Brown radial term k1 (r_d = r (1 + k1 r²), r normalised by the half-diagonal, about
-    /// the photo's centre) the photo was undistorted by before the lattice and the silhouette; 0.0 when the term did
-    /// not halve the residual (the SR503 road, bit-exact). When non-zero, `h` maps paper mm to UNDISTORTED px: a
+    /// the photo's centre) the photo was undistorted by before the lattice and the silhouette; 0.0 when the refined
+    /// term did not halve the wide-band lattice residual (the SR503 road, bit-exact). When non-zero, `h` maps paper mm to UNDISTORTED px: a
     /// consumer drawing over the raw photo composes `homography::distort(apply(h, p), k1, w, h)`.
     pub k1: f64,
     /// The lattice residual (px) with no lens term (= `residual_px` when `k1` is 0.0).
@@ -235,11 +235,15 @@ pub fn measure_lens(img: &Image, params: PhotoParams, tol: Tol, lens: bool) -> R
     })
 }
 
-// VUG-PHOTO-LENS (SR533): the passes. Pass 0 is the flat lattice (SR503's); k1 is fitted to its inliers and taken
-// only when it brings the residual to LENS_GAIN of the flat one; each refinement pass undistorts the photo by the
-// current k1, finds the grid again (the bowed lines now straight, so more of them are seen), takes the intersections
-// back to raw pixels by the exact forward model and fits the TOTAL k1; the last k1 undistorts the photo the lattice
-// and the silhouette are measured on.
+// VUG-PHOTO-LENS (SR533): the passes. Pass 0 is the flat lattice (SR503's); k1 is fitted to its wide-band inliers
+// (homography::LENS_BAND); each refinement pass undistorts the photo by the current k1, finds the grid again (the
+// bowed lines now straight, so more of them are seen), takes the intersections back to raw pixels by the exact
+// forward model and fits the TOTAL k1; the last k1 undistorts the photo the lattice and the silhouette are measured
+// on. The gate is AFTER the refinement: pass 0 cannot judge the term, since its crossings are intersections of
+// straight lines fitted to bowed strokes, a bias k1 cannot remove (measured on the k1 = -0.08 fixture: pass 0 alone
+// went 2.836 -> 1.791 px, ratio 0.632, with k1 already at -0.0758). The term is taken when the final undistorted
+// lattice's wide-band residual is at most LENS_GAIN x the flat one; otherwise, or when a refinement pass refuses,
+// the pass-0 values come back unchanged (the SR503 road, bit-exact).
 fn lens_passes(
     gray0: edges::Gray,
     g0: grid::Grid,
@@ -247,21 +251,35 @@ fn lens_passes(
     pitch: f64,
 ) -> Result<(edges::Gray, grid::Grid, homography::Lattice, f64), Refusal> {
     let (w, h) = (gray0.w, gray0.h);
-    let (paper, raw) = homography::lens_set(&g0, pitch, &|q: Vec2| q)?;
+    let Ok((paper, raw)) = homography::lens_set(&g0, pitch, &|q: Vec2| q) else { return Ok((gray0, g0, lat0, 0.0)) };
     let rms0 = homography::lens_residual(&paper, &raw, 0.0, w, h);
-    let (mut k, rms_k) = homography::fit_k1(&paper, &raw, w, h);
-    if !(rms_k <= homography::LENS_GAIN * rms0) {
-        return Ok((gray0, g0, lat0, 0.0));
+    let k = homography::fit_k1(&paper, &raw, w, h).0;
+    match lens_refine(&gray0, k, pitch) {
+        Ok((gray, g, lat, k, rms_f)) if rms_f <= homography::LENS_GAIN * rms0 => Ok((gray, g, lat, k)),
+        _ => Ok((gray0, g0, lat0, 0.0)),
     }
+}
+
+/// The refinement passes from `k`, then the final undistorted photo, its grid, its lattice, k1 and the final grid's
+/// wide-band residual (px, undistorted).
+fn lens_refine(
+    gray0: &edges::Gray,
+    mut k: f64,
+    pitch: f64,
+) -> Result<(edges::Gray, grid::Grid, homography::Lattice, f64, f64), Refusal> {
+    let (w, h) = (gray0.w, gray0.h);
     for _ in 0..homography::LENS_PASSES {
-        let (_, g) = lens_grid(&gray0, k)?;
+        let (_, g) = lens_grid(gray0, k)?;
         let kp = k;
         let (paper, raw) = homography::lens_set(&g, pitch, &|q: Vec2| homography::distort(q, kp, w, h))?;
         k = homography::fit_k1(&paper, &raw, w, h).0;
     }
-    let (gray, g) = lens_grid(&gray0, k)?;
+    let (gray, g) = lens_grid(gray0, k)?;
+    let kf = k;
+    let (paper, raw) = homography::lens_set(&g, pitch, &|q: Vec2| homography::distort(q, kf, w, h))?;
+    let rms_f = homography::lens_residual(&paper, &raw, k, w, h);
     let lat = homography::fit_lattice(&g, pitch, w, h)?;
-    Ok((gray, g, lat, k))
+    Ok((gray, g, lat, k, rms_f))
 }
 
 fn lens_grid(gray0: &edges::Gray, k1: f64) -> Result<(edges::Gray, grid::Grid), Refusal> {

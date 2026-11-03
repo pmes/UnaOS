@@ -309,8 +309,12 @@ pub fn fit_lattice(grid: &Grid, pitch: f64, w: usize, h: usize) -> Result<Lattic
 pub const K1_SPAN: f64 = 0.12;
 /// The golden-section bracket width at which the search stops.
 pub const K1_TOL: f64 = 1e-5;
-/// The term is taken only when it brings the lattice residual to at most this fraction of the flat residual.
+/// The term is taken only when the FINAL undistorted lattice residual is at most this fraction of the flat one.
 pub const LENS_GAIN: f64 = 0.5;
+/// The lens fit's RANSAC band, a fraction of the photo's lattice pitch (px): the bowed outer crossings are admitted
+/// (BAND_PX's 2 px keeps only the centre, where the flat H already fits), a crossing on the wrong lattice index
+/// (a whole pitch off) is still refused.
+pub const LENS_BAND: f64 = 0.25;
 /// Refinement passes: the photo undistorted by the current k1, the grid found again, k1 re-estimated.
 pub const LENS_PASSES: usize = 2;
 
@@ -396,11 +400,12 @@ pub fn fit_k1(paper: &[Vec2], raw: &[Vec2], w: usize, h: usize) -> (f64, f64) {
     (k, f(k))
 }
 
-/// The lens fit's correspondences: the paper points of RANSAC's inliers among `grid`'s intersections (built as
-/// [`fit_lattice`] builds them) and their pixels taken back to the RAW photo by `to_raw`.
+/// The lens fit's correspondences: the paper points of RANSAC's inliers (band [`LENS_BAND`] x the grid's pitch)
+/// among `grid`'s intersections (built as [`fit_lattice`] builds them) and their pixels taken back to the RAW photo
+/// by `to_raw`.
 pub(crate) fn lens_set(grid: &Grid, pitch: f64, to_raw: &dyn Fn(Vec2) -> Vec2) -> Result<(Vec<Vec2>, Vec<Vec2>), Refusal> {
     let paper: Vec<Vec2> = grid.inter.iter().map(|q| Vec2::new(q.i as f64 * pitch, q.j as f64 * pitch)).collect();
     let px: Vec<Vec2> = grid.inter.iter().map(|q| q.px).collect();
-    let (_, inl) = ransac(&paper, &px, BAND_PX)?;
+    let (_, inl) = ransac(&paper, &px, LENS_BAND * grid.pitch_px)?;
     Ok((pick(&paper, &inl), inl.iter().map(|&k| to_raw(px[k])).collect()))
 }
