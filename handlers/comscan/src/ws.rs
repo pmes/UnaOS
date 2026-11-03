@@ -30,8 +30,10 @@
 //!   client's): TEXT when the bytes are UTF-8, BINARY otherwise (grbl's extended realtime bytes 0x84-0xA2 alone are
 //!   not UTF-8, and a text frame carrying them would be failed 1007); FluidNC pushes both kinds to grbl. A frame is
 //!   never left half-written: [`Sock`]'s `write_all` waits out `WouldBlock` for up to [`WRITE_WAIT`].
-//! - The connect, handshake and banner wait run inside `PumpDesk::apply` under the desk's lock, as tcp's do;
-//!   VUG-COMSCAN-RECONNECT owes moving them out.
+//! - The connect, handshake and banner wait run inside `PumpDesk::apply` under the desk's lock, as tcp's do. A link
+//!   ended by a close frame or a socket error mid-stream is reopened by the desk through this same opener (a fresh
+//!   dial, opening handshake and banner wait) with the lock released (VUGCOMSCANRECONNECT, SR521); the first open's
+//!   wait under the lock stays owed.
 //!
 //! std only: no libc, no `unsafe`.
 

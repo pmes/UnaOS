@@ -35,6 +35,7 @@ use bandy::{PumpEvent, SMessage, Synapse};
 use make_core::{Machine, Program};
 use make_core::gcode::Dialect;
 use pump_core::{Event, Pump, PumpRefusal, PumpState, StatusReport, Transport};
+use pump_core::pump::Redial; // VUGCOMSCANRECONNECT (SR521): the redial schedule
 use tokio::sync::broadcast::Receiver;
 use tokio::sync::broadcast::error::RecvError;
 
@@ -56,6 +57,14 @@ pub enum Refused {
     /// VUG-HELM-BIND-MACHINE (SR498): the pass was issued for the machine `passed` (its `Machine::digest`), not for
     /// `desk`, the machine this pump would drive.
     WrongMachine { passed: u64, desk: u64 },
+    /// VUGCOMSCANRECONNECT (SR521): a re-arm with no run whose link was lost.
+    NotLinkLost,
+    /// VUGCOMSCANRECONNECT (SR521): a re-arm before the link came back (redial `attempt` is next).
+    LinkDown { attempt: u32 },
+    /// VUGCOMSCANRECONNECT (SR521): a re-arm for `program`, not the `lost` program the run was streaming.
+    NotTheLostProgram { lost: u64, program: u64 },
+    /// VUGCOMSCANRECONNECT (SR521): a re-arm in `asked`, not the `lost` run's dialect.
+    DialectChanged { lost: Dialect, asked: Dialect },
 }
 
 /// The only way Comscan makes a pump: a `Verdict::Pass` for `p` (VUG-HELM-BIND: by digest) on `m` (VUG-HELM-BIND-MACHINE:
@@ -111,6 +120,8 @@ fn state_word(s: PumpState) -> &'static str {
         PumpState::Stopping => "stopping",
         PumpState::Stopped => "stopped",
         PumpState::Done => "done",
+        PumpState::LinkLost { .. } => "link-lost",
+        PumpState::Rearmed { .. } => "rearmed",
     }
 }
 
@@ -186,7 +197,12 @@ struct Armed {
 
 struct Running {
     pump: Pump,
-    link: Box<dyn Transport + Send>,
+    /// VUGCOMSCANRECONNECT (SR521): `None` while the link is lost (the dead one is dropped at the loss).
+    link: Option<Box<dyn Transport + Send>>,
+    /// The port name PumpStart opened: the redial opens it again.
+    port: String,
+    /// The redial schedule while the link is lost.
+    redial: Option<Redial>,
 }
 
 /// Comscan's pump desk: the machine it drives, the armed programs and the one running stream.
@@ -247,7 +263,12 @@ impl PumpDesk {
     fn busy(&self) -> bool {
         self.running
             .as_ref()
-            .is_some_and(|r| matches!(r.pump.state(), PumpState::Streaming | PumpState::Stopping))
+            .is_some_and(|r| {
+                matches!(
+                    r.pump.state(),
+                    PumpState::Streaming | PumpState::Stopping | PumpState::LinkLost { .. } | PumpState::Rearmed { .. }
+                )
+            })
     }
 
     /// Apply one bus request; the answers to publish. Comscan's own answers are inert (no answer).
@@ -287,18 +308,26 @@ impl PumpDesk {
                 };
                 // One arming, one run: a FirstRun approval is per run, so a finished program must pass Helm again.
                 let a = self.armed.remove(i);
-                self.running = Some(Running { pump: a.pump, link });
+                self.running = Some(Running { pump: a.pump, link: Some(link), port: port.clone(), redial: None });
                 vec![self.squawk(Some("started".to_string()))]
             }
             PumpEvent::PumpHold { .. } | PumpEvent::PumpResume { .. } | PumpEvent::PumpStop { .. } => {
                 let Some(r) = self.running.as_mut() else {
                     return refused("nothing is streaming");
                 };
-                let (res, word) = match ev {
-                    PumpEvent::PumpHold { .. } => (r.pump.hold(&mut *r.link), "hold"),
-                    PumpEvent::PumpResume { .. } => (r.pump.resume(&mut *r.link), "resume"),
-                    _ => (r.pump.stop(&mut *r.link), "stop"),
+                let mut down = Down;
+                let link: &mut dyn Transport = match r.link.as_mut() {
+                    Some(l) => &mut **l,
+                    None => &mut down,
                 };
+                let (res, word) = match ev {
+                    PumpEvent::PumpHold { .. } => (r.pump.hold(link), "hold"),
+                    PumpEvent::PumpResume { .. } => (r.pump.resume(link), "resume"),
+                    _ => (r.pump.stop(link), "stop"),
+                };
+                if r.pump.state() == PumpState::Stopped {
+                    r.redial = None; // a stopped run is not redialled
+                }
                 match res {
                     Ok(()) => vec![self.squawk(Some(word.to_string()))],
                     Err(e) => refused(format!("{word}: {e:?}")),
@@ -311,13 +340,17 @@ impl PumpDesk {
     /// Drive the running stream one turn; a Squawk for each named event, else one for any traffic.
     pub fn tick(&mut self, now_us: u64) -> Vec<PumpEvent> {
         let evs = match self.running.as_mut() {
-            Some(r) => r.pump.tick(&mut *r.link, now_us),
-            None => return Vec::new(),
+            Some(Running { pump, link: Some(link), .. }) => pump.tick(&mut **link, now_us),
+            _ => return Vec::new(),
         };
         if evs.is_empty() {
             return Vec::new();
         }
-        let named: Vec<String> = evs.iter().filter_map(event_word).collect();
+        if evs.contains(&Event::LinkLost) {
+            self.link_lost(now_us);
+        }
+        let named: Vec<String> =
+            evs.iter().filter_map(event_word).map(|w| if w == "link lost" { self.lost_word() } else { w }).collect();
         if named.is_empty() {
             return vec![self.squawk(None)];
         }
@@ -363,6 +396,7 @@ pub async fn serve_pump(
                 for o in out {
                     synapse.fire(SMessage::Pump(o));
                 }
+                redial(&synapse, &desk, &mut *open, t0); // VUGCOMSCANRECONNECT (SR521): the reopen, outside the lock
             }
         }
     }
@@ -470,6 +504,131 @@ pub fn with_ws(mut ws: Box<Opener>, mut rest: Box<Opener>) -> Box<Opener> {
     Box::new(move |port: &str| -> Result<Box<dyn Transport + Send>, String> {
         if port.starts_with(WS_SCHEME) || port.starts_with(WSS_SCHEME) { ws(port) } else { rest(port) }
     })
+}
+
+// --- VUGCOMSCANRECONNECT (LEDGER SR521): a lost link redialled with backoff, the run re-armed by a person (named hunk) ---
+
+/// The link a link-less run answers Hold / Resume / Stop with: every call is `Closed`, so only a request that needs
+/// no byte (Resume refused by name, Stop of a lost run) gets through.
+struct Down;
+
+impl Transport for Down {
+    fn write(&mut self, _: &[u8]) -> Result<usize, pump_core::LinkError> {
+        Err(pump_core::LinkError::Closed)
+    }
+    fn read(&mut self, _: &mut [u8]) -> Result<usize, pump_core::LinkError> {
+        Err(pump_core::LinkError::Closed)
+    }
+}
+
+impl PumpDesk {
+    /// The running pump's state (`None`: nothing has started).
+    pub fn state(&self) -> Option<PumpState> {
+        self.running.as_ref().map(|r| r.pump.state())
+    }
+
+    /// The pump said `LinkLost`: drop the dead link (a tty's exclusive fd is released before the reopen) and, when
+    /// the run is lost mid-stream, start the redial schedule.
+    fn link_lost(&mut self, now_us: u64) {
+        if let Some(r) = self.running.as_mut() {
+            r.link = None;
+            r.redial = match r.pump.state() {
+                PumpState::LinkLost { .. } => Some(Redial::new(now_us)),
+                _ => None,
+            };
+        }
+    }
+
+    /// The Squawk word for a loss: the line it stopped at and the first redial.
+    fn lost_word(&self) -> String {
+        match self.running.as_ref().map(|r| (r.pump.state(), r.redial)) {
+            Some((PumpState::LinkLost { at_line, .. }, Some(d))) => format!(
+                "link lost at line {at_line}; reconnect attempt {} in {} ms",
+                d.attempt(),
+                d.wait_us() / 1000
+            ),
+            _ => "link lost".to_string(),
+        }
+    }
+
+    /// The port to reopen when a lost run's next redial is due at `now_us`.
+    pub fn redial_due(&self, now_us: u64) -> Option<String> {
+        let r = self.running.as_ref()?;
+        let lost = matches!(r.pump.state(), PumpState::LinkLost { .. });
+        match r.redial {
+            Some(d) if lost && r.link.is_none() && d.due(now_us) => Some(r.port.clone()),
+            _ => None,
+        }
+    }
+
+    /// The opener's answer for a redial (the opener's own handshake and banner wait included). Taken only while the
+    /// run is still lost and link-less; otherwise the new link is dropped and nothing is said.
+    pub fn relinked(&mut self, now_us: u64, res: Result<Box<dyn Transport + Send>, String>) -> Vec<PumpEvent> {
+        let Some(r) = self.running.as_mut() else { return Vec::new() };
+        let PumpState::LinkLost { at_line, .. } = r.pump.state() else { return Vec::new() };
+        let Some(mut d) = r.redial else { return Vec::new() };
+        if r.link.is_some() {
+            return Vec::new();
+        }
+        let word = match res {
+            Ok(link) => {
+                r.link = Some(link);
+                r.redial = None;
+                format!("relinked on attempt {}; re-arm to resume from line {at_line}", d.attempt())
+            }
+            Err(why) => {
+                let k = d.attempt();
+                d.failed(now_us);
+                r.redial = Some(d);
+                format!("reconnect attempt {k} failed: {why}; attempt {} in {} ms", d.attempt(), d.wait_us() / 1000)
+            }
+        };
+        vec![self.squawk(Some(word))]
+    }
+
+    /// Re-arm a lost run once its link is back: a fresh Helm `Verdict::Pass` for the SAME program on the desk's
+    /// machine (through [`start`]: both digests), in the same dialect; the run then waits at the line it lost for a
+    /// Resume. The line Resume starts from.
+    pub fn rearm(&mut self, v: &Verdict, p: &Program, d: Dialect) -> Result<usize, Refused> {
+        let Some(r) = self.running.as_ref() else { return Err(Refused::NotLinkLost) };
+        let PumpState::LinkLost { at_line, program_digest } = r.pump.state() else {
+            return Err(Refused::NotLinkLost);
+        };
+        if r.link.is_none() {
+            return Err(Refused::LinkDown { attempt: r.redial.map(|x| x.attempt()).unwrap_or(0) });
+        }
+        if p.digest() != program_digest {
+            return Err(Refused::NotTheLostProgram { lost: program_digest, program: p.digest() });
+        }
+        if d != r.pump.dialect() {
+            return Err(Refused::DialectChanged { lost: r.pump.dialect(), asked: d });
+        }
+        let fresh = start(v, p, d, &self.machine)?.resume_at(at_line).map_err(Refused::Pump)?;
+        if let Some(r) = self.running.as_mut() {
+            r.pump = fresh;
+        }
+        Ok(at_line)
+    }
+}
+
+/// serve_pump's reopen: the due port is taken under the desk lock, the opener (connect, handshake, banner wait) runs
+/// with the lock RELEASED, and its answer is handed back under the lock to [`PumpDesk::relinked`].
+fn redial(synapse: &Synapse, desk: &Mutex<PumpDesk>, open: &mut Opener, t0: tokio::time::Instant) {
+    let now = t0.elapsed().as_micros() as u64;
+    let port = match desk.lock() {
+        Ok(d) => d.redial_due(now),
+        Err(_) => None,
+    };
+    let Some(port) = port else { return };
+    let res = open(&port);
+    let now = t0.elapsed().as_micros() as u64;
+    let out = match desk.lock() {
+        Ok(mut d) => d.relinked(now, res),
+        Err(_) => Vec::new(),
+    };
+    for o in out {
+        synapse.fire(SMessage::Pump(o));
+    }
 }
 
 #[cfg(test)]

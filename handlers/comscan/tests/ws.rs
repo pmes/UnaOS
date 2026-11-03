@@ -112,34 +112,47 @@ fn url(port: u16) -> String {
 /// per line in BINARY frames (its WSChannel's shape); every client frame must be masked. Returns the lines it ran.
 fn fake_fluidnc(l: TcpListener) -> JoinHandle<Vec<String>> {
     thread::spawn(move || {
-        let mut s = accept_ws(&l, "/");
-        s.write_all(&encode_frame(true, OP_TEXT, b"CURRENT_ID:0", None)).unwrap();
-        s.write_all(&encode_frame(true, OP_TEXT, b"Grbl 3.7 [FluidNC v3.7.8 (wifi) '$' for help]", None)).unwrap();
-        let mut dec = FrameDecoder::new();
-        let mut got = Vec::new();
-        let mut cur: Vec<u8> = Vec::new();
-        while let Some(f) = next_frame(&mut s, &mut dec) {
-            assert!(f.mask.is_some(), "RFC 6455 §5.3: every client frame is masked");
-            match f.opcode {
-                OP_TEXT | OP_BINARY => {
-                    for b in f.payload {
-                        match b {
-                            b'?' | b'!' | b'~' | 0x18 => {}
-                            b'\n' => {
-                                got.push(String::from_utf8_lossy(&cur).trim().to_string());
-                                cur.clear();
+        let s = accept_ws(&l, "/");
+        serve_fluidnc(s, None) // VUGCOMSCANRECONNECT (SR521): the body lifted, unchanged, for the reconnect fake
+    })
+}
+
+/// One fake FluidNC connection (the [`fake_fluidnc`] shape); with `close_after: Some(n)` it answers the n-th line,
+/// sends a close frame 1001 and answers nothing more. Returns the lines it saw.
+fn serve_fluidnc(mut s: TcpStream, close_after: Option<usize>) -> Vec<String> {
+    s.write_all(&encode_frame(true, OP_TEXT, b"CURRENT_ID:0", None)).unwrap();
+    s.write_all(&encode_frame(true, OP_TEXT, b"Grbl 3.7 [FluidNC v3.7.8 (wifi) '$' for help]", None)).unwrap();
+    let mut dec = FrameDecoder::new();
+    let mut got = Vec::new();
+    let mut cur: Vec<u8> = Vec::new();
+    let mut closing = false;
+    while let Some(f) = next_frame(&mut s, &mut dec) {
+        assert!(f.mask.is_some(), "RFC 6455 §5.3: every client frame is masked");
+        match f.opcode {
+            OP_TEXT | OP_BINARY => {
+                for b in f.payload {
+                    match b {
+                        b'?' | b'!' | b'~' | 0x18 => {}
+                        b'\n' => {
+                            got.push(String::from_utf8_lossy(&cur).trim().to_string());
+                            cur.clear();
+                            if !closing {
                                 let _ = s.write_all(&encode_frame(true, OP_BINARY, b"ok\r\n", None));
+                                if close_after == Some(got.len()) {
+                                    closing = true;
+                                    let _ = s.write_all(&encode_frame(true, OP_CLOSE, &close_payload(Some(1001), "going away"), None));
+                                }
                             }
-                            _ => cur.push(b),
                         }
+                        _ => cur.push(b),
                     }
                 }
-                OP_CLOSE => break,
-                _ => {}
             }
+            OP_CLOSE => break,
+            _ => {}
         }
-        got
-    })
+    }
+    got
 }
 
 fn program() -> Program {
@@ -394,4 +407,113 @@ fn machine() -> Machine {
         fixtures: Vec::new(),
         loaded: Some(1),
     }
+}
+
+// --- VUGCOMSCANRECONNECT (SR521): a close frame mid-program is LinkLost; the redial re-handshakes; a re-arm resumes ---
+
+use pump_core::PumpState;
+
+/// One listener, two connections: the first acks `n` lines then closes 1001, the second serves to the end.
+fn fake_fluidnc_closes_then_returns(l: TcpListener, n: usize) -> JoinHandle<(Vec<String>, Vec<String>)> {
+    thread::spawn(move || {
+        let first = serve_fluidnc(accept_ws(&l, "/"), Some(n));
+        let second = serve_fluidnc(accept_ws(&l, "/"), None);
+        (first, second)
+    })
+}
+
+/// Tick the desk and run its redials (as `serve_pump` does) until a Squawk word satisfies `want`; every word seen
+/// is appended to `words`.
+fn drive_until(
+    desk: &mut PumpDesk,
+    open: &mut Opener,
+    t0: Instant,
+    words: &mut Vec<String>,
+    want: impl Fn(&str) -> bool,
+) -> PumpEvent {
+    let end = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < end {
+        let now = t0.elapsed().as_micros() as u64;
+        let mut out = desk.tick(now);
+        if let Some(port) = desk.redial_due(now) {
+            let res = open(&port);
+            out.extend(desk.relinked(t0.elapsed().as_micros() as u64, res));
+        }
+        for s in out {
+            if let PumpEvent::Squawk { event: Some(e), .. } = &s {
+                words.push(e.clone());
+                if want(e) {
+                    return s;
+                }
+            }
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+    panic!("no wanted squawk in 10 s; saw {words:?}");
+}
+
+#[test]
+fn a_close_frame_mid_program_is_link_lost_and_a_rearm_resumes_from_the_named_line() {
+    let (l, port) = listener();
+    let fake = fake_fluidnc_closes_then_returns(l, 5);
+    let p = program();
+    let want = Pump::from_program(&p, GRBL).unwrap();
+    let at = want.line_of(5).unwrap();
+    let lines = want.lines().to_vec();
+    let mut desk = PumpDesk::new(machine());
+    let pass = Verdict::Pass { digest: p.digest(), machine: machine().digest() };
+    let digest = desk.arm(&pass, &p, GRBL).expect("armed by a pass");
+    let mut open = with_ws(opener(GRBL, CONNECT_WAIT), by_scheme(refuse("serial"), refuse("tcp")));
+    let who = Origin::LocalUser("una".to_string());
+    let start = PumpEvent::PumpStart {
+        principal: who.clone(),
+        program: digest_hex(digest),
+        dialect: "grbl".to_string(),
+        port: url(port),
+    };
+    let out = desk.apply(&start, &mut *open);
+    assert!(matches!(&out[..], [PumpEvent::Squawk { event: Some(e), .. }] if e == "started"), "{out:?}");
+
+    let t0 = Instant::now();
+    let mut words: Vec<String> = Vec::new();
+
+    match drive_until(&mut desk, &mut *open, t0, &mut words, |e| e.starts_with("link lost")) {
+        PumpEvent::Squawk { acked, state, event: Some(e), .. } => {
+            assert_eq!(e, format!("link lost at line {at}; reconnect attempt 1 in 250 ms"));
+            assert_eq!((acked, state.as_str()), (5, "link-lost"));
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(desk.state(), Some(PumpState::LinkLost { at_line: at, program_digest: p.digest() }));
+    let resume = PumpEvent::PumpResume { principal: who.clone() };
+    match &desk.apply(&resume, &mut *open)[..] {
+        [PumpEvent::PumpRefused { why }] => {
+            assert!(why.contains("ResumeAfterLinkLost") && why.contains(&format!("at_line: {at}")), "{why}")
+        }
+        other => panic!("{other:?}"),
+    }
+
+    // Attempt 1, after the 250 ms backoff: a fresh dial, opening handshake and banner on the second connection.
+    match drive_until(&mut desk, &mut *open, t0, &mut words, |e| e.starts_with("relinked") || e.starts_with("reconnect attempt")) {
+        PumpEvent::Squawk { event: Some(e), .. } => {
+            assert_eq!(e, format!("relinked on attempt 1; re-arm to resume from line {at}"))
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(matches!(&desk.apply(&resume, &mut *open)[..], [PumpEvent::PumpRefused { why }] if why.contains("ResumeAfterLinkLost")));
+
+    assert_eq!(desk.rearm(&pass, &p, GRBL), Ok(at));
+    let out = desk.apply(&resume, &mut *open);
+    assert!(matches!(&out[..], [PumpEvent::Squawk { event: Some(e), .. }] if e == "resume"), "{out:?}");
+    match drive_until(&mut desk, &mut *open, t0, &mut words, |e| e == "done" || e.starts_with("link lost")) {
+        PumpEvent::Squawk { sent, acked, total, event: Some(e), .. } => {
+            assert_eq!(e, "done");
+            assert_eq!((sent, acked), (total, total));
+        }
+        other => panic!("{other:?}"),
+    }
+    drop(desk); // the second link closes: the fake sees the socket end and returns
+    let (first, second) = fake.join().unwrap();
+    assert_eq!(&first[..5], &lines[..5]);
+    assert_eq!(second, lines[5..].to_vec(), "the second connection ran only the lines from the lost one on");
 }

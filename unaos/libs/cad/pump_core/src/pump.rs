@@ -49,6 +49,11 @@ pub enum PumpRefusal {
     Program(Refusal),
     /// The link went away while sending a realtime byte.
     Link,
+    /// VUGCOMSCANRECONNECT (SR521): the link was lost at `at_line` (the oldest unacknowledged text line); the pump
+    /// resumes only after a person re-arms it ([`Pump::resume_at`]), never on a bare Resume.
+    ResumeAfterLinkLost { at_line: usize },
+    /// VUGCOMSCANRECONNECT (SR521): [`Pump::resume_at`] named a text line the pump does not send.
+    NoSuchLine { line: usize },
 }
 
 /// Why a stream stopped sending before its end.
@@ -62,6 +67,7 @@ pub enum Halt {
     Resend { line: usize },
     /// Marlin said `Error:`.
     Refused { line: usize },
+    /// No longer entered: a lost link is [`PumpState::LinkLost`] (VUGCOMSCANRECONNECT, SR521).
     Link,
 }
 
@@ -73,6 +79,13 @@ pub enum PumpState {
     Stopping,
     Stopped,
     Done,
+    /// VUGCOMSCANRECONNECT (SR521): the link went away mid-stream. `at_line` is the 1-based text line of the oldest
+    /// line the controller never acknowledged; `program_digest` the `Program::digest` this pump streams (0 for a pump
+    /// made from text by [`Pump::new`]). Nothing is sent until a person re-arms ([`Pump::resume_at`]).
+    LinkLost { at_line: usize, program_digest: u64 },
+    /// VUGCOMSCANRECONNECT (SR521): a fresh pump positioned at `at_line` by [`Pump::resume_at`]; [`Pump::resume`]
+    /// starts it streaming from there.
+    Rearmed { at_line: usize },
 }
 
 /// What the controller said, and what the pump did about it. `line` is the 1-based line of the program text.
@@ -122,6 +135,8 @@ pub struct Pump {
     last: Option<StatusReport>,
     status_every_us: u64,
     timeout_us: u64,
+    /// VUGCOMSCANRECONNECT (SR521): the `Program::digest` streamed (0 for a pump made from text).
+    digest: u64,
 }
 
 fn is_grbl(d: Dialect) -> bool {
@@ -187,13 +202,16 @@ impl Pump {
             last: None,
             status_every_us: STATUS_EVERY_US,
             timeout_us: TIMEOUT_US,
+            digest: 0,
         })
     }
 
     /// make_core's text for `p` in `d` (the one writer), then [`Pump::new`].
     pub fn from_program(p: &Program, d: Dialect) -> Result<Pump, PumpRefusal> {
         let text = write(p, d).map_err(PumpRefusal::Program)?;
-        Pump::new(d, &text)
+        let mut pump = Pump::new(d, &text)?;
+        pump.digest = p.digest();
+        Ok(pump)
     }
 
     pub fn with_timeout(mut self, us: u64) -> Pump {
@@ -278,6 +296,9 @@ impl Pump {
     /// grbl `~`: cycle start / resume. A halted stream stays halted: the controller resumes what it holds, the pump
     /// sends nothing more.
     pub fn resume(&mut self, t: &mut dyn Transport) -> Result<(), PumpRefusal> {
+        if let Some(r) = self.resume_lost() {
+            return r;
+        }
         self.grbl_only("cycle start")?;
         self.rt(t, Realtime::CycleStart)
     }
@@ -302,6 +323,10 @@ impl Pump {
     /// stopping). Marlin has no realtime byte: the pump stops sending, and the few lines Marlin holds finish.
     pub fn stop(&mut self, t: &mut dyn Transport) -> Result<(), PumpRefusal> {
         if matches!(self.state, PumpState::Stopped | PumpState::Done) {
+            return Ok(());
+        }
+        if matches!(self.state, PumpState::LinkLost { .. } | PumpState::Rearmed { .. }) {
+            self.state = PumpState::Stopped;
             return Ok(());
         }
         if !is_grbl(self.dialect) {
@@ -420,14 +445,14 @@ impl Pump {
             self.last_rx_us = now_us;
         }
         let mut buf = [0u8; 256];
+        let mut lost = false;
         loop {
             match t.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => self.rx.extend_from_slice(&buf[..n]),
                 Err(_) => {
-                    self.halt(Halt::Link, t);
-                    ev.push(Event::LinkLost);
-                    return ev;
+                    lost = true; // the bytes already read are classified first (an `ok` that came with the FIN counts)
+                    break;
                 }
             }
         }
@@ -447,8 +472,8 @@ impl Pump {
         if self.rx.len() > 4096 {
             self.rx.clear();
         }
-        if self.flush_rt(t).is_err() {
-            self.halt(Halt::Link, t);
+        if lost || self.flush_rt(t).is_err() {
+            self.lose_link();
             ev.push(Event::LinkLost);
             return ev;
         }
@@ -460,7 +485,7 @@ impl Pump {
                             self.tx.drain(..n);
                         }
                         Err(_) => {
-                            self.halt(Halt::Link, t);
+                            self.lose_link();
                             ev.push(Event::LinkLost);
                             return ev;
                         }
@@ -492,7 +517,7 @@ impl Pump {
             if due {
                 self.last_query_us = Some(now_us);
                 if self.rt(t, Realtime::StatusQuery).is_err() {
-                    self.halt(Halt::Link, t);
+                    self.lose_link();
                     ev.push(Event::LinkLost);
                     return ev;
                 }
@@ -507,5 +532,112 @@ impl Pump {
             ev.push(Event::Done);
         }
         ev
+    }
+}
+
+// --- VUGCOMSCANRECONNECT (LEDGER SR521): the lost link, the re-arm and the redial backoff (named tail hunk) ---
+
+/// The first redial waits this long after the loss.
+pub const REDIAL_FIRST_US: u64 = 250_000;
+/// The redial wait doubles up to this.
+pub const REDIAL_MAX_US: u64 = 4_000_000;
+
+/// The wait before redial `attempt` (1-based): 250 ms, doubling, capped at 4 s.
+pub fn backoff_us(attempt: u32) -> u64 {
+    let shift = attempt.saturating_sub(1).min(16);
+    (REDIAL_FIRST_US << shift).min(REDIAL_MAX_US)
+}
+
+/// The redial schedule for a lost link: which attempt is next and when it is due. The caller owns the clock.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Redial {
+    attempt: u32,
+    due_us: u64,
+}
+
+impl Redial {
+    /// Attempt 1, due [`REDIAL_FIRST_US`] after the loss at `lost_us`.
+    pub fn new(lost_us: u64) -> Redial {
+        Redial { attempt: 1, due_us: lost_us.saturating_add(backoff_us(1)) }
+    }
+
+    /// True once the next attempt is due.
+    pub fn due(&self, now_us: u64) -> bool {
+        now_us >= self.due_us
+    }
+
+    /// The next attempt's number (1-based).
+    pub fn attempt(&self) -> u32 {
+        self.attempt
+    }
+
+    /// The wait before the next attempt.
+    pub fn wait_us(&self) -> u64 {
+        backoff_us(self.attempt)
+    }
+
+    /// The attempt failed at `now_us`: the next one is due after the doubled wait.
+    pub fn failed(&mut self, now_us: u64) {
+        self.attempt = self.attempt.saturating_add(1);
+        self.due_us = now_us.saturating_add(backoff_us(self.attempt));
+    }
+}
+
+impl Pump {
+    /// The `Program::digest` this pump streams (0 for a pump made from text).
+    pub fn digest(&self) -> u64 {
+        self.digest
+    }
+
+    /// The 1-based text line of the pump's `index`-th line.
+    pub fn line_of(&self, index: usize) -> Option<usize> {
+        self.src.get(index).copied()
+    }
+
+    /// A FRESH pump (the one a re-arm made) positioned at text line `at_line`: the lines before it count as sent and
+    /// acknowledged, and the state is [`PumpState::Rearmed`] until [`Pump::resume`].
+    pub fn resume_at(mut self, at_line: usize) -> Result<Pump, PumpRefusal> {
+        let Some(i) = self.src.iter().position(|&l| l == at_line) else {
+            return Err(PumpRefusal::NoSuchLine { line: at_line });
+        };
+        self.next = i;
+        self.acked = i;
+        self.state = PumpState::Rearmed { at_line };
+        Ok(self)
+    }
+
+    /// The link went away: a live stream is [`PumpState::LinkLost`] at its oldest unacknowledged line (a Rearmed
+    /// pump keeps its line); nothing more is sent and no feed hold is tried (the link is gone).
+    fn lose_link(&mut self) {
+        let at_line = match self.state {
+            PumpState::Rearmed { at_line } => Some(at_line),
+            PumpState::Streaming | PumpState::Stopping => {
+                let i = self.outstanding.front().map(|(i, _)| *i).unwrap_or(self.next);
+                Some(self.src.get(i).copied().unwrap_or_else(|| self.src.last().copied().unwrap_or(0)))
+            }
+            _ => None,
+        };
+        if let Some(at_line) = at_line {
+            self.state = PumpState::LinkLost { at_line, program_digest: self.digest };
+        }
+        self.tx.clear();
+        self.rt_pending.clear();
+        self.outstanding.clear();
+        self.rx.clear();
+    }
+
+    /// Resume after a loss: refused by name while lost (no byte); a re-armed pump starts streaming (no `~` byte).
+    fn resume_lost(&mut self) -> Option<Result<(), PumpRefusal>> {
+        match self.state {
+            PumpState::LinkLost { at_line, .. } => Some(Err(PumpRefusal::ResumeAfterLinkLost { at_line })),
+            PumpState::Rearmed { .. } => {
+                self.state = PumpState::Streaming;
+                self.started = false;
+                self.timed_out = false;
+                self.last_query_us = None;
+                Some(Ok(()))
+            }
+            _ => None,
+        }
     }
 }

@@ -175,7 +175,7 @@ fn a_closed_link_is_named() {
     m.closed = true;
     let ev = p.tick(&mut m, 1);
     assert_eq!(ev, vec![Event::LinkLost]);
-    assert_eq!(p.state(), PumpState::Halted(Halt::Link));
+    assert_eq!(p.state(), PumpState::LinkLost { at_line: 1, program_digest: 0 }); // VUGCOMSCANRECONNECT (SR521)
     assert_eq!(m.write(b"x"), Err(LinkError::Closed));
 }
 
@@ -323,4 +323,120 @@ fn from_program_streams_make_cores_own_text() {
     let ev = drive(&mut pump, &mut m, 1_000, |e| e.contains(&Event::Done));
     assert!(ev.contains(&Event::Done));
     assert_eq!(m.executed, want);
+}
+
+// --- VUGCOMSCANRECONNECT (LEDGER SR521): the lost link, the re-arm and the redial backoff ---
+
+#[test]
+fn the_redial_backoff_is_250_ms_doubling_to_4_s() {
+    use pump_core::pump::{REDIAL_FIRST_US, REDIAL_MAX_US, Redial, backoff_us};
+    let ms: Vec<u64> = (1..=7).map(|a| backoff_us(a) / 1000).collect();
+    assert_eq!(ms, vec![250, 500, 1000, 2000, 4000, 4000, 4000]);
+    assert_eq!((backoff_us(0), backoff_us(u32::MAX)), (REDIAL_FIRST_US, REDIAL_MAX_US));
+    let mut r = Redial::new(1_000_000);
+    assert_eq!((r.attempt(), r.wait_us()), (1, 250_000));
+    assert!(!r.due(1_249_999) && r.due(1_250_000));
+    r.failed(2_000_000);
+    assert_eq!((r.attempt(), r.wait_us()), (2, 500_000));
+    assert!(!r.due(2_499_999) && r.due(2_500_000));
+    for _ in 0..10 {
+        r.failed(10_000_000);
+    }
+    assert_eq!((r.attempt(), r.wait_us()), (12, REDIAL_MAX_US));
+}
+
+#[test]
+fn a_link_lost_mid_program_is_link_lost_at_the_first_unacked_line_and_refuses_resume_by_name() {
+    let text = program(60);
+    let mut m = MockGrbl::new(1);
+    let mut p = Pump::new(GRBL, &text).unwrap().with_status_every(0);
+    drive(&mut p, &mut m, 500, |ev| count(ev, |e| matches!(e, Event::Ok(_))) >= 7);
+    let acked = p.progress().acked;
+    assert!(acked >= 7 && p.progress().sent > acked, "lines in flight at the loss");
+    let at = p.line_of(acked).unwrap();
+    m.closed = true;
+    assert_eq!(p.tick(&mut m, 900_000), vec![Event::LinkLost]);
+    assert_eq!(p.state(), PumpState::LinkLost { at_line: at, program_digest: 0 });
+    assert_eq!(p.progress().acked, acked);
+    // Resume is refused by name, before any byte: the second link sees nothing.
+    let mut m2 = MockGrbl::new(1);
+    assert_eq!(p.resume(&mut m2), Err(PumpRefusal::ResumeAfterLinkLost { at_line: at }));
+    assert!(m2.realtime.is_empty());
+    // A lost pump sends nothing on a new link while it waits.
+    for k in 0..20 {
+        p.tick(&mut m2, 1_000_000 + k * 1000);
+    }
+    assert!(m2.executed.is_empty() && m2.realtime.is_empty());
+    // Stop ends a lost run without a byte.
+    p.stop(&mut m2).unwrap();
+    assert_eq!(p.state(), PumpState::Stopped);
+    assert!(m2.realtime.is_empty());
+}
+
+#[test]
+fn the_acks_that_arrive_with_the_loss_are_counted_before_it() {
+    struct Fin(Vec<u8>);
+    impl Transport for Fin {
+        fn write(&mut self, b: &[u8]) -> Result<usize, LinkError> {
+            Ok(b.len())
+        }
+        fn read(&mut self, b: &mut [u8]) -> Result<usize, LinkError> {
+            if self.0.is_empty() {
+                return Err(LinkError::Closed);
+            }
+            let n = b.len().min(self.0.len());
+            b[..n].copy_from_slice(&self.0[..n]);
+            self.0.drain(..n);
+            Ok(n)
+        }
+    }
+    let mut p = Pump::new(GRBL, &program(10)).unwrap().with_status_every(0);
+    // First tick sends the window over a link that answers nothing yet.
+    struct Quiet;
+    impl Transport for Quiet {
+        fn write(&mut self, b: &[u8]) -> Result<usize, LinkError> {
+            Ok(b.len())
+        }
+        fn read(&mut self, _: &mut [u8]) -> Result<usize, LinkError> {
+            Ok(0)
+        }
+    }
+    p.tick(&mut Quiet, 1);
+    assert!(p.progress().sent >= 3);
+    // Two oks then the FIN in the same tick: both count, the loss is at the third line.
+    let mut fin = Fin(b"ok\r\nok\r\n".to_vec());
+    let ev = p.tick(&mut fin, 2);
+    assert_eq!(ev, vec![Event::Ok(p.line_of(0).unwrap()), Event::Ok(p.line_of(1).unwrap()), Event::LinkLost]);
+    assert_eq!(p.state(), PumpState::LinkLost { at_line: p.line_of(2).unwrap(), program_digest: 0 });
+}
+
+#[test]
+fn a_rearmed_pump_resumes_from_the_named_line_and_runs_only_the_rest() {
+    let text = program(40);
+    let lines = Pump::new(GRBL, &text).unwrap().lines().to_vec();
+    let fresh = Pump::new(GRBL, &text).unwrap().with_status_every(0);
+    assert_eq!(fresh.line_of(0), Some(1));
+    assert_eq!(fresh.line_of(1), Some(3), "the comment line is dropped");
+    let at = fresh.line_of(12).unwrap();
+    assert_eq!(
+        Pump::new(GRBL, &text).unwrap().resume_at(2).err(),
+        Some(PumpRefusal::NoSuchLine { line: 2 }),
+        "a comment line is not a line the pump sends"
+    );
+    let mut p = fresh.resume_at(at).unwrap();
+    assert_eq!(p.state(), PumpState::Rearmed { at_line: at });
+    assert_eq!((p.progress().sent, p.progress().acked), (12, 12));
+    let mut m = MockGrbl::new(1);
+    for k in 0..5 {
+        p.tick(&mut m, k * 1000);
+    }
+    assert!(m.executed.is_empty(), "a re-armed pump waits for Resume");
+    p.resume(&mut m).unwrap();
+    assert_eq!(p.state(), PumpState::Streaming);
+    assert!(!m.realtime.contains(&b'~'), "the re-armed resume is not a cycle start byte");
+    let ev = drive(&mut p, &mut m, 5_000, |ev| ev.contains(&Event::Done));
+    assert!(ev.contains(&Event::Done));
+    assert_eq!(m.executed, lines[12..].to_vec());
+    let pr = p.progress();
+    assert_eq!((pr.sent, pr.acked, pr.total), (lines.len(), lines.len(), lines.len()));
 }

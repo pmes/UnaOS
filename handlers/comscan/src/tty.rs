@@ -22,6 +22,9 @@
 //!   first line went out; so [`Port::ready`] waits for the banner before a pump ever sees the port, and a grbl that
 //!   stays silent (no auto-reset: grblHAL native USB) is sent make_core's `Realtime::SoftReset` once.
 //! - Candidates by readdir of `/dev` (no daemon): macOS `cu.usbserial*` / `cu.usbmodem*`, Linux `ttyUSB*` / `ttyACM*`.
+//! - A port lost mid-stream (EIO, end of file) is dropped by the desk, which releases the TIOCEXCL fd, and reopened
+//!   by path through [`opener`] with the desk lock released, 250 ms doubling to 4 s (VUGCOMSCANRECONNECT, SR521); a
+//!   device that comes back under another name is owed as VUG-COMSCAN-TTY-USBID.
 //!
 //! `unsafe` lives in four private fns, each with its SAFETY line: `termios_get`, `termios_set`, `exclusive`,
 //! `nonstandard_speed`.
