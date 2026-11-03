@@ -13,8 +13,9 @@
 
 //! The gate-invariant test battery for the machine gate (VUGHELM, LEDGER SR475).
 //!
-//! Every invariant G1–G7 from `helm::machine`'s module doc gets its own named test below. Every review is make_core's
-//! real `review` of a program on a mill in make_core's own test fixture shape — never a hand-built `Review`.
+//! Every invariant G1–G8 from `helm::machine`'s module doc gets its own named test below. Every review is make_core's
+//! real `review` of a program on a mill in make_core's own test fixture shape — never a hand-built `Review`; G8's
+//! unbound leg derives one from a real review by removing its `FirstRun` ask (VUG-HELM-BIND, LEDGER SR489).
 
 use helm::machine::{Approved, Level, Policy, Verdict, approve, gate};
 use make_core::{
@@ -131,7 +132,7 @@ fn g2_an_approved_digest_passes_and_a_changed_program_does_not() {
     let r = rev(&p);
     assert_eq!(gate(&r, &pol, &approved), Verdict::Ask(vec![Ask::FirstRun { digest: p.digest() }]));
     assert!(approve(&mut approved, p.digest(), "peter", 1_000));
-    assert_eq!(gate(&r, &pol, &approved), Verdict::Pass);
+    assert_eq!(gate(&r, &pol, &approved), Verdict::Pass { digest: p.digest() });
     // The same program reviewed again still passes.
     assert!(gate(&rev(&safe(30.0)), &pol, &approved).is_pass());
     // One move changed: a new digest, asked again.
@@ -173,7 +174,7 @@ fn g3_never_refuses_the_ask_by_name() {
 #[test]
 fn g4_pass_level_drops_the_ask() {
     let pol = Policy { first_run: Level::Pass, tool_change: Level::Pass, power_above: Level::Pass };
-    assert_eq!(gate(&rev(&busy()), &pol, &Approved::default()), Verdict::Pass);
+    assert_eq!(gate(&rev(&busy()), &pol, &Approved::default()), Verdict::Pass { digest: busy().digest() });
     let pol = Policy { tool_change: Level::Pass, ..Policy::default() };
     let p = busy();
     assert_eq!(
@@ -234,4 +235,34 @@ fn g7_approve_is_idempotent() {
     assert_eq!(approved.digests[0].when_us, 10);
     assert!(approved.covers(d));
     assert!(!approved.covers(d ^ 1));
+}
+
+// ---------------------------------------------------------------------------
+// G8 — a pass names its program (VUG-HELM-BIND, SR489): the digest of the program reviewed; no program, no pass.
+// ---------------------------------------------------------------------------
+#[test]
+fn g8_a_pass_names_the_program_it_passed() {
+    let pol = Policy::default();
+    let (p, q) = (safe(30.0), safe(31.0));
+    assert_ne!(p.digest(), q.digest());
+    let mut approved = Approved::default();
+    approve(&mut approved, p.digest(), "peter", 1);
+    approve(&mut approved, q.digest(), "peter", 2);
+    // The same asks on two programs: each pass names its own program, and the two passes differ.
+    let (vp, vq) = (gate(&rev(&p), &pol, &approved), gate(&rev(&q), &pol, &approved));
+    assert_eq!(vp, Verdict::Pass { digest: p.digest() });
+    assert_eq!(vq, Verdict::Pass { digest: q.digest() });
+    assert_ne!(vp, vq, "a pass for one program is not a pass for another");
+    // A pass at the all-Pass levels still names the program it was issued for.
+    let all = Policy { first_run: Level::Pass, tool_change: Level::Pass, power_above: Level::Pass };
+    let b = busy();
+    assert_eq!(gate(&rev(&b), &all, &Approved::default()), Verdict::Pass { digest: b.digest() });
+    // A review that names no program (its FirstRun removed) is Unbound, never a Pass, under every policy.
+    let mut r = rev(&b);
+    r.asks.retain(|a| !matches!(a, Ask::FirstRun { .. }));
+    assert_eq!(gate(&r, &all, &Approved::default()), Verdict::Unbound);
+    for pol in &every_policy() {
+        let v = gate(&r, pol, &approved);
+        assert!(!v.is_pass(), "{pol:?} passed a review that names no program as {v:?}");
+    }
 }
