@@ -10,7 +10,7 @@
 //! scan <in.prb | in.csv | in.raw> -o <out.ply> [--report <out.txt>]
 //!      [--meta <x_Depth_metadata.csv>] [--width W --height H] [--csv-raw]
 //!      [--fx F --fy F --ppx F --ppy F] [--units-um N] [--frame N]
-//!      [--turntable DEG --radius MM | --poses <file>] [--voxel MM] [--trunc MM] [--band MM]
+//!      [--turntable DEG --radius MM | --poses <file> | --track] [--voxel MM] [--trunc MM] [--band MM]
 //! ```
 //!
 //! Inputs (the measured roads from a D435i to this machine; librealsense v2.55.1):
@@ -27,8 +27,16 @@
 //!   metadata carries no depth units: the D400 default (1000 um) unless `--units-um`. Without `--meta`, `--width`
 //!   `--height` and the four intrinsic flags.
 //!
-//! Poses: ONE depth frame (or `--frame N`) is fused from the identity pose. Several frames need a pose source, else
-//! the run is refused (`ManyFramesNoPose`; frame-to-model ICP is VUG-SCAN-POSE, owed):
+//! Poses: ONE depth frame (or `--frame N`) is fused from the identity pose. Several frames need `--track` or a pose
+//! source, else the run is refused (`ManyFramesNoPose`); the three roads are exclusive (`PoseFlags`, also with `--frame`):
+//! - `--track` (VUGSCANTRACK, LEDGER SR493): no pose source but the depth. scan_core's frame-to-model tracker (SR478,
+//!   `Tracker::new`, its own pyramid and thresholds): frame 0 is integrated at the identity (the world is frame 0's
+//!   camera), each later frame through `Tsdf::integrate_tracked`. A frame the tracker refuses as `Lost`, or one with no
+//!   depth pixel (`Scan(NoDepth)`), is SKIPPED: never integrated, the tracker and the volume as they were, counted
+//!   `lost` and named on its own report line; any other refusal ends the run (`Track { frame, error }`). Gravity is
+//!   not passed: a .prb carries no accel record until SONDE-RECORD-IMU (VUG-SCAN-TOOL-GRAVITY owed). The report adds
+//!   `track: frames= tracked= lost= fine_iters_max= drift_est=none` (no truth on a recording, so no error is printed)
+//!   and one `track: frame=` line per frame with its inliers, inlier fraction, rms and iterations per level.
 //! - `--turntable DEG --radius MM`, the stop-gap: the world is frame 0's camera frame; the turntable axis passes
 //!   through (0, 0, MM) parallel to the image's vertical (camera +y); `DEG` > 0 is the table turning
 //!   counter-clockwise seen from above, so frame k's camera sits rotated by +k·DEG (right-handed about camera +y)
@@ -49,8 +57,8 @@ use std::path::Path;
 use probe_core::recording::{self, RecordingError};
 use probe_core::{FrameError, StreamKind};
 use scan_core::{
-    Cylinder, DepthScale, Fit, FitError, Frame, Intrinsics, PixelFormat, Plane, ScanError, Tol, Topo, Transform, Tsdf,
-    Vec3, extract, fit_cylinder, fit_plane,
+    Cylinder, DepthScale, Fit, FitError, Frame, Intrinsics, PixelFormat, Plane, ScanError, Tol, Topo, TrackError, Tracker,
+    Transform, Tsdf, Vec3, extract, fit_cylinder, fit_plane,
 };
 
 /// |RᵀR − I| bound for a `--poses` rotation: the rounding of a matrix printed to 6 decimals.
@@ -89,6 +97,7 @@ enum Refusal {
     PoseNotRigid { line: usize },
     Volume(ScanError),
     Integrate { frame: usize, error: ScanError },
+    Track { frame: usize, error: TrackError },
     Extract(ScanError),
 }
 
@@ -96,7 +105,7 @@ fn usage() -> ! {
     eprintln!("usage: scan <in.prb | in.csv | in.raw> -o <out.ply> [--report <out.txt>]");
     eprintln!("            [--meta <x_Depth_metadata.csv>] [--width W --height H] [--csv-raw]");
     eprintln!("            [--fx F --fy F --ppx F --ppy F] [--units-um N] [--frame N]");
-    eprintln!("            [--turntable DEG --radius MM | --poses <file>] [--voxel MM] [--trunc MM] [--band MM]");
+    eprintln!("            [--turntable DEG --radius MM | --poses <file> | --track] [--voxel MM] [--trunc MM] [--band MM]");
     std::process::exit(2)
 }
 
@@ -115,6 +124,7 @@ struct Args {
     turntable: Option<f64>,
     radius: Option<f64>,
     poses: Option<String>,
+    track: bool,
     voxel: f64,
     trunc: Option<f64>,
     band: f64,
@@ -144,6 +154,7 @@ fn parse_args() -> Args {
             "--turntable" => a.turntable = Some(num(&mut it)),
             "--radius" => a.radius = Some(num(&mut it)),
             "--poses" => a.poses = Some(it.next().unwrap_or_else(|| usage())),
+            "--track" => a.track = true,
             "--voxel" => a.voxel = num(&mut it),
             "--trunc" => a.trunc = Some(num(&mut it)),
             "--band" => a.band = num(&mut it),
@@ -318,6 +329,49 @@ fn load_poses(path: &str) -> Result<Vec<Transform>, Refusal> {
     Ok(out)
 }
 
+/// `--track` (VUGSCANTRACK, LEDGER SR493): frame 0 at the identity, each later frame tracked against the model and
+/// integrated through `Tsdf::integrate_tracked` (SR478's road); a `Lost` or depthless frame skipped and named. Returns
+/// the report's `track:` lines.
+fn fuse_tracked(t: &mut Tsdf, frames: &[Loaded], intr: &[Intrinsics]) -> Result<String, Refusal> {
+    let mut tr = Tracker::new(t, Tol::DEFAULT);
+    let (mut tracked, mut lost, mut fine_max) = (0usize, 0usize, 0u32);
+    let mut lines = String::new();
+    for (k, l) in frames.iter().enumerate() {
+        let anchor = t.frames() == 0;
+        match t.integrate_tracked(&mut tr, &l.frame, l.scale, &intr[k], None) {
+            Ok(_) if anchor => {
+                let _ = writeln!(lines, "track: frame={k} pose=identity");
+            }
+            Ok(_) => {
+                tracked += 1;
+                let Some(s) = tr.last() else { continue };
+                fine_max = fine_max.max(s.level_iterations[2]);
+                let frac = if s.valid > 0 { s.inliers as f64 / s.valid as f64 } else { 0.0 };
+                let _ = writeln!(
+                    lines,
+                    "track: frame={k} inliers={} valid={} frac={frac:.3} rms_mm={:.3} iters={}/{}/{}",
+                    s.inliers, s.valid, s.rms_mm, s.level_iterations[0], s.level_iterations[1], s.level_iterations[2]
+                );
+            }
+            Err(TrackError::Scan(error)) if anchor => return Err(Refusal::Integrate { frame: k, error }),
+            Err(TrackError::Lost { inliers, residual_mm }) => {
+                lost += 1;
+                let _ = writeln!(lines, "track: frame={k} lost inliers={inliers} rms_mm={residual_mm:.3}");
+            }
+            Err(TrackError::Scan(ScanError::NoDepth)) => {
+                lost += 1;
+                let _ = writeln!(lines, "track: frame={k} lost no_depth");
+            }
+            Err(error) => return Err(Refusal::Track { frame: k, error }),
+        }
+    }
+    let head = format!(
+        "track: frames={} tracked={tracked} lost={lost} fine_iters_max={fine_max} drift_est=none\n",
+        frames.len()
+    );
+    Ok(head + &lines)
+}
+
 fn v3(v: Vec3) -> String {
     format!("({:.5},{:.5},{:.5})", v.x, v.y, v.z)
 }
@@ -336,7 +390,7 @@ fn run(a: &Args) -> Result<String, Refusal> {
         return Err(Refusal::NoDepthFrames);
     }
     let posed = a.turntable.is_some() || a.poses.is_some();
-    if (a.turntable.is_some() && a.poses.is_some()) || (posed && a.frame.is_some()) {
+    if (a.turntable.is_some() && a.poses.is_some()) || (posed && a.frame.is_some()) || (a.track && (posed || a.frame.is_some())) {
         return Err(Refusal::PoseFlags);
     }
     if let Some(n) = a.frame {
@@ -357,6 +411,7 @@ fn run(a: &Args) -> Result<String, Refusal> {
             }
             p
         }
+        _ if a.track => Vec::new(), // the tracked road's poses are the tracker's (fuse_tracked)
         _ if frames.len() == 1 => vec![Transform::IDENTITY],
         _ => return Err(Refusal::ManyFramesNoPose { frames: frames.len() }),
     };
@@ -377,9 +432,14 @@ fn run(a: &Args) -> Result<String, Refusal> {
     }
     let trunc = a.trunc.unwrap_or(3.0 * a.voxel);
     let mut t = Tsdf::new(a.voxel, trunc, Tol::DEFAULT).map_err(Refusal::Volume)?;
-    for (k, l) in frames.iter().enumerate() {
-        t.integrate(&l.frame, l.scale, &intr[k], &poses[k]).map_err(|error| Refusal::Integrate { frame: k, error })?;
-    }
+    let track = if a.track {
+        Some(fuse_tracked(&mut t, &frames, &intr)?)
+    } else {
+        for (k, l) in frames.iter().enumerate() {
+            t.integrate(&l.frame, l.scale, &intr[k], &poses[k]).map_err(|error| Refusal::Integrate { frame: k, error })?;
+        }
+        None
+    };
     let sm = extract(&t).map_err(Refusal::Extract)?;
     let loops: Result<Vec<Vec<u32>>, Topo> = sm.mesh.boundary_loops();
     let band = Tol { lin: a.band, ang: BAND_DEG.to_radians() };
@@ -417,8 +477,17 @@ fn run(a: &Args) -> Result<String, Refusal> {
         k0.ppy,
         frames[0].scale.micrometres()
     );
-    let pose_src = if a.turntable.is_some() { "turntable" } else if a.poses.is_some() { "file" } else { "identity" };
+    let pose_src = if a.turntable.is_some() {
+        "turntable"
+    } else if a.poses.is_some() {
+        "file"
+    } else if a.track {
+        "track"
+    } else {
+        "identity"
+    };
     let _ = writeln!(r, "frames={} poses={pose_src} voxel_mm={} trunc_mm={}", sm.frames, a.voxel, trunc);
+    r.push_str(track.as_deref().unwrap_or(""));
     let _ = writeln!(r, "vertices={}", sm.mesh.positions.len());
     let _ = writeln!(r, "triangles={}", sm.mesh.triangles.len());
     let _ = writeln!(r, "confidence: min={cmin:.3} mean={cmean:.3}");

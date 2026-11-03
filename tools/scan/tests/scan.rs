@@ -161,3 +161,91 @@ fn refusals_are_named() {
     let o = scan(&[many.to_str().unwrap(), "-o", ply, "--turntable", "10"]);
     assert!(stderr(&o).contains("TurntableNoRadius"), "{}", stderr(&o));
 }
+
+/// VUGSCANTRACK (LEDGER SR493): a recording with no pose source fused through `--track` (scan_core's frame-to-model
+/// tracker, SR478). The orbit steps 1° a frame with the D435i's noise, SR478's regime (tests/pose.rs `STEP_DEG`); the
+/// fits, carried by frame 0's true pose into the scene, hold twice scan_core's tests/scan.rs bars as tests/pose.rs
+/// does. A blank frame in the middle is skipped, counted lost and named, and the rest still fuse.
+#[test]
+fn a_tracked_prb_recording_fuses_without_poses() {
+    let d = dir("track");
+    let intr = fixture::bench_intrinsics();
+    let truth = |k: u32| fixture::orbit(CENTRE, 600.0, 40.0 * DEG, k as f64 * DEG);
+    let render = |k: u32| fixture::render_depth(&Scene::bench(), &intr, DepthScale::D400_DEFAULT, &truth(k), &Noise::D435I, k as u64);
+    let blank = |k: u32| {
+        Frame::packed(
+            probe_core::StreamKind::Depth,
+            probe_core::PixelFormat::Z16,
+            intr.width,
+            intr.height,
+            k as u64 * 33_333,
+            k as u64,
+            vec![0u8; (intr.width * intr.height * 2) as usize],
+        )
+        .unwrap()
+    };
+    let write = |path: &PathBuf, blank_at: Option<u32>| {
+        let recs: Vec<Record> = (0..12u32)
+            .map(|k| {
+                let f = if blank_at == Some(k) { blank(k) } else { render(k) };
+                Record::new(f, "replay:d435i", 1000, Some(k4())).unwrap()
+            })
+            .collect();
+        std::fs::write(path, recording::write(&recs).unwrap()).unwrap();
+    };
+    let v3 = |s: &str| -> Vec3 {
+        let n: Vec<f64> = s.trim_matches(|c: char| c == '(' || c == ')').split(',').map(|t| t.parse().unwrap()).collect();
+        Vec3::new(n[0], n[1], n[2])
+    };
+    let deg = |a: Vec3, b: Vec3| (a.dot(b).abs() / (a.mag() * b.mag())).min(1.0).acos() / DEG;
+    let z = Vec3::new(0.0, 0.0, 1.0);
+
+    // Twelve tracked frames.
+    let (inp, ply) = (d.join("track.prb"), d.join("track.ply"));
+    write(&inp, None);
+    let o = scan(&[inp.to_str().unwrap(), "-o", ply.to_str().unwrap(), "--track"]);
+    let report = String::from_utf8_lossy(&o.stdout).into_owned();
+    assert!(o.status.success(), "stderr: {}", String::from_utf8_lossy(&o.stderr));
+    println!("{report}");
+    assert_eq!(field(&report, "frames=", "poses"), "track");
+    assert_eq!(field(&report, "frames=", "frames"), "12");
+    assert_eq!(field(&report, "track: frames=", "frames"), "12");
+    assert_eq!(field(&report, "track: frames=", "tracked"), "11");
+    assert_eq!(field(&report, "track: frames=", "lost"), "0");
+    assert_eq!(field(&report, "track: frames=", "drift_est"), "none");
+    let p0 = truth(0);
+    // The plane: the ground (z = 0) or the box top (z = 100), within 1° of up, 4 mm of its height, rms <= 4.
+    let n = p0.apply_vector(v3(field(&report, "plane:", "normal")));
+    let dw: f64 = field(&report, "plane:", "d").parse::<f64>().unwrap() + n.dot(p0.trans);
+    let h = dw / n.z;
+    assert!(deg(n, z) < 1.0, "plane normal {} deg off up", deg(n, z));
+    assert!(h.abs().min((h - 100.0).abs()) < 4.0, "plane height {h} mm");
+    let rms: f64 = field(&report, "plane:", "rms_mm").parse().unwrap();
+    assert!(rms <= 4.0, "plane rms {rms}");
+    // The cylinder: r 40 standing at (160, 0).
+    let axis = p0.apply_vector(v3(field(&report, "cylinder:", "axis")));
+    let pt = p0.apply_point(v3(field(&report, "cylinder:", "point")));
+    let r: f64 = field(&report, "cylinder:", "r").parse().unwrap();
+    let on = pt + axis * ((75.0 - pt.z) / axis.z);
+    let off = (on.x - 160.0).hypot(on.y);
+    assert!(deg(axis, z) < 2.0, "cylinder axis {} deg", deg(axis, z));
+    assert!((r - 40.0).abs() < 4.0, "cylinder radius {r}");
+    assert!(off < 4.0, "cylinder axis {off} mm off");
+
+    // Frame 6 blank: skipped, counted, named; the other eleven fuse.
+    let (inp6, ply6) = (d.join("blank6.prb"), d.join("blank6.ply"));
+    write(&inp6, Some(6));
+    let o = scan(&[inp6.to_str().unwrap(), "-o", ply6.to_str().unwrap(), "--track"]);
+    let report = String::from_utf8_lossy(&o.stdout).into_owned();
+    assert!(o.status.success(), "stderr: {}", String::from_utf8_lossy(&o.stderr));
+    println!("{report}");
+    assert_eq!(field(&report, "track: frames=", "lost"), "1");
+    assert_eq!(field(&report, "track: frames=", "tracked"), "10");
+    assert_eq!(field(&report, "frames=", "frames"), "11");
+    assert!(report.lines().any(|l| l == "track: frame=6 lost no_depth"), "{report}");
+
+    // The three pose roads are exclusive.
+    let o = scan(&[inp.to_str().unwrap(), "-o", ply.to_str().unwrap(), "--track", "--poses", "x.txt"]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&o.stderr).contains("PoseFlags"));
+}
