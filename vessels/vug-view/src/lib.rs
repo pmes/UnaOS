@@ -17,6 +17,8 @@ pub mod photo; // VUGFACEPHOTO (SR506): the photo underlay and the proposal glyp
 pub mod raster;
 pub mod sketch;
 pub mod view;
+// VUGFACEFILLET (SR511): the edge tool — fillet / chamfer an edge of the body.
+pub mod fillet;
 
 use bandy::SMessage;
 use model::Model;
@@ -41,6 +43,7 @@ pub const SHORTCUTS: &[(&str, &str)] = &[
     ("middle / right drag", "orbit / pan / zoom per the preset"),
     ("Alt+drag", "the middle button, for a trackpad (orbit / pan / zoom per the preset)"),
     ("wheel / pinch", "zoom to the cursor"),
+    ("f / Shift+f", "fillet / chamfer the body edge under the cursor (a click re-picks): type r (chamfer d1,d2), Enter; Esc cancels"), // VUGFACEFILLET (SR511)
     // VUGFACEPHOTO (SR506): a photo on graph paper opens as its measured sketch over the dimmed photo.
     ("i", "ask Vein for design intent on the photo's sketch (no provider today: the corner says so)"),
     ("Tab", "focus the next proposal"),

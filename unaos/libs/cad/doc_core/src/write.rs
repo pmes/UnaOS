@@ -291,6 +291,9 @@ fn stmt(w: &mut W, s: &Stmt) {
             w.out.push(']');
         }
         Stmt::Op { id, on, op } => write_op(w, id, on, op),
+        // VUGFACEFILLET (SR511): the edge edits.
+        Stmt::Fillet { id, on, edges, r } => write_edit(w, "fillet", id, on, edges, &[("r", *r)]),
+        Stmt::Chamfer { id, on, edges, d1, d2 } => write_edit(w, "chamfer", id, on, edges, &[("d1", *d1), ("d2", *d2)]),
         Stmt::Scan { id, path, pose, confidence } => {
             w.head("scan", id);
             w.s("path", path);
@@ -497,4 +500,24 @@ pub(crate) fn stmt_text(s: &Stmt) -> String {
     let mut w = W { out: String::new() };
     stmt(&mut w, s);
     w.out
+}
+
+/// VUGFACEFILLET (SR511): `<verb> <id> on=<feature> edges=[[op role a b] ...]` then the values in the given order.
+fn write_edit(w: &mut W, verb: &str, id: &str, on: &str, edges: &[brep_core::Name], vals: &[(&str, f64)]) {
+    w.head(verb, id);
+    w.w("on", on);
+    w.key("edges");
+    w.out.push('[');
+    for (i, n) in edges.iter().enumerate() {
+        if i > 0 {
+            w.out.push(' ');
+        }
+        w.out.push('[');
+        w.out.push_str(&crate::name_words(n));
+        w.out.push(']');
+    }
+    w.out.push(']');
+    for (k, x) in vals {
+        w.f(k, *x);
+    }
 }

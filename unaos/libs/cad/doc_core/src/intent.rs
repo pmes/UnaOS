@@ -156,6 +156,9 @@ fn fault_name(f: &Fault) -> String {
         Fault::Brep(e) => format!("brep {:?}", e),
         Fault::Make(e) => format!("make {:?}", e),
         Fault::NoMachine => String::from("no-machine"),
+        // VUGFACEFILLET (SR511): an edge name that no longer resolves, or resolves twice.
+        Fault::NoSuchEdge(n) => format!("no-such-edge({})", n),
+        Fault::AmbiguousEdge(n) => format!("ambiguous-edge({})", n),
     }
 }
 

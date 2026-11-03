@@ -416,3 +416,131 @@ fn replay_mints_dense_ids_after_statements_are_removed() {
     let p3 = sk.point(PointRef::Point(sketch_core::EntityId(1))).expect("p3 is minted as id 1");
     assert!((p3.x - 10.0).abs() < 1e-12 && (p3.y - 8.0).abs() < 1e-12, "{p3:?}");
 }
+
+// ---- VUGFACEFILLET (LEDGER SR511): the fillet / chamfer statements ----
+
+/// A 10 mm square extruded 10 mm: the SR502 cube, [0, 10]^3.
+const CUBE: &str = "vug-doc version=1 lin=1e-6 ang=1e-9
+sketch s1 o=[0 0 0] z=[0 0 1] x=[1 0 0]
+point p1 sketch=s1 x=0 y=0
+point p2 sketch=s1 x=10 y=0
+point p3 sketch=s1 x=10 y=10
+point p4 sketch=s1 x=0 y=10
+line l1 sketch=s1 a=p1 b=p2
+line l2 sketch=s1 a=p2 b=p3
+line l3 sketch=s1 a=p3 b=p4
+line l4 sketch=s1 a=p4 b=p1
+horizontal h1 sketch=s1 line=l1
+horizontal h2 sketch=s1 line=l3
+vertical v1 sketch=s1 line=l2
+vertical v2 sketch=s1 line=l4
+fix f0 sketch=s1 p=p1 at=[0 0]
+distance d1 sketch=s1 a=p1 b=p2 d=10
+distance d2 sketch=s1 a=p2 b=p3 d=10
+extrude e1 sketch=s1 outer=l1 dir=[0 0 1] length=10
+";
+
+/// The persistent Name of the replayed cube's top-front edge (both ends at y = 0, z = 10).
+fn top_front_name() -> brep_core::Name {
+    let d = read(CUBE).expect("read");
+    let r = replay(&d, d.tol);
+    assert!(r.failures.is_empty(), "{:?}", r.failures);
+    let b = &r.solids[0].brep;
+    let near = |a: f64, x: f64| (a - x).abs() < 1e-9;
+    let hits: Vec<brep_core::Name> = b
+        .edges
+        .iter()
+        .filter(|e| e.v.iter().all(|&v| near(b.vertices[v as usize].p.y, 0.0) && near(b.vertices[v as usize].p.z, 10.0)))
+        .map(|e| e.name)
+        .collect();
+    assert_eq!(hits.len(), 1, "one top-front edge");
+    hits[0]
+}
+
+/// The cube plus one statement, written, read back (byte-equal on the second write) and returned with its text.
+fn cube_with(s: Stmt) -> (Doc, String) {
+    let mut d = read(CUBE).expect("read");
+    d.stmts.push(s);
+    let text = write(&d);
+    let back = round_trip(&text);
+    assert_eq!(back, d, "the edit statement reads back to itself");
+    (back, text)
+}
+
+/// The edit's own solid: no failure, and its id the last solid's.
+fn edited(d: &Doc, id: &str) -> brep_core::Brep {
+    let r = replay(d, d.tol);
+    assert!(r.failures.is_empty(), "{:?}", r.failures);
+    let last = r.solids.last().expect("a solid");
+    assert_eq!(last.id, id);
+    last.brep.clone()
+}
+
+#[test]
+fn a_fillet_on_the_extrude_replays_to_the_sr502_volume() {
+    let n = top_front_name();
+    let (d, text) = cube_with(Stmt::Fillet { id: "f1".into(), on: "e1".into(), edges: vec![n], r: 2.0 });
+    let line = text.lines().find(|l| l.starts_with("fillet f1 ")).expect("the fillet line");
+    assert!(line.starts_with("fillet f1 on=e1 edges=[[extrude ") && line.ends_with("]] r=2"), "{line}");
+    let b = edited(&d, "f1");
+    assert_eq!(b.faces.len(), 7);
+    let want = 1000.0 - (4.0 - PI) * 10.0;
+    let v = brep_core::volume(&b).expect("volume");
+    assert!((v - want).abs() <= 1e-9 * want, "volume {v} vs {want}");
+}
+
+#[test]
+fn a_chamfer_on_the_extrude_replays_to_970() {
+    let n = top_front_name();
+    let (d, text) = cube_with(Stmt::Chamfer { id: "c1".into(), on: "e1".into(), edges: vec![n], d1: 2.0, d2: 3.0 });
+    assert!(text.lines().any(|l| l.starts_with("chamfer c1 on=e1 edges=[[") && l.ends_with("]] d1=2 d2=3")), "{text}");
+    let b = edited(&d, "c1");
+    assert_eq!(b.faces.len(), 7);
+    let v = brep_core::volume(&b).expect("volume");
+    assert!((v - 970.0).abs() <= 1e-9 * 970.0, "volume {v}");
+}
+
+#[test]
+fn a_fillet_naming_a_missing_edge_refuses_no_such_edge_by_name() {
+    let gone = brep_core::Name { op: brep_core::OpKind::Extrude, role: brep_core::Role::CapEnd, a: 9, b: 9 };
+    let (d, text) = cube_with(Stmt::Fillet { id: "f1".into(), on: "e1".into(), edges: vec![gone], r: 2.0 });
+    let r = replay(&d, d.tol);
+    assert_eq!(
+        r.failures,
+        vec![Failure { line: line_of(&text, "fillet f1"), id: "f1".into(), fault: Fault::NoSuchEdge("extrude cap_end 9 9".into()) }]
+    );
+    assert!(r.solids.iter().all(|s| s.id != "f1"), "a refused edit builds no solid");
+    // The statement stays in the document (never dropped).
+    assert!(write(&d).contains("fillet f1 on=e1 edges=[[extrude cap_end 9 9]] r=2"));
+}
+
+#[test]
+fn an_edge_name_reads_by_its_four_words_and_a_bad_word_refuses() {
+    let ok = format!("{CUBE}fillet f1 on=e1 edges=[[extrude cap_end 0 0] [extrude sweep 0 1]] r=1\n");
+    let d = read(&ok).expect("read");
+    let Some(Stmt::Fillet { edges, .. }) = d.stmts.last() else { panic!("a fillet") };
+    assert_eq!(edges.len(), 2);
+    assert_eq!(edges[1], brep_core::Name { op: brep_core::OpKind::Extrude, role: brep_core::Role::Sweep, a: 0, b: 1 });
+    let (_, _, what) = refused(&format!("{CUBE}fillet f1 on=e1 edges=[[extrude rim 0 0]] r=1\n"));
+    assert_eq!(what, What::BadValue { key: "edges".into() });
+    let (_, _, what) = refused(&format!("{CUBE}fillet f1 on=e1 edges=[] r=1\n"));
+    assert_eq!(what, What::BadValue { key: "edges".into() });
+    let (_, _, what) = refused(&format!("{CUBE}fillet f1 on=l1 edges=[[extrude cap_end 0 0]] r=1\n"));
+    assert_eq!(what, What::WrongTarget("l1".into()));
+}
+
+#[test]
+fn diff_sees_a_fillet_radius_change() {
+    let n = top_front_name();
+    let (a, _) = cube_with(Stmt::Fillet { id: "f1".into(), on: "e1".into(), edges: vec![n], r: 2.0 });
+    let (b, _) = cube_with(Stmt::Fillet { id: "f1".into(), on: "e1".into(), edges: vec![n], r: 3.0 });
+    let d = doc_core::diff(&a, &b);
+    assert_eq!(
+        d.entries,
+        vec![doc_core::Entry::Changed {
+            id: "f1".into(),
+            verb: "fillet".into(),
+            fields: vec![doc_core::Field { key: "r".into(), old: Some("2".into()), new: Some("3".into()) }],
+        }]
+    );
+}

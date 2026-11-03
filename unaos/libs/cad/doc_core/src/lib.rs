@@ -180,6 +180,12 @@ pub enum Stmt {
     /// An Op on a feature (BP-vug-3); the refused variants are data like the rest.
     Op { id: String, on: String, op: Op },
     Scan { id: String, path: String, pose: Pose, confidence: f64 },
+    // VUGFACEFILLET (SR511): a fillet / chamfer of the feature `on`'s edges, each edge named by its persistent brep_core
+    // `Name` (written as four words `[op role a b]`), resolved by replay against the feature's replayed solid.
+    /// brep_core `fillet` of radius `r` on the edges named `edges` of the solid of `on` (a feature or an earlier edit).
+    Fillet { id: String, on: String, edges: Vec<brep_core::Name>, r: f64 },
+    /// brep_core `chamfer`: `d1` along the face whose co-edge runs with the edge, `d2` along the other.
+    Chamfer { id: String, on: String, edges: Vec<brep_core::Name>, d1: f64, d2: f64 },
 }
 
 impl Stmt {
@@ -195,7 +201,7 @@ impl Stmt {
             | Stmt::Extrude { id, .. }
             | Stmt::Revolve { id, .. }
             | Stmt::Op { id, .. }
-            | Stmt::Scan { id, .. } => Some(id),
+            | Stmt::Scan { id, .. } | Stmt::Fillet { id, .. } | Stmt::Chamfer { id, .. } => Some(id), // VUGFACEFILLET (SR511)
             Stmt::Machine(m) => Some(&m.id),
             Stmt::Axis(_) | Stmt::Tool(_) | Stmt::Stock(_) | Stmt::Fixture(_) => None,
         }
@@ -315,6 +321,32 @@ pub(crate) const SIDES: [(&str, Side); 2] = [("outside", Side::Outside), ("insid
 pub(crate) const YESNO: [(&str, bool); 2] = [("yes", true), ("no", false)];
 pub(crate) const FACE_DIRS: [(&str, make_core::op::FaceDir); 2] =
     [("x", make_core::op::FaceDir::X), ("y", make_core::op::FaceDir::Y)];
+// VUGFACEFILLET (SR511): the words of a brep_core edge `Name` (ONE spelling each), read and written as `[op role a b]`.
+pub(crate) const OP_KINDS: [(&str, brep_core::OpKind); 6] = [
+    ("extrude", brep_core::OpKind::Extrude),
+    ("revolve", brep_core::OpKind::Revolve),
+    ("boolean", brep_core::OpKind::Boolean),
+    ("import", brep_core::OpKind::Import),
+    ("fillet", brep_core::OpKind::Fillet),
+    ("chamfer", brep_core::OpKind::Chamfer),
+];
+pub(crate) const ROLES: [(&str, brep_core::Role); 9] = [
+    ("cap_start", brep_core::Role::CapStart),
+    ("cap_end", brep_core::Role::CapEnd),
+    ("side", brep_core::Role::Side),
+    ("seam", brep_core::Role::Seam),
+    ("sweep", brep_core::Role::Sweep),
+    ("section", brep_core::Role::Section),
+    ("entity", brep_core::Role::Entity),
+    ("blend", brep_core::Role::Blend),
+    ("trim", brep_core::Role::Trim),
+];
+
+/// VUGFACEFILLET (SR511): an edge `Name` as its four words, `extrude cap_end 0 2` (the writer brackets it; replay's
+/// `NoSuchEdge` / `AmbiguousEdge` carry it).
+pub(crate) fn name_words(n: &brep_core::Name) -> String {
+    alloc::format!("{} {} {} {}", word_of(&OP_KINDS, n.op), word_of(&ROLES, n.role), n.a, n.b)
+}
 
 /// The word for `v` in `table` (every enum value has one).
 pub(crate) fn word_of<T: Copy + PartialEq>(table: &[(&'static str, T)], v: T) -> &'static str {

@@ -170,6 +170,8 @@ pub struct View {
     drag: Option<Drag>,
     /// VUGFACE2 (SR485): the sketch face, the body and the pull (sketch.rs); the drawn model is `design.shown()`.
     pub design: crate::sketch::Design,
+    /// VUGFACEFILLET (SR511): the edge tool (`f` fillet, Shift+f chamfer) while it is open (fillet.rs).
+    pub fillet: Option<crate::fillet::EdgeTool>,
     /// VUGFACEPHOTO (SR506): the opened photo — its underlay, the measured outline and the offered proposals (photo.rs).
     pub photo: Option<crate::photo::Photo>,
 }
@@ -178,7 +180,7 @@ impl View {
     /// A view at Home over `model`.
     pub fn new(model: &Model, size: (u32, u32), preset: Preset) -> View {
         let camera = Camera { eye: Vec3::zero(), yaw: 0.0, pitch: 0.0, fov_y: 30f32.to_radians() };
-        let mut v = View { camera, preset, size: (size.0.max(1), size.1.max(1)), picked: None, cursor: (0.0, 0.0), drag: None, design: Default::default(), photo: None };
+        let mut v = View { camera, preset, size: (size.0.max(1), size.1.max(1)), picked: None, cursor: (0.0, 0.0), drag: None, design: Default::default(), photo: None, fillet: None }; // VUGFACEFILLET (SR511): fillet
         v.home(model);
         v
     }
@@ -248,7 +250,7 @@ impl View {
 
     /// VUGFACE2 (SR485): the sketch overlay, drawn by `raster::render` over the frame.
     pub fn overlay(&self, fr: &mut crate::raster::Frame) {
-        crate::sketch::overlay(self, fr);
+        crate::sketch::overlay(self, fr); crate::fillet::overlay(self, fr); // VUGFACEFILLET (SR511): the edge tool over the sketch
         // VUGFACEPHOTO (SR506): the proposal glyphs and the corner note over the sketch.
         crate::photo::overlay(self, fr);
     }
@@ -300,7 +302,7 @@ impl View {
     pub fn key(&mut self, model: &Model, k: &str) -> bool {
         // VUGFACE2 (SR485): the body replaces the drawn model; the sketch face takes its keys first (l c a p e Esc).
         let shown = self.design.shown();
-        let model = shown.as_deref().unwrap_or(model);
+        let model = shown.as_deref().unwrap_or(model); if let Some(r) = crate::fillet::key(self, model, k) { return r; } // VUGFACEFILLET (SR511): the edge tool's keys first
         // VUGFACEPHOTO (SR506): the proposal keys (i, Tab, Enter / Backspace on the focused one) before the sketch's.
         if let Some(r) = crate::photo::key(self, k) {
             return r;
@@ -332,7 +334,7 @@ impl View {
         // VUGFACE2 (SR485): the body replaces the drawn model; a bare left press is the sketch face's first.
         let shown = self.design.shown();
         let model = shown.as_deref().unwrap_or(model);
-        self.cursor = (x, y);
+        self.cursor = (x, y); if let Some(r) = crate::fillet::press(self, model, button, mods, x, y) { return r; } // VUGFACEFILLET (SR511): a click re-picks the edge
         if let Some(r) = crate::sketch::press(self, button, mods, x, y) {
             return r;
         }

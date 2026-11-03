@@ -48,6 +48,11 @@ pub enum Fault {
     Make(make_core::Refusal),
     /// An Op in a document with no machine.
     NoMachine,
+    // VUGFACEFILLET (SR511): an edge name of a fillet / chamfer that does not resolve on the replayed solid.
+    /// No edge of the `on` solid carries this name (its four words): the reference no longer resolves.
+    NoSuchEdge(String),
+    /// More than one edge of the `on` solid carries this name (its four words).
+    AmbiguousEdge(String),
 }
 
 /// A failing statement: its line, its id (empty for none) and why.
@@ -260,7 +265,7 @@ pub fn replay(doc: &Doc, tol: Tol) -> Replay {
     let bt = tol; // VUGBREPSWAP (SR492): the document's Tol is brep_core's (geom_core's one Tol).
     let mut built: BTreeSet<String> = BTreeSet::new();
     for (i, s) in doc.stmts.iter().enumerate() {
-        let line = doc.line(i);
+        let line = doc.line(i); if edit_step(&mut r, &mut built, s, line, bt) { continue; } // VUGFACEFILLET (SR511): fillet / chamfer after their feature
         let (id, sketch, outer) = match s {
             Stmt::Extrude { id, sketch, outer, .. } | Stmt::Revolve { id, sketch, outer, .. } => (id, sketch, outer),
             _ => continue,
@@ -377,4 +382,50 @@ pub fn replay(doc: &Doc, tol: Tol) -> Replay {
     }
     r.failures.sort_by_key(|f| f.line);
     r
+}
+
+// ---- VUGFACEFILLET (SR511): a fillet / chamfer replays onto its feature's solid ----
+
+/// The fillet / chamfer statement `s` (true; any other statement is false and untouched): its `on` solid must have
+/// replayed (else `Upstream(on)`); each edge `Name` resolves to the ONE edge of that solid carrying it (`NoSuchEdge` /
+/// `AmbiguousEdge` by its words; brep_core has no edges-by-name lookup, VUG-BREP-EDGES-NAMED owed), and brep_core's
+/// `fillet` / `chamfer` runs on the resolved Ids. The result is this statement's own solid; the `on` solid stays.
+fn edit_step(r: &mut Replay, built: &mut BTreeSet<String>, s: &Stmt, line: u32, tol: Tol) -> bool {
+    let (id, on, edges) = match s {
+        Stmt::Fillet { id, on, edges, .. } | Stmt::Chamfer { id, on, edges, .. } => (id, on, edges),
+        _ => return false,
+    };
+    let src = if built.contains(on) { r.solids.iter().rev().find(|o| o.id == *on).map(|o| o.brep.clone()) } else { None };
+    let Some(src) = src else {
+        fail(r, line, id, Fault::Upstream(on.clone()));
+        return true;
+    };
+    let mut ids = Vec::new();
+    for n in edges {
+        let hits: Vec<brep_core::Id> = src.edges.iter().filter(|e| e.name == *n).map(|e| e.id).collect();
+        match hits.len() {
+            1 => ids.push(hits[0]),
+            0 => {
+                fail(r, line, id, Fault::NoSuchEdge(crate::name_words(n)));
+                return true;
+            }
+            _ => {
+                fail(r, line, id, Fault::AmbiguousEdge(crate::name_words(n)));
+                return true;
+            }
+        }
+    }
+    let got = match s {
+        Stmt::Fillet { r: rad, .. } => brep_core::fillet(&src, &ids, *rad, tol),
+        Stmt::Chamfer { d1, d2, .. } => brep_core::chamfer(&src, &ids, *d1, *d2, tol),
+        _ => return false,
+    };
+    match got {
+        Ok(brep) => {
+            built.insert(id.clone());
+            r.solids.push(SolidOut { id: id.clone(), brep });
+        }
+        Err(e) => fail(r, line, id, Fault::Brep(e)),
+    }
+    true
 }

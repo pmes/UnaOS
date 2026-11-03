@@ -17,6 +17,7 @@ use crate::{
     AXES, Cons, Doc, FACE_DIRS, FORMAT, KINEMATICS, MACHINE_KINDS, MachineStmt, POWER_KINDS, PRef, Pose, Refusal, SIDES, Stmt, YESNO,
     TOOL_KINDS, Tol, UNITS, VERSION, What, of_word,
 };
+use crate::{OP_KINDS, ROLES}; // VUGFACEFILLET (SR511)
 
 /// A lexed value and the column it starts at.
 #[derive(Clone, Debug)]
@@ -682,6 +683,22 @@ fn statement(t: Toks, line: u32, st: &mut State) -> Result<Stmt, Refusal> {
             f.done()?;
             Stmt::Op { id: st.declare(id, line, Kind::Op, None)?, on, op }
         }
+        // VUGFACEFILLET (SR511): `fillet <id> on=<feature> edges=[[op role a b] ...] r=` / `chamfer ... d1= d2=`; a
+        // feature itself, so an Op or a later edit may stand on it.
+        "fillet" | "chamfer" => {
+            let id = need_id(tid, line, vcol)?;
+            let on = f.target(st, "on", Kind::Feature)?;
+            let ev = f.req("edges")?;
+            let edges = edge_names(&ev, "edges", line)?;
+            let vals = if verb == "fillet" { [f.f64("r")?, 0.0] } else { [f.f64("d1")?, f.f64("d2")?] };
+            f.done()?;
+            let id = st.declare(id, line, Kind::Feature, None)?;
+            if verb == "fillet" {
+                Stmt::Fillet { id, on, edges, r: vals[0] }
+            } else {
+                Stmt::Chamfer { id, on, edges, d1: vals[0], d2: vals[1] }
+            }
+        }
         "scan" => {
             let id = need_id(tid, line, vcol)?;
             let path = f.text("path")?;
@@ -868,4 +885,29 @@ fn op_stmt(verb: &str, f: &mut Fields) -> Result<Op, Refusal> {
         }
         _ => Op::LaserCut { polylines: f.polys("polylines")?, passes: f.u32("passes")? },
     })
+}
+
+// ---- VUGFACEFILLET (SR511): the edge names of a fillet / chamfer ----
+
+/// `[[op role a b] ...]`: a non-empty list of brep_core `Name`s, each four words (the `OP_KINDS` / `ROLES` words and
+/// two u32); any other shape or word is `BadValue { key }` at the offending value.
+fn edge_names(v: &V, key: &str, line: u32) -> Result<Vec<brep_core::Name>, Refusal> {
+    let xs = list(v, key, line)?;
+    if xs.is_empty() {
+        return Err(bad(v, key, line));
+    }
+    let mut out = Vec::new();
+    for x in xs {
+        let w = list(x, key, line)?;
+        if w.len() != 4 {
+            return Err(bad(x, key, line));
+        }
+        out.push(brep_core::Name {
+            op: pick(&w[0], key, line, &OP_KINDS)?,
+            role: pick(&w[1], key, line, &ROLES)?,
+            a: int_max(&w[2], key, line, u32::MAX as u64)? as u32,
+            b: int_max(&w[3], key, line, u32::MAX as u64)? as u32,
+        });
+    }
+    Ok(out)
 }
