@@ -21,6 +21,10 @@
 //! * [`verify`] — a [`Proposal`] (one statement line) applied to a copy, replayed, and its residual checked against a
 //!   [`Measurement`] within [`K_SIGMA`] x sigma ([`Verdict`]); [`apply`] the one road into the document, [`verify_all`]
 //!   a batch in order (VUGINTENT, SR505; BP-vug-7: AI proposes, geometry disposes).
+//! * VUGINTENTSCAN (SR508): [`Measurement::Shapes`] (scan_core's shapes copied as [`ShapeRef`]s) verified against the
+//!   replayed faces; [`measurements_text`] the table Vein reads; [`standards`] the ISO 262 / 273 hole sizes
+//!   ([`nearest_standard`]); [`suggest`] the offline proposer (round sizes, standard holes, equal radii, axes,
+//!   concentric holes, bolt circles), every proposal still disposed by [`verify_all`].
 //!
 //! The grammar: `<verb> <id>? <key>=<value>...`; `#` starts a comment (outside a string) that runs to the end of the
 //! line; the first statement is the header `vug-doc version=1 lin=<f64> ang=<f64>` (the format, its version and the
@@ -42,10 +46,15 @@ mod diff;
 mod intent;
 mod lex;
 mod replay;
+pub mod standards;
+mod suggest;
 mod write;
 
 pub use diff::{Diff, Entry, Field, HEADER_ID, diff};
 pub use intent::{Batch, K_SIGMA, Measurement, Proposal, Reason, Verdict, apply, verify, verify_all};
+pub use intent::{ShapeParams, ShapeRef, measurements_text}; // VUGINTENTSCAN (SR508)
+pub use standards::{Class, METRIC, Standard, Thread, clearance_for, nearest_standard};
+pub use suggest::suggest;
 pub use lex::read;
 pub use replay::{Failure, Fault, Replay, SketchOut, SolidOut, brep_profile, replay};
 pub use write::{escape, f64_text, write};

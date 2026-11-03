@@ -13,6 +13,8 @@ description = "Vug's design document: the text form (one statement per line, git
 sketch_core = { path = "../sketch_core", default-features = false }
 brep_core = { path = "../brep_core", default-features = false }
 make_core = { path = "../make_core", default-features = false }
+# VUGINTENTSCAN (SR508, as ruled): the shape residual's angles (atan2 / atan) and suggest's rounding; already in the graph.
+libm = { version = "0.2", default-features = false }
 
 [features]
 default = ["std"]
