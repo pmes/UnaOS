@@ -155,3 +155,18 @@ fn the_header_tol_and_an_id_less_tool_are_named() {
     let c = edit(&a, "tool number=1 kind=flat_end dc=6 ", "tool number=1 kind=flat_end dc=8 ");
     assert_eq!(d(&a, &c).text(), "~ tool tool:1 dc: 6 -> 8\n");
 }
+
+// VUGBREPEDGESNAMED (LEDGER SR524): fillet / chamfer are ordered statements, so a reordered edit pair is a Moved.
+#[test]
+fn a_reordered_fillet_pair_is_one_moved() {
+    let a = doc_a();
+    // fl1 / fl2: doc_a already declares `fix f1`.
+    let f1 = "fillet fl1 on=e1 edges=[[extrude sweep 0 0]] r=1\n";
+    let f2 = "fillet fl2 on=e1 edges=[[extrude sweep 0 1]] r=1\n";
+    let old = format!("{a}{f1}{f2}");
+    let new = format!("{a}{f2}{f1}");
+    let r = d(&old, &new);
+    // doc_a's ordered statements are e1 e2 dr1 ct1 (1..4); the edits are 5 and 6.
+    assert_eq!(r.entries, [Entry::Moved { id: "fl2".into(), verb: "fillet".into(), from: 6, to: 5 }]);
+    assert_eq!(r.text(), "> fillet fl2 moved 6 -> 5\n");
+}

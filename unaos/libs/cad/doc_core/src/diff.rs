@@ -15,9 +15,9 @@
 //!   documents' Tol (BP-vug-2: per component the coarser of the two; `ang` for the radian keys — arc `start` / `end`,
 //!   revolve `angle`, the `angle` constraint's `angle`, tool `sig` — `lin` for every other).
 //! * The header's Tol is compared exactly, as a Changed on the pseudo-id [`HEADER_ID`].
-//! * Order is a change only where replay reads it: extrude, revolve and the Ops. The ids both documents hold, in the
-//!   new order and mapped to their old position, keep their longest increasing run (patience sort); each other one is
-//!   a [`Entry::Moved`] with its 1-based positions among the ordered statements.
+//! * Order is a change only where replay reads it: extrude, revolve, fillet / chamfer (SR524) and the Ops. The ids
+//!   both documents hold, in the new order and mapped to their old position, keep their longest increasing run
+//!   (patience sort); each other one is a [`Entry::Moved`] with its 1-based positions among the ordered statements.
 //! * The entries: the header change, the Removed in old order, then per statement of the new document its Moved,
 //!   its Changed, or its Added. [`Diff::text`] writes one line per change: `+ <statement>`, `- <statement>`,
 //!   `~ <verb> <id> <key>: <old> -> <new>` (an absent side `(none)`), `> <verb> <id> moved <from> -> <to>`.
@@ -180,9 +180,11 @@ fn keys(doc: &Doc) -> Vec<String> {
     out
 }
 
-/// The statements whose order replay reads: the features and the Ops.
+/// The statements whose order replay reads: the features, the edits (each solid pushed in statement order, an edit
+/// `on` an earlier edit) and the Ops.
 fn ordered(s: &Stmt) -> bool {
-    matches!(s, Stmt::Extrude { .. } | Stmt::Revolve { .. } | Stmt::Op { .. })
+    // VUGBREPEDGESNAMED (SR524): fillet / chamfer join the set, so a reordered edit is a Moved, not silence.
+    matches!(s, Stmt::Extrude { .. } | Stmt::Revolve { .. } | Stmt::Fillet { .. } | Stmt::Chamfer { .. } | Stmt::Op { .. })
 }
 
 /// The ordered statements both documents hold that left the longest increasing run: key -> (old, new) 1-based
