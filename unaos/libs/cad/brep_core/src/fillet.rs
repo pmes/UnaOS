@@ -133,7 +133,10 @@ fn edit(b: &Brep, ids: &[Id], kind: Kind, tol: Tol) -> Result<Brep, Refusal> {
     }
     let mut seen = vec![false; b.vertices.len()];
     for &e in &es {
-        for v in b.edges[e as usize].v {
+        // A closed edge (a cap circle) has one vertex at both ends: it is counted once.
+        let ev = b.edges[e as usize].v;
+        let ends: &[u32] = if ev[0] == ev[1] { &ev[..1] } else { &ev };
+        for &v in ends {
             if seen[v as usize] {
                 return Err(Refusal::CornerNotBlended { vertex: b.vertices[v as usize].id });
             }
