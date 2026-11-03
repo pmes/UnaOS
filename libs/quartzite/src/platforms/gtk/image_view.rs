@@ -72,6 +72,7 @@ pub fn bootstrap_image_surface_held(id: &str, synapse: Synapse) -> (NativeView, 
         });
         drawing_area.add_controller(click); { let drag = gtk4::GestureDrag::new(); let s = synapse.clone(); drag.connect_drag_begin(move |g, x, y| s.fire(SMessage::BrowserButton { down: true, x, y, mods: button_mods(g.current_event_state()), surface })); let s = synapse.clone(); drag.connect_drag_end(move |g, dx, dy| { if let Some((x, y)) = g.start_point() { s.fire(SMessage::BrowserButton { down: false, x: x + dx, y: y + dy, mods: button_mods(g.current_event_state()), surface }); } }); drawing_area.add_controller(drag); } // NLE2B (SR208): the press and the release (BrowserButton) for every drag; GestureClick sends no release past its threshold
     }
+    pointer_aux(&drawing_area, &synapse, surface, dim.clone()); // VUG-FACE-BUTTONS-GTK (SR488): the non-primary buttons, the wheel and the pinch (the controllers at the file tail)
     {
         let key = gtk4::EventControllerKey::new();
         let syn = synapse.clone();
@@ -345,4 +346,79 @@ fn button_mods(m: gtk4::gdk::ModifierType) -> u8 {
     .into_iter()
     .filter(|(mask, _)| m.intersects(*mask))
     .fold(0, |bits, (_, bit)| bits | bit)
+}
+
+/// VUG-FACE-BUTTONS-GTK (LEDGER SR488): the right / middle / extra buttons, the wheel and the pinch on the image surface,
+/// sent as the macOS surface sends them (SR477) through the pure fns of `super::wire`. Every drag still moves through the
+/// motion controller above (as the NLE2B drag does).
+fn pointer_aux(da: &DrawingArea, synapse: &Synapse, surface: u32, dim: Rc<RefCell<(u32, u32)>>) {
+    use super::wire;
+    use std::cell::Cell;
+    // The non-primary buttons: a GestureDrag on every button (`set_button(0)`), not a GestureClick (which sends no
+    // release past its drag threshold, so an orbit would never end). Its begin is the press, its end the release; the
+    // primary button is denied so the NLE2B drag keeps it, and the button held since the begin (0 when denied) is the
+    // one the end names, so the denied primary's end sends nothing (a cancelled aux drag still sends its release).
+    let aux = gtk4::GestureDrag::new();
+    aux.set_button(0);
+    let held = Rc::new(Cell::new(0u32));
+    {
+        let (s, d, w, h) = (synapse.clone(), dim.clone(), da.clone(), held.clone());
+        aux.connect_drag_begin(move |g, x, y| {
+            let button = g.current_button();
+            if wire::aux_button(button).is_none() {
+                h.set(0);
+                g.set_state(gtk4::EventSequenceState::Denied);
+                return;
+            }
+            h.set(button);
+            w.grab_focus();
+            if let Some(m) = wire::aux_wire(button, true, x, y, *d.borrow(), button_mods(g.current_event_state()), surface) {
+                s.fire(m);
+            }
+        });
+    }
+    {
+        let (s, d) = (synapse.clone(), dim.clone());
+        aux.connect_drag_end(move |g, dx, dy| {
+            let button = held.replace(0);
+            if let Some((x, y)) = g.start_point() {
+                if let Some(m) = wire::aux_wire(button, false, x + dx, y + dy, *d.borrow(), button_mods(g.current_event_state()), surface) {
+                    s.fire(m);
+                }
+            }
+        });
+    }
+    da.add_controller(aux);
+    // The wheel and the two-finger scroll, both axes.
+    let scroll = gtk4::EventControllerScroll::new(gtk4::EventControllerScrollFlags::BOTH_AXES);
+    {
+        let s = synapse.clone();
+        scroll.connect_scroll(move |c, dx, dy| {
+            let wheel = c.unit() == gtk4::gdk::ScrollUnit::Wheel;
+            if let Some(m) = wire::scroll_wire(dx, dy, wheel, button_mods(c.current_event_state()), surface) {
+                s.fire(m);
+            }
+            gtk4::glib::Propagation::Stop
+        });
+    }
+    da.add_controller(scroll);
+    // The pinch: GestureZoom's scale is absolute since its begin; the wire carries the increment.
+    let zoom = gtk4::GestureZoom::new();
+    let last = Rc::new(Cell::new(1.0f64));
+    {
+        let l = last.clone();
+        zoom.connect_begin(move |_, _| l.set(1.0));
+    }
+    {
+        let s = synapse.clone();
+        zoom.connect_scale_changed(move |g, scale| {
+            let mut prev = last.get();
+            let m = wire::pinch_wire(&mut prev, scale, g.bounding_box_center(), *dim.borrow(), surface);
+            last.set(prev);
+            if let Some(m) = m {
+                s.fire(m);
+            }
+        });
+    }
+    da.add_controller(zoom);
 }
