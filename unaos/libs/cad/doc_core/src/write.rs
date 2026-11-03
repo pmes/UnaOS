@@ -490,3 +490,11 @@ fn write_op(w: &mut W, id: &str, on: &str, op: &Op) {
         }
     }
 }
+
+/// VUGDOCDIFF (SR501): one statement as the writer's text, no header and no LF — the canonical `key=value` form
+/// (a fixed key order per verb) that `diff` reads field by field, so the field diff needs no per-variant code.
+pub(crate) fn stmt_text(s: &Stmt) -> String {
+    let mut w = W { out: String::new() };
+    stmt(&mut w, s);
+    w.out
+}
