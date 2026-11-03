@@ -435,6 +435,23 @@ fn banner(link: &mut dyn Transport, key: &str, wait: Duration) -> Result<Option<
     }
 }
 
+// --- VUGCOMSCANWS (LEDGER SR499): the WebSocket port strings and their opener arm (named hunk) ---
+
+/// The scheme that names a WebSocket link on the bus: `ws://host:port/path` (FluidNC on port 81, ESP3D).
+pub const WS_SCHEME: &str = "ws://";
+
+/// The TLS WebSocket scheme: routed to the ws opener, which refuses it by name (owed VUG-COMSCAN-WSS).
+pub const WSS_SCHEME: &str = "wss://";
+
+/// An opener that sends a name starting [`WS_SCHEME`] or [`WSS_SCHEME`] whole to `ws` (`crate::ws::opener`) and any
+/// other name to `rest` (the desk composes `with_ws(ws::opener(..), by_scheme(tty::opener(..), tcp::opener(..)))`;
+/// [`by_scheme`], `PumpDesk::apply` and [`serve_pump`] unchanged).
+pub fn with_ws(mut ws: Box<Opener>, mut rest: Box<Opener>) -> Box<Opener> {
+    Box::new(move |port: &str| -> Result<Box<dyn Transport + Send>, String> {
+        if port.starts_with(WS_SCHEME) || port.starts_with(WSS_SCHEME) { ws(port) } else { rest(port) }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

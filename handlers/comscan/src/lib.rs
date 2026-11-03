@@ -48,6 +48,7 @@ pub mod logview;
 pub mod pump; // VUGCOMSCAN1 (SR476): the pump, whose only entry is Helm's Verdict::Pass
 #[cfg(any(target_os = "linux", target_os = "macos"))] pub mod tty; // VUGCOMSCANTTY (SR484): the host serial port (termios) as the pump's Transport
 pub mod tcp; // VUGCOMSCANTCP (SR487): grblHAL / FluidNC raw TCP (tcp://host:port) as the pump's Transport
+pub mod ws; // VUGCOMSCANWS (SR499): FluidNC / ESP3D WebSocket (ws://host:port/path) as the pump's Transport over gneiss_pal's RFC 6455 client
 
 pub use logview::LogView;
 

@@ -12,6 +12,7 @@ pump_core = { path = "../../unaos/libs/cad/pump_core" }
 make_core = { path = "../../unaos/libs/cad/make_core" }
 helm = { path = "../../unaos/libs/sys/helm" }
 libc = "0.2" # VUGCOMSCANTTY (SR484): termios + TIOCEXCL + the 250000 speed ioctls for src/tty.rs (the installer's libc, Cargo.lock 0.2.190)
+gneiss_pal = { path = "../../libs/gneiss_pal" } # VUGCOMSCANWS (SR499): api::http::ws, the tree's RFC 6455 client (AETHERNET SR70), used whole by src/ws.rs
 
 [dev-dependencies]
 tokio = { version = "1.53", features = ["sync", "rt", "rt-multi-thread", "macros", "time"] }

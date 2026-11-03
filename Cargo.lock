@@ -805,6 +805,7 @@ name = "comscan"
 version = "0.1.0"
 dependencies = [
  "bandy",
+ "gneiss_pal",
  "helm",
  "libc",
  "make_core",
