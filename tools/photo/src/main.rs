@@ -102,8 +102,8 @@ fn detail(m: &Measured) -> String {
     let mut s = String::new();
     let _ = writeln!(
         s,
-        "photo: residual_mm={:.4} tilt_deg={:.2} lens_hint={:.4} line_width_mm={:.3} pitch_px={:.2} intersections={} inliers={} rect_px_per_mm={}",
-        m.residual_mm, m.tilt_deg, m.lens_hint, m.line_width_mm, m.pitch_px, m.intersections, m.inliers, m.rect_px_per_mm
+        "photo: residual_mm={:.4} tilt_deg={:.2} lens_hint={:.4} k1={:.4} line_width_mm={:.3} pitch_px={:.2} intersections={} inliers={} rect_px_per_mm={}",
+        m.residual_mm, m.tilt_deg, m.lens_hint, m.k1, m.line_width_mm, m.pitch_px, m.intersections, m.inliers, m.rect_px_per_mm
     );
     for (k, lp) in std::iter::once(&m.shape.outer).chain(m.shape.holes.iter()).enumerate() {
         for p in lp {
