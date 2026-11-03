@@ -196,3 +196,13 @@ pub fn opener(dialect: Dialect, connect: Duration) -> Box<crate::pump::Opener> {
         Ok(Box::new(p))
     })
 }
+
+// --- VUGCOMSCANWS (LEDGER SR499): the dialled socket handed to the WebSocket link (named tail hunk) ---
+
+impl Port {
+    /// The connected socket (TCP_NODELAY, nonblocking), for `crate::ws` to run its opening handshake over the same
+    /// dial and refusals.
+    pub(crate) fn into_stream(self) -> TcpStream {
+        self.stream
+    }
+}
