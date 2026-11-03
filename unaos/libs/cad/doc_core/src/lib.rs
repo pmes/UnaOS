@@ -25,6 +25,8 @@
 //!   replayed faces; [`measurements_text`] the table Vein reads; [`standards`] the ISO 262 / 273 hole sizes
 //!   ([`nearest_standard`]); [`suggest`] the offline proposer (round sizes, standard holes, equal radii, axes,
 //!   concentric holes, bolt circles), every proposal still disposed by [`verify_all`].
+//! * VUGDOCFROMSKETCH (SR516): [`from_sketch`] — the ONE sketch_core sketch -> statements writer (replay's inverse;
+//!   names through [`SketchNames`], [`PlainNames`] the plain `s` / `e<slot>` / `k<id>`).
 //!
 //! The grammar: `<verb> <id>? <key>=<value>...`; `#` starts a comment (outside a string) that runs to the end of the
 //! line; the first statement is the header `vug-doc version=1 lin=<f64> ang=<f64>` (the format, its version and the
@@ -43,6 +45,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 mod diff;
+mod from_sketch; // VUGDOCFROMSKETCH (SR516)
 mod intent;
 mod lex;
 mod replay;
@@ -51,6 +54,7 @@ mod suggest;
 mod write;
 
 pub use diff::{Diff, Entry, Field, HEADER_ID, diff};
+pub use from_sketch::{PlainNames, SketchNames, from_sketch, sketch_cons, sketch_pref}; // VUGDOCFROMSKETCH (SR516)
 pub use intent::{Batch, K_SIGMA, Measurement, Proposal, Reason, Verdict, apply, verify, verify_all};
 pub use intent::{ShapeParams, ShapeRef, measurements_text}; // VUGINTENTSCAN (SR508)
 pub use standards::{Class, METRIC, Standard, Thread, clearance_for, nearest_standard};
