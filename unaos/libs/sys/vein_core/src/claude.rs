@@ -465,6 +465,46 @@ pub fn error_message(body: &mut [u8]) -> Option<&str> {
     core::str::from_utf8(&body[r]).ok()
 }
 
+/// VUGVEINASK (LEDGER SR504): ONE user turn carrying image blocks, beside [`encode_body`] (which stays text-only):
+/// `{"model":..,"max_tokens":N,"stream":true[,"fallbacks":"default"][,"system":".."],"messages":[{"role":"user",
+/// "content":[<image>...,{"type":"text","text":".."}]}]}`. Each image is a base64 source block (the Messages API
+/// Vision form `{"type":"image","source":{"type":"base64","media_type":..,"data":..}}`), placed before the text as
+/// the docs advise; `texts` are joined into the one text block. `None` = `out` too small, or every text empty (the
+/// API refuses an empty text block). The limits are [`crate::propose::check`]'s.
+pub fn encode_image_body(p: &Params<'_>, images: &[crate::propose::ImageRef<'_>], texts: &[&str], out: &mut [u8]) -> Option<usize> {
+    if texts.iter().all(|t| t.is_empty()) {
+        return None;
+    }
+    let mut o = Out::new(out);
+    o.put(b"{\"model\":\"");
+    json::escape_into(p.model.as_bytes(), &mut o);
+    o.put(b"\",\"max_tokens\":");
+    o.dec(p.max_tokens as u64);
+    o.put(b",\"stream\":true");
+    if p.fallbacks {
+        o.put(b",\"fallbacks\":\"default\"");
+    }
+    if !p.system.is_empty() {
+        o.put(b",\"system\":\"");
+        json::escape_into(p.system.as_bytes(), &mut o);
+        o.put(b"\"");
+    }
+    o.put(b",\"messages\":[{\"role\":\"user\",\"content\":[");
+    for im in images {
+        o.put(b"{\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":\"");
+        json::escape_into(im.media_type.as_bytes(), &mut o);
+        o.put(b"\",\"data\":\"");
+        crate::propose::base64_into(im.bytes, &mut o);
+        o.put(b"\"}},");
+    }
+    o.put(b"{\"type\":\"text\",\"text\":\"");
+    for t in texts {
+        json::escape_into(t.as_bytes(), &mut o);
+    }
+    o.put(b"\"}]}]}");
+    o.done()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

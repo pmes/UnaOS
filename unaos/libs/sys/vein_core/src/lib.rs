@@ -25,6 +25,9 @@
 //!   conversations sidebar's index (list, new, switch, rename, trash path, search); [`fixture`] — the fixture
 //!   provider (one recorded stream per dialect and a replaying transport) the host tests and `tests lumen` drive.
 //! * [`model`] / [`context`] (feature `alloc`) — the conversation model and the pure context assembler.
+//! * VUGVEINASK (LEDGER SR504): [`propose`] — Vug's one structured exchange: the fixed system prompt, the design
+//!   document, the measurements and the photos as image blocks (both dialects), and the strict parse of the JSON
+//!   proposal list (`stmt`, `confidence`, `why`), every deviation refused by name; offline the answer is `[]`.
 #![no_std]
 #![forbid(unsafe_code)]
 
@@ -42,6 +45,7 @@ pub mod history;
 pub mod json;
 pub mod md;
 pub mod prefs;
+pub mod propose;
 pub mod provider;
 pub mod role;
 pub mod scroll;

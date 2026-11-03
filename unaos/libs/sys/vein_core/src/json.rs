@@ -283,3 +283,87 @@ pub fn uint(v: &[u8]) -> Option<u32> {
     }
     Some(n as u32)
 }
+
+/// VUGVEINASK (LEDGER SR504): the end (exclusive) of the ONE JSON value at the start of `b` (after whitespace), or
+/// `None` when it does not scan — the walk [`get`] and [`index`] skip values with, for a caller that must know
+/// whether anything follows the value (the propose answer: prose after the array is refused).
+pub fn value_end(b: &[u8]) -> Option<usize> {
+    skip_value(b, 0)
+}
+
+/// VUGVEINASK: entry `n` of a JSON object value as (the key's raw bytes between its quotes, the raw value), or
+/// `None` past its end or when `obj` is not an object — [`index`] for objects, the walk [`get`] does, so a caller
+/// can see every key (an extra or a repeated one), not just the first match.
+pub fn entry(obj: &[u8], n: usize) -> Option<(&[u8], &[u8])> {
+    let mut i = ws(obj, 0);
+    if obj.get(i) != Some(&b'{') {
+        return None;
+    }
+    i += 1;
+    let mut k = 0usize;
+    loop {
+        i = ws(obj, i);
+        match *obj.get(i)? {
+            b'}' => return None,
+            b',' => {
+                i += 1;
+                continue;
+            }
+            b'"' => {}
+            _ => return None,
+        }
+        let ke = skip_str(obj, i)?;
+        let key = &obj[i + 1..ke - 1];
+        i = ws(obj, ke);
+        if obj.get(i) != Some(&b':') {
+            return None;
+        }
+        let vs = ws(obj, i + 1);
+        let ve = skip_value(obj, vs)?;
+        if k == n {
+            return Some((key, &obj[vs..ve]));
+        }
+        k += 1;
+        i = ve;
+    }
+}
+
+/// VUGVEINASK: a raw JSON number value (RFC 8259 §6: `-? (0 | [1-9][0-9]*) (. [0-9]+)? ([eE] [+-]? [0-9]+)?`,
+/// checked byte by byte, then core's `f64` parse), beside [`uint`]; `None` for anything else (a string, `+1`,
+/// `.5`, `01`, `inf`).
+pub fn number(v: &[u8]) -> Option<f64> {
+    let digits = |mut i: usize| {
+        while i < v.len() && v[i].is_ascii_digit() {
+            i += 1;
+        }
+        i
+    };
+    let mut i = usize::from(v.first() == Some(&b'-'));
+    let int = i;
+    i = digits(i);
+    if i == int || (v[int] == b'0' && i - int > 1) {
+        return None;
+    }
+    if v.get(i) == Some(&b'.') {
+        let f = i + 1;
+        i = digits(f);
+        if i == f {
+            return None;
+        }
+    }
+    if matches!(v.get(i), Some(b'e' | b'E')) {
+        i += 1;
+        if matches!(v.get(i), Some(b'+' | b'-')) {
+            i += 1;
+        }
+        let e = i;
+        i = digits(e);
+        if i == e {
+            return None;
+        }
+    }
+    if i != v.len() {
+        return None;
+    }
+    core::str::from_utf8(v).ok()?.parse::<f64>().ok()
+}
