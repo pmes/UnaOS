@@ -1,0 +1,23 @@
+# ./arroyo knoboff sonderec 9033e50df — seat, 2026-11-03, tip 99fb2a781 (SR491 folded), UNAOS_KNOBOFF_WITH_ENV=1 UNAOS_SONDE=1. FAIL by cause: probe_core (pulled by `sonde`, armed on both sides) gained the motion record (wire.rs / recording.rs), so the sonde image moved on both arches; the sonderec-gated kernel files are not the cause. The SR491 LEDGER row carries the read.
+     it paid for the deps, or it compiled nothing at all. Either way it is a WARM-UP and its
+     images are discarded: rebuilding the kernel alone against the now-warm cache and scoring
+     THAT — one extra kernel-only compile per arch, which is what the claim costs.
+⚡ [3/3] current tree, knob ON (control — the comparison must be able to come out unequal)...
+   knoboff: warm=yes compiled_baseline=[unaos-kernel|unaos-kernel] compiled_tree=[unaos-kernel|unaos-kernel]   (x86|arm)
+   user_blob  baseline absent   tree absent   (include_bytes! payload, arch/aarch64/syscall.rs)
+   control    x86 armed≠off: YES   arm armed≠off: YES
+   ❌ x86 knob-off image MOVED
+      baseline a0cf90e59ab7b1f3ccbeac8a0a5be113f4421f1c124d6eebdb189f7631329808 5865424
+      current  6145b0e261bd9dc26d9bcf84ef6dcb5fe0205ac2a48306fc7ce823ade734f791 5865424
+      1622 byte(s) differ
+   ❌ arm knob-off image MOVED
+      baseline ea1f84be35df8aa49f6eb53091ca6a0b2faa7356cd11e932b26bc14b761d0a56 5661504
+      current  8c07acf3597fbe9e89ed3e99828ce257c1de1067877b59a022b4535400c15dcf 5661440
+      150281 byte(s) differ — and the SIZE changed, so this is code, not a line shift
+knoboff: FAIL — the knob-off image is not the baseline's. If nothing here is meant to be
+         armed by default, the usual cause is a LINE SHIFT: an inserted line moves every
+         panic::Location below it. Append onto an existing line (before its first //) or
+         put the statement inside an existing cfg region. EXECUTOR-BRIEF §5.
+   run directory KEPT for inspection: /root/unaos-bench/scratch/knoboff/caller-UnaOS-bbc2194accb6/run-20261103-211732Z-23808
+   (flat-{base,cur,armed}-{x86,arm}.bin · census-*.txt · worktree.patch · build.log)
+rc=1
