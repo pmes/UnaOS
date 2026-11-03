@@ -48,7 +48,7 @@ pub mod tsdf;
 
 use alloc::vec::Vec;
 
-pub use fit::{Cylinder, Fit, FitError, fit_cylinder, fit_plane};
+pub use fit::{Cone, Cylinder, Fit, FitError, Floor, Primitive, Shape, Sphere, detect, fit_cylinder, fit_plane};
 pub use geom::{Plane, Tol, Transform, Vec3};
 pub use mesh::{Mesh, Topo};
 pub use pose::{ModelMap, Surfel, TrackError, TrackParams, Tracked, Tracker, raycast};

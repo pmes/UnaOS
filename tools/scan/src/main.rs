@@ -45,11 +45,14 @@
 //!   blank lines and `#` lines skipped; R must be a rotation (|RᵀR − I| ≤ [`POSE_RIGID`], det > 0).
 //!
 //! The run is scan_core's: `Tsdf::new(voxel, trunc)` (default 4 mm, 3 × voxel), `integrate` per frame, `extract`,
-//! then `fit_plane` over every vertex (band `--band` mm, default 3, and 15°) and `fit_cylinder` over the vertices
-//! farther than the band from that plane, with their TSDF normals. The mesh goes out through `mesh_core::ply::write`
-//! (binary little-endian). The report (stdout, and `--report`) names the input, the intrinsics' source, frames,
-//! vertices, triangles, confidence, boundary loops, both fits' residuals or their refusal, and a `scan:` line in
-//! scan_core's own test token shape. A refusal prints `scan: refused <Name> {..}` and exits 1; usage exits 2.
+//! then `fit_plane` over every vertex (band `--band` mm, default 3, and 15°) and scan_core's `detect` (VUGSCANSHAPES,
+//! LEDGER SR497: Schnabel's multi-shape loop, `Floor::DEFAULT`) over every vertex with its TSDF normal. The mesh goes
+//! out through `mesh_core::ply::write` (binary little-endian). The report (stdout, and `--report`) names the input, the
+//! intrinsics' source, frames, vertices, triangles, confidence, boundary loops, the plane fit's residuals or its
+//! refusal, the `cylinder:` line from detect's best-supported cylinder or `cylinder: none (support < floor)` (no
+//! number for a cylinder the cloud does not support), `shapes: n=` and one `shape:` line per detected shape with its
+//! support, fraction and rms, and a `scan:` line in scan_core's own test token shape. A refusal prints
+//! `scan: refused <Name> {..}` and exits 1; usage exits 2.
 
 use std::fmt::Write as _;
 use std::path::Path;
@@ -57,8 +60,8 @@ use std::path::Path;
 use probe_core::recording::{self, RecordingError};
 use probe_core::{FrameError, StreamKind};
 use scan_core::{
-    Cylinder, DepthScale, Fit, FitError, Frame, Intrinsics, PixelFormat, Plane, ScanError, Tol, Topo, TrackError, Tracker,
-    Transform, Tsdf, Vec3, extract, fit_cylinder, fit_plane,
+    DepthScale, Fit, FitError, Floor, Frame, Intrinsics, PixelFormat, Plane, Primitive, ScanError, Shape, Tol, Topo, TrackError,
+    Tracker, Transform, Tsdf, Vec3, detect, extract, fit_plane,
 };
 
 /// |RᵀR − I| bound for a `--poses` rotation: the rounding of a matrix printed to 6 decimals.
@@ -454,14 +457,11 @@ fn run(a: &Args) -> Result<String, Refusal> {
     let loops: Result<Vec<Vec<u32>>, Topo> = sm.mesh.boundary_loops();
     let band = Tol { lin: a.band, ang: BAND_DEG.to_radians() };
     let plane: Result<Fit<Plane>, FitError> = fit_plane(&sm.mesh.positions, band);
-    let (mut cp, mut cn) = (Vec::new(), Vec::new());
-    for (i, &p) in sm.mesh.positions.iter().enumerate() {
-        if plane.as_ref().map_or(true, |f| f.shape.signed_distance(p).abs() > a.band) {
-            cp.push(p);
-            cn.push(sm.normals[i]);
-        }
-    }
-    let cyl: Result<Fit<Cylinder>, FitError> = fit_cylinder(&cp, &cn, band);
+    // VUGSCANSHAPES (SR497): every shape the mesh supports above the floor; the cylinder line is detect's best-supported
+    // cylinder (the shapes are ordered by support), never a fit over whatever is left off the plane.
+    let detected: Result<Vec<Shape>, FitError> = detect(&sm.mesh.positions, &sm.normals, band, Floor::DEFAULT);
+    let shapes: &[Shape] = detected.as_deref().unwrap_or(&[]);
+    let cyl = shapes.iter().find_map(|s| if let Primitive::Cylinder(c) = s.kind { Some((c, s)) } else { None });
 
     // The PLY: scan_core's mesh IS mesh_core's (VUGSHIMSWAP SR473), straight into mesh_core's writer.
     let out = a.out.as_deref().unwrap_or_default();
@@ -525,25 +525,26 @@ fn run(a: &Args) -> Result<String, Refusal> {
         }
     }
     match &cyl {
-        Ok(f) => {
+        Some((c, s)) => {
             let _ = writeln!(
                 r,
                 "cylinder: axis={} point={} r={:.3} rms_mm={:.3} max_mm={:.3} inliers={} outliers={}",
-                v3(f.shape.axis),
-                v3(f.shape.point),
-                f.shape.radius,
-                f.rms_mm,
-                f.max_mm,
-                f.inliers,
-                f.outliers
+                v3(c.axis),
+                v3(c.point),
+                c.radius,
+                s.rms_mm,
+                s.max_mm,
+                s.support,
+                sm.mesh.positions.len() - s.support as usize
             );
         }
-        Err(e) => {
-            let _ = writeln!(r, "cylinder: refused {e:?}");
+        None => {
+            let _ = writeln!(r, "cylinder: none (support < floor)");
         }
     }
+    shapes_report(&mut r, &detected);
     let plane_s = plane.as_ref().map_or("refused".into(), |f| format!("{:.3} normal={}", f.rms_mm, v3(f.shape.normal)));
-    let cyl_s = cyl.as_ref().map_or("refused".into(), |f| format!("{:.3} rms={:.3}", f.shape.radius, f.rms_mm));
+    let cyl_s = cyl.as_ref().map_or("none".into(), |(c, s)| format!("{:.3} rms={:.3}", c.radius, s.rms_mm));
     let _ = writeln!(
         r,
         "scan: frames={} verts={} tris={} loops={loops_s} plane rms={plane_s} cyl r={cyl_s}",
@@ -552,6 +553,29 @@ fn run(a: &Args) -> Result<String, Refusal> {
         sm.mesh.triangles.len()
     );
     Ok(r)
+}
+
+/// VUGSCANSHAPES (SR497): `shapes: n=<k>` and one `shape:` line per detected shape, by support.
+fn shapes_report(r: &mut String, detected: &Result<Vec<Shape>, FitError>) {
+    let shapes = match detected {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = writeln!(r, "shapes: refused {e:?}");
+            return;
+        }
+    };
+    let _ = writeln!(r, "shapes: n={}", shapes.len());
+    for s in shapes {
+        let params = match s.kind {
+            Primitive::Plane(p) => format!("normal={} d={:.3}", v3(p.normal), p.d),
+            Primitive::Cylinder(c) => format!("axis={} point={} r={:.3}", v3(c.axis), v3(c.point), c.radius),
+            Primitive::Sphere(p) => format!("centre={} r={:.3}", v3(p.centre), p.radius),
+            Primitive::Cone(c) => {
+                format!("apex={} axis={} half_angle_deg={:.3}", v3(c.apex), v3(c.axis), c.half_angle.to_degrees())
+            }
+        };
+        let _ = writeln!(r, "shape: {} support={} frac={:.4} rms={:.3} {params}", s.kind.name(), s.support, s.fraction, s.rms_mm);
+    }
 }
 
 fn main() {

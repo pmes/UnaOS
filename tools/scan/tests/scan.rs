@@ -243,6 +243,9 @@ fn a_tracked_prb_recording_fuses_without_poses() {
     assert_eq!(field(&report, "track: frames=", "tracked"), "10");
     assert_eq!(field(&report, "frames=", "frames"), "11");
     assert!(report.lines().any(|l| l == "track: frame=6 lost no_depth"), "{report}");
+    // VUGSCANSHAPES (SR497): the cylinder is detect's above the floor, or none — never SR493's 27-inlier r=68.9.
+    let cyl = report.lines().find(|l| l.starts_with("cylinder:")).expect("a cylinder line");
+    assert!(cyl == "cylinder: none (support < floor)" || (field(&report, "cylinder:", "r").parse::<f64>().unwrap() - 40.0).abs() < 4.0, "{cyl}");
 
     // The three pose roads are exclusive.
     let o = scan(&[inp.to_str().unwrap(), "-o", ply.to_str().unwrap(), "--track", "--poses", "x.txt"]);
