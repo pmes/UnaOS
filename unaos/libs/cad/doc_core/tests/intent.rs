@@ -248,12 +248,13 @@ fn batch_text_names_each() {
 /// The measured plate's two holes: 6.4 mm across, centred on the plate's mid-height.
 const HOLES: [(f64, f64); 2] = [(10.0, 15.1), (39.7, 15.1)];
 
-/// The plate as drawn from the photo: BASE plus a centre point and a 3.2 circle per hole.
+/// The plate as drawn from the photo: BASE plus a centre point and a 3.2 circle per hole (ids k1 / k2: one
+/// namespace, and SIX already takes h1 / h2).
 fn plate() -> Doc {
     let mut t = String::from(BASE);
     for (k, (x, y)) in HOLES.iter().enumerate() {
         let n = k + 1;
-        t.push_str(&format!("point c{n} sketch=s x={x} y={y}\ncircle h{n} sketch=s centre=c{n} r=3.2\n"));
+        t.push_str(&format!("point c{n} sketch=s x={x} y={y}\ncircle k{n} sketch=s centre=c{n} r=3.2\n"));
     }
     read(&t).unwrap()
 }
@@ -281,8 +282,8 @@ fn plate_outline() -> Measurement {
 fn plate_with_holes_accepts_diameters_and_refuses_a_moved_hole() {
     let d = plate();
     let mut v: Vec<&str> = SIX.to_vec();
-    v.push("diameter dh1 sketch=s circle=h1 d=6.5");
-    v.push("diameter dh2 sketch=s circle=h2 d=6.5");
+    v.push("diameter dh1 sketch=s circle=k1 d=6.5");
+    v.push("diameter dh2 sketch=s circle=k2 d=6.5");
     let b = verify_all(&d, &ps(&v), &plate_outline(), d.tol);
     assert_eq!(b.accepted(), 8, "{}", b.text());
     for (s, _, v) in &b.entries {
@@ -306,10 +307,11 @@ fn plate_with_holes_accepts_diameters_and_refuses_a_moved_hole() {
 
 #[test]
 fn hole_without_a_measured_loop_refused_by_name() {
-    let d = read(&format!("{BASE}point c1 sketch=s x=10 y=15.1\ncircle h1 sketch=s centre=c1 r=3.2\n")).unwrap();
+    let d = read(&format!("{BASE}point c1 sketch=s x=10 y=15.1\ncircle k1 sketch=s centre=c1 r=3.2\n")).unwrap();
     let v = verify(&d, &p(SIX[0]), &outline(), d.tol);
     assert_eq!(v, Verdict::Refuse { why: Reason::UnmatchedLoop { replayed: 2, measured: 1 } });
     if let Verdict::Refuse { why } = v {
         assert_eq!(why.text(), "unmatched-loop replayed=2 measured=1");
     }
 }
+
