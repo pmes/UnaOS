@@ -36,6 +36,7 @@ extern crate alloc;
 pub mod gcode;
 pub mod geom;
 pub mod machine;
+mod offset;
 pub mod op;
 pub mod plan;
 pub mod program;

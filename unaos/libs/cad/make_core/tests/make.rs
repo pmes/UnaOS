@@ -167,8 +167,8 @@ fn contour_refusals_by_name() {
 #[test]
 fn unbuilt_ops_refuse_with_their_owed_id() {
     let m = mill();
-    let pocket = Op::Pocket2_5D { outline: square(), islands: vec![], depth: 1.0, stepover: 1.0, tool: 2 };
-    assert_eq!(generate(&pocket, &m, T), Err(Refusal::OpOwed { op: "Pocket2_5D", owed: "VUG-MAKE-POCKET" }));
+    let laser = Op::LaserCut { polylines: vec![square()], passes: 1 };
+    assert_eq!(generate(&laser, &m, T), Err(Refusal::OpOwed { op: "LaserCut", owed: "VUG-MAKE-LASER" }));
     let print = Op::PrintLayers { slices: vec![], tool: 1 };
     assert_eq!(generate(&print, &m, T), Err(Refusal::OpOwed { op: "PrintLayers", owed: "VUG-MAKE-SLICE" }));
 }
