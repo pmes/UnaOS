@@ -13,9 +13,10 @@
 
 //! The gate-invariant test battery for the machine gate (VUGHELM, LEDGER SR475).
 //!
-//! Every invariant G1–G8 from `helm::machine`'s module doc gets its own named test below. Every review is make_core's
+//! Every invariant G1–G9 from `helm::machine`'s module doc gets its own named test below. Every review is make_core's
 //! real `review` of a program on a mill in make_core's own test fixture shape — never a hand-built `Review`; G8's
 //! unbound leg derives one from a real review by removing its `FirstRun` ask (VUG-HELM-BIND, LEDGER SR489).
+//! G9 reviews one program on two machines (VUG-HELM-BIND-MACHINE, LEDGER SR498).
 
 use helm::machine::{Approved, Level, Policy, Verdict, approve, gate};
 use make_core::{
@@ -132,7 +133,7 @@ fn g2_an_approved_digest_passes_and_a_changed_program_does_not() {
     let r = rev(&p);
     assert_eq!(gate(&r, &pol, &approved), Verdict::Ask(vec![Ask::FirstRun { digest: p.digest() }]));
     assert!(approve(&mut approved, p.digest(), "peter", 1_000));
-    assert_eq!(gate(&r, &pol, &approved), Verdict::Pass { digest: p.digest() });
+    assert_eq!(gate(&r, &pol, &approved), Verdict::Pass { digest: p.digest(), machine: mill().digest() });
     // The same program reviewed again still passes.
     assert!(gate(&rev(&safe(30.0)), &pol, &approved).is_pass());
     // One move changed: a new digest, asked again.
@@ -174,7 +175,7 @@ fn g3_never_refuses_the_ask_by_name() {
 #[test]
 fn g4_pass_level_drops_the_ask() {
     let pol = Policy { first_run: Level::Pass, tool_change: Level::Pass, power_above: Level::Pass };
-    assert_eq!(gate(&rev(&busy()), &pol, &Approved::default()), Verdict::Pass { digest: busy().digest() });
+    assert_eq!(gate(&rev(&busy()), &pol, &Approved::default()), Verdict::Pass { digest: busy().digest(), machine: mill().digest() });
     let pol = Policy { tool_change: Level::Pass, ..Policy::default() };
     let p = busy();
     assert_eq!(
@@ -250,13 +251,13 @@ fn g8_a_pass_names_the_program_it_passed() {
     approve(&mut approved, q.digest(), "peter", 2);
     // The same asks on two programs: each pass names its own program, and the two passes differ.
     let (vp, vq) = (gate(&rev(&p), &pol, &approved), gate(&rev(&q), &pol, &approved));
-    assert_eq!(vp, Verdict::Pass { digest: p.digest() });
-    assert_eq!(vq, Verdict::Pass { digest: q.digest() });
+    assert_eq!(vp, Verdict::Pass { digest: p.digest(), machine: mill().digest() });
+    assert_eq!(vq, Verdict::Pass { digest: q.digest(), machine: mill().digest() });
     assert_ne!(vp, vq, "a pass for one program is not a pass for another");
     // A pass at the all-Pass levels still names the program it was issued for.
     let all = Policy { first_run: Level::Pass, tool_change: Level::Pass, power_above: Level::Pass };
     let b = busy();
-    assert_eq!(gate(&rev(&b), &all, &Approved::default()), Verdict::Pass { digest: b.digest() });
+    assert_eq!(gate(&rev(&b), &all, &Approved::default()), Verdict::Pass { digest: b.digest(), machine: mill().digest() });
     // A review that names no program (its FirstRun removed) is Unbound, never a Pass, under every policy.
     let mut r = rev(&b);
     r.asks.retain(|a| !matches!(a, Ask::FirstRun { .. }));
@@ -265,4 +266,54 @@ fn g8_a_pass_names_the_program_it_passed() {
         let v = gate(&r, pol, &approved);
         assert!(!v.is_pass(), "{pol:?} passed a review that names no program as {v:?}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// G9 — a pass names its machine (VUG-HELM-BIND-MACHINE, SR498): the same program passed on two machines is two passes;
+// the machine's identity ignores its setup and state.
+// ---------------------------------------------------------------------------
+
+/// A 100 mm desktop router: the mill's tools and spindle, a smaller envelope that still holds the `safe` slot.
+fn router() -> Machine {
+    Machine {
+        axes: vec![axis(AxisId::X, -10.0, 110.0), axis(AxisId::Y, -10.0, 110.0), axis(AxisId::Z, -30.0, 40.0)],
+        envelope: Aabb3 { min: Vec3::new(0.0, 0.0, -20.0), max: Vec3::new(100.0, 100.0, 30.0) },
+        ..mill()
+    }
+}
+
+#[test]
+fn g9_a_pass_names_the_machine_it_passed() {
+    let (a, b) = (mill(), router());
+    assert_ne!(a.digest(), b.digest(), "two machines, two identities");
+    let p = safe(30.0);
+    let mut approved = Approved::default();
+    approve(&mut approved, p.digest(), "peter", 1);
+    let (ra, rb) = (review(&p, &a, T), review(&p, &b, T));
+    assert_eq!((ra.refusals.len(), rb.refusals.len()), (0, 0), "{:?} {:?}", ra.refusals, rb.refusals);
+    assert_eq!((ra.machine, rb.machine), (a.digest(), b.digest()), "the review names the machine it was made for");
+    let pol = Policy::default();
+    let (va, vb) = (gate(&ra, &pol, &approved), gate(&rb, &pol, &approved));
+    assert_eq!(va, Verdict::Pass { digest: p.digest(), machine: a.digest() });
+    assert_eq!(vb, Verdict::Pass { digest: p.digest(), machine: b.digest() });
+    assert_ne!(va, vb, "a pass for one machine is not a pass for another");
+
+    // The setup and the state are not the machine: the identity holds through them.
+    let mut set = mill();
+    set.stock = None;
+    set.fixtures.clear();
+    set.loaded = None;
+    set.safe_z = 10.0;
+    set.power.ask_above = 20000.0;
+    assert_eq!(set.digest(), a.digest(), "stock, fixtures, loaded tool, safe Z and the ask threshold are not identity");
+    // The identity is: an envelope, a tool or the power axis changed is another machine.
+    let mut env = mill();
+    env.envelope.max.x = 90.0;
+    assert_ne!(env.digest(), a.digest());
+    let mut tool = mill();
+    tool.tools[1].dc = 6.0;
+    assert_ne!(tool.digest(), a.digest());
+    let mut power = mill();
+    power.power.kind = PowerKind::Laser;
+    assert_ne!(power.digest(), a.digest());
 }

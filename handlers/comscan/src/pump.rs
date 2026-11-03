@@ -21,13 +21,18 @@
 //!
 //! VUG-HELM-BIND (LEDGER SR489): Helm's `Verdict::Pass { digest }` names the program it passed, and [`start`] checks
 //! it against `Program::digest()`, refusing [`Refused::Unbound`] by both digests: a pass issued for one program never
-//! pumps another. The machine is not in the pass yet (VUG-HELM-BIND-MACHINE owed).
+//! pumps another.
+//!
+//! VUG-HELM-BIND-MACHINE (LEDGER SR498): the pass names the machine too (`Verdict::Pass { digest, machine }`, the
+//! reviewed `make_core::Machine::digest`). A [`PumpDesk`] is built for the machine the operator declares behind its
+//! ports ([`PumpDesk::new`]), and [`start`] refuses a pass naming another machine as [`Refused::WrongMachine`] by both
+//! identities: a pass planned for a 300 mm envelope never pumps to a 100 mm router.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bandy::{PumpEvent, SMessage, Synapse};
-use make_core::Program;
+use make_core::{Machine, Program};
 use make_core::gcode::Dialect;
 use pump_core::{Event, Pump, PumpRefusal, PumpState, StatusReport, Transport};
 use tokio::sync::broadcast::Receiver;
@@ -48,14 +53,22 @@ pub enum Refused {
     /// VUG-HELM-BIND (SR489): the pass was issued for the program `passed` (or names none: Helm's `Unbound`), not
     /// for `program`, the one asked to start.
     Unbound { passed: Option<u64>, program: u64 },
+    /// VUG-HELM-BIND-MACHINE (SR498): the pass was issued for the machine `passed` (its `Machine::digest`), not for
+    /// `desk`, the machine this pump would drive.
+    WrongMachine { passed: u64, desk: u64 },
 }
 
-/// The only way Comscan makes a pump: a `Verdict::Pass` for `p` (VUG-HELM-BIND: by digest), then make_core's text
-/// for `p` in `d`.
-pub fn start(v: &Verdict, p: &Program, d: Dialect) -> Result<Pump, Refused> {
+/// The only way Comscan makes a pump: a `Verdict::Pass` for `p` (VUG-HELM-BIND: by digest) on `m` (VUG-HELM-BIND-MACHINE:
+/// by identity), then make_core's text for `p` in `d`.
+pub fn start(v: &Verdict, p: &Program, d: Dialect, m: &Machine) -> Result<Pump, Refused> {
     match v {
-        Verdict::Pass { digest } if *digest == p.digest() => Pump::from_program(p, d).map_err(Refused::Pump),
-        Verdict::Pass { digest } => Err(Refused::Unbound { passed: Some(*digest), program: p.digest() }),
+        Verdict::Pass { digest, .. } if *digest != p.digest() => {
+            Err(Refused::Unbound { passed: Some(*digest), program: p.digest() })
+        }
+        Verdict::Pass { machine, .. } if *machine != m.digest() => {
+            Err(Refused::WrongMachine { passed: *machine, desk: m.digest() })
+        }
+        Verdict::Pass { .. } => Pump::from_program(p, d).map_err(Refused::Pump),
         Verdict::Unbound => Err(Refused::Unbound { passed: None, program: p.digest() }),
         Verdict::Ask(a) => Err(Refused::Asked(a.len())),
         Verdict::Refuse { refusals, never } => {
@@ -176,9 +189,10 @@ struct Running {
     link: Box<dyn Transport + Send>,
 }
 
-/// Comscan's pump desk: the armed programs and the one running stream.
-#[derive(Default)]
+/// Comscan's pump desk: the machine it drives, the armed programs and the one running stream.
 pub struct PumpDesk {
+    /// VUG-HELM-BIND-MACHINE (SR498): the machine the operator declared behind this desk's ports, set once at `new`.
+    machine: Machine,
     armed: Vec<Armed>,
     running: Option<Running>,
 }
@@ -188,14 +202,20 @@ fn refused(why: impl Into<String>) -> Vec<PumpEvent> {
 }
 
 impl PumpDesk {
-    pub fn new() -> PumpDesk {
-        PumpDesk::default()
+    /// A desk for `machine`: every pass it arms must name this machine's identity (VUG-HELM-BIND-MACHINE).
+    pub fn new(machine: Machine) -> PumpDesk {
+        PumpDesk { machine, armed: Vec::new(), running: None }
     }
 
-    /// Arm `p` for `d` through [`start`] (the Verdict's only entry); the digest `PumpStart` names. Re-arming the
-    /// same digest replaces the earlier arming.
+    /// The machine this desk drives.
+    pub fn machine(&self) -> &Machine {
+        &self.machine
+    }
+
+    /// Arm `p` for `d` on the desk's machine through [`start`] (the Verdict's only entry); the digest `PumpStart`
+    /// names. Re-arming the same digest replaces the earlier arming.
     pub fn arm(&mut self, v: &Verdict, p: &Program, d: Dialect) -> Result<u64, Refused> {
-        let pump = start(v, p, d)?;
+        let pump = start(v, p, d, &self.machine)?;
         let digest = p.digest();
         self.armed.retain(|a| a.digest != digest);
         self.armed.push(Armed { digest, dialect: d, pump });
@@ -439,7 +459,9 @@ fn banner(link: &mut dyn Transport, key: &str, wait: Duration) -> Result<Option<
 mod tests {
     use super::*;
     use bandy::Origin;
-    use make_core::{Ask, Move, Units, Vec3};
+    use make_core::{
+        Aabb3, Ask, Axis, AxisId, Kinematics, MachineKind, Move, Power, PowerKind, Tool, ToolKind, Units, Vec3,
+    };
     use pump_core::LinkError;
     use pump_core::mock::MockGrbl;
 
@@ -467,6 +489,32 @@ mod tests {
         p
     }
 
+    fn axis(id: AxisId, min: f64, max: f64) -> Axis {
+        Axis { id, min, max, max_feed: 3000.0, max_accel: 100.0, rapid: 6000.0 }
+    }
+
+    /// The desk's machine: a mill whose envelope holds `program()` (VUG-HELM-BIND-MACHINE, SR498).
+    fn machine() -> Machine {
+        Machine {
+            kind: MachineKind::Mill3,
+            kinematics: Kinematics::Cartesian,
+            axes: vec![axis(AxisId::X, -50.0, 300.0), axis(AxisId::Y, -50.0, 300.0), axis(AxisId::Z, -50.0, 60.0)],
+            power: Power { kind: PowerKind::Spindle, max: 24000.0, ask_above: 18000.0 },
+            envelope: Aabb3 { min: Vec3::new(-20.0, -20.0, -20.0), max: Vec3::new(300.0, 300.0, 50.0) },
+            safe_z: 5.0,
+            units: Units::Mm,
+            tools: vec![Tool { number: 1, kind: ToolKind::FlatEnd, dc: 4.0, lf: 20.0, apmx: 2.0, nof: 3, sig: 0.0 }],
+            stock: None,
+            fixtures: Vec::new(),
+            loaded: Some(1),
+        }
+    }
+
+    /// A pass for `p` on the desk's machine.
+    fn pass(p: &Program) -> Verdict {
+        Verdict::Pass { digest: p.digest(), machine: machine().digest() }
+    }
+
     fn who() -> Origin {
         Origin::LocalUser("una".to_string())
     }
@@ -485,15 +533,15 @@ mod tests {
     #[test]
     fn only_a_pass_makes_a_pump() {
         let p = program();
-        assert_eq!(start(&Verdict::Ask(vec![Ask::FirstRun { digest: p.digest() }]), &p, GRBL).err(), Some(Refused::Asked(1)));
+        assert_eq!(start(&Verdict::Ask(vec![Ask::FirstRun { digest: p.digest() }]), &p, GRBL, &machine()).err(), Some(Refused::Asked(1)));
         let never = Verdict::Refuse { refusals: vec![], never: vec![Ask::ToolChange { at: 0, tool: 2 }] };
-        assert_eq!(start(&never, &p, GRBL).err(), Some(Refused::RefusedByHelm { refusals: 0, never: 1 }));
-        assert!(start(&Verdict::Pass { digest: p.digest() }, &p, GRBL).is_ok());
+        assert_eq!(start(&never, &p, GRBL, &machine()).err(), Some(Refused::RefusedByHelm { refusals: 0, never: 1 }));
+        assert!(start(&pass(&p), &p, GRBL, &machine()).is_ok());
         assert_eq!(
-            start(&Verdict::Pass { digest: p.digest() }, &p, Dialect::LinuxCnc).err(),
+            start(&pass(&p), &p, Dialect::LinuxCnc, &machine()).err(),
             Some(Refused::Pump(PumpRefusal::DialectNotStreamed { dialect: Dialect::LinuxCnc }))
         );
-        let mut desk = PumpDesk::new();
+        let mut desk = PumpDesk::new(machine());
         assert_eq!(desk.arm(&never, &p, GRBL), Err(Refused::RefusedByHelm { refusals: 0, never: 1 }));
         assert!(desk.armed().is_empty());
     }
@@ -505,18 +553,45 @@ mod tests {
         let mut b = program();
         b.moves.push(Move::Rapid { to: Vec3::new(0.0, 0.0, 10.0) });
         assert_ne!(a.digest(), b.digest());
-        let pass_a = Verdict::Pass { digest: a.digest() };
+        let pass_a = pass(&a);
         let unbound = Refused::Unbound { passed: Some(a.digest()), program: b.digest() };
-        assert_eq!(start(&pass_a, &b, GRBL).err(), Some(unbound.clone()));
-        let mut desk = PumpDesk::new();
+        assert_eq!(start(&pass_a, &b, GRBL, &machine()).err(), Some(unbound.clone()));
+        let mut desk = PumpDesk::new(machine());
         assert_eq!(desk.arm(&pass_a, &b, GRBL), Err(unbound));
         assert!(desk.armed().is_empty(), "a pass for another program arms nothing");
         assert_eq!(
-            start(&Verdict::Unbound, &a, GRBL).err(),
+            start(&Verdict::Unbound, &a, GRBL, &machine()).err(),
             Some(Refused::Unbound { passed: None, program: a.digest() })
         );
-        assert!(start(&pass_a, &a, GRBL).is_ok(), "the pass still starts the program it names");
+        assert!(start(&pass_a, &a, GRBL, &machine()).is_ok(), "the pass still starts the program it names");
         assert_eq!(desk.arm(&pass_a, &a, GRBL), Ok(a.digest()));
+    }
+
+    // VUG-HELM-BIND-MACHINE (SR498): a desk armed for one machine refuses a pass for another, by both identities.
+    #[test]
+    fn a_desk_armed_for_one_machine_refuses_a_pass_for_another_by_name() {
+        let p = program();
+        let a = machine();
+        let mut b = machine();
+        b.envelope.max = Vec3::new(100.0, 100.0, 50.0);
+        assert_ne!(a.digest(), b.digest());
+        let pass_b = Verdict::Pass { digest: p.digest(), machine: b.digest() };
+        let wrong = Refused::WrongMachine { passed: b.digest(), desk: a.digest() };
+        assert_eq!(start(&pass_b, &p, GRBL, &a).err(), Some(wrong.clone()));
+        let mut desk = PumpDesk::new(a.clone());
+        assert_eq!(desk.machine(), &a);
+        assert_eq!(desk.arm(&pass_b, &p, GRBL), Err(wrong));
+        assert!(desk.armed().is_empty(), "a pass for another machine arms nothing");
+        // The program check comes first: a pass for another program on another machine is Unbound.
+        let mut q = program();
+        q.moves.push(Move::Rapid { to: Vec3::new(0.0, 0.0, 10.0) });
+        assert_eq!(
+            start(&pass_b, &q, GRBL, &a).err(),
+            Some(Refused::Unbound { passed: Some(p.digest()), program: q.digest() })
+        );
+        // The pass naming the desk's machine still arms, and the same pass on B's own desk does too.
+        assert_eq!(desk.arm(&pass(&p), &p, GRBL), Ok(p.digest()));
+        assert_eq!(PumpDesk::new(b).arm(&pass_b, &p, GRBL), Ok(p.digest()));
     }
 
     #[test]
@@ -527,12 +602,12 @@ mod tests {
         let mut open = move |port: &str| -> Result<Box<dyn Transport + Send>, String> {
             if port == "mock" { Ok(Box::new(m2.clone())) } else { Err("no such port".to_string()) }
         };
-        let mut desk = PumpDesk::new();
+        let mut desk = PumpDesk::new(machine());
 
         // Nothing armed: refused by name, whatever the sender claims.
         assert!(why(&desk.apply(&start_msg(p.digest(), "grbl"), &mut open)).contains("is not armed"));
 
-        let digest = desk.arm(&Verdict::Pass { digest: p.digest() }, &p, GRBL).unwrap();
+        let digest = desk.arm(&pass(&p), &p, GRBL).unwrap();
         assert_eq!(digest, p.digest());
         assert!(why(&desk.apply(&start_msg(digest, "marlin"), &mut open)).contains("dialect mismatch"));
         assert!(why(&desk.apply(&start_msg(digest, "fanuc"), &mut open)).contains("unknown dialect"));
@@ -580,9 +655,9 @@ mod tests {
         let mock = Shared(Arc::new(Mutex::new(MockGrbl::new(5))));
         let m2 = mock.clone();
         let mut open = move |_: &str| -> Result<Box<dyn Transport + Send>, String> { Ok(Box::new(m2.clone())) };
-        let mut desk = PumpDesk::new();
+        let mut desk = PumpDesk::new(machine());
         assert_eq!(why(&desk.apply(&PumpEvent::PumpHold { principal: who() }, &mut open)), "nothing is streaming");
-        let d = desk.arm(&Verdict::Pass { digest: p.digest() }, &p, GRBL).unwrap();
+        let d = desk.arm(&pass(&p), &p, GRBL).unwrap();
         desk.apply(&start_msg(d, "grbl"), &mut open);
         desk.tick(1000);
         let out = desk.apply(&PumpEvent::PumpHold { principal: who() }, &mut open);
@@ -615,7 +690,7 @@ mod tests {
         let syn = Synapse::new();
         let rx = syn.subscribe();
         let mut watch = syn.subscribe();
-        let desk = Arc::new(Mutex::new(PumpDesk::new()));
+        let desk = Arc::new(Mutex::new(PumpDesk::new(machine())));
         let open: Box<Opener> = Box::new(|_: &str| -> Result<Box<dyn Transport + Send>, String> { Err("none".to_string()) });
         let task = tokio::spawn(serve_pump(syn.clone(), rx, desk, open, Duration::from_millis(5)));
         syn.fire(SMessage::Pump(PumpEvent::PumpStop { principal: who() }));

@@ -206,3 +206,50 @@ impl Machine {
         Ok(())
     }
 }
+
+// --- VUGHELMBINDMACHINE (LEDGER SR498): the machine's identity (named tail hunk) ---
+
+impl Machine {
+    /// FNV-1a 64 (`Program::digest`'s hasher and shape) over the machine's IDENTITY: kind, kinematics, every axis,
+    /// the power axis' kind and ceiling, the envelope, the units and every tool, in order. The setup and the state are
+    /// not identity and are left out: stock, fixtures, the loaded tool, safe Z and the power ask threshold may change
+    /// between a review and a run without the machine changing. Helm's pass names this digest and Comscan's desk
+    /// refuses a pass naming another machine (VUG-HELM-BIND-MACHINE).
+    pub fn digest(&self) -> u64 {
+        let mut h = crate::program::Fnv::new();
+        h.byte(1);
+        h.byte(self.kind as u8);
+        h.byte(2);
+        h.byte(self.kinematics as u8);
+        h.byte(3);
+        h.bytes(&(self.axes.len() as u64).to_le_bytes());
+        for a in &self.axes {
+            h.byte(a.id as u8);
+            h.f(a.min);
+            h.f(a.max);
+            h.f(a.max_feed);
+            h.f(a.max_accel);
+            h.f(a.rapid);
+        }
+        h.byte(4);
+        h.byte(self.power.kind as u8);
+        h.f(self.power.max);
+        h.byte(5);
+        h.v3(self.envelope.min);
+        h.v3(self.envelope.max);
+        h.byte(6);
+        h.byte(self.units as u8);
+        h.byte(7);
+        h.bytes(&(self.tools.len() as u64).to_le_bytes());
+        for t in &self.tools {
+            h.bytes(&t.number.to_le_bytes());
+            h.byte(t.kind as u8);
+            h.f(t.dc);
+            h.f(t.lf);
+            h.f(t.apmx);
+            h.byte(t.nof);
+            h.f(t.sig);
+        }
+        h.0
+    }
+}
