@@ -1301,3 +1301,9 @@ exec-rmbp-vugveinstream 7e8cbc770 wave36 cut46
 exec-rmbp-vugmakeramp 7e8cbc770 wave36 cut46
 exec-rmbp-vugphotolens 7e8cbc770 wave36 cut46
 exec-rmbp-vugfacesave 7e8cbc770 wave36 cut46
+exec-rmbp-pumphda 339b65319 wave36 cut47
+exec-rmbp-unlockstack 339b65319 wave36 cut47
+exec-rmbp-holdstage 339b65319 wave36 cut47
+exec-rmbp-wordspointer 339b65319 wave36 cut47
+exec-rmbp-dooronpump 339b65319 wave36 cut47
+exec-rmbp-gatereds 339b65319 wave36 cut47
