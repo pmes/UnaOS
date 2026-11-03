@@ -67,7 +67,7 @@ impl Program {
     /// FNV-1a (64-bit) over a canonical byte encoding of the moves (f64 by its bits): the key Helm remembers a
     /// first run by (VUG-HELM). Two programs with equal moves have equal digests on every host.
     pub fn digest(&self) -> u64 {
-        let mut h = Fnv(0xcbf2_9ce4_8422_2325);
+        let mut h = Fnv::new();
         h.byte(match self.units {
             Units::Mm => 0,
             Units::Inch => 1,
@@ -149,22 +149,28 @@ impl Program {
     }
 }
 
-struct Fnv(u64);
+/// FNV-1a 64 over bytes: make_core's one hasher (`Program::digest`, `Machine::digest`; VUGHELMBINDMACHINE SR498 made
+/// it crate-visible so the machine identity shares it).
+pub(crate) struct Fnv(pub(crate) u64);
 
 impl Fnv {
-    fn byte(&mut self, b: u8) {
+    /// The FNV-1a 64 offset basis.
+    pub(crate) fn new() -> Fnv {
+        Fnv(0xcbf2_9ce4_8422_2325)
+    }
+    pub(crate) fn byte(&mut self, b: u8) {
         self.0 ^= b as u64;
         self.0 = self.0.wrapping_mul(0x0000_0100_0000_01b3);
     }
-    fn bytes(&mut self, bs: &[u8]) {
+    pub(crate) fn bytes(&mut self, bs: &[u8]) {
         for b in bs {
             self.byte(*b);
         }
     }
-    fn f(&mut self, v: f64) {
+    pub(crate) fn f(&mut self, v: f64) {
         self.bytes(&v.to_bits().to_le_bytes());
     }
-    fn v3(&mut self, v: Vec3) {
+    pub(crate) fn v3(&mut self, v: Vec3) {
         self.f(v.x);
         self.f(v.y);
         self.f(v.z);
