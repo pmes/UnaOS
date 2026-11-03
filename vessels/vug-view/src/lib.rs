@@ -46,7 +46,7 @@ pub const SHORTCUTS: &[(&str, &str)] = &[
     ("wheel / pinch", "zoom to the cursor"),
     ("f / Shift+f", "fillet / chamfer the body edge under the cursor (a click re-picks): type r (chamfer d1,d2), Enter; Esc cancels"), // VUGFACEFILLET (SR511)
     // VUGFACEPHOTO (SR506): a photo on graph paper opens as its measured sketch over the dimmed photo.
-    ("i", "ask Vein for design intent on the photo's sketch (no provider today: the corner says so)"),
+    ("i", "ask Vein for design intent on the photo's sketch (over the bus; the corner shows the request, then the proposals or the refusal)"), // VUGFACEINTENTSEND (SR514)
     ("Tab", "focus the next proposal"),
     ("Enter / Backspace", "on the focused proposal: apply it (verified against the photo) / reject it"),
     // VUGFACETREE (SR513): the feature tree over doc_core.
@@ -124,6 +124,8 @@ impl Viewer {
                 true
             }
             SMessage::SurfaceResend { url } => url == SURFACE,
+            // VUGFACEINTENTSEND (SR514): Vein's answer to the face's ask (photo::answer matches the live request id).
+            SMessage::Intent(ev) => photo::answer(&mut self.view, ev),
             _ => false,
         }
     }
@@ -132,5 +134,11 @@ impl Viewer {
     pub fn frame(&self) -> SMessage {
         let f = raster::render(&self.model, &self.view);
         SMessage::SurfaceBlit { url: SURFACE.to_string(), width: f.width, height: f.height, pixels: f.rgba, damage: None, scroll: None }
+    }
+
+    /// VUGFACEINTENTSEND (SR514): THE send road — what the face asked since the last drain (`Photo::outbox`), as bus
+    /// messages for the controller to fire; empty with no photo.
+    pub fn outbox(&mut self) -> Vec<SMessage> {
+        self.view.photo.as_mut().map(|ph| ph.outbox.drain(..).map(SMessage::Intent).collect()).unwrap_or_default()
     }
 }

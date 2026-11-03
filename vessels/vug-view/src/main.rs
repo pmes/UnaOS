@@ -152,6 +152,7 @@ fn main() {
                             Err(TryRecvError::Closed) => return,
                         }
                     }
+                    for m in viewer.outbox() { synapse.fire(m); } // VUGFACEINTENTSEND (SR514): the face's asks onto the bus
                     if dirty {
                         synapse.fire(viewer.frame());
                     }
