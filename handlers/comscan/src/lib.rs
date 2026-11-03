@@ -45,6 +45,7 @@
 //! one broadcast bus.
 
 pub mod logview;
+pub mod pump; // VUGCOMSCAN1 (SR476): the pump, whose only entry is Helm's Verdict::Pass
 
 pub use logview::LogView;
 

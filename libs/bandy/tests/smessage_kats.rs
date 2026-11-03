@@ -547,6 +547,37 @@ kat!(
     SMessage::BrowserClick(12.5, 40.0, 1),
     r#"{"BrowserClick":[12.5,40.0,1]}"#
 );
+// VUG-FACE-BUTTONS (SR477): a non-primary button and a pinch, each its own appended message (BrowserButton's goldens
+// above are unchanged: a primary press keeps its frozen wire); mods and surface omitted when 0.
+kat!(
+    kat_browser_aux_button,
+    SMessage::BrowserAuxButton { button: bandy::BUTTON_RIGHT, down: true, x: 12.5, y: 40.0, mods: 0, surface: 0 },
+    r#"{"BrowserAuxButton":{"button":1,"down":true,"x":12.5,"y":40.0}}"#
+);
+kat!(
+    kat_browser_aux_button_mods_surface,
+    SMessage::BrowserAuxButton { button: bandy::BUTTON_MIDDLE, down: false, x: 1.0, y: 2.0, mods: bandy::MOD_CONTROL, surface: 3 },
+    r#"{"BrowserAuxButton":{"button":2,"down":false,"x":1.0,"y":2.0,"mods":2,"surface":3}}"#
+);
+kat!(
+    kat_browser_pinch,
+    SMessage::BrowserPinch { scale: 1.25, x: 3.0, y: 4.0, surface: 0 },
+    r#"{"BrowserPinch":{"scale":1.25,"x":3.0,"y":4.0}}"#
+);
+
+/// VUG-FACE-BUTTONS (SR477): the two new pointer messages carry a Surface number like the four older ones.
+#[test]
+fn aux_button_and_pinch_carry_a_surface() {
+    for m in [
+        r#"{"BrowserAuxButton":{"button":1,"down":true,"x":1.0,"y":2.0}}"#,
+        r#"{"BrowserPinch":{"scale":0.9,"x":1.0,"y":2.0}}"#,
+    ] {
+        let mut msg: SMessage = serde_json::from_str(m).expect(m);
+        assert_eq!(msg.surface(), Some(0), "{m}");
+        *msg.surface_mut().unwrap() = 4;
+        assert_eq!(msg.surface(), Some(4), "{m}");
+    }
+}
 
 /// SURFACEID (SR332): the pre-SR332 forms read back as Surface 0, and `surface()` / `surface_mut()` name exactly the four
 /// pointer messages.
@@ -1561,6 +1592,9 @@ fn smessage_variant_name(m: &SMessage) -> &'static str {
         SMessage::SavePanelChose { .. } => "SavePanelChose",
         SMessage::OpenPanel { .. } => "OpenPanel", // OPEN-DIALOG-ONE (SR386): the face's open panel ask / answer
         SMessage::OpenPanelChose { .. } => "OpenPanelChose",
+        SMessage::BrowserAuxButton { .. } => "BrowserAuxButton", // VUG-FACE-BUTTONS (SR477): the right / middle / extra buttons and the pinch
+        SMessage::BrowserPinch { .. } => "BrowserPinch",
+        SMessage::Pump(_) => "Pump", // VUGCOMSCAN1 (SR476): Comscan's pump channel
     }
 }
 
@@ -1820,4 +1854,28 @@ kat!(
     kat_open_panel_cancelled,
     SMessage::OpenPanelChose { url: "viewport".to_string(), path: None },
     r#"{"OpenPanelChose":{"url":"viewport","path":null}}"#
+);
+// VUGCOMSCAN1 (SR476): Comscan's pump channel; a start names an armed program by digest, and Squawk leaves its absent
+// status and event off the wire.
+kat!(
+    kat_pump_start,
+    SMessage::Pump(bandy::PumpEvent::PumpStart {
+        principal: Origin::LocalUser("una".to_string()),
+        program: "00000000deadbeef".to_string(),
+        dialect: "grbl".to_string(),
+        port: "mock".to_string(),
+    }),
+    r#"{"Pump":{"PumpStart":{"principal":{"LocalUser":"una"},"program":"00000000deadbeef","dialect":"grbl","port":"mock"}}}"#
+);
+kat!(
+    kat_pump_squawk,
+    SMessage::Pump(bandy::PumpEvent::Squawk {
+        sent: 12,
+        acked: 9,
+        total: 40,
+        state: "streaming".to_string(),
+        status: None,
+        event: None,
+    }),
+    r#"{"Pump":{"Squawk":{"sent":12,"acked":9,"total":40,"state":"streaming"}}}"#
 );
