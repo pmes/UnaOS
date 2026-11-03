@@ -55,6 +55,19 @@ pub enum Op {
     PrintLayers { slices: Vec<(f64, Vec<Vec<Vec2>>)>, tool: u32 },
     LaserCut { polylines: Vec<Vec<Vec2>>, passes: u32 },
     Slice { triangles: Vec<[Vec3; 3]>, params: SliceParams }, // VUGMAKESLICE (SR483): FDM slicing of a triangle soup
+    /// VUGMAKEREST (SR517): what a `Pocket2_5D` of the same outline and islands with tool `after` at `stepover` left
+    /// (its corners and any core), cut with the smaller `tool` from the cleared side ([`crate::rest`]).
+    Rest {
+        outline: Vec<Vec2>,
+        islands: Vec<Vec<Vec2>>,
+        top: f64,
+        depth: f64,
+        after: u32,
+        stepover: f64,
+        climb: bool,
+        tool: u32,
+        feeds: Feeds,
+    },
 }
 
 /// The toolpath for `op` on `m`, or the refusal by name.
@@ -73,11 +86,15 @@ pub fn generate(op: &Op, m: &Machine, tol: Tol) -> Result<Program, Refusal> {
         Op::PrintLayers { .. } => Err(Refusal::OpOwed { op: "PrintLayers", owed: "VUG-MAKE-SLICE" }),
         Op::LaserCut { .. } => Err(Refusal::OpOwed { op: "LaserCut", owed: "VUG-MAKE-LASER" }),
         Op::Slice { triangles, params } => crate::slice::slice(triangles, params, m, tol), // VUGMAKESLICE (SR483)
+        // VUGMAKEREST (SR517): the rest of a pocket, cut with a smaller tool.
+        Op::Rest { outline, islands, top, depth, after, stepover, climb, tool, feeds } => {
+            crate::rest::rest(m, outline, islands, *top, *depth, *after, *stepover, *climb, *tool, feeds, tol)
+        }
     }
 }
 
 /// The tool, a change to it if it is not loaded, and the spindle on.
-fn prelude<'m>(m: &'m Machine, tool: u32, rpm: f64) -> Result<(Program, &'m Tool), Refusal> {
+pub(crate) fn prelude<'m>(m: &'m Machine, tool: u32, rpm: f64) -> Result<(Program, &'m Tool), Refusal> {
     let t = m.tool(tool).ok_or(Refusal::UnknownTool { at: 0, tool })?;
     let mut p = Program::new(m.units);
     if m.loaded != Some(tool) {
@@ -136,7 +153,7 @@ fn drill(
 const ARC_MIN_CHORD: f64 = 1e-3;
 
 /// The ring's pieces at `z`: a segment as `Move::Linear`, an arc as `Move::Arc` (G2 / G3).
-fn emit(p: &mut Program, ring: &[El], z: f64, feed: f64) {
+pub(crate) fn emit(p: &mut Program, ring: &[El], z: f64, feed: f64) {
     for e in ring {
         match *e {
             El::Arc { from, to, centre, cw } if (to - from).length() > ARC_MIN_CHORD => {
@@ -223,13 +240,13 @@ pub enum FaceDir {
 const HELIX_SLOPE: f64 = 0.05;
 
 /// The depth passes APMX allows (Contour's rule; one when APMX is unset).
-fn passes(t: &Tool, depth: f64, tol: Tol) -> usize {
+pub(crate) fn passes(t: &Tool, depth: f64, tol: Tol) -> usize {
     if t.apmx > tol.lin { ceil((depth - tol.lin) / t.apmx).max(1.0) as usize } else { 1 }
 }
 
 /// Whether the tool may plunge straight into solid. `Tool` carries no centre-cutting flag (VUG-MAKE-TOOLCC): a ball
 /// end and a drill cut at the centre; a flat end is assumed not to.
-fn centre_cutting(t: &Tool) -> bool {
+pub(crate) fn centre_cutting(t: &Tool) -> bool {
     matches!(t.kind, crate::machine::ToolKind::BallEnd | crate::machine::ToolKind::Drill)
 }
 
@@ -310,18 +327,7 @@ fn pocket(
         return Err(Refusal::BadParameter { what: "chord not positive" });
     }
     let lps = crate::offset::loops(outline, islands, tol)?;
-    let mut levels: Vec<Vec<Vec<El>>> = Vec::new();
-    loop {
-        let d = r + stepover * (levels.len() as f64);
-        let rs = crate::offset::rings(&lps, d, tol)?;
-        if rs.is_empty() {
-            break;
-        }
-        levels.push(rs);
-    }
-    if levels.is_empty() {
-        return Err(Refusal::ToolTooLarge { tool });
-    }
+    let mut levels = levels(&lps, r, stepover, tool, tol)?; // VUGMAKEREST (SR517): the ring set, shared with the rest
     if climb {
         for lv in levels.iter_mut() {
             for ring in lv.iter_mut() {
@@ -476,4 +482,30 @@ fn face(
     }
     p.moves.push(Move::Spindle(Spin::Off));
     Ok(p)
+}
+
+// ---- VUGMAKEREST (LEDGER SR517): the pocket's ring set, read again by the rest. ----
+
+/// The pocket's rings: level k the rings at distance r + k·stepover from the boundary `lps` ([`crate::offset::rings`]),
+/// until a level is empty; none at all refuses `ToolTooLarge`.
+pub(crate) fn levels(
+    lps: &[Vec<Vec2>],
+    r: f64,
+    stepover: f64,
+    tool: u32,
+    tol: Tol,
+) -> Result<Vec<Vec<Vec<El>>>, Refusal> {
+    let mut levels: Vec<Vec<Vec<El>>> = Vec::new();
+    loop {
+        let d = r + stepover * (levels.len() as f64);
+        let rs = crate::offset::rings(lps, d, tol)?;
+        if rs.is_empty() {
+            break;
+        }
+        levels.push(rs);
+    }
+    if levels.is_empty() {
+        return Err(Refusal::ToolTooLarge { tool });
+    }
+    Ok(levels)
 }

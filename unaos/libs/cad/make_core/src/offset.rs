@@ -238,7 +238,7 @@ impl El {
         }
     }
 
-    fn mid(&self, tol: Tol) -> Vec2 {
+    pub(crate) fn mid(&self, tol: Tol) -> Vec2 {
         match *self {
             El::Line { from, to } => (from + to) * 0.5,
             El::Arc { from, centre, cw, .. } => {
@@ -276,7 +276,7 @@ impl El {
     }
 
     /// The point of the closed piece nearest `p`.
-    fn closest(&self, p: Vec2, tol: Tol) -> Vec2 {
+    pub(crate) fn closest(&self, p: Vec2, tol: Tol) -> Vec2 {
         match *self {
             El::Line { from, to } => foot(p, from, to),
             El::Arc { from, to, centre, .. } => {
@@ -368,7 +368,7 @@ fn crossings(x: El, y: El, tol: Tol) -> ([Vec2; 2], usize) {
 }
 
 /// A closed ring's exact signed area (the chord polygon plus each arc's circular segment) and its length.
-fn measure(ring: &[El], tol: Tol) -> (f64, f64) {
+pub(crate) fn measure(ring: &[El], tol: Tol) -> (f64, f64) {
     let (mut a, mut per) = (0.0, 0.0);
     for e in ring {
         a += 0.5 * e.start().cross(e.end());
@@ -394,6 +394,15 @@ pub(crate) fn rings(lps: &[Vec<Vec2>], d: f64, tol: Tol) -> Result<Vec<Vec<El>>,
             }
         }
     }
+    let pieces: Vec<El> =
+        split(&segs, tol).into_iter().map(|(_, e)| e).filter(|e| dist(e.mid(tol), lps) >= d - tol.lin).collect();
+    chain(&pieces, tol)
+}
+
+/// Every piece of `segs` split at every crossing with every other one (segment / segment, segment / circle and circle /
+/// circle; the one crossing point handed to both), as (source index, piece) in source order, along each source; a
+/// piece no longer than `tol.lin` merges into the next.
+pub(crate) fn split(segs: &[El], tol: Tol) -> Vec<(usize, El)> {
     let k = segs.len();
     let mut cuts: Vec<Vec<(f64, Vec2)>> = alloc::vec![Vec::new(); k];
     for a in 0..k {
@@ -410,21 +419,25 @@ pub(crate) fn rings(lps: &[Vec<Vec2>], d: f64, tol: Tol) -> Result<Vec<Vec<El>>,
             }
         }
     }
-    let mut pieces: Vec<El> = Vec::new();
+    let mut pieces: Vec<(usize, El)> = Vec::new();
     for (s, c) in cuts.iter_mut().enumerate() {
         let e = segs[s];
         c.sort_by(|p, q| p.0.partial_cmp(&q.0).unwrap_or(core::cmp::Ordering::Equal));
         let mut from = e.start();
         for q in c.iter().map(|&(_, q)| q).chain(core::iter::once(e.end())) {
             if len(q - from) > tol.lin {
-                let piece = e.with_from(from).with_to(q);
-                if dist(piece.mid(tol), lps) >= d - tol.lin {
-                    pieces.push(piece);
-                }
+                pieces.push((s, e.with_from(from).with_to(q)));
                 from = q;
             }
         }
     }
+    pieces
+}
+
+/// The pieces chained into closed rings by their shared end points (first free start wins); a chain that does not
+/// close refuses `NoRings` (never an open path); a ring of under two pieces or no more area than `tol.lin` times its
+/// length is dropped.
+pub(crate) fn chain(pieces: &[El], tol: Tol) -> Result<Vec<Vec<El>>, Refusal> {
     let mut used = alloc::vec![false; pieces.len()];
     let mut out = Vec::new();
     for s in 0..pieces.len() {
@@ -535,6 +548,93 @@ pub(crate) fn clearance(a: Vec2, b: Vec2, lps: &[Vec<Vec2>], tol: Tol) -> f64 {
         for i in 0..lp.len() {
             let (c, d) = edge(lp, i);
             m = m.min(seg_seg_dist(a, b, c, d, tol));
+        }
+    }
+    m
+}
+
+// ---- VUGMAKEREST (LEDGER SR517): the offset of a ring of pieces, for the rest a pocket leaves. ----
+
+/// The unit tangent of `e` at `q` (a point on it), in its running direction.
+fn tangent(e: &El, q: Vec2) -> Vec2 {
+    match *e {
+        El::Line { from, to } => (to - from) * (1.0 / len(to - from)),
+        El::Arc { centre, cw, .. } => {
+            let w = q - centre;
+            let t = Vec2::new(-w.y, w.x) * (1.0 / len(w));
+            if cw { t * -1.0 } else { t }
+        }
+    }
+}
+
+/// The unit normal to the left of `e` at `q` (a point on it).
+pub(crate) fn left_normal(e: &El, q: Vec2) -> Vec2 {
+    let t = tangent(e, q);
+    Vec2::new(-t.y, t.x)
+}
+
+/// One piece moved `d` to its right: (the new start, the new end, the piece). A segment shifts by its right normal; an
+/// arc keeps its centre, a clockwise one (centre on the right) at radius rho - d, a counter-clockwise one at rho + d;
+/// a clockwise arc whose new radius is no more than `tol.lin` collapses to its centre (no piece).
+fn shifted(e: El, d: f64, tol: Tol) -> (Vec2, Vec2, Option<El>) {
+    match e {
+        El::Line { from, to } => {
+            let u = (to - from) * (1.0 / len(to - from));
+            let n = Vec2::new(u.y, -u.x) * d;
+            (from + n, to + n, Some(El::Line { from: from + n, to: to + n }))
+        }
+        El::Arc { from, to, centre, cw } => {
+            let rho = len(from - centre);
+            let r = if cw { rho - d } else { rho + d };
+            if r <= tol.lin {
+                return (centre, centre, None);
+            }
+            let k = r / rho;
+            let (a, b) = (centre + (from - centre) * k, centre + (to - centre) * (r / len(to - centre)));
+            (a, b, Some(El::Arc { from: a, to: b, centre, cw }))
+        }
+    }
+}
+
+/// The raw offset of the closed `ring` by `d` to its right, as a closed chain of pieces (unsplit, untrimmed: the caller
+/// splits with [`split`] and keeps by distance). Each piece is [`shifted`]; where two shifted neighbours do not meet,
+/// the gap at the ring's junction `J` is filled by the arc about `J` of radius `d` (counter-clockwise) when the ring
+/// turns left there, a reversal (a cusp tip) counting as left, else by the PIVOT (two segments through `J`, every point
+/// of them nearer than `d` to the ring, so a distance keep drops them). Every clockwise arc fed in has a radius of at
+/// least `d - tol.lin` (the rest's rings and regions), so the collapse is the one degenerate case.
+pub(crate) fn offset_right(ring: &[El], d: f64, tol: Tol) -> Vec<El> {
+    let n = ring.len();
+    let sh: Vec<(Vec2, Vec2, Option<El>)> = ring.iter().map(|e| shifted(*e, d, tol)).collect();
+    let mut out = Vec::with_capacity(3 * n);
+    for i in 0..n {
+        if let Some(e) = sh[i].2 {
+            out.push(e);
+        }
+        let j = (i + 1) % n;
+        let (a, b) = (sh[i].1, sh[j].0);
+        if len(b - a) <= 2.0 * tol.lin {
+            continue;
+        }
+        let jn = ring[i].end();
+        let (u, v) = (tangent(&ring[i], jn), tangent(&ring[j], ring[j].start()));
+        let c = u.cross(v);
+        if c > tol.ang || (fabs(c) <= tol.ang && u.dot(v) < 0.0) {
+            out.push(El::Arc { from: a, to: b, centre: jn, cw: false });
+        } else {
+            out.push(El::Line { from: a, to: jn });
+            out.push(El::Line { from: jn, to: b });
+        }
+    }
+    out.retain(|e| len(e.end() - e.start()) > tol.lin);
+    out
+}
+
+/// The distance from `p` to the nearest piece of `rings` (infinite when there is none).
+pub(crate) fn dist_els(p: Vec2, rings: &[Vec<El>], tol: Tol) -> f64 {
+    let mut m = f64::INFINITY;
+    for ring in rings {
+        for e in ring {
+            m = m.min(len(p - e.closest(p, tol)));
         }
     }
     m

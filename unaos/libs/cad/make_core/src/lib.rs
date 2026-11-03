@@ -40,6 +40,7 @@ mod offset;
 pub mod op;
 pub mod plan;
 pub mod program;
+pub mod rest; // VUGMAKEREST (SR517)
 pub mod review;
 pub mod slice; // VUGMAKESLICE (SR483)
 pub mod sim; // VUGMAKESIM (SR496)
@@ -56,3 +57,4 @@ pub use review::{Ask, Review, review};
 pub use validate::{Refusal, Stats};
 pub use slice::{Island, Layer, SliceParams}; // VUGMAKESLICE (SR483)
 pub use sim::{Gouge, MoveSim, RapidCut, Sim, SimParams, SimRefusal, StockSdf, simulate}; // VUGMAKESIM (SR496)
+pub use rest::RestRegion; // VUGMAKEREST (SR517)
