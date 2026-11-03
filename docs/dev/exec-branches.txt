@@ -1280,3 +1280,14 @@ exec-rmbp-vugscandeviation | /home/user/exec/vugscandeviation | cut 1dae9b466 | 
 exec-rmbp-vugfacefillet | /home/user/exec/vugfacefillet | cut 1dae9b466 | VUGFACEFILLET | wave36
 exec-rmbp-vugbrepcorner | /home/user/exec/vugbrepcorner | cut 1dae9b466 | VUGBREPCORNER | wave36
 exec-rmbp-vugfacetree | /home/user/exec/vugfacetree | cut 1dae9b466 | VUGFACETREE | wave36
+exec-rmbp-vugfaceintentsend e08d144b2 wave36 cut45
+exec-rmbp-vugintentscanwire e08d144b2 wave36 cut45
+exec-rmbp-vugdocfromsketch e08d144b2 wave36 cut45
+exec-rmbp-vugmakerest e08d144b2 wave36 cut45
+exec-rmbp-vugfacetreefillet e08d144b2 wave36 cut45
+exec-rmbp-vugbrep3torus e08d144b2 wave36 cut45
+exec-rmbp-vuggeomlinalg e08d144b2 wave36 cut45
+exec-rmbp-vugcomscanreconnect e08d144b2 wave36 cut45
+exec-rmbp-vugscansubmap e08d144b2 wave36 cut45
+exec-rmbp-vugintentpoints e08d144b2 wave36 cut45
+exec-rmbp-vugbrepedgesnamed e08d144b2 wave36 cut45

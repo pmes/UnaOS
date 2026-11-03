@@ -252,4 +252,11 @@ impl Brep {
         let e = &self.edges[c.edge as usize];
         if c.reversed { (e.t1, e.t0) } else { (e.t0, e.t1) }
     }
+
+    // VUGBREPEDGESNAMED (SR524): the edge sibling of `faces_named` (bool.rs), the same rule.
+    /// The edges (slots, in arena order) carrying `name` exactly: one per generator on a fresh primitive, none for a
+    /// name this solid never minted, several where an operation split the edge.
+    pub fn edges_named(&self, name: Name) -> impl Iterator<Item = u32> + '_ {
+        (0..self.edges.len() as u32).filter(move |&i| self.edges[i as usize].name == name)
+    }
 }
