@@ -1,0 +1,216 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
+// Copyright (C) 2026 The Architect & Una
+//
+// VUGCOMSCANTCP (SR487): a networked grbl (grblHAL / FluidNC raw TCP) as the pump's Transport, exercised against a
+// std TcpListener fake grbl on 127.0.0.1:0. No real controller is touched.
+
+use std::io::{self, Read, Write};
+use std::net::TcpListener;
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
+
+use bandy::{Origin, PumpEvent};
+use comscan::pump::{Opener, PumpDesk, TCP_SCHEME, Verdict, by_scheme, digest_hex};
+use comscan::tcp::{CONNECT_WAIT, Port, Refusal, opener, parse, refusal_of};
+use make_core::gcode::Dialect;
+use make_core::{Move, Program, Units, Vec3};
+use pump_core::{LinkError, Pump, Transport};
+
+const GRBL: Dialect = Dialect::Grbl { laser: false };
+const BANNER: &[u8] = b"Grbl 1.1h ['$' for help]\r\n";
+
+/// A fake grbl behind one accepted connection: says its banner at once (or only after a soft reset when
+/// `banner_on_reset`), answers `ok` per line, ignores the realtime bytes; returns the lines it executed once the client
+/// closes (or `stop_after` lines, and with `banner_on_reset` the reset, were seen).
+fn fake_grbl(l: TcpListener, banner_on_reset: bool, stop_after: Option<usize>) -> JoinHandle<Vec<String>> {
+    thread::spawn(move || {
+        let (mut s, _) = l.accept().unwrap();
+        if !banner_on_reset {
+            s.write_all(BANNER).unwrap();
+        }
+        let mut got = Vec::new();
+        let mut cur: Vec<u8> = Vec::new();
+        let mut reset_seen = false;
+        let mut buf = [0u8; 256];
+        loop {
+            if stop_after.is_some_and(|n| got.len() >= n) && (!banner_on_reset || reset_seen) {
+                break;
+            }
+            let n = match s.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            for &b in &buf[..n] {
+                match b {
+                    0x18 => {
+                        reset_seen = true;
+                        let _ = s.write_all(b"\r\n");
+                        let _ = s.write_all(BANNER);
+                    }
+                    b'?' | b'!' | b'~' => {}
+                    b'\n' => {
+                        got.push(String::from_utf8_lossy(&cur).trim().to_string());
+                        cur.clear();
+                        let _ = s.write_all(b"ok\r\n");
+                    }
+                    _ => cur.push(b),
+                }
+            }
+        }
+        got
+    })
+}
+
+fn listener() -> (TcpListener, u16) {
+    let l = TcpListener::bind("127.0.0.1:0").expect("bind 127.0.0.1:0");
+    let port = l.local_addr().unwrap().port();
+    (l, port)
+}
+
+fn program() -> Program {
+    let mut p = Program::new(Units::Mm);
+    p.moves.push(Move::Rapid { to: Vec3::new(0.0, 0.0, 5.0) });
+    for i in 0..20 {
+        p.moves.push(Move::Linear { to: Vec3::new(i as f64, (i * 2) as f64, -1.0), feed: 300.0 });
+    }
+    p
+}
+
+fn no_serial() -> Box<Opener> {
+    Box::new(|port: &str| -> Result<Box<dyn Transport + Send>, String> { Err(format!("serial asked for {port}")) })
+}
+
+#[test]
+fn an_armed_program_streams_to_done_over_tcp_through_the_scheme_arm() {
+    let (l, port) = listener();
+    let fake = fake_grbl(l, false, None);
+    let p = program();
+    let mut desk = PumpDesk::new();
+    let digest = desk.arm(&Verdict::Pass, &p, GRBL).expect("armed by a pass");
+    let mut open = by_scheme(no_serial(), opener(GRBL, CONNECT_WAIT));
+    let start = PumpEvent::PumpStart {
+        principal: Origin::LocalUser("una".to_string()),
+        program: digest_hex(digest),
+        dialect: "grbl".to_string(),
+        port: format!("{TCP_SCHEME}127.0.0.1:{port}"),
+    };
+    let out = desk.apply(&start, &mut *open);
+    assert!(matches!(&out[..], [PumpEvent::Squawk { event: Some(e), .. }] if e == "started"), "{out:?}");
+
+    let t0 = Instant::now();
+    let mut last = None;
+    while t0.elapsed() < Duration::from_secs(10) {
+        for s in desk.tick(t0.elapsed().as_micros() as u64) {
+            last = Some(s);
+        }
+        if matches!(&last, Some(PumpEvent::Squawk { event: Some(e), .. }) if e == "done" || e == "link lost") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+    match last {
+        Some(PumpEvent::Squawk { sent, acked, total, event: Some(e), .. }) => {
+            assert_eq!(e, "done");
+            assert_eq!((sent, acked), (total, total));
+        }
+        other => panic!("no done squawk: {other:?}"),
+    }
+    drop(desk); // the link closes: the fake sees its FIN and returns
+    let lines = fake.join().unwrap();
+    let want = Pump::from_program(&p, GRBL).unwrap().lines().to_vec();
+    assert_eq!(lines, want, "the controller ran make_core's text, line for line, over TCP");
+}
+
+#[test]
+fn a_silent_grbl_is_soft_reset_once_over_tcp_and_says_its_banner() {
+    let (l, port) = listener();
+    let fake = fake_grbl(l, true, Some(0));
+    let mut link = Port::connect("127.0.0.1", port, CONNECT_WAIT).expect("connect");
+    assert_eq!(link.peer(), format!("127.0.0.1:{port}"));
+    assert_eq!(link.ready(Dialect::Marlin, Duration::from_millis(50)), Ok(None), "a silent Marlin proceeds, no reset sent");
+    let banner = link.ready(GRBL, Duration::from_millis(300)).expect("ready after the reset");
+    assert!(banner.as_deref().is_some_and(|b| b.starts_with("Grbl 1.1h")), "banner {banner:?}");
+    fake.join().unwrap();
+}
+
+#[test]
+fn a_closed_peer_reads_closed_and_nothing_yet_is_ok_zero() {
+    let (l, port) = listener();
+    let mut link = Port::connect("127.0.0.1", port, CONNECT_WAIT).expect("connect");
+    let (server, _) = l.accept().unwrap();
+    let mut buf = [0u8; 16];
+    assert_eq!(Transport::read(&mut link, &mut buf), Ok(0), "nothing yet is Ok(0), not a block");
+    drop(server);
+    drop(l);
+    let t0 = Instant::now();
+    let got = loop {
+        match Transport::read(&mut link, &mut buf) {
+            Ok(0) if t0.elapsed() < Duration::from_secs(5) => thread::sleep(Duration::from_millis(5)),
+            r => break r,
+        }
+    };
+    assert_eq!(got, Err(LinkError::Closed));
+}
+
+#[test]
+fn a_port_nobody_listens_on_refuses_by_name_within_the_timeout() {
+    let (l, port) = listener();
+    drop(l);
+    let wait = Duration::from_secs(2);
+    let t0 = Instant::now();
+    match Port::connect("127.0.0.1", port, wait) {
+        Err(Refusal::Refused { peer }) => assert_eq!(peer, format!("127.0.0.1:{port}")),
+        Err(r) => panic!("wrong refusal: {r}"),
+        Ok(_) => panic!("connected to nobody"),
+    }
+    assert!(t0.elapsed() < wait, "refused inside the timeout");
+
+    // The scheme arm: tcp:// goes to the network opener whole, a /dev path to the serial one.
+    let mut open = by_scheme(no_serial(), opener(GRBL, wait));
+    match open("/dev/ttyUSB0") {
+        Err(why) => assert_eq!(why, "serial asked for /dev/ttyUSB0"),
+        Ok(_) => panic!("opened a serial port"),
+    }
+    match open(&format!("tcp://127.0.0.1:{port}")) {
+        Err(why) => assert!(why.contains("connection refused"), "{why}"),
+        Ok(_) => panic!("connected to nobody"),
+    }
+    match open("tcp://127.0.0.1") {
+        Err(why) => assert!(why.contains("no :port"), "{why}"),
+        Ok(_) => panic!("opened without a port"),
+    }
+    match Port::connect("comscan-no-such-host.invalid", 23, wait) {
+        Err(Refusal::Unresolved { host }) => assert_eq!(host, "comscan-no-such-host.invalid"),
+        Err(r) => panic!("wrong refusal: {r}"),
+        Ok(_) => panic!("resolved .invalid"),
+    }
+}
+
+#[test]
+fn the_port_grammar_parses_and_refuses_by_name() {
+    assert_eq!(parse("tcp://grblhal.local:23"), Ok(("grblhal.local".to_string(), 23)));
+    assert_eq!(parse("tcp://192.168.0.1:8080"), Ok(("192.168.0.1".to_string(), 8080)));
+    assert_eq!(parse("tcp://[::1]:23"), Ok(("::1".to_string(), 23)));
+    for (text, why) in [
+        ("/dev/ttyUSB0", "no tcp:// scheme"),
+        ("ws://fluidnc.local:81", "no tcp:// scheme"),
+        ("tcp://grblhal.local", "no :port"),
+        ("tcp://[::1]", "no :port"),
+        ("tcp://:23", "empty host"),
+        ("tcp://host:0", "port not 1-65535"),
+        ("tcp://host:65536", "port not 1-65535"),
+        ("tcp://host:+23", "port not 1-65535"),
+        ("tcp://host:23/x", "port not 1-65535"),
+    ] {
+        assert_eq!(parse(text), Err(Refusal::BadAddress { text: text.to_string(), why }), "{text}");
+    }
+    let p = "10.0.0.9:23";
+    assert_eq!(refusal_of(io::ErrorKind::TimedOut, p, 3000), Refusal::TimedOut { peer: p.to_string(), waited_ms: 3000 });
+    assert_eq!(refusal_of(io::ErrorKind::ConnectionRefused, p, 3000), Refusal::Refused { peer: p.to_string() });
+    assert_eq!(refusal_of(io::ErrorKind::ConnectionReset, p, 3000), Refusal::Closed { peer: p.to_string() });
+    assert_eq!(
+        refusal_of(io::ErrorKind::PermissionDenied, p, 3000),
+        Refusal::Io { peer: p.to_string(), kind: io::ErrorKind::PermissionDenied }
+    );
+    assert!(refusal_of(io::ErrorKind::TimedOut, p, 3000).to_string().contains("timed out after 3000 ms"));
+}
