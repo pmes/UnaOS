@@ -27,12 +27,19 @@
 //! controller drains onto the bus (`Viewer::outbox`); [`answer`] takes Vein's `Proposals` for the live id through
 //! [`offer`] and names a `Refused` in the corner; an answer to any other id is ignored and counted. Echo gives no
 //! proposals and the road by hand still works.
+//!
+//! VUGFACESTREAM (SR535): Vein streams each proposal as it parses (`IntentEvent::Proposal`, SR531) before its one
+//! terminal answer. A streamed proposal for the live id enters as a PREVIEW (`Offer::streaming`): verified through the
+//! same road as [`offer`] and drawn with its residual and a `STREAMING` mark; Tab focuses it, Enter on it is refused by
+//! name (`wait: the answer is not complete`). The terminal `Proposals` settles the previews by index (an equal item keeps
+//! its verdict, a differing one is verified again, an extra preview is withdrawn); `Refused` withdraws every preview and
+//! names why with the count that arrived; a new ask withdraws the stale request's previews.
 
 use crate::model::Model;
 use crate::raster::{self, Frame as Raster, rgba};
 use crate::sketch::{ACTIVE, INK, REFUSED, SketchFace, world_planes};
 use crate::view::View;
-use bandy::{IntentEvent, IntentImage, Origin};
+use bandy::{IntentEvent, IntentImage, IntentProposal, Origin};
 use doc_core::{Doc, Measurement, Proposal, Stmt, Verdict};
 use sketch_core::{Constraint, ConstraintId, Entity, EntityId, PointRef, Tol, Vec2};
 use std::fmt;
@@ -68,6 +75,9 @@ pub struct Offer {
     pub proposal: Proposal,
     pub verdict: Verdict,
     pub state: State,
+    /// VUGFACESTREAM (SR535): the stream index of a preview of the live request (Enter waits for the terminal answer);
+    /// `None` for a settled or hand-offered proposal.
+    pub streaming: Option<u32>,
 }
 
 /// A proposal glyph as drawn: where, what, in which colour, and which offer.
@@ -340,15 +350,9 @@ pub fn offer(view: &mut View, ps: Vec<Proposal>) -> bool {
     let m = ph.measurement();
     let n = ps.len();
     for p in ps {
-        let verdict = doc_core::verify(&doc, &p, &m, Tol::DEFAULT);
-        ph.offers.push(Offer { proposal: p, verdict, state: State::Open });
+        ph.offers.push(verified(&doc, &m, p, None)); // VUGFACESTREAM (SR535): the one verify road
     }
-    let refused = ph.offers.iter().filter(|o| o.state == State::Open && matches!(o.verdict, Verdict::Refuse { .. })).count();
-    let open = ph.offers.iter().filter(|o| o.state == State::Open).count();
-    ph.note = Some(format!("intent: proposed={n} acceptable={} refused={refused}", open - refused));
-    if ph.focus.is_none_or(|i| ph.offers.get(i).is_none_or(|o| o.state != State::Open)) {
-        ph.focus = ph.offers.iter().position(|o| o.state == State::Open);
-    }
+    tally(ph, n); // VUGFACESTREAM (SR535): the one corner and focus rule
     n > 0
 }
 
@@ -396,6 +400,11 @@ pub fn key(view: &mut View, k: &str) -> Option<bool> {
 /// refusal is named in the corner and nothing is applied; an accepted one enters through `enter`.
 fn accept(view: &mut View, i: usize) -> bool {
     let (Some(face), Some(ph)) = (view.design.face.as_mut(), view.photo.as_mut()) else { return false };
+    if ph.offers[i].streaming.is_some() {
+        // VUGFACESTREAM (SR535): a preview enters only once the terminal answer has settled it.
+        ph.note = Some("wait: the answer is not complete".to_string());
+        return true;
+    }
     let p = ph.offers[i].proposal.clone();
     let doc = doc_of(face);
     let verdict = doc_core::verify(&doc, &p, &ph.measurement(), Tol::DEFAULT);
@@ -468,10 +477,13 @@ pub fn glyphs(view: &View) -> Vec<ProposalGlyph> {
             continue;
         }
         let stmt = o.proposal.stmt.trim();
-        let (text, refused) = match &o.verdict {
+        let (mut text, refused) = match &o.verdict {
             Verdict::Accept { residual_mm, .. } => (format!("{stmt} R={} C={}", num(*residual_mm), num(o.proposal.confidence)), false),
             Verdict::Refuse { why } => (format!("{stmt} REFUSED {}", why.text()), true),
         };
+        if o.streaming.is_some() {
+            text.push_str(" STREAMING"); // VUGFACESTREAM (SR535): the preview's mark
+        }
         let at = match anchor(face, stmt).and_then(|q| face.to_screen(view, q)) {
             Some((x, y)) => (x as f32 + 6.0, y as f32 - 14.0),
             None => {
@@ -542,6 +554,7 @@ fn ask(view: &mut View) -> bool {
             return true;
         }
     };
+    withdraw(ph); // VUGFACESTREAM (SR535): the stale request's previews go with it
     ph.request += 1;
     let request = ph.request;
     ph.outbox.push(IntentEvent::Propose {
@@ -562,24 +575,115 @@ fn ask(view: &mut View) -> bool {
 pub fn answer(view: &mut View, ev: &IntentEvent) -> bool {
     let Some(ph) = view.photo.as_mut() else { return false };
     let request = match ev {
-        IntentEvent::Propose { .. } | IntentEvent::Proposal { .. } => return false,
-        IntentEvent::Proposals { request, .. } | IntentEvent::Refused { request, .. } => *request,
+        IntentEvent::Propose { .. } => return false,
+        IntentEvent::Proposals { request, .. } | IntentEvent::Refused { request, .. } | IntentEvent::Proposal { request, .. } => *request,
     };
     if ph.asked != Some(request) {
         ph.ignored += 1;
         return false;
     }
+    if let IntentEvent::Proposal { index, proposal, .. } = ev {
+        return preview(view, request, *index, from_bus(proposal)); // VUGFACESTREAM (SR535): the terminal still follows
+    }
     ph.asked = None;
     match ev {
-        IntentEvent::Proposals { proposals, .. } => {
-            let ps = proposals.iter().map(|q| Proposal { stmt: q.stmt.clone(), confidence: q.confidence, why: q.why.clone() }).collect();
-            offer(view, ps);
-            true
-        }
+        IntentEvent::Proposals { proposals, .. } => settle(view, proposals.iter().map(from_bus).collect()), // VUGFACESTREAM (SR535)
         IntentEvent::Refused { why, .. } => {
-            ph.note = Some(format!("Vein refused: {why}"));
+            let k = withdraw(ph); // VUGFACESTREAM (SR535): every preview withdrawn, the count named
+            ph.note = Some(refused_note(why, k));
             true
         }
         IntentEvent::Propose { .. } | IntentEvent::Proposal { .. } => false,
     }
+}
+
+// ---- VUGFACESTREAM (SR535): the streamed preview (named tail block) ----
+
+/// The one verify road: `p` checked by `doc_core::verify` against the face's document and the measured outline, Open.
+fn verified(doc: &Doc, m: &Measurement, p: Proposal, streaming: Option<u32>) -> Offer {
+    let verdict = doc_core::verify(doc, &p, m, Tol::DEFAULT);
+    Offer { proposal: p, verdict, state: State::Open, streaming }
+}
+
+/// The one corner and focus rule after `n` proposals were offered: `intent: proposed=n acceptable=a refused=r` over the
+/// open offers, and the first open one focused when the focus is not on an open one.
+fn tally(ph: &mut Photo, n: usize) {
+    let refused = ph.offers.iter().filter(|o| o.state == State::Open && matches!(o.verdict, Verdict::Refuse { .. })).count();
+    let open = ph.offers.iter().filter(|o| o.state == State::Open).count();
+    ph.note = Some(format!("intent: proposed={n} acceptable={} refused={refused}", open - refused));
+    refocus(ph);
+}
+
+/// The first open offer takes the focus when the focus is not on an open one.
+fn refocus(ph: &mut Photo) {
+    if ph.focus.is_none_or(|i| ph.offers.get(i).is_none_or(|o| o.state != State::Open)) {
+        ph.focus = ph.offers.iter().position(|o| o.state == State::Open);
+    }
+}
+
+/// Vein's proposal as doc_core's.
+fn from_bus(q: &IntentProposal) -> Proposal {
+    Proposal { stmt: q.stmt.clone(), confidence: q.confidence, why: q.why.clone() }
+}
+
+/// A streamed proposal for the live `request` at `index`: a preview at the same index is replaced and verified again,
+/// else a new preview is verified and offered; the corner counts the previews. True (the frame changed).
+fn preview(view: &mut View, request: u64, index: u32, p: Proposal) -> bool {
+    let (Some(face), Some(ph)) = (view.design.face.as_ref(), view.photo.as_mut()) else { return false };
+    let o = verified(&doc_of(face), &ph.measurement(), p, Some(index));
+    match ph.offers.iter().position(|q| q.streaming == Some(index)) {
+        Some(j) => {
+            let state = ph.offers[j].state;
+            ph.offers[j] = Offer { state, ..o };
+        }
+        None => ph.offers.push(o),
+    }
+    let k = ph.offers.iter().filter(|q| q.streaming.is_some()).count();
+    ph.note = Some(format!("Vein streaming: {k} proposals (request {request})"));
+    refocus(ph);
+    true
+}
+
+/// The terminal `Proposals`: item i settles the preview at index i (equal: the mark cleared, the verdict kept; differing:
+/// replaced and verified again, its state kept), an item with no preview is verified and offered, a preview past the
+/// list is withdrawn; then the one corner. True (the frame changed).
+fn settle(view: &mut View, ps: Vec<Proposal>) -> bool {
+    let (Some(face), Some(ph)) = (view.design.face.as_ref(), view.photo.as_mut()) else { return false };
+    let doc = doc_of(face);
+    let m = ph.measurement();
+    let n = ps.len();
+    for (i, p) in ps.into_iter().enumerate() {
+        match ph.offers.iter().position(|q| q.streaming == Some(i as u32)) {
+            Some(j) if ph.offers[j].proposal == p => ph.offers[j].streaming = None,
+            Some(j) => {
+                let state = ph.offers[j].state;
+                ph.offers[j] = Offer { state, ..verified(&doc, &m, p, None) };
+            }
+            None => ph.offers.push(verified(&doc, &m, p, None)),
+        }
+    }
+    withdraw(ph);
+    tally(ph, n);
+    true
+}
+
+/// Every preview withdrawn (removed, the focus re-ruled); the count that had arrived.
+fn withdraw(ph: &mut Photo) -> usize {
+    let before = ph.offers.len();
+    // A settled focused offer keeps the focus: its index less the previews before it.
+    let kept = ph.focus.filter(|&i| ph.offers.get(i).is_some_and(|o| o.streaming.is_none())).map(|i| ph.offers[..i].iter().filter(|o| o.streaming.is_none()).count());
+    ph.offers.retain(|o| o.streaming.is_none());
+    let k = before - ph.offers.len();
+    if k > 0 {
+        ph.focus = kept;
+        refocus(ph);
+    }
+    k
+}
+
+/// The corner for a refusal after `k` previews: `Vein refused: <why>`, plus ` after <k> proposals` unless Vein's own text
+/// already ends with it (handlers/vein `intent`), so the count is never written twice.
+fn refused_note(why: &str, k: usize) -> String {
+    let tail = format!(" after {k} proposals");
+    if k == 0 || why.ends_with(&tail) { format!("Vein refused: {why}") } else { format!("Vein refused: {why}{tail}") }
 }
