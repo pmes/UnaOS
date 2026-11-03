@@ -22,7 +22,9 @@
 //! - [`Port::ready`] is `crate::pump::ready` (the banner wait every transport shares; one soft reset for a silent
 //!   grbl). [`READY_WAIT`] is shorter than tty's: a network board has no bootloader holding the line after connect.
 //! - The opener's connect and banner wait run inside `PumpDesk::apply` under the desk's lock (up to [`CONNECT_WAIT`] +
-//!   2 x [`READY_WAIT`]), as tty's open and wait do; VUG-COMSCAN-RECONNECT owes moving them out.
+//!   2 x [`READY_WAIT`]), as tty's open and wait do. A LOST link (a reset or a FIN mid-stream) is reopened by the
+//!   desk through this same opener with the lock released (VUGCOMSCANRECONNECT, SR521: `PumpDesk::redial_due` /
+//!   `relinked`, 250 ms doubling to 4 s); the first open's wait under the lock stays owed.
 //! - No enumeration: discovery (mDNS `_telnet._tcp` / FluidNC's `.local` name) is owed as VUG-COMSCAN-MDNS.
 //!
 //! std only: no libc, no `unsafe`.

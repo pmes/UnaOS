@@ -238,3 +238,174 @@ fn the_port_grammar_parses_and_refuses_by_name() {
     );
     assert!(refusal_of(io::ErrorKind::TimedOut, p, 3000).to_string().contains("timed out after 3000 ms"));
 }
+
+// --- VUGCOMSCANRECONNECT (SR521): a lost link is LinkLost at its line, redialled with backoff, resumed only after a re-arm ---
+
+use comscan::pump::Refused;
+use pump_core::PumpState;
+
+/// A fake grbl that says its banner, acks exactly `n` lines, then FINs (shutdown Write) and reads to the client's
+/// end; its listener goes at the accept, so a redial finds nobody. Returns every line it saw.
+fn fake_grbl_lost_after(l: TcpListener, n: usize) -> JoinHandle<Vec<String>> {
+    thread::spawn(move || {
+        let (mut s, _) = l.accept().unwrap();
+        drop(l);
+        s.write_all(BANNER).unwrap();
+        let mut got = Vec::new();
+        let mut cur: Vec<u8> = Vec::new();
+        let mut acked = 0usize;
+        let mut buf = [0u8; 256];
+        loop {
+            let k = match s.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(k) => k,
+            };
+            for &b in &buf[..k] {
+                match b {
+                    b'?' | b'!' | b'~' | 0x18 => {}
+                    b'\n' => {
+                        got.push(String::from_utf8_lossy(&cur).trim().to_string());
+                        cur.clear();
+                        if acked < n {
+                            let _ = s.write_all(b"ok\r\n");
+                            acked += 1;
+                            if acked == n {
+                                let _ = s.shutdown(std::net::Shutdown::Write);
+                            }
+                        }
+                    }
+                    _ => cur.push(b),
+                }
+            }
+        }
+        got
+    })
+}
+
+fn refused_why(out: &[PumpEvent]) -> String {
+    match out {
+        [PumpEvent::PumpRefused { why }] => why.clone(),
+        other => panic!("expected one PumpRefused, got {other:?}"),
+    }
+}
+
+/// Tick the desk and run its redials (as `serve_pump` does) until a Squawk word satisfies `want`; every word seen
+/// is appended to `words`.
+fn drive_until(
+    desk: &mut PumpDesk,
+    open: &mut Opener,
+    t0: Instant,
+    words: &mut Vec<String>,
+    want: impl Fn(&str) -> bool,
+) -> PumpEvent {
+    let end = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < end {
+        let now = t0.elapsed().as_micros() as u64;
+        let mut out = desk.tick(now);
+        if let Some(port) = desk.redial_due(now) {
+            let res = open(&port);
+            out.extend(desk.relinked(t0.elapsed().as_micros() as u64, res));
+        }
+        for s in out {
+            if let PumpEvent::Squawk { event: Some(e), .. } = &s {
+                words.push(e.clone());
+                if want(e) {
+                    return s;
+                }
+            }
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+    panic!("no wanted squawk in 10 s; saw {words:?}");
+}
+
+#[test]
+fn a_lost_tcp_link_is_link_lost_at_its_line_redials_with_backoff_and_resumes_only_after_a_rearm() {
+    let (l, port) = listener();
+    let fake1 = fake_grbl_lost_after(l, 5);
+    let p = program();
+    let want = Pump::from_program(&p, GRBL).unwrap();
+    let at = want.line_of(5).unwrap();
+    let lines = want.lines().to_vec();
+    let mut desk = PumpDesk::new(machine());
+    let pass = Verdict::Pass { digest: p.digest(), machine: machine().digest() };
+    let digest = desk.arm(&pass, &p, GRBL).expect("armed by a pass");
+    let mut open = by_scheme(no_serial(), opener(GRBL, Duration::from_millis(500)));
+    let who = Origin::LocalUser("una".to_string());
+    let start = PumpEvent::PumpStart {
+        principal: who.clone(),
+        program: digest_hex(digest),
+        dialect: "grbl".to_string(),
+        port: format!("{TCP_SCHEME}127.0.0.1:{port}"),
+    };
+    let out = desk.apply(&start, &mut *open);
+    assert!(matches!(&out[..], [PumpEvent::Squawk { event: Some(e), .. }] if e == "started"), "{out:?}");
+
+    // The FIN mid-program: LinkLost at the oldest unacknowledged line, the five acks counted.
+    let t0 = Instant::now();
+    let mut words = Vec::new();
+    match drive_until(&mut desk, &mut *open, t0, &mut words, |e| e.starts_with("link lost")) {
+        PumpEvent::Squawk { acked, state, event: Some(e), .. } => {
+            assert_eq!(e, format!("link lost at line {at}; reconnect attempt 1 in 250 ms"));
+            assert_eq!((acked, state.as_str()), (5, "link-lost"));
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(desk.state(), Some(PumpState::LinkLost { at_line: at, program_digest: p.digest() }));
+    let seen = fake1.join().unwrap();
+    assert_eq!(&seen[..5], &lines[..5]);
+
+    // Lost: Resume is refused by name with its line, a re-arm waits for the link, a new start is busy.
+    let resume = PumpEvent::PumpResume { principal: who.clone() };
+    let why = refused_why(&desk.apply(&resume, &mut *open));
+    assert!(why.contains("ResumeAfterLinkLost") && why.contains(&format!("at_line: {at}")), "{why}");
+    assert_eq!(desk.rearm(&pass, &p, GRBL), Err(Refused::LinkDown { attempt: 1 }));
+    assert!(refused_why(&desk.apply(&start, &mut *open)).contains("busy"));
+
+    // Attempt 1 (250 ms after the loss) finds nobody; the next waits the doubled 500 ms.
+    match drive_until(&mut desk, &mut *open, t0, &mut words, |e| e.starts_with("reconnect attempt 1 failed")) {
+        PumpEvent::Squawk { event: Some(e), .. } => {
+            assert!(e.contains("connection refused") && e.ends_with("attempt 2 in 500 ms"), "{e}")
+        }
+        other => panic!("{other:?}"),
+    }
+    let l2 = TcpListener::bind(("127.0.0.1", port)).expect("rebind the lost port");
+    let fake2 = fake_grbl(l2, false, None);
+    match drive_until(&mut desk, &mut *open, t0, &mut words, |e| e.starts_with("relinked")) {
+        PumpEvent::Squawk { event: Some(e), .. } => {
+            assert_eq!(e, format!("relinked on attempt 2; re-arm to resume from line {at}"))
+        }
+        other => panic!("{other:?}"),
+    }
+
+    // Relinked (the banner handshake ran) but not re-armed: still refused.
+    assert!(refused_why(&desk.apply(&resume, &mut *open)).contains("ResumeAfterLinkLost"));
+    let mut q = program();
+    q.moves.push(Move::Rapid { to: Vec3::new(0.0, 0.0, 10.0) });
+    let pass_q = Verdict::Pass { digest: q.digest(), machine: machine().digest() };
+    assert_eq!(desk.rearm(&pass_q, &q, GRBL), Err(Refused::NotTheLostProgram { lost: p.digest(), program: q.digest() }));
+    let mut other = machine();
+    other.envelope.max = Vec3::new(100.0, 100.0, 50.0);
+    let pass_other = Verdict::Pass { digest: p.digest(), machine: other.digest() };
+    assert_eq!(
+        desk.rearm(&pass_other, &p, GRBL),
+        Err(Refused::WrongMachine { passed: other.digest(), desk: machine().digest() }),
+        "the machine digest must match before any motion"
+    );
+    assert_eq!(desk.state(), Some(PumpState::LinkLost { at_line: at, program_digest: p.digest() }));
+
+    // Re-armed by a fresh pass, then Resume streams from the named line to done.
+    assert_eq!(desk.rearm(&pass, &p, GRBL), Ok(at));
+    assert_eq!(desk.state(), Some(PumpState::Rearmed { at_line: at }));
+    let out = desk.apply(&resume, &mut *open);
+    assert!(matches!(&out[..], [PumpEvent::Squawk { event: Some(e), .. }] if e == "resume"), "{out:?}");
+    match drive_until(&mut desk, &mut *open, t0, &mut words, |e| e == "done" || e.starts_with("link lost")) {
+        PumpEvent::Squawk { sent, acked, total, event: Some(e), .. } => {
+            assert_eq!(e, "done");
+            assert_eq!((sent, acked), (total, total));
+        }
+        other => panic!("{other:?}"),
+    }
+    drop(desk);
+    assert_eq!(fake2.join().unwrap(), lines[5..].to_vec(), "the second link ran only the lines from the lost one on");
+}
