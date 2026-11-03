@@ -43,6 +43,9 @@ type Live = (Arc<dyn ModelProvider>, ProviderConfig, Arc<dyn ModelProvider>);
 
 pub struct ProviderSlot {
     inner: Result<Live, String>,
+    /// VUG-VEIN-BUS (SR509): the propose road, resolved here with the chat provider from the same config and the same
+    /// Holocron-first key (never a second resolution); the key stays in the route's private field.
+    route: Result<crate::intent::ProposeRoute, String>,
 }
 
 impl ProviderSlot {
@@ -71,6 +74,7 @@ impl ProviderSlot {
             Ok(store) => Self::from_lookup_with(|k| store.get(PREF_NS, k), env, ask),
             Err(e) => ProviderSlot {
                 inner: Err(format!("preferences unreadable ({}): {e:#}", path.display())),
+                route: Err(String::new()),
             },
         }
     }
@@ -87,6 +91,7 @@ impl ProviderSlot {
         env: impl Fn(&str) -> Option<String>,
         ask: impl FnOnce() -> KeySource,
     ) -> Self {
+        let mut route = Err(String::new());
         let inner = ProviderConfig::from_prefs(get).map_err(|e| e.to_string()).and_then(|cfg| {
             let held = match (&cfg.kind, &cfg.auth) {
                 (ProviderKind::Claude, AuthMode::ApiKeyEnv(var)) => match ask() {
@@ -106,9 +111,17 @@ impl ProviderSlot {
             // VEINTURNS (SR42): two instances — the chat provider keeps the CLI session, engram side calls ride their own.
             let chat = build_provider_with_env(&cfg, &env).map_err(|e| e.to_string())?;
             let side = build_provider_with_env(&cfg, &env).map_err(|e| e.to_string())?;
+            route = crate::intent::ProposeRoute::from_config(&cfg, &env); // VUG-VEIN-BUS (SR509)
             Ok((Arc::from(chat), cfg, Arc::from(side)))
         });
-        ProviderSlot { inner }
+        ProviderSlot { inner, route }
+    }
+
+    /// VUG-VEIN-BUS (SR509): the propose road (endpoint, model, dialect, key), or why there is none — the slot's own
+    /// error first (no key, unreadable preferences), then the provider's (`Unsupported: ...`).
+    pub fn propose_route(&self) -> Result<crate::intent::ProposeRoute, String> {
+        self.inner.as_ref().map_err(Clone::clone)?;
+        self.route.clone()
     }
 
     /// The live provider, or the reason there is none.

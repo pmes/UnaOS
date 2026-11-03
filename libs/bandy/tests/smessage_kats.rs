@@ -1595,6 +1595,7 @@ fn smessage_variant_name(m: &SMessage) -> &'static str {
         SMessage::BrowserAuxButton { .. } => "BrowserAuxButton", // VUG-FACE-BUTTONS (SR477): the right / middle / extra buttons and the pinch
         SMessage::BrowserPinch { .. } => "BrowserPinch",
         SMessage::Pump(_) => "Pump", // VUGCOMSCAN1 (SR476): Comscan's pump channel
+        SMessage::Intent(_) => "Intent", // VUG-VEIN-BUS (SR509): Vug's propose exchange with Vein
     }
 }
 
@@ -1878,4 +1879,33 @@ kat!(
         event: None,
     }),
     r#"{"Pump":{"Squawk":{"sent":12,"acked":9,"total":40,"state":"streaming"}}}"#
+);
+// VUG-VEIN-BUS (SR509): Vug's propose exchange with Vein; the photo rides as bytes and every answer echoes the request.
+kat!(
+    kat_intent_propose,
+    SMessage::Intent(bandy::IntentEvent::Propose {
+        principal: Origin::LocalUser("una".to_string()),
+        context: "vug-doc version=1 lin=1e-6 ang=1e-9".to_string(),
+        measurements: "l1 len=49.7 sigma=0.4".to_string(),
+        images: vec![bandy::IntentImage { media_type: "image/png".to_string(), bytes: vec![137, 80, 78, 71] }],
+        request: 7,
+    }),
+    r#"{"Intent":{"Propose":{"principal":{"LocalUser":"una"},"context":"vug-doc version=1 lin=1e-6 ang=1e-9","measurements":"l1 len=49.7 sigma=0.4","images":[{"media_type":"image/png","bytes":[137,80,78,71]}],"request":7}}}"#
+);
+kat!(
+    kat_intent_proposals,
+    SMessage::Intent(bandy::IntentEvent::Proposals {
+        request: 7,
+        proposals: vec![bandy::IntentProposal {
+            stmt: "parallel c8 sketch=s1 a=l1 b=l3".to_string(),
+            confidence: 0.93,
+            why: "The two long edges measure 0.3 deg apart.".to_string(),
+        }],
+    }),
+    r#"{"Intent":{"Proposals":{"request":7,"proposals":[{"stmt":"parallel c8 sketch=s1 a=l1 b=l3","confidence":0.93,"why":"The two long edges measure 0.3 deg apart."}]}}}"#
+);
+kat!(
+    kat_intent_refused,
+    SMessage::Intent(bandy::IntentEvent::Refused { request: 7, why: "ProseAroundJson".to_string() }),
+    r#"{"Intent":{"Refused":{"request":7,"why":"ProseAroundJson"}}}"#
 );

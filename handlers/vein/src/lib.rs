@@ -9,6 +9,7 @@
 pub mod context;
 pub mod cortex;
 pub mod gravity;
+pub mod intent; // VUG-VEIN-BUS (SR509): Vug's propose exchange over the bus
 pub mod provider;
 pub mod reembed;
 pub mod skeleton;
@@ -465,6 +466,10 @@ impl VeinHandler {
                                             }
                                             _ => {}
                                         }
+                                    }
+                                    // VUG-VEIN-BUS (LEDGER SR509): a Vug propose, resolved as chat resolves and answered on its own task (named hunk)
+                                    SMessage::Intent(ev) if ev.is_request() => {
+                                        intent::serve(synapse_loop.clone(), ev, intent::Road::resolve(intent::provider_pref().as_deref(), &brain));
                                     }
                                     _ => {}
                                     },
