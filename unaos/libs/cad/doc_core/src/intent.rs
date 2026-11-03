@@ -122,7 +122,9 @@ pub enum Reason {
     /// VUGINTENTHOLES (SR507): a replayed profile loop or a measured loop has no partner (no loop of the other side
     /// whose centroid is within the larger extent, one-to-one); the counts are the replayed and measured loops.
     UnmatchedLoop { replayed: usize, measured: usize },
-    /// VUGINTENTSCAN (SR508): measured shape `index` has no replayed face of its kind.
+    /// VUGINTENTSCAN (SR508): measured shape `index` has no replayed face of its kind. VUG-INTENT-SCAN-UNMATCHED (SR515):
+    /// only when NO measured shape has one (the proposal cannot be judged; `index` / `kind` are the first shape's); a
+    /// shape alone without a partner is left out of the residual and reported in [`Batch::unmatched`].
     UnmatchedShape { index: usize, kind: &'static str },
 }
 
@@ -270,6 +272,9 @@ fn redundant(r: &Replay) -> usize {
 pub struct Batch {
     pub doc: Doc,
     pub entries: Vec<(String, f64, Verdict)>,
+    /// VUG-INTENT-SCAN-UNMATCHED (SR515): each measured shape (index, shape) with no face of its kind in the document's
+    /// replay, left out of every residual and reported; empty for any other measurement.
+    pub unmatched: Vec<(usize, ShapeRef)>,
 }
 
 impl Batch {
@@ -277,11 +282,15 @@ impl Batch {
         self.entries.iter().filter(|(_, _, v)| matches!(v, Verdict::Accept { .. })).count()
     }
 
-    /// `intent: proposed=<n> accepted=<a> refused=<r>`, then one line per proposal.
+    /// `intent: proposed=<n> accepted=<a> refused=<r>`, one `unmatched <kind> #<i> support=<n> rms=<r>` line per
+    /// unmatched shape (VUG-INTENT-SCAN-UNMATCHED, SR515), then one line per proposal.
     pub fn text(&self) -> String {
         let n = self.entries.len();
         let a = self.accepted();
         let mut out = format!("intent: proposed={} accepted={} refused={}\n", n, a, n - a);
+        for (i, s) in &self.unmatched {
+            out.push_str(&format!("unmatched {} #{} support={} rms={}\n", s.kind(), i, s.support, f64_text(s.rms_mm)));
+        }
         for (s, c, v) in &self.entries {
             match v {
                 Verdict::Accept { residual_mm, max_mm, residual_sigma } => out.push_str(&format!(
@@ -312,7 +321,15 @@ pub fn verify_all(doc: &Doc, ps: &[Proposal], m: &Measurement, tol: Tol) -> Batc
         }
         entries.push((p.stmt.clone(), p.confidence, v));
     }
-    Batch { doc: cur, entries }
+    // VUG-INTENT-SCAN-UNMATCHED (SR515): the shapes the document's own replay has no face of their kind for.
+    let unmatched = match m {
+        Measurement::Shapes { shapes, .. } => {
+            let r = replay(doc, tol);
+            shapes.iter().enumerate().filter(|(_, s)| !has_partner(&r, s)).map(|(i, s)| (i, *s)).collect()
+        }
+        _ => Vec::new(),
+    };
+    Batch { doc: cur, entries, unmatched }
 }
 
 struct Fit {
@@ -578,8 +595,15 @@ fn pair(s: &ShapeParams, f: &brep_core::Surface) -> Option<(f64, f64)> {
     }
 }
 
+/// Whether any replayed face is of `s`'s kind (VUG-INTENT-SCAN-UNMATCHED, SR515).
+fn has_partner(r: &Replay, s: &ShapeRef) -> bool {
+    r.solids.iter().any(|solid| solid.brep.faces.iter().any(|f| pair(&s.params, &f.surface).is_some()))
+}
+
 /// Every shape matched to the replayed face of its kind with the smallest `max(dist_mm, ang_deg * sigma_mm /
 /// sigma_deg)`; that value is the shape's residual (so judge's one `K_SIGMA * sigma_mm` limit holds both).
+/// VUG-INTENT-SCAN-UNMATCHED (SR515): a shape with no face of its kind (a TSDF-rounded corner read as a cone, an open
+/// rim as a sphere) is left out, and [`verify_all`] reports it; only when no shape matches is the proposal refused.
 fn shape_residuals(
     r: &Replay,
     shapes: &[ShapeRef],
@@ -594,7 +618,8 @@ fn shape_residuals(
         return Err(Reason::NoGeometry);
     }
     let per_deg = sigma_mm / sigma_deg;
-    for (i, s) in shapes.iter().enumerate() {
+    let mut matched = 0usize;
+    for s in shapes {
         let mut best: Option<f64> = None;
         for solid in &r.solids {
             for face in &solid.brep.faces {
@@ -604,12 +629,15 @@ fn shape_residuals(
                 }
             }
         }
-        match best {
-            Some(v) => d.push(v),
-            None => return Err(Reason::UnmatchedShape { index: i, kind: s.kind() }),
+        if let Some(v) = best {
+            d.push(v);
+            matched += 1;
         }
     }
-    Ok(())
+    match shapes.first() {
+        Some(s) if matched == 0 => Err(Reason::UnmatchedShape { index: 0, kind: s.kind() }),
+        _ => Ok(()),
+    }
 }
 
 /// `v` to `places` decimals, trailing zeros, a bare point and a negative zero dropped.

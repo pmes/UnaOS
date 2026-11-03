@@ -80,23 +80,45 @@ fn shapes_accept_the_round_diameter_and_refuse_a_wrong_one() {
     }
 }
 
+/// VUG-INTENT-SCAN-UNMATCHED (SR515): a shape with no face of its kind (a TSDF-rounded corner, an open rim) is left out
+/// of the residual and reported before the proposals, never a refusal of the batch.
 #[test]
-fn a_shape_with_no_face_of_its_kind_is_unmatched_by_name() {
+fn a_shape_with_no_face_of_its_kind_is_reported_not_refused() {
     let d = doc(HOLE_PLATE);
     let mut s = fixture_shapes();
     s.push(ShapeRef { params: ShapeParams::Sphere { centre: v(60.0, 60.0, 30.0), radius: 5.0 }, support: 300, rms_mm: 0.2 });
-    let why = match verify(&d, &p("diameter i1 sketch=s circle=c1 d=80"), &shapes(s), d.tol) {
-        Verdict::Refuse { why } => why,
-        v => panic!("accepted: {:?}", v),
-    };
-    assert_eq!(why, Reason::UnmatchedShape { index: 2, kind: "sphere" });
-    assert_eq!(why.text(), "unmatched-shape sphere #2");
+    let m = shapes(s);
+    match verify(&d, &p("diameter i1 sketch=s circle=c1 d=80"), &m, d.tol) {
+        Verdict::Accept { max_mm, .. } => assert!((max_mm - 0.26).abs() < 1e-6, "max {}", max_mm),
+        v => panic!("refused over an unmatched shape: {:?}", v),
+    }
+    let b = verify_all(&d, &[p("diameter i1 sketch=s circle=c1 d=80")], &m, d.tol);
+    assert_eq!(b.unmatched.len(), 1);
+    assert_eq!(b.unmatched[0].0, 2);
+    let t = b.text();
+    assert!(t.starts_with("intent: proposed=1 accepted=1 refused=0\nunmatched sphere #2 support=300 rms=0.2\naccept "), "{}", t);
+    // Every shape matched: no unmatched line.
+    let b = verify_all(&d, &[p("diameter i1 sketch=s circle=c1 d=80")], &shapes(fixture_shapes()), d.tol);
+    assert!(b.unmatched.is_empty() && !b.text().contains("unmatched"), "{}", b.text());
     // A non-positive angular sigma is a bad measurement.
     let bad = Measurement::Shapes { shapes: fixture_shapes(), sigma_mm: SIGMA, sigma_deg: 0.0 };
     assert_eq!(
         verify(&d, &p("diameter i1 sketch=s circle=c1 d=80"), &bad, d.tol),
         Verdict::Refuse { why: Reason::BadMeasurement }
     );
+}
+
+/// No measured shape has a face of its kind: the proposal cannot be judged and is refused by name (the first shape's).
+#[test]
+fn no_shape_with_a_face_of_its_kind_is_refused_by_name() {
+    let d = doc(HOLE_PLATE);
+    let only = vec![ShapeRef { params: ShapeParams::Sphere { centre: v(60.0, 60.0, 30.0), radius: 5.0 }, support: 300, rms_mm: 0.2 }];
+    let why = match verify(&d, &p("diameter i1 sketch=s circle=c1 d=80"), &shapes(only), d.tol) {
+        Verdict::Refuse { why } => why,
+        v => panic!("accepted: {:?}", v),
+    };
+    assert_eq!(why, Reason::UnmatchedShape { index: 0, kind: "sphere" });
+    assert_eq!(why.text(), "unmatched-shape sphere #0");
 }
 
 #[test]
