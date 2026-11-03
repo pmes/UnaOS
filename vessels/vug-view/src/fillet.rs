@@ -12,8 +12,8 @@
 //! Chamfer; a click re-picks; the value is typed through the SR494 road (sketch.rs `type_into`: digits, one `.`, a
 //! leading `-`, Backspace), a chamfer taking `d1,d2` (one value for both); Enter commits on the Body's Brep and
 //! re-tessellates, Esc cancels. A refusal is shown by name at the edge (`RadiusTooLarge max <r>`), at the vertex
-//! (`CornerNotBlended`), the body unchanged and the tool left open. The face writes no statement: the statement log
-//! is VUG-FACE-FEATURE-TREE (SR513).
+//! (`CornerNotBlended`), the body unchanged and the tool left open. The commit writes `fillet f<n> on=<feature>
+//! edges=[[..]] r=` (chamfer `c<n> d1= d2=`) through journal.rs `Journal::record_edit` (VUGFACETREEFILLET, SR518).
 
 use crate::extrude::Body;
 use crate::model::Model;
@@ -231,7 +231,7 @@ fn commit(view: &mut View) {
     };
     match outcome {
         Ok(b) => {
-            view.design.body = Some(b);
+            view.design.body = Some(b); record(view, mode, &edge, &vals); // VUGFACETREEFILLET (SR518): the committed edit is a statement
             view.picked = None;
             view.fillet = None;
         }
@@ -272,4 +272,18 @@ pub fn overlay(view: &View, fr: &mut Raster) {
             raster::text(fr, &n.text, x + 6.0, y + 4.0, rgba(REFUSED));
         }
     }
+}
+
+// ---- VUGFACETREEFILLET (SR518): the committed edit enters the document ----
+
+/// The committed fillet / chamfer as a doc_core statement on the picked edge's Name (the writer spells it), handed
+/// to the journal, which names its id and its `on` feature from the edge's Body index.
+fn record(view: &mut View, mode: Mode, edge: &Picked, vals: &[f64]) {
+    let Some(&d1) = vals.first() else { return };
+    let edges = vec![edge.name];
+    let stmt = match mode {
+        Mode::Fillet => doc_core::Stmt::Fillet { id: String::new(), on: String::new(), edges, r: d1 },
+        Mode::Chamfer => doc_core::Stmt::Chamfer { id: String::new(), on: String::new(), edges, d1, d2: *vals.get(1).unwrap_or(&d1) },
+    };
+    view.design.journal.record_edit(edge.brep, stmt);
 }
