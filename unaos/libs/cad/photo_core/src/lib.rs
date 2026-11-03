@@ -146,8 +146,15 @@ pub struct Measured {
     pub residual_mm: f64,
     /// The rectified sampling step (px per mm) the silhouette was taken at.
     pub rect_px_per_mm: f64,
-    /// The radial residual pattern: k in e_radial = k (r / r_max)³ (px at the photo's corner; VUG-PHOTO-LENS owes the model).
+    /// The radial residual pattern LEFT after the lens term: k in e_radial = k (r / r_max)³ (px at the photo's corner).
     pub lens_hint: f64,
+    /// VUG-PHOTO-LENS (SR533): the Brown radial term k1 (r_d = r (1 + k1 r²), r normalised by the half-diagonal, about
+    /// the photo's centre) the photo was undistorted by before the lattice and the silhouette; 0.0 when the term did
+    /// not halve the residual (the SR503 road, bit-exact). When non-zero, `h` maps paper mm to UNDISTORTED px: a
+    /// consumer drawing over the raw photo composes `homography::distort(apply(h, p), k1, w, h)`.
+    pub k1: f64,
+    /// The lattice residual (px) with no lens term (= `residual_px` when `k1` is 0.0).
+    pub residual_flat_px: f64,
     /// The camera's tilt off square at the lattice centroid (degrees).
     pub tilt_deg: f64,
     /// The ink stroke width (mm), measured from the edge pairs.
@@ -167,6 +174,11 @@ pub struct Measured {
 
 /// Measure a photo of a flat part lying on graph paper of `params.pitch_mm`; `tol` is the sketch's tolerance.
 pub fn measure(img: &Image, params: PhotoParams, tol: Tol) -> Result<Measured, Refusal> {
+    measure_lens(img, params, tol, true)
+}
+
+/// [`measure`] with the lens term on (`lens`) or off (VUG-PHOTO-LENS SR533; off is the SR503 road).
+pub fn measure_lens(img: &Image, params: PhotoParams, tol: Tol, lens: bool) -> Result<Measured, Refusal> {
     let pitch = params.pitch_mm;
     if !(pitch.is_finite() && pitch > 0.0) {
         return Err(Refusal::BadPitch);
@@ -176,6 +188,12 @@ pub fn measure(img: &Image, params: PhotoParams, tol: Tol) -> Result<Measured, R
     let g = grid::find(&el, gray.w, gray.h)?;
     let lat = homography::fit_lattice(&g, pitch, gray.w, gray.h)?;
     let max_deg = params.band.ang * 180.0 / core::f64::consts::PI;
+    if lat.tilt_deg > max_deg {
+        return Err(Refusal::GridUnsquare { deg: lat.tilt_deg });
+    }
+    // VUG-PHOTO-LENS (SR533): k1 from the lattice residual; the photo undistorted before the silhouette.
+    let residual_flat_px = lat.residual_px;
+    let (gray, g, lat, k1) = if lens { lens_passes(gray, g, lat, pitch)? } else { (gray, g, lat, 0.0) };
     if lat.tilt_deg > max_deg {
         return Err(Refusal::GridUnsquare { deg: lat.tilt_deg });
     }
@@ -203,6 +221,8 @@ pub fn measure(img: &Image, params: PhotoParams, tol: Tol) -> Result<Measured, R
         residual_mm: lat.residual_mm,
         rect_px_per_mm: r,
         lens_hint: lat.lens_hint,
+        k1,
+        residual_flat_px,
         tilt_deg: lat.tilt_deg,
         line_width_mm,
         grid: (g.a.len(), g.b.len()),
@@ -213,4 +233,54 @@ pub fn measure(img: &Image, params: PhotoParams, tol: Tol) -> Result<Measured, R
         solved: sk.solved,
         profiles: sk.profiles,
     })
+}
+
+// VUG-PHOTO-LENS (SR533): the passes. Pass 0 is the flat lattice (SR503's); k1 is fitted to its inliers and taken
+// only when it brings the residual to LENS_GAIN of the flat one; each refinement pass undistorts the photo by the
+// current k1, finds the grid again (the bowed lines now straight, so more of them are seen), takes the intersections
+// back to raw pixels by the exact forward model and fits the TOTAL k1; the last k1 undistorts the photo the lattice
+// and the silhouette are measured on.
+fn lens_passes(
+    gray0: edges::Gray,
+    g0: grid::Grid,
+    lat0: homography::Lattice,
+    pitch: f64,
+) -> Result<(edges::Gray, grid::Grid, homography::Lattice, f64), Refusal> {
+    let (w, h) = (gray0.w, gray0.h);
+    let (paper, raw) = homography::lens_set(&g0, pitch, &|q: Vec2| q)?;
+    let rms0 = homography::lens_residual(&paper, &raw, 0.0, w, h);
+    let (mut k, rms_k) = homography::fit_k1(&paper, &raw, w, h);
+    if !(rms_k <= homography::LENS_GAIN * rms0) {
+        return Ok((gray0, g0, lat0, 0.0));
+    }
+    for _ in 0..homography::LENS_PASSES {
+        let (_, g) = lens_grid(&gray0, k)?;
+        let kp = k;
+        let (paper, raw) = homography::lens_set(&g, pitch, &|q: Vec2| homography::distort(q, kp, w, h))?;
+        k = homography::fit_k1(&paper, &raw, w, h).0;
+    }
+    let (gray, g) = lens_grid(&gray0, k)?;
+    let lat = homography::fit_lattice(&g, pitch, w, h)?;
+    Ok((gray, g, lat, k))
+}
+
+fn lens_grid(gray0: &edges::Gray, k1: f64) -> Result<(edges::Gray, grid::Grid), Refusal> {
+    let gray = undistort_gray(gray0, k1);
+    let g = grid::find(&edges::edgels(&gray), gray.w, gray.h)?;
+    Ok((gray, g))
+}
+
+/// The photo undistorted by `k1`: every pixel is the raw luma (bilinear, `Gray::sample`) where the lens put it, the
+/// coordinates clamped to the pixel centres' hull.
+pub fn undistort_gray(g: &edges::Gray, k1: f64) -> edges::Gray {
+    let (w, h) = (g.w, g.h);
+    let (xmax, ymax) = (w as f64 - 0.5 - 1e-9, h as f64 - 0.5 - 1e-9);
+    let mut v = Vec::with_capacity(w * h);
+    for j in 0..h {
+        for i in 0..w {
+            let q = homography::distort(Vec2::new(i as f64 + 0.5, j as f64 + 0.5), k1, w, h);
+            v.push(g.sample(q.x.clamp(0.5, xmax), q.y.clamp(0.5, ymax)).unwrap_or(g.at(i, j)));
+        }
+    }
+    edges::Gray { w, h, v }
 }

@@ -297,3 +297,110 @@ pub fn fit_lattice(grid: &Grid, pitch: f64, w: usize, h: usize) -> Result<Lattic
         y1,
     })
 }
+
+// VUG-PHOTO-LENS (SR533): the Brown one-parameter radial term (Brown, "Decentering distortion of lenses",
+// Photogrammetric Engineering 1966; its k1 alone) about the photo's centre, normalised by the half-diagonal (the
+// centre and normaliser `fit_lattice`'s `lens_hint` reads): an undistorted point at normalised radius r is seen at
+// r_d = r (1 + k1 r²). k1 is estimated AFTER the homography from the lattice residual: a golden-section search
+// (Kiefer 1953) on k1 in [−K1_SPAN, K1_SPAN] minimising the rms residual of the DLT refitted to the undistorted
+// intersections. k1 = 0 is the identity by an explicit branch, so a flat photo measures bit-exactly as SR503.
+
+/// The k1 search span (normalised by the half-diagonal; at −0.12 the corner, r_d = 1, is still invertible).
+pub const K1_SPAN: f64 = 0.12;
+/// The golden-section bracket width at which the search stops.
+pub const K1_TOL: f64 = 1e-5;
+/// The term is taken only when it brings the lattice residual to at most this fraction of the flat residual.
+pub const LENS_GAIN: f64 = 0.5;
+/// Refinement passes: the photo undistorted by the current k1, the grid found again, k1 re-estimated.
+pub const LENS_PASSES: usize = 2;
+
+fn lens_frame(w: usize, h: usize) -> (Vec2, f64) {
+    (Vec2::new(w as f64 * 0.5, h as f64 * 0.5), libm::hypot(w as f64 * 0.5, h as f64 * 0.5))
+}
+
+/// Where the undistorted pixel `p` of a `w` x `h` photo is seen under `k1`.
+pub fn distort(p: Vec2, k1: f64, w: usize, h: usize) -> Vec2 {
+    if k1 == 0.0 {
+        return p;
+    }
+    let (c, rm) = lens_frame(w, h);
+    let n = (p - c) / rm;
+    c + n * (rm * (1.0 + k1 * n.mag_sq()))
+}
+
+/// The undistorted pixel seen at `q` under `k1`: r (1 + k1 r²) = r_d by Newton from r = r_d.
+pub fn undistort(q: Vec2, k1: f64, w: usize, h: usize) -> Vec2 {
+    if k1 == 0.0 {
+        return q;
+    }
+    let (c, rm) = lens_frame(w, h);
+    let nd = (q - c) / rm;
+    let rd = nd.mag();
+    if !(rd > 0.0) {
+        return q;
+    }
+    let mut r = rd;
+    for _ in 0..20 {
+        let d = 1.0 + 3.0 * k1 * r * r;
+        if !(d > 0.0) {
+            break;
+        }
+        let step = (r + k1 * r * r * r - rd) / d;
+        r -= step;
+        if !(step.abs() >= 1e-14) {
+            break;
+        }
+    }
+    c + nd * (rm * r / rd)
+}
+
+/// The rms residual (px, undistorted) of the DLT refitted to `raw` undistorted by `k1` against `paper`; +inf on a
+/// degenerate fit.
+pub fn lens_residual(paper: &[Vec2], raw: &[Vec2], k1: f64, w: usize, h: usize) -> f64 {
+    let px: Vec<Vec2> = raw.iter().map(|&q| undistort(q, k1, w, h)).collect();
+    let Ok(hm) = dlt(paper, &px) else { return f64::INFINITY };
+    let mut e = 0.0;
+    for k in 0..paper.len() {
+        match apply(&hm, paper[k]) {
+            Some(q) => e += q.dist(px[k]) * q.dist(px[k]),
+            None => return f64::INFINITY,
+        }
+    }
+    libm::sqrt(e / paper.len().max(1) as f64)
+}
+
+/// Golden-section search for the k1 minimising [`lens_residual`]: (k1, its rms residual).
+pub fn fit_k1(paper: &[Vec2], raw: &[Vec2], w: usize, h: usize) -> (f64, f64) {
+    let g = (libm::sqrt(5.0) - 1.0) * 0.5;
+    let f = |k: f64| lens_residual(paper, raw, k, w, h);
+    let (mut a, mut b) = (-K1_SPAN, K1_SPAN);
+    let mut c = b - g * (b - a);
+    let mut d = a + g * (b - a);
+    let (mut fc, mut fd) = (f(c), f(d));
+    while b - a > K1_TOL {
+        if fc <= fd {
+            b = d;
+            d = c;
+            fd = fc;
+            c = b - g * (b - a);
+            fc = f(c);
+        } else {
+            a = c;
+            c = d;
+            fc = fd;
+            d = a + g * (b - a);
+            fd = f(d);
+        }
+    }
+    let k = 0.5 * (a + b);
+    (k, f(k))
+}
+
+/// The lens fit's correspondences: the paper points of RANSAC's inliers among `grid`'s intersections (built as
+/// [`fit_lattice`] builds them) and their pixels taken back to the RAW photo by `to_raw`.
+pub(crate) fn lens_set(grid: &Grid, pitch: f64, to_raw: &dyn Fn(Vec2) -> Vec2) -> Result<(Vec<Vec2>, Vec<Vec2>), Refusal> {
+    let paper: Vec<Vec2> = grid.inter.iter().map(|q| Vec2::new(q.i as f64 * pitch, q.j as f64 * pitch)).collect();
+    let px: Vec<Vec2> = grid.inter.iter().map(|q| q.px).collect();
+    let (_, inl) = ransac(&paper, &px, BAND_PX)?;
+    Ok((pick(&paper, &inl), inl.iter().map(|&k| to_raw(px[k])).collect()))
+}

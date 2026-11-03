@@ -5,7 +5,7 @@
 
 use photo_core::fixture::{self, CORNER_R, HOLE_D, HOLES, PART_H, PART_W, Spec};
 use photo_core::homography::{apply, dlt};
-use photo_core::{Measured, PhotoParams, Prim, Refusal, Tol, Vec2, contour, fit, measure, silhouette};
+use photo_core::{Measured, PhotoParams, Prim, Refusal, Tol, Vec2, contour, fit, measure, measure_lens, silhouette};
 use sketch_core::{Constraint, Entity, EntityId, PointRef, dof, profiles, solve};
 
 fn run(s: &Spec) -> Result<Measured, Refusal> {
@@ -34,8 +34,8 @@ fn shared(a: (Vec2, Vec2), b: (Vec2, Vec2)) -> (Vec2, Vec2, Vec2) {
 fn good_photo_measures_the_part() {
     let m = run(&Spec::good()).expect("the good photo measures");
     eprintln!(
-        "photo: grid={}x{} pitch_px={:.2} residual_px={:.4} residual_mm={:.4} sigma_mm={:.4} tilt_deg={:.2} lens_hint={:.4} line_width_mm={:.3} inter={} inliers={} prims={:?} dof={}",
-        m.grid.0, m.grid.1, m.pitch_px, m.residual_px, m.residual_mm, m.sigma_mm, m.tilt_deg, m.lens_hint,
+        "photo: grid={}x{} pitch_px={:.2} residual_px={:.4} residual_mm={:.4} sigma_mm={:.4} tilt_deg={:.2} lens_hint={:.4} k1={:.4} line_width_mm={:.3} inter={} inliers={} prims={:?} dof={}",
+        m.grid.0, m.grid.1, m.pitch_px, m.residual_px, m.residual_mm, m.sigma_mm, m.tilt_deg, m.lens_hint, m.k1,
         m.line_width_mm, m.intersections, m.inliers, m.shape.counts(), m.solved.dof
     );
     assert!(m.sigma_mm < 0.3, "sigma_mm {}", m.sigma_mm);
@@ -227,4 +227,47 @@ fn dp_kat() {
     for c in corners {
         assert!(kept.iter().any(|k| k.dist(c) < 1e-9));
     }
+}
+
+/// VUGPHOTOLENS (SR533): the scene through a barrel lens (k1 = -0.08): the radial term recovers k1 within 10 %, the
+/// 50 x 30 plate within 0.1 mm, and the flat lattice's residual is at least 3x the corrected one.
+#[test]
+fn lens_photo_recovers_k1() {
+    let m = run(&Spec::lens()).expect("the lens photo measures");
+    eprintln!(
+        "photo: k1={:.4} residual_px={:.4} residual_flat_px={:.4} residual_mm={:.4} sigma_mm={:.4} lens_hint={:.4} inter={} inliers={} prims={:?}",
+        m.k1, m.residual_px, m.residual_flat_px, m.residual_mm, m.sigma_mm, m.lens_hint, m.intersections, m.inliers,
+        m.shape.counts()
+    );
+    assert!((m.k1 - (-0.08)).abs() <= 0.008, "k1 {}", m.k1);
+    assert!(m.residual_flat_px >= 3.0 * m.residual_px, "flat {} vs corrected {}", m.residual_flat_px, m.residual_px);
+    assert_eq!(m.shape.counts(), (4, 1, 2), "{:?}", m.shape);
+    assert_eq!(m.loops.len(), 3);
+    let ls = lines(&m);
+    let (a50, b50) = nearest_len(&ls, PART_W);
+    let (a30, b30) = nearest_len(&ls, PART_H);
+    let (w, h) = (a50.dist(b50), a30.dist(b30));
+    eprintln!("photo: plate={w:.3}x{h:.3}");
+    assert!((w - PART_W).abs() < 0.1, "plate side {w} vs {PART_W}");
+    assert!((h - PART_H).abs() < 0.1, "plate side {h} vs {PART_H}");
+}
+
+/// VUGPHOTOLENS (SR533): a perfect lens (k1 = 0) takes no term, and every number is bit-equal to the SR503 road.
+#[test]
+fn flat_photo_is_sr503() {
+    let img = pixel_core::decode(&fixture::png(&Spec::good())).expect("pixel_core decodes the fixture PNG");
+    let m = measure(&img, PhotoParams::new(5.0), Tol::DEFAULT).expect("the good photo measures");
+    let f = measure_lens(&img, PhotoParams::new(5.0), Tol::DEFAULT, false).expect("the SR503 road measures");
+    assert_eq!(m.k1, 0.0);
+    assert_eq!(f.k1, 0.0);
+    assert_eq!(m.residual_flat_px, m.residual_px);
+    assert_eq!(m.outline, f.outline);
+    assert_eq!(m.loops, f.loops);
+    assert_eq!(m.h, f.h);
+    assert_eq!(m.residual_px, f.residual_px);
+    assert_eq!(m.residual_mm, f.residual_mm);
+    assert_eq!(m.sigma_mm, f.sigma_mm);
+    assert_eq!(m.tilt_deg, f.tilt_deg);
+    assert_eq!(m.lens_hint, f.lens_hint);
+    assert_eq!(m.solved.dof, f.solved.dof);
 }

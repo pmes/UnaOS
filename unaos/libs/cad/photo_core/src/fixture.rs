@@ -9,13 +9,15 @@
 //! point `centre`, the paper tilted `tilt_deg` about an in-paper axis at `tilt_axis_deg` (the photo's y runs down;
 //! the paper's y up). Each pixel is the mean of 4 x 4 samples, then a 3 x 3 box blur (the 3 px blur), then Gaussian
 //! noise of `noise` luma (splitmix64 + Box-Muller, seeded). Pure: a value in, an `Image` (or PNG bytes) out.
+//! The lens (`k1`, VUG-PHOTO-LENS SR533) takes each sample through `homography::undistort` before the camera, so the
+//! measurement's own model renders the bowed grid exactly.
 
 use alloc::vec;
 use alloc::vec::Vec;
 
 use geom_core::Vec3;
 
-use crate::homography::{H, SplitMix, apply, invert, mul};
+use crate::homography::{H, SplitMix, apply, invert, mul, undistort};
 use crate::{Image, Vec2};
 
 pub const PITCH: f64 = 5.0;
@@ -50,6 +52,8 @@ pub struct Spec {
     /// Gaussian noise, luma units.
     pub noise: f64,
     pub seed: u64,
+    /// VUG-PHOTO-LENS (SR533): the lens's Brown radial term (`homography::distort`); 0.0 is a perfect lens.
+    pub k1: f64,
 }
 
 impl Spec {
@@ -70,12 +74,18 @@ impl Spec {
             part: true,
             noise: 6.0,
             seed: 0x0503_F1A7_0000_0001,
+            k1: 0.0,
         }
     }
 
     /// The same scene under a 35° tilt (the camera far from square).
     pub fn unsquare() -> Spec {
         Spec { tilt_deg: 35.0, ..Spec::good() }
+    }
+
+    /// VUG-PHOTO-LENS (SR533): the same scene through a barrel lens, k1 = −0.08 (the grid lines bow).
+    pub fn lens() -> Spec {
+        Spec { k1: -0.08, ..Spec::good() }
     }
 
     /// The part on blank paper.
@@ -175,6 +185,7 @@ pub fn render(s: &Spec) -> Image {
             for b in 0..4 {
                 for a in 0..4 {
                     let q = Vec2::new(i as f64 + (a as f64 + 0.5) / 4.0, j as f64 + (b as f64 + 0.5) / 4.0);
+                    let q = undistort(q, s.k1, w, h); // VUG-PHOTO-LENS (SR533): the identity at k1 = 0.0
                     let c = apply(&hinv, q).map(|p| colour(s, p)).unwrap_or(PAPER);
                     for k in 0..3 {
                         acc[k] += c[k];
