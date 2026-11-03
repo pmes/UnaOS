@@ -212,7 +212,10 @@ fn a_tracked_prb_recording_fuses_without_poses() {
     assert_eq!(field(&report, "track: frames=", "frames"), "12");
     assert_eq!(field(&report, "track: frames=", "tracked"), "11");
     assert_eq!(field(&report, "track: frames=", "lost"), "0");
-    assert_eq!(field(&report, "track: frames=", "drift_est"), "none");
+    // VUGSCANLOOP (SR500): twelve frames over 11 degrees never come back near an old keyframe: no candidate, no closure.
+    assert_eq!(field(&report, "loop:", "candidates"), "0");
+    assert_eq!(field(&report, "loop:", "closures"), "0");
+    assert_eq!((field(&report, "loop:", "before"), field(&report, "loop:", "after")), ("none", "none"));
     let p0 = truth(0);
     // The plane: the ground (z = 0) or the box top (z = 100), within 1° of up, 4 mm of its height, rms <= 4.
     let n = p0.apply_vector(v3(field(&report, "plane:", "normal")));

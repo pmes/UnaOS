@@ -35,8 +35,12 @@
 //!   depth pixel (`Scan(NoDepth)`), is SKIPPED: never integrated, the tracker and the volume as they were, counted
 //!   `lost` and named on its own report line; any other refusal ends the run (`Track { frame, error }`). Gravity is
 //!   not passed: a .prb carries no accel record until SONDE-RECORD-IMU (VUG-SCAN-TOOL-GRAVITY owed). The report adds
-//!   `track: frames= tracked= lost= fine_iters_max= drift_est=none` (no truth on a recording, so no error is printed)
-//!   and one `track: frame=` line per frame with its inliers, inlier fraction, rms and iterations per level.
+//!   `track: frames= tracked= lost= fine_iters_max=` and one `track: frame=` line per frame with its inliers, inlier
+//!   fraction, rms and iterations per level. VUGSCANLOOP (LEDGER SR500): the tracked poses then go through scan_core's
+//!   `close_loop` (keyframes, loop candidates closed by ICP against a keyframe's own frame, the pose graph solved); on
+//!   a closure every tracked frame is fused again at its corrected pose (`reintegrate`). The report adds
+//!   `loop: keyframes= candidates= closures= before=<deg>/<mm> after=<deg>/<mm>` (the worst closure's disagreement
+//!   with the poses, `none` without a closure: no truth on a recording) and one `loop: candidate` line each.
 //! - `--turntable DEG --radius MM`, the stop-gap: the world is frame 0's camera frame; the turntable axis passes
 //!   through (0, 0, MM) parallel to the image's vertical (camera +y); `DEG` > 0 is the table turning
 //!   counter-clockwise seen from above, so frame k's camera sits rotated by +k·DEG (right-handed about camera +y)
@@ -60,8 +64,9 @@ use std::path::Path;
 use probe_core::recording::{self, RecordingError};
 use probe_core::{FrameError, StreamKind};
 use scan_core::{
-    DepthScale, Fit, FitError, Floor, Frame, Intrinsics, PixelFormat, Plane, Primitive, ScanError, Shape, Tol, Topo, TrackError,
-    Tracker, Transform, Tsdf, Vec3, detect, extract, fit_plane,
+    DepthScale, Fit, FitError, Floor, Frame, Gap, Intrinsics, Keyframes, LoopParams, PixelFormat, Plane, Primitive,
+    Reintegrate, ScanError, Shape, Shot, Tol, Topo, TrackError, Tracker, Transform, Tsdf, Vec3, close_loop, detect, extract,
+    fit_plane, reintegrate,
 };
 
 /// |RᵀR − I| bound for a `--poses` rotation: the rounding of a matrix printed to 6 decimals.
@@ -342,16 +347,19 @@ fn load_poses(path: &str) -> Result<Vec<Transform>, Refusal> {
 /// the report's `track:` lines.
 fn fuse_tracked(t: &mut Tsdf, frames: &[Loaded], intr: &[Intrinsics]) -> Result<String, Refusal> {
     let mut tr = Tracker::new(t, Tol::DEFAULT);
+    let mut kf = Keyframes::new(LoopParams::for_volume(t)); // VUGSCANLOOP (SR500): the tracked poses, for close_loop
     let (mut tracked, mut lost, mut fine_max) = (0usize, 0usize, 0u32);
     let mut lines = String::new();
     for (k, l) in frames.iter().enumerate() {
         let anchor = t.frames() == 0;
         match t.integrate_tracked(&mut tr, &l.frame, l.scale, &intr[k], None) {
-            Ok(_) if anchor => {
+            Ok((pose, _)) if anchor => {
+                kf.observe(k as u32, pose, None);
                 let _ = writeln!(lines, "track: frame={k} pose=identity");
             }
-            Ok(_) => {
+            Ok((pose, _)) => {
                 tracked += 1;
+                kf.observe(k as u32, pose, tr.last());
                 let Some(s) = tr.last() else { continue };
                 fine_max = fine_max.max(s.level_iterations[2]);
                 let frac = if s.valid > 0 { s.inliers as f64 / s.valid as f64 } else { 0.0 };
@@ -373,11 +381,50 @@ fn fuse_tracked(t: &mut Tsdf, frames: &[Loaded], intr: &[Intrinsics]) -> Result<
             Err(error) => return Err(Refusal::Track { frame: k, error }),
         }
     }
-    let head = format!(
-        "track: frames={} tracked={tracked} lost={lost} fine_iters_max={fine_max} drift_est=none\n",
-        frames.len()
+    let head = format!("track: frames={} tracked={tracked} lost={lost} fine_iters_max={fine_max}\n", frames.len());
+    let closed = close_tracked_loop(t, &kf, frames, intr)?;
+    Ok(head + &lines + &closed)
+}
+
+/// VUGSCANLOOP (LEDGER SR500): the tracked road's loop closure. scan_core's `close_loop` over the observed poses; on a
+/// closure the volume is replaced by every tracked frame fused again at its corrected pose (`reintegrate`; a refusal
+/// is the run's `Integrate`, the volume as it was). A graph scan_core refuses (`GraphError`) is printed and the tracked
+/// volume kept. Returns the report's `loop:` lines.
+fn close_tracked_loop(t: &mut Tsdf, kf: &Keyframes, frames: &[Loaded], intr: &[Intrinsics]) -> Result<String, Refusal> {
+    let shot = move |k: u32| frames.get(k as usize).map(|l| Shot { frame: &l.frame, scale: l.scale, intr: &intr[k as usize] });
+    let lp = match close_loop(kf, t, shot) {
+        Ok(lp) => lp,
+        Err(e) => return Ok(format!("loop: keyframes={} refused {e:?}\n", kf.nodes().len())),
+    };
+    if lp.closures > 0 {
+        *t = reintegrate(t, &lp.poses, shot).map_err(|e| match e {
+            Reintegrate::Scan { frame, error } => Refusal::Integrate { frame: frame as usize, error },
+            Reintegrate::NoFrame { frame } => Refusal::FrameIndex { frame: frame as usize, frames: frames.len() },
+        })?;
+    }
+    let g = |x: Option<Gap>| x.map_or("none".to_string(), |g| format!("{:.3}/{:.3}", g.deg, g.mm));
+    let mut out = format!(
+        "loop: keyframes={} candidates={} closures={} before={} after={}\n",
+        lp.keyframes,
+        lp.candidates.len(),
+        lp.closures,
+        g(lp.before),
+        g(lp.after)
     );
-    Ok(head + &lines)
+    for c in &lp.candidates {
+        let _ = match &c.outcome {
+            Ok(k) => writeln!(
+                out,
+                "loop: candidate new={} old={} closed frac={:.3} rms_mm={:.3}",
+                c.new,
+                c.old,
+                if k.valid > 0 { k.inliers as f64 / k.valid as f64 } else { 0.0 },
+                k.rms_mm
+            ),
+            Err(r) => writeln!(out, "loop: candidate new={} old={} refused {r:?}", c.new, c.old),
+        };
+    }
+    Ok(out)
 }
 
 fn v3(v: Vec3) -> String {
