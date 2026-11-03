@@ -26,6 +26,9 @@ photo_core = { path = "../../unaos/libs/cad/photo_core" }
 # VUGFACETREE (SR513): doc_core holds the face's document (src/journal.rs: record, replay, diff). VUGFACEPHOTO adds the
 # same line: the fold keeps one.
 doc_core = { path = "../../unaos/libs/cad/doc_core" }
+# VUGFACEDEVIATION (SR525): scan_core measures an opened scan against the document (src/deviation.rs): the ONE design
+# builder `design_of`, `measure`, `shade` and the ONE ramp `colour`.
+scan_core = { path = "../../unaos/libs/cad/scan_core" }
 euclase = { path = "../../libs/euclase" }
 palette_core = { path = "../../unaos/libs/sys/palette_core" }
 pixel_core = { path = "../../unaos/libs/media/pixel_core" }

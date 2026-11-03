@@ -52,7 +52,7 @@ pub mod tsdf;
 
 use alloc::vec::Vec;
 
-pub use deviation::{AlignParams, Aligned, Design, Deviation, DeviationError, FaceReport, Shade, Stats, align, deviations, measure, shade};
+pub use deviation::{AlignParams, Aligned, DESIGN_CHORD_MM, Design, DesignError, Deviation, DeviationError, FaceReport, Shade, Stats, align, colour, design_of, deviations, measure, shade};
 pub use fit::{Cone, Cylinder, Fit, FitError, Floor, Primitive, Shape, Sphere, detect, fit_cylinder, fit_plane};
 pub use geom::{Plane, Tol, Transform, Vec3};
 pub use graph::{

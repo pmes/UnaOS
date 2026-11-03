@@ -4408,6 +4408,7 @@ dependencies = [
  "geom_core",
  "libm",
  "mesh_core",
+ "palette_core",
  "probe_core",
 ]
 
@@ -5473,6 +5474,7 @@ dependencies = [
  "photo_core",
  "pixel_core",
  "quartzite",
+ "scan_core",
  "sketch_core",
  "tokio",
 ]
