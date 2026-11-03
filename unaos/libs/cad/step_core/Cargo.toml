@@ -1,0 +1,19 @@
+[package]
+name = "step_core"
+version = "0.1.0"
+edition = "2024"
+license = "LGPL-3.0-or-later"
+description = "Vug's STEP core: the ISO 10303-21 clear-text encoding (tokenizer + instance table) and an AP214 reader and writer for brep_core's subset (analytic surfaces, lines / circles / ellipses / B-spline curves, the advanced B-rep) — shared by Ring 0 and Ring 3."
+
+# VUGSTEP (LEDGER SR482): `#![no_std]` + `alloc`, `#![forbid(unsafe_code)]`, the timeline_core shape: a shared core under
+# `unaos/libs/cad/`, a member of the ROOT host workspace, linkable by the kernel by path with `default-features = false`.
+# brep_core is the ONE geometry and topology it writes into and reads out of (no second B-rep type); libm gives the
+# no_std atan2 / hypot / tan / atan.
+[dependencies]
+brep_core = { path = "../brep_core", default-features = false }
+libm = { version = "0.2", default-features = false }
+
+[features]
+default = ["std"]
+# The seam only: nothing in `src/` is std-gated (midden_core's spelling, so a kernel `default-features = false` is honest).
+std = []
