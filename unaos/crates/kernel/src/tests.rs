@@ -244,7 +244,7 @@ fn ensure_lumen() {
     #[cfg(feature = "lumen")]
     {
         static DONE: AtomicBool = AtomicBool::new(false);
-        if !DONE.swap(true, Ordering::AcqRel) { register("lumen", crate::lumen::selftest); register("lumenfast", crate::lumen::lumenfast); register("holocron", crate::keyring::selftest); register("ringlogin", crate::keyring::ringlogin_selftest); #[cfg(all(target_arch = "x86_64", feature = "btc"))] register("btkeyseal", crate::drivers::ehci::bthid::btkeyseal_selftest); #[cfg(any(target_arch = "aarch64", feature = "unafs"))] register("volkey", crate::keyring::volkey_selftest); /* VOLKEY (B684): the volume key slot on a RAM volume (LINE-NEUTRAL append) */ #[cfg(any(target_arch = "aarch64", feature = "unafs"))] register("xts", xts_selftest); /* XTS (B689): the volume cipher on a scratch RAM volume, `tests.rs` tail (LINE-NEUTRAL append) */ #[cfg(all(feature = "login", any(target_arch = "aarch64", feature = "unafs")))] register("keyboot", keyboot_tests); /* crawl B 21: keyboot_selftest's own cfg (LINE-NEUTRAL) */ }
+        if !DONE.swap(true, Ordering::AcqRel) { register("lumen", crate::lumen::selftest); register("lumenfast", crate::lumen::lumenfast); register("holocron", crate::keyring::selftest); register("ringlogin", crate::keyring::ringlogin_selftest); #[cfg(all(target_arch = "x86_64", feature = "btc"))] register("btkeyseal", crate::drivers::ehci::bthid::btkeyseal_selftest); #[cfg(any(target_arch = "aarch64", feature = "unafs"))] register("volkey", crate::keyring::volkey_selftest); /* VOLKEY (B684): the volume key slot on a RAM volume (LINE-NEUTRAL append) */ #[cfg(any(target_arch = "aarch64", feature = "unafs"))] register("xts", xts_selftest); /* XTS (B689): the volume cipher on a scratch RAM volume, `tests.rs` tail (LINE-NEUTRAL append) */ #[cfg(all(feature = "login", any(target_arch = "aarch64", feature = "unafs")))] register("keyboot", keyboot_tests); /* crawl B 21: keyboot_selftest's own cfg (LINE-NEUTRAL) */ #[cfg(feature = "login")] register("holdstage", holdstage_tests); /* HOLDSTAGE (B1093): the no-store bound under the KEYBOOT hold, tests.rs tail (LINE-NEUTRAL) */ }
     }
 }
 
@@ -8602,4 +8602,29 @@ fn closehook_leg() -> Option<bool> {
     let cell_cleared = CLOSEHOOK_WIN.load(Ordering::Acquire) == wm::WIN_NONE;
     let freed = CLOSEHOOK_SURF.lock().capacity() == 0;
     Some(open_ok && cell_cleared && freed && census::snapshot().bytes_of("window-surface", true) == w0)
+}
+
+// ── HOLDSTAGE (rmbp-ledger B1093) — `tests holdstage`: the no-store bound under the KEYBOOT hold, as pure shapes through
+// `users::stage_wait_at` (the one predicate `desktop_allowed`'s wait reads) and `users::no_store_coherent` (the witness's
+// clause). The go-red is the OLD guard (`now < 30_000`), which published `no-store` at 30 s under the hold (FLIGHT 39 boots
+// 2-3). `live_held` must read 0: `tests` is refused while `desktop_allowed` is false, so a run under the hold is a defect.
+#[cfg(feature = "login")]
+fn holdstage_tests() {
+    use crate::fs::users::{keyboot_held, no_store_coherent, stage_wait_at};
+    const BOUND: u64 = 30_000;
+    let held = stage_wait_at(30_004, true, 0); // the f39 instant: held -> waits
+    let free = !stage_wait_at(30_004, false, 0) && stage_wait_at(29_999, false, 0); // no hold: the old reading
+    let rel = stage_wait_at(60_000, false, 50_000) && !stage_wait_at(80_001, false, 50_000); // re-armed from the release edge
+    let old_guard_publishes = !(30_004u64 < BOUND); // the OLD guard at the f39 instant
+    let go_red = old_guard_publishes && held; // the old and the new must differ there
+    let coh = !no_store_coherent(true) && no_store_coherent(false);
+    let live = keyboot_held();
+    let pass = held && free && rel && go_red && coh && !live;
+    serial_println!(
+        ":: HOLDSTAGE: held={} free={} released={} old_guard={} coherent={} live_held={} -> {} ::",
+        if held { "wait" } else { "PUBLISH" }, if free { "publish" } else { "BAD" }, if rel { "wait/publish" } else { "BAD" },
+        if go_red { "publish(go-red)" } else { "SAME" }, if coh { "held:no/free:yes" } else { "BAD" }, live as u8,
+        if pass { "PASS" } else { "FAIL" }
+    );
+    tally(pass);
 }

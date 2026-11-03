@@ -3018,7 +3018,7 @@ pub fn stage_resolved() -> bool {
 /// installer to run: the stage resolves to Desktop, said once.
 pub fn desktop_allowed() -> bool {
     if !stage_resolved() {
-        if crate::arch::ms() < STAGE_WAIT_MS {
+        if stage_wait_pending() { // HOLDSTAGE (B1093): the bound waits while the KEYBOOT hold is open (the store is behind the key) and re-arms from its release; no hold, no release: `ms < STAGE_WAIT_MS` as before (body at the tail)
             return false;
         }
         stage_publish(BootStage::Desktop, "no-store");
@@ -3041,7 +3041,7 @@ fn stage_witness(why: &str) {
     serial_println!(
         ":: FIRSTBOOT: stage={} root={} users={} desktop_ignited={} why={} -> {} ::",
         if login { "login-screen" } else { st.word() }, if root_set { "locked" } else { "ROW" }, users, up, why,
-        if (st == BootStage::Installer && root_set && users == 0 && !up) || (up && root_set && users > 0) || (login && st == BootStage::Desktop && root_set && users > 0) || why == "no-store" { "coherent" } else { "incoherent" }
+        if (st == BootStage::Installer && root_set && users == 0 && !up) || (up && root_set && users > 0) || (login && st == BootStage::Desktop && root_set && users > 0) || (why == "no-store" && no_store_coherent(keyboot_was_held())) { "coherent" } else { "incoherent" }
     ); crate::bootpace::boot_line(); // QUIETBOOT M4 (R80): the boot's one measurement, after its first stage line.
 }
 
@@ -3889,7 +3889,7 @@ pub fn keyboot_hold() -> bool {
                 if !crate::fs::unafs::root_unlocked() {
                     return true;
                 }
-                KB_HOLD.store(KB_OPENED, Release);
+                KB_HOLD.store(KB_OPENED, Release); KB_HOLD_END.store(crate::arch::ms().max(1), Release); // HOLDSTAGE (B1093): the no-store bound re-arms from the release (LINE-NEUTRAL append; the static at the tail)
                 serial_println!(
                     "[keyboot] hold released held_ms={} (the root is bound with its key; the boot goes on: users-load, root-mount, stage-resolve)",
                     crate::arch::ms().saturating_sub(KB_HOLD_T0.load(Acquire))
@@ -4058,4 +4058,64 @@ fn keyboot_form_up() {
         "[keyboot] unlock form up kdf_pending=1 on={} (KEYBOOT3: the boot holds here until the root's password or words; the KDF runs after Enter)",
         crate::video::crystal::login::kb_on()
     );
+}
+
+// HOLDSTAGE (rmbp-ledger B1093) — TAIL-APPENDED. FLIGHT 39 boots 2-3: with `[keyboot] hold OPEN root=keyed` (the unlock form up,
+// nothing bound) a `desktop_allowed` caller at STAGE_WAIT_MS published `no-store` and ignited a desktop under the modal hold —
+// but the store is BEHIND the key (`service` returns at the hold, before `try_load`), so "never answered" is the wrong
+// reading while the hold is open. [`desktop_allowed`]'s bounded wait asks [`stage_wait_pending`]: held -> wait (said once);
+// released -> the 30 s bound counts from the release edge (users-load, root-mount and the console wait still run after it);
+// no hold -> `ms < STAGE_WAIT_MS` as before. The resolution on bind is the existing path (keyboot_hold -> KB_OPENED ->
+// try_load -> resolve_tail). `stage_witness` calls a no-store after a hold `incoherent` ([`no_store_coherent`]).
+/// HOLDSTAGE: when the KEYBOOT hold released (ms, `max(1)`); 0 = no release this boot.
+static KB_HOLD_END: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// HOLDSTAGE: the `stage-resolve held` line is said once.
+static HOLD_SAID: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// HOLDSTAGE: PURE — the keyed root's unlock hold is open (`KB_HELD`). Never probes, never opens the form (that is
+/// [`keyboot_hold`]'s, on the service pass); `false` in a build without the hold.
+pub fn keyboot_held() -> bool {
+    #[cfg(all(feature = "login", any(all(target_arch = "x86_64", feature = "wc", feature = "unafs"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+    {
+        return KB_HOLD.load(core::sync::atomic::Ordering::Acquire) == KB_HELD;
+    }
+    #[cfg(not(all(feature = "login", any(all(target_arch = "x86_64", feature = "wc", feature = "unafs"), all(target_arch = "aarch64", feature = "desktop_firmware")))))]
+    false
+}
+
+/// HOLDSTAGE: PURE — a hold was opened this boot (held now, or opened by the key): the store answered the probe.
+fn keyboot_was_held() -> bool {
+    #[cfg(all(feature = "login", any(all(target_arch = "x86_64", feature = "wc", feature = "unafs"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+    {
+        let h = KB_HOLD.load(core::sync::atomic::Ordering::Acquire);
+        return h == KB_HELD || h == KB_OPENED;
+    }
+    #[cfg(not(all(feature = "login", any(all(target_arch = "x86_64", feature = "wc", feature = "unafs"), all(target_arch = "aarch64", feature = "desktop_firmware")))))]
+    false
+}
+
+/// HOLDSTAGE: PURE — does the no-store bound still wait at `now`? Held: always. Otherwise `now < end + STAGE_WAIT_MS`,
+/// where `end` is the hold's release (0 = none: the boot-relative bound, the old reading).
+pub fn stage_wait_at(now: u64, held: bool, end: u64) -> bool {
+    held || now < end.saturating_add(STAGE_WAIT_MS)
+}
+
+/// HOLDSTAGE: PURE — may a `no-store` stage be called coherent? Only when no hold was opened (a hold means the store answered).
+pub fn no_store_coherent(was_held: bool) -> bool {
+    !was_held
+}
+
+/// HOLDSTAGE: [`desktop_allowed`]'s bounded wait over the live atomics; says `stage-resolve held` once when the old bound
+/// would have published `no-store` under the hold.
+fn stage_wait_pending() -> bool {
+    use core::sync::atomic::Ordering::{Acquire, AcqRel};
+    let now = crate::arch::ms();
+    let held = keyboot_held();
+    if held && now >= STAGE_WAIT_MS && !HOLD_SAID.swap(true, AcqRel) {
+        serial_println!(
+            "[users] stage-resolve held why=keyboot-hold at_ms={} held_ms={} (the root is keyed and unbound: the store is behind the key; no-store is not read while the unlock form is up)",
+            now, now.saturating_sub(KB_HOLD_T0.load(Acquire))
+        );
+    }
+    stage_wait_at(now, held, KB_HOLD_END.load(Acquire))
 }
