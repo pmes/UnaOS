@@ -203,6 +203,9 @@ struct Running {
     port: String,
     /// The redial schedule while the link is lost.
     redial: Option<Redial>,
+    /// VUGCOMSCANTTYUSBID (SR529): the device the port was at the first open (`tty:usb:vvvv:pppp[:serial]`, from the
+    /// desk's identify hook); when known the redial opens it by identity, wherever it came back.
+    identity: Option<String>,
 }
 
 /// Comscan's pump desk: the machine it drives, the armed programs and the one running stream.
@@ -211,6 +214,8 @@ pub struct PumpDesk {
     machine: Machine,
     armed: Vec<Armed>,
     running: Option<Running>,
+    /// VUGCOMSCANTTYUSBID (SR529): a port name to its device identity (`crate::tty::identify`); none: redial by name.
+    identify: Option<Box<Identify>>,
 }
 
 fn refused(why: impl Into<String>) -> Vec<PumpEvent> {
@@ -220,7 +225,7 @@ fn refused(why: impl Into<String>) -> Vec<PumpEvent> {
 impl PumpDesk {
     /// A desk for `machine`: every pass it arms must name this machine's identity (VUG-HELM-BIND-MACHINE).
     pub fn new(machine: Machine) -> PumpDesk {
-        PumpDesk { machine, armed: Vec::new(), running: None }
+        PumpDesk { machine, armed: Vec::new(), running: None, identify: None }
     }
 
     /// The machine this desk drives.
@@ -308,7 +313,9 @@ impl PumpDesk {
                 };
                 // One arming, one run: a FirstRun approval is per run, so a finished program must pass Helm again.
                 let a = self.armed.remove(i);
-                self.running = Some(Running { pump: a.pump, link: Some(link), port: port.clone(), redial: None });
+                let identity = self.identify.as_ref().and_then(|f| f(port.as_str())); // VUGCOMSCANTTYUSBID (SR529)
+                self.running =
+                    Some(Running { pump: a.pump, link: Some(link), port: port.clone(), redial: None, identity });
                 vec![self.squawk(Some("started".to_string()))]
             }
             PumpEvent::PumpHold { .. } | PumpEvent::PumpResume { .. } | PumpEvent::PumpStop { .. } => {
@@ -551,12 +558,15 @@ impl PumpDesk {
         }
     }
 
-    /// The port to reopen when a lost run's next redial is due at `now_us`.
+    /// The port to reopen when a lost run's next redial is due at `now_us`: the device's identity when the first open
+    /// gave one (VUGCOMSCANTTYUSBID, SR529: never the old name, which another board may have taken), else the name.
     pub fn redial_due(&self, now_us: u64) -> Option<String> {
         let r = self.running.as_ref()?;
         let lost = matches!(r.pump.state(), PumpState::LinkLost { .. });
         match r.redial {
-            Some(d) if lost && r.link.is_none() && d.due(now_us) => Some(r.port.clone()),
+            Some(d) if lost && r.link.is_none() && d.due(now_us) => {
+                Some(r.identity.clone().unwrap_or_else(|| r.port.clone()))
+            }
             _ => None,
         }
     }
@@ -628,6 +638,19 @@ fn redial(synapse: &Synapse, desk: &Mutex<PumpDesk>, open: &mut Opener, t0: toki
     };
     for o in out {
         synapse.fire(SMessage::Pump(o));
+    }
+}
+
+// --- VUGCOMSCANTTYUSBID (LEDGER SR529): the desk's identity hook, so a redial reopens the same device (named tail hunk) ---
+
+/// A port name to the identity the redial opens instead (`crate::tty::identify`: `tty:usb:vvvv:pppp[:serial]`), or
+/// `None` (a pty, tcp, ws: the name is redialled). Called once per PumpStart under the desk lock, after the open.
+pub type Identify = dyn Fn(&str) -> Option<String> + Send;
+
+impl PumpDesk {
+    /// Set the identity hook every later PumpStart records beside its port name.
+    pub fn identify_by(&mut self, f: Box<Identify>) {
+        self.identify = Some(f);
     }
 }
 
