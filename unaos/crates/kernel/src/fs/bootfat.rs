@@ -228,6 +228,8 @@ fn key(s: crate::fs::fat::BlockSource) -> u16 {
         B::SdMmc => 4,
         #[cfg(all(target_arch = "x86_64", feature = "ahci"))]
         B::Ahci(p) => 0x400 | p as u16,
+        #[cfg(all(target_arch = "x86_64", feature = "nvme"))]
+        B::Nvme => 5, // FLIGHT39 §7 (x86-all check red: the `nvme` knob names a source this key had no arm for)
     }
 }
 
