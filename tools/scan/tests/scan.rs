@@ -333,3 +333,76 @@ extrude post sketch=s2 outer=c1 dir=[0 0 1] length=150
     let head = String::from_utf8_lossy(&bytes[..bytes.windows(10).position(|w| w == b"end_header").unwrap()]).into_owned();
     assert!(head.contains("property float deviation") && head.contains("property uchar red"), "{head}");
 }
+
+/// VUGINTENTSCANWIRE (SR515): a plate with a boss from scan_core's fixture (the ground rectangle ±200 at z = 0 is the
+/// plate's top, an r 40 boss 500 tall stands over the origin lifted 30 mm off it: a touching boss's inside corner is
+/// rounded by the TSDF into a skirt detect reads as a cone, VUG-INTENT-SCAN-UNMATCHED), a world-posed 12-frame orbit
+/// whose eye (z 446) sits under the boss top (z 530) and over its bottom so neither cap is seen: one plane and one
+/// cylinder. `--intent <doc>` prints doc_core's measurement
+/// table, then suggest's proposals each disposed by verify_all; `--intent` alone prints the table only.
+#[test]
+fn an_intent_scan_prints_the_shapes_and_verified_proposals() {
+    const DOC: &str = r#"vug-doc version=1 lin=1e-6 ang=1e-9
+sketch s o=[0 0 -10] z=[0 0 1] x=[1 0 0]
+point p1 sketch=s x=-200 y=-200
+point p2 sketch=s x=200 y=-200
+point p3 sketch=s x=200 y=200
+point p4 sketch=s x=-200 y=200
+line l1 sketch=s a=p1 b=p2
+line l2 sketch=s a=p2 b=p3
+line l3 sketch=s a=p3 b=p4
+line l4 sketch=s a=p4 b=p1
+extrude plate sketch=s outer=l1 dir=[0 0 1] length=10
+sketch b o=[0 0 30] z=[0 0 1] x=[1 0 0]
+point c0 sketch=b x=0 y=0
+circle c1 sketch=b centre=c0 r=40
+extrude boss sketch=b outer=c1 dir=[0 0 1] length=500
+"#;
+    let scene = Scene {
+        ground_centre: Vec3::ZERO,
+        ground: [200.0, 200.0],
+        boxes: Vec::new(),
+        cylinders: vec![fixture::CylPrim { base: Vec3::new(0.0, 0.0, 30.0), radius: 40.0, height: 500.0 }],
+    };
+    let d = dir("intent");
+    let (inp, ply, poses, doc) = (d.join("boss.prb"), d.join("boss.ply"), d.join("poses.txt"), d.join("part.vug"));
+    let intr = fixture::bench_intrinsics();
+    let truth = |k: u32| fixture::orbit(Vec3::new(0.0, 0.0, 60.0), 600.0, 40.0 * DEG, k as f64 * 30.0 * DEG);
+    let recs: Vec<Record> = (0..12u32)
+        .map(|k| {
+            let f = fixture::render_depth(&scene, &intr, DepthScale::D400_DEFAULT, &truth(k), &Noise::NONE, k as u64);
+            Record::new(f, "replay:d435i", 1000, Some(k4())).unwrap()
+        })
+        .collect();
+    std::fs::write(&inp, recording::write(&recs).unwrap()).unwrap();
+    let mut text = String::new();
+    for k in 0..12 {
+        let p = truth(k);
+        let (m, t) = (p.rot.to_mat3(), p.trans);
+        let r = [[m.cols[0].x, m.cols[1].x, m.cols[2].x], [m.cols[0].y, m.cols[1].y, m.cols[2].y], [m.cols[0].z, m.cols[1].z, m.cols[2].z]];
+        text += &format!(
+            "{:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?}\n",
+            r[0][0], r[0][1], r[0][2], t.x, r[1][0], r[1][1], r[1][2], t.y, r[2][0], r[2][1], r[2][2], t.z
+        );
+    }
+    std::fs::write(&poses, text).unwrap();
+    std::fs::write(&doc, DOC).unwrap();
+    let (inp, ply, poses, doc) = (inp.to_str().unwrap(), ply.to_str().unwrap(), poses.to_str().unwrap(), doc.to_str().unwrap());
+    let count = |report: &str, head: &str| report.lines().filter(|l| l.starts_with(head)).count();
+
+    let o = scan(&[inp, "-o", ply, "--poses", poses, "--intent", doc]);
+    let report = String::from_utf8_lossy(&o.stdout).into_owned();
+    assert!(o.status.success(), "stderr: {}", String::from_utf8_lossy(&o.stderr));
+    println!("{report}");
+    assert_eq!(count(&report, "intent: plane "), 1, "one plane in the table\n{report}");
+    assert_eq!(count(&report, "intent: cylinder "), 1, "one cylinder in the table\n{report}");
+    let accepted: usize = field(&report, "intent: proposed=", "accepted").parse().unwrap();
+    assert!(accepted >= 1 && count(&report, "accept ") == accepted, "an accepted proposal\n{report}");
+
+    // `--intent` with no document: the table alone.
+    let o = scan(&[inp, "-o", ply, "--poses", poses, "--intent"]);
+    let report = String::from_utf8_lossy(&o.stdout).into_owned();
+    assert!(o.status.success(), "stderr: {}", String::from_utf8_lossy(&o.stderr));
+    assert!(count(&report, "intent: shapes: n=") == 1 && count(&report, "intent: cylinder ") == 1, "{report}");
+    assert_eq!(count(&report, "intent: proposed="), 0, "{report}");
+}
