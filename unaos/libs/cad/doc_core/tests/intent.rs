@@ -3,7 +3,9 @@
 //! accepted proposals; a dimension the measurement does not support, a conflicting constraint, a coordinate the
 //! measurement did not give, a redundant constraint and a bad line are each refused by name. VUGINTENTHOLES (SR507):
 //! the outline is loops; a plate with two holes takes its round diameters and refuses a moved hole, and a replayed
-//! hole with no measured loop is refused UnmatchedLoop by name.
+//! hole with no measured loop is refused UnmatchedLoop by name. VUGINTENTPOINTS (SR523): the Points residual is
+//! two-sided: a boss removed is refused, a pin grown where no scan point is is refused by the surface side, a partial
+//! scan (no bottom) is not refused, and 100 000 points against a ~2k-triangle replay are timed.
 
 use brep_core::Vec3;
 use doc_core::{
@@ -313,4 +315,136 @@ fn hole_without_a_measured_loop_refused_by_name() {
     if let Verdict::Refuse { why } = v {
         assert_eq!(why.text(), "unmatched-loop replayed=2 measured=1");
     }
+}
+
+// VUGINTENTPOINTS (SR523): the two-sided Points residual.
+
+/// The 50 x 30 x 6 plate (BASE + SIX + fix), a r 5 boss at (25, 15) on its top (length 8.2 as drawn), and a r 0.4 pin
+/// at (40, 8) (length 0.5): three solids (the document has no booleans).
+fn boss_doc() -> Doc {
+    let text = format!(
+        "{BASE}{}\nfix f1 sketch=s p=p1 at=[0 0]\nextrude e1 sketch=s outer=l1 dir=[0 0 1] length=6\n\
+         sketch t o=[0 0 6] z=[0 0 1] x=[1 0 0]\npoint c sketch=t x=25 y=15\nfix f2 sketch=t p=c at=[25 15]\n\
+         circle k sketch=t centre=c r=5\nextrude e2 sketch=t outer=k dir=[0 0 1] length=8.2\n\
+         sketch u o=[0 0 6] z=[0 0 1] x=[1 0 0]\npoint q sketch=u x=40 y=8\nfix f3 sketch=u p=q at=[40 8]\n\
+         circle n sketch=u centre=q r=0.4\nextrude e3 sketch=u outer=n dir=[0 0 1] length=0.5\n",
+        SIX.join("\n")
+    );
+    read(&text).unwrap()
+}
+
+/// The part as scanned at 1 mm: the plate top outside the boss, the four plate walls, the boss wall and its top at
+/// z = 14 (the real boss is 8 tall), the pin's top and wall. No bottom: it sat on the table.
+fn boss_scan() -> Vec<Vec3> {
+    let mut v = Vec::new();
+    let r = |x: f64, y: f64, cx: f64, cy: f64| ((x - cx).powi(2) + (y - cy).powi(2)).sqrt();
+    for i in 0..50 {
+        for j in 0..30 {
+            let (x, y) = (i as f64 + 0.5, j as f64 + 0.5);
+            if r(x, y, 25.0, 15.0) >= 5.0 && r(x, y, 40.0, 8.0) >= 0.4 {
+                v.push(Vec3::new(x, y, 6.0));
+            }
+            if r(x, y, 25.0, 15.0) < 5.0 {
+                v.push(Vec3::new(x, y, 14.0));
+            }
+        }
+    }
+    for k in 0..6 {
+        let z = k as f64 + 0.5;
+        for j in 0..30 {
+            v.push(Vec3::new(0.0, j as f64 + 0.5, z));
+            v.push(Vec3::new(50.0, j as f64 + 0.5, z));
+        }
+        for i in 0..50 {
+            v.push(Vec3::new(i as f64 + 0.5, 0.0, z));
+            v.push(Vec3::new(i as f64 + 0.5, 30.0, z));
+        }
+    }
+    for k in 0..8 {
+        for a in 0..32 {
+            let t = a as f64 * std::f64::consts::TAU / 32.0;
+            v.push(Vec3::new(25.0 + 5.0 * t.cos(), 15.0 + 5.0 * t.sin(), 6.5 + k as f64));
+        }
+    }
+    v.push(Vec3::new(40.0, 8.0, 6.5));
+    for a in 0..4 {
+        let t = a as f64 * std::f64::consts::FRAC_PI_2;
+        v.push(Vec3::new(40.0 + 0.4 * t.cos(), 8.0 + 0.4 * t.sin(), 6.25));
+    }
+    v
+}
+
+#[test]
+fn points_two_sided_boss_removed_and_pin_grown() {
+    let d = boss_doc();
+    let m = Measurement::Points { pts: boss_scan(), sigma_mm: SIGMA };
+    // (i) The boss's round height: accepted, the bottom unscanned (the document's own surface is never held against
+    // a proposal) and the boss top moved 0.2 < sigma.
+    match verify(&d, &p("extrude e2 sketch=t outer=k dir=[0 0 1] length=8"), &m, d.tol) {
+        Verdict::Accept { max_mm, .. } => assert!(max_mm < 0.1, "max {max_mm}"),
+        v => panic!("{v:?}"),
+    }
+    // (ii) The boss removed to a 0.5 mm stub: its scan points hang 7.5 mm above the model.
+    match verify(&d, &p("extrude e2 sketch=t outer=k dir=[0 0 1] length=0.5"), &m, d.tol) {
+        Verdict::Refuse { why: Reason::Residual { max_mm, .. } } => assert!(max_mm > 7.0, "max {max_mm}"),
+        v => panic!("{v:?}"),
+    }
+    // (iii) The pin grown 9.5 mm where no scan point is: every point stays within 0.4 mm of the model (the forward
+    // side alone accepts), the new pin top is ~9.5 mm from any point, so the refusal is the surface side's.
+    match verify(&d, &p("extrude e3 sketch=u outer=n dir=[0 0 1] length=10"), &m, d.tol) {
+        Verdict::Refuse { why: Reason::Residual { max_mm, .. } } => assert!(max_mm > 7.0, "max {max_mm}"),
+        v => panic!("{v:?}"),
+    }
+}
+
+#[test]
+fn points_two_sided_100k_points_2k_triangles() {
+    // A disc r 60 (drawn 60.02) extruded 20; sigma 0.01 -> chord 0.0025 -> 487 arc pieces, ~1944 triangles.
+    let text = "vug-doc version=1 lin=1e-6 ang=1e-9
+sketch s o=[0 0 0] z=[0 0 1] x=[1 0 0]
+point c sketch=s x=0 y=0
+fix f1 sketch=s p=c at=[0 0]
+circle k sketch=s centre=c r=60.02
+extrude e1 sketch=s outer=k dir=[0 0 1] length=20
+";
+    let d = read(text).unwrap();
+    let sigma = 0.01;
+    let (r, h, step) = (60.0f64, 20.0f64, 0.54f64);
+    let mut pts = Vec::new();
+    let nz = 36;
+    let na = (std::f64::consts::TAU * r / step).round() as usize;
+    for k in 0..nz {
+        let z = (k as f64 + 0.5) * h / nz as f64;
+        for a in 0..na {
+            let t = a as f64 * std::f64::consts::TAU / na as f64;
+            pts.push(Vec3::new(r * t.cos(), r * t.sin(), z));
+        }
+    }
+    let n = (2.0 * r / step) as i32;
+    for z in [0.0, h] {
+        for i in 0..n {
+            for j in 0..n {
+                let (x, y) = (-r + (i as f64 + 0.5) * step, -r + (j as f64 + 0.5) * step);
+                if (x * x + y * y).sqrt() < r - step * 0.5 {
+                    pts.push(Vec3::new(x, y, z));
+                }
+            }
+        }
+    }
+    assert!(pts.len() >= 100_000, "lattice {}", pts.len());
+    pts.truncate(100_000);
+    let chord = (sigma * 0.25f64).max(4.0 * d.tol.lin);
+    let rep = replay(&d, d.tol);
+    let tris = brep_core::tessellate(&rep.solids[0].brep, chord, d.tol).unwrap().mesh.triangles.len();
+    let m = Measurement::Points { pts, sigma_mm: sigma };
+    let clock = std::time::Instant::now();
+    let v = verify(&d, &p("radius r1 sketch=s circle=k r=60"), &m, d.tol);
+    let ms = clock.elapsed().as_secs_f64() * 1e3;
+    println!("intent-points: n=100000 tris={tris} verify_ms={ms:.1}");
+    assert!((1500..=2500).contains(&tris), "tris {tris}");
+    match v {
+        Verdict::Accept { max_mm, .. } => assert!(max_mm < 3.0 * sigma, "max {max_mm}"),
+        v => panic!("{v:?}"),
+    }
+    assert!(ms < 20_000.0, "verify took {ms} ms: the BVH road is not in use");
 }

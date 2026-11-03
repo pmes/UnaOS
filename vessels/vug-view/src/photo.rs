@@ -22,13 +22,17 @@
 //! is never applied. `Backspace` rejects the focused one.
 //!
 //! `i` asks Vein — over the BUS, never by linking vein_core here: the provider choice, the key custody and the
-//! verified-TLS road are handlers/vein's. No bus verb carries a propose yet (VUG-VEIN-BUS, owed), so `i` says so in
-//! the corner; offline, Echo gives no proposals and the road by hand still works.
+//! verified-TLS road are handlers/vein's. VUGFACEINTENTSEND (SR514): `i` queues one `IntentEvent::Propose` (the face's
+//! document, the measurement table, the photo as `image/png`, a fresh request id) on [`Photo::outbox`], which the
+//! controller drains onto the bus (`Viewer::outbox`); [`answer`] takes Vein's `Proposals` for the live id through
+//! [`offer`] and names a `Refused` in the corner; an answer to any other id is ignored and counted. Echo gives no
+//! proposals and the road by hand still works.
 
 use crate::model::Model;
 use crate::raster::{self, Frame as Raster, rgba};
 use crate::sketch::{ACTIVE, INK, REFUSED, SketchFace, world_planes};
 use crate::view::View;
+use bandy::{IntentEvent, IntentImage, Origin};
 use doc_core::{Doc, Measurement, Proposal, Stmt, Verdict};
 use sketch_core::{Constraint, ConstraintId, Entity, EntityId, PointRef, Tol, Vec2};
 use std::fmt;
@@ -44,8 +48,6 @@ pub const FOCUS_PX: f64 = 12.0;
 pub const PROPOSAL: u32 = palette_core::ACCENTS[6];
 /// The sigma band: `text.tertiary`, dark, faint.
 pub const BAND: u32 = palette_core::TEXT_TERTIARY.1;
-/// The corner note for `i` while no bus verb reaches Vein.
-pub const OFFLINE: &str = "intent: no provider - offline (echo) gives no proposals";
 /// The id [`doc_of`] gives the photo's sketch statement.
 pub const SKETCH_ID: &str = "s";
 
@@ -94,8 +96,16 @@ pub struct Photo {
     pub band_mm: f64,
     pub offers: Vec<Offer>,
     pub focus: Option<usize>,
-    /// The corner note: the last thing the proposal road said (offline, applied, refused by name).
+    /// The corner note: the last thing the proposal road said (asked, applied, refused by name).
     pub note: Option<String>,
+    /// VUGFACEINTENTSEND (SR514): the asks not yet fired (the controller drains them onto the bus, `Viewer::outbox`).
+    pub outbox: Vec<IntentEvent>,
+    /// VUGFACEINTENTSEND (SR514): the request counter (0 = never asked; each `i` takes the next).
+    pub request: u64,
+    /// VUGFACEINTENTSEND (SR514): the LIVE request id, cleared when its answer lands.
+    pub asked: Option<u64>,
+    /// VUGFACEINTENTSEND (SR514): answers to any other id (stale, unknown, already answered), ignored and counted.
+    pub ignored: u32,
 }
 
 impl fmt::Debug for Photo {
@@ -108,6 +118,9 @@ impl fmt::Debug for Photo {
             .field("offers", &self.offers)
             .field("focus", &self.focus)
             .field("note", &self.note)
+            .field("request", &self.request)
+            .field("asked", &self.asked)
+            .field("ignored", &self.ignored)
             .finish()
     }
 }
@@ -157,7 +170,7 @@ pub fn open(bytes: &[u8], pitch_mm: f64) -> Result<(Model, SketchFace, Photo), S
     let params = photo_core::PhotoParams::new(pitch_mm);
     let m = photo_core::measure(&image, params, Tol::DEFAULT).map_err(|e| format!("photo {e:?}"))?;
     let model = paper(&m.outline, pitch_mm)?;
-    let photo = Photo { image, h: m.h, outline: m.outline, loops: m.loops, sigma_mm: m.sigma_mm, band_mm: params.band.lin.max(m.sigma_mm), offers: Vec::new(), focus: None, note: None };
+    let photo = Photo { image, h: m.h, outline: m.outline, loops: m.loops, sigma_mm: m.sigma_mm, band_mm: params.band.lin.max(m.sigma_mm), offers: Vec::new(), focus: None, note: None, outbox: Vec::new(), request: 0, asked: None, ignored: 0 };
     let face = SketchFace::over(world_planes()[0].1, m.sketch);
     Ok((model, face, photo))
 }
@@ -356,11 +369,7 @@ pub fn key(view: &mut View, k: &str) -> Option<bool> {
     }
     let focused = ph.focus.filter(|&i| ph.offers.get(i).is_some_and(|o| o.state == State::Open));
     match k {
-        "i" | "I" => {
-            // VUG-VEIN-BUS (owed): the propose verb to handlers/vein goes here; nothing reaches a provider today.
-            view.photo.as_mut()?.note = Some(OFFLINE.to_string());
-            Some(true)
-        }
+        "i" | "I" => Some(ask(view)), // VUGFACEINTENTSEND (SR514): the Propose onto the bus
         "Tab" | "\t" => {
             let n = ph.offers.len();
             let start = ph.focus.map(|i| i + 1).unwrap_or(0);
@@ -508,7 +517,69 @@ pub fn overlay(view: &View, fr: &mut Raster) {
         raster::text(fr, &g.text, g.at.0, g.at.1, col);
     }
     if let Some(note) = &ph.note {
-        let col = if note.starts_with("refused") { REFUSED } else { INK };
+        let col = if note.starts_with("refused") || note.starts_with("Vein refused") { REFUSED } else { INK };
         raster::text(fr, &note.to_uppercase(), 6.0, 18.0, rgba(col));
+    }
+}
+
+// ---- VUGFACEINTENTSEND (SR514): the ask over the bus and its answer (named tail block) ----
+
+/// Who asks: the person at the face (the facet-view / una vessels' shape).
+fn principal() -> Origin {
+    Origin::LocalUser(std::env::var("USER").unwrap_or_else(|_| "una".into()))
+}
+
+/// `i`: one `IntentEvent::Propose` queued on the photo's outbox — the face's sketch as its document (`doc_of`), the
+/// measurement table (`doc_core::measurements_text`), the decoded photo re-encoded as `image/png` (pixel_core's one
+/// encoder) and the next request id, which becomes the live one; the corner says so. A PNG encode error is named and
+/// nothing is sent. True when the corner changed.
+fn ask(view: &mut View) -> bool {
+    let (Some(face), Some(ph)) = (view.design.face.as_ref(), view.photo.as_mut()) else { return false };
+    let png = match pixel_core::png::encode::encode_rgba(ph.image.width, ph.image.height, &ph.image.rgba) {
+        Ok(b) => b,
+        Err(e) => {
+            ph.note = Some(format!("intent: png {e:?}"));
+            return true;
+        }
+    };
+    ph.request += 1;
+    let request = ph.request;
+    ph.outbox.push(IntentEvent::Propose {
+        principal: principal(),
+        context: doc_core::write(&doc_of(face)),
+        measurements: doc_core::measurements_text(&ph.measurement()),
+        images: vec![IntentImage { media_type: "image/png".to_string(), bytes: png }],
+        request,
+    });
+    ph.asked = Some(request);
+    ph.note = Some(format!("asked Vein (request {request})"));
+    true
+}
+
+/// Vein's answer off the bus (`Viewer::input`): `Proposals` for the live id enter through [`offer`] (verified, drawn);
+/// `Refused` for the live id is named in the corner; an answer to any other id is ignored and counted; our own `Propose`
+/// (the bus is shared) is not an answer. True when the frame changed.
+pub fn answer(view: &mut View, ev: &IntentEvent) -> bool {
+    let Some(ph) = view.photo.as_mut() else { return false };
+    let request = match ev {
+        IntentEvent::Propose { .. } => return false,
+        IntentEvent::Proposals { request, .. } | IntentEvent::Refused { request, .. } => *request,
+    };
+    if ph.asked != Some(request) {
+        ph.ignored += 1;
+        return false;
+    }
+    ph.asked = None;
+    match ev {
+        IntentEvent::Proposals { proposals, .. } => {
+            let ps = proposals.iter().map(|q| Proposal { stmt: q.stmt.clone(), confidence: q.confidence, why: q.why.clone() }).collect();
+            offer(view, ps);
+            true
+        }
+        IntentEvent::Refused { why, .. } => {
+            ph.note = Some(format!("Vein refused: {why}"));
+            true
+        }
+        IntentEvent::Propose { .. } => false,
     }
 }

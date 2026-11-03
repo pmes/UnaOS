@@ -20,6 +20,16 @@
 //! centroid is nearest within the larger loop's extent (`pair_loops`); a loop left without a partner on either side
 //! is refused by name ([`Reason::UnmatchedLoop`]); the two-sided residual runs per pair, max and RMS over all pairs.
 //!
+//! VUGINTENTPOINTS (LEDGER SR523): the Points measurement is TWO-SIDED. Forward, every point to the replayed surface
+//! through mesh_core's `Bvh::closest` (SR510) over the solids' tessellation (the SR505 chord, one mesh), warm-started
+//! from the previous point's answer; the same geom_core closest point and distance as the SR505 brute force (a value
+//! can differ only in the last ulp where two triangles tie within the box test's rounding). Back, the surface to the
+//! points: one sample per triangle (its centroid) of the proposal's replay, measured to the nearest scan point through
+//! a private median-split point tree, minus the scan's spacing `h` (the median nearest-other-point distance), floored
+//! at 0. Only CHANGED surface counts: a sample within sigma of the document's own replayed surface is the document's,
+//! never held against the proposal (a partial scan with the bottom on the table is not refused). Shrinking was already
+//! caught forward; the back side catches growth where no point is. Both sides go into the one max / RMS and limit.
+//!
 //! The RMS's square root is geom_core's `Vec2::mag` (a hypot accumulation); libm (VUGINTENTSCAN, SR508, as ruled)
 //! gives the shape residual's angles (`atan2`, `atan`) and suggest's rounding (`round`).
 
@@ -28,7 +38,8 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::f64::consts::{PI, TAU};
 
-use brep_core::geom_core::{Segment, Vec2, Vec3, closest_point_segment, closest_point_triangle};
+use brep_core::geom_core::{Aabb3, Segment, Vec2, Vec3, closest_point_segment};
+use brep_core::mesh_core::{Bvh, Mesh}; // VUGINTENTPOINTS (SR523)
 use sketch_core::{Arc2, Edge, Loop, profiles};
 
 use crate::lex::read;
@@ -236,12 +247,12 @@ fn judge(doc: &Doc, p: &Proposal, m: &Measurement, tol: Tol) -> Result<Verdict, 
     if redundant(&after) > redundant(&before) {
         return Err(Reason::Redundant);
     }
-    let fit = residual(&after, m, tol)?;
+    let fit = residual(&after, m, tol, Some(&before))?;
     let limit = K_SIGMA * sigma;
     if fit.max > limit {
         return Err(Reason::Residual { max_mm: fit.max, limit_mm: limit });
     }
-    if let Ok(b) = residual(&before, m, tol) {
+    if let Ok(b) = residual(&before, m, tol, None) {
         if fit.rms > b.rms + sigma {
             return Err(Reason::Worse { rms_mm: fit.rms, before_mm: b.rms, sigma_mm: sigma });
         }
@@ -309,8 +320,9 @@ struct Fit {
     max: f64,
 }
 
-/// The distances from the measurement to the replayed geometry.
-fn residual(r: &Replay, m: &Measurement, tol: Tol) -> Result<Fit, Reason> {
+/// The distances from the measurement to the replayed geometry; with a `base` (the document's own replay) the Points
+/// measurement also runs its surface side (VUGINTENTPOINTS SR523).
+fn residual(r: &Replay, m: &Measurement, tol: Tol, base: Option<&Replay>) -> Result<Fit, Reason> {
     let mut d: Vec<f64> = Vec::new();
     match m {
         Measurement::Outline { loops, .. } => {
@@ -342,30 +354,17 @@ fn residual(r: &Replay, m: &Measurement, tol: Tol) -> Result<Fit, Reason> {
                 }
             }
         }
+        // VUGINTENTPOINTS (SR523): forward through Bvh::closest, then the changed surface back to the points.
         Measurement::Points { pts, sigma_mm } => {
             if r.solids.is_empty() {
                 return Err(Reason::NoGeometry);
             }
             let chord = (sigma_mm * 0.25).max(4.0 * tol.lin);
-            let mut tris: Vec<[Vec3; 3]> = Vec::new();
-            for s in &r.solids {
-                let t = brep_core::tessellate(&s.brep, chord, tol).map_err(Reason::Tess)?;
-                let at = |k: u32| t.mesh.positions[k as usize];
-                for tr in &t.mesh.triangles {
-                    tris.push([at(tr[0]), at(tr[1]), at(tr[2])]);
-                }
-            }
-            for &q in pts {
-                let mut best = f64::INFINITY;
-                for t in &tris {
-                    if let Ok((c, _)) = closest_point_triangle(q, t[0], t[1], t[2], tol) {
-                        best = best.min(q.dist(c));
-                    }
-                }
-                if !best.is_finite() {
-                    return Err(Reason::NoGeometry);
-                }
-                d.push(best);
+            let mesh = solid_mesh(r, chord, tol)?;
+            let bvh = Bvh::build(&mesh);
+            forward(&mesh, &bvh, pts, tol, &mut d)?;
+            if let Some(b) = base {
+                surface_side(&mesh, b, pts, *sigma_mm, chord, tol, &mut d);
             }
         }
         // VUGINTENTSCAN (SR508): each shape against its nearest replayed face of the same kind.
@@ -692,4 +691,187 @@ pub fn measurements_text(m: &Measurement) -> String {
         }
     }
     out
+}
+
+// ---- VUGINTENTPOINTS (SR523): the two-sided Points residual ----
+
+/// Every solid of the replay tessellated at `chord` into ONE mesh (indices offset per solid), in solid order.
+fn solid_mesh(r: &Replay, chord: f64, tol: Tol) -> Result<Mesh, Reason> {
+    let mut mesh = Mesh::default();
+    for s in &r.solids {
+        let t = brep_core::tessellate(&s.brep, chord, tol).map_err(Reason::Tess)?;
+        let off = mesh.positions.len() as u32;
+        mesh.positions.extend_from_slice(&t.mesh.positions);
+        mesh.triangles.extend(t.mesh.triangles.iter().map(|tr| [tr[0] + off, tr[1] + off, tr[2] + off]));
+    }
+    Ok(mesh)
+}
+
+/// Each point's distance to the mesh through `Bvh::closest`; the reach starts at the previous answer plus the step
+/// between the points (the true nearest is within it), a miss at that bound re-queries unbounded, and a point with
+/// no non-degenerate triangle at all is NoGeometry (SR505's rule).
+fn forward(mesh: &Mesh, bvh: &Bvh, pts: &[Vec3], tol: Tol, d: &mut Vec<f64>) -> Result<(), Reason> {
+    let mut prev: Option<(Vec3, f64)> = None;
+    for &q in pts {
+        let reach = prev.map_or(f64::INFINITY, |(p, dist)| dist + q.dist(p));
+        let near = bvh.closest(mesh, q, reach, tol).or_else(|| bvh.closest(mesh, q, f64::INFINITY, tol));
+        let Some(n) = near else { return Err(Reason::NoGeometry) };
+        d.push(n.dist);
+        prev = Some((q, n.dist));
+    }
+    Ok(())
+}
+
+/// The surface side: one sample per triangle of `mesh` (its centroid; the density is the forward side's chord), a
+/// sample within `sigma` of the base replay's surface skipped (the document's own), every other sample's distance to
+/// the nearest scan point minus the scan's spacing, floored at 0. A base with no solid, or one that does not
+/// tessellate, skips nothing.
+fn surface_side(mesh: &Mesh, base: &Replay, pts: &[Vec3], sigma: f64, chord: f64, tol: Tol, d: &mut Vec<f64>) {
+    let own = if base.solids.is_empty() { None } else { solid_mesh(base, chord, tol).ok() };
+    let own_bvh = own.as_ref().map(Bvh::build);
+    let tree = PointTree::build(pts);
+    let h = spacing(&tree, pts);
+    for t in 0..mesh.triangles.len() {
+        let Some([a, b, c]) = mesh.corners(t) else { continue };
+        let g = (a + b + c) * (1.0 / 3.0);
+        if let (Some(m), Some(bv)) = (own.as_ref(), own_bvh.as_ref()) {
+            if bv.closest(m, g, sigma, tol).is_some() {
+                continue;
+            }
+        }
+        if let Some((_, dist)) = tree.nearest(pts, g, None) {
+            d.push((dist - h).max(0.0));
+        }
+    }
+}
+
+/// At most this many evenly strided scan points estimate the spacing.
+const SPACING_SAMPLES: usize = 1024;
+
+/// The scan's spacing `h`: the median nearest-OTHER-point distance over at most [`SPACING_SAMPLES`] points (0 for
+/// fewer than two points; duplicates pull it toward 0, so no allowance).
+fn spacing(tree: &PointTree, pts: &[Vec3]) -> f64 {
+    let step = (pts.len() / SPACING_SAMPLES).max(1);
+    let mut nn: Vec<f64> =
+        (0..pts.len()).step_by(step).filter_map(|i| tree.nearest(pts, pts[i], Some(i as u32)).map(|(_, x)| x)).collect();
+    if nn.is_empty() {
+        return 0.0;
+    }
+    nn.sort_by(|a, b| a.total_cmp(b));
+    nn[nn.len() / 2]
+}
+
+/// The most points a point-tree leaf holds.
+const POINT_LEAF: usize = 8;
+
+#[derive(Clone, Copy, Debug)]
+struct PNode {
+    bb: Aabb3,
+    /// Leaf: first index into `order`; inner: the left child (the right child is `first + 1`).
+    first: u32,
+    /// Leaf: point count (> 0); inner: 0.
+    count: u32,
+}
+
+/// A median-split tree over scan point ids (Bvh::build's shape for points: the longest axis of the node's box,
+/// `select_nth_unstable_by`, an explicit stack). It holds ids, so a query takes the slice it was built from.
+struct PointTree {
+    nodes: Vec<PNode>,
+    order: Vec<u32>,
+}
+
+impl PointTree {
+    fn build(pts: &[Vec3]) -> PointTree {
+        let mut t = PointTree { nodes: Vec::new(), order: (0..pts.len() as u32).collect() };
+        let Some(&p0) = pts.first() else { return t };
+        let at = |i: u32| pts[i as usize];
+        t.nodes.push(PNode { bb: Aabb3 { min: p0, max: p0 }, first: 0, count: 0 });
+        let mut stack: Vec<(usize, usize, usize)> = alloc::vec![(0, 0, pts.len())];
+        while let Some((ni, start, end)) = stack.pop() {
+            let ids = &mut t.order[start..end];
+            let f = at(ids[0]);
+            let bb = ids.iter().fold(Aabb3 { min: f, max: f }, |b, &i| b.union(Aabb3 { min: at(i), max: at(i) }));
+            let count = end - start;
+            if count <= POINT_LEAF {
+                t.nodes[ni] = PNode { bb, first: start as u32, count: count as u32 };
+                continue;
+            }
+            let ext = bb.max - bb.min;
+            let axis = if ext.x >= ext.y && ext.x >= ext.z {
+                0
+            } else if ext.y >= ext.z {
+                1
+            } else {
+                2
+            };
+            let key = |i: u32| {
+                let p = at(i);
+                match axis {
+                    0 => p.x,
+                    1 => p.y,
+                    _ => p.z,
+                }
+            };
+            let half = count / 2;
+            ids.select_nth_unstable_by(half, |a, b| key(*a).total_cmp(&key(*b)));
+            let left = t.nodes.len();
+            t.nodes.push(PNode { bb, first: 0, count: 0 });
+            t.nodes.push(PNode { bb, first: 0, count: 0 });
+            t.nodes[ni] = PNode { bb, first: left as u32, count: 0 };
+            stack.push((left, start, start + half));
+            stack.push((left + 1, start + half, end));
+        }
+        t
+    }
+
+    /// The scan point nearest `q` other than id `skip`: (id, distance). Branch and bound on the squared point-box
+    /// distance, the nearer child first; a non-finite distance is never taken.
+    fn nearest(&self, pts: &[Vec3], q: Vec3, skip: Option<u32>) -> Option<(u32, f64)> {
+        if self.nodes.is_empty() || !q.is_finite() {
+            return None;
+        }
+        let mut best_sq = f64::INFINITY;
+        let mut best: Option<u32> = None;
+        let mut stack: Vec<usize> = alloc::vec![0];
+        while let Some(ni) = stack.pop() {
+            let Some(n) = self.nodes.get(ni) else { continue };
+            if box_dist_sq(q, &n.bb) > best_sq {
+                continue;
+            }
+            if n.count == 0 {
+                let (l, r) = (n.first as usize, n.first as usize + 1);
+                let dl = self.nodes.get(l).map_or(f64::INFINITY, |c| box_dist_sq(q, &c.bb));
+                let dr = self.nodes.get(r).map_or(f64::INFINITY, |c| box_dist_sq(q, &c.bb));
+                if dl <= dr {
+                    stack.push(r);
+                    stack.push(l);
+                } else {
+                    stack.push(l);
+                    stack.push(r);
+                }
+                continue;
+            }
+            let s = n.first as usize;
+            for &i in self.order.get(s..s + n.count as usize).unwrap_or(&[]) {
+                if Some(i) == skip {
+                    continue;
+                }
+                let Some(&p) = pts.get(i as usize) else { continue };
+                let d2 = (p - q).mag_sq();
+                if d2 < best_sq {
+                    best_sq = d2;
+                    best = Some(i);
+                }
+            }
+        }
+        best.map(|i| (i, libm::sqrt(best_sq)))
+    }
+}
+
+/// The squared distance from `p` to the box (0 inside it); mesh_core's private `aabb_dist_sq`, which doc_core cannot
+/// reach (the lift is owed: VUG-INTENT-POINTS-DENSE).
+fn box_dist_sq(p: Vec3, b: &Aabb3) -> f64 {
+    let d = |x: f64, lo: f64, hi: f64| if x < lo { lo - x } else if x > hi { x - hi } else { 0.0 };
+    let (dx, dy, dz) = (d(p.x, b.min.x, b.max.x), d(p.y, b.min.y, b.max.y), d(p.z, b.min.z, b.max.z));
+    dx * dx + dy * dy + dz * dz
 }

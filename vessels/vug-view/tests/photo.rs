@@ -5,11 +5,12 @@
 //! measured sketch (the same primitives, one profile with its two holes) over the dimmed photo (dark at the part, light
 //! at the paper); proposals are verified through doc_core::intent and drawn as glyphs; Enter enters an accepted one
 //! through the sketch face's apply_as road and the sketch is exact; Enter on a refused one changes nothing and names
-//! the refusal; Backspace rejects; Tab cycles; `i` with no provider says so. The proposal road is witnessed twice: on
+//! the refusal; Backspace rejects; Tab cycles; `i` asks Vein over the bus (VUGFACEINTENTSEND SR514: one Propose out, the
+//! live id's Proposals offered, a stale id ignored, a Refused named). The proposal road is witnessed twice: on
 //! the fixture's hole circles, and on a hand-built photo face (the intent arc's 49.7 x 30.2 rectangle, sigma 0.3) that
 //! does not depend on photo_core.
 
-use bandy::SMessage;
+use bandy::{IntentEvent, IntentProposal, SMessage};
 use doc_core::{Proposal, Reason, Verdict};
 use sketch_core::{Entity, EntityId, PointRef, Sketch, Vec2};
 use vug_view::model::Model;
@@ -185,6 +186,10 @@ fn rectangle() -> Viewer {
         offers: Vec::new(),
         focus: None,
         note: None,
+        outbox: Vec::new(), // VUGFACEINTENTSEND (SR514)
+        request: 0,
+        asked: None,
+        ignored: 0,
     });
     vw
 }
@@ -236,12 +241,87 @@ fn a_proposal_enters_through_apply_as_and_a_refused_one_never() {
     assert_eq!(photo::key(&mut vw.view, "BackSpace"), None);
 }
 
+// ---- VUGFACEINTENTSEND (SR514): the ask over the bus and its answer ----
+
+fn ask(vw: &mut Viewer) -> Vec<SMessage> {
+    assert!(vw.input(&SMessage::BrowserText("i".into())), "`i` changes the corner");
+    vw.outbox()
+}
+
+fn vein(stmt: &str) -> IntentProposal {
+    IntentProposal { stmt: stmt.into(), confidence: 0.9, why: "a round size".into() }
+}
+
 #[test]
-fn intent_with_no_provider_says_so() {
+fn intent_sends_one_propose_over_the_bus() {
     let mut vw = rectangle();
-    assert!(vw.input(&SMessage::BrowserText("i".into())));
-    assert_eq!(ph(&vw).note.as_deref(), Some(photo::OFFLINE));
-    assert!(ph(&vw).offers.is_empty(), "offline gives no proposals, never a fake one");
-    assert!(!photo::offer(&mut vw.view, Vec::new()), "the Echo case: proposed=0");
+    let out = ask(&mut vw);
+    assert_eq!(out.len(), 1, "exactly one outbound message");
+    let SMessage::Intent(IntentEvent::Propose { context, measurements, images, request, .. }) = &out[0] else {
+        panic!("not a Propose: {:?}", out[0]);
+    };
+    let doc = doc_core::read(context).expect("the context parses back");
+    assert_eq!(doc_core::write(&doc), doc_core::write(&photo::doc_of(face(&vw))), "the context is the face document");
+    assert!(measurements.starts_with("outline:"), "{measurements}");
+    assert_eq!(images.len(), 1);
+    assert_eq!(images[0].media_type, "image/png");
+    assert!(images[0].bytes.starts_with(b"\x89PNG\r\n\x1a\n"), "PNG bytes");
+    assert_eq!(*request, 1);
+    assert_eq!(ph(&vw).asked, Some(1));
+    assert_eq!(ph(&vw).note.as_deref(), Some("asked Vein (request 1)"));
+    assert!(vw.outbox().is_empty(), "drained once");
+    // Our own Propose back on the shared bus is not an answer.
+    assert!(!vw.input(&out[0]));
+    assert_eq!(ph(&vw).ignored, 0);
+    assert_eq!(ph(&vw).asked, Some(1));
+}
+
+#[test]
+fn proposals_for_the_live_request_are_offered() {
+    let mut vw = rectangle();
+    // The Echo case: no proposals, proposed=0, never a fake one.
+    ask(&mut vw);
+    assert!(vw.input(&SMessage::Intent(IntentEvent::Proposals { request: 1, proposals: Vec::new() })));
+    assert!(ph(&vw).offers.is_empty());
     assert!(ph(&vw).note.as_deref().unwrap().contains("proposed=0"));
+    assert_eq!(ph(&vw).asked, None);
+    ask(&mut vw);
+    let proposals = vec![vein("distance v1 sketch=s a=e0 b=e1 d=50"), vein("distance v2 sketch=s a=e1 b=e2 d=33")];
+    assert!(vw.input(&SMessage::Intent(IntentEvent::Proposals { request: 2, proposals })));
+    assert_eq!(ph(&vw).asked, None, "answered");
+    assert_eq!(ph(&vw).offers.len(), 2);
+    assert_eq!(photo::glyphs(&vw.view).len(), 2, "two glyphs");
+    assert!(ph(&vw).note.as_deref().unwrap().contains("proposed=2 acceptable=1 refused=1"));
+}
+
+#[test]
+fn a_stale_request_id_changes_nothing() {
+    let mut vw = rectangle();
+    ask(&mut vw);
+    ask(&mut vw);
+    assert_eq!(ph(&vw).asked, Some(2), "the second ask is the live one");
+    let (note, focus) = (ph(&vw).note.clone(), ph(&vw).focus);
+    let stale = SMessage::Intent(IntentEvent::Proposals { request: 1, proposals: vec![vein("distance v1 sketch=s a=e0 b=e1 d=50")] });
+    assert!(!vw.input(&stale), "a stale answer draws nothing");
+    assert!(ph(&vw).offers.is_empty());
+    assert_eq!(ph(&vw).note, note);
+    assert_eq!(ph(&vw).focus, focus);
+    assert_eq!(ph(&vw).asked, Some(2));
+    assert_eq!(ph(&vw).ignored, 1, "counted");
+    assert!(!vw.input(&SMessage::Intent(IntentEvent::Refused { request: 99, why: "NoProvider: x".into() })), "an unknown id too");
+    assert_eq!(ph(&vw).note, note);
+    assert_eq!(ph(&vw).ignored, 2);
+}
+
+#[test]
+fn a_refusal_names_its_why() {
+    let mut vw = rectangle();
+    ask(&mut vw);
+    assert!(vw.input(&SMessage::Intent(IntentEvent::Refused { request: 1, why: "NoProvider: no key".into() })));
+    assert_eq!(ph(&vw).note.as_deref(), Some("Vein refused: NoProvider: no key"));
+    assert!(ph(&vw).offers.is_empty());
+    assert_eq!(ph(&vw).asked, None);
+    // Answered: a second answer to the same id is stale.
+    assert!(!vw.input(&SMessage::Intent(IntentEvent::Refused { request: 1, why: "again".into() })));
+    assert_eq!(ph(&vw).ignored, 1);
 }
