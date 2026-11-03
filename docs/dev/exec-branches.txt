@@ -1252,3 +1252,9 @@ exec-rmbp-vugstep | /home/user/exec/vugstep | cut f89569a2d | VUGSTEP | wave36
 exec-rmbp-vugmakeslice | /home/user/exec/vugmakeslice | cut f89569a2d | VUGMAKESLICE | wave36
 exec-rmbp-vugcomscantty | /home/user/exec/vugcomscantty | cut f89569a2d | VUGCOMSCANTTY | wave36
 exec-rmbp-vugface2 | /home/user/exec/vugface2 | cut f89569a2d | VUGFACE2 | wave36
+exec-rmbp-vug3mf | /home/user/exec/vug3mf | cut 314860b90 | VUG3MF | wave36
+exec-rmbp-vugcomscantcp | /home/user/exec/vugcomscantcp | cut 314860b90 | VUGCOMSCANTCP | wave36
+exec-rmbp-vugfacegtkbuttons | /home/user/exec/vugfacegtkbuttons | cut 314860b90 | VUGFACEGTKBUTTONS | wave36
+exec-rmbp-vughelmbind | /home/user/exec/vughelmbind | cut 314860b90 | VUGHELMBIND | wave36
+exec-rmbp-vugmakearcfit | /home/user/exec/vugmakearcfit | cut 314860b90 | VUGMAKEARCFIT | wave36
+exec-rmbp-sonderecordimu | /home/user/exec/sonderecordimu | cut 314860b90 | SONDERECORDIMU | wave36
