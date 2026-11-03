@@ -714,7 +714,7 @@ pub fn disconnect(slot: u8) {
         }
         serial_println!("[usb-iso] disconnect slot={} dir=in-feedback — stream disarmed", slot);
     }
-    ac::disconnect(slot);
+    ac::disconnect(slot); #[cfg(feature = "sonderec")] imu_disconnect(slot); // SONDE-RECORD-IMU (LEDGER SR491): the IMU interrupt pipe forgets the slot too; LINE-NEUTRAL, code first.
 }
 
 /// The 4 KiB EP0 buffer, allocated once per boot (4 KiB-aligned, never freed).
@@ -1033,7 +1033,7 @@ impl IsoHost for XhciUvc<'_> {
         Ok((n as u32, lead, "frameid"))
     }
 
-    fn iso_drop(&mut self, ep: &IsoEp) {
+    #[cfg(feature = "sonderec")] fn int_configure(&mut self, ep: &IsoEp) -> Result<(), (u8, &'static str)> { self.imu_configure(ep) } #[cfg(feature = "sonderec")] fn int_start(&mut self) -> Result<u32, &'static str> { self.imu_start() } fn iso_drop(&mut self, ep: &IsoEp) { // SONDE-RECORD-IMU (LEDGER SR491): the interrupt-IN pipe's two IsoHost methods, bodies at the file tail (`imu_configure` / `imu_start`); LINE-NEUTRAL, code first.
         let out = ep.addr & 0x80 == 0; // UAC1 (B706): the pipe of the endpoint's direction
         let dci = (ep.addr & 0x0F) as u32 * 2 + if out { 0 } else { 1 };
         let fb = !out && self.audio && ac::feedback_ep(ep.addr); // UACFEEDBACK (B789): the feedback pipe
@@ -1068,7 +1068,7 @@ impl XhciController {
             self.service_capture(slot); // UACMIC (B723) / SINKALL (B767): the class driver's EP0 job (the playback volume, or a capture source opened or closed) — one per pass, first
             return;
         }
-        let slot = pop_candidate();
+        #[cfg(feature = "sonderec")] { if self.service_imu_power() { return; } } let slot = pop_candidate(); // SONDE-RECORD-IMU (LEDGER SR491): the IMU's D4 power-down the recorder asked for, one EP0 job per pass, after the enum guard (file tail); LINE-NEUTRAL, code first.
         let (slot, audio) = if slot != 0 { (slot, false) } else if crate::boot::services_up() { (pop_audio(), true) } else { (0, true) }; // CRAWLC: an audio stream is a service — it waits in its queue for the services gate, as HDA does (BP-boot-3). UAC1 (B706): a camera first, else an audio device
         if slot == 0 {
             return;
@@ -1138,4 +1138,291 @@ impl XhciController {
 /// read of which device the camera driver holds. Tail-appended.
 pub fn in_slot() -> u8 {
     PIPE_SLOT.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+// ── SONDE-RECORD-IMU (LEDGER SR491): the interrupt-IN pipe — the D435i IMU's HID endpoint ──────────────────────────────
+//
+// APPENDED at the file tail, every item `#[cfg(feature = "sonderec")]` (sonderec implies sonde implies uvc, this file's
+// own gate): no line above moves except three same-line folds (the two IsoHost methods before `iso_drop`, the power-down
+// job before `pop_candidate`, `imu_disconnect` after `ac::disconnect`), so a knob-off image is byte-identical.
+//
+// THE FIFTH PIPE, `IPIPE`, in the PIPE / OPIPE / APIPE / FPIPE shape: its own armed word (slot, DCI), the SAME `Pipe`
+// (ring, TD buffers, `write_trb`, `index_of`, `doorbell`), its own producer because an interrupt TD is a Normal TRB
+// (xHCI 1.2 §6.4.1.1, TRB Type 1) with no Frame ID, and its own claim. The endpoint context is the hub Status Change
+// Endpoint's (`configure_hub_interrupt_ep` in mod.rs: §6.2.3 EP Type 7 Interrupt IN, CErr 3, DW0 = Interval alone,
+// DW4 = Average TRB Length | Max ESIT Payload Lo; Interval = bInterval - 1 at high/SuperSpeed, floor(log2(bInterval))
+// + 3 at full speed, §6.2.3.6). `INT_TDS` Normal TRBs stay outstanding (XHCINTD's lesson on the keyboard, B44: with
+// one, every report inside the re-arm window is lost). Each completed TD's bytes (one 32-byte IMU report, librealsense
+// `src/hid/hid-device.cpp:164-181`) go to `drivers::realsense_imu::push_report`, under this pipe's lock only.
+// A halting completion (Stall, Transaction Error) leaves the endpoint Halted: counted, not recovered
+// (SONDE-RECORD-IMU-HALT owed).
+
+/// TRB Type 1 = Normal (§6.4.1.1).
+#[cfg(feature = "sonderec")]
+const TRB_NORMAL: u32 = 1;
+/// Endpoint Context EP Type 7 = Interrupt IN (§6.2.3, Table 6-9).
+#[cfg(feature = "sonderec")]
+const EP_TYPE_INT_IN: u32 = 7;
+/// Normal TRBs kept outstanding on the interrupt-IN.
+#[cfg(feature = "sonderec")]
+const INT_TDS: usize = 8;
+
+#[cfg(feature = "sonderec")]
+static IPIPE: crate::sync::Mutex<Option<Pipe>> = crate::sync::Mutex::new(None);
+#[cfg(feature = "sonderec")]
+static IPIPE_SLOT: AtomicU8 = AtomicU8::new(0);
+#[cfg(feature = "sonderec")]
+static IPIPE_DCI: AtomicU8 = AtomicU8::new(0);
+/// The pipe `imu_configure` built (its ring is in the endpoint context), published by `imu_start`.
+#[cfg(feature = "sonderec")]
+static IBUILT: crate::sync::Mutex<Option<Pipe>> = crate::sync::Mutex::new(None);
+#[cfg(feature = "sonderec")]
+static ST_I_EVENTS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "sonderec")]
+static ST_I_REPORTS: AtomicU32 = AtomicU32::new(0);
+#[cfg(feature = "sonderec")]
+static ST_I_ERR: AtomicU32 = AtomicU32::new(0);
+#[cfg(feature = "sonderec")]
+static ST_I_DUP: AtomicU32 = AtomicU32::new(0);
+
+/// The interrupt pipe's counters: (events, reports delivered, TDs retired with an error code, duplicate events).
+#[cfg(feature = "sonderec")]
+pub fn imu_stats() -> (u64, u32, u32, u32) {
+    (ST_I_EVENTS.load(Ordering::Relaxed), ST_I_REPORTS.load(Ordering::Relaxed), ST_I_ERR.load(Ordering::Relaxed), ST_I_DUP.load(Ordering::Relaxed))
+}
+
+#[cfg(feature = "sonderec")]
+impl Pipe {
+    /// Produce one interrupt TD at the enqueue slot: ONE Normal TRB over its own `stride` buffer, ISP + IOC so every TD
+    /// posts the event whose residual gives the report's length. The Link handling is `produce`'s (§4.9.2.2).
+    fn produce_normal(&mut self) {
+        let i = self.enq;
+        let buf = self.bufs as u64 + (i * self.stride) as u64;
+        dma_coherency::clean(buf as usize, self.td_len as usize);
+        let ctl = (TRB_NORMAL << 10) | ISO_ISP | ISO_IOC | (self.cycle as u32);
+        self.write_trb(i, Trb { parameter: buf, status: self.td_len & 0x1FFFF, control: ctl });
+        self.enq += 1;
+        if self.enq == self.nslots {
+            let link = Trb { parameter: self.ring_phys, status: 0, control: (TRB_LINK << 10) | (1 << 1) | (self.cycle as u32) };
+            self.write_trb(self.nslots, link);
+            self.cycle = !self.cycle;
+            self.enq = 0;
+        }
+        self.outstanding += 1;
+    }
+
+    fn top_up_normal(&mut self) -> usize {
+        let mut n = 0;
+        while self.outstanding < self.target {
+            self.produce_normal();
+            n += 1;
+        }
+        n
+    }
+}
+
+/// THE INTERRUPT CLAIM — every event on the armed IMU (slot, DCI). Retires TDs in ring order through the TRB the event
+/// names (`claim`'s duplicate / stale guard), hands each completed report to `realsense_imu::push_report`, and tops the
+/// ring up. `true` = consumed.
+#[cfg(feature = "sonderec")]
+pub fn claim_int(slot: u8, dci: u8, param: u64, cc: u8, residual: u32) -> bool {
+    if slot == 0 || IPIPE_SLOT.load(Ordering::Acquire) != slot || IPIPE_DCI.load(Ordering::Relaxed) != dci {
+        return false;
+    }
+    let n_ev = ST_I_EVENTS.fetch_add(1, Ordering::Relaxed);
+    let mut g = IPIPE.lock();
+    let Some(p) = g.as_mut() else { return true };
+    if (n_ev as u32) < FIRST_WITNESSED {
+        serial_println!(
+            "[sonde-imu] event n={} slot={} dci={} cc={} ({}) trb={:#x} residual={} outstanding={}",
+            n_ev, slot, dci, cc, cc_name(cc), param, residual, p.outstanding
+        );
+    }
+    if let Some(i) = p.index_of(param) {
+        if i < p.nslots {
+            let dist = (i + p.nslots - p.deq) % p.nslots;
+            if dist >= p.outstanding {
+                ST_I_DUP.fetch_add(1, Ordering::Relaxed);
+                return true;
+            }
+            for k in 0..=dist {
+                let j = (p.deq + k) % p.nslots;
+                if k == dist && (cc == 1 || cc == 13) {
+                    let len = p.td_len.saturating_sub(residual) as usize;
+                    let b = p.bufs as usize + j * p.stride;
+                    dma_coherency::inval(b, len);
+                    // SAFETY: TD buffer `j` is `stride` >= td_len >= len bytes inside the pipe's allocation, and the
+                    // controller has retired the TD that wrote it.
+                    crate::drivers::realsense_imu::push_report(unsafe { core::slice::from_raw_parts(b as *const u8, len) });
+                    ST_I_REPORTS.fetch_add(1, Ordering::Relaxed);
+                    p.delivered = p.delivered.wrapping_add(1);
+                } else {
+                    ST_I_ERR.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            p.deq = (i + 1) % p.nslots;
+            p.outstanding -= dist + 1;
+        }
+    }
+    if p.top_up_normal() != 0 {
+        p.doorbell();
+    }
+    true
+}
+
+/// The device left: the interrupt pipe forgets the slot. Ring and buffers are leaked, as `disconnect` leaks the others.
+#[cfg(feature = "sonderec")]
+fn imu_disconnect(slot: u8) {
+    if IPIPE_SLOT.load(Ordering::Acquire) == slot {
+        IPIPE_SLOT.store(0, Ordering::Release);
+        if let Some(p) = IPIPE.lock().take() {
+            core::mem::forget(p); // the controller may still hold the dequeue pointer
+        }
+        serial_println!("[sonde-imu] disconnect slot={} — interrupt pipe disarmed", slot);
+    }
+    if let Some(p) = IBUILT.lock().take() {
+        core::mem::forget(p);
+    }
+}
+
+#[cfg(feature = "sonderec")]
+impl XhciUvc<'_> {
+    /// `IsoHost::int_configure`: Configure Endpoint (Add) of the interrupt-IN `ep` as EP Type 7, its ring built first
+    /// (the TR Dequeue Pointer is part of the context) and held in `IBUILT` until `imu_start`.
+    fn imu_configure(&mut self, ep: &IsoEp) -> Result<(), (u8, &'static str)> {
+        if IPIPE_SLOT.load(Ordering::Acquire) != 0 || IBUILT.lock().is_some() {
+            return Err((0, "one-imu-pipe-already-armed"));
+        }
+        if ep.addr & 0x80 == 0 {
+            return Err((0, "not-an-in-endpoint"));
+        }
+        let speed = self.speed();
+        let dci = (ep.addr & 0x0F) as u32 * 2 + 1;
+        let ss = speed >= 4;
+        let mps = ep.mps as u32;
+        if mps == 0 {
+            return Err((0, "zero-packet-size"));
+        }
+        let burst = if ss { ep.ss_burst as u32 } else if speed == 3 { ep.hs_extra as u32 } else { 0 };
+        let esit = if ss { ep.esit_bytes() } else { mps * (burst + 1) };
+        let biv = ep.interval.max(1) as u32;
+        let ivl = if speed >= 3 { biv.min(16) - 1 } else { (31 - biv.leading_zeros()) + 3 };
+        let stride = (mps as usize).next_power_of_two().max(64);
+        let nslots = INT_TDS + RING_SLACK;
+        let rl = core::alloc::Layout::from_size_align((nslots + 1) * 16, 4096).map_err(|_| (0u8, "layout"))?;
+        let bl = core::alloc::Layout::from_size_align(nslots * stride, stride).map_err(|_| (0u8, "layout"))?;
+        // SAFETY: non-zero layouts; zeroed so no stale cycle bit is ever a produced TRB (§4.9.2).
+        let ring = crate::arch::memory::dma::ident(rl.size(), rl.align()) as *mut Trb;
+        let bufs = crate::arch::memory::dma::ident(bl.size(), bl.align()) as *mut u8;
+        if ring.is_null() || bufs.is_null() {
+            return Err((0, "no-memory"));
+        }
+        dma_coherency::clean(ring as usize, (nslots + 1) * 16);
+        let ring_phys = ring as u64;
+        // The Link TRB at the end, not yet produced (cycle 0 against the ring's initial producer cycle 1).
+        // SAFETY: slot `nslots` is inside the ring allocation.
+        unsafe {
+            let p = ring.add(nslots) as *mut u32;
+            core::ptr::write_volatile(p, ring_phys as u32);
+            core::ptr::write_volatile(p.add(1), (ring_phys >> 32) as u32);
+            core::ptr::write_volatile(p.add(3), (TRB_LINK << 10) | (1 << 1));
+        }
+        let ctx = [
+            ivl << 16,
+            (EP_TYPE_INT_IN << 3) | (3 << 1) | (burst << 8) | (mps << 16),
+            (ring_phys as u32) | 1,
+            (ring_phys >> 32) as u32,
+            (mps & 0xFFFF) | ((esit & 0xFFFF) << 16),
+        ];
+        let before = self.c.ep_state_of(self.slot, dci as u8);
+        let r = self.configure(dci, true, ctx);
+        let after = self.c.ep_state_of(self.slot, dci as u8);
+        serial_println!(
+            "[sonde-imu] cfg-ep slot={} dci={} speed={} type=int-in ep={:#04x} mps={} burst={} esit={} interval_enc={} ring={:#x} slots={} epstate={}({})->{}({}) result={}",
+            self.slot, dci, speed, ep.addr, mps, burst + 1, esit, ivl, ring_phys, nslots,
+            before, ep_state_name(before), after, ep_state_name(after),
+            match r { Ok(()) => "cc=1 (Success)", Err((_, n)) => n }
+        );
+        if let Err(e) = r {
+            // SAFETY: the allocations above, with their own layouts, referenced by no context that took effect.
+            unsafe {
+                crate::arch::memory::dma::free_ident(ring as u64, rl.size(), rl.align());
+                crate::arch::memory::dma::free_ident(bufs as u64, bl.size(), bl.align());
+            }
+            return Err(e);
+        }
+        // SAFETY: capability registers of this controller — RTSOFF (Cap + 0x18) and DBOFF (Cap + 0x14).
+        let (rts, dbo) = unsafe {
+            (
+                core::ptr::read_volatile((self.c.base_addr + 0x18) as *const u32) & !0x1F,
+                core::ptr::read_volatile((self.c.base_addr + 0x14) as *const u32) & !0x3,
+            )
+        };
+        *IBUILT.lock() = Some(Pipe {
+            slot: self.slot,
+            dci: dci as u8,
+            out: false,
+            ain: false,
+            fb: false,
+            ring,
+            ring_phys,
+            nslots,
+            enq: 0,
+            deq: 0,
+            cycle: true,
+            outstanding: 0,
+            target: INT_TDS,
+            bufs,
+            stride,
+            td_len: mps,
+            esit,
+            mps,
+            ss_burst: burst,
+            ss,
+            interval_uf: 1u32 << ivl,
+            ist_uf: 0,
+            next_uf: 0,
+            sia: true, // no Frame ID: an interrupt TD is serviced at the endpoint's own interval
+            db_addr: (self.c.base_addr + dbo as usize + self.slot as usize * 4) as u64,
+            mfindex_addr: self.c.base_addr + rts as usize,
+            delivered: 0,
+            missed_since_start: 0,
+        });
+        Ok(())
+    }
+
+    /// `IsoHost::int_start`: produce `INT_TDS` Normal TRBs, publish the pipe to its word, ring the doorbell.
+    fn imu_start(&mut self) -> Result<u32, &'static str> {
+        let Some(mut pipe) = IBUILT.lock().take() else { return Err("not-configured") };
+        let n = pipe.top_up_normal();
+        let (slot, dci) = (pipe.slot, pipe.dci);
+        serial_println!("[sonde-imu] start slot={} dci={} tds={} slack={} stride={} td_len={} ring={:#x}", slot, dci, n, RING_SLACK, pipe.stride, pipe.td_len, pipe.ring_phys);
+        *IPIPE.lock() = Some(pipe);
+        IPIPE_DCI.store(dci, Ordering::Relaxed);
+        IPIPE_SLOT.store(slot, Ordering::Release);
+        self.c.ring_doorbell(slot, dci as u32);
+        Ok(n as u32)
+    }
+}
+
+#[cfg(feature = "sonderec")]
+impl XhciController {
+    /// The service pass's IMU EP0 job: the D4 power-down `tests sonderec` asks for at its end (`realsense_imu::
+    /// power_down_due`), sent on the slot's own EP0 — the service pass is the only context that may run EP0. `true` =
+    /// a job was taken this pass.
+    fn service_imu_power(&mut self) -> bool {
+        let Some(slot) = crate::drivers::realsense_imu::power_down_due() else { return false };
+        let s = slot as usize;
+        if s >= self.slots.len() || !self.slots[s].active || self.slots[s].ep0_ring.is_none() {
+            crate::drivers::realsense_imu::power_down_lost("slot-gone");
+            return true;
+        }
+        let Some(buf) = ep0_buf() else {
+            crate::drivers::realsense_imu::power_down_lost("no-ep0-buffer");
+            return true;
+        };
+        let mut host = XhciUvc { c: self, slot, buf, built: None, audio: false };
+        crate::drivers::realsense_imu::power_down(&mut host);
+        true
+    }
 }

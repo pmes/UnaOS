@@ -1648,7 +1648,7 @@ pub trait IsoHost {
     /// Fill the ring and ring the doorbell. Ok((TDs outstanding, lead in microframes, scheduling name)).
     fn iso_start(&mut self, ep: &IsoEp) -> Result<(u32, u32, &'static str), &'static str>;
     /// The unwind of `iso_configure` (Configure Endpoint, Drop).
-    fn iso_drop(&mut self, ep: &IsoEp);
+    fn iso_drop(&mut self, ep: &IsoEp); #[cfg(feature = "sonderec")] fn int_configure(&mut self, _ep: &IsoEp) -> Result<(), (u8, &'static str)> { Err((0, "no-interrupt-pipe")) } #[cfg(feature = "sonderec")] fn int_start(&mut self) -> Result<u32, &'static str> { Err("no-interrupt-pipe") } // SONDE-RECORD-IMU (LEDGER SR491): the interrupt-IN pipe (the D435i's IMU HID endpoint) — Configure Endpoint (Add) as EP Type 7, then fill the ring and ring the doorbell (Ok(TDs outstanding)); defaults refuse, `xhci::isoch::XhciUvc` implements both. LINE-NEUTRAL, before this comment.
 }
 
 static STREAM: crate::sync::Mutex<Option<Assembler>> = crate::sync::Mutex::new(None);
@@ -1813,7 +1813,7 @@ pub fn probe_iso(idx: usize, addr: u8, cfg: &[u8], config_value: u8, h: &mut dyn
         serial_println!("[uvc] abort addr={} host={} stage=set-configuration req=SET_CONFIGURATION({}) reason=stalled-or-timeout", addr, h.name(), config_value);
         return;
     }
-    crate::bootlog_println!("[uvc] configured addr={} host={} cfg_value={} vs_intf={}", addr, h.name(), config_value, c.vs_intf); #[cfg(feature = "sonde")] multi::after_census(addr, config_value, full, buf, cap, &mut |bm, br, wv, wi, wl, di| h.control(bm, br, wv, wi, wl, di)); // ARMSONDE (LEDGER SR101): `probe`'s FOLD 2 on the xHCI path — the multi-function census of the full descriptor and, for a D400, the record plus the three XU GET_CURs. Placed AFTER SET_CONFIGURATION so the XU reads address a configured device, and `full` is still the descriptor here: the only transfer since its read is SET_CONFIGURATION, wLength 0, which has no data stage (`sync_control` touches the buffer only when `w_length > 0`). Every later read in this function is of owned copies (`c`, `eps`, the pick) or of a fresh transfer.
+    crate::bootlog_println!("[uvc] configured addr={} host={} cfg_value={} vs_intf={}", addr, h.name(), config_value, c.vs_intf); #[cfg(feature = "sonde")] multi::after_census(addr, config_value, full, buf, cap, &mut |bm, br, wv, wi, wl, di| h.control(bm, br, wv, wi, wl, di)); #[cfg(feature = "sonderec")] crate::drivers::realsense_imu::arm(addr, &mut *h); // SONDE-RECORD-IMU (LEDGER SR491): the D435i's IMU — the feature-report enable (D0 + rate) and its interrupt-IN pipe, on the xHCI path only, after the census read the HID endpoint; LINE-NEUTRAL, before this comment. // ARMSONDE (LEDGER SR101): `probe`'s FOLD 2 on the xHCI path — the multi-function census of the full descriptor and, for a D400, the record plus the three XU GET_CURs. Placed AFTER SET_CONFIGURATION so the XU reads address a configured device, and `full` is still the descriptor here: the only transfer since its read is SET_CONFIGURATION, wLength 0, which has no data stage (`sync_control` touches the buffer only when `w_length > 0`). Every later read in this function is of owned copies (`c`, `eps`, the pick) or of a fresh transfer.
     let mut blk_len = 0usize;
     for (stage, req) in [("min", RQ_GET_MIN), ("max", RQ_GET_MAX), ("def", RQ_GET_DEF)] {
         match h.control(BMREQ_GET_INTF, req, wvalue, windex, PROBE_LEN_ASK, true) {
@@ -2473,7 +2473,7 @@ pub mod multi {
     /// D400 the record `tests sonde` reads, the three XU `GET_CUR`s and (SONDE3, SR108) the HW-monitor depth scale
     /// when `cap` — the EP0 buffer's size: 256 from EHCI, 4 KiB from xHCI — carries it. `full` aliases `buf`.
     pub fn after_census(addr: u8, config_value: u8, full: &[u8], buf: *mut u8, cap: usize, xfer: Xfer) {
-        let s = census(full);
+        let s = census(full); #[cfg(feature = "sonderec")] crate::drivers::realsense_imu::note_cfg(full);
         let vp = PENDING.load(Ordering::Relaxed);
         let (vid, pid) = ((vp >> 16) as u16, vp as u16);
         let mut lbl = [0u8; 32];
@@ -2559,7 +2559,7 @@ pub mod multi {
         // The depth scale's own read is the HW-monitor GET_ADV(etDepthTableControl) — a 1024-byte XU
         // SET_CUR/GET_CUR pair (realsense_xu::hwmon_*). SONDE3 (SR108): sent when `cap` carries it (the
         // xHCI 4 KiB EP0); EHCI's 256-byte buffer keeps `[sonde] hwmon=withheld reason=ep0-buf-256-lt-1024`.
-        super::hwmon::depth_units(addr, unit, vc, buf, cap, xfer); #[cfg(feature = "sonderec")] super::hwmon::intcal(addr, unit, vc, buf, cap, xfer);
+        super::hwmon::depth_units(addr, unit, vc, buf, cap, xfer); #[cfg(feature = "sonderec")] super::hwmon::intcal(addr, unit, vc, buf, cap, xfer); #[cfg(feature = "sonderec")] crate::drivers::realsense_imu::after_census(addr, unit, vc, s.hid_intf, buf, cap, xfer);
         // (The exchange lives in `super::hwmon`, appended at the file tail, so this module keeps its line
         // count and nothing below it — `ensure_tests` is compiled with `uvc` alone — moves.)
     }
@@ -2754,53 +2754,34 @@ pub mod hwmon {
     /// `GET_CUR(DS5_HWMONITOR)` of 1024 bytes, the reply's data parsed by `realsense_xu::coefficients_rects` (the CRC
     /// checked). ONE attempt each, never retried; a failure names its stage and the intrinsics stay unread. The command
     /// READS the calibration table. `buf` is the live EP0 data buffer of the controller `xfer` drives, valid for `cap`.
+    /// SONDE-RECORD-IMU (SR491): the exchange itself is [`exchange`] (shared with the IMU table's MMER read); the wire
+    /// words below are this function's own, unchanged.
     #[cfg(feature = "sonderec")]
     pub fn intcal(addr: u8, unit: u8, vc: u8, buf: *mut u8, cap: usize, xfer: Xfer) {
         RECT_OK.store(false, Ordering::Release);
-        if !rs::hwmon_fits(cap) {
-            serial_println!("[sonde] intcal=withheld reason=ep0-buf-{}-lt-{} intrinsics=none", cap, rs::HWMON_BUF);
-            return;
-        }
-        let (wv, wi) = (rs::xu_wvalue(rs::CTRL_HWMONITOR), rs::xu_windex(unit, vc));
         let len = rs::HWMON_BUF as u16;
-        let built = {
-            // SAFETY: `buf` holds `cap` >= HWMON_BUF bytes (checked above) and no transfer is in flight while this
-            // slice lives; it ends before the SET_CUR below hands the buffer to the controller.
-            let b = unsafe { core::slice::from_raw_parts_mut(buf, rs::HWMON_BUF) };
-            rs::hwmon_build_intcal(b)
-        };
-        if built == 0 {
-            serial_println!("[sonde] intcal=failed addr={} stage=build reason=buffer-short intrinsics=none", addr);
-            return;
-        }
-        if let Err(e) = xfer(rs::BM_CLASS_INTF_OUT, rs::RQ_SET_CUR, wv, wi, len, false) {
-            serial_println!("[sonde] intcal=failed addr={} stage=set-cur unit={} len={} reason={} intrinsics=none — NOT retried", addr, unit, len, e);
-            return;
-        }
-        let got = match xfer(rs::BM_CLASS_INTF_IN, rs::RQ_GET_CUR, wv, wi, len, true) {
-            Ok(got) => got as usize,
-            Err(e) => {
-                serial_println!("[sonde] intcal=failed addr={} stage=get-cur unit={} len={} reason={} intrinsics=none — NOT retried", addr, unit, len, e);
+        let g = match exchange(unit, vc, buf, cap, xfer, rs::OP_GETINTCAL, &rs::hwmon_build_intcal) {
+            Ok(g) => g,
+            Err(f) => {
+                match f {
+                    Fail::Withheld => serial_println!("[sonde] intcal=withheld reason=ep0-buf-{}-lt-{} intrinsics=none", cap, rs::HWMON_BUF),
+                    Fail::Build => serial_println!("[sonde] intcal=failed addr={} stage=build reason=buffer-short intrinsics=none", addr),
+                    Fail::SetCur(e) => serial_println!("[sonde] intcal=failed addr={} stage=set-cur unit={} len={} reason={} intrinsics=none — NOT retried", addr, unit, len, e),
+                    Fail::GetCur(e) => serial_println!("[sonde] intcal=failed addr={} stage=get-cur unit={} len={} reason={} intrinsics=none — NOT retried", addr, unit, len, e),
+                    Fail::Runt(got) => serial_println!("[sonde] intcal=failed addr={} stage=get-cur got={} need={} reason=runt intrinsics=none", addr, got, rs::HWMON_BUF),
+                    Fail::Reply { echo, size } => serial_println!(
+                        "[sonde] intcal=failed addr={} stage=reply echo={:#x} want_echo={:#x} size={} reason={} intrinsics=none",
+                        addr, echo, rs::OP_GETINTCAL, size, if echo != rs::OP_GETINTCAL as u32 { "error-echo" } else { "size" }
+                    ),
+                }
                 return;
             }
         };
-        if got < rs::HWMON_BUF {
-            serial_println!("[sonde] intcal=failed addr={} stage=get-cur got={} need={} reason=runt intrinsics=none", addr, got, rs::HWMON_BUF);
-            return;
-        }
-        // SAFETY: the GET_CUR just wrote `got` >= HWMON_BUF bytes into the live EP0 buffer; the next transfer is the
-        // caller's, after this function returns.
+        let (got, echo, size) = (g.got, g.echo, g.size);
+        // SAFETY: the GET_CUR in `exchange` wrote `got` >= HWMON_BUF bytes into the live EP0 buffer; the next transfer is
+        // the caller's, after this function returns.
         let r = unsafe { core::slice::from_raw_parts(buf as *const u8, rs::HWMON_BUF) };
-        let le32 = |o: usize| u32::from_le_bytes([r[o], r[o + 1], r[o + 2], r[o + 3]]);
-        let (echo, size) = (le32(0), le32(rs::HWMON_DATA_SIZE_OFFSET));
-        let Some(range) = rs::hwmon_reply(r, rs::OP_GETINTCAL) else {
-            serial_println!(
-                "[sonde] intcal=failed addr={} stage=reply echo={:#x} want_echo={:#x} size={} reason={} intrinsics=none",
-                addr, echo, rs::OP_GETINTCAL, size, if echo != rs::OP_GETINTCAL as u32 { "error-echo" } else { "size" }
-            );
-            return;
-        };
-        match rs::coefficients_rects(&r[range]) {
+        match rs::coefficients_rects(&r[g.range]) {
             Ok(rows) => {
                 for (i, row) in rows.iter().enumerate() {
                     for (j, v) in row.iter().enumerate() {
@@ -2816,6 +2797,70 @@ pub mod hwmon {
                 );
             }
             Err(why) => serial_println!("[sonde] intcal=failed addr={} stage=table size={} reason={} intrinsics=none", addr, size, why),
+        }
+    }
+
+    // ── SONDE-RECORD-IMU (LEDGER SR491): THE ONE HW-monitor exchange of the sonderec reads ────────────────────────────
+    //
+    // `depth_units`' shape (librealsense `uvc-option.cpp:132-151`: `SET_CUR(DS5_HWMONITOR)` with the 1024-byte buffer
+    // whose head is the command, then `GET_CUR(DS5_HWMONITOR)` of 1024 bytes, read by `realsense_xu::hwmon_reply`),
+    // written once for GETINTCAL (`intcal`) and MMER (`drivers::realsense_imu`). `depth_units` keeps its own copy: it
+    // is the sonde image's, and moving it onto this is SONDE-HWMON-ONE (a knoboff-sonde arc of its own).
+
+    /// What an [`exchange`] read: the reply data's range in the EP0 buffer, the GET_CUR length, the echo and the size.
+    #[cfg(feature = "sonderec")]
+    pub struct Got {
+        pub range: core::ops::Range<usize>,
+        pub got: usize,
+        pub echo: u32,
+        pub size: u32,
+    }
+
+    /// The stage an [`exchange`] stopped at, with what the caller's wire line names.
+    #[cfg(feature = "sonderec")]
+    pub enum Fail {
+        /// The EP0 buffer cannot hold the 1024-byte transfer (EHCI's 256).
+        Withheld,
+        Build,
+        SetCur(&'static str),
+        GetCur(&'static str),
+        /// The GET_CUR returned this many bytes, fewer than 1024.
+        Runt(usize),
+        /// The reply's echo or size refused by `hwmon_reply`.
+        Reply { echo: u32, size: u32 },
+    }
+
+    /// ONE HW-monitor command `op` (laid out by `build` at the head of the EP0 buffer) and its reply. ONE attempt each,
+    /// never retried. `buf` is the live EP0 data buffer of the controller `xfer` drives, valid for `cap` bytes; on `Ok`
+    /// the reply's 1024 bytes are in it until the caller's next transfer.
+    #[cfg(feature = "sonderec")]
+    pub fn exchange(unit: u8, vc: u8, buf: *mut u8, cap: usize, xfer: Xfer, op: u8, build: &dyn Fn(&mut [u8]) -> usize) -> Result<Got, Fail> {
+        if !rs::hwmon_fits(cap) {
+            return Err(Fail::Withheld);
+        }
+        let (wv, wi) = (rs::xu_wvalue(rs::CTRL_HWMONITOR), rs::xu_windex(unit, vc));
+        let len = rs::HWMON_BUF as u16;
+        let built = {
+            // SAFETY: `buf` holds `cap` >= HWMON_BUF bytes (checked above) and no transfer is in flight while this
+            // slice lives; it ends before the SET_CUR below hands the buffer to the controller.
+            let b = unsafe { core::slice::from_raw_parts_mut(buf, rs::HWMON_BUF) };
+            build(b)
+        };
+        if built == 0 {
+            return Err(Fail::Build);
+        }
+        xfer(rs::BM_CLASS_INTF_OUT, rs::RQ_SET_CUR, wv, wi, len, false).map_err(Fail::SetCur)?;
+        let got = xfer(rs::BM_CLASS_INTF_IN, rs::RQ_GET_CUR, wv, wi, len, true).map_err(Fail::GetCur)? as usize;
+        if got < rs::HWMON_BUF {
+            return Err(Fail::Runt(got));
+        }
+        // SAFETY: the GET_CUR just wrote `got` >= HWMON_BUF bytes into the live EP0 buffer.
+        let r = unsafe { core::slice::from_raw_parts(buf as *const u8, rs::HWMON_BUF) };
+        let le32 = |o: usize| u32::from_le_bytes([r[o], r[o + 1], r[o + 2], r[o + 3]]);
+        let (echo, size) = (le32(0), le32(rs::HWMON_DATA_SIZE_OFFSET));
+        match rs::hwmon_reply(r, op) {
+            Some(range) => Ok(Got { range, got, echo, size }),
+            None => Err(Fail::Reply { echo, size }),
         }
     }
 }

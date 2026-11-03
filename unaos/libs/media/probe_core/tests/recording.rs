@@ -105,3 +105,115 @@ fn an_overlong_id_is_refused_at_record_construction() {
     let f = replay::depth_plane(4, 2, 500, 1, 7);
     assert_eq!(Record::new(f, "an-id-of-seventeen", 1000, None), Err(WireError::Id));
 }
+
+// ── SONDE-RECORD-IMU (LEDGER SR491): motion records beside the frames ──────────────────────────────────────────────
+
+use probe_core::imu::{ImuKind, ACCEL_MPS2_PER_LSB};
+use probe_core::recording::Motion;
+use probe_core::wire::{MotionRecord, EXTRINSIC_LEN, FLAG_EXTRINSIC, FORMAT_MOTION, MOTION_LEN};
+
+const EXTR: [f32; 12] = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, -0.00552, 0.0051, 0.01174];
+
+fn accel(seq: u64, extrinsic: Option<[f32; 12]>) -> MotionRecord {
+    MotionRecord {
+        kind: ImuKind::Accel,
+        raw: [12, -1003, 40],
+        device_ts: 0x0102_0304_0506_0708,
+        scale: ACCEL_MPS2_PER_LSB,
+        seq,
+        timestamp_us: 1_000 + seq,
+        extrinsic,
+        id: wire::motion_id("uvc:8086:0b3a").unwrap(),
+    }
+}
+
+fn gyro(seq: u64) -> MotionRecord {
+    MotionRecord { kind: ImuKind::Gyro, raw: [-7, 3, 32767], scale: 0.0, extrinsic: None, ..accel(seq, None) }
+}
+
+fn motion_bytes(m: &MotionRecord) -> Vec<u8> {
+    let (b, n) = wire::encode_motion(m).unwrap();
+    b[..n].to_vec()
+}
+
+#[test]
+fn motion_records_interleave_and_round_trip() {
+    let recs = three();
+    let a0 = accel(0, Some(EXTR));
+    let g0 = gyro(0);
+    let a1 = accel(1, None);
+    // frame, accel (with the extrinsic), gyro (unscaled), frame, accel, frame
+    let mut bytes = recording::write(&recs[..1]).unwrap();
+    bytes.extend_from_slice(&motion_bytes(&a0));
+    bytes.extend_from_slice(&motion_bytes(&g0));
+    bytes.extend_from_slice(&recording::write(&recs[1..2]).unwrap());
+    bytes.extend_from_slice(&motion_bytes(&a1));
+    bytes.extend_from_slice(&recording::write(&recs[2..]).unwrap());
+    assert_eq!(motion_bytes(&a0).len(), HEADER_LEN + MOTION_LEN + EXTRINSIC_LEN);
+    assert_eq!(motion_bytes(&g0).len(), HEADER_LEN + MOTION_LEN);
+
+    let back = recording::read(&bytes).unwrap();
+    assert_eq!(back.records, recs);
+    assert_eq!(
+        back.motion,
+        vec![Motion { after: 1, record: a0 }, Motion { after: 1, record: g0 }, Motion { after: 2, record: a1 }]
+    );
+    assert_eq!(back.extrinsic(), Some(EXTR));
+    // A decoded record re-encodes to the same bytes.
+    for m in &back.motion {
+        let (b, n) = wire::encode_motion(&m.record).unwrap();
+        assert_eq!(wire::decode_motion(&b[..n]).unwrap(), m.record);
+    }
+    // SI units: accel raw x 0.001 g; the unscaled gyro gives raw counts only.
+    let s = a0.sample().unwrap();
+    assert_eq!(s.kind, ImuKind::Accel);
+    assert_eq!(s.timestamp, 0x0102_0304_0506_0708);
+    assert!((s.xyz[1] - (-1003.0 * 0.001 * 9.80665)).abs() < 1e-5, "{:?}", s.xyz);
+    assert!(g0.sample().is_none());
+    assert_eq!(back.motion[1].record.raw, [-7, 3, 32767]);
+    assert_eq!(back.motion[0].record.id_str(), "uvc:8086:0b3a");
+    // A recording with no motion records has none.
+    assert!(recording::read(&recording::write(&recs).unwrap()).unwrap().motion.is_empty());
+}
+
+#[test]
+fn motion_refusals_are_named() {
+    let m = motion_bytes(&accel(0, None));
+    // A frame reader refuses a motion header by its format code.
+    assert_eq!(wire::decode(&m), Err(WireError::Format));
+    assert!(wire::is_motion(&m));
+    assert_eq!(m[7], FORMAT_MOTION);
+    // Format 4 on a depth stream code.
+    let mut bad = m.clone();
+    bad[6] = 0;
+    assert_eq!(wire::decode_motion(&bad), Err(WireError::Stream));
+    // A data length the flag does not explain.
+    let mut bad = m.clone();
+    bad[40..44].copy_from_slice(&20u32.to_le_bytes());
+    bad[16..20].copy_from_slice(&20u32.to_le_bytes());
+    assert_eq!(wire::decode_motion_lengths(&bad), Err(WireError::Geometry));
+    let mut bad = m.clone();
+    bad[44..48].copy_from_slice(&FLAG_EXTRINSIC.to_le_bytes());
+    assert_eq!(wire::decode_motion_lengths(&bad), Err(WireError::Geometry));
+    // A record shorter than its lengths.
+    assert_eq!(wire::decode_motion(&m[..m.len() - 1]), Err(WireError::Short));
+    assert_eq!(wire::motion_id("an-id-of-seventeen"), Err(WireError::Id));
+
+    // In a recording: a cut inside the motion payload names that record (index 1: frame 0, motion 1).
+    let recs = three();
+    let mut bytes = recording::write(&recs[..1]).unwrap();
+    let start1 = bytes.len();
+    bytes.extend_from_slice(&m);
+    for cut in start1 + 1..bytes.len() {
+        match recording::read(&bytes[..cut]) {
+            Err(RecordingError::Truncated { index: 1, offset, .. }) => assert_eq!(offset, start1),
+            other => panic!("cut {cut}: {other:?}"),
+        }
+    }
+    // A bad motion header names its record too.
+    bytes[start1 + 6] = 1;
+    assert_eq!(
+        recording::read(&bytes),
+        Err(RecordingError::Header { index: 1, offset: start1, error: WireError::Stream })
+    );
+}

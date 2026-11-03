@@ -25,7 +25,7 @@ use alloc::vec::Vec;
 
 use crate::depth::{DepthScale, Intrinsics};
 use crate::frame::{Frame, FrameError, PixelFormat, StreamKind};
-use crate::wire::{self, HEADER_LEN, Header, WireError};
+use crate::wire::{self, HEADER_LEN, Header, MotionRecord, WireError};
 
 /// One record: its decoded header and its frame.
 #[derive(Clone, Debug, PartialEq)]
@@ -66,16 +66,29 @@ impl Record {
     }
 }
 
-/// A recording: its records in file order.
+/// SONDE-RECORD-IMU (LEDGER SR491): one motion record and where it sat — `after` frame records preceded it in the file.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Motion {
+    pub after: usize,
+    pub record: MotionRecord,
+}
+
+/// A recording: its frame records in file order, and (SR491) its motion records with their place among them.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Recording {
     pub records: Vec<Record>,
+    pub motion: Vec<Motion>,
 }
 
 impl Recording {
     /// The depth (Z16) records, in order.
     pub fn depth(&self) -> impl Iterator<Item = &Record> {
         self.records.iter().filter(|r| r.is_depth())
+    }
+
+    /// The depth-to-IMU extrinsic: the first motion record that carries one.
+    pub fn extrinsic(&self) -> Option<[f32; 12]> {
+        self.motion.iter().find_map(|m| m.record.extrinsic)
     }
 }
 
@@ -101,12 +114,25 @@ pub fn read(b: &[u8]) -> Result<Recording, RecordingError> {
         return Err(RecordingError::Empty);
     }
     let mut records = Vec::new();
+    let mut motion = Vec::new();
     let mut offset = 0usize;
     while offset < b.len() {
-        let index = records.len();
+        let index = records.len() + motion.len();
         let rest = &b[offset..];
         if rest.len() < HEADER_LEN {
             return Err(RecordingError::Truncated { index, offset, need: HEADER_LEN as u64, have: rest.len() as u64 });
+        }
+        if wire::is_motion(rest) {
+            // SR491: a motion record, walked by its own lengths and decoded whole.
+            let (hl, dl) = wire::decode_motion_lengths(rest).map_err(|error| RecordingError::Header { index, offset, error })?;
+            let need = hl as u64 + dl as u64;
+            if need > rest.len() as u64 {
+                return Err(RecordingError::Truncated { index, offset, need, have: rest.len() as u64 });
+            }
+            let record = wire::decode_motion(&rest[..need as usize]).map_err(|error| RecordingError::Header { index, offset, error })?;
+            motion.push(Motion { after: records.len(), record });
+            offset += need as usize;
+            continue;
         }
         let header = wire::decode(rest).map_err(|error| RecordingError::Header { index, offset, error })?;
         let need = header.header_len as u64 + header.data_len as u64;
@@ -118,7 +144,7 @@ pub fn read(b: &[u8]) -> Result<Recording, RecordingError> {
         records.push(Record { header, frame });
         offset += need as usize;
     }
-    Ok(Recording { records })
+    Ok(Recording { records, motion })
 }
 
 /// The bytes of `records`: per record, [`wire::encode`] of its frame with its header's id, units and intrinsics,
