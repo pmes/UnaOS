@@ -20,7 +20,8 @@
 //! The second per-machine domain of the [`helm`](crate) core (VUGHELM, LEDGER SR475). Where [`crate::rover`] holds a
 //! live control loop, this module holds the gate in front of a planned program: it reads make_core's [`Review`] (the
 //! facts: refusals by name, asks by name) against a [`Policy`] of [`Level`]s and the caller's [`Approved`] record, and
-//! returns one [`Verdict`]. Comscan (VUG-COMSCAN) pumps a stream on [`Verdict::Pass`] and nothing else.
+//! returns one [`Verdict`]. Comscan (VUG-COMSCAN) pumps a stream on a [`Verdict::Pass`] for the program it names and
+//! nothing else.
 //!
 //! # The levels
 //!
@@ -53,6 +54,8 @@
 //! - **G5 default asks all** — the default policy asks every ask, in review order.
 //! - **G6 approval is per digest only** — an approval never drops a `ToolChange` or a `PowerAbove`.
 //! - **G7 approve is idempotent** — a digest approved twice is one record, the first person kept.
+//! - **G8 a pass names its program** — a Pass carries the digest of the program reviewed (the review's own
+//!   `FirstRun`); a review naming no program is [`Verdict::Unbound`], never Pass (VUG-HELM-BIND, LEDGER SR489).
 
 extern crate alloc;
 
@@ -139,26 +142,43 @@ impl Approved {
     }
 }
 
-/// The gate's answer. Comscan pumps on `Pass` and nothing else.
+// VUG-HELM-BIND (SR489): the pass names what it passed. The digest is the reviewed program's
+// (`make_core::Program::digest`), read from the review's own `Ask::FirstRun`: make_core's `review` is the one fn that
+// sees the Program and always asks its first run, so the gate binds without the caller pairing anything. Comscan
+// pumps a `Pass` only for the program whose digest it carries. The machine is not in the pass yet: make_core's
+// `Machine` has no identity (VUG-HELM-BIND-MACHINE owed).
+/// The gate's answer. Comscan pumps on `Pass` for the program it names and nothing else.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Verdict {
-    /// Nothing refuses and nothing is left to ask.
-    Pass,
+    /// Nothing refuses and nothing is left to ask, for the program with this digest.
+    Pass { digest: u64 },
     /// A person must confirm these, in review order.
     Ask(Vec<Ask>),
     /// The machine's refusals (never overridable) and the asks the policy holds at [`Level::Never`], both by name.
     Refuse { refusals: Vec<Refusal>, never: Vec<Ask> },
+    /// Nothing refuses or asks, but the review names no program (it carries no [`Ask::FirstRun`], which make_core's
+    /// `review` always asks): there is nothing a pass could name, so nothing passes.
+    Unbound,
 }
 
 impl Verdict {
     /// `true` only for [`Verdict::Pass`].
     pub fn is_pass(&self) -> bool {
-        matches!(self, Verdict::Pass)
+        matches!(self, Verdict::Pass { .. })
     }
 }
 
+/// The digest of the program a review was made for: its first `FirstRun` ask (VUG-HELM-BIND).
+fn reviewed_digest(review: &Review) -> Option<u64> {
+    review.asks.iter().find_map(|a| match a {
+        Ask::FirstRun { digest } => Some(*digest),
+        _ => None,
+    })
+}
+
 /// The gate: any refusal or any ask at [`Level::Never`] refuses; else the asks at [`Level::Ask`] that `approved` does
-/// not cover are asked; else the program passes.
+/// not cover are asked; else the program passes, naming its digest (or is [`Verdict::Unbound`] when the review names
+/// no program).
 pub fn gate(review: &Review, policy: &Policy, approved: &Approved) -> Verdict {
     let never: Vec<Ask> = review.asks.iter().filter(|a| policy.level(a) == Level::Never).cloned().collect();
     if !review.refusals.is_empty() || !never.is_empty() {
@@ -171,7 +191,13 @@ pub fn gate(review: &Review, policy: &Policy, approved: &Approved) -> Verdict {
         .filter(|a| !matches!(a, Ask::FirstRun { digest } if approved.covers(*digest)))
         .cloned()
         .collect();
-    if asks.is_empty() { Verdict::Pass } else { Verdict::Ask(asks) }
+    if !asks.is_empty() {
+        return Verdict::Ask(asks);
+    }
+    match reviewed_digest(review) {
+        Some(digest) => Verdict::Pass { digest },
+        None => Verdict::Unbound,
+    }
 }
 
 /// Remember that `who` approved the program with `digest` at `when_us`: the one way a first run becomes remembered.
