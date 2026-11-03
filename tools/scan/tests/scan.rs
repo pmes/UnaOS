@@ -335,8 +335,10 @@ extrude post sketch=s2 outer=c1 dir=[0 0 1] length=150
 }
 
 /// VUGINTENTSCANWIRE (SR515): a plate with a boss from scan_core's fixture (the ground rectangle ±200 at z = 0 is the
-/// plate's top, an r 40 boss 500 tall stands at the origin), a world-posed 12-frame orbit whose eye (z 446) sits under
-/// the boss top so its cap is never seen: one plane and one cylinder. `--intent <doc>` prints doc_core's measurement
+/// plate's top, an r 40 boss 500 tall stands over the origin lifted 30 mm off it: a touching boss's inside corner is
+/// rounded by the TSDF into a skirt detect reads as a cone, VUG-INTENT-SCAN-UNMATCHED), a world-posed 12-frame orbit
+/// whose eye (z 446) sits under the boss top (z 530) and over its bottom so neither cap is seen: one plane and one
+/// cylinder. `--intent <doc>` prints doc_core's measurement
 /// table, then suggest's proposals each disposed by verify_all; `--intent` alone prints the table only.
 #[test]
 fn an_intent_scan_prints_the_shapes_and_verified_proposals() {
@@ -351,7 +353,7 @@ line l2 sketch=s a=p2 b=p3
 line l3 sketch=s a=p3 b=p4
 line l4 sketch=s a=p4 b=p1
 extrude plate sketch=s outer=l1 dir=[0 0 1] length=10
-sketch b o=[0 0 0] z=[0 0 1] x=[1 0 0]
+sketch b o=[0 0 30] z=[0 0 1] x=[1 0 0]
 point c0 sketch=b x=0 y=0
 circle c1 sketch=b centre=c0 r=40
 extrude boss sketch=b outer=c1 dir=[0 0 1] length=500
@@ -360,7 +362,7 @@ extrude boss sketch=b outer=c1 dir=[0 0 1] length=500
         ground_centre: Vec3::ZERO,
         ground: [200.0, 200.0],
         boxes: Vec::new(),
-        cylinders: vec![fixture::CylPrim { base: Vec3::ZERO, radius: 40.0, height: 500.0 }],
+        cylinders: vec![fixture::CylPrim { base: Vec3::new(0.0, 0.0, 30.0), radius: 40.0, height: 500.0 }],
     };
     let d = dir("intent");
     let (inp, ply, poses, doc) = (d.join("boss.prb"), d.join("boss.ply"), d.join("poses.txt"), d.join("part.vug"));
