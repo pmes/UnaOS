@@ -27,7 +27,7 @@ fn printer() -> Machine {
         envelope: Aabb3 { min: Vec3::new(0.0, 0.0, 0.0), max: Vec3::new(220.0, 220.0, 250.0) },
         safe_z: 5.0,
         units: Units::Mm,
-        tools: vec![Tool { number: 0, kind: ToolKind::Nozzle, dc: 0.4, lf: 0.0, apmx: 0.0, nof: 0, sig: 0.0 }],
+        tools: vec![Tool { number: 0, kind: ToolKind::Nozzle, dc: 0.4, lf: 0.0, apmx: 0.0, nof: 0, sig: 0.0, ramp_deg: None }],
         stock: None,
         fixtures: vec![],
         loaded: Some(0),
