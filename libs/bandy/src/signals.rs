@@ -570,6 +570,10 @@ pub enum SMessage {
     /// through Helm's `Verdict::Pass`, and the Squawk telemetry it answers with. APPENDED so no earlier wire tag moves;
     /// the [`SMessage::Logs`] sub-enum shape.
     Pump(PumpEvent),
+    /// VUG-VEIN-BUS (LEDGER SR509): Vug's propose exchange with Vein — a face asks for design intent over its document,
+    /// measurements and photos, Vein answers proposals or a refusal by name. APPENDED so no earlier wire tag moves; the
+    /// [`SMessage::Pump`] sub-enum shape.
+    Intent(IntentEvent),
 }
 
 /// A typed preference value — the whole value domain of the Principia
@@ -1226,5 +1230,44 @@ impl PumpEvent {
             self,
             PumpEvent::PumpStart { .. } | PumpEvent::PumpHold { .. } | PumpEvent::PumpResume { .. } | PumpEvent::PumpStop { .. }
         )
+    }
+}
+
+// --- VUG-VEIN-BUS (LEDGER SR509): Vug's propose vocabulary (named tail hunk) ---
+/// Vug's one structured exchange with Vein (`handlers/vein` `intent`; `vein_core::propose` encodes, decodes and parses).
+/// A face never links vein_core: the key and the verified-TLS road are Vein's, so the request rides the bus. The photos
+/// travel as BYTES (the bus is in process, the `SurfaceBlit` precedent), bounded by vein_core's limits (20 images, 3.75 MB
+/// each, 12 MB in all) and refused by name past them. Every answer echoes `request`. Vein's answers
+/// ([`IntentEvent::Proposals`], [`IntentEvent::Refused`]) are inert as input.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum IntentEvent {
+    /// Propose design intent for `context` (the vug-doc text) given `measurements` (the measurement table) and `images`.
+    Propose { principal: Origin, context: String, measurements: String, images: Vec<IntentImage>, request: u64 },
+    /// The proposals, in the model's order (Echo, no key, answers none).
+    Proposals { request: u64, proposals: Vec<IntentProposal> },
+    /// A refused request, with the reason by name (`ImageTooLarge(0)`, `ProseAroundJson`, `NoProvider: ...`).
+    Refused { request: u64, why: String },
+}
+
+/// One photo on the bus: `image/png`, `image/jpeg` or `image/webp`, its encoded bytes.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IntentImage {
+    pub media_type: String,
+    pub bytes: Vec<u8>,
+}
+
+/// One proposal as Vein parsed it: one vug-doc statement line, a confidence in 0..=1, the reason in one sentence (doc_core
+/// applies and verifies it, BP-vug-7).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IntentProposal {
+    pub stmt: String,
+    pub confidence: f64,
+    pub why: String,
+}
+
+impl IntentEvent {
+    /// True for what Vein consumes; its answers are inert as input.
+    pub fn is_request(&self) -> bool {
+        matches!(self, IntentEvent::Propose { .. })
     }
 }
