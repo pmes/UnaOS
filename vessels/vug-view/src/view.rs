@@ -253,6 +253,8 @@ impl View {
         crate::sketch::overlay(self, fr); crate::fillet::overlay(self, fr); // VUGFACEFILLET (SR511): the edge tool over the sketch
         // VUGFACEPHOTO (SR506): the proposal glyphs and the corner note over the sketch.
         crate::photo::overlay(self, fr);
+        // VUGFACETREE (SR513): the tree panel over everything.
+        crate::journal::overlay(self, fr);
     }
 
     /// The model point under (px, py), if the ray hits it.
@@ -305,6 +307,10 @@ impl View {
         let model = shown.as_deref().unwrap_or(model); if let Some(r) = crate::fillet::key(self, model, k) { return r; } // VUGFACEFILLET (SR511): the edge tool's keys first
         // VUGFACEPHOTO (SR506): the proposal keys (i, Tab, Enter / Backspace on the focused one) before the sketch's.
         if let Some(r) = crate::photo::key(self, k) {
+            return r;
+        }
+        // VUGFACETREE (SR513): the tree's keys (u / U undo / redo, t the panel, its rows) before the sketch's.
+        if let Some(r) = crate::journal::key(&mut self.design, k) {
             return r;
         }
         if let Some(r) = crate::sketch::key(self, model, k) {

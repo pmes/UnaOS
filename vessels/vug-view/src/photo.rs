@@ -29,7 +29,7 @@ use crate::model::Model;
 use crate::raster::{self, Frame as Raster, rgba};
 use crate::sketch::{ACTIVE, INK, REFUSED, SketchFace, world_planes};
 use crate::view::View;
-use doc_core::{Cons, Doc, Measurement, PRef, Proposal, Stmt, Verdict};
+use doc_core::{Doc, Measurement, Proposal, Stmt, Verdict};
 use sketch_core::{Constraint, ConstraintId, Entity, EntityId, PointRef, Tol, Vec2};
 use std::fmt;
 
@@ -238,74 +238,11 @@ fn band(view: &View, ph: &Photo, fr: &mut Raster) {
 
 // ---- The document road: the face's sketch as doc_core statements, and back ----
 
-fn ename(e: EntityId) -> String {
-    format!("e{}", e.0)
-}
-
-fn pref(p: PointRef) -> PRef {
-    match p {
-        PointRef::Point(e) => PRef::Point(ename(e)),
-        PointRef::Centre(e) => PRef::Centre(ename(e)),
-        PointRef::Start(e) => PRef::Start(ename(e)),
-        PointRef::End(e) => PRef::End(ename(e)),
-    }
-}
-
-/// A sketch_core constraint as doc_core's text form (ids `e<n>` by the face's entity id).
-fn cons(c: &Constraint) -> Cons {
-    match *c {
-        Constraint::Coincident(a, b) => Cons::Coincident(pref(a), pref(b)),
-        Constraint::PointOnLine(p, l) => Cons::PointOnLine(pref(p), ename(l)),
-        Constraint::PointOnCircle(p, r) => Cons::PointOnCircle(pref(p), ename(r)),
-        Constraint::Horizontal(l) => Cons::Horizontal(ename(l)),
-        Constraint::Vertical(l) => Cons::Vertical(ename(l)),
-        Constraint::Parallel(a, b) => Cons::Parallel(ename(a), ename(b)),
-        Constraint::Perpendicular(a, b) => Cons::Perpendicular(ename(a), ename(b)),
-        Constraint::TangentLineCircle(l, r) => Cons::TangentLineCircle(ename(l), ename(r)),
-        Constraint::TangentCircles(a, b) => Cons::TangentCircles(ename(a), ename(b)),
-        Constraint::EqualLength(a, b) => Cons::EqualLength(ename(a), ename(b)),
-        Constraint::EqualRadius(a, b) => Cons::EqualRadius(ename(a), ename(b)),
-        Constraint::Distance(a, b, d) => Cons::Distance(pref(a), pref(b), d),
-        Constraint::DistancePointLine(p, l, d) => Cons::DistancePointLine(pref(p), ename(l), d),
-        Constraint::Angle(a, b, t) => Cons::Angle(ename(a), ename(b), t),
-        Constraint::Radius(r, v) => Cons::Radius(ename(r), v),
-        Constraint::Diameter(r, v) => Cons::Diameter(ename(r), v),
-        Constraint::Fix(p, at) => Cons::Fix(pref(p), [at.x, at.y]),
-        Constraint::Midpoint(p, l) => Cons::Midpoint(pref(p), ename(l)),
-        Constraint::Symmetric(a, b, l) => Cons::Symmetric(pref(a), pref(b), ename(l)),
-    }
-}
-
-/// The face's sketch as a doc_core document — the inverse of `doc_core::replay`: the sketch statement `s` on the
-/// face's plane, every live entity `e<n>` (n its face id) and every live constraint `k<n>`, in id order (so replay's
-/// dense EntityIds are the live entities in order). The text a proposal names its references in. (Its home is
-/// doc_core, beside tools/photo's writer: VUG-DOC-FROMSKETCH, owed.)
+/// The face's sketch as a doc_core document (sketch `s`, `e<n>` / `k<n>` by face id): the text a proposal names
+/// its references in. VUGFACETREE (SR513) composed: the one writer is `journal::sketch_doc` (the journal's own `Open`
+/// naming), this is its name on the photo road.
 pub fn doc_of(face: &SketchFace) -> Doc {
-    let sk = &face.sketch;
-    let v3 = |p: geom_core::Vec3| [p.x, p.y, p.z];
-    let s = SKETCH_ID.to_string();
-    let mut doc = Doc::new(Tol::DEFAULT);
-    doc.stmts.push(Stmt::Sketch { id: s.clone(), o: v3(face.plane.o), z: v3(face.plane.z), x: v3(face.plane.x) });
-    let pr = sk.params();
-    for (i, e) in sk.entities().iter().enumerate() {
-        let id = EntityId(i as u32);
-        let st = match *e {
-            Entity::Point { x } => Stmt::Point { id: ename(id), sketch: s.clone(), at: [pr[x], pr[x + 1]] },
-            Entity::Line { a, b } => Stmt::Line { id: ename(id), sketch: s.clone(), a: ename(a), b: ename(b) },
-            Entity::Circle { centre, r } => Stmt::Circle { id: ename(id), sketch: s.clone(), centre: ename(centre), r: pr[r] },
-            Entity::Arc { centre, r } => {
-                Stmt::Arc { id: ename(id), sketch: s.clone(), centre: ename(centre), r: pr[r], start: pr[r + 1], end: pr[r + 2] }
-            }
-            Entity::Removed => continue,
-        };
-        doc.stmts.push(st);
-    }
-    for i in 0..face.issued() {
-        if let Some(c) = sk.constraint(ConstraintId(i)) {
-            doc.stmts.push(Stmt::Constraint { id: format!("k{i}"), sketch: s.clone(), c: cons(c) });
-        }
-    }
-    doc
+    crate::journal::sketch_doc(face)
 }
 
 /// A constraint's entity ids renumbered by `f` (replay's dense ids onto the face's); `None` when one has no image.
@@ -458,13 +395,21 @@ fn accept(view: &mut View, i: usize) -> bool {
         ph.note = Some(format!("refused {}", why.text()));
         return true;
     }
-    match enter(face, &doc, &p) {
+    let applied = match enter(face, &doc, &p) {
         Ok(()) => {
             ph.offers[i].state = State::Applied;
             ph.note = Some(format!("applied {}", p.stmt.trim()));
             ph.focus = ph.offers.iter().position(|o| o.state == State::Open);
+            true
         }
-        Err(e) => ph.note = Some(format!("refused by the sketch {e}")),
+        Err(e) => {
+            ph.note = Some(format!("refused by the sketch {e}"));
+            false
+        }
+    };
+    if applied {
+        // VUGFACETREE (SR513) composed: an accepted proposal is a committed face action (one undo step).
+        view.design.journal.record(view.design.face.as_ref(), None);
     }
     true
 }

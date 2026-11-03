@@ -367,6 +367,9 @@ const FONT: &[(char, [u8; 5])] = &[
     ('U', [5, 5, 5, 5, 7]),
     // VUGFACEPHOTO (SR506): the rest of the capitals and the statement / refusal punctuation (a proposal's text and
     // a refusal's name are drawn upper-cased).
+    // VUGFACETREE (SR513): the tree panel's statements are drawn upper-cased — the rest of the capitals and the
+    // statement punctuation (VUGFACEPHOTO adds the same sixteen B..',' with the same bitmaps: the fold keeps ONE copy)
+    // and the list brackets, the edit's mark and the plus (this arc's).
     ('B', [6, 5, 6, 5, 6]),
     ('J', [1, 1, 1, 5, 7]),
     ('K', [5, 5, 6, 5, 5]),
@@ -383,6 +386,10 @@ const FONT: &[(char, [u8; 5])] = &[
     ('(', [1, 2, 2, 2, 1]),
     (')', [4, 2, 2, 2, 4]),
     (',', [0, 0, 0, 2, 4]),
+    ('[', [3, 2, 2, 2, 3]),
+    (']', [6, 2, 2, 2, 6]),
+    ('>', [4, 2, 1, 2, 4]),
+    ('+', [0, 2, 7, 2, 0]),
 ];
 
 /// One character of the bitmap font at (x, y) (its top-left), each bit a 2x2 block; an unknown character (and the

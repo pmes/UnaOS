@@ -12,6 +12,7 @@
 //! settled burst of input. `model` is the ONE seam to mesh_core, `view` the navigation, `raster` the drawing.
 
 pub mod extrude;
+pub mod journal; // VUGFACETREE (SR513): the document, undo / redo, the tree panel
 pub mod model;
 pub mod photo; // VUGFACEPHOTO (SR506): the photo underlay and the proposal glyphs
 pub mod raster;
@@ -48,6 +49,10 @@ pub const SHORTCUTS: &[(&str, &str)] = &[
     ("i", "ask Vein for design intent on the photo's sketch (no provider today: the corner says so)"),
     ("Tab", "focus the next proposal"),
     ("Enter / Backspace", "on the focused proposal: apply it (verified against the photo) / reject it"),
+    // VUGFACETREE (SR513): the feature tree over doc_core.
+    ("t", "the feature tree panel (the document's statements)"),
+    ("u / U", "undo / redo (the document's snapshots; the face regenerates)"),
+    ("Up / Down, Delete, Enter", "in the tree panel: move, delete the row with its dependants, edit its value (type, Enter)"),
 ];
 
 /// The controller: owns the model and the view (one task, no lock).
