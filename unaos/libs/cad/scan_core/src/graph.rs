@@ -20,7 +20,9 @@
 //!    frame against the OLD node's frame alone (integrated into a fresh one-frame volume, raycast by `refresh`), so
 //!    the model is that keyframe's own geometry, not the late drifted frames fused over it ([`match_keyframe`]).
 //! 4. [`PoseGraph::optimise`]: Levenberg-Marquardt over the right perturbation `T ∘ Δ(ω, τ)`, central-difference
-//!    Jacobians, the normal equations dense (at most [`MAX_NODES`] nodes) by Cholesky.
+//!    Jacobians, the normal equations dense (at most [`MAX_NODES`] nodes) by Cholesky. VUGSCANSUBMAP (SR522): past
+//!    [`LoopParams::submap_after`] nodes [`PoseGraph::solve`] takes the two-level road ([`Submaps`]): the same step,
+//!    each run of [`SUBMAP_NODES`] nodes' interior eliminated (Schur), the separators dense, the interiors back-solved.
 //! 5. Every frame's pose is carried by its keyframe's correction; [`reintegrate`] fuses every frame again at its
 //!    corrected pose into a cleared volume (all of them: BP-vug-5's confidence is the observation count).
 //!
@@ -41,8 +43,13 @@ use crate::tsdf::Tsdf;
 const DEG: f64 = core::f64::consts::PI / 180.0;
 
 /// The dense rule: the normal equations are `6(N − 1)` square, 11.4 MB and ~2.8e8 flops a factorisation at 200
-/// nodes; past it the graph is refused by name (VUG-SCAN-SUBMAP owes large scenes).
+/// nodes; past it [`PoseGraph::optimise`] refuses the graph by name and [`PoseGraph::solve`] takes the two-level road
+/// ([`Submaps`], VUGSCANSUBMAP SR522), whose separator graph is held to the same rule.
 pub const MAX_NODES: usize = 200;
+
+/// VUGSCANSUBMAP (SR522): the two-level road's run length: nodes `[k·50, (k+1)·50)` are run `k`, its first node a
+/// separator (node 0, the gauge, excepted).
+pub const SUBMAP_NODES: usize = 50;
 
 /// The central-difference step of the Jacobians, in radians (times the lever in millimetres for the scaled
 /// parameters): a derivative step, never a comparison (the stop rule takes [`LoopParams::step_tol`]).
@@ -73,6 +80,9 @@ pub struct LoopParams {
     pub iterations: u32,
     /// The solve stops when no node moves more than `lin` mm and `ang` rad; `lin` also floors an rms (BP-vug-2).
     pub step_tol: Tol,
+    /// VUGSCANSUBMAP (SR522): past this many nodes [`PoseGraph::solve`] takes the two-level road ([`Submaps`]); at
+    /// or below it the dense road. A caller who raises it takes the dense road's cost up to it.
+    pub submap_after: usize,
 }
 
 impl LoopParams {
@@ -92,6 +102,7 @@ impl LoopParams {
             untracked_var_mm2: 1e-4,
             iterations: 20,
             step_tol: Tol { lin: 1e-3, ang: 1e-6 },
+            submap_after: MAX_NODES,
         }
     }
 }
@@ -223,7 +234,8 @@ pub struct Solved {
 /// Why a graph was not solved.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum GraphError {
-    /// More nodes than the dense rule holds ([`MAX_NODES`]).
+    /// More nodes than the dense rule holds ([`MAX_NODES`]); from [`PoseGraph::solve`], more separators in the
+    /// two-level road's submap graph than it holds (VUGSCANSUBMAP SR522).
     TooManyNodes { nodes: usize, max: usize },
     /// No damped normal matrix factored: the edges do not constrain every free node.
     Singular,
@@ -257,6 +269,28 @@ impl PoseGraph {
         if n > MAX_NODES {
             return Err(GraphError::TooManyNodes { nodes: n, max: MAX_NODES });
         }
+        self.lm(iterations, step_tol, None)
+    }
+
+    /// VUGSCANSUBMAP (SR522): the solve by size. At or below [`LoopParams::submap_after`] nodes the dense road
+    /// (bit for bit [`PoseGraph::optimise`]); past it the two-level road: the same Levenberg-Marquardt step, schedule
+    /// and stop rule, the normal equations solved through [`Submaps`]. Refuses `TooManyNodes` when the separators
+    /// pass [`MAX_NODES`].
+    pub fn solve(&mut self, prm: &LoopParams) -> Result<Solved, GraphError> {
+        let n = self.nodes.len();
+        if n <= prm.submap_after {
+            return self.lm(prm.iterations, prm.step_tol, None);
+        }
+        let s = Submaps::new(n, &self.edges, SUBMAP_NODES);
+        if s.separators().len() > MAX_NODES {
+            return Err(GraphError::TooManyNodes { nodes: s.separators().len(), max: MAX_NODES });
+        }
+        self.lm(prm.iterations, prm.step_tol, Some(&s))
+    }
+
+    /// The Levenberg-Marquardt loop of `optimise` (SR500), its normal equations dense (`sub` None) or two-level.
+    fn lm(&mut self, iterations: u32, step_tol: Tol, sub: Option<&Submaps>) -> Result<Solved, GraphError> {
+        let n = self.nodes.len();
         let before = self.chi2();
         if n < 2 {
             return Ok(Solved { chi2_before: before, chi2_after: before, iterations: 0 });
@@ -267,8 +301,7 @@ impl PoseGraph {
         let (mut cost_now, mut lambda, mut iters, mut factored) = (before, 1e-4f64, 0u32, false);
         for _ in 0..iterations {
             iters += 1;
-            let mut hm = vec![0.0f64; m * m];
-            let mut g = vec![0.0f64; m];
+            let mut ne = Normal::new(m, sub);
             for e in &self.edges {
                 let (a, b) = (self.nodes[e.from], self.nodes[e.to]);
                 let r = residual(e, &a, &b, lever);
@@ -289,16 +322,14 @@ impl PoseGraph {
                     if *na == 0 {
                         continue;
                     }
-                    let oa = 6 * (*na - 1);
                     for k in 0..6 {
-                        g[oa + k] += e.weight * dot6(&jna[k], &r);
+                        ne.add_g(*na, k, e.weight * dot6(&jna[k], &r));
                         for (nb, jnb) in blocks.iter() {
                             if *nb == 0 {
                                 continue;
                             }
-                            let ob = 6 * (*nb - 1);
                             for l in 0..6 {
-                                hm[(oa + k) * m + ob + l] += e.weight * dot6(&jna[k], &jnb[l]);
+                                ne.add_h(*na, *nb, k, l, e.weight * dot6(&jna[k], &jnb[l]));
                             }
                         }
                     }
@@ -307,12 +338,7 @@ impl PoseGraph {
             let mut accepted = false;
             let mut small = false;
             for _ in 0..10 {
-                let mut a = hm.clone();
-                for i in 0..m {
-                    a[i * m + i] *= 1.0 + lambda;
-                }
-                let b: Vec<f64> = g.iter().map(|x| -x).collect();
-                let Some(x) = cholesky_solve(m, a, b) else {
+                let Some(x) = ne.solve(lambda) else {
                     lambda *= 10.0;
                     continue;
                 };
@@ -400,29 +426,50 @@ fn dot6(a: &[f64; 6], b: &[f64; 6]) -> f64 {
 
 /// The dense symmetric positive-definite solve `a·x = b` (`a` is `m` x `m` row-major; its lower triangle is read):
 /// Cholesky, then the two triangular solves. `None` on a pivot that is not positive. (pose.rs's `solve6` is the
-/// fixed 6x6 of the same loop; VUG-LINALG owes the one shared dense solve.)
+/// fixed 6x6 of the same loop; VUG-LINALG owes the one shared dense solve.) VUGSCANSUBMAP (SR522): `factor` +
+/// `substitute` with an all-zero profile, the same operations in the same order.
 fn cholesky_solve(m: usize, mut a: Vec<f64>, mut b: Vec<f64>) -> Option<Vec<f64>> {
+    let first = vec![0usize; m];
+    if !factor(m, &mut a, &first) {
+        return None;
+    }
+    substitute(m, &a, &first, &mut b);
+    if b.iter().all(|x| x.is_finite()) { Some(b) } else { None }
+}
+
+/// VUGSCANSUBMAP (SR522): the Cholesky factor `L` of `a` (`m` x `m` row-major, lower triangle read) in place, over
+/// the envelope `first[row]` (the row's first structurally non-zero column; `L` keeps the envelope, so nothing left
+/// of it is read or written). False on a pivot that is not positive.
+fn factor(m: usize, a: &mut [f64], first: &[usize]) -> bool {
     for j in 0..m {
         let mut d = a[j * m + j];
-        for k in 0..j {
+        for k in first[j]..j {
             d -= a[j * m + k] * a[j * m + k];
         }
         if !(d > 0.0) || !d.is_finite() {
-            return None;
+            return false;
         }
         let l = libm::sqrt(d);
         a[j * m + j] = l;
         for i in j + 1..m {
+            if first[i] > j {
+                continue;
+            }
             let mut s = a[i * m + j];
-            for k in 0..j {
+            for k in first[i].max(first[j])..j {
                 s -= a[i * m + k] * a[j * m + k];
             }
             a[i * m + j] = s / l;
         }
     }
+    true
+}
+
+/// VUGSCANSUBMAP (SR522): `b` <- `(L·Lᵀ)⁻¹ b` for `factor`'s `L` over the same envelope (row-form substitutions).
+fn substitute(m: usize, a: &[f64], first: &[usize], b: &mut [f64]) {
     for i in 0..m {
         let mut s = b[i];
-        for k in 0..i {
+        for k in first[i]..i {
             s -= a[i * m + k] * b[k];
         }
         b[i] = s / a[i * m + i];
@@ -430,11 +477,12 @@ fn cholesky_solve(m: usize, mut a: Vec<f64>, mut b: Vec<f64>) -> Option<Vec<f64>
     for i in (0..m).rev() {
         let mut s = b[i];
         for k in i + 1..m {
-            s -= a[k * m + i] * b[k];
+            if first[k] <= i {
+                s -= a[k * m + i] * b[k];
+            }
         }
         b[i] = s / a[i * m + i];
     }
-    if b.iter().all(|x| x.is_finite()) { Some(b) } else { None }
 }
 
 /// One frame as the closure and the re-integration read it.
@@ -593,7 +641,7 @@ where
         });
     }
     let before = worst_gap(&graph);
-    let solved = graph.optimise(prm.iterations, prm.step_tol)?;
+    let solved = graph.solve(&prm)?;
     let after = worst_gap(&graph);
     // Each frame carried by the correction of the latest node at or before it: P' = T' ∘ T⁻¹ ∘ P.
     let mut poses = Vec::with_capacity(kf.poses().len());
@@ -641,4 +689,259 @@ where
         out.integrate(s.frame, s.scale, s.intr, &pose).map_err(|error| Reintegrate::Scan { frame, error })?;
     }
     Ok(out)
+}
+
+// VUGSCANSUBMAP (SR522): the two-level road. Written from the Schur complement of the Gauss-Newton normal equations
+// (Triggs et al., "Bundle Adjustment — A Modern Synthesis" (1999) §6.1; the separator form of nested dissection,
+// George (1973)): the nodes fall in runs of [`SUBMAP_NODES`]; each run's first node, and both ends of any edge that
+// joins the interiors of two runs, are SEPARATORS (the submap graph); every other node is its run's interior, tied
+// by edges only to its own run and the separators. A step factors each run's interior block once, solves the
+// separators' reduced system dense, then each interior alone with its ends pinned at their step: the dense step to
+// rounding, at ~n/50 dense nodes instead of n (measured in design: 17 mm for rigid submaps vs 3.5e-8 mm for this
+// road against the dense optimum at 250 nodes).
+
+/// The two-level structure of a graph: which node is the gauge, a separator or a run's interior, each run's
+/// separators and its interior block's envelope. Built from the node count and the edges only.
+#[derive(Clone, Debug)]
+pub struct Submaps {
+    slot: Vec<Slot>,
+    seps: Vec<usize>,
+    runs: Vec<Run>,
+}
+
+/// A node's place: the gauge (node 0, fixed), separator `i`, or interior node `at` of run `r`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Slot {
+    Gauge,
+    Sep(usize),
+    Inner(usize, usize),
+}
+
+/// One run: its interior nodes (ascending), the separators its edges reach (indices, ascending) and the envelope
+/// (`first`, per row of its 6-wide interior block).
+#[derive(Clone, Debug)]
+struct Run {
+    nodes: Vec<usize>,
+    adj: Vec<usize>,
+    first: Vec<usize>,
+}
+
+impl Submaps {
+    /// `nodes` nodes in runs of `run` (at least 1) with `edges` between them.
+    pub fn new(nodes: usize, edges: &[Edge], run: usize) -> Submaps {
+        let run = run.max(1);
+        let mut sep = vec![false; nodes];
+        let mut j = run;
+        while j < nodes {
+            sep[j] = true;
+            j += run;
+        }
+        for e in edges {
+            let (a, b) = (e.from, e.to);
+            if a != 0 && b != 0 && !sep[a] && !sep[b] && a / run != b / run {
+                sep[a] = true;
+                sep[b] = true;
+            }
+        }
+        let mut slot = vec![Slot::Gauge; nodes];
+        let mut seps = Vec::new();
+        let mut runs: Vec<Run> =
+            (0..nodes.div_ceil(run)).map(|_| Run { nodes: Vec::new(), adj: Vec::new(), first: Vec::new() }).collect();
+        for j in 1..nodes {
+            if sep[j] {
+                slot[j] = Slot::Sep(seps.len());
+                seps.push(j);
+            } else {
+                let r = j / run;
+                slot[j] = Slot::Inner(r, runs[r].nodes.len());
+                runs[r].nodes.push(j);
+            }
+        }
+        // The envelope by block: interior node p's rows start at the lowest interior block an edge ties it to.
+        let mut fb: Vec<Vec<usize>> = runs.iter().map(|r| (0..r.nodes.len()).collect()).collect();
+        for e in edges {
+            match (slot[e.from], slot[e.to]) {
+                (Slot::Inner(r, p), Slot::Inner(r2, q)) if r == r2 => {
+                    let (lo, hi) = (p.min(q), p.max(q));
+                    fb[r][hi] = fb[r][hi].min(lo);
+                }
+                (Slot::Inner(r, _), Slot::Sep(i)) | (Slot::Sep(i), Slot::Inner(r, _)) => {
+                    if !runs[r].adj.contains(&i) {
+                        runs[r].adj.push(i);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for (r, rn) in runs.iter_mut().enumerate() {
+            rn.adj.sort_unstable();
+            rn.first = fb[r].iter().flat_map(|&b| [6 * b; 6]).collect();
+        }
+        Submaps { slot, seps, runs }
+    }
+
+    /// How many runs.
+    pub fn runs(&self) -> usize {
+        self.runs.len()
+    }
+
+    /// The submap graph's nodes (the separators), ascending.
+    pub fn separators(&self) -> &[usize] {
+        &self.seps
+    }
+}
+
+/// One Levenberg-Marquardt iteration's normal equations `H·x = −g` over the free nodes 1..n (row `6(j − 1) + k`):
+/// dense (SR500's `hm` and `g`, the same accumulation and solve) or two-level over a [`Submaps`].
+enum Normal<'a> {
+    Dense { m: usize, hm: Vec<f64>, g: Vec<f64> },
+    Two { s: &'a Submaps, m: usize, hss: Vec<f64>, gs: Vec<f64>, hkk: Vec<Vec<f64>>, hks: Vec<Vec<f64>>, gk: Vec<Vec<f64>> },
+}
+
+impl<'a> Normal<'a> {
+    fn new(m: usize, sub: Option<&'a Submaps>) -> Normal<'a> {
+        match sub {
+            None => Normal::Dense { m, hm: vec![0.0f64; m * m], g: vec![0.0f64; m] },
+            Some(s) => {
+                let ns = 6 * s.seps.len();
+                Normal::Two {
+                    s,
+                    m,
+                    hss: vec![0.0f64; ns * ns],
+                    gs: vec![0.0f64; ns],
+                    hkk: s.runs.iter().map(|r| vec![0.0f64; 36 * r.nodes.len() * r.nodes.len()]).collect(),
+                    hks: s.runs.iter().map(|r| vec![0.0f64; 36 * r.nodes.len() * r.adj.len()]).collect(),
+                    gk: s.runs.iter().map(|r| vec![0.0f64; 6 * r.nodes.len()]).collect(),
+                }
+            }
+        }
+    }
+
+    /// `g[node a, row k] += v` (`a` ≥ 1).
+    fn add_g(&mut self, a: usize, k: usize, v: f64) {
+        match self {
+            Normal::Dense { g, .. } => g[6 * (a - 1) + k] += v,
+            Normal::Two { s, gs, gk, .. } => match s.slot[a] {
+                Slot::Sep(i) => gs[6 * i + k] += v,
+                Slot::Inner(r, p) => gk[r][6 * p + k] += v,
+                Slot::Gauge => {}
+            },
+        }
+    }
+
+    /// `H[node a, row k][node b, column l] += v` (`a`, `b` ≥ 1). The two-level form keeps an interior / separator
+    /// pair once, as `H_ks` (the dense H is exactly symmetric: `dot6` commutes term by term).
+    fn add_h(&mut self, a: usize, b: usize, k: usize, l: usize, v: f64) {
+        match self {
+            Normal::Dense { m, hm, .. } => hm[(6 * (a - 1) + k) * *m + 6 * (b - 1) + l] += v,
+            Normal::Two { s, hss, hkk, hks, .. } => match (s.slot[a], s.slot[b]) {
+                (Slot::Inner(r, p), Slot::Inner(r2, q)) if r == r2 => {
+                    let mk = 6 * s.runs[r].nodes.len();
+                    hkk[r][(6 * p + k) * mk + 6 * q + l] += v;
+                }
+                (Slot::Inner(r, p), Slot::Sep(i)) => {
+                    let adj = &s.runs[r].adj;
+                    if let Some(c) = adj.iter().position(|&x| x == i) {
+                        let ck = 6 * adj.len();
+                        hks[r][(6 * p + k) * ck + 6 * c + l] += v;
+                    }
+                }
+                (Slot::Sep(i), Slot::Sep(j)) => {
+                    let ns = 6 * s.seps.len();
+                    hss[(6 * i + k) * ns + 6 * j + l] += v;
+                }
+                _ => {}
+            },
+        }
+    }
+
+    /// The step `x` (dense layout) of the damped equations `(H + λ·diag H)·x = −g`, `None` when a factor fails.
+    fn solve(&self, lambda: f64) -> Option<Vec<f64>> {
+        match self {
+            Normal::Dense { m, hm, g } => {
+                let m = *m;
+                let mut a = hm.clone();
+                for i in 0..m {
+                    a[i * m + i] *= 1.0 + lambda;
+                }
+                let b: Vec<f64> = g.iter().map(|x| -x).collect();
+                cholesky_solve(m, a, b)
+            }
+            Normal::Two { s, m, hss, gs, hkk, hks, gk } => {
+                let ns = 6 * s.seps.len();
+                let mut sm = hss.clone();
+                for i in 0..ns {
+                    sm[i * ns + i] *= 1.0 + lambda;
+                }
+                // The separators' reduced system: S = H_ss − Σ H_ksᵀ H_kk⁻¹ H_ks, r = b_s − Σ H_ksᵀ H_kk⁻¹ b_k.
+                let mut rhs: Vec<f64> = gs.iter().map(|x| -x).collect();
+                let mut parts: Vec<(Vec<f64>, Vec<f64>)> = Vec::with_capacity(s.runs.len());
+                for (r, run) in s.runs.iter().enumerate() {
+                    let mk = 6 * run.nodes.len();
+                    let ck = 6 * run.adj.len();
+                    let mut a = hkk[r].clone();
+                    for i in 0..mk {
+                        a[i * mk + i] *= 1.0 + lambda;
+                    }
+                    if !factor(mk, &mut a, &run.first) {
+                        return None;
+                    }
+                    let mut z: Vec<f64> = gk[r].iter().map(|x| -x).collect();
+                    substitute(mk, &a, &run.first, &mut z);
+                    let mut y = vec![0.0f64; ck * mk]; // column c of H_kk⁻¹ H_ks at y[c·mk ..]
+                    for c in 0..ck {
+                        let col = &mut y[c * mk..(c + 1) * mk];
+                        for i in 0..mk {
+                            col[i] = hks[r][i * ck + c];
+                        }
+                        substitute(mk, &a, &run.first, col);
+                    }
+                    for (ci, &si) in run.adj.iter().enumerate() {
+                        for u in 0..6 {
+                            let (row, c) = (6 * si + u, 6 * ci + u);
+                            let mut t = 0.0;
+                            for i in 0..mk {
+                                t += hks[r][i * ck + c] * z[i];
+                            }
+                            rhs[row] -= t;
+                            for (cj, &sj) in run.adj.iter().enumerate() {
+                                for v in 0..6 {
+                                    let c2 = 6 * cj + v;
+                                    let mut t = 0.0;
+                                    for i in 0..mk {
+                                        t += hks[r][i * ck + c] * y[c2 * mk + i];
+                                    }
+                                    sm[row * ns + 6 * sj + v] -= t;
+                                }
+                            }
+                        }
+                    }
+                    parts.push((z, y));
+                }
+                let xs = cholesky_solve(ns, sm, rhs)?;
+                let mut x = vec![0.0f64; *m];
+                for (si, &node) in s.seps.iter().enumerate() {
+                    x[6 * (node - 1)..6 * node].copy_from_slice(&xs[6 * si..6 * si + 6]);
+                }
+                // Each interior alone, its ends pinned at their step: x_k = H_kk⁻¹ b_k − (H_kk⁻¹ H_ks) x_s.
+                for (r, run) in s.runs.iter().enumerate() {
+                    let (z, y) = &parts[r];
+                    let mk = 6 * run.nodes.len();
+                    for (p, &node) in run.nodes.iter().enumerate() {
+                        for u in 0..6 {
+                            let i = 6 * p + u;
+                            let mut v = z[i];
+                            for (ci, &si) in run.adj.iter().enumerate() {
+                                for w in 0..6 {
+                                    v -= y[(6 * ci + w) * mk + i] * xs[6 * si + w];
+                                }
+                            }
+                            x[6 * (node - 1) + u] = v;
+                        }
+                    }
+                }
+                if x.iter().all(|v| v.is_finite()) { Some(x) } else { None }
+            }
+        }
+    }
 }
