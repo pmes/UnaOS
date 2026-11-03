@@ -1263,3 +1263,9 @@ exec-rmbp-vugscantrack | /home/user/exec/vugscantrack | cut e4760165e | VUGSCANT
 exec-rmbp-vugfacedimension | /home/user/exec/vugfacedimension | cut e4760165e | VUGFACEDIMENSION | wave36
 exec-rmbp-vugsketcherase | /home/user/exec/vugsketcherase | cut e4760165e | VUGSKETCHERASE | wave36
 exec-rmbp-vugmakesim | /home/user/exec/vugmakesim | cut e4760165e | VUGMAKESIM | wave36
+exec-rmbp-vugscanshapes | /home/user/exec/vugscanshapes | cut 69aff329b | VUGSCANSHAPES | wave36
+exec-rmbp-vughelmbindmachine | /home/user/exec/vughelmbindmachine | cut 69aff329b | VUGHELMBINDMACHINE | wave36
+exec-rmbp-vugcomscanws | /home/user/exec/vugcomscanws | cut 69aff329b | VUGCOMSCANWS | wave36
+exec-rmbp-vugscanloop | /home/user/exec/vugscanloop | cut 69aff329b | VUGSCANLOOP | wave36
+exec-rmbp-vugdocdiff | /home/user/exec/vugdocdiff | cut 69aff329b | VUGDOCDIFF | wave36
+exec-rmbp-vugbrep3 | /home/user/exec/vugbrep3 | cut 69aff329b | VUGBREP3 | wave36
