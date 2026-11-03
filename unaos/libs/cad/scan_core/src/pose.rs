@@ -96,6 +96,9 @@ pub struct TrackParams {
     pub levels: [(u32, u32); 3],
     /// Refused when the tracked pose tilts the frame's gravity off the anchored down by more than this.
     pub tilt_rad: f64,
+    /// The ICP stopping rule: a level stops when a step moves less than `lin` mm and `ang` rad (KinFu-class
+    /// practice: fixed 4 / 5 / 10 iterations with an early exit; the geometry Tol is below the depth noise floor).
+    pub step_tol: Tol,
 }
 
 impl TrackParams {
@@ -107,8 +110,9 @@ impl TrackParams {
             normal_cos: libm::cos(20.0 * DEG),
             min_inlier_frac: 0.25,
             max_rms_mm: t.trunc_mm(),
-            levels: [(4, 4), (2, 5), (1, 30)],
+            levels: [(4, 4), (2, 5), (1, 10)],
             tilt_rad: 5.0 * DEG,
+            step_tol: Tol { lin: 0.01, ang: 1e-4 },
         }
     }
 }
@@ -152,8 +156,8 @@ pub struct Tracker {
 }
 
 impl Tracker {
-    /// A tracker at the identity pose (the first frame is the world) for volume `t`; `tol` is the convergence
-    /// tolerance of a step (BP-vug-2).
+    /// A tracker at the identity pose (the first frame is the world) for volume `t`; `tol` is the geometry Tol
+    /// (BP-vug-2): the stopping rule never goes finer than it.
     pub fn new(t: &Tsdf, tol: Tol) -> Tracker {
         Tracker { tol, params: TrackParams::for_volume(t), pose: Transform::IDENTITY, model: None, down: None, last: None }
     }
@@ -297,7 +301,7 @@ impl Tracker {
                 };
                 let (dw, dt) = (Vec3::new(xi[0], xi[1], xi[2]), Vec3::new(xi[3], xi[4], xi[5]));
                 pose = left_step(&pose, dw, dt);
-                if dw.mag() <= self.tol.ang && dt.mag() <= self.tol.lin {
+                if dw.mag() <= prm.step_tol.ang.max(self.tol.ang) && dt.mag() <= prm.step_tol.lin.max(self.tol.lin) {
                     break;
                 }
             }
