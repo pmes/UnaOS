@@ -29,6 +29,9 @@ pub struct Review {
     pub stats: Stats,
     pub refusals: Vec<Refusal>,
     pub asks: Vec<Ask>,
+    /// VUGHELMBINDMACHINE (SR498): the identity of the machine reviewed against ([`Machine::digest`]); Helm's pass
+    /// names it and Comscan's desk refuses a pass for any other machine.
+    pub machine: u64,
 }
 
 /// Every refusal and every ask for running `p` on `m`.
@@ -54,5 +57,5 @@ pub fn review(p: &Program, m: &Machine, tol: Tol) -> Review {
             }
         }
     }
-    Review { stats, refusals, asks }
+    Review { stats, refusals, asks, machine: m.digest() }
 }

@@ -13,7 +13,9 @@ use bandy::{Origin, PumpEvent};
 use comscan::pump::{Opener, PumpDesk, TCP_SCHEME, Verdict, by_scheme, digest_hex};
 use comscan::tcp::{CONNECT_WAIT, Port, Refusal, opener, parse, refusal_of};
 use make_core::gcode::Dialect;
-use make_core::{Move, Program, Units, Vec3};
+use make_core::{
+    Aabb3, Axis, AxisId, Kinematics, Machine, MachineKind, Move, Power, PowerKind, Program, Tool, ToolKind, Units, Vec3,
+};
 use pump_core::{LinkError, Pump, Transport};
 
 const GRBL: Dialect = Dialect::Grbl { laser: false };
@@ -76,6 +78,27 @@ fn program() -> Program {
     p
 }
 
+fn axis(id: AxisId, min: f64, max: f64) -> Axis {
+    Axis { id, min, max, max_feed: 3000.0, max_accel: 100.0, rapid: 6000.0 }
+}
+
+/// The desk's declared machine (VUG-HELM-BIND-MACHINE, SR498): a small mill.
+fn machine() -> Machine {
+    Machine {
+        kind: MachineKind::Mill3,
+        kinematics: Kinematics::Cartesian,
+        axes: vec![axis(AxisId::X, -50.0, 300.0), axis(AxisId::Y, -50.0, 300.0), axis(AxisId::Z, -50.0, 60.0)],
+        power: Power { kind: PowerKind::Spindle, max: 24000.0, ask_above: 18000.0 },
+        envelope: Aabb3 { min: Vec3::new(-20.0, -20.0, -20.0), max: Vec3::new(300.0, 300.0, 50.0) },
+        safe_z: 5.0,
+        units: Units::Mm,
+        tools: vec![Tool { number: 1, kind: ToolKind::FlatEnd, dc: 4.0, lf: 20.0, apmx: 2.0, nof: 3, sig: 0.0 }],
+        stock: None,
+        fixtures: Vec::new(),
+        loaded: Some(1),
+    }
+}
+
 fn no_serial() -> Box<Opener> {
     Box::new(|port: &str| -> Result<Box<dyn Transport + Send>, String> { Err(format!("serial asked for {port}")) })
 }
@@ -85,8 +108,9 @@ fn an_armed_program_streams_to_done_over_tcp_through_the_scheme_arm() {
     let (l, port) = listener();
     let fake = fake_grbl(l, false, None);
     let p = program();
-    let mut desk = PumpDesk::new();
-    let digest = desk.arm(&Verdict::Pass { digest: p.digest() }, &p, GRBL).expect("armed by a pass");
+    let mut desk = PumpDesk::new(machine());
+    let pass = Verdict::Pass { digest: p.digest(), machine: machine().digest() };
+    let digest = desk.arm(&pass, &p, GRBL).expect("armed by a pass");
     let mut open = by_scheme(no_serial(), opener(GRBL, CONNECT_WAIT));
     let start = PumpEvent::PumpStart {
         principal: Origin::LocalUser("una".to_string()),

@@ -56,6 +56,9 @@
 //! - **G7 approve is idempotent** — a digest approved twice is one record, the first person kept.
 //! - **G8 a pass names its program** — a Pass carries the digest of the program reviewed (the review's own
 //!   `FirstRun`); a review naming no program is [`Verdict::Unbound`], never Pass (VUG-HELM-BIND, LEDGER SR489).
+//! - **G9 a pass names its machine** — a Pass carries the reviewed machine's identity (`Review::machine`,
+//!   `make_core::Machine::digest`): the same program passed for two machines is two different passes
+//!   (VUG-HELM-BIND-MACHINE, LEDGER SR498).
 
 extern crate alloc;
 
@@ -145,13 +148,14 @@ impl Approved {
 // VUG-HELM-BIND (SR489): the pass names what it passed. The digest is the reviewed program's
 // (`make_core::Program::digest`), read from the review's own `Ask::FirstRun`: make_core's `review` is the one fn that
 // sees the Program and always asks its first run, so the gate binds without the caller pairing anything. Comscan
-// pumps a `Pass` only for the program whose digest it carries. The machine is not in the pass yet: make_core's
-// `Machine` has no identity (VUG-HELM-BIND-MACHINE owed).
+// pumps a `Pass` only for the program whose digest it carries. VUG-HELM-BIND-MACHINE (SR498): the pass names the
+// machine too, read from the review's own `machine` (`make_core::Machine::digest`, identity only, never the setup);
+// Comscan's desk refuses a pass naming any machine but the one it declared.
 /// The gate's answer. Comscan pumps on `Pass` for the program it names and nothing else.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Verdict {
-    /// Nothing refuses and nothing is left to ask, for the program with this digest.
-    Pass { digest: u64 },
+    /// Nothing refuses and nothing is left to ask, for the program with this digest on the machine with this identity.
+    Pass { digest: u64, machine: u64 },
     /// A person must confirm these, in review order.
     Ask(Vec<Ask>),
     /// The machine's refusals (never overridable) and the asks the policy holds at [`Level::Never`], both by name.
@@ -195,7 +199,7 @@ pub fn gate(review: &Review, policy: &Policy, approved: &Approved) -> Verdict {
         return Verdict::Ask(asks);
     }
     match reviewed_digest(review) {
-        Some(digest) => Verdict::Pass { digest },
+        Some(digest) => Verdict::Pass { digest, machine: review.machine },
         None => Verdict::Unbound,
     }
 }
