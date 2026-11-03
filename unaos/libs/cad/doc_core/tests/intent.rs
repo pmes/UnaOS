@@ -1,7 +1,9 @@
 //! VUGINTENT (LEDGER SR505): a proposal is applied to a copy of the document, replayed, and accepted only inside the
 //! measurement's confidence (BP-vug-7). A measured 49.7 x 30.2 rectangle (sigma 0.3) becomes exactly 50 x 30 through
 //! accepted proposals; a dimension the measurement does not support, a conflicting constraint, a coordinate the
-//! measurement did not give, a redundant constraint and a bad line are each refused by name.
+//! measurement did not give, a redundant constraint and a bad line are each refused by name. VUGINTENTHOLES (SR507):
+//! the outline is loops; a plate with two holes takes its round diameters and refuses a moved hole, and a replayed
+//! hole with no measured loop is refused UnmatchedLoop by name.
 
 use brep_core::Vec3;
 use doc_core::{
@@ -61,7 +63,7 @@ fn rect_outline(w: f64, h: f64, step: f64) -> Vec<Vec2> {
 }
 
 fn outline() -> Measurement {
-    Measurement::Outline { pts: rect_outline(49.7, 30.2, 5.0), sigma_mm: SIGMA }
+    Measurement::outline(rect_outline(49.7, 30.2, 5.0), SIGMA)
 }
 
 fn accepted() -> Doc {
@@ -182,7 +184,7 @@ fn bad_lines_refused_by_name() {
     for s in ["", "   ", "# a comment", "horizontal h9 sketch=s line=l1\nvertical v9 sketch=s line=l2"] {
         assert_eq!(verify(&d, &p(s), &outline(), d.tol), Verdict::Refuse { why: Reason::NotOneLine }, "{s:?}");
     }
-    let empty = Measurement::Outline { pts: Vec::new(), sigma_mm: SIGMA };
+    let empty = Measurement::outline(Vec::new(), SIGMA);
     assert_eq!(
         verify(&d, &p(SIX[0]), &empty, d.tol),
         Verdict::Refuse { why: Reason::BadMeasurement }
@@ -239,4 +241,76 @@ fn batch_text_names_each() {
     assert!(lines[1].starts_with("accept horizontal h1 sketch=s line=l1 rms="), "{t}");
     assert!(lines[1].ends_with("confidence=0.9"), "{t}");
     assert!(lines[2].starts_with("refuse fix f9 sketch=s p=p4 at=[0 100] residual max="), "{t}");
+}
+
+// VUGINTENTHOLES (SR507): the outline as loops.
+
+/// The measured plate's two holes: 6.4 mm across, centred on the plate's mid-height.
+const HOLES: [(f64, f64); 2] = [(10.0, 15.1), (39.7, 15.1)];
+
+/// The plate as drawn from the photo: BASE plus a centre point and a 3.2 circle per hole (ids k1 / k2: one
+/// namespace, and SIX already takes h1 / h2).
+fn plate() -> Doc {
+    let mut t = String::from(BASE);
+    for (k, (x, y)) in HOLES.iter().enumerate() {
+        let n = k + 1;
+        t.push_str(&format!("point c{n} sketch=s x={x} y={y}\ncircle k{n} sketch=s centre=c{n} r=3.2\n"));
+    }
+    read(&t).unwrap()
+}
+
+/// A closed CW circle polyline (a hole as photo_core gives it), `n` samples.
+fn hole_outline(c: (f64, f64), r: f64, n: usize) -> Vec<Vec2> {
+    (0..n)
+        .map(|k| {
+            let a = -std::f64::consts::TAU * k as f64 / n as f64;
+            Vec2::new(c.0 + r * a.cos(), c.1 + r * a.sin())
+        })
+        .collect()
+}
+
+/// The measured plate: the 49.7 x 30.2 outer (CCW) then the two 6.4 holes (CW).
+fn plate_outline() -> Measurement {
+    let mut loops = vec![rect_outline(49.7, 30.2, 5.0)];
+    for &c in &HOLES {
+        loops.push(hole_outline(c, 3.2, 64));
+    }
+    Measurement::Outline { loops, sigma_mm: SIGMA }
+}
+
+#[test]
+fn plate_with_holes_accepts_diameters_and_refuses_a_moved_hole() {
+    let d = plate();
+    let mut v: Vec<&str> = SIX.to_vec();
+    v.push("diameter dh1 sketch=s circle=k1 d=6.5");
+    v.push("diameter dh2 sketch=s circle=k2 d=6.5");
+    let b = verify_all(&d, &ps(&v), &plate_outline(), d.tol);
+    assert_eq!(b.accepted(), 8, "{}", b.text());
+    for (s, _, v) in &b.entries {
+        if let Verdict::Accept { max_mm, .. } = v {
+            assert!(*max_mm <= K_SIGMA * SIGMA, "{s}: max {max_mm}");
+        }
+    }
+    let l = edge_lengths(&b.doc);
+    for (got, w) in l.iter().zip([30.0, 30.0, 50.0, 50.0]) {
+        assert!((got - w).abs() <= 10.0 * d.tol.lin, "edges {l:?}");
+    }
+    // A 3 mm move of hole 1: paired with its measured hole, then past K_SIGMA x sigma.
+    match verify(&b.doc, &p("fix f9 sketch=s p=c1 at=[13 15.1]"), &plate_outline(), b.doc.tol) {
+        Verdict::Refuse { why: Reason::Residual { max_mm, limit_mm } } => {
+            assert_eq!(limit_mm, K_SIGMA * SIGMA);
+            assert!(max_mm > 2.0 && max_mm < 4.0, "max {max_mm}");
+        }
+        v => panic!("{v:?}"),
+    }
+}
+
+#[test]
+fn hole_without_a_measured_loop_refused_by_name() {
+    let d = read(&format!("{BASE}point c1 sketch=s x=10 y=15.1\ncircle k1 sketch=s centre=c1 r=3.2\n")).unwrap();
+    let v = verify(&d, &p(SIX[0]), &outline(), d.tol);
+    assert_eq!(v, Verdict::Refuse { why: Reason::UnmatchedLoop { replayed: 2, measured: 1 } });
+    if let Verdict::Refuse { why } = v {
+        assert_eq!(why.text(), "unmatched-loop replayed=2 measured=1");
+    }
 }

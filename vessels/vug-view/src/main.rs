@@ -17,7 +17,7 @@
 
 use bandy::SMessage;
 use vug_view::view::Preset;
-use vug_view::{model::Model, Viewer};
+use vug_view::Viewer;
 
 struct Cli {
     path: String,
@@ -27,7 +27,7 @@ struct Cli {
     out: Option<String>,
 }
 
-const USAGE: &str = "usage: vug-view <file.stl|obj|ply> [--preset una|solidworks|fusion|blender|onshape] [--size WxH] [--keys SCRIPT] [--out shot.png]";
+const USAGE: &str = "usage: vug-view <file.stl|obj|ply|png|jpg> [--preset una|solidworks|fusion|blender|onshape] [--size WxH] [--keys SCRIPT] [--out shot.png]";
 
 fn cli() -> Cli {
     let mut a = std::env::args().skip(1);
@@ -81,15 +81,16 @@ fn keys(script: &str) -> Vec<String> {
 
 fn main() {
     let cli = cli();
-    let model = match Model::open(&cli.path) {
-        Ok(m) => m,
+    // VUGFACEPHOTO (SR506): the one open road — a mesh, or a photo on graph paper measured into a sketch.
+    let mut viewer = match Viewer::open(&cli.path, cli.size, cli.preset) {
+        Ok(v) => v,
         Err(e) => {
             eprintln!("vug-view: {e}");
             std::process::exit(1);
         }
     };
-    let title = std::path::Path::new(&cli.path).file_name().and_then(|s| s.to_str()).unwrap_or("vug").to_string();
-    let mut viewer = Viewer::new(model, &title, cli.size, cli.preset);
+    #[allow(unused_variables)] // the window's title (macOS only); the headless witness prints `viewer.title`
+    let title = viewer.title.clone();
 
     // ---- The headless witness: the same controller, frames to a PNG. ----
     if cli.out.is_some() || cfg!(not(target_os = "macos")) {

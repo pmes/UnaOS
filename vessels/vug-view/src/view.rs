@@ -172,13 +172,15 @@ pub struct View {
     pub design: crate::sketch::Design,
     /// VUGFACEFILLET (SR511): the edge tool (`f` fillet, Shift+f chamfer) while it is open (fillet.rs).
     pub fillet: Option<crate::fillet::EdgeTool>,
+    /// VUGFACEPHOTO (SR506): the opened photo — its underlay, the measured outline and the offered proposals (photo.rs).
+    pub photo: Option<crate::photo::Photo>,
 }
 
 impl View {
     /// A view at Home over `model`.
     pub fn new(model: &Model, size: (u32, u32), preset: Preset) -> View {
         let camera = Camera { eye: Vec3::zero(), yaw: 0.0, pitch: 0.0, fov_y: 30f32.to_radians() };
-        let mut v = View { camera, preset, size: (size.0.max(1), size.1.max(1)), picked: None, cursor: (0.0, 0.0), drag: None, design: Default::default(), fillet: None }; // VUGFACEFILLET (SR511): fillet
+        let mut v = View { camera, preset, size: (size.0.max(1), size.1.max(1)), picked: None, cursor: (0.0, 0.0), drag: None, design: Default::default(), photo: None, fillet: None }; // VUGFACEFILLET (SR511): fillet
         v.home(model);
         v
     }
@@ -249,6 +251,8 @@ impl View {
     /// VUGFACE2 (SR485): the sketch overlay, drawn by `raster::render` over the frame.
     pub fn overlay(&self, fr: &mut crate::raster::Frame) {
         crate::sketch::overlay(self, fr); crate::fillet::overlay(self, fr); // VUGFACEFILLET (SR511): the edge tool over the sketch
+        // VUGFACEPHOTO (SR506): the proposal glyphs and the corner note over the sketch.
+        crate::photo::overlay(self, fr);
     }
 
     /// The model point under (px, py), if the ray hits it.
@@ -299,6 +303,10 @@ impl View {
         // VUGFACE2 (SR485): the body replaces the drawn model; the sketch face takes its keys first (l c a p e Esc).
         let shown = self.design.shown();
         let model = shown.as_deref().unwrap_or(model); if let Some(r) = crate::fillet::key(self, model, k) { return r; } // VUGFACEFILLET (SR511): the edge tool's keys first
+        // VUGFACEPHOTO (SR506): the proposal keys (i, Tab, Enter / Backspace on the focused one) before the sketch's.
+        if let Some(r) = crate::photo::key(self, k) {
+            return r;
+        }
         if let Some(r) = crate::sketch::key(self, model, k) {
             return r;
         }
@@ -343,13 +351,15 @@ impl View {
     /// Pointer motion; true when the frame changed.
     pub fn motion(&mut self, x: f64, y: f64) -> bool {
         self.cursor = (x, y);
+        // VUGFACEPHOTO (SR506): the proposal glyph under the cursor takes the focus (never consumes the motion).
+        let focus = crate::photo::hover(self, x, y);
         // VUGFACE2 (SR485): with no navigation drag, the sketch face's gesture / hover / pull first.
         if self.drag.is_none() {
             if let Some(r) = crate::sketch::motion(self, x, y) {
-                return r;
+                return r || focus;
             }
         }
-        let Some(mut d) = self.drag else { return false };
+        let Some(mut d) = self.drag else { return focus };
         if !d.moved {
             if (x - d.start.0).hypot(y - d.start.1) < CLICK_PX {
                 return false;
