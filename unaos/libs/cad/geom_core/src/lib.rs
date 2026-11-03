@@ -25,6 +25,7 @@ extern crate alloc;
 pub mod bounds;
 pub mod closest;
 pub mod intersect;
+pub mod linalg;
 pub mod mat;
 pub mod polygon;
 pub mod predicates;

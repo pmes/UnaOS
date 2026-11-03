@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // Copyright (C) 2026 The Architect & Una
 //
-//! The small dense kernels the solver needs (no dense m×n linear algebra exists elsewhere in the tree; geom_core's
-//! Mat3 / Mat4 are fixed-size): a row-major matrix, the ORDERED modified Gram-Schmidt rank with re-orthogonalisation
-//! (MGS2, "twice is enough") that names a dependent row by insertion order, and a Cholesky solve of the damped
-//! symmetric positive-definite system. Sketch scale (tens to a few hundred parameters) is what dense is for.
+//! The small dense kernels the solver needs: a row-major matrix and the ORDERED modified Gram-Schmidt rank with
+//! re-orthogonalisation (MGS2, "twice is enough") that names a dependent row by insertion order, the solver's own
+//! structure. The Cholesky solve of the damped symmetric positive-definite system is geom_core's ONE
+//! (`geom_core::linalg::cholesky_solve`, VUG-GEOM-LINALG SR520), re-exported here. Sketch scale (tens to a few hundred
+//! parameters) is what dense is for.
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -114,40 +115,5 @@ pub fn rank(m: &Mat) -> Rank {
     out
 }
 
-/// Solve `a x = b` for symmetric positive-definite `a` (m×m, row-major, overwritten by its Cholesky factor);
-/// `b` becomes `x`. False when a pivot is not positive (the caller raises its damping).
-pub fn cholesky_solve(a: &mut [f64], m: usize, b: &mut [f64]) -> bool {
-    for j in 0..m {
-        let mut d = a[j * m + j];
-        for k in 0..j {
-            d -= a[j * m + k] * a[j * m + k];
-        }
-        if !(d > 0.0) || !d.is_finite() {
-            return false;
-        }
-        let l = libm::sqrt(d);
-        a[j * m + j] = l;
-        for i in j + 1..m {
-            let mut s = a[i * m + j];
-            for k in 0..j {
-                s -= a[i * m + k] * a[j * m + k];
-            }
-            a[i * m + j] = s / l;
-        }
-    }
-    for i in 0..m {
-        let mut s = b[i];
-        for k in 0..i {
-            s -= a[i * m + k] * b[k];
-        }
-        b[i] = s / a[i * m + i];
-    }
-    for i in (0..m).rev() {
-        let mut s = b[i];
-        for k in i + 1..m {
-            s -= a[k * m + i] * b[k];
-        }
-        b[i] = s / a[i * m + i];
-    }
-    true
-}
+/// The damped normal-equations solve: geom_core's (VUG-GEOM-LINALG SR520).
+pub use geom_core::linalg::cholesky_solve;
