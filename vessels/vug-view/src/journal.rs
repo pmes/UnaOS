@@ -16,6 +16,8 @@
 //! own reader (`What::UnknownRef` by line) and replay (`Fault::Upstream` by line); `diff`'s Removed names them.
 //! A committed fillet / chamfer of the face (fillet.rs) enters by [`Journal::record_edit`] after the frozen features
 //! (VUGFACETREEFILLET, SR518); in the Body an edit's solid stands in its `on` solid's place ([`live_solids`]).
+//! Its row's value is its radius (a chamfer's `d1`, typed `d1,d2` through [`type_pair`]): an edit re-fillets through
+//! replay, and a brep_core refusal (`RadiusTooLarge`) names the line and keeps the last good body (VUGFACETREEEDITR, SR528).
 //!
 //! Ids: sketch 0 is `s` with entities `e<n>` and constraints `k<n>`, sketch j > 0 is `s<j>` with `s<j>e<n>` /
 //! `s<j>k<n>`, extrudes `x<n>`, fillets `f<n>`, chamfers `c<n>`; a face slot keeps its name across regenerates (the slot maps in `Open`).
@@ -195,7 +197,7 @@ pub fn regenerate(doc: &Doc) -> Result<Regen, String> {
 }
 
 /// The value a row edits, as shown: a dimension constraint's mm (an angle in degrees), an extrude's length, a
-/// revolve's angle in degrees; None for a row without one.
+/// revolve's angle in degrees, a fillet's radius, a chamfer's `d1` (VUGFACETREEEDITR, SR528); None for a row without one.
 pub fn value(s: &Stmt) -> Option<f64> {
     match s {
         Stmt::Constraint { c, .. } => match c {
@@ -205,11 +207,14 @@ pub fn value(s: &Stmt) -> Option<f64> {
         },
         Stmt::Extrude { length, .. } => Some(*length),
         Stmt::Revolve { angle, .. } => Some(angle.to_degrees()),
+        Stmt::Fillet { r, .. } => Some(*r),
+        Stmt::Chamfer { d1, .. } => Some(*d1),
         _ => None,
     }
 }
 
-/// The statement with its value replaced by `v` (as [`value`] shows it; an angle keeps its sign).
+/// The statement with its value replaced by `v` (as [`value`] shows it; an angle keeps its sign; a chamfer takes `v`
+/// for both distances, the edge tool's one-value rule).
 fn with_value(s: &Stmt, v: f64) -> Option<Stmt> {
     let mut s = s.clone();
     match &mut s {
@@ -223,6 +228,11 @@ fn with_value(s: &Stmt, v: f64) -> Option<Stmt> {
         },
         Stmt::Extrude { length, .. } => *length = v,
         Stmt::Revolve { angle, .. } => *angle = v.to_radians(),
+        Stmt::Fillet { r, .. } => *r = v,
+        Stmt::Chamfer { d1, d2, .. } => {
+            *d1 = v;
+            *d2 = v;
+        }
         _ => return None,
     }
     Some(s)
@@ -394,12 +404,17 @@ impl Journal {
     }
 
     /// Enter on an open row edit: the typed value replaces the row's, through `regenerate` (a refusal names its line
-    /// and nothing changes).
+    /// and nothing changes). A chamfer row's `d1,d2` sets both (VUGFACETREEEDITR, SR528).
     fn commit_value(&mut self) -> Result<Regen, String> {
         let buf = self.edit.take().unwrap_or_default();
         let i = self.cursor;
-        let v: f64 = buf.parse().map_err(|_| format!("line {}: Invalid", self.doc.line(i)))?;
-        let s = self.doc.stmts.get(i).and_then(|s| with_value(s, v)).ok_or_else(|| format!("line {}: no value", self.doc.line(i)))?;
+        let (v, second) = parse_pair(&buf).ok_or_else(|| format!("line {}: Invalid", self.doc.line(i)))?;
+        let mut s = self.doc.stmts.get(i).and_then(|s| with_value(s, v)).ok_or_else(|| format!("line {}: no value", self.doc.line(i)))?;
+        match (&mut s, second) {
+            (Stmt::Chamfer { d2, .. }, Some(b)) => *d2 = b,
+            (_, Some(_)) => return Err(format!("line {}: Invalid", self.doc.line(i))),
+            _ => {}
+        }
         let mut cand = self.doc.clone();
         cand.lines.clear();
         cand.stmts[i] = s;
@@ -408,7 +423,7 @@ impl Journal {
 }
 
 /// The view's key, before the sketch face's: `u` / `U` undo / redo, `t` the panel; with the panel shown Up / Down,
-/// Delete / BackSpace (the cursor row) and Enter (its value; then digits, Enter, Esc). None while a pull, a dimension
+/// Delete / BackSpace (the cursor row) and Enter (its value; then digits, a chamfer's one comma, Enter, Esc). None while a pull, a dimension
 /// edit or a gesture is open, and for every other key.
 pub fn key(d: &mut Design, k: &str) -> Option<bool> {
     if d.pull.is_some() || d.face.as_ref().is_some_and(|f| f.edit.is_some() || f.gesture.is_some()) {
@@ -424,13 +439,14 @@ pub fn key(d: &mut Design, k: &str) -> Option<bool> {
         }
     };
     let j = &mut d.journal;
+    let pair = matches!(j.doc.stmts.get(j.cursor), Some(Stmt::Chamfer { .. })); // VUGFACETREEEDITR (SR528): a chamfer row takes d1,d2
     let outcome: Result<Regen, String> = if let Some(buf) = j.edit.as_mut() {
         if enter {
             j.commit_value()
         } else if matches!(k, "Escape" | "\u{1b}") {
             j.edit = None;
             return Some(true);
-        } else if type_into(buf, ch, back) {
+        } else if type_pair(buf, ch, back, pair) {
             return Some(true);
         } else {
             j.edit = None;
@@ -578,4 +594,44 @@ impl Journal {
         self.cursor = at;
         Some(new_id)
     }
+}
+
+// ---- VUGFACETREEEDITR (SR528): the fillet / chamfer row's value — THE pair road (the edge tool's and the panel's) ----
+
+/// A value buffer's key: with `pair` (a chamfer) one `,` after a value starts `d2`, and Backspace over a trailing `,`
+/// removes it; every other key is sketch.rs `type_into` on the segment after the comma (the whole text without one).
+/// False for a key the buffer does not take (a `,` without `pair` included). fillet.rs's tool and the panel share it.
+pub(crate) fn type_pair(buf: &mut String, ch: Option<char>, back: bool, pair: bool) -> bool {
+    if ch == Some(',') {
+        if pair && !buf.is_empty() && !buf.contains(',') {
+            buf.push(',');
+        }
+        return pair;
+    }
+    if back && buf.ends_with(',') {
+        buf.pop();
+        return true;
+    }
+    let at = buf.rfind(',').map_or(0, |i| i + 1);
+    let mut seg = buf[at..].to_string();
+    if !type_into(&mut seg, ch, back) {
+        return false;
+    }
+    buf.truncate(at);
+    buf.push_str(&seg);
+    true
+}
+
+/// A typed value or pair: `v` or `v,w` as f64s (the second None when there is no comma); None for anything else.
+pub(crate) fn parse_pair(buf: &str) -> Option<(f64, Option<f64>)> {
+    let mut it = buf.split(',');
+    let a = it.next()?.parse::<f64>().ok()?;
+    let b = match it.next() {
+        Some(t) => Some(t.parse::<f64>().ok()?),
+        None => None,
+    };
+    if it.next().is_some() {
+        return None;
+    }
+    Some((a, b))
 }

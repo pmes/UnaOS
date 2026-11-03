@@ -18,7 +18,7 @@
 use crate::extrude::Body;
 use crate::model::Model;
 use crate::raster::{self, Frame as Raster, rgba};
-use crate::sketch::{ACTIVE, REFUSED, SNAP_PX, fmt_value, refusal_word, type_into};
+use crate::sketch::{ACTIVE, REFUSED, SNAP_PX, fmt_value, refusal_word};
 use crate::view::{Action, Button, View};
 use brep_core::{Brep, Curve, Entity, Id, Name, Refusal};
 
@@ -161,26 +161,10 @@ pub fn key(view: &mut View, model: &Model, k: &str) -> Option<bool> {
             _ => None,
         }
     };
-    if ch == Some(',') {
-        if tool.mode == Mode::Chamfer && !tool.buffer.is_empty() && !tool.buffer.contains(',') {
-            tool.buffer.push(',');
-        }
-        tool.note = None;
-        return Some(true);
-    }
-    if back && tool.buffer.ends_with(',') {
-        tool.buffer.pop();
-        tool.note = None;
-        return Some(true);
-    }
-    // The SR494 road on the value after the comma (the whole text for a fillet).
-    let at = tool.buffer.rfind(',').map_or(0, |i| i + 1);
-    let mut seg = tool.buffer[at..].to_string();
-    if !type_into(&mut seg, ch, back) {
+    // VUGFACETREEEDITR (SR528): THE pair road (journal.rs `type_pair`, the panel's too); a `,` is always consumed here.
+    if !crate::journal::type_pair(&mut tool.buffer, ch, back, tool.mode == Mode::Chamfer) && ch != Some(',') {
         return None;
     }
-    tool.buffer.truncate(at);
-    tool.buffer.push_str(&seg);
     tool.note = None;
     Some(true)
 }
@@ -207,8 +191,8 @@ fn commit(view: &mut View) {
     let tol = geom_core::Tol::DEFAULT;
     let Some(tool) = view.fillet.as_ref() else { return };
     let Some(edge) = tool.edge.clone() else { return };
-    let vals: Option<Vec<f64>> = tool.buffer.split(',').map(|s| s.parse::<f64>().ok()).collect();
-    let Some(vals) = vals.filter(|v| !v.is_empty() && v.len() <= 2) else { return };
+    let Some((d1, d2)) = crate::journal::parse_pair(&tool.buffer) else { return }; // VUGFACETREEEDITR (SR528): THE pair parse
+    let vals: Vec<f64> = std::iter::once(d1).chain(d2).collect();
     let mode = tool.mode;
     let outcome: Result<Body, Note> = {
         let Some(body) = view.design.body.as_ref() else { return };
