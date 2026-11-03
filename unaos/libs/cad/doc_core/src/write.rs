@@ -261,6 +261,13 @@ fn stmt(w: &mut W, s: &Stmt) {
             w.f("apmx", t.apmx);
             w.u("nof", t.nof as u64);
             w.f("sig", t.sig);
+            // VUGMAKETOOLCC (SR538): written only when set, so a document without them writes byte-identical.
+            if let Some(a) = t.ramp_deg {
+                w.f("ramp", a);
+            }
+            if let Some(c) = t.centre_cutting {
+                w.w("cc", word_of(&YESNO, c));
+            }
         }
         Stmt::Stock(st) => {
             w.out.push_str("stock");

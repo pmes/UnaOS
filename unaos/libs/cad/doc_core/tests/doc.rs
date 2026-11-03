@@ -563,3 +563,45 @@ fn a_rest_op_round_trips() {
         "{op:?}"
     );
 }
+
+// VUGMAKETOOLCC (SR538): the tool statement carries the ramp angle and the centre-cutting flag, each absent = None.
+const TOOL1: &str = "tool number=1 kind=flat_end dc=6 lf=40 apmx=2 nof=2 sig=0";
+
+fn tool_of(d: &Doc, n: u32) -> make_core::Tool {
+    d.stmts
+        .iter()
+        .find_map(|s| match s {
+            Stmt::Tool(t) if t.number == n => Some(*t),
+            _ => None,
+        })
+        .expect("the tool statement")
+}
+
+fn with_tool1(tail: &str) -> String {
+    DOC_A.replacen(TOOL1, &format!("{TOOL1}{tail}"), 1)
+}
+
+#[test]
+fn the_tool_statement_carries_ramp_and_cc() {
+    let text = with_tool1(" ramp=3 cc=yes");
+    let d = round_trip(&text);
+    assert!(write(&d).contains(&format!("{TOOL1} ramp=3 cc=yes\n")), "{}", write(&d));
+    let t = tool_of(&d, 1);
+    assert_eq!((t.ramp_deg, t.centre_cutting), (Some(3.0), Some(true)));
+    let t = tool_of(&round_trip(&with_tool1(" cc=no")), 1);
+    assert_eq!((t.ramp_deg, t.centre_cutting), (None, Some(false)));
+    let t = tool_of(&round_trip(DOC_A), 1);
+    assert_eq!((t.ramp_deg, t.centre_cutting), (None, None));
+    let r = read(&with_tool1(" cc=maybe")).expect_err("refused");
+    assert_eq!(r.what, What::BadValue { key: "cc".into() });
+}
+
+#[test]
+fn diff_names_the_ramp_and_cc() {
+    let a = read(&with_tool1(" ramp=3")).unwrap();
+    let b = read(&with_tool1(" ramp=5")).unwrap();
+    assert_eq!(doc_core::diff(&a, &b).text(), "~ tool tool:1 ramp: 3 -> 5\n");
+    let plain = read(DOC_A).unwrap();
+    let cc = read(&with_tool1(" cc=yes")).unwrap();
+    assert_eq!(doc_core::diff(&plain, &cc).text(), "~ tool tool:1 cc: (none) -> yes\n");
+}

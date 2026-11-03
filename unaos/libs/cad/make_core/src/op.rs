@@ -5,7 +5,8 @@
 //!
 //! Generated today: `Drill` (a peck cycle as explicit moves), `Contour` (one closed profile offset by the tool
 //! radius), `Pocket2_5D` (level-set rings inside-out, islands merged, a helical entry, or the tool's ramp or helix at
-//! its `ramp_deg`: VUGMAKERAMP SR532) and `Face` (zigzag passes over
+//! its `ramp_deg`: VUGMAKERAMP SR532; the plunge where the tool cuts at its centre, `centre_cutting` by flag or kind:
+//! VUGMAKETOOLCC SR538) and `Face` (zigzag passes over
 //! a rectangle, entered from the side). The rest refuse by name with their owed id.
 
 use alloc::vec::Vec;
@@ -245,10 +246,11 @@ pub(crate) fn passes(t: &Tool, depth: f64, tol: Tol) -> usize {
     if t.apmx > tol.lin { ceil((depth - tol.lin) / t.apmx).max(1.0) as usize } else { 1 }
 }
 
-/// Whether the tool may plunge straight into solid. `Tool` carries no centre-cutting flag (VUG-MAKE-TOOLCC): a ball
-/// end and a drill cut at the centre; a flat end is assumed not to.
+/// Whether the tool may plunge straight into solid: the tool's own `centre_cutting` flag first (VUGMAKETOOLCC SR538),
+/// and with None the rule by kind: a ball end and a drill cut at the centre; a flat end is assumed not to.
 pub(crate) fn centre_cutting(t: &Tool) -> bool {
-    matches!(t.kind, crate::machine::ToolKind::BallEnd | crate::machine::ToolKind::Drill)
+    use crate::machine::ToolKind;
+    t.centre_cutting.unwrap_or_else(|| matches!(t.kind, ToolKind::BallEnd | ToolKind::Drill))
 }
 
 /// Down from the safe Z into the cut at `z` beside ring point `c`: fed to the cleared `floor`, then a helix of radius

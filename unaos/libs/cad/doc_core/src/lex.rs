@@ -645,8 +645,17 @@ fn statement(t: Toks, line: u32, st: &mut State) -> Result<Stmt, Refusal> {
                     let nv = f.req("nof")?;
                     let nof = int_max(&nv, "nof", line, u8::MAX as u64)? as u8;
                     let sig = f.f64("sig")?;
-                    // VUGMAKERAMP (SR532): the grammar carries no ramp angle yet (VUG-MAKE-RAMP-DOC).
-                    Stmt::Tool(Tool { number, kind, dc, lf, apmx, nof, sig, ramp_deg: None })
+                    // VUGMAKETOOLCC (SR538): `ramp=<deg>` and `cc=yes|no`, each absent = None (VUG-MAKE-RAMP-DOC); a ramp
+                    // outside (0, 90) is kept as data, the pocket refusing it by name.
+                    let ramp_deg = match f.opt("ramp") {
+                        Some(v) => Some(num(&v, "ramp", line)?),
+                        None => None,
+                    };
+                    let centre_cutting = match f.opt("cc") {
+                        Some(v) => Some(pick(&v, "cc", line, &YESNO)?),
+                        None => None,
+                    };
+                    Stmt::Tool(Tool { number, kind, dc, lf, apmx, nof, sig, ramp_deg, centre_cutting })
                 }
                 "stock" => {
                     if st.stock {

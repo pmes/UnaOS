@@ -25,8 +25,8 @@ fn mill() -> Machine {
         safe_z: 5.0,
         units: Units::Mm,
         tools: vec![
-            Tool { number: 1, kind: ToolKind::Drill, dc: 3.0, lf: 30.0, apmx: 3.0, nof: 2, sig: 2.0944, ramp_deg: None },
-            Tool { number: 2, kind: ToolKind::FlatEnd, dc: 4.0, lf: 20.0, apmx: 2.0, nof: 3, sig: 0.0, ramp_deg: None },
+            Tool { number: 1, kind: ToolKind::Drill, dc: 3.0, lf: 30.0, apmx: 3.0, nof: 2, sig: 2.0944, ramp_deg: None, centre_cutting: None },
+            Tool { number: 2, kind: ToolKind::FlatEnd, dc: 4.0, lf: 20.0, apmx: 2.0, nof: 3, sig: 0.0, ramp_deg: None, centre_cutting: None },
         ],
         stock: Some(Stock { shape: StockShape::Box { size: Vec3::new(50.0, 50.0, 10.0) }, origin: Vec3::new(0.0, 0.0, -10.0) }),
         fixtures: vec![Fixture {
