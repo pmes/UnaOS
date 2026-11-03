@@ -163,4 +163,22 @@ impl NurbsCurve {
         let h = d[p];
         Vec3::new(h[0] / h[3], h[1] / h[3], h[2] / h[3])
     }
+
+    // VUGSTEP (SR482): read-only accessors, so an exchange writer (step_core) can write the curve back out.
+    /// The degree p.
+    pub fn degree(&self) -> usize {
+        self.degree
+    }
+    /// The full knot vector (n + p + 1 entries, non-decreasing).
+    pub fn knots(&self) -> &[f64] {
+        &self.knots
+    }
+    /// The control points.
+    pub fn ctrl(&self) -> &[Vec3] {
+        &self.ctrl
+    }
+    /// The weights (all > 0).
+    pub fn weights(&self) -> &[f64] {
+        &self.weights
+    }
 }
