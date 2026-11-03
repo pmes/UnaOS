@@ -36,10 +36,12 @@ extern crate alloc;
 pub mod gcode;
 pub mod geom;
 pub mod machine;
+mod offset;
 pub mod op;
 pub mod plan;
 pub mod program;
 pub mod review;
+pub mod slice; // VUGMAKESLICE (SR483)
 pub mod validate;
 
 pub use geom::{Aabb3, Tol, Vec2, Vec3};
@@ -51,3 +53,4 @@ pub use op::{Feeds, Op, Side, generate};
 pub use program::{Coolant, Heater, Move, Program, Spin};
 pub use review::{Ask, Review, review};
 pub use validate::{Refusal, Stats};
+pub use slice::{Island, Layer, SliceParams}; // VUGMAKESLICE (SR483)

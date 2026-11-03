@@ -3,8 +3,9 @@
 //
 //! The manufacturing intent attached to the design (BP-vug-3) and the toolpath generators for it.
 //!
-//! Generated today: `Drill` (a peck cycle as explicit moves) and `Contour` (one closed profile offset by the tool
-//! radius). The rest refuse by name with their owed id.
+//! Generated today: `Drill` (a peck cycle as explicit moves), `Contour` (one closed profile offset by the tool
+//! radius), `Pocket2_5D` (level-set rings inside-out, islands merged, a helical entry) and `Face` (zigzag passes over
+//! a rectangle, entered from the side). The rest refuse by name with their owed id.
 
 use alloc::vec::Vec;
 use libm::ceil;
@@ -12,6 +13,7 @@ use libm::ceil;
 use crate::geom::{Length, Tol, Vec2, Vec3, line_line2, seg_seg2, signed_area2};
 use crate::machine::{Machine, Tool};
 use crate::program::{Move, Program, Spin};
+use crate::slice::SliceParams; // VUGMAKESLICE (SR483)
 use crate::validate::Refusal;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -33,10 +35,23 @@ pub struct Feeds {
 pub enum Op {
     Drill { points: Vec<Vec2>, top: f64, depth: f64, peck: f64, tool: u32, feeds: Feeds },
     Contour { profile: Vec<Vec2>, top: f64, depth: f64, side: Side, tool: u32, feeds: Feeds },
-    Pocket2_5D { outline: Vec<Vec2>, islands: Vec<Vec<Vec2>>, depth: f64, stepover: f64, tool: u32 },
-    Face { area: Vec<Vec2>, depth: f64 },
+    /// `chord`: the most material a flattened corner arc may leave; `climb`: climb milling with the M3 spindle.
+    Pocket2_5D {
+        outline: Vec<Vec2>,
+        islands: Vec<Vec<Vec2>>,
+        top: f64,
+        depth: f64,
+        stepover: f64,
+        chord: f64,
+        climb: bool,
+        tool: u32,
+        feeds: Feeds,
+    },
+    /// The rectangle `lo`..`hi` faced by parallel passes along `along`.
+    Face { lo: Vec2, hi: Vec2, top: f64, depth: f64, stepover: f64, along: FaceDir, tool: u32, feeds: Feeds },
     PrintLayers { slices: Vec<(f64, Vec<Vec<Vec2>>)>, tool: u32 },
     LaserCut { polylines: Vec<Vec<Vec2>>, passes: u32 },
+    Slice { triangles: Vec<[Vec3; 3]>, params: SliceParams }, // VUGMAKESLICE (SR483): FDM slicing of a triangle soup
 }
 
 /// The toolpath for `op` on `m`, or the refusal by name.
@@ -46,10 +61,15 @@ pub fn generate(op: &Op, m: &Machine, tol: Tol) -> Result<Program, Refusal> {
         Op::Contour { profile, top, depth, side, tool, feeds } => {
             contour(m, profile, *top, *depth, *side, *tool, feeds, tol)
         }
-        Op::Pocket2_5D { .. } => Err(Refusal::OpOwed { op: "Pocket2_5D", owed: "VUG-MAKE-POCKET" }),
-        Op::Face { .. } => Err(Refusal::OpOwed { op: "Face", owed: "VUG-MAKE-POCKET" }),
+        Op::Pocket2_5D { outline, islands, top, depth, stepover, chord, climb, tool, feeds } => {
+            pocket(m, outline, islands, *top, *depth, *stepover, *chord, *climb, *tool, feeds, tol)
+        }
+        Op::Face { lo, hi, top, depth, stepover, along, tool, feeds } => {
+            face(m, *lo, *hi, *top, *depth, *stepover, *along, *tool, feeds, tol)
+        }
         Op::PrintLayers { .. } => Err(Refusal::OpOwed { op: "PrintLayers", owed: "VUG-MAKE-SLICE" }),
         Op::LaserCut { .. } => Err(Refusal::OpOwed { op: "LaserCut", owed: "VUG-MAKE-LASER" }),
+        Op::Slice { triangles, params } => crate::slice::slice(triangles, params, m, tol), // VUGMAKESLICE (SR483)
     }
 }
 
@@ -235,6 +255,275 @@ fn contour(
             }
         }
         p.moves.push(Move::Rapid { to: Vec3::new(start.x, start.y, m.safe_z) });
+    }
+    p.moves.push(Move::Spindle(Spin::Off));
+    Ok(p)
+}
+
+// ---- VUGMAKEPOCKET (LEDGER SR479): 2.5D pocketing by level-set rings and facing by zigzag passes. ----
+
+/// The direction a face pass runs along.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FaceDir {
+    X,
+    Y,
+}
+
+/// The helix's rise over its run (~2.9°): pitch per turn = 2π·rh·HELIX_SLOPE.
+const HELIX_SLOPE: f64 = 0.05;
+
+/// The depth passes APMX allows (Contour's rule; one when APMX is unset).
+fn passes(t: &Tool, depth: f64, tol: Tol) -> usize {
+    if t.apmx > tol.lin { ceil((depth - tol.lin) / t.apmx).max(1.0) as usize } else { 1 }
+}
+
+/// Whether the tool may plunge straight into solid. `Tool` carries no centre-cutting flag (VUG-MAKE-TOOLCC): a ball
+/// end and a drill cut at the centre; a flat end is assumed not to.
+fn centre_cutting(t: &Tool) -> bool {
+    matches!(t.kind, crate::machine::ToolKind::BallEnd | crate::machine::ToolKind::Drill)
+}
+
+/// Down from the safe Z into the cut at `z` beside ring point `c`: fed to the cleared `floor`, then a helix of radius
+/// min(r/2, `room`) about `c` at the plunge feed (full turns to `z`, one flat turn, a line to `c`), or, with less than
+/// r/4 of room, a straight plunge for a centre-cutting tool and `NoEntry` for any other.
+#[allow(clippy::too_many_arguments)]
+fn enter(
+    p: &mut Program,
+    m: &Machine,
+    t: &Tool,
+    c: Vec2,
+    room: f64,
+    floor: f64,
+    z: f64,
+    cw: bool,
+    f: &Feeds,
+    tol: Tol,
+) -> Result<(), Refusal> {
+    let r = t.radius();
+    let rh = (0.5 * r).min(room);
+    if rh >= 0.25 * r {
+        let s = c + Vec2::new(rh, 0.0);
+        p.moves.push(Move::Rapid { to: Vec3::new(s.x, s.y, m.safe_z) });
+        p.moves.push(Move::Linear { to: Vec3::new(s.x, s.y, floor), feed: f.plunge });
+        let pitch = 2.0 * core::f64::consts::PI * rh * HELIX_SLOPE;
+        let turns = ceil((floor - z - tol.lin) / pitch).max(1.0) as usize;
+        for k in 1..=turns {
+            let zk = floor - (floor - z) * (k as f64) / (turns as f64);
+            p.moves.push(Move::Arc { to: Vec3::new(s.x, s.y, zk), centre: c, cw, feed: f.plunge });
+        }
+        p.moves.push(Move::Arc { to: Vec3::new(s.x, s.y, z), centre: c, cw, feed: f.plunge });
+        p.moves.push(Move::Linear { to: Vec3::new(c.x, c.y, z), feed: f.feed });
+    } else if centre_cutting(t) {
+        p.moves.push(Move::Rapid { to: Vec3::new(c.x, c.y, m.safe_z) });
+        p.moves.push(Move::Linear { to: Vec3::new(c.x, c.y, floor), feed: f.plunge });
+        p.moves.push(Move::Linear { to: Vec3::new(c.x, c.y, z), feed: f.plunge });
+    } else {
+        return Err(Refusal::NoEntry { tool: t.number });
+    }
+    Ok(())
+}
+
+/// The pocket: ring k at distance r + k·stepover from the outline and islands ([`crate::offset::rings`]), cut
+/// inside-out per depth pass so the wall ring (distance r) is the last, finishing pass; climb runs each ring against
+/// its domain-left direction. A ring is reached by a fed link when the link is no longer than DC and keeps r from the
+/// boundary, else by a retract, a rapid at the safe Z and a fresh entry.
+///
+/// The fresh entry is first a CLEARED DROP ([`cleared_drop`]): down through a column already cut at this depth pass
+/// (any tool may: nothing is left there to cut), then a fed link to the ring under the same length and clearance gate.
+/// Only with no such drop does it helix in (room k·stepover at level k) or plunge or refuse `NoEntry`. Without the drop
+/// a pocket whose level 0 holds two rings far apart (the wall ring and the ring about a central island) re-entered
+/// its second ring with room 0, and a flat end refused an ordinary island pocket. The first ring of each depth pass
+/// is the innermost ring's helix entry.
+#[allow(clippy::too_many_arguments)]
+fn pocket(
+    m: &Machine,
+    outline: &[Vec2],
+    islands: &[Vec<Vec2>],
+    top: f64,
+    depth: f64,
+    stepover: f64,
+    chord: f64,
+    climb: bool,
+    tool: u32,
+    f: &Feeds,
+    tol: Tol,
+) -> Result<Program, Refusal> {
+    if !(depth > tol.lin) {
+        return Err(Refusal::DepthAboveTop);
+    }
+    let t = *m.tool(tool).ok_or(Refusal::UnknownTool { at: 0, tool })?;
+    let r = t.radius();
+    if !(stepover > tol.lin && stepover <= t.dc + tol.lin) {
+        return Err(Refusal::BadParameter { what: "stepover outside (0, DC]" });
+    }
+    if !(chord > tol.lin) {
+        return Err(Refusal::BadParameter { what: "chord not positive" });
+    }
+    let lps = crate::offset::loops(outline, islands, tol)?;
+    let mut levels: Vec<Vec<Vec<Vec2>>> = Vec::new();
+    loop {
+        let d = r + stepover * (levels.len() as f64);
+        let rs = crate::offset::rings(&lps, d, chord, tol)?;
+        if rs.is_empty() {
+            break;
+        }
+        levels.push(rs);
+    }
+    if levels.is_empty() {
+        return Err(Refusal::ToolTooLarge { tool });
+    }
+    if climb {
+        for lv in levels.iter_mut() {
+            for ring in lv.iter_mut() {
+                ring.reverse();
+            }
+        }
+    }
+    let (mut p, _) = prelude(m, tool, f.rpm)?;
+    let n = passes(&t, depth, tol);
+    let mut floor = top;
+    for j in 1..=n {
+        let z = top - depth * (j as f64) / (n as f64);
+        let mut at: Option<Vec2> = None;
+        let mut cut: Vec<Vec<Vec2>> = Vec::new();
+        for k in (0..levels.len()).rev() {
+            let mut left: Vec<Vec<Vec2>> = levels[k].clone();
+            while !left.is_empty() {
+                let mut best = (0usize, 0usize, left[0][0], f64::INFINITY);
+                if let Some(a) = at {
+                    for (i, ring) in left.iter().enumerate() {
+                        let (dd, e, q) = crate::offset::nearest(a, ring);
+                        if dd < best.3 {
+                            best = (i, e, q, dd);
+                        }
+                    }
+                }
+                let (ri, e, q, dd) = best;
+                let orig = left.swap_remove(ri);
+                let mut ring = crate::offset::start_at(&orig, e, q, tol);
+                let linked = match at {
+                    Some(a) => dd <= t.dc + tol.lin && crate::offset::clearance(a, ring[0], &lps, tol) >= r - tol.lin,
+                    None => false,
+                };
+                if linked {
+                    p.moves.push(Move::Linear { to: Vec3::new(ring[0].x, ring[0].y, z), feed: f.feed });
+                } else {
+                    if let Some(a) = at {
+                        p.moves.push(Move::Rapid { to: Vec3::new(a.x, a.y, m.safe_z) });
+                    }
+                    match cleared_drop(&cut, &orig, &lps, &t, tol) {
+                        Some((pd, e2, q2)) => {
+                            ring = crate::offset::start_at(&orig, e2, q2, tol);
+                            p.moves.push(Move::Rapid { to: Vec3::new(pd.x, pd.y, m.safe_z) });
+                            p.moves.push(Move::Linear { to: Vec3::new(pd.x, pd.y, z), feed: f.plunge });
+                            p.moves.push(Move::Linear { to: Vec3::new(q2.x, q2.y, z), feed: f.feed });
+                        }
+                        None => enter(&mut p, m, &t, ring[0], stepover * (k as f64), floor, z, climb, f, tol)?,
+                    }
+                }
+                let c = ring[0];
+                for v in &ring[1..] {
+                    p.moves.push(Move::Linear { to: Vec3::new(v.x, v.y, z), feed: f.feed });
+                }
+                p.moves.push(Move::Linear { to: Vec3::new(c.x, c.y, z), feed: f.feed });
+                cut.push(ring);
+                at = Some(c);
+            }
+        }
+        if let Some(a) = at {
+            p.moves.push(Move::Rapid { to: Vec3::new(a.x, a.y, m.safe_z) });
+        }
+        floor = z;
+    }
+    p.moves.push(Move::Spindle(Spin::Off));
+    Ok(p)
+}
+
+/// The cleared drop to `target`: the closest pair of a point on a ring already cut at this depth pass (`cut`) and a
+/// point on `target` (a closest pair of two polylines has a vertex of one of them), whose link is no longer than DC
+/// and keeps the tool radius from the boundary: (the drop point, the target edge, the target point).
+fn cleared_drop(cut: &[Vec<Vec2>], target: &[Vec2], lps: &[Vec<Vec2>], t: &Tool, tol: Tol) -> Option<(Vec2, usize, Vec2)> {
+    let r = t.radius();
+    let mut best: Option<(f64, Vec2, usize, Vec2)> = None;
+    let mut consider = |dd: f64, pd: Vec2, e: usize, q: Vec2| {
+        if dd <= t.dc + tol.lin
+            && best.map_or(true, |b| dd < b.0)
+            && crate::offset::clearance(pd, q, lps, tol) >= r - tol.lin
+        {
+            best = Some((dd, pd, e, q));
+        }
+    };
+    for done in cut {
+        for v in done {
+            let (dd, e, q) = crate::offset::nearest(*v, target);
+            consider(dd, *v, e, q);
+        }
+        for (e, u) in target.iter().enumerate() {
+            let (dd, _, pd) = crate::offset::nearest(*u, done);
+            consider(dd, pd, e, *u);
+        }
+    }
+    best.map(|b| (b.1, b.2, b.3))
+}
+
+/// The face: rows evenly spaced from `lo` to `hi` across `along`, no further apart than `stepover`, each run from 2r
+/// beyond the rectangle to 2r beyond its far side (the lead-in: the pass enters the material from the side, never
+/// from above), alternating direction, the step between rows outside the rectangle; one set per APMX depth pass.
+#[allow(clippy::too_many_arguments)]
+fn face(
+    m: &Machine,
+    lo: Vec2,
+    hi: Vec2,
+    top: f64,
+    depth: f64,
+    stepover: f64,
+    along: FaceDir,
+    tool: u32,
+    f: &Feeds,
+    tol: Tol,
+) -> Result<Program, Refusal> {
+    if !(depth > tol.lin) {
+        return Err(Refusal::DepthAboveTop);
+    }
+    let t = *m.tool(tool).ok_or(Refusal::UnknownTool { at: 0, tool })?;
+    if !(lo.x <= hi.x && lo.y <= hi.y) {
+        return Err(Refusal::BadParameter { what: "face rectangle min above max" });
+    }
+    if !(stepover > tol.lin && stepover <= t.dc + tol.lin) {
+        return Err(Refusal::BadParameter { what: "stepover outside (0, DC]" });
+    }
+    let r = t.radius();
+    let (u0, u1, v0, v1) = match along {
+        FaceDir::X => (lo.x, hi.x, lo.y, hi.y),
+        FaceDir::Y => (lo.y, hi.y, lo.x, hi.x),
+    };
+    let at = |u: f64, v: f64, z: f64| match along {
+        FaceDir::X => Vec3::new(u, v, z),
+        FaceDir::Y => Vec3::new(v, u, z),
+    };
+    let (ua, ub) = (u0 - 2.0 * r, u1 + 2.0 * r);
+    let span = v1 - v0;
+    let rows = if span > tol.lin { ceil((span - tol.lin) / stepover).max(1.0) as usize + 1 } else { 1 };
+    let (mut p, _) = prelude(m, tool, f.rpm)?;
+    let n = passes(&t, depth, tol);
+    for j in 1..=n {
+        let z = top - depth * (j as f64) / (n as f64);
+        p.moves.push(Move::Rapid { to: at(ua, v0, m.safe_z) });
+        p.moves.push(Move::Linear { to: at(ua, v0, z), feed: f.plunge });
+        let mut forward = true;
+        for i in 0..rows {
+            let v = if rows > 1 { v0 + span * (i as f64) / ((rows - 1) as f64) } else { v0 };
+            let from = if forward { ua } else { ub };
+            if i > 0 {
+                p.moves.push(Move::Linear { to: at(from, v, z), feed: f.feed });
+            }
+            let to = if forward { ub } else { ua };
+            p.moves.push(Move::Linear { to: at(to, v, z), feed: f.feed });
+            forward = !forward;
+        }
+        let end = if forward { ua } else { ub };
+        let v_end = if rows > 1 { v1 } else { v0 };
+        p.moves.push(Move::Rapid { to: at(end, v_end, m.safe_z) });
     }
     p.moves.push(Move::Spindle(Spin::Off));
     Ok(p)
