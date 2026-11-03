@@ -282,3 +282,24 @@ pub fn integrate(
 ) -> Result<Integrated, ScanError> {
     t.integrate(frame, scale, intr, pose)
 }
+
+// VUGSCANPOSE (SR478): the one integrate-with-tracking convenience. The first frame goes in at the tracker's pose
+// (the world's origin); every later frame is tracked against the model raycast after the previous one, then
+// integrated, then the model is raycast again. `integrate` itself is unchanged. A refused track touches neither the
+// volume nor the tracker; a refused integrate leaves the volume as it was (the tracker keeps the tracked pose
+// against its old model).
+impl Tsdf {
+    pub fn integrate_tracked(
+        &mut self,
+        tracker: &mut crate::pose::Tracker,
+        frame: &Frame,
+        scale: DepthScale,
+        intr: &Intrinsics,
+        gravity: Option<Vec3>,
+    ) -> Result<(Transform, Integrated), crate::pose::TrackError> {
+        let pose = if self.frames == 0 { tracker.pose() } else { tracker.track(frame, scale, intr, gravity)? };
+        let done = self.integrate(frame, scale, intr, &pose).map_err(crate::pose::TrackError::Scan)?;
+        tracker.accept(self, intr, pose, gravity);
+        Ok((pose, done))
+    }
+}
