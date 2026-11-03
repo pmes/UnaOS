@@ -235,7 +235,8 @@ fn classify(sys: &System, it: u32, n: usize, tol: Tol, strict: bool) -> Result<S
 }
 
 fn finish(sk: &mut Sketch, x0: Vec<f64>, w: &[f64], tol: Tol, strict: bool) -> Result<Solved, Refusal> {
-    let n = x0.len();
+    // VUGSKETCHERASE (SR495): dof counts live parameters; a removed entity's are frozen (zero Jacobian columns).
+    let n = sk.live_params();
     let (x, sys, it) = run(sk, x0, w, tol)?;
     let out = classify(&sys, it, n, tol, strict)?;
     sk.params = x;
@@ -309,12 +310,14 @@ pub fn dof(sk: &Sketch) -> Dof {
     let own = sk.param_owner();
     let mut free: Vec<EntityId> = Vec::new();
     for j in 0..n {
+        // VUGSKETCHERASE (SR495): a removed entity's frozen parameter is never free.
+        let Some(owner) = own[j] else { continue };
         let mut s = 0.0;
         for q in &rank.q {
             s += q[j] * q[j];
         }
         if 1.0 - s > RANK_TOL {
-            free.push(own[j]);
+            free.push(owner);
         }
     }
     for (i, e) in sk.entities.iter().enumerate() {
@@ -326,5 +329,5 @@ pub fn dof(sk: &Sketch) -> Dof {
     }
     free.sort_unstable();
     free.dedup();
-    Dof { count: n - rank.indep.len(), free }
+    Dof { count: sk.live_params() - rank.indep.len(), free }
 }
