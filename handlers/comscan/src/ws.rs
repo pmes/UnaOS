@@ -148,7 +148,7 @@ struct Sock {
 
 impl rfc6455::Transport for Sock {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let n = self.s.read(buf)?;
+        let n = Read::read(&mut self.s, buf)?;
         if Arc::strong_count(&self.seen) > 1 {
             if let Ok(mut seen) = self.seen.lock() {
                 let take = n.min(SEEN_CAP.saturating_sub(seen.len()));
