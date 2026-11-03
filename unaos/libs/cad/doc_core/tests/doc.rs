@@ -544,3 +544,22 @@ fn diff_sees_a_fillet_radius_change() {
         }]
     );
 }
+
+// VUGMAKEREST (SR517): the `rest` verb reads, writes byte-equal and reads back to the same make_core `Op::Rest`.
+#[test]
+fn a_rest_op_round_trips() {
+    let text = format!(
+        "{DOC_ALL}rest o8 on=f outline=[[0 0] [40 0] [40 40] [0 40]] islands=[] top=0 depth=1 after=7 stepover=4 \
+         climb=yes tool=7 feed=600 plunge=120 rpm=1000\n"
+    );
+    let d = round_trip(&text);
+    let op = d.stmts.iter().find_map(|s| match s {
+        Stmt::Op { id, op, .. } if id == "o8" => Some(op.clone()),
+        _ => None,
+    });
+    assert!(
+        matches!(op, Some(make_core::Op::Rest { after: 7, tool: 7, climb: true, stepover, ref islands, .. })
+            if stepover == 4.0 && islands.is_empty()),
+        "{op:?}"
+    );
+}

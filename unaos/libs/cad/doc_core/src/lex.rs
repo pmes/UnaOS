@@ -676,7 +676,7 @@ fn statement(t: Toks, line: u32, st: &mut State) -> Result<Stmt, Refusal> {
             f.done()?;
             s
         }
-        "drill" | "contour" | "pocket" | "face" | "print_layers" | "laser_cut" | "slice" => {
+        "drill" | "contour" | "pocket" | "face" | "print_layers" | "laser_cut" | "slice" | "rest" => {
             let id = need_id(tid, line, vcol)?;
             let on = f.target(st, "on", Kind::Feature)?;
             let op = op_stmt(&verb, &mut f)?;
@@ -883,6 +883,17 @@ fn op_stmt(verb: &str, f: &mut Fields) -> Result<Op, Refusal> {
             }
             Op::PrintLayers { slices, tool: f.u32("tool")? }
         }
+        "rest" => Op::Rest {
+            outline: f.pts("outline")?,
+            islands: f.polys("islands")?,
+            top: f.f64("top")?,
+            depth: f.f64("depth")?,
+            after: f.u32("after")?,
+            stepover: f.f64("stepover")?,
+            climb: f.pick("climb", &YESNO)?,
+            tool: f.u32("tool")?,
+            feeds: Feeds { feed: f.f64("feed")?, plunge: f.f64("plunge")?, rpm: f.f64("rpm")? },
+        }, // VUGMAKEREST (SR517)
         _ => Op::LaserCut { polylines: f.polys("polylines")?, passes: f.u32("passes")? },
     })
 }
