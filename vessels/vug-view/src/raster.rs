@@ -111,6 +111,8 @@ pub fn render(model: &Model, view: &View) -> Frame {
     let mut fr = Frame { width: w, height: h, rgba: bg.repeat(n), inv_z: vec![0.0; n], id: vec![u32::MAX; n] };
     fill(model, view, &mut fr);
     grid(model, view, &mut fr);
+    // VUGFACEPHOTO (SR506): the rectified photo under the sketch, dimmed, and the outline's sigma band.
+    crate::photo::underlay(view, &mut fr);
     triad(view, &mut fr);
     // VUGFACE2 (SR485): the sketch overlay (profile tint, entities, glyphs, dof) over everything.
     view.overlay(&mut fr);
@@ -363,6 +365,24 @@ const FONT: &[(char, [u8; 5])] = &[
     ('O', [2, 5, 5, 5, 2]),
     ('R', [6, 5, 6, 5, 5]),
     ('U', [5, 5, 5, 5, 7]),
+    // VUGFACEPHOTO (SR506): the rest of the capitals and the statement / refusal punctuation (a proposal's text and
+    // a refusal's name are drawn upper-cased).
+    ('B', [6, 5, 6, 5, 6]),
+    ('J', [1, 1, 1, 5, 7]),
+    ('K', [5, 5, 6, 5, 5]),
+    ('P', [6, 5, 6, 4, 4]),
+    ('Q', [2, 5, 5, 6, 3]),
+    ('S', [3, 4, 2, 1, 6]),
+    ('W', [5, 5, 7, 7, 5]),
+    ('X', [5, 5, 2, 5, 5]),
+    ('Y', [5, 5, 2, 2, 2]),
+    ('Z', [7, 1, 2, 4, 7]),
+    (':', [0, 2, 0, 2, 0]),
+    ('_', [0, 0, 0, 0, 7]),
+    ('/', [1, 1, 2, 4, 4]),
+    ('(', [1, 2, 2, 2, 1]),
+    (')', [4, 2, 2, 2, 4]),
+    (',', [0, 0, 0, 2, 4]),
 ];
 
 /// One character of the bitmap font at (x, y) (its top-left), each bit a 2x2 block; an unknown character (and the

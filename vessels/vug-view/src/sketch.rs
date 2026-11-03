@@ -1434,3 +1434,32 @@ fn dimension_overlay(view: &View, face: &SketchFace, fr: &mut Raster) {
         }
     }
 }
+
+// ---- VUGFACEPHOTO (SR506): the photo face's door — a measured sketch opened whole, the apply_as road named ----
+
+impl SketchFace {
+    /// A face over `sketch` (photo_core's measured sketch) on `plane`: its entities and constraints keep their ids, the
+    /// face's origin point is appended and fixed at (0, 0), and the glyph walk's bound covers every measured
+    /// constraint. Solved and settled.
+    pub fn over(plane: Frame, mut sketch: Sketch) -> SketchFace {
+        let mut f = SketchFace::new(plane);
+        let origin = sketch.add_point(0.0, 0.0);
+        let fix = sketch.add(Constraint::Fix(PointRef::Point(origin), Vec2::new(0.0, 0.0)));
+        f.sketch = sketch;
+        f.origin = origin;
+        f.issued = fix.map(|id| id.0 + 1).unwrap_or(0);
+        let _ = f.solve();
+        f
+    }
+
+    /// `apply_as` with a redundant constraint refused (the typed-dimension rule): a proposal's constraint enters the
+    /// sketch only here, and a refusal removes exactly what was added and names it.
+    pub fn constrain(&mut self, cs: Vec<Constraint>) -> Result<Vec<ConstraintId>, String> {
+        self.apply_as(cs, true)
+    }
+
+    /// One past the highest constraint id this face has added (every live constraint id is below it).
+    pub fn issued(&self) -> u32 {
+        self.issued
+    }
+}

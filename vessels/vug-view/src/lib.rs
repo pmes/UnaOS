@@ -13,6 +13,7 @@
 
 pub mod extrude;
 pub mod model;
+pub mod photo; // VUGFACEPHOTO (SR506): the photo underlay and the proposal glyphs
 pub mod raster;
 pub mod sketch;
 pub mod view;
@@ -40,6 +41,10 @@ pub const SHORTCUTS: &[(&str, &str)] = &[
     ("middle / right drag", "orbit / pan / zoom per the preset"),
     ("Alt+drag", "the middle button, for a trackpad (orbit / pan / zoom per the preset)"),
     ("wheel / pinch", "zoom to the cursor"),
+    // VUGFACEPHOTO (SR506): a photo on graph paper opens as its measured sketch over the dimmed photo.
+    ("i", "ask Vein for design intent on the photo's sketch (no provider today: the corner says so)"),
+    ("Tab", "focus the next proposal"),
+    ("Enter / Backspace", "on the focused proposal: apply it (verified against the photo) / reject it"),
 ];
 
 /// The controller: owns the model and the view (one task, no lock).
@@ -53,6 +58,34 @@ impl Viewer {
     pub fn new(model: Model, title: &str, size: (u32, u32), preset: Preset) -> Viewer {
         let view = View::new(&model, size, preset);
         Viewer { model, view, title: title.to_string() }
+    }
+
+    /// VUGFACEPHOTO (SR506): THE open road — a .png / .jpg / .jpeg (else any file pixel_core recognises that is not a
+    /// mesh by extension) is a photo on graph paper measured at `photo::PITCH_MM`; anything else is a mesh
+    /// (`Model::open`). The title is the file name.
+    pub fn open(path: &str, size: (u32, u32), preset: Preset) -> Result<Viewer, String> {
+        let p = std::path::Path::new(path);
+        let title = p.file_name().and_then(|s| s.to_str()).unwrap_or("vug").to_string();
+        let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+        let mesh = matches!(ext.as_str(), "stl" | "ply" | "obj");
+        if !mesh {
+            let bytes = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
+            if matches!(ext.as_str(), "png" | "jpg" | "jpeg") || pixel_core::sniff(&bytes).is_some() {
+                return Viewer::open_photo(&bytes, &title, size, preset, photo::PITCH_MM).map_err(|e| format!("{path}: {e}"));
+            }
+        }
+        Ok(Viewer::new(Model::open(path)?, &title, size, preset))
+    }
+
+    /// VUGFACEPHOTO (SR506): a photo's bytes on `pitch_mm` graph paper: photo_core measures it, the paper is the drawn
+    /// model, the measured sketch is open (Select) on the XY plane, seen from the top.
+    pub fn open_photo(bytes: &[u8], title: &str, size: (u32, u32), preset: Preset, pitch_mm: f64) -> Result<Viewer, String> {
+        let (model, face, photo) = photo::open(bytes, pitch_mm)?;
+        let mut v = Viewer::new(model, title, size, preset);
+        v.view.top(&v.model);
+        v.view.design.face = Some(face);
+        v.view.photo = Some(photo);
+        Ok(v)
     }
 
     /// A shortcut key; true when the frame changed.
