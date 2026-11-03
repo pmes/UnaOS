@@ -208,3 +208,40 @@ fn a_click_with_the_line_tool_creates_nothing_and_esc_selects() {
     assert_eq!(face(&vw).tool, Tool::Point);
     assert_eq!(vw.view.preset, Preset::Una);
 }
+
+/// VUGSKETCHERASE (SR495): the circle tool's radius follows the cursor live (a sketch_core circle through
+/// `set_radius`, its profile tinted before the release), and Backspace over its centre removes the centre and, by the
+/// cascade, the circle — ids stay put and the origin is never erased.
+#[test]
+fn a_circle_grows_live_and_backspace_erases_it() {
+    let mut vw = Viewer::new(cube(), "sketch", (W, H), Preset::Una);
+    assert!(vw.input(&SMessage::BrowserText("7".into())));
+    assert!(vw.input(&SMessage::BrowserText("c".into())));
+    let (at, mid, rim, origin_px) = (screen(&vw, (5.0, 5.0)), screen(&vw, (7.0, 5.0)), screen(&vw, (8.0, 5.0)), screen(&vw, (0.0, 0.0)));
+    button(&mut vw, true, at);
+    assert!(move_to(&mut vw, mid));
+    assert!(move_to(&mut vw, rim));
+    let live = |vw: &Viewer| {
+        face(vw).sketch.entities().iter().enumerate().find_map(|(i, e)| match e {
+            Entity::Circle { centre, .. } => Some((sketch_core::EntityId(i as u32), *centre)),
+            _ => None,
+        })
+    };
+    let (circle, centre) = live(&vw).expect("the circle exists while the rim is dragged");
+    assert!((face(&vw).sketch.radius(circle).unwrap() - 3.0).abs() < 1e-6, "{:?}", face(&vw).sketch.radius(circle));
+    assert_eq!(face(&vw).profiles.len(), 1, "tinted live");
+    assert!(button(&mut vw, false, rim));
+    assert!((face(&vw).sketch.radius(circle).unwrap() - 3.0).abs() < 1e-6);
+    let n = face(&vw).sketch.entities().len();
+    let _ = move_to(&mut vw, at);
+    assert!(vw.input(&SMessage::BrowserKey("BackSpace".into())), "the centre under the cursor is erased");
+    assert_eq!(face(&vw).sketch.entity(centre), Some(&Entity::Removed));
+    assert_eq!(face(&vw).sketch.entity(circle), Some(&Entity::Removed), "the circle goes with its centre");
+    assert_eq!(face(&vw).sketch.entities().len(), n, "ids stay put");
+    assert!(face(&vw).profiles.is_empty());
+    assert!(vw.view.design.refusal.is_none());
+    let origin = face(&vw).origin;
+    let _ = move_to(&mut vw, origin_px);
+    vw.input(&SMessage::BrowserKey("BackSpace".into()));
+    assert!(matches!(face(&vw).sketch.entity(origin), Some(Entity::Point { .. })), "the origin stays");
+}

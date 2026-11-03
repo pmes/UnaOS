@@ -387,3 +387,32 @@ fn every_read_refusal_names_line_and_column() {
         (3, 27, What::WrongTarget("s1".into()))
     );
 }
+
+/// VUGSKETCHERASE (SR495): a document holds no tombstone (its ids are text; an erase in a Doc deletes statements),
+/// and REPLAY is the one place EntityIds renumber: the survivors are minted dense in statement order.
+#[test]
+fn replay_mints_dense_ids_after_statements_are_removed() {
+    let text = "vug-doc version=1 lin=1e-6 ang=1e-9\n\
+                sketch s1 o=[0 0 0] z=[0 0 1] x=[1 0 0]\n\
+                point p1 sketch=s1 x=0 y=0\n\
+                point p2 sketch=s1 x=10 y=0\n\
+                point p3 sketch=s1 x=10 y=8\n\
+                line l1 sketch=s1 a=p1 b=p2\n\
+                line l2 sketch=s1 a=p2 b=p3\n";
+    let mut d = read(text).unwrap_or_else(|r| panic!("read: {r:?}"));
+    assert_eq!(replay(&d, d.tol).sketches[0].sketch.entities().len(), 5);
+    // The erase of p2 with what is built on it, as the face's cascade names it.
+    let gone = ["p2", "l1", "l2"];
+    d.stmts.retain(|s| !s.id().is_some_and(|id| gone.contains(&id)));
+    d.lines.clear();
+    let out = write(&d);
+    assert!(!out.contains("p2") && !out.contains("line "), "{out}");
+    let d2 = round_trip(&out);
+    let r = replay(&d2, d2.tol);
+    assert!(r.failures.is_empty(), "{:?}", r.failures);
+    let sk = &r.sketches[0].sketch;
+    assert_eq!(sk.entities().len(), 2, "no tombstone reaches a replayed sketch");
+    assert!(sk.entities().iter().all(|e| matches!(e, sketch_core::Entity::Point { .. })));
+    let p3 = sk.point(PointRef::Point(sketch_core::EntityId(1))).expect("p3 is minted as id 1");
+    assert!((p3.x - 10.0).abs() < 1e-12 && (p3.y - 8.0).abs() < 1e-12, "{p3:?}");
+}

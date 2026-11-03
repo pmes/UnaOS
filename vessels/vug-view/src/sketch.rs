@@ -105,13 +105,13 @@ pub struct Hover {
 /// A press in progress.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Gesture {
-    /// A placing tool's press before it moved `CLICK_PX`: nothing is created yet (sketch_core cannot remove an entity,
-    /// so a bare click creates nothing).
+    /// A placing tool's press before it moved `CLICK_PX`: nothing is created yet (lazy: a bare click creates nothing).
     Armed { tool: Tool, start: Vec2, snap: Option<Snap>, screen: (f64, f64) },
     /// A line from `a` (placed) to `b` (dragged).
     Line { a: EntityId, b: EntityId, line: EntityId, snap_a: Option<Snap> },
-    /// A circle's rim being dragged (a preview: the circle is added on release).
-    Circle { centre: Vec2, snap_c: Option<Snap>, r: f64 },
+    /// VUGSKETCHERASE (SR495): a circle's rim being dragged; the circle exists and grows live through
+    /// `Sketch::set_radius` (its constraints are inferred on release).
+    Circle { centre: EntityId, circle: EntityId, snap_c: Option<Snap> },
     /// An arc's start being dragged (radius and start angle).
     ArcStart { arc: EntityId, centre: EntityId, snap_c: Option<Snap> },
     /// An arc's end following the cursor on its circle until a click.
@@ -509,6 +509,8 @@ impl Design {
                 return Some(true);
             }
             "e" | "E" => return self.start_pull(view),
+            // VUGSKETCHERASE (SR495): Delete / Backspace removes the entity under the cursor.
+            "BackSpace" | "Backspace" | "Delete" => return self.erase_at(view),
             "l" | "L" => Tool::Line,
             "c" | "C" => Tool::Circle,
             "a" | "A" => Tool::Arc,
@@ -548,6 +550,34 @@ impl Design {
         let c = centroid(&polygon(&profile.outer));
         let centroid = face.world(c);
         self.pull = Some(Pull { profile, plane: face.plane, centroid, distance: 0.0, start: (x, y), preview: None });
+        Some(true)
+    }
+
+    /// VUGSKETCHERASE (SR495): remove the entity under the cursor through `Sketch::remove_entity` (the cascade takes
+    /// what is built on it and every constraint naming it), then solve. A point is picked first, else a line by its
+    /// midpoint (a circle or arc goes with its centre); the origin is the sketch's anchor and stays; nothing happens
+    /// while a gesture is in progress.
+    fn erase_at(&mut self, view: &View) -> Option<bool> {
+        let face = self.face.as_mut()?;
+        if face.gesture.is_some() {
+            return Some(false);
+        }
+        let (x, y) = view.cursor;
+        let id = match face.snap_at(view, x, y, &[], true) {
+            Some((Snap::Point(p), _)) => p,
+            Some((Snap::Midpoint(l), _)) => l,
+            None => return Some(false),
+        };
+        if id == face.origin {
+            return Some(false);
+        }
+        let Ok(gone) = face.sketch.remove_entity(id) else { return Some(false) };
+        if face.selection.is_some_and(|s| gone.entities.contains(&s)) {
+            face.selection = None;
+        }
+        face.hover = None;
+        let r = face.solve().map(|_| ()).map_err(|e| format!("{e:?}"));
+        self.note(r);
         Some(true)
     }
 
@@ -652,7 +682,10 @@ impl Design {
                         let b = face.sketch.add_point(start.x, start.y);
                         face.sketch.add_line(a, b).ok().map(|line| Gesture::Line { a, b, line, snap_a: snap })
                     }
-                    Tool::Circle => Some(Gesture::Circle { centre: start, snap_c: snap, r: len(sub(q, start)) }),
+                    Tool::Circle => {
+                        let c = face.sketch.add_point(start.x, start.y);
+                        face.sketch.add_circle(c, len(sub(q, start)).max(Tol::DEFAULT.lin * 10.0)).ok().map(|circle| Gesture::Circle { centre: c, circle, snap_c: snap })
+                    }
                     Tool::Arc => {
                         let c = face.sketch.add_point(start.x, start.y);
                         let d = sub(q, start);
@@ -678,9 +711,13 @@ impl Design {
                 marks.extend(face.line_marks(view, x, y, line, a, b).into_iter().map(|(m, _)| m));
                 face.hover = Some(Hover { at: q, screen: (x, y), snap: snap.map(|(s, _)| s), marks });
             }
-            Gesture::Circle { centre, snap_c, .. } => {
-                let rim = face.snap_at(view, x, y, &[], false).map_or(q, |(_, p)| p);
-                face.gesture = Some(Gesture::Circle { centre, snap_c, r: len(sub(rim, centre)) });
+            Gesture::Circle { centre, circle, .. } => {
+                // VUGSKETCHERASE (SR495): the radius follows the rim live; no solve (nothing constrains it yet).
+                let rim = face.snap_at(view, x, y, &[centre], false).map_or(q, |(_, p)| p);
+                if let Some(c) = face.sketch.point(PointRef::Point(centre)) {
+                    let _ = face.sketch.set_radius(circle, len(sub(rim, c)).max(Tol::DEFAULT.lin * 10.0));
+                    face.settle();
+                }
             }
             Gesture::ArcStart { arc, .. } => {
                 face.drag_to(PointRef::Start(arc), q);
@@ -728,23 +765,14 @@ impl Design {
                 face.gesture = None;
                 face.apply(cs)
             }
-            Gesture::Circle { centre, snap_c, r } => {
+            Gesture::Circle { centre, circle, snap_c } => {
+                // VUGSKETCHERASE (SR495): the circle already exists; the release infers its constraints.
                 face.gesture = None;
-                if !(r > Tol::DEFAULT.lin) {
-                    face.hover = None;
-                    return Some(true);
+                let mut cs: Vec<Constraint> = snap_c.map(|s| snap_constraint(centre, s)).into_iter().collect();
+                if let Some((Snap::Point(p), _)) = face.snap_at(view, x, y, &[centre], false) {
+                    cs.push(Constraint::PointOnCircle(PointRef::Point(p), circle));
                 }
-                let c = face.sketch.add_point(centre.x, centre.y);
-                match face.sketch.add_circle(c, r) {
-                    Ok(circle) => {
-                        let mut cs: Vec<Constraint> = snap_c.map(|s| snap_constraint(c, s)).into_iter().collect();
-                        if let Some((Snap::Point(p), _)) = face.snap_at(view, x, y, &[c], false) {
-                            cs.push(Constraint::PointOnCircle(PointRef::Point(p), circle));
-                        }
-                        face.apply(cs)
-                    }
-                    Err(_) => Ok(()),
-                }
+                face.apply(cs)
             }
             Gesture::ArcStart { arc, centre, snap_c } => {
                 face.gesture = Some(Gesture::ArcEnd { arc });
@@ -849,10 +877,15 @@ pub fn overlay(view: &View, fr: &mut Raster) {
                     raster::line(fr, (x, y - 2.0), (x, y + 2.0), col);
                 }
             }
+            // VUGSKETCHERASE (SR495): a tombstone draws nothing.
+            Entity::Removed => {}
         }
     }
-    if let Some(Gesture::Circle { centre, r, .. }) = face.gesture {
-        poly(fr, &circle(centre, r, 0.0, TAU), rgba(ACTIVE));
+    // VUGSKETCHERASE (SR495): the live circle in the accent.
+    if let Some(Gesture::Circle { circle: live, .. }) = face.gesture {
+        if let (Some(c), Some(r)) = (face.sketch.point(PointRef::Centre(live)), face.sketch.radius(live)) {
+            poly(fr, &circle(c, r, 0.0, TAU), rgba(ACTIVE));
+        }
     }
     if let Some(Hover { at, snap: Some(_), .. }) = &face.hover {
         if let Some((x, y)) = scr(*at) {

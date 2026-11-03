@@ -162,6 +162,8 @@ pub fn profiles(sk: &Sketch, tol: Tol) -> Vec<Profile> {
                 }
             }
             Entity::Point { .. } => {}
+            // VUGSKETCHERASE (SR495): a tombstone is no edge.
+            Entity::Removed => {}
         }
     }
 

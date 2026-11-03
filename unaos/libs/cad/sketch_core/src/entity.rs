@@ -25,6 +25,10 @@ pub enum Entity {
     /// Centre point, radius at `params[r]`, start angle at `params[r + 1]`, end angle at `params[r + 2]`; the arc runs
     /// CCW from start to end.
     Arc { centre: EntityId, r: usize },
+    /// VUGSKETCHERASE (SR495): the tombstone of a removed entity. Its id is never reused and its parameters stay in
+    /// place (frozen: no live constraint names them, so the solver never moves them and `dof` does not count them);
+    /// every `need_*` refuses it, so nothing new can reference it.
+    Removed,
 }
 
 /// A point of the sketch: a Point entity, a circle's or arc's centre, or a line's or arc's start / end.
@@ -40,7 +44,8 @@ pub enum PointRef {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BadRef(pub EntityId);
 
-/// Entities, constraints and the parameter vector. Ids are stable: a removed constraint leaves a hole.
+/// Entities, constraints and the parameter vector. Ids are stable: a removed constraint leaves a hole, a removed
+/// entity leaves [`Entity::Removed`] (VUGSKETCHERASE, SR495).
 #[derive(Clone, Debug, Default)]
 pub struct Sketch {
     pub(crate) entities: Vec<Entity>,
@@ -170,11 +175,11 @@ impl Sketch {
         }
     }
 
-    /// The entity owning each parameter.
-    pub(crate) fn param_owner(&self) -> Vec<EntityId> {
-        let mut own = alloc::vec![EntityId(0); self.params.len()];
+    /// The live entity owning each parameter; None for a removed entity's frozen parameter (VUGSKETCHERASE).
+    pub(crate) fn param_owner(&self) -> Vec<Option<EntityId>> {
+        let mut own = alloc::vec![None; self.params.len()];
         for (i, e) in self.entities.iter().enumerate() {
-            let id = EntityId(i as u32);
+            let id = Some(EntityId(i as u32));
             match *e {
                 Entity::Point { x } => {
                     own[x] = id;
@@ -186,10 +191,15 @@ impl Sketch {
                     own[r + 1] = id;
                     own[r + 2] = id;
                 }
-                Entity::Line { .. } => {}
+                Entity::Line { .. } | Entity::Removed => {}
             }
         }
         own
+    }
+
+    /// VUGSKETCHERASE: the parameters a live entity owns (the solver's and `dof`'s count; frozen ones excluded).
+    pub(crate) fn live_params(&self) -> usize {
+        self.param_owner().iter().filter(|o| o.is_some()).count()
     }
 }
 
@@ -214,5 +224,82 @@ pub(crate) fn point_at(sk: &Sketch, x: &[f64], p: PointRef) -> Option<Vec2> {
             }
             _ => None,
         },
+    }
+}
+
+/// VUGSKETCHERASE (SR495): what [`Sketch::remove_entity`] removed — the entity first, then its dependants ascending;
+/// the constraints ascending.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Removed {
+    pub entities: Vec<EntityId>,
+    pub constraints: Vec<ConstraintId>,
+}
+
+// VUGSKETCHERASE (SR495): removal and the direct parameter setters.
+impl Sketch {
+    /// Remove an entity by CASCADE: the entity, every entity built on it (a line with it as an end, a circle or arc
+    /// with it as centre: only points are referenced by entities, so the cascade is one level and removing a line,
+    /// circle or arc never removes its points), and every constraint naming any removed entity (the ones whose
+    /// `check` fails once the entities are tombstones). Ids are never reused; the parameters stay in place, frozen.
+    /// `BadRef` when the id names no live entity.
+    pub fn remove_entity(&mut self, id: EntityId) -> Result<Removed, BadRef> {
+        match self.entity(id) {
+            None | Some(Entity::Removed) => return Err(BadRef(id)),
+            Some(_) => {}
+        }
+        let mut entities = alloc::vec![id];
+        for (i, e) in self.entities.iter().enumerate() {
+            let built_on = match *e {
+                Entity::Line { a, b } => a == id || b == id,
+                Entity::Circle { centre, .. } | Entity::Arc { centre, .. } => centre == id,
+                Entity::Point { .. } | Entity::Removed => false,
+            };
+            if built_on {
+                entities.push(EntityId(i as u32));
+            }
+        }
+        for e in &entities {
+            self.entities[e.0 as usize] = Entity::Removed;
+        }
+        let mut constraints = Vec::new();
+        for i in 0..self.constraints.len() {
+            let dead = match &self.constraints[i] {
+                Some(c) => c.check(self).is_err(),
+                None => false,
+            };
+            if dead {
+                let cid = ConstraintId(i as u32);
+                self.remove(cid);
+                constraints.push(cid);
+            }
+        }
+        Ok(Removed { entities, constraints })
+    }
+
+    /// Move a Point entity to (x, y). No solve: the caller solves.
+    pub fn set_point(&mut self, id: EntityId, x: f64, y: f64) -> Result<(), BadRef> {
+        let i = self.need_point(id)?;
+        self.params[i] = x;
+        self.params[i + 1] = y;
+        Ok(())
+    }
+
+    /// Set a circle's or arc's radius. No solve: the caller solves (a non-finite value makes it refuse `Diverged`).
+    pub fn set_radius(&mut self, id: EntityId, r: f64) -> Result<(), BadRef> {
+        let (_, i, _) = self.need_round(id)?;
+        self.params[i] = r;
+        Ok(())
+    }
+
+    /// Set an arc's start and end angles (radians, CCW from start to end). No solve: the caller solves.
+    pub fn set_arc_angles(&mut self, id: EntityId, start: f64, end: f64) -> Result<(), BadRef> {
+        match self.need_round(id)? {
+            (_, i, true) => {
+                self.params[i + 1] = start;
+                self.params[i + 2] = end;
+                Ok(())
+            }
+            _ => Err(BadRef(id)),
+        }
     }
 }
