@@ -1307,3 +1307,9 @@ exec-rmbp-holdstage 339b65319 wave36 cut47
 exec-rmbp-wordspointer 339b65319 wave36 cut47
 exec-rmbp-dooronpump 339b65319 wave36 cut47
 exec-rmbp-gatereds 339b65319 wave36 cut47
+exec-rmbp-vugfacestream 9845465f6 wave36 cut48
+exec-rmbp-vugintentfeatures 9845465f6 wave36 cut48
+exec-rmbp-vugscanshapesmerge 9845465f6 wave36 cut48
+exec-rmbp-vugmaketoolcc 9845465f6 wave36 cut48
+exec-rmbp-vugfacesaveas 9845465f6 wave36 cut48
+exec-rmbp-vuggeomlinalgscan 9845465f6 wave36 cut48
