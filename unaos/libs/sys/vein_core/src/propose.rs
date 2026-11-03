@@ -14,6 +14,8 @@
 //! here by its SURFACE only (one line, the first word a verb shape `[a-z][a-z0-9_-]*`, doc_core's `valid_verb`,
 //! cited not linked: a sys core does not depend on a cad core); doc_core reads, replays and verifies it later
 //! (VUG-INTENT SR505). Offline the answer is [`ECHO_ANSWER`] — no proposals, never a fake one.
+//! VUG-VEIN-STREAM (SR531): [`Incremental`] yields each array element the moment its closing brace arrives (cut as
+//! `json::skip_value` cuts, checked by the same `one`), and its `finish` IS [`parse`] over the whole text.
 
 use crate::Out;
 use crate::claude::{self, Dialect, Params};
@@ -343,4 +345,150 @@ fn string(raw: &[u8]) -> Option<alloc::string::String> {
 fn verb_shape(s: &str) -> bool {
     let b = s.as_bytes();
     !b.is_empty() && b[0].is_ascii_lowercase() && b.iter().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'_' || *c == b'-')
+}
+
+// --- VUG-VEIN-STREAM (SR531): the incremental parse (named tail hunk) ---
+
+/// Where [`Incremental`] stands in the answer text.
+#[cfg(feature = "alloc")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Scan {
+    /// Whitespace before the array.
+    Lead,
+    /// After `[`: an element or `]`.
+    Open,
+    /// After `,`: an element only.
+    Next,
+    /// After an element: `,` or `]`.
+    After,
+    /// Inside an element (depth / string / escape tracked as `json::skip_value` does).
+    Elem,
+    /// After `]`: whitespace only.
+    Tail,
+    /// A deviation: nothing more is yielded; [`Incremental::finish`] names the refusal.
+    Dead,
+}
+
+/// The answer parsed as it streams: [`Incremental::push`] the decoded text deltas in order and take each complete
+/// proposal as soon as its closing brace arrives. Whenever [`parse`] of the whole text is `Ok`, the yielded items are
+/// exactly its list in order; on any deviation the scan stops yielding and [`Incremental::finish`] (= [`parse`])
+/// names the refusal, so there is one grammar and one refusal set.
+#[cfg(feature = "alloc")]
+#[derive(Debug, Clone)]
+pub struct Incremental {
+    buf: alloc::string::String,
+    at: usize,
+    scan: Scan,
+    depth: usize,
+    in_str: bool,
+    esc: bool,
+    start: usize,
+    yielded: usize,
+}
+
+#[cfg(feature = "alloc")]
+impl Default for Incremental {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(feature = "alloc")]
+impl Incremental {
+    pub fn new() -> Self {
+        Incremental { buf: alloc::string::String::new(), at: 0, scan: Scan::Lead, depth: 0, in_str: false, esc: false, start: 0, yielded: 0 }
+    }
+
+    /// Append `text` and return the proposals it completed, in order (an element `one` refuses ends the yield).
+    pub fn push(&mut self, text: &str) -> alloc::vec::Vec<Proposal> {
+        self.buf.push_str(text);
+        let mut out = alloc::vec::Vec::new();
+        while self.at < self.buf.len() {
+            let c = self.buf.as_bytes()[self.at];
+            let ws = matches!(c, b' ' | b'\t' | b'\r' | b'\n');
+            match self.scan {
+                Scan::Dead => {
+                    self.at = self.buf.len();
+                    break;
+                }
+                Scan::Lead => {
+                    if !ws {
+                        self.scan = if c == b'[' { Scan::Open } else { Scan::Dead };
+                    }
+                }
+                Scan::Open | Scan::Next => {
+                    if !ws {
+                        if c == b']' && self.scan == Scan::Open {
+                            self.scan = Scan::Tail;
+                        } else if c == b'{' && self.yielded < PROPOSALS_MAX {
+                            self.scan = Scan::Elem;
+                            self.start = self.at;
+                            self.depth = 1;
+                            self.in_str = false;
+                            self.esc = false;
+                        } else {
+                            self.scan = Scan::Dead;
+                        }
+                    }
+                }
+                Scan::After => {
+                    if !ws {
+                        self.scan = match c {
+                            b',' => Scan::Next,
+                            b']' => Scan::Tail,
+                            _ => Scan::Dead,
+                        };
+                    }
+                }
+                Scan::Elem => {
+                    if self.in_str {
+                        if self.esc {
+                            self.esc = false;
+                        } else if c == b'\\' {
+                            self.esc = true;
+                        } else if c == b'"' {
+                            self.in_str = false;
+                        }
+                    } else {
+                        match c {
+                            b'"' => self.in_str = true,
+                            b'{' | b'[' => self.depth += 1,
+                            b'}' | b']' => {
+                                self.depth -= 1;
+                                if self.depth == 0 {
+                                    let r = one(&self.buf.as_bytes()[self.start..=self.at], self.yielded);
+                                    match r {
+                                        Ok(p) => {
+                                            out.push(p);
+                                            self.yielded += 1;
+                                            self.scan = Scan::After;
+                                        }
+                                        Err(_) => self.scan = Scan::Dead,
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                Scan::Tail => {
+                    if !ws {
+                        self.scan = Scan::Dead;
+                    }
+                }
+            }
+            self.at += 1;
+        }
+        out
+    }
+
+    /// How many proposals [`Incremental::push`] has yielded.
+    pub fn yielded(&self) -> usize {
+        self.yielded
+    }
+
+    /// The verdict over everything pushed: exactly [`parse`] of the whole text.
+    pub fn finish(&self) -> Result<alloc::vec::Vec<Proposal>, Refusal> {
+        parse(&self.buf)
+    }
 }
