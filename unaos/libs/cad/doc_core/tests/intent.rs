@@ -314,4 +314,3 @@ fn hole_without_a_measured_loop_refused_by_name() {
         assert_eq!(why.text(), "unmatched-loop replayed=2 measured=1");
     }
 }
-
