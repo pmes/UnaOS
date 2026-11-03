@@ -15,7 +15,8 @@
 //! that does, called by the person's accept (and by [`verify_all`], which shows a batch in order, each later proposal
 //! seeing the earlier accepted ones). The proposer's confidence is reported, never a gate.
 //!
-//! doc_core takes no libm: the one square root is geom_core's `Vec2::mag` (the RMS as a hypot accumulation).
+//! The RMS's square root is geom_core's `Vec2::mag` (a hypot accumulation); libm (VUGINTENTSCAN, SR508, as ruled)
+//! gives the shape residual's angles (`atan2`, `atan`) and suggest's rounding (`round`).
 
 use alloc::format;
 use alloc::string::String;
@@ -42,19 +43,23 @@ pub struct Proposal {
     pub why: String,
 }
 
-/// What the geometry is checked against. Scan shapes (SR497) are VUG-INTENT-SCAN's (owed).
+/// What the geometry is checked against.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Measurement {
     /// A CLOSED polyline in the plane of the document's first solved sketch (a photo outline), mm.
     Outline { pts: Vec<Vec2>, sigma_mm: f64 },
     /// Points on the part's surface (a scan), mm, in the document's world frame.
     Points { pts: Vec<Vec3>, sigma_mm: f64 },
+    /// VUGINTENTSCAN (SR508): scan_core's detected shapes (SR497) copied as [`ShapeRef`]s, in the document's world
+    /// frame; an angle counts `sigma_mm` per `sigma_deg` in the residual.
+    Shapes { shapes: Vec<ShapeRef>, sigma_mm: f64, sigma_deg: f64 },
 }
 
 impl Measurement {
     pub fn sigma_mm(&self) -> f64 {
         match self {
             Measurement::Outline { sigma_mm, .. } | Measurement::Points { sigma_mm, .. } => *sigma_mm,
+            Measurement::Shapes { sigma_mm, .. } => *sigma_mm, // VUGINTENTSCAN (SR508)
         }
     }
 
@@ -62,6 +67,7 @@ impl Measurement {
         match self {
             Measurement::Outline { pts, .. } => pts.len(),
             Measurement::Points { pts, .. } => pts.len(),
+            Measurement::Shapes { shapes, .. } => shapes.len(), // VUGINTENTSCAN (SR508)
         }
     }
 
@@ -90,6 +96,8 @@ pub enum Reason {
     Residual { max_mm: f64, limit_mm: f64 },
     /// The RMS grew past the document's own by more than sigma.
     Worse { rms_mm: f64, before_mm: f64, sigma_mm: f64 },
+    /// VUGINTENTSCAN (SR508): measured shape `index` has no replayed face of its kind.
+    UnmatchedShape { index: usize, kind: &'static str },
 }
 
 impl Reason {
@@ -115,6 +123,7 @@ impl Reason {
                 f64_text(*before_mm),
                 f64_text(*sigma_mm)
             ),
+            Reason::UnmatchedShape { index, kind } => format!("unmatched-shape {} #{}", kind, index), // VUGINTENTSCAN
         }
     }
 }
@@ -331,6 +340,10 @@ fn residual(r: &Replay, m: &Measurement, tol: Tol) -> Result<Fit, Reason> {
                 d.push(best);
             }
         }
+        // VUGINTENTSCAN (SR508): each shape against its nearest replayed face of the same kind.
+        Measurement::Shapes { shapes, sigma_mm, sigma_deg } => {
+            shape_residuals(r, shapes, *sigma_mm, *sigma_deg, &mut d)?
+        }
     }
     Ok(fit(&d))
 }
@@ -381,4 +394,196 @@ fn to_arc(q: Vec2, arc: &Arc2, s: Vec2, e: Vec2, tol: Tol) -> f64 {
         !(b.cross(v) > 0.0 && v.cross(a) > 0.0)
     };
     if inside { (v.mag() - arc.radius).abs() } else { q.dist(s).min(q.dist(e)) }
+}
+
+// ---- VUGINTENTSCAN (SR508): the residual against scan shapes and the measurement table ----
+
+/// A detected primitive's parameters: scan_core's `Primitive` fields and conventions, copied (doc_core takes no
+/// scan_core: the caller copies a `Shape` into a [`ShapeRef`]). The plane is `normal . p = d`; a cylinder is a point on
+/// its axis, the axis and the radius; a cone its apex, its axis into the opening and its half-angle (radians); mm.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ShapeParams {
+    Plane { normal: Vec3, d: f64 },
+    Cylinder { point: Vec3, axis: Vec3, radius: f64 },
+    Sphere { centre: Vec3, radius: f64 },
+    Cone { apex: Vec3, axis: Vec3, half_angle: f64 },
+}
+
+impl ShapeParams {
+    /// scan_core's `Primitive::name` spelling.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            ShapeParams::Plane { .. } => "plane",
+            ShapeParams::Cylinder { .. } => "cylinder",
+            ShapeParams::Sphere { .. } => "sphere",
+            ShapeParams::Cone { .. } => "cone",
+        }
+    }
+}
+
+/// One measured shape: its parameters, the points that support it, and its fit rms (mm).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ShapeRef {
+    pub params: ShapeParams,
+    pub support: u32,
+    pub rms_mm: f64,
+}
+
+impl ShapeRef {
+    pub fn kind(&self) -> &'static str {
+        self.params.kind()
+    }
+}
+
+const DEG: f64 = 180.0 / PI;
+
+/// The unsigned angle between two axes (degrees, 0..=90); a zero axis is 90.
+fn axis_deg(a: Vec3, b: Vec3) -> f64 {
+    match (a.normalize(), b.normalize()) {
+        (Ok(a), Ok(b)) => libm::atan2(a.cross(b).mag(), a.dot(b).abs()) * DEG,
+        _ => 90.0,
+    }
+}
+
+/// (distance in mm, angle in degrees) between a measured shape and a face surface of the same kind; None for another
+/// kind (a cone face with no slope is no cone partner).
+fn pair(s: &ShapeParams, f: &brep_core::Surface) -> Option<(f64, f64)> {
+    use brep_core::Surface;
+    match (s, f) {
+        (ShapeParams::Plane { normal, d }, Surface::Plane { f }) => {
+            let m = normal.mag();
+            if !(m > 0.0) {
+                return None;
+            }
+            let n = *normal * (1.0 / m);
+            Some(((n.dot(f.o) - d / m).abs(), axis_deg(n, f.z)))
+        }
+        (ShapeParams::Cylinder { point, axis, radius }, Surface::Cylinder { f, r }) => {
+            let v = *point - f.o;
+            let off = (v - f.z * v.dot(f.z)).mag();
+            Some((off.max((radius - r).abs()), axis_deg(*axis, f.z)))
+        }
+        (ShapeParams::Sphere { centre, radius }, Surface::Sphere { f, r }) => {
+            Some((centre.dist(f.o).max((radius - r).abs()), 0.0))
+        }
+        (ShapeParams::Cone { apex, axis, half_angle }, Surface::Cone { f, r0, k }) => {
+            if !(k.is_finite() && *k != 0.0) {
+                return None;
+            }
+            let fa = f.o - f.z * (r0 / k);
+            let ha = (half_angle - libm::atan(k.abs())).abs() * DEG;
+            Some((apex.dist(fa), axis_deg(*axis, f.z).max(ha)))
+        }
+        _ => None,
+    }
+}
+
+/// Every shape matched to the replayed face of its kind with the smallest `max(dist_mm, ang_deg * sigma_mm /
+/// sigma_deg)`; that value is the shape's residual (so judge's one `K_SIGMA * sigma_mm` limit holds both).
+fn shape_residuals(
+    r: &Replay,
+    shapes: &[ShapeRef],
+    sigma_mm: f64,
+    sigma_deg: f64,
+    d: &mut Vec<f64>,
+) -> Result<(), Reason> {
+    if !(sigma_deg.is_finite() && sigma_deg > 0.0) {
+        return Err(Reason::BadMeasurement);
+    }
+    if r.solids.is_empty() {
+        return Err(Reason::NoGeometry);
+    }
+    let per_deg = sigma_mm / sigma_deg;
+    for (i, s) in shapes.iter().enumerate() {
+        let mut best: Option<f64> = None;
+        for solid in &r.solids {
+            for face in &solid.brep.faces {
+                if let Some((mm, deg)) = pair(&s.params, &face.surface) {
+                    let v = mm.max(deg * per_deg);
+                    best = Some(best.map_or(v, |b: f64| b.min(v)));
+                }
+            }
+        }
+        match best {
+            Some(v) => d.push(v),
+            None => return Err(Reason::UnmatchedShape { index: i, kind: s.kind() }),
+        }
+    }
+    Ok(())
+}
+
+/// `v` to `places` decimals, trailing zeros, a bare point and a negative zero dropped.
+fn num(v: f64, places: usize) -> String {
+    let mut t = format!("{:.*}", places, v);
+    if t.contains('.') {
+        while t.ends_with('0') {
+            t.pop();
+        }
+        if t.ends_with('.') {
+            t.pop();
+        }
+    }
+    if t == "-0" { String::from("0") } else { t }
+}
+
+fn v3(v: Vec3, places: usize) -> String {
+    format!("({},{},{})", num(v.x, places), num(v.y, places), num(v.z, places))
+}
+
+fn v2(v: Vec2) -> String {
+    format!("({},{})", num(v.x, 3), num(v.y, 3))
+}
+
+/// The measurement table vein_core's `Propose.measurements` carries: a header, then one line per shape (or per outline
+/// segment; a point cloud as its extent), mm to 3 places, unit vectors to 4, degrees to 2. Deterministic.
+pub fn measurements_text(m: &Measurement) -> String {
+    let mut out = String::new();
+    match m {
+        Measurement::Outline { pts, sigma_mm } => {
+            out.push_str(&format!("outline: n={} sigma={}\n", pts.len(), num(*sigma_mm, 3)));
+            let n = pts.len();
+            for i in 0..n {
+                let (a, b) = (pts[i], pts[(i + 1) % n]);
+                out.push_str(&format!("edge a={} b={} len={}\n", v2(a), v2(b), num(a.dist(b), 3)));
+            }
+        }
+        Measurement::Points { pts, sigma_mm } => {
+            out.push_str(&format!("points: n={} sigma={}\n", pts.len(), num(*sigma_mm, 3)));
+            if let Some(&f) = pts.first() {
+                let (mut lo, mut hi) = (f, f);
+                for p in pts {
+                    lo = Vec3::new(lo.x.min(p.x), lo.y.min(p.y), lo.z.min(p.z));
+                    hi = Vec3::new(hi.x.max(p.x), hi.y.max(p.y), hi.z.max(p.z));
+                }
+                out.push_str(&format!("extent min={} max={}\n", v3(lo, 3), v3(hi, 3)));
+            }
+        }
+        Measurement::Shapes { shapes, sigma_mm, sigma_deg } => {
+            out.push_str(&format!(
+                "shapes: n={} sigma={} sigma_deg={}\n",
+                shapes.len(),
+                num(*sigma_mm, 3),
+                num(*sigma_deg, 2)
+            ));
+            for s in shapes {
+                let head = match s.params {
+                    ShapeParams::Plane { normal, d } => format!("plane n={} d={}", v3(normal, 4), num(d, 3)),
+                    ShapeParams::Cylinder { point, axis, radius } => {
+                        format!("cylinder axis={} dir={} r={}", v3(point, 3), v3(axis, 4), num(radius, 3))
+                    }
+                    ShapeParams::Sphere { centre, radius } => {
+                        format!("sphere centre={} r={}", v3(centre, 3), num(radius, 3))
+                    }
+                    ShapeParams::Cone { apex, axis, half_angle } => format!(
+                        "cone apex={} dir={} half_angle_deg={}",
+                        v3(apex, 3),
+                        v3(axis, 4),
+                        num(half_angle * DEG, 2)
+                    ),
+                };
+                out.push_str(&format!("{} support={} rms={}\n", head, s.support, num(s.rms_mm, 3)));
+            }
+        }
+    }
+    out
 }

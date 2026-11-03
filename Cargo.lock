@@ -1311,6 +1311,7 @@ name = "doc_core"
 version = "0.1.0"
 dependencies = [
  "brep_core",
+ "libm",
  "make_core",
  "sketch_core",
 ]
