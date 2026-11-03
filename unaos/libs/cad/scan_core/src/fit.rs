@@ -7,7 +7,8 @@
 //! plane across the axis, the radius their mean distance; an inlier lies within the distance band AND its normal
 //! within the angle band). The trial count adapts to the best inlier fraction `w` seen so far,
 //! `T = ln(1 − 0.99) / ln(1 − w^k)` (Hartley & Zisserman, Multiple View Geometry §4.7), under a cap; the sampler is
-//! a fixed-seed splitmix64, so a fit is bit-reproducible.
+//! a fixed-seed splitmix64 (geom_core's `linalg::SplitMix64`, this crate's seeds), so a fit is bit-reproducible; the
+//! eigen-decompositions are geom_core's `linalg::jacobi_sym` (VUG-GEOM-LINALG SR520).
 //!
 //! The consensus set is refined: a plane by total least squares (the centroid and the covariance's smallest
 //! eigenvector); a cylinder's axis as the smallest eigenvector of `Σ n nᵀ` over the inliers' normals (they lie
@@ -73,31 +74,8 @@ pub enum FitError {
     NoConsensus,
 }
 
-/// splitmix64 (Steele, Lea & Flood 2014): the deterministic sampler (also the fixture's noise source).
-pub(crate) struct SplitMix(u64);
-
-impl SplitMix {
-    pub(crate) fn new(seed: u64) -> SplitMix {
-        SplitMix(seed)
-    }
-
-    pub(crate) fn next_u64(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    }
-
-    /// Uniform in [0, 1).
-    pub(crate) fn next_f64(&mut self) -> f64 {
-        (self.next_u64() >> 11) as f64 * (1.0 / (1u64 << 53) as f64)
-    }
-
-    fn below(&mut self, n: usize) -> usize {
-        (self.next_u64() % n as u64) as usize
-    }
-}
+/// splitmix64: geom_core's one (VUG-GEOM-LINALG SR520), the deterministic sampler (also the fixture's noise source).
+pub(crate) use geom_core::linalg::SplitMix64 as SplitMix;
 
 fn trials_for(inliers: usize, n: usize, k: i32) -> u32 {
     let w = inliers as f64 / n as f64;
@@ -112,60 +90,16 @@ fn trials_for(inliers: usize, n: usize, k: i32) -> u32 {
     if t.is_finite() && t < MAX_TRIALS as f64 { (t as u32).max(1) } else { MAX_TRIALS }
 }
 
-/// Eigen-decomposition of a symmetric 3×3 by cyclic Jacobi rotations (Numerical Recipes §11.1): the eigenvalues and
-/// the eigenvectors as COLUMNS of the returned matrix.
-fn eigen_sym3(mut a: [[f64; 3]; 3]) -> ([f64; 3], [[f64; 3]; 3]) {
-    let mut v = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
-    for _ in 0..50 {
-        let off = a[0][1] * a[0][1] + a[0][2] * a[0][2] + a[1][2] * a[1][2];
-        let mut norm = 0.0;
-        for row in &a {
-            for x in row {
-                norm += x * x;
-            }
-        }
-        if off <= norm * (f64::EPSILON * f64::EPSILON) {
-            break;
-        }
-        for (p, q) in [(0usize, 1usize), (0, 2), (1, 2)] {
-            if a[p][q] == 0.0 {
-                continue;
-            }
-            let theta = (a[q][q] - a[p][p]) / (2.0 * a[p][q]);
-            let sign = if theta >= 0.0 { 1.0 } else { -1.0 };
-            let t = sign / (theta.abs() + libm::sqrt(theta * theta + 1.0));
-            let c = 1.0 / libm::sqrt(t * t + 1.0);
-            let s = t * c;
-            for k in 0..3 {
-                let (akp, akq) = (a[k][p], a[k][q]);
-                a[k][p] = c * akp - s * akq;
-                a[k][q] = s * akp + c * akq;
-            }
-            for k in 0..3 {
-                let (apk, aqk) = (a[p][k], a[q][k]);
-                a[p][k] = c * apk - s * aqk;
-                a[q][k] = s * apk + c * aqk;
-            }
-            for row in v.iter_mut() {
-                let (vkp, vkq) = (row[p], row[q]);
-                row[p] = c * vkp - s * vkq;
-                row[q] = s * vkp + c * vkq;
-            }
-        }
-    }
-    ([a[0][0], a[1][1], a[2][2]], v)
+/// A symmetric 3×3 row-major, as geom_core's `linalg::jacobi_sym` reads it.
+fn flat(m: [[f64; 3]; 3]) -> [f64; 9] {
+    [m[0][0], m[0][1], m[0][2], m[1][0], m[1][1], m[1][2], m[2][0], m[2][1], m[2][2]]
 }
 
 /// The unit eigenvector of the smallest eigenvalue.
 fn smallest_eigvec(m: [[f64; 3]; 3]) -> Vec3 {
-    let (w, v) = eigen_sym3(m);
-    let mut k = 0;
-    for i in 1..3 {
-        if w[i] < w[k] {
-            k = i;
-        }
-    }
-    Vec3::new(v[0][k], v[1][k], v[2][k]).normalize().unwrap_or(Vec3::ZERO)
+    // Ascending eigenpairs: column 0 is the smallest (the first strict minimum).
+    let (_, v) = geom_core::linalg::jacobi_sym(&flat(m), 3);
+    Vec3::new(v[0], v[3], v[6]).normalize().unwrap_or(Vec3::ZERO)
 }
 
 /// Sign convention for a direction: its largest-magnitude component is positive (a deterministic orientation).
@@ -813,8 +747,7 @@ fn largest_component(points: &[Vec3], idx: &[usize], grid: &Grid) -> Vec<usize> 
 
 /// How far the normals turn: sqrt(λ_mid / Σλ) of their outer-product sum (0 for one direction).
 fn turns(m: [[f64; 3]; 3]) -> f64 {
-    let (mut w, _) = eigen_sym3(m);
-    w.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(core::cmp::Ordering::Equal));
+    let (w, _) = geom_core::linalg::jacobi_sym(&flat(m), 3); // ascending
     let sum = w[0] + w[1] + w[2];
     if !(sum > 0.0) {
         return 0.0;

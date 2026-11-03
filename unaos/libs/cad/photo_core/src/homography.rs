@@ -5,12 +5,12 @@
 //! (row-major). The normalised DLT (Hartley, "In defense of the eight-point algorithm", IEEE PAMI 1997; Hartley &
 //! Zisserman, Multiple View Geometry 2nd ed., Alg 4.2): each point set translated to its centroid and scaled to a
 //! mean distance of √2, two rows of A per correspondence (H&Z eq 4.3), H's nine entries the eigenvector of AᵀA with
-//! the smallest eigenvalue (cyclic Jacobi, Numerical Recipes §11.1 — scan_core's `eigen_sym3` is its n = 3 case and
-//! is private to scan_core; VUG-GEOM-LINALG owes the one shared copy). RANSAC (Fischler & Bolles, CACM 1981; H&Z
+//! the smallest eigenvalue (geom_core's `linalg::jacobi_sym`, cyclic Jacobi, Numerical Recipes §11.1; VUG-GEOM-LINALG
+//! SR520: the one copy scan_core shares). RANSAC (Fischler & Bolles, CACM 1981; H&Z
 //! Alg 4.6) over 4-intersection minimal sets: a set with three points collinear IN PAPER coordinates is skipped by
 //! geom_core's exact `orient2d` (lattice points are exactly collinear, and the predicate says so exactly); inliers
-//! within [`BAND_PX`]; the adaptive count `T = ln(1 − 0.99) / ln(1 − w⁴)` under a cap; a fixed-seed splitmix64 (the
-//! scan_core fit.rs pattern, mirrored), so a measurement is bit-reproducible; the consensus refit twice.
+//! within [`BAND_PX`]; the adaptive count `T = ln(1 − 0.99) / ln(1 − w⁴)` under a cap; a fixed-seed splitmix64
+//! (geom_core's `linalg::SplitMix64`, this crate's seed), so a measurement is bit-reproducible; the consensus refit twice.
 //!
 //! The paper frame is y-up as seen from above, so paper → photo (y down) must reverse orientation: when the
 //! lattice's local Jacobian has a positive determinant the j axis is negated (H ← H · diag(1, −1, 1)). The tilt
@@ -37,32 +37,8 @@ pub const CONFIDENCE: f64 = 0.99;
 pub const MAX_TRIALS: u32 = 2000;
 const SEED: u64 = 0x9A9E_4D06_0503_0001;
 
-/// splitmix64 (Steele, Lea & Flood 2014): the deterministic sampler and the fixture's noise source (scan_core
-/// fit.rs's is crate-private; VUG-GEOM-LINALG owes the one copy).
-pub(crate) struct SplitMix(u64);
-
-impl SplitMix {
-    pub(crate) fn new(seed: u64) -> SplitMix {
-        SplitMix(seed)
-    }
-
-    pub(crate) fn next_u64(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    }
-
-    /// Uniform in [0, 1).
-    pub(crate) fn next_f64(&mut self) -> f64 {
-        (self.next_u64() >> 11) as f64 * (1.0 / (1u64 << 53) as f64)
-    }
-
-    fn below(&mut self, n: usize) -> usize {
-        (self.next_u64() % n as u64) as usize
-    }
-}
+/// splitmix64: geom_core's one (VUG-GEOM-LINALG SR520), the deterministic sampler and the fixture's noise source.
+pub(crate) use geom_core::linalg::SplitMix64 as SplitMix;
 
 fn trials_for(inliers: usize, n: usize) -> u32 {
     let w = inliers as f64 / n as f64;
@@ -136,63 +112,6 @@ pub fn tilt_deg(j: &[[f64; 2]; 2]) -> f64 {
     libm::acos(ratio) * 180.0 / core::f64::consts::PI
 }
 
-/// Eigen-decomposition of a symmetric n x n (row-major `a`, destroyed) by cyclic Jacobi rotations: the eigenvalues
-/// and the eigenvectors as the COLUMNS of the returned row-major matrix.
-pub fn eigen_sym(a: &mut [f64], n: usize) -> (Vec<f64>, Vec<f64>) {
-    let mut v: Vec<f64> = (0..n * n).map(|k| if k / n == k % n { 1.0 } else { 0.0 }).collect();
-    for _ in 0..100 {
-        let mut off = 0.0;
-        let mut norm = 0.0;
-        for p in 0..n {
-            for q in 0..n {
-                let x = a[p * n + q];
-                norm += x * x;
-                if p < q {
-                    off += x * x;
-                }
-            }
-        }
-        if !(off > norm * (f64::EPSILON * f64::EPSILON)) {
-            break;
-        }
-        for p in 0..n {
-            for q in p + 1..n {
-                let apq = a[p * n + q];
-                if apq == 0.0 {
-                    continue;
-                }
-                let theta = (a[q * n + q] - a[p * n + p]) / (2.0 * apq);
-                let t = if theta >= 0.0 {
-                    1.0 / (theta + libm::sqrt(theta * theta + 1.0))
-                } else {
-                    -1.0 / (-theta + libm::sqrt(theta * theta + 1.0))
-                };
-                let c = 1.0 / libm::sqrt(t * t + 1.0);
-                let s = t * c;
-                for k in 0..n {
-                    let akp = a[k * n + p];
-                    let akq = a[k * n + q];
-                    a[k * n + p] = c * akp - s * akq;
-                    a[k * n + q] = s * akp + c * akq;
-                }
-                for k in 0..n {
-                    let apk = a[p * n + k];
-                    let aqk = a[q * n + k];
-                    a[p * n + k] = c * apk - s * aqk;
-                    a[q * n + k] = s * apk + c * aqk;
-                }
-                for k in 0..n {
-                    let vkp = v[k * n + p];
-                    let vkq = v[k * n + q];
-                    v[k * n + p] = c * vkp - s * vkq;
-                    v[k * n + q] = s * vkp + c * vkq;
-                }
-            }
-        }
-    }
-    ((0..n).map(|i| a[i * n + i]).collect(), v)
-}
-
 /// Hartley's normalisation: the similarity taking `pts` to centroid 0 and mean distance √2, and the moved points.
 fn normalise(pts: &[Vec2]) -> Result<(H, Vec<Vec2>), Degenerate> {
     let n = pts.len() as f64;
@@ -227,16 +146,11 @@ pub fn dlt(paper: &[Vec2], px: &[Vec2]) -> Result<H, Degenerate> {
             }
         }
     }
-    let (vals, vecs) = eigen_sym(&mut ata, 9);
-    let mut k = 0;
-    for i in 1..9 {
-        if vals[i] < vals[k] {
-            k = i;
-        }
-    }
+    // Ascending eigenpairs: column 0 is the smallest (the first strict minimum).
+    let (_, vecs) = geom_core::linalg::jacobi_sym(&ata, 9);
     let mut hn = [[0.0; 3]; 3];
     for i in 0..9 {
-        hn[i / 3][i % 3] = vecs[i * 9 + k];
+        hn[i / 3][i % 3] = vecs[i * 9];
     }
     let mut h = mul(&mul(&invert(&tx)?, &hn), &tp);
     let s = if h[2][2].abs() > 1e-12 {
