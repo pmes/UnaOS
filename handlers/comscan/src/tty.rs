@@ -32,9 +32,9 @@ use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use make_core::gcode::{Dialect, Realtime};
+use make_core::gcode::Dialect;
 use pump_core::{LinkError, Transport};
 
 #[cfg(target_os = "linux")]
@@ -206,66 +206,14 @@ impl Port {
         &self.path
     }
 
-    /// Wait for the controller's banner before any pump sees the port: `Grbl ` (grbl) or `start` (Marlin). A silent
-    /// grbl is sent make_core's soft reset once (position-safe at idle) and waited for again, then `NoBanner`; a
-    /// silent Marlin proceeds (`Ok(None)`: native USB does not reset on open); LinuxCNC is not streamed (`Ok(None)`).
+    /// Wait for the controller's banner before any pump sees the port: `crate::pump::ready` (the transport-neutral
+    /// wait, lifted from here by SR487) with its outcome named for this path.
     pub fn ready(&mut self, dialect: Dialect, wait: Duration) -> Result<Option<String>, Refusal> {
-        let key = match dialect {
-            Dialect::Grbl { .. } => "Grbl ",
-            Dialect::Marlin => "start",
-            Dialect::LinuxCnc => return Ok(None),
-        };
-        if let Some(b) = self.banner(key, wait)? {
-            return Ok(Some(b));
-        }
-        if let Dialect::Grbl { .. } = dialect {
-            let reset = [Realtime::SoftReset.byte()];
-            let end = Instant::now() + wait;
-            loop {
-                match Transport::write(self, &reset) {
-                    Ok(1) => break,
-                    Ok(_) if Instant::now() < end => std::thread::sleep(Duration::from_millis(10)),
-                    Ok(_) => return Err(Refusal::Io { path: self.path.clone(), errno: libc::EAGAIN }),
-                    Err(_) => return Err(Refusal::Disconnected { path: self.path.clone() }),
-                }
-            }
-            if let Some(b) = self.banner(key, wait)? {
-                return Ok(Some(b));
-            }
-            return Err(Refusal::NoBanner { path: self.path.clone(), waited_ms: 2 * wait.as_millis() as u64 });
-        }
-        Ok(None)
-    }
-
-    /// Read lines until one starts with `key` (`Some`) or `wait` passes (`None`).
-    fn banner(&mut self, key: &str, wait: Duration) -> Result<Option<String>, Refusal> {
-        let end = Instant::now() + wait;
-        let mut line: Vec<u8> = Vec::new();
-        let mut buf = [0u8; 64];
-        loop {
-            match Transport::read(self, &mut buf) {
-                Ok(0) => {
-                    if Instant::now() >= end {
-                        return Ok(None);
-                    }
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                Ok(n) => {
-                    for &b in &buf[..n] {
-                        if b == b'\n' {
-                            let s = String::from_utf8_lossy(&line).trim().to_string();
-                            line.clear();
-                            if s.starts_with(key) {
-                                return Ok(Some(s));
-                            }
-                        } else {
-                            line.push(b);
-                        }
-                    }
-                }
-                Err(_) => return Err(Refusal::Disconnected { path: self.path.clone() }),
-            }
-        }
+        crate::pump::ready(self, dialect, wait).map_err(|u| match u {
+            crate::pump::Unready::NoBanner { waited_ms } => Refusal::NoBanner { path: self.path.clone(), waited_ms },
+            crate::pump::Unready::Stalled => Refusal::Io { path: self.path.clone(), errno: libc::EAGAIN },
+            crate::pump::Unready::Closed => Refusal::Disconnected { path: self.path.clone() },
+        })
     }
 }
 

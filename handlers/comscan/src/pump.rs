@@ -13,8 +13,8 @@
 //!   PROCESS through [`start`], and the bus verb `PumpStart` names an armed program by its digest
 //!   (`make_core::Program::digest`, 16 hex digits). An unarmed digest, a dialect other than the armed one, a busy
 //!   desk or a port the opener cannot open is answered `PumpRefused` by name.
-//! - The link is the host's: the caller supplies the opener (port name -> [`Transport`]). The tree has no serial
-//!   path yet (VUG-COMSCAN-TTY owed: termios on macOS / Linux); tests open a `pump_core::mock::MockGrbl`.
+//! - The link is the host's: the caller supplies the opener (port name -> [`Transport`]): `crate::tty` (termios,
+//!   SR484) and `crate::tcp` (SR487), routed by [`by_scheme`]; tests open a `pump_core::mock::MockGrbl`.
 //! - [`PumpDesk`] is the pure synchronous core (the [`crate::LogView`] shape); [`serve_pump`] is the only bus code.
 //!   The desk sits behind a `std::sync::Mutex` that the caller's arming code and [`serve_pump`] share; the lock is
 //!   taken only inside the synchronous calls and never held across an await.
@@ -344,6 +344,93 @@ pub async fn serve_pump(
                     synapse.fire(SMessage::Pump(o));
                 }
             }
+        }
+    }
+}
+
+// --- VUGCOMSCANTCP (LEDGER SR487): the port string by scheme and the transport-neutral banner wait (named tail hunk) ---
+
+/// The scheme that names a network link on the bus: `tcp://host:port` (grblHAL / FluidNC telnet-style raw TCP).
+pub const TCP_SCHEME: &str = "tcp://";
+
+/// The one opener [`serve_pump`] takes, routed by the port string: a name starting [`TCP_SCHEME`] goes to `net` whole
+/// (`crate::tcp::opener`), any other name (a `/dev` path) to `serial` (`crate::tty::opener`).
+pub fn by_scheme(mut serial: Box<Opener>, mut net: Box<Opener>) -> Box<Opener> {
+    Box::new(move |port: &str| -> Result<Box<dyn Transport + Send>, String> {
+        if port.starts_with(TCP_SCHEME) { net(port) } else { serial(port) }
+    })
+}
+
+/// Why a link did not come ready; each transport names its link in its own refusal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Unready {
+    /// grbl said no banner, even after a soft reset (`waited_ms` over both waits).
+    NoBanner { waited_ms: u64 },
+    /// The link would not take the one soft-reset byte within the wait.
+    Stalled,
+    /// The link went away while waiting.
+    Closed,
+}
+
+/// Wait for the controller's banner before any pump sees the link: `Grbl ` (grbl) or `start` (Marlin). A silent grbl
+/// is sent make_core's soft reset once (position-safe at idle) and waited for again, then `NoBanner`; a silent Marlin
+/// proceeds (`Ok(None)`: native USB does not reset on open); LinuxCNC is not streamed (`Ok(None)`). Lifted from tty.rs
+/// `Port::ready` / `banner` (SR484) so every transport shares it.
+pub fn ready(link: &mut dyn Transport, dialect: Dialect, wait: Duration) -> Result<Option<String>, Unready> {
+    let key = match dialect {
+        Dialect::Grbl { .. } => "Grbl ",
+        Dialect::Marlin => "start",
+        Dialect::LinuxCnc => return Ok(None),
+    };
+    if let Some(b) = banner(link, key, wait)? {
+        return Ok(Some(b));
+    }
+    if let Dialect::Grbl { .. } = dialect {
+        let reset = [make_core::gcode::Realtime::SoftReset.byte()];
+        let end = std::time::Instant::now() + wait;
+        loop {
+            match link.write(&reset) {
+                Ok(1) => break,
+                Ok(_) if std::time::Instant::now() < end => std::thread::sleep(Duration::from_millis(10)),
+                Ok(_) => return Err(Unready::Stalled),
+                Err(_) => return Err(Unready::Closed),
+            }
+        }
+        if let Some(b) = banner(link, key, wait)? {
+            return Ok(Some(b));
+        }
+        return Err(Unready::NoBanner { waited_ms: 2 * wait.as_millis() as u64 });
+    }
+    Ok(None)
+}
+
+/// Read lines until one starts with `key` (`Some`) or `wait` passes (`None`).
+fn banner(link: &mut dyn Transport, key: &str, wait: Duration) -> Result<Option<String>, Unready> {
+    let end = std::time::Instant::now() + wait;
+    let mut line: Vec<u8> = Vec::new();
+    let mut buf = [0u8; 64];
+    loop {
+        match link.read(&mut buf) {
+            Ok(0) => {
+                if std::time::Instant::now() >= end {
+                    return Ok(None);
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Ok(n) => {
+                for &b in &buf[..n] {
+                    if b == b'\n' {
+                        let s = String::from_utf8_lossy(&line).trim().to_string();
+                        line.clear();
+                        if s.starts_with(key) {
+                            return Ok(Some(s));
+                        }
+                    } else {
+                        line.push(b);
+                    }
+                }
+            }
+            Err(_) => return Err(Unready::Closed),
         }
     }
 }
