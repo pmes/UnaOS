@@ -1485,3 +1485,15 @@ exec-rmbp-f39appsfolderns 85c317a05 wave36 cut63 FOLDED (kernel batch cut63 kern
 exec-rmbp-f39armlateknoboff 85c317a05 wave36 cut63 FOLDED (kernel batch cut63 kernel batch B1181-B1186)
 exec-rmbp-f39unsetpostrule 85c317a05 wave36 cut63 FOLDED (kernel batch cut63 kernel batch B1181-B1186)
 exec-rmbp-f39prefsunsetrelay 85c317a05 wave36 cut63 FOLDED (kernel batch cut63 kernel batch B1181-B1186)
+exec-rmbp-f39queuedsetstucklive 7cd0a22c4 wave36 cut64
+exec-rmbp-f39armlateadopt 7cd0a22c4 wave36 cut64
+exec-rmbp-f39unsetwords 7cd0a22c4 wave36 cut64
+exec-rmbp-f39settingsresetfollow 7cd0a22c4 wave36 cut64
+exec-rmbp-f39settingsresetbutton 7cd0a22c4 wave36 cut64
+exec-rmbp-f39armlatesecondtenant 7cd0a22c4 wave36 cut64
+exec-rmbp-vugcomscanenvelopeunlinked 7cd0a22c4 wave36 cut62h
+exec-rmbp-vugcomscandeclareconsole 7cd0a22c4 wave36 cut62h
+exec-rmbp-vugcomscanmarlinautoreport 7cd0a22c4 wave36 cut62h
+exec-rmbp-vugscandeviationcoarseview 7cd0a22c4 wave36 cut62h
+exec-rmbp-vugscandeviationcoarsetoolreport 7cd0a22c4 wave36 cut62h
+exec-rmbp-vugcomscanprefsuna 7cd0a22c4 wave36 cut62h
