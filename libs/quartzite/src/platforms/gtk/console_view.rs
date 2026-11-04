@@ -90,6 +90,7 @@ pub fn bootstrap_console_held(console: &ConsoleTetra, synapse: Synapse) -> (Nati
 
     container.append(&header);
     container.append(&scroller);
+    let pad = jog_pad(&container, synapse.clone()); // VUGCOMSCANJOGFACEGTK (SR616): the jog pad under the scrollback, painted from widgets::jog_rows
 
     // Follow the live feed. `comscan` folds every `SMessage::Log` into its
     // bounded scrollback and publishes `SMessage::Logs(LogTail)`; we re-render
@@ -99,6 +100,7 @@ pub fn bootstrap_console_held(console: &ConsoleTetra, synapse: Synapse) -> (Nati
     let mut rx = synapse.subscribe();
     let task = gtk4::glib::spawn_future_local(async move {
         while let Ok(msg) = rx.recv().await {
+            pad.hear(&msg); // VUGCOMSCANJOGFACEGTK (SR616): the pad rides this one subscriber, so the evaluator's abort (SR441) ends both
             if let SMessage::Logs(LogEvent::LogTail { lines, dropped, paused }) = msg {
                 let rendered = rows_from_tail(&lines);
                 buffer_live.set_text(&render_body(&rendered));
@@ -145,4 +147,121 @@ pub fn install_console_summon(window: &crate::NativeWindow, synapse: Synapse) {
         gtk4::glib::Propagation::Proceed
     });
     window.add_controller(controller);
+}
+
+// --- VUGCOMSCANJOGFACEGTK (LEDGER SR616): the Console's jog pad, painted from widgets::jog_rows (named tail hunk) ---
+
+/// The jog pad under the Console's scrollback: comscan's `PumpCard` (the pad's state, folded from the bus) and the widgets
+/// painting `widgets::jog_rows` over its snapshot. A key fires the card's own request on the bus; the desk refuses by name
+/// what it cannot do, so the pad only greys (and says why) while no link is up.
+struct JogPad {
+    card: std::rc::Rc<std::cell::RefCell<comscan::PumpCard>>,
+    link: Label,
+    travel: Label,
+    position: Label,
+    squawk: Label,
+    why: Label,
+    steps: Vec<gtk4::ToggleButton>,
+    keys: Vec<gtk4::Button>,
+}
+
+fn pad_label() -> Label {
+    Label::builder().xalign(0.0).wrap(true).build()
+}
+
+/// Build the jog pad, append it to `container` and paint its first rows. Keys fire on `synapse` as the local user.
+fn jog_pad(container: &Box, synapse: Synapse) -> JogPad {
+    use crate::widgets::jog_rows::{key_verb, KEYS, STEPS_MM};
+    let who = bandy::Origin::LocalUser(std::env::var("USER").unwrap_or_else(|_| "una".into()));
+    let card = std::rc::Rc::new(std::cell::RefCell::new(comscan::PumpCard::new(who)));
+
+    let pad = Box::new(Orientation::Vertical, 4);
+    pad.set_margin_start(8);
+    pad.set_margin_end(8);
+    pad.set_margin_top(4);
+    pad.set_margin_bottom(8);
+    let (link, travel, position, squawk, why) = (pad_label(), pad_label(), pad_label(), pad_label(), pad_label());
+    why.add_css_class("dim-label");
+
+    let step_row = Box::new(Orientation::Horizontal, 4);
+    step_row.append(&Label::new(Some("step")));
+    let mut steps: Vec<gtk4::ToggleButton> = Vec::with_capacity(STEPS_MM.len());
+    for mm in STEPS_MM {
+        let b = gtk4::ToggleButton::with_label(&format!("{mm} mm"));
+        if let Some(first) = steps.first() {
+            b.set_group(Some(first));
+        }
+        b.set_active(mm == card.borrow().step());
+        let c = card.clone();
+        b.connect_toggled(move |b| {
+            if b.is_active() {
+                c.borrow_mut().set_step(mm);
+            }
+        });
+        step_row.append(&b);
+        steps.push(b);
+    }
+
+    let key_row = Box::new(Orientation::Horizontal, 4);
+    let mut keys: Vec<gtk4::Button> = Vec::with_capacity(KEYS.len());
+    for (k, label) in KEYS {
+        let b = gtk4::Button::with_label(label);
+        let (c, syn) = (card.clone(), synapse.clone());
+        b.connect_clicked(move |_| syn.fire(key_verb(&c.borrow(), k)));
+        key_row.append(&b);
+        keys.push(b);
+    }
+
+    pad.append(&link);
+    pad.append(&travel);
+    pad.append(&position);
+    pad.append(&squawk);
+    pad.append(&step_row);
+    pad.append(&key_row);
+    pad.append(&why);
+    container.append(&pad);
+
+    let p = JogPad { card, link, travel, position, squawk, why, steps, keys };
+    p.render();
+    p
+}
+
+impl JogPad {
+    /// Fold a bus message into the card (pump answers only) and repaint.
+    fn hear(&self, msg: &SMessage) {
+        if let SMessage::Pump(ev) = msg {
+            self.card.borrow_mut().hear(ev);
+            self.render();
+        }
+    }
+
+    /// Paint `jog_rows` over the card's snapshot: the optional rows shown only when present, the picker and keys greyed
+    /// while no link is up. The pump's words are sanitized like every Console line.
+    fn render(&self) {
+        use crate::widgets::jog_rows::{jog_rows, JogRow};
+        let rows = jog_rows(&self.card.borrow().snapshot());
+        self.position.set_visible(false);
+        self.squawk.set_visible(false);
+        self.why.set_visible(false);
+        for row in rows {
+            match row {
+                JogRow::Link(t) => self.link.set_label(&t),
+                JogRow::Travel(t) => self.travel.set_label(&t),
+                JogRow::Position(t) => {
+                    self.position.set_label(&t);
+                    self.position.set_visible(true);
+                }
+                JogRow::Squawk(t) => {
+                    self.squawk.set_label(&crate::tetra::sanitize_line(&t));
+                    self.squawk.set_visible(true);
+                }
+                JogRow::Why(t) => {
+                    self.why.set_label(&t);
+                    self.why.set_visible(true);
+                }
+                JogRow::Steps { enabled, .. } => self.steps.iter().for_each(|b| b.set_sensitive(enabled)),
+                JogRow::Pad { enabled, .. } => self.keys.iter().for_each(|b| b.set_sensitive(enabled)),
+            }
+        }
+    }
 }

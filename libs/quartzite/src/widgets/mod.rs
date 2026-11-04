@@ -33,3 +33,4 @@ pub mod chrome_rows;
 pub mod console_rows;
 pub mod devtools_rows;
 pub mod a11y_rows;
+pub mod jog_rows; // VUGCOMSCANJOGFACEGTK (SR616): the Console jog pad's rows from comscan's PumpCard (every target; host-tested; the GTK face reads them)

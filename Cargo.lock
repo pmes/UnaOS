@@ -3931,6 +3931,7 @@ dependencies = [
  "bandy",
  "block2",
  "chrono",
+ "comscan",
  "cxx",
  "cxx-qt",
  "cxx-qt-build",
