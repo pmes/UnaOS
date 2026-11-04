@@ -183,3 +183,55 @@ fn verdicts_pass_fail_and_refuse_a_kind_the_surface_does_not_take() {
         assert_eq!(Kind::parse(k.name()), Some(k));
     }
 }
+
+// ---- VUGSCANGDTDATUMS (LEDGER SR552): the datum frame A|B|C from the box faces, the post's position read in it ----
+
+use scan_core::gdt::{DatumError, frame_of, position_in};
+
+/// The first design face whose nominal is a plane with this outward normal.
+fn plane_face(d: &Design, normal: Vec3) -> u32 {
+    (0..d.faces)
+        .find(|&f| matches!(nominal(d, f, Tol::DEFAULT), Nominal::Plane(p) if p.normal.dot(normal) > 0.99))
+        .unwrap_or_else(|| panic!("no plane face along {normal:?}"))
+}
+
+/// A = the box top (+z), B = the box's -x side, C = its -y side: the frame from the scan's datum faces, the post's
+/// position against its nominal read in it, and against the nominal shifted 1 mm along the frame's x.
+#[test]
+fn the_post_position_reads_in_the_box_datum_frame() {
+    let (d, names, dev) = measured();
+    let datums = [plane_face(d, Vec3::Z), plane_face(d, -Vec3::X), plane_face(d, -Vec3::Y)];
+    let fr = frame_of(scan(), d, dev, datums, fused().1, Tol::DEFAULT).expect("the box datums fix a frame");
+    let p = post(&faces());
+    let Nominal::Cylinder(nc) = p.nominal else { panic!("post nominal {:?}", p.nominal) };
+    let axis = p.axis.expect("post axis fitted");
+    let at = position_in(&fr, &axis, &nc, p.extent);
+    let x = fr.nominal.apply_vector(Vec3::X);
+    let off = position_in(&fr, &axis, &scan_core::Cylinder { point: nc.point + x, ..nc }, p.extent);
+    println!(
+        "gdt: frame A={} B={} C={} residual={:.3} position best_fit={:?} datum={at:.4} shifted_1mm={off:.4}",
+        names[datums[0] as usize],
+        names[datums[1] as usize],
+        names[datums[2] as usize],
+        fr.residual_mm,
+        p.position_mm
+    );
+    assert!(fr.residual_mm.is_finite(), "residual {}", fr.residual_mm);
+    assert!(at < 0.3, "post position in the datum frame {at}");
+    assert!((off - 2.0).abs() <= 0.2, "post position against the nominal shifted 1 mm along the frame's x {off}");
+}
+
+/// A datum face past the design, a surface that cannot stand as the primary, and an unseen face each refuse by label.
+#[test]
+fn a_missing_or_unseen_datum_face_refuses_by_name() {
+    let (d, _, dev) = measured();
+    let (top, mx, my, bottom) = (plane_face(d, Vec3::Z), plane_face(d, -Vec3::X), plane_face(d, -Vec3::Y), plane_face(d, -Vec3::Z));
+    let side = post(&faces()).face;
+    let at = |datums: [u32; 3]| frame_of(scan(), d, dev, datums, fused().1, Tol::DEFAULT);
+    assert_eq!(at([top, d.faces + 3, my]), Err(DatumError::NoFace { label: 'B', face: d.faces + 3 }));
+    assert_eq!(at([side, mx, my]), Err(DatumError::DatumSurface { label: 'A', face: side, surface: "cylinder" }));
+    let unseen = at([bottom, mx, my]);
+    println!("gdt: the box bottom as A -> {unseen:?}");
+    assert!(matches!(unseen, Err(DatumError::DatumFit { label: 'A', face, .. }) if face == bottom), "{unseen:?}");
+    assert_eq!(at([top, mx, my]).err().map(|e| e.label()), None);
+}
