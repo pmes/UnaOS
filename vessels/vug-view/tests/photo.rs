@@ -1020,3 +1020,53 @@ fn a_camera_flag_line_sets_the_side_and_clear_returns_it_to_the_lattice() {
     assert_eq!(prefs, photo::PhotoPrefs::default());
     assert_eq!(ph(&vw).prefs, prefs);
 }
+
+// ---- VUGFACEPHOTOPREFLINE (SR595): the typed `:` line on the photo's command road ----
+
+/// Type `text` into the open `:` line one key at a time.
+fn typed(vw: &mut Viewer, text: &str) {
+    for c in text.chars() {
+        key(vw, &c.to_string());
+    }
+}
+
+/// VUGFACEPHOTOPREFLINE (SR595): over a photo with no map `:` opens (the photo's sketch face no longer shuts it);
+/// `:camera x` Return refuses PREF_USAGE and the line stays open; `:camera 400` Return runs photo::command_in in the
+/// line's store folder: the line closes as the last, the corner reads `pref camera=400 mm stored`, the open photo and
+/// Principia's store hold 400; `:camera clear` Return unsets it from both (corner `pref camera cleared`).
+#[test]
+fn a_typed_camera_line_sets_the_pref_and_the_corner_reads_it() {
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("vug-photo-line-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut vw = opened();
+    vw.view.entry.store = Some(dir.clone());
+    assert!(vw.view.deviation.is_none() && vw.view.design.face.is_some(), "a photo with its sketch face, no map");
+    assert!(key(&mut vw, ":"), "`:` opens over a photo");
+    assert!(vw.view.entry.open);
+    typed(&mut vw, "camera x");
+    assert!(key(&mut vw, "Return"));
+    assert_eq!(vw.view.entry.refused.as_deref(), Some(photo::PREF_USAGE));
+    assert!(vw.view.entry.open, "a refused line stays open");
+    assert_eq!(photo::PhotoPrefs::load_from(&dir).camera_mm, None, "nothing stored");
+
+    assert!(key(&mut vw, "Escape"));
+    assert!(key(&mut vw, ":"));
+    typed(&mut vw, "camera 400");
+    assert!(key(&mut vw, "Return"));
+    assert!(!vw.view.entry.open, "a run line closes");
+    assert_eq!(vw.view.entry.last.as_deref(), Some("camera 400"));
+    let corner = ph(&vw).note.clone().unwrap_or_default();
+    eprintln!("photo: pref-line {corner}");
+    assert_eq!(corner, "pref camera=400 mm stored");
+    assert_eq!(ph(&vw).prefs.camera_mm, Some(400.0));
+    assert_eq!(photo::PhotoPrefs::load_from(&dir).camera_mm, Some(400.0));
+
+    assert!(key(&mut vw, ":"));
+    typed(&mut vw, "camera clear");
+    assert!(key(&mut vw, "Return"));
+    assert_eq!(ph(&vw).note.as_deref(), Some("pref camera cleared"));
+    assert_eq!(ph(&vw).prefs.camera_mm, None);
+    let prefs = photo::PhotoPrefs::load_from(&dir);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(prefs.camera_mm, None);
+}

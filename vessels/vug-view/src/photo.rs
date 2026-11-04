@@ -1523,3 +1523,34 @@ fn clear_in(view: &mut View, dir: &std::path::Path, words: &[&str]) -> Option<Re
     }
     Some(Ok(gone))
 }
+
+// ---- VUGFACEPHOTOPREFLINE (SR595): the typed `:` line on the photo's command road (named tail block) ----
+// VUGPHOTOPREFFACEWIRE (SR588) reached `command` from the flags only: the `:` line (deviation.rs `Viewer::line_key`) ran
+// `map_command` and its gate shut over a photo (a photo opens as its sketch face). The line's Enter now asks
+// [`line_command`] first and its gate takes [`line_free`]; the line's text is handed to [`command_in`] verbatim (no
+// second parser). With a photo and a map both open (`against_journal` over a photo) a photo verb is the photo's.
+
+/// The photo's verbs on the `:` line: [`command_in`]'s first words.
+const LINE_VERBS: [&str; 2] = ["camera", "pp"];
+
+/// `:` opens over a photo (deviation.rs `Viewer::line_key`'s gate, beside the map's): a photo is open and no pull or
+/// dimension edit ([`key`]'s gate), journal gesture or edit, or edge tool (the map's gate) holds the keys.
+pub fn line_free(view: &View) -> bool {
+    view.photo.is_some() && view.design.pull.is_none() && !view.design.face.as_ref().is_some_and(|f| f.edit.is_some()) && !crate::journal::busy(&view.design) && view.fillet.is_none()
+}
+
+/// The `:` line's Enter on the photo's road: None (the map's road, `Viewer::map_command`) with no photo open, or with a
+/// map up and a line whose first word is not a photo verb ([`LINE_VERBS`]); otherwise [`command_in`] in
+/// `view.entry.store`'s folder, or [`command`] (Principia's standard store) when it is None. With a photo and no map
+/// every line is the photo's, so a stray line refuses [`PREF_USAGE`] by name.
+pub fn line_command(view: &mut View, line: &str) -> Option<Result<bool, String>> {
+    view.photo.as_ref()?;
+    let verb = line.split_whitespace().next().is_some_and(|w| LINE_VERBS.contains(&w));
+    if view.deviation.is_some() && !verb {
+        return None;
+    }
+    Some(match view.entry.store.clone() {
+        Some(dir) => command_in(view, &dir, line),
+        None => command(view, line),
+    })
+}
