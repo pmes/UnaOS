@@ -516,7 +516,7 @@ fn run(a: &Args) -> Result<String, Refusal> {
     let fused = scan_core::fuse::fuse(&shots, road, a.voxel, trunc, knobs_of(&a)).map_err(|e| fuse_refusal(e, frames.len()))?;
     let t = fused.tsdf;
     let track = fused.track.as_ref().map(|log| track_report(log, frames.len()));
-    let sm = extract(&t).map_err(Refusal::Extract)?;
+    let sm = ScanMesh { camera: scan_core::fuse::camera(fused.track.as_ref(), road), ..extract(&t).map_err(Refusal::Extract)? }; // VUGSCANCOARSEVIEWORIGIN (SR643): frame 0's camera from the fuse's poses, the view road's front test
     let loops: Result<Vec<Vec<u32>>, Topo> = sm.mesh.boundary_loops();
     let band = Tol { lin: a.band, ang: BAND_DEG.to_radians() };
     let plane: Result<Fit<Plane>, FitError> = fit_plane(&sm.mesh.positions, band);

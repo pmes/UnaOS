@@ -11,7 +11,8 @@
 //! several through the tracker (tools/scan's `--track` road), at tools/scan's defaults ([`VOXEL_MM`],
 //! [`TRUNC_VOXELS`]). A tracked scan's world is frame 0's camera: [`fuse_prb_tracked`] says which road fused it, so the
 //! caller opens a tracked one through the coarse registration (`deviation::measure_coarse`, VUGSCANDEVIATIONCOARSE SR615;
-//! VUGFACEDEVIATIONPRBPOSES SR621).
+//! VUGFACEDEVIATIONPRBPOSES SR621). [`camera`] reads that world's frame-0 camera centre from the fuse's own poses onto
+//! `ScanMesh::camera` (VUGSCANCOARSEVIEWORIGIN SR643), the view road's front test reading it.
 
 use alloc::vec::Vec;
 
@@ -199,5 +200,22 @@ pub fn fuse_prb_volume(bytes: &[u8], knobs: Knobs) -> Result<(ScanMesh, bool, f6
     let identity = [Transform::IDENTITY];
     let road = if shots.len() == 1 { Road::Posed(&identity) } else { Road::Track };
     let f = fuse(&shots, road, VOXEL_MM, TRUNC_VOXELS * VOXEL_MM, knobs).map_err(PrbError::Fuse)?;
-    extract(&f.tsdf).map(|m| (m, f.track.is_some(), f.tsdf.trunc_mm())).map_err(PrbError::Extract)
+    extract(&f.tsdf).map(|m| (ScanMesh { camera: camera(f.track.as_ref(), road), ..m }, f.track.is_some(), f.tsdf.trunc_mm())).map_err(PrbError::Extract) // VUGSCANCOARSEVIEWORIGIN (SR643): the mesh carries frame 0's camera
+}
+
+// ---- VUGSCANCOARSEVIEWORIGIN (LEDGER SR643): the fused world's frame-0 camera, read from the fuse's poses ----
+// The view road's front test (deviation.rs `front`) read the scan frame's origin as the camera: a convention (a tracked
+// scan's world is frame 0's camera). The Fused holds no pose list of its own; the poses live on the road: the posed
+// road's slice (the caller's), and on the tracked road the loop's `Loop::poses` (every observed frame in shot order, the
+// anchor first: frame 0 at the tracker's start, or its corrected pose when a closure re-integrated the volume). A graph
+// the tracked road refused drops that list, so its mesh carries no camera and is refused the view road.
+
+/// The camera centre (mm, `pose.apply_point(0)`) of frame 0 in the fused world: the posed road's first pose, or the
+/// tracked road's first loop pose; None with no pose (an empty posed slice, no `TrackLog`, or a refused graph).
+pub fn camera(track: Option<&TrackLog>, road: Road<'_>) -> Option<crate::Vec3> {
+    let pose = match road {
+        Road::Posed(poses) => poses.first().copied(),
+        Road::Track => track.and_then(|log| log.closed.as_ref().ok()).and_then(|lp| lp.poses.first()).map(|p| p.1),
+    }?;
+    Some(pose.apply_point(crate::Vec3::ZERO))
 }
