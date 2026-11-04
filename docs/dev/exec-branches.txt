@@ -1377,3 +1377,9 @@ exec-rmbp-vugfacegdtreport 3d5151e40 wave36 cut53
 exec-rmbp-vugfacejournalsolidfault 3d5151e40 wave36 cut53
 exec-rmbp-vugcomscanjog 3d5151e40 wave36 cut53
 exec-rmbp-vugscantsdfedgelateral 3d5151e40 wave36 cut53
+exec-rmbp-f39settingsarrowsense be6016e00 wave36 cut54
+exec-rmbp-f39veilloginheld be6016e00 wave36 cut54
+exec-rmbp-f39continueclosedrain be6016e00 wave36 cut54
+exec-rmbp-f39sessionlineforeign be6016e00 wave36 cut54
+exec-rmbp-f39unafslockdeathpath be6016e00 wave36 cut54
+exec-rmbp-f39quarrymenua11ywitness be6016e00 wave36 cut54

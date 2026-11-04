@@ -399,7 +399,7 @@ impl View {
         let click = (x - d.start.0).hypot(y - d.start.1) < CLICK_PX;
         if click && d.action == Action::Pick {
             let was = self.picked;
-            let h = self.hit(model, x, y); self.picked = h.map(|(_, t)| t); let dv = crate::deviation::pick(self, model, h); // VUGFACEDEVIATIONPICK (SR543): the click's one hit also picks the map's vertex
+            if crate::deviation::fault_click(self, x, y) { return true; } let h = self.hit(model, x, y); self.picked = h.map(|(_, t)| t); let dv = crate::deviation::pick(self, model, h); // VUGFACEJOURNALSOLIDFAULT (SR572): a click on a corner `fault line N` selects N in the panel first; VUGFACEDEVIATIONPICK (SR543): the click's one hit also picks the map's vertex
             return self.picked != was || dv;
         }
         false

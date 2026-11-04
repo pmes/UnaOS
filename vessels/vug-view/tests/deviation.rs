@@ -842,3 +842,35 @@ fn the_margin_argument_changes_n_kept() {
 
 
 
+
+// VUGFACEJOURNALSOLIDFAULT (LEDGER SR572): a document with an Op naming no machine opens as the journal (it refused
+// before), the map measures it, and a click on the corner's `fault line N` selects statement N in the panel through the
+// panel's cursor; with the map off the body is the journal's own.
+
+#[test]
+fn a_click_on_a_corner_fault_line_selects_its_statement() {
+    let doc = doc_core::read(&format!("{DOC}{DRILL}")).expect("the document reads");
+    let mut v = Viewer::open_doc(doc, "fixture", SIZE, Preset::Una).expect("an Op's fault opens as the journal");
+    assert_eq!(v.view.design.journal.faults.len(), 1, "{:?}", v.view.design.journal.faults);
+    v.against_journal(scan().clone()).expect("the journal measures");
+    let lines = corner(v.view.deviation.as_ref().unwrap());
+    println!("{}", lines.join("\n"));
+    let (i, line) = lines.iter().enumerate().find(|(_, l)| l.starts_with("fault line ")).expect("a fault line on the corner");
+    let n: u32 = line["fault line ".len()..].split(':').next().unwrap().parse().expect("its line number");
+    let text = line.to_uppercase();
+    let (x0, y0) = vug_view::deviation::line_at(SIZE.0, &text, i);
+    let (x, y) = ((x0 + 4.0 * text.chars().count() as f32) as f64, (y0 + vug_view::deviation::LINE_PX * 0.5) as f64);
+    assert!(!v.view.design.journal.panel, "the panel starts hidden");
+    v.input(&bandy::SMessage::BrowserButton { down: true, x, y, mods: 0, surface: 0 });
+    assert!(v.input(&bandy::SMessage::BrowserButton { down: false, x, y, mods: 0, surface: 0 }), "the click is taken");
+    let j = &v.view.design.journal;
+    let o1 = j.doc.stmts.iter().position(|s| s.id() == Some("o1")).expect("the Op");
+    println!("select line {n} -> row {}", j.cursor);
+    assert!(j.panel, "the click shows the panel");
+    assert_eq!((j.cursor, j.doc.line(j.cursor)), (o1, n), "the cursor is the faulted statement");
+    assert!(j.faulted(o1), "its row is marked");
+
+    // The map off: the body is the journal's own (regenerate carries the fault, no refusal).
+    assert!(v.key("d"), "d toggles the map");
+    assert!(v.view.design.body.is_some(), "the journal's body is shown with the map off");
+}

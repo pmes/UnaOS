@@ -189,8 +189,8 @@ pub fn overlay(view: &View, fr: &mut Frame) {
     };
     for (i, line) in corner(m).iter().enumerate() {
         let text = line.to_uppercase();
-        let x = fr.width as f32 - 8.0 * text.chars().count() as f32 - 6.0;
-        raster::text(fr, &text, x.max(0.0), 6.0 + LINE_PX * i as f32, col);
+        let (x, y) = line_at(fr.width, &text, i); // VUGFACEJOURNALSOLIDFAULT (SR572): the ONE corner geometry, paint and hit
+        raster::text(fr, &text, x, y, col);
     }
     ring(view, m, fr); // VUGFACEDEVIATIONPICK (SR543): the ring at the picked vertex
 }
@@ -681,7 +681,7 @@ pub fn datum_key(view: &mut View, model: &Model, k: &str) -> Option<bool> {
 
 /// `failures` split into (those on a statement a solid reads, the rest), each in replay's (line) order. A failure with
 /// no id counts as a solid's.
-fn split_faults(doc: &Doc, failures: Vec<doc_core::Failure>) -> (Vec<doc_core::Failure>, Vec<doc_core::Failure>) {
+pub(crate) fn split_faults(doc: &Doc, failures: Vec<doc_core::Failure>) -> (Vec<doc_core::Failure>, Vec<doc_core::Failure>) {
     let solid = crate::journal::solid_stmts(doc);
     failures.into_iter().partition(|f| f.id.is_empty() || solid.iter().any(|s| s.id() == Some(f.id.as_str())))
 }
@@ -751,4 +751,35 @@ fn carry_named(old: &Map, new: &mut Map) {
     new.chosen = old.chosen.map(|f| f.and_then(name).and_then(|n| new.names.iter().position(|x| *x == n).map(|i| i as u32)));
 }
 
+// ---- VUGFACEJOURNALSOLIDFAULT (LEDGER SR572): a click on a corner fault line reaches its statement ----
+// The corner's lines sit at ONE geometry ([`line_at`], what [`overlay`] paints with). `View::release`'s Pick arm asks
+// [`fault_click`] first: on a journal map (a path map's lines are another document's) a click inside a line's rect
+// (8 px a glyph, [`LINE_PX`] high) whose text is `fault line N: ...` selects line N in the panel through journal.rs
+// `Journal::select_line` (the panel's cursor). One rect per line, no replay, no BVH.
 
+/// Where corner line `i` (its painted, upper-cased `text`) is drawn on a frame `width` wide: right-aligned 6 px in,
+/// [`LINE_PX`] apart from 6 px down, clamped to the left edge.
+pub fn line_at(width: u32, text: &str, i: usize) -> (f32, f32) {
+    let x = width as f32 - 8.0 * text.chars().count() as f32 - 6.0;
+    (x.max(0.0), 6.0 + LINE_PX * i as f32)
+}
+
+/// A click at (x, y) on a journal map's `fault line N` corner line selects statement N in the panel; true when it did
+/// (the click is taken). Any other click, or a map with no journal, is not taken.
+pub fn fault_click(view: &mut View, x: f64, y: f64) -> bool {
+    let Some(m) = view.deviation.as_ref().filter(|m| m.source.is_some()) else { return false };
+    let w = view.size.0;
+    let line = corner(m).into_iter().enumerate().find_map(|(i, l)| {
+        let text = l.to_uppercase();
+        let (x0, y0) = line_at(w, &text, i);
+        let inside = x as f32 >= x0 && (x as f32) < x0 + 8.0 * text.chars().count() as f32 && y as f32 >= y0 && (y as f32) < y0 + LINE_PX;
+        if !inside {
+            return None;
+        }
+        l.strip_prefix("fault line ")?.split(':').next()?.parse::<u32>().ok()
+    });
+    match line {
+        Some(n) => view.design.journal.select_line(n),
+        None => false,
+    }
+}
