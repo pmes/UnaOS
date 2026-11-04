@@ -1031,7 +1031,7 @@ pub fn note_set_unread(corr: u32) {
         let i = u.1;
         u.0[i] = corr;
         u.1 = (i + 1) % Q_CAP;
-    });
+    }); queued_due(); // QUEUED-SET-EAGER-ARM (rmbp-ledger B1196): the handoff wakes the parked `prefs-apply` task (a Semaphore post, the teardown's own done_sem road; file tail). Named in-place hunk
 }
 
 /// Take (clear) the unread mark of client corr `corr`. `true` = on_exit marked that SET's frame unread.
@@ -1070,7 +1070,7 @@ pub fn set_unread_take(corr: u32) -> bool {
 // arm, the drain's sweep), never held across `kernel` or `set_unread_take`.
 // QUEUED-SET-LOSTRESET (B1181): each entry carries its holder's (row, rgen); a holder whose generation moved with no
 // mark and no answer (its reset lost to a full inbox) is released -ECONNRESET by `queued_lost` (file tail).
-// Witness: `tests bandy3` -> `:: RELAY-QUEUED-SET: unread=applied read=released full=eagain lostreset=released/applied eager=owed -> PASS ::`.
+// Witness: `tests bandy3` -> `:: RELAY-QUEUED-SET: unread=applied read=released full=eagain lostreset=released/applied eager=applied -> PASS ::` (eager: QUEUED-SET-EAGER-ARM B1196, file tail).
 // =================================================================================================
 /// One queued SET: the request header (verb PREF_SET, the client corr), its body, and the status of the
 /// holder's late answer once one reached the inbox.
@@ -1096,7 +1096,7 @@ static QUEUED: crate::sync::Mutex<VecDeque<Queued>> = crate::sync::Mutex::new(Ve
 fn queued_keep(hdr: &crate::bus::BusHdr, body: &[u8], held: Option<(usize, u64)>) -> bool {
     let b: Box<[u8]> = body.into();
     let h = *hdr;
-    let silent_at_ms = crate::arch::ms().saturating_add(QUEUED_SILENT_MS);
+    let silent_at_ms = crate::arch::ms().saturating_add(QUEUED_SILENT_MS); applier_ensure(); // QUEUED-SET-EAGER-ARM (rmbp-ledger B1196): the parked applier is spawned once, here in task context (file tail). Named in-place hunk
     locked(move || {
         let mut q = QUEUED.lock();
         if q.len() >= Q_CAP {
@@ -1149,7 +1149,7 @@ fn queued_take(corr: u32) -> Option<Queued> {
 
 /// The head of every `call`: settle the queued SETs (see the block above).
 #[cfg(feature = "busreg")]
-fn queued_drain() {
+fn queued_drain() { let Some(_gate) = drain_gate() else { return }; queued_settle() } #[cfg(feature = "busreg")] fn queued_settle() { // QUEUED-SET-EAGER-ARM (rmbp-ledger B1196): ONE drain at a time (the gate, file tail); `queued_settle` is the drain body, unchanged. Named in-place hunk
     if locked(|| QUEUED.lock().is_empty()) {
         return;
     }
@@ -1267,7 +1267,7 @@ pub fn queued_selftest() {
         let _ = queued_take(c);
     }
     let (q4, q5) = lostreset_selftest(&next, &body_of, &read, want); // QUEUED-SET-LOSTRESET (B1181): Q4 / Q5, the full-inbox legs (file tail)
-    let (q6, q7) = stucklive_selftest(&next, &body_of, &read, want); // QUEUED-SET-STUCKLIVE (B1187): Q6 silent live holder, Q7 refused answer delivered (file tail)
+    let (q6, q7) = stucklive_selftest(&next, &body_of, &read, want); let q10 = eager_selftest(&next, &body_of, want); // QUEUED-SET-EAGER-ARM (B1196): Q10 the parked applier settles an unread SET with no client call (file tail). QUEUED-SET-STUCKLIVE (B1187): Q6 silent live holder, Q7 refused answer delivered (file tail)
     // Restore the operator's value through the same kernel fulfiller (or leave the key unset as it was).
     match orig {
         Some(v) => {
@@ -1280,10 +1280,10 @@ pub fn queued_selftest() {
             let _ = crate::prefs::unset(crate::prefs::NS, key::IDLE_MIN);
         }
     }
-    if q1 && q2 && q3 && q4 && q5 && q6 && q7 {
-        serial_println!(":: RELAY-QUEUED-SET: unread=applied read=released full=eagain lostreset=released/applied stucklive=released refusedreply=redelivered eager=owed -> PASS ::");
+    if q1 && q2 && q3 && q4 && q5 && q6 && q7 && q10 { // QUEUED-SET-EAGER-ARM (B1196): q10. Named in-place hunk
+        serial_println!(":: RELAY-QUEUED-SET: unread=applied read=released full=eagain lostreset=released/applied stucklive=released refusedreply=redelivered eager=applied -> PASS ::"); // QUEUED-SET-EAGER-ARM (B1196): eager=applied
     } else {
-        serial_println!(":: RELAY-QUEUED-SET: q1={} q2={} q3={} q4={} q5={} q6={} q7={} (want={} read1={} read2={} kept={}/{} pushed={}/{}) -> FAIL ::", q1 as u8, q2 as u8, q3 as u8, q4 as u8, q5 as u8, q6 as u8, q7 as u8, want, read1.unwrap_or(-1), read2.unwrap_or(-1), kept1 as u8, kept2 as u8, pushed1 as u8, pushed2 as u8);
+        serial_println!(":: RELAY-QUEUED-SET: q1={} q2={} q3={} q4={} q5={} q6={} q7={} q10={} (want={} read1={} read2={} kept={}/{} pushed={}/{}) -> FAIL ::", q1 as u8, q2 as u8, q3 as u8, q4 as u8, q5 as u8, q6 as u8, q7 as u8, q10 as u8, want, read1.unwrap_or(-1), read2.unwrap_or(-1), kept1 as u8, kept2 as u8, pushed1 as u8, pushed2 as u8);
     }
 }
 
@@ -1298,8 +1298,8 @@ pub fn queued_selftest() {
 // the generation at the top of the teardown and `on_exit` marks an unread SET at its end, so a drain on another
 // core can see the holder dead before its mark lands; the first drain only STAMPS `gone_ms`, a later one releases
 // once RELAY_WAIT_MS has passed, and the mark is asked first at every drain, so a mark that lands in the grace
-// applies. A mark lost to SET_UNREAD's ring overwrite is released as read (fail-closed, B1169). EAGER is owed: the
-// `prefs-flush` spawn road is x86-only and a spawn from the teardown / reap context is unmeasured.
+// applies. A mark lost to SET_UNREAD's ring overwrite is released as read (fail-closed, B1169). EAGER is BUILT by
+// QUEUED-SET-EAGER-ARM (B1196, file tail): the unread mark wakes a parked `prefs-apply` task on both arches.
 // =================================================================================================
 /// Has the holder of queued corr `corr` been torn down, past the grace, with no answer and no mark? The first
 /// drain that sees it dead stamps `gone_ms`; the arch `rgen` is read with `QUEUED` released.
@@ -1584,4 +1584,180 @@ fn stucklive_selftest(next: &dyn Fn() -> u32, body_of: &dyn Fn(i64) -> String, r
 #[cfg(feature = "busreg")]
 fn queued_word(verb: u8) -> &'static str {
     if verb == una_abi::BUS_VERB_PREF_UNSET || verb == una_abi::BUS_VERB_R3PREF_UNSET { "unset" } else { "set" }
+}
+
+// =================================================================================================
+// QUEUED-SET-EAGER-ARM (rmbp-ledger B1196) — TAIL-APPENDED. B1175's ring applied a queued SET whose holder died with
+// it UNREAD only at the NEXT client call (`queued_drain` at the head of `call`): on_exit runs in the dying task's exit
+// (IRQ masked) or in the scheduler's reap, where no file I/O may run, and the x86 `prefs-flush` road is a render-task
+// deferral, not an exit road. Now the on_exit handoff's own callee (`note_set_unread`) raises [`QUEUED_DUE`] and, on
+// its false->true edge, posts [`APPLY_SEM`]: a `sched::Semaphore` post, the road every exit and reap ALREADY takes in
+// the same frame (`done_sem.post()`: aarch64 `exit` / `retire_killed`, x86 `exit` / `reap_killed`; `post` drops its raw
+// lock before `make_ready`'s run-queue push and no run-queue lock is held there). The parked kernel task `prefs-apply`
+// (the aarch64 `orphan_reaper` / `REAPER_SEM` shape, arch-neutral; spawned ONCE, lazily, by `queued_keep` in task
+// context) wakes, takes the drain gate, runs the drain body (`queued_settle`, the one apply path) and records the corrs
+// it settled. THE GATE: two drains at once could lose a SET (one takes the unread mark, the other releases the same entry
+// as lost past the grace) or land an OLD queued value after a call's NEW SET, so every drain holds [`DRAINING`]; an
+// unmasked waiter yields, a MASKED caller (aarch64 `yield_now` unmasks) tries once and skips, the holder settling the
+// ring. The apply path never calls `call`, so the gate cannot re-enter. Cost: one parked task (APPLIER_STACK, idle at 0
+// duty), one flag, one Semaphore, one gate flag, one Q_CAP ring. A lost-reset release (`queued_lost`, a READ SET, no
+// write) still waits for a later drain past its grace. OWED: QUEUED-SET-EAGER-KEEPRACE (a holder dying between `relay`'s
+// last poll and `queued_keep` marks before the entry exists: settled at the next call); PREFS-FLUSH-ONTO-APPLIER.
+// Witness: `tests bandy3` -> `[prefsbus] queued apply on=prefs-apply settled=<n> ms=<ms> (QUEUED-SET-EAGER-ARM)` and
+// `:: RELAY-QUEUED-SET: ... eager=applied -> PASS ::` (Q10, `eager_selftest`).
+// =================================================================================================
+/// Raised by the on_exit handoff (`note_set_unread`); cleared by `prefs-apply` before it drains.
+#[cfg(feature = "busreg")]
+static QUEUED_DUE: AtomicBool = AtomicBool::new(false);
+/// `prefs-apply`'s wake: posted from the teardown (the `done_sem` road), waited on by `prefs-apply` alone.
+#[cfg(feature = "busreg")]
+static APPLY_SEM: crate::arch::sched::Semaphore = crate::arch::sched::Semaphore::new(0);
+/// `prefs-apply` has been spawned (once per boot).
+#[cfg(feature = "busreg")]
+static APPLIER: AtomicBool = AtomicBool::new(false);
+/// The applier's kernel stack: the store path's measured size (x86 `prefs-watch` runs it on `RENDER_PATH_STACK_SIZE`, 32 KiB).
+#[cfg(feature = "busreg")]
+const APPLIER_STACK: usize = 32 * 1024;
+/// The drain gate: one `queued_settle` at a time.
+#[cfg(feature = "busreg")]
+static DRAINING: AtomicBool = AtomicBool::new(false);
+/// The client corrs `prefs-apply` settled (a ring, next slot in `.1`; 0 = empty). LEAF lock, under `locked`.
+#[cfg(feature = "busreg")]
+static EAGER_SETTLED: crate::sync::Mutex<([u32; Q_CAP], usize)> = crate::sync::Mutex::new(([0u32; Q_CAP], 0));
+/// How long Q10 waits for the applier (40 x `RELAY_WAIT_MS`, 2 s).
+#[cfg(feature = "busreg")]
+const EAGER_WAIT_MS: u64 = 40 * RELAY_WAIT_MS;
+
+/// `note_set_unread` (the on_exit handoff, any context): mark the ring due and wake `prefs-apply` once per edge.
+#[cfg(feature = "busreg")]
+fn queued_due() {
+    if !QUEUED_DUE.swap(true, Ordering::AcqRel) {
+        APPLY_SEM.post();
+    }
+}
+
+/// `queued_keep` (task context): spawn `prefs-apply` the first time a SET is queued.
+#[cfg(feature = "busreg")]
+fn applier_ensure() {
+    if APPLIER.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        crate::arch::sched::spawn_stack("prefs-apply", prefs_apply, 0, crate::arch::sched::CPU_AUTO, crate::arch::sched::PRIO_NORMAL, APPLIER_STACK);
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        let _ = crate::arch::sched::spawn_stack("prefs-apply", prefs_apply, 0, crate::arch::sched::CPU_AUTO, APPLIER_STACK);
+    }
+}
+
+/// The corrs in the ring now.
+#[cfg(feature = "busreg")]
+fn queued_corrs() -> Vec<u32> {
+    locked(|| QUEUED.lock().iter().map(|e| e.hdr.corr).collect())
+}
+
+/// `prefs-apply`: parked on `APPLY_SEM`; each wake settles the ring under the gate and records what it settled.
+#[cfg(feature = "busreg")]
+fn prefs_apply(_: usize) {
+    locked(|| APPLY_SEM.init()); // masked: a teardown post on this core must never spin on a raw lock this task holds
+    loop {
+        if !APPLY_SEM.wait() {
+            return; // off a scheduled task (never for a spawned task)
+        }
+        QUEUED_DUE.store(false, Ordering::Release);
+        let Some(_gate) = drain_gate() else { continue };
+        let before = queued_corrs();
+        if before.is_empty() {
+            continue;
+        }
+        let t0 = crate::arch::ms();
+        queued_settle();
+        let after = queued_corrs();
+        let mut n = 0usize;
+        for &c in before.iter().filter(|c| !after.contains(*c)) {
+            n += 1;
+            locked(|| {
+                let mut s = EAGER_SETTLED.lock();
+                let i = s.1;
+                s.0[i] = c;
+                s.1 = (i + 1) % Q_CAP;
+            });
+        }
+        if n > 0 {
+            serial_println!("[prefsbus] queued apply on=prefs-apply settled={} ms={} (QUEUED-SET-EAGER-ARM)", n, crate::arch::ms().saturating_sub(t0));
+        }
+    }
+}
+
+/// The drain gate's hold; dropping it opens the gate.
+#[cfg(feature = "busreg")]
+struct DrainGate;
+
+#[cfg(feature = "busreg")]
+impl Drop for DrainGate {
+    fn drop(&mut self) {
+        DRAINING.store(false, Ordering::Release);
+    }
+}
+
+/// Take the drain gate. Unmasked: wait (yield) for the holder. Masked: one try, `None` when busy (the holder is
+/// settling the ring; a masked wait on a preemptible holder could never end, and aarch64 `yield_now` unmasks).
+#[cfg(feature = "busreg")]
+fn drain_gate() -> Option<DrainGate> {
+    loop {
+        if !DRAINING.swap(true, Ordering::AcqRel) {
+            return Some(DrainGate);
+        }
+        if crate::arch::irqs_masked() {
+            return None;
+        }
+        crate::arch::sched::yield_now();
+        core::hint::spin_loop();
+    }
+}
+
+/// Did `prefs-apply` settle client corr `corr`?
+#[cfg(feature = "busreg")]
+fn eager_settled(corr: u32) -> bool {
+    corr != 0 && locked(|| EAGER_SETTLED.lock().0.contains(&corr))
+}
+
+/// `queued_selftest`'s Q10: a SET kept for a dead holder (a generation that is not live), then on_exit's two steps in
+/// its order (`note_set_unread`, which wakes the applier, then the -ECONNRESET into the inbox), and NO client call: the
+/// leg yields until `prefs-apply` has settled it and reads the key through the STORE (`prefs::get`), not the client.
+#[cfg(feature = "busreg")]
+fn eager_selftest(next: &dyn Fn() -> u32, body_of: &dyn Fn(i64) -> String, want: i64) -> bool {
+    let stale = Some((0usize, (crate::arch::syscall::busreg_ops().rgen)(0).wrapping_add(1)));
+    let v10: i64 = if want == 7 { 25 } else { 27 };
+    let b10 = body_of(v10);
+    let c10 = next();
+    let kept10 = queued_set_hdr(c10, b10.as_bytes()).is_some_and(|h| queued_keep(&h, b10.as_bytes(), stale));
+    note_set_unread(c10);
+    let pushed10 = inbox_push(queued_reply(c10, una_abi::ECONNRESET as i32));
+    let t = crate::arch::ms();
+    let mut spins = 0u32;
+    while kept10 && !eager_settled(c10) && crate::arch::ms().saturating_sub(t) <= EAGER_WAIT_MS && spins < RELAY_SPIN_MAX.saturating_mul(16) {
+        spins += 1;
+        if crate::arch::irqs_masked() {
+            core::hint::spin_loop();
+        } else {
+            crate::arch::sched::yield_now();
+        }
+    }
+    let waited = crate::arch::ms().saturating_sub(t);
+    let by_applier = eager_settled(c10);
+    let store10 = crate::prefs::get(crate::prefs::NS, crate::prefs::key::IDLE_MIN).and_then(|v| v.as_int());
+    let gone10 = queued_take(c10).is_none();
+    if !by_applier {
+        // The fixture's leftovers: the mark and the reset frame go with the entry.
+        let _ = set_unread_take(c10);
+        locked(|| REPLIES.lock().retain(|f| !matches!(crate::bus::frame_parse(f), Ok(h) if h.corr == c10)));
+    }
+    let q10 = kept10 && by_applier && gone10 && store10 == Some(v10);
+    if !q10 {
+        serial_println!("[prefsbus] eager leg: kept={} by_applier={} gone={} store={} waited={}ms pushed={}", kept10 as u8, by_applier as u8, gone10 as u8, store10.unwrap_or(-1), waited, pushed10 as u8);
+    }
+    q10
 }
