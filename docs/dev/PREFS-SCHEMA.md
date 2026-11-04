@@ -14,7 +14,7 @@ PREFSCAP (B454): a ring-3 program's PREF_SET reaches only its own `app.<name>.*`
 after it, and the rows marked `yes` under `ring 3` (writer `program`); every other row is NOT settable
 from ring 3 (`prefs_core::cap`).
 
-Rows: 77.
+Rows: 78.
 
 | key | type | default | writers | ring 3 | reader | meaning |
 | :-- | :-- | :-- | :-- | :-- | :-- | :-- |
@@ -44,6 +44,7 @@ Rows: 77.
 | `system.display.brightness` | int `1..=16` | `12` | settings, keys, program | yes | kernel settings, backlight | Panel level in sixteenths; never 0 (BRIGHTFLOOR: the backlight's OFF belongs to the idle blank). |
 | `system.display.font` | enum `sans \| serif \| mono` | `"sans"` | program | yes | kernel `video::text` (KERNELFONT) | The UI typeface family for captions, menus and running text: DejaVu Sans, Serif or Sans Mono (KERNELFONT B359; the console grid is always mono). |
 | `system.display.font_size` | int `9..=32` | `13` | program | yes | kernel `video::text` (KERNELFONT) | UI text size in CSS px; device px = size x the panel's ppi (EDID) / 96, capped by the 16 px text cell; captions keep the bar-derived size. |
+| `system.display.icc` | string ≤255 printable | `""` | operator | — | kernel `video::colour::latch` (DISPLAYICCFILE) | The absolute path of an installed display profile (ICC matrix/TRC) that wins over the EDID at the display transform's latch; empty = the EDID's own (DISPLAYICCFILE B972). No Settings row until DISPLAY-ICC-FACE: the operator writes it (`pref set system.display.icc <path>`). |
 | `system.display.idle_min` | int `0..=1440` | `10` | settings | — | kernel settings (DIMIDLE) | Minutes before the idle blank; 0 = never. |
 | `system.display.mode` | string ≤16 printable | consumer: the panel's own density scale (UIMETRICS) | settings | — | kernel settings (Display > Resolution), `video::dpi` | The looks-like size `WxH` of the chosen mode: the panel's native mode at a UI scale (`prefs_core::modes`); unset = the panel's default scale. |
 | `system.display.wallpaper` | string ≤120 printable | `""` | settings, wallpaper-verb | — | kernel settings, wallpaper | Wallpaper image path; empty = off. |
