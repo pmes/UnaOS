@@ -978,14 +978,83 @@ fn a_thin_side_alongside_the_plate_edge_is_kept() {
         found.len(),
         m.sigma_mm
     );
+    // VUGPHOTOSIDETHINEDGEMERGE (SR668) witness diagnostic: the fitted outer loop's primitives near the top side in true
+    // paper mm (ends, the line's angle, its offset from the plate's true top line and from the shim's top 55.25).
+    let to_paper = |p: Vec2| apply(&truth_inv, apply(&m.h, p).expect("h maps the shape")).expect("the truth maps back");
+    let plate_top = |x: f64| 53.690 + s.part_rot_deg.to_radians().tan() * (x - 32.515);
+    for (k, pr) in m.shape.outer.iter().enumerate() {
+        match *pr {
+            Prim::Line { a, b, rms } => {
+                let (a, b) = (to_paper(a), to_paper(b));
+                if a.y.max(b.y) > 53.0 && a.x.max(b.x) > 30.0 {
+                    let deg = (b.y - a.y).atan2(b.x - a.x).to_degrees();
+                    eprintln!(
+                        "diag shape[{k}] line ({:.3},{:.3})-({:.3},{:.3}) len={:.3} deg={deg:.3} rms={rms:.4} d_plate=({:.3},{:.3}) d_shim=({:.3},{:.3})",
+                        a.x,
+                        a.y,
+                        b.x,
+                        b.y,
+                        a.dist(b),
+                        a.y - plate_top(a.x),
+                        b.y - plate_top(b.x),
+                        a.y - 55.25,
+                        b.y - 55.25
+                    );
+                }
+            }
+            Prim::Arc { centre, r, from, to, .. } => {
+                let (c, f, t) = (to_paper(centre), to_paper(from), to_paper(to));
+                if f.y.max(t.y) > 53.0 && f.x.max(t.x) > 30.0 {
+                    eprintln!("diag shape[{k}] arc c=({:.3},{:.3}) r={r:.3} ({:.3},{:.3})-({:.3},{:.3})", c.x, c.y, f.x, f.y, t.x, t.y);
+                }
+            }
+            Prim::Circle { .. } => {}
+        }
+    }
     assert!((tip - fixture::SHIM_EDGE_TIP).abs() <= band, "shim tip {tip} vs {}", fixture::SHIM_EDGE_TIP);
-    assert!((top - (fixture::SHIM_EDGE_Y + fixture::SHIM_W * 0.5)).abs() <= band, "shim top {top}");
+    // VUGPHOTOSIDETHINEDGEMERGE (SR668): the loop's top is one crack row (1 / r) over the shim's, inside 2 σ.
+    assert!((top - (fixture::SHIM_EDGE_Y + fixture::SHIM_W * 0.5)).abs() <= 2.0 * m.sigma_mm, "shim top {top} past 2 sigma");
     let worst = pts
         .iter()
         .filter(|q| !(q.x >= x0 - 1.0 && q.x <= x1 + 1.0 && q.y > 54.0))
         .map(|&q| fixture::outline_distance(fixture::paper_to_part(&s, q)))
         .fold(0.0f64, f64::max);
     assert!(worst < 0.5, "plate outline off the truth by {worst} mm");
+    // VUGPHOTOSIDETHINEDGEMERGE (SR668): the witness in the fit, where the shim merges into the plate through a gap under
+    // the blur (0.262 mm at the tip to 0 at x 73). The shim's top is its OWN fitted line, both ends within 2 σ of 55.25;
+    // the plate's top is its own line at the plate's angle within atan(band / len), both ends within the band of the true
+    // top side; the merge's mark is the tip's 0.5 mm end fitted as a short slope, inside the band (measured at 56ae75426).
+    let paper_lines: Vec<(Vec2, Vec2)> = m
+        .shape
+        .outer
+        .iter()
+        .filter_map(|p| if let Prim::Line { a, b, .. } = *p { Some((to_paper(a), to_paper(b))) } else { None })
+        .collect();
+    let longest = |p: &(Vec2, Vec2), q: &(Vec2, Vec2)| p.0.dist(p.1).total_cmp(&q.0.dist(q.1));
+    let shim_top = paper_lines
+        .iter()
+        .copied()
+        .filter(|(a, b)| a.y.min(b.y) > fixture::SHIM_EDGE_Y && a.x.min(b.x) >= x0 - 1.0 && a.x.max(b.x) <= x1 + 1.0)
+        .max_by(longest)
+        .expect("the shim's top is a fitted line of its own");
+    let shim_off = (shim_top.0.y - 55.25).abs().max((shim_top.1.y - 55.25).abs());
+    assert!(shim_off <= 2.0 * m.sigma_mm, "the shim's top line off 55.25 by {shim_off}: {shim_top:?}");
+    let plate = paper_lines
+        .iter()
+        .copied()
+        .filter(|(a, b)| a.x.min(b.x) < x0 && a.y.min(b.y) > 53.0)
+        .max_by(longest)
+        .expect("the plate's top is a fitted line");
+    let plate_len = plate.0.dist(plate.1);
+    let plate_deg = ((plate.1.y - plate.0.y) / (plate.1.x - plate.0.x)).atan().to_degrees();
+    let deg_tol = (band / plate_len).atan().to_degrees();
+    let plate_off = (plate.0.y - plate_top(plate.0.x)).abs().max((plate.1.y - plate_top(plate.1.x)).abs());
+    eprintln!(
+        "photo: shim-on-edge-fit plate_deg={plate_deg:.3} true_deg={:.3} deg_tol={deg_tol:.3} plate_off={plate_off:.3} shim_line=({:.3},{:.3})-({:.3},{:.3}) shim_off={shim_off:.3} band={band:.3}",
+        s.part_rot_deg, shim_top.0.x, shim_top.0.y, shim_top.1.x, shim_top.1.y
+    );
+    assert!((plate_deg - s.part_rot_deg).abs() <= deg_tol, "the plate's top line at {plate_deg} deg vs {} (tol {deg_tol})", s.part_rot_deg);
+    assert!(plate_off <= band, "the plate's top line off its true side by {plate_off}: {plate:?}");
 }
 
 // ---- VUGPHOTOSIDETHINFIT (SR655): the shim's two sides fit as two parallel lines and its end (named tail block) ----
