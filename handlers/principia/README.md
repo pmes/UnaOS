@@ -113,8 +113,8 @@ an explicit home (tests, and any future multi-profile boot).
 
 - **Locking between writers.** Live update on external change is BUILT (PRINCIPIA-TWO-WRITERS,
   SR635): `serve` looks at the `settings/<domain>` files' stamps each second and a changed one
-  reloads the store and emits `PrefChanged` per differing key; two writers can still lose an
-  update between that reload and their own rename (PRINCIPIA-TWO-WRITERS-LOCK, owed to prefs_core's swap).
+  reloads the store and emits `PrefChanged` per differing key; two writers no longer lose an
+  update: a write holds `<domain>.lock`, re-reads the domain and swaps per writer (PREFS-SWAP-LOCK, SR644).
 - **The GUI surface.** Settings are served but have no face yet; a quartzite
   view over `PrefList`/`PrefSet` is the natural next step, rendered from
   `prefs_core::schema::SCHEMA` (types, ranges, enums per key).
