@@ -278,7 +278,7 @@ impl SectorDevice for SdSectorDevice {
         }
         if self.ra.window_sectors() > 1 {
             return self.read_sectors(lba, buf); // BOOT80: through the read-ahead window
-        }
+        } #[cfg(all(target_arch = "x86_64", feature = "wc"))] { if rawrote::warm_serve(self.handle, lba, buf) { return Ok(()); } } // F39UNAFSLOCKONE (B1125): WARM answers the windowless single-sector read too (LINE-NEUTRAL)
         match handle_read(self.handle, lba, buf) {
             Ok(512) => Ok(()),
             Ok(n) => Err(SectorError::Io(format!("short sector read: {n} bytes"))),
@@ -325,7 +325,7 @@ impl SectorDevice for SdSectorDevice {
 
     /// BOOT80 (B350): a 4 KiB block in one call. On the SD card: served from the read-ahead window, or
     /// ONE multi-block read (CMD18) of the window that holds it; elsewhere the per-sector loop.
-    fn read_sectors(&mut self, lba: u64, buf: &mut [u8]) -> Result<(), SectorError> {
+    fn read_sectors(&mut self, lba: u64, buf: &mut [u8]) -> Result<(), SectorError> { #[cfg(all(target_arch = "x86_64", feature = "wc"))] { if rawrote::warm_serve(self.handle, lba, buf) { return Ok(()); } } // F39UNAFSLOCKONE (B1125): WARM served at the head, before the windowless loop (moved from :345; LINE-NEUTRAL)
         if self.ra.window_sectors() <= 1 { TX_FILLS.fetch_add(1, Ordering::Relaxed);
             for (i, c) in buf.chunks_mut(512).enumerate() {
                 let at = lba.checked_add(i as u64).ok_or(SectorError::OutOfBounds(lba))?;
@@ -342,7 +342,7 @@ impl SectorDevice for SdSectorDevice {
             return Ok(());
         }
         let handle = self.handle;
-        let sectors = self.sectors; #[cfg(all(target_arch = "x86_64", feature = "wc"))] { if rawrote::warm_serve(handle, lba, buf) { return Ok(()); } }
+        let sectors = self.sectors;
         self.ra.read(lba, buf, sectors, |start, b| handle_read_multi(handle, start, b))
     }
 
@@ -635,7 +635,7 @@ fn handle_kind_name(handle: block::BlockHandle) -> &'static str {
 
 /// UNAFSBIND: the handle the live cached mount is riding, or `None` if no mount is currently bound.
 /// A read-only peek (masked, like every `MOUNT` touch); it never triggers the lazy bind.
-pub fn mount_bound_handle() -> Option<block::BlockHandle> { #[cfg(all(target_arch = "x86_64", feature = "wc"))] { if !crate::video::renderwedge::wait_unlocked(&MOUNT, crate::video::renderwedge::W_UNAFS) { return None; } } // TRASHLOCK (B523): RENDERWEDGE's bounded pre-wait (B520 :793's shape) — the render task never spins unbounded on MOUNT here; past MOUNT_BOUND_MS `[render] wait-timeout what=unafs-mount` and "none bound". ⚠ SAME-LINE fold: :639's `MOUNT.lock()` keeps its line and column
+pub fn mount_bound_handle() -> Option<block::BlockHandle> { #[cfg(all(target_arch = "x86_64", feature = "wc"))] { if !crate::video::renderwedge::wait_unlocked(&MOUNT, crate::video::renderwedge::W_UNAFS) { return None; } } #[cfg(all(target_arch = "x86_64", feature = "wc"))] let _tk = lockcensus::Take::peek(&MOUNT); // F39UNAFSLOCKONE (B1125): the peek censused (:639 untouched; LINE-NEUTRAL). TRASHLOCK (B523): RENDERWEDGE's bounded pre-wait (B520 :793's shape) — the render task never spins unbounded on MOUNT here; past MOUNT_BOUND_MS `[render] wait-timeout what=unafs-mount` and "none bound". ⚠ SAME-LINE fold: :639's `MOUNT.lock()` keeps its line and column
     crate::arch::without_interrupts(|| MOUNT.lock().as_ref().map(|b| b.handle))
 }
 
@@ -789,9 +789,9 @@ enum Attempt<R> {
 ///
 /// UNAFSTXN: `f` is `FnMut` rather than `FnOnce` because a transaction that dies on a transient
 /// `Busy` is RESTARTED — see [`with_unafs`]'s restart loop and [`TXN_BUSY_ATTEMPTS`].
-fn with_unafs_attempt<R>(f: &mut impl FnMut(&mut KernelUnaFS) -> R, arm: bool, #[cfg(all(target_arch = "x86_64", feature = "wc"))] took: &mut u64, #[cfg(all(target_arch = "x86_64", feature = "wc"))] rel: &mut u64) -> Attempt<R> {
-    attempt_span(arm, || { #[cfg(all(target_arch = "x86_64", feature = "wc"))] { if !crate::video::renderwedge::wait_unlocked(&MOUNT, crate::video::renderwedge::W_UNAFS) { return Attempt::Settled(Err(MountError::Busy)); } } #[cfg(all(target_arch = "x86_64", feature = "wc"))] let _rel = lockcensus::Release(&mut *rel); // RENDERWEDGE (B520): the RENDER task's acquire of the mount is bounded (MOUNT_BOUND_MS) — f28's wedge was this masked spin with no bound; past it `[render] wait-timeout what=unafs-mount` and a clean Busy (nothing was touched). Every other caller is unchanged. ⚠ SAME-LINE fold: line :794's `MOUNT.lock()` keeps its line and column (its `#[track_caller]` site)
-        let mut guard = MOUNT.lock(); #[cfg(all(target_arch = "x86_64", feature = "wc"))] { *took = crate::hidstall::now_us(); } let _own = crate::lockowner::own(crate::lockowner::UNAFS); #[cfg(all(target_arch = "x86_64", feature = "wc"))] if splitwrite::ticket_foreign() { return Attempt::Restart; } #[cfg(target_arch = "x86_64")] mount_poison_check(&mut *guard); // POISON2 (B846) MOUNTPOISON: a dead holder's mark discards the in-RAM instance before anything reads it (file tail; LINE-NEUTRAL, before this comment). UNAFSWRITE (B825): another task's commit is writing with MOUNT released — leave MOUNT untouched and restart (LINE-NEUTRAL, before this comment). STACKGUARD2 (B403): the holder, released if it overflows mid-transaction
+fn with_unafs_attempt<R>(f: &mut impl FnMut(&mut KernelUnaFS) -> R, arm: bool, #[cfg(all(target_arch = "x86_64", feature = "wc"))] tk: &lockcensus::Take) -> Attempt<R> {
+    attempt_span(arm, || { #[cfg(all(target_arch = "x86_64", feature = "wc"))] { if !crate::video::renderwedge::wait_unlocked(&MOUNT, crate::video::renderwedge::W_UNAFS) { return Attempt::Settled(Err(MountError::Busy)); } } #[cfg(all(target_arch = "x86_64", feature = "wc"))] let _rel = tk.release(); // RENDERWEDGE (B520): the RENDER task's acquire of the mount is bounded (MOUNT_BOUND_MS) — f28's wedge was this masked spin with no bound; past it `[render] wait-timeout what=unafs-mount` and a clean Busy (nothing was touched). Every other caller is unchanged. ⚠ SAME-LINE fold: line :794's `MOUNT.lock()` keeps its line and column (its `#[track_caller]` site)
+        let mut guard = MOUNT.lock(); #[cfg(all(target_arch = "x86_64", feature = "wc"))] { tk.took(); }                         let _own = crate::lockowner::own(crate::lockowner::UNAFS); #[cfg(all(target_arch = "x86_64", feature = "wc"))] if splitwrite::ticket_foreign() { return Attempt::Restart; } #[cfg(target_arch = "x86_64")] mount_poison_check(&mut *guard); // POISON2 (B846) MOUNTPOISON: a dead holder's mark discards the in-RAM instance before anything reads it (file tail; LINE-NEUTRAL, before this comment). UNAFSWRITE (B825): another task's commit is writing with MOUNT released — leave MOUNT untouched and restart (LINE-NEUTRAL, before this comment). STACKGUARD2 (B403): the holder, released if it overflows mid-transaction
         // UNAFSTXN: open the attempt's contention window, INSIDE the hold. Clearing it before the
         // acquire would be an SMP bug: a core waiting on `MOUNT` would wipe the latch belonging to
         // the transaction currently running under it. Under the lock the flag is serialized with
@@ -897,7 +897,7 @@ fn with_unafs_attempt<R>(f: &mut impl FnMut(&mut KernelUnaFS) -> R, arm: bool, #
     let budget = crate::arch::hw_wait_budget();
     let mut restarts: u32 = 0;
     for _ in 0..TXN_BUSY_ATTEMPTS {
-        #[cfg(all(target_arch = "x86_64", feature = "wc"))] if !splitwrite::ticket_wait() { break; } if let Err(e) = prebind() { note_txn_restarts(restarts, true); return Err(e); } match { let t_mask = crate::hidstall::now_us(); #[cfg(all(target_arch = "x86_64", feature = "wc"))] let c0 = lockcensus::open(); #[cfg(all(target_arch = "x86_64", feature = "wc"))] let mut took = 0u64; #[cfg(all(target_arch = "x86_64", feature = "wc"))] let mut rel = 0u64; let arm = attempt_arm(read); #[cfg(all(target_arch = "x86_64", feature = "wc"))] let a = with_unafs_attempt(&mut f, arm, &mut took, &mut rel); #[cfg(not(all(target_arch = "x86_64", feature = "wc")))] let a = with_unafs_attempt(&mut f, arm); note_attempt(arm, t_mask); #[cfg(all(target_arch = "x86_64", feature = "wc"))] { lockcensus::close(c0, t_mask, took, rel); } a } { // HIDSTALL (B485): the attempt's IRQ-masked span, on the stall line as `masked_ms=`
+        #[cfg(all(target_arch = "x86_64", feature = "wc"))] if !splitwrite::ticket_wait() { break; } if let Err(e) = prebind() { note_txn_restarts(restarts, true); return Err(e); } match { let t_mask = crate::hidstall::now_us(); #[cfg(all(target_arch = "x86_64", feature = "wc"))] let tk = lockcensus::Take::open_at(t_mask);                                                                                                                                   let arm = attempt_arm(read); #[cfg(all(target_arch = "x86_64", feature = "wc"))] let a = with_unafs_attempt(&mut f, arm, &tk);                 #[cfg(not(all(target_arch = "x86_64", feature = "wc")))] let a = with_unafs_attempt(&mut f, arm); note_attempt(arm, t_mask); #[cfg(all(target_arch = "x86_64", feature = "wc"))] { drop(tk); }                                 a } { // HIDSTALL (B485): the attempt's IRQ-masked span, on the stall line as `masked_ms=`
             Attempt::Settled(out) => {
                 if restarts > 0 {
                     note_txn_restarts(restarts, true);
@@ -1013,7 +1013,7 @@ pub static TEST_FAIL_MIDSTAGE: core::sync::atomic::AtomicBool =
 /// actually reached the medium. This is the durability-proof primitive the K4
 /// witness uses to prove a write survived being committed to the block device.
 pub fn force_remount() {
-    crate::arch::without_interrupts(|| { #[cfg(all(target_arch = "x86_64", feature = "wc"))] { if !crate::video::renderwedge::wait_unlocked(&MOUNT, crate::video::renderwedge::W_UNAFS) { return ; } } // TRASHLOCK (B523): RENDERWEDGE's bounded pre-wait (B520 :793's shape); past the bound the remount is skipped (nothing was touched). ⚠ SAME-LINE fold: :1017's `MOUNT.lock()` keeps its line and column
+    crate::arch::without_interrupts(|| { #[cfg(all(target_arch = "x86_64", feature = "wc"))] { if !crate::video::renderwedge::wait_unlocked(&MOUNT, crate::video::renderwedge::W_UNAFS) { return ; } } #[cfg(all(target_arch = "x86_64", feature = "wc"))] let _tk = lockcensus::Take::peek(&MOUNT); // F39UNAFSLOCKONE (B1125): the remount's hold (the instance's write-back) censused (:1017 untouched; LINE-NEUTRAL). TRASHLOCK (B523): RENDERWEDGE's bounded pre-wait (B520 :793's shape); past the bound the remount is skipped (nothing was touched). ⚠ SAME-LINE fold: :1017's `MOUNT.lock()` keeps its line and column
         *MOUNT.lock() = None;
     });
 }
@@ -3301,7 +3301,7 @@ pub mod splitread {
             }
             at += n;
         }
-        let (_, _, io0, fb0) = census();
+        let (_, _, io0, fb0) = census(); let tk0 = super::lockcensus::takes(); // F39UNAFSLOCKONE (B1125): every hold the probe makes must reach the census (LINE-NEUTRAL)
         HELD_MAX_US.store(0, Ordering::Relaxed);
         crate::arch::without_interrupts(|| *T_PATH.lock() = path.clone());
         T_LEN.store(len, Ordering::Relaxed);
@@ -3338,9 +3338,9 @@ pub mod splitread {
         let io_under = io1.wrapping_sub(io0);
         let fallbacks = fb1.wrapping_sub(fb0);
         let same = T_OK.load(Ordering::Relaxed) && T_BYTES.load(Ordering::Relaxed) == len && T_HASH.load(Ordering::Relaxed) == want; let (retry, chunked, kat_hold) = super::lockhold::kat(&path, len, |d: &[u8]| fnv(FNV0, d) == want); super::lockcensus::say("tests"); // UNAFSLOCKHOLD (B1015): the retry + chunked-fallback KAT, after the census (file tail; LINE-NEUTRAL, before this comment)
-        let pass = done && same && held_us <= 5000 && io_under == 0 && fallbacks == 0 && ops >= 1 && retry && chunked;
+        let takes = super::lockcensus::takes().wrapping_sub(tk0); let pass = done && same && held_us <= 5000 && io_under == 0 && fallbacks == 0 && ops >= 1 && retry && chunked && takes >= ops; // F39UNAFSLOCKONE (B1125): the census saw every metadata op's attempt (LINE-NEUTRAL)
         serial_println!(
-            ":: UNAFSLOCK: ops={} held_max_ms={} io_under_lock={} retry={} chunked={} hold_max_us={} -> {} :: path={} bytes={} read_ms={} read_held_us={} meta_held_us={} meta_wait_max_ms={} fallbacks={} match={} done={}",
+            ":: UNAFSLOCK: ops={} held_max_ms={} io_under_lock={} retry={} chunked={} hold_max_us={} -> {} :: path={} bytes={} read_ms={} read_held_us={} meta_held_us={} meta_wait_max_ms={} fallbacks={} match={} done={} takes={}",
             ops,
             held_us.div_ceil(1000),
             io_under, if retry { "ok" } else { "FAIL" }, if chunked { "ok" } else { "FAIL" }, kat_hold,
@@ -3353,7 +3353,7 @@ pub mod splitread {
             meta_wait_max / 1000,
             fallbacks,
             if same { "yes" } else { "no" },
-            if done { "yes" } else { "no" }
+            if done { "yes" } else { "no" }, takes
         );
     }
 }
@@ -3614,8 +3614,8 @@ fn kb_bind_root(handle: block::BlockHandle, key: ::unafs::VolumeKey) -> Result<b
         return Err(MountError::Busy); // RENDERWEDGE's bounded pre-wait: this half runs on the render task, where it is armed
     }
     let prev = kb_masked(move || KB_KEY.lock().replace(key)); // crawl B 8 + 7: the open root's key parked BEFORE the bind (a rebind right after it opens WITH the key, `keyboot_mount`)
-    let bound = kb_masked(|| {
-        let mut g = MOUNT.lock();
+    let bound = kb_masked(|| { #[cfg(all(target_arch = "x86_64", feature = "wc"))] let tk = lockcensus::Take::open(); // F39UNAFSLOCKONE (B1125): the install censused (LINE-NEUTRAL)
+        let mut g = MOUNT.lock(); #[cfg(all(target_arch = "x86_64", feature = "wc"))] { tk.took(); }
         if let Some(b) = g.as_ref() {
             return if b.handle == handle { Some(false) } else { None }; // crawl B 4: this root already bound = moot; ANOTHER volume bound = refused below
         }
@@ -4099,9 +4099,9 @@ pub mod splitwrite {
         if tid == 0 || TICKET.load(Ordering::Acquire) != tid {
             return false;
         }
-        let t0 = now_us();
+        let t0 = now_us(); let tk = super::lockcensus::Take::open(); // F39UNAFSLOCKONE (B1125): the leak take censused, a timeout all wait (LINE-NEUTRAL)
         let leaked = crate::arch::without_interrupts(|| loop {
-            if let Some(mut g) = MOUNT.try_lock() {
+            if let Some(mut g) = MOUNT.try_lock() { tk.took();
                 if let Some(m) = g.take() {
                     core::mem::forget(m);
                 }
@@ -4111,7 +4111,7 @@ pub mod splitwrite {
                 break false;
             }
             core::hint::spin_loop();
-        });
+        }); drop(tk);
         if !leaked {
             serial_println!(
                 "[lock] kept-on-death name=unafs-ticket at=lockowner by={}@cpu? why=mount-busy ms={} (TICKETOWNER B844: MOUNT held past the bound — the ticket stays held, never a force_unlock)",
@@ -4550,10 +4550,10 @@ fn prebind() -> Result<(), MountError> {
 
 /// The pre-bind's peek: MOUNT free (`try_lock`, masked — it never spins) and empty after its poison check. A held MOUNT
 /// answers `false` (its holder may be binding or bound; the attempt waits on it).
-fn mount_unbound() -> bool {
+fn mount_unbound() -> bool { #[cfg(all(target_arch = "x86_64", feature = "wc"))] let tk = lockcensus::Take::try_open(); // F39UNAFSLOCKONE (B1125): a try censused only when it took (LINE-NEUTRAL)
     crate::arch::without_interrupts(|| match MOUNT.try_lock() {
         #[allow(unused_mut)]
-        Some(mut g) => {
+        Some(mut g) => { #[cfg(all(target_arch = "x86_64", feature = "wc"))] { tk.took(); }
             #[cfg(target_arch = "x86_64")]
             mount_poison_check(&mut *g);
             g.is_none()
@@ -4573,8 +4573,8 @@ fn prebind_now() -> Result<(), MountError> {
                 drop(m);
                 return Ok(());
             }
-            let lost = crate::arch::without_interrupts(|| {
-                let mut g = MOUNT.lock();
+            let lost = crate::arch::without_interrupts(|| { #[cfg(all(target_arch = "x86_64", feature = "wc"))] let tk = lockcensus::Take::open(); // F39UNAFSLOCKONE (B1125): the install censused (LINE-NEUTRAL)
+                let mut g = MOUNT.lock(); #[cfg(all(target_arch = "x86_64", feature = "wc"))] { tk.took(); }
                 #[cfg(target_arch = "x86_64")]
                 mount_poison_check(&mut *g);
                 if g.is_none() {
@@ -4609,8 +4609,8 @@ pub fn poison_leg() -> &'static str {
         return "skip(unbound)";
     }
     let c0 = MPOISON_CHECKS.load(Ordering::Acquire);
-    let marked = crate::arch::without_interrupts(|| {
-        let g = MOUNT.lock();
+    let marked = crate::arch::without_interrupts(|| { #[cfg(all(target_arch = "x86_64", feature = "wc"))] let tk = lockcensus::Take::open(); // F39UNAFSLOCKONE (B1125): the mark hold censused (:4607 test peek left out; LINE-NEUTRAL)
+        let g = MOUNT.lock(); #[cfg(all(target_arch = "x86_64", feature = "wc"))] { tk.took(); }
         let m = MOUNT.mark_poison();
         drop(g);
         m
@@ -5606,10 +5606,10 @@ pub fn bind_now() -> Result<(), MountError> {
 
 /// `bind_now`'s look: `Some(bound)` with MOUNT free (masked `try_lock`, never spins; poison-checked as [`mount_unbound`]),
 /// `None` while MOUNT is held (its holder may be binding).
-fn mount_state() -> Option<bool> {
+fn mount_state() -> Option<bool> { #[cfg(all(target_arch = "x86_64", feature = "wc"))] let tk = lockcensus::Take::try_open(); // F39UNAFSLOCKONE (B1125): a try censused only when it took (LINE-NEUTRAL)
     crate::arch::without_interrupts(|| match MOUNT.try_lock() {
         #[allow(unused_mut)]
-        Some(mut g) => {
+        Some(mut g) => { #[cfg(all(target_arch = "x86_64", feature = "wc"))] { tk.took(); }
             #[cfg(target_arch = "x86_64")]
             mount_poison_check(&mut *g);
             Some(g.is_some())
@@ -5972,39 +5972,118 @@ pub mod lockcensus {
     /// F39UNAFSHOLDRELEASE (B1120): block reads `rawrote::warm_serve` answered from a commit's own written bytes (no fill).
     static WARM_HITS: AtomicU64 = AtomicU64::new(0);
 
-    /// F39UNAFSHOLDRELEASE (B1120): the MOUNT release stamp. `with_unafs_attempt` (:793) declares it BEFORE :794's guard, so it
-    /// drops right AFTER the guard unlocks MOUNT (reverse declaration order, early returns included) and before `attempt_span`'s
-    /// exit: `close`'s hold ends at the release, not after `note_attempt`.
-    pub struct Release<'a>(pub &'a mut u64);
+    /// F39UNAFSLOCKONE (rmbp-ledger B1125): every MOUNT take closed through a `Take` since boot (any span; `takes()`).
+    static TAKES: AtomicU64 = AtomicU64::new(0);
+
+    /// F39UNAFSLOCKONE (B1125): ONE guard type for every MOUNT take (UNAFS-LOCK-ONE). A stack local of the taking fn, opened
+    /// on the line BEFORE the take (or at `with_unafs_arm`'s :900 for the attempt) and stamped by `took` AFTER it, so no take
+    /// call's line or column moves (its `#[track_caller]` Location is in every x86 image). It holds no lock: it is declared
+    /// before the take's guard (or dropped after it), so its `Drop` (the census keep, `WORST` taken masked) always runs with
+    /// MOUNT released. The site is where it opened (`#[track_caller]`: the attempt's is `with_unafs`'s caller, as before).
+    /// Never on the overflow path (`lockowner_release` :2881, owed UNAFS-LOCK-DEATHPATH) nor `poison_leg`'s :4607 test peek.
+    pub struct Take {
+        site: &'static Location<'static>,
+        f0: u64,
+        t0: u64,
+        /// The take (0 = not stamped: a lock take's span is all wait, a try that never took keeps nothing).
+        took: core::cell::Cell<u64>,
+        /// The release, stamped by `Release` (0 = the hold runs to the drop).
+        rel: core::cell::Cell<u64>,
+        try_: bool,
+    }
+
+    impl Take {
+        /// A lock take opened now.
+        #[track_caller]
+        #[inline(always)]
+        pub fn open() -> Self {
+            Self::open_at(crate::hidstall::now_us())
+        }
+
+        /// :900 fold — the attempt, opened at HIDSTALL's `t_mask`.
+        #[track_caller]
+        #[inline(always)]
+        pub fn open_at(t0: u64) -> Self {
+            Take { site: Location::caller(), f0: tx_io().0, t0, took: core::cell::Cell::new(0), rel: core::cell::Cell::new(0), try_: false }
+        }
+
+        /// An expression-only take (:639, :1017: no statement after the take on its line): the take is stamped at open when
+        /// `m` is free (it cannot wait), else unstamped, so a peek's span is all wait when MOUNT was busy.
+        #[track_caller]
+        #[inline(always)]
+        pub fn peek<T: ?Sized>(m: &Mutex<T>) -> Self {
+            let t = Self::open();
+            if !m.is_locked() {
+                t.took.set(t.t0);
+            }
+            t
+        }
+
+        /// A `try_lock` take: kept only when `took` stamped it (a failed try never held).
+        #[track_caller]
+        #[inline(always)]
+        pub fn try_open() -> Self {
+            let mut t = Self::open();
+            t.try_ = true;
+            t
+        }
+
+        /// Right after the take.
+        #[inline(always)]
+        pub fn took(&self) {
+            self.took.set(crate::hidstall::now_us());
+        }
+
+        /// :793 fold — the release stamp by drop order (B1120): declared BEFORE :794's guard, it drops right after the unlock.
+        #[inline(always)]
+        pub fn release(&self) -> Release<'_> {
+            Release(&self.rel)
+        }
+    }
+
+    impl Drop for Take {
+        #[inline(always)]
+        fn drop(&mut self) {
+            let took = self.took.get();
+            if self.try_ && took == 0 {
+                return;
+            }
+            TAKES.fetch_add(1, Ordering::Relaxed);
+            close_at(self.site, self.f0, self.t0, took, self.rel.get());
+        }
+    }
+
+    /// F39UNAFSHOLDRELEASE (B1120): the MOUNT release stamp, a `Take`'s (F39UNAFSLOCKONE re-typed it onto the Take's cell).
+    /// `with_unafs_attempt` (:793) declares it BEFORE :794's guard, so it drops right AFTER the guard unlocks MOUNT (reverse
+    /// declaration order, early returns included) and before `attempt_span`'s exit: the hold ends at the release.
+    pub struct Release<'a>(&'a core::cell::Cell<u64>);
 
     impl Drop for Release<'_> {
         #[inline(always)]
         fn drop(&mut self) {
-            *self.0 = crate::hidstall::now_us();
+            self.0.set(crate::hidstall::now_us());
         }
     }
 
-    /// :899 fold — the attempt opens: the window fills so far.
-    #[inline(always)]
-    pub fn open() -> u64 {
-        tx_io().0
+    /// Every MOUNT take closed through a `Take` since boot.
+    pub fn takes() -> u64 {
+        TAKES.load(Ordering::Relaxed)
     }
 
-    /// :899 fold — the attempt (opened at `t0_us` with `f0` fills, MOUNT taken at `took_us`, 0 = never taken) ended, MOUNT
-    /// released. Over `OVER_US` it is counted and, when among the worst, kept with its site (`with_unafs`'s caller), task, fills
-    /// and its wait / hold split (F39UNAFSTRUESPAN: no take, i.e. the RENDERWEDGE Busy return, is all wait). F39UNAFSHOLDRELEASE
-    /// (B1120): the hold runs from the take to the release (`rel_us`, the `Release` stamp); wait + hold <= span, the rest the
-    /// release epilogue. No release stamp (never expected past a take): the hold runs to `close` as before.
-    #[track_caller]
+    /// A `Take` closed (opened at `t0_us` with `f0` fills, MOUNT taken at `took_us`, 0 = never taken), MOUNT released. Over
+    /// `OVER_US` it is counted and, when among the worst, kept with its site, task, fills and its wait / hold split
+    /// (F39UNAFSTRUESPAN: no take, i.e. the RENDERWEDGE Busy return, is all wait). F39UNAFSHOLDRELEASE (B1120): the hold runs
+    /// from the take to the release (`rel_us`, the `Release` stamp); wait + hold <= span, the rest the release epilogue. No
+    /// release stamp: the hold runs to the drop.
     #[inline(always)]
-    pub fn close(f0: u64, t0_us: u64, took_us: u64, rel_us: u64) {
+    fn close_at(site: &'static Location<'static>, f0: u64, t0_us: u64, took_us: u64, rel_us: u64) {
         let us = crate::hidstall::now_us().saturating_sub(t0_us);
         if us <= OVER_US {
             return;
         }
         let wait = if took_us == 0 { us } else { took_us.saturating_sub(t0_us).min(us) };
         let hold = if took_us != 0 && rel_us >= took_us { rel_us.saturating_sub(took_us).min(us - wait) } else { us - wait };
-        keep(Location::caller(), tx_io().0.wrapping_sub(f0), us, wait, hold);
+        keep(site, tx_io().0.wrapping_sub(f0), us, wait, hold);
     }
 
     #[inline(never)]
@@ -6072,7 +6151,7 @@ pub mod lockcensus {
         let kept = t.iter().filter(|h| h.site.is_some()).count();
         let n = OVER_N.swap(0, Ordering::Relaxed);
         let mut line = String::new();
-        let _ = write!(line, "[unafslock] holds why={} over_us={} n={} kept={} worst_us={}", why, OVER_US, n, kept, t[0].span_us);
+        let _ = write!(line, "[unafslock] holds why={} over_us={} n={} kept={} worst_us={} takes={}", why, OVER_US, n, kept, t[0].span_us, takes());
         for h in t.iter() {
             let Some(site) = h.site else { continue };
             let file = site.file().rsplit('/').next().unwrap_or(site.file());
