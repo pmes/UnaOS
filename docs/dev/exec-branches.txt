@@ -1541,3 +1541,11 @@ exec-rmbp-vugphotosidethinfit 5c7f3114c wave36 cut67h
 exec-rmbp-vugcomscanresumemodal 5c7f3114c wave36 cut67h
 exec-rmbp-vugscancoarsesymthree 5c7f3114c wave36 cut67h
 exec-rmbp-vugcomscanmdnsifmacos 5c7f3114c wave36 cut67h
+exec-rmbp-vugscancoarsesymthreekeep 750a1f0d8 wave36 cut68h
+exec-rmbp-vugdocphotorefcrop 750a1f0d8 wave36 cut68h
+exec-rmbp-vugphotosidethinparallel 750a1f0d8 wave36 cut68h
+exec-rmbp-vugphotosidethinedge 750a1f0d8 wave36 cut68h
+exec-rmbp-vugcomscanresumetool 750a1f0d8 wave36 cut68h
+exec-rmbp-vugcomscanmarlinjogmodal 750a1f0d8 wave36 cut68h
+exec-rmbp-vugintentfeaturesextenttable 750a1f0d8 wave36 cut68h
+exec-rmbp-vugintentfeaturesslot 750a1f0d8 wave36 cut68h
