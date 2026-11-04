@@ -853,7 +853,7 @@ pub fn app_name_arm(owner: u64, path: &str) -> bool {
     if owner == 0 || name.is_empty() {
         return false;
     }
-    let len = name.len().min(MAX_TITLE);
+    #[cfg(feature = "busreg")] { app_path_arm(owner, path); } let len = name.len().min(MAX_TITLE); // BUSREG-TAG-PATH (B1163): the path beside the name (file tail) — ⚠ LINE-NEUTRAL fold
     let mut t = APP_NAMES.lock();
     // Re-arm in place first: an owner already named must not occupy two rows, or `app_name_forget`
     // would clear one and leave the other to title the next tenant.
@@ -953,7 +953,7 @@ pub fn title_source_of(id: WinId) -> TitleSource {
 /// shell-launched program left, whose shell never reaped it" — which reads a stale NAME, never a
 /// wrong number, and is corrected by the next `app_name_arm` for that owner.
 pub fn app_name_forget(owner: u64) {
-    if owner == 0 {
+    #[cfg(feature = "busreg")] { app_path_forget(owner); } if owner == 0 { // BUSREG-TAG-PATH (B1163): the path goes with the name (file tail) — ⚠ LINE-NEUTRAL fold
         return;
     }
     let mut t = APP_NAMES.lock();
@@ -30508,7 +30508,7 @@ pub fn app_name_arm_launch(owner: u64, path: &str) -> bool {
         Some(n) => (n, "appres"),
         None => (alloc::string::String::from(program_name(path)), "path"),
     };
-    let armed = app_name_arm(owner, &name);
+    let armed = app_name_arm(owner, &name); #[cfg(feature = "busreg")] { app_path_arm(owner, path); } // BUSREG-TAG-PATH (B1163): the inner arm took the APPRES name, so the loaded path is armed after it (file tail) — ⚠ LINE-NEUTRAL fold
     serial_println!("[wm] launch-name owner={} path={} name={} via={} armed={}", owner, path, name, via, armed as u8);
     armed
 }
@@ -33717,4 +33717,51 @@ fn drain_shimtimed(fb: &super::FrameBuffer) -> bool {
 #[inline(always)]
 fn drain_shimtimed(fb: &super::FrameBuffer) -> bool {
     drain_deferred(fb)
+}
+
+// =================================================================================================
+// BUSREG-TAG-PATH (rmbp-ledger B1163) — TAIL-APPENDED, feature `busreg` only (knob-off: no symbol, no byte).
+// [`APP_NAMES`] keeps the 16-byte basename, so a program called PREFS.ELF launched from any path was `prefs`
+// to `bus_route`'s tag check (BUSREG-TAG-IDENTITY B1157). Every launcher that can start a fulfiller arms
+// through [`app_name_arm`] / [`app_name_arm_launch`] with the path it read the image from, so the PATH is kept
+// here, beside the name, armed by the same two calls and forgotten by [`app_name_forget`]. An ABSOLUTE path
+// is kept; anything else CLEARS the owner's row, so a recycled owner re-armed with a relative literal never
+// wears its predecessor's path. `bus_route` judges it (`tagpath_id`); this table only stores.
+// LOCK ORDER: a LEAF like [`APP_NAMES`] — armed before that mutex is taken, never held across another lock,
+// read by `bus_route::tag_id`, which is never called under its `REGS`.
+// =================================================================================================
+#[cfg(feature = "busreg")]
+static APP_PATHS: Mutex<alloc::vec::Vec<(u64, alloc::string::String)>> = Mutex::new(alloc::vec::Vec::new());
+
+/// BUSREG-TAG-PATH — record the path `owner`'s image was loaded from (absolute only; else clear the row).
+#[cfg(feature = "busreg")]
+fn app_path_arm(owner: u64, path: &str) {
+    if owner == 0 {
+        return;
+    }
+    let mut t = APP_PATHS.lock();
+    t.retain(|e| e.0 != owner);
+    if path.starts_with('/') {
+        t.push((owner, alloc::string::String::from(path)));
+    }
+}
+
+/// BUSREG-TAG-PATH — drop `owner`'s path (with its name, [`app_name_forget`]).
+#[cfg(feature = "busreg")]
+fn app_path_forget(owner: u64) {
+    if owner == 0 {
+        return;
+    }
+    APP_PATHS.lock().retain(|e| e.0 != owner);
+}
+
+/// BUSREG-TAG-PATH — `f(path)` for `owner`'s armed path; `None` = no path armed. `f` runs under the leaf lock
+/// and must take no lock.
+#[cfg(feature = "busreg")]
+pub fn app_path_with(owner: u64, f: impl FnOnce(&str) -> bool) -> Option<bool> {
+    if owner == 0 {
+        return None;
+    }
+    let t = APP_PATHS.lock();
+    t.iter().find(|e| e.0 == owner).map(|e| f(e.1.as_str()))
 }
