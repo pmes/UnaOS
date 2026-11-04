@@ -1648,7 +1648,7 @@ fn r3_tick() {
     if !pending {
         return;
     }
-    let r = start(rate, ch, bits); // SINKALL: the Player is a mixer source now, never a second client of this stream
+    if super::start_off_pump(r3_tick) { return; } let r = start(rate, ch, bits); // PUMPHDA (B1091): on the pump the start is POSTED to the `hda-start` task, which runs this tick itself (hda.rs tail). SINKALL: the Player is a mixer source now, never a second client of this stream
     let epoch = EPOCH.load(Ordering::Acquire);
     let mut g = R3S.lock();
     match g.as_mut().filter(|s| s.handle == handle) {

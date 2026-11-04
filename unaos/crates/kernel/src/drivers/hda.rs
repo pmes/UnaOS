@@ -2270,7 +2270,7 @@ fn run_tone(base: u64, rings: &mut Rings, iss: u8, walk: Option<&CodecWalk>, ws:
 
 /// BOOTSLOW — `probe()` once, from a device-service pass, after the root pass's verdict.
 pub fn probe_after_root() {
-    if ring::parked() { return; } ring::leg_maybe(); // HDARING (B811) M3: the hda step (NETSPLIT B852: its own, P_HDA) is off the pump while parked; the gatesteal2 leg's park point (idle = one load)
+    if ring::parked() { return; } ring::leg_maybe(); if start_busy() { return; } // PUMPHDA (B1091): a stream start runs on the `hda-start` task — the hda step returns before `play::service` until it is done (file tail). HDARING (B811) M3: the hda step (NETSPLIT B852: its own, P_HDA) is off the pump while parked; the gatesteal2 leg's park point (idle = one load)
     #[cfg(feature = "hda-tone")] play::service(); static DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false); // PLAYWAV (R75): the stream's refill tick (idle = one atomic load), LINE-NEUTRAL fold
     if DONE.load(core::sync::atomic::Ordering::Relaxed) || !crate::fs::bootdisk::root_pass_open("hda") || !crate::boot::services_gate("hda") || bar_holds() { // KVMLAT2 (B576): and not before the bar's first paint (`bar_holds`, file tail). FIRSTBOOT (R77): no HDA bring-up (the boot tone) before the Desktop stage. LINE-NEUTRAL fold.
         return;
@@ -3977,5 +3977,216 @@ fn alc_depop_selftest() {
     serial_println!(
         "[hda] depop kat verbs={} order={} rmw={} poll={} nack={} -> {}",
         f.verbs(), w(order), w(rmw), w(poll), w(nack), w(order && rmw && poll && nack)
+    );
+}
+
+// ===================== PUMPHDA (rmbp-ledger B1091) — THE STREAM START LEAVES THE HID PUMP — TAIL-APPENDED =====================
+// Flight 39 boot 1 (docs/dev/evidence/rmbp-0915/flight39/FLIGHT39.md §2): the usb-pump died 42 times in 8 minutes, every
+// death on its `hda` step. Measured (design /root/unaos-bench/scratch/cloud/wave36/pumphda/design.md): the step's
+// `probe_after_root` -> `play::service` -> `r3_tick` ran the mixer's PENDING stream `start` (-> `probe` -> `start_reattach`)
+// SYNCHRONOUSLY on the pump — 12-67 ms early, then 6.9-15.5 s (`[hda] start … ms=7733`); PUMPWEDGE's 2 s bound (right: HID
+// was off) re-homed the pump; the fresh pump called `start` again beside the revenant still inside it holding `ring::DEV`
+// (R3S stays PENDING until `start` returns), forever. Now `r3_tick` (its `start` line, same-line fold) asks
+// [`start_off_pump`]: on the pump, the start is POSTED to ONE `hda-start` task — PRTSCROFFPUMP's post-once shape
+// (video/prtscr.rs `capture_post`), SMALLFIX8's off-pump core (`xhci_worker_cpu(0)`, never the pump's), PUMPSTACK's
+// `PUMP_PATH_STACK_SIZE` — which runs `r3_tick` ITSELF (the unchanged pending branch: `start`, R3S's handle filter, the
+// closed-while-coming-up stop). While it runs the pump's hda step returns before `play::service` ([`start_busy`], the
+// park line's fold), so the amp's idle drop, the alert and the refill never interleave with a start (the exclusion the
+// pump gave when the start ran on it). Not the pump (a fixture's or the shell's `service`), or no such core: inline, as
+// before. Blueprint: audio.md BP-audio-19 (e).
+
+/// PUMPHDA — a stream start is in flight on the `hda-start` task (set by the post's CAS, cleared by the worker's exit).
+#[cfg(feature = "hda-tone")]
+static PH_BUSY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// PUMPHDA — the worker's tid while it runs its tick (its own `r3_tick` runs `start` inline).
+#[cfg(feature = "hda-tone")]
+static PH_TID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "hda-tone")]
+static PH_T0: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "hda-tone")]
+static PH_CPU: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+#[cfg(feature = "hda-tone")]
+static PH_POSTS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+#[cfg(feature = "hda-tone")]
+static PH_DONE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+#[cfg(feature = "hda-tone")]
+static PH_INLINE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// PUMPHDA — the last posted start's wall ms (post to done, the witness's delay included).
+#[cfg(feature = "hda-tone")]
+static PH_LAST_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// PUMPHDA — `tests pumphda`'s one-shot delay before the worker's tick (0 = none; swapped to 0 by the worker).
+#[cfg(feature = "hda-tone")]
+static PH_SLOW_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "hda-tone")]
+static PH_STUCK_SAID: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+#[cfg(feature = "hda-tone")]
+static PH_INLINE_SAID: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// PUMPHDA — a worker past this is said once per post (the stream stays pending; the pump keeps HID).
+#[cfg(feature = "hda-tone")]
+const PH_STUCK_MS: u64 = 60_000;
+
+/// PUMPHDA — the pump's hda step returns before `play::service` while a start runs off the pump (idle = one load).
+#[cfg(feature = "hda-tone")]
+fn start_busy() -> bool {
+    PH_BUSY.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// PUMPHDA — no stream start without `hda-tone`: never busy.
+#[cfg(not(feature = "hda-tone"))]
+#[inline]
+fn start_busy() -> bool {
+    false
+}
+
+/// PUMPHDA — `r3_tick`'s door before its `start` (`tick` = `r3_tick`): `true` = the caller returns now (the start is the
+/// `hda-start` task's), `false` = run `start` here (the worker's own tick, a caller that is not the pump, or no worker core).
+#[cfg(feature = "hda-tone")]
+pub(super) fn start_off_pump(tick: fn()) -> bool {
+    use core::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
+    let me = crate::arch::sched::current_id().unwrap_or(0);
+    if me != 0 && me == PH_TID.load(Acquire) {
+        return false;
+    }
+    if PH_BUSY.load(Acquire) {
+        let age = crate::arch::ms().saturating_sub(PH_T0.load(Relaxed));
+        if age >= PH_STUCK_MS && !PH_STUCK_SAID.swap(true, AcqRel) {
+            serial_println!(
+                "[hda] start on=task stuck ms={} cpu={} (PUMPHDA B1091: the stream stays pending; the pump keeps HID)",
+                age, PH_CPU.load(Relaxed)
+            );
+        }
+        return true;
+    }
+    if !crate::arch::sched::singleton_is_current() {
+        return false;
+    }
+    let pump = crate::hidstall::pump_cpu();
+    let Some(cpu) = crate::arch::smp::xhci_worker_cpu(0).filter(|&c| c != pump) else {
+        PH_INLINE.fetch_add(1, Relaxed);
+        if !PH_INLINE_SAID.swap(true, Relaxed) {
+            serial_println!("[hda] start on=pump (no worker core apart from the pump's c{}: the start stays inline as before)", pump);
+        }
+        return false;
+    };
+    if PH_BUSY.compare_exchange(false, true, AcqRel, Acquire).is_err() {
+        return true;
+    }
+    PH_T0.store(crate::arch::ms(), Relaxed);
+    PH_CPU.store(cpu as u32, Relaxed);
+    PH_STUCK_SAID.store(false, Relaxed);
+    PH_TID.store(0, Release);
+    PH_POSTS.fetch_add(1, Relaxed);
+    crate::arch::sched::spawn_stack("hda-start", start_worker, tick as usize, cpu, crate::arch::sched::PRIO_NORMAL, crate::arch::sched::PUMP_PATH_STACK_SIZE);
+    true
+}
+
+/// PUMPHDA — `hda-start`: run the posted `r3_tick` (its pending branch runs `start` here), say it, clear the busy word, exit.
+#[cfg(feature = "hda-tone")]
+fn start_worker(t: usize) {
+    use core::sync::atomic::Ordering::{AcqRel, Relaxed, Release};
+    // SAFETY: `t` is the `fn()` `start_off_pump` passed as its spawn argument, unchanged (fs/bootlog.rs `flusher`'s round trip).
+    let tick: fn() = unsafe { core::mem::transmute::<usize, fn()>(t) };
+    PH_TID.store(crate::arch::sched::current_id().unwrap_or(0), Release);
+    let slow = PH_SLOW_MS.swap(0, AcqRel);
+    if slow != 0 {
+        crate::arch::sched::sleep_ms(slow);
+    }
+    tick();
+    let ms = crate::arch::ms().saturating_sub(PH_T0.load(Relaxed));
+    PH_LAST_MS.store(ms, Relaxed);
+    let posts = PH_POSTS.load(Relaxed);
+    PH_DONE.fetch_add(1, Relaxed);
+    serial_println!(
+        "[hda] start on=task cpu={} from=pump ms={} posts={} slow_ms={} (PUMPHDA B1091: the stream open left the hid pump; the pump only polls the busy word)",
+        PH_CPU.load(Relaxed), ms, posts, slow
+    );
+    PH_TID.store(0, Release);
+    PH_BUSY.store(false, Release);
+}
+
+/// PUMPHDA — `(posts, done, inline, last start's ms)` since boot (`tests pumphda` reads the deltas).
+#[cfg(feature = "hda-tone")]
+pub fn pumphda_counts() -> (u32, u32, u32, u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    (PH_POSTS.load(Relaxed), PH_DONE.load(Relaxed), PH_INLINE.load(Relaxed), PH_LAST_MS.load(Relaxed))
+}
+
+/// PUMPHDA — the next posted start waits `ms` before its tick (0 disarms).
+#[cfg(feature = "hda-tone")]
+fn start_slow_arm(ms: u64) {
+    PH_SLOW_MS.store(ms, core::sync::atomic::Ordering::Release);
+}
+
+/// PUMPHDA — the pump's wedge deaths (PUMPWEDGE's edge, GATESTEAL2's count); None without the watch (`wc`).
+#[cfg(all(feature = "hda-tone", feature = "wc"))]
+fn pumphda_deaths() -> Option<u32> {
+    Some(crate::sessionwedge::gatesteal2_rehome().1)
+}
+
+#[cfg(all(feature = "hda-tone", not(feature = "wc")))]
+fn pumphda_deaths() -> Option<u32> {
+    None
+}
+
+/// PUMPHDA — `tests pumphda`: the Player's synth WAV is opened and the PUMP's hda step (never this fixture: it does not
+/// call `service`) picks the mixer's HDA start up; the start is forced 2500 ms slow (past PUMPWEDGE's WEDGE_MS) by the
+/// worker's one-shot delay. PASS iff the start was posted and done off the pump, took >= the delay, and no restart and no
+/// wedge death landed across it.
+#[cfg(feature = "hda-tone")]
+pub fn pumphda_selftest() {
+    const SLOW: u64 = 2_500;
+    const WAIT_MS: u64 = 12_000;
+    const NO_OPEN_MS: u64 = 4_000;
+    if crate::arch::sched::singleton_step_parked(crate::video::lag::P_HDA).is_some() {
+        serial_println!(":: PUMPHDA: -> SKIP(parked) :: (PUMPHDA B1091: the hda step is parked; nothing would pick the start up)");
+        return;
+    }
+    let Some(path) = play::fixture_file() else {
+        serial_println!(":: PUMPHDA: -> SKIP(no-home) :: (PUMPHDA B1091: no writable home for the synth WAV)");
+        return;
+    };
+    let (p0, d0, i0, _) = pumphda_counts();
+    let o0 = crate::audio::mixer::hda_opens();
+    let r0 = crate::arch::sched::singleton_restarts();
+    let k0 = pumphda_deaths();
+    start_slow_arm(SLOW);
+    let opened_ok = play::open_player(&path).is_ok();
+    let t0 = crate::arch::ms();
+    while opened_ok {
+        let (p, d, i, _) = pumphda_counts();
+        let el = crate::arch::ms().saturating_sub(t0);
+        if d != d0 || i != i0 || el > WAIT_MS {
+            break;
+        }
+        if p == p0 && crate::audio::mixer::hda_opens() == o0 && el > NO_OPEN_MS {
+            break;
+        }
+        crate::arch::sched::sleep_ms(20);
+    }
+    start_slow_arm(0);
+    play::stop_all();
+    play::fixture_drop(&path);
+    let (p1, d1, i1, last) = pumphda_counts();
+    let (posts, done, inline) = (p1.wrapping_sub(p0), d1.wrapping_sub(d0), i1.wrapping_sub(i0));
+    let opened = crate::audio::mixer::hda_opens().wrapping_sub(o0);
+    let restarts = crate::arch::sched::singleton_restarts().wrapping_sub(r0);
+    let deaths = match (k0, pumphda_deaths()) { (Some(a), Some(b)) => Some(b.wrapping_sub(a)), _ => None };
+    let start_ms = if done != 0 { last } else { 0 };
+    let verdict = if !opened_ok {
+        "SKIP(no-codec)"
+    } else if inline != 0 {
+        "SKIP(no-worker-core)"
+    } else if opened == 0 && posts == 0 {
+        "SKIP(sink)"
+    } else if posts >= 1 && done >= 1 && start_ms >= SLOW && restarts == 0 && deaths.unwrap_or(0) == 0 {
+        "PASS"
+    } else {
+        "FAIL"
+    };
+    let mut dw = alloc::string::String::new();
+    match deaths { Some(n) => { let _ = core::fmt::Write::write_fmt(&mut dw, format_args!("+{}", n)); } None => dw.push('-') }
+    serial_println!(
+        ":: PUMPHDA: opened={} posts={} done={} inline={} start_ms={} slow_ms={} restarts=+{} deaths={} -> {} :: (PUMPHDA B1091: the stream start on its own task, the pump stamping through it)",
+        opened, posts, done, inline, start_ms, SLOW, restarts, dw, verdict
     );
 }
