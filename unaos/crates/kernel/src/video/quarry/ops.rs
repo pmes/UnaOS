@@ -445,7 +445,7 @@ pub fn sheet_probe() -> (bool, bool) {
         sheet::seal_row(&mut refrow);
         darker &= band_px[k] == refrow[bw + 1] & 0x00FF_FFFF;
     }
-    menu_ok &= fit_probe(&g) && page_probe(&g); // QUARRYMENUFIT (B1107): the live fit rule, in a window shorter than the menu · F39MENUSCROLL (B1119): its second page
+    menu_ok &= fit_probe(&g) && page_probe(&g); menu_ok &= a11y_probe(); // QUARRY-MENU-A11Y-WITNESS (B1132): the live menu's census leg (file tail), its verdict in quarry_menu= · QUARRYMENUFIT (B1107): the live fit rule, in a window shorter than the menu · F39MENUSCROLL (B1119): its second page
     (menu_ok, darker && band_px[0] != band_px[1])
 }
 
@@ -1601,3 +1601,75 @@ pub fn a11y_menu_up() -> bool {
     MENU_UP.load(Ordering::Acquire)
 }
 
+// ── QUARRY-MENU-A11Y-WITNESS (rmbp-ledger B1132): the LIVE menu's accessibility census — TAIL-APPENDED ────────────────
+// `sheet_probe` paints offscreen and never raises `MENU_UP`, so no run read B1126's `[a11y] census kind=menu stops=<n>
+// up=1`. This leg raises THE menu on Quarry's own live window through the open road (`right_press`, a panel point on the
+// list body's first row), reads the tree's census once (`wm::a11y::quarry_menu_census`: the MENU children of Quarry's
+// node, the one count `tests a11ytree` prints) and lowers it through THE dismiss (`menu_key(0x1B)`, Escape's arm). It
+// holds no pointer, so the walk's `sel` cannot move between the open and the read (B1126's roundtrip hazard); it is
+// read before and after. `quarry::live::hover_selftest`'s shape: open when closed (a declined open SKIPs, never reds),
+// raise over the shell's rows, the model's sel / scroll / focus put back, closed when this leg opened it, the focus
+// owner restored. No Quarry lock is held across `right_press`, the census build (TABLE, then MODEL -> MENU) or the
+// dismiss. One `[menuscraft] quarry_a11y` line.
+
+/// QUARRY-MENU-A11Y-WITNESS (B1132) — `sheet_probe`'s live leg: `true` = the open menu's stops equal the rows its fit
+/// shows, `up=1`, the lit count matches the walk's `sel`, and after the dismiss the census is 0 with the menu down.
+fn a11y_probe() -> bool {
+    let saved_focus = wm::focus_asid();
+    let was_open = is_open();
+    if !was_open {
+        open();
+    }
+    if !is_open() {
+        wm::focus_changed(saved_focus);
+        serial_println!("[menuscraft] quarry_a11y declined reason=open -> skip");
+        return true;
+    }
+    let id = WIN.load(Ordering::Relaxed);
+    let _ = wm::raise_one(id);
+    let Some(info) = wm::info(id) else {
+        if !was_open { close(); }
+        wm::focus_changed(saved_focus);
+        serial_println!("[menuscraft] quarry_a11y declined reason=geometry -> skip");
+        return true;
+    };
+    let Some((geom, saved)) = MODEL.lock().as_ref().map(|m| (m.geom, (m.list_sel, m.list_scroll, m.focus))) else {
+        if !was_open { close(); }
+        wm::focus_changed(saved_focus);
+        serial_println!("[menuscraft] quarry_a11y declined reason=model -> skip");
+        return true;
+    };
+    let sc = info.scale.max(1);
+    let li = geom.list_pane().inner();
+    let rh = geom.row_h();
+    let (sx, sy) = (li.x + li.w / 2, li.y + rh + rh / 2);
+    let _ = right_press((info.x + sx * sc) as i32, (info.y + sy * sc) as i32); // THE open road
+    let up = MENU_UP.load(Ordering::Acquire);
+    let rows = menu_fit(&geom).0;
+    let sel0 = MENU.lock().as_ref().and_then(|mn| mn.walk.sel);
+    let (stops, lit) = crate::video::wm::a11y::quarry_menu_census();
+    let sel1 = MENU.lock().as_ref().and_then(|mn| mn.walk.sel);
+    if up {
+        let _ = menu_key(0x1B); // THE dismiss (Escape's arm)
+    }
+    let (down, _) = crate::video::wm::a11y::quarry_menu_census();
+    let up_after = MENU_UP.load(Ordering::Acquire);
+    if let Some(m) = MODEL.lock().as_mut() {
+        m.list_sel = saved.0;
+        m.list_scroll = saved.1;
+        m.focus = saved.2;
+    }
+    if !was_open {
+        close();
+    } else {
+        repaint();
+    }
+    wm::focus_changed(saved_focus);
+    let ok = up && rows > 0 && stops == rows && sel0 == sel1 && lit == sel0.is_some() as usize && down == 0 && !up_after;
+    let sel_s = match sel0 { Some(i) => alloc::format!("{}", i), None => String::from("-") };
+    serial_println!(
+        "[menuscraft] quarry_a11y stops={} rows={} up={} sel={} lit={} down={}/{} -> {}",
+        stops, rows, up as u8, sel_s, lit, down, up_after as u8, if ok { "ok" } else { "BAD" }
+    );
+    ok
+}
