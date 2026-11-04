@@ -236,7 +236,8 @@ pub struct PumpDesk {
     /// (SR597): on by default, riding the hello (read only where the hello is on).
     envelope: bool,
     /// VUGCOMSCANENVELOPEBOUND (SR602): the controller's travel the first open read, kept for the jog's [`bound`]; `None`:
-    /// the hello or the read is off, the controller did not answer, or a relink since (a reopen never reads it).
+    /// the hello or the read is off or the controller did not answer. VUGCOMSCANRELINKENVELOPE (SR607): an accepted relink
+    /// reads it again (the start's spec, [`PumpDesk::envelope_spec_for`]) and keeps the reopen's answer.
     read: Option<Envelope>,
 }
 
@@ -574,14 +575,19 @@ impl PumpDesk {
     }
 
     /// The opener's answer for a redial (the opener's own handshake and banner wait included). Taken only while the
-    /// run is still lost and link-less; otherwise the new link is dropped and nothing is said.
+    /// run is still lost and link-less; otherwise the new link is dropped and nothing is said. VUGCOMSCANRELINKENVELOPE
+    /// (SR607): the travel is read after the hello, as at the start ([`with_envelope`]).
     pub fn relinked(&mut self, now_us: u64, res: Result<Box<dyn Transport + Send>, String>) -> Vec<PumpEvent> {
         let spec = self.hello_spec(); // VUGCOMSCANHELLOID (SR546): the reopened link says who it is first
-        self.relinked_said(now_us, with_hello(res, spec).map(|(l, s)| (l, s, None, None))) // VUGCOMSCANJOG (SR573): a reopen never commissions; VUGCOMSCANALARMIDLE (SR591): nor reads the envelope
+        let read = self.running_dialect().and_then(|d| self.envelope_spec_for(d)); // VUGCOMSCANRELINKENVELOPE (SR607): the start's travel read, the same spec
+        self.relinked_said(now_us, with_envelope(with_hello(res, spec).map(|(l, s)| (l, s, None, None)), read)) // VUGCOMSCANJOG (SR573): a reopen never commissions; VUGCOMSCANRELINKENVELOPE (SR607): it reads the travel again
     }
 
     /// [`PumpDesk::relinked`] with the reopened link's identity answer beside it (VUGCOMSCANHELLOID, SR546): an answer
     /// that differs from the one the first open kept refuses the relink by name and the redial goes on.
+    /// VUGCOMSCANRELINKENVELOPE (SR607): an accepted relink keeps the reopen's travel read (the fourth slot) as the jog's
+    /// bound and says the differing axes through the one sayer ([`PumpDesk::envelope_words`]) only when the read changed
+    /// from the kept one; a refused or failed reopen leaves the kept read.
     pub fn relinked_said(
         &mut self,
         now_us: u64,
@@ -593,6 +599,7 @@ impl PumpDesk {
         if r.link.is_some() {
             return Vec::new();
         }
+        let mut fresh: Option<Envelope> = None; // VUGCOMSCANRELINKENVELOPE (SR607): the reopen's read when it changed
         let word = match res {
             Ok((link, now, _, _)) if r.hello.is_some() && now != r.hello => {
                 drop(link); // another board: its link (a tty's exclusive fd) goes at once
@@ -602,10 +609,11 @@ impl PumpDesk {
                 let was = r.hello.clone().unwrap_or_default();
                 format!("reconnect attempt {k} refused: {:?}; attempt {} in {} ms", Refused::AnotherBoard { was, now }, d.attempt(), d.wait_us() / 1000)
             }
-            Ok((link, _, _, _)) => {
+            Ok((link, _, _, env)) => {
                 r.link = Some(link);
                 r.redial = None;
-                self.read = None; // VUGCOMSCANENVELOPEBOUND (SR602): the reopened board was not asked its travel: the declared bound until the next start
+                fresh = if env != self.read { env } else { None }; // VUGCOMSCANRELINKENVELOPE (SR607): said again only when it changed
+                self.read = env; // VUGCOMSCANENVELOPEBOUND (SR602); VUGCOMSCANRELINKENVELOPE (SR607): the reopen's read (None: off or unanswered, the declared bound)
                 format!("relinked on attempt {}; re-arm to resume from line {at_line}", d.attempt())
             }
             Err(why) => {
@@ -615,7 +623,11 @@ impl PumpDesk {
                 format!("reconnect attempt {k} failed: {why}; attempt {} in {} ms", d.attempt(), d.wait_us() / 1000)
             }
         };
-        vec![self.squawk(Some(word))]
+        let mut out = vec![self.squawk(Some(word))];
+        for w in self.envelope_words(fresh) {
+            out.push(self.squawk(Some(w))); // VUGCOMSCANRELINKENVELOPE (SR607): the one sayer, after the relinked word
+        }
+        out
     }
 
     /// Re-arm a lost run once its link is back: a fresh Helm `Verdict::Pass` for the SAME program on the desk's
@@ -651,7 +663,7 @@ async fn redial(synapse: &Synapse, desk: &Mutex<PumpDesk>, open: &mut Box<Opener
     let out = open_road(
         desk,
         open,
-        |d| d.redial_due(now).zip(d.running_dialect()).map(|(port, dl)| (port, dl, d.hello_spec(), None, None)).ok_or_else(Vec::new), // VUGCOMSCANHOSTDESK (SR561): a reopen never commissions (VUGCOMSCANALARMIDLE SR591: nor reads the envelope); VUGCOMSCANHOSTDIALECT (SR566): the run's dialect
+        |d| d.redial_due(now).zip(d.running_dialect()).map(|(port, dl)| (port, dl, d.hello_spec(), None, d.envelope_spec_for(dl))).ok_or_else(Vec::new), // VUGCOMSCANHOSTDESK (SR561): a reopen never commissions; VUGCOMSCANRELINKENVELOPE (SR607): it reads the travel, the start's spec; VUGCOMSCANHOSTDIALECT (SR566): the run's dialect
         |d, res| d.relinked_said(t0.elapsed().as_micros() as u64, res),
     )
     .await
@@ -1393,7 +1405,7 @@ pub fn with_envelope(res: Result<Opened, String>, read: Option<(Dialect, Duratio
 }
 
 impl PumpDesk {
-    /// Turn the travel read on (or off): every later PumpStart asks the controller its travel after the hello and says a
+    /// Turn the travel read on (or off): every later PumpStart (and accepted relink, SR607) asks the controller its travel after the hello and says a
     /// travel that differs from the declared machine's once (`envelope differs axis=<a> declared=<d> controller=<c>`); the
     /// tighter of the declared and the read travel is the jog's bound ([`bound`], VUGCOMSCANENVELOPEBOUND SR602). VUGCOMSCANENVELOPEREADON (SR597): on by default wherever the hello is on (the
     /// bus, [`compose`]); `envelope_read(false)` is the off switch.
