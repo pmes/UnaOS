@@ -314,7 +314,7 @@ pub fn fulfiller_reply(ops: &Ops, row: usize, rgen: u64, hdr: &crate::bus::BusHd
         return 0;
     }
     if !(if p.caller_row == crate::prefs_client::KCLIENT_ROW { crate::prefs_client::inbox_has_room() } else { (ops.has_room)(p.caller_row) }) {
-        return EAGAIN; // pending kept — the fulfiller may retry
+        if p.caller_row == crate::prefs_client::KCLIENT_ROW && hdr.status != una_abi::BUS_STATUS_MORE && crate::prefs_client::queued_answer(p.caller_corr, hdr.status) { take_pending(|q| q.relay == relay); return 0; } return EAGAIN; // pending kept — the fulfiller may retry. QUEUED-SET-STUCKLIVE (B1187): a queued kernel-client SET's answer refused by the full inbox is delivered to its ring entry (prefs_client file tail). LINE-NEUTRAL fold, code first.
     }
     // The `more` flag (VEINCORE B304, kept by LUMENAPP B323 as bus mechanism). A BUS_STATUS_MORE frame is
     // one non-final frame of a multi-frame answer: delivered WITH its body, the pending entry LEFT OPEN for the next; status 0 / an errno closes.
