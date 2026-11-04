@@ -537,7 +537,7 @@ fn run(a: &Args) -> Result<String, Refusal> {
         },
         None => (None, None, None),
     };
-    let (intent, gdt) = if refused.is_some() { (String::new(), String::new()) } else { (intent_road(a, &detected)?, gdt_road(a, &sm, dev.as_ref(), t.trunc_mm())?) }; // VUGINTENTSCANWIRE (SR515): before anything is written; VUGSCANGDT (SR542) gdt_road too
+    let (intent, gdt) = if refused.is_some() { (String::new(), String::new()) } else { (intent_road(a, &detected, &sm.mesh.positions)?, gdt_road(a, &sm, dev.as_ref(), t.trunc_mm())?) }; // VUGINTENTSCANWIRE (SR515): before anything is written; VUGSCANGDT (SR542) gdt_road too
 
     // The PLY: scan_core's mesh IS mesh_core's (VUGSHIMSWAP SR473), straight into mesh_core's writer.
     let out = a.out.as_deref().unwrap_or_default();
@@ -805,8 +805,10 @@ fn intent_doc(it: &mut std::iter::Peekable<impl Iterator<Item = String>>) -> Opt
 /// takes |n.o - d| and the unsigned axis angle, so detect's arbitrary normal sign is carried as is), the cylinder a
 /// point on its axis, the axis and the radius, the cone its apex, its axis into the opening and its half-angle in
 /// radians; mm throughout; one geom_core `Vec3`. support and rms_mm are carried; fraction, max_mm and inliers have no
-/// field.
-fn shape_ref(s: &Shape) -> doc_core::ShapeRef {
+/// field. VUGINTENTFEATURESEXTENT (SR653): `points` (the slice detect ran on) gives the extent: the inliers' [min, max]
+/// along the unit axis from the cylinder's point or the cone's apex; None for a plane or a sphere, no inliers, or an
+/// inlier index past `points`.
+fn shape_ref(s: &Shape, points: &[Vec3]) -> doc_core::ShapeRef {
     use doc_core::ShapeParams;
     let params = match s.kind {
         Primitive::Plane(p) => ShapeParams::Plane { normal: p.normal, d: p.d },
@@ -814,7 +816,18 @@ fn shape_ref(s: &Shape) -> doc_core::ShapeRef {
         Primitive::Sphere(p) => ShapeParams::Sphere { centre: p.centre, radius: p.radius },
         Primitive::Cone(c) => ShapeParams::Cone { apex: c.apex, axis: c.axis, half_angle: c.half_angle },
     };
-    doc_core::ShapeRef { params, support: s.support, rms_mm: s.rms_mm }
+    let along = match s.kind {
+        Primitive::Cylinder(c) => Some((c.point, c.axis)),
+        Primitive::Cone(c) => Some((c.apex, c.axis)),
+        _ => None,
+    };
+    let extent = along.and_then(|(o, a)| {
+        let u = a.normalize().ok()?;
+        let ts: Vec<f64> = s.inliers.iter().map(|&i| points.get(i as usize).map(|&p| u.dot(p - o))).collect::<Option<_>>()?;
+        let (lo, hi) = ts.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(l, h), &t| (l.min(t), h.max(t)));
+        (lo <= hi).then_some([lo, hi])
+    });
+    doc_core::ShapeRef { params, support: s.support, rms_mm: s.rms_mm, extent }
 }
 
 /// (sigma_mm, sigma_deg): the largest shape fit rms (scan_core's own residual; the worst-fitting shape sets the one
@@ -833,14 +846,14 @@ fn intent_sigma(shapes: &[Shape]) -> (f64, f64) {
 /// `verify_all` disposes each in order (BP-vug-7), and `Batch::text` is appended verbatim (`intent: proposed= accepted=
 /// refused=`, then one `accept` / `refuse` line per proposal). A detect refusal prints `intent: refused`. Without
 /// `--intent`, empty.
-fn intent_road(a: &Args, detected: &Result<Vec<Shape>, FitError>) -> Result<String, Refusal> {
+fn intent_road(a: &Args, detected: &Result<Vec<Shape>, FitError>, points: &[Vec3]) -> Result<String, Refusal> {
     let Some(doc_path) = &a.intent else { return Ok(String::new()) };
     let shapes = match detected {
         Ok(s) => s,
         Err(e) => return Ok(format!("intent: refused {e:?}\n")),
     };
     let (sigma_mm, sigma_deg) = intent_sigma(shapes);
-    let m = doc_core::Measurement::Shapes { shapes: shapes.iter().map(shape_ref).collect(), sigma_mm, sigma_deg };
+    let m = doc_core::Measurement::Shapes { shapes: shapes.iter().map(|s| shape_ref(s, points)).collect(), sigma_mm, sigma_deg };
     let mut out = String::new();
     for l in doc_core::measurements_text(&m).lines() {
         let _ = writeln!(out, "intent: {l}");
@@ -872,17 +885,22 @@ mod intent_tests {
         let post = Scene::bench().cylinders[0];
         let z = Vec3::new(0.0, 0.0, 1.0);
         let c = Cylinder { point: post.base, axis: z, radius: post.radius };
-        let r = shape_ref(&shape(Primitive::Cylinder(c), 1234, 0.21));
+        let r = shape_ref(&shape(Primitive::Cylinder(c), 1234, 0.21), &[]);
         let ShapeParams::Cylinder { point, axis, radius } = r.params else { panic!("not a cylinder: {:?}", r.params) };
         assert!((point - post.base).mag() < 1e-9, "point {point:?}");
         assert!((axis - z).mag() < 1e-9, "axis {axis:?}");
         assert!((radius - post.radius).abs() < 1e-9, "radius {radius}");
         assert_eq!((r.support, r.rms_mm, r.kind()), (1234, 0.21, "cylinder"));
+        // VUGINTENTFEATURESEXTENT (SR653): no inliers, no extent; two inliers at z 2 and 9 about a point at z 5: [-3, 4].
+        assert_eq!(r.extent, None);
+        let c5 = Cylinder { point: Vec3::new(0.0, 0.0, 5.0), axis: z, radius: 3.0 };
+        let pts = [Vec3::new(3.0, 0.0, 2.0), Vec3::new(0.0, 3.0, 9.0)];
+        assert_eq!(shape_ref(&Shape { inliers: vec![0, 1], ..shape(Primitive::Cylinder(c5), 2, 0.1) }, &pts).extent, Some([-3.0, 4.0]));
         let pl = Plane { normal: Vec3::new(0.0, 0.0, -1.0), d: -100.0 };
-        assert_eq!(shape_ref(&shape(Primitive::Plane(pl), 9, 0.1)).params, ShapeParams::Plane { normal: pl.normal, d: -100.0 });
+        assert_eq!(shape_ref(&shape(Primitive::Plane(pl), 9, 0.1), &[]).params, ShapeParams::Plane { normal: pl.normal, d: -100.0 });
         let k = Cone { apex: Vec3::new(1.0, 2.0, 3.0), axis: Vec3::new(0.0, 1.0, 0.0), half_angle: 0.3 };
         assert_eq!(
-            shape_ref(&shape(Primitive::Cone(k), 7, 0.05)).params,
+            shape_ref(&shape(Primitive::Cone(k), 7, 0.05), &[]).params,
             ShapeParams::Cone { apex: k.apex, axis: k.axis, half_angle: 0.3 }
         );
         let ss = [shape(Primitive::Plane(pl), 9, 0.1), shape(Primitive::Cylinder(c), 1234, 0.21)];

@@ -611,6 +611,10 @@ pub struct ShapeRef {
     pub params: ShapeParams,
     pub support: u32,
     pub rms_mm: f64,
+    /// VUGINTENTFEATURESEXTENT (SR653): the support's [min, max] along the UNIT axis (mm), from the cylinder's `point`
+    /// or the cone's `apex` (into the opening); None for a plane or a sphere, or when the copy had no inlier points
+    /// (the feature rule then takes the support-centroid road, SR536).
+    pub extent: Option<[f64; 2]>,
 }
 
 impl ShapeRef {
