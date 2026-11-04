@@ -330,8 +330,9 @@ impl Journal {
         self.note = None;
     }
 
-    /// A history edit: regenerate `cand`, and only then make it the document (a snapshot).
-    fn adopt(&mut self, cand: Doc) -> Result<Regen, String> {
+    /// A history edit: regenerate `cand`, and only then make it the document (a snapshot). VUGINTENTUNDOSET (SR563): also
+    /// the photo road's accepted statement set (`photo::enter_set`), N statements in ONE snapshot (one `u`).
+    pub fn adopt(&mut self, cand: Doc) -> Result<Regen, String> {
         let mut r = regenerate(&cand)?;
         let cursor = self.cursor;
         self.commit(cand);

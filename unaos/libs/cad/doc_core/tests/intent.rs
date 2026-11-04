@@ -120,7 +120,7 @@ fn unsupported_dimension_refused_by_residual() {
     // Same id: a changed dimension replaces d1 in place.
     assert_eq!(apply(&acc, &prop).unwrap().stmts.len(), acc.stmts.len());
     match verify(&acc, &prop, &outline(), acc.tol) {
-        Verdict::Refuse { why: Reason::Residual { max_mm, limit_mm } } => {
+        Verdict::Refuse { why: Reason::Residual { max_mm, limit_mm, .. } } => {
             assert_eq!(limit_mm, K_SIGMA * SIGMA);
             assert!(max_mm > limit_mm && max_mm < 2.0, "max {max_mm}");
         }
@@ -299,7 +299,7 @@ fn plate_with_holes_accepts_diameters_and_refuses_a_moved_hole() {
     }
     // A 3 mm move of hole 1: paired with its measured hole, then past K_SIGMA x sigma.
     match verify(&b.doc, &p("fix f9 sketch=s p=c1 at=[13 15.1]"), &plate_outline(), b.doc.tol) {
-        Verdict::Refuse { why: Reason::Residual { max_mm, limit_mm } } => {
+        Verdict::Refuse { why: Reason::Residual { max_mm, limit_mm, .. } } => {
             assert_eq!(limit_mm, K_SIGMA * SIGMA);
             assert!(max_mm > 2.0 && max_mm < 4.0, "max {max_mm}");
         }
