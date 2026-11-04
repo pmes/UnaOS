@@ -370,7 +370,7 @@ pub mod fixture {
     pub const OPAQUE_GREEN: u32 = 0xFF00_FF00;
     pub const RGB_RED: u32 = 0x00FF_0000;
     pub const RGB_GREEN: u32 = 0x0000_FF00;
-    pub const RGB_BLUE: u32 = 0x0000_00FF;
+    pub const RGB_BLUE: u32 = 0x0000_00FF; pub const RGB_ORANGE: u32 = 0x00FF_8000; // GATEREDS (rmbp-ledger B1096): RGB_ORANGE, GOPIGNITEPIXEL's centre witness square (R != B, so a channel swap reads 0080ff). LINE-NEUTRAL append, code first
     pub const RAMP_BASE: u32 = 0x0000_FF80;
     pub const BLUE: u32 = 0x0020_40FF;
     pub const GREEN: u32 = 0x0040_FF20;
