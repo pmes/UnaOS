@@ -6079,3 +6079,108 @@ fn keys_table() -> (usize, usize, String) {
 fn keys_table() -> (usize, usize, String) {
     (0, 0, String::from("skip(no-witness)"))
 }
+
+// ── F39SETTINGSKEYSPROBE (rmbp-ledger B1133, BP-video-38) — SETTINGS-KEYS-PROBE, `tests menuscraft`'s Settings leg — TAIL-APPENDED ──
+// F39SETTINGSARROWSENSE (B1127) made Settings' arrow arms name una_abi's `KEY_UP` / `KEY_DOWN`, but no probe drove them:
+// the arms run on the LIVE window's STATE behind `key_route`'s focus gate. This leg drives THE router [`key_route`] with
+// those bytes on the live window (no offscreen copy of `walk` / `strip_step`): the column step (Down, Down, Up from
+// General: tabs 2 then 1), the Users form's walk (Down, Down, Up from the Name field: stop and field 2 then 1) and the
+// pane walk (Down, Down, Up on General: stop 2 then 1). `quarry::live::ops::a11y_probe`'s shape (B1132): open when closed
+// (a refused open SKIPs, never reds), focus and raise, put back, close when it opened, the focus owner restored; the tab
+// and the store's `system.settings.tab` end at the tab it found (`tabs_probe`'s shape). STATE is taken only in short
+// scopes, never across `key_route` / `switch_tab` / `repaint` (each takes CUR, then STATE, itself). HAZARD (B1132's
+// class): a person in Settings during `tests menuscraft` — a key of theirs between the steps reaches the same arms (a BAD
+// read, never a hang); their pane state is put back whole (sel, strip, column top, stop, pending segment, the search
+// text, the Resolution popup and the Users UI incl. a typed Add form, by `mem::replace`). One `[menuscraft] settings_keys` line.
+
+/// One key through THE router, as the focused window receives it.
+fn keys_send(c: u8) {
+    let _ = key_route(crate::pal::Event::Key(c));
+}
+
+/// SETTINGS-KEYS-PROBE (B1133) — `true` = the column, the Users form (stop and field) and the pane each read 2 after
+/// Down, Down and 1 after Up, or the window could not be opened or focused (a skip).
+pub fn keys_leg() -> bool {
+    let saved_focus = wm::focus_asid();
+    let was_open = is_open();
+    if !was_open && open().is_err() {
+        wm::focus_changed(saved_focus);
+        serial_println!("[menuscraft] settings_keys declined reason=open -> skip");
+        return true;
+    }
+    let id = WIN.load(Ordering::Relaxed);
+    wm::focus_changed(OWNER);
+    let _ = wm::raise_one(id);
+    let snap = if id == wm::WIN_NONE || wm::focus_asid() != OWNER {
+        None
+    } else {
+        STATE.lock().as_mut().map(|st| {
+            let s = (st.sel, st.strip, st.col_top, st.kf, st.pend, core::mem::take(&mut st.query), st.search, st.kbd, st.found, st.modes_open, core::mem::replace(&mut st.u, UsersUi::new()));
+            st.search = false;
+            st.modes_open = false;
+            s
+        })
+    };
+    let Some(snap) = snap else {
+        if !was_open { close(); }
+        wm::focus_changed(saved_focus);
+        serial_println!("[menuscraft] settings_keys declined reason=focus -> skip");
+        return true;
+    };
+    let set = |strip: bool, kf: usize| { if let Some(st) = STATE.lock().as_mut() { st.strip = strip; st.kf = kf; st.pend = None; } };
+    let stop = || STATE.lock().as_ref().map_or(usize::MAX, |st| st.kf);
+    let fld = || STATE.lock().as_ref().map_or(usize::MAX, |st| st.u.focus as usize);
+    let tab0 = cur_tab();
+    // The column (arms: KEY_DOWN on the column, KEY_UP on the column): from General.
+    if tab0 != 0 { switch_tab(0); }
+    set(true, 0);
+    keys_send(una_abi::KEY_DOWN);
+    keys_send(una_abi::KEY_DOWN);
+    let col_a = cur_tab();
+    keys_send(una_abi::KEY_UP);
+    let col_b = cur_tab();
+    // The Users form (arms: the form's KEY_DOWN / KEY_UP): from the Name field, painted so the walk reads its stops.
+    if cur_tab() != 1 { switch_tab(1); }
+    if let Some(st) = STATE.lock().as_mut() { st.u = UsersUi::new(); st.u.form = true; }
+    set(false, 0);
+    repaint();
+    keys_send(una_abi::KEY_DOWN);
+    keys_send(una_abi::KEY_DOWN);
+    let (form_a, focus_a) = (stop(), fld());
+    keys_send(una_abi::KEY_UP);
+    let (form_b, focus_b) = (stop(), fld());
+    // The pane (arms: KEY_DOWN in the pane, KEY_UP in the pane): General's first stop (`switch_tab` drops the form).
+    switch_tab(0);
+    set(false, 0);
+    keys_send(una_abi::KEY_DOWN);
+    keys_send(una_abi::KEY_DOWN);
+    let pane_a = stop();
+    keys_send(una_abi::KEY_UP);
+    let pane_b = stop();
+    // Put back: the tab (and the store's), then the pane state, then the window and the focus owner.
+    if cur_tab() != tab0 { switch_tab(tab0); }
+    let (sel, strip, col_top, kf, pend, query, search, kbd, found, modes_open, u) = snap;
+    if let Some(st) = STATE.lock().as_mut() {
+        st.sel = sel;
+        st.strip = strip;
+        st.col_top = col_top;
+        st.kf = kf;
+        st.pend = pend;
+        st.query = query;
+        st.search = search;
+        st.kbd = kbd;
+        st.found = found;
+        st.modes_open = modes_open;
+        st.u = u;
+    }
+    if !was_open { close(); } else { repaint(); }
+    wm::focus_changed(saved_focus);
+    let two_one = |a: usize, b: usize| a == 2 && b == 1;
+    let ok = two_one(pane_a, pane_b) && two_one(col_a, col_b) && two_one(form_a, form_b) && two_one(focus_a, focus_b);
+    let n = |v: usize| if v == usize::MAX { String::from("-") } else { alloc::format!("{}", v) };
+    serial_println!(
+        "[menuscraft] settings_keys pane={}/{} column={}/{} form={}/{} focus={}/{} -> {}",
+        n(pane_a), n(pane_b), n(col_a), n(col_b), n(form_a), n(form_b), n(focus_a), n(focus_b), if ok { "ok" } else { "BAD" }
+    );
+    ok
+}

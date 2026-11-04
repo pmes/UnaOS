@@ -3645,7 +3645,8 @@ fn luma(c: u32) -> u32 {
 }
 
 /// **`tests menuscraft`** — the sheet every dropdown paints, and the status items' glyph/slot table, measured off
-/// the SAME painters and accessors the live paths use, on synthetic inputs (no panel, no open menu, no press):
+/// the SAME painters and accessors the live paths use, on synthetic inputs (no panel, no press) but for two live legs:
+/// Quarry's menu opened on its own window (`quarry_a11y`, B1132) and Settings' arrow keys (`settings_keys`, B1133):
 ///
 /// * `sheet` — a sheet rect `MIN_W + BAND` x `120 + BAND` over the flat scene: the body's bottom-left corner pixel
 ///   is NOT the face (rounded, `corners`), the body's centre IS `surface.overlay` (`face`), the foot row is the
@@ -3659,6 +3660,8 @@ fn luma(c: u32) -> u32 {
 ///   `band_exact` (`quarry::live::ops::sheet_probe`: Quarry's menu painted in its own surface over two fills, the band
 ///   darker than each and different between them; `n/a` without `quarry`), `wallpaper_gen` (`strip::seal` folds
 ///   `strip::wall_gen` through `seal_with`, and another generation changes it).
+/// * F39SETTINGSKEYSPROBE (B1133) — `settings_keys` (`settings::keys_leg`): Down, Down, Up through `settings::key_route`
+///   on the live window over the column, the Users form and the pane (2 then 1 each), its state put back.
 pub fn menuscraft_selftest() {
     use super::crystal::sheet;
     // ── leg 1: the sheet ──
@@ -3747,7 +3750,7 @@ pub fn menuscraft_selftest() {
     let glyphs_ok = seated_live > 0 && drawn_live == seated_live && inside && gap_ok;
 
     // ── leg 3 (MENUS2, B652): the context menus on the sheet, the wallpaper generation in the seal, the exact band ──
-    let dock_ok = super::dock::sheet_probe(); let winmenu_ok = winmenu_keys_leg(); // F39SETTINGSARROWSENSE (B1127): the window menu's key walk, offscreen (LINE-NEUTRAL; body at the file tail)
+    let dock_ok = super::dock::sheet_probe(); let winmenu_ok = winmenu_keys_leg(); let settings_ok = super::settings::keys_leg(); // F39SETTINGSKEYSPROBE (B1133): Settings' arrow arms through `settings::key_route` on the live window. F39SETTINGSARROWSENSE (B1127): the window menu's key walk, offscreen (LINE-NEUTRAL; body at the file tail)
     #[cfg(feature = "quarry")]
     let (quarry_ok, band_exact) = super::quarry::live::ops::sheet_probe();
     #[cfg(not(feature = "quarry"))]
@@ -3755,7 +3758,7 @@ pub fn menuscraft_selftest() {
     let (e, g) = (theme::epoch(), strip::wall_gen());
     let wall_ok = strip::seal(1) == strip::seal_with(1, e, g) && strip::seal_with(1, e, g) != strip::seal_with(1, e, g ^ 1);
     let q = |b: bool| if !cfg!(feature = "quarry") { "n/a" } else if b { "ok" } else { "BAD" };
-    let ok = sheet_ok && glyphs_ok && dock_ok && quarry_ok && band_exact && wall_ok && winmenu_ok;
+    let ok = sheet_ok && glyphs_ok && dock_ok && quarry_ok && band_exact && wall_ok && winmenu_ok && settings_ok;
     serial_println!(
         ":: MENUSCRAFT: sheet={}x{} band={} corners={} face={} hairline={} shadow={}({}<{},{}) pill={} white={} glyphs={}/{} inside={} gap={}({}) dock_menu={} quarry_menu={} wallpaper_gen={} band_exact={} -> {} ::",
         w, h, band, if corners { "ok" } else { "BAD" }, if face_ok { "ok" } else { "BAD" }, if hairline { "ok" } else { "BAD" },
