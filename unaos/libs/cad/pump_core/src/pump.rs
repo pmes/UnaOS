@@ -613,7 +613,7 @@ impl Pump {
         let Some(i) = self.src.iter().position(|&l| l == at_line) else {
             return Err(PumpRefusal::NoSuchLine { line: at_line });
         };
-        self.next = i;
+        self.modal_prefix(i, at_line); self.next = i; // VUGCOMSCANRESUMEMODAL (SR656): the modal words the lines before at_line set go first, numbered at_line
         self.acked = i;
         self.state = PumpState::Rearmed { at_line };
         Ok(self)
@@ -1070,5 +1070,144 @@ impl Pump {
         self.autoreport = AutoAsk::Answered { on: false };
         self.rt_pending.extend_from_slice(b"M154 S0\n");
         let _ = self.flush_rt(t);
+    }
+}
+
+// --- VUGCOMSCANLINKREUSEINFLIGHT (LEDGER SR646): a restart on the held link carries the in-flight M114 / M154 answer (named tail hunk) ---
+
+impl Pump {
+    /// The arming's pump takes over the live link `from` streamed on (comscan's `PumpDesk::restarted`, SR641): what is
+    /// still on the wire for `from` is read by this pump as `from` would. `status_asked` (an `M114` whose `ok` is not yet
+    /// read: swallowed here, never a job line's), `autoreport` (an `M154` out keeps its `ok` swallowed; an `Answered`
+    /// report is not asked again, [`Pump::autoreport_hello`] arming only from `Off`, and the desk's close still turns it
+    /// off) and the partial line in `rx` (an `ok` split across two reads stays whole). Nothing unless both speak the same
+    /// dialect and this pump has not ticked.
+    pub fn inherit(&mut self, from: &Pump) {
+        if self.dialect != from.dialect || self.started {
+            return;
+        }
+        self.status_asked = from.status_asked;
+        self.autoreport = from.autoreport;
+        self.rx = from.rx.clone();
+    }
+}
+
+// --- VUGCOMSCANRESUMEMODAL (LEDGER SR656): a resume restores the modal state the lines before its line set (named tail hunk) ---
+
+/// The modal groups a resume restores: 0 units, 1 distance, 2 plane, 3 feed mode, 4 work system, 5 extrusion.
+pub const MODAL_GROUPS: usize = 6;
+
+/// grbl 1.1's restored words as (letter, code, group, word); it boots in `G0 G54 G17 G21 G90 G94 M5 M9`. Motion and F
+/// need none (make_core's writer says them on every motion line); `G91.1` is not `G91` (its code is not an integer).
+const MODAL_GRBL: &[(u8, u16, usize, &str)] = &[
+    (b'G', 20, 0, "G20"),
+    (b'G', 21, 0, "G21"),
+    (b'G', 90, 1, "G90"),
+    (b'G', 91, 1, "G91"),
+    (b'G', 17, 2, "G17"),
+    (b'G', 18, 2, "G18"),
+    (b'G', 19, 2, "G19"),
+    (b'G', 93, 3, "G93"),
+    (b'G', 94, 3, "G94"),
+    (b'G', 54, 4, "G54"),
+    (b'G', 55, 4, "G55"),
+    (b'G', 56, 4, "G56"),
+    (b'G', 57, 4, "G57"),
+    (b'G', 58, 4, "G58"),
+    (b'G', 59, 4, "G59"),
+];
+
+/// Marlin 2's restored words; it boots in `G21 G90 M82` (the planes and work systems are compiled out by default, G93
+/// does not exist).
+const MODAL_MARLIN: &[(u8, u16, usize, &str)] = &[
+    (b'G', 20, 0, "G20"),
+    (b'G', 21, 0, "G21"),
+    (b'G', 90, 1, "G90"),
+    (b'G', 91, 1, "G91"),
+    (b'M', 82, 5, "M82"),
+    (b'M', 83, 5, "M83"),
+];
+
+fn modal_table(d: Dialect) -> &'static [(u8, u16, usize, &'static str)] {
+    match d {
+        Dialect::Grbl { .. } => MODAL_GRBL,
+        Dialect::Marlin => MODAL_MARLIN,
+        Dialect::LinuxCnc => &[],
+    }
+}
+
+/// Each G / M word with an integer code on `line` (spaces dropped, upper-cased), in order: grbl reads every word of a
+/// block and its `$` system lines carry none; Marlin runs ONE command per line, so only its first word past an N word.
+fn modal_words(d: Dialect, line: &str, mut f: impl FnMut(u8, u16)) {
+    let marlin = d == Dialect::Marlin;
+    let b: Vec<u8> = line.bytes().filter(|c| !c.is_ascii_whitespace()).map(|c| c.to_ascii_uppercase()).collect();
+    if b.first() == Some(&b'$') {
+        return;
+    }
+    let mut k = 0;
+    while k < b.len() {
+        let letter = b[k];
+        k += 1;
+        if !letter.is_ascii_alphabetic() {
+            continue;
+        }
+        let s = k;
+        while k < b.len() && matches!(b[k], b'0'..=b'9' | b'.' | b'-' | b'+') {
+            k += 1;
+        }
+        if marlin && letter == b'N' {
+            continue;
+        }
+        let num = &b[s..k];
+        if (letter == b'G' || letter == b'M') && !num.is_empty() && num.len() <= 4 && num.iter().all(u8::is_ascii_digit) {
+            f(letter, num.iter().fold(0u16, |a, c| a * 10 + u16::from(c - b'0')));
+        }
+        if marlin {
+            return;
+        }
+    }
+}
+
+/// The modal state some lines set: per group the last word and the index of its line.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Modal {
+    last: [Option<(usize, &'static str)>; MODAL_GROUPS],
+}
+
+impl Modal {
+    /// The fold over `lines` in dialect `d` (LinuxCNC, not streamed, sets nothing).
+    pub fn of(d: Dialect, lines: &[String]) -> Modal {
+        let t = modal_table(d);
+        let mut m = Modal::default();
+        for (i, l) in lines.iter().enumerate() {
+            modal_words(d, l, |letter, code| {
+                if let Some(&(_, _, g, w)) = t.iter().find(|e| e.0 == letter && e.1 == code) {
+                    m.last[g] = Some((i, w));
+                }
+            });
+        }
+        m
+    }
+
+    /// One line per group set, in the program order of each group's last word (ties in group order): replayed so, the
+    /// words leave a controller as the program left it, on a Marlin whose G90 / G91 also set E's mode or one whose do not.
+    pub fn lines(&self) -> Vec<String> {
+        let mut v: Vec<(usize, usize, &'static str)> =
+            self.last.iter().enumerate().filter_map(|(g, x)| x.map(|(i, w)| (i, g, w))).collect();
+        v.sort_unstable();
+        v.into_iter().map(|(_, _, w)| String::from(w)).collect()
+    }
+}
+
+impl Pump {
+    /// [`Pump::resume_at`]'s prefix: every group the lines before index `i` set, as lines at `i` numbered `at_line` (the
+    /// controller that lost the link most often rebooted into its defaults; one that did not, or a jog between, may sit
+    /// anywhere). An `ok`, an `error:N` or a loss inside the prefix names `at_line`, so a re-arm restores again.
+    fn modal_prefix(&mut self, i: usize, at_line: usize) {
+        let words = Modal::of(self.dialect, &self.lines[..i]).lines();
+        for (k, w) in words.into_iter().enumerate() {
+            self.lines.insert(i + k, w);
+            self.src.insert(i + k, at_line);
+        }
     }
 }
