@@ -6245,7 +6245,7 @@ fn reset_row(tab: usize) {
         let h = st.hits[p0 + st.kf];
         (h[1] as usize + h[3] as usize / 2).saturating_sub(TOP) / ROW_H()
     };
-    reset_at(tab, row); // RESETWORD (B1191): the unset loop, shared with the painted word's press (file tail)
+    reset_delete(tab, row); // RESETREPAINT (rmbp-ledger B1195): the unset loop then one repaint, as the word's press does (file tail). RESETWORD (B1191): the unset loop, shared with the painted word's press (file tail)
 }
 
 
@@ -6455,5 +6455,28 @@ fn reset_word_leg() {
     serial_println!(
         ":: SETTINGS-RESET-BUTTON: set={} resetword={} press={} default={} resetword={} press={} off={} x={}..{} -> {} ::",
         name(set), word(s_paint), yn(s_hit), name(dflt), word(d_paint), yn(d_hit), yn(s_off), x0, x1, verdict
+    );
+}
+
+// =================================================================================================
+// RESETREPAINT (rmbp-ledger B1195, BP-storage-11) — TAIL-APPENDED. Delete on a held row now repaints after its unset
+// loop, as the `reset` word's press does: B1190's follower (`bus_changes_inner`) repaints only a SHOWN value that moved,
+// so a Brightness reset (R89: the glass keeps its level), a SHOWN key stored at its own default and every MAP row whose
+// keys are outside SHOWN left the row's value and the word on screen until the next paint. A row with no MAP entry or at
+// its default does nothing and says nothing (B1186). The repaint runs with no settings lock held (`reset_row`'s STATE
+// guard is dropped before this call). Said `[settings] resetrepaint=reset_row tab=<name> row=<r> word=<hidden|painted>`
+// (`painted` = the store still holds a key after the repaint, e.g. a PREFS.ELF unset answered QUEUED: RESETREPAINT-QUEUED owed).
+// =================================================================================================
+/// Delete's road: [`reset_at`] on a held row of pane `tab`, then one [`repaint`] (see the block above).
+fn reset_delete(tab: usize, row: usize) {
+    let Some(m) = MAP.iter().find(|m| m.tab == tab && m.row == row) else { return };
+    if !row_is_set(m.keys) {
+        return;
+    }
+    reset_at(tab, row);
+    repaint();
+    serial_println!(
+        "[settings] resetrepaint=reset_row tab={} row={} word={}",
+        TAB_NAMES[tab.min(TABS - 1)], row, if row_is_set(m.keys) { "painted" } else { "hidden" }
     );
 }

@@ -52,8 +52,8 @@ pub fn decode(b: &[u8]) -> Result<Image, Error> {
         let size = le32(b, p + 4) as usize;
         let data = b.get(p + 8..p + 8 + size).ok_or(Error::Truncated)?;
         match fourcc {
-            b"VP8L" => return decode_vp8l(data).map(|i| i.with_icc(icc.clone())),
-            b"VP8 " => return decode_lossy(data, alph, canvas).map(|i| i.with_icc(icc.clone())),
+            b"VP8L" => return decode_vp8l(data).map(|i| with_xmp(i.with_icc(icc.clone()), b, p + 8 + size + (size & 1), end)), // VUGPHOTOCROPMETAXMP (SR631): the walk continued past the image chunk for `XMP `
+            b"VP8 " => return decode_lossy(data, alph, canvas).map(|i| with_xmp(i.with_icc(icc.clone()), b, p + 8 + size + (size & 1), end)), // VUGPHOTOCROPMETAXMP (SR631)
             b"VP8X" => {
                 if data.len() < 10 {
                     return Err(Error::Truncated);
@@ -63,7 +63,7 @@ pub fn decode(b: &[u8]) -> Result<Image, Error> {
                 canvas = Some((w, h)); if data[0] & 0x20 != 0 { icc = iccp_after(b, p + 8 + size + (size & 1), end); }
                 // §2.7: the Animation flag (bit 1 of the flags byte) — the rest of the file is ANIM + ANMF.
                 if data[0] & 0x02 != 0 {
-                    return decode_animated(b, p + 8 + size + (size & 1), end, w, h).map(|i| i.with_icc(icc.clone()));
+                    return decode_animated(b, p + 8 + size + (size & 1), end, w, h).map(|i| with_xmp(i.with_icc(icc.clone()), b, p + 8 + size + (size & 1), end)); // VUGPHOTOCROPMETAXMP (SR631)
                 }
             }
             b"ALPH" => alph = Some(data),
@@ -989,4 +989,23 @@ pub(crate) fn iccp_after(b: &[u8], p: usize, end: usize) -> Option<Vec<u8>> {
         return None;
     }
     Some(b.get(p + 8..(p + 8).checked_add(size)?.min(end))?.to_vec())
+}
+
+// ---- VUGPHOTOCROPMETAXMP (SR631): the `XMP ` chunk after the image (named tail block) ----
+
+/// VUGPHOTOCROPMETAXMP (SR631): [`decode`]'s chunk walk continued from `p` (just past the chunk it returned at) to
+/// `end`: the first `XMP ` chunk (RFC 9649 §2.7 places it after the image data and EXIF) read onto `img.text` through
+/// the one XMP reader ([`crate::png::xmp_packet`], the one budget). A chunk cut off by the end of the file ends the
+/// walk; the image is returned either way.
+fn with_xmp(mut img: Image, b: &[u8], mut p: usize, end: usize) -> Image {
+    while p + 8 <= end {
+        let size = le32(b, p + 4) as usize;
+        let Some(stop) = (p + 8).checked_add(size).filter(|&s| s <= end) else { break };
+        if &b[p..p + 4] == b"XMP " {
+            crate::png::xmp_packet(&mut img.text, &b[p + 8..stop], false);
+            break;
+        }
+        p = stop + (size & 1);
+    }
+    img
 }
