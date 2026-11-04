@@ -361,3 +361,48 @@ fn esc_cancels_save_as_with_nothing_written() {
     assert!(!p.exists());
     assert_eq!(vw.title, "tree*");
 }
+
+// ---- VUGMAKEMACHINELIBFACE (SR548): a part beside its machine library ----
+
+/// The library's machine line (doc_core tests/doc.rs MACHINE_A's keys) and its axes / tool, as a `.vugmachine`.
+const SHOP_MACHINE: &str = "machine shop name=\"Shop mill\" kind=mill3 kinematics=cartesian units=mm \
+     envelope=[[-50 -50 -60] [100 100 50]] safe_z=10 power=spindle power_max=24000 ask_above=20000";
+const SHOP_LINES: &str = "axis axis=x min=-50 max=100 max_feed=5000 max_accel=500 rapid=8000\n\
+     axis axis=y min=-50 max=100 max_feed=5000 max_accel=500 rapid=8000\n\
+     axis axis=z min=-60 max=50 max_feed=2000 max_accel=300 rapid=4000\n\
+     tool number=1 kind=flat_end dc=6 lf=40 apmx=2 nof=2 sig=0\n";
+
+#[test]
+fn a_part_beside_its_library_opens_and_replays() {
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("vugmakemachinelibface");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    std::fs::write(dir.join("shop.vugmachine"), format!("vug-doc version=1 lin=1e-6 ang=1e-9\n{SHOP_MACHINE}\n{SHOP_LINES}")).expect("library");
+    // The extruded rectangle's document with the machine named from the library.
+    let body = doc_core::write(doc(&extruded()));
+    let body = body.trim_end();
+    let part = dir.join("part.vug");
+    std::fs::write(&part, format!("{body}\nmachine mill lib=shop loaded=1\n")).expect("part");
+    let vw = Viewer::open(part.to_str().expect("utf-8 path"), (W, H), Preset::Una).unwrap_or_else(|e| panic!("open: {e}"));
+    assert!((volume(&vw) - 1600.0).abs() < 1e-4, "volume {}", volume(&vw));
+    let Some(Stmt::Machine(m)) = doc(&vw).stmts.iter().find(|s| matches!(s, Stmt::Machine(_))) else { panic!("machine") };
+    assert_eq!(m.lib.as_ref().map(|l| (l.name.as_str(), l.stmts.len())), Some(("shop", 4)), "the library's axes and tool are held");
+    // The library machine replays as the same machine written inline.
+    let shop_inline = SHOP_MACHINE.replacen("machine shop ", "machine mill ", 1);
+    let inline = doc_core::read(&format!("{body}\n{shop_inline} loaded=1\n{SHOP_LINES}")).unwrap_or_else(|r| panic!("inline: {r:?}"));
+    let (a, b) = (doc_core::machine_of(&inline).expect("inline machine"), doc_core::machine_of(doc(&vw)).expect("library machine"));
+    assert_eq!(b, a, "the same make_core Machine");
+    assert_eq!(b.digest(), a.digest());
+    assert!(doc_core::write(doc(&vw)).contains("\nmachine mill lib=shop loaded=1\n"), "the part writes back the name only");
+    // The journal's re-read resolves the same shelf: deleting the extrude row is not refused UnknownLib.
+    let mut vw = vw;
+    let x = index_of(&vw, |s| matches!(s, Stmt::Extrude { .. }));
+    vw.view.design.journal.delete(x).unwrap_or_else(|e| panic!("delete: {e}"));
+    assert!(!doc(&vw).stmts.iter().any(|s| matches!(s, Stmt::Extrude { .. })), "the extrude went");
+    assert!(doc(&vw).stmts.iter().any(|s| matches!(s, Stmt::Machine(m) if m.lib.is_some())), "the library machine stays");
+    // A library that is not beside the part refuses by name.
+    let lost = dir.join("lost.vug");
+    std::fs::write(&lost, format!("{body}\nmachine mill lib=nosuch loaded=1\n")).expect("part");
+    let e = Viewer::open(lost.to_str().expect("utf-8 path"), (W, H), Preset::Una).err().expect("refused");
+    assert!(e.contains("UnknownLib(\"nosuch\")"), "{e}");
+}

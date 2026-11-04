@@ -133,6 +133,7 @@ members = [
     "vessels/una",
     "vessels/una-installer", # INSTALLERVESSEL (SR413): the UnaOS_Installer vessel — host probe, the vessel catalog, build (Aulë) + install + run
     "libs/lux",
+    "libs/doc_host", # VUGMAKEMACHINELIBFACE (SR548): the host side of doc_core — DirLib, the one lookup of a part's .vugmachine library beside it (vug-view, tools/scan)
     "vessels/aether-shell"
 ]
 
