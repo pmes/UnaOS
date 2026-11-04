@@ -135,20 +135,24 @@ pub struct Regen {
     pub body: Option<Body>,
     open: Option<Open>,
     closed: usize,
+    /// VUGFACEJOURNALSOLIDFAULT (SR572): the replay failures no solid reads (an Op, an unnamed sketch), carried.
+    pub faults: Vec<doc_core::Failure>,
 }
 
-/// Regenerate the design from `doc` through doc_core's `replay`: a failure is `Err("line N: <fault> <id>")` and
-/// nothing is built; else the solids become the Body and the open sketch a SketchFace (its plane by `Frame::new`, its
+/// Regenerate the design from `doc` through doc_core's `replay`: a failure on a statement a solid reads (SR565's ONE rule,
+/// deviation.rs `split_faults` over [`solid_stmts`]) is `Err("line N: <fault> <id>")` and nothing is built; every other
+/// failure is carried in `Regen::faults` (VUGFACEJOURNALSOLIDFAULT, SR572); else the solids become the Body and the open sketch a SketchFace (its plane by `Frame::new`, its
 /// origin the point fixed at (0, 0), its dimensions re-placed beside their feet).
 pub fn regenerate(doc: &Doc) -> Result<Regen, String> {
     let rep = doc_core::replay(doc, doc.tol);
-    if let Some(f) = rep.failures.first() {
+    let (on_solid, faults) = crate::deviation::split_faults(doc, rep.failures.clone()); // VUGFACEJOURNALSOLIDFAULT (SR572): only a solid's failure refuses
+    if let Some(f) = on_solid.first() {
         return Err(format!("line {}: {:?} {}", f.line, f.fault, f.id));
     }
     let breps = live_breps(doc, &rep.solids); // VUGFACETREEFILLET (SR518): an edit's solid stands in its on solid's place
     let body = if breps.is_empty() { None } else { Some(Body::from_breps(breps, doc.tol)?) };
     let Some(j) = open_sketch(doc) else {
-        return Ok(Regen { face: None, body, open: None, closed: doc.stmts.len() });
+        return Ok(Regen { face: None, body, open: None, closed: doc.stmts.len(), faults });
     };
     let Stmt::Sketch { id, o, z, x } = &doc.stmts[j] else { return Err(format!("line {}: not a sketch", doc.line(j))) };
     let v = |a: &[f64; 3]| brep_core::Vec3::new(a[0], a[1], a[2]);
@@ -193,7 +197,7 @@ pub fn regenerate(doc: &Doc) -> Result<Regen, String> {
     };
     let (next_e, next_k) = (next(&ents, 'e'), next(&kons, 'k'));
     let open = Open { sketch: id.clone(), prefix: prefix.clone(), ents, cons: kons, next_e, next_k };
-    Ok(Regen { face: Some(face), body, open: Some(open), closed: j })
+    Ok(Regen { face: Some(face), body, open: Some(open), closed: j, faults })
 }
 
 /// The value a row edits, as shown: a dimension constraint's mm (an angle in degrees), an extrude's length, a
@@ -262,11 +266,13 @@ pub struct Journal {
     pub disk: Option<Result<String, String>>,
     /// VUGFACESAVEAS (SR539): the Save As field while it is open (Cmd+Shift+S; lib.rs `Viewer::save_as_key`).
     pub save_as: Option<SaveAs>,
+    /// VUGFACEJOURNALSOLIDFAULT (SR572): the last regenerate's carried failures (no solid reads them), marked in the panel.
+    pub faults: Vec<doc_core::Failure>,
 }
 
 impl Default for Journal {
     fn default() -> Journal {
-        Journal { doc: Doc::new(Tol::DEFAULT), closed: 0, open: None, undo: Vec::new(), redo: Vec::new(), panel: false, cursor: 0, edit: None, note: None, saved: None, disk: None, save_as: None }
+        Journal { doc: Doc::new(Tol::DEFAULT), closed: 0, open: None, undo: Vec::new(), redo: Vec::new(), panel: false, cursor: 0, edit: None, note: None, saved: None, disk: None, save_as: None, faults: Vec::new() }
     }
 }
 
@@ -330,7 +336,7 @@ impl Journal {
         let cursor = self.cursor;
         self.commit(cand);
         self.open = r.open.take();
-        self.closed = r.closed;
+        self.closed = r.closed; self.faults = r.faults.clone(); // VUGFACEJOURNALSOLIDFAULT (SR572): the carried failures
         self.cursor = cursor.min(self.doc.stmts.len().saturating_sub(1));
         Ok(r)
     }
@@ -348,7 +354,7 @@ impl Journal {
                     self.undo.push(cur);
                 }
                 self.open = r.open.take();
-                self.closed = r.closed;
+                self.closed = r.closed; self.faults = r.faults.clone(); // VUGFACEJOURNALSOLIDFAULT (SR572): the carried failures
                 self.cursor = self.doc.stmts.len().saturating_sub(1);
                 self.note = None;
                 Some(r)
@@ -527,7 +533,7 @@ pub fn overlay(view: &View, fr: &mut Raster) {
     let clip = |s: &str| s.chars().take(cols).collect::<String>();
     for (k, i) in (first..rows.len().min(first + fit)).enumerate() {
         let y = 4.0 + k as f32 * ROW_PX;
-        let mut col = rgba(INK);
+        let mut col = if j.faulted(i) { rgba(REFUSED) } else { rgba(INK) }; // VUGFACEJOURNALSOLIDFAULT (SR572): a faulted row in the refusal colour
         let mut text = rows[i].clone();
         if i == j.cursor {
             raster::tint(fr, &[vec![(x0, y - 2.0), (w, y - 2.0), (w, y + ROW_PX - 2.0), (x0, y + ROW_PX - 2.0)]], rgba(ACTIVE), 0.25);
@@ -713,7 +719,7 @@ impl Journal {
         self.saved = Some(doc_core::write(&doc));
         self.doc = doc;
         self.open = r.open.take();
-        self.closed = r.closed;
+        self.closed = r.closed; self.faults = r.faults.clone(); // VUGFACEJOURNALSOLIDFAULT (SR572): the carried failures
         self.undo.clear();
         self.redo.clear();
         self.cursor = self.doc.stmts.len().saturating_sub(1);
@@ -760,4 +766,30 @@ fn save_as_overlay(view: &View, fr: &mut Raster) {
     let text: String = format!("SAVE AS: {}_", f.text.to_uppercase()).chars().take(cols).collect();
     let y = h - 2.0 * ROW_PX - if j.panel { ROW_PX } else { 0.0 };
     raster::text(fr, &text, 6.0, y, rgba(ACTIVE));
+}
+
+// ---- VUGFACEJOURNALSOLIDFAULT (LEDGER SR572): a document whose failures no solid reads opens; a fault line is picked ----
+// [`regenerate`] refuses only on a failure SR565's rule puts in a solid's chain (deviation.rs `split_faults` over
+// [`solid_stmts`]); every other failure (an Op naming no machine, an unnamed sketch's conflict) is carried in
+// `Regen::faults` and `Journal::faults` (set by `adopt` / `step` / `load`, left by `record`), and the panel paints a row
+// whose statement id a carried failure names in the refusal colour (by id: a record moves lines, never ids). A click on
+// the deviation corner's `fault line N` (deviation.rs `fault_click`) selects line N through the panel's one select road,
+// the cursor: the panel's scroll and tint follow it.
+
+impl Journal {
+    /// Statement `i` is named by a carried failure (its id; a failure with no id names no row).
+    pub fn faulted(&self, i: usize) -> bool {
+        let Some(id) = self.doc.stmts.get(i).and_then(Stmt::id) else { return false };
+        self.faults.iter().any(|f| !f.id.is_empty() && f.id == id)
+    }
+
+    /// Select the statement on document line `line`: the panel shown, its cursor on that row, a row edit closed. False
+    /// (nothing changes) when no statement is on that line.
+    pub fn select_line(&mut self, line: u32) -> bool {
+        let Some(i) = (0..self.doc.stmts.len()).find(|&i| self.doc.line(i) == line) else { return false };
+        self.cursor = i;
+        self.panel = true;
+        self.edit = None;
+        true
+    }
 }

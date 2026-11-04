@@ -407,3 +407,45 @@ fn a_part_beside_its_library_opens_and_replays() {
     let e = Viewer::open(lost.to_str().expect("utf-8 path"), (W, H), Preset::Una).err().expect("refused");
     assert!(e.contains("UnknownLib(\"nosuch\")"), "{e}");
 }
+
+// VUGFACEJOURNALSOLIDFAULT (LEDGER SR572): a document whose only failure no solid reads (an Op naming no machine) opens
+// as the journal with that failure carried and the body built; its row is marked; a failure in the solid's own sketch
+// still refuses by line.
+
+/// A 20 x 10 x 5 box and a drill on it, with no machine in the document.
+const BOX_DRILL: &str = "vug-doc version=1 lin=1e-6 ang=1e-9
+sketch s1 o=[0 0 0] z=[0 0 1] x=[1 0 0]
+point p1 sketch=s1 x=0 y=0
+point p2 sketch=s1 x=20 y=0
+point p3 sketch=s1 x=20 y=10
+point p4 sketch=s1 x=0 y=10
+line l1 sketch=s1 a=p1 b=p2
+line l2 sketch=s1 a=p2 b=p3
+line l3 sketch=s1 a=p3 b=p4
+line l4 sketch=s1 a=p4 b=p1
+fix f1 sketch=s1 p=p1 at=[0 0]
+fix f2 sketch=s1 p=p2 at=[20 0]
+fix f3 sketch=s1 p=p3 at=[20 10]
+fix f4 sketch=s1 p=p4 at=[0 10]
+extrude box sketch=s1 outer=l1 dir=[0 0 1] length=5
+drill o1 on=box points=[[10 5]] top=5 depth=2 peck=0 tool=1 feed=300 plunge=100 rpm=10000
+";
+
+#[test]
+fn a_doc_with_an_op_naming_no_machine_opens_with_its_fault_and_a_body() {
+    let d = doc_core::read(BOX_DRILL).expect("the document reads");
+    let vw = Viewer::open_doc(d, "box", (W, H), Preset::Una).expect("an Op's fault does not refuse the journal");
+    let j = &vw.view.design.journal;
+    let o1 = index_of(&vw, |s| s.id() == Some("o1"));
+    let f = j.faults.iter().map(|f| (f.id.as_str(), f.fault.clone(), f.line)).collect::<Vec<_>>();
+    println!("faults={f:?} volume={}", volume(&vw));
+    assert_eq!(f, vec![("o1", doc_core::Fault::NoMachine, doc(&vw).line(o1))], "the one fault carried");
+    assert!((volume(&vw) - 1000.0).abs() < 1e-4, "the box is the body: {}", volume(&vw));
+    assert!(j.faulted(o1), "the drill row is marked");
+    assert!((0..doc(&vw).stmts.len()).filter(|&i| i != o1).all(|i| !j.faulted(i)), "no other row is marked");
+
+    // A conflicting fix in the box's sketch: a solid reads it, the journal refuses by line as before.
+    let d = doc_core::read(&BOX_DRILL.replace("fix f4 sketch=s1 p=p4 at=[0 10]\n", "fix f4 sketch=s1 p=p4 at=[0 10]\nfix f5 sketch=s1 p=p1 at=[1 1]\n")).expect("reads");
+    let e = Viewer::open_doc(d, "box", (W, H), Preset::Una).err().expect("a solid's fault refuses");
+    assert!(e.starts_with("line ") && e.contains("Conflicting"), "{e}");
+}
