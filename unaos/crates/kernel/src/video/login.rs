@@ -964,7 +964,7 @@ pub fn consume_key(c: u8) -> bool {
     crate::boot::key_taken(); // INSTALLBARE M2 (R86): `[login] key latency ms=` — the EHCI decode's stamp to here
     kb_drain_key(); kb_words_key_gap(); // WORDSPOINTER (B1094): the gap before this key, stamped on EVERY key incl. a busy one (tail). LINE-NEUTRAL fold, code first. INPUTSTALL M5: an outcome that landed since the last pass applies before this key is read. KEYBOOT4 (B864): `submit_drain` labelled `on=key` (tail)
     if submit_busy() {
-        return true; // INPUTSTALL M5: a submit is on the worker — the form takes no keys until its outcome lands
+        #[cfg(all(target_arch = "x86_64", feature = "wc"))] { crate::video::lag::consumed(); } return true; // LOGINBUSYNODRAW (B1115): a key taken while a submit is on the worker draws nothing — its lag timing ends at the route (lag.rs LOGINNODRAW), never a 3 s timeout. LINE-NEUTRAL, code first. INPUTSTALL M5: a submit is on the worker — the form takes no keys until its outcome lands
     }
     if !KEY_SAID.swap(true, Ordering::Relaxed) {
         serial_println!("[login] key taken by the screen (the first of this open — LOGIN13/R63: while the screen is up it is the only thing taking input; no typed byte is ever printed)");
