@@ -64,6 +64,7 @@ pub use from_sketch::{PlainNames, SketchNames, from_sketch, sketch_cons, sketch_
 pub use intent::{Batch, K_SIGMA, Measurement, Proposal, Reason, Verdict, apply, verify, verify_all};
 pub use intent::{ShapeParams, ShapeRef, measurements_text}; // VUGINTENTSCAN (SR508)
 pub use intent::apply_with; // VUGINTENTSETORDER (SR551)
+pub use intent::Term; // VUGINTENTTERMTYPE (SR577)
 pub use standards::{Class, METRIC, Standard, Thread, clearance_for, nearest_standard};
 pub use suggest::suggest;
 pub use lex::read;

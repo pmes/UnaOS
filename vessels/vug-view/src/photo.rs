@@ -41,7 +41,7 @@ use crate::raster::{self, Frame as Raster, rgba};
 use crate::sketch::{ACTIVE, INK, REFUSED, SketchFace, world_planes};
 use crate::view::View;
 use bandy::{IntentEvent, IntentImage, IntentProposal, Origin};
-use doc_core::{Doc, Measurement, PlainNames, Proposal, SketchNames, Stmt, Verdict}; // VUGFACEPHOTOSIDE (SR547): PlainNames, SketchNames
+use doc_core::{Doc, Measurement, PlainNames, Proposal, SketchNames, Stmt, Term, Verdict}; // VUGFACEPHOTOSIDE (SR547): PlainNames, SketchNames; VUGINTENTTERMTYPE (SR577): Term
 use sketch_core::{Constraint, ConstraintId, Entity, EntityId, PointRef, Tol, Vec2};
 use std::fmt;
 
@@ -417,7 +417,7 @@ pub fn key(view: &mut View, k: &str) -> Option<bool> {
 /// Enter on offer `i`: verified again against the sketch as it stands (an earlier accept may have changed it); a
 /// refusal is named in the corner and nothing is applied; an accepted one enters through `enter`.
 fn accept(view: &mut View, i: usize) -> bool {
-    if let Some(done) = set_road(view, i) { return done; } // VUGINTENTUNDOSET (SR563): a statement set enters whole, one journal step
+    if let Some(done) = set_road(view, i).or_else(|| single_road(view, i)) { return done; } // VUGINTENTUNDOSET (SR563): a statement set enters whole, one journal step; VUGINTENTSINGLERENAMED (SR577): a lone proposal in the journal's names
     let (Some(face), Some(ph)) = (view.design.face.as_mut(), view.photo.as_mut()) else { return false };
     if ph.offers[i].streaming.is_some() {
         // VUGFACESTREAM (SR535): a preview enters only once the terminal answer has settled it.
@@ -959,7 +959,7 @@ fn camera_text(s: &photo_core::Side, set: bool) -> String {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Member {
     pub key: usize,
-    pub term: &'static str,
+    pub term: Term, // VUGINTENTTERMTYPE (SR577)
 }
 
 /// A statement set as drawn: its members' statements (upper-cased, the bitmap font's case), the term and the set's one
@@ -967,7 +967,7 @@ pub struct Member {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Card {
     pub lines: Vec<String>,
-    pub term: &'static str,
+    pub term: Term, // VUGINTENTTERMTYPE (SR577)
     pub verdict: Verdict,
 }
 
@@ -1089,7 +1089,7 @@ fn named_set(ph: &Photo, lo: usize, hi: usize, names: &[(String, String)]) -> Ve
 /// SR563's judging: doc_core's `verify_all` decides whether `set` is ONE set (`Batch.sets` from 0 over all of it) and
 /// gives its verdict, then [`judged`]'s thickness rule for a set that extrudes the photo's sketch. The verdict, its term
 /// (a Residual's own; else the thickness's when it decided; else `m`'s) and the document with the set applied.
-fn judge_set(doc: &Doc, set: &[Proposal], m: &Measurement, t: Option<&Measurement>) -> Option<(Verdict, &'static str, Doc)> {
+fn judge_set(doc: &Doc, set: &[Proposal], m: &Measurement, t: Option<&Measurement>) -> Option<(Verdict, Term, Doc)> {
     let b = doc_core::verify_all(doc, set, m, Tol::DEFAULT);
     if !b.sets.first().is_some_and(|(start, steps)| *start == 0 && steps.len() == set.len()) {
         return None;
@@ -1174,3 +1174,47 @@ fn reject_card(view: &mut View, i: usize) -> Option<bool> {
     Some(true)
 }
 
+
+// ---- VUGINTENTSINGLERENAMED (SR577): the single proposal in the journal's names (named tail block) ----
+
+/// Enter on a lone offer `i` once the journal's names are not the face's: the single is a set of ONE on SR570's road:
+/// [`journal_doc`], [`named_set`] (the statement captured in the journal's names at offer time), [`judged`] in the
+/// journal's current document, then [`enter_set`] (one snapshot). None (the single road as it was) with no journal map,
+/// when the map renames nothing and the captured statement is the offer's own, for a streaming preview, and for an
+/// extrude (SR547's pull road). A refusal names itself and applies nothing; the corner says `applied <statement>`.
+fn single_road(view: &mut View, i: usize) -> Option<bool> {
+    let (face, ph) = (view.design.face.as_ref()?, view.photo.as_ref()?);
+    let o = ph.offers.get(i)?;
+    if o.streaming.is_some() {
+        return None;
+    }
+    let (doc, names) = journal_doc(&view.design.journal, face);
+    let p = named_set(ph, i, i, &names).pop()?;
+    if names.is_empty() || (names.iter().all(|(a, b)| a == b) && p.stmt == o.proposal.stmt) {
+        return None;
+    }
+    if extruded(&doc, &p).is_some() {
+        return None;
+    }
+    let stmt = o.proposal.stmt.trim().to_string();
+    let verdict = judged(&doc, &p, &ph.measurement(), ph.thickness.as_ref());
+    let f = face.clone();
+    let entered = match &verdict {
+        Verdict::Refuse { why } => Err(format!("refused {}", why.text())),
+        Verdict::Accept { .. } => doc_core::apply(&doc, &p)
+            .map_err(|r| r.text())
+            .and_then(|cand| enter_set(&mut view.design, &f, &doc, cand))
+            .map_err(|e| format!("refused by the sketch {e}")),
+    };
+    let ph = view.photo.as_mut()?;
+    ph.offers[i].verdict = verdict;
+    match entered {
+        Ok(()) => {
+            ph.offers[i].state = State::Applied;
+            ph.note = Some(format!("applied {stmt}"));
+            ph.focus = ph.offers.iter().position(|o| o.state == State::Open);
+        }
+        Err(e) => ph.note = Some(e),
+    }
+    Some(true)
+}

@@ -7,7 +7,7 @@ use doc_core::{
     Class, Doc, Measurement, Proposal, Reason, ShapeParams, ShapeRef, Verdict, clearance_for, measurements_text,
     nearest_standard, read, replay, suggest, verify, verify_all,
 };
-use doc_core::{Lib, Stmt, apply, apply_with, read_with}; // VUGINTENTSETORDER (SR551); VUGMAKEMACHINELIBHELD (SR556): What no longer used
+use doc_core::{Lib, Stmt, Term, apply, apply_with, read_with}; // VUGINTENTSETORDER (SR551); VUGMAKEMACHINELIBHELD (SR556): What no longer used
 
 const SIGMA: f64 = 0.3;
 const SIGMA_DEG: f64 = 0.5;
@@ -660,7 +660,7 @@ fn a_residual_names_its_term() {
     let d = plate_sketch();
     match verify(&d, &p("extrude e1 sketch=s outer=l1 dir=[0 0 1] length=12"), &thickness(10.0), d.tol) {
         Verdict::Refuse { why } => {
-            assert!(matches!(why, Reason::Residual { term: "thickness", .. }), "{why:?}");
+            assert!(matches!(why, Reason::Residual { term: Term::Thickness, .. }), "{why:?}");
             assert!(why.text().ends_with(" term=thickness"), "{}", why.text());
         }
         v => panic!("length=12 not refused: {v:?}"),
@@ -668,7 +668,7 @@ fn a_residual_names_its_term() {
     let pt = brep_core::geom_core::Vec2::new;
     let outline = Measurement::outline(vec![pt(0.0, 0.0), pt(80.0, 0.0), pt(80.0, 60.0), pt(0.0, 60.0)], SIGMA);
     match verify(&d, &p("distance i1 sketch=s a=p1 b=p2 d=86"), &outline, d.tol) {
-        Verdict::Refuse { why } => assert!(matches!(why, Reason::Residual { term: "outline", .. }), "{why:?}"),
+        Verdict::Refuse { why } => assert!(matches!(why, Reason::Residual { term: Term::Outline, .. }), "{why:?}"),
         v => panic!("d=86 not refused: {v:?}"),
     }
 }

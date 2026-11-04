@@ -610,7 +610,7 @@ fn a_set_is_one_card_entered_by_one_enter_and_refused_by_one_escape() {
     let card = gs[0].card.as_ref().expect("a card");
     assert_eq!(card.lines.len(), 2);
     assert!(card.lines[0].starts_with("POINT V3") && card.lines[1].starts_with("DISTANCE V4"), "{:?}", card.lines);
-    assert_eq!(card.term, "outline");
+    assert_eq!(card.term, doc_core::Term::Outline); // VUGINTENTTERMTYPE (SR577): the typed term
     assert!(matches!(card.verdict, Verdict::Accept { .. }), "{:?}", card.verdict);
     assert!(gs[0].text.starts_with("SET N=2 A DATUM POINT") && gs[0].text.ends_with("TERM=OUTLINE"), "{}", gs[0].text);
     assert!(drawn(&fr, &gs[0]));
@@ -688,3 +688,51 @@ fn a_set_verified_before_a_panel_delete_enters_in_the_journal_names() {
     assert_eq!(vw.view.design.journal.doc, before, "nothing entered");
 }
 
+// ---- VUGINTENTSINGLERENAMED (SR577): a single proposal re-verified in the journal's names after a panel delete ----
+
+/// SR570's face (a stray point e0 before the rectangle's corners e1..e4, sides e5..e8), the journal recorded. A lone
+/// distance on the journal's e1-e2 (the 49.7 side) is offered; the panel deletes e0, so doc_of's e1 is now the (49.7, 0)
+/// corner where d=50 would be a far residual: Enter still enters it, verified and entered in the journal's names. A
+/// second single names the journal's e3; the panel deletes e3: Enter refuses it by that name and nothing enters.
+#[test]
+fn a_single_verified_before_a_panel_delete_enters_in_the_journal_names() {
+    let mut vw = rectangle();
+    let mut sk = Sketch::new();
+    let _stray = sk.add_point(20.0, 10.0);
+    let c = [(0.0, 0.0), (49.7, 0.0), (49.7, 30.2), (0.0, 30.2)];
+    let p: Vec<EntityId> = c.iter().map(|&(x, y)| sk.add_point(x, y)).collect();
+    for i in 0..4 {
+        sk.add_line(p[i], p[(i + 1) % 4]).expect("a line");
+    }
+    vw.view.design.face = Some(SketchFace::over(world_planes()[0].1, sk));
+    {
+        let d = &mut vw.view.design;
+        d.journal.record(d.face.as_ref(), None);
+    }
+    assert!(photo::offer(&mut vw.view, vec![proposal("distance v4 sketch=s a=e1 b=e2 d=50".into())]));
+    assert!(ph(&vw).offers[0].set.is_none(), "a single, not a card");
+    assert!(matches!(ph(&vw).offers[0].verdict, Verdict::Accept { .. }), "{:?}", ph(&vw).offers[0].verdict);
+    // The panel deletes the stray point: the journal keeps e1..e8, the face's dense slots read e0..e7 again.
+    delete_row(&mut vw, "e0");
+    assert!(photo::doc_of(face(&vw)).stmts.iter().any(|s| s.id() == Some("e0")), "the slots renumbered");
+    assert_eq!(ph(&vw).focus, Some(0));
+    assert!(key(&mut vw, "Return"));
+    assert!(ph(&vw).note.as_deref().unwrap_or("").starts_with("applied distance v4"), "{:?}", ph(&vw).note);
+    assert_eq!(ph(&vw).offers[0].state, State::Applied);
+    let v4 = vw.view.design.journal.doc.stmts.iter().find(|s| s.id() == Some("v4")).expect("v4 entered");
+    assert!(v4.refs().contains(&"e1") && v4.refs().contains(&"e2"), "the distance names the journal's e1 and e2: {v4:?}");
+    // The (0, 0) and (49.7, 0) corners are slots 0 and 1 after the delete: the side the offer named is exactly 50.
+    assert!((dist(&face(&vw).sketch, 0, 1) - 50.0).abs() < 1e-6, "{}", dist(&face(&vw).sketch, 0, 1));
+    // A true conflict: a single on the top side, offered in the face's names e2-e3 (the journal's e3-e4), then the panel
+    // deletes the journal's e3 (its sides go with it); Enter refuses it by that name.
+    assert!(photo::offer(&mut vw.view, vec![proposal("distance v5 sketch=s a=e2 b=e3 d=50".into())]));
+    assert!(ph(&vw).offers[1].named.contains("a=e3 b=e4"), "captured in the journal's names: {}", ph(&vw).offers[1].named);
+    delete_row(&mut vw, "e3");
+    let before = vw.view.design.journal.doc.clone();
+    assert_eq!(ph(&vw).focus, Some(1));
+    assert!(key(&mut vw, "Return"));
+    let note = ph(&vw).note.clone().unwrap_or_default();
+    assert!(note.starts_with("refused") && note.contains("e3"), "{note}");
+    assert_eq!(ph(&vw).offers[1].state, State::Open);
+    assert_eq!(vw.view.design.journal.doc, before, "nothing entered");
+}
