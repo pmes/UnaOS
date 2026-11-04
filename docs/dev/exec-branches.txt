@@ -1443,15 +1443,21 @@ exec-rmbp-vugintentsetfacelistedoverlap 364b81387 wave36 cut58
 exec-rmbp-vugcomscanenvelopebound 364b81387 wave36 cut58
 exec-rmbp-vugprincipiaunsetsynapse 364b81387 wave36 cut58
 exec-rmbp-vugsketchbadrefkind 364b81387 wave36 cut58
-exec-rmbp-f39busregtagpath cf3a30b52 wave36 cut60
-exec-rmbp-f39busregarmearly cf3a30b52 wave36 cut60
-exec-rmbp-f39relayresetfallback cf3a30b52 wave36 cut60
-exec-rmbp-f39prefsunsetbus cf3a30b52 wave36 cut60
-exec-rmbp-f39machinestoreonelay cf3a30b52 wave36 cut60
-exec-rmbp-f39hidwhoorin cf3a30b52 wave36 cut60
+exec-rmbp-f39busregtagpath 3116826e5 FOLDED (kernel batch cut60 kernel batch B1163-B1168)
+exec-rmbp-f39busregarmearly e68fd1d7c FOLDED (kernel batch cut60 kernel batch B1163-B1168)
+exec-rmbp-f39relayresetfallback b10bfe2bf FOLDED (kernel batch cut60 kernel batch B1163-B1168)
+exec-rmbp-f39prefsunsetbus 0df571c4c FOLDED (kernel batch cut60 kernel batch B1163-B1168)
+exec-rmbp-f39machinestoreonelay f8b1b97bc FOLDED (kernel batch cut60 kernel batch B1163-B1168)
+exec-rmbp-f39hidwhoorin 466fd514e FOLDED (kernel batch cut60 kernel batch B1163-B1168)
 exec-rmbp-vugfacefieldkeysrest 44ace0a30 wave36 cut59
 exec-rmbp-vugintentsetfacepushedge 44ace0a30 wave36 cut59
 exec-rmbp-vugcomscanrelinkenvelope 44ace0a30 wave36 cut59
 exec-rmbp-vugprincipiaunsetchanged 44ace0a30 wave36 cut59
 exec-rmbp-vugfacejournalholdmany 44ace0a30 wave36 cut59
 exec-rmbp-vugfacedeviationprb 44ace0a30 wave36 cut59
+exec-rmbp-f39relayresetset e84b64a95 wave36 cut61
+exec-rmbp-f39prefscappath e84b64a95 wave36 cut61
+exec-rmbp-f39armforgetteardown e84b64a95 wave36 cut61
+exec-rmbp-f39busregarmearlyring3 e84b64a95 wave36 cut61
+exec-rmbp-f39prefsunsetwirepin e84b64a95 wave36 cut61
+exec-rmbp-f39machinestorekernelonly e84b64a95 wave36 cut61
