@@ -737,7 +737,7 @@ fn kat_hold(max: &AtomicU64, who: &MaskWho, ms: u64) -> u64 {
 
 /// DESKTOPHIDGAP (B1020): the `hid-pump` task's pass, on its own core — re-stamp [`PUMP_CPU`] (one writer: this task) and
 /// print one line when it changed from a set value. Task context only (never the ISR).
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 pub fn pump_here() {
     let cpu = crate::arch::percpu::this_cpu().cpu_index as usize;
     let was = PUMP_CPU.swap(cpu, Relaxed);
@@ -1604,7 +1604,7 @@ fn hid_place_kat() {
 // gated off by `pass_begin`'s T0 swap before it takes and resets the gap's candidate ([`wait_who_gap`]); the minute's worst
 // gap keeps its own ([`wait_who_keep`]). The name is held in the ONE name record, [`MaskWho`] (its site word is this tail's
 // sample line, never printed). `who=<task>:<tid>`, `-` unless the minute reads WAIT-LONG, `?` when no tick sampled
-// (aarch64: no HID pass stamps the pump there yet, HID-PUMP-ARM owed; an idle core). F39HIDPLACERENDER (B1118): both arches' tick sample through [`wait_tick`]. `:: HIDGAPSPLIT:` adds `who_ok=` (pure cases).
+// (QEMU raspi4b: no tick IRQ; an idle core; F39HIDPUMPARM B1124 retired the aarch64 note). F39HIDPLACERENDER (B1118): both arches' tick sample through [`wait_tick`]. `:: HIDGAPSPLIT:` adds `who_ok=` (pure cases).
 
 /// F39HIDPLACESVC (B1109): the ended-or-running gap's majority candidate (tid 0 = none) and its Boyer-Moore count.
 static GAP_WHO: MaskWho = MaskWho::new();
@@ -1727,8 +1727,8 @@ fn svc_kat() -> Option<bool> {
 // skip, skip_b)`, widened in place; `sibling_online_cpu` passes none), and `pick_live_skip` passes the render core as
 // `skip_b`. `:: HIDPLACE:` adds `render_ok=` (x86 SMP live, at least two siblings; `-` on aarch64 / fewer CPUs).
 // HID-WAIT-WHO-ARM: the pump-core gate is ONE fn, [`wait_tick`]; each arch's `timer_preempt` -> `hid_wait_tick` keeps only
-// its own `Task` read in the closure. aarch64's tick is wired, but no aarch64 HID pass stamps [`pump_here`] /
-// `pass_begin` yet, so `who=` stays `?` there (HID-PUMP-ARM owed).
+// its own `Task` read in the closure. aarch64's pass stamps [`pump_here`] / `pass_begin` since F39HIDPUMPARM (B1124, file
+// tail), so `who=` reads `?` only when no tick sampled (QEMU raspi4b: no tick IRQ).
 
 /// F39HIDPLACERENDER (B1118): the tick sampler's gate, shared by both arches' `sched::hid_wait_tick` (ISR, IF=0): on the
 /// hid pump's core only, `who` reads the interrupted task's name and id and [`wait_who_tick`] votes it.
@@ -1765,3 +1765,15 @@ fn render_kat() -> Option<bool> {
 fn render_kat() -> Option<bool> {
     None
 }
+
+// ── F39HIDPUMPARM (rmbp-ledger B1124) — HID-PUMP-ARM: aarch64's HID pass bracketed by the same three fns. FILE-TAIL append. ──
+// B1118 wired aarch64's `timer_preempt` -> `hid_wait_tick` -> [`wait_tick`], but nothing on aarch64 called [`pump_here`] /
+// [`pass_begin`] / [`pass_done`] (the only caller was x86 `ehci::hid_task`), so [`pump_cpu`] read none, the tick sampled
+// nothing and the gap split's fields read 0 there. aarch64's HID pass is ONE `pump_usb_into_gui()` (main.rs, aarch64 +
+// baremetal: the xHCI claim, `poll_events`' HID decode into `pal::push_event`, the services, the GUI forward). It has early
+// returns, so the bracket sits at its two CALLERS, runtime-exclusive: the metal `usb-pump` task's pass (`usb_pump`, timer
+// live) and `input_service`'s poll-nap (QEMU raspi4b, no Group-1 IRQ) — each a line-neutral fold, the x86 order and fns,
+// no copy. [`pump_here`] is compiled on both arches (its body is arch-neutral). One writer per boot (that pass's task),
+// relaxed atomics as on x86. Side effect, intended (BP-input-11): on aarch64 [`pump_cpu`] now reads the pump's core, so
+// [`apart`] and every `!= pump_cpu()` placement filter keep apart from it. `[hid] gap split` keeps its one shape; `who=`
+// names the task on Pi metal and reads `?` on QEMU raspi4b (no tick IRQ there).

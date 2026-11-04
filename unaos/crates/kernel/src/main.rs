@@ -5166,7 +5166,7 @@ fn input_service(_: usize) {
             // PIUSB-23: pump xHCI + bridge decoded HID keys into GUI_CHANNEL each cooperative pass
             // (QEMU raspi4b delivers no USB HID, so this is a cheap no-op there; on metal it consumes
             // the re-armed interrupt-IN completions the enumerate() pump no longer services).
-            pump_usb_into_gui();
+            unaos_kernel::hidstall::pump_here(); unaos_kernel::hidstall::pass_begin(); pump_usb_into_gui(); unaos_kernel::hidstall::pass_done(); // F39HIDPUMPARM (B1124): the QEMU raspi4b HID pass bracketed by the x86 pump's same three fns, so the gap split and the census's pump core read it (hidstall.rs tail). LINE-NEUTRAL fold, code first
             unaos_kernel::arch::sched::yield_now();
         }
     }
@@ -5778,7 +5778,7 @@ fn usb_pump(_: usize) {
     loop {
         unaos_kernel::arch::sched::sleep_ticks(1); // ~4 ms at the 250 Hz per-core tick
         let t0 = unaos_kernel::arch::now_cycles();
-        pump_usb_into_gui();
+        unaos_kernel::hidstall::pump_here(); unaos_kernel::hidstall::pass_begin(); pump_usb_into_gui(); unaos_kernel::hidstall::pass_done(); // F39HIDPUMPARM (B1124): the metal HID pass bracketed by the x86 pump's same three fns, so the gap split, the pump core and B1118's tick sampler read it (hidstall.rs tail). LINE-NEUTRAL fold, code first
         let dt = unaos_kernel::arch::now_cycles().wrapping_sub(t0);
         // Rate-limit the cost line to once every ~5 s (this loop runs ~250×/s).
         let now = unaos_kernel::arch::ms();
