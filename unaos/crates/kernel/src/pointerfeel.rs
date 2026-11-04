@@ -109,7 +109,7 @@ pub fn note(now: u64, vendor: bool, down: bool) {
     REPORTS.fetch_add(1, Relaxed);
     if vendor { MT.fetch_add(1, Relaxed); } else { LEGACY.fetch_add(1, Relaxed); }
     let prev = LAST_MS.swap(now, Relaxed); let pass_gap = PASS_GAP_MS.swap(0, Relaxed); // PUMPHOLE (B541): the longest hid-pass gap since the previous report, taken at EVERY counted report
-    let prev_down = PREV_DOWN.swap(down, Relaxed);
+    let prev_down = PREV_DOWN.swap(down, Relaxed); tap_note(now, down); // F39HIDPLACE (B1103) POINTERFEEL-TAP: the touch's last finger-down report and its lift (LINE-NEUTRAL fold, code first; body at the tail)
     if prev == 0 || !prev_down || !down {
         return;
     }
@@ -273,7 +273,7 @@ fn run() {
     }
     GAP_MAX_MS.store(0, Relaxed);
     GAP_MAX_WHO.store(usize::MAX, Relaxed);
-    GAP_MAX_STEP.store(0, Relaxed); reset_class(); reset_xfer(); // PUMPHOLE (B541). TPSTREAM (B624): the window's transfer census starts at zero
+    GAP_MAX_STEP.store(0, Relaxed); reset_class(); reset_xfer(); reset_tap(); // F39HIDPLACE (B1103): the tap reading starts clear. PUMPHOLE (B541). TPSTREAM (B624): the window's transfer census starts at zero
     ARMED.store(true, core::sync::atomic::Ordering::Release);
     serial_println!("[ptrfeel] move one finger on the trackpad for {} s (waiting up to {} s for the first touch)", WINDOW_MS / 1000, TOUCH_WAIT_MS / 1000);
     let _ = crate::video::notify(b"pointerfeel", b"Trackpad test", b"Move one finger on the trackpad for 5 seconds", b"", 0, b"");
@@ -313,7 +313,7 @@ fn report() {
     serial_println!(
         ":: POINTERFEEL: reports={} rate_hz={}.{} gaps={} gap_max_ms={} worst_holder={} route={} {} {} -> {} :: bound_ms={} window_ms={} mt={} legacy={} reassert={} reassert_latched={} fr={} fr_worst_ms={} login_gap_ms={} login_gap_holder={} starved={} starved_max_ms={} silent={} silent_max_ms={} pass_max_ms={} pass_bound_ms={} {} via=tests",
         n, rate_x10 / 10, rate_x10 % 10, gaps, gmax, Classed(silent_worst(gaps), WorstWord(worst)), if mt > leg { "mt" } else { "legacy" }, FineWord, RateWord(rate_x10), // POINTERSCALE2 (B554): `expected_hz=` from the endpoint's bInterval beside `rate_hz=` (LINE-NEUTRAL, code first)
-        if verdict(n, STARVED.load(Relaxed), mt, leg) && rate_ok(rate_x10, expected_hz()) { "PASS" } else { "FAIL" }, BOUND_MS, WINDOW_MS, mt, leg, reasserts(),
+        TapWord(verdict(n, STARVED.load(Relaxed), mt, leg) && rate_ok(rate_x10, expected_hz()), gaps, mt, leg), BOUND_MS, WINDOW_MS, mt, leg, reasserts(),
         REASSERT_LATCHED.load(Relaxed), fr, fr_worst, LOGIN_GAP_MS.load(Relaxed), LoginGapHolder, STARVED.load(Relaxed), STARVED_MAX_MS.load(Relaxed), SILENT.load(Relaxed), SILENT_MAX_MS.load(Relaxed), PASS_MAX_MS.load(Relaxed), BOUND_MS, XferWord
     );
     let start = START_MS.load(Relaxed);
@@ -563,5 +563,61 @@ impl core::fmt::Display for XferWord {
             f, "nak={} err={} csplit_miss={} via_isr={} via_poll={} rescued={} inflight=1",
             g(XFER_NAK), g(XFER_ERR), g(XFER_MISS), g(XFER_ISR), g(XFER_POLL), g(XFER_RESCUED)
         )
+    }
+}
+
+// ── F39HIDPLACE (rmbp-ledger B1103) — POINTERFEEL-TAP: a tap is SKIP, not a starved stream. FILE-TAIL append. ──────────────
+// Flight 39: `:: POINTERFEEL: reports=6 … gaps=0 … starved=0 … rate=LOW -> FAIL` — a tap: six frames (~48 ms at the pad's
+// 125 Hz) then the lift, rated over the fixed 5 s window. The window now reads `-> SKIP reason=tap touch_ms=<n>
+// tap_ms=500` when, and only when, [`is_tap`] holds: the touch's finger-down span (its last finger-down report minus
+// the window's first) is under [`TAP_MS`], a finger-UP report arrived after that last finger-down report (the touch
+// ENDED on the wire: a stream that dies mid-touch never sends the lift and still FAILs), no gap of any class inside it
+// (`gaps=` raw — `starved` is a subset, so a real starvation never reads SKIP), and the route is `mt` (the legacy stream
+// cannot see a lift; its route FAIL stands). A PASS is never re-worded. One writer (the hid-pump, inside [`note`]).
+
+/// A touch whose finger-down span is under this is a tap (ms).
+pub const TAP_MS: u64 = 500;
+/// The window's last finger-down report (`arch::ms()`; 0 = none), and whether a finger-up report followed it.
+static TAP_DOWN_MS: AtomicU64 = AtomicU64::new(0);
+static TAP_LIFTED: AtomicBool = AtomicBool::new(false);
+
+/// [`note`], at every counted report: a finger-down report moves the touch's end and clears the lift; a finger-up one lifts.
+fn tap_note(now: u64, down: bool) {
+    if down {
+        TAP_DOWN_MS.store(now, Relaxed);
+        TAP_LIFTED.store(false, Relaxed);
+    } else {
+        TAP_LIFTED.store(true, Relaxed);
+    }
+}
+
+fn reset_tap() {
+    TAP_DOWN_MS.store(0, Relaxed);
+    TAP_LIFTED.store(false, Relaxed);
+}
+
+/// Is the window a tap? Finger-down span under [`TAP_MS`], ended by a lift, no gap inside, route `mt`. Pure.
+pub fn is_tap(touch_ms: u64, lifted: bool, gaps: u32, mt: u32, legacy: u32) -> bool {
+    touch_ms < TAP_MS && lifted && gaps == 0 && mt > legacy
+}
+
+/// The window's finger-down span: its last finger-down report minus its first (0 before a touch).
+fn touch_ms() -> u64 {
+    let (s, d) = (START_MS.load(Relaxed), TAP_DOWN_MS.load(Relaxed));
+    if s == 0 || d == 0 { 0 } else { d.saturating_sub(s) }
+}
+
+/// The verdict word: `PASS` | `SKIP reason=tap touch_ms=<n> tap_ms=500` | `FAIL` — `(pass, gaps, mt, legacy)`.
+struct TapWord(bool, u32, u32, u32);
+impl core::fmt::Display for TapWord {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        if self.0 {
+            return f.write_str("PASS");
+        }
+        let t = touch_ms();
+        if is_tap(t, TAP_LIFTED.load(Relaxed), self.1, self.2, self.3) {
+            return write!(f, "SKIP reason=tap touch_ms={} tap_ms={}", t, TAP_MS);
+        }
+        f.write_str("FAIL")
     }
 }

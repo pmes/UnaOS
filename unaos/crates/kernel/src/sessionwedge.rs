@@ -706,17 +706,17 @@ pub fn gatesteal_long_step_maybe() {
 
 /// GATESTEAL — a live core for the pump: the placement authority's xHCI worker (never the render core, never the
 /// service/dead core, never a core parked by name), else the dead core's least-loaded sibling under the same rules.
-fn pick_live(dead: usize, render: Option<usize>) -> Option<usize> {
+fn pick_live(dead: usize, render: Option<usize>) -> Option<usize> { crate::hidstall::apart(|skip| pick_live_skip(dead, render, skip)) } fn pick_live_skip(dead: usize, render: Option<usize>, skip: usize) -> Option<usize> { // F39HIDPLACE (B1103) HID-PLACE: the ladder below asked first apart from the hid pump's core (`skip`), then with none (`hidstall::apart`). LINE-NEUTRAL, in place
     let n = crate::arch::smp::online_aps().len();
     for i in 0..n {
         match crate::arch::smp::xhci_worker_cpu(i) {
-            Some(c) if c != dead && Some(c) != render && !crate::arch::sched::is_dead_core(c) => return Some(c),
+            Some(c) if c != dead && c != skip && Some(c) != render && !crate::arch::sched::is_dead_core(c) => return Some(c),
             Some(_) => continue,
             None => break,
         }
     }
     let c = crate::arch::sched::sibling_online_cpu(dead);
-    if c != dead && Some(c) != render && !crate::arch::sched::is_dead_core(c) { Some(c) } else { None }
+    if c != dead && c != skip && Some(c) != render && !crate::arch::sched::is_dead_core(c) { Some(c) } else { None }
 }
 
 /// GATESTEAL — the watch's half of the loop (see the block above). Two relaxed loads per look when no steal has
@@ -976,4 +976,11 @@ pub fn stamp_live() {
         return;
     }
     LAST_MS.store(crate::arch::ms().max(1), Relaxed);
+}
+
+// ── F39HIDPLACE (rmbp-ledger B1103) — where the watch last placed the usb-pump, read only. FILE-TAIL append. ──────────
+/// The core the watch last placed the usb-pump on (a wedge restart or a steal re-home; `usize::MAX` = none yet) — the
+/// existing [`REHOME_LIVE`], read by `hidstall`'s census for `placed=`.
+pub fn rehome_live() -> usize {
+    REHOME_LIVE.load(Relaxed) as usize
 }
