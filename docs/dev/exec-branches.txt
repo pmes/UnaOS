@@ -1443,3 +1443,9 @@ exec-rmbp-vugintentsetfacelistedoverlap 364b81387 wave36 cut58
 exec-rmbp-vugcomscanenvelopebound 364b81387 wave36 cut58
 exec-rmbp-vugprincipiaunsetsynapse 364b81387 wave36 cut58
 exec-rmbp-vugsketchbadrefkind 364b81387 wave36 cut58
+exec-rmbp-f39busregtagpath cf3a30b52 wave36 cut60
+exec-rmbp-f39busregarmearly cf3a30b52 wave36 cut60
+exec-rmbp-f39relayresetfallback cf3a30b52 wave36 cut60
+exec-rmbp-f39prefsunsetbus cf3a30b52 wave36 cut60
+exec-rmbp-f39machinestoreonelay cf3a30b52 wave36 cut60
+exec-rmbp-f39hidwhoorin cf3a30b52 wave36 cut60
