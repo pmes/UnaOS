@@ -1764,3 +1764,89 @@ fn a_desk_reads_the_declared_machine_from_principia_at_start_and_bounds_the_jog(
     let (lines, _rt, _m) = fake.join().unwrap();
     assert_eq!(jogs_of(&lines), ["$J=G91 X100 Y0 Z0 F300"], "the refused X150 never reached the wire: {lines:?}");
 }
+
+// --- VUGCOMSCANPREFSUNA (SR628): the declare kept by the REAL Principia (una's mount) and read back after a restart ---
+
+/// VUGCOMSCANPREFSUNA (SR628): una's composition on a test bus — `principia::serve` mounted, its receiver taken first,
+/// before `serve_pump`, over a home under CARGO_TARGET_TMPDIR. Boot 1: the start's PrefGet is answered unset (no machine
+/// said from prefs) and an accepted declare is kept by Principia (its own PrefChanged, then the file). Boot 2, the
+/// restart: a fresh Principia over the same home and a fresh undeclared desk say the machine from prefs, and nothing is
+/// written back.
+#[test]
+fn a_declare_survives_a_restart_through_the_real_principia() {
+    use bandy::{PrefValue, PrincipiaCommand, SMessage, Synapse};
+    let home = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("vugcomscanprefsuna-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    let record = "mill x=120 y=300 z=100 dialect=grbl";
+    let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+
+    // Boot 1: Principia over an empty home, then the desk; a declare is kept.
+    let desk1 = std::sync::Arc::new(std::sync::Mutex::new(PumpDesk::new(machine())));
+    rt.block_on(async {
+        let syn = Synapse::new();
+        let prx = syn.subscribe();
+        let principia = tokio::spawn(principia::serve(syn.clone(), prx, principia::Principia::with_home(&home)));
+        let rx = syn.subscribe();
+        let mut watch = syn.subscribe();
+        let task = tokio::spawn(comscan::pump::serve_pump(syn.clone(), rx, desk1.clone(), no_opener(), Duration::from_millis(5)));
+        let unset = next_on(&mut watch, |m| match m {
+            SMessage::Principia(PrincipiaCommand::PrefValueIs { ns, key, value }) if ns == "comscan" && key == "machine" => Some(value),
+            _ => None,
+        })
+        .await;
+        assert_eq!(unset, None, "a fresh home keeps no machine: the real Principia answers the start's PrefGet unset");
+        let good = comscan::pump::declare_request(&format!("machine declare {record}"), Origin::LocalUser("una".to_string())).expect("the text form parses");
+        syn.fire(SMessage::Pump(good));
+        let mut from_prefs = Vec::new();
+        let kept = next_on(&mut watch, |m| match m {
+            SMessage::Pump(PumpEvent::Squawk { event: Some(e), .. }) if e.ends_with("(from prefs)") => {
+                from_prefs.push(e);
+                None
+            }
+            SMessage::Principia(PrincipiaCommand::PrefChanged { ns, key, value, .. }) if ns == "comscan" && key == "machine" => Some(Ok(value)),
+            SMessage::Principia(PrincipiaCommand::PrefError { ns, key, message }) if ns == "comscan" && key == "machine" => Some(Err(message)),
+            _ => None,
+        })
+        .await;
+        assert!(from_prefs.is_empty(), "an unset store declares nothing from prefs: {from_prefs:?}");
+        assert_eq!(kept, Ok(Some(PrefValue::Str(record.to_string()))), "Principia kept the declared record");
+        syn.fire(SMessage::Kill("comscan".to_string()));
+        tokio::time::timeout(Duration::from_secs(5), task).await.expect("stops on Kill").unwrap();
+        principia.abort();
+    });
+    assert_eq!(desk1.lock().unwrap().declared(), Some(("mill", Some(GRBL))));
+    let stored = principia::PrefStore::load(home.join("settings")).expect("the settings folder reads").get("comscan", "machine");
+    assert_eq!(stored, Some(PrefValue::Str(record.to_string())), "the record is in the file, not only Principia's cache");
+
+    // Boot 2, the restart: a fresh Principia (reloaded from the file) and a fresh undeclared desk.
+    let desk2 = std::sync::Arc::new(std::sync::Mutex::new(PumpDesk::new(machine())));
+    let written_back = rt.block_on(async {
+        let syn = Synapse::new();
+        let prx = syn.subscribe();
+        let principia = tokio::spawn(principia::serve(syn.clone(), prx, principia::Principia::with_home(&home)));
+        let rx = syn.subscribe();
+        let mut watch = syn.subscribe();
+        let task = tokio::spawn(comscan::pump::serve_pump(syn.clone(), rx, desk2.clone(), no_opener(), Duration::from_millis(5)));
+        let said = next_on(&mut watch, |m| match m {
+            SMessage::Pump(PumpEvent::Squawk { event: Some(e), .. }) if e.starts_with("machine declared") => Some(e),
+            _ => None,
+        })
+        .await;
+        assert_eq!(said, format!("machine declared {record} (from prefs)"));
+        syn.fire(SMessage::Kill("comscan".to_string()));
+        tokio::time::timeout(Duration::from_secs(5), task).await.expect("stops on Kill").unwrap();
+        principia.abort();
+        let mut sets = 0;
+        while let Ok(m) = watch.try_recv() {
+            if matches!(m, SMessage::Principia(PrincipiaCommand::PrefSet { .. })) {
+                sets += 1;
+            }
+        }
+        sets
+    });
+    assert_eq!(written_back, 0, "a declare from prefs writes nothing back");
+    assert_eq!(desk2.lock().unwrap().declared(), Some(("mill", Some(GRBL))), "the restarted desk holds the kept machine");
+    drop(rt);
+    let _ = std::fs::remove_dir_all(&home);
+}

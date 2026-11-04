@@ -29,6 +29,7 @@ tabula = { path = "../../handlers/tabula" }   # de-GTK'd (528c213); default feat
 midden = { path = "../../handlers/midden" }   # console core (default features GTK-free)
 aule = { path = "../../handlers/aule" }       # forge streamer (String lines over mpsc)
 comscan = { path = "../../handlers/comscan" } # Console log viewer (bus-fed scrollback)
+principia = { path = "../../handlers/principia" } # VUGCOMSCANPREFSUNA (SR628): the one host Principia on the desk's bus
 # vaire = { path = "../../handlers/vaire" }
 
 [target.'cfg(target_os = "linux")'.dependencies]

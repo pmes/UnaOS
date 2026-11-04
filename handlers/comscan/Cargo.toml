@@ -16,3 +16,4 @@ gneiss_pal = { path = "../../libs/gneiss_pal" } # VUGCOMSCANWS (SR499): api::htt
 
 [dev-dependencies]
 tokio = { version = "1.53", features = ["sync", "rt", "rt-multi-thread", "macros", "time"] }
+principia = { path = "../principia" } # VUGCOMSCANPREFSUNA (SR628): tests/tty.rs keeps the declare through the real fulfiller
