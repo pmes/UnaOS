@@ -1182,7 +1182,7 @@ fn queued_drain() {
             }
         } else if queued_silent(c) {
             // QUEUED-SET-STUCKLIVE (B1187): a live holder that never answered, past the deadline (file tail).
-            if queued_take(c).is_some() {
+            if queued_take(c).is_some() { pendpin_release(c); // QUEUED-SET-PENDPIN (B1193): the silent holder's relay Pend is reclaimed (file tail). LINE-NEUTRAL fold.
                 serial_println!("[prefsbus] queued set corr={} holder silent — released status={}", c, ETIMEDOUT);
             }
         }
@@ -1267,7 +1267,7 @@ pub fn queued_selftest() {
         let _ = queued_take(c);
     }
     let (q4, q5) = lostreset_selftest(&next, &body_of, &read, want); // QUEUED-SET-LOSTRESET (B1181): Q4 / Q5, the full-inbox legs (file tail)
-    let (q6, q7) = stucklive_selftest(&next, &body_of, &read, want); // QUEUED-SET-STUCKLIVE (B1187): Q6 silent live holder, Q7 refused answer delivered (file tail)
+    let (q6, q7) = stucklive_selftest(&next, &body_of, &read, want); let q8 = pendpin_selftest(&next, &body_of, &read, want); /* QUEUED-SET-PENDPIN (B1193): Q8 the silent holder's Pend reclaimed (file tail) */ // QUEUED-SET-STUCKLIVE (B1187): Q6 silent live holder, Q7 refused answer delivered (file tail)
     // Restore the operator's value through the same kernel fulfiller (or leave the key unset as it was).
     match orig {
         Some(v) => {
@@ -1280,10 +1280,10 @@ pub fn queued_selftest() {
             let _ = crate::prefs::unset(crate::prefs::NS, key::IDLE_MIN);
         }
     }
-    if q1 && q2 && q3 && q4 && q5 && q6 && q7 {
-        serial_println!(":: RELAY-QUEUED-SET: unread=applied read=released full=eagain lostreset=released/applied stucklive=released refusedreply=redelivered eager=owed -> PASS ::");
+    if q1 && q2 && q3 && q4 && q5 && q6 && q7 && q8 {
+        serial_println!(":: RELAY-QUEUED-SET: unread=applied read=released full=eagain lostreset=released/applied stucklive=released refusedreply=redelivered pendpin=reclaimed eager=owed -> PASS ::");
     } else {
-        serial_println!(":: RELAY-QUEUED-SET: q1={} q2={} q3={} q4={} q5={} q6={} q7={} (want={} read1={} read2={} kept={}/{} pushed={}/{}) -> FAIL ::", q1 as u8, q2 as u8, q3 as u8, q4 as u8, q5 as u8, q6 as u8, q7 as u8, want, read1.unwrap_or(-1), read2.unwrap_or(-1), kept1 as u8, kept2 as u8, pushed1 as u8, pushed2 as u8);
+        serial_println!(":: RELAY-QUEUED-SET: q1={} q2={} q3={} q4={} q5={} q6={} q7={} q8={} (want={} read1={} read2={} kept={}/{} pushed={}/{}) -> FAIL ::", q1 as u8, q2 as u8, q3 as u8, q4 as u8, q5 as u8, q6 as u8, q7 as u8, q8 as u8, want, read1.unwrap_or(-1), read2.unwrap_or(-1), kept1 as u8, kept2 as u8, pushed1 as u8, pushed2 as u8);
     }
 }
 
@@ -1584,4 +1584,82 @@ fn stucklive_selftest(next: &dyn Fn() -> u32, body_of: &dyn Fn(i64) -> String, r
 #[cfg(feature = "busreg")]
 fn queued_word(verb: u8) -> &'static str {
     if verb == una_abi::BUS_VERB_PREF_UNSET || verb == una_abi::BUS_VERB_R3PREF_UNSET { "unset" } else { "set" }
+}
+
+// =================================================================================================
+// QUEUED-SET-PENDPIN (rmbp-ledger B1193, BP-storage-11) — TAIL-APPENDED. B1187's silent arm released a queued SET whose
+// live holder never answered, but the relay's kernel-client `Pend` stayed in `bus_route`'s table (KCLIENT_GEN never moves,
+// so the dead-caller reclaim never frees it): at `PEND_MAX_PER_CALLER` every later SET was written by the kernel fulfiller
+// ahead of the holder's queue, and the holder's late commit of the old SET could overtake it. The silent arm now takes that
+// Pend by the client corr (`bus_route::take_pending_by_corr`, the keyed form of `take_pending`): the late answer meets
+// `fulfiller_reply`'s no-Pend arm (-ENOENT, nothing delivered) and the next SET relays to the holder again. The dead-holder
+// roads (B1169 unread, B1181 lost reset) need nothing: `on_exit` already takes the dying holder's Pends. The serial line is
+// printed with no lock held (`QUEUED` released by `queued_take`, `PEND` by the taker).
+// Wire: `[prefsbus] queued set corr=<c> holder silent — relay pend reclaimed` before the arm's `released status=-110`.
+// =================================================================================================
+/// The silent arm's reclaim: drop the kernel-client relay Pend of client corr `corr`, if the holder still held one.
+#[cfg(feature = "busreg")]
+fn pendpin_release(corr: u32) {
+    if crate::bus_route::take_pending_by_corr(KCLIENT_ROW, corr) {
+        serial_println!("[prefsbus] queued set corr={} holder silent — relay pend reclaimed", corr);
+    }
+}
+
+/// `queued_selftest`'s Q8 (B1193). Holder = row 0 at its CURRENT generation (Q6's). Client Pends are planted up to the
+/// per-caller cap (the first one's corr also kept on the ring); the entry's deadline is expired and the drain releases it:
+/// the count is back under the cap (the next SET relays), the holder's late answer is -ENOENT with no inbox frame, and
+/// the key is unchanged. The filler Pends and any stray frame are taken back.
+#[cfg(feature = "busreg")]
+fn pendpin_selftest(next: &dyn Fn() -> u32, body_of: &dyn Fn(i64) -> String, read: &dyn Fn() -> Option<i64>, want: i64) -> bool {
+    let ops = crate::arch::syscall::busreg_ops();
+    let rg0 = (ops.rgen)(0);
+    let cap = crate::bus_route::PEND_MAX_PER_CALLER;
+    let n0 = crate::bus_route::caller_pending(KCLIENT_ROW, KCLIENT_GEN);
+    let b8 = body_of(if want == 7 { 33 } else { 35 });
+    let c8 = next();
+    let relay8 = crate::bus_route::pendpin_plant(una_abi::BUS_VERB_R3PREF_SET, c8, 0, rg0);
+    let kept8 = relay8.is_some() && queued_set_hdr(c8, b8.as_bytes()).is_some_and(|h| queued_keep(&h, b8.as_bytes(), Some((0usize, rg0))));
+    let mut fillers: Vec<u32> = Vec::new();
+    let mut planted = relay8.is_some();
+    for _ in (n0 + 1)..cap {
+        let c = next();
+        if crate::bus_route::pendpin_plant(una_abi::BUS_VERB_R3PREF_SET, c, 0, rg0).is_none() {
+            planted = false;
+            break;
+        }
+        fillers.push(c);
+    }
+    let full8 = crate::bus_route::caller_pending(KCLIENT_ROW, KCLIENT_GEN) >= cap;
+    let now = crate::arch::ms();
+    locked(|| {
+        if let Some(e) = QUEUED.lock().iter_mut().find(|e| e.hdr.corr == c8) {
+            e.silent_at_ms = now;
+        }
+    });
+    queued_drain();
+    let released8 = queued_take(c8).is_none();
+    let freed8 = crate::bus_route::caller_pending(KCLIENT_ROW, KCLIENT_GEN) < cap;
+    let mut r = alloc::vec![0u8; BUS_HDR_LEN];
+    let rn = crate::bus::build_reply(una_abi::BUS_VERB_R3PREF_SET, relay8.unwrap_or(0), 0, [0u8; 32], &[], &mut r);
+    let late8 = match crate::bus::frame_parse(&r[..rn]) {
+        Ok(h) => crate::bus_route::fulfiller_reply(ops, 0, rg0, &h, &r[..rn]) == -2,
+        Err(_) => false,
+    };
+    let stray8 = locked(|| {
+        let mut q = REPLIES.lock();
+        let before = q.len();
+        q.retain(|f| !matches!(crate::bus::frame_parse(f), Ok(h) if h.corr == c8));
+        q.len() != before
+    });
+    let read8 = read();
+    for c in fillers {
+        let _ = crate::bus_route::take_pending_by_corr(KCLIENT_ROW, c);
+    }
+    let _ = crate::bus_route::take_pending_by_corr(KCLIENT_ROW, c8);
+    let _ = queued_take(c8);
+    let q8 = kept8 && planted && full8 && released8 && freed8 && late8 && !stray8 && read8 == Some(want);
+    if !q8 {
+        serial_println!("[prefsbus] pendpin leg: kept={} planted={} full={} released={} freed={} late={} stray={} n0={} read8={}", kept8 as u8, planted as u8, full8 as u8, released8 as u8, freed8 as u8, late8 as u8, stray8 as u8, n0, read8.unwrap_or(-1));
+    }
+    q8
 }

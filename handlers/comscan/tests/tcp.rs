@@ -974,11 +974,19 @@ fn fake_marlin_m114(l: TcpListener) -> JoinHandle<Vec<String>> {
 
 /// VUGCOMSCANMARLINAUTOREPORT (SR625): how [`fake_marlin_said`] answers `M154 S<n>`: a build with AUTO_REPORT_POSITION
 /// (`ok`, then a position line after each absolute `G0` / `G1` move of the job) or without it (`echo:Unknown command`, `ok`).
+/// VUGCOMSCANAUTOREPORTCAPOFF (SR634): On / Unknown / OnHangUp say `Cap:AUTOREPORT_POS:1` in their M115 answer, NoCap says
+/// `Cap:AUTOREPORT_POS:0` (and `ok` to an M154 it should never hear); OnHangUp is On that answers `G28` with a FIN (its
+/// write half shut, no `ok`) and still records what it hears.
 #[derive(Clone, Copy, PartialEq)]
 enum M154 {
     On,
     Unknown,
+    NoCap,
+    OnHangUp,
 }
+
+/// VUGCOMSCANAUTOREPORTCAPOFF (SR634): the fakes' M115 identity line.
+const MARLIN_FIRMWARE_LINE: &str = "FIRMWARE_NAME:Marlin 2.1.2.1 (Jun  1 2023 12:00:00) SOURCE_CODE_URL:github.com/MarlinFirmware/Marlin PROTOCOL_VERSION:1.0 MACHINE_TYPE:3D Printer EXTRUDER_COUNT:1";
 
 /// [`fake_marlin_m114`]'s body; `m154` `None` answers `M154` with a bare `ok` and reports nothing unasked (SR620's fake).
 fn fake_marlin_said(l: TcpListener, m154: Option<M154>) -> JoinHandle<Vec<String>> {
@@ -1002,7 +1010,21 @@ fn fake_marlin_said(l: TcpListener, m154: Option<M154>) -> JoinHandle<Vec<String
                 }
                 let line = String::from_utf8_lossy(&cur).trim().to_string();
                 cur.clear();
+                if m154 == Some(M154::OnHangUp) && line == "G28" { // VUGCOMSCANAUTOREPORTCAPOFF (SR634): the link lost from the controller's side
+                    got.push(line);
+                    let _ = s.shutdown(std::net::Shutdown::Write);
+                    continue;
+                }
                 match line.as_str() {
+                    "M115" => match m154 { // VUGCOMSCANAUTOREPORTCAPOFF (SR634): the identity and the cap; `None` keeps SR620's bare ok
+                        Some(M154::On | M154::Unknown | M154::OnHangUp) => {
+                            let _ = s.write_all(format!("{MARLIN_FIRMWARE_LINE}\r\nCap:SERIAL_XON_XOFF:0\r\nCap:AUTOREPORT_POS:1\r\n").as_bytes());
+                        }
+                        Some(M154::NoCap) => {
+                            let _ = s.write_all(format!("{MARLIN_FIRMWARE_LINE}\r\nCap:AUTOREPORT_POS:0\r\n").as_bytes());
+                        }
+                        None => {}
+                    },
                     "M114" => {
                         let steps = |v: f64| (v * 80.0).round() as i64;
                         let said = format!(
@@ -1015,11 +1037,11 @@ fn fake_marlin_said(l: TcpListener, m154: Option<M154>) -> JoinHandle<Vec<String
                     "G90" => rel = false,
                     "G28" => at = [0.0; 3],
                     l if l.starts_with("M154") => match m154 { // VUGCOMSCANMARLINAUTOREPORT (SR625)
-                        Some(M154::On) => auto = true,
+                        Some(M154::On | M154::OnHangUp) => auto = true, // VUGCOMSCANAUTOREPORTCAPOFF (SR634): + OnHangUp
                         Some(M154::Unknown) => {
                             let _ = s.write_all(format!("echo:Unknown command: \"{l}\"\r\n").as_bytes());
                         }
-                        None => {}
+                        Some(M154::NoCap) | None => {} // VUGCOMSCANAUTOREPORTCAPOFF (SR634): + NoCap
                     },
                     l if auto && !rel && (l.starts_with("G0 ") || l.starts_with("G1 ")) => {
                         // VUGCOMSCANMARLINAUTOREPORT (SR625): the job's absolute move, then the unasked position line mid-job
@@ -1221,7 +1243,7 @@ fn a_marlin_autoreport_moves_the_position_during_the_job_and_bounds_the_jog_afte
     assert!(!words.iter().any(|w| w.starts_with("jog bound")), "{words:?}");
     drop(desk);
     let got = fake.join().unwrap();
-    assert_eq!(got.iter().filter(|l| l.starts_with("M154")).collect::<Vec<_>>(), ["M154 S1"], "asked once: {got:?}");
+    assert_eq!(got.iter().filter(|l| l.starts_with("M154")).collect::<Vec<_>>(), ["M154 S1", "M154 S0"], "asked once: {got:?}"); // VUGCOMSCANAUTOREPORTCAPOFF (SR634): the desk's close (drop) turns it off
     let program_lines = Pump::from_program(&program(), Dialect::Marlin).unwrap().lines().to_vec();
     let at = |want: &str| got.iter().position(|l| l == want).unwrap_or_else(|| panic!("{want} missing: {got:?}"));
     assert!(at("M154 S1") < at(&program_lines[0]), "the M154 rides ahead of the first job line: {got:?}");
@@ -1250,4 +1272,53 @@ fn a_marlin_without_autoreport_says_unsupported_once_and_keeps_the_m114_road() {
     let got = fake.join().unwrap();
     let program_lines = Pump::from_program(&program(), Dialect::Marlin).unwrap().lines().to_vec();
     assert!(program_lines.iter().all(|l| got.contains(l)), "every job line reached the controller: {got:?}");
+}
+
+// --- VUGCOMSCANAUTOREPORTCAPOFF (SR634): the M154 asked only where M115 says Cap:AUTOREPORT_POS:1; M154 S0 at the desk's own close, never on a lost link ---
+
+#[test]
+fn a_marlin_with_the_autoreport_cap_is_asked_and_the_desk_close_turns_it_off() {
+    assert!(pump_core::pump::autoreport_cap("FIRMWARE_NAME:Marlin 2.1.2.1 Cap:AUTOREPORT_POS:1"));
+    assert!(!pump_core::pump::autoreport_cap("FIRMWARE_NAME:Marlin 2.1.2.1"));
+    assert!(!pump_core::pump::autoreport_cap("Cap:AUTOREPORT_POS:0"));
+    let (l, port) = listener();
+    let fake = fake_marlin_said(l, Some(M154::On));
+    let (desk, _open, _t0, words, _) = marlin_done_hello(machine(), port);
+    assert_eq!(words.iter().filter(|w| w.starts_with("autoreport=")).collect::<Vec<_>>(), ["autoreport=on"], "said once: {words:?}");
+    assert_eq!(desk.hello(), Some(format!("{MARLIN_FIRMWARE_LINE} Cap:AUTOREPORT_POS:1").as_str()), "the one Cap line rides the kept hello");
+    drop(desk); // the desk's own close of the live link
+    let got = fake.join().unwrap();
+    assert_eq!(got.iter().filter(|l| l.starts_with("M154")).collect::<Vec<_>>(), ["M154 S1", "M154 S0"], "{got:?}");
+    assert_eq!(got.last().map(String::as_str), Some("M154 S0"), "the off is the last line the controller hears: {got:?}");
+}
+
+#[test]
+fn a_marlin_without_the_autoreport_cap_is_never_asked_and_says_absent_once() {
+    let (l, port) = listener();
+    let fake = fake_marlin_said(l, Some(M154::NoCap));
+    let (desk, _open, _t0, words, _) = marlin_done_hello(machine(), port);
+    assert_eq!(words.iter().filter(|w| w.starts_with("autoreport=")).collect::<Vec<_>>(), ["autoreport=absent"], "said once: {words:?}");
+    assert_eq!(desk.hello(), Some(MARLIN_FIRMWARE_LINE), "Cap:AUTOREPORT_POS:0 is not kept");
+    drop(desk);
+    let got = fake.join().unwrap();
+    assert!(got.iter().any(|l| l == "M115"), "the hello asked: {got:?}");
+    assert!(!got.iter().any(|l| l.starts_with("M154")), "never asked, never turned off: {got:?}");
+    let program_lines = Pump::from_program(&program(), Dialect::Marlin).unwrap().lines().to_vec();
+    assert!(program_lines.iter().all(|l| got.contains(l)), "every job line reached the controller: {got:?}");
+}
+
+#[test]
+fn a_lost_marlin_link_writes_no_autoreport_off() {
+    let (l, port) = listener();
+    let fake = fake_marlin_said(l, Some(M154::OnHangUp));
+    let (mut desk, mut open, t0, mut words, _) = marlin_done_hello(machine(), port);
+    assert_eq!(words.iter().filter(|w| w.starts_with("autoreport=")).collect::<Vec<_>>(), ["autoreport=on"], "{words:?}");
+    let home = PumpEvent::PumpHome { principal: Origin::LocalUser("una".to_string()) };
+    assert_eq!(squawk_words(&desk.apply(&home, &mut *open)), ["home sent: G28"]);
+    let lost = word_of(drive_until(&mut desk, &mut *open, t0, &mut words, |e| e.starts_with("link lost")));
+    assert!(lost.starts_with("link lost"), "{lost}");
+    drop(desk); // the link is already gone: nothing to turn off
+    let got = fake.join().unwrap();
+    assert_eq!(got.iter().filter(|l| *l != "M114").last().map(String::as_str), Some("G28"), "nothing but a position poll after the loss: {got:?}");
+    assert_eq!(got.iter().filter(|l| l.starts_with("M154")).collect::<Vec<_>>(), ["M154 S1"], "no M154 S0 on a lost link: {got:?}");
 }
