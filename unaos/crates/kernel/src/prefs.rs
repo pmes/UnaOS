@@ -203,7 +203,7 @@ fn ensure_dirs() {
     let d = path();
     if mt.stat(&d).is_err() {
         let _ = mt.create(&d, NodeKind::Dir, crate::fs::vfs::KERNEL_PRINCIPAL);
-    }
+    } crate::fs::rootacl::stamp_store(&mt, &d); // MACHINESTOREACL (rmbp-ledger B1150): the no-session folder takes ROOTACL's `system` row (fs/rootacl.rs tail); a home's folder is left alone. LINE-NEUTRAL append, code first
 }
 
 // ── SETTINGSFILES state ─────────────────────────────────────────────────────────────────────────
@@ -1870,6 +1870,6 @@ fn machine_mirror(ns: &str, k: &str, v: Option<&PrefValue>) {
     if mt.stat(&dir).is_err() {
         let _ = mt.create(&dir, crate::fs::vfs::NodeKind::Dir, crate::fs::vfs::KERNEL_PRINCIPAL);
     }
-    let ok = mt.put_file_atomic(&p, text.as_bytes(), crate::fs::vfs::KERNEL_PRINCIPAL).is_ok();
+    crate::fs::rootacl::stamp_store(&mt, &dir); let ok = mt.put_file_atomic(&p, text.as_bytes(), crate::fs::vfs::KERNEL_PRINCIPAL).is_ok(); // MACHINESTOREACL (rmbp-ledger B1150): the machine folder is stamped ROOTACL `system` before its swap (fs/rootacl.rs tail). LINE-NEUTRAL append, code first
     serial_println!("[prefs] machine settings/{} {}.{}={} wrote={}", d, ns, k, v, ok as u8);
 }
