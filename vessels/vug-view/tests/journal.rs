@@ -675,3 +675,92 @@ fn a_bad_ref_offers_the_sketch_points_and_tab_return_fixes_it() {
     assert!((volume(&vw) - 1000.0).abs() < 1e-4, "the box unchanged: {}", volume(&vw));
     assert!(j.offered().is_none(), "nothing left to fix");
 }
+
+// VUGFACEJOURNALSOLIDFAULTFIX (LEDGER SR598): an extrude whose `outer` names a point (NoProfile: the solid half, refused
+// before) opens held: the box above it painted, the extrude's row faulted with the sketch's two closed loops; the card
+// offers each loop into `outer=`, Tab picks the second and Enter repairs it as ONE snapshot: no fault, the post built.
+
+/// The 20 x 10 x 5 box and, on its top, a sketch of two squares (4 x 4 `m*`, 2 x 5 `n*`) and a point `q9`; the post's
+/// `outer` names the point.
+const BOX_NOPROFILE: &str = "vug-doc version=1 lin=1e-6 ang=1e-9
+sketch s1 o=[0 0 0] z=[0 0 1] x=[1 0 0]
+point p1 sketch=s1 x=0 y=0
+point p2 sketch=s1 x=20 y=0
+point p3 sketch=s1 x=20 y=10
+point p4 sketch=s1 x=0 y=10
+line l1 sketch=s1 a=p1 b=p2
+line l2 sketch=s1 a=p2 b=p3
+line l3 sketch=s1 a=p3 b=p4
+line l4 sketch=s1 a=p4 b=p1
+fix f1 sketch=s1 p=p1 at=[0 0]
+fix f2 sketch=s1 p=p2 at=[20 0]
+fix f3 sketch=s1 p=p3 at=[20 10]
+fix f4 sketch=s1 p=p4 at=[0 10]
+extrude box sketch=s1 outer=l1 dir=[0 0 1] length=5
+sketch s2 o=[0 0 5] z=[0 0 1] x=[1 0 0]
+point q1 sketch=s2 x=0 y=0
+point q2 sketch=s2 x=4 y=0
+point q3 sketch=s2 x=4 y=4
+point q4 sketch=s2 x=0 y=4
+point r1 sketch=s2 x=10 y=0
+point r2 sketch=s2 x=12 y=0
+point r3 sketch=s2 x=12 y=5
+point r4 sketch=s2 x=10 y=5
+point q9 sketch=s2 x=16 y=8
+line m1 sketch=s2 a=q1 b=q2
+line m2 sketch=s2 a=q2 b=q3
+line m3 sketch=s2 a=q3 b=q4
+line m4 sketch=s2 a=q4 b=q1
+line n1 sketch=s2 a=r1 b=r2
+line n2 sketch=s2 a=r2 b=r3
+line n3 sketch=s2 a=r3 b=r4
+line n4 sketch=s2 a=r4 b=r1
+fix g1 sketch=s2 p=q1 at=[0 0]
+fix g2 sketch=s2 p=q2 at=[4 0]
+fix g3 sketch=s2 p=q3 at=[4 4]
+fix g4 sketch=s2 p=q4 at=[0 4]
+fix g5 sketch=s2 p=r1 at=[10 0]
+fix g6 sketch=s2 p=r2 at=[12 0]
+fix g7 sketch=s2 p=r3 at=[12 5]
+fix g8 sketch=s2 p=r4 at=[10 5]
+fix g9 sketch=s2 p=q9 at=[16 8]
+extrude post sketch=s2 outer=q9 dir=[0 0 1] length=5
+";
+
+#[test]
+fn an_extrude_on_no_profile_opens_held_and_tab_return_fixes_it() {
+    let d = doc_core::read(BOX_NOPROFILE).expect("an outer on a point is geometry, not syntax: the document reads");
+    let mut vw = Viewer::open_doc(d, "box", (W, H), Preset::Una).expect("ONE solid fault with its data is held, not refused");
+    let post = index_of(&vw, |s| s.id() == Some("post"));
+    let line = doc(&vw).line(post);
+    let faults = vw.view.design.journal.faults.clone();
+    assert_eq!(faults.len(), 1, "{faults:?}");
+    assert_eq!((faults[0].id.as_str(), faults[0].line), ("post", line));
+    let doc_core::Fault::NoProfile { loops } = faults[0].fault.clone() else { panic!("{faults:?}") };
+    assert_eq!(loops.len(), 2, "two closed loops: {loops:?}");
+    let held_volume = volume(&vw);
+    assert!((held_volume - 1000.0).abs() < 1e-4, "the box painted, the post held: {held_volume}");
+    assert!(vw.view.design.journal.faulted(post), "the post row is marked");
+    assert!(vw.view.design.journal.select_line(line), "the post's line is a row");
+
+    // The card: each loop into `outer=`, in the fault's order.
+    let texts = vw.view.design.journal.fixes_for(post).into_iter().map(|f| f.text).collect::<Vec<_>>();
+    let want = loops.iter().map(|l| format!("extrude post sketch=s2 outer={l} dir=[0 0 1] length=5")).collect::<Vec<_>>();
+    assert_eq!(texts, want, "one choice per loop");
+    assert!(vw.view.design.journal.choosing_fix(), "two choices are a card");
+    assert!(key(&mut vw, "Tab"), "Tab walks the card");
+    let picked = vw.view.design.journal.offered().expect("a pick").text;
+    assert_eq!(picked, want[1], "Tab picked the second");
+    let depth = vw.view.design.journal.depth().0;
+
+    // Enter takes the pick: ONE snapshot, no fault, the post built on the picked loop.
+    assert!(key(&mut vw, "Return"), "Enter takes the pick");
+    let j = &vw.view.design.journal;
+    let area = if loops[1].starts_with('m') { 16.0 } else { 10.0 };
+    println!("solidfault loops={} held_volume={held_volume} picked={picked} faults_after={} volume={}", loops.len(), j.faults.len(), volume(&vw));
+    assert!(j.faults.is_empty(), "{:?}", j.faults);
+    assert_eq!(j.depth().0, depth + 1, "ONE snapshot");
+    assert_eq!(j.note.as_deref(), Some(format!("fixed line {line}: {picked}").as_str()));
+    assert!((volume(&vw) - (1000.0 + 5.0 * area)).abs() < 1e-4, "the box and the post: {}", volume(&vw));
+    assert!(j.offered().is_none(), "nothing left to fix");
+}
