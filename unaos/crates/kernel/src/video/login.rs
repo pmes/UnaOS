@@ -4054,7 +4054,7 @@ fn kb_words_key(c: u8) {
     let key = match c {
         b'\n' | b'\r' => "enter",
         b' ' => "space",
-        _ => return,
+        _ => { #[cfg(all(target_arch = "x86_64", feature = "wc"))] { crate::video::lag::consumed(); } return } // LOGINNODRAW (B1113): a withheld key is consumed and draws nothing — its lag timing ends at the route (lag.rs tail), never a 3 s timeout. LINE-NEUTRAL, code first
     };
     let up_ms = crate::arch::ms().saturating_sub(KB_WORDS_AT.load(Ordering::Relaxed));
     let gap = KB_KEY_GAP.load(Ordering::Relaxed);
@@ -4072,7 +4072,7 @@ fn kb_words_key(c: u8) {
                 why, KB_WORDS_DWELL_MS, KB_WORDS_QUIET_MS
             );
         }
-        return;
+        #[cfg(all(target_arch = "x86_64", feature = "wc"))] { crate::video::lag::consumed(); } return; // LOGINNODRAW (B1113): a held-back Enter/Space draws nothing either. LINE-NEUTRAL, code first
     }
     PRESS_ANSWERED.fetch_add(1, Ordering::Relaxed);
     serial_println!(
