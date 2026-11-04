@@ -1449,3 +1449,9 @@ exec-rmbp-f39relayresetfallback cf3a30b52 wave36 cut60
 exec-rmbp-f39prefsunsetbus cf3a30b52 wave36 cut60
 exec-rmbp-f39machinestoreonelay cf3a30b52 wave36 cut60
 exec-rmbp-f39hidwhoorin cf3a30b52 wave36 cut60
+exec-rmbp-vugfacefieldkeysrest 44ace0a30 wave36 cut59
+exec-rmbp-vugintentsetfacepushedge 44ace0a30 wave36 cut59
+exec-rmbp-vugcomscanrelinkenvelope 44ace0a30 wave36 cut59
+exec-rmbp-vugprincipiaunsetchanged 44ace0a30 wave36 cut59
+exec-rmbp-vugfacejournalholdmany 44ace0a30 wave36 cut59
+exec-rmbp-vugfacedeviationprb 44ace0a30 wave36 cut59

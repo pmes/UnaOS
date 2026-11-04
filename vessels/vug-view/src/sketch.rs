@@ -1083,16 +1083,56 @@ pub(crate) fn type_text_at(buf: &mut String, at: &mut usize, ch: Option<char>, b
     true
 }
 
-/// The caret's moves in a free text: Left / Right one char, Home / End to the ends (the named keys and their one-char
-/// Cocoa codes, never typed). Some(whether the caret moved), None for every other key.
-pub(crate) fn caret_key(buf: &str, at: &mut usize, k: &str) -> Option<bool> {
+// VUGFACEFIELDKEYS (LEDGER SR599): ONE key-name table for the free text fields. The Save As field (lib.rs
+// `Viewer::save_as_key`) and the `:` line (deviation.rs `Viewer::line_key`) read [`FieldKey::of`] once per key; a key
+// the table names is never typed (the one-char Cocoa codes are private-use chars, not `is_control`, and an unhandled
+// one used to land in the text as a glyph). photo.rs's PageDown / PageUp page a card: a view key, not a field key.
+
+/// A free text field's named keys: the GTK / browser names and their one-char forms (the Cocoa function-key codes,
+/// the ASCII controls), read in ONE place.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FieldKey {
+    Left,
+    Right,
+    Home,
+    End,
+    Up,
+    Down,
+    Backspace,
+    Delete,
+    Enter,
+    Escape,
+}
+
+impl FieldKey {
+    /// The field key a key name spells; None for a typed character or a key no field reads (`Shift_L`, `Tab`).
+    pub(crate) fn of(k: &str) -> Option<FieldKey> {
+        Some(match k {
+            "Left" | "\u{f702}" => FieldKey::Left,
+            "Right" | "\u{f703}" => FieldKey::Right,
+            "Home" | "\u{f729}" => FieldKey::Home,
+            "End" | "\u{f72b}" => FieldKey::End,
+            "Up" | "\u{f700}" => FieldKey::Up,
+            "Down" | "\u{f701}" => FieldKey::Down,
+            "BackSpace" | "Backspace" | "\u{8}" | "\u{7f}" => FieldKey::Backspace,
+            "Delete" | "\u{f728}" => FieldKey::Delete,
+            "Return" | "KP_Enter" | "\r" | "\n" => FieldKey::Enter,
+            "Escape" | "\u{1b}" => FieldKey::Escape,
+            _ => return None,
+        })
+    }
+}
+
+/// The caret's moves in a free text: Left / Right one char, Home / End to the ends ([`FieldKey::of`] read the name,
+/// never typed). Some(whether the caret moved), None for every other field key.
+pub(crate) fn caret_key(buf: &str, at: &mut usize, k: FieldKey) -> Option<bool> {
     let n = buf.chars().count();
     let was = (*at).min(n);
     *at = match k {
-        "Left" | "\u{f702}" => was.saturating_sub(1),
-        "Right" | "\u{f703}" => (was + 1).min(n),
-        "Home" | "\u{f729}" => 0,
-        "End" | "\u{f72b}" => n,
+        FieldKey::Left => was.saturating_sub(1),
+        FieldKey::Right => (was + 1).min(n),
+        FieldKey::Home => 0,
+        FieldKey::End => n,
         _ => return None,
     };
     Some(*at != was)
