@@ -30,7 +30,8 @@
 //!    VUGFACEDEVIATION, SR525, lifted from tools/scan).
 //!
 //! The start is the caller's (`init`): a world-posed scan starts at the identity, a scan with no starting pose at
-//! [`measure_coarse`]'s principal axes (VUGSCANDEVIATIONCOARSE SR615).
+//! [`measure_coarse`]'s principal axes (VUGSCANDEVIATIONCOARSE SR615), a near-single view refused there at
+//! [`coarse_view`]'s yaw sweep with its translation re-solved (VUGSCANDEVIATIONCOARSEVIEW SR626).
 
 use alloc::collections::BTreeMap;
 use alloc::format;
@@ -601,6 +602,7 @@ pub fn measure_coarse(scan: &ScanMesh, design: &Design, p: &AlignParams, band_mm
     let bvh = Bvh::build(&design.mesh);
     let starts = coarse(scan, design, &bvh, p, tol).unwrap_or_default();
     let rms_mm = starts.iter().map(|s| s.1).fold(f64::INFINITY, f64::min);
+    let (starts, rms_mm) = view_or(scan, design, &bvh, p, tol, starts, rms_mm); // VUGSCANDEVIATIONCOARSEVIEW (SR626): SR615's floor refusing, a near-single view takes the swept starts
     if !(rms_mm <= p.gate(2)) {
         return (Road::CoarseRefused { rms_mm }, Err(DeviationError::NoAlignment { rms_mm, pairs: 0 }));
     }
@@ -630,4 +632,123 @@ pub fn measure_coarse(scan: &ScanMesh, design: &Design, p: &AlignParams, band_mm
         (None, None) => Err(DeviationError::NoAlignment { rms_mm, pairs: 0 }),
     };
     (Road::CoarseFine { rms_mm }, result)
+}
+
+// ---- VUGSCANDEVIATIONCOARSEVIEW (LEDGER SR626): the near-single-view start ----
+// A short tracked scan sees ONE side of the part from frame 0's camera (its world's origin), with the ground it stands
+// on: MEASURED (an analytic model of SR621's 12-frame fixture) the scan is 79% ground, its largest and middle axes are
+// the ground's and sit 70.5° off the design's in yaw, its smallest axis (the ground normal) 3.7° off, and its centroid
+// 56 mm off the design's (a part-only centroid 57 mm: a one-sided view's centroid sits on its seen faces), so none of
+// [`coarse`]'s four signs reaches the fine basin (SR621: 18.7 / 19.1 against gate(2) 9). The view's mean normal is the
+// ground's up (the axis already right), and one fine step cannot cross 70°. So [`coarse_view`] widens the candidate set:
+// the design frame swept about its smallest axis, both signs, in [`COARSE_VIEW_STEPS`] steps onto the scan's frame, each
+// start's translation re-solved by [`COARSE_VIEW_SHIFTS`] point-to-point means of `pair` at gate(0)·[`COARSE_WIDEN`]
+// ([`shift`]: the rotation is left to `align`) before it is scored by [`trimmed`] (the start score, gate(0),
+// [`COARSE_KEEP`]); the best [`COARSE_VIEW_KEEP`] by the keep-[`COARSE_SELECT_KEEP`] score go into `measure_coarse`'s
+// own refine / select loop (the box-symmetric 180° turn ranks first on the start's score and is told apart there, as
+// SR615 measured). It runs only when SR615's floor refuses AND the scan is a view: at least [`COARSE_VIEW_FRONT`] of
+// the sampled vertices face the scan frame's origin ([`front`]; modelled 0.9975 for the 12-frame tracked scan, 0.855 /
+// 0.865 for SR615's carried orbit and its half fragment, which keep SR615's road). Cost: 2·STEPS × (SHIFTS + 2) ×
+// [`COARSE_POINTS`] `Bvh::closest` (≈ 344k) and COARSE_POINTS for the front, then SR615's budget unchanged.
+
+/// The least fraction of the sampled scan vertices whose normal faces the scan frame's origin for the view road.
+pub const COARSE_VIEW_FRONT: f64 = 0.95;
+/// The yaw steps of the sweep about the design's smallest axis (30°: the nearest within 15° of the truth).
+pub const COARSE_VIEW_STEPS: usize = 12;
+/// The point-to-point translation means each swept start takes before it is scored.
+pub const COARSE_VIEW_SHIFTS: usize = 5;
+/// The swept starts handed to `measure_coarse`'s refine / select loop (SR615's four-refine budget).
+pub const COARSE_VIEW_KEEP: usize = 4;
+
+/// The fraction of `sample`'s vertices whose normal faces the scan frame's origin (n·(0 − q) > 0); a vertex with no
+/// normal counts against it. 0.0 on an empty sample.
+fn front(scan: &ScanMesh, sample: &[usize]) -> f64 {
+    if sample.is_empty() {
+        return 0.0;
+    }
+    let facing = sample
+        .iter()
+        .filter(|&&i| {
+            let q = scan.mesh.positions[i];
+            let n = scan.normals.get(i).copied().unwrap_or(Vec3::ZERO);
+            n.dot(q) < 0.0
+        })
+        .count();
+    facing as f64 / sample.len() as f64
+}
+
+/// `pose` with its translation re-solved: [`COARSE_VIEW_SHIFTS`] times, the mean of `c − q` over the sampled vertices
+/// `pair` pairs within `gate`, applied on the left; it stops early when nothing pairs.
+fn shift(scan: &ScanMesh, design: &Design, bvh: &Bvh, normals: &[Vec3], sample: &[usize], pose: Transform, gate: f64, p: &AlignParams, tol: Tol) -> Transform {
+    let mut pose = pose;
+    for _ in 0..COARSE_VIEW_SHIFTS {
+        let (mut sum, mut n) = (Vec3::ZERO, 0u32);
+        for &i in sample {
+            let q = pose.apply_point(scan.mesh.positions[i]);
+            let nq = pose.apply_vector(scan.normals.get(i).copied().unwrap_or(Vec3::ZERO));
+            if let Some((c, _)) = pair(design, bvh, normals, q, nq, gate, p.normal_cos, tol) {
+                sum = sum + (c - q);
+                n += 1;
+            }
+        }
+        if n == 0 {
+            break;
+        }
+        pose = Transform::from_translation(sum * (1.0 / n as f64)).compose(pose);
+    }
+    pose
+}
+
+/// The near-single-view starts (scan → design): None when the scan or design is empty, has zero area, or is not a view
+/// ([`front`] under [`COARSE_VIEW_FRONT`]); else the design frame (x, y, z = x × y from the principal axes) with z of
+/// both signs, x swept about z in [`COARSE_VIEW_STEPS`] steps, onto the scan's frame as [`coarse`] builds it, each
+/// [`shift`]ed at `p.gate(0)`·[`COARSE_WIDEN`]; the best [`COARSE_VIEW_KEEP`] by [`trimmed`] at `p.gate(0)` over
+/// [`COARSE_SELECT_KEEP`] (the first on a tie), each carrying its start score ([`trimmed`] at `p.gate(0)`,
+/// [`COARSE_KEEP`]).
+pub fn coarse_view(scan: &ScanMesh, design: &Design, bvh: &Bvh, p: &AlignParams, tol: Tol) -> Option<Vec<(Transform, f64)>> {
+    let nv = scan.mesh.positions.len();
+    if nv == 0 || design.mesh.triangles.is_empty() {
+        return None;
+    }
+    let sample = coarse_sample(nv);
+    if !(front(scan, &sample) >= COARSE_VIEW_FRONT) {
+        return None;
+    }
+    let (cs, xs, ys) = axes(&scan.mesh)?;
+    let (cd, xd, yd) = axes(&design.mesh)?;
+    let inv = crate::geom::from_axes(xs, ys, xs.cross(ys), cs).invert().ok()?;
+    let zd = xd.cross(yd);
+    let normals = design.mesh.normals_face(tol);
+    let mut scored: Vec<(f64, Transform, f64)> = Vec::with_capacity(2 * COARSE_VIEW_STEPS);
+    for sz in [1.0, -1.0] {
+        let z = zd * sz;
+        for k in 0..COARSE_VIEW_STEPS {
+            let t = 2.0 * core::f64::consts::PI * k as f64 / COARSE_VIEW_STEPS as f64;
+            let (c, s) = (libm::cos(t), libm::sin(t));
+            // Rodrigues: xd turned by t about the unit z.
+            let x = xd * c + z.cross(xd) * s + z * (z.dot(xd) * (1.0 - c));
+            let start = crate::geom::from_axes(x, z.cross(x), z, cd).compose(inv);
+            let start = shift(scan, design, bvh, &normals, &sample, start, p.gate(0) * COARSE_WIDEN, p, tol);
+            let rank = trimmed(scan, design, bvh, &normals, &sample, start, p.gate(0), COARSE_SELECT_KEEP, p, tol);
+            let score = trimmed(scan, design, bvh, &normals, &sample, start, p.gate(0), COARSE_KEEP, p, tol);
+            scored.push((rank, start, score));
+        }
+    }
+    scored.sort_by(|a, b| a.0.total_cmp(&b.0));
+    Some(scored.into_iter().take(COARSE_VIEW_KEEP).map(|(_, t, s)| (t, s)).collect())
+}
+
+/// `measure_coarse`'s starts: SR615's four when their least score is inside `p.gate(2)`; else [`coarse_view`]'s when the
+/// scan is a view (their least start score the road's rms, refused above the same floor); else SR615's unchanged.
+fn view_or(scan: &ScanMesh, design: &Design, bvh: &Bvh, p: &AlignParams, tol: Tol, starts: Vec<(Transform, f64)>, rms_mm: f64) -> (Vec<(Transform, f64)>, f64) {
+    if rms_mm <= p.gate(2) {
+        return (starts, rms_mm);
+    }
+    match coarse_view(scan, design, bvh, p, tol) {
+        Some(view) if !view.is_empty() => {
+            let r = view.iter().map(|s| s.1).fold(f64::INFINITY, f64::min);
+            (view, r)
+        }
+        _ => (starts, rms_mm),
+    }
 }
