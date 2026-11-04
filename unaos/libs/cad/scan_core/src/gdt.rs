@@ -28,7 +28,7 @@
 //!    [`cylindricity_minzone`], the discrete Chebyshev band as its dual LP (`chebyshev_band`, the exchange method).
 //! 4. Position: the fitted axis against the nominal axis as a diameter zone, [`position_mm`]: twice the larger distance
 //!    of the measured axis from the nominal one at the feature's two axial ends. The frame is the design's after the
-//!    best-fit registration; a datum frame is owed (VUG-SCAN-GDT-DATUMS).
+//!    best-fit registration; the datum frame (ISO 5459, VUGSCANGDTDATUMS SR552) is [`frame_of`] / [`position_in`].
 //! 5. `band_mm`: the nominal-relative band (max − min of the signed deviation over the form vertices), printed beside
 //!    the form values and never given a verdict: it carries the face's offset, tilt and radius error (ISO profile).
 
@@ -255,8 +255,6 @@ pub fn position_mm(measured: &Cylinder, nominal: &Cylinder, extent: (f64, f64)) 
 /// Every design face read as tolerances, in face-index order, with the edge margin `margin_mm` (the TSDF's
 /// truncation, `Tsdf::trunc_mm`; see the module doc).
 pub fn gdt(scan: &ScanMesh, design: &Design, dev: &Deviation, margin_mm: f64, tol: Tol) -> Vec<FaceGdt> {
-    let cos = libm::cos(GDT_NORMAL_DEG.to_radians());
-    let pose = dev.aligned.pose;
     (0..design.faces)
         .map(|face| {
             let nominal = nominal(design, face, tol);
@@ -278,36 +276,7 @@ pub fn gdt(scan: &ScanMesh, design: &Design, dev: &Deviation, margin_mm: f64, to
             if nominal == Nominal::Other {
                 return out;
             }
-            // The form vertices: paired with this face, their normal along the nominal's there, outside the edge margin.
-            let edges = boundary(design, face);
-            let (mut pts, mut nrm, mut dev_mm) = (Vec::new(), Vec::new(), Vec::new());
-            for (i, f) in dev.face_of_vertex.iter().enumerate() {
-                if *f != Some(face) {
-                    continue;
-                }
-                let (Some(&p), Some(Some(d))) = (scan.mesh.positions.get(i), dev.per_vertex.get(i)) else { continue };
-                let q = pose.apply_point(p);
-                let n = pose.apply_vector(scan.normals.get(i).copied().unwrap_or(Vec3::ZERO));
-                let along = match nominal {
-                    Nominal::Plane(pl) => pl.normal,
-                    Nominal::Cylinder(c) => radial(&c, q).normalize().unwrap_or(Vec3::ZERO),
-                    Nominal::Other => Vec3::ZERO,
-                };
-                if n.dot(along).abs() < cos * n.mag() || n.mag_sq() == 0.0 {
-                    continue;
-                }
-                let on = match nominal {
-                    Nominal::Plane(pl) => pl.project(q),
-                    Nominal::Cylinder(c) => q - radial(&c, q) + along * c.radius,
-                    Nominal::Other => q,
-                };
-                if edges.iter().any(|&(a, b)| to_segment(on, a, b) < margin_mm) {
-                    continue;
-                }
-                pts.push(q);
-                nrm.push(n);
-                dev_mm.push(*d);
-            }
+            let (pts, nrm, dev_mm) = form(scan, design, dev, face, nominal, margin_mm); // VUGSCANGDTDATUMS (SR552): the loop moved into form(), shared with the datum fits
             out.n = pts.len() as u32;
             if out.n < GDT_MIN_POINTS {
                 return out;
@@ -626,4 +595,176 @@ pub fn cylindricity_minzone(points: &[Vec3], ls: &Cylinder, tol: Tol) -> MinZone
         }
     }
     fallback
+}
+
+// ---- VUGSCANGDTDATUMS (LEDGER SR552): the ISO 5459 datum frame A|B|C, position read in it ----
+
+use crate::geom::{Transform, from_axes};
+
+/// The form vertices of design face `face` against its nominal (the module doc's item 2): their positions and TSDF
+/// normals at the aligned pose and their signed deviations. The one selection `gdt` and [`frame_of`] read.
+fn form(scan: &ScanMesh, design: &Design, dev: &Deviation, face: u32, nominal: Nominal, margin_mm: f64) -> (Vec<Vec3>, Vec<Vec3>, Vec<f64>) {
+    let cos = libm::cos(GDT_NORMAL_DEG.to_radians());
+    let pose = dev.aligned.pose;
+    let edges = boundary(design, face);
+    let (mut pts, mut nrm, mut dev_mm) = (Vec::new(), Vec::new(), Vec::new());
+    for (i, f) in dev.face_of_vertex.iter().enumerate() {
+        if *f != Some(face) {
+            continue;
+        }
+        let (Some(&p), Some(Some(d))) = (scan.mesh.positions.get(i), dev.per_vertex.get(i)) else { continue };
+        let q = pose.apply_point(p);
+        let n = pose.apply_vector(scan.normals.get(i).copied().unwrap_or(Vec3::ZERO));
+        let along = match nominal {
+            Nominal::Plane(pl) => pl.normal,
+            Nominal::Cylinder(c) => radial(&c, q).normalize().unwrap_or(Vec3::ZERO),
+            Nominal::Other => Vec3::ZERO,
+        };
+        if n.dot(along).abs() < cos * n.mag() || n.mag_sq() == 0.0 {
+            continue;
+        }
+        let on = match nominal {
+            Nominal::Plane(pl) => pl.project(q),
+            Nominal::Cylinder(c) => q - radial(&c, q) + along * c.radius,
+            Nominal::Other => q,
+        };
+        if edges.iter().any(|&(a, b)| to_segment(on, a, b) < margin_mm) {
+            continue;
+        }
+        pts.push(q);
+        nrm.push(n);
+        dev_mm.push(*d);
+    }
+    (pts, nrm, dev_mm)
+}
+
+/// The datum labels in precedence order: primary, secondary, tertiary.
+pub const DATUM_LABELS: [char; 3] = ['A', 'B', 'C'];
+/// A secondary or tertiary datum within this of the direction it must cross is degenerate; a cylinder datum within
+/// this of A's normal stands along it (degrees).
+const DATUM_DEG: f64 = 10.0;
+
+/// Why a datum frame was refused, by the datum's label.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DatumError {
+    /// The face index is past the design's faces.
+    NoFace { label: char, face: u32 },
+    /// The face's surface cannot stand at this precedence (Other; A not a plane; a cylinder across A).
+    DatumSurface { label: char, face: u32, surface: &'static str },
+    /// Fewer than [`GDT_MIN_POINTS`] form vertices stood on the face, or its fit was refused; `n` the kept count.
+    DatumFit { label: char, face: u32, n: u32 },
+    /// The datum does not cross the frame the earlier datums left (parallel to them).
+    Degenerate { label: char },
+}
+
+impl DatumError {
+    pub fn label(&self) -> char {
+        match *self {
+            DatumError::NoFace { label, .. } | DatumError::DatumSurface { label, .. } | DatumError::DatumFit { label, .. } | DatumError::Degenerate { label } => label,
+        }
+    }
+}
+
+/// A datum reference frame (ISO 5459) as measured on the scan and as designed: each frame-local -> design
+/// coordinates, z along A's outward normal, x from B (or C), the origin where the datums meet. `residual_mm` is the
+/// largest rms of the three datum fits.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DatumFrame {
+    pub measured: Transform,
+    pub nominal: Transform,
+    pub residual_mm: f64,
+}
+
+/// The frame three datum surfaces fix (see [`DatumFrame`]): A a plane takes z and the origin's height; B a plane
+/// takes x (its normal across z) or a cylinder along A the origin; C completes the origin (a plane: the A∩B∩C point;
+/// a cylinder along A: its axis's coordinate along y) or, after a cylinder B, takes x.
+fn axes(s: [Nominal; 3], faces: [u32; 3]) -> Result<Transform, DatumError> {
+    let surface = |k: usize| DatumError::DatumSurface { label: DATUM_LABELS[k], face: faces[k], surface: s[k].name() };
+    let Nominal::Plane(a) = s[0] else { return Err(surface(0)) };
+    let z = a.normal;
+    let (along, cross) = (libm::cos(DATUM_DEG.to_radians()), libm::sin(DATUM_DEG.to_radians()));
+    // A vector flattened across z, refused within DATUM_DEG of it.
+    let flat = |v: Vec3, k: usize| {
+        let f = v - z * z.dot(v);
+        if f.mag() < cross * v.mag() { Err(DatumError::Degenerate { label: DATUM_LABELS[k] }) } else { f.normalize().map_err(|_| DatumError::Degenerate { label: DATUM_LABELS[k] }) }
+    };
+    // Where a cylinder datum standing along A meets A's plane.
+    let foot = |c: &Cylinder, k: usize| {
+        let cz = z.dot(c.axis);
+        if cz.abs() < along { Err(surface(k)) } else { Ok(c.point + c.axis * ((a.d - z.dot(c.point)) / cz)) }
+    };
+    // The point on three planes (n_i . o = d_i), Cramer by triple products; refused as degenerate at label C.
+    let meet = |p: [(Vec3, f64); 3]| {
+        let det = p[0].0.dot(p[1].0.cross(p[2].0));
+        if det.abs() < cross * cross {
+            return Err(DatumError::Degenerate { label: DATUM_LABELS[2] });
+        }
+        Ok((p[1].0.cross(p[2].0) * p[0].1 + p[2].0.cross(p[0].0) * p[1].1 + p[0].0.cross(p[1].0) * p[2].1) * (1.0 / det))
+    };
+    let (x, origin) = match (s[1], s[2]) {
+        (Nominal::Plane(b), Nominal::Plane(c)) => (flat(b.normal, 1)?, meet([(z, a.d), (b.normal, b.d), (c.normal, c.d)])?),
+        (Nominal::Plane(b), Nominal::Cylinder(c)) => {
+            let x = flat(b.normal, 1)?;
+            let y = z.cross(x);
+            let _ = foot(&c, 2)?;
+            (x, meet([(z, a.d), (b.normal, b.d), (y, y.dot(c.point))])?)
+        }
+        (Nominal::Cylinder(b), Nominal::Plane(c)) => (flat(c.normal, 2)?, foot(&b, 1)?),
+        (Nominal::Cylinder(b), Nominal::Cylinder(c)) => {
+            let o = foot(&b, 1)?;
+            (flat(foot(&c, 2)? - o, 2)?, o)
+        }
+        (Nominal::Other, _) => return Err(surface(1)),
+        (_, Nominal::Other) => return Err(surface(2)),
+    };
+    Ok(from_axes(x, z.cross(x), z, origin))
+}
+
+/// The datum frame A|B|C on design faces `datums` (ISO 5459): the nominal frame from each face's [`nominal`], the
+/// measured frame from `fit_plane` / `fit_cylinder` through each face's [`form`] vertices at the aligned pose (the
+/// fitted normal or axis turned to agree with its nominal's), with the edge margin `margin_mm` as [`gdt`] takes it.
+/// A face past the design, a surface that cannot stand there, or a fit that fails is refused by its label.
+pub fn frame_of(scan: &ScanMesh, design: &Design, dev: &Deviation, datums: [u32; 3], margin_mm: f64, tol: Tol) -> Result<DatumFrame, DatumError> {
+    let (mut nom, mut meas, mut residual_mm) = ([Nominal::Other; 3], [Nominal::Other; 3], 0.0f64);
+    for (k, &face) in datums.iter().enumerate() {
+        let label = DATUM_LABELS[k];
+        if face >= design.faces {
+            return Err(DatumError::NoFace { label, face });
+        }
+        let n = nominal(design, face, tol);
+        if n == Nominal::Other {
+            return Err(DatumError::DatumSurface { label, face, surface: n.name() });
+        }
+        let (pts, nrm, _) = form(scan, design, dev, face, n, margin_mm);
+        let fail = DatumError::DatumFit { label, face, n: pts.len() as u32 };
+        if (pts.len() as u32) < GDT_MIN_POINTS {
+            return Err(fail);
+        }
+        meas[k] = match n {
+            Nominal::Plane(np) => {
+                let f = fit_plane(&pts, FIT_BAND).map_err(|_| fail)?;
+                residual_mm = residual_mm.max(f.rms_mm);
+                let pl = f.shape;
+                Nominal::Plane(if pl.normal.dot(np.normal) < 0.0 { Plane { normal: -pl.normal, d: -pl.d } } else { pl })
+            }
+            Nominal::Cylinder(nc) => {
+                let f = fit_cylinder(&pts, &nrm, FIT_BAND).map_err(|_| fail)?;
+                residual_mm = residual_mm.max(f.rms_mm);
+                let c = f.shape;
+                Nominal::Cylinder(if c.axis.dot(nc.axis) < 0.0 { Cylinder { axis: -c.axis, ..c } } else { c })
+            }
+            Nominal::Other => return Err(DatumError::DatumSurface { label, face, surface: n.name() }),
+        };
+        nom[k] = n;
+    }
+    Ok(DatumFrame { measured: axes(meas, datums)?, nominal: axes(nom, datums)?, residual_mm })
+}
+
+/// [`position_mm`] read in the datum frame: the measured axis expressed in the measured frame against the nominal axis
+/// in the nominal frame, so an error of the global registration (which moves the measured feature and the measured
+/// datums together) does not leak in. `extent` as [`FaceGdt::extent`]. Infinite when a frame does not invert.
+pub fn position_in(frame: &DatumFrame, measured: &Cylinder, nominal: &Cylinder, extent: (f64, f64)) -> f64 {
+    let (Ok(m), Ok(n)) = (frame.measured.invert(), frame.nominal.invert()) else { return f64::INFINITY };
+    let local = |t: Transform, c: &Cylinder| Cylinder { point: t.apply_point(c.point), axis: t.apply_vector(c.axis), ..*c };
+    position_mm(&local(m, measured), &local(n, nominal), extent)
 }

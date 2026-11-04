@@ -11,7 +11,7 @@
 //!      [--meta <x_Depth_metadata.csv>] [--width W --height H] [--csv-raw]
 //!      [--fx F --fy F --ppx F --ppy F] [--units-um N] [--frame N]
 //!      [--turntable DEG --radius MM | --poses <file> | --track] [--voxel MM] [--trunc MM] [--band MM]
-//!      [--against <design.vugdoc>] [--intent [<doc.vug>]] [--gdt <face>=<kind>:<tol>]...
+//!      [--against <design.vugdoc>] [--intent [<doc.vug>]] [--gdt <face>=<kind>:<tol>]... [--datum A=<face> B=<face> C=<face>]
 //! ```
 //!
 //! Inputs (the measured roads from a D435i to this machine; librealsense v2.55.1):
@@ -70,7 +70,7 @@
 //! status colours (inside the band POSITIVE, short toward INFO, proud toward CRITICAL, off the design TEXT_SECONDARY).
 //! The report adds `deviation: aligned rms= max= p95= inside= faces=<seen>/<total> ...` and one
 //! `face: <solid>/<op>.<role>.<a>.<b>:<kind> n= max= rms= mean=` line per design face, by rms, worst first; a refused
-//! registration prints `deviation: refused <Name> {..}` and the run exits 1. Without `--against` nothing changes. `--intent [<doc.vug>]` (VUGINTENTSCANWIRE, LEDGER SR515): [`intent_road`]. `--gdt <face>=<kind>:<tol>` (VUGSCANGDT, LEDGER SR542): [`gdt_road`].
+//! registration prints `deviation: refused <Name> {..}` and the run exits 1. Without `--against` nothing changes. `--intent [<doc.vug>]` (VUGINTENTSCANWIRE, LEDGER SR515): [`intent_road`]. `--gdt <face>=<kind>:<tol>` (VUGSCANGDT, LEDGER SR542): [`gdt_road`]. `--datum A=<face> B=<face> C=<face>` (VUGSCANGDTDATUMS, LEDGER SR552): [`datum_road`].
 
 use std::fmt::Write as _;
 use std::path::Path;
@@ -128,7 +128,7 @@ enum Refusal {
     DesignEmpty,
     Tessellate { solid: String, error: brep_core::Refusal },
     DesignFaceId { solid: String, id: u64 },
-    Deviation(DeviationError), GdtFace { face: String }, GdtKind { face: String, kind: &'static str }, GdtWithoutAgainst, // VUGSCANGDT (SR542): the `--gdt` road's refusals
+    Deviation(DeviationError), GdtFace { face: String }, GdtKind { face: String, kind: &'static str }, GdtWithoutAgainst, GdtDatumFace { label: char, face: String }, GdtDatum { face: String, error: scan_core::gdt::DatumError }, // VUGSCANGDT (SR542): the `--gdt` road's refusals; VUGSCANGDTDATUMS (SR552) the `--datum` ones
 }
 
 fn usage() -> ! {
@@ -136,7 +136,7 @@ fn usage() -> ! {
     eprintln!("            [--meta <x_Depth_metadata.csv>] [--width W --height H] [--csv-raw]");
     eprintln!("            [--fx F --fy F --ppx F --ppy F] [--units-um N] [--frame N]");
     eprintln!("            [--turntable DEG --radius MM | --poses <file> | --track] [--voxel MM] [--trunc MM] [--band MM]");
-    eprintln!("            [--against <design.vugdoc>] [--intent [<doc.vug>]] [--gdt <face>=<kind>:<tol>]...");
+    eprintln!("            [--against <design.vugdoc>] [--intent [<doc.vug>]] [--gdt <face>=<kind>:<tol>]... [--datum A=<face> B=<face> C=<face>]");
     std::process::exit(2)
 }
 
@@ -159,7 +159,7 @@ struct Args {
     voxel: f64,
     trunc: Option<f64>,
     band: f64,
-    against: Option<String>, intent: Option<Option<String>>, gdt: Vec<(String, scan_core::Kind, f64)>, // VUGSCANDEVIATION (SR510); VUGSCANGDT (SR542) gdt
+    against: Option<String>, intent: Option<Option<String>>, gdt: Vec<(String, scan_core::Kind, f64)>, datum: Option<[String; 3]>, // VUGSCANDEVIATION (SR510); VUGSCANGDT (SR542) gdt; VUGSCANGDTDATUMS (SR552) datum
 }
 
 fn num<T: std::str::FromStr>(it: &mut impl Iterator<Item = String>) -> T {
@@ -190,7 +190,7 @@ fn parse_args() -> Args {
             "--voxel" => a.voxel = num(&mut it),
             "--trunc" => a.trunc = Some(num(&mut it)),
             "--band" => a.band = num(&mut it),
-            "--against" => a.against = Some(it.next().unwrap_or_else(|| usage())), "--intent" => a.intent = Some(intent_doc(&mut it)), "--gdt" => a.gdt.push(gdt_spec(&mut it)),
+            "--against" => a.against = Some(it.next().unwrap_or_else(|| usage())), "--intent" => a.intent = Some(intent_doc(&mut it)), "--gdt" => a.gdt.push(gdt_spec(&mut it)), "--datum" => a.datum = Some(datum_spec(&mut it)),
             _ if s.starts_with('-') => usage(),
             _ if a.input.is_none() => a.input = Some(s),
             _ => usage(),
@@ -906,9 +906,9 @@ fn gdt_spec(it: &mut impl Iterator<Item = String>) -> (String, scan_core::Kind, 
 /// Without `--against`, nothing.
 fn gdt_road(a: &Args, sm: &ScanMesh, dev: Option<&(Deviation, Vec<String>, scan_core::Design)>, margin: f64) -> Result<String, Refusal> {
     let Some((d, names, design)) = dev else {
-        return if a.gdt.is_empty() { Ok(String::new()) } else { Err(Refusal::GdtWithoutAgainst) };
+        return if a.gdt.is_empty() && a.datum.is_none() { Ok(String::new()) } else { Err(Refusal::GdtWithoutAgainst) }; // VUGSCANGDTDATUMS (SR552): `--datum` needs `--against` too
     };
-    let g = scan_core::gdt(sm, design, d, margin, Tol::DEFAULT);
+    let mut g = scan_core::gdt(sm, design, d, margin, Tol::DEFAULT); let frame = datum_road(a, sm, design, d, names, margin, &mut g)?; // VUGSCANGDTDATUMS (SR552): position read in the datum frame
     let mut calls: Vec<(usize, scan_core::Kind, f64)> = Vec::with_capacity(a.gdt.len());
     for (face, kind, tol) in &a.gdt {
         let Some(i) = names.iter().position(|n| n == face) else { return Err(Refusal::GdtFace { face: face.clone() }) };
@@ -919,7 +919,7 @@ fn gdt_road(a: &Args, sm: &ScanMesh, dev: Option<&(Deviation, Vec<String>, scan_
     }
     let mm = |v: Option<f64>| v.map_or_else(|| "none".to_string(), |x| format!("{x:.3}"));
     let (mut pass, mut fail) = (0usize, 0usize);
-    let mut r = String::new();
+    let mut r = frame; // VUGSCANGDTDATUMS (SR552): the frame line first
     for f in &g {
         let name = names.get(f.face as usize).map(String::as_str).unwrap_or("?");
         let _ = write!(r, "gdt: {name} surface={} n={}/{}", f.nominal.name(), f.n, f.matched);
@@ -959,4 +959,45 @@ fn gdt_road(a: &Args, sm: &ScanMesh, dev: Option<&(Deviation, Vec<String>, scan_
     }
     let _ = writeln!(r, "gdt: callouts={} pass={pass} fail={fail}", calls.len());
     Ok(r)
+}
+
+// ---- VUGSCANGDTDATUMS (LEDGER SR552): --datum, the ISO 5459 datum frame position is read in ----
+
+/// `--datum A=<face> B=<face> C=<face>`: exactly the three following arguments, labelled A, B, C in that order, each
+/// face as its `face:` line names it (split at the FIRST `=`); anything else is usage.
+fn datum_spec(it: &mut impl Iterator<Item = String>) -> [String; 3] {
+    let mut out: [String; 3] = Default::default();
+    for (k, label) in ["A=", "B=", "C="].iter().enumerate() {
+        let s = it.next().unwrap_or_else(|| usage());
+        let Some(face) = s.strip_prefix(*label) else { usage() };
+        if face.is_empty() {
+            usage()
+        }
+        out[k] = face.to_string();
+    }
+    out
+}
+
+/// With `--datum`: the datum faces by name (an unknown one refused as `GdtDatumFace` by label and name), the frame
+/// scan_core `gdt::frame_of` builds (measured from the scan's datum faces at the aligned pose, nominal from the design;
+/// a refusal as `GdtDatum` with the datum's name), every cylinder face's position replaced by `gdt::position_in`, so
+/// `position=` and its verdict read in the frame; returns the `gdt: frame A= B= C= residual=` line. Without, nothing.
+fn datum_road(a: &Args, sm: &ScanMesh, design: &scan_core::Design, d: &Deviation, names: &[String], margin: f64, g: &mut [scan_core::FaceGdt]) -> Result<String, Refusal> {
+    let Some(datum) = &a.datum else { return Ok(String::new()) };
+    let mut faces = [0u32; 3];
+    for (k, face) in datum.iter().enumerate() {
+        let label = scan_core::gdt::DATUM_LABELS[k];
+        let Some(i) = names.iter().position(|n| n == face) else { return Err(Refusal::GdtDatumFace { label, face: face.clone() }) };
+        faces[k] = i as u32;
+    }
+    let fr = scan_core::gdt::frame_of(sm, design, d, faces, margin, Tol::DEFAULT).map_err(|error| {
+        let k = scan_core::gdt::DATUM_LABELS.iter().position(|&l| l == error.label()).unwrap_or(0);
+        Refusal::GdtDatum { face: datum[k].clone(), error }
+    })?;
+    for f in g.iter_mut() {
+        if let (scan_core::Nominal::Cylinder(nc), Some(axis)) = (f.nominal, f.axis) {
+            f.position_mm = Some(scan_core::gdt::position_in(&fr, &axis, &nc, f.extent));
+        }
+    }
+    Ok(format!("gdt: frame A={} B={} C={} residual={:.3}\n", datum[0], datum[1], datum[2], fr.residual_mm))
 }
