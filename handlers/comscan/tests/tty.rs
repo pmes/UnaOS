@@ -1158,3 +1158,93 @@ fn a_differing_envelope_is_said_once_at_the_start() {
     let (lines, _m) = fake.join().unwrap();
     assert_eq!(lines, want, "the `$$` is no program line");
 }
+
+// --- VUGCOMSCANENVELOPEBOUND (SR602): the jog's bound is the tighter of the declared travel and the controller's read one ---
+
+#[test]
+fn a_jog_is_bounded_by_the_tighter_of_the_declared_and_the_read_travel() {
+    let who = || Origin::LocalUser("una".to_string());
+    let x300 = PumpEvent::PumpJog { principal: who(), dx: 300.0, dy: 0.0, dz: 0.0, feed: 300.0 };
+    let home = PumpEvent::PumpHome { principal: who() };
+
+    // Hello off: nothing is read, so the declared X travel (350) bounds and a 300 mm jog goes out.
+    let (m, path, _s) = pty();
+    let fake = fake_grbl_alarm(m, usize::MAX);
+    let (mut desk, mut open) = started_desk(&path);
+    let t0 = Instant::now();
+    let mut words = Vec::new();
+    assert_eq!(drive_until(&mut desk, &mut *open, t0, &mut words, |e| e == "done"), "done");
+    assert_eq!(said_in(&desk.apply(&x300, &mut *open)), "jog sent: $J=G91 X300 Y0 Z0 F300");
+    assert_eq!(drive_until(&mut desk, &mut *open, t0, &mut words, |e| e.starts_with("jog")), "jog ok", "{words:?}");
+    assert_eq!(said_in(&desk.apply(&home, &mut *open)), "home sent: $H");
+    assert_eq!(drive_until(&mut desk, &mut *open, t0, &mut words, |e| e.starts_with("home")), "home ok", "{words:?}");
+    drop(desk);
+    drop(open);
+    let (lines, _rt, _m) = fake.join().unwrap();
+    assert_eq!(lines[lines.len() - 2..].to_vec(), vec!["$J=G91 X300 Y0 Z0 F300".to_string(), "$H".to_string()], "{lines:?}");
+
+    // Hello on, on a port the redial reopens by name: the fake's `$130=200` is kept as the X bound.
+    let root = fresh("comscan-envelope-bound");
+    let port = root.join("ttyACM0");
+    let (m1, slave1, s1) = pty();
+    std::os::unix::fs::symlink(&slave1, &port).unwrap();
+    let p = program();
+    let mut desk = PumpDesk::new(machine());
+    desk.hello_within(comscan::tty::READY_WAIT);
+    let pass = Verdict::Pass { digest: p.digest(), machine: machine().digest() };
+    let digest = desk.arm(&pass, &p, GRBL).expect("armed by a pass");
+    let mut open = opener(Baud::B115200, Flow::None);
+    let fake1 = fake_grbl(m1, true, 2);
+    let start = PumpEvent::PumpStart {
+        principal: who(),
+        program: digest_hex(digest),
+        dialect: "grbl".to_string(),
+        port: port.to_str().unwrap().to_string(),
+    };
+    let out = desk.apply(&start, &mut *open);
+    let said: Vec<String> =
+        out.iter().filter_map(|s| match s { PumpEvent::Squawk { event: Some(e), .. } => Some(e.clone()), _ => None }).collect();
+    assert_eq!(said, vec!["started".to_string(), format!("hello {}", hello_of(VER_A)), "envelope differs axis=X declared=350 controller=200".to_string()], "{out:?}");
+
+    // Two lines reach the first fake, then the board goes; the second comes back on the same name.
+    let t0 = Instant::now();
+    while !fake1.is_finished() && t0.elapsed() < Duration::from_secs(5) {
+        desk.tick(t0.elapsed().as_micros() as u64);
+        thread::sleep(Duration::from_millis(2));
+    }
+    for _ in 0..20 {
+        desk.tick(t0.elapsed().as_micros() as u64);
+        thread::sleep(Duration::from_millis(2));
+    }
+    let (_lines, m1) = fake1.join().unwrap();
+    let (m2, slave2, _s2) = pty();
+    std::fs::remove_file(&port).unwrap();
+    std::os::unix::fs::symlink(&slave2, &port).unwrap();
+    let fake2 = fake_grbl_alarm(m2, usize::MAX);
+    drop(m1);
+    drop(s1);
+
+    let mut words = Vec::new();
+    let lost = drive_until(&mut desk, &mut *open, t0, &mut words, |e| e.starts_with("link lost"));
+    assert!(lost.starts_with("link lost at line "), "{lost}");
+    // Lost, the read is still kept: past the controller's 200 is refused by name; inside both bounds meets the down link.
+    assert_eq!(
+        refused_in(&desk.apply(&x300, &mut *open)),
+        "jog: X300 is past the controller X travel 200 (the position is not polled outside a job: the jog's delta is bounded)"
+    );
+    let x150 = PumpEvent::PumpJog { principal: who(), dx: 150.0, dy: 0.0, dz: 0.0, feed: 300.0 };
+    assert_eq!(refused_in(&desk.apply(&x150, &mut *open)), "jog: the link is down (reconnect attempt 1)");
+    let relinked =
+        drive_until(&mut desk, &mut *open, t0, &mut words, |e| e.starts_with("relinked") || e.contains("failed") || e.contains("refused"));
+    assert!(relinked.starts_with("relinked on attempt 1;"), "{words:?}");
+
+    // Relinked: the reopened board was not asked its travel, so the declared bound stands until the next start.
+    assert_eq!(said_in(&desk.apply(&x300, &mut *open)), "jog sent: $J=G91 X300 Y0 Z0 F300");
+    assert_eq!(drive_until(&mut desk, &mut *open, t0, &mut words, |e| e.starts_with("jog")), "jog ok", "{words:?}");
+    assert_eq!(said_in(&desk.apply(&home, &mut *open)), "home sent: $H");
+    assert_eq!(drive_until(&mut desk, &mut *open, t0, &mut words, |e| e.starts_with("home")), "home ok", "{words:?}");
+    drop(desk);
+    drop(open);
+    let (lines, _rt, _m) = fake2.join().unwrap();
+    assert_eq!(lines, vec!["$J=G91 X300 Y0 Z0 F300".to_string(), "$H".to_string()], "no `$$` on the relink, the jog and the home only");
+}

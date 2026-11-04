@@ -235,6 +235,9 @@ pub struct PumpDesk {
     /// VUGCOMSCANALARMIDLE (SR591): the controller's travel is read at a first open (`envelope_read`); VUGCOMSCANENVELOPEREADON
     /// (SR597): on by default, riding the hello (read only where the hello is on).
     envelope: bool,
+    /// VUGCOMSCANENVELOPEBOUND (SR602): the controller's travel the first open read, kept for the jog's [`bound`]; `None`:
+    /// the hello or the read is off, the controller did not answer, or a relink since (a reopen never reads it).
+    read: Option<Envelope>,
 }
 
 fn refused(why: impl Into<String>) -> Vec<PumpEvent> {
@@ -244,7 +247,7 @@ fn refused(why: impl Into<String>) -> Vec<PumpEvent> {
 impl PumpDesk {
     /// A desk for `machine`: every pass it arms must name this machine's identity (VUG-HELM-BIND-MACHINE).
     pub fn new(machine: Machine) -> PumpDesk {
-        PumpDesk { machine, armed: Vec::new(), running: None, identify: None, hello: None, envelope: true }
+        PumpDesk { machine, armed: Vec::new(), running: None, identify: None, hello: None, envelope: true, read: None }
     }
 
     /// The machine this desk drives.
@@ -602,6 +605,7 @@ impl PumpDesk {
             Ok((link, _, _, _)) => {
                 r.link = Some(link);
                 r.redial = None;
+                self.read = None; // VUGCOMSCANENVELOPEBOUND (SR602): the reopened board was not asked its travel: the declared bound until the next start
                 format!("relinked on attempt {}; re-arm to resume from line {at_line}", d.attempt())
             }
             Err(why) => {
@@ -817,6 +821,7 @@ impl PumpDesk {
         if let Some(h) = before.or(said) {
             out.push(self.squawk(Some(format!("hello {h}")))); // printed once, at the first open (VUGCOMSCANJOG SR573: as the controller first said it)
         }
+        self.read = env; // VUGCOMSCANENVELOPEBOUND (SR602): kept for the jog's bound (a hello-off start keeps None)
         for w in self.envelope_words(env) {
             out.push(self.squawk(Some(w))); // VUGCOMSCANALARMIDLE (SR591): a travel that differs from the declared machine, said once
         }
@@ -1156,7 +1161,7 @@ impl PumpDesk {
                 if *dx == 0.0 && *dy == 0.0 && *dz == 0.0 {
                     return refused("jog: no axis moves");
                 }
-                if let Some(why) = jog_past_travel(&self.machine, [*dx, *dy, *dz]) { return refused(why); } // VUGCOMSCANALARMRESET (SR585): VUG-COMSCAN-JOG-ENVELOPE
+                if let Some(why) = jog_past_travel(&self.machine, self.read, [*dx, *dy, *dz]) { return refused(why); } // VUGCOMSCANALARMRESET (SR585): VUG-COMSCAN-JOG-ENVELOPE; VUGCOMSCANENVELOPEBOUND (SR602): + the kept read
                 ("jog", pump_core::pump::jog_lines(d, [*dx, *dy, *dz], *feed))
             }
             _ => return Vec::new(),
@@ -1319,19 +1324,20 @@ impl PumpDesk {
 /// VUG-COMSCAN-JOG-ENVELOPE: a jog's delta against the declared machine's axes (`Machine::axes`, the SR498 machine
 /// behind the desk): an axis that moves and is not declared, or a delta past its travel (`max - min`), refused by name
 /// before the wire. The position is not polled outside a job (the pump queries `?` only while live), so the DELTA is
-/// bounded, not the jog's end (owed VUG-COMSCAN-JOG-POSITION).
-fn jog_past_travel(m: &Machine, delta: [f64; 3]) -> Option<String> {
+/// bounded, not the jog's end (owed VUG-COMSCAN-JOG-POSITION). VUGCOMSCANENVELOPEBOUND (SR602): the bound is [`bound`],
+/// the tighter of the declared travel and the controller's `read`, and the refusal names which (`declared` / `controller`).
+fn jog_past_travel(m: &Machine, read: Option<Envelope>, delta: [f64; 3]) -> Option<String> {
     use make_core::AxisId;
-    for (id, c, v) in [(AxisId::X, 'X', delta[0]), (AxisId::Y, 'Y', delta[1]), (AxisId::Z, 'Z', delta[2])] {
+    for (i, (id, c, v)) in [(AxisId::X, 'X', delta[0]), (AxisId::Y, 'Y', delta[1]), (AxisId::Z, 'Z', delta[2])].into_iter().enumerate() {
         if v == 0.0 {
             continue;
         }
-        let Some(travel) = axis_travel(m, id) else { // VUGCOMSCANALARMIDLE (SR591): the one travel
+        let Some((travel, which)) = bound(m, read, id, i) else { // VUGCOMSCANALARMIDLE (SR591): the one travel; VUGCOMSCANENVELOPEBOUND (SR602): through bound
             return Some(format!("jog: {c}{v} on an axis the declared machine does not have"));
         };
         if v.abs() > travel {
             return Some(format!(
-                "jog: {c}{v} is past the declared {c} travel {travel} (the position is not polled outside a job: the jog's delta is bounded)"
+                "jog: {c}{v} is past the {which} {c} travel {travel} (the position is not polled outside a job: the jog's delta is bounded)"
             ));
         }
     }
@@ -1389,7 +1395,7 @@ pub fn with_envelope(res: Result<Opened, String>, read: Option<(Dialect, Duratio
 impl PumpDesk {
     /// Turn the travel read on (or off): every later PumpStart asks the controller its travel after the hello and says a
     /// travel that differs from the declared machine's once (`envelope differs axis=<a> declared=<d> controller=<c>`); the
-    /// declared machine stays the jog's bound. VUGCOMSCANENVELOPEREADON (SR597): on by default wherever the hello is on (the
+    /// tighter of the declared and the read travel is the jog's bound ([`bound`], VUGCOMSCANENVELOPEBOUND SR602). VUGCOMSCANENVELOPEREADON (SR597): on by default wherever the hello is on (the
     /// bus, [`compose`]); `envelope_read(false)` is the off switch.
     pub fn envelope_read(&mut self, on: bool) {
         self.envelope = on;
@@ -1437,6 +1443,17 @@ fn send_unlock(r: &mut Running) -> Option<String> {
 /// The declared machine's travel on axis `id` (`max - min`, the SR498 machine behind the desk); `None`: not declared.
 fn axis_travel(m: &Machine, id: make_core::AxisId) -> Option<f64> {
     m.axes.iter().find(|a| a.id == id).map(|a| a.max - a.min)
+}
+
+/// VUGCOMSCANENVELOPEBOUND (SR602): the jog's bound on axis `id` (slot `i` of the controller's `read`): `None` when the
+/// declared machine does not have the axis; the controller's travel (`"controller"`) when it was read, is finite, above
+/// zero and strictly tighter than the declared one; else the declared travel (`"declared"`, a tie included).
+fn bound(m: &Machine, read: Option<Envelope>, id: make_core::AxisId, i: usize) -> Option<(f64, &'static str)> {
+    let declared = axis_travel(m, id)?;
+    match read.and_then(|r| r[i]) {
+        Some(c) if c.is_finite() && c > 0.0 && c < declared => Some((c, "controller")),
+        _ => Some((declared, "declared")),
+    }
 }
 
 #[cfg(test)]
