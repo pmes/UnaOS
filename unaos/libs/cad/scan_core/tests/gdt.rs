@@ -388,13 +388,20 @@ struct Census {
     edge: u32,
     shadow: u32,
     graze: (f64, f64),
+    /// VUGSCANTSDFEDGELATERAL (SR574) M1: (s < 0, all, zero gradient) over the cameras at which the vertex sits on an
+    /// edge pixel holding a depth more than a truncation behind it (the known scene: the misassigned floor), and the
+    /// same for the free-space control one truncation out along the nominal normal.
+    mis: (u32, u32, u32),
+    free: (u32, u32, u32),
 }
 
 fn census(p: Vec3, n: Vec3, frames: &[(Transform, Frame)], trunc: f64) -> Census {
     let (intr, scale) = (fixture::bench_intrinsics(), DepthScale::D400_DEFAULT);
-    let mut c = Census { saw: 0, edge: 0, shadow: 0, graze: (f64::INFINITY, f64::NEG_INFINITY) };
+    let mut c = Census { saw: 0, edge: 0, shadow: 0, graze: (f64::INFINITY, f64::NEG_INFINITY), mis: (0, 0, 0), free: (0, 0, 0) };
     for (cam, f) in frames {
         let Ok(inv) = cam.invert() else { continue };
+        lateral_tally(&mut c.mis, &inv, f, p, trunc); // VUGSCANTSDFEDGELATERAL (SR574) M1
+        lateral_tally(&mut c.free, &inv, f, p + n * trunc, trunc);
         let q = inv.apply_point(p);
         if q.z <= 0.0 {
             continue;
@@ -420,6 +427,44 @@ fn census(p: Vec3, n: Vec3, frames: &[(Transform, Frame)], trunc: f64) -> Census
         }
     }
     c
+}
+
+/// VUGSCANTSDFEDGELATERAL (SR574) M1: one camera's lateral sample of point `p` into `t` = (s < 0, all, zero
+/// gradient): counted only when `p`'s floor pixel is a depth edge at the truncation and its depth lies more than a
+/// truncation behind `p` (a near point on a far pixel). `s` is `p`'s sub-pixel offset from that pixel's centre along
+/// the 3x3's Sobel depth gradient (near -> far); s < 0 is the near neighbour's side.
+fn lateral_tally(t: &mut (u32, u32, u32), inv: &Transform, f: &Frame, p: Vec3, trunc: f64) {
+    let (intr, scale) = (fixture::bench_intrinsics(), DepthScale::D400_DEFAULT);
+    let q = inv.apply_point(p);
+    if q.z <= 0.0 {
+        return;
+    }
+    let Some(uv) = intr.project([(q.x / 1000.0) as f32, (q.y / 1000.0) as f32, (q.z / 1000.0) as f32]) else { return };
+    if !(uv[0] >= 0.0 && uv[1] >= 0.0) {
+        return;
+    }
+    let (px, py) = (uv[0] as u32, uv[1] as u32);
+    let at = |x: i64, y: i64| -> Option<f64> {
+        if x < 0 || y < 0 {
+            return None;
+        }
+        f.u16_at(x as u32, y as u32).and_then(|raw| scale.metres(raw)).map(|m| m as f64 * 1000.0)
+    };
+    let Some(m) = at(px as i64, py as i64) else { return };
+    if m - q.z <= trunc || !tsdf::depth_edge(f, scale, px, py, trunc) {
+        return;
+    }
+    // Sobel; a hole or an off-frame neighbour reads the centre's depth (neutral, as the 3x3 span treats it).
+    let d = |dx: i64, dy: i64| at(px as i64 + dx, py as i64 + dy).unwrap_or(m);
+    let gx = (d(1, -1) + 2.0 * d(1, 0) + d(1, 1)) - (d(-1, -1) + 2.0 * d(-1, 0) + d(-1, 1));
+    let gy = (d(-1, 1) + 2.0 * d(0, 1) + d(1, 1)) - (d(-1, -1) + 2.0 * d(0, -1) + d(1, -1));
+    t.1 += 1;
+    if gx == 0.0 && gy == 0.0 {
+        t.2 += 1;
+        return;
+    }
+    let s = (uv[0] as f64 - px as f64 - 0.5) * gx + (uv[1] as f64 - py as f64 - 0.5) * gy;
+    t.0 += (s < 0.0) as u32;
 }
 
 /// The known scene's oracle for a vertex of the top or the post: (the nominal normal there, the distance to the face's
@@ -453,6 +498,7 @@ fn probe_table(label: &str, f: &FaceGdt, s: &ScanMesh, dev: &Deviation, frames: 
     let mut printed = 0;
     for (set, form_only) in [("all", false), ("form", true)] {
         let (mut n, mut edge, mut shadow, mut graze) = (0, 0, 0, 0);
+        let (mut lat_mis, mut lat_free) = ((0u32, 0u32, 0u32), (0u32, 0u32, 0u32)); // VUGSCANTSDFEDGELATERAL (SR574) M1
         for &(i, d) in &rows {
             if n == 20 {
                 break;
@@ -470,13 +516,20 @@ fn probe_table(label: &str, f: &FaceGdt, s: &ScanMesh, dev: &Deviation, frames: 
             edge += (c.edge > 0) as u32;
             shadow += (c.shadow > 0) as u32;
             graze += (c.graze.1 > 75.0) as u32;
+            for (acc, t) in [(&mut lat_mis, c.mis), (&mut lat_free, c.free)] {
+                (acc.0, acc.1, acc.2) = (acc.0 + t.0, acc.1 + t.1, acc.2 + t.2); // VUGSCANTSDFEDGELATERAL (SR574) M1
+            }
             let g = ((p.x / 4.0).floor() as i64, (p.y / 4.0).floor() as i64, (p.z / 4.0).floor() as i64);
             println!(
-                "tsdf-probe: {label} {set} {n:2} voxel=({},{},{}) at=({:.1},{:.1},{:.1}) dev={d:+.3} off_median={:+.3} boundary={bdist:.1} normal={nang:.1}deg saw={}/12 edge={} shadow={} graze={:.1}-{:.1}deg",
-                g.0, g.1, g.2, p.x, p.y, p.z, d - med, c.saw, c.edge, c.shadow, c.graze.0, c.graze.1
+                "tsdf-probe: {label} {set} {n:2} voxel=({},{},{}) at=({:.1},{:.1},{:.1}) dev={d:+.3} off_median={:+.3} boundary={bdist:.1} normal={nang:.1}deg saw={}/12 edge={} shadow={} graze={:.1}-{:.1}deg lat_mis={}/{} lat_free={}/{}",
+                g.0, g.1, g.2, p.x, p.y, p.z, d - med, c.saw, c.edge, c.shadow, c.graze.0, c.graze.1, c.mis.0, c.mis.1, c.free.0, c.free.1
             );
         }
         println!("tsdf-probe: {label} {set} worst{n} edge>0={edge} shadow>0={shadow} graze>75={graze} median={med:+.3}");
+        println!(
+            "tsdf-probe: {label} {set} lateral mis_near={}/{} free_near={}/{} zero_grad mis={} free={}",
+            lat_mis.0, lat_mis.1, lat_free.0, lat_free.1, lat_mis.2, lat_free.2
+        );
         printed += n;
     }
     printed
@@ -669,3 +722,26 @@ fn a_profile_uz_callout_passes_a_proud_face_at_its_offset() {
         assert_eq!(c.verdict(&t), t.verdict(k, tol));
     }
 }
+
+// ---- VUGSCANTSDFEDGELATERAL (LEDGER SR574), VUG-SCAN-TSDF-EDGE-CARRY: the guard knobs survive a re-integration ----
+
+#[test]
+fn knobs_carry_through_reintegrate() {
+    use scan_core::tsdf::Knobs;
+    let (scene, intr, scale) = (Scene::bench(), fixture::bench_intrinsics(), DepthScale::D400_DEFAULT);
+    let frames: Vec<Frame> = (0..2u32).map(|k| fixture::render_depth(&scene, &intr, scale, &pose(k), &Noise::NONE, k as u64)).collect();
+    let mut t = Tsdf::new(4.0, 12.0, Tol::DEFAULT).expect("volume");
+    assert_eq!(t.knobs(), Knobs::OFF, "the default is both guards off");
+    let k = Knobs { edge_mm: 30.0, edge_far_mm: 12.0 };
+    t = t.with_knobs(k);
+    assert_eq!((t.edge_mm(), t.edge_far_mm()), (30.0, 12.0), "the knobs read back through the SR555 / SR562 getters");
+    let poses: Vec<(u32, Transform)> = (0..2u32).map(|i| (i, pose(i))).collect();
+    for &(i, p) in &poses {
+        t.integrate(&frames[i as usize], scale, &intr, &p).expect("frame integrates");
+    }
+    let shot = |i: u32| frames.get(i as usize).map(|frame| scan_core::Shot { frame, scale, intr: &intr });
+    let t2 = scan_core::reintegrate(&t, &poses, shot).expect("reintegrate");
+    assert_eq!(t2.knobs(), k, "reintegrate carries the guard knobs, not Tsdf::new's defaults");
+    assert_eq!((t2.frames(), t2.blocks()), (t.frames(), t.blocks()), "the same frames at the same poses fill the same blocks");
+}
+
