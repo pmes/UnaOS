@@ -1011,7 +1011,7 @@ impl Viewer {
             }
             return Some(typed);
         }
-        let free = (self.view.deviation.is_some() || self.view.sheet.is_some()) && self.view.design.face.is_none() && !crate::journal::busy(&self.view.design) && self.view.fillet.is_none() || crate::photo::line_free(&self.view); // VUGFACESAVEASCARET (SR593): a sheet with no map opens the line too; VUGFACEPHOTOPREFLINE (SR595): `:` opens over a photo too (its sketch face is open)
+        let free = (self.view.deviation.is_some() || self.view.sheet.is_some()) && self.view.design.face.is_none() && !crate::journal::busy(&self.view.design) && self.view.fillet.is_none() || crate::photo::line_free(&self.view); // VUGFACESAVEASCARET (SR593): a sheet with no map opens the line too // VUGFACEPHOTOPREFLINE (SR595): `:` opens over a photo too (its sketch face is open)
         if k == ":" && free {
             let e = &mut self.view.entry;
             e.open = true;
