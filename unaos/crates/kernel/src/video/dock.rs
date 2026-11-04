@@ -3024,7 +3024,7 @@ fn menu_geo(l: &Layout, rows: &[wm::DockEntry], dims: Option<(usize, usize)>) ->
         let (bx0, by0, bw, bh) = super::crystal::sheet::body((mx, my, mw, mh)); // MENUS2: the hover lives in the body, never on the band
         if cx >= bx0 && cx < bx0 + bw && cy >= by0 && cy < by0 + bh { hover = (cy - my) / TILE_H(); }
     }
-    Some(MenuGeo { mx, my, mw, mh, band, hover, keep: is_kept(owner), rows: nrows, owner })
+    let hover = if dims.is_some() { walk_lit(hover, nrows) } else { hover }; Some(MenuGeo { mx, my, mw, mh, band, hover, keep: is_kept(owner), rows: nrows, owner }) // F39MENUKEYSONE (B1123): the walk's sel is the lit row (LINE-NEUTRAL)
 }
 
 /// Menu band row `j` (0 = top of the band) as logical colours into `out[0..l.w]`: the desktop where the
@@ -3083,7 +3083,7 @@ pub fn sheet_probe() -> bool {
     paint(bh + 1, &mut out);
     let luma = |c: u32| (((c >> 16) & 255) * 77 + ((c >> 8) & 255) * 150 + (c & 255) * 29) >> 8;
     let shadow = luma(out[bw / 2]) < luma(theme::DESKTOP_BG);
-    corner && pill && shadow && white == 0
+    super::crystal::walk::probe() & (corner && pill && shadow && white == 0) // F39MENUKEYSONE (B1123): the menu key walker's KAT rides this leg (`[menu] walk`, printed every run)
 }
 
 /// The open menu's box (x, y, w, h), or `None` when closed. Same geometry the painter draws from.
@@ -3096,7 +3096,7 @@ pub fn menu_rect() -> Option<(usize, usize, usize, usize)> {
 pub fn menu_open() -> bool { MENU_OPEN.load(Ordering::Acquire) }
 pub fn menu_close() { MENU_OPEN.store(false, Ordering::Release); }
 
-fn menu_open_at(t: usize, owner: u64) { crate::video::lag::menu_opened(); // GLASSLAG M1 (B370)
+fn menu_open_at(t: usize, owner: u64) { crate::video::lag::menu_opened(); WALK.reset(); // GLASSLAG M1 (B370) · F39MENUKEYSONE (B1123): the walk starts at page 0, nothing lit (LINE-NEUTRAL)
     MENU_OWNER.store(owner, Ordering::Relaxed); MENU_TILE.store(t as u64, Ordering::Relaxed);
     MENU_OPEN.store(true, Ordering::Release);
     serial_println!("[dock] menu open tile={} owner={:#x} keep={}", t, owner, is_kept(owner));
@@ -5343,6 +5343,51 @@ fn dp_new_launch(i: usize, path: &str, on: &str) -> Result<(u64, u64), &'static 
         Err(e) => {
             serial_println!("[dock] direct app={} path={} on={} new=1 -> refused=spawn ({})", name, path, on, e);
             Err("spawn")
+        }
+    }
+}
+
+// ── F39MENUKEYSONE (rmbp-ledger B1123): the tile menu on THE menu key walker (`crystal::walk`) ────────────────────────
+
+/// F39MENUKEYSONE — the open tile menu's walk (lock-free: [`compose`] reads it from the present tail).
+static WALK: super::crystal::walk::Cell = super::crystal::walk::Cell::new();
+
+/// F39MENUKEYSONE — the lit row after the pointer's row `hover` (`nrows` = none): a CROSSING writes the walk's sel, a
+/// still pointer leaves the keys' sel. `nrows` = nothing lit.
+fn walk_lit(hover: usize, nrows: usize) -> usize {
+    WALK.cross((hover < nrows).then_some(hover)).filter(|&i| i < nrows).unwrap_or(nrows)
+}
+
+/// F39MENUKEYSONE — a key while the tile menu is open: the walk's act. `true` = consumed. Escape closes the menu (it
+/// had no key at all); Return presses the lit row through [`menu_press`] at the row's centre (the fixture's own shape,
+/// the pick road a click takes). Task context only (the key seam).
+pub fn menu_key(ev: crate::pal::Event) -> bool {
+    let crate::pal::Event::Key(c) = ev else { return false };
+    if !menu_open() {
+        return false;
+    }
+    let geo = {
+        let mut rows = ModelBuf::take();
+        router_model(&mut rows).and_then(|(n, l)| menu_geo(&l, &rows[..n], None))
+    };
+    let Some(g) = geo else { return false };
+    let (mx, my, _, _) = super::crystal::sheet::body((g.mx, g.my, g.mw, g.mh));
+    match WALK.update(g.rows, (g.rows, false), |w| w.key(c, |_| true)) {
+        super::crystal::walk::Act::Pass => false,
+        super::crystal::walk::Act::Held => true,
+        super::crystal::walk::Act::Moved | super::crystal::walk::Act::Paged => {
+            wm::composite(); // the lit row is in `compose`'s damage sig
+            true
+        }
+        super::crystal::walk::Act::Dismiss => {
+            menu_close();
+            wm::composite();
+            true
+        }
+        super::crystal::walk::Act::Press(i) => {
+            menu_press((mx + PAD() + 1) as i32, (my + i * TILE_H() + TILE_H() / 2) as i32);
+            wm::composite();
+            true
         }
     }
 }

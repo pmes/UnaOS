@@ -283,12 +283,9 @@ fn empty_armed() -> bool {
 struct Menu {
     x: usize,
     y: usize,
-    /// F39MENUSCROLL (B1119): the page's first item (a multiple of `menu_fit`'s rows; read through [`page_first`]).
-    first: usize,
-    /// F39MENUSCROLL (B1119): THE lit item (absolute index), written by the keys and by a pointer crossing.
-    sel: Option<usize>,
-    /// F39MENUSCROLL (B1119): the item the pointer was last over (a crossing is a change of it).
-    ptr: Option<usize>,
+    /// F39MENUSCROLL (B1119): the page's first item, THE lit item and the pointer's last item — F39MENUKEYSONE (B1123):
+    /// on THE menu key walker (`crystal::walk::Walk`, `rows` = the items, `fit` refreshed from `menu_fit` per key).
+    walk: crate::video::crystal::walk::Walk,
 }
 static MENU: crate::sync::Mutex<Option<Menu>> = crate::sync::Mutex::new(None);
 static MENU_UP: AtomicBool = AtomicBool::new(false);
@@ -323,7 +320,7 @@ fn menu_h(g: &Geom) -> usize {
 /// that fit less one, the last slot the more-row (it lights nothing; a press on it dismisses, like the band). The
 /// ONE geometry every site reads (paint, hover, press, the open road, the probe) through [`menu_h`] / [`menu_body`];
 /// `(0, _)` means nothing fits and the open road refuses. The menu never scrolls (BP-video-38: it is no pane); the
-/// rows past the fit are a PAGE (F39MENUSCROLL B1119: `Menu.first`, [`page_turn`]).
+/// rows past the fit are a PAGE (F39MENUSCROLL B1119: `Menu.walk.first`, `crystal::walk::Walk::turned`).
 fn menu_fit(g: &Geom) -> (usize, bool) {
     let rh = g.row_h().max(1);
     let cap = g.h.saturating_sub(2 * crate::video::crystal::DROP_PADY() + crate::video::crystal::sheet::BAND()) / rh;
@@ -354,7 +351,7 @@ fn menu_hover(g: &Geom, x: usize, y: usize, first: usize) -> Option<usize> {
     }
     let k = (sy - y - pady) / g.row_h();
     let fit = menu_fit(g);
-    let i = page_first(first, fit) + k; // F39MENUSCROLL (B1119): the item on this page, absolute
+    let i = walk_at(first, fit).page() + k; // F39MENUSCROLL (B1119): the item on this page, absolute
     if k < fit.0 && i < ITEMS.len() { Some(i) } else { None } // QUARRYMENUFIT (B1107): the more-row lights nothing
 }
 
@@ -382,7 +379,7 @@ fn menu_paint(px: &mut [u32], g: &Geom, x: usize, y: usize, first: usize, hover:
         }
     }
     let (rows, more) = menu_fit(g); // QUARRYMENUFIT (B1107)
-    let first = page_first(first, (rows, more)); // F39MENUSCROLL (B1119): the page; the sheet never moves
+    let first = walk_at(first, (rows, more)).page(); // F39MENUSCROLL (B1119): the page; the sheet never moves
     for (i, it) in ITEMS.iter().enumerate().skip(first).take(rows) {
         let top = y + pady + (i - first) * rh;
         let hot = hover == Some(i);
@@ -484,11 +481,11 @@ pub fn paint_overlay(m: &Model, px: &mut [u32]) {
         s.push(b'_');
         text(px, g, x + PAD(), y + g.ts, &s, x + w, theme::text_primary());
     }
-    let at = MENU.lock().as_ref().map(|mn| (mn.x, mn.y, mn.first)); // MENUS2 (B652): the origin copied out, so the hover read below holds no Quarry UI lock
+    let at = MENU.lock().as_ref().map(|mn| (mn.x, mn.y, mn.walk.first)); // MENUS2 (B652): the origin copied out, so the hover read below holds no Quarry UI lock
     if let Some((mx, my, first)) = at {
         let hov = menu_hover(g, mx, my, first);
         let lit = match MENU.lock().as_mut() { // F39MENUSCROLL (B1119): a pointer CROSSING writes the one sel; a still pointer leaves the keys' sel
-            Some(mn) => { if mn.ptr != hov { mn.ptr = hov; if hov.is_some() { mn.sel = hov; } } mn.sel }
+            Some(mn) => { mn.walk.cross(hov); mn.walk.sel } // F39MENUKEYSONE (B1123): the crossing is `Walk::cross`
             None => None,
         };
         menu_paint(px, g, mx, my, first, lit); // MENUS2 (B652): the sheet (was a raised face, a keyline and flat rows)
@@ -595,7 +592,7 @@ pub fn right_press(x: i32, y: i32) -> bool {
         }
         let mx = sx.min(g.w.saturating_sub(w));
         let my = sy.min(g.h.saturating_sub(h));
-        *MENU.lock() = Some(Menu { x: mx, y: my, first: 0, sel: None, ptr: None }); // F39MENUSCROLL (B1119): page 0, nothing lit
+        *MENU.lock() = Some(Menu { x: mx, y: my, walk: crate::video::crystal::walk::Walk::new(ITEMS.len(), fit) }); // F39MENUSCROLL (B1119): page 0, nothing lit
         MENU_UP.store(true, Ordering::Release);
     }
     serial_println!("[quarry] menu open at=({},{}) rows={}/{} more={}", sx, sy, fit.0, ITEMS.len(), fit.1 as u8); // QUARRYMENUFIT (B1107): rows= more=
@@ -640,7 +637,7 @@ pub fn menu_press(x: i32, y: i32) -> bool {
     if !MENU_UP.load(Ordering::Acquire) {
         return false;
     }
-    let peek = MENU.lock().as_ref().map(|mn| (mn.x, mn.y, mn.first)); // F39MENUSCROLL (B1119): peeked, not taken — the more-row turns the page and the menu stays
+    let peek = MENU.lock().as_ref().map(|mn| (mn.x, mn.y, mn.walk.first)); // F39MENUSCROLL (B1119): peeked, not taken — the more-row turns the page and the menu stays
     let Some((mx, my, first)) = peek else { MENU_UP.store(false, Ordering::Release); return false };
     let hit = to_source(x, y);
     let mut picked = None;
@@ -652,7 +649,7 @@ pub fn menu_press(x: i32, y: i32) -> bool {
         };
         if sx >= mx && sx < mx + bw && sy >= my + pady {
             let k = (sy - my - pady) / rh;
-            let i = page_first(first, fit) + k;
+            let i = walk_at(first, fit).page() + k;
             if fit.1 && k == fit.0 { // F39MENUSCROLL (B1119): a press on the more-row turns the page (was: dismiss)
                 page_go(fit, false, "press");
                 repaint();
@@ -1403,7 +1400,7 @@ pub(super) fn menu_probe(f: impl FnOnce() -> bool) -> bool {
 /// QUARRYMENUFIT (B1107) — the menu's closing `<n> more…` row at source row `top` (one item tall, body width `bw`):
 /// a `line.subtle` hairline on its first row (`sheet::separator`, inset from both sides) and the count in
 /// `text.secondary`. No pill: it is not an item. F39MENUSCROLL (B1119): `back` = the last page's row, `<n> back…`
-/// (`n` the items before the page); a press on either turns the page ([`page_turn`]).
+/// (`n` the items before the page); a press on either turns the page (`crystal::walk::Walk::turned`).
 fn more_row(px: &mut [u32], g: &Geom, x: usize, top: usize, bw: usize, back: bool, hidden: usize) {
     use crate::video::crystal::sheet;
     if top >= g.h || x + bw > g.w {
@@ -1437,44 +1434,29 @@ fn fit_probe(g: &Geom) -> bool {
 }
 
 // ── F39MENUSCROLL (rmbp-ledger B1119): the menu's page and its keys ─────────────────────────────────────────────────
-// The rows past `menu_fit` are a PAGE, never a scroll (BP-video-38: the menu is no pane): `Menu.first` names the page's
-// first item (a multiple of the fit's rows), the sheet keeps its height and place, and the nav row at slot `rows`
+// The rows past `menu_fit` are a PAGE, never a scroll (BP-video-38: the menu is no pane): `Menu.walk.first` names the
+// page's first item (a multiple of the fit's rows), the sheet keeps its height and place, and the nav row at slot `rows`
 // (`<n> more…`, the last page's `<n> back…`) or PageDown turns it. The keys walk ONE `sel` — the pointer's crossing
-// writes the same field (`paint_overlay`) — lit by `menu_paint`'s one pill. Lock order MODEL -> MENU (as
-// `paint_overlay`): the fit is read under MODEL and dropped before MENU is taken; no lock is held across the pick.
+// writes the same field (`paint_overlay`, `menu_cross`) — lit by `menu_paint`'s one pill. F39MENUKEYSONE (B1123): the
+// page arithmetic and the key walk are THE menu key walker's (`crystal::walk::Walk`, shared with the SHARD menu, the
+// window menus and the dock tile menu); this file keeps the fit, the paint, the pick and its `[quarry] menu page`
+// line. Lock order MODEL -> MENU (as `paint_overlay`): the fit is read under MODEL and dropped before MENU is taken;
+// no lock is held across the pick.
 
-/// The page's first item under `fit`: `first` on its page boundary, or 0 when the menu re-fit under it (everything
-/// fits now, or the page is past the end).
-fn page_first(first: usize, fit: (usize, bool)) -> usize {
-    if !fit.1 || fit.0 == 0 || first >= ITEMS.len() { 0 } else { first - first % fit.0 }
+/// F39MENUKEYSONE (B1123) — the walk over Quarry's items at page `first` under `fit` (nothing lit): the arithmetic
+/// reads (`page`, `turned`, `back`, `page_of`, `step`) of a menu not under `MENU`.
+fn walk_at(first: usize, fit: (usize, bool)) -> crate::video::crystal::walk::Walk {
+    crate::video::crystal::walk::Walk { first, ..crate::video::crystal::walk::Walk::new(ITEMS.len(), fit) }
 }
 
-/// The page holding item `i` (pages of `rows` items).
-fn page_of(i: usize, rows: usize) -> usize {
-    if rows == 0 { 0 } else { i - i % rows }
-}
-
-/// The page after `first`: the next `rows` items, or page 0 from the last page (the `<n> back…` row).
-fn page_turn(first: usize, fit: (usize, bool)) -> usize {
-    let f = page_first(first, fit);
-    if !fit.1 || f + fit.0 >= ITEMS.len() { 0 } else { f + fit.0 }
-}
-
-/// The page before `first` (PageUp), saturating at page 0.
-fn page_back(first: usize, fit: (usize, bool)) -> usize {
-    page_first(first, fit).saturating_sub(fit.0)
-}
-
-/// Move the open menu to the page `back ? page_back : page_turn` names: a keyboard sel moves to the page's first
-/// item, the pointer's last row is forgotten (the next crossing writes sel again). One `[quarry] menu page` line.
+/// Move the open menu to the page `back ? Walk::back : Walk::turned` names (`Walk::go`: a keyboard sel moves to the
+/// page's first item, the pointer's last row is forgotten). One `[quarry] menu page` line.
 fn page_go(fit: (usize, bool), back: bool, by: &str) {
     let turned = match MENU.lock().as_mut() {
         Some(mn) => {
-            let f = if back { page_back(mn.first, fit) } else { page_turn(mn.first, fit) };
-            mn.first = f;
-            mn.sel = mn.sel.map(|_| f);
-            mn.ptr = None;
-            Some(f)
+            mn.walk.rows = ITEMS.len();
+            mn.walk.fit = fit;
+            Some(mn.walk.go(back, |_| true))
         }
         None => None,
     };
@@ -1483,24 +1465,12 @@ fn page_go(fit: (usize, bool), back: bool, by: &str) {
     }
 }
 
-/// One Up (`down` false) or Down step of the one sel: `(first, sel)` after it. ±1 modulo the items, the page following
-/// the sel (wraps inside a one-page menu, crosses a page at its edge, last <-> first across pages); with nothing lit,
-/// Down lights the page's first item and Up its last. Pure: the keys and `page_probe` share it.
-fn menu_step(first: usize, sel: Option<usize>, fit: (usize, bool), down: bool) -> (usize, usize) {
-    let n = ITEMS.len();
-    let rows = if fit.1 && fit.0 > 0 { fit.0 } else { n };
-    let f = page_first(first, fit);
-    let s = match sel {
-        Some(s) if s < n => if down { (s + 1) % n } else { (s + n - 1) % n },
-        _ => if down { f } else { (f + rows).min(n) - 1 },
-    };
-    (if fit.1 { page_of(s, rows) } else { 0 }, s)
-}
-
 /// A key while the menu is up (`key_pre`'s menu arm): `true` = consumed. Escape dismisses; Up/Down walk the sel;
 /// PageDown/PageUp turn the page; Return runs the lit item through [`menu_pick`] (nothing lit: consumed, nothing run,
-/// so the list behind the menu is not opened). Every other key falls through as before.
+/// so the list behind the menu is not opened). Every other key falls through as before. F39MENUKEYSONE (B1123): the
+/// walk is `Walk::key` (every item pickable: `ok = |_| true`, B1119's behaviour); Quarry runs the act.
 fn menu_key(c: u8) -> bool {
+    use crate::video::crystal::walk::Act;
     if c == 0x1B {
         *MENU.lock() = None;
         MENU_UP.store(false, Ordering::Release);
@@ -1510,40 +1480,24 @@ fn menu_key(c: u8) -> bool {
         return false;
     }
     let Some(fit) = MODEL.lock().as_ref().map(|m| menu_fit(&m.geom)) else { return false };
-    match c {
-        una_abi::KEY_PGDN => page_go(fit, false, "key"),
-        una_abi::KEY_PGUP => page_go(fit, true, "key"),
-        0x1E | 0x1F => {
-            let crossed = match MENU.lock().as_mut() {
-                Some(mn) => {
-                    let (f, s) = menu_step(mn.first, mn.sel, fit, c == 0x1E);
-                    let crossed = f != page_first(mn.first, fit);
-                    mn.first = f;
-                    mn.sel = Some(s);
-                    crossed.then_some(f)
-                }
-                None => None,
-            };
-            if let Some(f) = crossed {
-                serial_println!("[quarry] menu page first={} rows={} by=key", f, fit.0);
-            }
+    let act = match MENU.lock().as_mut() {
+        Some(mn) => {
+            mn.walk.rows = ITEMS.len();
+            mn.walk.fit = fit;
+            Some((mn.walk.key(c, |_| true), mn.walk.first, (mn.x, mn.y)))
         }
-        _ => {
-            let pick = {
-                let mut guard = MENU.lock();
-                match guard.as_ref().map(|mn| (mn.x, mn.y, mn.sel)) {
-                    Some((x, y, Some(i))) if i < ITEMS.len() => {
-                        *guard = None;
-                        Some((ITEMS[i], (x, y)))
-                    }
-                    _ => None,
-                }
-            };
-            if let Some((it, origin)) = pick {
-                MENU_UP.store(false, Ordering::Release);
-                menu_pick(Some(it), origin);
-            }
+        None => None,
+    };
+    match act {
+        Some((Act::Paged, f, _)) => {
+            serial_println!("[quarry] menu page first={} rows={} by=key", f, fit.0);
         }
+        Some((Act::Press(i), _, origin)) if i < ITEMS.len() => {
+            *MENU.lock() = None;
+            MENU_UP.store(false, Ordering::Release);
+            menu_pick(Some(ITEMS[i]), origin);
+        }
+        _ => {}
     }
     true
 }
@@ -1562,7 +1516,7 @@ fn menu_pick(picked: Option<Item>, origin: (usize, usize)) {
 }
 
 /// `sheet_probe`'s page leg: `fit_probe`'s short window (three rows less than the whole menu), its second page
-/// (`page_turn(0)`) painted by the live painter with that page's first item lit. Ok: more than one page, the body's
+/// (`Walk::turned` from page 0) painted by the live painter with that page's first item lit. Ok: more than one page, the body's
 /// centre `surface.overlay`, the pill on slot 0 (accent at the body's right inner edge), no pure white; the page
 /// arithmetic: the last page turns back to 0, a stale page clamps to 0, Down from the page's last item crosses to the
 /// next page, Up from item 0 wraps to the last item on the last page, Down from the last item wraps to (0, 0).
@@ -1572,17 +1526,18 @@ fn page_probe(g: &Geom) -> bool {
     let s = Geom { h: menu_h_all(g).saturating_sub(3 * g.row_h()), ..*g };
     let fit = menu_fit(&s);
     let (rows, n) = (fit.0, ITEMS.len());
-    let first = page_turn(0, fit);
+    let first = walk_at(0, fit).turned();
     let (w, h) = (menu_w(&s), menu_h(&s));
     let (bw, bh, pady) = menu_body(&s);
     let mut ok = fit.1 && rows > 1 && first == rows && first < n && w <= s.w && h <= s.h;
     if ok {
-        let last = page_of(n - 1, rows);
-        ok &= page_turn(last, fit) == 0 && page_first(n + 5, fit) == 0 && page_back(first, fit) == 0;
-        ok &= menu_step(0, Some(rows - 1), fit, true) == (rows, rows);
-        ok &= menu_step(0, Some(0), fit, false) == (last, n - 1);
-        ok &= menu_step(last, Some(n - 1), fit, true) == (0, 0);
-        ok &= menu_step(0, None, fit, true) == (0, 0);
+        let step = |first: usize, sel: Option<usize>, down: bool| crate::video::crystal::walk::Walk { sel, ..walk_at(first, fit) }.step(down, |_| true); // F39MENUKEYSONE (B1123): B1119's asserts on THE walker
+        let last = walk_at(0, fit).page_of(n - 1);
+        ok &= walk_at(last, fit).turned() == 0 && walk_at(n + 5, fit).page() == 0 && walk_at(first, fit).back() == 0;
+        ok &= step(0, Some(rows - 1), true) == (rows, rows);
+        ok &= step(0, Some(0), false) == (last, n - 1);
+        ok &= step(last, Some(n - 1), true) == (0, 0);
+        ok &= step(0, None, true) == (0, 0);
         let mut px = alloc::vec![theme::surface_content() & 0x00FF_FFFF; s.w * s.h];
         menu_paint(&mut px, &s, 0, 0, first, Some(first));
         let at = |x: usize, y: usize| px[y * s.w + x] & 0x00FF_FFFF;
@@ -1594,4 +1549,20 @@ fn page_probe(g: &Geom) -> bool {
     }
     serial_println!("[menuscraft] quarry_page first={} rows={} -> {}", first, rows, if ok { "ok" } else { "BAD" });
     ok
+}
+
+// ── F39MENUKEYSONE (rmbp-ledger B1123): the menu's crossing on the hover pass ─────────────────────────────────────────
+
+/// `live::hover_route`'s change test (QUARRY-MENU-HOVER-PASS): the pointer's item on the open menu, latched as a
+/// crossing (`Walk::cross`). `true` = the lit item moved, so the pass repaints and the pill follows the pointer at once
+/// (it waited for an unrelated repaint while only `paint_overlay` latched it). A closed menu costs one load. Lock
+/// order MODEL -> MENU: the geometry is copied under MODEL and dropped; `menu_hover` takes no Quarry lock.
+pub(super) fn menu_cross() -> bool {
+    if !MENU_UP.load(Ordering::Acquire) {
+        return false;
+    }
+    let Some(g) = MODEL.lock().as_ref().map(|m| m.geom) else { return false };
+    let Some((x, y, first)) = MENU.lock().as_ref().map(|mn| (mn.x, mn.y, mn.walk.first)) else { return false };
+    let hov = menu_hover(&g, x, y, first);
+    MENU.lock().as_mut().is_some_and(|mn| mn.walk.cross(hov))
 }

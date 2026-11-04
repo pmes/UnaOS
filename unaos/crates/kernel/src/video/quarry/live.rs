@@ -2907,7 +2907,7 @@ pub fn hover_route(x: i32, y: i32) -> bool {
         m.hover = h;
         c
     };
-    if changed {
+    let changed = changed | ops::menu_cross(); if changed { // F39MENUKEYSONE (B1123): the change test gains the open menu's lit item (QUARRY-MENU-HOVER-PASS; `|` so the crossing is always latched) (LINE-NEUTRAL)
         repaint();
         HOVER_PAINTS.fetch_add(1, Ordering::Relaxed);
     }

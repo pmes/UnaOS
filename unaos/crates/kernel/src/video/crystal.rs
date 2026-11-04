@@ -549,7 +549,7 @@ fn open(pw: usize, ph: usize) {
 /// whether the consumed press hit the painted glyph itself (`crystal-glyph`), the widened corner
 /// cell around it (`corner-zone` — the new pixels this arc claims, so a capture can tell a flick
 /// into the corner from an aimed click), or no press at all (`fixture-direct`).
-fn open_via(pw: usize, ph: usize, via: &str) { crate::video::lag::menu_opened(); // GLASSLAG M1 (B370)
+fn open_via(pw: usize, ph: usize, via: &str) { crate::video::lag::menu_opened(); WALK.reset(); // GLASSLAG M1 (B370) · F39MENUKEYSONE (B1123): the walk starts at page 0, nothing lit (LINE-NEUTRAL)
     if OPEN.swap(true, Ordering::AcqRel) {
         return;
     }
@@ -1516,7 +1516,7 @@ fn sheet_hover(r: strip::Rect, pw: usize, ph: usize) -> usize {
             }
         }
     };
-    HOVER.store(hot, Ordering::Relaxed);
+    let hot = walk_lit(hot); HOVER.store(hot, Ordering::Relaxed); // F39MENUKEYSONE (B1123): the walk's sel is the lit row (LINE-NEUTRAL)
     hot
 }
 
@@ -1960,5 +1960,286 @@ pub mod veil {
         }
         let back = crate::video::wm::desktop::live_back();
         row(out, x0, y, back.as_ref(), look);
+    }
+}
+
+// ── F39MENUKEYSONE (rmbp-ledger B1123): ONE key walker for every menu sheet ──────────────────────────────────────────
+// The SHARD menu, the window menus (`winmenu`), the dock tile menu and Quarry's context menu walk their rows on one
+// [`walk::Walk`]: Up/Down step the one `sel` (separators and disabled rows skipped), PageDown/PageUp turn the page,
+// Return hands `Act::Press(i)` to the sheet's OWN press, Escape dismisses. Each sheet keeps its painter and its lit
+// field; the walk's `sel` is written into that field on the line that already stores it. The bar sheets are asked
+// from `strip::key_escape` (the one menu key seam both arch routers ask first); Quarry from `ops::key_pre`.
+
+/// F39MENUKEYSONE — the SHARD menu's walk (lock-free: [`compose`] runs IRQ-masked from the present tail).
+static WALK: walk::Cell = walk::Cell::new();
+
+/// F39MENUKEYSONE — the lit row (+1) after the pointer's row `hot` (+1, `0` = none): a CROSSING writes the walk's sel,
+/// a still pointer leaves the keys' sel. The panel mode lights nothing (unchanged).
+fn walk_lit(hot: usize) -> usize {
+    if super::powerui::panel_open() {
+        return hot;
+    }
+    WALK.cross(hot.checked_sub(1)).map_or(0, |i| i + 1)
+}
+
+/// F39MENUKEYSONE — a key while the SHARD menu is open (not its panel mode): the walk's act. `true` = consumed.
+/// Return presses the lit row through [`press_at`] at the row's centre (the pick road a click takes).
+pub fn key_walk(ev: crate::pal::Event) -> bool {
+    let crate::pal::Event::Key(c) = ev else { return false };
+    if !OPEN.load(Ordering::Acquire) || super::powerui::panel_open() {
+        return false;
+    }
+    let n = ROWS.len();
+    match WALK.update(n, (n, false), |w| w.key(c, |i| ROWS[i].verb.is_some())) {
+        walk::Act::Pass => false,
+        walk::Act::Held => true,
+        walk::Act::Moved | walk::Act::Paged => {
+            super::wm::composite(); // MENU-DRIVE: the lit row is in `compose`'s damage sig
+            true
+        }
+        walk::Act::Dismiss => {
+            dismiss("escape");
+            true
+        }
+        walk::Act::Press(i) => {
+            let (pw, ph) = {
+                let fb = *super::WRITER.lock();
+                if !fb.is_ready() {
+                    return true;
+                }
+                (fb.width(), fb.height())
+            };
+            if let Some(r) = menu_rect(pw, ph) {
+                let (bx, by, _, _) = sheet::body(r);
+                press_at((bx + BORDER + PADX() + 1) as i32, (by + row_top(i) + ITEM_H() / 2) as i32);
+            }
+            true
+        }
+    }
+}
+
+/// F39MENUKEYSONE (rmbp-ledger B1123) — **THE menu key walker**: which row is lit and which page shows, for every menu
+/// sheet. F39MENUSCROLL's (B1119) page arithmetic moved here unchanged (`page` = `page_first`, `turned` = `page_turn`,
+/// `back` = `page_back`, `step` = `menu_step`); a sheet with separators or disabled rows passes `ok` and the step skips
+/// them. Pure data: the owner keeps it under its own lock (Quarry's `MENU`) or in a lock-free [`Cell`].
+pub mod walk {
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    /// What a key did to the walk.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub enum Act {
+        /// Not a menu key: fall through.
+        Pass,
+        /// A menu key that changed nothing (Return with nothing lit): consumed.
+        Held,
+        /// The sel moved on its page.
+        Moved,
+        /// The page turned (PageDown / PageUp always; Up/Down when the sel crossed a page).
+        Paged,
+        /// Return on the lit row `i`: the sheet's own press runs it.
+        Press(usize),
+        /// Escape.
+        Dismiss,
+    }
+
+    /// The walk: the page's first row, THE lit row, the row the pointer was last over (a crossing is a change of it),
+    /// the row count and the fit (`(rows on a page, more pages)`; `(rows, false)` = one page).
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub struct Walk {
+        pub first: usize,
+        pub sel: Option<usize>,
+        pub ptr: Option<usize>,
+        pub rows: usize,
+        pub fit: (usize, bool),
+    }
+
+    impl Walk {
+        /// Page 0, nothing lit.
+        pub const fn new(rows: usize, fit: (usize, bool)) -> Walk {
+            Walk { first: 0, sel: None, ptr: None, rows, fit }
+        }
+
+        /// The page's first row: `first` on its page boundary, or 0 when the menu re-fit under it.
+        pub fn page(&self) -> usize {
+            if !self.fit.1 || self.fit.0 == 0 || self.first >= self.rows { 0 } else { self.first - self.first % self.fit.0 }
+        }
+
+        /// The page holding row `i`.
+        pub fn page_of(&self, i: usize) -> usize {
+            if self.fit.0 == 0 { 0 } else { i - i % self.fit.0 }
+        }
+
+        /// The page after this one, or page 0 from the last page.
+        pub fn turned(&self) -> usize {
+            let f = self.page();
+            if !self.fit.1 || f + self.fit.0 >= self.rows { 0 } else { f + self.fit.0 }
+        }
+
+        /// The page before this one, saturating at 0.
+        pub fn back(&self) -> usize {
+            self.page().saturating_sub(self.fit.0)
+        }
+
+        /// One Up (`down` false) or Down step of the sel: `(first, sel)` after it. ±1 modulo the rows, the page
+        /// following the sel; with nothing lit Down lights the page's first row and Up its last; a row `!ok` is skipped.
+        pub fn step(&self, down: bool, ok: impl Fn(usize) -> bool) -> (usize, usize) {
+            let n = self.rows;
+            if n == 0 {
+                return (0, 0);
+            }
+            let per = if self.fit.1 && self.fit.0 > 0 { self.fit.0 } else { n };
+            let f = self.page();
+            let mv = |s: usize| if down { (s + 1) % n } else { (s + n - 1) % n };
+            let mut s = match self.sel {
+                Some(s) if s < n => mv(s),
+                _ => if down { f } else { (f + per).min(n) - 1 },
+            };
+            for _ in 0..n {
+                if ok(s) {
+                    break;
+                }
+                s = mv(s);
+            }
+            (if self.fit.1 { self.page_of(s) } else { 0 }, s)
+        }
+
+        /// Turn to the page `back ? back() : turned()` names: a keyboard sel moves to the page's first `ok` row, the
+        /// pointer's last row is forgotten (the next crossing writes sel again). Returns the new first row.
+        pub fn go(&mut self, back: bool, ok: impl Fn(usize) -> bool) -> usize {
+            let f = if back { self.back() } else { self.turned() };
+            self.first = f;
+            self.sel = self.sel.map(|_| (f..self.rows).find(|&i| ok(i)).unwrap_or(f));
+            self.ptr = None;
+            f
+        }
+
+        /// The pointer is over row `hov`: a CHANGE of it writes the sel (when over a row); a still pointer leaves the
+        /// keys' sel. `true` = the sel moved.
+        pub fn cross(&mut self, hov: Option<usize>) -> bool {
+            let was = self.sel;
+            if self.ptr != hov {
+                self.ptr = hov;
+                if hov.is_some() {
+                    self.sel = hov;
+                }
+            }
+            self.sel != was
+        }
+
+        /// A key byte while the menu is up.
+        pub fn key(&mut self, c: u8, ok: impl Fn(usize) -> bool) -> Act {
+            match c {
+                0x1B => Act::Dismiss,
+                una_abi::KEY_DOWN | una_abi::KEY_UP => {
+                    if self.rows == 0 {
+                        return Act::Held;
+                    }
+                    let (f, s) = self.step(c == una_abi::KEY_DOWN, &ok);
+                    let paged = f != self.page();
+                    self.first = f;
+                    self.sel = Some(s);
+                    if paged { Act::Paged } else { Act::Moved }
+                }
+                una_abi::KEY_PGDN | una_abi::KEY_PGUP => {
+                    self.go(c == una_abi::KEY_PGUP, &ok);
+                    Act::Paged
+                }
+                b'\r' | b'\n' => match self.sel {
+                    Some(i) if i < self.rows && ok(i) => Act::Press(i),
+                    _ => Act::Held,
+                },
+                _ => Act::Pass,
+            }
+        }
+    }
+
+    /// A lock-free walk for a sheet composed IRQ-masked (the SHARD menu, the window menus, the dock tile menu):
+    /// `first | sel+1 << 16 | ptr+1 << 32`, 16 bits each (`0` = none). The row count and fit are the caller's.
+    pub struct Cell(AtomicU64);
+
+    impl Cell {
+        pub const fn new() -> Cell {
+            Cell(AtomicU64::new(0))
+        }
+
+        /// Page 0, nothing lit, no pointer row: the sheet's open.
+        pub fn reset(&self) {
+            self.0.store(0, Ordering::Release);
+        }
+
+        fn unpack(v: u64, rows: usize, fit: (usize, bool)) -> Walk {
+            let o = |s: u32| (((v >> s) & 0xFFFF) as usize).checked_sub(1);
+            Walk { first: (v & 0xFFFF) as usize, sel: o(16), ptr: o(32), rows, fit }
+        }
+
+        fn pack(w: &Walk) -> u64 {
+            let o = |x: Option<usize>| x.map_or(0, |i| (i as u64 + 1) & 0xFFFF);
+            (w.first as u64 & 0xFFFF) | (o(w.sel) << 16) | (o(w.ptr) << 32)
+        }
+
+        /// Run `f` on the walk and store it back (a CAS loop: the key seam and the sheet's compose both write).
+        pub fn update<R>(&self, rows: usize, fit: (usize, bool), mut f: impl FnMut(&mut Walk) -> R) -> R {
+            let mut cur = self.0.load(Ordering::Acquire);
+            loop {
+                let mut w = Self::unpack(cur, rows, fit);
+                let r = f(&mut w);
+                match self.0.compare_exchange_weak(cur, Self::pack(&w), Ordering::AcqRel, Ordering::Acquire) {
+                    Ok(_) => return r,
+                    Err(v) => cur = v,
+                }
+            }
+        }
+
+        /// The pointer's row `hov` crossed ([`Walk::cross`]): the lit row after it.
+        pub fn cross(&self, hov: Option<usize>) -> Option<usize> {
+            self.update(0, (0, false), |w| {
+                w.cross(hov);
+                w.sel
+            })
+        }
+    }
+
+    /// `tests menuscraft`'s walker KAT (on `dock::sheet_probe`'s `dock_menu=` leg): four sheet shapes — Quarry's 13 items
+    /// paged 9 a page (B1119), the SHARD menu's real rows with their separators, a window-menu shape [item, separator,
+    /// disabled, item, item], a dock menu of 7 — driven by the five keys (Up, Down, PageDown, Return, Escape), plus the
+    /// crossing (a still pointer leaves the keys' sel) and the lock-free cell. One `[menu] walk` line.
+    pub fn probe() -> bool {
+        use una_abi::{KEY_DOWN as D, KEY_PGDN as PD, KEY_UP as U};
+        let all = |_: usize| true;
+        let mut q = Walk::new(13, (9, true));
+        let mut ok = q.key(D, all) == Act::Moved && q.sel == Some(0);
+        ok &= q.key(PD, all) == Act::Paged && q.first == 9 && q.sel == Some(9);
+        ok &= q.key(U, all) == Act::Paged && q.first == 0 && q.sel == Some(8);
+        ok &= q.key(b'\r', all) == Act::Press(8) && q.key(0x1B, all) == Act::Dismiss;
+        let n = super::ROWS.len();
+        let pick = |i: usize| super::ROWS[i].verb.is_some();
+        let mut s = Walk::new(n, (n, false));
+        ok &= s.key(D, pick) == Act::Moved && s.sel == Some(0);
+        ok &= s.key(D, pick) == Act::Moved && s.sel == Some(2); // row 1 is the separator
+        ok &= s.key(U, pick) == Act::Moved && s.sel == Some(0);
+        ok &= s.key(U, pick) == Act::Moved && s.sel == Some(n - 1);
+        ok &= s.key(PD, pick) == Act::Paged && s.first == 0 && s.sel == Some(0);
+        ok &= s.key(b'\r', pick) == Act::Press(0) && s.key(0x1B, pick) == Act::Dismiss;
+        let wmok = |i: usize| matches!(i, 0 | 3 | 4);
+        let mut w = Walk::new(5, (5, false));
+        ok &= w.key(b'\r', wmok) == Act::Held && w.key(b'x', wmok) == Act::Pass;
+        ok &= w.key(D, wmok) == Act::Moved && w.sel == Some(0);
+        ok &= w.key(D, wmok) == Act::Moved && w.sel == Some(3); // the separator and the disabled row skipped
+        ok &= w.key(PD, wmok) == Act::Paged && w.sel == Some(0);
+        ok &= w.key(b'\r', wmok) == Act::Press(0) && w.key(0x1B, wmok) == Act::Dismiss;
+        let mut d = Walk::new(7, (7, false));
+        ok &= d.key(U, all) == Act::Moved && d.sel == Some(6);
+        ok &= d.key(D, all) == Act::Moved && d.sel == Some(0);
+        ok &= d.cross(Some(4)) && d.sel == Some(4) && !d.cross(Some(4));
+        ok &= d.key(D, all) == Act::Moved && d.sel == Some(5) && !d.cross(Some(4)) && d.sel == Some(5);
+        ok &= d.key(PD, all) == Act::Paged && d.sel == Some(0) && d.ptr.is_none();
+        ok &= d.key(b'\r', all) == Act::Press(0) && d.key(0x1B, all) == Act::Dismiss;
+        let c = Cell::new();
+        ok &= c.cross(Some(3)) == Some(3);
+        ok &= c.update(7, (7, false), |w| w.key(D, all)) == Act::Moved && c.cross(Some(3)) == Some(4);
+        c.reset();
+        ok &= c.cross(None).is_none();
+        serial_println!("[menu] walk keys=5 sheets=4 -> {}", if ok { "ok" } else { "BAD" });
+        ok
     }
 }

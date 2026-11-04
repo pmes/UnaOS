@@ -802,11 +802,11 @@ pub fn press_route(x: i32, y: i32) -> bool {
 /// two lanes is the drift `press_route`'s own header was written about. So the question moves here and
 /// the routers ask one thing.
 ///
-/// Consumes ONLY a bare `Esc` while one of the two menus is open; every other event, and `Esc` with
+/// Consumes a bare `Esc` while a menu is open, and the walk keys while a menu sheet is open (F39MENUKEYSONE); the rest, and keys with
 /// nothing down, falls straight through, so a boot that never opens a menu is byte-alike in behaviour.
 #[inline]
 pub fn key_escape(ev: crate::pal::Event) -> bool {
-    super::crystal::key_escape(ev) || super::winmenu::key_escape(ev)
+    super::crystal::key_escape(ev) || super::winmenu::key_escape(ev) || super::crystal::key_walk(ev) || super::winmenu::key_walk(ev) || super::dock::menu_key(ev) // F39MENUKEYSONE (B1123): Up/Down/PageUp/PageDown/Return walk an open menu sheet on ONE walker (`crystal::walk`); the dock tile menu gains Escape
 }
 
 // ---------------------------------------------------------------------------
