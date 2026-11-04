@@ -201,7 +201,7 @@ fn selftest() {
         if verdict(h, s, k) { "PASS" } else { "FAIL" }, HID_GAP_STALL_MS, KEY_QUEUE_BOUND_MS, DOCK_RELEASE_TIMEOUT_MS,
         holders_seen(), session_worst().1, HolderName(session_worst().0), RELEASES_WAITED.load(Relaxed), LANE_MAX_MS.load(Relaxed), CpuWord(pump_cpu()),
         HID_STALL_HELD_S.load(Relaxed), STALL_GAP_MAX_MS.load(Relaxed), DOCK_HELD.load(Relaxed), TIMEOUT_RELEASE_MS.load(Relaxed), DOCK_UNDECODED.load(Relaxed), FrPlace
-    ); mask_sites_say(); maskscope_kat(); gap_split_kat(); // F39INPUTSTALL (B1097): `:: HIDGAPSPLIT:` the pass/wait split KAT (body at the tail). HIDSTALLMASKSCOPE (B1019): the masked-max holder KAT, `:: MASKSCOPE:` (LINE-NEUTRAL fold, code first; body at the tail); MASKCENSUS (B1028): the boot site table's ONE line first
+    ); mask_sites_say(); maskscope_kat(); gap_split_kat(); hid_place_kat(); // F39HIDPLACE (B1103): `:: HIDPLACE:` the placement rule + tap KAT (body at the tail). F39INPUTSTALL (B1097): `:: HIDGAPSPLIT:` the pass/wait split KAT (body at the tail). HIDSTALLMASKSCOPE (B1019): the masked-max holder KAT, `:: MASKSCOPE:` (LINE-NEUTRAL fold, code first; body at the tail); MASKCENSUS (B1028): the boot site table's ONE line first
 }
 
 /// REGISTRYCHUNK (rmbp-ledger B508): the longest masked UnaFS span on ANY core since the last take — a step reads
@@ -433,8 +433,8 @@ pub fn census_minute() {
         }
     }
     serial_println!(
-        "[hid] stall census holders={} worst_ms={} worst={} unnamed={} overflow={} pump_cpu={} over_ms={} -> {}",
-        k, worst, HolderName(wix), k - said, HOLD_OVERFLOW.load(Relaxed), CpuWord(pump_cpu()), HOLD_OVER_MS,
+        "[hid] stall census holders={} worst_ms={} worst={} unnamed={} overflow={} pump_cpu={} placed={} over_ms={} -> {}",
+        k, worst, HolderName(wix), k - said, HOLD_OVERFLOW.load(Relaxed), CpuWord(pump_cpu()), CpuWord(usb_pump_placed()), HOLD_OVER_MS,
         if k == 0 { "CLEAR" } else { "HELD" }
     ); gap_split_minute(); #[cfg(all(target_arch = "x86_64", feature = "wc"))] { crate::fs::unafs::lockcensus::minute(); } // F39INPUTSTALL (B1097): the minute's HID gaps split into pass and wait, one line after the census (LINE-NEUTRAL fold, code first; body at the tail)
 }
@@ -1527,5 +1527,65 @@ fn gap_split_kat() {
     serial_println!(
         ":: HIDGAPSPLIT: kat_ok={} boot_worst_ms={} pass_ms={} wait_ms={} -> {} ::",
         ok as u8, g, p, w, if ok { "PASS" } else { "FAIL" }
+    );
+}
+
+// ── F39HIDPLACE (rmbp-ledger B1103) — HID-PLACE + POINTERFEEL-TAP. FILE-TAIL append. ─────────────────────────────────────
+// Flight 39 boot 1: 19 usb-pump restarts and `render-rehomed` (tid 384) landed on c4, the hid pump's core, because no
+// placement road asked where the hid pump lives. Two roads land a task beside it: `sessionwedge::pick_live` (the
+// usb-pump's wedge restart, the steal re-home's drain + service role, the GATESTEAL drive fixture) and main.rs
+// `render_rehome_service` (its own `smp::xhci_worker_cpu(n)` walk — NOT a pick_live caller). ONE rule both call:
+// [`apart`] asks the road's own ladder first with the hid pump's core as the core to skip, and only when that finds
+// nothing (the hid pump's core is the sole candidate) asks it again with no skip — co-location is the fallback, never a
+// decline the road did not already make. The ladder stays the road's (BP-cores-1: asked by name, never re-derived).
+// The census's `placed=<n|->` is where the watch last placed the usb-pump (`sessionwedge::rehome_live`, its existing
+// `REHOME_LIVE`; `-` on aarch64, without `wc`, or before any re-home). `tests hidstall` adds
+// `:: HIDPLACE: kat_ok=1 apart_ok=1 tap_ok=1 placed=<n|-> pump_cpu=c<n> -> PASS ::` (every arch; pure cases only).
+
+/// F39HIDPLACE (B1103): the placement rule over `pick(skip)` with the hid pump on `p` — `pick(p)`, then `pick(usize::MAX)`
+/// (no skip) when that is `None`; `p == usize::MAX` (no hid pump yet) asks once. Pure.
+pub fn apart_with(p: usize, mut pick: impl FnMut(usize) -> Option<usize>) -> Option<usize> {
+    if p == usize::MAX {
+        return pick(usize::MAX);
+    }
+    pick(p).or_else(|| pick(usize::MAX))
+}
+
+/// F39HIDPLACE (B1103): [`apart_with`] against the hid pump's live core ([`pump_cpu`]) — `sessionwedge::pick_live` and
+/// main.rs `render_rehome_service` place through this, so neither lands on the hid pump's core while another core answers.
+pub fn apart(pick: impl FnMut(usize) -> Option<usize>) -> Option<usize> {
+    apart_with(pump_cpu(), pick)
+}
+
+/// F39HIDPLACE (B1103): the census's `placed=` — the core the watch last placed the usb-pump on (`usize::MAX` = none).
+fn usb_pump_placed() -> usize {
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+    {
+        crate::sessionwedge::rehome_live()
+    }
+    #[cfg(not(all(target_arch = "x86_64", feature = "wc")))]
+    {
+        usize::MAX
+    }
+}
+
+/// F39HIDPLACE (B1103): `tests hidstall`'s HIDPLACE KAT — the placement rule over a synthetic first-fit pool and
+/// POINTERFEEL-TAP's pure rule; the live `placed=` / `pump_cpu=` are a reading.
+fn hid_place_kat() {
+    let pool = |cores: &'static [usize]| move |skip: usize| cores.iter().copied().find(|&c| c != skip);
+    let apart_ok = apart_with(4, pool(&[4, 5])) == Some(5)
+        && apart_with(4, pool(&[4])) == Some(4)
+        && apart_with(usize::MAX, pool(&[4, 5])) == Some(4)
+        && apart_with(4, pool(&[])).is_none();
+    let tp = crate::pointerfeel::is_tap;
+    let tap_ok = tp(48, true, 0, 6, 0)
+        && !tp(48, false, 0, 6, 0)
+        && !tp(600, true, 0, 6, 0)
+        && !tp(48, true, 1, 6, 0)
+        && !tp(48, true, 0, 0, 6);
+    let ok = apart_ok && tap_ok;
+    serial_println!(
+        ":: HIDPLACE: kat_ok={} apart_ok={} tap_ok={} placed={} pump_cpu=c{} -> {} ::",
+        ok as u8, apart_ok as u8, tap_ok as u8, CpuWord(usb_pump_placed()), CpuWord(pump_cpu()), if ok { "PASS" } else { "FAIL" }
     );
 }
