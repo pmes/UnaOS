@@ -738,23 +738,23 @@ fn tagid_selftest(fx: &Fixture) {
     if admitted && sent && enoent && unseen && lookup(fx.ops, get).is_none() {
         w |= 1 << 4;
     }
-    on_exit(fx.ops, f);
+    w |= appsfolder_legs(fx, f, owner_f) << 5; on_exit(fx.ops, f); // APPS-FOLDER-NS-LEG (B1183): L6/L7, the folder form admitted and the other folder refused (file tail)
     (fx.clear)(a);
     (fx.clear)(f);
     on_exit(fx.ops, a);
     crate::video::wm::app_name_forget(owner_f);
-    const ALL: u32 = (1 << 5) - 1;
+    const ALL: u32 = (1 << 7) - 1; // APPS-FOLDER-NS-LEG (B1183): two legs more
     let (rf, dr) = (TAGID_REFUSED.load(Ordering::Relaxed), TAGID_DROPPED.load(Ordering::Relaxed));
     if w == ALL {
-        serial_println!(":: BUSREG-TAGID: probe=refused unnamed=dropped prefs=admitted path=refused spelled=dropped relayed=1 refused={} dropped={} -> PASS ::", rf, dr);
+        serial_println!(":: BUSREG-TAGID: probe=refused unnamed=dropped prefs=admitted path=refused spelled=dropped folder=admitted folderother=refused relayed=1 refused={} dropped={} -> PASS ::", rf, dr);
     } else {
         serial_println!(
-            ":: BUSREG-TAGID: probe={} unnamed={} prefs={} path={} spelled={} relayed={} refused={} dropped={} w={:#x}/{:#x} -> FAIL ::",
+            ":: BUSREG-TAGID: probe={} unnamed={} prefs={} path={} spelled={} folder={} folderother={} relayed={} refused={} dropped={} w={:#x}/{:#x} -> FAIL ::",
             if w & 1 != 0 { "refused" } else { "OPEN" },
             if w & 2 != 0 { "dropped" } else { "KEPT" },
             if w & 4 != 0 { "admitted" } else { "REFUSED" },
             if w & 8 != 0 { "refused" } else { "OPEN" },
-            if w & 16 != 0 { "dropped" } else { "KEPT" },
+            if w & 16 != 0 { "dropped" } else { "KEPT" }, if w & 32 != 0 { "admitted" } else { "REFUSED" }, if w & 64 != 0 { "refused" } else { "OPEN" }, // APPS-FOLDER-NS-LEG (B1183)
             (w >> 2) & 1, rf, dr, w, ALL
         );
     }
@@ -839,11 +839,11 @@ fn tagpath_id(row: usize, img: &str, buf: &mut [u8; crate::video::wm::MAX_TITLE]
     (!name.is_empty() && name.eq_ignore_ascii_case(crate::video::wm::program_name(img))).then_some(TagId::Unnamed)
 }
 
-/// Is the loaded `path` the image `img` (`/apps/<LEAF>`)? The directory byte-exact, the leaf any case.
+/// Is the loaded `path` the image `img` (`/apps/<LEAF>`)? The directory byte-exact, the leaf any case; APPS-FOLDER-NS (B1183): or the folder form `/apps/<name>/<LEAF>` (file tail).
 pub fn path_names(path: &str, img: &str) -> bool {
     const DIR: &str = "/apps/";
     match (path.strip_prefix(DIR), img.strip_prefix(DIR)) {
-        (Some(leaf), Some(want)) => !leaf.is_empty() && leaf.eq_ignore_ascii_case(want),
+        (Some(leaf), Some(want)) => !leaf.is_empty() && (leaf.eq_ignore_ascii_case(want) || appsfolder_names(leaf, want)), // APPS-FOLDER-NS-JUDGE (B1183): the folder form, one `/`, the folder the image's name any case (file tail)
         _ => false,
     }
 }
@@ -1269,4 +1269,63 @@ fn armlate_selftest(fx: &Fixture) {
             w, ALL
         );
     }
+}
+
+// =================================================================================================
+// APPS-FOLDER-NS (rmbp-ledger B1183) — TAIL-APPENDED. B1163's `path_names` (the ONE judge of TAG_IMAGE's holder,
+// `tagpath_id`, and of PREFSCAP's namespace owner, `prefs::prefscap_path` / `prefscap_early`) admitted only the flat
+// `/apps/<NAME>.ELF`. The house layout is moving to one folder per app (`/apps/<name>/<NAME>.ELF`, BP-storage-15; B679's
+// uninstall already removes it), so the judge now admits BOTH spellings for one name: after the byte-exact `/apps/`
+// prefix, either the leaf any case, or exactly `<dir>/<file>` — `file` the leaf any case and `dir` the image's program
+// name any case (`wm::program_name`, the ONE derivation: `PREFS.ELF` -> `PREFS`). Nothing deeper (`/apps/prefs/sub/…`),
+// no other folder (`/apps/other/PREFS.ELF`), no empty part. A folder launch arms `program_name` = the flat name, so
+// PREFSCAP's derived image `/apps/<p>.ELF` needs no change. Pure, takes no lock (it runs under wm's leaf locks).
+// Witness: `tests bandy3` → `:: BUSREG-TAGID: … folder=admitted folderother=refused … -> PASS ::`.
+// =================================================================================================
+
+/// `path_names`' folder spelling: is `leaf` (the path after `/apps/`) `<name>/<want>`, `<name>` = `want`'s program name?
+fn appsfolder_names(leaf: &str, want: &str) -> bool {
+    if want.is_empty() || want.contains('/') {
+        return false;
+    }
+    match leaf.split_once('/') {
+        Some((dir, file)) => {
+            let name = crate::video::wm::program_name(want);
+            !dir.is_empty() && !name.is_empty() && !file.contains('/') && file.eq_ignore_ascii_case(want) && dir.eq_ignore_ascii_case(name)
+        }
+        None => false,
+    }
+}
+
+/// `tagid_selftest`'s folder legs on the scratch fulfiller row `f` (wm owner `owner_f`), run after L5. Bit 0 (L6): armed
+/// `/apps/prefs/PREFS.ELF`, REGISTER 130 -> 0 and `fulfiller_row(130)` = `f`. Bit 1 (L7): armed `/apps/other/PREFS.ELF`,
+/// REGISTER 130 -> -EACCES with no holder; and the judge refuses `/apps/prefs/sub/PREFS.ELF`, admits `/apps/PREFS/prefs.elf`.
+/// Leaves `f` unregistered; the caller's cleanup forgets the name.
+fn appsfolder_legs(fx: &Fixture, f: usize, owner_f: u64) -> u32 {
+    let set = una_abi::BUS_VERB_R3PREF_SET;
+    let parse = |b: &[u8]| crate::bus::frame_parse(b).ok();
+    let mut buf = [0u8; 128];
+    let mut w = 0u32;
+    on_exit(fx.ops, f);
+    (fx.clear)(f);
+    // L6: the folder form registers and holds Principia's tag.
+    let _ = crate::video::wm::app_name_arm(owner_f, "/apps/prefs/PREFS.ELF");
+    let n = crate::bus::build_request(BUS_VERB_REGISTER, 69, &[set], &mut buf);
+    let admitted = (fx.send)(f, &buf[..n]) == 0 && matches!((fx.pop)(f).as_deref().and_then(parse), Some(h) if h.status == 0 && h.corr == 69);
+    let holder = matches!(fulfiller_row(set), Some((r, _)) if r == f);
+    if admitted && holder {
+        w |= 1 << 0;
+    }
+    on_exit(fx.ops, f);
+    (fx.clear)(f);
+    // L7: another folder holding the same leaf is refused at REGISTER; a deeper path is not the image.
+    let _ = crate::video::wm::app_name_arm(owner_f, "/apps/other/PREFS.ELF");
+    let n = crate::bus::build_request(BUS_VERB_REGISTER, 70, &[set], &mut buf);
+    let refused = (fx.send)(f, &buf[..n]) == 0 && matches!((fx.pop)(f).as_deref().and_then(parse), Some(h) if h.status == EACCES as i32 && h.corr == 70);
+    let img = "/apps/PREFS.ELF";
+    let judged = !path_names("/apps/prefs/sub/PREFS.ELF", img) && path_names("/apps/PREFS/prefs.elf", img);
+    if refused && lookup(fx.ops, set).is_none() && judged {
+        w |= 1 << 1;
+    }
+    w
 }
