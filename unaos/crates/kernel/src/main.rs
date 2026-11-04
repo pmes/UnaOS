@@ -1401,7 +1401,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     if framebuffer_addr != 0 {
         let online = unaos_kernel::arch::smp::online_secondaries();
         if let (Some(&render_cpu), Some(&input_cpu)) = (online.first(), online.last()) {
-            GUI_CHANNEL.init(); #[cfg(all(feature = "login", feature = "desktop_firmware"))] { unaos_kernel::video::crystal::login::kb_wake_hook(|| if !SCREEN_APP_ACTIVE.load(core::sync::atomic::Ordering::Relaxed) { gui_send(unaos_kernel::pal::Event::Timer) }); } // reserve waiter capacity on the BSP before the tasks block on it. KEYBOOT4 (B864): the login worker's outcome wakes the render task (status_tick's own Timer, its own gate; IRQ-safe, never waits on render). LINE-NEUTRAL
+            GUI_CHANNEL.init(); #[cfg(all(feature = "login", feature = "desktop_firmware"))] { unaos_kernel::video::crystal::login::kb_wake_hook(|| if !SCREEN_APP_ACTIVE.load(core::sync::atomic::Ordering::Relaxed) { gui_send(unaos_kernel::pal::Event::Timer) }); } unaos_kernel::arch::sched::publish_role_split(render_cpu, input_cpu); // reserve waiter capacity on the BSP before the tasks block on it. KEYBOOT4 (B864): the login worker's outcome wakes the render task (status_tick's own Timer, its own gate; IRQ-safe, never waits on render). LINE-NEUTRAL ARM-SPLIT-PUBLISH (B1141): the split published lib-side for `sched::worker_cpu_apart` before the panel tasks spawn, one `[sched] split` line. LINE-NEUTRAL append, code first.
             // INROUTE: `input_router_selftest` used to run HERE. It does not any more — see its own doc
             // comment and the call site up in the `start_aps` block. The claim this comment used to make
             // ("EVENT_QUEUE is empty and no user slot is live") was false at this point in the boot: the
@@ -4429,13 +4429,13 @@ fn pump_usb_into_gui() {
     // task parks the CONTROLLER, not a lock every masked FS writer spins on. A Busy claim means a
     // block-layer transaction is in flight; skip the pass — the next one is ~4 ms out.
     if let Ok(mut x) = unaos_kernel::drivers::xhci::claim() {
-        x.poll_events();
+        x.poll_events(); unaos_kernel::hidstall::phase_mark(unaos_kernel::hidstall::PH_POLL); // F39SHIMBEAMPAN (B1137) HID-PASS-PHASE: the HID decode ends here (hidstall.rs tail)
         x.service_storage();
         x.service_hubs();
         x.service_hid_setproto();
         x.service_ftdi();
         x.service_slot_disposal();
-        x.service_enum();
+        x.service_enum(); unaos_kernel::hidstall::phase_mark(unaos_kernel::hidstall::PH_SVC); // F39SHIMBEAMPAN (B1137) HID-PASS-PHASE: the six services end here; `pass_done` charges the rest to fwd
     }
     // BOT-CENSUS-PI: the one-shot BOT phase-desync census (`:: BOT: phase … result=SUMMARY ::`) plus
     // the USB topology dump. Its other two call sites ride the shared x86/virt BSP loop, which a Pi

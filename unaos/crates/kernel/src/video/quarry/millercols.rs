@@ -348,17 +348,17 @@ pub(super) fn press(m: &mut Model, sx: usize, sy: usize) -> Option<Act> {
 /// One arrow on the model: Up / Down within the focus pane, Left to the parent (the folder left selected), Right
 /// into the selected folder. `true` = consumed.
 pub(super) fn step(m: &mut Model, c: u8) -> bool {
-    if !matches!(c, 0x1C..=0x1F) || m.focus != Pane::List {
+    if !matches!(c, una_abi::KEY_RIGHT..=una_abi::KEY_UP) || m.focus != Pane::List {
         return false;
     }
     match c {
-        0x1F => m.list_sel = m.list_sel.saturating_sub(1),
-        0x1E => {
+        una_abi::KEY_UP => m.list_sel = m.list_sel.saturating_sub(1),
+        una_abi::KEY_DOWN => {
             if m.list_sel + 1 < m.list.len() {
                 m.list_sel += 1;
             }
         }
-        0x1D => {
+        una_abi::KEY_LEFT => {
             if m.cwd != "/" {
                 let (up, child) = (super::parent(&m.cwd), super::leaf(&m.cwd));
                 m.navigate(&up);
@@ -456,13 +456,13 @@ pub fn selftest() {
     let preview_ok = ink > 0;
     // The keys.
     let (sel0, len) = (m.list_sel, m.list.len());
-    step(&mut m, 0x1E);
+    step(&mut m, una_abi::KEY_DOWN);
     let down_ok = m.list_sel == if sel0 + 1 < len { sel0 + 1 } else { sel0 };
-    step(&mut m, 0x1F);
+    step(&mut m, una_abi::KEY_UP);
     let up_ok = m.list_sel == sel0;
-    step(&mut m, 0x1D);
+    step(&mut m, una_abi::KEY_LEFT);
     let left_ok = m.cwd == super::parent(dir) && m.list.get(m.list_sel).map(|e| e.name == super::leaf(dir)).unwrap_or(false);
-    step(&mut m, 0x1C);
+    step(&mut m, una_abi::KEY_RIGHT);
     let right_ok = m.cwd == dir;
     let keys_ok = down_ok && up_ok && left_ok && right_ok;
     // A press on the root pane's selected row.

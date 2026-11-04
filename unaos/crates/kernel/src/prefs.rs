@@ -692,7 +692,7 @@ pub fn set_sys(k: &str, v: PrefValue) {
 fn changed(ns: &str, k: &str, a: &prefs_core::schema::Applied) {
     let v = &a.value;
     serial_println!("[prefs] changed {}.{}", ns, k); #[cfg(any(feature = "aarch64_el0", target_arch = "x86_64", all(target_arch = "aarch64", feature = "desktop_firmware")))] crate::prefs_client::on_changed(ns, k, Some(a)); // SETTINGSBUS (B337): the verb-19 frame to the kernel's subscribers. PREFSKERNEL (B345): it carries `clamped`. ARMNOEL0: widened with the prefs_client cfg (lib.rs).
-    mirror_attr(ns, k, v);
+    mirror_attr(ns, k, v); machine_mirror(ns, k, Some(v)); // VEIL-REDUCE-BOOT-STORE (rmbp-ledger B1140): a machine key the session committed is copied to the no-session store (file tail). LINE-NEUTRAL append, code first
 }
 
 /// ATTRSURF hook: stamp `system.*` keys as attributes on the preferences file (so `query` finds them on
@@ -1674,7 +1674,7 @@ fn post_changes(changes: &[(String, String, Option<prefs_core::schema::Applied>)
     for (ns, k, a) in changes {
         #[cfg(any(feature = "aarch64_el0", target_arch = "x86_64", all(target_arch = "aarch64", feature = "desktop_firmware")))]
         crate::prefs_client::on_changed(ns, k, a.as_ref()); // the `changed()` cfg: no bus on this build, no frame
-        let _ = (ns, k, a);
+        let _ = (ns, k, a); machine_mirror(ns, k, a.as_ref().map(|x| &x.value)); // VEIL-REDUCE-BOOT-STORE (rmbp-ledger B1140): a session switch catches the machine copy up (file tail). LINE-NEUTRAL append, code first
     }
     changes.len()
 }
@@ -1816,4 +1816,60 @@ pub fn reload_session(old: &PrefTree) -> usize {
     ensure_loaded();
     load();
     reload_post(old, t0)
+}
+
+// ── VEIL-REDUCE-BOOT-STORE (rmbp-ledger B1140, BP-storage-11, BP-video-11) — TAIL-APPENDED ─────────────────────────────
+// The boot login screen has no session user, so its GET (`crystal::login_reduce_load` -> the bus -> [`ensure_loaded`]) reads
+// the NO-SESSION store, `/settings/<domain>` ([`path`] with an empty home). That store is the MACHINE copy: while a session
+// holds the store, every accepted change of a key in [`MACHINE_KEYS`] ([`changed`]) and every session switch's post
+// ([`post_changes`]) is mirrored into `/settings/<domain>` by [`machine_mirror`] — read, the one key set, rendered by the
+// same `prefs_core::files::render`, the render parsed, written by the same swap (`put_file_atomic`), under SAVE_LOCK; the
+// session TREE is never taken. No session (or no `login`: the store IS `/settings`) = nothing to mirror. A machine file
+// prefs_core refuses is never overwritten. Wire: `[prefs] machine settings/<d> system.<k>=<v> wrote=<0|1>`.
+
+/// The keys the boot screen reads before any login (the machine copy's whole content from the session side).
+const MACHINE_KEYS: [&str; 1] = [key::A11Y_REDUCE_TRANSPARENCY];
+
+/// Mirror the session's committed `ns`/`k` = `v` into the no-session store's domain file (see the block above).
+fn machine_mirror(ns: &str, k: &str, v: Option<&PrefValue>) {
+    let Some(v) = v else { return };
+    if ns != NS || !MACHINE_KEYS.contains(&k) {
+        return;
+    }
+    match home() {
+        Some(h) if !h.is_empty() => {}
+        _ => return,
+    }
+    let d = prefs_core::files::domain_of(ns, k);
+    let dir = alloc::format!("/{}", prefs_core::files::DIR);
+    let p = alloc::format!("{}/{}", dir, d);
+    let _g = SAVE_LOCK.lock();
+    let mut t = match read_all(&p) {
+        Some(b) => match parse_said(&p, &b) {
+            Ok(t) => t,
+            Err(_) => {
+                serial_println!("[prefs] machine settings/{} refused: not mirrored", d);
+                return;
+            }
+        },
+        None => PrefTree::new(),
+    };
+    if t.get(ns, k) == Some(v) {
+        serial_println!("[prefs] machine settings/{} {}.{}={} wrote=0", d, ns, k, v);
+        return;
+    }
+    if t.set(ns, k, v.clone()).is_err() {
+        return;
+    }
+    let text = prefs_core::files::render(&d, &t, &now_iso(), "the session store's machine mirror (VEIL-REDUCE-BOOT-STORE)", &doc_of);
+    match PrefTree::parse(&text) {
+        Ok(r) if r == t || r.to_toml() == t.to_toml() => {}
+        _ => return,
+    }
+    let mt = store_mt();
+    if mt.stat(&dir).is_err() {
+        let _ = mt.create(&dir, crate::fs::vfs::NodeKind::Dir, crate::fs::vfs::KERNEL_PRINCIPAL);
+    }
+    let ok = mt.put_file_atomic(&p, text.as_bytes(), crate::fs::vfs::KERNEL_PRINCIPAL).is_ok();
+    serial_println!("[prefs] machine settings/{} {}.{}={} wrote={}", d, ns, k, v, ok as u8);
 }

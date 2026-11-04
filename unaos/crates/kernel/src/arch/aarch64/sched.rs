@@ -12219,3 +12219,43 @@ fn hid_wait_tick(cpu: usize, raw: *const Task) {
         (t.name, t.id)
     });
 }
+
+// ── JOBS-INLINE-ARM / CLOSE-DRAIN-ARM (rmbp-ledger B1136) — FILE-TAIL append. aarch64 had no worker placement: the
+// `jobs-scan` worker ran inline on the press and the session press's owed login-row close had no runner (B1129). ONE
+// answer for both callers (`fs/jobs.rs` `worker_place`, `video/wm.rs` `close_owed_host`): the lowest online secondary
+// that is neither the CALLER's core (both callers run on the press, i.e. the render task; the aarch64 render core is not
+// published lib-side — ARM-SPLIT-PUBLISH owed) nor the hid pump's (`hidstall::pump_cpu`, B1124). Measured at 853d303c4:
+// the Pi and QEMU raspi4b answer c2 (render c1, input/pump c3); the Orin answers c1 (desktop on c0, its five EL2 APs
+// dispatch kernel tasks through `secondary_run`); two APs answer `None` (the caller works inline, as before). The BSP is
+// never chosen (Pi: boot duties, pinned work never lands there). Deterministic, like x86's `smp::worker_cpu(0)`.
+
+/// JOBS-INLINE-ARM (B1136): the core for one-shot work off the press — `None` when no secondary is free of the render
+/// core, the input core and the hid pump's. ARM-SPLIT-PUBLISH (B1141): the render and input cores are the ROLES main.rs's
+/// split published ([`role_split`]); before a publish (the Orin's BSP-terminus desktop, a boot that took no split) the
+/// caller's core stands in for render, as B1136 had it. Read-only atomics; no lock.
+pub fn worker_cpu_apart() -> Option<usize> {
+    let (render, input) = role_split().unwrap_or((percpu::this_cpu().cpu_index as usize, usize::MAX));
+    let pump = crate::hidstall::pump_cpu();
+    (1..NUM_CPUS).find(|&c| c != render && c != input && c != pump && ONLINE_MASK[c].load(Ordering::Acquire))
+}
+
+// ── ARM-SPLIT-PUBLISH (rmbp-ledger B1141) — FILE-TAIL append. main.rs's aarch64 split (render on `online.first()`, input
+// on `online.last()`) was never published lib-side, so [`worker_cpu_apart`] excluded the CALLER's core: a caller off the
+// render task (the login's prefs load, a worker) could be handed the render core. ONE word, x86's `smp::SPLIT` shape
+// (render << 32 | input; a reader never sees half a pair), stored once by `publish_role_split` before the panel tasks are
+// spawned. Wire: `[sched] split render=c<r> input=c<i>` once per boot that takes the split (Pi metal, QEMU raspi4b).
+
+/// ARM-SPLIT-PUBLISH: the published render/input pair; `u64::MAX` = unpublished.
+static ROLE_SPLIT: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// ARM-SPLIT-PUBLISH: main.rs's aarch64 split, once, before the `render` / `input` spawns.
+pub fn publish_role_split(render: usize, input: usize) {
+    ROLE_SPLIT.store(((render as u64) << 32) | (input as u64 & 0xffff_ffff), Ordering::Release);
+    serial_println!("[sched] split render=c{} input=c{}", render, input);
+}
+
+/// ARM-SPLIT-PUBLISH: `(render, input)` once published, else `None`. ONE load.
+pub fn role_split() -> Option<(usize, usize)> {
+    let v = ROLE_SPLIT.load(Ordering::Acquire);
+    (v != u64::MAX).then(|| ((v >> 32) as usize, (v & 0xffff_ffff) as usize))
+}

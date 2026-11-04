@@ -434,8 +434,8 @@ pub fn key_route(ev: crate::pal::Event) -> bool {
     match ev {
         crate::pal::Event::Wheel(d) => scroll_by(-(d as isize) * 3),
         crate::pal::Event::Key(c) => match c {
-            0x1F => scroll_by(-1),
-            0x1E => scroll_by(1),
+            una_abi::KEY_UP => scroll_by(-1),
+            una_abi::KEY_DOWN => scroll_by(1),
             b' ' => scroll_by(page),
             b'b' | b'B' => scroll_by(-page),
             0x09 => {

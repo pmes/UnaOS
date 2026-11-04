@@ -368,8 +368,8 @@ pub fn key_route(ev: crate::pal::Event) -> bool {
         crate::pal::Event::Key(c) => {
             let page = vis.saturating_sub(1).max(1) as isize;
             match c {
-                0x1F => scroll_to(top - 1),
-                0x1E => scroll_to(top + 1),
+                una_abi::KEY_UP => scroll_to(top - 1),
+                una_abi::KEY_DOWN => scroll_to(top + 1),
                 // PageUp/PageDown have no decoded byte on either HID path yet: space/`b` page.
                 b' ' => scroll_to(top + page),
                 b'b' | b'B' => scroll_to(top - page),

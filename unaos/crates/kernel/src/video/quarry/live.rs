@@ -2180,11 +2180,11 @@ pub fn key_route(ev: crate::pal::Event) -> bool {
         };
         let _door = livedir::Door::raise(); match c { // NAVREAD (B834): Enter / Backspace navigations through the Door (lowered at the block's end, still under MODEL)
             // Up / Down — move the selection in the focused pane; `settle` does the following.
-            0x1F => match m.focus {
+            una_abi::KEY_UP => match m.focus {
                 Pane::Tree => m.tree_sel = m.tree_sel.saturating_sub(1),
                 Pane::List => m.list_sel = m.list_sel.saturating_sub(1),
             },
-            0x1E => match m.focus {
+            una_abi::KEY_DOWN => match m.focus {
                 Pane::Tree => {
                     if m.tree_sel + 1 < m.tree.len() {
                         m.tree_sel += 1;
@@ -2198,7 +2198,7 @@ pub fn key_route(ev: crate::pal::Event) -> bool {
             },
             // Left — in the list, hand focus back to the tree; in the tree, collapse, or step to the
             // parent row when this one is already closed. The Finder gesture, on a keyboard.
-            0x1D => match m.focus {
+            una_abi::KEY_LEFT => match m.focus {
                 Pane::List => m.focus = Pane::Tree,
                 Pane::Tree => {
                     if m.tree.get(m.tree_sel).map(|r| r.expanded).unwrap_or(false) {
@@ -2215,7 +2215,7 @@ pub fn key_route(ev: crate::pal::Event) -> bool {
                 }
             },
             // Right — in the tree, expand; a second press on an open row crosses into the list.
-            0x1C => match m.focus {
+            una_abi::KEY_RIGHT => match m.focus {
                 Pane::Tree => {
                     if m.tree.get(m.tree_sel).map(|r| r.expanded).unwrap_or(false) {
                         m.focus = Pane::List;
@@ -3837,7 +3837,7 @@ pub fn door_selftest() {
         let win = WIN.load(Ordering::Relaxed);
         let leg_open = on_glass() && wm::focus_asid() == OWNER;
         // Leg 2 — an ARROW, through the door, while Quarry is FOCUSED.
-        let arrow = crate::arch::x86_64::syscall::wc_route_event(crate::pal::Event::Key(0x1E));
+        let arrow = crate::arch::x86_64::syscall::wc_route_event(crate::pal::Event::Key(una_abi::KEY_DOWN));
         let leg_arrow = leg_open && matches!(arrow, crate::pal::Event::Unknown);
         // Leg 3 (SO9) — focus to the CONSOLE, Quarry still on the glass, and the shell's two
         // indispensable keys must come back UNCHANGED. `KERNEL_OWNER_CONSOLE` and not the shell slot
@@ -3860,7 +3860,7 @@ pub fn door_selftest() {
             && wm::info(win).is_some();
         // Leg 5 — the control: a CLOSED Quarry consumes nothing.
         close();
-        let leg_shut = !key_route(crate::pal::Event::Key(0x1E));
+        let leg_shut = !key_route(crate::pal::Event::Key(una_abi::KEY_DOWN));
         // Restore: if a red leg left the row standing, take it back rather than leaving a file
         // manager on the operator's desktop — and give the focus owner back whatever held it.
         if wm::info(win).is_some() {

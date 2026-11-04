@@ -3070,7 +3070,7 @@ pub mod splitread {
         root_gen: u64,
         bound: Bound,
         chunks: ::unafs::ExtentList,
-        size: u64,
+        size: u64, hold: super::execread::PlanHold, // F39UNAFSEXECMEASURE (B1138): the plan hold's fills / warm, for `[unafs] exec read` (LINE-NEUTRAL)
     }
 
     /// Read `len` bytes at `offset` of the file at absolute unafs `path`: the plan and the check hold
@@ -3104,7 +3104,7 @@ pub mod splitread {
     /// One split try (the B670 body): plan under MOUNT, the data blocks off it, the check under MOUNT.
     fn try_split(path: &str, offset: u64, len: u64, st: &mut super::lockhold::Stats, data_us: &mut u64) -> Try {
         let planned = with_unafs_read(|fs| {
-            let h0 = crate::hidstall::now_us();
+            let h0 = crate::hidstall::now_us(); let pw = super::execread::PlanHold::open(); // F39UNAFSEXECMEASURE (B1138): the two existing counters snapshotted inside the plan hold (LINE-NEUTRAL)
             let r = (|| -> Result<Option<Plan>, ReadMiss> {
                 let id = fs.resolve_path(path).map_err(|_| ReadMiss::NoSuchPath)?;
                 let ino = fs.read_inode(id).map_err(|_| ReadMiss::NoSuchPath)?;
@@ -3112,7 +3112,7 @@ pub mod splitread {
                     return Err(ReadMiss::IsADirectory);
                 }
                 if fs.key_slot().is_some_and(|k| k.cipher == ::unafs::keyslot::CIPHER_AES256_XTS) { return Ok(None); } let root_gen = fs.root_generation(); // crawl B 1: a CIPHERED root's raw sectors are XTS ciphertext — the one-hold read goes through the mount's VolumeCipher (LINE-NEUTRAL fold, code first)
-                Ok(BOUND.lock().as_ref().copied().map(|bound| Plan { root_gen, bound, chunks: ino.chunks, size: ino.size }))
+                Ok(BOUND.lock().as_ref().copied().map(|bound| Plan { root_gen, bound, chunks: ino.chunks, size: ino.size, hold: pw.close() }))
             })();
             (r, crate::hidstall::now_us().saturating_sub(h0))
         });
@@ -3146,7 +3146,7 @@ pub mod splitread {
     /// fetches batched into contiguous runs and issued with MOUNT released. `None` = take the one-hold
     /// path (it reproduces the crate's own refusal, if there is one).
     fn read_extents(p: &Plan, offset: u64, len: u64) -> Option<Vec<u8>> {
-        let bs = ::unafs::BLOCK_SIZE; let mut er = super::execread::Runs::start(); // F39UNAFSLOCKDEATHPATH (B1131): the runs' landing stamps for `[unafs] exec read` (`execread` at the tail; LINE-NEUTRAL)
+        let bs = ::unafs::BLOCK_SIZE; let mut er = super::execread::Runs::start(p.hold); // F39UNAFSLOCKDEATHPATH (B1131): the runs' landing stamps for `[unafs] exec read` (`execread` at the tail; F39UNAFSEXECMEASURE B1138: with the plan hold's fills / warm; LINE-NEUTRAL)
         if p.size > p.bound.span.block_count.saturating_mul(bs) {
             return None;
         }
@@ -3354,7 +3354,7 @@ pub mod splitread {
             fallbacks,
             if same { "yes" } else { "no" },
             if done { "yes" } else { "no" }, takes
-        );
+        ); super::lockcensus::death_leg(); // F39UNAFSWARMSINCEBOOT (rmbp-ledger B1143): the overflow path reached by a REAL guard death, after the verdict (`lockcensus` tail; LINE-NEUTRAL, before this comment)
     }
 }
 
@@ -5971,6 +5971,8 @@ pub mod lockcensus {
     static RA_FULL: AtomicU64 = AtomicU64::new(0);
     /// F39UNAFSHOLDRELEASE (B1120): block reads `rawrote::warm_serve` answered from a commit's own written bytes (no fill).
     static WARM_HITS: AtomicU64 = AtomicU64::new(0);
+    /// F39UNAFSWARMSINCEBOOT (rmbp-ledger B1143): the same hits since boot (never reset; `warm_hits()`), so a delta across a census is exact.
+    static WARM_TOTAL: AtomicU64 = AtomicU64::new(0);
 
     /// F39UNAFSLOCKONE (rmbp-ledger B1125): every MOUNT take closed through a `Take` since boot (any span; `takes()`).
     static TAKES: AtomicU64 = AtomicU64::new(0);
@@ -6150,6 +6152,13 @@ pub mod lockcensus {
     #[inline(always)]
     pub fn warm_hit() {
         WARM_HITS.fetch_add(1, Ordering::Relaxed);
+        WARM_TOTAL.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// F39UNAFSEXECMEASURE (rmbp-ledger B1138): the `WARM` hits for `execread::PlanHold` (a relaxed load, never a swap).
+    /// F39UNAFSWARMSINCEBOOT (B1143): since boot (`WARM_TOTAL`, the shape of `tx_io().0`); the ra line keeps the per-census count.
+    pub fn warm_hits() -> u64 {
+        WARM_TOTAL.load(Ordering::Relaxed)
     }
 
     /// hidstall.rs:439 fold — the desktop's minute roll.
@@ -6184,6 +6193,58 @@ pub mod lockcensus {
             why, syncs, slots.saturating_sub(dropped), dropped, full, warm
         );
     }
+
+    // ── F39UNAFSWARMSINCEBOOT (rmbp-ledger B1143): `tests unafslock`'s death leg — UNAFS-LOCK-DEATHPATH's witness. A 16 KiB
+    // `unafslock-death` task recurses into its guard page (`stackguard::scratch_deep`) INSIDE a `with_unafs` closure, so it
+    // dies holding MOUNT with its `lockowner::own(UNAFS)` recorded: `overflow_exit` -> `sync::release_task` ->
+    // `lockowner::release_dead` -> `lockowner_release` (:2880 `death()`). A REAL death, no stand-in call. The mount it took
+    // is leaked and poisoned and re-bound by the next `with_unafs` (STACKGUARD3 / POISON2, as `poison_leg` pays). Its
+    // attempt's `Take` never drops (the dead attempt is not in `takes=`). Runs after the `:: UNAFSLOCK:` verdict. ──
+
+    /// The death task's stack (sync.rs `GUARD_STACK`'s figure).
+    const DEATH_STACK: usize = 16 * 1024;
+    static DEATH_TOOK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    static DEATH_RET: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+    /// `unafslock-death`: take MOUNT through `with_unafs`, then the guard leg's recursion inside the hold.
+    fn death_task(_: usize) {
+        let r = with_unafs(|_| {
+            DEATH_TOOK.store(true, Ordering::Release);
+            crate::arch::stackguard::scratch_deep(0)
+        });
+        DEATH_RET.store(true, Ordering::Release);
+        serial_println!("[unafslock] death task returned ok={} (the guard did not fire)", r.is_ok());
+    }
+
+    /// `splitread::selftest` :3357 fold — the death leg: `[unafslock] death probe=<word> deaths=<d0>-><d1> rebind=<0|1>`,
+    /// then the census (`say("death")`: its holds line carries `deaths=`).
+    pub fn death_leg() {
+        if crate::arch::sched::current_id().is_none() || crate::arch::irqs_masked() {
+            serial_println!("[unafslock] death probe=skip(no-task) deaths={}", deaths());
+            return;
+        }
+        DEATH_TOOK.store(false, Ordering::Release);
+        DEATH_RET.store(false, Ordering::Release);
+        let d0 = deaths();
+        crate::arch::sched::spawn_stack("unafslock-death", death_task, 0, crate::arch::sched::CPU_AUTO, crate::arch::sched::PRIO_NORMAL, DEATH_STACK);
+        let t0 = crate::arch::ms();
+        while deaths() <= d0 && !DEATH_RET.load(Ordering::Acquire) && crate::arch::ms().saturating_sub(t0) <= 1000 {
+            crate::arch::sched::sleep_ms(1);
+        }
+        let d1 = deaths();
+        let word = if d1 > d0 {
+            "ok"
+        } else if DEATH_RET.load(Ordering::Acquire) {
+            "returned"
+        } else if DEATH_TOOK.load(Ordering::Acquire) {
+            "not-counted"
+        } else {
+            "no-task"
+        };
+        let rebind = with_unafs(|_| ()).is_ok();
+        serial_println!("[unafslock] death probe={} deaths={}->{} rebind={}", word, d0, d1, rebind as u8);
+        say("death");
+    }
 }
 
 // ── F39UNAFSLOCKDEATHPATH (rmbp-ledger B1131, BP-storage-8) — the exec read's card timing. UNAFS-READ-AHEAD measured: the
@@ -6193,22 +6254,63 @@ pub mod lockcensus {
 // line that sizes what streaming could overlap. `splitread::read_extents` (three LINE-NEUTRAL folds) stamps each run as it
 // lands, MOUNT released; an exec image's whole-file read (offset 0, ELF magic, two runs or more) prints
 // `[unafs] exec read runs=<n> bytes=<n> first_us=<n> last_us=<n>` (from the read's start). Owed: UNAFS-EXEC-STREAM.
+// F39UNAFSEXECMEASURE (rmbp-ledger B1138): the line gains `runs_us=<a,b,...>` (the FIRST eight runs' landing offsets, us from
+// the read's start: the head of the read, where the gap between runs shows card or split) and the plan hold's
+// `fills=<n> warm=<n>` (`PlanHold`: `tx_io().0` and `lockcensus::warm_hits()`, the two counters the census lines print,
+// snapshotted inside `try_split`'s plan hold at :3107 and closed to deltas at :3115; it rides `Plan` into :3149). No new
+// counter, no static, no lock: a census `say` inside the hold swaps `WARM_HITS` to 0, so `warm=` can only undercount.
+// F39UNAFSWARMSINCEBOOT (rmbp-ledger B1143): `warm_hits()` now reads `WARM_TOTAL` (since boot, beside the per-census
+// `WARM_HITS`), so `warm=` is exact across a census, as `fills=` already was (`TX_FILLS` is never reset).
+// Owed: UNAFS-EXEC-STREAM, UNAFS-WARM-SIZE (the bench sizes WARM from `warm=` beside `fills=`).
 #[cfg(all(target_arch = "x86_64", feature = "wc"))]
 /// CHARTER: fs-core — the split data road's per-run landing stamps for an exec image read (a stack local, no lock, no static).
 pub mod execread {
-    /// One `read_extents` call's runs: the start, the runs landed, the first and the last landing (us from the start).
+    use core::fmt::Write as _;
+
+    /// Landing offsets kept per read (the first ones).
+    const AT_MAX: usize = 8;
+
+    /// F39UNAFSEXECMEASURE (B1138): the plan hold's window fills and `WARM` hits. `open` snapshots the two existing
+    /// counters inside the hold; `close` returns the deltas (relaxed loads, no lock).
+    #[derive(Clone, Copy)]
+    pub struct PlanHold {
+        fills: u64,
+        warm: u64,
+    }
+
+    impl PlanHold {
+        /// :3107 fold — inside the plan hold, right after its `h0`.
+        #[inline(always)]
+        pub fn open() -> Self {
+            PlanHold { fills: super::tx_io().0, warm: super::lockcensus::warm_hits() }
+        }
+
+        /// :3115 fold — the hold's plan is built: the deltas since `open` (both since-boot totals: F39UNAFSWARMSINCEBOOT B1143).
+        #[inline(always)]
+        pub fn close(&self) -> Self {
+            PlanHold {
+                fills: super::tx_io().0.wrapping_sub(self.fills),
+                warm: super::lockcensus::warm_hits().wrapping_sub(self.warm),
+            }
+        }
+    }
+
+    /// One `read_extents` call's runs: the start, the runs landed, the first and the last landing (us from the start),
+    /// the first `AT_MAX` landings, and the plan hold that planned it.
     pub struct Runs {
         t0: u64,
         n: u32,
         first_us: u64,
         last_us: u64,
+        at: [u32; AT_MAX],
+        hold: PlanHold,
     }
 
     impl Runs {
-        /// :3149 fold — the read starts.
+        /// :3149 fold — the read starts (`hold` = the plan hold's deltas, F39UNAFSEXECMEASURE).
         #[inline(always)]
-        pub fn start() -> Self {
-            Runs { t0: crate::hidstall::now_us(), n: 0, first_us: 0, last_us: 0 }
+        pub fn start(hold: PlanHold) -> Self {
+            Runs { t0: crate::hidstall::now_us(), n: 0, first_us: 0, last_us: 0, at: [0; AT_MAX], hold }
         }
 
         /// :3197 fold — one run landed (its `read_run` returned true).
@@ -6217,6 +6319,9 @@ pub mod execread {
             let t = crate::hidstall::now_us().saturating_sub(self.t0);
             if self.n == 0 {
                 self.first_us = t;
+            }
+            if (self.n as usize) < AT_MAX {
+                self.at[self.n as usize] = t.min(u32::MAX as u64) as u32;
             }
             self.last_us = t;
             self.n = self.n.saturating_add(1);
@@ -6232,8 +6337,16 @@ pub mod execread {
         }
     }
 
+    /// The line, built outside every lock (MOUNT is released in `read_extents`).
     #[inline(never)]
     fn say(r: &Runs, bytes: usize) {
-        serial_println!("[unafs] exec read runs={} bytes={} first_us={} last_us={}", r.n, bytes, r.first_us, r.last_us);
+        let mut at = alloc::string::String::new();
+        for (i, us) in r.at.iter().take((r.n as usize).min(AT_MAX)).enumerate() {
+            let _ = if i == 0 { write!(at, "{}", us) } else { write!(at, ",{}", us) };
+        }
+        serial_println!(
+            "[unafs] exec read runs={} bytes={} first_us={} last_us={} runs_us={} fills={} warm={}",
+            r.n, bytes, r.first_us, r.last_us, at, r.hold.fills, r.hold.warm
+        );
     }
 }
