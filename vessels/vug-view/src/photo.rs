@@ -560,7 +560,7 @@ pub fn hover(view: &mut View, was: (f64, f64), x: f64, y: f64) -> bool {
 pub fn overlay(view: &View, fr: &mut Raster) {
     let Some(ph) = view.photo.as_ref() else { return };
     for g in glyphs(view) {
-        let col = rgba(g.colour);
+        let col = rgba(g.colour); paint_leader(view, fr, &g); // VUGINTENTSETFACELISTEDOVERLAP (SR601): a pushed glyph's leader, INK, under its cross and text
         let (x, y) = (g.at.0 - 6.0, g.at.1 + 14.0);
         raster::line(fr, (x - 3.0, y - 3.0), (x + 3.0, y + 3.0), col);
         raster::line(fr, (x - 3.0, y + 3.0), (x + 3.0, y - 3.0), col);
@@ -1507,14 +1507,24 @@ fn overlaps(a: (f32, f32, f32, f32), b: (f32, f32, f32, f32)) -> bool {
 /// SR596's rule, ONE pass over [`glyphs`]' output in offer (= anchor) order: an anchored glyph (its statement's
 /// [`anchor`] on screen, the predicate `glyphs` placed it by) whose [`glyph_rect`] overlaps an earlier anchored glyph's
 /// moves down to that glyph's foot (by the overlap), again while it overlaps one, its card re-paged at the new height
-/// from the head offer's page ([`paged`]). x never moves; a listed glyph keeps SR589's column. Nothing is stored.
+/// from the head offer's page ([`paged`]). A listed glyph keeps SR589's column. Nothing is stored.
+/// VUGINTENTSETFACELISTEDOVERLAP (SR601): first, an anchored glyph overlapping the listed column ([`listed_column`])
+/// moves RIGHT to the column's edge + 6 px (the only case x moves, at most once: x never comes back); both checks re-run
+/// after either push, so a right-pushed glyph still goes down under an earlier anchored one.
 fn unstack(view: &View, ph: &Photo, face: &SketchFace, mut out: Vec<ProposalGlyph>) -> Vec<ProposalGlyph> {
+    let col = listed_column(view, ph, face, &out); // VUGINTENTSETFACELISTEDOVERLAP (SR601): the listed column's strip
     let mut placed: Vec<(f32, f32, f32, f32)> = Vec::new();
     for g in &mut out {
         if anchor(face, ph.offers[g.offer].proposal.stmt.trim()).and_then(|q| face.to_screen(view, q)).is_none() {
             continue;
         }
-        while let Some(r) = { let me = glyph_rect(g); placed.iter().copied().find(|r| overlaps(*r, me)) } {
+        loop {
+            let me = glyph_rect(g);
+            if let Some(c) = col.filter(|c| overlaps(*c, me)) {
+                g.at.0 = c.0 + c.2 + 6.0; // VUGINTENTSETFACELISTEDOVERLAP (SR601): right to the column's edge + 6, y kept
+                continue;
+            }
+            let Some(r) = placed.iter().copied().find(|r| overlaps(*r, me)) else { break };
             g.at.1 = r.1 + r.3;
             if let Some(c) = g.card.as_mut() {
                 c.first = ph.offers[g.offer].page;
@@ -1605,4 +1615,37 @@ pub fn line_command(view: &mut View, line: &str) -> Option<Result<bool, String>>
         Some(dir) => command_in(view, &dir, line),
         None => command(view, line),
     })
+}
+
+// ---- VUGINTENTSETFACELISTEDOVERLAP (SR601): the listed column pushes an anchored glyph right; its leader (named tail block) ----
+
+/// The listed column as one strip: the bounding rect of every LISTED glyph's [`glyph_rect`] in [`glyphs`]' output (x 6
+/// to the widest listed row's right edge, y from the first listed head to the running row's foot SR589 reserves; the
+/// listed rects tile it). None with nothing listed.
+fn listed_column(view: &View, ph: &Photo, face: &SketchFace, out: &[ProposalGlyph]) -> Option<(f32, f32, f32, f32)> {
+    let listed = out.iter().filter(|g| anchor(face, ph.offers[g.offer].proposal.stmt.trim()).and_then(|q| face.to_screen(view, q)).is_none());
+    let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+    for g in listed {
+        let r = glyph_rect(g);
+        (x0, y0, x1, y1) = (x0.min(r.0), y0.min(r.1), x1.max(r.0 + r.2), y1.max(r.1 + r.3));
+    }
+    (x0 <= x1).then_some((x0, y0, x1 - x0, y1 - y0))
+}
+
+/// A pushed anchored glyph's leader: from its cross (where [`overlay`] paints it, (at.0 - 6, at.1 + 14)) to its
+/// statement's [`anchor`] on screen. None for a listed glyph and for one the push did not move (the cross within half a
+/// pixel of its anchor). The one geometry the painter ([`paint_leader`]) and the tests read.
+pub fn leader(view: &View, g: &ProposalGlyph) -> Option<((f32, f32), (f32, f32))> {
+    let (face, ph) = (view.design.face.as_ref()?, view.photo.as_ref()?);
+    let (ax, ay) = anchor(face, ph.offers.get(g.offer)?.proposal.stmt.trim()).and_then(|q| face.to_screen(view, q))?;
+    let (cross, at) = ((g.at.0 - 6.0, g.at.1 + 14.0), (ax as f32, ay as f32));
+    ((cross.0 - at.0).abs() > 0.5 || (cross.1 - at.1).abs() > 0.5).then_some((cross, at))
+}
+
+/// The leader painted through the raster's line painter in INK, before the glyph's cross and text (so under its own
+/// glyph, over the earlier glyphs it crosses).
+fn paint_leader(view: &View, fr: &mut Raster, g: &ProposalGlyph) {
+    if let Some((a, b)) = leader(view, g) {
+        raster::line(fr, a, b, rgba(INK));
+    }
 }

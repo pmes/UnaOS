@@ -392,6 +392,7 @@ fn save_as_edits_at_its_caret_and_enter_saves_the_edited_name() {
     assert!(typed(&mut vw, "w") && key(&mut vw, "Left"));
     assert!(typed(&mut vw, "e"), "a char inserts at the caret");
     assert_eq!(save_as_text(&vw), ("vugfacesaveascaret-new".to_string(), 21));
+    assert!(typed(&mut vw, "x") && key(&mut vw, "\u{f702}") && key(&mut vw, "\u{f728}") && save_as_text(&vw) == ("vugfacesaveascaret-new".to_string(), 21), "VUGFACEFIELDKEYS (SR599): the Cocoa Delete reaches Delete's arm, never typed: {:?}", save_as_text(&vw));
     println!("save as caret {:?}", save_as_text(&vw));
     assert!(key(&mut vw, "Return"), "Enter saves the edited name");
     assert!(!save_as_open(&vw), "{:?}", vw.view.design.journal.disk);

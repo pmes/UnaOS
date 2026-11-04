@@ -216,9 +216,9 @@ fn circles_tangent_diameter_point_on_circle_and_line_distances() {
 fn bad_references_are_refused_by_name() {
     let mut sk = Sketch::new();
     let p = sk.add_point(0.0, 0.0);
-    assert_eq!(sk.add_line(p, EntityId(9)), Err(BadRef(EntityId(9))));
-    assert_eq!(sk.add(Constraint::Horizontal(p)), Err(BadRef(p)));
-    assert_eq!(sk.add(Constraint::Radius(p, 1.0)), Err(BadRef(p)));
+    assert_eq!(sk.add_line(p, EntityId(9)), Err(BadRef { id: EntityId(9), kind: RefKind::Point }));
+    assert_eq!(sk.add(Constraint::Horizontal(p)), Err(BadRef { id: p, kind: RefKind::Line }));
+    assert_eq!(sk.add(Constraint::Radius(p, 1.0)), Err(BadRef { id: p, kind: RefKind::Round }));
 }
 
 #[test]
@@ -236,4 +236,17 @@ fn degenerate_zero_length_line_does_not_panic() {
     let _ = solve(&mut sk, T);
     let _ = dof(&sk);
     let _ = profiles(&sk, T);
+}
+
+// VUGSKETCHBADREFKIND (LEDGER SR604): the refusal names the kind its slot wanted, at the one check site per slot.
+#[test]
+fn a_circle_in_a_point_slot_is_refused_as_wanting_a_point() {
+    let mut sk = Sketch::new();
+    let p = sk.add_point(0.0, 0.0);
+    let c = sk.add_point(5.0, 0.0);
+    let circle = sk.add_circle(c, 2.0).unwrap();
+    let got = sk.add(Constraint::Coincident(PointRef::Point(circle), PointRef::Point(p)));
+    assert_eq!(got, Err(BadRef { id: circle, kind: RefKind::Point }), "a circle is no point");
+    assert_eq!(sk.add(Constraint::Coincident(PointRef::Point(p), PointRef::Centre(p))), Err(BadRef { id: p, kind: RefKind::Round }), "a centre wants a round");
+    assert_eq!(sk.add(Constraint::Coincident(PointRef::End(circle), PointRef::Point(p))), Err(BadRef { id: circle, kind: RefKind::Ends }), "a circle has no ends");
 }

@@ -37,5 +37,6 @@ mod solve;
 
 pub use constraint::Constraint;
 pub use entity::{BadRef, ConstraintId, Entity, EntityId, PointRef, Removed, Sketch};
+pub use entity::{Declares, RefKind}; // VUGSKETCHBADREFKIND (SR604)
 pub use profile::{Edge, Loop, Profile, profiles};
 pub use solve::{Dof, Refusal, Solved, dof, drag, solve, solve_strict};
