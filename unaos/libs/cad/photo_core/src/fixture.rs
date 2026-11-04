@@ -237,7 +237,7 @@ pub fn render_shape(s: &Spec, inside: &dyn Fn(Vec2) -> bool) -> Image {
             rgba[px * 4 + k] = libm::round(blur[px * 3 + k] + s.noise * z).clamp(0.0, 255.0) as u8;
         }
     }
-    Image { width: s.width, height: s.height, rgba, frames: None, loop_count: None, orientation: 1, icc: None }
+    Image { width: s.width, height: s.height, rgba, frames: None, loop_count: None, orientation: 1, icc: None, text: Vec::new() }
 }
 
 /// The photo as PNG bytes (pixel_core's encoder).
@@ -353,5 +353,15 @@ pub fn crop(img: &Image, x0: u32, y0: u32, w: u32, h: u32) -> Image {
         let row = (j as usize * img.width as usize + x0 as usize) * 4;
         rgba.extend_from_slice(&img.rgba[row..row + w as usize * 4]);
     }
-    Image { width: w, height: h, rgba, frames: None, loop_count: None, orientation: 1, icc: None }
+    Image { width: w, height: h, rgba, frames: None, loop_count: None, orientation: 1, icc: None, text: Vec::new() } // VUGPHOTOCROPMETA (SR582): meta-free in memory (crop_png carries it)
+}
+
+// ---- VUGPHOTOCROPMETA (SR582): a crop that carries its own principal point (named tail block) ----
+
+/// [`crop`] as PNG bytes carrying its crop as the tEXt [`crate::CROP_KEY`] = `<x0>,<y0>,<W>,<H>` (the clamped offset
+/// [`crop`] used and `img`'s size), so the photo states its principal point ([`crate::crop_principal`]) with no pref.
+pub fn crop_png(img: &Image, x0: u32, y0: u32, w: u32, h: u32) -> Vec<u8> {
+    let c = crop(img, x0, y0, w, h);
+    let meta = alloc::format!("{},{},{},{}", x0.min(img.width), y0.min(img.height), img.width, img.height);
+    pixel_core::png::encode::encode_rgba_text(c.width, c.height, &c.rgba, &[(crate::CROP_KEY, meta.as_str())]).unwrap_or_default()
 }
