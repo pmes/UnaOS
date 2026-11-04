@@ -10,8 +10,9 @@ use std::sync::OnceLock;
 
 use brep_core::primitives;
 use scan_core::fixture::{self, Noise, Scene};
+use scan_core::gdt::{cylindricity_minzone, flatness_minzone};
 use scan_core::{
-    AlignParams, DepthScale, Design, Deviation, FaceGdt, Kind, Nominal, ScanMesh, Tol, Transform, Tsdf, Vec3, Verdict, design_of, extract,
+    AlignParams, Cylinder, fit_cylinder, fit_plane, DepthScale, Design, Deviation, FaceGdt, Kind, Nominal, ScanMesh, Tol, Transform, Tsdf, Vec3, Verdict, design_of, extract,
     gdt, measure, nominal, position_mm,
 };
 
@@ -68,7 +69,7 @@ fn faces() -> Vec<FaceGdt> {
     let g = gdt(scan(), d, dev, fused().1, Tol::DEFAULT);
     for f in &g {
         println!(
-            "gdt: {} {} n={}/{} flatness={:?} cylindricity={:?} position={:?} band={:?} extent={:?}",
+            "gdt: {} {} n={}/{} flatness={:?} cylindricity={:?} position={:?} band={:?} extent={:?}{}",
             names[f.face as usize],
             f.nominal.name(),
             f.n,
@@ -77,7 +78,8 @@ fn faces() -> Vec<FaceGdt> {
             f.cylindricity_mm,
             f.position_mm,
             f.band_mm,
-            f.extent
+            f.extent,
+            f.minzone_tokens()
         );
     }
     g
@@ -169,4 +171,86 @@ fn verdicts_pass_fail_and_refuse_a_kind_the_surface_does_not_take() {
     for k in [Kind::Flatness, Kind::Cylindricity, Kind::Position] {
         assert_eq!(Kind::parse(k.name()), Some(k));
     }
+}
+
+// ---- VUGSCANGDTMINZONE (SR554): the ISO 1101 minimum zone under the least-squares band ----
+
+/// A deterministic value in [0, 1): the golden-ratio Weyl sequence (scan_core's sampler is crate-private).
+fn weyl(i: u32) -> f64 {
+    (i as f64 * 0.618_033_988_749_894_9).fract()
+}
+
+fn band(vals: impl Iterator<Item = f64>) -> f64 {
+    let (lo, hi) = vals.fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), v| (lo.min(v), hi.max(v)));
+    hi - lo
+}
+
+#[test]
+fn minzone_flatness_reads_under_least_squares() {
+    // A plane tilted 0.5 / 0.3 mm per metre over 100 x 100 mm, 21 x 21 points, heights within +-0.05 mm of it.
+    let grid = |noise: f64| -> Vec<Vec3> {
+        (0..21u32 * 21)
+            .map(|k| {
+                let (x, y) = ((k / 21) as f64 * 5.0, (k % 21) as f64 * 5.0);
+                Vec3::new(x, y, 0.0005 * x + 0.0003 * y + noise * (weyl(k) - 0.5))
+            })
+            .collect()
+    };
+    let fit = Tol { lin: 1.0, ang: 30.0 * DEG };
+    let pts = grid(0.1);
+    let ls = fit_plane(&pts, fit).expect("plane fits").shape;
+    let ls_mm = band(pts.iter().map(|&p| ls.signed_distance(p)));
+    let mz = flatness_minzone(&pts, &ls, Tol::DEFAULT);
+    println!("tilted plane: least squares {ls_mm:.6} min-zone {mz}");
+    assert!(!mz.ls, "the search converged");
+    assert!(mz.mm <= ls_mm + 1e-12, "min-zone {} over least squares {ls_mm}", mz.mm);
+    assert!(mz.mm <= 0.1 + 1e-6, "min-zone {} wider than the generator's band", mz.mm);
+    // Coplanar points: both bands are zero.
+    let flat = grid(0.0);
+    let ls = fit_plane(&flat, fit).expect("plane fits").shape;
+    let ls_mm = band(flat.iter().map(|&p| ls.signed_distance(p)));
+    let mz = flatness_minzone(&flat, &ls, Tol::DEFAULT);
+    assert!(!mz.ls && (mz.mm - ls_mm).abs() <= 1e-9, "coplanar: min-zone {mz:?} least squares {ls_mm}");
+    // The SR542 fixture's box top.
+    let t = top(&faces());
+    let m = t.minzone_flatness_mm.expect("top min-zone");
+    let fl = t.flatness_mm.expect("top measured");
+    println!("box top: least squares {fl:.6} min-zone {m}");
+    assert!(!m.ls && m.mm <= fl + 1e-12, "box top min-zone {m:?} over least squares {fl}");
+    assert!(t.minzone_tokens().starts_with(" minzone_flatness=") && t.minzone_cylindricity_mm.is_none());
+}
+
+#[test]
+fn minzone_cylindricity_reads_under_least_squares_on_a_tilted_cylinder() {
+    // r 40 h 100, the axis tilted 0.1 mm over its length, a 3-lobe form error of 0.03 mm and +-0.01 mm more.
+    let a = Vec3::new(0.001, 0.0, 1.0).normalize().expect("axis");
+    let u = a.any_perpendicular().expect("u");
+    let v = a.cross(u);
+    let base = Vec3::new(5.0, -3.0, 0.0);
+    let (mut pts, mut nrm) = (Vec::new(), Vec::new());
+    for k in 0..36u32 * 11 {
+        let (th, z) = ((k % 36) as f64 * 10.0 * DEG, (k / 36) as f64 * 10.0);
+        let n = u * th.cos() + v * th.sin();
+        let r = 40.0 + 0.03 * (3.0 * th).cos() + 0.02 * (weyl(k) - 0.5);
+        pts.push(base + a * z + n * r);
+        nrm.push(n);
+    }
+    let ls = fit_cylinder(&pts, &nrm, Tol { lin: 1.0, ang: 10.0 * DEG }).expect("cylinder fits").shape;
+    let radial = |c: &Cylinder, p: Vec3| {
+        let d = p - c.point;
+        (d - c.axis * c.axis.dot(d)).mag() - c.radius
+    };
+    let ls_mm = band(pts.iter().map(|&p| radial(&ls, p)));
+    let mz = cylindricity_minzone(&pts, &ls, Tol::DEFAULT);
+    println!("tilted cylinder: least squares {ls_mm:.6} min-zone {mz}");
+    assert!(!mz.ls, "the search converged");
+    assert!(mz.mm <= ls_mm + 1e-12, "min-zone {} over least squares {ls_mm}", mz.mm);
+    assert!(mz.mm <= 0.08 + 1e-3, "min-zone {} wider than the generator's band", mz.mm);
+    // The SR542 fixture's post.
+    let p = post(&faces());
+    let m = p.minzone_cylindricity_mm.expect("post min-zone");
+    let cy = p.cylindricity_mm.expect("post measured");
+    println!("post: least squares {cy:.6} min-zone {m}");
+    assert!(!m.ls && m.mm <= cy + 1e-12, "post min-zone {m:?} over least squares {cy}");
+    assert!(p.minzone_tokens().starts_with(" minzone_cylindricity=") && p.minzone_flatness_mm.is_none());
 }
