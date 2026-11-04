@@ -2877,7 +2877,7 @@ pub fn ra_window_bound() -> u64 {
 /// `with_unafs` re-binds from it.
 pub fn lockowner_release() -> bool { let poisoned = MOUNT.mark_poison(); // POISON2 (B846) MOUNTPOISON: MARKED before the force-unlock, so a taker that wins the window below sees it (`true` = marked)
     unsafe { MOUNT.force_unlock() };
-    crate::arch::without_interrupts(|| { #[cfg(all(target_arch = "x86_64", feature = "wc"))] { if !crate::video::renderwedge::wait_unlocked(&MOUNT, crate::video::renderwedge::W_UNAFS) { return ; } } // TRASHLOCK (B523): RENDERWEDGE's bounded pre-wait (B520 :793's shape); past the bound the leak is left to the next `with_unafs` (the lock was force-released above). ⚠ SAME-LINE fold: :2881's `MOUNT.lock()` keeps its line and column
+    crate::arch::without_interrupts(|| { #[cfg(all(target_arch = "x86_64", feature = "wc"))] { if !crate::video::renderwedge::wait_unlocked(&MOUNT, crate::video::renderwedge::W_UNAFS) { return ; } } #[cfg(all(target_arch = "x86_64", feature = "wc"))] { lockcensus::death(); } // F39UNAFSLOCKDEATHPATH (rmbp-ledger B1131): the overflow-path take COUNTED (`deaths=` on the holds line; no Take, :2881 untouched; LINE-NEUTRAL, before this comment). TRASHLOCK (B523): RENDERWEDGE's bounded pre-wait (B520 :793's shape); past the bound the leak is left to the next `with_unafs` (the lock was force-released above). ⚠ SAME-LINE fold: :2881's `MOUNT.lock()` keeps its line and column
         if let Some(m) = MOUNT.lock().take() {
             core::mem::forget(m);
         }
@@ -3146,7 +3146,7 @@ pub mod splitread {
     /// fetches batched into contiguous runs and issued with MOUNT released. `None` = take the one-hold
     /// path (it reproduces the crate's own refusal, if there is one).
     fn read_extents(p: &Plan, offset: u64, len: u64) -> Option<Vec<u8>> {
-        let bs = ::unafs::BLOCK_SIZE;
+        let bs = ::unafs::BLOCK_SIZE; let mut er = super::execread::Runs::start(); // F39UNAFSLOCKDEATHPATH (B1131): the runs' landing stamps for `[unafs] exec read` (`execread` at the tail; LINE-NEUTRAL)
         if p.size > p.bound.span.block_count.saturating_mul(bs) {
             return None;
         }
@@ -3194,7 +3194,7 @@ pub mod splitread {
             if !read_run(p.bound.handle, lba, run) {
                 return None;
             }
-            for i in 0..n {
+            er.landed(); for i in 0..n {
                 let off = (cur % bs) as usize;
                 let take = (bs as usize - off).min((end - cur) as usize);
                 let at = (i * bs) as usize + off;
@@ -3202,7 +3202,7 @@ pub mod splitread {
                 cur += take as u64;
             }
         }
-        Some(out)
+        er.done(offset, &out); Some(out)
     }
 
     /// `buf.len() / 512` sectors from `lba` on `handle`, the device's own calls, no `TXN_BUSY` latch
@@ -5974,13 +5974,16 @@ pub mod lockcensus {
 
     /// F39UNAFSLOCKONE (rmbp-ledger B1125): every MOUNT take closed through a `Take` since boot (any span; `takes()`).
     static TAKES: AtomicU64 = AtomicU64::new(0);
+    /// F39UNAFSLOCKDEATHPATH (rmbp-ledger B1131): the overflow path's MOUNT takes reached since boot (`lockowner_release`
+    /// :2881, after its bounded wait; `deaths()`). A counter, not a `Take`: the path runs with the holder dead.
+    static DEATHS: AtomicU64 = AtomicU64::new(0);
 
     /// F39UNAFSLOCKONE (B1125): ONE guard type for every MOUNT take (UNAFS-LOCK-ONE). A stack local of the taking fn, opened
     /// on the line BEFORE the take (or at `with_unafs_arm`'s :900 for the attempt) and stamped by `took` AFTER it, so no take
     /// call's line or column moves (its `#[track_caller]` Location is in every x86 image). It holds no lock: it is declared
     /// before the take's guard (or dropped after it), so its `Drop` (the census keep, `WORST` taken masked) always runs with
     /// MOUNT released. The site is where it opened (`#[track_caller]`: the attempt's is `with_unafs`'s caller, as before).
-    /// Never on the overflow path (`lockowner_release` :2881, owed UNAFS-LOCK-DEATHPATH) nor `poison_leg`'s :4607 test peek.
+    /// Never on the overflow path (`lockowner_release` :2881: COUNTED by `death`, F39UNAFSLOCKDEATHPATH B1131) nor `poison_leg`'s :4607 test peek.
     pub struct Take {
         site: &'static Location<'static>,
         f0: u64,
@@ -6070,6 +6073,17 @@ pub mod lockcensus {
         TAKES.load(Ordering::Relaxed)
     }
 
+    /// :2880 fold (F39UNAFSLOCKDEATHPATH, B1131) — the overflow path reached its MOUNT take (relaxed, no lock, no frame).
+    #[inline(always)]
+    pub fn death() {
+        DEATHS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The overflow path's MOUNT takes since boot.
+    pub fn deaths() -> u64 {
+        DEATHS.load(Ordering::Relaxed)
+    }
+
     /// A `Take` closed (opened at `t0_us` with `f0` fills, MOUNT taken at `took_us`, 0 = never taken), MOUNT released. Over
     /// `OVER_US` it is counted and, when among the worst, kept with its site, task, fills and its wait / hold split
     /// (F39UNAFSTRUESPAN: no take, i.e. the RENDERWEDGE Busy return, is all wait). F39UNAFSHOLDRELEASE (B1120): the hold runs
@@ -6151,7 +6165,7 @@ pub mod lockcensus {
         let kept = t.iter().filter(|h| h.site.is_some()).count();
         let n = OVER_N.swap(0, Ordering::Relaxed);
         let mut line = String::new();
-        let _ = write!(line, "[unafslock] holds why={} over_us={} n={} kept={} worst_us={} takes={}", why, OVER_US, n, kept, t[0].span_us, takes());
+        let _ = write!(line, "[unafslock] holds why={} over_us={} n={} kept={} worst_us={} takes={} deaths={}", why, OVER_US, n, kept, t[0].span_us, takes(), deaths());
         for h in t.iter() {
             let Some(site) = h.site else { continue };
             let file = site.file().rsplit('/').next().unwrap_or(site.file());
@@ -6169,5 +6183,57 @@ pub mod lockcensus {
             "[unafslock] ra why={} syncs={} kept={} dropped={} full={} warm={}",
             why, syncs, slots.saturating_sub(dropped), dropped, full, warm
         );
+    }
+}
+
+// ── F39UNAFSLOCKDEATHPATH (rmbp-ledger B1131, BP-storage-8) — the exec read's card timing. UNAFS-READ-AHEAD measured: the
+// exec loader needs the WHOLE image before its first map (`validate_elf` checks every PT_LOAD file range against the image
+// length before a slot exists; `map_image_into_slot` allocates the slot last, "no fallible step may follow", then copies
+// each segment from one contiguous slice), so a streamed read would put a fallible step after the slot. Built instead: the
+// line that sizes what streaming could overlap. `splitread::read_extents` (three LINE-NEUTRAL folds) stamps each run as it
+// lands, MOUNT released; an exec image's whole-file read (offset 0, ELF magic, two runs or more) prints
+// `[unafs] exec read runs=<n> bytes=<n> first_us=<n> last_us=<n>` (from the read's start). Owed: UNAFS-EXEC-STREAM.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+/// CHARTER: fs-core — the split data road's per-run landing stamps for an exec image read (a stack local, no lock, no static).
+pub mod execread {
+    /// One `read_extents` call's runs: the start, the runs landed, the first and the last landing (us from the start).
+    pub struct Runs {
+        t0: u64,
+        n: u32,
+        first_us: u64,
+        last_us: u64,
+    }
+
+    impl Runs {
+        /// :3149 fold — the read starts.
+        #[inline(always)]
+        pub fn start() -> Self {
+            Runs { t0: crate::hidstall::now_us(), n: 0, first_us: 0, last_us: 0 }
+        }
+
+        /// :3197 fold — one run landed (its `read_run` returned true).
+        #[inline(always)]
+        pub fn landed(&mut self) {
+            let t = crate::hidstall::now_us().saturating_sub(self.t0);
+            if self.n == 0 {
+                self.first_us = t;
+            }
+            self.last_us = t;
+            self.n = self.n.saturating_add(1);
+        }
+
+        /// :3205 fold — every run landed: an exec image's whole-file read prints its line. The split try's check runs
+        /// after this, so a try that turns out stale prints too (the timing is the card's either way; `stale` is not known here).
+        #[inline(always)]
+        pub fn done(&self, offset: u64, out: &[u8]) {
+            if offset == 0 && self.n >= 2 && out.starts_with(b"\x7fELF") {
+                say(self, out.len());
+            }
+        }
+    }
+
+    #[inline(never)]
+    fn say(r: &Runs, bytes: usize) {
+        serial_println!("[unafs] exec read runs={} bytes={} first_us={} last_us={}", r.n, bytes, r.first_us, r.last_us);
     }
 }
