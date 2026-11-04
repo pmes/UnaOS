@@ -301,13 +301,33 @@ pub fn selftest() {
         serial_println!("[a11y] census kind={} stops={} rung={}", kind, c[0], c[1]);
     }
     // QUARRYMENUA11Y (rmbp-ledger B1126): the tree's Quarry menu stops (MENU children of Quarry's window node); informative, not in `ok`
-    let qwin = crate::video::quarry::live::win();
-    let qid = t.nodes.iter().position(|b| qwin != WIN_NONE && b.win == qwin).map_or(0, |k| k + 1);
-    let menu_stops = t.nodes.iter().filter(|b| qid != 0 && b.node.parent as usize == qid && b.node.role == A11Y_ROLE_MENU).count();
+    let (menu_stops, _) = quarry_menu_in(&t); // QUARRY-MENU-A11Y-WITNESS (B1132): THE count (file tail), shared with `tests menuscraft`'s quarry_a11y leg
     serial_println!("[a11y] census kind=menu stops={} up={}", menu_stops, crate::video::quarry::live::ops::a11y_menu_up() as u8);
     serial_println!(
         ":: A11YTREE: windows={} nodes={} unnamed={} focus={} ring_px={} s2={} stops={}/{} missed={} wire={} -> {} ::",
         windows, t.nodes.len(), unnamed, if focus_ok { "ok" } else { "FAIL" }, ring_px, crate::video::metrics::s2(), rung,
         stops, misses.len(), wire, if ok { "PASS" } else { "FAIL" }
     );
+}
+
+// ── QUARRY-MENU-A11Y-WITNESS (rmbp-ledger B1132): the tree's Quarry menu census, one count — TAIL-APPENDED ───────────
+// `selftest`'s `[a11y] census kind=menu` line and `ops::a11y_probe` (`tests menuscraft`'s live leg, which raises THE
+// menu on Quarry's window) read the same count off a built tree: no second walk of the menu's rows.
+
+/// `(stops, selected)`: the MENU children of Quarry's window node in `t`, and how many of them are SELECTED.
+fn quarry_menu_in(t: &Tree) -> (usize, usize) {
+    let qwin = crate::video::quarry::live::win();
+    let qid = t.nodes.iter().position(|b| qwin != WIN_NONE && b.win == qwin).map_or(0, |k| k + 1);
+    let mut n = (0, 0);
+    for b in t.nodes.iter().filter(|b| qid != 0 && b.node.parent as usize == qid && b.node.role == A11Y_ROLE_MENU) {
+        n.0 += 1;
+        n.1 += (b.node.flags & A11Y_F_SELECTED != 0) as usize;
+    }
+    n
+}
+
+/// QUARRY-MENU-A11Y-WITNESS (B1132) — the tree built now, its Quarry menu census `(stops, selected)`. Called with no
+/// Quarry lock held (the build takes TABLE, then `ops::a11y_menu`'s MODEL -> MENU after the hold drops).
+pub fn quarry_menu_census() -> (usize, usize) {
+    quarry_menu_in(&build())
 }
