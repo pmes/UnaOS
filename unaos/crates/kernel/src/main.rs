@@ -4429,13 +4429,13 @@ fn pump_usb_into_gui() {
     // task parks the CONTROLLER, not a lock every masked FS writer spins on. A Busy claim means a
     // block-layer transaction is in flight; skip the pass — the next one is ~4 ms out.
     if let Ok(mut x) = unaos_kernel::drivers::xhci::claim() {
-        x.poll_events();
+        x.poll_events(); unaos_kernel::hidstall::phase_mark(unaos_kernel::hidstall::PH_POLL); // F39SHIMBEAMPAN (B1137) HID-PASS-PHASE: the HID decode ends here (hidstall.rs tail)
         x.service_storage();
         x.service_hubs();
         x.service_hid_setproto();
         x.service_ftdi();
         x.service_slot_disposal();
-        x.service_enum();
+        x.service_enum(); unaos_kernel::hidstall::phase_mark(unaos_kernel::hidstall::PH_SVC); // F39SHIMBEAMPAN (B1137) HID-PASS-PHASE: the six services end here; `pass_done` charges the rest to fwd
     }
     // BOT-CENSUS-PI: the one-shot BOT phase-desync census (`:: BOT: phase … result=SUMMARY ::`) plus
     // the USB topology dump. Its other two call sites ride the shared x86/virt BSP loop, which a Pi

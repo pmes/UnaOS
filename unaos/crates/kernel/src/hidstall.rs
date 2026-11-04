@@ -1476,13 +1476,13 @@ pub fn gap_split(t0_prev: u64, end_prev: u64, now: u64) -> Option<(u64, u64)> {
 
 /// `ehci::hid_task`, before `service_ehci_hid`: stamp this pass's entry and split the gap that just ended.
 pub fn pass_begin() {
-    let now = crate::arch::ms();
+    let now = crate::arch::ms(); phase_open(); // F39SHIMBEAMPAN (B1137) HID-PASS-PHASE: this pass's phase accumulators open (file tail). LINE-NEUTRAL fold, code first
     let t0 = PASS_T0_MS.swap(now, Relaxed); let who = wait_who_gap(); // F39HIDPLACESVC (B1109) HID-WAIT-WHO: the T0 swap shut the tick's gate; take the ended gap's majority task (file tail). LINE-NEUTRAL fold, code first
     let Some((pass, wait)) = gap_split(t0, PASS_END_MS.load(Relaxed), now) else { return };
     let gap = pass.saturating_add(wait);
     let w = split_pack(gap, pass, wait);
-    if SPLIT_WORST.fetch_max(w, Relaxed) < w { wait_who_keep(who); } // F39HIDPLACESVC (B1109): the minute's worst gap keeps its own `who`, as it keeps its own split
-    SPLIT_BOOT.fetch_max(w, Relaxed);
+    if SPLIT_WORST.fetch_max(w, Relaxed) < w { wait_who_keep(who); phase_keep_min(); } // F39SHIMBEAMPAN (B1137): and its pass's longest phase. F39HIDPLACESVC (B1109): the minute's worst gap keeps its own `who`, as it keeps its own split
+    if SPLIT_BOOT.fetch_max(w, Relaxed) < w { phase_keep_boot(); } // F39SHIMBEAMPAN (B1137): the boot-worst gap keeps its pass's longest phase (file tail)
     SPLIT_PASS_MAX.fetch_max(pass, Relaxed);
     SPLIT_WAIT_MAX.fetch_max(wait, Relaxed);
     if gap >= HID_GAP_STALL_MS {
@@ -1492,7 +1492,7 @@ pub fn pass_begin() {
 
 /// `ehci::hid_task`, after `service_ehci_hid`: stamp the pass's exit.
 pub fn pass_done() {
-    PASS_END_MS.store(crate::arch::ms(), Relaxed);
+    PASS_END_MS.store(crate::arch::ms(), Relaxed); phase_close(); // F39SHIMBEAMPAN (B1137): the remainder is the tail phase; the pass's longest phase is packed (file tail). LINE-NEUTRAL fold, code first
 }
 
 /// The worst gap's branch: `CLEAR` under one frame, else the larger half names it.
@@ -1509,8 +1509,8 @@ fn gap_split_minute() {
     let (g, p, w) = split_unpack(SPLIT_WORST.swap(0, Relaxed));
     let (pm, wm, over) = (SPLIT_PASS_MAX.swap(0, Relaxed), SPLIT_WAIT_MAX.swap(0, Relaxed), SPLIT_OVER.swap(0, Relaxed));
     serial_println!(
-        "[hid] gap split worst_ms={} pass_ms={} wait_ms={} pass_max_ms={} wait_max_ms={} over={} bound_ms={} pump_cpu=c{} who={} -> {} (F39INPUTSTALL B1097: a HID gap = the previous pass's own length + the hid pump's wait to run again; F39HIDPLACESVC B1109: who= the task the pump core's tick found running while the pass was overdue)",
-        g, p, w, pm, wm, over, HID_GAP_STALL_MS, CpuWord(pump_cpu()), WaitWho(MIN_WHO.read(true), MIN_TID.swap(0, Relaxed), g >= HID_GAP_STALL_MS && p < w), SplitWord(g, p, w)
+        "[hid] gap split worst_ms={} pass_ms={} wait_ms={} pass_max_ms={} wait_max_ms={} over={} bound_ms={} pump_cpu=c{} who={}{} -> {} (F39INPUTSTALL B1097: a HID gap = the previous pass's own length + the hid pump's wait to run again; F39HIDPLACESVC B1109: who= the task the pump core's tick found running while the pass was overdue)",
+        g, p, w, pm, wm, over, HID_GAP_STALL_MS, CpuWord(pump_cpu()), WaitWho(MIN_WHO.read(true), MIN_TID.swap(0, Relaxed), g >= HID_GAP_STALL_MS && p < w), PhaseWord(PH_MIN.swap(0, Relaxed), g >= HID_GAP_STALL_MS && p >= w), SplitWord(g, p, w)
     );
 }
 
@@ -1523,11 +1523,11 @@ fn gap_split_kat() {
     let packed = split_unpack(split_pack(4_840, 278, 4_562)) == (4_840, 278, 4_562)
         && split_unpack(split_pack(u64::MAX, 1, 2)) == (SPLIT_FIELD, 1, 2);
     let who_ok = wait_who_kat(); // F39HIDPLACESVC (B1109): the pure vote + overdue gate (file tail)
-    let ok = unset && unfinished && backwards && flight39 && packed && who_ok;
+    let phase_ok = phase_kat(); let ok = unset && unfinished && backwards && flight39 && packed && who_ok && phase_ok; // F39SHIMBEAMPAN (B1137): the pure longest-phase pick and its pack (file tail)
     let (g, p, w) = split_unpack(SPLIT_BOOT.load(Relaxed));
     serial_println!(
-        ":: HIDGAPSPLIT: kat_ok={} who_ok={} boot_worst_ms={} pass_ms={} wait_ms={} -> {} ::",
-        ok as u8, who_ok as u8, g, p, w, if ok { "PASS" } else { "FAIL" }
+        ":: HIDGAPSPLIT: kat_ok={} who_ok={} phase_ok={} boot_worst_ms={} pass_ms={} wait_ms={} boot_phase={} -> {} ::",
+        ok as u8, who_ok as u8, phase_ok as u8, g, p, w, PhaseName(PH_BOOT.load(Relaxed)), if ok { "PASS" } else { "FAIL" }
     );
 }
 
@@ -1777,3 +1777,141 @@ fn render_kat() -> Option<bool> {
 // relaxed atomics as on x86. Side effect, intended (BP-input-11): on aarch64 [`pump_cpu`] now reads the pump's core, so
 // [`apart`] and every `!= pump_cpu()` placement filter keep apart from it. `[hid] gap split` keeps its one shape; `who=`
 // names the task on Pi metal and reads `?` on QEMU raspi4b (no tick IRQ there).
+
+// ── F39SHIMBEAMPAN (rmbp-ledger B1137) — HID-PASS-PHASE: the pass's longest phase on a PASS-LONG minute. FILE-TAIL append. ─
+// B1118/B1124: a PASS-LONG `[hid] gap split` said the previous pass was long but not where inside it. The pass is now
+// stamped at its phase boundaries by [`phase_mark`]: each mark charges the time since the previous one to its phase. x86
+// (`ehci::service_ehci_hid`): `svc` at `Controller::service`'s tail before its hub change (the lock and the i8042/touchpad
+// pumps included; owed HID-PHASE-LOCK), `hub` after `c.service()`, `isr` after `isr_rollup`, and [`pass_done`] charges the
+// remainder to `bt` (the bt block). aarch64 (`pump_usb_into_gui`, main.rs): `poll` after `poll_events`, `svc` after the
+// six services, and the remainder to `fwd` (the GUI forward). A mark is a no-op unless [`pass_begin`] opened the pass, so
+// an unbracketed `service_ehci_hid` (the usb-pump's, before the hid-pump owns it) writes nothing. ONE writer, relaxed.
+// [`pass_done`] packs the pass's longest phase; the minute's and the boot's worst gaps keep the phase of the pass that
+// made them (the gap's `pass` IS that pass), as they keep their split. The gap split prints ` phase=<name>:<ms>` only
+// on PASS-LONG; `:: HIDGAPSPLIT:` adds `phase_ok=` (pure cases) and `boot_phase=<name>:<ms>|-`. No new line.
+
+/// F39SHIMBEAMPAN (B1137): the phase indices [`phase_mark`] takes (x86: svc/hub/isr/bt; aarch64: poll/svc/fwd).
+pub const PH_SVC: usize = 0;
+pub const PH_HUB: usize = 1;
+pub const PH_ISR: usize = 2;
+pub const PH_BT: usize = 3;
+pub const PH_POLL: usize = 4;
+pub const PH_FWD: usize = 5;
+const PH_N: usize = 6;
+const PH_NAMES: [&str; PH_N] = ["svc", "hub", "isr", "bt", "poll", "fwd"];
+/// The phase [`pass_done`] charges the pass's remainder to.
+#[cfg(target_arch = "x86_64")]
+const PH_TAIL: usize = PH_BT;
+#[cfg(not(target_arch = "x86_64"))]
+const PH_TAIL: usize = PH_FWD;
+
+/// F39SHIMBEAMPAN (B1137): this pass's per-phase us, the last mark (us), a pass open, and the packed longest phase of the
+/// last finished pass, of the minute's worst gap's pass, and of the boot's worst gap's pass ([`phase_longest`]'s shape).
+static PH_ACC: [AtomicU64; PH_N] = [const { AtomicU64::new(0) }; PH_N];
+static PH_LAST: AtomicU64 = AtomicU64::new(0);
+static PH_OPEN: AtomicBool = AtomicBool::new(false);
+static PH_PASS: AtomicU64 = AtomicU64::new(0);
+static PH_MIN: AtomicU64 = AtomicU64::new(0);
+static PH_BOOT: AtomicU64 = AtomicU64::new(0);
+
+/// F39SHIMBEAMPAN (B1137): the HID pass reached the end of phase `k` — charge the time since the previous mark to it.
+/// A no-op outside a pass [`pass_begin`] opened.
+pub fn phase_mark(k: usize) {
+    if !PH_OPEN.load(Relaxed) {
+        return;
+    }
+    let now = now_us();
+    let last = PH_LAST.swap(now, Relaxed);
+    PH_ACC[k.min(PH_N - 1)].fetch_add(now.saturating_sub(last), Relaxed);
+}
+
+/// [`pass_begin`]'s head: a new pass, its accumulators zeroed.
+fn phase_open() {
+    for a in PH_ACC.iter() {
+        a.store(0, Relaxed);
+    }
+    PH_LAST.store(now_us(), Relaxed);
+    PH_OPEN.store(true, Relaxed);
+}
+
+/// [`pass_done`]: the remainder to the tail phase, the pass closed, its longest phase packed.
+fn phase_close() {
+    if !PH_OPEN.load(Relaxed) {
+        return;
+    }
+    phase_mark(PH_TAIL);
+    PH_OPEN.store(false, Relaxed);
+    let mut acc = [0u64; PH_N];
+    for (d, a) in acc.iter_mut().zip(PH_ACC.iter()) {
+        *d = a.load(Relaxed);
+    }
+    PH_PASS.store(phase_longest(&acc), Relaxed);
+}
+
+/// [`pass_begin`]'s minute-worst win: that gap's pass's phase becomes the minute's.
+fn phase_keep_min() {
+    PH_MIN.store(PH_PASS.load(Relaxed), Relaxed);
+}
+
+/// [`pass_begin`]'s boot-worst win: that gap's pass's phase becomes the boot's.
+fn phase_keep_boot() {
+    PH_BOOT.store(PH_PASS.load(Relaxed), Relaxed);
+}
+
+/// The longest phase of `acc` (us), packed `(index + 1) << 32 | ms` (ms floored, capped at u32); the lowest index on a
+/// tie; 0 when every phase is 0 us. Pure.
+pub fn phase_longest(acc: &[u64; PH_N]) -> u64 {
+    let mut best = 0usize;
+    for (i, &v) in acc.iter().enumerate() {
+        if v > acc[best] {
+            best = i;
+        }
+    }
+    if acc[best] == 0 {
+        return 0;
+    }
+    ((best as u64 + 1) << 32) | (acc[best] / 1000).min(u32::MAX as u64)
+}
+
+/// The inverse of [`phase_longest`]'s pack: `(name, ms)`, `None` for 0 or a bad index. Pure.
+pub fn phase_unpack(w: u64) -> Option<(&'static str, u64)> {
+    let i = (w >> 32) as usize;
+    if i == 0 || i > PH_N {
+        return None;
+    }
+    Some((PH_NAMES[i - 1], w & 0xFFFF_FFFF))
+}
+
+/// `<name>:<ms>`, or `-` when no phase was kept.
+struct PhaseName(u64);
+impl core::fmt::Display for PhaseName {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match phase_unpack(self.0) {
+            Some((n, ms)) => write!(f, "{}:{}", n, ms),
+            None => f.write_str("-"),
+        }
+    }
+}
+
+/// The gap split's ` phase=<name>:<ms>`: written only on a PASS-LONG minute with a kept phase, nothing otherwise.
+struct PhaseWord(u64, bool);
+impl core::fmt::Display for PhaseWord {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        if !self.1 || phase_unpack(self.0).is_none() {
+            return Ok(());
+        }
+        write!(f, " phase={}", PhaseName(self.0))
+    }
+}
+
+/// `:: HIDGAPSPLIT:`'s `phase_ok=`: the longest-phase pick, its tie rule, the empty pass and the pack on synthetic cases. Pure.
+fn phase_kat() -> bool {
+    let tie = phase_longest(&[3_000, 278_400, 0, 278_400, 0, 0]);
+    let empty = phase_longest(&[0; PH_N]);
+    let fwd = phase_longest(&[0, 0, 0, 0, 900, 4_200]);
+    phase_unpack(tie) == Some(("hub", 278))
+        && empty == 0
+        && phase_unpack(empty).is_none()
+        && phase_unpack(fwd) == Some(("fwd", 4))
+        && phase_unpack(7u64 << 32).is_none()
+}

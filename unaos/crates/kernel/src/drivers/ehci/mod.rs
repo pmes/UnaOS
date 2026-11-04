@@ -14498,7 +14498,7 @@ impl Controller {
             if n >= MT_RAW_DUMP_MAX {
                 self.bcm5974_mt_restore();
             }
-        } #[cfg(all(feature = "lidsleep", feature = "wc"))] self.reap_dead_eps(); #[cfg(all(feature = "lidsleep", feature = "wc"))] self.service_hub_changes(); // EHCIPOOLRECYCLE (B807): every endpoint this pass retired leaves the pool here, after every index-holding stage (`intpool::reap_dead_eps`, file tail). EHCIHUBDISC (B801): the endpoint borrow is released and EP0 is usable — one hub port change per pass (`hubchange`, file tail). LINE-NEUTRAL fold, code first
+        } crate::hidstall::phase_mark(crate::hidstall::PH_SVC); #[cfg(all(feature = "lidsleep", feature = "wc"))] self.reap_dead_eps(); #[cfg(all(feature = "lidsleep", feature = "wc"))] self.service_hub_changes(); // F39SHIMBEAMPAN (B1137) HID-PASS-PHASE: the controller's service ends here, its hub change follows (hidstall.rs tail). EHCIPOOLRECYCLE (B807): every endpoint this pass retired leaves the pool here, after every index-holding stage (`intpool::reap_dead_eps`, file tail). EHCIHUBDISC (B801): the endpoint borrow is released and EP0 is usable — one hub port change per pass (`hubchange`, file tail). LINE-NEUTRAL fold, code first
     }
 }
 
@@ -18615,13 +18615,13 @@ pub fn service_ehci_hid() {
     let mut g = EHCI_HID.lock(); crate::pointerfeel::note_pass(crate::arch::ms()); crate::drivers::i8042::pump(); crate::drivers::dwi2c::touchpad::pump(); // ZENBOOKTOUCHPADREPORTS (zenbook-ledger Z18): the I2C-HID touchpad polls here, under this lock, into `pal::push_pointer_report` (LINE-NEUTRAL fold, code first). ZENBOOKI8042 (Z3): the i8042 transport drains here, under this lock, into the one boot-keyboard decoder (`drivers::hidboot`, HIDBOOTSHARED B982) (LINE-NEUTRAL fold, code first). PUMPHOLE (B541): the pass cadence `tests pointerfeel` classes each report gap by — stamped AFTER the lock, so a pass that waited on it is charged the wait (LINE-NEUTRAL fold, code first)
     let Some(ctrls) = g.as_mut() else { return };
     for c in ctrls.iter_mut() {
-        unsafe { c.service() }; #[cfg(all(feature = "lidsleep", feature = "wc"))] c.port_suspend_service(); // USBSUSPEND (B766): the sleep state's SUSPEND/resume of this controller's root ports, under this lock; the body is `suspend` at the file tail. LINE-NEUTRAL fold, code first
+        unsafe { c.service() }; crate::hidstall::phase_mark(crate::hidstall::PH_HUB); #[cfg(all(feature = "lidsleep", feature = "wc"))] c.port_suspend_service(); // F39SHIMBEAMPAN (B1137) HID-PASS-PHASE: the hub change (service's tail) ends here. USBSUSPEND (B766): the sleep state's SUSPEND/resume of this controller's root ports, under this lock; the body is `suspend` at the file tail. LINE-NEUTRAL fold, code first
     }
     // ISRARM: the completion interrupt's own rollup, and its DEAD verdict. Emitted from here — the
     // polled pass — and never from the ISR, which does not print at all. Placed after the walk so a
     // line reports the state the pass just left the endpoints in, and outside it so it is charged
     // once per pass rather than once per controller.
-    isr_rollup(crate::arch::ms());
+    isr_rollup(crate::arch::ms()); crate::hidstall::phase_mark(crate::hidstall::PH_ISR); // F39SHIMBEAMPAN (B1137) HID-PASS-PHASE: the rollup ends here; `pass_done` charges the rest to bt (hidstall.rs tail). LINE-NEUTRAL fold
     // BT-RETRY: drain a pending re-trigger AFTER the service pass, still under the `EHCI_HID` lock,
     // so the chain runs serialized against every controller's service exactly as the boot chain did.
     // One chain per pass; the first controller that claimed a radio owns it.
