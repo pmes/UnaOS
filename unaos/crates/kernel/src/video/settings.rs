@@ -2178,7 +2178,7 @@ pub fn selftest_users() {
 pub fn selftest_all() {
     selftest();
     selftest_users();
-    selftest_prefsui(); resetfollow_leg(); reset_word_leg(); // SETTINGS-RESET-FOLLOW (rmbp-ledger B1190): the unset-follow leg (file tail). LINE-NEUTRAL fold, code first
+    selftest_prefsui(); resetfollow_leg(); reset_word_leg(); resetq_leg(); // RESETREPAINT-QUEUED (rmbp-ledger B1201): the follower's queued-reset leg (file tail). SETTINGS-RESET-FOLLOW (rmbp-ledger B1190): the unset-follow leg (file tail). LINE-NEUTRAL fold, code first
 }
 
 // ── BRIGHTFLOOR (B312): the floor, the load clamp, safe mode ───────────────────────────────────
@@ -2265,19 +2265,19 @@ fn bus_changes_inner() -> (usize, usize, usize) {
     let mut keys: Vec<&'static str> = Vec::new();
     let mut idle = 0usize;
     let frames = crate::prefs_client::changes_drain(|ns, k| {
-        if ns != crate::prefs::NS { return; } if k.starts_with("appearance.") { super::appearance::mark_dirty(); } if k.starts_with("accessibility.") { A11Y_DIRTY.store(true, Ordering::Release); } if k.starts_with("keyboard.") { KB_DIRTY.store(true, Ordering::Release); } #[cfg(feature = "dicc")] { if k == crate::prefs::key::DISPLAY_ICC { A11Y_DIRTY.store(true, Ordering::Release); } } // DISPLAYICCFILE (rmbp-ledger B972): the installed display profile key re-latches through the a11y filter's own door (a11y_load -> af::changed -> colour::latch). LINE-NEUTRAL append, code first. KEYMAPS (B704): another client chose a layout. A11YPANE (B655): the service pass re-reads and re-latches. APPEARANCE (B408): another client chose
+        if ns != crate::prefs::NS { return; } if k.starts_with("appearance.") { super::appearance::mark_dirty(); } if k.starts_with("accessibility.") { A11Y_DIRTY.store(true, Ordering::Release); } if k.starts_with("keyboard.") { KB_DIRTY.store(true, Ordering::Release); } #[cfg(feature = "dicc")] { if k == crate::prefs::key::DISPLAY_ICC { A11Y_DIRTY.store(true, Ordering::Release); } } resetq_note(ns, k); // RESETREPAINT-QUEUED (rmbp-ledger B1201): an unset MAP key outside SHOWN counts as moved (file tail). DISPLAYICCFILE (rmbp-ledger B972): the installed display profile key re-latches through the a11y filter's own door (a11y_load -> af::changed -> colour::latch). LINE-NEUTRAL append, code first. KEYMAPS (B704): another client chose a layout. A11YPANE (B655): the service pass re-reads and re-latches. APPEARANCE (B408): another client chose
         if let Some(s) = SHOWN.iter().find(|s| **s == k) {
             if *s == crate::prefs::key::IDLE_MIN { idle += 1; }
             if !keys.contains(s) { keys.push(s); }
         }
     });
     // Before the login's load the load itself reads the store fresh; nothing to follow yet.
-    if keys.is_empty() || !LOAD_DONE.load(Ordering::Acquire) {
+    let rq = resetq_take(); if (keys.is_empty() && rq == 0) || !LOAD_DONE.load(Ordering::Acquire) { // RESETREPAINT-QUEUED (rmbp-ledger B1201): the taken count rides past the gate (file tail)
         return (frames, 0, idle);
     }
     let old = CUR.lock().clone();
     let mut fresh = old.clone();
-    let mask = from_prefs(&mut fresh).0; follow_unset(&mut fresh, mask, &keys); // SETTINGS-RESET-FOLLOW (rmbp-ledger B1190): a frame key the store no longer holds takes its schema default, not the old value (file tail). LINE-NEUTRAL fold, code first
+    let mask = if keys.is_empty() { 0 } else { from_prefs(&mut fresh).0 }; follow_unset(&mut fresh, mask, &keys); // RESETREPAINT-QUEUED (rmbp-ledger B1201): a MAP-only drain reads nothing, fresh stays old. SETTINGS-RESET-FOLLOW (rmbp-ledger B1190): a frame key the store no longer holds takes its schema default, not the old value (file tail). LINE-NEUTRAL fold, code first
     if BRIGHT_PERSIST_AT.load(Ordering::Acquire) != 0 { fresh.bright = old.bright; } // BRIGHTSLIDER M2: a slider move not yet stored is newer than the store
     use crate::prefs::key;
     let mut moved = 0usize;
@@ -2293,7 +2293,7 @@ fn bus_changes_inner() -> (usize, usize, usize) {
         };
         if m { moved += 1; }
     }
-    if moved > 0 {
+    moved += rq; if moved > 0 { // RESETREPAINT-QUEUED (rmbp-ledger B1201): an unset MAP frame is one more moved (file tail)
         let tab_moved = (fresh.tab != old.tab).then_some(fresh.tab as usize); *CUR.lock() = fresh; if let Some(t) = tab_moved { col_follow_open(t); } // A11YFILTER (B857): a moved tab scrolls into view; STATE taken after CUR is dropped
         serial_println!("[settings] prefchanged keys={} moved={} via={}", keys.len(), moved, crate::prefs_client::last_via());
         if is_open() { repaint(); }
@@ -6478,5 +6478,104 @@ fn reset_delete(tab: usize, row: usize) {
     serial_println!(
         "[settings] resetrepaint=reset_row tab={} row={} word={}",
         TAB_NAMES[tab.min(TABS - 1)], row, if row_is_set(m.keys) { "painted" } else { "hidden" }
+    );
+}
+
+// =================================================================================================
+// RESETREPAINT-QUEUED (rmbp-ledger B1201, BP-storage-11) — TAIL-APPENDED. A PREFS.ELF unset answered QUEUED at
+// RELAY_WAIT_MS leaves the store holding the key at Delete's repaint (B1195's `word=painted`); the later drain's
+// PrefChanged frame reached `bus_changes_inner`, whose SHOWN gate dropped every MAP key outside SHOWN, so the row kept
+// its word until the next paint. `prefs_client::changes_drain` hands the follower `(ns, k)` only (the unset form's
+// `None` is dropped: CHANGES-DRAIN-VALUE owed), so the follower's test is the painter's own: a frame naming a MAP key
+// outside SHOWN that the store no longer holds ([`row_is_set`] false) is counted ([`resetq_note`]) and taken at the
+// gate ([`resetq_take`]) into the existing `moved` counter, so the one `if moved > 0` arm repaints (no second road). A
+// SET frame of a key since unset also counts (the unset frame would anyway); an unset frame of a key since re-set does
+// not (the word stays painted, correctly). SHOWN keys are unchanged (the SHOWN gate and B1190's `follow_unset`). A
+// count taken before the login's load is dropped (the load reads the store fresh). Said
+// `[settings] resetrepaint=follower frames=<n> open=<0|1>`. Witness: `tests settings`
+// `:: SETTINGS-RESET-QUEUED: key=system.dock.position held=<n> unset=<0|1> resetrepaint=<follower|none> nonmap=system.audio.amp_holdoff_ms counted=<n> -> PASS|FAIL ::`
+// (`-> SKIP reason=no-load ::` before a session's load, `-> SKIP reason=set-refused ::` when the store takes no write).
+// =================================================================================================
+/// Frames the drain closure counted since the last gate (see the block above).
+static RESETQ: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+/// Every counted frame taken past the gate after the load (the leg's view).
+static RESETQ_SEEN: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// `ns.k` is a key of some Settings `MAP` row.
+fn map_key(ns: &str, k: &str) -> bool {
+    ns == crate::prefs::NS && MAP.iter().any(|r| r.keys.contains(&k))
+}
+
+/// The drain closure's fold: a frame of a MAP key outside SHOWN that the store no longer holds counts once.
+fn resetq_note(ns: &str, k: &str) {
+    if map_key(ns, k) && !SHOWN.contains(&k) && !row_is_set(core::slice::from_ref(&k)) {
+        RESETQ.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+/// The gate's fold: the counted frames since the last pass (0 before the login's load, which drops them).
+fn resetq_take() -> usize {
+    let n = RESETQ.swap(0, Ordering::AcqRel);
+    if n == 0 || !LOAD_DONE.load(Ordering::Acquire) {
+        return 0;
+    }
+    RESETQ_SEEN.fetch_add(n, Ordering::AcqRel);
+    serial_println!("[settings] resetrepaint=follower frames={} open={}", n, is_open() as u8);
+    n
+}
+
+/// `tests settings`' queued-reset leg (see the block above): dock.position (a MAP row outside SHOWN) stored at its own
+/// default counts nothing, unset counts one; the non-MAP `audio.amp_holdoff_ms` set and unset counts nothing. Each
+/// key's prior stored value is restored (an unset key stays unset).
+#[cfg(feature = "witness")]
+fn resetq_leg() {
+    use crate::prefs::{key, PrefValue, NS};
+    let (dk, nk) = (key::DOCK_POSITION, "audio.amp_holdoff_ms");
+    if !LOAD_DONE.load(Ordering::Acquire) {
+        serial_println!(":: SETTINGS-RESET-QUEUED: key={}.{} -> SKIP reason=no-load ::", NS, dk);
+        return;
+    }
+    let _ = bus_changes(); // the queue subscribed and settled before the leg's own frames
+    let seen = || RESETQ_SEEN.load(Ordering::Acquire);
+    let (d_was, n_was) = (crate::prefs::get(NS, dk), crate::prefs::get(NS, nk));
+    let restore = || {
+        for (k, was) in [(dk, &d_was), (nk, &n_was)] {
+            match was {
+                Some(v) => { let _ = crate::prefs::set(NS, k, v.clone()); }
+                None => { let _ = crate::prefs::unset(NS, k); }
+            }
+        }
+        let _ = bus_changes();
+    };
+    let s0 = seen();
+    if crate::prefs::set(NS, dk, PrefValue::Str(String::from("bottom"))).is_err() {
+        restore();
+        serial_println!(":: SETTINGS-RESET-QUEUED: key={}.{} -> SKIP reason=set-refused ::", NS, dk);
+        return;
+    }
+    let _ = bus_changes();
+    let held = seen() - s0;
+    let s1 = seen();
+    let unset = matches!(crate::prefs::unset(NS, dk), Ok(true));
+    let _ = bus_changes();
+    let follower = seen() - s1;
+    let s2 = seen();
+    if crate::prefs::set(NS, nk, PrefValue::Int(5000)).is_err() {
+        restore();
+        serial_println!(":: SETTINGS-RESET-QUEUED: key={}.{} -> SKIP reason=set-refused ::", NS, nk);
+        return;
+    }
+    let n_unset = matches!(crate::prefs::unset(NS, nk), Ok(true));
+    let _ = bus_changes();
+    let counted = seen() - s2;
+    restore();
+    if !unset || !n_unset {
+        serial_println!(":: SETTINGS-RESET-QUEUED: key={}.{} -> SKIP reason=set-refused ::", NS, dk);
+        return;
+    }
+    let ok = held == 0 && follower == 1 && counted == 0;
+    serial_println!(
+        ":: SETTINGS-RESET-QUEUED: key={}.{} held={} unset={} resetrepaint={} nonmap={}.{} counted={} -> {} ::",
+        NS, dk, held, unset as u8, if follower == 1 { "follower" } else { "none" }, NS, nk, counted, if ok { "PASS" } else { "FAIL" }
     );
 }
