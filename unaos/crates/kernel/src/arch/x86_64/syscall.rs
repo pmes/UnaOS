@@ -13071,7 +13071,7 @@ fn sys_open_dynamic(row: usize, name: &str, mode: u64) -> i64 {
         // unreachable but fails closed to -ENOENT.
         if let Ok(cname) = core::str::from_utf8(&canon[..cn]) {
             if staged_lookup(cname).is_none() && u10_name_id(cname).is_none() {
-                return open_dynamic_ondisk(row, cname, mode);
+                if machine_store_open_refused(row, cname, mode) { return EACCES; } return open_dynamic_ondisk(row, cname, mode); // MACHINESTOREFATROOT (rmbp-ledger B1160): a RW/O_CREAT open in the machine store is ROOTACL's refusal before any claim (file tail). LINE-NEUTRAL append, code first
             }
         }
     }
@@ -32552,4 +32552,20 @@ fn focus_held_now(_owner: u64) -> bool { false }
 #[cfg(feature = "busreg")]
 pub fn pref_row_in_session(row: usize) -> bool {
     pref_caller_in_session(row)
+}
+
+// ── MACHINESTOREFATROOT (rmbp-ledger B1160, BP-storage-11) — TAIL-APPENDED ─────────────────────────────────────────────
+// The `irqstorage` dynamic arm (`open_dynamic_ondisk`) opened any arbitrary EL0 FAT path RW or O_CREAT with no ACL, the
+// FAT-root machine store `/SETTINGS/GENERAL` included (the boot screen's copy; FAT has no owner rows for B1150's stamp).
+// `sys_open_dynamic` asks this before the arm claims anything: ROOTACL's shared verdict (`rootacl::store_open_refused`,
+// the kernel and the administrator write the store, a read-only open stays public). Knob-off it does not exist.
+
+/// May slot `row`'s RW/O_CREAT open of the canonical EL0 path `name` NOT proceed (the machine store, not the administrator)?
+#[cfg(feature = "irqstorage")]
+fn machine_store_open_refused(row: usize, name: &str, mode: u64) -> bool {
+    let write = mode & (1 | O_CREAT) != 0;
+    if !write || !crate::fs::rootacl::machine_store_path(name) {
+        return false;
+    }
+    crate::fs::rootacl::store_open_refused(name, write, &attrsurf_principal(row))
 }

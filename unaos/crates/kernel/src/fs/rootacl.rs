@@ -146,7 +146,7 @@ pub fn selftest() {
     };
     let _ = mt.unlink(G, KERNEL_PRINCIPAL);
     let _ = mt.unlink(F, KERNEL_PRINCIPAL);
-    let anon_write = w && c && a && u; #[cfg(target_arch = "x86_64")] let _ = machine_store_leg(&mt); // MACHINESTOREACL (rmbp-ledger B1150): the no-session settings folder's ring-3 refusal leg (file tail); its own summary line, not in ROOTACL's PASS. LINE-NEUTRAL append, code first
+    let anon_write = w && c && a && u; #[cfg(target_arch = "x86_64")] let _ = machine_store_leg(&mt); let _ = store_open_leg(admin.as_deref()); // MACHINESTOREFATROOT (rmbp-ledger B1160): the SYS_OPEN road's shared machine-store verdict, both arches (file tail), its own summary line. MACHINESTOREACL (rmbp-ledger B1150): the no-session settings folder's ring-3 refusal leg (file tail); its own summary line, not in ROOTACL's PASS. LINE-NEUTRAL append, code first
     let pass = made && owner == SYSTEM_OWNER && trees == TREES.len() && anon_write && r && admin_tok != "REFUSED";
     serial_println!(
         ":: ROOTACL: owner={} trees={} anon_write={} admin_write={} -> {} :: anon_read={} anon_create={} anon_unlink={} anon_attr={} admin={} scratch={} ::",
@@ -286,4 +286,68 @@ pub fn store_file_refused(mt: &MountTable, path: &str) -> Option<String> {
         }
         Err(_) => None,
     }
+}
+
+// ── MACHINESTOREFATROOT (rmbp-ledger B1160, BP-storage-11) — TAIL-APPENDED ─────────────────────────────────────────────
+// A FAT root carries no owner rows, so the B1150 stamp and the B1156 owner read both answer "no attributes" and the
+// machine store's ring-3 refusal has to come from the one door that writes the EL0 FAT: `SYS_OPEN`. Measured at
+// 4e18c6bb4: x86's `irqstorage` dynamic arm (`sys_open_dynamic` -> `open_dynamic_ondisk`) admitted a RW or O_CREAT open
+// of `/SETTINGS/GENERAL` with no ACL, and aarch64's default-on DIRNS road (`el0_resolve` onto the EL0 FAT,
+// `owned_access_ok` admitting an unowned kernel file) did the same. Both arches now ask [`store_open_refused`] before
+// any claim: ROOTACL's rule (B456/B1150), not a second ACL — the kernel and the administrator (R100) write the machine
+// store, everyone else's RW/O_CREAT open is `-EACCES`, a read-only open stays public. The folder test is
+// [`machine_store_path`] (the 8.3 spelling is case-insensitive, as the FAT resolver matches). It refuses a top-level
+// `SETTINGS` folder on any EL0 FAT, also one that is not the root (conservative: prefs writes `/settings` only on
+// the root). `tests rootacl` runs [`store_open_leg`] (both arches) over the shared verdict.
+// Wire: `[rootacl] open refused path=<p> principal=<p> reason=machine-store (...)` (once per boot) ·
+// `:: MACHINESTOREOPEN: write=refused read=ok other=ok near=ok admin=<ok|no-admin> -> PASS|FAIL :: path=/SETTINGS/GENERAL by=anon ::`.
+
+/// Is the EL0 path `path` (absolute, volume-relative or 8.3 uppercase) the machine store folder or inside it?
+pub fn machine_store_path(path: &str) -> bool {
+    path.trim_start_matches('/').split('/').next().map_or(false, |c| c.eq_ignore_ascii_case(prefs_core::files::DIR))
+}
+
+/// `SYS_OPEN`'s machine-store verdict on the EL0 FAT (no rows there): `true` = refuse this open by `principal`
+/// (a write or create, in the store, by anyone but the administrator), said once per boot with the principal.
+pub fn store_open_refused(path: &str, write: bool, principal: &str) -> bool {
+    use core::sync::atomic::{AtomicBool, Ordering};
+    static SAID: AtomicBool = AtomicBool::new(false);
+    if !write || !machine_store_path(path) || admin_principal(principal) {
+        return false;
+    }
+    if !SAID.swap(true, Ordering::AcqRel) {
+        serial_println!("[rootacl] open refused path={} principal={} reason=machine-store (B1160: kernel and the administrator write here)", path, principal);
+    }
+    true
+}
+
+/// MACHINESTOREOPEN leg of `tests rootacl`: the shared verdict both arches' `SYS_OPEN` ask. An `anon` write of the store's
+/// `general` (8.3 and lower-case relative spellings) must be refused, its read admitted, a path outside the store and a
+/// near-miss folder admitted, and the administrator (when the user store names one) admitted. One summary line.
+fn store_open_leg(admin: Option<&str>) -> bool {
+    const P: &str = "/SETTINGS/GENERAL";
+    let w = store_open_refused(P, true, "anon") && store_open_refused("settings/general", true, "anon");
+    let r = !store_open_refused(P, false, "anon");
+    let other = !store_open_refused("/APPS/SETTINGS.ELF", true, "anon");
+    let near = !store_open_refused("/SETTINGSX/GENERAL", true, "anon");
+    let admin_tok = match admin {
+        Some(n) => {
+            let p = alloc::format!("user:{}#0", n);
+            if store_open_refused(P, true, &p) { "REFUSED" } else { "ok" }
+        }
+        None => "no-admin",
+    };
+    let ok = |b: bool| if b { "ok" } else { "REFUSED" };
+    let pass = w && r && other && near && admin_tok != "REFUSED";
+    serial_println!(
+        ":: MACHINESTOREOPEN: write={} read={} other={} near={} admin={} -> {} :: path={} by=anon ::",
+        if w { "refused" } else { "ADMITTED" },
+        ok(r),
+        if other { "ok" } else { "REFUSED" },
+        if near { "ok" } else { "REFUSED" },
+        admin_tok,
+        if pass { "PASS" } else { "FAIL" },
+        P,
+    );
+    pass
 }
