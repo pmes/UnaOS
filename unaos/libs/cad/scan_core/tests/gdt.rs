@@ -268,3 +268,49 @@ fn minzone_cylindricity_reads_under_least_squares_on_a_tilted_cylinder() {
     assert!(!m.ls && m.mm <= cy + 1e-12, "post min-zone {m:?} over least squares {cy}");
     assert!(p.minzone_tokens().starts_with(" minzone_cylindricity=") && p.minzone_flatness_mm.is_none());
 }
+
+// ---- VUGSCANGDTSPEC (LEDGER SR559): the callout parsed once; profile of a surface ----
+
+/// `Callout::parse` reads `<face>=<kind>:<tol>` at the LAST `=` and the LAST `:` (a face name carries `:` and may carry
+/// `=`), its `Display` reads back to the same callout, and every malformed callout is refused by name.
+#[test]
+fn a_callout_parses_once_round_trips_and_refuses_by_name() {
+    use scan_core::gdt::{Callout, GdtSpecError};
+    let c = Callout::parse("box/f3:plane=flatness:0.05").expect("parses");
+    assert_eq!(c, Callout { face: "box/f3:plane".into(), kind: Kind::Flatness, tol_mm: 0.05 });
+    let c = Callout::parse("a=b:c=profile:1.5").expect("parses");
+    assert_eq!((c.face.as_str(), c.kind, c.tol_mm), ("a=b:c", Kind::Profile, 1.5));
+    for s in ["box/f3:plane=flatness:0.05", "post/f0:cylinder=cylindricity:0.1", "p=position:2", "a=b:c=profile:1.5", "x=profile:0.000125"] {
+        let c = Callout::parse(s).expect(s);
+        assert_eq!(Callout::parse(&c.to_string()), Ok(c.clone()), "{s} -> {c}");
+    }
+    assert_eq!(Callout::parse("nosuch"), Err(GdtSpecError::GdtFace));
+    assert_eq!(Callout::parse("=flatness:1"), Err(GdtSpecError::GdtFace));
+    assert_eq!(Callout::parse("f=flatness"), Err(GdtSpecError::GdtKind { kind: "flatness".into() }));
+    assert_eq!(Callout::parse("f=roundness:1"), Err(GdtSpecError::GdtKind { kind: "roundness".into() }));
+    for tol in ["0", "-1", "inf", "NaN", "x", ""] {
+        assert_eq!(Callout::parse(&format!("f=flatness:{tol}")), Err(GdtSpecError::BadTol { tol: tol.into() }), "{tol}");
+    }
+    for k in [Kind::Flatness, Kind::Cylindricity, Kind::Position, Kind::Profile] {
+        assert_eq!(Kind::parse(k.name()), Some(k));
+    }
+}
+
+/// Profile of a surface on the SR510 fixture: the zone centred on the nominal (2 · max |d|) is never below the band
+/// (max − min), plane and cylinder both take it, and its verdict passes on and above the value and fails below.
+#[test]
+fn a_profile_callout_reads_the_nominal_zone_pass_and_fail() {
+    let g = faces();
+    let (t, p) = (top(&g), post(&g));
+    let (tp, pp) = (t.profile_mm.expect("top profile"), p.profile_mm.expect("post profile"));
+    println!("gdt: profile top={tp:.3} band={:.3} post={pp:.3} band={:.3}", t.band_mm.unwrap_or(f64::NAN), p.band_mm.unwrap_or(f64::NAN));
+    for f in [t, p] {
+        let (pr, band) = (f.profile_mm.unwrap(), f.band_mm.expect("band"));
+        assert!(pr.is_finite() && pr >= band, "face {} profile {pr} below band {band}", f.face);
+        assert!(f.accepts(Kind::Profile));
+        assert_eq!(f.value(Kind::Profile), Some(pr));
+        assert!(matches!(f.verdict(Kind::Profile, pr + 0.1), Verdict::Pass { .. }));
+        assert_eq!(f.verdict(Kind::Profile, pr), Verdict::Pass { value_mm: pr, tol_mm: pr });
+        assert_eq!(f.verdict(Kind::Profile, pr * 0.5), Verdict::Fail { value_mm: pr, tol_mm: pr * 0.5 });
+    }
+}

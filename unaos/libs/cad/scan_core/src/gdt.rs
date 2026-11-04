@@ -30,7 +30,7 @@
 //!    of the measured axis from the nominal one at the feature's two axial ends. The frame is the design's after the
 //!    best-fit registration; a datum frame is owed (VUG-SCAN-GDT-DATUMS).
 //! 5. `band_mm`: the nominal-relative band (max − min of the signed deviation over the form vertices), printed beside
-//!    the form values and never given a verdict: it carries the face's offset, tilt and radius error (ISO profile).
+//!    the form values; the zone that takes a verdict is `profile_mm` ([`Kind::Profile`], VUGSCANGDTSPEC SR559).
 
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
@@ -74,6 +74,8 @@ pub enum Kind {
     Flatness,
     Cylindricity,
     Position,
+    /// Profile of a surface (ISO 1101, no datum): the zone centred on the nominal, `FaceGdt::profile_mm`. VUGSCANGDTSPEC (SR559).
+    Profile,
 }
 
 impl Kind {
@@ -82,6 +84,7 @@ impl Kind {
             "flatness" => Some(Kind::Flatness),
             "cylindricity" => Some(Kind::Cylindricity),
             "position" => Some(Kind::Position),
+            "profile" => Some(Kind::Profile),
             _ => None,
         }
     }
@@ -91,6 +94,7 @@ impl Kind {
             Kind::Flatness => "flatness",
             Kind::Cylindricity => "cylindricity",
             Kind::Position => "position",
+            Kind::Profile => "profile",
         }
     }
 }
@@ -118,6 +122,9 @@ pub struct FaceGdt {
     pub cylindricity_mm: Option<f64>,
     pub position_mm: Option<f64>,
     pub band_mm: Option<f64>,
+    /// VUGSCANGDTSPEC (SR559): profile of a surface, 2 · max |signed deviation| over the form vertices (the width of the
+    /// zone centred on the nominal that holds them all; never below `band_mm`).
+    pub profile_mm: Option<f64>,
     pub axis: Option<Cylinder>,
     pub extent: (f64, f64),
     pub minzone_flatness_mm: Option<MinZone>,
@@ -125,9 +132,9 @@ pub struct FaceGdt {
 }
 
 impl FaceGdt {
-    /// Whether this face's surface takes the kind: flatness a plane, cylindricity and position a cylinder.
+    /// Whether this face's surface takes the kind: flatness a plane, cylindricity and position a cylinder, profile either.
     pub fn accepts(&self, kind: Kind) -> bool {
-        matches!((kind, self.nominal), (Kind::Flatness, Nominal::Plane(_)) | (Kind::Cylindricity | Kind::Position, Nominal::Cylinder(_)))
+        matches!((kind, self.nominal), (Kind::Flatness, Nominal::Plane(_)) | (Kind::Cylindricity | Kind::Position, Nominal::Cylinder(_)) | (Kind::Profile, Nominal::Plane(_) | Nominal::Cylinder(_)))
     }
 
     pub fn value(&self, kind: Kind) -> Option<f64> {
@@ -135,6 +142,7 @@ impl FaceGdt {
             Kind::Flatness => self.flatness_mm,
             Kind::Cylindricity => self.cylindricity_mm,
             Kind::Position => self.position_mm,
+            Kind::Profile => self.profile_mm,
         }
     }
 
@@ -269,6 +277,7 @@ pub fn gdt(scan: &ScanMesh, design: &Design, dev: &Deviation, margin_mm: f64, to
                 cylindricity_mm: None,
                 position_mm: None,
                 band_mm: None,
+                profile_mm: None,
                 axis: None,
                 extent: (0.0, 0.0),
                 minzone_flatness_mm: None,
@@ -312,7 +321,7 @@ pub fn gdt(scan: &ScanMesh, design: &Design, dev: &Deviation, margin_mm: f64, to
             if out.n < GDT_MIN_POINTS {
                 return out;
             }
-            out.band_mm = spread(dev_mm.iter().copied());
+            out.band_mm = spread(dev_mm.iter().copied()); out.profile_mm = dev_mm.iter().map(|d| 2.0 * d.abs()).reduce(f64::max); // VUGSCANGDTSPEC (SR559): the zone centred on the nominal
             match nominal {
                 Nominal::Plane(_) => {
                     if let Ok(f) = fit_plane(&pts, FIT_BAND) {
@@ -626,4 +635,54 @@ pub fn cylindricity_minzone(points: &[Vec3], ls: &Cylinder, tol: Tol) -> MinZone
         }
     }
     fallback
+}
+
+// ---- VUGSCANGDTSPEC (LEDGER SR559): the `<face>=<kind>:<tol>` callout parsed once ----
+//
+// VUGSCANGDT (SR542, tools/scan `--gdt`) and VUGFACEGDT (SR553, vug-view's `gdt` command) each split the callout
+// themselves; [`Callout::parse`] is the one grammar both call: the face before the LAST `=` (a face name carries `:` and
+// may carry `=`), the kind ([`Kind::parse`]) and the tolerance either side of the LAST `:` after it, the tolerance a
+// finite number of millimetres above 0. Each refusal is named; the callers keep their own face lookup and refusals.
+
+/// A tolerance named on a design face by its name: `<face>=<kind>:<tol>`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Callout {
+    pub face: alloc::string::String,
+    pub kind: Kind,
+    pub tol_mm: f64,
+}
+
+/// Why a callout did not parse.
+#[derive(Clone, Debug, PartialEq)]
+pub enum GdtSpecError {
+    /// No `=`, or nothing before the last one.
+    GdtFace,
+    /// No `:` after the last `=`, or a kind [`Kind::parse`] does not read.
+    GdtKind { kind: alloc::string::String },
+    /// The tolerance is not a number, not finite, or not above 0.
+    BadTol { tol: alloc::string::String },
+}
+
+impl Callout {
+    /// `<face>=<kind>:<tol>` (see the section comment).
+    pub fn parse(s: &str) -> Result<Callout, GdtSpecError> {
+        let (face, rest) = s.rsplit_once('=').ok_or(GdtSpecError::GdtFace)?;
+        if face.is_empty() {
+            return Err(GdtSpecError::GdtFace);
+        }
+        let (kind, tol) = rest.rsplit_once(':').ok_or_else(|| GdtSpecError::GdtKind { kind: rest.into() })?;
+        let kind = Kind::parse(kind).ok_or_else(|| GdtSpecError::GdtKind { kind: kind.into() })?;
+        let tol_mm = match tol.parse::<f64>() {
+            Ok(t) if t.is_finite() && t > 0.0 => t,
+            _ => return Err(GdtSpecError::BadTol { tol: tol.into() }),
+        };
+        Ok(Callout { face: face.into(), kind, tol_mm })
+    }
+}
+
+impl core::fmt::Display for Callout {
+    /// `<face>=<kind>:<tol>`, which [`Callout::parse`] reads back to the same callout.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}={}:{}", self.face, self.kind.name(), self.tol_mm)
+    }
 }
