@@ -52,6 +52,14 @@ pub struct Map {
     pub gdt: Vec<scan_core::FaceGdt>,
     /// VUGFACEGDT (SR553): the tolerances named on the face (`gdt <face>=<kind>:<tol>`, [`command`]), in the order named.
     pub callouts: Vec<Callout>,
+    /// VUGFACEGDTREMEASURE (SR560): the edge margin (mm) this map's gdt and frame read at ([`open`]'s argument).
+    pub margin_mm: f64,
+    /// VUGFACEGDTREMEASURE (SR560): the scan and the design the map measured, what scan_core `frame_of` reads after the open.
+    pub basis: std::sync::Arc<(ScanMesh, Design)>,
+    /// VUGFACEGDTREMEASURE (SR560): the datum faces A|B|C (`datum A=<f> B=<f> C=<f>`, [`command`]).
+    pub datums: Option<[u32; 3]>,
+    /// VUGFACEGDTREMEASURE (SR560): the datum frame position reads in, or its refusal on a re-measure ([`reframe`]).
+    pub frame: Option<Result<scan_core::gdt::DatumFrame, String>>,
 }
 
 /// A scan mesh read from a file (a PLY carries no normals, no confidence and no intrinsics): mesh_core's
@@ -87,9 +95,9 @@ fn mean3(a: u32, b: u32, c: u32) -> u32 {
 }
 
 /// Measure `scan` against `doc` at `band_mm` from the identity: the model to draw (the scan at the aligned pose, or as
-/// read on a refusal) and the map. A design that does not build refuses the whole open (`Err`); a registration
-/// refusal is the map's (`Map::result`), shown by name.
-pub fn open(scan: &ScanMesh, doc: &Doc, band_mm: f64) -> Result<(Model, Map), String> {
+/// read on a refusal) and the map, its gdt read at the edge margin `margin_mm` (VUGFACEGDTREMEASURE SR560). A design
+/// that does not build refuses the whole open (`Err`); a registration refusal is the map's (`Map::result`), shown by name.
+pub fn open(scan: &ScanMesh, doc: &Doc, band_mm: f64, margin_mm: f64) -> Result<(Model, Map), String> {
     let (design, names) = design(doc)?;
     let result = measure(scan, &design, Transform::IDENTITY, &AlignParams::DEFAULT, band_mm, Tol::DEFAULT);
     let (positions, vertex): (Vec<_>, Vec<u32>) = match &result {
@@ -108,7 +116,7 @@ pub fn open(scan: &ScanMesh, doc: &Doc, band_mm: f64) -> Result<(Model, Map), St
     };
     let model = Model::from_mesh(mesh)?;
     let on = result.is_ok();
-    Ok((model, Map { on, band_mm, names, gdt: gdt_of(scan, &design, &result), result, vertex, tri, pick: None, source: None, callouts: Vec::new() })) // VUGFACEDEVIATIONJOURNAL (SR550) + VUGFACEGDT (SR553): no source, no callouts yet; the gdt read once per build
+    let mut map = Map { on, band_mm, names, gdt: Vec::new(), result, vertex, tri, pick: None, source: None, callouts: Vec::new(), margin_mm, basis: std::sync::Arc::new((scan.clone(), design)), datums: None, frame: None }; reframe(&mut map); Ok((model, map)) // VUGFACEDEVIATIONJOURNAL (SR550) + VUGFACEGDT (SR553): no source, no callouts yet; VUGFACEGDTREMEASURE (SR560): the gdt read once per build through reframe
 }
 
 /// The corner's lines: the statistics and the worst [`WORST`] faces (matched ones, by rms) with their signed mean, or
@@ -128,7 +136,7 @@ fn measured(map: &Map) -> Vec<String> {
                 let name = map.names.get(f.face as usize).map(String::as_str).unwrap_or("?");
                 out.push(format!("{name} rms={:.3} mean={:+.3}", f.rms_mm, f.mean_mm));
             }
-            out.extend(gdt_lines(map)); out // VUGFACEGDT (SR553): a line per callout after the faces
+            out.extend(frame_line(map)); out.extend(gdt_lines(map)); out // VUGFACEGDT (SR553): a line per callout after the faces; VUGFACEGDTREMEASURE (SR560): the frame line first
         }
         Err(DeviationError::NoAlignment { rms_mm, pairs }) => vec![format!("refused NoAlignment rms={rms_mm:.3} pairs={pairs}")],
         Err(DeviationError::Unconstrained { level }) => vec![format!("refused Unconstrained level={level}")],
@@ -316,7 +324,7 @@ impl Viewer {
     pub fn against_journal(&mut self, scan: ScanMesh) -> Result<(), String> {
         let doc = self.view.design.journal.doc.clone();
         journal_body(&doc)?;
-        let (model, mut map) = open(&scan, &doc, BAND_MM)?;
+        let (model, mut map) = open(&scan, &doc, BAND_MM, GDT_MARGIN_MM)?; // VUGFACEGDTREMEASURE (SR560): a ScanMesh carries no truncation: the fallback
         map.source = Some(Source { scan, doc, generation: 0, measured: 0, refused: None });
         self.model = model;
         self.view.deviation = Some(map);
@@ -338,12 +346,13 @@ pub fn follow(v: &mut Viewer) {
     let doc = v.view.design.journal.doc.clone();
     src.generation += 1;
     let generation = src.generation;
-    let out = journal_body(&doc).and_then(|()| open(&src.scan, &doc, m.band_mm));
+    let out = journal_body(&doc).and_then(|()| open(&src.scan, &doc, m.band_mm, m.margin_mm)); // VUGFACEGDTREMEASURE (SR560): the map's margin kept
     src.doc = doc;
     match out {
         Ok((model, mut map)) => {
             map.on = m.on && map.result.is_ok();
             map.source = m.source.take().map(|s| Source { measured: generation, refused: None, ..s });
+            carry(m, &mut map, &model); // VUGFACEGDTREMEASURE (SR560): the callouts and the datums follow the re-measure, re-read and re-tinted
             *m = map;
             v.model = model;
         }
@@ -360,8 +369,9 @@ pub fn follow(v: &mut Viewer) {
 // (`<face> <kind>=<mm> tol=<mm> PASS|FAIL|UNMEASURED`) and a FAIL face's scan vertices take the band ramp's over colour
 // (`colour(Shade::Over(1.0))`, [`retint`]); `gdt clear` removes them. BP-vug-5: a printed verdict, nothing changes.
 
-/// The edge margin (mm) [`gdt_of`] passes to scan_core's `gdt`: tools/scan's default `--trunc` (3 x its 4 mm voxel), the
-/// TSDF truncation a fused scan carries (a PLY carries none; VUG-FACE-GDT-MARGIN owes the scan's own).
+/// The FALLBACK edge margin (mm) for scan_core's `gdt` when the caller knows no truncation (a PLY carries none;
+/// `Viewer::open_deviation(.., None)`): tools/scan's default `--trunc` (3 x its 4 mm voxel). A caller that fused the scan
+/// passes the volume's own `Tsdf::trunc_mm()` (VUGFACEGDTREMEASURE SR560).
 pub const GDT_MARGIN_MM: f64 = 12.0;
 
 /// A tolerance named on a design face: the face (an index into `Map::names`), the kind and the tolerance (mm).
@@ -372,10 +382,11 @@ pub struct Callout {
     pub tol_mm: f64,
 }
 
-/// Every design face read as tolerances (scan_core's `gdt` at [`GDT_MARGIN_MM`]), or none on a refused registration.
-pub fn gdt_of(scan: &ScanMesh, design: &Design, result: &Result<Deviation, DeviationError>) -> Vec<scan_core::FaceGdt> {
+/// Every design face read as tolerances (scan_core's `gdt` at the edge margin `margin_mm`), or none on a refused
+/// registration.
+pub fn gdt_of(scan: &ScanMesh, design: &Design, result: &Result<Deviation, DeviationError>, margin_mm: f64) -> Vec<scan_core::FaceGdt> {
     match result {
-        Ok(d) => scan_core::gdt(scan, design, d, GDT_MARGIN_MM, Tol::DEFAULT),
+        Ok(d) => scan_core::gdt(scan, design, d, margin_mm, Tol::DEFAULT), // VUGFACEGDTREMEASURE (SR560): the margin an argument
         Err(_) => Vec::new(),
     }
 }
@@ -387,6 +398,7 @@ pub fn gdt_of(scan: &ScanMesh, design: &Design, result: &Result<Deviation, Devia
 /// kind), anything else the usage. True when the map changed.
 pub fn command(view: &mut View, model: &Model, line: &str) -> Result<bool, String> {
     const USAGE: &str = "usage: gdt <face>=<kind>:<tol> | gdt clear";
+    if let Some(r) = datum_command(view, model, line) { return r; } // VUGFACEGDTREMEASURE (SR560): `datum ...` is the frame's command
     let rest = line.trim().strip_prefix("gdt ").map(str::trim).ok_or(USAGE)?;
     let m = view.deviation.as_mut().ok_or("gdt: no map")?;
     if let Err(e) = &m.result {
@@ -489,4 +501,121 @@ fn lazy(v: &mut Viewer) {
     }
     src.doc = doc.clone();
     show(&mut v.view);
+}
+
+// ---- VUGFACEGDTREMEASURE (LEDGER SR560): the callouts and the datum frame follow a re-measure ----
+// VUGFACEGDT (SR553) read the gdt once per build, but [`follow`] builds a new Map on every journal change, so the callouts
+// were lost; [`carry`] moves them (and the datum faces) into the new map BY FACE NAME (an edit can renumber faces), then
+// [`reframe`] re-reads the gdt and the frame and [`retint`] re-tints. `datum A=<f> B=<f> C=<f>` ([`command`]) names an
+// ISO 5459 datum frame: scan_core `gdt::frame_of` on the map's own scan and design at its margin, every cylinder face's
+// position re-read in it by scan_core `gdt::in_frame` (the one loop tools/scan's `--datum` also calls); the corner gains
+// `frame A= B= C= residual=` before the callout lines. BP-vug-5: a printed verdict, nothing changes.
+
+/// The datum frame on design faces `faces` (scan_core `frame_of` on the map's basis at its margin); refused by
+/// tools/scan's name `GdtDatum <face> <error>` (the face of the refused label), or the refused map.
+fn frame(map: &Map, faces: [u32; 3]) -> Result<scan_core::gdt::DatumFrame, String> {
+    let Ok(d) = &map.result else { return Err("datum: refused map".to_string()) };
+    let (scan, design) = &*map.basis;
+    scan_core::gdt::frame_of(scan, design, d, faces, map.margin_mm, Tol::DEFAULT).map_err(|e| {
+        let k = scan_core::gdt::DATUM_LABELS.iter().position(|&l| l == e.label()).unwrap_or(0);
+        let name = map.names.get(faces[k] as usize).map(String::as_str).unwrap_or("?");
+        format!("GdtDatum {name} {e:?}")
+    })
+}
+
+/// The map's gdt re-read on its basis at its margin ([`gdt_of`]), then the frame of its datums (if any) and every
+/// cylinder face's position read in it (scan_core `gdt::in_frame`). The verdicts are read on demand from `gdt`.
+pub fn reframe(map: &mut Map) {
+    let basis = map.basis.clone();
+    let (scan, design) = &*basis;
+    map.gdt = gdt_of(scan, design, &map.result, map.margin_mm);
+    let datums = map.datums;
+    let fr = datums.map(|f| frame(&*map, f));
+    map.frame = fr;
+    if let Some(Ok(fr)) = map.frame.clone() {
+        scan_core::gdt::in_frame(&mut map.gdt, &fr);
+    }
+}
+
+/// A re-measure keeps what was named on the old map: each callout whose face name the new design still has (by name,
+/// the new index), the datum faces likewise (a datum whose face is gone leaves the frame refused
+/// `GdtDatumFace <label> <name>`, named on the corner); then [`reframe`] and [`retint`] on the new measurement.
+fn carry(old: &Map, new: &mut Map, model: &Model) {
+    let name = |f: u32| old.names.get(f as usize).cloned();
+    let names = new.names.clone();
+    let at = |n: &str| names.iter().position(|x| x == n).map(|i| i as u32);
+    new.callouts = old.callouts.iter().filter_map(|c| Some(Callout { face: at(name(c.face)?.as_str())?, ..*c })).collect();
+    let mut lost = None;
+    new.datums = None;
+    if let Some(d) = old.datums {
+        let mut faces = [0u32; 3];
+        for k in 0..3 {
+            match name(d[k]).as_deref().and_then(at) {
+                Some(i) => faces[k] = i,
+                None => {
+                    lost.get_or_insert(format!("GdtDatumFace {} {}", scan_core::gdt::DATUM_LABELS[k], name(d[k]).unwrap_or_default()));
+                }
+            }
+        }
+        if lost.is_none() {
+            new.datums = Some(faces);
+        }
+    }
+    reframe(new);
+    if lost.is_some() {
+        new.frame = lost.map(Err);
+    }
+    retint(new, model);
+}
+
+/// `datum ...` lines are the frame's ([`datum`]); any other line is not (None).
+fn datum_command(view: &mut View, model: &Model, line: &str) -> Option<Result<bool, String>> {
+    let rest = line.trim().strip_prefix("datum")?;
+    if !(rest.is_empty() || rest.starts_with(' ')) {
+        return None;
+    }
+    Some(datum(view, model, rest.trim()))
+}
+
+/// `datum A=<face> B=<face> C=<face>` (tools/scan's `--datum`: exactly three, labelled A, B, C in order, each face as the
+/// corner names it, split at the FIRST `=`) names the datum frame; `datum clear` removes it. Refused by name, nothing
+/// changed: no map, a refused map, `GdtDatumFace <label> <face>` (no such face), `GdtDatum <face> <error>` (scan_core
+/// `frame_of`'s refusal), anything else the usage. A position FAIL tints ([`retint`]). True when the map changed.
+fn datum(view: &mut View, model: &Model, rest: &str) -> Result<bool, String> {
+    const USAGE: &str = "usage: datum A=<face> B=<face> C=<face> | datum clear";
+    let m = view.deviation.as_mut().ok_or("datum: no map")?;
+    if let Err(e) = &m.result {
+        return Err(format!("datum: refused map {e:?}"));
+    }
+    if rest == "clear" {
+        let changed = m.datums.is_some() || m.frame.is_some();
+        m.datums = None;
+        reframe(m);
+        retint(m, model);
+        return Ok(changed);
+    }
+    let args: Vec<&str> = rest.split_whitespace().collect();
+    if args.len() != 3 {
+        return Err(USAGE.into());
+    }
+    let mut faces = [0u32; 3];
+    for (k, label) in ["A=", "B=", "C="].iter().enumerate() {
+        let face = args[k].strip_prefix(*label).filter(|f| !f.is_empty()).ok_or(USAGE)?;
+        faces[k] = m.names.iter().position(|n| n == face).ok_or_else(|| format!("GdtDatumFace {} {face}", scan_core::gdt::DATUM_LABELS[k]))? as u32;
+    }
+    frame(m, faces)?;
+    m.datums = Some(faces);
+    reframe(m);
+    retint(m, model);
+    Ok(true)
+}
+
+/// The corner's frame line: `frame A=<face> B=<face> C=<face> residual=<mm>`, or `frame refused <why>`; none without datums.
+fn frame_line(map: &Map) -> Option<String> {
+    let name = |f: u32| map.names.get(f as usize).map(String::as_str).unwrap_or("?");
+    match (&map.frame, map.datums) {
+        (Some(Ok(fr)), Some(d)) => Some(format!("frame A={} B={} C={} residual={:.3}", name(d[0]), name(d[1]), name(d[2]), fr.residual_mm)),
+        (Some(Err(why)), _) => Some(format!("frame refused {why}")),
+        _ => None,
+    }
 }
