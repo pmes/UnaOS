@@ -418,6 +418,7 @@ system.audio.volume = 12\n\
 system.display.brightness = 12\n\
 system.display.font = \"sans\"\n\
 system.display.font_size = 13\n\
+system.display.icc = \"\"\n\
 system.display.idle_min = 10\n\
 system.display.wallpaper = \"\"\n\
 system.dock.autohide = false\n\

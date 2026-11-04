@@ -436,7 +436,7 @@ pub fn census_minute() {
         "[hid] stall census holders={} worst_ms={} worst={} unnamed={} overflow={} pump_cpu={} placed={} over_ms={} -> {}",
         k, worst, HolderName(wix), k - said, HOLD_OVERFLOW.load(Relaxed), CpuWord(pump_cpu()), CpuWord(usb_pump_placed()), HOLD_OVER_MS,
         if k == 0 { "CLEAR" } else { "HELD" }
-    ); gap_split_minute(); #[cfg(all(target_arch = "x86_64", feature = "wc"))] { crate::fs::unafs::lockcensus::minute(); } // F39INPUTSTALL (B1097): the minute's HID gaps split into pass and wait, one line after the census (LINE-NEUTRAL fold, code first; body at the tail)
+    ); gap_split_minute(); #[cfg(all(target_arch = "x86_64", feature = "wc", feature = "unafs"))] { crate::fs::unafs::lockcensus::minute(); } // F39INPUTSTALL (B1097): the minute's HID gaps split into pass and wait, one line after the census (LINE-NEUTRAL fold, code first; body at the tail)
 }
 
 // ── HIDSTALL2 (B509): the release lane ─────────────────────────────────────────────────────────────────────────────────
