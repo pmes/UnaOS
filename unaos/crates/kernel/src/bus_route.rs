@@ -1250,16 +1250,32 @@ fn armlate_selftest(fx: &Fixture) {
     if rearmed {
         w |= 1 << 1;
     }
+    // L3 ARMLATE-SECOND-TENANT (B1192): a second tenant minted at the current generation by THIS task and armed as
+    // another program; then the note's minter made another task's (this task plays the FIRST tenant's launcher) and
+    // its late arm of `/apps/PREFS.ELF` is refused: the row stays the other program, never the fulfiller.
+    let _ = crate::video::wm::app_mint_note(owner_f, Some(rg));
+    let _ = crate::video::wm::app_name_arm(owner_f, "/apps/PROBE.ELF");
+    let other = tag_id(set, f, &mut nb) == TagId::Other;
+    crate::video::wm::app_mint_minter_set(owner_f, u64::MAX);
+    let refused = !crate::video::wm::app_name_arm(owner_f, "/apps/PREFS.ELF");
+    let kept = tag_id(set, f, &mut nb) == TagId::Other && {
+        let n = crate::video::wm::app_name_of(owner_f, &mut nb);
+        nb[..n] == *b"PROBE"
+    };
+    if other && refused && kept {
+        w |= 1 << 2;
+    }
     crate::video::wm::app_name_forget(owner_f);
     let _ = crate::video::wm::app_mint_note(owner_f, prev);
-    const ALL: u32 = (1 << 2) - 1;
+    const ALL: u32 = (1 << 3) - 1;
     if w == ALL {
-        serial_println!(":: BUSREG-ARMLATE: late=stale-dropped rearm=fulfiller -> PASS ::");
+        serial_println!(":: BUSREG-ARMLATE: late=stale-dropped rearm=fulfiller secondtenant=closed -> PASS ::");
     } else {
         serial_println!(
-            ":: BUSREG-ARMLATE: late={} rearm={} w={:#x}/{:#x} -> FAIL ::",
+            ":: BUSREG-ARMLATE: late={} rearm={} secondtenant={} w={:#x}/{:#x} -> FAIL ::",
             if w & 1 != 0 { "stale-dropped" } else { "KEPT" },
             if w & 2 != 0 { "fulfiller" } else { "NOT-FULFILLER" },
+            if w & 4 != 0 { "closed" } else { "OPEN" },
             w, ALL
         );
     }
