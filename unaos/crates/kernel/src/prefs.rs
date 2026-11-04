@@ -736,7 +736,7 @@ pub fn verb(args: &[&str], out: &mut dyn FnMut(&str)) {
             }
             None => out("pref: address is <ns>.<key> ([A-Za-z0-9_-] segments)"),
         },
-        ["list"] | ["list", _] => {
+        ["unset", a] => unset_verb(a, out), ["list"] | ["list", _] => { // PREFS-UNSET-VERB (rmbp-ledger B1161): the operator unset (file tail). LINE-NEUTRAL fold, code first
             let nss = match args.get(1) {
                 Some(ns) => alloc::vec![String::from(*ns)],
                 None => namespaces(),
@@ -753,7 +753,7 @@ pub fn verb(args: &[&str], out: &mut dyn FnMut(&str)) {
             }
             out(&alloc::format!("({})", path()));
         }
-        _ => out("usage: pref get <ns.key> | pref set <ns.key> <value> | pref list [<ns>]"),
+        _ => out("usage: pref get <ns.key> | pref set <ns.key> <value> | pref unset <ns.key> | pref list [<ns>]"),
     }
 }
 
@@ -985,7 +985,7 @@ pub fn selftest() {
         codec as u8, set_ok as u8, file_ok as u8, no_temp as u8, refused as u8, held as u8, restored as u8,
         loadclamp_ok as u8, clamp_ok as u8, if wire_ok { "shared" } else { "diverged" }, rows, if ok { "PASS" } else { "FAIL" }
     );
-    settingsfiles_selftest();
+    settingsfiles_selftest(); unset_selftest(); // PREFS-UNSET-VERB (rmbp-ledger B1161): the unset KAT (file tail). LINE-NEUTRAL fold, code first
 }
 
 /// SETTINGSFILES (B407, R98) — `tests prefs`' second line (never at boot, R80): a program declares a stanza
@@ -1895,4 +1895,119 @@ fn machine_refused(mt: &crate::fs::vfs::MountTable, p: &str) -> bool {
 /// `tests rootacl`'s MACHINESTORE plant leg reads through the one reader.
 pub(crate) fn store_read(p: &str) -> Option<Vec<u8>> {
     read_all(p)
+}
+
+// ── PREFS-UNSET-VERB (rmbp-ledger B1161, BP-storage-11) — TAIL-APPENDED ────────────────────────────────────────────────
+// The operator's `pref unset <ns.key>`: the key leaves the session store by THE ONE RULE the delete watch and the session
+// reload already keep — removed from the tree (never the default written into the user's file), its domain saved by the
+// same swap (`KernelPersist` -> `save_domain`, rolled back on a failed save), then ONE post through [`post_changes`] of
+// [`default_applied`]: the static or declared default as `Some`, SR169's unset form (`None`) only for a Consumer-default or
+// undeclared key. So a static-default machine key reaches `machine_mirror` as `Some(<default>)` (`=<default>`), and
+// B1154's `=unset` arm stays dark at this cut. Operator-only: the bus has no unset request (PREFS-UNSET-BUS owed). The
+// writers column admits the operator for every key (`prefs_core::schema::Writer`), so there is no new check.
+// Wire: `[prefs] unset <ns>.<key> ok=1` (+ `[prefs] changed <ns>.<key>`), `ok=1 was=unset`, `ok=0 why=<e>`.
+
+/// Unset `ns`/`k` and persist its domain (see the block above). `Ok(true)` = a value left the store and was posted;
+/// `Ok(false)` = it was unset already (nothing saved, nothing posted).
+pub fn unset(ns: &str, k: &str) -> Result<bool, SetError> {
+    use prefs_core::wire::Persist as _;
+    ensure_loaded();
+    prefs_core::validate_ns(ns).map_err(SetError::Name)?;
+    prefs_core::validate_key(k).map_err(SetError::Name)?;
+    let mut kp = KernelPersist { err: None, domain: Some(prefs_core::files::domain_of(ns, k)) };
+    let Some(old) = kp.with_tree(|t| t.remove(ns, k)) else {
+        serial_println!("[prefs] unset {}.{} ok=1 was=unset", ns, k);
+        return Ok(false);
+    };
+    if kp.save().is_err() {
+        kp.with_tree(|t| {
+            let _ = t.set(ns, k, old);
+        });
+        let e = kp.err.take().unwrap_or_else(|| String::from("save failed"));
+        serial_println!("[prefs] unset {}.{} ok=0 why={}", ns, k, e);
+        return Err(SetError::Io(e));
+    }
+    serial_println!("[prefs] unset {}.{} ok=1", ns, k);
+    serial_println!("[prefs] changed {}.{}", ns, k);
+    let _ = post_changes(&[(String::from(ns), String::from(k), default_applied(ns, k))]);
+    Ok(true)
+}
+
+/// The `pref unset <ns.key>` arm of [`verb`].
+fn unset_verb(a: &str, out: &mut dyn FnMut(&str)) {
+    let Some((ns, k)) = split_addr(a) else {
+        out("pref: address is <ns>.<key> ([A-Za-z0-9_-] segments)");
+        return;
+    };
+    *BY.lock() = Some("the pref verb");
+    let r = unset(ns, k);
+    *BY.lock() = None;
+    match r {
+        Ok(true) => match default_applied(ns, k) {
+            Some(d) => out(&alloc::format!("{} unset (reads {})", a, d.value.to_literal())),
+            None => out(&alloc::format!("{} unset (reads its consumer's default)", a)),
+        },
+        Ok(false) => out(&alloc::format!("pref: {} was already unset", a)),
+        Err(e) => out(&alloc::format!("pref: {} refused: {}", a, e)),
+    }
+}
+
+/// `tests prefs`' unset line (B1161): a fixture key leaves the tree and its file; a second unset writes nothing; a
+/// Consumer-default key posts the unset form; a static-default key is removed (never written as its default) and posts
+/// the default; a malformed address is refused. The tree and every domain file touched are restored byte for byte.
+/// `:: PREFS-UNSET: removed=1 again=noop consumer=unset static=0 name=refused restored=1 -> PASS ::`.
+#[cfg(feature = "witness")]
+fn unset_selftest() {
+    let fp = domain_path("fixturens");
+    let doms = [prefs_core::files::domain_of(NS, key::LOWBAT_PCT), prefs_core::files::domain_of(NS, key::SETTINGS_TAB)];
+    let saved: Vec<(String, Option<Vec<u8>>)> = doms.iter().map(|d| (domain_path(d), read_all(&domain_path(d)))).collect();
+    let tree0 = TREE.lock().clone();
+    let (on_disk0, saved_n0) = (ON_DISK.lock().clone(), SAVED_N.load(Ordering::Relaxed));
+    *BY.lock() = Some("tests prefs");
+    // Leg 1 — a fixture key leaves the tree and its domain file.
+    let fu = "fixture.u";
+    let removed = set("fixturens", fu, PrefValue::Int(1)).is_ok()
+        && matches!(unset("fixturens", fu), Ok(true))
+        && get("fixturens", fu).is_none()
+        && read_all(&fp).and_then(|b| String::from_utf8(b).ok()).and_then(|t| PrefTree::parse(&t).ok()).is_some_and(|t| t.get("fixturens", fu).is_none())
+        && read_all(&alloc::format!("{}.new", fp)).is_none();
+    // Leg 2 — unset again: nothing saved.
+    let n_before = SAVED_N.load(Ordering::Relaxed);
+    SAVED_N.store(u32::MAX, Ordering::Relaxed);
+    let again = matches!(unset("fixturens", fu), Ok(false)) && SAVED_N.load(Ordering::Relaxed) == u32::MAX;
+    SAVED_N.store(n_before, Ordering::Relaxed);
+    // Leg 3 — a Consumer-default key: removed, posted as the unset form.
+    let lk = key::LOWBAT_PCT;
+    let consumer = set(NS, lk, PrefValue::Int(40)).is_ok() && matches!(unset(NS, lk), Ok(true)) && get(NS, lk).is_none() && default_applied(NS, lk).is_none();
+    // Leg 4 — a static-default key: removed (the store never writes the default), posted with the default.
+    let tk = key::SETTINGS_TAB;
+    let st_default = default_applied(NS, tk).map(|a| a.value);
+    let static_ok = set(NS, tk, PrefValue::Int(3)).is_ok() && matches!(unset(NS, tk), Ok(true)) && get(NS, tk).is_none() && st_default == Some(PrefValue::Int(0));
+    // Leg 5 — a malformed address.
+    let name = matches!(unset("bad ns", "k"), Err(SetError::Name(_)));
+    // Restore the tree and the files.
+    let mt = crate::shell::vfs_mount_table();
+    for (p, b) in saved.iter() {
+        match b {
+            Some(b) => {
+                let _ = write_all(p, b);
+            }
+            None => {
+                let _ = mt.unlink(p, crate::fs::vfs::KERNEL_PRINCIPAL);
+            }
+        }
+    }
+    let _ = mt.unlink(&fp, crate::fs::vfs::KERNEL_PRINCIPAL);
+    *TREE.lock() = tree0;
+    *ON_DISK.lock() = on_disk0;
+    SAVED_N.store(saved_n0, Ordering::Relaxed);
+    *BY.lock() = None;
+    let restored = saved.iter().all(|(p, b)| read_all(p) == *b) && read_all(&fp).is_none();
+    let ok = removed && again && consumer && static_ok && name && restored;
+    serial_println!(
+        ":: PREFS-UNSET: removed={} again={} consumer={} static={} name={} restored={} -> {} ::",
+        removed as u8, if again { "noop" } else { "wrote" }, if consumer { "unset" } else { "FAIL" },
+        st_default.map(|v| v.to_literal()).unwrap_or_else(|| String::from("none")), if name { "refused" } else { "admitted" },
+        restored as u8, if ok { "PASS" } else { "FAIL" }
+    );
 }
