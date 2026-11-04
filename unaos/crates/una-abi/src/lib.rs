@@ -1957,7 +1957,7 @@ pub const BUS_VERB_ALL: &[u8] = &[
     BUS_VERB_MENU_CLEAR, BUS_VERB_MENU_GET, BUS_VERB_NOTICE, BUS_VERB_ATTR_SET, BUS_VERB_ATTR_GET, BUS_VERB_ATTR_LIST,
     BUS_VERB_ATTR_QUERY, BUS_VERB_ATTR_STAT, BUS_VERB_PREF_GET, BUS_VERB_PREF_SET, BUS_VERB_PREF_LIST,
     BUS_VERB_PREF_CHANGED, BUS_VERB_REGISTER, BUS_VERB_HOLOCRON_FIRST, BUS_VERB_HOLOCRON_LAST, BUS_VERB_DIALOG,
-    BUS_VERB_SHEET, BUS_VERB_TOAST, BUS_VERB_PREF_DECLARE, BUS_VERB_DROP_GET, BUS_VERB_A11Y_TREE, BUS_VERB_SCROLL_SET, // RING3SCROLL (B778): verb 28 appended on the last line
+    BUS_VERB_SHEET, BUS_VERB_TOAST, BUS_VERB_PREF_DECLARE, BUS_VERB_DROP_GET, BUS_VERB_A11Y_TREE, BUS_VERB_SCROLL_SET, BUS_VERB_PREF_UNSET, // PREFS-UNSET-BUS (rmbp-ledger B1166): verb 29 appended. RING3SCROLL (B778): verb 28 appended on the last line
 ];
 /// No two entries equal (and none zero). `const` so the assertion below runs in the compiler.
 pub const fn codes_unique_u64(v: &[u64]) -> bool {
@@ -3632,3 +3632,15 @@ mod mailboxkeep_tests {
         assert_eq!(keep.take(&mut out), None);
     }
 }
+
+// =================================================================================================
+// PREFS-UNSET-BUS (rmbp-ledger B1166) — Principia's UNSET request beside PREF_GET/SET/LIST. Body = the GET address
+// `<ns>.<key>`; kernel-fulfilled through `prefs_core::wire::fulfil_as` (SET's gate: -EACCES outside the session or past
+// `prefs_core::cap::may_set` for the stamped caller); reply = 0 with the PREF_CHANGED unset form (`<ns>.<key>` NUL,
+// `prefs_core::wire::unset_body`), -ENOENT already unset, -EINVAL malformed, -EIO the write. 24 (the number after
+// PREF_DECLARE) is DROP_GET and 25..=28 are taken: 29 is the first free kernel verb. Appended at the file tail.
+// =================================================================================================
+
+/// Bus verb: unset one preference (the key reads its default again; session user only, SET's capability).
+pub const BUS_VERB_PREF_UNSET: u8 = 29;
+const _: () = assert!(BUS_VERB_PREF_UNSET > BUS_VERB_SCROLL_SET && BUS_VERB_PREF_UNSET < BUS_VERB_AUDIO_SOURCE_OPEN);
