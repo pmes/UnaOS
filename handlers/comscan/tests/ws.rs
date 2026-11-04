@@ -175,7 +175,7 @@ fn program() -> Program {
 }
 
 fn refuse(what: &'static str) -> Box<Opener> {
-    Box::new(move |port: &str| -> Result<Box<dyn Transport + Send>, String> { Err(format!("{what} asked for {port}")) })
+    Box::new(move |port: &str, _: Dialect| -> Result<Box<dyn Transport + Send>, String> { Err(format!("{what} asked for {port}")) })
 }
 
 #[test]
@@ -191,7 +191,7 @@ fn an_armed_program_streams_to_done_over_a_websocket_through_the_ws_arm() {
     let p = program();
     let mut desk = PumpDesk::new(machine()); // the fold composed SR499 onto SR498 (the desk declares its machine)
     let digest = desk.arm(&Verdict::Pass { digest: p.digest(), machine: machine().digest() }, &p, GRBL).expect("armed by a pass");
-    let mut open = with_ws(opener(GRBL, CONNECT_WAIT), by_scheme(refuse("serial"), refuse("tcp")));
+    let mut open = with_ws(opener(CONNECT_WAIT), by_scheme(refuse("serial"), refuse("tcp")));
     let start = PumpEvent::PumpStart {
         principal: Origin::LocalUser("una".to_string()),
         program: digest_hex(digest),
@@ -227,12 +227,12 @@ fn an_armed_program_streams_to_done_over_a_websocket_through_the_ws_arm() {
 
 #[test]
 fn the_ws_arm_routes_ws_and_wss_and_leaves_the_rest() {
-    let ws = Box::new(|port: &str| -> Result<Box<dyn Transport + Send>, String> { Err(format!("ws:{port}")) });
+    let ws = Box::new(|port: &str, _: Dialect| -> Result<Box<dyn Transport + Send>, String> { Err(format!("ws:{port}")) });
     let mut open = with_ws(ws, by_scheme(refuse("serial"), refuse("tcp")));
-    assert_eq!(open("ws://a:81/").err().unwrap(), "ws:ws://a:81/");
-    assert_eq!(open("wss://a/").err().unwrap(), "ws:wss://a/");
-    assert_eq!(open("tcp://a:23").err().unwrap(), "tcp asked for tcp://a:23");
-    assert_eq!(open("/dev/ttyUSB0").err().unwrap(), "serial asked for /dev/ttyUSB0");
+    assert_eq!(open("ws://a:81/", GRBL).err().unwrap(), "ws:ws://a:81/");
+    assert_eq!(open("wss://a/", GRBL).err().unwrap(), "ws:wss://a/");
+    assert_eq!(open("tcp://a:23", GRBL).err().unwrap(), "tcp asked for tcp://a:23");
+    assert_eq!(open("/dev/ttyUSB0", GRBL).err().unwrap(), "serial asked for /dev/ttyUSB0");
 }
 
 #[test]
@@ -446,7 +446,7 @@ fn drive_until(
         let now = t0.elapsed().as_micros() as u64;
         let mut out = desk.tick(now);
         if let Some(port) = desk.redial_due(now) {
-            let res = open(&port);
+            let res = open(&port, GRBL);
             out.extend(desk.relinked(t0.elapsed().as_micros() as u64, res));
         }
         for s in out {
@@ -473,7 +473,7 @@ fn a_close_frame_mid_program_is_link_lost_and_a_rearm_resumes_from_the_named_lin
     let mut desk = PumpDesk::new(machine());
     let pass = Verdict::Pass { digest: p.digest(), machine: machine().digest() };
     let digest = desk.arm(&pass, &p, GRBL).expect("armed by a pass");
-    let mut open = with_ws(opener(GRBL, CONNECT_WAIT), by_scheme(refuse("serial"), refuse("tcp")));
+    let mut open = with_ws(opener(CONNECT_WAIT), by_scheme(refuse("serial"), refuse("tcp")));
     let who = Origin::LocalUser("una".to_string());
     let start = PumpEvent::PumpStart {
         principal: who.clone(),
@@ -563,7 +563,7 @@ async fn the_bus_turns_the_hello_on_and_the_first_ws_open_keeps_its_answer() {
     let desk = Arc::new(Mutex::new(PumpDesk::new(machine()))); // no hello_within: the bus turns it on
     let pass = Verdict::Pass { digest: p.digest(), machine: machine().digest() };
     let digest = desk.lock().unwrap().arm(&pass, &p, GRBL).expect("armed by a pass");
-    let open = with_ws(opener(GRBL, CONNECT_WAIT), by_scheme(refuse("serial"), refuse("tcp")));
+    let open = with_ws(opener(CONNECT_WAIT), by_scheme(refuse("serial"), refuse("tcp")));
     let syn = Synapse::new();
     let rx = syn.subscribe();
     let mut watch = syn.subscribe();

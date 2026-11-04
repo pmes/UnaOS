@@ -12,6 +12,8 @@
 //! The lens (`k1`, VUG-PHOTO-LENS SR533) takes each sample through `homography::undistort` before the camera, so the
 //! measurement's own model renders the bowed grid exactly.
 //! The side view (VUG-PHOTO-SIDE SR545): [`render_side`] lays the part on its side, a [`PART_W`] x [`PART_T`] rectangle.
+//! The raised side (VUG-PHOTO-SIDE-PARALLAX SR568): [`render_side_raised`] stands the part on that face, its top
+//! `standing_mm` above the paper, each ray from the [`camera`] centre tested against the box.
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -145,12 +147,7 @@ pub fn outline_distance(q: Vec2) -> f64 {
 
 /// The true homography, paper mm → photo px (row-major, `px ~ H [x, y, 1]`).
 pub fn homography(s: &Spec) -> H {
-    let a = s.tilt_axis_deg.to_radians();
-    let t = s.tilt_deg.to_radians();
-    let axis = Vec3::new(libm::cos(a), libm::sin(a), 0.0);
-    let rodrigues = |v: Vec3| v * libm::cos(t) + axis.cross(v) * libm::sin(t) + axis * (axis.dot(v) * (1.0 - libm::cos(t)));
-    let r1 = rodrigues(Vec3::X);
-    let r2 = rodrigues(Vec3::Y);
+    let (r1, r2) = basis(s);
     let (f, d) = (s.focal_px, s.distance_mm);
     let (u0, v0) = (s.width as f64 * 0.5, s.height as f64 * 0.5);
     let hp = [
@@ -159,6 +156,16 @@ pub fn homography(s: &Spec) -> H {
         [-r1.z, -r2.z, d],
     ];
     mul(&hp, &[[1.0, 0.0, -s.centre.x], [0.0, 1.0, -s.centre.y], [0.0, 0.0, 1.0]])
+}
+
+/// The paper axes in the camera's frame: the tilt's Rodrigues rotation of x and y (VUG-PHOTO-SIDE-PARALLAX SR568 shares
+/// it with [`camera`]).
+fn basis(s: &Spec) -> (Vec3, Vec3) {
+    let a = s.tilt_axis_deg.to_radians();
+    let t = s.tilt_deg.to_radians();
+    let axis = Vec3::new(libm::cos(a), libm::sin(a), 0.0);
+    let rodrigues = |v: Vec3| v * libm::cos(t) + axis.cross(v) * libm::sin(t) + axis * (axis.dot(v) * (1.0 - libm::cos(t)));
+    (rodrigues(Vec3::X), rodrigues(Vec3::Y))
 }
 
 fn near_line(v: f64) -> bool {
@@ -267,5 +274,67 @@ pub fn render_side(s: &Spec, length_mm: f64, thickness_mm: f64) -> Image {
 /// The side photo as PNG bytes (pixel_core's encoder).
 pub fn side_png(s: &Spec, length_mm: f64, thickness_mm: f64) -> Vec<u8> {
     let img = render_side(s, length_mm, thickness_mm);
+    pixel_core::png::encode::encode_rgba(img.width, img.height, &img.rgba).unwrap_or_default()
+}
+
+// VUG-PHOTO-SIDE-PARALLAX (SR568): the part standing on its side, its top above the paper, through the same renderer.
+/// The camera centre in paper mm: `distance_mm` back along the optical axis from `centre` (x, y, and the height z).
+pub fn camera(s: &Spec) -> Vec3 {
+    let (r1, r2) = basis(s);
+    let d = s.distance_mm;
+    Vec3::new(s.centre.x + d * r1.z, s.centre.y + d * r2.z, d * r1.cross(r2).z)
+}
+
+impl Spec {
+    /// The side camera at 400 mm (the focal raised to 3200 px to keep ~8 px / mm), the arc's raised-edge camera.
+    pub fn side_raised() -> Spec {
+        Spec { focal_px: 3200.0, distance_mm: 400.0, ..Spec::side() }
+    }
+
+    /// [`Spec::side_raised`] square to the paper (no tilt), the strip off the nadir on the paper's +y side.
+    pub fn side_square() -> Spec {
+        Spec { tilt_deg: 0.0, part_at: Vec2::new(27.3, 48.7), ..Spec::side_raised() }
+    }
+}
+
+/// Whether the segment `p0`-`p1` meets the rectangle `0..w` x `0..h` (Liang-Barsky).
+fn segment_hits_rect(p0: Vec2, p1: Vec2, w: f64, h: f64) -> bool {
+    let d = p1 - p0;
+    let (mut t0, mut t1) = (0.0f64, 1.0f64);
+    for (p, q) in [(-d.x, p0.x), (d.x, w - p0.x), (-d.y, p0.y), (d.y, h - p0.y)] {
+        if p == 0.0 {
+            if q < 0.0 {
+                return false;
+            }
+        } else {
+            let r = q / p;
+            if p < 0.0 {
+                if r > t1 {
+                    return false;
+                }
+                t0 = t0.max(r);
+            } else {
+                if r < t0 {
+                    return false;
+                }
+                t1 = t1.min(r);
+            }
+        }
+    }
+    true
+}
+
+/// Render the side photo of a `length_mm` x `thickness_mm` side standing `standing_mm` tall: a sample is the part
+/// when its ray from the camera meets the box (in the part frame, the ray's run from the paper up to `standing_mm`).
+pub fn render_side_raised(s: &Spec, length_mm: f64, thickness_mm: f64, standing_mm: f64) -> Image {
+    let c = camera(s);
+    let cq = paper_to_part(s, Vec2::new(c.x, c.y));
+    let a = standing_mm / c.z;
+    render_shape(s, &|q: Vec2| segment_hits_rect(q, q + (cq - q) * a, length_mm, thickness_mm))
+}
+
+/// The raised side photo as PNG bytes (pixel_core's encoder).
+pub fn side_raised_png(s: &Spec, length_mm: f64, thickness_mm: f64, standing_mm: f64) -> Vec<u8> {
+    let img = render_side_raised(s, length_mm, thickness_mm, standing_mm);
     pixel_core::png::encode::encode_rgba(img.width, img.height, &img.rgba).unwrap_or_default()
 }

@@ -6,7 +6,8 @@
 use photo_core::fixture::{self, CORNER_R, HOLE_D, HOLES, PART_H, PART_T, PART_W, Spec};
 use photo_core::homography::{apply, dlt};
 use photo_core::{
-    Measured, PhotoParams, Prim, Refusal, Tol, Vec2, contour, fit, measure, measure_lens, measure_side, silhouette,
+    Measured, PhotoParams, Prim, Refusal, Tol, Vec2, contour, fit, measure, measure_lens, measure_side, measure_side_raised,
+    silhouette,
 };
 use sketch_core::{Constraint, Entity, EntityId, PointRef, dof, profiles, solve};
 
@@ -298,5 +299,94 @@ fn side_photo_of_another_part_refuses() {
     match measure_side(&first, &img, PhotoParams::new(5.0), Tol::DEFAULT) {
         Err(e) => assert_eq!(e.name(), "NoSideMatch", "{e:?}"),
         Ok(s) => panic!("expected NoSideMatch, got length {} thickness {}", s.length_mm, s.thickness_mm),
+    }
+}
+
+/// VUGPHOTOSIDEPARALLAX (SR568): the raw (long, short) extents the standing side reads under `s`'s TRUE camera: the
+/// footprint and its top (`z` up) scaled by k = Hc / (Hc - z) about the nadir, measured along the part's axes.
+fn predicted_raw(s: &Spec, l: f64, t: f64, z: f64) -> (f64, f64) {
+    let c = fixture::camera(s);
+    let n = Vec2::new(c.x, c.y);
+    let k = c.z / (c.z - z);
+    let foot: Vec<Vec2> =
+        [(0.0, 0.0), (l, 0.0), (l, t), (0.0, t)].iter().map(|&(x, y)| fixture::part_to_paper(s, Vec2::new(x, y))).collect();
+    let pts: Vec<Vec2> = foot.iter().flat_map(|&p| [p, n + (p - n) * k]).collect();
+    let r = s.part_rot_deg.to_radians();
+    let ext = |u: Vec2| {
+        let hi = pts.iter().map(|p| p.dot(u)).fold(f64::MIN, f64::max);
+        let lo = pts.iter().map(|p| p.dot(u)).fold(f64::MAX, f64::min);
+        hi - lo
+    };
+    let (a, b) = (ext(Vec2::new(r.cos(), r.sin())), ext(Vec2::new(-r.sin(), r.cos())));
+    (a.max(b), a.min(b))
+}
+
+/// VUGPHOTOSIDEPARALLAX (SR568): the fixture standing on its 50 x 6 face (its top PART_H above the paper) under the
+/// 400 mm camera tilted 12°: the camera self-calibrated from the side photo's lattice, the raw outline (~55.4 x 12.3)
+/// corrected to 50 x 6, the same as the flat render through the SR545 road; the raw photo refuses on that road.
+#[test]
+fn side_parallax_corrects_raised_photo() {
+    let first = run(&Spec::good()).expect("the good photo measures");
+    let s = Spec::side_raised();
+    let img = pixel_core::decode(&fixture::side_raised_png(&s, PART_W, PART_T, PART_H)).expect("pixel_core decodes the raised PNG");
+    let r = measure_side_raised(&first, &img, PhotoParams::new(5.0), Tol::DEFAULT).expect("the raised side photo measures");
+    let p = r.parallax.expect("the raised road reports its parallax");
+    let truth = fixture::camera(&s);
+    let (pl, pt) = predicted_raw(&s, PART_W, PART_T, PART_H);
+    // The lattice's paper frame is its own: compare the nadir in photo pixels, each through its homography.
+    let seen = apply(&r.side.h, p.camera.nadir).expect("the nadir maps into the photo plane");
+    let want = apply(&fixture::homography(&s), Vec2::new(truth.x, truth.y)).expect("the true nadir maps");
+    let px_per_mm = r.side.pitch_px / 5.0;
+    let nadir_mm = seen.dist(want) / px_per_mm;
+    eprintln!(
+        "photo: side-parallax raw={:.3}x{:.3} predicted_raw={:.3}x{:.3} corrected={:.3}x{:.3} paired={:.3} standing={:.3} k={:.4} height={:.2} truth_height={:.2} focal={:?} nadir_off_mm={:.3} sigma={:.4} tilt={:.2}",
+        p.raw_length_mm, p.raw_thickness_mm, pl, pt, r.length_mm, r.thickness_mm, r.paired_mm, p.standing_mm, p.k,
+        p.camera.height_mm, truth.z, p.camera.focal_px, nadir_mm, r.sigma_mm, r.side.tilt_deg
+    );
+    assert!((r.thickness_mm - PART_T).abs() < 0.1, "corrected thickness {} vs {PART_T}", r.thickness_mm);
+    assert!((r.length_mm - PART_W).abs() < 0.5, "corrected length {} vs {PART_W}", r.length_mm);
+    assert!((r.paired_mm - PART_W).abs() < 0.5, "paired {} vs {PART_W}", r.paired_mm);
+    assert!((p.raw_thickness_mm - pt).abs() < 0.3, "raw thickness {} vs predicted {pt}", p.raw_thickness_mm);
+    assert!(p.raw_thickness_mm > 11.5, "the parallax is in the raw photo: {}", p.raw_thickness_mm);
+    assert!((p.camera.height_mm - truth.z).abs() < 0.01 * truth.z, "height {} vs {}", p.camera.height_mm, truth.z);
+    assert!(nadir_mm < 1.0, "nadir off by {nadir_mm} mm");
+
+    let flat = pixel_core::decode(&fixture::side_png(&s, PART_W, PART_T)).expect("pixel_core decodes the side PNG");
+    let f = measure_side(&first, &flat, PhotoParams::new(5.0), Tol::DEFAULT).expect("the flat side photo measures");
+    eprintln!("photo: side-parallax flat thickness={:.3} length={:.3} vs corrected {:.3}", f.thickness_mm, f.length_mm, r.thickness_mm);
+    assert!((f.thickness_mm - r.thickness_mm).abs() < 0.05, "flat {} vs corrected {}", f.thickness_mm, r.thickness_mm);
+
+    match measure_side(&first, &img, PhotoParams::new(5.0), Tol::DEFAULT) {
+        Err(e) => assert_eq!(e.name(), "NoSideMatch", "{e:?}"),
+        Ok(x) => panic!("the uncorrected road paired a raised photo: length {} thickness {}", x.length_mm, x.thickness_mm),
+    }
+}
+
+/// VUGPHOTOSIDEPARALLAX (SR568): a square camera (no tilt) gives no height from the lattice: the person's
+/// `camera_mm` = 400 corrects the off-nadir strip (raw ~54.1 x 7.1) to 50 x 6, the flat render's reading; without it
+/// the photo refuses NoCamera by name.
+#[test]
+fn side_parallax_square_camera_takes_camera_mm() {
+    let first = run(&Spec::good()).expect("the good photo measures");
+    let s = Spec::side_square();
+    let img = pixel_core::decode(&fixture::side_raised_png(&s, PART_W, PART_T, PART_H)).expect("pixel_core decodes the raised PNG");
+    let params = PhotoParams { camera_mm: Some(400.0), ..PhotoParams::new(5.0) };
+    let r = measure_side_raised(&first, &img, params, Tol::DEFAULT).expect("the square raised photo measures");
+    let p = r.parallax.expect("the raised road reports its parallax");
+    let (pl, pt) = predicted_raw(&s, PART_W, PART_T, PART_H);
+    let flat = pixel_core::decode(&fixture::side_png(&s, PART_W, PART_T)).expect("pixel_core decodes the side PNG");
+    let f = measure_side(&first, &flat, PhotoParams::new(5.0), Tol::DEFAULT).expect("the flat side photo measures");
+    eprintln!(
+        "photo: side-parallax square camera_mm=400 raw={:.3}x{:.3} predicted_raw={:.3}x{:.3} corrected={:.3}x{:.3} k={:.4} flat={:.3} tilt={:.2}",
+        p.raw_length_mm, p.raw_thickness_mm, pl, pt, r.length_mm, r.thickness_mm, p.k, f.thickness_mm, r.side.tilt_deg
+    );
+    assert!((r.thickness_mm - PART_T).abs() < 0.1, "corrected thickness {} vs {PART_T}", r.thickness_mm);
+    assert!((p.raw_thickness_mm - pt).abs() < 0.3, "raw thickness {} vs predicted {pt}", p.raw_thickness_mm);
+    assert!((f.thickness_mm - r.thickness_mm).abs() < 0.05, "flat {} vs corrected {}", f.thickness_mm, r.thickness_mm);
+    assert_eq!(p.camera.focal_px, None, "a square camera is not self-calibrated");
+
+    match measure_side_raised(&first, &img, PhotoParams::new(5.0), Tol::DEFAULT) {
+        Err(e) => assert_eq!(e.name(), "NoCamera", "{e:?}"),
+        Ok(x) => panic!("a square camera with no camera_mm measured: thickness {}", x.thickness_mm),
     }
 }
