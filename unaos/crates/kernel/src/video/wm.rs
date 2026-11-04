@@ -1941,7 +1941,7 @@ fn pace_admit(id: WinId, exempt: bool) -> bool {
 /// bounded scan of [`MAX_WINDOWS`] stamps, no locks.
 #[cfg(all(target_arch = "x86_64", feature = "wc"))]
 pub fn pace_service() {
-    use core::sync::atomic::Ordering::Relaxed; gesture_service(); // PINCHZOOM (B735): a three-finger swipe the trackpad latched is acted on here, ahead of the pacer's early return (one relaxed load when none). LINE-NEUTRAL fold, code first
+    use core::sync::atomic::Ordering::Relaxed; gesture_service(); close_owed_run(); // CONTINUE-CLOSE-DRAIN (B1129): the login row the session press hid is closed here, off the press (file tail). PINCHZOOM (B735): a three-finger swipe the trackpad latched is acted on here, ahead of the pacer's early return (one relaxed load when none). LINE-NEUTRAL fold, code first
     if !PACE_PENDING_ANY.swap(false, Relaxed) {
         return;
     }
@@ -2661,7 +2661,7 @@ pub fn close(id: WinId) -> bool {
         let mut t = table();
         match row_mut(&mut t, id) {
             Some(r) => {
-                let b = outer_box(r);
+                let b = outer_box(r); #[cfg(all(target_arch = "x86_64", feature = "wc"))] close_owed_clear(id); // CONTINUE-CLOSE-DRAIN (B1129): the owed-close hide ends in the TABLE section that frees the row (file tail). LINE-NEUTRAL append, code first
                 *r = Window::empty();
                 b
             }
@@ -3597,7 +3597,7 @@ pub fn focus_release(owner: u64, route: &'static str) {
 /// `z == 0` means [`minimise`] put it there and nothing else. The exemption reads "furniture that
 /// has not been deliberately parked".
 fn above_shell(r: &Window, shell: u32) -> bool {
-    (r.compat || r.z > shell || (is_kernel_owner(r.owner_asid) && r.z != PARKED_Z)) && !lock_veiled(r) // AUTOLOCK (B712): while the session is locked every row but the modal one (the locked login card) reads below the shell — the compositor, the occluders, the hit test and the a11y tree all skip it; nothing in the row moves (file tail). LINE-NEUTRAL fold, code first.
+    (r.compat || r.z > shell || (is_kernel_owner(r.owner_asid) && r.z != PARKED_Z)) && !lock_veiled(r) && !close_owed_hidden(r) // CONTINUE-CLOSE-DRAIN (B1129): the login row the session press hid reads below the shell until its owed close frees it (file tail). AUTOLOCK (B712): while the session is locked every row but the modal one (the locked login card) reads below the shell — the compositor, the occluders, the hit test and the a11y tree all skip it; nothing in the row moves (file tail). LINE-NEUTRAL fold, code first.
 }
 
 /// CONSOLEWIN — **the `z` [`minimise`] parks a row at, as a name.** Zero, and the value is
@@ -33579,4 +33579,75 @@ pub fn wmtable_leg() -> &'static str {
     } else {
         "ok"
     }
+}
+
+// CONTINUE-CLOSE-DRAIN (rmbp-ledger B1129) — TAIL-APPENDED, so no line above moves. CONTINUEREST (B1121) found the session
+// press's real cost: `login::take_down`'s `close` waits in its `DrainBarrier` for an in-flight pass (flight 39
+// pass_ms_max=29.1), on the render task inside the route, so the wait shows up in the `[lag]` line's `wm=`. Now the press HIDES
+// the login row and the close is OWED: [`close_owed`] puts the id in ONE cell, `CLOSE_OWED`. [`above_shell`] reads that cell
+// beside AUTOLOCK's veil ([`close_owed_hidden`]: the same skip by the compositor, the occluders, the hit test and the a11y
+// tree; nothing in the row moves). The x86 device-service pass ([`pace_service`]'s first line, desktop_uefi's
+// `desktop_app_service`, one runner) runs the ONE [`close`] ([`close_owed_run`]), barrier and all, off the press. `close`
+// clears the cell ([`close_owed_clear`]) inside the TABLE section that frees the row, so the hide and the free happen
+// together: no frame shows the card again, and a re-issued id is never hidden. If the cell is busy, or the build has no
+// x86 `wc` (no service pass hosts the close there), `close_owed` is `close` at once, as before. Residual hazard: a Log Out's
+// `close_all_furniture` between the runner's read and its `close(id)`, with a new window minted into that slot in
+// between (a Log Out gesture inside one ~1 ms service pass).
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+static CLOSE_OWED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(WIN_NONE);
+/// CONTINUE-CLOSE-DRAIN: `arch::ms()` when the close was owed (for the runner's `after_ms=`).
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+static CLOSE_OWED_AT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// CONTINUE-CLOSE-DRAIN: close `id` off the caller. On x86 + `wc` the row is hidden now and closed on the next
+/// device-service pass; a busy cell, or any other build, closes at once (today's `close`).
+pub fn close_owed(id: WinId) {
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+    {
+        use core::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed};
+        if id != WIN_NONE && CLOSE_OWED.compare_exchange(WIN_NONE, id, AcqRel, Acquire).is_ok() {
+            CLOSE_OWED_AT.store(crate::arch::ms(), Relaxed);
+            return;
+        }
+    }
+    close(id);
+}
+
+/// CONTINUE-CLOSE-DRAIN: `close`'s row free, under TABLE — the hide ends with the row (id-checked).
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+#[inline]
+fn close_owed_clear(id: WinId) {
+    use core::sync::atomic::Ordering::{AcqRel, Acquire};
+    let _ = CLOSE_OWED.compare_exchange(id, WIN_NONE, AcqRel, Acquire);
+}
+
+/// CONTINUE-CLOSE-DRAIN: `above_shell`'s sibling term — the row whose close is owed is hidden. One atomic load, under TABLE.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+#[inline]
+fn close_owed_hidden(r: &Window) -> bool {
+    let o = CLOSE_OWED.load(core::sync::atomic::Ordering::Acquire);
+    o != WIN_NONE && r.id == o
+}
+
+/// CONTINUE-CLOSE-DRAIN: no owed close on this build — the predicate is the trunk's.
+#[cfg(not(all(target_arch = "x86_64", feature = "wc")))]
+#[inline(always)]
+fn close_owed_hidden(_r: &Window) -> bool {
+    false
+}
+
+/// CONTINUE-CLOSE-DRAIN: the device-service pass's taker (`pace_service`'s first line). One relaxed load when nothing
+/// is owed; otherwise the ONE `close`, which clears the cell when it frees the row. The cell is cleared again (id-checked)
+/// if the row was already gone, so a stale id is never re-run.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+fn close_owed_run() {
+    use core::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed};
+    let id = CLOSE_OWED.load(Relaxed);
+    if id == WIN_NONE {
+        return;
+    }
+    let after_ms = crate::arch::ms().saturating_sub(CLOSE_OWED_AT.load(Relaxed));
+    let _ = close(id);
+    let _ = CLOSE_OWED.compare_exchange(id, WIN_NONE, AcqRel, Acquire);
+    serial_println!("[wm] close owed win={} after_ms={} on=svc", id, after_ms);
 }
