@@ -1267,11 +1267,7 @@ pub fn queued_selftest() {
         let _ = queued_take(c);
     }
     let (q4, q5) = lostreset_selftest(&next, &body_of, &read, want); // QUEUED-SET-LOSTRESET (B1181): Q4 / Q5, the full-inbox legs (file tail)
-<<<<<<< HEAD
-    let (q6, q7) = stucklive_selftest(&next, &body_of, &read, want); let q8 = pendpin_selftest(&next, &body_of, &read, want); /* QUEUED-SET-PENDPIN (B1193): Q8 the silent holder's Pend reclaimed (file tail) */ // QUEUED-SET-STUCKLIVE (B1187): Q6 silent live holder, Q7 refused answer delivered (file tail)
-=======
-    let (q6, q7) = stucklive_selftest(&next, &body_of, &read, want); let q9 = deliverrace_selftest(&next, &body_of, &read, want); /* QUEUED-SET-DELIVER-RACE (rmbp-ledger B1194): Q9, the inbox filled between the room check and the deliver (file tail). Named in-place hunk */ // QUEUED-SET-STUCKLIVE (B1187): Q6 silent live holder, Q7 refused answer delivered (file tail)
->>>>>>> exec-rmbp-f39queuedsetdeliverrace
+    let (q6, q7) = stucklive_selftest(&next, &body_of, &read, want); let q8 = pendpin_selftest(&next, &body_of, &read, want); /* QUEUED-SET-PENDPIN (B1193): Q8 the silent holder's Pend reclaimed (file tail) */ let q9 = deliverrace_selftest(&next, &body_of, &read, want); /* QUEUED-SET-DELIVER-RACE (rmbp-ledger B1194): Q9, the inbox filled between the room check and the deliver (file tail). Named in-place hunk */ // QUEUED-SET-STUCKLIVE (B1187): Q6 silent live holder, Q7 refused answer delivered (file tail)
     // Restore the operator's value through the same kernel fulfiller (or leave the key unset as it was).
     match orig {
         Some(v) => {
@@ -1284,17 +1280,10 @@ pub fn queued_selftest() {
             let _ = crate::prefs::unset(crate::prefs::NS, key::IDLE_MIN);
         }
     }
-<<<<<<< HEAD
-    if q1 && q2 && q3 && q4 && q5 && q6 && q7 && q8 {
-        serial_println!(":: RELAY-QUEUED-SET: unread=applied read=released full=eagain lostreset=released/applied stucklive=released refusedreply=redelivered pendpin=reclaimed eager=owed -> PASS ::");
+    if q1 && q2 && q3 && q4 && q5 && q6 && q7 && q8 && q9 {
+        serial_println!(":: RELAY-QUEUED-SET: unread=applied read=released full=eagain lostreset=released/applied stucklive=released refusedreply=redelivered pendpin=reclaimed deliverrace=closed eager=owed -> PASS ::");
     } else {
-        serial_println!(":: RELAY-QUEUED-SET: q1={} q2={} q3={} q4={} q5={} q6={} q7={} q8={} (want={} read1={} read2={} kept={}/{} pushed={}/{}) -> FAIL ::", q1 as u8, q2 as u8, q3 as u8, q4 as u8, q5 as u8, q6 as u8, q7 as u8, q8 as u8, want, read1.unwrap_or(-1), read2.unwrap_or(-1), kept1 as u8, kept2 as u8, pushed1 as u8, pushed2 as u8);
-=======
-    if q1 && q2 && q3 && q4 && q5 && q6 && q7 && q9 {
-        serial_println!(":: RELAY-QUEUED-SET: unread=applied read=released full=eagain lostreset=released/applied stucklive=released refusedreply=redelivered deliverrace=closed eager=owed -> PASS ::");
-    } else {
-        serial_println!(":: RELAY-QUEUED-SET: q1={} q2={} q3={} q4={} q5={} q6={} q7={} q9={} (want={} read1={} read2={} kept={}/{} pushed={}/{}) -> FAIL ::", q1 as u8, q2 as u8, q3 as u8, q4 as u8, q5 as u8, q6 as u8, q7 as u8, q9 as u8, want, read1.unwrap_or(-1), read2.unwrap_or(-1), kept1 as u8, kept2 as u8, pushed1 as u8, pushed2 as u8);
->>>>>>> exec-rmbp-f39queuedsetdeliverrace
+        serial_println!(":: RELAY-QUEUED-SET: q1={} q2={} q3={} q4={} q5={} q6={} q7={} q8={} q9={} (want={} read1={} read2={} kept={}/{} pushed={}/{}) -> FAIL ::", q1 as u8, q2 as u8, q3 as u8, q4 as u8, q5 as u8, q6 as u8, q7 as u8, q8 as u8, q9 as u8, want, read1.unwrap_or(-1), read2.unwrap_or(-1), kept1 as u8, kept2 as u8, pushed1 as u8, pushed2 as u8);
     }
 }
 
@@ -1598,7 +1587,6 @@ fn queued_word(verb: u8) -> &'static str {
 }
 
 // =================================================================================================
-<<<<<<< HEAD
 // QUEUED-SET-PENDPIN (rmbp-ledger B1193, BP-storage-11) — TAIL-APPENDED. B1187's silent arm released a queued SET whose
 // live holder never answered, but the relay's kernel-client `Pend` stayed in `bus_route`'s table (KCLIENT_GEN never moves,
 // so the dead-caller reclaim never frees it): at `PEND_MAX_PER_CALLER` every later SET was written by the kernel fulfiller
@@ -1674,7 +1662,8 @@ fn pendpin_selftest(next: &dyn Fn() -> u32, body_of: &dyn Fn(i64) -> String, rea
         serial_println!("[prefsbus] pendpin leg: kept={} planted={} full={} released={} freed={} late={} stray={} n0={} read8={}", kept8 as u8, planted as u8, full8 as u8, released8 as u8, freed8 as u8, late8 as u8, stray8 as u8, n0, read8.unwrap_or(-1));
     }
     q8
-=======
+}
+
 // QUEUED-SET-DELIVER-RACE (rmbp-ledger B1194, BP-storage-11) — TAIL-APPENDED. B1187 handed a holder's answer refused by
 // `bus_route::fulfiller_reply`'s room check to its queued entry; the inbox could still fill AFTER that check passed and
 // before the final arm's `deliver` (the Pend already taken), and the status was lost (the entry aged out at -110). That
@@ -1730,5 +1719,4 @@ fn deliverrace_selftest(next: &dyn Fn() -> u32, body_of: &dyn Fn(i64) -> String,
         serial_println!("[prefsbus] deliverrace leg: kept={} room={} rc={} left={} full={} noted={} released={} read9={}", kept9 as u8, room9 as u8, rc9, left9 as u8, full9 as u8, noted9 as u8, released9 as u8, read9.unwrap_or(-1));
     }
     q9
->>>>>>> exec-rmbp-f39queuedsetdeliverrace
 }
