@@ -807,3 +807,100 @@ fn a_camera_line_writes_the_store_and_the_next_side_reads_it() {
     assert_eq!(prefs, photo::PhotoPrefs { camera_mm: Some(400.0), principal_px: Some(Vec2::new(250.0, 320.0)) });
     assert_eq!(ph(&vw).prefs, prefs);
 }
+
+// ---- VUGINTENTSETFACESCROLL (SR583): a card taller than the sheet pages; a single extrude in the journal's names ----
+
+/// The rectangle face on a sheet 148 px tall (the listed head at y = 42: eight 12 px rows under it): a chain of six
+/// points along the bottom side, each with its distance to the one before (one why, one connected set: twelve lines),
+/// is ONE card paged by B1119's rule: seven lines and `... 5 MORE`; PageDown shows the last seven and `... 5 BACK`, a
+/// second PageDown does not move, PageUp returns to the top; the pages cover every line; Tab stays one stop; ONE Enter
+/// enters all twelve.
+#[test]
+fn a_card_taller_than_the_sheet_pages_and_enters_whole() {
+    let mut vw = rectangle();
+    vw.view.resize(W, 148);
+    let why = "a chain of datum points";
+    let mut set = Vec::new();
+    let mut prev = "e0".to_string();
+    for k in 0..6u32 {
+        let (pt, d) = (format!("v{}", 3 + 2 * k), format!("v{}", 4 + 2 * k));
+        set.push(datum(&format!("point {pt} sketch=s x={} y=0", 5 * (k + 1)), why));
+        set.push(datum(&format!("distance {d} sketch=s a={prev} b={pt} d=5"), why));
+        prev = pt;
+    }
+    let ents = face(&vw).sketch.entities().len();
+    assert!(photo::offer(&mut vw.view, set));
+    assert!(ph(&vw).offers.iter().all(|o| o.set.is_some_and(|m| m.key == 0) && matches!(o.verdict, Verdict::Accept { .. })), "{:?}", ph(&vw).offers);
+    let card = |vw: &Viewer| {
+        let gs = photo::glyphs(&vw.view);
+        assert_eq!(gs.len(), 1, "one card: {gs:?}");
+        gs[0].card.clone().expect("a card")
+    };
+    let c = card(&vw);
+    assert_eq!(c.lines.len(), 12);
+    assert_eq!((c.first, c.fit), (0, 7), "eight rows: seven lines and the more line");
+    let rows = c.rows();
+    assert_eq!(rows.len(), 8);
+    assert_eq!(rows[..7], c.lines[..7]);
+    assert_eq!(rows[7], "... 5 MORE");
+    let _ = raster::render(&vw.model, &vw.view);
+    let mut seen: Vec<String> = rows[..7].to_vec();
+    // PageDown: the last page, full.
+    assert!(key(&mut vw, "Page_Down"));
+    let c = card(&vw);
+    assert_eq!(c.first, 5);
+    let rows = c.rows();
+    assert_eq!(rows[..7], c.lines[5..]);
+    assert_eq!(rows[7], "... 5 BACK");
+    seen.extend(rows[..7].iter().cloned());
+    assert!(c.lines.iter().all(|l| seen.contains(l)), "the pages cover every line");
+    // A second PageDown does not move; PageUp is back at the top.
+    key(&mut vw, "Page_Down");
+    assert_eq!(card(&vw).first, 5);
+    assert!(key(&mut vw, "Page_Up"));
+    assert_eq!(card(&vw).first, 0);
+    // Tab: still one stop.
+    key(&mut vw, "Tab");
+    assert_eq!(ph(&vw).focus, Some(0), "a card is one stop");
+    // ONE Enter: all twelve.
+    assert!(key(&mut vw, "Return"));
+    assert!(ph(&vw).offers.iter().all(|o| o.state == State::Applied), "{:?}", ph(&vw).note);
+    assert!(ph(&vw).note.as_deref().unwrap_or("").starts_with("applied set n=12"), "{:?}", ph(&vw).note);
+    assert_eq!(face(&vw).sketch.entities().len(), ents + 6, "six points in the face");
+}
+
+/// SR570's face (a stray point e0 before the rectangle's corners e1..e4, sides e5..e8), the journal recorded. A lone
+/// extrude of the profile (its `outer=` the profile's first edge slot) is offered; the panel deletes e0, so the face's
+/// slots renumber while the journal keeps its names: Enter still enters it, judged in the journal's names and entered by
+/// SR547's pull road, and the journal's extrude names the same outer it was offered on.
+#[test]
+fn a_single_extrude_offered_before_a_panel_delete_enters_in_the_journal_names() {
+    let mut vw = rectangle();
+    let mut sk = Sketch::new();
+    let _stray = sk.add_point(20.0, 10.0);
+    let c = [(0.0, 0.0), (49.7, 0.0), (49.7, 30.2), (0.0, 30.2)];
+    let p: Vec<EntityId> = c.iter().map(|&(x, y)| sk.add_point(x, y)).collect();
+    for i in 0..4 {
+        sk.add_line(p[i], p[(i + 1) % 4]).expect("a line");
+    }
+    vw.view.design.face = Some(SketchFace::over(world_planes()[0].1, sk));
+    {
+        let d = &mut vw.view.design;
+        d.journal.record(d.face.as_ref(), None);
+    }
+    let outer = format!("e{}", face(&vw).profiles[0].outer.edges[0].src().0);
+    assert!(photo::offer(&mut vw.view, vec![proposal(format!("extrude x0 sketch=s outer={outer} dir=[0 0 1] length=6"))]));
+    assert!(ph(&vw).offers[0].set.is_none(), "a single, not a card");
+    assert!(matches!(ph(&vw).offers[0].verdict, Verdict::Accept { .. }), "{:?}", ph(&vw).offers[0].verdict);
+    // The panel deletes the stray point: the journal keeps its names, the face's dense slots renumber.
+    delete_row(&mut vw, "e0");
+    assert!(photo::doc_of(face(&vw)).stmts.iter().any(|s| s.id() == Some("e0")), "the slots renumbered");
+    assert_eq!(ph(&vw).focus, Some(0));
+    assert!(key(&mut vw, "Return"));
+    assert!(ph(&vw).note.as_deref().unwrap_or("").starts_with("applied extrude x0"), "{:?}", ph(&vw).note);
+    assert_eq!(ph(&vw).offers[0].state, State::Applied);
+    assert!(vw.view.design.face.is_none(), "the sketch closed with its extrude");
+    assert!(vw.view.design.body.is_some(), "the extrude regenerated a body");
+    let x = vw.view.design.journal.doc.stmts.iter().find(|s| matches!(s, doc_core::Stmt::Extrude { .. })).expect("the extrude entered");
+    assert!(matches!(x, doc_core::Stmt::Extrude { outer: o, .. } if *o == outer), "the journal's outer is the one offered: {x:?}");
+}

@@ -51,6 +51,7 @@ pub const SHORTCUTS: &[(&str, &str)] = &[
     ("Tab", "focus the next proposal"),
     ("Enter / Backspace", "on the focused proposal: apply it (verified against the photo) / reject it"),
     ("Escape", "on a focused proposal set (one card): reject the whole set (Backspace too); off a card, the sketch's Esc"), // VUGINTENTSINGLERENAMED (SR577): VUG-FACE-KEYS-CARD
+    ("PageDown / PageUp", "on a focused proposal card taller than the window: the next / previous page of its lines"), // VUGINTENTSETFACESCROLL (SR583): VUG-FACE-KEYS-PAGE
     // VUGFACETREE (SR513): the feature tree over doc_core.
     ("t", "the feature tree panel (the document's statements)"),
     ("u / U", "undo / redo (the document's snapshots; the face regenerates)"),
