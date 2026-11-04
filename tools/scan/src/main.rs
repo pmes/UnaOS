@@ -11,7 +11,7 @@
 //!      [--meta <x_Depth_metadata.csv>] [--width W --height H] [--csv-raw]
 //!      [--fx F --fy F --ppx F --ppy F] [--units-um N] [--frame N]
 //!      [--turntable DEG --radius MM | --poses <file> | --track] [--voxel MM] [--trunc MM] [--band MM]
-//!      [--against <design.vugdoc>] [--intent [<doc.vug>]] [--gdt <face>=<kind>:<tol>]... [--datum A=<face> B=<face> C=<face>]
+//!      [--against <design.vugdoc>] [--intent [<doc.vug>]] [--gdt <face>=<kind>:<tol>]... [--datum A=<face> B=<face> C=<face>] [--vugreport <out.vugreport>]
 //! ```
 //!
 //! Inputs (the measured roads from a D435i to this machine; librealsense v2.55.1):
@@ -70,7 +70,7 @@
 //! status colours (inside the band POSITIVE, short toward INFO, proud toward CRITICAL, off the design TEXT_SECONDARY).
 //! The report adds `deviation: aligned rms= max= p95= inside= faces=<seen>/<total> ...` and one
 //! `face: <solid>/<op>.<role>.<a>.<b>:<kind> n= max= rms= mean=` line per design face, by rms, worst first; a refused
-//! registration prints `deviation: refused <Name> {..}` and the run exits 1. Without `--against` nothing changes. `--intent [<doc.vug>]` (VUGINTENTSCANWIRE, LEDGER SR515): [`intent_road`]. `--gdt <face>=<kind>:<tol>` (VUGSCANGDT, LEDGER SR542): [`gdt_road`]. `--datum A=<face> B=<face> C=<face>` (VUGSCANGDTDATUMS, LEDGER SR552): [`datum_road`].
+//! registration prints `deviation: refused <Name> {..}` and the run exits 1. Without `--against` nothing changes. `--intent [<doc.vug>]` (VUGINTENTSCANWIRE, LEDGER SR515): [`intent_road`]. `--gdt <face>=<kind>:<tol>` (VUGSCANGDT, LEDGER SR542): [`gdt_road`]. `--datum A=<face> B=<face> C=<face>` (VUGSCANGDTDATUMS, LEDGER SR552): [`datum_road`]. `--vugreport <out.vugreport>` (VUGFACEGDTREPORT, LEDGER SR571): [`vugreport_write`].
 
 use std::fmt::Write as _;
 use std::path::Path;
@@ -136,7 +136,7 @@ fn usage() -> ! {
     eprintln!("            [--meta <x_Depth_metadata.csv>] [--width W --height H] [--csv-raw]");
     eprintln!("            [--fx F --fy F --ppx F --ppy F] [--units-um N] [--frame N]");
     eprintln!("            [--turntable DEG --radius MM | --poses <file> | --track] [--voxel MM] [--trunc MM] [--band MM]");
-    eprintln!("            [--against <design.vugdoc>] [--intent [<doc.vug>]] [--gdt <face>=<kind>:<tol>]... [--datum A=<face> B=<face> C=<face>]");
+    eprintln!("            [--against <design.vugdoc>] [--intent [<doc.vug>]] [--gdt <face>=<kind>:<tol>]... [--datum A=<face> B=<face> C=<face>] [--vugreport <out.vugreport>]");
     std::process::exit(2)
 }
 
@@ -159,7 +159,7 @@ struct Args {
     voxel: f64,
     trunc: Option<f64>,
     band: f64,
-    against: Option<String>, intent: Option<Option<String>>, gdt: Vec<(String, scan_core::Kind, f64)>, datum: Option<[String; 3]>, // VUGSCANDEVIATION (SR510); VUGSCANGDT (SR542) gdt; VUGSCANGDTDATUMS (SR552) datum
+    against: Option<String>, intent: Option<Option<String>>, gdt: Vec<(String, scan_core::Kind, f64)>, datum: Option<[String; 3]>, vugreport: Option<String>, // VUGSCANDEVIATION (SR510); VUGSCANGDT (SR542) gdt; VUGSCANGDTDATUMS (SR552) datum; VUGFACEGDTREPORT (SR571) vugreport
 }
 
 fn num<T: std::str::FromStr>(it: &mut impl Iterator<Item = String>) -> T {
@@ -190,7 +190,7 @@ fn parse_args() -> Args {
             "--voxel" => a.voxel = num(&mut it),
             "--trunc" => a.trunc = Some(num(&mut it)),
             "--band" => a.band = num(&mut it),
-            "--against" => a.against = Some(it.next().unwrap_or_else(|| usage())), "--intent" => a.intent = Some(intent_doc(&mut it)), "--gdt" => a.gdt.push(gdt_spec(&mut it)), "--datum" => a.datum = Some(datum_spec(&mut it)),
+            "--against" => a.against = Some(it.next().unwrap_or_else(|| usage())), "--intent" => a.intent = Some(intent_doc(&mut it)), "--gdt" => a.gdt.push(gdt_spec(&mut it)), "--datum" => a.datum = Some(datum_spec(&mut it)), "--vugreport" => a.vugreport = Some(it.next().unwrap_or_else(|| usage())),
             _ if s.starts_with('-') => usage(),
             _ if a.input.is_none() => a.input = Some(s),
             _ => usage(),
@@ -899,7 +899,7 @@ fn gdt_spec(it: &mut impl Iterator<Item = String>) -> (String, scan_core::Kind, 
 /// Without `--against`, nothing.
 fn gdt_road(a: &Args, sm: &ScanMesh, dev: Option<&(Deviation, Vec<String>, scan_core::Design)>, margin: f64) -> Result<String, Refusal> {
     let Some((d, names, design)) = dev else {
-        return if a.gdt.is_empty() && a.datum.is_none() { Ok(String::new()) } else { Err(Refusal::GdtWithoutAgainst) }; // VUGSCANGDTDATUMS (SR552): `--datum` needs `--against` too
+        return if a.gdt.is_empty() && a.datum.is_none() && a.vugreport.is_none() { Ok(String::new()) } else { Err(Refusal::GdtWithoutAgainst) }; // VUGSCANGDTDATUMS (SR552): `--datum` needs `--against` too; VUGFACEGDTREPORT (SR571): `--vugreport` too
     };
     let mut g = scan_core::gdt(sm, design, d, margin, Tol::DEFAULT); let frame = datum_road(a, sm, design, d, names, margin, &mut g)?; // VUGSCANGDTDATUMS (SR552): position read in the datum frame
     let mut calls: Vec<(usize, scan_core::Kind, f64)> = Vec::with_capacity(a.gdt.len());
@@ -912,7 +912,7 @@ fn gdt_road(a: &Args, sm: &ScanMesh, dev: Option<&(Deviation, Vec<String>, scan_
     }
     let mm = |v: Option<f64>| v.map_or_else(|| "none".to_string(), |x| format!("{x:.3}"));
     let (mut pass, mut fail) = (0usize, 0usize);
-    let mut r = frame; // VUGSCANGDTDATUMS (SR552): the frame line first
+    let mut r = frame.as_deref().map_or(String::new(), |l| format!("gdt: {l}\n")); // VUGSCANGDTDATUMS (SR552): the frame line first; VUGFACEGDTREPORT (SR571): datum_road returns the bare line
     for f in &g {
         let name = names.get(f.face as usize).map(String::as_str).unwrap_or("?");
         let _ = write!(r, "gdt: {name} surface={} n={}/{}", f.nominal.name(), f.n, f.matched);
@@ -953,6 +953,7 @@ fn gdt_road(a: &Args, sm: &ScanMesh, dev: Option<&(Deviation, Vec<String>, scan_
         r.push('\n');
     }
     let _ = writeln!(r, "gdt: callouts={} pass={pass} fail={fail}", calls.len());
+    vugreport_write(a, names, &g, &calls, frame.as_deref(), sm)?; // VUGFACEGDTREPORT (SR571): the .vugreport, the face's format
     Ok(r)
 }
 
@@ -976,9 +977,10 @@ fn datum_spec(it: &mut impl Iterator<Item = String>) -> [String; 3] {
 /// With `--datum`: the datum faces by name (an unknown one refused as `GdtDatumFace` by label and name), the frame
 /// scan_core `gdt::frame_of` builds (measured from the scan's datum faces at the aligned pose, nominal from the design;
 /// a refusal as `GdtDatum` with the datum's name), every cylinder face's position replaced by `gdt::in_frame`, so
-/// `position=` and its verdict read in the frame; returns the `gdt: frame A= B= C= residual=` line. Without, nothing.
-fn datum_road(a: &Args, sm: &ScanMesh, design: &scan_core::Design, d: &Deviation, names: &[String], margin: f64, g: &mut [scan_core::FaceGdt]) -> Result<String, Refusal> {
-    let Some(datum) = &a.datum else { return Ok(String::new()) };
+/// `position=` and its verdict read in the frame; returns the bare `frame A= B= C= residual=` line (scan_core
+/// `gdt::frame_line`, VUGFACEGDTREPORT SR571: the face's corner string; [`gdt_road`] prints it after `gdt: `). Without, None.
+fn datum_road(a: &Args, sm: &ScanMesh, design: &scan_core::Design, d: &Deviation, names: &[String], margin: f64, g: &mut [scan_core::FaceGdt]) -> Result<Option<String>, Refusal> {
+    let Some(datum) = &a.datum else { return Ok(None) };
     let mut faces = [0u32; 3];
     for (k, face) in datum.iter().enumerate() {
         let label = scan_core::gdt::DATUM_LABELS[k];
@@ -990,5 +992,26 @@ fn datum_road(a: &Args, sm: &ScanMesh, design: &scan_core::Design, d: &Deviation
         Refusal::GdtDatum { face: datum[k].clone(), error }
     })?;
     scan_core::gdt::in_frame(sm, design, d, margin, g, &fr); // VUGSCANGDTPROFILEDATUM (SR567): the form inputs for the profile; VUGFACEGDTREMEASURE (SR560): the loop lifted into scan_core, the face calls the same fn
-    Ok(format!("gdt: frame A={} B={} C={} residual={:.3}\n", datum[0], datum[1], datum[2], fr.residual_mm))
+    Ok(Some(scan_core::gdt::frame_line([datum[0].as_str(), datum[1].as_str(), datum[2].as_str()], fr.residual_mm)))
 }
+
+// ---- VUGFACEGDTREPORT (LEDGER SR571): --vugreport, the verdicts in the face's .vugreport format ----
+
+/// With `--vugreport <file>`: scan_core `gdt::report_text` of this run's reading, the text vug-view's `Viewer::report`
+/// writes: the header (the `--against` file name, generation 0 (a document read once), scan_core `gdt::scan_tag` of the
+/// fused mesh), the frame line `datum_road` built (if any), then one scan_core `gdt::callout_line` per `--gdt` in the order
+/// named, each read by `FaceGdt::verdict` as the `verdict=` tokens are. A failed write refuses `Io`. Without, nothing.
+fn vugreport_write(a: &Args, names: &[String], g: &[scan_core::FaceGdt], calls: &[(usize, scan_core::Kind, f64)], frame: Option<&str>, sm: &ScanMesh) -> Result<(), Refusal> {
+    let Some(out) = &a.vugreport else { return Ok(()) };
+    let mut lines: Vec<String> = frame.map(String::from).into_iter().collect();
+    for &(i, kind, tol) in calls {
+        let name = names.get(i).map(String::as_str).unwrap_or("?");
+        let v = g.get(i).map_or(scan_core::Verdict::Unmeasured, |f| f.verdict(kind, tol));
+        let token = if kind == scan_core::Kind::Profile && g.get(i).is_some_and(|f| f.profile_in_frame_mm.is_some()) { "profile_frame" } else { kind.name() }; // seat fold (SR567 + SR571): the face's kind token, so the two files stay byte-equal (VUG-FACE-GDT-REPORT-KEY lifts it into scan_core)
+        lines.push(scan_core::gdt::callout_line(name, token, tol, v));
+    }
+    let part = a.against.as_deref().and_then(|p| Path::new(p).file_name()).and_then(|s| s.to_str()).unwrap_or("design");
+    let text = scan_core::gdt::report_text(part, 0, &scan_core::gdt::scan_tag(sm), &lines);
+    std::fs::write(out, text).map_err(|e| Refusal::Io { path: out.clone(), error: e.to_string() })
+}
+
