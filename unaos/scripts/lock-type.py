@@ -36,7 +36,11 @@ import contextlib, importlib.util, io, os, re, sys, tempfile
 SRC = os.path.join('crates', 'kernel', 'src')            # relative to the unaos dir
 REG = 'unaos/crates/kernel/src/sync.rs'                   # the registry (repo-relative)
 WHY = 'the registry\'s own inner lock (B414 LOCKREG): sync::Mutex is built on a raw spin::Mutex<()>'
-ALLOW = {(REG, 22): WHY, (REG, 38): WHY, (REG, 49): WHY, (REG, 60): WHY, (REG, 67): WHY, (REG, 768): WHY}
+COLOUR = 'unaos/crates/kernel/src/video/colour.rs'          # GATEREDS (rmbp-ledger B1096): the one RwLock row
+WHYXF = ('DISPLAYICCFILE XF (B972): one settings-thread writer (colour::latch swaps a transform built outside the lock), '
+         'per-frame scanout readers (rows / word) by try_read that must not exclude each other; sync.rs has no RwLock '
+         'twin yet (SYNC-RWLOCK owed): delete this row when XF moves onto it')
+ALLOW = {(REG, 22): WHY, (REG, 38): WHY, (REG, 49): WHY, (REG, 60): WHY, (REG, 67): WHY, (REG, 768): WHY, (COLOUR, 41): WHYXF}  # GATEREDS (rmbp-ledger B1096): + the display transform's XF (below)
 
 FAM = r'(?:Mutex|MutexGuard|SpinMutex|TicketMutex|FairMutex|RwLock\w*)'
 PATH = re.compile(r'\bspin\s*::\s*(?:(?:mutex|rwlock)\s*::\s*(?:spin\s*::\s*)?)?' + FAM + r'\b')
