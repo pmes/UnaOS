@@ -3393,7 +3393,7 @@ fn a11y_text_step_of(px: i64) -> Option<usize> {
 /// Read the four keys over the bus (the schema's default where unset), latch them for the glass. `via` = `login`
 /// (the login's load) or `prefchanged` (another client wrote one); on `prefchanged` a moved text step is re-applied
 /// (its px written) through the same latched write a press makes.
-fn a11y_load(via: &str) {
+pub(crate) fn a11y_load(via: &str) -> u8 {
     use crate::prefs::key; use crate::prefs_client::{sys_flag as flag, sys_get, sys_text as text};
     let rm = flag(key::A11Y_REDUCE_MOTION).unwrap_or(draw::motion::REDUCE_MOTION);
     let ic = flag(key::A11Y_INCREASE_CONTRAST).unwrap_or(false);
@@ -3415,7 +3415,7 @@ fn a11y_load(via: &str) {
     if via == "login" || moved > 0 {
         serial_println!("[settings] accessibility loaded reduce_motion={} increase_contrast={} cursor_size=x{} text_size={} cvd={} invert={} moved={} via={} shimmer={}", rm as u8, ic as u8, a11y_cursor_str(cq), A11Y_TEXT_NAMES[ts as usize], af::NAMES[cvd], inv as u8, moved, via, shimmer_on() as u8);
         a11y_cost_line(if via == "login" { "load" } else { "change" });
-    }
+    } moved // A11Y-BOOT-SET (rmbp-ledger B1147): the latches moved, answered to the boot screen's read (`login::veil_reduce_boot`); the session callers drop it. LINE-NEUTRAL, code first
 }
 
 /// A11YFILTERS (B705): the filter's wire line, draining the cost counters: `pass_us` = the transform's microseconds

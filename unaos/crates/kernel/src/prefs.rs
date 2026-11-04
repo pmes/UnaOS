@@ -1828,7 +1828,7 @@ pub fn reload_session(old: &PrefTree) -> usize {
 // prefs_core refuses is never overwritten. Wire: `[prefs] machine settings/<d> system.<k>=<v> wrote=<0|1>`.
 
 /// The keys the boot screen reads before any login (the machine copy's whole content from the session side).
-const MACHINE_KEYS: [&str; 1] = [key::A11Y_REDUCE_TRANSPARENCY];
+pub const MACHINE_KEYS: [&str; 9] = [key::A11Y_REDUCE_TRANSPARENCY, key::A11Y_REDUCE_MOTION, key::A11Y_INCREASE_CONTRAST, key::A11Y_CURSOR_SIZE, key::A11Y_CVD, key::A11Y_INVERT, key::A11Y_SHIMMER, key::A11Y_ZOOM, key::A11Y_ZOOM_FOLLOW]; // A11Y-BOOT-SET (rmbp-ledger B1147): the accessibility keys a boot-screen consumer reads (contrast, cursor, filter, shimmer and motion, the lens); `login::veil_reduce_boot` reads them all through `settings::a11y_load("machine")`. Named in-place hunk
 
 /// Mirror the session's committed `ns`/`k` = `v` into the no-session store's domain file (see the block above).
 fn machine_mirror(ns: &str, k: &str, v: Option<&PrefValue>) {
