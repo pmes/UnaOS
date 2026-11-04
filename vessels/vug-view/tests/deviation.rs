@@ -569,8 +569,8 @@ fn scan_flag_opens_the_part_as_the_journal() {
     assert_eq!(lj[..lj.len() - 1], lp[..], "the journal measures the scan as the path road does");
 
     let prb = dir.join("scan.prb");
-    let e = Viewer::open_scan(part, prb.to_str().unwrap(), SIZE, Preset::Una).err().expect("a .prb refuses");
-    assert!(e.contains("ScanPrb"), "{e}");
+    let e = Viewer::open_scan(part, prb.to_str().unwrap(), SIZE, Preset::Una).err().expect("a missing .prb refuses");
+    assert!(e.contains("scan.prb"), "{e}"); // VUGFACEDEVIATIONPRB (SR610): a .prb is fused now, so a missing one refuses by its path
     let e = Viewer::open_scan(ply, ply, SIZE, Preset::Una).err().expect("a mesh is no part");
     assert!(e.ends_with("--scan opens a .vug part"), "{e}");
 }
@@ -1413,4 +1413,63 @@ fn a_held_document_opens_the_map_held_and_its_fix_re_measures() {
     let two = doc_core::read(&text.replace("extrude body sketch=s1 outer=l1 ", "extrude body sketch=s1 outer=p1 ")).expect("reads");
     let e = Viewer::open_deviation(scan().clone(), &two, "fixture", SIZE, Preset::Una, None).err().expect("two roots refuse");
     assert!(e.starts_with("line ") && e.contains("NoProfile body"), "{e}");
+}
+
+// ---- VUGFACEDEVIATIONPRB (LEDGER SR610): a .prb fused by the face itself (scan_core `fuse::fuse_prb`) ----
+// One D435i frame of the bench from the orbit's azimuth 0, written as a .prb through probe_core's writer (the bytes
+// tools/scan reads). A recording carries no pose, so its one frame is fused at the identity: the design is DOC moved into
+// that camera's frame (each sketch's o / z / x and each extrude's dir through the inverse pose). The map's basis is the
+// mesh scan_core's own road fuses from the same frame (tools/scan's defaults: voxel 4, trunc 12), and the first callout
+// reads the same on both maps.
+
+#[test]
+fn a_prb_opens_against_the_part_as_scan_core_fuses_it() {
+    use scan_core::fuse::recording::{self, Record};
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("vugfacedeviationprb");
+    std::fs::create_dir_all(&dir).expect("the fixture dir");
+    let b = fixture::bench_intrinsics();
+    let k4 = [b.fx, b.fy, b.ppx, b.ppy];
+    let intr = scan_core::Intrinsics::from_rect_params(b.width, b.height, k4); // what the record reads back
+    let scale = DepthScale::from_micrometres(1000); // what the record's units read back
+    let pose = fixture::orbit(CENTRE, 600.0, 40.0 * DEG, 0.0);
+    let frame = fixture::render_depth(&Scene::bench(), &intr, scale, &pose, &Noise::D435I, 0);
+    let prb = dir.join("scan.prb");
+    let rec = Record::new(frame.clone(), "replay:d435i", 1000, Some(k4)).expect("the record");
+    std::fs::write(&prb, recording::write(&[rec]).expect("the recording")).expect("the .prb is written");
+
+    let inv = pose.invert().expect("a rigid pose");
+    let v3 = |p: Vec3| format!("{} {} {}", p.x, p.y, p.z);
+    let (o, z, x) = (inv.apply_point(Vec3::ZERO), inv.apply_vector(Vec3::new(0.0, 0.0, 1.0)), inv.apply_vector(Vec3::new(1.0, 0.0, 0.0)));
+    let text = DOC
+        .replace("o=[0 0 0] z=[0 0 1] x=[1 0 0]", &format!("o=[{}] z=[{}] x=[{}]", v3(o), v3(z), v3(x)))
+        .replace("dir=[0 0 1]", &format!("dir=[{}]", v3(z)));
+    let part = dir.join("part.vugdoc");
+    std::fs::write(&part, &text).expect("the part is written");
+
+    let mut p = Viewer::open_against(prb.to_str().unwrap(), part.to_str().unwrap(), SIZE, Preset::Una).expect("the .prb fuses and measures");
+    let mut t = Tsdf::new(4.0, 12.0, Tol::DEFAULT).expect("volume");
+    t.integrate(&frame, scale, &intr, &Transform::IDENTITY).expect("the frame integrates");
+    let direct = extract(&t).expect("surface");
+    let doc = doc_core::read(&text).expect("the moved document reads");
+    let mut d = Viewer::open_deviation(direct.clone(), &doc, "direct", SIZE, Preset::Una, None).expect("the design builds");
+
+    let map = p.view.deviation.as_ref().expect("a map");
+    assert!(map.result.is_ok(), "the frame lies on the moved design: {:?}", map.result.as_ref().err());
+    println!("prb: verts={} direct={}", map.basis.0.mesh.positions.len(), direct.mesh.positions.len());
+    assert_eq!(map.basis.0.mesh.positions.len(), direct.mesh.positions.len(), "the vertex count");
+    assert!(map.basis.0 == direct, "the map's basis is scan_core's own fuse of the frame");
+
+    let face = map
+        .gdt
+        .iter()
+        .find(|f| map.names[f.face as usize].starts_with("body/") && matches!(f.nominal, scan_core::Nominal::Plane(_)) && f.flatness_mm.is_some())
+        .map(|f| map.names[f.face as usize].clone())
+        .expect("a measured body plane");
+    let cmd = format!("gdt {face}=flatness:100");
+    assert_eq!(vug_view::deviation::command(&mut p.view, &p.model, &cmd), Ok(true));
+    assert_eq!(vug_view::deviation::command(&mut d.view, &d.model, &cmd), Ok(true));
+    let (lp, ld) = (corner(p.view.deviation.as_ref().unwrap()), corner(d.view.deviation.as_ref().unwrap()));
+    println!("{}", lp.join("\n"));
+    assert_eq!(lp.last(), ld.last(), "the first callout reads the same");
+    assert!(lp.last().is_some_and(|l| l.starts_with(face.as_str()) && l.ends_with("PASS")), "{lp:?}");
 }

@@ -32,6 +32,7 @@
 //! | [`graph`] | keyframes, the pose graph and loop closure over the tracked poses (VUGSCANLOOP SR500) | Kintinuous / ElasticFusion (Whelan et al.); g2o (Kümmerle et al. 2011) |
 //! | [`deviation`] | the scan registered to the design (point-to-plane ICP over mesh_core's `Bvh::closest`) and its signed deviation, stats and faces ranked (VUGSCANDEVIATION SR510) | Chen & Medioni 1992; Low 2004 |
 //! | [`fixture`] | synthetic Z16 frames of a known scene through probe_core's pinhole model | the inverse of `Intrinsics::deproject` |
+//! | [`fuse`] | THE fuse: shots on a pose road into one TSDF, a `.prb` recording fused into a mesh (VUGFACEDEVIATIONPRB SR610) | tools/scan's composition, lifted |
 //!
 //! Units: millimetres in the world (BP-vug-2's `Tol` is linear in mm), metres only at probe_core's seam.
 
@@ -66,6 +67,8 @@ pub use tsdf::{Integrated, Tsdf, Voxel, integrate};
 // VUGSCANGDT (LEDGER SR542): the deviation read as ISO 1101 flatness / cylindricity / position per design face.
 pub mod gdt;
 pub use gdt::{FaceGdt, GDT_MIN_POINTS, GDT_NORMAL_DEG, Kind, Nominal, Verdict, gdt, nominal, position_mm};
+// VUGFACEDEVIATIONPRB (LEDGER SR610): THE fuse (tools/scan's composition lifted) and a .prb recording fused by it.
+pub mod fuse;
 
 /// Why a frame, a volume or an extraction was refused. Every refusal leaves the volume as it was.
 #[derive(Clone, Copy, Debug, PartialEq)]
