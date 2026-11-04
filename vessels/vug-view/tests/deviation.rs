@@ -1958,7 +1958,7 @@ fn a_post_on_its_ground_pivots_on_the_scan_s_own_axis() {
 
 #[test]
 fn a_scan_without_a_camera_is_refused_the_view_road() {
-    use scan_core::deviation::{Road, coarse, coarse_view, measure_coarse};
+    use scan_core::deviation::{Road, Sweep, coarse, coarse_view, measure_coarse};
     let (track, _, part, _) = tracked_prb("vugscancoarsevieworigin", 4);
     let p = Viewer::open_against(&track, &part, SIZE, Preset::Una).expect("the .prb fuses and measures");
     let map = p.view.deviation.as_ref().expect("a map");
@@ -1972,7 +1972,7 @@ fn a_scan_without_a_camera_is_refused_the_view_road() {
     let ap = scan_core::AlignParams::DEFAULT;
     let bvh = mesh_core::bvh::Bvh::build(&design.mesh);
     let none = ScanMesh { camera: None, ..s.clone() };
-    assert!(coarse_view(&none, design, &bvh, &ap, Tol::DEFAULT).is_none(), "no camera, no view road");
+    assert!(coarse_view(&none, design, &bvh, &ap, Tol::DEFAULT, Sweep::View).is_none(), "no camera, no view road");
     let least = coarse(&none, design, &bvh, &ap, Tol::DEFAULT).expect("four starts").iter().map(|x| x.1).fold(f64::INFINITY, f64::min);
     let (road, r) = measure_coarse(&none, design, &ap, BAND_MM, Tol::DEFAULT);
     println!("vieworigin: camera={:?} road=CoarseFine rms={kept:.3} | camera=None view=None road={road:?} least-four={least:.3}", s.camera);
