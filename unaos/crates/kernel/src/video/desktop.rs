@@ -2536,7 +2536,7 @@ static SHIM_TICK_PX: AtomicU64 = AtomicU64::new(0);
 /// cursor bracket).
 #[cfg(feature = "facet")]
 fn shimmer_live(occ: &[(usize, usize, usize, usize)], pw: usize, ph: usize) {
-    if super::DEFER_N.load(Ordering::Relaxed) != 0 || !crate::video::wallpaper::owns_backdrop() || crate::video::settings::reduce_motion() { // SHIMMERMOTION (B1099): the live seat honours reduce motion like the idle seat (DESIGN-LANGUAGE §2.6). STARTSCENE (B662): the scene owns the backdrop from the splash on (x86 never sets the REALDESK latch)
+    if super::DEFER_N.load(Ordering::Relaxed) != 0 || !crate::video::wallpaper::owns_backdrop() || crate::video::settings::reduce_motion() || !crate::video::settings::shimmer_on() { // SHIMMERPREF (B1108): the Settings row holds the stars still on its own. SHIMMERMOTION (B1099): the live seat honours reduce motion like the idle seat (DESIGN-LANGUAGE §2.6). STARTSCENE (B662): the scene owns the backdrop from the splash on (x86 never sets the REALDESK latch)
         return;
     }
     let now = crate::arch::ms();
@@ -2642,7 +2642,7 @@ pub fn shimmer_idle() {
     if now.wrapping_sub(SHIM_LAST.load(Ordering::Relaxed)) < SHIMMER_MS || now.wrapping_sub(SHIM_IDLE_LAST.load(Ordering::Relaxed)) < floor {
         return;
     }
-    let _in = ShimIn::enter(); if crate::video::settings::reduce_motion() || SHIM_RM_FORCE.load(Ordering::SeqCst) || crate::splash::holding() || !crate::video::wallpaper::owns_backdrop() {
+    let _in = ShimIn::enter(); if crate::video::settings::reduce_motion() || !crate::video::settings::shimmer_on() || SHIM_RM_FORCE.load(Ordering::SeqCst) || crate::splash::holding() || !crate::video::wallpaper::owns_backdrop() {
         return;
     }
     SHIM_IDLE_LAST.store(now, Ordering::Relaxed);
@@ -2681,8 +2681,8 @@ pub fn shimmer_idle() {
 #[cfg(all(target_arch = "x86_64", feature = "facet"))]
 pub fn shimmeridle_selftest() {
     const IDLE_MS: u64 = 200;
-    if crate::video::settings::reduce_motion() {
-        serial_println!(":: SHIMMERIDLE: reduce motion is set (the idle tick is off by design) -> SKIP ::");
+    if crate::video::settings::reduce_motion() || !crate::video::settings::shimmer_on() { // SHIMMERPREF (B1108): the shimmer row off is the same by-design refusal
+        serial_println!(":: SHIMMERIDLE: reduce motion or the shimmer row is off (the idle tick is off by design) -> SKIP ::");
         return;
     }
     // SHIMMERIDLE2 (B830): SETTLE first — the premise is an idle desktop; wait (<= 1 s) for any shimmer tick.
@@ -2708,8 +2708,9 @@ pub fn shimmeridle_selftest() {
     crate::arch::sched::sleep_ms(IDLE_MS);
     let rm_ticks = SHIM_IDLE_TICKS.load(Ordering::Relaxed).wrapping_sub(r0);
     SHIM_RM_FORCE.store(false, Ordering::Relaxed);
+    let pref_ticks = shim_pref_leg(IDLE_MS); // SHIMMERPREF (B1108): the Settings row off, both seats count zero ticks (file tail)
     let steals = super::comp_steal_gen().wrapping_sub(steal0);
-    let ok = (3..=7).contains(&ticks) && idle_ticks > 0 && max_us <= 800 && rm_ticks == 0 && steals == 0;
+    let ok = (3..=7).contains(&ticks) && idle_ticks > 0 && max_us <= 800 && rm_ticks == 0 && steals == 0 && pref_ticks == 0;
     shim_wire();
     serial_println!(
         ":: SHIMMERIDLE: detail idle_ticks={} pass_max_us={} skips={} backdrop={} why={} carried={} settle_ms={} present={} pass_us={} ::",
@@ -3730,4 +3731,33 @@ fn shim_in_quiesce() {
     while SHIM_IDLE_IN.load(Ordering::SeqCst) != 0 && crate::arch::ms().saturating_sub(t0) < 100 {
         crate::arch::sched::sleep_ms(1);
     }
+}
+
+// ── SHIMMERPREF (rmbp-ledger B1108) — `tests shimmeridle`'s pref leg ─────────────────────────────────────────────────
+// Settings > Accessibility row 9 (`system.accessibility.shimmer`, `settings::shimmer_on`) is read beside
+// `settings::reduce_motion()` at both seats. The leg turns the row off through the press's own path with no store write
+// (`settings::shimmer_set_unstored`), waits out an idle call already past its test (`shim_in_quiesce`) and a live tick in
+// flight (`SHIM_BUSY`), then counts every seat's ticks over one window and restores the row.
+// `:: SHIMMERIDLE: pref leg row=off ticks=<n> idle_ticks=<n> restored=<0|1> -> PASS|FAIL ::`
+
+/// The pref leg over `ms`: the shimmer's ticks at ALL seats with the row off (0 = held still).
+#[cfg(all(target_arch = "x86_64", feature = "facet"))]
+fn shim_pref_leg(ms: u64) -> u32 {
+    let was = crate::video::settings::shimmer_set_unstored(false);
+    shim_in_quiesce();
+    let t0 = crate::arch::ms();
+    while SHIM_BUSY.load(Ordering::Acquire) && crate::arch::ms().saturating_sub(t0) < 100 {
+        crate::arch::sched::sleep_ms(1);
+    }
+    let (a0, i0) = (SHIM_TICKS.load(Ordering::Relaxed), SHIM_IDLE_TICKS.load(Ordering::Relaxed));
+    crate::arch::sched::sleep_ms(ms);
+    let ticks = SHIM_TICKS.load(Ordering::Relaxed).wrapping_sub(a0);
+    let idle_ticks = SHIM_IDLE_TICKS.load(Ordering::Relaxed).wrapping_sub(i0);
+    let _ = crate::video::settings::shimmer_set_unstored(was);
+    let restored = crate::video::settings::shimmer_on() == was;
+    serial_println!(
+        ":: SHIMMERIDLE: pref leg row=off ticks={} idle_ticks={} restored={} -> {} ::",
+        ticks, idle_ticks, restored as u8, if ticks == 0 && restored { "PASS" } else { "FAIL" }
+    );
+    ticks
 }
