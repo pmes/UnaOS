@@ -11,8 +11,9 @@
 //! ±trunc band ("block activation") before the voxels are integrated, so a 2 m cube at 5 mm (400³ = 64M voxels dense)
 //! holds only its surface band.
 //!
-//! VUGSCANTSDFOUTLIERS (SR555): a pixel on a depth edge (its 3x3 neighbourhood spans more than [`Tsdf::edge_mm`],
-//! default the truncation) integrates nothing that frame — see [`depth_edge`].
+//! VUGSCANTSDFOUTLIERS (SR555): with [`Tsdf::with_edge_mm`] a pixel on a depth edge (its 3x3 neighbourhood spans more
+//! than [`Tsdf::edge_mm`]) integrates nothing that frame — see [`depth_edge`]; off by default (the seat's ruling: at
+//! scan noise it costs more averaging than it removes, VUG-SCAN-TSDF-EDGEFAR owed).
 //!
 //! Sign: positive in front of the surface (free space, toward the camera), negative behind it (inside the solid).
 //! Voxel `g` (integer) sits at `g · voxel_mm` in the world. The pinhole model is probe_core's (`Intrinsics::project`,
@@ -36,8 +37,8 @@ pub const W_MAX: f32 = 64.0;
 pub const DEFAULT_BUDGET: usize = 65_536;
 
 /// One voxel: the fused signed distance (mm, within ±trunc) and its observation weight. The weight IS the voxel's
-/// confidence (BP-vug-5): uniform weight 1 per frame that observed it, capped at [`W_MAX`]; 0 = never observed. A frame
-/// whose pixel at the voxel is a depth edge ([`depth_edge`]) does not observe it.
+/// confidence (BP-vug-5): uniform weight 1 per frame that observed it, capped at [`W_MAX`]; 0 = never observed. With the
+/// depth-edge guard on ([`Tsdf::with_edge_mm`]), a frame whose pixel at the voxel is a depth edge does not observe it.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Voxel {
     pub sdf: f32,
@@ -64,7 +65,8 @@ pub struct Tsdf {
     trunc_mm: f64,
     tol: Tol,
     budget: usize,
-    /// VUGSCANTSDFOUTLIERS (SR555): the depth jump across a pixel's 3x3 neighbourhood above which it integrates nothing.
+    /// VUGSCANTSDFOUTLIERS (SR555): the depth jump across a pixel's 3x3 neighbourhood above which it integrates nothing
+    /// (`f64::INFINITY`, the default: the guard off).
     edge_mm: f64,
     blocks: BTreeMap<Key, Box<[Voxel; BLOCK_VOXELS]>>,
     frames: u32,
@@ -98,7 +100,7 @@ impl Tsdf {
             trunc_mm,
             tol,
             budget: DEFAULT_BUDGET,
-            edge_mm: trunc_mm, // VUGSCANTSDFOUTLIERS: the depth-edge guard at the band's own width
+            edge_mm: f64::INFINITY, // VUGSCANTSDFOUTLIERS: the depth-edge guard off unless `with_edge_mm` arms it
             blocks: BTreeMap::new(),
             frames: 0,
             intrinsics: None,
@@ -319,12 +321,16 @@ impl Tsdf {
 // (`integrate`); within one pixel of a silhouette that pixel can belong to the OTHER surface (a free-space voxel
 // beside the post takes the post's depth, an inside voxel beside an edge takes the ground behind it), and each
 // camera's silhouette writes that error along the surface. A pixel whose 3x3 neighbourhood spans more than
-// `edge_mm` of depth cannot speak for a voxel within one pixel of it, so it integrates nothing that frame, exactly
-// as an unseen voxel. The default is the volume's own truncation (no second constant); an adjacent-pixel step
-// above it is also the grazing case (beyond ~77° at 600 mm on the bench intrinsics). The weight stays the
-// observation count (BP-vug-5).
+// `edge_mm` of depth cannot speak for a voxel within one pixel of it, so with the guard armed it integrates nothing
+// that frame, exactly as an unseen voxel; an adjacent-pixel step above the truncation is also the grazing case
+// (beyond ~77° at 600 mm on the bench intrinsics). The weight stays the observation count (BP-vug-5). MEASURED, not
+// a default (SR555 RUN 1, the seat's ruling (a)): armed at the truncation it cut the noise-free post's cylindricity
+// 3.214 -> 2.775 mm but raised it 3.542 -> 4.016 at D435i noise (fewer frames averaged per voxel near a silhouette)
+// and left the box top's 1.217 mm unchanged (that is the fixture's depth quantisation, VUG-SCAN-FIXTURE-QUANT), so it
+// is off by default and `tests/gdt.rs` `tsdf_outliers_probe` arms it; the far-side-only guard is VUG-SCAN-TSDF-EDGEFAR.
 impl Tsdf {
-    /// The same volume with the depth-edge jump `mm` (default: `trunc_mm`); `f64::INFINITY` turns the guard off.
+    /// The same volume with the depth-edge guard armed at the jump `mm` (`trunc_mm` is the measured setting);
+    /// `f64::INFINITY` (the default) leaves it off.
     pub fn with_edge_mm(mut self, mm: f64) -> Tsdf {
         self.edge_mm = mm;
         self

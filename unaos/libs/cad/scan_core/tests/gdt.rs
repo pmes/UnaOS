@@ -27,7 +27,7 @@ fn fused() -> &'static (ScanMesh, f64) {
 }
 
 /// VUGSCANTSDFOUTLIERS (SR555): the ONE fuse builder — the 12 orbit frames at `noise`, the volume's depth-edge guard at
-/// its default (`None`) or at `edge_mm` (`f64::INFINITY` = off); the surface and the volume's truncation.
+/// its default (`None`: off) or armed at `edge_mm` (`f64::INFINITY` = off); the surface and the volume's truncation.
 fn fuse(noise: &Noise, edge_mm: Option<f64>) -> (ScanMesh, f64) {
     let (scene, intr, scale) = (Scene::bench(), fixture::bench_intrinsics(), DepthScale::D400_DEFAULT);
     let mut t = Tsdf::new(4.0, 12.0, Tol::DEFAULT).expect("volume");
@@ -324,7 +324,8 @@ fn tsdf_outliers_probe() {
     let frames: Vec<(Transform, Frame)> =
         (0..12u32).map(|k| (pose(k), fixture::render_depth(&scene, &intr, scale, &pose(k), &Noise::NONE, k as u64))).collect();
     for (noise, nname) in [(Noise::NONE, "none"), (Noise::D435I, "d435i")] {
-        for (edge, gname) in [(Some(f64::INFINITY), "off"), (None, "on")] {
+        // The guard armed at the volume's own truncation (read from the fixture's fuse, no second constant).
+        for (edge, gname) in [(Some(f64::INFINITY), "off"), (Some(fused().1), "on")] {
             let (s, trunc) = fuse(&noise, edge);
             let dev = measure_of(&s, &d);
             let g = gdt(&s, &d, &dev, trunc, Tol::DEFAULT);
