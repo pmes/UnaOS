@@ -707,3 +707,55 @@ fn a_webp_xmp_crop_opens_cropped() {
     assert_eq!(photo_core::crop_principal(&keyless), None);
     eprintln!("photo: crop-meta-xmp webp={},{}", pp.x, pp.y);
 }
+
+// ---- VUGFACEPHOTOCROPPREFFRAC (SR648): the crop pair's optional principal point (named tail block) ----
+
+/// The lens photo's crop 200,40 700x560 carrying `value` as its one `vug:crop` pair, and the meta-free crop itself.
+fn frac_crop(value: &str) -> (pixel_core::Image, pixel_core::Image) {
+    let full = fixture::render(&Spec::lens());
+    let bare = fixture::crop(&full, 200, 40, 700, 560);
+    let mut img = bare.clone();
+    img.text = vec![(String::from(photo_core::CROP_KEY), String::from(value))];
+    (img, bare)
+}
+
+/// VUGFACEPHOTOCROPPREFFRAC (SR648): a 6-field pair `200,40,900,720,446.5,357.25` keeps the 4-field frame and states
+/// the carried point less the offset, (246.5, 317.25), which `measure` takes with no pref, bit-equal (k1, outline) to the
+/// meta-free crop measured with that point stated; a crop of it carries the point unchanged and ignores a pref (the
+/// meta outranks it); a 5-field pair and a non-finite point are no crop.
+#[test]
+fn a_six_field_crop_carries_its_principal_point() {
+    let (img, bare) = frac_crop("200,40,900,720,446.5,357.25");
+    assert_eq!(photo_core::crop_frame(&img), Some([200, 40, 900, 720]));
+    assert_eq!(photo_core::crop_meta(&img), Some(([200, 40, 900, 720], Some(Vec2::new(446.5, 357.25)))));
+    let pp = photo_core::crop_principal(&img).expect("the six-field pair carries the point");
+    assert_eq!(pp, Vec2::new(246.5, 317.25));
+    let m = measure(&img, PhotoParams::new(5.0), Tol::DEFAULT).expect("the crop measures from its own point");
+    let stated = measure(&bare, PhotoParams { principal_px: Some(pp), ..PhotoParams::new(5.0) }, Tol::DEFAULT).expect("the meta-free crop measures with the point stated");
+    assert_eq!(m.k1, stated.k1);
+    assert_eq!(m.outline, stated.outline);
+    let (k, v) = photo_core::crop_pair_with(&img, 10, 5, Some(Vec2::new(1.0, 2.0)));
+    assert_eq!((k.as_str(), v.as_str()), (photo_core::CROP_KEY, "210,45,900,720,446.5,357.25"), "the point carried, the pref outranked");
+    assert_eq!(photo_core::crop_pair(&img, 10, 5).1, "210,45,900,720,446.5,357.25");
+    assert_eq!(photo_core::crop_frame(&frac_crop("200,40,900,720,446.5").0), None, "five fields are no crop");
+    assert_eq!(photo_core::crop_principal(&frac_crop("200,40,900,720,NaN,357.25").0), None, "a non-finite point is no crop");
+    assert_eq!(photo_core::crop_principal(&frac_crop("200,40,900,720,446.5,357.25,1").0), None, "seven fields are no crop");
+    eprintln!("photo: crop-pref-frac six={},{} k1={:.4} stated_k1={:.4}", pp.x, pp.y, m.k1, stated.k1);
+}
+
+/// VUGFACEPHOTOCROPPREFFRAC (SR648): a 4-field pair reads as SR582 did (the frame's centre less the offset, (250, 320)),
+/// and the writer with no point stated writes the 4-field pair byte for byte as `crop_pair` (the fixture's road); with
+/// a point stated on a meta-free photo it appends the point as written.
+#[test]
+fn a_four_field_crop_reads_as_before() {
+    let (img, bare) = frac_crop("200,40,900,720");
+    assert_eq!(photo_core::crop_meta(&img), Some(([200, 40, 900, 720], None)));
+    assert_eq!(photo_core::crop_principal(&img), Some(Vec2::new(250.0, 320.0)));
+    let full = fixture::render(&Spec::lens());
+    assert_eq!(photo_core::crop_pair_with(&full, 200, 40, None), photo_core::crop_pair(&full, 200, 40));
+    assert_eq!(photo_core::crop_pair(&full, 200, 40).1, "200,40,900,720");
+    assert_eq!(photo_core::crop_pair_with(&full, 200, 40, Some(Vec2::new(446.5, 357.25))).1, "200,40,900,720,446.5,357.25");
+    assert_eq!(photo_core::crop_pair_with(&img, 10, 5, Some(Vec2::new(446.5, 357.25))).1, "210,45,900,720", "a 4-field meta outranks the pref");
+    assert_eq!(photo_core::crop_pair_with(&bare, 0, 0, Some(Vec2::new(f64::NAN, 1.0))).1, "0,0,700,560", "a non-finite point is not written");
+    eprintln!("photo: crop-pref-frac four=250,320");
+}

@@ -413,6 +413,7 @@ pub fn key(view: &mut View, k: &str) -> Option<bool> {
             ph.focus = next;
             Some(changed)
         }
+        "r" | "R" if line_free(view) => Some(crop_arm(view)), // VUGFACEPHOTOCROPKEYPREF (SR645): the crop key, the arm `:crop` takes (line_free: the `:` line's gate)
         _ if is_enter(k) => focused.map(|i| accept(view, i)),
         _ if is_back(k) => {
             let i = focused?;
@@ -1788,6 +1789,7 @@ pub struct Crop {
 const CROP_HINT: &str = "crop: drag a rectangle on the photo, Return keeps it, Esc cancels";
 
 /// `:crop` on the photo's line: arms the drag (a rectangle already dragged is dropped).
+/// VUGFACEPHOTOCROPKEYPREF (SR645): `:crop` on the photo's line, or the `r` key ([`key`], under [`line_free`]).
 fn crop_arm(view: &mut View) -> bool {
     let Some(ph) = view.photo.as_mut() else { return false };
     let source = ph.crop.source.take();
@@ -1905,7 +1907,7 @@ fn crop_keep(view: &mut View) -> bool {
         (None, _) => Err("refused crop: drag a rectangle on the photo".to_string()),
         _ if dirty => Err("refused crop: the document is unsaved (s saves it)".to_string()),
         (Some(_), None) => Err("refused crop: the photo has no file (open it by its path)".to_string()),
-        (Some(r), Some(src)) => crop_write(&ph.image, r, &src),
+        (Some(r), Some(src)) => crop_write(&ph.image, r, &src, ph.prefs.principal_px), // VUGFACEPHOTOCROPPREFFRAC (SR648): the pref the photo was measured about
     };
     match out {
         Ok(out) => {
@@ -1919,14 +1921,16 @@ fn crop_keep(view: &mut View) -> bool {
 }
 
 /// The crop `[x, y, w, h]` of `img` as PNG beside `src`: `<stem>.crop.png` (`Path::with_extension`: a .jpg / .webp / .png
-/// photo alike), refused when it exists; the cropped pixels carry photo_core's `crop_pair` as their one tEXt pair.
-fn crop_write(img: &pixel_core::Image, [x, y, w, h]: [u32; 4], src: &std::path::Path) -> Result<std::path::PathBuf, String> {
+/// photo alike), refused when it exists; the cropped pixels carry photo_core's `crop_pair_with` as their one tEXt pair
+/// (VUGFACEPHOTOCROPPREFFRAC SR648: under `principal_px`, the pref a meta-free photo was measured about, carried as the
+/// pair's point so the re-open measures about it less the offset).
+fn crop_write(img: &pixel_core::Image, [x, y, w, h]: [u32; 4], src: &std::path::Path, principal_px: Option<Vec2>) -> Result<std::path::PathBuf, String> {
     let out = src.with_extension("crop.png");
     if out.exists() {
         return Err(format!("refused crop: {} exists", file_name(&out)));
     }
     let c = photo_core::fixture::crop(img, x, y, w, h);
-    let (key, value) = photo_core::crop_pair(img, x, y);
+    let (key, value) = photo_core::crop_pair_with(img, x, y, principal_px); // VUGFACEPHOTOCROPPREFFRAC (SR648): the one writer, the pref's point carried
     let png = pixel_core::png::encode::encode_rgba_text(c.width, c.height, &c.rgba, &[(key.as_str(), value.as_str())]).map_err(|e| format!("refused crop: png {e:?}"))?;
     crate::write_atomic(&out, &png).map_err(|e| format!("refused crop: {e}"))?;
     Ok(out)
