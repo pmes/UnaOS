@@ -217,6 +217,9 @@ struct Running {
     /// VUGCOMSCANJOGFACE (SR579): a jog was sent on this link and no home or jog cancel since (grbl answers `$J=` when
     /// it is PLANNED, so `motion` empties while the axis still moves; Hold / Stop cancel on this, not on `motion`).
     jogged: bool,
+    /// VUGCOMSCANALARMRESET (SR585): the soft reset after an alarm went out and its banner is not yet seen; the banner
+    /// sends the dialect's unlock line ([`pump_core::pump::unlock_line`]).
+    unlock: bool,
 }
 
 /// Comscan's pump desk: the machine it drives, the armed programs and the one running stream.
@@ -306,6 +309,7 @@ impl PumpDesk {
                 Err(out) => out,
             },
             PumpEvent::PumpHold { .. } | PumpEvent::PumpResume { .. } | PumpEvent::PumpStop { .. } => {
+                if let Some(out) = self.alarm_reset_due(ev) { return out; } // VUGCOMSCANALARMRESET (SR585): Stop on a run halted by an alarm is the soft reset at once
                 if let Some(out) = self.jog_cancel_due(ev) { return out; } // VUGCOMSCANJOGFACE (SR579): Hold / Stop while a grbl jog runs is grbl's jog cancel
                 let Some(r) = self.running.as_mut() else {
                     return refused("nothing is streaming");
@@ -343,6 +347,7 @@ impl PumpDesk {
             return Vec::new();
         }
         let (evs, moved) = self.motion_replies(evs); // VUGCOMSCANJOG (SR573): the home / jog answers by name
+        let moved: Vec<String> = moved.into_iter().chain(self.unlock_after_banner(&evs)).collect(); // VUGCOMSCANALARMRESET (SR585): the unlock after the reset's banner
         if evs.contains(&Event::LinkLost) {
             self.link_lost(now_us);
         }
@@ -427,11 +432,7 @@ pub enum Unready {
 /// proceeds (`Ok(None)`: native USB does not reset on open); LinuxCNC is not streamed (`Ok(None)`). Lifted from tty.rs
 /// `Port::ready` / `banner` (SR484) so every transport shares it.
 pub fn ready(link: &mut dyn Transport, dialect: Dialect, wait: Duration) -> Result<Option<String>, Unready> {
-    let key = match dialect {
-        Dialect::Grbl { .. } => "Grbl ",
-        Dialect::Marlin => "start",
-        Dialect::LinuxCnc => return Ok(None),
-    };
+    let Some(key) = pump_core::pump::banner_key(dialect) else { return Ok(None) }; // VUGCOMSCANALARMRESET (SR585): the one banner key (LinuxCNC: none)
     if let Some(b) = banner(link, key, wait)? {
         return Ok(Some(b));
     }
@@ -806,7 +807,7 @@ impl PumpDesk {
         let a = self.armed.remove(u.i);
         let identity = self.identify.as_ref().and_then(|f| f(port.as_str())); // VUGCOMSCANTTYUSBID (SR529)
         let commissioned = commissioned_name(a.dialect, before.as_deref(), said.as_deref()); // VUGCOMSCANJOG (SR573)
-        self.running = Some(Running { pump: a.pump, link: Some(link), port: port.clone(), redial: None, identity, hello: said.clone(), motion: Default::default(), jogged: false });
+        self.running = Some(Running { pump: a.pump, link: Some(link), port: port.clone(), redial: None, identity, hello: said.clone(), motion: Default::default(), jogged: false, unlock: false });
         let mut out = vec![self.squawk(Some("started".to_string()))];
         if let Some(h) = before.or(said) {
             out.push(self.squawk(Some(format!("hello {h}")))); // printed once, at the first open (VUGCOMSCANJOG SR573: as the controller first said it)
@@ -1145,6 +1146,7 @@ impl PumpDesk {
                 if *dx == 0.0 && *dy == 0.0 && *dz == 0.0 {
                     return refused("jog: no axis moves");
                 }
+                if let Some(why) = jog_past_travel(&self.machine, [*dx, *dy, *dz]) { return refused(why); } // VUGCOMSCANALARMRESET (SR585): VUG-COMSCAN-JOG-ENVELOPE
                 ("jog", pump_core::pump::jog_lines(d, [*dx, *dy, *dz], *feed))
             }
             _ => return Vec::new(),
@@ -1194,7 +1196,7 @@ impl PumpDesk {
                 Claim::Ok => {
                     if let Some(m) = r.motion.pop_front() {
                         if m.last && !m.failed {
-                            words.push(format!("{} ok", m.word));
+                            words.push(if m.word == "unlock" { "unlocked".to_string() } else { format!("{} ok", m.word) }); // VUGCOMSCANALARMRESET (SR585)
                         }
                     }
                 }
@@ -1255,6 +1257,80 @@ impl PumpDesk {
         r.motion.clear();
         Some(vec![self.squawk(Some("jog cancelled".to_string()))])
     }
+}
+
+// --- VUGCOMSCANALARMRESET (LEDGER SR585): Stop on an alarm is the soft reset at once, the unlock after its banner; a jog bounded by the declared machine (named tail hunk) ---
+
+impl PumpDesk {
+    /// PumpStop on a run halted by an alarm (grbl reports `Alarm`, never Idle / Hold:0, and hears only the soft reset):
+    /// [`pump_core::Pump::stop`] takes the core's reset road (0x18 at once), the unlock is due at the controller's
+    /// banner when the dialect has an unlock line, the pending home / jog lines, `jogged` and the redial cleared, answered
+    /// `reset sent`. `None`: not a Stop, not an alarm halt, or the link is down (the Stop arm's Down road as before).
+    fn alarm_reset_due(&mut self, ev: &PumpEvent) -> Option<Vec<PumpEvent>> {
+        if !matches!(ev, PumpEvent::PumpStop { .. }) {
+            return None;
+        }
+        let r = self.running.as_mut()?;
+        if !matches!(r.pump.state(), PumpState::Halted(pump_core::Halt::Alarm { .. })) {
+            return None;
+        }
+        let link = r.link.as_mut()?;
+        if let Err(e) = r.pump.stop(&mut **link) {
+            return Some(refused(format!("reset: {e:?}")));
+        }
+        r.unlock = pump_core::pump::unlock_line(r.pump.dialect()).is_some();
+        r.jogged = false;
+        r.motion.clear();
+        r.redial = None;
+        Some(vec![self.squawk(Some("reset sent".to_string()))])
+    }
+
+    /// [`PumpDesk::tick`]'s events after the alarm reset: the controller's banner ([`pump_core::pump::banner_key`] in a
+    /// message) sends the dialect's unlock line through [`send_line`], queued as the `unlock` verb so its `ok` is claimed
+    /// by [`PumpDesk::motion_replies`] (said `unlocked`); said `unlock sent: <line>`. `None`: no unlock due, no banner
+    /// in these events, or the link went away in them.
+    fn unlock_after_banner(&mut self, evs: &[Event]) -> Option<String> {
+        let r = self.running.as_mut()?;
+        if !r.unlock || evs.contains(&Event::LinkLost) {
+            return None;
+        }
+        let d = r.pump.dialect();
+        let key = pump_core::pump::banner_key(d)?;
+        if !evs.iter().any(|e| matches!(e, Event::Message(s) if s.starts_with(key))) {
+            return None;
+        }
+        r.unlock = false;
+        let line = pump_core::pump::unlock_line(d)?;
+        let link = r.link.as_mut()?;
+        if !send_line(&mut **link, line, MOTION_WAIT) {
+            return Some(format!("unlock: the link would not take {line:?}"));
+        }
+        r.motion.push_back(Motion { word: "unlock", last: true, failed: false });
+        Some(format!("unlock sent: {line}"))
+    }
+}
+
+/// VUG-COMSCAN-JOG-ENVELOPE: a jog's delta against the declared machine's axes (`Machine::axes`, the SR498 machine
+/// behind the desk): an axis that moves and is not declared, or a delta past its travel (`max - min`), refused by name
+/// before the wire. The position is not polled outside a job (the pump queries `?` only while live), so the DELTA is
+/// bounded, not the jog's end (owed VUG-COMSCAN-JOG-POSITION).
+fn jog_past_travel(m: &Machine, delta: [f64; 3]) -> Option<String> {
+    use make_core::AxisId;
+    for (id, c, v) in [(AxisId::X, 'X', delta[0]), (AxisId::Y, 'Y', delta[1]), (AxisId::Z, 'Z', delta[2])] {
+        if v == 0.0 {
+            continue;
+        }
+        let Some(a) = m.axes.iter().find(|a| a.id == id) else {
+            return Some(format!("jog: {c}{v} on an axis the declared machine does not have"));
+        };
+        let travel = a.max - a.min;
+        if v.abs() > travel {
+            return Some(format!(
+                "jog: {c}{v} is past the declared {c} travel {travel} (the position is not polled outside a job: the jog's delta is bounded)"
+            ));
+        }
+    }
+    None
 }
 
 #[cfg(test)]

@@ -1401,3 +1401,9 @@ exec-rmbp-vugfacejournalfaultfixmany 421605443 wave36 cut55
 exec-rmbp-vugcomscanalarmreset 421605443 wave36 cut55
 exec-rmbp-vugscantsdfconfidence 421605443 wave36 cut55
 exec-rmbp-vugfacegdtreportopen 421605443 wave36 cut55
+exec-rmbp-f39settingsformkeys c97597481 wave36 cut56
+exec-rmbp-f39veilreducebootstore c97597481 wave36 cut56
+exec-rmbp-f39veilheldarm c97597481 wave36 cut56
+exec-rmbp-f39hidphaselock c97597481 wave36 cut56
+exec-rmbp-f39unafswarmsinceboot c97597481 wave36 cut56
+exec-rmbp-f39menuscraftdocs c97597481 wave36 cut56
