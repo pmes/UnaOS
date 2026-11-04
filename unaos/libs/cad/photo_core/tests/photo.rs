@@ -865,3 +865,73 @@ fn a_thin_side_on_a_lattice_line_is_kept() {
         .fold(0.0f64, f64::max);
     assert!(worst < 0.5, "plate outline off the truth by {worst} mm");
 }
+
+/// VUGPHOTOSIDETHINEDGE (SR662): a 0.5 mm shim on the lattice line y = 55 alongside the plate's top side (its whole length
+/// within 0.27 mm of it, inside SR654's skip zone, where every whole cross-section touches the part) is kept by its tone on
+/// the half away from the part: its stretch is found and its outline is in the loop at its tip and top side; on the plain
+/// plate the plate edge alongside the line and the line / plate junctions trip no stretch.
+#[test]
+fn a_thin_side_alongside_the_plate_edge_is_kept() {
+    use photo_core::{edges, grid, homography};
+    let s = Spec::good();
+    let truth_inv = homography::invert(&fixture::homography(&s)).expect("the true homography inverts");
+    // The rule through the public steps (the flat road: Spec::good has k1 = 0); the stretches mapped to true paper mm.
+    let stretches = |img: &photo_core::Image| -> (Vec<(Vec2, Vec2)>, f64, f64, f64, f64) {
+        let gray = edges::luma(img).expect("luma");
+        let el = edges::edgels(&gray);
+        let g = grid::find(&el, gray.w, gray.h).expect("grid");
+        let lat = homography::fit_lattice(&g, 5.0, gray.w, gray.h).expect("lattice");
+        let hi = homography::invert(&lat.h).expect("H inverts");
+        let wmm = g.width_px / lat.px_per_mm;
+        let r = (g.pitch_px / 5.0).round().clamp(4.0, 20.0);
+        let sil = silhouette::extract(&gray, &lat, 5.0, wmm, r).expect("silhouette");
+        let (ink, spread, cut) = photo_core::ink_cut(&g.pairs, &gray, &sil, &hi, 5.0, wmm).expect("the on-lattice pairs give an ink tone");
+        let min_px = 5.0 / 8.0 * lat.px_per_mm;
+        let mut out = Vec::new();
+        for p in g.pairs.iter().filter(|p| !photo_core::off_lattice(p, &hi, 5.0, wmm)) {
+            for (t0, t1) in photo_core::dark_pair(p, &gray, &sil, &hi, cut, min_px) {
+                let a = apply(&truth_inv, p.point + p.dir * t0).expect("the truth maps the stretch");
+                let b = apply(&truth_inv, p.point + p.dir * t1).expect("the truth maps the stretch");
+                eprintln!("diag stretch: paper ({:.2},{:.2})-({:.2},{:.2}) len_px={:.1} width_px={:.2}", a.x, a.y, b.x, b.y, t1 - t0, p.width_px);
+                out.push((a, b));
+            }
+        }
+        (out, ink, spread, cut, g.width_px)
+    };
+    let plain = pixel_core::decode(&fixture::photo_png()).expect("pixel_core decodes the good PNG");
+    let (none, ..) = stretches(&plain);
+    assert!(none.is_empty(), "the plain plate tripped the tone tell: {none:?}");
+    let img = pixel_core::decode(&fixture::shim_on_edge_png(&s)).expect("pixel_core decodes the edge shim PNG");
+    let (found, ink, spread, cut, width_px) = stretches(&img);
+    let (x0, x1) = (fixture::SHIM_EDGE_TIP, fixture::SHIM_EDGE_TIP + fixture::SHIM_EDGE_L);
+    let near = |q: Vec2| (q.y - fixture::SHIM_EDGE_Y).abs() <= 1.5 && q.x >= x0 - 1.5 && q.x <= x1 + 1.5;
+    assert!(!found.is_empty(), "no dark stretch along the shim on y = {}", fixture::SHIM_EDGE_Y);
+    for &(a, b) in &found {
+        assert!(near(a) && near(b), "a stretch off the shim tripped the tone tell: ({},{})-({},{})", a.x, a.y, b.x, b.y);
+    }
+    let (sx0, sx1) = found.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |m, &(a, b)| (m.0.min(a.x.min(b.x)), m.1.max(a.x.max(b.x))));
+    let m = measure(&img, PhotoParams::new(5.0), Tol::DEFAULT).expect("the edge shim photo measures");
+    let pts: Vec<Vec2> = m.loops[0]
+        .iter()
+        .map(|&p| apply(&truth_inv, apply(&m.h, p).expect("h maps the outline")).expect("the truth maps back"))
+        .collect();
+    // The plate's true top side is at or under paper y 54.74; the shim's top side is at 55.25.
+    let tab: Vec<Vec2> = pts.iter().copied().filter(|q| q.y > fixture::SHIM_EDGE_Y && q.x < x1 + 1.0).collect();
+    let band = fit::BAND_SIGMA * m.sigma_mm;
+    assert!(tab.len() >= 2, "no shim vertices in the loop: {pts:?}");
+    let tip = tab.iter().map(|q| q.x).fold(f64::INFINITY, f64::min);
+    let top = tab.iter().map(|q| q.y).fold(f64::NEG_INFINITY, f64::max);
+    eprintln!(
+        "photo: shim-on-edge ink={ink:.1} spread={spread:.2} cut={cut:.1} width_px={width_px:.2} stretches={} stretch={sx0:.2}..{sx1:.2} tip={tip:.3} top={top:.3} sigma={:.4}",
+        found.len(),
+        m.sigma_mm
+    );
+    assert!((tip - fixture::SHIM_EDGE_TIP).abs() <= band, "shim tip {tip} vs {}", fixture::SHIM_EDGE_TIP);
+    assert!((top - (fixture::SHIM_EDGE_Y + fixture::SHIM_W * 0.5)).abs() <= band, "shim top {top}");
+    let worst = pts
+        .iter()
+        .filter(|q| !(q.x >= x0 - 1.0 && q.x <= x1 + 1.0 && q.y > 54.0))
+        .map(|&q| fixture::outline_distance(fixture::paper_to_part(&s, q)))
+        .fold(0.0f64, f64::max);
+    assert!(worst < 0.5, "plate outline off the truth by {worst} mm");
+}
