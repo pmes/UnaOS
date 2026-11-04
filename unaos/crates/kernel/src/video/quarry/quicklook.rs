@@ -100,19 +100,19 @@ pub(super) fn key(c: u8) -> bool {
             request(Req::Close);
             true
         }
-        0x1C..=0x1F if open => {
+        una_abi::KEY_RIGHT..=una_abi::KEY_UP if open => {
             let icons = toolbar::view() == toolbar::View::Icons;
             if icons {
                 if !super::iconview::key(c) {
                     return true;
                 }
             } else {
-                if c == 0x1C || c == 0x1D {
+                if c == una_abi::KEY_RIGHT || c == una_abi::KEY_LEFT {
                     return true; // left/right do not leave the list while the panel shows it
                 }
                 let mut g = MODEL.lock();
                 let Some(m) = g.as_mut() else { return true };
-                if c == 0x1F {
+                if c == una_abi::KEY_UP {
                     m.list_sel = m.list_sel.saturating_sub(1);
                 } else if m.list_sel + 1 < m.list.len() {
                     m.list_sel += 1;

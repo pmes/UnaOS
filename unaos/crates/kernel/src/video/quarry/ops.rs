@@ -1476,7 +1476,7 @@ fn menu_key(c: u8) -> bool {
         MENU_UP.store(false, Ordering::Release);
         return true;
     }
-    if !matches!(c, 0x1E | 0x1F | b'\r' | b'\n' | una_abi::KEY_PGDN | una_abi::KEY_PGUP) {
+    if !matches!(c, una_abi::KEY_DOWN | una_abi::KEY_UP | b'\r' | b'\n' | una_abi::KEY_PGDN | una_abi::KEY_PGUP) {
         return false;
     }
     let Some(fit) = MODEL.lock().as_ref().map(|m| menu_fit(&m.geom)) else { return false };
@@ -1648,7 +1648,7 @@ fn a11y_probe() -> bool {
     let rows = menu_fit(&geom).0;
     let sel0 = MENU.lock().as_ref().and_then(|mn| mn.walk.sel);
     let (stops, lit) = crate::video::wm::a11y::quarry_menu_census();
-    let sel1 = MENU.lock().as_ref().and_then(|mn| mn.walk.sel);
+    let sel1 = MENU.lock().as_ref().and_then(|mn| mn.walk.sel); let hover_ok = !up || hover_probe(&geom, &info); // F39MENUSCRAFTDOCS (B1144): the pill on the LIVE hover pass, inside this open menu, after the census (LINE-NEUTRAL; body at the file tail)
     if up {
         let _ = menu_key(0x1B); // THE dismiss (Escape's arm)
     }
@@ -1665,11 +1665,68 @@ fn a11y_probe() -> bool {
         repaint();
     }
     wm::focus_changed(saved_focus);
-    let ok = up && rows > 0 && stops == rows && sel0 == sel1 && lit == sel0.is_some() as usize && down == 0 && !up_after;
+    let ok = up && rows > 0 && stops == rows && sel0 == sel1 && lit == sel0.is_some() as usize && down == 0 && !up_after && hover_ok;
     let sel_s = match sel0 { Some(i) => alloc::format!("{}", i), None => String::from("-") };
     serial_println!(
         "[menuscraft] quarry_a11y stops={} rows={} up={} sel={} lit={} down={}/{} -> {}",
         stops, rows, up as u8, sel_s, lit, down, up_after as u8, if ok { "ok" } else { "BAD" }
     );
+    ok
+}
+
+// ── F39MENUSCRAFTDOCS (rmbp-ledger B1144): the menu's crossing on the LIVE hover pass (QUARRY-MENU-HOVER-PASS) ────────
+// `menu_cross` (B1123) latches the open menu's item in `live::hover_route`'s change test; no run drove it. This leg runs
+// inside `a11y_probe`'s open menu (its open, raise and put-back): the pointer to the page's first row, then the next,
+// each through `pal::cursor::set_abs` and the hover pass itself (`live::hover_poll` -> `hover_route` -> `menu_cross`
+// -> `Walk::cross`), `hover_selftest`'s drive. Lock order MODEL -> MENU, each copied out and dropped; no lock is held
+// across `hover_poll`. The pointer goes home and `Model.hover` is put back. One `[menuscraft] quarry_hover` line.
+
+/// F39MENUSCRAFTDOCS (B1144) — `true` = after the two moves the walk's `sel` reads the first row, then the next, and
+/// the second crossing repainted exactly once; a page under two rows or no panel SKIPs (`true`).
+fn hover_probe(g: &Geom, info: &wm::WindowInfo) -> bool {
+    let fit = menu_fit(g);
+    let Some((mx, my, first)) = MENU.lock().as_ref().map(|mn| (mn.x, mn.y, walk_at(mn.walk.first, fit).page())) else {
+        serial_println!("[menuscraft] quarry_hover declined reason=menu -> skip");
+        return true;
+    };
+    if fit.0 < 2 || first + 1 >= ITEMS.len() {
+        serial_println!("[menuscraft] quarry_hover declined reason=rows -> skip");
+        return true;
+    }
+    let Some(pi) = crate::video::panel_info_nonblocking() else {
+        serial_println!("[menuscraft] quarry_hover declined reason=panel -> skip");
+        return true;
+    };
+    let (pw, ph) = (pi.width as i64, pi.height as i64);
+    let home = crate::pal::cursor::pos(pw as i32, ph as i32);
+    let saved_hover = MODEL.lock().as_ref().map(|m| m.hover);
+    let sc = info.scale.max(1);
+    let (bw, _, pady) = menu_body(g);
+    let rh = g.row_h();
+    // `set_abs` maps `ax * w / 32767` (floored): round the report UP, `hover_selftest`'s rounding.
+    let put = |px: i64, py: i64| {
+        crate::pal::cursor::set_abs(((px * 32767 + pw - 1) / pw) as i32, ((py * 32767 + ph - 1) / ph) as i32, pw as i32, ph as i32);
+    };
+    let row = |k: usize| ((info.x + (mx + bw / 2) * sc) as i64, (info.y + (my + pady + k * rh + rh / 2) * sc) as i64);
+    let sel_now = || MENU.lock().as_ref().and_then(|mn| mn.walk.sel);
+    let (x0, y0) = row(0);
+    put(x0, y0);
+    LAST_PTR.store(u64::MAX, Ordering::Relaxed);
+    hover_poll();
+    let from = sel_now();
+    let p0 = HOVER_PAINTS.load(Ordering::Relaxed);
+    let (x1, y1) = row(1);
+    put(x1, y1);
+    hover_poll();
+    let paints = HOVER_PAINTS.load(Ordering::Relaxed).wrapping_sub(p0);
+    let to = sel_now();
+    put(home.0 as i64, home.1 as i64);
+    LAST_PTR.store(u64::MAX, Ordering::Relaxed);
+    if let (Some(m), Some(h)) = (MODEL.lock().as_mut(), saved_hover) {
+        m.hover = h;
+    }
+    let ok = from == Some(first) && to == Some(first + 1) && paints == 1;
+    let opt = |v: Option<usize>| match v { Some(i) => alloc::format!("{}", i), None => String::from("-") };
+    serial_println!("[menuscraft] quarry_hover from={} to={} paints={} -> {}", opt(from), opt(to), paints, if ok { "ok" } else { "BAD" });
     ok
 }

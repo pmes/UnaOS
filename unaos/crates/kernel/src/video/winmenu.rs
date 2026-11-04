@@ -3283,3 +3283,103 @@ pub fn walk_probe() -> (usize, Option<usize>) {
     }
     (M.len(), picked)
 }
+
+// ── F39MENUSCRAFTDOCS (rmbp-ledger B1144): the window menu's walk on a LIVE menu (WINMENU-PROBE-KEYS) ─────────────────
+// `walk_probe` drives the walk's glue offscreen; this leg drives the SAME walk on a LIVE window menu: its own fixture
+// window (`selftest`'s shape) publishes its own tree, the routed press (`strip::press_route`) opens the title, the one
+// menu key seam (`strip::key_escape`) carries Down, Down and Return into `key_walk` (the live `WALK`, `walk_act`, then
+// `press_at`'s pick arm), and the pick lands in this leg's own sink — nothing of the operator's is pressed. Task
+// context only (the `tests` verb), as `drive` is; no lock is held across a press or a key.
+
+/// F39MENUSCRAFTDOCS — the fixture's rows: [item, separator, disabled, item, item] (Down, Down lights row 3).
+#[cfg(all(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")), feature = "witness"))]
+const LIVE_ROWS: &[MenuItem] = &[
+    MenuItem { id: 0xE0, label: "One", flags: 0 },
+    MenuItem { id: 0xE1, label: "", flags: FLAG_SEPARATOR },
+    MenuItem { id: 0xE2, label: "Greyed", flags: FLAG_DISABLED },
+    MenuItem { id: 0xE3, label: "Two", flags: 0 },
+    MenuItem { id: 0xE4, label: "Three", flags: 0 },
+];
+
+/// F39MENUSCRAFTDOCS — the fixture's one title.
+#[cfg(all(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")), feature = "witness"))]
+const LIVE_TITLES: &[MenuTitle] = &[MenuTitle { label: "Walk", items: LIVE_ROWS }];
+
+/// F39MENUSCRAFTDOCS — the id the fixture's sink last took (`u32::MAX` = none).
+#[cfg(all(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")), feature = "witness"))]
+static LIVE_PICK: AtomicU32 = AtomicU32::new(u32::MAX);
+
+/// F39MENUSCRAFTDOCS — the fixture's pick sink: records the id, runs nothing.
+#[cfg(all(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")), feature = "witness"))]
+fn live_pick(id: u32) {
+    LIVE_PICK.store(id, Ordering::Release);
+}
+
+/// F39MENUSCRAFTDOCS (WINMENU-PROBE-KEYS) — `tests menuscraft`'s `winmenu_live` leg: `Ok((rows, sel after Down Down,
+/// picked row))`, want `(5, Some(3), Some(3))`; `Err(reason)` = the leg could not be put its question (a skip). The
+/// window, its tree, the open menu, the focus owner and the bar's enable are put back on every path.
+#[cfg(all(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")), feature = "witness"))]
+pub fn walk_live() -> Result<(usize, Option<usize>, Option<usize>), &'static str> {
+    static SURF: [u32; 64] = [0; 64];
+    const FIX_W: usize = 8;
+    const FIX_STRIDE: usize = 32;
+    const _: () = assert!(FIX_W * 4 <= FIX_STRIDE && FIX_W * FIX_STRIDE <= 64 * 4);
+    const OWNER: u64 = wm::KERNEL_OWNER_BASE + 0x58;
+    let (pw, ph) = panel();
+    if pw == 0 || ph == 0 {
+        return Err("panel");
+    }
+    let saved_bar = menubar::enabled();
+    menubar::set_enabled(true);
+    let saved_focus = wm::focus_asid();
+    let win = wm::create(OWNER, SURF.as_ptr() as usize, core::mem::size_of_val(&SURF), FIX_W as u32, FIX_W as u32, FIX_STRIDE as u32, b"walk");
+    if win == wm::WIN_NONE {
+        menubar::set_enabled(saved_bar);
+        return Err("table");
+    }
+    let out = walk_live_on(win, OWNER, pw, ph);
+    dismiss("menuscraft");
+    clear(win);
+    if wm::info(win).is_some() {
+        wm::close(win);
+    }
+    wm::focus_changed(saved_focus);
+    menubar::set_enabled(saved_bar);
+    out
+}
+
+/// F39MENUSCRAFTDOCS — [`walk_live`]'s drive on the fixture window `win` (its owner `owner`): publish, focus, open
+/// the `Walk` title through the routed press, Down, Down, Return through the key seam. The caller tears down.
+#[cfg(all(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")), feature = "witness"))]
+fn walk_live_on(win: wm::WinId, owner: u64, pw: usize, ph: usize) -> Result<(usize, Option<usize>, Option<usize>), &'static str> {
+    if !publish(win, LIVE_TITLES, live_pick) {
+        return Err("publish");
+    }
+    wm::focus_changed(owner);
+    wm::composite();
+    if !await_app_publish(win, b"walk").0 {
+        return Err("unpublished");
+    }
+    let s = bar_boxes(pw, ph);
+    let Some(k) = (0..s.n).find(|&k| s.kind[k] == KIND_TENANT && s.label_of(k) == b"Walk") else { return Err("title") };
+    let (_bx, by, _bw, bh) = s.bar;
+    let opened = strip::press_route((s.x[k] + s.w[k] / 2) as i32, (by + bh / 2) as i32) && is_open() && OPEN_OWNER.load(Ordering::Acquire) == win;
+    if !opened {
+        return Err("open");
+    }
+    LIVE_PICK.store(u32::MAX, Ordering::Release);
+    let n = LIVE_ROWS.len();
+    for c in [una_abi::KEY_DOWN, una_abi::KEY_DOWN] {
+        let _ = strip::key_escape(crate::pal::Event::Key(c));
+    }
+    let sel = WALK.update(n, (n, false), |w| w.sel);
+    let _ = strip::key_escape(crate::pal::Event::Key(b'\r'));
+    let id = LIVE_PICK.load(Ordering::Acquire);
+    Ok((n, sel, LIVE_ROWS.iter().position(|it| it.id == id)))
+}
+
+/// F39MENUSCRAFTDOCS — a build without the fixture battery: the live leg is not put (a skip, never a red).
+#[cfg(all(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")), not(feature = "witness")))]
+pub fn walk_live() -> Result<(usize, Option<usize>, Option<usize>), &'static str> {
+    Err("witness")
+}
