@@ -151,7 +151,7 @@ impl Viewer {
         } else {
             self.view.key(&self.model, k)
         };
-        self.retitle();
+        deviation::follow(self); self.retitle(); // VUGFACEDEVIATIONJOURNAL (SR550): a journal map re-measures when the document moved
         r
     }
 
@@ -182,7 +182,7 @@ impl Viewer {
             SMessage::Intent(ev) => photo::answer(&mut self.view, ev),
             _ => false,
         };
-        self.retitle(); // VUGFACESAVE (SR534): a release commits a stroke; the title's mark follows the document
+        deviation::follow(self); self.retitle(); // VUGFACEDEVIATIONJOURNAL (SR550): follow the journal; VUGFACESAVE (SR534): a release commits a stroke; the title's mark follows the document
         r
     }
 
