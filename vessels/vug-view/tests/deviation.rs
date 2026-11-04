@@ -937,3 +937,52 @@ fn a_report_writes_the_corner_lines_beside_the_part() {
     assert_eq!(text, scan_core::gdt::report_text("part.vug", 0, &tag, &want), "scan_core's formatter on scan_core's reading");
 }
 
+// VUGFACEGDTREPORTKEY (LEDGER SR575): the `report` command on the map's road (Viewer::map_command) writes the report and the
+// corner names it until the next command; the header names the scan by its file name; a path map (open_against) writes
+// beside its design at generation 0; scan_core's one kind token reads a kind's own name off the frame.
+
+#[test]
+fn a_report_command_writes_beside_the_part_and_a_path_map_beside_its_design() {
+    use vug_view::deviation::report_lines;
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("vugfacegdtreportkey");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("the fixture dir");
+    let (part, design, ply) = (dir.join("part.vug"), dir.join("design.vugdoc"), dir.join("scan.ply"));
+    std::fs::write(&part, DOC).expect("the part is written");
+    std::fs::write(&design, DOC).expect("the design is written");
+    std::fs::write(&ply, mesh_core::ply::write(&scan().mesh)).expect("the scan is written");
+    let (ps, ds, ss) = (part.to_str().unwrap(), design.to_str().unwrap(), ply.to_str().unwrap());
+
+    // The journal road: the part's report beside the part, the corner naming it once.
+    let mut j = Viewer::open_scan(ps, ss, SIZE, Preset::Una).expect("the part opens with the scan measured");
+    let (_, top) = plate_top(j.view.deviation.as_ref().unwrap());
+    assert_eq!(j.map_command(&format!("gdt {top}=flatness:0.001")), Ok(true), "any other line is deviation::command's");
+    assert_eq!(j.map_command("report"), Ok(true));
+    let out = dir.join("part.vugreport");
+    let text = std::fs::read_to_string(&out).expect("the report is written beside the part");
+    println!("{text}");
+    let map = j.view.deviation.as_ref().unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines[0], "# vugreport part.vug design=0 scan=scan.ply", "the scan named by its file");
+    let rl = report_lines(map);
+    assert_eq!(rl.len(), 1, "{rl:?}");
+    assert_eq!(lines[1..], rl.iter().map(String::as_str).collect::<Vec<_>>()[..]);
+    let said = format!("report {}", out.display());
+    let cl = corner(map);
+    assert_eq!(cl.iter().filter(|l| **l == said).count(), 1, "the corner names the report: {cl:?}");
+    assert_eq!(j.map_command("gdt clear"), Ok(true));
+    assert!(!corner(j.view.deviation.as_ref().unwrap()).contains(&said), "the next command clears the report line");
+
+    // The path road: the design's report beside the design, generation 0.
+    let mut p = Viewer::open_against(ss, ds, SIZE, Preset::Una).expect("the path road");
+    assert_eq!(p.map_command(&format!("gdt {top}=flatness:0.001")), Ok(true));
+    assert_eq!(p.report_command(), Ok(dir.join("design.vugreport")), "written beside the design");
+    let text = std::fs::read_to_string(dir.join("design.vugreport")).expect("the report reads back");
+    let pm = p.view.deviation.as_ref().unwrap();
+    assert_eq!(text, scan_core::gdt::report_text("design.vugdoc", 0, "scan.ply", &report_lines(pm)));
+    assert_eq!(text.lines().nth(1), Some(rl[0].as_str()), "the path road measures as the journal does");
+
+    // The one kind token both writers read a callout under.
+    assert_eq!(scan_core::gdt::kind_token(scan_core::Kind::Flatness, None), "flatness");
+    assert_eq!(scan_core::gdt::kind_token(scan_core::Kind::Profile, None), "profile");
+}
