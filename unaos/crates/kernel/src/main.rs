@@ -10179,16 +10179,10 @@ fn x86_ptr_install(dx: i32, dy: i32) {
     PTRI_INSTALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 }
 
-/// PTRLAG (rmbp-ledger B134) — the LAST GOOD panel geometry, packed `w << 32 | h`, 0 for "never read".
-///
-/// Panel geometry is set once by `init_panel` and changes only on a mode set, so a cached answer is
-/// not a stale answer — it is the same answer, taken earlier. That is what lets [`ptrlag_panel_wh`]
-/// answer a refused `try_lock` with a number instead of a wait, and it is why the refusal costs the
-/// pointer nothing at all rather than costing it one report.
-#[cfg(all(target_arch = "x86_64", feature = "wc"))]
-static PTRI_PANEL_WH: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+// PANEL-HELD-ONE (rmbp-ledger B1110) — `PTRI_PANEL_WH`, this installer's own last-good cell, is retired: the
+// held read is `video::panel_wh_held`'s, one cell for every reader; [`ptrlag_panel_wh`] reads that door.
 
-/// PTRLAG — panel reads the installer took as a REFUSAL and absorbed from [`PTRI_PANEL_WH`].
+/// PTRLAG — panel reads the installer took as a REFUSAL and absorbed from the door's hold (`video::panel_wh_held`, B1110).
 ///
 /// Reported as `panel_busy=` on the `[ptrinstall]` line, and it is this fix's own witness: every one
 /// of these is a report that, before B134, blocked the input band on the core holding the panel.
@@ -10214,26 +10208,17 @@ static PTRI_PANEL_BUSY: core::sync::atomic::AtomicU64 = core::sync::atomic::Atom
 #[cfg(all(target_arch = "x86_64", feature = "wc"))]
 #[inline]
 fn ptrlag_panel_wh() -> Option<(i32, i32)> {
-    use core::sync::atomic::Ordering::Relaxed;
-    match unaos_kernel::video::panel_info_nonblocking() {
-        Some(i) => {
-            // The `is_ready()` half that survives the door: a degenerate panel is a no-op, and it is
-            // never cached, so one bad read cannot poison every later install.
-            if i.width == 0 || i.height == 0 {
-                return None;
-            }
-            PTRI_PANEL_WH.store(((i.width as u64) << 32) | i.height as u64, Relaxed);
-            Some((i.width as i32, i.height as i32))
-        }
-        None => {
-            PTRI_PANEL_BUSY.fetch_add(1, Relaxed);
-            let cached = PTRI_PANEL_WH.load(Relaxed);
-            if cached == 0 {
-                return None;
-            }
-            Some(((cached >> 32) as i32, (cached & 0xFFFF_FFFF) as i32))
-        }
+    // PANEL-HELD-ONE (B1110): the door holds the last good read; this installer keeps its own census of
+    // the refusals it absorbed (`panel_busy=`), charged from the door's `refused` field.
+    let (w, h, refused) = unaos_kernel::video::panel_wh_held();
+    if refused {
+        PTRI_PANEL_BUSY.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     }
+    // The `is_ready()` half that survives the door: no geometry ever read (or a degenerate panel) is a no-op.
+    if w == 0 || h == 0 {
+        return None;
+    }
+    Some((w as i32, h as i32))
 }
 
 /// PTRLAG — the installer's geometry door driven across a HELD `WRITER`, on the input task's own core.

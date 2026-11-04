@@ -2621,7 +2621,7 @@ static MODE_APPLY: AtomicU32 = AtomicU32::new(0);
 
 /// The dropdown's entries for the live panel (empty only until the first good panel read: B1105).
 fn display_modes() -> Vec<prefs_core::modes::Mode> {
-    let (w, h) = crate::video::panel_wh_held(); // SETTINGS-PANELBUSY (B1105): the last good panel read across a refused try_lock, so the captions never flicker to "panel busy"
+    let (w, h, _) = crate::video::panel_wh_held(); // PANEL-HELD-ONE (B1110): the door's third field (refused) is not this caption's. SETTINGS-PANELBUSY (B1105): the last good panel read across a refused try_lock, so the captions never flicker to "panel busy"
     prefs_core::modes::modes(w, h, super::dpi::native_s2())
 }
 
@@ -4117,11 +4117,11 @@ pub fn selftest_map() {
         }
         _ => "bad",
     };
-    let (rung, stops_all) = keys_probe(); let (gets_ok, gets_other) = crate::tests::prefsclientkeys_leg(); // PREFSCLIENTKEYS (B779): an unrelated key's PrefChanged costs 0 GETs across every pass (tests.rs tail). PICKERKEYS (B768): every control a keyboard stop with its ring
-    let ok = unrowed == 0 && orphans == 0 && same && search.starts_with("ok(") && live != "bad" && stops_all > 0 && rung == stops_all && gets_ok;
+    let (rung, stops_all) = keys_probe(); let table = stops_table(stops_all); let (gets_ok, gets_other) = crate::tests::prefsclientkeys_leg(); // PREFSCLIENTKEYS (B779): an unrelated key's PrefChanged costs 0 GETs across every pass (tests.rs tail). PICKERKEYS (B768): every control a keyboard stop with its ring
+    let ok = unrowed == 0 && orphans == 0 && same && search.starts_with("ok(") && live != "bad" && stops_all > 0 && rung == stops_all && gets_ok && !table.starts_with("bad");
     serial_println!(
-        ":: SETTINGSMAP: keys={} rows={} orphans={} unrowed={} search={} -> {} :: live={} owners_same={} keys={}/{} gets_other={}",
-        keys, MAP.len(), orphans, unrowed, search, if ok { "PASS" } else { "FAIL" }, live, same as u8, rung, stops_all, gets_other
+        ":: SETTINGSMAP: keys={} rows={} orphans={} unrowed={} search={} -> {} :: live={} owners_same={} keys={}/{} gets_other={} table={}",
+        keys, MAP.len(), orphans, unrowed, search, if ok { "PASS" } else { "FAIL" }, live, same as u8, rung, stops_all, gets_other, table
     );
 }
 
@@ -4214,11 +4214,11 @@ fn row_ring(st: &mut State, r: usize) {
 /// `DIMS.focus_ring + 3` logical px — so a pixel that moved between the two paints for another reason (flight 39: the
 /// Resolution caption reading "panel busy" when `panel_info_nonblocking` was refused) cannot stand in for the ring.
 #[cfg(feature = "witness")]
-pub fn ring_probe() -> (usize, usize, usize, Vec<(usize, usize, &'static str, String)>, [[usize; 2]; CENSUS_KINDS.len()]) {
+pub fn ring_probe_tabs() -> (usize, usize, usize, Vec<(usize, usize, &'static str, String)>, [[usize; 2]; CENSUS_KINDS.len()], [[[usize; 2]; CENSUS_KINDS.len()]; TABS]) { // A11Y-STOPS-TABLE (B1110): the walk also returns the census per tab; [`ring_probe`] (file tail) is the 5-tuple
     let (pw, ph) = (super::metrics::size(WIN_W), super::metrics::size(WIN_H()));
     let (mut a, mut b): (Vec<u32>, Vec<u32>) = (Vec::new(), Vec::new());
     if a.try_reserve_exact(pw * ph).is_err() || b.try_reserve_exact(pw * ph).is_err() {
-        return (0, 0, 0, alloc::vec![(usize::MAX, 0, "-", String::from("oom"))], [[0; 2]; CENSUS_KINDS.len()]);
+        return (0, 0, 0, alloc::vec![(usize::MAX, 0, "-", String::from("oom"))], [[0; 2]; CENSUS_KINDS.len()], [[[0; 2]; CENSUS_KINDS.len()]; TABS]);
     }
     a.resize(pw * ph, 0);
     b.resize(pw * ph, 0);
@@ -4255,7 +4255,7 @@ pub fn ring_probe() -> (usize, usize, usize, Vec<(usize, usize, &'static str, St
     let near = |p: u32| (0..3).all(|k| ((p >> (8 * k)) & 0xFF).abs_diff((ring >> (8 * k)) & 0xFF) <= 3);
     let edge = |v: usize, max: usize| (e(v).max(0) as usize).min(max);
     let (mut stops, mut rung, mut thin, mut fail) = (0usize, 0usize, usize::MAX, Vec::new());
-    let mut census = [[0usize; 2]; CENSUS_KINDS.len()]; // A11Y-STOPS-CENSUS (B1105): [stops, rung] per kit kind
+    let mut census = [[0usize; 2]; CENSUS_KINDS.len()]; let mut per_tab = [[[0usize; 2]; CENSUS_KINDS.len()]; TABS]; // A11Y-STOPS-TABLE (B1110): per_tab[tab][kind]. A11Y-STOPS-CENSUS (B1105): [stops, rung] per kit kind
     for tab in 0..TABS {
         let (bb, n_pane, _, _) = paint_one(b, tab, None);
         b = bb;
@@ -4265,7 +4265,7 @@ pub fn ring_probe() -> (usize, usize, usize, Vec<(usize, usize, &'static str, St
             a = aa;
             stops += 1;
             let slot = census_slot(kind); // A11Y-STOPS-CENSUS (B1105)
-            census[slot][0] += 1;
+            census[slot][0] += 1; per_tab[tab][slot][0] += 1; // A11Y-STOPS-TABLE (B1110)
             // F39A11Y (B1101): the stop's own box, device px `[bx0, bx1) x [by0, by1)`
             let (bx0, bx1, by0, by1) = match hit {
                 Some(h) if k > 0 => {
@@ -4293,7 +4293,7 @@ pub fn ring_probe() -> (usize, usize, usize, Vec<(usize, usize, &'static str, St
             };
             if px >= 2 {
                 rung += 1;
-                census[slot][1] += 1; // A11Y-STOPS-CENSUS (B1105)
+                census[slot][1] += 1; per_tab[tab][slot][1] += 1; // A11Y-STOPS-TABLE (B1110). A11Y-STOPS-CENSUS (B1105)
                 thin = thin.min(px);
             } else {
                 let at = first.map_or(String::from("-"), |(x, y)| alloc::format!("{},{}", x, y));
@@ -4301,7 +4301,7 @@ pub fn ring_probe() -> (usize, usize, usize, Vec<(usize, usize, &'static str, St
             }
         }
     }
-    (stops, rung, if thin == usize::MAX { 0 } else { thin }, fail, census)
+    (stops, rung, if thin == usize::MAX { 0 } else { thin }, fail, census, per_tab)
 }
 
 /// A11YTREE2 (B822): the name of `ring_probe`'s stop `stop` on tab `tab` — `column` for stop 0 (the tab's pill), else
@@ -6075,4 +6075,48 @@ pub fn shimmer_set_unstored(on: bool) -> bool {
     let was = shimmer_on();
     a11y_set(9, on as usize, false);
     was
+}
+
+// ── A11Y-STOPS-TABLE (rmbp-ledger B1110, BP-video-20) — the census per tab, checked by `tests settingsmap` ──────────
+// `ring_probe_tabs` is A11YTREE's one walk of every Tab stop; it tallies each stop under (tab, kit kind) beside the
+// per-kind census. `tests settingsmap` prints one `[settings] stops tab=<name> total= rung= <kind>=<n>...` line per tab
+// and checks the table against `keys_probe`, the independent walk of the pane's controls: the tabs' totals, the walk's
+// `stops` and the per-kind census are one number, and it is the panes' controls plus one column stop per tab.
+
+/// A11YTREE's ring leg as `tests a11ytree` reads it: [`ring_probe_tabs`] without the per-tab table.
+#[cfg(feature = "witness")]
+pub fn ring_probe() -> (usize, usize, usize, Vec<(usize, usize, &'static str, String)>, [[usize; 2]; CENSUS_KINDS.len()]) {
+    let (stops, rung, thin, fail, census, _) = ring_probe_tabs();
+    (stops, rung, thin, fail, census)
+}
+
+/// `tests settingsmap`'s `table=`: one line per tab from [`ring_probe_tabs`]; `ok(<sum>/<stops>)` when the tabs' totals,
+/// the walk's stops and the per-kind census agree and equal `pane_all` (`keys_probe`'s total) plus [`TABS`] column
+/// stops, with every tab holding a stop; else `bad(..)` naming the numbers.
+#[cfg(feature = "witness")]
+fn stops_table(pane_all: usize) -> String {
+    let (stops, _, _, _, census, per_tab) = ring_probe_tabs();
+    let mut sum = 0usize;
+    let mut empty: Option<usize> = None;
+    for (tab, row) in per_tab.iter().enumerate() {
+        let n: usize = row.iter().map(|c| c[0]).sum();
+        let r: usize = row.iter().map(|c| c[1]).sum();
+        sum += n;
+        if n == 0 && empty.is_none() { empty = Some(tab); }
+        let mut line = alloc::format!("[settings] stops tab={} total={} rung={}", TAB_NAMES.get(tab).copied().unwrap_or("-"), n, r);
+        for (k, c) in CENSUS_KINDS.iter().zip(row.iter()) { line.push_str(&alloc::format!(" {}={}", k, c[0])); }
+        serial_println!("{}", line);
+    }
+    let kinds: usize = census.iter().map(|c| c[0]).sum();
+    if sum == stops && kinds == stops && stops == pane_all + TABS && empty.is_none() {
+        alloc::format!("ok({}/{})", sum, stops)
+    } else {
+        alloc::format!("bad(sum={} stops={} kinds={} pane={}+{} empty={})", sum, stops, kinds, pane_all, TABS, empty.map_or(String::from("-"), |t| alloc::format!("{}", t)))
+    }
+}
+
+/// Without the witness probes there is no walk to tabulate.
+#[cfg(not(feature = "witness"))]
+fn stops_table(_pane_all: usize) -> String {
+    String::from("skip(no-witness)")
 }

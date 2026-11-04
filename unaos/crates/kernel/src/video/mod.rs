@@ -435,18 +435,24 @@ static PANEL_HELD_WH: core::sync::atomic::AtomicU64 = core::sync::atomic::Atomic
 /// last good read across a refusal (B134's PTRLAG rule: only a nonzero read is held, so one bad read
 /// cannot poison the cell). `(0, 0)` only when no read has ever succeeded. A painter that captions the
 /// panel reads this, so a refused try_lock between two paints never rewrites the caption (flight 39:
-/// Settings' Resolution and Panel lines flickering to "panel busy"). PANEL-HELD-ONE owed: main.rs
-/// `ptrlag_panel_wh` and the aarch64 syscall `GEOM` cell move onto this door.
-pub fn panel_wh_held() -> (u32, u32) {
-    match panel_info_nonblocking() {
+/// Settings' Resolution and Panel lines flickering to "panel busy").
+/// PANEL-HELD-ONE (rmbp-ledger B1110) — the ONE held panel read: the third field is `refused`, true when
+/// THIS call's try_lock was refused and the answer is the hold (a degenerate read also answers the hold,
+/// with `refused` false). Its readers: `settings::display_modes`, main.rs `ptrlag_panel_wh` (which
+/// charges `refused` to its `panel_busy=` count) and the aarch64 `click_pointer_pos`; their own copies
+/// (`PTRI_PANEL_WH`, the fn-local `GEOM`) are retired onto this door.
+pub fn panel_wh_held() -> (u32, u32, bool) {
+    let read = panel_info_nonblocking();
+    let refused = read.is_none();
+    match read {
         Some(i) if i.width != 0 && i.height != 0 => {
             let (w, h) = (i.width as u32, i.height as u32);
             PANEL_HELD_WH.store(((w as u64) << 32) | h as u64, Ordering::Relaxed);
-            (w, h)
+            (w, h, false)
         }
         _ => {
             let v = PANEL_HELD_WH.load(Ordering::Relaxed);
-            ((v >> 32) as u32, (v & 0xFFFF_FFFF) as u32)
+            ((v >> 32) as u32, (v & 0xFFFF_FFFF) as u32, refused)
         }
     }
 }
