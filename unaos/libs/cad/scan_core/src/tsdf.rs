@@ -70,12 +70,9 @@ pub struct Tsdf {
     trunc_mm: f64,
     tol: Tol,
     budget: usize,
-    /// VUGSCANTSDFOUTLIERS (SR555): the depth jump across a pixel's 3x3 neighbourhood above which it integrates nothing
-    /// (`f64::INFINITY`, the default: the guard off).
-    edge_mm: f64,
-    /// VUGSCANTSDFEDGEFAR (SR562): the depth jump above which the far-side guard holds (`f64::INFINITY`, the default:
-    /// off); `edge_mm`, when finite, takes precedence.
-    edge_far_mm: f64,
+    /// VUGSCANTSDFEDGELATERAL (SR574, VUG-SCAN-TSDF-EDGE-CARRY): the depth-edge guard knobs, one value copied whole by
+    /// every volume shaped like this one ([`Tsdf::with_knobs`]).
+    knobs: Knobs,
     blocks: BTreeMap<Key, Box<[Voxel; BLOCK_VOXELS]>>,
     frames: u32,
     intrinsics: Option<Intrinsics>,
@@ -108,8 +105,7 @@ impl Tsdf {
             trunc_mm,
             tol,
             budget: DEFAULT_BUDGET,
-            edge_mm: f64::INFINITY, // VUGSCANTSDFOUTLIERS: the depth-edge guard off unless `with_edge_mm` arms it
-            edge_far_mm: f64::INFINITY, // VUGSCANTSDFEDGEFAR: the far-side guard off unless `with_edge_far_mm` arms it
+            knobs: Knobs::OFF, // VUGSCANTSDFOUTLIERS / VUGSCANTSDFEDGEFAR: both guards off unless a knob arms them
             blocks: BTreeMap::new(),
             frames: 0,
             intrinsics: None,
@@ -255,8 +251,8 @@ impl Tsdf {
         }
         let inv = pose.invert().unwrap_or(Transform::IDENTITY);
         let (voxel_mm, trunc) = (self.voxel_mm, self.trunc_mm);
-        let both = self.edge_mm.is_finite(); // VUGSCANTSDFEDGEFAR: SR555's both-sides rule when its knob is armed
-        let edge = depth_edges(frame, scale, if both { self.edge_mm } else { self.edge_far_mm }); // empty when off
+        let both = self.knobs.edge_mm.is_finite(); // VUGSCANTSDFEDGEFAR: SR555's both-sides rule when its knob is armed
+        let edge = depth_edges(frame, scale, if both { self.knobs.edge_mm } else { self.knobs.edge_far_mm }); // empty when off
         let mut updated = 0u32;
         for k in &active {
             let Some(blk) = self.blocks.get_mut(k) else { continue };
@@ -343,13 +339,13 @@ impl Tsdf {
     /// The same volume with the depth-edge guard armed at the jump `mm` (`trunc_mm` is the measured setting);
     /// `f64::INFINITY` (the default) leaves it off.
     pub fn with_edge_mm(mut self, mm: f64) -> Tsdf {
-        self.edge_mm = mm;
+        self.knobs.edge_mm = mm;
         self
     }
 
     /// The depth jump across a pixel's 3x3 neighbourhood above which the pixel is a depth edge.
     pub fn edge_mm(&self) -> f64 {
-        self.edge_mm
+        self.knobs.edge_mm
     }
 }
 
@@ -391,13 +387,13 @@ impl Tsdf {
     /// The same volume with the far-side guard armed at the jump `mm` (`trunc_mm` is the measured setting);
     /// `f64::INFINITY` (the default) leaves it off. A finite [`Tsdf::edge_mm`] takes precedence (SR555's both-sides rule).
     pub fn with_edge_far_mm(mut self, mm: f64) -> Tsdf {
-        self.edge_far_mm = mm;
+        self.knobs.edge_far_mm = mm;
         self
     }
 
     /// The depth jump across a pixel's 3x3 neighbourhood above which the far-side guard holds.
     pub fn edge_far_mm(&self) -> f64 {
-        self.edge_far_mm
+        self.knobs.edge_far_mm
     }
 }
 
@@ -431,4 +427,44 @@ fn edge_skip(edge: &[Option<f32>], both: bool, idx: usize, m: f32, qz_mm: f64) -
     }
     let mid_mm = *mid as f64 * 1000.0;
     (qz_mm < mid_mm) != ((m as f64 * 1000.0) < mid_mm)
+}
+
+// VUGSCANTSDFEDGELATERAL (SR574), VUG-SCAN-TSDF-EDGE-CARRY: the guard knobs as one value. graph.rs `match_keyframe`
+// and `reintegrate` built their volumes with `Tsdf::new`'s defaults, so a guard armed once was dropped by every
+// keyframe match and every re-integration after a loop closure (tools/scan `--track`'s road); both now copy
+// [`Tsdf::knobs`] through [`Tsdf::with_knobs`] beside the voxel, band, tol and budget. The lateral silhouette rule
+// SR574 measured is NOT a knob: the probe's census (tests/gdt.rs `lateral_tally`) read the pixel-centre sign as a
+// coin toss on the free-space votes (post off: mis_near 6/9, free_near 19/35 on the form set; pooled 0.77 / 0.38),
+// so it was not built (VUG-SCAN-TSDF-EDGE-SUBPIXEL-LINE, VUG-SCAN-TSDF-EDGE-LATERAL-SAMPLE owed).
+
+/// The depth-edge guard knobs of a volume: SR555's both-sides jump `edge_mm` (finite: armed, and it takes precedence)
+/// and SR562's far-side jump `edge_far_mm`; `f64::INFINITY` leaves a guard off.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Knobs {
+    pub edge_mm: f64,
+    pub edge_far_mm: f64,
+}
+
+impl Knobs {
+    /// Both guards off: [`Tsdf::new`]'s default.
+    pub const OFF: Knobs = Knobs { edge_mm: f64::INFINITY, edge_far_mm: f64::INFINITY };
+}
+
+impl Default for Knobs {
+    fn default() -> Knobs {
+        Knobs::OFF
+    }
+}
+
+impl Tsdf {
+    /// The volume's guard knobs (copied whole by every volume shaped like it).
+    pub fn knobs(&self) -> Knobs {
+        self.knobs
+    }
+
+    /// The same volume with the guard knobs `k`.
+    pub fn with_knobs(mut self, k: Knobs) -> Tsdf {
+        self.knobs = k;
+        self
+    }
 }

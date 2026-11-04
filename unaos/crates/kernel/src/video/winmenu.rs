@@ -3207,9 +3207,9 @@ pub fn key_walk(ev: crate::pal::Event) -> bool {
         Menu::Busy => return walks,
         Menu::Absent => return false,
     };
-    let n = items.len();
-    let ok = |i: usize| items[i].flags & FLAG_SEPARATOR == 0 && (items[i].flags & FLAG_DISABLED == 0 || walk_undo(&items[i]));
-    match WALK.update(n, (n, false), |w| w.key(c, &ok)) {
+    // F39SETTINGSARROWSENSE (B1127): the walk's glue (the row rule, the unpaged fit, Return's press row) is `walk_act` /
+    // `walk_ok` / `press_ly` at the file tail, the fns `walk_probe` drives offscreen for `tests menuscraft`.
+    match walk_act(&WALK, items, c) {
         crystal::walk::Act::Pass => false,
         crystal::walk::Act::Held => true,
         crystal::walk::Act::Moved | crystal::walk::Act::Paged => {
@@ -3223,7 +3223,7 @@ pub fn key_walk(ev: crate::pal::Event) -> bool {
         crystal::walk::Act::Press(i) => {
             if let Some(r) = open_rect(pw, ph) {
                 let (mx, my, _, _) = crystal::sheet::body(r);
-                press_at((mx + BORDER + PADX() + 1) as i32, (my + item_top(items, i) + ITEM_H() / 2) as i32);
+                press_at((mx + BORDER + PADX() + 1) as i32, (my + press_ly(items, i)) as i32);
             }
             true
         }
@@ -3240,4 +3240,46 @@ fn walk_undo(it: &MenuItem) -> bool {
 #[cfg(not(all(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")), feature = "quarry")))]
 fn walk_undo(_it: &MenuItem) -> bool {
     false
+}
+
+// ── F39SETTINGSARROWSENSE (rmbp-ledger B1127): the window-menu walk's glue, and its offscreen witness ──────────────────
+
+/// F39SETTINGSARROWSENSE — the rows the walk may light: not a separator, and enabled or a live Undo/Redo row.
+fn walk_ok(items: &[MenuItem], i: usize) -> bool {
+    items[i].flags & FLAG_SEPARATOR == 0 && (items[i].flags & FLAG_DISABLED == 0 || walk_undo(&items[i]))
+}
+
+/// F39SETTINGSARROWSENSE — a key against a dropdown's walk `cell`: unpaged (the dropdown is sized for every row).
+fn walk_act(cell: &crystal::walk::Cell, items: &[MenuItem], c: u8) -> crystal::walk::Act {
+    let n = items.len();
+    cell.update(n, (n, false), |w| w.key(c, |i: usize| walk_ok(items, i)))
+}
+
+/// F39SETTINGSARROWSENSE — Return's press row, dropdown-local: the centre of item `i` (what [`press_at`]'s pick arm
+/// reads back through [`item_at_row`]).
+fn press_ly(items: &[MenuItem], i: usize) -> usize {
+    item_top(items, i) + ITEM_H() / 2
+}
+
+/// F39SETTINGSARROWSENSE (WINMENU-PROBE-KEYS) — `tests menuscraft`'s `winmenu_keys` leg: a window menu [item,
+/// separator, disabled, item, item] on a PRIVATE walk cell (never the live [`WALK`]), driven Down, Down, Return
+/// through [`walk_act`], the `Press(i)` read back as the row [`item_at_row`] finds at [`press_ly`] in a dropdown of
+/// [`drop_extent`]'s height. No press is delivered and no lock is taken. `(rows, picked row)`; want `(5, Some(3))`.
+pub fn walk_probe() -> (usize, Option<usize>) {
+    const M: &[MenuItem] = &[
+        MenuItem { id: 0xE0, label: "One", flags: 0 },
+        MenuItem { id: 0xE1, label: "", flags: FLAG_SEPARATOR },
+        MenuItem { id: 0xE2, label: "Greyed", flags: FLAG_DISABLED },
+        MenuItem { id: 0xE3, label: "Two", flags: 0 },
+        MenuItem { id: 0xE4, label: "Three", flags: 0 },
+    ];
+    let cell = crystal::walk::Cell::new();
+    let mh = drop_extent(M, 0).1;
+    let mut picked = None;
+    for c in [una_abi::KEY_DOWN, una_abi::KEY_DOWN, b'\r'] {
+        if let crystal::walk::Act::Press(i) = walk_act(&cell, M, c) {
+            picked = item_at_row(M, press_ly(M, i), mh).filter(|&r| M[r].flags & (FLAG_SEPARATOR | FLAG_DISABLED) == 0);
+        }
+    }
+    (M.len(), picked)
 }
