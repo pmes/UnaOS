@@ -451,7 +451,7 @@ fn a_callout_survives_a_journal_edit() {
     println!("{}", lines.join("\n"));
     assert!(lines.contains(&format!("{top} flatness={flat:.3} tol=0.001 FAIL")), "{lines:?}");
     assert!(lines.iter().any(|l| l.starts_with(&format!("frame A={a} B={b} C={c} residual="))), "the frame followed: {lines:?}");
-    assert_eq!(lines.last().map(String::as_str), Some("design=journal@1"), "{lines:?}");
+    assert_eq!(lines.last().map(String::as_str), Some("design=journal@1 solids=2"), "{lines:?}");
     // Re-tinted: every vertex of the new map paired with the plate top is the over colour.
     let over = colour(Shade::Over(1.0));
     let mut tinted = 0;
