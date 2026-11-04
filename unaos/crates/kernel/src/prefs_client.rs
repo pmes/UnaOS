@@ -627,7 +627,7 @@ pub fn relay_tag(tag: u8, prin: [u8; 32], body: &[u8], wait_ms: u64) -> Result<(
         spins += 1;
         if crate::arch::ms().saturating_sub(t0) >= wait_ms || spins >= RELAY_SPIN_MAX {
             RELAY_TIMEOUT.fetch_add(1, Ordering::Relaxed);
-            return Err(ETIMEDOUT);
+            tagtimeout_release(tag, corr); return Err(ETIMEDOUT); // RELAY-TAG-TIMEOUT-PENDPIN (rmbp-ledger B1202): a timed-out Holocron relay (tags 144-151) takes its kernel-client relay Pend by its own corr, so a silent holder never pins the per-caller cap; the late answer meets the no-Pend arm (file tail). LINE-NEUTRAL fold, code first.
         }
         core::hint::spin_loop();
     }
@@ -1267,7 +1267,7 @@ pub fn queued_selftest() {
         let _ = queued_take(c);
     }
     let (q4, q5) = lostreset_selftest(&next, &body_of, &read, want); // QUEUED-SET-LOSTRESET (B1181): Q4 / Q5, the full-inbox legs (file tail)
-    let (q6, q7) = stucklive_selftest(&next, &body_of, &read, want); let q8 = pendpin_selftest(&next, &body_of, &read, want); /* QUEUED-SET-PENDPIN (B1193): Q8 the silent holder's Pend reclaimed (file tail) */ let q9 = deliverrace_selftest(&next, &body_of, &read, want); /* QUEUED-SET-DELIVER-RACE (rmbp-ledger B1194): Q9, the inbox filled between the room check and the deliver (file tail). Named in-place hunk */ let q10 = eager_selftest(&next, &body_of, want); let q12 = timeoutpend_selftest(&next); /* RELAY-TIMEOUT-PENDPIN (rmbp-ledger B1197): Q12, a timed-out GET / LIST's Pend reclaimed (file tail). Named in-place hunk */ let q11 = keeprace_selftest(&next, &body_of, want); /* QUEUED-SET-EAGER-KEEPRACE (rmbp-ledger B1199): Q11, the mark landed before the keep (file tail). Named in-place hunk */ let q13 = flush_selftest(&read, want); /* PREFS-FLUSH-ONTO-APPLIER (rmbp-ledger B1200): Q13, a render-task deferral flushed by `prefs-apply` (file tail). Named in-place hunk */ // QUEUED-SET-STUCKLIVE (B1187): Q6 silent live holder, Q7 refused answer delivered (file tail)
+    let (q6, q7) = stucklive_selftest(&next, &body_of, &read, want); let q8 = pendpin_selftest(&next, &body_of, &read, want); /* QUEUED-SET-PENDPIN (B1193): Q8 the silent holder's Pend reclaimed (file tail) */ let q9 = deliverrace_selftest(&next, &body_of, &read, want); /* QUEUED-SET-DELIVER-RACE (rmbp-ledger B1194): Q9, the inbox filled between the room check and the deliver (file tail). Named in-place hunk */ let q10 = eager_selftest(&next, &body_of, want); let q12 = timeoutpend_selftest(&next); /* RELAY-TIMEOUT-PENDPIN (rmbp-ledger B1197): Q12, a timed-out GET / LIST's Pend reclaimed (file tail). Named in-place hunk */ let q11 = keeprace_selftest(&next, &body_of, want); /* QUEUED-SET-EAGER-KEEPRACE (rmbp-ledger B1199): Q11, the mark landed before the keep (file tail). Named in-place hunk */ let q13 = flush_selftest(&read, want); /* PREFS-FLUSH-ONTO-APPLIER (rmbp-ledger B1200): Q13, a render-task deferral flushed by `prefs-apply` (file tail). Named in-place hunk */ let q14 = tagtimeout_selftest(&next); /* RELAY-TAG-TIMEOUT-PENDPIN (rmbp-ledger B1202): Q14, a timed-out Holocron relay's Pend reclaimed (file tail). Named in-place hunk */ // QUEUED-SET-STUCKLIVE (B1187): Q6 silent live holder, Q7 refused answer delivered (file tail)
     // Restore the operator's value through the same kernel fulfiller (or leave the key unset as it was).
     match orig {
         Some(v) => {
@@ -1280,10 +1280,10 @@ pub fn queued_selftest() {
             let _ = crate::prefs::unset(crate::prefs::NS, key::IDLE_MIN);
         }
     }
-    if q1 && q2 && q3 && q4 && q5 && q6 && q7 && q8 && q9 && q10 && q11 && q12 && q13 { // RELAY-TIMEOUT-PENDPIN (rmbp-ledger B1197): Q12. Named in-place hunk
-        serial_println!(":: RELAY-QUEUED-SET: unread=applied read=released full=eagain lostreset=released/applied stucklive=released refusedreply=redelivered pendpin=reclaimed timeoutpend=reclaimed deliverrace=closed eager=applied keeprace=closed flush=applier -> PASS ::");
+    if q1 && q2 && q3 && q4 && q5 && q6 && q7 && q8 && q9 && q10 && q11 && q12 && q13 && q14 { // RELAY-TIMEOUT-PENDPIN (rmbp-ledger B1197): Q12. RELAY-TAG-TIMEOUT-PENDPIN (rmbp-ledger B1202): Q14. Named in-place hunk
+        serial_println!(":: RELAY-QUEUED-SET: unread=applied read=released full=eagain lostreset=released/applied stucklive=released refusedreply=redelivered pendpin=reclaimed timeoutpend=reclaimed tagtimeout=reclaimed deliverrace=closed eager=applied keeprace=closed flush=applier -> PASS ::");
     } else {
-        serial_println!(":: RELAY-QUEUED-SET: q1={} q2={} q3={} q4={} q5={} q6={} q7={} q8={} q9={} q10={} q11={} q12={} q13={} (want={} read1={} read2={} kept={}/{} pushed={}/{}) -> FAIL ::", q1 as u8, q2 as u8, q3 as u8, q4 as u8, q5 as u8, q6 as u8, q7 as u8, q8 as u8, q9 as u8, q10 as u8, q11 as u8, q12 as u8, q13 as u8, want, read1.unwrap_or(-1), read2.unwrap_or(-1), kept1 as u8, kept2 as u8, pushed1 as u8, pushed2 as u8);
+        serial_println!(":: RELAY-QUEUED-SET: q1={} q2={} q3={} q4={} q5={} q6={} q7={} q8={} q9={} q10={} q11={} q12={} q13={} q14={} (want={} read1={} read2={} kept={}/{} pushed={}/{}) -> FAIL ::", q1 as u8, q2 as u8, q3 as u8, q4 as u8, q5 as u8, q6 as u8, q7 as u8, q8 as u8, q9 as u8, q10 as u8, q11 as u8, q12 as u8, q13 as u8, q14 as u8, want, read1.unwrap_or(-1), read2.unwrap_or(-1), kept1 as u8, kept2 as u8, pushed1 as u8, pushed2 as u8);
     }
 }
 
@@ -2195,4 +2195,67 @@ fn flush_selftest(read: &dyn Fn() -> Option<i64>, want: i64) -> bool {
         serial_println!("[prefsbus] flush leg: flushed={} read={} waited={}ms", flushed as u8, got.unwrap_or(-1), waited);
     }
     q13
+}
+
+// =================================================================================================
+// RELAY-TAG-TIMEOUT-PENDPIN (rmbp-ledger B1202, BP-storage-11) — TAIL-APPENDED. `relay_tag` (BTKEYSEAL B446) is the
+// kernel-client relay for Holocron's ring-3 tags 144-151; its -ETIMEDOUT arm returned with the relay's Pend still in
+// `bus_route`'s table (KCLIENT_GEN never moves, so the dead-caller reclaim never frees it), so eight timed-out Holocron
+// relays pinned the kernel client at PEND_MAX_PER_CALLER and every later PREF relay was -EAGAIN (kernel fulfiller). The
+// arm now takes that Pend by its own corr through B1193's `bus_route::take_pending_by_corr`, as B1197's
+// `timeoutpend_release` does for `relay`'s read arm. Every kernel-client corr comes from the one NEXT_CORR, so the keyed
+// take never removes another call's Pend, and a caller's retry after -ETIMEDOUT (bthid's seal pass) mints a new corr
+// that `take_reply` matches exactly. Holocron's late answer meets `fulfiller_reply`'s no-Pend arm (-ENOENT, nothing
+// delivered): honest, since the caller was already answered -ETIMEDOUT (Unavailable), and a late SecretGet's key bytes
+// no longer land in the inbox. An answer delivered between the timeout check and the take has already taken its Pend
+// (`false` here, no print) and is dropped as stale by `take_reply` (owed RELAY-TAG-LATE-WIPE: that drop does not wipe).
+// The serial line is printed with no lock held (`PEND` released by the taker).
+// Wire: `[prefsbus] relay tag=<t> corr=<c> timeout — relay pend reclaimed`; `tests bandy3` ->
+// `:: RELAY-QUEUED-SET: ... timeoutpend=reclaimed tagtimeout=reclaimed ... -> PASS ::` (Q14). Limit: Q14 drives this fn on
+// a PLANTED Pend; `relay_tag`'s arm itself is reached only with a registered silent Holocron holder, which
+// `queued_selftest` has no fixture for.
+// =================================================================================================
+/// `relay_tag`'s -ETIMEDOUT arm: drop the kernel-client relay Pend of client corr `corr` for ring-3 tag `tag`, if still held.
+#[cfg(feature = "busreg")]
+fn tagtimeout_release(tag: u8, corr: u32) {
+    if crate::bus_route::take_pending_by_corr(KCLIENT_ROW, corr) {
+        serial_println!("[prefsbus] relay tag={} corr={} timeout — relay pend reclaimed", tag, corr);
+    }
+}
+
+/// `queued_selftest`'s Q14 (B1202), B1197's leg shape for one Holocron tag: a kernel-client Pend of tag 144 for a fresh
+/// client corr, held by row 0 at its CURRENT generation, is planted (the count rises by one); the arm's own fn runs; the
+/// count is back; the holder's late answer through the real `fulfiller_reply` is -ENOENT with no inbox frame for that
+/// corr. A leftover Pend and any stray frame are taken back.
+#[cfg(feature = "busreg")]
+fn tagtimeout_selftest(next: &dyn Fn() -> u32) -> bool {
+    /// Holocron's SecretGet tag (`holocron_core::wire::VERB_SECRET_GET`; the crate rides `lumen`, so the literal).
+    const HOLOCRON_SECRET_GET: u8 = 144;
+    let ops = crate::arch::syscall::busreg_ops();
+    let rg0 = (ops.rgen)(0);
+    let tag = HOLOCRON_SECRET_GET;
+    let n0 = crate::bus_route::caller_pending(KCLIENT_ROW, KCLIENT_GEN);
+    let c = next();
+    let relay = crate::bus_route::pendpin_plant(tag, c, 0, rg0);
+    let planted = relay.is_some() && crate::bus_route::caller_pending(KCLIENT_ROW, KCLIENT_GEN) == n0 + 1;
+    tagtimeout_release(tag, c);
+    let freed = crate::bus_route::caller_pending(KCLIENT_ROW, KCLIENT_GEN) == n0;
+    let mut r = alloc::vec![0u8; BUS_HDR_LEN];
+    let rn = crate::bus::build_reply(tag, relay.unwrap_or(0), 0, [0u8; 32], &[], &mut r);
+    let late = match crate::bus::frame_parse(&r[..rn]) {
+        Ok(h) => crate::bus_route::fulfiller_reply(ops, 0, rg0, &h, &r[..rn]) == -2,
+        Err(_) => false,
+    };
+    let stray = locked(|| {
+        let mut q = REPLIES.lock();
+        let before = q.len();
+        q.retain(|f| !matches!(crate::bus::frame_parse(f), Ok(h) if h.corr == c));
+        q.len() != before
+    });
+    let _ = crate::bus_route::take_pending_by_corr(KCLIENT_ROW, c);
+    let ok = planted && freed && late && !stray;
+    if !ok {
+        serial_println!("[prefsbus] tagtimeout leg: tag={} planted={} freed={} late={} stray={} n0={}", tag, planted as u8, freed as u8, late as u8, stray as u8, n0);
+    }
+    ok
 }
