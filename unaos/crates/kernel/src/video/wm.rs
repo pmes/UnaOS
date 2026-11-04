@@ -2661,7 +2661,7 @@ pub fn close(id: WinId) -> bool {
         let mut t = table();
         match row_mut(&mut t, id) {
             Some(r) => {
-                let b = outer_box(r); #[cfg(all(target_arch = "x86_64", feature = "wc"))] close_owed_clear(id); // CONTINUE-CLOSE-DRAIN (B1129): the owed-close hide ends in the TABLE section that frees the row (file tail). LINE-NEUTRAL append, code first
+                let b = outer_box(r); #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] close_owed_clear(id); // CONTINUE-CLOSE-DRAIN (B1129): the owed-close hide ends in the TABLE section that frees the row (file tail). LINE-NEUTRAL append, code first
                 *r = Window::empty();
                 b
             }
@@ -33593,28 +33593,31 @@ pub fn wmtable_leg() -> &'static str {
 // x86 `wc` (no service pass hosts the close there), `close_owed` is `close` at once, as before. Residual hazard: a Log Out's
 // `close_all_furniture` between the runner's read and its `close(id)`, with a new window minted into that slot in
 // between (a Log Out gesture inside one ~1 ms service pass).
-#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 static CLOSE_OWED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(WIN_NONE);
 /// CONTINUE-CLOSE-DRAIN: `arch::ms()` when the close was owed (for the runner's `after_ms=`).
-#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 static CLOSE_OWED_AT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// CONTINUE-CLOSE-DRAIN: close `id` off the caller. On x86 + `wc` the row is hidden now and closed on the next
 /// device-service pass; a busy cell, or any other build, closes at once (today's `close`).
 pub fn close_owed(id: WinId) {
-    #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
     {
         use core::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed};
         if id != WIN_NONE && CLOSE_OWED.compare_exchange(WIN_NONE, id, AcqRel, Acquire).is_ok() {
             CLOSE_OWED_AT.store(crate::arch::ms(), Relaxed);
-            return;
+            if close_owed_host() {
+                return; // CLOSE-DRAIN-ARM (B1136): a runner holds the cell (x86: the service pass; aarch64: the one-shot task)
+            }
+            let _ = CLOSE_OWED.compare_exchange(id, WIN_NONE, AcqRel, Acquire); // no runner: today's close, here
         }
     }
     close(id);
 }
 
 /// CONTINUE-CLOSE-DRAIN: `close`'s row free, under TABLE — the hide ends with the row (id-checked).
-#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 #[inline]
 fn close_owed_clear(id: WinId) {
     use core::sync::atomic::Ordering::{AcqRel, Acquire};
@@ -33622,7 +33625,7 @@ fn close_owed_clear(id: WinId) {
 }
 
 /// CONTINUE-CLOSE-DRAIN: `above_shell`'s sibling term — the row whose close is owed is hidden. One atomic load, under TABLE.
-#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 #[inline]
 fn close_owed_hidden(r: &Window) -> bool {
     let o = CLOSE_OWED.load(core::sync::atomic::Ordering::Acquire);
@@ -33630,7 +33633,7 @@ fn close_owed_hidden(r: &Window) -> bool {
 }
 
 /// CONTINUE-CLOSE-DRAIN: no owed close on this build — the predicate is the trunk's.
-#[cfg(not(all(target_arch = "x86_64", feature = "wc")))]
+#[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
 #[inline(always)]
 fn close_owed_hidden(_r: &Window) -> bool {
     false
@@ -33639,7 +33642,7 @@ fn close_owed_hidden(_r: &Window) -> bool {
 /// CONTINUE-CLOSE-DRAIN: the device-service pass's taker (`pace_service`'s first line). One relaxed load when nothing
 /// is owed; otherwise the ONE `close`, which clears the cell when it frees the row. The cell is cleared again (id-checked)
 /// if the row was already gone, so a stale id is never re-run.
-#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 fn close_owed_run() {
     use core::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed};
     let id = CLOSE_OWED.load(Relaxed);
@@ -33650,4 +33653,39 @@ fn close_owed_run() {
     let _ = close(id);
     let _ = CLOSE_OWED.compare_exchange(id, WIN_NONE, AcqRel, Acquire);
     serial_println!("[wm] close owed win={} after_ms={} on=svc", id, after_ms);
+}
+
+// CLOSE-DRAIN-ARM (rmbp-ledger B1136) — TAIL-APPENDED. B1129 owed the session press's login-row close to x86's device-
+// service pass; aarch64 had no runner, so its press kept `close`'s DrainBarrier. The cell, the hide, the clear and the run
+// above are B1129's, cfg-widened to aarch64 + `desktop_firmware`. aarch64 has no periodic pass off the render and pump
+// cores (measured at 853d303c4), and a ~1 kHz one would spin under QEMU raspi4b (no tick IRQ) for a once-per-session event,
+// so its runner is ONE `close-owed` task spawned when the cell fills, on `sched::worker_cpu_apart` (c2 Pi, c1 Orin), whose
+// body is `close_owed_run` and which exits after the one close. No such core: the cell is cleared and the press closes at
+// once (before this arc's behaviour). Hazards are B1129's: one runner per fill (the CAS from empty), the clear under TABLE;
+// the Log Out residual window is now one task dispatch. The close composites from that core, the same off-render path task
+// teardown's `close_owner` takes (arch/aarch64/syscall.rs).
+
+/// CLOSE-DRAIN-ARM: x86 + `wc` — `pace_service`'s first line runs the owed close.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+#[inline(always)]
+fn close_owed_host() -> bool {
+    true
+}
+
+/// CLOSE-DRAIN-ARM: aarch64 + `desktop_firmware` — spawn the one-shot runner off the press; `false` when no core is free.
+#[cfg(all(target_arch = "aarch64", feature = "desktop_firmware"))]
+fn close_owed_host() -> bool {
+    match crate::arch::sched::worker_cpu_apart() {
+        Some(cpu) => {
+            let _ = crate::arch::sched::spawn("close-owed", close_owed_task, 0, cpu);
+            true
+        }
+        None => false,
+    }
+}
+
+/// CLOSE-DRAIN-ARM: the one-shot runner — B1129's ONE close, then it exits.
+#[cfg(all(target_arch = "aarch64", feature = "desktop_firmware"))]
+fn close_owed_task(_: usize) {
+    close_owed_run();
 }

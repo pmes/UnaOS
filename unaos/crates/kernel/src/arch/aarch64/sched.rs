@@ -12219,3 +12219,20 @@ fn hid_wait_tick(cpu: usize, raw: *const Task) {
         (t.name, t.id)
     });
 }
+
+// ── JOBS-INLINE-ARM / CLOSE-DRAIN-ARM (rmbp-ledger B1136) — FILE-TAIL append. aarch64 had no worker placement: the
+// `jobs-scan` worker ran inline on the press and the session press's owed login-row close had no runner (B1129). ONE
+// answer for both callers (`fs/jobs.rs` `worker_place`, `video/wm.rs` `close_owed_host`): the lowest online secondary
+// that is neither the CALLER's core (both callers run on the press, i.e. the render task; the aarch64 render core is not
+// published lib-side — ARM-SPLIT-PUBLISH owed) nor the hid pump's (`hidstall::pump_cpu`, B1124). Measured at 853d303c4:
+// the Pi and QEMU raspi4b answer c2 (render c1, input/pump c3); the Orin answers c1 (desktop on c0, its five EL2 APs
+// dispatch kernel tasks through `secondary_run`); two APs answer `None` (the caller works inline, as before). The BSP is
+// never chosen (Pi: boot duties, pinned work never lands there). Deterministic, like x86's `smp::worker_cpu(0)`.
+
+/// JOBS-INLINE-ARM (B1136): the core for one-shot work off the press — `None` when no secondary is free of the caller's
+/// core and the hid pump's. Read-only atomics; no lock.
+pub fn worker_cpu_apart() -> Option<usize> {
+    let me = percpu::this_cpu().cpu_index as usize;
+    let pump = crate::hidstall::pump_cpu();
+    (1..NUM_CPUS).find(|&c| c != me && c != pump && ONLINE_MASK[c].load(Ordering::Acquire))
+}
