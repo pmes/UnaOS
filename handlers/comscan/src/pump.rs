@@ -232,7 +232,8 @@ pub struct PumpDesk {
     identify: Option<Box<Identify>>,
     /// VUGCOMSCANHELLOID (SR546): the wait for the identity answer when the hello is on (`hello_within`); none: off.
     hello: Option<Duration>,
-    /// VUGCOMSCANALARMIDLE (SR591): the controller's travel is read at a first open (`envelope_read`); off by default.
+    /// VUGCOMSCANALARMIDLE (SR591): the controller's travel is read at a first open (`envelope_read`); VUGCOMSCANENVELOPEREADON
+    /// (SR597): on by default, riding the hello (read only where the hello is on).
     envelope: bool,
 }
 
@@ -243,7 +244,7 @@ fn refused(why: impl Into<String>) -> Vec<PumpEvent> {
 impl PumpDesk {
     /// A desk for `machine`: every pass it arms must name this machine's identity (VUG-HELM-BIND-MACHINE).
     pub fn new(machine: Machine) -> PumpDesk {
-        PumpDesk { machine, armed: Vec::new(), running: None, identify: None, hello: None, envelope: false }
+        PumpDesk { machine, armed: Vec::new(), running: None, identify: None, hello: None, envelope: true }
     }
 
     /// The machine this desk drives.
@@ -1342,9 +1343,10 @@ fn jog_past_travel(m: &Machine, delta: [f64; 3]) -> Option<String> {
 /// The controller's own travel, X / Y / Z in mm (grbl `$130`-`$132`); `None` for an axis the answer did not carry.
 pub type Envelope = [Option<f64>; 3];
 
-/// Ask the controller its travel: its dialect's verb (`pump_core::pump::envelope_verb`: grbl `$$`) sent once through
-/// [`send_line`], the answer read through the one line reader to its end (`pump_core::pump::hello_line`: `ok` / a refusal)
-/// and every `$130`-`$132` line kept (`pump_core::pump::envelope_setting`). `None`: no verb, the link would not take it,
+/// Ask the controller its travel: its dialect's verb (`pump_core::pump::envelope_verb`: grbl `$$`, Marlin `M211`) sent once
+/// through [`send_line`], the answer read through the one line reader to its end (`pump_core::pump::hello_line`: `ok` / a
+/// refusal) and every axis a line carries kept (`pump_core::pump::envelope_setting`: grbl `$130`-`$132`, Marlin's soft
+/// endstops `Max - Min`). `None`: no verb, the link would not take it,
 /// the controller refused it, went silent for `wait` or closed.
 pub fn envelope(link: &mut dyn Transport, dialect: Dialect, wait: Duration) -> Option<Envelope> {
     use pump_core::pump::{HelloLine, envelope_setting, envelope_verb, hello_line};
@@ -1355,8 +1357,10 @@ pub fn envelope(link: &mut dyn Transport, dialect: Dialect, wait: Duration) -> O
     let mut got: Envelope = [None; 3];
     let mut refused = false;
     let ended = lines_until(link, wait, |s| {
-        if let Some((i, v)) = envelope_setting(dialect, s) {
-            got[i] = Some(v);
+        for (g, v) in got.iter_mut().zip(envelope_setting(dialect, s)) {
+            if v.is_some() {
+                *g = v; // VUGCOMSCANENVELOPEREADON (SR597): a line may carry every axis (Marlin's M211)
+            }
         }
         match hello_line(dialect, s) {
             HelloLine::End => true,
@@ -1385,14 +1389,16 @@ pub fn with_envelope(res: Result<Opened, String>, read: Option<(Dialect, Duratio
 impl PumpDesk {
     /// Turn the travel read on (or off): every later PumpStart asks the controller its travel after the hello and says a
     /// travel that differs from the declared machine's once (`envelope differs axis=<a> declared=<d> controller=<c>`); the
-    /// declared machine stays the jog's bound. Off by default (owed VUG-COMSCAN-ENVELOPE-READ-ON).
+    /// declared machine stays the jog's bound. VUGCOMSCANENVELOPEREADON (SR597): on by default wherever the hello is on (the
+    /// bus, [`compose`]); `envelope_read(false)` is the off switch.
     pub fn envelope_read(&mut self, on: bool) {
         self.envelope = on;
     }
 
-    /// The travel read for a start in `d`: the hello's wait, else [`HELLO_WAIT`]; `None` while the read is off.
+    /// The travel read for a start in `d` at the hello's wait; `None` while the read or the hello is off
+    /// (VUGCOMSCANENVELOPEREADON SR597: the read rides the hello, so a hello-off desk sends nothing new).
     fn envelope_spec_for(&self, d: Dialect) -> Option<(Dialect, Duration)> {
-        self.envelope.then(|| (d, self.hello.unwrap_or(HELLO_WAIT)))
+        self.hello.filter(|_| self.envelope).map(|w| (d, w))
     }
 
     /// One word per axis both declared and read whose travel differs at grbl's printed resolution (three decimals), the
@@ -1780,5 +1786,12 @@ mod tests {
         assert!(a.len() == 12 && a.starts_with("UNA-") && a != b, "{a} {b}");
         assert!(a[4..].chars().all(|c| c.is_ascii_digit() || c.is_ascii_uppercase()), "{a}");
         assert_ne!(undeclared_machine().digest(), machine().digest(), "the undeclared machine is no real machine");
+
+        // VUGCOMSCANENVELOPEREADON (SR597): the travel read rides the hello, on by default; envelope_read(false) the off switch.
+        let (mut d, _) = compose(machine(), Box::new(|_: &str| -> Option<String> { None }), arm("serial"), arm("tcp"), arm("ws"));
+        assert_eq!(d.envelope_spec_for(GRBL), Some((GRBL, HELLO_WAIT)), "the composed desk reads the travel");
+        d.envelope_read(false);
+        assert_eq!(d.envelope_spec_for(GRBL), None, "the off switch");
+        assert_eq!(PumpDesk::new(machine()).envelope_spec_for(GRBL), None, "a hello-off desk sends nothing new");
     }
 }

@@ -818,26 +818,66 @@ pub fn marlin_halted(s: &str) -> bool {
 }
 
 /// The verb that reports the controller's own travel, sent once after the hello when the read is on: grbl 1.1 `$$` (every
-/// setting, one `$<n>=<value>` line each, then `ok`); Marlin's M211 report is owed and LinuxCNC is not streamed: `None`.
+/// setting, one `$<n>=<value>` line each, then `ok`); Marlin `M211` with no argument (VUGCOMSCANENVELOPEREADON SR597: the
+/// soft endstops report, `Min:` and `Max:` on one line, then `ok`; compiled out it is an unknown command, a refusal);
+/// LinuxCNC is not streamed: `None`.
 pub fn envelope_verb(d: Dialect) -> Option<&'static str> {
     match d {
         Dialect::Grbl { .. } => Some("$$"),
-        Dialect::Marlin | Dialect::LinuxCnc => None,
+        Dialect::Marlin => Some("M211"),
+        Dialect::LinuxCnc => None,
     }
 }
 
-/// One line of the [`envelope_verb`] answer read for the travel only: grbl `$130=` / `$131=` / `$132=` (X / Y / Z max
-/// travel, mm) as (axis 0 / 1 / 2, value); every other line, a value that is not a finite number, or another dialect: `None`.
-pub fn envelope_setting(d: Dialect, s: &str) -> Option<(usize, f64)> {
-    if !is_grbl(d) {
-        return None;
+/// One line of the [`envelope_verb`] answer read for the travel only, X / Y / Z in mm (`None` for an axis the line does not
+/// carry): grbl `$130=` / `$131=` / `$132=` (X / Y / Z max travel) fill one slot; VUGCOMSCANENVELOPEREADON (SR597): Marlin's
+/// soft endstops line (`echo:  Min:  X0.00 Y0.00 Z0.00   Max:  X200.00 Y200.00 Z200.00`) gives `Max - Min` per axis both
+/// sides carry (a 2-axis machine's line leaves Z `None`). A value that is not a finite number, every other line, or
+/// another dialect: all `None`.
+pub fn envelope_setting(d: Dialect, s: &str) -> [Option<f64>; 3] {
+    let mut out = [None; 3];
+    match d {
+        Dialect::Grbl { .. } => {
+            let Some((k, v)) = s.strip_prefix("$13").and_then(|r| r.split_once('=')) else { return out };
+            let i = match k {
+                "0" => 0,
+                "1" => 1,
+                "2" => 2,
+                _ => return out,
+            };
+            out[i] = v.trim().parse::<f64>().ok().filter(|v| v.is_finite());
+        }
+        Dialect::Marlin => {
+            let (Some(lo), Some(hi)) = (s.find("Min:"), s.find("Max:")) else { return out };
+            if lo >= hi {
+                return out;
+            }
+            let (min, max) = (marlin_xyz(&s[lo + 4..hi]), marlin_xyz(&s[hi + 4..]));
+            for (o, (a, b)) in out.iter_mut().zip(min.into_iter().zip(max)) {
+                *o = a.zip(b).map(|(a, b)| b - a);
+            }
+        }
+        Dialect::LinuxCnc => {}
     }
-    let (k, v) = s.strip_prefix("$13")?.split_once('=')?;
-    let i = match k {
-        "0" => 0,
-        "1" => 1,
-        "2" => 2,
-        _ => return None,
-    };
-    v.trim().parse::<f64>().ok().filter(|v| v.is_finite()).map(|v| (i, v))
+    out
+}
+
+// VUGCOMSCANENVELOPEREADON (SR597): Marlin's soft endstops read through the one envelope_setting
+
+/// The `X<n>` / `Y<n>` / `Z<n>` words of one side of Marlin's soft endstops line (`print_pos`: ` X0.00 Y0.00 Z0.00`), finite only.
+fn marlin_xyz(seg: &str) -> [Option<f64>; 3] {
+    let mut out = [None; 3];
+    for w in seg.split_whitespace() {
+        let mut c = w.chars();
+        let i = match c.next() {
+            Some('X') => 0,
+            Some('Y') => 1,
+            Some('Z') => 2,
+            _ => continue,
+        };
+        if let Some(v) = c.as_str().parse::<f64>().ok().filter(|v| v.is_finite()) {
+            out[i] = Some(v);
+        }
+    }
+    out
 }
