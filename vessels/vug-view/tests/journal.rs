@@ -918,3 +918,58 @@ fn a_first_held_root_with_no_fix_passes_the_card_to_the_next() {
     assert!(vw.view.design.journal.offered().is_none(), "the round offers nothing");
     assert!((volume(&vw) - (1000.0 + 5.0 * area)).abs() < 1e-4, "the box and the post: {}", volume(&vw));
 }
+
+// ---- VUGFACEJOURNALHOLDNOFIXWORD (LEDGER SR630): held roots with no fix say `no fix` after the list ----
+// SR611's box, post and fillet `round` (a NoSuchEdge with no resolving name, first in line order). Opened, the post has a
+// fix, so the note row is the note (byte-identical: None). Tab + Return fix the post: the round alone stays held with no
+// fix, so the row is the note then `held=round no fix`. The written document reopened: no note, the row is the word alone.
+
+/// SR611's fixture: BOX_NOPROFILE with a fillet `round` right after the box whose first edge name is gone and whose list
+/// already names every edge of the box.
+fn round_and_post() -> doc_core::Doc {
+    let base = doc_core::read(BOX_NOPROFILE).expect("reads");
+    let r = doc_core::replay(&base, base.tol);
+    let solid = r.solids.iter().find(|s| s.id == "box").expect("the box replays");
+    let gone = brep_core::Name { op: brep_core::OpKind::Extrude, role: brep_core::Role::CapEnd, a: 9, b: 9 };
+    let mut edges = vec![gone];
+    for e in &solid.brep.edges {
+        if !edges.contains(&e.name) {
+            edges.push(e.name);
+        }
+    }
+    let mut d = base.clone();
+    d.lines.clear();
+    let at = d.stmts.iter().position(|s| s.id() == Some("box")).expect("the box row") + 1;
+    d.stmts.insert(at, Stmt::Fillet { id: "round".into(), on: "box".into(), edges, r: 1.0 });
+    doc_core::read(&doc_core::write(&d)).expect("the fillet line reads")
+}
+
+#[test]
+fn held_roots_with_no_fix_say_no_fix_after_the_list() {
+    let mut vw = Viewer::open_doc(round_and_post(), "box", (W, H), Preset::Una).expect("two solid roots are held, not refused");
+    let post = index_of(&vw, |s| s.id() == Some("post"));
+    let line = doc(&vw).line(post);
+    let j = &vw.view.design.journal;
+    assert_eq!(j.faults.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(), ["round", "post"], "both roots held, the round first");
+    assert_eq!(j.note_row(), j.note, "a held root with a fix: the row is SR611's, byte for byte");
+    assert_eq!(j.note_row(), None, "opened: no note");
+
+    assert!(typed(&mut vw, "t"), "t shows the panel");
+    assert_eq!(vw.view.design.journal.offered().expect("the post's card").line, line);
+    assert!(key(&mut vw, "Tab"), "Tab walks the card");
+    let picked = vw.view.design.journal.offered().expect("a pick").text;
+    assert!(key(&mut vw, "Return"), "Return takes the pick");
+    let j = &vw.view.design.journal;
+    assert_eq!(j.faults.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(), ["round"], "{:?}", j.faults);
+    assert_eq!(j.note.as_deref(), Some(format!("fixed line {line}: {picked}").as_str()), "the note itself unchanged");
+    let after = j.note_row();
+    assert_eq!(after.as_deref(), Some(format!("fixed line {line}: {picked} held=round no fix").as_str()), "the word after the held list, one row");
+
+    let written = doc_core::read(&doc_core::write(doc(&vw))).expect("the fixed document reads");
+    let again = Viewer::open_doc(written, "box", (W, H), Preset::Una).expect("the round alone is held, not refused");
+    let j = &again.view.design.journal;
+    assert_eq!(j.note, None, "reopened: no note");
+    let reopened = j.note_row();
+    assert_eq!(reopened.as_deref(), Some("held=round no fix"), "no note: the word alone");
+    println!("holdnofix after_fix={} reopened={}", after.unwrap_or_default(), reopened.unwrap_or_default());
+}
