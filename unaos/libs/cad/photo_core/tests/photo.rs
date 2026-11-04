@@ -623,3 +623,87 @@ fn the_first_crop_in_the_file_wins_whatever_its_chunk() {
     assert_eq!(b, Vec2::new(350.0, 280.0));
     eprintln!("photo: crop-meta-itxt first={},{}/{},{}", a.x, a.y, b.x, b.y);
 }
+
+// ---- VUGPHOTOCROPMETAXMP (SR631): the crop meta in an XMP packet (named tail block) ----
+
+/// An XMP packet (the `<?xpacket?>` wrapper, `x:xmpmeta`, `rdf:RDF`) around one `rdf:Description` whose attributes are
+/// `attrs` and whose children are `body`; the `vug` and `other` prefixes are bound on `x:xmpmeta`.
+fn xmp_packet(attrs: &str, body: &str) -> String {
+    format!(
+        "<?xpacket begin=\"\u{feff}\" id=\"W5M0MpCehiHzreSzNTczkc9d\"?>\n<x:xmpmeta xmlns:x=\"adobe:ns:meta/\" \
+         xmlns:vug=\"urn:example:vug\" xmlns:other=\"urn:example:other\"><rdf:RDF \
+         xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\"><rdf:Description rdf:about=\"\" {attrs}>{body}\
+         </rdf:Description></rdf:RDF></x:xmpmeta>\n    \n<?xpacket end=\"w\"?>"
+    )
+}
+
+/// SR614's hand-built 8 x 8 JPEG (an empty COM, which surfaces no pair) with `app1` spliced in after SOI as an APP1.
+fn xmp_jpeg(app1: &[u8]) -> Vec<u8> {
+    let base = meta_jpeg(b"");
+    let mut j = vec![0xFF, 0xD8, 0xFF, 0xE1];
+    j.extend_from_slice(&((app1.len() + 2) as u16).to_be_bytes());
+    j.extend_from_slice(app1);
+    j.extend_from_slice(&base[2..]);
+    j
+}
+
+/// VUGPHOTOCROPMETAXMP (SR631): a JPEG whose APP1 carries an XMP packet with `vug:crop` opens cropped at (250, 320),
+/// the property as an `rdf:Description` attribute or as its child element; a packet without it (another prefix's
+/// `crop`, other properties) and an extended-XMP APP1 surface no crop.
+#[test]
+fn a_jpeg_xmp_crop_opens_cropped() {
+    let app1 = |packet: &str| [&b"http://ns.adobe.com/xap/1.0/\0"[..], packet.as_bytes()].concat();
+    let attr = pixel_core::decode(&xmp_jpeg(&app1(&xmp_packet("vug:crop=\"200,40,900,720\"", "")))).expect("decodes");
+    assert_eq!((attr.width, attr.height), (8, 8));
+    assert_eq!(attr.text.len(), 1);
+    assert_eq!(attr.text[0].0, pixel_core::png::XMP_KEY);
+    let pp = photo_core::crop_principal(&attr).expect("the XMP attribute carries the crop");
+    assert_eq!(pp, Vec2::new(250.0, 320.0));
+    let elem = pixel_core::decode(&xmp_jpeg(&app1(&xmp_packet("", "<vug:crop> 200,40,900,720 </vug:crop>")))).expect("decodes");
+    assert_eq!(photo_core::crop_principal(&elem), Some(Vec2::new(250.0, 320.0)));
+    let none = xmp_packet("other:crop=\"0,0,700,560\" other:CreatorTool=\"a camera\"", "<other:crop>0,0,700,560</other:crop>");
+    let keyless = pixel_core::decode(&xmp_jpeg(&app1(&none))).expect("decodes");
+    assert_eq!(keyless.text.len(), 1);
+    assert_eq!(photo_core::crop_principal(&keyless), None);
+    let ext = [&b"http://ns.adobe.com/xmp/extension/\0"[..], xmp_packet("vug:crop=\"200,40,900,720\"", "").as_bytes()].concat();
+    let extended = pixel_core::decode(&xmp_jpeg(&ext)).expect("decodes");
+    assert!(extended.text.is_empty());
+    assert_eq!(photo_core::crop_principal(&extended), None);
+    eprintln!("photo: crop-meta-xmp jpeg={},{}", pp.x, pp.y);
+}
+
+/// pixel_core's lossless WebP KAT fixture (VP8X + ICCP + VP8L) with the VP8X XMP flag set and an `XMP ` chunk carrying
+/// `packet` appended after the image (RFC 9649 §2.7's order), the RIFF size rewritten.
+fn xmp_webp(packet: &str) -> Vec<u8> {
+    let mut w = include_bytes!("../../../media/pixel_core/tests/fixtures/webp/pal8v5-ll.webp").to_vec();
+    assert_eq!(&w[12..16], b"VP8X");
+    w[20] |= 0x04;
+    w.extend_from_slice(b"XMP ");
+    w.extend_from_slice(&(packet.len() as u32).to_le_bytes());
+    w.extend_from_slice(packet.as_bytes());
+    if packet.len() & 1 == 1 {
+        w.push(0);
+    }
+    let riff = (w.len() - 8) as u32;
+    w[4..8].copy_from_slice(&riff.to_le_bytes());
+    w
+}
+
+/// VUGPHOTOCROPMETAXMP (SR631): a WebP whose `XMP ` chunk (after the image data) carries `vug:crop` opens cropped at
+/// (250, 320) with the same pixels as the plain file; a packet without it surfaces no crop.
+#[test]
+fn a_webp_xmp_crop_opens_cropped() {
+    let plain = pixel_core::decode(include_bytes!("../../../media/pixel_core/tests/fixtures/webp/pal8v5-ll.webp")).expect("the KAT decodes");
+    assert!(plain.text.is_empty());
+    let img = pixel_core::decode(&xmp_webp(&xmp_packet("vug:crop=\"200,40,900,720\"", ""))).expect("the XMP WebP decodes");
+    assert_eq!((img.width, img.height), (plain.width, plain.height));
+    assert_eq!(img.rgba, plain.rgba);
+    assert_eq!(img.text.len(), 1);
+    assert_eq!(img.text[0].0, pixel_core::png::XMP_KEY);
+    let pp = photo_core::crop_principal(&img).expect("the XMP chunk carries the crop");
+    assert_eq!(pp, Vec2::new(250.0, 320.0));
+    let keyless = pixel_core::decode(&xmp_webp(&xmp_packet("other:crop=\"0,0,700,560\"", ""))).expect("decodes");
+    assert_eq!(keyless.text.len(), 1);
+    assert_eq!(photo_core::crop_principal(&keyless), None);
+    eprintln!("photo: crop-meta-xmp webp={},{}", pp.x, pp.y);
+}
