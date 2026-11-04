@@ -2221,42 +2221,47 @@ fn unset_bus_legs() {
 // case); from any other path, or with no path (the spelling never promotes), it is `Caller::Anon` — an
 // impostor, not a program owed a namespace: the schema's ring-3 rows, no declare. `prefs_core` stays path-free
 // and untouched. Knob-off (no `busreg`): no path record exists, [`prefscap_path`] is the identity.
+// PREFSCAP-NS-PATH (rmbp-ledger B1177): the same verdict, generalised in place, binds EVERY stamped name to its image
+// `/apps/<NAME>.ELF` (a namespace's owner is named only by the caller's name: `cap`'s stanza, owner and declare arms),
+// so an image called VEIN.ELF from `/home` is `Anon` and may not SET `vein.*`; `prefs` is the general case.
 // Witness: `tests prefs` → `[prefs] set vein.endpoint ok=0 why=refused via=bus by=prefs path=foreign` and
 // `:: PREFSCAP-PATH: … -> PASS ::`.
 // =================================================================================================
 
-/// PREFSCAP-PATH — `c` as PREFSCAP may see it, and whether it was demoted. Takes only wm's leaf `APP_PATHS`
-/// (`bus_route::path_names` and `tag_image` take no lock).
+/// PREFSCAP-PATH — `c` as PREFSCAP may see it, and the stamped name it was demoted from (`None` = kept). Takes only
+/// wm's leaf `APP_PATHS` (then, with no late path, `APP_NAMES_EARLY`; `bus_route::path_names` takes no lock).
+/// PREFSCAP-NS-PATH (rmbp-ledger B1177): EVERY program, not only `prefs`, is its name only when its path is
+/// `/apps/<NAME>.ELF` (B1163's rule; `prefs` is the general case, its image TAG_IMAGE's `/apps/PREFS.ELF`), else `Anon`.
 #[cfg(all(feature = "busreg", any(feature = "aarch64_el0", target_arch = "x86_64")))]
-fn prefscap_path(owner: u64, c: prefs_core::cap::Caller<'_>) -> (prefs_core::cap::Caller<'_>, bool) {
+fn prefscap_path<'a>(owner: u64, c: prefs_core::cap::Caller<'a>) -> (prefs_core::cap::Caller<'a>, Option<&'a str>) {
     match c {
-        prefs_core::cap::Caller::Program(p) if p.eq_ignore_ascii_case(prefs_core::cap::PRINCIPIA) => {
-            let principia = crate::bus_route::tag_image(una_abi::BUS_VERB_R3PREF_SET)
-                .and_then(|img| crate::video::wm::app_path_with(owner, |path| crate::bus_route::path_names(path, img)).or_else(|| prefscap_early(owner, img))) // PREFSCAP-ARM-EARLY (rmbp-ledger B1176): no late path -> wm's early record at the caller row's current generation, B1164's two-source rule as `tagpath_id` (file tail). LINE-NEUTRAL fold, code first
+        prefs_core::cap::Caller::Program(p) => {
+            let img = alloc::format!("/apps/{}.ELF", p); // built before any leaf lock is taken
+            let bound = crate::video::wm::app_path_with(owner, |path| crate::bus_route::path_names(path, &img)).or_else(|| prefscap_early(owner, &img)) // PREFSCAP-ARM-EARLY (rmbp-ledger B1176): no late path -> wm's early record at the caller row's current generation, B1164's two-source rule as `tagpath_id` (file tail); rides PREFSCAP-NS-PATH's (B1177) per-name image. LINE-NEUTRAL fold, code first
                 == Some(true);
-            if principia {
-                (c, false)
+            if bound {
+                (c, None)
             } else {
-                (prefs_core::cap::Caller::Anon, true)
+                (prefs_core::cap::Caller::Anon, Some(p))
             }
         }
-        _ => (c, false),
+        _ => (c, None),
     }
 }
 
 /// PREFSCAP-PATH knob-off: no path record, nothing demoted (today's caller, unchanged).
 #[cfg(all(not(feature = "busreg"), any(feature = "aarch64_el0", target_arch = "x86_64")))]
 #[inline(always)]
-fn prefscap_path(_owner: u64, c: prefs_core::cap::Caller<'_>) -> (prefs_core::cap::Caller<'_>, bool) {
-    (c, false)
+fn prefscap_path<'a>(_owner: u64, c: prefs_core::cap::Caller<'a>) -> (prefs_core::cap::Caller<'a>, Option<&'a str>) {
+    (c, None)
 }
 
-/// PREFSCAP-PATH — a DEMOTED caller's SET is said with its stamped name and `path=foreign` (B1166's why words);
+/// PREFSCAP-PATH — a DEMOTED caller's SET is said with its stamped name (any program since B1177) and `path=foreign` (B1166's why words);
 /// every other verb or caller passes `st` through silently.
 #[cfg(any(feature = "aarch64_el0", target_arch = "x86_64"))]
 #[inline(always)]
-fn prefscap_set_note(verb: u8, body: &[u8], demoted: bool, st: i64) -> i64 {
-    if demoted && verb == prefs_core::wire::VERB_SET {
+fn prefscap_set_note(verb: u8, body: &[u8], demoted: Option<&str>, st: i64) -> i64 {
+    if let (Some(by), true) = (demoted, verb == prefs_core::wire::VERB_SET) {
         let ok = (st == 0) as u8;
         let why = match st {
             0 => "",
@@ -2266,9 +2271,9 @@ fn prefscap_set_note(verb: u8, body: &[u8], demoted: bool, st: i64) -> i64 {
         };
         match prefs_core::wire::parse_set(body) {
             Some((ns, k, _)) => {
-                serial_println!("[prefs] set {}.{} ok={}{} via=bus by={} path=foreign", ns, k, ok, why, prefs_core::cap::PRINCIPIA)
+                serial_println!("[prefs] set {}.{} ok={}{} via=bus by={} path=foreign", ns, k, ok, why, by)
             }
-            None => serial_println!("[prefs] set <malformed> ok={}{} via=bus by={} path=foreign", ok, why, prefs_core::cap::PRINCIPIA),
+            None => serial_println!("[prefs] set <malformed> ok={}{} via=bus by={} path=foreign", ok, why, by),
         }
     }
     st
@@ -2279,8 +2284,10 @@ fn prefscap_set_note(verb: u8, body: &[u8], demoted: bool, st: i64) -> i64 {
 /// ring-3 rows only, no declare: pure cap checks, nothing written); `/apps/PREFS.ELF` and `/apps/prefs.elf` keep
 /// Principia, `/APPS/PREFS.ELF` and a pathless `PREFS.ELF` are demoted, a non-prefs name is never touched. The
 /// scratch name and path are forgotten.
-/// `:: PREFSCAP-PATH: foreign=refused anon=held apps=admitted case=admitted upper=demoted pathless=demoted early=admitted stale=demoted other=kept restored=1 -> PASS ::`
-/// (`early=` / `stale=`: PREFSCAP-ARM-EARLY B1176, [`prefscap_early_legs`]).
+/// `:: PREFSCAP-PATH: foreign=refused anon=held apps=admitted case=admitted upper=demoted pathless=demoted early=admitted stale=demoted other=demoted ns=refused nsown=admitted restored=1 -> PASS ::`
+/// (`early=` / `stale=`: PREFSCAP-ARM-EARLY B1176, [`prefscap_early_legs`]; `other=demoted` / `ns=` / `nsown=`: PREFSCAP-NS-PATH
+/// B1177 — a `/home/una/LUMEN.ELF` is demoted, a `/home/una/VEIN.ELF` SET of `vein.endpoint` is -EACCES with the value kept
+/// (`[prefs] set vein.endpoint ok=0 why=refused via=bus by=vein path=foreign`), `/apps/VEIN.ELF` keeps `vein.*` and only it).
 #[cfg(feature = "witness")]
 fn prefscap_path_selftest() {
     #[cfg(all(feature = "busreg", any(feature = "aarch64_el0", target_arch = "x86_64")))]
@@ -2308,7 +2315,7 @@ fn prefscap_path_legs() {
         let mut nb = [0u8; crate::video::wm::MAX_TITLE];
         caller_name(OWNER, &mut nb).map(|p| {
             let (c, d) = prefscap_path(OWNER, Caller::Program(p));
-            d == (c == Caller::Anon) && d
+            d.is_some() == (c == Caller::Anon) && d.is_some()
         })
     };
     // L1 + L2: the foreign PREFS — demoted, its SET refused on the wire, the value kept; Anon's rows only.
@@ -2330,16 +2337,30 @@ fn prefscap_path_legs() {
     // L4: a relative arm clears the path row: the spelling alone never promotes.
     let pathless = demoted("PREFS.ELF") == Some(true);
     let (early, stale, early_gone) = prefscap_early_legs(OWNER, &demoted); // PREFSCAP-ARM-EARLY (rmbp-ledger B1176): the early record admits a pathless PREFS.ELF at the current generation only (file tail)
-    let other = demoted("/home/una/LUMEN.ELF") == Some(false);
+    // L5 (PREFSCAP-NS-PATH B1177): every program is its name only from `/apps/<NAME>.ELF`: a non-prefs image from
+    // `/home` is demoted; VEIN from `/home` is refused its own namespace on the wire; `/apps/VEIN.ELF` owns `vein.*`.
+    let other = demoted("/home/una/LUMEN.ELF") == Some(true);
+    let ns_demoted = demoted("/home/una/VEIN.ELF") == Some(true);
+    let ep = get("vein", "endpoint");
+    o.clear();
+    let st = bus_fulfil_from(prefs_core::wire::VERB_SET, b"vein.endpoint\x00\"https://foreign.example/\"", true, OWNER, &mut o);
+    let ns = ns_demoted && st == prefs_core::wire::EACCES && get("vein", "endpoint") == ep;
+    let nsown = demoted("/apps/VEIN.ELF") == Some(false) && {
+        let mut nb = [0u8; crate::video::wm::MAX_TITLE];
+        caller_name(OWNER, &mut nb).is_some_and(|p| {
+            let (c, _) = prefscap_path(OWNER, Caller::Program(p));
+            c == Caller::Program("vein") && may_set(c, "vein", "x") && !may_set(c, "system", "login.items")
+        })
+    };
     crate::video::wm::app_name_forget(OWNER);
     let restored = early_gone && !crate::video::wm::app_name_armed(OWNER) && crate::video::wm::app_path_with(OWNER, |_| true).is_none();
-    let ok = foreign && anon && apps && case && upper && pathless && early && stale && other && restored;
+    let ok = foreign && anon && apps && case && upper && pathless && early && stale && other && ns && nsown && restored;
     serial_println!(
-        ":: PREFSCAP-PATH: foreign={} anon={} apps={} case={} upper={} pathless={} early={} stale={} other={} restored={} -> {} ::",
+        ":: PREFSCAP-PATH: foreign={} anon={} apps={} case={} upper={} pathless={} early={} stale={} other={} ns={} nsown={} restored={} -> {} ::",
         if foreign { "refused" } else { "ADMITTED" }, if anon { "held" } else { "FAIL" }, if apps { "admitted" } else { "DEMOTED" },
         if case { "admitted" } else { "DEMOTED" }, if upper { "demoted" } else { "ADMITTED" }, if pathless { "demoted" } else { "ADMITTED" },
         if early { "admitted" } else { "DEMOTED" }, if stale { "demoted" } else { "ADMITTED" },
-        if other { "kept" } else { "DEMOTED" }, restored as u8, if ok { "PASS" } else { "FAIL" }
+        if other { "demoted" } else { "KEPT" }, if ns { "refused" } else { "ADMITTED" }, if nsown { "admitted" } else { "DEMOTED" }, restored as u8, if ok { "PASS" } else { "FAIL" }
     );
 }
 
