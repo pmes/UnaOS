@@ -1898,9 +1898,9 @@ pub(crate) fn store_read(p: &str) -> Option<Vec<u8>> {
 // The operator's `pref unset <ns.key>`: the key leaves the session store by THE ONE RULE the delete watch and the session
 // reload already keep — removed from the tree (never the default written into the user's file), its domain saved by the
 // same swap (`KernelPersist` -> `save_domain`, rolled back on a failed save), then ONE post through [`post_changes`] of
-// [`default_applied`]: the static or declared default as `Some`, SR169's unset form (`None`) only for a Consumer-default or
-// undeclared key; MACHINE-KEY-DEFAULT-PIN (B1173) + UNSET-POST-ROADS (B1179): a `MACHINE_KEYS` row or a static-default key
-// posts the unset form ([`unset_posted`]), so the mirror removes a machine key (B1154's `=unset`). The bus unset is PREFS-UNSET-BUS (B1166, `store_unset` below). The
+// [`unset_posted`]: SR169's unset form (`None`) for EVERY key (MACHINE-KEY-DEFAULT-PIN B1173, UNSET-POST-ROADS B1179,
+// UNSET-POST-RULE B1185), so the mirror removes a machine key (B1154's `=unset`); [`default_applied`] answers the
+// operator's `reads <lit>` text only. The bus unset is PREFS-UNSET-BUS (B1166, `store_unset` below). The
 // writers column admits the operator for every key (`prefs_core::schema::Writer`), so there is no new check.
 // Wire: `[prefs] unset <ns>.<key> ok=1` (+ `[prefs] changed <ns>.<key>`), `ok=1 was=unset`, `ok=0 why=<e>`.
 
@@ -2372,16 +2372,12 @@ fn prefscap_path_legs() {
 // `machine_mirror` removes the key from the machine copy by B1154's None arm instead of writing the default literal.
 // UNSET-POST-ROADS (B1179): ONE rule on the three roads ([`unset`], the delete watch's [`deleted_post`], the reload's
 // [`reload_post`]), and a STATIC-default key (`schema::default_of` -> `Source::Default`) posts the unset form too, as the
-// host ring does: no consumer reads the value and the post path writes no session file (the store already lacks the key).
-// A Rule-default or declared `app.*` key keeps [`default_applied`] (UNSET-POST-RULE owed). Wire: `[prefs] machine settings/<d> system.<k>=unset wrote=1`, `[prefs] unset <a> ok=1 posted=<unset|lit> via=bus …`.
+// host ring does. UNSET-POST-RULE (B1185): so do a Rule-default key (vein's provider rebuild re-reads on the namespace) and a declared
+// `app.*` key (no reader binds the value; the declarer holds its default): EVERY unset posts the unset form, [`default_applied`] answers reads only. Wire: `[prefs] machine settings/<d> system.<k>=unset wrote=1`, `[prefs] unset <a> ok=1 posted=unset via=bus …`.
 
 /// The PrefChanged value [`unset`], [`deleted_post`] and [`reload_post`] post for `ns`/`k` (see the block above). Called with no prefs lock held.
 fn unset_posted(ns: &str, k: &str) -> Option<prefs_core::schema::Applied> {
-    if ns == NS && MACHINE_KEYS.contains(&k) {
-        return None;
-    }
-    if ns != prefs_core::files::APP_NS && matches!(prefs_core::schema::default_of(ns, k, &StoreEnv), Some((_, prefs_core::schema::Source::Default))) { return None; } // UNSET-POST-ROADS (rmbp-ledger B1179): a static-default key posts the unset form too (the block above). Named in-place hunk
-    default_applied(ns, k)
+    let _ = (ns, k); None // UNSET-POST-RULE (rmbp-ledger B1185): every kind posts the unset form; B1173's machine arm and B1179's static line fold into it (the block above). Named in-place hunk
 }
 
 /// [`unset_bus_note`]'s `posted=` word: `unset`, or the literal [`unset_posted`] carried.
@@ -2397,7 +2393,7 @@ fn unset_posted_word(body: &[u8]) -> String {
 /// UNSET `system.accessibility.reduce_motion` (a ring-3 settable row) through [`bus_fulfil_from`]; the post is the unset
 /// form, the key is gone, and (in a session) the machine copy no longer holds it. The session domain file, the machine
 /// file, the tree and ON_DISK are restored byte for byte.
-/// `:: MACHINE-KEY-UNSET: set=1 unset=0 posted=unset roads=3 mirror=<removed|nosession> restored=1 -> PASS ::`.
+/// `:: MACHINE-KEY-UNSET: set=1 unset=0 posted=unset roads=3 rule=unset app=unset mirror=<removed|nosession> restored=1 -> PASS ::`.
 #[cfg(all(feature = "witness", any(feature = "aarch64_el0", target_arch = "x86_64")))]
 fn machine_unset_leg(owner: u64) {
     use prefs_core::wire::{VERB_SET, VERB_UNSET};
@@ -2421,7 +2417,7 @@ fn machine_unset_leg(owner: u64) {
     } else {
         "removed"
     };
-    let (del, rel) = unset_roads_leg(&sp, &mp, session); let roads = (posted && mirror != "KEPT") as u8 + del as u8 + rel as u8; // UNSET-POST-ROADS (rmbp-ledger B1179): the delete and reload roads, before the restore below (file tail). Named in-place hunk
+    let (del, rel) = unset_roads_leg(&sp, &mp, session); let roads = (posted && mirror != "KEPT") as u8 + del as u8 + rel as u8; let (rule, app) = unset_rule_leg(); // UNSET-POST-ROADS (rmbp-ledger B1179): the delete and reload roads, before the restore below (file tail). Named in-place hunk UNSET-POST-RULE (rmbp-ledger B1185): the Rule-default and declared app.* legs (file tail).
     // Restore the files, the tree and ON_DISK.
     let mt = crate::shell::vfs_mount_table();
     for (p, b) in [(&sp, &s0), (&mp, &m0)] {
@@ -2437,10 +2433,10 @@ fn machine_unset_leg(owner: u64) {
     *TREE.lock() = tree0;
     *ON_DISK.lock() = on_disk0;
     let restored = read_all(&sp) == s0 && read_all(&mp) == m0;
-    let ok = set && st == 0 && posted && mirror != "KEPT" && restored && roads == 3; // UNSET-POST-ROADS (rmbp-ledger B1179): `roads=` (named in-place hunk)
+    let ok = set && st == 0 && posted && mirror != "KEPT" && restored && roads == 3 && rule && app; // UNSET-POST-ROADS (rmbp-ledger B1179): `roads=` (named in-place hunk). UNSET-POST-RULE (rmbp-ledger B1185): `rule=` `app=`
     serial_println!(
-        ":: MACHINE-KEY-UNSET: set={} unset={} posted={} roads={} mirror={} restored={} -> {} ::",
-        set as u8, st, if posted { "unset" } else { "VALUE" }, roads, mirror, restored as u8, if ok { "PASS" } else { "FAIL" }
+        ":: MACHINE-KEY-UNSET: set={} unset={} posted={} roads={} rule={} app={} mirror={} restored={} -> {} ::",
+        set as u8, st, if posted { "unset" } else { "VALUE" }, roads, if rule { "unset" } else { "VALUE" }, if app { "unset" } else { "VALUE" }, mirror, restored as u8, if ok { "PASS" } else { "FAIL" }
     );
 }
 
@@ -2573,4 +2569,29 @@ fn prefscap_earlyname_leg(owner: u64) -> bool {
     };
     let gone = crate::video::wm::app_path_early_of(owner, g, |_| true).is_none();
     admitted && anon && gone
+}
+
+// ── UNSET-POST-RULE (rmbp-ledger B1185, BP-storage-11) — TAIL-APPENDED ─────────────────────────────────────────────────
+// [`machine_unset_leg`]'s `rule=` and `app=` words. A Rule-default key (`vein.embed.provider`: `schema::default_of` answers
+// `Source::Rule`, and under the kernel's [`StoreEnv`] the embedder rule always yields a value) and a declared `app.*` key
+// (a scratch `app.unsetrule.k`, declared through [`declare_kernel`] only when no `unsetrule` stanza is held, removed after)
+// each have a literal [`default_applied`] would answer, and [`unset_posted`] posts the unset form for both. No store write,
+// no tree change; TREE and DECLARED are taken one at a time, with no prefs lock held by the caller.
+
+/// The Rule-default and declared-app legs (see the block above): `(rule_ok, app_ok)`.
+#[cfg(all(feature = "witness", any(feature = "aarch64_el0", target_arch = "x86_64")))]
+fn unset_rule_leg() -> (bool, bool) {
+    const RK: &str = "embed.provider";
+    let rule = matches!(prefs_core::schema::default_of("vein", RK, &StoreEnv), Some((_, prefs_core::schema::Source::Rule(_))))
+        && default_applied("vein", RK).is_some()
+        && unset_posted("vein", RK).is_none();
+    let held = DECLARED.lock().contains_key("unsetrule");
+    let declared = !held && declare_kernel(b"unsetrule\x00k\tint:0:9\t4\tUNSET-POST-RULE scratch");
+    let app = declared
+        && default_applied(prefs_core::files::APP_NS, "unsetrule.k").map(|a| a.value) == Some(PrefValue::Int(4))
+        && unset_posted(prefs_core::files::APP_NS, "unsetrule.k").is_none();
+    if declared {
+        DECLARED.lock().remove("unsetrule");
+    }
+    (rule, app)
 }
