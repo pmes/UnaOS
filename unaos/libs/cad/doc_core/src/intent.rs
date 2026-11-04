@@ -43,7 +43,9 @@
 //! measured shape counts in a Shapes residual only when the document's own replay pairs it within the band (K_SIGMA x
 //! sigma) or the proposal's replay came closer to it than the document by more than the band; a face only a later set
 //! models no longer refuses the earlier single proposals. [`apply_with`] is [`apply`] through a caller's [`Lib`] (a
-//! library part, VUGMAKEMACHINELIB SR544), as [`crate::read_with`] is [`crate::read`].
+//! library part, VUGMAKEMACHINELIB SR544), as [`crate::read_with`] is [`crate::read`]. VUGMAKEMACHINELIBHELD (SR556):
+//! [`apply`] re-reads through [`Doc::reread`] (the libraries the Doc already holds), so [`verify`] / [`verify_all`] take
+//! a library part with no signature change; [`apply_with`] keeps the caller's explicit [`Lib`].
 //!
 //! The RMS's square root is geom_core's `Vec2::mag` (a hypot accumulation); libm (VUGINTENTSCAN, SR508, as ruled)
 //! gives the shape residual's angles (`atan2`, `atan`) and suggest's rounding (`round`).
@@ -57,7 +59,6 @@ use brep_core::geom_core::{Aabb3, Segment, Vec2, Vec3, closest_point_segment};
 use brep_core::mesh_core::{Bvh, Mesh}; // VUGINTENTPOINTS (SR523)
 use sketch_core::{Arc2, Edge, Loop, profiles};
 
-use crate::lex::read;
 use crate::lex::read_with; // VUGINTENTSETORDER (SR551)
 use crate::replay::{Failure, Fault, Replay, replay};
 use crate::write::{f64_text, write};
@@ -207,7 +208,7 @@ pub enum Verdict {
 /// The document with a proposal in it: appended, or replacing the statement of the same id in place. The one road
 /// that changes a document; the person's accept calls it.
 pub fn apply(doc: &Doc, p: &Proposal) -> Result<Doc, Reason> {
-    applied(doc, p, &read).map(|(d, _)| d) // VUGINTENTSETORDER (SR551): the one body, `applied`
+    applied(doc, p, &|t: &str| doc.reread(t)).map(|(d, _)| d) // VUGINTENTSETORDER (SR551): the one body, `applied`; VUGMAKEMACHINELIBHELD (SR556): re-read from the libraries the Doc holds
 }
 
 /// VUGINTENTSETORDER (SR551): [`apply`] re-reading through the caller's [`Lib`], so a part whose machine names a
@@ -1006,7 +1007,7 @@ fn set_len(doc: &Doc, ps: &[Proposal]) -> usize {
     let mut ids: Vec<Option<String>> = Vec::new();
     let mut refs: Vec<Vec<String>> = Vec::new();
     for p in &ps[..run] {
-        let Ok((d, k)) = applied(&copy, p, &read) else { break };
+        let Ok((d, k)) = applied(&copy, p, &|t: &str| copy.reread(t)) else { break }; // VUGMAKEMACHINELIBHELD (SR556)
         let s = &d.stmts[k];
         ids.push(s.id().map(String::from));
         refs.push(s.refs().into_iter().map(String::from).collect());
