@@ -842,3 +842,65 @@ fn the_margin_argument_changes_n_kept() {
 
 
 
+
+// VUGFACEGDTREPORT (LEDGER SR571): the journal map with two callouts and a datum frame writes `<part>.vugreport` beside
+// the part: the header, then the corner's own frame and callout lines (deviation::report_lines), equal to scan_core's
+// formatter over scan_core's own reading of the map's basis; a map with no part path refuses ReportNoPath, nothing written.
+
+#[test]
+fn a_report_writes_the_corner_lines_beside_the_part() {
+    use vug_view::deviation::{GDT_MARGIN_MM, REPORT_NO_PATH, report_lines};
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("vugfacegdtreport");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("the fixture dir");
+    let (part, out) = (dir.join("part.vug"), dir.join("part.vugreport"));
+
+    // No part path: a journal never saved, a path map.
+    let mut v = journal_viewer();
+    assert!(v.save_to.is_none());
+    assert_eq!(v.report(), Err(REPORT_NO_PATH.to_string()));
+    let p = open(scan().clone());
+    assert_eq!(p.report(), Err(REPORT_NO_PATH.to_string()));
+    assert!(!out.exists(), "a refusal writes nothing");
+
+    v.save_to = Some(part.clone());
+    let m0 = v.view.deviation.clone().unwrap();
+    let (_, top) = plate_top(&m0);
+    let (post, pname) = post_side(&m0);
+    let (a, b, c) = box_datums(&m0);
+    assert_eq!(vug_view::deviation::command(&mut v.view, &v.model, &format!("gdt {top}=flatness:0.001")), Ok(true));
+    assert_eq!(vug_view::deviation::command(&mut v.view, &v.model, &format!("gdt {pname}=position:5")), Ok(true));
+    assert_eq!(vug_view::deviation::command(&mut v.view, &v.model, &format!("datum A={a} B={b} C={c}")), Ok(true));
+    assert_eq!(v.report(), Ok(out.clone()), "written beside the part");
+    let text = std::fs::read_to_string(&out).expect("the report reads back");
+    println!("{text}");
+
+    let map = v.view.deviation.as_ref().unwrap();
+    let tag = scan_core::gdt::scan_tag(&map.basis.0);
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines[0], format!("# vugreport part.vug design=0 scan={tag}"));
+    let rl = report_lines(map);
+    assert_eq!(rl.len(), 3, "the frame and two callouts: {rl:?}");
+    assert_eq!(lines[1..], rl.iter().map(String::as_str).collect::<Vec<_>>()[..], "the file's lines are report_lines");
+    assert!(rl[0].starts_with(&format!("frame A={a} B={b} C={c} residual=")), "{rl:?}");
+    assert!(rl[1].starts_with(&format!("{top} flatness=")) && rl[1].ends_with(" FAIL"), "{rl:?}");
+    assert!(rl[2].starts_with(&format!("{pname} position=")), "{rl:?}");
+    // The corner paints the same three lines, in order.
+    let cl = corner(map);
+    let at = cl.iter().position(|l| *l == rl[0]).unwrap_or_else(|| panic!("no frame line on the corner: {cl:?}"));
+    assert_eq!(cl[at..at + 3], rl[..], "the corner's lines: {cl:?}");
+
+    // The same text from scan_core's own reading of the map's basis, through the one formatter.
+    let (s, design) = &*map.basis;
+    let d = map.result.as_ref().expect("aligned");
+    let idx = |n: &str| map.names.iter().position(|x| x == n).unwrap() as u32;
+    let mut g = scan_core::gdt(s, design, d, GDT_MARGIN_MM, Tol::DEFAULT);
+    let fr = scan_core::gdt::frame_of(s, design, d, [idx(&a), idx(&b), idx(&c)], GDT_MARGIN_MM, Tol::DEFAULT).expect("the box datums fix a frame");
+    scan_core::gdt::in_frame(&mut g, &fr);
+    let want = vec![
+        scan_core::gdt::frame_line([a.as_str(), b.as_str(), c.as_str()], fr.residual_mm),
+        scan_core::gdt::callout_line(&top, "flatness", 0.001, g[idx(&top) as usize].verdict(scan_core::Kind::Flatness, 0.001)),
+        scan_core::gdt::callout_line(&pname, "position", 5.0, g[post as usize].verdict(scan_core::Kind::Position, 5.0)),
+    ];
+    assert_eq!(text, scan_core::gdt::report_text("part.vug", 0, &tag, &want), "scan_core's formatter on scan_core's reading");
+}

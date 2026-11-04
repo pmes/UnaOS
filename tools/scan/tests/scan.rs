@@ -595,3 +595,119 @@ tool number=1 kind=flat_end dc=6 lf=40 apmx=2 nof=2 sig=0
     let err = String::from_utf8_lossy(&o.stderr).into_owned();
     assert!(err.contains("DesignRead") && err.contains("UnknownLib(\"nosuch\")"), "{err}");
 }
+
+/// VUGFACEGDTREPORT (SR571): the SR542 world-posed orbit `--against` its design with two `--gdt` callouts (the box top's
+/// flatness, the post's position), the box `--datum` frame and `--vugreport`: the file is scan_core `gdt::report_text`
+/// (the face's `.vugreport` format, vug-view's `Viewer::report` writes the same fn) of scan_core's own reading rebuilt
+/// here on the binary's road (the recording read back, each pose from the columns the poses file carries through
+/// `fixture::from_axes` as `load_poses` builds it, a 4 mm / 12 mm volume, `--against`'s design, `measure` at `--band 1`,
+/// `gdt` and `frame_of` at the truncation, `in_frame`), byte for byte; stdout's frame line is the file's after `gdt: `;
+/// `--vugreport` without `--against` is refused `GdtWithoutAgainst` and writes nothing.
+#[test]
+fn a_vugreport_is_the_face_format() {
+    const DOC: &str = r#"vug-doc version=1 lin=1e-6 ang=1e-9
+sketch s1 o=[0 0 0] z=[0 0 1] x=[1 0 0]
+point p1 sketch=s1 x=-230 y=-100
+point p2 sketch=s1 x=70 y=-100
+point p3 sketch=s1 x=70 y=100
+point p4 sketch=s1 x=-230 y=100
+line l1 sketch=s1 a=p1 b=p2
+line l2 sketch=s1 a=p2 b=p3
+line l3 sketch=s1 a=p3 b=p4
+line l4 sketch=s1 a=p4 b=p1
+fix f1 sketch=s1 p=p1 at=[-230 -100]
+fix f2 sketch=s1 p=p2 at=[70 -100]
+fix f3 sketch=s1 p=p3 at=[70 100]
+fix f4 sketch=s1 p=p4 at=[-230 100]
+sketch s2 o=[0 0 0] z=[0 0 1] x=[1 0 0]
+point c0 sketch=s2 x=160 y=0
+circle c1 sketch=s2 centre=c0 r=40
+fix g1 sketch=s2 p=c0 at=[160 0]
+radius r1 sketch=s2 circle=c1 r=40
+extrude body sketch=s1 outer=l1 dir=[0 0 1] length=100
+extrude post sketch=s2 outer=c1 dir=[0 0 1] length=150
+"#;
+    let d = dir("vugreport");
+    let (inp, ply, poses, doc) = (d.join("orbit.prb"), d.join("orbit.ply"), d.join("poses.txt"), d.join("part.vugdoc"));
+    let (rep, rep_none) = (d.join("part.vugreport"), d.join("none.vugreport"));
+    let intr = fixture::bench_intrinsics();
+    let truth = |k: u32| fixture::orbit(CENTRE, 600.0, 40.0 * DEG, k as f64 * 30.0 * DEG);
+    let recs: Vec<Record> = (0..12u32)
+        .map(|k| {
+            let f = fixture::render_depth(&Scene::bench(), &intr, DepthScale::D400_DEFAULT, &truth(k), &Noise::NONE, k as u64);
+            Record::new(f, "replay:d435i", 1000, Some(k4())).unwrap()
+        })
+        .collect();
+    std::fs::write(&inp, recording::write(&recs).unwrap()).unwrap();
+    let mut text = String::new();
+    for k in 0..12 {
+        let p = truth(k);
+        let (m, t) = (p.rot.to_mat3(), p.trans);
+        let r = [[m.cols[0].x, m.cols[1].x, m.cols[2].x], [m.cols[0].y, m.cols[1].y, m.cols[2].y], [m.cols[0].z, m.cols[1].z, m.cols[2].z]];
+        text += &format!(
+            "{:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?}\n",
+            r[0][0], r[0][1], r[0][2], t.x, r[1][0], r[1][1], r[1][2], t.y, r[2][0], r[2][1], r[2][2], t.z
+        );
+    }
+    std::fs::write(&poses, text).unwrap();
+    std::fs::write(&doc, DOC).unwrap();
+
+    // scan_core's own reading on the binary's road.
+    let rec = recording::read(&std::fs::read(&inp).unwrap()).unwrap();
+    let mut vol = scan_core::Tsdf::new(4.0, 3.0 * 4.0, scan_core::Tol::DEFAULT).unwrap();
+    for (k, r) in rec.depth().enumerate() {
+        let p = truth(k as u32);
+        let m = p.rot.to_mat3();
+        let col = |j: usize| Vec3::new(m.cols[j].x, m.cols[j].y, m.cols[j].z);
+        let pose = fixture::from_axes(col(0), col(1), col(2), Vec3::new(p.trans.x, p.trans.y, p.trans.z));
+        vol.integrate(&r.frame, r.depth_scale().unwrap(), &r.intrinsics().unwrap(), &pose).unwrap();
+    }
+    let sm = scan_core::extract(&vol).unwrap();
+    let dc = doc_core::read_with(&std::fs::read_to_string(&doc).unwrap(), &doc_host::DirLib::beside(&doc)).unwrap();
+    let rp = doc_core::replay(&dc, dc.tol);
+    assert!(rp.failures.is_empty());
+    let (design, names) = scan_core::design_of(rp.solids.iter().map(|s| (s.id.as_str(), &s.brep)), dc.tol).unwrap();
+    let dev = scan_core::measure(&sm, &design, Transform::IDENTITY, &scan_core::AlignParams::DEFAULT, 1.0, scan_core::Tol::DEFAULT).unwrap();
+    let margin = vol.trunc_mm();
+    let mut g = scan_core::gdt(&sm, &design, &dev, margin, scan_core::Tol::DEFAULT);
+    let (top, b, c, post) = {
+        let plane = |n: [f64; 3]| {
+            g.iter()
+                .find(|f| names[f.face as usize].starts_with("body/") && matches!(f.nominal, scan_core::Nominal::Plane(p) if p.normal.x * n[0] + p.normal.y * n[1] + p.normal.z * n[2] > 0.99))
+                .unwrap_or_else(|| panic!("no body plane along {n:?}"))
+                .face as usize
+        };
+        let post = g.iter().find(|f| names[f.face as usize].starts_with("post/") && matches!(f.nominal, scan_core::Nominal::Cylinder(_))).expect("the post's side").face as usize;
+        (plane([0.0, 0.0, 1.0]), plane([-1.0, 0.0, 0.0]), plane([0.0, -1.0, 0.0]), post)
+    };
+    let fr = scan_core::gdt::frame_of(&sm, &design, &dev, [top as u32, b as u32, c as u32], margin, scan_core::Tol::DEFAULT).expect("the box datums fix a frame");
+    scan_core::gdt::in_frame(&mut g, &fr);
+    let want = scan_core::gdt::report_text(
+        "part.vugdoc",
+        0,
+        &scan_core::gdt::scan_tag(&sm),
+        &[
+            scan_core::gdt::frame_line([names[top].as_str(), names[b].as_str(), names[c].as_str()], fr.residual_mm),
+            scan_core::gdt::callout_line(&names[top], "flatness", 0.001, g[top].verdict(scan_core::Kind::Flatness, 0.001)),
+            scan_core::gdt::callout_line(&names[post], "position", 5.0, g[post].verdict(scan_core::Kind::Position, 5.0)),
+        ],
+    );
+
+    let (top_spec, post_spec) = (format!("{}=flatness:0.001", names[top]), format!("{}=position:5", names[post]));
+    let (da, db, dcc) = (format!("A={}", names[top]), format!("B={}", names[b]), format!("C={}", names[c]));
+    let base = [inp.to_str().unwrap(), "-o", ply.to_str().unwrap(), "--poses", poses.to_str().unwrap(), "--band", "1"];
+    let extra: [&str; 12] = ["--against", doc.to_str().unwrap(), "--gdt", top_spec.as_str(), "--gdt", post_spec.as_str(), "--datum", da.as_str(), db.as_str(), dcc.as_str(), "--vugreport", rep.to_str().unwrap()];
+    let o = scan(&[&base[..], &extra[..]].concat());
+    assert!(o.status.success(), "stderr: {}", String::from_utf8_lossy(&o.stderr));
+    let report = String::from_utf8_lossy(&o.stdout).into_owned();
+    let got = std::fs::read_to_string(&rep).expect("the .vugreport is written");
+    println!("{got}");
+    assert_eq!(got, want, "scan_core's formatter on scan_core's own reading, byte for byte");
+    let frame = got.lines().nth(1).unwrap();
+    assert!(report.lines().any(|l| l == format!("gdt: {frame}")), "stdout's frame line is the file's: {report}");
+
+    let o = scan(&[&base[..], &["--vugreport", rep_none.to_str().unwrap()][..]].concat());
+    assert_eq!(o.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&o.stderr).contains("GdtWithoutAgainst"), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(!rep_none.exists(), "a refusal writes nothing");
+}

@@ -147,7 +147,7 @@ fn measured(map: &Map) -> Vec<String> {
                 let name = map.names.get(f.face as usize).map(String::as_str).unwrap_or("?");
                 out.push(format!("{name} rms={:.3} mean={:+.3}", f.rms_mm, f.mean_mm));
             }
-            out.extend(frame_line(map)); out.extend(gdt_lines(map)); out.extend(lost_lines(map)); out // VUGFACEGDT (SR553): a line per callout after the faces; VUGFACEGDTREMEASURE (SR560): the frame line first
+            out.extend(report_lines(map)); out.extend(lost_lines(map)); out // VUGFACEGDTREPORT (SR571): the frame and callout lines the .vugreport writes; VUGFACEGDT (SR553): a line per callout after the faces; VUGFACEGDTREMEASURE (SR560): the frame line first
         }
         Err(DeviationError::NoAlignment { rms_mm, pairs }) => vec![format!("refused NoAlignment rms={rms_mm:.3} pairs={pairs}")],
         Err(DeviationError::Unconstrained { level }) => vec![format!("refused Unconstrained level={level}")],
@@ -444,12 +444,7 @@ pub fn verdict(map: &Map, c: &Callout) -> scan_core::Verdict {
 /// The callout's corner line: `<face> <kind>=<mm, or none> tol=<mm> PASS|FAIL|UNMEASURED`.
 pub fn gdt_line(map: &Map, c: &Callout) -> String {
     let name = map.names.get(c.face as usize).map(String::as_str).unwrap_or("?");
-    let (value, v) = match verdict(map, c) {
-        scan_core::Verdict::Pass { value_mm, .. } => (format!("{value_mm:.3}"), "PASS"),
-        scan_core::Verdict::Fail { value_mm, .. } => (format!("{value_mm:.3}"), "FAIL"),
-        scan_core::Verdict::Unmeasured => ("none".to_string(), "UNMEASURED"),
-    };
-    format!("{name} {}={value} tol={:.3} {v}", c.kind.name(), c.tol_mm)
+    scan_core::gdt::callout_line(name, c.kind.name(), c.tol_mm, verdict(map, c)) // VUGFACEGDTREPORT (SR571): the one formatter tools/scan's --vugreport calls
 }
 
 /// The corner's callout lines, in the order named.
@@ -620,7 +615,7 @@ fn datum(view: &mut View, model: &Model, rest: &str) -> Result<bool, String> {
 fn frame_line(map: &Map) -> Option<String> {
     let name = |f: u32| map.names.get(f as usize).map(String::as_str).unwrap_or("?");
     match (&map.frame, map.datums) {
-        (Some(Ok(fr)), Some(d)) => Some(format!("frame A={} B={} C={} residual={:.3}", name(d[0]), name(d[1]), name(d[2]), fr.residual_mm)),
+        (Some(Ok(fr)), Some(d)) => Some(scan_core::gdt::frame_line([name(d[0]), name(d[1]), name(d[2])], fr.residual_mm)), // VUGFACEGDTREPORT (SR571): the one formatter
         (Some(Err(why)), _) => Some(format!("frame refused {why}")),
         _ => chosen_line(map), // VUGFACEGDTDATUMSPICK (SR564): the datums picked so far
     }
@@ -751,3 +746,39 @@ fn carry_named(old: &Map, new: &mut Map) {
 }
 
 
+// ---- VUGFACEGDTREPORT (LEDGER SR571): the verdicts written beside the part, the corner's own lines ----
+// [`report_lines`] is the frame line and the callout lines the corner paints ([`frame_line`], [`gdt_lines`], their strings
+// scan_core's ONE `gdt::callout_line` / `gdt::frame_line`); `Viewer::report` writes them as scan_core `gdt::report_text`
+// to `<part>.vugreport` beside the journal's part (`Viewer::save_to`), through lib.rs's atomic writer. tools/scan's
+// `--vugreport` writes the same text from its own reading. A map with no part path (a path map, or a journal never saved)
+// refuses [`REPORT_NO_PATH`]. BP-vug-5: a printed verdict, nothing changes.
+
+/// The extension the report takes beside the part.
+pub const REPORT_EXT: &str = "vugreport";
+/// The refusal when the map has no part to write beside.
+pub const REPORT_NO_PATH: &str = "ReportNoPath";
+
+/// The report's lines: the corner's frame line (if any) and one line per callout, in the order named.
+pub fn report_lines(map: &Map) -> Vec<String> {
+    let mut out: Vec<String> = frame_line(map).into_iter().collect();
+    out.extend(gdt_lines(map));
+    out
+}
+
+impl Viewer {
+    /// Write the map's verdicts to `<part>.vugreport` beside the journal's part: the header (the part's file name, the
+    /// generation the map shows, scan_core `gdt::scan_tag` of the scan) and [`report_lines`]. Refused by name, nothing
+    /// written: no map, a refused map, [`REPORT_NO_PATH`] (no journal source, or no `save_to`). The path written on success.
+    pub fn report(&self) -> Result<std::path::PathBuf, String> {
+        let m = self.view.deviation.as_ref().ok_or("report: no map")?;
+        if let Err(e) = &m.result {
+            return Err(format!("report: refused map {e:?}"));
+        }
+        let (Some(src), Some(part)) = (m.source.as_ref(), self.save_to.as_ref()) else { return Err(REPORT_NO_PATH.to_string()) };
+        let path = part.with_extension(REPORT_EXT);
+        let name = part.file_name().and_then(|s| s.to_str()).unwrap_or("vug");
+        let text = scan_core::gdt::report_text(name, src.measured, &scan_core::gdt::scan_tag(&m.basis.0), &report_lines(m));
+        crate::write_atomic(&path, &text)?;
+        Ok(path)
+    }
+}

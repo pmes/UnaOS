@@ -841,3 +841,43 @@ pub fn in_frame(faces: &mut [FaceGdt], frame: &DatumFrame) {
     }
 }
 
+
+// ---- VUGFACEGDTREPORT (LEDGER SR571): the verdicts as text, one formatter for the face's corner, its .vugreport and tools/scan ----
+//
+// vug-view's corner painted each callout and the datum frame with its own `format!`, and tools/scan had no file of the
+// verdicts. These are the strings: [`callout_line`] and [`frame_line`] are the corner's lines exactly as SR553 / SR560
+// wrote them, [`report_text`] heads them with `# vugreport <part> design=<generation> scan=<scan>` (the scan named by
+// [`scan_tag`], its mesh's counts, which every producer that measured it can derive). vug-view's `Viewer::report` and
+// tools/scan's `--vugreport` both write [`report_text`], so the two agree byte for byte on the same reading. BP-vug-5: a
+// printed verdict, nothing changes.
+
+/// One callout as the corner paints it: `<face> <kind>=<mm, or none> tol=<mm> PASS|FAIL|UNMEASURED`; `kind` the token the
+/// caller reads the value under (the kind's [`Kind::name`]).
+pub fn callout_line(face: &str, kind: &str, tol_mm: f64, v: Verdict) -> String {
+    let (value, word) = match v {
+        Verdict::Pass { value_mm, .. } => (alloc::format!("{value_mm:.3}"), "PASS"),
+        Verdict::Fail { value_mm, .. } => (alloc::format!("{value_mm:.3}"), "FAIL"),
+        Verdict::Unmeasured => (String::from("none"), "UNMEASURED"),
+    };
+    alloc::format!("{face} {kind}={value} tol={tol_mm:.3} {word}")
+}
+
+/// The datum frame as the corner paints it: `frame A=<face> B=<face> C=<face> residual=<mm>`.
+pub fn frame_line(names: [&str; 3], residual_mm: f64) -> String {
+    alloc::format!("frame A={} B={} C={} residual={residual_mm:.3}", names[0], names[1], names[2])
+}
+
+/// The scan's name in a report: `<vertices>v<triangles>t` of its mesh.
+pub fn scan_tag(scan: &ScanMesh) -> String {
+    alloc::format!("{}v{}t", scan.mesh.positions.len(), scan.mesh.triangles.len())
+}
+
+/// A `.vugreport`: the header `# vugreport <part> design=<generation> scan=<scan>`, then each line, every line `\n`-ended.
+pub fn report_text(part: &str, generation: u64, scan: &str, lines: &[String]) -> String {
+    let mut out = alloc::format!("# vugreport {part} design={generation} scan={scan}\n");
+    for l in lines {
+        out.push_str(l);
+        out.push('\n');
+    }
+    out
+}
