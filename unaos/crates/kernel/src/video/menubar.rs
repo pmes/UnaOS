@@ -3669,7 +3669,7 @@ fn luma(c: u32) -> u32 {
 ///   Down, Down, Return picks row 3. F39MENUSCRAFTDOCS (B1144) — `winmenu_live` (`winmenu::walk_live`): the same keys
 ///   through `strip::key_escape` on a LIVE menu of the leg's own fixture window, the pick delivered to its own sink.
 /// * F39SETTINGSKEYSPROBE (B1133) — `settings_keys` (`settings::keys_leg`): Down, Down, Up through `settings::key_route`
-///   on the live window over the column, the Users form and the pane (2 then 1 each), its state put back.
+///   on the live window over the column, the Users form (stop and field, `focus`) and the pane (2 then 1 each) and, F39SETTINGSFORMKEYS (B1139), the search field (`search`: Up from the first listed tab takes it, Down leaves it), its state put back.
 pub fn menuscraft_selftest() {
     use super::crystal::sheet;
     // ── leg 1: the sheet ──

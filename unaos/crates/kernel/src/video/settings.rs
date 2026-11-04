@@ -1757,7 +1757,7 @@ pub fn key_route(ev: crate::pal::Event) -> bool {
                 };
             }
             match c {
-                0x1C | 0x1D => true,
+                una_abi::KEY_RIGHT | una_abi::KEY_LEFT => true,
                 una_abi::KEY_UP => { if strip { strip_step(tab, false); } else { walk(tab, false); } true } // Up: previous stop; from the first, the column. F39SETTINGSARROWSENSE (B1127): the arms name una_abi's KEY_UP (0x1F) / KEY_DOWN (0x1E); they read 0x1E as Up
                 una_abi::KEY_DOWN if strip => { strip_step(tab, true); true } // SETTINGSTABS: Down on the column, the next tab (SETTINGSCRAFT: of those the search lists)
                 0x09 if !strip => { if let Some(x) = STATE.lock().as_mut() { x.strip = true; x.pend = None; } repaint(); true } // SETTINGSTABS: Tab, pane -> column

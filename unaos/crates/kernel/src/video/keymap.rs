@@ -59,11 +59,11 @@
 //!  * **A chord types nothing.** `hid_key_ascii` returns 0 for any usage while a GUI **or** an Alt
 //!    bit is held, so both `cmd_role` spellings suppress the character on their own — the table
 //!    needs no suppression rule and did not gain one. **A row with no `CMD` role is the exception
-//!    and says so:** `Shift+←`/`Shift+→` and `Esc` (TERMSEL) still type their byte (`0x1D`/`0x1C`,
+//!    and says so:** `Shift+←`/`Shift+→` and `Esc` (TERMSEL) still type their byte (`KEY_LEFT`/`KEY_RIGHT`,
 //!    `0x1B`), pushed by the decoder just AHEAD of the action, because neither Shift nor no modifier
 //!    suppresses a key. That is deliberate: a menu that closes on `0x1B` still sees it, and the
 //!    shell's line editor ignores both bytes. TERMSEL2's bare `←`/`→` rows (the caret) are the same
-//!    exception: the arrow bytes `0x1D`/`0x1C` are still pushed ahead of `CursorLeft`/`CursorRight`,
+//!    exception: the arrow bytes `KEY_LEFT`/`KEY_RIGHT` are still pushed ahead of `CursorLeft`/`CursorRight`,
 //!    so Quarry and `user-vug`, which read the bytes, see exactly what they saw before; `Home`/`End`
 //!    type nothing (their ascii is 0) and `⌘←`/`⌘→` are suppressed by the `CMD` rule.
 //!
@@ -119,10 +119,10 @@ pub enum Action {
     SelectLineEnd,
     /// TERMSEL: drop the selection (`Esc`, a row with no roles — the `0x1B` key is still typed).
     Deselect,
-    /// TERMSEL2: the CARET one cell left (`←` on both tables; the `0x1D` byte is still typed). With
+    /// TERMSEL2: the CARET one cell left (`←` on both tables; the `KEY_LEFT` byte is still typed). With
     /// a selection on the editable line it collapses to the selection's start, as on a Mac.
     CursorLeft,
-    /// TERMSEL2: the caret one cell right (`→`; the `0x1C` byte is still typed); with a selection on
+    /// TERMSEL2: the caret one cell right (`→`; the `KEY_RIGHT` byte is still typed); with a selection on
     /// the editable line, to its end.
     CursorRight,
     /// TERMSEL2: the caret to the line start (`⌘←` and `Home` on CRISPY, `Home` on PC).

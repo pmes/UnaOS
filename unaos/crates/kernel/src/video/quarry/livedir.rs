@@ -1389,7 +1389,7 @@ pub(super) fn key_probe(dir: &str, sub: &str) -> KeyProbe {
     let at_sub = MODEL.lock().as_ref().map_or(false, |m| m.cwd == sub);
     let forward_ok = at_sub && fwd == 0 && forward.as_ref().map_or(false, |d| d.word == "forward" && d.locked_reads == 0);
     prime();
-    let _ = super::millercols::key(0x1D);
+    let _ = super::millercols::key(una_abi::KEY_LEFT);
     drain(&|| NAV_LAST.lock().is_some());
     let left = NAV_LAST.lock().take();
     let child = leaf(sub);
