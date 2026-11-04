@@ -6,6 +6,7 @@
 //! refusals by name, climb against conventional, and each program validated and round-tripped through grbl.
 //! VUGMAKERAMP (LEDGER SR532): a flat end with a ramp angle enters by a ramp along its first ring or a helix at that
 //! angle, removing what the centre-cutting program removes; without the angle the flat end still refuses `NoEntry`.
+//! VUGMAKETOOLCC (LEDGER SR538): a tool's `centre_cutting` flag overrides the rule by kind both ways.
 
 use std::collections::BTreeSet;
 
@@ -30,10 +31,10 @@ fn mill() -> Machine {
         safe_z: 5.0,
         units: Units::Mm,
         tools: vec![
-            Tool { number: 2, kind: ToolKind::FlatEnd, dc: 4.0, lf: 20.0, apmx: 2.0, nof: 3, sig: 0.0, ramp_deg: None },
-            Tool { number: 3, kind: ToolKind::BallEnd, dc: 4.0, lf: 20.0, apmx: 2.0, nof: 2, sig: 0.0, ramp_deg: None },
+            Tool { number: 2, kind: ToolKind::FlatEnd, dc: 4.0, lf: 20.0, apmx: 2.0, nof: 3, sig: 0.0, ramp_deg: None, centre_cutting: None },
+            Tool { number: 3, kind: ToolKind::BallEnd, dc: 4.0, lf: 20.0, apmx: 2.0, nof: 2, sig: 0.0, ramp_deg: None, centre_cutting: None },
             // VUGMAKERAMP (SR532): a flat end whose maker allows a 3 degree ramp.
-            Tool { number: 4, kind: ToolKind::FlatEnd, dc: 4.0, lf: 20.0, apmx: 2.0, nof: 3, sig: 0.0, ramp_deg: Some(3.0) },
+            Tool { number: 4, kind: ToolKind::FlatEnd, dc: 4.0, lf: 20.0, apmx: 2.0, nof: 3, sig: 0.0, ramp_deg: Some(3.0), centre_cutting: None },
         ],
         stock: Some(Stock { shape: StockShape::Box { size: Vec3::new(50.0, 50.0, 10.0) }, origin: Vec3::new(0.0, 0.0, -10.0) }),
         fixtures: vec![],
@@ -503,4 +504,29 @@ fn without_a_ramp_angle_the_flat_end_still_has_no_way_in() {
             Err(Refusal::BadParameter { what: "ramp angle outside (0, 90) degrees" })
         );
     }
+}
+
+// ---- VUGMAKETOOLCC (LEDGER SR538): the centre-cutting flag first, the kind rule when it is None. ----
+
+#[test]
+fn a_flat_end_flagged_centre_cutting_plunges_where_it_refused() {
+    // The 5 mm pocket of `pocket_and_face_refusals_by_name`: only the wall ring, no room for a helix.
+    let snug = rect(10.0, 10.0, 15.0, 15.0);
+    assert_eq!(generate(&pocket(snug.clone(), vec![], 1.0, true, 2), &mill(), T), Err(Refusal::NoEntry { tool: 2 }));
+    let mut m = mill();
+    m.tools[0].centre_cutting = Some(true);
+    let p = generate(&pocket(snug.clone(), vec![], 1.0, true, 2), &m, T).unwrap();
+    assert!(!p.moves.iter().any(|mv| matches!(mv, Move::Arc { .. })), "a straight plunge, no helix");
+    assert_inset(&p, &snug, &[], 2.0);
+    assert!(p.validate(&m, T).is_ok());
+    grbl_round_trip(&p);
+}
+
+#[test]
+fn a_ball_end_flagged_not_centre_cutting_refuses() {
+    let snug = rect(10.0, 10.0, 15.0, 15.0);
+    assert!(generate(&pocket(snug.clone(), vec![], 1.0, true, 3), &mill(), T).is_ok());
+    let mut m = mill();
+    m.tools[1].centre_cutting = Some(false);
+    assert_eq!(generate(&pocket(snug, vec![], 1.0, true, 3), &m, T), Err(Refusal::NoEntry { tool: 3 }));
 }

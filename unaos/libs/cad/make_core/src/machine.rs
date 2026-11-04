@@ -103,6 +103,10 @@ pub struct Tool {
     /// ring or helixes no steeper ([`crate::op`]); None keeps the centre-cutting rule only (a ball end or a drill
     /// plunges, a flat end with no room for the helix refuses `NoEntry`).
     pub ramp_deg: Option<f64>,
+    /// VUGMAKETOOLCC (SR538): whether the tool cuts at its centre and may plunge straight into solid, as its maker says:
+    /// Some(true) yes, Some(false) no, None by kind (a ball end and a drill yes, every other kind no). Read only through
+    /// [`crate::op`]'s `centre_cutting`.
+    pub centre_cutting: Option<bool>,
 }
 
 impl Tool {
