@@ -1613,15 +1613,19 @@ fn a_half_scan_fragment_refuses_coarse() {
 // Twelve D435i frames of the bench from the orbit's azimuths 0°..11° (1° a frame: the tracker's regime and span, tools/scan
 // tests/scan.rs `a_tracked_prb_recording_fuses_without_poses`) written as a .prb through probe_core's writer: fuse_prb
 // tracks them, so the mesh's world is frame 0's camera, and the face opens it through `open_road`'s coarse road against
-// the UNMOVED document (the world frame). MEASURED: the near-single-view scan's best coarse start is above the floor
-// (four frames over 3° 18.668, twelve over 11° 19.144, gate(2) 9), so the road is taken and the corner names the refusal
-// (`align=coarse refused rms=`); the near-single-view start is owed (VUG-SCAN-DEVIATION-COARSE-VIEW). A one-frame .prb stays
+// the UNMOVED document (the world frame). SR621 MEASURED the near-single-view scan's four principal-axis starts above the
+// floor (four frames over 3° 18.668, twelve over 11° 19.144, gate(2) 9); VUGSCANDEVIATIONCOARSEVIEW (SR626) turned the
+// refusal into the acceptance: the scan is a view of frame 0's camera, so scan_core `coarse_view`'s yaw sweep with its
+// translation re-solved starts it and it opens `align=coarse+fine` at frame 0's true pose. The refusal witness of the
+// coarse floor is SR615's `a_half_scan_fragment_refuses_coarse` (not a view, its road unchanged). A one-frame .prb stays
 // on the identity road (no `align=` line).
 
-#[test]
-fn a_tracked_prb_opens_on_the_coarse_road() {
+/// VUGSCANDEVIATIONCOARSEVIEW (SR626): `frames` D435i frames of the bench at the orbit's azimuths 0°, 1°, .. written as
+/// `<name>/track.prb` beside the document `<name>/part.vug` (and frame 0 alone as `one.prb`): the paths and frame 0's
+/// true camera → world pose.
+fn tracked_prb(name: &str, frames: u32) -> (String, String, String, Transform) {
     use scan_core::fuse::recording::{self, Record};
-    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("vugfacedeviationprbposes");
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
     std::fs::create_dir_all(&dir).expect("the fixture dir");
     let b = fixture::bench_intrinsics();
     let k4 = [b.fx, b.fy, b.ppx, b.ppy];
@@ -1633,31 +1637,59 @@ fn a_tracked_prb_opens_on_the_coarse_road() {
         Record::new(f, "replay:d435i", 1000, Some(k4)).expect("the record")
     };
     let (track, one, part) = (dir.join("track.prb"), dir.join("one.prb"), dir.join("part.vug"));
-    std::fs::write(&track, recording::write(&(0..12u32).map(&rec).collect::<Vec<_>>()).expect("the recording")).expect("the .prb is written");
+    std::fs::write(&track, recording::write(&(0..frames).map(&rec).collect::<Vec<_>>()).expect("the recording")).expect("the .prb is written");
     std::fs::write(&one, recording::write(&[rec(0)]).expect("the recording")).expect("the .prb is written");
     std::fs::write(&part, DOC).expect("the part is written");
-    let (track, one, part) = (track.to_str().unwrap(), one.to_str().unwrap(), part.to_str().unwrap());
+    let s = |p: std::path::PathBuf| p.to_str().unwrap().to_string();
+    (s(track), s(one), s(part), truth(0))
+}
 
-    // The tracked .prb: the coarse road, its start refused at the floor and named on the corner.
+/// VUGSCANDEVIATIONCOARSEVIEW (SR626): the tracked .prb at `track` opened against `part` on the view road: SR615's four
+/// starts above the floor (printed), the road kept under gate(2), the corner's `align=coarse+fine`, the fine alignment
+/// under SR615's 1.0 mm floor and its pose frame 0's camera `truth0`. The corner lines.
+fn opens_on_the_view_road(tag: &str, track: &str, part: &str, truth0: Transform) -> Vec<String> {
     let p = Viewer::open_against(track, part, SIZE, Preset::Una).expect("the .prb fuses and measures");
     let map = p.view.deviation.as_ref().expect("a map");
     let lp = corner(map);
     println!("{}", lp.join("\n"));
+    let ap = scan_core::AlignParams::DEFAULT;
+    let (s, design) = &*map.basis;
+    let bvh = mesh_core::bvh::Bvh::build(&design.mesh);
+    let four: Vec<f64> = scan_core::deviation::coarse(s, design, &bvh, &ap, Tol::DEFAULT).expect("four starts").iter().map(|x| x.1).collect();
+    println!("{tag}: four-start rms={four:.3?} gate2={:.3}", ap.gate(2));
+    assert!(four.iter().all(|r| *r > ap.gate(2)), "SR615's four starts refuse a near-single view: {four:?}");
     let rms = match map.road {
-        scan_core::deviation::Road::CoarseRefused { rms_mm } => rms_mm,
-        other => panic!("expected the coarse road refused at the floor, got {other:?} ({:?})", map.result.as_ref().err()),
+        scan_core::deviation::Road::CoarseFine { rms_mm } => rms_mm,
+        other => panic!("expected the view road kept, got {other:?} ({:?})", map.result.as_ref().err()),
     };
-    println!("prbposes: road=CoarseRefused rms={rms:.3}");
-    assert!(rms > scan_core::AlignParams::DEFAULT.gate(2), "the floor: {rms}");
-    assert!(matches!(map.result, Err(DeviationError::NoAlignment { pairs: 0, .. })), "{:?}", map.result.as_ref().err());
-    assert!(!map.on && map.vertex.is_empty());
-    assert!(lp[0].starts_with("refused NoAlignment"), "{lp:?}");
-    assert!(lp.contains(&format!("align=coarse refused rms={rms:.3}")), "{lp:?}");
+    let d = map.result.as_ref().expect("the view road aligns the tracked scan");
+    let back = truth0.invert().expect("a rigid pose");
+    let err_deg = 2.0 * d.aligned.pose.rot.dot(truth0.rot).abs().min(1.0).acos() / DEG;
+    let err_mm = [Vec3::new(-230.0, -100.0, 0.0), Vec3::new(70.0, 100.0, 100.0), Vec3::new(160.0, 0.0, 150.0)]
+        .iter()
+        .map(|&x| (d.aligned.pose.apply_point(back.apply_point(x)) - x).mag())
+        .fold(0.0, f64::max);
+    println!("{tag}: road=CoarseFine rms={rms:.3} aligned={:.3} stats_rms={:.3} err_deg={err_deg:.4} err_mm={err_mm:.4}", d.aligned.rms_mm, d.stats.rms_mm);
+    assert!(rms <= ap.gate(2), "the floor: {rms}");
+    assert!(d.aligned.rms_mm < 1.0 && d.stats.rms_mm < 1.0, "the SR510 floor: aligned {} stats {}", d.aligned.rms_mm, d.stats.rms_mm);
+    assert!(err_deg < 1.0 && err_mm < 2.0, "pose error against frame 0's camera {err_deg} deg {err_mm} mm");
+    assert!(lp.contains(&format!("align=coarse+fine rms={rms:.3}")), "{lp:?}");
+    assert!(map.on, "the map opens on");
+    lp
+}
+
+#[test]
+fn a_tracked_prb_opens_on_the_coarse_road() {
+    let (track, one, part, truth0) = tracked_prb("vugfacedeviationprbposes", 12);
+    let (track, one, part) = (track.as_str(), one.as_str(), part.as_str());
+
+    // The tracked .prb: the coarse road, SR615's starts refused, the view road's start kept and aligned.
+    let lp = opens_on_the_view_road("prbposes", track, part, truth0);
 
     // The part opened as the journal with the tracked .prb: the same road, the same corner but the source line.
     let j = Viewer::open_scan(part, track, SIZE, Preset::Una).expect("the part opens with the tracked scan on the coarse road");
     let jm = j.view.deviation.as_ref().expect("a journal map");
-    assert!(matches!(jm.road, scan_core::deviation::Road::CoarseRefused { .. }), "{:?}", jm.road);
+    assert!(matches!(jm.road, scan_core::deviation::Road::CoarseFine { .. }), "{:?}", jm.road);
     let lj = corner(jm);
     assert_eq!(lj[..lj.len() - 1], lp[..], "the journal measures the tracked scan as the path road does");
 
@@ -1669,4 +1701,12 @@ fn a_tracked_prb_opens_on_the_coarse_road() {
     assert!(!lo.iter().any(|l| l.starts_with("align=")), "{lo:?}");
     assert!(matches!(om.result, Err(DeviationError::NoAlignment { .. })), "{:?}", om.result.as_ref().err());
     println!("prbposes: one-frame road=Fine");
+}
+
+// ---- VUGSCANDEVIATIONCOARSEVIEW (LEDGER SR626): the near-single-view start ----
+
+#[test]
+fn a_four_frame_tracked_prb_opens_on_the_view_road() {
+    let (track, _, part, truth0) = tracked_prb("vugscandeviationcoarseview", 4);
+    opens_on_the_view_road("coarseview", &track, &part, truth0);
 }

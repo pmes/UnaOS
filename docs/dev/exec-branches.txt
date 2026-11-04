@@ -1497,3 +1497,13 @@ exec-rmbp-vugcomscanmarlinautoreport 7cd0a22c4 wave36 cut62h
 exec-rmbp-vugscandeviationcoarseview 7cd0a22c4 wave36 cut62h
 exec-rmbp-vugscandeviationcoarsetoolreport 7cd0a22c4 wave36 cut62h
 exec-rmbp-vugcomscanprefsuna 7cd0a22c4 wave36 cut62h
+exec-rmbp-vugintentsetfacepushfull 955de622d wave36 cut63h
+exec-rmbp-vugfacejournalholdnofixword 955de622d wave36 cut63h
+exec-rmbp-vugphotocropmetaxmp 955de622d wave36 cut63h
+exec-rmbp-vugcomscanmdns 955de622d wave36 cut63h
+exec-rmbp-vugcomscandeclareconsoleface 955de622d wave36 cut63h
+exec-rmbp-vugcomscanautoreportcapoff 955de622d wave36 cut63h
+exec-rmbp-f39queuedsetpendpin 9a75ccd9d wave36 cut65
+exec-rmbp-f39queuedsetdeliverrace 9a75ccd9d wave36 cut65
+exec-rmbp-f39settingsresetrepaint 9a75ccd9d wave36 cut65
+exec-rmbp-f39queuedseteagerarm 9a75ccd9d wave36 cut65
