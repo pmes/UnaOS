@@ -37,7 +37,7 @@
 //!   pending event is the one measured, the same proxy `rtwit` uses). Counted as `coalesced=`.
 //! * Stage attribution follows FIFO order, not identity: the first key to reach the router after the timed
 //!   key was pushed is taken to be that key. A ring-3 key's `app` stamp is exact (the ring sequence number).
-//! * A kernel surface that composites inside its own route is finished at the route (LOGINCOMP B1104); one that only latches is charged the next composite pass.
+//! * A kernel surface that composites inside its own route is finished at the route (LOGINCOMP B1104); one that only latches is charged the next composite pass; a route that consumed its event and drew nothing (`consumed`, LOGINNODRAW B1113) is finished at the route too.
 //! * x86 + `wc` only (the hooks live in the x86 router). Elsewhere every entry point is a no-op.
 
 use core::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering::{AcqRel, Acquire, Relaxed, Release}};
@@ -1524,5 +1524,34 @@ fn rt_fin() -> u32 {
 fn rt_kat() {
     let cases: [(u64, u64, bool); 4] = [(0, 5, false), (10, 9, false), (10, 10, true), (10, 20, true)];
     let ok = cases.iter().all(|&(r, t, want)| drawn_in_route(r, t) == want);
-    serial_println!("[lag] inroute kat={} cases={} finished={}", if ok { "ok" } else { "FAIL" }, cases.len(), RT_FIN.load(Relaxed));
+    serial_println!("[lag] inroute kat={} cases={} finished={} nodraw={}", if ok { "ok" } else { "FAIL" }, cases.len(), RT_FIN.load(Relaxed), RT_NODRAW.load(Relaxed)); // LOGINNODRAW (B1113): `nodraw=` the routes that consumed their event and drew nothing
+}
+
+// LOGINNODRAW (rmbp-ledger B1113) — TAIL-APPENDED. LOGINCOMP (B1104) left LOGIN-NODRAW: a key the recovery-words sheet
+// withholds (`login::kb_words_key`'s two returns: a key that is not Enter/Space, and an Enter/Space held back by the dwell
+// or the quiet gap) is CONSUMED by the screen and draws nothing, so no in-route present stamps `RT_REQ`, `rt_finish`
+// never fires, the slot waits in APP for a composite pass the login screen never runs, and `flush` times it out at
+// 3 s (flight 39 boot 1: three `[lag] key→echo timeout … reached=app`, f39-boot1.log :527 :676 :742). Such an event is
+// FINISHED, not dropped: the screen is its only taker (BP-input-4) and its effect, nothing, is already on the glass. The
+// route that consumed it says so with [`consumed`], which stamps the QUEUE ring-0 slot's `RT_DREW` (the same rule as
+// `rt_pass`: one router runs at a time, so a QUEUE slot is the event being routed); the guard's existing `rt_finish`
+// then ends it at the route with B1104's stamps (app = comp = present = 0). No second finish path. Relaxed atomics,
+// no lock; `RT_DREW` is cleared at the slot's claim (`rt_reset`). x86 + `wc` only.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+static RT_NODRAW: AtomicU32 = AtomicU32::new(0);
+
+/// LOGINNODRAW: the route being run consumed its event and draws nothing — its timing ends at the route (`rt_finish`).
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+pub fn consumed() {
+    let mut now = 0;
+    for (c, s) in SLOTS.iter().enumerate() {
+        if s.stage.load(Acquire) == QUEUE && s.ring.load(Relaxed) == 0 {
+            if now == 0 {
+                now = now_us().max(1);
+            }
+            if RT_DREW[c].compare_exchange(0, now, Relaxed, Relaxed).is_ok() {
+                RT_NODRAW.fetch_add(1, Relaxed);
+            }
+        }
+    }
 }
