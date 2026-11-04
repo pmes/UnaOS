@@ -1227,3 +1227,48 @@ fn a_report_file_opens_as_the_sheet_with_no_map() {
     assert!(m.view.sheet.is_none(), "a refusal shows nothing");
     assert!(Viewer::open_report(gs, SIZE, Preset::Una).is_err(), "open_report refuses it too");
 }
+
+// VUGFACEPATHBESIDE (LEDGER SR594): ONE typed-path rule (journal.rs `beside`): a bare name typed on the `:` line's
+// `report open <name>` and in the Save As field both land beside the opened part; a path map's anchor is its design
+// document; with nothing opened a relative name is the cwd's; an absolute path is as typed.
+
+#[test]
+fn a_bare_name_is_beside_the_opened_part_for_report_open_and_save_as() {
+    let (mut v, dir) = report_open_fixture("vugfacepathbeside");
+    let (_, top) = plate_top(v.view.deviation.as_ref().unwrap());
+    assert_eq!(v.map_command(&format!("gdt {top}=flatness:0.001")), Ok(true));
+    assert_eq!(v.map_command("report"), Ok(true), "the report is written beside the part");
+    let report = dir.join("part.vugreport");
+    let lines: Vec<String> = std::fs::read_to_string(&report).expect("the report is written").lines().map(String::from).collect();
+    assert_eq!(vug_view::journal::beside(&v, "part.vugreport"), report, "a bare name is beside the opened part");
+
+    // `report open <bare name>` reads the file `report` wrote, not a cwd file of that name.
+    assert_eq!(v.map_command("report open part.vugreport"), Ok(true));
+    assert_eq!(v.view.sheet.as_ref().map(|s| s.lines.clone()), Some(lines), "the sheet is the file beside the part");
+    assert!(v.key("Escape"), "Escape closes the sheet");
+    assert!(v.view.sheet.is_none());
+
+    // Save As of a bare name lands at the same rule's path.
+    let want = vug_view::journal::beside(&v, "copy.vug");
+    assert_eq!(want, dir.join("copy.vug"));
+    assert!(v.key("Meta+Shift+s"), "the Save As field opens");
+    assert!(v.input(&bandy::SMessage::BrowserText("copy".to_string())));
+    assert!(v.key("Return"), "Enter saves");
+    println!("beside: report {} save as {}", report.display(), want.display());
+    assert_eq!(v.save_to.as_deref(), Some(want.as_path()), "{:?}", v.view.design.journal.disk);
+    assert!(want.exists(), "the document is written beside the part");
+
+    // An absolute path is as typed.
+    let abs = std::env::temp_dir().join("vugfacepathbeside-abs.vugreport");
+    assert_eq!(vug_view::journal::beside(&v, abs.to_str().unwrap()), abs);
+
+    // A path map (no part: save_to None) is anchored on its design document.
+    let (part, ply) = (dir.join("part.vug"), dir.join("scan.ply"));
+    let pm = Viewer::open_against(ply.to_str().unwrap(), part.to_str().unwrap(), SIZE, Preset::Una).expect("the path map opens");
+    assert!(pm.save_to.is_none());
+    assert_eq!(vug_view::journal::beside(&pm, "part.vugreport"), report, "beside the design document");
+
+    // Nothing opened: a relative name is the cwd's, as typed.
+    let plain = Viewer::open_doc(doc_core::read(DOC).expect("the document reads"), "fixture", SIZE, Preset::Una).expect("the document opens");
+    assert_eq!(vug_view::journal::beside(&plain, "x.vugreport"), std::path::PathBuf::from("x.vugreport"));
+}

@@ -1117,3 +1117,20 @@ impl Journal {
         if out.is_empty() { None } else { Some(out) }
     }
 }
+
+// ---- VUGFACEPATHBESIDE (LEDGER SR594): THE typed-path rule ----
+// Save As's field (lib.rs `save_as_enter`) joined a relative name to the opened file's dir while the `:` line's typed
+// `report open <path>` (deviation.rs `Viewer::map_command`) read it from the cwd: one name, two places. [`beside`] is the
+// one rule both take, in deviation.rs `report_target`'s order (the journal's part, else a path map's design document).
+
+/// THE typed-path rule (the Save As field and the `:` line's `report open <path>`): an absolute path as typed; a relative
+/// one beside the opened document (`Viewer::save_to`, else a path map's design path); with no opened document, as typed
+/// (the cwd).
+pub fn beside(v: &crate::Viewer, typed: &str) -> std::path::PathBuf {
+    let p = std::path::PathBuf::from(typed);
+    let opened = v.save_to.as_deref().or_else(|| v.view.deviation.as_ref().and_then(|m| m.design_path.as_deref()));
+    match opened.and_then(|o| o.parent()) {
+        Some(dir) if p.is_relative() => dir.join(p),
+        _ => p,
+    }
+}
