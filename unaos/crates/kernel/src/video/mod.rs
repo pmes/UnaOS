@@ -427,6 +427,30 @@ pub fn panel_info_nonblocking() -> Option<FrameBufferInfo> {
     })
 }
 
+/// SETTINGS-PANELBUSY (rmbp-ledger B1105) — the LAST GOOD panel geometry this door returned, packed
+/// `w << 32 | h`, 0 for "never read". Lock-free; written only by [`panel_wh_held`] on a nonzero read.
+static PANEL_HELD_WH: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// SETTINGS-PANELBUSY (B1105) — the panel's `(w, h)` through [`panel_info_nonblocking`], holding the
+/// last good read across a refusal (B134's PTRLAG rule: only a nonzero read is held, so one bad read
+/// cannot poison the cell). `(0, 0)` only when no read has ever succeeded. A painter that captions the
+/// panel reads this, so a refused try_lock between two paints never rewrites the caption (flight 39:
+/// Settings' Resolution and Panel lines flickering to "panel busy"). PANEL-HELD-ONE owed: main.rs
+/// `ptrlag_panel_wh` and the aarch64 syscall `GEOM` cell move onto this door.
+pub fn panel_wh_held() -> (u32, u32) {
+    match panel_info_nonblocking() {
+        Some(i) if i.width != 0 && i.height != 0 => {
+            let (w, h) = (i.width as u32, i.height as u32);
+            PANEL_HELD_WH.store(((w as u64) << 32) | h as u64, Ordering::Relaxed);
+            (w, h)
+        }
+        _ => {
+            let v = PANEL_HELD_WH.load(Ordering::Relaxed);
+            ((v >> 32) as u32, (v & 0xFFFF_FFFF) as u32)
+        }
+    }
+}
+
 /// LOCKFIX — a copy of the panel handle for a painter, with the WEDGE-8 rule applied to `WRITER`.
 ///
 /// Blocking when interrupts are enabled (the caller is preemptible, so the holder can run), a bare

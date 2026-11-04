@@ -279,13 +279,17 @@ pub fn selftest() {
         Some((win, _)) => flagged == 1 && t.focus != 0 && t.nodes.get(t.focus as usize - 1).is_some_and(|b| b.win == win),
         None => flagged == 0 && t.focus == 0,
     };
-    let (stops, rung, ring_px, misses) = crate::video::settings::ring_probe();
+    let (stops, rung, ring_px, misses, census) = crate::video::settings::ring_probe(); // A11Y-STOPS-CENSUS (B1105): the stops per kit kind
     // A11YTREE2 (B822): BP-bar-22's 2 px is logical — the floor at the panel's scale (`ring_px` is device px)
     let floor = crate::video::metrics::size(2);
     let ok = wire == "ok" && windows == live && unnamed == 0 && focus_ok && stops > 0 && rung == stops && ring_px >= floor;
     for (tab, stop, row, why) in misses.iter() {
         let name = crate::video::settings::TAB_NAMES.get(*tab).copied().unwrap_or("-");
         serial_println!("[a11y] ring missing tab={}({}) stop={} row={} {}", tab, name, stop, row, why); // F39A11Y (B1101): `kind= px= at=`
+    }
+    // A11Y-STOPS-CENSUS (rmbp-ledger B1105): one line per kit kind, zeros included (the slots sum to `stops=`); informative, not in `ok`
+    for (kind, c) in crate::video::settings::CENSUS_KINDS.iter().zip(census.iter()) {
+        serial_println!("[a11y] census kind={} stops={} rung={}", kind, c[0], c[1]);
     }
     serial_println!(
         ":: A11YTREE: windows={} nodes={} unnamed={} focus={} ring_px={} s2={} stops={}/{} missed={} wire={} -> {} ::",

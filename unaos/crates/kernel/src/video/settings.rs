@@ -2619,9 +2619,9 @@ fn press_login(row: usize, cx: usize) {
 /// A chosen entry owed to the service pass (index + 1; 0 = none).
 static MODE_APPLY: AtomicU32 = AtomicU32::new(0);
 
-/// The dropdown's entries for the live panel (empty while the panel is busy or unknown).
+/// The dropdown's entries for the live panel (empty only until the first good panel read: B1105).
 fn display_modes() -> Vec<prefs_core::modes::Mode> {
-    let (w, h) = crate::video::panel_info_nonblocking().map_or((0, 0), |i| (i.width as u32, i.height as u32));
+    let (w, h) = crate::video::panel_wh_held(); // SETTINGS-PANELBUSY (B1105): the last good panel read across a refused try_lock, so the captions never flicker to "panel busy"
     prefs_core::modes::modes(w, h, super::dpi::native_s2())
 }
 
@@ -4208,11 +4208,11 @@ fn row_ring(st: &mut State, r: usize) {
 /// `DIMS.focus_ring + 3` logical px — so a pixel that moved between the two paints for another reason (flight 39: the
 /// Resolution caption reading "panel busy" when `panel_info_nonblocking` was refused) cannot stand in for the ring.
 #[cfg(feature = "witness")]
-pub fn ring_probe() -> (usize, usize, usize, Vec<(usize, usize, &'static str, String)>) {
+pub fn ring_probe() -> (usize, usize, usize, Vec<(usize, usize, &'static str, String)>, [[usize; 2]; CENSUS_KINDS.len()]) {
     let (pw, ph) = (super::metrics::size(WIN_W), super::metrics::size(WIN_H()));
     let (mut a, mut b): (Vec<u32>, Vec<u32>) = (Vec::new(), Vec::new());
     if a.try_reserve_exact(pw * ph).is_err() || b.try_reserve_exact(pw * ph).is_err() {
-        return (0, 0, 0, alloc::vec![(usize::MAX, 0, "-", String::from("oom"))]);
+        return (0, 0, 0, alloc::vec![(usize::MAX, 0, "-", String::from("oom"))], [[0; 2]; CENSUS_KINDS.len()]);
     }
     a.resize(pw * ph, 0);
     b.resize(pw * ph, 0);
@@ -4249,6 +4249,7 @@ pub fn ring_probe() -> (usize, usize, usize, Vec<(usize, usize, &'static str, St
     let near = |p: u32| (0..3).all(|k| ((p >> (8 * k)) & 0xFF).abs_diff((ring >> (8 * k)) & 0xFF) <= 3);
     let edge = |v: usize, max: usize| (e(v).max(0) as usize).min(max);
     let (mut stops, mut rung, mut thin, mut fail) = (0usize, 0usize, usize::MAX, Vec::new());
+    let mut census = [[0usize; 2]; CENSUS_KINDS.len()]; // A11Y-STOPS-CENSUS (B1105): [stops, rung] per kit kind
     for tab in 0..TABS {
         let (bb, n_pane, _, _) = paint_one(b, tab, None);
         b = bb;
@@ -4257,6 +4258,8 @@ pub fn ring_probe() -> (usize, usize, usize, Vec<(usize, usize, &'static str, St
             let (aa, _, hit, kind) = paint_one(a, tab, Some(k));
             a = aa;
             stops += 1;
+            let slot = census_slot(kind); // A11Y-STOPS-CENSUS (B1105)
+            census[slot][0] += 1;
             // F39A11Y (B1101): the stop's own box, device px `[bx0, bx1) x [by0, by1)`
             let (bx0, bx1, by0, by1) = match hit {
                 Some(h) if k > 0 => {
@@ -4284,6 +4287,7 @@ pub fn ring_probe() -> (usize, usize, usize, Vec<(usize, usize, &'static str, St
             };
             if px >= 2 {
                 rung += 1;
+                census[slot][1] += 1; // A11Y-STOPS-CENSUS (B1105)
                 thin = thin.min(px);
             } else {
                 let at = first.map_or(String::from("-"), |(x, y)| alloc::format!("{},{}", x, y));
@@ -4291,7 +4295,7 @@ pub fn ring_probe() -> (usize, usize, usize, Vec<(usize, usize, &'static str, St
             }
         }
     }
-    (stops, rung, if thin == usize::MAX { 0 } else { thin }, fail)
+    (stops, rung, if thin == usize::MAX { 0 } else { thin }, fail, census)
 }
 
 /// A11YTREE2 (B822): the name of `ring_probe`'s stop `stop` on tab `tab` — `column` for stop 0 (the tab's pill), else
@@ -6007,4 +6011,19 @@ fn close_hook(_id: wm::WinId, surf: usize) {
         if g.as_ref().map(|s| s.surf.as_ptr() as usize) == Some(surf) { g.take() } else { None }
     };
     drop(st);
+}
+
+// ── A11Y-STOPS-CENSUS (rmbp-ledger B1105) — every control kind lists its stops ─────────────────────────────────────
+// `ring_probe` tallies each stop it walks under its kit kind (the `kind` it already names a miss by), so `tests
+// a11ytree` prints one `[a11y] census kind=<k> stops=<n> rung=<n>` line per kind, zeros included: a kind with no stop
+// is visible, and the slots sum to `stops=`. `-` is a stop whose control recorded no keyboard word.
+
+/// The census's kinds: the column (stop 0), then [`K_NAMES`] in kind order, then `-`.
+#[cfg(feature = "witness")]
+pub const CENSUS_KINDS: [&str; 8] = ["column", "press", "seg", "slider", "field", "line", "entry", "-"];
+
+/// `kind`'s slot in [`CENSUS_KINDS`] (an unknown name counts as `-`).
+#[cfg(feature = "witness")]
+fn census_slot(kind: &str) -> usize {
+    CENSUS_KINDS.iter().position(|k| *k == kind).unwrap_or(CENSUS_KINDS.len() - 1)
 }
