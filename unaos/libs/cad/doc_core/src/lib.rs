@@ -71,7 +71,7 @@ pub use lex::read;
 pub use lex::read_with; // VUGMAKEMACHINELIB (SR544)
 pub use lex::HeldLib; // VUGMAKEMACHINELIBHELD (SR556)
 pub use replay::machine_of; // VUGMAKEMACHINELIB (SR544)
-pub use replay::{Failure, Fault, Replay, SketchOut, SolidOut, brep_profile, replay};
+pub use replay::{Failure, Fault, RefKind, Replay, SketchOut, SolidOut, brep_profile, replay}; // VUGFACEJOURNALFAULTFIXREF (SR590): RefKind
 pub use write::{escape, f64_text, write};
 
 /// The one tolerance policy (BP-vug-2): sketch_core's re-export (geom_core's `Tol` once VUGSHIMSWAP folds).

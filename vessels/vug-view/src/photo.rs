@@ -1010,7 +1010,7 @@ fn journal_doc(j: &crate::journal::Journal, face: &SketchFace) -> (Doc, Vec<(Str
 
 /// `stmt` with its own id (the second word) and every `key=value` head (before a `.`) that `names` maps re-written to
 /// the mapped name; the input untouched when nothing maps.
-fn renamed(stmt: &str, names: &[(String, String)]) -> String {
+pub(crate) fn renamed(stmt: &str, names: &[(String, String)]) -> String { // VUGFACEJOURNALFAULTFIXREF (SR590): the fix card re-names through it
     let look = |n: &str| names.iter().find(|(a, b)| a == n && a != b).map(|(_, b)| b.clone());
     let mut changed = false;
     let words: Vec<String> = stmt

@@ -435,10 +435,7 @@ impl Journal {
             (_, Some(_)) => return Err(format!("line {}: Invalid", self.doc.line(i))),
             _ => {}
         }
-        let mut cand = self.doc.clone();
-        cand.lines.clear();
-        cand.stmts[i] = s;
-        self.adopt(cand)
+        self.replace(i, s) // VUGFACEJOURNALFAULTFIXREF (SR590): THE statement replace, the fix road's too
     }
 }
 
@@ -822,6 +819,8 @@ pub enum FixRoad {
     Insert(usize, Stmt),
     /// The statement at this index removed, through the panel's [`Journal::delete`].
     Remove(usize),
+    /// VUGFACEJOURNALFAULTFIXREF (SR590): the statement at this index replaced, through [`Journal::replace`].
+    Replace(usize, Stmt),
 }
 
 /// A fix offered on a faulted row: the document line it is offered on, its text (the writer's line, or `remove <id>`)
@@ -885,6 +884,7 @@ impl Journal {
                 let rid = self.doc.stmts[k].id()?;
                 Some(vec![Fix { line, text: format!("remove {rid}"), road: FixRoad::Remove(k) }])
             }
+            Fault::BadRef { id: bad, kind } => self.ref_fixes(i, bad, *kind, line), // VUGFACEJOURNALFAULTFIXREF (SR590): the live entities of the slot's kind
             _ => None,
         }
     }
@@ -914,6 +914,7 @@ impl Journal {
                 self.adopt(cand)?
             }
             FixRoad::Remove(k) => self.delete(k)?,
+            FixRoad::Replace(k, s) => self.replace(k, s)?, // VUGFACEJOURNALFAULTFIXREF (SR590)
         };
         self.note = Some(format!("fixed line {}: {}", f.line, f.text));
         Ok(r)
@@ -942,8 +943,8 @@ fn fix_overlay(j: &Journal, fr: &mut Raster, x0: f32, h: f32, clip: &dyn Fn(&str
 // keyed on the faulted statement, 0 on any other row), and Enter takes it through the unchanged [`Journal::accept_fix`]
 // (ONE snapshot); Escape declines the whole card. photo.rs's card road is not used: a card there is a statement SET
 // entered whole and judged against a photo's measurement; a fix card is a CHOICE of one with no measurement. A Make
-// value has nothing to choose (the row's value is typed); BadRef / NoProfile / an edge reference are owed (the
-// failure carries no candidates: VUG-FACE-JOURNAL-FAULT-FIX-REF / -PROFILE / -EDGE).
+// value has nothing to choose (the row's value is typed); BadRef is SR590's (below); NoProfile / an edge reference sit in
+// a solid's chain, so `regenerate` refuses them and the journal never carries one (owed VUG-FACE-JOURNAL-SOLIDFAULT-FIX).
 
 impl Journal {
     /// Every fix for the carried failure on statement `i`, in card order (empty: nothing to offer).
@@ -1054,4 +1055,48 @@ pub(crate) fn field_line(fr: &mut Raster, label: &str, text: &str, panel: bool) 
     let line: String = format!("{label} {}_", text.to_uppercase()).chars().take(cols).collect();
     let y = h - 2.0 * ROW_PX - if panel { ROW_PX } else { 0.0 };
     raster::text(fr, &line, 6.0, y, rgba(ACTIVE));
+}
+
+// ---- VUGFACEJOURNALFAULTFIXREF (LEDGER SR590): a BadRef offers the live entities of the kind its slot wanted ----
+// doc_core's `Fault::BadRef` names the refused id and the kind its slot wanted (`RefKind`, read from the statement in
+// sketch_core's check order). The fixes are the statements of the same sketch BEFORE the faulted one (replay reads in
+// document order) of that kind (`RefKind::holds`, THE kind table), not themselves faulted, not already referenced by the
+// faulted statement: each is the faulted statement with the refused id re-named (photo.rs `renamed`, on the writer's
+// line, read back by `Doc::reread`), entered by [`Journal::replace`] (ONE snapshot). One fix is SR578's; several are
+// SR584's card. NoProfile / NoSuchEdge / AmbiguousEdge carry their candidates too (doc_core) but never reach `faults`.
+
+impl Journal {
+    /// THE statement replace: statement `i` replaced by `s` through [`Journal::adopt`] (a refusal names its line and
+    /// nothing changes). A row value's Enter and a Replace fix both enter here.
+    fn replace(&mut self, i: usize, s: Stmt) -> Result<Regen, String> {
+        let mut cand = self.doc.clone();
+        cand.lines.clear();
+        cand.stmts[i] = s;
+        self.adopt(cand)
+    }
+
+    /// The fixes for statement `i`'s BadRef on `bad` (wanted `kind`), on document line `line`; None with none to offer.
+    fn ref_fixes(&self, i: usize, bad: &str, kind: doc_core::RefKind, line: u32) -> Option<Vec<Fix>> {
+        let stmt = self.doc.stmts.get(i)?;
+        let refs = stmt.refs();
+        let sketch = *refs.first()?;
+        let faulted = |id: &str| self.faults.iter().any(|f| f.id == id);
+        let text = doc_core::write(&self.doc);
+        let lines: Vec<&str> = text.lines().collect();
+        let own = lines.get(i + 1)?.to_string();
+        let mut out = Vec::new();
+        for s in &self.doc.stmts[..i] {
+            let Some(id) = s.id() else { continue };
+            if !kind.holds(s) || s.refs().first() != Some(&sketch) || faulted(id) || refs.contains(&id) {
+                continue;
+            }
+            let new = crate::photo::renamed(&own, &[(bad.to_string(), id.to_string())]);
+            let mut all: Vec<&str> = lines.clone();
+            all[i + 1] = new.as_str();
+            let Ok(d) = self.doc.reread(&(all.join("\n") + "\n")) else { continue };
+            let Some(fixed) = d.stmts.get(i).filter(|_| d.stmts.len() == self.doc.stmts.len()).cloned() else { continue };
+            out.push(Fix { line, text: stmt_text(&fixed), road: FixRoad::Replace(i, fixed) });
+        }
+        if out.is_empty() { None } else { Some(out) }
+    }
 }

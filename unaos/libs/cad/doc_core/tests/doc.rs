@@ -3,7 +3,7 @@
 //! reads a hand-edited copy to the same Doc.
 
 use brep_core::{Frame, extrude, properties, revolve};
-use doc_core::{Cons, Doc, Fault, Failure, PRef, Stmt, What, brep_profile, f64_text, read, replay, write};
+use doc_core::{Cons, Doc, Fault, Failure, PRef, RefKind, Stmt, What, brep_profile, f64_text, read, replay, write};
 use make_core::Move;
 use sketch_core::{Constraint, PointRef, Sketch, Tol, Vec2, profiles, solve};
 use std::f64::consts::PI;
@@ -245,7 +245,7 @@ fn a_broken_constraint_still_reads_and_replay_names_its_line() {
         "the conflicting constraint named by its line: {:?}",
         r.failures
     );
-    assert!(r.failures.contains(&Failure { line: lx, id: "lx".into(), fault: Fault::BadRef("l1".into()) }));
+    assert!(r.failures.contains(&Failure { line: lx, id: "lx".into(), fault: Fault::BadRef { id: "l1".into(), kind: RefKind::Point } }));
     assert!(r.failures.contains(&Failure { line: e1, id: "e1".into(), fault: Fault::Upstream("s1".into()) }));
     assert!(r.failures.iter().any(|f| f.id == "dr1" && f.fault == Fault::Upstream("e1".into())));
     assert!(r.program.is_none(), "a Program missing an Op is not the design's Make");
@@ -505,10 +505,18 @@ fn a_fillet_naming_a_missing_edge_refuses_no_such_edge_by_name() {
     let gone = brep_core::Name { op: brep_core::OpKind::Extrude, role: brep_core::Role::CapEnd, a: 9, b: 9 };
     let (d, text) = cube_with(Stmt::Fillet { id: "f1".into(), on: "e1".into(), edges: vec![gone], r: 2.0 });
     let r = replay(&d, d.tol);
-    assert_eq!(
-        r.failures,
-        vec![Failure { line: line_of(&text, "fillet f1"), id: "f1".into(), fault: Fault::NoSuchEdge("extrude cap_end 9 9".into()) }]
-    );
+    assert_eq!(r.failures.len(), 1, "{:?}", r.failures);
+    assert_eq!((r.failures[0].line, r.failures[0].id.as_str()), (line_of(&text, "fillet f1"), "f1"));
+    // VUGFACEJOURNALFAULTFIXREF (SR590): the fault carries the cube's edge names a fix would choose from.
+    let Fault::NoSuchEdge { name, edges } = &r.failures[0].fault else { panic!("{:?}", r.failures) };
+    assert_eq!(name, "extrude cap_end 9 9");
+    let (top, _) = cube_with(Stmt::Fillet { id: "f1".into(), on: "e1".into(), edges: vec![top_front_name()], r: 2.0 });
+    let top = write(&top);
+    let words = top.lines().find_map(|l| l.strip_prefix("fillet f1 on=e1 edges=[[")?.split("]]").next()).expect("the words");
+    assert!(edges.iter().any(|e| e == words), "the top-front edge {words} is offered: {edges:?}");
+    assert!(!edges.iter().any(|e| e == name), "the gone name is not");
+    assert!(!edges.is_empty() && edges.len() <= 12, "{edges:?}");
+    assert_eq!(format!("{:?}", r.failures[0].fault), "NoSuchEdge(\"extrude cap_end 9 9\")", "the pre-SR590 words");
     assert!(r.solids.iter().all(|s| s.id != "f1"), "a refused edit builds no solid");
     // The statement stays in the document (never dropped).
     assert!(write(&d).contains("fillet f1 on=e1 edges=[[extrude cap_end 9 9]] r=2"));
@@ -740,4 +748,26 @@ fn a_library_part_rereads_from_the_libraries_it_holds() {
     let (a, b) = (doc_core::machine_of(&d).unwrap(), doc_core::machine_of(&d2).unwrap());
     assert_eq!(b, a);
     assert_eq!(b.digest(), a.digest(), "Machine::digest byte-equal");
+}
+
+// VUGFACEJOURNALFAULTFIXREF (LEDGER SR590): a BadRef names the kind its slot wanted (a line slot, a circle slot, a
+// `.start`), a NoProfile the closed loops of its sketch.
+#[test]
+fn a_bad_ref_names_the_kind_its_slot_wanted_and_no_profile_its_loops() {
+    let text = DOC_A.replace(
+        "distance d2 sketch=s1 a=p2 b=p3 d=8\n",
+        "distance d2 sketch=s1 a=p2 b=p3 d=8\nhorizontal hz sketch=s1 line=p1\non_circle oc sketch=s1 p=p3 circle=l2\ncoincident cc sketch=s1 a=p1.start b=p2\n",
+    ).replace("revolve e2 ", "extrude e3 sketch=s1 outer=p1 dir=[0 0 1] length=5\nrevolve e2 ");
+    let d = read(&text).expect("a wrong-kind reference is geometry, not syntax: the document reads");
+    let r = replay(&d, d.tol);
+    let fault = |id: &str| r.failures.iter().find(|f| f.id == id).map(|f| f.fault.clone()).unwrap_or_else(|| panic!("{id}: {:?}", r.failures));
+    assert_eq!(fault("hz"), Fault::BadRef { id: "p1".into(), kind: RefKind::Line });
+    assert_eq!(fault("oc"), Fault::BadRef { id: "l2".into(), kind: RefKind::Round });
+    assert_eq!(fault("cc"), Fault::BadRef { id: "p1".into(), kind: RefKind::Ends });
+    let Fault::NoProfile { loops } = fault("e3") else { panic!("{:?}", r.failures) };
+    assert_eq!(loops.len(), 1, "one closed loop: {loops:?}");
+    assert!(["l1", "l2", "l3", "l4"].contains(&loops[0].as_str()), "{loops:?}");
+    assert_eq!(format!("{:?}", fault("e3")), "NoProfile", "the pre-SR590 words");
+    assert_eq!(format!("{:?}", fault("hz")), "BadRef(\"p1\")");
+    assert!(r.solids.iter().any(|s| s.id == "e1"), "the sketch still solves without the refused constraints");
 }
