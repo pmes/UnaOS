@@ -362,6 +362,44 @@ fn esc_cancels_save_as_with_nothing_written() {
     assert_eq!(vw.title, "tree*");
 }
 
+// VUGFACESAVEASCARET (LEDGER SR593): the Save As field edits at a caret on the `:` line's road (sketch.rs `caret_key` /
+// `type_text_at`), painted by journal.rs `field_line_at`; Enter saves the edited name.
+
+fn save_as_text(vw: &Viewer) -> (String, usize) {
+    let f = vw.view.design.journal.save_as.as_ref().expect("the field is open");
+    (f.text.clone(), f.caret)
+}
+
+#[test]
+fn save_as_edits_at_its_caret_and_enter_saves_the_edited_name() {
+    let mut vw = dimensioned();
+    let orig = scratch("vugfacesaveascaret-orig.vug");
+    let new = scratch("vugfacesaveascaret-new.vug");
+    vw.save_to = Some(orig.clone());
+    assert!(key(&mut vw, "Meta+Shift+s"));
+    assert!(typed(&mut vw, "vugfacesaveascaret-nw"));
+    assert_eq!(save_as_text(&vw), ("vugfacesaveascaret-nw".to_string(), 21), "typing leaves the caret at the end");
+    let at_end = vug_view::raster::render(&vw.model, &vw.view);
+    assert!(key(&mut vw, "Left"), "Left moves the caret");
+    assert_eq!(save_as_text(&vw).1, 20);
+    let mid = vug_view::raster::render(&vw.model, &vw.view);
+    assert_ne!(mid.rgba, at_end.rgba, "the painted caret follows the caret");
+    assert!(key(&mut vw, "Right") && !key(&mut vw, "Right"), "Right at the end does not move");
+    assert!(key(&mut vw, "\u{f702}"), "the Cocoa Left moves");
+    assert_eq!(save_as_text(&vw), ("vugfacesaveascaret-nw".to_string(), 20), "and is never typed");
+    assert!(key(&mut vw, "Delete"), "Delete removes the char after the caret");
+    assert_eq!(save_as_text(&vw), ("vugfacesaveascaret-n".to_string(), 20));
+    assert!(typed(&mut vw, "w") && key(&mut vw, "Left"));
+    assert!(typed(&mut vw, "e"), "a char inserts at the caret");
+    assert_eq!(save_as_text(&vw), ("vugfacesaveascaret-new".to_string(), 21));
+    println!("save as caret {:?}", save_as_text(&vw));
+    assert!(key(&mut vw, "Return"), "Enter saves the edited name");
+    assert!(!save_as_open(&vw), "{:?}", vw.view.design.journal.disk);
+    assert_eq!(std::fs::read_to_string(&new).expect("written"), doc_core::write(doc(&vw)));
+    assert!(!orig.exists(), "the old target is not written");
+    assert_eq!(vw.title, "vugfacesaveascaret-new.vug");
+}
+
 // ---- VUGMAKEMACHINELIBFACE (SR548): a part beside its machine library ----
 
 /// The library's machine line (doc_core tests/doc.rs MACHINE_A's keys) and its axes / tool, as a `.vugmachine`.

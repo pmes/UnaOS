@@ -764,14 +764,16 @@ fn disk_overlay(view: &View, fr: &mut Raster) {
 pub struct SaveAs {
     pub text: String,
     pub armed: bool,
+    /// VUGFACESAVEASCARET (SR593): the caret, in chars of `text` (sketch.rs `type_text_at` / `caret_key`).
+    pub caret: usize,
 }
 
-/// The open field, bottom left, one row above the corner line: `SAVE AS: <TEXT>_` (upper-cased: the font's case),
-/// clipped to the frame's width.
+/// The open field, bottom left, one row above the corner line: `SAVE AS: <TEXT>` with the field's `_` at its caret
+/// (upper-cased: the font's case), clipped to the frame's width.
 fn save_as_overlay(view: &View, fr: &mut Raster) {
     let j = &view.design.journal;
     let Some(f) = &j.save_as else { return };
-    field_line(fr, "SAVE AS:", &f.text, j.panel); // VUGFACEGDTREPORTOPEN (SR581): THE field painter, the command line's too
+    field_line_at(fr, "SAVE AS:", &f.text, f.caret, j.panel); // VUGFACESAVEASCARET (SR593): the caret where it is; VUGFACEGDTREPORTOPEN (SR581): THE field painter, the command line's too
 }
 
 // ---- VUGFACEJOURNALSOLIDFAULT (LEDGER SR572): a document whose failures no solid reads opens; a fault line is picked ----
@@ -1016,7 +1018,7 @@ fn fix_card(j: &Journal, fr: &mut Raster, x0: f32, y: f32, all: &[Fix], f: &Fix,
 // ---- VUGFACEGDTREPORTOPEN (LEDGER SR581): THE panel painter and THE field painter ----
 // The tree panel's paint was held inside [`overlay`]; [`paint_panel`] is it, handed rows: the journal paints its
 // statements through it with its own style, deviation.rs `line_overlay` paints an opened `.vugreport` (the sheet).
-// [`field_line`] is the Save As field's paint, handed a label: the face's `:` command line paints through it too.
+// [`field_line_at`] is the Save As field's paint, handed a label and a caret: the face's `:` command line paints through it too.
 
 /// The rows that fit in the panel on a frame `height` tall, above its two foot rows (the fix and the note).
 pub(crate) fn panel_fit(height: u32) -> usize {
@@ -1047,16 +1049,12 @@ pub(crate) fn paint_panel(fr: &mut Raster, rows: &[String], first: usize, style:
     }
 }
 
-/// THE field painter: `<LABEL> <TEXT>_` bottom left, one row above the corner line (one more while the panel's note
-/// row is shown), upper-cased (the font's case), clipped to the frame's width, in the active colour.
-pub(crate) fn field_line(fr: &mut Raster, label: &str, text: &str, panel: bool) {
-    field_line_at(fr, label, text, text.chars().count(), panel); // VUGFACECOMMANDCARET (SR587): the caret at the end
-}
-
 // ---- VUGFACECOMMANDCARET (LEDGER SR587): the field's caret ----
 
-/// [`field_line`] with the caret at char `caret` of `text`: `<LABEL> <TEXT>` and the field's `_` at the caret's column —
-/// on the text row at the end (the frame [`field_line`] always painted), one font row lower under the caret's char
+/// THE field painter (VUGFACESAVEASCARET SR593: `field_line`, its caret-at-the-end caller, retired with its last caller):
+/// `<LABEL> <TEXT>` bottom left, one row above the corner line (one more while the panel's note row is shown),
+/// upper-cased (the font's case), clipped to the frame's width, in the active colour, with the caret at char `caret` of
+/// `text`: the field's `_` at the caret's column — on the text row at the end, one font row lower under the caret's char
 /// mid-text (the font's `_` shares the letters' bottom row). The column counts the upper-cased text before the caret; a
 /// column past the clip paints no caret.
 pub(crate) fn field_line_at(fr: &mut Raster, label: &str, text: &str, caret: usize, panel: bool) {
