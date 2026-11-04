@@ -4445,7 +4445,7 @@ pub fn clear_handle_row(asid: u64) {
     // deposit stamped for the dying tenant is dead-on-arrival for the ASID's next tenant even if it lands
     // after the sweep passed its slot (RECV verifies the stamp; the sender's post-check re-reads this word).
     // This closes the U7-documented sys_xfer TOCTOU (exit + recycle + consume inside the deposit window).
-    ASID_GEN[asid as usize].fetch_add(1, Ordering::AcqRel); net6_free_owner(asid); #[cfg(feature = "desktop_firmware")] crate::video::wm::spawn_focus_forget(asid); // FOCUSARM64 (SR180): the unconsumed SPAWN-FOCUS token and focussteal's record die with the tenant, x86 `clear_handle_row`'s twin (LINE-NEUTRAL fold, code before this comment). NET6 — close every socket this dying address space still owns, so an EL0 program that exits with sockets open frees its registry slots instead of leaking them for the boot's life. Placed with the generation bump, before the handle sweep, for the same reason that bump is first: past this point nothing the dying tenant held can be resolved. ⚠ LINE-NEUTRAL append — `#[inline(always)]`-empty knob-off, body at the FILE TAIL.
+    ASID_GEN[asid as usize].fetch_add(1, Ordering::AcqRel); net6_free_owner(asid); #[cfg(feature = "desktop_firmware")] crate::video::wm::spawn_focus_forget(asid); crate::video::wm::app_records_teardown(crate::video::wm::owner_of_launch(asid)); // ARMFORGET-ARM (B1171): wm forgets the dying tenant's name + path (+ the early record under busreg) at the generation bump, final release only, Pi and Orin (wm tail). FOCUSARM64 (SR180): the unconsumed SPAWN-FOCUS token and focussteal's record die with the tenant, x86 `clear_handle_row`'s twin (LINE-NEUTRAL fold, code before this comment). NET6 — close every socket this dying address space still owns, so an EL0 program that exits with sockets open frees its registry slots instead of leaking them for the boot's life. Placed with the generation bump, before the handle sweep, for the same reason that bump is first: past this point nothing the dying tenant held can be resolved. ⚠ LINE-NEUTRAL append — `#[inline(always)]`-empty knob-off, body at the FILE TAIL.
     for i in 0..NHANDLE {
         // Clear the value first (Empty => `handle_resolve` bails as NoHandle before reading rights/kind), then
         // the rights and kind — so no intermediate state is ever a live handle with wrong rights/kind.
@@ -8310,7 +8310,7 @@ pub enum BgPoll {
 /// (the shell's `bg` verb) records the pid and reaps it later via [`bg_poll`]. Mirrors
 /// `run_user_image`'s front half exactly — same bounds, same console-cap endowment, same EXEC1-M
 /// publish order — and diverges only where the contract block above says it does.
-pub fn spawn_user_image_bg_argv(bytes: &[u8], argv: &[&str]) -> Result<(u64, u64, u64), &'static str> { spawn_user_image_bg_piped(bytes, argv, None, false) } fn spawn_user_image_bg_piped(bytes: &[u8], argv: &[&str], pipe: Option<usize>, ring3: bool) -> Result<(u64, u64, u64), &'static str> { // ARMPIPE (A108): the bg body with SYS_SPAWN_PATH's two extras — the reserved pipe bound before the task exists, and the caller's principal rule; the shell's `bg` passes neither. ⚠ LINE-NEUTRAL fold.
+pub fn spawn_user_image_bg_argv(bytes: &[u8], argv: &[&str]) -> Result<(u64, u64, u64), &'static str> { spawn_user_image_bg_piped(bytes, argv, None, false, argv.first().copied()) } fn spawn_user_image_bg_piped(bytes: &[u8], argv: &[&str], pipe: Option<usize>, ring3: bool, early: Option<&str>) -> Result<(u64, u64, u64), &'static str> { // ARMPIPE (A108): the bg body with SYS_SPAWN_PATH's two extras — the reserved pipe bound before the task exists, and the caller's principal rule; the shell's `bg` passes neither. ⚠ LINE-NEUTRAL fold.
     #[cfg(feature = "desktop_firmware")] if oneinstance_gate(argv, pipe.is_some()).is_some() { return Err(ONEINSTANCE_RAISED); } if bytes.len() > super::xwin::IMAGE_CAP { // RING3ABI2 M5: the 4 MiB ELF window. ONEINSTANCE2 (rmbp-ledger B751): a second launch of a running program by the user's verb raises it instead of spawning (file tail), BEFORE anything is claimed; LINE-NEUTRAL fold, code before this line's first `//`.
         return Err("image larger than the user image cap (USER_WINDOW_BYTES)");
     }
@@ -8349,7 +8349,7 @@ pub fn spawn_user_image_bg_argv(bytes: &[u8], argv: &[&str]) -> Result<(u64, u64
             });
         }
     };
-    let asid = mapped.ttbr0 >> 48; spawn_path_bind(asid, bytes, pipe, ring3); super::xwin::args_write(mapped.slot, argv); #[cfg(feature = "desktop_firmware")] crate::video::wm::spawn_focus_arm(asid); #[cfg(all(feature = "busreg", feature = "aarch64_el0"))] crate::bus_route::arm_early(asid as usize, if !ring3 { argv.first().copied() } else { None }); /* BUSREG-ARM-EARLY (B1164): the kernel launcher's own argv[0] (never ring-3 bytes) armed for the bus check before the task can run (bus_route tail) */ // FOCUSARM64 (SR180): every launch through this funnel arms its first window's focus token before the task can run, x86 `spawn_user_image_bg_inner`'s twin (aarch64 has no desktop-app exemption to make; LINE-NEUTRAL fold). ARMPIPE (A108): the pipe bound and the principal ruled BEFORE the task can run (fn at the FILE TAIL). RING3ABI2 M2
+    let asid = mapped.ttbr0 >> 48; spawn_path_bind(asid, bytes, pipe, ring3); super::xwin::args_write(mapped.slot, argv); #[cfg(feature = "desktop_firmware")] crate::video::wm::spawn_focus_arm(asid); #[cfg(all(feature = "busreg", feature = "aarch64_el0"))] crate::bus_route::arm_early(asid as usize, early, ring3); #[cfg(not(all(feature = "busreg", feature = "aarch64_el0")))] let _ = early; /* BUSREG-ARM-EARLY (B1164) + BUSREG-ARM-EARLY-RING3 (B1172): the early path the CALLER chose (a kernel road its own argv[0], SYS_SPAWN_PATH its kernel-opened path, never ring-3 argv) armed for the bus check before the task can run; `ring3` is the road label only (bus_route tail) */ // FOCUSARM64 (SR180): every launch through this funnel arms its first window's focus token before the task can run, x86 `spawn_user_image_bg_inner`'s twin (aarch64 has no desktop-app exemption to make; LINE-NEUTRAL fold). ARMPIPE (A108): the pipe bound and the principal ruled BEFORE the task can run (fn at the FILE TAIL). RING3ABI2 M2
     // VUG-BG: mark the address space DETACHED before the task can be dispatched, so the program observes
     // the bit on its very first info-page read rather than racing the launcher. See `set_detached`.
     set_detached(asid, true);
@@ -22523,7 +22523,7 @@ fn bus_mbox_clear(asid: u64) {
     mb.head = 0;
     mb.count = 0;
     for s in mb.slots.iter_mut() {
-        *s = None; // drops the box
+        #[cfg(feature = "busreg")] crate::bus_route::mbox_unread(asid as usize, s.as_ref().map(|m| &*m.frame)); *s = None; // drops the box. RELAY-RESET-SET (B1169): a relayed REQUEST still here was never read by the dying fulfiller; bus_route marks its relay id for on_exit (file tail). LINE-NEUTRAL fold.
     }
 }
 
@@ -22687,7 +22687,7 @@ fn bus_cat(asid: u64, agen: u64, ppid: PrincipalRecord, name: &str, text: &mut a
 /// persist runs AFTER the hold drops (the K5B discipline, exactly like sys_open). A successful
 /// cp's reply body is EMPTY (status 0 is the whole truth — the native error-reply symmetry).
 fn bus_cp(asid: u64, agen: u64, ppid: PrincipalRecord, src: &str, dst: &str) -> i64 {
-    if src.eq_ignore_ascii_case(ATR_NAME) || dst.eq_ignore_ascii_case(ATR_NAME) {
+    if asid != 0 && machine_store_open_refused(dst, O_CREAT, &ppid) { return EACCES; } if src.eq_ignore_ascii_case(ATR_NAME) || dst.eq_ignore_ascii_case(ATR_NAME) { // MACHINESTOREBUSLEAF (rmbp-ledger B1174): a ring-3 destination leaf in the machine store (`SETTINGS`, a squat before the kernel lays the folder) is ROOTACL's refusal through the shared SYS_OPEN verdict (file tail helper). LINE-NEUTRAL append, code first
         return EACCES;
     }
     let fs = match crate::fs::fat::mount() {
@@ -22781,7 +22781,7 @@ fn bus_cp(asid: u64, agen: u64, ppid: PrincipalRecord, src: &str, dst: &str) -> 
 /// invoker. A previously-owned file stays owned by its owner; a public file becomes private to the
 /// writer (the sys_open(O_CREAT) private policy, applied uniformly to create and truncate).
 fn bus_write(asid: u64, agen: u64, ppid: PrincipalRecord, name: &str, content: &[u8]) -> i64 {
-    if name.eq_ignore_ascii_case(ATR_NAME) {
+    if asid != 0 && machine_store_open_refused(name, O_CREAT, &ppid) { return EACCES; } if name.eq_ignore_ascii_case(ATR_NAME) { // MACHINESTOREBUSLEAF (rmbp-ledger B1174): a ring-3 destination leaf in the machine store (`SETTINGS`, a squat before the kernel lays the folder) is ROOTACL's refusal through the shared SYS_OPEN verdict (file tail helper). LINE-NEUTRAL append, code first
         return EACCES; // the kernel owns the ACL store — never a writable name
     }
     if content.len() > BUS_CP_MAX {
@@ -22975,7 +22975,7 @@ fn bus_rm(asid: u64, agen: u64, ppid: PrincipalRecord, name: &str) -> i64 {
 /// re-bind failure the stale-named row is cleared (fail-closed against the K1-F2 re-adoption class).
 /// Errnos: ATR deny / mount / -ENOENT (src) / -EISDIR / -EACCES / -EEXIST (dst) / -EINVAL (bad name).
 fn bus_mv(asid: u64, agen: u64, ppid: PrincipalRecord, src: &str, dst: &str) -> i64 {
-    if src.eq_ignore_ascii_case(ATR_NAME) || dst.eq_ignore_ascii_case(ATR_NAME) {
+    if asid != 0 && machine_store_open_refused(dst, O_CREAT, &ppid) { return EACCES; } if src.eq_ignore_ascii_case(ATR_NAME) || dst.eq_ignore_ascii_case(ATR_NAME) { // MACHINESTOREBUSLEAF (rmbp-ledger B1174): a ring-3 destination leaf in the machine store (`SETTINGS`, a squat before the kernel lays the folder) is ROOTACL's refusal through the shared SYS_OPEN verdict (file tail helper). LINE-NEUTRAL append, code first
         return EACCES;
     }
     let fs = match crate::fs::fat::mount() {
@@ -26571,7 +26571,7 @@ fn spawn_path_checked(path: &str, words: &[alloc::string::String], who: &str, ca
     let argv: alloc::vec::Vec<&str> = words.iter().map(|s| s.as_str()).collect();
     let pipe_idx = pipe_reserve(pipe, caller).map_err(|why| (EAGAIN, why))?;
     crate::prof::launching(path);
-    match spawn_user_image_bg_piped(&bytes, &argv, pipe_idx, true) {
+    match spawn_user_image_bg_piped(&bytes, &argv, pipe_idx, true, Some(path)) { // BUSREG-ARM-EARLY-RING3 (B1172): the kernel-opened path, never ring-3 argv
         Ok((pid, asid, entry)) => {
             crate::video::wm::app_name_arm(crate::video::wm::owner_of_launch(asid), path);
             crate::fs::appres::sight(path);
@@ -27572,7 +27572,7 @@ static ONEINST_NEW: AtomicBool = AtomicBool::new(false);
 #[cfg(feature = "desktop_firmware")]
 pub fn spawn_user_image_bg_argv_new(bytes: &[u8], argv: &[&str]) -> Result<(u64, u64, u64), &'static str> {
     ONEINST_NEW.store(true, Ordering::Release);
-    let r = spawn_user_image_bg_piped(bytes, argv, None, false);
+    let r = spawn_user_image_bg_piped(bytes, argv, None, false, argv.first().copied());
     ONEINST_NEW.store(false, Ordering::Release);
     r
 }

@@ -527,7 +527,7 @@ impl Design {
     fn key(&mut self, view: &View, model: &Model, k: &str) -> Option<bool> {
         if let Some(r) = self.typed_key(k) { return Some(r); } // VUGFACEDIMENSION (SR494): an open edit / pull takes its keys first
         let tool = match k {
-            "Escape" | "\u{1b}" => {
+            _ if FieldKey::of(k) == Some(FieldKey::Escape) => { // VUGFACEFIELDKEYSREST (SR605): the table's Escape
                 if self.pull.take().is_some() {
                     return Some(true);
                 }
@@ -543,7 +543,7 @@ impl Design {
             }
             "e" | "E" => return self.start_pull(view),
             // VUGSKETCHERASE (SR495): Delete / Backspace removes the entity under the cursor.
-            "BackSpace" | "Backspace" | "Delete" => return self.erase_at(view),
+            _ if matches!(FieldKey::of(k), Some(FieldKey::Backspace | FieldKey::Delete)) => return self.erase_at(view), // VUGFACEFIELDKEYSREST (SR605): the table's forms (the Cocoa and one-char too)
             "l" | "L" => Tool::Line,
             "c" | "C" => Tool::Circle,
             "a" | "A" => Tool::Arc,
@@ -1087,6 +1087,8 @@ pub(crate) fn type_text_at(buf: &mut String, at: &mut usize, ch: Option<char>, b
 // `Viewer::save_as_key`) and the `:` line (deviation.rs `Viewer::line_key`) read [`FieldKey::of`] once per key; a key
 // the table names is never typed (the one-char Cocoa codes are private-use chars, not `is_control`, and an unhandled
 // one used to land in the text as a glyph). photo.rs's PageDown / PageUp page a card: a view key, not a field key.
+// VUGFACEFIELDKEYSREST (SR605): every key-name reader of the face reads it (fillet.rs, journal.rs, photo.rs, the sketch's
+// Esc / erase arms and [`Design::typed_key`]); [`field_char`] beside it is the one typed char.
 
 /// A free text field's named keys: the GTK / browser names and their one-char forms (the Cocoa function-key codes,
 /// the ASCII controls), read in ONE place.
@@ -1136,6 +1138,22 @@ pub(crate) fn caret_key(buf: &str, at: &mut usize, k: FieldKey) -> Option<bool> 
         _ => return None,
     };
     Some(*at != was)
+}
+
+// VUGFACEFIELDKEYSREST (LEDGER SR605): THE one typed char of a key, beside the table. fillet.rs `key`, journal.rs `key`,
+// [`Design::typed_key`], lib.rs `Viewer::save_as_key` and deviation.rs `Viewer::line_key` read it (five ch blocks before).
+
+/// A key's one typed char: None whenever [`FieldKey::of`] names the key (a named key is never typed), else the key's one
+/// char; None for a longer name (`Shift_L`, `Tab`).
+pub(crate) fn field_char(k: &str) -> Option<char> {
+    if FieldKey::of(k).is_some() {
+        return None;
+    }
+    let mut it = k.chars();
+    match (it.next(), it.next()) {
+        (Some(c), None) => Some(c),
+        _ => None,
+    }
 }
 
 impl Dim {
@@ -1416,15 +1434,10 @@ impl Design {
     /// The keys an open pull or dimension edit takes first: digits, `.`, a leading `-`, Backspace, Enter, Esc (and `d`
     /// toggling a round dimension). Any other key closes an edit uncommitted and falls through.
     fn typed_key(&mut self, k: &str) -> Option<bool> {
-        let enter = matches!(k, "Return" | "KP_Enter" | "\r" | "\n");
-        let back = matches!(k, "BackSpace" | "\u{8}" | "\u{7f}");
-        let ch = {
-            let mut it = k.chars();
-            match (it.next(), it.next()) {
-                (Some(c), None) => Some(c),
-                _ => None,
-            }
-        };
+        let fk = FieldKey::of(k); // VUGFACEFIELDKEYSREST (SR605): the one key-name table (its Backspace takes `Backspace` too)
+        let enter = fk == Some(FieldKey::Enter);
+        let back = fk == Some(FieldKey::Backspace);
+        let ch = field_char(k);
         if self.pull.is_some() {
             if enter {
                 self.commit_pull();
@@ -1445,7 +1458,7 @@ impl Design {
         }
         let face = self.face.as_mut()?;
         let edit = face.edit.as_mut()?;
-        if matches!(k, "Escape" | "\u{1b}") {
+        if fk == Some(FieldKey::Escape) { // VUGFACEFIELDKEYSREST (SR605)
             face.edit = None;
             return Some(true);
         }

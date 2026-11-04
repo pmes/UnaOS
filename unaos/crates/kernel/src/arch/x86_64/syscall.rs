@@ -14985,7 +14985,7 @@ pub fn clear_handle_row(slot: usize) {
     // deposit stamped for the dying tenant is dead-on-arrival for the slot's next tenant even if it lands
     // after the sweep passed its slot (RECV verifies the stamp; the sender's post-check re-reads this word).
     // This closes the U7x-documented sys_xfer TOCTOU (exit + recycle + consume inside the deposit window).
-    SLOT_GEN[slot].fetch_add(1, Ordering::AcqRel); #[cfg(feature = "login")] slot_user_clear(slot); // LOGIN M1 — the dying tenant's user stamp goes with its generation (file tail). ⚠ LINE-NEUTRAL append.
+    SLOT_GEN[slot].fetch_add(1, Ordering::AcqRel); #[cfg(feature = "login")] slot_user_clear(slot); crate::video::wm::app_records_teardown(crate::video::wm::owner_of_launch(slot as u64)); // ARMFORGET-X86 (B1171): wm forgets the dying tenant's name + path (+ the early record under busreg) here, at the generation bump and before the slot is claimable (wm tail). LOGIN M1 — the dying tenant's user stamp goes with its generation (file tail). ⚠ LINE-NEUTRAL append.
     // WINX-7: revoke input focus if this dying slot held it, and reset its input ring — BEFORE the
     // rest of the teardown, and for the same reason the generation bump comes first: from this point
     // on nothing addressed to the old tenant may reach the slot's next one. Without the revoke, focus
@@ -16969,7 +16969,7 @@ pub fn run_user_image_argv(
 /// runs the BGRUN-SCAV sweep before refusing, reclaiming `bg_owned` rows that exited and were never
 /// reaped. So a shell that never runs `jobs` loses exit STATUSES, not launch capacity.
 pub fn spawn_user_image_bg(bytes: &[u8]) -> Result<(u64, u64, u64), &'static str> {
-    spawn_user_image_bg_inner(bytes, false, &[], None, None)
+    spawn_user_image_bg_inner(bytes, false, &[], None, None, None)
 }
 
 /// DESKTOP-APP: [`spawn_user_image_bg`] for a launch NOBODY ASKED FOR — the compositor's own desktop
@@ -16986,17 +16986,17 @@ pub fn spawn_user_image_bg(bytes: &[u8]) -> Result<(u64, u64, u64), &'static str
 /// and has exactly one caller — and it is `wc`-gated, because that caller is.
 #[cfg(feature = "wc")]
 pub fn spawn_user_image_bg_no_autofocus(bytes: &[u8]) -> Result<(u64, u64, u64), &'static str> {
-    spawn_user_image_bg_inner(bytes, true, &[], None, None)
+    spawn_user_image_bg_inner(bytes, true, &[], None, None, None)
 }
 
 fn spawn_user_image_bg_inner(
     bytes: &[u8],
     no_autofocus: bool,
-    argv: &[&str], as_row: Option<usize>, pipe: Option<usize>,
+    argv: &[&str], as_row: Option<usize>, pipe: Option<usize>, early: Option<&str>,
 ) -> Result<(u64, u64, u64), &'static str> {
     let _ = no_autofocus; #[cfg(feature = "wc")] let app_t0 = crate::arch::now_cycles(); #[cfg(feature = "wc")] if oneinstance_gate(no_autofocus, argv, as_row, pipe.is_some()) { return Err(ONEINSTANCE_RAISED); } // APPLAUNCH (B678): the exec stamp, before the ELF load. ⚠ LINE-NEUTRAL fold. ONEINSTANCE (B734): a second launch of a running program by the user's verb raises it instead of spawning (file tail), BEFORE any slot exists; LINE-NEUTRAL fold, code before this line's first `//`. — // read only on `wc` builds — see `SLOT_NO_AUTOFOCUS`
     argv_fits(argv)?; // RING3ABI2 M2: refused BEFORE a slot exists
-    let (mapped, pi) = load_program_common(bytes)?; if let Some(i) = pipe { crate::pipe::bind(i, mapped.slot, pipe_gen(mapped.slot)); } super::memory::args_write(mapped.slot, argv); #[cfg(feature = "login")] slot_user_stamp(mapped.slot); #[cfg(feature = "login")] slot_user_inherit(mapped.slot, as_row); #[cfg(not(feature = "login"))] let _ = as_row; #[cfg(feature = "wc")] crate::procslot::launch::exec_stamp(mapped.slot, crate::video::wm::program_name(argv.first().copied().unwrap_or("-")), app_t0); /* APPLAUNCH (B678) */ #[cfg(feature = "busreg")] crate::bus_route::arm_early(mapped.slot, if as_row.is_none() { argv.first().copied() } else { None }); /* BUSREG-ARM-EARLY (B1164): the kernel launcher's own argv[0] (never ring-3 bytes) armed for the bus check before the task can run (bus_route tail) */ // LOGIN M1 — with a session open the slot runs AS THE USER (file tail); knob-off `#[cfg]`-erased. ⚠ LINE-NEUTRAL append.
+    let (mapped, pi) = load_program_common(bytes)?; if let Some(i) = pipe { crate::pipe::bind(i, mapped.slot, pipe_gen(mapped.slot)); } super::memory::args_write(mapped.slot, argv); #[cfg(feature = "login")] slot_user_stamp(mapped.slot); #[cfg(feature = "login")] slot_user_inherit(mapped.slot, as_row); #[cfg(not(feature = "login"))] let _ = as_row; #[cfg(feature = "wc")] crate::procslot::launch::exec_stamp(mapped.slot, crate::video::wm::program_name(argv.first().copied().unwrap_or("-")), app_t0); /* APPLAUNCH (B678) */ #[cfg(feature = "busreg")] crate::bus_route::arm_early(mapped.slot, early, as_row.is_some()); #[cfg(not(feature = "busreg"))] let _ = early; /* BUSREG-ARM-EARLY (B1164) + BUSREG-ARM-EARLY-RING3 (B1172): the early path the CALLER chose (a kernel road its own argv[0], SYS_SPAWN_PATH its kernel-opened path, never ring-3 argv) armed for the bus check before the task can run; `as_row` is the road label only (bus_route tail) */ // LOGIN M1 — with a session open the slot runs AS THE USER (file tail); knob-off `#[cfg]`-erased. ⚠ LINE-NEUTRAL append.
     // PROCREAP: mark the row SCAVENGEABLE before the task can exist. This is the one launch path whose
     // reaper is a shell HANDLE (`BG_JOBS`) rather than a held index, so it is the one path whose row can
     // be orphaned by losing that handle — and therefore the only one BGRUN-SCAV may reclaim. See the
@@ -24643,7 +24643,7 @@ fn busx_mbox_clear(row: usize) {
     mb.head = 0;
     mb.count = 0;
     for s in mb.slots.iter_mut() {
-        *s = None; // drops the box
+        #[cfg(feature = "busreg")] crate::bus_route::mbox_unread(row, s.as_ref().map(|m| &*m.frame)); *s = None; // drops the box. RELAY-RESET-SET (B1169): a relayed REQUEST still here was never read by the dying fulfiller; bus_route marks its relay id for on_exit (file tail). LINE-NEUTRAL fold.
     }
 }
 
@@ -30093,7 +30093,7 @@ pub fn run_user_image(name: &'static str, bytes: &[u8], deadline_ms: u64) -> Res
 /// RING3ABI2 M2: the background launcher WITH words — `bg <path> a b`, and a bare name that detaches.
 /// `argv[0]` is the word that named the program. Otherwise exactly [`spawn_user_image_bg`].
 pub fn spawn_user_image_bg_argv(bytes: &[u8], argv: &[&str]) -> Result<(u64, u64, u64), &'static str> {
-    spawn_user_image_bg_inner(bytes, false, argv, None, None)
+    spawn_user_image_bg_inner(bytes, false, argv, None, None, argv.first().copied())
 }
 
 /// RING3ABI2 M3: `SYS_WHOAMI(buf, len)` — who the CALLER's slot runs as. With `login`, a slot stamped
@@ -30859,7 +30859,7 @@ fn spawn_path_checked(path: &str, words: &[alloc::string::String], who: &str, ro
     let note = super::elf::app_flags(&bytes);
     let argv: alloc::vec::Vec<&str> = words.iter().map(|s| s.as_str()).collect();
     let pipe_idx = pipe_reserve(pipe, row).map_err(|why| (EAGAIN, why))?; crate::prof::launching(path); // RING3PIPE (B609): reserved BEFORE a slot exists, so a full table refuses the launch, not the pipe. ⚠ LINE-NEUTRAL fold.
-    match spawn_user_image_bg_inner(&bytes, false, &argv, Some(row), pipe_idx) {
+    match spawn_user_image_bg_inner(&bytes, false, &argv, Some(row), pipe_idx, Some(path)) { // BUSREG-ARM-EARLY-RING3 (B1172): the kernel-opened path, never ring-3 argv
         Ok((pid, slot, entry)) => {
             crate::video::wm::app_name_arm(crate::video::wm::owner_of_launch(slot), path);
             crate::fs::appres::sight(path); pipe_named(pipe_idx, pid); // RING3PIPE (B609): the pid names the pipe. ⚠ LINE-NEUTRAL fold.
@@ -31940,7 +31940,7 @@ static ONEINST_LAST_RC: core::sync::atomic::AtomicI64 = core::sync::atomic::Atom
 #[cfg(feature = "wc")]
 pub fn spawn_user_image_bg_argv_new(bytes: &[u8], argv: &[&str]) -> Result<(u64, u64, u64), &'static str> {
     ONEINST_NEW.store(true, Ordering::Release);
-    let r = spawn_user_image_bg_inner(bytes, false, argv, None, None);
+    let r = spawn_user_image_bg_inner(bytes, false, argv, None, None, argv.first().copied());
     ONEINST_NEW.store(false, Ordering::Release);
     r
 }

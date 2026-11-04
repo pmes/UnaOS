@@ -327,13 +327,7 @@ impl Viewer {
         }
         let back = fk == Some(FieldKey::Backspace);
         let del = fk == Some(FieldKey::Delete); // VUGFACESAVEASCARET (SR593): the char after the caret
-        let ch = {
-            let mut it = k.chars();
-            match (it.next(), it.next()) {
-                (Some(c), None) if fk.is_none() => Some(c), // VUGFACEFIELDKEYS (SR599): a named key is never typed
-                _ => None,
-            }
-        };
+        let ch = sketch::field_char(k); // VUGFACEFIELDKEYSREST (SR605): the one typed char (a named key is never typed)
         if !sketch::type_text_at(&mut f.text, &mut f.caret, ch, back, del) { // VUGFACESAVEASCARET (SR593): at the caret, the `:` line's road
             return Some(false);
         }

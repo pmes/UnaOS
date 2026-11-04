@@ -171,6 +171,7 @@ fn deleting_the_extrude_row_removes_the_body() {
     while vw.view.design.journal.cursor > x {
         assert!(key(&mut vw, "Up"));
     }
+    assert!(key(&mut vw, "\u{f700}") && key(&mut vw, "Down") && vw.view.design.journal.cursor == x, "VUGFACEFIELDKEYSREST (SR605): the Cocoa Up moves the panel cursor as Up does");
     assert!(key(&mut vw, "Delete"));
     assert!(vw.view.design.body.is_none(), "{:?}", vw.view.design.journal.note);
     assert!(!doc(&vw).stmts.iter().any(|s| matches!(s, Stmt::Extrude { .. })));

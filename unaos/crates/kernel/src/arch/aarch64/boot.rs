@@ -953,7 +953,7 @@ pub fn slot_page_is_data(s: usize, va: u64) -> bool {
 /// ELF-1 behavior is a special case: one task, refcount 1, so the first (and only) release is the final one
 /// and the flush+free run exactly as before.
 pub unsafe fn teardown_user_slot(asid: u64) {
-    debug_assert!(asid >= 1 && slot_known((asid - 1) as usize), "teardown: asid out of range"); crate::video::wm::app_name_forget(asid); // SO22: on aarch64 the wm owner IS the asid (slot + 1) — the name dies with the slot, so a recycled slot cannot wear its predecessor's
+    debug_assert!(asid >= 1 && slot_known((asid - 1) as usize), "teardown: asid out of range"); // ARMFORGET-SO22 (B1171): the name+path forget moved to `syscall::clear_handle_row`'s ASID_GEN line — the FINAL release only (here, at entry, it ran on every thread's exit and wiped a live tenant's records)
     // The ASIDE1IS operand carries the ASID in Xt[63:48]; assert `asid << 48` round-trips (a mis-encoded
     // operand would flush the wrong ASID — silent on QEMU, a stale-entry bug on metal).
     debug_assert_eq!((asid << 48) >> 48, asid, "teardown: ASID does not fit Xt[63:48]");

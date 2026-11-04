@@ -985,7 +985,7 @@ pub fn selftest() {
         codec as u8, set_ok as u8, file_ok as u8, no_temp as u8, refused as u8, held as u8, restored as u8,
         loadclamp_ok as u8, clamp_ok as u8, if wire_ok { "shared" } else { "diverged" }, rows, if ok { "PASS" } else { "FAIL" }
     );
-    settingsfiles_selftest(); unset_selftest(); unset_bus_selftest(); // PREFS-UNSET-VERB (rmbp-ledger B1161): the unset KAT (file tail). PREFS-UNSET-BUS (rmbp-ledger B1166): the bus UNSET KAT (file tail). LINE-NEUTRAL fold, code first
+    settingsfiles_selftest(); unset_selftest(); unset_bus_selftest(); prefscap_path_selftest(); // PREFS-UNSET-VERB (rmbp-ledger B1161): the unset KAT (file tail). PREFS-UNSET-BUS (rmbp-ledger B1166): the bus UNSET KAT (file tail). LINE-NEUTRAL fold, code first PREFSCAP-PATH (rmbp-ledger B1170): the path-keyed cap KAT (file tail).
 }
 
 /// SETTINGSFILES (B407, R98) — `tests prefs`' second line (never at boot, R80): a program declares a stanza
@@ -1110,7 +1110,7 @@ pub fn bus_fulfil_from(verb: u8, body: &[u8], in_session: bool, owner: u64, text
     let caller = match caller_name(owner, &mut nb) {
         Some(p) => prefs_core::cap::Caller::Program(p),
         None => prefs_core::cap::Caller::Anon,
-    };
+    }; let (caller, demoted) = prefscap_path(owner, caller); // PREFSCAP-PATH (rmbp-ledger B1170): `prefs` is Principia only from /apps/PREFS.ELF, else Anon (file tail). LINE-NEUTRAL fold, code first
     if verb == prefs_core::wire::VERB_SET && in_session {
         if let Some((ns, k, _)) = prefs_core::wire::parse_set(body) {
             if !prefs_core::cap::may_set(caller, ns, k) {
@@ -1130,7 +1130,7 @@ pub fn bus_fulfil_from(verb: u8, body: &[u8], in_session: bool, owner: u64, text
             serial_println!("[prefs] set {}.{} refused: caller is not the session user", ns, k);
         }
     }
-    unset_bus_note(verb, body, caller, prefs_core::wire::fulfil_as(&mut KernelStore, verb, body, in_session, caller, text)) // PREFS-UNSET-BUS (rmbp-ledger B1166): a ring-3 UNSET is said with its caller (file tail). LINE-NEUTRAL fold, code first
+    prefscap_set_note(verb, body, demoted, unset_bus_note(verb, body, caller, prefs_core::wire::fulfil_as(&mut KernelStore, verb, body, in_session, caller, text))) // PREFS-UNSET-BUS (rmbp-ledger B1166): a ring-3 UNSET is said with its caller (file tail). LINE-NEUTRAL fold, code first PREFSCAP-PATH (rmbp-ledger B1170): a demoted caller's SET is said with path=foreign (file tail).
 }
 
 #[cfg(any(feature = "aarch64_el0", target_arch = "x86_64"))]
@@ -1899,8 +1899,8 @@ pub(crate) fn store_read(p: &str) -> Option<Vec<u8>> {
 // reload already keep — removed from the tree (never the default written into the user's file), its domain saved by the
 // same swap (`KernelPersist` -> `save_domain`, rolled back on a failed save), then ONE post through [`post_changes`] of
 // [`default_applied`]: the static or declared default as `Some`, SR169's unset form (`None`) only for a Consumer-default or
-// undeclared key. So a static-default machine key reaches `machine_mirror` as `Some(<default>)` (`=<default>`), and
-// B1154's `=unset` arm stays dark at this cut. Operator-only: the bus has no unset request (PREFS-UNSET-BUS owed). The
+// undeclared key; MACHINE-KEY-DEFAULT-PIN (B1173): a `MACHINE_KEYS` row posts the unset form ([`unset_posted`]), so the
+// mirror removes it (B1154's `=unset`). The bus unset is PREFS-UNSET-BUS (B1166, `store_unset` below). The
 // writers column admits the operator for every key (`prefs_core::schema::Writer`), so there is no new check.
 // Wire: `[prefs] unset <ns>.<key> ok=1` (+ `[prefs] changed <ns>.<key>`), `ok=1 was=unset`, `ok=0 why=<e>`.
 
@@ -1926,7 +1926,7 @@ pub fn unset(ns: &str, k: &str) -> Result<bool, SetError> {
     }
     serial_println!("[prefs] unset {}.{} ok=1", ns, k);
     serial_println!("[prefs] changed {}.{}", ns, k);
-    let _ = post_changes(&[(String::from(ns), String::from(k), default_applied(ns, k))]);
+    let _ = post_changes(&[(String::from(ns), String::from(k), unset_posted(ns, k))]); // MACHINE-KEY-DEFAULT-PIN (rmbp-ledger B1173): a MACHINE_KEYS row posts SR169's unset form, every other key `default_applied` (file tail). LINE-NEUTRAL fold, code first
     Ok(true)
 }
 
@@ -2121,7 +2121,7 @@ fn unset_bus_note(verb: u8, body: &[u8], caller: prefs_core::cap::Caller<'_>, st
         let a = prefs_core::wire::parse_get(body).map(|_| core::str::from_utf8(body).unwrap_or("?")).unwrap_or("<malformed>");
         let who = prefs_caller_text(caller);
         if st == 0 {
-            serial_println!("[prefs] unset {} ok=1 via=bus by={}", a, who);
+            serial_println!("[prefs] unset {} ok=1 posted={} via=bus by={}", a, unset_posted_word(body), who); // MACHINE-KEY-DEFAULT-PIN (rmbp-ledger B1173): what the one post carried (file tail). Named in-place hunk
         } else if st == prefs_core::wire::ENOENT {
             serial_println!("[prefs] unset {} ok=1 was=unset via=bus by={}", a, who);
         } else {
@@ -2188,7 +2188,7 @@ fn unset_bus_legs() {
     let outside = call(VERB_SET, b"app.pcaptest.level\x003", true, &mut o) == 0
         && call(VERB_UNSET, b"app.pcaptest.level", false, &mut o) == EACCES
         && get(app, KEY).is_some();
-    let name = call(VERB_UNSET, b"app", true, &mut o) == EINVAL;
+    let name = call(VERB_UNSET, b"app", true, &mut o) == EINVAL; machine_unset_leg(OWNER); // MACHINE-KEY-DEFAULT-PIN (rmbp-ledger B1173): the machine-key bus unset leg, while the scratch name is armed (file tail). LINE-NEUTRAL append, code first
     // Restore the name, the tree, ON_DISK and the domain file.
     crate::video::wm::app_name_forget(OWNER);
     let _ = TREE.lock().remove(app, KEY);
@@ -2208,5 +2208,210 @@ fn unset_bus_legs() {
         ":: PREFS-UNSET-BUS: unset={} body={} again={} foreign={} outside={} name={} restored={} -> {} ::",
         unset_st, if body { "frozen" } else { "MOVED" }, if again { "enoent" } else { "FAIL" }, if foreign { "refused" } else { "UNSET" },
         if outside { "refused" } else { "UNSET" }, if name { "einval" } else { "FAIL" }, restored as u8, if ok { "PASS" } else { "FAIL" }
+    );
+}
+
+// =================================================================================================
+// PREFSCAP-PATH (rmbp-ledger B1170) — TAIL-APPENDED. PREFSCAP named a ring-3 caller from its launcher-armed NAME
+// only (`caller_name`), so any image called PREFS.ELF was `prefs`, Principia's fulfiller, and `prefs_core::cap`
+// let it SET every key (vein.endpoint, system.login.items) through this fulfiller. B1163 (BUSREG-TAG-PATH) gave
+// wm the PATH each launcher loaded the image from (`wm::app_path_with`) and `bus_route` the rule that judges it
+// (`path_names` against `TAG_IMAGE`). [`bus_fulfil_from`] now asks it ONCE: a caller stamped `prefs` keeps
+// Principia's rights only when its path is `TAG_IMAGE`'s Principia image (`/apps/` byte-exact, the leaf any
+// case); from any other path, or with no path (the spelling never promotes), it is `Caller::Anon` — an
+// impostor, not a program owed a namespace: the schema's ring-3 rows, no declare. `prefs_core` stays path-free
+// and untouched. Knob-off (no `busreg`): no path record exists, [`prefscap_path`] is the identity.
+// Witness: `tests prefs` → `[prefs] set vein.endpoint ok=0 why=refused via=bus by=prefs path=foreign` and
+// `:: PREFSCAP-PATH: … -> PASS ::`.
+// =================================================================================================
+
+/// PREFSCAP-PATH — `c` as PREFSCAP may see it, and whether it was demoted. Takes only wm's leaf `APP_PATHS`
+/// (`bus_route::path_names` and `tag_image` take no lock).
+#[cfg(all(feature = "busreg", any(feature = "aarch64_el0", target_arch = "x86_64")))]
+fn prefscap_path(owner: u64, c: prefs_core::cap::Caller<'_>) -> (prefs_core::cap::Caller<'_>, bool) {
+    match c {
+        prefs_core::cap::Caller::Program(p) if p.eq_ignore_ascii_case(prefs_core::cap::PRINCIPIA) => {
+            let principia = crate::bus_route::tag_image(una_abi::BUS_VERB_R3PREF_SET)
+                .and_then(|img| crate::video::wm::app_path_with(owner, |path| crate::bus_route::path_names(path, img)))
+                == Some(true);
+            if principia {
+                (c, false)
+            } else {
+                (prefs_core::cap::Caller::Anon, true)
+            }
+        }
+        _ => (c, false),
+    }
+}
+
+/// PREFSCAP-PATH knob-off: no path record, nothing demoted (today's caller, unchanged).
+#[cfg(all(not(feature = "busreg"), any(feature = "aarch64_el0", target_arch = "x86_64")))]
+#[inline(always)]
+fn prefscap_path(_owner: u64, c: prefs_core::cap::Caller<'_>) -> (prefs_core::cap::Caller<'_>, bool) {
+    (c, false)
+}
+
+/// PREFSCAP-PATH — a DEMOTED caller's SET is said with its stamped name and `path=foreign` (B1166's why words);
+/// every other verb or caller passes `st` through silently.
+#[cfg(any(feature = "aarch64_el0", target_arch = "x86_64"))]
+#[inline(always)]
+fn prefscap_set_note(verb: u8, body: &[u8], demoted: bool, st: i64) -> i64 {
+    if demoted && verb == prefs_core::wire::VERB_SET {
+        let ok = (st == 0) as u8;
+        let why = match st {
+            0 => "",
+            prefs_core::wire::EACCES => " why=refused",
+            prefs_core::wire::EINVAL => " why=malformed",
+            _ => " why=io",
+        };
+        match prefs_core::wire::parse_set(body) {
+            Some((ns, k, _)) => {
+                serial_println!("[prefs] set {}.{} ok={}{} via=bus by={} path=foreign", ns, k, ok, why, prefs_core::cap::PRINCIPIA)
+            }
+            None => serial_println!("[prefs] set <malformed> ok={}{} via=bus by={} path=foreign", ok, why, prefs_core::cap::PRINCIPIA),
+        }
+    }
+    st
+}
+
+/// `tests prefs`' PREFSCAP-PATH line (B1170): a scratch wm owner named PREFS from `/home/una/PREFS.ELF` SETs
+/// `vein.endpoint` through [`bus_fulfil_from`] (-EACCES, the value kept) and is demoted to `Anon` (the schema's
+/// ring-3 rows only, no declare: pure cap checks, nothing written); `/apps/PREFS.ELF` and `/apps/prefs.elf` keep
+/// Principia, `/APPS/PREFS.ELF` and a pathless `PREFS.ELF` are demoted, a non-prefs name is never touched. The
+/// scratch name and path are forgotten.
+/// `:: PREFSCAP-PATH: foreign=refused anon=held apps=admitted case=admitted upper=demoted pathless=demoted other=kept restored=1 -> PASS ::`.
+#[cfg(feature = "witness")]
+fn prefscap_path_selftest() {
+    #[cfg(all(feature = "busreg", any(feature = "aarch64_el0", target_arch = "x86_64")))]
+    {
+        prefscap_path_legs();
+    }
+    #[cfg(not(all(feature = "busreg", any(feature = "aarch64_el0", target_arch = "x86_64"))))]
+    {
+        serial_println!(":: PREFSCAP-PATH: SKIP (no busreg path record on this build) ::");
+    }
+}
+
+#[cfg(all(feature = "witness", feature = "busreg", any(feature = "aarch64_el0", target_arch = "x86_64")))]
+fn prefscap_path_legs() {
+    use prefs_core::cap::{may_declare, may_set, Caller};
+    const OWNER: u64 = u64::MAX - 0x5F6; // beside B1166's 0x5F5: no launcher hands out an owner this high
+    ensure_loaded();
+    if crate::video::wm::app_name_armed(OWNER) {
+        serial_println!(":: PREFSCAP-PATH: SKIP (the scratch owner is named) ::");
+        return;
+    }
+    // Arm the scratch owner from `path`; `Some(demoted)` for the stamped caller, `None` = nothing armed.
+    let demoted = |path: &str| -> Option<bool> {
+        let _ = crate::video::wm::app_name_arm(OWNER, path);
+        let mut nb = [0u8; crate::video::wm::MAX_TITLE];
+        caller_name(OWNER, &mut nb).map(|p| {
+            let (c, d) = prefscap_path(OWNER, Caller::Program(p));
+            d == (c == Caller::Anon) && d
+        })
+    };
+    // L1 + L2: the foreign PREFS — demoted, its SET refused on the wire, the value kept; Anon's rows only.
+    let foreign_demoted = demoted("/home/una/PREFS.ELF") == Some(true);
+    let ep = get("vein", "endpoint");
+    let mut o = Vec::new();
+    let st = bus_fulfil_from(prefs_core::wire::VERB_SET, b"vein.endpoint\x00\"https://foreign.example/\"", true, OWNER, &mut o);
+    let foreign = foreign_demoted && st == prefs_core::wire::EACCES && get("vein", "endpoint") == ep;
+    let a = Caller::Anon;
+    let anon = foreign_demoted
+        && !may_set(a, "system", "login.items")
+        && !may_set(a, "app", "prefs.x")
+        && may_set(a, "system", "audio.volume")
+        && !may_declare(a, "prefs");
+    // L3: the Principia image keeps its rights; the directory is byte-exact, the leaf any case.
+    let apps = demoted("/apps/PREFS.ELF") == Some(false);
+    let case = demoted("/apps/prefs.elf") == Some(false);
+    let upper = demoted("/APPS/PREFS.ELF") == Some(true);
+    // L4: a relative arm clears the path row: the spelling alone never promotes.
+    let pathless = demoted("PREFS.ELF") == Some(true);
+    let other = demoted("/home/una/LUMEN.ELF") == Some(false);
+    crate::video::wm::app_name_forget(OWNER);
+    let restored = !crate::video::wm::app_name_armed(OWNER) && crate::video::wm::app_path_with(OWNER, |_| true).is_none();
+    let ok = foreign && anon && apps && case && upper && pathless && other && restored;
+    serial_println!(
+        ":: PREFSCAP-PATH: foreign={} anon={} apps={} case={} upper={} pathless={} other={} restored={} -> {} ::",
+        if foreign { "refused" } else { "ADMITTED" }, if anon { "held" } else { "FAIL" }, if apps { "admitted" } else { "DEMOTED" },
+        if case { "admitted" } else { "DEMOTED" }, if upper { "demoted" } else { "ADMITTED" }, if pathless { "demoted" } else { "ADMITTED" },
+        if other { "kept" } else { "DEMOTED" }, restored as u8, if ok { "PASS" } else { "FAIL" }
+    );
+}
+
+// ── MACHINE-KEY-DEFAULT-PIN (rmbp-ledger B1173, BP-storage-11) — TAIL-APPENDED ─────────────────────────────────────────
+// What [`unset`]'s ONE post carries. A key in [`MACHINE_KEYS`] posts SR169's unset form (`None`): the store no longer
+// holds it (GET answers -ENOENT), Principia's host store posts the same form for the same verb, every consumer re-reads
+// (the kernel's `changes_drain`, ring 3's theme HINT) or falls back per key (`settings::a11y_load("machine")`) and takes
+// the static default from `prefs_core::schema` (B1160 pins it static), and no consumer reads the frame's value; so
+// `machine_mirror` removes the key from the machine copy by B1154's None arm instead of writing the default literal.
+// Every other key keeps [`default_applied`]. The delete watch and the reload still post `default_applied` (UNSET-POST-ROADS
+// owed). Wire: `[prefs] machine settings/<d> system.<k>=unset wrote=1`, `[prefs] unset <a> ok=1 posted=<unset|lit> via=bus …`.
+
+/// The PrefChanged value [`unset`] posts for `ns`/`k` (see the block above). Called with no prefs lock held.
+fn unset_posted(ns: &str, k: &str) -> Option<prefs_core::schema::Applied> {
+    if ns == NS && MACHINE_KEYS.contains(&k) {
+        return None;
+    }
+    default_applied(ns, k)
+}
+
+/// [`unset_bus_note`]'s `posted=` word: `unset`, or the literal [`unset_posted`] carried.
+#[cfg(any(feature = "aarch64_el0", target_arch = "x86_64"))]
+fn unset_posted_word(body: &[u8]) -> String {
+    match prefs_core::wire::parse_get(body).and_then(|(ns, k)| unset_posted(ns, k)) {
+        Some(a) => a.value.to_literal(),
+        None => String::from("unset"),
+    }
+}
+
+/// `tests prefs`' machine-key bus unset leg (B1173), from [`unset_bus_legs`] while its scratch owner is armed: SET then
+/// UNSET `system.accessibility.reduce_motion` (a ring-3 settable row) through [`bus_fulfil_from`]; the post is the unset
+/// form, the key is gone, and (in a session) the machine copy no longer holds it. The session domain file, the machine
+/// file, the tree and ON_DISK are restored byte for byte.
+/// `:: MACHINE-KEY-UNSET: set=1 unset=0 posted=unset mirror=<removed|nosession> restored=1 -> PASS ::`.
+#[cfg(all(feature = "witness", any(feature = "aarch64_el0", target_arch = "x86_64")))]
+fn machine_unset_leg(owner: u64) {
+    use prefs_core::wire::{VERB_SET, VERB_UNSET};
+    const K: &str = "accessibility.reduce_motion";
+    let d = prefs_core::files::domain_of(NS, K);
+    let sp = domain_path(&d);
+    let mp = alloc::format!("/{}/{}", prefs_core::files::DIR, d);
+    let (s0, m0) = (read_all(&sp), read_all(&mp));
+    let (tree0, on_disk0) = (TREE.lock().clone(), ON_DISK.lock().clone());
+    let mut o = Vec::new();
+    let set = bus_fulfil_from(VERB_SET, b"system.accessibility.reduce_motion\x00true", true, owner, &mut o) == 0;
+    o.clear();
+    let st = bus_fulfil_from(VERB_UNSET, b"system.accessibility.reduce_motion", true, owner, &mut o);
+    let posted = unset_posted(NS, K).is_none() && get(NS, K).is_none();
+    let session = home().is_some_and(|h| !h.is_empty());
+    let held = read_all(&mp).and_then(|b| String::from_utf8(b).ok()).and_then(|t| PrefTree::parse(&t).ok()).is_some_and(|t| t.get(NS, K).is_some());
+    let mirror = if !session {
+        "nosession"
+    } else if held {
+        "KEPT"
+    } else {
+        "removed"
+    };
+    // Restore the files, the tree and ON_DISK.
+    let mt = crate::shell::vfs_mount_table();
+    for (p, b) in [(&sp, &s0), (&mp, &m0)] {
+        match b {
+            Some(b) => {
+                let _ = write_all(p, b);
+            }
+            None => {
+                let _ = mt.unlink(p, crate::fs::vfs::KERNEL_PRINCIPAL);
+            }
+        }
+    }
+    *TREE.lock() = tree0;
+    *ON_DISK.lock() = on_disk0;
+    let restored = read_all(&sp) == s0 && read_all(&mp) == m0;
+    let ok = set && st == 0 && posted && mirror != "KEPT" && restored;
+    serial_println!(
+        ":: MACHINE-KEY-UNSET: set={} unset={} posted={} mirror={} restored={} -> {} ::",
+        set as u8, st, if posted { "unset" } else { "VALUE" }, mirror, restored as u8, if ok { "PASS" } else { "FAIL" }
     );
 }

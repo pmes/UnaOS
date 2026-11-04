@@ -233,7 +233,7 @@ fn machine_store_leg(mt: &MountTable) -> bool {
     let plant = alloc::format!("{}/machinestore-plant", dir);
     let _ = mt.unlink(&plant, KERNEL_PRINCIPAL);
     let _ = mt.remove_attr(&dir, "owner", KERNEL_PRINCIPAL);
-    let pe = path_write_as(&plant, una_abi::PATH_W_TRUNC, 0, b"[system]\n", "anon");
+    let pe: i64 = if mt.create(&plant, NodeKind::File, KERNEL_PRINCIPAL).is_ok() && mt.write(&plant, 0, b"[system]\n", KERNEL_PRINCIPAL).is_ok() && mt.set_attr(&plant, "owner", AttrValue::Str(String::from("anon")), KERNEL_PRINCIPAL).is_ok() { 0 } else { -1 }; // MACHINESTOREKERNELONLY (B1174): the VFS path wall refuses ring 3's plant at any stamp state, so the pre-wall plant is laid at kernel authority carrying the `owner=anon` row a ring-3 create stamped (fs/vfs.rs create). Named in-place hunk
     let restamped = stamp_store(mt, &dir);
     let plant_tok = if pe < 0 { "unplanted" } else if crate::prefs::store_read(&plant).is_none() { "refused" } else { "READ" };
     let _ = mt.unlink(&plant, KERNEL_PRINCIPAL);
@@ -252,19 +252,23 @@ fn machine_store_leg(mt: &MountTable) -> bool {
         let _ = mt.remove_dir(&dir, KERNEL_PRINCIPAL);
     }
     let tok = |e: i64| if e == una_abi::EACCES { "refused" } else if e >= 0 { "ADMITTED" } else { "error" };
-    let pass = owned && we == una_abi::EACCES && ce == una_abi::EACCES && read && restamped && plant_tok == "refused" && boot_tok == "refused-at-create"; // MACHINESTOREPLANT (B1156): the plant leg joins this leg's PASS; MACHINESTORESTAMPRING3 (B1162): so does the boot step
+    let (fat_create, fat_rename, fat_near) = machine_store_fat_leg(); // MACHINESTOREKERNELONLY (B1174): the path wall on a scratch FAT mount (file tail). Named in-place hunk
+    let pass = fat_create && fat_rename && fat_near && owned && we == una_abi::EACCES && ce == una_abi::EACCES && read && restamped && plant_tok == "refused" && boot_tok == "refused-at-create"; // MACHINESTOREPLANT (B1156): the plant leg joins this leg's PASS; MACHINESTORESTAMPRING3 (B1162): so does the boot step
     serial_println!(
-        ":: MACHINESTORE: owner={} write={} create={} read={} plant={} boot={} -> {} :: by=anon target={} errno={} made_dir={} ::",
+        ":: MACHINESTORE: owner={} write={} create={} read={} plant={} boot={} fat-create={} fat-rename={} -> {} :: by=anon target={} errno={} made_dir={} fat_near={} ::",
         if owned { SYSTEM_OWNER } else { "none" },
         tok(we),
         tok(ce),
         if read { "ok" } else { "REFUSED" },
         plant_tok,
         boot_tok,
+        if fat_create { "refused" } else { "ADMITTED" },
+        if fat_rename { "refused" } else { "ADMITTED" },
         if pass { "PASS" } else { "FAIL" },
         if is_general { "general" } else { "scratch" },
         we,
         made_dir as u8,
+        if fat_near { "ok" } else { "REFUSED" },
     );
     pass
 }
@@ -359,4 +363,31 @@ fn store_open_leg(admin: Option<&str>) -> bool {
         P,
     );
     pass
+}
+
+// ── MACHINESTOREKERNELONLY (rmbp-ledger B1174, BP-storage-11) — TAIL-APPENDED ─────────────────────────────────────────
+// The FAT leg of the MACHINESTORE witness: the VFS path wall (`MountTable::machine_store_wall`, fs/vfs.rs tail) on a
+// scratch table whose `/` is a FAT mount OWNED by `anon` (the shell.rs fixture shape), so the backend's own posture
+// admits `anon` and only the wall can refuse. Both refusals land before any I/O (the root backend is the same object).
+// Wire: the `fat-create=` / `fat-rename=` tokens and the `fat_near=` trailer of `:: MACHINESTORE: ... ::`.
+
+/// `(fat_create, fat_rename, fat_near)`: an `anon` create of `/settings/machinestore-fat.toml` and an `anon` rename of
+/// `/machinestore-fat.toml` over `/settings/prefs.toml` are both `Denied`; a near-miss folder (`settingsx`) by `anon` and
+/// a store path by the kernel both pass the wall. A wrongly admitted create is removed at kernel authority.
+#[cfg(target_arch = "x86_64")]
+fn machine_store_fat_leg() -> (bool, bool, bool) {
+    let mut t = MountTable::new();
+    t.mount("/", alloc::boxed::Box::new(crate::fs::vfs::FatBackend::new("fat", "anon", true)));
+    const NEW: &str = "/settings/machinestore-fat.toml";
+    let c = t.create(NEW, NodeKind::File, "anon");
+    if c.is_ok() {
+        let _ = t.unlink(NEW, KERNEL_PRINCIPAL);
+    }
+    let fat_create = matches!(c, Err(VfsError::Denied));
+    let fat_rename = matches!(t.rename("/machinestore-fat.toml", "/settings/prefs.toml", "anon"), Err(VfsError::Denied));
+    let fat_near = match t.resolve("/") {
+        Ok((root, _)) => t.machine_store_wall(root, "settingsx/a", "anon").is_ok() && t.machine_store_wall(root, "settings/x", KERNEL_PRINCIPAL).is_ok(),
+        Err(_) => false,
+    };
+    (fat_create, fat_rename, fat_near)
 }

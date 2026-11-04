@@ -1010,13 +1010,7 @@ impl Viewer {
             }
             let back = fk == Some(FieldKey::Backspace);
             let del = fk == Some(FieldKey::Delete); // VUGFACECOMMANDCARET (SR587): the char after the caret
-            let ch = {
-                let mut it = k.chars();
-                match (it.next(), it.next()) {
-                    (Some(c), None) if fk.is_none() => Some(c), // VUGFACEFIELDKEYS (SR599): a named key is never typed
-                    _ => None,
-                }
-            };
+            let ch = crate::sketch::field_char(k); // VUGFACEFIELDKEYSREST (SR605): the one typed char (a named key is never typed)
             let typed = crate::sketch::type_text_at(&mut e.text, &mut e.caret, ch, back, del); // VUGFACECOMMANDCARET (SR587): at the caret
             if typed {
                 e.refused = None;

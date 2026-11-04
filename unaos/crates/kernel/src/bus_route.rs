@@ -345,7 +345,7 @@ pub fn on_exit(ops: &Ops, row: usize) {
         }
     });
     while let Some(p) = take_pending(|p| p.ful_row == row) {
-        if (ops.rgen)(p.caller_row) == p.caller_gen && deliver(ops, &p, ECONNRESET as i32, &[]) {
+        unread_handoff(row, &p); if (ops.rgen)(p.caller_row) == p.caller_gen && deliver(ops, &p, ECONNRESET as i32, &[]) { // RELAY-RESET-SET (B1169): a kernel-client SET whose frame the dying fulfiller never read is marked for `prefs_client` BEFORE the reset is delivered (file tail). LINE-NEUTRAL fold.
             ORPHAN.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -518,7 +518,7 @@ pub fn selftest(fx: &Fixture) {
     } else {
         serial_println!(":: BANDY3: registered={} relayed={} replied={} orphan={} w={:#05x}/{:#05x} verbs={}/{} -> FAIL ::", rg, rl, rp, or, w, ALL, vg, vl);
     }
-    tagid_selftest(fx); armearly_selftest(fx); /* BUSREG-ARM-EARLY (B1164): the early-arm legs, after the BUSREG-TAGID line (file tail) */ // BUSREG-TAG-IDENTITY (B1157): the identity legs, after the BANDY3 line
+    tagid_selftest(fx); armearly_selftest(fx); unreadset_selftest(fx); /* RELAY-RESET-SET (B1169): the unread-mark legs (file tail). BUSREG-ARM-EARLY (B1164): the early-arm legs, after the BUSREG-TAGID line (file tail) */ armforget_selftest(fx); /* ARMFORGET-CHAIN (B1171): the teardown-forget legs (file tail) */ // BUSREG-TAG-IDENTITY (B1157): the identity legs, after the BANDY3 line
 }
 
 /// HOLOCRON2 (rmbp-ledger B355): does `verb` have a registration right now? (Generation not checked: a row
@@ -577,7 +577,7 @@ pub static TAGID_REFUSED: AtomicU32 = AtomicU32::new(0);
 pub static TAGID_DROPPED: AtomicU32 = AtomicU32::new(0);
 
 /// The image the kernel names for `verb`, `None` = an open tag.
-fn tag_image(verb: u8) -> Option<&'static str> {
+pub fn tag_image(verb: u8) -> Option<&'static str> {
     TAG_IMAGE.iter().find(|&&(lo, hi, _)| (lo..=hi).contains(&verb)).map(|&(_, _, img)| img)
 }
 
@@ -840,7 +840,7 @@ fn tagpath_id(row: usize, img: &str, buf: &mut [u8; crate::video::wm::MAX_TITLE]
 }
 
 /// Is the loaded `path` the image `img` (`/apps/<LEAF>`)? The directory byte-exact, the leaf any case.
-fn path_names(path: &str, img: &str) -> bool {
+pub fn path_names(path: &str, img: &str) -> bool {
     const DIR: &str = "/apps/";
     match (path.strip_prefix(DIR), img.strip_prefix(DIR)) {
         (Some(leaf), Some(want)) => !leaf.is_empty() && leaf.eq_ignore_ascii_case(want),
@@ -853,7 +853,7 @@ fn path_names(path: &str, img: &str) -> bool {
 // launcher arms a program's name only AFTER the spawn made the task runnable (WINTITLE-LATE), and PREFS.ELF
 // registers as its second syscall. The arch spawn bodies now arm the kernel launcher's own argv[0] at the mint,
 // before the task exists (x86 `spawn_user_image_bg_inner`, aarch64 `spawn_user_image_bg_piped`, one line each;
-// never on the ring-3 SYS_SPAWN_PATH road, whose argv is ring-3 bytes — BUSREG-ARM-EARLY-RING3, owed), into wm's
+// the ring-3 SYS_SPAWN_PATH road passes its kernel-opened path, never its argv — BUSREG-ARM-EARLY-RING3 B1172), into wm's
 // early record (`wm::app_name_arm_early`), stamped with the row's generation. `row_name` and `tagpath_id` read it
 // only when no launcher-armed name / path exists, and only at the row's CURRENT generation, so a launched
 // fulfiller is judged at REGISTER, a squatter early-named otherwise is refused there, and the relay gate stays
@@ -864,9 +864,9 @@ fn path_names(path: &str, img: &str) -> bool {
 /// Early records armed since boot (monotonic).
 pub static ARMEARLY_ARMED: AtomicU32 = AtomicU32::new(0);
 
-/// The arch spawn body's arm: `path` is the kernel launcher's argv[0] (`None` on the ring-3 road or an argv-less
-/// launch: nothing armed). Called before the task is spawned; takes only wm's leaf lock.
-pub fn arm_early(row: usize, path: Option<&str>) {
+/// The arch spawn body's arm: `path` is the early path the body's CALLER chose (a kernel road's argv[0], the ring-3
+/// road's kernel-opened path; `None` = nothing armed); `ring3` labels the road only. Takes only wm's leaf lock.
+pub fn arm_early(row: usize, path: Option<&str>, ring3: bool) {
     let Some(path) = path else { return };
     let rg = (crate::arch::syscall::busreg_ops().rgen)(row);
     let armed = crate::video::wm::app_name_arm_early(crate::video::wm::owner_of_launch(row as u64), rg, path);
@@ -874,8 +874,8 @@ pub fn arm_early(row: usize, path: Option<&str>) {
         ARMEARLY_ARMED.fetch_add(1, Ordering::Relaxed);
     }
     serial_println!(
-        "[busreg] arm-early row={} gen={} name={} path={} armed={}",
-        row, rg, crate::video::wm::program_name(path), if path.starts_with('/') { path } else { "-" }, armed as u8
+        "[busreg] arm-early row={} gen={} name={} path={} armed={} road={}",
+        row, rg, crate::video::wm::program_name(path), if path.starts_with('/') { path } else { "-" }, armed as u8, if ring3 { "ring3" } else { "kernel" }
     );
 }
 
@@ -923,14 +923,14 @@ fn armearly_selftest(fx: &Fixture) {
     let mut w = 0u32;
 
     // E1: early-named as another program (by its /apps/ path) -> refused at REGISTER, no late arm needed.
-    arm_early(f, Some("/apps/PROBE.ELF"));
+    arm_early(f, Some("/apps/PROBE.ELF"), false);
     let n = crate::bus::build_request(BUS_VERB_REGISTER, 71, &[set], &mut buf);
     let refused = (fx.send)(f, &buf[..n]) == 0 && matches!((fx.pop)(f).as_deref().and_then(parse), Some(h) if h.status == EACCES as i32 && h.corr == 71);
     if refused && lookup(fx.ops, set).is_none() {
         w |= 1 << 0;
     }
     // E2: early-armed as the fulfiller's image, still no late arm -> registered AND relayed (B1157 dropped it).
-    arm_early(f, Some("/apps/PREFS.ELF"));
+    arm_early(f, Some("/apps/PREFS.ELF"), false);
     let n = crate::bus::build_request(BUS_VERB_REGISTER, 72, &[get, set], &mut buf);
     let ok = (fx.send)(f, &buf[..n]) == 0 && matches!((fx.pop)(f).as_deref().and_then(parse), Some(h) if h.status == 0 && h.corr == 72);
     let n = crate::bus::build_request(get, 73, b"ui.theme", &mut buf);
@@ -959,19 +959,241 @@ fn armearly_selftest(fx: &Fixture) {
     on_exit(fx.ops, f);
     (fx.clear)(a);
     (fx.clear)(f);
+    // E4 (BUSREG-ARM-EARLY-RING3 B1172): the ring-3 road's arm (SYS_SPAWN_PATH's kernel-opened path) -> admitted
+    // at REGISTER as the fulfiller, no late arm.
+    arm_early(f, Some("/apps/PREFS.ELF"), true);
+    let n = crate::bus::build_request(BUS_VERB_REGISTER, 76, &[get, set], &mut buf);
+    let r3 = (fx.send)(f, &buf[..n]) == 0 && matches!((fx.pop)(f).as_deref().and_then(parse), Some(h) if h.status == 0 && h.corr == 76);
+    if r3 && matches!(fulfiller_row(set), Some((r, _)) if r == f) {
+        w |= 1 << 3;
+    }
+    on_exit(fx.ops, f);
+    (fx.clear)(a);
+    (fx.clear)(f);
     on_exit(fx.ops, a);
     crate::video::wm::app_name_early_forget(owner_f);
-    const ALL: u32 = (1 << 3) - 1;
+    const ALL: u32 = (1 << 4) - 1;
     let armed = ARMEARLY_ARMED.load(Ordering::Relaxed);
     if w == ALL {
-        serial_println!(":: BUSREG-ARMEARLY: probe=refused-at-register prefs=relayed-early stale=dropped armed={} -> PASS ::", armed);
+        serial_println!(":: BUSREG-ARMEARLY: probe=refused-at-register prefs=relayed-early stale=dropped ring3=registered-early armed={} -> PASS ::", armed);
     } else {
         serial_println!(
-            ":: BUSREG-ARMEARLY: probe={} prefs={} stale={} armed={} w={:#x}/{:#x} -> FAIL ::",
+            ":: BUSREG-ARMEARLY: probe={} prefs={} stale={} ring3={} armed={} w={:#x}/{:#x} -> FAIL ::",
             if w & 1 != 0 { "refused-at-register" } else { "OPEN" },
             if w & 2 != 0 { "relayed-early" } else { "DROPPED" },
             if w & 4 != 0 { "dropped" } else { "KEPT" },
+            if w & 8 != 0 { "registered-early" } else { "REFUSED" },
             armed, w, ALL
+        );
+    }
+}
+
+// =================================================================================================
+// BUSREG-ARM-EARLY-RING3 (rmbp-ledger B1172) — TAIL-APPENDED. The spawn bodies take the early path as an argument
+// (x86 `spawn_user_image_bg_inner`, aarch64 `spawn_user_image_bg_piped`: `early`), chosen by each CALLER: a kernel
+// road passes its own argv[0], SYS_SPAWN_PATH's `spawn_path_checked` the path the kernel opened, apptrust passed and
+// read the image from (the string its late `app_name_arm` records), never ring-3 argv. The mint's as_row / ring3
+// trust branch is retired; `arm_early`'s `ring3` labels the road only. Witness: `tests bandy3` E4 (`ring3=`).
+// =================================================================================================
+
+// RELAY-RESET-SET (rmbp-ledger B1169) — TAIL-APPENDED. RELAY-RESET-FALLBACK (B1165) left a kernel-client SET
+// whose fulfiller dies mid-relay refused -ECONNRESET, because the holder may have committed it. Two truths sit
+// under that reset and only the ARCH's mailbox clear (x86 `busx_mbox_clear`, aarch64 `bus_mbox_clear`, run on
+// the teardown line after the generation bump and just before `on_exit`) can tell them apart: a relayed
+// REQUEST still in a slot was never MRECV'd (UNREAD: the holder never saw it); a frame the holder popped is
+// gone (READ: committed-or-not is unknowable). The clear reports each REQUEST frame it drops through
+// `mbox_unread` (the relay id is the frame's `corr`, kernel-built by `route_request`, so ring 3 cannot forge
+// it); `on_exit`'s sweep takes the mark per pending relay in `unread_handoff` and, for a kernel-client SET,
+// hands the CLIENT's corr to `prefs_client::note_set_unread` BEFORE `deliver` queues the -ECONNRESET. The
+// reply frame is unchanged for every caller (a status in it would be forgeable: `fulfiller_reply` passes a
+// live holder's status verbatim). `UNREAD` is a LEAF lock (taken under the arch mailbox SpinMutex, IRQs
+// masked, and in `on_exit` with PEND released); full = the oldest mark is overwritten, so a lost mark leaves
+// the SET -ECONNRESET (fail-closed, B1165's behaviour).
+// Witness: `tests bandy3` → `:: RELAY-RESET-SET: unread=marked read=unmarked handoff=once -> PASS ::`.
+// =================================================================================================
+
+/// (row, relay id) of relayed REQUEST frames a mailbox clear dropped unread; a ring, next slot in `.1`.
+static UNREAD: crate::sync::Mutex<([(usize, u32); PEND_CAP], usize)> = crate::sync::Mutex::new(([(usize::MAX, 0u32); PEND_CAP], 0));
+
+/// The arch mailbox clear's report: `frame` (a slot's frame, `None` = empty slot) is being dropped from
+/// `row`'s mailbox without being read. A relayed REQUEST (a fulfiller tag, kernel-built) marks its relay id.
+pub fn mbox_unread(row: usize, frame: Option<&[u8]>) {
+    let Some(f) = frame else { return };
+    let Ok(h) = crate::bus::frame_parse(f) else { return };
+    if h.kind != crate::bus::BUS_KIND_REQUEST || h.verb < BUS_VERB_FULFIL_MIN || h.corr == 0 {
+        return;
+    }
+    locked(|| {
+        let mut u = UNREAD.lock();
+        let i = u.1;
+        u.0[i] = (row, h.corr);
+        u.1 = (i + 1) % PEND_CAP;
+    });
+}
+
+/// Take (clear) the unread mark of relay `relay` on fulfiller row `row`. `true` = the frame was never read.
+fn take_unread(row: usize, relay: u32) -> bool {
+    if relay == 0 {
+        return false;
+    }
+    locked(|| {
+        let mut u = UNREAD.lock();
+        match u.0.iter().position(|&e| e == (row, relay)) {
+            Some(i) => {
+                u.0[i] = (usize::MAX, 0);
+                true
+            }
+            None => false,
+        }
+    })
+}
+
+/// `on_exit`'s per-relay step: the mark is always consumed; a kernel-client SET (R3PREF_SET) whose frame was
+/// unread is handed to `prefs_client` by its CLIENT corr, before the -ECONNRESET is delivered.
+fn unread_handoff(row: usize, p: &Pend) {
+    if take_unread(row, p.relay) && p.verb == una_abi::BUS_VERB_R3PREF_SET && p.caller_row == crate::prefs_client::KCLIENT_ROW {
+        crate::prefs_client::note_set_unread(p.caller_corr);
+    }
+}
+
+/// `tests bandy3`' unread-mark legs on the fixture's scratch rows (caller `a`, fulfiller `f`), open tag 254:
+/// U1 a relayed request left in `f`'s mailbox and cleared is marked; U2 one `f` popped (read) and then cleared
+/// is not; U3 `unread_handoff` of a kernel-client SET marks the client corr exactly once (a GET marks none).
+fn unreadset_selftest(fx: &Fixture) {
+    let (a, f) = fx.rows;
+    let busy = locked(|| REGS.lock().iter().flatten().any(|r| (r.row == a || r.row == f) && (fx.ops.rgen)(r.row) == r.rgen));
+    if busy {
+        serial_println!(":: RELAY-RESET-SET: SKIP (scratch rows {}/{} hold a live registration) ::", a, f);
+        return;
+    }
+    let vg = 254u8;
+    let parse = |b: &[u8]| crate::bus::frame_parse(b).ok();
+    let pend_relay = |c: u32| locked(|| PEND.lock().iter().flatten().find(|p| p.ful_row == f && p.caller_row == a && p.caller_corr == c).map(|p| p.relay));
+    let mut buf = [0u8; 128];
+    (fx.clear)(a);
+    (fx.clear)(f);
+    // U1: unread at the clear -> marked.
+    let n = crate::bus::build_request(BUS_VERB_REGISTER, 80, &[vg], &mut buf);
+    let reg1 = (fx.send)(f, &buf[..n]) == 0 && matches!((fx.pop)(f).as_deref().and_then(parse), Some(h) if h.status == 0 && h.corr == 80);
+    let n = crate::bus::build_request(vg, 81, b"ui.theme", &mut buf);
+    let sent1 = (fx.send)(a, &buf[..n]) == 0;
+    let r1 = pend_relay(81);
+    (fx.clear)(f);
+    let u1 = reg1 && sent1 && r1.is_some_and(|r| take_unread(f, r));
+    on_exit(fx.ops, f);
+    (fx.clear)(a);
+    // U2: read (popped) before the clear -> not marked.
+    let n = crate::bus::build_request(BUS_VERB_REGISTER, 82, &[vg], &mut buf);
+    let reg2 = (fx.send)(f, &buf[..n]) == 0 && matches!((fx.pop)(f).as_deref().and_then(parse), Some(h) if h.status == 0 && h.corr == 82);
+    let n = crate::bus::build_request(vg, 83, b"ui.theme", &mut buf);
+    let sent2 = (fx.send)(a, &buf[..n]) == 0;
+    let r2 = pend_relay(83);
+    let read2 = (fx.pop)(f).is_some();
+    (fx.clear)(f);
+    let u2 = reg2 && sent2 && read2 && r2.is_some_and(|r| !take_unread(f, r));
+    on_exit(fx.ops, f);
+    (fx.clear)(a);
+    // U3: the handoff of a kernel-client SET marks the client corr once; a GET's mark is consumed, not handed.
+    let cc = u32::MAX; // never a live client corr in practice (the client counts up from 1)
+    let mut handoff = |verb: u8| {
+        let mut relay = NEXT_RELAY.fetch_add(1, Ordering::Relaxed);
+        if relay == 0 {
+            relay = NEXT_RELAY.fetch_add(1, Ordering::Relaxed);
+        }
+        let n = crate::bus::build_request(verb, relay, b"", &mut buf);
+        mbox_unread(f, Some(&buf[..n]));
+        let p = Pend { relay, verb, caller_row: crate::prefs_client::KCLIENT_ROW, caller_gen: crate::prefs_client::KCLIENT_GEN, caller_corr: cc, ful_row: f, ful_gen: (fx.ops.rgen)(f) };
+        unread_handoff(f, &p);
+        !take_unread(f, relay)
+    };
+    let get_consumed = handoff(una_abi::BUS_VERB_R3PREF_GET);
+    let get_none = !crate::prefs_client::set_unread_take(cc);
+    let set_consumed = handoff(una_abi::BUS_VERB_R3PREF_SET);
+    let once = crate::prefs_client::set_unread_take(cc) && !crate::prefs_client::set_unread_take(cc);
+    let u3 = get_consumed && get_none && set_consumed && once;
+    if u1 && u2 && u3 {
+        serial_println!(":: RELAY-RESET-SET: unread=marked read=unmarked handoff=once -> PASS ::");
+    } else {
+        serial_println!(":: RELAY-RESET-SET: u1={} u2={} u3={} (reg={}/{} sent={}/{} read={}) -> FAIL ::", u1 as u8, u2 as u8, u3 as u8, reg1 as u8, reg2 as u8, sent1 as u8, sent2 as u8, read2 as u8);
+    }
+}
+
+// ARMFORGET-TEARDOWN (rmbp-ledger B1171) — TAIL-APPENDED. Both arches forget a tenant's launcher records at the
+// generation bump in `clear_handle_row` through ONE wm fn (`wm::app_records_teardown`), on the final release and
+// before the slot is claimable, so a recycled owner launched by a road that arms nothing is judged Unnamed, never
+// on its predecessor's name and path (which B1163's rule would PROMOTE). The leg drives that exact fn: the full
+// `clear_handle_row` on a scratch row would close a live compat window (aarch64) and revoke focus.
+// Witness: `tests bandy3` → `:: BUSREG-ARMFORGET: … -> PASS ::`.
+// =================================================================================================
+
+/// `tests bandy3`' teardown-forget legs, on the fixture's scratch rows (caller `a`, fulfiller `f`):
+/// F1 `f` armed as the fulfiller (late name + path `/apps/PREFS.ELF` and the early record at its generation) is
+/// `Fulfiller`; after `wm::app_records_teardown` all three records are gone and `f` is `Unnamed`; F2 the recycled,
+/// unarmed `f` registers 128 -> 0 (REGISTER refuses only `Other`), the caller's GET 128 -> KERNEL -ENOENT, `f`'s
+/// mailbox empty, 128 dropped. SKIP as `armearly_selftest` does.
+fn armforget_selftest(fx: &Fixture) {
+    let (a, f) = fx.rows;
+    let owner_f = crate::video::wm::owner_of_launch(f as u64);
+    let (get, set) = (una_abi::BUS_VERB_R3PREF_GET, una_abi::BUS_VERB_R3PREF_SET);
+    if (get..=set).any(|v| lookup(fx.ops, v).is_some()) {
+        serial_println!(":: BUSREG-ARMFORGET: SKIP (a live row holds Principia's tags) ::");
+        return;
+    }
+    let rg = (fx.ops.rgen)(f);
+    let mut nb = [0u8; crate::video::wm::MAX_TITLE];
+    if crate::video::wm::app_name_armed(owner_f)
+        || crate::video::wm::app_path_with(owner_f, |_| true).is_some()
+        || crate::video::wm::app_name_early_of(owner_f, rg, &mut nb) != 0
+    {
+        serial_println!(":: BUSREG-ARMFORGET: SKIP (scratch row {} carries a name) ::", f);
+        return;
+    }
+    (fx.clear)(a);
+    (fx.clear)(f);
+    let parse = |b: &[u8]| crate::bus::frame_parse(b).ok();
+    let mut buf = [0u8; 128];
+    let mut w = 0u32;
+
+    // F1: the predecessor's records, then the teardown's own forget.
+    let _ = crate::video::wm::app_name_arm(owner_f, "/apps/PREFS.ELF");
+    let _ = crate::video::wm::app_name_arm_early(owner_f, rg, "/apps/PREFS.ELF");
+    let armed = tag_id(set, f, &mut nb) == TagId::Fulfiller;
+    crate::video::wm::app_records_teardown(owner_f);
+    let cleared = !crate::video::wm::app_name_armed(owner_f)
+        && crate::video::wm::app_path_with(owner_f, |_| true).is_none()
+        && crate::video::wm::app_name_early_of(owner_f, rg, &mut nb) == 0;
+    let unnamed = tag_id(set, f, &mut nb) == TagId::Unnamed;
+    if armed && cleared && unnamed {
+        w |= 1 << 0;
+    }
+    // F2: the recycled owner, armed by nothing, registers but its first relay drops it — no body reaches it.
+    let n = crate::bus::build_request(BUS_VERB_REGISTER, 81, &[get], &mut buf);
+    let admitted = (fx.send)(f, &buf[..n]) == 0 && matches!((fx.pop)(f).as_deref().and_then(parse), Some(h) if h.status == 0 && h.corr == 81);
+    let n = crate::bus::build_request(get, 82, b"ui.theme", &mut buf);
+    let sent = (fx.send)(a, &buf[..n]) == 0;
+    let enoent = matches!((fx.pop)(a).as_deref().and_then(parse), Some(h) if h.status == ENOENT as i32 && h.corr == 82 && h.principal[0] == PRIN_KERNEL_REPLY);
+    let unseen = (fx.pop)(f).is_none();
+    if admitted && sent && enoent && unseen && lookup(fx.ops, get).is_none() {
+        w |= 1 << 1;
+    }
+    on_exit(fx.ops, f);
+    (fx.clear)(a);
+    (fx.clear)(f);
+    on_exit(fx.ops, a);
+    crate::video::wm::app_name_forget(owner_f);
+    crate::video::wm::app_name_early_forget(owner_f);
+    const ALL: u32 = (1 << 2) - 1;
+    let forgot = crate::video::wm::ARMFORGET_CLEARED.load(Ordering::Relaxed);
+    if w == ALL {
+        serial_println!(":: BUSREG-ARMFORGET: armed=fulfiller cleared=name,path,early recycled=unnamed relay=dropped forgot={} -> PASS ::", forgot);
+    } else {
+        serial_println!(
+            ":: BUSREG-ARMFORGET: armed={} cleared={} recycled={} relay={} forgot={} w={:#x}/{:#x} -> FAIL ::",
+            if armed { "fulfiller" } else { "NOT-FULFILLER" },
+            if cleared { "name,path,early" } else { "KEPT" },
+            if unnamed { "unnamed" } else { "NAMED" },
+            if w & 2 != 0 { "dropped" } else { "KEPT" },
+            forgot, w, ALL
         );
     }
 }
