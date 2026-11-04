@@ -60,6 +60,10 @@ pub struct Map {
     pub datums: Option<[u32; 3]>,
     /// VUGFACEGDTREMEASURE (SR560): the datum frame position reads in, or its refusal on a re-measure ([`reframe`]).
     pub frame: Option<Result<scan_core::gdt::DatumFrame, String>>,
+    /// VUGFACEGDTDATUMSPICK (SR564): the datum faces picked so far by the keys `A` `B` `C` ([`datum_key`]), before all three.
+    pub chosen: [Option<u32>; 3],
+    /// VUGFACEGDTDATUMSPICK (SR564): the callout faces a re-measure dropped ([`carry`]), named on the corner until the next command.
+    pub lost: Vec<String>,
 }
 
 /// A scan mesh read from a file (a PLY carries no normals, no confidence and no intrinsics): mesh_core's
@@ -116,7 +120,7 @@ pub fn open(scan: &ScanMesh, doc: &Doc, band_mm: f64, margin_mm: f64) -> Result<
     };
     let model = Model::from_mesh(mesh)?;
     let on = result.is_ok();
-    let mut map = Map { on, band_mm, names, gdt: Vec::new(), result, vertex, tri, pick: None, source: None, callouts: Vec::new(), margin_mm, basis: std::sync::Arc::new((scan.clone(), design)), datums: None, frame: None }; reframe(&mut map); Ok((model, map)) // VUGFACEDEVIATIONJOURNAL (SR550) + VUGFACEGDT (SR553): no source, no callouts yet; VUGFACEGDTREMEASURE (SR560): the gdt read once per build through reframe
+    let mut map = Map { on, band_mm, names, gdt: Vec::new(), result, vertex, tri, pick: None, source: None, callouts: Vec::new(), margin_mm, basis: std::sync::Arc::new((scan.clone(), design)), datums: None, frame: None, chosen: [None; 3], lost: Vec::new() }; reframe(&mut map); Ok((model, map)) // VUGFACEDEVIATIONJOURNAL (SR550) + VUGFACEGDT (SR553): no source, no callouts yet; VUGFACEGDTREMEASURE (SR560): the gdt read once per build through reframe
 }
 
 /// The corner's lines: the statistics and the worst [`WORST`] faces (matched ones, by rms) with their signed mean, or
@@ -136,7 +140,7 @@ fn measured(map: &Map) -> Vec<String> {
                 let name = map.names.get(f.face as usize).map(String::as_str).unwrap_or("?");
                 out.push(format!("{name} rms={:.3} mean={:+.3}", f.rms_mm, f.mean_mm));
             }
-            out.extend(frame_line(map)); out.extend(gdt_lines(map)); out // VUGFACEGDT (SR553): a line per callout after the faces; VUGFACEGDTREMEASURE (SR560): the frame line first
+            out.extend(frame_line(map)); out.extend(gdt_lines(map)); out.extend(lost_lines(map)); out // VUGFACEGDT (SR553): a line per callout after the faces; VUGFACEGDTREMEASURE (SR560): the frame line first
         }
         Err(DeviationError::NoAlignment { rms_mm, pairs }) => vec![format!("refused NoAlignment rms={rms_mm:.3} pairs={pairs}")],
         Err(DeviationError::Unconstrained { level }) => vec![format!("refused Unconstrained level={level}")],
@@ -398,7 +402,7 @@ pub fn gdt_of(scan: &ScanMesh, design: &Design, result: &Result<Deviation, Devia
 /// kind), anything else the usage. True when the map changed.
 pub fn command(view: &mut View, model: &Model, line: &str) -> Result<bool, String> {
     const USAGE: &str = "usage: gdt <face>=<kind>:<tol> | gdt clear";
-    if let Some(r) = datum_command(view, model, line) { return r; } // VUGFACEGDTREMEASURE (SR560): `datum ...` is the frame's command
+    forget(view); if let Some(r) = datum_command(view, model, line) { return r; } // VUGFACEGDTREMEASURE (SR560): `datum ...` is the frame's command
     let rest = line.trim().strip_prefix("gdt ").map(str::trim).ok_or(USAGE)?;
     let m = view.deviation.as_mut().ok_or("gdt: no map")?;
     if let Err(e) = &m.result {
@@ -536,7 +540,7 @@ fn carry(old: &Map, new: &mut Map, model: &Model) {
     if lost.is_some() {
         new.frame = lost.map(Err);
     }
-    retint(new, model);
+    retint(new, model); carry_named(old, new); // VUGFACEGDTDATUMSPICK (SR564): the lost callouts named, the partial picks by name
 }
 
 /// `datum ...` lines are the frame's ([`datum`]); any other line is not (None).
@@ -560,7 +564,7 @@ fn datum(view: &mut View, model: &Model, rest: &str) -> Result<bool, String> {
     }
     if rest == "clear" {
         let changed = m.datums.is_some() || m.frame.is_some();
-        m.datums = None;
+        m.datums = None; m.chosen = [None; 3]; // VUGFACEGDTDATUMSPICK (SR564): the partial picks go with the frame
         reframe(m);
         retint(m, model);
         return Ok(changed);
@@ -587,7 +591,7 @@ fn frame_line(map: &Map) -> Option<String> {
     match (&map.frame, map.datums) {
         (Some(Ok(fr)), Some(d)) => Some(format!("frame A={} B={} C={} residual={:.3}", name(d[0]), name(d[1]), name(d[2]), fr.residual_mm)),
         (Some(Err(why)), _) => Some(format!("frame refused {why}")),
-        _ => None,
+        _ => chosen_line(map), // VUGFACEGDTDATUMSPICK (SR564): the datums picked so far
     }
 }
 
@@ -618,4 +622,86 @@ fn lazy(v: &mut Viewer) {
     }
     src.doc = doc.clone();
     show(&mut v.view);
+}
+
+// ---- VUGFACEGDTDATUMSPICK (LEDGER SR564): datums chosen by clicking faces; a callout a re-measure loses is named ----
+// With a pick held on the live map (SR543's [`pick`] names the face under the click) and no sketch open, the UPPERCASE
+// keys `A` `B` `C` make the picked face that datum and `D` clears the datums ([`datum_key`], asked by `View::key` before
+// the sketch's keys, which take `a` / `c` even outside a sketch). While fewer than three are named the corner reads
+// `frame A=<face> B=- C=-`; the third calls the EXISTING [`datum`] with the command's own `A=<f> B=<f> C=<f>`, so the frame
+// is the command's bit for bit. [`carry`] keeps the callouts whose face the new design lacks in `Map::lost` and the corner
+// reads `callout lost <face>` until the next command. BP-vug-5: a printed verdict, nothing changes.
+
+/// The datum keys: `A` / `B` / `C` set that datum to the held pick's face (a set datum replaced; the frame built by
+/// [`datum`] once all three are named, a refusal named on the corner as `frame refused <why>`), `D` clears them. None
+/// (the key falls through unchanged) unless the map is live, no sketch is open and the pick names a face.
+pub fn datum_key(view: &mut View, model: &Model, k: &str) -> Option<bool> {
+    let slot = match k {
+        "A" => 0,
+        "B" => 1,
+        "C" => 2,
+        "D" => 3,
+        _ => return None,
+    };
+    if !active(view) || view.design.face.is_some() {
+        return None;
+    }
+    let face = view.deviation.as_ref()?.pick.as_ref()?.face?;
+    forget(view);
+    if slot == 3 {
+        let had = view.deviation.as_ref().is_some_and(|m| m.chosen.iter().any(Option::is_some));
+        return Some(datum(view, model, "clear").unwrap_or(false) | had);
+    }
+    let m = view.deviation.as_mut()?;
+    let mut c = m.datums.map(|d| d.map(Some)).unwrap_or(m.chosen);
+    c[slot] = Some(face);
+    m.chosen = c;
+    let [Some(a), Some(b), Some(cc)] = c else { return Some(true) };
+    let name = |f: u32| m.names.get(f as usize).cloned().unwrap_or_default();
+    let args = format!("A={} B={} C={}", name(a), name(b), name(cc));
+    if let Err(why) = datum(view, model, &args) {
+        let m = view.deviation.as_mut()?;
+        m.datums = None;
+        reframe(m);
+        m.frame = Some(Err(why));
+        retint(m, model);
+    }
+    Some(true)
+}
+
+/// The corner's partial frame line while datums are being picked: `frame A=<face|-> B=<face|-> C=<face|->`; none when
+/// nothing is picked.
+fn chosen_line(map: &Map) -> Option<String> {
+    if map.chosen.iter().all(Option::is_none) {
+        return None;
+    }
+    let name = |f: Option<u32>| f.and_then(|f| map.names.get(f as usize)).map_or("-", String::as_str);
+    Some(format!("frame A={} B={} C={}", name(map.chosen[0]), name(map.chosen[1]), name(map.chosen[2])))
+}
+
+/// The corner's lost-callout lines: `callout lost <face>` per face a re-measure dropped.
+fn lost_lines(map: &Map) -> Vec<String> {
+    map.lost.iter().map(|f| format!("callout lost {f}")).collect()
+}
+
+/// A command (or a datum key) is the person's next word: the lost-callout lines are cleared.
+fn forget(view: &mut View) {
+    if let Some(m) = view.deviation.as_mut() {
+        m.lost.clear();
+    }
+}
+
+/// After [`carry`]: every old callout face the new design does not name joins the old map's `lost` (deduped), and the
+/// partial picks follow by face name (a picked face that is gone is unpicked).
+fn carry_named(old: &Map, new: &mut Map) {
+    let name = |f: u32| old.names.get(f as usize).cloned();
+    let mut lost = old.lost.clone();
+    for c in &old.callouts {
+        let Some(n) = name(c.face) else { continue };
+        if !new.names.contains(&n) && !lost.contains(&n) {
+            lost.push(n);
+        }
+    }
+    new.lost = lost;
+    new.chosen = old.chosen.map(|f| f.and_then(name).and_then(|n| new.names.iter().position(|x| *x == n).map(|i| i as u32)));
 }

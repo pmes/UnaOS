@@ -451,7 +451,7 @@ fn a_callout_survives_a_journal_edit() {
     println!("{}", lines.join("\n"));
     assert!(lines.contains(&format!("{top} flatness={flat:.3} tol=0.001 FAIL")), "{lines:?}");
     assert!(lines.iter().any(|l| l.starts_with(&format!("frame A={a} B={b} C={c} residual="))), "the frame followed: {lines:?}");
-    assert_eq!(lines.last().map(String::as_str), Some("design=journal@1"), "{lines:?}");
+    assert_eq!(lines.last().map(String::as_str), Some("design=journal@1 solids=2"), "{lines:?}"); // VUGFACEGDTDATUMSPICK (SR564): SR558's source line
     // Re-tinted: every vertex of the new map paired with the plate top is the over colour.
     let over = colour(Shade::Over(1.0));
     let mut tinted = 0;
@@ -620,4 +620,134 @@ fn an_open_sketch_edit_keeps_the_generation_and_a_solid_edit_bumps_it() {
     let r2 = stats(&v).0;
     println!("gen0 rms={r0} gen1={r1} gen2={r2}");
     assert!((r2 - r1).abs() > 1e-6, "the post widened 5 mm: {r2} vs {r1}");
+}
+
+// VUGFACEGDTDATUMSPICK (LEDGER SR564): with a pick held on the live map, `A` `B` `C` make the picked face that datum and
+// the third builds the frame through the `datum` command's own road (bit-equal to the command form); a set datum is
+// replaced; `D` clears (and toggles the map as before with no pick); lowercase `a` still opens a sketch. A re-measure
+// that renames a callout's face names it on the corner (`callout lost <face>`) until the next command.
+
+/// Pick design face `face` through the click's own fn (`deviation::pick`): the hit is a vertex of a triangle whose three
+/// vertices pair with the face, so the nearest vertex names it.
+fn pick_face(v: &mut Viewer, face: u32) {
+    let p = {
+        let d = v.view.deviation.as_ref().unwrap().result.as_ref().unwrap();
+        let (idx, pos) = (v.model.indices(), v.model.positions());
+        let t = (0..idx.len() / 3)
+            .find(|&t| (0..3).all(|k| d.face_of_vertex.get(idx[t * 3 + k] as usize).copied().flatten() == Some(face)))
+            .unwrap_or_else(|| panic!("no triangle on face {face}"));
+        let i = idx[t * 3] as usize;
+        (euclase::Vec3::new(pos[i * 3], pos[i * 3 + 1], pos[i * 3 + 2]), t as u32)
+    };
+    vug_view::deviation::pick(&mut v.view, &v.model, Some(p));
+    assert_eq!(v.view.deviation.as_ref().unwrap().pick.as_ref().and_then(|p| p.face), Some(face), "the pick names the face");
+}
+
+/// The corner's frame line (`frame ...`).
+fn frame_of_corner(m: &vug_view::deviation::Map) -> String {
+    corner(m).into_iter().find(|l| l.starts_with("frame ")).unwrap_or_else(|| panic!("no frame line: {:?}", corner(m)))
+}
+
+#[test]
+fn picked_datums_read_as_the_command_form() {
+    let mut v = open(scan().clone());
+    let m0 = v.view.deviation.clone().unwrap();
+    let (a, b, c) = box_datums(&m0);
+    let at = |n: &str| m0.names.iter().position(|x| x == n).unwrap() as u32;
+    let (fa, fb, fc) = (at(&a), at(&b), at(&c));
+    let (post, _) = post_side(&m0);
+
+    // No pick: `D` toggles the map as before.
+    assert!(v.key("D"), "D toggles");
+    assert!(!v.view.deviation.as_ref().unwrap().on);
+    assert!(v.key("D"));
+    assert!(v.view.deviation.as_ref().unwrap().on);
+
+    pick_face(&mut v, fa);
+    assert!(v.key("A"), "A takes the picked face");
+    let m = v.view.deviation.as_ref().unwrap();
+    assert_eq!(m.chosen, [Some(fa), None, None]);
+    assert!(m.datums.is_none() && m.frame.is_none(), "no frame before three");
+    assert_eq!(frame_of_corner(m), format!("frame A={a} B=- C=-"));
+    pick_face(&mut v, fb);
+    assert!(v.key("B"));
+    pick_face(&mut v, fc);
+    assert!(v.key("C"));
+    let mk = v.view.deviation.clone().unwrap();
+    assert_eq!(mk.datums, Some([fa, fb, fc]), "the third pick builds the frame");
+
+    // The command form on a second viewer.
+    let mut w = open(scan().clone());
+    assert_eq!(vug_view::deviation::command(&mut w.view, &w.model, &format!("datum A={a} B={b} C={c}")), Ok(true));
+    let mc = w.view.deviation.clone().unwrap();
+    let (fk, fm) = (mk.frame.clone().unwrap().expect("a frame"), mc.frame.clone().unwrap().expect("a frame"));
+    println!("keys: {}\ncommand: {}", frame_of_corner(&mk), frame_of_corner(&mc));
+    assert_eq!(fk.residual_mm.to_bits(), fm.residual_mm.to_bits(), "bit-equal residual");
+    assert_eq!(mk.gdt[post as usize].position_mm.map(f64::to_bits), mc.gdt[post as usize].position_mm.map(f64::to_bits), "the post's position in the same frame");
+    assert_eq!(frame_of_corner(&mk), frame_of_corner(&mc));
+    assert_eq!(frame_of_corner(&mk), format!("frame A={a} B={b} C={c} residual={:.3}", fm.residual_mm));
+    assert_eq!(mk.vertex, mc.vertex, "the same tint");
+
+    // A datum set twice replaces: B the top, then B the -x side again.
+    pick_face(&mut v, fa);
+    assert!(v.key("B"));
+    let m = v.view.deviation.as_ref().unwrap();
+    assert_eq!(m.chosen, [Some(fa), Some(fa), Some(fc)]);
+    assert_ne!(frame_of_corner(m), frame_of_corner(&mc), "B replaced");
+    pick_face(&mut v, fb);
+    assert!(v.key("B"));
+    let m = v.view.deviation.as_ref().unwrap();
+    assert_eq!(m.datums, Some([fa, fb, fc]));
+    assert_eq!(frame_of_corner(m), frame_of_corner(&mc), "the command's frame again");
+    assert_eq!(m.frame.clone().unwrap().unwrap().residual_mm.to_bits(), fm.residual_mm.to_bits());
+
+    // `D` with a pick clears (the map stays on).
+    assert!(v.key("D"), "D clears");
+    let m = v.view.deviation.as_ref().unwrap();
+    assert!(m.on, "D with a pick clears, it does not toggle");
+    assert!(m.datums.is_none() && m.frame.is_none() && m.chosen == [None; 3]);
+    assert!(!corner(m).iter().any(|l| l.starts_with("frame ")), "{:?}", corner(m));
+    assert_eq!(m.gdt[post as usize].position_mm.map(f64::to_bits), m0.gdt[post as usize].position_mm.map(f64::to_bits), "the registration's position is back");
+
+    // Lowercase `a` still opens a sketch with the pick held; inside it `A` is the sketch's.
+    assert!(v.key("a"));
+    assert!(v.view.design.face.is_some(), "a opens a sketch");
+    assert!(v.key("A"));
+    assert!(v.view.deviation.as_ref().unwrap().chosen.iter().all(Option::is_none), "inside a sketch A is not a datum key");
+}
+
+#[test]
+fn a_renamed_face_names_its_lost_callout() {
+    let mut v = journal_viewer();
+    let m0 = v.view.deviation.clone().unwrap();
+    let (_, pname) = post_side(&m0);
+    assert_eq!(vug_view::deviation::command(&mut v.view, &v.model, &format!("gdt {pname}=position:5")), Ok(true));
+    let doc = doc_core::read(&DOC.replace("extrude post ", "extrude peg ")).expect("the renamed document reads");
+    v.view.design.journal.doc = doc.clone();
+    vug_view::deviation::follow(&mut v);
+    let m = v.view.deviation.as_ref().unwrap();
+    let src = m.source.as_ref().expect("a journal map");
+    assert_eq!((src.generation, src.measured, src.refused.as_deref()), (1, 1, None), "the rename re-measured");
+    assert!(m.names.iter().all(|n| !n.starts_with("post/")), "the post's faces are renamed: {:?}", m.names);
+    assert!(m.callouts.is_empty(), "the callout's face is gone");
+    assert_eq!(m.lost, vec![pname.clone()]);
+    let lines = corner(m);
+    println!("{}", lines.join("\n"));
+    let want = format!("callout lost {pname}");
+    assert_eq!(lines.iter().filter(|l| **l == want).count(), 1, "{lines:?}");
+    assert_eq!(lines[lines.len() - 2], want, "after the callout lines, before the source line: {lines:?}");
+
+    // A journal change that moves no solid keeps the line.
+    let mut doc2 = doc.clone();
+    doc2.stmts.push(doc_core::Stmt::Sketch { id: "s9".into(), o: [0.0, 0.0, 0.0], z: [0.0, 0.0, 1.0], x: [1.0, 0.0, 0.0] });
+    v.view.design.journal.doc = doc2;
+    vug_view::deviation::follow(&mut v);
+    assert_eq!(v.view.deviation.as_ref().unwrap().source.as_ref().unwrap().measured, 1, "no re-measure");
+    assert!(corner(v.view.deviation.as_ref().unwrap()).contains(&want), "kept until the next command");
+
+    // The next command clears it.
+    assert_eq!(vug_view::deviation::command(&mut v.view, &v.model, "gdt clear"), Ok(false));
+    let m = v.view.deviation.as_ref().unwrap();
+    assert!(m.lost.is_empty());
+    assert!(!corner(m).iter().any(|l| l.starts_with("callout lost")), "{:?}", corner(m));
 }

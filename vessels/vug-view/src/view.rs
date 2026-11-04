@@ -315,7 +315,7 @@ impl View {
         if let Some(r) = crate::journal::key(&mut self.design, k) {
             return r;
         }
-        if let Some(r) = crate::sketch::key(self, model, k) {
+        if let Some(r) = crate::deviation::datum_key(self, model, k) { return r; } if let Some(r) = crate::sketch::key(self, model, k) { // VUGFACEGDTDATUMSPICK (SR564): A B C D on a held pick of the live map, before the sketch takes a / c
             return r;
         }
         if let Some(r) = crate::deviation::key(self, k) { return r; } match k { // VUGFACEDEVIATION (SR525): `d` outside a sketch toggles the map
