@@ -883,23 +883,16 @@ mod intent_tests {
 
 // ---- VUGSCANGDT (LEDGER SR542): --gdt, the deviation read as ISO 1101 tolerances ----
 
-/// `--gdt <face>=<kind>:<tol>`: the face as its `face:` line names it (split at the LAST `=`), the kind (flatness,
-/// cylindricity, position) and the tolerance in mm (finite, above 0, split at the LAST `:`); anything else is usage.
+/// `--gdt <face>=<kind>:<tol>`: the face as its `face:` line names it, read by scan_core's ONE grammar
+/// (`gdt::Callout::parse`, VUGSCANGDTSPEC SR559: flatness, cylindricity, position or profile); a refusal is usage.
 fn gdt_spec(it: &mut impl Iterator<Item = String>) -> (String, scan_core::Kind, f64) {
-    let s = it.next().unwrap_or_else(|| usage());
-    let Some((face, rest)) = s.rsplit_once('=') else { usage() };
-    let Some((kind, tol)) = rest.rsplit_once(':') else { usage() };
-    let kind = scan_core::Kind::parse(kind).unwrap_or_else(|| usage());
-    let tol: f64 = tol.parse().unwrap_or_else(|_| usage());
-    if face.is_empty() || !(tol.is_finite() && tol > 0.0) {
-        usage()
-    }
-    (face.to_string(), kind, tol)
+    let c = scan_core::gdt::Callout::parse(&it.next().unwrap_or_else(|| usage())).unwrap_or_else(|_| usage());
+    (c.face, c.kind, c.tol_mm)
 }
 
 /// `gdt:` per design face (face-index order) after `--against`'s `face:` lines: the nominal surface, the form vertices
 /// `n=<kept>/<matched>` (kept outside the edge margin, the fused volume's truncation `margin`, of the vertices paired
-/// with the face), flatness (a plane) or cylindricity and position (a cylinder), the nominal-relative `band=` (no verdict), and
+/// with the face), flatness (a plane) or cylindricity and position (a cylinder), the nominal-relative `band=` (no verdict), `profile=` (its zone about the nominal, SR559), and
 /// a `verdict=<kind>:<tol> PASS|FAIL|UNMEASURED` per callout naming the face; then `gdt: callouts= pass= fail=`.
 /// A FAIL is a printed measurement (the run exits 0, BP-vug-5); an unknown face (`GdtFace`), a kind its surface does
 /// not take (`GdtKind`) and `--gdt` without `--against` (`GdtWithoutAgainst`) are refused before anything is written.
@@ -925,18 +918,19 @@ fn gdt_road(a: &Args, sm: &ScanMesh, dev: Option<&(Deviation, Vec<String>, scan_
         let _ = write!(r, "gdt: {name} surface={} n={}/{}", f.nominal.name(), f.n, f.matched);
         match f.nominal {
             scan_core::Nominal::Plane(p) => {
-                let _ = write!(r, " normal={} d={:.3} flatness={} band={}", v3(p.normal), p.d, mm(f.flatness_mm), mm(f.band_mm));
+                let _ = write!(r, " normal={} d={:.3} flatness={} band={} profile={}", v3(p.normal), p.d, mm(f.flatness_mm), mm(f.band_mm), mm(f.profile_mm));
             }
             scan_core::Nominal::Cylinder(c) => {
                 let _ = write!(
                     r,
-                    " axis={} point={} r={:.3} cylindricity={} position={} band={}",
+                    " axis={} point={} r={:.3} cylindricity={} position={} band={} profile={}",
                     v3(c.axis),
                     v3(c.point),
                     c.radius,
                     mm(f.cylindricity_mm),
                     mm(f.position_mm),
-                    mm(f.band_mm)
+                    mm(f.band_mm),
+                    mm(f.profile_mm)
                 );
             }
             scan_core::Nominal::Other => {}
