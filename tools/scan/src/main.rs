@@ -539,7 +539,7 @@ fn run(a: &Args) -> Result<String, Refusal> {
     let dev = match &a.against {
         Some(p) => Some(against(p, &sm, a.band)?),
         None => None,
-    }; let intent = intent_road(a, &detected)?; let gdt = gdt_road(a, &sm, dev.as_ref())?; // VUGINTENTSCANWIRE (SR515): before anything is written; VUGSCANGDT (SR542) gdt_road too
+    }; let intent = intent_road(a, &detected)?; let gdt = gdt_road(a, &sm, dev.as_ref(), t.trunc_mm())?; // VUGINTENTSCANWIRE (SR515): before anything is written; VUGSCANGDT (SR542) gdt_road too
 
     // The PLY: scan_core's mesh IS mesh_core's (VUGSHIMSWAP SR473), straight into mesh_core's writer.
     let out = a.out.as_deref().unwrap_or_default();
@@ -898,16 +898,17 @@ fn gdt_spec(it: &mut impl Iterator<Item = String>) -> (String, scan_core::Kind, 
 }
 
 /// `gdt:` per design face (face-index order) after `--against`'s `face:` lines: the nominal surface, the form vertices
-/// `n=`, flatness (a plane) or cylindricity and position (a cylinder), the nominal-relative `band=` (no verdict), and
+/// `n=<kept>/<matched>` (kept outside the edge margin, the fused volume's truncation `margin`, of the vertices paired
+/// with the face), flatness (a plane) or cylindricity and position (a cylinder), the nominal-relative `band=` (no verdict), and
 /// a `verdict=<kind>:<tol> PASS|FAIL|UNMEASURED` per callout naming the face; then `gdt: callouts= pass= fail=`.
 /// A FAIL is a printed measurement (the run exits 0, BP-vug-5); an unknown face (`GdtFace`), a kind its surface does
 /// not take (`GdtKind`) and `--gdt` without `--against` (`GdtWithoutAgainst`) are refused before anything is written.
 /// Without `--against`, nothing.
-fn gdt_road(a: &Args, sm: &ScanMesh, dev: Option<&(Deviation, Vec<String>, scan_core::Design)>) -> Result<String, Refusal> {
+fn gdt_road(a: &Args, sm: &ScanMesh, dev: Option<&(Deviation, Vec<String>, scan_core::Design)>, margin: f64) -> Result<String, Refusal> {
     let Some((d, names, design)) = dev else {
         return if a.gdt.is_empty() { Ok(String::new()) } else { Err(Refusal::GdtWithoutAgainst) };
     };
-    let g = scan_core::gdt(sm, design, d, Tol::DEFAULT);
+    let g = scan_core::gdt(sm, design, d, margin, Tol::DEFAULT);
     let mut calls: Vec<(usize, scan_core::Kind, f64)> = Vec::with_capacity(a.gdt.len());
     for (face, kind, tol) in &a.gdt {
         let Some(i) = names.iter().position(|n| n == face) else { return Err(Refusal::GdtFace { face: face.clone() }) };
@@ -921,7 +922,7 @@ fn gdt_road(a: &Args, sm: &ScanMesh, dev: Option<&(Deviation, Vec<String>, scan_
     let mut r = String::new();
     for f in &g {
         let name = names.get(f.face as usize).map(String::as_str).unwrap_or("?");
-        let _ = write!(r, "gdt: {name} surface={} n={}", f.nominal.name(), f.n);
+        let _ = write!(r, "gdt: {name} surface={} n={}/{}", f.nominal.name(), f.n, f.matched);
         match f.nominal {
             scan_core::Nominal::Plane(p) => {
                 let _ = write!(r, " normal={} d={:.3} flatness={} band={}", v3(p.normal), p.d, mm(f.flatness_mm), mm(f.band_mm));

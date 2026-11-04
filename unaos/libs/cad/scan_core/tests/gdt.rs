@@ -19,9 +19,10 @@ const DEG: f64 = PI / 180.0;
 const CENTRE: Vec3 = Vec3::new(-20.0, 0.0, 50.0);
 const BAND: f64 = 1.0;
 
-/// tests/deviation.rs's fusion (SR510): 12 orbit frames at 600 mm, 40° up, D435i noise.
-fn scan() -> &'static ScanMesh {
-    static S: OnceLock<ScanMesh> = OnceLock::new();
+/// tests/deviation.rs's fusion (SR510): 12 orbit frames at 600 mm, 40° up, D435i noise; with the volume's truncation,
+/// the edge margin `gdt` takes (the seat's ruling: read from the fuse, no second constant).
+fn fused() -> &'static (ScanMesh, f64) {
+    static S: OnceLock<(ScanMesh, f64)> = OnceLock::new();
     S.get_or_init(|| {
         let (scene, intr, scale) = (Scene::bench(), fixture::bench_intrinsics(), DepthScale::D400_DEFAULT);
         let mut t = Tsdf::new(4.0, 12.0, Tol::DEFAULT).expect("volume");
@@ -30,8 +31,12 @@ fn scan() -> &'static ScanMesh {
             let f = fixture::render_depth(&scene, &intr, scale, &p, &Noise::D435I, k as u64);
             t.integrate(&f, scale, &intr, &p).expect("frame integrates");
         }
-        extract(&t).expect("surface")
+        (extract(&t).expect("surface"), t.trunc_mm())
     })
+}
+
+fn scan() -> &'static ScanMesh {
+    &fused().0
 }
 
 /// The fixture's box (-230..70, ±100, 0..100) and r 40 h 150 post at (160, 0) through `design_of`, each solid's
@@ -60,13 +65,14 @@ fn measured() -> &'static (Design, Vec<String>, Deviation) {
 
 fn faces() -> Vec<FaceGdt> {
     let (d, names, dev) = measured();
-    let g = gdt(scan(), d, dev, Tol::DEFAULT);
+    let g = gdt(scan(), d, dev, fused().1, Tol::DEFAULT);
     for f in &g {
         println!(
-            "gdt: {} {} n={} flatness={:?} cylindricity={:?} position={:?} band={:?} extent={:?}",
+            "gdt: {} {} n={}/{} flatness={:?} cylindricity={:?} position={:?} band={:?} extent={:?}",
             names[f.face as usize],
             f.nominal.name(),
             f.n,
+            f.matched,
             f.flatness_mm,
             f.cylindricity_mm,
             f.position_mm,

@@ -13,7 +13,12 @@
 //!    from the face's vertices, which lie on the surface), else Other (cone, torus, sphere: not toleranced here).
 //! 2. The form vertices of a face: the scan vertices `deviations` paired with it (`Deviation::face_of_vertex`), at the
 //!    aligned pose, whose TSDF normal agrees with the nominal's normal there within [`GDT_NORMAL_DEG`]: the TSDF's
-//!    rounded edges pair with a face through deviation.rs's 60° gate and are a blend, not the face's form. Fewer than
+//!    rounded edges pair with a face through deviation.rs's 60° gate and are a blend, not the face's form. The edge
+//!    margin (SR542, the seat's ruling): a vertex is dropped when its projection onto the nominal surface lies within
+//!    `margin_mm` of the face's boundary (the edges of the face's tessellation that one of its triangles alone uses,
+//!    keyed by position so a seam a tessellation duplicates is not a boundary; the distance is Euclidean from the
+//!    projected point, the chord, which on a cylinder is the axial distance to a rim and under the margin the arc to a
+//!    straight edge); the caller passes the TSDF's truncation (`Tsdf::trunc_mm`), the width of the blend. Fewer than
 //!    [`GDT_MIN_POINTS`] and the face is unmeasured.
 //! 3. Flatness (ISO 1101, two parallel planes of free orientation): max − min of the signed distance of the form
 //!    vertices to the plane `fit_plane` gives through them. Cylindricity (two coaxial cylinders, axis and radius free):
@@ -26,6 +31,7 @@
 //! 5. `band_mm`: the nominal-relative band (max − min of the signed deviation over the form vertices), printed beside
 //!    the form values and never given a verdict: it carries the face's offset, tilt and radius error (ISO profile).
 
+use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
 use crate::ScanMesh;
@@ -97,7 +103,8 @@ pub enum Verdict {
     Unmeasured,
 }
 
-/// One design face read as tolerances: its nominal, the form vertices measured, each value its surface takes (`None`
+/// One design face read as tolerances: its nominal, the form vertices measured (`n`, of the `matched` vertices
+/// `deviations` paired with the face), each value its surface takes (`None`
 /// where it does not, or unmeasured), the nominal-relative band, the fitted axis of a cylinder and the form vertices'
 /// extent along the nominal axis (from the nominal's point; `(0, 0)` for a plane).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -105,6 +112,7 @@ pub struct FaceGdt {
     pub face: u32,
     pub nominal: Nominal,
     pub n: u32,
+    pub matched: u32,
     pub flatness_mm: Option<f64>,
     pub cylindricity_mm: Option<f64>,
     pub position_mm: Option<f64>,
@@ -144,6 +152,37 @@ impl FaceGdt {
 fn radial(c: &Cylinder, p: Vec3) -> Vec3 {
     let d = p - c.point;
     d - c.axis * c.axis.dot(d)
+}
+
+/// A position on a 1e-6 mm grid: the key that welds a tessellation's duplicated seam vertices.
+fn key(p: Vec3) -> (i64, i64, i64) {
+    let q = |x: f64| libm::round(x * 1e6) as i64;
+    (q(p.x), q(p.y), q(p.z))
+}
+
+/// The boundary of design face `face`: the edges of its triangles that one of them alone uses (by position).
+fn boundary(design: &Design, face: u32) -> Vec<(Vec3, Vec3)> {
+    let mut uses: BTreeMap<((i64, i64, i64), (i64, i64, i64)), (u32, Vec3, Vec3)> = BTreeMap::new();
+    for (t, _) in design.face_of.iter().enumerate().filter(|(_, f)| **f == face) {
+        let Some([a, b, c]) = design.mesh.corners(t) else { continue };
+        for (u, v) in [(a, b), (b, c), (c, a)] {
+            let (ku, kv) = (key(u), key(v));
+            if ku == kv {
+                continue;
+            }
+            let k = if ku < kv { (ku, kv) } else { (kv, ku) };
+            uses.entry(k).or_insert((0, u, v)).0 += 1;
+        }
+    }
+    uses.into_values().filter(|e| e.0 == 1).map(|e| (e.1, e.2)).collect()
+}
+
+/// The distance from `p` to the segment `ab`.
+fn to_segment(p: Vec3, a: Vec3, b: Vec3) -> f64 {
+    let ab = b - a;
+    let l2 = ab.mag_sq();
+    let t = if l2 > 0.0 { (ab.dot(p - a) / l2).clamp(0.0, 1.0) } else { 0.0 };
+    (p - (a + ab * t)).mag()
 }
 
 /// max − min of the values, `None` when there are none.
@@ -210,8 +249,9 @@ pub fn position_mm(measured: &Cylinder, nominal: &Cylinder, extent: (f64, f64)) 
     2.0 * at(extent.0).max(at(extent.1))
 }
 
-/// Every design face read as tolerances, in face-index order (see the module doc).
-pub fn gdt(scan: &ScanMesh, design: &Design, dev: &Deviation, tol: Tol) -> Vec<FaceGdt> {
+/// Every design face read as tolerances, in face-index order, with the edge margin `margin_mm` (the TSDF's
+/// truncation, `Tsdf::trunc_mm`; see the module doc).
+pub fn gdt(scan: &ScanMesh, design: &Design, dev: &Deviation, margin_mm: f64, tol: Tol) -> Vec<FaceGdt> {
     let cos = libm::cos(GDT_NORMAL_DEG.to_radians());
     let pose = dev.aligned.pose;
     (0..design.faces)
@@ -221,6 +261,7 @@ pub fn gdt(scan: &ScanMesh, design: &Design, dev: &Deviation, tol: Tol) -> Vec<F
                 face,
                 nominal,
                 n: 0,
+                matched: 0,
                 flatness_mm: None,
                 cylindricity_mm: None,
                 position_mm: None,
@@ -228,10 +269,12 @@ pub fn gdt(scan: &ScanMesh, design: &Design, dev: &Deviation, tol: Tol) -> Vec<F
                 axis: None,
                 extent: (0.0, 0.0),
             };
+            out.matched = dev.face_of_vertex.iter().zip(&dev.per_vertex).filter(|(f, d)| **f == Some(face) && d.is_some()).count() as u32;
             if nominal == Nominal::Other {
                 return out;
             }
-            // The form vertices: paired with this face, their normal along the nominal's there.
+            // The form vertices: paired with this face, their normal along the nominal's there, outside the edge margin.
+            let edges = boundary(design, face);
             let (mut pts, mut nrm, mut dev_mm) = (Vec::new(), Vec::new(), Vec::new());
             for (i, f) in dev.face_of_vertex.iter().enumerate() {
                 if *f != Some(face) {
@@ -246,6 +289,14 @@ pub fn gdt(scan: &ScanMesh, design: &Design, dev: &Deviation, tol: Tol) -> Vec<F
                     Nominal::Other => Vec3::ZERO,
                 };
                 if n.dot(along).abs() < cos * n.mag() || n.mag_sq() == 0.0 {
+                    continue;
+                }
+                let on = match nominal {
+                    Nominal::Plane(pl) => pl.project(q),
+                    Nominal::Cylinder(c) => q - radial(&c, q) + along * c.radius,
+                    Nominal::Other => q,
+                };
+                if edges.iter().any(|&(a, b)| to_segment(on, a, b) < margin_mm) {
                     continue;
                 }
                 pts.push(q);
