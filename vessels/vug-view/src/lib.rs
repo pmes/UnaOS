@@ -428,3 +428,21 @@ fn shelf(lib: &doc_host::DirLib) -> Vec<doc_core::Stmt> {
         .filter_map(|n| doc_core::read_with(&format!("{}\nmachine {n} lib={n}\n", head.trim_end()), lib).ok()?.stmts.into_iter().next())
         .collect()
 }
+
+// ---- VUGFACEPHOTOCROPDOC (LEDGER SR649): the cropped photo slid under the kept document, beside the open road ----
+
+impl Viewer {
+    /// The saved crop at `path` (offset `at` in the open photo's pixels) under the KEPT face: read back and decoded (the
+    /// file is the truth), then `photo::slid` (the image, H moved by the offset, the crop road on the new file); the
+    /// model, the design (the journal, its snapshots and its dirty mark), `save_to` and `claimed` stay, the title names
+    /// the crop. Nothing changes on an error, which names the file.
+    pub fn swap_photo(&mut self, path: &std::path::Path, at: (u32, u32)) -> Result<(), String> {
+        let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let image = pixel_core::decode(&bytes).map_err(|e| format!("{}: image {e:?}", path.display()))?;
+        let ph = self.view.photo.as_mut().ok_or("no photo is open")?;
+        photo::slid(ph, image, at, path.to_path_buf());
+        self.name = path.file_name().and_then(|s| s.to_str()).unwrap_or("vug").to_string();
+        self.retitle();
+        Ok(())
+    }
+}
