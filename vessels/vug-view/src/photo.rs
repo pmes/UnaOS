@@ -399,7 +399,7 @@ pub fn key(view: &mut View, k: &str) -> Option<bool> {
     let focused = ph.focus.filter(|&i| ph.offers.get(i).is_some_and(|o| o.state == State::Open));
     match k {
         "i" | "I" => Some(ask(view)), // VUGFACEINTENTSEND (SR514): the Propose onto the bus
-        "Tab" | "\t" => {
+        "Tab" | "\t" if !crate::journal::choosing(&view.design) => { // VUGFACEJOURNALFAULTFIXMANY (SR584): an offered fix card takes Tab
             let n = ph.offers.len();
             let start = ph.focus.map(|i| i + 1).unwrap_or(0);
             let next = (0..n).map(|j| (start + j) % n.max(1)).find(|&j| ph.offers[j].state == State::Open && !tail_member(ph, j)); // VUGINTENTSETFACE (SR570): a card is one stop
