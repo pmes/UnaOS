@@ -16,6 +16,8 @@
 //! compositor's own nearest sampler (`video::wm::thumb`, read-only) into R11's pages; the target is the window's
 //! composited size (w*scale x h*scale, the compositor's integer nearest upscale). The CPU reference is that upscale:
 //! `want(x, y) = src[y / scale][x / scale]`. The GPU does NOT present (R12 is the present): the proof is the read-back.
+//! F39GEN7WINDOW (rmbp-ledger B1102): with no wm row (the BOOTLIST's fresh desktop) the source is a centred tile of
+//! the desktop's own surface (`video::wallpaper::back`, read-only, scale 1; `desktop_tile` at the file tail).
 //!
 //! SOURCES (R83 / R95 §2): `rs` = i915 gt/gen7_renderstate.c (linux 24a19b95, SPDX MIT, sha256 52e5ca5b…; the null
 //! state batch rs:18-258 is a textured-quad pipeline and pairs every open row literally), `rc` = gt/gen7_renderclear.c.
@@ -255,24 +257,40 @@ pub(super) fn run(r10: &str) {
             }
         }
     }
-    let Some(win) = best else { return refuse("no-window") };
-    let scale = win.scale.max(1);
-    let (rt_w, rt_h) = (win.w.saturating_mul(scale), win.h.saturating_mul(scale));
-    let rt_pitch = (rt_w.saturating_mul(4) + 63) & !63;
-    if rt_w > DIM_MAX || rt_h > DIM_MAX || rt_pitch.saturating_mul(rt_h) > RT_MAX_BYTES {
-        return refuse("rt-too-large");
-    }
-    let g = Geom { id: win.id, w: win.w, h: win.h, scale, src_pitch: (win.w * 4 + 63) & !63, rt_w, rt_h, rt_pitch };
-    // The copy: `thumb` at tw = w, th = h is the compositor's own nearest sampler at 1:1 (aspect fit degenerates to the
-    // full frame), alpha masked to 0. The window's backing store is video/'s; R12 (present) is where that moves.
+    // F39GEN7WINDOW (rmbp-ledger B1102): no wm row (the BOOTLIST's fresh desktop: nothing typed `tests gen7`, the
+    // furniture is never a row) -> a centred tile of the desktop's own surface (`desktop_tile`, file tail), scale 1,
+    // `Geom.id` 0 (= `wm::WIN_NONE`); `no-window` only when neither a row nor a desktop surface exists.
     let mut src: alloc::vec::Vec<u32> = alloc::vec::Vec::new();
-    if src.try_reserve_exact(g.w * g.h).is_err() {
-        return refuse("alloc");
-    }
-    src.resize(g.w * g.h, 0);
-    if !crate::video::wm::thumb(g.id, &mut src, g.w, g.h) {
-        return refuse("no-surface");
-    }
+    let g = match best {
+        Some(win) => {
+            let scale = win.scale.max(1);
+            let (rt_w, rt_h) = (win.w.saturating_mul(scale), win.h.saturating_mul(scale));
+            let rt_pitch = (rt_w.saturating_mul(4) + 63) & !63;
+            if rt_w > DIM_MAX || rt_h > DIM_MAX || rt_pitch.saturating_mul(rt_h) > RT_MAX_BYTES {
+                return refuse("rt-too-large");
+            }
+            let g = Geom { id: win.id, w: win.w, h: win.h, scale, src_pitch: (win.w * 4 + 63) & !63, rt_w, rt_h, rt_pitch };
+            // The copy: `thumb` at tw = w, th = h is the compositor's own nearest sampler at 1:1 (aspect fit degenerates
+            // to the full frame), alpha masked to 0. The window's backing store is video/'s; R12 (present) is where that moves.
+            if src.try_reserve_exact(g.w * g.h).is_err() {
+                return refuse("alloc");
+            }
+            src.resize(g.w * g.h, 0);
+            if !crate::video::wm::thumb(g.id, &mut src, g.w, g.h) {
+                return refuse("no-surface");
+            }
+            g
+        }
+        None => {
+            let Some((w, h)) = desktop_tile(&mut src) else { return refuse("no-window") };
+            let rt_pitch = (w.saturating_mul(4) + 63) & !63;
+            if w > DIM_MAX || h > DIM_MAX || rt_pitch.saturating_mul(h) > RT_MAX_BYTES {
+                return refuse("rt-too-large");
+            }
+            Geom { id: 0, w, h, scale: 1, src_pitch: rt_pitch, rt_w: w, rt_h: h, rt_pitch }
+        }
+    };
+    let src_tag = if g.id == 0 { alloc::string::String::from("desktop") } else { alloc::format!("{}", g.id) }; // F39GEN7WINDOW (B1102): the wire's `src=`
 
     let bank = *super::super::super::ladder::BANK.lock();
     let Some(b) = bank else { return refuse("no-boot-bank") };
@@ -313,7 +331,7 @@ pub(super) fn run(r10: &str) {
     let (fx, fy, got, want) = o.first.unwrap_or((0, 0, 0, 0));
     serial_println!(
         "[gen7] r11 draw=quad src={}:{}x{}@s{} rt={}x{}:b8g8r8a8 sampled={} mismatch={} landed={} r10={} rows_cited={}/{} ring=rcs cand={} prim=trilist verts=6 pitch={} slots={} pixels={}/{} first={} at=({},{}) got=0x{:08X} want=0x{:08X} fence=0x{:08X} read=0x{:08X} head={:#x} tail={:#x} passed={} idle={} restored=regs:{},fw:{},ptes:{} gpu_us={} us={} reuse={} held_kb={} -> {}",
-        g.id,
+        src_tag,
         g.w,
         g.h,
         g.scale,
@@ -352,7 +370,7 @@ pub(super) fn run(r10: &str) {
     );
     serial_println!(
         ":: GEN7: r11 draw=quad src={} rt={}x{} sampled={} mismatch={} landed={} -> {} ::",
-        g.id,
+        src_tag,
         g.rt_w,
         g.rt_h,
         sampled,
@@ -621,4 +639,38 @@ unsafe fn exec11(bar0: usize, bar0_size: usize, g: &Geom, src: &[u32]) -> Result
         wr(bar0, flsh, 1); crate::drivers::gpu::gen7::assert_no_slot_held("r11-unmap"); // GEN7SLOTNOHOLD (B1047): no slot guard live across this GPU op (gen7.rs tail). LINE-NEUTRAL append
     }
     crate::drivers::gpu::gen7::held_release(&HELD, "r11", out.disabled, out.ptes_restored); Ok(out) // GEN7HELDRELEASE (B1039): the ONE release, behind the disabled confirm + the PTE read-back + R6c's witness (gen7.rs tail). LINE-NEUTRAL append
+}
+
+// F39GEN7WINDOW (rmbp-ledger B1102) — FILE-TAIL append. THE DESKTOP'S OWN SURFACE as R11's source when wm has no row
+// (FLIGHT 39 boot 1: `:: GEN7: r11 draw=quad -> REFUSED reason=no-window ::` under the BOOTLIST, a fresh desktop with
+// zero rows). `video::wallpaper::back()` is the furniture painters' read-only snapshot (an AtomicPtr load, no lock;
+// its buffers live until the second install after this one, far past this bounded copy). The centred
+// min(TILE_W, w) x min(TILE_H, h) box is copied 1:1 into `out`, alpha masked to 0 exactly as `wm::thumb` masks it (so
+// R11_SEED's alpha-0x10 pixel count stays sound). Returns the tile's (w, h), or `None` = no desktop surface (no picture
+// installed, `wallpaper off`, the heap short): the caller's `no-window`. Nothing in video/ is written.
+#[cfg(all(feature = "wc", feature = "facet"))]
+fn desktop_tile(out: &mut alloc::vec::Vec<u32>) -> Option<(usize, usize)> {
+    const TILE_W: usize = 512;
+    const TILE_H: usize = 320;
+    let back = crate::video::wallpaper::back()?;
+    let (tw, th) = (TILE_W.min(back.w), TILE_H.min(back.h));
+    if tw == 0 || th == 0 || back.px.len() < back.w * back.h {
+        return None;
+    }
+    let (x0, y0) = ((back.w - tw) / 2, (back.h - th) / 2);
+    out.clear();
+    if out.try_reserve_exact(tw * th).is_err() {
+        return None;
+    }
+    for y in 0..th {
+        let row = (y0 + y) * back.w + x0;
+        out.extend(back.px[row..row + tw].iter().map(|&p| p & 0x00FF_FFFF));
+    }
+    Some((tw, th))
+}
+
+/// F39GEN7WINDOW (B1102): a `gen7r9` build without the desktop (`wc` + `facet`) has no desktop surface: `no-window`.
+#[cfg(not(all(feature = "wc", feature = "facet")))]
+fn desktop_tile(_out: &mut alloc::vec::Vec<u32>) -> Option<(usize, usize)> {
+    None
 }

@@ -4182,6 +4182,8 @@ pub fn keys_probe() -> (usize, usize) {
 // declares none; its ring is read on the paint the glass would show (the column scrolled by `col_scrolled`, as `open`
 // and `switch_tab` scroll it — tabs 14 and 15 sit past `COL_VIS`); the thinnest ring is >= 2 logical px at the
 // panel's scale (`a11y::selftest`), and every miss prints `[a11y] ring missing tab= stop= row=`.
+// F39A11Y (rmbp-ledger B1101): the reference paint is the keyboard in the pane on no stop and each ring is read inside
+// its stop's own box; every miss also names its kit kind, the ring run and the first changed pixel (`kind= px= at=`).
 
 /// The kit's focus ring outside a Users row's wash (row `r`): width `DIMS.focus_ring` at the panel's scale, the radius
 /// the wash's plus that width — what `draw::focus_ring` draws around a control.
@@ -4194,65 +4196,99 @@ fn row_ring(st: &mut State, r: usize) {
 
 /// `tests a11ytree`'s ring leg. Every stop Tab reaches — on each tab the column (stop 0), then every pane control
 /// (PICKERKEYS B768: the pane's stops, `hits[pane0..]`) — is painted OFFSCREEN holding the keyboard (`kbd`), and the
-/// same tab is painted at rest (focus on the column, no key pressed). The ring is read from the difference: in the
-/// first changed run of its top row, at the run's middle, the changed pixels downward that are the ring's colour (one
-/// anti-aliased pixel skipped at the top). Returns `(stops, rung, ring_px, every stop without a ring as (tab, stop,
-/// row name))`, `ring_px` the thinnest ring seen, in device px. One reused pair of surfaces; a fresh `State` per paint,
-/// so no glide carries between paints. A11YTREE2 (B822): each paint's column is scrolled as the live window scrolls it
+/// same tab is painted as the REFERENCE. The ring is read from the difference: in the first changed run of its top row,
+/// at the run's middle, the changed pixels downward that are the ring's colour (one anti-aliased pixel skipped at the
+/// top). Returns `(stops, rung, ring_px, every stop without a ring as (tab, stop, row name, `kind= px= at=`))`,
+/// `ring_px` the thinnest ring seen, in device px. One reused pair of surfaces; a fresh `State` per paint, so no glide
+/// carries between paints. A11YTREE2 (B822): each paint's column is scrolled as the live window scrolls it
 /// (`col_scrolled`, `open`'s rule), so a tab past [`COL_VIS`] shows its pill and its ring as on the glass.
+/// F39A11Y (rmbp-ledger B1101): the reference is the keyboard in the pane on NO stop (`kbd`, `!strip`, `KF_NONE`), so
+/// a stop's paint differs from it by that stop's ring alone (Users' row wash and row ring are in both); and the first
+/// changed pixel is sought only inside the stop's own BOX — the column for stop 0, else the control's hit rect grown by
+/// `DIMS.focus_ring + 3` logical px — so a pixel that moved between the two paints for another reason (flight 39: the
+/// Resolution caption reading "panel busy" when `panel_info_nonblocking` was refused) cannot stand in for the ring.
 #[cfg(feature = "witness")]
-pub fn ring_probe() -> (usize, usize, usize, Vec<(usize, usize, &'static str)>) {
+pub fn ring_probe() -> (usize, usize, usize, Vec<(usize, usize, &'static str, String)>) {
     let (pw, ph) = (super::metrics::size(WIN_W), super::metrics::size(WIN_H()));
     let (mut a, mut b): (Vec<u32>, Vec<u32>) = (Vec::new(), Vec::new());
     if a.try_reserve_exact(pw * ph).is_err() || b.try_reserve_exact(pw * ph).is_err() {
-        return (0, 0, 0, alloc::vec![(usize::MAX, 0, "-")]);
+        return (0, 0, 0, alloc::vec![(usize::MAX, 0, "-", String::from("oom"))]);
     }
     a.resize(pw * ph, 0);
     b.resize(pw * ph, 0);
     let v0 = CUR.lock().clone();
-    // PICKERKEYS (B768): each paint also returns the pane's stops (the rest paint's count is the tab's)
-    let paint_one = |buf: Vec<u32>, tab: usize, stop: Option<usize>| -> (Vec<u32>, usize, Option<[u16; 4]>) {
+    // PICKERKEYS (B768): each paint also returns the pane's stops (the reference paint's count is the tab's).
+    // F39A11Y (B1101): `None` is the reference (the keyboard in the pane on no stop); each paint also returns the
+    // stop's kit kind (`K_NAMES`, `column` for stop 0).
+    let paint_one = |buf: Vec<u32>, tab: usize, stop: Option<usize>| -> (Vec<u32>, usize, Option<[u16; 4]>, &'static str) {
         let mut st = State::new(WIN_W, WIN_H(), buf, 1, true, col_scrolled(0, tab, TABS)); // A11YTREE2 (B822): the live column
-        if let Some(k) = stop {
-            st.kbd = true;
-            if k > 0 {
+        st.kbd = true;
+        match stop {
+            None => {
+                st.strip = false;
+                st.kf = KF_NONE;
+            }
+            Some(k) if k > 0 => {
                 st.strip = false;
                 st.kf = k - 1;
             }
+            Some(_) => {}
         }
         let mut v = v0.clone();
         v.tab = tab as u8;
         paint(&mut st, &v);
-        let hit = stop.filter(|&k| k > 0).and_then(|k| st.hits.get(st.pane0.saturating_add(k - 1)).copied());
-        (core::mem::take(&mut st.surf), stops(&st).1, hit)
+        let at = stop.filter(|&k| k > 0).map(|k| st.pane0.saturating_add(k - 1));
+        let hit = at.and_then(|i| st.hits.get(i).copied());
+        let kind = match stop {
+            Some(0) => "column",
+            _ => at.and_then(|i| st.meta.get(i)).and_then(|m| K_NAMES.get(m[0] as usize).copied()).unwrap_or("-"),
+        };
+        (core::mem::take(&mut st.surf), stops(&st).1, hit, kind)
     };
     let ring = theme::focus_ring() & 0x00FF_FFFF;
     let near = |p: u32| (0..3).all(|k| ((p >> (8 * k)) & 0xFF).abs_diff((ring >> (8 * k)) & 0xFF) <= 3);
+    let edge = |v: usize, max: usize| (e(v).max(0) as usize).min(max);
     let (mut stops, mut rung, mut thin, mut fail) = (0usize, 0usize, usize::MAX, Vec::new());
     for tab in 0..TABS {
-        let (bb, n_pane, _) = paint_one(b, tab, None);
+        let (bb, n_pane, _, _) = paint_one(b, tab, None);
         b = bb;
         let n = 1 + n_pane;
         for k in 0..n {
-            let (aa, _, hit) = paint_one(a, tab, Some(k));
+            let (aa, _, hit, kind) = paint_one(a, tab, Some(k));
             a = aa;
             stops += 1;
+            // F39A11Y (B1101): the stop's own box, device px `[bx0, bx1) x [by0, by1)`
+            let (bx0, bx1, by0, by1) = match hit {
+                Some(h) if k > 0 => {
+                    let m = draw::DIMS.focus_ring + 3;
+                    let (hx, hy, hw, hh) = (h[0] as usize, h[1] as usize, h[2] as usize, h[3] as usize);
+                    (edge(hx.saturating_sub(m), pw), edge(hx + hw + m, pw), edge(hy.saturating_sub(m), ph), edge(hy + hh + m, ph))
+                }
+                _ if k == 0 => (0, edge(COL_W, pw), 0, ph),
+                _ => (0, 0, 0, 0),
+            };
             let ch = |i: usize| (a[i] & 0x00FF_FFFF) != (b[i] & 0x00FF_FFFF);
-            let px = match (0..pw * ph).find(|&i| ch(i)) {
+            let first = (by0..by1).find_map(|y| (bx0..bx1).find(|&x| ch(y * pw + x)).map(|x| (x, y)));
+            let px = match first {
                 None => 0,
-                Some(i0) => {
-                    let (y0, x0) = (i0 / pw, i0 % pw);
+                Some((x0, y0)) => {
                     let mut x1 = x0;
-                    while x1 + 1 < pw && ch(y0 * pw + x1 + 1) { x1 += 1; }
+                    while x1 + 1 < bx1 && ch(y0 * pw + x1 + 1) { x1 += 1; }
                     let xm = (x0 + x1) / 2;
                     let mut y = y0;
-                    while y < ph && y < y0 + 2 && ch(y * pw + xm) && !near(a[y * pw + xm]) { y += 1; }
+                    while y < by1 && y < y0 + 2 && ch(y * pw + xm) && !near(a[y * pw + xm]) { y += 1; }
                     let mut run = 0;
-                    while y < ph && ch(y * pw + xm) && near(a[y * pw + xm]) { run += 1; y += 1; }
+                    while y < by1 && ch(y * pw + xm) && near(a[y * pw + xm]) { run += 1; y += 1; }
                     run
                 }
             };
-            if px >= 2 { rung += 1; thin = thin.min(px); } else { fail.push((tab, k, ring_row_name(tab, k, hit))); }
+            if px >= 2 {
+                rung += 1;
+                thin = thin.min(px);
+            } else {
+                let at = first.map_or(String::from("-"), |(x, y)| alloc::format!("{},{}", x, y));
+                fail.push((tab, k, ring_row_name(tab, k, hit), alloc::format!("kind={} px={} at={}", kind, px, at)));
+            }
         }
     }
     (stops, rung, if thin == usize::MAX { 0 } else { thin }, fail)

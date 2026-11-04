@@ -6469,7 +6469,7 @@ fn a11yshadow_leg() {
     if m0 != 0 || i0 {
         change(0, false);
     }
-    wm::composite();
+    wm::composite(); let box0 = a11yshadow_settle(win); let mut moved = false; // F39A11Y (rmbp-ledger B1101): the row settled before the probe point is chosen (fn at this file's tail). LINE-NEUTRAL fold, code first.
     // The probe point: the bottom margin of this window's cast, alpha > 0, no window box over it, clear of the sprite.
     let sprite = crate::video::cursor::sprite_box();
     let clear_of_sprite = |x: i32, y: i32| match sprite {
@@ -6522,10 +6522,10 @@ fn a11yshadow_leg() {
             let relaid = wm::a11yshadow::relays().wrapping_sub(r0);
             let (calls, extra) = (af::changes().wrapping_sub(c0), desktop::relay_walks().wrapping_sub(w0));
             serial_println!("[a11y] shadows stale passes={} covered={}", 1 + extra, crate::video::theme::epoch());
-            let ok = after == want && before != want;
+            let ok = after == want && before != want; let (names, mv) = a11yshadow_names(win, OWNER, box0, x, y); moved = mv; // F39A11Y (B1101): box0/box1, the cast, the occluders and the focus at the point. LINE-NEUTRAL fold, code first.
             serial_println!(
-                "[a11y] shadow_follows={} win={} at={},{} alpha={} before={:06x} after={:06x} want={:06x} passes={}",
-                if ok { "ok" } else { "FAIL" }, win, x, y, al, before, after, want, passes
+                "[a11y] shadow_follows={} win={} at={},{} alpha={} before={:06x} after={:06x} want={:06x} passes={} {}",
+                if ok { "ok" } else { "FAIL" }, win, x, y, al, before, after, want, passes, names
             );
             (Some(ok), relaid, calls, extra)
         }
@@ -6535,10 +6535,10 @@ fn a11yshadow_leg() {
     wm::close(win);
     wm::composite();
     if let Some(ok) = verdict {
-        let pass = ok && calls == 1 && extra == 0 && cpass == 1 && lpass != "0" && cwalks == 0;
+        let pass = ok && calls == 1 && extra == 0 && cpass == 1 && lpass != "0" && cwalks == 0 && !moved; // F39A11Y (B1101): a row that moved under the probe is a FAIL named `moved=1`
         serial_println!(
-            ":: A11YSHADOW: shadow_follows={} relaid={} changed_calls={} extra_pass={} contrast_pass={} lens_pass={} relay_walks={} -> {} ::",
-            if ok { "ok" } else { "FAIL" }, relaid, calls, extra, cpass, lpass, extra + cwalks, if pass { "PASS" } else { "FAIL" }
+            ":: A11YSHADOW: shadow_follows={} relaid={} changed_calls={} extra_pass={} contrast_pass={} lens_pass={} relay_walks={} moved={} -> {} ::",
+            if ok { "ok" } else { "FAIL" }, relaid, calls, extra, cpass, lpass, extra + cwalks, moved as u8, if pass { "PASS" } else { "FAIL" }
         );
     }
 }
@@ -8657,4 +8657,59 @@ fn keyboot_words_key_leg() {
     }
     #[cfg(not(any(all(target_arch = "x86_64", feature = "wc", feature = "unafs"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
     serial_println!(":: WORDSKEY: unlock=not-built -> SKIP (no words sheet in this build) ::");
+}
+
+// F39A11Y (rmbp-ledger B1101, BP-video-25 kept) — TAIL-APPENDED: `a11yshadow_leg`'s settle and its names. FLIGHT 39 boot 1
+// read `shadow_follows=FAIL` with after = the background inverted EXACTLY (the shadow absent at the point, not stale) and
+// the point at 132,376 though the leg asked the panel's centre: a row that moves after the point is chosen gets its old
+// extent filled flat. The leg now waits for the row to settle, and every verdict names what held the point afterwards.
+
+/// The row's content box `(x, y, w, h)` from the window table (`wm::info`), or `None` when the row is gone.
+#[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+fn a11yshadow_box(win: crate::video::wm::WinId) -> Option<(usize, usize, usize, usize)> {
+    crate::video::wm::info(win).map(|i| (i.x, i.y, i.w, i.h))
+}
+
+/// Composite (5 ms apart) up to 8 passes until the row's box reads the same on two passes; that box.
+#[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+fn a11yshadow_settle(win: crate::video::wm::WinId) -> Option<(usize, usize, usize, usize)> {
+    let mut last = a11yshadow_box(win);
+    for _ in 0..8 {
+        let t = crate::arch::ms() + 5;
+        while crate::arch::ms() < t {
+            crate::arch::sched::yield_now();
+        }
+        crate::video::wm::composite();
+        let now = a11yshadow_box(win);
+        if now == last {
+            break;
+        }
+        last = now;
+    }
+    last
+}
+
+/// After the filter change: `box0=<x>,<y>,<w>,<h> box1=.. cast1=<alpha|-> occ1=<in|out> focus1=<held|moved>` and
+/// whether the row moved (`box0 != box1`). `cast1` = the row's published cast's alpha at the point (`-`: no cast),
+/// `occ1` = the point inside a box the desktop present leaves alone (`wm::occluders`), `focus1` = wm's focus still ours.
+#[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+fn a11yshadow_names(win: crate::video::wm::WinId, owner: u64, box0: Option<(usize, usize, usize, usize)>, x: i32, y: i32) -> (alloc::string::String, bool) {
+    use crate::video::wm::{self, desktop};
+    let fmt_box = |b: Option<(usize, usize, usize, usize)>| b.map_or(alloc::string::String::from("-"), |(bx, by, bw, bh)| alloc::format!("{},{},{},{}", bx, by, bw, bh));
+    let box1 = a11yshadow_box(win);
+    let cast1 = desktop::casts_now().iter().find(|c| c.id == win).copied().map(|c| {
+        let mut al = 0u32;
+        c.for_each_alpha(y, x, x + 1, |_, a| al = a);
+        al
+    });
+    let mut occ: alloc::vec::Vec<(usize, usize, usize, usize)> = alloc::vec::Vec::new();
+    let _ = wm::occluders(&mut occ);
+    let (ux, uy) = (x as usize, y as usize);
+    let inside = occ.iter().any(|&(ox, oy, ow, oh)| ux >= ox && ux < ox + ow && uy >= oy && uy < oy + oh);
+    let names = alloc::format!(
+        "box0={} box1={} cast1={} occ1={} focus1={}",
+        fmt_box(box0), fmt_box(box1), cast1.map_or(alloc::string::String::from("-"), |a| alloc::format!("{}", a)),
+        if inside { "in" } else { "out" }, if wm::focus_asid() == owner { "held" } else { "moved" }
+    );
+    (names, box0 != box1)
 }

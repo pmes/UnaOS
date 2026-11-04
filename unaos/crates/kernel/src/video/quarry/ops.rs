@@ -379,17 +379,24 @@ fn menu_paint(px: &mut [u32], g: &Geom, x: usize, y: usize, hover: Option<usize>
 }
 
 /// MENUS2 (B652) — `tests menuscraft`'s `quarry_menu=` and `band_exact=` legs: `(menu ok, band exact)`. The live
-/// painter ([`menu_paint`]) over a pure geometry (`geometry(1280, 800)`), item 0 hovered, into two surfaces of
+/// painter ([`menu_paint`]) over a pure geometry (`geometry(px(1280), px(800))`: the logical 1280x800 desktop at the
+/// live scale, MENUPROBESCALE B1100 — the menu sizes at that scale too), item 0 hovered, into two surfaces of
 /// different fills (`surface.content`, then the accent). Menu ok: the body's centre is `surface.overlay`, the pill
 /// sits inside the inset (accent at the body's right inner edge, the face outside the inset), no pure white in the
 /// outer rect. Band exact: the band pixel beside the body is darker than its own fill in BOTH surfaces and differs
 /// between them — the shadow blended over the true pixels beneath, not over an estimate.
 pub fn sheet_probe() -> (bool, bool) {
     use crate::video::crystal::sheet;
-    let Some(g) = geometry(1280, 800) else { return (false, false) };
+    // MENUPROBESCALE (B1100): the probe's panel at the LIVE scale — a physical 1280x800 at s2=4 is a 640-logical panel
+    // (g.h 480) under a menu sized at scale 2 (504 tall), and both legs read BAD from the fit refusal (flight 39).
+    let Some(g) = geometry(crate::ui::px(1280), crate::ui::px(800)) else {
+        serial_println!("[menuscraft] quarry_probe declined surf=none menu=-");
+        return (false, false);
+    };
     let (w, h) = (menu_w(&g), menu_h(&g));
     let (bw, bh, pady) = menu_body(&g);
     if w > g.w || h > g.h {
+        serial_println!("[menuscraft] quarry_probe declined surf={}x{} menu={}x{}", g.w, g.h, w, h); // MENUPROBESCALE (B1100)
         return (false, false);
     }
     let fills = [theme::surface_content() & 0x00FF_FFFF, theme::accent() & 0x00FF_FFFF];

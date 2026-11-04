@@ -32,7 +32,7 @@
 //!
 //! WIRE: `una_abi`'s A11YTREE block (8-byte header, 64-byte nodes, 63 per page). [`bus_tree`] is the verb's body;
 //! [`selftest`] is `tests a11ytree`:
-//! `:: A11YTREE: windows=<n> nodes=<n> unnamed=<n> focus=<ok|FAIL> ring_px=<n> s2=<n> stops=<rung>/<n> wire=<ok|why> -> PASS|FAIL ::`.
+//! `:: A11YTREE: windows=<n> nodes=<n> unnamed=<n> focus=<ok|FAIL> ring_px=<n> s2=<n> stops=<rung>/<n> missed=<n> wire=<ok|why> -> PASS|FAIL ::`.
 
 use alloc::vec::Vec;
 
@@ -238,7 +238,9 @@ pub fn bus_tree(in_session: bool, body: &[u8], text: &mut Vec<u8>) -> i64 {
 /// decoder (`wire=`), its windows counted against a second walk, every node named (`unnamed=`), the focused node
 /// the row `wl_focused` names and the only one flagged (`focus=`), and Settings' ring at every Tab stop
 /// (`settings::ring_probe`: `ring_px=` the thinnest in device px against 2 logical px at the panel's scale `s2=`,
-/// `stops=` rung/all; A11YTREE2 B822: every miss its own `[a11y] ring missing tab=<n>(<name>) stop=<k> row=<name>`).
+/// `stops=` rung/all; A11YTREE2 B822: every miss its own `[a11y] ring missing tab=<n>(<name>) stop=<k> row=<name>`;
+/// F39A11Y B1101: each ring read inside its stop's own box against the keyboard-on-no-stop paint, every miss gaining
+/// `kind=<kit kind> px=<n> at=<x>,<y>|-` and the line `missed=<n>`).
 #[cfg(feature = "witness")]
 pub fn selftest() {
     let t = build();
@@ -281,13 +283,13 @@ pub fn selftest() {
     // A11YTREE2 (B822): BP-bar-22's 2 px is logical — the floor at the panel's scale (`ring_px` is device px)
     let floor = crate::video::metrics::size(2);
     let ok = wire == "ok" && windows == live && unnamed == 0 && focus_ok && stops > 0 && rung == stops && ring_px >= floor;
-    for (tab, stop, row) in misses.iter() {
+    for (tab, stop, row, why) in misses.iter() {
         let name = crate::video::settings::TAB_NAMES.get(*tab).copied().unwrap_or("-");
-        serial_println!("[a11y] ring missing tab={}({}) stop={} row={}", tab, name, stop, row);
+        serial_println!("[a11y] ring missing tab={}({}) stop={} row={} {}", tab, name, stop, row, why); // F39A11Y (B1101): `kind= px= at=`
     }
     serial_println!(
-        ":: A11YTREE: windows={} nodes={} unnamed={} focus={} ring_px={} s2={} stops={}/{} wire={} -> {} ::",
+        ":: A11YTREE: windows={} nodes={} unnamed={} focus={} ring_px={} s2={} stops={}/{} missed={} wire={} -> {} ::",
         windows, t.nodes.len(), unnamed, if focus_ok { "ok" } else { "FAIL" }, ring_px, crate::video::metrics::s2(), rung,
-        stops, wire, if ok { "PASS" } else { "FAIL" }
+        stops, misses.len(), wire, if ok { "PASS" } else { "FAIL" }
     );
 }
