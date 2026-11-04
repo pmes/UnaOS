@@ -1431,12 +1431,12 @@ exec-rmbp-vugfacephotoprefline eb705bcdd wave36 cut57
 exec-rmbp-vugintentsetfaceanchoredoverlap eb705bcdd wave36 cut57
 exec-rmbp-vugcomscanenvelopereadon eb705bcdd wave36 cut57
 exec-rmbp-vugfacejournalsolidfaultfix eb705bcdd wave36 cut57
-exec-rmbp-f39busregtagidentity 4e18c6bb4 wave36 cut59
-exec-rmbp-f39prefselfrelaunch 4e18c6bb4 wave36 cut59
-exec-rmbp-f39hidcensuspi 4e18c6bb4 wave36 cut59
-exec-rmbp-f39machinekeydefaultpin 4e18c6bb4 wave36 cut59
-exec-rmbp-f39prefsunsetverb 4e18c6bb4 wave36 cut59
-exec-rmbp-f39machinestorestampring3 4e18c6bb4 wave36 cut59
+exec-rmbp-f39busregtagidentity db630ad78 FOLDED (kernel batch B1157-B1162)
+exec-rmbp-f39prefselfrelaunch 4e18c6bb4 FOLDED (kernel batch B1157-B1162)
+exec-rmbp-f39hidcensuspi cdd4f3755 FOLDED (kernel batch B1157-B1162)
+exec-rmbp-f39machinekeydefaultpin b039ad8fb FOLDED (kernel batch B1157-B1162)
+exec-rmbp-f39prefsunsetverb 4e18c6bb4 FOLDED (kernel batch B1157-B1162)
+exec-rmbp-f39machinestorestampring3 4e18c6bb4 FOLDED (kernel batch B1157-B1162)
 exec-rmbp-vugfacefieldkeys 364b81387 wave36 cut58
 exec-rmbp-vugfacedeviationheld 364b81387 wave36 cut58
 exec-rmbp-vugintentsetfacelistedoverlap 364b81387 wave36 cut58
