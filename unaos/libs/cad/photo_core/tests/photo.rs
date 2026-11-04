@@ -1293,3 +1293,95 @@ fn a_thin_side_gap_does_not_split_it() {
         m.solved.dof
     );
 }
+
+// ---- VUGPHOTOOFFAXIS (SR670): a part's own sides off the paper's axes are Perpendicular / Parallel (named tail block) ----
+/// (H / V, Perpendicular, Parallel) row counts of a sketch.
+fn oa_counts(sk: &sketch_core::Sketch) -> (usize, usize, usize) {
+    let mut c = (0, 0, 0);
+    for c0 in (0u32..).map(sketch_core::ConstraintId).map_while(|id| sk.constraint(id).copied()) {
+        match c0 {
+            Constraint::Horizontal(_) | Constraint::Vertical(_) => c.0 += 1,
+            Constraint::Perpendicular(..) => c.1 += 1,
+            Constraint::Parallel(..) => c.2 += 1,
+            _ => {}
+        }
+    }
+    c
+}
+
+/// A closed loop turned `deg` about the origin and moved by `at`.
+fn oa_turn(p: Vec2, deg: f64, at: Vec2) -> Vec2 {
+    let (s, c) = deg.to_radians().sin_cos();
+    Vec2::new(c * p.x - s * p.y + at.x, s * p.x + c * p.y + at.y)
+}
+
+#[test]
+fn relations_off_the_paper_axes() {
+    // ALIGNED: the good plate at 1.5° keeps its four H / V and nothing new: dof 10 as SR503.
+    let m0 = run(&Spec::good()).expect("the good photo measures");
+    let (hv0, perp0, par0) = oa_counts(&m0.sketch);
+    assert_eq!((hv0, perp0, par0), (4, 0, 0), "the aligned plate's relations");
+    assert_eq!(m0.solved.dof, 10, "aligned dof");
+
+    // TURNED: the same plate at 5°: no H / V, the three consecutive line pairs Perpendicular (bottom-right, top-left,
+    // left-bottom; the arc separates right from top), both Parallels implied by them (not pushed), no redundant row;
+    // dof = aligned + 1, the part's rotation on the paper that H / V pinned.
+    let s = Spec { part_rot_deg: 5.0, ..Spec::good() };
+    let m = run(&s).expect("the turned good photo measures");
+    let (hv, perp, par) = oa_counts(&m.sketch);
+    eprintln!(
+        "photo: offaxis rot={:.1} hv={hv} perp={perp} par={par} redundant={} dof={} aligned_dof={} aligned_perp={perp0} aligned_par={par0}",
+        s.part_rot_deg,
+        m.solved.redundant.len(),
+        m.solved.dof,
+        m0.solved.dof
+    );
+    assert_eq!(m.shape.counts(), m0.shape.counts(), "the turned plate fits the same primitives");
+    assert_eq!((hv, perp, par), (0, 3, 0), "the turned plate's relations");
+    assert!(m.solved.redundant.is_empty(), "a redundant row: {:?}", m.solved.redundant);
+    assert_eq!(m.solved.dof, m0.solved.dof + 1, "turned dof");
+
+    // PARALLELOGRAM (63.4° corners) turned 20°: no corner near 90°, so the two pairs of opposite sides Parallel.
+    let at = Vec2::new(10.0, 10.0);
+    let q: Vec<Vec2> = [(0.0, 0.0), (40.0, 0.0), (50.0, 20.0), (10.0, 20.0)]
+        .iter()
+        .map(|&(x, y)| oa_turn(Vec2::new(x, y), 20.0, at))
+        .collect();
+    let outer: Vec<Prim> = (0..4).map(|k| Prim::Line { a: q[k], b: q[(k + 1) % 4], rms: 0.0 }).collect();
+    let o = photo_core::Outline { outer, holes: Vec::new(), sigma_mm: 0.125, thin: vec![Vec::new()] };
+    let pg = photo_core::sketch::to_sketch(&o, Tol::DEFAULT).expect("the parallelogram sketches");
+    let (pg_hv, pg_perp, pg_par) = oa_counts(&pg.sketch);
+    assert_eq!((pg_hv, pg_perp, pg_par), (0, 0, 2), "the parallelogram's relations");
+    assert!(pg.solved.redundant.is_empty(), "a redundant row: {:?}", pg.solved.redundant);
+    assert_eq!(pg.solved.dof, 6, "parallelogram dof");
+
+    // OBROUND (20 between R5 ends) turned 20°: its two lines share two tangent arcs, which with EqualRadius already
+    // hold them parallel: no Parallel, no redundant row, dof 5 (place 2, turn 1, length 1, radius 1).
+    let t = |x: f64, y: f64| oa_turn(Vec2::new(x, y), 20.0, at);
+    let arc = |c: Vec2, from: Vec2, to: Vec2| Prim::Arc {
+        centre: c,
+        r: 5.0,
+        from,
+        to,
+        ccw: true,
+        tangent_in: true,
+        tangent_out: true,
+        rms: 0.0,
+    };
+    let outer = vec![
+        Prim::Line { a: t(-10.0, -5.0), b: t(10.0, -5.0), rms: 0.0 },
+        arc(t(10.0, 0.0), t(10.0, -5.0), t(10.0, 5.0)),
+        Prim::Line { a: t(10.0, 5.0), b: t(-10.0, 5.0), rms: 0.0 },
+        arc(t(-10.0, 0.0), t(-10.0, 5.0), t(-10.0, -5.0)),
+    ];
+    let o = photo_core::Outline { outer, holes: Vec::new(), sigma_mm: 0.125, thin: vec![Vec::new()] };
+    let ob = photo_core::sketch::to_sketch(&o, Tol::DEFAULT).expect("the obround sketches");
+    let (ob_hv, ob_perp, ob_par) = oa_counts(&ob.sketch);
+    eprintln!(
+        "photo: offaxis parallelogram par={pg_par} perp={pg_perp} dof={} obround par={ob_par} perp={ob_perp} dof={}",
+        pg.solved.dof, ob.solved.dof
+    );
+    assert_eq!((ob_hv, ob_perp, ob_par), (0, 0, 0), "the obround's relations");
+    assert!(ob.solved.redundant.is_empty(), "a redundant row: {:?}", ob.solved.redundant);
+    assert_eq!(ob.solved.dof, 5, "obround dof");
+}
