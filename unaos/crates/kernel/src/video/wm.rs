@@ -872,7 +872,7 @@ pub fn app_name_arm(owner: u64, path: &str) -> bool {
         }
         None => false,
     };
-    drop(t); if armed { app_name_adopt(owner, &name[..len]); } armed // WINTITLE-LATE — ⚠ SAME-LINE fold, line-NEUTRAL. The APP_NAMES guard is DROPPED first and by name: that mutex is a LEAF (see its doc), `app_name_adopt` takes `TABLE`, and a leaf held across the table acquisition would put APP_NAMES into the WINDOWS ⊃ TABLE ⊃ WRITER order that `create_inner` deliberately keeps it out of. Only on a successful arm — a full name table has nothing to adopt WITH, and re-titling rows to a name that is not in the registry would leave a caption no `mint_title` could ever reproduce.
+    drop(t); if armed && app_record_owner(owner) == owner { app_name_adopt(owner, &name[..len]); } armed // ARMLATE-ADOPT (B1188): a STALE late arm (stamped before its tenant's teardown, `app_record_owner` keys 0) adopts nothing, so the next tenant's open `Unnamed` window keeps its noun and provenance; both roads (`app_name_arm_launch` arms through here); the APP_PATHS leaf is read after the APP_NAMES drop and before TABLE. WINTITLE-LATE — ⚠ SAME-LINE fold, line-NEUTRAL. The APP_NAMES guard is DROPPED first and by name: that mutex is a LEAF (see its doc), `app_name_adopt` takes `TABLE`, and a leaf held across the table acquisition would put APP_NAMES into the WINDOWS ⊃ TABLE ⊃ WRITER order that `create_inner` deliberately keeps it out of. Only on a successful arm — a full name table has nothing to adopt WITH, and re-titling rows to a name that is not in the registry would leave a caption no `mint_title` could ever reproduce.
 }
 
 /// WINTITLE-LATE — **the catch-up half of [`app_name_arm`]: title the windows `owner` ALREADY
@@ -26933,7 +26933,7 @@ fn wintitle_selftest() {
         Some(unnamed_first && armed_late && named && title_source_of(wl) == TitleSource::Program)
     };
     close(wl);
-    app_name_forget(ASID_T);
+    app_name_forget(ASID_T); let stale_ok = wintitle_stale_leg(ASID_T, sa, len); // ARMLATE-ADOPT (B1188): the stale-owner leg (a back-dated mint note, a late arm over an open Unnamed window; body at this file's tail) — ⚠ LINE-NEUTRAL fold
 
     let ok = pn_ok
         && doc_ok
@@ -26943,9 +26943,9 @@ fn wintitle_selftest() {
         && decl_ok
         && row_ok != Some(false)
         && forget_ok
-        && late_ok != Some(false);
+        && late_ok != Some(false) && stale_ok != Some(false);
     serial_println!(
-        ":: WINTITLE: program_name={} document={} label={} seam=\"{}\" program={} no-seq={} declared={} row={} forget={} late-arm={} {} ::",
+        ":: WINTITLE: program_name={} document={} label={} seam=\"{}\" program={} no-seq={} declared={} row={} forget={} late-arm={} stale={} {} ::",
         pn_ok as u8,
         doc_ok as u8,
         label_ok as u8,
@@ -26964,7 +26964,7 @@ fn wintitle_selftest() {
             Some(false) => "0",
             None => "skip",
         },
-        if ok { "PASS" } else { "FAIL" }
+        wintitle_stale_word(stale_ok), if ok { "PASS" } else { "FAIL" }
     );
     composite();
 }
@@ -33953,5 +33953,62 @@ fn app_record_owner(owner: u64) -> u64 {
     match stamp {
         Some(s) if s != now => 0,
         _ => owner,
+    }
+}
+
+// =================================================================================================
+// ARMLATE-ADOPT (rmbp-ledger B1188) — TAIL-APPENDED. The knob-off leg ARMLATE-KNOBOFF (B1184) left owed: a STALE late
+// arm (its stamp is the mint generation of a tenant already torn down) must not re-title an `Unnamed` window the
+// owner's NEXT tenant opened. The gate is the in-place `app_record_owner(owner) == owner` on [`app_name_arm`]'s adopt
+// line (both roads: [`app_name_arm_launch`] arms through it); this leg drives it. The owner is
+// [`wintitle_selftest`]'s own out-of-range one (`slot_gen` answers u64::MAX for it), its mint note back-dated one
+// generation through [`app_mint_note`] so the late arm's stamp compares stale, and RESTORED after. Witness: `tests wm`
+// → `:: WINTITLE: … stale=unnamed PASS ::` (go-red without the gate: `stale=adopted`).
+// =================================================================================================
+/// ARMLATE-ADOPT — the stale-owner leg: `Some(true)` = the window kept its noun and `Unnamed` provenance under a stale
+/// late arm, `Some(false)` = the stale arm adopted it, `None` = skip (full table).
+#[cfg(all(feature = "witness", any(target_arch = "x86_64", feature = "aarch64_el0")))]
+fn wintitle_stale_leg(owner: u64, sa: usize, len: usize) -> Option<bool> {
+    let now = armlate_now(owner);
+    let prev = app_mint_note(owner, Some(now.wrapping_sub(1)));
+    app_name_forget(owner);
+    let w = create(owner, sa, len, 8, 8, 32, b"el0 win 8");
+    let res = if w == WIN_NONE {
+        None
+    } else {
+        let unnamed_first = title_source_of(w) == TitleSource::Unnamed && {
+            let t = table();
+            let v = row(&t, w).is_some_and(|r| r.title[..r.title_len] == *ANON_APP);
+            drop(t);
+            v
+        };
+        // The predecessor's launcher arms LATE, after this tenant's window exists: stamped with the back-dated note.
+        let armed_late = app_name_arm(owner, "/apps/VUG.ELF");
+        let t = table();
+        let kept = row(&t, w).is_some_and(|r| r.title[..r.title_len] == *ANON_APP);
+        drop(t);
+        let mut buf = [0u8; MAX_TITLE];
+        let (_, ms) = mint_title(owner, b"el0 win 8", &mut buf);
+        Some(unnamed_first && armed_late && kept && title_source_of(w) == TitleSource::Unnamed && ms == TitleSource::Unnamed)
+    };
+    close(w);
+    app_name_forget(owner);
+    app_mint_note(owner, prev);
+    res
+}
+
+/// ARMLATE-ADOPT — a build with no arch generation has no stale stamp to drive: skip.
+#[cfg(all(feature = "witness", not(any(target_arch = "x86_64", feature = "aarch64_el0"))))]
+fn wintitle_stale_leg(_owner: u64, _sa: usize, _len: usize) -> Option<bool> {
+    None
+}
+
+/// ARMLATE-ADOPT — the WINTITLE wire's `stale=` word.
+#[cfg(feature = "witness")]
+fn wintitle_stale_word(v: Option<bool>) -> &'static str {
+    match v {
+        Some(true) => "unnamed",
+        Some(false) => "adopted",
+        None => "skip",
     }
 }
