@@ -1685,7 +1685,7 @@ fn deleted_post(cleared: &[(String, String)]) {
     if cleared.is_empty() {
         return;
     }
-    let out: Vec<(String, String, Option<prefs_core::schema::Applied>)> = cleared.iter().map(|(ns, k)| (ns.clone(), k.clone(), default_applied(ns, k))).collect();
+    let out: Vec<(String, String, Option<prefs_core::schema::Applied>)> = cleared.iter().map(|(ns, k)| (ns.clone(), k.clone(), unset_posted(ns, k))).collect(); // UNSET-POST-ROADS (rmbp-ledger B1179): the delete road posts the one rule `unset_posted` (file tail). LINE-NEUTRAL fold, code first
     let unset = out.iter().filter(|c| c.2.is_none()).count();
     let sent = post_changes(&out);
     deleted_note(cleared.len(), sent);
@@ -1710,7 +1710,7 @@ fn reload_post(old: &PrefTree, t0: u64) -> usize {
         }
     }
     let n = out.len() + gone.len();
-    let unset = gone.iter().filter(|(ns, k)| { let a = default_applied(ns, k); let none = a.is_none(); out.push((ns.clone(), k.clone(), a)); none }).count();
+    let unset = gone.iter().filter(|(ns, k)| { let a = unset_posted(ns, k); let none = a.is_none(); out.push((ns.clone(), k.clone(), a)); none }).count(); // UNSET-POST-ROADS (rmbp-ledger B1179): the reload road posts the one rule `unset_posted` (file tail). LINE-NEUTRAL fold, code first
     let sent = post_changes(&out);
     serial_println!("[prefs] reload gen={} changed={} sent={} unsent={} unset={} ms={}", session_gen(), n, sent, n - sent, unset, crate::arch::ms().saturating_sub(t0)); // PREFSRELOAD (B763) + PREFSDELETED (B755) + PREFSUNSET (SR169): the ONE reload line
     n
@@ -1899,8 +1899,8 @@ pub(crate) fn store_read(p: &str) -> Option<Vec<u8>> {
 // reload already keep — removed from the tree (never the default written into the user's file), its domain saved by the
 // same swap (`KernelPersist` -> `save_domain`, rolled back on a failed save), then ONE post through [`post_changes`] of
 // [`default_applied`]: the static or declared default as `Some`, SR169's unset form (`None`) only for a Consumer-default or
-// undeclared key; MACHINE-KEY-DEFAULT-PIN (B1173): a `MACHINE_KEYS` row posts the unset form ([`unset_posted`]), so the
-// mirror removes it (B1154's `=unset`). The bus unset is PREFS-UNSET-BUS (B1166, `store_unset` below). The
+// undeclared key; MACHINE-KEY-DEFAULT-PIN (B1173) + UNSET-POST-ROADS (B1179): a `MACHINE_KEYS` row or a static-default key
+// posts the unset form ([`unset_posted`]), so the mirror removes a machine key (B1154's `=unset`). The bus unset is PREFS-UNSET-BUS (B1166, `store_unset` below). The
 // writers column admits the operator for every key (`prefs_core::schema::Writer`), so there is no new check.
 // Wire: `[prefs] unset <ns>.<key> ok=1` (+ `[prefs] changed <ns>.<key>`), `ok=1 was=unset`, `ok=0 why=<e>`.
 
@@ -1950,8 +1950,8 @@ fn unset_verb(a: &str, out: &mut dyn FnMut(&str)) {
 }
 
 /// `tests prefs`' unset line (B1161): a fixture key leaves the tree and its file; a second unset writes nothing; a
-/// Consumer-default key posts the unset form; a static-default key is removed (never written as its default) and posts
-/// the default; a malformed address is refused. The tree and every domain file touched are restored byte for byte.
+/// Consumer-default key posts the unset form; a static-default key is removed (never written as its default) and reads
+/// the default (it posts the unset form, UNSET-POST-ROADS B1179); a malformed address is refused. The tree and every domain file touched are restored byte for byte.
 /// `:: PREFS-UNSET: removed=1 again=noop consumer=unset static=0 name=refused restored=1 -> PASS ::`.
 #[cfg(feature = "witness")]
 fn unset_selftest() {
@@ -2370,14 +2370,17 @@ fn prefscap_path_legs() {
 // (the kernel's `changes_drain`, ring 3's theme HINT) or falls back per key (`settings::a11y_load("machine")`) and takes
 // the static default from `prefs_core::schema` (B1160 pins it static), and no consumer reads the frame's value; so
 // `machine_mirror` removes the key from the machine copy by B1154's None arm instead of writing the default literal.
-// Every other key keeps [`default_applied`]. The delete watch and the reload still post `default_applied` (UNSET-POST-ROADS
-// owed). Wire: `[prefs] machine settings/<d> system.<k>=unset wrote=1`, `[prefs] unset <a> ok=1 posted=<unset|lit> via=bus …`.
+// UNSET-POST-ROADS (B1179): ONE rule on the three roads ([`unset`], the delete watch's [`deleted_post`], the reload's
+// [`reload_post`]), and a STATIC-default key (`schema::default_of` -> `Source::Default`) posts the unset form too, as the
+// host ring does: no consumer reads the value and the post path writes no session file (the store already lacks the key).
+// A Rule-default or declared `app.*` key keeps [`default_applied`] (UNSET-POST-RULE owed). Wire: `[prefs] machine settings/<d> system.<k>=unset wrote=1`, `[prefs] unset <a> ok=1 posted=<unset|lit> via=bus …`.
 
-/// The PrefChanged value [`unset`] posts for `ns`/`k` (see the block above). Called with no prefs lock held.
+/// The PrefChanged value [`unset`], [`deleted_post`] and [`reload_post`] post for `ns`/`k` (see the block above). Called with no prefs lock held.
 fn unset_posted(ns: &str, k: &str) -> Option<prefs_core::schema::Applied> {
     if ns == NS && MACHINE_KEYS.contains(&k) {
         return None;
     }
+    if ns != prefs_core::files::APP_NS && matches!(prefs_core::schema::default_of(ns, k, &StoreEnv), Some((_, prefs_core::schema::Source::Default))) { return None; } // UNSET-POST-ROADS (rmbp-ledger B1179): a static-default key posts the unset form too (the block above). Named in-place hunk
     default_applied(ns, k)
 }
 
@@ -2394,7 +2397,7 @@ fn unset_posted_word(body: &[u8]) -> String {
 /// UNSET `system.accessibility.reduce_motion` (a ring-3 settable row) through [`bus_fulfil_from`]; the post is the unset
 /// form, the key is gone, and (in a session) the machine copy no longer holds it. The session domain file, the machine
 /// file, the tree and ON_DISK are restored byte for byte.
-/// `:: MACHINE-KEY-UNSET: set=1 unset=0 posted=unset mirror=<removed|nosession> restored=1 -> PASS ::`.
+/// `:: MACHINE-KEY-UNSET: set=1 unset=0 posted=unset roads=3 mirror=<removed|nosession> restored=1 -> PASS ::`.
 #[cfg(all(feature = "witness", any(feature = "aarch64_el0", target_arch = "x86_64")))]
 fn machine_unset_leg(owner: u64) {
     use prefs_core::wire::{VERB_SET, VERB_UNSET};
@@ -2418,6 +2421,7 @@ fn machine_unset_leg(owner: u64) {
     } else {
         "removed"
     };
+    let (del, rel) = unset_roads_leg(&sp, &mp, session); let roads = (posted && mirror != "KEPT") as u8 + del as u8 + rel as u8; // UNSET-POST-ROADS (rmbp-ledger B1179): the delete and reload roads, before the restore below (file tail). Named in-place hunk
     // Restore the files, the tree and ON_DISK.
     let mt = crate::shell::vfs_mount_table();
     for (p, b) in [(&sp, &s0), (&mp, &m0)] {
@@ -2433,10 +2437,10 @@ fn machine_unset_leg(owner: u64) {
     *TREE.lock() = tree0;
     *ON_DISK.lock() = on_disk0;
     let restored = read_all(&sp) == s0 && read_all(&mp) == m0;
-    let ok = set && st == 0 && posted && mirror != "KEPT" && restored;
+    let ok = set && st == 0 && posted && mirror != "KEPT" && restored && roads == 3; // UNSET-POST-ROADS (rmbp-ledger B1179): `roads=` (named in-place hunk)
     serial_println!(
-        ":: MACHINE-KEY-UNSET: set={} unset={} posted={} mirror={} restored={} -> {} ::",
-        set as u8, st, if posted { "unset" } else { "VALUE" }, mirror, restored as u8, if ok { "PASS" } else { "FAIL" }
+        ":: MACHINE-KEY-UNSET: set={} unset={} posted={} roads={} mirror={} restored={} -> {} ::",
+        set as u8, st, if posted { "unset" } else { "VALUE" }, roads, mirror, restored as u8, if ok { "PASS" } else { "FAIL" }
     );
 }
 
@@ -2483,4 +2487,37 @@ fn prefscap_early_legs(owner: u64, demoted: &dyn Fn(&str) -> Option<bool>) -> (b
     let gone = crate::video::wm::app_path_early_of(owner, g, |_| true).is_none()
         && crate::video::wm::app_path_early_of(owner, g.wrapping_add(1), |_| true).is_none();
     (early, stale, gone)
+}
+
+// ── UNSET-POST-ROADS (rmbp-ledger B1179, BP-storage-11) — TAIL-APPENDED ────────────────────────────────────────────────
+// [`machine_unset_leg`]'s second and third roads for `system.accessibility.reduce_motion`, run before that leg's restore
+// (which puts the session domain file, the machine file, the tree and ON_DISK back byte for byte). The delete road: the
+// key is set, the session domain file holding it is deleted, [`watch_deleted`] clears the domain and [`deleted_post`]
+// posts [`unset_posted`]'s unset form, so the machine copy loses the key. The reload road: the key is set, the store is
+// saved without it while RAM still holds it, [`reload_session`] re-reads the store and [`reload_post`] posts the unset
+// form for the key that left. Each road passes when the key is gone and (in a session) the machine copy no longer holds it.
+// Wire: `[prefs] machine settings/general system.accessibility.reduce_motion=unset wrote=1` once per road, then
+// `[prefs] deleted -> changed … unset=<n>` / `[prefs] reload … changed=1 sent=1 unsent=0 unset=1 …`.
+
+/// The delete and reload roads (see the block above): `(delete_ok, reload_ok)`. `sp` = the session domain file, `mp` = the
+/// machine copy's file, `session` = a session home is mounted.
+#[cfg(all(feature = "witness", any(feature = "aarch64_el0", target_arch = "x86_64")))]
+fn unset_roads_leg(sp: &str, mp: &str, session: bool) -> (bool, bool) {
+    const K: &str = "accessibility.reduce_motion";
+    let d = prefs_core::files::domain_of(NS, K);
+    let kept = || read_all(mp).and_then(|b| String::from_utf8(b).ok()).and_then(|t| PrefTree::parse(&t).ok()).is_some_and(|t| t.get(NS, K).is_some());
+    let mt = crate::shell::vfs_mount_table();
+    // Road 2 — the delete watch: the session domain file holding the key is deleted.
+    let set2 = set(NS, K, PrefValue::Bool(true)).is_ok();
+    let _ = mt.unlink(sp, crate::fs::vfs::KERNEL_PRINCIPAL);
+    let _ = watch_deleted();
+    let del = set2 && !ON_DISK.lock().iter().any(|x| *x == d) && get(NS, K).is_none() && !(session && kept());
+    // Road 3 — the reload: RAM holds the key, the store does not.
+    let set3 = set(NS, K, PrefValue::Bool(true)).is_ok();
+    let old = TREE.lock().clone();
+    let _ = TREE.lock().remove(NS, K);
+    let saved = save_domain(&d).is_ok();
+    let _ = reload_session(&old);
+    let rel = set3 && saved && get(NS, K).is_none() && !(session && kept());
+    (del, rel)
 }
