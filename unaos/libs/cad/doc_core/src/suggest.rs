@@ -35,6 +35,12 @@
 //! normals are canonical, not outward), outside a BOSS; the set is `sketch` on the plane (z toward the support), the
 //! centre `point`, `circle` (a pocket's diameter through the standards table, else round; a boss's round), `extrude`
 //! along z by the height (round within sigma), ONE statement set sharing one why, confidence from the worst residual.
+//!
+//! VUGINTENTSETVERIFY (LEDGER SR541): a statement set is emitted as [`crate::verify_all`] disposes it WHOLE: contiguous,
+//! one `why` that no adjacent proposal shares (a feature's names its cylinder, a bolt circle its n and r, a midline its
+//! pair), every member linked to the others by id (`sketch=` / `centre=` / `outer=`, `a=` / `p=` / `line=`). The set is
+//! applied, replayed and judged once by the residual after its last member, so a boss top or a pocket floor only the
+//! extrude models no longer refuses the set's leading lines.
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
@@ -766,7 +772,8 @@ fn extent(planes: &[PlaneM], pk: usize, t: f64, sigma: f64, sigma_deg: f64) -> O
     })
 }
 
-/// The feature rule (module doc): per measured cylinder in order, at most ONE statement set.
+/// The feature rule (module doc): per measured cylinder in order, at most ONE statement set (judged whole by
+/// `verify_all`, VUGINTENTSETVERIFY SR541).
 fn features(doc: &Doc, m: &Measurement, sigma: f64, ids: &mut Ids, out: &mut Vec<Proposal>) {
     let Measurement::Shapes { shapes, sigma_deg, .. } = m else { return };
     let sigma_deg = *sigma_deg;

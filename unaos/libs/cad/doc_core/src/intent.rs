@@ -30,6 +30,14 @@
 //! never held against the proposal (a partial scan with the bottom on the table is not refused). Shrinking was already
 //! caught forward; the back side catches growth where no point is. Both sides go into the one max / RMS and limit.
 //!
+//! VUGINTENTSETVERIFY (LEDGER SR541): a STATEMENT SET is judged as one unit. A set is a run of consecutive proposals
+//! sharing one non-empty `why` whose reference graph is connected (a `key=value` value of one member is another's
+//! statement id); a same-why run that is not connected stays single proposals. [`verify_all`] applies a set's members to
+//! the copy in order whatever each one's own verdict, replays once and judges once by the residual AFTER the last member
+//! (`judge_cand`, the one body `judge` also runs): the set enters whole or not at all. Each member's own [`verify`]
+//! verdict on the copy so far is reported in [`Batch::sets`] and the set's lines, never a gate; a single proposal's line
+//! in [`Batch::text`] is byte-identical.
+//!
 //! The RMS's square root is geom_core's `Vec2::mag` (a hypot accumulation); libm (VUGINTENTSCAN, SR508, as ruled)
 //! gives the shape residual's angles (`atan2`, `atan`) and suggest's rounding (`round`).
 
@@ -235,8 +243,16 @@ fn judge(doc: &Doc, p: &Proposal, m: &Measurement, tol: Tol) -> Result<Verdict, 
         return Err(Reason::BadMeasurement);
     }
     let cand = apply(doc, p)?;
+    judge_cand(doc, &cand, m, tol)
+}
+
+/// The verdict on `cand` (the document with one proposal or one statement set in it) against `doc`: fresh replay
+/// failures, redundancy, the residual after the last statement, and the RMS against the document's own. The one body
+/// `judge` and the set (VUGINTENTSETVERIFY SR541) both run; the measurement is checked by the caller.
+fn judge_cand(doc: &Doc, cand: &Doc, m: &Measurement, tol: Tol) -> Result<Verdict, Reason> {
+    let sigma = m.sigma_mm();
     let before = replay(doc, tol);
-    let after = replay(&cand, tol);
+    let after = replay(cand, tol);
     let fresh: Vec<Failure> = after
         .failures
         .iter()
@@ -275,6 +291,9 @@ pub struct Batch {
     /// VUG-INTENT-SCAN-UNMATCHED (SR515): each measured shape (index, shape) with no face of its kind in the document's
     /// replay, left out of every residual and reported; empty for any other measurement.
     pub unmatched: Vec<(usize, ShapeRef)>,
+    /// VUGINTENTSETVERIFY (SR541): per statement set, the index of its first member in `entries` and each member's own
+    /// verdict on the copy so far, in order (reported, never the gate; a member's entry carries the set's verdict).
+    pub sets: Vec<(usize, Vec<Verdict>)>,
 }
 
 impl Batch {
@@ -291,7 +310,7 @@ impl Batch {
         for (i, s) in &self.unmatched {
             out.push_str(&format!("unmatched {} #{} support={} rms={}\n", s.kind(), i, s.support, f64_text(s.rms_mm)));
         }
-        for (s, c, v) in &self.entries {
+        for (e, (s, c, v)) in self.entries.iter().enumerate() {
             match v {
                 Verdict::Accept { residual_mm, max_mm, residual_sigma } => out.push_str(&format!(
                     "accept {} rms={} max={} sigma={} confidence={}\n",
@@ -303,6 +322,7 @@ impl Batch {
                 )),
                 Verdict::Refuse { why } => out.push_str(&format!("refuse {} {}\n", s.trim(), why.text())),
             }
+            self.set_suffix(e, &mut out); // VUGINTENTSETVERIFY (SR541): ` set=<k> step=...` on a set member's line
         }
         out
     }
@@ -312,7 +332,24 @@ impl Batch {
 pub fn verify_all(doc: &Doc, ps: &[Proposal], m: &Measurement, tol: Tol) -> Batch {
     let mut cur = doc.clone();
     let mut entries = Vec::new();
-    for p in ps {
+    let mut sets = Vec::new(); // VUGINTENTSETVERIFY (SR541)
+    let mut i = 0;
+    while i < ps.len() {
+        let n = set_len(&ps[i..]);
+        if n > 1 {
+            // VUGINTENTSETVERIFY (SR541): the set applied, replayed and judged once, entering whole or not at all.
+            let (v, steps, next) = verify_set(&cur, &ps[i..i + n], m, tol);
+            if let Some(d) = next {
+                cur = d;
+            }
+            sets.push((entries.len(), steps));
+            for p in &ps[i..i + n] {
+                entries.push((p.stmt.clone(), p.confidence, v.clone()));
+            }
+            i += n;
+            continue;
+        }
+        let p = &ps[i];
         let v = verify(&cur, p, m, tol);
         if let Verdict::Accept { .. } = v {
             if let Ok(d) = apply(&cur, p) {
@@ -320,6 +357,7 @@ pub fn verify_all(doc: &Doc, ps: &[Proposal], m: &Measurement, tol: Tol) -> Batc
             }
         }
         entries.push((p.stmt.clone(), p.confidence, v));
+        i += 1;
     }
     // VUG-INTENT-SCAN-UNMATCHED (SR515): the shapes the document's own replay has no face of their kind for.
     let unmatched = match m {
@@ -329,7 +367,7 @@ pub fn verify_all(doc: &Doc, ps: &[Proposal], m: &Measurement, tol: Tol) -> Batc
         }
         _ => Vec::new(),
     };
-    Batch { doc: cur, entries, unmatched }
+    Batch { doc: cur, entries, unmatched, sets }
 }
 
 struct Fit {
@@ -902,4 +940,96 @@ fn box_dist_sq(p: Vec3, b: &Aabb3) -> f64 {
     let d = |x: f64, lo: f64, hi: f64| if x < lo { lo - x } else if x > hi { x - hi } else { 0.0 };
     let (dx, dy, dz) = (d(p.x, b.min.x, b.max.x), d(p.y, b.min.y, b.max.y), d(p.z, b.min.z, b.max.z));
     dx * dx + dy * dy + dz * dz
+}
+
+// ---- VUGINTENTSETVERIFY (SR541): a statement set judged as one unit ----
+
+/// The statement's id: the line's second token when it carries no `=` (the reader's `<verb> <id>? key=value` shape).
+fn stmt_id(stmt: &str) -> Option<&str> {
+    stmt.split_whitespace().nth(1).filter(|t| !t.contains('='))
+}
+
+/// The values of the line's `key=value` tokens (a list's or a string's inner tokens never equal an id).
+fn stmt_refs(stmt: &str) -> Vec<&str> {
+    stmt.split_whitespace().skip(1).filter_map(|t| t.split_once('=').map(|(_, v)| v)).collect()
+}
+
+/// The length of the statement set at the head of `ps`: the run sharing the head's non-empty `why` when its reference
+/// graph is connected, else 1 (a single proposal); 0 for no proposals.
+fn set_len(ps: &[Proposal]) -> usize {
+    let Some(h) = ps.first() else { return 0 };
+    if h.why.is_empty() {
+        return 1;
+    }
+    let run = ps.iter().take_while(|p| p.why == h.why).count();
+    if run < 2 {
+        return 1;
+    }
+    let ids: Vec<Option<&str>> = ps[..run].iter().map(|p| stmt_id(&p.stmt)).collect();
+    let refs: Vec<Vec<&str>> = ps[..run].iter().map(|p| stmt_refs(&p.stmt)).collect();
+    let names = |a: usize, b: usize| ids[b].is_some_and(|id| refs[a].contains(&id));
+    let mut seen = alloc::vec![false; run];
+    seen[0] = true;
+    let mut stack = alloc::vec![0usize];
+    while let Some(a) = stack.pop() {
+        for b in 0..run {
+            if !seen[b] && (names(a, b) || names(b, a)) {
+                seen[b] = true;
+                stack.push(b);
+            }
+        }
+    }
+    if seen.iter().all(|&x| x) { run } else { 1 }
+}
+
+/// One set against `doc`: (the set's verdict, each member's own verdict on the copy so far, the document with the
+/// set in it when accepted). Every member is applied to the copy whatever its own verdict; an `apply` refusal refuses
+/// the set with that reason (the later members, never applied, carry it too); the set is judged once after its last
+/// member by `judge_cand`.
+fn verify_set(doc: &Doc, set: &[Proposal], m: &Measurement, tol: Tol) -> (Verdict, Vec<Verdict>, Option<Doc>) {
+    let sigma = m.sigma_mm();
+    if m.is_empty() || !(sigma.is_finite() && sigma > 0.0) {
+        let why = Reason::BadMeasurement;
+        let steps = set.iter().map(|_| Verdict::Refuse { why: why.clone() }).collect();
+        return (Verdict::Refuse { why }, steps, None);
+    }
+    let mut copy = doc.clone();
+    let mut steps = Vec::new();
+    let mut bad: Option<Reason> = None;
+    for p in set {
+        if let Some(why) = &bad {
+            steps.push(Verdict::Refuse { why: why.clone() });
+            continue;
+        }
+        steps.push(verify(&copy, p, m, tol));
+        match apply(&copy, p) {
+            Ok(d) => copy = d,
+            Err(why) => bad = Some(why),
+        }
+    }
+    let whole = match bad {
+        Some(why) => Err(why),
+        None => judge_cand(doc, &copy, m, tol),
+    };
+    match whole {
+        Ok(v) => (v, steps, Some(copy)),
+        Err(why) => (Verdict::Refuse { why }, steps, None),
+    }
+}
+
+impl Batch {
+    /// ` set=<k> step=accept` or ` set=<k> step=refuse <why>` closing entry `e`'s line when `e` is a set member (k counts
+    /// the sets from 1); nothing for a single proposal, so its line stays byte-identical.
+    fn set_suffix(&self, e: usize, out: &mut String) {
+        for (k, (start, steps)) in self.sets.iter().enumerate() {
+            let Some(step) = e.checked_sub(*start).and_then(|j| steps.get(j)) else { continue };
+            let t = match step {
+                Verdict::Accept { .. } => String::from("accept"),
+                Verdict::Refuse { why } => format!("refuse {}", why.text()),
+            };
+            out.pop(); // the line's '\n'
+            out.push_str(&format!(" set={} step={}\n", k + 1, t));
+            return;
+        }
+    }
 }
