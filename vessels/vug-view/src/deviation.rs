@@ -81,6 +81,9 @@ pub struct Map {
     /// `faults`), the design built over the standing document; named on the corner `held=<id>` ([`held_line`]).
     /// VUGFACEJOURNALHOLDMANY (SR609): every held root, comma-joined in line order (`post,post2`).
     pub held: Option<String>,
+    /// VUGSCANDEVIATIONCOARSE (SR615): how the registration started: `Fine` for the identity road ([`open`]), the coarse
+    /// start kept or refused for [`open_coarse`]; named on the corner by [`align_line`].
+    pub road: scan_core::deviation::Road,
 }
 
 /// A scan mesh read from a file (a PLY carries no normals, no confidence and no intrinsics): mesh_core's
@@ -124,9 +127,10 @@ fn mean3(a: u32, b: u32, c: u32) -> u32 {
 /// Measure `scan` against `doc` at `band_mm` from the identity: the model to draw (the scan at the aligned pose, or as
 /// read on a refusal) and the map, its gdt read at the edge margin `margin_mm` (VUGFACEGDTREMEASURE SR560). A design
 /// that does not build refuses the whole open (`Err`); a registration refusal is the map's (`Map::result`), shown by name.
-pub fn open(scan: &ScanMesh, doc: &Doc, band_mm: f64, margin_mm: f64) -> Result<(Model, Map), String> {
+/// VUGSCANDEVIATIONCOARSE (SR615): `coarse` starts from scan_core's principal axes instead ([`open_coarse`]).
+fn open_road(scan: &ScanMesh, doc: &Doc, band_mm: f64, margin_mm: f64, coarse: bool) -> Result<(Model, Map), String> {
     let (design, names, faults, held) = design(doc)?; // VUGFACEDEVIATIONHELD (SR600): the held root; VUGFACEDEVIATIONSOLIDFAULT (SR565): the faults no solid reads
-    let result = measure(scan, &design, Transform::IDENTITY, &AlignParams::DEFAULT, band_mm, Tol::DEFAULT);
+    let (road, result) = road_measure(scan, &design, band_mm, coarse); // VUGSCANDEVIATIONCOARSE (SR615): the identity road or the coarse one
     let (positions, vertex): (Vec<_>, Vec<u32>) = match &result {
         Ok(d) => (
             scan.mesh.positions.iter().map(|p| d.aligned.pose.apply_point(*p)).collect(),
@@ -143,13 +147,13 @@ pub fn open(scan: &ScanMesh, doc: &Doc, band_mm: f64, margin_mm: f64) -> Result<
     };
     let model = Model::from_mesh(mesh)?;
     let on = result.is_ok();
-    let mut map = Map { on, band_mm, names, gdt: Vec::new(), result, vertex, tri, pick: None, source: None, callouts: Vec::new(), margin_mm, basis: std::sync::Arc::new((scan.clone(), design)), datums: None, frame: None, chosen: [None; 3], lost: Vec::new(), faults, scan_name: None, design_path: None, reported: None, conf: None, held }; reframe(&mut map); Ok((model, map)) // VUGFACEDEVIATIONJOURNAL (SR550) + VUGFACEGDT (SR553): no source, no callouts yet; VUGFACEGDTREMEASURE (SR560): the gdt read once per build through reframe
+    let mut map = Map { on, band_mm, names, gdt: Vec::new(), result, vertex, tri, pick: None, source: None, callouts: Vec::new(), margin_mm, basis: std::sync::Arc::new((scan.clone(), design)), datums: None, frame: None, chosen: [None; 3], lost: Vec::new(), faults, scan_name: None, design_path: None, reported: None, conf: None, held, road }; reframe(&mut map); Ok((model, map)) // VUGFACEDEVIATIONJOURNAL (SR550) + VUGFACEGDT (SR553): no source, no callouts yet; VUGFACEGDTREMEASURE (SR560): the gdt read once per build through reframe
 }
 
 /// The corner's lines: the statistics and the worst [`WORST`] faces (matched ones, by rms) with their signed mean, or
 /// the refusal by name.
 pub fn corner(map: &Map) -> Vec<String> {
-    let mut out = measured(map); out.extend(conf_line(map)); out.extend(fault_lines(map)); out.extend(source_line(map)); out // VUGFACEDEVIATIONJOURNAL (SR550): the journal's line last; VUGFACEDEVIATIONSOLIDFAULT (SR565): the faults before it
+    let mut out = measured(map); out.extend(align_line(map)); out.extend(conf_line(map)); out.extend(fault_lines(map)); out.extend(source_line(map)); out // VUGFACEDEVIATIONJOURNAL (SR550): the journal's line last; VUGFACEDEVIATIONSOLIDFAULT (SR565): the faults before it
 }
 
 /// The corner's measured lines: the pick's, the statistics and the worst faces, or the refusal by name.
@@ -373,7 +377,7 @@ pub fn follow(v: &mut Viewer) {
     let doc = v.view.design.journal.doc.clone();
     src.generation += 1;
     let generation = src.generation;
-    let out = journal_body(&doc).and_then(|()| open(&src.scan, &doc, m.band_mm, m.margin_mm)); // VUGFACEGDTREMEASURE (SR560): the map's margin kept
+    let out = journal_body(&doc).and_then(|()| open_road(&src.scan, &doc, m.band_mm, m.margin_mm, !matches!(m.road, scan_core::deviation::Road::Fine))); // VUGFACEGDTREMEASURE (SR560): the map's margin kept; VUGSCANDEVIATIONCOARSE (SR615): a coarse map re-measures through coarse
     src.doc = doc;
     match out {
         Ok((model, mut map)) => {
@@ -1198,4 +1202,41 @@ fn held_split(doc: &Doc, failures: Vec<doc_core::Failure>) -> (Vec<doc_core::Fai
 /// (VUGFACEJOURNALHOLDMANY, SR609).
 fn held_line(map: &Map) -> Option<String> {
     map.held.as_ref().map(|id| format!("held={id}"))
+}
+
+// ---- VUGSCANDEVIATIONCOARSE (LEDGER SR615): the coarse open road ----
+// [`open`] measures from the identity (a world-posed scan: a PLY, a `--poses` / one-frame scan); [`open_coarse`] is the
+// road for a scan with no starting pose (a `--track` scan in frame 0's camera): scan_core `deviation::measure_coarse`,
+// the principal axes' best sign by the trimmed residual, then the fine alignment. The CALLER chooses the road (a scan
+// that does not lie on the design from the identity still reads NoAlignment through `open`). The corner names the
+// coarse road (`align=coarse+fine rms=` / `align=coarse refused rms=`); the identity road's corner is unchanged.
+
+/// Measure `scan` against `doc` from the identity ([`open_road`]'s identity road).
+pub fn open(scan: &ScanMesh, doc: &Doc, band_mm: f64, margin_mm: f64) -> Result<(Model, Map), String> {
+    open_road(scan, doc, band_mm, margin_mm, false)
+}
+
+/// Measure `scan`, which carries no starting pose (a `--track` scan in frame 0's camera), against `doc` from scan_core's
+/// coarse registration ([`open_road`]'s coarse road).
+pub fn open_coarse(scan: &ScanMesh, doc: &Doc, band_mm: f64, margin_mm: f64) -> Result<(Model, Map), String> {
+    open_road(scan, doc, band_mm, margin_mm, true)
+}
+
+/// The identity `measure` (`Road::Fine`) or scan_core's `measure_coarse`, at `AlignParams::DEFAULT`.
+fn road_measure(scan: &ScanMesh, design: &Design, band_mm: f64, coarse: bool) -> (scan_core::deviation::Road, Result<Deviation, DeviationError>) {
+    if coarse {
+        scan_core::deviation::measure_coarse(scan, design, &AlignParams::DEFAULT, band_mm, Tol::DEFAULT)
+    } else {
+        (scan_core::deviation::Road::Fine, measure(scan, design, Transform::IDENTITY, &AlignParams::DEFAULT, band_mm, Tol::DEFAULT))
+    }
+}
+
+/// The corner's road line: none for the identity road, `align=coarse+fine rms=<mm>` (the coarse start's trimmed rms)
+/// or `align=coarse refused rms=<mm>`.
+fn align_line(map: &Map) -> Option<String> {
+    match map.road {
+        scan_core::deviation::Road::Fine => None,
+        scan_core::deviation::Road::CoarseFine { rms_mm } => Some(format!("align=coarse+fine rms={rms_mm:.3}")),
+        scan_core::deviation::Road::CoarseRefused { rms_mm } => Some(format!("align=coarse refused rms={rms_mm:.3}")),
+    }
 }

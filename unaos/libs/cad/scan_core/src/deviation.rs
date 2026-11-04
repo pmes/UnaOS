@@ -29,8 +29,8 @@
 //! 5. [`shade`]: the band classifier, and [`colour`] the ONE ramp both faces colour from (palette_core's status rows;
 //!    VUGFACEDEVIATION, SR525, lifted from tools/scan).
 //!
-//! The start is the caller's (`init`): a world-posed scan starts at the identity; a global coarse registration is
-//! owed (VUG-SCAN-DEVIATION-COARSE).
+//! The start is the caller's (`init`): a world-posed scan starts at the identity, a scan with no starting pose at
+//! [`measure_coarse`]'s principal axes (VUGSCANDEVIATIONCOARSE SR615).
 
 use alloc::collections::BTreeMap;
 use alloc::format;
@@ -457,4 +457,177 @@ pub fn floored(dev: &Deviation, scan: &ScanMesh, conf_floor: f32) -> Deviation {
         }
     }
     out
+}
+
+// ---- VUGSCANDEVIATIONCOARSE (LEDGER SR615): the global coarse registration ----
+// A scan with no starting pose (a `--track` scan in frame 0's camera) opens against the design from its principal axes:
+// the exact area moments of the scan mesh and of the design mesh ([`moments`], one fn for both: no sampler), their
+// eigenvectors through geom_core's `jacobi_sym`, the four right-handed sign ambiguities of the design's frame each scored
+// by the trimmed residual of `pair` (the deviation measure's own). The least start score above the fine's last gate
+// (`AlignParams::gate(2)`) refuses (a fragment: its axes are not the part's). Each start is refined by `align` at
+// σ·[`COARSE_WIDEN`] (the scene's ground biases the scan's frame toward the fine basin's edge) and the refined poses are
+// SELECTED by the trimmed residual at gate(2) over [`COARSE_SELECT_KEEP`]: MEASURED (M3, the 12-frame orbit carried by
+// a known pose) the start score picked a 180°-wrong sign (trimmed 5.357, the box faces symmetric under the turn) and the
+// fine alignment ACCEPTED it (rms 0.555: `align`'s acceptance reads paired vertices only, the post unpaired), so a
+// box-symmetric part is told apart only after refining all four. Then `align` at the caller's params. Cost:
+// 4 × [`COARSE_POINTS`] `Bvh::closest` to score the starts, 4 × 3·iters·COARSE_POINTS for the refines (the budget of one
+// align at 8192), 4 × COARSE_POINTS to select, then the default `align` (<= 3·iters·max_points).
+
+/// How a registration started: the caller's pose (`Fine`), or [`coarse`]'s principal axes, kept (`CoarseFine`, the
+/// start's trimmed rms) or refused at the floor (`CoarseRefused`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Road {
+    Fine,
+    CoarseFine { rms_mm: f64 },
+    CoarseRefused { rms_mm: f64 },
+}
+
+/// The stride sample the four candidate starts are scored on.
+pub const COARSE_POINTS: usize = 2048;
+/// The trimmed fraction: the RMS of the best tenth of the sampled residuals (an unpaired vertex counts at the gate).
+pub const COARSE_KEEP: f64 = 0.1;
+/// The first refine's σ multiple: gates k·σ·2·[8, 4, 2], accepted at k·σ·2.
+pub const COARSE_WIDEN: f64 = 2.0;
+/// The trimmed fraction the refined poses are selected on (at gate(2)): the part is ~36% of the fixture scan's area,
+/// its post ~8%, so a pose that leaves the post unpaired counts it inside the kept 30%.
+pub const COARSE_SELECT_KEEP: f64 = 0.3;
+
+/// The area-weighted centroid and covariance (row-major 3 x 3) of `mesh`, exact per triangle:
+/// ∫x dA = A·s/3, ∫xxᵀ dA = A/12·(aaᵀ + bbᵀ + ccᵀ + ssᵀ), s = a + b + c. None on zero area.
+fn moments(mesh: &Mesh) -> Option<(Vec3, [f64; 9])> {
+    let (mut area, mut c, mut m) = (0.0f64, Vec3::ZERO, [0.0f64; 9]);
+    for t in 0..mesh.triangles.len() {
+        let Some([a, b, d]) = mesh.corners(t) else { continue };
+        let w = (b - a).cross(d - a).mag() * 0.5;
+        if !(w > 0.0) {
+            continue;
+        }
+        let s = a + b + d;
+        area += w;
+        c = c + s * (w / 3.0);
+        for v in [a, b, d, s] {
+            let x = [v.x, v.y, v.z];
+            for r in 0..3 {
+                for k in 0..3 {
+                    m[r * 3 + k] += w / 12.0 * x[r] * x[k];
+                }
+            }
+        }
+    }
+    if !(area > 0.0) {
+        return None;
+    }
+    let c = c * (1.0 / area);
+    let x = [c.x, c.y, c.z];
+    for r in 0..3 {
+        for k in 0..3 {
+            m[r * 3 + k] = m[r * 3 + k] / area - x[r] * x[k];
+        }
+    }
+    Some((c, m))
+}
+
+/// The principal axes of `mesh`: the centroid, the largest eigenvector and the middle one (unit).
+fn axes(mesh: &Mesh) -> Option<(Vec3, Vec3, Vec3)> {
+    let (c, m) = moments(mesh)?;
+    let (w, v) = geom_core::linalg::jacobi_sym(&m, 3);
+    if w.len() != 3 || v.len() != 9 {
+        return None;
+    }
+    let col = |j: usize| Vec3::new(v[j], v[3 + j], v[6 + j]);
+    let x = col(2).normalize().ok()?;
+    let y = col(1).normalize().ok()?;
+    Some((c, x, y))
+}
+
+/// The trimmed residual of `scan` at `pose`: per sampled vertex its `pair` distance within `gate` (or `gate` when it
+/// pairs with nothing), sorted, the RMS of the best ceil(`keep`·n).
+fn trimmed(scan: &ScanMesh, design: &Design, bvh: &Bvh, normals: &[Vec3], sample: &[usize], pose: Transform, gate: f64, keep: f64, p: &AlignParams, tol: Tol) -> f64 {
+    let mut r: Vec<f64> = sample
+        .iter()
+        .map(|&i| {
+            let q = pose.apply_point(scan.mesh.positions[i]);
+            let nq = pose.apply_vector(scan.normals.get(i).copied().unwrap_or(Vec3::ZERO));
+            pair(design, bvh, normals, q, nq, gate, p.normal_cos, tol).map_or(gate, |(c, _)| (q - c).mag())
+        })
+        .collect();
+    if r.is_empty() {
+        return f64::INFINITY;
+    }
+    r.sort_by(|a, b| a.total_cmp(b));
+    let k = (libm::ceil(r.len() as f64 * keep) as usize).clamp(1, r.len());
+    libm::sqrt(r[..k].iter().map(|x| x * x).sum::<f64>() / k as f64)
+}
+
+/// The stride sample of at most [`COARSE_POINTS`] vertices the coarse road scores on.
+fn coarse_sample(nv: usize) -> Vec<usize> {
+    (0..nv).step_by(nv.div_ceil(COARSE_POINTS).max(1)).collect()
+}
+
+/// The four coarse starts (scan → design) from the principal axes: the scan's frame onto each of the design's four
+/// right-handed sign variants (x, y signs ++, --, -+, +-), each with its trimmed rms at the fine basin's gate
+/// (`p.gate(0)`, [`COARSE_KEEP`]). None: an empty scan or design, or zero area.
+pub fn coarse(scan: &ScanMesh, design: &Design, bvh: &Bvh, p: &AlignParams, tol: Tol) -> Option<Vec<(Transform, f64)>> {
+    let nv = scan.mesh.positions.len();
+    if nv == 0 || design.mesh.triangles.is_empty() {
+        return None;
+    }
+    let (cs, xs, ys) = axes(&scan.mesh)?;
+    let (cd, xd, yd) = axes(&design.mesh)?;
+    let inv = crate::geom::from_axes(xs, ys, xs.cross(ys), cs).invert().ok()?;
+    let normals = design.mesh.normals_face(tol);
+    let sample = coarse_sample(nv);
+    let mut out = Vec::with_capacity(4);
+    for (sx, sy) in [(1.0, 1.0), (-1.0, -1.0), (-1.0, 1.0), (1.0, -1.0)] {
+        let (x, y) = (xd * sx, yd * sy);
+        let start = crate::geom::from_axes(x, y, x.cross(y), cd).compose(inv);
+        out.push((start, trimmed(scan, design, bvh, &normals, &sample, start, p.gate(0), COARSE_KEEP, p, tol)));
+    }
+    Some(out)
+}
+
+/// [`coarse`]'s four starts, refused when the least start rms is above the floor `p.gate(2)` (`Road::CoarseRefused`,
+/// `NoAlignment` with that rms and no pair); else each start refined by [`align`] at σ·[`COARSE_WIDEN`] over
+/// [`COARSE_POINTS`], the accepted refines selected by [`trimmed`] at `p.gate(2)` over [`COARSE_SELECT_KEEP`] (the
+/// least, the first on a tie), [`align`] at `p` from it and [`deviations`] with the band (`Road::CoarseFine` carrying
+/// the least start rms; no refine accepted, or the last align's refusal, is the result). One BVH of the design.
+pub fn measure_coarse(scan: &ScanMesh, design: &Design, p: &AlignParams, band_mm: f64, tol: Tol) -> (Road, Result<Deviation, DeviationError>) {
+    if scan.mesh.positions.is_empty() {
+        return (Road::CoarseRefused { rms_mm: f64::INFINITY }, Err(DeviationError::EmptyScan));
+    }
+    if design.mesh.triangles.is_empty() {
+        return (Road::CoarseRefused { rms_mm: f64::INFINITY }, Err(DeviationError::EmptyDesign));
+    }
+    let bvh = Bvh::build(&design.mesh);
+    let starts = coarse(scan, design, &bvh, p, tol).unwrap_or_default();
+    let rms_mm = starts.iter().map(|s| s.1).fold(f64::INFINITY, f64::min);
+    if !(rms_mm <= p.gate(2)) {
+        return (Road::CoarseRefused { rms_mm }, Err(DeviationError::NoAlignment { rms_mm, pairs: 0 }));
+    }
+    let wide = AlignParams { sigma_mm: p.sigma_mm * COARSE_WIDEN, max_points: p.max_points.min(COARSE_POINTS), ..*p };
+    let normals = design.mesh.normals_face(tol);
+    let sample = coarse_sample(scan.mesh.positions.len());
+    let mut best: Option<(Transform, f64)> = None;
+    let mut refused: Option<(f64, DeviationError)> = None;
+    for &(start, start_rms) in &starts {
+        match align(scan, design, &bvh, start, &wide, tol) {
+            Ok(w) => {
+                let score = trimmed(scan, design, &bvh, &normals, &sample, w.pose, p.gate(2), COARSE_SELECT_KEEP, p, tol);
+                if best.map_or(true, |(_, b)| score < b) {
+                    best = Some((w.pose, score));
+                }
+            }
+            Err(e) => {
+                if refused.map_or(true, |(r, _)| start_rms < r) {
+                    refused = Some((start_rms, e));
+                }
+            }
+        }
+    }
+    let result = match (best, refused) {
+        (Some((pose, _)), _) => align(scan, design, &bvh, pose, p, tol).map(|a| deviations(scan, design, &bvh, a, p, band_mm, tol)),
+        (None, Some((_, e))) => Err(e),
+        (None, None) => Err(DeviationError::NoAlignment { rms_mm, pairs: 0 }),
+    };
+    (Road::CoarseFine { rms_mm }, result)
 }
