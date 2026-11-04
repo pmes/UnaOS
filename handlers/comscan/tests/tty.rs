@@ -1474,9 +1474,7 @@ fn a_jog_with_no_position_report_is_bounded_by_its_distance_and_says_so_once() {
     assert!(rt.contains(&b'?'), "the desk asked the position and was never answered: {rt:?}");
 }
 
-// --- VUGCOMSCANMACHINEDECLARE (SR613): the machine declared on the bus bounds the jog, from the start and after link-up ---
-
-/// The `$J=` lines the fake recorded.
+// ---- seat fold: SR613 (VUGCOMSCANMACHINEDECLARE) tests carried after SR612 (VUGCOMSCANJOGPOSITION), both tails in one file ----
 fn jogs_of(lines: &[String]) -> Vec<String> {
     lines.iter().filter(|l| l.starts_with("$J=")).cloned().collect()
 }
@@ -1521,10 +1519,11 @@ fn a_declared_x_travel_bounds_the_jog_from_the_start() {
     assert_eq!(drive_until(&mut desk, &mut *open, t0, &mut words, |e| e == "done"), "done");
 
     // The declared X travel is 120: X150 refused before the wire, X100 goes out.
-    // VUGCOMSCANJOGPOSITION (SR612): the fake reports MPos 0, so the jog's END is bounded from 0.
-    settle_at(&mut desk, t0, [0.0, 0.0, 0.0]);
     let jog = |dx: f64| PumpEvent::PumpJog { principal: who(), dx, dy: 0.0, dz: 0.0, feed: 300.0 };
-    assert_eq!(refused_in(&desk.apply(&jog(150.0), &mut *open)), "jog: X150 from 0 ends past the declared X travel 120");
+    assert_eq!(
+        refused_in(&desk.apply(&jog(150.0), &mut *open)),
+        "jog: X150 from 0 ends past the declared X travel 120" // seat fold: under SR612 the fake answers `?`, so the jog is bounded by its END from the reported position
+    );
     assert_eq!(said_in(&desk.apply(&jog(100.0), &mut *open)), "jog sent: $J=G91 X100 Y0 Z0 F300");
     assert_eq!(drive_until(&mut desk, &mut *open, t0, &mut words, |e| e.starts_with("jog ")), "jog ok", "{words:?}");
     let home = PumpEvent::PumpHome { principal: who() };
@@ -1546,19 +1545,21 @@ fn a_declare_after_link_up_rebounds_the_next_jog_without_a_relink() {
     let mut words = Vec::new();
     assert_eq!(drive_until(&mut desk, &mut *open, t0, &mut words, |e| e == "done"), "done");
 
-    // Against the machine at new (X -50..300, travel 350) X150 goes out (SR612: from the reported MPos 0).
-    settle_at(&mut desk, t0, [0.0, 0.0, 0.0]);
+    // Against the machine at new (X -50..300, travel 350) X150 goes out.
     let jog = |dx: f64| PumpEvent::PumpJog { principal: who(), dx, dy: 0.0, dz: 0.0, feed: 300.0 };
     assert_eq!(said_in(&desk.apply(&jog(150.0), &mut *open)), "jog sent: $J=G91 X150 Y0 Z0 F300");
     assert_eq!(drive_until(&mut desk, &mut *open, t0, &mut words, |e| e.starts_with("jog ")), "jog ok", "{words:?}");
 
     // A declare on the live link: the next jog is bounded by the declared 120, on the same link.
-    // VUGCOMSCANJOGPOSITION (SR612): the machine now stands at MPos X=150, so X150 ends past 120 and X-100 (to 50) fits.
-    settle_at(&mut desk, t0, [150.0, 0.0, 0.0]);
     let declare = PumpEvent::PumpDeclare { principal: who(), name: "mill".to_string(), x: 120.0, y: 300.0, z: 100.0, dialect: None };
     assert_eq!(said_in(&desk.apply(&declare, &mut *open)), "machine declared mill x=120 y=300 z=100");
-    assert_eq!(refused_in(&desk.apply(&jog(150.0), &mut *open)), "jog: X150 from 150 ends past the declared X travel 120");
-    assert_eq!(said_in(&desk.apply(&jog(-100.0), &mut *open)), "jog sent: $J=G91 X-100 Y0 Z0 F300");
+    assert_eq!(
+        refused_in(&desk.apply(&jog(150.0), &mut *open)),
+        "jog: X150 from 150 ends past the declared X travel 120" // seat fold: SR612 end bound from the position after the first X150
+    );
+    // seat fold: under SR612 the machine stands at 150, past the declared 120, so X100 is refused by its END too and only a move back in goes out.
+    assert_eq!(refused_in(&desk.apply(&jog(100.0), &mut *open)), "jog: X100 from 150 ends past the declared X travel 120");
+    assert_eq!(said_in(&desk.apply(&jog(-50.0), &mut *open)), "jog sent: $J=G91 X-50 Y0 Z0 F300");
     assert_eq!(drive_until(&mut desk, &mut *open, t0, &mut words, |e| e.starts_with("jog ")), "jog ok", "{words:?}");
     let home = PumpEvent::PumpHome { principal: who() };
     assert_eq!(said_in(&desk.apply(&home, &mut *open)), "home sent: $H");
@@ -1567,5 +1568,5 @@ fn a_declare_after_link_up_rebounds_the_next_jog_without_a_relink() {
     drop(desk);
     drop(open);
     let (lines, _rt, _m) = fake.join().unwrap();
-    assert_eq!(jogs_of(&lines), ["$J=G91 X150 Y0 Z0 F300", "$J=G91 X-100 Y0 Z0 F300"], "the second X150 never reached the wire: {lines:?}");
+    assert_eq!(jogs_of(&lines), ["$J=G91 X150 Y0 Z0 F300", "$J=G91 X-50 Y0 Z0 F300"], "the second X150 and the X100 never reached the wire: {lines:?}");
 }

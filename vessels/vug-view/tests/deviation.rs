@@ -1436,6 +1436,7 @@ fn two_held_roots_name_both_on_the_corner_and_the_first_fix_re_measures() {
     let lines = corner(map);
     println!("{}", lines.join("\n"));
     assert_eq!(map.held.as_deref(), Some("post,post2"));
+    assert!([String::from("held=post,post2"), format!("fault line {line}: NoProfile post"), format!("fault line {line2}: NoProfile post2")].map(|w| lines.iter().position(|l| *l == w)).windows(2).all(|p| p[0].is_some() && p[0] < p[1]), "VUGFACEJOURNALHOLDREST (SR611): held= order unchanged, named first: {lines:?}");
     assert!(lines.contains(&"held=post,post2".to_string()), "{lines:?}");
     assert!(lines.contains(&format!("fault line {line}: NoProfile post")), "{lines:?}");
     assert!(lines.contains(&format!("fault line {line2}: NoProfile post2")), "{lines:?}");

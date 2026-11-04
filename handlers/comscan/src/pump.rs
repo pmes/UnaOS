@@ -253,7 +253,7 @@ fn refused(why: impl Into<String>) -> Vec<PumpEvent> {
 impl PumpDesk {
     /// A desk for `machine`: every pass it arms must name this machine's identity (VUG-HELM-BIND-MACHINE).
     pub fn new(machine: Machine) -> PumpDesk {
-        PumpDesk { machine, armed: Vec::new(), running: None, identify: None, hello: None, envelope: true, read: None, declared: None, pos: Position::default() } // VUGCOMSCANMACHINEDECLARE (SR613): + declared; VUGCOMSCANJOGPOSITION (SR612): + pos
+        PumpDesk { machine, armed: Vec::new(), running: None, identify: None, hello: None, envelope: true, read: None, declared: None, pos: Position::default() } // VUGCOMSCANMACHINEDECLARE (SR613): + declared
     }
 
     /// The machine this desk drives.
