@@ -2264,8 +2264,8 @@ fn bus_changes_inner() -> (usize, usize, usize) {
     bus_subscribe_once(); // SETTINGSSUB (B802): the registration is the first pass's edge (file tail); this pass is the drain only
     let mut keys: Vec<&'static str> = Vec::new();
     let mut idle = 0usize;
-    let frames = crate::prefs_client::changes_drain(|ns, k| {
-        if ns != crate::prefs::NS { return; } if k.starts_with("appearance.") { super::appearance::mark_dirty(); } if k.starts_with("accessibility.") { A11Y_DIRTY.store(true, Ordering::Release); } if k.starts_with("keyboard.") { KB_DIRTY.store(true, Ordering::Release); } #[cfg(feature = "dicc")] { if k == crate::prefs::key::DISPLAY_ICC { A11Y_DIRTY.store(true, Ordering::Release); } } resetq_note(ns, k); // RESETREPAINT-QUEUED (rmbp-ledger B1201): an unset MAP key outside SHOWN counts as moved (file tail). DISPLAYICCFILE (rmbp-ledger B972): the installed display profile key re-latches through the a11y filter's own door (a11y_load -> af::changed -> colour::latch). LINE-NEUTRAL append, code first. KEYMAPS (B704): another client chose a layout. A11YPANE (B655): the service pass re-reads and re-latches. APPEARANCE (B408): another client chose
+    let frames = crate::prefs_client::changes_drain(|ns, k, v| {
+        if ns != crate::prefs::NS { return; } if k.starts_with("appearance.") { super::appearance::mark_dirty(); } if k.starts_with("accessibility.") { A11Y_DIRTY.store(true, Ordering::Release); } if k.starts_with("keyboard.") { KB_DIRTY.store(true, Ordering::Release); } #[cfg(feature = "dicc")] { if k == crate::prefs::key::DISPLAY_ICC { A11Y_DIRTY.store(true, Ordering::Release); } } resetq_note(ns, k, v.is_none()); // RESETREPAINT-QUEUED (rmbp-ledger B1201): an unset MAP key outside SHOWN counts as moved, tested on the frame's own unset form (CHANGES-DRAIN-VALUE rmbp-ledger B1204; file tail). DISPLAYICCFILE (rmbp-ledger B972): the installed display profile key re-latches through the a11y filter's own door (a11y_load -> af::changed -> colour::latch). LINE-NEUTRAL append, code first. KEYMAPS (B704): another client chose a layout. A11YPANE (B655): the service pass re-reads and re-latches. APPEARANCE (B408): another client chose
         if let Some(s) = SHOWN.iter().find(|s| **s == k) {
             if *s == crate::prefs::key::IDLE_MIN { idle += 1; }
             if !keys.contains(s) { keys.push(s); }
@@ -6485,12 +6485,12 @@ fn reset_delete(tab: usize, row: usize) {
 // RESETREPAINT-QUEUED (rmbp-ledger B1201, BP-storage-11) — TAIL-APPENDED. A PREFS.ELF unset answered QUEUED at
 // RELAY_WAIT_MS leaves the store holding the key at Delete's repaint (B1195's `word=painted`); the later drain's
 // PrefChanged frame reached `bus_changes_inner`, whose SHOWN gate dropped every MAP key outside SHOWN, so the row kept
-// its word until the next paint. `prefs_client::changes_drain` hands the follower `(ns, k)` only (the unset form's
-// `None` is dropped: CHANGES-DRAIN-VALUE owed), so the follower's test is the painter's own: a frame naming a MAP key
-// outside SHOWN that the store no longer holds ([`row_is_set`] false) is counted ([`resetq_note`]) and taken at the
+// its word until the next paint. `prefs_client::changes_drain` hands the follower `(ns, k, value)` (CHANGES-DRAIN-VALUE
+// rmbp-ledger B1204), so the follower's test is the frame's own: an unset-form frame (value `None`, posted by every road
+// that empties a key) naming a MAP key outside SHOWN is counted ([`resetq_note`], no store read) and taken at the
 // gate ([`resetq_take`]) into the existing `moved` counter, so the one `if moved > 0` arm repaints (no second road). A
-// SET frame of a key since unset also counts (the unset frame would anyway); an unset frame of a key since re-set does
-// not (the word stays painted, correctly). SHOWN keys are unchanged (the SHOWN gate and B1190's `follow_unset`). A
+// SET frame never counts (the key's own unset frame does); an unset frame of a key since re-set counts one spare
+// repaint (the painter reads the store: the word stays painted). SHOWN keys are unchanged (the SHOWN gate, B1190). A
 // count taken before the login's load is dropped (the load reads the store fresh). Said
 // `[settings] resetrepaint=follower frames=<n> open=<0|1>`. Witness: `tests settings`
 // `:: SETTINGS-RESET-QUEUED: key=system.dock.position held=<n> unset=<0|1> resetrepaint=<follower|none> nonmap=system.audio.amp_holdoff_ms counted=<n> -> PASS|FAIL ::`
@@ -6506,9 +6506,9 @@ fn map_key(ns: &str, k: &str) -> bool {
     ns == crate::prefs::NS && MAP.iter().any(|r| r.keys.contains(&k))
 }
 
-/// The drain closure's fold: a frame of a MAP key outside SHOWN that the store no longer holds counts once.
-fn resetq_note(ns: &str, k: &str) {
-    if map_key(ns, k) && !SHOWN.contains(&k) && !row_is_set(core::slice::from_ref(&k)) {
+/// The drain closure's fold: an unset-form frame (`unset`: the frame's value is `None`) of a MAP key outside SHOWN counts once.
+fn resetq_note(ns: &str, k: &str, unset: bool) {
+    if unset && map_key(ns, k) && !SHOWN.contains(&k) {
         RESETQ.fetch_add(1, Ordering::AcqRel);
     }
 }
