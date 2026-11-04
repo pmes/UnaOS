@@ -68,12 +68,15 @@ pub struct PhotoParams {
     /// VUG-PHOTO-SIDE-PARALLAX (SR568): the camera's height above the paper (mm), the person's once-per-setup datum
     /// for [`measure_side_raised`]; `None` self-calibrates it from the lattice homography ([`camera`]).
     pub camera_mm: Option<f64>,
+    /// VUG-PHOTO-PP (SR569): the principal point in photo pixels; `None` is the photo centre. A cropped photo states it
+    /// (the uncropped centre less the crop's offset) so [`camera_pose_at`] solves f and the pose about the right point.
+    pub principal_px: Option<Vec2>,
 }
 
 impl PhotoParams {
     /// `pitch_mm` with the default band: 0.5 mm, 20°.
     pub fn new(pitch_mm: f64) -> PhotoParams {
-        PhotoParams { pitch_mm, band: Tol { lin: 0.5, ang: 20.0 * core::f64::consts::PI / 180.0 }, camera_mm: None }
+        PhotoParams { pitch_mm, band: Tol { lin: 0.5, ang: 20.0 * core::f64::consts::PI / 180.0 }, camera_mm: None, principal_px: None }
     }
 }
 
@@ -458,7 +461,14 @@ pub struct Parallax {
 /// The camera from a paper-to-photo homography `h` of a `w` x `h_px` photo (principal point the photo centre, square
 /// pixels); `None` when the perspective is too weak to give a positive finite 1 / f².
 pub fn camera_pose(h: &homography::H, w: f64, h_px: f64) -> Option<Camera> {
-    let (u0, v0) = (w * 0.5, h_px * 0.5);
+    camera_pose_at(h, Vec2::new(w * 0.5, h_px * 0.5))
+}
+
+/// VUG-PHOTO-PP (SR569): [`camera_pose`] about the principal point `pp` (photo px). With g = H's rows 0 and 1 less
+/// `pp` times row 2, and x = 1 / f²: r1·r2 = 0 is (g00 g01 + g10 g11) x + g20 g21 = 0 and |r1|² = |r2|² is
+/// (g00² + g10² - g01² - g11²) x + (g20² - g21²) = 0, solved together by least squares.
+pub fn camera_pose_at(h: &homography::H, pp: Vec2) -> Option<Camera> {
+    let (u0, v0) = (pp.x, pp.y);
     let g = [
         [h[0][0] - u0 * h[2][0], h[0][1] - u0 * h[2][1], h[0][2] - u0 * h[2][2]],
         [h[1][0] - v0 * h[2][0], h[1][1] - v0 * h[2][1], h[1][2] - v0 * h[2][2]],
@@ -493,13 +503,19 @@ pub fn camera_pose(h: &homography::H, w: f64, h_px: f64) -> Option<Camera> {
 /// [`CALIB_MIN_DEG`] (the height replaced by `camera_mm` when the person stated one); else `camera_mm` with the nadir
 /// the photo centre through H⁻¹ (exact for a square camera); else [`Refusal::NoCamera`].
 pub fn camera(m: &Measured, w: f64, h_px: f64, camera_mm: Option<f64>) -> Result<Camera, Refusal> {
-    let pose = if m.tilt_deg >= CALIB_MIN_DEG { camera_pose(&m.h, w, h_px) } else { None };
+    camera_at(m, Vec2::new(w * 0.5, h_px * 0.5), camera_mm)
+}
+
+/// VUG-PHOTO-PP (SR569): [`camera`] about the principal point `pp` (photo px): the pose by [`camera_pose_at`], the
+/// square camera's nadir `pp` through H⁻¹ (the principal ray is the optical axis).
+pub fn camera_at(m: &Measured, pp: Vec2, camera_mm: Option<f64>) -> Result<Camera, Refusal> {
+    let pose = if m.tilt_deg >= CALIB_MIN_DEG { camera_pose_at(&m.h, pp) } else { None };
     match (pose, camera_mm) {
         (Some(c), None) => Ok(c),
         (Some(c), Some(hc)) => Ok(Camera { height_mm: hc, ..c }),
         (None, Some(hc)) => {
             let inv = homography::invert(&m.h).map_err(Refusal::Degenerate)?;
-            let nadir = homography::apply(&inv, Vec2::new(w * 0.5, h_px * 0.5)).ok_or(Refusal::Uncertain)?;
+            let nadir = homography::apply(&inv, pp).ok_or(Refusal::Uncertain)?;
             Ok(Camera { nadir, height_mm: hc, focal_px: None })
         }
         (None, None) => Err(Refusal::NoCamera { tilt_deg: m.tilt_deg }),
@@ -527,7 +543,8 @@ pub fn measure_side_raised(first: &Measured, side: &Image, params: PhotoParams, 
     let s = measure(side, params, tol)?;
     let (raw_length_mm, raw_thickness_mm) = extents(&s.shape).ok_or(Refusal::Uncertain)?;
     let (long, short) = extents(&first.shape).ok_or(Refusal::Uncertain)?;
-    let cam = camera(&s, side.width as f64, side.height as f64, params.camera_mm)?;
+    let centre = Vec2::new(side.width as f64 * 0.5, side.height as f64 * 0.5);
+    let cam = camera_at(&s, params.principal_px.unwrap_or(centre), params.camera_mm)?; // VUG-PHOTO-PP (SR569)
     let band = fit::BAND_SIGMA * libm::hypot(first.sigma_mm, s.sigma_mm);
     // (miss, length, thickness, paired, standing, k)
     let mut best: Option<(f64, f64, f64, f64, f64, f64)> = None;

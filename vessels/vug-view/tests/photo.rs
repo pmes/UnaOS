@@ -432,9 +432,9 @@ fn a_refusal_after_two_withdraws_both() {
 /// 6.0 within 0.1 through the one verify road; Enter enters it by the journal's pull road and the journal records it.
 #[test]
 fn a_side_photo_proposes_the_extrude_and_the_journal_records_it() {
-    use photo_core::fixture::{PART_T, PART_W, Spec, side_png};
+    use photo_core::fixture::{PART_H, PART_T, PART_W, Spec, side_raised_png};
     let mut vw = opened();
-    photo::side(&mut vw.view, &side_png(&Spec::side(), PART_W, PART_T), "side.png").expect("the side photo measures");
+    photo::side(&mut vw.view, &side_raised_png(&Spec::side_raised(), PART_W, PART_T, PART_H), "side.png").expect("the side photo measures");
     let p = ph(&vw);
     assert_eq!(p.offers.len(), 1, "one proposal");
     let o = &p.offers[0];
@@ -483,9 +483,9 @@ fn with_length(stmt: &str, length: f64) -> String {
 /// thickness and Enter on the 6 mm extrude then refuses by Residual and applies nothing.
 #[test]
 fn a_wrong_side_photo_refuses_the_extrude_by_its_thickness() {
-    use photo_core::fixture::{PART_T, PART_W, Spec, side_png};
+    use photo_core::fixture::{PART_H, PART_T, PART_W, Spec, side_raised_png};
     let mut vw = opened();
-    photo::side(&mut vw.view, &side_png(&Spec::side(), PART_W, PART_T), "side.png").expect("the side photo measures");
+    photo::side(&mut vw.view, &side_raised_png(&Spec::side_raised(), PART_W, PART_T, PART_H), "side.png").expect("the side photo measures");
     assert!(matches!(ph(&vw).offers[0].verdict, Verdict::Accept { .. }), "{:?}", ph(&vw).offers[0].verdict);
     match &ph(&vw).thickness {
         Some(doc_core::Measurement::Thickness { mm, .. }) => assert!((mm - PART_T).abs() < 0.1, "held {mm}"),
@@ -494,7 +494,7 @@ fn a_wrong_side_photo_refuses_the_extrude_by_its_thickness() {
     let stmt = ph(&vw).offers[0].proposal.stmt.clone();
     assert!(photo::offer(&mut vw.view, vec![proposal(with_length(&stmt, PART_T + 2.0))]));
     assert!(matches!(ph(&vw).offers[1].verdict, Verdict::Refuse { why: Reason::Residual { .. } }), "{:?}", ph(&vw).offers[1].verdict);
-    photo::side(&mut vw.view, &side_png(&Spec::side(), PART_W, 9.0), "wrong.png").expect("the wrong side photo measures");
+    photo::side(&mut vw.view, &side_raised_png(&Spec::side_raised(), PART_W, 9.0, PART_H), "wrong.png").expect("the wrong side photo measures");
     match &ph(&vw).thickness {
         Some(doc_core::Measurement::Thickness { mm, .. }) => assert!((mm - 9.0).abs() < 0.3, "held {mm}"),
         t => panic!("no thickness held: {t:?}"),
@@ -540,4 +540,41 @@ fn a_set_enters_whole_and_undoes_in_one_step() {
     assert_eq!(vw.view.design.journal.doc, entered, "one redo brings both statements back");
     assert_eq!(vw.view.design.journal.depth(), (undo, 0));
     assert_eq!(face(&vw).sketch.entities().len(), ents + 1);
+}
+
+// ---- VUGFACEPHOTOSIDEPARALLAX (SR569): the side photo through the raised-edge correction ----
+
+/// The fixture part standing on its 50 x 6 face (its top PART_H above the paper) under the 400 mm camera: the face reads
+/// 6.0 within 0.1 with the camera from the side lattice (`camera= .. lattice`); the square camera reads 6.0 with the
+/// person's 400 mm (`camera=400 mm set`) and, without it, refuses NoCamera by name and offers nothing.
+#[test]
+fn a_raised_side_photo_reads_its_thickness_and_names_the_camera() {
+    use photo_core::fixture::{PART_H, PART_T, PART_W, Spec, side_raised_png};
+    let held = |vw: &Viewer| match &ph(vw).thickness {
+        Some(doc_core::Measurement::Thickness { mm, .. }) => *mm,
+        t => panic!("no thickness held: {t:?}"),
+    };
+    let mut vw = opened();
+    photo::side(&mut vw.view, &side_raised_png(&Spec::side_raised(), PART_W, PART_T, PART_H), "raised.png").expect("the raised side photo measures");
+    let mm = held(&vw);
+    assert!((mm - PART_T).abs() < 0.1, "held {mm} vs {PART_T}");
+    let o = &ph(&vw).offers[0];
+    assert!(o.proposal.why.contains("camera=") && o.proposal.why.contains("lattice"), "{}", o.proposal.why);
+    assert!(matches!(o.verdict, Verdict::Accept { .. }), "{:?}", o.verdict);
+    let note = ph(&vw).note.as_deref().unwrap_or("").to_string();
+    assert!(note.contains("camera=") && note.ends_with("mm lattice"), "{note}");
+
+    let square = side_raised_png(&Spec::side_square(), PART_W, PART_T, PART_H);
+    let mut vw = opened();
+    photo::side_camera(&mut vw.view, &square, "square.png", Some(400.0)).expect("the square photo measures with camera_mm");
+    let mm = held(&vw);
+    assert!((mm - PART_T).abs() < 0.1, "held {mm} vs {PART_T}");
+    let note = ph(&vw).note.as_deref().unwrap_or("").to_string();
+    assert!(note.contains("camera=400 mm set"), "{note}");
+
+    let mut vw = opened();
+    let e = photo::side(&mut vw.view, &square, "square.png").expect_err("a square camera with no camera_mm");
+    assert!(e.contains("NoCamera"), "{e}");
+    assert!(ph(&vw).offers.is_empty(), "nothing offered");
+    assert!(ph(&vw).note.as_deref().unwrap_or("").starts_with("refused side NoCamera"), "{:?}", ph(&vw).note);
 }
