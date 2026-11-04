@@ -19,6 +19,7 @@ principia = { path = "../../handlers/principia" }
 # The Console pane runs every log line through Tabula's control-byte sanitizer
 # before it reaches glass. Default-features is the pure `sanitize` core (no GTK).
 tabula = { path = "../../handlers/tabula", default-features = false }
+comscan = { path = "../../handlers/comscan" } # VUGCOMSCANJOGFACEGTK (SR616): the Console jog pad reads PumpCard and fires its press (widgets/jog_rows.rs)
 async-channel = "2.5"
 log = "0.4"
 serde = { version = "1.0", features = ["derive"] }

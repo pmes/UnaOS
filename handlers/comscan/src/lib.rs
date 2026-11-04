@@ -163,6 +163,7 @@ pub struct PumpCard {
     step: f64,
     feed: f64,
     said: Vec<(String, String)>,
+    pad: PadState, // VUGCOMSCANJOGFACEGTK (SR616): what the pad shows, folded from the bus by `hear`
 }
 
 impl PumpCard {
@@ -174,7 +175,7 @@ impl PumpCard {
     /// A card whose requests carry `principal` (the message-security law), at [`PumpCard::STEP_MM`] and
     /// [`PumpCard::FEED_MM_MIN`].
     pub fn new(principal: bandy::Origin) -> PumpCard {
-        PumpCard { principal, step: Self::STEP_MM, feed: Self::FEED_MM_MIN, said: Vec::new() }
+        PumpCard { principal, step: Self::STEP_MM, feed: Self::FEED_MM_MIN, said: Vec::new(), pad: PadState::default() }
     }
 
     /// The step field, mm.
@@ -224,5 +225,85 @@ impl PumpCard {
         }
         self.said.push(key);
         Some(format!("commissioned {name}"))
+    }
+}
+
+// --- VUGCOMSCANJOGFACEGTK (LEDGER SR616): the pump card's bus fold and snapshot, what a face's jog pad reads (named tail hunk) ---
+
+/// What the pad shows of the pump, folded from the bus by [`PumpCard::hear`] (the travel set by [`PumpCard::set_travel`]).
+#[derive(Debug, Clone, Default)]
+struct PadState {
+    linked: bool,
+    state: String,
+    squawk: Option<String>,
+    declared: [Option<f64>; 3],
+    read: [Option<f64>; 3],
+}
+
+/// A [`PumpCard`] as a face reads it: the link (up or not, and the pump's last state word), the travel per axis X / Y / Z
+/// in mm as declared and as read from the controller (`None`: not known to the card), the last position (`None` until
+/// VUG-COMSCAN-JOG-POSITION puts it on the wire), the last thing the pump said, and the pad's two fields.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CardSnapshot {
+    pub linked: bool,
+    pub state: String,
+    pub declared: [Option<f64>; 3],
+    pub read: [Option<f64>; 3],
+    pub position: Option<[f64; 3]>,
+    pub squawk: Option<String>,
+    pub step: f64,
+    pub feed: f64,
+}
+
+impl PumpCard {
+    /// Fold one pump answer into what the pad shows. A Squawk keeps its state word and its event; the link goes down on
+    /// a `link lost` event, up on a `relinked on attempt` event (the state word stays `link-lost` after a relink while
+    /// the link is up), else down on `idle` (nothing has started), unchanged on `link-lost`, up on any other state. A
+    /// refusal is said `refused: <why>`, a commission `commissioned <name>`. Requests are not answers: ignored.
+    pub fn hear(&mut self, ev: &bandy::PumpEvent) {
+        match ev {
+            bandy::PumpEvent::Squawk { state, event, .. } => {
+                let word = event.as_deref().unwrap_or("");
+                self.pad.linked = if word.starts_with("link lost") {
+                    false
+                } else if word.starts_with("relinked on attempt") {
+                    true
+                } else {
+                    match state.as_str() {
+                        "idle" => false,
+                        "link-lost" => self.pad.linked,
+                        _ => true,
+                    }
+                };
+                self.pad.state = state.clone();
+                if let Some(e) = event {
+                    self.pad.squawk = Some(e.clone());
+                }
+            }
+            bandy::PumpEvent::PumpRefused { why } => self.pad.squawk = Some(format!("refused: {why}")),
+            bandy::PumpEvent::Commissioned { name, .. } => self.pad.squawk = Some(format!("commissioned {name}")),
+            _ => {}
+        }
+    }
+
+    /// Set the travel the pad shows, X / Y / Z in mm: the declared machine's and the controller's read (the desk holds
+    /// both; the bus does not carry them, VUG-COMSCAN-JOG-TRAVEL-WIRE owed).
+    pub fn set_travel(&mut self, declared: [Option<f64>; 3], read: [Option<f64>; 3]) {
+        self.pad.declared = declared;
+        self.pad.read = read;
+    }
+
+    /// The card as a face reads it.
+    pub fn snapshot(&self) -> CardSnapshot {
+        CardSnapshot {
+            linked: self.pad.linked,
+            state: self.pad.state.clone(),
+            declared: self.pad.declared,
+            read: self.pad.read,
+            position: None,
+            squawk: self.pad.squawk.clone(),
+            step: self.step,
+            feed: self.feed,
+        }
     }
 }
