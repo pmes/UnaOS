@@ -1251,6 +1251,17 @@ pub enum PumpEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         dialect: Option<String>,
     },
+    /// VUGCOMSCANJOGTRAVELWIRE (SR618): the desk's travel and position typed for a face, so no face parses the Squawk
+    /// words back: X / Y / Z travel in mm as `declared` (the desk's machine) and as `read` from the controller (`None`
+    /// per axis: not known), and the last settled machine position (`None`: no Idle report since the last start, motion
+    /// or lost link). Posted by the desk's tick when any of them changed, before that tick's Squawks. An answer, inert
+    /// as input, so it carries no principal (as Squawk, PumpRefused and Commissioned carry none).
+    PumpEnvelope {
+        declared: [Option<f64>; 3],
+        read: [Option<f64>; 3],
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        position: Option<[f64; 3]>,
+    },
 }
 
 impl PumpEvent {

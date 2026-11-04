@@ -92,19 +92,25 @@ mod tests {
         PumpEvent::Squawk { sent: 0, acked: 0, total: 0, state: state.into(), status: None, event: event.map(Into::into) }
     }
 
-    /// A linked card with travel 200 / 200 / 100 declared and read: the link, the travel, the last word, the picker and
-    /// the keys enabled, no reason row.
+    /// A linked card that heard the desk's PumpEnvelope (VUGCOMSCANJOGTRAVELWIRE SR618: travel 350 / 350 / 110 declared,
+    /// 200 / 350 / 110 read, settled at X 150 Y 0 Z -2.5): the link, the travel, the position, the last word, the picker
+    /// and the keys enabled, no reason row.
     #[test]
     fn jog_rows_linked_kat() {
         let mut c = card();
         c.hear(&squawk("done", Some("started")));
-        c.set_travel([Some(200.0), Some(200.0), Some(100.0)], [Some(200.0), Some(200.0), Some(100.0)]);
+        c.hear(&PumpEvent::PumpEnvelope {
+            declared: [Some(350.0), Some(350.0), Some(110.0)],
+            read: [Some(200.0), Some(350.0), Some(110.0)],
+            position: Some([150.0, 0.0, -2.5]),
+        });
         c.set_step(10.0);
         assert_eq!(
             jog_rows(&c.snapshot()),
             vec![
                 JogRow::Link("link up · done".into()),
-                JogRow::Travel("travel  X 200 (read 200)  Y 200 (read 200)  Z 100 (read 100)".into()),
+                JogRow::Travel("travel  X 350 (read 200)  Y 350 (read 350)  Z 110 (read 110)".into()),
+                JogRow::Position("at X 150  Y 0  Z -2.5".into()),
                 JogRow::Squawk("started".into()),
                 JogRow::Steps { choices: [1.0, 10.0, 100.0], chosen: 10.0, enabled: true },
                 JogRow::Pad { keys: KEYS, enabled: true },
