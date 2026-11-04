@@ -277,10 +277,10 @@ pub fn list_in(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// The host's opener for `crate::pump::serve_pump`: a port name opened at `baud` / `flow` and made ready for
-/// `dialect`; a refusal is its name.
-pub fn opener(baud: Baud, flow: Flow, dialect: Dialect) -> Box<crate::pump::Opener> {
-    opener_in(PathBuf::from("/sys"), PathBuf::from("/dev"), baud, flow, dialect) // VUGCOMSCANTTYUSBID (SR529)
+/// The host's opener for `crate::pump::serve_pump`: a port name opened at `baud` / `flow` and made ready for the
+/// dialect each open is handed (VUGCOMSCANHOSTDIALECT, SR566); a refusal is its name.
+pub fn opener(baud: Baud, flow: Flow) -> Box<crate::pump::Opener> {
+    opener_in(PathBuf::from("/sys"), PathBuf::from("/dev"), baud, flow) // VUGCOMSCANTTYUSBID (SR529); VUGCOMSCANHOSTDIALECT (SR566)
 }
 
 /// The flags `cfmakeraw` leaves alone: the receiver on, modem lines ignored, one stop bit, the flow control, no
@@ -475,9 +475,9 @@ pub fn identify_in(sys: PathBuf) -> Box<crate::pump::Identify> {
 }
 
 /// [`opener`] over the roots `sys` and `dev`: a port starting [`USB_SCHEME`] is resolved by [`enumerate`] to its node
-/// first, any other port is a path; then opened at `baud` / `flow` and made ready for `dialect`.
-pub fn opener_in(sys: PathBuf, dev: PathBuf, baud: Baud, flow: Flow, dialect: Dialect) -> Box<crate::pump::Opener> {
-    Box::new(move |port: &str| -> Result<Box<dyn Transport + Send>, String> {
+/// first, any other port is a path; then opened at `baud` / `flow` and made ready for the dialect it is handed.
+pub fn opener_in(sys: PathBuf, dev: PathBuf, baud: Baud, flow: Flow) -> Box<crate::pump::Opener> {
+    Box::new(move |port: &str, dialect: Dialect| -> Result<Box<dyn Transport + Send>, String> { // VUGCOMSCANHOSTDIALECT (SR566)
         let path = if port.starts_with(USB_SCHEME) {
             let id = UsbId::parse(port).map_err(|r| r.to_string())?;
             enumerate(&sys, &dev, &id).map_err(|r| r.to_string())?

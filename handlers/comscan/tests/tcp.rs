@@ -109,7 +109,7 @@ fn machine() -> Machine {
 }
 
 fn no_serial() -> Box<Opener> {
-    Box::new(|port: &str| -> Result<Box<dyn Transport + Send>, String> { Err(format!("serial asked for {port}")) })
+    Box::new(|port: &str, _: Dialect| -> Result<Box<dyn Transport + Send>, String> { Err(format!("serial asked for {port}")) })
 }
 
 #[test]
@@ -120,7 +120,7 @@ fn an_armed_program_streams_to_done_over_tcp_through_the_scheme_arm() {
     let mut desk = PumpDesk::new(machine());
     let pass = Verdict::Pass { digest: p.digest(), machine: machine().digest() };
     let digest = desk.arm(&pass, &p, GRBL).expect("armed by a pass");
-    let mut open = by_scheme(no_serial(), opener(GRBL, CONNECT_WAIT));
+    let mut open = by_scheme(no_serial(), opener(CONNECT_WAIT));
     let start = PumpEvent::PumpStart {
         principal: Origin::LocalUser("una".to_string()),
         program: digest_hex(digest),
@@ -199,16 +199,16 @@ fn a_port_nobody_listens_on_refuses_by_name_within_the_timeout() {
     assert!(t0.elapsed() < wait, "refused inside the timeout");
 
     // The scheme arm: tcp:// goes to the network opener whole, a /dev path to the serial one.
-    let mut open = by_scheme(no_serial(), opener(GRBL, wait));
-    match open("/dev/ttyUSB0") {
+    let mut open = by_scheme(no_serial(), opener(wait));
+    match open("/dev/ttyUSB0", GRBL) {
         Err(why) => assert_eq!(why, "serial asked for /dev/ttyUSB0"),
         Ok(_) => panic!("opened a serial port"),
     }
-    match open(&format!("tcp://127.0.0.1:{port}")) {
+    match open(&format!("tcp://127.0.0.1:{port}"), GRBL) {
         Err(why) => assert!(why.contains("connection refused"), "{why}"),
         Ok(_) => panic!("connected to nobody"),
     }
-    match open("tcp://127.0.0.1") {
+    match open("tcp://127.0.0.1", GRBL) {
         Err(why) => assert!(why.contains("no :port"), "{why}"),
         Ok(_) => panic!("opened without a port"),
     }
@@ -322,7 +322,7 @@ fn drive_until(
         let now = t0.elapsed().as_micros() as u64;
         let mut out = desk.tick(now);
         if let Some(port) = desk.redial_due(now) {
-            let res = open(&port);
+            let res = open(&port, GRBL);
             out.extend(desk.relinked(t0.elapsed().as_micros() as u64, res));
         }
         for s in out {
@@ -349,7 +349,7 @@ fn a_lost_tcp_link_is_link_lost_at_its_line_redials_with_backoff_and_resumes_onl
     let mut desk = PumpDesk::new(machine());
     let pass = Verdict::Pass { digest: p.digest(), machine: machine().digest() };
     let digest = desk.arm(&pass, &p, GRBL).expect("armed by a pass");
-    let mut open = by_scheme(no_serial(), opener(GRBL, Duration::from_millis(500)));
+    let mut open = by_scheme(no_serial(), opener(Duration::from_millis(500)));
     let who = Origin::LocalUser("una".to_string());
     let start = PumpEvent::PumpStart {
         principal: who.clone(),
@@ -483,7 +483,7 @@ fn a_reopen_onto_another_board_is_refused_by_name_and_keeps_redialing_the_same_b
     desk.hello_within(Duration::from_millis(500));
     let pass = Verdict::Pass { digest: p.digest(), machine: machine().digest() };
     let digest = desk.arm(&pass, &p, GRBL).expect("armed by a pass");
-    let mut open = by_scheme(no_serial(), opener(GRBL, Duration::from_millis(500)));
+    let mut open = by_scheme(no_serial(), opener(Duration::from_millis(500)));
     let who = Origin::LocalUser("una".to_string());
     let start = PumpEvent::PumpStart {
         principal: who.clone(),
@@ -608,12 +608,12 @@ fn no_identity() -> Box<Identify> {
 }
 
 fn no_ws() -> Box<Opener> {
-    Box::new(|port: &str| -> Result<Box<dyn Transport + Send>, String> { Err(format!("ws asked for {port}")) })
+    Box::new(|port: &str, _: Dialect| -> Result<Box<dyn Transport + Send>, String> { Err(format!("ws asked for {port}")) })
 }
 
 /// The desk and opener through THE composition (`compose`, what `host_parts` builds over the host's links).
 fn composed() -> (PumpDesk, Box<Opener>) {
-    compose(machine(), no_identity(), no_serial(), opener(GRBL, Duration::from_millis(500)), no_ws())
+    compose(machine(), no_identity(), no_serial(), opener(Duration::from_millis(500)), no_ws())
 }
 
 fn start_at(digest: u64, port: u16) -> PumpEvent {
@@ -747,4 +747,96 @@ fn a_reopen_onto_a_board_answering_another_name_refuses_another_board() {
     let (ran_a, writes_a) = fake_a.join().unwrap();
     assert_eq!(ran_a, lines[5..].to_vec(), "the commissioned board ran only the lines from the lost one on");
     assert!(writes_a.is_empty(), "a reopen never commissions");
+}
+
+// --- VUGCOMSCANHOSTDIALECT (SR566): serve_pump's open runs on tokio's blocking pool, the worker stays free ---
+
+use bandy::{SMessage, Synapse};
+use comscan::pump::serve_pump;
+use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::sync::broadcast::error::RecvError;
+
+#[tokio::test(flavor = "current_thread")] // ONE worker: a blocking open on it would hold every task
+async fn serve_pump_leaves_the_worker_free_while_an_open_sleeps() {
+    let (opening, opened) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+    let (o1, o2) = (opening.clone(), opened.clone());
+    let slow: Box<Opener> = Box::new(move |port: &str, d: Dialect| -> Result<Box<dyn Transport + Send>, String> {
+        o1.store(true, Ordering::SeqCst);
+        thread::sleep(Duration::from_millis(300));
+        o2.store(true, Ordering::SeqCst);
+        Err(format!("slow board at {port} handed {d:?}"))
+    });
+    let (desk, open) = compose(machine(), no_identity(), slow, opener(Duration::from_millis(500)), no_ws());
+    let desk = Arc::new(Mutex::new(desk));
+    let p = program();
+    let pass = Verdict::Pass { digest: p.digest(), machine: machine().digest() };
+    let digest = desk.lock().unwrap().arm(&pass, &p, Dialect::Marlin).expect("armed by a pass");
+
+    let syn = Synapse::new();
+    let rx = syn.subscribe();
+    let mut watch = syn.subscribe();
+    let (mut probe_rx, probe_syn) = (syn.subscribe(), syn.clone());
+    // Another task on the same worker, answering a bus event serve_pump ignores.
+    let probe = tokio::spawn(async move {
+        loop {
+            match probe_rx.recv().await {
+                Ok(SMessage::Kill(w)) if w == "tcp-probe" => probe_syn.fire(SMessage::Kill("tcp-probe-answered".to_string())),
+                Ok(SMessage::Kill(w)) if w == "comscan" => break,
+                Ok(_) | Err(RecvError::Lagged(_)) => {}
+                Err(RecvError::Closed) => break,
+            }
+        }
+    });
+    let task = tokio::spawn(serve_pump(syn.clone(), rx, desk.clone(), open, Duration::from_millis(5)));
+    syn.fire(SMessage::Pump(PumpEvent::PumpStart {
+        principal: Origin::LocalUser("una".to_string()),
+        program: digest_hex(digest),
+        dialect: "marlin".to_string(),
+        port: "/dev/comscan-slow-board".to_string(),
+    }));
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !opening.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("the open began");
+    assert!(!opened.load(Ordering::SeqCst), "the test task ran while the open sleeps (a blocking open holds the worker)");
+    assert!(desk.try_lock().is_ok(), "the desk lock is not held across the open");
+
+    syn.fire(SMessage::Kill("tcp-probe".to_string()));
+    tokio::time::timeout(Duration::from_millis(200), async {
+        loop {
+            match watch.recv().await {
+                Ok(SMessage::Kill(w)) if w == "tcp-probe-answered" => return,
+                Ok(_) | Err(RecvError::Lagged(_)) => {}
+                Err(RecvError::Closed) => panic!("the bus closed"),
+            }
+        }
+    })
+    .await
+    .expect("the probe was answered while the open sleeps");
+    assert!(!opened.load(Ordering::SeqCst), "answered before the open returned");
+
+    // The handback on the runtime thread: the refused open named by the opener (handed the PumpStart's dialect).
+    let why = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            match watch.recv().await {
+                Ok(SMessage::Pump(PumpEvent::PumpRefused { why })) => return why,
+                Ok(SMessage::Pump(PumpEvent::Squawk { event: Some(e), .. })) => panic!("unexpected squawk {e}"),
+                Ok(_) | Err(RecvError::Lagged(_)) => {}
+                Err(RecvError::Closed) => panic!("the bus closed"),
+            }
+        }
+    })
+    .await
+    .expect("the open's answer");
+    assert!(opened.load(Ordering::SeqCst));
+    assert!(why.contains("slow board at /dev/comscan-slow-board handed Marlin"), "{why}");
+    assert_eq!(desk.lock().unwrap().armed(), vec![digest], "a refused open leaves the arming");
+
+    syn.fire(SMessage::Kill("comscan".to_string()));
+    tokio::time::timeout(Duration::from_secs(5), task).await.expect("stops on Kill").unwrap();
+    tokio::time::timeout(Duration::from_secs(5), probe).await.expect("the probe stops").unwrap();
 }
