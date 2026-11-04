@@ -853,7 +853,7 @@ fn path_names(path: &str, img: &str) -> bool {
 // launcher arms a program's name only AFTER the spawn made the task runnable (WINTITLE-LATE), and PREFS.ELF
 // registers as its second syscall. The arch spawn bodies now arm the kernel launcher's own argv[0] at the mint,
 // before the task exists (x86 `spawn_user_image_bg_inner`, aarch64 `spawn_user_image_bg_piped`, one line each;
-// never on the ring-3 SYS_SPAWN_PATH road, whose argv is ring-3 bytes — BUSREG-ARM-EARLY-RING3, owed), into wm's
+// the ring-3 SYS_SPAWN_PATH road passes its kernel-opened path, never its argv — BUSREG-ARM-EARLY-RING3 B1172), into wm's
 // early record (`wm::app_name_arm_early`), stamped with the row's generation. `row_name` and `tagpath_id` read it
 // only when no launcher-armed name / path exists, and only at the row's CURRENT generation, so a launched
 // fulfiller is judged at REGISTER, a squatter early-named otherwise is refused there, and the relay gate stays
@@ -864,9 +864,9 @@ fn path_names(path: &str, img: &str) -> bool {
 /// Early records armed since boot (monotonic).
 pub static ARMEARLY_ARMED: AtomicU32 = AtomicU32::new(0);
 
-/// The arch spawn body's arm: `path` is the kernel launcher's argv[0] (`None` on the ring-3 road or an argv-less
-/// launch: nothing armed). Called before the task is spawned; takes only wm's leaf lock.
-pub fn arm_early(row: usize, path: Option<&str>) {
+/// The arch spawn body's arm: `path` is the early path the body's CALLER chose (a kernel road's argv[0], the ring-3
+/// road's kernel-opened path; `None` = nothing armed); `ring3` labels the road only. Takes only wm's leaf lock.
+pub fn arm_early(row: usize, path: Option<&str>, ring3: bool) {
     let Some(path) = path else { return };
     let rg = (crate::arch::syscall::busreg_ops().rgen)(row);
     let armed = crate::video::wm::app_name_arm_early(crate::video::wm::owner_of_launch(row as u64), rg, path);
@@ -874,8 +874,8 @@ pub fn arm_early(row: usize, path: Option<&str>) {
         ARMEARLY_ARMED.fetch_add(1, Ordering::Relaxed);
     }
     serial_println!(
-        "[busreg] arm-early row={} gen={} name={} path={} armed={}",
-        row, rg, crate::video::wm::program_name(path), if path.starts_with('/') { path } else { "-" }, armed as u8
+        "[busreg] arm-early row={} gen={} name={} path={} armed={} road={}",
+        row, rg, crate::video::wm::program_name(path), if path.starts_with('/') { path } else { "-" }, armed as u8, if ring3 { "ring3" } else { "kernel" }
     );
 }
 
@@ -923,14 +923,14 @@ fn armearly_selftest(fx: &Fixture) {
     let mut w = 0u32;
 
     // E1: early-named as another program (by its /apps/ path) -> refused at REGISTER, no late arm needed.
-    arm_early(f, Some("/apps/PROBE.ELF"));
+    arm_early(f, Some("/apps/PROBE.ELF"), false);
     let n = crate::bus::build_request(BUS_VERB_REGISTER, 71, &[set], &mut buf);
     let refused = (fx.send)(f, &buf[..n]) == 0 && matches!((fx.pop)(f).as_deref().and_then(parse), Some(h) if h.status == EACCES as i32 && h.corr == 71);
     if refused && lookup(fx.ops, set).is_none() {
         w |= 1 << 0;
     }
     // E2: early-armed as the fulfiller's image, still no late arm -> registered AND relayed (B1157 dropped it).
-    arm_early(f, Some("/apps/PREFS.ELF"));
+    arm_early(f, Some("/apps/PREFS.ELF"), false);
     let n = crate::bus::build_request(BUS_VERB_REGISTER, 72, &[get, set], &mut buf);
     let ok = (fx.send)(f, &buf[..n]) == 0 && matches!((fx.pop)(f).as_deref().and_then(parse), Some(h) if h.status == 0 && h.corr == 72);
     let n = crate::bus::build_request(get, 73, b"ui.theme", &mut buf);
@@ -959,19 +959,39 @@ fn armearly_selftest(fx: &Fixture) {
     on_exit(fx.ops, f);
     (fx.clear)(a);
     (fx.clear)(f);
+    // E4 (BUSREG-ARM-EARLY-RING3 B1172): the ring-3 road's arm (SYS_SPAWN_PATH's kernel-opened path) -> admitted
+    // at REGISTER as the fulfiller, no late arm.
+    arm_early(f, Some("/apps/PREFS.ELF"), true);
+    let n = crate::bus::build_request(BUS_VERB_REGISTER, 76, &[get, set], &mut buf);
+    let r3 = (fx.send)(f, &buf[..n]) == 0 && matches!((fx.pop)(f).as_deref().and_then(parse), Some(h) if h.status == 0 && h.corr == 76);
+    if r3 && matches!(fulfiller_row(set), Some((r, _)) if r == f) {
+        w |= 1 << 3;
+    }
+    on_exit(fx.ops, f);
+    (fx.clear)(a);
+    (fx.clear)(f);
     on_exit(fx.ops, a);
     crate::video::wm::app_name_early_forget(owner_f);
-    const ALL: u32 = (1 << 3) - 1;
+    const ALL: u32 = (1 << 4) - 1;
     let armed = ARMEARLY_ARMED.load(Ordering::Relaxed);
     if w == ALL {
-        serial_println!(":: BUSREG-ARMEARLY: probe=refused-at-register prefs=relayed-early stale=dropped armed={} -> PASS ::", armed);
+        serial_println!(":: BUSREG-ARMEARLY: probe=refused-at-register prefs=relayed-early stale=dropped ring3=registered-early armed={} -> PASS ::", armed);
     } else {
         serial_println!(
-            ":: BUSREG-ARMEARLY: probe={} prefs={} stale={} armed={} w={:#x}/{:#x} -> FAIL ::",
+            ":: BUSREG-ARMEARLY: probe={} prefs={} stale={} ring3={} armed={} w={:#x}/{:#x} -> FAIL ::",
             if w & 1 != 0 { "refused-at-register" } else { "OPEN" },
             if w & 2 != 0 { "relayed-early" } else { "DROPPED" },
             if w & 4 != 0 { "dropped" } else { "KEPT" },
+            if w & 8 != 0 { "registered-early" } else { "REFUSED" },
             armed, w, ALL
         );
     }
 }
+
+// =================================================================================================
+// BUSREG-ARM-EARLY-RING3 (rmbp-ledger B1172) — TAIL-APPENDED. The spawn bodies take the early path as an argument
+// (x86 `spawn_user_image_bg_inner`, aarch64 `spawn_user_image_bg_piped`: `early`), chosen by each CALLER: a kernel
+// road passes its own argv[0], SYS_SPAWN_PATH's `spawn_path_checked` the path the kernel opened, apptrust passed and
+// read the image from (the string its late `app_name_arm` records), never ring-3 argv. The mint's as_row / ring3
+// trust branch is retired; `arm_early`'s `ring3` labels the road only. Witness: `tests bandy3` E4 (`ring3=`).
+// =================================================================================================

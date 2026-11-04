@@ -8310,7 +8310,7 @@ pub enum BgPoll {
 /// (the shell's `bg` verb) records the pid and reaps it later via [`bg_poll`]. Mirrors
 /// `run_user_image`'s front half exactly — same bounds, same console-cap endowment, same EXEC1-M
 /// publish order — and diverges only where the contract block above says it does.
-pub fn spawn_user_image_bg_argv(bytes: &[u8], argv: &[&str]) -> Result<(u64, u64, u64), &'static str> { spawn_user_image_bg_piped(bytes, argv, None, false) } fn spawn_user_image_bg_piped(bytes: &[u8], argv: &[&str], pipe: Option<usize>, ring3: bool) -> Result<(u64, u64, u64), &'static str> { // ARMPIPE (A108): the bg body with SYS_SPAWN_PATH's two extras — the reserved pipe bound before the task exists, and the caller's principal rule; the shell's `bg` passes neither. ⚠ LINE-NEUTRAL fold.
+pub fn spawn_user_image_bg_argv(bytes: &[u8], argv: &[&str]) -> Result<(u64, u64, u64), &'static str> { spawn_user_image_bg_piped(bytes, argv, None, false, argv.first().copied()) } fn spawn_user_image_bg_piped(bytes: &[u8], argv: &[&str], pipe: Option<usize>, ring3: bool, early: Option<&str>) -> Result<(u64, u64, u64), &'static str> { // ARMPIPE (A108): the bg body with SYS_SPAWN_PATH's two extras — the reserved pipe bound before the task exists, and the caller's principal rule; the shell's `bg` passes neither. ⚠ LINE-NEUTRAL fold.
     #[cfg(feature = "desktop_firmware")] if oneinstance_gate(argv, pipe.is_some()).is_some() { return Err(ONEINSTANCE_RAISED); } if bytes.len() > super::xwin::IMAGE_CAP { // RING3ABI2 M5: the 4 MiB ELF window. ONEINSTANCE2 (rmbp-ledger B751): a second launch of a running program by the user's verb raises it instead of spawning (file tail), BEFORE anything is claimed; LINE-NEUTRAL fold, code before this line's first `//`.
         return Err("image larger than the user image cap (USER_WINDOW_BYTES)");
     }
@@ -8349,7 +8349,7 @@ pub fn spawn_user_image_bg_argv(bytes: &[u8], argv: &[&str]) -> Result<(u64, u64
             });
         }
     };
-    let asid = mapped.ttbr0 >> 48; spawn_path_bind(asid, bytes, pipe, ring3); super::xwin::args_write(mapped.slot, argv); #[cfg(feature = "desktop_firmware")] crate::video::wm::spawn_focus_arm(asid); #[cfg(all(feature = "busreg", feature = "aarch64_el0"))] crate::bus_route::arm_early(asid as usize, if !ring3 { argv.first().copied() } else { None }); /* BUSREG-ARM-EARLY (B1164): the kernel launcher's own argv[0] (never ring-3 bytes) armed for the bus check before the task can run (bus_route tail) */ // FOCUSARM64 (SR180): every launch through this funnel arms its first window's focus token before the task can run, x86 `spawn_user_image_bg_inner`'s twin (aarch64 has no desktop-app exemption to make; LINE-NEUTRAL fold). ARMPIPE (A108): the pipe bound and the principal ruled BEFORE the task can run (fn at the FILE TAIL). RING3ABI2 M2
+    let asid = mapped.ttbr0 >> 48; spawn_path_bind(asid, bytes, pipe, ring3); super::xwin::args_write(mapped.slot, argv); #[cfg(feature = "desktop_firmware")] crate::video::wm::spawn_focus_arm(asid); #[cfg(all(feature = "busreg", feature = "aarch64_el0"))] crate::bus_route::arm_early(asid as usize, early, ring3); #[cfg(not(all(feature = "busreg", feature = "aarch64_el0")))] let _ = early; /* BUSREG-ARM-EARLY (B1164) + BUSREG-ARM-EARLY-RING3 (B1172): the early path the CALLER chose (a kernel road its own argv[0], SYS_SPAWN_PATH its kernel-opened path, never ring-3 argv) armed for the bus check before the task can run; `ring3` is the road label only (bus_route tail) */ // FOCUSARM64 (SR180): every launch through this funnel arms its first window's focus token before the task can run, x86 `spawn_user_image_bg_inner`'s twin (aarch64 has no desktop-app exemption to make; LINE-NEUTRAL fold). ARMPIPE (A108): the pipe bound and the principal ruled BEFORE the task can run (fn at the FILE TAIL). RING3ABI2 M2
     // VUG-BG: mark the address space DETACHED before the task can be dispatched, so the program observes
     // the bit on its very first info-page read rather than racing the launcher. See `set_detached`.
     set_detached(asid, true);
@@ -26571,7 +26571,7 @@ fn spawn_path_checked(path: &str, words: &[alloc::string::String], who: &str, ca
     let argv: alloc::vec::Vec<&str> = words.iter().map(|s| s.as_str()).collect();
     let pipe_idx = pipe_reserve(pipe, caller).map_err(|why| (EAGAIN, why))?;
     crate::prof::launching(path);
-    match spawn_user_image_bg_piped(&bytes, &argv, pipe_idx, true) {
+    match spawn_user_image_bg_piped(&bytes, &argv, pipe_idx, true, Some(path)) { // BUSREG-ARM-EARLY-RING3 (B1172): the kernel-opened path, never ring-3 argv
         Ok((pid, asid, entry)) => {
             crate::video::wm::app_name_arm(crate::video::wm::owner_of_launch(asid), path);
             crate::fs::appres::sight(path);
@@ -27572,7 +27572,7 @@ static ONEINST_NEW: AtomicBool = AtomicBool::new(false);
 #[cfg(feature = "desktop_firmware")]
 pub fn spawn_user_image_bg_argv_new(bytes: &[u8], argv: &[&str]) -> Result<(u64, u64, u64), &'static str> {
     ONEINST_NEW.store(true, Ordering::Release);
-    let r = spawn_user_image_bg_piped(bytes, argv, None, false);
+    let r = spawn_user_image_bg_piped(bytes, argv, None, false, argv.first().copied());
     ONEINST_NEW.store(false, Ordering::Release);
     r
 }
