@@ -4183,7 +4183,7 @@ fn session_diet_per_min() -> u64 {
 // keeps equal to the last session's value). [`open_as`] reads it once per no-session opening, ahead of the VEIL raise, through
 // the latch's own door (`crystal::login_reduce_load`: the bus GET, the no-session load); with a session open it reads nothing,
 // so the lock's re-raise keeps the session's latch. Wire: `[veil] login reduce_transparency=<0|1> a=<n> via=machine moved=<0|1>`.
-// A11Y-BOOT-SET (rmbp-ledger B1147): the read is the WHOLE accessibility set through its one load road, `settings::a11y_load("machine")` (which holds the reduce_transparency load), over `prefs::MACHINE_KEYS`' mirror; wire `[veil] login a11y via=machine keys=<n> moved=<n>`.
+// A11Y-BOOT-SET (rmbp-ledger B1147): the read is the WHOLE accessibility set through its one load road, `settings::a11y_load("machine")` (which holds the reduce_transparency load), over `prefs::MACHINE_KEYS`' mirror; wire `[veil] login a11y via=machine keys=<n> moved=<n>`. A11Y-BOOT-TEXT (rmbp-ledger B1153): `display.font_size` is mirrored too; the same load fills the tree `text::follow_prefs` reads, so the login form's Ui face restyles before any login; ` text_px=<n>` on the line.
 fn veil_reduce_boot() {
     let mut wb = [0u8; crate::prefs::WHO_BUF];
     if crate::prefs::user_name_in(&mut wb).is_some() {
@@ -4191,5 +4191,5 @@ fn veil_reduce_boot() {
     }
     let r0 = crate::video::crystal::login_reduce(); let n = crate::video::settings::a11y_load("machine"); let moved = (crate::video::crystal::login_reduce() != r0) as u8; // A11Y-BOOT-SET (rmbp-ledger B1147): the one road latches every consumer, Reduce transparency included
     serial_println!("[veil] login reduce_transparency={} a={} via=machine moved={}", crate::video::crystal::login_reduce() as u8, crate::video::crystal::veil::Look::login().a, moved);
-    serial_println!("[veil] login a11y via=machine keys={} moved={}", crate::prefs::MACHINE_KEYS.len(), n); // A11Y-BOOT-SET (rmbp-ledger B1147)
+    serial_println!("[veil] login a11y via=machine keys={} moved={} text_px={}", crate::prefs::MACHINE_KEYS.len(), n, crate::prefs::int(crate::prefs::key::FONT_SIZE, 9, 32).unwrap_or(13)); // A11Y-BOOT-SET (rmbp-ledger B1147). A11Y-BOOT-TEXT (rmbp-ledger B1153): text_px = the mirrored display.font_size `text::follow_prefs` restyles to
 }
