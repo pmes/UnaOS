@@ -603,7 +603,7 @@ pub mod ftdirx {
     static IDLE: AtomicU64 = AtomicU64::new(0);
     /// Completions with a non-success, non-short completion code.
     static ERRORS: AtomicU64 = AtomicU64::new(0);
-    static FIRST_LOGGED: AtomicBool = AtomicBool::new(false);
+    static FIRST_LOGGED: AtomicBool = AtomicBool::new(false); pub fn counts() -> (u64, u64, u64, u64) { (RX.load(Ordering::Relaxed), PACKETS.load(Ordering::Relaxed), IDLE.load(Ordering::Relaxed), ERRORS.load(Ordering::Relaxed)) } // DOORONPUMP (rmbp-ledger B1095): `(rx, packets, idle, errors)` for the `ftdi-door` task and `tests ftdidoor` (`door`, file tail). ⚠ LINE-NEUTRAL fold, code before the comment: a line added inside this module would shift `console_watch` below it, which compiles knob-off.
     /// Last `rx=` a rollup reported; the next fires when `rx` has at least DOUBLED it. The
     /// log-scale throttle `note_ftdi_pump` uses, for the same reason: a console that is being typed
     /// into must not spend its own bandwidth narrating itself, while the LAST such line still
@@ -1098,5 +1098,298 @@ pub mod console_watch {
             EnumWord(s),
             pw
         );
+    }
+}
+
+// ── DOORONPUMP (rmbp-ledger B1095, FLIGHT 39 boot 1) — the serial door outlives a usb-pump death ─────────────────────────
+//
+// Flight 39 boot 1: the usb-pump died 42 times in its hda step (PUMPHDA B1091) and the serial door died with it: FTDIRX=0
+// all boot, the seat's `tests facetedit` typed from narino at 21:35:56Z never seen. The RX completion was already latched off
+// the pump (`ftdirx::claim` from the one dispatch, which `xhci-poll` runs every tick), but the CONSUME + RE-ARM
+// (`XhciController::service_ftdi_rx`) had one caller, `service_ftdi`, and on the rMBP that is the pump's xHCI step alone. A
+// restart touches no FTDI state (the slot, the IN ring, `ARMED`, a latched `DONE` all survive), so the door was simply never
+// serviced while the pump was parked or dead.
+//
+// THE DOOR. `ftdi-door`, spawned ONCE from the first `service_ftdi` pass with the sink live (console-up), on a core apart
+// from its caller's (`sched::sibling_online_cpu`), at `PRIO_HIGH` (x86 has no `PRIO_SERVICE`; the console and pump watches run
+// HIGH) on `PUMP_PATH_STACK_SIZE` (`deliver` is a pump-path frame: `push_event` + `serial_println!`). Every `CADENCE_MS` it
+// runs ONE `xhci::ftdi_door_pass` — the existing `service_ftdi_rx` under the FTDI controller's loan, taken non-blocking —
+// and while it is up `service_ftdi` skips its own call (`claim_rx`): one owner. No task to spawn from, or no other core:
+// the pump keeps the job exactly as before, said once. The door SAYS its state with no data arriving (`armed_ms=`, `idle=`,
+// the silent-episode line, the stuck line), which the flight-39 wire could not.
+//
+// ⚠ TAIL MODULE ON PURPOSE (LINE-NEUTRAL): nothing below it shifts, so no panic `Location` above moves.
+/// CHARTER: driver seam (CODEX §2 Comscan) — the FTDI RX door on its own task (`ftdi-door`), off the usb-pump: the one owner of the RX consume + re-arm.
+#[cfg(feature = "ftdirx")]
+pub mod door {
+    use core::sync::atomic::{AtomicBool, Ordering::Acquire};
+
+    /// The door owns the RX consume + re-arm (set when `ftdi-door` is spawned; never cleared).
+    static ON: AtomicBool = AtomicBool::new(false);
+
+    /// Whether the `ftdi-door` task owns the RX half.
+    #[inline]
+    pub fn on() -> bool {
+        ON.load(Acquire)
+    }
+
+    /// `service_ftdi`'s question, every pass: does the door own RX? Starts it once (console live, a scheduled caller, another
+    /// core); `false` = the caller keeps consuming, as before. Off x86: always `false`.
+    #[inline]
+    pub fn claim_rx() -> bool {
+        if ON.load(Acquire) {
+            return true;
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            imp::start()
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            false
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub use imp::fixture;
+
+    #[cfg(target_arch = "x86_64")]
+    mod imp {
+        use super::ON;
+        use core::sync::atomic::{AtomicBool, AtomicU64, Ordering::{AcqRel, Acquire, Relaxed, Release}};
+
+        /// The door's period: half the FT232's 16 ms latency timer, so a packet waits at most one period for its consume.
+        pub const CADENCE_MS: u64 = 8;
+        /// An outstanding IN TRB this old with no completion, on a cable that HAS answered idle polls, is a stuck endpoint
+        /// (the metal FT232 answers every IN token within its 16 ms latency timer; QEMU's usb-serial NAKs, idle=0).
+        const STUCK_MS: u64 = 2_000;
+        /// The pump counts as silent for the door's books once its stamp is this old: a quarter of PUMPWEDGE's bound
+        /// (`sessionwedge::WEDGE_MS`, 2 s), 500x a healthy ~1 ms pass and far past the 4 ms FTDI slice.
+        #[cfg(feature = "wc")]
+        const SILENT_MS: u64 = crate::sessionwedge::WEDGE_MS / 4;
+
+        static STARTED: AtomicBool = AtomicBool::new(false);
+        static SAID_PUMP: AtomicBool = AtomicBool::new(false);
+        static STUCK_SAID: AtomicBool = AtomicBool::new(false);
+        static TID: AtomicU64 = AtomicU64::new(0);
+        static CPU: AtomicU64 = AtomicU64::new(0);
+        static FROM: AtomicU64 = AtomicU64::new(0);
+        /// Passes that took the loan and ran the consume + re-arm.
+        static PASSES: AtomicU64 = AtomicU64::new(0);
+        /// Passes that consumed a completion (any size, error included).
+        static TOOK: AtomicU64 = AtomicU64::new(0);
+        /// Passes the loan was busy (or no controller): skipped, the FT232 holds its bytes.
+        static BUSY: AtomicU64 = AtomicU64::new(0);
+        /// The same two counts while the pump's stamp was `SILENT_MS` old — the door working without the pump.
+        static SILENT_PASSES: AtomicU64 = AtomicU64::new(0);
+        static SILENT_TOOK: AtomicU64 = AtomicU64::new(0);
+        /// Silent stretches that reached PUMPWEDGE's bound (a pump death the door outlived).
+        static EPISODES: AtomicU64 = AtomicU64::new(0);
+        /// `arch::ms` of the door's last consumed completion (or its start).
+        static LAST_TAKE_MS: AtomicU64 = AtomicU64::new(0);
+
+        /// The pump keeps the job: said once per boot.
+        fn say_pump(reason: &str) {
+            if !SAID_PUMP.swap(true, AcqRel) {
+                serial_println!(":: FTDIRX: on=pump reason={} (DOORONPUMP B1095: the door stays on the pump) ::", reason);
+            }
+        }
+
+        /// `claim_rx`'s start: once, with the sink live, from a scheduled task, onto another core.
+        pub fn start() -> bool {
+            if !super::super::is_live() || STARTED.load(Acquire) {
+                return false;
+            }
+            if crate::arch::sched::current_id().is_none() {
+                say_pump("no-task");
+                return false;
+            }
+            let me = crate::arch::percpu::this_cpu().cpu_index as usize;
+            let cpu = crate::arch::sched::sibling_online_cpu(me);
+            if cpu == me {
+                say_pump("no-core");
+                return false;
+            }
+            if STARTED.swap(true, AcqRel) {
+                return ON.load(Acquire);
+            }
+            FROM.store(me as u64, Relaxed);
+            CPU.store(cpu as u64, Relaxed);
+            LAST_TAKE_MS.store(crate::arch::ms().max(1), Relaxed);
+            ON.store(true, Release);
+            crate::arch::sched::spawn_stack("ftdi-door", task, cpu, cpu, crate::arch::sched::PRIO_HIGH, crate::arch::sched::PUMP_PATH_STACK_SIZE);
+            true
+        }
+
+        /// The pump's stamp age when it is silent for the door's books, else `None` (always `None` without `wc`).
+        fn pump_silent_age() -> Option<u64> {
+            #[cfg(feature = "wc")]
+            {
+                crate::sessionwedge::pump_age_ms().filter(|&a| a >= SILENT_MS)
+            }
+            #[cfg(not(feature = "wc"))]
+            {
+                None
+            }
+        }
+
+        /// Whether a silent stretch this long is a pump death (PUMPWEDGE's own bound); never without `wc`.
+        fn is_episode(max_age: u64) -> bool {
+            #[cfg(feature = "wc")]
+            {
+                max_age >= crate::sessionwedge::WEDGE_MS
+            }
+            #[cfg(not(feature = "wc"))]
+            {
+                let _ = max_age;
+                false
+            }
+        }
+
+        /// ms the outstanding IN TRB has waited since the door's last consume; 0 when none is outstanding.
+        fn armed_ms(now: u64) -> u64 {
+            if super::super::ftdirx::armed() { now.saturating_sub(LAST_TAKE_MS.load(Relaxed)) } else { 0 }
+        }
+
+        /// One silent stretch's own counts.
+        struct Stretch {
+            open: bool,
+            max_age: u64,
+            passes: u64,
+            took: u64,
+            busy: u64,
+        }
+
+        impl Stretch {
+            const fn new() -> Self {
+                Stretch { open: false, max_age: 0, passes: 0, took: 0, busy: 0 }
+            }
+        }
+
+        /// A silent stretch ended (the pump stamped again): a pump death is counted and, log-throttled (1, 2, 4, 8 …), said.
+        fn end_stretch(st: &Stretch, now: u64) {
+            if !is_episode(st.max_age) {
+                return;
+            }
+            let n = EPISODES.fetch_add(1, Relaxed) + 1;
+            if !n.is_power_of_two() {
+                return;
+            }
+            let (rx, _packets, idle, _errors) = super::super::ftdirx::counts();
+            serial_println!(
+                "[ftdirx] door kept the cable while the pump was silent silent_ms={} passes={} took={} busy={} rx={} idle={} armed_ms={} episodes={}",
+                st.max_age, st.passes, st.took, st.busy, rx, idle, armed_ms(now), n
+            );
+        }
+
+        /// The stuck endpoint, said once: the loan was taken, nothing completed for `STUCK_MS`, and this cable has answered
+        /// idle polls before (so silence is not QEMU's NAK).
+        fn stuck_maybe(now: u64) {
+            if STUCK_SAID.load(Relaxed) || !super::super::is_live() {
+                return;
+            }
+            let (_rx, _packets, idle, _errors) = super::super::ftdirx::counts();
+            let age = armed_ms(now);
+            if idle == 0 || age < STUCK_MS || STUCK_SAID.swap(true, AcqRel) {
+                return;
+            }
+            serial_println!(
+                "[ftdirx] door: IN TRB armed {} ms with no completion idle={} (metal FT232 answers every 16 ms; FTDIRX-EPRESET owed)",
+                age, idle
+            );
+        }
+
+        /// `ftdi-door`: the RX consume + re-arm, every `CADENCE_MS`, whatever the pump is doing.
+        fn task(cpu: usize) {
+            TID.store(crate::arch::sched::current_id().unwrap_or(0), Relaxed);
+            serial_println!(
+                ":: FTDIRX: on=task door=ftdi-door tid={} cpu={} from_cpu={} prio=high cadence_ms={} stack={} (DOORONPUMP B1095: the RX consume and re-arm leave the usb-pump) ::",
+                TID.load(Relaxed), cpu, FROM.load(Relaxed), CADENCE_MS, crate::arch::sched::PUMP_PATH_STACK_SIZE
+            );
+            let mut st = Stretch::new();
+            loop {
+                crate::arch::sched::sleep_ms(CADENCE_MS);
+                let silent = pump_silent_age();
+                let p0 = super::super::ftdirx::counts().1;
+                let loaned = crate::drivers::xhci::ftdi_door_pass();
+                let took = super::super::ftdirx::counts().1 != p0;
+                let now = crate::arch::ms();
+                if loaned {
+                    PASSES.fetch_add(1, Relaxed);
+                } else {
+                    BUSY.fetch_add(1, Relaxed);
+                }
+                if took {
+                    TOOK.fetch_add(1, Relaxed);
+                    LAST_TAKE_MS.store(now.max(1), Relaxed);
+                }
+                if let Some(age) = silent {
+                    st.open = true;
+                    st.max_age = st.max_age.max(age);
+                    if loaned {
+                        SILENT_PASSES.fetch_add(1, Relaxed);
+                        st.passes += 1;
+                    } else {
+                        st.busy += 1;
+                    }
+                    if took {
+                        SILENT_TOOK.fetch_add(1, Relaxed);
+                        st.took += 1;
+                    }
+                } else if st.open {
+                    end_stretch(&st, now);
+                    st = Stretch::new();
+                }
+                if loaned && !took {
+                    stuck_maybe(now);
+                }
+            }
+        }
+
+        /// `tests ftdidoor`: `:: FTDIDOOR: on=<task|pump> door=<tid>@c<n> passes=<d> took=<d> busy=<d> armed=<0|1> rx=<n>
+        /// silent_passes=<n> silent_took=<n> episodes=<n> -> PASS|FAIL|SKIP :: reason=<ok|no-door|no-passes|not-armed|no-cable>`
+        /// over a 1 s window (`<d>` = the window's delta). PASS iff the door owns RX, its passes rose and a read is armed.
+        /// Go-red: drop `ftdi_door_pass()` in `task` -> `passes=0 -> FAIL reason=no-passes`. Run after `tests gatesteal2`
+        /// (its legs park and restart the pump): `silent_passes>0` is the door working while the pump was parked; with the
+        /// bench's injector typing during the park, `silent_took>0`.
+        pub fn fixture() {
+            let on = ON.load(Acquire);
+            let live = super::super::is_live();
+            let (p0, t0, b0) = (PASSES.load(Relaxed), TOOK.load(Relaxed), BUSY.load(Relaxed));
+            if live {
+                crate::arch::sched::sleep_ms(1_000);
+            }
+            let (p1, t1, b1) = (PASSES.load(Relaxed), TOOK.load(Relaxed), BUSY.load(Relaxed));
+            let armed = super::super::ftdirx::armed();
+            let (rx, _packets, _idle, _errors) = super::super::ftdirx::counts();
+            let reason = if !live {
+                "no-cable"
+            } else if !on {
+                "no-door"
+            } else if p1 == p0 {
+                "no-passes"
+            } else if !armed {
+                "not-armed"
+            } else {
+                "ok"
+            };
+            let verdict = if !live { "SKIP" } else if reason == "ok" { "PASS" } else { "FAIL" };
+            serial_println!(
+                ":: FTDIDOOR: on={} door={}@c{} passes={} took={} busy={} armed={} rx={} silent_passes={} silent_took={} episodes={} -> {} :: reason={}",
+                if on { "task" } else { "pump" },
+                TID.load(Relaxed),
+                CPU.load(Relaxed),
+                p1.wrapping_sub(p0),
+                t1.wrapping_sub(t0),
+                b1.wrapping_sub(b0),
+                armed as u8,
+                rx,
+                SILENT_PASSES.load(Relaxed),
+                SILENT_TOOK.load(Relaxed),
+                EPISODES.load(Relaxed),
+                verdict,
+                reason
+            );
+        }
     }
 }
