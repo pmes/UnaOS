@@ -1190,3 +1190,74 @@ fn a_glyph_not_moved_has_no_leader() {
     assert_eq!(gs[0].at, (sx + 6.0, sy - 14.0), "nothing to push: its anchor's place");
     assert_eq!(photo::leader(&vw.view, &gs[0]), None, "an unmoved glyph has no leader");
 }
+
+// ---- VUGINTENTSETFACEPUSHEDGE (SR606): a right push past the sheet's edge goes down to the column's foot; the corner names a glyph wider than the sheet ----
+
+/// SR601's rectangle face with `n` listed singles and one single anchored at the left side's midpoint whose id is `id`:
+/// the anchored glyph (last) and the listed column's bounding rect (x0, y0, x1, y1).
+fn anchored_over_column(id: &str, n: usize) -> (Viewer, vug_view::photo::ProposalGlyph, (f32, f32, f32, f32)) {
+    let mut vw = rectangle();
+    let (e, _) = left_side(&vw);
+    let mut ps = listed(n);
+    ps.push(datum(&format!("horizontal {id} sketch=s line=e{e}"), "the left side"));
+    assert!(photo::offer(&mut vw.view, ps));
+    let gs = photo::glyphs(&vw.view);
+    assert_eq!(gs.len(), n + 1, "{n} listed singles and the anchored one: {gs:?}");
+    let col = gs[..n].iter().map(photo::glyph_rect).fold((f32::MAX, f32::MAX, f32::MIN, f32::MIN), |c, r| (c.0.min(r.0), c.1.min(r.1), c.2.max(r.0 + r.2), c.3.max(r.1 + r.3)));
+    let g = gs[n].clone();
+    (vw, g, col)
+}
+
+/// The listed count that puts the column's rows past the left side's midpoint (SR601's), and the width of the anchored
+/// glyph with the short id `v12` (its text grows 8 px per id character).
+fn column_and_base() -> (usize, (f32, f32), f32) {
+    let vw = rectangle();
+    let (_, (sx, sy)) = left_side(&vw);
+    let natural = (sx + 6.0, sy - 14.0);
+    let n = ((natural.1 - 30.0) / 12.0).ceil().max(0.0) as usize + 1;
+    let (_, g, _) = anchored_over_column("v12", n);
+    (n, natural, photo::glyph_rect(&g).2)
+}
+
+/// A wide anchored single over the listed column: a right push to the column's edge + 6 would carry its right edge past
+/// the sheet, so it goes DOWN to the column's foot with its anchor's x; its rect stays inside the sheet, its leader runs
+/// from its cross to the anchor in INK, and the corner names nothing.
+#[test]
+fn a_wide_anchored_glyph_over_the_column_is_pushed_down_to_its_foot() {
+    use vug_view::sketch::INK;
+    let (n, natural, w0) = column_and_base();
+    let extra = ((W as f32 - natural.0 - w0) / 8.0).floor().max(0.0) as usize;
+    let id = format!("v12{}", "a".repeat(extra));
+    let (vw, g, col) = anchored_over_column(&id, n);
+    let r = photo::glyph_rect(&g);
+    assert!(natural.0 + r.2 <= W as f32, "it fits at its anchor's x: {natural:?} w {}", r.2);
+    assert!(col.2 + 6.0 + r.2 > W as f32, "a right push would pass the sheet's edge: column {col:?} w {}", r.2);
+    assert!((g.at.0 - natural.0).abs() < 1e-3 && (g.at.1 - col.3).abs() < 1e-3, "down to the column's foot, x unmoved: {:?} column {col:?}", g.at);
+    assert!(r.0 >= 0.0 && r.0 + r.2 <= W as f32, "the rect inside the sheet: {r:?}");
+    let (a, b) = photo::leader(&vw.view, &g).expect("a pushed glyph has a leader");
+    assert_eq!(a, (g.at.0 - 6.0, g.at.1 + 14.0), "the leader starts at its cross");
+    let fr = raster::render(&vw.model, &vw.view);
+    let (mx, my) = ((0.5 * (a.0 + b.0)) as u32, (0.5 * (a.1 + b.1)) as u32);
+    let ink = raster::rgba(INK);
+    let xs = mx.saturating_sub(1)..=mx + 1;
+    assert!(xs.clone().any(|x| fr.pixel(x, my) == ink), "the leader's midpoint ({xs:?}, {my}) paints INK");
+    assert_eq!(photo::wide_note(&vw.view), None, "a glyph the sheet holds is not named");
+}
+
+/// An anchored single wider than the sheet itself: no push can hold it, so it keeps its anchor's x (down to the
+/// column's foot), is clipped, and the corner's second row says `glyph wider than the sheet: <id>` once, in INK.
+#[test]
+fn a_glyph_wider_than_the_sheet_keeps_its_anchor_x_and_the_corner_says_so() {
+    use vug_view::sketch::INK;
+    let (n, natural, w0) = column_and_base();
+    let extra = ((W as f32 - w0) / 8.0).ceil() as usize + 2;
+    let id = format!("v12{}", "a".repeat(extra));
+    let (vw, g, col) = anchored_over_column(&id, n);
+    assert!(photo::glyph_rect(&g).2 > W as f32, "wider than the sheet: {:?}", photo::glyph_rect(&g));
+    assert!((g.at.0 - natural.0).abs() < 1e-3, "its anchor's x: {:?} natural {natural:?}", g.at);
+    assert!((g.at.1 - col.3).abs() < 1e-3, "down to the column's foot: {:?} column {col:?}", g.at);
+    assert_eq!(photo::wide_note(&vw.view).as_deref(), Some(format!("glyph wider than the sheet: {id}").as_str()));
+    let fr = raster::render(&vw.model, &vw.view);
+    let ink = raster::rgba(INK);
+    assert!((30..40u32).any(|y| (6..46u32).any(|x| fr.pixel(x, y) == ink)), "the corner's second row paints INK");
+}
