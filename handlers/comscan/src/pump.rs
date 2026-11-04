@@ -318,6 +318,7 @@ impl PumpDesk {
         match ev {
             // VUGCOMSCANHELLOON (SR549): the checks, the open + hello, the handback; the bus runs the middle with the desk
             // lock released (`request` over `open_road`, the redial's road).
+            PumpEvent::PumpStart { .. } if self.link_reusable(ev) => self.restarted(ev), // VUGCOMSCANLINKREUSE (SR641): the live link's own port streams on it, no open
             PumpEvent::PumpStart { .. } => match self.start_due(ev) {
                 Ok(u) => {
                     let res = with_envelope(with_hello_named(open(&u.port, u.dialect), u.hello, u.name), u.envelope); // VUGCOMSCANHOSTDESK (SR561); VUGCOMSCANHOSTDIALECT (SR566); VUGCOMSCANALARMIDLE (SR591)
@@ -841,25 +842,27 @@ impl PumpDesk {
         };
         // One arming, one run: a FirstRun approval is per run, so a finished program must pass Helm again.
         let a = self.armed.remove(u.i);
-        self.bind(a.pump, port, (link, said, before, env), "started".to_string()) // VUGCOMSCANMDNSDIAL (SR638): the link taken through the one bind, PumpLink's too
+        self.bind(a.pump, port, (link, said, before, env), "started".to_string(), false) // VUGCOMSCANMDNSDIAL (SR638): the link taken through the one bind, PumpLink's too
     }
 
     /// A live link taken by the desk (PumpStart's run, or PumpLink's empty program, VUGCOMSCANMDNSDIAL SR638): the run built
     /// on it, the link-up M154, `first` said, the hello printed once, the travel and position read anew, the travel words and
-    /// the commission. Under the desk lock.
-    fn bind(&mut self, pump: Pump, port: String, opened: Opened, first: String) -> Vec<PumpEvent> {
+    /// the commission. Under the desk lock. VUGCOMSCANLINKREUSE (SR641): `held` — the transport is the live link the desk
+    /// already held ([`PumpDesk::restarted`]): the hello is not said again, the position is kept and the travel words are not
+    /// said again (the read comes back unchanged).
+    fn bind(&mut self, pump: Pump, port: String, opened: Opened, first: String, held: bool) -> Vec<PumpEvent> {
         let (link, said, before, env) = opened;
         let identity = self.identify.as_ref().and_then(|f| f(port.as_str())); // VUGCOMSCANTTYUSBID (SR529)
         let commissioned = commissioned_name(pump.dialect(), before.as_deref(), said.as_deref()); // VUGCOMSCANJOG (SR573)
         self.running = Some(Running { pump, link: Some(link), port: port.clone(), redial: None, identity, hello: said.clone(), motion: Default::default(), jogged: false, unlock: false });
         self.autoreport_due(); // VUGCOMSCANMARLINAUTOREPORT (SR625): the link-up M154, riding the hello
         let mut out = vec![self.squawk(Some(first))];
-        if let Some(h) = before.or(said) {
+        if let Some(h) = before.or(said).filter(|_| !held) { // VUGCOMSCANLINKREUSE (SR641): a held link's hello was said at its open
             out.push(self.squawk(Some(format!("hello {h}")))); // printed once, at the first open (VUGCOMSCANJOG SR573: as the controller first said it)
         }
         self.read = env; // VUGCOMSCANENVELOPEBOUND (SR602): kept for the jog's bound (a hello-off start keeps None)
-        self.pos = Position::default(); self.told = None; // VUGCOMSCANJOGPOSITION (SR612): a new link knows no position yet; VUGCOMSCANJOGTRAVELWIRE (SR618): each start says its travel again on its first tick
-        for w in self.envelope_words(env) {
+        if !held { self.pos = Position::default(); } self.told = None; // VUGCOMSCANLINKREUSE (SR641): a held link keeps its position; VUGCOMSCANJOGPOSITION (SR612): a new link knows no position yet; VUGCOMSCANJOGTRAVELWIRE (SR618): each start says its travel again on its first tick
+        let words = if held { Vec::new() } else { self.envelope_words(env) }; for w in words { // VUGCOMSCANLINKREUSE (SR641): a held link's travel words were said at its open
             out.push(self.squawk(Some(w))); // VUGCOMSCANALARMIDLE (SR591): a travel that differs from the declared machine, said once
         }
         if let Some(name) = commissioned {
@@ -881,6 +884,7 @@ async fn request(desk: &Mutex<PumpDesk>, ev: &PumpEvent, open: &mut Box<Opener>)
             Err(_) => refused("the pump desk is poisoned"),
         };
     }
+    if let Some(out) = desk.lock().ok().and_then(|mut d| d.link_reusable(ev).then(|| d.restarted(ev))) { return out; } // VUGCOMSCANLINKREUSE (SR641): the live link's own port, checked and taken under one lock take, no open
     open_road(desk, open, |d| d.start_due(ev).map(|u| (u.port, u.dialect, u.hello, u.name, u.envelope)), |d, res| d.started(ev, res)) // VUGCOMSCANHOSTDESK (SR561); VUGCOMSCANHOSTDIALECT (SR566)
         .await
         .unwrap_or_else(|| refused("the pump desk is poisoned"))
@@ -2267,7 +2271,7 @@ impl PumpDesk {
         match link_pump(d) {
             Ok(pump) => {
                 let first = format!("linked {port}");
-                self.bind(pump, port, opened, first)
+                self.bind(pump, port, opened, first, false)
             }
             Err(e) => refused(format!("link: {e:?}")),
         }
@@ -2294,4 +2298,39 @@ async fn link_request(desk: &Mutex<PumpDesk>, ev: &PumpEvent, open: &mut Box<Ope
     open_road(desk, open, |d| d.link_due(ev), |d, res| d.linked(ev, res))
         .await
         .unwrap_or_else(|| refused("the pump desk is poisoned"))
+}
+
+// --- VUGCOMSCANLINKREUSE (LEDGER SR641): a PumpStart on the live link's own port streams on it (named tail hunk) ---
+
+impl PumpDesk {
+    /// A PumpStart the live link takes without an open: the start's checks pass ([`PumpDesk::start_due`]: nothing of a job in
+    /// flight, armed, the dialect right) and the running link is up, names the request's port (the literal name) and has no
+    /// home / jog / unlock line of the desk's unanswered (its `ok` would be read by the new pump as a job line's).
+    fn link_reusable(&self, ev: &PumpEvent) -> bool {
+        let Ok(u) = self.start_due(ev) else { return false };
+        self.running.as_ref().is_some_and(|r| r.link.is_some() && r.port == u.port && r.motion.is_empty() && !r.unlock)
+    }
+
+    /// The arming's pump bound over the held transport through the one [`PumpDesk::bind`] (`held`): the link is taken out of
+    /// the running `Running` first (its drop then writes no `M154 S0` on the kept link), its hello rides the new run (so the
+    /// auto-report arms from it) and is not said again, the travel read, the position and the identity are kept; said
+    /// `started (on the live link)`. Under the desk lock; a start that no longer passes its checks is refused by them.
+    fn restarted(&mut self, ev: &PumpEvent) -> Vec<PumpEvent> {
+        let u = match self.start_due(ev) {
+            Ok(u) => u,
+            Err(out) => return out,
+        };
+        let Some((link, hello, identity)) =
+            self.running.as_mut().and_then(|r| r.link.take().map(|l| (l, r.hello.clone(), r.identity.clone())))
+        else {
+            return refused(format!("port {:?}: the live link went down", u.port));
+        };
+        let a = self.armed.remove(u.i);
+        let read = self.read;
+        let out = self.bind(a.pump, u.port, (link, hello, None, read), "started (on the live link)".to_string(), true);
+        if let Some(r) = self.running.as_mut() {
+            r.identity = identity; // the identity the first open recorded, not the hook's answer on a name a redial left behind
+        }
+        out
+    }
 }

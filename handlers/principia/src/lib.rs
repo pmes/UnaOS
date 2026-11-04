@@ -42,11 +42,12 @@
 //!
 //! # Not implemented (deliberately, this round)
 //!
-//! - **Locking between writers.** Reload on external change is BUILT
+//! - **Locking between writers** is BUILT now: reload on external change
 //!   (PRINCIPIA-TWO-WRITERS, SR635: [`serve`] polls the domain files' stamps each
-//!   second and reloads a changed one, posting `PrefChanged` per differing key);
-//!   two writers can still lose an update in the window between that reload and
-//!   their own rename (PRINCIPIA-TWO-WRITERS-LOCK, owed to prefs_core's swap).
+//!   second and reloads a changed one, posting `PrefChanged` per differing key),
+//!   and the store's write holds the domain's lock file, re-reads the domain from
+//!   disk and swaps through a per-writer name, so two writers lose no update; the
+//!   watch records the stamp the write itself produced (PREFS-SWAP-LOCK, SR644).
 //! - **Policy levels.** The charter's law layer (the safety levels helm
 //!   enforces) rides this same store when the first drivable domain lands; the
 //!   store is the mechanism, the levels are not yet defined.
@@ -754,11 +755,14 @@ struct Watch {
 }
 
 impl Watch {
-    /// Stamps taken at start (the load just read them); the first look is one cadence from now.
+    /// No stamps at start (PREFS-SWAP-LOCK, SR644: the SR635 start-up race closed — the store was loaded when the
+    /// handler was built, the task may first run after another writer's write, and stamps taken here would hide it):
+    /// the first look, one cadence from now, reloads once and posts only keys that differ from that load.
     fn new(dir: &Path) -> Self {
         let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + WATCH_CADENCE, WATCH_CADENCE);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        Self { seen: stamps(dir), tick }
+        let _ = dir;
+        Self { seen: std::collections::BTreeMap::new(), tick } // PREFS-SWAP-LOCK (SR644): seen starts empty
     }
 }
 
@@ -822,13 +826,11 @@ impl Principia {
             if write {
                 if let SMessage::Principia(PrincipiaCommand::PrefChanged { ns, key, .. }) = &reply {
                     let domain = prefs_core::files::domain_of(ns, key);
-                    match fs::metadata(self.prefs.domain_path(&domain)) {
-                        Ok(md) => {
-                            w.seen.insert(domain, Stamp::of(&md));
-                        }
-                        Err(_) => {
-                            w.seen.remove(&domain);
-                        }
+                    // PREFS-SWAP-LOCK (SR644): the stamp the write itself produced, never a stat after the fact (a
+                    // foreign rename in between would be taken for ours). None (the write kept another writer's keys):
+                    // `seen` stays, so the next look reloads and posts exactly those keys.
+                    if let Some(md) = self.prefs.written(&domain) {
+                        w.seen.insert(domain, Stamp::of(md));
                     }
                 }
             }

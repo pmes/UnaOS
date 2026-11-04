@@ -528,8 +528,9 @@ fn moments(mesh: &Mesh) -> Option<(Vec3, [f64; 9])> {
     Some((c, m))
 }
 
-/// The principal axes of `mesh`: the centroid, the largest eigenvector and the middle one (unit).
-fn axes(mesh: &Mesh) -> Option<(Vec3, Vec3, Vec3)> {
+/// The principal axes of `mesh`: the centroid, the largest eigenvector and the middle one (unit), and the three
+/// eigenvalues ascending (VUGSCANDEVIATIONCOARSESYM SR636: [`pivot`] reads them).
+fn axes(mesh: &Mesh) -> Option<(Vec3, Vec3, Vec3, [f64; 3])> {
     let (c, m) = moments(mesh)?;
     let (w, v) = geom_core::linalg::jacobi_sym(&m, 3);
     if w.len() != 3 || v.len() != 9 {
@@ -538,7 +539,7 @@ fn axes(mesh: &Mesh) -> Option<(Vec3, Vec3, Vec3)> {
     let col = |j: usize| Vec3::new(v[j], v[3 + j], v[6 + j]);
     let x = col(2).normalize().ok()?;
     let y = col(1).normalize().ok()?;
-    Some((c, x, y))
+    Some((c, x, y, [w[0], w[1], w[2]]))
 }
 
 /// The trimmed residual of `scan` at `pose`: per sampled vertex its `pair` distance within `gate` (or `gate` when it
@@ -573,8 +574,8 @@ pub fn coarse(scan: &ScanMesh, design: &Design, bvh: &Bvh, p: &AlignParams, tol:
     if nv == 0 || design.mesh.triangles.is_empty() {
         return None;
     }
-    let (cs, xs, ys) = axes(&scan.mesh)?;
-    let (cd, xd, yd) = axes(&design.mesh)?;
+    let (cs, xs, ys, _) = axes(&scan.mesh)?;
+    let (cd, xd, yd, _) = axes(&design.mesh)?;
     let inv = crate::geom::from_axes(xs, ys, xs.cross(ys), cs).invert().ok()?;
     let normals = design.mesh.normals_face(tol);
     let sample = coarse_sample(nv);
@@ -600,7 +601,7 @@ pub fn measure_coarse(scan: &ScanMesh, design: &Design, p: &AlignParams, band_mm
         return (Road::CoarseRefused { rms_mm: f64::INFINITY }, Err(DeviationError::EmptyDesign));
     }
     let bvh = Bvh::build(&design.mesh);
-    let starts = coarse(scan, design, &bvh, p, tol).unwrap_or_default();
+    let starts = sym_or(scan, design, &bvh, p, tol, coarse(scan, design, &bvh, p, tol).unwrap_or_default()); // VUGSCANDEVIATIONCOARSESYM (SR636): a design degenerate in one moment pair takes the sweep about its pivot
     let rms_mm = starts.iter().map(|s| s.1).fold(f64::INFINITY, f64::min);
     let (starts, rms_mm) = view_or(scan, design, &bvh, p, tol, starts, rms_mm); // VUGSCANDEVIATIONCOARSEVIEW (SR626): SR615's floor refusing, a near-single view takes the swept starts
     if !(rms_mm <= p.gate(2)) {
@@ -699,35 +700,45 @@ fn shift(scan: &ScanMesh, design: &Design, bvh: &Bvh, normals: &[Vec3], sample: 
     pose
 }
 
-/// The near-single-view starts (scan → design): None when the scan or design is empty, has zero area, or is not a view
-/// ([`front`] under [`COARSE_VIEW_FRONT`]); else the design frame (x, y, z = x × y from the principal axes) with z of
-/// both signs, x swept about z in [`COARSE_VIEW_STEPS`] steps, onto the scan's frame as [`coarse`] builds it, each
-/// [`shift`]ed at `p.gate(0)`·[`COARSE_WIDEN`]; the best [`COARSE_VIEW_KEEP`] by [`trimmed`] at `p.gate(0)` over
-/// [`COARSE_SELECT_KEEP`] (the first on a tie), each carrying its start score ([`trimmed`] at `p.gate(0)`,
+/// The swept starts (scan → design): None when the scan or design is empty, has zero area, or (`Sweep::View`) is not a
+/// view ([`front`] under [`COARSE_VIEW_FRONT`]); else the design frame (x, y, z = x × y from the principal axes) with
+/// the sweep's pivot (z for `Sweep::View`, frame index `i` for `Sweep::About(i)`, VUGSCANDEVIATIONCOARSESYM SR636) of
+/// both signs, the next axis swept about it in [`COARSE_VIEW_STEPS`] steps, onto the scan's frame as [`coarse`] builds
+/// it, each [`shift`]ed at `p.gate(0)`·[`COARSE_WIDEN`]; the best [`COARSE_VIEW_KEEP`] by [`trimmed`] at `p.gate(0)`
+/// over [`COARSE_SELECT_KEEP`] (the first on a tie), each carrying its start score ([`trimmed`] at `p.gate(0)`,
 /// [`COARSE_KEEP`]).
-pub fn coarse_view(scan: &ScanMesh, design: &Design, bvh: &Bvh, p: &AlignParams, tol: Tol) -> Option<Vec<(Transform, f64)>> {
+pub fn coarse_view(scan: &ScanMesh, design: &Design, bvh: &Bvh, p: &AlignParams, tol: Tol, sweep: Sweep) -> Option<Vec<(Transform, f64)>> {
     let nv = scan.mesh.positions.len();
     if nv == 0 || design.mesh.triangles.is_empty() {
         return None;
     }
     let sample = coarse_sample(nv);
-    if !(front(scan, &sample) >= COARSE_VIEW_FRONT) {
+    let (axis, view) = match sweep {
+        Sweep::View => (2, true),
+        Sweep::About(i) => (i.min(2), false),
+    };
+    if view && !(front(scan, &sample) >= COARSE_VIEW_FRONT) {
         return None;
     }
-    let (cs, xs, ys) = axes(&scan.mesh)?;
-    let (cd, xd, yd) = axes(&design.mesh)?;
+    let (cs, xs, ys, _) = axes(&scan.mesh)?;
+    let (cd, xd, yd, _) = axes(&design.mesh)?;
     let inv = crate::geom::from_axes(xs, ys, xs.cross(ys), cs).invert().ok()?;
-    let zd = xd.cross(yd);
+    let frame = [xd, yd, xd.cross(yd)];
     let normals = design.mesh.normals_face(tol);
     let mut scored: Vec<(f64, Transform, f64)> = Vec::with_capacity(2 * COARSE_VIEW_STEPS);
     for sz in [1.0, -1.0] {
-        let z = zd * sz;
+        let z = frame[axis] * sz;
+        let a = frame[(axis + 1) % 3];
         for k in 0..COARSE_VIEW_STEPS {
             let t = 2.0 * core::f64::consts::PI * k as f64 / COARSE_VIEW_STEPS as f64;
             let (c, s) = (libm::cos(t), libm::sin(t));
-            // Rodrigues: xd turned by t about the unit z.
-            let x = xd * c + z.cross(xd) * s + z * (z.dot(xd) * (1.0 - c));
-            let start = crate::geom::from_axes(x, z.cross(x), z, cd).compose(inv);
+            // Rodrigues: the pivot's next axis turned by t about the unit pivot z (SR626's xd about zd for axis 2).
+            let x = a * c + z.cross(a) * s + z * (z.dot(a) * (1.0 - c));
+            let mut e = [Vec3::ZERO; 3];
+            e[axis] = z;
+            e[(axis + 1) % 3] = x;
+            e[(axis + 2) % 3] = z.cross(x);
+            let start = crate::geom::from_axes(e[0], e[1], e[2], cd).compose(inv);
             let start = shift(scan, design, bvh, &normals, &sample, start, p.gate(0) * COARSE_WIDEN, p, tol);
             let rank = trimmed(scan, design, bvh, &normals, &sample, start, p.gate(0), COARSE_SELECT_KEEP, p, tol);
             let score = trimmed(scan, design, bvh, &normals, &sample, start, p.gate(0), COARSE_KEEP, p, tol);
@@ -744,7 +755,7 @@ fn view_or(scan: &ScanMesh, design: &Design, bvh: &Bvh, p: &AlignParams, tol: To
     if rms_mm <= p.gate(2) {
         return (starts, rms_mm);
     }
-    match coarse_view(scan, design, bvh, p, tol) {
+    match coarse_view(scan, design, bvh, p, tol, Sweep::View) {
         Some(view) if !view.is_empty() => {
             let r = view.iter().map(|s| s.1).fold(f64::INFINITY, f64::min);
             (view, r)
@@ -767,5 +778,57 @@ impl Road {
             Road::CoarseFine { rms_mm } => Some(alloc::format!("coarse+fine rms={rms_mm:.3}")),
             Road::CoarseRefused { rms_mm } => Some(alloc::format!("coarse refused rms={rms_mm:.3}")),
         }
+    }
+}
+
+// ---- VUGSCANDEVIATIONCOARSESYM (LEDGER SR636): the start of a design with near-equal principal moments ----
+// Near-equal moments leave the design's axes in that pair free: a small feature, not the part, sets them, so SR615's four
+// signs are a coin toss. MEASURED (an analytic model of the design's exact moments and of the orbit scan's visible
+// surfaces): on a box 150 x Y x 100 with a post r20 h60 on its top (8% of the design's area) the pair's largest axis
+// turns from the box's own long axis by 27.2° at Y = 156 (ratio 0.880), 20.4° at 0.863, 15.6° at 0.840, 11.0° at 0.803,
+// so above ~0.835 such a feature turns the axes past 15°, SR626's half step: [`COARSE_SYM_RATIO`] 0.83. The test reads
+// the DESIGN's moments only: SR626's tracked views are near-degenerate in the SCAN (0.951 / 0.873, a frustum of ground)
+// while the bench design is not (0.447 / 0.256), so every SR615 / SR626 fixture keeps its road. On the 150 x 156 x 100
+// box SR615's four starts sit 177 / 165 / 119 / 63° off the truth and its road accepts the 180° turn at rms 2.73;
+// [`sym_or`] runs BEFORE the floor and gives `measure_coarse` SR626's own sweep ([`coarse_view`], `Sweep::About`) about
+// the pivot, the well-determined axis (it contains SR615's four signs at steps 0 and 6), the best [`COARSE_VIEW_KEEP`]
+// into SR615's refine / select loop: modelled the true start ranks first of 24 and aligns within 0.11°. Cost: SR626's,
+// 2·STEPS × (SHIFTS + 2) × [`COARSE_POINTS`] `Bvh::closest` (≈ 344k), and one moments pass more over the design.
+// Three near-equal moments stay on SR615's four (VUG-SCAN-DEVIATION-COARSE-SYM-THREE): the two-angle sweep (the cube's
+// 13 symmetry lines × 2 × 12 = 312 starts, ≈ 4.47M closest) ranked the true start 2nd..49th, inside the KEEP 4 once in
+// eight (a near-cube's 24 near-symmetric basins tie on the shift-only score).
+
+/// The least ratio of two adjacent ascending eigenvalues of the design's moments (lo / hi) that makes them a degenerate
+/// pair.
+pub const COARSE_SYM_RATIO: f64 = 0.83;
+
+/// What [`coarse_view`] sweeps about: `View` SR626's near-single view (the design's smallest axis, gated by [`front`]);
+/// `About(i)` the pivot of a degenerate pair (`i` the design-frame index: 0 the largest axis, 2 the smallest), no view
+/// test.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Sweep {
+    View,
+    About(usize),
+}
+
+/// The pivot of `mesh`'s principal frame when exactly one adjacent pair of its ascending eigenvalues is degenerate
+/// (lo ≥ [`COARSE_SYM_RATIO`]·hi): 2 (the smallest axis) when the middle and largest pair, 0 (the largest) when the
+/// smallest and middle pair; None when neither pair or both (three near-equal: SR615's four, owed).
+fn pivot(mesh: &Mesh) -> Option<usize> {
+    let (_, _, _, w) = axes(mesh)?;
+    let pair = |lo: f64, hi: f64| hi > 0.0 && lo >= COARSE_SYM_RATIO * hi;
+    match (pair(w[0], w[1]), pair(w[1], w[2])) {
+        (false, true) => Some(2),
+        (true, false) => Some(0),
+        _ => None,
+    }
+}
+
+/// `measure_coarse`'s starts: when the design is degenerate in one pair ([`pivot`]), [`coarse_view`]'s sweep about the
+/// pivot (`Sweep::About`) in place of SR615's four; else `starts` unchanged.
+fn sym_or(scan: &ScanMesh, design: &Design, bvh: &Bvh, p: &AlignParams, tol: Tol, starts: Vec<(Transform, f64)>) -> Vec<(Transform, f64)> {
+    match pivot(&design.mesh).and_then(|axis| coarse_view(scan, design, bvh, p, tol, Sweep::About(axis))) {
+        Some(sym) if !sym.is_empty() => sym,
+        _ => starts,
     }
 }
