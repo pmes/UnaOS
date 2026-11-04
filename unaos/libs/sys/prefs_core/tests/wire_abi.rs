@@ -8,6 +8,7 @@
 fn the_pref_verbs_and_the_body_ceiling_are_una_abi() {
     assert_eq!(prefs_core::wire::VERB_GET, una_abi::BUS_VERB_PREF_GET);
     assert_eq!(prefs_core::wire::VERB_SET, una_abi::BUS_VERB_PREF_SET);
+    assert_eq!(prefs_core::wire::VERB_UNSET, una_abi::BUS_VERB_PREF_UNSET); // PREFS-UNSET-WIREABI (rmbp-ledger B1173): verb 29, the host twin of the kernel's const-assert
     assert_eq!(prefs_core::wire::VERB_LIST, una_abi::BUS_VERB_PREF_LIST);
     assert_eq!(prefs_core::wire::VERB_CHANGED, una_abi::BUS_VERB_PREF_CHANGED);
     assert_eq!(prefs_core::wire::VERB_DECLARE, una_abi::BUS_VERB_PREF_DECLARE); // SETTINGSFILES (B407)
