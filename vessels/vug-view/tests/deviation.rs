@@ -1409,8 +1409,56 @@ fn a_held_document_opens_the_map_held_and_its_fix_re_measures() {
     let rms1 = map.result.as_ref().expect("both solids align").stats.rms_mm;
     println!("deviationheld held=post solids=1->2 gen=1 rms0={rms0:?} rms1={rms1}");
 
-    // Two roots: the box's outer on a point too; the hold does not take it, the design refuses by the first line.
+    // Two roots: the box's outer on a point too; VUGFACEJOURNALHOLDMANY (SR609): both are held, no solid stands, so the map refuses DesignEmpty.
     let two = doc_core::read(&text.replace("extrude body sketch=s1 outer=l1 ", "extrude body sketch=s1 outer=p1 ")).expect("reads");
-    let e = Viewer::open_deviation(scan().clone(), &two, "fixture", SIZE, Preset::Una, None).err().expect("two roots refuse");
-    assert!(e.starts_with("line ") && e.contains("NoProfile body"), "{e}");
+    let e = Viewer::open_deviation(scan().clone(), &two, "fixture", SIZE, Preset::Una, None).err().expect("nothing stands to measure");
+    assert_eq!(e, "DesignEmpty", "{e}");
+}
+
+// ---- VUGFACEJOURNALHOLDMANY (LEDGER SR609): two held roots are named together and the first fix re-measures ----
+// SR600's held document with a second root (`post2`, its own sketch s3, its `outer` on a point): the map opens beside
+// both, the corner names `held=post,post2` and both fault lines; the post's card (the first root's) takes c1 and
+// `follow` re-measures with the post in the basis and `held=post2` left.
+
+#[test]
+fn two_held_roots_name_both_on_the_corner_and_the_first_fix_re_measures() {
+    let text = held_doc() + "sketch s3 o=[0 0 0] z=[0 0 1] x=[1 0 0]\npoint d7 sketch=s3 x=-380 y=-300\nfix g7 sketch=s3 p=d7 at=[-380 -300]\nextrude post2 sketch=s3 outer=d7 dir=[0 0 1] length=10\n";
+    let doc = doc_core::read(&text).expect("two outers on points are geometry, not syntax: the document reads");
+    let mut v = Viewer::open_doc(doc, "fixture", SIZE, Preset::Una).expect("SR609: the journal holds both posts");
+    v.against_journal(scan().clone()).expect("the map opens beside both held posts");
+    let at = |v: &Viewer, id: &str| {
+        let j = &v.view.design.journal;
+        let i = j.doc.stmts.iter().position(|s| s.id() == Some(id)).expect("the row");
+        (i, j.doc.line(i))
+    };
+    let ((post, line), (_, line2)) = (at(&v, "post"), at(&v, "post2"));
+    let map = v.view.deviation.as_ref().expect("a map");
+    let lines = corner(map);
+    println!("{}", lines.join("\n"));
+    assert_eq!(map.held.as_deref(), Some("post,post2"));
+    assert!(lines.contains(&"held=post,post2".to_string()), "{lines:?}");
+    assert!(lines.contains(&format!("fault line {line}: NoProfile post")), "{lines:?}");
+    assert!(lines.contains(&format!("fault line {line2}: NoProfile post2")), "{lines:?}");
+    assert_eq!(lines.last().map(String::as_str), Some("design=journal@0 solids=1 faults=2"), "{lines:?}");
+
+    // The first root's card: Tab to the post's own circle, Return replaces it and the map re-measures.
+    assert!(v.view.design.journal.select_line(line), "the post's line is a row");
+    let texts: Vec<String> = v.view.design.journal.fixes_for(post).into_iter().map(|f| f.text).collect();
+    let want = texts.iter().position(|t| t.contains("outer=c1 ")).expect("c1 is offered");
+    for _ in 0..want {
+        assert!(v.key("Tab"), "Tab walks the card");
+    }
+    assert!(v.key("Return"), "Return takes the pick");
+    let ids: Vec<String> = v.view.design.journal.faults.iter().map(|f| f.id.clone()).collect();
+    assert_eq!(ids, ["post2"], "the second root still held");
+    let map = v.view.deviation.as_ref().expect("a map");
+    let src = map.source.as_ref().expect("a journal map");
+    assert_eq!((src.generation, src.measured, src.refused.as_deref()), (1, 1, None), "the fix re-measured");
+    let lines = corner(map);
+    println!("{}", lines.join("\n"));
+    assert_eq!(map.held.as_deref(), Some("post2"));
+    assert!(lines.contains(&"held=post2".to_string()), "{lines:?}");
+    assert_eq!(lines.last().map(String::as_str), Some("design=journal@1 solids=2 faults=1"), "{lines:?}");
+    assert!(map.names.iter().any(|n| n.starts_with("post/")), "the post joins the basis: {:?}", map.names);
+    println!("deviationholdmany held=post,post2->post2 solids=1->2 gen=1");
 }

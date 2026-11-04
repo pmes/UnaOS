@@ -765,3 +765,93 @@ fn an_extrude_on_no_profile_opens_held_and_tab_return_fixes_it() {
     assert!((volume(&vw) - (1000.0 + 5.0 * area)).abs() < 1e-4, "the box and the post: {}", volume(&vw));
     assert!(j.offered().is_none(), "nothing left to fix");
 }
+
+// ---- VUGFACEJOURNALHOLDMANY (LEDGER SR609): two independent solid roots open held, each card follows the last fix ----
+// SR598's box and post with a second post (`post2`, its own sketch s3 of two squares and a point, its `outer` on the
+// point): both NoProfile roots are held (SR572 refused, SR598 held only ONE), the box painted; the card is offered for
+// the FIRST root in line order (the cursor on it), the second root's row marked and offering nothing; Tab + Return
+// fixes the first (ONE snapshot), the cursor moves to the second and its card follows; Tab + Return fixes it.
+
+/// BOX_NOPROFILE and a sketch s3 on the box's top: a 2 x 2 square `t*` at (14, 6), a 3 x 3 square `v*` at (16, 0) and a
+/// point `z9`; `post2`'s `outer` names the point.
+fn two_roots() -> String {
+    BOX_NOPROFILE.to_string()
+        + "sketch s3 o=[0 0 5] z=[0 0 1] x=[1 0 0]
+point u1 sketch=s3 x=14 y=6
+point u2 sketch=s3 x=16 y=6
+point u3 sketch=s3 x=16 y=8
+point u4 sketch=s3 x=14 y=8
+point w1 sketch=s3 x=16 y=0
+point w2 sketch=s3 x=19 y=0
+point w3 sketch=s3 x=19 y=3
+point w4 sketch=s3 x=16 y=3
+point z9 sketch=s3 x=5 y=8
+line t1 sketch=s3 a=u1 b=u2
+line t2 sketch=s3 a=u2 b=u3
+line t3 sketch=s3 a=u3 b=u4
+line t4 sketch=s3 a=u4 b=u1
+line v1 sketch=s3 a=w1 b=w2
+line v2 sketch=s3 a=w2 b=w3
+line v3 sketch=s3 a=w3 b=w4
+line v4 sketch=s3 a=w4 b=w1
+fix h1 sketch=s3 p=u1 at=[14 6]
+fix h2 sketch=s3 p=u2 at=[16 6]
+fix h3 sketch=s3 p=u3 at=[16 8]
+fix h4 sketch=s3 p=u4 at=[14 8]
+fix h5 sketch=s3 p=w1 at=[16 0]
+fix h6 sketch=s3 p=w2 at=[19 0]
+fix h7 sketch=s3 p=w3 at=[19 3]
+fix h8 sketch=s3 p=w4 at=[16 3]
+fix h9 sketch=s3 p=z9 at=[5 8]
+extrude post2 sketch=s3 outer=z9 dir=[0 0 1] length=5
+"
+}
+
+#[test]
+fn two_held_roots_open_held_and_each_card_follows_the_last_fix() {
+    let d = doc_core::read(&two_roots()).expect("two outers on points are geometry, not syntax: the document reads");
+    let mut vw = Viewer::open_doc(d, "box", (W, H), Preset::Una).expect("two solid roots with their data are held, not refused");
+    let post = index_of(&vw, |s| s.id() == Some("post"));
+    let post2 = index_of(&vw, |s| s.id() == Some("post2"));
+    let (line, line2) = (doc(&vw).line(post), doc(&vw).line(post2));
+    let ids = vw.view.design.journal.faults.iter().map(|f| (f.id.clone(), f.line)).collect::<Vec<_>>();
+    assert_eq!(ids, vec![("post".to_string(), line), ("post2".to_string(), line2)], "both roots held, in line order");
+    assert!(vw.view.design.journal.faults.iter().all(|f| matches!(f.fault, doc_core::Fault::NoProfile { .. })));
+    let held_volume = volume(&vw);
+    assert!((held_volume - 1000.0).abs() < 1e-4, "the box painted, both posts held: {held_volume}");
+    assert!(vw.view.design.journal.faulted(post) && vw.view.design.journal.faulted(post2), "both rows marked");
+    assert_eq!(vw.view.design.journal.cursor, post, "the cursor opens on the first root");
+
+    // The panel shown: the first root's card is offered; the second root offers nothing yet.
+    assert!(typed(&mut vw, "t"), "t shows the panel");
+    let f = vw.view.design.journal.offered().expect("the first root's card");
+    assert_eq!(f.line, line, "offered on the post's line");
+    assert!(vw.view.design.journal.fixes_for(post2).is_empty(), "the card is the first root's only");
+    assert!(vw.view.design.journal.choosing_fix(), "two loops are a card");
+    assert!(key(&mut vw, "Tab"), "Tab walks the card");
+    let first = vw.view.design.journal.offered().expect("a pick").text;
+    let depth = vw.view.design.journal.depth().0;
+    assert!(key(&mut vw, "Return"), "Return takes the pick");
+
+    // ONE snapshot restored ONE root; the cursor and the card follow to the second.
+    let j = &vw.view.design.journal;
+    assert_eq!(j.depth().0, depth + 1, "ONE snapshot");
+    assert_eq!(j.note.as_deref(), Some(format!("fixed line {line}: {first}").as_str()));
+    assert_eq!(j.faults.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(), ["post2"], "{:?}", j.faults);
+    assert_eq!(j.cursor, post2, "the cursor on the next root");
+    assert_eq!(j.offered().map(|f| f.line), Some(line2), "the next card follows");
+    assert!(j.choosing_fix(), "two loops are a card");
+    assert!(key(&mut vw, "Tab"), "Tab walks the card");
+    let second = vw.view.design.journal.offered().expect("a pick").text;
+    let depth = vw.view.design.journal.depth().0;
+    assert!(key(&mut vw, "Return"), "Return takes the pick");
+
+    let j = &vw.view.design.journal;
+    let area = |t: &str, a: (&str, f64), b: f64| if t.contains(a.0) { a.1 } else { b };
+    let want = 1000.0 + 5.0 * area(&first, ("outer=m", 16.0), 10.0) + 5.0 * area(&second, ("outer=t", 4.0), 9.0);
+    println!("holdmany roots=post,post2 held_volume={held_volume} first={first} second={second} faults_after={} volume={}", j.faults.len(), volume(&vw));
+    assert_eq!(j.depth().0, depth + 1, "ONE snapshot");
+    assert!(j.faults.is_empty(), "{:?}", j.faults);
+    assert!((volume(&vw) - want).abs() < 1e-4, "the box and both posts: {} vs {want}", volume(&vw));
+    assert!(j.offered().is_none(), "nothing left to fix");
+}
