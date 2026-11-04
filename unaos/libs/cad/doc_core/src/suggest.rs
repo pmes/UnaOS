@@ -23,15 +23,29 @@
 //! the nearest horizontal-class line, at most one `distance_point_line` each: the datum grid (the target's offset from
 //! the datum a round pair and the line's offset round: their difference) else the edge distance (the measured distance
 //! round). At most one per axis because `verify_all` is cumulative and refuses a redundant statement.
+//!
+//! VUGINTENTFEATURES (LEDGER SR536): a FEATURE from `Measurement::Shapes` alone ([`features`], after every sketch rule).
+//! A measured cylinder the replayed document does not already model, whose axis is within sigma_deg of a measured plane
+//! that is a face of the document (paired within `K_SIGMA` x sigma through intent's one `pair`), stands on the plane with
+//! the least support-centroid offset `t` (scan_core's cylinder point is its inliers' centroid along the axis). THE EXTENT
+//! RULE: h = 2|t| (the centroid is mid-extent, the near end on the plane), or |s| to a measured parallel plane on the
+//! support side whose near end e = |t - s/2| is within 3 sigma (the far end: a boss top, a pocket floor, a plate's far
+//! face); a measured parallel plane crossing the span (|s| < 2|t| - 6 sigma) means no end on the plane within 3 sigma and
+//! nothing is proposed; one beyond it is ignored. The support centroid inside the replayed solid is a POCKET (scan
+//! normals are canonical, not outward), outside a BOSS; the set is `sketch` on the plane (z toward the support), the
+//! centre `point`, `circle` (a pocket's diameter through the standards table, else round; a boss's round), `extrude`
+//! along z by the height (round within sigma), ONE statement set sharing one why, confidence from the worst residual.
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use brep_core::geom_core::Vec2;
+use brep_core::geom_core::{Vec2, Vec3};
+use brep_core::{Where, point_in_solid}; // VUGINTENTFEATURES (SR536)
 
-use crate::intent::{Measurement, Proposal};
+use crate::intent::{K_SIGMA, Measurement, Proposal, ShapeParams, axis_deg, pair};
+use crate::replay::replay; // VUGINTENTFEATURES (SR536)
 use crate::standards::{Class, nearest_standard};
 use crate::write::f64_text;
 use crate::{Cons, Doc, PRef, Stmt};
@@ -49,6 +63,7 @@ pub fn suggest(doc: &Doc, m: &Measurement) -> Vec<Proposal> {
             sketch_rules(doc, id, sigma, &mut ids, &mut out);
         }
     }
+    features(doc, m, sigma, &mut ids, &mut out); // VUGINTENTFEATURES (SR536): bosses / pockets from shapes (file tail)
     out
 }
 
@@ -705,6 +720,166 @@ fn position_rule<'a>(
             });
             let Some((v, res, why)) = pick else { continue };
             push(format!("distance_point_line {} sketch={} p={} line={} d={}", ids.next(), sk, t.id, l.id, f64_text(v)), res, why);
+        }
+    }
+}
+
+// ---- VUGINTENTFEATURES (SR536): a boss or a pocket from a cylinder standing on a document face ----
+
+/// A measured plane: its shape index, unit normal, offset along it (`n . p = d`) and support.
+struct PlaneM {
+    i: usize,
+    n: Vec3,
+    d: f64,
+    support: u32,
+}
+
+/// The extent rule for the cylinder whose support centroid sits `t` off `planes[pk]`: (h, the far-end plane's (shape
+/// index, e) when one is measured); None when a measured parallel plane crosses the span (no end on the plane within
+/// 3 sigma).
+fn extent(planes: &[PlaneM], pk: usize, t: f64, sigma: f64, sigma_deg: f64) -> Option<(f64, Option<(usize, f64)>)> {
+    let p = &planes[pk];
+    let h0 = 2.0 * t.abs();
+    let lim = K_SIGMA * sigma;
+    let mut far: Option<(usize, f64, f64)> = None;
+    for (k, q) in planes.iter().enumerate() {
+        if k == pk || axis_deg(q.n, p.n) > sigma_deg {
+            continue;
+        }
+        // Q's offset along P's normal (a flipped normal flips the offset), relative to P.
+        let s = (if q.n.dot(p.n) < 0.0 { -q.d } else { q.d }) - p.d;
+        if !(s * t > 0.0 && s.abs() > lim) {
+            continue;
+        }
+        let e = (t - s / 2.0).abs();
+        if e <= lim {
+            if far.is_none_or(|(_, b, _)| e < b) {
+                far = Some((q.i, e, s.abs()));
+            }
+        } else if s.abs() < h0 - 2.0 * lim {
+            return None;
+        }
+    }
+    Some(match far {
+        Some((i, e, s)) => (s, Some((i, e))),
+        None => (h0, None),
+    })
+}
+
+/// The feature rule (module doc): per measured cylinder in order, at most ONE statement set.
+fn features(doc: &Doc, m: &Measurement, sigma: f64, ids: &mut Ids, out: &mut Vec<Proposal>) {
+    let Measurement::Shapes { shapes, sigma_deg, .. } = m else { return };
+    let sigma_deg = *sigma_deg;
+    if !(sigma_deg.is_finite() && sigma_deg > 0.0) {
+        return;
+    }
+    let r = replay(doc, doc.tol);
+    if r.solids.is_empty() {
+        return;
+    }
+    let band = K_SIGMA * sigma;
+    let per_deg = sigma / sigma_deg;
+    // Some replayed face pairs the shape within the band (intent's one value: max(mm, deg x sigma_mm / sigma_deg)).
+    let fits = |s: &ShapeParams| {
+        r.solids
+            .iter()
+            .flat_map(|so| so.brep.faces.iter())
+            .filter_map(|f| pair(s, &f.surface))
+            .any(|(d, deg)| d.max(deg * per_deg) <= band)
+    };
+    let mut planes: Vec<PlaneM> = Vec::new();
+    for (i, s) in shapes.iter().enumerate() {
+        if let ShapeParams::Plane { normal, d } = s.params {
+            let k = normal.mag();
+            if let (true, Ok(n)) = (k > 0.0, normal.normalize()) {
+                planes.push(PlaneM { i, n, d: d / k, support: s.support });
+            }
+        }
+    }
+    let on_doc: Vec<bool> = planes.iter().map(|p| fits(&shapes[p.i].params)).collect();
+    let lin = doc.tol.lin;
+    for (ci, s) in shapes.iter().enumerate() {
+        let ShapeParams::Cylinder { point, axis, radius } = s.params else { continue };
+        if fits(&s.params) {
+            continue;
+        }
+        // The plane it stands on: a document face, parallel, the least |t| (ties to the larger support, then earlier).
+        let mut best: Option<(usize, f64)> = None;
+        for (k, p) in planes.iter().enumerate() {
+            if !on_doc[k] || axis_deg(axis, p.n) > sigma_deg {
+                continue;
+            }
+            let t = p.n.dot(point) - p.d;
+            if !(t.abs() > sigma) {
+                continue;
+            }
+            let better = best.is_none_or(|(b, bt)| {
+                t.abs() + lin < bt.abs() || ((t.abs() - bt.abs()).abs() <= lin && p.support > planes[b].support)
+            });
+            if better {
+                best = Some((k, t));
+            }
+        }
+        let Some((pk, t)) = best else { continue };
+        let Some((h, far)) = extent(&planes, pk, t, sigma, sigma_deg) else { continue };
+        // Boss or pocket: the support centroid against the replayed solids.
+        let (mut inside, mut unsure) = (false, false);
+        for so in &r.solids {
+            match point_in_solid(&so.brep, point, doc.tol) {
+                Ok(Where::Inside) => inside = true,
+                Ok(Where::Outside) => {}
+                _ => unsure = true,
+            }
+        }
+        if unsure {
+            continue;
+        }
+        let p = &planes[pk];
+        let z = p.n * (if t > 0.0 { 1.0 } else { -1.0 });
+        let z = Vec3::new(z.x + 0.0, z.y + 0.0, z.z + 0.0);
+        let foot = point - p.n * t;
+        let hint = if z.x.abs() < 0.9 { "1 0 0" } else { "0 1 0" };
+        let (hv, hres) = round_within(h, sigma).unwrap_or((h, 0.0));
+        let dm = 2.0 * radius;
+        let standard = if inside { nearest_standard(dm, sigma) } else { None };
+        let (rv, rres, rwhy) = if let Some(st) = standard {
+            let name = match st.class {
+                Class::TapDrill => format!("ISO 2306 tap drill for {}", st.thread),
+                c => format!("ISO 273 {} clearance for {}", c.name(), st.thread),
+            };
+            (st.hole_mm / 2.0, (dm - st.hole_mm).abs(), format!("{} {} mm measured", name, mm(dm)))
+        } else if let Some((v, res)) = round_within(dm, sigma) {
+            (v / 2.0, res, format!("round diameter {} from {} mm", f64_text(v), mm(dm)))
+        } else {
+            (radius, 0.0, format!("diameter {} mm as measured", mm(dm)))
+        };
+        let e = far.map_or(0.0, |(_, e)| e);
+        let src = match far {
+            Some((qi, e)) => format!("far-end plane #{} (near end {} mm off)", qi, mm(e)),
+            None => format!("the support centroid ({} mm off)", mm(t.abs())),
+        };
+        let why = format!(
+            "{}: cylinder #{} on plane #{} (a document face), extent {} mm from {}, height {}, {}, sigma {}",
+            if inside { "pocket" } else { "boss" },
+            ci,
+            p.i,
+            mm(h),
+            src,
+            f64_text(hv),
+            rwhy,
+            mm(sigma)
+        );
+        let res = e.max(hres).max(rres);
+        let conf = confidence(res, sigma);
+        let (a, b, c, x) = (ids.next(), ids.next(), ids.next(), ids.next());
+        let v3 = |v: Vec3| format!("{} {} {}", f64_text(v.x), f64_text(v.y), f64_text(v.z));
+        for stmt in [
+            format!("sketch {} o=[{}] z=[{}] x=[{}]", a, v3(foot), v3(z), hint),
+            format!("point {} sketch={} x=0 y=0", b, a),
+            format!("circle {} sketch={} centre={} r={}", c, a, b, f64_text(rv)),
+            format!("extrude {} sketch={} outer={} dir=[{}] length={}", x, a, c, v3(z), f64_text(hv)),
+        ] {
+            out.push(Proposal { stmt, confidence: conf, why: why.clone() });
         }
     }
 }
