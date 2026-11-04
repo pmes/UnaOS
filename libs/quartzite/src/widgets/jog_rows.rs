@@ -38,6 +38,9 @@ pub enum JogRow {
     Pad { keys: [(Pad, &'static str); 6], enabled: bool },
     /// Why the pad is greyed, only while it is.
     Why(String),
+    /// VUGCOMSCANMDNSDIAL (SR638): a controller the last discover found on the link (telnet entries only), in the card's
+    /// order; a press links it ([`dial_verb`]). `addr` is the address as discovery said it, the label is [`found_label`].
+    Found { name: String, addr: String, port: u16 },
 }
 
 fn axis_text(c: char, declared: Option<f64>, read: Option<f64>) -> String {
@@ -67,6 +70,7 @@ pub fn jog_rows(s: &CardSnapshot) -> Vec<JogRow> {
     if let Some(w) = &s.squawk {
         out.push(JogRow::Squawk(w.clone()));
     }
+    out.extend(s.found.iter().map(|f| JogRow::Found { name: f.name.clone(), addr: f.addr.to_string(), port: f.port })); // VUGCOMSCANMDNSDIAL (SR638): the found rows under the squawk row
     out.push(JogRow::Steps { choices: STEPS_MM, chosen: s.step, enabled: s.linked });
     out.push(JogRow::Pad { keys: KEYS, enabled: s.linked });
     if !s.linked {
@@ -92,6 +96,24 @@ pub const DECLARE_PLACEHOLDER: &str = "machine declare <name> x=.. y=.. z=..";
 /// the entry (a declare with no link is typed by the desk's next tick, SR623) and never checks the line itself.
 pub fn declare_verb(card: &mut PumpCard, line: &str) -> Option<SMessage> {
     card.declare(line)
+}
+
+// --- VUGCOMSCANMDNSDIAL (LEDGER SR638): the found rows' press and the discover button, written once for both faces (named tail hunk) ---
+
+/// The label of the button beside the declare entry that asks the link who is there (the face runs
+/// `comscan::discovery::discover` off its main thread and hands the answers to the card's `say_found` on it).
+pub const DISCOVER_LABEL: &str = "discover";
+
+/// What a found row's button says: `<name> <addr>:<port>`, an IPv6 address bracketed (discovery's own words, less `found:`).
+pub fn found_label(name: &str, addr: &str, port: u16) -> String {
+    if addr.contains(':') { format!("{name} [{addr}]:{port}") } else { format!("{name} {addr}:{port}") }
+}
+
+/// The verb a press on found row `i` fires: the card's own request ([`PumpCard::dial`]: `PumpLink` with the card's
+/// principal for the row's `tcp://` name). The desk answers `linked <port>` or `refused: <why>` through the card's `hear`.
+/// `None`: no such row.
+pub fn dial_verb(card: &PumpCard, i: usize) -> Option<SMessage> {
+    card.dial(i)
 }
 
 #[cfg(test)]
@@ -199,5 +221,49 @@ mod tests {
         assert!(declare_verb(&mut c, "machine declare bench x=120 y=200").is_none());
         assert!(jog_rows(&c.snapshot()).contains(&JogRow::Squawk("refused: declare: x, y and z are each required".into())));
         assert_eq!(DECLARE_PLACEHOLDER, "machine declare <name> x=.. y=.. z=..");
+    }
+
+    /// VUGCOMSCANMDNSDIAL (SR638): a discover's telnet entries are rows under the squawk row (the http hint is said, not
+    /// listed); a press is the card's PumpLink for the row's tcp:// name with its principal; the next discover replaces
+    /// the rows; a row that is not there fires nothing.
+    #[test]
+    fn jog_rows_found_kat() {
+        use comscan::discovery::{Found, Service};
+        use std::net::{IpAddr, Ipv4Addr};
+        let at = |n: u8| IpAddr::V4(Ipv4Addr::new(192, 168, 1, n));
+        let mut c = card();
+        c.say_found(&[
+            Found { name: "fluidnc".into(), addr: at(40), port: 23, scope: 0, service: Service::Telnet, dialect_hint: None },
+            Found { name: "fluidnc".into(), addr: at(40), port: 80, scope: 0, service: Service::Http, dialect_hint: None },
+            Found { name: "router".into(), addr: at(41), port: 23, scope: 0, service: Service::Telnet, dialect_hint: None },
+        ]);
+        let rows = jog_rows(&c.snapshot());
+        assert_eq!(
+            rows[2..5],
+            [
+                JogRow::Squawk("found: router 192.168.1.41:23".into()),
+                JogRow::Found { name: "fluidnc".into(), addr: "192.168.1.40".into(), port: 23 },
+                JogRow::Found { name: "router".into(), addr: "192.168.1.41".into(), port: 23 },
+            ]
+        );
+        assert_eq!(rows.iter().filter(|r| matches!(r, JogRow::Found { .. })).count(), 2, "the http hint is not a row");
+        assert_eq!(found_label("fluidnc", "192.168.1.40", 23), "fluidnc 192.168.1.40:23");
+        assert_eq!(found_label("cnc", "fe80::1", 23), "cnc [fe80::1]:23");
+        match dial_verb(&c, 0) {
+            Some(SMessage::Pump(PumpEvent::PumpLink { principal, port, dialect })) => {
+                assert_eq!(principal, Origin::LocalUser("una".into()));
+                assert_eq!((port.as_str(), dialect.as_str()), ("tcp://192.168.1.40:23", "grbl"));
+            }
+            other => panic!("expected PumpLink, got {other:?}"),
+        }
+        match dial_verb(&c, 1) {
+            Some(SMessage::Pump(PumpEvent::PumpLink { port, dialect, .. })) => {
+                assert_eq!((port.as_str(), dialect.as_str()), ("tcp://192.168.1.41:23", "grbl"), "no hint: grbl's raw stream (quartzite names no make_core Dialect)");
+            }
+            other => panic!("expected PumpLink, got {other:?}"),
+        }
+        assert!(dial_verb(&c, 2).is_none());
+        c.say_found(&[]);
+        assert!(!jog_rows(&c.snapshot()).iter().any(|r| matches!(r, JogRow::Found { .. })), "the next discover replaces the rows");
     }
 }

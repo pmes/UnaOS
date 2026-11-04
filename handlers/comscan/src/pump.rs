@@ -71,7 +71,8 @@ pub enum Refused {
 }
 
 /// The only way Comscan makes a pump: a `Verdict::Pass` for `p` (VUG-HELM-BIND: by digest) on `m` (VUG-HELM-BIND-MACHINE:
-/// by identity), then make_core's text for `p` in `d`.
+/// by identity), then make_core's text for `p` in `d`. The ONE exception is [`link_pump`] (VUGCOMSCANMDNSDIAL SR638): the
+/// empty program a `PumpLink` opens with, which moves nothing, so no move bypasses Helm.
 pub fn start(v: &Verdict, p: &Program, d: Dialect, m: &Machine) -> Result<Pump, Refused> {
     match v {
         Verdict::Pass { digest, .. } if *digest != p.digest() => {
@@ -324,6 +325,7 @@ impl PumpDesk {
                 }
                 Err(out) => out,
             },
+            PumpEvent::PumpLink { .. } => self.link_applied(ev, open), // VUGCOMSCANMDNSDIAL (SR638): the sync road, as PumpStart's arm
             PumpEvent::PumpHold { .. } | PumpEvent::PumpResume { .. } | PumpEvent::PumpStop { .. } => {
                 if let Some(out) = self.alarm_reset_due(ev) { return out; } // VUGCOMSCANALARMRESET (SR585): Stop on a run halted by an alarm is the soft reset at once
                 if let Some(out) = self.jog_cancel_due(ev) { return out; } // VUGCOMSCANJOGFACE (SR579): Hold / Stop while a grbl jog runs is grbl's jog cancel
@@ -839,11 +841,19 @@ impl PumpDesk {
         };
         // One arming, one run: a FirstRun approval is per run, so a finished program must pass Helm again.
         let a = self.armed.remove(u.i);
+        self.bind(a.pump, port, (link, said, before, env), "started".to_string()) // VUGCOMSCANMDNSDIAL (SR638): the link taken through the one bind, PumpLink's too
+    }
+
+    /// A live link taken by the desk (PumpStart's run, or PumpLink's empty program, VUGCOMSCANMDNSDIAL SR638): the run built
+    /// on it, the link-up M154, `first` said, the hello printed once, the travel and position read anew, the travel words and
+    /// the commission. Under the desk lock.
+    fn bind(&mut self, pump: Pump, port: String, opened: Opened, first: String) -> Vec<PumpEvent> {
+        let (link, said, before, env) = opened;
         let identity = self.identify.as_ref().and_then(|f| f(port.as_str())); // VUGCOMSCANTTYUSBID (SR529)
-        let commissioned = commissioned_name(a.dialect, before.as_deref(), said.as_deref()); // VUGCOMSCANJOG (SR573)
-        self.running = Some(Running { pump: a.pump, link: Some(link), port: port.clone(), redial: None, identity, hello: said.clone(), motion: Default::default(), jogged: false, unlock: false });
+        let commissioned = commissioned_name(pump.dialect(), before.as_deref(), said.as_deref()); // VUGCOMSCANJOG (SR573)
+        self.running = Some(Running { pump, link: Some(link), port: port.clone(), redial: None, identity, hello: said.clone(), motion: Default::default(), jogged: false, unlock: false });
         self.autoreport_due(); // VUGCOMSCANMARLINAUTOREPORT (SR625): the link-up M154, riding the hello
-        let mut out = vec![self.squawk(Some("started".to_string()))];
+        let mut out = vec![self.squawk(Some(first))];
         if let Some(h) = before.or(said) {
             out.push(self.squawk(Some(format!("hello {h}")))); // printed once, at the first open (VUGCOMSCANJOG SR573: as the controller first said it)
         }
@@ -862,6 +872,9 @@ impl PumpDesk {
 /// serve_pump's request: PumpStart takes the one open road (the checks under the desk lock, the opener and the hello
 /// with it RELEASED, the handback under it); every other request is applied under the lock.
 async fn request(desk: &Mutex<PumpDesk>, ev: &PumpEvent, open: &mut Box<Opener>) -> Vec<PumpEvent> { // VUGCOMSCANHOSTDIALECT (SR566): async
+    if matches!(ev, PumpEvent::PumpLink { .. }) {
+        return link_request(desk, ev, open).await; // VUGCOMSCANMDNSDIAL (SR638): PumpLink takes the one open road too
+    }
     if !matches!(ev, PumpEvent::PumpStart { .. }) {
         return match desk.lock() {
             Ok(mut d) => d.apply(ev, &mut **open),
@@ -2199,4 +2212,86 @@ mod tests {
         assert_eq!(d.envelope_spec_for(GRBL), None, "the off switch");
         assert_eq!(PumpDesk::new(machine()).envelope_spec_for(GRBL), None, "a hello-off desk sends nothing new");
     }
+}
+
+// --- VUGCOMSCANMDNSDIAL (LEDGER SR638): PumpLink, a port linked with no program through the one open road (named tail hunk) ---
+
+/// The pump a `PumpLink` runs on: make_core's ONE writer over the empty program in `d` (`G21 G90 G17 G94` / `M2` for grbl,
+/// `G21` / `G90` / `M82` for Marlin: modal lines, no move), so the link reaches `done` and home / jog / declare ride it as
+/// after a run. The one exception to [`start`]'s Verdict: nothing it streams moves the machine.
+fn link_pump(d: Dialect) -> Result<Pump, Refused> {
+    Pump::from_program(&Program::new(make_core::Units::Mm), d).map_err(Refused::Pump)
+}
+
+/// What a PumpLink's checks found: the port, the dialect, the hello, the commission name and the travel read (open_road's
+/// `due` shape, as PumpStart's).
+type LinkDue = (String, Dialect, Option<(Dialect, Duration)>, Option<String>, Option<(Dialect, Duration)>);
+
+impl PumpDesk {
+    /// PumpLink's checks under the desk lock, nothing opened: refused while a job streams (PumpStart's words) or while a link
+    /// is up (one link at a time; a PumpStart replaces it, as it replaces a finished run's), the dialect as PumpStart's; then
+    /// the hello, the commission name and the travel read exactly as [`PumpDesk::start_due`] takes them.
+    fn link_due(&self, ev: &PumpEvent) -> Result<LinkDue, Vec<PumpEvent>> {
+        let PumpEvent::PumpLink { port, dialect, .. } = ev else { return Err(Vec::new()) };
+        if self.busy() {
+            return Err(refused("busy: a program is streaming (PumpStop first)"));
+        }
+        if let Some(r) = self.running.as_ref().filter(|r| r.link.is_some()) {
+            return Err(refused(format!("linked: {} (one link at a time; PumpStart replaces it)", r.port)));
+        }
+        let Some(d) = parse_dialect(dialect) else {
+            return Err(refused(format!("unknown dialect {dialect:?} (grbl, grbl-laser, marlin)")));
+        };
+        if let Some(why) = self.declared_dialect_refusal(d) {
+            return Err(refused(why));
+        }
+        let hello = self.hello_spec_for(d);
+        let name = match hello {
+            Some(_) if pump_core::pump::name_verb(d, "").is_some() => Some(self.name_for(port)),
+            _ => None,
+        };
+        Ok((port.clone(), d, hello, name, self.envelope_spec_for(d)))
+    }
+
+    /// PumpLink's handback under the desk lock: the checks again (a link that came up while the lock was released drops
+    /// this one), a refused open said as PumpStart's, else the empty program's pump bound to the link, said `linked <port>`.
+    fn linked(&mut self, ev: &PumpEvent, res: Result<Opened, String>) -> Vec<PumpEvent> {
+        let (port, d, ..) = match self.link_due(ev) {
+            Ok(u) => u,
+            Err(out) => return out, // a live link in `res` is dropped here
+        };
+        let opened = match res {
+            Ok(x) => x,
+            Err(e) => return refused(format!("port {port:?}: {e}")),
+        };
+        match link_pump(d) {
+            Ok(pump) => {
+                let first = format!("linked {port}");
+                self.bind(pump, port, opened, first)
+            }
+            Err(e) => refused(format!("link: {e:?}")),
+        }
+    }
+
+    /// PumpLink on the sync road ([`PumpDesk::apply`]): the checks, the open with its hello and travel read, the handback.
+    fn link_applied(
+        &mut self,
+        ev: &PumpEvent,
+        open: &mut dyn FnMut(&str, Dialect) -> Result<Box<dyn Transport + Send>, String>,
+    ) -> Vec<PumpEvent> {
+        match self.link_due(ev) {
+            Ok((port, d, hello, name, envelope)) => {
+                let res = with_envelope(with_hello_named(open(&port, d), hello, name), envelope);
+                self.linked(ev, res)
+            }
+            Err(out) => out,
+        }
+    }
+}
+
+/// serve_pump's PumpLink: the one open road ([`open_road`]) with [`PumpDesk::link_due`] and [`PumpDesk::linked`].
+async fn link_request(desk: &Mutex<PumpDesk>, ev: &PumpEvent, open: &mut Box<Opener>) -> Vec<PumpEvent> {
+    open_road(desk, open, |d| d.link_due(ev), |d, res| d.linked(ev, res))
+        .await
+        .unwrap_or_else(|| refused("the pump desk is poisoned"))
 }

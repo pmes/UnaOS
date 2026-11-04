@@ -233,3 +233,48 @@ Local:
     assert_eq!(local_v4(fib_trie), vec![Ipv4Addr::new(192, 168, 1, 5), Ipv4Addr::new(10, 0, 0, 7)]);
     assert!(link_scopes("").is_empty() && local_v4("").is_empty(), "an unreadable list is empty: discover falls back");
 }
+
+// --- VUGCOMSCANMDNSDIAL (SR638): a found telnet entry dialed by index as the one tcp:// name, in a PumpLink ---
+
+#[test]
+fn a_found_telnet_entry_is_dialed_by_index_as_the_one_tcp_spec() {
+    use bandy::{PumpEvent, SMessage};
+    use comscan::tcp::{parse, spec};
+
+    let mut card = PumpCard::new(Origin::LocalUser("una".to_string()));
+    card.say_found(&fluidnc_found());
+    let kept = card.snapshot().found;
+    assert_eq!(kept.len(), 1, "the http hint is said, not kept as a row");
+    assert_eq!((kept[0].port, kept[0].service), (23, Service::Telnet));
+    match card.dial(0) {
+        Some(SMessage::Pump(PumpEvent::PumpLink { principal, port, dialect })) => {
+            assert_eq!(principal, Origin::LocalUser("una".to_string()), "the card's own principal");
+            assert_eq!((port.as_str(), dialect.as_str()), ("tcp://192.168.1.40:23", "grbl"));
+            assert_eq!(parse(&port).unwrap(), ("192.168.1.40".to_string(), 23), "the opener reads the name back");
+        }
+        other => panic!("expected PumpLink, got {other:?}"),
+    }
+    assert!(card.dial(1).is_none(), "no such row");
+
+    let v6 = SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1)), 23);
+    assert_eq!(spec(v6), "tcp://[fe80::1]:23");
+    assert_eq!(parse(&spec(v6)).unwrap(), ("fe80::1".to_string(), 23));
+    let scoped = Found {
+        name: "cnc".into(),
+        addr: IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1)),
+        port: 23,
+        scope: 2,
+        service: Service::Telnet,
+        dialect_hint: Some(Dialect::Marlin),
+    };
+    assert_eq!(spec(scoped.socket_addr()), "tcp://[fe80::1%2]:23", "the link's scope rides the name");
+    card.say_found(&[scoped]);
+    match card.dial(0) {
+        Some(SMessage::Pump(PumpEvent::PumpLink { port, dialect, .. })) => {
+            assert_eq!((port.as_str(), dialect.as_str()), ("tcp://[fe80::1%2]:23", "marlin"), "the hinted dialect");
+        }
+        other => panic!("expected PumpLink, got {other:?}"),
+    }
+    card.say_found(&[]);
+    assert!(card.snapshot().found.is_empty(), "the next discover replaces the rows");
+}

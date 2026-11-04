@@ -463,3 +463,67 @@ fn a_typed_bad_declare_is_refused_in_the_parsers_words() {
     }
     assert_eq!(card.snapshot().squawk, before, "the desk's answer, not the post, is what the row says next");
 }
+
+// --- VUGCOMSCANMDNSDIAL (SR638): a found controller linked by one press of the card's row, then jogged ---
+
+/// A discover's telnet entry pressed on the Console's card posts the card's PumpLink; the desk opens that `tcp://` name in
+/// grbl through its one open road (the opener asked exactly it), says `linked <port>`, streams the empty program's modal
+/// lines to `done`, and the next jog rides the link; a second press while linked is refused by name (a desk over the
+/// vessel's undeclared machine, the travel typed first, on pump_core's mock grbl).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_found_controller_is_linked_by_one_press_and_jogs() {
+    use bandy::{Origin, PumpEvent};
+    use comscan::discovery::{Found, Service};
+    use comscan::pump::{Opener, PumpDesk, serve_pump, undeclared_machine};
+    use comscan::{Pad, PumpCard};
+    use make_core::gcode::Dialect;
+    use pump_core::Transport;
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::sync::{Arc, Mutex};
+
+    let synapse = Synapse::new();
+    let rx = synapse.subscribe();
+    let mut watch = synapse.subscribe();
+    let desk = Arc::new(Mutex::new(PumpDesk::new(undeclared_machine())));
+    desk.lock().unwrap().hello_within(Duration::from_millis(50));
+    let asked: Arc<Mutex<Vec<(String, Dialect)>>> = Arc::new(Mutex::new(Vec::new()));
+    let seen = asked.clone();
+    let open: Box<Opener> = Box::new(move |port: &str, d: Dialect| -> Result<Box<dyn Transport + Send>, String> {
+        seen.lock().unwrap().push((port.to_string(), d));
+        Ok(Box::new(pump_core::mock::MockGrbl::new(2)))
+    });
+    let task = tokio::spawn(serve_pump(synapse.clone(), rx, desk.clone(), open, Duration::from_millis(5)));
+
+    let mut card = PumpCard::new(Origin::LocalUser("una".to_string()));
+    synapse.fire(card.declare("machine declare bench x=120 y=200 z=80").expect("a declare the parser takes"));
+    assert_eq!(
+        card_hears_until(&mut watch, &mut card, |w| w.starts_with("machine declared") || w.starts_with("refused")).await,
+        "machine declared bench x=120 y=200 z=80"
+    );
+
+    let addr = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 40));
+    let grbl = Some(Dialect::Grbl { laser: false });
+    card.say_found(&[
+        Found { name: "fluidnc".into(), addr, port: 23, scope: 0, service: Service::Telnet, dialect_hint: grbl },
+        Found { name: "fluidnc".into(), addr, port: 80, scope: 0, service: Service::Http, dialect_hint: grbl },
+    ]);
+    synapse.fire(card.dial(0).expect("the telnet row"));
+    let said = card_hears_until(&mut watch, &mut card, |w| w.starts_with("linked") || w.starts_with("refused")).await;
+    assert_eq!(said, "linked tcp://192.168.1.40:23");
+    assert_eq!(*asked.lock().unwrap(), vec![("tcp://192.168.1.40:23".to_string(), Dialect::Grbl { laser: false })], "the one opener, asked the row's name");
+    assert_eq!(card_hears_until(&mut watch, &mut card, |w| w == "done" || w.starts_with("refused")).await, "done");
+    assert!(card.snapshot().linked, "the pad's link is up");
+
+    card.set_step(10.0);
+    synapse.fire(card.press(Pad::XPlus));
+    let jog = card_hears_until(&mut watch, &mut card, |w| w.starts_with("refused") || w.starts_with("jog sent")).await;
+    assert_eq!(jog, "jog sent: $J=G91 X10 Y0 Z0 F600", "the jog rides the dialed link");
+
+    synapse.fire(card.dial(0).expect("the telnet row"));
+    let again = card_hears_until(&mut watch, &mut card, |w| w.starts_with("refused") || w.starts_with("linked")).await;
+    assert_eq!(again, "refused: linked: tcp://192.168.1.40:23 (one link at a time; PumpStart replaces it)");
+    assert!(matches!(card.dial(0), Some(SMessage::Pump(PumpEvent::PumpLink { .. }))));
+
+    synapse.fire(SMessage::Kill("comscan".to_string()));
+    timeout(Duration::from_secs(5), task).await.expect("stops on Kill").unwrap();
+}
