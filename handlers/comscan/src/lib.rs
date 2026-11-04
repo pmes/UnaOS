@@ -314,3 +314,22 @@ impl PumpCard {
         }
     }
 }
+
+// --- VUGCOMSCANDECLARECONSOLE (LEDGER SR624): a typed `machine declare ..` line posted from the Console's card (named tail hunk) ---
+
+impl PumpCard {
+    /// A typed `machine declare <name> x=<mm> y=<mm> z=<mm> [dialect=..]` line as the request it posts: the ONE parser
+    /// ([`pump::declare_request`]) with the card's principal, so the desk's ONE validator judges it and its answer comes back
+    /// through [`PumpCard::hear`] like every other (`machine declared ..`, or `refused: <why>`), and an accepted declare is
+    /// kept in Principia's store by the desk's own road. A line the parser refuses posts nothing (`None`) and is said in the
+    /// pad's squawk row in the parser's own words, `refused: <why>`, the shape [`PumpCard::hear`] gives a desk refusal.
+    pub fn declare(&mut self, line: &str) -> Option<SMessage> {
+        match pump::declare_request(line, self.principal.clone()) {
+            Ok(ev) => Some(SMessage::Pump(ev)),
+            Err(why) => {
+                self.pad.squawk = Some(format!("refused: {why}"));
+                None
+            }
+        }
+    }
+}

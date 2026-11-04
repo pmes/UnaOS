@@ -312,3 +312,154 @@ async fn a_jog_pad_press_posts_the_verb_and_commissioned_shows_once() {
     assert_eq!(said.len(), 1, "said once: {lines:?}");
     assert_eq!((said[0].level.as_str(), said[0].source.as_str()), ("info", "comscan"));
 }
+
+// --- VUGCOMSCANDECLARECONSOLE (SR624): a typed `machine declare ..` line from the Console's card, answered as every other ---
+
+/// Hear every pump answer on `rx` into `card` until one says what `want` takes (a Squawk's event, or `refused: <why>` for a
+/// PumpRefused), within 10 s; the words heard are in the panic.
+async fn card_hears_until(
+    rx: &mut tokio::sync::broadcast::Receiver<SMessage>,
+    card: &mut comscan::PumpCard,
+    mut want: impl FnMut(&str) -> bool,
+) -> String {
+    let mut heard: Vec<String> = Vec::new();
+    let got = timeout(Duration::from_secs(10), async {
+        loop {
+            let Ok(SMessage::Pump(ev)) = rx.recv().await else { continue };
+            card.hear(&ev);
+            let word = match &ev {
+                bandy::PumpEvent::Squawk { event: Some(e), .. } => e.clone(),
+                bandy::PumpEvent::PumpRefused { why } => format!("refused: {why}"),
+                _ => continue,
+            };
+            if want(&word) {
+                return word;
+            }
+            heard.push(word);
+        }
+    })
+    .await;
+    match got {
+        Ok(w) => w,
+        Err(_) => panic!("timed out; the card heard {heard:?}"),
+    }
+}
+
+/// A typed declare on the Console's card goes through the one parser with the card's principal; the desk answers the
+/// declare word, which the card says in its squawk row; the desk's own road keeps it in Principia's store; and the next jog
+/// past the typed X travel is refused by name while one inside it goes out (a desk over the vessel's undeclared machine,
+/// on pump_core's mock grbl).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_typed_declare_answers_the_declare_word_and_bounds_the_next_jog() {
+    use bandy::{Origin, PrefValue, PrincipiaCommand, PumpEvent};
+    use comscan::pump::{Opener, PumpDesk, Verdict, digest_hex, serve_pump, undeclared_machine};
+    use comscan::{Pad, PumpCard};
+    use make_core::gcode::Dialect;
+    use make_core::{Move, Program, Units, Vec3};
+    use pump_core::Transport;
+    use std::sync::{Arc, Mutex};
+
+    let synapse = Synapse::new();
+    let rx = synapse.subscribe();
+    let mut watch = synapse.subscribe();
+    let mut prefs = synapse.subscribe();
+    let desk = Arc::new(Mutex::new(PumpDesk::new(undeclared_machine())));
+    desk.lock().unwrap().hello_within(Duration::from_millis(50));
+    let open: Box<Opener> = Box::new(|_: &str, _: Dialect| -> Result<Box<dyn Transport + Send>, String> {
+        Ok(Box::new(pump_core::mock::MockGrbl::new(2)))
+    });
+    let task = tokio::spawn(serve_pump(synapse.clone(), rx, desk.clone(), open, Duration::from_millis(5)));
+
+    let who = Origin::LocalUser("una".to_string());
+    let mut card = PumpCard::new(who.clone());
+    let typed = card.declare("machine declare bench x=120 y=200 z=80").expect("a declare the parser takes posts its request");
+    match &typed {
+        SMessage::Pump(PumpEvent::PumpDeclare { principal, name, x, y, z, dialect }) => {
+            assert_eq!(principal, &who, "the card's own principal");
+            assert_eq!((name.as_str(), *x, *y, *z, dialect), ("bench", 120.0, 200.0, 80.0, &None));
+        }
+        other => panic!("expected PumpDeclare, got {other:?}"),
+    }
+    synapse.fire(typed);
+    let said = card_hears_until(&mut watch, &mut card, |w| w.starts_with("machine declared") || w.starts_with("refused")).await;
+    assert_eq!(said, "machine declared bench x=120 y=200 z=80");
+    assert_eq!(card.snapshot().squawk.as_deref(), Some("machine declared bench x=120 y=200 z=80"), "said in the squawk row");
+
+    // The desk's own road (declare_kept) keeps the console's declare in Principia's store; nothing of the console's.
+    let kept = timeout(Duration::from_secs(5), async {
+        loop {
+            if let Ok(SMessage::Principia(PrincipiaCommand::PrefSet { ns, key, value })) = prefs.recv().await {
+                return (ns, key, value);
+            }
+        }
+    })
+    .await
+    .expect("the accepted declare is kept");
+    assert_eq!(kept, ("comscan".to_string(), "machine".to_string(), PrefValue::Str("bench x=120 y=200 z=80".to_string())));
+
+    // A run on the declared machine (the pass names it), started on the bus, to done: the link the jog rides.
+    let mut p = Program::new(Units::Mm);
+    p.moves.push(Move::Rapid { to: Vec3::new(0.0, 0.0, 5.0) });
+    p.moves.push(Move::Linear { to: Vec3::new(10.0, 10.0, 5.0), feed: 300.0 });
+    let digest = {
+        let mut d = desk.lock().unwrap();
+        let pass = Verdict::Pass { digest: p.digest(), machine: d.machine().digest() };
+        d.arm(&pass, &p, Dialect::Grbl { laser: false }).expect("armed by a pass naming the declared machine")
+    };
+    synapse.fire(SMessage::Pump(PumpEvent::PumpStart {
+        principal: who.clone(),
+        program: digest_hex(digest),
+        dialect: "grbl".to_string(),
+        port: "mock".to_string(),
+    }));
+    assert_eq!(card_hears_until(&mut watch, &mut card, |w| w == "done" || w.starts_with("refused")).await, "done");
+
+    // The typed X travel is 120: X150 refused by name before the wire, X100 goes out.
+    card.set_step(150.0);
+    synapse.fire(card.press(Pad::XPlus));
+    let past = card_hears_until(&mut watch, &mut card, |w| w.starts_with("refused") || w.starts_with("jog sent")).await;
+    assert!(past.starts_with("refused: jog: X150") && past.contains("the declared X travel 120"), "{past}");
+    assert_eq!(card.snapshot().squawk.as_deref(), Some(past.as_str()));
+    card.set_step(100.0);
+    synapse.fire(card.press(Pad::XPlus));
+    let inside = card_hears_until(&mut watch, &mut card, |w| w.starts_with("refused") || w.starts_with("jog sent")).await;
+    assert_eq!(inside, "jog sent: $J=G91 X100 Y0 Z0 F600");
+
+    synapse.fire(SMessage::Kill("comscan".to_string()));
+    timeout(Duration::from_secs(5), task).await.expect("stops on Kill").unwrap();
+}
+
+/// A typed line the parser refuses posts nothing and is said in the card's squawk row in the parser's own words (no second
+/// parser: the words are `declare_request`'s, verbatim); a line that is not a declare likewise.
+#[test]
+fn a_typed_bad_declare_is_refused_in_the_parsers_words() {
+    use bandy::{Origin, PumpEvent};
+    use comscan::PumpCard;
+    use comscan::pump::declare_request;
+
+    let who = Origin::LocalUser("una".to_string());
+    let mut card = PumpCard::new(who.clone());
+    for line in ["machine declare bench x=120 y=200", "machine home", "machine declare bench x=120 y=200 z=80 w=1"] {
+        let why = declare_request(line, who.clone()).expect_err("the parser refuses it");
+        assert!(card.declare(line).is_none(), "a refused line posts nothing: {line}");
+        assert_eq!(card.snapshot().squawk, Some(format!("refused: {why}")), "the parser's words: {line}");
+    }
+    assert_eq!(
+        card.snapshot().squawk.as_deref(),
+        Some("refused: declare: unknown key \"w\" (x, y, z, dialect)"),
+        "the last refusal, verbatim"
+    );
+    let missing = declare_request("machine declare bench x=120 y=200", who.clone()).unwrap_err();
+    assert_eq!(missing, "declare: x, y and z are each required");
+
+    // A line the parser takes is the request, carrying the card's principal; posting it says nothing of its own.
+    let before = card.snapshot().squawk;
+    match card.declare("machine declare bench x=120 y=200 z=80 dialect=grbl") {
+        Some(SMessage::Pump(PumpEvent::PumpDeclare { principal, name, x, y, z, dialect })) => {
+            assert_eq!(principal, who);
+            assert_eq!((name.as_str(), x, y, z, dialect.as_deref()), ("bench", 120.0, 200.0, 80.0, Some("grbl")));
+        }
+        other => panic!("expected PumpDeclare, got {other:?}"),
+    }
+    assert_eq!(card.snapshot().squawk, before, "the desk's answer, not the post, is what the row says next");
+}
