@@ -90,6 +90,9 @@ pub struct Grid {
     pub pitch_px: f64,
     pub width_px: f64,
     pub inter: Vec<Inter>,
+    /// VUGPHOTOSIDETHIN (SR651): every stroke pair before the family split, so a pair off the lattice (a thin part's
+    /// side, not ink) reaches the silhouette ([`crate::thin_sides`]).
+    pub pairs: Vec<GridLine>,
 }
 
 fn ang_diff(a: f64, b: f64) -> f64 {
@@ -338,6 +341,7 @@ fn index_family(fam: Vec<GridLine>, reference: &GridLine) -> Vec<(i32, GridLine)
 pub fn find(el: &[Edgel], w: usize, h: usize) -> Result<Grid, Refusal> {
     let lines = hough_lines(el, w, h);
     let centres = strokes(&lines);
+    let pairs = centres.clone(); // VUGPHOTOSIDETHIN (SR651): the pairs kept for the off-lattice rule
     let mut hist = [0.0f64; 180];
     for l in &centres {
         let b = (deg_mod180(l.dir) as usize).min(179);
@@ -399,5 +403,5 @@ pub fn find(el: &[Edgel], w: usize, h: usize) -> Result<Grid, Refusal> {
             }
         }
     }
-    Ok(Grid { a, b, pitch_px, width_px, inter })
+    Ok(Grid { a, b, pitch_px, width_px, inter, pairs })
 }

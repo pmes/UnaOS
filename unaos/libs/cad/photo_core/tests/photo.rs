@@ -707,3 +707,32 @@ fn a_webp_xmp_crop_opens_cropped() {
     assert_eq!(photo_core::crop_principal(&keyless), None);
     eprintln!("photo: crop-meta-xmp webp={},{}", pp.x, pp.y);
 }
+
+/// VUGPHOTOSIDETHIN (SR651): a 0.5 mm shim off the plate's left side pairs like an ink stroke but lies off the lattice,
+/// so it is a thin side of the part: its outline is in the loops at its width and length; the plate stays on the truth,
+/// and the plain plate has nothing past its left side.
+#[test]
+fn a_thin_side_off_the_lattice_is_kept() {
+    let s = Spec::good();
+    let truth_inv = photo_core::homography::invert(&fixture::homography(&s)).expect("the true homography inverts");
+    let to_part = |m: &Measured, p: Vec2| -> Vec2 {
+        let q = apply(&m.h, p).expect("h maps the outline");
+        fixture::paper_to_part(&s, apply(&truth_inv, q).expect("the truth maps back"))
+    };
+    let img = pixel_core::decode(&fixture::shim_png(&s)).expect("pixel_core decodes the shim PNG");
+    let m = measure(&img, PhotoParams::new(5.0), Tol::DEFAULT).expect("the shim photo measures");
+    let pts: Vec<Vec2> = m.loops[0].iter().map(|&p| to_part(&m, p)).collect();
+    let tab: Vec<Vec2> = pts.iter().copied().filter(|q| q.x < -1.0).collect();
+    let band = fit::BAND_SIGMA * m.sigma_mm;
+    assert!(tab.len() >= 2, "no shim vertices in the loop: {pts:?}");
+    let (ylo, yhi) = tab.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |a, q| (a.0.min(q.y), a.1.max(q.y)));
+    let tip = tab.iter().map(|q| q.x).fold(f64::INFINITY, f64::min);
+    eprintln!("photo: shim width={:.3} tip={:.3} y={:.3}..{:.3} sigma={:.4} k1={:.4}", yhi - ylo, tip, ylo, yhi, m.sigma_mm, m.k1);
+    assert!(((yhi - ylo) - fixture::SHIM_W).abs() <= band, "shim width {} vs {}", yhi - ylo, fixture::SHIM_W);
+    assert!((tip + fixture::SHIM_L).abs() <= band, "shim tip {tip} vs {}", -fixture::SHIM_L);
+    assert!(((ylo + yhi) * 0.5 - fixture::SHIM_Y).abs() <= band, "shim centre {}", (ylo + yhi) * 0.5);
+    let worst = pts.iter().filter(|q| q.x > 0.5).map(|&q| fixture::outline_distance(q)).fold(0.0f64, f64::max);
+    assert!(worst < 0.5, "plate outline off the truth by {worst} mm");
+    let plain = run(&s).expect("the good photo measures");
+    assert!(plain.loops[0].iter().all(|&p| to_part(&plain, p).x >= -1.0), "the plain plate has a vertex past its left side");
+}

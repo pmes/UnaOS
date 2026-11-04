@@ -365,3 +365,28 @@ pub fn crop_png(img: &Image, x0: u32, y0: u32, w: u32, h: u32) -> Vec<u8> {
     let meta = alloc::format!("{},{},{},{}", x0.min(img.width), y0.min(img.height), img.width, img.height);
     pixel_core::png::encode::encode_rgba_text(c.width, c.height, &c.rgba, &[(crate::CROP_KEY, meta.as_str())]).unwrap_or_default()
 }
+
+// ---- VUGPHOTOSIDETHIN (SR651): the plate with a thin shim off its left side (named tail block) ----
+/// The shim's width (mm): 4 px at the good camera's ~8 px / mm, under MAX_STROKE_PX (it pairs like ink) and under both
+/// silhouette openings, over the outline's 2 σ simplification (both its sides survive into the loops).
+pub const SHIM_W: f64 = 0.5;
+/// The shim's length out from the plate's left side (mm).
+pub const SHIM_L: f64 = 20.0;
+/// The shim's centre line in the part frame (mm): on [`Spec::good`] it runs paper y 37.2 to 37.7, mid-cell.
+pub const SHIM_Y: f64 = 14.0;
+
+/// Whether a part-frame point is in the shim: x in [-SHIM_L, 0] (touching the plate's left side), y in SHIM_Y ± SHIM_W / 2.
+pub fn in_shim(q: Vec2) -> bool {
+    q.x >= -SHIM_L && q.x <= 0.0 && (q.y - SHIM_Y).abs() <= SHIM_W * 0.5
+}
+
+/// Render the plate with the shim.
+pub fn render_shim(s: &Spec) -> Image {
+    render_shape(s, &|q: Vec2| in_part(q) || in_shim(q))
+}
+
+/// The shim photo as PNG bytes (pixel_core's encoder).
+pub fn shim_png(s: &Spec) -> Vec<u8> {
+    let img = render_shim(s);
+    pixel_core::png::encode::encode_rgba(img.width, img.height, &img.rgba).unwrap_or_default()
+}
