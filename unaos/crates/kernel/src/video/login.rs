@@ -681,7 +681,7 @@ fn open_as(state: State) {
         f.message = "";
         f.windowed = false;
     }
-    if state == State::Open { let _ = super::loginwindow::resolve(); super::loginwindow::register(); ARMED.store(false, Ordering::Relaxed); } // LOGINWINDOW (B430): each user's `una:icon` read once per opening; `tests loginwindow`
+    if state == State::Open { let _ = super::loginwindow::resolve(); super::loginwindow::register(); ARMED.store(false, Ordering::Relaxed); } veil_reduce_boot(); // VEIL-REDUCE-BOOT-STORE (rmbp-ledger B1140): the machine copy latched before any login (file tail). LOGINWINDOW (B430): each user's `una:icon` read once per opening; `tests loginwindow`
     MISS_SAID.store(false, Ordering::Relaxed); // LOGINFLOW — the one miss line is per OPEN, not per boot
     KEY_SAID.store(false, Ordering::Relaxed); // LOGIN13 M3 — and so is the one key line
     if HEADLESS.load(Ordering::Relaxed) {
@@ -4176,4 +4176,18 @@ fn close_or_owe(id: wm::WinId) {
 fn session_diet_per_min() -> u64 {
     let lines = crate::serial_ring::SUBMITTED.load(Ordering::Relaxed);
     lines.saturating_mul(60_000) / crate::arch::ms().max(1)
+}
+
+// VEIL-REDUCE-BOOT-STORE (rmbp-ledger B1140, BP-video-11) — TAIL-APPENDED. Before any login there is no session store; the
+// boot screen's Reduce transparency is the MACHINE copy (`/settings/general`, the no-session store `prefs::machine_mirror`
+// keeps equal to the last session's value). [`open_as`] reads it once per no-session opening, ahead of the VEIL raise, through
+// the latch's own door (`crystal::login_reduce_load`: the bus GET, the no-session load); with a session open it reads nothing,
+// so the lock's re-raise keeps the session's latch. Wire: `[veil] login reduce_transparency=<0|1> a=<n> via=machine moved=<0|1>`.
+fn veil_reduce_boot() {
+    let mut wb = [0u8; crate::prefs::WHO_BUF];
+    if crate::prefs::user_name_in(&mut wb).is_some() {
+        return;
+    }
+    let moved = crate::video::crystal::login_reduce_load();
+    serial_println!("[veil] login reduce_transparency={} a={} via=machine moved={}", crate::video::crystal::login_reduce() as u8, crate::video::crystal::veil::Look::login().a, moved);
 }
