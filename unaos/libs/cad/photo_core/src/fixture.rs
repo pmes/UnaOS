@@ -413,3 +413,29 @@ pub fn shim_on_line_png(s: &Spec) -> Vec<u8> {
     let img = render_shim_on_line(s);
     pixel_core::png::encode::encode_rgba(img.width, img.height, &img.rgba).unwrap_or_default()
 }
+
+// ---- VUGPHOTOSIDETHINEDGE (SR662): the plate with the shim on a lattice line alongside its top edge (named tail block) ----
+/// The lattice line the edge shim lies on (paper y, mm): on [`Spec::good`] the plate's top side runs paper y 53.69 to 54.74
+/// (the R10 corner's tangency at paper x ~72.75) under it, the gap closing at the plate's 1.5° turn.
+pub const SHIM_EDGE_Y: f64 = 55.0;
+/// The edge shim's free tip (paper x, mm): its centre line 4.1 px from the plate there, inside the tone tell's skip zone.
+pub const SHIM_EDGE_TIP: f64 = 63.0;
+/// The edge shim's length (mm): paper x 63 to 73, its far end at the corner's tangency (0.01 mm off the plate's top side).
+pub const SHIM_EDGE_L: f64 = 10.0;
+
+/// Whether a PAPER point is in the edge shim: y in SHIM_EDGE_Y ± SHIM_W / 2 (the 0.4 mm ink line under it), x in
+/// [SHIM_EDGE_TIP, SHIM_EDGE_TIP + SHIM_EDGE_L] (its far end meeting the plate's top side, its whole length within 0.27 mm of it).
+pub fn in_shim_on_edge(p: Vec2) -> bool {
+    (p.y - SHIM_EDGE_Y).abs() <= SHIM_W * 0.5 && p.x >= SHIM_EDGE_TIP && p.x <= SHIM_EDGE_TIP + SHIM_EDGE_L
+}
+
+/// Render the plate with the edge shim.
+pub fn render_shim_on_edge(s: &Spec) -> Image {
+    render_shape(s, &|q: Vec2| in_part(q) || in_shim_on_edge(part_to_paper(s, q)))
+}
+
+/// The edge shim photo as PNG bytes (pixel_core's encoder).
+pub fn shim_on_edge_png(s: &Spec) -> Vec<u8> {
+    let img = render_shim_on_edge(s);
+    pixel_core::png::encode::encode_rgba(img.width, img.height, &img.rgba).unwrap_or_default()
+}
