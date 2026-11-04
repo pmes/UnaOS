@@ -5525,7 +5525,7 @@ fn composite_inner() -> CursorTail {
         // `panel_snapshot`'s own note says mixing the two makes both unreadable.
         match super::panel_snapshot() {
             Some(fb) => {
-                if fb.is_ready() && drain_deferred(&fb) {
+                if fb.is_ready() && drain_shimtimed(&fb) {
                     disturbed = true;
                 }
             }
@@ -33663,4 +33663,20 @@ fn veil_rebuild_run() {
     {
         crate::video::wallpaper::veil_login_svc();
     }
+}
+
+// ── SHIMPAN-ARM (F39HIDPHASELOCK, rmbp-ledger B1142) — TAIL-APPENDED: `composite_inner`'s drain, timed for the shimmer pan ──
+// `composite_inner`'s erase drain calls this in place of `drain_deferred` (same argument, same answer). On aarch64 with
+// the desktop and the live seat it is bracketed by `desktop::shim_drain_open` / `shim_drain_close` (desktop.rs tail),
+// which time only a drain of a new shimmer tick's boxes: the per-px cost B1137's pan reads off x86. Elsewhere it is the
+// plain call (`shadow_track`'s two-arm shape), so x86 and the knob-off images keep their drain.
+#[cfg(all(target_arch = "aarch64", feature = "desktop_firmware", feature = "facet"))]
+fn drain_shimtimed(fb: &super::FrameBuffer) -> bool {
+    let t0 = desktop::shim_drain_open();
+    desktop::shim_drain_close(t0, drain_deferred(fb))
+}
+#[cfg(not(all(target_arch = "aarch64", feature = "desktop_firmware", feature = "facet")))]
+#[inline(always)]
+fn drain_shimtimed(fb: &super::FrameBuffer) -> bool {
+    drain_deferred(fb)
 }

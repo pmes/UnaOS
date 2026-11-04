@@ -2847,10 +2847,10 @@ pub fn starfield_selftest() {
     let ok = gen_ms <= 400 && sc.stars > 0 && lens_ok && sc.streams > 0 && gem_ok && beam_ok && runs == 0 && shim_ok && lit == 0;
     let lf = |i: usize| if lens_txt[i].0 { "ok" } else { "FAIL" };
     serial_println!(
-        ":: STARFIELD: detail surface={}x{} glints={} groups={} zircon_box={},{},{},{} front={} beam_land={},{} lens={}({},{}) lens={}({},{}) lens={}({},{}) covered_changed={} changed={} boxes={} shimmer_max_us={} black_runs={} literals={} ::",
+        ":: STARFIELD: detail surface={}x{} glints={} groups={} zircon_box={},{},{},{} front={} beam_land={},{} lens={}({},{}) lens={}({},{}) lens={}({},{}) covered_changed={} changed={} boxes={} shimmer_max_us={} black_runs={} literals={} panned={} ::",
         pw, ph, nglint, sc.shimmer.groups.len(), gx, gy, gw, gh, sc.front, bx, land,
         lf(0), lens_txt[0].1, lens_txt[0].2, lf(1), lens_txt[1].1, lens_txt[1].2, lf(2), lens_txt[2].1, lens_txt[2].2,
-        covered, changed, boxes, worst, runs, lit
+        covered, changed, boxes, worst, runs, lit, shim_panned()
     );
     serial_println!(
         ":: STARFIELD: gen_ms={} stars={} lensed={} streams={} zircon={}(facets={}) beam={} shimmer_us={} -> {} ::",
@@ -4045,10 +4045,16 @@ fn shim_pan_rate() -> Option<(u64, u64)> {
     Some(((pres - tick).saturating_mul(1000) / px, tick))
 }
 
-/// SHIMBEAMPAN (B1137): no drain-cost record off x86 (owed SHIMPAN-ARM): the fixed band stays.
+/// SHIMBEAMPAN (B1137) off x86, SHIMPAN-ARM (B1142): `(ns per px, base us)` from the last drain `composite_inner` timed
+/// after a tick (`wm::drain_shimtimed` -> [`shim_drain_close`], file tail), or `None` before one: the fixed band stays.
 #[cfg(all(not(target_arch = "x86_64"), feature = "facet"))]
 fn shim_pan_rate() -> Option<(u64, u64)> {
-    None
+    let px = SHIM_TICK_PX.load(Ordering::Relaxed);
+    let drain = SHIM_DRAIN_US.load(Ordering::Relaxed);
+    if px == 0 || drain == 0 {
+        return None;
+    }
+    Some((drain.saturating_mul(1000) / px, SHIM_TICK_US.load(Ordering::Relaxed)))
 }
 
 /// SHIMBEAMPAN (B1137): two row bands as four 16-bit words. Pure.
@@ -4121,8 +4127,61 @@ fn shim_pan_disarm() {
     SHIM_PAN_TID.store(0, Ordering::Relaxed);
 }
 
-/// SHIMBEAMPAN (B1137): `panned=` — rows the pan kept that the fixed 200 us band would have dropped, since boot.
-#[cfg(all(target_arch = "x86_64", feature = "facet"))]
+/// SHIMBEAMPAN (B1137): `panned=` — rows the pan kept that the fixed 200 us band would have dropped, since boot. Every
+/// arch since SHIMPAN-ARM (B1142): `:: STARFIELD: detail` reads it too.
+#[cfg(feature = "facet")]
 fn shim_panned() -> u64 {
     SHIM_PANNED.load(Ordering::Relaxed)
+}
+
+// ── SHIMPAN-ARM (F39HIDPHASELOCK, rmbp-ledger B1142) — TAIL-APPENDED: the pan arms off x86 from the drain's own cost ──
+//
+// B1137's rate came from the x86 idle seat's drain present (`SHIM_PRESENT_US`); aarch64 has no idle seat and no drain
+// present, so its live seat kept the fixed band. On aarch64 the live tick runs in `composite_inner`'s `shadow_track`, and
+// the SAME pass's `drain_deferred` paints its boxes next (`shimmer_live` ticks only on an empty erase queue, so that
+// drain holds the tick's boxes). On the Orin the drain is CPU writes into the scanned-out DRAM carveout plus the clean,
+// a real per-px cost. `wm::drain_shimtimed` (wm.rs tail; aarch64 + desktop_firmware + facet, a passthrough elsewhere)
+// brackets that call with [`shim_drain_open`] / [`shim_drain_close`]; only a drain after a NEW tick is timed (the
+// tick count moved since the last open), so `SHIM_DRAIN_US` / `SHIM_TICK_PX` is one tick's ns per px, the pair
+// `shim_pan_rate`'s aarch64 arm reads. The clock is `now_cycles` (CNTFRQ), not the ms tick `now_ns` falls back to off
+// x86. Writers: the composite pass holder (one pass at a time under `COMP_GATE`), relaxed. With no raster source
+// (`beam` off, or a beam that did not lock) `busy_rows` answers `None` and nothing pans: the fixed band is absent too.
+// `panned=` is printed on `:: STARFIELD: detail` (every arch; SHIMMERIDLE is x86-only).
+
+/// SHIMPAN-ARM (B1142): the last timed drain's cost (us) and the tick count the last open saw.
+#[cfg(all(not(target_arch = "x86_64"), feature = "facet"))]
+static SHIM_DRAIN_US: AtomicU64 = AtomicU64::new(0);
+#[cfg(all(not(target_arch = "x86_64"), feature = "facet"))]
+static SHIM_DRAIN_SEEN: AtomicU32 = AtomicU32::new(0);
+
+/// SHIMPAN-ARM (B1142), `wm::drain_shimtimed` before `drain_deferred`: the open stamp (cycles) when a new tick's boxes
+/// are queued to drain, else 0 (nothing to time; an empty queue leaves the tick for the next drain).
+#[cfg(all(not(target_arch = "x86_64"), feature = "facet"))]
+pub(super) fn shim_drain_open() -> u64 {
+    if super::DEFER_N.load(Ordering::Relaxed) == 0 {
+        return 0;
+    }
+    let t = SHIM_TICKS.load(Ordering::Relaxed);
+    if SHIM_DRAIN_SEEN.swap(t, Ordering::Relaxed) == t {
+        return 0;
+    }
+    crate::arch::now_cycles().max(1)
+}
+
+/// SHIMPAN-ARM (B1142), `wm::drain_shimtimed` after `drain_deferred`: store the timed drain's us when `t0` opened one;
+/// hand `drain_deferred`'s answer (the sprite owes a repaint) back unchanged.
+#[cfg(all(not(target_arch = "x86_64"), feature = "facet"))]
+pub(super) fn shim_drain_close(t0: u64, sprite: bool) -> bool {
+    if t0 != 0 {
+        let us = crate::video::blitter::cycles_to_us(crate::arch::now_cycles().saturating_sub(t0));
+        SHIM_DRAIN_US.store(us.max(1), Ordering::Relaxed);
+    }
+    sprite
+}
+
+/// Off-facet [`shim_panned`]: no live seat, nothing panned.
+#[cfg(not(feature = "facet"))]
+#[inline(always)]
+fn shim_panned() -> u64 {
+    0
 }

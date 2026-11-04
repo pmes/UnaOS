@@ -1781,8 +1781,8 @@ fn render_kat() -> Option<bool> {
 // ── F39SHIMBEAMPAN (rmbp-ledger B1137) — HID-PASS-PHASE: the pass's longest phase on a PASS-LONG minute. FILE-TAIL append. ─
 // B1118/B1124: a PASS-LONG `[hid] gap split` said the previous pass was long but not where inside it. The pass is now
 // stamped at its phase boundaries by [`phase_mark`]: each mark charges the time since the previous one to its phase. x86
-// (`ehci::service_ehci_hid`): `svc` at `Controller::service`'s tail before its hub change (the lock and the i8042/touchpad
-// pumps included; owed HID-PHASE-LOCK), `hub` after `c.service()`, `isr` after `isr_rollup`, and [`pass_done`] charges the
+// (`ehci::service_ehci_hid`): `lock` after the EHCI_HID take, `ps2` after the i8042/touchpad pumps (F39HIDPHASELOCK
+// B1142), `svc` at `Controller::service`'s tail before its hub change, `hub` after `c.service()`, `isr` after `isr_rollup`, and [`pass_done`] charges the
 // remainder to `bt` (the bt block). aarch64 (`pump_usb_into_gui`, main.rs): `poll` after `poll_events`, `svc` after the
 // six services, and the remainder to `fwd` (the GUI forward). A mark is a no-op unless [`pass_begin`] opened the pass, so
 // an unbracketed `service_ehci_hid` (the usb-pump's, before the hid-pump owns it) writes nothing. ONE writer, relaxed.
@@ -1790,15 +1790,18 @@ fn render_kat() -> Option<bool> {
 // made them (the gap's `pass` IS that pass), as they keep their split. The gap split prints ` phase=<name>:<ms>` only
 // on PASS-LONG; `:: HIDGAPSPLIT:` adds `phase_ok=` (pure cases) and `boot_phase=<name>:<ms>|-`. No new line.
 
-/// F39SHIMBEAMPAN (B1137): the phase indices [`phase_mark`] takes (x86: svc/hub/isr/bt; aarch64: poll/svc/fwd).
+/// F39SHIMBEAMPAN (B1137): the phase indices [`phase_mark`] takes (x86: lock/ps2/svc/hub/isr/bt; aarch64: poll/svc/fwd).
 pub const PH_SVC: usize = 0;
 pub const PH_HUB: usize = 1;
 pub const PH_ISR: usize = 2;
 pub const PH_BT: usize = 3;
 pub const PH_POLL: usize = 4;
 pub const PH_FWD: usize = 5;
-const PH_N: usize = 6;
-const PH_NAMES: [&str; PH_N] = ["svc", "hub", "isr", "bt", "poll", "fwd"];
+/// F39HIDPHASELOCK (B1142): x86's EHCI_HID wait and its i8042 / touchpad pumps, split out of `svc` (see below).
+pub const PH_LOCK: usize = 6;
+pub const PH_PS2: usize = 7;
+const PH_N: usize = 8;
+const PH_NAMES: [&str; PH_N] = ["svc", "hub", "isr", "bt", "poll", "fwd", "lock", "ps2"];
 /// The phase [`pass_done`] charges the pass's remainder to.
 #[cfg(target_arch = "x86_64")]
 const PH_TAIL: usize = PH_BT;
@@ -1906,12 +1909,24 @@ impl core::fmt::Display for PhaseWord {
 
 /// `:: HIDGAPSPLIT:`'s `phase_ok=`: the longest-phase pick, its tie rule, the empty pass and the pack on synthetic cases. Pure.
 fn phase_kat() -> bool {
-    let tie = phase_longest(&[3_000, 278_400, 0, 278_400, 0, 0]);
+    let tie = phase_longest(&[3_000, 278_400, 0, 278_400, 0, 0, 0, 0]);
     let empty = phase_longest(&[0; PH_N]);
-    let fwd = phase_longest(&[0, 0, 0, 0, 900, 4_200]);
+    let fwd = phase_longest(&[0, 0, 0, 0, 900, 4_200, 0, 0]);
+    let lock = phase_longest(&[2_000, 0, 0, 0, 0, 0, 9_100, 400]); // F39HIDPHASELOCK (B1142): the EHCI_HID wait names the pass
+    let ps2 = phase_longest(&[2_000, 0, 0, 0, 0, 0, 400, 5_900]); // F39HIDPHASELOCK (B1142): the i8042/touchpad pumps name it
     phase_unpack(tie) == Some(("hub", 278))
         && empty == 0
         && phase_unpack(empty).is_none()
         && phase_unpack(fwd) == Some(("fwd", 4))
-        && phase_unpack(7u64 << 32).is_none()
+        && phase_unpack(lock) == Some(("lock", 9))
+        && phase_unpack(ps2) == Some(("ps2", 5))
+        && phase_unpack(9u64 << 32).is_none()
 }
+
+// ── F39HIDPHASELOCK (rmbp-ledger B1142) — HID-PHASE-LOCK: x86's `svc` split into the lock wait and the ps2 pumps. ──
+// B1137's `svc` ran from `pass_begin` to `Controller::service`'s tail, so it held the `EHCI_HID` spin wait and the
+// i8042 / I2C-HID touchpad pumps beside the controller service. `ehci::service_ehci_hid`'s take line now marks `lock`
+// right after `EHCI_HID.lock()` (only atomic stamps run between `pass_begin` and the take, so `lock` is the wait) and
+// `ps2` right after `dwi2c::touchpad::pump()` (`pointerfeel::note_pass` + the two pumps); `svc` is then the controller
+// service alone. Two more names, [`PH_LOCK`] / [`PH_PS2`], in B1137's block above; [`phase_longest`] is unchanged.
+// aarch64 marks neither. Who held the lock is owed (HID-LOCK-WHO) until a flight reads `phase=lock`.
