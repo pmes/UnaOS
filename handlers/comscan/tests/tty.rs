@@ -1434,6 +1434,18 @@ fn words_in(out: &[PumpEvent]) -> Vec<String> {
         .collect()
 }
 
+// --- VUGCOMSCANMACHINEDECLARE (SR613): the machine declared on the bus bounds the jog, from the start and after link-up ---
+
+/// The Squawk words in `out`, in order.
+fn words_in(out: &[PumpEvent]) -> Vec<String> {
+    out.iter()
+        .filter_map(|s| match s {
+            PumpEvent::Squawk { event: Some(e), .. } => Some(e.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
 #[test]
 fn a_jog_with_no_position_report_is_bounded_by_its_distance_and_says_so_once() {
     let (m, path, _s) = pty();
@@ -1472,4 +1484,99 @@ fn a_jog_with_no_position_report_is_bounded_by_its_distance_and_says_so_once() {
         "{lines:?}"
     );
     assert!(rt.contains(&b'?'), "the desk asked the position and was never answered: {rt:?}");
+}
+
+/// The `$J=` lines the fake recorded.
+fn jogs_of(lines: &[String]) -> Vec<String> {
+    lines.iter().filter(|l| l.starts_with("$J=")).cloned().collect()
+}
+
+#[test]
+fn a_declared_x_travel_bounds_the_jog_from_the_start() {
+    let (m, path, _s) = pty();
+    let fake = fake_grbl_alarm(m, usize::MAX);
+    let who = || Origin::LocalUser("una".to_string());
+    let p = program();
+    let mut desk = PumpDesk::new(machine());
+    let before = Verdict::Pass { digest: p.digest(), machine: machine().digest() };
+    desk.arm(&before, &p, GRBL).expect("armed for the machine before the declare");
+    let mut open = opener(Baud::B115200, Flow::None);
+
+    // The text form to the one bus request; the declare rewrites the desk's machine and drops the arming its pass named.
+    let declare = comscan::pump::declare_request("machine declare mill x=120 y=300 z=100 dialect=grbl", who()).expect("the text form parses");
+    assert_eq!(
+        words_in(&desk.apply(&declare, &mut *open)),
+        ["machine declared mill x=120 y=300 z=100 dialect=grbl", "armed dropped: 1 (passed for the machine before)"]
+    );
+    assert_eq!(desk.declared(), Some(("mill", Some(GRBL))));
+    assert!(desk.armed().is_empty(), "the arming for the machine before is gone");
+    assert!(
+        matches!(desk.arm(&before, &p, GRBL), Err(comscan::pump::Refused::WrongMachine { .. })),
+        "a pass naming the machine before no longer arms"
+    );
+    let pass = Verdict::Pass { digest: p.digest(), machine: desk.machine().digest() };
+    let digest = desk.arm(&pass, &p, GRBL).expect("armed by a pass naming the declared machine");
+
+    // The start road reads the declared dialect first.
+    let start = |dialect: &str| PumpEvent::PumpStart {
+        principal: who(),
+        program: digest_hex(digest),
+        dialect: dialect.to_string(),
+        port: path.to_str().unwrap().to_string(),
+    };
+    assert_eq!(refused_in(&desk.apply(&start("marlin"), &mut *open)), "dialect mismatch: the declared machine mill speaks grbl, asked marlin");
+    assert_eq!(said_in(&desk.apply(&start("grbl"), &mut *open)), "started");
+    let t0 = Instant::now();
+    let mut words = Vec::new();
+    assert_eq!(drive_until(&mut desk, &mut *open, t0, &mut words, |e| e == "done"), "done");
+
+    // The declared X travel is 120: X150 refused before the wire, X100 goes out.
+    let jog = |dx: f64| PumpEvent::PumpJog { principal: who(), dx, dy: 0.0, dz: 0.0, feed: 300.0 };
+    assert_eq!(
+        refused_in(&desk.apply(&jog(150.0), &mut *open)),
+        "jog: X150 is past the declared X travel 120 (the position is not polled outside a job: the jog's delta is bounded)"
+    );
+    assert_eq!(said_in(&desk.apply(&jog(100.0), &mut *open)), "jog sent: $J=G91 X100 Y0 Z0 F300");
+    assert_eq!(drive_until(&mut desk, &mut *open, t0, &mut words, |e| e.starts_with("jog ")), "jog ok", "{words:?}");
+    let home = PumpEvent::PumpHome { principal: who() };
+    assert_eq!(said_in(&desk.apply(&home, &mut *open)), "home sent: $H");
+    assert_eq!(drive_until(&mut desk, &mut *open, t0, &mut words, |e| e.starts_with("home")), "home ok", "{words:?}");
+    drop(desk);
+    drop(open);
+    let (lines, _rt, _m) = fake.join().unwrap();
+    assert_eq!(jogs_of(&lines), ["$J=G91 X100 Y0 Z0 F300"], "the refused X150 never reached the wire: {lines:?}");
+}
+
+#[test]
+fn a_declare_after_link_up_rebounds_the_next_jog_without_a_relink() {
+    let (m, path, _s) = pty();
+    let fake = fake_grbl_alarm(m, usize::MAX);
+    let (mut desk, mut open) = started_desk(&path);
+    let who = || Origin::LocalUser("una".to_string());
+    let t0 = Instant::now();
+    let mut words = Vec::new();
+    assert_eq!(drive_until(&mut desk, &mut *open, t0, &mut words, |e| e == "done"), "done");
+
+    // Against the machine at new (X -50..300, travel 350) X150 goes out.
+    let jog = |dx: f64| PumpEvent::PumpJog { principal: who(), dx, dy: 0.0, dz: 0.0, feed: 300.0 };
+    assert_eq!(said_in(&desk.apply(&jog(150.0), &mut *open)), "jog sent: $J=G91 X150 Y0 Z0 F300");
+    assert_eq!(drive_until(&mut desk, &mut *open, t0, &mut words, |e| e.starts_with("jog ")), "jog ok", "{words:?}");
+
+    // A declare on the live link: the next jog is bounded by the declared 120, on the same link.
+    let declare = PumpEvent::PumpDeclare { principal: who(), name: "mill".to_string(), x: 120.0, y: 300.0, z: 100.0, dialect: None };
+    assert_eq!(said_in(&desk.apply(&declare, &mut *open)), "machine declared mill x=120 y=300 z=100");
+    assert_eq!(
+        refused_in(&desk.apply(&jog(150.0), &mut *open)),
+        "jog: X150 is past the declared X travel 120 (the position is not polled outside a job: the jog's delta is bounded)"
+    );
+    assert_eq!(said_in(&desk.apply(&jog(100.0), &mut *open)), "jog sent: $J=G91 X100 Y0 Z0 F300");
+    assert_eq!(drive_until(&mut desk, &mut *open, t0, &mut words, |e| e.starts_with("jog ")), "jog ok", "{words:?}");
+    let home = PumpEvent::PumpHome { principal: who() };
+    assert_eq!(said_in(&desk.apply(&home, &mut *open)), "home sent: $H");
+    assert_eq!(drive_until(&mut desk, &mut *open, t0, &mut words, |e| e.starts_with("home")), "home ok", "{words:?}");
+    assert!(!words.iter().any(|w| w.starts_with("relinked") || w.starts_with("link lost")), "no relink: {words:?}");
+    drop(desk);
+    drop(open);
+    let (lines, _rt, _m) = fake.join().unwrap();
+    assert_eq!(jogs_of(&lines), ["$J=G91 X150 Y0 Z0 F300", "$J=G91 X100 Y0 Z0 F300"], "the second X150 never reached the wire: {lines:?}");
 }
