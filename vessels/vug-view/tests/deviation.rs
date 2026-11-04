@@ -1836,3 +1836,117 @@ fn a_near_square_box_opens_on_the_sym_road() {
     assert!(lines.contains(&format!("align=coarse+fine rms={rms:.3}")), "{lines:?}");
     assert!(map.on, "the map opens on");
 }
+
+// ---- VUGSCANCOARSESYMPIVOT (LEDGER SR642): the scan's own unique axis takes the design's pivot ----
+// The bench's post r40 h150 with four pins r10 h40 at radius 75 (C4: the design's lateral moments equal, so its pivot
+// is the LARGEST axis, the post's; a bare cylinder's spin is unconstrained in `align`) on a 360 x 310 ground (modelled
+// 66% of the scan): the scan's unique axis is its SMALLEST, the ground normal, so SR636's same-index pairing laid the
+// post on the ground's long axis (modelled every kept start 90° off, the road refused). scan_core `partner` picks the
+// scan's own unique end and the sweep about the post's axis opens `align=coarse+fine` at the identity road's pose,
+// compared modulo the pins' four 90° turns.
+
+/// The post and its four pins, one sketch each, built to the scene's dimensions.
+const PIVOT_DOC: &str = r#"vug-doc version=1 lin=1e-6 ang=1e-9
+sketch s1 o=[0 0 0] z=[0 0 1] x=[1 0 0]
+point c1 sketch=s1 x=0 y=0
+circle k1 sketch=s1 centre=c1 r=40
+fix g1 sketch=s1 p=c1 at=[0 0]
+radius r1 sketch=s1 circle=k1 r=40
+extrude post sketch=s1 outer=k1 dir=[0 0 1] length=150
+sketch s2 o=[0 0 0] z=[0 0 1] x=[1 0 0]
+point c2 sketch=s2 x=75 y=0
+circle k2 sketch=s2 centre=c2 r=10
+fix g2 sketch=s2 p=c2 at=[75 0]
+radius r2 sketch=s2 circle=k2 r=10
+extrude pin1 sketch=s2 outer=k2 dir=[0 0 1] length=40
+sketch s3 o=[0 0 0] z=[0 0 1] x=[1 0 0]
+point c3 sketch=s3 x=0 y=75
+circle k3 sketch=s3 centre=c3 r=10
+fix g3 sketch=s3 p=c3 at=[0 75]
+radius r3 sketch=s3 circle=k3 r=10
+extrude pin2 sketch=s3 outer=k3 dir=[0 0 1] length=40
+sketch s4 o=[0 0 0] z=[0 0 1] x=[1 0 0]
+point c4 sketch=s4 x=-75 y=0
+circle k4 sketch=s4 centre=c4 r=10
+fix g4 sketch=s4 p=c4 at=[-75 0]
+radius r4 sketch=s4 circle=k4 r=10
+extrude pin3 sketch=s4 outer=k4 dir=[0 0 1] length=40
+sketch s5 o=[0 0 0] z=[0 0 1] x=[1 0 0]
+point c5 sketch=s5 x=0 y=-75
+circle k5 sketch=s5 centre=c5 r=10
+fix g5 sketch=s5 p=c5 at=[0 -75]
+radius r5 sketch=s5 circle=k5 r=10
+extrude pin4 sketch=s5 outer=k5 dir=[0 0 1] length=40
+"#;
+
+/// The post's orbit scan (12 frames at 600 mm, 40° up, D435i noise), fused once in the design's world.
+fn pivot_scan() -> &'static ScanMesh {
+    static S: OnceLock<ScanMesh> = OnceLock::new();
+    S.get_or_init(|| {
+        let cyl = |x: f64, y: f64, radius: f64, height: f64| fixture::CylPrim { base: Vec3::new(x, y, 0.0), radius, height };
+        let scene = Scene {
+            ground_centre: Vec3::ZERO,
+            ground: [180.0, 155.0],
+            boxes: Vec::new(),
+            cylinders: vec![cyl(0.0, 0.0, 40.0, 150.0), cyl(75.0, 0.0, 10.0, 40.0), cyl(0.0, 75.0, 10.0, 40.0), cyl(-75.0, 0.0, 10.0, 40.0), cyl(0.0, -75.0, 10.0, 40.0)],
+        };
+        let (intr, scale) = (fixture::bench_intrinsics(), DepthScale::D400_DEFAULT);
+        let mut t = Tsdf::new(4.0, 12.0, Tol::DEFAULT).expect("volume");
+        for k in 0..12u32 {
+            let p = fixture::orbit(Vec3::new(0.0, 0.0, 75.0), 600.0, 40.0 * DEG, k as f64 * 2.0 * PI / 12.0);
+            let f = fixture::render_depth(&scene, &intr, scale, &p, &Noise::D435I, k as u64);
+            t.integrate(&f, scale, &intr, &p).expect("frame integrates");
+        }
+        extract(&t).expect("surface")
+    })
+}
+
+#[test]
+fn a_post_on_its_ground_pivots_on_the_scan_s_own_axis() {
+    let doc = doc_core::read(PIVOT_DOC).expect("the document reads");
+    let p = known_pose();
+    let moved = fragment(pivot_scan(), |_| true, p);
+    let up = Vec3::new(0.0, 0.0, 1.0);
+    let axis_deg = |t: Transform, u: Vec3| t.apply_vector(up).dot(u).clamp(-1.0, 1.0).acos() / DEG;
+
+    // The partner: the sweep about the post's axis (the design's largest, index 0) puts it on the scan's ground normal.
+    let (_, home) = vug_view::deviation::open(pivot_scan(), &doc, BAND_MM, vug_view::deviation::GDT_MARGIN_MM).expect("the design builds");
+    let h = home.result.as_ref().expect("the scan aligns from the identity");
+    let (_, design) = &*home.basis;
+    let ap = scan_core::AlignParams::DEFAULT;
+    let bvh = mesh_core::bvh::Bvh::build(&design.mesh);
+    let starts = scan_core::deviation::coarse_view(&moved, design, &bvh, &ap, Tol::DEFAULT, scan_core::deviation::Sweep::About(0)).expect("the pivot sweep");
+    let first = axis_deg(starts[0].0.compose(p), up);
+    println!("coarsesympivot: sweep-start axis_deg={first:.2} score={:.3}", starts[0].1);
+    assert!(first < 15.0, "the sweep's best start carries the post's axis onto the ground normal: {first}");
+
+    // The road: coarse + fine lands on the identity road's pose, modulo the pins' four 90° turns about the post.
+    let (_, map) = vug_view::deviation::open_coarse(&moved, &doc, BAND_MM, vug_view::deviation::GDT_MARGIN_MM).expect("the design builds");
+    let lines = corner(&map);
+    println!("{}", lines.join("\n"));
+    let rms = match map.road {
+        scan_core::deviation::Road::CoarseFine { rms_mm } => rms_mm,
+        other => panic!("expected the sym road kept, got {other:?} ({:?})", map.result.as_ref().err()),
+    };
+    let d = map.result.as_ref().expect("the sym road aligns the post");
+    let back = d.aligned.pose.compose(p);
+    let axis = axis_deg(back, h.aligned.pose.apply_vector(up));
+    let (err_deg, err_mm) = (0..4)
+        .map(|k| {
+            let (s, c) = (k as f64 * PI / 2.0).sin_cos();
+            let turn = fixture::from_axes(Vec3::new(c, s, 0.0), Vec3::new(-s, c, 0.0), up, Vec3::ZERO).compose(h.aligned.pose);
+            let deg = 2.0 * back.rot.dot(turn.rot).abs().min(1.0).acos() / DEG;
+            let mm = [Vec3::ZERO, Vec3::new(0.0, 0.0, 150.0), Vec3::new(75.0, 0.0, 40.0)]
+                .iter()
+                .map(|&x| (back.apply_point(x) - turn.apply_point(x)).mag())
+                .fold(0.0, f64::max);
+            (deg, mm)
+        })
+        .fold((f64::INFINITY, f64::INFINITY), |a, b| if b.0 < a.0 { b } else { a });
+    println!("coarsesympivot: road=CoarseFine rms={rms:.3} aligned={:.3} stats_rms={:.3} axis_deg={axis:.4} err_deg={err_deg:.4} err_mm={err_mm:.4}", d.aligned.rms_mm, d.stats.rms_mm);
+    assert!(rms <= ap.gate(2), "the floor: {rms}");
+    assert!(d.aligned.rms_mm < 1.0 && d.stats.rms_mm < 1.0, "the SR510 floor: aligned {} stats {}", d.aligned.rms_mm, d.stats.rms_mm);
+    assert!(axis < 1.0 && err_deg < 1.0 && err_mm < 2.0, "pose error: axis {axis} deg, {err_deg} deg {err_mm} mm modulo C4");
+    assert!(lines.contains(&format!("align=coarse+fine rms={rms:.3}")), "{lines:?}");
+    assert!(map.on, "the map opens on");
+}
