@@ -1148,7 +1148,7 @@ type Split = (Vec<doc_core::Failure>, Vec<doc_core::Failure>);
 /// deviation.rs `split_faults`'s (solid half, carried) with the solid half moved into the carried (re-sorted by line)
 /// when it is ONE root NoProfile / NoSuchEdge / AmbiguousEdge with an id and only `Upstream` failures chained from it
 /// in line order; anything else unchanged (the caller refuses on the solid half's first).
-fn hold((on_solid, mut carried): Split) -> Split {
+pub(crate) fn hold((on_solid, mut carried): Split) -> Split { // VUGFACEDEVIATIONHELD (SR600): the deviation map's road (deviation.rs `held_split`)
     let held = {
         let mut roots = on_solid.iter().filter(|f| !matches!(f.fault, Fault::Upstream(_)));
         match (roots.next(), roots.next()) {
