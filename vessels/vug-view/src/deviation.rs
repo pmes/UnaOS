@@ -935,6 +935,9 @@ pub struct Entry {
     pub refused: Option<String>,
     /// VUGFACECOMMANDCARET (SR587): the caret, in chars of `text` (sketch.rs `type_text_at` / `caret_key`).
     pub caret: usize,
+    /// VUGFACEPHOTOPREFLINE (SR595): the store folder a photo line writes (photo.rs `line_command`); None is
+    /// Principia's standard store (`photo::command`), a test sets its own folder.
+    pub store: Option<std::path::PathBuf>,
 }
 
 impl Viewer {
@@ -974,7 +977,7 @@ impl Viewer {
             }
             if matches!(k, "Return" | "KP_Enter" | "\r" | "\n") {
                 let line = self.view.entry.text.clone();
-                match self.map_command(&line) {
+                match crate::photo::line_command(&mut self.view, &line).unwrap_or_else(|| self.map_command(&line)) { // VUGFACEPHOTOPREFLINE (SR595): a photo's line runs the photo's command road, the rest the map's
                     Ok(_) => {
                         let e = &mut self.view.entry;
                         e.last = Some(line);
@@ -1013,7 +1016,7 @@ impl Viewer {
             }
             return Some(typed);
         }
-        let free = (self.view.deviation.is_some() || self.view.sheet.is_some()) && self.view.design.face.is_none() && !crate::journal::busy(&self.view.design) && self.view.fillet.is_none(); // VUGFACESAVEASCARET (SR593): a sheet with no map opens the line too
+        let free = (self.view.deviation.is_some() || self.view.sheet.is_some()) && self.view.design.face.is_none() && !crate::journal::busy(&self.view.design) && self.view.fillet.is_none() || crate::photo::line_free(&self.view); // VUGFACESAVEASCARET (SR593): a sheet with no map opens the line too // VUGFACEPHOTOPREFLINE (SR595): `:` opens over a photo too (its sketch face is open)
         if k == ":" && free {
             let e = &mut self.view.entry;
             e.open = true;

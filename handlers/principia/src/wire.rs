@@ -117,3 +117,61 @@ mod tests {
         assert_eq!(on_disk, kern.0, "the folder is the reference tree");
     }
 }
+
+// ---- VUGFACEPHOTOPREFLINE (SR595): the host UNSET arm (named tail block) ----
+// PREFSUNSET (SR169) froze the PREF_CHANGED unset form (`prefs_core::wire::unset_body`) and VUGPHOTOPREFFACEWIRE (SR588)
+// gave the host store `PrefStore::unset`, but no Principia request unset a key and posted the form. This is that arm
+// on the byte seam, in the SET arm's shape (prefs_core `fulfil_as`); the typed Synapse arm (PRINCIPIA-UNSET-SYNAPSE)
+// and an una-abi request verb (PREFS-UNSET-VERB) are owed.
+
+/// Unset one key: request body `<ns>.<key>` (the GET address form, [`prefs_core::wire::parse_get`]), the refusals in
+/// SET's order: -EINVAL malformed; -EACCES outside the session or past [`prefs_core::cap::may_set`] for the trusted
+/// caller ([`fulfil`]'s); then [`PrefStore::unset`]: `(0, unset_body)` when a value left the store (the PREF_CHANGED
+/// (19) body the transport posts), `(-ENOENT, [])` when it was unset already (nothing written), `(-EIO, [])` on a held
+/// domain or a failed write (the store rolled back).
+pub fn unset(store: &mut PrefStore, body: &[u8], in_session: bool) -> (i64, Vec<u8>) {
+    use prefs_core::wire::{Caller, EACCES, EINVAL, EIO, ENOENT};
+    let Some((ns, k)) = prefs_core::wire::parse_get(body) else { return (EINVAL, Vec::new()) };
+    if !in_session || !prefs_core::cap::may_set(Caller::Kernel, ns, k) {
+        return (EACCES, Vec::new());
+    }
+    match PrefStore::unset(store, ns, k) {
+        Ok(true) => (0, prefs_core::wire::unset_body(ns, k)),
+        Ok(false) => (ENOENT, Vec::new()),
+        Err(e) => {
+            log::warn!("[PRINCIPIA] :: wire unset {ns}.{k} failed: {e:#}");
+            (EIO, Vec::new())
+        }
+    }
+}
+
+#[cfg(test)]
+mod unset_tests {
+    use super::*;
+    use prefs_core::wire::{EACCES, EINVAL, ENOENT, VERB_SET};
+
+    /// VUGFACEPHOTOPREFLINE (SR595): `vug.photo.camera_mm` set through the SET verb, then the unset request answers 0
+    /// with SR169's frozen unset form (`vug.photo.camera_mm` NUL, which `parse_changed` reads as no value), the store
+    /// and a reload read it unset; a second unset is -ENOENT, outside the session -EACCES, a bare namespace -EINVAL.
+    #[test]
+    fn an_unset_request_posts_the_unset_body_and_the_store_reads_unset() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(prefs_core::files::DIR);
+        let mut store = PrefStore::load(&path).unwrap();
+        assert_eq!(fulfil(&mut store, VERB_SET, b"vug.photo.camera_mm\x00400.0", true).0, 0);
+        assert!(store.get("vug", "photo.camera_mm").is_some());
+
+        assert_eq!(unset(&mut store, b"vug.photo.camera_mm", false), (EACCES, Vec::new()), "outside the session");
+        assert!(store.get("vug", "photo.camera_mm").is_some(), "a refusal touches nothing");
+        let (st, posted) = unset(&mut store, b"vug.photo.camera_mm", true);
+        assert_eq!(st, 0);
+        assert_eq!(posted, prefs_core::wire::unset_body("vug", "photo.camera_mm"));
+        assert_eq!(posted, b"vug.photo.camera_mm\x00".to_vec());
+        assert_eq!(prefs_core::wire::parse_changed(&posted), Some(("vug", "photo.camera_mm", None, false)));
+        assert_eq!(store.get("vug", "photo.camera_mm"), None);
+        assert_eq!(PrefStore::load(&path).unwrap().get("vug", "photo.camera_mm"), None, "the file no longer holds it");
+
+        assert_eq!(unset(&mut store, b"vug.photo.camera_mm", true), (ENOENT, Vec::new()), "unset already");
+        assert_eq!(unset(&mut store, b"vug", true), (EINVAL, Vec::new()), "a bare namespace");
+    }
+}
