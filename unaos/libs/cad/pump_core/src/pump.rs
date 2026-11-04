@@ -1072,3 +1072,22 @@ impl Pump {
         let _ = self.flush_rt(t);
     }
 }
+
+// --- VUGCOMSCANLINKREUSEINFLIGHT (LEDGER SR646): a restart on the held link carries the in-flight M114 / M154 answer (named tail hunk) ---
+
+impl Pump {
+    /// The arming's pump takes over the live link `from` streamed on (comscan's `PumpDesk::restarted`, SR641): what is
+    /// still on the wire for `from` is read by this pump as `from` would. `status_asked` (an `M114` whose `ok` is not yet
+    /// read: swallowed here, never a job line's), `autoreport` (an `M154` out keeps its `ok` swallowed; an `Answered`
+    /// report is not asked again, [`Pump::autoreport_hello`] arming only from `Off`, and the desk's close still turns it
+    /// off) and the partial line in `rx` (an `ok` split across two reads stays whole). Nothing unless both speak the same
+    /// dialect and this pump has not ticked.
+    pub fn inherit(&mut self, from: &Pump) {
+        if self.dialect != from.dialect || self.started {
+            return;
+        }
+        self.status_asked = from.status_asked;
+        self.autoreport = from.autoreport;
+        self.rx = from.rx.clone();
+    }
+}

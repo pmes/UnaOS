@@ -1322,3 +1322,146 @@ fn a_lost_marlin_link_writes_no_autoreport_off() {
     assert_eq!(got.iter().filter(|l| *l != "M114").last().map(String::as_str), Some("G28"), "nothing but a position poll after the loss: {got:?}");
     assert_eq!(got.iter().filter(|l| l.starts_with("M154")).collect::<Vec<_>>(), ["M154 S1"], "no M154 S0 on a lost link: {got:?}");
 }
+
+// --- VUGCOMSCANLINKREUSEINFLIGHT (SR646): a restart on the held Marlin link reads the old pump's M114 / M154 answer as the old pump would ---
+
+use std::sync::atomic::AtomicUsize;
+
+/// Wait (10 s at most) until `step` reaches `at`.
+fn step_at(step: &AtomicUsize, at: usize) {
+    let end = Instant::now() + Duration::from_secs(10);
+    while step.load(Ordering::SeqCst) < at && Instant::now() < end {
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// [`fake_marlin`] gated by the test: its first `M114` sets `step` to 1 and is answered (a position line, then `ok`) only
+/// once `step` reaches 2; the next line after it is answered only once `step` reaches 3, so between 2 and 3 the one `ok`
+/// on the wire is the M114's. Every other line is `ok` at once (a later M114 with its position line); records every line.
+fn fake_marlin_gated(l: TcpListener, step: Arc<AtomicUsize>) -> JoinHandle<Vec<String>> {
+    thread::spawn(move || {
+        let (mut s, _) = l.accept().unwrap();
+        drop(l);
+        s.write_all(b"start\r\n").unwrap();
+        let (mut got, mut cur) = (Vec::new(), Vec::<u8>::new());
+        let (mut gated, mut hold_next) = (false, false);
+        let mut buf = [0u8; 256];
+        loop {
+            let k = match s.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(k) => k,
+            };
+            for &b in &buf[..k] {
+                if b != b'\n' {
+                    cur.push(b);
+                    continue;
+                }
+                let line = String::from_utf8_lossy(&cur).trim().to_string();
+                cur.clear();
+                if line == "M114" {
+                    if !gated {
+                        gated = true;
+                        step.store(1, Ordering::SeqCst);
+                        step_at(&step, 2);
+                        hold_next = true;
+                    }
+                    let _ = s.write_all(b"X:0.00 Y:0.00 Z:0.00 E:0.00 Count X:0 Y:0 Z:0\r\n");
+                } else if hold_next {
+                    hold_next = false;
+                    step_at(&step, 3);
+                }
+                got.push(line);
+                let _ = s.write_all(b"ok\r\n");
+            }
+        }
+        got
+    })
+}
+
+/// A PumpStart for [`program`] armed again on `desk` for `m`, naming the Marlin at `port` over TCP.
+fn marlin_start_again(desk: &mut PumpDesk, m: &Machine, port: u16) -> PumpEvent {
+    let p = program();
+    let pass = Verdict::Pass { digest: p.digest(), machine: m.digest() };
+    let digest = desk.arm(&pass, &p, Dialect::Marlin).expect("armed again by a pass");
+    PumpEvent::PumpStart {
+        principal: Origin::LocalUser("una".to_string()),
+        program: digest_hex(digest),
+        dialect: "marlin".to_string(),
+        port: format!("{TCP_SCHEME}127.0.0.1:{port}"),
+    }
+}
+
+#[test]
+fn a_marlin_m114_ok_in_flight_at_a_restart_is_swallowed_not_taken_as_the_jobs() {
+    let (l, port) = listener();
+    let step = Arc::new(AtomicUsize::new(0));
+    let fake = fake_marlin_gated(l, step.clone());
+    let (mut desk, mut open, t0, mut words) = marlin_done(machine(), port);
+
+    // The idle desk asks Marlin's position; the fake holds its answer: the M114 is out and unanswered.
+    let end = Instant::now() + Duration::from_secs(10);
+    while step.load(Ordering::SeqCst) < 1 {
+        assert!(Instant::now() < end, "no M114 asked in 10 s; saw {words:?}");
+        desk.tick(t0.elapsed().as_micros() as u64);
+        thread::sleep(Duration::from_millis(2));
+    }
+
+    // The restart on the live link, the M114 still out.
+    let start = marlin_start_again(&mut desk, &machine(), port);
+    let first = squawk_words(&desk.apply(&start, &mut *open));
+    assert_eq!(first.first().map(String::as_str), Some("started (on the live link)"), "{first:?}");
+
+    // The M114's position line and `ok` arrive; the first job line's answer is held, so no job line is answered yet.
+    step.store(2, Ordering::SeqCst);
+    let (mut acked, mut read) = (0u32, None::<Instant>);
+    let end = Instant::now() + Duration::from_secs(10);
+    while read.is_none_or(|r| r.elapsed() < Duration::from_millis(100)) {
+        assert!(Instant::now() < end, "the M114 answer was never read; saw {words:?}");
+        for s in desk.tick(t0.elapsed().as_micros() as u64) {
+            if let PumpEvent::Squawk { acked: a, status, event, .. } = s {
+                acked = acked.max(a);
+                if read.is_none() && status.as_deref().is_some_and(|st| st.contains("MPos")) {
+                    read = Some(Instant::now());
+                }
+                words.extend(event);
+            }
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+    assert_eq!(acked, 0, "the M114's ok is swallowed, never the first job line's: {words:?}");
+
+    // The job's own answers: the run streams to done on its own oks.
+    step.store(3, Ordering::SeqCst);
+    let done = drive_until(&mut desk, &mut *open, t0, &mut words, |e| e == "done" || e.starts_with("link lost"));
+    match done {
+        PumpEvent::Squawk { acked, total, event: Some(e), .. } => {
+            assert_eq!(e, "done", "{words:?}");
+            assert_eq!(acked, total, "{words:?}");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(!words.iter().any(|w| w.starts_with("refused") || w.starts_with("error")), "{words:?}");
+    drop(desk);
+    let got = fake.join().unwrap();
+    let program_lines = Pump::from_program(&program(), Dialect::Marlin).unwrap().lines().to_vec();
+    let jobs: Vec<String> = got.into_iter().filter(|l| l != "M114").collect();
+    assert_eq!(jobs.len(), 2 * program_lines.len(), "the program twice, on one link: {jobs:?}");
+}
+
+#[test]
+fn a_restart_after_autoreport_on_asks_no_second_m154() {
+    let (l, port) = listener();
+    let fake = fake_marlin_said(l, Some(M154::On));
+    let (mut desk, mut open, t0, mut words, _) = marlin_done_hello(machine(), port);
+    assert_eq!(words.iter().filter(|w| w.starts_with("autoreport=")).collect::<Vec<_>>(), ["autoreport=on"], "{words:?}");
+
+    let start = marlin_start_again(&mut desk, &machine(), port);
+    let first = squawk_words(&desk.apply(&start, &mut *open));
+    assert_eq!(first.first().map(String::as_str), Some("started (on the live link)"), "{first:?}");
+    assert_eq!(word_of(drive_until(&mut desk, &mut *open, t0, &mut words, |e| e == "done" || e.starts_with("link lost"))), "done");
+    assert_eq!(words.iter().filter(|w| w.starts_with("autoreport=")).count(), 1, "the report already on is not asked again: {words:?}");
+    assert!(!words.iter().any(|w| w.starts_with("refused") || w.starts_with("error")), "{words:?}");
+    drop(desk); // the desk's close: the carried on turns the report off
+    let got = fake.join().unwrap();
+    assert_eq!(got.iter().filter(|l| l.starts_with("M154")).collect::<Vec<_>>(), ["M154 S1", "M154 S0"], "one ask, one off: {got:?}");
+}
