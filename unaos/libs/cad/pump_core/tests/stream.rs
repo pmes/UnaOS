@@ -572,7 +572,7 @@ fn a_resume_restores_the_tool_state_set_before_its_line() {
     let p = Pump::new(Dialect::Marlin, text).unwrap().resume_at(9).unwrap();
     assert_eq!(
         p.lines().to_vec(),
-        with_prefix(&lines, 8, &["G21", "G90", "M82", "M190 S60", "M109 S210", "T1", "M106 S128"])
+        with_prefix(&lines, 8, &["G21", "G90", "M82", "M190 S60", "M109 T0 S210", "T1", "M106 S128"]) // VUGCOMSCANRESUMETOOLINDEX (SR672): the heater set under T0 names T0
     );
 
     // M107 clears the fan, an S0 target stays non-blocking, a recorded wait stays; a packed command is re-spaced.
@@ -713,4 +713,29 @@ fn a_laser_resume_folds_dynamic_power_onto_the_first_resumed_motion() {
         Pump::new(laser, &text).unwrap().resume_at(3).err(),
         Some(PumpRefusal::LineTooLong { line: 3, len: long.len() + 1 + "M4 ".len() + " S500".len() })
     );
+}
+
+// --- VUGCOMSCANRESUMETOOLINDEX (SR672): a resume restores every hotend and fan index set before its line ---
+
+#[test]
+fn a_resume_restores_every_hotend_and_fan_index_set_before_its_line() {
+    let marlin = |text: &str, at: usize, words: &[&str]| {
+        let lines = Pump::new(Dialect::Marlin, text).unwrap().lines().to_vec();
+        let p = Pump::new(Dialect::Marlin, text).unwrap().resume_at(at).unwrap();
+        assert_eq!(p.lines().to_vec(), with_prefix(&lines, at - 1, words), "{text:?}");
+    };
+    // Two hotends each keep their target (each M109 T<n> blocking), then the active tool, then the fan by its index.
+    marlin(
+        "T0\nM104 S210\nT1\nM104 S230\nM106 P1 S64\nG1 X1 E1 F100\n",
+        6,
+        &["M109 T0 S210", "M109 T1 S230", "T1", "M106 P1 S64"],
+    );
+    // An index-less M104 after T1 heats T1.
+    marlin("T1\nM104 S230\nG1 X1 E1 F100\n", 3, &["M109 T1 S230", "T1"]);
+    // M107 alone clears the active tool's fan (P0 with no T): fan 1 keeps its speed.
+    marlin("M106 P1 S64\nM106 S100\nM107\nG1 X1 E1 F100\n", 4, &["M106 P1 S64", "M107"]);
+    // A heater set before the first T is named by its index once the program is multi-tool.
+    marlin("M104 S200\nT1\nM104 S210\nG1 X1 E1 F100\n", 4, &["M109 T0 S200", "M109 T1 S210", "T1"]);
+    // A fan set under a tool no longer active is named by that index; the active tool's stays index-less, after the T.
+    marlin("T1\nM106 S200\nT0\nM106 S50\nG1 X1 E1 F100\n", 5, &["T0", "M106 P1 S200", "M106 S50"]);
 }
