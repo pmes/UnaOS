@@ -201,9 +201,9 @@ pub fn replay(doc: &Doc, tol: Tol) -> Replay {
                     Ok(e) => {
                         wk.ents.insert(id.clone(), e);
                     }
-                    Err(BadRef(e)) => {
+                    Err(BadRef { id: e, kind }) => {
                         let n = wk.name_of(e);
-                        fail(&mut r, line, id, Fault::BadRef { id: n, kind: RefKind::Point }); // VUGFACEJOURNALFAULTFIXREF (SR590): an end / a centre is a point
+                        fail(&mut r, line, id, Fault::BadRef { id: n, kind }); // VUGSKETCHBADREFKIND (SR604): the kind sketch_core's need_point named
                     }
                 }
             }
@@ -222,9 +222,9 @@ pub fn replay(doc: &Doc, tol: Tol) -> Replay {
                     Ok(e) => {
                         wk.ents.insert(id.clone(), e);
                     }
-                    Err(BadRef(e)) => {
+                    Err(BadRef { id: e, kind }) => {
                         let n = wk.name_of(e);
-                        fail(&mut r, line, id, Fault::BadRef { id: n, kind: RefKind::Point }); // VUGFACEJOURNALFAULTFIXREF (SR590): an end / a centre is a point
+                        fail(&mut r, line, id, Fault::BadRef { id: n, kind }); // VUGSKETCHBADREFKIND (SR604): the kind sketch_core's need_point named
                     }
                 }
             }
@@ -235,9 +235,9 @@ pub fn replay(doc: &Doc, tol: Tol) -> Replay {
                     Err(missing) => fail(&mut r, line, id, Fault::Upstream(missing)),
                     Ok(sc) => match wk.sk.add(sc) {
                         Ok(cid) => wk.cons.push((cid, i)),
-                        Err(BadRef(e)) => {
+                        Err(BadRef { id: e, kind }) => {
                             let n = wk.name_of(e);
-                            fail(&mut r, line, id, Fault::BadRef { kind: wanted(c, &n, doc, sketch), id: n }); // VUGFACEJOURNALFAULTFIXREF (SR590): the slot's kind
+                            fail(&mut r, line, id, Fault::BadRef { id: n, kind }); // VUGSKETCHBADREFKIND (SR604): the slot's kind, named by sketch_core's check
                         }
                     },
                 }
@@ -453,72 +453,26 @@ fn fold_machine(machine: &mut Option<Machine>, s: &Stmt) {
 }
 
 // ---- VUGFACEJOURNALFAULTFIXREF (SR590): a fault carries what a fix would choose from ----
-// A BadRef names the kind its slot wanted (sketch_core's `BadRef` carries the entity only, so the slot is read from the
-// text `Cons` in sketch_core's check order), a NoProfile the closed loops of its sketch, an edge reference the edge
-// names of its `on` solid. The face (vug-view journal.rs) lists the candidates; it re-derives none of these.
+// A BadRef names the kind its slot wanted (VUGSKETCHBADREFKIND, SR604: sketch_core's `BadRef { id, kind }` names it at
+// its `need_*`, so no second table of its check order lives here), a NoProfile the closed loops of its sketch, an edge
+// reference the edge names of its `on` solid. The face (vug-view journal.rs) lists the candidates; it re-derives none.
 
-/// The kind of sketch entity a reference slot wants.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RefKind {
-    /// A point entity (a line's end, a circle's centre, `<id>` in a point slot).
-    Point,
-    /// A line.
-    Line,
-    /// A circle or an arc (`<id>.centre`, a radius, a circle slot).
-    Round,
-    /// A line or an arc (`<id>.start` / `<id>.end`).
-    Ends,
-}
+/// The kind of sketch entity a reference slot wants: sketch_core's (VUGSKETCHBADREFKIND, SR604), re-exported.
+pub use sketch_core::RefKind;
 
-impl RefKind {
-    /// THE kind table: statement `s` declares an entity of this kind.
-    pub fn holds(self, s: &Stmt) -> bool {
+impl sketch_core::Declares for Stmt {
+    /// THE kind table: this statement declares an entity of kind `k` (`RefKind::holds` reads it).
+    fn declares(&self, k: RefKind) -> bool {
         matches!(
-            (self, s),
+            (k, self),
             (RefKind::Point, Stmt::Point { .. })
                 | (RefKind::Line, Stmt::Line { .. })
                 | (RefKind::Round, Stmt::Circle { .. } | Stmt::Arc { .. })
                 | (RefKind::Ends, Stmt::Line { .. } | Stmt::Arc { .. })
+                | (RefKind::Arc, Stmt::Arc { .. })
+                | (RefKind::Live, Stmt::Point { .. } | Stmt::Line { .. } | Stmt::Circle { .. } | Stmt::Arc { .. })
         )
     }
-}
-
-/// A point reference's entity and the kind it wants.
-fn pref_slot(p: &PRef) -> (&str, RefKind) {
-    match p {
-        PRef::Point(i) => (i, RefKind::Point),
-        PRef::Centre(i) => (i, RefKind::Round),
-        PRef::Start(i) | PRef::End(i) => (i, RefKind::Ends),
-    }
-}
-
-/// Every entity slot of `c` with the kind it wants, in sketch_core's `Constraint::check` order.
-fn slots(c: &Cons) -> Vec<(&str, RefKind)> {
-    use RefKind::{Line, Round};
-    match c {
-        Cons::Coincident(a, b) | Cons::Distance(a, b, _) => alloc::vec![pref_slot(a), pref_slot(b)],
-        Cons::PointOnLine(p, l) | Cons::DistancePointLine(p, l, _) | Cons::Midpoint(p, l) => {
-            alloc::vec![pref_slot(p), (l.as_str(), Line)]
-        }
-        Cons::PointOnCircle(p, k) => alloc::vec![pref_slot(p), (k.as_str(), Round)],
-        Cons::Horizontal(l) | Cons::Vertical(l) => alloc::vec![(l.as_str(), Line)],
-        Cons::Parallel(a, b) | Cons::Perpendicular(a, b) | Cons::EqualLength(a, b) | Cons::Angle(a, b, _) => {
-            alloc::vec![(a.as_str(), Line), (b.as_str(), Line)]
-        }
-        Cons::TangentLineCircle(l, k) => alloc::vec![(l.as_str(), Line), (k.as_str(), Round)],
-        Cons::TangentCircles(a, b) | Cons::EqualRadius(a, b) => alloc::vec![(a.as_str(), Round), (b.as_str(), Round)],
-        Cons::Radius(k, _) | Cons::Diameter(k, _) => alloc::vec![(k.as_str(), Round)],
-        Cons::Fix(p, _) => alloc::vec![pref_slot(p)],
-        Cons::Symmetric(a, b, l) => alloc::vec![pref_slot(a), pref_slot(b), (l.as_str(), Line)],
-    }
-}
-
-/// The kind the slot of `c` that refused `n` wanted: the first slot naming `n` whose kind `n`'s statement (in sketch
-/// `sketch`) does not hold, else the first slot naming `n`, else a point.
-fn wanted(c: &Cons, n: &str, doc: &Doc, sketch: &str) -> RefKind {
-    let decl = doc.stmts.iter().find(|s| s.id() == Some(n) && s.refs().first() == Some(&sketch));
-    let named: Vec<RefKind> = slots(c).into_iter().filter(|(i, _)| *i == n).map(|(_, k)| k).collect();
-    named.iter().copied().find(|k| !decl.is_some_and(|s| k.holds(s))).or(named.first().copied()).unwrap_or(RefKind::Point)
 }
 
 /// One text id per closed profile of the solved sketch: its outer loop's first edge entity.
