@@ -1157,6 +1157,7 @@ fn the_command_line_edits_at_its_caret() {
     assert!(v.key("End"));
     assert!(v.key("BackSpace"));
     assert_eq!((v.view.entry.text.as_str(), v.view.entry.caret), ("abx", 3), "Backspace removes the char before the caret");
+    assert!(v.key("\u{7f}") && v.view.entry.text == "ab" && v.key("\u{f729}") && v.view.entry.caret == 0 && v.key("\u{f72b}") && v.view.entry.caret == 2, "VUGFACEFIELDKEYS (SR599): the one-char Backspace and the Cocoa Home / End reach the named arms: {:?} at {}", v.view.entry.text, v.view.entry.caret);
 
     // A run line recalled by Up puts the caret at its end: a typed char appends.
     while !v.view.entry.text.is_empty() {
