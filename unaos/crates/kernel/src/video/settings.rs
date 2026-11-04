@@ -4117,66 +4117,12 @@ pub fn selftest_map() {
         }
         _ => "bad",
     };
-    let (rung, stops_all) = keys_probe(); let table = stops_table(stops_all); let (gets_ok, gets_other) = crate::tests::prefsclientkeys_leg(); // PREFSCLIENTKEYS (B779): an unrelated key's PrefChanged costs 0 GETs across every pass (tests.rs tail). PICKERKEYS (B768): every control a keyboard stop with its ring
+    let (rung, stops_all, table) = keys_table(); let (gets_ok, gets_other) = crate::tests::prefsclientkeys_leg(); // PREFSCLIENTKEYS (B779): an unrelated key's PrefChanged costs 0 GETs across every pass (tests.rs tail). PICKERKEYS (B768): every control a keyboard stop with its ring. KEYS-RING-ONE (B1117): keys= and table= from ONE walk, `ring_probe_tabs`
     let ok = unrowed == 0 && orphans == 0 && same && search.starts_with("ok(") && live != "bad" && stops_all > 0 && rung == stops_all && gets_ok && !table.starts_with("bad");
     serial_println!(
         ":: SETTINGSMAP: keys={} rows={} orphans={} unrowed={} search={} -> {} :: live={} owners_same={} keys={}/{} gets_other={} table={}",
         keys, MAP.len(), orphans, unrowed, search, if ok { "PASS" } else { "FAIL" }, live, same as u8, rung, stops_all, gets_other, table
     );
-}
-
-/// PICKERKEYS (rmbp-ledger B768) — `tests settingsmap`'s `keys=<rung>/<total>`: every tab painted OFFSCREEN with the
-/// keyboard in the pane and no stop (the rest), then once per stop; `total` = the pane's controls summed over the tabs
-/// (every press target `cs` recorded), and a stop is RUNG when, around ITS control's rect (grown by the ring and half
-/// a knob), pixels of the ring's colour (`theme::focus_ring`, +-3 a channel) changed from the rest. Equal = every
-/// control is reached by the keyboard and shows it. A fresh `State` per paint (no glide carries); one surface pair.
-pub fn keys_probe() -> (usize, usize) {
-    let (pw, ph) = (super::metrics::size(WIN_W), super::metrics::size(WIN_H()));
-    let (mut a, mut b): (Vec<u32>, Vec<u32>) = (Vec::new(), Vec::new());
-    if a.try_reserve_exact(pw * ph).is_err() || b.try_reserve_exact(pw * ph).is_err() { return (0, 0); }
-    a.resize(pw * ph, 0);
-    b.resize(pw * ph, 0);
-    let v0 = CUR.lock().clone();
-    let paint_one = |buf: Vec<u32>, tab: usize, kf: usize| -> (Vec<u32>, Vec<[u16; 4]>, usize) {
-        let mut st = State::new(WIN_W, WIN_H(), buf, 1, false, col_scrolled(0, tab, TABS));
-        st.kbd = true;
-        st.kf = kf;
-        let mut v = v0.clone();
-        v.tab = tab as u8;
-        paint(&mut st, &v);
-        let p0 = st.pane0.min(st.hits.len());
-        (core::mem::take(&mut st.surf), core::mem::take(&mut st.hits), p0)
-    };
-    let ring = theme::focus_ring() & 0x00FF_FFFF;
-    let near = |p: u32| (0..3).all(|k| ((p >> (8 * k)) & 0xFF).abs_diff((ring >> (8 * k)) & 0xFF) <= 3);
-    let pad = draw::DIMS.focus_ring + draw::DIMS.slider_knob / 2 + 4;
-    let (mut rung, mut total) = (0usize, 0usize);
-    let mut miss: Option<(usize, usize)> = None;
-    for tab in 0..TABS {
-        let (bb, hits, p0) = paint_one(b, tab, KF_NONE);
-        b = bb;
-        let n = hits.len() - p0;
-        total += n;
-        for k in 0..n {
-            let (aa, hk, p0k) = paint_one(a, tab, k);
-            a = aa;
-            let Some(h) = hk.get(p0k + k) else { continue };
-            let (x, y, w, hh) = (h[0] as usize, h[1] as usize, h[2] as usize, h[3] as usize);
-            let (x0, y0) = (e(x.saturating_sub(pad)).max(0) as usize, e(y.saturating_sub(pad)).max(0) as usize);
-            let (x1, y1) = ((e(x + w + pad).max(0) as usize).min(pw), (e(y + hh + pad).max(0) as usize).min(ph));
-            let mut px = 0usize;
-            for yy in y0..y1 {
-                for xx in x0..x1 {
-                    let i = yy * pw + xx;
-                    if (a[i] & 0x00FF_FFFF) != (b[i] & 0x00FF_FFFF) && near(a[i]) { px += 1; }
-                }
-            }
-            if px >= 4 { rung += 1; } else if miss.is_none() { miss = Some((tab, k)); }
-        }
-    }
-    if let Some((t, k)) = miss { serial_println!("[settings] keys miss tab={} stop={}", TAB_NAMES[t], k); }
-    serial_println!("[settings] keys tabs={} stops={} rung={}", TABS, total, rung);
-    (rung, total)
 }
 
 // ── A11YTREE (rmbp-ledger B675; BP-bar-22: "Tab through Settings shows a ≥ 2 px ring at every stop") ──────────────
@@ -6079,9 +6025,11 @@ pub fn shimmer_set_unstored(on: bool) -> bool {
 
 // ── A11Y-STOPS-TABLE (rmbp-ledger B1110, BP-video-20) — the census per tab, checked by `tests settingsmap` ──────────
 // `ring_probe_tabs` is A11YTREE's one walk of every Tab stop; it tallies each stop under (tab, kit kind) beside the
-// per-kind census. `tests settingsmap` prints one `[settings] stops tab=<name> total= rung= <kind>=<n>...` line per tab
-// and checks the table against `keys_probe`, the independent walk of the pane's controls: the tabs' totals, the walk's
-// `stops` and the per-kind census are one number, and it is the panes' controls plus one column stop per tab.
+// per-kind census. `tests settingsmap` prints one `[settings] stops tab=<name> total= rung= <kind>=<n>...` line per tab.
+// KEYS-RING-ONE (rmbp-ledger B1117): the same walk answers PICKERKEYS' `keys=<rung>/<total>` (B768) — the pane's stops
+// are the walk's non-`column` kinds, rung by the walk's one ring reader (F39A11Y) — so `keys_probe`, a second offscreen
+// walk of the same stops with a second ring reader, is retired. The table checks the walk against itself: the tabs'
+// totals, the walk's `stops` and the per-kind census are one number, and every tab holds exactly one column stop.
 
 /// A11YTREE's ring leg as `tests a11ytree` reads it: [`ring_probe_tabs`] without the per-tab table.
 #[cfg(feature = "witness")]
@@ -6090,33 +6038,44 @@ pub fn ring_probe() -> (usize, usize, usize, Vec<(usize, usize, &'static str, St
     (stops, rung, thin, fail, census)
 }
 
-/// `tests settingsmap`'s `table=`: one line per tab from [`ring_probe_tabs`]; `ok(<sum>/<stops>)` when the tabs' totals,
-/// the walk's stops and the per-kind census agree and equal `pane_all` (`keys_probe`'s total) plus [`TABS`] column
-/// stops, with every tab holding a stop; else `bad(..)` naming the numbers.
+/// `tests settingsmap`'s `keys=` and `table=` from ONE [`ring_probe_tabs`] walk (KEYS-RING-ONE B1117). Returns
+/// `(rung, total, table)`: `total` = the pane's stops summed over the tabs (every kind but `column`), `rung` = those
+/// whose ring the walk read; prints `[settings] keys miss tab= stop=` (the first pane stop without a ring, its pane
+/// index), `[settings] keys tabs= stops= rung=`, then one `[settings] stops tab=` line per tab. `table` is
+/// `ok(<sum>/<stops>)` when the tabs' totals, the walk's stops and the per-kind census agree and every tab holds
+/// exactly one column stop; else `bad(..)` naming the numbers (`empty=` the first tab without one column stop).
 #[cfg(feature = "witness")]
-fn stops_table(pane_all: usize) -> String {
-    let (stops, _, _, _, census, per_tab) = ring_probe_tabs();
+fn keys_table() -> (usize, usize, String) {
+    let (stops, _, _, fail, census, per_tab) = ring_probe_tabs();
+    let total: usize = census.iter().skip(1).map(|c| c[0]).sum();
+    let rung: usize = census.iter().skip(1).map(|c| c[1]).sum();
+    if let Some(&(t, k, _, _)) = fail.iter().find(|f| f.1 > 0) {
+        serial_println!("[settings] keys miss tab={} stop={}", TAB_NAMES.get(t).copied().unwrap_or("-"), k - 1);
+    }
+    serial_println!("[settings] keys tabs={} stops={} rung={}", TABS, total, rung);
     let mut sum = 0usize;
     let mut empty: Option<usize> = None;
     for (tab, row) in per_tab.iter().enumerate() {
         let n: usize = row.iter().map(|c| c[0]).sum();
         let r: usize = row.iter().map(|c| c[1]).sum();
         sum += n;
-        if n == 0 && empty.is_none() { empty = Some(tab); }
+        if row[0][0] != 1 && empty.is_none() { empty = Some(tab); }
         let mut line = alloc::format!("[settings] stops tab={} total={} rung={}", TAB_NAMES.get(tab).copied().unwrap_or("-"), n, r);
         for (k, c) in CENSUS_KINDS.iter().zip(row.iter()) { line.push_str(&alloc::format!(" {}={}", k, c[0])); }
         serial_println!("{}", line);
     }
     let kinds: usize = census.iter().map(|c| c[0]).sum();
-    if sum == stops && kinds == stops && stops == pane_all + TABS && empty.is_none() {
+    let col = census[0][0];
+    let table = if sum == stops && kinds == stops && col == TABS && empty.is_none() {
         alloc::format!("ok({}/{})", sum, stops)
     } else {
-        alloc::format!("bad(sum={} stops={} kinds={} pane={}+{} empty={})", sum, stops, kinds, pane_all, TABS, empty.map_or(String::from("-"), |t| alloc::format!("{}", t)))
-    }
+        alloc::format!("bad(sum={} stops={} kinds={} pane={}+{} empty={})", sum, stops, kinds, total, col, empty.map_or(String::from("-"), |t| alloc::format!("{}", t)))
+    };
+    (rung, total, table)
 }
 
-/// Without the witness probes there is no walk to tabulate.
+/// Without the witness probes there is no walk (`tests settingsmap` runs only under witness).
 #[cfg(not(feature = "witness"))]
-fn stops_table(_pane_all: usize) -> String {
-    String::from("skip(no-witness)")
+fn keys_table() -> (usize, usize, String) {
+    (0, 0, String::from("skip(no-witness)"))
 }

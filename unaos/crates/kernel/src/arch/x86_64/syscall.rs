@@ -6364,10 +6364,10 @@ pub fn click_stats() -> (u64, u64) {
 /// Locks: the framebuffer info read is LOCKFIX's masked NON-BLOCKING door (a blocking take here is INWEDGE's boot-8 wedge, on this exact band — rmbp-ledger B1), then the cursor position lock, and both
 /// are released before `wm::hit_test` takes the window TABLE lock. No nesting, so no new lock order.
 fn click_pointer_pos() -> (i32, i32) {
-    // LOCKFIX/INWEDGE B1 — the input band's ONE panel door (`video::panel_info_nonblocking`): masked, non-blocking, COUNTED. Refused ⇒ (0, 0), the clamp an unset framebuffer has always given this function.
+    // LOCKFIX/INWEDGE B1 — the input band's ONE panel door (`video::panel_info_nonblocking`): masked, non-blocking, COUNTED. CLICK-X86-HELD (rmbp-ledger B1117): read through `video::panel_wh_held`, so a refused read answers the HELD geometry (the last nonzero read), never (0, 0) into `pal::cursor::pos`, whose first caller seeds the boot's pointer at the panel centre; a never-read panel answers (0, 0, refused) and pal's PIWM guard returns the live pointer, or (0, 0) without seeding — the aarch64 twin's rule, one door.
     // WAS `WRITER.lock().info()`, a BLOCKING acquire on the preemptible input band — INWEDGE's boot-8 wedge, reachable from `wc_click_route` (its `Event::Button` arm) and `wc_drag_motion`: once per button edge and once per drag pass. The aarch64 twin (`arch/aarch64/syscall.rs::click_pointer_pos`) has read it through this door since LOCKFIX, and `video/mod.rs`'s own door comment already NAMED this function as one of its three callers — so the x86 half was that comment's one false sentence, and this is what makes it true. ⚠ LINE-NEUTRAL: 5 body lines out, 5 in, so no panic `Location` below this point moves.
-    let (w, h) = crate::video::panel_info_nonblocking()
-        .map_or((0, 0), |i| (i.width as i32, i.height as i32));
+    let (w, h, _refused) = crate::video::panel_wh_held(); // CLICK-X86-HELD (B1117): the one held panel read
+    let (w, h) = (w as i32, h as i32);
     crate::pal::cursor::pos(w, h)
 }
 
@@ -24050,12 +24050,12 @@ fn lockfix_b1_selftest() {
     if DONE.swap(true, Ordering::Relaxed) {
         return;
     }
-    let (read0, refused0) = crate::video::panel_census();
+    let _ = (0..RELEASED_TRIES).find(|_| !crate::video::panel_wh_held().2); let (read0, refused0) = crate::video::panel_census(); // CLICK-X86-HELD (B1117): prime the held read BEFORE read0, so the control's read2 > read0 is untouched
     // THE HELD HALF — the input band's own read, driven with this core holding the very lock it
     // reads. At the base sha control does not return from this block.
-    let (hx, hy) = {
+    let ((hx, hy), (hw, hh, hrefused)) = {
         let _held = crate::video::WRITER.lock();
-        click_pointer_pos()
+        (click_pointer_pos(), crate::video::panel_wh_held())
     };
     let (read1, refused1) = crate::video::panel_census();
     // The real geometry, taken unmasked and holding nothing — the one acquire in this leg where
@@ -24072,18 +24072,18 @@ fn lockfix_b1_selftest() {
             break;
         }
     }
-    let declined = refused1 >= refused0 + 1;
+    let declined = refused1 >= refused0 + 1; let held = hrefused && hw as i32 == real_w && hh > 0; // CLICK-X86-HELD (B1117): under the refusal click_pointer_pos took, its door answers the panel, not (0, 0)
     let recovered = read2 > read0;
     serial_println!(
-        ":: LOCKFIX-B1: click_pointer_pos across a held WRITER — held: refused+{} read+{} at=({},{}) | released: read+{} tries={} real_w={} :: {} ::",
+        ":: LOCKFIX-B1: click_pointer_pos across a held WRITER — held: refused+{} read+{} at=({},{}) | released: read+{} tries={} real_w={} held={}x{}({}) :: {} ::",
         refused1 - refused0,
         read1 - read0,
         hx,
         hy,
         read2 - read0,
         tries,
-        real_w,
-        if declined && recovered { "PASS" } else { "FAIL" }
+        real_w, hw, hh, if held { "hold" } else { "zero" },
+        if declined && recovered && held { "PASS" } else { "FAIL" }
     );
 }
 
