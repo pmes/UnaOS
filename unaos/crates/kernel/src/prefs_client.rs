@@ -1104,7 +1104,7 @@ fn queued_keep(hdr: &crate::bus::BusHdr, body: &[u8], held: Option<(usize, u64)>
         }
         q.push_back(Queued { hdr: h, body: b, answered: None, held, gone_ms: None, silent_at_ms });
         true
-    })
+    }) && keeprace_consult(hdr.corr) // QUEUED-SET-EAGER-KEEPRACE (rmbp-ledger B1199): a kept SET whose corr on_exit already marked unread (the holder died before the keep) wakes the applier now (file tail). Named in-place hunk
 }
 
 /// The full ring's honest answer: -EAGAIN (the frame may still land at the holder; it is not tracked).
@@ -1267,7 +1267,7 @@ pub fn queued_selftest() {
         let _ = queued_take(c);
     }
     let (q4, q5) = lostreset_selftest(&next, &body_of, &read, want); // QUEUED-SET-LOSTRESET (B1181): Q4 / Q5, the full-inbox legs (file tail)
-    let (q6, q7) = stucklive_selftest(&next, &body_of, &read, want); let q8 = pendpin_selftest(&next, &body_of, &read, want); /* QUEUED-SET-PENDPIN (B1193): Q8 the silent holder's Pend reclaimed (file tail) */ let q9 = deliverrace_selftest(&next, &body_of, &read, want); /* QUEUED-SET-DELIVER-RACE (rmbp-ledger B1194): Q9, the inbox filled between the room check and the deliver (file tail). Named in-place hunk */ let q10 = eager_selftest(&next, &body_of, want); // QUEUED-SET-STUCKLIVE (B1187): Q6 silent live holder, Q7 refused answer delivered (file tail)
+    let (q6, q7) = stucklive_selftest(&next, &body_of, &read, want); let q8 = pendpin_selftest(&next, &body_of, &read, want); /* QUEUED-SET-PENDPIN (B1193): Q8 the silent holder's Pend reclaimed (file tail) */ let q9 = deliverrace_selftest(&next, &body_of, &read, want); /* QUEUED-SET-DELIVER-RACE (rmbp-ledger B1194): Q9, the inbox filled between the room check and the deliver (file tail). Named in-place hunk */ let q10 = eager_selftest(&next, &body_of, want); let q11 = keeprace_selftest(&next, &body_of, want); /* QUEUED-SET-EAGER-KEEPRACE (rmbp-ledger B1199): Q11, the mark landed before the keep (file tail). Named in-place hunk */ // QUEUED-SET-STUCKLIVE (B1187): Q6 silent live holder, Q7 refused answer delivered (file tail)
     // Restore the operator's value through the same kernel fulfiller (or leave the key unset as it was).
     match orig {
         Some(v) => {
@@ -1280,10 +1280,10 @@ pub fn queued_selftest() {
             let _ = crate::prefs::unset(crate::prefs::NS, key::IDLE_MIN);
         }
     }
-    if q1 && q2 && q3 && q4 && q5 && q6 && q7 && q8 && q9 && q10 {
-        serial_println!(":: RELAY-QUEUED-SET: unread=applied read=released full=eagain lostreset=released/applied stucklive=released refusedreply=redelivered pendpin=reclaimed deliverrace=closed eager=applied -> PASS ::");
+    if q1 && q2 && q3 && q4 && q5 && q6 && q7 && q8 && q9 && q10 && q11 {
+        serial_println!(":: RELAY-QUEUED-SET: unread=applied read=released full=eagain lostreset=released/applied stucklive=released refusedreply=redelivered pendpin=reclaimed deliverrace=closed eager=applied keeprace=closed -> PASS ::");
     } else {
-        serial_println!(":: RELAY-QUEUED-SET: q1={} q2={} q3={} q4={} q5={} q6={} q7={} q8={} q9={} q10={} (want={} read1={} read2={} kept={}/{} pushed={}/{}) -> FAIL ::", q1 as u8, q2 as u8, q3 as u8, q4 as u8, q5 as u8, q6 as u8, q7 as u8, q8 as u8, q9 as u8, q10 as u8, want, read1.unwrap_or(-1), read2.unwrap_or(-1), kept1 as u8, kept2 as u8, pushed1 as u8, pushed2 as u8);
+        serial_println!(":: RELAY-QUEUED-SET: q1={} q2={} q3={} q4={} q5={} q6={} q7={} q8={} q9={} q10={} q11={} (want={} read1={} read2={} kept={}/{} pushed={}/{}) -> FAIL ::", q1 as u8, q2 as u8, q3 as u8, q4 as u8, q5 as u8, q6 as u8, q7 as u8, q8 as u8, q9 as u8, q10 as u8, q11 as u8, want, read1.unwrap_or(-1), read2.unwrap_or(-1), kept1 as u8, kept2 as u8, pushed1 as u8, pushed2 as u8);
     }
 }
 
@@ -1894,4 +1894,83 @@ fn eager_selftest(next: &dyn Fn() -> u32, body_of: &dyn Fn(i64) -> String, want:
         serial_println!("[prefsbus] eager leg: kept={} by_applier={} gone={} store={} waited={}ms pushed={}", kept10 as u8, by_applier as u8, gone10 as u8, store10.unwrap_or(-1), waited, pushed10 as u8);
     }
     q10
+}
+
+// =================================================================================================
+// QUEUED-SET-EAGER-KEEPRACE (rmbp-ledger B1199) — TAIL-APPENDED. B1196's applier is woken by the on_exit handoff
+// (`note_set_unread` -> `queued_due`). A holder that dies between `relay`'s last poll and `queued_keep` is marked
+// BEFORE its entry exists: the wake finds the ring empty for that corr, the entry is kept after with no wake, and the
+// SET waited for the next client call. Measured at 0e0a0fd07: the B1169 mark already outlives a missing entry (every
+// clearer takes only its own corr; `queued_settle` visits only kept corrs; the applier's empty pass touches no mark),
+// so nothing changes in the mark. The keep now CONSULTS it, after the push and with `QUEUED` released
+// (`keeprace_consult`, a non-clearing peek through [`set_unread_marked`]), and finding its corr marked posts B1196's
+// one wake (`queued_due`); the drain's `set_unread_take` stays the one clearer and `queued_settle` the one apply path.
+// Order: keep pushes THEN peeks, on_exit marks THEN posts: either the peek sees the mark or on_exit's post follows the
+// entry; a `queued_due` that finds `QUEUED_DUE` already raised precedes the applier's `store(false)`, which precedes its
+// ring read, so the entry is seen. No second mark, no poll. This closes the QUEUED-SET-EAGER-KEEPRACE owed item of the
+// QUEUED-SET-EAGER-ARM block above.
+// Witness: `tests bandy3` -> `[prefsbus] queued set corr=<c> marked unread before keep — applier woken
+// (QUEUED-SET-EAGER-KEEPRACE)` and `:: RELAY-QUEUED-SET: ... eager=applied keeprace=closed -> PASS ::` (Q11).
+// =================================================================================================
+/// Is client corr `corr` marked unread (B1169's mark)? A peek: the mark is NOT cleared (the drain takes it).
+#[cfg(feature = "busreg")]
+fn set_unread_marked(corr: u32) -> bool {
+    corr != 0 && locked(|| SET_UNREAD.lock().0.contains(&corr))
+}
+
+/// `queued_keep`, after the push (`QUEUED` released): a corr already marked unread wakes `prefs-apply`. Always `true`.
+#[cfg(feature = "busreg")]
+fn keeprace_consult(corr: u32) -> bool {
+    if set_unread_marked(corr) {
+        serial_println!("[prefsbus] queued set corr={} marked unread before keep — applier woken (QUEUED-SET-EAGER-KEEPRACE)", corr);
+        queued_due();
+    }
+    true
+}
+
+/// `queued_selftest`'s Q11: on_exit's two steps (`note_set_unread`, then the -ECONNRESET into the inbox) land BEFORE
+/// the keep (the race); the leg lets the applier consume that wake on a ring without the entry, THEN keeps the SET for
+/// a dead holder and makes NO client call: it yields until `prefs-apply` has settled it and reads the STORE.
+#[cfg(feature = "busreg")]
+fn keeprace_selftest(next: &dyn Fn() -> u32, body_of: &dyn Fn(i64) -> String, want: i64) -> bool {
+    let stale = Some((0usize, (crate::arch::syscall::busreg_ops().rgen)(0).wrapping_add(1)));
+    let v11: i64 = if want == 7 { 31 } else { 33 };
+    let b11 = body_of(v11);
+    let c11 = next();
+    let Some(h11) = queued_set_hdr(c11, b11.as_bytes()) else { return false };
+    note_set_unread(c11);
+    let pushed11 = inbox_push(queued_reply(c11, una_abi::ECONNRESET as i32));
+    let yield_until = |done: &dyn Fn() -> bool| {
+        let t = crate::arch::ms();
+        let mut spins = 0u32;
+        while !done() && crate::arch::ms().saturating_sub(t) <= EAGER_WAIT_MS && spins < RELAY_SPIN_MAX.saturating_mul(16) {
+            spins += 1;
+            if crate::arch::irqs_masked() {
+                core::hint::spin_loop();
+            } else {
+                crate::arch::sched::yield_now();
+            }
+        }
+    };
+    yield_until(&|| !QUEUED_DUE.load(Ordering::Acquire));
+    let due_cleared = !QUEUED_DUE.load(Ordering::Acquire);
+    let kept11 = queued_keep(&h11, b11.as_bytes(), stale);
+    let t = crate::arch::ms();
+    if kept11 {
+        yield_until(&|| eager_settled(c11));
+    }
+    let waited = crate::arch::ms().saturating_sub(t);
+    let by_applier = eager_settled(c11);
+    let store11 = crate::prefs::get(crate::prefs::NS, crate::prefs::key::IDLE_MIN).and_then(|v| v.as_int());
+    let gone11 = queued_take(c11).is_none();
+    if !by_applier {
+        // The fixture's leftovers: the mark and the reset frame go with the entry.
+        let _ = set_unread_take(c11);
+        locked(|| REPLIES.lock().retain(|f| !matches!(crate::bus::frame_parse(f), Ok(h) if h.corr == c11)));
+    }
+    let q11 = kept11 && by_applier && gone11 && store11 == Some(v11);
+    if !q11 {
+        serial_println!("[prefsbus] keeprace leg: kept={} by_applier={} gone={} store={} due_cleared={} waited={}ms pushed={}", kept11 as u8, by_applier as u8, gone11 as u8, store11.unwrap_or(-1), due_cleared as u8, waited, pushed11 as u8);
+    }
+    q11
 }
