@@ -30,7 +30,8 @@
 //!    of the measured axis from the nominal one at the feature's two axial ends. The frame is the design's after the
 //!    best-fit registration; the datum frame (ISO 5459, VUGSCANGDTDATUMS SR552) is [`frame_of`] / [`position_in`].
 //! 5. `band_mm`: the nominal-relative band (max − min of the signed deviation over the form vertices), printed beside
-//!    the form values; the zone that takes a verdict is `profile_mm` ([`Kind::Profile`], VUGSCANGDTSPEC SR559).
+//!    the form values; the zone that takes a verdict is `profile_mm` ([`Kind::Profile`], VUGSCANGDTSPEC SR559), located
+//!    in a datum frame by [`in_frame`] / [`profile_in`] and offset by an unequal zone `@<off>` (VUGSCANGDTPROFILEDATUM SR567).
 
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
@@ -125,6 +126,13 @@ pub struct FaceGdt {
     /// VUGSCANGDTSPEC (SR559): profile of a surface, 2 · max |signed deviation| over the form vertices (the width of the
     /// zone centred on the nominal that holds them all; never below `band_mm`).
     pub profile_mm: Option<f64>,
+    /// VUGSCANGDTPROFILEDATUM (SR567): the signed (min, max) of the form vertices' deviation at the best-fit registration
+    /// (positive proud), the span an unequal zone reads ([`zone_mm`]).
+    pub span_mm: Option<(f64, f64)>,
+    /// VUGSCANGDTPROFILEDATUM (SR567): profile of a surface located in the datum frame ([`in_frame`]), 2 · max |d'|.
+    pub profile_in_frame_mm: Option<f64>,
+    /// VUGSCANGDTPROFILEDATUM (SR567): the signed (min, max) of d' in the datum frame ([`profile_in`]).
+    pub frame_span_mm: Option<(f64, f64)>,
     pub axis: Option<Cylinder>,
     pub extent: (f64, f64),
     pub minzone_flatness_mm: Option<MinZone>,
@@ -142,7 +150,7 @@ impl FaceGdt {
             Kind::Flatness => self.flatness_mm,
             Kind::Cylindricity => self.cylindricity_mm,
             Kind::Position => self.position_mm,
-            Kind::Profile => self.profile_mm,
+            Kind::Profile => self.profile_in_frame_mm.or(self.profile_mm), // VUGSCANGDTPROFILEDATUM (SR567): read in the datum frame when one was given
         }
     }
 
@@ -276,6 +284,9 @@ pub fn gdt(scan: &ScanMesh, design: &Design, dev: &Deviation, margin_mm: f64, to
                 position_mm: None,
                 band_mm: None,
                 profile_mm: None,
+                span_mm: None,
+                profile_in_frame_mm: None,
+                frame_span_mm: None,
                 axis: None,
                 extent: (0.0, 0.0),
                 minzone_flatness_mm: None,
@@ -290,7 +301,7 @@ pub fn gdt(scan: &ScanMesh, design: &Design, dev: &Deviation, margin_mm: f64, to
             if out.n < GDT_MIN_POINTS {
                 return out;
             }
-            out.band_mm = spread(dev_mm.iter().copied()); out.profile_mm = dev_mm.iter().map(|d| 2.0 * d.abs()).reduce(f64::max); // VUGSCANGDTSPEC (SR559): the zone centred on the nominal
+            out.band_mm = spread(dev_mm.iter().copied()); out.profile_mm = dev_mm.iter().map(|d| 2.0 * d.abs()).reduce(f64::max); out.span_mm = span(dev_mm.iter().copied()); // VUGSCANGDTPROFILEDATUM (SR567): the signed span; VUGSCANGDTSPEC (SR559): the zone centred on the nominal
             match nominal {
                 Nominal::Plane(_) => {
                     if let Ok(f) = fit_plane(&pts, FIT_BAND) {
@@ -791,6 +802,8 @@ pub struct Callout {
     pub face: alloc::string::String,
     pub kind: Kind,
     pub tol_mm: f64,
+    /// VUGSCANGDTPROFILEDATUM (SR567): the unequal zone's offset (`@<off>`, profile only); None the equal zone.
+    pub off_mm: Option<f64>,
 }
 
 /// Why a callout did not parse.
@@ -802,6 +815,8 @@ pub enum GdtSpecError {
     GdtKind { kind: alloc::string::String },
     /// The tolerance is not a number, not finite, or not above 0.
     BadTol { tol: alloc::string::String },
+    /// VUGSCANGDTPROFILEDATUM (SR567): an `@<off>` on a kind other than profile, or an offset that is not a finite number.
+    BadUz { uz: alloc::string::String },
 }
 
 impl Callout {
@@ -813,18 +828,21 @@ impl Callout {
         }
         let (kind, tol) = rest.rsplit_once(':').ok_or_else(|| GdtSpecError::GdtKind { kind: rest.into() })?;
         let kind = Kind::parse(kind).ok_or_else(|| GdtSpecError::GdtKind { kind: kind.into() })?;
+        let (tol, off_mm) = uz_split(kind, tol)?; // VUGSCANGDTPROFILEDATUM (SR567): `<tol>@<off>`
         let tol_mm = match tol.parse::<f64>() {
             Ok(t) if t.is_finite() && t > 0.0 => t,
             _ => return Err(GdtSpecError::BadTol { tol: tol.into() }),
         };
-        Ok(Callout { face: face.into(), kind, tol_mm })
+        Ok(Callout { face: face.into(), kind, tol_mm, off_mm })
     }
 }
 
 impl core::fmt::Display for Callout {
     /// `<face>=<kind>:<tol>`, which [`Callout::parse`] reads back to the same callout.
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "{}={}:{}", self.face, self.kind.name(), self.tol_mm)
+        write!(f, "{}={}:{}", self.face, self.kind.name(), self.tol_mm)?;
+        if let Some(off) = self.off_mm { write!(f, "@{off}")?; } // VUGSCANGDTPROFILEDATUM (SR567): the unequal zone reads back
+        Ok(())
     }
 }
 
@@ -833,11 +851,97 @@ impl core::fmt::Display for Callout {
 /// Every cylinder face of `faces` (as [`gdt`] read them) with its `position_mm` re-read in `frame` through
 /// [`position_in`] (its fitted axis against its nominal over its extent); planes and unmeasured faces unchanged. The one
 /// place a datum frame reaches a reading: tools/scan's `--datum` and vug-view's `datum` command both call it.
-pub fn in_frame(faces: &mut [FaceGdt], frame: &DatumFrame) {
+///
+/// VUGSCANGDTPROFILEDATUM (SR567): each plane and cylinder face measured on at least [`GDT_MIN_POINTS`] form vertices
+/// also takes its profile located in the frame ([`profile_in`] against its own nominal): `frame_span_mm` and
+/// `profile_in_frame_mm`; `profile_mm` (the best fit) is left as it is.
+pub fn in_frame(scan: &ScanMesh, design: &Design, dev: &Deviation, margin_mm: f64, faces: &mut [FaceGdt], frame: &DatumFrame) {
     for f in faces.iter_mut() {
         if let (Nominal::Cylinder(nc), Some(axis)) = (f.nominal, f.axis) {
             f.position_mm = Some(position_in(frame, &axis, &nc, f.extent));
         }
+        if f.n >= GDT_MIN_POINTS && matches!(f.nominal, Nominal::Plane(_) | Nominal::Cylinder(_)) {
+            f.frame_span_mm = profile_in(frame, scan, design, dev, f.face, f.nominal, margin_mm);
+            f.profile_in_frame_mm = f.frame_span_mm.map(|s| zone_mm(s, 0.0));
+        }
     }
 }
 
+// ---- VUGSCANGDTPROFILEDATUM (LEDGER SR567): profile located in the datum frame; the unequal zone ----
+//
+// ISO 1101 profile with datums: the nominal is placed by the datum frame, not by the global registration, so a part
+// whose datum faces are true and whose profiled face is shifted reads the shift. Each form vertex q (design
+// coordinates at the aligned pose, [`form`]) goes through the measured frame into the nominal frame,
+// q' = N ∘ M⁻¹ (q) as [`position_in`] reads an axis, and d' is the nominal's own signed distance there (a plane's along
+// its outward normal; a cylinder's radial residual, signed by the material side its design triangles face), positive
+// where the face stands proud like deviation.rs's. The unequal zone `<face>=profile:<tol>@<off>` is the zone
+// [off − tol/2, off + tol/2]: its value is [`zone_mm`] about `off`, which passes at or under `tol`; off 0 is the equal zone.
+
+/// The signed (min, max) of the values, `None` when there are none.
+fn span(vals: impl Iterator<Item = f64>) -> Option<(f64, f64)> {
+    let (lo, hi) = vals.fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), v| (lo.min(v), hi.max(v)));
+    if lo <= hi { Some((lo, hi)) } else { None }
+}
+
+/// The tolerance text and the unequal zone's offset: `<tol>@<off>` (profile only, the offset any finite number).
+fn uz_split(kind: Kind, tol: &str) -> Result<(&str, Option<f64>), GdtSpecError> {
+    let Some((t, off)) = tol.split_once('@') else { return Ok((tol, None)) };
+    match off.parse::<f64>() {
+        Ok(o) if o.is_finite() && kind == Kind::Profile => Ok((t, Some(o))),
+        _ => Err(GdtSpecError::BadUz { uz: off.into() }),
+    }
+}
+
+/// The width of the zone centred on `off` that holds the signed span `(lo, hi)`: 2 · max(hi − off, off − lo).
+pub fn zone_mm(span: (f64, f64), off: f64) -> f64 {
+    2.0 * (span.1 - off).max(off - span.0)
+}
+
+/// +1 when cylinder `c` of design face `face` is a boss (its outward triangles face away from the axis), −1 a hole.
+fn material_side(design: &Design, face: u32, c: &Cylinder) -> f64 {
+    let s: f64 = design
+        .face_of
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| **f == face)
+        .filter_map(|(t, _)| design.mesh.corners(t))
+        .map(|[a, b, k]| (b - a).cross(k - a).dot(radial(c, (a + b + k) * (1.0 / 3.0))))
+        .sum();
+    if s < 0.0 { -1.0 } else { 1.0 }
+}
+
+/// The signed span (min, max) of design face `face`'s form vertices ([`form`] against `placed`, at the edge margin
+/// `margin_mm`) located in `frame` (see the section comment), `placed` the nominal surface in design coordinates (a
+/// plane's normal outward). None for Other, under [`GDT_MIN_POINTS`] form vertices, or when the measured frame does
+/// not invert.
+pub fn profile_in(frame: &DatumFrame, scan: &ScanMesh, design: &Design, dev: &Deviation, face: u32, placed: Nominal, margin_mm: f64) -> Option<(f64, f64)> {
+    let to = frame.nominal.compose(frame.measured.invert().ok()?);
+    let (pts, _, _) = form(scan, design, dev, face, placed, margin_mm);
+    if (pts.len() as u32) < GDT_MIN_POINTS {
+        return None;
+    }
+    match placed {
+        Nominal::Plane(pl) => span(pts.iter().map(|&q| pl.signed_distance(to.apply_point(q)))),
+        Nominal::Cylinder(c) => {
+            let side = material_side(design, face, &c);
+            span(pts.iter().map(|&q| side * (radial(&c, to.apply_point(q)).mag() - c.radius)))
+        }
+        Nominal::Other => None,
+    }
+}
+
+impl Callout {
+    /// The callout's verdict on its face: the equal zone is [`FaceGdt::verdict`]; an unequal zone (`off_mm`) reads
+    /// [`zone_mm`] about the offset over the frame's span when a frame was given, else the best-fit span.
+    pub fn verdict(&self, f: &FaceGdt) -> Verdict {
+        let Some(off) = self.off_mm else { return f.verdict(self.kind, self.tol_mm) };
+        if !f.accepts(Kind::Profile) {
+            return Verdict::Unmeasured;
+        }
+        match f.frame_span_mm.or(f.span_mm) {
+            Some(s) if zone_mm(s, off) <= self.tol_mm => Verdict::Pass { value_mm: zone_mm(s, off), tol_mm: self.tol_mm },
+            Some(s) => Verdict::Fail { value_mm: zone_mm(s, off), tol_mm: self.tol_mm },
+            None => Verdict::Unmeasured,
+        }
+    }
+}

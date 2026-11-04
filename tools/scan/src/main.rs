@@ -886,7 +886,7 @@ mod intent_tests {
 /// `--gdt <face>=<kind>:<tol>`: the face as its `face:` line names it, read by scan_core's ONE grammar
 /// (`gdt::Callout::parse`, VUGSCANGDTSPEC SR559: flatness, cylindricity, position or profile); a refusal is usage.
 fn gdt_spec(it: &mut impl Iterator<Item = String>) -> (String, scan_core::Kind, f64) {
-    let c = scan_core::gdt::Callout::parse(&it.next().unwrap_or_else(|| usage())).unwrap_or_else(|_| usage());
+    let c = scan_core::gdt::Callout::parse(&it.next().unwrap_or_else(|| usage())).ok().filter(|c| c.off_mm.is_none()).unwrap_or_else(|| usage()); // VUGSCANGDTPROFILEDATUM (SR567): an unequal zone is refused, never dropped (VUG-SCAN-GDT-PROFILE-UZ-WIRE owed)
     (c.face, c.kind, c.tol_mm)
 }
 
@@ -935,6 +935,7 @@ fn gdt_road(a: &Args, sm: &ScanMesh, dev: Option<&(Deviation, Vec<String>, scan_
             }
             scan_core::Nominal::Other => {}
         }
+        if let Some(v) = f.profile_in_frame_mm { let _ = write!(r, " profile_frame={v:.3}"); } // VUGSCANGDTPROFILEDATUM (SR567): profile located in the datum frame, with --datum only
         r.push_str(&f.minzone_tokens()); for &(_, kind, tol) in calls.iter().filter(|c| c.0 == f.face as usize) { // VUGSCANGDTMINZONE (SR554): the min-zone token before the verdicts
             let v = match f.verdict(kind, tol) {
                 scan_core::Verdict::Pass { .. } => {
@@ -988,6 +989,6 @@ fn datum_road(a: &Args, sm: &ScanMesh, design: &scan_core::Design, d: &Deviation
         let k = scan_core::gdt::DATUM_LABELS.iter().position(|&l| l == error.label()).unwrap_or(0);
         Refusal::GdtDatum { face: datum[k].clone(), error }
     })?;
-    scan_core::gdt::in_frame(g, &fr); // VUGFACEGDTREMEASURE (SR560): the loop lifted into scan_core, the face calls the same fn
+    scan_core::gdt::in_frame(sm, design, d, margin, g, &fr); // VUGSCANGDTPROFILEDATUM (SR567): the form inputs for the profile; VUGFACEGDTREMEASURE (SR560): the loop lifted into scan_core, the face calls the same fn
     Ok(format!("gdt: frame A={} B={} C={} residual={:.3}\n", datum[0], datum[1], datum[2], fr.residual_mm))
 }

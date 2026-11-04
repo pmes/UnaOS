@@ -549,7 +549,7 @@ fn tsdf_outliers_probe() {
 fn a_callout_parses_once_round_trips_and_refuses_by_name() {
     use scan_core::gdt::{Callout, GdtSpecError};
     let c = Callout::parse("box/f3:plane=flatness:0.05").expect("parses");
-    assert_eq!(c, Callout { face: "box/f3:plane".into(), kind: Kind::Flatness, tol_mm: 0.05 });
+    assert_eq!(c, Callout { face: "box/f3:plane".into(), kind: Kind::Flatness, tol_mm: 0.05, off_mm: None }); // VUGSCANGDTPROFILEDATUM (SR567): the struct grew
     let c = Callout::parse("a=b:c=profile:1.5").expect("parses");
     assert_eq!((c.face.as_str(), c.kind, c.tol_mm), ("a=b:c", Kind::Profile, 1.5));
     for s in ["box/f3:plane=flatness:0.05", "post/f0:cylinder=cylindricity:0.1", "p=position:2", "a=b:c=profile:1.5", "x=profile:0.000125"] {
@@ -584,5 +584,88 @@ fn a_profile_callout_reads_the_nominal_zone_pass_and_fail() {
         assert!(matches!(f.verdict(Kind::Profile, pr + 0.1), Verdict::Pass { .. }));
         assert_eq!(f.verdict(Kind::Profile, pr), Verdict::Pass { value_mm: pr, tol_mm: pr });
         assert_eq!(f.verdict(Kind::Profile, pr * 0.5), Verdict::Fail { value_mm: pr, tol_mm: pr * 0.5 });
+    }
+}
+
+// ---- VUGSCANGDTPROFILEDATUM (LEDGER SR567): profile located in the datum frame; the unequal zone ----
+
+use scan_core::DESIGN_CHORD_MM;
+use scan_core::gdt::{Callout, DatumFrame, GdtSpecError, in_frame, profile_in, zone_mm};
+
+/// A frame whose measured datums ARE the nominal ones (the true-datum case): the relative transform is the identity.
+const TRUE_FRAME: DatumFrame = DatumFrame { measured: Transform::IDENTITY, nominal: Transform::IDENTITY, residual_mm: 0.0 };
+
+/// Under a true-datum frame the profile in the frame reads the best-fit profile within the facet sagitta (deviation.rs
+/// measures to the faceted design, the nominal cylinder passes through its vertices: 2 · DESIGN_CHORD_MM); under the box
+/// datums' MEASURED frame it stays within SR552's promise on this fixture (the seat's ruling D1). Datum face B's plane
+/// nominal shifted 1 mm along x toward the side its span leans reads the profile 2 mm wider while the best fit stays
+/// (ruling D2: on a plane the shift moves every d' by exactly 1); the post's shifted reading is printed.
+#[test]
+fn the_profile_reads_in_the_box_datum_frame() {
+    let (d, names, dev) = measured();
+    let margin = fused().1;
+    let best = faces();
+    let mut g = best.clone();
+    in_frame(scan(), d, dev, margin, &mut g, &TRUE_FRAME);
+    let (t, p) = (top(&g), post(&g));
+    for f in [t, p] {
+        let (pf, pr) = (f.profile_in_frame_mm.expect("profile in the frame"), f.profile_mm.expect("profile"));
+        println!("gdt: profile_frame {}={pf:.3} profile={pr:.3} true", names[f.face as usize]);
+        assert!((pf - pr).abs() <= 2.0 * DESIGN_CHORD_MM + 1e-9, "face {} profile_frame {pf} profile {pr}", f.face);
+        assert_eq!(f.value(Kind::Profile), Some(pf), "the verdict reads in the frame");
+    }
+    let datums = [plane_face(d, Vec3::Z), plane_face(d, -Vec3::X), plane_face(d, -Vec3::Y)];
+    let fr = frame_of(scan(), d, dev, datums, margin, Tol::DEFAULT).expect("the box datums fix a frame");
+    let mut m = best.clone();
+    in_frame(scan(), d, dev, margin, &mut m, &fr);
+    let pm = post(&m);
+    let (pf, pr) = (pm.profile_in_frame_mm.expect("post profile in the measured frame"), pm.profile_mm.expect("post profile"));
+    println!("gdt: profile_frame post={pf:.3} profile={pr:.3} measured residual={:.3}", fr.residual_mm);
+    assert!(pf.is_finite() && pf <= pr + 5.0, "post profile_frame {pf} against profile {pr} in the measured frame");
+    // Datum face B (the box's -x side), its plane nominal shifted 1 mm along x.
+    let b = g.iter().find(|f| f.face == datums[1]).copied().expect("B read");
+    let Nominal::Plane(bp) = b.nominal else { panic!("B is not a plane") };
+    let (lo, hi) = b.span_mm.expect("B span");
+    let grow = if hi >= -lo { 1.0 } else { -1.0 };
+    let own = profile_in(&TRUE_FRAME, scan(), d, dev, b.face, b.nominal, margin).expect("B own");
+    let moved = profile_in(&TRUE_FRAME, scan(), d, dev, b.face, Nominal::Plane(scan_core::Plane { d: bp.d - grow, ..bp }), margin).expect("B shifted");
+    let delta = zone_mm(moved, 0.0) - zone_mm(own, 0.0);
+    let Nominal::Cylinder(nc) = p.nominal else { panic!("post nominal") };
+    let post_moved = profile_in(&TRUE_FRAME, scan(), d, dev, p.face, Nominal::Cylinder(Cylinder { point: nc.point + Vec3::X, ..nc }), margin).map(|s| zone_mm(s, 0.0));
+    println!("gdt: profile shift B={delta:.3} post={:?} (own {:.3})", post_moved, p.profile_in_frame_mm.unwrap_or(f64::NAN));
+    assert!((delta - 2.0).abs() <= 0.3, "B shifted 1 mm: profile_frame wider by {delta}");
+    assert!(post_moved.is_some_and(f64::is_finite), "post shifted reads");
+    assert_eq!(b.profile_mm, best.iter().find(|f| f.face == datums[1]).and_then(|f| f.profile_mm), "best fit unchanged by in_frame");
+}
+
+/// The unequal zone: `@<off>` parses on profile only, reads back, and is refused by name otherwise; a frame that puts
+/// the box top 2 mm proud passes its UZ callout at `@2` with the tolerance its zone about 2 needs, where the same
+/// tolerance on the equal zone fails; without an offset `Callout::verdict` is `FaceGdt::verdict`.
+#[test]
+fn a_profile_uz_callout_passes_a_proud_face_at_its_offset() {
+    let c = Callout::parse("box/f3:plane=profile:1.5@-0.25").expect("parses");
+    assert_eq!((c.kind, c.tol_mm, c.off_mm), (Kind::Profile, 1.5, Some(-0.25)));
+    assert_eq!(Callout::parse(&c.to_string()), Ok(c.clone()), "{c}");
+    assert_eq!(Callout::parse("f=flatness:1@0.5"), Err(GdtSpecError::BadUz { uz: "0.5".into() }));
+    assert_eq!(Callout::parse("f=profile:1@inf"), Err(GdtSpecError::BadUz { uz: "inf".into() }));
+    assert_eq!(Callout::parse("f=profile:1@x"), Err(GdtSpecError::BadUz { uz: "x".into() }));
+    assert_eq!(Callout::parse("f=profile:0@1"), Err(GdtSpecError::BadTol { tol: "0".into() }));
+    let (d, names, dev) = measured();
+    let mut g = faces();
+    let proud = DatumFrame { nominal: Transform::from_translation(Vec3::new(0.0, 0.0, 2.0)), ..TRUE_FRAME };
+    in_frame(scan(), d, dev, fused().1, &mut g, &proud);
+    let t = top(&g);
+    let s = t.frame_span_mm.expect("top span in the frame");
+    let tol = zone_mm(s, 2.0) + 0.01;
+    let name = &names[t.face as usize];
+    let uz = Callout { face: name.clone(), kind: Kind::Profile, tol_mm: tol, off_mm: Some(2.0) };
+    let eq = Callout { off_mm: None, ..uz.clone() };
+    println!("gdt: uz top span=({:.3}, {:.3}) zone@2={:.3} equal={:.3} tol={tol:.3}", s.0, s.1, zone_mm(s, 2.0), zone_mm(s, 0.0));
+    assert!(s.0 > 0.0, "the top stands proud in the frame: {s:?}");
+    assert_eq!(uz.verdict(&t), Verdict::Pass { value_mm: zone_mm(s, 2.0), tol_mm: tol });
+    assert!(matches!(eq.verdict(&t), Verdict::Fail { .. }), "{:?}", eq.verdict(&t));
+    for k in [Kind::Flatness, Kind::Profile] {
+        let c = Callout { kind: k, off_mm: None, ..uz.clone() };
+        assert_eq!(c.verdict(&t), t.verdict(k, tol));
     }
 }
