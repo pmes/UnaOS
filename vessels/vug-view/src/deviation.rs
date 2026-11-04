@@ -79,6 +79,7 @@ pub struct Map {
     pub conf: Option<Conf>,
     /// VUGFACEDEVIATIONHELD (SR600): the statement journal.rs `hold` held (a solid's ONE root fault, its chain in
     /// `faults`), the design built over the standing document; named on the corner `held=<id>` ([`held_line`]).
+    /// VUGFACEJOURNALHOLDMANY (SR609): every held root, comma-joined in line order (`post,post2`).
     pub held: Option<String>,
 }
 
@@ -1180,19 +1181,21 @@ fn conf_line(map: &Map) -> Option<String> {
 // refused the document the journal held (`against_journal`, `open_against`). [`held_split`] is the same pair regenerate
 // reads: the design is the standing document's solids, the held chain is carried in `Map::faults` (and [`refault`]
 // keeps it), the root named on the corner `held=<id>`. The fix's statement replace moves `solid_stmts`, so [`follow`]
-// re-measures and the held word, re-derived per build, is gone. Two roots and the rest still refuse by the first line.
+// re-measures and the held word, re-derived per build, is gone. The rest still refuse by the first line; two or more
+// roots are held together and named `held=<a>,<b>` (VUGFACEJOURNALHOLDMANY, SR609).
 
-/// `failures` split by [`split_faults`] then journal.rs `hold`: (the solid half, the carried, the held root's id). The
-/// root is the solid half's first failure that is not `Upstream`, kept only when the hold emptied that half.
+/// `failures` split by [`split_faults`] then journal.rs `hold`: (the solid half, the carried, the held roots' ids).
+/// VUGFACEJOURNALHOLDMANY (SR609): the roots are journal.rs `held_roots` of the carried, comma-joined in line order,
+/// kept only when the hold emptied the solid half.
 fn held_split(doc: &Doc, failures: Vec<doc_core::Failure>) -> (Vec<doc_core::Failure>, Vec<doc_core::Failure>, Option<String>) {
-    let split = split_faults(doc, failures);
-    let root = split.0.iter().find(|f| !matches!(f.fault, doc_core::Fault::Upstream(_))).map(|f| f.id.clone());
-    let (on_solid, carried) = crate::journal::hold(split);
-    let held = if on_solid.is_empty() { root } else { None };
+    let (on_solid, carried) = crate::journal::hold(split_faults(doc, failures));
+    let roots = crate::journal::held_roots(&carried); // VUGFACEJOURNALHOLDMANY (SR609): every held root, the journal's one list
+    let held = if on_solid.is_empty() && !roots.is_empty() { Some(roots.join(",")) } else { None };
     (on_solid, carried, held)
 }
 
-/// The corner's held line: `held=<id>` while the design stands beside a held statement.
+/// The corner's held line: `held=<id>` while the design stands beside a held statement; `held=<a>,<b>` beside many
+/// (VUGFACEJOURNALHOLDMANY, SR609).
 fn held_line(map: &Map) -> Option<String> {
     map.held.as_ref().map(|id| format!("held={id}"))
 }

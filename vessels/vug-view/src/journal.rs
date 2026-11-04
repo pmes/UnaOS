@@ -732,7 +732,7 @@ impl Journal {
         self.closed = r.closed; self.faults = r.faults.clone(); // VUGFACEJOURNALSOLIDFAULT (SR572): the carried failures
         self.undo.clear();
         self.redo.clear();
-        self.cursor = self.doc.stmts.len().saturating_sub(1);
+        self.cursor = self.doc.stmts.len().saturating_sub(1); self.to_held(); // VUGFACEJOURNALHOLDMANY (SR609): a held document opens on its first root
         self.edit = None;
         self.note = None;
         Ok(r)
@@ -887,7 +887,7 @@ impl Journal {
                 Some(vec![Fix { line, text: format!("remove {rid}"), road: FixRoad::Remove(k) }])
             }
             Fault::BadRef { id: bad, kind } => self.ref_fixes(i, bad, *kind, line), // VUGFACEJOURNALFAULTFIXREF (SR590): the live entities of the slot's kind
-            Fault::NoProfile { .. } | Fault::NoSuchEdge { .. } | Fault::AmbiguousEdge { .. } => self.solid_fixes(i, &f.fault, line), // VUGFACEJOURNALSOLIDFAULTFIX (SR598): the loops / the edge names
+            Fault::NoProfile { .. } | Fault::NoSuchEdge { .. } | Fault::AmbiguousEdge { .. } if held_roots(&self.faults).first().map(String::as_str) == Some(id) => self.solid_fixes(i, &f.fault, line), // VUGFACEJOURNALSOLIDFAULTFIX (SR598): the loops / the edge names; VUGFACEJOURNALHOLDMANY (SR609): the first held root's card only
             _ => None,
         }
     }
@@ -919,7 +919,7 @@ impl Journal {
             FixRoad::Remove(k) => self.delete(k)?,
             FixRoad::Replace(k, s) => self.replace(k, s)?, // VUGFACEJOURNALFAULTFIXREF (SR590)
         };
-        self.note = Some(format!("fixed line {}: {}", f.line, f.text));
+        self.note = Some(format!("fixed line {}: {}", f.line, f.text)); self.to_held(); // VUGFACEJOURNALHOLDMANY (SR609): the next held root's card follows the fix
         Ok(r)
     }
 
@@ -1138,32 +1138,31 @@ pub fn beside(v: &crate::Viewer, typed: &str) -> std::path::PathBuf {
 // chooses from (NoProfile: the closed loops; NoSuchEdge / AmbiguousEdge: the `on` solid's resolving edge names) and only
 // its `Upstream` chain: those failures join the carried ones (`Journal::faults`, the rows painted by `faulted`), and the
 // Body is the solids of the [`standing`] document (the held statements dropped, so a held fillet's `on` solid keeps its
-// slot and [`Journal::record_edit`]'s index rule matches the Body). Two roots, a Conflicting / Diverged / BadRef in a
-// named sketch, a Brep refusal (SR528's RadiusTooLarge) still refuse by the first line: one card restores ONE statement
-// in ONE snapshot. The hold is regenerate's, so load / adopt / step share it (an edit that newly breaks an edge name is
-// held with its card, not refused). The choices ride SR584's card and SR590's Replace road through [`Journal::retyped`].
+// slot and [`Journal::record_edit`]'s index rule matches the Body). A Conflicting / Diverged / BadRef in a named
+// sketch, a Brep refusal (SR528's RadiusTooLarge) still refuse by the first line: one card restores ONE statement in
+// ONE snapshot; two or more roots are held together, the card on the first (VUGFACEJOURNALHOLDMANY, SR609, below).
+// The hold is regenerate's, so load / adopt / step share it (an edit that newly breaks an edge name is held with its
+// card, not refused). The choices ride SR584's card and SR590's Replace road through [`Journal::retyped`].
 
 type Split = (Vec<doc_core::Failure>, Vec<doc_core::Failure>);
 
 /// deviation.rs `split_faults`'s (solid half, carried) with the solid half moved into the carried (re-sorted by line)
-/// when it is ONE root NoProfile / NoSuchEdge / AmbiguousEdge with an id and only `Upstream` failures chained from it
-/// in line order; anything else unchanged (the caller refuses on the solid half's first).
+/// when every root is a NoProfile / NoSuchEdge / AmbiguousEdge with an id and every `Upstream` failure chains from a
+/// root in line order (VUGFACEJOURNALHOLDMANY, SR609: one root or many); anything else unchanged (the caller refuses
+/// on the solid half's first).
 pub(crate) fn hold((on_solid, mut carried): Split) -> Split { // VUGFACEDEVIATIONHELD (SR600): the deviation map's road (deviation.rs `held_split`)
-    let held = {
-        let mut roots = on_solid.iter().filter(|f| !matches!(f.fault, Fault::Upstream(_)));
-        match (roots.next(), roots.next()) {
-            (Some(root), None) if !root.id.is_empty() && matches!(root.fault, Fault::NoProfile { .. } | Fault::NoSuchEdge { .. } | Fault::AmbiguousEdge { .. }) => {
-                let mut chain: Vec<&str> = vec![root.id.as_str()];
-                on_solid.iter().filter(|f| matches!(f.fault, Fault::Upstream(_))).all(|f| match &f.fault {
-                    Fault::Upstream(u) if !f.id.is_empty() && chain.contains(&u.as_str()) => {
-                        chain.push(f.id.as_str());
-                        true
-                    }
-                    _ => false,
-                })
-            }
-            _ => false,
-        }
+    let held = { // VUGFACEJOURNALHOLDMANY (SR609): every root held, each with its own Upstream chain
+        let roots: Vec<&doc_core::Failure> = on_solid.iter().filter(|f| !matches!(f.fault, Fault::Upstream(_))).collect();
+        let rooted = !roots.is_empty() && roots.iter().all(|r| !r.id.is_empty() && root_kind(&r.fault));
+        let mut chain: Vec<&str> = roots.iter().map(|r| r.id.as_str()).collect();
+        rooted
+            && on_solid.iter().filter(|f| matches!(f.fault, Fault::Upstream(_))).all(|f| match &f.fault {
+                Fault::Upstream(u) if !f.id.is_empty() && chain.contains(&u.as_str()) => {
+                    chain.push(f.id.as_str());
+                    true
+                }
+                _ => false,
+            })
     };
     if !held {
         return (on_solid, carried);
@@ -1219,5 +1218,37 @@ impl Journal {
             .map(|s| Fix { line, text: stmt_text(&s), road: FixRoad::Replace(i, s) })
             .collect();
         if out.is_empty() { None } else { Some(out) }
+    }
+}
+
+// ---- VUGFACEJOURNALHOLDMANY (LEDGER SR609): every independent solid root is held, the card on the first ----
+// SR598's [`hold`] took ONE root; a document with two or more independent roots refused, though `standing` already drops
+// every named statement. Now every root (NoProfile / NoSuchEdge / AmbiguousEdge with an id) and its own `Upstream` chain
+// is held. An `Upstream` joins the chain holding its source: doc_core names ONE source statement, so the chain is
+// unique; were a source reachable from two roots, it follows the EARLIER root in line order. The card is offered for
+// the FIRST held root in line order only ([`held_roots`]; a later root's row is marked by `faulted` and offers nothing),
+// the cursor is put on it when a document opens held ([`Journal::load`]) and after a fix lands ([`Journal::accept_fix`]):
+// each fix ONE Replace, ONE snapshot, ONE root restored, the next card following. deviation.rs `held_split` names the
+// same list on the corner, `held=<a>,<b>`.
+
+/// The fault kinds a hold takes as a root: each carries the data its fix chooses from.
+fn root_kind(f: &Fault) -> bool {
+    matches!(f, Fault::NoProfile { .. } | Fault::NoSuchEdge { .. } | Fault::AmbiguousEdge { .. })
+}
+
+/// The held roots' ids in the failures' (line) order: the root-kind failures with an id. Only [`hold`] carries one
+/// (an extrude / revolve / fillet / chamfer is always a solid's statement), so this is the held list; the first is the
+/// root whose card is offered.
+pub(crate) fn held_roots(faults: &[doc_core::Failure]) -> Vec<String> {
+    faults.iter().filter(|f| !f.id.is_empty() && root_kind(&f.fault)).map(|f| f.id.clone()).collect()
+}
+
+impl Journal {
+    /// The cursor on the first held root's row (its card is the one offered); unchanged when nothing is held.
+    fn to_held(&mut self) {
+        let Some(id) = held_roots(&self.faults).into_iter().next() else { return };
+        if let Some(i) = self.doc.stmts.iter().position(|s| s.id() == Some(id.as_str())) {
+            self.cursor = i;
+        }
     }
 }
