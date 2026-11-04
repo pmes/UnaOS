@@ -5206,7 +5206,7 @@ pub fn timer_preempt() {
     }
     let raw = SCHED[cpu].current.load(Ordering::Acquire) as *mut Task;
     if raw.is_null() {
-        return; // scheduler/idle context, or an unscheduled core (the BSP)
+        crate::hidstall::wait_tick_idle(cpu); return; // scheduler/idle context, or an unscheduled core (the BSP). F39HIDWHONOTICK (B1180): the hid pump core's idle tick while its pass is overdue reads `who=?idle` (hidstall.rs tail). LINE-NEUTRAL fold, code first
     }
     // COMPGATE — a standing preemption hold declines this boundary. Placed ABOVE the kill check on
     // purpose: `kill_check_current` NEVER RETURNS for a killed task, so a kill taken at a tick that
@@ -12258,4 +12258,15 @@ pub fn publish_role_split(render: usize, input: usize) {
 pub fn role_split() -> Option<(usize, usize)> {
     let v = ROLE_SPLIT.load(Ordering::Acquire);
     (v != u64::MAX).then(|| ((v >> 32) as usize, (v & 0xffff_ffff) as usize))
+}
+
+// ── F39HIDWHONOTICK (rmbp-ledger B1180) — HID-WHO-NOTICK: does a tick reach `timer_preempt` on this boot? FILE-TAIL append. ──
+// `SCHED_ACTIVE` has three setters and each comes with the IRQ arm that calls `timer_preempt`: `start_aps` (gic.rs's
+// `cfg(baremetal)` post-EOI arm), `run_bsp_tegra` (gic.rs's `any(all(tegra, bsprun), virt_tick)` arm) and virt_tick's arm.
+// False therefore means no tick reaches `hid_wait_tick`, and `hidstall`'s gap split prints `who=?notick` (an Orin
+// `UNAOS_NOBSPTICK` / `UNAOS_NOBSPRUN` image, whose terminus is the cooperative `run_capstone_boot_core`).
+
+/// F39HIDWHONOTICK (B1180): `timer_preempt` runs past its first line on this boot (the tick sampler is wired). One Acquire load.
+pub fn preempt_wired() -> bool {
+    SCHED_ACTIVE.load(Ordering::Acquire)
 }
