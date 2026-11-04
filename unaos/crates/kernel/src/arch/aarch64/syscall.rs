@@ -22523,7 +22523,7 @@ fn bus_mbox_clear(asid: u64) {
     mb.head = 0;
     mb.count = 0;
     for s in mb.slots.iter_mut() {
-        *s = None; // drops the box
+        #[cfg(feature = "busreg")] crate::bus_route::mbox_unread(asid as usize, s.as_ref().map(|m| &*m.frame)); *s = None; // drops the box. RELAY-RESET-SET (B1169): a relayed REQUEST still here was never read by the dying fulfiller; bus_route marks its relay id for on_exit (file tail). LINE-NEUTRAL fold.
     }
 }
 

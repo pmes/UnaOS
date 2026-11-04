@@ -345,7 +345,7 @@ pub fn on_exit(ops: &Ops, row: usize) {
         }
     });
     while let Some(p) = take_pending(|p| p.ful_row == row) {
-        if (ops.rgen)(p.caller_row) == p.caller_gen && deliver(ops, &p, ECONNRESET as i32, &[]) {
+        unread_handoff(row, &p); if (ops.rgen)(p.caller_row) == p.caller_gen && deliver(ops, &p, ECONNRESET as i32, &[]) { // RELAY-RESET-SET (B1169): a kernel-client SET whose frame the dying fulfiller never read is marked for `prefs_client` BEFORE the reset is delivered (file tail). LINE-NEUTRAL fold.
             ORPHAN.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -518,7 +518,7 @@ pub fn selftest(fx: &Fixture) {
     } else {
         serial_println!(":: BANDY3: registered={} relayed={} replied={} orphan={} w={:#05x}/{:#05x} verbs={}/{} -> FAIL ::", rg, rl, rp, or, w, ALL, vg, vl);
     }
-    tagid_selftest(fx); armearly_selftest(fx); /* BUSREG-ARM-EARLY (B1164): the early-arm legs, after the BUSREG-TAGID line (file tail) */ // BUSREG-TAG-IDENTITY (B1157): the identity legs, after the BANDY3 line
+    tagid_selftest(fx); armearly_selftest(fx); unreadset_selftest(fx); /* RELAY-RESET-SET (B1169): the unread-mark legs (file tail). BUSREG-ARM-EARLY (B1164): the early-arm legs, after the BUSREG-TAGID line (file tail) */ // BUSREG-TAG-IDENTITY (B1157): the identity legs, after the BANDY3 line
 }
 
 /// HOLOCRON2 (rmbp-ledger B355): does `verb` have a registration right now? (Generation not checked: a row
@@ -973,5 +973,128 @@ fn armearly_selftest(fx: &Fixture) {
             if w & 4 != 0 { "dropped" } else { "KEPT" },
             armed, w, ALL
         );
+    }
+}
+
+// =================================================================================================
+// RELAY-RESET-SET (rmbp-ledger B1169) — TAIL-APPENDED. RELAY-RESET-FALLBACK (B1165) left a kernel-client SET
+// whose fulfiller dies mid-relay refused -ECONNRESET, because the holder may have committed it. Two truths sit
+// under that reset and only the ARCH's mailbox clear (x86 `busx_mbox_clear`, aarch64 `bus_mbox_clear`, run on
+// the teardown line after the generation bump and just before `on_exit`) can tell them apart: a relayed
+// REQUEST still in a slot was never MRECV'd (UNREAD: the holder never saw it); a frame the holder popped is
+// gone (READ: committed-or-not is unknowable). The clear reports each REQUEST frame it drops through
+// `mbox_unread` (the relay id is the frame's `corr`, kernel-built by `route_request`, so ring 3 cannot forge
+// it); `on_exit`'s sweep takes the mark per pending relay in `unread_handoff` and, for a kernel-client SET,
+// hands the CLIENT's corr to `prefs_client::note_set_unread` BEFORE `deliver` queues the -ECONNRESET. The
+// reply frame is unchanged for every caller (a status in it would be forgeable: `fulfiller_reply` passes a
+// live holder's status verbatim). `UNREAD` is a LEAF lock (taken under the arch mailbox SpinMutex, IRQs
+// masked, and in `on_exit` with PEND released); full = the oldest mark is overwritten, so a lost mark leaves
+// the SET -ECONNRESET (fail-closed, B1165's behaviour).
+// Witness: `tests bandy3` → `:: RELAY-RESET-SET: unread=marked read=unmarked handoff=once -> PASS ::`.
+// =================================================================================================
+
+/// (row, relay id) of relayed REQUEST frames a mailbox clear dropped unread; a ring, next slot in `.1`.
+static UNREAD: crate::sync::Mutex<([(usize, u32); PEND_CAP], usize)> = crate::sync::Mutex::new(([(usize::MAX, 0u32); PEND_CAP], 0));
+
+/// The arch mailbox clear's report: `frame` (a slot's frame, `None` = empty slot) is being dropped from
+/// `row`'s mailbox without being read. A relayed REQUEST (a fulfiller tag, kernel-built) marks its relay id.
+pub fn mbox_unread(row: usize, frame: Option<&[u8]>) {
+    let Some(f) = frame else { return };
+    let Ok(h) = crate::bus::frame_parse(f) else { return };
+    if h.kind != crate::bus::BUS_KIND_REQUEST || h.verb < BUS_VERB_FULFIL_MIN || h.corr == 0 {
+        return;
+    }
+    locked(|| {
+        let mut u = UNREAD.lock();
+        let i = u.1;
+        u.0[i] = (row, h.corr);
+        u.1 = (i + 1) % PEND_CAP;
+    });
+}
+
+/// Take (clear) the unread mark of relay `relay` on fulfiller row `row`. `true` = the frame was never read.
+fn take_unread(row: usize, relay: u32) -> bool {
+    if relay == 0 {
+        return false;
+    }
+    locked(|| {
+        let mut u = UNREAD.lock();
+        match u.0.iter().position(|&e| e == (row, relay)) {
+            Some(i) => {
+                u.0[i] = (usize::MAX, 0);
+                true
+            }
+            None => false,
+        }
+    })
+}
+
+/// `on_exit`'s per-relay step: the mark is always consumed; a kernel-client SET (R3PREF_SET) whose frame was
+/// unread is handed to `prefs_client` by its CLIENT corr, before the -ECONNRESET is delivered.
+fn unread_handoff(row: usize, p: &Pend) {
+    if take_unread(row, p.relay) && p.verb == una_abi::BUS_VERB_R3PREF_SET && p.caller_row == crate::prefs_client::KCLIENT_ROW {
+        crate::prefs_client::note_set_unread(p.caller_corr);
+    }
+}
+
+/// `tests bandy3`' unread-mark legs on the fixture's scratch rows (caller `a`, fulfiller `f`), open tag 254:
+/// U1 a relayed request left in `f`'s mailbox and cleared is marked; U2 one `f` popped (read) and then cleared
+/// is not; U3 `unread_handoff` of a kernel-client SET marks the client corr exactly once (a GET marks none).
+fn unreadset_selftest(fx: &Fixture) {
+    let (a, f) = fx.rows;
+    let busy = locked(|| REGS.lock().iter().flatten().any(|r| (r.row == a || r.row == f) && (fx.ops.rgen)(r.row) == r.rgen));
+    if busy {
+        serial_println!(":: RELAY-RESET-SET: SKIP (scratch rows {}/{} hold a live registration) ::", a, f);
+        return;
+    }
+    let vg = 254u8;
+    let parse = |b: &[u8]| crate::bus::frame_parse(b).ok();
+    let pend_relay = |c: u32| locked(|| PEND.lock().iter().flatten().find(|p| p.ful_row == f && p.caller_row == a && p.caller_corr == c).map(|p| p.relay));
+    let mut buf = [0u8; 128];
+    (fx.clear)(a);
+    (fx.clear)(f);
+    // U1: unread at the clear -> marked.
+    let n = crate::bus::build_request(BUS_VERB_REGISTER, 80, &[vg], &mut buf);
+    let reg1 = (fx.send)(f, &buf[..n]) == 0 && matches!((fx.pop)(f).as_deref().and_then(parse), Some(h) if h.status == 0 && h.corr == 80);
+    let n = crate::bus::build_request(vg, 81, b"ui.theme", &mut buf);
+    let sent1 = (fx.send)(a, &buf[..n]) == 0;
+    let r1 = pend_relay(81);
+    (fx.clear)(f);
+    let u1 = reg1 && sent1 && r1.is_some_and(|r| take_unread(f, r));
+    on_exit(fx.ops, f);
+    (fx.clear)(a);
+    // U2: read (popped) before the clear -> not marked.
+    let n = crate::bus::build_request(BUS_VERB_REGISTER, 82, &[vg], &mut buf);
+    let reg2 = (fx.send)(f, &buf[..n]) == 0 && matches!((fx.pop)(f).as_deref().and_then(parse), Some(h) if h.status == 0 && h.corr == 82);
+    let n = crate::bus::build_request(vg, 83, b"ui.theme", &mut buf);
+    let sent2 = (fx.send)(a, &buf[..n]) == 0;
+    let r2 = pend_relay(83);
+    let read2 = (fx.pop)(f).is_some();
+    (fx.clear)(f);
+    let u2 = reg2 && sent2 && read2 && r2.is_some_and(|r| !take_unread(f, r));
+    on_exit(fx.ops, f);
+    (fx.clear)(a);
+    // U3: the handoff of a kernel-client SET marks the client corr once; a GET's mark is consumed, not handed.
+    let cc = u32::MAX; // never a live client corr in practice (the client counts up from 1)
+    let mut handoff = |verb: u8| {
+        let mut relay = NEXT_RELAY.fetch_add(1, Ordering::Relaxed);
+        if relay == 0 {
+            relay = NEXT_RELAY.fetch_add(1, Ordering::Relaxed);
+        }
+        let n = crate::bus::build_request(verb, relay, b"", &mut buf);
+        mbox_unread(f, Some(&buf[..n]));
+        let p = Pend { relay, verb, caller_row: crate::prefs_client::KCLIENT_ROW, caller_gen: crate::prefs_client::KCLIENT_GEN, caller_corr: cc, ful_row: f, ful_gen: (fx.ops.rgen)(f) };
+        unread_handoff(f, &p);
+        !take_unread(f, relay)
+    };
+    let get_consumed = handoff(una_abi::BUS_VERB_R3PREF_GET);
+    let get_none = !crate::prefs_client::set_unread_take(cc);
+    let set_consumed = handoff(una_abi::BUS_VERB_R3PREF_SET);
+    let once = crate::prefs_client::set_unread_take(cc) && !crate::prefs_client::set_unread_take(cc);
+    let u3 = get_consumed && get_none && set_consumed && once;
+    if u1 && u2 && u3 {
+        serial_println!(":: RELAY-RESET-SET: unread=marked read=unmarked handoff=once -> PASS ::");
+    } else {
+        serial_println!(":: RELAY-RESET-SET: u1={} u2={} u3={} (reg={}/{} sent={}/{} read={}) -> FAIL ::", u1 as u8, u2 as u8, u3 as u8, reg1 as u8, reg2 as u8, sent1 as u8, sent2 as u8, read2 as u8);
     }
 }
