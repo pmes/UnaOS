@@ -430,3 +430,121 @@ fn the_intent_sigma_deg_is_the_largest_shape_spread() {
     let sigma: f64 = field(&report, "intent: shapes:", "sigma_deg").parse().unwrap();
     assert!((sigma - largest).abs() <= 0.0055 + 1e-9, "sigma_deg {sigma} vs the largest spread {largest}\n{report}");
 }
+
+/// VUGSCANGDT (SR542): the SR510 world-posed orbit `--against` its design document (its own copy of that test's
+/// setup), read as ISO 1101 tolerances: every design face gets a `gdt:` line and no verdict when no tolerance is
+/// named; the box top's flatness named just over its value reads PASS, the post's position at half its value FAIL; an unknown face is refused
+/// `GdtFace` (exit 1) and a malformed callout is usage (exit 2).
+#[test]
+fn a_gdt_against_design_reads_each_face_and_the_named_verdicts() {
+    const DOC: &str = r#"vug-doc version=1 lin=1e-6 ang=1e-9
+sketch s1 o=[0 0 0] z=[0 0 1] x=[1 0 0]
+point p1 sketch=s1 x=-230 y=-100
+point p2 sketch=s1 x=70 y=-100
+point p3 sketch=s1 x=70 y=100
+point p4 sketch=s1 x=-230 y=100
+line l1 sketch=s1 a=p1 b=p2
+line l2 sketch=s1 a=p2 b=p3
+line l3 sketch=s1 a=p3 b=p4
+line l4 sketch=s1 a=p4 b=p1
+fix f1 sketch=s1 p=p1 at=[-230 -100]
+fix f2 sketch=s1 p=p2 at=[70 -100]
+fix f3 sketch=s1 p=p3 at=[70 100]
+fix f4 sketch=s1 p=p4 at=[-230 100]
+sketch s2 o=[0 0 0] z=[0 0 1] x=[1 0 0]
+point c0 sketch=s2 x=160 y=0
+circle c1 sketch=s2 centre=c0 r=40
+fix g1 sketch=s2 p=c0 at=[160 0]
+radius r1 sketch=s2 circle=c1 r=40
+extrude body sketch=s1 outer=l1 dir=[0 0 1] length=100
+extrude post sketch=s2 outer=c1 dir=[0 0 1] length=150
+"#;
+    let d = dir("gdt");
+    let (inp, ply, poses, doc) = (d.join("orbit.prb"), d.join("orbit.ply"), d.join("poses.txt"), d.join("part.vugdoc"));
+    let intr = fixture::bench_intrinsics();
+    let truth = |k: u32| fixture::orbit(CENTRE, 600.0, 40.0 * DEG, k as f64 * 30.0 * DEG);
+    let recs: Vec<Record> = (0..12u32)
+        .map(|k| {
+            let f = fixture::render_depth(&Scene::bench(), &intr, DepthScale::D400_DEFAULT, &truth(k), &Noise::NONE, k as u64);
+            Record::new(f, "replay:d435i", 1000, Some(k4())).unwrap()
+        })
+        .collect();
+    std::fs::write(&inp, recording::write(&recs).unwrap()).unwrap();
+    let mut text = String::new();
+    for k in 0..12 {
+        let p = truth(k);
+        let (m, t) = (p.rot.to_mat3(), p.trans);
+        let r = [[m.cols[0].x, m.cols[1].x, m.cols[2].x], [m.cols[0].y, m.cols[1].y, m.cols[2].y], [m.cols[0].z, m.cols[1].z, m.cols[2].z]];
+        text += &format!(
+            "{:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?}\n",
+            r[0][0], r[0][1], r[0][2], t.x, r[1][0], r[1][1], r[1][2], t.y, r[2][0], r[2][1], r[2][2], t.z
+        );
+    }
+    std::fs::write(&poses, text).unwrap();
+    std::fs::write(&doc, DOC).unwrap();
+    let base = [inp.to_str().unwrap(), "-o", ply.to_str().unwrap(), "--poses", poses.to_str().unwrap(), "--band", "1", "--against", doc.to_str().unwrap()];
+    let run = |extra: &[&str]| scan(&[&base[..], extra].concat());
+
+    // No tolerance named: one gdt line per face line, no verdict.
+    let o = run(&[]);
+    let report = String::from_utf8_lossy(&o.stdout).into_owned();
+    assert!(o.status.success(), "stderr: {}", String::from_utf8_lossy(&o.stderr));
+    println!("{report}");
+    let gdt: Vec<&str> = report.lines().filter(|l| l.starts_with("gdt: ") && !l.starts_with("gdt: callouts=")).collect();
+    assert_eq!(gdt.len(), report.lines().filter(|l| l.starts_with("face: ")).count(), "one gdt line per design face");
+    assert!(gdt.iter().all(|l| !l.contains("verdict=") && l.contains(" n=")), "no verdict without a tolerance");
+    assert!(report.lines().any(|l| l == "gdt: callouts=0 pass=0 fail=0"), "{report}");
+    let name = |l: &str| l["gdt: ".len()..l.find(" surface=").unwrap()].to_string();
+    let num = |l: &str, key: &str| -> f64 {
+        let at = l.find(&format!(" {key}=")).unwrap_or_else(|| panic!("no {key} in {l}")) + key.len() + 2;
+        l[at..].split_whitespace().next().unwrap().parse().unwrap_or_else(|_| panic!("{key} in {l}"))
+    };
+    let top = gdt
+        .iter()
+        .copied()
+        .find(|l| {
+            let l: &str = l;
+            l.contains(" surface=plane ") && (num(l, "d") - 100.0).abs() < 0.05 && l.contains(" normal=(") && {
+                let n = &l[l.find(" normal=(").unwrap() + 9..];
+                n[..n.find(')').unwrap()].split(',').nth(2).unwrap().parse::<f64>().unwrap() > 0.99
+            }
+        })
+        .unwrap_or_else(|| panic!("no box top in\n{report}"));
+    let post = gdt.iter().copied().find(|l| l.contains(" surface=cylinder ")).unwrap_or_else(|| panic!("no post side in\n{report}"));
+    // The seat's ruling (SR542): the fixture's TSDF surface carries interior vertices 0.6-3 mm off with no noise
+    // (VUG-SCAN-TSDF-OUTLIERS), so the form values are printed and checked finite, never bounded here.
+    let (fl, cy, pos) = (num(top, "flatness"), num(post, "cylindricity"), num(post, "position"));
+    println!("gdt: outliers top={fl:.3} post={cy:.3} (VUG-SCAN-TSDF-OUTLIERS owed)");
+    println!("gdt: form/band top={fl:.3}/{:.3} post={cy:.3}/{:.3}", num(top, "band"), num(post, "band"));
+    assert!([fl, cy, pos, num(top, "band"), num(post, "band")].iter().all(|v| v.is_finite() && *v >= 0.0), "{top}\n{post}");
+    for l in [top, post] {
+        let n = &l[l.find(" n=").unwrap() + 3..];
+        let (kept, matched) = n.split_whitespace().next().unwrap().split_once('/').unwrap_or_else(|| panic!("n=<kept>/<matched> in {l}"));
+        let (kept, matched): (u32, u32) = (kept.parse().unwrap(), matched.parse().unwrap());
+        assert!(kept >= 16 && kept <= matched, "{l}");
+    }
+    // The nominals: the top (0, 0, 1) at d 100, the post r 40 on the axis through (160, 0).
+    assert!((num(top, "d") - 100.0).abs() < 0.05, "{top}");
+    assert!((num(post, "r") - 40.0).abs() < 0.05, "{post}");
+    let point = &post[post.find(" point=(").unwrap() + 8..];
+    let xy: Vec<f64> = point[..point.find(')').unwrap()].split(',').map(|v| v.parse().unwrap()).collect();
+    assert!((xy[0] - 160.0).abs() < 0.05 && xy[1].abs() < 0.05, "{post}");
+
+    // Two named tolerances read against the measured values: the top just over its flatness PASSes, the post at half
+    // its position FAILs (a FAIL is a printed measurement: the run still succeeds).
+    let (top_spec, post_spec) = (format!("{}=flatness:{:.4}", name(top), fl + 0.1), format!("{}=position:{:.4}", name(post), (pos * 0.5).max(1e-4)));
+    let o = run(&["--gdt", &top_spec, "--gdt", &post_spec]);
+    let report = String::from_utf8_lossy(&o.stdout).into_owned();
+    assert!(o.status.success(), "stderr: {}", String::from_utf8_lossy(&o.stderr));
+    println!("{report}");
+    assert!(report.lines().any(|l| l.starts_with(&format!("gdt: {} ", name(top))) && l.contains(" verdict=flatness:") && l.ends_with(" PASS")), "{report}");
+    assert!(pos <= 2e-4 || report.lines().any(|l| l.starts_with(&format!("gdt: {} ", name(post))) && l.contains(" verdict=position:") && l.ends_with(" FAIL")), "{report}");
+    assert!(report.lines().any(|l| l.starts_with("gdt: callouts=2 pass=")), "{report}");
+
+    // An unknown face is refused by name; a malformed callout is usage.
+    let o = run(&["--gdt", "nosuch=flatness:1"]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&o.stderr).contains("GdtFace"), "{}", String::from_utf8_lossy(&o.stderr));
+    let o = run(&["--gdt", "nosuch=roundness:1"]);
+    assert_eq!(o.status.code(), Some(2));
+}
