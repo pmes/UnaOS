@@ -223,7 +223,10 @@ pub enum Stmt {
     // document, referencing nothing; the path is relative to the document's folder and is data, never opened here
     // (BP-vug-4): the face opens it. The crop meta rides the photo itself; the camera's prefs are Principia's.
     /// The graph-paper photo under the document: its file (relative to the document) and the paper's pitch (mm).
-    Photo { path: String, pitch_mm: f64 },
+    /// VUGDOCPHOTOREFCROP (SR660): `h=[9 numbers]`, optional — the frame the document was drawn in, row-major paper mm ->
+    /// pixel of the NAMED file's pixels (a crop re-measured alone numbers its lattice from its own first line, so its
+    /// frame cannot be recovered from it); absent, the named file's own measurement frames the document (SR652's road).
+    Photo { path: String, pitch_mm: f64, h: Option<[f64; 9]> },
 }
 
 impl Stmt {

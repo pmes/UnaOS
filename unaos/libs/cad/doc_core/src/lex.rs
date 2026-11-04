@@ -753,9 +753,10 @@ fn statement(t: Toks, line: u32, st: &mut State, lib: &dyn Lib) -> Result<Stmt, 
             }
             let path = f.text("path")?;
             let pitch_mm = f.f64("pitch")?;
+            let h = match f.opt("h") { Some(v) => Some(nums::<9>(&v, "h", line)?), None => None }; // VUGDOCPHOTOREFCROP (SR660): the optional frame, nine finite numbers
             f.done()?;
             st.photo = true;
-            Stmt::Photo { path, pitch_mm }
+            Stmt::Photo { path, pitch_mm, h }
         }
         _ => match constraint(&verb, &mut f, st)? {
             Some((sketch, c)) => {

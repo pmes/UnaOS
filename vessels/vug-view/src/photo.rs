@@ -2030,3 +2030,27 @@ pub fn cropped_h(h: &[[f64; 3]; 3], x: u32, y: u32) -> [[f64; 3]; 3] {
     let (x, y) = (x as f64, y as f64);
     [[h[0][0] - x * h[2][0], h[0][1] - x * h[2][1], h[0][2] - x * h[2][2]], [h[1][0] - y * h[2][0], h[1][1] - y * h[2][1], h[1][2] - y * h[2][2]], h[2]]
 }
+
+// ---- VUGDOCPHOTOREFCROP (SR660): a measured photo laid on the document's stated frame (named tail block) ----
+// [`slid`]'s sibling: where the carry moves H by a known offset, a re-opened document that states its frame (lib.rs
+// `Viewer::photo_frame`, the .vug's `photo ... h=[..]`) takes THE photo road's measurement of the named file, whose own
+// lattice numbering may differ from the document's by whole pitches or a flip, and moves it onto that frame through the
+// pixels: every outline and loop point p goes to H_doc⁻¹ · H_measured · p, `h` becomes H_doc exactly, the sheet is rebuilt
+// over the moved outline. `first` (the side photo's pairing, read for its lengths and pitch, which such a move keeps)
+// stays in its own frame.
+
+/// `ph` (measured) laid on the stated frame `h` (paper mm -> pixel of the same image): its outline and loops moved onto
+/// `h`'s paper frame, `ph.h = h`, and the paper sheet over the moved outline at `pitch_mm`; a frame that does not invert,
+/// or a point either frame does not see, is refused by name and `ph` is untouched.
+pub fn framed(ph: &mut Photo, h: [[f64; 3]; 3], pitch_mm: f64) -> Result<Model, String> {
+    let inv = photo_core::homography::invert(&h).map_err(|_| "the stated frame does not invert".to_string())?;
+    let mv = |p: &Vec2| photo_core::homography::apply(&ph.h, *p).and_then(|u| photo_core::homography::apply(&inv, u));
+    let outline: Option<Vec<Vec2>> = ph.outline.iter().map(mv).collect();
+    let loops: Option<Vec<Vec<Vec2>>> = ph.loops.iter().map(|l| l.iter().map(mv).collect()).collect();
+    let (Some(outline), Some(loops)) = (outline, loops) else { return Err("the stated frame does not see the measured outline".to_string()) };
+    let model = paper(&outline, pitch_mm)?;
+    ph.outline = outline;
+    ph.loops = loops;
+    ph.h = h;
+    Ok(model)
+}

@@ -1749,15 +1749,15 @@ fn a_sketched_line_survives_the_crop_at_the_same_paper_mm() {
 }
 
 /// VUGFACEPHOTOCROPDOC (SR649): the carried document then saves to its own file beside the ORIGINAL photo (`s` writes
-/// doc_core's text to the kept `fixture.vug`; VUGDOCPHOTOREF (SR652): its `photo` line names the ORIGINAL
-/// `fixture.png`, whose measurement frames the document), clean, the title the crop's name; no `fixture.crop.vug` is
+/// doc_core's text to the kept `fixture.vug`; VUGDOCPHOTOREFCROP (SR660): its `photo` line names the crop
+/// `fixture.crop.png` with the slid frame `h` the document is drawn in), clean, the title the crop's name; no `fixture.crop.vug` is
 /// written and the original photo is untouched.
 #[test]
 fn the_carried_document_saves_beside_the_original_photo() {
     let (mut vw, dir, _, doc, _, _) = crop_sketched("docsave");
     assert!(key(&mut vw, "s"));
     let saved = std::fs::read_to_string(dir.join("fixture.vug")).expect("the document is saved beside the original photo");
-    assert_eq!(saved, with_photo(&doc, "fixture.png"), "the carried document, the line's statements included, over the original photo"); // VUGDOCPHOTOREF (SR652)
+    assert_eq!(saved, with_framed(&doc, "fixture.crop.png", &ph(&vw).h), "the carried document, the line's statements included, over the crop in its slid frame"); // VUGDOCPHOTOREFCROP (SR660)
     assert!(!vw.view.design.journal.dirty(), "saved");
     assert_eq!(vw.title, "fixture.crop.png");
     assert!(!dir.join("fixture.crop.vug").exists(), "the crop's name never becomes the document's");
@@ -1770,7 +1770,7 @@ fn the_carried_document_saves_beside_the_original_photo() {
 /// The text `s` writes for `doc` drawn over the photo `path` (relative): doc_core's writer with the `photo` statement
 /// first, at the fixture's pitch.
 fn with_photo(doc: &doc_core::Doc, path: &str) -> String {
-    let mut stmts = vec![doc_core::Stmt::Photo { path: path.into(), pitch_mm: photo::PITCH_MM }];
+    let mut stmts = vec![doc_core::Stmt::Photo { path: path.into(), pitch_mm: photo::PITCH_MM, h: None }]; // VUGDOCPHOTOREFCROP (SR660): no frame
     stmts.extend(doc.stmts.iter().cloned());
     doc_core::write(&doc_core::Doc { tol: doc.tol, stmts, lines: Vec::new() })
 }
@@ -1854,5 +1854,76 @@ fn a_document_whose_photo_is_missing_opens_bare_and_names_it() {
     back.save().expect("the save");
     assert_eq!(std::fs::read_to_string(&vug).expect("re-saved"), saved, "the photo line survives a save without the photo");
     eprintln!("photo: doc-ref missing=fixture.png bare=true kept-on-save=true");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---- VUGDOCPHOTOREFCROP (SR660): the document names the crop with its frame; a re-open from the crop alone (named tail block) ----
+
+/// The text `s` writes for `doc` drawn over the photo `path` in the frame `h` (row-major `h=[..]` after the pitch).
+fn with_framed(doc: &doc_core::Doc, path: &str, h: &[[f64; 3]; 3]) -> String {
+    let flat = [h[0][0], h[0][1], h[0][2], h[1][0], h[1][1], h[1][2], h[2][0], h[2][1], h[2][2]];
+    let mut stmts = vec![doc_core::Stmt::Photo { path: path.into(), pitch_mm: photo::PITCH_MM, h: Some(flat) }];
+    stmts.extend(doc.stmts.iter().cloned());
+    doc_core::write(&doc_core::Doc { tol: doc.tol, stmts, lines: Vec::new() })
+}
+
+/// The bounds of a closed outline: (min x, min y, max x, max y).
+fn bounds(o: &[Vec2]) -> (f64, f64, f64, f64) {
+    o.iter().fold((f64::MAX, f64::MAX, f64::MIN, f64::MIN), |b, p| (b.0.min(p.x), b.1.min(p.y), b.2.max(p.x), b.3.max(p.y)))
+}
+
+/// VUGDOCPHOTOREFCROP (SR660): a line sketched over the photo survives crop -> save -> re-open from the CROP file alone at
+/// the same paper mm. After SR649's carry `s` writes `photo path="fixture.crop.png" pitch=5 h=[..]` (the slid H' bit for
+/// bit) and `photo_doc` names the crop; the ORIGINAL is then removed; `Viewer::open` of the .vug measures the crop
+/// through THE photo road and lays it on the stated frame: the same document, clean, `Photo.h` == H', the colour under
+/// the line the one it was drawn over, the outline within the band of the carried one, the crop road on the crop's file,
+/// and a re-save writes the same bytes. The crop measured by itself numbers its lattice from its own first line: the
+/// paper map from its frame to the document's at the crop's centre is printed in pitches.
+#[test]
+fn a_sketched_line_survives_the_crop_and_reopens_from_the_crop_alone_at_the_same_paper_mm() {
+    let (mut vw, dir, [_, _, w, h], doc, _, line) = crop_sketched("refcrop");
+    let crop = dir.join("fixture.crop.png");
+    let carried = ph(&vw).clone();
+    assert!(key(&mut vw, "s"), "`s` saves");
+    assert!(!vw.view.design.journal.dirty(), "saved: {:?}", vw.view.design.journal.disk);
+    let vug = dir.join("fixture.vug");
+    let saved = std::fs::read_to_string(&vug).expect("the document is saved");
+    assert_eq!(saved, with_framed(&doc, "fixture.crop.png", &carried.h), "the photo line names the crop in its slid frame");
+    assert_eq!(vw.photo_doc.as_ref().map(|(p, _)| p.as_path()), Some(crop.as_path()), "the reference is the crop");
+    assert_eq!(vw.photo_frame, Some(carried.h));
+    std::fs::remove_file(dir.join("fixture.png")).expect("the original is removed");
+
+    let alone = Viewer::open(crop.to_str().expect("a UTF-8 path"), (W, H), Preset::Una).unwrap_or_else(|e| panic!("the crop measures alone: {e}"));
+    let own = ph(&alone).h;
+    let c = Vec2::new(w as f64 * 0.5, h as f64 * 0.5);
+    let (Ok(inv_own), Ok(inv_doc)) = (photo_core::homography::invert(&own), photo_core::homography::invert(&carried.h)) else { panic!("both frames invert") };
+    let (q_own, q_doc) = (photo_core::homography::apply(&inv_own, c).expect("own"), photo_core::homography::apply(&inv_doc, c).expect("doc"));
+
+    let mut back = Viewer::open(vug.to_str().expect("a UTF-8 path"), (W, H), Preset::Una).unwrap_or_else(|e| panic!("the document opens: {e}"));
+    assert!(back.view.photo.is_some(), "the crop is laid under the document: {:?}", back.view.design.journal.disk);
+    assert_eq!(back.view.design.journal.doc, doc, "the same document: the line at the same paper mm");
+    assert!(!back.view.design.journal.dirty(), "opened clean");
+    assert_eq!(back.title, "fixture.vug");
+    assert_eq!(ph(&back).h, carried.h, "the stated frame, bit for bit, not the crop's own");
+    assert_eq!(ph(&back).crop.source.as_deref(), Some(crop.as_path()), "the crop road on the crop's file");
+    let mid = Vec2::new((line[0].x + line[1].x) * 0.5, (line[0].y + line[1].y) * 0.5);
+    for q in [line[0], line[1], mid] {
+        let (c0, c1) = (carried.sample([q.x, q.y]).expect("on the carried crop"), ph(&back).sample([q.x, q.y]).expect("on the re-laid crop"));
+        assert_eq!(c0, c1, "the same colour under the line at {q:?}");
+    }
+    let (b0, b1) = (bounds(&carried.outline), bounds(&ph(&back).outline));
+    let band = 2.0 * carried.band_mm.max(ph(&back).band_mm);
+    assert!((b0.0 - b1.0).abs() <= band && (b0.1 - b1.1).abs() <= band && (b0.2 - b1.2).abs() <= band && (b0.3 - b1.3).abs() <= band, "the outline on the document's frame: {b0:?} vs {b1:?} (band {band})");
+
+    back.save().expect("the re-save");
+    assert_eq!(std::fs::read_to_string(&vug).expect("re-saved"), saved, "a re-save writes the same bytes: the crop and its frame");
+    eprintln!(
+        "photo: doc-ref-crop saved=fixture.vug photo=fixture.crop.png h-equal=true original=removed shift={},{} pitches own-h-equal={} outline={:?}/{:?}",
+        (q_doc.x - q_own.x) / photo::PITCH_MM,
+        (q_doc.y - q_own.y) / photo::PITCH_MM,
+        own == carried.h,
+        b0,
+        b1
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
