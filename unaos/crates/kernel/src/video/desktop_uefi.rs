@@ -1152,7 +1152,7 @@ pub fn gop_ignite() {
 // paint under a live compositor is the second writer this module's law forbids). The monitor is the metal witness.
 
 /// Witness colours (0x00RRGGBB), in wire order: centre, tl, tr, bl, br. Orange has R != B, so a channel swap reads 0080ff.
-const GOP_SHOT_COLOURS: [u32; 5] = [0x00FF_8000, 0x00FF_0000, 0x0000_FF00, 0x0000_00FF, 0x00FF_FFFF];
+const GOP_SHOT_COLOURS: [u32; 5] = [crate::video::theme::fixture::RGB_ORANGE, crate::video::theme::fixture::RGB_RED, crate::video::theme::fixture::RGB_GREEN, crate::video::theme::fixture::RGB_BLUE, crate::video::theme::fixture::WHITE]; // GATEREDS (rmbp-ledger B1096): the five witness colours through theme::fixture (palette_core), same values and order
 /// The wire names of the five squares, in [`GOP_SHOT_COLOURS`]'s order.
 const GOP_SHOT_NAMES: [&str; 5] = ["centre", "tl", "tr", "bl", "br"];
 /// The latch: 0 not run, 1 PASS, 2 FAIL, 3 SKIP.
