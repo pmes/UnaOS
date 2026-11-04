@@ -8,7 +8,8 @@
 //! the refusal; Backspace rejects; Tab cycles; `i` asks Vein over the bus (VUGFACEINTENTSEND SR514: one Propose out, the
 //! live id's Proposals offered, a stale id ignored, a Refused named). The proposal road is witnessed twice: on
 //! the fixture's hole circles, and on a hand-built photo face (the intent arc's 49.7 x 30.2 rectangle, sigma 0.3) that
-//! does not depend on photo_core.
+//! does not depend on photo_core. VUGFACESTREAM (SR535): Vein's streamed proposals enter as previews (verified, marked
+//! STREAMING), Enter on one waits by name, the terminal Proposals settles them, Refused withdraws them with the count.
 
 use bandy::{IntentEvent, IntentProposal, SMessage};
 use doc_core::{Proposal, Reason, Verdict};
@@ -324,4 +325,101 @@ fn a_refusal_names_its_why() {
     // Answered: a second answer to the same id is stale.
     assert!(!vw.input(&SMessage::Intent(IntentEvent::Refused { request: 1, why: "again".into() })));
     assert_eq!(ph(&vw).ignored, 1);
+}
+
+// ---- VUGFACESTREAM (SR535): the streamed preview ----
+
+const V1: &str = "distance v1 sketch=s a=e0 b=e1 d=50";
+const V2: &str = "distance v2 sketch=s a=e1 b=e2 d=33";
+const V3: &str = "distance v3 sketch=s a=e2 b=e3 d=50";
+
+fn streamed(vw: &mut Viewer, request: u64, index: u32, stmt: &str) -> bool {
+    vw.input(&SMessage::Intent(IntentEvent::Proposal { request, index, proposal: vein(stmt) }))
+}
+
+#[test]
+fn three_streamed_proposals_settle_on_the_terminal() {
+    let mut vw = rectangle();
+    ask(&mut vw);
+    for (i, s) in [V1, V2, V3].iter().enumerate() {
+        assert!(streamed(&mut vw, 1, i as u32, s), "a preview draws");
+    }
+    assert_eq!(ph(&vw).asked, Some(1), "the terminal answer still follows");
+    assert_eq!(ph(&vw).offers.len(), 3);
+    assert!(ph(&vw).offers.iter().enumerate().all(|(i, o)| o.streaming == Some(i as u32)), "each marked by its index");
+    assert!(matches!(ph(&vw).offers[0].verdict, Verdict::Accept { .. }));
+    assert!(matches!(ph(&vw).offers[1].verdict, Verdict::Refuse { why: Reason::Residual { .. } }), "verified on arrival");
+    let gs = photo::glyphs(&vw.view);
+    assert_eq!(gs.len(), 3, "three glyphs");
+    assert!(gs.iter().all(|g| g.text.ends_with(" STREAMING")), "{:?}", gs.iter().map(|g| &g.text).collect::<Vec<_>>());
+    assert!(gs[0].text.contains(" R="), "the residual shows: {}", gs[0].text);
+    assert_eq!(ph(&vw).note.as_deref(), Some("Vein streaming: 3 proposals (request 1)"));
+    // Tab focuses a preview.
+    assert_eq!(ph(&vw).focus, Some(0));
+    assert!(key(&mut vw, "Tab"));
+    assert_eq!(ph(&vw).focus, Some(1));
+    // A stale id's preview is ignored and counted.
+    assert!(!streamed(&mut vw, 7, 3, V1));
+    assert_eq!(ph(&vw).ignored, 1);
+    assert_eq!(ph(&vw).offers.len(), 3);
+    let verdicts: Vec<Verdict> = ph(&vw).offers.iter().map(|o| o.verdict.clone()).collect();
+    let proposals = vec![vein(V1), vein(V2), vein(V3)];
+    assert!(vw.input(&SMessage::Intent(IntentEvent::Proposals { request: 1, proposals })));
+    assert_eq!(ph(&vw).asked, None, "answered");
+    assert_eq!(ph(&vw).offers.len(), 3, "the same three, settled in place");
+    assert!(ph(&vw).offers.iter().all(|o| o.streaming.is_none()), "the mark cleared");
+    assert_eq!(ph(&vw).offers.iter().map(|o| o.verdict.clone()).collect::<Vec<_>>(), verdicts, "equal items keep their verdict");
+    let gs = photo::glyphs(&vw.view);
+    assert_eq!(gs.len(), 3);
+    assert!(gs.iter().all(|g| !g.text.contains("STREAMING")));
+    assert!(ph(&vw).note.as_deref().unwrap().contains("proposed=3 acceptable=2 refused=1"), "{:?}", ph(&vw).note);
+}
+
+#[test]
+fn enter_during_the_stream_is_refused_by_name() {
+    let mut vw = rectangle();
+    ask(&mut vw);
+    assert!(streamed(&mut vw, 1, 0, V1));
+    assert!(matches!(ph(&vw).offers[0].verdict, Verdict::Accept { .. }));
+    assert_eq!(ph(&vw).focus, Some(0));
+    let before = face(&vw).sketch.params().to_vec();
+    assert!(key(&mut vw, "Return"));
+    assert_eq!(ph(&vw).note.as_deref(), Some("wait: the answer is not complete"));
+    assert_eq!(face(&vw).sketch.params(), &before[..], "nothing entered");
+    assert_eq!(ph(&vw).offers[0].state, State::Open);
+    assert_eq!(ph(&vw).offers[0].streaming, Some(0));
+    // Settled by the terminal answer, the same Enter enters it exactly.
+    assert!(vw.input(&SMessage::Intent(IntentEvent::Proposals { request: 1, proposals: vec![vein(V1)] })));
+    assert!(key(&mut vw, "Return"));
+    assert_eq!(ph(&vw).offers[0].state, State::Applied);
+    assert!((dist(&face(&vw).sketch, 0, 1) - 50.0).abs() < 1e-6, "the side is exactly 50");
+}
+
+#[test]
+fn a_refusal_after_two_withdraws_both() {
+    let mut vw = rectangle();
+    ask(&mut vw);
+    assert!(streamed(&mut vw, 1, 0, V1));
+    assert!(streamed(&mut vw, 1, 1, V2));
+    assert_eq!(photo::glyphs(&vw.view).len(), 2);
+    // Vein's own wire already names the count (handlers/vein intent): never written twice.
+    assert!(vw.input(&SMessage::Intent(IntentEvent::Refused { request: 1, why: "ProseAroundJson after 2 proposals".into() })));
+    assert!(ph(&vw).offers.is_empty(), "both withdrawn");
+    assert!(photo::glyphs(&vw.view).is_empty());
+    assert_eq!(ph(&vw).note.as_deref(), Some("Vein refused: ProseAroundJson after 2 proposals"));
+    assert_eq!(ph(&vw).asked, None);
+    assert_eq!(ph(&vw).focus, None);
+    // A bare why: the face names the count that arrived.
+    ask(&mut vw);
+    assert!(streamed(&mut vw, 2, 0, V1));
+    assert!(streamed(&mut vw, 2, 1, V3));
+    assert!(vw.input(&SMessage::Intent(IntentEvent::Refused { request: 2, why: "ProseAroundJson".into() })));
+    assert!(ph(&vw).offers.is_empty());
+    assert_eq!(ph(&vw).note.as_deref(), Some("Vein refused: ProseAroundJson after 2 proposals"));
+    // A new ask withdraws the stale request's previews.
+    ask(&mut vw);
+    assert!(streamed(&mut vw, 3, 0, V1));
+    ask(&mut vw);
+    assert!(ph(&vw).offers.is_empty(), "the stale preview went with its request");
+    assert_eq!(ph(&vw).asked, Some(4));
 }
