@@ -5215,7 +5215,7 @@ pub fn timer_preempt() {
     // first tick after the release. The quantum is deliberately NOT counted down here either — the
     // held task resumes with what it had rather than being granted a fresh slice. See the COMPGATE
     // ledger at the file tail for why this is a switch decline and not an interrupt mask.
-    if nopreempt_held(cpu) {
+    hid_wait_tick(cpu, raw); if nopreempt_held(cpu) { // F39HIDPLACERENDER (B1118) HID-WAIT-WHO-ARM: the hid pump core's own tick votes the task it interrupted, above the hold/kill/quantum exits (body at the file tail; the gate is `hidstall::wait_tick`'s). LINE-NEUTRAL fold, code first
         NOPREEMPT_DEFERRED.fetch_add(1, Ordering::Relaxed);
         return;
     }
@@ -12201,4 +12201,21 @@ mod yieldsite {
             _ => "wrong-lock-site",
         }
     }
+}
+
+// ── F39HIDPLACERENDER (rmbp-ledger B1118) — HID-WAIT-WHO-ARM: the hid pump core's tick names who ran while the pass was overdue. ──
+// `timer_preempt` (every core's tick, IRQ masked) hands this core's own non-null `current` here; `hidstall::wait_tick` gates on
+// the hid pump's core and runs the closure only there, then votes through `hidstall::wait_who_tick` (the x86 tick's shape,
+// x86_64/sched.rs tail). No aarch64 HID pass stamps `pump_here`/`pass_begin` yet, so `pump_cpu()` reads none and this samples
+// nothing until one does (HID-PUMP-ARM owed). FILE-TAIL append.
+
+/// F39HIDPLACERENDER (B1118): the pump core's tick sample — one `PUMP_CPU` load and compare on every other core.
+#[inline]
+fn hid_wait_tick(cpu: usize, raw: *const Task) {
+    crate::hidstall::wait_tick(cpu, || {
+        // SAFETY: this core's own current task (non-null at the caller, `timer_preempt`), read in its timer IRQ (masked) and
+        // only on the pump core: nothing frees it while it is current, and only this core's scheduler reclaims it.
+        let t = unsafe { &*raw };
+        (t.name, t.id)
+    });
 }
