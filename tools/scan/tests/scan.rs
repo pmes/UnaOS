@@ -711,3 +711,62 @@ extrude post sketch=s2 outer=c1 dir=[0 0 1] length=150
     assert!(String::from_utf8_lossy(&o.stderr).contains("GdtWithoutAgainst"), "{}", String::from_utf8_lossy(&o.stderr));
     assert!(!rep_none.exists(), "a refusal writes nothing");
 }
+
+// ---- VUGSCANDEVIATIONCOARSETOOLREPORT (LEDGER SR627): a tracked .prb against its design names its road in the report ----
+// The fixture is SR621's (vessels/vug-view tests/deviation.rs `a_tracked_prb_opens_on_the_coarse_road`), copied: twelve
+// D435i frames of the bench from the orbit's azimuths 0°..11° (this file's `a_tracked_prb_recording_fuses_without_poses`
+// render) and the UNMOVED bench document. MEASURED by SR621: the near-single-view scan's best coarse start is above the
+// floor (twelve frames 19.144, gate(2) 9), so the run refuses (exit 1, `deviation: refused NoAlignment` on stderr) and its
+// stdout report still names the road where `deviation: aligned` would begin. The test reads the line, not the number:
+// VUG-SCAN-DEVIATION-COARSE-VIEW turns it to `road: coarse+fine` and changes this one expectation.
+#[test]
+fn a_tracked_prb_against_names_its_road_in_the_report() {
+    const DOC: &str = r#"vug-doc version=1 lin=1e-6 ang=1e-9
+sketch s1 o=[0 0 0] z=[0 0 1] x=[1 0 0]
+point p1 sketch=s1 x=-230 y=-100
+point p2 sketch=s1 x=70 y=-100
+point p3 sketch=s1 x=70 y=100
+point p4 sketch=s1 x=-230 y=100
+line l1 sketch=s1 a=p1 b=p2
+line l2 sketch=s1 a=p2 b=p3
+line l3 sketch=s1 a=p3 b=p4
+line l4 sketch=s1 a=p4 b=p1
+fix f1 sketch=s1 p=p1 at=[-230 -100]
+fix f2 sketch=s1 p=p2 at=[70 -100]
+fix f3 sketch=s1 p=p3 at=[70 100]
+fix f4 sketch=s1 p=p4 at=[-230 100]
+sketch s2 o=[0 0 0] z=[0 0 1] x=[1 0 0]
+point c0 sketch=s2 x=160 y=0
+circle c1 sketch=s2 centre=c0 r=40
+fix g1 sketch=s2 p=c0 at=[160 0]
+radius r1 sketch=s2 circle=c1 r=40
+extrude body sketch=s1 outer=l1 dir=[0 0 1] length=100
+extrude post sketch=s2 outer=c1 dir=[0 0 1] length=150
+"#;
+    let d = dir("track-against");
+    let (inp, ply, doc) = (d.join("track.prb"), d.join("track.ply"), d.join("part.vugdoc"));
+    let intr = fixture::bench_intrinsics();
+    let truth = |k: u32| fixture::orbit(CENTRE, 600.0, 40.0 * DEG, k as f64 * DEG);
+    let recs: Vec<Record> = (0..12u32)
+        .map(|k| {
+            let f = fixture::render_depth(&Scene::bench(), &intr, DepthScale::D400_DEFAULT, &truth(k), &Noise::D435I, k as u64);
+            Record::new(f, "replay:d435i", 1000, Some(k4())).unwrap()
+        })
+        .collect();
+    std::fs::write(&inp, recording::write(&recs).unwrap()).unwrap();
+    std::fs::write(&doc, DOC).unwrap();
+
+    let o = scan(&[inp.to_str().unwrap(), "-o", ply.to_str().unwrap(), "--track", "--against", doc.to_str().unwrap()]);
+    let (report, err) = (String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+    assert_eq!(o.status.code(), Some(1), "the refused coarse start is the run's refusal\n{report}\n{err}");
+    let lines: Vec<&str> = report.lines().collect();
+    let at = lines.iter().position(|l| l.starts_with("road: ")).unwrap_or_else(|| panic!("no road line in\n{report}\n{err}"));
+    println!("{}", lines[at]);
+    assert!(lines[at].starts_with("road: coarse refused rms="), "{}", lines[at]);
+    assert!(lines[at - 1].starts_with("shape"), "the road line follows the shapes: {:?}", &lines[..=at]);
+    assert_eq!(at + 1, lines.len(), "the road line stands where `deviation: aligned` begins:\n{report}");
+    assert!(!report.contains("deviation: aligned"), "{report}");
+    assert!(err.contains("deviation: refused NoAlignment"), "{err}");
+    assert!(!err.contains("deviation: road"), "the stderr road line is retired: {err}");
+    assert!(!ply.exists(), "a refusal writes no PLY");
+}
