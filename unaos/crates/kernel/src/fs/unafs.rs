@@ -4640,7 +4640,7 @@ pub fn poison_leg() -> &'static str {
 /// The bind task's usable stack: 64 KiB until measured; its rule (BINDLIVE B873) is [`bind_stack_rule`] of the printed `high_kib`.
 const BIND_STACK: usize = 64 * 1024;
 /// A caller whose usable stack is at most this binds through the task.
-const BIND_SMALL: usize = 16 * 1024;
+const BIND_SMALL: usize = (if cfg!(target_arch = "x86_64") { 32 } else { 16 }) * 1024; // UNLOCKSTACK (rmbp-ledger B1092): x86 16 -> 32 KiB — flight 39's keyed boots bound on-caller on the 32 KiB `render` (overflowed, high=36904) and `usb-pump` (entered its absorber); both now take this task road. aarch64 unchanged.
 /// The join's bound: splitwrite's `TICKET_BOUND_MS` (the ticket's own bound), the same 1500 ms.
 const BIND_BOUND_MS: u64 = 1_500;
 

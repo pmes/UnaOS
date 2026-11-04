@@ -798,7 +798,7 @@ mod worker {
             return false;
         };
         STATE.store(ST_SPAWNED, Ordering::Release);
-        crate::arch::sched::spawn("flightrec", run, 0, c, crate::arch::sched::PRIO_NORMAL);
+        spawn_worker(run, 0, c); // UNLOCKSTACK (B1092): the worker on FLIGHTREC_STACK_SIZE on x86 (the helper at this module's tail)
         true
     }
 
@@ -828,7 +828,7 @@ mod worker {
         if arg == 0 { print_deferred("worker-up"); } // DESKTOPHIDGAP (B1020): a re-homed worker does not re-print the boot's deferral (same-line)
         loop {
             let t0 = crate::arch::ms();
-            super::service();
+            super::service(); stack_note(); // UNLOCKSTACK (B1092): STACKHIGH samples the worker each pass (x86 witness; no-op otherwise)
             WORST_MS.fetch_max(crate::arch::ms().saturating_sub(t0), Ordering::Relaxed);
             if leave_hid_pump(run) { crate::arch::sched::exit(); } crate::arch::sched::sleep_ms(PACE_MS); // DESKTOPHIDGAP (B1020): the hid pump arrived on this core (GATESTEAL's re-home) -> a fresh worker by `hand()`'s own pick, this one exits (LINE-NEUTRAL fold, code first)
         }
@@ -859,7 +859,32 @@ mod worker {
             return false;
         };
         serial_println!("[flight] service rehome from=c{} to=c{} why=hid-pump-arrived hid_pump_cpu={} (DESKTOPHIDGAP B1020: the flight-recorder step leaves the hid pump's core) ::", here, c, pump);
-        crate::arch::sched::spawn("flightrec", run, 1, c, crate::arch::sched::PRIO_NORMAL);
+        spawn_worker(run, 1, c); // UNLOCKSTACK (B1092): the worker on FLIGHTREC_STACK_SIZE on x86 (the helper at this module's tail)
         true
+    }
+
+    // ── UNLOCKSTACK (rmbp-ledger B1092): the worker's stack, named in sched.rs (flight 39: `[stack] guard hit task=flightrec
+    // size=16384 high=22040`, the keyed root's per-caller walk; boot 1 already `entered` its absorber at 16 KiB). x86 takes
+    // `FLIGHTREC_STACK_SIZE` through `spawn_stack`; every other arch keeps the old `spawn`, byte for byte. ──
+
+    /// Spawn the `flightrec` worker on `c` (both of the module's spawn sites).
+    fn spawn_worker(run: fn(usize), arg: usize, c: usize) {
+        #[cfg(target_arch = "x86_64")]
+        {
+            crate::arch::sched::spawn_stack("flightrec", run, arg, c, crate::arch::sched::PRIO_NORMAL, crate::arch::sched::FLIGHTREC_STACK_SIZE);
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            crate::arch::sched::spawn("flightrec", run, arg, c, crate::arch::sched::PRIO_NORMAL);
+        }
+    }
+
+    /// STACKHIGH's per-pass sample of this worker (x86 `witness`; a no-op otherwise).
+    #[inline(always)]
+    fn stack_note() {
+        #[cfg(all(target_arch = "x86_64", feature = "witness"))]
+        {
+            crate::arch::sched::stackhigh_here();
+        }
     }
 }

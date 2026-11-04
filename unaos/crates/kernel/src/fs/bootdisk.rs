@@ -596,7 +596,7 @@ pub fn survey() -> Survey {
         }
     }
     // The walk runs OUTSIDE both locks (see [`CACHE`]): a long disk read never holds one.
-    let v = walk_and_witness(); if keyboot_locked() { return v; } // KEYBOOT (B688): while the keyed root is locked (the unlock hold) no answer is cached, neither CACHE nor PENDING — the root binds after the unlock (LINE-NEUTRAL append, before this comment; body at the tail)
+    if let Some(v) = keyheld_take(&fp) { return v; } let v = walk_and_witness(); if keyboot_locked() { keyheld_put(&fp, &v); return v; } // UNLOCKSTACK (B1092): while locked the walk's answer is HELD (KEYHELD, file tail) so every caller is answered from one walk, not one per caller. KEYBOOT (B688): while the keyed root is locked (the unlock hold) no answer is cached, neither CACHE nor PENDING — the root binds after the unlock (LINE-NEUTRAL append, before this comment; body at the tail)
     if v.root.is_some() {
         *PENDING.lock() = None;
         *CACHE.lock() = Some(v.clone()); crate::bootpace::record_once(&ROOT_BIND_STAMP, "root-bind"); // BOOTSLOW (rmbp-ledger B201): the BPACE `root-bind` rung — the instant the boot first HAS a root, stamped where the answer is cached and nowhere else, so every caller (the root pass, a verb, a fixture) reports the same moment. `record_once` because two walks can race to this line. ⚠ LINE-NEUTRAL fold, statement BEFORE the comment; the latch and the root pass are at this file's tail.
@@ -1037,7 +1037,7 @@ fn walk_and_witness() -> Survey {
             f.source.name(),
             f.path,
             BUILD_SHA,
-            unafs_state(f.source),
+            keyheld_unafs(f.source),
             matching,
             home,
             d.hits.len(),
@@ -1431,7 +1431,7 @@ pub fn bind(mt: &mut crate::fs::vfs::MountTable) {
     }
 
     let Some(found) = s.root else { return };
-    bind_root(mt, found.source, unafs_state(found.source), announce); #[cfg(feature = "sdwritefx")] sdwrite_fixture(mt, found.source); // SDWRITE (A60): the metal fixture, armed by UNAOS_SDWRITE=1, on the root this call just bound.
+    bind_root(mt, found.source, keyheld_unafs(found.source), announce); #[cfg(feature = "sdwritefx")] sdwrite_fixture(mt, found.source); // SDWRITE (A60): the metal fixture, armed by UNAOS_SDWRITE=1, on the root this call just bound.
     // CARDROOT (B123): `/volumes/data`, and it hangs HERE rather than inside [`bind_root`] for a
     // reason leg 6 states in its own words. `unafsroot_selftest` drives `bind_root` FOUR times at
     // HEAP-UP with a scratch table, on the premise that it is "table shape ONLY … touch no disk
@@ -3070,4 +3070,72 @@ fn keyboot_locked() -> bool {
 pub fn root_source_now() -> Result<Option<BlockSource>, ()> {
     let g = CACHE.try_lock().ok_or(())?;
     Ok(g.as_ref().and_then(|s| s.root.as_ref().map(|f| f.source)))
+}
+
+// ── UNLOCKSTACK (rmbp-ledger B1092) — KEYHELD: the locked root's ONE walk. ─────────────────────────────────────────────
+// Flight 39 boots 2-3 (docs/dev/evidence/rmbp-0915/flight39/f39-boot2.log): while the keyed root is locked, [`survey`]
+// cached nothing (KEYBOOT B688, kept), so EVERY `shell::vfs_mount_table()` re-ran [`walk_and_witness`] and, through
+// [`unafs_state`], `unafs::bind_now` — 25 `[vfs] root =` and 29 `[unafs] bind on=caller` in ~5 s, each on the asking
+// task's own stack: `render` (32 KiB), `dock-trash` and `flightrec` (16 KiB) ran off their floors. KEYBOOT's rule stays:
+// nothing enters CACHE or PENDING while locked. The walk's answer is HELD here per source fingerprint (PENDING's key) and
+// the `unafs_state` word per source, answered to every caller while `keyboot_locked()`, dropped once it is not, so the
+// unlock re-walks fresh. Neither lock is held across a walk or a bind (CACHE's rule). At the tail: no line above moves.
+
+/// The locked root's walk, keyed on `present_fingerprint()`; answered only while [`keyboot_locked`].
+static KEYHELD: Mutex<Option<(String, Survey)>> = Mutex::new(None);
+/// The locked root's [`unafs_state`] word, for the source it was asked about.
+static KEYHELD_UNAFS: Mutex<Option<(BlockSource, &'static str)>> = Mutex::new(None);
+/// Either slot holds something (so an unkeyed boot's callers take no lock here).
+static KEYHELD_SET: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Both slots emptied (the unlock edge, or a boot that was never keyed: one relaxed load).
+fn keyheld_clear() {
+    if KEYHELD_SET.load(core::sync::atomic::Ordering::Relaxed) && KEYHELD_SET.swap(false, core::sync::atomic::Ordering::AcqRel) {
+        *KEYHELD.lock() = None;
+        *KEYHELD_UNAFS.lock() = None;
+    }
+}
+
+/// The held walk for this fingerprint while the root is locked; `None` (and the slots cleared) once it is not.
+fn keyheld_take(fp: &str) -> Option<Survey> {
+    if !keyboot_locked() {
+        keyheld_clear();
+        return None;
+    }
+    match KEYHELD.lock().as_ref() {
+        Some((seen, v)) if seen.as_str() == fp => Some(v.clone()),
+        _ => None,
+    }
+}
+
+/// Hold a walk made while locked. One `[vfs] keyheld put` line per lock state (the first hold).
+fn keyheld_put(fp: &str, v: &Survey) {
+    KEYHELD_SET.store(true, core::sync::atomic::Ordering::Release);
+    let first = KEYHELD.lock().replace((String::from(fp), v.clone())).is_none();
+    if first {
+        let word = (*KEYHELD_UNAFS.lock()).map_or("-", |(_, w)| w);
+        serial_println!(
+            "[vfs] keyheld put root={} unafs={} (UNLOCKSTACK B1092: the locked root's walk answers every caller until the unlock; never CACHE or PENDING)",
+            v.root.as_ref().map_or("none", |f| f.source.name()),
+            word
+        );
+    }
+}
+
+/// [`unafs_state`] — while the root is locked, asked ONCE per source and the word held (one bind attempt per lock state).
+fn keyheld_unafs(src: BlockSource) -> &'static str {
+    if !keyboot_locked() {
+        keyheld_clear();
+        return unafs_state(src);
+    }
+    let held = *KEYHELD_UNAFS.lock();
+    if let Some((s, w)) = held {
+        if s == src {
+            return w;
+        }
+    }
+    let w = unafs_state(src);
+    KEYHELD_SET.store(true, core::sync::atomic::Ordering::Release);
+    *KEYHELD_UNAFS.lock() = Some((src, w));
+    w
 }

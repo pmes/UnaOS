@@ -7571,7 +7571,7 @@ static GUARD_LAST: AtomicU64 = AtomicU64::new(u64::MAX);
 fn stack_guard_check(cpu: usize, raw: *mut Task) {
     // SAFETY: `raw` is this core's just-switched-back task; the `Box::from_raw` that may free it is
     // below this call in `run()`. Fields are read, never written.
-    let task = unsafe { &*raw };
+    let task = unsafe { &*raw }; stackhigh_near(task); // UNLOCKSTACK (B1092): the 1 KiB line, one byte (witness; no-op otherwise; file tail)
     let st = guard_state(&task.stack[super::stackguard::absorber_lo(task.stack.as_ptr() as u64)..STACK_GUARD]); // SMALLFIX M6: only the ABSORBER above the unmapped page is read (its bytes are mapped).
     if st == 0 {
         return;
@@ -7643,7 +7643,7 @@ fn stack_high_water(task: &Task) -> usize {
 /// shared instrument.
 #[cfg(feature = "witness")]
 fn emit_stack_witness() {
-    let cpu = percpu::this_cpu().cpu_index as usize; if !crate::census::on(crate::census::STACK) { return; } // QUIETBOOT (R80): a census, OFF until `census start`.
+    stackhigh_here(); let cpu = percpu::this_cpu().cpu_index as usize; if !crate::census::on(crate::census::STACK) { return; } // QUIETBOOT (R80): a census, OFF until `census start`.
     let raw = SCHED[cpu].current.load(Ordering::Acquire) as *const Task;
     if raw.is_null() {
         return;
@@ -7799,7 +7799,7 @@ impl Drop for Task {
     /// The guard page is made PRESENT again before the slab goes back to the heap: the allocator writes its
     /// free-list node at the block's start, which may be inside the guard page.
     fn drop(&mut self) {
-        super::stackguard::disarm(self.stack.as_ptr() as u64);
+        stackhigh_drop(self); super::stackguard::disarm(self.stack.as_ptr() as u64); // UNLOCKSTACK (B1092): STACKHIGH reads the ending task's high first (file tail)
     }
 }
 
@@ -7824,7 +7824,7 @@ pub fn current_named_slab(cpu: usize) -> Option<(&'static str, u64, usize)> {
 
 /// Re-lay [`GUARD_FILL`] over the current task's absorber (the overflow path, before `exit`).
 pub fn stack_repaint_absorber(cpu: usize) {
-    if let Some((_, base, len)) = current_named_slab(cpu) {
+    stackhigh_overflow(cpu); if let Some((_, base, len)) = current_named_slab(cpu) { // UNLOCKSTACK (B1092): the overflow row before the absorber is re-laid (file tail)
         let lo = super::stackguard::absorber_lo(base);
         if lo < STACK_GUARD && STACK_GUARD <= len {
             // SAFETY: the absorber is mapped and belongs to the task being abandoned (we run at its slab's top).
@@ -10411,4 +10411,192 @@ pub fn singleton_is_current() -> bool {
 /// PUMPHDA — the singleton's restarts since boot (`singleton_restart`'s count).
 pub fn singleton_restarts() -> u32 {
     SGL_RESTARTS.load(Ordering::Acquire)
+}
+
+// ── UNLOCKSTACK (rmbp-ledger B1092) — two tasks off the BLANKET, and STACKHIGH. ─────────────────────────────────────────
+// Flight 39 boots 2-3 (docs/dev/evidence/rmbp-0915/flight39/f39-boot2.log), the keyed root locked at the unlock form:
+// `[stack] guard hit task=dock-trash size=16384 high=21576`, `task=render size=32768 high=36904`, `task=flightrec
+// size=16384 high=22040`, all via=df. One mechanism: `fs/bootdisk.rs::survey` cached nothing while locked, so every
+// mount-table ask re-walked the disks and re-bound UnaFS on the asking task's stack (cured there: KEYHELD, and
+// `fs/unafs.rs` BIND_SMALL 32 KiB on x86 sends render's and the pump's bind to the 64 KiB bind task). The two 16 KiB
+// tasks still carry one walk per lock state, and died IN the walk (no bind line before either death; the faults are 1096
+// and 1560 B into the guard page): they take named sizes through [`spawn_stack`], RENDSTACK's road. 32 KiB = 1.52x
+// dock-trash's 21576 and 1.49x flightrec's 22040 — both FLOORS (the guard stopped the descent) — and still <=
+// BIND_SMALL, so the bind stays off them. flightrec was already marginal unkeyed (boot 1 21:30:14, `entered`).
+// TASK_STACK_SIZE is untouched. STACKHIGH (below) is the reading that confirms or re-sizes them. Owed: STACK-POOL-ONE
+// (one size table both arches; these two join it), PUMP-FIXTURE-AUDIT. At the tail: no line above moves.
+
+/// UNLOCKSTACK — the Dock's one-shot Trash read (`video/dock.rs` `trash_read_off_pump`); numbers in the block above.
+pub const DOCK_TRASH_STACK_SIZE: usize = 32 * 1024;
+/// UNLOCKSTACK — the flight-recorder worker (`flight_recorder.rs` `worker::spawn_worker`); numbers in the block above.
+pub const FLIGHTREC_STACK_SIZE: usize = 32 * 1024;
+
+// STACKHIGH (witness): `:: STACKHIGH: task=<name> size=<n> high=<n> margin=<n> -> ok|FAIL ::` on `tests stackhigh`, for
+// render / dock-trash / flightrec always (`unseen` when never sampled), `unafs-bind` (BINDSTACKHIGH's reading), and
+// every task that came within 1 KiB of its floor or overflowed. Fed by: a task's end ([`Task`]'s drop), the overflow
+// path ([`stack_repaint_absorber`]), the switch-out 1 KiB line ([`stack_guard_check`], one byte), render's ~5 s dump
+// ([`emit_stack_witness`]) and the flightrec loop ([`stackhigh_here`]). The table is try-locked with IF=0 on every feed
+// (a contended feed counts `missed=`), max-merged by name; nothing here is held across anything else.
+
+/// The margin a row must keep, and the line the switch-out probe reads.
+#[cfg(feature = "witness")]
+const SH_LINE: usize = 1024;
+/// The tasks the arc names: a row always.
+#[cfg(feature = "witness")]
+const SH_WATCH: [&str; 3] = ["render", "dock-trash", "flightrec"];
+
+#[cfg(feature = "witness")]
+const SH_CAP: usize = 24;
+
+#[cfg(feature = "witness")]
+#[derive(Clone, Copy)]
+struct ShRow {
+    name: &'static str,
+    size: usize,
+    high: usize,
+    over: bool,
+}
+
+#[cfg(feature = "witness")]
+static SH_ROWS: SpinMutex<[Option<ShRow>; SH_CAP]> = SpinMutex::new([None; SH_CAP]);
+#[cfg(feature = "witness")]
+static SH_DROPPED: AtomicU32 = AtomicU32::new(0);
+#[cfg(feature = "witness")]
+static SH_MISSED: AtomicU32 = AtomicU32::new(0);
+/// Task ids (+1) the switch-out probe has already noted, so a task past the line pays its scan once.
+#[cfg(feature = "witness")]
+static SH_NOTED: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
+#[cfg(feature = "witness")]
+static SH_NOTED_FULL: AtomicBool = AtomicBool::new(false);
+
+/// Merge one reading into the table (IF=0, try-lock).
+#[cfg(feature = "witness")]
+fn sh_note(name: &'static str, size: usize, high: usize, over: bool) {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let Some(mut g) = SH_ROWS.try_lock() else {
+            SH_MISSED.fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+        if let Some(r) = g.iter_mut().flatten().find(|r| r.name == name) {
+            r.high = r.high.max(high);
+            r.size = r.size.max(size);
+            r.over |= over;
+            return;
+        }
+        match g.iter_mut().find(|e| e.is_none()) {
+            Some(e) => *e = Some(ShRow { name, size, high, over }),
+            None => {
+                SH_DROPPED.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    });
+}
+
+/// A row worth keeping: a watched name, the bind task, or within the line.
+#[cfg(feature = "witness")]
+fn sh_wanted(name: &str, size: usize, high: usize) -> bool {
+    SH_WATCH.iter().any(|w| *w == name) || name == "unafs-bind" || high + SH_LINE >= size
+}
+
+/// The task CURRENT on this core, sampled (render's dump, the flightrec loop).
+pub fn stackhigh_here() {
+    #[cfg(feature = "witness")]
+    {
+        if let Some((name, high, size)) = current_stack_high() {
+            if sh_wanted(name, size, high) {
+                sh_note(name, size, high, false);
+            }
+        }
+    }
+}
+
+/// A task's end (its slab is still live here): its lifetime high.
+#[cfg(feature = "witness")]
+fn stackhigh_drop(task: &Task) {
+    if task.stack.len() <= STACK_GUARD {
+        return;
+    }
+    let size = task.stack.len().saturating_sub(STACK_GUARD);
+    let high = stack_high_water(task);
+    if sh_wanted(task.name, size, high) {
+        sh_note(task.name, size, high, false);
+    }
+}
+#[cfg(not(feature = "witness"))]
+#[inline(always)]
+fn stackhigh_drop(_task: &Task) {}
+
+/// The overflow path, on the dead task's own core: the row is FAIL, its high at least the usable span plus the absorber.
+#[cfg(feature = "witness")]
+fn stackhigh_overflow(cpu: usize) {
+    if let Some((name, base, len)) = current_named_slab(cpu) {
+        let size = len.saturating_sub(STACK_GUARD);
+        let lo = super::stackguard::absorber_lo(base).min(STACK_GUARD);
+        sh_note(name, size, size + (STACK_GUARD - lo), true);
+    }
+}
+#[cfg(not(feature = "witness"))]
+#[inline(always)]
+fn stackhigh_overflow(_cpu: usize) {}
+
+/// Switch-out: ONE byte at the 1 KiB line above the usable floor. Touched = this task came within 1 KiB of its guard;
+/// the first crossing per task scans its high once and notes it.
+#[cfg(feature = "witness")]
+#[inline]
+fn stackhigh_near(task: &Task) {
+    let size = task.stack.len().saturating_sub(STACK_GUARD);
+    if size <= SH_LINE {
+        return;
+    }
+    // SAFETY: inside this task's usable span (mapped), read only.
+    let b = unsafe { core::ptr::read_volatile(task.stack.as_ptr().add(STACK_GUARD + SH_LINE - 1)) };
+    if b == STACK_POISON {
+        return;
+    }
+    let key = task.id.wrapping_add(1);
+    if SH_NOTED.iter().any(|s| s.load(Ordering::Relaxed) == key) {
+        return;
+    }
+    if !SH_NOTED.iter().any(|s| s.compare_exchange(0, key, Ordering::AcqRel, Ordering::Relaxed).is_ok()) {
+        if !SH_NOTED_FULL.swap(true, Ordering::Relaxed) {
+            SH_DROPPED.fetch_add(1, Ordering::Relaxed);
+        }
+        return;
+    }
+    sh_note(task.name, size, stack_high_water(task), false);
+}
+#[cfg(not(feature = "witness"))]
+#[inline(always)]
+fn stackhigh_near(_task: &Task) {}
+
+/// `tests stackhigh` — the rows, then `:: STACKHIGH: rows= fail= dropped= missed= -> PASS|FAIL ::`.
+#[cfg(feature = "witness")]
+pub fn stackhigh_selftest() {
+    let rows = x86_64::instructions::interrupts::without_interrupts(|| *SH_ROWS.lock());
+    for w in SH_WATCH {
+        if !rows.iter().flatten().any(|r| r.name == w) {
+            serial_println!(":: STACKHIGH: task={} unseen ::", w);
+        }
+    }
+    let (mut n, mut fail) = (0u32, 0u32);
+    for r in rows.iter().flatten() {
+        if !(r.over || sh_wanted(r.name, r.size, r.high)) {
+            continue;
+        }
+        let margin = r.size as i64 - r.high as i64;
+        let ok = !r.over && margin > SH_LINE as i64;
+        n += 1;
+        if !ok {
+            fail += 1;
+        }
+        serial_println!(":: STACKHIGH: task={} size={} high={} margin={} -> {} ::", r.name, r.size, r.high, margin, if ok { "ok" } else { "FAIL" });
+    }
+    serial_println!(
+        ":: STACKHIGH: rows={} fail={} dropped={} missed={} -> {} ::",
+        n,
+        fail,
+        SH_DROPPED.load(Ordering::Relaxed),
+        SH_MISSED.load(Ordering::Relaxed),
+        if fail == 0 { "PASS" } else { "FAIL" }
+    );
 }
