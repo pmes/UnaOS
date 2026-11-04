@@ -436,9 +436,11 @@ fn a_rearmed_pump_resumes_from_the_named_line_and_runs_only_the_rest() {
     assert!(!m.realtime.contains(&b'~'), "the re-armed resume is not a cycle start byte");
     let ev = drive(&mut p, &mut m, 5_000, |ev| ev.contains(&Event::Done));
     assert!(ev.contains(&Event::Done));
-    assert_eq!(m.executed, lines[12..].to_vec());
+    let modal: Vec<String> = lines[0].split_whitespace().map(str::to_string).collect(); // VUGCOMSCANRESUMEMODAL (SR656): the preamble's groups, one line each, first
+    assert_eq!(m.executed, modal.iter().cloned().chain(lines[12..].iter().cloned()).collect::<Vec<_>>());
     let pr = p.progress();
-    assert_eq!((pr.sent, pr.acked, pr.total), (lines.len(), lines.len(), lines.len()));
+    let n = lines.len() + modal.len();
+    assert_eq!((pr.sent, pr.acked, pr.total), (n, n, n));
 }
 
 // --- VUGCOMSCANJOGFACE (SR579): grbl's jog cancel is the one realtime byte 0x85, never a feed hold ---
@@ -459,4 +461,124 @@ fn jog_cancel_is_0x85_on_the_wire_and_no_feed_hold() {
         marlin.jog_cancel(&mut m).err(),
         Some(PumpRefusal::NotInDialect { dialect: Dialect::Marlin, what: "jog cancel" })
     );
+}
+
+// --- VUGCOMSCANRESUMEMODAL (SR656): a resume restores the modal words the lines before its line set ---
+
+/// `lines` with `words` spliced in at index `i`.
+fn with_prefix(lines: &[String], i: usize, words: &[&str]) -> Vec<String> {
+    let mut v = lines[..i].to_vec();
+    v.extend(words.iter().map(|w| w.to_string()));
+    v.extend_from_slice(&lines[i..]);
+    v
+}
+
+#[test]
+fn a_resume_restores_the_modal_words_set_before_its_line() {
+    // grbl: every group the block set, the distance mode from its LAST word (G91.1 is the arc mode, not G91), program order.
+    let text = "G21 G90 G17 G94\nG91.1 G1 X1 F100\nG1 X2\nG91 G1 X3\nG1 X4\n";
+    let lines = Pump::new(GRBL, text).unwrap().lines().to_vec();
+    let p = Pump::new(GRBL, text).unwrap().with_status_every(0).resume_at(5).unwrap();
+    assert_eq!(p.lines().to_vec(), with_prefix(&lines, 4, &["G21", "G17", "G94", "G91"]));
+    assert_eq!((p.progress().sent, p.progress().acked), (4, 4), "the prefix is unsent");
+    assert!((4..9).all(|k| p.line_of(k) == Some(5)), "the prefix is numbered at the resume line");
+
+    // Marlin: one command per line (the M82 after G90 is never run), M83 then G90 in the program's order.
+    let text = "G21\nG91\nM83\nG1 X1 E1 F100\nG90 M82\nG1 X2 E2\nG1 X3 E3\n";
+    let lines = Pump::new(Dialect::Marlin, text).unwrap().lines().to_vec();
+    let p = Pump::new(Dialect::Marlin, text).unwrap().resume_at(7).unwrap();
+    assert_eq!(p.lines().to_vec(), with_prefix(&lines, 6, &["G21", "M83", "G90"]));
+
+    // No modal word before the line: nothing is added.
+    let text = "G1 X1 F100\nG1 X2\nG21\nG1 X3\n";
+    let lines = Pump::new(GRBL, text).unwrap().lines().to_vec();
+    let p = Pump::new(GRBL, text).unwrap().resume_at(2).unwrap();
+    assert_eq!(p.lines().to_vec(), lines);
+
+    // A loss inside the prefix is a loss at the resume line: the re-arm restores again.
+    struct Quiet;
+    impl Transport for Quiet {
+        fn write(&mut self, b: &[u8]) -> Result<usize, LinkError> {
+            Ok(b.len())
+        }
+        fn read(&mut self, _: &mut [u8]) -> Result<usize, LinkError> {
+            Ok(0)
+        }
+    }
+    struct Fin(Vec<u8>);
+    impl Transport for Fin {
+        fn write(&mut self, b: &[u8]) -> Result<usize, LinkError> {
+            Ok(b.len())
+        }
+        fn read(&mut self, b: &mut [u8]) -> Result<usize, LinkError> {
+            if self.0.is_empty() {
+                return Err(LinkError::Closed);
+            }
+            let n = b.len().min(self.0.len());
+            b[..n].copy_from_slice(&self.0[..n]);
+            self.0.drain(..n);
+            Ok(n)
+        }
+    }
+    let text = "G21 G90 G17 G94\nG91.1 G1 X1 F100\nG1 X2\nG91 G1 X3\nG1 X4\n";
+    let mut p = Pump::new(GRBL, text).unwrap().with_status_every(0).resume_at(5).unwrap();
+    p.resume(&mut Quiet).unwrap();
+    p.tick(&mut Quiet, 0);
+    assert_eq!(p.progress().sent, 9, "the prefix and the resume line went out");
+    let ev = p.tick(&mut Fin(b"ok\r\n".to_vec()), 1);
+    assert_eq!(ev, vec![Event::Ok(5), Event::LinkLost]);
+    assert_eq!(p.state(), PumpState::LinkLost { at_line: 5, program_digest: 0 });
+}
+
+// --- VUGCOMSCANRESUMETOOL (SR663): a resume restores the spindle, coolant, heater, fan and tool words set before its line ---
+
+#[test]
+fn a_resume_restores_the_tool_state_set_before_its_line() {
+    // grbl: the S before the M in one block, the spin-up dwell right after the spindle word, the coolant after it; the
+    // whole prefix numbered at the resume line.
+    let text = "G21 G90 G17 G94\nS1200 M3\nM8\nG1 X1 F100\nG1 X2\n";
+    let lines = Pump::new(GRBL, text).unwrap().lines().to_vec();
+    let p = Pump::new(GRBL, text).unwrap().with_status_every(0).resume_at(5).unwrap();
+    assert_eq!(p.lines().to_vec(), with_prefix(&lines, 4, &["G21", "G90", "G17", "G94", "M3 S1200", "G4 P4", "M8"]));
+    assert_eq!((p.progress().sent, p.progress().acked), (4, 4), "the prefix is unsent");
+    assert!((4..12).all(|k| p.line_of(k) == Some(5)), "the prefix is numbered at the resume line");
+
+    // An S alone changes a running spindle's speed; M9 clears both coolants and is said once; a later M7 stays.
+    let text = "M3 S1000\nM8\nS1500\nM9\nM7\nG1 X1 F100\n";
+    let lines = Pump::new(GRBL, text).unwrap().lines().to_vec();
+    let p = Pump::new(GRBL, text).unwrap().resume_at(6).unwrap();
+    assert_eq!(p.lines().to_vec(), with_prefix(&lines, 5, &["M3 S1500", "G4 P4", "M9", "M7"]));
+
+    // M5 is said again, with no dwell.
+    let text = "M3 S1000\nG1 X1 F100\nM5\nG0 Z5\n";
+    let lines = Pump::new(GRBL, text).unwrap().lines().to_vec();
+    let p = Pump::new(GRBL, text).unwrap().resume_at(4).unwrap();
+    assert_eq!(p.lines().to_vec(), with_prefix(&lines, 3, &["M5"]));
+
+    // grbl laser mode: the power word is not restored (VUG-COMSCAN-RESUME-LASER owed), the air assist is.
+    let laser = Dialect::Grbl { laser: true };
+    let text = "M4 S500\nM8\nG1 X1 F100\nG1 X2\n";
+    let lines = Pump::new(laser, text).unwrap().lines().to_vec();
+    let p = Pump::new(laser, text).unwrap().resume_at(4).unwrap();
+    assert_eq!(p.lines().to_vec(), with_prefix(&lines, 3, &["M8"]));
+
+    // Marlin: the bed and hotend targets restored as the blocking M190 / M109, then the tool and the fan, in the
+    // program's order after its modal words.
+    let text = "G21\nG90\nM82\nM140 S60\nM104 S210\nT1\nM106 S128\nG1 X1 E1 F100\nG1 X2 E2\n";
+    let lines = Pump::new(Dialect::Marlin, text).unwrap().lines().to_vec();
+    let p = Pump::new(Dialect::Marlin, text).unwrap().resume_at(9).unwrap();
+    assert_eq!(
+        p.lines().to_vec(),
+        with_prefix(&lines, 8, &["G21", "G90", "M82", "M190 S60", "M109 S210", "T1", "M106 S128"])
+    );
+
+    // M107 clears the fan, an S0 target stays non-blocking, a recorded wait stays; a packed command is re-spaced.
+    let text = "M106 S255\nM104 S0\nM190 S60\nM107\nG1 X1 E1 F100\n";
+    let lines = Pump::new(Dialect::Marlin, text).unwrap().lines().to_vec();
+    let p = Pump::new(Dialect::Marlin, text).unwrap().resume_at(5).unwrap();
+    assert_eq!(p.lines().to_vec(), with_prefix(&lines, 4, &["M104 S0", "M190 S60", "M107"]));
+    let text = "M104T1S210\nG1 X1 E1 F100\n";
+    let lines = Pump::new(Dialect::Marlin, text).unwrap().lines().to_vec();
+    let p = Pump::new(Dialect::Marlin, text).unwrap().resume_at(2).unwrap();
+    assert_eq!(p.lines().to_vec(), with_prefix(&lines, 1, &["M109 T1 S210"]));
 }
