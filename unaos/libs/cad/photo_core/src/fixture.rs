@@ -365,3 +365,51 @@ pub fn crop_png(img: &Image, x0: u32, y0: u32, w: u32, h: u32) -> Vec<u8> {
     let (key, meta) = crate::crop_pair(img, x0.min(img.width), y0.min(img.height)); // VUGFACEPHOTOCROPSAVE (SR640): the key written once
     pixel_core::png::encode::encode_rgba_text(c.width, c.height, &c.rgba, &[(key.as_str(), meta.as_str())]).unwrap_or_default()
 }
+
+// ---- VUGPHOTOSIDETHIN (SR651): the plate with a thin shim off its left side (named tail block) ----
+/// The shim's width (mm): 4 px at the good camera's ~8 px / mm, under MAX_STROKE_PX (it pairs like ink) and under both
+/// silhouette openings, over the outline's 2 σ simplification (both its sides survive into the loops).
+pub const SHIM_W: f64 = 0.5;
+/// The shim's length out from the plate's left side (mm).
+pub const SHIM_L: f64 = 20.0;
+/// The shim's centre line in the part frame (mm): on [`Spec::good`] it runs paper y 37.2 to 37.7, mid-cell.
+pub const SHIM_Y: f64 = 14.0;
+
+/// Whether a part-frame point is in the shim: x in [-SHIM_L, 0] (touching the plate's left side), y in SHIM_Y ± SHIM_W / 2.
+pub fn in_shim(q: Vec2) -> bool {
+    q.x >= -SHIM_L && q.x <= 0.0 && (q.y - SHIM_Y).abs() <= SHIM_W * 0.5
+}
+
+/// Render the plate with the shim.
+pub fn render_shim(s: &Spec) -> Image {
+    render_shape(s, &|q: Vec2| in_part(q) || in_shim(q))
+}
+
+/// The shim photo as PNG bytes (pixel_core's encoder).
+pub fn shim_png(s: &Spec) -> Vec<u8> {
+    let img = render_shim(s);
+    pixel_core::png::encode::encode_rgba(img.width, img.height, &img.rgba).unwrap_or_default()
+}
+
+// ---- VUGPHOTOSIDETHINCROSS (SR654): the plate with the shim lying ON a lattice line (named tail block) ----
+/// The lattice line the shim lies on (paper x, mm): on [`Spec::good`] it crosses the plate's bottom side at paper y ~24.0.
+pub const SHIM_ON_X: f64 = 45.0;
+/// The shim's tip (paper y, mm): mid-cell and inside the seen lattice; the shim runs [`SHIM_L`] up from it, under the plate.
+pub const SHIM_ON_TIP: f64 = 7.5;
+
+/// Whether a PAPER point is in the on-line shim: x in SHIM_ON_X ± SHIM_W / 2 (the 0.4 mm ink line under it), y in
+/// [SHIM_ON_TIP, SHIM_ON_TIP + SHIM_L] (its top end under the plate, so it hangs off the plate's bottom side).
+pub fn in_shim_on_line(p: Vec2) -> bool {
+    (p.x - SHIM_ON_X).abs() <= SHIM_W * 0.5 && p.y >= SHIM_ON_TIP && p.y <= SHIM_ON_TIP + SHIM_L
+}
+
+/// Render the plate with the on-line shim.
+pub fn render_shim_on_line(s: &Spec) -> Image {
+    render_shape(s, &|q: Vec2| in_part(q) || in_shim_on_line(part_to_paper(s, q)))
+}
+
+/// The on-line shim photo as PNG bytes (pixel_core's encoder).
+pub fn shim_on_line_png(s: &Spec) -> Vec<u8> {
+    let img = render_shim_on_line(s);
+    pixel_core::png::encode::encode_rgba(img.width, img.height, &img.rgba).unwrap_or_default()
+}
