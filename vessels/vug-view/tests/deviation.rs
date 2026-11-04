@@ -61,7 +61,7 @@ fn scan() -> &'static ScanMesh {
 
 fn open(s: ScanMesh) -> Viewer {
     let doc = doc_core::read(DOC).expect("the document reads");
-    Viewer::open_deviation(s, &doc, "fixture", SIZE, Preset::Una).expect("the design builds")
+    Viewer::open_deviation(s, &doc, "fixture", SIZE, Preset::Una, None).expect("the design builds") // VUGFACEGDTREMEASURE (SR560): the fallback margin
 }
 
 /// Green dominates the pixel (STATUS_POSITIVE under any light: the shade scales the three channels alike).
@@ -256,7 +256,7 @@ fn the_journal_measures_as_the_path_does() {
     let path = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("vugfacedeviationjournal.vug");
     std::fs::write(&path, doc_core::write(&v.view.design.journal.doc)).expect("the journal's document is written");
     let doc = doc_core::read(&std::fs::read_to_string(&path).expect("read back")).expect("it reads");
-    let p = Viewer::open_deviation(scan().clone(), &doc, "fixture", SIZE, Preset::Una).expect("the design builds");
+    let p = Viewer::open_deviation(scan().clone(), &doc, "fixture", SIZE, Preset::Una, None).expect("the design builds"); // VUGFACEGDTREMEASURE (SR560)
     let (a, b) = (stats(&v), stats(&p));
     println!("journal {a:?} path {b:?}");
     assert_eq!((a.0.to_bits(), a.1.to_bits(), a.2.to_bits()), (b.0.to_bits(), b.1.to_bits(), b.2.to_bits()), "journal {a:?} vs path {b:?}");
@@ -388,4 +388,139 @@ fn gdt_clear_removes_the_callouts_and_the_tint() {
     assert_eq!(m.vertex, m0.vertex, "the tint is gone");
     assert_eq!(m.tri, m0.tri, "the albedo is the open's");
     assert_eq!(vug_view::deviation::command(&mut v.view, &v.model, "gdt clear"), Ok(false), "nothing left to clear");
+}
+
+// VUGFACEGDTREMEASURE (LEDGER SR560): a callout and the datum frame survive a journal re-measure (re-read, re-tinted);
+// the box datum frame A|B|C (the faces SR552's own test uses) moves the post's position line to scan_core's
+// `position_in`; the margin argument changes the plate top's kept form vertices, and None is the constant.
+
+/// The first `body/` plane face whose outward normal is within 8° of `n` (unit) — its name.
+fn body_plane(map: &vug_view::deviation::Map, n: [f64; 3]) -> String {
+    let f = map
+        .gdt
+        .iter()
+        .find(|f| {
+            map.names[f.face as usize].starts_with("body/")
+                && matches!(f.nominal, scan_core::Nominal::Plane(p) if p.normal.x * n[0] + p.normal.y * n[1] + p.normal.z * n[2] > 0.99)
+        })
+        .unwrap_or_else(|| panic!("no body plane along {n:?}"));
+    map.names[f.face as usize].clone()
+}
+
+/// The post's side: the `post/` face whose nominal is a cylinder — `(face, name)`.
+fn post_side(map: &vug_view::deviation::Map) -> (u32, String) {
+    let f = map
+        .gdt
+        .iter()
+        .find(|f| map.names[f.face as usize].starts_with("post/") && matches!(f.nominal, scan_core::Nominal::Cylinder(_)))
+        .expect("the post's side is a cylinder");
+    (f.face, map.names[f.face as usize].clone())
+}
+
+/// The box datums: A the top (+z), B the -x side, C the -y side.
+fn box_datums(map: &vug_view::deviation::Map) -> (String, String, String) {
+    (body_plane(map, [0.0, 0.0, 1.0]), body_plane(map, [-1.0, 0.0, 0.0]), body_plane(map, [0.0, -1.0, 0.0]))
+}
+
+#[test]
+fn a_callout_survives_a_journal_edit() {
+    let mut v = journal_viewer();
+    let m0 = v.view.deviation.clone().unwrap();
+    let (_, top) = plate_top(&m0);
+    let (a, b, c) = box_datums(&m0);
+    assert_eq!(vug_view::deviation::command(&mut v.view, &v.model, &format!("gdt {top}=flatness:0.001")), Ok(true));
+    assert_eq!(vug_view::deviation::command(&mut v.view, &v.model, &format!("datum A={a} B={b} C={c}")), Ok(true));
+    for k in ["t", "Return", "1", "4", "0", "Return"] {
+        v.key(k);
+    }
+    let map = v.view.deviation.as_ref().unwrap();
+    let src = map.source.as_ref().expect("a journal map");
+    assert_eq!((src.generation, src.measured, src.refused.as_deref()), (1, 1, None), "the edit re-measured");
+    assert_ne!(map.basis.1, m0.basis.1, "the new map measured the edited design");
+    let (top1, name1) = plate_top(map);
+    assert_eq!(name1, top, "the plate top keeps its name");
+    assert_eq!(map.callouts.len(), 1, "the callout followed: {:?}", map.callouts);
+    assert_eq!((map.callouts[0].face, map.callouts[0].tol_mm), (top1, 0.001));
+    // The gdt is the new measurement's: scan_core's own reading of the new basis.
+    let (s, design) = &*map.basis;
+    let d = map.result.as_ref().expect("aligned");
+    let fresh = scan_core::gdt(s, design, d, vug_view::deviation::GDT_MARGIN_MM, Tol::DEFAULT);
+    let flat = map.gdt[top1 as usize].flatness_mm.expect("the plate top is re-read");
+    assert_eq!(Some(flat.to_bits()), fresh[top1 as usize].flatness_mm.map(f64::to_bits));
+    let lines = corner(map);
+    println!("{}", lines.join("\n"));
+    assert!(lines.contains(&format!("{top} flatness={flat:.3} tol=0.001 FAIL")), "{lines:?}");
+    assert!(lines.iter().any(|l| l.starts_with(&format!("frame A={a} B={b} C={c} residual="))), "the frame followed: {lines:?}");
+    assert_eq!(lines.last().map(String::as_str), Some("design=journal@1"), "{lines:?}");
+    // Re-tinted: every vertex of the new map paired with the plate top is the over colour.
+    let over = colour(Shade::Over(1.0));
+    let mut tinted = 0;
+    for (i, f) in d.face_of_vertex.iter().enumerate() {
+        if *f == Some(top1) {
+            assert_eq!(map.vertex[i], over, "vertex {i} on the failing face after the re-measure");
+            tinted += 1;
+        }
+    }
+    assert!(tinted > 0, "the plate top has vertices");
+    let _ = v.frame();
+}
+
+#[test]
+fn a_datum_frame_changes_the_post_position_line() {
+    let mut v = open(scan().clone());
+    let m0 = v.view.deviation.clone().unwrap();
+    let (post, pname) = post_side(&m0);
+    let (a, b, c) = box_datums(&m0);
+    let p0 = m0.gdt[post as usize].position_mm.expect("the post's position is measured");
+    assert_eq!(vug_view::deviation::command(&mut v.view, &v.model, &format!("gdt {pname}=position:5")), Ok(true));
+    let c0 = corner(v.view.deviation.as_ref().unwrap());
+    assert!(c0.last().unwrap().starts_with(&format!("{pname} position={p0:.3} tol=5.000")), "{c0:?}");
+
+    // Refusals by name change nothing.
+    let e = vug_view::deviation::command(&mut v.view, &v.model, &format!("datum A=nosuch B={b} C={c}")).unwrap_err();
+    assert!(e.starts_with("GdtDatumFace A"), "{e}");
+    let e = vug_view::deviation::command(&mut v.view, &v.model, &format!("datum A={a} B={b}")).unwrap_err();
+    assert!(e.starts_with("usage"), "{e}");
+    let e = vug_view::deviation::command(&mut v.view, &v.model, &format!("datum B={a} A={b} C={c}")).unwrap_err();
+    assert!(e.starts_with("usage"), "{e}");
+    let m = v.view.deviation.as_ref().unwrap();
+    assert!(m.datums.is_none() && m.frame.is_none());
+    assert_eq!(corner(m), c0);
+
+    assert_eq!(vug_view::deviation::command(&mut v.view, &v.model, &format!("datum A={a} B={b} C={c}")), Ok(true));
+    let m = v.view.deviation.as_ref().unwrap();
+    let fr = m.frame.clone().expect("a frame").expect("the box datums fix a frame");
+    let g = m.gdt[post as usize];
+    let p1 = g.position_mm.expect("the post's position in the frame");
+    let scan_core::Nominal::Cylinder(nc) = g.nominal else { panic!("the post is a cylinder") };
+    assert_eq!(p1.to_bits(), scan_core::gdt::position_in(&fr, &g.axis.expect("a fitted axis"), &nc, g.extent).to_bits(), "scan_core's position_in");
+    assert_ne!(p1.to_bits(), p0.to_bits(), "the frame moves the position: {p1} vs {p0}");
+    let lines = corner(m);
+    println!("{}", lines.join("\n"));
+    let fl = format!("frame A={a} B={b} C={c} residual={:.3}", fr.residual_mm);
+    let at = lines.iter().position(|l| *l == fl).unwrap_or_else(|| panic!("no frame line: {lines:?}"));
+    assert_eq!(at + 2, lines.len(), "the frame line just before the callout line: {lines:?}");
+    assert!(lines.last().unwrap().starts_with(&format!("{pname} position={p1:.3} tol=5.000")), "{lines:?}");
+
+    assert_eq!(vug_view::deviation::command(&mut v.view, &v.model, "datum clear"), Ok(true));
+    let m = v.view.deviation.as_ref().unwrap();
+    assert!(m.datums.is_none() && m.frame.is_none());
+    assert_eq!(corner(m), c0, "the registration's position is back");
+    assert_eq!(vug_view::deviation::command(&mut v.view, &v.model, "datum clear"), Ok(false), "nothing left to clear");
+}
+
+#[test]
+fn the_margin_argument_changes_n_kept() {
+    let doc = doc_core::read(DOC).expect("the document reads");
+    let at = |m: Option<f64>| Viewer::open_deviation(scan().clone(), &doc, "fixture", SIZE, Preset::Una, m).expect("the design builds");
+    let (none, twelve, four) = (at(None), at(Some(12.0)), at(Some(4.0)));
+    let map = |v: &Viewer| v.view.deviation.clone().expect("a map");
+    let (mn, m12, m4) = (map(&none), map(&twelve), map(&four));
+    assert_eq!(mn.margin_mm, vug_view::deviation::GDT_MARGIN_MM, "None is the fallback");
+    assert_eq!(mn.gdt, m12.gdt, "the fallback is the constant, not another rule");
+    let (top, _) = plate_top(&mn);
+    let (n12, n4) = (mn.gdt[top as usize], m4.gdt[top as usize]);
+    println!("plate top n={}/{} at 12 mm, n={}/{} at 4 mm", n12.n, n12.matched, n4.n, n4.matched);
+    assert_eq!(n4.matched, n12.matched, "the margin does not change the pairing");
+    assert!(n4.n > n12.n, "a narrower margin keeps more form vertices: {} vs {}", n4.n, n12.n);
 }
