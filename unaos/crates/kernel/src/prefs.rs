@@ -1097,7 +1097,7 @@ pub fn retire(ns: &str) -> usize {
 #[cfg(any(feature = "aarch64_el0", target_arch = "x86_64"))]
 /// The stamped program name of wm `owner`, lowercased into `buf`; `None` = nothing armed.
 fn caller_name(owner: u64, buf: &mut [u8; crate::video::wm::MAX_TITLE]) -> Option<&str> {
-    let n = crate::video::wm::app_name_of(owner, buf);
+    let n = crate::video::wm::app_name_of(owner, buf); #[cfg(feature = "busreg")] let n = prefscap_early_name(owner, n, buf); // PREFSCAP-EARLY-NAME (rmbp-ledger B1182): no launcher-armed name -> wm's early record at the row's current generation, the cap road only (file tail). LINE-NEUTRAL fold, code first
     buf[..n].make_ascii_lowercase();
     core::str::from_utf8(&buf[..n]).ok().filter(|s| !s.is_empty())
 }
@@ -2284,8 +2284,8 @@ fn prefscap_set_note(verb: u8, body: &[u8], demoted: Option<&str>, st: i64) -> i
 /// ring-3 rows only, no declare: pure cap checks, nothing written); `/apps/PREFS.ELF` and `/apps/prefs.elf` keep
 /// Principia, `/APPS/PREFS.ELF` and a pathless `PREFS.ELF` are demoted, a non-prefs name is never touched. The
 /// scratch name and path are forgotten.
-/// `:: PREFSCAP-PATH: foreign=refused anon=held apps=admitted case=admitted upper=demoted pathless=demoted early=admitted stale=demoted other=demoted ns=refused nsown=admitted restored=1 -> PASS ::`
-/// (`early=` / `stale=`: PREFSCAP-ARM-EARLY B1176, [`prefscap_early_legs`]; `other=demoted` / `ns=` / `nsown=`: PREFSCAP-NS-PATH
+/// `:: PREFSCAP-PATH: foreign=refused anon=held apps=admitted case=admitted upper=demoted pathless=demoted early=admitted stale=demoted earlyname=admitted other=demoted ns=refused nsown=admitted restored=1 -> PASS ::`
+/// (`early=` / `stale=`: PREFSCAP-ARM-EARLY B1176, [`prefscap_early_legs`]; `earlyname=`: PREFSCAP-EARLY-NAME B1182, [`prefscap_earlyname_leg`]; `other=demoted` / `ns=` / `nsown=`: PREFSCAP-NS-PATH
 /// B1177 — a `/home/una/LUMEN.ELF` is demoted, a `/home/una/VEIN.ELF` SET of `vein.endpoint` is -EACCES with the value kept
 /// (`[prefs] set vein.endpoint ok=0 why=refused via=bus by=vein path=foreign`), `/apps/VEIN.ELF` keeps `vein.*` and only it).
 #[cfg(feature = "witness")]
@@ -2352,14 +2352,14 @@ fn prefscap_path_legs() {
             c == Caller::Program("vein") && may_set(c, "vein", "x") && !may_set(c, "system", "login.items")
         })
     };
-    crate::video::wm::app_name_forget(OWNER);
+    crate::video::wm::app_name_forget(OWNER); let earlyname = prefscap_earlyname_leg(OWNER); // PREFSCAP-EARLY-NAME (rmbp-ledger B1182): no late name, the early record names the caller `prefs` (file tail). Named in-place hunk
     let restored = early_gone && !crate::video::wm::app_name_armed(OWNER) && crate::video::wm::app_path_with(OWNER, |_| true).is_none();
-    let ok = foreign && anon && apps && case && upper && pathless && early && stale && other && ns && nsown && restored;
+    let ok = foreign && anon && apps && case && upper && pathless && early && stale && earlyname && other && ns && nsown && restored; // PREFSCAP-EARLY-NAME (rmbp-ledger B1182): `earlyname` (named in-place hunk)
     serial_println!(
-        ":: PREFSCAP-PATH: foreign={} anon={} apps={} case={} upper={} pathless={} early={} stale={} other={} ns={} nsown={} restored={} -> {} ::",
+        ":: PREFSCAP-PATH: foreign={} anon={} apps={} case={} upper={} pathless={} early={} stale={} earlyname={} other={} ns={} nsown={} restored={} -> {} ::",
         if foreign { "refused" } else { "ADMITTED" }, if anon { "held" } else { "FAIL" }, if apps { "admitted" } else { "DEMOTED" },
         if case { "admitted" } else { "DEMOTED" }, if upper { "demoted" } else { "ADMITTED" }, if pathless { "demoted" } else { "ADMITTED" },
-        if early { "admitted" } else { "DEMOTED" }, if stale { "demoted" } else { "ADMITTED" },
+        if early { "admitted" } else { "DEMOTED" }, if stale { "demoted" } else { "ADMITTED" }, if earlyname { "admitted" } else { "DEMOTED" },
         if other { "demoted" } else { "KEPT" }, if ns { "refused" } else { "ADMITTED" }, if nsown { "admitted" } else { "DEMOTED" }, restored as u8, if ok { "PASS" } else { "FAIL" }
     );
 }
@@ -2520,4 +2520,57 @@ fn unset_roads_leg(sp: &str, mp: &str, session: bool) -> (bool, bool) {
     let _ = reload_session(&old);
     let rel = set3 && saved && get(NS, K).is_none() && !(session && kept());
     (del, rel)
+}
+
+// =================================================================================================
+// PREFSCAP-EARLY-NAME (rmbp-ledger B1182) — TAIL-APPENDED, `busreg` only (knob-off: no symbol, no byte). B1176 let
+// [`prefscap_path`] read wm's early PATH record, but [`caller_name`] named the caller from `wm::app_name_of` only, and
+// B1164 keeps the early record invisible to it by design (titles and NOTICE must not read it). So a ring-3
+// SYS_SPAWN_PATH launch of `/apps/PREFS.ELF` (early-armed at the mint, B1172) that REGISTERs and SETs before its
+// launcher's late arm, or with no late arm at all, was `Anon` before the path was asked. [`caller_name`]'s callers are
+// the cap road only ([`bus_fulfil_from`] and the PREFSCAP-PATH witness), so its ONE fold falls back to
+// `wm::app_name_early_of` at the row's CURRENT generation ([`prefscap_gen`], B1176's inverse, reused) when no late name
+// answers: `bus_route::row_name`'s own early fallback (`armearly_name`), mirrored. A late name always wins; a row with
+// neither record stays `Anon`; an early name from a non-`/apps` or relative argv[0] is named, then demoted by
+// [`prefscap_path`] (`path=foreign`); a record from another generation answers nothing. Locks: wm's leaf `APP_NAMES`
+// is dropped before `rgen` (an atomic load) and the leaf `APP_NAMES_EARLY`, taken alone; no prefs lock is held.
+// Witness: `tests prefs` → `:: PREFSCAP-PATH: … stale=demoted earlyname=admitted … -> PASS ::`.
+// =================================================================================================
+
+/// PREFSCAP-EARLY-NAME — `n` when a launcher-armed name exists, else the length of `owner`'s early program name at its
+/// row's current generation, copied into `buf` (0 = no record at that generation, or an owner below every row's).
+#[cfg(all(feature = "busreg", any(feature = "aarch64_el0", target_arch = "x86_64")))]
+fn prefscap_early_name(owner: u64, n: usize, buf: &mut [u8; crate::video::wm::MAX_TITLE]) -> usize {
+    if n != 0 {
+        return n;
+    }
+    prefscap_gen(owner).map_or(0, |g| crate::video::wm::app_name_early_of(owner, g, buf))
+}
+
+/// `prefscap_path_legs`' early-name leg on the scratch `owner` (no late name armed): `/apps/PREFS.ELF` early-armed at
+/// [`prefscap_gen`] makes [`caller_name`] `prefs`, [`prefscap_path`] keeps it (nothing demoted) and it may set
+/// `app.prefs.x` and declare `prefs` (pure cap checks, nothing written); the record forgotten, the row has neither
+/// record and [`caller_name`] answers none (`Anon`).
+#[cfg(all(feature = "witness", feature = "busreg", any(feature = "aarch64_el0", target_arch = "x86_64")))]
+fn prefscap_earlyname_leg(owner: u64) -> bool {
+    use prefs_core::cap::{may_declare, may_set, Caller};
+    let Some(g) = prefscap_gen(owner) else { return false };
+    if crate::video::wm::app_name_armed(owner) {
+        return false;
+    }
+    let _ = crate::video::wm::app_name_arm_early(owner, g, "/apps/PREFS.ELF");
+    let admitted = {
+        let mut nb = [0u8; crate::video::wm::MAX_TITLE];
+        caller_name(owner, &mut nb).is_some_and(|p| {
+            let (c, d) = prefscap_path(owner, Caller::Program(p));
+            p == "prefs" && d.is_none() && c == Caller::Program("prefs") && may_set(c, "app", "prefs.x") && may_declare(c, "prefs")
+        })
+    };
+    crate::video::wm::app_name_early_forget(owner);
+    let anon = {
+        let mut nb = [0u8; crate::video::wm::MAX_TITLE];
+        caller_name(owner, &mut nb).is_none()
+    };
+    let gone = crate::video::wm::app_path_early_of(owner, g, |_| true).is_none();
+    admitted && anon && gone
 }
