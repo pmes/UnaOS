@@ -2619,9 +2619,9 @@ fn press_login(row: usize, cx: usize) {
 /// A chosen entry owed to the service pass (index + 1; 0 = none).
 static MODE_APPLY: AtomicU32 = AtomicU32::new(0);
 
-/// The dropdown's entries for the live panel (empty while the panel is busy or unknown).
+/// The dropdown's entries for the live panel (empty only until the first good panel read: B1105).
 fn display_modes() -> Vec<prefs_core::modes::Mode> {
-    let (w, h) = crate::video::panel_info_nonblocking().map_or((0, 0), |i| (i.width as u32, i.height as u32));
+    let (w, h) = crate::video::panel_wh_held(); // SETTINGS-PANELBUSY (B1105): the last good panel read across a refused try_lock, so the captions never flicker to "panel busy"
     prefs_core::modes::modes(w, h, super::dpi::native_s2())
 }
 
@@ -3320,7 +3320,7 @@ static A11Y_REDUCE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicB
 static A11Y_CONTRAST: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 static A11Y_CURSOR_Q: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(A11Y_CURSOR_MIN_Q);
 static A11Y_TEXT: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
-/// Store writes owed: bit k = row k (0 reduce motion, 1 contrast, 2 cursor size, 3 text size, 4 cvd, 5 invert, 6 zoom, 7 zoom follow, 8 show performance).
+/// Store writes owed: bit k = row k (0 reduce motion, 1 contrast, 2 cursor size, 3 text size, 4 cvd, 5 invert, 6 zoom, 7 zoom follow, 8 show performance, 9 starfield shimmer: SHIMMERPREF B1108).
 static A11Y_PERSIST: AtomicU32 = AtomicU32::new(0);
 /// ZOOM (B713): the magnifier's factor as stored (0 off, 2, 3, 4) and what it follows (0 the pointer, 1 the focus) —
 /// the rows' latch; the lens (`video/zoom.rs`, x86 `wc`) is handed both by [`zoom_apply`].
@@ -3411,8 +3411,9 @@ fn a11y_load(via: &str) {
     let zoom_owed = A11Y_PERSIST.load(Ordering::Acquire) & (3 << 6) != 0; if !zoom_owed { A11Y_ZOOM.store(zm, Ordering::Relaxed); } // crawl A 15: a chord's or a press's zoom write still owed is newer than the store, so the re-read leaves the lens alone
     if !zoom_owed { A11Y_FOLLOW.store(zf, Ordering::Relaxed); }
     if !zoom_owed { zoom_apply(); }
+    let moved = moved + shimmer_load(); // SHIMMERPREF (B1108): the starfield shimmer row (file tail)
     if via == "login" || moved > 0 {
-        serial_println!("[settings] accessibility loaded reduce_motion={} increase_contrast={} cursor_size=x{} text_size={} cvd={} invert={} moved={} via={}", rm as u8, ic as u8, a11y_cursor_str(cq), A11Y_TEXT_NAMES[ts as usize], af::NAMES[cvd], inv as u8, moved, via);
+        serial_println!("[settings] accessibility loaded reduce_motion={} increase_contrast={} cursor_size=x{} text_size={} cvd={} invert={} moved={} via={} shimmer={}", rm as u8, ic as u8, a11y_cursor_str(cq), A11Y_TEXT_NAMES[ts as usize], af::NAMES[cvd], inv as u8, moved, via, shimmer_on() as u8);
         a11y_cost_line(if via == "login" { "load" } else { "change" });
     }
 }
@@ -3446,6 +3447,7 @@ fn a11y_set(row: usize, val: usize, store: bool) {
         6 => { let z = a11y_zoom_of_seg(a11y_zoom_seg(val.min(4) as u8)); A11Y_ZOOM.store(z, Ordering::Relaxed); zoom_apply(); ("zoom", alloc::format!("{}", z), cfg!(all(target_arch = "x86_64", feature = "wc"))) } // ZOOM (B713)
         7 => { let f = val.min(A11Y_FOLLOW_NAMES.len() - 1); A11Y_FOLLOW.store(f as u8, Ordering::Relaxed); zoom_apply(); ("zoom_follow", alloc::format!("{}", A11Y_FOLLOW_NAMES[f]), cfg!(all(target_arch = "x86_64", feature = "wc"))) }
         8 => { let _ = super::perfhud::apply(val != 0, "settings", false); /* crawl A 24: the store write is this row's bit 8, not perfhud's OWED too */ ("show_performance", alloc::format!("{}", (val != 0) as u8), cfg!(all(target_arch = "x86_64", feature = "wc"))) } // PERFHUD (B710): applied where the compositor paints it
+        9 => shimmer_row_set(val != 0), // SHIMMERPREF (B1108)
         _ => return,
     };
     if store {
@@ -3505,10 +3507,11 @@ fn a11y_service() {
         set_sys(key::A11Y_ZOOM_FOLLOW, P::Str(String::from(A11Y_FOLLOW_NAMES[f])));
     }
     if owed & 256 != 0 { set_sys(key::A11Y_SHOW_PERF, P::Bool(super::perfhud::visible())); } // PERFHUD (B710), row 8
+    if owed & 512 != 0 { set_sys(key::A11Y_SHIMMER, P::Bool(shimmer_on())); } // SHIMMERPREF (B1108), row 9
 }
 
 fn paint_a11y(st: &mut State) {
-    groups(st, &[(0, 1), (2, 3), (4, 5), (6, 7), (8, 8)]);
+    groups(st, &[(0, 1), (2, 3), (4, 5), (6, 7), (8, 9)]); // SHIMMERPREF (B1108): row 9 joins the performance group
     let (rm, ic, q) = (reduce_motion(), increase_contrast(), A11Y_CURSOR_Q.load(Ordering::Relaxed));
     txt(st, LABEL_X, 0, "Reduce motion");
     tog(st, 0, TOG_X, rm, false); // SETTINGSCRAFT: the kit's switch, right-aligned (a press anywhere on the row flips it)
@@ -3537,11 +3540,12 @@ fn paint_a11y(st: &mut State) {
     txt2(st, VAL_X, 6, if zm == 0 { "Win+= zooms in" } else { "Win+- out, Win+0 off" });
     txt(st, LABEL_X, 7, "Zoom follows");
     seg(st, 7, &[b"Pointer", b"Focus"], zf, false);
+    txt2(st, VAL_X, 7, "Around the pointer or the focused window"); // SHIMMERPREF (B1108): the help text row 9 held
     let hud = super::perfhud::visible(); // PERFHUD (B710): the overlay's switch
     txt(st, LABEL_X, 8, "Show performance");
     tog(st, 8, TOG_X, hud, false);
     txt2(st, TRACK_X, 8, if hud { "Frame times, latency and memory, top right" } else { "Off (Win+F12 toggles it)" });
-    txt2(st, LABEL_X, 9, "Zoom magnifies around the pointer or focus; the colour filter and invert cover the whole glass."); // crawl A 3: ROWS = 10, so row 9 is the last painted row (row 10 clipped at WIN_H)
+    paint_shimmer_row(st); // SHIMMERPREF (B1108): the starfield shimmer switch (file tail). crawl A 3: ROWS = 10, so row 9 is the last painted row (row 10 clipped at WIN_H)
 }
 
 /// A11YFILTERS (B705): what row 4's value column says per mode (the segments name the cone each filter simulates).
@@ -3559,6 +3563,7 @@ fn press_a11y(row: usize, cx: usize) {
         6 => { if cx >= TRACK_X && cx < TRACK_X + TRACK_W { a11y_set(6, a11y_zoom_of_seg((cx - TRACK_X) / (TRACK_W / A11Y_ZOOM_SEGS.len())) as usize, true); } } // ZOOM (B713)
         7 => { if cx >= TRACK_X && cx < TRACK_X + TRACK_W { a11y_set(7, ((cx - TRACK_X) / (TRACK_W / A11Y_FOLLOW_NAMES.len())).min(A11Y_FOLLOW_NAMES.len() - 1), true); } }
         8 => a11y_set(8, (!super::perfhud::visible()) as usize, true), // PERFHUD (B710)
+        9 => a11y_set(9, (!shimmer_on()) as usize, true), // SHIMMERPREF (B1108)
         _ => {}
     }
 }
@@ -3885,7 +3890,7 @@ const fn mr(keys: &'static [&'static str], tab: usize, row: usize, label: &'stat
 }
 
 /// Every Settings row, in column order then row order. Labels are the strings the panes paint.
-pub const MAP: [MapRow; 45] = {
+pub const MAP: [MapRow; 46] = {
     use crate::prefs::key::*;
     [
         // General (0)
@@ -3931,6 +3936,7 @@ pub const MAP: [MapRow; 45] = {
         mr(&[A11Y_ZOOM], A11Y_TAB, 6, "Zoom", NO_CTRL), // ZOOM (B713)
         mr(&[A11Y_ZOOM_FOLLOW], A11Y_TAB, 7, "Zoom follows", NO_CTRL),
         mr(&[A11Y_SHOW_PERF], A11Y_TAB, 8, "Show performance", NO_CTRL), // PERFHUD (B710)
+        mr(&[A11Y_SHIMMER], A11Y_TAB, 9, "Starfield shimmer", NO_CTRL), // SHIMMERPREF (B1108)
         // Privacy (REASK B681): the switch row; the decisions below it are dynamic (`prefs::decisions`), each with a Revoke
         mr(&[PRIVACY_REMEMBER], PRIV_TAB, 0, "Remember my answers", NO_CTRL),
         // Date & Time (TZLOCALE B701): the one locale authority's three keys
@@ -4182,6 +4188,8 @@ pub fn keys_probe() -> (usize, usize) {
 // declares none; its ring is read on the paint the glass would show (the column scrolled by `col_scrolled`, as `open`
 // and `switch_tab` scroll it — tabs 14 and 15 sit past `COL_VIS`); the thinnest ring is >= 2 logical px at the
 // panel's scale (`a11y::selftest`), and every miss prints `[a11y] ring missing tab= stop= row=`.
+// F39A11Y (rmbp-ledger B1101): the reference paint is the keyboard in the pane on no stop and each ring is read inside
+// its stop's own box; every miss also names its kit kind, the ring run and the first changed pixel (`kind= px= at=`).
 
 /// The kit's focus ring outside a Users row's wash (row `r`): width `DIMS.focus_ring` at the panel's scale, the radius
 /// the wash's plus that width — what `draw::focus_ring` draws around a control.
@@ -4194,68 +4202,106 @@ fn row_ring(st: &mut State, r: usize) {
 
 /// `tests a11ytree`'s ring leg. Every stop Tab reaches — on each tab the column (stop 0), then every pane control
 /// (PICKERKEYS B768: the pane's stops, `hits[pane0..]`) — is painted OFFSCREEN holding the keyboard (`kbd`), and the
-/// same tab is painted at rest (focus on the column, no key pressed). The ring is read from the difference: in the
-/// first changed run of its top row, at the run's middle, the changed pixels downward that are the ring's colour (one
-/// anti-aliased pixel skipped at the top). Returns `(stops, rung, ring_px, every stop without a ring as (tab, stop,
-/// row name))`, `ring_px` the thinnest ring seen, in device px. One reused pair of surfaces; a fresh `State` per paint,
-/// so no glide carries between paints. A11YTREE2 (B822): each paint's column is scrolled as the live window scrolls it
+/// same tab is painted as the REFERENCE. The ring is read from the difference: in the first changed run of its top row,
+/// at the run's middle, the changed pixels downward that are the ring's colour (one anti-aliased pixel skipped at the
+/// top). Returns `(stops, rung, ring_px, every stop without a ring as (tab, stop, row name, `kind= px= at=`))`,
+/// `ring_px` the thinnest ring seen, in device px. One reused pair of surfaces; a fresh `State` per paint, so no glide
+/// carries between paints. A11YTREE2 (B822): each paint's column is scrolled as the live window scrolls it
 /// (`col_scrolled`, `open`'s rule), so a tab past [`COL_VIS`] shows its pill and its ring as on the glass.
+/// F39A11Y (rmbp-ledger B1101): the reference is the keyboard in the pane on NO stop (`kbd`, `!strip`, `KF_NONE`), so
+/// a stop's paint differs from it by that stop's ring alone (Users' row wash and row ring are in both); and the first
+/// changed pixel is sought only inside the stop's own BOX — the column for stop 0, else the control's hit rect grown by
+/// `DIMS.focus_ring + 3` logical px — so a pixel that moved between the two paints for another reason (flight 39: the
+/// Resolution caption reading "panel busy" when `panel_info_nonblocking` was refused) cannot stand in for the ring.
 #[cfg(feature = "witness")]
-pub fn ring_probe() -> (usize, usize, usize, Vec<(usize, usize, &'static str)>) {
+pub fn ring_probe() -> (usize, usize, usize, Vec<(usize, usize, &'static str, String)>, [[usize; 2]; CENSUS_KINDS.len()]) {
     let (pw, ph) = (super::metrics::size(WIN_W), super::metrics::size(WIN_H()));
     let (mut a, mut b): (Vec<u32>, Vec<u32>) = (Vec::new(), Vec::new());
     if a.try_reserve_exact(pw * ph).is_err() || b.try_reserve_exact(pw * ph).is_err() {
-        return (0, 0, 0, alloc::vec![(usize::MAX, 0, "-")]);
+        return (0, 0, 0, alloc::vec![(usize::MAX, 0, "-", String::from("oom"))], [[0; 2]; CENSUS_KINDS.len()]);
     }
     a.resize(pw * ph, 0);
     b.resize(pw * ph, 0);
     let v0 = CUR.lock().clone();
-    // PICKERKEYS (B768): each paint also returns the pane's stops (the rest paint's count is the tab's)
-    let paint_one = |buf: Vec<u32>, tab: usize, stop: Option<usize>| -> (Vec<u32>, usize, Option<[u16; 4]>) {
+    // PICKERKEYS (B768): each paint also returns the pane's stops (the reference paint's count is the tab's).
+    // F39A11Y (B1101): `None` is the reference (the keyboard in the pane on no stop); each paint also returns the
+    // stop's kit kind (`K_NAMES`, `column` for stop 0).
+    let paint_one = |buf: Vec<u32>, tab: usize, stop: Option<usize>| -> (Vec<u32>, usize, Option<[u16; 4]>, &'static str) {
         let mut st = State::new(WIN_W, WIN_H(), buf, 1, true, col_scrolled(0, tab, TABS)); // A11YTREE2 (B822): the live column
-        if let Some(k) = stop {
-            st.kbd = true;
-            if k > 0 {
+        st.kbd = true;
+        match stop {
+            None => {
+                st.strip = false;
+                st.kf = KF_NONE;
+            }
+            Some(k) if k > 0 => {
                 st.strip = false;
                 st.kf = k - 1;
             }
+            Some(_) => {}
         }
         let mut v = v0.clone();
         v.tab = tab as u8;
         paint(&mut st, &v);
-        let hit = stop.filter(|&k| k > 0).and_then(|k| st.hits.get(st.pane0.saturating_add(k - 1)).copied());
-        (core::mem::take(&mut st.surf), stops(&st).1, hit)
+        let at = stop.filter(|&k| k > 0).map(|k| st.pane0.saturating_add(k - 1));
+        let hit = at.and_then(|i| st.hits.get(i).copied());
+        let kind = match stop {
+            Some(0) => "column",
+            _ => at.and_then(|i| st.meta.get(i)).and_then(|m| K_NAMES.get(m[0] as usize).copied()).unwrap_or("-"),
+        };
+        (core::mem::take(&mut st.surf), stops(&st).1, hit, kind)
     };
     let ring = theme::focus_ring() & 0x00FF_FFFF;
     let near = |p: u32| (0..3).all(|k| ((p >> (8 * k)) & 0xFF).abs_diff((ring >> (8 * k)) & 0xFF) <= 3);
+    let edge = |v: usize, max: usize| (e(v).max(0) as usize).min(max);
     let (mut stops, mut rung, mut thin, mut fail) = (0usize, 0usize, usize::MAX, Vec::new());
+    let mut census = [[0usize; 2]; CENSUS_KINDS.len()]; // A11Y-STOPS-CENSUS (B1105): [stops, rung] per kit kind
     for tab in 0..TABS {
-        let (bb, n_pane, _) = paint_one(b, tab, None);
+        let (bb, n_pane, _, _) = paint_one(b, tab, None);
         b = bb;
         let n = 1 + n_pane;
         for k in 0..n {
-            let (aa, _, hit) = paint_one(a, tab, Some(k));
+            let (aa, _, hit, kind) = paint_one(a, tab, Some(k));
             a = aa;
             stops += 1;
+            let slot = census_slot(kind); // A11Y-STOPS-CENSUS (B1105)
+            census[slot][0] += 1;
+            // F39A11Y (B1101): the stop's own box, device px `[bx0, bx1) x [by0, by1)`
+            let (bx0, bx1, by0, by1) = match hit {
+                Some(h) if k > 0 => {
+                    let m = draw::DIMS.focus_ring + 3;
+                    let (hx, hy, hw, hh) = (h[0] as usize, h[1] as usize, h[2] as usize, h[3] as usize);
+                    (edge(hx.saturating_sub(m), pw), edge(hx + hw + m, pw), edge(hy.saturating_sub(m), ph), edge(hy + hh + m, ph))
+                }
+                _ if k == 0 => (0, edge(COL_W, pw), 0, ph),
+                _ => (0, 0, 0, 0),
+            };
             let ch = |i: usize| (a[i] & 0x00FF_FFFF) != (b[i] & 0x00FF_FFFF);
-            let px = match (0..pw * ph).find(|&i| ch(i)) {
+            let first = (by0..by1).find_map(|y| (bx0..bx1).find(|&x| ch(y * pw + x)).map(|x| (x, y)));
+            let px = match first {
                 None => 0,
-                Some(i0) => {
-                    let (y0, x0) = (i0 / pw, i0 % pw);
+                Some((x0, y0)) => {
                     let mut x1 = x0;
-                    while x1 + 1 < pw && ch(y0 * pw + x1 + 1) { x1 += 1; }
+                    while x1 + 1 < bx1 && ch(y0 * pw + x1 + 1) { x1 += 1; }
                     let xm = (x0 + x1) / 2;
                     let mut y = y0;
-                    while y < ph && y < y0 + 2 && ch(y * pw + xm) && !near(a[y * pw + xm]) { y += 1; }
+                    while y < by1 && y < y0 + 2 && ch(y * pw + xm) && !near(a[y * pw + xm]) { y += 1; }
                     let mut run = 0;
-                    while y < ph && ch(y * pw + xm) && near(a[y * pw + xm]) { run += 1; y += 1; }
+                    while y < by1 && ch(y * pw + xm) && near(a[y * pw + xm]) { run += 1; y += 1; }
                     run
                 }
             };
-            if px >= 2 { rung += 1; thin = thin.min(px); } else { fail.push((tab, k, ring_row_name(tab, k, hit))); }
+            if px >= 2 {
+                rung += 1;
+                census[slot][1] += 1; // A11Y-STOPS-CENSUS (B1105)
+                thin = thin.min(px);
+            } else {
+                let at = first.map_or(String::from("-"), |(x, y)| alloc::format!("{},{}", x, y));
+                fail.push((tab, k, ring_row_name(tab, k, hit), alloc::format!("kind={} px={} at={}", kind, px, at)));
+            }
         }
     }
-    (stops, rung, if thin == usize::MAX { 0 } else { thin }, fail)
+    (stops, rung, if thin == usize::MAX { 0 } else { thin }, fail, census)
 }
 
 /// A11YTREE2 (B822): the name of `ring_probe`'s stop `stop` on tab `tab` — `column` for stop 0 (the tab's pill), else
@@ -5971,4 +6017,62 @@ fn close_hook(_id: wm::WinId, surf: usize) {
         if g.as_ref().map(|s| s.surf.as_ptr() as usize) == Some(surf) { g.take() } else { None }
     };
     drop(st);
+}
+
+// ── A11Y-STOPS-CENSUS (rmbp-ledger B1105) — every control kind lists its stops ─────────────────────────────────────
+// `ring_probe` tallies each stop it walks under its kit kind (the `kind` it already names a miss by), so `tests
+// a11ytree` prints one `[a11y] census kind=<k> stops=<n> rung=<n>` line per kind, zeros included: a kind with no stop
+// is visible, and the slots sum to `stops=`. `-` is a stop whose control recorded no keyboard word.
+
+/// The census's kinds: the column (stop 0), then [`K_NAMES`] in kind order, then `-`.
+#[cfg(feature = "witness")]
+pub const CENSUS_KINDS: [&str; 8] = ["column", "press", "seg", "slider", "field", "line", "entry", "-"];
+
+/// `kind`'s slot in [`CENSUS_KINDS`] (an unknown name counts as `-`).
+#[cfg(feature = "witness")]
+fn census_slot(kind: &str) -> usize {
+    CENSUS_KINDS.iter().position(|k| *k == kind).unwrap_or(CENSUS_KINDS.len() - 1)
+}
+
+// ── SHIMMERPREF (rmbp-ledger B1108) — Settings > Accessibility row 9, the starfield shimmer ─────────────────────────
+// `system.accessibility.shimmer` (bool, default on; PREFS-SCHEMA.md) turns the desktop STARFIELD shimmer off on its own,
+// apart from Reduce motion (BP-video-11). One more latch of the A11YPANE family: loaded by `a11y_load`, set by
+// `a11y_set` row 9, stored through `A11Y_PERSIST` bit 9 by `a11y_service`. Both shimmer seats (`desktop::shimmer_live`,
+// `desktop::shimmer_idle`) read [`shimmer_on`] beside [`reduce_motion`]. Wire: `[settings] accessibility.shimmer=<0|1>
+// applied=<0|1>`; the loaded line's ` shimmer=<0|1>`.
+
+/// The row's applied state (the schema's default: on).
+static A11Y_SHIMMER: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+
+/// The starfield shimmer row, as applied: the shimmer runs only while this is on AND Reduce motion is off.
+#[inline]
+pub fn shimmer_on() -> bool {
+    A11Y_SHIMMER.load(Ordering::Relaxed)
+}
+
+/// `a11y_load`'s read of the row (the schema's default where unset): latch it, answer 1 when it moved.
+fn shimmer_load() -> u8 {
+    let on = crate::prefs_client::sys_flag(crate::prefs::key::A11Y_SHIMMER).unwrap_or(true);
+    (A11Y_SHIMMER.swap(on, Ordering::Relaxed) != on) as u8
+}
+
+/// `a11y_set` row 9: apply the switch; `(name, value, applied)` for its wire (applied where the shimmer is built).
+fn shimmer_row_set(on: bool) -> (&'static str, String, bool) {
+    A11Y_SHIMMER.store(on, Ordering::Relaxed);
+    ("shimmer", alloc::format!("{}", on as u8), cfg!(feature = "facet"))
+}
+
+/// `paint_a11y` row 9: the label, the switch, and what the stars do now.
+fn paint_shimmer_row(st: &mut State) {
+    let on = shimmer_on();
+    txt(st, LABEL_X, 9, "Starfield shimmer");
+    tog(st, 9, TOG_X, on, false);
+    txt2(st, TRACK_X, 9, if !on { "Stars hold still" } else if reduce_motion() { "Held still by Reduce motion" } else { "Stars glint on the desktop" });
+}
+
+/// `tests shimmeridle`'s toggle: row 9 set through the press's own path with no store write; answers the value it had.
+pub fn shimmer_set_unstored(on: bool) -> bool {
+    let was = shimmer_on();
+    a11y_set(9, on as usize, false);
+    was
 }

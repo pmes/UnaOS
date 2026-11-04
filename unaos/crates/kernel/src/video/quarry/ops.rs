@@ -308,6 +308,24 @@ fn menu_w(g: &Geom) -> usize {
     22 * g.cell_w() + 2 * PAD() + 2 * sheet::INSET() + sheet::BAND()
 }
 fn menu_h(g: &Geom) -> usize {
+    let (rows, more) = menu_fit(g); // QUARRYMENUFIT (B1107): the rows that fit, plus the more-row
+    (rows + more as usize) * g.row_h() + 2 * crate::video::crystal::DROP_PADY() + crate::video::crystal::sheet::BAND()
+}
+
+/// QUARRYMENUFIT (rmbp-ledger B1107) — **the live fit rule**: `(rows, more)`, the items the menu shows and whether
+/// one hairline `<n> more…` row closes it. Every item when the whole menu fits the window's height; else the slots
+/// that fit less one, the last slot the more-row (it lights nothing; a press on it dismisses, like the band). The
+/// ONE geometry every site reads (paint, hover, press, the open road, the probe) through [`menu_h`] / [`menu_body`];
+/// `(0, _)` means nothing fits and the open road refuses. The menu never scrolls (BP-video-38: it is no pane;
+/// MENU-SCROLL owed).
+fn menu_fit(g: &Geom) -> (usize, bool) {
+    let rh = g.row_h().max(1);
+    let cap = g.h.saturating_sub(2 * crate::video::crystal::DROP_PADY() + crate::video::crystal::sheet::BAND()) / rh;
+    if cap >= ITEMS.len() { (ITEMS.len(), false) } else { (cap.saturating_sub(1), true) }
+}
+
+/// QUARRYMENUFIT (B1107) — the menu's height with EVERY item (the probe's fit leg sizes its short window under it).
+fn menu_h_all(g: &Geom) -> usize {
     ITEMS.len() * g.row_h() + 2 * crate::video::crystal::DROP_PADY() + crate::video::crystal::sheet::BAND()
 }
 
@@ -329,7 +347,7 @@ fn menu_hover(g: &Geom, x: usize, y: usize) -> Option<usize> {
         return None;
     }
     let k = (sy - y - pady) / g.row_h();
-    if k < ITEMS.len() { Some(k) } else { None }
+    if k < menu_fit(g).0 { Some(k) } else { None } // QUARRYMENUFIT (B1107): the more-row lights nothing
 }
 
 /// MENUS2 (B652) — **Quarry's file-ops menu on the sheet** (MENUSCRAFT §9), painted IN Quarry's own surface `px`
@@ -362,7 +380,8 @@ fn menu_paint(px: &mut [u32], g: &Geom, x: usize, y: usize, hover: Option<usize>
         draw::fill_rrect(&mut s, b, rad, sheet::surface_overlay());
         draw::stroke_rrect(&mut s, b, rad, 1, draw::Ink::argb(sheet::line_subtle()));
     }
-    for (i, it) in ITEMS.iter().enumerate() {
+    let (rows, more) = menu_fit(g); // QUARRYMENUFIT (B1107)
+    for (i, it) in ITEMS.iter().enumerate().take(rows) {
         let top = y + pady + i * rh;
         let hot = hover == Some(i);
         if hot {
@@ -373,23 +392,33 @@ fn menu_paint(px: &mut [u32], g: &Geom, x: usize, y: usize, hover: Option<usize>
         let ink = if hot { sheet::on_accent() } else { sheet::text_primary() };
         text(px, g, x + sheet::INSET() + PAD(), top + g.ts, it.label().as_bytes(), x + bw - sheet::INSET(), ink);
     }
+    if more {
+        more_row(px, g, x, y + pady + rows * rh, bw, ITEMS.len() - rows); // QUARRYMENUFIT (B1107): the hidden tail
+    }
     for r in y..y + h {
         sheet::seal_row(&mut px[r * g.w + x..r * g.w + x + w]);
     }
 }
 
 /// MENUS2 (B652) — `tests menuscraft`'s `quarry_menu=` and `band_exact=` legs: `(menu ok, band exact)`. The live
-/// painter ([`menu_paint`]) over a pure geometry (`geometry(1280, 800)`), item 0 hovered, into two surfaces of
+/// painter ([`menu_paint`]) over a pure geometry (`geometry(px(1280), px(800))`: the logical 1280x800 desktop at the
+/// live scale, MENUPROBESCALE B1100 — the menu sizes at that scale too), item 0 hovered, into two surfaces of
 /// different fills (`surface.content`, then the accent). Menu ok: the body's centre is `surface.overlay`, the pill
 /// sits inside the inset (accent at the body's right inner edge, the face outside the inset), no pure white in the
 /// outer rect. Band exact: the band pixel beside the body is darker than its own fill in BOTH surfaces and differs
 /// between them — the shadow blended over the true pixels beneath, not over an estimate.
 pub fn sheet_probe() -> (bool, bool) {
     use crate::video::crystal::sheet;
-    let Some(g) = geometry(1280, 800) else { return (false, false) };
+    // MENUPROBESCALE (B1100): the probe's panel at the LIVE scale — a physical 1280x800 at s2=4 is a 640-logical panel
+    // (g.h 480) under a menu sized at scale 2 (504 tall), and both legs read BAD from the fit refusal (flight 39).
+    let Some(g) = geometry(crate::ui::px(1280), crate::ui::px(800)) else {
+        serial_println!("[menuscraft] quarry_probe declined surf=none menu=-");
+        return (false, false);
+    };
     let (w, h) = (menu_w(&g), menu_h(&g));
     let (bw, bh, pady) = menu_body(&g);
     if w > g.w || h > g.h {
+        serial_println!("[menuscraft] quarry_probe declined surf={}x{} menu={}x{}", g.w, g.h, w, h); // MENUPROBESCALE (B1100)
         return (false, false);
     }
     let fills = [theme::surface_content() & 0x00FF_FFFF, theme::accent() & 0x00FF_FFFF];
@@ -408,6 +437,7 @@ pub fn sheet_probe() -> (bool, bool) {
         band_px[k] = at(bw + 1, bh / 2);
         darker &= luma(band_px[k]) < luma(f);
     }
+    menu_ok &= fit_probe(&g); // QUARRYMENUFIT (B1107): the live fit rule, in a window shorter than the menu
     (menu_ok, darker && band_px[0] != band_px[1])
 }
 
@@ -515,6 +545,7 @@ fn say(s: String) {
 pub fn right_press(x: i32, y: i32) -> bool {
     let Some((sx, sy)) = to_source(x, y) else { return false };
     wm::focus_changed(OWNER);
+    let fit: (usize, bool); // QUARRYMENUFIT (B1107): the open line's rows= / more= (set on the road that opens the menu)
     {
         let mut guard = MODEL.lock();
         let Some(m) = guard.as_mut() else { return true };
@@ -539,12 +570,19 @@ pub fn right_press(x: i32, y: i32) -> bool {
             }
         }
         let (w, h) = (menu_w(g), menu_h(g));
+        fit = menu_fit(g); // QUARRYMENUFIT (B1107)
+        if fit.0 == 0 || w > g.w || h > g.h {
+            serial_println!("[quarry] menu refused surf={}x{} menu={}x{}", g.w, g.h, w, h); // QUARRYMENUFIT (B1107): never a silent blank menu
+            drop(guard);
+            repaint();
+            return true;
+        }
         let mx = sx.min(g.w.saturating_sub(w));
         let my = sy.min(g.h.saturating_sub(h));
         *MENU.lock() = Some(Menu { x: mx, y: my });
         MENU_UP.store(true, Ordering::Release);
     }
-    serial_println!("[quarry] menu open at=({},{})", sx, sy);
+    serial_println!("[quarry] menu open at=({},{}) rows={}/{} more={}", sx, sy, fit.0, ITEMS.len(), fit.1 as u8); // QUARRYMENUFIT (B1107): rows= more=
     repaint();
     true
 }
@@ -594,12 +632,12 @@ pub fn menu_press(x: i32, y: i32) -> bool {
     let origin = (mn.x, mn.y);
     if let Some((sx, sy)) = hit {
         let g = match MODEL.lock().as_ref() {
-            Some(m) => { let (bw, _, pady) = menu_body(&m.geom); (bw, m.geom.row_h(), pady) } // MENUS2 (B652): the BODY less its padding — a press on the band dismisses (MENUSCRAFT §2)
+            Some(m) => { let (bw, _, pady) = menu_body(&m.geom); (bw, m.geom.row_h(), pady, menu_fit(&m.geom).0) } // MENUS2 (B652): the BODY less its padding — a press on the band dismisses (MENUSCRAFT §2)
             None => return true,
         };
         if sx >= mn.x && sx < mn.x + g.0 && sy >= mn.y + g.2 {
             let i = (sy - mn.y - g.2) / g.1;
-            if i < ITEMS.len() {
+            if i < g.3 { // QUARRYMENUFIT (B1107): a press on the more-row dismisses
                 picked = Some(ITEMS[i]);
             }
         }
@@ -1344,4 +1382,41 @@ pub(super) fn menu_probe(f: impl FnOnce() -> bool) -> bool {
     let r = f();
     MENU_UP.store(was, Ordering::Release);
     r
+}
+
+// ── QUARRYMENUFIT (rmbp-ledger B1107): the more-row and the probe's fit leg ─────────────────────────────────────────
+
+/// QUARRYMENUFIT (B1107) — the menu's closing `<n> more…` row at source row `top` (one item tall, body width `bw`):
+/// a `line.subtle` hairline on its first row (`sheet::separator`, inset from both sides) and the count in
+/// `text.secondary`. No pill: it is not an item.
+fn more_row(px: &mut [u32], g: &Geom, x: usize, top: usize, bw: usize, hidden: usize) {
+    use crate::video::crystal::sheet;
+    if top >= g.h || x + bw > g.w {
+        return;
+    }
+    sheet::separator(&mut px[top * g.w + x..top * g.w + x + bw], bw, 0, 0);
+    let label = alloc::format!("{} more\u{2026}", hidden);
+    text(px, g, x + sheet::INSET() + PAD(), top + g.ts, label.as_bytes(), x + bw - sheet::INSET(), sheet::text_secondary());
+}
+
+/// QUARRYMENUFIT (B1107) — `sheet_probe`'s fit leg: `g` shortened to three rows less than the whole menu, the live
+/// painter at (0, 0) with item 0 hovered. Ok: fewer rows than items, the more-row present, the menu inside the
+/// window, the body's centre `surface.overlay` and no pure white in the outer rect. One `[menuscraft] quarry_fit` line.
+fn fit_probe(g: &Geom) -> bool {
+    use crate::video::crystal::sheet;
+    let s = Geom { h: menu_h_all(g).saturating_sub(3 * g.row_h()), ..*g };
+    let (rows, more) = menu_fit(&s);
+    let (w, h) = (menu_w(&s), menu_h(&s));
+    let (bw, bh, _) = menu_body(&s);
+    let mut ok = rows > 0 && rows < ITEMS.len() && more && w <= s.w && h <= s.h;
+    if ok {
+        let mut px = alloc::vec![theme::surface_content() & 0x00FF_FFFF; s.w * s.h];
+        menu_paint(&mut px, &s, 0, 0, Some(0));
+        ok &= px[(bh / 2) * s.w + bw / 2] & 0x00FF_FFFF == sheet::surface_overlay();
+        for r in 0..h {
+            ok &= !px[r * s.w..r * s.w + w].iter().any(|&c| c & 0x00FF_FFFF == theme::pure_white());
+        }
+    }
+    serial_println!("[menuscraft] quarry_fit surf={}x{} menu={}x{} rows={}/{} more={} -> {}", s.w, s.h, w, h, rows, ITEMS.len(), more as u8, if ok { "ok" } else { "BAD" });
+    ok
 }

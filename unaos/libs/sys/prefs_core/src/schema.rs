@@ -200,6 +200,11 @@ pub static SCHEMA: &[Key] = &[
         doc: "Minimise non-essential motion: the glass's slides (the Settings pill, toggle knobs, segmented thumbs) become one-frame cuts (DESIGN-LANGUAGE §2.6, A11YPANE B655), and the `prefers-reduced-motion: reduce` media feature pages read (AETHERA11Y, SR119).",
     },
     Key {
+        ns: "system", key: "accessibility.shimmer", kind: Kind::Bool, default: Default::Bool(true),
+        writers: &[Writer::Settings], reader: "kernel desktop STARFIELD shimmer (`video/desktop.rs` `shimmer_live` and `shimmer_idle` through `settings::shimmer_on`, beside `settings::reduce_motion`), Settings > Accessibility",
+        doc: "The desktop starfield's shimmer, its glints re-tinted about thirty times a second: off holds the stars still at both seats, the composite pass's and the idle tick's; Reduce motion holds them too, whatever this says (SHIMMERPREF, B1108).",
+    },
+    Key {
         ns: "system", key: "accessibility.show_performance", kind: Kind::Bool, default: Default::Bool(false),
         writers: &[Writer::Settings], reader: "kernel compositor (`video/perfhud.rs`: the overlay pass in `wm::composite_pass_half`), Settings > Accessibility (`settings::a11y_load`); Win+F12 toggles it and the Settings service pass writes it back",
         doc: "The performance overlay in the top-right of the desktop: frame time p50/p99, missed vblanks per minute, input-to-photon p99, heap used/limit, windows, processes, the render and service cores' load and the last OVER boot step, refreshed twice a second (PERFHUD, B710).",
@@ -274,7 +279,7 @@ pub static SCHEMA: &[Key] = &[
         ns: "system", key: "display.font_size", kind: Kind::Int { min: 9, max: 32 }, default: Default::Int(13),
         writers: &[Writer::Program], reader: "kernel `video::text` (KERNELFONT)",
         doc: "UI text size in CSS px; device px = size x the panel's ppi (EDID) / 96, capped by the 16 px text cell; captions keep the bar-derived size.",
-    },
+    }, Key { ns: "system", key: "display.icc", kind: Kind::Str { max_len: 255, printable: true }, default: Default::Str(""), writers: OP, reader: "kernel `video::colour::latch` (DISPLAYICCFILE)", doc: "The absolute path of an installed display profile (ICC matrix/TRC) that wins over the EDID at the display transform's latch; empty = the EDID's own (DISPLAYICCFILE B972). No Settings row until DISPLAY-ICC-FACE: the operator writes it (`pref set system.display.icc <path>`)." }, // GATEREDS (rmbp-ledger B1096): the DISPLAYICCFILE key (B972) declared, OUT of prefs::key::ALL until DISPLAY-ICC-FACE gives it a Settings row; operator-written only. LINE-NEUTRAL append, code first
     Key {
         ns: "system", key: "display.idle_min", kind: Kind::Int { min: 0, max: 1440 },
         default: Default::Int(crate::display::IDLE_MIN_DEFAULT),

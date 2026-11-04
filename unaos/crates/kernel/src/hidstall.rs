@@ -201,7 +201,7 @@ fn selftest() {
         if verdict(h, s, k) { "PASS" } else { "FAIL" }, HID_GAP_STALL_MS, KEY_QUEUE_BOUND_MS, DOCK_RELEASE_TIMEOUT_MS,
         holders_seen(), session_worst().1, HolderName(session_worst().0), RELEASES_WAITED.load(Relaxed), LANE_MAX_MS.load(Relaxed), CpuWord(pump_cpu()),
         HID_STALL_HELD_S.load(Relaxed), STALL_GAP_MAX_MS.load(Relaxed), DOCK_HELD.load(Relaxed), TIMEOUT_RELEASE_MS.load(Relaxed), DOCK_UNDECODED.load(Relaxed), FrPlace
-    ); mask_sites_say(); maskscope_kat(); // HIDSTALLMASKSCOPE (B1019): the masked-max holder KAT, `:: MASKSCOPE:` (LINE-NEUTRAL fold, code first; body at the tail); MASKCENSUS (B1028): the boot site table's ONE line first
+    ); mask_sites_say(); maskscope_kat(); gap_split_kat(); hid_place_kat(); // F39HIDPLACE (B1103): `:: HIDPLACE:` the placement rule + tap KAT (body at the tail). F39INPUTSTALL (B1097): `:: HIDGAPSPLIT:` the pass/wait split KAT (body at the tail). HIDSTALLMASKSCOPE (B1019): the masked-max holder KAT, `:: MASKSCOPE:` (LINE-NEUTRAL fold, code first; body at the tail); MASKCENSUS (B1028): the boot site table's ONE line first
 }
 
 /// REGISTRYCHUNK (rmbp-ledger B508): the longest masked UnaFS span on ANY core since the last take — a step reads
@@ -433,10 +433,10 @@ pub fn census_minute() {
         }
     }
     serial_println!(
-        "[hid] stall census holders={} worst_ms={} worst={} unnamed={} overflow={} pump_cpu={} over_ms={} -> {}",
-        k, worst, HolderName(wix), k - said, HOLD_OVERFLOW.load(Relaxed), CpuWord(pump_cpu()), HOLD_OVER_MS,
+        "[hid] stall census holders={} worst_ms={} worst={} unnamed={} overflow={} pump_cpu={} placed={} over_ms={} -> {}",
+        k, worst, HolderName(wix), k - said, HOLD_OVERFLOW.load(Relaxed), CpuWord(pump_cpu()), CpuWord(usb_pump_placed()), HOLD_OVER_MS,
         if k == 0 { "CLEAR" } else { "HELD" }
-    );
+    ); gap_split_minute(); #[cfg(all(target_arch = "x86_64", feature = "wc"))] { crate::fs::unafs::lockcensus::minute(); } // F39INPUTSTALL (B1097): the minute's HID gaps split into pass and wait, one line after the census (LINE-NEUTRAL fold, code first; body at the tail)
 }
 
 // ── HIDSTALL2 (B509): the release lane ─────────────────────────────────────────────────────────────────────────────────
@@ -1427,4 +1427,165 @@ fn masksites_overflow_kat() -> bool {
     let b2 = KAT_SITES.boot();
     let two = b2.dropped() == (2, false, p17) && b2.other().0 == 4 && KAT_SITES.site.iter().all(|k| k.load(Acquire) != p18);
     full && p17 != p18 && one && two
+}
+
+// ── F39INPUTSTALL (rmbp-ledger B1097) — HIDGAPSPLIT: a HID gap is the previous pass's length plus the wait. FILE-TAIL append. ─
+// Flight 39 boot 1: `[lag] stall … stage=hid hid_gap_ms=4840 … holder=-` (and 3786, 3368, 8696, 5905 ms) while every
+// minute's census read `holders=0 … pump_cpu=4 -> CLEAR`. The gap is stamped at `service_ehci_hid`'s ENTRY
+// (`boot::hid_pass`), so it is either the previous pass's own length (POINTERFEEL read `pass_max_ms=278`) or the `hid-pump`
+// not being dispatched on its core (19 usb-pump restarts and `render-rehomed` shared c4 that boot) — and no line said which.
+// `ehci::hid_task` now brackets the pass with [`pass_begin`] / [`pass_done`]; each gap is split by the pure [`gap_split`]
+// into `pass` (the previous pass, entry to exit) and `wait` (its exit to this entry). Once a minute, after the census:
+// `[hid] gap split worst_ms= pass_ms= wait_ms= pass_max_ms= wait_max_ms= over= bound_ms=16 pump_cpu=c<n> ->
+// CLEAR|PASS-LONG|WAIT-LONG`; `tests hidstall` adds `:: HIDGAPSPLIT: kat_ok=1 boot_worst_ms= pass_ms= wait_ms= -> PASS ::`.
+// ONE writer (the `hid-pump`), relaxed atomics; the minute's fields are taken by swap. The gap source of `[lag] stall` and
+// INPUTSTALL (`boot::hid_pass` -> `lag::hid_gap`) is unchanged. Owed: HID-PRIO / HID-PLACE / HID-PASS-PHASE / HID-WAIT-WHO.
+
+/// F39INPUTSTALL (B1097): this pass's entry (`arch::ms()`), and the previous pass's exit.
+static PASS_T0_MS: AtomicU64 = AtomicU64::new(0);
+static PASS_END_MS: AtomicU64 = AtomicU64::new(0);
+/// The minute's worst gap with its own split, packed by [`split_pack`]; the boot-long one the same shape.
+static SPLIT_WORST: AtomicU64 = AtomicU64::new(0);
+static SPLIT_BOOT: AtomicU64 = AtomicU64::new(0);
+static SPLIT_PASS_MAX: AtomicU64 = AtomicU64::new(0);
+static SPLIT_WAIT_MAX: AtomicU64 = AtomicU64::new(0);
+/// Gaps at or over [`HID_GAP_STALL_MS`] this minute.
+static SPLIT_OVER: AtomicU32 = AtomicU32::new(0);
+/// One packed field's cap (ms): 21 bits, ~35 minutes.
+const SPLIT_FIELD: u64 = (1 << 21) - 1;
+
+/// `gap << 42 | pass << 21 | wait`, each capped at [`SPLIT_FIELD`] — gap is the high field, so `fetch_max` keeps the
+/// worst gap's own split. Pure.
+pub fn split_pack(gap: u64, pass: u64, wait: u64) -> u64 {
+    gap.min(SPLIT_FIELD) << 42 | pass.min(SPLIT_FIELD) << 21 | wait.min(SPLIT_FIELD)
+}
+
+/// The inverse of [`split_pack`]: `(gap, pass, wait)`. Pure.
+pub fn split_unpack(w: u64) -> (u64, u64, u64) {
+    (w >> 42 & SPLIT_FIELD, w >> 21 & SPLIT_FIELD, w & SPLIT_FIELD)
+}
+
+/// The split of the gap ending `now`: `(pass, wait)` = (the previous pass's entry `t0_prev` to its exit `end_prev`, that
+/// exit to `now`). `None` while either stamp is unset (0) or the stamps are out of order (a pass that never finished). Pure.
+pub fn gap_split(t0_prev: u64, end_prev: u64, now: u64) -> Option<(u64, u64)> {
+    if t0_prev == 0 || end_prev == 0 || end_prev < t0_prev || now < end_prev {
+        return None;
+    }
+    Some((end_prev - t0_prev, now - end_prev))
+}
+
+/// `ehci::hid_task`, before `service_ehci_hid`: stamp this pass's entry and split the gap that just ended.
+pub fn pass_begin() {
+    let now = crate::arch::ms();
+    let t0 = PASS_T0_MS.swap(now, Relaxed);
+    let Some((pass, wait)) = gap_split(t0, PASS_END_MS.load(Relaxed), now) else { return };
+    let gap = pass.saturating_add(wait);
+    let w = split_pack(gap, pass, wait);
+    SPLIT_WORST.fetch_max(w, Relaxed);
+    SPLIT_BOOT.fetch_max(w, Relaxed);
+    SPLIT_PASS_MAX.fetch_max(pass, Relaxed);
+    SPLIT_WAIT_MAX.fetch_max(wait, Relaxed);
+    if gap >= HID_GAP_STALL_MS {
+        SPLIT_OVER.fetch_add(1, Relaxed);
+    }
+}
+
+/// `ehci::hid_task`, after `service_ehci_hid`: stamp the pass's exit.
+pub fn pass_done() {
+    PASS_END_MS.store(crate::arch::ms(), Relaxed);
+}
+
+/// The worst gap's branch: `CLEAR` under one frame, else the larger half names it.
+struct SplitWord(u64, u64, u64);
+impl core::fmt::Display for SplitWord {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let (g, p, w) = (self.0, self.1, self.2);
+        f.write_str(if g < HID_GAP_STALL_MS { "CLEAR" } else if p >= w { "PASS-LONG" } else { "WAIT-LONG" })
+    }
+}
+
+/// `census_minute`'s tail: the minute's split, taken.
+fn gap_split_minute() {
+    let (g, p, w) = split_unpack(SPLIT_WORST.swap(0, Relaxed));
+    let (pm, wm, over) = (SPLIT_PASS_MAX.swap(0, Relaxed), SPLIT_WAIT_MAX.swap(0, Relaxed), SPLIT_OVER.swap(0, Relaxed));
+    serial_println!(
+        "[hid] gap split worst_ms={} pass_ms={} wait_ms={} pass_max_ms={} wait_max_ms={} over={} bound_ms={} pump_cpu=c{} -> {} (F39INPUTSTALL B1097: a HID gap = the previous pass's own length + the hid pump's wait to run again)",
+        g, p, w, pm, wm, over, HID_GAP_STALL_MS, CpuWord(pump_cpu()), SplitWord(g, p, w)
+    );
+}
+
+/// `tests hidstall`'s HIDGAPSPLIT KAT: five synthetic cases of the pure split and its packing; the live numbers are a reading.
+fn gap_split_kat() {
+    let unset = gap_split(0, 5, 9).is_none() && gap_split(5, 0, 9).is_none();
+    let unfinished = gap_split(10, 5, 20).is_none();
+    let backwards = gap_split(10, 20, 15).is_none();
+    let flight39 = gap_split(1_000, 1_278, 5_840) == Some((278, 4_562));
+    let packed = split_unpack(split_pack(4_840, 278, 4_562)) == (4_840, 278, 4_562)
+        && split_unpack(split_pack(u64::MAX, 1, 2)) == (SPLIT_FIELD, 1, 2);
+    let ok = unset && unfinished && backwards && flight39 && packed;
+    let (g, p, w) = split_unpack(SPLIT_BOOT.load(Relaxed));
+    serial_println!(
+        ":: HIDGAPSPLIT: kat_ok={} boot_worst_ms={} pass_ms={} wait_ms={} -> {} ::",
+        ok as u8, g, p, w, if ok { "PASS" } else { "FAIL" }
+    );
+}
+
+// ── F39HIDPLACE (rmbp-ledger B1103) — HID-PLACE + POINTERFEEL-TAP. FILE-TAIL append. ─────────────────────────────────────
+// Flight 39 boot 1: 19 usb-pump restarts and `render-rehomed` (tid 384) landed on c4, the hid pump's core, because no
+// placement road asked where the hid pump lives. Two roads land a task beside it: `sessionwedge::pick_live` (the
+// usb-pump's wedge restart, the steal re-home's drain + service role, the GATESTEAL drive fixture) and main.rs
+// `render_rehome_service` (its own `smp::xhci_worker_cpu(n)` walk — NOT a pick_live caller). ONE rule both call:
+// [`apart`] asks the road's own ladder first with the hid pump's core as the core to skip, and only when that finds
+// nothing (the hid pump's core is the sole candidate) asks it again with no skip — co-location is the fallback, never a
+// decline the road did not already make. The ladder stays the road's (BP-cores-1: asked by name, never re-derived).
+// The census's `placed=<n|->` is where the watch last placed the usb-pump (`sessionwedge::rehome_live`, its existing
+// `REHOME_LIVE`; `-` on aarch64, without `wc`, or before any re-home). `tests hidstall` adds
+// `:: HIDPLACE: kat_ok=1 apart_ok=1 tap_ok=1 placed=<n|-> pump_cpu=c<n> -> PASS ::` (every arch; pure cases only).
+
+/// F39HIDPLACE (B1103): the placement rule over `pick(skip)` with the hid pump on `p` — `pick(p)`, then `pick(usize::MAX)`
+/// (no skip) when that is `None`; `p == usize::MAX` (no hid pump yet) asks once. Pure.
+pub fn apart_with(p: usize, mut pick: impl FnMut(usize) -> Option<usize>) -> Option<usize> {
+    if p == usize::MAX {
+        return pick(usize::MAX);
+    }
+    pick(p).or_else(|| pick(usize::MAX))
+}
+
+/// F39HIDPLACE (B1103): [`apart_with`] against the hid pump's live core ([`pump_cpu`]) — `sessionwedge::pick_live` and
+/// main.rs `render_rehome_service` place through this, so neither lands on the hid pump's core while another core answers.
+pub fn apart(pick: impl FnMut(usize) -> Option<usize>) -> Option<usize> {
+    apart_with(pump_cpu(), pick)
+}
+
+/// F39HIDPLACE (B1103): the census's `placed=` — the core the watch last placed the usb-pump on (`usize::MAX` = none).
+fn usb_pump_placed() -> usize {
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+    {
+        crate::sessionwedge::rehome_live()
+    }
+    #[cfg(not(all(target_arch = "x86_64", feature = "wc")))]
+    {
+        usize::MAX
+    }
+}
+
+/// F39HIDPLACE (B1103): `tests hidstall`'s HIDPLACE KAT — the placement rule over a synthetic first-fit pool and
+/// POINTERFEEL-TAP's pure rule; the live `placed=` / `pump_cpu=` are a reading.
+fn hid_place_kat() {
+    let pool = |cores: &'static [usize]| move |skip: usize| cores.iter().copied().find(|&c| c != skip);
+    let apart_ok = apart_with(4, pool(&[4, 5])) == Some(5)
+        && apart_with(4, pool(&[4])) == Some(4)
+        && apart_with(usize::MAX, pool(&[4, 5])) == Some(4)
+        && apart_with(4, pool(&[])).is_none();
+    let tp = crate::pointerfeel::is_tap;
+    let tap_ok = tp(48, true, 0, 6, 0)
+        && !tp(48, false, 0, 6, 0)
+        && !tp(600, true, 0, 6, 0)
+        && !tp(48, true, 1, 6, 0)
+        && !tp(48, true, 0, 0, 6);
+    let ok = apart_ok && tap_ok;
+    serial_println!(
+        ":: HIDPLACE: kat_ok={} apart_ok={} tap_ok={} placed={} pump_cpu=c{} -> {} ::",
+        ok as u8, apart_ok as u8, tap_ok as u8, CpuWord(usb_pump_placed()), CpuWord(pump_cpu()), if ok { "PASS" } else { "FAIL" }
+    );
 }

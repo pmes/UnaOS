@@ -2536,7 +2536,7 @@ static SHIM_TICK_PX: AtomicU64 = AtomicU64::new(0);
 /// cursor bracket).
 #[cfg(feature = "facet")]
 fn shimmer_live(occ: &[(usize, usize, usize, usize)], pw: usize, ph: usize) {
-    if super::DEFER_N.load(Ordering::Relaxed) != 0 || !crate::video::wallpaper::owns_backdrop() { // STARTSCENE (B662): the scene owns the backdrop from the splash on (x86 never sets the REALDESK latch)
+    if super::DEFER_N.load(Ordering::Relaxed) != 0 || !crate::video::wallpaper::owns_backdrop() || crate::video::settings::reduce_motion() || !crate::video::settings::shimmer_on() { // SHIMMERPREF (B1108): the Settings row holds the stars still on its own. SHIMMERMOTION (B1099): the live seat honours reduce motion like the idle seat (DESIGN-LANGUAGE §2.6). STARTSCENE (B662): the scene owns the backdrop from the splash on (x86 never sets the REALDESK latch)
         return;
     }
     let now = crate::arch::ms();
@@ -2544,7 +2544,7 @@ fn shimmer_live(occ: &[(usize, usize, usize, usize)], pw: usize, ph: usize) {
         return;
     }
     SHIM_LAST.store(now, Ordering::Relaxed);
-    let cur = SHIM_CURSOR.load(Ordering::Relaxed);
+    let cur = SHIM_CURSOR.load(Ordering::Relaxed); let mut occb = [(0usize, 0usize, 0usize, 0usize); SHIM_OCC + 2]; // SHIMMERBEAM (B1099): the occluders plus the raster's hazard band(s), filled by `shim_beam_occ` (file tail). LINE-NEUTRAL fold
     let t0 = now_ns().0;
     let next = crate::video::wallpaper::shimmer_with(|s, buf, w, h| {
         if w != pw || h != ph || s.w != w || s.h != h {
@@ -2553,7 +2553,7 @@ fn shimmer_live(occ: &[(usize, usize, usize, usize)], pw: usize, ph: usize) {
         let (c, gl, nb, px) = shimmer_tick(
             s,
             now,
-            occ,
+            shim_beam_occ(occ, &mut occb, s, pw, ph), // SHIMMERBEAM (B1099): a group the drain's beam bracket would wait on is skipped like an occluded one
             cur,
             // SAFETY: `buf` is the installed picture's `w * h` buffer (published with its shimmer, freed only by the
             // install after next — see `wallpaper::Snap`); `(x, y)` lies inside it (a glint is a pixel of that
@@ -2642,7 +2642,7 @@ pub fn shimmer_idle() {
     if now.wrapping_sub(SHIM_LAST.load(Ordering::Relaxed)) < SHIMMER_MS || now.wrapping_sub(SHIM_IDLE_LAST.load(Ordering::Relaxed)) < floor {
         return;
     }
-    if crate::video::settings::reduce_motion() || SHIM_RM_FORCE.load(Ordering::Relaxed) || crate::splash::holding() || !crate::video::wallpaper::owns_backdrop() {
+    let _in = ShimIn::enter(); if crate::video::settings::reduce_motion() || !crate::video::settings::shimmer_on() || SHIM_RM_FORCE.load(Ordering::SeqCst) || crate::splash::holding() || !crate::video::wallpaper::owns_backdrop() {
         return;
     }
     SHIM_IDLE_LAST.store(now, Ordering::Relaxed);
@@ -2681,8 +2681,8 @@ pub fn shimmer_idle() {
 #[cfg(all(target_arch = "x86_64", feature = "facet"))]
 pub fn shimmeridle_selftest() {
     const IDLE_MS: u64 = 200;
-    if crate::video::settings::reduce_motion() {
-        serial_println!(":: SHIMMERIDLE: reduce motion is set (the idle tick is off by design) -> SKIP ::");
+    if crate::video::settings::reduce_motion() || !crate::video::settings::shimmer_on() { // SHIMMERPREF (B1108): the shimmer row off is the same by-design refusal
+        serial_println!(":: SHIMMERIDLE: reduce motion or the shimmer row is off (the idle tick is off by design) -> SKIP ::");
         return;
     }
     // SHIMMERIDLE2 (B830): SETTLE first — the premise is an idle desktop; wait (<= 1 s) for any shimmer tick.
@@ -2703,13 +2703,14 @@ pub fn shimmeridle_selftest() {
     let ticks = SHIM_TICKS.load(Ordering::Relaxed).wrapping_sub(a0);
     let idle_ticks = SHIM_IDLE_TICKS.load(Ordering::Relaxed).wrapping_sub(i0);
     let (max_us, pass_us) = (SHIM_IDLE_MAX_US.load(Ordering::Relaxed), SHIM_IDLE_PASS_US.load(Ordering::Relaxed));
-    SHIM_RM_FORCE.store(true, Ordering::Relaxed);
+    SHIM_RM_FORCE.store(true, Ordering::SeqCst); shim_in_quiesce(); // SHIMMERRACE (B1099): an idle tick already past the force test is waited out before `r0` is read (file tail). LINE-NEUTRAL fold
     let r0 = SHIM_IDLE_TICKS.load(Ordering::Relaxed);
     crate::arch::sched::sleep_ms(IDLE_MS);
     let rm_ticks = SHIM_IDLE_TICKS.load(Ordering::Relaxed).wrapping_sub(r0);
     SHIM_RM_FORCE.store(false, Ordering::Relaxed);
+    let pref_ticks = shim_pref_leg(IDLE_MS); // SHIMMERPREF (B1108): the Settings row off, both seats count zero ticks (file tail)
     let steals = super::comp_steal_gen().wrapping_sub(steal0);
-    let ok = (3..=7).contains(&ticks) && idle_ticks > 0 && max_us <= 800 && rm_ticks == 0 && steals == 0;
+    let ok = (3..=7).contains(&ticks) && idle_ticks > 0 && max_us <= 800 && rm_ticks == 0 && steals == 0 && pref_ticks == 0;
     shim_wire();
     serial_println!(
         ":: SHIMMERIDLE: detail idle_ticks={} pass_max_us={} skips={} backdrop={} why={} carried={} settle_ms={} present={} pass_us={} ::",
@@ -3653,4 +3654,110 @@ pub(crate) fn casts_span() -> crate::arch::sched::PreemptHold {
 #[track_caller]
 fn casts_span() -> crate::arch::IrqMask {
     crate::arch::IrqMask::new()
+}
+
+// ── F39SHIMMER (rmbp-ledger B1099): the shimmer picks boxes the raster is clear of; the reduce-motion witness waits out an
+// in-flight idle tick ─────────────────────────────────────────────────────────────────────────────────────────────────
+//
+// FLIGHT 39 boot 1 had two reds, from two separate causes.
+//
+// VEILCOST `shimmer_idle_us=2835` (bar 200 us): each drained shimmer box goes through `wm::stage_fill`, which opens a
+// `beam::hold` over its rows. On the rMBP the beam source is armed, so a box under the scan-out spins (~1.1 ms per waited
+// hold); ten boxes a tick waited on two or three. The live seat now adds the rows `beam::busy_rows` names (the hold's own
+// zone over the next `SHIM_BEAM_AHEAD_US`) to the occluder slice `shimmer_tick` already skips groups by, so such a group
+// keeps its tint one more tick instead of being painted under the beam. The hold still brackets every box. No raster
+// source (QEMU, the Pi, an unarmed x86) answers `None`, and the slice is exactly the occluders, as before.
+//
+// SHIMMERIDLE `reduce_motion_ticks=1`: `shimmer_idle` tested the force, then ran a drain present (~10 ms on the metal) and
+// counted the tick after it. The fixture set the force and read `r0` at once, so a tick that began before the force was
+// counted inside the reduce-motion window. `ShimIn` counts idle calls past the floor; it is entered BEFORE the force test
+// (SeqCst on both sides), and the fixture waits for it to read 0 after setting the force. A call that entered first is
+// waited out, and a call that enters later sees the force.
+
+/// The look-ahead of the raster test, in us: VEILCOST's bar for the whole drain present (`SHIM_BAR_US`, tests.rs). A drain
+/// within its bar opens every hold clear of the beam.
+#[cfg(feature = "facet")]
+const SHIM_BEAM_AHEAD_US: u64 = 200;
+
+/// SHIMMERBEAM (B1099): `occ` (at most [`SHIM_OCC`] boxes) copied into `buf`, followed by the hazard band(s) from
+/// `beam::busy_rows` as full-width boxes. The span is the tallest group in `s`, so the lead covers every box the tick queues.
+#[cfg(feature = "facet")]
+fn shim_beam_occ<'a>(occ: &[(usize, usize, usize, usize)], buf: &'a mut [(usize, usize, usize, usize); SHIM_OCC + 2], s: &Shimmer, pw: usize, ph: usize) -> &'a [(usize, usize, usize, usize)] {
+    let n = occ.len().min(SHIM_OCC);
+    buf[..n].copy_from_slice(&occ[..n]);
+    let mut k = n;
+    let span = s.groups.iter().map(|g| g.y1.saturating_sub(g.y0) as usize).max().unwrap_or(0);
+    if let Some(bands) = crate::video::beam::busy_rows(ph, span, SHIM_BEAM_AHEAD_US) {
+        for (y0, y1) in bands {
+            if y1 > y0 && k < buf.len() {
+                buf[k] = (0, y0, pw, y1 - y0);
+                k += 1;
+            }
+        }
+    }
+    &buf[..k]
+}
+
+/// SHIMMERRACE (B1099): idle-seat calls past the floor and still in flight (counter: the veilcost fixture calls
+/// `shimmer_idle` from its own task too).
+#[cfg(all(target_arch = "x86_64", feature = "facet"))]
+static SHIM_IDLE_IN: AtomicU32 = AtomicU32::new(0);
+
+/// SHIMMERRACE (B1099): the in-flight mark for one `shimmer_idle` call, entered before its force test and released on
+/// every exit.
+#[cfg(all(target_arch = "x86_64", feature = "facet"))]
+struct ShimIn;
+
+#[cfg(all(target_arch = "x86_64", feature = "facet"))]
+impl ShimIn {
+    fn enter() -> ShimIn {
+        SHIM_IDLE_IN.fetch_add(1, Ordering::SeqCst);
+        ShimIn
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "facet"))]
+impl Drop for ShimIn {
+    fn drop(&mut self) {
+        SHIM_IDLE_IN.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// SHIMMERRACE (B1099): after the fixture sets the force, wait (at most 100 ms) until no idle call that may have passed
+/// the force test before it is still running.
+#[cfg(all(target_arch = "x86_64", feature = "facet"))]
+fn shim_in_quiesce() {
+    let t0 = crate::arch::ms();
+    while SHIM_IDLE_IN.load(Ordering::SeqCst) != 0 && crate::arch::ms().saturating_sub(t0) < 100 {
+        crate::arch::sched::sleep_ms(1);
+    }
+}
+
+// ── SHIMMERPREF (rmbp-ledger B1108) — `tests shimmeridle`'s pref leg ─────────────────────────────────────────────────
+// Settings > Accessibility row 9 (`system.accessibility.shimmer`, `settings::shimmer_on`) is read beside
+// `settings::reduce_motion()` at both seats. The leg turns the row off through the press's own path with no store write
+// (`settings::shimmer_set_unstored`), waits out an idle call already past its test (`shim_in_quiesce`) and a live tick in
+// flight (`SHIM_BUSY`), then counts every seat's ticks over one window and restores the row.
+// `:: SHIMMERIDLE: pref leg row=off ticks=<n> idle_ticks=<n> restored=<0|1> -> PASS|FAIL ::`
+
+/// The pref leg over `ms`: the shimmer's ticks at ALL seats with the row off (0 = held still).
+#[cfg(all(target_arch = "x86_64", feature = "facet"))]
+fn shim_pref_leg(ms: u64) -> u32 {
+    let was = crate::video::settings::shimmer_set_unstored(false);
+    shim_in_quiesce();
+    let t0 = crate::arch::ms();
+    while SHIM_BUSY.load(Ordering::Acquire) && crate::arch::ms().saturating_sub(t0) < 100 {
+        crate::arch::sched::sleep_ms(1);
+    }
+    let (a0, i0) = (SHIM_TICKS.load(Ordering::Relaxed), SHIM_IDLE_TICKS.load(Ordering::Relaxed));
+    crate::arch::sched::sleep_ms(ms);
+    let ticks = SHIM_TICKS.load(Ordering::Relaxed).wrapping_sub(a0);
+    let idle_ticks = SHIM_IDLE_TICKS.load(Ordering::Relaxed).wrapping_sub(i0);
+    let _ = crate::video::settings::shimmer_set_unstored(was);
+    let restored = crate::video::settings::shimmer_on() == was;
+    serial_println!(
+        ":: SHIMMERIDLE: pref leg row=off ticks={} idle_ticks={} restored={} -> {} ::",
+        ticks, idle_ticks, restored as u8, if ticks == 0 && restored { "PASS" } else { "FAIL" }
+    );
+    ticks
 }
