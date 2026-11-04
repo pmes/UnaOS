@@ -1194,10 +1194,11 @@ fn a_glyph_not_moved_has_no_leader() {
 
 // ---- VUGINTENTSETFACEPUSHEDGE (SR606): a right push past the sheet's edge goes down to the column's foot; the corner names a glyph wider than the sheet ----
 
-/// SR601's rectangle face with `n` listed singles and one single anchored at the left side's midpoint whose id is `id`:
-/// the anchored glyph (last) and the listed column's bounding rect (x0, y0, x1, y1).
-fn anchored_over_column(id: &str, n: usize) -> (Viewer, vug_view::photo::ProposalGlyph, (f32, f32, f32, f32)) {
+/// SR601's rectangle face on a sheet `grow` px wider than W, with `n` listed singles and one single anchored at the left
+/// side's midpoint whose id is `id`: the anchored glyph (last) and the listed column's bounding rect (x0, y0, x1, y1).
+fn anchored_over_column(id: &str, n: usize, grow: u32) -> (Viewer, vug_view::photo::ProposalGlyph, (f32, f32, f32, f32)) {
     let mut vw = rectangle();
+    vw.view.resize(W + grow, H);
     let (e, _) = left_side(&vw);
     let mut ps = listed(n);
     ps.push(datum(&format!("horizontal {id} sketch=s line=e{e}"), "the left side"));
@@ -1216,7 +1217,7 @@ fn column_and_base() -> (usize, (f32, f32), f32) {
     let (_, (sx, sy)) = left_side(&vw);
     let natural = (sx + 6.0, sy - 14.0);
     let n = ((natural.1 - 30.0) / 12.0).ceil().max(0.0) as usize + 1;
-    let (_, g, _) = anchored_over_column("v12", n);
+    let (_, g, _) = anchored_over_column("v12", n, 0);
     (n, natural, photo::glyph_rect(&g).2)
 }
 
@@ -1226,18 +1227,22 @@ fn column_and_base() -> (usize, (f32, f32), f32) {
 #[test]
 fn a_wide_anchored_glyph_over_the_column_is_pushed_down_to_its_foot() {
     use vug_view::sketch::INK;
-    let (n, natural, w0) = column_and_base();
-    let guess = ((W as f32 - natural.0 - w0) / 8.0).floor().max(0.0) as usize;
-    let (_, g1, _) = anchored_over_column(&format!("v12{}", "a".repeat(guess)), n);
-    let excess = photo::glyph_rect(&g1).2 - (W as f32 - natural.0);
-    let extra = (guess as i64 - (excess / 8.0).ceil() as i64).max(0) as usize;
-    let id = format!("v12{}", "a".repeat(extra));
-    let (vw, g, col) = anchored_over_column(&id, n);
+    let (n, natural, w) = column_and_base();
+    let (_, _, col) = anchored_over_column("v12", n, 0);
+    // The v12 glyph is 408 px at W (its text carries the refusal): it fits at its anchor's x and not after a right
+    // push only on a sheet W + g with 2 (natural.0 + w - W) <= g < column edge + 6 + w - W (x shifts by g / 2).
+    let (lo, hi) = ((2.0 * (natural.0 + w - W as f32)).max(0.0), col.2 + 6.0 + w - W as f32);
+    assert!(lo + 2.0 < hi, "a sheet width holds case (a): growth {lo}..{hi} (w {w}, natural {natural:?}, column {col:?})");
+    let grow = (0.5 * (lo + hi)).round() as u32;
+    let sheet = (W + grow) as f32;
+    let (vw, g, col) = anchored_over_column("v12", n, grow);
+    let (_, (sx, sy)) = left_side(&vw);
+    let natural = (sx + 6.0, sy - 14.0);
     let r = photo::glyph_rect(&g);
-    assert!(natural.0 + r.2 <= W as f32, "it fits at its anchor's x: {natural:?} w {}", r.2);
-    assert!(col.2 + 6.0 + r.2 > W as f32, "a right push would pass the sheet's edge: column {col:?} w {}", r.2);
+    assert!(natural.0 + r.2 <= sheet, "it fits at its anchor's x: {natural:?} w {} sheet {sheet}", r.2);
+    assert!(col.2 + 6.0 + r.2 > sheet, "a right push would pass the sheet's edge: column {col:?} w {} sheet {sheet}", r.2);
     assert!((g.at.0 - natural.0).abs() < 1e-3 && (g.at.1 - col.3).abs() < 1e-3, "down to the column's foot, x unmoved: {:?} column {col:?}", g.at);
-    assert!(r.0 >= 0.0 && r.0 + r.2 <= W as f32, "the rect inside the sheet: {r:?}");
+    assert!(r.0 >= 0.0 && r.0 + r.2 <= sheet, "the rect inside the sheet: {r:?} sheet {sheet}");
     let (a, b) = photo::leader(&vw.view, &g).expect("a pushed glyph has a leader");
     assert_eq!(a, (g.at.0 - 6.0, g.at.1 + 14.0), "the leader starts at its cross");
     let fr = raster::render(&vw.model, &vw.view);
@@ -1256,7 +1261,7 @@ fn a_glyph_wider_than_the_sheet_keeps_its_anchor_x_and_the_corner_says_so() {
     let (n, natural, w0) = column_and_base();
     let extra = ((W as f32 - w0) / 8.0).ceil() as usize + 2;
     let id = format!("v12{}", "a".repeat(extra));
-    let (vw, g, col) = anchored_over_column(&id, n);
+    let (vw, g, col) = anchored_over_column(&id, n, 0);
     assert!(photo::glyph_rect(&g).2 > W as f32, "wider than the sheet: {:?}", photo::glyph_rect(&g));
     assert!((g.at.0 - natural.0).abs() < 1e-3, "its anchor's x: {:?} natural {natural:?}", g.at);
     assert!((g.at.1 - col.3).abs() < 1e-3, "down to the column's foot: {:?} column {col:?}", g.at);
