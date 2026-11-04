@@ -518,7 +518,7 @@ pub fn selftest(fx: &Fixture) {
     } else {
         serial_println!(":: BANDY3: registered={} relayed={} replied={} orphan={} w={:#05x}/{:#05x} verbs={}/{} -> FAIL ::", rg, rl, rp, or, w, ALL, vg, vl);
     }
-    tagid_selftest(fx); armearly_selftest(fx); unreadset_selftest(fx); /* RELAY-RESET-SET (B1169): the unread-mark legs (file tail). BUSREG-ARM-EARLY (B1164): the early-arm legs, after the BUSREG-TAGID line (file tail) */ armforget_selftest(fx); /* ARMFORGET-CHAIN (B1171): the teardown-forget legs (file tail) */ // BUSREG-TAG-IDENTITY (B1157): the identity legs, after the BANDY3 line
+    tagid_selftest(fx); armearly_selftest(fx); unreadset_selftest(fx); /* RELAY-RESET-SET (B1169): the unread-mark legs (file tail). BUSREG-ARM-EARLY (B1164): the early-arm legs, after the BUSREG-TAGID line (file tail) */ armforget_selftest(fx); /* ARMFORGET-CHAIN (B1171): the teardown-forget legs (file tail) */ crate::prefs_client::queued_selftest(); /* RELAY-QUEUED-SET (B1175): the queued-set legs (prefs_client.rs tail) */ // BUSREG-TAG-IDENTITY (B1157): the identity legs, after the BANDY3 line
 }
 
 /// HOLOCRON2 (rmbp-ledger B355): does `verb` have a registration right now? (Generation not checked: a row

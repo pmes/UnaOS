@@ -148,7 +148,7 @@ fn take_reply(corr: u32) -> Option<Box<[u8]>> {
         while let Some(f) = q.pop_front() {
             if matches!(crate::bus::frame_parse(&f), Ok(h) if h.kind == BUS_KIND_REPLY && h.corr == corr) {
                 return Some(f);
-            }
+            } #[cfg(feature = "busreg")] queued_mark(&f); // RELAY-QUEUED-SET (B1175): a stale answer to a QUEUED set notes its status on the ring entry before it drops (file tail). LINE-NEUTRAL fold.
         }
         None
     })
@@ -253,7 +253,7 @@ fn relay(hdr: &crate::bus::BusHdr, body: &[u8]) -> Option<Answer> {
                 // The frame is already in PREFS.ELF's mailbox and WILL land: a kernel write now could be
                 // overtaken by this queued one (set A times out, set B lands, A lands = A wins). One queue,
                 // one order — the set is accepted as in flight; its PrefChanged tells the window when it lands.
-                serial_println!("[prefsbus] relay verb={} corr={} timeout={}ms — set queued at prefs.elf", tag, hdr.corr, RELAY_WAIT_MS);
+                if !queued_keep(hdr, body) { return Some(queued_full(tag, hdr.corr)); } serial_println!("[prefsbus] relay verb={} corr={} timeout={}ms — set queued at prefs.elf", tag, hdr.corr, RELAY_WAIT_MS); // RELAY-QUEUED-SET (B1175): the queued set's body is kept per client corr (full = -EAGAIN, never a silent 0) so a holder that dies with it unread is answered by the kernel fulfiller (file tail). LINE-NEUTRAL fold, code first.
                 return Some(Answer { status: 0, body: Vec::new() });
             }
             serial_println!("[prefsbus] relay verb={} corr={} timeout={}ms — kernel fulfiller answers", tag, hdr.corr, RELAY_WAIT_MS);
@@ -280,7 +280,7 @@ fn call(verb: u8, body: &[u8]) -> Answer {
     if body.len() > crate::bus::BUS_BODY_MAX {
         return Answer { status: EINVAL, body: Vec::new() };
     }
-    let mut corr = NEXT_CORR.fetch_add(1, Ordering::Relaxed);
+    let mut corr = NEXT_CORR.fetch_add(1, Ordering::Relaxed); #[cfg(feature = "busreg")] queued_drain(); // RELAY-QUEUED-SET (B1175): every call first settles the queued sets whose holder answered late or died with them unread (file tail). LINE-NEUTRAL fold.
     if corr == 0 {
         corr = NEXT_CORR.fetch_add(1, Ordering::Relaxed); // corr 0 is PrefChanged's
     }
@@ -1049,4 +1049,217 @@ pub fn set_unread_take(corr: u32) -> bool {
             None => false,
         }
     })
+}
+
+// =================================================================================================
+// RELAY-QUEUED-SET (rmbp-ledger B1175) — TAIL-APPENDED. A relayed SET that hits `RELAY_WAIT_MS` is answered
+// as in flight ("set queued at prefs.elf"): its frame sits in the holder's mailbox and will land in order. Before
+// this block nothing kept it, so when that holder then died with the frame UNREAD, `bus_route::on_exit` marked
+// SET_UNREAD (B1169) and delivered the -ECONNRESET into an inbox nobody was waiting on: `reset_by_kernel` never
+// ran, the next `take_reply` dropped the frame as stale, and the write was lost silently. Now the timeout arm
+// keeps the SET's header and body per client corr in ONE bounded ring ([`QUEUED`], `Q_CAP` entries, each body
+// at most `bus::BUS_BODY_MAX` since `call` refuses a longer one); full = the SET is answered -EAGAIN, never a
+// silent 0. `queued_drain` (the head of every `call`) settles each entry in FIFO order: B1169's unread mark
+// (`set_unread_take`) = the kernel fulfiller (`kernel`) applies the kept body — its own `changed` posts the
+// PrefChanged — and says `[prefsbus] queued set corr=<c> holder gone unread — kernel fulfiller applied`; a late
+// answer from the holder (status 0 = it applied the SET; -ECONNRESET with no mark = it READ it and died,
+// committed-or-not unknowable as in B1169) = released, no second write. The answered status is read BEFORE the
+// mark is asked, and on_exit marks BEFORE it delivers, so a reset already seen can never shadow an unread mark.
+// `QUEUED` is a LEAF lock, always taken inside `locked`, nested only as REPLIES -> QUEUED (`take_reply`'s stale
+// arm, the drain's sweep), never held across `kernel` or `set_unread_take`.
+// Witness: `tests bandy3` -> `:: RELAY-QUEUED-SET: unread=applied read=released full=eagain -> PASS ::`.
+// =================================================================================================
+/// One queued SET: the request header (verb PREF_SET, the client corr), its body, and the status of the
+/// holder's late answer once one reached the inbox.
+#[cfg(feature = "busreg")]
+struct Queued {
+    hdr: crate::bus::BusHdr,
+    body: Box<[u8]>,
+    answered: Option<i32>,
+}
+
+#[cfg(feature = "busreg")]
+static QUEUED: crate::sync::Mutex<VecDeque<Queued>> = crate::sync::Mutex::new(VecDeque::new());
+
+/// `relay`'s timeout arm: keep the queued SET. `false` = the ring is full (the caller answers -EAGAIN).
+#[cfg(feature = "busreg")]
+fn queued_keep(hdr: &crate::bus::BusHdr, body: &[u8]) -> bool {
+    let b: Box<[u8]> = body.into();
+    let h = *hdr;
+    locked(move || {
+        let mut q = QUEUED.lock();
+        if q.len() >= Q_CAP {
+            return false;
+        }
+        q.push_back(Queued { hdr: h, body: b, answered: None });
+        true
+    })
+}
+
+/// The full ring's honest answer: -EAGAIN (the frame may still land at the holder; it is not tracked).
+#[cfg(feature = "busreg")]
+fn queued_full(tag: u8, corr: u32) -> Answer {
+    serial_println!("[prefsbus] relay verb={} corr={} timeout={}ms — queue full ({}), set refused -EAGAIN", tag, corr, RELAY_WAIT_MS, Q_CAP);
+    Answer { status: una_abi::EAGAIN, body: Vec::new() }
+}
+
+/// Note a kernel-stamped REPLY `f` on its queued entry. `true` = `f` answered a queued SET (the caller drops it).
+#[cfg(feature = "busreg")]
+fn queued_note(q: &mut VecDeque<Queued>, f: &[u8]) -> bool {
+    let Ok(h) = crate::bus::frame_parse(f) else { return false };
+    if h.kind != BUS_KIND_REPLY || h.principal[0] != PRIN_KERNEL_REPLY || h.corr == 0 {
+        return false;
+    }
+    match q.iter_mut().find(|e| e.hdr.corr == h.corr) {
+        Some(e) => {
+            e.answered = Some(h.status);
+            true
+        }
+        None => false,
+    }
+}
+
+/// `take_reply`'s stale arm (IRQs masked, REPLIES held): a frame about to drop that answers a queued SET.
+#[cfg(feature = "busreg")]
+fn queued_mark(f: &[u8]) {
+    let mut q = QUEUED.lock();
+    let _ = queued_note(&mut q, f);
+}
+
+/// Take the entry of client corr `corr` out of the ring.
+#[cfg(feature = "busreg")]
+fn queued_take(corr: u32) -> Option<Queued> {
+    locked(|| {
+        let mut q = QUEUED.lock();
+        let i = q.iter().position(|e| e.hdr.corr == corr)?;
+        q.remove(i)
+    })
+}
+
+/// The head of every `call`: settle the queued SETs (see the block above).
+#[cfg(feature = "busreg")]
+fn queued_drain() {
+    if locked(|| QUEUED.lock().is_empty()) {
+        return;
+    }
+    // 1. A late answer still in the inbox is noted on its entry and removed (nobody else waits on that corr).
+    locked(|| {
+        let mut r = REPLIES.lock();
+        let mut q = QUEUED.lock();
+        r.retain(|f| !queued_note(&mut q, f));
+    });
+    // 2. FIFO: the unread mark = the kernel fulfiller applies; an answer = released; neither = kept.
+    let corrs: Vec<u32> = locked(|| QUEUED.lock().iter().map(|e| e.hdr.corr).collect());
+    for c in corrs {
+        let answered = locked(|| QUEUED.lock().iter().find(|e| e.hdr.corr == c).and_then(|e| e.answered));
+        if set_unread_take(c) {
+            let Some(e) = queued_take(c) else { continue };
+            let a = kernel(&e.hdr, &e.body);
+            if a.status == 0 {
+                serial_println!("[prefsbus] queued set corr={} holder gone unread — kernel fulfiller applied", c);
+            } else {
+                serial_println!("[prefsbus] queued set corr={} holder gone unread — kernel fulfiller refused status={}", c, a.status);
+            }
+        } else if let Some(st) = answered {
+            if queued_take(c).is_some() {
+                serial_println!("[prefsbus] queued set corr={} answered status={} — released", c, st);
+            }
+        }
+    }
+}
+
+/// A PREF_SET request header for the fixture (the frame `call` builds for the same body).
+#[cfg(feature = "busreg")]
+fn queued_set_hdr(corr: u32, body: &[u8]) -> Option<crate::bus::BusHdr> {
+    let mut f = alloc::vec![0u8; BUS_HDR_LEN + body.len()];
+    let n = crate::bus::build_request(una_abi::BUS_VERB_PREF_SET, corr, body, &mut f);
+    crate::bus::frame_parse(&f[..n]).ok()
+}
+
+/// The reply frame `bus_route::deliver` puts in this client's inbox for a relayed SET (empty body).
+#[cfg(feature = "busreg")]
+fn queued_reply(corr: u32, status: i32) -> Box<[u8]> {
+    let mut r = alloc::vec![0u8; BUS_HDR_LEN];
+    crate::bus::build_reply(una_abi::BUS_VERB_R3PREF_SET, corr, status, kernel_reply_principal(), &[], &mut r);
+    r.into_boxed_slice()
+}
+
+/// `tests bandy3` (called from `bus_route::selftest`): Q1 a queued SET whose holder is torn down with it UNREAD
+/// (on_exit's two steps in its order: `note_set_unread`, then the -ECONNRESET into the inbox) — the next client
+/// call's drain applies it through the kernel fulfiller and the key reads the SET value; Q2 a queued SET the
+/// holder answered (status 0, no mark) is released with no second write; Q3 the ring refuses past `Q_CAP`
+/// (the -EAGAIN answer). Key `system.display.idle_min` (settingsbus' key); the operator's value is restored.
+#[cfg(feature = "busreg")]
+pub fn queued_selftest() {
+    use crate::prefs::key;
+    if let Some(k) = crate::fs::vfs::home_unwritable(&crate::shell::vfs_mount_table(), &crate::prefs::path()) {
+        serial_println!(":: RELAY-QUEUED-SET: SKIP reason=home-not-writable({}) ::", k);
+        return;
+    }
+    if !in_session() {
+        serial_println!(":: RELAY-QUEUED-SET: SKIP reason=no-session ::");
+        return;
+    }
+    let next = || {
+        let mut c = NEXT_CORR.fetch_add(1, Ordering::Relaxed);
+        if c == 0 {
+            c = NEXT_CORR.fetch_add(1, Ordering::Relaxed);
+        }
+        c
+    };
+    let body_of = |v: i64| alloc::format!("{}.{}\0{}", crate::prefs::NS, key::IDLE_MIN, PrefValue::Int(v).to_literal());
+    let read = || pref_get(crate::prefs::NS, key::IDLE_MIN).ok().and_then(|v| v.as_int());
+    let orig = read();
+    let want: i64 = if orig == Some(7) { 9 } else { 7 };
+    let other: i64 = if want == 7 { 11 } else { 13 };
+    // Q1: unread at the teardown -> the kernel fulfiller applies it at the next call.
+    let b1 = body_of(want);
+    let c1 = next();
+    let kept1 = queued_set_hdr(c1, b1.as_bytes()).is_some_and(|h| queued_keep(&h, b1.as_bytes()));
+    note_set_unread(c1);
+    let pushed1 = inbox_push(queued_reply(c1, una_abi::ECONNRESET as i32));
+    let read1 = read();
+    let q1 = kept1 && pushed1 && read1 == Some(want) && queued_take(c1).is_none();
+    // Q2: the holder answered (applied it itself) -> released, no second write.
+    let b2 = body_of(other);
+    let c2 = next();
+    let kept2 = queued_set_hdr(c2, b2.as_bytes()).is_some_and(|h| queued_keep(&h, b2.as_bytes()));
+    let pushed2 = inbox_push(queued_reply(c2, 0));
+    let read2 = read();
+    let q2 = kept2 && pushed2 && read2 == Some(want) && queued_take(c2).is_none();
+    // Q3: the ring refuses past Q_CAP with -EAGAIN; the fixture's entries are taken back.
+    let mut mine: Vec<u32> = Vec::new();
+    let mut eagain = false;
+    for _ in 0..=Q_CAP {
+        let c = next();
+        match queued_set_hdr(c, b2.as_bytes()) {
+            Some(h) if queued_keep(&h, b2.as_bytes()) => mine.push(c),
+            Some(_) => {
+                eagain = queued_full(una_abi::BUS_VERB_R3PREF_SET, c).status == una_abi::EAGAIN;
+                break;
+            }
+            None => break,
+        }
+    }
+    let q3 = eagain && mine.len() <= Q_CAP;
+    for c in mine {
+        let _ = queued_take(c);
+    }
+    // Restore the operator's value through the same kernel fulfiller (or leave the key unset as it was).
+    match orig {
+        Some(v) => {
+            let b = body_of(v);
+            if let Some(h) = queued_set_hdr(next(), b.as_bytes()) {
+                let _ = kernel(&h, b.as_bytes());
+            }
+        }
+        None => {
+            let _ = crate::prefs::unset(crate::prefs::NS, key::IDLE_MIN);
+        }
+    }
+    if q1 && q2 && q3 {
+        serial_println!(":: RELAY-QUEUED-SET: unread=applied read=released full=eagain -> PASS ::");
+    } else {
+        serial_println!(":: RELAY-QUEUED-SET: q1={} q2={} q3={} (want={} read1={} read2={} kept={}/{} pushed={}/{}) -> FAIL ::", q1 as u8, q2 as u8, q3 as u8, want, read1.unwrap_or(-1), read2.unwrap_or(-1), kept1 as u8, kept2 as u8, pushed1 as u8, pushed2 as u8);
+    }
 }
