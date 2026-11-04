@@ -13,7 +13,7 @@ use scan_core::fixture::{self, Noise, Scene};
 use scan_core::{DepthScale, DeviationError, ScanMesh, Shade, Tol, Transform, Tsdf, Vec3, colour, extract, shade};
 use vug_view::deviation::{BAND_MM, corner};
 use vug_view::raster;
-use vug_view::view::Preset;
+use vug_view::view::{Button, Preset}; // VUGFACEDEVIATIONPICK (SR543): Button for the click
 use vug_view::Viewer;
 
 const DEG: f64 = PI / 180.0;
@@ -150,4 +150,85 @@ fn a_scan_with_no_alignment_shows_no_alignment() {
     let lines = corner(map);
     assert!(lines[0].starts_with("refused NoAlignment"), "{lines:?}");
     let _ = v.frame();
+}
+
+// VUGFACEDEVIATIONPICK (LEDGER SR543): a click on the coloured scan names the vertex under it on the corner's first
+// line; a click off the scan clears it.
+
+/// A scan vertex that is on the design, visible at its own projection (the view's hit there lands on a triangle that
+/// names it) and clear of that triangle's other two vertices by 0.5 mm (a marching-cubes sliver is never the target):
+/// `(vertex, x, y)`.
+fn visible_vertex(v: &Viewer) -> (u32, f64, f64) {
+    let fr = raster::render(&v.model, &v.view);
+    let (idx, pos) = (v.model.indices(), v.model.positions());
+    let d = v.view.deviation.as_ref().unwrap().result.as_ref().unwrap();
+    let at = |i: u32| [0, 1, 2].map(|k| pos[i as usize * 3 + k] as f64);
+    let dist = |a: [f64; 3], b: [f64; 3]| (0..3).map(|k| (a[k] - b[k]) * (a[k] - b[k])).sum::<f64>().sqrt();
+    for y in (20..fr.height - 20).step_by(7) {
+        for x in (20..fr.width - 20).step_by(7) {
+            let t = fr.id[(y * fr.width + x) as usize];
+            if t == u32::MAX {
+                continue;
+            }
+            for k in 0..3 {
+                let i = idx[t as usize * 3 + k];
+                if d.per_vertex[i as usize].is_none() {
+                    continue;
+                }
+                let Some((sx, sy)) = v.view.project_f64(at(i)) else { continue };
+                let Some((_, ht)) = v.view.hit(&v.model, sx, sy) else { continue };
+                let tri = &idx[ht as usize * 3..ht as usize * 3 + 3];
+                if tri.contains(&i) && tri.iter().all(|&j| j == i || dist(at(j), at(i)) > 0.5) {
+                    return (i, sx, sy);
+                }
+            }
+        }
+    }
+    panic!("no visible matched vertex on screen");
+}
+
+#[test]
+fn a_click_on_a_vertex_reads_its_deviation_and_face() {
+    let mut v = open(scan().clone());
+    let (i, x, y) = visible_vertex(&v);
+    v.view.press(&v.model, Button::Left, 0, x, y);
+    assert!(v.view.release(&v.model, x, y), "the click picks");
+    let map = v.view.deviation.as_ref().unwrap();
+    let d = map.result.as_ref().unwrap();
+    let p = map.pick.as_ref().expect("a pick");
+    assert_eq!(p.vertex, i, "the hit triangle's nearest vertex");
+    let want = d.per_vertex[i as usize].expect("matched");
+    let got = p.d.expect("the pick carries the deviation");
+    assert!((got - want).abs() <= 1e-9, "d {got} vs {want}");
+    let face = p.face.expect("a matched vertex names its face");
+    assert_eq!(Some(face), d.face_of_vertex[i as usize]);
+    let name = &map.names[face as usize];
+    assert!(name.starts_with("body/") || name.starts_with("post/"), "{name}");
+    let band = match shade(Some(want), BAND_MM) {
+        Shade::Inside => "inside".to_string(),
+        Shade::Under(k) => format!("under {k:.2}"),
+        Shade::Over(k) => format!("over {k:.2}"),
+        Shade::Off => "off".to_string(),
+    };
+    let lines = corner(map);
+    println!("{}", lines.join("\n"));
+    assert_eq!(lines[0], format!("pick: {name} d={want:+.3} {band}"));
+    assert!(lines[1].starts_with("deviation rms="), "{}", lines[1]);
+    // The frame carries the corner and the ring without panicking.
+    let _ = v.frame();
+}
+
+#[test]
+fn a_click_off_the_scan_clears_the_pick() {
+    let mut v = open(scan().clone());
+    let (_, x, y) = visible_vertex(&v);
+    v.view.press(&v.model, Button::Left, 0, x, y);
+    assert!(v.view.release(&v.model, x, y));
+    assert!(v.view.deviation.as_ref().unwrap().pick.is_some());
+    assert!(v.view.hit(&v.model, 2.0, 2.0).is_none(), "the corner pixel is off the scan");
+    v.view.press(&v.model, Button::Left, 0, 2.0, 2.0);
+    assert!(v.view.release(&v.model, 2.0, 2.0), "the click off the scan clears the pick");
+    let map = v.view.deviation.as_ref().unwrap();
+    assert!(map.pick.is_none());
+    assert!(corner(map)[0].starts_with("deviation rms="), "{:?}", corner(map));
 }
