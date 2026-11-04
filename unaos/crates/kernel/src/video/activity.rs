@@ -410,9 +410,9 @@ pub fn key_route(ev: crate::pal::Event) -> bool {
     let crate::pal::Event::Key(c) = ev else { return false };
     match c {
         b'q' | b'Q' => { close(); true }
-        0x1F | 0x1E => {
+        una_abi::KEY_UP | una_abi::KEY_DOWN => {
             if let Some(st) = STATE.lock().as_mut() {
-                if c == 0x1F { st.sel = st.sel.saturating_sub(1); } else if st.sel + 1 < st.cen.n_proc { st.sel += 1; }
+                if c == una_abi::KEY_UP { st.sel = st.sel.saturating_sub(1); } else if st.sel + 1 < st.cen.n_proc { st.sel += 1; }
                 paint(st);
             }
             let _ = wm::present(WIN.load(Ordering::Relaxed));

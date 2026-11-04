@@ -3645,8 +3645,10 @@ fn luma(c: u32) -> u32 {
 }
 
 /// **`tests menuscraft`** — the sheet every dropdown paints, and the status items' glyph/slot table, measured off
-/// the SAME painters and accessors the live paths use, on synthetic inputs (no panel, no press) but for two live legs:
-/// Quarry's menu opened on its own window (`quarry_a11y`, B1132) and Settings' arrow keys (`settings_keys`, B1133):
+/// the SAME painters and accessors the live paths use, on synthetic inputs (no panel, no press) but for four live legs:
+/// Quarry's menu opened on its own window (`quarry_a11y`, B1132) and the pill on its hover pass (`quarry_hover`,
+/// B1144), a window menu walked on its own fixture window (`winmenu_live`, B1144) and Settings' arrow keys
+/// (`settings_keys`, B1133). The `[menuscraft]` lines below each ride the one `:: MENUSCRAFT:` verdict:
 ///
 /// * `sheet` — a sheet rect `MIN_W + BAND` x `120 + BAND` over the flat scene: the body's bottom-left corner pixel
 ///   is NOT the face (rounded, `corners`), the body's centre IS `surface.overlay` (`face`), the foot row is the
@@ -3659,7 +3661,13 @@ fn luma(c: u32) -> u32 {
 /// * MENUS2 (B652) — `dock_menu` (`dock::sheet_probe`: the tile menu's `menu_box` on the sheet), `quarry_menu` and
 ///   `band_exact` (`quarry::live::ops::sheet_probe`: Quarry's menu painted in its own surface over two fills, the band
 ///   darker than each and different between them; `n/a` without `quarry`), `wallpaper_gen` (`strip::seal` folds
-///   `strip::wall_gen` through `seal_with`, and another generation changes it).
+///   `strip::wall_gen` through `seal_with`, and another generation changes it). `quarry_menu` also carries
+///   `quarry_fit` (B1107: the fit in a window shorter than the menu), `quarry_page` (B1119: its second page and the
+///   walk's page arithmetic), `quarry_a11y` (B1132: the LIVE menu's census through `right_press`) and, inside that
+///   open menu, `quarry_hover` (B1144: two pointer moves through `live::hover_poll`, the pill's row read off the walk).
+/// * F39SETTINGSARROWSENSE (B1127) — `winmenu_keys` (`winmenu::walk_probe`): the window menu's walk glue offscreen,
+///   Down, Down, Return picks row 3. F39MENUSCRAFTDOCS (B1144) — `winmenu_live` (`winmenu::walk_live`): the same keys
+///   through `strip::key_escape` on a LIVE menu of the leg's own fixture window, the pick delivered to its own sink.
 /// * F39SETTINGSKEYSPROBE (B1133) — `settings_keys` (`settings::keys_leg`): Down, Down, Up through `settings::key_route`
 ///   on the live window over the column, the Users form and the pane (2 then 1 each), its state put back.
 pub fn menuscraft_selftest() {
@@ -3750,7 +3758,7 @@ pub fn menuscraft_selftest() {
     let glyphs_ok = seated_live > 0 && drawn_live == seated_live && inside && gap_ok;
 
     // ── leg 3 (MENUS2, B652): the context menus on the sheet, the wallpaper generation in the seal, the exact band ──
-    let dock_ok = super::dock::sheet_probe(); let winmenu_ok = winmenu_keys_leg(); let settings_ok = super::settings::keys_leg(); // F39SETTINGSKEYSPROBE (B1133): Settings' arrow arms through `settings::key_route` on the live window. F39SETTINGSARROWSENSE (B1127): the window menu's key walk, offscreen (LINE-NEUTRAL; body at the file tail)
+    let dock_ok = super::dock::sheet_probe(); let winmenu_ok = winmenu_keys_leg() & winmenu_live_leg(); let settings_ok = super::settings::keys_leg(); // F39SETTINGSKEYSPROBE (B1133): Settings' arrow arms through `settings::key_route` on the live window. F39SETTINGSARROWSENSE (B1127): the window menu's key walk, offscreen. F39MENUSCRAFTDOCS (B1144): the same walk on a LIVE fixture menu (LINE-NEUTRAL; body at the file tail)
     #[cfg(feature = "quarry")]
     let (quarry_ok, band_exact) = super::quarry::live::ops::sheet_probe();
     #[cfg(not(feature = "quarry"))]
@@ -4038,4 +4046,25 @@ fn winmenu_keys_leg() -> bool {
         None => serial_println!("[menuscraft] winmenu_keys rows={} picked=- -> BAD", rows),
     }
     ok
+}
+
+// ── F39MENUSCRAFTDOCS (rmbp-ledger B1144): `tests menuscraft`'s LIVE window-menu key leg (WINMENU-PROBE-KEYS) ──────────
+
+/// F39MENUSCRAFTDOCS — the window menu's walk on a LIVE menu (`winmenu::walk_live`: its own fixture window and tree,
+/// opened through `strip::press_route`, Down, Down, Return through `strip::key_escape`): the sel reads row 3 after the
+/// two Downs (the separator and the disabled row skipped) and Return's pick names row 3. One `[menuscraft]
+/// winmenu_live` line; rides the `:: MENUSCRAFT:` verdict. A leg that could not be put its question SKIPs, never reds.
+fn winmenu_live_leg() -> bool {
+    let opt = |v: Option<usize>| v.map_or(alloc::string::String::from("-"), |i| alloc::format!("{}", i));
+    match super::winmenu::walk_live() {
+        Ok((rows, sel, picked)) => {
+            let ok = rows == 5 && sel == Some(3) && picked == Some(3);
+            serial_println!("[menuscraft] winmenu_live rows={} sel={} picked={} -> {}", rows, opt(sel), opt(picked), if ok { "ok" } else { "BAD" });
+            ok
+        }
+        Err(reason) => {
+            serial_println!("[menuscraft] winmenu_live declined reason={} -> skip", reason);
+            true
+        }
+    }
 }

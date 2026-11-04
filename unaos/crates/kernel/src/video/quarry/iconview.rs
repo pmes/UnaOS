@@ -207,7 +207,7 @@ fn follow(m: &mut Model) {
 
 /// Arrow keys while the view is Icons and the list has the keyboard. `true` = consumed.
 pub(super) fn key(c: u8) -> bool {
-    if !matches!(c, 0x1C..=0x1F) {
+    if !matches!(c, una_abi::KEY_RIGHT..=una_abi::KEY_UP) {
         return false;
     }
     let mut guard = MODEL.lock();
@@ -219,9 +219,9 @@ pub(super) fn key(c: u8) -> bool {
     let n = m.list.len();
     let s = m.list_sel;
     m.list_sel = match c {
-        0x1D => s.saturating_sub(1),
-        0x1C => (s + 1).min(n - 1),
-        0x1F => s.saturating_sub(cols),
+        una_abi::KEY_LEFT => s.saturating_sub(1),
+        una_abi::KEY_RIGHT => (s + 1).min(n - 1),
+        una_abi::KEY_UP => s.saturating_sub(cols),
         _ => (s + cols).min(n - 1),
     };
     follow(m);

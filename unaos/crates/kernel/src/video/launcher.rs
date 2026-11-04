@@ -705,11 +705,11 @@ pub fn key_door(ev: crate::pal::Event) -> bool {
                         owe_pick(it);
                     }
                 }
-                0x1F | 0x1E => {
+                una_abi::KEY_UP | una_abi::KEY_DOWN => {
                     if let Some(st) = ST.lock().as_mut() {
                         let n = st.items.len();
                         if n > 0 {
-                            st.sel = if c == 0x1F { st.sel.saturating_sub(1) } else { (st.sel + 1).min(n - 1) };
+                            st.sel = if c == una_abi::KEY_UP { st.sel.saturating_sub(1) } else { (st.sel + 1).min(n - 1) };
                         }
                     }
                     owe_paint();
