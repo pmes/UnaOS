@@ -656,7 +656,8 @@ fn the_first_bind_commissions_an_unnamed_board_once_and_keeps_the_name() {
     let out = desk.apply(&start_at(digest, port), &mut *open);
     let kept = name.lock().unwrap().clone();
     assert!(kept.starts_with("UNA-") && kept.len() == 12, "the commissioned name {kept:?}");
-    assert_eq!(squawk_words(&out), vec!["started".to_string(), format!("hello {}", ver_of(&kept))], "{out:?}");
+    assert_eq!(squawk_words(&out), vec!["started".to_string(), format!("hello {}", ver_of(""))], "{out:?}"); // VUGCOMSCANJOG (SR573): the hello as first said
+    assert_eq!(commissioned(&out), vec![(format!("{TCP_SCHEME}127.0.0.1:{port}"), kept.clone())], "the commission is its own word, once");
     assert_eq!(desk.hello(), Some(ver_of(&kept).as_str()), "the readback is the identity the reopen compares");
 
     let t0 = Instant::now();
@@ -678,6 +679,7 @@ fn the_first_bind_commissions_an_unnamed_board_once_and_keeps_the_name() {
     let digest2 = desk2.arm(&pass, &p, GRBL).expect("armed by a pass");
     let out = desk2.apply(&start_at(digest2, port2), &mut *open2);
     assert_eq!(squawk_words(&out), vec!["started".to_string(), format!("hello {}", ver_of("MILL-A"))], "{out:?}");
+    assert!(commissioned(&out).is_empty(), "a named board says no commission: {out:?}"); // VUGCOMSCANJOG (SR573)
     drop(desk2);
     let (_, writes2) = fake2.join().unwrap();
     assert!(writes2.is_empty(), "a named board is not commissioned: {writes2:?}");
@@ -700,7 +702,8 @@ fn a_reopen_onto_a_board_answering_another_name_refuses_another_board() {
     let out = desk.apply(&start_at(digest, port), &mut *open);
     let kept = name_a.lock().unwrap().clone();
     let said_a = ver_of(&kept);
-    assert_eq!(squawk_words(&out), vec!["started".to_string(), format!("hello {said_a}")], "{out:?}");
+    assert_eq!(squawk_words(&out), vec!["started".to_string(), format!("hello {}", ver_of(""))], "{out:?}"); // VUGCOMSCANJOG (SR573): said_a is the readback the run keeps
+    assert_eq!(commissioned(&out).len(), 1, "{out:?}");
 
     // The FIN after five lines: lost at the oldest unacknowledged line.
     let t0 = Instant::now();
@@ -839,4 +842,110 @@ async fn serve_pump_leaves_the_worker_free_while_an_open_sleeps() {
     syn.fire(SMessage::Kill("comscan".to_string()));
     tokio::time::timeout(Duration::from_secs(5), task).await.expect("stops on Kill").unwrap();
     tokio::time::timeout(Duration::from_secs(5), probe).await.expect("the probe stops").unwrap();
+}
+
+// --- VUGCOMSCANJOG (SR573): home and jog on the running link; a Marlin jog is G91 / G0 / G90 in order; the commission's own word ---
+
+use pump_core::pump::{home_lines, jog_lines};
+
+/// The `Commissioned { port, name }` words in `out`.
+fn commissioned(out: &[PumpEvent]) -> Vec<(String, String)> {
+    out.iter()
+        .filter_map(|s| match s { PumpEvent::Commissioned { port, name } => Some((port.clone(), name.clone())), _ => None })
+        .collect()
+}
+
+/// A fake Marlin behind one accepted connection: says `start`, answers `ok` per line, records every line; returns them
+/// once the client closes.
+fn fake_marlin(l: TcpListener) -> JoinHandle<Vec<String>> {
+    thread::spawn(move || {
+        let (mut s, _) = l.accept().unwrap();
+        drop(l);
+        s.write_all(b"start\r\n").unwrap();
+        let mut got = Vec::new();
+        let mut cur: Vec<u8> = Vec::new();
+        let mut buf = [0u8; 256];
+        loop {
+            let k = match s.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(k) => k,
+            };
+            for &b in &buf[..k] {
+                if b == b'\n' {
+                    got.push(String::from_utf8_lossy(&cur).trim().to_string());
+                    cur.clear();
+                    let _ = s.write_all(b"ok\r\n");
+                } else {
+                    cur.push(b);
+                }
+            }
+        }
+        got
+    })
+}
+
+/// The word `drive_until` stopped at.
+fn word_of(s: PumpEvent) -> String {
+    match s {
+        PumpEvent::Squawk { event: Some(e), .. } => e,
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn a_marlin_jog_is_g91_g0_g90_in_order_and_home_is_g28() {
+    let s = |v: &[&str]| -> Option<Vec<String>> { Some(v.iter().map(|x| x.to_string()).collect()) };
+    assert_eq!(home_lines(GRBL), s(&["$H"]));
+    assert_eq!(home_lines(Dialect::Grbl { laser: true }), s(&["$H"]));
+    assert_eq!(home_lines(Dialect::Marlin), s(&["G28"]));
+    assert_eq!(home_lines(Dialect::LinuxCnc), None);
+    assert_eq!(jog_lines(GRBL, [1.0, -2.0, 0.5], 600.0), s(&["$J=G91 X1 Y-2 Z0.5 F600"]));
+    assert_eq!(jog_lines(Dialect::Marlin, [1.0, -2.0, 0.5], 600.0), s(&["G91", "G0 X1 Y-2 Z0.5 F600", "G90"]));
+    assert_eq!(jog_lines(GRBL, [0.00004, 0.0, -0.0], 1.25), s(&["$J=G91 X0 Y0 Z0 F1.25"]), "make_core's number grammar");
+    assert_eq!(jog_lines(Dialect::LinuxCnc, [1.0, 0.0, 0.0], 100.0), None);
+
+    let who = || Origin::LocalUser("una".to_string());
+    let (l, port) = listener();
+    let fake = fake_marlin(l);
+    let p = program();
+    let lines = Pump::from_program(&p, Dialect::Marlin).unwrap().lines().to_vec();
+    let mut desk = PumpDesk::new(machine());
+    let mut open = by_scheme(no_serial(), opener(Duration::from_millis(500)));
+    let pass = Verdict::Pass { digest: p.digest(), machine: machine().digest() };
+    let digest = desk.arm(&pass, &p, Dialect::Marlin).expect("armed by a pass");
+    let home = PumpEvent::PumpHome { principal: who() };
+    assert!(home.is_request());
+    assert!(refused_why(&desk.apply(&home, &mut *open)).starts_with("nothing is linked"), "no link before a start");
+
+    let start = PumpEvent::PumpStart {
+        principal: who(),
+        program: digest_hex(digest),
+        dialect: "marlin".to_string(),
+        port: format!("{TCP_SCHEME}127.0.0.1:{port}"),
+    };
+    let out = desk.apply(&start, &mut *open);
+    assert!(matches!(&out[..], [PumpEvent::Squawk { event: Some(e), .. }] if e == "started"), "{out:?}");
+    let busy = refused_why(&desk.apply(&home, &mut *open));
+    assert!(busy.starts_with("busy: streaming"), "busy on a job refuses: {busy}");
+    let t0 = Instant::now();
+    let mut words = Vec::new();
+    assert_eq!(word_of(drive_until(&mut desk, &mut *open, t0, &mut words, |e| e == "done" || e.starts_with("link lost"))), "done");
+
+    let bad = PumpEvent::PumpJog { principal: who(), dx: 1.0, dy: 0.0, dz: 0.0, feed: 0.0 };
+    assert_eq!(refused_why(&desk.apply(&bad, &mut *open)), "jog: feed 0 is not above zero");
+    let still = PumpEvent::PumpJog { principal: who(), dx: 0.0, dy: 0.0, dz: 0.0, feed: 100.0 };
+    assert_eq!(refused_why(&desk.apply(&still, &mut *open)), "jog: no axis moves");
+
+    let jog = PumpEvent::PumpJog { principal: who(), dx: 1.0, dy: -2.0, dz: 0.5, feed: 600.0 };
+    let out = desk.apply(&jog, &mut *open);
+    assert!(matches!(&out[..], [PumpEvent::Squawk { event: Some(e), .. }] if e == "jog sent: G91 / G0 X1 Y-2 Z0.5 F600 / G90"), "{out:?}");
+    assert_eq!(word_of(drive_until(&mut desk, &mut *open, t0, &mut words, |e| e.starts_with("jog"))), "jog ok");
+    let out = desk.apply(&home, &mut *open);
+    assert!(matches!(&out[..], [PumpEvent::Squawk { event: Some(e), .. }] if e == "home sent: G28"), "{out:?}");
+    assert_eq!(word_of(drive_until(&mut desk, &mut *open, t0, &mut words, |e| e.starts_with("home"))), "home ok");
+    drop(desk);
+    let got = fake.join().unwrap();
+    let mut want = lines.clone();
+    want.extend(["G91", "G0 X1 Y-2 Z0.5 F600", "G90", "G28"].iter().map(|x| x.to_string()));
+    assert_eq!(got, want, "the program, then the jog's three lines in order, then the home");
 }

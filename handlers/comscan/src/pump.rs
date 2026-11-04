@@ -212,6 +212,8 @@ struct Running {
     /// VUGCOMSCANHELLOID (SR546): the controller's answer to its dialect's identity verb at the first open (`None`: the
     /// hello is off, the dialect has no verb, or the controller said nothing it keeps); a reopen must answer the same.
     hello: Option<String>,
+    /// VUGCOMSCANJOG (SR573): the home / jog lines sent on this link and not yet answered, oldest first.
+    motion: std::collections::VecDeque<Motion>,
 }
 
 /// Comscan's pump desk: the machine it drives, the armed programs and the one running stream.
@@ -322,7 +324,8 @@ impl PumpDesk {
                     Err(e) => refused(format!("{word}: {e:?}")),
                 }
             }
-            PumpEvent::Squawk { .. } | PumpEvent::PumpRefused { .. } => Vec::new(),
+            PumpEvent::PumpHome { .. } | PumpEvent::PumpJog { .. } => self.motion(ev), // VUGCOMSCANJOG (SR573)
+            PumpEvent::Squawk { .. } | PumpEvent::PumpRefused { .. } | PumpEvent::Commissioned { .. } => Vec::new(),
         }
     }
 
@@ -335,11 +338,13 @@ impl PumpDesk {
         if evs.is_empty() {
             return Vec::new();
         }
+        let (evs, moved) = self.motion_replies(evs); // VUGCOMSCANJOG (SR573): the home / jog answers by name
         if evs.contains(&Event::LinkLost) {
             self.link_lost(now_us);
         }
         let named: Vec<String> =
             evs.iter().filter_map(event_word).map(|w| if w == "link lost" { self.lost_word() } else { w }).collect();
+        let named: Vec<String> = moved.into_iter().chain(named).collect(); // VUGCOMSCANJOG (SR573)
         if named.is_empty() {
             return vec![self.squawk(None)];
         }
@@ -561,7 +566,7 @@ impl PumpDesk {
     /// run is still lost and link-less; otherwise the new link is dropped and nothing is said.
     pub fn relinked(&mut self, now_us: u64, res: Result<Box<dyn Transport + Send>, String>) -> Vec<PumpEvent> {
         let spec = self.hello_spec(); // VUGCOMSCANHELLOID (SR546): the reopened link says who it is first
-        self.relinked_said(now_us, with_hello(res, spec))
+        self.relinked_said(now_us, with_hello(res, spec).map(|(l, s)| (l, s, None))) // VUGCOMSCANJOG (SR573): a reopen never commissions
     }
 
     /// [`PumpDesk::relinked`] with the reopened link's identity answer beside it (VUGCOMSCANHELLOID, SR546): an answer
@@ -569,7 +574,7 @@ impl PumpDesk {
     pub fn relinked_said(
         &mut self,
         now_us: u64,
-        res: Result<(Box<dyn Transport + Send>, Option<String>), String>,
+        res: Result<Opened, String>, // VUGCOMSCANJOG (SR573): the third slot (a commission) is never set on a reopen
     ) -> Vec<PumpEvent> {
         let Some(r) = self.running.as_mut() else { return Vec::new() };
         let PumpState::LinkLost { at_line, .. } = r.pump.state() else { return Vec::new() };
@@ -578,7 +583,7 @@ impl PumpDesk {
             return Vec::new();
         }
         let word = match res {
-            Ok((link, now)) if r.hello.is_some() && now != r.hello => {
+            Ok((link, now, _)) if r.hello.is_some() && now != r.hello => {
                 drop(link); // another board: its link (a tty's exclusive fd) goes at once
                 let k = d.attempt();
                 d.failed(now_us);
@@ -586,7 +591,7 @@ impl PumpDesk {
                 let was = r.hello.clone().unwrap_or_default();
                 format!("reconnect attempt {k} refused: {:?}; attempt {} in {} ms", Refused::AnotherBoard { was, now }, d.attempt(), d.wait_us() / 1000)
             }
-            Ok((link, _)) => {
+            Ok((link, _, _)) => {
                 r.link = Some(link);
                 r.redial = None;
                 format!("relinked on attempt {}; re-arm to resume from line {at_line}", d.attempt())
@@ -782,24 +787,28 @@ impl PumpDesk {
     fn started(
         &mut self,
         ev: &PumpEvent,
-        res: Result<(Box<dyn Transport + Send>, Option<String>), String>,
+        res: Result<Opened, String>, // VUGCOMSCANJOG (SR573): + the answer before a commission
     ) -> Vec<PumpEvent> {
         let u = match self.start_due(ev) {
             Ok(u) => u,
             Err(out) => return out, // a live link in `res` is dropped here (a tty's exclusive fd released)
         };
         let port = u.port;
-        let (link, said) = match res {
+        let (link, said, before) = match res {
             Ok(x) => x,
             Err(e) => return refused(format!("port {port:?}: {e}")),
         };
         // One arming, one run: a FirstRun approval is per run, so a finished program must pass Helm again.
         let a = self.armed.remove(u.i);
         let identity = self.identify.as_ref().and_then(|f| f(port.as_str())); // VUGCOMSCANTTYUSBID (SR529)
-        self.running = Some(Running { pump: a.pump, link: Some(link), port, redial: None, identity, hello: said.clone() });
+        let commissioned = commissioned_name(a.dialect, before.as_deref(), said.as_deref()); // VUGCOMSCANJOG (SR573)
+        self.running = Some(Running { pump: a.pump, link: Some(link), port: port.clone(), redial: None, identity, hello: said.clone(), motion: Default::default() });
         let mut out = vec![self.squawk(Some("started".to_string()))];
-        if let Some(h) = said {
-            out.push(self.squawk(Some(format!("hello {h}")))); // printed once, at the first open
+        if let Some(h) = before.or(said) {
+            out.push(self.squawk(Some(format!("hello {h}")))); // printed once, at the first open (VUGCOMSCANJOG SR573: as the controller first said it)
+        }
+        if let Some(name) = commissioned {
+            out.push(PumpEvent::Commissioned { port, name }); // VUGCOMSCANJOG (SR573): the EEPROM write, its own word, once
         }
         out
     }
@@ -828,7 +837,7 @@ async fn open_road(
     desk: &Mutex<PumpDesk>,
     open: &mut Box<Opener>,
     due: impl FnOnce(&PumpDesk) -> Result<(String, Dialect, Option<(Dialect, Duration)>, Option<String>), Vec<PumpEvent>>, // VUGCOMSCANHOSTDESK (SR561): + the name; VUGCOMSCANHOSTDIALECT (SR566): + the dialect
-    back: impl FnOnce(&mut PumpDesk, Result<(Box<dyn Transport + Send>, Option<String>), String>) -> Vec<PumpEvent>,
+    back: impl FnOnce(&mut PumpDesk, Result<Opened, String>) -> Vec<PumpEvent>, // VUGCOMSCANJOG (SR573): Opened
 ) -> Option<Vec<PumpEvent>> {
     let (port, dialect, spec, name) = {
         let d = desk.lock().ok()?;
@@ -898,19 +907,23 @@ pub fn commission(link: &mut dyn Transport, dialect: Dialect, name: &str, wait: 
 /// [`with_hello`], then at a first bind (`name` set) on a board whose answer carries no name
 /// (`pump_core::pump::hello_name` is `Some("")`) the commission, whose readback replaces the answer; a refused
 /// commission keeps the unnamed answer (the reopen then compares by the build, VUGCOMSCANHELLOID's behaviour).
+/// VUGCOMSCANJOG (SR573): the third slot is the unnamed answer, `Some` only when the commission acked and was read back.
 pub fn with_hello_named(
     res: Result<Box<dyn Transport + Send>, String>,
     spec: Option<(Dialect, Duration)>,
     name: Option<String>,
-) -> Result<(Box<dyn Transport + Send>, Option<String>), String> {
+) -> Result<Opened, String> {
     let (mut l, said) = with_hello(res, spec)?;
-    let said = match (spec, name, said) {
+    let (said, before) = match (spec, name, said) {
         (Some((d, w)), Some(n), Some(s)) if pump_core::pump::hello_name(d, &s) == Some("") => {
-            Some(commission(&mut *l, d, &n, w).unwrap_or(s))
+            match commission(&mut *l, d, &n, w) {
+                Some(back) => (Some(back), Some(s)),
+                None => (Some(s), None),
+            }
         }
-        (_, _, s) => s,
+        (_, _, s) => (s, None),
     };
-    Ok((l, said))
+    Ok((l, said, before))
 }
 
 /// The name a first bind commissions: `UNA-` and the last 8 letters / digits of the USB serial (upper-cased) when the
@@ -1039,7 +1052,7 @@ async fn open_blocking(
     dialect: Dialect,
     spec: Option<(Dialect, Duration)>,
     name: Option<String>,
-) -> Result<(Box<dyn Transport + Send>, Option<String>), String> {
+) -> Result<Opened, String> { // VUGCOMSCANJOG (SR573): Opened
     let mut op = std::mem::replace(open, opener_lost());
     let job = tokio::task::spawn_blocking(move || {
         let res = with_hello_named(op(&port, dialect), spec, name);
@@ -1065,6 +1078,144 @@ impl PumpDesk {
     /// The running pump's dialect (the redial hands it to the opener).
     fn running_dialect(&self) -> Option<Dialect> {
         self.running.as_ref().map(|r| r.pump.dialect())
+    }
+}
+
+// --- VUGCOMSCANJOG (LEDGER SR573): home and jog on the run's link, answered by name; the commission said as its own word (named tail hunk) ---
+
+/// An opener's answer after the hello ([`with_hello_named`]): the link, the identity the run keeps (a commission's
+/// readback, else the answer) and the answer as the controller first said it, `Some` only when a commission acked and was
+/// read back.
+pub type Opened = (Box<dyn Transport + Send>, Option<String>, Option<String>);
+
+/// The wait for the link to take one home / jog line (a few bytes; the answer is read by [`PumpDesk::tick`]).
+pub const MOTION_WAIT: Duration = Duration::from_millis(100);
+
+/// One home / jog line sent and not yet answered.
+struct Motion {
+    /// `home` or `jog`.
+    word: &'static str,
+    /// The verb's last line: its `ok` names the verb done.
+    last: bool,
+    /// An earlier line of the verb was refused: this line's answer is claimed silently.
+    failed: bool,
+}
+
+/// What [`PumpDesk::motion_replies`] does with one event.
+enum Claim {
+    Ok,
+    Refused(String),
+    Drop,
+    Pass,
+}
+
+/// The name a first bind commissioned: the readback's name when the commission acked (`before` set) and it is not empty.
+fn commissioned_name(d: Dialect, before: Option<&str>, said: Option<&str>) -> Option<String> {
+    before?;
+    pump_core::pump::hello_name(d, said?).filter(|n| !n.is_empty()).map(str::to_string)
+}
+
+impl PumpDesk {
+    /// PumpHome / PumpJog: the dialect's lines (`pump_core::pump::home_lines` / `jog_lines`) on the running link through
+    /// [`send_line`], each answered through [`PumpDesk::tick`]. Allowed with the link up and nothing of a job in flight
+    /// (halted, stopped, done, lost and relinked); refused by name when nothing is linked, busy on a job, the jog's numbers
+    /// cannot be said, the dialect has no verb, or the link is down.
+    fn motion(&mut self, ev: &PumpEvent) -> Vec<PumpEvent> {
+        let Some(r) = self.running.as_mut() else {
+            return refused("nothing is linked: home and jog ride the link a PumpStart opened");
+        };
+        let st = r.pump.state();
+        if matches!(st, PumpState::Streaming | PumpState::Stopping | PumpState::Rearmed { .. }) || r.pump.in_flight() > 0 {
+            return refused(format!("busy: {} (home and jog wait for the job: PumpStop first)", state_word(st)));
+        }
+        let d = r.pump.dialect();
+        let (word, lines) = match ev {
+            PumpEvent::PumpHome { .. } => ("home", pump_core::pump::home_lines(d)),
+            PumpEvent::PumpJog { dx, dy, dz, feed, .. } => {
+                if ![*dx, *dy, *dz, *feed].iter().all(|v| v.is_finite()) {
+                    return refused(format!("jog: not a number in X{dx} Y{dy} Z{dz} F{feed}"));
+                }
+                if *feed <= 0.0 {
+                    return refused(format!("jog: feed {feed} is not above zero"));
+                }
+                if *dx == 0.0 && *dy == 0.0 && *dz == 0.0 {
+                    return refused("jog: no axis moves");
+                }
+                ("jog", pump_core::pump::jog_lines(d, [*dx, *dy, *dz], *feed))
+            }
+            _ => return Vec::new(),
+        };
+        let Some(lines) = lines else {
+            return refused(format!("{word}: no {word} verb in {}", dialect_word(d)));
+        };
+        if matches!(d, Dialect::Grbl { .. }) && lines.iter().any(|l| l.len() + 1 > pump_core::pump::GRBL_RX) {
+            return refused(format!("{word}: a line over grbl's {} bytes", pump_core::pump::GRBL_RX));
+        }
+        let attempt = r.redial.map(|x| x.attempt()).unwrap_or(0);
+        let Some(link) = r.link.as_mut() else {
+            return refused(format!("{word}: the link is down (reconnect attempt {attempt})"));
+        };
+        for (k, l) in lines.iter().enumerate() {
+            if !send_line(&mut **link, l, MOTION_WAIT) {
+                return refused(format!("{word}: the link would not take {l:?}"));
+            }
+            r.motion.push_back(Motion { word, last: k + 1 == lines.len(), failed: false });
+        }
+        vec![self.squawk(Some(format!("{word} sent: {}", lines.join(" / "))))]
+    }
+
+    /// [`PumpDesk::tick`]'s events with the home / jog answers claimed, oldest line first: an `ok` (grbl `ok`, Marlin
+    /// `ok...`, which the pump reads as a message with nothing of the job in flight) answers one line and the verb's last
+    /// names it `<verb> ok`; a grbl `error:N` or a Marlin `Error:` names it `<verb> error:N <name>` / `<verb> refused: ..`
+    /// and the verb's later lines are claimed silently; an alarm, a reset or a lost link drops what is pending. The
+    /// unclaimed events go on to the Squawk words unchanged.
+    fn motion_replies(&mut self, evs: Vec<Event>) -> (Vec<Event>, Vec<String>) {
+        let Some(r) = self.running.as_mut() else { return (evs, Vec::new()) };
+        if r.motion.is_empty() {
+            return (evs, Vec::new());
+        }
+        let mut keep = Vec::new();
+        let mut words = Vec::new();
+        for e in evs {
+            let pending = !r.motion.is_empty();
+            let claim = match &e {
+                Event::Message(s) if pending && s.starts_with("ok") => Claim::Ok,
+                Event::Error { code, name, .. } if pending => Claim::Refused(format!("error:{code} {name}")),
+                Event::Refused { text, .. } if pending => Claim::Refused(format!("refused: {text}")),
+                Event::Alarm { .. } | Event::Reset | Event::LinkLost => Claim::Drop,
+                _ => Claim::Pass,
+            };
+            match claim {
+                Claim::Ok => {
+                    if let Some(m) = r.motion.pop_front() {
+                        if m.last && !m.failed {
+                            words.push(format!("{} ok", m.word));
+                        }
+                    }
+                }
+                Claim::Refused(why) => {
+                    if let Some(m) = r.motion.pop_front() {
+                        if !m.failed {
+                            words.push(format!("{} {why}", m.word));
+                        }
+                        if !m.last {
+                            for later in r.motion.iter_mut() {
+                                later.failed = true;
+                                if later.last {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                Claim::Drop => {
+                    r.motion.clear();
+                    keep.push(e);
+                }
+                Claim::Pass => keep.push(e),
+            }
+        }
+        (keep, words)
     }
 }
 

@@ -67,7 +67,9 @@ impl Realtime {
     }
 }
 
-fn num(o: &mut String, v: f64) {
+/// A number in the one dialect grammar: four decimals, trailing zeros and point trimmed, `-0` said `0` (VUGCOMSCANJOG
+/// SR573: public, so pump_core's jog lines say numbers the same way).
+pub fn num(o: &mut String, v: f64) {
     let s = format!("{:.4}", v);
     let t = if s.contains('.') { s.trim_end_matches('0').trim_end_matches('.') } else { s.as_str() };
     if t == "-0" { o.push('0') } else { o.push_str(t) }
