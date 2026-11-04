@@ -615,6 +615,7 @@ fn fake_marlin(mut m: File, lines: usize) -> JoinHandle<(Vec<String>, File)> {
                     m.write_all(format!("{MARLIN_FIRMWARE}\r\nCap:SERIAL_XON_XOFF:0\r\nok\r\n").as_bytes()).unwrap();
                 } else if line == "M211" {
                     m.write_all(MARLIN_SOFT_ENDSTOPS).unwrap(); // VUGCOMSCANENVELOPEREADON (SR597): neither recorded nor counted
+                } else if line.starts_with("M154") { m.write_all(b"ok\r\n").unwrap(); // VUGCOMSCANMARLINAUTOREPORT (SR625): neither recorded nor counted
                 } else {
                     got.push(line);
                     m.write_all(b"ok\r\n").unwrap();

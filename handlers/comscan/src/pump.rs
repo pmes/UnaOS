@@ -188,6 +188,7 @@ fn event_word(e: &Event) -> Option<String> {
         Event::Stopped => "stopped".to_string(),
         Event::Done => "done".to_string(),
         Event::LinkLost => "link lost".to_string(),
+        Event::AutoReport { on } => format!("autoreport={}", if *on { "on" } else { "unsupported" }), // VUGCOMSCANMARLINAUTOREPORT (SR625)
         Event::Ok(_) | Event::Status(_) | Event::Message(_) => return None,
     })
 }
@@ -660,6 +661,7 @@ impl PumpDesk {
         if let Some(r) = self.running.as_mut() {
             r.pump = fresh;
         }
+        self.autoreport_due(); // VUGCOMSCANMARLINAUTOREPORT (SR625): a relinked run's fresh pump asks again (once per link)
         Ok(at_line)
     }
 }
@@ -839,6 +841,7 @@ impl PumpDesk {
         let identity = self.identify.as_ref().and_then(|f| f(port.as_str())); // VUGCOMSCANTTYUSBID (SR529)
         let commissioned = commissioned_name(a.dialect, before.as_deref(), said.as_deref()); // VUGCOMSCANJOG (SR573)
         self.running = Some(Running { pump: a.pump, link: Some(link), port: port.clone(), redial: None, identity, hello: said.clone(), motion: Default::default(), jogged: false, unlock: false });
+        self.autoreport_due(); // VUGCOMSCANMARLINAUTOREPORT (SR625): the link-up M154, riding the hello
         let mut out = vec![self.squawk(Some("started".to_string()))];
         if let Some(h) = before.or(said) {
             out.push(self.squawk(Some(format!("hello {h}")))); // printed once, at the first open (VUGCOMSCANJOG SR573: as the controller first said it)
@@ -1807,6 +1810,22 @@ fn declare_kept(synapse: &Synapse, desk: &Mutex<PumpDesk>, ev: &PumpEvent, out: 
     }
     let Some(record) = desk.lock().ok().and_then(|d| d.declared_record().map(str::to_string)) else { return };
     synapse.fire(SMessage::Principia(bandy::PrincipiaCommand::PrefSet { ns: "comscan".to_string(), key: "machine".to_string(), value: bandy::PrefValue::Str(record) }));
+}
+
+// --- VUGCOMSCANMARLINAUTOREPORT (LEDGER SR625): the link-up M154 rides the hello (named tail hunk) ---
+
+impl PumpDesk {
+    /// The running pump's position auto-report armed ([`pump_core::Pump::autoreport`], Marlin's `M154 S1` at its first
+    /// tick) where the hello is on, as the travel read rides it (SR597): a hello-off desk sends program lines only. A grbl
+    /// pump ignores it. Called at a start's handback and at a re-arm (the fresh pump of a relinked run: once per link).
+    fn autoreport_due(&mut self) {
+        if self.hello.is_none() {
+            return;
+        }
+        if let Some(r) = self.running.as_mut() {
+            r.pump.autoreport(pump_core::pump::AUTOREPORT_S);
+        }
+    }
 }
 
 #[cfg(test)]

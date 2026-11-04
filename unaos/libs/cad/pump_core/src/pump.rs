@@ -107,6 +107,9 @@ pub enum Event {
     Stopped,
     Done,
     LinkLost,
+    /// VUGCOMSCANMARLINAUTOREPORT (SR625): Marlin's answer to the link-up `M154 S<n>` ([`Pump::autoreport`]): `on` (an `ok`),
+    /// else the build lacks AUTO_REPORT_POSITION (`echo:Unknown command`, then its `ok`). Said once per pump.
+    AutoReport { on: bool },
 }
 
 /// Lines sent (started) / acknowledged / total, the state and the last status report.
@@ -139,7 +142,7 @@ pub struct Pump {
     status_every_us: u64,
     timeout_us: u64,
     /// VUGCOMSCANRECONNECT (SR521): the `Program::digest` streamed (0 for a pump made from text).
-    digest: u64, status_asked: bool, // VUGCOMSCANMARLINPOSITION (SR620): status_asked: a Marlin `M114` is out and its `ok` not yet read ([`Pump::status`])
+    digest: u64, status_asked: bool, autoreport: AutoAsk, // VUGCOMSCANMARLINPOSITION (SR620): status_asked: a Marlin `M114` is out and its `ok` not yet read ([`Pump::status`]); VUGCOMSCANMARLINAUTOREPORT (SR625): autoreport: the link-up M154's place
 }
 
 fn is_grbl(d: Dialect) -> bool {
@@ -205,7 +208,7 @@ impl Pump {
             last: None,
             status_every_us: STATUS_EVERY_US,
             timeout_us: TIMEOUT_US,
-            digest: 0, status_asked: false, // VUGCOMSCANMARLINPOSITION (SR620)
+            digest: 0, status_asked: false, autoreport: AutoAsk::Off, // VUGCOMSCANMARLINPOSITION (SR620); VUGCOMSCANMARLINAUTOREPORT (SR625)
         })
     }
 
@@ -448,7 +451,7 @@ impl Pump {
     pub fn tick(&mut self, t: &mut dyn Transport, now_us: u64) -> Vec<Event> {
         let mut ev = Vec::new();
         if !self.started {
-            self.started = true;
+            self.started = true; self.autoreport_due(); // VUGCOMSCANMARLINAUTOREPORT (SR625): the armed M154, once, ahead of the first line
             self.last_rx_us = now_us;
         }
         let mut buf = [0u8; 256];
@@ -630,7 +633,7 @@ impl Pump {
         self.tx.clear();
         self.rt_pending.clear();
         self.outstanding.clear();
-        self.rx.clear(); self.status_asked = false; // VUGCOMSCANMARLINPOSITION (SR620): a lost link answers no M114
+        self.rx.clear(); self.status_asked = false; self.autoreport_lost(); // VUGCOMSCANMARLINPOSITION (SR620): a lost link answers no M114; VUGCOMSCANMARLINAUTOREPORT (SR625): nor an M154
     }
 
     /// Resume after a loss: refused by name while lost (no byte); a re-armed pump starts streaming (no `~` byte).
@@ -941,6 +944,7 @@ impl Pump {
             ev.push(Event::Status(r));
             return true;
         }
+        if self.autoreport_line(s, ev) { return true; } // VUGCOMSCANMARLINAUTOREPORT (SR625): the M154's own answer, sent first, read first
         if s.starts_with("ok") && self.status_asked {
             self.status_asked = false;
             return true;
@@ -949,5 +953,69 @@ impl Pump {
             self.status_asked = false;
         }
         false
+    }
+}
+
+// --- VUGCOMSCANMARLINAUTOREPORT (LEDGER SR625): Marlin's position auto-report asked once at the link-up (named tail hunk) ---
+
+/// The period, in seconds, of the position auto-report the link-up asks Marlin for (`M154 S1`).
+pub const AUTOREPORT_S: u8 = 1;
+
+/// Where a pump's one `M154 S<n>` stands: not asked, armed for the first tick, out (and whether Marlin called it an
+/// unknown command), answered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AutoAsk {
+    Off,
+    Due(u8),
+    Out { unknown: bool },
+    Answered,
+}
+
+impl Pump {
+    /// Arm Marlin's position auto-report: the pump's first tick writes `M154 S<s>` on the realtime road, ahead of the first
+    /// job line (Marlin builds with AUTO_REPORT_POSITION then say `report_current_position_projected`'s line, the M114
+    /// shape, every `s` seconds, read by `marlin_status_line` as [`Event::Status`], `Run` during a job). Marlin only; `s`
+    /// 0 never asks; called before the first tick (a pump asks at most once). The answer is swallowed and said once as
+    /// [`Event::AutoReport`].
+    pub fn autoreport(&mut self, s: u8) {
+        if self.dialect == Dialect::Marlin && s > 0 && self.autoreport == AutoAsk::Off {
+            self.autoreport = AutoAsk::Due(s);
+        }
+    }
+
+    /// The first tick: an armed `M154 S<s>` onto `rt_pending` (flushed this tick before the window writes a line).
+    fn autoreport_due(&mut self) {
+        if let AutoAsk::Due(s) = self.autoreport {
+            self.rt_pending.extend_from_slice(alloc::format!("M154 S{s}\n").as_bytes());
+            self.autoreport = AutoAsk::Out { unknown: false };
+        }
+    }
+
+    /// One Marlin line while the M154 is out, ahead of the M114 `ok` arm (the M154 went out first, so its answer comes
+    /// first): `echo:Unknown command` naming M154 (a build without AUTO_REPORT_POSITION; Marlin still says `ok` after it)
+    /// is taken; the `ok` is taken and said as [`Event::AutoReport`]; `start` or a halt forget it silently and go on to
+    /// their own roads. `true`: the line was taken here.
+    fn autoreport_line(&mut self, s: &str, ev: &mut Vec<Event>) -> bool {
+        let AutoAsk::Out { unknown } = self.autoreport else { return false };
+        if s.starts_with("echo:Unknown command") && s.contains("M154") {
+            self.autoreport = AutoAsk::Out { unknown: true };
+            return true;
+        }
+        if s.starts_with("ok") {
+            self.autoreport = AutoAsk::Answered;
+            ev.push(Event::AutoReport { on: !unknown });
+            return true;
+        }
+        if s == "start" || marlin_halted(s) {
+            self.autoreport = AutoAsk::Answered;
+        }
+        false
+    }
+
+    /// A lost link answers no M154: an M154 out is forgotten, so a later home / jog line's `ok` is never swallowed.
+    fn autoreport_lost(&mut self) {
+        if matches!(self.autoreport, AutoAsk::Out { .. }) {
+            self.autoreport = AutoAsk::Answered;
+        }
     }
 }

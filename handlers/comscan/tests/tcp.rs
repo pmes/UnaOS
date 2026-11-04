@@ -969,12 +969,26 @@ fn a_marlin_jog_is_g91_g0_g90_in_order_and_home_is_g28() {
 /// `ok`) from the position its own jogs moved it to: a `G0` between `G91` and `G90` adds its X / Y / Z words, `G28` zeroes
 /// it. The program's absolute moves are not tracked (the fake stands at 0 through the job).
 fn fake_marlin_m114(l: TcpListener) -> JoinHandle<Vec<String>> {
+    fake_marlin_said(l, None) // VUGCOMSCANMARLINAUTOREPORT (SR625): the body below, no M154 answer of its own
+}
+
+/// VUGCOMSCANMARLINAUTOREPORT (SR625): how [`fake_marlin_said`] answers `M154 S<n>`: a build with AUTO_REPORT_POSITION
+/// (`ok`, then a position line after each absolute `G0` / `G1` move of the job) or without it (`echo:Unknown command`, `ok`).
+#[derive(Clone, Copy, PartialEq)]
+enum M154 {
+    On,
+    Unknown,
+}
+
+/// [`fake_marlin_m114`]'s body; `m154` `None` answers `M154` with a bare `ok` and reports nothing unasked (SR620's fake).
+fn fake_marlin_said(l: TcpListener, m154: Option<M154>) -> JoinHandle<Vec<String>> {
     thread::spawn(move || {
         let (mut s, _) = l.accept().unwrap();
         drop(l);
         s.write_all(b"start\r\n").unwrap();
         let (mut got, mut cur) = (Vec::new(), Vec::<u8>::new());
         let (mut at, mut rel) = ([0.0f64; 3], false);
+        let mut auto = false; // VUGCOMSCANMARLINAUTOREPORT (SR625): M154 answered on
         let mut buf = [0u8; 256];
         loop {
             let k = match s.read(&mut buf) {
@@ -1000,6 +1014,33 @@ fn fake_marlin_m114(l: TcpListener) -> JoinHandle<Vec<String>> {
                     "G91" => rel = true,
                     "G90" => rel = false,
                     "G28" => at = [0.0; 3],
+                    l if l.starts_with("M154") => match m154 { // VUGCOMSCANMARLINAUTOREPORT (SR625)
+                        Some(M154::On) => auto = true,
+                        Some(M154::Unknown) => {
+                            let _ = s.write_all(format!("echo:Unknown command: \"{l}\"\r\n").as_bytes());
+                        }
+                        None => {}
+                    },
+                    l if auto && !rel && (l.starts_with("G0 ") || l.starts_with("G1 ")) => {
+                        // VUGCOMSCANMARLINAUTOREPORT (SR625): the job's absolute move, then the unasked position line mid-job
+                        for w in l.split_whitespace().skip(1) {
+                            let slot = match w.chars().next() {
+                                Some('X') => 0,
+                                Some('Y') => 1,
+                                Some('Z') => 2,
+                                _ => continue,
+                            };
+                            if let Ok(v) = w[1..].parse::<f64>() {
+                                at[slot] = v;
+                            }
+                        }
+                        let steps = |v: f64| (v * 80.0).round() as i64;
+                        let said = format!(
+                            "X:{:.2} Y:{:.2} Z:{:.2} E:0.00 Count X:{} Y:{} Z:{}\r\n",
+                            at[0], at[1], at[2], steps(at[0]), steps(at[1]), steps(at[2])
+                        );
+                        let _ = s.write_all(said.as_bytes());
+                    }
                     l if rel && l.starts_with("G0 ") => {
                         for w in l.split_whitespace().skip(1) {
                             let slot = match w.chars().next() {
@@ -1115,4 +1156,98 @@ fn a_marlin_with_no_position_answer_keeps_the_distance_bound_and_says_it_once() 
     let got: Vec<String> = got.into_iter().filter(|l| l != "M114").collect();
     let jogs = ["G91", "G0 X300 Y0 Z0 F300", "G90", "G91", "G0 X300 Y0 Z0 F300", "G90"];
     assert_eq!(got[got.len() - jogs.len()..].to_vec(), jogs.map(String::from).to_vec(), "{got:?}");
+}
+
+// --- VUGCOMSCANMARLINAUTOREPORT (SR625): Marlin's M154 asked at the link-up; the position moves during the job; the jog after it bounded by the reported end ---
+
+/// A hello-on desk for `m` started on a Marlin at `port` over TCP for [`program`], driven to `done`: every Squawk word into
+/// `words`, and every status a `streaming` Squawk carried, in order.
+fn marlin_done_hello(m: Machine, port: u16) -> (PumpDesk, Box<Opener>, Instant, Vec<String>, Vec<String>) {
+    let p = program();
+    let mut desk = PumpDesk::new(m.clone());
+    desk.hello_within(Duration::from_millis(200)); // the link-up talk (M115, M211, M154) rides the hello
+    let mut open = by_scheme(no_serial(), opener(Duration::from_millis(500)));
+    let pass = Verdict::Pass { digest: p.digest(), machine: m.digest() };
+    let digest = desk.arm(&pass, &p, Dialect::Marlin).expect("armed by a pass");
+    let start = PumpEvent::PumpStart {
+        principal: Origin::LocalUser("una".to_string()),
+        program: digest_hex(digest),
+        dialect: "marlin".to_string(),
+        port: format!("{TCP_SCHEME}127.0.0.1:{port}"),
+    };
+    let first = squawk_words(&desk.apply(&start, &mut *open));
+    assert_eq!(first.first().map(String::as_str), Some("started"), "{first:?}");
+    let t0 = Instant::now();
+    let (mut words, mut moving) = (Vec::new(), Vec::new());
+    let end = Instant::now() + Duration::from_secs(10);
+    while !words.iter().any(|w| w == "done") {
+        assert!(Instant::now() < end, "no done in 10 s; saw {words:?}");
+        for s in desk.tick(t0.elapsed().as_micros() as u64) {
+            if let PumpEvent::Squawk { state, status, event, .. } = s {
+                if let (true, Some(st)) = (state == "streaming", status) {
+                    if moving.last() != Some(&st) {
+                        moving.push(st);
+                    }
+                }
+                words.extend(event);
+            }
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+    (desk, open, t0, words, moving)
+}
+
+#[test]
+fn a_marlin_autoreport_moves_the_position_during_the_job_and_bounds_the_jog_after() {
+    let mut m = machine();
+    m.axes[0] = axis(AxisId::X, 0.0, 200.0); // the declared X travel 200
+    let (l, port) = listener();
+    let fake = fake_marlin_said(l, Some(M154::On));
+    let (mut desk, mut open, t0, mut words, moving) = marlin_done_hello(m, port);
+    assert_eq!(words.iter().filter(|w| w.starts_with("autoreport=")).collect::<Vec<_>>(), ["autoreport=on"], "said once: {words:?}");
+    assert!(!words.iter().any(|w| w.starts_with("refused") || w.starts_with("error")), "{words:?}");
+    // The card's status moved while the job streamed: the unasked lines read as Run, never Idle.
+    let run: Vec<&String> = moving.iter().filter(|s| s.starts_with("<Run|MPos:")).collect();
+    assert!(run.len() >= 2, "the position moves during the job: {moving:?}");
+    assert!(!moving.iter().any(|s| s.starts_with("<Idle")), "a report mid-job is Run: {moving:?}");
+
+    // After the job the latest report is the program's last move; the jog's END is bounded from it.
+    settle_at(&mut desk, t0, [19.0, 38.0, -1.0]);
+    let who = || Origin::LocalUser("una".to_string());
+    let jog = |dx: f64| PumpEvent::PumpJog { principal: who(), dx, dy: 0.0, dz: 0.0, feed: 300.0 };
+    assert_eq!(refused_why(&desk.apply(&jog(190.0), &mut *open)), "jog: X190 from 19 ends past the declared X travel 200");
+    assert_eq!(squawk_words(&desk.apply(&jog(150.0), &mut *open)), ["jog sent: G91 / G0 X150 Y0 Z0 F300 / G90"]);
+    assert_eq!(word_of(drive_until(&mut desk, &mut *open, t0, &mut words, |e| e.starts_with("jog"))), "jog ok");
+    assert!(!words.iter().any(|w| w.starts_with("jog bound")), "{words:?}");
+    drop(desk);
+    let got = fake.join().unwrap();
+    assert_eq!(got.iter().filter(|l| l.starts_with("M154")).collect::<Vec<_>>(), ["M154 S1"], "asked once: {got:?}");
+    let program_lines = Pump::from_program(&program(), Dialect::Marlin).unwrap().lines().to_vec();
+    let at = |want: &str| got.iter().position(|l| l == want).unwrap_or_else(|| panic!("{want} missing: {got:?}"));
+    assert!(at("M154 S1") < at(&program_lines[0]), "the M154 rides ahead of the first job line: {got:?}");
+}
+
+#[test]
+fn a_marlin_without_autoreport_says_unsupported_once_and_keeps_the_m114_road() {
+    let mut m = machine();
+    m.axes[0] = axis(AxisId::X, 0.0, 200.0);
+    let (l, port) = listener();
+    let fake = fake_marlin_said(l, Some(M154::Unknown));
+    let (mut desk, mut open, t0, mut words, _) = marlin_done_hello(m, port);
+    assert_eq!(words.iter().filter(|w| w.starts_with("autoreport=")).collect::<Vec<_>>(), ["autoreport=unsupported"], "said once: {words:?}");
+    assert!(!words.iter().any(|w| w.starts_with("refused") || w.starts_with("error")), "the echo and its ok answered no job line: {words:?}");
+
+    // SR620's road is unchanged: M114 after the job, the jog's end bounded from it.
+    settle_at(&mut desk, t0, [0.0, 0.0, 0.0]);
+    let who = || Origin::LocalUser("una".to_string());
+    let jog = |dx: f64| PumpEvent::PumpJog { principal: who(), dx, dy: 0.0, dz: 0.0, feed: 300.0 };
+    assert_eq!(squawk_words(&desk.apply(&jog(150.0), &mut *open)), ["jog sent: G91 / G0 X150 Y0 Z0 F300 / G90"]);
+    assert_eq!(word_of(drive_until(&mut desk, &mut *open, t0, &mut words, |e| e.starts_with("jog"))), "jog ok");
+    settle_at(&mut desk, t0, [150.0, 0.0, 0.0]);
+    assert_eq!(refused_why(&desk.apply(&jog(150.0), &mut *open)), "jog: X150 from 150 ends past the declared X travel 200");
+    assert_eq!(words.iter().filter(|w| w.starts_with("autoreport=")).count(), 1, "once per link: {words:?}");
+    drop(desk);
+    let got = fake.join().unwrap();
+    let program_lines = Pump::from_program(&program(), Dialect::Marlin).unwrap().lines().to_vec();
+    assert!(program_lines.iter().all(|l| got.contains(l)), "every job line reached the controller: {got:?}");
 }
