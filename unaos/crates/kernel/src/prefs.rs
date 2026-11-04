@@ -2232,7 +2232,7 @@ fn prefscap_path(owner: u64, c: prefs_core::cap::Caller<'_>) -> (prefs_core::cap
     match c {
         prefs_core::cap::Caller::Program(p) if p.eq_ignore_ascii_case(prefs_core::cap::PRINCIPIA) => {
             let principia = crate::bus_route::tag_image(una_abi::BUS_VERB_R3PREF_SET)
-                .and_then(|img| crate::video::wm::app_path_with(owner, |path| crate::bus_route::path_names(path, img)))
+                .and_then(|img| crate::video::wm::app_path_with(owner, |path| crate::bus_route::path_names(path, img)).or_else(|| prefscap_early(owner, img))) // PREFSCAP-ARM-EARLY (rmbp-ledger B1176): no late path -> wm's early record at the caller row's current generation, B1164's two-source rule as `tagpath_id` (file tail). LINE-NEUTRAL fold, code first
                 == Some(true);
             if principia {
                 (c, false)
@@ -2279,7 +2279,8 @@ fn prefscap_set_note(verb: u8, body: &[u8], demoted: bool, st: i64) -> i64 {
 /// ring-3 rows only, no declare: pure cap checks, nothing written); `/apps/PREFS.ELF` and `/apps/prefs.elf` keep
 /// Principia, `/APPS/PREFS.ELF` and a pathless `PREFS.ELF` are demoted, a non-prefs name is never touched. The
 /// scratch name and path are forgotten.
-/// `:: PREFSCAP-PATH: foreign=refused anon=held apps=admitted case=admitted upper=demoted pathless=demoted other=kept restored=1 -> PASS ::`.
+/// `:: PREFSCAP-PATH: foreign=refused anon=held apps=admitted case=admitted upper=demoted pathless=demoted early=admitted stale=demoted other=kept restored=1 -> PASS ::`
+/// (`early=` / `stale=`: PREFSCAP-ARM-EARLY B1176, [`prefscap_early_legs`]).
 #[cfg(feature = "witness")]
 fn prefscap_path_selftest() {
     #[cfg(all(feature = "busreg", any(feature = "aarch64_el0", target_arch = "x86_64")))]
@@ -2328,14 +2329,16 @@ fn prefscap_path_legs() {
     let upper = demoted("/APPS/PREFS.ELF") == Some(true);
     // L4: a relative arm clears the path row: the spelling alone never promotes.
     let pathless = demoted("PREFS.ELF") == Some(true);
+    let (early, stale, early_gone) = prefscap_early_legs(OWNER, &demoted); // PREFSCAP-ARM-EARLY (rmbp-ledger B1176): the early record admits a pathless PREFS.ELF at the current generation only (file tail)
     let other = demoted("/home/una/LUMEN.ELF") == Some(false);
     crate::video::wm::app_name_forget(OWNER);
-    let restored = !crate::video::wm::app_name_armed(OWNER) && crate::video::wm::app_path_with(OWNER, |_| true).is_none();
-    let ok = foreign && anon && apps && case && upper && pathless && other && restored;
+    let restored = early_gone && !crate::video::wm::app_name_armed(OWNER) && crate::video::wm::app_path_with(OWNER, |_| true).is_none();
+    let ok = foreign && anon && apps && case && upper && pathless && early && stale && other && restored;
     serial_println!(
-        ":: PREFSCAP-PATH: foreign={} anon={} apps={} case={} upper={} pathless={} other={} restored={} -> {} ::",
+        ":: PREFSCAP-PATH: foreign={} anon={} apps={} case={} upper={} pathless={} early={} stale={} other={} restored={} -> {} ::",
         if foreign { "refused" } else { "ADMITTED" }, if anon { "held" } else { "FAIL" }, if apps { "admitted" } else { "DEMOTED" },
         if case { "admitted" } else { "DEMOTED" }, if upper { "demoted" } else { "ADMITTED" }, if pathless { "demoted" } else { "ADMITTED" },
+        if early { "admitted" } else { "DEMOTED" }, if stale { "demoted" } else { "ADMITTED" },
         if other { "kept" } else { "DEMOTED" }, restored as u8, if ok { "PASS" } else { "FAIL" }
     );
 }
@@ -2414,4 +2417,49 @@ fn machine_unset_leg(owner: u64) {
         ":: MACHINE-KEY-UNSET: set={} unset={} posted={} mirror={} restored={} -> {} ::",
         set as u8, st, if posted { "unset" } else { "VALUE" }, mirror, restored as u8, if ok { "PASS" } else { "FAIL" }
     );
+}
+
+// =================================================================================================
+// PREFSCAP-ARM-EARLY (rmbp-ledger B1176) — TAIL-APPENDED, `busreg` only (knob-off: no symbol, no byte). B1170's
+// [`prefscap_path`] read only the LATE path (`wm::app_path_with`), so the real PREFS.ELF was demoted while it had a
+// name and no path: `wm::app_name_arm_launch` arms the name through `app_name_arm` (which clears the path, the name
+// being bare) and arms the path after it, and a relative late arm leaves that state for good. B1164 keeps the EARLY
+// record (`wm::app_path_early_of`: the arch spawn body's absolute argv[0] or SYS_SPAWN_PATH's kernel-opened path,
+// stamped with the row's bus generation at the mint). The verdict now reads the late path OR ELSE the early record at
+// the caller row's CURRENT generation: B1164's two-source rule, `bus_route::tagpath_id`'s order (a late path decides,
+// foreign stays foreign), so the cap verdict is the fulfiller verdict. The row is the owner's through
+// `wm::owner_of_launch`'s own offset (x86 slot + 1, aarch64 the asid), never an arch cfg here. Locks: wm's two leaves,
+// one at a time (`app_path_with`'s guard is gone before `or_else` runs); `rgen` is an atomic load.
+// Witness: `tests prefs` → `:: PREFSCAP-PATH: … pathless=demoted early=admitted stale=demoted … -> PASS ::`.
+// =================================================================================================
+
+/// PREFSCAP-ARM-EARLY — the bus generation of wm `owner`'s row now (`owner_of_launch(row) == owner`); `None` = an
+/// owner below every row's (x86 owner 0).
+#[cfg(all(feature = "busreg", any(feature = "aarch64_el0", target_arch = "x86_64")))]
+fn prefscap_gen(owner: u64) -> Option<u64> {
+    let row = owner.checked_sub(crate::video::wm::owner_of_launch(0))?;
+    Some((crate::arch::syscall::busreg_ops().rgen)(row as usize))
+}
+
+/// PREFSCAP-ARM-EARLY — is `owner`'s early path, at its row's current generation, the image `img`? `None` = no
+/// absolute early record at that generation (the verdict stays demoted). Takes only wm's leaf `APP_NAMES_EARLY`.
+#[cfg(all(feature = "busreg", any(feature = "aarch64_el0", target_arch = "x86_64")))]
+fn prefscap_early(owner: u64, img: &str) -> Option<bool> {
+    crate::video::wm::app_path_early_of(owner, prefscap_gen(owner)?, |p| crate::bus_route::path_names(p, img))
+}
+
+/// `prefscap_path_legs`' early legs on the scratch `owner` (name relative, so no late path): `/apps/PREFS.ELF`
+/// early-armed at [`prefscap_gen`] is admitted; the same record at the next generation (a dead tenant's) is demoted;
+/// the record is then forgotten. `(early, stale, gone)`.
+#[cfg(all(feature = "witness", feature = "busreg", any(feature = "aarch64_el0", target_arch = "x86_64")))]
+fn prefscap_early_legs(owner: u64, demoted: &dyn Fn(&str) -> Option<bool>) -> (bool, bool, bool) {
+    let Some(g) = prefscap_gen(owner) else { return (false, false, false) };
+    let _ = crate::video::wm::app_name_arm_early(owner, g, "/apps/PREFS.ELF");
+    let early = demoted("PREFS.ELF") == Some(false);
+    let _ = crate::video::wm::app_name_arm_early(owner, g.wrapping_add(1), "/apps/PREFS.ELF");
+    let stale = demoted("PREFS.ELF") == Some(true);
+    crate::video::wm::app_name_early_forget(owner);
+    let gone = crate::video::wm::app_path_early_of(owner, g, |_| true).is_none()
+        && crate::video::wm::app_path_early_of(owner, g.wrapping_add(1), |_| true).is_none();
+    (early, stale, gone)
 }
