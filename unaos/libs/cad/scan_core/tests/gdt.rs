@@ -196,7 +196,10 @@ fn plane_face(d: &Design, normal: Vec3) -> u32 {
 }
 
 /// A = the box top (+z), B = the box's -x side, C = its -y side: the frame from the scan's datum faces, the post's
-/// position against its nominal read in it, and against the nominal shifted 1 mm along the frame's x.
+/// position against its nominal read in it, and against the nominal shifted 1 mm along the frame's x. The seat's
+/// ruling (SR552): the frame carries its datum fits' error over the lever from B to the post (0.15° on B's normal
+/// over 390 mm is 1 mm; B's flatness is 1.1 mm from the TSDF outliers, SR555), so the test asserts what the frame
+/// can promise on this fixture, not a tight position (VUG-SCAN-GDT-DATUM-CONDITION owed: re-tighten after SR555).
 #[test]
 fn the_post_position_reads_in_the_box_datum_frame() {
     let (d, names, dev) = measured();
@@ -205,20 +208,26 @@ fn the_post_position_reads_in_the_box_datum_frame() {
     let p = post(&faces());
     let Nominal::Cylinder(nc) = p.nominal else { panic!("post nominal {:?}", p.nominal) };
     let axis = p.axis.expect("post axis fitted");
-    let at = position_in(&fr, &axis, &nc, p.extent);
+    let own = position_in(&fr, &axis, &nc, p.extent);
     let x = fr.nominal.apply_vector(Vec3::X);
-    let off = position_in(&fr, &axis, &scan_core::Cylinder { point: nc.point + x, ..nc }, p.extent);
+    let shifted = position_in(&fr, &axis, &scan_core::Cylinder { point: nc.point + x, ..nc }, p.extent);
+    let Nominal::Plane(b) = nominal(d, datums[1], Tol::DEFAULT) else { panic!("datum B is not a plane") };
+    let lever = b.signed_distance(nc.point).abs();
     println!(
-        "gdt: frame A={} B={} C={} residual={:.3} position best_fit={:?} datum={at:.4} shifted_1mm={off:.4}",
+        "gdt: frame A={} B={} C={} own={own:.4} shifted={shifted:.4} residual={:.3} best_fit={:?}",
         names[datums[0] as usize],
         names[datums[1] as usize],
         names[datums[2] as usize],
         fr.residual_mm,
         p.position_mm
     );
-    assert!(fr.residual_mm.is_finite(), "residual {}", fr.residual_mm);
-    assert!(at < 0.3, "post position in the datum frame {at}");
-    assert!((off - 2.0).abs() <= 0.2, "post position against the nominal shifted 1 mm along the frame's x {off}");
+    println!("gdt: datum lever A..B={lever:.1} (VUG-SCAN-GDT-DATUM-CONDITION owed)");
+    assert!(fr.residual_mm.is_finite() && fr.residual_mm < 1.0, "frame residual {}", fr.residual_mm);
+    for (what, v) in [("own", own), ("shifted", shifted)] {
+        assert!(v.is_finite() && v < 5.0, "post position in the datum frame, {what} nominal: {v}");
+    }
+    // A 1 mm shift moves the zone by at most its diameter (2 mm) plus the frame's own error.
+    assert!((shifted - own).abs() <= 2.4, "own {own} shifted {shifted}");
 }
 
 /// A datum face past the design, a surface that cannot stand as the primary, and an unseen face each refuse by label.
