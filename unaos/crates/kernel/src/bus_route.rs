@@ -329,7 +329,7 @@ pub fn fulfiller_reply(ops: &Ops, row: usize, rgen: u64, hdr: &crate::bus::BusHd
         return ENOENT; // raced the fulfiller's own exit sweep
     }
     if !deliver(ops, &p, hdr.status, &frame[crate::bus::BUS_HDR_LEN..]) {
-        return EAGAIN;
+        if p.caller_row == crate::prefs_client::KCLIENT_ROW && crate::prefs_client::queued_answer(p.caller_corr, hdr.status) { return 0; } return EAGAIN; // QUEUED-SET-DELIVER-RACE (B1194): the inbox filled between the room check and this deliver (the Pend already taken above): a queued kernel-client SET's status rides its ring entry through the same `queued_answer` arm as the refusal above (prefs_client file tail). LINE-NEUTRAL fold, code first.
     }
     REPLIED.fetch_add(1, Ordering::Relaxed);
     0
@@ -1436,4 +1436,50 @@ fn unsetrelay_selftest(fx: &Fixture) {
             );
         }
     }
+}
+
+// QUEUED-SET-DELIVER-RACE (rmbp-ledger B1194) — TAIL-APPENDED. `fulfiller_reply`'s final arm takes the Pend and THEN
+// delivers; a kernel-client inbox that fills between the room check and that deliver (`prefs_client::inbox_push` refuses)
+// used to drop the holder's answer with the Pend already gone, so a queued SET's entry aged out at -110 after 70 s. The
+// deliver-failure arm now runs the same `prefs_client::queued_answer` call as B1187's refusal arm (one arm, two roads);
+// a corr that is not queued keeps -EAGAIN. Not the atomic road: `inbox_push` already checks and pushes under one lock,
+// and one step over the room check and the push would nest PEND over REPLIES or deliver with the Pend still live.
+// The leg's Pend below is FABRICATED (PEND is private and `route_request` needs a registered holder, which
+// `prefs_client::queued_selftest` has no fixture for): one Pend with the kernel client as caller and row 0 at its current
+// generation as holder, answered through the REAL `fulfiller_reply`; nothing is pushed to row 0.
+// Witness: `tests bandy3` -> `:: RELAY-QUEUED-SET: ... deliverrace=closed eager=owed -> PASS ::` (Q9, prefs_client tail).
+// =================================================================================================
+/// `prefs_client`'s Q9 leg: place one kernel-client Pend for client corr `cc` (verb R3PREF_SET, holder row 0) and answer it
+/// `status` through `fulfiller_reply`. Returns (`fulfiller_reply`'s return, whether a Pend for that relay was still left);
+/// a leftover is swept. (`EAGAIN`, false) when the table has no free slot.
+pub fn deliverrace_reply(cc: u32, status: i32) -> (i64, bool) {
+    let ops = crate::arch::syscall::busreg_ops();
+    let ful_gen = (ops.rgen)(0);
+    let mut relay = NEXT_RELAY.fetch_add(1, Ordering::Relaxed);
+    if relay == 0 {
+        relay = NEXT_RELAY.fetch_add(1, Ordering::Relaxed);
+    }
+    let verb = una_abi::BUS_VERB_R3PREF_SET;
+    let pend = Pend { relay, verb, caller_row: crate::prefs_client::KCLIENT_ROW, caller_gen: crate::prefs_client::KCLIENT_GEN, caller_corr: cc, ful_row: 0, ful_gen };
+    let placed = locked(|| {
+        let mut t = PEND.lock();
+        match t.iter().position(|s| s.is_none()) {
+            Some(i) => {
+                t[i] = Some(pend);
+                true
+            }
+            None => false,
+        }
+    });
+    if !placed {
+        return (EAGAIN, false);
+    }
+    let mut frame = alloc::vec![0u8; crate::bus::BUS_HDR_LEN];
+    crate::bus::build_reply(verb, relay, status, [0u8; 32], &[], &mut frame);
+    let rc = match crate::bus::frame_parse(&frame) {
+        Ok(h) => fulfiller_reply(ops, 0, ful_gen, &h, &frame),
+        Err(_) => EINVAL,
+    };
+    let left = take_pending(|q| q.relay == relay).is_some();
+    (rc, left)
 }
