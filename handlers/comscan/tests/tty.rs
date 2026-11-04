@@ -510,6 +510,10 @@ const VER_A: &str = "1.1h.20190825:mill-a";
 
 /// grbl 1.1's `$I` answer for build `ver`, written when `line` is `$I`; true when it was.
 fn said_hello(s: &mut impl Write, line: &str, ver: &str) -> bool {
+    if line == "$$" {
+        let _ = s.write_all(ENVELOPE_ANSWER); // VUGCOMSCANALARMIDLE (SR591): heard only when the desk's travel read is on
+        return true;
+    }
     if line != "$I" {
         return false;
     }
@@ -987,4 +991,154 @@ fn a_jog_past_the_declared_travel_is_refused_with_nothing_on_the_wire() {
     let (lines, _rt, _m) = fake.join().unwrap();
     assert_eq!(lines.last().map(String::as_str), Some("$H"), "{lines:?}");
     assert!(!lines.iter().any(|l| l.starts_with("$J=")), "the refused jog never reached the wire: {lines:?}");
+}
+
+// --- VUGCOMSCANALARMIDLE (SR591): an alarm with no job live halts the pump, so Stop resets and unlocks; Marlin's halt and M999 S1; the controller's travel read once ---
+
+/// grbl 1.1's `$$` answer, cut to one ordinary setting and the travel: X 200 (the declared machine says 350), Y 350, Z 110.
+const ENVELOPE_ANSWER: &[u8] = b"$0=10\r\n$130=200.000\r\n$131=350.000\r\n$132=110.000\r\nok\r\n";
+
+/// Marlin's `stop()` line (STR_ERR_STOPPED).
+const MARLIN_STOPPED: &[u8] =
+    b"Error:Printer stopped due to errors. Fix the error and use M999 to restart. (Temperature is reset. Set it after restarting)\r\n";
+
+#[test]
+fn an_alarm_during_a_jog_then_stop_resets_and_unlocks() {
+    let (m, path, _s) = pty();
+    let n = Pump::from_program(&program(), GRBL).unwrap().lines().len();
+    // The fake's ALARM:1 answers its line `n`: the first line after the program, the jog (a hard limit hit while jogging).
+    let fake = fake_grbl_locked(m, n);
+    let (mut desk, mut open) = started_desk(&path);
+    let t0 = Instant::now();
+    let mut words = Vec::new();
+    assert_eq!(drive_until(&mut desk, &mut *open, t0, &mut words, |e| e == "done"), "done");
+
+    let who = || Origin::LocalUser("una".to_string());
+    let jog = PumpEvent::PumpJog { principal: who(), dx: 2.0, dy: 0.0, dz: 0.0, feed: 300.0 };
+    assert!(said_in(&desk.apply(&jog, &mut *open)).starts_with("jog sent: $J=G91 X2"));
+    assert_eq!(drive_until(&mut desk, &mut *open, t0, &mut words, |e| e.starts_with("alarm")), "alarm:1 Hard limit");
+    assert_eq!(desk.state(), Some(PumpState::Halted(pump_core::Halt::Alarm { code: 1 })), "a Done pump halts on the alarm");
+
+    // Stop is the reset (the alarm is grbl's lock), not the jog cancel the jog alone would take.
+    assert_eq!(said_in(&desk.apply(&PumpEvent::PumpStop { principal: who() }, &mut *open)), "reset sent");
+    assert_eq!(desk.state(), Some(PumpState::Stopped));
+    assert_eq!(drive_until(&mut desk, &mut *open, t0, &mut words, |e| e == "unlocked"), "unlocked", "{words:?}");
+    assert!(words.iter().any(|w| w == "unlock sent: $X"), "{words:?}");
+    drop(desk);
+    drop(open);
+    let (lines, rt, unlocked, _m) = fake.join().unwrap();
+    assert_eq!(lines.last().map(String::as_str), Some("$X"), "{lines:?}");
+    assert_eq!(rt.iter().filter(|&&b| b == 0x18).count(), 2, "the open's reset and the Stop's: {rt:?}");
+    assert!(!rt.contains(&0x85), "no jog cancel: the alarm already stopped the jog: {rt:?}");
+    assert!(!rt.contains(&b'!'), "no feed hold on an alarm halt: {rt:?}");
+    assert!(unlocked, "the controller is unlocked after the `$X`");
+}
+
+/// A fake Marlin, silent at the open (the opener's Marlin wait passes): `ok` per line until the stream line `halt_at`
+/// (0-based), answered [`MARLIN_STOPPED`] and no `ok`; `M999 S1` answered `ok`. Returns every line once `M999 S1` arrived.
+fn fake_marlin_halted(mut m: File, halt_at: usize) -> JoinHandle<(Vec<String>, File)> {
+    thread::spawn(move || {
+        let (mut got, mut cur, mut stream) = (Vec::<String>::new(), Vec::<u8>::new(), 0usize);
+        let mut buf = [0u8; 256];
+        while got.last().map(String::as_str) != Some("M999 S1") {
+            let n = match m.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            for &b in &buf[..n] {
+                if b != b'\n' {
+                    cur.push(b);
+                    continue;
+                }
+                let line = String::from_utf8_lossy(&cur).trim().to_string();
+                cur.clear();
+                got.push(line.clone());
+                if line == "M999 S1" {
+                    m.write_all(b"ok\r\n").unwrap();
+                } else if stream == halt_at {
+                    stream = usize::MAX;
+                    m.write_all(MARLIN_STOPPED).unwrap();
+                } else if stream < halt_at {
+                    stream += 1;
+                    m.write_all(b"ok\r\n").unwrap();
+                }
+            }
+        }
+        (got, m)
+    })
+}
+
+#[test]
+fn a_marlin_halt_then_stop_sends_m999() {
+    let (m, path, _s) = pty();
+    let p = program();
+    let want = Pump::from_program(&p, MARLIN).unwrap().lines().to_vec();
+    let mut desk = PumpDesk::new(machine());
+    let pass = Verdict::Pass { digest: p.digest(), machine: machine().digest() };
+    let digest = desk.arm(&pass, &p, MARLIN).expect("armed by a pass");
+    let mut open = opener(Baud::B115200, Flow::None);
+    let fake = fake_marlin_halted(m, 2);
+    let who = || Origin::LocalUser("una".to_string());
+    let start = PumpEvent::PumpStart {
+        principal: who(),
+        program: digest_hex(digest),
+        dialect: "marlin".to_string(),
+        port: path.to_str().unwrap().to_string(),
+    };
+    assert_eq!(said_in(&desk.apply(&start, &mut *open)), "started");
+    let t0 = Instant::now();
+    let mut words = Vec::new();
+    assert_eq!(drive_until(&mut desk, &mut *open, t0, &mut words, |e| e.starts_with("alarm")), "alarm:0 printer halted");
+    assert_eq!(desk.state(), Some(PumpState::Halted(pump_core::Halt::Alarm { code: 0 })));
+
+    // Marlin has no soft reset: Stop sends the unlock at once.
+    assert_eq!(said_in(&desk.apply(&PumpEvent::PumpStop { principal: who() }, &mut *open)), "unlock sent: M999 S1");
+    assert_eq!(desk.state(), Some(PumpState::Stopped));
+    assert_eq!(drive_until(&mut desk, &mut *open, t0, &mut words, |e| e == "unlocked"), "unlocked", "{words:?}");
+    drop(desk);
+    drop(open);
+    let (lines, _m) = fake.join().unwrap();
+    let mut expect = want[..3].to_vec();
+    expect.push("M999 S1".to_string());
+    assert_eq!(lines, expect, "two lines run, the third halted, then the unlock; no reset byte rides any line");
+}
+
+#[test]
+fn a_differing_envelope_is_said_once_at_the_start() {
+    let (m, path, _s) = pty();
+    let p = program();
+    let want = Pump::from_program(&p, GRBL).unwrap().lines().to_vec();
+    let mut desk = PumpDesk::new(machine());
+    desk.envelope_read(true);
+    let pass = Verdict::Pass { digest: p.digest(), machine: machine().digest() };
+    let digest = desk.arm(&pass, &p, GRBL).expect("armed by a pass");
+    let mut open = opener(Baud::B115200, Flow::None);
+    let fake = fake_grbl_as(m, true, want.len(), VER_A);
+    let start = PumpEvent::PumpStart {
+        principal: Origin::LocalUser("una".to_string()),
+        program: digest_hex(digest),
+        dialect: "grbl".to_string(),
+        port: path.to_str().unwrap().to_string(),
+    };
+    let out = desk.apply(&start, &mut *open);
+    let words: Vec<String> =
+        out.iter().filter_map(|s| match s { PumpEvent::Squawk { event: Some(e), .. } => Some(e.clone()), _ => None }).collect();
+    // The declared X travel is 350 (-50..300), the controller's $130 200; Y and Z agree.
+    assert_eq!(words, vec!["started".to_string(), "envelope differs axis=X declared=350 controller=200".to_string()], "{out:?}");
+
+    let t0 = Instant::now();
+    let mut done = false;
+    while !done && t0.elapsed() < Duration::from_secs(10) {
+        for s in desk.tick(t0.elapsed().as_micros() as u64) {
+            if let PumpEvent::Squawk { event: Some(e), .. } = &s {
+                assert!(!e.starts_with("envelope") && !e.starts_with("link lost"), "{e}");
+                done |= e == "done";
+            }
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+    assert!(done, "the run reached done: the `$$` answer's `ok` was not taken as a program line's");
+    drop(desk);
+    let (lines, _m) = fake.join().unwrap();
+    assert_eq!(lines, want, "the `$$` is no program line");
 }

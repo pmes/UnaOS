@@ -15,7 +15,9 @@
 //!   resumes sending (the remainder would start from the wrong place);
 //! - STOP is a feed hold, then a soft reset once a status report shows the hold complete (`Hold:0`) or `Idle`: grbl's
 //!   alarm 3 "Abort during cycle" is a reset during motion, which loses the position; a run halted by an alarm is the
-//!   soft reset at once (the controller reports `Alarm`, never `Idle`, and hears nothing else; VUGCOMSCANALARMRESET SR585).
+//!   soft reset at once (the controller reports `Alarm`, never `Idle`, and hears nothing else; VUGCOMSCANALARMRESET SR585);
+//! - an alarm (grbl `ALARM:N`, Marlin's halt) halts the pump in every state the link reaches, a job or not (a hard limit
+//!   during a jog after the run), so Stop is the reset and the unlock (VUGCOMSCANALARMIDLE SR591).
 
 use alloc::{collections::VecDeque, string::String, vec::Vec};
 
@@ -326,7 +328,7 @@ impl Pump {
         if matches!(self.state, PumpState::Stopped | PumpState::Done) {
             return Ok(());
         }
-        if matches!(self.state, PumpState::Halted(Halt::Alarm { .. })) { return self.reset(t); } // VUGCOMSCANALARMRESET (SR585): an alarm reports `Alarm`, never Idle / Hold:0, and grbl hears only the soft reset
+        if matches!(self.state, PumpState::Halted(Halt::Alarm { .. })) && is_grbl(self.dialect) { return self.reset(t); } // VUGCOMSCANALARMRESET (SR585): an alarm reports `Alarm`, never Idle / Hold:0, and grbl hears only the soft reset; VUGCOMSCANALARMIDLE (SR591): grbl only, a Marlin alarm halt takes the Marlin arm below (no reset byte)
         if matches!(self.state, PumpState::LinkLost { .. } | PumpState::Rearmed { .. }) {
             self.state = PumpState::Stopped;
             return Ok(());
@@ -342,7 +344,7 @@ impl Pump {
 
     fn halt(&mut self, h: Halt, t: &mut dyn Transport) {
         let live = matches!(self.state, PumpState::Streaming | PumpState::Stopping); // VUGCOMSCANJOGALARM (SR579): the error feed hold's reason (buffered lines running without the skipped one) exists only on a live stream
-        if live {
+        if live || matches!(h, Halt::Alarm { .. }) { // VUGCOMSCANALARMIDLE (SR591): an alarm halts in every state the link reaches (Done, Stopped, Halted, relinked, Rearmed)
             self.state = PumpState::Halted(h);
         }
         self.tx.clear();
@@ -393,9 +395,7 @@ impl Pump {
                 self.halt(Halt::Error { line, code }, t);
             } else if let Some(n) = s.strip_prefix("ALARM:") {
                 let code = n.trim().parse::<u16>().unwrap_or(0);
-                ev.push(Event::Alarm { code, name: alarm_name(code) });
-                self.outstanding.clear(); // VUGCOMSCANJOGALARM (SR579): grbl flushes its receive buffer at every alarm, so no line of the window is answered after it
-                self.halt(Halt::Alarm { code }, t);
+                self.alarmed(code, alarm_name(code), t, ev); // VUGCOMSCANALARMIDLE (SR591): the one alarm road (grbl ALARM:N, Marlin's halt)
             } else if s.starts_with('<') {
                 match parse_status(s) {
                     Ok(r) => {
@@ -429,6 +429,8 @@ impl Pump {
             let line = n.trim().parse::<usize>().unwrap_or(0);
             ev.push(Event::ResendAsked { line });
             self.halt(Halt::Resend { line }, t);
+        } else if marlin_halted(s) {
+            self.alarmed(0, MARLIN_HALTED, t, ev); // VUGCOMSCANALARMIDLE (SR591): Marlin's kill() / stop() is its alarm
         } else if s.starts_with("Error:") {
             let line = self.front_line();
             ev.push(Event::Refused { line, text: String::from(s) });
@@ -782,10 +784,60 @@ pub fn banner_key(d: Dialect) -> Option<&'static str> {
 }
 
 /// The line that clears a controller's alarm lock after the soft reset: grbl 1.1 `$X` (the kill-alarm-lock, answered
-/// `[MSG:Caution: Unlocked]` and `ok`); Marlin halts by kill() with no ALARM line here and LinuxCNC is not streamed: `None`.
+/// `[MSG:Caution: Unlocked]` and `ok`); VUGCOMSCANALARMIDLE (SR591): Marlin `M999 S1` (clears `stop()`'s "use M999 to
+/// restart" with no reboot; `S1` resumes without the flush whose `Resend:` the pump would read as a resend ask; a kill()
+/// needs a hardware reset); LinuxCNC is not streamed: `None`.
 pub fn unlock_line(d: Dialect) -> Option<&'static str> {
     match d {
         Dialect::Grbl { .. } => Some("$X"),
+        Dialect::Marlin => Some("M999 S1"),
+        Dialect::LinuxCnc => None,
+    }
+}
+
+// --- VUGCOMSCANALARMIDLE (LEDGER SR591): one alarm road in every linked state, Marlin's halt and its M999, grbl's travel settings (named tail hunk) ---
+
+impl Pump {
+    /// The one alarm road: said as [`Event::Alarm`], the window dropped (VUGCOMSCANJOGALARM SR579: grbl flushes its receive
+    /// buffer at every alarm and Marlin's halt flushes its queue, so no line of the window is answered after it), and
+    /// [`PumpState::Halted`] by [`Halt::Alarm`] whatever the state (a hard limit during a jog halts a Done pump).
+    fn alarmed(&mut self, code: u16, name: &'static str, t: &mut dyn Transport, ev: &mut Vec<Event>) {
+        ev.push(Event::Alarm { code, name });
+        self.outstanding.clear();
+        self.halt(Halt::Alarm { code }, t);
+    }
+}
+
+/// The name a Marlin halt is said by (`alarm:0 printer halted`): Marlin numbers no alarm.
+pub const MARLIN_HALTED: &str = "printer halted";
+
+/// A Marlin line that halts the machine: `Error:` carrying `kill() called` (STR_ERR_KILLED, "Printer halted. kill()
+/// called!") or `M999` (STR_ERR_STOPPED, "Printer stopped due to errors. Fix the error and use M999 to restart.").
+pub fn marlin_halted(s: &str) -> bool {
+    s.starts_with("Error:") && (s.contains("kill() called") || s.contains("M999"))
+}
+
+/// The verb that reports the controller's own travel, sent once after the hello when the read is on: grbl 1.1 `$$` (every
+/// setting, one `$<n>=<value>` line each, then `ok`); Marlin's M211 report is owed and LinuxCNC is not streamed: `None`.
+pub fn envelope_verb(d: Dialect) -> Option<&'static str> {
+    match d {
+        Dialect::Grbl { .. } => Some("$$"),
         Dialect::Marlin | Dialect::LinuxCnc => None,
     }
+}
+
+/// One line of the [`envelope_verb`] answer read for the travel only: grbl `$130=` / `$131=` / `$132=` (X / Y / Z max
+/// travel, mm) as (axis 0 / 1 / 2, value); every other line, a value that is not a finite number, or another dialect: `None`.
+pub fn envelope_setting(d: Dialect, s: &str) -> Option<(usize, f64)> {
+    if !is_grbl(d) {
+        return None;
+    }
+    let (k, v) = s.strip_prefix("$13")?.split_once('=')?;
+    let i = match k {
+        "0" => 0,
+        "1" => 1,
+        "2" => 2,
+        _ => return None,
+    };
+    v.trim().parse::<f64>().ok().filter(|v| v.is_finite()).map(|v| (i, v))
 }
