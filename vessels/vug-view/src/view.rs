@@ -362,9 +362,9 @@ impl View {
 
     /// Pointer motion; true when the frame changed.
     pub fn motion(&mut self, x: f64, y: f64) -> bool {
-        self.cursor = (x, y);
+        let was = self.cursor; self.cursor = (x, y); // VUGINTENTSETFACEANCHOREDOVERLAP (SR596): the cursor before this motion, handed to photo's more-line cue
         // VUGFACEPHOTO (SR506): the proposal glyph under the cursor takes the focus (never consumes the motion).
-        let focus = crate::photo::hover(self, x, y);
+        let focus = crate::photo::hover(self, was, x, y);
         // VUGFACE2 (SR485): with no navigation drag, the sketch face's gesture / hover / pull first.
         if self.drag.is_none() {
             if let Some(r) = crate::sketch::motion(self, x, y) {
