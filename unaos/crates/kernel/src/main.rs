@@ -3300,17 +3300,17 @@ fn render_rehome_service() {
     // `xhci_worker_cpu(0)` would answer with the core that just died and the "recovery" would spawn a
     // task onto a core that never dispatches. Silent, and indistinguishable from success on the wire.
     // So placement is EXPLICIT: ask the authority, then reject any answer we know to be a corpse.
-    let mut rescue = None;
+    let rescue = unaos_kernel::hidstall::apart(|skip| { let mut rescue = None; // F39HIDPLACE (B1103) HID-PLACE: the walk below asked first apart from the hid pump's core (`skip`), then with none (`hidstall::apart`, the rule `sessionwedge::pick_live` shares). LINE-NEUTRAL, in place
     for n in 0..unaos_kernel::arch::smp::online_aps().len() {
         match unaos_kernel::arch::smp::xhci_worker_cpu(n) {
-            Some(c) if c < 64 && DEAD_CORES_X86.load(Relaxed) & (1u64 << c) == 0 => {
+            Some(c) if c < 64 && c != skip && DEAD_CORES_X86.load(Relaxed) & (1u64 << c) == 0 => {
                 rescue = Some(c);
                 break;
             }
             Some(_) => continue,
             None => break, // the pool is exhausted or co-location is forbidden; both mean decline
         }
-    }
+    } rescue }); // F39HIDPLACE (B1103): the closure's answer
     let Some(rescue) = rescue else {
         // DECLINE, LOUDLY. Co-locating is a documented deadlock and inventing a core is not an
         // option, so the honest answer is that this machine cannot recover — said out loud, on the

@@ -897,7 +897,7 @@ fn with_unafs_attempt<R>(f: &mut impl FnMut(&mut KernelUnaFS) -> R, arm: bool) -
     let budget = crate::arch::hw_wait_budget();
     let mut restarts: u32 = 0;
     for _ in 0..TXN_BUSY_ATTEMPTS {
-        #[cfg(all(target_arch = "x86_64", feature = "wc"))] if !splitwrite::ticket_wait() { break; } if let Err(e) = prebind() { note_txn_restarts(restarts, true); return Err(e); } match { let t_mask = crate::hidstall::now_us(); let arm = attempt_arm(read); let a = with_unafs_attempt(&mut f, arm); note_attempt(arm, t_mask); a } { // HIDSTALL (B485): the attempt's IRQ-masked span, on the stall line as `masked_ms=`
+        #[cfg(all(target_arch = "x86_64", feature = "wc"))] if !splitwrite::ticket_wait() { break; } if let Err(e) = prebind() { note_txn_restarts(restarts, true); return Err(e); } match { let t_mask = crate::hidstall::now_us(); #[cfg(all(target_arch = "x86_64", feature = "wc"))] let c0 = lockcensus::open(); let arm = attempt_arm(read); let a = with_unafs_attempt(&mut f, arm); note_attempt(arm, t_mask); #[cfg(all(target_arch = "x86_64", feature = "wc"))] { lockcensus::close(c0, t_mask); } a } { // HIDSTALL (B485): the attempt's IRQ-masked span, on the stall line as `masked_ms=`
             Attempt::Settled(out) => {
                 if restarts > 0 {
                     note_txn_restarts(restarts, true);
@@ -3337,7 +3337,7 @@ pub mod splitread {
         let held_us = read_held.max(meta_held_max);
         let io_under = io1.wrapping_sub(io0);
         let fallbacks = fb1.wrapping_sub(fb0);
-        let same = T_OK.load(Ordering::Relaxed) && T_BYTES.load(Ordering::Relaxed) == len && T_HASH.load(Ordering::Relaxed) == want; let (retry, chunked, kat_hold) = super::lockhold::kat(&path, len, |d: &[u8]| fnv(FNV0, d) == want); // UNAFSLOCKHOLD (B1015): the retry + chunked-fallback KAT, after the census (file tail; LINE-NEUTRAL, before this comment)
+        let same = T_OK.load(Ordering::Relaxed) && T_BYTES.load(Ordering::Relaxed) == len && T_HASH.load(Ordering::Relaxed) == want; let (retry, chunked, kat_hold) = super::lockhold::kat(&path, len, |d: &[u8]| fnv(FNV0, d) == want); super::lockcensus::say("tests"); // UNAFSLOCKHOLD (B1015): the retry + chunked-fallback KAT, after the census (file tail; LINE-NEUTRAL, before this comment)
         let pass = done && same && held_us <= 5000 && io_under == 0 && fallbacks == 0 && ops >= 1 && retry && chunked;
         serial_println!(
             ":: UNAFSLOCK: ops={} held_max_ms={} io_under_lock={} retry={} chunked={} hold_max_us={} -> {} :: path={} bytes={} read_ms={} read_held_us={} meta_held_us={} meta_wait_max_ms={} fallbacks={} match={} done={}",
@@ -5764,7 +5764,7 @@ pub mod rawrote {
                     for s in ra.slots.iter_mut() {
                         // A zero-length lookup compares only: true when `x` lies in the window (its end inclusive, an over-drop).
                         if (lba..lba.saturating_add(n)).any(|x| s.lookup(x, &mut [])) {
-                            s.invalidate();
+                            s.invalidate(); super::lockcensus::ra_drop();
                         }
                     }
                 }
@@ -5775,7 +5775,7 @@ pub mod rawrote {
                 w.sectors = w.spans.iter().map(|e| e.2).sum();
                 w.pruned = w.pruned.max(g);
             }
-            ok
+            super::lockcensus::ra_synced(ok, ra.slots.len()); ok
         })
     }
 
@@ -5798,5 +5798,142 @@ pub mod rawrote {
             out.extend_from_slice(&d);
         }
         Ok(out)
+    }
+}
+
+// ── F39UNAFSCENSUS (rmbp-ledger B1106, BP-storage-8) — the MOUNT lock census. F39UNAFSLOCK (B1098) narrowed `ra_sync` to the
+// written spans and time-bounded the chunked hold; this names what still holds the lock. Every MOUNT attempt passes
+// `with_unafs_arm`'s :899, which opens HIDSTALL's span (`t_mask`) and closes it with `note_attempt`: `open` notes the window
+// fills so far (`tx_io`, VFSTXCOST's counter) and `close` (after the attempt returned, MOUNT released) keeps an attempt over
+// `OVER_US` in a fixed table of the worst `WORST_MAX` — site (the `#[track_caller]` chain through `with_unafs`), task id, fills in
+// the span, span_us (the wait for MOUNT plus the hold: HIDSTALL's span, UNAFS-HOLD-TRUESPAN owed). `rawrote::narrow` counts its
+// syncs, the windows it drops and the full invalidates. `say` prints and resets both: from `hidstall::census_minute` (the
+// desktop's minute roll, hidstall.rs:439 fold) and on demand from `tests unafslock` (:3340 fold). `WORST` is a LEAF lock taken
+// masked, never under MOUNT; no allocation under it; the counters are relaxed atomics taken by swap. At the tail: no line moves.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+pub mod lockcensus {
+    use super::*;
+    use core::fmt::Write as _;
+    use core::panic::Location;
+    use core::sync::atomic::AtomicU64;
+
+    /// An attempt span over this is a hold the census keeps.
+    const OVER_US: u64 = 1_000;
+    /// Holds kept between two censuses (the worst ones).
+    const WORST_MAX: usize = 8;
+
+    /// One kept hold.
+    #[derive(Clone, Copy)]
+    struct Hold {
+        site: Option<&'static Location<'static>>,
+        tid: u64,
+        fills: u32,
+        span_us: u32,
+    }
+
+    const EMPTY: Hold = Hold { site: None, tid: 0, fills: 0, span_us: 0 };
+
+    /// The worst holds since the last census (`site: None` = a free slot).
+    static WORST: Mutex<[Hold; WORST_MAX]> = Mutex::new([EMPTY; WORST_MAX]);
+    /// Attempts over `OVER_US` since the last census (kept or not).
+    static OVER_N: AtomicU64 = AtomicU64::new(0);
+    /// `rawrote::narrow` calls (a moved `RA_GEN`), the slots their narrowed syncs saw, the windows they dropped, the full invalidates.
+    static RA_SYNCS: AtomicU64 = AtomicU64::new(0);
+    static RA_SLOTS: AtomicU64 = AtomicU64::new(0);
+    static RA_DROPPED: AtomicU64 = AtomicU64::new(0);
+    static RA_FULL: AtomicU64 = AtomicU64::new(0);
+
+    /// :899 fold — the attempt opens: the window fills so far.
+    #[inline(always)]
+    pub fn open() -> u64 {
+        tx_io().0
+    }
+
+    /// :899 fold — the attempt (opened at `t0_us` with `f0` fills) ended, MOUNT released. Over `OVER_US` it is counted and,
+    /// when among the worst, kept with its site (`with_unafs`'s caller), task and fills.
+    #[track_caller]
+    #[inline(always)]
+    pub fn close(f0: u64, t0_us: u64) {
+        let us = crate::hidstall::now_us().saturating_sub(t0_us);
+        if us <= OVER_US {
+            return;
+        }
+        keep(Location::caller(), tx_io().0.wrapping_sub(f0), us);
+    }
+
+    #[inline(never)]
+    fn keep(site: &'static Location<'static>, fills: u64, us: u64) {
+        OVER_N.fetch_add(1, Ordering::Relaxed);
+        let h = Hold {
+            site: Some(site),
+            tid: crate::arch::sched::current_id().unwrap_or(0),
+            fills: fills.min(u32::MAX as u64) as u32,
+            span_us: us.min(u32::MAX as u64) as u32,
+        };
+        crate::arch::without_interrupts(|| {
+            let mut w = WORST.lock();
+            let mut ix = 0usize;
+            for (i, s) in w.iter().enumerate() {
+                if s.site.is_none() {
+                    ix = i;
+                    break;
+                }
+                if s.span_us < w[ix].span_us {
+                    ix = i;
+                }
+            }
+            if w[ix].site.is_none() || w[ix].span_us < h.span_us {
+                w[ix] = h;
+            }
+        });
+    }
+
+    /// `rawrote::narrow` fold — one window dropped by a narrowed sync.
+    #[inline(always)]
+    pub fn ra_drop() {
+        RA_DROPPED.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `rawrote::narrow` fold — a sync ended: narrowed over `slots` windows (`ok`), else the caller drops every window.
+    #[inline(always)]
+    pub fn ra_synced(ok: bool, slots: usize) {
+        RA_SYNCS.fetch_add(1, Ordering::Relaxed);
+        if ok {
+            RA_SLOTS.fetch_add(slots as u64, Ordering::Relaxed);
+        } else {
+            RA_FULL.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// hidstall.rs:439 fold — the desktop's minute roll.
+    pub fn minute() {
+        say("minute");
+    }
+
+    /// Print and reset the census: `[unafslock] holds …` (the kept holds, worst first) then `[unafslock] ra …`. The table is
+    /// copied and cleared under its lock; the lines are built and printed outside it.
+    pub fn say(why: &str) {
+        let mut t = crate::arch::without_interrupts(|| core::mem::replace(&mut *WORST.lock(), [EMPTY; WORST_MAX]));
+        t.sort_unstable_by(|a, b| b.span_us.cmp(&a.span_us));
+        let kept = t.iter().filter(|h| h.site.is_some()).count();
+        let n = OVER_N.swap(0, Ordering::Relaxed);
+        let mut line = String::new();
+        let _ = write!(line, "[unafslock] holds why={} over_us={} n={} kept={} worst_us={}", why, OVER_US, n, kept, t[0].span_us);
+        for h in t.iter() {
+            let Some(site) = h.site else { continue };
+            let file = site.file().rsplit('/').next().unwrap_or(site.file());
+            let _ = write!(line, " · {}:{} tid=", file, site.line());
+            let _ = if h.tid == 0 { write!(line, "-") } else { write!(line, "{}", h.tid) };
+            let _ = write!(line, " fills={} span_us={}", h.fills, h.span_us);
+        }
+        serial_println!("{}", line);
+        let syncs = RA_SYNCS.swap(0, Ordering::Relaxed);
+        let slots = RA_SLOTS.swap(0, Ordering::Relaxed);
+        let dropped = RA_DROPPED.swap(0, Ordering::Relaxed);
+        let full = RA_FULL.swap(0, Ordering::Relaxed);
+        serial_println!(
+            "[unafslock] ra why={} syncs={} kept={} dropped={} full={}",
+            why, syncs, slots.saturating_sub(dropped), dropped, full
+        );
     }
 }

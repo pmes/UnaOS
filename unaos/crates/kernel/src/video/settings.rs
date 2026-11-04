@@ -3320,7 +3320,7 @@ static A11Y_REDUCE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicB
 static A11Y_CONTRAST: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 static A11Y_CURSOR_Q: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(A11Y_CURSOR_MIN_Q);
 static A11Y_TEXT: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
-/// Store writes owed: bit k = row k (0 reduce motion, 1 contrast, 2 cursor size, 3 text size, 4 cvd, 5 invert, 6 zoom, 7 zoom follow, 8 show performance).
+/// Store writes owed: bit k = row k (0 reduce motion, 1 contrast, 2 cursor size, 3 text size, 4 cvd, 5 invert, 6 zoom, 7 zoom follow, 8 show performance, 9 starfield shimmer: SHIMMERPREF B1108).
 static A11Y_PERSIST: AtomicU32 = AtomicU32::new(0);
 /// ZOOM (B713): the magnifier's factor as stored (0 off, 2, 3, 4) and what it follows (0 the pointer, 1 the focus) —
 /// the rows' latch; the lens (`video/zoom.rs`, x86 `wc`) is handed both by [`zoom_apply`].
@@ -3411,8 +3411,9 @@ fn a11y_load(via: &str) {
     let zoom_owed = A11Y_PERSIST.load(Ordering::Acquire) & (3 << 6) != 0; if !zoom_owed { A11Y_ZOOM.store(zm, Ordering::Relaxed); } // crawl A 15: a chord's or a press's zoom write still owed is newer than the store, so the re-read leaves the lens alone
     if !zoom_owed { A11Y_FOLLOW.store(zf, Ordering::Relaxed); }
     if !zoom_owed { zoom_apply(); }
+    let moved = moved + shimmer_load(); // SHIMMERPREF (B1108): the starfield shimmer row (file tail)
     if via == "login" || moved > 0 {
-        serial_println!("[settings] accessibility loaded reduce_motion={} increase_contrast={} cursor_size=x{} text_size={} cvd={} invert={} moved={} via={}", rm as u8, ic as u8, a11y_cursor_str(cq), A11Y_TEXT_NAMES[ts as usize], af::NAMES[cvd], inv as u8, moved, via);
+        serial_println!("[settings] accessibility loaded reduce_motion={} increase_contrast={} cursor_size=x{} text_size={} cvd={} invert={} moved={} via={} shimmer={}", rm as u8, ic as u8, a11y_cursor_str(cq), A11Y_TEXT_NAMES[ts as usize], af::NAMES[cvd], inv as u8, moved, via, shimmer_on() as u8);
         a11y_cost_line(if via == "login" { "load" } else { "change" });
     }
 }
@@ -3446,6 +3447,7 @@ fn a11y_set(row: usize, val: usize, store: bool) {
         6 => { let z = a11y_zoom_of_seg(a11y_zoom_seg(val.min(4) as u8)); A11Y_ZOOM.store(z, Ordering::Relaxed); zoom_apply(); ("zoom", alloc::format!("{}", z), cfg!(all(target_arch = "x86_64", feature = "wc"))) } // ZOOM (B713)
         7 => { let f = val.min(A11Y_FOLLOW_NAMES.len() - 1); A11Y_FOLLOW.store(f as u8, Ordering::Relaxed); zoom_apply(); ("zoom_follow", alloc::format!("{}", A11Y_FOLLOW_NAMES[f]), cfg!(all(target_arch = "x86_64", feature = "wc"))) }
         8 => { let _ = super::perfhud::apply(val != 0, "settings", false); /* crawl A 24: the store write is this row's bit 8, not perfhud's OWED too */ ("show_performance", alloc::format!("{}", (val != 0) as u8), cfg!(all(target_arch = "x86_64", feature = "wc"))) } // PERFHUD (B710): applied where the compositor paints it
+        9 => shimmer_row_set(val != 0), // SHIMMERPREF (B1108)
         _ => return,
     };
     if store {
@@ -3505,10 +3507,11 @@ fn a11y_service() {
         set_sys(key::A11Y_ZOOM_FOLLOW, P::Str(String::from(A11Y_FOLLOW_NAMES[f])));
     }
     if owed & 256 != 0 { set_sys(key::A11Y_SHOW_PERF, P::Bool(super::perfhud::visible())); } // PERFHUD (B710), row 8
+    if owed & 512 != 0 { set_sys(key::A11Y_SHIMMER, P::Bool(shimmer_on())); } // SHIMMERPREF (B1108), row 9
 }
 
 fn paint_a11y(st: &mut State) {
-    groups(st, &[(0, 1), (2, 3), (4, 5), (6, 7), (8, 8)]);
+    groups(st, &[(0, 1), (2, 3), (4, 5), (6, 7), (8, 9)]); // SHIMMERPREF (B1108): row 9 joins the performance group
     let (rm, ic, q) = (reduce_motion(), increase_contrast(), A11Y_CURSOR_Q.load(Ordering::Relaxed));
     txt(st, LABEL_X, 0, "Reduce motion");
     tog(st, 0, TOG_X, rm, false); // SETTINGSCRAFT: the kit's switch, right-aligned (a press anywhere on the row flips it)
@@ -3537,11 +3540,12 @@ fn paint_a11y(st: &mut State) {
     txt2(st, VAL_X, 6, if zm == 0 { "Win+= zooms in" } else { "Win+- out, Win+0 off" });
     txt(st, LABEL_X, 7, "Zoom follows");
     seg(st, 7, &[b"Pointer", b"Focus"], zf, false);
+    txt2(st, VAL_X, 7, "Around the pointer or the focused window"); // SHIMMERPREF (B1108): the help text row 9 held
     let hud = super::perfhud::visible(); // PERFHUD (B710): the overlay's switch
     txt(st, LABEL_X, 8, "Show performance");
     tog(st, 8, TOG_X, hud, false);
     txt2(st, TRACK_X, 8, if hud { "Frame times, latency and memory, top right" } else { "Off (Win+F12 toggles it)" });
-    txt2(st, LABEL_X, 9, "Zoom magnifies around the pointer or focus; the colour filter and invert cover the whole glass."); // crawl A 3: ROWS = 10, so row 9 is the last painted row (row 10 clipped at WIN_H)
+    paint_shimmer_row(st); // SHIMMERPREF (B1108): the starfield shimmer switch (file tail). crawl A 3: ROWS = 10, so row 9 is the last painted row (row 10 clipped at WIN_H)
 }
 
 /// A11YFILTERS (B705): what row 4's value column says per mode (the segments name the cone each filter simulates).
@@ -3559,6 +3563,7 @@ fn press_a11y(row: usize, cx: usize) {
         6 => { if cx >= TRACK_X && cx < TRACK_X + TRACK_W { a11y_set(6, a11y_zoom_of_seg((cx - TRACK_X) / (TRACK_W / A11Y_ZOOM_SEGS.len())) as usize, true); } } // ZOOM (B713)
         7 => { if cx >= TRACK_X && cx < TRACK_X + TRACK_W { a11y_set(7, ((cx - TRACK_X) / (TRACK_W / A11Y_FOLLOW_NAMES.len())).min(A11Y_FOLLOW_NAMES.len() - 1), true); } }
         8 => a11y_set(8, (!super::perfhud::visible()) as usize, true), // PERFHUD (B710)
+        9 => a11y_set(9, (!shimmer_on()) as usize, true), // SHIMMERPREF (B1108)
         _ => {}
     }
 }
@@ -3885,7 +3890,7 @@ const fn mr(keys: &'static [&'static str], tab: usize, row: usize, label: &'stat
 }
 
 /// Every Settings row, in column order then row order. Labels are the strings the panes paint.
-pub const MAP: [MapRow; 45] = {
+pub const MAP: [MapRow; 46] = {
     use crate::prefs::key::*;
     [
         // General (0)
@@ -3931,6 +3936,7 @@ pub const MAP: [MapRow; 45] = {
         mr(&[A11Y_ZOOM], A11Y_TAB, 6, "Zoom", NO_CTRL), // ZOOM (B713)
         mr(&[A11Y_ZOOM_FOLLOW], A11Y_TAB, 7, "Zoom follows", NO_CTRL),
         mr(&[A11Y_SHOW_PERF], A11Y_TAB, 8, "Show performance", NO_CTRL), // PERFHUD (B710)
+        mr(&[A11Y_SHIMMER], A11Y_TAB, 9, "Starfield shimmer", NO_CTRL), // SHIMMERPREF (B1108)
         // Privacy (REASK B681): the switch row; the decisions below it are dynamic (`prefs::decisions`), each with a Revoke
         mr(&[PRIVACY_REMEMBER], PRIV_TAB, 0, "Remember my answers", NO_CTRL),
         // Date & Time (TZLOCALE B701): the one locale authority's three keys
@@ -6026,4 +6032,47 @@ pub const CENSUS_KINDS: [&str; 8] = ["column", "press", "seg", "slider", "field"
 #[cfg(feature = "witness")]
 fn census_slot(kind: &str) -> usize {
     CENSUS_KINDS.iter().position(|k| *k == kind).unwrap_or(CENSUS_KINDS.len() - 1)
+}
+
+// ── SHIMMERPREF (rmbp-ledger B1108) — Settings > Accessibility row 9, the starfield shimmer ─────────────────────────
+// `system.accessibility.shimmer` (bool, default on; PREFS-SCHEMA.md) turns the desktop STARFIELD shimmer off on its own,
+// apart from Reduce motion (BP-video-11). One more latch of the A11YPANE family: loaded by `a11y_load`, set by
+// `a11y_set` row 9, stored through `A11Y_PERSIST` bit 9 by `a11y_service`. Both shimmer seats (`desktop::shimmer_live`,
+// `desktop::shimmer_idle`) read [`shimmer_on`] beside [`reduce_motion`]. Wire: `[settings] accessibility.shimmer=<0|1>
+// applied=<0|1>`; the loaded line's ` shimmer=<0|1>`.
+
+/// The row's applied state (the schema's default: on).
+static A11Y_SHIMMER: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+
+/// The starfield shimmer row, as applied: the shimmer runs only while this is on AND Reduce motion is off.
+#[inline]
+pub fn shimmer_on() -> bool {
+    A11Y_SHIMMER.load(Ordering::Relaxed)
+}
+
+/// `a11y_load`'s read of the row (the schema's default where unset): latch it, answer 1 when it moved.
+fn shimmer_load() -> u8 {
+    let on = crate::prefs_client::sys_flag(crate::prefs::key::A11Y_SHIMMER).unwrap_or(true);
+    (A11Y_SHIMMER.swap(on, Ordering::Relaxed) != on) as u8
+}
+
+/// `a11y_set` row 9: apply the switch; `(name, value, applied)` for its wire (applied where the shimmer is built).
+fn shimmer_row_set(on: bool) -> (&'static str, String, bool) {
+    A11Y_SHIMMER.store(on, Ordering::Relaxed);
+    ("shimmer", alloc::format!("{}", on as u8), cfg!(feature = "facet"))
+}
+
+/// `paint_a11y` row 9: the label, the switch, and what the stars do now.
+fn paint_shimmer_row(st: &mut State) {
+    let on = shimmer_on();
+    txt(st, LABEL_X, 9, "Starfield shimmer");
+    tog(st, 9, TOG_X, on, false);
+    txt2(st, TRACK_X, 9, if !on { "Stars hold still" } else if reduce_motion() { "Held still by Reduce motion" } else { "Stars glint on the desktop" });
+}
+
+/// `tests shimmeridle`'s toggle: row 9 set through the press's own path with no store write; answers the value it had.
+pub fn shimmer_set_unstored(on: bool) -> bool {
+    let was = shimmer_on();
+    a11y_set(9, on as usize, false);
+    was
 }
