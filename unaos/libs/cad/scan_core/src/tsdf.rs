@@ -13,7 +13,11 @@
 //!
 //! VUGSCANTSDFOUTLIERS (SR555): with [`Tsdf::with_edge_mm`] a pixel on a depth edge (its 3x3 neighbourhood spans more
 //! than [`Tsdf::edge_mm`]) integrates nothing that frame — see [`depth_edge`]; off by default (the seat's ruling: at
-//! scan noise it costs more averaging than it removes, VUG-SCAN-TSDF-EDGEFAR owed).
+//! scan noise it costs more averaging than it removes).
+//!
+//! VUGSCANTSDFEDGEFAR (SR562): with [`Tsdf::with_edge_far_mm`] the far-side guard: at a depth-edge pixel a voxel
+//! integrates only when its own camera depth and the pixel's depth fall on the same side of the 3x3's mid depth.
+//! MEASURED, not a default (the seat's ruling: it fattened the post and reddened the tracking and closure tests).
 //!
 //! Sign: positive in front of the surface (free space, toward the camera), negative behind it (inside the solid).
 //! Voxel `g` (integer) sits at `g · voxel_mm` in the world. The pinhole model is probe_core's (`Intrinsics::project`,
@@ -38,7 +42,8 @@ pub const DEFAULT_BUDGET: usize = 65_536;
 
 /// One voxel: the fused signed distance (mm, within ±trunc) and its observation weight. The weight IS the voxel's
 /// confidence (BP-vug-5): uniform weight 1 per frame that observed it, capped at [`W_MAX`]; 0 = never observed. With the
-/// depth-edge guard on ([`Tsdf::with_edge_mm`]), a frame whose pixel at the voxel is a depth edge does not observe it.
+/// depth-edge guard on ([`Tsdf::with_edge_mm`]), a frame whose pixel at the voxel is a depth edge does not observe it;
+/// with the far-side guard ([`Tsdf::with_edge_far_mm`]), only a voxel on the other surface's side of the edge.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Voxel {
     pub sdf: f32,
@@ -68,6 +73,9 @@ pub struct Tsdf {
     /// VUGSCANTSDFOUTLIERS (SR555): the depth jump across a pixel's 3x3 neighbourhood above which it integrates nothing
     /// (`f64::INFINITY`, the default: the guard off).
     edge_mm: f64,
+    /// VUGSCANTSDFEDGEFAR (SR562): the depth jump above which the far-side guard holds (`f64::INFINITY`, the default:
+    /// off); `edge_mm`, when finite, takes precedence.
+    edge_far_mm: f64,
     blocks: BTreeMap<Key, Box<[Voxel; BLOCK_VOXELS]>>,
     frames: u32,
     intrinsics: Option<Intrinsics>,
@@ -101,6 +109,7 @@ impl Tsdf {
             tol,
             budget: DEFAULT_BUDGET,
             edge_mm: f64::INFINITY, // VUGSCANTSDFOUTLIERS: the depth-edge guard off unless `with_edge_mm` arms it
+            edge_far_mm: f64::INFINITY, // VUGSCANTSDFEDGEFAR: the far-side guard off unless `with_edge_far_mm` arms it
             blocks: BTreeMap::new(),
             frames: 0,
             intrinsics: None,
@@ -246,7 +255,8 @@ impl Tsdf {
         }
         let inv = pose.invert().unwrap_or(Transform::IDENTITY);
         let (voxel_mm, trunc) = (self.voxel_mm, self.trunc_mm);
-        let edge = depth_edges(frame, scale, self.edge_mm); // VUGSCANTSDFOUTLIERS: empty when the guard is off
+        let both = self.edge_mm.is_finite(); // VUGSCANTSDFEDGEFAR: SR555's both-sides rule when its knob is armed
+        let edge = depth_edges(frame, scale, if both { self.edge_mm } else { self.edge_far_mm }); // empty when off
         let mut updated = 0u32;
         for k in &active {
             let Some(blk) = self.blocks.get_mut(k) else { continue };
@@ -265,10 +275,10 @@ impl Tsdf {
                     continue;
                 }
                 let (px, py) = (uv[0] as u32, uv[1] as u32); // floor: pixel x covers u in [x, x + 1)
-                if edge.get(py as usize * frame.width as usize + px as usize) == Some(&true) {
-                    continue; // VUGSCANTSDFOUTLIERS: a depth-edge pixel cannot speak for a voxel within one pixel of it
-                }
                 let Some(m) = metres_at(frame, scale, px, py) else { continue };
+                if edge_skip(&edge, both, py as usize * frame.width as usize + px as usize, m, q.z) {
+                    continue; // VUGSCANTSDFOUTLIERS / VUGSCANTSDFEDGEFAR: the depth-edge guard
+                }
                 let sdf = m as f64 * 1000.0 - q.z;
                 if sdf < -trunc {
                     continue; // unseen: behind the surface by more than the band
@@ -327,7 +337,8 @@ impl Tsdf {
 // a default (SR555 RUN 1, the seat's ruling (a)): armed at the truncation it cut the noise-free post's cylindricity
 // 3.214 -> 2.775 mm but raised it 3.542 -> 4.016 at D435i noise (fewer frames averaged per voxel near a silhouette)
 // and left the box top's 1.217 mm unchanged (that is the fixture's depth quantisation, VUG-SCAN-FIXTURE-QUANT), so it
-// is off by default and `tests/gdt.rs` `tsdf_outliers_probe` arms it; the far-side-only guard is VUG-SCAN-TSDF-EDGEFAR.
+// is off by default and `tests/gdt.rs` `tsdf_outliers_probe` arms it; the far-side-only guard is VUGSCANTSDFEDGEFAR's,
+// below.
 impl Tsdf {
     /// The same volume with the depth-edge guard armed at the jump `mm` (`trunc_mm` is the measured setting);
     /// `f64::INFINITY` (the default) leaves it off.
@@ -345,7 +356,55 @@ impl Tsdf {
 /// Whether pixel `(x, y)` of a Z16 frame is a depth edge: its valid depth and the valid depths of its 3x3
 /// neighbourhood span more than `jump_mm`. A hole (raw 0) is neutral; a pixel with no depth of its own is no edge.
 pub fn depth_edge(frame: &Frame, scale: DepthScale, x: u32, y: u32, jump_mm: f64) -> bool {
-    let Some(c) = metres_at(frame, scale, x, y) else { return false };
+    depth_span(frame, scale, x, y).is_some_and(|(lo, hi)| (hi - lo) as f64 * 1000.0 > jump_mm) // VUGSCANTSDFEDGEFAR
+}
+
+/// The frame's depth-edge mask, row-major (`y · width + x`): the edge pixel's 3x3 mid depth in metres (VUGSCANTSDFEDGEFAR:
+/// the far-side rule's split), `None` off an edge; empty when `jump_mm` is not finite (the guard off).
+fn depth_edges(frame: &Frame, scale: DepthScale, jump_mm: f64) -> alloc::vec::Vec<Option<f32>> {
+    if !jump_mm.is_finite() {
+        return alloc::vec::Vec::new();
+    }
+    let mut out = alloc::vec::Vec::with_capacity(frame.width as usize * frame.height as usize);
+    for y in 0..frame.height {
+        for x in 0..frame.width {
+            let span = depth_span(frame, scale, x, y).filter(|(lo, hi)| (hi - lo) as f64 * 1000.0 > jump_mm);
+            out.push(span.map(|(lo, hi)| 0.5 * (lo + hi)));
+        }
+    }
+    out
+}
+
+// VUGSCANTSDFEDGEFAR (SR562): the far-side depth-edge guard. At an edge pixel the 3x3 holds two depth
+// populations split at their mid depth. The error SR555 measured is a voxel of the NEAR population whose floor pixel
+// holds the FAR depth (`far - q.z` well past the truncation: a free-space vote carving the near surface's band); the
+// opposite mismatch (a far voxel on a near pixel) is already skipped by the `sdf < -trunc` line whenever the jump
+// exceeds the truncation. So a voxel integrates when its own camera depth and its pixel's depth fall on the same side
+// of the mid, and skips when they do not: the matched voxels on both sides of the jump keep their observation, the
+// averaging SR555's both-sides rule (`with_edge_mm`, kept for the probe) gave up at scan noise. Measured by
+// `tests/gdt.rs` `tsdf_outliers_probe` (`guard=far`); the weight stays the observation count (BP-vug-5). MEASURED, not
+// a default (SR562 RUN 1, the seat's ruling): armed at the truncation it took the post's cylindricity 3.214 -> 3.300 mm
+// noise-free and 3.542 -> 4.156 at D435i (it also skips the correct free-space votes of near-depth voxels just outside
+// the silhouette, which carve the outline) and reddened the pose and loop-closure tests, so it is off by default; a
+// lateral silhouette test is VUG-SCAN-TSDF-EDGE-LATERAL (owed).
+impl Tsdf {
+    /// The same volume with the far-side guard armed at the jump `mm` (`trunc_mm` is the measured setting);
+    /// `f64::INFINITY` (the default) leaves it off. A finite [`Tsdf::edge_mm`] takes precedence (SR555's both-sides rule).
+    pub fn with_edge_far_mm(mut self, mm: f64) -> Tsdf {
+        self.edge_far_mm = mm;
+        self
+    }
+
+    /// The depth jump across a pixel's 3x3 neighbourhood above which the far-side guard holds.
+    pub fn edge_far_mm(&self) -> f64 {
+        self.edge_far_mm
+    }
+}
+
+/// The valid depths' span (lo, hi metres) over pixel `(x, y)`'s 3x3 neighbourhood; a hole (raw 0) is neutral, a pixel
+/// with no depth of its own has none. The one 3x3 scan behind [`depth_edge`] and the guard's mask.
+fn depth_span(frame: &Frame, scale: DepthScale, x: u32, y: u32) -> Option<(f32, f32)> {
+    let c = metres_at(frame, scale, x, y)?;
     let (mut lo, mut hi) = (c, c);
     for dy in -1i64..=1 {
         for dx in -1i64..=1 {
@@ -359,19 +418,17 @@ pub fn depth_edge(frame: &Frame, scale: DepthScale, x: u32, y: u32, jump_mm: f64
             }
         }
     }
-    (hi - lo) as f64 * 1000.0 > jump_mm
+    Some((lo, hi))
 }
 
-/// The frame's depth-edge mask, row-major (`y · width + x`); empty when `jump_mm` is not finite (the guard off).
-fn depth_edges(frame: &Frame, scale: DepthScale, jump_mm: f64) -> alloc::vec::Vec<bool> {
-    if !jump_mm.is_finite() {
-        return alloc::vec::Vec::new();
+/// Whether the guard skips a voxel at camera depth `qz_mm` on pixel `idx` whose depth is `m` metres: off an edge,
+/// never; on an edge, always under the both-sides rule, else when the voxel and the pixel sit on opposite sides of
+/// the 3x3's mid depth.
+fn edge_skip(edge: &[Option<f32>], both: bool, idx: usize, m: f32, qz_mm: f64) -> bool {
+    let Some(Some(mid)) = edge.get(idx) else { return false };
+    if both {
+        return true;
     }
-    let mut out = alloc::vec::Vec::with_capacity(frame.width as usize * frame.height as usize);
-    for y in 0..frame.height {
-        for x in 0..frame.width {
-            out.push(depth_edge(frame, scale, x, y, jump_mm));
-        }
-    }
-    out
+    let mid_mm = *mid as f64 * 1000.0;
+    (qz_mm < mid_mm) != ((m as f64 * 1000.0) < mid_mm)
 }
