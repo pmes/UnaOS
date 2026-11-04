@@ -44,6 +44,10 @@ pub struct Map {
     pub tri: Vec<u32>,
     /// VUGFACEDEVIATIONPICK (SR543): the vertex a click on the map picked, held until the next click ([`pick`]).
     pub pick: Option<Pick>,
+    /// VUGFACEGDT (SR553): every design face read as ISO 1101 tolerances, once per build ([`gdt_of`]; empty on a refusal).
+    pub gdt: Vec<scan_core::FaceGdt>,
+    /// VUGFACEGDT (SR553): the tolerances named on the face (`gdt <face>=<kind>:<tol>`, [`command`]), in the order named.
+    pub callouts: Vec<Callout>,
 }
 
 /// A scan mesh read from a file (a PLY carries no normals, no confidence and no intrinsics): mesh_core's
@@ -100,7 +104,7 @@ pub fn open(scan: &ScanMesh, doc: &Doc, band_mm: f64) -> Result<(Model, Map), St
     };
     let model = Model::from_mesh(mesh)?;
     let on = result.is_ok();
-    Ok((model, Map { on, band_mm, names, result, vertex, tri, pick: None })) // VUGFACEDEVIATIONPICK (SR543): no pick at open
+    Ok((model, Map { on, band_mm, names, gdt: gdt_of(scan, &design, &result), result, vertex, tri, pick: None, callouts: Vec::new() })) // VUGFACEDEVIATIONPICK (SR543): no pick at open; VUGFACEGDT (SR553): the gdt once per build
 }
 
 /// The corner's lines: the statistics and the worst [`WORST`] faces (matched ones, by rms) with their signed mean, or
@@ -115,7 +119,7 @@ pub fn corner(map: &Map) -> Vec<String> {
                 let name = map.names.get(f.face as usize).map(String::as_str).unwrap_or("?");
                 out.push(format!("{name} rms={:.3} mean={:+.3}", f.rms_mm, f.mean_mm));
             }
-            out
+            out.extend(gdt_lines(map)); out // VUGFACEGDT (SR553): a line per callout after the faces
         }
         Err(DeviationError::NoAlignment { rms_mm, pairs }) => vec![format!("refused NoAlignment rms={rms_mm:.3} pairs={pairs}")],
         Err(DeviationError::Unconstrained { level }) => vec![format!("refused Unconstrained level={level}")],
@@ -250,4 +254,114 @@ fn ring(view: &View, m: &Map, fr: &mut Frame) {
     for i in 0..16 {
         raster::line(fr, pt(i), pt(i + 1), col);
     }
+}
+
+// ---- VUGFACEGDT (LEDGER SR553): the gdt callouts on the map ----
+// VUGSCANGDT (SR542) reads each design face as ISO 1101 tolerances in tools/scan; this is the same reading in the face.
+// [`open`] runs scan_core's ONE `gdt` once per build ([`gdt_of`]) and the Map keeps it; `gdt <face>=<kind>:<tol>`
+// ([`command`], tools/scan's `--gdt` grammar and refusal names) names a tolerance on a face, and the verdict is
+// scan_core's `FaceGdt::verdict`, read on demand. The corner lists one line per callout
+// (`<face> <kind>=<mm> tol=<mm> PASS|FAIL|UNMEASURED`) and a FAIL face's scan vertices take the band ramp's over colour
+// (`colour(Shade::Over(1.0))`, [`retint`]); `gdt clear` removes them. BP-vug-5: a printed verdict, nothing changes.
+
+/// The edge margin (mm) [`gdt_of`] passes to scan_core's `gdt`: tools/scan's default `--trunc` (3 x its 4 mm voxel), the
+/// TSDF truncation a fused scan carries (a PLY carries none; VUG-FACE-GDT-MARGIN owes the scan's own).
+pub const GDT_MARGIN_MM: f64 = 12.0;
+
+/// A tolerance named on a design face: the face (an index into `Map::names`), the kind and the tolerance (mm).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Callout {
+    pub face: u32,
+    pub kind: scan_core::Kind,
+    pub tol_mm: f64,
+}
+
+/// Every design face read as tolerances (scan_core's `gdt` at [`GDT_MARGIN_MM`]), or none on a refused registration.
+pub fn gdt_of(scan: &ScanMesh, design: &Design, result: &Result<Deviation, DeviationError>) -> Vec<scan_core::FaceGdt> {
+    match result {
+        Ok(d) => scan_core::gdt(scan, design, d, GDT_MARGIN_MM, Tol::DEFAULT),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// One command on the map: `gdt <face>=<kind>:<tol>` names a tolerance (the face as the corner names it, split at the
+/// LAST `=`; flatness, cylindricity or position, split at the LAST `:`; the tolerance finite and above 0), replacing
+/// the face's callout of the same kind; `gdt clear` removes every callout. A FAIL face is tinted ([`retint`]). Refused
+/// by name, nothing changed: no map, a refused map, `GdtFace` (no such face), `GdtKind` (its surface does not take the
+/// kind), anything else the usage. True when the map changed.
+pub fn command(view: &mut View, model: &Model, line: &str) -> Result<bool, String> {
+    const USAGE: &str = "usage: gdt <face>=<kind>:<tol> | gdt clear";
+    let rest = line.trim().strip_prefix("gdt ").map(str::trim).ok_or(USAGE)?;
+    let m = view.deviation.as_mut().ok_or("gdt: no map")?;
+    if let Err(e) = &m.result {
+        return Err(format!("gdt: refused map {e:?}"));
+    }
+    if rest == "clear" {
+        let changed = !m.callouts.is_empty();
+        m.callouts.clear();
+        retint(m, model);
+        return Ok(changed);
+    }
+    let (face, spec) = rest.rsplit_once('=').ok_or(USAGE)?;
+    let (kind, tol) = spec.rsplit_once(':').ok_or(USAGE)?;
+    let kind = scan_core::Kind::parse(kind).ok_or(USAGE)?;
+    let tol_mm: f64 = tol.parse().map_err(|_| USAGE)?;
+    if face.is_empty() || !(tol_mm.is_finite() && tol_mm > 0.0) {
+        return Err(USAGE.into());
+    }
+    let i = m.names.iter().position(|n| n == face).ok_or_else(|| format!("GdtFace {face}"))? as u32;
+    if !m.gdt.get(i as usize).is_some_and(|f| f.accepts(kind)) {
+        return Err(format!("GdtKind {face} {}", kind.name()));
+    }
+    let c = Callout { face: i, kind, tol_mm };
+    match m.callouts.iter_mut().find(|x| x.face == i && x.kind == kind) {
+        Some(x) => *x = c,
+        None => m.callouts.push(c),
+    }
+    retint(m, model);
+    Ok(true)
+}
+
+/// The callout's verdict: scan_core's `FaceGdt::verdict` of its face (Unmeasured when the face is not read).
+pub fn verdict(map: &Map, c: &Callout) -> scan_core::Verdict {
+    map.gdt.get(c.face as usize).map_or(scan_core::Verdict::Unmeasured, |f| f.verdict(c.kind, c.tol_mm))
+}
+
+/// The callout's corner line: `<face> <kind>=<mm, or none> tol=<mm> PASS|FAIL|UNMEASURED`.
+pub fn gdt_line(map: &Map, c: &Callout) -> String {
+    let name = map.names.get(c.face as usize).map(String::as_str).unwrap_or("?");
+    let (value, v) = match verdict(map, c) {
+        scan_core::Verdict::Pass { value_mm, .. } => (format!("{value_mm:.3}"), "PASS"),
+        scan_core::Verdict::Fail { value_mm, .. } => (format!("{value_mm:.3}"), "FAIL"),
+        scan_core::Verdict::Unmeasured => ("none".to_string(), "UNMEASURED"),
+    };
+    format!("{name} {}={value} tol={:.3} {v}", c.kind.name(), c.tol_mm)
+}
+
+/// The corner's callout lines, in the order named.
+fn gdt_lines(map: &Map) -> Vec<String> {
+    map.callouts.iter().map(|c| gdt_line(map, c)).collect()
+}
+
+/// The map's colours from its measurement and callouts: each scan vertex the band ramp's `colour(shade(d, band))` as
+/// [`open`] paints it, the vertices paired with a face whose callout FAILs the ramp's over colour; each triangle the
+/// [`mean3`] of its three vertices (the model's triangles are the scan's, in order). A refused map is left as it is.
+pub fn retint(map: &mut Map, model: &Model) {
+    let Ok(d) = &map.result else { return };
+    let fail: Vec<u32> = {
+        let m: &Map = map;
+        m.callouts.iter().filter(|c| matches!(verdict(m, c), scan_core::Verdict::Fail { .. })).map(|c| c.face).collect()
+    };
+    let over = colour(Shade::Over(1.0));
+    map.vertex = d
+        .per_vertex
+        .iter()
+        .enumerate()
+        .map(|(i, x)| match d.face_of_vertex.get(i).copied().flatten() {
+            Some(f) if fail.contains(&f) => over,
+            _ => colour(shade(*x, map.band_mm)),
+        })
+        .collect();
+    let at = |i: u32| map.vertex.get(i as usize).copied().unwrap_or(raster::ALBEDO);
+    map.tri = model.indices().chunks_exact(3).map(|t| mean3(at(t[0]), at(t[1]), at(t[2]))).collect();
 }

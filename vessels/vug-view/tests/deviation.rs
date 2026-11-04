@@ -232,3 +232,89 @@ fn a_click_off_the_scan_clears_the_pick() {
     assert!(map.pick.is_none());
     assert!(corner(map)[0].starts_with("deviation rms="), "{:?}", corner(map));
 }
+
+// VUGFACEGDT (LEDGER SR553): a gdt callout on the plate top reads scan_core's flatness and its verdict on the corner;
+// a FAIL tints the face's scan vertices in the band ramp's over colour; `gdt clear` removes the line and the tint.
+
+/// The box's top: the `body/` face whose nominal (scan_core `gdt`) is a plane facing +z — `(face, name)`.
+fn plate_top(map: &vug_view::deviation::Map) -> (u32, String) {
+    let f = map
+        .gdt
+        .iter()
+        .find(|f| map.names[f.face as usize].starts_with("body/") && matches!(f.nominal, scan_core::Nominal::Plane(p) if p.normal.z > 0.99))
+        .expect("the plate top is a plane");
+    (f.face, map.names[f.face as usize].clone())
+}
+
+#[test]
+fn a_flatness_callout_on_the_plate_top_reads_pass_then_fail() {
+    let mut v = open(scan().clone());
+    let (top, name) = plate_top(v.view.deviation.as_ref().unwrap());
+    let flat = v.view.deviation.as_ref().unwrap().gdt[top as usize].flatness_mm.expect("the plate top is measured");
+    assert!(flat > 0.001, "flatness {flat}");
+    let before = v.view.deviation.as_ref().unwrap().vertex.clone();
+
+    assert_eq!(vug_view::deviation::command(&mut v.view, &v.model, &format!("gdt {name}=flatness:100")), Ok(true));
+    let map = v.view.deviation.as_ref().unwrap();
+    let lines = corner(map);
+    println!("{}", lines.join("\n"));
+    assert_eq!(lines.last().unwrap(), &format!("{name} flatness={flat:.3} tol=100.000 PASS"));
+    assert_eq!(map.vertex, before, "a PASS tints nothing");
+
+    // The same face and kind replaces the callout.
+    assert_eq!(vug_view::deviation::command(&mut v.view, &v.model, &format!("gdt {name}=flatness:0.001")), Ok(true));
+    let map = v.view.deviation.as_ref().unwrap();
+    assert_eq!(map.callouts.len(), 1, "one callout per face and kind");
+    let lines = corner(map);
+    println!("{}", lines.join("\n"));
+    assert_eq!(lines.last().unwrap(), &format!("{name} flatness={flat:.3} tol=0.001 FAIL"));
+    let d = map.result.as_ref().unwrap();
+    let over = colour(Shade::Over(1.0));
+    let (mut tinted, mut other) = (0, 0);
+    for (i, f) in d.face_of_vertex.iter().enumerate() {
+        if *f == Some(top) {
+            assert_eq!(map.vertex[i], over, "vertex {i} on the failing face");
+            tinted += 1;
+        } else {
+            assert_eq!(map.vertex[i], colour(shade(d.per_vertex[i], BAND_MM)), "vertex {i} off the failing face");
+            other += 1;
+        }
+    }
+    println!("tinted={tinted} other={other}");
+    assert!(tinted > 0 && other > 0);
+    // The albedo follows: a triangle whose three vertices are on the top is painted the over colour.
+    let idx = v.model.indices();
+    let t = (0..idx.len() / 3).find(|&t| (0..3).all(|k| d.face_of_vertex[idx[t * 3 + k] as usize] == Some(top))).expect("a triangle on the top");
+    assert_eq!(map.tri[t], over);
+    let _ = v.frame();
+}
+
+#[test]
+fn gdt_clear_removes_the_callouts_and_the_tint() {
+    let mut v = open(scan().clone());
+    let (_, name) = plate_top(v.view.deviation.as_ref().unwrap());
+    let m0 = v.view.deviation.clone().unwrap();
+    let c0 = corner(&m0);
+    assert_eq!(vug_view::deviation::command(&mut v.view, &v.model, &format!("gdt {name}=flatness:0.001")), Ok(true));
+    let m1 = v.view.deviation.clone().unwrap();
+    assert_ne!(m1.vertex, m0.vertex, "the FAIL tints");
+    assert_eq!(corner(&m1).len(), c0.len() + 1);
+
+    // Refusals by name change nothing.
+    let e = vug_view::deviation::command(&mut v.view, &v.model, "gdt nosuch=flatness:1").unwrap_err();
+    assert!(e.starts_with("GdtFace"), "{e}");
+    let e = vug_view::deviation::command(&mut v.view, &v.model, &format!("gdt {name}=cylindricity:1")).unwrap_err();
+    assert!(e.starts_with("GdtKind"), "{e}");
+    let e = vug_view::deviation::command(&mut v.view, &v.model, &format!("gdt {name}=flatness:0")).unwrap_err();
+    assert!(e.starts_with("usage"), "{e}");
+    let m = v.view.deviation.as_ref().unwrap();
+    assert_eq!((&m.callouts, &m.vertex, &m.tri), (&m1.callouts, &m1.vertex, &m1.tri));
+
+    assert_eq!(vug_view::deviation::command(&mut v.view, &v.model, "gdt clear"), Ok(true));
+    let m = v.view.deviation.as_ref().unwrap();
+    assert!(m.callouts.is_empty());
+    assert_eq!(corner(m), c0, "the callout line is gone");
+    assert_eq!(m.vertex, m0.vertex, "the tint is gone");
+    assert_eq!(m.tri, m0.tri, "the albedo is the open's");
+    assert_eq!(vug_view::deviation::command(&mut v.view, &v.model, "gdt clear"), Ok(false), "nothing left to clear");
+}

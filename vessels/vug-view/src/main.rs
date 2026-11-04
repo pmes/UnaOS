@@ -13,6 +13,7 @@
 //! vug-view <file.stl|obj|ply> [--preset una|solidworks|fusion|blender|onshape]    # the window (macOS)
 //! vug-view <file> --size 320x240 --keys "17h" --out shot.png                      # headless witness
 //! vug-view scan.ply --against part.vugdoc --out map.png                              # the deviation map (SR525)
+//! vug-view scan.ply --against part.vugdoc --gdt "<face>=flatness:0.5" --out map.png  # a gdt callout (SR553)
 //! ```
 //! Key script: one character per shortcut; `{Name}` for a named key.
 
@@ -27,13 +28,14 @@ struct Cli {
     keys: Option<String>,
     out: Option<String>,
     against: Option<String>, // VUGFACEDEVIATION (SR525): the design document a scan is measured against
+    gdt: Vec<String>, // VUGFACEGDT (SR553): each `--gdt <face>=<kind>:<tol>`, a callout on the map
 }
 
-const USAGE: &str = "usage: vug-view <file.stl|obj|ply|png|jpg> [--preset una|solidworks|fusion|blender|onshape] [--size WxH] [--keys SCRIPT] [--out shot.png] [--against design.vugdoc]";
+const USAGE: &str = "usage: vug-view <file.stl|obj|ply|png|jpg> [--preset una|solidworks|fusion|blender|onshape] [--size WxH] [--keys SCRIPT] [--out shot.png] [--against design.vugdoc] [--gdt face=kind:tol]...";
 
 fn cli() -> Cli {
     let mut a = std::env::args().skip(1);
-    let mut c = Cli { path: String::new(), size: (800, 600), preset: Preset::Una, keys: None, out: None, against: None };
+    let mut c = Cli { path: String::new(), size: (800, 600), preset: Preset::Una, keys: None, out: None, against: None, gdt: Vec::new() };
     while let Some(arg) = a.next() {
         match arg.as_str() {
             "--size" => {
@@ -51,6 +53,7 @@ fn cli() -> Cli {
             "--keys" => c.keys = a.next(),
             "--out" => c.out = a.next(),
             "--against" => c.against = a.next(), // VUGFACEDEVIATION (SR525)
+            "--gdt" => c.gdt.extend(a.next()), // VUGFACEGDT (SR553): repeatable
             "--help" | "-h" => {
                 eprintln!("{USAGE}");
                 for (k, what) in vug_view::SHORTCUTS {
@@ -93,6 +96,13 @@ fn main() {
             std::process::exit(1);
         }
     };
+    // VUGFACEGDT (SR553): each `--gdt` names a callout on the map (deviation::command), a refusal named before any frame.
+    for g in &cli.gdt {
+        if let Err(e) = vug_view::deviation::command(&mut viewer.view, &viewer.model, &format!("gdt {g}")) {
+            eprintln!("vug-view: {e}");
+            std::process::exit(1);
+        }
+    }
     #[allow(unused_variables)] // the window's title (macOS only); the headless witness prints `viewer.title`
     let title = viewer.title.clone();
 
