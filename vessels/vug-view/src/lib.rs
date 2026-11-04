@@ -60,6 +60,7 @@ pub const SHORTCUTS: &[(&str, &str)] = &[
     ("s / Cmd+S", "save the document: the opened .vug, else <file stem>.vug beside the opened file (a sibling .tmp renamed over it); the title shows * while unsaved; a write error is named in the corner"), // VUGFACESAVE (SR534)
     ("Cmd+Shift+S", "save as: type a path (relative: beside the opened file; no extension: .vug), Enter; an existing file is refused once, Enter again overwrites; Esc or Cmd+Shift+S cancels"), // VUGFACESAVEAS (SR539)
     ("d (outside a sketch)", "the deviation map on / off (a scan opened with --against <design.vugdoc>; the corner names the worst faces)"), // VUGFACEDEVIATION (SR525)
+    ("?", "these keys over the face (again: the next page; Esc closes)"), // VUGFACEHELPOVERLAY (SR650): SHORTCUTS' in-face reader
 ];
 
 /// The controller: owns the model and the view (one task, no lock).
@@ -161,7 +162,7 @@ impl Viewer {
     /// A shortcut key; true when the frame changed. VUGFACESAVE (SR534): Cmd+S (`Meta+s` on the bus) saves, and a
     /// plain `s` when no edit, pull or gesture holds the keys; the title follows the document.
     pub fn key(&mut self, k: &str) -> bool {
-        if let Some(r) = self.line_key(k) { self.retitle(); return r; } if let Some(r) = self.save_as_key(k) { self.retitle(); return r; } // VUGFACEGDTREPORTOPEN (SR581): the `:` line and the report sheet first (none while Save As is open); VUGFACESAVEAS (SR539): the open Save As field takes every key first
+        if let Some(r) = self.view.help_key(k) { return r; } if let Some(r) = self.line_key(k) { self.retitle(); return r; } if let Some(r) = self.save_as_key(k) { self.retitle(); return r; } // VUGFACEGDTREPORTOPEN (SR581): the `:` line and the report sheet first (none while Save As is open); VUGFACESAVEAS (SR539): the open Save As field takes every key first
         let save = k == "Meta+s" || (k == "s" && !journal::busy(&self.view.design) && self.view.fillet.is_none());
         let r = if save {
             let _ = self.save();
@@ -428,4 +429,63 @@ fn shelf(lib: &doc_host::DirLib) -> Vec<doc_core::Stmt> {
         .iter()
         .filter_map(|n| doc_core::read_with(&format!("{}\nmachine {n} lib={n}\n", head.trim_end()), lib).ok()?.stmts.into_iter().next())
         .collect()
+}
+
+// ---- VUGFACEPHOTOCROPDOC (LEDGER SR649): the cropped photo slid under the kept document, beside the open road ----
+
+impl Viewer {
+    /// The saved crop at `path` (offset `at` in the open photo's pixels) under the KEPT face: read back and decoded (the
+    /// file is the truth), then `photo::slid` (the image, H moved by the offset, the crop road on the new file); the
+    /// model, the design (the journal, its snapshots and its dirty mark), `save_to` and `claimed` stay, the title names
+    /// the crop. Nothing changes on an error, which names the file.
+    pub fn swap_photo(&mut self, path: &std::path::Path, at: (u32, u32)) -> Result<(), String> {
+        let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let image = pixel_core::decode(&bytes).map_err(|e| format!("{}: image {e:?}", path.display()))?;
+        let ph = self.view.photo.as_mut().ok_or("no photo is open")?;
+        photo::slid(ph, image, at, path.to_path_buf());
+        self.name = path.file_name().and_then(|s| s.to_str()).unwrap_or("vug").to_string();
+        self.retitle();
+        Ok(())
+    }
+}
+
+// ---- VUGFACEHELPOVERLAY (LEDGER SR650): SHORTCUTS' in-face reader ----
+// [`SHORTCUTS`] had one reader, main.rs's `--help`. `?` (view.rs, the base match's tail: any layer that types or owns
+// `?` takes it first) opens it over the face in the report sheet's style through journal.rs `paint_panel`, THE panel
+// painter; `?` again turns the page, past the last one it closes; Escape closes it (view.rs `View::help_key`, the head of
+// [`Viewer::key`]); every other key passes, so the face underneath stays live. The table stays the one source.
+
+/// The help overlay while it is open: the page shown (rows `page * panel_fit ..`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Help {
+    pub page: usize,
+}
+
+impl Help {
+    /// [`SHORTCUTS`] in its own order as two columns, `<key> <word>`, the key padded to the longest key (capped at half
+    /// of `cols`; a longer key is clipped to it), upper-cased (the bitmap font's case). The panel clips each row to `cols`.
+    pub fn rows(cols: usize) -> Vec<String> {
+        let kw = SHORTCUTS.iter().map(|(k, _)| k.chars().count()).max().unwrap_or(0).min((cols / 2).max(1));
+        SHORTCUTS
+            .iter()
+            .map(|(k, what)| {
+                let key: String = k.chars().take(kw).collect();
+                format!("{key:<kw$} {what}").to_uppercase()
+            })
+            .collect()
+    }
+
+    /// The pages [`SHORTCUTS`] takes in the panel on a frame `height` tall (journal.rs `panel_fit` rows a page), at least one.
+    pub fn pages(height: u32) -> usize {
+        SHORTCUTS.len().div_ceil(journal::panel_fit(height)).max(1)
+    }
+
+    /// `?`: closed opens the first page, a page turns to the next, the last page closes.
+    pub fn next(cur: Option<Help>, height: u32) -> Option<Help> {
+        match cur {
+            None => Some(Help { page: 0 }),
+            Some(h) if h.page + 1 < Help::pages(height) => Some(Help { page: h.page + 1 }),
+            Some(_) => None,
+        }
+    }
 }

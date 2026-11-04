@@ -299,3 +299,43 @@ fn hundred_thousand_triangles_frame_time() {
     let f = f.unwrap();
     assert_ne!(f.pixel(400, 300), rgba(BACKGROUND));
 }
+
+/// VUGFACEHELPOVERLAY (LEDGER SR650): `?` lists SHORTCUTS (the one table, its `?` row included) in the panel over a
+/// live face: the paint probe finds the first row's key (`H / 0`, the font's 'H' inks its top-left pixel) in the sheet's
+/// ink, a navigation key still turns the view with the list open, `?` closes it, Escape closes it; on a short frame
+/// `?` walks every page and then closes.
+#[test]
+fn the_question_key_lists_the_shortcuts_over_a_live_face() {
+    assert!(vug_view::SHORTCUTS.iter().any(|(k, _)| *k == "?"), "SHORTCUTS carries the help key's own row");
+    let mut v = Viewer::new(cube_model(), "cube", (640, 480), Preset::Una);
+    assert_eq!(vug_view::Help::pages(480), 1, "640x480 holds the table on one page");
+    let probe = |v: &Viewer| raster::render(&v.model, &v.view).pixel(vug_view::journal::panel_x0(640) as u32 + 4, 4);
+    let closed = probe(&v);
+    assert!(v.input(&SMessage::BrowserText("?".into())));
+    assert_eq!(v.view.help, Some(vug_view::Help { page: 0 }));
+    let ink = rgba(palette_core::TEXT_PRIMARY.1);
+    assert_eq!(probe(&v), ink, "the first row's key is painted in the sheet's ink");
+    assert_ne!(closed, ink);
+    assert!(vug_view::Help::rows(60)[0].starts_with("H / 0"));
+    // The face underneath stays live: `1` turns to the front view and the list stays open.
+    let was = v.view.camera;
+    assert!(v.key("1"));
+    assert_ne!(v.view.camera, was);
+    assert!(v.view.help.is_some());
+    assert!(v.key("?"));
+    assert_eq!(v.view.help, None, "one page: `?` again closes");
+    assert!(!v.view.help_key("Escape").unwrap_or(false), "Escape is not the help's while it is closed");
+    v.key("?");
+    assert!(v.key("Escape"));
+    assert_eq!(v.view.help, None, "Escape closes");
+    // A short frame pages: `?` walks every page, then closes.
+    let mut s = Viewer::new(cube_model(), "cube", (W, H), Preset::Una);
+    let pages = vug_view::Help::pages(H);
+    assert!(pages > 1);
+    for p in 0..pages {
+        assert!(s.key("?"));
+        assert_eq!(s.view.help, Some(vug_view::Help { page: p }));
+    }
+    assert!(s.key("?"));
+    assert_eq!(s.view.help, None);
+}
