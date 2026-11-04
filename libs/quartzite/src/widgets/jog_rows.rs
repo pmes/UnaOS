@@ -4,8 +4,8 @@
 //! [`comscan::PumpCard::hear`], and hands a [`CardSnapshot`]); what a face derives from it is written ONCE here,
 //! platform-neutral (std + bandy + comscan, no toolkit): the rows ([`jog_rows`]) and the verb a key fires ([`key_verb`],
 //! the card's own `press`, so nothing new rides the wire and the desk stays the one validator). The pad is greyed, with
-//! the reason said, while no link is up. `platforms/gtk/console_view.rs` paints them; the AppKit face is owed
-//! (VUG-COMSCAN-JOG-FACE-MACOS).
+//! the reason said, while no link is up. `platforms/gtk/console_view.rs` paints them, and (VUGCOMSCANJOGFACEMACOS,
+//! SR622) so does the AppKit Console pane, `platforms/macos/console_view.rs` `jog_pad`.
 
 use bandy::SMessage;
 use comscan::{CardSnapshot, Pad, PumpCard};

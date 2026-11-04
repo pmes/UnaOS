@@ -142,12 +142,14 @@ pub fn bootstrap_console_held(console: &ConsoleTetra, synapse: Synapse) -> (Reta
         let _: () = msg_send![&root, addArrangedSubview: &*filters];
         let _: () = msg_send![&root, addArrangedSubview: &*scroll];
     }
+    let pad = jog_pad(&root, synapse.clone(), mtm); // VUGCOMSCANJOGFACEMACOS (SR622): the jog pad under the scrollback, painted from widgets::jog_rows
 
     let bound = std::sync::Arc::new(dispatch2::MainThreadBound::new(state, mtm));
     let mut rx = synapse.subscribe();
     let abort = super::tetra_eval::face_subscribe("console-view", async move {
         loop {
             match rx.recv().await {
+                Ok(msg @ SMessage::Pump(_)) => pad.hear(&msg), // VUGCOMSCANJOGFACEMACOS (SR622): the pad rides this one subscriber, so the evaluator's abort (SR441) ends both
                 Ok(SMessage::Logs(LogEvent::LogTail { lines, dropped, paused })) => {
                     let rows = console_rows::rows_from_tail(&lines);
                     let bound = bound.clone();
@@ -187,5 +189,164 @@ pub fn open_console_window(synapse: Synapse) {
         let _: () = msg_send![&w, center];
         let _: () = msg_send![&w, makeKeyAndOrderFront: None::<&AnyObject>];
         WINDOWS.with(|ws| ws.borrow_mut().push(w));
+    }
+}
+
+// --- VUGCOMSCANJOGFACEMACOS (LEDGER SR622): the Console's jog pad on AppKit, painted from widgets::jog_rows (named tail hunk) ---
+
+/// The jog pad's card and widgets, on the main thread only (the GTK `JogPad`'s counterpart): comscan's `PumpCard` (the
+/// pad's state, folded from the bus) and the views painting `widgets::jog_rows` over its snapshot.
+struct PadState {
+    card: RefCell<comscan::PumpCard>,
+    link: Retained<NSTextField>,
+    travel: Retained<NSTextField>,
+    position: Retained<NSTextField>,
+    squawk: Retained<NSTextField>,
+    why: Retained<NSTextField>,
+    steps: RefCell<Vec<(f64, Retained<NSView>)>>,
+    keys: RefCell<Vec<Retained<NSView>>>,
+}
+
+/// The pad's handle the subscriber loop holds: Send (the loop runs on its own thread); every touch hops to the main
+/// thread, as the LogTail arm does.
+struct JogPad {
+    bound: std::sync::Arc<dispatch2::MainThreadBound<Rc<PadState>>>,
+}
+
+/// Build the jog pad, add it under `root`'s scrollback and paint its first rows. Keys fire on `synapse` as the local
+/// user; the step picker is the filter row's ✓ convention (no segmented control in the house). Main thread only.
+fn jog_pad(root: &objc2_app_kit::NSStackView, synapse: Synapse, mtm: MainThreadMarker) -> JogPad {
+    use super::meter::{ns_color, LABEL};
+    use crate::widgets::jog_rows::{key_verb, KEYS, STEPS_MM};
+    let who = bandy::Origin::LocalUser(std::env::var("USER").unwrap_or_else(|_| "una".into()));
+    let st = Rc::new(PadState {
+        card: RefCell::new(comscan::PumpCard::new(who)),
+        link: label(""),
+        travel: label(""),
+        position: label(""),
+        squawk: label(""),
+        why: label(""),
+        steps: RefCell::new(Vec::with_capacity(STEPS_MM.len())),
+        keys: RefCell::new(Vec::with_capacity(KEYS.len())),
+    });
+    // dim-label's twin: the palette's legend colour.
+    let _: () = unsafe { msg_send![&st.why, setTextColor: &*ns_color(LABEL)] };
+
+    let step_row = stack(false);
+    let step_name = label("step");
+    let _: () = unsafe { msg_send![&step_row, addArrangedSubview: &*step_name] };
+    for mm in STEPS_MM {
+        let w = Rc::downgrade(&st);
+        let b = super::button::bootstrap_button_with(&format!("{mm} mm"), Box::new(move || {
+            if let Some(st) = w.upgrade() {
+                st.card.borrow_mut().set_step(mm);
+                render_pad(&st);
+            }
+        }));
+        let _: () = unsafe { msg_send![&step_row, addArrangedSubview: &*b] };
+        st.steps.borrow_mut().push((mm, b));
+    }
+    hug(&step_row, 1);
+
+    let key_row = stack(false);
+    for (k, name) in KEYS {
+        let (w, syn) = (Rc::downgrade(&st), synapse.clone());
+        let b = super::button::bootstrap_button_with(name, Box::new(move || {
+            if let Some(st) = w.upgrade() {
+                syn.fire(key_verb(&st.card.borrow(), k));
+            }
+        }));
+        let _: () = unsafe { msg_send![&key_row, addArrangedSubview: &*b] };
+        st.keys.borrow_mut().push(b);
+    }
+    hug(&key_row, 1);
+
+    for l in [&st.link, &st.travel, &st.position, &st.squawk, &st.why] {
+        hug(l, 1);
+    }
+    let pad = stack(true);
+    unsafe {
+        // NSLayoutAttributeWidth = 7: every row fills the width, as in the root.
+        let _: () = msg_send![&pad, setAlignment: 7isize];
+        let _: () = msg_send![&pad, addArrangedSubview: &*st.link];
+        let _: () = msg_send![&pad, addArrangedSubview: &*st.travel];
+        let _: () = msg_send![&pad, addArrangedSubview: &*st.position];
+        let _: () = msg_send![&pad, addArrangedSubview: &*st.squawk];
+        let _: () = msg_send![&pad, addArrangedSubview: &*step_row];
+        let _: () = msg_send![&pad, addArrangedSubview: &*key_row];
+        let _: () = msg_send![&pad, addArrangedSubview: &*st.why];
+    }
+    hug(&pad, 1);
+    let _: () = unsafe { msg_send![root, addArrangedSubview: &*pad] };
+
+    render_pad(&st);
+    JogPad { bound: std::sync::Arc::new(dispatch2::MainThreadBound::new(st, mtm)) }
+}
+
+impl JogPad {
+    /// Fold a bus message into the card (pump answers only) and repaint, on the main thread.
+    fn hear(&self, msg: &SMessage) {
+        if let SMessage::Pump(ev) = msg {
+            let (ev, bound) = (ev.clone(), self.bound.clone());
+            dispatch2::DispatchQueue::main().exec_async(move || {
+                let mtm = MainThreadMarker::new().unwrap();
+                let st = bound.get(mtm);
+                st.card.borrow_mut().hear(&ev);
+                render_pad(st);
+            });
+        }
+    }
+}
+
+fn set_field(field: &NSTextField, text: &str) {
+    let s = NSString::from_str(text);
+    let _: () = unsafe { msg_send![field, setStringValue: &*s] };
+}
+
+fn set_hidden(view: &NSView, hidden: bool) {
+    let _: () = unsafe { msg_send![view, setHidden: Bool::new(hidden)] };
+}
+
+/// Paint `jog_rows` over the card's snapshot: the optional rows shown only when present, the step titles ticked on the
+/// card's step, the picker and keys disabled while no link is up. The pump's words are sanitized like every Console
+/// line. Main thread only.
+fn render_pad(st: &PadState) {
+    use crate::widgets::jog_rows::{jog_rows, JogRow};
+    let rows = jog_rows(&st.card.borrow().snapshot());
+    set_hidden(&st.position, true);
+    set_hidden(&st.squawk, true);
+    set_hidden(&st.why, true);
+    for row in rows {
+        match row {
+            JogRow::Link(t) => set_field(&st.link, &t),
+            JogRow::Travel(t) => set_field(&st.travel, &t),
+            JogRow::Position(t) => {
+                set_field(&st.position, &t);
+                set_hidden(&st.position, false);
+            }
+            JogRow::Squawk(t) => {
+                set_field(&st.squawk, &crate::tetra::sanitize_line(&t));
+                set_hidden(&st.squawk, false);
+            }
+            JogRow::Why(t) => {
+                set_field(&st.why, &t);
+                set_hidden(&st.why, false);
+            }
+            JogRow::Steps { chosen, enabled, .. } => {
+                for (mm, b) in st.steps.borrow().iter() {
+                    let t = if *mm == chosen { format!("✓ {mm} mm") } else { format!("{mm} mm") };
+                    let s = NSString::from_str(&t);
+                    unsafe {
+                        let _: () = msg_send![&**b, setTitle: &*s];
+                        let _: () = msg_send![&**b, setEnabled: Bool::new(enabled)];
+                    }
+                }
+            }
+            JogRow::Pad { enabled, .. } => {
+                for b in st.keys.borrow().iter() {
+                    let _: () = unsafe { msg_send![&**b, setEnabled: Bool::new(enabled)] };
+                }
+            }
+        }
     }
 }
