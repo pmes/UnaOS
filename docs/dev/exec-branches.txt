@@ -1352,12 +1352,12 @@ exec-rmbp-vugfacedeviationlive ae12b39c1 wave36 cut51
 exec-rmbp-vugscangdtspec ae12b39c1 wave36 cut51
 exec-rmbp-vugfacegdtremeasure ae12b39c1 wave36 cut51
 exec-rmbp-vugcomscanhostdesk ae12b39c1 wave36 cut51
-exec-rmbp-f39continueignite ae49d500c wave36 cut52
-exec-rmbp-f39veillogin ae49d500c wave36 cut52
-exec-rmbp-f39clickheld ae49d500c wave36 cut52
-exec-rmbp-f39hidplacerender ae49d500c wave36 cut52
-exec-rmbp-f39menuscroll ae49d500c wave36 cut52
-exec-rmbp-f39unafsholdrelease ae49d500c wave36 cut52
+exec-rmbp-f39continueignite c216d4f04 FOLDED (kernel batch B1115-B1126)
+exec-rmbp-f39veillogin 3db567ef6 FOLDED (kernel batch B1115-B1126)
+exec-rmbp-f39clickheld dd96b0a61 FOLDED (kernel batch B1115-B1126)
+exec-rmbp-f39hidplacerender f058d0156 FOLDED (kernel batch B1115-B1126)
+exec-rmbp-f39menuscroll cd3b2cc1e FOLDED (kernel batch B1115-B1126)
+exec-rmbp-f39unafsholdrelease c9b74e4d1 FOLDED (kernel batch B1115-B1126)
 exec-rmbp-vugscantsdfedgefar ae49d500c wave36 cut52
 exec-rmbp-vugintentundoset ae49d500c wave36 cut52
 exec-rmbp-vugfacegdtdatumspick ae49d500c wave36 cut52
@@ -1365,12 +1365,12 @@ exec-rmbp-vugfacedeviationsolidfault ae49d500c wave36 cut52
 exec-rmbp-vugcomscanhostdialect ae49d500c wave36 cut52
 exec-rmbp-vugscangdtprofiledatum ae49d500c wave36 cut52
 exec-rmbp-vugphotosideparallax ae49d500c wave36 cut52
-exec-rmbp-f39continuerest 3d5151e40 wave36 cut53
-exec-rmbp-f39veilloginpi 3d5151e40 wave36 cut53
-exec-rmbp-f39menukeysone 3d5151e40 wave36 cut53
-exec-rmbp-f39hidpumparm 3d5151e40 wave36 cut53
-exec-rmbp-f39unafslockone 3d5151e40 wave36 cut53
-exec-rmbp-f39doorstidy 3d5151e40 wave36 cut53
+exec-rmbp-f39continuerest af57e4842 FOLDED (kernel batch B1115-B1126)
+exec-rmbp-f39veilloginpi 9b17fd9ee FOLDED (kernel batch B1115-B1126)
+exec-rmbp-f39menukeysone 5162f270f FOLDED (kernel batch B1115-B1126)
+exec-rmbp-f39hidpumparm b3917818b FOLDED (kernel batch B1115-B1126)
+exec-rmbp-f39unafslockone c2f3730be FOLDED (kernel batch B1115-B1126)
+exec-rmbp-f39doorstidy 29930b0d8 FOLDED (kernel batch B1115-B1126)
 exec-rmbp-vugfacephotosideparallax 3d5151e40 wave36 cut53
 exec-rmbp-vugintentsetface 3d5151e40 wave36 cut53
 exec-rmbp-vugfacegdtreport 3d5151e40 wave36 cut53
