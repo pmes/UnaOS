@@ -704,7 +704,8 @@ fn shift(scan: &ScanMesh, design: &Design, bvh: &Bvh, normals: &[Vec3], sample: 
 /// view ([`front`] under [`COARSE_VIEW_FRONT`]); else the design frame (x, y, z = x × y from the principal axes) with
 /// the sweep's pivot (z for `Sweep::View`, frame index `i` for `Sweep::About(i)`, VUGSCANDEVIATIONCOARSESYM SR636) of
 /// both signs, the next axis swept about it in [`COARSE_VIEW_STEPS`] steps, onto the scan's frame as [`coarse`] builds
-/// it, each [`shift`]ed at `p.gate(0)`·[`COARSE_WIDEN`]; the best [`COARSE_VIEW_KEEP`] by [`trimmed`] at `p.gate(0)`
+/// it (for `Sweep::About`, cycled so the scan's own unique axis, [`partner`], takes the pivot's slot: VUGSCANCOARSESYMPIVOT
+/// SR642), each [`shift`]ed at `p.gate(0)`·[`COARSE_WIDEN`]; the best [`COARSE_VIEW_KEEP`] by [`trimmed`] at `p.gate(0)`
 /// over [`COARSE_SELECT_KEEP`] (the first on a tie), each carrying its start score ([`trimmed`] at `p.gate(0)`,
 /// [`COARSE_KEEP`]).
 pub fn coarse_view(scan: &ScanMesh, design: &Design, bvh: &Bvh, p: &AlignParams, tol: Tol, sweep: Sweep) -> Option<Vec<(Transform, f64)>> {
@@ -720,9 +721,9 @@ pub fn coarse_view(scan: &ScanMesh, design: &Design, bvh: &Bvh, p: &AlignParams,
     if view && !(front(scan, &sample) >= COARSE_VIEW_FRONT) {
         return None;
     }
-    let (cs, xs, ys, _) = axes(&scan.mesh)?;
+    let (cs, xs, ys, ws) = axes(&scan.mesh)?;
     let (cd, xd, yd, _) = axes(&design.mesh)?;
-    let inv = crate::geom::from_axes(xs, ys, xs.cross(ys), cs).invert().ok()?;
+    let inv = scan_frame(xs, ys, cs, axis, partner(ws, sweep)).invert().ok()?; // VUGSCANCOARSESYMPIVOT (SR642): the scan's partner of the pivot by its own eigenvalues
     let frame = [xd, yd, xd.cross(yd)];
     let normals = design.mesh.normals_face(tol);
     let mut scored: Vec<(f64, Transform, f64)> = Vec::with_capacity(2 * COARSE_VIEW_STEPS);
@@ -814,4 +815,50 @@ fn sym_or(scan: &ScanMesh, design: &Design, bvh: &Bvh, p: &AlignParams, tol: Tol
         Some(sym) if !sym.is_empty() => sym,
         _ => starts,
     }
+}
+
+// ---- VUGSCANCOARSESYMPIVOT (LEDGER SR642): the scan's partner of the design's pivot ----
+// SR636's sweep turns the design about its pivot (the unique axis of a degenerate moment pair) but put that pivot on the
+// scan frame's axis of the SAME index: right when both are the ground normal (SR636's near-square box: the design's
+// smallest, the scan's smallest), wrong for a tall part on a ground scan. MEASURED (an analytic model of the orbit scan's
+// visible surfaces, SR636's): the bench's post r40 h150 with four pins r10 h40 at radius 75 (C4: the design's two lateral
+// moments equal, 1162.0 / 1162.0 / 2646.8, so its pivot is the LARGEST axis, index 0; a bare cylinder cannot be aligned
+// at all: q × n has no axial part on it, so `align`'s spin is unconstrained) on a 360 x 310 ground (66.2% of the scan):
+// the scan's eigenvalues 1949.6 / 5972.2 / 7924.0 (ratios 0.326 / 0.754) make its unique axis the SMALLEST, the ground
+// normal, and the same-index pairing laid the post on the ground's long axis (every kept start 90° off, the road
+// refused). [`partner`] reads the scan's own spectrum: the end whose ratio to its neighbour is the less degenerate (w0·w2
+// against w1², division-free), the tie to the design's pivot; [`scan_frame`] cycles the scan frame so that axis takes
+// the pivot's slot (a cyclic order keeps it right-handed; the same index is SR636's frame float for float, so SR636's
+// fixture, whose scan pairs 2 with 2, keeps its numbers). Modelled the kept starts 0.0° off in axis and the road aligned
+// within 0.16° modulo the pins' C4. A scan near-degenerate itself has no trustworthy end (the bare post on a 240 x 220
+// ground: 0.957 / 0.896 picks a horizontal axis): both ends tried is owed inside VUG-SCAN-DEVIATION-COARSE-SYM-PIVOT.
+
+/// The scan-frame index (0 the largest axis, 2 the smallest) that takes the sweep's pivot, from the scan's ascending
+/// eigenvalues `w`: `Sweep::View` 2 (SR626's road); `Sweep::About(i)` the scan's unique end, 2 when w0/w1 < w1/w2
+/// (w0·w2 < w1²), 0 when greater, else (equal, or unordered) the design's pivot `i`.
+fn partner(w: [f64; 3], sweep: Sweep) -> usize {
+    match sweep {
+        Sweep::View => 2,
+        Sweep::About(i) => {
+            let (ends, mid) = (w[0] * w[2], w[1] * w[1]);
+            if ends < mid {
+                2
+            } else if ends > mid {
+                0
+            } else {
+                i.min(2)
+            }
+        }
+    }
+}
+
+/// The scan's principal frame (x the largest, y the middle, x × y) at `cs`, cycled so its axis `j` sits at slot `axis`
+/// (`j == axis` is the frame in its own order).
+fn scan_frame(xs: Vec3, ys: Vec3, cs: Vec3, axis: usize, j: usize) -> Transform {
+    let f = [xs, ys, xs.cross(ys)];
+    let mut g = [Vec3::ZERO; 3];
+    for k in 0..3 {
+        g[(axis + k) % 3] = f[(j + k) % 3];
+    }
+    crate::geom::from_axes(g[0], g[1], g[2], cs)
 }
