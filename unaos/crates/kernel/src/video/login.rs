@@ -734,7 +734,7 @@ fn take_down() {
     LOCKED.store(false, Ordering::Relaxed); // SCREENLOCK: the locked mode ends with the row, whichever way it ends
     let id = WIN.swap(wm::WIN_NONE, Ordering::Relaxed);
     if id != wm::WIN_NONE {
-        crate::boot::note_screen(false); #[cfg(feature = "facet")] { crate::video::wallpaper::veil_login_down(); } #[cfg(feature = "facet")] { wm::desktop_repaint(); } wm::clear_modal_top(id); wm::close(id); /* VEIL-LOGIN (B1116): the backdrop back to the picture, the whole desktop layer once; VEIL-LOGIN-HELD (B1128): the field freed unless its rebuild is over the raise budget */ // LOGINZ (B223): the ceiling goes with the row
+        crate::boot::note_screen(false); #[cfg(feature = "facet")] { crate::video::wallpaper::veil_login_down(); } #[cfg(feature = "facet")] { wm::desktop_repaint(); } wm::clear_modal_top(id); close_or_owe(id); /* VEIL-LOGIN (B1116): the backdrop back to the picture, the whole desktop layer once; VEIL-LOGIN-HELD (B1128): the field freed unless its rebuild is over the raise budget */ // LOGINZ (B223): the ceiling goes with the row // seat fold (B1128 + B1129): the veil down and the owed close on the one take_down line
         fbcon::console_present_suspend(false);
     }
     let mut f = FORM.lock();
@@ -749,7 +749,7 @@ fn take_down() {
 }
 
 fn close_into_session() {
-    take_down();
+    OWE_CLOSE.store(true, Ordering::Relaxed); take_down(); OWE_CLOSE.store(false, Ordering::Relaxed); // CONTINUE-CLOSE-DRAIN (rmbp-ledger B1129): the session press hides the login row and owes its close to the device-service pass (`close_or_owe`, file tail), so the press never waits in `close`'s DrainBarrier. LINE-NEUTRAL, code first
     crate::boot::session_opened(); // INSTALLBARE M3 (R86): the Desktop phase begins here; the services open when the shell has launched (or the bound)
     if SWEPT.swap(false, Ordering::AcqRel) {
         REIGNITED.fetch_add(1, Ordering::Relaxed); // LOGINFURN (R88): a session opened over a swept desktop — and it stays BARE: nothing is posted
@@ -4151,3 +4151,19 @@ fn session_line() {
     };
     serial_println!("[session] opened user={} ms={}.{} deferred={} from={}", who, us / 1000, (us % 1000) / 100, deferred, from);
 }
+
+// CONTINUE-CLOSE-DRAIN (rmbp-ledger B1129) — TAIL-APPENDED. The road into a session (`close_into_session`) takes the
+// screen down without waiting on a compositor pass: `take_down`'s close is OWED (`wm::close_owed`: the row hidden at once by
+// `above_shell`, closed on x86's next device-service pass; any other build closes at once). `OWE_CLOSE` is set only around
+// that one `take_down`; every other `take_down` (the lock, the refusals, Log Out, the words sheet) closes as before.
+static OWE_CLOSE: AtomicBool = AtomicBool::new(false);
+
+/// CONTINUE-CLOSE-DRAIN: `take_down`'s close — owed on the session road, at once everywhere else.
+fn close_or_owe(id: wm::WinId) {
+    if OWE_CLOSE.swap(false, Ordering::Relaxed) {
+        wm::close_owed(id);
+    } else {
+        wm::close(id);
+    }
+}
+
