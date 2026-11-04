@@ -551,7 +551,7 @@ pub fn overlay(view: &View, fr: &mut Raster) {
 /// [`regenerate`] share. An extrude / revolve appends its id (the pull's brep is appended, its statement too); a
 /// fillet / chamfer replaces the id equal to its `on` in place (the face's edit replaces `breps[k]`; replay keeps the
 /// `on` solid and pushes the edit's at the end, so the order is the document's, not replay's).
-fn live_solids(doc: &Doc) -> Vec<String> {
+pub(crate) fn live_solids(doc: &Doc) -> Vec<String> {
     let mut ids: Vec<String> = Vec::new();
     for s in &doc.stmts {
         match s {
@@ -569,7 +569,44 @@ fn live_solids(doc: &Doc) -> Vec<String> {
 
 /// The replayed Breps in Body order ([`live_solids`]): each id's LAST solid (as replay's `edit_step` reads its `on`).
 fn live_breps(doc: &Doc, solids: &[doc_core::SolidOut]) -> Vec<brep_core::Brep> {
-    live_solids(doc).iter().filter_map(|id| solids.iter().rev().find(|o| o.id == *id).map(|o| o.brep.clone())).collect()
+    live_outs(doc, solids).into_iter().map(|o| o.brep.clone()).collect() // VUGFACEDEVIATIONLIVE (SR558): the lookup is live_outs'
+}
+
+// ---- VUGFACEDEVIATIONLIVE (SR558): the live solids and the solid statements, for the deviation map too ----
+
+/// The replayed solids in Body order ([`live_solids`]): each live id's LAST solid (as replay's `edit_step` reads its
+/// `on`). [`live_breps`] (the Body) and deviation.rs `design` (the measured design) both read it.
+pub(crate) fn live_outs<'a>(doc: &Doc, solids: &'a [doc_core::SolidOut]) -> Vec<&'a doc_core::SolidOut> {
+    live_solids(doc).iter().filter_map(|id| solids.iter().rev().find(|o| o.id == *id)).collect()
+}
+
+/// The statements doc_core's `replay` feeds into solids, in document order: every extrude / revolve and fillet /
+/// chamfer, and each sketch an extrude / revolve names with its entities and constraints (its solve, its profiles and
+/// its frame). An Op (replay feeds it to the Program only), the machine, a scan and a sketch no feature names are not:
+/// an edit of those changes no solid (deviation.rs `follow` re-measures only when this list, or the Tol, changes).
+pub fn solid_stmts(doc: &Doc) -> Vec<Stmt> {
+    let named: Vec<&str> = doc
+        .stmts
+        .iter()
+        .filter_map(|s| match s {
+            Stmt::Extrude { sketch, .. } | Stmt::Revolve { sketch, .. } => Some(sketch.as_str()),
+            _ => None,
+        })
+        .collect();
+    doc.stmts
+        .iter()
+        .filter(|s| match s {
+            Stmt::Extrude { .. } | Stmt::Revolve { .. } | Stmt::Fillet { .. } | Stmt::Chamfer { .. } => true,
+            Stmt::Sketch { id: sk, .. }
+            | Stmt::Point { sketch: sk, .. }
+            | Stmt::Line { sketch: sk, .. }
+            | Stmt::Circle { sketch: sk, .. }
+            | Stmt::Arc { sketch: sk, .. }
+            | Stmt::Constraint { sketch: sk, .. } => named.contains(&sk.as_str()),
+            _ => false,
+        })
+        .cloned()
+        .collect()
 }
 
 impl Journal {
