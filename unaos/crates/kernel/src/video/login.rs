@@ -975,7 +975,7 @@ pub fn consume_key(c: u8) -> bool {
         b'\t' if power_tab() => {} // DIALOG2: Tab walks Name -> Password -> Sleep -> Restart -> Shut Down -> Name
         b'\n' | b'\r' | b' ' if PFOCUS.load(Ordering::Relaxed) != 0 => power_pick(PFOCUS.load(Ordering::Relaxed) - 1, "key"),
         0x20..=0x7e | 8 | 0x7f if PFOCUS.load(Ordering::Relaxed) != 0 => {} // a power button has the keyboard: it takes no text
-        0x1C | 0x1D if arrow_pick(c == 0x1C) => {} // LOGINWINDOW (B430): Right/Left pick the next/previous user tile
+        una_abi::KEY_RIGHT | una_abi::KEY_LEFT if arrow_pick(c == una_abi::KEY_RIGHT) => {} // LOGINWINDOW (B430): Right/Left pick the next/previous user tile
         b'\x1b' if esc_back() => {} // LOGINWINDOW: Esc from the password field goes back to picking a tile
         b'\n' | b'\r' if return_opens() => {} // LOGINWINDOW: Return on an arrow-picked tile opens its password field
         b'\x1b' => {} // R24: Esc dismisses menus only; the screen stays

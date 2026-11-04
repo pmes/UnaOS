@@ -224,7 +224,7 @@ impl LineSel {
     /// cells: a byte that edits the line (printable, BS/DEL, CR/LF) drops a live selection. The
     /// editor has no caret, so it cannot replace a selection with what is typed (a Mac text field
     /// would); keeping the selection across the edit would paint the band over cells that moved.
-    /// A byte that edits nothing — Esc, an arrow's `0x1C..0x1F` — leaves it alone, which matters:
+    /// A byte that edits nothing — Esc, an arrow's `KEY_RIGHT..=KEY_UP` — leaves it alone, which matters:
     /// the decoders push `Shift+←`'s arrow byte onto the ring JUST AHEAD of its `SelectLeft`.
     /// Returns `true` iff the selection changed.
     pub fn on_edit(&mut self, c: u8, len: usize) -> bool {

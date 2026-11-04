@@ -2080,8 +2080,8 @@ pub fn close() {
 
 /// Keyboard. Returns `true` when the key was CONSUMED.
 ///
-/// Arrow keys arrive as the C0 codes the HID map assigns (`0x1C..=0x1F`, right/left/down/up) — the
-/// same bytes `una_abi::KEY_RIGHT`..`KEY_UP` publish to ring 3, decoded once in the driver.
+/// Arrow keys arrive as una_abi's `KEY_RIGHT` / `KEY_LEFT` / `KEY_DOWN` / `KEY_UP` — the C0 bytes the HID map
+/// assigns, decoded once in the driver and published to ring 3 unchanged.
 ///
 /// ### SO9 — THE GATE IS FOCUS, NOT PRESENCE
 ///
@@ -3754,7 +3754,7 @@ pub fn selftest() {
 ///    holds focus, because [`open`] raises through `wm::focus_changed(OWNER)`.
 ///    A DECLINE is a SKIP, not a FAIL: at 640x480 `open()` refuses by design so the pixel-exact video
 ///    battery is unperturbed, and that refusal is not this fixture's defect.
-/// 2. `arrow` — `wc_route_event(Key(0x1E))` is CONSUMED (`Event::Unknown`) while Quarry is FOCUSED.
+/// 2. `arrow` — `wc_route_event(Key(KEY_DOWN))` is CONSUMED (`Event::Unknown`) while Quarry is FOCUSED.
 ///    Down-arrow, the key that fell through to `handle_key` on every board before F1.
 /// 3. `enter_blind` — **SO9, and the leg this fixture exists for now.** Focus is handed to the
 ///    console owner (`wm::focus_changed(KERNEL_OWNER_CONSOLE)`, which raises the console's rows and
@@ -3768,7 +3768,7 @@ pub fn selftest() {
 ///    that used to sit in `key_route` is retracted by ruling, and this leg is the tripwire against a
 ///    reader restoring it (`docs/dev/RULINGS.md` R24).
 /// 5. `shut` — THE CONTROL, and the leg that makes leg 2 mean something. With Quarry closed,
-///    `key_route(Key(0x1E))` must return FALSE: `on_glass()` is the conjunct that stops a closed file
+///    `key_route(Key(KEY_DOWN))` must return FALSE: `on_glass()` is the conjunct that stops a closed file
 ///    manager stealing the shell's arrows, and a fixture that only ever tested the open case could not
 ///    tell a working guard from a missing one.
 ///

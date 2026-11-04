@@ -690,8 +690,8 @@ pub fn key_route(ev: crate::pal::Event) -> bool {
             post(Act::Toggle);
             true
         }
-        crate::pal::Event::Key(0x1D) | crate::pal::Event::Key(0x1C) => {
-            let back = matches!(ev, crate::pal::Event::Key(0x1D));
+        crate::pal::Event::Key(una_abi::KEY_LEFT) | crate::pal::Event::Key(una_abi::KEY_RIGHT) => {
+            let back = matches!(ev, crate::pal::Event::Key(una_abi::KEY_LEFT));
             let cur = STATE.lock().as_ref().map(|s| s.shown_ms).unwrap_or(0);
             post(Act::Seek(if back { cur.saturating_sub(STEP_MS) } else { cur + STEP_MS }));
             true
