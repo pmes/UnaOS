@@ -230,7 +230,7 @@ fn r3_tag(verb: u8) -> Option<u8> {
 #[cfg(feature = "busreg")]
 fn relay(hdr: &crate::bus::BusHdr, body: &[u8]) -> Option<Answer> {
     let tag = r3_tag(hdr.verb)?; if hdr.verb == una_abi::BUS_VERB_PREF_SET && !set_holder_in_session(tag, hdr.corr) { return None; } // PREFSELF-PRELOGIN (B1155): a SET whose fulfiller is not a program of the open session (a PREFS.ELF launched before login) is never relayed — the kernel fulfiller answers (file tail). LINE-NEUTRAL fold.
-    let ops = crate::arch::syscall::busreg_ops();
+    let ops = crate::arch::syscall::busreg_ops(); let held = crate::bus_route::fulfiller_row(tag); // RELAY-RESET-FALLBACK (B1165): the (row, rgen) the relay goes to, read back if a -ECONNRESET answers (file tail). LINE-NEUTRAL fold.
     let h3 = crate::bus::BusHdr { verb: tag, ..*hdr };
     match crate::bus_route::route_request(ops, KCLIENT_ROW, KCLIENT_GEN, principal(), &h3, body) {
         crate::bus_route::Route::Relayed => {}
@@ -244,7 +244,7 @@ fn relay(hdr: &crate::bus::BusHdr, body: &[u8]) -> Option<Answer> {
             if h.principal[0] != PRIN_KERNEL_REPLY {
                 return None; // only a KERNEL-stamped reply is an answer
             }
-            return Some(Answer { status: h.status as i64, body: fr[BUS_HDR_LEN..].to_vec() });
+            if reset_by_kernel(hdr, tag, held, h.status) { return None; } return Some(Answer { status: h.status as i64, body: fr[BUS_HDR_LEN..].to_vec() }); // RELAY-RESET-FALLBACK (B1165): a GET / LIST whose holder died in flight (on_exit's -ECONNRESET) is answered by the kernel fulfiller (file tail). LINE-NEUTRAL fold.
         }
         spins += 1;
         if crate::arch::ms().saturating_sub(t0) >= RELAY_WAIT_MS || spins >= RELAY_SPIN_MAX {
@@ -976,4 +976,31 @@ fn set_holder_in_session(tag: u8, corr: u32) -> bool {
     }
     serial_println!("[prefsbus] relay verb={} corr={} fulfiller=row:{} not in session — kernel fulfiller answers", tag, corr, row);
     false
+}
+
+// =================================================================================================
+// RELAY-RESET-FALLBACK (rmbp-ledger B1165) — TAIL-APPENDED. When a fulfiller row is torn down with a relay
+// in flight (PREFSELF-RELAUNCH B1158 ends a pre-login PREFS.ELF at login; any holder's exit), `bus_route::
+// on_exit` answers the CALLER -ECONNRESET (BANDY3's contract; ring-3 callers keep it). For the kernel
+// client a GET or LIST is a read the kernel's own store answers, so `relay` returns `None` and the kernel
+// fulfiller answers, exactly as for -ENOENT / -EAGAIN / a timeout. The frame cannot say who made the reset:
+// a live holder's own -ECONNRESET reply goes through the same `deliver` and is byte-identical. The key is the
+// row GENERATION both arches bump before `on_exit` (`clear_handle_row`): the reset is kernel-made when the
+// (row, rgen) the relay went to (`bus_route::fulfiller_row`, read before the route) is no longer live; a live
+// holder's own -ECONNRESET stays its final answer. A SET keeps -ECONNRESET final (an in-session holder may
+// have committed it; B1155 already keeps SETs off pre-login holders).
+// =================================================================================================
+/// Is `status` a kernel-made -ECONNRESET for a GET / LIST whose holder `held` has died? Then the kernel
+/// fulfiller answers (`relay` returns `None`).
+#[cfg(feature = "busreg")]
+fn reset_by_kernel(hdr: &crate::bus::BusHdr, tag: u8, held: Option<(usize, u64)>, status: i32) -> bool {
+    if status as i64 != una_abi::ECONNRESET || hdr.verb == una_abi::BUS_VERB_PREF_SET {
+        return false;
+    }
+    let Some((row, rgen)) = held else { return false };
+    if (crate::arch::syscall::busreg_ops().rgen)(row) == rgen {
+        return false; // the holder lives: its own -ECONNRESET is its answer
+    }
+    serial_println!("[prefsbus] relay verb={} corr={} fulfiller gone — kernel fulfiller answers", tag, hdr.corr);
+    true
 }
