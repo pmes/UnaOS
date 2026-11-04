@@ -3742,14 +3742,14 @@ fn shim_pref_leg(ms: u64) -> u32 {
 // is 14 ns/px (VEILCOST's miss row on flight 39), so the whole panel is composed ONCE per wallpaper install
 // (`wallpaper::install` -> [`login_prefill`], off the frame path) into one `VeilCache` keyed by `veil_key` (the picture,
 // the install generation, the theme epoch: a Light/Dark change moves the scrim and re-keys it), and every frame copies
-// the kept row. `wallpaper::row` / `wallpaper::paint` select it while `boot::screen_is_up()`. x86 only: aarch64's
-// 48 MiB heap keeps no panel field and paints the same rows live (owed VEIL-LOGIN-PI).
+// the kept row. `wallpaper::row` / `wallpaper::paint` select it while `boot::screen_is_up()`. aarch64's 48 MiB heap
+// keeps the same field at half resolution, upscaled 2x on the frame (VEIL-LOGIN-PI B1122, the file tail).
 
 /// The login backdrop's field (try-locked by painters; the builder holds it one row at a time).
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", all(target_arch = "aarch64", feature = "facet", feature = "desktop_firmware")))]
 static LOGIN_VEIL: crate::sync::Mutex<VeilCache> = crate::sync::Mutex::new(VeilCache::new());
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", all(target_arch = "aarch64", feature = "facet", feature = "desktop_firmware")))]
 impl VeilCache {
     /// Row `j` of the field keyed `key`: the kept row, composed by `paint` straight into its slot on a miss (no copy
     /// out; `row`'s key check and `reset`). `None` when the field cannot be held: the caller paints uncached.
@@ -3789,7 +3789,7 @@ pub fn login_put(back: &Back, y: usize, x: usize, w: usize, mut put: impl FnMut(
             }
         }
     }
-    let mut t = [0u32; 64];
+    #[cfg(all(target_arch = "aarch64", feature = "facet", feature = "desktop_firmware"))] { if login_half_put(back, y, x, w, &mut put) { return true; } } let mut t = [0u32; 64]; // VEIL-LOGIN-PI (B1122): aarch64 keeps the half field. LINE-NEUTRAL fold, code first
     let mut i = 0;
     while i < w {
         let n = (w - i).min(t.len());
@@ -3842,7 +3842,7 @@ pub fn login_prefill(back: &Back) -> (u64, u64, usize) {
 }
 #[cfg(not(target_arch = "x86_64"))]
 pub fn login_prefill(_back: &Back) -> (u64, u64, usize) {
-    (0, 0, 0)
+    login_half_prefill(_back)
 }
 
 /// Free the login field (the picture went: `wallpaper off`).
@@ -3855,7 +3855,7 @@ pub fn login_veil_drop() {
     drop(old);
 }
 #[cfg(not(target_arch = "x86_64"))]
-pub fn login_veil_drop() {}
+pub fn login_veil_drop() { login_half_drop(); }
 
 /// The bytes the login field holds (0 while contended, and on aarch64).
 #[cfg(target_arch = "x86_64")]
@@ -3864,5 +3864,108 @@ pub fn login_veil_bytes() -> usize {
 }
 #[cfg(not(target_arch = "x86_64"))]
 pub fn login_veil_bytes() -> usize {
+    login_half_bytes()
+}
+
+// ── VEIL-LOGIN-PI (rmbp-ledger B1122, BP-video-11) — TAIL-APPENDED: aarch64 keeps the login field at half resolution ──
+// The full login field (w x h) never fits beside the desktop on aarch64's 48 MiB heap (1920x1200: 9,216,000 B; the
+// Orin's 48 MiB census reads free=884 KiB after the desktop with no wallpaper). The SAME field, `LOGIN_VEIL` through
+// `VeilCache::fill`, keeps samples at panel (2i, 2j), (w/2+1) x (h/2+1) (2,310,244 B at 1920x1200, 309,444 B at
+// 640x480), keyed `veil_key(.., 1)`, and the frame upscales 2x bilinearly. Exact to rounding: `Back::soft` is bilinear
+// between VEIL cell centres whose edges sit at x = 4 + 8k (even) and the blend with black is linear, so the only error
+// is truncation, <= 2 LSB per channel. A refused or contended field paints live through B1116's 64-px painter.
+
+/// Half row `j` of the login field: `out[i]` = the login look at panel `(2i, 2j)`, one `veil::row` sample each.
+#[cfg(all(target_arch = "aarch64", feature = "facet", feature = "desktop_firmware"))]
+fn login_half_row(out: &mut [u32], j: usize, back: &Back, look: crate::video::crystal::veil::Look) {
+    for (i, o) in out.iter_mut().enumerate() {
+        crate::video::crystal::veil::row(core::slice::from_mut(o), 2 * i, 2 * j, Some(back), look);
+    }
+}
+
+/// Columns `x..x + w` of panel row `y` (already clipped by [`login_put`]) from the half field through `put(i, px)`: the
+/// mean of the four half samples around each pixel (a copy at even/even, a 2-tap mean on one odd axis). `false` when
+/// the field is contended or refused its memory (the caller paints live).
+#[cfg(all(target_arch = "aarch64", feature = "facet", feature = "desktop_firmware"))]
+fn login_half_put(back: &Back, y: usize, x: usize, w: usize, put: &mut impl FnMut(usize, u32)) -> bool {
+    let (pw, ph) = (back.w, back.h);
+    let (hw, hh) = (pw / 2 + 1, ph / 2 + 1);
+    let look = crate::video::crystal::veil::Look::login();
+    let Some(mut c) = LOGIN_VEIL.try_lock() else { return false };
+    let k = veil_key(Some(back), (0, 0, pw, ph), 1);
+    let j0 = y >> 1;
+    let j1 = if y & 1 == 1 { (j0 + 1).min(hh - 1) } else { j0 };
+    if c.fill(k, hw, hh, j0, |o| login_half_row(o, j0, back, look)).is_none() {
+        return false;
+    }
+    if j1 != j0 && c.fill(k, hw, hh, j1, |o| login_half_row(o, j1, back, look)).is_none() {
+        return false;
+    }
+    let (r0, r1) = (&c.rows[j0 * hw..(j0 + 1) * hw], &c.rows[j1 * hw..(j1 + 1) * hw]);
+    for i in 0..w {
+        let px = x + i;
+        let a = (px >> 1).min(hw - 1);
+        let b = if px & 1 == 1 { (a + 1).min(hw - 1) } else { a };
+        let (p, q, r, s) = (r0[a], r0[b], r1[a], r1[b]);
+        let rb = (((p & 0x00FF_00FF) + (q & 0x00FF_00FF) + (r & 0x00FF_00FF) + (s & 0x00FF_00FF)) >> 2) & 0x00FF_00FF;
+        let g = (((p & 0x0000_FF00) + (q & 0x0000_FF00) + (r & 0x0000_FF00) + (s & 0x0000_FF00)) >> 2) & 0x0000_FF00;
+        put(i, rb | g);
+    }
+    true
+}
+
+/// [`login_prefill`] on aarch64: every half row through [`VeilCache::fill`] with the lock held one row at a time, then
+/// one timed full-panel upscale through [`login_half_put`] (the frame's path). `(build_us, blit_us, bytes)`;
+/// `(0, 0, 0)` when the field refused its memory (painters then paint live).
+#[cfg(all(target_arch = "aarch64", feature = "facet", feature = "desktop_firmware"))]
+fn login_half_prefill(back: &Back) -> (u64, u64, usize) {
+    let (pw, ph) = (back.w, back.h);
+    if pw == 0 || ph == 0 {
+        return (0, 0, 0);
+    }
+    let (hw, hh) = (pw / 2 + 1, ph / 2 + 1);
+    let look = crate::video::crystal::veil::Look::login();
+    let k = veil_key(Some(back), (0, 0, pw, ph), 1);
+    let t0 = crate::arch::now_cycles();
+    for j in 0..hh {
+        let mut c = LOGIN_VEIL.lock();
+        if c.fill(k, hw, hh, j, |o| login_half_row(o, j, back, look)).is_none() {
+            return (0, 0, 0);
+        }
+    }
+    let t1 = crate::arch::now_cycles();
+    let mut sink = 0u32;
+    for y in 0..ph {
+        login_half_put(back, y, 0, pw, &mut |_: usize, p: u32| sink ^= p);
+    }
+    core::hint::black_box(sink);
+    let blit = crate::video::blitter::cycles_to_us(crate::arch::now_cycles().saturating_sub(t1));
+    let bytes = LOGIN_VEIL.lock().bytes();
+    (crate::video::blitter::cycles_to_us(t1.saturating_sub(t0)), blit, bytes)
+}
+#[cfg(all(not(target_arch = "x86_64"), not(all(target_arch = "aarch64", feature = "facet", feature = "desktop_firmware"))))]
+fn login_half_prefill(_back: &Back) -> (u64, u64, usize) {
+    (0, 0, 0)
+}
+
+/// [`login_veil_drop`] on aarch64: free the half field.
+#[cfg(all(target_arch = "aarch64", feature = "facet", feature = "desktop_firmware"))]
+fn login_half_drop() {
+    let old = {
+        let mut g = LOGIN_VEIL.lock();
+        core::mem::replace(&mut *g, VeilCache::new())
+    };
+    drop(old);
+}
+#[cfg(all(not(target_arch = "x86_64"), not(all(target_arch = "aarch64", feature = "facet", feature = "desktop_firmware"))))]
+fn login_half_drop() {}
+
+/// [`login_veil_bytes`] on aarch64: the bytes the half field holds (0 while contended).
+#[cfg(all(target_arch = "aarch64", feature = "facet", feature = "desktop_firmware"))]
+fn login_half_bytes() -> usize {
+    LOGIN_VEIL.try_lock().map_or(0, |c| c.bytes())
+}
+#[cfg(all(not(target_arch = "x86_64"), not(all(target_arch = "aarch64", feature = "facet", feature = "desktop_firmware"))))]
+fn login_half_bytes() -> usize {
     0
 }
