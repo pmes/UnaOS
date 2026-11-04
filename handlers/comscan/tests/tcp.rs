@@ -438,8 +438,17 @@ const VER_A: &str = "1.1h.20190825:mill-a";
 /// Another board on the same firmware build, its user string `mill-b`.
 const VER_B: &str = "1.1h.20190825:mill-b";
 
-/// grbl 1.1's `$I` answer for build `ver`, written when `line` is `$I`; true when it was.
+/// VUGCOMSCANENVELOPEREADON (SR597): grbl 1.1's `$$` answer, cut to one ordinary setting and the travel, agreeing with the
+/// declared machine (X 350, Y 350, Z 110): the read rides the hello and says nothing here.
+const ENVELOPE_ANSWER: &[u8] = b"$0=10\r\n$130=350.000\r\n$131=350.000\r\n$132=110.000\r\nok\r\n";
+
+/// grbl 1.1's `$I` answer for build `ver`, written when `line` is `$I` (and the `$$` travel answer when it is `$$`); true
+/// when it was.
 fn said_hello(s: &mut TcpStream, line: &str, ver: &str) -> bool {
+    if line == "$$" {
+        let _ = s.write_all(ENVELOPE_ANSWER); // VUGCOMSCANENVELOPEREADON (SR597): neither recorded nor counted
+        return true;
+    }
     if line != "$I" {
         return false;
     }
@@ -580,6 +589,8 @@ fn fake_grbl_named(l: TcpListener, name: Arc<Mutex<String>>, lost_after: Option<
                         if up == "$I" {
                             let ver = format!("1.1h.20190825:{}", name.lock().unwrap());
                             let _ = s.write_all(format!("[VER:{ver}]\r\n[OPT:V,15,128]\r\nok\r\n").as_bytes());
+                        } else if up == "$$" {
+                            let _ = s.write_all(ENVELOPE_ANSWER); // VUGCOMSCANENVELOPEREADON (SR597): the composed desk reads the travel
                         } else if let Some(n) = up.strip_prefix("$I=") {
                             *name.lock().unwrap() = n.to_string();
                             writes.push(up.clone());

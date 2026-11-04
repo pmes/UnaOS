@@ -511,7 +511,7 @@ const VER_A: &str = "1.1h.20190825:mill-a";
 /// grbl 1.1's `$I` answer for build `ver`, written when `line` is `$I`; true when it was.
 fn said_hello(s: &mut impl Write, line: &str, ver: &str) -> bool {
     if line == "$$" {
-        let _ = s.write_all(ENVELOPE_ANSWER); // VUGCOMSCANALARMIDLE (SR591): heard only when the desk's travel read is on
+        let _ = s.write_all(ENVELOPE_ANSWER); // VUGCOMSCANALARMIDLE (SR591); VUGCOMSCANENVELOPEREADON (SR597): heard wherever the hello is on
         return true;
     }
     if line != "$I" {
@@ -546,7 +546,8 @@ fn the_first_tty_open_keeps_the_controllers_answer_to_the_hello() {
     let out = desk.apply(&start, &mut *open);
     let words: Vec<String> =
         out.iter().filter_map(|s| match s { PumpEvent::Squawk { event: Some(e), .. } => Some(e.clone()), _ => None }).collect();
-    assert_eq!(words, vec!["started".to_string(), format!("hello {}", hello_of(VER_A))], "{out:?}");
+    // VUGCOMSCANENVELOPEREADON (SR597): the travel read rides the hello; the fake's `$$` says X 200 against the declared 350.
+    assert_eq!(words, vec!["started".to_string(), format!("hello {}", hello_of(VER_A)), "envelope differs axis=X declared=350 controller=200".to_string()], "{out:?}");
     assert_eq!(desk.hello(), Some(hello_of(VER_A).as_str()), "the first open keeps the answer");
 
     let t0 = Instant::now();
@@ -607,6 +608,8 @@ fn fake_marlin(mut m: File, lines: usize) -> JoinHandle<(Vec<String>, File)> {
                 }
                 if line == "M115" {
                     m.write_all(format!("{MARLIN_FIRMWARE}\r\nCap:SERIAL_XON_XOFF:0\r\nok\r\n").as_bytes()).unwrap();
+                } else if line == "M211" {
+                    m.write_all(MARLIN_SOFT_ENDSTOPS).unwrap(); // VUGCOMSCANENVELOPEREADON (SR597): neither recorded nor counted
                 } else {
                     got.push(line);
                     m.write_all(b"ok\r\n").unwrap();
@@ -623,6 +626,11 @@ fn fake_marlin(mut m: File, lines: usize) -> JoinHandle<(Vec<String>, File)> {
 
 #[test]
 fn a_marlin_start_on_the_host_composition_says_m115_and_streams() {
+    use pump_core::pump::{envelope_setting, envelope_verb}; // VUGCOMSCANENVELOPEREADON (SR597): Marlin's travel is M211's one soft endstops line
+    assert_eq!(envelope_verb(MARLIN), Some("M211"));
+    let line = "echo:  Min:  X0.00 Y0.00 Z0.00   Max:  X200.00 Y350.00 Z110.00";
+    assert_eq!(envelope_setting(MARLIN, line), [Some(200.0), Some(350.0), Some(110.0)]);
+    assert_eq!(envelope_setting(MARLIN, "echo:  Min:  X0.00 Y0.00   Max:  X200.00 Y350.00"), [Some(200.0), Some(350.0), None], "a 2-axis line: Z not compared");
     let (m, path, _s) = pty();
     let p = program();
     let want = Pump::from_program(&p, MARLIN).unwrap().lines().to_vec();
@@ -641,7 +649,8 @@ fn a_marlin_start_on_the_host_composition_says_m115_and_streams() {
     let words: Vec<String> =
         out.iter().filter_map(|s| match s { PumpEvent::Squawk { event: Some(e), .. } => Some(e.clone()), _ => None }).collect();
     // A grbl-bound opener waited for `Grbl `, reset and refused NoBanner here; no commission (Marlin has no name verb).
-    assert_eq!(words, vec!["started".to_string(), format!("hello {MARLIN_FIRMWARE}")], "{out:?}");
+    // VUGCOMSCANENVELOPEREADON (SR597): M211's soft endstops say X 0..200 against the declared 350; Y and Z agree.
+    assert_eq!(words, vec!["started".to_string(), format!("hello {MARLIN_FIRMWARE}"), "envelope differs axis=X declared=350 controller=200".to_string()], "{out:?}");
     assert_eq!(desk.hello(), Some(MARLIN_FIRMWARE), "the M115 answer is the identity the reopen compares");
 
     let t0 = Instant::now();
@@ -649,7 +658,7 @@ fn a_marlin_start_on_the_host_composition_says_m115_and_streams() {
     while !done && t0.elapsed() < Duration::from_secs(10) {
         for s in desk.tick(t0.elapsed().as_micros() as u64) {
             if let PumpEvent::Squawk { event: Some(e), .. } = &s {
-                assert!(!e.starts_with("link lost") && e != "controller reset", "{e}");
+                assert!(!e.starts_with("link lost") && e != "controller reset" && !e.starts_with("envelope"), "{e}");
                 done |= e == "done";
             }
         }
@@ -661,6 +670,13 @@ fn a_marlin_start_on_the_host_composition_says_m115_and_streams() {
     let (lines, _m) = fake.join().unwrap();
     assert_eq!(lines, want, "make_core's Marlin text, line for line, and M115 is no program line");
 }
+
+// --- VUGCOMSCANENVELOPEREADON (SR597): Marlin's travel read through M211, the one soft endstops line ---
+
+/// Marlin 2.1's `M211` report (M211_report: the heading, the S state, `print_pos(min)` and `print_pos(max)` on one line,
+/// then `ok`): soft endstops X 0..200 (the declared machine says 350), Y 0..350, Z 0..110.
+const MARLIN_SOFT_ENDSTOPS: &[u8] =
+    b"echo:; Soft Endstops:\r\necho:  M211 S1 ; ON\r\necho:  Min:  X0.00 Y0.00 Z0.00   Max:  X200.00 Y350.00 Z110.00\r\nok\r\n";
 
 // --- VUGCOMSCANJOG (SR573): a lost grbl pump homes and jogs on the relinked port, before any re-arm ---
 
@@ -1109,7 +1125,7 @@ fn a_differing_envelope_is_said_once_at_the_start() {
     let p = program();
     let want = Pump::from_program(&p, GRBL).unwrap().lines().to_vec();
     let mut desk = PumpDesk::new(machine());
-    desk.envelope_read(true);
+    desk.hello_within(comscan::tty::READY_WAIT); // VUGCOMSCANENVELOPEREADON (SR597): the read is on by default and rides the hello
     let pass = Verdict::Pass { digest: p.digest(), machine: machine().digest() };
     let digest = desk.arm(&pass, &p, GRBL).expect("armed by a pass");
     let mut open = opener(Baud::B115200, Flow::None);
@@ -1124,7 +1140,7 @@ fn a_differing_envelope_is_said_once_at_the_start() {
     let words: Vec<String> =
         out.iter().filter_map(|s| match s { PumpEvent::Squawk { event: Some(e), .. } => Some(e.clone()), _ => None }).collect();
     // The declared X travel is 350 (-50..300), the controller's $130 200; Y and Z agree.
-    assert_eq!(words, vec!["started".to_string(), "envelope differs axis=X declared=350 controller=200".to_string()], "{out:?}");
+    assert_eq!(words, vec!["started".to_string(), format!("hello {}", hello_of(VER_A)), "envelope differs axis=X declared=350 controller=200".to_string()], "{out:?}");
 
     let t0 = Instant::now();
     let mut done = false;

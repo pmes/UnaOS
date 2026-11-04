@@ -539,9 +539,17 @@ use tokio::sync::broadcast::error::RecvError;
 /// The fakes' default build (the tests/tcp.rs one).
 const VER_A: &str = "1.1h.20190825:mill-a";
 
-/// grbl 1.1's `$I` answer for build `ver` in one BINARY frame (the fake's `ok` shape), written when `line` is `$I`;
-/// true when it was.
+/// VUGCOMSCANENVELOPEREADON (SR597): grbl 1.1's `$$` answer, cut to one ordinary setting and the travel, agreeing with the
+/// declared machine (X 350, Y 350, Z 110): the bus's read rides the hello and says nothing here.
+const ENVELOPE_ANSWER: &[u8] = b"$0=10\r\n$130=350.000\r\n$131=350.000\r\n$132=110.000\r\nok\r\n";
+
+/// grbl 1.1's `$I` answer for build `ver` in one BINARY frame (the fake's `ok` shape), written when `line` is `$I` (and
+/// the `$$` travel answer when it is `$$`); true when it was.
 fn said_hello(s: &mut TcpStream, line: &str, ver: &str) -> bool {
+    if line == "$$" {
+        let _ = s.write_all(&encode_frame(true, OP_BINARY, ENVELOPE_ANSWER, None)); // VUGCOMSCANENVELOPEREADON (SR597): neither recorded nor counted
+        return true;
+    }
     if line != "$I" {
         return false;
     }
