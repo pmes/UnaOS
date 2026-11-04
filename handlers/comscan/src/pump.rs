@@ -239,6 +239,9 @@ pub struct PumpDesk {
     /// the hello or the read is off or the controller did not answer. VUGCOMSCANRELINKENVELOPE (SR607): an accepted relink
     /// reads it again (the start's spec, [`PumpDesk::envelope_spec_for`]) and keeps the reopen's answer.
     read: Option<Envelope>,
+    /// VUGCOMSCANMACHINEDECLARE (SR613): the name and dialect of the machine a PumpDeclare declared (its travel is
+    /// `machine`'s axes, rewritten in place); `None`: nothing declared on the bus this session.
+    declared: Option<Declared>,
 }
 
 fn refused(why: impl Into<String>) -> Vec<PumpEvent> {
@@ -248,7 +251,7 @@ fn refused(why: impl Into<String>) -> Vec<PumpEvent> {
 impl PumpDesk {
     /// A desk for `machine`: every pass it arms must name this machine's identity (VUG-HELM-BIND-MACHINE).
     pub fn new(machine: Machine) -> PumpDesk {
-        PumpDesk { machine, armed: Vec::new(), running: None, identify: None, hello: None, envelope: true, read: None }
+        PumpDesk { machine, armed: Vec::new(), running: None, identify: None, hello: None, envelope: true, read: None, declared: None } // VUGCOMSCANMACHINEDECLARE (SR613): + declared
     }
 
     /// The machine this desk drives.
@@ -340,6 +343,7 @@ impl PumpDesk {
                 }
             }
             PumpEvent::PumpHome { .. } | PumpEvent::PumpJog { .. } => self.motion(ev), // VUGCOMSCANJOG (SR573)
+            PumpEvent::PumpDeclare { .. } => self.declare(ev), // VUGCOMSCANMACHINEDECLARE (SR613)
             PumpEvent::Squawk { .. } | PumpEvent::PumpRefused { .. } | PumpEvent::Commissioned { .. } => Vec::new(),
         }
     }
@@ -782,6 +786,7 @@ impl PumpDesk {
         let Some(d) = parse_dialect(dialect) else {
             return Err(refused(format!("unknown dialect {dialect:?} (grbl, grbl-laser, marlin)")));
         };
+        if let Some(why) = self.declared_dialect_refusal(d) { return Err(refused(why)); } // VUGCOMSCANMACHINEDECLARE (SR613): the declared record first
         let Ok(digest) = u64::from_str_radix(program, 16) else {
             return Err(refused(format!("program {program:?} is not a digest (16 hex digits)")));
         };
@@ -1050,8 +1055,8 @@ fn host_serial() -> Box<Opener> {
     Box::new(|port: &str, _: Dialect| -> Result<Box<dyn Transport + Send>, String> { Err(format!("no serial ports on this host: {port}")) })
 }
 
-/// The machine a vessel's desk declares until one is declared (owed VUG-COMSCAN-MACHINE-DECLARE): no axes, no tools, a
-/// zero envelope. Nothing arms it in a vessel (arming is in process only), and a Helm pass for any real machine is
+/// The machine a vessel's desk declares until one is declared (a `PumpDeclare`, VUGCOMSCANMACHINEDECLARE SR613): no axes,
+/// no tools, a zero envelope. Nothing arms it in a vessel (arming is in process only), and a Helm pass for any real machine is
 /// refused `Refused::WrongMachine` by both identities.
 pub fn undeclared_machine() -> Machine {
     use make_core::{Aabb3, Kinematics, MachineKind, Power, PowerKind, Units, Vec3};
@@ -1466,6 +1471,145 @@ fn bound(m: &Machine, read: Option<Envelope>, id: make_core::AxisId, i: usize) -
         Some(c) if c.is_finite() && c > 0.0 && c < declared => Some((c, "controller")),
         _ => Some((declared, "declared")),
     }
+}
+
+// --- VUGCOMSCANMACHINEDECLARE (LEDGER SR613): the machine declared behind the desk's ports by name, on the bus (named tail hunk) ---
+
+/// What a declare carries that make_core's `Machine` has no field for: the operator's name for it and the dialect it
+/// speaks (`None`: any). The travel is the desk's `machine` itself ([`declared_machine`]), the one record every reader reads.
+struct Declared {
+    name: String,
+    dialect: Option<Dialect>,
+}
+
+/// `base` with its X / Y / Z travel declared (mm): an axis `base` has keeps its `min` and its feed / acceleration / rapid
+/// and takes `max = min + travel`; an axis it lacks is added `0..travel` with the first axis' limits (else zero: a
+/// declare says travel only); the envelope spans each axis. The digest moves with the travel (SR498: a pass must name it).
+fn declared_machine(base: &Machine, travel: [f64; 3]) -> Machine {
+    use make_core::{Aabb3, Axis, AxisId, Vec3};
+    let mut m = base.clone();
+    let (max_feed, max_accel, rapid) = base.axes.first().map(|a| (a.max_feed, a.max_accel, a.rapid)).unwrap_or((0.0, 0.0, 0.0));
+    let ids = [AxisId::X, AxisId::Y, AxisId::Z];
+    for (id, t) in ids.into_iter().zip(travel) {
+        match m.axes.iter_mut().find(|a| a.id == id) {
+            Some(a) => a.max = a.min + t,
+            None => m.axes.push(Axis { id, min: 0.0, max: t, max_feed, max_accel, rapid }),
+        }
+    }
+    let span = |id: AxisId| m.axes.iter().find(|a| a.id == id).map(|a| (a.min, a.max)).unwrap_or((0.0, 0.0));
+    let ((x0, x1), (y0, y1), (z0, z1)) = (span(AxisId::X), span(AxisId::Y), span(AxisId::Z));
+    m.envelope = Aabb3 { min: Vec3::new(x0, y0, z0), max: Vec3::new(x1, y1, z1) };
+    m
+}
+
+impl PumpDesk {
+    /// PumpDeclare: the machine behind the ports declared by name. Refused by name while a job is in flight ([`PumpDesk::busy`]:
+    /// a lost run's re-arm is bound to the machine its pass named), for an empty name or one holding a space, a travel
+    /// not finite or not above zero, or an unknown dialect. Else `machine` is rewritten ([`declared_machine`]: the next
+    /// jog's bound, no relink; the controller's kept `read` still the tighter, SR602), the armings are dropped (their
+    /// passes named the machine before, SR498) and said when there were any, and the declare is said back
+    /// `machine declared <name> x=<x> y=<y> z=<z>[ dialect=<d>]`, then a kept read that differs, through [`PumpDesk::envelope_words`].
+    /// Per session: nothing keeps it past the pump (owed VUG-COMSCAN-MACHINE-DECLARE-PREFS).
+    fn declare(&mut self, ev: &PumpEvent) -> Vec<PumpEvent> {
+        let PumpEvent::PumpDeclare { name, x, y, z, dialect, .. } = ev else { return Vec::new() };
+        if self.busy() {
+            return refused("declare: busy: a job is in flight (PumpStop first)");
+        }
+        if name.is_empty() || name.chars().any(char::is_whitespace) {
+            return refused(format!("declare: the machine name {name:?} is empty or holds a space"));
+        }
+        let travel = [*x, *y, *z];
+        for (c, v) in ['x', 'y', 'z'].into_iter().zip(travel) {
+            if !v.is_finite() || v <= 0.0 {
+                return refused(format!("declare: {c}={v} is not a travel above zero"));
+            }
+        }
+        let dialect = match dialect.as_deref() {
+            None => None,
+            Some(s) => match parse_dialect(s) {
+                Some(d) => Some(d),
+                None => return refused(format!("declare: unknown dialect {s:?} (grbl, grbl-laser, marlin)")),
+            },
+        };
+        self.machine = declared_machine(&self.machine, travel);
+        let dropped = self.armed.len();
+        self.armed.clear();
+        self.declared = Some(Declared { name: name.clone(), dialect });
+        let mut word = format!("machine declared {name}");
+        for (c, v) in ['x', 'y', 'z'].into_iter().zip(travel) {
+            word.push_str(&format!(" {c}="));
+            make_core::gcode::num(&mut word, v);
+        }
+        if let Some(d) = dialect {
+            word.push_str(&format!(" dialect={}", dialect_word(d)));
+        }
+        let mut out = vec![self.squawk(Some(word))];
+        if dropped > 0 {
+            out.push(self.squawk(Some(format!("armed dropped: {dropped} (passed for the machine before)"))));
+        }
+        for w in self.envelope_words(self.read) {
+            out.push(self.squawk(Some(w)));
+        }
+        out
+    }
+
+    /// The declared machine's name and dialect (`None`: nothing declared this session).
+    pub fn declared(&self) -> Option<(&str, Option<Dialect>)> {
+        self.declared.as_ref().map(|d| (d.name.as_str(), d.dialect))
+    }
+
+    /// A PumpStart in `d` against the declared dialect: the refusal by name when the declared machine speaks another.
+    fn declared_dialect_refusal(&self, d: Dialect) -> Option<String> {
+        let decl = self.declared.as_ref()?;
+        let speaks = decl.dialect?;
+        (speaks != d).then(|| {
+            format!("dialect mismatch: the declared machine {} speaks {}, asked {}", decl.name, dialect_word(speaks), dialect_word(d))
+        })
+    }
+}
+
+/// The text form of the declare, `machine declare <name> x=<mm> y=<mm> z=<mm> [dialect=grbl|grbl-laser|marlin]`, to the
+/// one bus request ([`PumpEvent::PumpDeclare`]): each key once, x / y / z required; a line that is not a declare, an
+/// unknown key, a repeated key or a number that does not parse refused by name. The travel's sense (finite, above zero)
+/// and the dialect word are the desk's to judge ([`PumpDesk::declare`]), so there is one validator.
+pub fn declare_request(line: &str, principal: bandy::Origin) -> Result<PumpEvent, String> {
+    let mut w = line.split_whitespace();
+    if (w.next(), w.next()) != (Some("machine"), Some("declare")) {
+        return Err(format!("not a declare: {line:?} (machine declare <name> x=<mm> y=<mm> z=<mm> [dialect=..])"));
+    }
+    let Some(name) = w.next().filter(|n| !n.contains('=')) else {
+        return Err("declare: no machine name before the keys".to_string());
+    };
+    let mut xyz: [Option<f64>; 3] = [None; 3];
+    let mut dialect: Option<String> = None;
+    for kv in w {
+        let Some((k, v)) = kv.split_once('=') else {
+            return Err(format!("declare: {kv:?} is not key=value"));
+        };
+        let i = match k {
+            "x" => 0,
+            "y" => 1,
+            "z" => 2,
+            "dialect" => {
+                if dialect.replace(v.to_string()).is_some() {
+                    return Err("declare: dialect given twice".to_string());
+                }
+                continue;
+            }
+            _ => return Err(format!("declare: unknown key {k:?} (x, y, z, dialect)")),
+        };
+        if xyz[i].is_some() {
+            return Err(format!("declare: {k} given twice"));
+        }
+        let Ok(n) = v.parse::<f64>() else {
+            return Err(format!("declare: {k}={v:?} is not a number"));
+        };
+        xyz[i] = Some(n);
+    }
+    let [Some(x), Some(y), Some(z)] = xyz else {
+        return Err("declare: x, y and z are each required".to_string());
+    };
+    Ok(PumpEvent::PumpDeclare { principal, name: name.to_string(), x, y, z, dialect })
 }
 
 #[cfg(test)]
