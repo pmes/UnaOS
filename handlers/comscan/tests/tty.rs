@@ -1764,3 +1764,37 @@ fn a_desk_reads_the_declared_machine_from_principia_at_start_and_bounds_the_jog(
     let (lines, _rt, _m) = fake.join().unwrap();
     assert_eq!(jogs_of(&lines), ["$J=G91 X100 Y0 Z0 F300"], "the refused X150 never reached the wire: {lines:?}");
 }
+
+// --- VUGCOMSCANENVELOPEUNLINKED (SR623): a declare on a desk with no link typed by the next tick (tick's unlinked arm) ---
+
+/// The one PumpEnvelope in `out` as (declared, read, position); a panic on anything else.
+fn envelope_in(out: &[PumpEvent]) -> ([Option<f64>; 3], [Option<f64>; 3], Option<[f64; 3]>) {
+    match out {
+        [PumpEvent::PumpEnvelope { declared, read, position }] => (*declared, *read, *position),
+        other => panic!("expected one PumpEnvelope, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_declare_on_an_unlinked_desk_is_typed_by_the_next_tick() {
+    let mut desk = PumpDesk::new(comscan::pump::undeclared_machine());
+    // Never started: the first tick types the machine at `new` (no axes); a quiet tick after it says nothing.
+    assert_eq!(envelope_in(&desk.tick(1000)), ([None; 3], [None; 3], None), "the first tick types the undeclared machine");
+    assert!(desk.tick(2000).is_empty(), "once per change");
+
+    let declare = PumpEvent::PumpDeclare { principal: Origin::LocalUser("una".to_string()), name: "mill".to_string(), x: 350.0, y: 300.0, z: 100.0, dialect: None };
+    let out = desk.apply(&declare, &mut *no_opener());
+    assert_eq!(said_in(&out), "machine declared mill x=350 y=300 z=100", "the declare's words, no PumpEnvelope: the tick is the one post site");
+
+    let told = desk.tick(3000);
+    assert_eq!(envelope_in(&told), ([Some(350.0), Some(300.0), Some(100.0)], [None; 3], None), "the declared travel, read none, position none, with no link");
+    assert!(desk.tick(4000).is_empty(), "once per change");
+
+    let mut card = comscan::PumpCard::new(Origin::LocalUser("una".to_string()));
+    card.hear(&told[0]);
+    let snap = card.snapshot();
+    assert_eq!(snap.declared, [Some(350.0), Some(300.0), Some(100.0)]);
+    assert_eq!(snap.read, [None; 3]);
+    assert_eq!(snap.position, None);
+    assert!(!snap.linked, "the envelope does not make the pane linked");
+}

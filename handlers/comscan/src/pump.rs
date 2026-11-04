@@ -356,7 +356,7 @@ impl PumpDesk {
     pub fn tick(&mut self, now_us: u64) -> Vec<PumpEvent> {
         let evs = match self.running.as_mut() {
             Some(Running { pump, link: Some(link), .. }) => pump.tick(&mut **link, now_us),
-            _ => return Vec::new(),
+            _ => return self.envelope_due().into_iter().collect(), // VUGCOMSCANENVELOPEUNLINKED (SR623): an unlinked desk still types a changed travel (a declare), once per change
         };
         self.position_seen(&evs, now_us); let told = self.envelope_due(); // VUGCOMSCANJOGPOSITION (SR612): the reports' settled position; the idle `?` on a quiet tick too; VUGCOMSCANJOGTRAVELWIRE (SR618): the travel and position typed, once per change
         if evs.is_empty() {
@@ -1724,7 +1724,7 @@ struct Told {
 impl PumpDesk {
     /// [`PumpDesk::tick`]'s typed travel: the declared travel through the one [`axis_travel`], the kept `read` and the
     /// settled `pos.at`; the [`PumpEvent::PumpEnvelope`] only when that differs from the last one posted (`told`; a
-    /// start clears it), so the event follows a start, an accepted relink, a declare on a linked desk and every settled
+    /// start clears it), so the event follows a start, an accepted relink, a declare, linked or unlinked (VUGCOMSCANENVELOPEUNLINKED SR623: tick's unlinked arm), and every settled
     /// or forgotten position by one tick. The Squawk words are unchanged: [`PumpDesk::envelope_words`] stays the sayer.
     fn envelope_due(&mut self) -> Option<PumpEvent> {
         use make_core::AxisId;
