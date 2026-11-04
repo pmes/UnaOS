@@ -499,7 +499,7 @@ pub fn selftest() {
 // This is the seam, not `settings.rs`: every kernel `sys_set` caller on the render task is covered.
 
 static DEFERRED: crate::sync::Mutex<Vec<(String, PrefValue)>> = crate::sync::Mutex::new(Vec::new());
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", feature = "busreg"))]
 static FLUSHER: AtomicBool = AtomicBool::new(false);
 static DEFER_T0_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
@@ -520,7 +520,7 @@ fn defer_core() -> Option<usize> {
 
 /// Queue `system.<k> = v` for the worker; `Some(v)` back = the caller runs it inline.
 fn defer_set(k: &str, v: PrefValue) -> Option<PrefValue> {
-    let Some(cpu) = defer_core() else { return Some(v) };
+    #[cfg(feature = "busreg")] let Some(cpu) = flush_core() else { return Some(v) }; #[cfg(not(feature = "busreg"))] let Some(cpu) = defer_core() else { return Some(v) }; // PREFS-FLUSH-ONTO-APPLIER (rmbp-ledger B1200): on a busreg image the core pick is `flush_core` (x86 = defer_core, aarch64 = the render task on a worker core; file tail). LINE-NEUTRAL fold
     {
         let mut q = DEFERRED.lock();
         if q.is_empty() {
@@ -531,12 +531,12 @@ fn defer_set(k: &str, v: PrefValue) -> Option<PrefValue> {
             None => q.push((String::from(k), v)),
         }
     }
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", not(feature = "busreg")))]
     if !FLUSHER.swap(true, Ordering::AcqRel) {
         crate::arch::sched::spawn("prefs-flush", prefs_flush, 0, cpu, crate::arch::sched::PRIO_NORMAL);
     }
-    #[cfg(not(target_arch = "x86_64"))]
-    let _ = cpu;
+    #[cfg(any(not(target_arch = "x86_64"), feature = "busreg"))]
+    let _ = cpu; #[cfg(feature = "busreg")] flush_wake(); // PREFS-FLUSH-ONTO-APPLIER (rmbp-ledger B1200): the per-burst `prefs-flush` spawn is retired on a busreg image; the parked `prefs-apply` is woken instead (file tail). LINE-NEUTRAL fold
     None
 }
 
@@ -548,7 +548,7 @@ fn deferred_value(k: &str) -> Option<PrefValue> {
 
 /// `prefs-flush`: run every queued PrefSet (in order, latest value per key), then exit; a set queued while
 /// it was finishing re-arms it.
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", feature = "busreg"))]
 fn prefs_flush(_: usize) {
     loop {
         let (batch, t0) = {
@@ -1267,7 +1267,7 @@ pub fn queued_selftest() {
         let _ = queued_take(c);
     }
     let (q4, q5) = lostreset_selftest(&next, &body_of, &read, want); // QUEUED-SET-LOSTRESET (B1181): Q4 / Q5, the full-inbox legs (file tail)
-    let (q6, q7) = stucklive_selftest(&next, &body_of, &read, want); let q8 = pendpin_selftest(&next, &body_of, &read, want); /* QUEUED-SET-PENDPIN (B1193): Q8 the silent holder's Pend reclaimed (file tail) */ let q9 = deliverrace_selftest(&next, &body_of, &read, want); /* QUEUED-SET-DELIVER-RACE (rmbp-ledger B1194): Q9, the inbox filled between the room check and the deliver (file tail). Named in-place hunk */ let q10 = eager_selftest(&next, &body_of, want); // QUEUED-SET-STUCKLIVE (B1187): Q6 silent live holder, Q7 refused answer delivered (file tail)
+    let (q6, q7) = stucklive_selftest(&next, &body_of, &read, want); let q8 = pendpin_selftest(&next, &body_of, &read, want); /* QUEUED-SET-PENDPIN (B1193): Q8 the silent holder's Pend reclaimed (file tail) */ let q9 = deliverrace_selftest(&next, &body_of, &read, want); /* QUEUED-SET-DELIVER-RACE (rmbp-ledger B1194): Q9, the inbox filled between the room check and the deliver (file tail). Named in-place hunk */ let q10 = eager_selftest(&next, &body_of, want); let q13 = flush_selftest(&read, want); /* PREFS-FLUSH-ONTO-APPLIER (rmbp-ledger B1200): Q13, a render-task deferral flushed by `prefs-apply` (file tail). Named in-place hunk */ // QUEUED-SET-STUCKLIVE (B1187): Q6 silent live holder, Q7 refused answer delivered (file tail)
     // Restore the operator's value through the same kernel fulfiller (or leave the key unset as it was).
     match orig {
         Some(v) => {
@@ -1280,10 +1280,10 @@ pub fn queued_selftest() {
             let _ = crate::prefs::unset(crate::prefs::NS, key::IDLE_MIN);
         }
     }
-    if q1 && q2 && q3 && q4 && q5 && q6 && q7 && q8 && q9 && q10 {
-        serial_println!(":: RELAY-QUEUED-SET: unread=applied read=released full=eagain lostreset=released/applied stucklive=released refusedreply=redelivered pendpin=reclaimed deliverrace=closed eager=applied -> PASS ::");
+    if q1 && q2 && q3 && q4 && q5 && q6 && q7 && q8 && q9 && q10 && q13 {
+        serial_println!(":: RELAY-QUEUED-SET: unread=applied read=released full=eagain lostreset=released/applied stucklive=released refusedreply=redelivered pendpin=reclaimed deliverrace=closed eager=applied flush=applier -> PASS ::");
     } else {
-        serial_println!(":: RELAY-QUEUED-SET: q1={} q2={} q3={} q4={} q5={} q6={} q7={} q8={} q9={} q10={} (want={} read1={} read2={} kept={}/{} pushed={}/{}) -> FAIL ::", q1 as u8, q2 as u8, q3 as u8, q4 as u8, q5 as u8, q6 as u8, q7 as u8, q8 as u8, q9 as u8, q10 as u8, want, read1.unwrap_or(-1), read2.unwrap_or(-1), kept1 as u8, kept2 as u8, pushed1 as u8, pushed2 as u8);
+        serial_println!(":: RELAY-QUEUED-SET: q1={} q2={} q3={} q4={} q5={} q6={} q7={} q8={} q9={} q10={} q13={} (want={} read1={} read2={} kept={}/{} pushed={}/{}) -> FAIL ::", q1 as u8, q2 as u8, q3 as u8, q4 as u8, q5 as u8, q6 as u8, q7 as u8, q8 as u8, q9 as u8, q10 as u8, q13 as u8, want, read1.unwrap_or(-1), read2.unwrap_or(-1), kept1 as u8, kept2 as u8, pushed1 as u8, pushed2 as u8);
     }
 }
 
@@ -1778,11 +1778,11 @@ fn applier_ensure() {
     }
     #[cfg(target_arch = "x86_64")]
     {
-        crate::arch::sched::spawn_stack("prefs-apply", prefs_apply, 0, crate::arch::sched::CPU_AUTO, crate::arch::sched::PRIO_NORMAL, APPLIER_STACK);
+        crate::arch::sched::spawn_stack("prefs-apply", prefs_apply, 0, applier_cpu(), crate::arch::sched::PRIO_NORMAL, APPLIER_STACK); // PREFS-FLUSH-ONTO-APPLIER (B1200): a worker core, never the render core (file tail). Named in-place hunk
     }
     #[cfg(target_arch = "aarch64")]
     {
-        let _ = crate::arch::sched::spawn_stack("prefs-apply", prefs_apply, 0, crate::arch::sched::CPU_AUTO, APPLIER_STACK);
+        let _ = crate::arch::sched::spawn_stack("prefs-apply", prefs_apply, 0, applier_cpu(), APPLIER_STACK); // PREFS-FLUSH-ONTO-APPLIER (B1200): a worker core, never the render core (file tail). Named in-place hunk
     }
 }
 
@@ -1796,7 +1796,7 @@ fn queued_corrs() -> Vec<u32> {
 #[cfg(feature = "busreg")]
 fn prefs_apply(_: usize) {
     locked(|| APPLY_SEM.init()); // masked: a teardown post on this core must never spin on a raw lock this task holds
-    loop {
+    loop { flush_deferred(); // PREFS-FLUSH-ONTO-APPLIER (rmbp-ledger B1200): the render-task deferrals, after the previous wake's ring settle, no drain gate held (file tail). Named in-place hunk
         if !APPLY_SEM.wait() {
             return; // off a scheduled task (never for a spawned task)
         }
@@ -1894,4 +1894,109 @@ fn eager_selftest(next: &dyn Fn() -> u32, body_of: &dyn Fn(i64) -> String, want:
         serial_println!("[prefsbus] eager leg: kept={} by_applier={} gone={} store={} waited={}ms pushed={}", kept10 as u8, by_applier as u8, gone10 as u8, store10.unwrap_or(-1), waited, pushed10 as u8);
     }
     q10
+}
+
+// =================================================================================================
+// PREFS-FLUSH-ONTO-APPLIER (rmbp-ledger B1200) — TAIL-APPENDED. INPUTSTALL M5's render-task PrefSet deferral (B375,
+// `defer_set` / `DEFERRED` / `prefs_flush`) spawned a `prefs-flush` task PER BURST and only on x86: aarch64's render
+// task (also named `render`) ran every Settings / Look / Quarry `sys_set` with the store's file I/O inline on the
+// render path. On a busreg image the deferred SETs now ride the parked `prefs-apply` task (B1196): `defer_set` picks
+// the core by [`flush_core`] (x86 = `defer_core`, aarch64 = the render task with a `sched::worker_cpu_apart` core),
+// pushes into B375's own queue unchanged (latest value per key, `sys_get` read-your-writes), and instead of spawning
+// calls [`flush_wake`] (`applier_ensure` + `queued_due`, the one APPLY_SEM edge post). `prefs_apply` runs
+// [`flush_deferred`] at the head of each loop pass, after the previous wake's ring settle with the drain gate dropped:
+// the ONE flush body `prefs_flush` (its cfg widened to busreg), whose every `pref_set` goes through `call`'s head
+// `queued_drain` (the gate taken there, so B1175's order holds: the ring settles before any newer SET). The applier is
+// spawned on [`applier_cpu`] (x86 `smp::worker_cpu(0)`, aarch64 `worker_cpu_apart`), never the render core (B375, R88).
+// Knob-off (no busreg) is unchanged: x86 spawns `prefs-flush` per burst, aarch64 runs inline (PREFS-FLUSH-KNOBOFF owed).
+// Witness: `[prefsbus] queued apply on=prefs-apply deferred=<n> ms=<ms> (PREFS-FLUSH-ONTO-APPLIER)`; `tests bandy3`
+// `:: RELAY-QUEUED-SET: ... flush=applier -> PASS ::` (Q13, `flush_selftest`).
+// =================================================================================================
+/// Q13's one-shot hook: the next `flush_core` defers as if called on the render task.
+#[cfg(feature = "busreg")]
+static FLUSH_FORCE: AtomicBool = AtomicBool::new(false);
+/// Deferred keys `prefs-apply` has flushed (`flush_deferred`).
+#[cfg(feature = "busreg")]
+static FLUSHED_N: AtomicU32 = AtomicU32::new(0);
+
+/// `defer_set`'s core pick on a busreg image: `Some` = queue for `prefs-apply`; `None` = the caller runs it inline.
+#[cfg(feature = "busreg")]
+fn flush_core() -> Option<usize> {
+    if FLUSH_FORCE.swap(false, Ordering::AcqRel) {
+        return Some(applier_cpu());
+    }
+    #[cfg(target_arch = "aarch64")]
+    if matches!(crate::arch::sched::current_name(), Some(n) if n.starts_with("render")) {
+        return crate::arch::sched::worker_cpu_apart();
+    }
+    defer_core()
+}
+
+/// `defer_set` (busreg): wake the parked applier (spawned at the first deferral) instead of spawning `prefs-flush`.
+#[cfg(feature = "busreg")]
+fn flush_wake() {
+    applier_ensure();
+    queued_due();
+}
+
+/// The core `prefs-apply` runs on: a worker core off the render task's, else the scheduler's pick.
+#[cfg(feature = "busreg")]
+fn applier_cpu() -> usize {
+    #[cfg(target_arch = "x86_64")]
+    {
+        crate::arch::smp::worker_cpu(0).unwrap_or(crate::arch::sched::CPU_AUTO)
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        crate::arch::sched::worker_cpu_apart().unwrap_or(crate::arch::sched::CPU_AUTO)
+    }
+}
+
+/// `prefs_apply`'s loop head: run every deferred PrefSet through the one flush body (no drain gate held).
+#[cfg(feature = "busreg")]
+fn flush_deferred() {
+    let n = DEFERRED.lock().len();
+    if n == 0 {
+        return;
+    }
+    let t0 = crate::arch::ms();
+    prefs_flush(0);
+    FLUSHED_N.fetch_add(n as u32, Ordering::AcqRel);
+    serial_println!("[prefsbus] queued apply on=prefs-apply deferred={} ms={} (PREFS-FLUSH-ONTO-APPLIER)", n, crate::arch::ms().saturating_sub(t0));
+}
+
+/// `queued_selftest`'s Q13: a `sys_set` deferred through the one-shot hook (as from the render task) returns at once
+/// with the key queued; the leg yields until `prefs-apply` has flushed it (no `prefs-flush` task exists on a busreg
+/// image) and reads it back through the client.
+#[cfg(feature = "busreg")]
+fn flush_selftest(read: &dyn Fn() -> Option<i64>, want: i64) -> bool {
+    let k = crate::prefs::key::IDLE_MIN;
+    let v13: i64 = if want == 7 { 21 } else { 23 };
+    let before = FLUSHED_N.load(Ordering::Acquire);
+    FLUSH_FORCE.store(true, Ordering::Release);
+    sys_set(k, PrefValue::Int(v13));
+    FLUSH_FORCE.store(false, Ordering::Release);
+    let t = crate::arch::ms();
+    let mut spins = 0u32;
+    let pending = || DEFERRED.lock().iter().any(|(key, _)| key == k);
+    while (pending() || FLUSHED_N.load(Ordering::Acquire) == before) && crate::arch::ms().saturating_sub(t) <= EAGER_WAIT_MS && spins < RELAY_SPIN_MAX.saturating_mul(16) {
+        spins += 1;
+        if crate::arch::irqs_masked() {
+            core::hint::spin_loop();
+        } else {
+            crate::arch::sched::yield_now();
+        }
+    }
+    let waited = crate::arch::ms().saturating_sub(t);
+    let flushed = FLUSHED_N.load(Ordering::Acquire) != before && !pending();
+    if !flushed {
+        // The fixture's leftover: never let it land after queued_selftest's restore.
+        DEFERRED.lock().retain(|(key, _)| key != k);
+    }
+    let got = read();
+    let q13 = flushed && got == Some(v13);
+    if !q13 {
+        serial_println!("[prefsbus] flush leg: flushed={} read={} waited={}ms", flushed as u8, got.unwrap_or(-1), waited);
+    }
+    q13
 }
