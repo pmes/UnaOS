@@ -211,6 +211,14 @@ fn main() {
         comscan::ignite(console_synapse, comscan::DEFAULT_SCROLLBACK).await;
     });
 
+    // 3c0. VUGCOMSCANPREFSUNA (SR628): Principia, the ONE host preference fulfiller (lumen's line: the
+    //      `~/settings` store, prefs_core::files), serves PrefGet / PrefSet / PrefUnset on this bus. Its
+    //      receiver is taken BEFORE host_desk spawns, so the pump start's one `comscan.machine` PrefGet
+    //      (SR619) is queued and answered, and an accepted declare survives a una restart. Ended by the
+    //      runtime's drop, like the desk.
+    let principia_rx = synapse.subscribe();
+    let _principia_handle = rt.spawn(principia::serve(synapse.clone(), principia_rx, principia::Principia::new()));
+
     // 3c. VUGCOMSCANHOSTDESK (SR561): ignite Comscan's pump desk beside the
     //     Console on the same bus (`comscan::host_desk`, THE composition: the
     //     ws / tcp / serial opener, the device identity hook, the hello on so a

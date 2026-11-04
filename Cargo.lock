@@ -809,6 +809,7 @@ dependencies = [
  "helm",
  "libc",
  "make_core",
+ "principia",
  "pump_core",
  "tokio",
 ]
@@ -5174,6 +5175,7 @@ dependencies = [
  "libadwaita",
  "matrix",
  "midden",
+ "principia",
  "quartzite",
  "rustls",
  "tabula",
