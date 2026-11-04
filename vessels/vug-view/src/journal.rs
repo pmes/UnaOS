@@ -262,14 +262,11 @@ pub struct Journal {
     pub disk: Option<Result<String, String>>,
     /// VUGFACESAVEAS (SR539): the Save As field while it is open (Cmd+Shift+S; lib.rs `Viewer::save_as_key`).
     pub save_as: Option<SaveAs>,
-    /// VUGMAKEMACHINELIBFACE (SR548): the opened part's library shelf (lib.rs `open_vug`): [`Journal::reread`] resolves
-    /// `machine <id> lib=<name>` through it; None for a document not opened from a file.
-    pub lib: Option<doc_host::DirLib>,
 }
 
 impl Default for Journal {
     fn default() -> Journal {
-        Journal { doc: Doc::new(Tol::DEFAULT), closed: 0, open: None, undo: Vec::new(), redo: Vec::new(), panel: false, cursor: 0, edit: None, note: None, saved: None, disk: None, save_as: None, lib: None }
+        Journal { doc: Doc::new(Tol::DEFAULT), closed: 0, open: None, undo: Vec::new(), redo: Vec::new(), panel: false, cursor: 0, edit: None, note: None, saved: None, disk: None, save_as: None }
     }
 }
 
@@ -383,7 +380,7 @@ impl Journal {
         cand.lines.clear();
         cand.stmts.remove(i);
         for _ in 0..=self.doc.stmts.len() {
-            match self.reread(&doc_core::write(&cand)) { // VUGMAKEMACHINELIBFACE (SR548): the part's library resolves
+            match self.doc.reread(&doc_core::write(&cand)) { // VUGMAKEMACHINELIBHELD (SR556): the library the part holds resolves, no file
                 Err(r) if matches!(r.what, What::UnknownRef(_)) && r.line >= 2 && ((r.line - 2) as usize) < cand.stmts.len() => {
                     cand.stmts.remove((r.line - 2) as usize);
                     continue;
@@ -726,17 +723,4 @@ fn save_as_overlay(view: &View, fr: &mut Raster) {
     let text: String = format!("SAVE AS: {}_", f.text.to_uppercase()).chars().take(cols).collect();
     let y = h - 2.0 * ROW_PX - if j.panel { ROW_PX } else { 0.0 };
     raster::text(fr, &text, 6.0, y, rgba(ACTIVE));
-}
-
-// ---- VUGMAKEMACHINELIBFACE (SR548): the journal's text re-read ----
-
-impl Journal {
-    /// doc_core's reader over `text` with the opened part's library shelf (`lib=<name>` beside the part), else the plain
-    /// reader (a document not opened from a file names no library the face could resolve).
-    pub fn reread(&self, text: &str) -> Result<Doc, doc_core::Refusal> {
-        match &self.lib {
-            Some(l) => doc_core::read_with(text, l),
-            None => doc_core::read(text),
-        }
-    }
 }
