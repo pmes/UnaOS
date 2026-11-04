@@ -570,8 +570,9 @@ const MARLIN_FIRMWARE: &str = "FIRMWARE_NAME:Marlin 2.1.2.1 (Jun  1 2023 12:00:0
 
 /// A fake Marlin on the master: says `start` every 20 ms until its first line arrives (a booting board; a grbl wait
 /// never matches it), answers `M115` with its firmware line, a `Cap:` line and `ok`, then `ok` per line; returns the
-/// lines it executed once `lines` arrived (`M115` is neither recorded nor counted).
-fn fake_marlin(mut m: File, lines: usize) -> JoinHandle<Vec<String>> {
+/// lines it executed and the master (kept open until the desk is done) once `lines` arrived (`M115` is neither recorded
+/// nor counted).
+fn fake_marlin(mut m: File, lines: usize) -> JoinHandle<(Vec<String>, File)> {
     thread::spawn(move || {
         let heard = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (mut w, h) = (m.try_clone().unwrap(), heard.clone());
@@ -612,7 +613,7 @@ fn fake_marlin(mut m: File, lines: usize) -> JoinHandle<Vec<String>> {
         if let Some(t) = spam.take() {
             let _ = t.join();
         }
-        got
+        (got, m)
     })
 }
 
@@ -653,6 +654,6 @@ fn a_marlin_start_on_the_host_composition_says_m115_and_streams() {
     assert!(done, "the Marlin run reached done");
     drop(desk);
     drop(open);
-    let lines = fake.join().unwrap();
+    let (lines, _m) = fake.join().unwrap();
     assert_eq!(lines, want, "make_core's Marlin text, line for line, and M115 is no program line");
 }

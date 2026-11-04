@@ -90,7 +90,7 @@ pub fn start(v: &Verdict, p: &Program, d: Dialect, m: &Machine) -> Result<Pump, 
 }
 
 /// The host's opener: a port name to a live link.
-pub type Opener = dyn FnMut(&str, Dialect) -> Result<Box<dyn Transport + Send>, String> + Send; VUGCOMSCANHOSTDIALECT (SR566): the dialect at call time
+pub type Opener = dyn FnMut(&str, Dialect) -> Result<Box<dyn Transport + Send>, String> + Send; // VUGCOMSCANHOSTDIALECT (SR566): the dialect at call time
 
 /// A digest as the bus names it.
 pub fn digest_hex(d: u64) -> String {
