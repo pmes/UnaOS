@@ -50,6 +50,7 @@ pub const SHORTCUTS: &[(&str, &str)] = &[
     ("i", "ask Vein for design intent on the photo's sketch (over the bus; the corner shows the request, then the proposals or the refusal)"), // VUGFACEINTENTSEND (SR514)
     ("Tab", "focus the next proposal"),
     ("Enter / Backspace", "on the focused proposal: apply it (verified against the photo) / reject it"),
+    ("Escape", "on a focused proposal set (one card): reject the whole set (Backspace too); off a card, the sketch's Esc"), // VUGINTENTSINGLERENAMED (SR577): VUG-FACE-KEYS-CARD
     // VUGFACETREE (SR513): the feature tree over doc_core.
     ("t", "the feature tree panel (the document's statements)"),
     ("u / U", "undo / redo (the document's snapshots; the face regenerates)"),

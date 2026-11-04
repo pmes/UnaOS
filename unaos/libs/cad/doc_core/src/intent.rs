@@ -138,8 +138,8 @@ pub enum Reason {
     NoGeometry,
     Tess(brep_core::Refusal),
     /// The max distance is past `K_SIGMA` x sigma. VUGINTENTUNDOSET (SR563): `term` names the measurement whose distance
-    /// was the max ([`Measurement::term`]: "outline", "points", "shapes", "thickness").
-    Residual { max_mm: f64, limit_mm: f64, term: &'static str },
+    /// was the max ([`Measurement::term`]: "outline", "points", "shapes", "thickness"; VUGINTENTTERMTYPE (SR577): a [`Term`]).
+    Residual { max_mm: f64, limit_mm: f64, term: Term },
     /// The RMS grew past the document's own by more than sigma.
     Worse { rms_mm: f64, before_mm: f64, sigma_mm: f64 },
     /// VUGINTENTHOLES (SR507): a replayed profile loop or a measured loop has no partner (no loop of the other side
@@ -1119,12 +1119,35 @@ fn thickness_residual(r: &Replay, mm: f64, sigma_mm: f64, along: Vec3, tol: Tol,
 impl Measurement {
     /// The term a [`Reason::Residual`] names: which measurement the max distance was against — the word
     /// [`measurements_text`] heads its first line with.
-    pub fn term(&self) -> &'static str {
+    pub fn term(&self) -> Term {
         match self {
-            Measurement::Outline { .. } => "outline",
-            Measurement::Points { .. } => "points",
-            Measurement::Shapes { .. } => "shapes",
-            Measurement::Thickness { .. } => "thickness",
+            Measurement::Outline { .. } => Term::Outline,
+            Measurement::Points { .. } => Term::Points,
+            Measurement::Shapes { .. } => Term::Shapes,
+            Measurement::Thickness { .. } => Term::Thickness,
         }
+    }
+}
+
+// ---- VUGINTENTTERMTYPE (SR577): the residual's term, typed (named tail block) ----
+
+/// The measurement a [`Reason::Residual`] was judged against ([`Measurement::term`]); `Display` writes the lowercase word
+/// the refusal's ` term=` text has always printed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Term {
+    Outline,
+    Points,
+    Shapes,
+    Thickness,
+}
+
+impl core::fmt::Display for Term {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Term::Outline => "outline",
+            Term::Points => "points",
+            Term::Shapes => "shapes",
+            Term::Thickness => "thickness",
+        })
     }
 }
