@@ -1136,9 +1136,10 @@ fn modal_table(d: Dialect) -> &'static [(u8, u16, usize, &'static str)] {
     }
 }
 
-/// Each G / M word with an integer code on `line` (spaces dropped, upper-cased), in order: grbl reads every word of a
-/// block and its `$` system lines carry none; Marlin runs ONE command per line, so only its first word past an N word.
-fn modal_words(d: Dialect, line: &str, mut f: impl FnMut(u8, u16)) {
+/// Each lettered word on `line` (spaces dropped, upper-cased) as (letter, its number bytes, the bytes after it), in
+/// order: grbl reads every word of a block and its `$` system lines carry none; Marlin runs ONE command per line, so
+/// only its first word past an N word (VUGCOMSCANRESUMETOOL SR663: every letter and the rest, for the valued words).
+fn modal_words(d: Dialect, line: &str, mut f: impl FnMut(u8, &[u8], &[u8])) {
     let marlin = d == Dialect::Marlin;
     let b: Vec<u8> = line.bytes().filter(|c| !c.is_ascii_whitespace()).map(|c| c.to_ascii_uppercase()).collect();
     if b.first() == Some(&b'$') {
@@ -1158,20 +1159,27 @@ fn modal_words(d: Dialect, line: &str, mut f: impl FnMut(u8, u16)) {
         if marlin && letter == b'N' {
             continue;
         }
-        let num = &b[s..k];
-        if (letter == b'G' || letter == b'M') && !num.is_empty() && num.len() <= 4 && num.iter().all(u8::is_ascii_digit) {
-            f(letter, num.iter().fold(0u16, |a, c| a * 10 + u16::from(c - b'0')));
-        }
+        f(letter, &b[s..k], &b[k..]);
         if marlin {
             return;
         }
     }
 }
 
-/// The modal state some lines set: per group the last word and the index of its line.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// A word's integer code (1-4 digits, no point or sign): `G91.1` has none, so it is not `G91`.
+fn int_code(num: &[u8]) -> Option<u16> {
+    if num.is_empty() || num.len() > 4 || !num.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    Some(num.iter().fold(0u16, |a, c| a * 10 + u16::from(c - b'0')))
+}
+
+/// The modal state some lines set: per group the last word and the index of its line; per valued group (SR663) the
+/// whole last word with its value, in the form a resume sends.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Modal {
     last: [Option<(usize, &'static str)>; MODAL_GROUPS],
+    tool: [Option<(usize, String)>; TOOL_GROUPS],
 }
 
 impl Modal {
@@ -1179,22 +1187,33 @@ impl Modal {
     pub fn of(d: Dialect, lines: &[String]) -> Modal {
         let t = modal_table(d);
         let mut m = Modal::default();
+        let mut run = ToolRun::default();
         for (i, l) in lines.iter().enumerate() {
-            modal_words(d, l, |letter, code| {
+            modal_words(d, l, |letter, num, _| {
+                let Some(code) = int_code(num).filter(|_| letter == b'G' || letter == b'M') else { return };
                 if let Some(&(_, _, g, w)) = t.iter().find(|e| e.0 == letter && e.1 == code) {
                     m.last[g] = Some((i, w));
                 }
             });
+            tool_fold(d, i, l, &mut m.tool, &mut run); // VUGCOMSCANRESUMETOOL (SR663): the valued words, below
         }
         m
     }
 
-    /// One line per group set, in the program order of each group's last word (ties in group order): replayed so, the
-    /// words leave a controller as the program left it, on a Marlin whose G90 / G91 also set E's mode or one whose do not.
+    /// One line per group set, in the program order of each group's last word (ties in group order, the valued groups
+    /// after the modal ones): replayed so, the words leave a controller as the program left it, on a Marlin whose
+    /// G90 / G91 also set E's mode or one whose do not. The same word at the same line is said once (an `M9` is the
+    /// last word of both coolant groups).
     pub fn lines(&self) -> Vec<String> {
-        let mut v: Vec<(usize, usize, &'static str)> =
-            self.last.iter().enumerate().filter_map(|(g, x)| x.map(|(i, w)| (i, g, w))).collect();
+        let mut v: Vec<(usize, usize, &str)> = self
+            .last
+            .iter()
+            .enumerate()
+            .filter_map(|(g, x)| x.map(|(i, w)| (i, g, w)))
+            .chain(self.tool.iter().enumerate().filter_map(|(g, x)| x.as_ref().map(|(i, w)| (*i, MODAL_GROUPS + g, w.as_str()))))
+            .collect();
         v.sort_unstable();
+        v.dedup_by(|a, b| a.0 == b.0 && a.2 == b.2);
         v.into_iter().map(|(_, _, w)| String::from(w)).collect()
     }
 }
@@ -1210,4 +1229,140 @@ impl Pump {
             self.src.insert(i + k, at_line);
         }
     }
+}
+
+// --- VUGCOMSCANRESUMETOOL (LEDGER SR663): a resume restores the spindle, coolant, heater, fan and tool words the lines before its line set (named tail hunk) ---
+
+/// The valued groups a resume restores (after [`MODAL_GROUPS`]'s): 0 spindle, 1 its spin-up dwell, 2 mist, 3 flood,
+/// 4 hotend, 5 bed, 6 fan, 7 tool. A rebooted grbl sits in `M5 M9`; a rebooted Marlin has no heater target, no fan
+/// and tool 0. A clearing word (`M5`, `M9`, `M107`, an `S0` target) is kept and replayed like any other: a board that
+/// did not reboot may hold what a later, sent but unacknowledged line set. The prefix runs only inside the person's
+/// own re-arm, restoring what their program had already set before the lost line.
+pub const TOOL_GROUPS: usize = 8;
+const SPINDLE: usize = 0;
+const SPINUP: usize = 1;
+const MIST: usize = 2;
+const FLOOD: usize = 3;
+const HOTEND: usize = 4;
+const BED: usize = 5;
+const FAN: usize = 6;
+const TOOL: usize = 7;
+
+/// The dwell after a restored grbl `M3 S` / `M4 S`: grbl 1.1's M3 mid-stream synchronises the planner and sets the
+/// PWM, it does not wait for the spindle to reach speed, so the next move would plunge at a spinning-up tool. 4 s is
+/// grbl's own number for the same case (config.h `SAFETY_DOOR_SPINDLE_DELAY`, the dwell it inserts when it restores
+/// the spindle itself on a safety-door resume before motion); a constant, not a knob. Marlin's M3 dwells its own
+/// `SPINDLE_LASER_POWERUP_DELAY`, so it gets none.
+pub const GRBL_SPINUP_DWELL: &str = "G4 P4";
+
+/// The grbl spindle carried across lines: its direction (3 / 4 / 5) and its modal `S` as written.
+#[derive(Default)]
+struct ToolRun {
+    dir: Option<u16>,
+    s: Option<String>,
+}
+
+/// Line `i`'s valued words into `tool`, in their resume form (LinuxCNC, not streamed, sets nothing).
+fn tool_fold(d: Dialect, i: usize, line: &str, tool: &mut [Option<(usize, String)>; TOOL_GROUPS], run: &mut ToolRun) {
+    match d {
+        Dialect::Grbl { laser } => grbl_tool(laser, i, line, tool, run),
+        Dialect::Marlin => marlin_tool(i, line, tool),
+        Dialect::LinuxCnc => {}
+    }
+}
+
+/// grbl 1.1: the block's M3 / M4 / M5 with the modal `S` (`S12000 M3`, `M3 S1200`, or an `S` alone changing a running
+/// spindle), then the dwell; M7 / M8 each its own group, M9 both. In laser mode ($32=1) the power word is not
+/// restored (VUG-COMSCAN-RESUME-LASER owed: a beam on before the move burns a spot); the air assist is. `T` is not
+/// restored: grbl 1.1 acts on nothing for it and refuses M6.
+fn grbl_tool(laser: bool, i: usize, line: &str, tool: &mut [Option<(usize, String)>; TOOL_GROUPS], run: &mut ToolRun) {
+    let mut spin = None;
+    let mut s: Option<String> = None;
+    let mut cool: Vec<u16> = Vec::new();
+    modal_words(Dialect::Grbl { laser }, line, |letter, num, _| match (letter, int_code(num)) {
+        (b'M', Some(c @ (3 | 4 | 5))) => spin = Some(c),
+        (b'M', Some(c @ (7 | 8 | 9))) => cool.push(c),
+        (b'S', _) if !num.is_empty() => s = core::str::from_utf8(num).ok().map(String::from),
+        _ => {}
+    });
+    for c in cool {
+        let w = alloc::format!("M{c}");
+        match c {
+            7 => tool[MIST] = Some((i, w)),
+            8 => tool[FLOOD] = Some((i, w)),
+            _ => {
+                tool[MIST] = Some((i, w.clone()));
+                tool[FLOOD] = Some((i, w));
+            }
+        }
+    }
+    let said_s = s.is_some();
+    if s.is_some() {
+        run.s = s;
+    }
+    if spin.is_some() {
+        run.dir = spin;
+    }
+    if laser || (spin.is_none() && !said_s) {
+        return;
+    }
+    match run.dir {
+        Some(c @ (3 | 4)) => {
+            let w = match &run.s {
+                Some(v) => alloc::format!("M{c} S{v}"),
+                None => alloc::format!("M{c}"),
+            };
+            tool[SPINDLE] = Some((i, w));
+            tool[SPINUP] = Some((i, String::from(GRBL_SPINUP_DWELL)));
+        }
+        Some(_) if spin.is_some() => {
+            tool[SPINDLE] = Some((i, String::from("M5")));
+            tool[SPINUP] = None;
+        }
+        _ => {}
+    }
+}
+
+/// Marlin 2: the line's one command with its parameters, re-spaced; a hotend / bed target above 0 set by `M104` /
+/// `M140` is restored as the blocking `M109` / `M190` (a resumed print must not extrude cold; `M109 S` waits only
+/// when heating), a recorded `M109` / `M190` stays, an `S0` stays non-blocking; `M106` / `M107` the fan, `T<n>` the
+/// tool, `M3` / `M4` / `M5` the spindle, `M7` / `M8` / `M9` the coolant.
+fn marlin_tool(i: usize, line: &str, tool: &mut [Option<(usize, String)>; TOOL_GROUPS]) {
+    modal_words(Dialect::Marlin, line, |letter, num, rest| {
+        let rest = spaced(rest);
+        let word = |c: &str| alloc::format!("{c}{rest}");
+        match (letter, int_code(num)) {
+            (b'M', Some(c @ (3 | 4))) => tool[SPINDLE] = Some((i, word(&alloc::format!("M{c}")))),
+            (b'M', Some(5)) => tool[SPINDLE] = Some((i, String::from("M5"))),
+            (b'M', Some(7)) => tool[MIST] = Some((i, String::from("M7"))),
+            (b'M', Some(8)) => tool[FLOOD] = Some((i, String::from("M8"))),
+            (b'M', Some(9)) => {
+                tool[MIST] = Some((i, String::from("M9")));
+                tool[FLOOD] = Some((i, String::from("M9")));
+            }
+            (b'M', Some(c @ (104 | 109))) => tool[HOTEND] = Some((i, word(if c == 109 || heats(&rest) { "M109" } else { "M104" }))),
+            (b'M', Some(c @ (140 | 190))) => tool[BED] = Some((i, word(if c == 190 || heats(&rest) { "M190" } else { "M140" }))),
+            (b'M', Some(106)) => tool[FAN] = Some((i, word("M106"))),
+            (b'M', Some(107)) => tool[FAN] = Some((i, word("M107"))),
+            (b'T', Some(n)) => tool[TOOL] = Some((i, alloc::format!("T{n}"))),
+            _ => {}
+        }
+    });
+}
+
+/// The bytes after a Marlin command (spaces dropped, upper-cased) said as ` T1 S210`: one space before each letter.
+fn spaced(rest: &[u8]) -> String {
+    let mut o = String::new();
+    for &c in rest {
+        if c.is_ascii_alphabetic() {
+            o.push(' ');
+        }
+        o.push(char::from(c));
+    }
+    o
+}
+
+/// A Marlin heater command's target above 0 (its `S`, or the `R` that waits either way).
+fn heats(rest: &str) -> bool {
+    rest.split(' ').any(|p| matches!(p.as_bytes().first(), Some(b'S' | b'R')) && p[1..].parse::<f64>().is_ok_and(|t| t > 0.0))
 }
