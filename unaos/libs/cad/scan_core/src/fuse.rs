@@ -175,6 +175,17 @@ pub fn fuse_prb(bytes: &[u8], knobs: Knobs) -> Result<ScanMesh, PrbError> {
 /// VUGFACEDEVIATIONPRBPOSES (LEDGER SR621): [`fuse_prb`] and whether the tracker fused it (`Fused::track` is Some):
 /// true means the mesh's world is frame 0's camera, not the design's.
 pub fn fuse_prb_tracked(bytes: &[u8], knobs: Knobs) -> Result<(ScanMesh, bool), PrbError> {
+    fuse_prb_volume(bytes, knobs).map(|(m, tracked, _)| (m, tracked)) // VUGSCANROADWORDMARGIN (SR637): the body is fuse_prb_volume's
+}
+
+// ---- VUGSCANROADWORDMARGIN (LEDGER SR637): the fused volume's truncation read out ----
+// A ScanMesh carries no truncation and the Fused was dropped after `extract`, so a caller that measures the mesh (the
+// gdt edge margin, vug-view's `margin_mm`) could only name the equal fallback. The truncation is the volume's own
+// `Tsdf::trunc_mm()`, read from the Fused: today the const product [`TRUNC_VOXELS`] x [`VOXEL_MM`] (12, no knob sets it),
+// so a future knob flows through this read.
+
+/// [`fuse_prb_tracked`] and the fused volume's own truncation (mm, `Tsdf::trunc_mm()` of the `Fused`).
+pub fn fuse_prb_volume(bytes: &[u8], knobs: Knobs) -> Result<(ScanMesh, bool, f64), PrbError> {
     let rec = recording::read(bytes).map_err(PrbError::Recording)?;
     let depth = prb_depth(&rec, None).map_err(|index| PrbError::NoDepthUnits { index })?;
     if depth.is_empty() {
@@ -188,5 +199,5 @@ pub fn fuse_prb_tracked(bytes: &[u8], knobs: Knobs) -> Result<(ScanMesh, bool), 
     let identity = [Transform::IDENTITY];
     let road = if shots.len() == 1 { Road::Posed(&identity) } else { Road::Track };
     let f = fuse(&shots, road, VOXEL_MM, TRUNC_VOXELS * VOXEL_MM, knobs).map_err(PrbError::Fuse)?;
-    extract(&f.tsdf).map(|m| (m, f.track.is_some())).map_err(PrbError::Extract)
+    extract(&f.tsdf).map(|m| (m, f.track.is_some(), f.tsdf.trunc_mm())).map_err(PrbError::Extract)
 }
