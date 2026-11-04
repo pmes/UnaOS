@@ -4,10 +4,13 @@
 //! VUGSCANSHAPES (LEDGER SR497): `detect`, Schnabel's multi-shape loop, on synthetic clouds sampled here with exact
 //! normals and ±0.2 mm position jitter: a plane and a cylinder (the SR469 scene's two primitives) are exactly two
 //! shapes with their parameters; a sphere added makes three; a cloud of noise is no shape at all; a cone is one cone.
+//! VUGSCANSHAPESMERGE (LEDGER SR537): one surface found twice (two components, the normal's sign flipped) is one shape
+//! and a parallel face beside it is not; tools/scan's tracked fixture finds each plane once.
 
 use core::f64::consts::PI;
 
-use scan_core::{FitError, Floor, Primitive, Shape, Tol, Vec3, detect};
+use scan_core::fixture::{self, Noise, Scene};
+use scan_core::{DepthScale, FitError, Floor, Plane, Primitive, Shape, Tol, Tracker, Tsdf, Vec3, detect, extract};
 
 const DEG: f64 = PI / 180.0;
 const BAND: Tol = Tol { lin: 1.0, ang: 10.0 * DEG };
@@ -219,4 +222,113 @@ fn refusals_are_named() {
     let n = [Vec3::new(0.0, 0.0, 1.0); 2];
     assert_eq!(detect(&p, &n, BAND, Floor::DEFAULT), Err(FitError::NormalsMismatch { points: 3, normals: 2 }));
     assert_eq!(detect(&p[..2], &n, BAND, Floor::DEFAULT), Ok(Vec::new()), "fewer than three points: no shape");
+}
+
+/// VUGSCANSHAPESMERGE (SR537): the tilted plane cut by a 33 mm gap into two components (60 x 28 points each, the
+/// second half's normals negated: a scan normal's sign is arbitrary) is ONE plane over both halves; a parallel patch
+/// 20 mm off beside it stays its own plane (two parallel faces are not one surface); two coaxial r 30 pieces with a gap
+/// are ONE cylinder.
+#[test]
+fn one_surface_found_twice_is_one_shape() {
+    let (mut c, mut rng) = (Cloud::default(), Lcg(0x537));
+    let nrm = plane_normal();
+    let (u, w) = basis(nrm);
+    for i in 0..60 {
+        for j in 0..56 {
+            let (off, n) = if j < 28 { (0.0, nrm) } else { (30.0, -nrm) };
+            c.push(&mut rng, PLANE_AT + u * (i as f64 * 3.0 - 90.0) + w * (j as f64 * 3.0 - 99.0 + off), n);
+        }
+    }
+    for i in 0..30 {
+        for j in 0..30 {
+            c.push(&mut rng, PLANE_AT + nrm * 20.0 + u * (i as f64 * 3.0 + 100.0) + w * (j as f64 * 3.0 - 45.0), nrm);
+        }
+    }
+    let a = cyl_axis();
+    let (cu, cw) = basis(a);
+    for k in 0..64 {
+        let th = k as f64 * 2.0 * PI / 64.0;
+        let r = cu * th.cos() + cw * th.sin();
+        for h in (0..15).chain(25..40) {
+            c.push(&mut rng, CYL_BASE + a * (h as f64 * 3.0) + r * 30.0, r);
+        }
+    }
+    noise(&mut c, &mut rng, Vec3::ZERO, 200);
+    let shapes = detect(&c.p, &c.n, BAND, Floor::DEFAULT).expect("detect");
+    print("twin", &shapes);
+    let mut names: Vec<&str> = shapes.iter().map(|s| s.kind.name()).collect();
+    names.sort_unstable();
+    assert_eq!(names, ["cylinder", "plane", "plane"], "one shape per surface");
+    let mut planes: Vec<(&Shape, Plane)> =
+        shapes.iter().filter_map(|s| if let Primitive::Plane(p) = s.kind { Some((s, p)) } else { None }).collect();
+    planes.sort_by(|x, y| y.0.support.cmp(&x.0.support));
+    let (big, pl) = planes[0];
+    assert!(big.support >= 3000, "the merged plane holds both halves: support {} of 3360", big.support);
+    assert!(angle_deg(pl.normal, nrm) < 0.5, "merged plane normal {} deg", angle_deg(pl.normal, nrm));
+    assert!(pl.signed_distance(PLANE_AT).abs() < 0.5, "merged plane offset {}", pl.signed_distance(PLANE_AT));
+    let (side, sp) = planes[1];
+    assert!(side.support >= 800, "the parallel patch: support {} of 900", side.support);
+    assert!((sp.signed_distance(PLANE_AT).abs() - 20.0).abs() < 0.5, "the parallel patch is 20 mm off: {}", sp.signed_distance(PLANE_AT));
+    let cyl = shapes.iter().find(|s| s.kind.name() == "cylinder").unwrap();
+    assert!(cyl.support >= 1800, "the merged cylinder holds both pieces: support {} of 1920", cyl.support);
+    check_cylinder(&shapes);
+    for s in &shapes {
+        assert_eq!(s.support as usize, s.inliers.len());
+        assert!(s.rms_mm <= JITTER && s.max_mm <= BAND.lin, "{} rms {} max {}", s.kind.name(), s.rms_mm, s.max_mm);
+    }
+    assert_eq!(detect(&c.p, &c.n, BAND, Floor::DEFAULT), Ok(shapes), "deterministic");
+}
+
+/// VUGSCANSHAPESMERGE (SR537): tools/scan's `--track` run (tests/scan.rs `a_tracked_prb_recording_fuses_without_poses`)
+/// rebuilt here: the bench scene, the orbit about (-20, 0, 50) at 600 mm and 40 deg stepping 1 deg a frame, 12 frames
+/// with the D435i's noise, tracked into a 4 mm / 12 mm volume, `detect` at tools/scan's band (3 mm, 15 deg). Frame 0
+/// is the identity, so each plane is carried to the world by frame 0's true pose. The ground (split by the box and the
+/// cylinder) is ONE plane, the box top at most one, and no two planes are one surface (this test's own arithmetic: the
+/// normals within 15 deg sign-blind AND each inlier centroid within 3 mm of the other plane).
+#[test]
+fn the_tracked_fixture_finds_each_plane_once() {
+    let (intr, scale) = (fixture::bench_intrinsics(), DepthScale::D400_DEFAULT);
+    let truth = |k: u32| fixture::orbit(Vec3::new(-20.0, 0.0, 50.0), 600.0, 40.0 * DEG, k as f64 * DEG);
+    let mut t = Tsdf::new(4.0, 12.0, Tol::DEFAULT).expect("volume");
+    let mut tr = Tracker::new(&t, Tol::DEFAULT);
+    for k in 0..12u32 {
+        let f = fixture::render_depth(&Scene::bench(), &intr, scale, &truth(k), &Noise::D435I, k as u64);
+        t.integrate_tracked(&mut tr, &f, scale, &intr, None).unwrap_or_else(|e| panic!("frame {k}: {e:?}"));
+    }
+    let sm = extract(&t).expect("mesh");
+    let band = Tol { lin: 3.0, ang: 15.0 * DEG };
+    let shapes = detect(&sm.mesh.positions, &sm.normals, band, Floor::DEFAULT).expect("detect");
+    print("tracked", &shapes);
+    let pos = &sm.mesh.positions;
+    let planes: Vec<(Plane, Vec3)> = shapes
+        .iter()
+        .filter_map(|s| if let Primitive::Plane(p) = s.kind { Some((s, p)) } else { None })
+        .map(|(s, p)| {
+            let mut c = Vec3::ZERO;
+            for &i in &s.inliers {
+                c = c + pos[i as usize];
+            }
+            (p, c * (1.0 / s.inliers.len() as f64))
+        })
+        .collect();
+    let (p0, z) = (truth(0), Vec3::new(0.0, 0.0, 1.0));
+    let heights: Vec<f64> = planes
+        .iter()
+        .filter_map(|(p, _)| {
+            let n = p0.apply_vector(p.normal);
+            if angle_deg(n, z) < 15.0 { Some((p.d + n.dot(p0.trans)) / n.z) } else { None }
+        })
+        .collect();
+    println!("tracked: up-facing plane heights {heights:?}");
+    assert_eq!(heights.iter().filter(|h| h.abs() < 4.0).count(), 1, "ONE ground plane: {heights:?}");
+    assert!(heights.iter().filter(|h| (*h - 100.0).abs() < 4.0).count() <= 1, "at most one box top: {heights:?}");
+    for i in 0..planes.len() {
+        for j in i + 1..planes.len() {
+            let ((a, ca), (b, cb)) = (planes[i], planes[j]);
+            let one = angle_deg(a.normal, b.normal) < 15.0
+                && a.signed_distance(cb).abs() <= 3.0
+                && b.signed_distance(ca).abs() <= 3.0;
+            assert!(!one, "planes {i} and {j} are one surface: {a:?} {b:?}");
+        }
+    }
 }
