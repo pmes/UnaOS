@@ -608,3 +608,47 @@ tool number=1 kind=flat_end dc=6 lf=40 apmx=2 nof=2 sig=0
     let Some(Stmt::Machine(mm)) = b.doc.stmts.iter().find(|s| matches!(s, Stmt::Machine(_))) else { panic!("machine") };
     assert_eq!(mm.lib.as_ref().map(|l| (l.name.as_str(), l.stmts.len())), Some(("shop-mill", 2)), "the library stays held");
 }
+
+// ---- VUGINTENTTHICKNESS (SR557): an extrude judged by a measured thickness ----
+
+/// The 80 x 60 plate's sketch with no extrude (a photo's sketch before its side photo).
+fn plate_sketch() -> Doc {
+    let text = plate(80.0, 60.0, 10.0);
+    let text: String = text.lines().filter(|l| !l.starts_with("extrude ")).map(|l| format!("{l}\n")).collect();
+    let d = read(&text).unwrap();
+    assert!(replay(&d, d.tol).solids.is_empty());
+    d
+}
+
+fn thickness(mm: f64) -> Measurement {
+    Measurement::Thickness { mm, sigma_mm: SIGMA, along: v(0.0, 0.0, 1.0) }
+}
+
+#[test]
+fn a_thickness_accepts_the_measured_extrude_and_refuses_one_2mm_off() {
+    let d = plate_sketch();
+    let m = thickness(10.0);
+    match verify(&d, &p("extrude e1 sketch=s outer=l1 dir=[0 0 1] length=10"), &m, d.tol) {
+        Verdict::Accept { max_mm, .. } => assert!(max_mm < 1e-6, "max {max_mm}"),
+        v => panic!("length=10 refused: {v:?}"),
+    }
+    // The outline is the same either way: only the thickness tells 12 from 10.
+    match verify(&d, &p("extrude e1 sketch=s outer=l1 dir=[0 0 1] length=12"), &m, d.tol) {
+        Verdict::Refuse { why: Reason::Residual { max_mm, limit_mm } } => {
+            assert!((max_mm - 2.0).abs() < 1e-6, "max {max_mm}");
+            assert!((limit_mm - 3.0 * SIGMA).abs() < 1e-12, "limit {limit_mm}");
+        }
+        v => panic!("length=12 not a Residual refusal: {v:?}"),
+    }
+}
+
+#[test]
+fn a_thickness_with_no_solid_is_unmatched_and_tabled() {
+    let d = plate_sketch();
+    let m = thickness(10.0);
+    match verify(&d, &p("distance i1 sketch=s a=p1 b=p2 d=80"), &m, d.tol) {
+        Verdict::Refuse { why: Reason::UnmatchedShape { kind, .. } } => assert_eq!(kind, "thickness"),
+        v => panic!("no solid not unmatched: {v:?}"),
+    }
+    assert_eq!(measurements_text(&m), "thickness: mm=10 sigma=0.3 along=(0,0,1)\n");
+}

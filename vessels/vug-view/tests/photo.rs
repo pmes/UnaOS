@@ -192,6 +192,7 @@ fn rectangle() -> Viewer {
         asked: None,
         ignored: 0,
         first: None, // VUGFACEPHOTOSIDE (SR547)
+        thickness: None, // VUGINTENTTHICKNESS (SR557)
     });
     vw
 }
@@ -468,4 +469,41 @@ fn a_side_photo_with_no_first_photo_refuses_by_name() {
     assert!(e.contains("NoFirstPhoto"), "{e}");
     assert!(ph(&vw).offers.is_empty());
     assert!(ph(&vw).note.as_deref().unwrap_or("").starts_with("refused side NoFirstPhoto"), "{:?}", ph(&vw).note);
+}
+
+// ---- VUGINTENTTHICKNESS (SR557): the extrude judged by the side photo's thickness ----
+
+/// The statement with its `length=` token replaced.
+fn with_length(stmt: &str, length: f64) -> String {
+    stmt.split_whitespace().map(|t| if t.starts_with("length=") { format!("length={length}") } else { t.to_string() }).collect::<Vec<_>>().join(" ")
+}
+
+/// The fixture part (50 x 30 x 6): the side photo's extrude accepts and the thickness is held; an extrude 2 mm long
+/// (the outline alone cannot tell) refuses by Residual; a wrong side photo (a 9 mm side of the same length) re-holds the
+/// thickness and Enter on the 6 mm extrude then refuses by Residual and applies nothing.
+#[test]
+fn a_wrong_side_photo_refuses_the_extrude_by_its_thickness() {
+    use photo_core::fixture::{PART_T, PART_W, Spec, side_png};
+    let mut vw = opened();
+    photo::side(&mut vw.view, &side_png(&Spec::side(), PART_W, PART_T), "side.png").expect("the side photo measures");
+    assert!(matches!(ph(&vw).offers[0].verdict, Verdict::Accept { .. }), "{:?}", ph(&vw).offers[0].verdict);
+    match &ph(&vw).thickness {
+        Some(doc_core::Measurement::Thickness { mm, .. }) => assert!((mm - PART_T).abs() < 0.1, "held {mm}"),
+        t => panic!("no thickness held: {t:?}"),
+    }
+    let stmt = ph(&vw).offers[0].proposal.stmt.clone();
+    assert!(photo::offer(&mut vw.view, vec![proposal(with_length(&stmt, PART_T + 2.0))]));
+    assert!(matches!(ph(&vw).offers[1].verdict, Verdict::Refuse { why: Reason::Residual { .. } }), "{:?}", ph(&vw).offers[1].verdict);
+    photo::side(&mut vw.view, &side_png(&Spec::side(), PART_W, 9.0), "wrong.png").expect("the wrong side photo measures");
+    match &ph(&vw).thickness {
+        Some(doc_core::Measurement::Thickness { mm, .. }) => assert!((mm - 9.0).abs() < 0.3, "held {mm}"),
+        t => panic!("no thickness held: {t:?}"),
+    }
+    assert_eq!(ph(&vw).focus, Some(0));
+    assert!(key(&mut vw, "Return"));
+    assert!(matches!(ph(&vw).offers[0].verdict, Verdict::Refuse { why: Reason::Residual { .. } }), "{:?}", ph(&vw).offers[0].verdict);
+    assert_eq!(ph(&vw).offers[0].state, State::Open, "never applied");
+    assert!(vw.view.design.face.is_some(), "the sketch is still open");
+    assert!(vw.view.design.body.is_none(), "no body");
+    assert!(ph(&vw).note.as_deref().unwrap_or("").starts_with("refused residual"), "{:?}", ph(&vw).note);
 }
