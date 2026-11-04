@@ -395,6 +395,7 @@ const FONT: &[(char, [u8; 5])] = &[
     (']', [6, 2, 2, 2, 6]),
     ('>', [4, 2, 1, 2, 4]),
     ('+', [0, 2, 7, 2, 0]),
+    ('?', [6, 1, 2, 0, 2]), // VUGFACEHELPOVERLAY (SR650): the help's own key
 ];
 
 /// One character of the bitmap font at (x, y) (its top-left), each bit a 2x2 block; an unknown character (and the
