@@ -460,3 +460,85 @@ fn a_through_hole_proposes_the_pocket_set_with_the_plate_thickness() {
     let bt = verify_all(&d, &ps, &m, d.tol);
     assert_eq!(bt.accepted(), ps.len(), "{}", bt.text());
 }
+
+// ---- VUGINTENTSETVERIFY (SR541): a statement set judged as one unit ----
+
+/// The plate with a 12.1 mm boss (r 7.95, support centroid 6.05 above the plate top) AND its top plane measured at
+/// z = 22.1 (#6): a face only the set's extrude models.
+fn boss_with_top() -> (Doc, Measurement) {
+    let d = doc(&plate(80.0, 60.0, 10.0));
+    let mut s = box_planes(80.0, 60.0, 10.0);
+    s.push(plane(v(0.0, 0.0, 1.0), 22.1, 700, 0.2));
+    s.push(cyl(v(40.0, 30.0, 16.05), 7.95, 900, 0.2));
+    (d, shapes(s))
+}
+
+fn residual_max(v: &Verdict) -> f64 {
+    match v {
+        Verdict::Refuse { why: Reason::Residual { max_mm, .. } } => *max_mm,
+        v => panic!("not a Residual refusal: {:?}", v),
+    }
+}
+
+#[test]
+fn a_boss_with_its_top_measured_is_accepted_as_one_set() {
+    let (d, m) = boss_with_top();
+    let ps = suggest(&d, &m);
+    let set = feature_set(&ps, "boss:");
+    assert_eq!(set.len(), 4, "{:?}", stmts(&ps));
+    assert!(set[0].why.contains("far-end plane #6"), "{}", set[0].why);
+    assert!(set[3].stmt.ends_with("length=12"), "{}", set[3].stmt);
+    // The SR536 gap: the set's leading line alone is refused by the boss top no document face models.
+    assert!((residual_max(&verify(&d, set[0], &m, d.tol)) - 12.1).abs() < 1e-6);
+    let first = ps.len() - 4;
+    let b = verify_all(&d, &ps, &m, d.tol);
+    assert_eq!(b.sets.len(), 1, "{}", b.text());
+    let (start, steps) = &b.sets[0];
+    assert_eq!(*start, first);
+    assert_eq!(steps.len(), 4);
+    assert!((residual_max(&steps[0]) - 12.1).abs() < 1e-6, "{:?}", steps[0]);
+    assert!(matches!(steps[3], Verdict::Accept { .. }), "{:?}", steps[3]);
+    for (s, _, v) in &b.entries[first..] {
+        match v {
+            Verdict::Accept { max_mm, .. } => assert!(*max_mm <= 3.0 * SIGMA, "{s}: max {max_mm}"),
+            v => panic!("{s}: the set refused: {v:?}\n{}", b.text()),
+        }
+    }
+    assert_eq!(b.accepted(), 4, "{}", b.text());
+    assert_eq!(b.doc.stmts.len(), d.stmts.len() + 4);
+    let t = b.text();
+    let lines: Vec<&str> = t.lines().collect();
+    let sk = lines.iter().find(|l| l.starts_with(&format!("accept {}", set[0].stmt))).unwrap();
+    assert!(sk.contains(" set=1 step=refuse residual max="), "{t}");
+    let ex = lines.iter().find(|l| l.starts_with(&format!("accept {}", set[3].stmt))).unwrap();
+    assert!(ex.ends_with(" set=1 step=accept"), "{t}");
+    assert_eq!(lines.iter().filter(|l| l.starts_with("accept ")).count(), b.accepted(), "{t}");
+    // A single proposal's line carries no set suffix.
+    assert!(lines.iter().filter(|l| l.contains(" set=")).count() == 4, "{t}");
+}
+
+#[test]
+fn a_set_with_a_wrong_extrude_is_refused_whole_with_its_reason() {
+    let (d, m) = boss_with_top();
+    let mut ps = suggest(&d, &m);
+    let n = ps.len();
+    assert!(ps[n - 1].stmt.starts_with("extrude ") && ps[n - 1].stmt.ends_with("length=12"), "{:?}", stmts(&ps));
+    ps[n - 1].stmt = ps[n - 1].stmt.replace("length=12", "length=20");
+    let b = verify_all(&d, &ps, &m, d.tol);
+    assert_eq!(b.sets.len(), 1, "{}", b.text());
+    let (start, steps) = &b.sets[0];
+    assert_eq!(*start, n - 4);
+    // The boss top at z = 30 against the measured 22.1: the extrude's own reason is the set's.
+    let Verdict::Refuse { why } = &steps[3] else { panic!("the wrong extrude accepted: {:?}", steps[3]) };
+    assert!((residual_max(&steps[3]) - 7.9).abs() < 1e-6, "{:?}", steps[3]);
+    for (s, _, v) in &b.entries[n - 4..] {
+        assert_eq!(v, &Verdict::Refuse { why: why.clone() }, "{s}");
+    }
+    assert!(b.entries[n - 4..].iter().all(|(_, _, v)| (residual_max(v) - 7.9).abs() < 1e-6));
+    if let Reason::Residual { limit_mm, .. } = why {
+        assert!((limit_mm - 0.9).abs() < 1e-12);
+    }
+    // Nothing of the set entered the document.
+    assert!(b.doc.stmts.len() == d.stmts.len() + b.accepted() && b.accepted() + 4 <= n, "{}", b.text());
+    assert!(!b.doc.stmts.iter().any(|s| s.id() == stmts(&ps)[n - 1].split(' ').nth(1)), "{}", b.text());
+}
