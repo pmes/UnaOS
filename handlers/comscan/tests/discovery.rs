@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use bandy::Origin;
 use comscan::PumpCard;
-use comscan::discovery::{Found, Service, discover_at, link_scopes, local_v4, query, walk, words};
+use comscan::discovery::{Found, Service, discover_at, interfaces, link_scopes, local_v4, query, walk, words};
 use make_core::gcode::Dialect;
 
 fn unhex(s: &str) -> Vec<u8> {
@@ -277,4 +277,14 @@ fn a_found_telnet_entry_is_dialed_by_index_as_the_one_tcp_spec() {
     }
     card.say_found(&[]);
     assert!(card.snapshot().found.is_empty(), "the next discover replaces the rows");
+}
+
+// --- VUGCOMSCANMDNSIFMACOS (SR658): the dispatcher reads the live /proc through the parsers on Linux ---
+
+#[cfg(target_os = "linux")]
+#[test]
+fn the_interface_lists_are_procs_on_linux() {
+    let read = |path: &str| std::fs::read_to_string(path).unwrap_or_default();
+    let want = (link_scopes(&read("/proc/net/if_inet6")), local_v4(&read("/proc/net/fib_trie")));
+    assert_eq!(interfaces(), want, "/proc through the parsers (both empty where unreadable)");
 }
