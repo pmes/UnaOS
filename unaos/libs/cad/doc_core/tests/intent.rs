@@ -43,7 +43,7 @@ fn base() -> Doc {
 }
 
 fn p(s: &str) -> Proposal {
-    Proposal { stmt: s.into(), confidence: 0.9, why: "round dimension".into() }
+    Proposal { stmt: s.into(), confidence: 0.9, why: "round dimension".into(), shapes: Vec::new() }
 }
 
 fn ps(v: &[&str]) -> Vec<Proposal> {

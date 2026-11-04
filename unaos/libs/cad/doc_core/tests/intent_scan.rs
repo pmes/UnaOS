@@ -50,7 +50,7 @@ fn shapes(s: Vec<ShapeRef>) -> Measurement {
 }
 
 fn p(s: &str) -> Proposal {
-    Proposal { stmt: s.into(), confidence: 0.9, why: "test".into() }
+    Proposal { stmt: s.into(), confidence: 0.9, why: "test".into(), shapes: Vec::new() }
 }
 
 fn doc(text: &str) -> Doc {
@@ -820,14 +820,36 @@ fn two_equal_bosses_stay_two_bosses() {
             ]
         );
     }
-    // VUG-INTENT-SET-SIBLINGS (owed): SR551's counting rule takes the other, still unmodelled boss into each set's
-    // residual (no cylinder face in the document, one 30 mm off in the set's replay), so each set is refused whole by
-    // Residual 30; the plate's own singles are accepted.
+    // VUGINTENTSETSIBLINGS (SR674): each set names the cylinder it models, and is judged with the one its sibling set
+    // names left out (SR551's rule alone took the other, still unmodelled boss 30 mm off into each set's residual and
+    // refused both by Residual 30): both sets and the plate's own singles are accepted.
+    assert!(set[..4].iter().all(|p| p.shapes == [6]) && set[4..].iter().all(|p| p.shapes == [7]), "{:?}", set);
     let bt = verify_all(&d, &ps, &m, d.tol);
     assert_eq!(bt.sets.len(), 2, "{}", bt.text());
     for (start, _) in &bt.sets {
         for (st, _, v) in &bt.entries[*start..*start + 4] {
-            assert!((residual_max(v) - 30.0).abs() < 1e-6, "{st}: {v:?}");
+            match v {
+                Verdict::Accept { max_mm, .. } => assert!(*max_mm <= 3.0 * SIGMA, "{st}: max {max_mm}"),
+                v => panic!("{st}: the set refused: {v:?}\n{}", bt.text()),
+            }
+        }
+    }
+    assert_eq!(bt.accepted(), ps.len(), "{}", bt.text());
+    // The leftover control (SR551 kept): a cylinder NO proposal names (r 3, its axis 45 deg off z in xz, so no plane
+    // stands it and no slot pairs it) still counts in each set's residual, so both sets are refused by Residual.
+    let mut s = box_planes(80.0, 60.0, 10.0);
+    s.push(cyl(v(25.0, 30.0, 13.0), 5.0, 400, 0.2));
+    s.push(cyl(v(55.0, 30.0, 13.0), 5.0, 400, 0.2));
+    s.push(ShapeRef { params: ShapeParams::Cylinder { point: v(40.0, 45.0, 20.0), axis: v(1.0, 0.0, 1.0), radius: 3.0 }, support: 300, rms_mm: 0.2, extent: None });
+    let m = shapes(s);
+    let ps = suggest(&d, &m);
+    assert_eq!(feature_set(&ps, "boss:").len(), 8, "{:?}", stmts(&ps));
+    assert!(ps.iter().all(|p| !p.shapes.contains(&8)), "{:?}", stmts(&ps));
+    let bt = verify_all(&d, &ps, &m, d.tol);
+    assert_eq!(bt.sets.len(), 2, "{}", bt.text());
+    for (start, _) in &bt.sets {
+        for (st, _, v) in &bt.entries[*start..*start + 4] {
+            assert!(residual_max(v) > 3.0 * SIGMA, "{st}: {v:?}");
         }
     }
     assert_eq!(bt.accepted(), ps.len() - 8, "{}", bt.text());

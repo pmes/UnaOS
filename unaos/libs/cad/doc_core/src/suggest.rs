@@ -239,7 +239,7 @@ fn sketch_rules(doc: &Doc, sk: &str, sigma: f64, ids: &mut Ids, out: &mut Vec<Pr
         }
     }
     let mut push = |stmt: String, res: f64, why: String| {
-        out.push(Proposal { stmt, confidence: confidence(res, sigma), why });
+        out.push(Proposal { stmt, confidence: confidence(res, sigma), why, shapes: Vec::new() }); // VUGINTENTSETSIBLINGS (SR674): a sketch rule names no shape
     };
 
     // 1. Horizontal / vertical: the end-to-end offset across the axis within sigma.
@@ -867,7 +867,7 @@ fn features(doc: &Doc, m: &Measurement, sigma: f64, ids: &mut Ids, out: &mut Vec
             format!("circle {} sketch={} centre={} r={}", c, a, b, f64_text(rv)),
             format!("extrude {} sketch={} outer={} dir=[{}] length={}", x, a, c, v3(z), f64_text(hv)),
         ] {
-            out.push(Proposal { stmt, confidence: conf, why: why.clone() });
+            out.push(Proposal { stmt, confidence: conf, why: why.clone(), shapes: modelled(&[ci], far) }); // VUGINTENTSETSIBLINGS (SR674)
         }
     }
 }
@@ -1110,8 +1110,17 @@ fn slots(
             format!("arc {} sketch={} centre={} r={} start={} end={}", k2, sk, c1, hw, f64_text(q), f64_text(3.0 * q)),
             format!("extrude {} sketch={} outer={} dir=[{}] length={}", ex, sk, l1, v3(z), f64_text(hv)),
         ] {
-            out.push(Proposal { stmt, confidence: conf, why: why.clone() });
+            out.push(Proposal { stmt, confidence: conf, why: why.clone(), shapes: modelled(&[sl.i, sl.j, sl.walls[0], sl.walls[1]], far) }); // VUGINTENTSETSIBLINGS (SR674)
         }
     }
     taken
+}
+
+// ---- VUGINTENTSETSIBLINGS (SR674): the shapes a feature set models (named tail block) ----
+
+/// The measured shapes a feature set's statements create a face for: `own` (the cylinder, or the slot's two cylinders
+/// and two walls) then the far-end plane when the extent rule measured one; the plane the feature stands on is not
+/// named (the document already models it).
+fn modelled(own: &[usize], far: Option<(usize, f64)>) -> Vec<usize> {
+    own.iter().copied().chain(far.map(|(q, _)| q)).collect()
 }

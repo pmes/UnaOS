@@ -74,6 +74,10 @@ pub struct Proposal {
     pub stmt: String,
     pub confidence: f64,
     pub why: String,
+    /// VUGINTENTSETSIBLINGS (SR674): the indices (into the `Measurement::Shapes` it was suggested from) of the measured
+    /// shapes this proposal's statements create a face for; empty for a proposal that names none (a sketch rule, a
+    /// Vein or hand proposal). A statement set is judged with the shapes a sibling set names left out ([`verify_all`]).
+    pub shapes: Vec<usize>,
 }
 
 /// What the geometry is checked against.
@@ -365,7 +369,7 @@ pub fn verify_all(doc: &Doc, ps: &[Proposal], m: &Measurement, tol: Tol) -> Batc
         let n = set_len(&cur, &ps[i..]); // VUGINTENTSETORDER (SR551): the reader's graph on the copy so far
         if n > 1 {
             // VUGINTENTSETVERIFY (SR541): the set applied, replayed and judged once, entering whole or not at all.
-            let (v, steps, next) = verify_set(&cur, &ps[i..i + n], m, tol);
+            let (v, steps, next) = verify_set(&cur, &ps[i..i + n], sibling_free(m, ps, i, n).as_ref().unwrap_or(m), tol); // VUGINTENTSETSIBLINGS (SR674): a sibling set's shapes left out
             if let Some(d) = next {
                 cur = d;
             }
@@ -678,6 +682,8 @@ fn has_partner(r: &Replay, s: &ShapeRef) -> bool {
 /// VUGINTENTSETORDER (SR551): a shape counts only when `base` (the document's own replay; `r` itself for the
 /// document's baseline) pairs it within the band, or `r` came closer to it than `base` by more than the band (the
 /// proposal models it); a face only a later statement set models is left out of an earlier single's residual.
+/// VUGINTENTSETSIBLINGS (SR674): a statement set reaches here with the shapes a SIBLING set of its batch names (and it
+/// does not) already removed from `shapes` by [`verify_all`] ([`sibling_free`]); a shape no proposal names still counts.
 fn shape_residuals(
     r: &Replay,
     base: &Replay,
@@ -1154,4 +1160,26 @@ impl core::fmt::Display for Term {
             Term::Thickness => "thickness",
         })
     }
+}
+
+// ---- VUGINTENTSETSIBLINGS (SR674): a sibling set's shapes left out of a set's residual (named tail block) ----
+
+/// The measurement the statement set `ps[i..i + n]` is judged against: for a Shapes measurement, every measured shape
+/// some proposal OUTSIDE the set names in its [`Proposal::shapes`] (a sibling set models it) and no member of the set
+/// names is left out; a shape no proposal names still counts (SR551's leftover rule). None (judge against `m` itself,
+/// byte-identical) when nothing is left out, for any other measurement, or when nothing would be left.
+fn sibling_free(m: &Measurement, ps: &[Proposal], i: usize, n: usize) -> Option<Measurement> {
+    let Measurement::Shapes { shapes, sigma_mm, sigma_deg } = m else { return None };
+    let (set, rest) = (&ps[i..i + n], ps[..i].iter().chain(ps[i + n..].iter()));
+    let named: Vec<usize> = rest.flat_map(|p| p.shapes.iter().copied()).collect();
+    let kept: Vec<ShapeRef> = shapes
+        .iter()
+        .enumerate()
+        .filter(|(k, _)| !named.contains(k) || set.iter().any(|p| p.shapes.contains(k)))
+        .map(|(_, s)| *s)
+        .collect();
+    if kept.len() == shapes.len() || kept.is_empty() {
+        return None;
+    }
+    Some(Measurement::Shapes { shapes: kept, sigma_mm: *sigma_mm, sigma_deg: *sigma_deg })
 }
