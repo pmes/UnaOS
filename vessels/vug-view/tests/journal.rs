@@ -575,3 +575,65 @@ fn a_part_with_one_machine_beside_it_offers_the_shelf() {
     assert!((volume(&vw) - 1000.0).abs() < 1e-4, "the box unchanged: {}", volume(&vw));
     assert!(doc_core::write(doc(&vw)).contains("\nmachine shop lib=shop\ndrill o1 "), "the shelf machine before the drill, by name");
 }
+
+// VUGFACEJOURNALFAULTFIXREF (LEDGER SR590): a line whose end names a line (a BadRef: the slot wanted a point) in a sketch
+// no feature names is carried; its row offers the sketch's live points it does not already name, one card; Tab picks the
+// second and Enter re-names the end as ONE snapshot: no fault, the box unchanged.
+
+/// The 20 x 10 x 5 box and an open sketch whose `m2` starts at the line `m1`.
+const BOX_BADREF: &str = "vug-doc version=1 lin=1e-6 ang=1e-9
+sketch s1 o=[0 0 0] z=[0 0 1] x=[1 0 0]
+point p1 sketch=s1 x=0 y=0
+point p2 sketch=s1 x=20 y=0
+point p3 sketch=s1 x=20 y=10
+point p4 sketch=s1 x=0 y=10
+line l1 sketch=s1 a=p1 b=p2
+line l2 sketch=s1 a=p2 b=p3
+line l3 sketch=s1 a=p3 b=p4
+line l4 sketch=s1 a=p4 b=p1
+fix f1 sketch=s1 p=p1 at=[0 0]
+fix f2 sketch=s1 p=p2 at=[20 0]
+fix f3 sketch=s1 p=p3 at=[20 10]
+fix f4 sketch=s1 p=p4 at=[0 10]
+extrude box sketch=s1 outer=l1 dir=[0 0 1] length=5
+sketch s2 o=[0 0 20] z=[0 0 1] x=[1 0 0]
+point q1 sketch=s2 x=0 y=0
+point q2 sketch=s2 x=8 y=0
+point q3 sketch=s2 x=8 y=6
+fix g1 sketch=s2 p=q1 at=[0 0]
+fix g2 sketch=s2 p=q2 at=[8 0]
+fix g3 sketch=s2 p=q3 at=[8 6]
+line m1 sketch=s2 a=q1 b=q2
+line m2 sketch=s2 a=m1 b=q2
+";
+
+#[test]
+fn a_bad_ref_offers_the_sketch_points_and_tab_return_fixes_it() {
+    let d = doc_core::read(BOX_BADREF).expect("a wrong-kind end is geometry, not syntax: the document reads");
+    let mut vw = Viewer::open_doc(d, "box", (W, H), Preset::Una).expect("a BadRef no solid reads does not refuse the journal");
+    let m2 = index_of(&vw, |s| s.id() == Some("m2"));
+    let line = doc(&vw).line(m2);
+    let f = vw.view.design.journal.faults.iter().map(|f| (f.id.clone(), f.fault.clone())).collect::<Vec<_>>();
+    assert_eq!(f, vec![("m2".to_string(), doc_core::Fault::BadRef { id: "m1".into(), kind: doc_core::RefKind::Point })], "the end wanted a point");
+    assert!(vw.view.design.journal.select_line(line), "m2's line is a row");
+
+    // The card: the sketch's points before m2 that m2 does not already name, in document order.
+    let texts = vw.view.design.journal.fixes_for(m2).into_iter().map(|f| f.text).collect::<Vec<_>>();
+    assert_eq!(texts, ["line m2 sketch=s2 a=q1 b=q2", "line m2 sketch=s2 a=q3 b=q2"], "q1 and q3, not q2 (named) nor a line");
+    assert!(vw.view.design.journal.choosing_fix(), "two choices are a card");
+    assert!(key(&mut vw, "Tab"), "Tab walks the card");
+    let picked = vw.view.design.journal.offered().expect("a pick").text;
+    assert_eq!(picked, "line m2 sketch=s2 a=q3 b=q2", "Tab picked the second");
+    let depth = vw.view.design.journal.depth().0;
+
+    // Enter takes the pick: ONE snapshot, no fault, the end re-named, the box unchanged.
+    assert!(key(&mut vw, "Return"), "Enter takes the pick");
+    let j = &vw.view.design.journal;
+    println!("badref choices={} picked={picked} faults_after={} volume={}", texts.len(), j.faults.len(), volume(&vw));
+    assert!(j.faults.is_empty(), "{:?}", j.faults);
+    assert_eq!(doc(&vw).stmts[m2], Stmt::Line { id: "m2".into(), sketch: "s2".into(), a: "q3".into(), b: "q2".into() });
+    assert_eq!(j.depth().0, depth + 1, "ONE snapshot");
+    assert_eq!(j.note.as_deref(), Some(format!("fixed line {line}: line m2 sketch=s2 a=q3 b=q2").as_str()));
+    assert!((volume(&vw) - 1000.0).abs() < 1e-4, "the box unchanged: {}", volume(&vw));
+    assert!(j.offered().is_none(), "nothing left to fix");
+}

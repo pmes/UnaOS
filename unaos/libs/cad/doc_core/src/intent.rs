@@ -184,17 +184,17 @@ impl Reason {
 
 fn fault_name(f: &Fault) -> String {
     match f {
-        Fault::BadRef(n) => format!("bad-ref({})", n),
+        Fault::BadRef { id: n, .. } => format!("bad-ref({})", n), // VUGFACEJOURNALFAULTFIXREF (SR590): the words kept
         Fault::Conflicting => String::from("conflicting"),
         Fault::Diverged => String::from("diverged"),
-        Fault::NoProfile => String::from("no-profile"),
+        Fault::NoProfile { .. } => String::from("no-profile"),
         Fault::Upstream(u) => format!("upstream({})", u),
         Fault::Brep(e) => format!("brep {:?}", e),
         Fault::Make(e) => format!("make {:?}", e),
         Fault::NoMachine => String::from("no-machine"),
         // VUGFACEFILLET (SR511): an edge name that no longer resolves, or resolves twice.
-        Fault::NoSuchEdge(n) => format!("no-such-edge({})", n),
-        Fault::AmbiguousEdge(n) => format!("ambiguous-edge({})", n),
+        Fault::NoSuchEdge { name: n, .. } => format!("no-such-edge({})", n),
+        Fault::AmbiguousEdge { name: n, .. } => format!("ambiguous-edge({})", n),
     }
 }
 

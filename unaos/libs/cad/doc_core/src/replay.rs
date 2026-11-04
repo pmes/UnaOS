@@ -30,18 +30,20 @@ pub struct SolidOut {
     pub brep: Brep,
 }
 
-/// Why a statement did not regenerate.
-#[derive(Clone, Debug, PartialEq)]
+/// Why a statement did not regenerate. VUGFACEJOURNALFAULTFIXREF (SR590): `Debug` is written by hand at the tail (the
+/// pre-SR590 words, the candidates left out).
+#[derive(Clone, PartialEq)]
 pub enum Fault {
     /// sketch_core refused the reference as the wrong kind of entity (`Constraint::check` / `Sketch::add_*`): the
-    /// text id it named.
-    BadRef(String),
+    /// text id it named and the kind its slot wanted (VUGFACEJOURNALFAULTFIXREF, SR590).
+    BadRef { id: String, kind: RefKind },
     /// sketch_core names this constraint among those that cannot all hold.
     Conflicting,
     /// The sketch's solve did not converge.
     Diverged,
-    /// No profile of the solved sketch has the `outer` entity in its outer loop.
-    NoProfile,
+    /// No profile of the solved sketch has the `outer` entity in its outer loop; `loops` names one entity of each closed
+    /// profile's outer loop (VUGFACEJOURNALFAULTFIXREF, SR590).
+    NoProfile { loops: Vec<String> },
     /// It depends on a statement that failed (that statement's id).
     Upstream(String),
     Brep(brep_core::Refusal),
@@ -49,10 +51,11 @@ pub enum Fault {
     /// An Op in a document with no machine.
     NoMachine,
     // VUGFACEFILLET (SR511): an edge name of a fillet / chamfer that does not resolve on the replayed solid.
-    /// No edge of the `on` solid carries this name (its four words): the reference no longer resolves.
-    NoSuchEdge(String),
-    /// More than one edge of the `on` solid carries this name (its four words).
-    AmbiguousEdge(String),
+    /// No edge of the `on` solid carries this name (its four words): the reference no longer resolves. `edges`: the
+    /// solid's names that resolve to one edge (VUGFACEJOURNALFAULTFIXREF, SR590).
+    NoSuchEdge { name: String, edges: Vec<String> },
+    /// More than one edge of the `on` solid carries this name (its four words); `edges` as for `NoSuchEdge`.
+    AmbiguousEdge { name: String, edges: Vec<String> },
 }
 
 /// A failing statement: its line, its id (empty for none) and why.
@@ -200,7 +203,7 @@ pub fn replay(doc: &Doc, tol: Tol) -> Replay {
                     }
                     Err(BadRef(e)) => {
                         let n = wk.name_of(e);
-                        fail(&mut r, line, id, Fault::BadRef(n));
+                        fail(&mut r, line, id, Fault::BadRef { id: n, kind: RefKind::Point }); // VUGFACEJOURNALFAULTFIXREF (SR590): an end / a centre is a point
                     }
                 }
             }
@@ -221,7 +224,7 @@ pub fn replay(doc: &Doc, tol: Tol) -> Replay {
                     }
                     Err(BadRef(e)) => {
                         let n = wk.name_of(e);
-                        fail(&mut r, line, id, Fault::BadRef(n));
+                        fail(&mut r, line, id, Fault::BadRef { id: n, kind: RefKind::Point }); // VUGFACEJOURNALFAULTFIXREF (SR590): an end / a centre is a point
                     }
                 }
             }
@@ -234,7 +237,7 @@ pub fn replay(doc: &Doc, tol: Tol) -> Replay {
                         Ok(cid) => wk.cons.push((cid, i)),
                         Err(BadRef(e)) => {
                             let n = wk.name_of(e);
-                            fail(&mut r, line, id, Fault::BadRef(n));
+                            fail(&mut r, line, id, Fault::BadRef { kind: wanted(c, &n, doc, sketch), id: n }); // VUGFACEJOURNALFAULTFIXREF (SR590): the slot's kind
                         }
                     },
                 }
@@ -282,7 +285,7 @@ pub fn replay(doc: &Doc, tol: Tol) -> Replay {
         let Some(p) =
             sketch_core::profiles(&wk.sk, tol).into_iter().find(|p| p.outer.edges.iter().any(|e| e.src() == eo))
         else {
-            fail(&mut r, line, id, Fault::NoProfile);
+            fail(&mut r, line, id, Fault::NoProfile { loops: loops_of(wk, tol) }); // VUGFACEJOURNALFAULTFIXREF (SR590): the closed loops
             continue;
         };
         let (o, z, x) = wk.frame;
@@ -382,11 +385,11 @@ fn edit_step(r: &mut Replay, built: &mut BTreeSet<String>, s: &Stmt, line: u32, 
         match hits.len() {
             1 => ids.push(hits[0]),
             0 => {
-                fail(r, line, id, Fault::NoSuchEdge(crate::name_words(n)));
+                fail(r, line, id, Fault::NoSuchEdge { name: crate::name_words(n), edges: unique_edges(&src) }); // VUGFACEJOURNALFAULTFIXREF (SR590)
                 return true;
             }
             _ => {
-                fail(r, line, id, Fault::AmbiguousEdge(crate::name_words(n)));
+                fail(r, line, id, Fault::AmbiguousEdge { name: crate::name_words(n), edges: unique_edges(&src) }); // VUGFACEJOURNALFAULTFIXREF (SR590)
                 return true;
             }
         }
@@ -446,5 +449,103 @@ fn fold_machine(machine: &mut Option<Machine>, s: &Stmt) {
         Stmt::Stock(st) => machine.iter_mut().for_each(|m| m.stock = Some(*st)),
         Stmt::Fixture(fx) => machine.iter_mut().for_each(|m| m.fixtures.push(fx.clone())),
         _ => {}
+    }
+}
+
+// ---- VUGFACEJOURNALFAULTFIXREF (SR590): a fault carries what a fix would choose from ----
+// A BadRef names the kind its slot wanted (sketch_core's `BadRef` carries the entity only, so the slot is read from the
+// text `Cons` in sketch_core's check order), a NoProfile the closed loops of its sketch, an edge reference the edge
+// names of its `on` solid. The face (vug-view journal.rs) lists the candidates; it re-derives none of these.
+
+/// The kind of sketch entity a reference slot wants.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RefKind {
+    /// A point entity (a line's end, a circle's centre, `<id>` in a point slot).
+    Point,
+    /// A line.
+    Line,
+    /// A circle or an arc (`<id>.centre`, a radius, a circle slot).
+    Round,
+    /// A line or an arc (`<id>.start` / `<id>.end`).
+    Ends,
+}
+
+impl RefKind {
+    /// THE kind table: statement `s` declares an entity of this kind.
+    pub fn holds(self, s: &Stmt) -> bool {
+        matches!(
+            (self, s),
+            (RefKind::Point, Stmt::Point { .. })
+                | (RefKind::Line, Stmt::Line { .. })
+                | (RefKind::Round, Stmt::Circle { .. } | Stmt::Arc { .. })
+                | (RefKind::Ends, Stmt::Line { .. } | Stmt::Arc { .. })
+        )
+    }
+}
+
+/// A point reference's entity and the kind it wants.
+fn pref_slot(p: &PRef) -> (&str, RefKind) {
+    match p {
+        PRef::Point(i) => (i, RefKind::Point),
+        PRef::Centre(i) => (i, RefKind::Round),
+        PRef::Start(i) | PRef::End(i) => (i, RefKind::Ends),
+    }
+}
+
+/// Every entity slot of `c` with the kind it wants, in sketch_core's `Constraint::check` order.
+fn slots(c: &Cons) -> Vec<(&str, RefKind)> {
+    use RefKind::{Line, Round};
+    match c {
+        Cons::Coincident(a, b) | Cons::Distance(a, b, _) => alloc::vec![pref_slot(a), pref_slot(b)],
+        Cons::PointOnLine(p, l) | Cons::DistancePointLine(p, l, _) | Cons::Midpoint(p, l) => {
+            alloc::vec![pref_slot(p), (l.as_str(), Line)]
+        }
+        Cons::PointOnCircle(p, k) => alloc::vec![pref_slot(p), (k.as_str(), Round)],
+        Cons::Horizontal(l) | Cons::Vertical(l) => alloc::vec![(l.as_str(), Line)],
+        Cons::Parallel(a, b) | Cons::Perpendicular(a, b) | Cons::EqualLength(a, b) | Cons::Angle(a, b, _) => {
+            alloc::vec![(a.as_str(), Line), (b.as_str(), Line)]
+        }
+        Cons::TangentLineCircle(l, k) => alloc::vec![(l.as_str(), Line), (k.as_str(), Round)],
+        Cons::TangentCircles(a, b) | Cons::EqualRadius(a, b) => alloc::vec![(a.as_str(), Round), (b.as_str(), Round)],
+        Cons::Radius(k, _) | Cons::Diameter(k, _) => alloc::vec![(k.as_str(), Round)],
+        Cons::Fix(p, _) => alloc::vec![pref_slot(p)],
+        Cons::Symmetric(a, b, l) => alloc::vec![pref_slot(a), pref_slot(b), (l.as_str(), Line)],
+    }
+}
+
+/// The kind the slot of `c` that refused `n` wanted: the first slot naming `n` whose kind `n`'s statement (in sketch
+/// `sketch`) does not hold, else the first slot naming `n`, else a point.
+fn wanted(c: &Cons, n: &str, doc: &Doc, sketch: &str) -> RefKind {
+    let decl = doc.stmts.iter().find(|s| s.id() == Some(n) && s.refs().first() == Some(&sketch));
+    let named: Vec<RefKind> = slots(c).into_iter().filter(|(i, _)| *i == n).map(|(_, k)| k).collect();
+    named.iter().copied().find(|k| !decl.is_some_and(|s| k.holds(s))).or(named.first().copied()).unwrap_or(RefKind::Point)
+}
+
+/// One text id per closed profile of the solved sketch: its outer loop's first edge entity.
+fn loops_of(wk: &Work, tol: Tol) -> Vec<String> {
+    sketch_core::profiles(&wk.sk, tol).iter().filter_map(|p| p.outer.edges.first().map(|e| wk.name_of(e.src()))).collect()
+}
+
+/// The edge names of `b` that resolve to exactly one edge, as their four words, in edge order.
+fn unique_edges(b: &Brep) -> Vec<String> {
+    b.edges.iter().filter(|e| b.edges_named(e.name).count() == 1).map(|e| crate::name_words(&e.name)).collect()
+}
+
+impl core::fmt::Debug for Fault {
+    /// The pre-SR590 words: a refusal's text (deviation.rs `fault_text`, journal.rs `regenerate`, tools/scan) names the
+    /// fault, never its candidates.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Fault::BadRef { id, .. } => write!(f, "BadRef({:?})", id),
+            Fault::Conflicting => f.write_str("Conflicting"),
+            Fault::Diverged => f.write_str("Diverged"),
+            Fault::NoProfile { .. } => f.write_str("NoProfile"),
+            Fault::Upstream(u) => write!(f, "Upstream({:?})", u),
+            Fault::Brep(e) => write!(f, "Brep({:?})", e),
+            Fault::Make(e) => write!(f, "Make({:?})", e),
+            Fault::NoMachine => f.write_str("NoMachine"),
+            Fault::NoSuchEdge { name, .. } => write!(f, "NoSuchEdge({:?})", name),
+            Fault::AmbiguousEdge { name, .. } => write!(f, "AmbiguousEdge({:?})", name),
+        }
     }
 }
