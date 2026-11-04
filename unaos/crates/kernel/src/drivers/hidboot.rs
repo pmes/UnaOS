@@ -679,7 +679,7 @@ pub fn selftest() {
     };
     let (mut prev, mut pm) = ([0u8; 6], 0u8);
     let (owed_ok, coalesce_ok, latch_ok, held_ok) = {
-        #[cfg(feature = "ehcihid")] let _g = crate::drivers::ehci::EHCI_HID.lock(); // HIDBOOTARM (B1000): aarch64 has no EHCI; its KAT runs unserialised (lock keys push no event), HIDBOOT-ARM-KATLOCK owed
+        #[cfg(feature = "ehcihid")] let _g = crate::drivers::ehci::EHCI_HID.lock(); #[cfg(all(target_arch = "x86_64", feature = "ehcihid"))] { crate::hidstall::lock_took(); } // F39HIDLOCKWHOKATSITES (B1151): this taker named for the hid pass's `lock_by=` (hidstall.rs tail). LINE-NEUTRAL fold. HIDBOOTARM (B1000): aarch64 has no EHCI; its KAT runs unserialised (lock keys push no event), HIDBOOT-ARM-KATLOCK owed
         // owed: a press edge owes the slot; a restated level, a release and a short report do not.
         let mut leds = 0u8;
         let (mut p0, mut m0) = ([0u8; 6], 0u8);
