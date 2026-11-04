@@ -146,7 +146,7 @@ pub fn selftest() {
     };
     let _ = mt.unlink(G, KERNEL_PRINCIPAL);
     let _ = mt.unlink(F, KERNEL_PRINCIPAL);
-    let anon_write = w && c && a && u;
+    let anon_write = w && c && a && u; #[cfg(target_arch = "x86_64")] let _ = machine_store_leg(&mt); // MACHINESTOREACL (rmbp-ledger B1150): the no-session settings folder's ring-3 refusal leg (file tail); its own summary line, not in ROOTACL's PASS. LINE-NEUTRAL append, code first
     let pass = made && owner == SYSTEM_OWNER && trees == TREES.len() && anon_write && r && admin_tok != "REFUSED";
     serial_println!(
         ":: ROOTACL: owner={} trees={} anon_write={} admin_write={} -> {} :: anon_read={} anon_create={} anon_unlink={} anon_attr={} admin={} scratch={} ::",
@@ -162,4 +162,90 @@ pub fn selftest() {
         admin.as_deref().unwrap_or("-"),
         if made { "made" } else { "unmade" },
     );
+}
+
+// ── MACHINESTOREACL (rmbp-ledger B1150, BP-storage-11) — TAIL-APPENDED ─────────────────────────────────────────────────
+// The no-session settings folder (prefs' MACHINE store, VEIL-REDUCE-BOOT-STORE B1140: `/settings/general` is the boot
+// screen's copy) carries the `system` owner row above. `write_verdict`'s walk then refuses every write, create, rename,
+// unlink and attribute set in it to all but `kernel` and the administrator (the swap's row-less `general` inherits the
+// folder's row); reads stay public (`unafs::read_authz`). Before B1150 the folder was a public object (a kernel create
+// stamps no row) and ring 3's `SYS_PATH_WRITE` wrote it as `anon`. prefs.rs stamps it from its two writers
+// (`ensure_dirs`, `machine_mirror`) through [`stamp_store`]; a home's `<home>/settings` is never stamped. `tests rootacl`
+// runs the MACHINESTORE leg (x86): the ring-3 path door's body (`arch::syscall::path_write_as`) as `anon`.
+// Wire: `[rootacl] store dir=<d> owner=<system|none> stamped=<1|0>` (a write, or the first failure) ·
+// `:: MACHINESTORE: owner= write= create= read= -> PASS|FAIL :: by=anon target=<general|scratch> errno= made_dir= ::`.
+
+/// The no-session settings folder, spelt as prefs.rs's `path()` with no home and uninstall's `settings_dirs` spell it.
+fn machine_store_dir() -> String {
+    alloc::format!("/{}", prefs_core::files::DIR)
+}
+
+/// Stamp the machine store folder `dir` with [`SYSTEM_OWNER`] at kernel authority when it lacks the row; any other
+/// `dir` (a home's settings folder) is left alone with no I/O. `true` = the folder carries the row.
+pub fn stamp_store(mt: &MountTable, dir: &str) -> bool {
+    use core::sync::atomic::{AtomicBool, Ordering};
+    static FAIL_SAID: AtomicBool = AtomicBool::new(false);
+    if machine_store_dir() != dir || !matches!(mt.stat(dir), Ok(s) if matches!(s.kind, NodeKind::Dir)) {
+        return false;
+    }
+    if stamped(mt, dir) {
+        return true;
+    }
+    let ok = mt.set_attr(dir, "owner", AttrValue::Str(String::from(SYSTEM_OWNER)), KERNEL_PRINCIPAL).is_ok() && stamped(mt, dir);
+    if ok || !FAIL_SAID.swap(true, Ordering::AcqRel) {
+        serial_println!("[rootacl] store dir={} owner={} stamped={}", dir, if ok { SYSTEM_OWNER } else { "none" }, ok as u8);
+    }
+    ok
+}
+
+/// MACHINESTORE leg of `tests rootacl`: the folder laid at kernel authority only when absent (removed after if still
+/// empty), stamped by [`stamp_store`]; then, through the ring-3 path door's body as `anon`, a write (a trailing newline
+/// at EOF of `general`, else of a kernel-laid scratch file; a wrongly admitted byte is truncated back) and a create
+/// beside it must both be `-EACCES`, and an `anon` read of the target must still open. One summary line.
+#[cfg(target_arch = "x86_64")]
+fn machine_store_leg(mt: &MountTable) -> bool {
+    use crate::arch::syscall::path_write_as;
+    let dir = machine_store_dir();
+    let made_dir = mt.stat(&dir).is_err() && mt.create(&dir, NodeKind::Dir, KERNEL_PRINCIPAL).is_ok();
+    let owned = stamp_store(mt, &dir);
+    let general = alloc::format!("{}/general", dir);
+    let scratch = alloc::format!("{}/machinestore-probe", dir);
+    let anon_new = alloc::format!("{}/machinestore-anon", dir);
+    let _ = mt.unlink(&anon_new, KERNEL_PRINCIPAL);
+    let is_general = matches!(mt.stat(&general), Ok(s) if matches!(s.kind, NodeKind::File));
+    let target = if is_general { general } else { scratch };
+    let laid = !is_general && {
+        let _ = mt.unlink(&target, KERNEL_PRINCIPAL);
+        mt.create(&target, NodeKind::File, KERNEL_PRINCIPAL).is_ok() && mt.write(&target, 0, b"probe\n", KERNEL_PRINCIPAL).is_ok()
+    };
+    let size = mt.stat(&target).map(|s| s.size as u64).unwrap_or(0);
+    let we = path_write_as(&target, 0, size, b"\n", "anon");
+    if we >= 0 {
+        let _ = mt.truncate(&target, size, KERNEL_PRINCIPAL);
+    }
+    let ce = path_write_as(&anon_new, una_abi::PATH_W_TRUNC, 0, b"x", "anon");
+    if ce >= 0 {
+        let _ = mt.unlink(&anon_new, KERNEL_PRINCIPAL);
+    }
+    let read = mt.open_read(&target, "anon").is_ok();
+    if laid {
+        let _ = mt.unlink(&target, KERNEL_PRINCIPAL);
+    }
+    if made_dir {
+        let _ = mt.remove_dir(&dir, KERNEL_PRINCIPAL);
+    }
+    let tok = |e: i64| if e == una_abi::EACCES { "refused" } else if e >= 0 { "ADMITTED" } else { "error" };
+    let pass = owned && we == una_abi::EACCES && ce == una_abi::EACCES && read;
+    serial_println!(
+        ":: MACHINESTORE: owner={} write={} create={} read={} -> {} :: by=anon target={} errno={} made_dir={} ::",
+        if owned { SYSTEM_OWNER } else { "none" },
+        tok(we),
+        tok(ce),
+        if read { "ok" } else { "REFUSED" },
+        if pass { "PASS" } else { "FAIL" },
+        if is_general { "general" } else { "scratch" },
+        we,
+        made_dir as u8,
+    );
+    pass
 }
