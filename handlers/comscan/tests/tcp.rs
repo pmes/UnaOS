@@ -544,3 +544,207 @@ fn a_reopen_onto_another_board_is_refused_by_name_and_keeps_redialing_the_same_b
     drop(desk);
     assert_eq!(fake_a.join().unwrap(), lines[5..].to_vec(), "the same board ran only the lines from the lost one on");
 }
+
+// --- VUGCOMSCANHOSTDESK (SR561): the first bind commissions an unnamed board once; a reopen compares the commissioned name ---
+
+use std::sync::{Arc, Mutex};
+
+use comscan::pump::{Identify, compose};
+
+/// A fake grbl whose `$I` user string is the shared `name`: says its banner, answers `$I` as build
+/// `1.1h.20190825:<name>`, takes `$I=<s>` through grbl's line intake (a-z upper-cased, bytes <= ' ' dropped) into
+/// `name` with `ok`, acks program lines; with `lost_after` it FINs after that many acks (its listener goes at the
+/// accept). Returns (the program lines, the `$I=` writes) at the client's end.
+fn fake_grbl_named(l: TcpListener, name: Arc<Mutex<String>>, lost_after: Option<usize>) -> JoinHandle<(Vec<String>, Vec<String>)> {
+    thread::spawn(move || {
+        let (mut s, _) = l.accept().unwrap();
+        drop(l);
+        s.write_all(BANNER).unwrap();
+        let mut got = Vec::new();
+        let mut writes = Vec::new();
+        let mut cur: Vec<u8> = Vec::new();
+        let mut acked = 0usize;
+        let mut buf = [0u8; 256];
+        loop {
+            let k = match s.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(k) => k,
+            };
+            for &b in &buf[..k] {
+                match b {
+                    b'?' | b'!' | b'~' | 0x18 => {}
+                    b'\n' => {
+                        let raw = String::from_utf8_lossy(&cur).trim().to_string();
+                        cur.clear();
+                        let up: String = raw.chars().filter(|c| *c > ' ').map(|c| c.to_ascii_uppercase()).collect();
+                        if up == "$I" {
+                            let ver = format!("1.1h.20190825:{}", name.lock().unwrap());
+                            let _ = s.write_all(format!("[VER:{ver}]\r\n[OPT:V,15,128]\r\nok\r\n").as_bytes());
+                        } else if let Some(n) = up.strip_prefix("$I=") {
+                            *name.lock().unwrap() = n.to_string();
+                            writes.push(up.clone());
+                            let _ = s.write_all(b"ok\r\n");
+                        } else {
+                            got.push(raw);
+                            if lost_after.is_none_or(|n| acked < n) {
+                                let _ = s.write_all(b"ok\r\n");
+                                acked += 1;
+                                if lost_after == Some(acked) {
+                                    let _ = s.shutdown(std::net::Shutdown::Write);
+                                }
+                            }
+                        }
+                    }
+                    _ => cur.push(b),
+                }
+            }
+        }
+        (got, writes)
+    })
+}
+
+fn no_identity() -> Box<Identify> {
+    Box::new(|_: &str| -> Option<String> { None })
+}
+
+fn no_ws() -> Box<Opener> {
+    Box::new(|port: &str| -> Result<Box<dyn Transport + Send>, String> { Err(format!("ws asked for {port}")) })
+}
+
+/// The desk and opener through THE composition (`compose`, what `host_parts` builds over the host's links).
+fn composed() -> (PumpDesk, Box<Opener>) {
+    compose(machine(), no_identity(), no_serial(), opener(GRBL, Duration::from_millis(500)), no_ws())
+}
+
+fn start_at(digest: u64, port: u16) -> PumpEvent {
+    PumpEvent::PumpStart {
+        principal: Origin::LocalUser("una".to_string()),
+        program: digest_hex(digest),
+        dialect: "grbl".to_string(),
+        port: format!("{TCP_SCHEME}127.0.0.1:{port}"),
+    }
+}
+
+fn squawk_words(out: &[PumpEvent]) -> Vec<String> {
+    out.iter().filter_map(|s| match s { PumpEvent::Squawk { event: Some(e), .. } => Some(e.clone()), _ => None }).collect()
+}
+
+fn ver_of(name: &str) -> String {
+    format!("[VER:1.1h.20190825:{name}] [OPT:V,15,128]")
+}
+
+#[test]
+fn the_first_bind_commissions_an_unnamed_board_once_and_keeps_the_name() {
+    use pump_core::pump::{hello_name, name_verb};
+    assert_eq!(name_verb(GRBL, "UNA-1"), Some("$I=UNA-1".to_string()));
+    assert_eq!(name_verb(Dialect::Marlin, "UNA-1"), None, "Marlin has no writable name");
+    assert_eq!(name_verb(Dialect::LinuxCnc, "UNA-1"), None);
+    assert_eq!(hello_name(GRBL, &ver_of("")), Some(""), "an uncommissioned board");
+    assert_eq!(hello_name(GRBL, &hello_of(VER_A)), Some("mill-a"));
+    assert_eq!(hello_name(GRBL, "[OPT:V,15,128]"), None, "no VER line");
+
+    let (l, port) = listener();
+    let name = Arc::new(Mutex::new(String::new()));
+    let fake = fake_grbl_named(l, name.clone(), None);
+    let p = program();
+    let lines = Pump::from_program(&p, GRBL).unwrap().lines().to_vec();
+    let (mut desk, mut open) = composed();
+    let pass = Verdict::Pass { digest: p.digest(), machine: machine().digest() };
+    let digest = desk.arm(&pass, &p, GRBL).expect("armed by a pass");
+
+    // The first bind: the unnamed answer, the commission, the readback kept and printed once.
+    let out = desk.apply(&start_at(digest, port), &mut *open);
+    let kept = name.lock().unwrap().clone();
+    assert!(kept.starts_with("UNA-") && kept.len() == 12, "the commissioned name {kept:?}");
+    assert_eq!(squawk_words(&out), vec!["started".to_string(), format!("hello {}", ver_of(&kept))], "{out:?}");
+    assert_eq!(desk.hello(), Some(ver_of(&kept).as_str()), "the readback is the identity the reopen compares");
+
+    let t0 = Instant::now();
+    let mut words = Vec::new();
+    match drive_until(&mut desk, &mut *open, t0, &mut words, |e| e == "done" || e.starts_with("link lost")) {
+        PumpEvent::Squawk { event: Some(e), .. } => assert_eq!(e, "done"),
+        other => panic!("{other:?}"),
+    }
+    drop(desk);
+    let (got, writes) = fake.join().unwrap();
+    assert_eq!(writes, vec![format!("$I={kept}")], "commissioned exactly once");
+    assert_eq!(got, lines, "neither the hello nor the commission is a program line");
+
+    // A board already named is never written.
+    let (l2, port2) = listener();
+    let named = Arc::new(Mutex::new("MILL-A".to_string()));
+    let fake2 = fake_grbl_named(l2, named.clone(), None);
+    let (mut desk2, mut open2) = composed();
+    let digest2 = desk2.arm(&pass, &p, GRBL).expect("armed by a pass");
+    let out = desk2.apply(&start_at(digest2, port2), &mut *open2);
+    assert_eq!(squawk_words(&out), vec!["started".to_string(), format!("hello {}", ver_of("MILL-A"))], "{out:?}");
+    drop(desk2);
+    let (_, writes2) = fake2.join().unwrap();
+    assert!(writes2.is_empty(), "a named board is not commissioned: {writes2:?}");
+    assert_eq!(named.lock().unwrap().as_str(), "MILL-A");
+}
+
+#[test]
+fn a_reopen_onto_a_board_answering_another_name_refuses_another_board() {
+    let (l, port) = listener();
+    let name_a = Arc::new(Mutex::new(String::new()));
+    let fake1 = fake_grbl_named(l, name_a.clone(), Some(5));
+    let p = program();
+    let want = Pump::from_program(&p, GRBL).unwrap();
+    let at = want.line_of(5).unwrap();
+    let lines = want.lines().to_vec();
+    let (mut desk, mut open) = composed();
+    let pass = Verdict::Pass { digest: p.digest(), machine: machine().digest() };
+    let digest = desk.arm(&pass, &p, GRBL).expect("armed by a pass");
+
+    let out = desk.apply(&start_at(digest, port), &mut *open);
+    let kept = name_a.lock().unwrap().clone();
+    let said_a = ver_of(&kept);
+    assert_eq!(squawk_words(&out), vec!["started".to_string(), format!("hello {said_a}")], "{out:?}");
+
+    // The FIN after five lines: lost at the oldest unacknowledged line.
+    let t0 = Instant::now();
+    let mut words = Vec::new();
+    drive_until(&mut desk, &mut *open, t0, &mut words, |e| e.starts_with("link lost"));
+    assert_eq!(desk.state(), Some(PumpState::LinkLost { at_line: at, program_digest: p.digest() }));
+    let (seen, writes) = fake1.join().unwrap();
+    assert_eq!(&seen[..5], &lines[..5]);
+    assert_eq!(writes, vec![format!("$I={kept}")]);
+
+    // An unnamed board of the same build takes the port: refused by the commissioned name, and never commissioned.
+    let lb = TcpListener::bind(("127.0.0.1", port)).expect("rebind the lost port");
+    let name_b = Arc::new(Mutex::new(String::new()));
+    let fake_b = fake_grbl_named(lb, name_b.clone(), None);
+    match drive_until(&mut desk, &mut *open, t0, &mut words, |e| e.starts_with("reconnect attempt 1")) {
+        PumpEvent::Squawk { event: Some(e), .. } => {
+            let another = Refused::AnotherBoard { was: said_a.clone(), now: Some(ver_of("")) };
+            assert_eq!(e, format!("reconnect attempt 1 refused: {another:?}; attempt 2 in 500 ms"))
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(desk.rearm(&pass, &p, GRBL), Err(Refused::LinkDown { attempt: 2 }), "no re-arm onto another board");
+    let (ran_b, writes_b) = fake_b.join().unwrap();
+    assert!(ran_b.is_empty() && writes_b.is_empty(), "another board ran nothing and was not named: {ran_b:?} {writes_b:?}");
+    assert_eq!(name_b.lock().unwrap().as_str(), "", "a reopen never commissions");
+
+    // The commissioned board comes back: relinked, re-armed, resumed to done from the lost line.
+    let la = TcpListener::bind(("127.0.0.1", port)).expect("rebind for the commissioned board");
+    let fake_a = fake_grbl_named(la, name_a.clone(), None);
+    match drive_until(&mut desk, &mut *open, t0, &mut words, |e| e.starts_with("relinked") || e.starts_with("reconnect attempt 2")) {
+        PumpEvent::Squawk { event: Some(e), .. } => {
+            assert_eq!(e, format!("relinked on attempt 2; re-arm to resume from line {at}"))
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(desk.rearm(&pass, &p, GRBL), Ok(at));
+    let out = desk.apply(&PumpEvent::PumpResume { principal: Origin::LocalUser("una".to_string()) }, &mut *open);
+    assert!(matches!(&out[..], [PumpEvent::Squawk { event: Some(e), .. }] if e == "resume"), "{out:?}");
+    match drive_until(&mut desk, &mut *open, t0, &mut words, |e| e == "done" || e.starts_with("link lost")) {
+        PumpEvent::Squawk { event: Some(e), .. } => assert_eq!(e, "done"),
+        other => panic!("{other:?}"),
+    }
+    drop(desk);
+    let (ran_a, writes_a) = fake_a.join().unwrap();
+    assert_eq!(ran_a, lines[5..].to_vec(), "the commissioned board ran only the lines from the lost one on");
+    assert!(writes_a.is_empty(), "a reopen never commissions");
+}

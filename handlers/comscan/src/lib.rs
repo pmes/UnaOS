@@ -111,3 +111,21 @@ pub async fn serve(synapse: Synapse, mut rx: Receiver<SMessage>, cap: usize) {
         }
     }
 }
+
+// --- VUGCOMSCANHOSTDESK (LEDGER SR561): the host's pump desk ignited on the bus (named tail hunk) ---
+
+/// Ignite Comscan's pump desk on the bus beside the Console: `pump::host_parts` (THE composition: the identity hook,
+/// the hello on so a first bind commissions an unnamed board, the ws / tcp / serial opener) for `machine`, the
+/// receiver subscribed FIRST, then [`pump::serve_pump`] spawned at [`pump::PUMP_TICK`]. No port is opened until a
+/// `PumpStart`, so with no controller attached the desk idles and says nothing. The desk is returned beside the task:
+/// arming (Helm's `Verdict::Pass`) happens in process only, through it. Call inside a tokio runtime context.
+pub fn host_desk(
+    synapse: Synapse,
+    machine: make_core::Machine,
+) -> (std::sync::Arc<std::sync::Mutex<pump::PumpDesk>>, tokio::task::JoinHandle<()>) {
+    let (desk, open) = pump::host_parts(machine);
+    let desk = std::sync::Arc::new(std::sync::Mutex::new(desk));
+    let rx = synapse.subscribe();
+    let task = tokio::spawn(pump::serve_pump(synapse, rx, desk.clone(), open, pump::PUMP_TICK));
+    (desk, task)
+}
