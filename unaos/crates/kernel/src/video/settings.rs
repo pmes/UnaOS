@@ -1853,7 +1853,7 @@ fn users_key_delete() {
     if let Some(nm) = users_key_name() { users_row_action(&nm, 1); }
 }
 
-/// Typing in the Add form: Tab/Enter move on (Enter on the last field submits), Backspace, Esc cancels.
+/// Typing in the Add form: Enter moves on (Enter on the last field submits), Backspace, Esc cancels.
 fn users_form_key(c: u8) -> bool {
     let mut submit = false;
     {
@@ -1862,8 +1862,8 @@ fn users_form_key(c: u8) -> bool {
         let u = &mut x.u;
         match c {
             0x1B => { u.form = false; }
-            0x09 | una_abi::KEY_DOWN => u.focus = (u.focus + 1) % 3,
-            una_abi::KEY_UP => u.focus = (u.focus + 2) % 3,
+            // F39SETTINGSFORMKEYS (B1139): Tab/Down/Up are key_route's form arm (walk: fields and buttons, u.focus follows via stop_set); this arm was unreachable
+            // F39SETTINGSFORMKEYS (B1139): the field-only Up arm retired with it (key_route's form arm takes KEY_UP first)
             0x0A | 0x0D => { if u.focus < 2 { u.focus += 1; } else { submit = true; } }
             0x08 | 0x7F => { match u.focus { 0 => { u.name.pop(); } 1 => { u.pw.pop(); } _ => { u.pw2.pop(); } } }
             0x20..=0x7e => {
@@ -6092,6 +6092,8 @@ fn keys_table() -> (usize, usize, String) {
 // class): a person in Settings during `tests menuscraft` — a key of theirs between the steps reaches the same arms (a BAD
 // read, never a hang); their pane state is put back whole (sel, strip, column top, stop, pending segment, the search
 // text, the Resolution popup and the Users UI incl. a typed Add form, by `mem::replace`). One `[menuscraft] settings_keys` line.
+// F39SETTINGSFORMKEYS (rmbp-ledger B1139): one more sub-leg, the search field — from the column's first listed tab (General)
+// Up takes the field (`strip_step`) and Down leaves it to the column on that tab (`search_key`'s KEY_DOWN arm), `search=<a>/<b>`.
 
 /// One key through THE router, as the focused window receives it.
 fn keys_send(c: u8) {
@@ -6099,7 +6101,8 @@ fn keys_send(c: u8) {
 }
 
 /// SETTINGS-KEYS-PROBE (B1133) — `true` = the column, the Users form (stop and field) and the pane each read 2 after
-/// Down, Down and 1 after Up, or the window could not be opened or focused (a skip).
+/// Down, Down and 1 after Up, and the search field is taken by Up and left by Down (B1139), or the window could not be
+/// opened or focused (a skip).
 pub fn keys_leg() -> bool {
     let saved_focus = wm::focus_asid();
     let was_open = is_open();
@@ -6139,6 +6142,15 @@ pub fn keys_leg() -> bool {
     let col_a = cur_tab();
     keys_send(una_abi::KEY_UP);
     let col_b = cur_tab();
+    // The search field (F39SETTINGSFORMKEYS B1139; arms: KEY_UP on the column's first row, `search_key`'s KEY_DOWN).
+    let first = col_list("").0[0] as usize;
+    if cur_tab() != first { switch_tab(first); }
+    set(true, 0);
+    keys_send(una_abi::KEY_UP);
+    let search_a = STATE.lock().as_ref().is_some_and(|st| st.search) as usize;
+    keys_send(una_abi::KEY_DOWN);
+    let left = STATE.lock().as_ref().is_some_and(|st| !st.search && st.strip);
+    let search_b = (left && cur_tab() == first) as usize;
     // The Users form (arms: the form's KEY_DOWN / KEY_UP): from the Name field, painted so the walk reads its stops.
     if cur_tab() != 1 { switch_tab(1); }
     if let Some(st) = STATE.lock().as_mut() { st.u = UsersUi::new(); st.u.form = true; }
@@ -6176,11 +6188,11 @@ pub fn keys_leg() -> bool {
     if !was_open { close(); } else { repaint(); }
     wm::focus_changed(saved_focus);
     let two_one = |a: usize, b: usize| a == 2 && b == 1;
-    let ok = two_one(pane_a, pane_b) && two_one(col_a, col_b) && two_one(form_a, form_b) && two_one(focus_a, focus_b);
+    let ok = two_one(pane_a, pane_b) && two_one(col_a, col_b) && two_one(form_a, form_b) && two_one(focus_a, focus_b) && search_a == 1 && search_b == 1;
     let n = |v: usize| if v == usize::MAX { String::from("-") } else { alloc::format!("{}", v) };
     serial_println!(
-        "[menuscraft] settings_keys pane={}/{} column={}/{} form={}/{} focus={}/{} -> {}",
-        n(pane_a), n(pane_b), n(col_a), n(col_b), n(form_a), n(form_b), n(focus_a), n(focus_b), if ok { "ok" } else { "BAD" }
+        "[menuscraft] settings_keys pane={}/{} column={}/{} form={}/{} focus={}/{} search={}/{} -> {}",
+        n(pane_a), n(pane_b), n(col_a), n(col_b), n(form_a), n(form_b), n(focus_a), n(focus_b), search_a, search_b, if ok { "ok" } else { "BAD" }
     );
     ok
 }
