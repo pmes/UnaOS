@@ -1206,7 +1206,7 @@ impl PumpDesk {
             r.motion.push_back(Motion { word, last: k + 1 == lines.len(), failed: false });
         }
         r.jogged = word == "jog"; // VUGCOMSCANJOGFACE (SR579): set on a jog, cleared on a home
-        let first = self.position_moved(word == "jog", matches!(d, Dialect::Grbl { .. })); // VUGCOMSCANJOGPOSITION (SR612): the fallback word once per link; the axis moves, so the position is asked again
+        let first = self.position_moved(word == "jog", matches!(d, Dialect::Grbl { .. } | Dialect::Marlin)); // VUGCOMSCANJOGPOSITION (SR612): the fallback word once per link; the axis moves, so the position is asked again; VUGCOMSCANMARLINPOSITION (SR620): + Marlin (M114)
         first.into_iter().chain(std::iter::once(format!("{word} sent: {}", lines.join(" / ")))).map(|w| self.squawk(Some(w))).collect()
     }
 
@@ -1655,13 +1655,17 @@ fn idle_mpos(r: &StatusReport) -> Option<[f64; 3]> {
 impl PumpDesk {
     /// [`PumpDesk::tick`]'s events and turn: a status report sets the settled position ([`idle_mpos`]: a moving or
     /// alarmed report forgets it), an alarm or reset forgets it, a lost link forgets it all (the fallback word is said
-    /// again on the next link); then on a grbl link that is up with no job live (a live job's pump polls itself) and no
-    /// settled position, `?` through the one writer ([`pump_core::Pump::status`]) at most every
-    /// `pump_core::pump::STATUS_EVERY_US`. A dead link is the next tick's `LinkLost`.
+    /// again on the next link); then on a link that is up with no job live (a live job's pump polls itself) and no
+    /// settled position, the dialect's ask through the one writer ([`pump_core::Pump::status`]: grbl `?`, Marlin `M114`)
+    /// at most every `pump_core::pump::STATUS_EVERY_US`. A dead link is the next tick's `LinkLost`.
+    /// VUGCOMSCANMARLINPOSITION (SR620): Marlin's idle has no word: no job live and every home / jog line answered (the
+    /// last line was `ok`), so Marlin is asked only with `motion` empty, and a Marlin report read while a home / jog line
+    /// is pending predates the move and settles nothing.
     fn position_seen(&mut self, evs: &[Event], now_us: u64) {
+        let settled = self.running.as_ref().is_none_or(|r| r.motion.is_empty() || matches!(r.pump.dialect(), Dialect::Grbl { .. })); // VUGCOMSCANMARLINPOSITION (SR620)
         for e in evs {
             match e {
-                Event::Status(r) => self.pos.at = idle_mpos(r),
+                Event::Status(r) => self.pos.at = idle_mpos(r).filter(|_| settled), // VUGCOMSCANMARLINPOSITION (SR620): + the Marlin idle rule
                 Event::Alarm { .. } | Event::Reset => self.pos.at = None,
                 Event::LinkLost => self.pos = Position::default(),
                 _ => {}
@@ -1671,7 +1675,7 @@ impl PumpDesk {
             return;
         }
         let Some(r) = self.running.as_mut() else { return };
-        if matches!(r.pump.state(), PumpState::Streaming | PumpState::Stopping) || !matches!(r.pump.dialect(), Dialect::Grbl { .. }) {
+        if matches!(r.pump.state(), PumpState::Streaming | PumpState::Stopping) || (!matches!(r.pump.dialect(), Dialect::Grbl { .. }) && !r.motion.is_empty()) { // VUGCOMSCANMARLINPOSITION (SR620): Marlin asks M114 with every home / jog line answered
             return;
         }
         let Some(link) = r.link.as_mut() else { return };
@@ -1679,10 +1683,11 @@ impl PumpDesk {
         let _ = r.pump.status(&mut **link);
     }
 
-    /// A home or jog was sent: the fallback word when it is a grbl jog bounded by its distance (no settled position)
-    /// and not yet said on this link; the axis moves, so the position is forgotten and asked again at the next tick.
-    fn position_moved(&mut self, jog: bool, grbl: bool) -> Option<String> {
-        let word = (jog && grbl && self.pos.at.is_none() && !self.pos.said).then(|| "jog bound=distance: no position report yet".to_string());
+    /// A home or jog was sent: the fallback word when it is a jog on a polled dialect (grbl; VUGCOMSCANMARLINPOSITION
+    /// SR620: and Marlin) bounded by its distance (no settled position) and not yet said on this link; the axis moves, so
+    /// the position is forgotten and asked again at the next tick.
+    fn position_moved(&mut self, jog: bool, polled: bool) -> Option<String> {
+        let word = (jog && polled && self.pos.at.is_none() && !self.pos.said).then(|| "jog bound=distance: no position report yet".to_string());
         self.pos.said |= word.is_some();
         self.pos.at = None;
         self.pos.asked_us = None;

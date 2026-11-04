@@ -949,14 +949,170 @@ fn a_marlin_jog_is_g91_g0_g90_in_order_and_home_is_g28() {
 
     let jog = PumpEvent::PumpJog { principal: who(), dx: 1.0, dy: -2.0, dz: 0.5, feed: 600.0 };
     let out = desk.apply(&jog, &mut *open);
-    assert!(matches!(&out[..], [PumpEvent::Squawk { event: Some(e), .. }] if e == "jog sent: G91 / G0 X1 Y-2 Z0.5 F600 / G90"), "{out:?}");
+    assert_eq!(squawk_words(&out), ["jog bound=distance: no position report yet", "jog sent: G91 / G0 X1 Y-2 Z0.5 F600 / G90"], "{out:?}"); // VUGCOMSCANMARLINPOSITION (SR620): this fake answers M114 with a bare `ok`, no position: the distance bound, said once
     assert_eq!(word_of(drive_until(&mut desk, &mut *open, t0, &mut words, |e| e.starts_with("jog"))), "jog ok");
     let out = desk.apply(&home, &mut *open);
     assert!(matches!(&out[..], [PumpEvent::Squawk { event: Some(e), .. }] if e == "home sent: G28"), "{out:?}");
     assert_eq!(word_of(drive_until(&mut desk, &mut *open, t0, &mut words, |e| e.starts_with("home"))), "home ok");
     drop(desk);
     let got = fake.join().unwrap();
+    assert!(got.iter().any(|l| l == "M114"), "the desk asked Marlin's position outside the job: {got:?}"); // VUGCOMSCANMARLINPOSITION (SR620)
+    let got: Vec<String> = got.into_iter().filter(|l| l != "M114").collect(); // VUGCOMSCANMARLINPOSITION (SR620): the polls aside
     let mut want = lines.clone();
     want.extend(["G91", "G0 X1 Y-2 Z0.5 F600", "G90", "G28"].iter().map(|x| x.to_string()));
     assert_eq!(got, want, "the program, then the jog's three lines in order, then the home");
+}
+
+// --- VUGCOMSCANMARLINPOSITION (SR620): Marlin's M114 polled outside a job bounds the jog's END; with no answer the distance, said once ---
+
+/// [`fake_marlin`] that answers `M114` as Marlin's `report_current_position` does (`X:.. Y:.. Z:.. E:0.00 Count X:..`, then
+/// `ok`) from the position its own jogs moved it to: a `G0` between `G91` and `G90` adds its X / Y / Z words, `G28` zeroes
+/// it. The program's absolute moves are not tracked (the fake stands at 0 through the job).
+fn fake_marlin_m114(l: TcpListener) -> JoinHandle<Vec<String>> {
+    thread::spawn(move || {
+        let (mut s, _) = l.accept().unwrap();
+        drop(l);
+        s.write_all(b"start\r\n").unwrap();
+        let (mut got, mut cur) = (Vec::new(), Vec::<u8>::new());
+        let (mut at, mut rel) = ([0.0f64; 3], false);
+        let mut buf = [0u8; 256];
+        loop {
+            let k = match s.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(k) => k,
+            };
+            for &b in &buf[..k] {
+                if b != b'\n' {
+                    cur.push(b);
+                    continue;
+                }
+                let line = String::from_utf8_lossy(&cur).trim().to_string();
+                cur.clear();
+                match line.as_str() {
+                    "M114" => {
+                        let steps = |v: f64| (v * 80.0).round() as i64;
+                        let said = format!(
+                            "X:{:.2} Y:{:.2} Z:{:.2} E:0.00 Count X:{} Y:{} Z:{}\r\n",
+                            at[0], at[1], at[2], steps(at[0]), steps(at[1]), steps(at[2])
+                        );
+                        let _ = s.write_all(said.as_bytes());
+                    }
+                    "G91" => rel = true,
+                    "G90" => rel = false,
+                    "G28" => at = [0.0; 3],
+                    l if rel && l.starts_with("G0 ") => {
+                        for w in l.split_whitespace().skip(1) {
+                            let slot = match w.chars().next() {
+                                Some('X') => 0,
+                                Some('Y') => 1,
+                                Some('Z') => 2,
+                                _ => continue,
+                            };
+                            if let Ok(v) = w[1..].parse::<f64>() {
+                                at[slot] += v;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                got.push(line);
+                let _ = s.write_all(b"ok\r\n");
+            }
+        }
+        got
+    })
+}
+
+/// Tick the desk until it holds the settled position `want` (`PumpDesk::position`).
+fn settle_at(desk: &mut PumpDesk, t0: Instant, want: [f64; 3]) {
+    let end = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < end {
+        desk.tick(t0.elapsed().as_micros() as u64);
+        if desk.position() == Some(want) {
+            return;
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+    panic!("no settled position {want:?} in 10 s; the desk holds {:?}", desk.position());
+}
+
+/// A desk for `m` started on a Marlin at `port` over TCP for [`program`], driven to `done`.
+fn marlin_done(m: Machine, port: u16) -> (PumpDesk, Box<Opener>, Instant, Vec<String>) {
+    let p = program();
+    let mut desk = PumpDesk::new(m.clone());
+    let mut open = by_scheme(no_serial(), opener(Duration::from_millis(500)));
+    let pass = Verdict::Pass { digest: p.digest(), machine: m.digest() };
+    let digest = desk.arm(&pass, &p, Dialect::Marlin).expect("armed by a pass");
+    let start = PumpEvent::PumpStart {
+        principal: Origin::LocalUser("una".to_string()),
+        program: digest_hex(digest),
+        dialect: "marlin".to_string(),
+        port: format!("{TCP_SCHEME}127.0.0.1:{port}"),
+    };
+    assert_eq!(squawk_words(&desk.apply(&start, &mut *open)), ["started"]);
+    let t0 = Instant::now();
+    let mut words = Vec::new();
+    assert_eq!(word_of(drive_until(&mut desk, &mut *open, t0, &mut words, |e| e == "done" || e.starts_with("link lost"))), "done");
+    (desk, open, t0, words)
+}
+
+#[test]
+fn a_marlin_jog_is_bounded_by_its_end_from_m114() {
+    assert_eq!(pump_core::pump::marlin_position("X:150.00 Y:0.00 Z:2.50 E:0.00 Count X:12000 Y:0 Z:200"), Some([150.0, 0.0, 2.5]));
+    assert_eq!(pump_core::pump::marlin_position("X:1.00 Y:2.00 E:0.00 Count X:80 Y:160 Z:0"), None, "the first triple only");
+    assert_eq!(pump_core::pump::marlin_position("echo:  Min:  X0.00 Y0.00 Z0.00"), None);
+
+    let mut m = machine();
+    m.axes[0] = axis(AxisId::X, 0.0, 200.0); // the declared X travel 200
+    let (l, port) = listener();
+    let fake = fake_marlin_m114(l);
+    let (mut desk, mut open, t0, mut words) = marlin_done(m, port);
+    settle_at(&mut desk, t0, [0.0, 0.0, 0.0]);
+
+    // The position is known: no fallback word, and the jog's END is bounded from where M114 says the machine stands.
+    let who = || Origin::LocalUser("una".to_string());
+    let jog = |dx: f64| PumpEvent::PumpJog { principal: who(), dx, dy: 0.0, dz: 0.0, feed: 300.0 };
+    assert_eq!(squawk_words(&desk.apply(&jog(150.0), &mut *open)), ["jog sent: G91 / G0 X150 Y0 Z0 F300 / G90"]);
+    assert_eq!(word_of(drive_until(&mut desk, &mut *open, t0, &mut words, |e| e.starts_with("jog"))), "jog ok");
+    settle_at(&mut desk, t0, [150.0, 0.0, 0.0]);
+    assert_eq!(refused_why(&desk.apply(&jog(150.0), &mut *open)), "jog: X150 from 150 ends past the declared X travel 200");
+    assert_eq!(squawk_words(&desk.apply(&jog(40.0), &mut *open)), ["jog sent: G91 / G0 X40 Y0 Z0 F300 / G90"]);
+    assert_eq!(word_of(drive_until(&mut desk, &mut *open, t0, &mut words, |e| e.starts_with("jog"))), "jog ok");
+    assert!(!words.iter().any(|w| w.starts_with("jog bound")), "{words:?}");
+    drop(desk);
+    let got = fake.join().unwrap();
+    assert!(got.iter().any(|l| l == "M114"), "{got:?}");
+    let got: Vec<String> = got.into_iter().filter(|l| l != "M114").collect();
+    let jogs = ["G91", "G0 X150 Y0 Z0 F300", "G90", "G91", "G0 X40 Y0 Z0 F300", "G90"];
+    assert_eq!(got[got.len() - jogs.len()..].to_vec(), jogs.map(String::from).to_vec(), "the refused X150 never reached the wire: {got:?}");
+}
+
+#[test]
+fn a_marlin_with_no_position_answer_keeps_the_distance_bound_and_says_it_once() {
+    let (l, port) = listener();
+    let fake = fake_marlin(l); // `ok` to every line: M114 is answered with no position
+    let (mut desk, mut open, t0, mut words) = marlin_done(machine(), port);
+    assert_eq!(desk.position(), None, "the controller never reported: no position");
+
+    // No position: the declared X travel 350 bounds the delta, and the fallback word is said once on the link.
+    let who = || Origin::LocalUser("una".to_string());
+    let jog = |dx: f64| PumpEvent::PumpJog { principal: who(), dx, dy: 0.0, dz: 0.0, feed: 300.0 };
+    assert_eq!(
+        refused_why(&desk.apply(&jog(400.0), &mut *open)),
+        "jog: X400 is past the declared X travel 350 (no position report yet: the jog's delta is bounded)"
+    );
+    assert_eq!(
+        squawk_words(&desk.apply(&jog(300.0), &mut *open)),
+        ["jog bound=distance: no position report yet", "jog sent: G91 / G0 X300 Y0 Z0 F300 / G90"]
+    );
+    assert_eq!(word_of(drive_until(&mut desk, &mut *open, t0, &mut words, |e| e.starts_with("jog"))), "jog ok");
+    assert_eq!(squawk_words(&desk.apply(&jog(300.0), &mut *open)), ["jog sent: G91 / G0 X300 Y0 Z0 F300 / G90"], "the word is said once");
+    assert_eq!(word_of(drive_until(&mut desk, &mut *open, t0, &mut words, |e| e.starts_with("jog"))), "jog ok");
+    assert_eq!(desk.position(), None);
+    drop(desk);
+    let got = fake.join().unwrap();
+    assert!(got.iter().any(|l| l == "M114"), "the desk asked and was answered with no position: {got:?}");
+    let got: Vec<String> = got.into_iter().filter(|l| l != "M114").collect();
+    let jogs = ["G91", "G0 X300 Y0 Z0 F300", "G90", "G91", "G0 X300 Y0 Z0 F300", "G90"];
+    assert_eq!(got[got.len() - jogs.len()..].to_vec(), jogs.map(String::from).to_vec(), "{got:?}");
 }
