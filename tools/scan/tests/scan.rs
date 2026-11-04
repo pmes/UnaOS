@@ -685,7 +685,7 @@ extrude post sketch=s2 outer=c1 dir=[0 0 1] length=150
     let want = scan_core::gdt::report_text(
         "part.vugdoc",
         0,
-        &scan_core::gdt::scan_tag(&sm),
+        "orbit.ply", // VUGFACEGDTREPORTOPEN (SR581): the `-o` mesh's file name, as the face's header names the file it opened
         &[
             scan_core::gdt::frame_line([names[top].as_str(), names[b].as_str(), names[c].as_str()], fr.residual_mm),
             scan_core::gdt::callout_line(&names[top], "flatness", 0.001, g[top].verdict(scan_core::Kind::Flatness, 0.001)),

@@ -1011,7 +1011,7 @@ fn vugreport_write(a: &Args, names: &[String], g: &[scan_core::FaceGdt], calls: 
         lines.push(scan_core::gdt::callout_line(name, token, tol, v));
     }
     let part = a.against.as_deref().and_then(|p| Path::new(p).file_name()).and_then(|s| s.to_str()).unwrap_or("design");
-    let text = scan_core::gdt::report_text(part, 0, &scan_core::gdt::scan_tag(sm), &lines);
+    let text = scan_core::gdt::report_text(part, 0, &a.out.as_deref().and_then(|p| Path::new(p).file_name()).and_then(|s| s.to_str()).map_or_else(|| scan_core::gdt::scan_tag(sm), String::from), &lines); // VUGFACEGDTREPORTOPEN (SR581): the `-o` mesh's file name, the file the face opens (its `scan=`), so the two reports agree byte for byte
     std::fs::write(out, text).map_err(|e| Refusal::Io { path: out.clone(), error: e.to_string() })
 }
 

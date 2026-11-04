@@ -875,7 +875,7 @@ impl Viewer {
     /// One command on the map: `report` writes the report ([`Viewer::report_command`]); any other line is
     /// [`command`]'s. True when the map changed; refused by name, as each road refuses.
     pub fn map_command(&mut self, line: &str) -> Result<bool, String> {
-        if line.trim() == "report" {
+        if line.trim() == "report open" { return self.report_open().map(|_| true); } if line.trim() == "report" { // VUGFACEGDTREPORTOPEN (SR581): `report open` shows the written report as a sheet
             return self.report_command().map(|_| true);
         }
         command(&mut self.view, &self.model, line)
@@ -898,5 +898,147 @@ impl Viewer {
             m.scan_name = scan_name.map(String::from);
             m.design_path = design.map(std::path::PathBuf::from);
         }
+    }
+}
+
+// ---- VUGFACEGDTREPORTOPEN (LEDGER SR581): the report opened as a sheet, the `:` command line ----
+// VUGFACEGDTREPORTKEY (SR575) left the `.vugreport` unread in the face and `map_command` reachable only from the flags.
+// `report open` ([`Viewer::report_open`], on [`Viewer::map_command`]'s road) reads the file `report` writes
+// ([`report_target`]) into a [`Sheet`] on the View, painted by journal.rs's ONE panel painter (`paint_panel`), read-only.
+// `:` opens the [`Entry`] when a map is up and nothing else holds the keys; its keys are lib.rs `Viewer::key`'s first
+// ([`Viewer::line_key`], ahead of the Save As field: a typed `s` is the entry's, never the save); its typing is sketch.rs
+// `type_text` and its paint journal.rs `field_line` (the Save As field's). Enter runs the line through
+// [`Viewer::map_command`]. BP-vug-5: a printed verdict, nothing changes.
+
+/// An opened `.vugreport`: its lines as read and the first row shown. Read-only: Escape closes, Up / Down scroll.
+#[derive(Clone, Debug, Default)]
+pub struct Sheet {
+    pub lines: Vec<String>,
+    pub top: usize,
+}
+
+/// The `:` command line: open or not, the typed text, the last line run (Up recalls it) and the last refusal (shown
+/// above the line until the next edit).
+#[derive(Clone, Debug, Default)]
+pub struct Entry {
+    pub open: bool,
+    pub text: String,
+    pub last: Option<String>,
+    pub refused: Option<String>,
+}
+
+impl Viewer {
+    /// Read the map's report (the file [`Viewer::report`] writes: [`report_target`]) into the sheet, shown in the panel
+    /// until Escape. Refused by name, nothing shown: no map, a refused map, [`REPORT_NO_PATH`], the read's error. The
+    /// path read on success.
+    pub fn report_open(&mut self) -> Result<std::path::PathBuf, String> {
+        forget(&mut self.view);
+        let m = self.view.deviation.as_ref().ok_or("report open: no map")?;
+        if let Err(e) = &m.result {
+            return Err(format!("report open: refused map {e:?}"));
+        }
+        let Some((path, _, _)) = report_target(self, m) else { return Err(REPORT_NO_PATH.to_string()) };
+        let text = std::fs::read_to_string(&path).map_err(|e| format!("report open: {}: {e}", path.display()))?;
+        self.view.sheet = Some(Sheet { lines: text.lines().map(String::from).collect(), top: 0 });
+        Ok(path)
+    }
+
+    /// The command line's and the sheet's keys, before every other (lib.rs `Viewer::key`); None while the Save As field
+    /// is open and for every key neither takes. The open entry takes EVERY key: a character is typed, Backspace pops, Up
+    /// recalls the last line run, Escape closes, Enter runs the line through [`Viewer::map_command`] (run: the line is
+    /// the last, the entry closes; refused: it stays open naming the refusal). `:` opens it while a map is up and no
+    /// sketch face, edit, pull, gesture or edge tool holds the keys. The shown sheet takes Escape (closes) and Up / Down.
+    pub fn line_key(&mut self, k: &str) -> Option<bool> {
+        if self.view.design.journal.save_as.is_some() {
+            return None;
+        }
+        let esc = matches!(k, "Escape" | "\u{1b}");
+        let (up, down) = (matches!(k, "Up" | "\u{f700}"), matches!(k, "Down" | "\u{f701}"));
+        if self.view.entry.open {
+            if esc {
+                let e = &mut self.view.entry;
+                e.open = false;
+                e.text.clear();
+                e.refused = None;
+                return Some(true);
+            }
+            if matches!(k, "Return" | "KP_Enter" | "\r" | "\n") {
+                let line = self.view.entry.text.clone();
+                match self.map_command(&line) {
+                    Ok(_) => {
+                        let e = &mut self.view.entry;
+                        e.last = Some(line);
+                        e.text.clear();
+                        e.open = false;
+                        e.refused = None;
+                    }
+                    Err(r) => self.view.entry.refused = Some(r),
+                }
+                return Some(true);
+            }
+            let e = &mut self.view.entry;
+            if up {
+                let Some(l) = e.last.clone() else { return Some(false) };
+                e.text = l;
+                e.refused = None;
+                return Some(true);
+            }
+            let back = matches!(k, "BackSpace" | "Backspace" | "\u{8}" | "\u{7f}");
+            let ch = {
+                let mut it = k.chars();
+                match (it.next(), it.next()) {
+                    (Some(c), None) => Some(c),
+                    _ => None,
+                }
+            };
+            let typed = crate::sketch::type_text(&mut e.text, ch, back);
+            if typed {
+                e.refused = None;
+            }
+            return Some(typed);
+        }
+        let free = self.view.deviation.is_some() && self.view.design.face.is_none() && !crate::journal::busy(&self.view.design) && self.view.fillet.is_none();
+        if k == ":" && free {
+            let e = &mut self.view.entry;
+            e.open = true;
+            e.text.clear();
+            e.refused = None;
+            return Some(true);
+        }
+        let fit = crate::journal::panel_fit(self.view.size.1);
+        let s = self.view.sheet.as_mut()?;
+        if esc {
+            self.view.sheet = None;
+            return Some(true);
+        }
+        if !(up || down) {
+            return None;
+        }
+        let was = s.top;
+        s.top = if up { was.saturating_sub(1) } else { (was + 1).min(s.lines.len().saturating_sub(fit)) };
+        Some(was != s.top)
+    }
+}
+
+/// The sheet in the panel (journal.rs `paint_panel`: its lines upper-cased in the primary text colour from its top row)
+/// and the open command line bottom left (journal.rs `field_line`, label `:`), its refusal one row above in the critical
+/// status colour.
+pub fn line_overlay(view: &View, fr: &mut Frame) {
+    if let Some(s) = &view.sheet {
+        let ink = rgba(palette_core::TEXT_PRIMARY.1);
+        crate::journal::paint_panel(fr, &s.lines, s.top, &|_, l| (l.to_uppercase(), ink, false));
+    }
+    let e = &view.entry;
+    if !e.open {
+        return;
+    }
+    let panel = view.design.journal.panel;
+    crate::journal::field_line(fr, ":", &e.text, panel);
+    if let Some(r) = &e.refused {
+        let (w, h) = (fr.width as f32, fr.height as f32);
+        let cols = ((w - 12.0) / 8.0).floor().max(1.0) as usize;
+        let text: String = r.to_uppercase().chars().take(cols).collect();
+        let y = h - 3.0 * crate::journal::ROW_PX - if panel { crate::journal::ROW_PX } else { 0.0 };
+        raster::text(fr, &text, 6.0, y, rgba(palette_core::STATUS_CRITICAL));
     }
 }

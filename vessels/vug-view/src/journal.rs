@@ -530,29 +530,27 @@ pub fn overlay(view: &View, fr: &mut Raster) {
     if !j.panel {
         return;
     }
-    let (w, h) = (fr.width as f32, fr.height as f32);
+    let h = fr.height as f32;
     let x0 = panel_x0(fr.width); // VUGFACEJOURNALFAULTFIX (SR578): the one panel edge (deviation.rs corner_origin reads it)
-    raster::tint(fr, &[vec![(x0, 0.0), (w, 0.0), (w, h), (x0, h)]], rgba(raster::BACKGROUND), 0.9);
-    raster::line(fr, (x0, 0.0), (x0, h), rgba(INK));
+    // VUGFACEGDTREPORTOPEN (SR581): the backdrop and the rows through THE panel painter (the report sheet's too); the
+    // journal's style: a faulted row in the refusal colour (SR572), the cursor's band, an edit as `<verb> <id> = <typed>`.
     let rows = j.rows();
-    let fit = ((h - 2.0 * ROW_PX) / ROW_PX).floor().max(1.0) as usize;
+    let fit = panel_fit(fr.height);
     let first = j.cursor.saturating_sub(fit / 2).min(rows.len().saturating_sub(fit));
-    let cols = ((w - x0 - 8.0) / 8.0).floor().max(1.0) as usize;
+    let cols = panel_cols(fr.width);
     let clip = |s: &str| s.chars().take(cols).collect::<String>();
-    for (k, i) in (first..rows.len().min(first + fit)).enumerate() {
-        let y = 4.0 + k as f32 * ROW_PX;
-        let mut col = if j.faulted(i) { rgba(REFUSED) } else { rgba(INK) }; // VUGFACEJOURNALSOLIDFAULT (SR572): a faulted row in the refusal colour
-        let mut text = rows[i].clone();
+    paint_panel(fr, &rows, first, &|i, row| {
+        let mut col = if j.faulted(i) { rgba(REFUSED) } else { rgba(INK) };
+        let mut text = row.to_string();
         if i == j.cursor {
-            raster::tint(fr, &[vec![(x0, y - 2.0), (w, y - 2.0), (w, y + ROW_PX - 2.0), (x0, y + ROW_PX - 2.0)]], rgba(ACTIVE), 0.25);
             if let Some(buf) = &j.edit {
                 let head = text.split_whitespace().take(2).collect::<Vec<_>>().join(" ");
                 text = format!("{head} = {buf}");
                 col = rgba(ACTIVE);
             }
         }
-        raster::text(fr, &clip(&text), x0 + 4.0, y, col);
-    }
+        (text, col, i == j.cursor)
+    });
     fix_overlay(j, fr, x0, h, &clip); // VUGFACEJOURNALFAULTFIX (SR578): the offered fix above the note
     if let Some(n) = &j.note {
         let col = if n.starts_with("line ") { rgba(REFUSED) } else { rgba(INK) };
@@ -770,11 +768,7 @@ pub struct SaveAs {
 fn save_as_overlay(view: &View, fr: &mut Raster) {
     let j = &view.design.journal;
     let Some(f) = &j.save_as else { return };
-    let (w, h) = (fr.width as f32, fr.height as f32);
-    let cols = ((w - 12.0) / 8.0).floor().max(1.0) as usize;
-    let text: String = format!("SAVE AS: {}_", f.text.to_uppercase()).chars().take(cols).collect();
-    let y = h - 2.0 * ROW_PX - if j.panel { ROW_PX } else { 0.0 };
-    raster::text(fr, &text, 6.0, y, rgba(ACTIVE));
+    field_line(fr, "SAVE AS:", &f.text, j.panel); // VUGFACEGDTREPORTOPEN (SR581): THE field painter, the command line's too
 }
 
 // ---- VUGFACEJOURNALSOLIDFAULT (LEDGER SR572): a document whose failures no solid reads opens; a fault line is picked ----
@@ -926,4 +920,48 @@ fn fix_overlay(j: &Journal, fr: &mut Raster, x0: f32, h: f32, clip: &dyn Fn(&str
     let Some(f) = j.offered() else { return };
     let y = if j.note.is_some() { h - 2.0 * ROW_PX } else { h - ROW_PX };
     raster::text(fr, &clip(&format!("FIX: {} (ENTER)", f.text.to_uppercase())), x0 + 4.0, y, rgba(ACTIVE));
+}
+
+// ---- VUGFACEGDTREPORTOPEN (LEDGER SR581): THE panel painter and THE field painter ----
+// The tree panel's paint was held inside [`overlay`]; [`paint_panel`] is it, handed rows: the journal paints its
+// statements through it with its own style, deviation.rs `line_overlay` paints an opened `.vugreport` (the sheet).
+// [`field_line`] is the Save As field's paint, handed a label: the face's `:` command line paints through it too.
+
+/// The rows that fit in the panel on a frame `height` tall, above its two foot rows (the fix and the note).
+pub(crate) fn panel_fit(height: u32) -> usize {
+    ((height as f32 - 2.0 * ROW_PX) / ROW_PX).floor().max(1.0) as usize
+}
+
+/// The characters a panel row holds on a frame `width` wide.
+pub(crate) fn panel_cols(width: u32) -> usize {
+    ((width as f32 - panel_x0(width) - 8.0) / 8.0).floor().max(1.0) as usize
+}
+
+/// THE panel painter: the right quarter's backdrop and its rule at [`panel_x0`], then `rows[first..]` one per
+/// [`ROW_PX`] from the top, as many as [`panel_fit`] holds, each through `style(i, row)` -> (text, colour, banded: the
+/// cursor's tint behind it), clipped to [`panel_cols`].
+pub(crate) fn paint_panel(fr: &mut Raster, rows: &[String], first: usize, style: &dyn Fn(usize, &str) -> (String, [u8; 4], bool)) {
+    let (w, h) = (fr.width as f32, fr.height as f32);
+    let x0 = panel_x0(fr.width);
+    raster::tint(fr, &[vec![(x0, 0.0), (w, 0.0), (w, h), (x0, h)]], rgba(raster::BACKGROUND), 0.9);
+    raster::line(fr, (x0, 0.0), (x0, h), rgba(INK));
+    let cols = panel_cols(fr.width);
+    for (k, i) in (first..rows.len().min(first + panel_fit(fr.height))).enumerate() {
+        let y = 4.0 + k as f32 * ROW_PX;
+        let (text, col, band) = style(i, &rows[i]);
+        if band {
+            raster::tint(fr, &[vec![(x0, y - 2.0), (w, y - 2.0), (w, y + ROW_PX - 2.0), (x0, y + ROW_PX - 2.0)]], rgba(ACTIVE), 0.25);
+        }
+        raster::text(fr, &text.chars().take(cols).collect::<String>(), x0 + 4.0, y, col);
+    }
+}
+
+/// THE field painter: `<LABEL> <TEXT>_` bottom left, one row above the corner line (one more while the panel's note
+/// row is shown), upper-cased (the font's case), clipped to the frame's width, in the active colour.
+pub(crate) fn field_line(fr: &mut Raster, label: &str, text: &str, panel: bool) {
+    let (w, h) = (fr.width as f32, fr.height as f32);
+    let cols = ((w - 12.0) / 8.0).floor().max(1.0) as usize;
+    let line: String = format!("{label} {}_", text.to_uppercase()).chars().take(cols).collect();
+    let y = h - 2.0 * ROW_PX - if panel { ROW_PX } else { 0.0 };
+    raster::text(fr, &line, 6.0, y, rgba(ACTIVE));
 }

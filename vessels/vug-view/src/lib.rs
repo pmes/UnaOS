@@ -152,7 +152,7 @@ impl Viewer {
     /// A shortcut key; true when the frame changed. VUGFACESAVE (SR534): Cmd+S (`Meta+s` on the bus) saves, and a
     /// plain `s` when no edit, pull or gesture holds the keys; the title follows the document.
     pub fn key(&mut self, k: &str) -> bool {
-        if let Some(r) = self.save_as_key(k) { self.retitle(); return r; } // VUGFACESAVEAS (SR539): the open Save As field takes every key first
+        if let Some(r) = self.line_key(k) { self.retitle(); return r; } if let Some(r) = self.save_as_key(k) { self.retitle(); return r; } // VUGFACEGDTREPORTOPEN (SR581): the `:` line and the report sheet first (none while Save As is open); VUGFACESAVEAS (SR539): the open Save As field takes every key first
         let save = k == "Meta+s" || (k == "s" && !journal::busy(&self.view.design) && self.view.fillet.is_none());
         let r = if save {
             let _ = self.save();

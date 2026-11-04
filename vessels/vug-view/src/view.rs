@@ -176,13 +176,17 @@ pub struct View {
     pub photo: Option<crate::photo::Photo>,
     /// VUGFACEDEVIATION (SR525): the opened scan measured against its design — the band's colours and the corner (deviation.rs).
     pub deviation: Option<crate::deviation::Map>,
+    /// VUGFACEGDTREPORTOPEN (SR581): an opened `.vugreport` shown read-only in the panel (`report open`; Escape closes).
+    pub sheet: Option<crate::deviation::Sheet>,
+    /// VUGFACEGDTREPORTOPEN (SR581): the `:` command line (deviation.rs `Viewer::line_key`), its last line recalled.
+    pub entry: crate::deviation::Entry,
 }
 
 impl View {
     /// A view at Home over `model`.
     pub fn new(model: &Model, size: (u32, u32), preset: Preset) -> View {
         let camera = Camera { eye: Vec3::zero(), yaw: 0.0, pitch: 0.0, fov_y: 30f32.to_radians() };
-        let mut v = View { camera, preset, size: (size.0.max(1), size.1.max(1)), picked: None, cursor: (0.0, 0.0), drag: None, design: Default::default(), photo: None, fillet: None, deviation: None }; // VUGFACEFILLET (SR511): fillet; VUGFACEDEVIATION (SR525): deviation
+        let mut v = View { camera, preset, size: (size.0.max(1), size.1.max(1)), picked: None, cursor: (0.0, 0.0), drag: None, design: Default::default(), photo: None, fillet: None, deviation: None, sheet: None, entry: Default::default() }; // VUGFACEGDTREPORTOPEN (SR581): sheet, entry; VUGFACEFILLET (SR511): fillet; VUGFACEDEVIATION (SR525): deviation
         v.home(model);
         v
     }
@@ -256,7 +260,7 @@ impl View {
         // VUGFACEPHOTO (SR506): the proposal glyphs and the corner note over the sketch.
         crate::photo::overlay(self, fr); crate::deviation::overlay(self, fr); // VUGFACEDEVIATION (SR525): the map's corner, top-right
         // VUGFACETREE (SR513): the tree panel over everything.
-        crate::journal::overlay(self, fr);
+        crate::journal::overlay(self, fr); crate::deviation::line_overlay(self, fr); // VUGFACEGDTREPORTOPEN (SR581): the report sheet and the `:` line over the panel
     }
 
     /// The model point under (px, py), if the ray hits it.
