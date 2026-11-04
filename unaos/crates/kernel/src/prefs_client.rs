@@ -145,10 +145,10 @@ pub fn inbox_has_room() -> bool {
 fn take_reply(corr: u32) -> Option<Box<[u8]>> {
     locked(|| {
         let mut q = REPLIES.lock();
-        while let Some(f) = q.pop_front() {
+        while let Some(mut f) = q.pop_front() {
             if matches!(crate::bus::frame_parse(&f), Ok(h) if h.kind == BUS_KIND_REPLY && h.corr == corr) {
                 return Some(f);
-            } #[cfg(feature = "busreg")] queued_mark(&f); // RELAY-QUEUED-SET (B1175): a stale answer to a QUEUED set notes its status on the ring entry before it drops (file tail). LINE-NEUTRAL fold.
+            } #[cfg(feature = "busreg")] queued_mark(&f); stale_wipe(&mut f); // RELAY-QUEUED-SET (B1175): a stale answer to a QUEUED set notes its status on the ring entry before it drops (file tail). LINE-NEUTRAL fold. RELAY-TAG-LATE-WIPE (rmbp-ledger B1205): every stale frame wiped and counted before it drops (file tail).
         }
         None
     })
@@ -603,8 +603,8 @@ pub fn relay_tag(tag: u8, prin: [u8; 32], body: &[u8], wait_ms: u64) -> Result<(
         }
         _ => crate::bus_route::Route::Reply(EINVAL),
     };
-    for b in f.iter_mut() {
-        unsafe { core::ptr::write_volatile(b, 0) };
+    { // RELAY-TAG-LATE-WIPE (rmbp-ledger B1205): the request frame through the client's ONE wipe, `frame_wipe` (file tail). Named in-place hunk
+        frame_wipe(&mut f);
     }
     match routed {
         crate::bus_route::Route::Relayed => {}
@@ -619,8 +619,8 @@ pub fn relay_tag(tag: u8, prin: [u8; 32], body: &[u8], wait_ms: u64) -> Result<(
                 Ok(h) if h.principal[0] == PRIN_KERNEL_REPLY => Ok((h.status, fr[BUS_HDR_LEN..].to_vec())),
                 _ => Err(EIO), // only a KERNEL-stamped reply is an answer
             };
-            for b in fr.iter_mut() {
-                unsafe { core::ptr::write_volatile(b, 0) };
+            { // RELAY-TAG-LATE-WIPE (rmbp-ledger B1205): the taken answer through the client's ONE wipe, `frame_wipe` (file tail). Named in-place hunk
+                frame_wipe(&mut fr);
             }
             return out;
         }
@@ -1267,7 +1267,7 @@ pub fn queued_selftest() {
         let _ = queued_take(c);
     }
     let (q4, q5) = lostreset_selftest(&next, &body_of, &read, want); // QUEUED-SET-LOSTRESET (B1181): Q4 / Q5, the full-inbox legs (file tail)
-    let (q6, q7) = stucklive_selftest(&next, &body_of, &read, want); let q8 = pendpin_selftest(&next, &body_of, &read, want); /* QUEUED-SET-PENDPIN (B1193): Q8 the silent holder's Pend reclaimed (file tail) */ let q9 = deliverrace_selftest(&next, &body_of, &read, want); /* QUEUED-SET-DELIVER-RACE (rmbp-ledger B1194): Q9, the inbox filled between the room check and the deliver (file tail). Named in-place hunk */ let q10 = eager_selftest(&next, &body_of, want); let q12 = timeoutpend_selftest(&next); /* RELAY-TIMEOUT-PENDPIN (rmbp-ledger B1197): Q12, a timed-out GET / LIST's Pend reclaimed (file tail). Named in-place hunk */ let q11 = keeprace_selftest(&next, &body_of, want); /* QUEUED-SET-EAGER-KEEPRACE (rmbp-ledger B1199): Q11, the mark landed before the keep (file tail). Named in-place hunk */ let q13 = flush_selftest(&read, want); /* PREFS-FLUSH-ONTO-APPLIER (rmbp-ledger B1200): Q13, a render-task deferral flushed by `prefs-apply` (file tail). Named in-place hunk */ let q14 = tagtimeout_selftest(&next); /* RELAY-TAG-TIMEOUT-PENDPIN (rmbp-ledger B1202): Q14, a timed-out Holocron relay's Pend reclaimed (file tail). Named in-place hunk */ // QUEUED-SET-STUCKLIVE (B1187): Q6 silent live holder, Q7 refused answer delivered (file tail)
+    let (q6, q7) = stucklive_selftest(&next, &body_of, &read, want); let q8 = pendpin_selftest(&next, &body_of, &read, want); /* QUEUED-SET-PENDPIN (B1193): Q8 the silent holder's Pend reclaimed (file tail) */ let q9 = deliverrace_selftest(&next, &body_of, &read, want); /* QUEUED-SET-DELIVER-RACE (rmbp-ledger B1194): Q9, the inbox filled between the room check and the deliver (file tail). Named in-place hunk */ let q10 = eager_selftest(&next, &body_of, want); let q12 = timeoutpend_selftest(&next); /* RELAY-TIMEOUT-PENDPIN (rmbp-ledger B1197): Q12, a timed-out GET / LIST's Pend reclaimed (file tail). Named in-place hunk */ let q11 = keeprace_selftest(&next, &body_of, want); /* QUEUED-SET-EAGER-KEEPRACE (rmbp-ledger B1199): Q11, the mark landed before the keep (file tail). Named in-place hunk */ let q13 = flush_selftest(&read, want); /* PREFS-FLUSH-ONTO-APPLIER (rmbp-ledger B1200): Q13, a render-task deferral flushed by `prefs-apply` (file tail). Named in-place hunk */ let q14 = tagtimeout_selftest(&next); /* RELAY-TAG-TIMEOUT-PENDPIN (rmbp-ledger B1202): Q14, a timed-out Holocron relay's Pend reclaimed (file tail). Named in-place hunk */ let (q15, stalewipe) = latewipe_selftest(&next); /* RELAY-TAG-LATE-WIPE (rmbp-ledger B1205): Q15, a planted stale Holocron frame wiped and counted (file tail). Named in-place hunk */ // QUEUED-SET-STUCKLIVE (B1187): Q6 silent live holder, Q7 refused answer delivered (file tail)
     // Restore the operator's value through the same kernel fulfiller (or leave the key unset as it was).
     match orig {
         Some(v) => {
@@ -1280,10 +1280,10 @@ pub fn queued_selftest() {
             let _ = crate::prefs::unset(crate::prefs::NS, key::IDLE_MIN);
         }
     }
-    if q1 && q2 && q3 && q4 && q5 && q6 && q7 && q8 && q9 && q10 && q11 && q12 && q13 && q14 { // RELAY-TIMEOUT-PENDPIN (rmbp-ledger B1197): Q12. RELAY-TAG-TIMEOUT-PENDPIN (rmbp-ledger B1202): Q14. Named in-place hunk
-        serial_println!(":: RELAY-QUEUED-SET: unread=applied read=released full=eagain lostreset=released/applied stucklive=released refusedreply=redelivered pendpin=reclaimed timeoutpend=reclaimed tagtimeout=reclaimed deliverrace=closed eager=applied keeprace=closed flush=applier -> PASS ::");
+    if q1 && q2 && q3 && q4 && q5 && q6 && q7 && q8 && q9 && q10 && q11 && q12 && q13 && q14 && q15 { // RELAY-TIMEOUT-PENDPIN (rmbp-ledger B1197): Q12. RELAY-TAG-TIMEOUT-PENDPIN (rmbp-ledger B1202): Q14. RELAY-TAG-LATE-WIPE (rmbp-ledger B1205): Q15. Named in-place hunk
+        serial_println!(":: RELAY-QUEUED-SET: unread=applied read=released full=eagain lostreset=released/applied stucklive=released refusedreply=redelivered pendpin=reclaimed timeoutpend=reclaimed tagtimeout=reclaimed stalewipe={} deliverrace=closed eager=applied keeprace=closed flush=applier -> PASS ::", stalewipe);
     } else {
-        serial_println!(":: RELAY-QUEUED-SET: q1={} q2={} q3={} q4={} q5={} q6={} q7={} q8={} q9={} q10={} q11={} q12={} q13={} q14={} (want={} read1={} read2={} kept={}/{} pushed={}/{}) -> FAIL ::", q1 as u8, q2 as u8, q3 as u8, q4 as u8, q5 as u8, q6 as u8, q7 as u8, q8 as u8, q9 as u8, q10 as u8, q11 as u8, q12 as u8, q13 as u8, q14 as u8, want, read1.unwrap_or(-1), read2.unwrap_or(-1), kept1 as u8, kept2 as u8, pushed1 as u8, pushed2 as u8);
+        serial_println!(":: RELAY-QUEUED-SET: q1={} q2={} q3={} q4={} q5={} q6={} q7={} q8={} q9={} q10={} q11={} q12={} q13={} q14={} q15={} (want={} read1={} read2={} kept={}/{} pushed={}/{}) -> FAIL ::", q1 as u8, q2 as u8, q3 as u8, q4 as u8, q5 as u8, q6 as u8, q7 as u8, q8 as u8, q9 as u8, q10 as u8, q11 as u8, q12 as u8, q13 as u8, q14 as u8, q15 as u8, want, read1.unwrap_or(-1), read2.unwrap_or(-1), kept1 as u8, kept2 as u8, pushed1 as u8, pushed2 as u8);
     }
 }
 
@@ -2276,3 +2276,67 @@ fn tagtimeout_selftest(next: &dyn Fn() -> u32) -> bool {
 // on=worker queued_ms=<n> (INPUTSTALL M5 ...)` then `[prefsbus] queued apply on=prefs-apply deferred=<k> ms=<n>
 // (PREFS-FLUSH-ONTO-APPLIER)`, no `prefs-flush` task; busreg `tests bandy3` unchanged (`flush=applier`).
 // =================================================================================================
+
+// =================================================================================================
+// RELAY-TAG-LATE-WIPE (rmbp-ledger B1205, BP-storage-11) — TAIL-APPENDED. RELAY-TAG-TIMEOUT-PENDPIN (B1202) left one
+// window: a Holocron answer (tags 144-151; a SecretGet carries key bytes) delivered between `relay_tag`'s last
+// `take_reply` and `tagtimeout_release` has already taken its Pend and lands in REPLIES; the next `take_reply` for any
+// other corr pops it as stale and the Box was freed unwiped, so the heap kept the bytes until reuse. The stale arm now
+// runs `stale_wipe` after `queued_mark` has read the frame and before the iteration frees it: EVERY stale frame (a PREF
+// answer alike, no per-tag branch) is zeroed under REPLIES (IRQs masked; O(frame) <= BUS_HDR_LEN 52 + BUS_BODY_MAX 4096
+// = 4148 volatile stores, worst case Q_CAP 16 frames in one take) and counted in `STALE_WIPED`. The house wipe,
+// `keyring::wipe`, rides `lumen` (lib.rs `#[cfg(feature = "lumen")] pub mod keyring`; holocron_core is optional) and
+// prefs_client is compiled on every build, so the client keeps ONE every-build wipe, `frame_wipe` (volatile stores +
+// a SeqCst compiler fence, holocron_core::zero::wipe's contract); `relay_tag`'s two inline loops (the request frame and
+// the taken answer) call it now. OWED: FRAME-WIPE-HOUSE (`frame_wipe` becomes `keyring::wipe` once holocron_core rides
+// every build); VEIL-LOGIN-LANE (the bench).
+// Wire: x86 busreg `tests bandy3` -> `:: RELAY-QUEUED-SET: ... tagtimeout=reclaimed stalewipe=<n> ... -> PASS ::` (Q15,
+// n >= 1). Limit: the freed frame cannot be read back honestly; Q15 witnesses the arm's count and `frame_wipe`'s
+// contract on a scratch buffer.
+// =================================================================================================
+/// Stale frames `take_reply` wiped before they dropped (monotonic since boot).
+pub static STALE_WIPED: AtomicU32 = AtomicU32::new(0);
+
+/// The client's ONE wipe: zero `b` with volatile stores the optimiser may not remove (holocron_core::zero::wipe's contract).
+fn frame_wipe(b: &mut [u8]) {
+    for x in b.iter_mut() {
+        // SAFETY: `x` is a valid, aligned, exclusive reference to one byte.
+        unsafe { core::ptr::write_volatile(x, 0) };
+    }
+    core::sync::atomic::compiler_fence(Ordering::SeqCst);
+}
+
+/// `take_reply`'s stale arm (IRQs masked, REPLIES held): zero the frame about to drop, and count it.
+fn stale_wipe(f: &mut [u8]) {
+    frame_wipe(f);
+    STALE_WIPED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// `queued_selftest`'s Q15 (B1205): a kernel-stamped REPLY of Holocron's SecretGet tag for a client corr nobody waits on,
+/// body a known pattern, is pushed into the inbox; `take_reply` for another fresh corr answers nothing and pops it as
+/// stale; `STALE_WIPED` rose by at least one and no frame of the planted corr is left; `frame_wipe` zeroes a filled
+/// scratch buffer. Returns (ok, the count's rise).
+#[cfg(feature = "busreg")]
+fn latewipe_selftest(next: &dyn Fn() -> u32) -> (bool, u32) {
+    /// Holocron's SecretGet tag (`holocron_core::wire::VERB_SECRET_GET`; the crate rides `lumen`, so the literal).
+    const HOLOCRON_SECRET_GET: u8 = 144;
+    let s0 = STALE_WIPED.load(Ordering::Relaxed);
+    let cs = next();
+    let ct = next();
+    let body = [0xA5u8; 32];
+    let mut r = alloc::vec![0u8; BUS_HDR_LEN + body.len()];
+    let rn = crate::bus::build_reply(HOLOCRON_SECRET_GET, cs, 0, kernel_reply_principal(), &body, &mut r);
+    r.truncate(rn);
+    let pushed = rn > 0 && inbox_push(r.into_boxed_slice());
+    let took = take_reply(ct).is_some();
+    let n = STALE_WIPED.load(Ordering::Relaxed).wrapping_sub(s0);
+    let gone = locked(|| !REPLIES.lock().iter().any(|f| matches!(crate::bus::frame_parse(f), Ok(h) if h.corr == cs)));
+    let mut scratch = [0xA5u8; 64];
+    frame_wipe(&mut scratch);
+    let zeroed = scratch.iter().all(|&b| b == 0);
+    let ok = pushed && !took && n >= 1 && gone && zeroed;
+    if !ok {
+        serial_println!("[prefsbus] latewipe leg: pushed={} took={} n={} gone={} zeroed={}", pushed as u8, took as u8, n, gone as u8, zeroed as u8);
+    }
+    (ok, n)
+}
