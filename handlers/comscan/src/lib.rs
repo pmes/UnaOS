@@ -241,6 +241,7 @@ struct PadState {
     declared: [Option<f64>; 3],
     read: [Option<f64>; 3],
     position: Option<[f64; 3]>, // VUGCOMSCANJOGTRAVELWIRE (SR618): the desk's settled position, from the wire
+    found: Vec<discovery::Found>, // VUGCOMSCANMDNSDIAL (SR638): the last discover's telnet entries, each a row a press links
 }
 
 /// A [`PumpCard`] as a face reads it: the link (up or not, and the pump's last state word), the travel per axis X / Y / Z
@@ -256,6 +257,7 @@ pub struct CardSnapshot {
     pub squawk: Option<String>,
     pub step: f64,
     pub feed: f64,
+    pub found: Vec<discovery::Found>, // VUGCOMSCANMDNSDIAL (SR638): the last discover's telnet entries (replaced by the next)
 }
 
 impl PumpCard {
@@ -312,6 +314,7 @@ impl PumpCard {
             squawk: self.pad.squawk.clone(),
             step: self.step,
             feed: self.feed,
+            found: self.pad.found.clone(), // VUGCOMSCANMDNSDIAL (SR638)
         }
     }
 }
@@ -349,7 +352,31 @@ impl PumpCard {
     /// for silence), the last of them in the pad's squawk row. Posts nothing and connects nothing: the person picks.
     pub fn say_found(&mut self, found: &[discovery::Found]) -> Vec<String> {
         let said = discovery::words(found);
-        self.pad.squawk = said.last().cloned();
+        self.pad.squawk = said.last().cloned(); self.keep_found(found); // VUGCOMSCANMDNSDIAL (SR638): the telnet entries kept as the pad's rows
         said
+    }
+}
+
+// --- VUGCOMSCANMDNSDIAL (LEDGER SR638): a found controller linked by one press, the card's own request (named tail hunk) ---
+
+impl PumpCard {
+    /// Keep a discover's telnet entries as the pad's found rows, replacing the last discover's (an http entry is the
+    /// controller's web UI, not a pump link, so it is said but not kept).
+    fn keep_found(&mut self, found: &[discovery::Found]) {
+        self.pad.found = found.iter().filter(|f| f.service == discovery::Service::Telnet).cloned().collect();
+    }
+
+    /// The request a press on found row `i` posts: [`bandy::PumpEvent::PumpLink`] with the card's principal for the entry's
+    /// [`tcp::spec`] (`tcp://<addr>:<port>`, the name the desk's one opener takes) in its hinted dialect (grbl when there is
+    /// no hint: the telnet service is grbl's raw stream). The desk opens it through its one open road and answers `linked
+    /// <port>` (or `refused: <why>`) through [`PumpCard::hear`]. `None`: no such row.
+    pub fn dial(&self, i: usize) -> Option<SMessage> {
+        let f = self.pad.found.get(i)?;
+        let dialect = f.dialect_hint.unwrap_or(make_core::gcode::Dialect::Grbl { laser: false });
+        Some(SMessage::Pump(bandy::PumpEvent::PumpLink {
+            principal: self.principal.clone(),
+            port: tcp::spec(f.socket_addr()),
+            dialect: pump::dialect_word(dialect).to_string(),
+        }))
     }
 }

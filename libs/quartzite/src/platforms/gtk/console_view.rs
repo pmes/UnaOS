@@ -164,6 +164,9 @@ struct JogPad {
     why: Label,
     steps: Vec<gtk4::ToggleButton>,
     keys: Vec<gtk4::Button>,
+    syn: Synapse, // VUGCOMSCANMDNSDIAL (SR638): a found row's press fires the card's PumpLink
+    found: Box, // VUGCOMSCANMDNSDIAL (SR638): the found rows' buttons, rebuilt when the rows change
+    painted: std::rc::Rc<std::cell::RefCell<Vec<crate::widgets::jog_rows::JogRow>>>, // VUGCOMSCANMDNSDIAL (SR638): the found rows the buttons show
 }
 
 fn pad_label() -> Label {
@@ -219,14 +222,15 @@ fn jog_pad(container: &Box, synapse: Synapse) -> JogPad {
     pad.append(&travel);
     pad.append(&position);
     pad.append(&squawk);
-    pad.append(&declare); // VUGCOMSCANDECLARECONSOLEFACE (SR633)
+    let (declare_row, discover, found) = discover_row(&declare); pad.append(&declare_row); pad.append(&found); // VUGCOMSCANDECLARECONSOLEFACE (SR633); VUGCOMSCANMDNSDIAL (SR638): the discover button beside the entry, the found rows under it
     pad.append(&step_row);
     pad.append(&key_row);
     pad.append(&why);
     container.append(&pad);
 
-    let p = JogPad { card, link, travel, position, squawk, why, steps, keys };
+    let p = JogPad { card, link, travel, position, squawk, why, steps, keys, syn: synapse.clone(), found, painted: Default::default() }; // VUGCOMSCANMDNSDIAL (SR638): + syn, found, painted
     p.render();
+    p.wire_discover(&discover); // VUGCOMSCANMDNSDIAL (SR638)
     {
         // VUGCOMSCANDECLARECONSOLEFACE (SR633): Enter fires the card's declare when the parser takes the line and clears the
         // entry; a refused line stays for mending (the card says why in the squawk row); the pad repaints either way.
@@ -278,7 +282,64 @@ impl JogPad {
                 }
                 JogRow::Steps { enabled, .. } => self.steps.iter().for_each(|b| b.set_sensitive(enabled)),
                 JogRow::Pad { enabled, .. } => self.keys.iter().for_each(|b| b.set_sensitive(enabled)),
+                JogRow::Found { .. } => {} // VUGCOMSCANMDNSDIAL (SR638): painted together by paint_found
             }
         }
+        self.paint_found(); // VUGCOMSCANMDNSDIAL (SR638)
+    }
+}
+
+// --- VUGCOMSCANMDNSDIAL (LEDGER SR638): the discover button and the found rows a press links (named tail hunk) ---
+
+/// The declare entry with the discover button beside it, and the (empty) box the found rows' buttons go in.
+fn discover_row(declare: &super::glyph::GlyphEntry) -> (Box, gtk4::Button, Box) {
+    let row = Box::new(Orientation::Horizontal, 4);
+    declare.set_hexpand(true);
+    row.append(declare);
+    let discover = gtk4::Button::with_label(crate::widgets::jog_rows::DISCOVER_LABEL);
+    row.append(&discover);
+    (row, discover, Box::new(Orientation::Vertical, 2))
+}
+
+impl JogPad {
+    /// The discover button: the one mDNS question (`comscan::discovery::discover`, which blocks for its wait) on gio's
+    /// blocking pool, the answers handed back to this main-loop future, said through the card's `say_found` (which keeps
+    /// the telnet entries as rows), then the pad repainted. The card is touched on the main thread only.
+    fn wire_discover(&self, discover: &gtk4::Button) {
+        let pad = self.clone();
+        discover.connect_clicked(move |_| {
+            let pad = pad.clone();
+            gtk4::glib::spawn_future_local(async move {
+                let wait = comscan::discovery::DISCOVER_WAIT;
+                let found = gtk4::gio::spawn_blocking(move || comscan::discovery::discover(wait)).await.unwrap_or_default();
+                pad.card.borrow_mut().say_found(&found);
+                pad.render();
+            });
+        });
+    }
+
+    /// The found rows as buttons, `found_label` each, rebuilt only when the rows changed (so a press never removes its own
+    /// button); a press fires the card's PumpLink for that row (`dial_verb`) and the desk's `linked` comes back by `hear`.
+    fn paint_found(&self) {
+        use crate::widgets::jog_rows::{dial_verb, found_label, jog_rows, JogRow};
+        let rows: Vec<JogRow> = jog_rows(&self.card.borrow().snapshot()).into_iter().filter(|r| matches!(r, JogRow::Found { .. })).collect();
+        if *self.painted.borrow() == rows {
+            return;
+        }
+        while let Some(child) = self.found.first_child() {
+            self.found.remove(&child);
+        }
+        for (i, row) in rows.iter().enumerate() {
+            let JogRow::Found { name, addr, port } = row else { continue };
+            let b = gtk4::Button::with_label(&found_label(name, addr, *port));
+            let (c, syn) = (self.card.clone(), self.syn.clone());
+            b.connect_clicked(move |_| {
+                if let Some(m) = dial_verb(&c.borrow(), i) {
+                    syn.fire(m);
+                }
+            });
+            self.found.append(&b);
+        }
+        *self.painted.borrow_mut() = rows;
     }
 }

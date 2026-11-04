@@ -206,6 +206,9 @@ struct PadState {
     steps: RefCell<Vec<(f64, Retained<NSView>)>>,
     keys: RefCell<Vec<Retained<NSView>>>,
     declare: std::cell::OnceCell<Retained<super::text_field::UnaTextField>>, // VUGCOMSCANDECLARECONSOLEFACE (SR633): the declare entry, set once built (its Enter clears it)
+    syn: Synapse, // VUGCOMSCANMDNSDIAL (SR638): a found row's press fires the card's PumpLink
+    found_box: Retained<objc2_app_kit::NSStackView>, // VUGCOMSCANMDNSDIAL (SR638): the found rows' buttons
+    found: RefCell<(Vec<crate::widgets::jog_rows::JogRow>, Vec<Retained<NSView>>)>, // VUGCOMSCANMDNSDIAL (SR638): the rows painted and their buttons
 }
 
 /// The pad's handle the subscriber loop holds: Send (the loop runs on its own thread); every touch hops to the main
@@ -230,6 +233,7 @@ fn jog_pad(root: &objc2_app_kit::NSStackView, synapse: Synapse, mtm: MainThreadM
         steps: RefCell::new(Vec::with_capacity(STEPS_MM.len())),
         keys: RefCell::new(Vec::with_capacity(KEYS.len())),
         declare: std::cell::OnceCell::new(), // VUGCOMSCANDECLARECONSOLEFACE (SR633)
+        syn: synapse.clone(), found_box: stack(true), found: RefCell::new((Vec::new(), Vec::new())), // VUGCOMSCANMDNSDIAL (SR638)
     });
     // dim-label's twin: the palette's legend colour.
     let _: () = unsafe { msg_send![&st.why, setTextColor: &*ns_color(LABEL)] };
@@ -282,7 +286,7 @@ fn jog_pad(root: &objc2_app_kit::NSStackView, synapse: Synapse, mtm: MainThreadM
         }))
     };
     let _ = st.declare.set(declare.clone());
-    hug(&declare, 1);
+    hug(&declare, 1); let declare_row = discover_row(&st, &declare, mtm); // VUGCOMSCANMDNSDIAL (SR638): the discover button beside the entry
 
     for l in [&st.link, &st.travel, &st.position, &st.squawk, &st.why] {
         hug(l, 1);
@@ -295,7 +299,7 @@ fn jog_pad(root: &objc2_app_kit::NSStackView, synapse: Synapse, mtm: MainThreadM
         let _: () = msg_send![&pad, addArrangedSubview: &*st.travel];
         let _: () = msg_send![&pad, addArrangedSubview: &*st.position];
         let _: () = msg_send![&pad, addArrangedSubview: &*st.squawk];
-        let _: () = msg_send![&pad, addArrangedSubview: &*declare]; // VUGCOMSCANDECLARECONSOLEFACE (SR633)
+        let _: () = msg_send![&pad, addArrangedSubview: &*declare_row]; let _: () = msg_send![&pad, addArrangedSubview: &*st.found_box]; // VUGCOMSCANDECLARECONSOLEFACE (SR633); VUGCOMSCANMDNSDIAL (SR638): the entry's row with the discover button, the found rows under it
         let _: () = msg_send![&pad, addArrangedSubview: &*step_row];
         let _: () = msg_send![&pad, addArrangedSubview: &*key_row];
         let _: () = msg_send![&pad, addArrangedSubview: &*st.why];
@@ -334,7 +338,7 @@ fn set_hidden(view: &NSView, hidden: bool) {
 /// Paint `jog_rows` over the card's snapshot: the optional rows shown only when present, the step titles ticked on the
 /// card's step, the picker and keys disabled while no link is up. The pump's words are sanitized like every Console
 /// line. Main thread only.
-fn render_pad(st: &PadState) {
+fn render_pad(st: &Rc<PadState>) { // VUGCOMSCANMDNSDIAL (SR638): the Rc, so a found row's button holds the state weakly
     use crate::widgets::jog_rows::{jog_rows, JogRow};
     let rows = jog_rows(&st.card.borrow().snapshot());
     set_hidden(&st.position, true);
@@ -371,6 +375,70 @@ fn render_pad(st: &PadState) {
                     let _: () = unsafe { msg_send![&**b, setEnabled: Bool::new(enabled)] };
                 }
             }
+            JogRow::Found { .. } => {} // VUGCOMSCANMDNSDIAL (SR638): painted together by paint_found
         }
     }
+    paint_found(st); // VUGCOMSCANMDNSDIAL (SR638)
+}
+
+// --- VUGCOMSCANMDNSDIAL (LEDGER SR638): the discover button and the found rows a press links (named tail hunk) ---
+
+/// The declare field with the discover button beside it. The button runs the one mDNS question
+/// (`comscan::discovery::discover`, which blocks for its wait) on its own thread and hops the answers back to the main
+/// thread (the SR622 hop, `DispatchQueue::main().exec_async`), where the card's `say_found` keeps the telnet entries as
+/// rows and the pad repaints. The state is held weakly (the button lives in it) and touched on the main thread only.
+fn discover_row(st: &Rc<PadState>, declare: &NSView, mtm: MainThreadMarker) -> Retained<objc2_app_kit::NSStackView> {
+    let row = stack(false);
+    let bound = std::sync::Arc::new(dispatch2::MainThreadBound::new(Rc::downgrade(st), mtm));
+    let discover = super::button::bootstrap_button_with(crate::widgets::jog_rows::DISCOVER_LABEL, Box::new(move || {
+        let bound = bound.clone();
+        std::thread::spawn(move || {
+            let found = comscan::discovery::discover(comscan::discovery::DISCOVER_WAIT);
+            dispatch2::DispatchQueue::main().exec_async(move || {
+                let mtm = MainThreadMarker::new().unwrap();
+                if let Some(st) = bound.get(mtm).upgrade() {
+                    st.card.borrow_mut().say_found(&found);
+                    render_pad(&st);
+                }
+            });
+        });
+    }));
+    unsafe {
+        let _: () = msg_send![&row, addArrangedSubview: declare];
+        let _: () = msg_send![&row, addArrangedSubview: &*discover];
+    }
+    hug(&row, 1);
+    row
+}
+
+/// The found rows as buttons (`found_label` each), rebuilt only when the rows changed, so a press never removes its own
+/// button; a press fires the card's PumpLink for that row (`dial_verb`), and the desk's `linked` comes back by `hear`.
+/// Main thread only.
+fn paint_found(st: &Rc<PadState>) {
+    use crate::widgets::jog_rows::{dial_verb, found_label, jog_rows, JogRow};
+    let rows: Vec<JogRow> = jog_rows(&st.card.borrow().snapshot()).into_iter().filter(|r| matches!(r, JogRow::Found { .. })).collect();
+    if st.found.borrow().0 == rows {
+        return;
+    }
+    let mut painted = st.found.borrow_mut();
+    for v in painted.1.drain(..) {
+        unsafe {
+            let _: () = msg_send![&st.found_box, removeArrangedSubview: &*v];
+            let _: () = msg_send![&v, removeFromSuperview];
+        }
+    }
+    for (i, row) in rows.iter().enumerate() {
+        let JogRow::Found { name, addr, port } = row else { continue };
+        let w = Rc::downgrade(st);
+        let b = super::button::bootstrap_button_with(&found_label(name, addr, *port), Box::new(move || {
+            if let Some(st) = w.upgrade() {
+                if let Some(m) = dial_verb(&st.card.borrow(), i) {
+                    st.syn.fire(m);
+                }
+            }
+        }));
+        let _: () = unsafe { msg_send![&st.found_box, addArrangedSubview: &*b] };
+        painted.1.push(b);
+    }
+    painted.0 = rows;
 }

@@ -1938,6 +1938,16 @@ kat!(
     }),
     r#"{"Pump":{"PumpDeclare":{"principal":{"LocalUser":"una"},"name":"mill","x":120.0,"y":300.0,"z":100.0,"dialect":"grbl"}}}"#
 );
+// VUGCOMSCANMDNSDIAL (SR638): a found controller linked with no program.
+kat!(
+    kat_pump_link,
+    SMessage::Pump(bandy::PumpEvent::PumpLink {
+        principal: Origin::LocalUser("una".to_string()),
+        port: "tcp://192.168.1.40:23".to_string(),
+        dialect: "grbl".to_string(),
+    }),
+    r#"{"Pump":{"PumpLink":{"principal":{"LocalUser":"una"},"port":"tcp://192.168.1.40:23","dialect":"grbl"}}}"#
+);
 // VUGCOMSCANJOGTRAVELWIRE (SR618): the desk's travel (declared and read) and its settled position, typed for a face.
 kat!(
     kat_pump_envelope,

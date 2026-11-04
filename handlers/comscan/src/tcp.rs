@@ -112,6 +112,15 @@ pub fn parse(spec: &str) -> Result<(String, u16), Refusal> {
     }
 }
 
+// --- VUGCOMSCANMDNSDIAL (LEDGER SR638): the one port name for a found controller, parse's inverse (named hunk) ---
+
+/// The bus name of the link at `at`: `tcp://<addr>:<port>`, an IPv6 literal bracketed with its scope (`tcp://[fe80::1%2]:23`),
+/// the text [`parse`] reads back and [`crate::pump::by_scheme`] routes to this opener. A found controller's
+/// (`crate::discovery::Found::socket_addr`) dial is this name in a `PumpLink`.
+pub fn spec(at: std::net::SocketAddr) -> String {
+    format!("{TCP_SCHEME}{at}")
+}
+
 /// An open, nonblocking TCP link to a controller.
 pub struct Port {
     stream: TcpStream,

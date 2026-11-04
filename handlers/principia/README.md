@@ -111,10 +111,10 @@ an explicit home (tests, and any future multi-profile boot).
 
 ### Queued
 
-- **Live update on external change.** Principia is the writer of record; an edit
-  made to a `settings/<domain>` file underneath a running Principia is not noticed until
-  the next load. A file watcher that reloads and emits `PrefChanged` per delta
-  is the follow-up.
+- **Locking between writers.** Live update on external change is BUILT (PRINCIPIA-TWO-WRITERS,
+  SR635): `serve` looks at the `settings/<domain>` files' stamps each second and a changed one
+  reloads the store and emits `PrefChanged` per differing key; two writers can still lose an
+  update between that reload and their own rename (PRINCIPIA-TWO-WRITERS-LOCK, owed to prefs_core's swap).
 - **The GUI surface.** Settings are served but have no face yet; a quartzite
   view over `PrefList`/`PrefSet` is the natural next step, rendered from
   `prefs_core::schema::SCHEMA` (types, ranges, enums per key).
