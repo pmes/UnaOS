@@ -2420,7 +2420,7 @@ fn a_near_cube_s_basins_scored() {
 
 #[test]
 fn a_near_cube_aligns_on_the_three_equal_road() {
-    use scan_core::deviation::{Road, Sweep, swept};
+    use scan_core::deviation::{COARSE_VIEW_KEEP, Road, Sweep, first_refine, swept}; // VUGSCANCOARSESYMTHREECOST (SR667): the first refine's seam
     let doc = doc_core::read(CUBE_DOC).expect("the document reads");
     let (s, c) = (35.0 * DEG).sin_cos();
     let yaw = fixture::from_axes(Vec3::new(c, s, 0.0), Vec3::new(-s, c, 0.0), Vec3::new(0.0, 0.0, 1.0), Vec3::ZERO);
@@ -2463,19 +2463,40 @@ fn a_near_cube_aligns_on_the_three_equal_road() {
         println!("coarsesymthreekeep: start axis={i} rank={rank:.3} score={score:.3} basin={b} off={off:.1} kept={keep}");
     }
 
+    // VUGSCANCOARSESYMTHREECOST (SR667): `three_or`'s window (the 72 by rank, the first on a tie, within best + gate(2))
+    // through the cheap first refine; the best COARSE_VIEW_KEEP distinct go into the full refine. The decision rule,
+    // fixed before the run: the truth basin among them, the full count at most COARSE_VIEW_KEEP, the road below within
+    // 1° / 2 mm.
+    let mut window: Vec<(f64, Transform, f64)> = all.iter().map(|&(_, rank, t, score)| (rank, t, score)).collect();
+    window.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let window: Vec<(Transform, f64)> = window.into_iter().filter(|s| s.0 <= best + k).map(|(_, t, s)| (t, s)).collect();
+    let first = first_refine(&moved, design, &bvh, &ap, Tol::DEFAULT, &window);
+    let mut full = 0usize;
+    let mut full_truth = false;
+    for (n, &(select, t, _)) in first.iter().enumerate() {
+        let (b, off) = nearest(t);
+        let into = n < COARSE_VIEW_KEEP;
+        full += into as usize;
+        full_truth |= into && b == 0;
+        println!("coarsesymthreecost: first select={select:.4} basin={b} off={off:.2} full={into}");
+    }
+
     // The road.
     let (_, map) = vug_view::deviation::open_coarse(&moved, &doc, BAND_MM, vug_view::deviation::GDT_MARGIN_MM).expect("the design builds");
     let d = map.result.as_ref().expect("the three-equal road aligns");
     let (deg, mm) = err(d.aligned.pose);
     println!(
-        "coarsesymthreekeep: kept={kept} of {} best={best:.3} K={k:.3} road={:?} aligned={:.3} err_deg={deg:.3} err_mm={mm:.3} basin={}",
+        "coarsesymthreekeep: kept={kept} of {} best={best:.3} K={k:.3} first={} full={full} road={:?} aligned={:.3} err_deg={deg:.3} err_mm={mm:.3} basin={}",
         all.len(),
+        first.len(),
         map.road,
         d.aligned.rms_mm,
         nearest(d.aligned.pose).0
     );
     assert_eq!(all.len(), 72, "three sweeps of 2 x 12 starts");
     assert!(kept_truth, "the truth basin has a kept start");
+    assert!(full_truth, "the truth basin is among the full refines"); // VUGSCANCOARSESYMTHREECOST (SR667)
+    assert!(full >= 1 && full <= COARSE_VIEW_KEEP, "full refines {full}"); // VUGSCANCOARSESYMTHREECOST (SR667)
     assert!(matches!(map.road, Road::CoarseFine { .. }), "{:?}", map.road);
     assert!(deg <= 1.0 && mm <= 2.0, "pose error {deg} deg {mm} mm");
 }

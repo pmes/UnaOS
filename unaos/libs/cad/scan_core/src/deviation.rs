@@ -973,5 +973,58 @@ fn three_or(scan: &ScanMesh, design: &Design, bvh: &Bvh, p: &AlignParams, tol: T
     }
     all.sort_by(|a, b| a.0.total_cmp(&b.0));
     let kept: Vec<(Transform, f64)> = all.into_iter().filter(|s| s.0 <= best + p.gate(2)).map(|(_, t, s)| (t, s)).collect();
-    if kept.is_empty() { starts } else { kept }
+    if kept.is_empty() {
+        return starts;
+    }
+    // VUGSCANCOARSESYMTHREECOST (SR667): a window that passes the floor takes the cheap first refine, its best
+    // COARSE_VIEW_KEEP distinct poses into the wide refine; refused at the floor, or no first refine accepted, the window.
+    if !(kept.iter().map(|s| s.1).fold(f64::INFINITY, f64::min) <= p.gate(2)) {
+        return kept;
+    }
+    let first = first_refine(scan, design, bvh, p, tol, &kept);
+    if first.is_empty() { kept } else { first.into_iter().take(COARSE_VIEW_KEEP).map(|(_, t, s)| (t, s)).collect() }
+}
+
+// ---- VUGSCANCOARSESYMTHREECOST (LEDGER SR667): a three-equal design's near-tie starts take a cheap first refine ----
+// SR659 handed every start of the gate(2) window into `measure_coarse`'s wide refine: on SR657's near-cube that is all 72
+// (ranks 4.649 .. 13.438), ≈ 9.1M `Bvh::closest` (72 × (3·iters·COARSE_POINTS + 2·COARSE_POINTS)). MEASURED (SR659's
+// table) no window read from the ranks themselves is both constant-free and tight: the first gap above the median gap
+// (0.372 against 0.076) keeps one start (basin 13) and drops the truth; the largest gap (0.974, after rank 24) keeps one
+// start per cube-group basin, 24. The refine, not the start, tells the group apart (SR657's T1 at gate(2): truth
+// 0.0543, its three 180° twins 0.0599-0.0600, the swapped group 0.105, the rest ≥ 3.17; every start refines into its
+// nearest basin, drift ≤ 0.24°). So [`first_refine`] refines every window start by [`align`] at σ·[`COARSE_WIDEN`] over
+// [`COARSE_FIRST_POINTS`] (the one new constant: points cut, not iterations, so every level still converges; ≥ 4 ×
+// `min_pairs`), selects by `measure_coarse`'s own select ([`trimmed`] at `p.gate(2)`, [`COARSE_SELECT_KEEP`]), and drops
+// a pose within half a sweep step (π / [`COARSE_VIEW_STEPS`], 15°: the sweep resolves no finer; cube-group basins are ≥
+// 90° apart) of a better one: ~3 starts reach each basin and the truth leads its twins by 0.0056 mm, so without the
+// dedupe the twins' duplicates could fill the keep. The best [`COARSE_VIEW_KEEP`] distinct go into the unchanged wide
+// refine / select loop. Cost: ≤ 72 × (3·iters·256 + 256 + COARSE_POINTS) ≈ 1.27M, then ≤ 4 × 126.9k ≈ 0.51M, against
+// SR659's 9.1M; only for a [`three`]-equal design whose window passes the floor.
+
+/// The first refine's stride sample (VUGSCANCOARSESYMTHREECOST SR667): [`COARSE_POINTS`] / 8.
+pub const COARSE_FIRST_POINTS: usize = 256;
+
+/// Each start refined by [`align`] at σ·[`COARSE_WIDEN`] over [`COARSE_FIRST_POINTS`] (a refused refine is skipped),
+/// scored by [`trimmed`] at `p.gate(2)` over [`COARSE_SELECT_KEEP`] on the coarse sample, sorted by that score (the
+/// first on a tie), a pose within π / [`COARSE_VIEW_STEPS`] of rotation of a better kept one dropped: (select, refined
+/// pose, the start's own score).
+pub fn first_refine(scan: &ScanMesh, design: &Design, bvh: &Bvh, p: &AlignParams, tol: Tol, starts: &[(Transform, f64)]) -> Vec<(f64, Transform, f64)> {
+    let first = AlignParams { sigma_mm: p.sigma_mm * COARSE_WIDEN, max_points: p.max_points.min(COARSE_FIRST_POINTS), ..*p };
+    let normals = design.mesh.normals_face(tol);
+    let sample = coarse_sample(scan.mesh.positions.len());
+    let mut refined: Vec<(f64, Transform, f64)> = Vec::with_capacity(starts.len());
+    for &(start, score) in starts {
+        if let Ok(a) = align(scan, design, bvh, start, &first, tol) {
+            refined.push((trimmed(scan, design, bvh, &normals, &sample, a.pose, p.gate(2), COARSE_SELECT_KEEP, p, tol), a.pose, score));
+        }
+    }
+    refined.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let same = libm::cos(core::f64::consts::PI / (2.0 * COARSE_VIEW_STEPS as f64));
+    let mut out: Vec<(f64, Transform, f64)> = Vec::with_capacity(refined.len());
+    for r in refined {
+        if !out.iter().any(|k| libm::fabs(k.1.rot.dot(r.1.rot)) >= same) {
+            out.push(r);
+        }
+    }
+    out
 }
