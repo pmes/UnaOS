@@ -188,9 +188,9 @@ pub fn on_changed(ns: &str, k: &str, a: Option<&prefs_core::schema::Applied>) {
 
 /// Drain the subscription queue: each frame is parsed through the frozen `frame_parse` (verb 19, kind
 /// REPLY, corr 0) and its body through the shared `wire::parse_changed` (a value or the unset form, PREFSUNSET
-/// SR169); `f(ns, key)` per change — the consumer re-reads the store, so an unset key answers its default.
-/// Returns the frames delivered.
-pub fn changes_drain(mut f: impl FnMut(&str, &str)) -> usize {
+/// SR169); `f(ns, key, value)` per change, `None` = the unset form (CHANGES-DRAIN-VALUE rmbp-ledger B1204); a consumer
+/// that needs more than the frame re-reads the store, so an unset key answers its default. Returns the frames delivered.
+pub fn changes_drain(mut f: impl FnMut(&str, &str, Option<PrefValue>)) -> usize {
     let frames: Vec<Box<[u8]>> = locked(|| CHANGES.lock().drain(..).collect());
     let mut n = 0usize;
     for fr in frames.iter() {
@@ -199,8 +199,8 @@ pub fn changes_drain(mut f: impl FnMut(&str, &str)) -> usize {
             continue;
         }
         let body = &fr[BUS_HDR_LEN..];
-        if let Some((ns, k, _, _)) = prefs_core::wire::parse_changed(body) {
-            f(ns, k);
+        if let Some((ns, k, v, _)) = prefs_core::wire::parse_changed(body) {
+            f(ns, k, v);
             n += 1;
         }
     }
