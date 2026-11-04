@@ -14,6 +14,10 @@
 //! depth error grows with the square of the distance): Gaussian with σ(z) = σ_ref · (z / z_ref)², drawn by Box–Muller
 //! over a seeded splitmix64. [`Noise::D435I`] is 1.5 mm at 0.6 m (Gee: 1.06 mm at 0.621 m; the 1-2 mm at 0.6 m the
 //! research reads), random noise only: the calibration bias the research names is not modelled.
+//!
+//! VUGFACECONFIDENCETINT (SR592): [`Noise::invalid_band_px`] zeroes depth within that many pixels of a silhouette (a hit
+//! beside a miss or beside a depth step over [`SILHOUETTE_STEP`]), the D400's invalid band; 0 (both consts) is the
+//! render as before, byte for byte (the band pass runs after the noise stream, only when armed).
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -55,13 +59,15 @@ pub struct Noise {
     pub sigma_ref_mm: f64,
     pub z_ref_m: f64,
     pub seed: u64,
+    /// VUGFACECONFIDENCETINT (SR592): the silhouette's invalid band in pixels (0: none).
+    pub invalid_band_px: u32,
 }
 
 impl Noise {
     /// The D435i at 848x480-class precision: 1.5 mm at 0.6 m.
-    pub const D435I: Noise = Noise { sigma_ref_mm: 1.5, z_ref_m: 0.6, seed: 0xD435 };
+    pub const D435I: Noise = Noise { sigma_ref_mm: 1.5, z_ref_m: 0.6, seed: 0xD435, invalid_band_px: 0 };
     /// No noise (only the scale's quantisation).
-    pub const NONE: Noise = Noise { sigma_ref_mm: 0.0, z_ref_m: 0.6, seed: 0 };
+    pub const NONE: Noise = Noise { sigma_ref_mm: 0.0, z_ref_m: 0.6, seed: 0, invalid_band_px: 0 };
 }
 
 impl Scene {
@@ -194,6 +200,8 @@ pub fn render_depth(
     let mut rng = SplitMix::new(noise.seed ^ seq.wrapping_mul(0x9E37_79B9_7F4A_7C15));
     let origin = pose.trans;
     let unit = scale.metres_per_unit as f64 * 1000.0; // mm per raw unit
+    let band = noise.invalid_band_px; // VUGFACECONFIDENCETINT (SR592): the noise-free hit depth per pixel, kept only when the band is armed
+    let mut hit = if band > 0 { vec![0.0f64; w as usize * h as usize] } else { Vec::new() };
     for y in 0..h {
         for x in 0..w {
             // Box–Muller: two uniforms per pixel, drawn whether or not the pixel hits, so the stream is per-pixel.
@@ -202,6 +210,9 @@ pub fn render_depth(
             let Some(c) = intr.deproject(x as f32 + 0.5, y as f32 + 0.5, 1.0) else { continue };
             let dir = pose.apply_vector(Vec3::new(c[0] as f64, c[1] as f64, 1.0));
             let Some(z_mm) = scene.raycast(origin, dir) else { continue };
+            if let Some(hz) = hit.get_mut(y as usize * w as usize + x as usize) {
+                *hz = z_mm;
+            }
             let zr = z_mm / 1000.0 / noise.z_ref_m;
             let z = z_mm + noise.sigma_ref_mm * zr * zr * g;
             if !(unit > 0.0) || !(z > 0.0) {
@@ -213,6 +224,50 @@ pub fn render_depth(
             data[o..o + 2].copy_from_slice(&raw.to_le_bytes());
         }
     }
+    if band > 0 {
+        invalid_band(&mut data, &hit, w, h, band);
+    }
     Frame::packed(StreamKind::Depth, PixelFormat::Z16, w, h, seq * 33_333, seq, data)
         .expect("render_depth sizes its own buffer")
+}
+
+// ---- VUGFACECONFIDENCETINT (LEDGER SR592): the D400's invalid band beside a silhouette ----
+// The D400 returns no depth in a band beside an object's outline (the stereo pair's occlusion), so a real frame carries
+// holes right where the TSDF's silhouette error lives (VUG-SCAN-TSDF-HOLES); without them the fixture had a hole beside 0
+// of the post's 40 form rows (SR586). A silhouette pixel is a hit whose 4-neighbour is a miss or a hit whose noise-free
+// depth differs by more than [`SILHOUETTE_STEP`] of the nearer (the bench ground's adjacent-pixel step stays under 1.5% at
+// its grazing angles; the post's and the box's outlines step 20% and more); every pixel within Chebyshev distance under
+// the band of a silhouette pixel reads raw 0.
+
+/// The relative depth step between 4-neighbours that makes a silhouette (5% of the nearer depth).
+pub const SILHOUETTE_STEP: f64 = 0.05;
+
+/// Zero every pixel of the Z16 `data` (`w` x `h`, packed) within Chebyshev distance under `band` of a silhouette pixel of
+/// the noise-free hit depths `hit` (0: a miss).
+fn invalid_band(data: &mut [u8], hit: &[f64], w: u32, h: u32, band: u32) {
+    let (w, h) = (w as i64, h as i64);
+    let at = |x: i64, y: i64| hit.get((y * w + x) as usize).copied().unwrap_or(0.0);
+    let step = |a: f64, b: f64| b <= 0.0 || (a - b).abs() > SILHOUETTE_STEP * a.min(b);
+    let r = band as i64 - 1;
+    for y in 0..h {
+        for x in 0..w {
+            let a = at(x, y);
+            if a <= 0.0 {
+                continue;
+            }
+            let edge = [(1i64, 0i64), (-1, 0), (0, 1), (0, -1)].iter().any(|(dx, dy)| {
+                let (nx, ny) = (x + dx, y + dy);
+                nx >= 0 && ny >= 0 && nx < w && ny < h && step(a, at(nx, ny))
+            });
+            if !edge {
+                continue;
+            }
+            for yy in (y - r).max(0)..=(y + r).min(h - 1) {
+                for xx in (x - r).max(0)..=(x + r).min(w - 1) {
+                    let o = ((yy * w + xx) * 2) as usize;
+                    data[o..o + 2].copy_from_slice(&0u16.to_le_bytes());
+                }
+            }
+        }
+    }
 }

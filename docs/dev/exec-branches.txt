@@ -1425,3 +1425,9 @@ exec-rmbp-f39a11yboottext 84e30a13a wave36 cut58
 exec-rmbp-f39machineunset 84e30a13a wave36 cut58
 exec-rmbp-f39prefselfprelogin 84e30a13a wave36 cut58
 exec-rmbp-f39machinestoreplant 84e30a13a wave36 cut58
+exec-rmbp-vugfacesaveascaret eb705bcdd wave36 cut57
+exec-rmbp-vugfacepathbeside eb705bcdd wave36 cut57
+exec-rmbp-vugfacephotoprefline eb705bcdd wave36 cut57
+exec-rmbp-vugintentsetfaceanchoredoverlap eb705bcdd wave36 cut57
+exec-rmbp-vugcomscanenvelopereadon eb705bcdd wave36 cut57
+exec-rmbp-vugfacejournalsolidfaultfix eb705bcdd wave36 cut57
