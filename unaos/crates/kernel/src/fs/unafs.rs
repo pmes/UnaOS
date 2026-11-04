@@ -4147,7 +4147,7 @@ pub mod splitwrite {
     pub(super) fn ra_sync(ra: &mut RaSet) {
         let g = RA_GEN.load(Ordering::Acquire);
         if ra.seen != g {
-            ra.invalidate();
+            if !super::rawrote::narrow(ra, g) { ra.invalidate(); } // F39UNAFSLOCK (B1098): only the windows the write phases' spans overlap drop (file tail)
             ra.seen = g;
         }
     }
@@ -4337,7 +4337,7 @@ pub mod splitwrite {
     /// uses (`SdSectorDevice::open_on`, `BlockAdapter::for_partition`). `false` on any refusal.
     fn write_phase(s: &StagedCommit, handle: block::BlockHandle, span: &PartitionSpan) -> bool {
         match SdSectorDevice::open_on(handle) {
-            Ok(dev) => s.write_staged(&mut BlockAdapter::for_partition(dev, span)).is_ok(),
+            Ok(dev) => super::rawrote::write_noted(s, dev, span, RA_GEN.load(Ordering::Acquire) + 1), // F39UNAFSLOCK (B1098): the phase's sector spans noted for ra_sync (file tail)
             Err(_) => false,
         }
     }
@@ -5250,7 +5250,7 @@ pub mod lockhold {
                         if n == 0 {
                             return Ok(Some(Vec::new()));
                         }
-                        fs.read_data(id, at, n).map(Some).map_err(|_| ReadMiss::Failed)
+                        super::rawrote::read_bounded(fs, id, at, n, first, h0).map(Some).map_err(|_| ReadMiss::Failed) // F39UNAFSLOCK (B1098): block steps, the hold time-bounded (file tail)
                     })();
                     (r, crate::hidstall::now_us().saturating_sub(h0))
                 });
@@ -5260,11 +5260,11 @@ pub mod lockhold {
                     None => break true,
                     Some(d) => {
                         st.chunks += 1;
-                        first = false;
+                        let was_first = core::mem::replace(&mut first, false); // F39UNAFSLOCK (B1098): the first hold may end over budget with no bytes
                         let got = d.len() as u64;
                         out.extend_from_slice(&d);
                         at = at.saturating_add(got);
-                        if got == 0 || at >= end {
+                        if (got == 0 && !was_first) || at >= end { // F39UNAFSLOCK (B1098): an empty FIRST hold is not the end
                             break false;
                         }
                         kat_inject(); // `tests unafslock` KAT only: a commit between two holds
@@ -5659,4 +5659,144 @@ fn bind_now_kat() -> bool {
         "[unafs] bind_now kat={} r={} bound={} masked={} (UNAFSBINDTRIGGER B1058: a bind_now on an unbound mount takes no masked MOUNT attempt)",
         word, rw, bound as u8, masked
     ); ok
+}
+
+// ── F39UNAFSLOCK (rmbp-ledger B1098, BP-storage-8) — the chunked read's holds stay under the KAT's 20 ms bound. FLIGHT 39
+// boot 1: `[unafslock] kat … chunked … chunks=59 restarts=1 hold_max_us=98188 -> FAIL`. Two card costs ran inside the hold
+// (one 32 KiB window fill ~10.8 ms on the rMBP 1-bit bus). (1) The EVICTION: every split commit's write phase moved
+// `splitwrite::RA_GEN` and the next hold's `ra_sync` dropped all sixteen read-ahead windows, so the hold after a commit
+// walked the path cold (~9 fills = 98 ms) although the commit rewrote none of its blocks. Now the write phase records the
+// sector spans it wrote (`Noting`, `write_noted`) and `ra_sync` drops only the windows they overlap (`narrow`); spans pruned
+// or past the caps fall back to the full invalidate. K8a: the write phase's blocks are the only ones that change past the
+// mount device, and every one of them passes through `Noting`. (2) The RUN: a cold 64 KiB run is 2-3 window fills. Now
+// each chunked hold reads block steps through the crate's `read_data` and stops at `HOLD_BUDGET_US` (`read_bounded`): a
+// step is at most one fill. `WROTE` is a leaf lock (TICKET ⊃ MOUNT ⊃ WROTE), taken masked; no ISR takes it.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+pub mod rawrote {
+    use super::*;
+
+    /// A chunked hold stops taking block steps once it has run this long (a step costs at most one window fill).
+    const HOLD_BUDGET_US: u64 = 4_000;
+    /// Spans kept between syncs, and the sectors they may name; past either the next sync invalidates everything.
+    const SPANS_MAX: usize = 256;
+    const SECTORS_MAX: u64 = 32_768;
+
+    /// Sector spans the write phases wrote past the mount device, tagged with the `RA_GEN` each one moved to.
+    struct Wrote {
+        spans: Vec<(u64, u64, u64)>,
+        sectors: u64,
+        /// Spans with a tag at or below this are gone: a device synced at an older generation drops every window.
+        pruned: u64,
+    }
+
+    static WROTE: Mutex<Wrote> = Mutex::new(Wrote { spans: Vec::new(), sectors: 0, pruned: 0 });
+
+    /// The write phase's device: every write is the mount device's, its span noted (contiguous spans merged).
+    struct Noting<'a> {
+        dev: SdSectorDevice,
+        spans: &'a mut Vec<(u64, u64)>,
+    }
+
+    impl Noting<'_> {
+        fn note(&mut self, lba: u64, sectors: u64) {
+            match self.spans.last_mut() {
+                Some(l) if l.0.saturating_add(l.1) == lba => l.1 = l.1.saturating_add(sectors),
+                _ => self.spans.push((lba, sectors)),
+            }
+        }
+    }
+
+    impl SectorDevice for Noting<'_> {
+        fn read_sector(&mut self, lba: u64, buf: &mut [u8]) -> Result<(), SectorError> {
+            self.dev.read_sector(lba, buf)
+        }
+        fn write_sector(&mut self, lba: u64, buf: &[u8]) -> Result<(), SectorError> {
+            self.note(lba, 1);
+            self.dev.write_sector(lba, buf)
+        }
+        fn sector_count(&self) -> u64 {
+            self.dev.sector_count()
+        }
+        fn flush(&mut self) -> Result<(), SectorError> {
+            self.dev.flush()
+        }
+        fn read_sectors(&mut self, lba: u64, buf: &mut [u8]) -> Result<(), SectorError> {
+            self.dev.read_sectors(lba, buf)
+        }
+        fn write_sectors(&mut self, lba: u64, buf: &[u8]) -> Result<(), SectorError> {
+            self.note(lba, (buf.len() as u64).div_ceil(512));
+            self.dev.write_sectors(lba, buf)
+        }
+    }
+
+    /// `splitwrite::write_phase`'s write (:4340 fold): the staged blocks through `dev`, the spans tagged `tag` (the
+    /// `RA_GEN` the phase moves to) published before the caller moves it. A failed phase's issued spans are noted too.
+    pub(super) fn write_noted(s: &::unafs::fs::StagedCommit, dev: SdSectorDevice, span: &PartitionSpan, tag: u64) -> bool {
+        let mut spans: Vec<(u64, u64)> = Vec::new();
+        let ok = s.write_staged(&mut BlockAdapter::for_partition(Noting { dev, spans: &mut spans }, span)).is_ok();
+        crate::arch::without_interrupts(|| {
+            let mut w = WROTE.lock();
+            let more: u64 = spans.iter().map(|e| e.1).sum();
+            if w.spans.len() + spans.len() > SPANS_MAX || w.sectors.saturating_add(more) > SECTORS_MAX {
+                w.spans.clear();
+                w.sectors = 0;
+                w.pruned = w.pruned.max(tag);
+            } else {
+                w.sectors += more;
+                w.spans.extend(spans.iter().map(|&(lba, n)| (tag, lba, n)));
+            }
+        });
+        ok
+    }
+
+    /// `splitwrite::ra_sync`'s narrow drop (:4150 fold), inside MOUNT: the windows the spans written since `ra.seen`
+    /// overlap are dropped, the rest kept. `false` = the spans since `ra.seen` are gone: the caller drops every window.
+    pub(super) fn narrow(ra: &mut RaSet, g: u64) -> bool {
+        let seen = ra.seen;
+        crate::arch::without_interrupts(|| {
+            let mut w = WROTE.lock();
+            let ok = seen >= w.pruned;
+            if ok {
+                for &(tag, lba, n) in w.spans.iter() {
+                    if tag <= seen || tag > g {
+                        continue;
+                    }
+                    for s in ra.slots.iter_mut() {
+                        // A zero-length lookup compares only: true when `x` lies in the window (its end inclusive, an over-drop).
+                        if (lba..lba.saturating_add(n)).any(|x| s.lookup(x, &mut [])) {
+                            s.invalidate();
+                        }
+                    }
+                }
+            }
+            let before = w.spans.len();
+            w.spans.retain(|e| e.0 > g);
+            if w.spans.len() != before {
+                w.sectors = w.spans.iter().map(|e| e.2).sum();
+                w.pruned = w.pruned.max(g);
+            }
+            ok
+        })
+    }
+
+    /// `lockhold::chunked`'s per-hold read (:5250 fold): up to `n` bytes at `at` of inode `id` in block steps through the
+    /// crate's `read_data`, stopping once the hold (opened at `h0`) has run `HOLD_BUDGET_US`. A later hold always takes
+    /// its first step (progress); the `first` hold also resolved the path, so it checks the budget before every step.
+    pub(super) fn read_bounded(fs: &mut KernelUnaFS, id: u64, at: u64, n: u64, first: bool, h0: u64) -> Result<Vec<u8>, FileSystemError> {
+        let bs = ::unafs::BLOCK_SIZE;
+        let end = at.saturating_add(n);
+        let (mut out, mut cur) = (Vec::new(), at);
+        while cur < end {
+            if (first || !out.is_empty()) && crate::hidstall::now_us().saturating_sub(h0) >= HOLD_BUDGET_US {
+                break;
+            }
+            let d = fs.read_data(id, cur, (bs - cur % bs).min(end - cur))?;
+            if d.is_empty() {
+                break;
+            }
+            cur += d.len() as u64;
+            out.extend_from_slice(&d);
+        }
+        Ok(out)
+    }
 }
