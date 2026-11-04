@@ -410,7 +410,7 @@ pub fn command(view: &mut View, model: &Model, line: &str) -> Result<bool, Strin
         retint(m, model);
         return Ok(changed);
     }
-    let spec = scan_core::gdt::Callout::parse(rest).map_err(|_| USAGE)?; // VUGSCANGDTSPEC (SR559): the ONE parse; a refusal is the usage
+    let spec = scan_core::gdt::Callout::parse(rest).ok().filter(|s| s.off_mm.is_none()).ok_or(USAGE)?; // VUGSCANGDTPROFILEDATUM (SR567): an unequal zone is the usage (VUG-SCAN-GDT-PROFILE-UZ-WIRE owed); VUGSCANGDTSPEC (SR559): the ONE parse; a refusal is the usage
     let (face, kind, tol_mm) = (spec.face.as_str(), spec.kind, spec.tol_mm);
     let i = m.names.iter().position(|n| n == face).ok_or_else(|| format!("GdtFace {face}"))? as u32;
     if !m.gdt.get(i as usize).is_some_and(|f| f.accepts(kind)) {
@@ -438,7 +438,8 @@ pub fn gdt_line(map: &Map, c: &Callout) -> String {
         scan_core::Verdict::Fail { value_mm, .. } => (format!("{value_mm:.3}"), "FAIL"),
         scan_core::Verdict::Unmeasured => ("none".to_string(), "UNMEASURED"),
     };
-    format!("{name} {}={value} tol={:.3} {v}", c.kind.name(), c.tol_mm)
+    let kind = if c.kind == scan_core::Kind::Profile && map.gdt.get(c.face as usize).is_some_and(|f| f.profile_in_frame_mm.is_some()) { "profile_frame" } else { c.kind.name() }; // VUGSCANGDTPROFILEDATUM (SR567): tools/scan's token when read in the frame
+    format!("{name} {kind}={value} tol={:.3} {v}", c.tol_mm)
 }
 
 /// The corner's callout lines, in the order named.
@@ -498,8 +499,8 @@ pub fn reframe(map: &mut Map) {
     let datums = map.datums;
     let fr = datums.map(|f| frame(&*map, f));
     map.frame = fr;
-    if let Some(Ok(fr)) = map.frame.clone() {
-        scan_core::gdt::in_frame(&mut map.gdt, &fr);
+    if let (Some(Ok(fr)), Ok(d)) = (map.frame.clone(), &map.result) { // VUGSCANGDTPROFILEDATUM (SR567): the deviation for the profile in the frame
+        scan_core::gdt::in_frame(scan, design, d, map.margin_mm, &mut map.gdt, &fr);
     }
 }
 
