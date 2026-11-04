@@ -6920,7 +6920,7 @@ pub mod bootlist {
 #[cfg(all(feature = "login", any(target_arch = "aarch64", feature = "unafs")))]
 fn keyboot_tests() {
     crate::keyring::keyboot_selftest();
-    keyboot_unlock_leg();
+    keyboot_unlock_leg(); keyboot_words_key_leg(); // WORDSPOINTER (B1094): the recovery-words sheet's key path, headless (file tail). LINE-NEUTRAL fold, code first.
 }
 
 /// KEYBOOT2: the unlock leg (see the section head).
@@ -8627,4 +8627,34 @@ fn holdstage_tests() {
         if pass { "PASS" } else { "FAIL" }
     );
     tally(pass);
+}
+
+// ── WORDSPOINTER (rmbp-ledger B1094) — `tests keyboot` gains the WORDS KEY LEG (folded onto `keyboot_tests`' unlock-leg
+// line). The recovery-words sheet's Continue now takes Enter/Space after a 2 s dwell and a 600 ms key-quiet gap; this
+// leg drives the sheet HEADLESS through `login::consume_key` (the key routes' entry) via `login::words_key_leg`: ten
+// back-to-back Enters inside the dwell and an Enter right after another key leave it up (`held=withheld`), `a` past
+// the dwell leaves it up (`letter=withheld`), an Enter after the quiet gap presses Continue (`enter=continued`), and the
+// pointer pin is not held (`pin=released`; the headless sheet never pins). No window, no words, no pin.
+
+/// WORDSPOINTER: the words key leg (see the section head).
+#[cfg(all(feature = "login", any(target_arch = "aarch64", feature = "unafs")))]
+fn keyboot_words_key_leg() {
+    #[cfg(any(all(target_arch = "x86_64", feature = "wc", feature = "unafs"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+    {
+        let (held, letter, enter, pin) = crate::video::crystal::login::words_key_leg();
+        if held == 2 {
+            return serial_println!(":: WORDSKEY: held=none letter=none enter=none -> SKIP (screen up) ::");
+        }
+        let pass = held == 1 && letter == 1 && enter == 1 && pin;
+        serial_println!(
+            ":: WORDSKEY: held={} letter={} enter={} via=key pin={} -> {} ::",
+            if held == 1 { "withheld" } else { "SKIPPED" },
+            if letter == 1 { "withheld" } else { "SKIPPED" },
+            if enter == 1 { "continued" } else { "stuck" },
+            if pin { "released" } else { "HELD" },
+            if pass { "PASS" } else { "FAIL" }
+        );
+    }
+    #[cfg(not(any(all(target_arch = "x86_64", feature = "wc", feature = "unafs"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+    serial_println!(":: WORDSKEY: unlock=not-built -> SKIP (no words sheet in this build) ::");
 }

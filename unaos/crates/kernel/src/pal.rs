@@ -375,7 +375,7 @@ pub mod cursor {
     /// the last report is younger than the auto-hide delay.
     pub fn visible() -> bool {
         let t = LAST_INPUT_MS.load(Ordering::Relaxed);
-        t != 0 && crate::arch::ms().wrapping_sub(t) < HIDE_AFTER_MS
+        t != 0 && (crate::arch::ms().wrapping_sub(t) < HIDE_AFTER_MS || super::cursor_pin_held()) // WORDSPOINTER (rmbp-ledger B1094): while the recovery-words sheet is on the glass the idle expiry is suspended (`cursor_pin`, file tail); the start-hidden half (`t != 0`) stands. LINE-NEUTRAL fold, code first.
     }
 
     /// FOCUS-VIS — whether a REAL pointer report has ever arrived this boot (the `visible()` predicate
@@ -2543,4 +2543,21 @@ pub fn typematic_note_report(newest_press: u8, held: &[u8]) {
         *d = b as u32;
     }
     typematic_note_keys(newest_press as u32, &t[..n]);
+}
+
+// WORDSPOINTER (rmbp-ledger B1094) — THE POINTER PIN. TAIL-APPENDED; its one reader is `cursor::visible()`'s same-line
+// fold. CURSOR-HIDE hides the arrow 1.5 s after the last pointer report; on a CLICK-ONLY modal (the recovery-words sheet,
+// `video::crystal::login`) that hid the one thing the person needed (flight 39 boot 1: `[cursor12] … hidden=8`, Continue
+// found blind). While the pin is held the idle expiry is suspended; an arrow that never reported stays hidden. The pin
+// is set by the sheet when it goes up on the glass and dropped at its Continue — login.rs is its only writer.
+static CURSOR_PIN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// WORDSPOINTER: hold (`true`) or drop (`false`) the pointer pin.
+pub fn cursor_pin(on: bool) {
+    CURSOR_PIN.store(on, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// WORDSPOINTER: whether the pointer pin is held (`cursor::visible()`'s fold; the witness reads it back).
+pub fn cursor_pin_held() -> bool {
+    CURSOR_PIN.load(core::sync::atomic::Ordering::Relaxed)
 }
