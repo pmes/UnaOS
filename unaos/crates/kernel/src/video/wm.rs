@@ -1941,7 +1941,7 @@ fn pace_admit(id: WinId, exempt: bool) -> bool {
 /// bounded scan of [`MAX_WINDOWS`] stamps, no locks.
 #[cfg(all(target_arch = "x86_64", feature = "wc"))]
 pub fn pace_service() {
-    use core::sync::atomic::Ordering::Relaxed; gesture_service(); close_owed_run(); // CONTINUE-CLOSE-DRAIN (B1129): the login row the session press hid is closed here, off the press (file tail). PINCHZOOM (B735): a three-finger swipe the trackpad latched is acted on here, ahead of the pacer's early return (one relaxed load when none). LINE-NEUTRAL fold, code first
+    use core::sync::atomic::Ordering::Relaxed; gesture_service(); close_owed_run(); veil_rebuild_run(); // VEIL-HELD-REPREF (B1135): a held login field's in-place rebuild after a pref move, one bounded slice per pass (file tail). CONTINUE-CLOSE-DRAIN (B1129): the login row the session press hid is closed here, off the press (file tail). PINCHZOOM (B735): a three-finger swipe the trackpad latched is acted on here, ahead of the pacer's early return (one relaxed load when none). LINE-NEUTRAL fold, code first
     if !PACE_PENDING_ANY.swap(false, Relaxed) {
         return;
     }
@@ -33650,4 +33650,17 @@ fn close_owed_run() {
     let _ = close(id);
     let _ = CLOSE_OWED.compare_exchange(id, WIN_NONE, AcqRel, Acquire);
     serial_println!("[wm] close owed win={} after_ms={} on=svc", id, after_ms);
+}
+
+// VEIL-HELD-REPREF (rmbp-ledger B1135) — TAIL-APPENDED, so no line above moves. A Reduce transparency move no longer drops a
+// HELD login field (the raise then paid the whole build in its route, ~72.6 ms at 2880x1800): the field is kept and its
+// rebuild is owed to this device-service pass, which recomposes it in place one bounded slice per pass after B1129's
+// `close_owed_run` (`wallpaper::veil_login_svc`: one relaxed load when nothing is owed). `wallpaper` rides `facet`.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+#[inline]
+fn veil_rebuild_run() {
+    #[cfg(feature = "facet")]
+    {
+        crate::video::wallpaper::veil_login_svc();
+    }
 }
