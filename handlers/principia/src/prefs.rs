@@ -967,3 +967,78 @@ mod tests {
         assert_eq!(iso_of(951_782_400), "2000-02-29T00:00:00Z");
     }
 }
+
+// ---- VUGPHOTOPREFFACEWIRE (SR588): PrefStore::unset, a key leaves the store (named tail block) ----
+// The store had no road for "back to the default": a consumer-default row (`Default::Consumer`) has no value to
+// write, and a sentinel is either clamped or a stored value. prefs_core already owns the concept (`PrefTree::remove`,
+// PREFSUNSET SR169's `wire::unset_body`, the kernel's `retire`); this is the host store's half, on `set`'s own road.
+
+impl PrefStore {
+    /// Unset `ns`/`key` and persist its DOMAIN's file atomically (the same swap as [`PrefStore::set`]); a reader then
+    /// answers the consumer's (or the schema's) default. An emptied namespace disappears; an emptied domain's file
+    /// stays as its header. `Ok(true)` when a value left the store, `Ok(false)` when it was unset already (nothing is
+    /// written). Errors on a malformed namespace/key, a held domain, or a failed write — and on error the in-memory
+    /// cache is left exactly as it was.
+    pub fn unset(&mut self, ns: &str, key: &str) -> Result<bool> {
+        validate_ns(ns)?;
+        validate_key(key)?;
+        let domain = files::domain_of(ns, key);
+        if self.held.contains(&domain) {
+            bail!("held: settings/{domain} was refused at load; fix or delete it");
+        }
+        let Some(entry) = self.namespaces.get_mut(ns) else { return Ok(false) };
+        let Some(old) = entry.remove(key) else { return Ok(false) };
+        if entry.is_empty() {
+            self.namespaces.remove(ns);
+        }
+        if let Err(e) = self.save_domain(&domain) {
+            // Roll the cache back to the persisted truth.
+            self.namespaces.entry(ns.to_string()).or_default().insert(key.to_string(), old);
+            return Err(e);
+        }
+        Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod unset_tests {
+    use super::*;
+
+    /// VUGPHOTOPREFFACEWIRE (SR588): two `vug` keys set, one unset -> a reload reads it unset and the other kept; a
+    /// second unset is `Ok(false)` and rewrites nothing; the last unset leaves `settings/vug` a header that parses to
+    /// the empty tree and a reload with no `vug` namespace; a held domain refuses the unset and keeps the user's file.
+    #[test]
+    fn unset_round_trips_through_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let sd = dir.path().join(files::DIR);
+        let mut s = PrefStore::load(&sd).unwrap();
+        s.set("vug", "photo.camera_mm", PrefValue::Float(400.0)).unwrap();
+        s.set("vug", "photo.principal_px", PrefValue::Str("250,320".into())).unwrap();
+        assert!(s.unset("vug", "photo.camera_mm").unwrap(), "a value left the store");
+        assert_eq!(s.get("vug", "photo.camera_mm"), None);
+        let back = PrefStore::load(&sd).unwrap();
+        assert_eq!(back.get("vug", "photo.camera_mm"), None, "the file no longer holds it");
+        assert_eq!(back.get("vug", "photo.principal_px"), Some(PrefValue::Str("250,320".into())), "the other key kept");
+
+        let before = fs::read_to_string(sd.join("vug")).unwrap();
+        assert!(!s.unset("vug", "photo.camera_mm").unwrap(), "unset already");
+        assert_eq!(fs::read_to_string(sd.join("vug")).unwrap(), before, "nothing rewritten");
+        assert!(!s.unset("nothing", "here").unwrap(), "an unknown namespace is unset already");
+        assert!(s.unset("vug", "").is_err(), "a malformed key is refused");
+
+        assert!(s.unset("vug", "photo.principal_px").unwrap());
+        assert_eq!(s.namespaces(), Vec::<String>::new(), "the emptied namespace disappears");
+        let text = fs::read_to_string(sd.join("vug")).unwrap();
+        assert!(PrefTree::parse(&text).expect("the header-only file parses").entries().next().is_none(), "{text}");
+        let back = PrefStore::load(&sd).unwrap();
+        assert_eq!(back.list("vug"), Vec::new());
+        assert!(back.held().is_empty());
+
+        let bad = "[vug]\nphoto.camera_mm = [1, 2]\n";
+        fs::write(sd.join("vug"), bad).unwrap();
+        let mut held = PrefStore::load(&sd).unwrap();
+        assert_eq!(held.held(), ["vug"]);
+        assert!(held.unset("vug", "photo.camera_mm").is_err(), "held");
+        assert_eq!(fs::read_to_string(sd.join("vug")).unwrap(), bad, "the user's file is untouched");
+    }
+}

@@ -1302,7 +1302,7 @@ fn xy(s: &str) -> Option<Vec2> {
 // ---- VUGPHOTOCROPMETA (SR582): the photo's command road, writing the camera's datum to Principia's store (named tail block) ----
 
 /// The usage the photo's command road refuses with.
-pub const PREF_USAGE: &str = "usage: camera <mm> | pp <x> <y>";
+pub const PREF_USAGE: &str = "usage: camera <mm>|clear | pp <x> <y>|clear"; // VUGPHOTOPREFFACEWIRE (SR588): clear
 
 /// One line on the photo's command road in the standard store ([`command_in`] on `principia::default_prefs_path()`).
 pub fn command(view: &mut View, line: &str) -> Result<bool, String> {
@@ -1315,9 +1315,10 @@ pub fn command(view: &mut View, line: &str) -> Result<bool, String> {
 /// is folded into the open photo's prefs by [`PhotoPrefs::from_prefs`]'s rules, so the next side read and open take it;
 /// the corner reads `pref camera=<mm> mm stored` / `pref pp=<x>,<y> stored` (` clamped` when the schema clamped it).
 /// Refused by name, nothing stored: [`PREF_USAGE`] (anything else, or a number that is not finite), `pref: <why>` (the
-/// store did not load or refused the value). True when stored.
+/// store did not load or refused the value). True when stored. VUGPHOTOPREFFACEWIRE (SR588): `camera clear` / `pp clear`
+/// unset the key ([`clear_in`]).
 pub fn command_in(view: &mut View, dir: &std::path::Path, line: &str) -> Result<bool, String> {
-    let words: Vec<&str> = line.split_whitespace().collect();
+    let words: Vec<&str> = line.split_whitespace().collect(); if let Some(r) = clear_in(view, dir, &words) { return r; } // VUGPHOTOPREFFACEWIRE (SR588): `camera clear` / `pp clear` unset the key
     let finite = |t: &str| t.parse::<f64>().ok().filter(|v| v.is_finite());
     let (key, value) = match words.as_slice() {
         ["camera", mm] => ("photo.camera_mm", bandy::PrefValue::Float(finite(*mm).ok_or(PREF_USAGE)?)),
@@ -1428,4 +1429,39 @@ fn extrude_named(view: &mut View, i: usize, doc: &Doc, p: &Proposal, x: (String,
         return Some(true);
     };
     Some(enter_extrude(view, i, (slot, dir, length)))
+}
+
+// ---- VUGPHOTOPREFFACEWIRE (SR588): clearing the camera's datum (named tail block) ----
+
+/// `camera clear` / `pp clear` on the photo's command road ([`command_in`]'s first look; None for every other line):
+/// `vug.photo.camera_mm` / `vug.photo.principal_px` leave Principia's store in `dir` (`principia::PrefStore::unset`,
+/// the domain file rewritten by the store's own swap) and the open photo's prefs, so the next side read takes the
+/// lattice's own camera solve and the next open the photo's centre (the consumer defaults). The corner reads
+/// `pref camera cleared` / `pref pp cleared` (` (was unset)` when nothing was stored); a refusal is
+/// [`command_in`]'s (`refused pref: <why>` on the corner, `Err("pref: <why>")`). Ok(true) when a value left the store.
+fn clear_in(view: &mut View, dir: &std::path::Path, words: &[&str]) -> Option<Result<bool, String>> {
+    let (key, name) = match words {
+        ["camera", "clear"] => ("photo.camera_mm", "camera"),
+        ["pp", "clear"] => ("photo.principal_px", "pp"),
+        _ => return None,
+    };
+    let gone = match principia::PrefStore::load(dir).and_then(|mut store| store.unset(PREF_NS, key)) {
+        Ok(gone) => gone,
+        Err(e) => {
+            let text = format!("pref: {e}");
+            if let Some(ph) = view.photo.as_mut() {
+                ph.note = Some(format!("refused {text}"));
+            }
+            return Some(Err(text));
+        }
+    };
+    if let Some(ph) = view.photo.as_mut() {
+        if key == "photo.camera_mm" {
+            ph.prefs.camera_mm = None;
+        } else {
+            ph.prefs.principal_px = None;
+        }
+        ph.note = Some(format!("pref {name} cleared{}", if gone { "" } else { " (was unset)" }));
+    }
+    Some(Ok(gone))
 }

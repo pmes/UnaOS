@@ -904,3 +904,51 @@ fn a_single_extrude_offered_before_a_panel_delete_enters_in_the_journal_names() 
     let x = vw.view.design.journal.doc.stmts.iter().find(|s| matches!(s, doc_core::Stmt::Extrude { .. })).expect("the extrude entered");
     assert!(matches!(x, doc_core::Stmt::Extrude { outer: o, .. } if *o == outer), "the journal's outer is the one offered: {x:?}");
 }
+
+// ---- VUGPHOTOPREFFACEWIRE (SR588): the flags' lines on the command road, and clearing a pref ----
+
+/// VUGPHOTOPREFFACEWIRE (SR588): `camera 400` (the line main.rs's `--camera 400` hands photo::command) stores the height
+/// and the square-camera side reads `camera=400 mm set`; `camera clear` unsets `vug.photo.camera_mm` in Principia's store
+/// and the open photo (corner `pref camera cleared`), so the tilted raised side then reads `... mm lattice` and the square
+/// side refuses NoCamera by name; a second clear is `Ok(false)` (`(was unset)`); `pp 250 320` then `pp clear` leaves no
+/// principal point in the store or the photo.
+#[test]
+fn a_camera_flag_line_sets_the_side_and_clear_returns_it_to_the_lattice() {
+    use photo_core::fixture::{PART_H, PART_T, PART_W, Spec, side_raised_png};
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("vug-photo-clear-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let square = side_raised_png(&Spec::side_square(), PART_W, PART_T, PART_H);
+    let raised = side_raised_png(&Spec::side_raised(), PART_W, PART_T, PART_H);
+    let mut vw = opened();
+    assert_eq!(photo::command_in(&mut vw.view, &dir, "camera 400"), Ok(true));
+    let stored = ph(&vw).note.clone().unwrap_or_default();
+    assert_eq!(stored, "pref camera=400 mm stored");
+    photo::side(&mut vw.view, &square, "square.png").expect("the square photo measures with the stored camera height");
+    let set = ph(&vw).note.clone().unwrap_or_default();
+    assert!(set.contains("camera=400 mm set"), "{set}");
+
+    assert_eq!(photo::command_in(&mut vw.view, &dir, "camera clear"), Ok(true));
+    let cleared = ph(&vw).note.clone().unwrap_or_default();
+    assert_eq!(cleared, "pref camera cleared");
+    assert_eq!(ph(&vw).prefs.camera_mm, None, "the open photo dropped it");
+    assert_eq!(photo::PhotoPrefs::load_from(&dir).camera_mm, None, "the store dropped it");
+
+    photo::side(&mut vw.view, &raised, "raised.png").expect("the raised side photo measures with the lattice's camera");
+    let lattice = ph(&vw).note.clone().unwrap_or_default();
+    eprintln!("photo: pref-clear {stored} | {set} | {cleared} | {lattice}");
+    assert!(lattice.contains("camera=") && lattice.ends_with("mm lattice"), "{lattice}");
+    let e = photo::side(&mut vw.view, &square, "square.png").expect_err("a square camera with the height cleared");
+    assert!(e.contains("NoCamera"), "{e}");
+
+    assert_eq!(photo::command_in(&mut vw.view, &dir, "camera clear"), Ok(false));
+    assert_eq!(ph(&vw).note.as_deref(), Some("pref camera cleared (was unset)"));
+
+    assert_eq!(photo::command_in(&mut vw.view, &dir, "pp 250 320"), Ok(true));
+    assert_eq!(ph(&vw).prefs.principal_px, Some(Vec2::new(250.0, 320.0)));
+    assert_eq!(photo::command_in(&mut vw.view, &dir, "pp clear"), Ok(true));
+    assert_eq!(ph(&vw).note.as_deref(), Some("pref pp cleared"));
+    let prefs = photo::PhotoPrefs::load_from(&dir);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(prefs, photo::PhotoPrefs::default());
+    assert_eq!(ph(&vw).prefs, prefs);
+}
