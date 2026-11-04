@@ -54,6 +54,7 @@ fn fuse(noise: &Noise, guard: Guard, scale: DepthScale, phase_rad: f64) -> (Scan
         let f = fixture::render_depth(&scene, &intr, scale, &p, noise, k as u64);
         t.integrate(&f, scale, &intr, &p).expect("frame integrates");
     }
+    println!("tsdf-probe: fuse blocks={} voxel_bytes={} spread_bytes={}", t.blocks(), t.blocks() * 512 * 8, t.blocks() * 512 * 4); // VUGSCANTSDFCONFIDENCE (SR586) M1
     (extract(&t).expect("surface"), t.trunc_mm())
 }
 
@@ -553,9 +554,11 @@ fn probe_table(label: &str, f: &FaceGdt, s: &ScanMesh, dev: &Deviation, frames: 
                 (acc.0, acc.1, acc.2, acc.3) = (acc.0 + t.0, acc.1 + t.1, acc.2 + t.2, acc.3 + t.3); // VUGSCANTSDFEDGELATERAL (SR574) M1
             }
             let g = ((p.x / 4.0).floor() as i64, (p.y / 4.0).floor() as i64, (p.z / 4.0).floor() as i64);
+            let v = votes(p, frames, trunc); // VUGSCANTSDFCONFIDENCE (SR586) M1
             println!(
-                "tsdf-probe: {label} {set} {n:2} voxel=({},{},{}) at=({:.1},{:.1},{:.1}) dev={d:+.3} off_median={:+.3} boundary={bdist:.1} normal={nang:.1}deg saw={}/12 edge={} shadow={} graze={:.1}-{:.1}deg lat_mis={}/{} lat_free={}/{}",
-                g.0, g.1, g.2, p.x, p.y, p.z, d - med, c.saw, c.edge, c.shadow, c.graze.0, c.graze.1, c.mis.0, c.mis.1, c.free.0, c.free.1
+                "tsdf-probe: {label} {set} {n:2} voxel=({},{},{}) at=({:.1},{:.1},{:.1}) dev={d:+.3} off_median={:+.3} boundary={bdist:.1} normal={nang:.1}deg saw={}/12 edge={} shadow={} graze={:.1}-{:.1}deg lat_mis={}/{} lat_free={}/{} conf_w={:.2} conf_s={:.3} hole={}",
+                g.0, g.1, g.2, p.x, p.y, p.z, d - med, c.saw, c.edge, c.shadow, c.graze.0, c.graze.1, c.mis.0, c.mis.1, c.free.0, c.free.1,
+                s.confidence.get(i).copied().unwrap_or(0.0), v.2, v.3
             );
         }
         println!("tsdf-probe: {label} {set} worst{n} edge>0={edge} shadow>0={shadow} graze>75={graze} median={med:+.3}");
@@ -574,6 +577,139 @@ fn probe_table(label: &str, f: &FaceGdt, s: &ScanMesh, dev: &Deviation, frames: 
     printed
 }
 
+// ---- VUGSCANTSDFCONFIDENCE (LEDGER SR586) M1: per-voxel confidence measured before it is built ----
+// The voxel's weight (the observation count, BP-vug-5) is already the mesh's `confidence`; the spread of the votes it
+// averaged would need a second accumulator (a sum of squares, one f32 a voxel). `votes` recomputes, at a vertex, the
+// votes `integrate` folds there from the fuse's own frames (the spread a second accumulator would hold, read at the
+// vertex instead of interpolated from its cube's corners); `confidence_leg` reads whether either separates the post's
+// worst form vertices and what the post reads with a confidence floor (weight under the form set's 10th percentile
+// dropped, `deviation::floored`) or a spread ceiling (spread over its 90th percentile dropped), every face gated by the
+// same rule. MEASURE: PASS (the seat): the spread refused, the floor built default OFF.
+
+/// The votes the fixture's cameras cast at point `p` as `integrate` folds them (the floor pixel's depth minus the
+/// camera depth, skipped beyond -`trunc`, clamped to +`trunc`): (count, mean, spread = the population standard
+/// deviation, the cameras whose floor pixel has a hole (raw 0) in its 3x3).
+fn votes(p: Vec3, frames: &[(Transform, Frame)], trunc: f64) -> (u32, f64, f64, u32) {
+    let (intr, scale) = (fixture::bench_intrinsics(), DepthScale::D400_DEFAULT);
+    let (mut n, mut sum, mut sq, mut hole) = (0u32, 0.0f64, 0.0f64, 0u32);
+    for (cam, f) in frames {
+        let Ok(inv) = cam.invert() else { continue };
+        let q = inv.apply_point(p);
+        if q.z <= 0.0 {
+            continue;
+        }
+        let Some(uv) = intr.project([(q.x / 1000.0) as f32, (q.y / 1000.0) as f32, (q.z / 1000.0) as f32]) else { continue };
+        if !(uv[0] >= 0.0 && uv[1] >= 0.0) {
+            continue;
+        }
+        let (px, py) = (uv[0] as u32, uv[1] as u32);
+        let Some(m) = f.u16_at(px, py).and_then(|raw| scale.metres(raw)) else { continue };
+        let dz = m as f64 * 1000.0 - q.z;
+        if dz < -trunc {
+            continue;
+        }
+        let v = dz.min(trunc);
+        (n, sum, sq) = (n + 1, sum + v, sq + v * v);
+        let near_hole = (-1i64..=1).any(|dy| {
+            (-1i64..=1).any(|dx| {
+                let (x, y) = (px as i64 + dx, py as i64 + dy);
+                x >= 0 && y >= 0 && f.u16_at(x as u32, y as u32) == Some(0)
+            })
+        });
+        hole += near_hole as u32;
+    }
+    if n == 0 {
+        return (0, 0.0, 0.0, hole);
+    }
+    let mean = sum / n as f64;
+    (n, mean, (sq / n as f64 - mean * mean).max(0.0).sqrt(), hole)
+}
+
+/// The `q` quantile of `v` (nearest rank); NaN when empty.
+fn quantile(mut v: Vec<f64>, q: f64) -> f64 {
+    if v.is_empty() {
+        return f64::NAN;
+    }
+    v.sort_by(|a, b| a.total_cmp(b));
+    v[((v.len() - 1) as f64 * q).round() as usize]
+}
+
+/// `dev` with every paired vertex `keep` refuses unpaired (the refused spread ceiling's record; the weight floor is
+/// `deviation::floored`).
+fn gated(dev: &Deviation, keep: impl Fn(usize) -> bool) -> Deviation {
+    let mut out = dev.clone();
+    for (i, (pv, fv)) in out.per_vertex.iter_mut().zip(out.face_of_vertex.iter_mut()).enumerate() {
+        if pv.is_some() && !keep(i) {
+            (*pv, *fv) = (None, None);
+        }
+    }
+    out
+}
+
+/// The confidence leg of one fuse (the guard off) at noise `nname` over its own `frames`.
+fn confidence_leg(nname: &str, s: &ScanMesh, d: &Design, dev: &Deviation, g: &[FaceGdt], frames: &[(Transform, Frame)], trunc: f64) {
+    let pf = post(g);
+    let cos = GDT_NORMAL_DEG.to_radians().cos();
+    let spread: Vec<f64> = (0..s.mesh.positions.len())
+        .map(|i| if dev.per_vertex.get(i).is_some_and(Option::is_some) { votes(s.mesh.positions[i], frames, trunc).2 } else { 0.0 })
+        .collect();
+    let conf = |i: usize| s.confidence.get(i).copied().unwrap_or(0.0) as f64;
+    // The post's known-scene form set (probe_table's rule): (vertex, deviation).
+    let mut set: Vec<(usize, f64)> = Vec::new();
+    for (i, (fv, dv)) in dev.face_of_vertex.iter().zip(&dev.per_vertex).enumerate() {
+        let (Some(fv), Some(dv)) = (fv, dv) else { continue };
+        if *fv != pf.face {
+            continue;
+        }
+        let p = s.mesh.positions[i];
+        let (nn, bdist) = oracle(&pf, p);
+        let sn = s.normals.get(i).copied().unwrap_or(Vec3::ZERO);
+        if bdist < trunc || sn.mag_sq() == 0.0 || sn.dot(nn).abs() < cos * sn.mag() {
+            continue;
+        }
+        set.push((i, *dv));
+    }
+    let med = quantile(set.iter().map(|r| r.1).collect(), 0.5);
+    let (w, sp): (Vec<f64>, Vec<f64>) = set.iter().map(|r| (conf(r.0), spread[r.0])).unzip();
+    let (floor_w, ceil_s) = (quantile(w.clone(), 0.10), quantile(sp.clone(), 0.90));
+    let mut worst = set.clone();
+    worst.sort_by(|a, b| (b.1 - med).abs().total_cmp(&(a.1 - med).abs()));
+    worst.truncate(20);
+    let ww: Vec<f64> = worst.iter().map(|r| conf(r.0)).collect();
+    let ws: Vec<f64> = worst.iter().map(|r| spread[r.0]).collect();
+    println!(
+        "tsdf-probe: noise={nname} conf post form n={} conf_w p10={floor_w:.2} p50={:.2} worst20 p50={:.2} under_floor={}/{} conf_s p50={:.3} p90={ceil_s:.3} worst20 p50={:.3} over_ceil={}/{}",
+        set.len(),
+        quantile(w, 0.5),
+        quantile(ww.clone(), 0.5),
+        ww.iter().filter(|x| **x < floor_w).count(),
+        ww.len(),
+        quantile(sp, 0.5),
+        quantile(ws.clone(), 0.5),
+        ws.iter().filter(|x| **x > ceil_s).count(),
+        ws.len()
+    );
+    let floored = scan_core::deviation::floored(dev, s, floor_w as f32); // the floor, the crate's one mechanism
+    for (rule, gd) in [("floor_w", floored), ("ceil_s", gated(dev, |i| spread[i] <= ceil_s))] {
+        let g2 = gdt(s, d, &gd, trunc, Tol::DEFAULT);
+        let (t2, p2) = (top(&g2), post(&g2));
+        println!(
+            "tsdf-probe: noise={nname} conf {rule} top flatness={:?} n={}/{} post cylindricity={:?} position={:?} n={}/{} (off: top {:?} n={} post {:?} n={})",
+            t2.flatness_mm,
+            t2.n,
+            t2.matched,
+            p2.cylindricity_mm,
+            p2.position_mm,
+            p2.n,
+            p2.matched,
+            top(g).flatness_mm,
+            top(g).n,
+            pf.cylindricity_mm,
+            pf.n
+        );
+    }
+}
+
 #[test]
 fn tsdf_outliers_probe() {
     let (d, _) = design();
@@ -581,6 +717,9 @@ fn tsdf_outliers_probe() {
     let frames: Vec<(Transform, Frame)> =
         (0..12u32).map(|k| (pose(k), fixture::render_depth(&scene, &intr, scale, &pose(k), &Noise::NONE, k as u64))).collect();
     for (noise, nname) in [(Noise::NONE, "none"), (Noise::D435I, "d435i")] {
+        // VUGSCANTSDFCONFIDENCE (SR586) M1: the fuse's own frames at this noise (render_depth is seeded per frame).
+        let nframes: Vec<(Transform, Frame)> =
+            (0..12u32).map(|k| (pose(k), fixture::render_depth(&scene, &intr, scale, &pose(k), &noise, k as u64))).collect();
         // The guards at the volume's own truncation (read from the volume, no second constant): off, SR555's
         // both-sides rule, SR562's far-side rule.
         for (guard, gname) in [(Guard::Off, "off"), (Guard::Both, "both"), (Guard::Far, "far")] {
@@ -600,6 +739,9 @@ fn tsdf_outliers_probe() {
                 p.matched,
                 dev.stats.rms_mm
             );
+            if guard == Guard::Off {
+                confidence_leg(nname, &s, &d, &dev, &g, &nframes, trunc); // VUGSCANTSDFCONFIDENCE (SR586) M1
+            }
             if guard != Guard::Off {
                 assert!(t.flatness_mm.is_some_and(f64::is_finite) && p.cylindricity_mm.is_some_and(f64::is_finite), "guard-{gname} values finite");
             }
@@ -784,3 +926,26 @@ fn knobs_carry_through_reintegrate() {
     assert_eq!((t2.frames(), t2.blocks()), (t.frames(), t.blocks()), "the same frames at the same poses fill the same blocks");
 }
 
+// ---- VUGSCANTSDFCONFIDENCE (LEDGER SR586): the confidence floor ----
+
+/// `deviation::floored` at 0.0 is the identity; at a floor above every vertex's confidence it unpairs every vertex;
+/// at the fixture's median weight it unpairs exactly the paired vertices under it.
+#[test]
+fn the_confidence_floor_unpairs_only_under_it() {
+    let (_, _, dev) = measured();
+    let s = scan();
+    assert_eq!(&scan_core::deviation::floored(dev, s, 0.0), dev, "floor 0.0 is OFF");
+    let ceiling = s.confidence.iter().copied().fold(0.0f32, f32::max) + 1.0;
+    let none = scan_core::deviation::floored(dev, s, ceiling);
+    assert!(none.per_vertex.iter().all(Option::is_none) && none.face_of_vertex.iter().all(Option::is_none), "a floor above every weight unpairs all");
+    let mut w: Vec<f32> = s.confidence.clone();
+    w.sort_by(|a, b| a.total_cmp(b));
+    let mid = w[w.len() / 2];
+    let half = scan_core::deviation::floored(dev, s, mid);
+    for (i, (a, b)) in dev.per_vertex.iter().zip(&half.per_vertex).enumerate() {
+        let under = s.confidence[i] < mid;
+        assert_eq!(b.is_some(), a.is_some() && !under, "vertex {i}: kept iff paired and not under the floor");
+        assert_eq!(half.face_of_vertex[i].is_some(), b.is_some(), "vertex {i}: face pairing follows");
+    }
+    assert_eq!(half.stats, dev.stats, "stats stay as measured");
+}
