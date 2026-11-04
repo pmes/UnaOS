@@ -228,7 +228,7 @@ pub fn witness() {
     let limit = win_limit();
     let refused = OPENS_REFUSED.load(Relaxed);
     let mem_bound = limit == MEM_WIN.load(Relaxed);
-    serial_println!(
+    if !crate::boot::session_fold() { serial_println!( // SESSIONLINEFOREIGN (rmbp-ledger B1130): folds on the session press into `[session] opened … deferred=` (boot.rs tail, B1121); the ignition at boot (no fold open) prints. LINE-NEUTRAL, code first
         ":: WINDOWCAP: fixed_cap={} limit={} procs={} from=mem:{} opens_refused={} -> {} ::",
         if mem_bound { "none" } else { "type:u32" },
         limit,
@@ -236,7 +236,7 @@ pub fn witness() {
         MEM_MIB.load(Relaxed),
         refused,
         if limit >= 11 && refused == 0 { "armed" } else { "declined" }
-    );
+    ); }
 }
 
 /// SMALLFIX6 (rmbp-ledger B495) — `tests windowcap` (R80: run only when asked). Flight 26 typed it and got

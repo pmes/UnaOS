@@ -12206,8 +12206,8 @@ mod yieldsite {
 // ── F39HIDPLACERENDER (rmbp-ledger B1118) — HID-WAIT-WHO-ARM: the hid pump core's tick names who ran while the pass was overdue. ──
 // `timer_preempt` (every core's tick, IRQ masked) hands this core's own non-null `current` here; `hidstall::wait_tick` gates on
 // the hid pump's core and runs the closure only there, then votes through `hidstall::wait_who_tick` (the x86 tick's shape,
-// x86_64/sched.rs tail). No aarch64 HID pass stamps `pump_here`/`pass_begin` yet, so `pump_cpu()` reads none and this samples
-// nothing until one does (HID-PUMP-ARM owed). FILE-TAIL append.
+// x86_64/sched.rs tail). aarch64's HID pass stamps `pump_here`/`pass_begin` since F39HIDPUMPARM (B1124, main.rs's two pumps), so
+// this samples the pass's core and the gap split's `who=` reads `?` only when no tick sampled. FILE-TAIL append.
 
 /// F39HIDPLACERENDER (B1118): the pump core's tick sample — one `PUMP_CPU` load and compare on every other core.
 #[inline]
