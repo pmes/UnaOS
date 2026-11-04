@@ -137,8 +137,9 @@ pub enum Reason {
     /// Nothing to measure against: no solved sketch with a profile (outline), no solid (points).
     NoGeometry,
     Tess(brep_core::Refusal),
-    /// The max distance is past `K_SIGMA` x sigma.
-    Residual { max_mm: f64, limit_mm: f64 },
+    /// The max distance is past `K_SIGMA` x sigma. VUGINTENTUNDOSET (SR563): `term` names the measurement whose distance
+    /// was the max ([`Measurement::term`]: "outline", "points", "shapes", "thickness").
+    Residual { max_mm: f64, limit_mm: f64, term: &'static str },
     /// The RMS grew past the document's own by more than sigma.
     Worse { rms_mm: f64, before_mm: f64, sigma_mm: f64 },
     /// VUGINTENTHOLES (SR507): a replayed profile loop or a measured loop has no partner (no loop of the other side
@@ -164,8 +165,8 @@ impl Reason {
             Reason::BadMeasurement => String::from("bad-measurement"),
             Reason::NoGeometry => String::from("no-geometry"),
             Reason::Tess(r) => format!("tess {:?}", r),
-            Reason::Residual { max_mm, limit_mm } => {
-                format!("residual max={} limit={}", f64_text(*max_mm), f64_text(*limit_mm))
+            Reason::Residual { max_mm, limit_mm, term } => {
+                format!("residual max={} limit={} term={}", f64_text(*max_mm), f64_text(*limit_mm), term) // VUGINTENTUNDOSET (SR563)
             }
             Reason::Worse { rms_mm, before_mm, sigma_mm } => format!(
                 "worse rms={} before={} sigma={}",
@@ -294,7 +295,7 @@ fn judge_cand(doc: &Doc, cand: &Doc, m: &Measurement, tol: Tol) -> Result<Verdic
     let fit = residual(&after, m, tol, Some(&before))?;
     let limit = K_SIGMA * sigma;
     if fit.max > limit {
-        return Err(Reason::Residual { max_mm: fit.max, limit_mm: limit });
+        return Err(Reason::Residual { max_mm: fit.max, limit_mm: limit, term: m.term() }); // VUGINTENTUNDOSET (SR563)
     }
     if let Ok(b) = residual(&before, m, tol, None) {
         if fit.rms > b.rms + sigma {
@@ -1111,4 +1112,19 @@ fn thickness_residual(r: &Replay, mm: f64, sigma_mm: f64, along: Vec3, tol: Tol,
     }
     d.push((hi - lo - mm).abs());
     Ok(())
+}
+
+// ---- VUGINTENTUNDOSET (SR563): the residual's term (named tail block) ----
+
+impl Measurement {
+    /// The term a [`Reason::Residual`] names: which measurement the max distance was against — the word
+    /// [`measurements_text`] heads its first line with.
+    pub fn term(&self) -> &'static str {
+        match self {
+            Measurement::Outline { .. } => "outline",
+            Measurement::Points { .. } => "points",
+            Measurement::Shapes { .. } => "shapes",
+            Measurement::Thickness { .. } => "thickness",
+        }
+    }
 }
