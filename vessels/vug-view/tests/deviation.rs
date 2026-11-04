@@ -937,3 +937,43 @@ fn a_report_writes_the_corner_lines_beside_the_part() {
     assert_eq!(text, scan_core::gdt::report_text("part.vug", 0, &tag, &want), "scan_core's formatter on scan_core's reading");
 }
 
+
+// VUGFACEJOURNALFAULTFIX (LEDGER SR578): the shown panel covers the frame's right quarter; the corner's lines move left
+// of it (deviation::corner_origin, the one right edge the paint and the hit read), and a click on the moved fault line
+// still selects its statement.
+
+#[test]
+fn the_corner_moves_left_of_the_shown_panel_and_its_fault_click_hits() {
+    use vug_view::deviation::{LINE_PX, corner_origin, line_at};
+    let doc = doc_core::read(&format!("{DOC}{DRILL}")).expect("the document reads");
+    let mut v = Viewer::open_doc(doc, "fixture", SIZE, Preset::Una).expect("an Op's fault opens as the journal");
+    v.against_journal(scan().clone()).expect("the journal measures");
+    assert_eq!(corner_origin(&v.view, SIZE.0), SIZE.0, "panel hidden: the frame's right edge");
+    assert!(v.key("t"), "t shows the panel");
+    let x0 = vug_view::journal::panel_x0(SIZE.0);
+    let right = corner_origin(&v.view, SIZE.0);
+    assert_eq!(right, x0 as u32, "panel shown: its left edge");
+    let lines = corner(v.view.deviation.as_ref().unwrap());
+    for (i, l) in lines.iter().enumerate() {
+        let t = l.to_uppercase();
+        let n = 8.0 * t.chars().count() as f32;
+        if n + 6.0 <= right as f32 {
+            let (x, _) = line_at(right, &t, i);
+            assert!(x + n <= x0, "line {i} clears the panel: {t}");
+        }
+    }
+    let (i, line) = lines.iter().enumerate().find(|(_, l)| l.starts_with("fault line ")).expect("a fault line on the corner");
+    let n: u32 = line["fault line ".len()..].split(':').next().unwrap().parse().expect("its line number");
+    let text = line.to_uppercase();
+    let (fx, fy) = line_at(right, &text, i);
+    let (x, y) = ((fx + 4.0 * text.chars().count() as f32) as f64, (fy + LINE_PX * 0.5) as f64);
+    assert!((x as f32) < x0, "the click is left of the panel");
+    let o1 = v.view.design.journal.doc.stmts.iter().position(|s| s.id() == Some("o1")).expect("the Op");
+    v.view.design.journal.cursor = 0;
+    v.input(&bandy::SMessage::BrowserButton { down: true, x, y, mods: 0, surface: 0 });
+    assert!(v.input(&bandy::SMessage::BrowserButton { down: false, x, y, mods: 0, surface: 0 }), "the click is taken");
+    let j = &v.view.design.journal;
+    println!("corner right hidden={} shown={right} fault line {n} -> row {}", SIZE.0, j.cursor);
+    assert!(j.panel, "the panel stays shown");
+    assert_eq!((j.cursor, j.doc.line(j.cursor)), (o1, n), "the moved fault line selects the faulted statement");
+}

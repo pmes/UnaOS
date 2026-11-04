@@ -449,3 +449,56 @@ fn a_doc_with_an_op_naming_no_machine_opens_with_its_fault_and_a_body() {
     let e = Viewer::open_doc(d, "box", (W, H), Preset::Una).err().expect("a solid's fault refuses");
     assert!(e.starts_with("line ") && e.contains("Conflicting"), "{e}");
 }
+
+// VUGFACEJOURNALFAULTFIX (LEDGER SR578): the box and drill with the shop's library machine; the panel deletes the machine
+// row, the drill turns red (NoMachine), the one machine the undo history holds is offered on the drill's row, and Enter
+// puts it back as ONE snapshot: no fault, the same body, the document as it was; one `u` returns the fault. A document
+// whose history holds no machine offers nothing.
+
+#[test]
+fn a_no_machine_fault_offers_the_machine_and_enter_clears_it() {
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("vugfacejournalfaultfix");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    std::fs::write(dir.join("shop.vugmachine"), format!("vug-doc version=1 lin=1e-6 ang=1e-9\n{SHOP_MACHINE}\n{SHOP_LINES}")).expect("library");
+    let part = dir.join("part.vug");
+    std::fs::write(&part, BOX_DRILL.replace("drill o1 ", "machine mill lib=shop loaded=1\ndrill o1 ")).expect("part");
+    let mut vw = Viewer::open(part.to_str().expect("utf-8 path"), (W, H), Preset::Una).unwrap_or_else(|e| panic!("open: {e}"));
+    assert!(vw.view.design.journal.faults.is_empty(), "the drill generates with the machine: {:?}", vw.view.design.journal.faults);
+    let held = doc(&vw).clone();
+
+    // The panel deletes the machine row: the drill's NoMachine is carried, the box stays.
+    let m = index_of(&vw, |s| matches!(s, Stmt::Machine(_)));
+    vw.view.design.journal.delete(m).unwrap_or_else(|e| panic!("delete: {e}"));
+    let o1 = index_of(&vw, |s| s.id() == Some("o1"));
+    let line = doc(&vw).line(o1);
+    let f = vw.view.design.journal.faults.iter().map(|f| (f.id.clone(), f.fault.clone())).collect::<Vec<_>>();
+    assert_eq!(f, vec![("o1".to_string(), doc_core::Fault::NoMachine)], "the drill is faulted");
+
+    // The drill's row selected: the history's one machine is offered on it.
+    assert!(vw.view.design.journal.select_line(line), "the drill's line is a row");
+    let fix = vw.view.design.journal.offered().expect("a fix is offered on the faulted row");
+    assert_eq!((fix.text.as_str(), fix.line), ("machine mill lib=shop loaded=1", line));
+    let depth = vw.view.design.journal.depth().0;
+
+    // Enter takes it: one snapshot, no fault, the same box, the document it was before the delete.
+    assert!(key(&mut vw, "Return"), "Enter takes the fix");
+    let j = &vw.view.design.journal;
+    println!("fix offered={} line={line} faults_after={} volume={}", fix.text, j.faults.len(), volume(&vw));
+    assert!(j.faults.is_empty(), "{:?}", j.faults);
+    assert!((volume(&vw) - 1000.0).abs() < 1e-4, "the body unchanged: {}", volume(&vw));
+    assert_eq!(*doc(&vw), held, "the machine is back on its line");
+    assert_eq!(j.depth().0, depth + 1, "ONE snapshot");
+    assert_eq!(j.note.as_deref(), Some(format!("fixed line {line}: machine mill lib=shop loaded=1").as_str()));
+    assert!(j.offered().is_none(), "nothing left to fix");
+    assert!(key(&mut vw, "u"), "one u");
+    assert_eq!(vw.view.design.journal.faults.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(), ["o1"], "one u returns the fault");
+
+    // No machine anywhere in the history: the fault is marked, nothing is offered.
+    let d = doc_core::read(BOX_DRILL).expect("the document reads");
+    let mut vw = Viewer::open_doc(d, "box", (W, H), Preset::Una).expect("opens");
+    let o1 = index_of(&vw, |s| s.id() == Some("o1"));
+    let line = doc(&vw).line(o1);
+    assert!(vw.view.design.journal.select_line(line));
+    assert!(vw.view.design.journal.faulted(o1) && vw.view.design.journal.offered().is_none(), "no machine to offer");
+}

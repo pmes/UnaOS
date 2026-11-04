@@ -189,7 +189,7 @@ pub fn overlay(view: &View, fr: &mut Frame) {
     };
     for (i, line) in corner(m).iter().enumerate() {
         let text = line.to_uppercase();
-        let (x, y) = line_at(fr.width, &text, i); // VUGFACEJOURNALSOLIDFAULT (SR572): the ONE corner geometry, paint and hit
+        let (x, y) = line_at(corner_origin(view, fr.width), &text, i); // VUGFACEJOURNALSOLIDFAULT (SR572): the ONE corner geometry, paint and hit; VUGFACEJOURNALFAULTFIX (SR578): its right edge left of a shown panel
         raster::text(fr, &text, x, y, col);
     }
     ring(view, m, fr); // VUGFACEDEVIATIONPICK (SR543): the ring at the picked vertex
@@ -763,7 +763,7 @@ pub fn line_at(width: u32, text: &str, i: usize) -> (f32, f32) {
 /// (the click is taken). Any other click, or a map with no journal, is not taken.
 pub fn fault_click(view: &mut View, x: f64, y: f64) -> bool {
     let Some(m) = view.deviation.as_ref().filter(|m| m.source.is_some()) else { return false };
-    let w = view.size.0;
+    let w = corner_origin(view, view.size.0); // VUGFACEJOURNALFAULTFIX (SR578): the paint's right edge, so the hit stays one geometry
     let line = corner(m).into_iter().enumerate().find_map(|(i, l)| {
         let text = l.to_uppercase();
         let (x0, y0) = line_at(w, &text, i);
@@ -816,3 +816,14 @@ impl Viewer {
     }
 }
 
+
+// ---- VUGFACEJOURNALFAULTFIX (LEDGER SR578): the corner left of the shown panel ----
+// The shown tree panel covers the frame's right quarter, so a right-aligned corner line (a `fault line N` the person just
+// clicked to open the panel) would hide under it. [`corner_origin`] is the corner's ONE right edge: [`overlay`] paints
+// at it and [`fault_click`] hit-tests at it, both through [`line_at`].
+
+/// The right edge the corner's lines align to on a frame `width` wide: the frame's edge, or journal.rs `panel_x0` (the
+/// panel's left edge) while the panel is shown.
+pub fn corner_origin(view: &View, width: u32) -> u32 {
+    if view.design.journal.panel { crate::journal::panel_x0(width) as u32 } else { width }
+}
