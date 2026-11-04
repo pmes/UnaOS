@@ -190,9 +190,10 @@ impl Transport for Port {
 }
 
 /// The host's opener for `crate::pump::serve_pump` (through `crate::pump::by_scheme`): a `tcp://host:port` name
-/// connected within `connect` and made ready for `dialect`; a refusal is its name.
-pub fn opener(dialect: Dialect, connect: Duration) -> Box<crate::pump::Opener> {
-    Box::new(move |port: &str| -> Result<Box<dyn Transport + Send>, String> {
+/// connected within `connect` and made ready for the dialect each open is handed (VUGCOMSCANHOSTDIALECT, SR566); a
+/// refusal is its name.
+pub fn opener(connect: Duration) -> Box<crate::pump::Opener> {
+    Box::new(move |port: &str, dialect: Dialect| -> Result<Box<dyn Transport + Send>, String> { // VUGCOMSCANHOSTDIALECT (SR566)
         let mut p = Port::open(port, connect).map_err(|r| r.to_string())?;
         p.ready(dialect, READY_WAIT).map_err(|r| r.to_string())?;
         Ok(Box::new(p))
