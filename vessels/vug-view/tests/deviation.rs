@@ -1710,3 +1710,103 @@ fn a_four_frame_tracked_prb_opens_on_the_view_road() {
     let (track, _, part, truth0) = tracked_prb("vugscandeviationcoarseview", 4);
     opens_on_the_view_road("coarseview", &track, &part, truth0);
 }
+
+// ---- VUGSCANDEVIATIONCOARSESYM (LEDGER SR636): a design with near-equal principal moments starts from its pivot ----
+// The bench's box made near-square (150 x 156 x 100) with a post r20 h60 on its top at (35, 40), on a 480 x 400 ground
+// (the part ~35% of the scan, SR615's bench 36%): the design's middle and largest moments pair (0.671 / 0.880 against
+// scan_core's COARSE_SYM_RATIO 0.83), so its in-plane axes are the post's, not the box's, and SR615's four signs land far
+// from the truth (modelled 177 / 165 / 119 / 63°, its road accepting the 180° turn). scan_core `sym_or` hands
+// `measure_coarse` SR626's sweep about the pivot (the smallest axis) and the scan carried by a known pose opens
+// `align=coarse+fine` at the identity road's pose.
+
+/// The near-square box and its post, built to the scene's dimensions (the post's sketch on the box's top).
+const SYM_DOC: &str = r#"vug-doc version=1 lin=1e-6 ang=1e-9
+sketch s1 o=[0 0 0] z=[0 0 1] x=[1 0 0]
+point p1 sketch=s1 x=-75 y=-78
+point p2 sketch=s1 x=75 y=-78
+point p3 sketch=s1 x=75 y=78
+point p4 sketch=s1 x=-75 y=78
+line l1 sketch=s1 a=p1 b=p2
+line l2 sketch=s1 a=p2 b=p3
+line l3 sketch=s1 a=p3 b=p4
+line l4 sketch=s1 a=p4 b=p1
+fix f1 sketch=s1 p=p1 at=[-75 -78]
+fix f2 sketch=s1 p=p2 at=[75 -78]
+fix f3 sketch=s1 p=p3 at=[75 78]
+fix f4 sketch=s1 p=p4 at=[-75 78]
+sketch s2 o=[0 0 100] z=[0 0 1] x=[1 0 0]
+point c0 sketch=s2 x=35 y=40
+circle c1 sketch=s2 centre=c0 r=20
+fix g1 sketch=s2 p=c0 at=[35 40]
+radius r1 sketch=s2 circle=c1 r=20
+extrude body sketch=s1 outer=l1 dir=[0 0 1] length=100
+extrude post sketch=s2 outer=c1 dir=[0 0 1] length=60
+"#;
+
+/// The near-square box's orbit scan (12 frames at 600 mm, 40° up, D435i noise), fused once in the design's world.
+fn sym_scan() -> &'static ScanMesh {
+    static S: OnceLock<ScanMesh> = OnceLock::new();
+    S.get_or_init(|| {
+        let scene = Scene {
+            ground_centre: Vec3::ZERO,
+            ground: [240.0, 200.0],
+            boxes: vec![fixture::BoxPrim { min: Vec3::new(-75.0, -78.0, 0.0), max: Vec3::new(75.0, 78.0, 100.0) }],
+            cylinders: vec![fixture::CylPrim { base: Vec3::new(35.0, 40.0, 100.0), radius: 20.0, height: 60.0 }],
+        };
+        let (intr, scale) = (fixture::bench_intrinsics(), DepthScale::D400_DEFAULT);
+        let mut t = Tsdf::new(4.0, 12.0, Tol::DEFAULT).expect("volume");
+        for k in 0..12u32 {
+            let p = fixture::orbit(Vec3::new(0.0, 0.0, 50.0), 600.0, 40.0 * DEG, k as f64 * 2.0 * PI / 12.0);
+            let f = fixture::render_depth(&scene, &intr, scale, &p, &Noise::D435I, k as u64);
+            t.integrate(&f, scale, &intr, &p).expect("frame integrates");
+        }
+        extract(&t).expect("surface")
+    })
+}
+
+#[test]
+fn a_near_square_box_opens_on_the_sym_road() {
+    let doc = doc_core::read(SYM_DOC).expect("the document reads");
+    // SR615's known pose with a 50° turn about the box's z (the free yaw of its near-equal pair) first.
+    let (s, c) = (50.0 * DEG).sin_cos();
+    let yaw = fixture::from_axes(Vec3::new(c, s, 0.0), Vec3::new(-s, c, 0.0), Vec3::new(0.0, 0.0, 1.0), Vec3::ZERO);
+    let p = known_pose().compose(yaw);
+    let moved = fragment(sym_scan(), |_| true, p);
+    let truth = p.invert().expect("a rigid pose");
+
+    // Before: SR615's four sign starts do not span the truth.
+    let (_, home) = vug_view::deviation::open(sym_scan(), &doc, BAND_MM, vug_view::deviation::GDT_MARGIN_MM).expect("the design builds");
+    let h = home.result.as_ref().expect("the scan aligns from the identity");
+    let (_, design) = &*home.basis;
+    let ap = scan_core::AlignParams::DEFAULT;
+    let bvh = mesh_core::bvh::Bvh::build(&design.mesh);
+    let four: Vec<f64> = scan_core::deviation::coarse(&moved, design, &bvh, &ap, Tol::DEFAULT)
+        .expect("four starts")
+        .iter()
+        .map(|x| 2.0 * x.0.rot.dot(truth.rot).abs().min(1.0).acos() / DEG)
+        .collect();
+    println!("coarsesym: four-start err_deg={four:.1?}");
+    assert!(four.iter().all(|e| *e > 20.0), "SR615's four signs miss the near-square box's truth: {four:?}");
+
+    // After: the pivot sweep starts it and the fine alignment lands on the identity road's pose.
+    let (_, map) = vug_view::deviation::open_coarse(&moved, &doc, BAND_MM, vug_view::deviation::GDT_MARGIN_MM).expect("the design builds");
+    let lines = corner(&map);
+    println!("{}", lines.join("\n"));
+    let rms = match map.road {
+        scan_core::deviation::Road::CoarseFine { rms_mm } => rms_mm,
+        other => panic!("expected the sym road kept, got {other:?} ({:?})", map.result.as_ref().err()),
+    };
+    let d = map.result.as_ref().expect("the sym road aligns the near-square box");
+    let back = d.aligned.pose.compose(p);
+    let err_deg = 2.0 * back.rot.dot(h.aligned.pose.rot).abs().min(1.0).acos() / DEG;
+    let err_mm = [Vec3::new(-75.0, -78.0, 0.0), Vec3::new(75.0, 78.0, 100.0), Vec3::new(35.0, 40.0, 160.0)]
+        .iter()
+        .map(|&x| (back.apply_point(x) - h.aligned.pose.apply_point(x)).mag())
+        .fold(0.0, f64::max);
+    println!("coarsesym: road=CoarseFine rms={rms:.3} aligned={:.3} stats_rms={:.3} err_deg={err_deg:.4} err_mm={err_mm:.4}", d.aligned.rms_mm, d.stats.rms_mm);
+    assert!(rms <= ap.gate(2), "the floor: {rms}");
+    assert!(d.aligned.rms_mm < 1.0 && d.stats.rms_mm < 1.0, "the SR510 floor: aligned {} stats {}", d.aligned.rms_mm, d.stats.rms_mm);
+    assert!(err_deg < 1.0 && err_mm < 2.0, "pose error {err_deg} deg {err_mm} mm");
+    assert!(lines.contains(&format!("align=coarse+fine rms={rms:.3}")), "{lines:?}");
+    assert!(map.on, "the map opens on");
+}
