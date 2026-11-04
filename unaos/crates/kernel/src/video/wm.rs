@@ -946,12 +946,12 @@ pub fn title_source_of(id: WinId) -> TitleSource {
 /// behind by a program that exited would title the NEXT tenant of that slot. Called by the shell
 /// when it reaps or kills a job — the launches it armed are the launches it retires.
 ///
-/// ⚠ The complete fix is a call from the arch slot-teardown seam
-/// (`arch::*::boot::teardown_user_slot`, beside where the hidden bit is cleared), which would cover
-/// tenants no shell ever tracked. That seam is in `arch/` and out of this arc's lane; it is owed,
-/// and until it lands the residual hazard is bounded to "a kernel-initiated launch into a slot a
-/// shell-launched program left, whose shell never reaped it" — which reads a stale NAME, never a
-/// wrong number, and is corrected by the next `app_name_arm` for that owner.
+/// The arch slot teardown forgets too (ARMFORGET B1171): [`app_records_teardown`] runs at each
+/// arch's generation bump in `clear_handle_row` (x86 SLOT_GEN, aarch64 ASID_GEN), on the FINAL
+/// release only and before the slot is claimable, so it covers tenants no shell ever tracked. The
+/// residual is WINTITLE-LATE's: a late arm that lands after its child already tore down leaves a
+/// name on a dead owner (ARMFORGET-LATEARM, owed: generation-stamp the late arm), corrected by the
+/// next `app_name_arm` for that owner or by this shell reap.
 pub fn app_name_forget(owner: u64) {
     #[cfg(feature = "busreg")] { app_path_forget(owner); } if owner == 0 { // BUSREG-TAG-PATH (B1163): the path goes with the name (file tail) — ⚠ LINE-NEUTRAL fold
         return;
@@ -33838,4 +33838,38 @@ pub fn app_name_early_forget(owner: u64) {
         return;
     }
     APP_NAMES_EARLY.lock().retain(|e| e.0 != owner);
+}
+
+// =================================================================================================
+// ARMFORGET-TEARDOWN (rmbp-ledger B1171) — TAIL-APPENDED. SO22 forgot a tenant's name (and, since B1163, its path) at
+// the wrong points: x86 AFTER `SLOT_USED` was released (a racing claim + REGISTER was judged on the predecessor's
+// record, and a new tenant's arm could be wiped), aarch64 at `teardown_user_slot` ENTRY (every thread's exit, so a
+// threaded tenant lost its name and path while alive). Both arches now call this ONE fn at their generation bump in
+// `clear_handle_row` — the final release only, before the slot is claimable — in every build. It reuses the existing
+// forgets: [`app_name_forget`] (name + the chained path) and, under `busreg`, [`app_name_early_forget`] (the early
+// record is already generation-sound; cleared for table hygiene) plus the witness counter. Knob-off it is the plain
+// name+path forget.
+// LOCK ORDER: APP_NAMES, APP_PATHS, APP_NAMES_EARLY are leaves, taken one at a time, each guard dropped before the
+// next; the arch caller holds no lock at the generation line.
+// =================================================================================================
+/// ARMFORGET — teardowns (or the `tests bandy3` leg) that found a record to clear (monotonic since boot).
+#[cfg(feature = "busreg")]
+pub static ARMFORGET_CLEARED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// ARMFORGET — drop every launcher record `owner` holds: name, path and (busreg) the early record. Called by the
+/// arch slot teardown at its generation bump; owners are recycled slot aliases.
+pub fn app_records_teardown(owner: u64) {
+    if owner == 0 {
+        return;
+    }
+    #[cfg(feature = "busreg")]
+    let had = app_name_armed(owner) || app_path_with(owner, |_| true).is_some() || APP_NAMES_EARLY.lock().iter().any(|e| e.0 == owner);
+    app_name_forget(owner);
+    #[cfg(feature = "busreg")]
+    {
+        app_name_early_forget(owner);
+        if had {
+            ARMFORGET_CLEARED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
+    }
 }

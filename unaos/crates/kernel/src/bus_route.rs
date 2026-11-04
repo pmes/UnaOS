@@ -518,7 +518,7 @@ pub fn selftest(fx: &Fixture) {
     } else {
         serial_println!(":: BANDY3: registered={} relayed={} replied={} orphan={} w={:#05x}/{:#05x} verbs={}/{} -> FAIL ::", rg, rl, rp, or, w, ALL, vg, vl);
     }
-    tagid_selftest(fx); armearly_selftest(fx); /* BUSREG-ARM-EARLY (B1164): the early-arm legs, after the BUSREG-TAGID line (file tail) */ // BUSREG-TAG-IDENTITY (B1157): the identity legs, after the BANDY3 line
+    tagid_selftest(fx); armearly_selftest(fx); /* BUSREG-ARM-EARLY (B1164): the early-arm legs, after the BUSREG-TAGID line (file tail) */ armforget_selftest(fx); /* ARMFORGET-CHAIN (B1171): the teardown-forget legs (file tail) */ // BUSREG-TAG-IDENTITY (B1157): the identity legs, after the BANDY3 line
 }
 
 /// HOLOCRON2 (rmbp-ledger B355): does `verb` have a registration right now? (Generation not checked: a row
@@ -972,6 +972,87 @@ fn armearly_selftest(fx: &Fixture) {
             if w & 2 != 0 { "relayed-early" } else { "DROPPED" },
             if w & 4 != 0 { "dropped" } else { "KEPT" },
             armed, w, ALL
+        );
+    }
+}
+
+// =================================================================================================
+// ARMFORGET-TEARDOWN (rmbp-ledger B1171) — TAIL-APPENDED. Both arches forget a tenant's launcher records at the
+// generation bump in `clear_handle_row` through ONE wm fn (`wm::app_records_teardown`), on the final release and
+// before the slot is claimable, so a recycled owner launched by a road that arms nothing is judged Unnamed, never
+// on its predecessor's name and path (which B1163's rule would PROMOTE). The leg drives that exact fn: the full
+// `clear_handle_row` on a scratch row would close a live compat window (aarch64) and revoke focus.
+// Witness: `tests bandy3` → `:: BUSREG-ARMFORGET: … -> PASS ::`.
+// =================================================================================================
+
+/// `tests bandy3`' teardown-forget legs, on the fixture's scratch rows (caller `a`, fulfiller `f`):
+/// F1 `f` armed as the fulfiller (late name + path `/apps/PREFS.ELF` and the early record at its generation) is
+/// `Fulfiller`; after `wm::app_records_teardown` all three records are gone and `f` is `Unnamed`; F2 the recycled,
+/// unarmed `f` registers 128 -> 0 (REGISTER refuses only `Other`), the caller's GET 128 -> KERNEL -ENOENT, `f`'s
+/// mailbox empty, 128 dropped. SKIP as `armearly_selftest` does.
+fn armforget_selftest(fx: &Fixture) {
+    let (a, f) = fx.rows;
+    let owner_f = crate::video::wm::owner_of_launch(f as u64);
+    let (get, set) = (una_abi::BUS_VERB_R3PREF_GET, una_abi::BUS_VERB_R3PREF_SET);
+    if (get..=set).any(|v| lookup(fx.ops, v).is_some()) {
+        serial_println!(":: BUSREG-ARMFORGET: SKIP (a live row holds Principia's tags) ::");
+        return;
+    }
+    let rg = (fx.ops.rgen)(f);
+    let mut nb = [0u8; crate::video::wm::MAX_TITLE];
+    if crate::video::wm::app_name_armed(owner_f)
+        || crate::video::wm::app_path_with(owner_f, |_| true).is_some()
+        || crate::video::wm::app_name_early_of(owner_f, rg, &mut nb) != 0
+    {
+        serial_println!(":: BUSREG-ARMFORGET: SKIP (scratch row {} carries a name) ::", f);
+        return;
+    }
+    (fx.clear)(a);
+    (fx.clear)(f);
+    let parse = |b: &[u8]| crate::bus::frame_parse(b).ok();
+    let mut buf = [0u8; 128];
+    let mut w = 0u32;
+
+    // F1: the predecessor's records, then the teardown's own forget.
+    let _ = crate::video::wm::app_name_arm(owner_f, "/apps/PREFS.ELF");
+    let _ = crate::video::wm::app_name_arm_early(owner_f, rg, "/apps/PREFS.ELF");
+    let armed = tag_id(set, f, &mut nb) == TagId::Fulfiller;
+    crate::video::wm::app_records_teardown(owner_f);
+    let cleared = !crate::video::wm::app_name_armed(owner_f)
+        && crate::video::wm::app_path_with(owner_f, |_| true).is_none()
+        && crate::video::wm::app_name_early_of(owner_f, rg, &mut nb) == 0;
+    let unnamed = tag_id(set, f, &mut nb) == TagId::Unnamed;
+    if armed && cleared && unnamed {
+        w |= 1 << 0;
+    }
+    // F2: the recycled owner, armed by nothing, registers but its first relay drops it — no body reaches it.
+    let n = crate::bus::build_request(BUS_VERB_REGISTER, 81, &[get], &mut buf);
+    let admitted = (fx.send)(f, &buf[..n]) == 0 && matches!((fx.pop)(f).as_deref().and_then(parse), Some(h) if h.status == 0 && h.corr == 81);
+    let n = crate::bus::build_request(get, 82, b"ui.theme", &mut buf);
+    let sent = (fx.send)(a, &buf[..n]) == 0;
+    let enoent = matches!((fx.pop)(a).as_deref().and_then(parse), Some(h) if h.status == ENOENT as i32 && h.corr == 82 && h.principal[0] == PRIN_KERNEL_REPLY);
+    let unseen = (fx.pop)(f).is_none();
+    if admitted && sent && enoent && unseen && lookup(fx.ops, get).is_none() {
+        w |= 1 << 1;
+    }
+    on_exit(fx.ops, f);
+    (fx.clear)(a);
+    (fx.clear)(f);
+    on_exit(fx.ops, a);
+    crate::video::wm::app_name_forget(owner_f);
+    crate::video::wm::app_name_early_forget(owner_f);
+    const ALL: u32 = (1 << 2) - 1;
+    let forgot = crate::video::wm::ARMFORGET_CLEARED.load(Ordering::Relaxed);
+    if w == ALL {
+        serial_println!(":: BUSREG-ARMFORGET: armed=fulfiller cleared=name,path,early recycled=unnamed relay=dropped forgot={} -> PASS ::", forgot);
+    } else {
+        serial_println!(
+            ":: BUSREG-ARMFORGET: armed={} cleared={} recycled={} relay={} forgot={} w={:#x}/{:#x} -> FAIL ::",
+            if armed { "fulfiller" } else { "NOT-FULFILLER" },
+            if cleared { "name,path,early" } else { "KEPT" },
+            if unnamed { "unnamed" } else { "NAMED" },
+            if w & 2 != 0 { "dropped" } else { "KEPT" },
+            forgot, w, ALL
         );
     }
 }

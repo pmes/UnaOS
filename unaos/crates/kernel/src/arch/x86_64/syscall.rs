@@ -14985,7 +14985,7 @@ pub fn clear_handle_row(slot: usize) {
     // deposit stamped for the dying tenant is dead-on-arrival for the slot's next tenant even if it lands
     // after the sweep passed its slot (RECV verifies the stamp; the sender's post-check re-reads this word).
     // This closes the U7x-documented sys_xfer TOCTOU (exit + recycle + consume inside the deposit window).
-    SLOT_GEN[slot].fetch_add(1, Ordering::AcqRel); #[cfg(feature = "login")] slot_user_clear(slot); // LOGIN M1 — the dying tenant's user stamp goes with its generation (file tail). ⚠ LINE-NEUTRAL append.
+    SLOT_GEN[slot].fetch_add(1, Ordering::AcqRel); #[cfg(feature = "login")] slot_user_clear(slot); crate::video::wm::app_records_teardown(crate::video::wm::owner_of_launch(slot as u64)); // ARMFORGET-X86 (B1171): wm forgets the dying tenant's name + path (+ the early record under busreg) here, at the generation bump and before the slot is claimable (wm tail). LOGIN M1 — the dying tenant's user stamp goes with its generation (file tail). ⚠ LINE-NEUTRAL append.
     // WINX-7: revoke input focus if this dying slot held it, and reset its input ring — BEFORE the
     // rest of the teardown, and for the same reason the generation bump comes first: from this point
     // on nothing addressed to the old tenant may reach the slot's next one. Without the revoke, focus
