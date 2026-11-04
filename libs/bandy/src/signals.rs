@@ -1239,6 +1239,18 @@ pub enum PumpEvent {
     /// VUGCOMSCANJOG (SR573): the controller at `port` took the commissioned `name` (its EEPROM write acked and read back),
     /// said once at the first bind. An answer, inert as input.
     Commissioned { port: String, name: String },
+    /// VUGCOMSCANMACHINEDECLARE (SR613): declare the machine behind the desk's ports by `name`: X / Y / Z travel in mm and
+    /// optionally the `dialect` it speaks (`grbl`, `grbl-laser`, `marlin`); the jog's bound from the next jog on and the
+    /// next PumpStart's dialect. Refused while a job is in flight; per session (no prefs key).
+    PumpDeclare {
+        principal: Origin,
+        name: String,
+        x: f64,
+        y: f64,
+        z: f64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dialect: Option<String>,
+    },
 }
 
 impl PumpEvent {
@@ -1247,7 +1259,7 @@ impl PumpEvent {
         matches!(
             self,
             PumpEvent::PumpStart { .. } | PumpEvent::PumpHold { .. } | PumpEvent::PumpResume { .. } | PumpEvent::PumpStop { .. }
-                | PumpEvent::PumpHome { .. } | PumpEvent::PumpJog { .. } // VUGCOMSCANJOG (SR573)
+                | PumpEvent::PumpHome { .. } | PumpEvent::PumpJog { .. } | PumpEvent::PumpDeclare { .. } // VUGCOMSCANJOG (SR573); VUGCOMSCANMACHINEDECLARE (SR613)
         )
     }
 }
