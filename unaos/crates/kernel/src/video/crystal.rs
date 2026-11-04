@@ -1907,3 +1907,58 @@ pub fn label_boxes(out: &mut alloc::vec::Vec<(&'static str, alloc::string::Strin
         out.push(("crystal", alloc::string::String::from(r.label), inner, false, FACE));
     }
 }
+
+// ── VEILONE (rmbp-ledger B1114, BP-video-11) — TAIL-APPENDED, so no line above moves ─────────────────────────────────
+// The one VEIL painter. DESIGN-LANGUAGE §2.4: the VEIL is the wallpaper blurred ONCE (`wm::desktop::veil_gen`, sampled
+// by `wm::desktop::Back::soft`) under a tinted face. Before this the tint loop was written three times — the menu bar
+// (`desktop::bar_row`), the dock plate (`desktop::dock_plate_row`) and Softy's taskbar (`softy::paint::veil_row`) —
+// each with its own copy of the 78 % alpha. Now each site passes its [`veil::Look`] and keeps only its own edge (the
+// bar's hairline foot, the dock's rounded plate); the caches (`desktop::VeilCache`) stay the callers'.
+
+/// CHARTER: Kernel — wm (VEILONE B1114: the VEIL's one row painter, a face at an alpha over the once-blurred wallpaper).
+pub mod veil {
+    use crate::video::{draw, theme, wm::desktop::Back};
+
+    /// What one site lays over the VEIL: its face and the face's straight alpha (`255` = a plain fill, no sample).
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub struct Look {
+        pub face: u32,
+        pub a: u8,
+    }
+
+    impl Look {
+        /// The Una furniture (the menu bar, the dock plate): `surface.window` at the theme's VEIL alpha (72 % / 78 %).
+        #[inline]
+        pub fn una() -> Look {
+            Look { face: theme::surface_window(), a: theme::veil_a() }
+        }
+    }
+
+    /// **Row `y` of the VEIL** from panel column `x0` into all of `out`: `look.face` at `look.a` over `back`'s VEIL
+    /// (the flat desktop colour with no picture); at `a == 255` a plain fill, no sample taken. Lock-free, no allocation.
+    #[inline]
+    pub fn row(out: &mut [u32], x0: usize, y: usize, back: Option<&Back>, look: Look) {
+        if look.a == 255 {
+            out.fill(look.face);
+            return;
+        }
+        match back {
+            Some(b) => b.soft(out, x0, y),
+            None => out.fill(theme::DESKTOP_BG),
+        }
+        for p in out.iter_mut() {
+            *p = draw::blend(*p, look.face, look.a as u32);
+        }
+    }
+
+    /// [`row`] over the live wallpaper (`wm::desktop::live_back`), read only when the look samples it (`a < 255`).
+    #[inline]
+    pub fn row_live(out: &mut [u32], x0: usize, y: usize, look: Look) {
+        if look.a == 255 {
+            out.fill(look.face);
+            return;
+        }
+        let back = crate::video::wm::desktop::live_back();
+        row(out, x0, y, back.as_ref(), look);
+    }
+}
