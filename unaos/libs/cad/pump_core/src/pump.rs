@@ -641,3 +641,58 @@ impl Pump {
         }
     }
 }
+
+// --- VUGCOMSCANHELLOID (LEDGER SR546): the controller's own identity verb and its answer grammar (named tail hunk) ---
+
+/// The verb a dialect answers with its own identity, sent once after the banner: grbl 1.1 `$I` (the build info:
+/// `[VER:<version>.<date>:<user string>]` and `[OPT:<flags>,<blocks>,<rx>]`, then `ok`), Marlin / Klipper `M115`
+/// (`FIRMWARE_NAME:...` then the `Cap:` lines and `ok`); LinuxCNC is not streamed and has none.
+pub fn identity_verb(d: Dialect) -> Option<&'static str> {
+    match d {
+        Dialect::Grbl { .. } => Some("$I"),
+        Dialect::Marlin => Some("M115"),
+        Dialect::LinuxCnc => None,
+    }
+}
+
+/// One line of the answer to [`identity_verb`], classified.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HelloLine {
+    /// Part of the identity: kept.
+    Keep,
+    /// The answer is complete (`ok`).
+    End,
+    /// The controller refused the verb (`error:N`, Marlin's `Error:` or unknown command).
+    Refused,
+    /// Anything else (a push message, a `Cap:` line, an echo): not the identity.
+    Other,
+}
+
+/// Classify one trimmed line of the identity answer in dialect `d`.
+pub fn hello_line(d: Dialect, s: &str) -> HelloLine {
+    match d {
+        Dialect::Grbl { .. } => {
+            if s.starts_with("[VER:") || s.starts_with("[OPT:") {
+                HelloLine::Keep
+            } else if s == "ok" {
+                HelloLine::End
+            } else if s.starts_with("error:") {
+                HelloLine::Refused
+            } else {
+                HelloLine::Other
+            }
+        }
+        Dialect::Marlin => {
+            if s.contains("FIRMWARE_NAME:") {
+                HelloLine::Keep
+            } else if s.starts_with("ok") {
+                HelloLine::End
+            } else if s.starts_with("Error:") || s.starts_with("echo:Unknown command") {
+                HelloLine::Refused
+            } else {
+                HelloLine::Other
+            }
+        }
+        Dialect::LinuxCnc => HelloLine::Other,
+    }
+}

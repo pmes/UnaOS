@@ -23,8 +23,14 @@ const BANNER: &[u8] = b"Grbl 1.1h ['$' for help]\r\n";
 
 /// A fake grbl behind one accepted connection: says its banner at once (or only after a soft reset when
 /// `banner_on_reset`), answers `ok` per line, ignores the realtime bytes; returns the lines it executed once the client
-/// closes (or `stop_after` lines, and with `banner_on_reset` the reset, were seen).
+/// closes (or `stop_after` lines, and with `banner_on_reset` the reset, were seen). It answers `$I` as build `VER_A`
+/// (VUGCOMSCANHELLOID, SR546).
 fn fake_grbl(l: TcpListener, banner_on_reset: bool, stop_after: Option<usize>) -> JoinHandle<Vec<String>> {
+    fake_grbl_as(l, banner_on_reset, stop_after, VER_A)
+}
+
+/// [`fake_grbl`] answering `$I` as build `ver` (`$I` is neither recorded nor counted as a line).
+fn fake_grbl_as(l: TcpListener, banner_on_reset: bool, stop_after: Option<usize>, ver: &'static str) -> JoinHandle<Vec<String>> {
     thread::spawn(move || {
         let (mut s, _) = l.accept().unwrap();
         if !banner_on_reset {
@@ -51,9 +57,12 @@ fn fake_grbl(l: TcpListener, banner_on_reset: bool, stop_after: Option<usize>) -
                     }
                     b'?' | b'!' | b'~' => {}
                     b'\n' => {
-                        got.push(String::from_utf8_lossy(&cur).trim().to_string());
+                        let line = String::from_utf8_lossy(&cur).trim().to_string();
                         cur.clear();
-                        let _ = s.write_all(b"ok\r\n");
+                        if !said_hello(&mut s, &line, ver) {
+                            got.push(line);
+                            let _ = s.write_all(b"ok\r\n");
+                        }
                     }
                     _ => cur.push(b),
                 }
@@ -245,8 +254,14 @@ use comscan::pump::Refused;
 use pump_core::PumpState;
 
 /// A fake grbl that says its banner, acks exactly `n` lines, then FINs (shutdown Write) and reads to the client's
-/// end; its listener goes at the accept, so a redial finds nobody. Returns every line it saw.
+/// end; its listener goes at the accept, so a redial finds nobody. Returns every line it saw. It answers `$I` as build
+/// `VER_A` (VUGCOMSCANHELLOID, SR546).
 fn fake_grbl_lost_after(l: TcpListener, n: usize) -> JoinHandle<Vec<String>> {
+    fake_grbl_lost_after_as(l, n, VER_A)
+}
+
+/// [`fake_grbl_lost_after`] answering `$I` as build `ver` (not recorded, not counted toward `n`).
+fn fake_grbl_lost_after_as(l: TcpListener, n: usize, ver: &'static str) -> JoinHandle<Vec<String>> {
     thread::spawn(move || {
         let (mut s, _) = l.accept().unwrap();
         drop(l);
@@ -264,8 +279,12 @@ fn fake_grbl_lost_after(l: TcpListener, n: usize) -> JoinHandle<Vec<String>> {
                 match b {
                     b'?' | b'!' | b'~' | 0x18 => {}
                     b'\n' => {
-                        got.push(String::from_utf8_lossy(&cur).trim().to_string());
+                        let line = String::from_utf8_lossy(&cur).trim().to_string();
                         cur.clear();
+                        if said_hello(&mut s, &line, ver) {
+                            continue;
+                        }
+                        got.push(line);
                         if acked < n {
                             let _ = s.write_all(b"ok\r\n");
                             acked += 1;
@@ -408,4 +427,120 @@ fn a_lost_tcp_link_is_link_lost_at_its_line_redials_with_backoff_and_resumes_onl
     }
     drop(desk);
     assert_eq!(fake2.join().unwrap(), lines[5..].to_vec(), "the second link ran only the lines from the lost one on");
+}
+
+// --- VUGCOMSCANHELLOID (SR546): the controller's own identity at the first open, a reopen onto another board refused ---
+
+use std::net::TcpStream;
+
+/// The fakes' default build: grbl 1.1h with the stored user string `mill-a` (`$I=mill-a`).
+const VER_A: &str = "1.1h.20190825:mill-a";
+/// Another board on the same firmware build, its user string `mill-b`.
+const VER_B: &str = "1.1h.20190825:mill-b";
+
+/// grbl 1.1's `$I` answer for build `ver`, written when `line` is `$I`; true when it was.
+fn said_hello(s: &mut TcpStream, line: &str, ver: &str) -> bool {
+    if line != "$I" {
+        return false;
+    }
+    let _ = s.write_all(format!("[VER:{ver}]\r\n[OPT:V,15,128]\r\nok\r\n").as_bytes());
+    true
+}
+
+fn hello_of(ver: &str) -> String {
+    format!("[VER:{ver}] [OPT:V,15,128]")
+}
+
+#[test]
+fn hello_sends_the_dialects_identity_verb_once_and_keeps_its_answer() {
+    use pump_core::pump::identity_verb;
+    assert_eq!(identity_verb(GRBL), Some("$I"));
+    assert_eq!(identity_verb(Dialect::Grbl { laser: true }), Some("$I"));
+    assert_eq!(identity_verb(Dialect::Marlin), Some("M115"));
+    assert_eq!(identity_verb(Dialect::LinuxCnc), None, "a dialect without an identity verb");
+
+    let (l, port) = listener();
+    let fake = fake_grbl(l, false, None);
+    let mut link = Port::connect("127.0.0.1", port, CONNECT_WAIT).expect("connect");
+    let banner = link.ready(GRBL, Duration::from_millis(500)).expect("banner");
+    assert!(banner.as_deref().is_some_and(|b| b.starts_with("Grbl 1.1h")), "banner {banner:?}");
+    let said = comscan::pump::hello(&mut link, GRBL, Duration::from_millis(500));
+    assert_eq!(said, Some(hello_of(VER_A)));
+    assert_eq!(comscan::pump::hello(&mut link, Dialect::LinuxCnc, Duration::from_millis(50)), None, "no verb, nothing sent");
+    drop(link);
+    assert!(fake.join().unwrap().is_empty(), "the hello is no program line");
+}
+
+#[test]
+fn a_reopen_onto_another_board_is_refused_by_name_and_keeps_redialing_the_same_board_relinks() {
+    let (l, port) = listener();
+    let fake1 = fake_grbl_lost_after(l, 5);
+    let p = program();
+    let want = Pump::from_program(&p, GRBL).unwrap();
+    let at = want.line_of(5).unwrap();
+    let lines = want.lines().to_vec();
+    let mut desk = PumpDesk::new(machine());
+    desk.hello_within(Duration::from_millis(500));
+    let pass = Verdict::Pass { digest: p.digest(), machine: machine().digest() };
+    let digest = desk.arm(&pass, &p, GRBL).expect("armed by a pass");
+    let mut open = by_scheme(no_serial(), opener(GRBL, Duration::from_millis(500)));
+    let who = Origin::LocalUser("una".to_string());
+    let start = PumpEvent::PumpStart {
+        principal: who.clone(),
+        program: digest_hex(digest),
+        dialect: "grbl".to_string(),
+        port: format!("{TCP_SCHEME}127.0.0.1:{port}"),
+    };
+
+    // The first open keeps the hello and prints it once, after "started".
+    let out = desk.apply(&start, &mut *open);
+    let words: Vec<String> =
+        out.iter().filter_map(|s| match s { PumpEvent::Squawk { event: Some(e), .. } => Some(e.clone()), _ => None }).collect();
+    assert_eq!(words, vec!["started".to_string(), format!("hello {}", hello_of(VER_A))], "{out:?}");
+    assert_eq!(desk.hello(), Some(hello_of(VER_A).as_str()));
+
+    // The FIN after five lines: lost at the oldest unacknowledged line.
+    let t0 = Instant::now();
+    let mut words = Vec::new();
+    drive_until(&mut desk, &mut *open, t0, &mut words, |e| e.starts_with("link lost"));
+    assert_eq!(desk.state(), Some(PumpState::LinkLost { at_line: at, program_digest: p.digest() }));
+    let seen = fake1.join().unwrap();
+    assert_eq!(&seen[..5], &lines[..5], "the hello was no program line on the first link");
+
+    // Another board of the same build takes the port: refused by name, the link dropped, the redial goes on.
+    let lb = TcpListener::bind(("127.0.0.1", port)).expect("rebind the lost port");
+    let fake_b = fake_grbl_as(lb, false, None, VER_B);
+    let refused = drive_until(&mut desk, &mut *open, t0, &mut words, |e| e.starts_with("reconnect attempt 1"));
+    match refused {
+        PumpEvent::Squawk { event: Some(e), .. } => {
+            let another = Refused::AnotherBoard { was: hello_of(VER_A), now: Some(hello_of(VER_B)) };
+            assert_eq!(e, format!("reconnect attempt 1 refused: {another:?}; attempt 2 in 500 ms"))
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(desk.state(), Some(PumpState::LinkLost { at_line: at, program_digest: p.digest() }));
+    assert_eq!(desk.rearm(&pass, &p, GRBL), Err(Refused::LinkDown { attempt: 2 }), "no re-arm onto another board");
+    assert!(fake_b.join().unwrap().is_empty(), "another board ran no program line");
+
+    // The same board comes back: relinked as today, re-armed, resumed to done from the lost line.
+    let la = TcpListener::bind(("127.0.0.1", port)).expect("rebind for the same board");
+    let fake_a = fake_grbl(la, false, None);
+    match drive_until(&mut desk, &mut *open, t0, &mut words, |e| e.starts_with("relinked") || e.starts_with("reconnect attempt 2")) {
+        PumpEvent::Squawk { event: Some(e), .. } => {
+            assert_eq!(e, format!("relinked on attempt 2; re-arm to resume from line {at}"))
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(desk.rearm(&pass, &p, GRBL), Ok(at));
+    let out = desk.apply(&PumpEvent::PumpResume { principal: who }, &mut *open);
+    assert!(matches!(&out[..], [PumpEvent::Squawk { event: Some(e), .. }] if e == "resume"), "{out:?}");
+    match drive_until(&mut desk, &mut *open, t0, &mut words, |e| e == "done" || e.starts_with("link lost")) {
+        PumpEvent::Squawk { sent, acked, total, event: Some(e), .. } => {
+            assert_eq!(e, "done");
+            assert_eq!((sent, acked), (total, total));
+        }
+        other => panic!("{other:?}"),
+    }
+    drop(desk);
+    assert_eq!(fake_a.join().unwrap(), lines[5..].to_vec(), "the same board ran only the lines from the lost one on");
 }
