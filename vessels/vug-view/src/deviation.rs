@@ -380,11 +380,11 @@ pub fn gdt_of(scan: &ScanMesh, design: &Design, result: &Result<Deviation, Devia
     }
 }
 
-/// One command on the map: `gdt <face>=<kind>:<tol>` names a tolerance (the face as the corner names it, split at the
-/// LAST `=`; flatness, cylindricity or position, split at the LAST `:`; the tolerance finite and above 0), replacing
-/// the face's callout of the same kind; `gdt clear` removes every callout. A FAIL face is tinted ([`retint`]). Refused
-/// by name, nothing changed: no map, a refused map, `GdtFace` (no such face), `GdtKind` (its surface does not take the
-/// kind), anything else the usage. True when the map changed.
+/// One command on the map: `gdt <face>=<kind>:<tol>` names a tolerance (the face as the corner names it; the grammar
+/// is scan_core's ONE `gdt::Callout::parse`, VUGSCANGDTSPEC SR559: flatness, cylindricity, position or profile, the
+/// tolerance finite and above 0), replacing the face's callout of the same kind; `gdt clear` removes every callout. A
+/// FAIL face is tinted ([`retint`]). Refused by name, nothing changed: no map, a refused map, `GdtFace` (no such face),
+/// `GdtKind` (its surface does not take the kind), anything else the usage. True when the map changed.
 pub fn command(view: &mut View, model: &Model, line: &str) -> Result<bool, String> {
     const USAGE: &str = "usage: gdt <face>=<kind>:<tol> | gdt clear";
     let rest = line.trim().strip_prefix("gdt ").map(str::trim).ok_or(USAGE)?;
@@ -398,13 +398,8 @@ pub fn command(view: &mut View, model: &Model, line: &str) -> Result<bool, Strin
         retint(m, model);
         return Ok(changed);
     }
-    let (face, spec) = rest.rsplit_once('=').ok_or(USAGE)?;
-    let (kind, tol) = spec.rsplit_once(':').ok_or(USAGE)?;
-    let kind = scan_core::Kind::parse(kind).ok_or(USAGE)?;
-    let tol_mm: f64 = tol.parse().map_err(|_| USAGE)?;
-    if face.is_empty() || !(tol_mm.is_finite() && tol_mm > 0.0) {
-        return Err(USAGE.into());
-    }
+    let spec = scan_core::gdt::Callout::parse(rest).map_err(|_| USAGE)?; // VUGSCANGDTSPEC (SR559): the ONE parse; a refusal is the usage
+    let (face, kind, tol_mm) = (spec.face.as_str(), spec.kind, spec.tol_mm);
     let i = m.names.iter().position(|n| n == face).ok_or_else(|| format!("GdtFace {face}"))? as u32;
     if !m.gdt.get(i as usize).is_some_and(|f| f.accepts(kind)) {
         return Err(format!("GdtKind {face} {}", kind.name()));
