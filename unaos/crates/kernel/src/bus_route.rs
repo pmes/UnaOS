@@ -751,7 +751,7 @@ fn tagid_selftest(fx: &Fixture) {
 /// (B1157) owns the table; until it folds this one line is the list (the seat swaps in B1157's table).
 #[cfg(feature = "login")]
 fn relayed_private(v: u8) -> bool {
-    matches!(v, una_abi::BUS_VERB_R3PREF_GET | una_abi::BUS_VERB_R3PREF_LIST | una_abi::BUS_VERB_R3PREF_SET) || (una_abi::BUS_VERB_HOLOCRON_FIRST..=una_abi::BUS_VERB_HOLOCRON_LAST).contains(&v)
+    tag_image(v).is_some() // seat fold: B1158's inline list retired onto B1157's `TAG_IMAGE` (one table of the relayed-private tags)
 }
 
 /// End every live relayed-private fulfiller row that is not a program of the open session (B1155's judge,
