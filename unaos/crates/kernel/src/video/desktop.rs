@@ -2460,7 +2460,7 @@ pub fn shimmer_tick(s: &Shimmer, now_ms: u64, occ: &[(usize, usize, usize, usize
     let hit = |g: &Group| occ.iter().any(|&(x, y, w, h)| (g.x0 as usize) < x + w && x < g.x1 as usize && (g.y0 as usize) < y + h && y < g.y1 as usize);
     let (mut n, mut nb, mut area) = (0u32, 0u32, 0u64);
     let mut run = |g: &Group, n: &mut u32, nb: &mut u32, area: &mut u64| {
-        if g.len == 0 || g.x1 <= g.x0 || g.y1 <= g.y0 || hit(g) {
+        if g.len == 0 || g.x1 <= g.x0 || g.y1 <= g.y0 || hit(g) || shim_pan_late(g, *area) { // SHIMBEAMPAN (B1137): on the live seat, a group the beam reaches before the drain does (its arrival = the px queued before it) is skipped; the rest are kept (file tail). LINE-NEUTRAL fold
             return;
         }
         *n += sf_retint(s, g, t, &mut put);
@@ -2538,7 +2538,7 @@ fn shimmer_live(occ: &[(usize, usize, usize, usize)], pw: usize, ph: usize) {
         );
         (c, nb, gl, px)
     });
-    if let Some((c, nb, gl, px)) = next {
+    shim_pan_disarm(); if let Some((c, nb, gl, px)) = next { // SHIMBEAMPAN (B1137): the pan context lives for this tick only (file tail). LINE-NEUTRAL fold, code first
         SHIM_CURSOR.store(c, Ordering::Relaxed);
         // SHIMMERIDLE (B663): this tick's cost (re-tint + queue) and its boxes, read by the idle seat.
         SHIM_TICK_US.store(now_ns().0.saturating_sub(t0) / 1000, Ordering::Relaxed);
@@ -2687,9 +2687,9 @@ pub fn shimmeridle_selftest() {
     let ok = (3..=7).contains(&ticks) && idle_ticks > 0 && max_us <= 800 && rm_ticks == 0 && steals == 0 && pref_ticks == 0;
     shim_wire();
     serial_println!(
-        ":: SHIMMERIDLE: detail idle_ticks={} pass_max_us={} skips={} backdrop={} why={} carried={} settle_ms={} present={} pass_us={} ::",
+        ":: SHIMMERIDLE: detail idle_ticks={} pass_max_us={} skips={} backdrop={} why={} carried={} settle_ms={} present={} pass_us={} panned={} ::",
         idle_ticks, pass_us, SHIM_IDLE_SKIPS.load(Ordering::Relaxed).wrapping_sub(skip0), crate::video::wallpaper::owns_backdrop() as u8,
-        WhyLabel(SHIM_IDLE_WHY.load(Ordering::Relaxed)), SHIM_IDLE_CARRIED.load(Ordering::Relaxed).wrapping_sub(carried0), settle_ms, shim_present_label(), SHIM_PRESENT_US.load(Ordering::Relaxed)
+        WhyLabel(SHIM_IDLE_WHY.load(Ordering::Relaxed)), SHIM_IDLE_CARRIED.load(Ordering::Relaxed).wrapping_sub(carried0), settle_ms, shim_present_label(), SHIM_PRESENT_US.load(Ordering::Relaxed), shim_panned()
     );
     serial_println!(
         ":: SHIMMERIDLE: idle_ms={} ticks={} max_us={} reduce_motion_ticks={} gate_steals={} -> {} ::",
@@ -3661,7 +3661,7 @@ fn shim_beam_occ<'a>(occ: &[(usize, usize, usize, usize)], buf: &'a mut [(usize,
     buf[..n].copy_from_slice(&occ[..n]);
     let mut k = n;
     let span = s.groups.iter().map(|g| g.y1.saturating_sub(g.y0) as usize).max().unwrap_or(0);
-    if let Some(bands) = crate::video::beam::busy_rows(ph, span, SHIM_BEAM_AHEAD_US) {
+    if let Some(bands) = crate::video::beam::busy_rows(ph, span, SHIM_BEAM_AHEAD_US).filter(|b| !shim_pan_arm(b, ph)) { // SHIMBEAMPAN (B1137): with a drain-measured rate the per-group pan takes these bands instead of the fixed skip (file tail). LINE-NEUTRAL fold
         for (y0, y1) in bands {
             if y1 > y0 && k < buf.len() {
                 buf[k] = (0, y0, pw, y1 - y0);
@@ -3998,4 +3998,131 @@ pub fn login_refill_rows(back: &Back, y0: usize, n: usize) -> Option<(usize, u64
         c.have[y] = true;
     }
     Some((end, crate::video::blitter::cycles_to_us(crate::arch::now_cycles().saturating_sub(t0))))
+}
+
+// ── SHIMBEAMPAN (rmbp-ledger B1137) — TAIL-APPENDED so no line above moves: the shimmer pans to the rows the drain reaches first ──
+//
+// F39SHIMMER (B1099) skipped every group in `beam::busy_rows(.., SHIM_BEAM_AHEAD_US)`, a FIXED 200 us look-ahead, whatever
+// the group's place in the drain. That drops a near group the drain paints in 20 us, and keeps a far group a long drain
+// reaches after the beam has (it then spins in `beam::hold`, the net). Nothing in the drain itself has a 200 us budget.
+// The pan uses each group's ARRIVAL in the drain: c = base + rate * px_before. base is the last tick's cost (the tick
+// precedes the drain). rate is the last ticked drain present's ns per px ((present_us - tick_us) * 1000 / tick px). px_before
+// is `shimmer_tick`'s own `area`, so the order is the loop's own. A group is skipped iff it meets `busy_rows(ph, its height, c)`:
+// the beam reaches its rows before the drain does. Every other group is kept: the rows ahead of the beam's sweep and the rows
+// behind the beam. `panned=` (`:: SHIMMERIDLE: detail`) is the boot-long sum of rows kept that the fixed band would have
+// dropped. `shim_beam_occ` arms the context (this task's id) only on the live seat and only with a rate; armed, the fixed
+// bands are not appended. `shimmer_live` disarms after the tick, so the fixture and splash callers (unarmed, or another task)
+// run as before. Fallback is today's skip exactly: no raster source, no drain-measured rate yet, or aarch64 (no
+// `SHIM_PRESENT_US` there; owed SHIMPAN-ARM). Each group past the occluder test costs one `busy_rows` (one raster read).
+
+/// SHIMBEAMPAN (B1137): the armed live tick's task id + 1 (0 = unarmed), the panel height, the drain's ns per px, the
+/// drain's start (us from now), the fixed 200 us bands (packed by [`shim_band_pack`]), and the rows panned since boot.
+#[cfg(feature = "facet")]
+static SHIM_PAN_TID: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "facet")]
+static SHIM_PAN_PH: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "facet")]
+static SHIM_PAN_RATE: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "facet")]
+static SHIM_PAN_BASE: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "facet")]
+static SHIM_PAN_BAND: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "facet")]
+static SHIM_PANNED: AtomicU64 = AtomicU64::new(0);
+
+/// SHIMBEAMPAN (B1137): `(ns per px, base us)` from the last ticked drain present, or `None` when there is none to read.
+#[cfg(all(target_arch = "x86_64", feature = "facet"))]
+fn shim_pan_rate() -> Option<(u64, u64)> {
+    if !shimmer_present_drain() {
+        return None;
+    }
+    let px = SHIM_TICK_PX.load(Ordering::Relaxed);
+    let tick = SHIM_TICK_US.load(Ordering::Relaxed);
+    let pres = SHIM_PRESENT_US.load(Ordering::Relaxed);
+    if px == 0 || pres <= tick {
+        return None;
+    }
+    Some(((pres - tick).saturating_mul(1000) / px, tick))
+}
+
+/// SHIMBEAMPAN (B1137): no drain-cost record off x86 (owed SHIMPAN-ARM): the fixed band stays.
+#[cfg(all(not(target_arch = "x86_64"), feature = "facet"))]
+fn shim_pan_rate() -> Option<(u64, u64)> {
+    None
+}
+
+/// SHIMBEAMPAN (B1137): two row bands as four 16-bit words. Pure.
+#[cfg(feature = "facet")]
+fn shim_band_pack(b: &[(usize, usize); 2]) -> u64 {
+    let w = |v: usize| (v.min(0xFFFF)) as u64;
+    w(b[0].0) | w(b[0].1) << 16 | w(b[1].0) << 32 | w(b[1].1) << 48
+}
+
+/// SHIMBEAMPAN (B1137): the inverse of [`shim_band_pack`]. Pure.
+#[cfg(feature = "facet")]
+fn shim_band_unpack(w: u64) -> [(usize, usize); 2] {
+    let f = |k: u32| ((w >> k) & 0xFFFF) as usize;
+    [(f(0), f(16)), (f(32), f(48))]
+}
+
+/// SHIMBEAMPAN (B1137): do rows `[y0, y1)` meet either band? Pure.
+#[cfg(feature = "facet")]
+fn shim_meets(b: &[(usize, usize); 2], y0: usize, y1: usize) -> bool {
+    b.iter().any(|&(a, e)| e > a && y0 < e && a < y1)
+}
+
+/// SHIMBEAMPAN (B1137), from `shim_beam_occ`'s `busy_rows` filter: arm the pan for this task when a drain-measured rate
+/// exists, keeping the fixed bands `b` for the `panned=` count. `true` = armed (the bands are not appended).
+#[cfg(feature = "facet")]
+fn shim_pan_arm(b: &[(usize, usize); 2], ph: usize) -> bool {
+    let Some((rate, base)) = shim_pan_rate() else { return false };
+    let Some(tid) = crate::arch::sched::current_id() else { return false };
+    SHIM_PAN_PH.store(ph as u64, Ordering::Relaxed);
+    SHIM_PAN_RATE.store(rate, Ordering::Relaxed);
+    SHIM_PAN_BASE.store(base, Ordering::Relaxed);
+    SHIM_PAN_BAND.store(shim_band_pack(b), Ordering::Relaxed);
+    SHIM_PAN_TID.store(tid.wrapping_add(1), Ordering::Relaxed);
+    true
+}
+
+/// SHIMBEAMPAN (B1137), `shimmer_tick`'s `run` guard: is group `g`, queued after `area` px, met by the beam before the
+/// drain reaches it? `false` unless this task armed the pan (the fixture and splash callers never do).
+#[cfg(feature = "facet")]
+fn shim_pan_late(g: &Group, area: u64) -> bool {
+    let armed = SHIM_PAN_TID.load(Ordering::Relaxed);
+    if armed == 0 || crate::arch::sched::current_id().map(|t| t.wrapping_add(1)) != Some(armed) {
+        return false;
+    }
+    let (y0, y1) = (g.y0 as usize, g.y1 as usize);
+    if y1 <= y0 {
+        return false;
+    }
+    let c = SHIM_PAN_BASE.load(Ordering::Relaxed).saturating_add(SHIM_PAN_RATE.load(Ordering::Relaxed).saturating_mul(area) / 1000).min(crate::video::beam::FRAME_US);
+    let Some(bands) = crate::video::beam::busy_rows(SHIM_PAN_PH.load(Ordering::Relaxed) as usize, y1 - y0, c) else { return false };
+    if shim_meets(&bands, y0, y1) {
+        return true;
+    }
+    if shim_meets(&shim_band_unpack(SHIM_PAN_BAND.load(Ordering::Relaxed)), y0, y1) {
+        SHIM_PANNED.fetch_add((y1 - y0) as u64, Ordering::Relaxed);
+    }
+    false
+}
+
+/// Off-facet [`shim_pan_late`]: no live seat, never armed.
+#[cfg(not(feature = "facet"))]
+#[inline(always)]
+fn shim_pan_late(_g: &Group, _area: u64) -> bool {
+    false
+}
+
+/// SHIMBEAMPAN (B1137), `shimmer_live` after the tick: the pan context is this tick's only.
+#[cfg(feature = "facet")]
+fn shim_pan_disarm() {
+    SHIM_PAN_TID.store(0, Ordering::Relaxed);
+}
+
+/// SHIMBEAMPAN (B1137): `panned=` — rows the pan kept that the fixed 200 us band would have dropped, since boot.
+#[cfg(all(target_arch = "x86_64", feature = "facet"))]
+fn shim_panned() -> u64 {
+    SHIM_PANNED.load(Ordering::Relaxed)
 }
