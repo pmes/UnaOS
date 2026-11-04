@@ -1549,6 +1549,7 @@ fn a_declare_after_link_up_rebounds_the_next_jog_without_a_relink() {
     let jog = |dx: f64| PumpEvent::PumpJog { principal: who(), dx, dy: 0.0, dz: 0.0, feed: 300.0 };
     assert_eq!(said_in(&desk.apply(&jog(150.0), &mut *open)), "jog sent: $J=G91 X150 Y0 Z0 F300");
     assert_eq!(drive_until(&mut desk, &mut *open, t0, &mut words, |e| e.starts_with("jog ")), "jog ok", "{words:?}");
+    settle_at(&mut desk, t0, [150.0, 0.0, 0.0]); // seat fold: wait for the post-jog `?` so the end bound below reads from 150, not from a race (found by SR620)
 
     // A declare on the live link: the next jog is bounded by the declared 120, on the same link.
     let declare = PumpEvent::PumpDeclare { principal: who(), name: "mill".to_string(), x: 120.0, y: 300.0, z: 100.0, dialect: None };

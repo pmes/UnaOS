@@ -1479,3 +1479,9 @@ exec-rmbp-vugcomscanmachinedeclareprefs c17a94a54 wave36 cut61
 exec-rmbp-vugcomscanmarlinposition c17a94a54 wave36 cut61
 exec-rmbp-vugfacedeviationprbposes c17a94a54 wave36 cut61
 exec-rmbp-vugcomscanjogfacemacos c17a94a54 wave36 cut61
+exec-rmbp-f39queuedsetlostreset 85c317a05 wave36 cut63
+exec-rmbp-f39prefscapearlyname 85c317a05 wave36 cut63
+exec-rmbp-f39appsfolderns 85c317a05 wave36 cut63
+exec-rmbp-f39armlateknoboff 85c317a05 wave36 cut63
+exec-rmbp-f39unsetpostrule 85c317a05 wave36 cut63
+exec-rmbp-f39prefsunsetrelay 85c317a05 wave36 cut63
