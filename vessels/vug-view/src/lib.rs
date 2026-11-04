@@ -297,9 +297,10 @@ fn write_atomic(path: &std::path::Path, text: &str) -> Result<(), String> {
 // ---- VUGFACESAVEAS (SR539): the chosen path ----
 
 impl Viewer {
-    /// The Save As field's keys: `Meta+Shift+s` opens it; while it is open it takes every key — a character is typed
-    /// (sketch.rs `type_text`), Backspace pops, Esc or the chord again closes it with nothing written, Enter saves to
-    /// the typed path, any other key does nothing. None when it is closed and the key is not the chord.
+    /// The Save As field's keys: `Meta+Shift+s` opens it; while it is open it takes every key — Left / Right / Home /
+    /// End move its caret (sketch.rs `caret_key`, never typed), a character is typed at the caret, Backspace and Delete
+    /// remove the char before / after it (sketch.rs `type_text_at`, THE free text road), Esc or the chord again closes
+    /// it with nothing written, Enter saves to the typed path, any other key does nothing. None when it is closed and the key is not the chord.
     pub fn save_as_key(&mut self, k: &str) -> Option<bool> {
         let chord = matches!(k, "Meta+Shift+s" | "Meta+Shift+S");
         let j = &mut self.view.design.journal;
@@ -319,7 +320,11 @@ impl Viewer {
             self.save_as_enter(&typed, armed);
             return Some(true);
         }
+        if let Some(moved) = sketch::caret_key(&f.text, &mut f.caret, k) {
+            return Some(moved); // VUGFACESAVEASCARET (SR593): a move never disarms (the text is the same)
+        }
         let back = matches!(k, "BackSpace" | "Backspace" | "\u{8}" | "\u{7f}");
+        let del = matches!(k, "Delete" | "\u{f728}"); // VUGFACESAVEASCARET (SR593): the char after the caret
         let ch = {
             let mut it = k.chars();
             match (it.next(), it.next()) {
@@ -327,7 +332,7 @@ impl Viewer {
                 _ => None,
             }
         };
-        if !sketch::type_text(&mut f.text, ch, back) {
+        if !sketch::type_text_at(&mut f.text, &mut f.caret, ch, back, del) { // VUGFACESAVEASCARET (SR593): at the caret, the `:` line's road
             return Some(false);
         }
         if f.armed {

@@ -908,9 +908,9 @@ impl Viewer {
 // VUGFACEGDTREPORTKEY (SR575) left the `.vugreport` unread in the face and `map_command` reachable only from the flags.
 // `report open` ([`Viewer::report_open`], on [`Viewer::map_command`]'s road) reads the file `report` writes
 // ([`report_target`]) into a [`Sheet`] on the View, painted by journal.rs's ONE panel painter (`paint_panel`), read-only.
-// `:` opens the [`Entry`] when a map is up and nothing else holds the keys; its keys are lib.rs `Viewer::key`'s first
-// ([`Viewer::line_key`], ahead of the Save As field: a typed `s` is the entry's, never the save); its typing is sketch.rs
-// `type_text` and its paint journal.rs `field_line` (the Save As field's). Enter runs the line through
+// `:` opens the [`Entry`] when a map or a sheet is up and nothing else holds the keys; its keys are lib.rs `Viewer::key`'s
+// first ([`Viewer::line_key`], ahead of the Save As field: a typed `s` is the entry's, never the save); its typing is
+// sketch.rs `type_text_at` and its paint journal.rs `field_line_at` (the Save As field's too). Enter runs the line through
 // [`Viewer::map_command`]. BP-vug-5: a printed verdict, nothing changes.
 
 /// An opened `.vugreport`: its lines as read and the first row shown. Read-only: Escape closes, Up / Down scroll.
@@ -949,7 +949,8 @@ impl Viewer {
     /// The command line's and the sheet's keys, before every other (lib.rs `Viewer::key`); None while the Save As field
     /// is open and for every key neither takes. The open entry takes EVERY key: a character is typed, Backspace pops, Up
     /// recalls the last line run, Escape closes, Enter runs the line through [`Viewer::map_command`] (run: the line is
-    /// the last, the entry closes; refused: it stays open naming the refusal). `:` opens it while a map is up and no
+    /// the last, the entry closes; refused: it stays open naming the refusal). `:` opens it while a map or a sheet is up
+    /// (VUGFACESAVEASCARET SR593: with no map the map's words refuse by name) and no
     /// sketch face, edit, pull, gesture or edge tool holds the keys. The shown sheet takes Escape (closes) and Up / Down.
     pub fn line_key(&mut self, k: &str) -> Option<bool> {
         if self.view.design.journal.save_as.is_some() {
@@ -1007,7 +1008,7 @@ impl Viewer {
             }
             return Some(typed);
         }
-        let free = self.view.deviation.is_some() && self.view.design.face.is_none() && !crate::journal::busy(&self.view.design) && self.view.fillet.is_none();
+        let free = (self.view.deviation.is_some() || self.view.sheet.is_some()) && self.view.design.face.is_none() && !crate::journal::busy(&self.view.design) && self.view.fillet.is_none(); // VUGFACESAVEASCARET (SR593): a sheet with no map opens the line too
         if k == ":" && free {
             let e = &mut self.view.entry;
             e.open = true;
@@ -1032,7 +1033,7 @@ impl Viewer {
 }
 
 /// The sheet in the panel (journal.rs `paint_panel`: its lines upper-cased in the primary text colour from its top row)
-/// and the open command line bottom left (journal.rs `field_line`, label `:`), its refusal one row above in the critical
+/// and the open command line bottom left (journal.rs `field_line_at`, label `:`), its refusal one row above in the critical
 /// status colour.
 pub fn line_overlay(view: &View, fr: &mut Frame) {
     if let Some(s) = &view.sheet {

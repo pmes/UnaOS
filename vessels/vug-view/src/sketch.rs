@@ -1043,16 +1043,11 @@ pub(crate) fn type_into(buf: &mut String, ch: Option<char>, back: bool) -> bool 
     true
 }
 
-/// VUGFACESAVEAS (SR539): a typed key into a free text (the Save As path): any non-control character, Backspace pops.
-/// False when the key is none of them (a key name such as `Shift_L`); the caller owns Enter and Esc, as with [`type_into`].
-pub(crate) fn type_text(buf: &mut String, ch: Option<char>, back: bool) -> bool {
-    let mut at = buf.chars().count(); // VUGFACECOMMANDCARET (SR587): the caret at the end, the one road below
-    type_text_at(buf, &mut at, ch, back, false)
-}
-
 // ---- VUGFACECOMMANDCARET (LEDGER SR587): the free text road with a caret ----
-// [`type_text`] is the caret-at-the-end caller of [`type_text_at`] (the Save As field rides it unchanged); the `:` command
-// line (deviation.rs `Viewer::line_key`) holds a caret and calls it directly, with [`caret_key`] for the moves.
+// VUGFACESAVEASCARET (SR593): both free text fields hold a caret and call [`type_text_at`] directly, with [`caret_key`]
+// for the moves: the `:` command line (deviation.rs `Viewer::line_key`) and the Save As field (lib.rs
+// `Viewer::save_as_key`); `type_text`, the caret-at-the-end caller (VUGFACESAVEAS SR539), retired with its last caller.
+// The caller owns Enter and Esc, as with [`type_into`].
 
 /// The byte offset of char `i` in `s` (its length past the last char).
 fn char_byte(s: &str, i: usize) -> usize {
@@ -1061,7 +1056,7 @@ fn char_byte(s: &str, i: usize) -> usize {
 
 /// A typed key into a free text at the caret `at` (in chars, clamped to the text): a non-control character is inserted
 /// before the caret and the caret steps past it, Backspace removes the char before the caret, Delete (`del`) the char
-/// after it (each true even with nothing to remove, as [`type_text`]'s Backspace). False when the key is none of them.
+/// after it (each true even with nothing to remove). False when the key is none of them (a key name such as `Shift_L`).
 pub(crate) fn type_text_at(buf: &mut String, at: &mut usize, ch: Option<char>, back: bool, del: bool) -> bool {
     let n = buf.chars().count();
     *at = (*at).min(n);

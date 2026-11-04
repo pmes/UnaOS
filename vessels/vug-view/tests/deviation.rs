@@ -1120,7 +1120,7 @@ fn a_typed_command_line_runs_the_map_command() {
     assert!(!v.view.entry.open);
     assert_eq!(v.view.deviation.as_ref().unwrap().callouts.len(), 1, "nothing else ran");
 
-    // The line opens only over a map.
+    // The line opens only over a map or a sheet (VUGFACESAVEASCARET SR593: this face has neither).
     let mut plain = Viewer::open_doc(doc_core::read(DOC).expect("the document reads"), "fixture", SIZE, Preset::Una).expect("the document opens");
     plain.key(":");
     assert!(!plain.view.entry.open, "no map: `:` opens nothing");
@@ -1307,4 +1307,40 @@ fn a_bare_name_is_beside_the_opened_part_for_report_open_and_save_as() {
     // Nothing opened: a relative name is the cwd's, as typed.
     let plain = Viewer::open_doc(doc_core::read(DOC).expect("the document reads"), "fixture", SIZE, Preset::Una).expect("the document opens");
     assert_eq!(vug_view::journal::beside(&plain, "x.vugreport"), std::path::PathBuf::from("x.vugreport"));
+}
+
+// VUGFACESAVEASCARET (LEDGER SR593): the `:` line opens over a face with a sheet and no map (deviation.rs `line_key`'s
+// gate reads map or sheet); `report open <path>` runs there and the map's words refuse by name.
+
+#[test]
+fn the_command_line_opens_over_a_sheet_with_no_map() {
+    let (mut m, dir) = report_open_fixture("vugfacesaveascaret-nomap");
+    let (_, top) = plate_top(m.view.deviation.as_ref().unwrap());
+    assert_eq!(m.map_command(&format!("gdt {top}=flatness:0.001")), Ok(true));
+    assert_eq!(m.map_command("report"), Ok(true), "SR571's road writes the file");
+    let path = dir.join("part.vugreport");
+    let lines: Vec<String> = std::fs::read_to_string(&path).expect("the report is written").lines().map(String::from).collect();
+    let ps = path.to_str().unwrap();
+
+    let mut v = Viewer::open_report(ps, SIZE, Preset::Una).expect("the report opens");
+    assert!(v.view.deviation.is_none(), "no map");
+    assert!(v.key(":"), "a sheet with no map opens the line");
+    assert!(v.view.entry.open && v.view.entry.text.is_empty(), "the `:` is not typed");
+    assert!(v.input(&bandy::SMessage::BrowserText(format!("report open {ps}"))));
+    assert!(v.key("Return"), "Enter runs the line");
+    assert!(!v.view.entry.open, "`report open <path>` ran with no map");
+    assert_eq!(v.view.sheet.as_ref().map(|s| s.lines.clone()), Some(lines), "the typed path's file is the sheet");
+
+    assert!(v.key(":"));
+    assert!(v.input(&bandy::SMessage::BrowserText(format!("gdt {top}=flatness:0.1"))));
+    assert!(v.key("Return"));
+    assert!(v.view.entry.open, "a refused line stays open");
+    assert_eq!(v.view.entry.refused.as_deref(), Some("gdt: no map"), "the map's word refused by name");
+    println!("no-map line refused {:?}", v.view.entry.refused);
+    assert!(v.key("Escape"), "Escape closes the line first");
+    assert!(!v.view.entry.open && v.view.sheet.is_some(), "the sheet stays");
+    assert!(v.key("Escape"), "Escape closes the sheet");
+    assert!(v.view.sheet.is_none());
+    v.key(":");
+    assert!(!v.view.entry.open, "no map and no sheet: `:` opens nothing");
 }
