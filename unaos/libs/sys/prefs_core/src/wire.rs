@@ -404,6 +404,7 @@ system.accessibility.forced_colors = false\n\
 system.accessibility.increase_contrast = false\n\
 system.accessibility.invert = false\n\
 system.accessibility.reduce_motion = false\n\
+system.accessibility.shimmer = true\n\
 system.accessibility.show_performance = false\n\
 system.accessibility.text_size = \"default\"\n\
 system.accessibility.zoom = 0\n\
