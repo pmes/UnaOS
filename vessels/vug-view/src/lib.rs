@@ -130,13 +130,13 @@ impl Viewer {
     }
 
     /// VUGFACEDEVIATION (SR525): THE deviation road — a scan mesh (.ply / .stl / .obj through model.rs's readers; a
-    /// .prb is refused by name: fusion is tools/scan's) measured against a design document (doc_core `read`), drawn at
+    /// .prb fused by scan_core `fuse::fuse_prb`, VUGFACEDEVIATIONPRB SR610) measured against a design document (doc_core `read`), drawn at
     /// the aligned pose in the band's colours. The title is the scan's file name.
     pub fn open_against(scan: &str, design: &str, size: (u32, u32), preset: Preset) -> Result<Viewer, String> {
         let (title, mesh) = read_scan(scan)?; // VUGFACEDEVIATIONSOLIDFAULT (SR565): the one scan reader, shared with open_scan
         let text = std::fs::read_to_string(design).map_err(|e| format!("{design}: {e}"))?;
         let doc = doc_core::read_with(&text, &doc_host::DirLib::beside(std::path::Path::new(design))).map_err(|e| format!("{design}: {e:?}"))?; // VUGMAKEMACHINELIBFACE (SR548)
-        Viewer::open_deviation(deviation::scan_mesh(mesh), &doc, &title, size, preset, None).map_err(|e| format!("{design}: {e}")).map(|mut v| { v.hold_names(Some(title.as_str()), Some(design)); v }) // VUGFACEGDTREPORTKEY (SR575): the scan's name and the design path held for the report; VUGFACEGDTREMEASURE (SR560): a PLY carries no truncation
+        Viewer::open_deviation(mesh, &doc, &title, size, preset, None).map_err(|e| format!("{design}: {e}")).map(|mut v| { v.hold_names(Some(title.as_str()), Some(design)); v }) // VUGFACEGDTREPORTKEY (SR575): the scan's name and the design path held for the report; VUGFACEGDTREMEASURE (SR560): a PLY carries no truncation
     }
 
     /// VUGFACEDEVIATION (SR525): a scan measured against `doc` at `deviation::BAND_MM` (the test door): the model is the
@@ -381,7 +381,7 @@ impl Viewer {
 impl Viewer {
     /// A .vug part opened as itself (the journal, [`Viewer::open`]'s .vug road) with a scan mesh measured against the
     /// journal's document (`Viewer::against_journal`, generation 0): edits of the part re-measure the scan. The title
-    /// is the part's file name; a part that is not a .vug, a .prb scan, or a document the journal refuses are named.
+    /// is the part's file name; a part that is not a .vug or a document the journal refuses are named (a .prb scan is fused).
     pub fn open_scan(part: &str, scan: &str, size: (u32, u32), preset: Preset) -> Result<Viewer, String> {
         let p = std::path::Path::new(part);
         if !p.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("vug")) {
@@ -390,20 +390,23 @@ impl Viewer {
         let title = p.file_name().and_then(|s| s.to_str()).unwrap_or("vug").to_string();
         let (sname, mesh) = read_scan(scan)?; // VUGFACEGDTREPORTKEY (SR575): the scan's file name kept
         let mut v = Viewer::open_vug(part, &title, size, preset)?;
-        v.against_journal(deviation::scan_mesh(mesh)).map_err(|e| format!("{part}: {e}"))?; v.hold_names(Some(sname.as_str()), None); // VUGFACEGDTREPORTKEY (SR575): the report header names the scan
+        v.against_journal(mesh).map_err(|e| format!("{part}: {e}"))?; v.hold_names(Some(sname.as_str()), None); // VUGFACEGDTREPORTKEY (SR575): the report header names the scan
         Ok(v)
     }
 }
 
-/// A scan mesh by path (.ply / .stl / .obj through model.rs's readers) and its file name, the title; a .prb is refused
-/// by name (fusion is tools/scan's). The one reader [`Viewer::open_against`] and [`Viewer::open_scan`] share.
-fn read_scan(scan: &str) -> Result<(String, scan_core::Mesh), String> {
+/// A scan by path and its file name, the title: a mesh (.ply / .stl / .obj through model.rs's readers, `scan_mesh`'s unit
+/// confidence) or, VUGFACEDEVIATIONPRB (SR610), a .prb recording fused by scan_core `fuse::fuse_prb` at tools/scan's
+/// defaults (`Knobs::OFF`): one depth frame at the identity, several through the tracker. The one reader
+/// [`Viewer::open_against`] and [`Viewer::open_scan`] share.
+fn read_scan(scan: &str) -> Result<(String, scan_core::ScanMesh), String> {
     let p = std::path::Path::new(scan);
     let title = p.file_name().and_then(|s| s.to_str()).unwrap_or("vug").to_string();
     if p.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("prb")) {
-        return Err(format!("{scan}: ScanPrb (fuse it first: `scan {scan} -o scan.ply`)"));
+        let b = std::fs::read(scan).map_err(|e| format!("{scan}: {e}"))?;
+        return scan_core::fuse::fuse_prb(&b, scan_core::tsdf::Knobs::OFF).map(|m| (title, m)).map_err(|e| format!("{scan}: {e:?}"));
     }
-    Ok((title, model::read_mesh(scan)?))
+    Ok((title, deviation::scan_mesh(model::read_mesh(scan)?)))
 }
 
 // ---- VUGFACEJOURNALFAULTFIXMANY (LEDGER SR584): the machine shelf beside the part, handed to the journal ----

@@ -79,10 +79,11 @@ use probe_core::recording::{self, RecordingError};
 use probe_core::{FrameError, StreamKind};
 use scan_core::{
     AlignParams, Deviation, DesignError, DeviationError, ScanMesh, colour, design_of, measure, shade, // VUGSCANDEVIATION (SR510); VUGFACEDEVIATION (SR525): the builder and the ramp are scan_core's
-    DepthScale, Fit, FitError, Floor, Frame, Gap, Intrinsics, Keyframes, LoopParams, PixelFormat, Plane, Primitive,
-    Reintegrate, ScanError, Shape, Shot, Tol, Topo, TrackError, Tracker, Transform, Tsdf, Vec3, close_loop, detect, extract,
-    fit_plane, reintegrate,
+    DepthScale, Fit, FitError, Floor, Frame, Gap, Intrinsics, PixelFormat, Plane, Primitive,
+    ScanError, Shape, Shot, Tol, Topo, TrackError, Transform, Vec3, detect, extract,
+    fit_plane,
 };
+use scan_core::fuse::{FuseError, Road, Step, TrackLog}; // VUGFACEDEVIATIONPRB (SR610): THE fuse is scan_core's
 
 /// |RᵀR − I| bound for a `--poses` rotation: the rounding of a matrix printed to 6 decimals.
 const POSE_RIGID: f64 = 1e-6;
@@ -167,7 +168,7 @@ fn num<T: std::str::FromStr>(it: &mut impl Iterator<Item = String>) -> T {
 }
 
 fn parse_args() -> Args {
-    let mut a = Args { voxel: 4.0, band: 3.0, ..Args::default() };
+    let mut a = Args { voxel: scan_core::fuse::VOXEL_MM, band: 3.0, ..Args::default() }; // VUGFACEDEVIATIONPRB (SR610): scan_core's default voxel
     let mut it = std::env::args().skip(1).peekable();
     while let Some(s) = it.next() {
         match s.as_str() {
@@ -229,17 +230,14 @@ fn load_prb(a: &Args, b: &[u8]) -> Result<(Vec<Loaded>, MotionCount), Refusal> {
     let rec = recording::read(b).map_err(Refusal::Recording)?;
     let accel = rec.motion.iter().filter(|m| m.record.kind == probe_core::ImuKind::Accel).count();
     let motion = (accel, rec.motion.len() - accel, rec.extrinsic().is_some());
-    let mut out = Vec::new();
-    for (index, r) in rec.depth().enumerate() {
-        let scale = match (a.units_um, r.depth_scale()) {
-            (Some(0), _) => return Err(Refusal::UnitsZero),
-            (Some(u), _) => DepthScale::from_micrometres(u),
-            (None, Some(s)) => s,
-            (None, None) => return Err(Refusal::NoDepthUnits { index }),
-        };
-        out.push(Loaded { frame: r.frame.clone(), scale, intrinsics: r.intrinsics() });
-    }
-    Ok((out, motion))
+    // VUGFACEDEVIATIONPRB (SR610): the per-record scale / intrinsics rule is scan_core's `prb_depth`; `--units-um` here.
+    let units = match a.units_um {
+        Some(0) if rec.depth().next().is_some() => return Err(Refusal::UnitsZero),
+        Some(0) | None => None,
+        Some(u) => Some(DepthScale::from_micrometres(u)),
+    };
+    let depth = scan_core::fuse::prb_depth(&rec, units).map_err(|index| Refusal::NoDepthUnits { index })?;
+    Ok((depth.into_iter().map(|(f, scale, intrinsics)| Loaded { frame: f.clone(), scale, intrinsics }).collect(), motion))
 }
 
 /// `.csv`: rs-convert's metres (or, `--csv-raw`, integer Z16 units), one line per row.
@@ -367,25 +365,20 @@ fn load_poses(path: &str) -> Result<Vec<Transform>, Refusal> {
     Ok(out)
 }
 
-/// `--track` (VUGSCANTRACK, LEDGER SR493): frame 0 at the identity, each later frame tracked against the model and
-/// integrated through `Tsdf::integrate_tracked` (SR478's road); a `Lost` or depthless frame skipped and named. Returns
-/// the report's `track:` lines.
-fn fuse_tracked(t: &mut Tsdf, frames: &[Loaded], intr: &[Intrinsics]) -> Result<String, Refusal> {
-    let mut tr = Tracker::new(t, Tol::DEFAULT);
-    let mut kf = Keyframes::new(LoopParams::for_volume(t)); // VUGSCANLOOP (SR500): the tracked poses, for close_loop
+/// `--track` (VUGSCANTRACK, LEDGER SR493): the report's `track:` lines from scan_core's tracked road (frame 0 at the
+/// identity, each later frame through `Tsdf::integrate_tracked`, a `Lost` or depthless frame skipped and named), then
+/// the `loop:` lines. VUGFACEDEVIATIONPRB (SR610): the road is scan_core `fuse::fuse`; this tool keeps the lines.
+fn track_report(log: &TrackLog, frames: usize) -> String {
     let (mut tracked, mut lost, mut fine_max) = (0usize, 0usize, 0u32);
     let mut lines = String::new();
-    for (k, l) in frames.iter().enumerate() {
-        let anchor = t.frames() == 0;
-        match t.integrate_tracked(&mut tr, &l.frame, l.scale, &intr[k], None) {
-            Ok((pose, _)) if anchor => {
-                kf.observe(k as u32, pose, None);
+    for (k, step) in log.steps.iter().enumerate() {
+        match step {
+            Step::Anchor => {
                 let _ = writeln!(lines, "track: frame={k} pose=identity");
             }
-            Ok((pose, _)) => {
+            Step::Tracked(m) => {
                 tracked += 1;
-                kf.observe(k as u32, pose, tr.last());
-                let Some(s) = tr.last() else { continue };
+                let Some(s) = m else { continue };
                 fine_max = fine_max.max(s.level_iterations[2]);
                 let frac = if s.valid > 0 { s.inliers as f64 / s.valid as f64 } else { 0.0 };
                 let _ = writeln!(
@@ -394,39 +387,27 @@ fn fuse_tracked(t: &mut Tsdf, frames: &[Loaded], intr: &[Intrinsics]) -> Result<
                     s.inliers, s.valid, s.rms_mm, s.level_iterations[0], s.level_iterations[1], s.level_iterations[2]
                 );
             }
-            Err(TrackError::Scan(error)) if anchor => return Err(Refusal::Integrate { frame: k, error }),
-            Err(TrackError::Lost { inliers, residual_mm }) => {
+            Step::Lost { inliers, residual_mm } => {
                 lost += 1;
                 let _ = writeln!(lines, "track: frame={k} lost inliers={inliers} rms_mm={residual_mm:.3}");
             }
-            Err(TrackError::Scan(ScanError::NoDepth)) => {
+            Step::NoDepth => {
                 lost += 1;
                 let _ = writeln!(lines, "track: frame={k} lost no_depth");
             }
-            Err(error) => return Err(Refusal::Track { frame: k, error }),
         }
     }
-    let head = format!("track: frames={} tracked={tracked} lost={lost} fine_iters_max={fine_max}\n", frames.len());
-    let closed = close_tracked_loop(t, &kf, frames, intr)?;
-    Ok(head + &lines + &closed)
+    let head = format!("track: frames={frames} tracked={tracked} lost={lost} fine_iters_max={fine_max}\n");
+    head + &lines + &loop_report(log)
 }
 
-/// VUGSCANLOOP (LEDGER SR500): the tracked road's loop closure. scan_core's `close_loop` over the observed poses; on a
-/// closure the volume is replaced by every tracked frame fused again at its corrected pose (`reintegrate`; a refusal
-/// is the run's `Integrate`, the volume as it was). A graph scan_core refuses (`GraphError`) is printed and the tracked
-/// volume kept. Returns the report's `loop:` lines.
-fn close_tracked_loop(t: &mut Tsdf, kf: &Keyframes, frames: &[Loaded], intr: &[Intrinsics]) -> Result<String, Refusal> {
-    let shot = move |k: u32| frames.get(k as usize).map(|l| Shot { frame: &l.frame, scale: l.scale, intr: &intr[k as usize] });
-    let lp = match close_loop(kf, t, shot) {
+/// VUGSCANLOOP (LEDGER SR500): the report's `loop:` lines from scan_core's closure (`close_loop`, `reintegrate` on a
+/// closure, inside `fuse::fuse`); a graph scan_core refuses is printed and the tracked volume was kept.
+fn loop_report(log: &TrackLog) -> String {
+    let lp = match &log.closed {
         Ok(lp) => lp,
-        Err(e) => return Ok(format!("loop: keyframes={} refused {e:?}\n", kf.nodes().len())),
+        Err(e) => return format!("loop: keyframes={} refused {e:?}\n", log.nodes),
     };
-    if lp.closures > 0 {
-        *t = reintegrate(t, &lp.poses, shot).map_err(|e| match e {
-            Reintegrate::Scan { frame, error } => Refusal::Integrate { frame: frame as usize, error },
-            Reintegrate::NoFrame { frame } => Refusal::FrameIndex { frame: frame as usize, frames: frames.len() },
-        })?;
-    }
     let g = |x: Option<Gap>| x.map_or("none".to_string(), |g| format!("{:.3}/{:.3}", g.deg, g.mm));
     let mut out = format!(
         "loop: keyframes={} candidates={} closures={} before={} after={}\n",
@@ -449,7 +430,17 @@ fn close_tracked_loop(t: &mut Tsdf, kf: &Keyframes, frames: &[Loaded], intr: &[I
             Err(r) => writeln!(out, "loop: candidate new={} old={} refused {r:?}", c.new, c.old),
         };
     }
-    Ok(out)
+    out
+}
+
+/// VUGFACEDEVIATIONPRB (SR610): scan_core's fuse refusals on this tool's names (a closure's missing frame is `FrameIndex`).
+fn fuse_refusal(e: FuseError, frames: usize) -> Refusal {
+    match e {
+        FuseError::Volume(e) => Refusal::Volume(e),
+        FuseError::Integrate { frame, error } => Refusal::Integrate { frame, error },
+        FuseError::Track { frame, error } => Refusal::Track { frame, error },
+        FuseError::NoFrame { frame } => Refusal::FrameIndex { frame, frames },
+    }
 }
 
 fn v3(v: Vec3) -> String {
@@ -515,16 +506,14 @@ fn run(a: &Args) -> Result<String, Refusal> {
         };
         intr.push(i);
     }
-    let trunc = a.trunc.unwrap_or(3.0 * a.voxel);
-    let mut t = Tsdf::new(a.voxel, trunc, Tol::DEFAULT).map_err(Refusal::Volume)?.with_knobs(knobs_of(&a)); // VUGSCANTSDFEDGELATERAL (SR574): EDGE-CARRY
-    let track = if a.track {
-        Some(fuse_tracked(&mut t, &frames, &intr)?)
-    } else {
-        for (k, l) in frames.iter().enumerate() {
-            t.integrate(&l.frame, l.scale, &intr[k], &poses[k]).map_err(|error| Refusal::Integrate { frame: k, error })?;
-        }
-        None
-    };
+    let trunc = a.trunc.unwrap_or(scan_core::fuse::TRUNC_VOXELS * a.voxel); // VUGFACEDEVIATIONPRB (SR610): scan_core's default band
+    // VUGFACEDEVIATIONPRB (SR610): THE fuse is scan_core's `fuse::fuse` (this tool's posed loop and tracked road, lifted);
+    // VUGSCANTSDFEDGELATERAL (SR574): EDGE-CARRY through `knobs_of`.
+    let shots: Vec<Shot> = frames.iter().zip(&intr).map(|(l, i)| Shot { frame: &l.frame, scale: l.scale, intr: i }).collect();
+    let road = if a.track { Road::Track } else { Road::Posed(&poses) };
+    let fused = scan_core::fuse::fuse(&shots, road, a.voxel, trunc, knobs_of(&a)).map_err(|e| fuse_refusal(e, frames.len()))?;
+    let t = fused.tsdf;
+    let track = fused.track.as_ref().map(|log| track_report(log, frames.len()));
     let sm = extract(&t).map_err(Refusal::Extract)?;
     let loops: Result<Vec<Vec<u32>>, Topo> = sm.mesh.boundary_loops();
     let band = Tol { lin: a.band, ang: BAND_DEG.to_radians() };

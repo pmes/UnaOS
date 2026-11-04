@@ -1467,3 +1467,9 @@ exec-rmbp-vugcomscanmachinedeclare 2f4c28e12 wave36 cut60
 exec-rmbp-vugphotocropmetaitxt 2f4c28e12 wave36 cut60
 exec-rmbp-vugscandeviationcoarse 2f4c28e12 wave36 cut60
 exec-rmbp-vugcomscanjogfacegtk 2f4c28e12 wave36 cut60
+exec-rmbp-f39relayqueuedsetlost 6afdafb45 wave36 cut62
+exec-rmbp-f39prefscaparmearly 6afdafb45 wave36 cut62
+exec-rmbp-f39prefscapnspath 6afdafb45 wave36 cut62
+exec-rmbp-f39armforgetlatearm 6afdafb45 wave36 cut62
+exec-rmbp-f39unsetpostroads 6afdafb45 wave36 cut62
+exec-rmbp-f39hidwhonotick 6afdafb45 wave36 cut62
