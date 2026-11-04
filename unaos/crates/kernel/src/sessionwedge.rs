@@ -715,7 +715,7 @@ fn pick_live(dead: usize, render: Option<usize>) -> Option<usize> { crate::hidst
             None => break,
         }
     }
-    let c = crate::arch::sched::sibling_online_cpu(dead);
+    let c = crate::arch::sched::sibling_online_cpu_skip(dead, skip); // F39HIDPLACESVC (B1109) HID-PLACE-SVC: the sibling tier skips the hid pump's core too, so `apart`'s no-skip retry runs only when no other sibling answers
     if c != dead && c != skip && Some(c) != render && !crate::arch::sched::is_dead_core(c) { Some(c) } else { None }
 }
 
