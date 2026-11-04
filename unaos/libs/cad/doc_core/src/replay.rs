@@ -315,31 +315,7 @@ pub fn replay(doc: &Doc, tol: Tol) -> Replay {
     }
 
     // 4. The Make: the one machine, then each Op in order with the tool the previous Op left in the spindle.
-    let mut machine: Option<Machine> = None;
-    for s in &doc.stmts {
-        match s {
-            Stmt::Machine(m) => {
-                machine = Some(Machine {
-                    kind: m.kind,
-                    kinematics: m.kinematics,
-                    axes: Vec::new(),
-                    power: m.power,
-                    envelope: m.envelope,
-                    safe_z: m.safe_z,
-                    units: m.units,
-                    tools: Vec::new(),
-                    stock: None,
-                    fixtures: Vec::new(),
-                    loaded: m.loaded,
-                })
-            }
-            Stmt::Axis(a) => machine.iter_mut().for_each(|m| m.axes.push(*a)),
-            Stmt::Tool(t) => machine.iter_mut().for_each(|m| m.tools.push(*t)),
-            Stmt::Stock(st) => machine.iter_mut().for_each(|m| m.stock = Some(*st)),
-            Stmt::Fixture(fx) => machine.iter_mut().for_each(|m| m.fixtures.push(fx.clone())),
-            _ => {}
-        }
-    }
+    let machine: Option<Machine> = machine_of(doc); // VUGMAKEMACHINELIB (SR544): the one Machine assembly
     let mt = make_tol(tol);
     let mut program: Option<Program> = None;
     let mut all = true;
@@ -428,4 +404,47 @@ fn edit_step(r: &mut Replay, built: &mut BTreeSet<String>, s: &Stmt, line: u32, 
         Err(e) => fail(r, line, id, Fault::Brep(e)),
     }
     true
+}
+
+// ---- VUGMAKEMACHINELIB (SR544): the one road from a document to make_core's Machine ----
+
+/// The document's machine as make_core's `Machine` (None without a machine statement): the machine statement, then the
+/// axis / tool / stock / fixture statements in order. A library machine's axes and tools fold in at the machine's own
+/// line, so a part naming a library gives the SAME `Machine` (and `Machine::digest`) as the inline form. Replay's
+/// step 4 reads it; a face or tool reviewing the Program reads it too.
+pub fn machine_of(doc: &Doc) -> Option<Machine> {
+    let mut machine: Option<Machine> = None;
+    for s in &doc.stmts {
+        fold_machine(&mut machine, s);
+    }
+    machine
+}
+
+/// One statement into the machine under assembly (anything but the Make's statements is left alone).
+fn fold_machine(machine: &mut Option<Machine>, s: &Stmt) {
+    match s {
+        Stmt::Machine(m) => {
+            *machine = Some(Machine {
+                kind: m.kind,
+                kinematics: m.kinematics,
+                axes: Vec::new(),
+                power: m.power,
+                envelope: m.envelope,
+                safe_z: m.safe_z,
+                units: m.units,
+                tools: Vec::new(),
+                stock: None,
+                fixtures: Vec::new(),
+                loaded: m.loaded,
+            });
+            for l in m.lib.iter().flat_map(|l| l.stmts.iter()) {
+                fold_machine(machine, l);
+            }
+        }
+        Stmt::Axis(a) => machine.iter_mut().for_each(|m| m.axes.push(*a)),
+        Stmt::Tool(t) => machine.iter_mut().for_each(|m| m.tools.push(*t)),
+        Stmt::Stock(st) => machine.iter_mut().for_each(|m| m.stock = Some(*st)),
+        Stmt::Fixture(fx) => machine.iter_mut().for_each(|m| m.fixtures.push(fx.clone())),
+        _ => {}
+    }
 }

@@ -18,6 +18,8 @@ use crate::{
     TOOL_KINDS, Tol, UNITS, VERSION, What, of_word,
 };
 use crate::{OP_KINDS, ROLES}; // VUGFACEFILLET (SR511)
+use crate::{Lib, MachineLib}; // VUGMAKEMACHINELIB (SR544)
+use alloc::boxed::Box; // VUGMAKEMACHINELIB (SR544)
 
 /// A lexed value and the column it starts at.
 #[derive(Clone, Debug)]
@@ -235,8 +237,14 @@ fn lex_line(s: &str, line: u32) -> Result<Option<Toks>, Refusal> {
     Ok(Some(t))
 }
 
-/// Read a document. The first statement is the header; every later line is one statement or blank / comment.
+/// Read a document. The first statement is the header; every later line is one statement or blank / comment. A
+/// `machine <id> lib=<name>` refuses `UnknownLib` here: [`read_with`] takes the resolver (VUGMAKEMACHINELIB, SR544).
 pub fn read(text: &str) -> Result<Doc, Refusal> {
+    read_with(text, &NoLib)
+}
+
+/// VUGMAKEMACHINELIB (SR544): [`read`] with the caller's library lookup for `machine <id> lib=<name>`.
+pub fn read_with(text: &str, lib: &dyn Lib) -> Result<Doc, Refusal> {
     let mut doc: Option<Doc> = None;
     let mut st = State { decls: BTreeMap::new(), machine: false, stock: false };
     for (n, raw) in text.split('\n').enumerate() {
@@ -244,7 +252,7 @@ pub fn read(text: &str) -> Result<Doc, Refusal> {
         let raw = raw.strip_suffix('\r').unwrap_or(raw);
         let Some(t) = lex_line(raw, line)? else { continue };
         if let Some(d) = doc.as_mut() {
-            let s = statement(t, line, &mut st)?;
+            let s = statement(t, line, &mut st, lib)?;
             d.stmts.push(s);
             d.lines.push(line);
         } else {
@@ -527,7 +535,7 @@ fn no_id(t_id: &Option<(String, u32)>, line: u32) -> Result<(), Refusal> {
 }
 
 /// One statement by its verb.
-fn statement(t: Toks, line: u32, st: &mut State) -> Result<Stmt, Refusal> {
+fn statement(t: Toks, line: u32, st: &mut State, lib: &dyn Lib) -> Result<Stmt, Refusal> {
     let Toks { verb, vcol, id: tid, items } = t;
     let mut f = Fields { line, vcol, items };
     let s = match verb.as_str() {
@@ -593,6 +601,19 @@ fn statement(t: Toks, line: u32, st: &mut State) -> Result<Stmt, Refusal> {
             if st.machine {
                 return Err(Refusal { line, col: vcol, what: What::SecondMachine });
             }
+            let loaded = match f.opt("loaded") {
+                Some(v) => Some(int_max(&v, "loaded", line, u32::MAX as u64)? as u32),
+                None => None,
+            };
+            // VUGMAKEMACHINELIB (SR544): `lib=<name>` takes the machine, its axes and tools from the library; the part
+            // keeps its id and `loaded`, every other machine key is unknown beside it.
+            if let Some(lv) = f.opt("lib") {
+                f.done()?;
+                let m = lib_machine(&lv, line, lib)?;
+                st.machine = true;
+                let id = st.declare(id, line, Kind::Machine, None)?;
+                return Ok(Stmt::Machine(MachineStmt { id, loaded, ..m }));
+            }
             let name = f.text("name")?;
             let kind = f.pick("kind", &MACHINE_KINDS)?;
             let kinematics = f.pick("kinematics", &KINEMATICS)?;
@@ -603,10 +624,6 @@ fn statement(t: Toks, line: u32, st: &mut State) -> Result<Stmt, Refusal> {
             let pk = f.pick("power", &POWER_KINDS)?;
             let max = f.f64("power_max")?;
             let ask_above = f.f64("ask_above")?;
-            let loaded = match f.opt("loaded") {
-                Some(v) => Some(int_max(&v, "loaded", line, u32::MAX as u64)? as u32),
-                None => None,
-            };
             f.done()?;
             st.machine = true;
             let id = st.declare(id, line, Kind::Machine, None)?;
@@ -620,6 +637,7 @@ fn statement(t: Toks, line: u32, st: &mut State) -> Result<Stmt, Refusal> {
                 safe_z,
                 power: Power { kind: pk, max, ask_above },
                 loaded,
+                lib: None, // VUGMAKEMACHINELIB (SR544)
             })
         }
         "axis" | "tool" | "stock" | "fixture" => {
@@ -931,4 +949,45 @@ fn edge_names(v: &V, key: &str, line: u32) -> Result<Vec<brep_core::Name>, Refus
         });
     }
     Ok(out)
+}
+
+// ---- VUGMAKEMACHINELIB (SR544): a machine from a library ----
+
+/// The resolver that holds nothing: [`read`]'s, and a library's own (a library naming a library refuses).
+struct NoLib;
+
+impl Lib for NoLib {
+    fn resolve(&self, _name: &str) -> Option<String> {
+        None
+    }
+}
+
+/// The `lib=<name>` value resolved and read by THE reader: the library machine's statement with its axes / tools held
+/// in `lib` (the caller sets the part's id and `loaded`). The name is a word of the id charset (never a path); an
+/// unresolved name is `UnknownLib`, a library that does not read or holds more than the machine is `BadLib`, both at
+/// the part's line and the value's column.
+fn lib_machine(lv: &V, line: u32, lib: &dyn Lib) -> Result<MachineStmt, Refusal> {
+    let name = match &lv.val {
+        Val::Word(w) if valid_id(w) => w.clone(),
+        _ => return Err(bad(lv, "lib", line)),
+    };
+    let Some(text) = lib.resolve(&name) else {
+        return Err(Refusal { line, col: lv.col, what: What::UnknownLib(name) });
+    };
+    let at = |r: Refusal| Refusal { line, col: lv.col, what: What::BadLib { name: name.clone(), at: Box::new(r) } };
+    let not = |l: u32| at(Refusal { line: l, col: 1, what: What::NotLibrary });
+    let d = read_with(&text, &NoLib).map_err(|r| at(r))?;
+    let m = match d.stmts.first() {
+        Some(Stmt::Machine(m)) if m.loaded.is_none() => m.clone(),
+        Some(_) => return Err(not(d.line(0))),
+        None => return Err(not(1)),
+    };
+    let mut stmts = Vec::new();
+    for (i, s) in d.stmts.iter().enumerate().skip(1) {
+        match s {
+            Stmt::Axis(_) | Stmt::Tool(_) => stmts.push(s.clone()),
+            _ => return Err(not(d.line(i))),
+        }
+    }
+    Ok(MachineStmt { lib: Some(MachineLib { name, stmts }), ..m })
 }
