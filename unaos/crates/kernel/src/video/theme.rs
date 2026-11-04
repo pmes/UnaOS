@@ -1152,3 +1152,17 @@ fn contrast_bumped() {
         EPOCH.fetch_add(1, AOrd::AcqRel);
     }
 }
+
+// ── VEILONE (rmbp-ledger B1114, BP-video-11) — TAIL-APPENDED so no line above moves ───────────────────────────────────
+// The VEIL's tint alpha, held once (DESIGN-LANGUAGE §2.4: `surface.window` at 72 % light / 78 % dark). It was
+// `desktop::CRAFT.veil_tint` and, for the dark value, `palette_core::softy::dark::VEIL_A` beside it; the dark 78 % is
+// now read from that one palette value. The painter is `crystal::veil`.
+
+/// The VEIL's tint alpha `(light, dark)`, of 255.
+pub const VEIL_A: (u8, u8) = (184, palette_core::softy::dark::VEIL_A);
+
+/// The VEIL's tint alpha for the live set.
+#[inline]
+pub fn veil_a() -> u8 {
+    if is_dark() { VEIL_A.1 } else { VEIL_A.0 }
+}

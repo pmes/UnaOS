@@ -108,8 +108,6 @@ pub struct Craft {
     pub elev: [[[Layer; 2]; 2]; 4],
     /// A hovered disc's glyph: black at this opacity (50 %, §3.1).
     pub glyph_alpha: u32,
-    /// The VEIL's tint (§2.4): `surface.window` at 72 % (Light) / 78 % (Dark) — the menu bar and the dock.
-    pub veil_tint: (u32, u32),
     /// The dock plate's corner radius (`radius.dock`, §2.5).
     pub dock_radius: usize,
     /// A hovered dock tile: the ink over the tile at this opacity (10 = 4 %).
@@ -133,7 +131,6 @@ pub const CRAFT: Craft = Craft {
         [[ly(0, 2, 20), ly(8, 20, 36)], [ly(0, 2, 77), ly(8, 20, 89)]],
     ],
     glyph_alpha: 128,
-    veil_tint: (184, 199),
     dock_radius: 18,
     dock_hover: 10,
     dot: 4,
@@ -236,15 +233,6 @@ fn back_sharp(b: Option<&Back>, out: &mut [u32], x0: usize, y: usize) {
     }
 }
 
-/// Row `y` of the VEIL (the flat desktop colour where there is no wallpaper).
-#[inline]
-fn back_soft(b: Option<&Back>, out: &mut [u32], x0: usize, y: usize) {
-    match b {
-        Some(b) => b.soft(out, x0, y),
-        None => out.fill(theme::DESKTOP_BG),
-    }
-}
-
 // ── the VEIL cache (VEILCOST B690, BP-bar-23: beauty costs no more than a solid fill) ───────────────────────────────
 
 /// What a veiled field's pixels depend on: the picture (its buffers, size and a 32-cell fingerprint of its VEIL, so a
@@ -283,7 +271,7 @@ fn veil_key(b: Option<&Back>, rect: (usize, usize, usize, usize), extra: usize) 
             (b.px.as_ptr() as usize, b.veil.as_ptr() as usize, b.vw, b.vh, f)
         }
     };
-    VeilKey { wgen: VEIL_GEN.load(Ordering::Acquire), pic, epoch: theme::epoch(), look: (theme::surface_window(), veil_tint(), theme::hairline()), rect, extra }
+    VeilKey { wgen: VEIL_GEN.load(Ordering::Acquire), pic, epoch: theme::epoch(), look: (theme::surface_window(), theme::veil_a() as u32, theme::hairline()), rect, extra }
 }
 
 /// One strip's composed veiled field, `w` x `h` (`rows`, row-major) with a filled flag per row. A miss composes the
@@ -1131,21 +1119,11 @@ fn damage_head(id: super::WinId) {
 
 // ── the menu bar ────────────────────────────────────────────────────────────────────────────────────────────────
 
-/// The VEIL's tint for the live set (§2.4: `surface.window` at 72 % Light / 78 % Dark).
-#[inline]
-fn veil_tint() -> u32 {
-    if theme::is_dark() { CRAFT.veil_tint.1 } else { CRAFT.veil_tint.0 }
-}
-
 /// Row `j` of the menu bar's field (`w` x `h` at panel `(x0, y0)`) into `out[..w]`: `surface.window` at the VEIL's
 /// tint over the VEIL, and one hairline where the bar meets the desktop.
 pub fn bar_row(out: &mut [u32], x0: usize, y0: usize, w: usize, h: usize, j: usize, back: Option<&Back>) {
     let out = &mut out[..w];
-    back_soft(back, out, x0, y0 + j);
-    let face = theme::surface_window();
-    for p in out.iter_mut() {
-        *p = draw::blend(*p, face, veil_tint());
-    }
+    crate::video::crystal::veil::row(out, x0, y0 + j, back, crate::video::crystal::veil::Look::una()); // VEILONE (B1114): the one VEIL painter (crystal.rs tail)
     if j + 1 == h {
         let ink = Ink::argb(theme::hairline());
         for p in out.iter_mut() {
@@ -1213,11 +1191,7 @@ pub fn battery_row(out: &mut [u32], w: usize, h: usize, j: usize, x0: usize, bod
 /// rounded at `dock_radius` (the wallpaper itself outside the corners), a hairline round its edge.
 pub fn dock_plate_row(out: &mut [u32], x0: usize, y0: usize, w: usize, h: usize, j: usize, back: Option<&Back>) {
     let out = &mut out[..w];
-    back_soft(back, out, x0, y0 + j);
-    let face = theme::surface_window();
-    for p in out.iter_mut() {
-        *p = draw::blend(*p, face, veil_tint());
-    }
+    crate::video::crystal::veil::row(out, x0, y0 + j, back, crate::video::crystal::veil::Look::una()); // VEILONE (B1114): the one VEIL painter (crystal.rs tail)
     let rad = (d(CRAFT.dock_radius) as usize).min(w / 2).min(h / 2);
     let corner = j < rad || j + rad >= h;
     if corner && rad > 0 && rad <= 128 {
