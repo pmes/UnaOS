@@ -1782,6 +1782,9 @@ pub struct Crop {
     pub dragging: bool,
     /// The saved crop the controller re-opens ([`follow`], drained once).
     pub reopen: Option<std::path::PathBuf>,
+    /// VUGFACEPHOTOCROPDOC (SR649): the kept rectangle's offset in the photo's pixels, set with `reopen`: the carry
+    /// ([`slid`]) moves `Photo.h` by it.
+    pub at: Option<(u32, u32)>,
 }
 
 /// The corner while the crop is armed with no rectangle.
@@ -1895,15 +1898,14 @@ fn crop_key(view: &mut View, k: &str) -> Option<bool> {
     }
 }
 
-/// Return on an armed crop: refused by name (the corner, nothing written, still armed) with no rectangle, with the
-/// document unsaved (the re-open replaces the face), with no file, or when `<stem>.crop.png` exists; else the crop is
-/// written ([`crop_write`]) and queued for the controller's re-open ([`follow`]), the corner `saved <name>`.
+/// Return on an armed crop: refused by name (the corner, nothing written, still armed) with no rectangle, with no file,
+/// or when `<stem>.crop.png` exists; else the crop is written ([`crop_write`]) and queued for the controller ([`follow`]:
+/// a document holding statements, saved or not, is carried onto the crop, VUGFACEPHOTOCROPDOC SR649), the corner
+/// `saved <name>`.
 fn crop_keep(view: &mut View) -> bool {
-    let dirty = view.design.journal.dirty();
     let Some(ph) = view.photo.as_mut() else { return false };
     let out = match (crop_rect(ph), ph.crop.source.clone()) {
         (None, _) => Err("refused crop: drag a rectangle on the photo".to_string()),
-        _ if dirty => Err("refused crop: the document is unsaved (s saves it)".to_string()),
         (Some(_), None) => Err("refused crop: the photo has no file (open it by its path)".to_string()),
         (Some(r), Some(src)) => crop_write(&ph.image, r, &src),
     };
@@ -1911,7 +1913,8 @@ fn crop_keep(view: &mut View) -> bool {
         Ok(out) => {
             let source = ph.crop.source.take();
             ph.note = Some(format!("saved {}", file_name(&out)));
-            ph.crop = Crop { source, reopen: Some(out), ..Crop::default() };
+            let at = crop_rect(ph).map(|[x, y, _, _]| (x, y)); // VUGFACEPHOTOCROPDOC (SR649): the offset the carry moves H by
+            ph.crop = Crop { source, reopen: Some(out), at, ..Crop::default() };
         }
         Err(e) => ph.note = Some(e),
     }
@@ -1968,7 +1971,7 @@ fn crop_mask(view: &View, ph: &Photo, fr: &mut Raster) {
 pub fn follow(v: &mut crate::Viewer) {
     let Some(path) = v.view.photo.as_mut().and_then(|ph| ph.crop.reopen.take()) else { return };
     let prefs = v.view.photo.as_ref().map(|ph| ph.prefs).unwrap_or_default();
-    let name = file_name(&path);
+    let name = file_name(&path); if carry(v, &path, &name) { return; } // VUGFACEPHOTOCROPDOC (SR649): a document holding statements stays; the crop slides under it
     match crate::Viewer::open_with(&path.to_string_lossy(), v.view.size, v.view.preset, prefs) {
         Ok(mut next) => {
             next.view.entry = std::mem::take(&mut v.view.entry);
@@ -1983,4 +1986,43 @@ pub fn follow(v: &mut crate::Viewer) {
             }
         }
     }
+}
+
+// ---- VUGFACEPHOTOCROPDOC (SR649): the open document carried onto the cropped photo (named tail block) ----
+// SR640's keep refused while the document was unsaved because its re-open (`Viewer::open_with`) replaces the face, and a
+// saved document lost its link (save_to became `<stem>.crop.vug`). Re-measuring cannot carry the sketch: photo_core
+// numbers each lattice family from the first line in ITS image (grid.rs `index_family`), so the crop's paper frame is
+// the old one shifted by whole pitches (or flipped). The crop is a pixel translation (`fixture::crop` copies (x + i,
+// y + j) to (i, j)), so H' = T(-x, -y) · H exactly and every paper-mm thing stays valid: the sketch, the journal, the
+// outline and loops, `first`, the offers, the paper model. [`carry`] takes a document holding statements onto lib.rs
+// `Viewer::swap_photo` (the decoded file, [`slid`]); an empty document keeps SR640's re-open (the fresh measured sketch).
+
+/// [`follow`]'s carry: true (handled) when the journal's document holds statements and the keep left its offset; the
+/// saved file slides under the kept document (`Viewer::swap_photo`), the corner `saved <name>`, or a read / decode
+/// failure keeps the face whole and is named as [`follow`] names its own.
+fn carry(v: &mut crate::Viewer, path: &std::path::Path, name: &str) -> bool {
+    let at = v.view.photo.as_ref().and_then(|ph| ph.crop.at);
+    let Some(at) = at.filter(|_| !v.view.design.journal.doc.stmts.is_empty()) else { return false };
+    let note = match v.swap_photo(path, at) {
+        Ok(()) => format!("saved {name}"),
+        Err(e) => format!("refused the saved crop {e} (saved {name})"),
+    };
+    if let Some(ph) = v.view.photo.as_mut() {
+        ph.note = Some(note);
+    }
+    true
+}
+
+/// The cropped photo under the kept measurement: `image` (the crop at offset `at` of the photo's pixels) replaces the
+/// photo, `h` moves by the offset ([`cropped_h`]), the crop road restarts on `source`; everything in paper mm is kept.
+pub fn slid(ph: &mut Photo, image: pixel_core::Image, at: (u32, u32), source: std::path::PathBuf) {
+    ph.h = cropped_h(&ph.h, at.0, at.1);
+    ph.image = image;
+    ph.crop = Crop { source: Some(source), ..Crop::default() };
+}
+
+/// T(-x, -y) · H: the paper -> pixel homography of the photo cropped at offset (x, y) (rows u - x·w, v - y·w, w).
+pub fn cropped_h(h: &[[f64; 3]; 3], x: u32, y: u32) -> [[f64; 3]; 3] {
+    let (x, y) = (x as f64, y as f64);
+    [[h[0][0] - x * h[2][0], h[0][1] - x * h[2][1], h[0][2] - x * h[2][2]], [h[1][0] - y * h[2][0], h[1][1] - y * h[2][1], h[1][2] - y * h[2][2]], h[2]]
 }
