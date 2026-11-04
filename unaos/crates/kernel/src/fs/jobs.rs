@@ -18,7 +18,7 @@
 //! transaction per directory with an inode read per row, 10.9 s masked): on x86 it runs on the `jobs-scan` task on a
 //! worker core (never the render core), AFTER the bar is painted (`desktopbuild::settled`), one directory blob per
 //! chunk ([`MountTable::read_dir_kinds`] — names and kinds, no inode reads), a 1 ms sleep between chunks. Then the
-//! worker builds the FILETYPES registry the login owed (`assoc::build_owed`), off the device-service pass. Lines:
+//! worker reads the stamp the login owed (`assoc::stamp_owed`, first, CONTINUEIGNITE B1115) and builds the registry (`assoc::build_owed`), off the device-service pass. Lines:
 //!   `[jobs] scan pending at=login on=<worker|inline> [cpu=<c>]`
 //!   `[jobs] scan chunk=<n>/<m> records=<r> ms=<ms>` (one per directory)
 //!   `[jobs] volume=/jobs records=<n> claims=<n> ledger=<n> queue=<n> queries=<n> on=<worker|inline> chunks=<m>
@@ -139,7 +139,7 @@ fn worker(_: usize) {
     while !bar_settled() && crate::arch::ms().saturating_sub(t0) < BAR_WAIT_MS {
         crate::arch::sched::sleep_ms(10);
     }
-    scan(crate::arch::ms().saturating_sub(t0));
+    #[cfg(feature = "wc")] { crate::fs::assoc::stamp_owed(); } scan(crate::arch::ms().saturating_sub(t0)); // CONTINUEIGNITE (B1115): the login's stamp read is the worker's FIRST job after the bar (before the /jobs walk: the shortest unpublished window). LINE-NEUTRAL, code first
     crate::fs::assoc::build_owed(); // FILETYPES (B423): the owed registry, here — not on the pass that pumps hid and paints the bar
 }
 

@@ -426,7 +426,7 @@ pub fn build(why: &str) -> usize {
 /// the `jobs-scan` worker runs it after the bar ([`build_owed`]; the device-service pass when no worker took it,
 /// still after the bar); elsewhere it builds inline (said `login=full`). One line:
 /// `[filetypes] login=<stamp|none|full> stamp=<match|stale|absent> blocks_read= ms= owed=<no|after-bar|inline>`.
-pub fn owe() {
+pub fn owe() { #[cfg(all(target_arch = "x86_64", feature = "wc"))] { if owe_at_press() { return; } } // CONTINUEIGNITE (B1115): on x86 + `wc` the press reads nothing — the registry goes unpublished and the stamp read is owed to the jobs-scan worker after the bar (`stamp_owed`, file tail), which calls this body back. LINE-NEUTRAL, code first
     let (state, blocks, ms) = login_read(&crate::shell::vfs_mount_table());
     if state == "match" {
         REG.store(REG_LIVE, Ordering::Release);
@@ -466,7 +466,7 @@ pub fn login_read(mt: &MountTable) -> (&'static str, u64, u64) {
 
 /// The device-service pass: one relaxed load when nothing is owed. Builds only when the `jobs-scan` worker did
 /// not take the build, and only after the bar.
-pub fn service() {
+pub fn service() { #[cfg(all(target_arch = "x86_64", feature = "wc"))] { if stamp_read_owed() && !TAKEN.load(Ordering::Acquire) && bar_first() { stamp_owed(); } } // CONTINUEIGNITE (B1115): the owed stamp read when no worker took it, after the bar, before the OWED check below (a miss builds in the same pass). LINE-NEUTRAL, code first
     if OWED.load(Ordering::Acquire) && !TAKEN.load(Ordering::Acquire) && bar_first() && OWED.swap(false, Ordering::AcqRel) { // JOBSCAN (B497): the bar first; the jobs worker builds it when it took it
         build_stamped("service", false);
     }
@@ -1127,7 +1127,7 @@ pub fn stamp_selftest() {
     let pass = state == "match" && stale == "rebuilt" && rehit == "ok" && ms <= 10 && login_path == "ok";
     serial_println!(":: ASSOCSTAMP: stamp={} blocks_read={} ms={} -> {} :: cmds={} stale={} rehit={} bound_ms=10 stamp=v{} n={} login_path={} login_hit_blocks={} login_hit_ms={} unpublished_src={} live_src={}",
         state, d.blocks_read(), ms, if pass { "PASS" } else { "FAIL" }, d.cmds(), stale, rehit, BUILDER_VERSION, builtin_type_count(),
-        login_path, hit_blocks, hit_ms, none_src, live_src);
+        login_path, hit_blocks, hit_ms, none_src, live_src); #[cfg(all(target_arch = "x86_64", feature = "wc"))] { ignite_kat(&mt); } // CONTINUEIGNITE (B1115): the press/worker halves KAT (file tail). LINE-NEUTRAL, code first
 }
 
 /// REFUSALUI (B468): the wire's words when `path`'s own `una:preferred` is refused for type `mime`
@@ -1267,4 +1267,91 @@ fn stria_first(mut regs: Vec<Registrant>) -> Vec<Registrant> {
         regs.insert(0, r);
     }
     regs
+}
+
+// ── CONTINUEIGNITE (rmbp-ledger B1115) — the login's stamp read off the Continue press ─────────────────────────────
+//
+// F39LOGINNODRAW (B1113) measured the Continue press (flight 39 `[lag] stall … render=route render_ms=75.5`): its largest
+// piece was [`owe`]'s stamp read (`[filetypes] login=stamp stamp=match blocks_read=25 ms=32`), ONE `get_attr` on
+// [`TYPES_DIR`] and the boot's first touch of that subtree, so a cold read on every boot. On x86 + `wc` the press now reads
+// NOTHING: it leaves the registry unpublished (`REG_NONE`, the stamp-miss state FILETYPES2 already serves: the resolver
+// answers from the facts, the extension table and the registrants, and an open resolves) and owes the read. The
+// `jobs-scan` worker runs it as its FIRST job after the bar (`jobs::worker`, before the /jobs walk), or the device-service
+// pass [`service`] when no worker took it. The read is `owe`'s own body, unchanged: its line, its record, its branches (a
+// miss still owes the build, which the same worker or pass then runs). One turn word, lock-free: exactly one of worker /
+// service takes OWED→READING. Off x86 + `wc` nothing here exists and `owe` reads inline as before.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+const TURN_IDLE: u8 = 0;
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+const TURN_OWED: u8 = 1;
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+const TURN_READING: u8 = 2;
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+static STAMP_TURN: AtomicU8 = AtomicU8::new(TURN_IDLE);
+
+/// CONTINUEIGNITE: the press's half of [`owe`]. `true` = the read is owed and the press returns having read nothing;
+/// `false` = this IS the reading turn (the worker's or the service pass's `owe()`), and `owe` reads.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+fn owe_at_press() -> bool {
+    if STAMP_TURN.load(Ordering::Acquire) == TURN_READING {
+        return false;
+    }
+    REG.store(REG_NONE, Ordering::Release);
+    STAMP_TURN.store(TURN_OWED, Ordering::Release);
+    true
+}
+
+/// CONTINUEIGNITE: is a stamp read owed (the press passed, no turn has taken it)? One acquire load.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+fn stamp_read_owed() -> bool {
+    STAMP_TURN.load(Ordering::Acquire) == TURN_OWED
+}
+
+/// CONTINUEIGNITE: the owed stamp read: [`owe`]'s read, its `[filetypes] login=` line and its record. Run by the
+/// `jobs-scan` worker after the bar, or by the service pass. One load when nothing is owed.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+pub fn stamp_owed() {
+    if stamp_read_owed() && STAMP_TURN.compare_exchange(TURN_OWED, TURN_READING, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+        owe();
+        let _ = STAMP_TURN.compare_exchange(TURN_READING, TURN_IDLE, Ordering::AcqRel, Ordering::Acquire);
+    }
+}
+
+/// CONTINUEIGNITE KAT (`tests assocstamp`, after ASSOCSTAMP's line; the stamp is current there). The press half reads
+/// no block, leaves the registry unpublished and the read owed, and an open resolves (`registrant`). The worker half
+/// publishes it (`db`). The boot's publication, turn and login record are restored.
+/// `[filetypes] ignite kat=<ok|press-io:<n>|press-reg|turn|before:<src>|after:<src>> press_blocks=<n> before_src=<s> after_src=<s>`
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+fn ignite_kat(mt: &MountTable) {
+    let reg0 = REG.load(Ordering::Acquire);
+    let turn0 = STAMP_TURN.swap(TURN_IDLE, Ordering::AcqRel);
+    let (kind0, ms0, blocks0) = (LOGIN_KIND.load(Ordering::Acquire), LOGIN_MS.load(Ordering::Relaxed), LOGIN_BLOCKS.load(Ordering::Relaxed));
+    let probe = object_path(ft::TEXT_PLAIN);
+    let io0 = crate::fs::bootstep::io();
+    owe();
+    let press_blocks = crate::fs::bootstep::io().since(io0).blocks_read();
+    let (press_reg, press_turn) = (REG.load(Ordering::Acquire), STAMP_TURN.load(Ordering::Acquire));
+    let before = opener_for_in(mt, &probe, ft::TEXT_PLAIN).1;
+    stamp_owed();
+    let (after_turn, readable) = (STAMP_TURN.load(Ordering::Acquire), registry_readable());
+    let after = opener_for_in(mt, &probe, ft::TEXT_PLAIN).1;
+    REG.store(reg0, Ordering::Release);
+    STAMP_TURN.store(turn0, Ordering::Release);
+    LOGIN_MS.store(ms0, Ordering::Relaxed);
+    LOGIN_BLOCKS.store(blocks0, Ordering::Relaxed);
+    LOGIN_KIND.store(kind0, Ordering::Release);
+    let kat = if press_blocks != 0 {
+        alloc::format!("press-io:{}", press_blocks)
+    } else if press_reg != REG_NONE {
+        String::from("press-reg")
+    } else if press_turn != TURN_OWED || after_turn != TURN_IDLE {
+        String::from("turn")
+    } else if before != "registrant" {
+        alloc::format!("before:{}", before)
+    } else if !readable || after != "db" {
+        alloc::format!("after:{}", after)
+    } else {
+        String::from("ok")
+    };
+    serial_println!("[filetypes] ignite kat={} press_blocks={} before_src={} after_src={}", kat, press_blocks, before, after);
 }
