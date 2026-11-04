@@ -490,16 +490,16 @@ pub fn selftest() {
 // on the RENDER task, the one consumer of the input channel: `[lag] click→shown ms=1478.0 … wm=1471.4`, six
 // presses in a row, each ~1.3–1.5 s with every key and press behind it. `sys_set` is fire-and-forget (its
 // callers persist and ignore the answer), so from the render task it now QUEUES the write (the latest value
-// per key wins — a drag of the slider is one write, not twenty) and a `prefs-flush` kernel task on a worker
-// core (`smp::worker_cpu(0)`, never the render core) runs the PrefSets. `sys_get` answers a queued key from
-// the queue (read-your-writes), so a caller that reads back right after its set sees what it set. Off the
-// render task, off x86, or with no worker core, `sys_set` is the synchronous PrefSet it always was.
+// per key wins — a drag of the slider is one write, not twenty) and the parked `prefs-apply` kernel task on a
+// worker core (x86 `smp::worker_cpu(0)`, aarch64 `worker_cpu_apart`; never the render core) runs the PrefSets on
+// every build (PREFS-FLUSH-KNOBOFF B1203). `sys_get` answers a queued key from the queue (read-your-writes), so a
+// caller reading back right after its set sees what it set. Off the render task or with no worker core: inline.
 //
 // Witness per flush: `[prefsbus] flush n=<keys> ms=<n> on=worker queued_ms=<oldest wait> (INPUTSTALL M5)`.
 // This is the seam, not `settings.rs`: every kernel `sys_set` caller on the render task is covered.
 
 static DEFERRED: crate::sync::Mutex<Vec<(String, PrefValue)>> = crate::sync::Mutex::new(Vec::new());
-#[cfg(any(target_arch = "x86_64", feature = "busreg"))]
+// PREFS-FLUSH-KNOBOFF (rmbp-ledger B1203): every build (was cfg(any(x86, busreg))); `prefs_flush`'s empty-batch arm reads it. Named in-place hunk
 static FLUSHER: AtomicBool = AtomicBool::new(false);
 static DEFER_T0_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
@@ -520,7 +520,7 @@ fn defer_core() -> Option<usize> {
 
 /// Queue `system.<k> = v` for the worker; `Some(v)` back = the caller runs it inline.
 fn defer_set(k: &str, v: PrefValue) -> Option<PrefValue> {
-    #[cfg(feature = "busreg")] let Some(cpu) = flush_core() else { return Some(v) }; #[cfg(not(feature = "busreg"))] let Some(cpu) = defer_core() else { return Some(v) }; // PREFS-FLUSH-ONTO-APPLIER (rmbp-ledger B1200): on a busreg image the core pick is `flush_core` (x86 = defer_core, aarch64 = the render task on a worker core; file tail). LINE-NEUTRAL fold
+    let Some(cpu) = flush_core() else { return Some(v) }; // PREFS-FLUSH-KNOBOFF (rmbp-ledger B1203): the core pick is `flush_core` on every build, both arches (x86 = defer_core, aarch64 = the render task on a worker core; B1200 tail). LINE-NEUTRAL fold
     {
         let mut q = DEFERRED.lock();
         if q.is_empty() {
@@ -531,12 +531,12 @@ fn defer_set(k: &str, v: PrefValue) -> Option<PrefValue> {
             None => q.push((String::from(k), v)),
         }
     }
-    #[cfg(all(target_arch = "x86_64", not(feature = "busreg")))]
-    if !FLUSHER.swap(true, Ordering::AcqRel) {
-        crate::arch::sched::spawn("prefs-flush", prefs_flush, 0, cpu, crate::arch::sched::PRIO_NORMAL);
-    }
-    #[cfg(any(not(target_arch = "x86_64"), feature = "busreg"))]
-    let _ = cpu; #[cfg(feature = "busreg")] flush_wake(); // PREFS-FLUSH-ONTO-APPLIER (rmbp-ledger B1200): the per-burst `prefs-flush` spawn is retired on a busreg image; the parked `prefs-apply` is woken instead (file tail). LINE-NEUTRAL fold
+    // PREFS-FLUSH-KNOBOFF (rmbp-ledger B1203): the per-burst `prefs-flush` spawn (x86, knob-off) is retired in every build;
+    // the parked `prefs-apply` (B1196) flushes `DEFERRED` at its loop head (`flush_deferred`, B1200 tail),
+    // spawned lazily by `flush_wake` -> `applier_ensure` at the first deferral and woken by `queued_due`.
+    // Named in-place hunk (four lines, line-neutral).
+    // PREFS-FLUSH-KNOBOFF (rmbp-ledger B1203): every build (was cfg(any(not(x86), busreg))). Named in-place hunk
+    let _ = cpu; flush_wake(); // PREFS-FLUSH-KNOBOFF (rmbp-ledger B1203): every build wakes the parked `prefs-apply` (spawned at the first deferral) instead of a per-burst `prefs-flush` spawn (file tail). LINE-NEUTRAL fold
     None
 }
 
@@ -548,7 +548,7 @@ fn deferred_value(k: &str) -> Option<PrefValue> {
 
 /// `prefs-flush`: run every queued PrefSet (in order, latest value per key), then exit; a set queued while
 /// it was finishing re-arms it.
-#[cfg(any(target_arch = "x86_64", feature = "busreg"))]
+// PREFS-FLUSH-KNOBOFF (rmbp-ledger B1203): every build (was cfg(any(x86, busreg))); the one flush body, run by `prefs-apply`. Named in-place hunk
 fn prefs_flush(_: usize) {
     loop {
         let (batch, t0) = {
@@ -1741,16 +1741,16 @@ fn deliverrace_selftest(next: &dyn Fn() -> u32, body_of: &dyn Fn(i64) -> String,
 // `:: RELAY-QUEUED-SET: ... eager=applied -> PASS ::` (Q10, `eager_selftest`).
 // =================================================================================================
 /// Raised by the on_exit handoff (`note_set_unread`); cleared by `prefs-apply` before it drains.
-#[cfg(feature = "busreg")]
+// PREFS-FLUSH-KNOBOFF (rmbp-ledger B1203): every build (was cfg(busreg)); the APPLY_SEM edge flag. Named in-place hunk
 static QUEUED_DUE: AtomicBool = AtomicBool::new(false);
 /// `prefs-apply`'s wake: posted from the teardown (the `done_sem` road), waited on by `prefs-apply` alone.
-#[cfg(feature = "busreg")]
+// PREFS-FLUSH-KNOBOFF (rmbp-ledger B1203): every build (was cfg(busreg)); the applier's wake. Named in-place hunk
 static APPLY_SEM: crate::arch::sched::Semaphore = crate::arch::sched::Semaphore::new(0);
 /// `prefs-apply` has been spawned (once per boot).
-#[cfg(feature = "busreg")]
+// PREFS-FLUSH-KNOBOFF (rmbp-ledger B1203): every build (was cfg(busreg)); the applier's once flag. Named in-place hunk
 static APPLIER: AtomicBool = AtomicBool::new(false);
 /// The applier's kernel stack: the store path's measured size (x86 `prefs-watch` runs it on `RENDER_PATH_STACK_SIZE`, 32 KiB).
-#[cfg(feature = "busreg")]
+// PREFS-FLUSH-KNOBOFF (rmbp-ledger B1203): every build (was cfg(busreg)); the applier's stack. Named in-place hunk
 const APPLIER_STACK: usize = 32 * 1024;
 /// The drain gate: one `queued_settle` at a time.
 #[cfg(feature = "busreg")]
@@ -1763,7 +1763,7 @@ static EAGER_SETTLED: crate::sync::Mutex<([u32; Q_CAP], usize)> = crate::sync::M
 const EAGER_WAIT_MS: u64 = 40 * RELAY_WAIT_MS;
 
 /// `note_set_unread` (the on_exit handoff, any context): mark the ring due and wake `prefs-apply` once per edge.
-#[cfg(feature = "busreg")]
+// PREFS-FLUSH-KNOBOFF (rmbp-ledger B1203): every build (was cfg(busreg)); the one APPLY_SEM edge post. Named in-place hunk
 fn queued_due() {
     if !QUEUED_DUE.swap(true, Ordering::AcqRel) {
         APPLY_SEM.post();
@@ -1771,7 +1771,7 @@ fn queued_due() {
 }
 
 /// `queued_keep` (task context): spawn `prefs-apply` the first time a SET is queued.
-#[cfg(feature = "busreg")]
+// PREFS-FLUSH-KNOBOFF (rmbp-ledger B1203): every build (was cfg(busreg)); the applier's lazy spawn. Named in-place hunk
 fn applier_ensure() {
     if APPLIER.swap(true, Ordering::AcqRel) {
         return;
@@ -1793,7 +1793,7 @@ fn queued_corrs() -> Vec<u32> {
 }
 
 /// `prefs-apply`: parked on `APPLY_SEM`; each wake settles the ring under the gate and records what it settled.
-#[cfg(feature = "busreg")]
+// PREFS-FLUSH-KNOBOFF (rmbp-ledger B1203): every build (was cfg(busreg)); the task; its ring arm below stays busreg. Named in-place hunk
 fn prefs_apply(_: usize) {
     locked(|| APPLY_SEM.init()); // masked: a teardown post on this core must never spin on a raw lock this task holds
     loop { flush_deferred(); // PREFS-FLUSH-ONTO-APPLIER (rmbp-ledger B1200): the render-task deferrals, after the previous wake's ring settle, no drain gate held (file tail). Named in-place hunk
@@ -1801,7 +1801,7 @@ fn prefs_apply(_: usize) {
             return; // off a scheduled task (never for a spawned task)
         }
         QUEUED_DUE.store(false, Ordering::Release);
-        let Some(_gate) = drain_gate() else { continue };
+        #[cfg(feature = "busreg")] { let Some(_gate) = drain_gate() else { continue }; // PREFS-FLUSH-KNOBOFF (rmbp-ledger B1203): the queued-ring arm stays busreg (empty knob-off). Named in-place hunk
         let before = queued_corrs();
         if before.is_empty() {
             continue;
@@ -1821,7 +1821,7 @@ fn prefs_apply(_: usize) {
         }
         if n > 0 {
             serial_println!("[prefsbus] queued apply on=prefs-apply settled={} ms={} (QUEUED-SET-EAGER-ARM)", n, crate::arch::ms().saturating_sub(t0));
-        }
+        } }; // PREFS-FLUSH-KNOBOFF (rmbp-ledger B1203): the ring arm's close. Named in-place hunk
     }
 }
 
@@ -1908,7 +1908,7 @@ fn eager_selftest(next: &dyn Fn() -> u32, body_of: &dyn Fn(i64) -> String, want:
 // the ONE flush body `prefs_flush` (its cfg widened to busreg), whose every `pref_set` goes through `call`'s head
 // `queued_drain` (the gate taken there, so B1175's order holds: the ring settles before any newer SET). The applier is
 // spawned on [`applier_cpu`] (x86 `smp::worker_cpu(0)`, aarch64 `worker_cpu_apart`), never the render core (B375, R88).
-// Knob-off (no busreg) is unchanged: x86 spawns `prefs-flush` per burst, aarch64 runs inline (PREFS-FLUSH-KNOBOFF owed).
+// Knob-off: lifted by PREFS-FLUSH-KNOBOFF (B1203, file tail): the task, wake and flush every build, the ring busreg.
 // Witness: `[prefsbus] queued apply on=prefs-apply deferred=<n> ms=<ms> (PREFS-FLUSH-ONTO-APPLIER)`; `tests bandy3`
 // `:: RELAY-QUEUED-SET: ... flush=applier -> PASS ::` (Q13, `flush_selftest`).
 // =================================================================================================
@@ -1920,11 +1920,11 @@ static FLUSH_FORCE: AtomicBool = AtomicBool::new(false);
 static FLUSHED_N: AtomicU32 = AtomicU32::new(0);
 
 /// `defer_set`'s core pick on a busreg image: `Some` = queue for `prefs-apply`; `None` = the caller runs it inline.
-#[cfg(feature = "busreg")]
+// PREFS-FLUSH-KNOBOFF (rmbp-ledger B1203): every build (was cfg(busreg)); `defer_set`'s core pick. Named in-place hunk
 fn flush_core() -> Option<usize> {
-    if FLUSH_FORCE.swap(false, Ordering::AcqRel) {
+    #[cfg(feature = "busreg")] { if FLUSH_FORCE.swap(false, Ordering::AcqRel) { // PREFS-FLUSH-KNOBOFF (rmbp-ledger B1203): Q13's hook stays busreg. Named in-place hunk
         return Some(applier_cpu());
-    }
+    } }
     #[cfg(target_arch = "aarch64")]
     if matches!(crate::arch::sched::current_name(), Some(n) if n.starts_with("render")) {
         return crate::arch::sched::worker_cpu_apart();
@@ -1933,14 +1933,14 @@ fn flush_core() -> Option<usize> {
 }
 
 /// `defer_set` (busreg): wake the parked applier (spawned at the first deferral) instead of spawning `prefs-flush`.
-#[cfg(feature = "busreg")]
+// PREFS-FLUSH-KNOBOFF (rmbp-ledger B1203): every build (was cfg(busreg)); the deferral's wake. Named in-place hunk
 fn flush_wake() {
     applier_ensure();
     queued_due();
 }
 
 /// The core `prefs-apply` runs on: a worker core off the render task's, else the scheduler's pick.
-#[cfg(feature = "busreg")]
+// PREFS-FLUSH-KNOBOFF (rmbp-ledger B1203): every build (was cfg(busreg)); the applier's core. Named in-place hunk
 fn applier_cpu() -> usize {
     #[cfg(target_arch = "x86_64")]
     {
@@ -1953,7 +1953,7 @@ fn applier_cpu() -> usize {
 }
 
 /// `prefs_apply`'s loop head: run every deferred PrefSet through the one flush body (no drain gate held).
-#[cfg(feature = "busreg")]
+// PREFS-FLUSH-KNOBOFF (rmbp-ledger B1203): every build (was cfg(busreg)); the loop-head flush. Named in-place hunk
 fn flush_deferred() {
     let n = DEFERRED.lock().len();
     if n == 0 {
@@ -1961,7 +1961,7 @@ fn flush_deferred() {
     }
     let t0 = crate::arch::ms();
     prefs_flush(0);
-    FLUSHED_N.fetch_add(n as u32, Ordering::AcqRel);
+    #[cfg(feature = "busreg")] FLUSHED_N.fetch_add(n as u32, Ordering::AcqRel); // PREFS-FLUSH-KNOBOFF (rmbp-ledger B1203): Q13's counter stays busreg. LINE-NEUTRAL fold
     serial_println!("[prefsbus] queued apply on=prefs-apply deferred={} ms={} (PREFS-FLUSH-ONTO-APPLIER)", n, crate::arch::ms().saturating_sub(t0));
 }
 
@@ -2000,3 +2000,21 @@ fn flush_selftest(read: &dyn Fn() -> Option<i64>, want: i64) -> bool {
     }
     q13
 }
+
+// =================================================================================================
+// PREFS-FLUSH-KNOBOFF (rmbp-ledger B1203) — TAIL-APPENDED. PREFS-FLUSH-ONTO-APPLIER (B1200) moved the render-task
+// PrefSet deferral onto the parked `prefs-apply` task on a busreg image only; knob-off, x86 still spawned `prefs-flush`
+// per burst and aarch64's render task ran every `sys_set` with the store's file I/O inline (seat ruling: a defect in
+// every build; the knob-off image moves on purpose, B1184's precedent). The applier road's cfg(busreg) lines are lifted
+// IN PLACE where busreg was no reason: the task (`prefs_apply`), its wake (`QUEUED_DUE`, `APPLY_SEM`, `queued_due`), its
+// spawn (`APPLIER`, `APPLIER_STACK`, `applier_ensure`, `applier_cpu`) and the deferred flush (`flush_core`, `flush_wake`,
+// `flush_deferred`, `prefs_flush`, `FLUSHER`) are every build; `defer_set` picks by `flush_core` and wakes by
+// `flush_wake` on both arches. The queued ring stays busreg because the relay is: `prefs_apply`'s ring arm (the drain
+// gate, `queued_settle`, the settled record) is a `#[cfg(feature = "busreg")]` block, empty knob-off; `DRAINING`,
+// `EAGER_SETTLED`, `queued_corrs`, `drain_gate` and Q13's `FLUSH_FORCE` / `FLUSHED_N` / `flush_selftest` stay busreg.
+// Knob-off cost: one parked kernel task spawned at the first render-task deferral (32 KiB stack, idle), two flags, one
+// Semaphore; a 1-core aarch64 (no `worker_cpu_apart` core) stays inline as before. OWED: VEIL-LOGIN-LANE (the bench).
+// Witness (knob-off x86 and the aarch64 desktop image, a render-task Settings press): `[prefsbus] flush n=<k> ms=<n>
+// on=worker queued_ms=<n> (INPUTSTALL M5 ...)` then `[prefsbus] queued apply on=prefs-apply deferred=<k> ms=<n>
+// (PREFS-FLUSH-ONTO-APPLIER)`, no `prefs-flush` task; busreg `tests bandy3` unchanged (`flush=applier`).
+// =================================================================================================
