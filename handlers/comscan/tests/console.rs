@@ -527,3 +527,80 @@ async fn a_found_controller_is_linked_by_one_press_and_jogs() {
     synapse.fire(SMessage::Kill("comscan".to_string()));
     timeout(Duration::from_secs(5), task).await.expect("stops on Kill").unwrap();
 }
+
+// --- VUGCOMSCANLINKREUSE (SR641): a PumpStart on the linked port streams on the live link; another port reopens ---
+
+/// A controller linked by one press (SR638's road) then started on the SAME `tcp://` name streams the armed program on the
+/// live link: said `started (on the live link)`, run to `done`, the opener asked ONCE; a start naming another port opens it
+/// and replaces the link as before (said `started`, the opener asked a second time, that name) (a desk over the vessel's
+/// undeclared machine, the travel typed first, on pump_core's mock grbl).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_start_on_the_linked_port_streams_on_the_link_and_another_port_reopens() {
+    use bandy::{Origin, PumpEvent};
+    use comscan::PumpCard;
+    use comscan::discovery::{Found, Service};
+    use comscan::pump::{Opener, PumpDesk, Verdict, digest_hex, serve_pump, undeclared_machine};
+    use make_core::gcode::Dialect;
+    use make_core::{Move, Program, Units, Vec3};
+    use pump_core::Transport;
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::sync::{Arc, Mutex};
+
+    let synapse = Synapse::new();
+    let rx = synapse.subscribe();
+    let mut watch = synapse.subscribe();
+    let desk = Arc::new(Mutex::new(PumpDesk::new(undeclared_machine())));
+    desk.lock().unwrap().hello_within(Duration::from_millis(50));
+    let asked: Arc<Mutex<Vec<(String, Dialect)>>> = Arc::new(Mutex::new(Vec::new()));
+    let seen = asked.clone();
+    let open: Box<Opener> = Box::new(move |port: &str, d: Dialect| -> Result<Box<dyn Transport + Send>, String> {
+        seen.lock().unwrap().push((port.to_string(), d));
+        Ok(Box::new(pump_core::mock::MockGrbl::new(2)))
+    });
+    let task = tokio::spawn(serve_pump(synapse.clone(), rx, desk.clone(), open, Duration::from_millis(5)));
+
+    let who = Origin::LocalUser("una".to_string());
+    let mut card = PumpCard::new(who.clone());
+    synapse.fire(card.declare("machine declare bench x=120 y=200 z=80").expect("a declare the parser takes"));
+    assert_eq!(
+        card_hears_until(&mut watch, &mut card, |w| w.starts_with("machine declared") || w.starts_with("refused")).await,
+        "machine declared bench x=120 y=200 z=80"
+    );
+
+    let addr = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 40));
+    card.say_found(&[Found { name: "fluidnc".into(), addr, port: 23, scope: 0, service: Service::Telnet, dialect_hint: Some(Dialect::Grbl { laser: false }) }]);
+    synapse.fire(card.dial(0).expect("the telnet row"));
+    assert_eq!(card_hears_until(&mut watch, &mut card, |w| w.starts_with("linked") || w.starts_with("refused")).await, "linked tcp://192.168.1.40:23");
+    assert_eq!(card_hears_until(&mut watch, &mut card, |w| w == "done" || w.starts_with("refused")).await, "done");
+    assert_eq!(asked.lock().unwrap().len(), 1, "the link's one open");
+
+    // A run on the declared machine, armed by a pass naming it (one arming, one run: armed again for the second start).
+    let mut p = Program::new(Units::Mm);
+    p.moves.push(Move::Rapid { to: Vec3::new(0.0, 0.0, 5.0) });
+    p.moves.push(Move::Linear { to: Vec3::new(10.0, 10.0, 5.0), feed: 300.0 });
+    let arm = |desk: &Arc<Mutex<PumpDesk>>| {
+        let mut d = desk.lock().unwrap();
+        let pass = Verdict::Pass { digest: p.digest(), machine: d.machine().digest() };
+        d.arm(&pass, &p, Dialect::Grbl { laser: false }).expect("armed by a pass naming the declared machine")
+    };
+    let start = |digest: u64, port: &str| {
+        SMessage::Pump(PumpEvent::PumpStart { principal: who.clone(), program: digest_hex(digest), dialect: "grbl".to_string(), port: port.to_string() })
+    };
+
+    synapse.fire(start(arm(&desk), "tcp://192.168.1.40:23"));
+    assert_eq!(
+        card_hears_until(&mut watch, &mut card, |w| w.starts_with("started") || w.starts_with("refused")).await,
+        "started (on the live link)"
+    );
+    assert_eq!(card_hears_until(&mut watch, &mut card, |w| w == "done" || w.starts_with("refused")).await, "done");
+    assert_eq!(asked.lock().unwrap().len(), 1, "the start streamed on the live link: the opener asked once");
+
+    synapse.fire(start(arm(&desk), "tcp://192.168.1.40:24"));
+    assert_eq!(card_hears_until(&mut watch, &mut card, |w| w.starts_with("started") || w.starts_with("refused")).await, "started");
+    assert_eq!(card_hears_until(&mut watch, &mut card, |w| w == "done" || w.starts_with("refused")).await, "done");
+    let names: Vec<String> = asked.lock().unwrap().iter().map(|(n, _)| n.clone()).collect();
+    assert_eq!(names, vec!["tcp://192.168.1.40:23".to_string(), "tcp://192.168.1.40:24".to_string()], "another port is opened");
+
+    synapse.fire(SMessage::Kill("comscan".to_string()));
+    timeout(Duration::from_secs(5), task).await.expect("stops on Kill").unwrap();
+}
