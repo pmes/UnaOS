@@ -855,3 +855,65 @@ fn two_held_roots_open_held_and_each_card_follows_the_last_fix() {
     assert!((volume(&vw) - want).abs() < 1e-4, "the box and both posts: {} vs {want}", volume(&vw));
     assert!(j.offered().is_none(), "nothing left to fix");
 }
+
+// ---- VUGFACEJOURNALHOLDREST (LEDGER SR611): a first held root with no fix passes the card to the next ----
+// SR598's box and post with a fillet `round` on the box, right after it, whose first edge name is gone and whose list
+// already names every edge of the box: a NoSuchEdge with no resolving name left (its card offers nothing), the FIRST
+// root in line order; the post (NoProfile, two loops) the second. SR609 offered the card on the first root only, so the
+// post's card never showed; now the card is the first held root WITH a fix: the cursor opens on the post, Tab + Return
+// fixes it (ONE snapshot), the round stays held and first in the failures (the `held=` list), the cursor falls back to
+// it with no card.
+
+#[test]
+fn a_first_held_root_with_no_fix_passes_the_card_to_the_next() {
+    let base = doc_core::read(BOX_NOPROFILE).expect("reads");
+    let r = doc_core::replay(&base, base.tol);
+    let solid = r.solids.iter().find(|s| s.id == "box").expect("the box replays");
+    let gone = brep_core::Name { op: brep_core::OpKind::Extrude, role: brep_core::Role::CapEnd, a: 9, b: 9 };
+    let mut edges = vec![gone];
+    for e in &solid.brep.edges {
+        if !edges.contains(&e.name) {
+            edges.push(e.name);
+        }
+    }
+    assert!(edges.len() > 1, "the box has edges: {edges:?}");
+    let mut d = base.clone();
+    d.lines.clear();
+    let at = d.stmts.iter().position(|s| s.id() == Some("box")).expect("the box row") + 1;
+    d.stmts.insert(at, Stmt::Fillet { id: "round".into(), on: "box".into(), edges, r: 1.0 });
+    let d = doc_core::read(&doc_core::write(&d)).expect("the fillet line reads");
+
+    let mut vw = Viewer::open_doc(d, "box", (W, H), Preset::Una).expect("two solid roots are held, not refused");
+    let round = index_of(&vw, |s| s.id() == Some("round"));
+    let post = index_of(&vw, |s| s.id() == Some("post"));
+    let (rline, line) = (doc(&vw).line(round), doc(&vw).line(post));
+    let ids = vw.view.design.journal.faults.iter().map(|f| (f.id.clone(), f.line)).collect::<Vec<_>>();
+    assert_eq!(ids, vec![("round".to_string(), rline), ("post".to_string(), line)], "both roots held, the round first");
+    assert!(matches!(vw.view.design.journal.faults[0].fault, doc_core::Fault::NoSuchEdge { .. }), "{:?}", vw.view.design.journal.faults);
+    assert!(matches!(vw.view.design.journal.faults[1].fault, doc_core::Fault::NoProfile { .. }), "{:?}", vw.view.design.journal.faults);
+    assert!((volume(&vw) - 1000.0).abs() < 1e-4, "the box painted, the round and the post held: {}", volume(&vw));
+    assert!(vw.view.design.journal.faulted(round) && vw.view.design.journal.faulted(post), "both rows marked");
+    assert!(vw.view.design.journal.fixes_for(round).is_empty(), "the round's card offers nothing");
+    assert_eq!(vw.view.design.journal.cursor, post, "the cursor opens on the first root with a fix");
+
+    // The post's card is offered though the round is first.
+    assert!(typed(&mut vw, "t"), "t shows the panel");
+    let f = vw.view.design.journal.offered().expect("the post's card");
+    assert_eq!(f.line, line, "offered on the post's line");
+    assert_eq!(vw.view.design.journal.fixes_for(post).len(), 2, "one choice per loop");
+    assert!(key(&mut vw, "Tab"), "Tab walks the card");
+    let picked = vw.view.design.journal.offered().expect("a pick").text;
+    let depth = vw.view.design.journal.depth().0;
+    assert!(key(&mut vw, "Return"), "Return takes the pick");
+
+    // ONE snapshot restored the post; the round stays held and first, the cursor on it, no card.
+    let j = &vw.view.design.journal;
+    let area = if picked.contains("outer=m") { 16.0 } else { 10.0 };
+    println!("holdrest roots=round,post first_fix=post picked={picked} held_after={} volume={}", j.faults.iter().map(|f| f.id.as_str()).collect::<Vec<_>>().join(","), volume(&vw));
+    assert_eq!(j.depth().0, depth + 1, "ONE snapshot");
+    assert_eq!(j.note.as_deref(), Some(format!("fixed line {line}: {picked}").as_str()));
+    assert_eq!(j.faults.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(), ["round"], "{:?}", j.faults);
+    assert_eq!(j.cursor, index_of(&vw, |s| s.id() == Some("round")), "no root with a fix: the cursor on the first held root");
+    assert!(vw.view.design.journal.offered().is_none(), "the round offers nothing");
+    assert!((volume(&vw) - (1000.0 + 5.0 * area)).abs() < 1e-4, "the box and the post: {}", volume(&vw));
+}

@@ -887,7 +887,7 @@ impl Journal {
                 Some(vec![Fix { line, text: format!("remove {rid}"), road: FixRoad::Remove(k) }])
             }
             Fault::BadRef { id: bad, kind } => self.ref_fixes(i, bad, *kind, line), // VUGFACEJOURNALFAULTFIXREF (SR590): the live entities of the slot's kind
-            Fault::NoProfile { .. } | Fault::NoSuchEdge { .. } | Fault::AmbiguousEdge { .. } if held_roots(&self.faults).first().map(String::as_str) == Some(id) => self.solid_fixes(i, &f.fault, line), // VUGFACEJOURNALSOLIDFAULTFIX (SR598): the loops / the edge names; VUGFACEJOURNALHOLDMANY (SR609): the first held root's card only
+            Fault::NoProfile { .. } | Fault::NoSuchEdge { .. } | Fault::AmbiguousEdge { .. } if held_roots(&self.faults).iter().take_while(|r| r.as_str() != id).all(|r| !self.fixable(r)) => self.solid_fixes(i, &f.fault, line), // VUGFACEJOURNALSOLIDFAULTFIX (SR598): the loops / the edge names; VUGFACEJOURNALHOLDMANY (SR609): the first held root's card only; VUGFACEJOURNALHOLDREST (SR611): the first held root WITH a fix (no earlier held root has one)
             _ => None,
         }
     }
@@ -1140,7 +1140,7 @@ pub fn beside(v: &crate::Viewer, typed: &str) -> std::path::PathBuf {
 // Body is the solids of the [`standing`] document (the held statements dropped, so a held fillet's `on` solid keeps its
 // slot and [`Journal::record_edit`]'s index rule matches the Body). A Conflicting / Diverged / BadRef in a named
 // sketch, a Brep refusal (SR528's RadiusTooLarge) still refuse by the first line: one card restores ONE statement in
-// ONE snapshot; two or more roots are held together, the card on the first (VUGFACEJOURNALHOLDMANY, SR609, below).
+// ONE snapshot; two or more roots are held together, the card on the first (VUGFACEJOURNALHOLDMANY, SR609, below) that has a fix (VUGFACEJOURNALHOLDREST, SR611).
 // The hold is regenerate's, so load / adopt / step share it (an edit that newly breaks an edge name is held with its
 // card, not refused). The choices ride SR584's card and SR590's Replace road through [`Journal::retyped`].
 
@@ -1229,7 +1229,12 @@ impl Journal {
 // the FIRST held root in line order only ([`held_roots`]; a later root's row is marked by `faulted` and offers nothing),
 // the cursor is put on it when a document opens held ([`Journal::load`]) and after a fix lands ([`Journal::accept_fix`]):
 // each fix ONE Replace, ONE snapshot, ONE root restored, the next card following. deviation.rs `held_split` names the
-// same list on the corner, `held=<a>,<b>`.
+// same list on the corner, `held=<a>,<b>`. VUGFACEJOURNALHOLDREST (SR611): a first root whose card offers nothing (no loop to
+// offer, no resolving edge name) blocked every later card; now the card is offered for the first held root WITH a fix
+// ([`Journal::fixable`]: [`Journal::solid_fixes`] non-empty, a parse-only retype, computed lazily in line order up to the
+// first fixable root), the cursor put on it by `load` and after `accept_fix`; the roots before it stay held and marked
+// and come first on the corner (`held=` is the same list, unchanged). No root with a fix: held, no card, the cursor on the
+// first held root (SR609's rule).
 
 /// The fault kinds a hold takes as a root: each carries the data its fix chooses from.
 fn root_kind(f: &Fault) -> bool {
@@ -1238,17 +1243,28 @@ fn root_kind(f: &Fault) -> bool {
 
 /// The held roots' ids in the failures' (line) order: the root-kind failures with an id. Only [`hold`] carries one
 /// (an extrude / revolve / fillet / chamfer is always a solid's statement), so this is the held list; the first is the
-/// root whose card is offered.
+/// root whose card is offered (VUGFACEJOURNALHOLDREST, SR611: the first that [`Journal::fixable`] holds).
 pub(crate) fn held_roots(faults: &[doc_core::Failure]) -> Vec<String> {
     faults.iter().filter(|f| !f.id.is_empty() && root_kind(&f.fault)).map(|f| f.id.clone()).collect()
 }
 
 impl Journal {
-    /// The cursor on the first held root's row (its card is the one offered); unchanged when nothing is held.
+    /// The cursor on the first held root with a fix (its card is the one offered; VUGFACEJOURNALHOLDREST, SR611), else on
+    /// the first held root (no card); unchanged when nothing is held.
     fn to_held(&mut self) {
-        let Some(id) = held_roots(&self.faults).into_iter().next() else { return };
+        let roots = held_roots(&self.faults);
+        let Some(id) = roots.iter().find(|r| self.fixable(r)).or(roots.first()) else { return };
         if let Some(i) = self.doc.stmts.iter().position(|s| s.id() == Some(id.as_str())) {
             self.cursor = i;
         }
+    }
+
+    /// VUGFACEJOURNALHOLDREST (SR611): held root `id` has a fix: its row's carried failure gives [`Journal::solid_fixes`]
+    /// at least one choice (NoProfile: a loop; NoSuchEdge / AmbiguousEdge: a resolving edge name; each rereads). A parse
+    /// per candidate, no replay.
+    fn fixable(&self, id: &str) -> bool {
+        let Some(i) = self.doc.stmts.iter().position(|s| s.id() == Some(id)) else { return false };
+        let Some(f) = self.faults.iter().find(|f| !f.id.is_empty() && f.id == id) else { return false };
+        self.solid_fixes(i, &f.fault, self.doc.line(i)).is_some()
     }
 }
