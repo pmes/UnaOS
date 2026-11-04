@@ -101,18 +101,18 @@ fn sub(name: &str) -> String {
     format!("{}/{}", jobs_core::ROOT, name)
 }
 
-/// `login ok`: the scan is owed. On x86 it runs on the `jobs-scan` worker task; elsewhere inline (still chunked).
+/// `login ok`: the scan is owed. It runs on the `jobs-scan` worker task (x86 and aarch64, JOBS-INLINE-ARM B1136); with no worker core, inline (still chunked).
 pub fn owe() {
     ensure_tests();
     if STATE.swap(1, AcqRel) == 1 {
         return; // a scan is already in flight
     }
-    #[cfg(target_arch = "x86_64")]
-    if let Some(cpu) = crate::arch::smp::worker_cpu(0) {
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    if let Some(cpu) = worker_place() {
         crate::fs::assoc::take_to_worker();
         ON_WORKER.store(true, Relaxed);
         if !crate::boot::session_fold() { serial_println!("[jobs] scan pending at=login on=worker cpu={}", cpu); } // CONTINUEREST (rmbp-ledger B1121): folds on the session press into `[session] opened … deferred=` (boot.rs tail); the inline arm below always prints. LINE-NEUTRAL, code first
-        crate::arch::sched::spawn("jobs-scan", worker, 0, cpu, crate::arch::sched::PRIO_NORMAL);
+        spawn_scan(cpu);
         return;
     }
     ON_WORKER.store(false, Relaxed);
@@ -133,11 +133,11 @@ fn bar_settled() -> bool {
 }
 
 /// `jobs-scan`: wait (bounded) for the bar, scan, then build the registry the login owed. Exits when done.
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn worker(_: usize) {
-    let t0 = crate::arch::ms();
-    while !bar_settled() && crate::arch::ms().saturating_sub(t0) < BAR_WAIT_MS {
-        crate::arch::sched::sleep_ms(10);
+    let t0 = crate::arch::ms(); let mut waits = 0u64; // JOBS-INLINE-ARM (B1136): `waits` bounds the bar wait where the clock is stuck (QEMU raspi4b; file tail)
+    while !bar_settled() && !bar_wait_over(t0, &mut waits) {
+        nap(10);
     }
     #[cfg(feature = "wc")] { crate::fs::assoc::stamp_owed(); } scan(crate::arch::ms().saturating_sub(t0)); // CONTINUEIGNITE (B1115): the login's stamp read is the worker's FIRST job after the bar (before the /jobs walk: the shortest unpublished window). LINE-NEUTRAL, code first
     crate::fs::assoc::build_owed(); // FILETYPES (B423): the owed registry, here — not on the pass that pumps hid and paints the bar
@@ -163,9 +163,9 @@ fn chunk(mt: &MountTable, dir: &str, nested: bool) -> (u32, Vec<String>, u64) {
 
 /// Between chunks: the core is unmasked and the scheduler runs the rest (the hid pump, the IPIs).
 fn breathe() {
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     if ON_WORKER.load(Relaxed) {
-        crate::arch::sched::sleep_ms(1);
+        nap(1);
     }
 }
 
@@ -895,4 +895,78 @@ fn ui_selftest() {
         read,
         items.first().map_or("-", |i| i.name.as_str())
     );
+}
+
+// ── JOBS-INLINE-ARM (rmbp-ledger B1136) — FILE-TAIL append. F39CONTINUECLOSEDRAIN (B1129) measured that aarch64 had no
+// `jobs-scan` worker: every Pi or Orin session press (`UNAOS_UNAFS=1` on both lines) scanned /jobs inline. The worker arm
+// is now `any(x86_64, aarch64)`; the arch differences are these four fns. The aarch64 placement is
+// `sched::worker_cpu_apart` (the lowest online secondary that is neither the caller's core, the press's render task, nor
+// the hid pump's: c2 on the Pi, c1 on the Orin, `None` -> inline as before). aarch64 has no `sleep_ms`: a nap is
+// `sleep_ticks` where the tick is live, else one cooperative yield; and `arch::ms()` is stuck at 0 under QEMU raspi4b, so
+// the bar wait is also bounded by a yield count there.
+
+/// JOBS-INLINE-ARM: the worker's core (x86: JOBSCAN's `smp::worker_cpu(0)`, never the render core).
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn worker_place() -> Option<usize> {
+    crate::arch::smp::worker_cpu(0)
+}
+
+/// JOBS-INLINE-ARM: the worker's core (aarch64: neither the press's core nor the hid pump's).
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn worker_place() -> Option<usize> {
+    crate::arch::sched::worker_cpu_apart()
+}
+
+/// JOBS-INLINE-ARM: spawn the `jobs-scan` worker on `cpu`.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn spawn_scan(cpu: usize) {
+    crate::arch::sched::spawn("jobs-scan", worker, 0, cpu, crate::arch::sched::PRIO_NORMAL);
+}
+
+/// JOBS-INLINE-ARM: spawn the `jobs-scan` worker on `cpu` (aarch64's spawn is PRIO_NORMAL and returns the tid).
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn spawn_scan(cpu: usize) {
+    let _ = crate::arch::sched::spawn("jobs-scan", worker, 0, cpu);
+}
+
+/// JOBS-INLINE-ARM: the worker's nap of about `ms`.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn nap(ms: u64) {
+    crate::arch::sched::sleep_ms(ms);
+}
+
+/// JOBS-INLINE-ARM: the worker's nap of about `ms` — `sleep_ticks` where the tick IRQ wakes it, else one yield (QEMU
+/// raspi4b, the Orin past its EL1 drop: `sleep_ticks` would park with nothing to wake it).
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn nap(ms: u64) {
+    if crate::arch::timer::is_live() {
+        crate::arch::sched::sleep_ticks((ms * crate::arch::timer::TICK_HZ / 1000).max(1));
+    } else {
+        crate::arch::sched::yield_now();
+    }
+}
+
+/// JOBS-INLINE-ARM: has the worker waited the bar long enough? (x86: JOBSCAN's `BAR_WAIT_MS`.)
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn bar_wait_over(t0: u64, _waits: &mut u64) -> bool {
+    crate::arch::ms().saturating_sub(t0) >= BAR_WAIT_MS
+}
+
+/// JOBS-INLINE-ARM: the stuck-clock bound — this many naps, when `arch::ms()` never moves.
+#[cfg(target_arch = "aarch64")]
+const BAR_WAIT_YIELDS: u64 = 1_000_000;
+
+/// JOBS-INLINE-ARM: has the worker waited the bar long enough? (aarch64: `BAR_WAIT_MS`, or `BAR_WAIT_YIELDS` naps.)
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn bar_wait_over(t0: u64, waits: &mut u64) -> bool {
+    *waits += 1;
+    crate::arch::ms().saturating_sub(t0) >= BAR_WAIT_MS || *waits >= BAR_WAIT_YIELDS
 }
