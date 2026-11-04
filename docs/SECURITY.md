@@ -834,6 +834,9 @@ metal-unproven and `--as-esp` exists as the answer if it turns out to be require
 - [x] **The deputy door:** `bus_route` answers ring-3 `R3PREF_SET` (130) `-EACCES` — only the kernel's preference client may reach Principia's forwarder, which writes under its own name.
 - [ ] Owed: the names `prefs` and a namespace's owner are trusted by spelling (a program launched as `VEIN.ELF` is vein); binding them to the system image on the root's kernel-owned tree is the seat's call. Metal-pending (`tests prefscap`).
 
+### BUSREG-TAG-IDENTITY (2026-11-04, rmbp-ledger B1155 — found by F39PREFSELFPRELOGIN; the register check is arc F39BUSREGTAGIDENTITY)
+- [ ] **MEDIUM — a bus tag goes to whoever registers it first.** `bus_route` REGISTER is first-come for any tag with no image or capability check, so a program started before login can claim Principia's tags 128–130 or Holocron's and then sees every relayed GET / LIST body and the session principal in the relayed header. Bounded today by B1155 (a SET whose fulfiller is not a program of the open session is answered by the kernel's own store, never relayed) and by PREFSCAP's deputy door (ring 3 cannot reach the forwarder's SET). The read side stays open until the fulfiller's image is bound to its tag at REGISTER (`execname`-stamped, the launcher's name, not the caller's spelling). Owed with it: PREFSELF-RELAUNCH (an anonymous resident fulfiller is ended at login, never re-stamped).
+
 ### The sacred boot FAT, enforced at the FAT layer (BOOTFATSEAM, rmbp-ledger B453 — SECREVIEW F3)
 
 R99: the boot FAT is read-only for every principal, root included. ROOTDISK2 (B401) and SMALLFIX3 (B416) enforced it

@@ -1419,12 +1419,12 @@ exec-rmbp-f39a11ybootset a206e40a3 FOLDED (kernel batch B1145-B1150)
 exec-rmbp-f39hidlockwho 9e65c60b3 FOLDED (kernel batch B1145-B1150)
 exec-rmbp-f39armsplitorin 43f2155f4 FOLDED (kernel batch B1145-B1150)
 exec-rmbp-f39machinestoreacl 4756b4866 FOLDED (kernel batch B1145-B1150)
-exec-rmbp-f39hidlockwhokatsites 84e30a13a wave36 cut58
-exec-rmbp-f39hidpumporin 84e30a13a wave36 cut58
-exec-rmbp-f39a11yboottext 84e30a13a wave36 cut58
-exec-rmbp-f39machineunset 84e30a13a wave36 cut58
-exec-rmbp-f39prefselfprelogin 84e30a13a wave36 cut58
-exec-rmbp-f39machinestoreplant 84e30a13a wave36 cut58
+exec-rmbp-f39hidlockwhokatsites 9afa45c9e FOLDED (kernel batch B1151-B1156)
+exec-rmbp-f39hidpumporin 84e30a13a FOLDED (kernel batch B1151-B1156)
+exec-rmbp-f39a11yboottext b6f8ba145 FOLDED (kernel batch B1151-B1156)
+exec-rmbp-f39machineunset cc581a6ce FOLDED (kernel batch B1151-B1156)
+exec-rmbp-f39prefselfprelogin 84e30a13a FOLDED (kernel batch B1151-B1156)
+exec-rmbp-f39machinestoreplant 84e30a13a FOLDED (kernel batch B1151-B1156)
 exec-rmbp-vugfacesaveascaret eb705bcdd wave36 cut57
 exec-rmbp-vugfacepathbeside eb705bcdd wave36 cut57
 exec-rmbp-vugfacephotoprefline eb705bcdd wave36 cut57
