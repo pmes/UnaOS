@@ -201,9 +201,9 @@ fn ensure_dirs() {
     use crate::fs::vfs::NodeKind;
     let mt = store_mt();
     let d = path();
-    if mt.stat(&d).is_err() {
+    if lay_machine_dir(&mt, &d, "save").is_none() && mt.stat(&d).is_err() { // MACHINESTOREONELAY (rmbp-ledger B1167): the no-session folder is laid and stamped by the ONE lay (file tail; was MACHINESTOREACL B1150's own create + stamp); a home's folder keeps this create. Named in-place hunk
         let _ = mt.create(&d, NodeKind::Dir, crate::fs::vfs::KERNEL_PRINCIPAL);
-    } crate::fs::rootacl::stamp_store(&mt, &d); // MACHINESTOREACL (rmbp-ledger B1150): the no-session folder takes ROOTACL's `system` row (fs/rootacl.rs tail); a home's folder is left alone. LINE-NEUTRAL append, code first
+    }
 }
 
 // ── SETTINGSFILES state ─────────────────────────────────────────────────────────────────────────
@@ -1867,10 +1867,7 @@ fn machine_mirror(ns: &str, k: &str, v: Option<&PrefValue>) {
         _ => return,
     }
     let mt = store_mt();
-    if mt.stat(&dir).is_err() {
-        let _ = mt.create(&dir, crate::fs::vfs::NodeKind::Dir, crate::fs::vfs::KERNEL_PRINCIPAL);
-    }
-    crate::fs::rootacl::stamp_store(&mt, &dir); let ok = mt.put_file_atomic(&p, text.as_bytes(), crate::fs::vfs::KERNEL_PRINCIPAL).is_ok(); // MACHINESTOREACL (rmbp-ledger B1150): the machine folder is stamped ROOTACL `system` before its swap (fs/rootacl.rs tail). LINE-NEUTRAL append, code first
+    let _ = lay_machine_dir(&mt, &dir, "mirror"); let ok = mt.put_file_atomic(&p, text.as_bytes(), crate::fs::vfs::KERNEL_PRINCIPAL).is_ok(); // MACHINESTOREONELAY (rmbp-ledger B1167): the machine folder is laid and stamped ROOTACL `system` by the ONE lay before its swap (file tail; was MACHINESTOREACL B1150's own create + stamp). Named in-place hunk
     serial_println!("[prefs] machine settings/{} {}.{}={} wrote={}", d, ns, k, shown, ok as u8);
 }
 
@@ -2039,25 +2036,63 @@ pub fn stamp_machine_store() {
         if MACHINE_LAID.swap(true, Ordering::AcqRel) {
             return;
         }
-        let (made, stamped) = lay_machine_store(&store_mt());
-        serial_println!(
-            "[prefs] machine store dir=/{} owner={} made={} at=spawn",
-            prefs_core::files::DIR,
-            if stamped { crate::fs::rootacl::SYSTEM_OWNER } else { "none" },
-            made as u8
-        );
+        let _ = lay_native(&store_mt(), "spawn"); // MACHINESTOREONELAY (rmbp-ledger B1167): the once-per-boot wire is said by the ONE lay (file tail). Named in-place hunk
     }
 }
 
 /// Lay `/settings` at kernel authority when absent and stamp it through `rootacl::stamp_store`; no I/O unless the folder
 /// resolves to the native volume. `(made, stamped)`. `tests rootacl`'s MACHINESTORE boot step drives it (no latch).
 pub(crate) fn lay_machine_store(mt: &crate::fs::vfs::MountTable) -> (bool, bool) {
+    lay_native(mt, "tests") // MACHINESTOREONELAY (rmbp-ledger B1167): the body is the ONE lay behind B1162's native gate (file tail). Named in-place hunk
+}
+
+// ── MACHINESTOREONELAY (rmbp-ledger B1167, BP-storage-11) — TAIL-APPENDED ──────────────────────────────────────────────
+// The no-session folder `/settings` has ONE lay, [`lay_machine_dir`]: create-if-absent at kernel authority, then
+// `rootacl::stamp_store`. Three roads call it: `ensure_dirs` (the save road; `path()` is `<home>/settings` in a session,
+// whose create stays in the caller, and the lay answers `None` with no I/O for any dir but `/settings`),
+// `machine_mirror` (the session's machine copy) and the spawn road (`stamp_machine_store`, plus `tests rootacl`'s BOOT
+// step through `lay_machine_store`), the last two behind [`lay_native`], B1162's native-volume gate. The lay itself is
+// gate-free because a FAT root's `/settings` is still kernel-written (B1160 refuses only ring 3's SYS_OPEN there): the
+// save and mirror roads must lay it on any volume. `load`'s stamp (B1156) stays stamp-only: a read never creates.
+// MACHINE-STORE-PREB1150, measured and ACCEPTED: a ring-3 create carries `owner=<principal>` (fs/vfs.rs create) and is
+// refused by `rootacl::store_file_refused`; the residual is a kernel-created row-less file a pre-B1150 image let ring 3
+// rewrite in place. A write adds no row, native UnaFS keeps no mtime, and the `# auto-saved` header is content the
+// writer chose, so nothing on disk tells it apart; a rewrite from the session stores needs a session the boot screen
+// does not have. Bounded to volumes that ran a pre-B1150 image; the kernel's next swap of that domain replaces the file.
+// No lock (create and stamp are idempotent); callers keep SAVE_LOCK where they hold it.
+// Wire, once per boot from whichever road lays first:
+// `[prefs] machine store dir=/settings owner=<system|none> made=<0|1> at=<spawn|save|mirror|tests>`.
+
+/// The one-per-boot wire of [`lay_machine_dir`] was said.
+static MACHINE_SAID: AtomicBool = AtomicBool::new(false);
+
+/// B1162's spawn-road gate: lay the machine folder only when it resolves to the native volume. `(made, stamped)`.
+fn lay_native(mt: &crate::fs::vfs::MountTable, at: &str) -> (bool, bool) {
     let dir = alloc::format!("/{}", prefs_core::files::DIR);
     if !mt.volume_name(&dir).map(|n| n == "native").unwrap_or(false) {
         return (false, false);
     }
-    let made = mt.stat(&dir).is_err() && mt.create(&dir, crate::fs::vfs::NodeKind::Dir, crate::fs::vfs::KERNEL_PRINCIPAL).is_ok();
-    (made, crate::fs::rootacl::stamp_store(mt, &dir))
+    lay_machine_dir(mt, &dir, at).unwrap_or((false, false))
+}
+
+/// THE lay of the no-session folder: `None` (no I/O) unless `dir` is `/settings`; else create it at kernel authority when
+/// absent and stamp it through `rootacl::stamp_store`. `Some((made, stamped))`; the first lay per boot says the wire.
+fn lay_machine_dir(mt: &crate::fs::vfs::MountTable, dir: &str, at: &str) -> Option<(bool, bool)> {
+    if dir.strip_prefix('/') != Some(prefs_core::files::DIR) {
+        return None;
+    }
+    let made = mt.stat(dir).is_err() && mt.create(dir, crate::fs::vfs::NodeKind::Dir, crate::fs::vfs::KERNEL_PRINCIPAL).is_ok();
+    let stamped = crate::fs::rootacl::stamp_store(mt, dir);
+    if !MACHINE_SAID.swap(true, Ordering::AcqRel) {
+        serial_println!(
+            "[prefs] machine store dir={} owner={} made={} at={}",
+            dir,
+            if stamped { crate::fs::rootacl::SYSTEM_OWNER } else { "none" },
+            made as u8,
+            at
+        );
+    }
+    Some((made, stamped))
 }
 
 // ── PREFS-UNSET-BUS (rmbp-ledger B1166, BP-storage-11) — TAIL-APPENDED ─────────────────────────────────────────────────

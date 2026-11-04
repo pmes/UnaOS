@@ -169,8 +169,8 @@ pub fn selftest() {
 // screen's copy) carries the `system` owner row above. `write_verdict`'s walk then refuses every write, create, rename,
 // unlink and attribute set in it to all but `kernel` and the administrator (the swap's row-less `general` inherits the
 // folder's row); reads stay public (`unafs::read_authz`). Before B1150 the folder was a public object (a kernel create
-// stamps no row) and ring 3's `SYS_PATH_WRITE` wrote it as `anon`. prefs.rs stamps it from its two writers
-// (`ensure_dirs`, `machine_mirror`) through [`stamp_store`]; a home's `<home>/settings` is never stamped. `tests rootacl`
+// stamps no row) and ring 3's `SYS_PATH_WRITE` wrote it as `anon`. prefs.rs stamps it through [`stamp_store`] from its
+// ONE lay (`prefs::lay_machine_dir`, B1167: save, mirror, spawn roads); a home's `<home>/settings` is never stamped. `tests rootacl`
 // runs the MACHINESTORE leg (x86): the ring-3 path door's body (`arch::syscall::path_write_as`) as `anon`.
 // Wire: `[rootacl] store dir=<d> owner=<system|none> stamped=<1|0>` (a write, or the first failure) ·
 // `:: MACHINESTORE: owner= write= create= read= -> PASS|FAIL :: by=anon target=<general|scratch> errno= made_dir= ::`.
