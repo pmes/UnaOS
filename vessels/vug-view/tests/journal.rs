@@ -6,6 +6,8 @@
 //! face regenerates; deleting the extrude row removes the body; editing the width row regenerates the body; a refused
 //! edit keeps the geometry and names its line. VUGFACESAVE (SR534): a saved document reopens through `Viewer::open` to the
 //! same text and volume; the title's `*` follows an edit and clears on save; a path that cannot be written is named.
+//! VUGFACESAVEAS (SR539): Save As (Cmd+Shift+S, a typed path) writes a new path beside the opened file and retitles; an
+//! existing path is refused once and overwritten on the second Enter; Esc cancels with nothing written.
 
 use bandy::SMessage;
 use doc_core::{Cons, Stmt};
@@ -279,4 +281,83 @@ fn a_path_that_cannot_be_written_names_the_error() {
     assert!(typed(&mut vw, "s"));
     assert!(matches!(&vw.view.design.journal.disk, Some(Err(e)) if e.contains("exists")), "{:?}", vw.view.design.journal.disk);
     assert_eq!(std::fs::read_to_string(&other).expect("untouched"), "vug-doc version=1\n");
+}
+
+// ---- VUGFACESAVEAS (SR539): Save As, the chosen path ----
+
+fn save_as_open(vw: &Viewer) -> bool {
+    vw.view.design.journal.save_as.is_some()
+}
+
+#[test]
+fn save_as_writes_a_new_path_beside_the_opened_file_and_retitles() {
+    let mut vw = dimensioned();
+    let orig = scratch("vugfacesaveas-orig.vug");
+    let new = scratch("vugfacesaveas-new.vug");
+    vw.save_to = Some(orig.clone());
+    let before = doc(&vw).clone();
+    assert!(key(&mut vw, "Meta+Shift+s"));
+    assert!(save_as_open(&vw));
+    // Relative and without an extension: beside the opened file, `.vug` appended. The field takes `u` / `t` (no undo,
+    // no panel).
+    assert!(typed(&mut vw, "vugfacesaveas-new"));
+    assert_eq!(vw.view.design.journal.save_as.as_ref().map(|f| f.text.as_str()), Some("vugfacesaveas-new"));
+    assert!(!vw.view.design.journal.panel);
+    assert_eq!(doc(&vw), &before);
+    assert!(key(&mut vw, "Return"));
+    assert!(!save_as_open(&vw), "{:?}", vw.view.design.journal.disk);
+    assert_eq!(vw.view.design.journal.disk, Some(Ok("saved vugfacesaveas-new.vug".to_string())));
+    assert_eq!(std::fs::read_to_string(&new).expect("written"), doc_core::write(doc(&vw)));
+    assert!(!orig.exists(), "the old target is not written");
+    assert_eq!(vw.save_to.as_deref(), Some(new.as_path()));
+    assert_eq!(vw.title, "vugfacesaveas-new.vug");
+    // The chosen path is the face's own now: an edit and `s` write it again.
+    assert!(typed(&mut vw, "u"));
+    assert_eq!(vw.title, "vugfacesaveas-new.vug*");
+    assert!(typed(&mut vw, "s"));
+    assert_eq!(vw.title, "vugfacesaveas-new.vug", "{:?}", vw.view.design.journal.disk);
+    assert_eq!(std::fs::read_to_string(&new).expect("rewritten"), doc_core::write(doc(&vw)));
+}
+
+#[test]
+fn save_as_to_an_existing_path_refuses_once_then_overwrites() {
+    let mut vw = dimensioned();
+    let other = scratch("vugfacesaveas-existing.vug");
+    std::fs::write(&other, "vug-doc version=1\n").expect("scratch doc");
+    assert!(key(&mut vw, "Meta+Shift+s"));
+    assert!(typed(&mut vw, other.to_str().expect("utf-8 path")));
+    assert!(key(&mut vw, "Return"));
+    assert!(
+        matches!(&vw.view.design.journal.disk, Some(Err(e)) if e.contains("exists") && e.contains("Enter again")),
+        "{:?}",
+        vw.view.design.journal.disk
+    );
+    assert_eq!(std::fs::read_to_string(&other).expect("untouched"), "vug-doc version=1\n");
+    assert!(save_as_open(&vw));
+    assert_eq!(vw.title, "tree*");
+    // The second Enter overwrites.
+    assert!(key(&mut vw, "Return"));
+    assert!(!save_as_open(&vw), "{:?}", vw.view.design.journal.disk);
+    assert_eq!(std::fs::read_to_string(&other).expect("overwritten"), doc_core::write(doc(&vw)));
+    assert_eq!(vw.title, "vugfacesaveas-existing.vug");
+}
+
+#[test]
+fn esc_cancels_save_as_with_nothing_written() {
+    let mut vw = dimensioned();
+    let p = scratch("vugfacesaveas-esc.vug");
+    assert!(key(&mut vw, "Meta+Shift+s"));
+    assert!(typed(&mut vw, p.to_str().expect("utf-8 path")));
+    assert!(key(&mut vw, "Escape"));
+    assert!(!save_as_open(&vw));
+    assert!(!p.exists());
+    assert_eq!(vw.title, "tree*");
+    assert_eq!(vw.view.design.journal.disk, None);
+    // The chord again closes it too.
+    assert!(key(&mut vw, "Meta+Shift+s"));
+    assert!(typed(&mut vw, p.to_str().expect("utf-8 path")));
+    assert!(key(&mut vw, "Meta+Shift+s"));
+    assert!(!save_as_open(&vw));
+    assert!(!p.exists());
+    assert_eq!(vw.title, "tree*");
 }
