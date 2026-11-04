@@ -11,7 +11,7 @@
 //!      [--meta <x_Depth_metadata.csv>] [--width W --height H] [--csv-raw]
 //!      [--fx F --fy F --ppx F --ppy F] [--units-um N] [--frame N]
 //!      [--turntable DEG --radius MM | --poses <file> | --track] [--voxel MM] [--trunc MM] [--band MM]
-//!      [--against <design.vugdoc>] [--intent [<doc.vug>]]
+//!      [--against <design.vugdoc>] [--intent [<doc.vug>]] [--gdt <face>=<kind>:<tol>]...
 //! ```
 //!
 //! Inputs (the measured roads from a D435i to this machine; librealsense v2.55.1):
@@ -70,7 +70,7 @@
 //! status colours (inside the band POSITIVE, short toward INFO, proud toward CRITICAL, off the design TEXT_SECONDARY).
 //! The report adds `deviation: aligned rms= max= p95= inside= faces=<seen>/<total> ...` and one
 //! `face: <solid>/<op>.<role>.<a>.<b>:<kind> n= max= rms= mean=` line per design face, by rms, worst first; a refused
-//! registration prints `deviation: refused <Name> {..}` and the run exits 1. Without `--against` nothing changes. `--intent [<doc.vug>]` (VUGINTENTSCANWIRE, LEDGER SR515): [`intent_road`].
+//! registration prints `deviation: refused <Name> {..}` and the run exits 1. Without `--against` nothing changes. `--intent [<doc.vug>]` (VUGINTENTSCANWIRE, LEDGER SR515): [`intent_road`]. `--gdt <face>=<kind>:<tol>` (VUGSCANGDT, LEDGER SR542): [`gdt_road`].
 
 use std::fmt::Write as _;
 use std::path::Path;
@@ -128,7 +128,7 @@ enum Refusal {
     DesignEmpty,
     Tessellate { solid: String, error: brep_core::Refusal },
     DesignFaceId { solid: String, id: u64 },
-    Deviation(DeviationError),
+    Deviation(DeviationError), GdtFace { face: String }, GdtKind { face: String, kind: &'static str }, GdtWithoutAgainst, // VUGSCANGDT (SR542): the `--gdt` road's refusals
 }
 
 fn usage() -> ! {
@@ -136,7 +136,7 @@ fn usage() -> ! {
     eprintln!("            [--meta <x_Depth_metadata.csv>] [--width W --height H] [--csv-raw]");
     eprintln!("            [--fx F --fy F --ppx F --ppy F] [--units-um N] [--frame N]");
     eprintln!("            [--turntable DEG --radius MM | --poses <file> | --track] [--voxel MM] [--trunc MM] [--band MM]");
-    eprintln!("            [--against <design.vugdoc>] [--intent [<doc.vug>]]");
+    eprintln!("            [--against <design.vugdoc>] [--intent [<doc.vug>]] [--gdt <face>=<kind>:<tol>]...");
     std::process::exit(2)
 }
 
@@ -159,7 +159,7 @@ struct Args {
     voxel: f64,
     trunc: Option<f64>,
     band: f64,
-    against: Option<String>, intent: Option<Option<String>>, // VUGSCANDEVIATION (SR510)
+    against: Option<String>, intent: Option<Option<String>>, gdt: Vec<(String, scan_core::Kind, f64)>, // VUGSCANDEVIATION (SR510); VUGSCANGDT (SR542) gdt
 }
 
 fn num<T: std::str::FromStr>(it: &mut impl Iterator<Item = String>) -> T {
@@ -190,7 +190,7 @@ fn parse_args() -> Args {
             "--voxel" => a.voxel = num(&mut it),
             "--trunc" => a.trunc = Some(num(&mut it)),
             "--band" => a.band = num(&mut it),
-            "--against" => a.against = Some(it.next().unwrap_or_else(|| usage())), "--intent" => a.intent = Some(intent_doc(&mut it)),
+            "--against" => a.against = Some(it.next().unwrap_or_else(|| usage())), "--intent" => a.intent = Some(intent_doc(&mut it)), "--gdt" => a.gdt.push(gdt_spec(&mut it)),
             _ if s.starts_with('-') => usage(),
             _ if a.input.is_none() => a.input = Some(s),
             _ => usage(),
@@ -539,12 +539,12 @@ fn run(a: &Args) -> Result<String, Refusal> {
     let dev = match &a.against {
         Some(p) => Some(against(p, &sm, a.band)?),
         None => None,
-    }; let intent = intent_road(a, &detected)?; // VUGINTENTSCANWIRE (SR515): before anything is written
+    }; let intent = intent_road(a, &detected)?; let gdt = gdt_road(a, &sm, dev.as_ref(), t.trunc_mm())?; // VUGINTENTSCANWIRE (SR515): before anything is written; VUGSCANGDT (SR542) gdt_road too
 
     // The PLY: scan_core's mesh IS mesh_core's (VUGSHIMSWAP SR473), straight into mesh_core's writer.
     let out = a.out.as_deref().unwrap_or_default();
     let ply = match &dev {
-        Some((d, _)) => deviation_ply(&sm, d, a.band),
+        Some((d, ..)) => deviation_ply(&sm, d, a.band),
         None => mesh_core::ply::write(&sm.mesh),
     };
     std::fs::write(out, ply).map_err(|e| Refusal::Io { path: out.into(), error: e.to_string() })?;
@@ -625,8 +625,8 @@ fn run(a: &Args) -> Result<String, Refusal> {
         }
     }
     shapes_report(&mut r, &detected);
-    if let Some((d, names)) = &dev {
-        deviation_report(&mut r, d, names);
+    if let Some((d, names, _)) = &dev {
+        deviation_report(&mut r, d, names); r.push_str(&gdt); // VUGSCANGDT (SR542): the gdt lines after the face lines
     } r.push_str(&intent); // VUGINTENTSCANWIRE (SR515)
     let plane_s = plane.as_ref().map_or("refused".into(), |f| format!("{:.3} normal={}", f.rms_mm, v3(f.shape.normal)));
     let cyl_s = cyl.as_ref().map_or("none".into(), |(c, s)| format!("{:.3} rms={:.3}", c.radius, s.rms_mm));
@@ -665,7 +665,7 @@ fn shapes_report(r: &mut String, detected: &Result<Vec<Shape>, FitError>) {
 
 /// VUGSCANDEVIATION (SR510): the document replayed, every solid tessellated into one design with each triangle's face
 /// (named `<solid>/<op>.<role>.<a>.<b>:<kind>`), and the scan measured against it from the identity.
-fn against(path: &str, sm: &ScanMesh, band: f64) -> Result<(Deviation, Vec<String>), Refusal> {
+fn against(path: &str, sm: &ScanMesh, band: f64) -> Result<(Deviation, Vec<String>, scan_core::Design), Refusal> {
     let text = String::from_utf8(read(path)?).map_err(|e| Refusal::Io { path: path.into(), error: e.to_string() })?;
     let doc = doc_core::read(&text).map_err(Refusal::DesignRead)?;
     let rp = doc_core::replay(&doc, doc.tol);
@@ -682,7 +682,7 @@ fn against(path: &str, sm: &ScanMesh, band: f64) -> Result<(Deviation, Vec<Strin
         DesignError::Design(e) => Refusal::Deviation(e),
     })?;
     match measure(sm, &design, Transform::IDENTITY, &AlignParams::DEFAULT, band, Tol::DEFAULT) {
-        Ok(d) => Ok((d, names)),
+        Ok(d) => Ok((d, names, design)),
         Err(e) => {
             eprintln!("deviation: refused {e:?}");
             Err(Refusal::Deviation(e))
@@ -879,4 +879,84 @@ mod intent_tests {
         let ss = [spread(shape(Primitive::Plane(pl), 9, 0.1), 0.4), spread(shape(Primitive::Cylinder(c), 1234, 0.21), 1.7)];
         assert_eq!(intent_sigma(&ss), (0.21, 1.7));
     }
+}
+
+// ---- VUGSCANGDT (LEDGER SR542): --gdt, the deviation read as ISO 1101 tolerances ----
+
+/// `--gdt <face>=<kind>:<tol>`: the face as its `face:` line names it (split at the LAST `=`), the kind (flatness,
+/// cylindricity, position) and the tolerance in mm (finite, above 0, split at the LAST `:`); anything else is usage.
+fn gdt_spec(it: &mut impl Iterator<Item = String>) -> (String, scan_core::Kind, f64) {
+    let s = it.next().unwrap_or_else(|| usage());
+    let Some((face, rest)) = s.rsplit_once('=') else { usage() };
+    let Some((kind, tol)) = rest.rsplit_once(':') else { usage() };
+    let kind = scan_core::Kind::parse(kind).unwrap_or_else(|| usage());
+    let tol: f64 = tol.parse().unwrap_or_else(|_| usage());
+    if face.is_empty() || !(tol.is_finite() && tol > 0.0) {
+        usage()
+    }
+    (face.to_string(), kind, tol)
+}
+
+/// `gdt:` per design face (face-index order) after `--against`'s `face:` lines: the nominal surface, the form vertices
+/// `n=<kept>/<matched>` (kept outside the edge margin, the fused volume's truncation `margin`, of the vertices paired
+/// with the face), flatness (a plane) or cylindricity and position (a cylinder), the nominal-relative `band=` (no verdict), and
+/// a `verdict=<kind>:<tol> PASS|FAIL|UNMEASURED` per callout naming the face; then `gdt: callouts= pass= fail=`.
+/// A FAIL is a printed measurement (the run exits 0, BP-vug-5); an unknown face (`GdtFace`), a kind its surface does
+/// not take (`GdtKind`) and `--gdt` without `--against` (`GdtWithoutAgainst`) are refused before anything is written.
+/// Without `--against`, nothing.
+fn gdt_road(a: &Args, sm: &ScanMesh, dev: Option<&(Deviation, Vec<String>, scan_core::Design)>, margin: f64) -> Result<String, Refusal> {
+    let Some((d, names, design)) = dev else {
+        return if a.gdt.is_empty() { Ok(String::new()) } else { Err(Refusal::GdtWithoutAgainst) };
+    };
+    let g = scan_core::gdt(sm, design, d, margin, Tol::DEFAULT);
+    let mut calls: Vec<(usize, scan_core::Kind, f64)> = Vec::with_capacity(a.gdt.len());
+    for (face, kind, tol) in &a.gdt {
+        let Some(i) = names.iter().position(|n| n == face) else { return Err(Refusal::GdtFace { face: face.clone() }) };
+        if !g.get(i).is_some_and(|f| f.accepts(*kind)) {
+            return Err(Refusal::GdtKind { face: face.clone(), kind: kind.name() });
+        }
+        calls.push((i, *kind, *tol));
+    }
+    let mm = |v: Option<f64>| v.map_or_else(|| "none".to_string(), |x| format!("{x:.3}"));
+    let (mut pass, mut fail) = (0usize, 0usize);
+    let mut r = String::new();
+    for f in &g {
+        let name = names.get(f.face as usize).map(String::as_str).unwrap_or("?");
+        let _ = write!(r, "gdt: {name} surface={} n={}/{}", f.nominal.name(), f.n, f.matched);
+        match f.nominal {
+            scan_core::Nominal::Plane(p) => {
+                let _ = write!(r, " normal={} d={:.3} flatness={} band={}", v3(p.normal), p.d, mm(f.flatness_mm), mm(f.band_mm));
+            }
+            scan_core::Nominal::Cylinder(c) => {
+                let _ = write!(
+                    r,
+                    " axis={} point={} r={:.3} cylindricity={} position={} band={}",
+                    v3(c.axis),
+                    v3(c.point),
+                    c.radius,
+                    mm(f.cylindricity_mm),
+                    mm(f.position_mm),
+                    mm(f.band_mm)
+                );
+            }
+            scan_core::Nominal::Other => {}
+        }
+        for &(_, kind, tol) in calls.iter().filter(|c| c.0 == f.face as usize) {
+            let v = match f.verdict(kind, tol) {
+                scan_core::Verdict::Pass { .. } => {
+                    pass += 1;
+                    "PASS"
+                }
+                scan_core::Verdict::Fail { .. } => {
+                    fail += 1;
+                    "FAIL"
+                }
+                scan_core::Verdict::Unmeasured => "UNMEASURED",
+            };
+            let _ = write!(r, " verdict={}:{tol} {v}", kind.name());
+        }
+        r.push('\n');
+    }
+    let _ = writeln!(r, "gdt: callouts={} pass={pass} fail={fail}", calls.len());
+    Ok(r)
 }
