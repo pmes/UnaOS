@@ -18612,7 +18612,7 @@ pub fn service_ehci_hid() {
     // passes per second and this measures the gap BETWEEN them, which is the quantity `dark_gap_ms`
     // is made of; stamped here, beside its twin and above the lock, for the identical reason.
     pass_period_note();
-    let mut g = EHCI_HID.lock(); crate::hidstall::phase_mark(crate::hidstall::PH_LOCK); crate::pointerfeel::note_pass(crate::arch::ms()); crate::drivers::i8042::pump(); crate::drivers::dwi2c::touchpad::pump(); crate::hidstall::phase_mark(crate::hidstall::PH_PS2); // F39HIDPHASELOCK (B1142) HID-PHASE-LOCK: `lock` = the wait for this take, `ps2` = the two pumps, so `svc` is the controller service alone (hidstall.rs tail). ZENBOOKTOUCHPADREPORTS (zenbook-ledger Z18): the I2C-HID touchpad polls here, under this lock, into `pal::push_pointer_report` (LINE-NEUTRAL fold, code first). ZENBOOKI8042 (Z3): the i8042 transport drains here, under this lock, into the one boot-keyboard decoder (`drivers::hidboot`, HIDBOOTSHARED B982) (LINE-NEUTRAL fold, code first). PUMPHOLE (B541): the pass cadence `tests pointerfeel` classes each report gap by — stamped AFTER the lock, so a pass that waited on it is charged the wait (LINE-NEUTRAL fold, code first)
+    if EHCI_HID.is_locked() { crate::hidstall::lock_peek(EHCI_HID.holder()); } let mut g = EHCI_HID.lock(); crate::hidstall::phase_mark(crate::hidstall::PH_LOCK); crate::hidstall::lock_took(); crate::pointerfeel::note_pass(crate::arch::ms()); crate::drivers::i8042::pump(); crate::drivers::dwi2c::touchpad::pump(); crate::hidstall::phase_mark(crate::hidstall::PH_PS2); // F39HIDLOCKWHO (B1148) HID-LOCK-WHO: the holder peeked before the take, this taker named after its `lock` mark (hidstall.rs tail). F39HIDPHASELOCK (B1142) HID-PHASE-LOCK: `lock` = the wait for this take, `ps2` = the two pumps, so `svc` is the controller service alone (hidstall.rs tail). ZENBOOKTOUCHPADREPORTS (zenbook-ledger Z18): the I2C-HID touchpad polls here, under this lock, into `pal::push_pointer_report` (LINE-NEUTRAL fold, code first). ZENBOOKI8042 (Z3): the i8042 transport drains here, under this lock, into the one boot-keyboard decoder (`drivers::hidboot`, HIDBOOTSHARED B982) (LINE-NEUTRAL fold, code first). PUMPHOLE (B541): the pass cadence `tests pointerfeel` classes each report gap by — stamped AFTER the lock, so a pass that waited on it is charged the wait (LINE-NEUTRAL fold, code first)
     let Some(ctrls) = g.as_mut() else { return };
     for c in ctrls.iter_mut() {
         unsafe { c.service() }; crate::hidstall::phase_mark(crate::hidstall::PH_HUB); #[cfg(all(feature = "lidsleep", feature = "wc"))] c.port_suspend_service(); // F39SHIMBEAMPAN (B1137) HID-PASS-PHASE: the hub change (service's tail) ends here. USBSUSPEND (B766): the sleep state's SUSPEND/resume of this controller's root ports, under this lock; the body is `suspend` at the file tail. LINE-NEUTRAL fold, code first
@@ -19531,7 +19531,7 @@ fn tp_mode_ok(idx: usize, latched: bool) {
 /// trackpad path, 3 other) and whether it was given up (`dead`). `None` while the table is held (`try_lock`; the
 /// caller retries). Reads only. Tail-appended, so no line above moves.
 pub fn census() -> Option<Vec<((u8, u8, u8), Vec<(u8, bool)>)>> {
-    let g = EHCI_HID.try_lock()?;
+    let g = EHCI_HID.try_lock()?; crate::hidstall::lock_took(); // F39HIDLOCKWHO (B1148): this taker named for the hid pass's `lock_by=` (hidstall.rs tail). LINE-NEUTRAL fold
     Some(g.as_ref().map(|cs| cs.iter().map(|c| {
         let eps = c.int_eps.iter().map(|e| (if e.is_kbd { 0 } else if e.is_rel_mouse { 1 } else if e.layout.is_some() { 2 } else { 3 }, e.dead)).collect();
         ((c.bus, c.dev, c.func), eps)
@@ -19686,7 +19686,7 @@ pub mod suspend {
     /// first live EHCI keyboard, and whether its interrupt QH is still un-halted. `None` = `EHCI_HID` busy;
     /// `Some(None)` = no EHCI keyboard; `Some(Some((len, ep_ok)))`.
     pub fn kbd_report_probe() -> Option<Option<(u32, bool)>> {
-        let mut g = EHCI_HID.try_lock()?;
+        let mut g = EHCI_HID.try_lock()?; crate::hidstall::lock_took(); // F39HIDLOCKWHO (B1148): this taker named for the hid pass's `lock_by=` (hidstall.rs tail). LINE-NEUTRAL fold
         let Some(ctrls) = g.as_mut() else { return Some(None) };
         for c in ctrls.iter_mut() {
             let Some(e) = c.int_eps.iter().find(|e| e.is_kbd && !e.dead) else { continue };
@@ -20173,7 +20173,7 @@ pub mod hubchange {
             && below(&nodes, 5, 2).is_empty()
             && super::intpool::selftest_pure();
         let (mut hubs, mut armed) = (0usize, 0usize);
-        if let Some(ctrls) = EHCI_HID.lock().as_ref() {
+        if let Some(ctrls) = EHCI_HID.lock().as_ref() { crate::hidstall::lock_took(); // F39HIDLOCKWHO (B1148): this taker named for the hid pass's `lock_by=` (hidstall.rs tail). LINE-NEUTRAL fold
             for c in ctrls.iter() {
                 hubs += suspend::hubs_of(c.idx).len();
                 armed += c.int_eps.iter().filter(|e| e.hub.is_some() && !e.dead).count();
@@ -20740,7 +20740,7 @@ pub fn intpool_selftest() {
         && lost_note(&mut [0u32; 4], 4, IntClass::Kbd, 2); // past the record: still counted as a HID loss
     let kat = shapes && counting;
     let (mut taken, mut hid_armed) = (0usize, 0usize);
-    if let Some(ctrls) = EHCI_HID.lock().as_ref() {
+    if let Some(ctrls) = EHCI_HID.lock().as_ref() { crate::hidstall::lock_took(); // F39HIDLOCKWHO (B1148): this taker named for the hid pass's `lock_by=` (hidstall.rs tail). LINE-NEUTRAL fold
         for c in ctrls.iter() {
             taken += c.int_held();
             hid_armed += c.int_eps.iter().filter(|e| !e.dead && (e.is_kbd || e.is_rel_mouse || e.layout.is_some())).count();
