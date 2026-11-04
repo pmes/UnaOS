@@ -752,3 +752,20 @@ fn view_or(scan: &ScanMesh, design: &Design, bvh: &Bvh, p: &AlignParams, tol: To
         _ => (starts, rms_mm),
     }
 }
+
+// ---- VUGSCANROADWORDMARGIN (LEDGER SR637): the road's one word ----
+// vug-view's corner (`align_line`, `align=` before it) and tools/scan's report (`road_report`, `road: ` before it)
+// spelled the road each in their own match; the word is the road's, so it is spelled once here and the prefixes stay
+// the callers'.
+
+impl Road {
+    /// The road's word: none for `Fine` (the caller's pose), `coarse+fine rms=<mm>` (the coarse start's trimmed rms)
+    /// or `coarse refused rms=<mm>`, at three decimals.
+    pub fn word(self) -> Option<String> {
+        match self {
+            Road::Fine => None,
+            Road::CoarseFine { rms_mm } => Some(alloc::format!("coarse+fine rms={rms_mm:.3}")),
+            Road::CoarseRefused { rms_mm } => Some(alloc::format!("coarse refused rms={rms_mm:.3}")),
+        }
+    }
+}

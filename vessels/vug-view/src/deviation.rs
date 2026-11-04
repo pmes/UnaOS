@@ -354,15 +354,15 @@ impl Viewer {
     /// Measure `scan` against the journal's document at [`BAND_MM`]: generation 0, the drawn model the aligned scan,
     /// the camera homed on it. A document with no body refuses [`JOURNAL_EMPTY`]; a refusal changes nothing.
     pub fn against_journal(&mut self, scan: ScanMesh) -> Result<(), String> {
-        self.against_journal_road(scan, false)
+        self.against_journal_road(scan, false, None) // VUGSCANROADWORDMARGIN (SR637): a bare ScanMesh carries no truncation: the fallback
     }
 
     /// VUGFACEDEVIATIONPRBPOSES (SR621): [`Viewer::against_journal`] on [`open_road`]'s road: `coarse` for a scan with no
     /// starting pose (a tracked .prb, its world frame 0's camera); [`follow`] keeps the road through `Map::road`.
-    pub(crate) fn against_journal_road(&mut self, scan: ScanMesh, coarse: bool) -> Result<(), String> {
+    pub(crate) fn against_journal_road(&mut self, scan: ScanMesh, coarse: bool, margin_mm: Option<f64>) -> Result<(), String> {
         let doc = self.view.design.journal.doc.clone();
         journal_body(&doc)?;
-        let (model, mut map) = open_road(&scan, &doc, BAND_MM, GDT_MARGIN_MM, coarse)?; // VUGFACEGDTREMEASURE (SR560): a ScanMesh carries no truncation: the fallback
+        let (model, mut map) = open_road(&scan, &doc, BAND_MM, margin_mm.unwrap_or(GDT_MARGIN_MM), coarse)?; // VUGFACEGDTREMEASURE (SR560): a ScanMesh carries no truncation: the fallback; VUGSCANROADWORDMARGIN (SR637): a fused scan's volume truncation when the reader has it
         map.source = Some(Source { scan, doc, generation: 0, measured: 0, refused: None });
         self.model = model;
         self.view.deviation = Some(map);
@@ -1233,11 +1233,7 @@ fn road_measure(scan: &ScanMesh, design: &Design, band_mm: f64, coarse: bool) ->
 }
 
 /// The corner's road line: none for the identity road, `align=coarse+fine rms=<mm>` (the coarse start's trimmed rms)
-/// or `align=coarse refused rms=<mm>`.
+/// or `align=coarse refused rms=<mm>`. VUGSCANROADWORDMARGIN (SR637): the word is scan_core's `Road::word`.
 fn align_line(map: &Map) -> Option<String> {
-    match map.road {
-        scan_core::deviation::Road::Fine => None,
-        scan_core::deviation::Road::CoarseFine { rms_mm } => Some(format!("align=coarse+fine rms={rms_mm:.3}")),
-        scan_core::deviation::Road::CoarseRefused { rms_mm } => Some(format!("align=coarse refused rms={rms_mm:.3}")),
-    }
+    map.road.word().map(|w| format!("align={w}"))
 }
