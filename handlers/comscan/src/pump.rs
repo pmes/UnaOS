@@ -242,6 +242,8 @@ pub struct PumpDesk {
     /// VUGCOMSCANMACHINEDECLARE (SR613): the name and dialect of the machine a PumpDeclare declared (its travel is
     /// `machine`'s axes, rewritten in place); `None`: nothing declared on the bus this session.
     declared: Option<Declared>,
+    /// VUGCOMSCANJOGPOSITION (SR612): the controller's last settled (Idle) machine position, polled outside a job, the poll's time and the once-per-link fallback word ([`Position`]).
+    pos: Position,
 }
 
 fn refused(why: impl Into<String>) -> Vec<PumpEvent> {
@@ -251,7 +253,7 @@ fn refused(why: impl Into<String>) -> Vec<PumpEvent> {
 impl PumpDesk {
     /// A desk for `machine`: every pass it arms must name this machine's identity (VUG-HELM-BIND-MACHINE).
     pub fn new(machine: Machine) -> PumpDesk {
-        PumpDesk { machine, armed: Vec::new(), running: None, identify: None, hello: None, envelope: true, read: None, declared: None } // VUGCOMSCANMACHINEDECLARE (SR613): + declared
+        PumpDesk { machine, armed: Vec::new(), running: None, identify: None, hello: None, envelope: true, read: None, declared: None, pos: Position::default() } // VUGCOMSCANMACHINEDECLARE (SR613): + declared; VUGCOMSCANJOGPOSITION (SR612): + pos
     }
 
     /// The machine this desk drives.
@@ -354,6 +356,7 @@ impl PumpDesk {
             Some(Running { pump, link: Some(link), .. }) => pump.tick(&mut **link, now_us),
             _ => return Vec::new(),
         };
+        self.position_seen(&evs, now_us); // VUGCOMSCANJOGPOSITION (SR612): the reports' settled position; the idle `?` on a quiet tick too
         if evs.is_empty() {
             return Vec::new();
         }
@@ -839,6 +842,7 @@ impl PumpDesk {
             out.push(self.squawk(Some(format!("hello {h}")))); // printed once, at the first open (VUGCOMSCANJOG SR573: as the controller first said it)
         }
         self.read = env; // VUGCOMSCANENVELOPEBOUND (SR602): kept for the jog's bound (a hello-off start keeps None)
+        self.pos = Position::default(); // VUGCOMSCANJOGPOSITION (SR612): a new link knows no position yet
         for w in self.envelope_words(env) {
             out.push(self.squawk(Some(w))); // VUGCOMSCANALARMIDLE (SR591): a travel that differs from the declared machine, said once
         }
@@ -1178,7 +1182,7 @@ impl PumpDesk {
                 if *dx == 0.0 && *dy == 0.0 && *dz == 0.0 {
                     return refused("jog: no axis moves");
                 }
-                if let Some(why) = jog_past_travel(&self.machine, self.read, [*dx, *dy, *dz]) { return refused(why); } // VUGCOMSCANALARMRESET (SR585): VUG-COMSCAN-JOG-ENVELOPE; VUGCOMSCANENVELOPEBOUND (SR602): + the kept read
+                if let Some(why) = jog_past_travel(&self.machine, self.read, self.pos.at, [*dx, *dy, *dz]) { return refused(why); } // VUGCOMSCANALARMRESET (SR585): VUG-COMSCAN-JOG-ENVELOPE; VUGCOMSCANENVELOPEBOUND (SR602): + the kept read
                 ("jog", pump_core::pump::jog_lines(d, [*dx, *dy, *dz], *feed))
             }
             _ => return Vec::new(),
@@ -1200,7 +1204,8 @@ impl PumpDesk {
             r.motion.push_back(Motion { word, last: k + 1 == lines.len(), failed: false });
         }
         r.jogged = word == "jog"; // VUGCOMSCANJOGFACE (SR579): set on a jog, cleared on a home
-        vec![self.squawk(Some(format!("{word} sent: {}", lines.join(" / "))))]
+        let first = self.position_moved(word == "jog", matches!(d, Dialect::Grbl { .. })); // VUGCOMSCANJOGPOSITION (SR612): the fallback word once per link; the axis moves, so the position is asked again
+        first.into_iter().chain(std::iter::once(format!("{word} sent: {}", lines.join(" / ")))).map(|w| self.squawk(Some(w))).collect()
     }
 
     /// [`PumpDesk::tick`]'s events with the home / jog answers claimed, oldest line first: an `ok` (grbl `ok`, Marlin
@@ -1339,11 +1344,14 @@ impl PumpDesk {
 }
 
 /// VUG-COMSCAN-JOG-ENVELOPE: a jog's delta against the declared machine's axes (`Machine::axes`, the SR498 machine
-/// behind the desk): an axis that moves and is not declared, or a delta past its travel (`max - min`), refused by name
-/// before the wire. The position is not polled outside a job (the pump queries `?` only while live), so the DELTA is
-/// bounded, not the jog's end (owed VUG-COMSCAN-JOG-POSITION). VUGCOMSCANENVELOPEBOUND (SR602): the bound is [`bound`],
-/// the tighter of the declared travel and the controller's `read`, and the refusal names which (`declared` / `controller`).
-fn jog_past_travel(m: &Machine, read: Option<Envelope>, delta: [f64; 3]) -> Option<String> {
+/// behind the desk): an axis that moves and is not declared, or a jog past its travel (`max - min`), refused by name
+/// before the wire. VUGCOMSCANENVELOPEBOUND (SR602): the bound is [`bound`], the tighter of the declared travel and the
+/// controller's `read`, and the refusal names which (`declared` / `controller`). VUGCOMSCANJOGPOSITION (SR612): with the
+/// controller's settled position `pos` (polled outside a job, [`PumpDesk::position`]) the jog's END is bounded: every jog
+/// is G91 (`pump_core::pump::jog_lines`), so the end is `pos + delta`, refused when `|end|` passes the travel (both grbl
+/// MPos frames: 0..-travel after a default homing, 0..+travel with the origin forced); with no position yet the delta is
+/// bounded as before.
+fn jog_past_travel(m: &Machine, read: Option<Envelope>, pos: Option<[f64; 3]>, delta: [f64; 3]) -> Option<String> {
     use make_core::AxisId;
     for (i, (id, c, v)) in [(AxisId::X, 'X', delta[0]), (AxisId::Y, 'Y', delta[1]), (AxisId::Z, 'Z', delta[2])].into_iter().enumerate() {
         if v == 0.0 {
@@ -1352,9 +1360,13 @@ fn jog_past_travel(m: &Machine, read: Option<Envelope>, delta: [f64; 3]) -> Opti
         let Some((travel, which)) = bound(m, read, id, i) else { // VUGCOMSCANALARMIDLE (SR591): the one travel; VUGCOMSCANENVELOPEBOUND (SR602): through bound
             return Some(format!("jog: {c}{v} on an axis the declared machine does not have"));
         };
-        if v.abs() > travel {
+        if let Some(p) = pos.map(|p| p[i]) { // VUGCOMSCANJOGPOSITION (SR612): the end from the reported position
+            if (p + v).abs() > travel {
+                return Some(format!("jog: {c}{v} from {p} ends past the {which} {c} travel {travel}"));
+            }
+        } else if v.abs() > travel {
             return Some(format!(
-                "jog: {c}{v} is past the {which} {c} travel {travel} (the position is not polled outside a job: the jog's delta is bounded)"
+                "jog: {c}{v} is past the {which} {c} travel {travel} (no position report yet: the jog's delta is bounded)"
             ));
         }
     }
@@ -1610,6 +1622,76 @@ pub fn declare_request(line: &str, principal: bandy::Origin) -> Result<PumpEvent
         return Err("declare: x, y and z are each required".to_string());
     };
     Ok(PumpEvent::PumpDeclare { principal, name: name.to_string(), x, y, z, dialect })
+}
+
+// --- VUGCOMSCANJOGPOSITION (LEDGER SR612): the position polled outside a job, the jog's END bounded (named tail hunk) ---
+
+/// The desk's view of where the machine stands (one field, [`PumpDesk`]'s `pos`, under the desk lock).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Position {
+    /// The last settled machine position per axis (X / Y / Z, mm) from an `Idle` report ([`idle_mpos`]).
+    at: Option<[f64; 3]>,
+    /// When the desk last asked `?` outside a job (`now_us`); the next ask waits `pump_core::pump::STATUS_EVERY_US`.
+    asked_us: Option<u64>,
+    /// The fallback word (`jog bound=distance: no position report yet`) was said on this link.
+    said: bool,
+}
+
+/// A report's machine position when the machine is settled: `Idle` only (grbl answers `$J=` when planned, so a Jog /
+/// Run / Home / Alarm report is a moving or untrusted axis); `MPos` (grbl `$10=1`, the default), else `WPos + WCO` from
+/// the same report (`$10=0`); else `None`.
+fn idle_mpos(r: &StatusReport) -> Option<[f64; 3]> {
+    if !matches!(r.state, pump_core::State::Idle) {
+        return None;
+    }
+    r.mpos.or_else(|| {
+        let (w, o) = (r.wpos?, r.wco?);
+        Some([w[0] + o[0], w[1] + o[1], w[2] + o[2]])
+    })
+}
+
+impl PumpDesk {
+    /// [`PumpDesk::tick`]'s events and turn: a status report sets the settled position ([`idle_mpos`]: a moving or
+    /// alarmed report forgets it), an alarm or reset forgets it, a lost link forgets it all (the fallback word is said
+    /// again on the next link); then on a grbl link that is up with no job live (a live job's pump polls itself) and no
+    /// settled position, `?` through the one writer ([`pump_core::Pump::status`]) at most every
+    /// `pump_core::pump::STATUS_EVERY_US`. A dead link is the next tick's `LinkLost`.
+    fn position_seen(&mut self, evs: &[Event], now_us: u64) {
+        for e in evs {
+            match e {
+                Event::Status(r) => self.pos.at = idle_mpos(r),
+                Event::Alarm { .. } | Event::Reset => self.pos.at = None,
+                Event::LinkLost => self.pos = Position::default(),
+                _ => {}
+            }
+        }
+        if self.pos.at.is_some() || self.pos.asked_us.is_some_and(|t| now_us.saturating_sub(t) < pump_core::pump::STATUS_EVERY_US) {
+            return;
+        }
+        let Some(r) = self.running.as_mut() else { return };
+        if matches!(r.pump.state(), PumpState::Streaming | PumpState::Stopping) || !matches!(r.pump.dialect(), Dialect::Grbl { .. }) {
+            return;
+        }
+        let Some(link) = r.link.as_mut() else { return };
+        self.pos.asked_us = Some(now_us);
+        let _ = r.pump.status(&mut **link);
+    }
+
+    /// A home or jog was sent: the fallback word when it is a grbl jog bounded by its distance (no settled position)
+    /// and not yet said on this link; the axis moves, so the position is forgotten and asked again at the next tick.
+    fn position_moved(&mut self, jog: bool, grbl: bool) -> Option<String> {
+        let word = (jog && grbl && self.pos.at.is_none() && !self.pos.said).then(|| "jog bound=distance: no position report yet".to_string());
+        self.pos.said |= word.is_some();
+        self.pos.at = None;
+        self.pos.asked_us = None;
+        word
+    }
+
+    /// The controller's last settled machine position (X / Y / Z, mm), polled outside a job; `None` until an `Idle`
+    /// report on this link, and after a home or jog until the next one.
+    pub fn position(&self) -> Option<[f64; 3]> {
+        self.pos.at
+    }
 }
 
 #[cfg(test)]
