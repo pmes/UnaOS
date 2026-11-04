@@ -219,6 +219,11 @@ pub enum Stmt {
     Fillet { id: String, on: String, edges: Vec<brep_core::Name>, r: f64 },
     /// brep_core `chamfer`: `d1` along the face whose co-edge runs with the edge, `d2` along the other.
     Chamfer { id: String, on: String, edges: Vec<brep_core::Name>, d1: f64, d2: f64 },
+    // VUGDOCPHOTOREF (SR652): the photo the document was drawn over, `photo path="<file>" pitch=<mm>` — id-less, one per
+    // document, referencing nothing; the path is relative to the document's folder and is data, never opened here
+    // (BP-vug-4): the face opens it. The crop meta rides the photo itself; the camera's prefs are Principia's.
+    /// The graph-paper photo under the document: its file (relative to the document) and the paper's pitch (mm).
+    Photo { path: String, pitch_mm: f64 },
 }
 
 impl Stmt {
@@ -236,7 +241,7 @@ impl Stmt {
             | Stmt::Op { id, .. }
             | Stmt::Scan { id, .. } | Stmt::Fillet { id, .. } | Stmt::Chamfer { id, .. } => Some(id), // VUGFACEFILLET (SR511)
             Stmt::Machine(m) => Some(&m.id),
-            Stmt::Axis(_) | Stmt::Tool(_) | Stmt::Stock(_) | Stmt::Fixture(_) => None,
+            Stmt::Axis(_) | Stmt::Tool(_) | Stmt::Stock(_) | Stmt::Fixture(_) | Stmt::Photo { .. } => None, // VUGDOCPHOTOREF (SR652)
         }
     }
 
@@ -289,7 +294,7 @@ impl Stmt {
             | Stmt::Tool(_)
             | Stmt::Stock(_)
             | Stmt::Fixture(_)
-            | Stmt::Scan { .. } => Vec::new(),
+            | Stmt::Scan { .. } | Stmt::Photo { .. } => Vec::new(), // VUGDOCPHOTOREF (SR652)
         }
     }
 }
@@ -375,6 +380,8 @@ pub enum What {
     BadLib { name: String, at: Box<Refusal> },
     /// A library statement other than the one machine first (without `loaded`) and its axes / tools, or no machine.
     NotLibrary,
+    /// VUGDOCPHOTOREF (SR652): a second `photo` statement: one photo per document.
+    SecondPhoto,
 }
 
 // The word tables: one per enum, read by word and written by value (the ONE spelling of each).

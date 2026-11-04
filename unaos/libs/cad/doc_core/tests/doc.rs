@@ -771,3 +771,41 @@ fn a_bad_ref_names_the_kind_its_slot_wanted_and_no_profile_its_loops() {
     assert_eq!(format!("{:?}", fault("hz")), "BadRef(\"p1\")");
     assert!(r.solids.iter().any(|s| s.id == "e1"), "the sketch still solves without the refused constraints");
 }
+
+// ---- VUGDOCPHOTOREF (LEDGER SR652): the photo the document was drawn over (named tail block) ----
+
+/// VUGDOCPHOTOREF (SR652): `photo path="<file>" pitch=<mm>` reads to `Stmt::Photo` and writes back byte for byte (a
+/// relative path with `..` and a space kept as the one string escape writes it); it references nothing, so it stands
+/// on any line after the header (here after every sketch line); a second photo is refused by name at its verb, an id
+/// is refused, a missing pitch names its key; `diff` keys it `photo` (never the stock's pseudo-id), a pitch change one
+/// Changed entry.
+#[test]
+fn a_photo_statement_round_trips_on_any_line_and_stands_alone() {
+    let head = write(&Doc::new(Tol::DEFAULT));
+    let text = format!("{head}photo path=\"../shots/part one.png\" pitch=5\n");
+    let d = read(&text).unwrap_or_else(|r| panic!("photo: {r:?}"));
+    assert_eq!(d.stmts, vec![Stmt::Photo { path: "../shots/part one.png".into(), pitch_mm: 5.0 }]);
+    assert_eq!(write(&d), text, "byte for byte");
+    assert_eq!(d.stmts[0].id(), None, "id-less");
+    assert!(d.stmts[0].refs().is_empty(), "references nothing");
+
+    let late = format!("{DOC_A}photo path=\"fixture.png\" pitch=2.5\n");
+    let dl = read(&late).unwrap_or_else(|r| panic!("a photo after the sketch lines: {r:?}"));
+    assert_eq!(dl.stmts.last(), Some(&Stmt::Photo { path: "fixture.png".into(), pitch_mm: 2.5 }));
+    assert_eq!(read(&write(&dl)).expect("re-reads"), dl);
+
+    let n = text.lines().count() as u32;
+    let two = format!("{text}photo path=\"b.png\" pitch=5\n");
+    assert_eq!(read(&two).err(), Some(doc_core::Refusal { line: n + 1, col: 1, what: What::SecondPhoto }), "one photo per document");
+    let id = format!("{head}photo p1 path=\"a.png\" pitch=5\n");
+    assert!(matches!(read(&id), Err(r) if r.what == What::BadId), "a photo takes no id");
+    let bare = format!("{head}photo path=\"a.png\"\n");
+    assert!(matches!(read(&bare), Err(r) if r.what == What::MissingKey("pitch")), "the pitch is required");
+
+    let (a, b) = (format!("{head}photo path=\"a.png\" pitch=5\n"), format!("{head}photo path=\"a.png\" pitch=2\n"));
+    let (da, db) = (read(&a).expect("a"), read(&b).expect("b"));
+    let df = doc_core::diff(&da, &db);
+    assert_eq!(df.entries.len(), 1, "{df:?}");
+    assert!(matches!(&df.entries[0], doc_core::Entry::Changed { id, verb, .. } if id == "photo" && verb == "photo"), "{df:?}");
+    eprintln!("doc: photo-ref text={:?} late-line={} second=SecondPhoto diff={}", write(&d).lines().nth(1).unwrap_or(""), dl.line(dl.stmts.len() - 1), df.text().trim_end());
+}

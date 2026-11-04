@@ -72,12 +72,16 @@ pub struct Viewer {
     pub save_to: Option<std::path::PathBuf>,
     claimed: bool,
     name: String,
+    /// VUGDOCPHOTOREF (SR652): the photo whose measurement frames the document (its file, resolved, and its pitch, mm):
+    /// set when a photo opens by its path and from a .vug's `photo` statement; SR649's carry leaves it (the crop's frame
+    /// is the original's). `s` writes it as the document's `photo` line, relative to the .vug's folder.
+    pub photo_doc: Option<(std::path::PathBuf, f64)>,
 }
 
 impl Viewer {
     pub fn new(model: Model, title: &str, size: (u32, u32), preset: Preset) -> Viewer {
         let view = View::new(&model, size, preset);
-        Viewer { model, view, title: title.to_string(), save_to: None, claimed: false, name: title.to_string() }
+        Viewer { model, view, title: title.to_string(), save_to: None, claimed: false, name: title.to_string(), photo_doc: None } // VUGDOCPHOTOREF (SR652): photo_doc
     }
 
     /// VUGFACEPHOTO (SR506): THE open road — a .png / .jpg / .jpeg (else any file pixel_core recognises that is not a
@@ -95,7 +99,7 @@ impl Viewer {
         let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
         // VUGFACESAVE (SR534): a .vug document opens as itself (and saves back over itself).
         if ext == "vug" {
-            return Viewer::open_vug(path, &title, size, preset);
+            return Viewer::open_vug(path, &title, size, preset).map(|v| v.under_photo(prefs)); // VUGDOCPHOTOREF (SR652): a document naming a photo lays it under itself
         }
         let mesh = matches!(ext.as_str(), "stl" | "ply" | "obj");
         let mut v = None;
@@ -109,7 +113,7 @@ impl Viewer {
             Some(v) => v,
             None => Viewer::new(Model::open(path)?, &title, size, preset),
         };
-        v.save_to = Some(p.with_extension("vug")); if let Some(ph) = v.view.photo.as_mut() { ph.crop.source = Some(p.to_path_buf()); } // VUGFACESAVE (SR534): `<stem>.vug` beside a mesh / photo; VUGFACEPHOTOCROPSAVE (SR640): the photo's own file, where its crop is saved beside
+        v.save_to = Some(p.with_extension("vug")); if let Some(ph) = v.view.photo.as_mut() { ph.crop.source = Some(p.to_path_buf()); } v.photo_doc = v.view.photo.is_some().then(|| (p.to_path_buf(), photo::PITCH_MM)); // VUGDOCPHOTOREF (SR652): the photo the document is drawn over; VUGFACESAVE (SR534): `<stem>.vug` beside a mesh / photo; VUGFACEPHOTOCROPSAVE (SR640): the photo's own file, where its crop is saved beside
         Ok(v)
     }
 
@@ -227,10 +231,12 @@ impl Viewer {
         let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
         let lib = doc_host::DirLib::beside(std::path::Path::new(path)); // VUGMAKEMACHINELIBFACE (SR548): `lib=<name>` beside the part
         let doc = doc_core::read_with(&text, &lib).map_err(|r| format!("{path}: line {}: {:?}", r.line, r.what))?;
+        let (doc, photo_doc) = take_photo(doc, path); // VUGDOCPHOTOREF (SR652): the photo line kept on the Viewer, never in the journal
         let mut v = Viewer::open_doc(doc, title, size, preset).map_err(|e| format!("{path}: {e}"))?;
         v.view.design.journal.shelf = shelf(&lib); // VUGFACEJOURNALFAULTFIXMANY (SR584): the machines beside the part, for a NoMachine fix
         v.save_to = Some(std::path::PathBuf::from(path));
         v.claimed = true;
+        v.photo_doc = photo_doc; // VUGDOCPHOTOREF (SR652)
         Ok(v)
     }
 
@@ -269,7 +275,7 @@ impl Viewer {
             return Err(format!("{} exists: open it to change it", path.display()));
         }
         let text = doc_core::write(&self.view.design.journal.doc);
-        write_atomic(&path, &text)?;
+        write_atomic(&path, self.photo_text(&path, &text))?; // VUGDOCPHOTOREF (SR652): the photo line after the header; the journal keeps the document's own text
         self.view.design.journal.mark_saved(text);
         self.claimed = true;
         Ok(path)
@@ -444,5 +450,97 @@ impl Viewer {
         self.name = path.file_name().and_then(|s| s.to_str()).unwrap_or("vug").to_string();
         self.retitle();
         Ok(())
+    }
+}
+
+// ---- VUGDOCPHOTOREF (LEDGER SR652): the document names its photo; a re-open lays the underlay (named tail block) ----
+// The .vug's `photo path="<file>" pitch=<mm>` (doc_core `Stmt::Photo`) is the photo the document was drawn over: the
+// face writes it after the header when it holds one (`photo_doc`), the path relative to the .vug's folder; `open_vug`
+// strips it from the document before the journal sees it (the tree, undo, `dirty()` and SR649's carry unchanged) and
+// keeps it on the Viewer; `open_with`'s .vug road then lays the photo under the document through THE photo road
+// (`open_photo_with`, measured again: the same bytes give the same frame) with the document's design swapped in, as
+// SR649's carry keeps the design over a new photo. A photo missing at its path opens the document bare with one word in
+// the corner; the reference is kept, so a save still writes it.
+
+/// The document's first `photo` statement taken out (with its line), its path resolved against the .vug's folder.
+fn take_photo(mut doc: doc_core::Doc, vug: &str) -> (doc_core::Doc, Option<(std::path::PathBuf, f64)>) {
+    let Some(i) = doc.stmts.iter().position(|s| matches!(s, doc_core::Stmt::Photo { .. })) else { return (doc, None) };
+    let doc_core::Stmt::Photo { path, pitch_mm } = doc.stmts.remove(i) else { return (doc, None) };
+    if i < doc.lines.len() {
+        doc.lines.remove(i);
+    }
+    let dir = std::path::Path::new(vug).parent().unwrap_or(std::path::Path::new(""));
+    (doc, Some((dir.join(path), pitch_mm)))
+}
+
+/// `to` relative to the folder `dir` (`..` up from their common prefix, both made absolute first, symlinks unresolved):
+/// the same text on every re-save; never an absolute path (no common prefix, or no current folder: the file name).
+fn relative(to: &std::path::Path, dir: &std::path::Path) -> std::path::PathBuf {
+    let dir = if dir.as_os_str().is_empty() { std::path::Path::new(".") } else { dir };
+    let name = || to.file_name().map(std::path::PathBuf::from).unwrap_or_default();
+    let (Ok(t), Ok(d)) = (std::path::absolute(to), std::path::absolute(dir)) else { return name() };
+    let (t, d): (Vec<_>, Vec<_>) = (t.components().collect(), d.components().collect());
+    let n = t.iter().zip(&d).take_while(|(a, b)| a == b).count();
+    if n == 0 {
+        return name();
+    }
+    let mut out = std::path::PathBuf::new();
+    for _ in n..d.len() {
+        out.push("..");
+    }
+    for c in &t[n..] {
+        out.push(c.as_os_str());
+    }
+    out
+}
+
+impl Viewer {
+    /// The file text `s` writes to `path`: the journal's document with the `photo` statement first (doc_core's ONE
+    /// writer), else `text` (no photo, or the document already names one).
+    fn photo_text(&self, path: &std::path::Path, text: &str) -> String {
+        let doc = &self.view.design.journal.doc;
+        let Some((photo, pitch_mm)) = &self.photo_doc else { return text.to_string() };
+        if doc.stmts.iter().any(|s| matches!(s, doc_core::Stmt::Photo { .. })) {
+            return text.to_string();
+        }
+        let rel = relative(photo, path.parent().unwrap_or(std::path::Path::new(""))).to_string_lossy().into_owned();
+        let mut stmts = Vec::with_capacity(doc.stmts.len() + 1);
+        stmts.push(doc_core::Stmt::Photo { path: rel, pitch_mm: *pitch_mm });
+        stmts.extend(doc.stmts.iter().cloned());
+        doc_core::write(&doc_core::Doc { tol: doc.tol, stmts, lines: Vec::new() })
+    }
+
+    /// The opened document over its photo: none named, itself; the photo unreadable, itself with the corner `photo:
+    /// missing <path>`; unmeasured, itself with `photo: refused <path>: <why>`; else THE photo road on its bytes and pitch
+    /// under the camera's `prefs`, the document's design (journal, face, body) swapped in, `save_to` / `claimed` / the
+    /// name / `photo_doc` carried, the crop road on the photo's file. Never a refusal of the document.
+    fn under_photo(mut self, prefs: photo::PhotoPrefs) -> Viewer {
+        let Some((path, pitch_mm)) = self.photo_doc.clone() else { return self };
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(_) => {
+                self.view.design.journal.disk = Some(Ok(format!("photo: missing {}", path.display())));
+                return self;
+            }
+        };
+        let (size, preset) = (self.view.size, self.view.preset);
+        match Viewer::open_photo_with(&bytes, &self.name, size, preset, pitch_mm, prefs) {
+            Ok(mut next) => {
+                std::mem::swap(&mut next.view.design, &mut self.view.design);
+                next.save_to = self.save_to.take();
+                next.claimed = self.claimed;
+                next.name = std::mem::take(&mut self.name);
+                next.photo_doc = self.photo_doc.take();
+                if let Some(ph) = next.view.photo.as_mut() {
+                    ph.crop.source = Some(path);
+                }
+                next.retitle();
+                next
+            }
+            Err(e) => {
+                self.view.design.journal.disk = Some(Ok(format!("photo: refused {}: {e}", path.display())));
+                self
+            }
+        }
     }
 }
