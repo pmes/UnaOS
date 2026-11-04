@@ -23,19 +23,34 @@ const BAND: f64 = 1.0;
 /// the edge margin `gdt` takes (the seat's ruling: read from the fuse, no second constant).
 fn fused() -> &'static (ScanMesh, f64) {
     static S: OnceLock<(ScanMesh, f64)> = OnceLock::new();
-    S.get_or_init(|| fuse(&Noise::D435I, None))
+    S.get_or_init(|| fuse(&Noise::D435I, Guard::Default, DepthScale::D400_DEFAULT, 0.0))
 }
 
-/// VUGSCANTSDFOUTLIERS (SR555): the ONE fuse builder — the 12 orbit frames at `noise`, the volume's depth-edge guard at
-/// its default (`None`: off) or armed at `edge_mm` (`f64::INFINITY` = off); the surface and the volume's truncation.
-fn fuse(noise: &Noise, edge_mm: Option<f64>) -> (ScanMesh, f64) {
-    let (scene, intr, scale) = (Scene::bench(), fixture::bench_intrinsics(), DepthScale::D400_DEFAULT);
+/// VUGSCANTSDFEDGEFAR (SR562): the volume's depth-edge guard for one fuse — its default (the far-side guard at the
+/// truncation), off, SR555's both-sides rule at the truncation, or the far-side guard armed explicitly.
+#[derive(Clone, Copy, PartialEq)]
+enum Guard {
+    Default,
+    Off,
+    Both,
+    Far,
+}
+
+/// VUGSCANTSDFOUTLIERS (SR555) / VUGSCANTSDFEDGEFAR (SR562): the ONE fuse builder — the 12 orbit frames at `noise`
+/// quantised to `scale`, camera k at azimuth k·30° + k·`phase_rad` (0: `pose(k)`), the volume's guard `guard`; the
+/// surface and the volume's truncation.
+fn fuse(noise: &Noise, guard: Guard, scale: DepthScale, phase_rad: f64) -> (ScanMesh, f64) {
+    let (scene, intr) = (Scene::bench(), fixture::bench_intrinsics());
     let mut t = Tsdf::new(4.0, 12.0, Tol::DEFAULT).expect("volume");
-    if let Some(e) = edge_mm {
-        t = t.with_edge_mm(e);
-    }
+    let trunc = t.trunc_mm();
+    t = match guard {
+        Guard::Default => t,
+        Guard::Off => t.with_edge_far_mm(f64::INFINITY),
+        Guard::Both => t.with_edge_mm(trunc),
+        Guard::Far => t.with_edge_far_mm(trunc),
+    };
     for k in 0..12u32 {
-        let p = pose(k);
+        let p = if phase_rad == 0.0 { pose(k) } else { pose_phased(k, phase_rad) };
         let f = fixture::render_depth(&scene, &intr, scale, &p, noise, k as u64);
         t.integrate(&f, scale, &intr, &p).expect("frame integrates");
     }
@@ -361,6 +376,12 @@ fn pose(k: u32) -> Transform {
     fixture::orbit(CENTRE, 600.0, 40.0 * DEG, k as f64 * 2.0 * PI / 12.0)
 }
 
+/// VUGSCANTSDFEDGEFAR (SR562), VUG-SCAN-FIXTURE-QUANT: camera `k` with a `phase_rad` offset per frame, so the 12
+/// cameras no longer sit at the orbit's 12-fold symmetric azimuths (the quantisation stops correlating across them).
+fn pose_phased(k: u32, phase_rad: f64) -> Transform {
+    fixture::orbit(CENTRE, 600.0, 40.0 * DEG, k as f64 * (2.0 * PI / 12.0 + phase_rad))
+}
+
 /// What the fixture's cameras saw at one point.
 struct Census {
     saw: u32,
@@ -468,9 +489,10 @@ fn tsdf_outliers_probe() {
     let frames: Vec<(Transform, Frame)> =
         (0..12u32).map(|k| (pose(k), fixture::render_depth(&scene, &intr, scale, &pose(k), &Noise::NONE, k as u64))).collect();
     for (noise, nname) in [(Noise::NONE, "none"), (Noise::D435I, "d435i")] {
-        // The guard armed at the volume's own truncation (read from the fixture's fuse, no second constant).
-        for (edge, gname) in [(Some(f64::INFINITY), "off"), (Some(fused().1), "on")] {
-            let (s, trunc) = fuse(&noise, edge);
+        // The guards at the volume's own truncation (read from the volume, no second constant): off, SR555's
+        // both-sides rule, SR562's far-side rule (the default).
+        for (guard, gname) in [(Guard::Off, "off"), (Guard::Both, "both"), (Guard::Far, "far")] {
+            let (s, trunc) = fuse(&noise, guard, scale, 0.0);
             let dev = measure_of(&s, &d);
             let g = gdt(&s, &d, &dev, trunc, Tol::DEFAULT);
             let (t, p) = (top(&g), post(&g));
@@ -486,8 +508,8 @@ fn tsdf_outliers_probe() {
                 p.matched,
                 dev.stats.rms_mm
             );
-            if gname == "on" {
-                assert!(t.flatness_mm.is_some_and(f64::is_finite) && p.cylindricity_mm.is_some_and(f64::is_finite), "guard-on values finite");
+            if guard != Guard::Off {
+                assert!(t.flatness_mm.is_some_and(f64::is_finite) && p.cylindricity_mm.is_some_and(f64::is_finite), "guard-{gname} values finite");
             }
             if nname == "none" {
                 let label = |f: &str| format!("guard={gname} {f}");
@@ -495,5 +517,26 @@ fn tsdf_outliers_probe() {
                 assert_eq!(probe_table(&label("post"), &p, &s, &dev, &frames, trunc), 40, "20 rows per set on the post");
             }
         }
+    }
+    // VUGSCANTSDFEDGEFAR (SR562), VUG-SCAN-FIXTURE-QUANT: the top's reading split into fixture and fusion — the same
+    // noise-free fuse (the default guard) at the 1 mm scale and at the D400's 100 um depth units, on the symmetric
+    // orbit and with a 7° phase per frame.
+    for (um, phase_deg) in [(1000u32, 0.0f64), (100, 0.0), (1000, 7.0), (100, 7.0)] {
+        let (s, trunc) = fuse(&Noise::NONE, Guard::Default, DepthScale::from_micrometres(um), phase_deg * DEG);
+        let dev = measure_of(&s, &d);
+        let g = gdt(&s, &d, &dev, trunc, Tol::DEFAULT);
+        let (t, p) = (top(&g), post(&g));
+        println!(
+            "tsdf-probe: fixture scale_um={um} phase_deg={phase_deg} verts={} top flatness={:?} n={}/{} post cylindricity={:?} n={}/{} align_rms={:.3}",
+            s.mesh.positions.len(),
+            t.flatness_mm,
+            t.n,
+            t.matched,
+            p.cylindricity_mm,
+            p.n,
+            p.matched,
+            dev.stats.rms_mm
+        );
+        assert!(t.flatness_mm.is_some_and(f64::is_finite), "fixture leg {um} um {phase_deg} deg: top flatness");
     }
 }
