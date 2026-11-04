@@ -65,13 +65,14 @@
 //! the ONE builder, vug-view's too); scan_core's `measure` registers the scan to
 //! it from the identity (the scan's world is the design's: a `--poses` / `--turntable` / one-frame scan; a `--track` scan,
 //! its world frame 0's camera, through scan_core's coarse start `measure_coarse`, VUGFACEDEVIATIONPRBPOSES SR621, the road
-//! named on stderr `deviation: road CoarseFine {..}` / `CoarseRefused {..}`) and measures each vertex's signed deviation (positive proud,
+//! named in the report `road: coarse+fine rms=` / `road: coarse refused rms=`, VUGSCANDEVIATIONCOARSETOOLREPORT SR627) and measures each vertex's signed deviation (positive proud,
 //! negative short), the band being `--band`. The PLY then carries the ALIGNED positions (the design's frame), a
 //! `float deviation` (mm, NaN off the design) and `uchar red green blue` from scan_core's `shade` in palette_core's
 //! status colours (inside the band POSITIVE, short toward INFO, proud toward CRITICAL, off the design TEXT_SECONDARY).
 //! The report adds `deviation: aligned rms= max= p95= inside= faces=<seen>/<total> ...` and one
 //! `face: <solid>/<op>.<role>.<a>.<b>:<kind> n= max= rms= mean=` line per design face, by rms, worst first; a refused
-//! registration prints `deviation: refused <Name> {..}` and the run exits 1. Without `--against` nothing changes. `--intent [<doc.vug>]` (VUGINTENTSCANWIRE, LEDGER SR515): [`intent_road`]. `--gdt <face>=<kind>:<tol>` (VUGSCANGDT, LEDGER SR542): [`gdt_road`]. `--datum A=<face> B=<face> C=<face>` (VUGSCANGDTDATUMS, LEDGER SR552): [`datum_road`]. `--vugreport <out.vugreport>` (VUGFACEGDTREPORT, LEDGER SR571): [`vugreport_write`].
+//! registration prints `deviation: refused <Name> {..}` and the run exits 1 (SR627: a `--track` scan's coarse start
+//! refused at the floor still prints the report up to the shapes and its `road: coarse refused rms=` line, no PLY). Without `--against` nothing changes. `--intent [<doc.vug>]` (VUGINTENTSCANWIRE, LEDGER SR515): [`intent_road`]. `--gdt <face>=<kind>:<tol>` (VUGSCANGDT, LEDGER SR542): [`gdt_road`]. `--datum A=<face> B=<face> C=<face>` (VUGSCANGDTDATUMS, LEDGER SR552): [`datum_road`]. `--vugreport <out.vugreport>` (VUGFACEGDTREPORT, LEDGER SR571): [`vugreport_write`].
 
 use std::fmt::Write as _;
 use std::path::Path;
@@ -526,10 +527,17 @@ fn run(a: &Args) -> Result<String, Refusal> {
     let cyl = shapes.iter().find_map(|s| if let Primitive::Cylinder(c) = s.kind { Some((c, s)) } else { None });
 
     // VUGSCANDEVIATION (SR510): the made part against its model, before anything is written.
-    let dev = match &a.against {
-        Some(p) => Some(against(p, &sm, a.band, a.track)?), // VUGFACEDEVIATIONPRBPOSES (SR621): a tracked scan starts coarse
-        None => None,
-    }; let intent = intent_road(a, &detected)?; let gdt = gdt_road(a, &sm, dev.as_ref(), t.trunc_mm())?; // VUGINTENTSCANWIRE (SR515): before anything is written; VUGSCANGDT (SR542) gdt_road too
+    let (road, dev, refused) = match &a.against {
+        Some(p) => match against(p, &sm, a.band, a.track) { // VUGFACEDEVIATIONPRBPOSES (SR621): a tracked scan starts coarse
+            (road, Ok(d)) => (road, Some(d), None),
+            // VUGSCANDEVIATIONCOARSETOOLREPORT (SR627): the coarse start refused at the floor is still the run's refusal,
+            // held until the report up to the shapes and its `road:` line is printed; no PLY, no gdt / intent sections.
+            (road @ Some(scan_core::deviation::Road::CoarseRefused { .. }), Err(e @ Refusal::Deviation(DeviationError::NoAlignment { .. }))) => (road, None, Some(e)),
+            (_, Err(e)) => return Err(e),
+        },
+        None => (None, None, None),
+    };
+    let (intent, gdt) = if refused.is_some() { (String::new(), String::new()) } else { (intent_road(a, &detected)?, gdt_road(a, &sm, dev.as_ref(), t.trunc_mm())?) }; // VUGINTENTSCANWIRE (SR515): before anything is written; VUGSCANGDT (SR542) gdt_road too
 
     // The PLY: scan_core's mesh IS mesh_core's (VUGSHIMSWAP SR473), straight into mesh_core's writer.
     let out = a.out.as_deref().unwrap_or_default();
@@ -537,7 +545,7 @@ fn run(a: &Args) -> Result<String, Refusal> {
         Some((d, ..)) => deviation_ply(&sm, d, a.band),
         None => mesh_core::ply::write(&sm.mesh),
     };
-    std::fs::write(out, ply).map_err(|e| Refusal::Io { path: out.into(), error: e.to_string() })?;
+    if refused.is_none() { std::fs::write(out, ply).map_err(|e| Refusal::Io { path: out.into(), error: e.to_string() })?; } // VUGSCANDEVIATIONCOARSETOOLREPORT (SR627): no PLY on the held refusal
 
     let k0 = intr[0];
     let (cmin, cmean) = if sm.confidence.is_empty() {
@@ -614,7 +622,7 @@ fn run(a: &Args) -> Result<String, Refusal> {
             let _ = writeln!(r, "cylinder: none (support < floor)");
         }
     }
-    shapes_report(&mut r, &detected);
+    shapes_report(&mut r, &detected); r.push_str(&road_report(road)); if let Some(e) = refused { print!("{r}"); return Err(e); } // VUGSCANDEVIATIONCOARSETOOLREPORT (SR627): the road where `deviation: aligned` begins
     if let Some((d, names, _)) = &dev {
         deviation_report(&mut r, d, names); r.push_str(&gdt); // VUGSCANGDT (SR542): the gdt lines after the face lines
     } r.push_str(&intent); // VUGINTENTSCANWIRE (SR515)
@@ -656,8 +664,15 @@ fn shapes_report(r: &mut String, detected: &Result<Vec<Shape>, FitError>) {
 /// VUGSCANDEVIATION (SR510): the document replayed, every solid tessellated into one design with each triangle's face
 /// (named `<solid>/<op>.<role>.<a>.<b>:<kind>`), and the scan measured against it from the identity.
 /// VUGFACEDEVIATIONPRBPOSES (SR621): `coarse` (a `--track` scan, its world frame 0's camera) through scan_core's
-/// `measure_coarse` instead, its road on stderr.
-fn against(path: &str, sm: &ScanMesh, band: f64, coarse: bool) -> Result<(Deviation, Vec<String>, scan_core::Design), Refusal> {
+/// `measure_coarse` instead. VUGSCANDEVIATIONCOARSETOOLREPORT (SR627): its road returned beside the map or its refusal
+/// (measure_coarse's own shape; `None` on the identity road), for the report's `road:` line.
+fn against(path: &str, sm: &ScanMesh, band: f64, coarse: bool) -> (Option<scan_core::deviation::Road>, Result<(Deviation, Vec<String>, scan_core::Design), Refusal>) {
+    let mut road = None;
+    let r = against_map(path, sm, band, coarse, &mut road);
+    (road, r)
+}
+
+fn against_map(path: &str, sm: &ScanMesh, band: f64, coarse: bool, road_out: &mut Option<scan_core::deviation::Road>) -> Result<(Deviation, Vec<String>, scan_core::Design), Refusal> {
     let text = String::from_utf8(read(path)?).map_err(|e| Refusal::Io { path: path.into(), error: e.to_string() })?;
     let doc = doc_core::read_with(&text, &doc_host::DirLib::beside(std::path::Path::new(path))).map_err(Refusal::DesignRead)?; // VUGMAKEMACHINELIBFACE (SR548): `lib=<name>` beside the document
     let rp = doc_core::replay(&doc, doc.tol);
@@ -675,7 +690,7 @@ fn against(path: &str, sm: &ScanMesh, band: f64, coarse: bool) -> Result<(Deviat
     })?;
     let measured = if coarse {
         let (road, r) = scan_core::deviation::measure_coarse(sm, &design, &AlignParams::DEFAULT, band, Tol::DEFAULT);
-        eprintln!("deviation: road {road:?}");
+        *road_out = Some(road); // VUGSCANDEVIATIONCOARSETOOLREPORT (SR627): the report's `road:` line, the stderr line retired
         r
     } else {
         measure(sm, &design, Transform::IDENTITY, &AlignParams::DEFAULT, band, Tol::DEFAULT)
@@ -1023,3 +1038,14 @@ fn knobs_of(a: &Args) -> scan_core::tsdf::Knobs {
     scan_core::tsdf::Knobs { edge_mm: a.edge.unwrap_or(off.edge_mm), edge_far_mm: a.edge_far.unwrap_or(off.edge_far_mm) }
 }
 
+// ---- VUGSCANDEVIATIONCOARSETOOLREPORT (LEDGER SR627): the coarse road in the stdout report ----
+// The report's `road:` line in the deviation section's place, the corner's words (vug-view deviation.rs `align_line`):
+// nothing without `--against`, on the identity road or `Road::Fine`; `road: coarse+fine rms=<mm>` (the coarse start's
+// trimmed rms) or `road: coarse refused rms=<mm>`. Every non-track report is byte-identical.
+fn road_report(road: Option<scan_core::deviation::Road>) -> String {
+    match road {
+        None | Some(scan_core::deviation::Road::Fine) => String::new(),
+        Some(scan_core::deviation::Road::CoarseFine { rms_mm }) => format!("road: coarse+fine rms={rms_mm:.3}\n"),
+        Some(scan_core::deviation::Road::CoarseRefused { rms_mm }) => format!("road: coarse refused rms={rms_mm:.3}\n"),
+    }
+}
