@@ -11,6 +11,9 @@
 //! ±trunc band ("block activation") before the voxels are integrated, so a 2 m cube at 5 mm (400³ = 64M voxels dense)
 //! holds only its surface band.
 //!
+//! VUGSCANTSDFOUTLIERS (SR555): a pixel on a depth edge (its 3x3 neighbourhood spans more than [`Tsdf::edge_mm`],
+//! default the truncation) integrates nothing that frame — see [`depth_edge`].
+//!
 //! Sign: positive in front of the surface (free space, toward the camera), negative behind it (inside the solid).
 //! Voxel `g` (integer) sits at `g · voxel_mm` in the world. The pinhole model is probe_core's (`Intrinsics::project`,
 //! `Intrinsics::deproject`, `depth::metres_at`), called at the seam in its f32 metres and widened to f64 mm after.
@@ -33,7 +36,8 @@ pub const W_MAX: f32 = 64.0;
 pub const DEFAULT_BUDGET: usize = 65_536;
 
 /// One voxel: the fused signed distance (mm, within ±trunc) and its observation weight. The weight IS the voxel's
-/// confidence (BP-vug-5): uniform weight 1 per frame that observed it, capped at [`W_MAX`]; 0 = never observed.
+/// confidence (BP-vug-5): uniform weight 1 per frame that observed it, capped at [`W_MAX`]; 0 = never observed. A frame
+/// whose pixel at the voxel is a depth edge ([`depth_edge`]) does not observe it.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Voxel {
     pub sdf: f32,
@@ -60,6 +64,8 @@ pub struct Tsdf {
     trunc_mm: f64,
     tol: Tol,
     budget: usize,
+    /// VUGSCANTSDFOUTLIERS (SR555): the depth jump across a pixel's 3x3 neighbourhood above which it integrates nothing.
+    edge_mm: f64,
     blocks: BTreeMap<Key, Box<[Voxel; BLOCK_VOXELS]>>,
     frames: u32,
     intrinsics: Option<Intrinsics>,
@@ -92,6 +98,7 @@ impl Tsdf {
             trunc_mm,
             tol,
             budget: DEFAULT_BUDGET,
+            edge_mm: trunc_mm, // VUGSCANTSDFOUTLIERS: the depth-edge guard at the band's own width
             blocks: BTreeMap::new(),
             frames: 0,
             intrinsics: None,
@@ -237,6 +244,7 @@ impl Tsdf {
         }
         let inv = pose.invert().unwrap_or(Transform::IDENTITY);
         let (voxel_mm, trunc) = (self.voxel_mm, self.trunc_mm);
+        let edge = depth_edges(frame, scale, self.edge_mm); // VUGSCANTSDFOUTLIERS: empty when the guard is off
         let mut updated = 0u32;
         for k in &active {
             let Some(blk) = self.blocks.get_mut(k) else { continue };
@@ -255,6 +263,9 @@ impl Tsdf {
                     continue;
                 }
                 let (px, py) = (uv[0] as u32, uv[1] as u32); // floor: pixel x covers u in [x, x + 1)
+                if edge.get(py as usize * frame.width as usize + px as usize) == Some(&true) {
+                    continue; // VUGSCANTSDFOUTLIERS: a depth-edge pixel cannot speak for a voxel within one pixel of it
+                }
                 let Some(m) = metres_at(frame, scale, px, py) else { continue };
                 let sdf = m as f64 * 1000.0 - q.z;
                 if sdf < -trunc {
@@ -302,4 +313,59 @@ impl Tsdf {
         tracker.accept(self, intr, pose, gravity);
         Ok((pose, done))
     }
+}
+
+// VUGSCANTSDFOUTLIERS (SR555): the depth-edge guard. A voxel takes the depth of the pixel its centre floors into
+// (`integrate`); within one pixel of a silhouette that pixel can belong to the OTHER surface (a free-space voxel
+// beside the post takes the post's depth, an inside voxel beside an edge takes the ground behind it), and each
+// camera's silhouette writes that error along the surface. A pixel whose 3x3 neighbourhood spans more than
+// `edge_mm` of depth cannot speak for a voxel within one pixel of it, so it integrates nothing that frame, exactly
+// as an unseen voxel. The default is the volume's own truncation (no second constant); an adjacent-pixel step
+// above it is also the grazing case (beyond ~77° at 600 mm on the bench intrinsics). The weight stays the
+// observation count (BP-vug-5).
+impl Tsdf {
+    /// The same volume with the depth-edge jump `mm` (default: `trunc_mm`); `f64::INFINITY` turns the guard off.
+    pub fn with_edge_mm(mut self, mm: f64) -> Tsdf {
+        self.edge_mm = mm;
+        self
+    }
+
+    /// The depth jump across a pixel's 3x3 neighbourhood above which the pixel is a depth edge.
+    pub fn edge_mm(&self) -> f64 {
+        self.edge_mm
+    }
+}
+
+/// Whether pixel `(x, y)` of a Z16 frame is a depth edge: its valid depth and the valid depths of its 3x3
+/// neighbourhood span more than `jump_mm`. A hole (raw 0) is neutral; a pixel with no depth of its own is no edge.
+pub fn depth_edge(frame: &Frame, scale: DepthScale, x: u32, y: u32, jump_mm: f64) -> bool {
+    let Some(c) = metres_at(frame, scale, x, y) else { return false };
+    let (mut lo, mut hi) = (c, c);
+    for dy in -1i64..=1 {
+        for dx in -1i64..=1 {
+            let (nx, ny) = (x as i64 + dx, y as i64 + dy);
+            if nx < 0 || ny < 0 || nx >= frame.width as i64 || ny >= frame.height as i64 {
+                continue;
+            }
+            if let Some(m) = metres_at(frame, scale, nx as u32, ny as u32) {
+                lo = lo.min(m);
+                hi = hi.max(m);
+            }
+        }
+    }
+    (hi - lo) as f64 * 1000.0 > jump_mm
+}
+
+/// The frame's depth-edge mask, row-major (`y · width + x`); empty when `jump_mm` is not finite (the guard off).
+fn depth_edges(frame: &Frame, scale: DepthScale, jump_mm: f64) -> alloc::vec::Vec<bool> {
+    if !jump_mm.is_finite() {
+        return alloc::vec::Vec::new();
+    }
+    let mut out = alloc::vec::Vec::with_capacity(frame.width as usize * frame.height as usize);
+    for y in 0..frame.height {
+        for x in 0..frame.width {
+            out.push(depth_edge(frame, scale, x, y, jump_mm));
+        }
+    }
+    out
 }
