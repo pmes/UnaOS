@@ -363,7 +363,7 @@ impl MapErr {
 /// Copies go through the KERNEL identity alias (`slot_backing_ptr`), never through the ring-3 VA, so the
 /// code pages are never writable through their ring-3 mapping and W^X holds by construction — the same
 /// discipline `build_slot` documents for the U1a blob.
-pub fn map_image_into_slot(bytes: &[u8]) -> Result<Mapped, MapErr> {
+pub fn map_image_into_slot(bytes: &[u8]) -> Result<Mapped, MapErr> { crate::prefs::stamp_machine_store(); // MACHINESTORESTAMPRING3 (rmbp-ledger B1162): the no-session settings folder laid and stamped ROOTACL `system` once per boot before the first ring-3 slot (prefs.rs tail; no-op until a native volume is mounted). LINE-NEUTRAL append, code first
     if bytes.is_empty() {
         return Err(MapErr::Empty);
     }

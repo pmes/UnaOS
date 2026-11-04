@@ -237,6 +237,14 @@ fn machine_store_leg(mt: &MountTable) -> bool {
     let restamped = stamp_store(mt, &dir);
     let plant_tok = if pe < 0 { "unplanted" } else if crate::prefs::store_read(&plant).is_none() { "refused" } else { "READ" };
     let _ = mt.unlink(&plant, KERNEL_PRINCIPAL);
+    // MACHINESTORESTAMPRING3 (rmbp-ledger B1162): the boot stamp's body (`prefs::lay_machine_store`, no latch) leaves the
+    // folder stamped, so the same plant as `anon` is now refused at CREATE (`-EACCES`). Named in-place hunk.
+    let (_, boot_stamped) = crate::prefs::lay_machine_store(mt);
+    let be = path_write_as(&plant, una_abi::PATH_W_TRUNC, 0, b"[system]\n", "anon");
+    if be >= 0 {
+        let _ = mt.unlink(&plant, KERNEL_PRINCIPAL);
+    }
+    let boot_tok = if !boot_stamped { "unstamped" } else if be == una_abi::EACCES { "refused-at-create" } else if be >= 0 { "ADMITTED" } else { "error" };
     if laid {
         let _ = mt.unlink(&target, KERNEL_PRINCIPAL);
     }
@@ -244,14 +252,15 @@ fn machine_store_leg(mt: &MountTable) -> bool {
         let _ = mt.remove_dir(&dir, KERNEL_PRINCIPAL);
     }
     let tok = |e: i64| if e == una_abi::EACCES { "refused" } else if e >= 0 { "ADMITTED" } else { "error" };
-    let pass = owned && we == una_abi::EACCES && ce == una_abi::EACCES && read && restamped && plant_tok == "refused"; // MACHINESTOREPLANT (B1156): the plant leg joins this leg's PASS
+    let pass = owned && we == una_abi::EACCES && ce == una_abi::EACCES && read && restamped && plant_tok == "refused" && boot_tok == "refused-at-create"; // MACHINESTOREPLANT (B1156): the plant leg joins this leg's PASS; MACHINESTORESTAMPRING3 (B1162): so does the boot step
     serial_println!(
-        ":: MACHINESTORE: owner={} write={} create={} read={} plant={} -> {} :: by=anon target={} errno={} made_dir={} ::",
+        ":: MACHINESTORE: owner={} write={} create={} read={} plant={} boot={} -> {} :: by=anon target={} errno={} made_dir={} ::",
         if owned { SYSTEM_OWNER } else { "none" },
         tok(we),
         tok(ce),
         if read { "ok" } else { "REFUSED" },
         plant_tok,
+        boot_tok,
         if pass { "PASS" } else { "FAIL" },
         if is_general { "general" } else { "scratch" },
         we,
