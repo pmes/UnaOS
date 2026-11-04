@@ -180,13 +180,15 @@ pub struct View {
     pub sheet: Option<crate::deviation::Sheet>,
     /// VUGFACEGDTREPORTOPEN (SR581): the `:` command line (deviation.rs `Viewer::line_key`), its last line recalled.
     pub entry: crate::deviation::Entry,
+    /// VUGFACEHELPOVERLAY (SR650): SHORTCUTS over the face while open (`?` opens / turns the page, Escape closes), its page.
+    pub help: Option<crate::Help>,
 }
 
 impl View {
     /// A view at Home over `model`.
     pub fn new(model: &Model, size: (u32, u32), preset: Preset) -> View {
         let camera = Camera { eye: Vec3::zero(), yaw: 0.0, pitch: 0.0, fov_y: 30f32.to_radians() };
-        let mut v = View { camera, preset, size: (size.0.max(1), size.1.max(1)), picked: None, cursor: (0.0, 0.0), drag: None, design: Default::default(), photo: None, fillet: None, deviation: None, sheet: None, entry: Default::default() }; // VUGFACEGDTREPORTOPEN (SR581): sheet, entry; VUGFACEFILLET (SR511): fillet; VUGFACEDEVIATION (SR525): deviation
+        let mut v = View { camera, preset, size: (size.0.max(1), size.1.max(1)), picked: None, cursor: (0.0, 0.0), drag: None, design: Default::default(), photo: None, fillet: None, deviation: None, sheet: None, entry: Default::default(), help: None }; // VUGFACEGDTREPORTOPEN (SR581): sheet, entry; VUGFACEFILLET (SR511): fillet; VUGFACEDEVIATION (SR525): deviation
         v.home(model);
         v
     }
@@ -260,7 +262,7 @@ impl View {
         // VUGFACEPHOTO (SR506): the proposal glyphs and the corner note over the sketch.
         crate::photo::overlay(self, fr); crate::deviation::overlay(self, fr); // VUGFACEDEVIATION (SR525): the map's corner, top-right
         // VUGFACETREE (SR513): the tree panel over everything.
-        crate::journal::overlay(self, fr); crate::deviation::line_overlay(self, fr); // VUGFACEGDTREPORTOPEN (SR581): the report sheet and the `:` line over the panel
+        crate::journal::overlay(self, fr); crate::deviation::line_overlay(self, fr); self.help_overlay(fr); // VUGFACEGDTREPORTOPEN (SR581): the report sheet and the `:` line over the panel
     }
 
     /// The model point under (px, py), if the ray hits it.
@@ -328,6 +330,7 @@ impl View {
             "3" => self.right(model),
             "7" => self.top(model),
             "p" | "P" => self.preset = self.preset.next(),
+            "?" => self.help = crate::Help::next(self.help, self.size.1), // VUGFACEHELPOVERLAY (SR650): the text `?` only (GTK also sends `Shift+question`)
             _ => return false,
         }
         true
@@ -471,5 +474,34 @@ impl View {
     /// fixed, so the target (and every point on its sight line) keeps its place on the surface.
     pub fn dolly(&mut self, target: Vec3, scale: f32) {
         self.camera.eye = target + (self.camera.eye - target) * scale;
+    }
+}
+
+// ---- VUGFACEHELPOVERLAY (LEDGER SR650): the help's Escape and its paint ----
+
+impl View {
+    /// Escape while the help is open closes it (lib.rs `Viewer::key` asks first: the help is painted topmost, so it closes
+    /// first; a second Escape reaches the `:` line, the sheet or the sketch). None for every other key, and for Escape
+    /// while it is closed: the help takes no other key.
+    pub fn help_key(&mut self, k: &str) -> Option<bool> {
+        if self.help.is_none() || crate::sketch::FieldKey::of(k) != Some(crate::sketch::FieldKey::Escape) {
+            return None;
+        }
+        self.help = None;
+        Some(true)
+    }
+
+    /// The help in the panel (journal.rs `paint_panel`, the report sheet's style: the primary text colour, no band), its
+    /// page's rows from the top; with more than one page the foot row says `<page>/<pages>`.
+    fn help_overlay(&self, fr: &mut crate::raster::Frame) {
+        let Some(h) = self.help else { return };
+        let rows = crate::Help::rows(crate::journal::panel_cols(fr.width));
+        let ink = crate::raster::rgba(palette_core::TEXT_PRIMARY.1);
+        crate::journal::paint_panel(fr, &rows, h.page * crate::journal::panel_fit(fr.height), &|_, r| (r.to_string(), ink, false));
+        let pages = crate::Help::pages(fr.height);
+        if pages > 1 {
+            let x0 = crate::journal::panel_x0(fr.width);
+            crate::raster::text(fr, &format!("{}/{}", h.page + 1, pages), x0 + 4.0, fr.height as f32 - crate::journal::ROW_PX, ink);
+        }
     }
 }
