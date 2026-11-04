@@ -15,6 +15,8 @@
 //! (`refused NoAlignment rms= pairs=` / `refused Unconstrained level=`) and the scan is drawn as read, in the albedo.
 //! `d` outside a sketch toggles the map (inside a sketch `d` stays the dimension tool: the view asks the sketch first).
 //! BP-vug-5: the map is a printed residual; neither the scan nor the design changes.
+//! VUGFACEDEVIATIONJOURNAL (SR550): `Viewer::against_journal` measures against the document the tree holds and
+//! [`follow`] re-measures when that document changes (the corner's last line `design=journal@<gen>`).
 
 use crate::model::Model;
 use crate::raster::{self, Frame, rgba};
@@ -44,6 +46,8 @@ pub struct Map {
     pub tri: Vec<u32>,
     /// VUGFACEDEVIATIONPICK (SR543): the vertex a click on the map picked, held until the next click ([`pick`]).
     pub pick: Option<Pick>,
+    /// VUGFACEDEVIATIONJOURNAL (SR550): the journal the map follows ([`follow`]); None for a document read from a path.
+    pub source: Option<Source>,
 }
 
 /// A scan mesh read from a file (a PLY carries no normals, no confidence and no intrinsics): mesh_core's
@@ -100,12 +104,17 @@ pub fn open(scan: &ScanMesh, doc: &Doc, band_mm: f64) -> Result<(Model, Map), St
     };
     let model = Model::from_mesh(mesh)?;
     let on = result.is_ok();
-    Ok((model, Map { on, band_mm, names, result, vertex, tri, pick: None })) // VUGFACEDEVIATIONPICK (SR543): no pick at open
+    Ok((model, Map { on, band_mm, names, result, vertex, tri, pick: None, source: None })) // VUGFACEDEVIATIONJOURNAL (SR550): no source; VUGFACEDEVIATIONPICK (SR543): no pick at open
 }
 
 /// The corner's lines: the statistics and the worst [`WORST`] faces (matched ones, by rms) with their signed mean, or
 /// the refusal by name.
 pub fn corner(map: &Map) -> Vec<String> {
+    let mut out = measured(map); out.extend(source_line(map)); out // VUGFACEDEVIATIONJOURNAL (SR550): the journal's line last
+}
+
+/// The corner's measured lines: the pick's, the statistics and the worst faces, or the refusal by name.
+fn measured(map: &Map) -> Vec<String> {
     match &map.result {
         Ok(d) => {
             let s = &d.stats;
@@ -142,7 +151,7 @@ pub fn key(view: &mut View, k: &str) -> Option<bool> {
     if m.result.is_err() {
         return Some(false);
     }
-    m.on = !m.on;
+    m.on = !m.on; show(view); // VUGFACEDEVIATIONJOURNAL (SR550): a journal map hides / regenerates the body
     Some(true)
 }
 
@@ -250,4 +259,91 @@ fn ring(view: &View, m: &Map, fr: &mut Frame) {
     for i in 0..16 {
         raster::line(fr, pt(i), pt(i + 1), col);
     }
+}
+
+// ---- VUGFACEDEVIATIONJOURNAL (LEDGER SR550): measure against the document the tree holds ----
+// `Viewer::against_journal` measures a scan against `view.design.journal.doc` through the ONE road [`open`] ->
+// [`design`] -> doc_core `replay` -> scan_core `design_of`; the map keeps the Doc it measured and [`follow`] (lib.rs,
+// after every key and input) re-measures when the journal's document differs from it (Doc's own equality, the test
+// `Journal::commit` uses), so a record, an edge edit, a panel edit, an undo or a load each count once. The generation
+// is the map's count of the documents it followed. While a journal map is on the scan is drawn (the body cleared);
+// off, the body is the journal's own (`journal::regenerate`), never stashed.
+
+use crate::Viewer;
+use doc_core::Stmt;
+
+/// The refusal when the journal's document holds no body (no extrude, no revolve).
+pub const JOURNAL_EMPTY: &str = "JournalEmpty";
+
+/// The journal a map follows: the scan, the document last seen, its generation, the generation the map shows, and
+/// the refusal of the newest one when it did not measure (the map then still shows `measured`).
+#[derive(Clone, Debug)]
+pub struct Source {
+    pub scan: ScanMesh,
+    pub doc: Doc,
+    pub generation: u64,
+    pub measured: u64,
+    pub refused: Option<String>,
+}
+
+/// `JournalEmpty` unless `doc` has a statement that makes a body; any other refusal is [`design`]'s, by line.
+fn journal_body(doc: &Doc) -> Result<(), String> {
+    if doc.stmts.iter().any(|s| matches!(s, Stmt::Extrude { .. } | Stmt::Revolve { .. })) { Ok(()) } else { Err(JOURNAL_EMPTY.to_string()) }
+}
+
+/// A journal map on: the body cleared, so the scan is drawn in the band's colours; off: the journal's body back.
+fn show(view: &mut View) {
+    let Some(on) = view.deviation.as_ref().filter(|m| m.source.is_some()).map(|m| m.on) else { return };
+    view.design.body = if on { None } else { crate::journal::regenerate(&view.design.journal.doc).ok().and_then(|r| r.body) };
+}
+
+/// The corner's source line: `design=journal@<gen>`, with ` refused <why> map@<measured>` when the newest did not measure.
+fn source_line(map: &Map) -> Option<String> {
+    let s = map.source.as_ref()?;
+    Some(match &s.refused {
+        None => format!("design=journal@{}", s.generation),
+        Some(why) => format!("design=journal@{} refused {why} map@{}", s.generation, s.measured),
+    })
+}
+
+impl Viewer {
+    /// Measure `scan` against the journal's document at [`BAND_MM`]: generation 0, the drawn model the aligned scan,
+    /// the camera homed on it. A document with no body refuses [`JOURNAL_EMPTY`]; a refusal changes nothing.
+    pub fn against_journal(&mut self, scan: ScanMesh) -> Result<(), String> {
+        let doc = self.view.design.journal.doc.clone();
+        journal_body(&doc)?;
+        let (model, mut map) = open(&scan, &doc, BAND_MM)?;
+        map.source = Some(Source { scan, doc, generation: 0, measured: 0, refused: None });
+        self.model = model;
+        self.view.deviation = Some(map);
+        show(&mut self.view);
+        self.view.home(&self.model);
+        Ok(())
+    }
+}
+
+/// Re-measure a journal map when the journal's document is no longer the one it saw: the generation moves; a
+/// measured one replaces the model and the map (the on state kept, the pick cleared), a refused one keeps both and
+/// is named on the corner.
+pub fn follow(v: &mut Viewer) {
+    let Some(m) = v.view.deviation.as_mut() else { return };
+    let Some(src) = m.source.as_mut() else { return };
+    if src.doc == v.view.design.journal.doc {
+        return;
+    }
+    let doc = v.view.design.journal.doc.clone();
+    src.generation += 1;
+    let generation = src.generation;
+    let out = journal_body(&doc).and_then(|()| open(&src.scan, &doc, m.band_mm));
+    src.doc = doc;
+    match out {
+        Ok((model, mut map)) => {
+            map.on = m.on && map.result.is_ok();
+            map.source = m.source.take().map(|s| Source { measured: generation, refused: None, ..s });
+            *m = map;
+            v.model = model;
+        }
+        Err(why) => src.refused = Some(why),
+    }
+    show(&mut v.view);
 }
