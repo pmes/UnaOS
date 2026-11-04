@@ -723,3 +723,52 @@ fn a_boss_carries_its_axial_extent() {
     let ps = suggest(&d, &shapes(s));
     assert!(feature_set(&ps, "boss:").is_empty() && feature_set(&ps, "pocket:").is_empty(), "{:?}", stmts(&ps));
 }
+
+// ---- VUGINTENTFEATURESEXTENTTABLE (SR665): the extent in the table Vein reads; a near end off the plane proposes nothing ----
+
+/// A shape that carries its axial extent prints ` len=<mm> ends=<a>,<b>` on its line; a shape without one prints the
+/// SR508 line byte for byte.
+#[test]
+fn the_measurement_table_carries_a_shapes_axial_extent() {
+    let m = shapes(vec![
+        plane(v(0.0, 0.0, 1.0), 10.0, 5000, 0.4),
+        ShapeRef { extent: Some([-4.6, 3.0]), ..cyl(v(40.0, 30.0, 15.0), 7.95, 900, 0.2) },
+        ShapeRef {
+            params: ShapeParams::Cone { apex: v(0.0, 0.0, 0.0), axis: v(0.0, 0.0, 1.0), half_angle: core::f64::consts::FRAC_PI_4 },
+            support: 10,
+            rms_mm: 0.05,
+            extent: Some([0.5, 4.25]),
+        },
+    ]);
+    assert_eq!(
+        measurements_text(&m),
+        "shapes: n=3 sigma=0.3 sigma_deg=0.5\n\
+         plane n=(0,0,1) d=10 support=5000 rms=0.4\n\
+         cylinder axis=(40,30,15) dir=(0,0,1) r=7.95 support=900 rms=0.2 len=7.6 ends=-4.6,3\n\
+         cone apex=(0,0,0) dir=(0,0,1) half_angle_deg=45 support=10 rms=0.05 len=3.75 ends=0.5,4.25\n"
+    );
+}
+
+/// The SR653 plate (80 x 60 x 10, top z = 10) at sigma 0.3: K_SIGMA x sigma = 0.9. A support whose near end sits 2 mm
+/// above the plate (point raised to z 17, t = 7, extent [-5, 1]: near 2.000, far 8.000) does not start at that plane and
+/// proposes no set; nor does one whose near end runs 2 mm through it (z 15, extent [-7, 3]: near -2); the control at
+/// near 0.850 (z 15, extent [-4.15, 3]) still proposes the boss, length=8.
+#[test]
+fn a_near_end_off_the_plane_proposes_no_feature() {
+    let d = doc(&plate(80.0, 60.0, 10.0));
+    let none = |p: Vec3, e: [f64; 2]| {
+        let mut s = box_planes(80.0, 60.0, 10.0);
+        s.push(ShapeRef { extent: Some(e), ..cyl(p, 7.95, 900, 0.2) });
+        let ps = suggest(&d, &shapes(s));
+        assert!(feature_set(&ps, "boss:").is_empty() && feature_set(&ps, "pocket:").is_empty(), "{:?}", stmts(&ps));
+    };
+    none(v(40.0, 30.0, 17.0), [-5.0, 1.0]);
+    none(v(40.0, 30.0, 15.0), [-7.0, 3.0]);
+    let mut s = box_planes(80.0, 60.0, 10.0);
+    s.push(ShapeRef { extent: Some([-4.15, 3.0]), ..cyl(v(40.0, 30.0, 15.0), 7.95, 900, 0.2) });
+    let ps = suggest(&d, &shapes(s));
+    let set = feature_set(&ps, "boss:");
+    assert_eq!(set.len(), 4, "{:?}", stmts(&ps));
+    assert!(set[3].stmt.ends_with("dir=[0 0 1] length=8"), "{}", set[3].stmt);
+    assert!(set[0].why.contains("the support's axial extent (near end 0.850 mm off)"), "{}", set[0].why);
+}

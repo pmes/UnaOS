@@ -841,6 +841,7 @@ fn features(doc: &Doc, m: &Measurement, sigma: f64, ids: &mut Ids, out: &mut Vec
         if ends.is_some_and(|(_, f)| !(f.is_finite() && f > sigma)) {
             continue;
         }
+        if ends.is_some_and(|(n, _)| !(n.abs() <= K_SIGMA * sigma)) { continue; } // VUGINTENTFEATURESEXTENTTABLE (SR665): a near end off the plane past K_SIGMA x sigma (above it or through it): the support does not start there, no set
         let Some((h, far)) = extent(&planes, pk, t, ends.map(|e| e.1), sigma, sigma_deg) else { continue };
         // Boss or pocket: the support centroid against the replayed solids.
         let (mut inside, mut unsure) = (false, false);
