@@ -863,7 +863,7 @@ kat!(
     SMessage::Principia(PrincipiaCommand::PrefChanged {
         ns: "stria".to_string(),
         key: "muted".to_string(),
-        value: PrefValue::Bool(true),
+        value: Some(PrefValue::Bool(true)),
         clamped: false,
     }),
     r#"{"Principia":{"PrefChanged":{"ns":"stria","key":"muted","value":{"Bool":true}}}}"#
@@ -875,7 +875,7 @@ kat!(
     SMessage::Principia(PrincipiaCommand::PrefChanged {
         ns: "system".to_string(),
         key: "display.brightness".to_string(),
-        value: PrefValue::Int(16),
+        value: Some(PrefValue::Int(16)),
         clamped: true,
     }),
     r#"{"Principia":{"PrefChanged":{"ns":"system","key":"display.brightness","value":{"Int":16},"clamped":true}}}"#
@@ -890,7 +890,7 @@ kat!(
     r#"{"Principia":{"PrefError":{"ns":"aether","key":"window..width","message":"empty key segment"}}}"#
 );
 
-// PRINCIPIA-UNSET-SYNAPSE (SR603): the typed unset request (answered by PrefValueIs { value: None } or PrefError).
+// PRINCIPIA-UNSET-SYNAPSE (SR603): the typed unset request (answered by PrefChanged { value: None } since SR608, or PrefError).
 kat!(
     kat_principia_pref_unset,
     SMessage::Principia(PrincipiaCommand::PrefUnset {
@@ -898,6 +898,18 @@ kat!(
         key: "photo.camera_mm".to_string(),
     }),
     r#"{"Principia":{"PrefUnset":{"ns":"vug","key":"photo.camera_mm"}}}"#
+);
+// PRINCIPIA-UNSET-CHANGED (SR608): an unset is a PrefChanged whose value is null (the PrefValueIs unset shape); a set's
+// `Some(v)` serialises as `v`, so the two PrefChanged goldens above are byte-identical.
+kat!(
+    kat_principia_pref_changed_unset,
+    SMessage::Principia(PrincipiaCommand::PrefChanged {
+        ns: "vug".to_string(),
+        key: "photo.camera_mm".to_string(),
+        value: None,
+        clamped: false,
+    }),
+    r#"{"Principia":{"PrefChanged":{"ns":"vug","key":"photo.camera_mm","value":null}}}"#
 );
 
 /// The typed value domain must not widen or coerce across the wire — a float

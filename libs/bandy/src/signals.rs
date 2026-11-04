@@ -744,9 +744,10 @@ pub enum PrincipiaCommand {
         value: PrefValue,
     },
     /// PRINCIPIA-UNSET-SYNAPSE (LEDGER SR603): unset one preference (the key leaves the store; every reader answers
-    /// the schema's or the consumer's default). On success Principia answers [`PrincipiaCommand::PrefValueIs`] with
-    /// `value: None` (the typed reading of the PREF_CHANGED unset form it posts, `prefs_core::wire::unset_body`); on
-    /// rejection (malformed name, unset already, a held domain or a failed write) [`PrincipiaCommand::PrefError`].
+    /// the schema's or the consumer's default). On success Principia broadcasts [`PrincipiaCommand::PrefChanged`] with
+    /// `value: None` (PRINCIPIA-UNSET-CHANGED SR608: the typed reading of the PREF_CHANGED unset form it posts,
+    /// `prefs_core::wire::unset_body`, so every PrefChanged re-read lane sees it); on rejection (malformed name, unset
+    /// already, a held domain or a failed write) [`PrincipiaCommand::PrefError`].
     PrefUnset { ns: String, key: String },
     /// Ask for every set key in one namespace. Answered by
     /// [`PrincipiaCommand::PrefListIs`].
@@ -757,15 +758,18 @@ pub enum PrincipiaCommand {
         ns: String,
         entries: Vec<(String, PrefValue)>,
     },
-    /// Broadcast after every successful set: the new value of `ns`/`key`.
-    /// This is both the set's acknowledgement and the live-update signal every
+    /// Broadcast after every successful set or unset: the new value of `ns`/`key`.
+    /// This is both the acknowledgement and the live-update signal every
     /// running consumer subscribes to.
     PrefChanged {
         ns: String,
         key: String,
         /// The value STORED — for a declared key written out of range, its
-        /// clamp (`prefs_core::schema::check`, PRINCIPIA2 SR32).
-        value: PrefValue,
+        /// clamp (`prefs_core::schema::check`, PRINCIPIA2 SR32). `None` = unset
+        /// (PRINCIPIA-UNSET-CHANGED SR608: the key left the store; the consumer
+        /// re-reads and applies its default). `Some(v)` is `v` on the wire, so
+        /// every set's frozen golden is unchanged (smessage_kats).
+        value: Option<PrefValue>,
         /// `true` when the written value was out of range and `value` is the
         /// clamp. Omitted from the wire when false, so every unclamped
         /// `PrefChanged` keeps its frozen shape (smessage_kats).

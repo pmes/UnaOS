@@ -595,7 +595,7 @@ mod tests {
         assert!(!layout_is_side("top"));
         assert!(!layout_is_side(""));
         let change = |ns: &str, key: &str| {
-            SMessage::Principia(PrincipiaCommand::PrefChanged { ns: ns.into(), key: key.into(), value: PrefValue::Str("side".into()), clamped: false })
+            SMessage::Principia(PrincipiaCommand::PrefChanged { ns: ns.into(), key: key.into(), value: Some(PrefValue::Str("side".into())), clamped: false })
         };
         assert!(is_layout_change(&change("aether", "tabs.layout")));
         assert!(!is_layout_change(&change("aether", "tabs.other")));

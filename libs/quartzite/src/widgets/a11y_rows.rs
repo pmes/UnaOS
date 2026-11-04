@@ -96,11 +96,20 @@ mod tests {
             "BrowserA11yPrefs { reduce_motion: true, contrast: \"more\", forced_colors: true }"
         );
         let change = |ns: &str, key: &str| {
-            SMessage::Principia(PrincipiaCommand::PrefChanged { ns: ns.into(), key: key.into(), value: PrefValue::Bool(true), clamped: false })
+            SMessage::Principia(PrincipiaCommand::PrefChanged { ns: ns.into(), key: key.into(), value: Some(PrefValue::Bool(true)), clamped: false })
         };
         assert!(is_a11y_change(&change("system", "accessibility.contrast")));
         assert!(!is_a11y_change(&change("aether", "accessibility.contrast")));
         assert!(!is_a11y_change(&change("system", "accessibility.other")));
+    }
+
+    /// PRINCIPIA-UNSET-CHANGED (SR608): a typed unset of a row is Principia's PrefChanged with `value: None`; both faces'
+    /// re-read lane takes it (`is_a11y_change`), and the re-read of an unset row is the schema default triple.
+    #[test]
+    fn a11y_rows_typed_unset_rereads() {
+        let unset = SMessage::Principia(PrincipiaCommand::PrefChanged { ns: NS.into(), key: "accessibility.contrast".into(), value: None, clamped: false });
+        assert!(is_a11y_change(&unset));
+        assert_eq!(A11yRows::from_values(|_| None), A11yRows { reduce_motion: false, contrast: "no-preference".into(), forced_colors: false });
     }
 
     /// F6 and Shift+F6 alternate the two stops; from neither, the page takes the keys.
