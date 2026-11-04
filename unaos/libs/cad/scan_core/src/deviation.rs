@@ -723,27 +723,30 @@ pub fn coarse_view(scan: &ScanMesh, design: &Design, bvh: &Bvh, p: &AlignParams,
     }
     let (cs, xs, ys, ws) = axes(&scan.mesh)?;
     let (cd, xd, yd, _) = axes(&design.mesh)?;
-    let inv = scan_frame(xs, ys, cs, axis, partner(ws, sweep)).invert().ok()?; // VUGSCANCOARSESYMPIVOT (SR642): the scan's partner of the pivot by its own eigenvalues
+    let ends = partner(ws, sweep); // VUGSCANCOARSESYMPIVOT (SR642): the scan's partner of the pivot by its own eigenvalues; VUGSCANCOARSESYMBOTHENDS (SR647): both ends when the scan is degenerate at both
     let frame = [xd, yd, xd.cross(yd)];
     let normals = design.mesh.normals_face(tol);
-    let mut scored: Vec<(f64, Transform, f64)> = Vec::with_capacity(2 * COARSE_VIEW_STEPS);
-    for sz in [1.0, -1.0] {
-        let z = frame[axis] * sz;
-        let a = frame[(axis + 1) % 3];
-        for k in 0..COARSE_VIEW_STEPS {
-            let t = 2.0 * core::f64::consts::PI * k as f64 / COARSE_VIEW_STEPS as f64;
-            let (c, s) = (libm::cos(t), libm::sin(t));
-            // Rodrigues: the pivot's next axis turned by t about the unit pivot z (SR626's xd about zd for axis 2).
-            let x = a * c + z.cross(a) * s + z * (z.dot(a) * (1.0 - c));
-            let mut e = [Vec3::ZERO; 3];
-            e[axis] = z;
-            e[(axis + 1) % 3] = x;
-            e[(axis + 2) % 3] = z.cross(x);
-            let start = crate::geom::from_axes(e[0], e[1], e[2], cd).compose(inv);
-            let start = shift(scan, design, bvh, &normals, &sample, start, p.gate(0) * COARSE_WIDEN, p, tol);
-            let rank = trimmed(scan, design, bvh, &normals, &sample, start, p.gate(0), COARSE_SELECT_KEEP, p, tol);
-            let score = trimmed(scan, design, bvh, &normals, &sample, start, p.gate(0), COARSE_KEEP, p, tol);
-            scored.push((rank, start, score));
+    let mut scored: Vec<(f64, Transform, f64)> = Vec::with_capacity(ends.len() * 2 * COARSE_VIEW_STEPS);
+    for &j in ends {
+        let inv = scan_frame(xs, ys, cs, axis, j).invert().ok()?;
+        for sz in [1.0, -1.0] {
+            let z = frame[axis] * sz;
+            let a = frame[(axis + 1) % 3];
+            for k in 0..COARSE_VIEW_STEPS {
+                let t = 2.0 * core::f64::consts::PI * k as f64 / COARSE_VIEW_STEPS as f64;
+                let (c, s) = (libm::cos(t), libm::sin(t));
+                // Rodrigues: the pivot's next axis turned by t about the unit pivot z (SR626's xd about zd for axis 2).
+                let x = a * c + z.cross(a) * s + z * (z.dot(a) * (1.0 - c));
+                let mut e = [Vec3::ZERO; 3];
+                e[axis] = z;
+                e[(axis + 1) % 3] = x;
+                e[(axis + 2) % 3] = z.cross(x);
+                let start = crate::geom::from_axes(e[0], e[1], e[2], cd).compose(inv);
+                let start = shift(scan, design, bvh, &normals, &sample, start, p.gate(0) * COARSE_WIDEN, p, tol);
+                let rank = trimmed(scan, design, bvh, &normals, &sample, start, p.gate(0), COARSE_SELECT_KEEP, p, tol);
+                let score = trimmed(scan, design, bvh, &normals, &sample, start, p.gate(0), COARSE_KEEP, p, tol);
+                scored.push((rank, start, score));
+            }
         }
     }
     scored.sort_by(|a, b| a.0.total_cmp(&b.0));
@@ -817,7 +820,7 @@ pub enum Sweep {
 /// smallest and middle pair; None when neither pair or both (three near-equal: SR615's four, owed).
 fn pivot(mesh: &Mesh) -> Option<usize> {
     let (_, _, _, w) = axes(mesh)?;
-    let pair = |lo: f64, hi: f64| hi > 0.0 && lo >= COARSE_SYM_RATIO * hi;
+    let pair = degenerate; // VUGSCANCOARSESYMBOTHENDS (SR647): the one pair test
     match (pair(w[0], w[1]), pair(w[1], w[2])) {
         (false, true) => Some(2),
         (true, false) => Some(0),
@@ -848,22 +851,31 @@ fn sym_or(scan: &ScanMesh, design: &Design, bvh: &Bvh, p: &AlignParams, tol: Tol
 // the pivot's slot (a cyclic order keeps it right-handed; the same index is SR636's frame float for float, so SR636's
 // fixture, whose scan pairs 2 with 2, keeps its numbers). Modelled the kept starts 0.0° off in axis and the road aligned
 // within 0.16° modulo the pins' C4. A scan near-degenerate itself has no trustworthy end (the bare post on a 240 x 220
-// ground: 0.957 / 0.896 picks a horizontal axis): both ends tried is owed inside VUG-SCAN-DEVIATION-COARSE-SYM-PIVOT.
+// ground: 0.957 / 0.896 picks a horizontal axis): both ends are tried by VUGSCANCOARSESYMBOTHENDS (SR647, below).
 
-/// The scan-frame index (0 the largest axis, 2 the smallest) that takes the sweep's pivot, from the scan's ascending
-/// eigenvalues `w`: `Sweep::View` 2 (SR626's road); `Sweep::About(i)` the scan's unique end, 2 when w0/w1 < w1/w2
-/// (w0·w2 < w1²), 0 when greater, else (equal, or unordered) the design's pivot `i`.
-fn partner(w: [f64; 3], sweep: Sweep) -> usize {
+/// The scan-frame indices (0 the largest axis, 2 the smallest) that take the sweep's pivot, from the scan's ascending
+/// eigenvalues `w`: `Sweep::View` `[2]` (SR626's road); `Sweep::About(i)` the scan's unique end, 2 when w0/w1 < w1/w2
+/// (w0·w2 < w1²), 0 when greater, else (equal, or unordered) the design's pivot `i`; when both adjacent pairs are
+/// [`degenerate`] (VUGSCANCOARSESYMBOTHENDS SR647: no trustworthy end) that end first and then the other, `[2, 0]` /
+/// `[0, 2]`; else the list of one.
+fn partner(w: [f64; 3], sweep: Sweep) -> &'static [usize] {
     match sweep {
-        Sweep::View => 2,
+        Sweep::View => &[2],
         Sweep::About(i) => {
             let (ends, mid) = (w[0] * w[2], w[1] * w[1]);
-            if ends < mid {
+            let one = if ends < mid {
                 2
             } else if ends > mid {
                 0
             } else {
                 i.min(2)
+            };
+            match (one, degenerate(w[0], w[1]) && degenerate(w[1], w[2])) {
+                (2, true) => &[2, 0],
+                (0, true) => &[0, 2],
+                (0, _) => &[0],
+                (1, _) => &[1],
+                _ => &[2],
             }
         }
     }
@@ -878,4 +890,25 @@ fn scan_frame(xs: Vec3, ys: Vec3, cs: Vec3, axis: usize, j: usize) -> Transform 
         g[(axis + k) % 3] = f[(j + k) % 3];
     }
     crate::geom::from_axes(g[0], g[1], g[2], cs)
+}
+
+// ---- VUGSCANCOARSESYMBOTHENDS (LEDGER SR647): a scan degenerate at both ends tries both ----
+// SR642's [`partner`] reads the scan's own unique end, but a scan near-isotropic ITSELF has none to trust: MEASURED (an
+// analytic model of the orbit scan's visible surfaces, SR642's calibrated: its fixture 1951.8 / 5978.4 / 7933.5 against
+// the run's 1949.6 / 5972.2 / 7924.0, the bare post on 240 x 220 0.957 / 0.896 exactly) SR642's post with its four pins
+// on a 240 x 220 ground has ratios 0.946 / 0.870 (w0·w2 / w1² 1.087): the ground normal is the SMALLEST axis but the
+// end rule picks the largest, the ground's long axis, and the sweep lays the post down. The rule: both adjacent ratios
+// [`degenerate`] (the design's own pair test, [`COARSE_SYM_RATIO`] 0.83, no new constant). Over the pinned post's
+// grounds 120 x 110 .. 480 x 440 the end rule is wrong at exactly 220 x 202 (0.882 / 0.977) and 240 x 220, and the rule
+// fires at exactly those two and at no ground where the end rule is right (200 x 183: 0.890 / 0.790; 260 x 238: 0.767 /
+// 0.861); a band on w0·w2 / w1² separates nothing (wrong at 0.903 / 1.087, right at 0.890 / 1.127). [`coarse_view`]
+// runs its sweep once per candidate (ONE loop over the list; the list of one is SR626's / SR636's / SR642's sweep float
+// for float) and the best [`COARSE_VIEW_KEEP`] of the union go into `measure_coarse`'s refine / select loop unchanged.
+// Cost: twice SR626's sweep (≈ 688k `Bvh::closest`) only for a scan degenerate at both ends. Limit: the bare post on
+// 240 x 220 carries its ground normal on the MIDDLE axis, which neither end holds (owed VUG-SCAN-DEVIATION-COARSE-SYM-MIDDLE).
+
+/// Two adjacent ascending eigenvalues (lo ≤ hi) are a degenerate pair: lo ≥ [`COARSE_SYM_RATIO`]·hi (`pivot` on the
+/// design, `partner` on the scan).
+fn degenerate(lo: f64, hi: f64) -> bool {
+    hi > 0.0 && lo >= COARSE_SYM_RATIO * hi
 }
