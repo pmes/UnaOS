@@ -753,17 +753,34 @@ pub fn home_lines(d: Dialect) -> Option<Vec<String>> {
 
 /// The lines that jog by `delta` (mm, relative) at `feed` (mm/min), the numbers in make_core's one grammar
 /// (`make_core::gcode::num`): grbl 1.1 `$J=G91 X.. Y.. Z.. F..` (one jog line; the modal state is untouched), Marlin
-/// `G91`, `G0 X.. Y.. Z.. F..`, `G90` (relative for the one move, absolute again after); LinuxCNC: `None`.
-pub fn jog_lines(d: Dialect, delta: [f64; 3], feed: f64) -> Option<Vec<String>> {
+/// `G91`, `G0 X.. Y.. Z.. F..`, then the run's distance word (relative for the one move, the run's mode again after);
+/// LinuxCNC: `None`. VUGCOMSCANMARLINJOGMODAL (SR664): `run` is the modal state the run left on the board
+/// ([`Pump::sent_modal`]; `Modal::default()` with no run): Marlin closes with its distance word (`G90`, the board's
+/// default, when none is recorded), and under a `G20` run the jog still says mm: grbl's jog-local `$J=G21 G91 ..`,
+/// Marlin `G21` before and `G20` after.
+pub fn jog_lines(d: Dialect, delta: [f64; 3], feed: f64, run: Modal) -> Option<Vec<String>> {
     let mut mv = String::new();
     for (c, v) in [('X', delta[0]), ('Y', delta[1]), ('Z', delta[2]), ('F', feed)] {
         mv.push(' ');
         mv.push(c);
         make_core::gcode::num(&mut mv, v);
     }
+    let inch = run.units() == Some("G20"); // VUGCOMSCANMARLINJOGMODAL (SR664): VUG-COMSCAN-JOG-UNITS
     match d {
-        Dialect::Grbl { .. } => Some(alloc::vec![alloc::format!("$J=G91{mv}")]),
-        Dialect::Marlin => Some(alloc::vec![String::from("G91"), alloc::format!("G0{mv}"), String::from("G90")]),
+        Dialect::Grbl { .. } => Some(alloc::vec![alloc::format!("$J={}G91{mv}", if inch { "G21 " } else { "" })]),
+        Dialect::Marlin => {
+            let mut v = Vec::new();
+            if inch {
+                v.push(String::from("G21"));
+            }
+            v.push(String::from("G91"));
+            v.push(alloc::format!("G0{mv}"));
+            v.push(String::from(run.distance().unwrap_or("G90")));
+            if inch {
+                v.push(String::from("G20"));
+            }
+            Some(v)
+        }
         Dialect::LinuxCnc => None,
     }
 }
@@ -1209,5 +1226,27 @@ impl Pump {
             self.lines.insert(i + k, w);
             self.src.insert(i + k, at_line);
         }
+    }
+}
+
+// --- VUGCOMSCANMARLINJOGMODAL (LEDGER SR664): the run's units and distance words for a jog (named tail hunk) ---
+
+impl Modal {
+    /// Group 0's last word (`G20` / `G21`), `None` when the lines set none.
+    pub fn units(&self) -> Option<&'static str> {
+        self.last[0].map(|(_, w)| w)
+    }
+
+    /// Group 1's last word (`G90` / `G91`), `None` when the lines set none.
+    pub fn distance(&self) -> Option<&'static str> {
+        self.last[1].map(|(_, w)| w)
+    }
+}
+
+impl Pump {
+    /// The modal state the lines sent so far set ([`Modal::of`] over them): with nothing in flight (a jog's
+    /// precondition) the state the run left on the board, read by [`jog_lines`].
+    pub fn sent_modal(&self) -> Modal {
+        Modal::of(self.dialect, &self.lines[..self.next])
     }
 }
