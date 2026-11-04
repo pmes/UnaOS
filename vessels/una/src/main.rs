@@ -211,6 +211,17 @@ fn main() {
         comscan::ignite(console_synapse, comscan::DEFAULT_SCROLLBACK).await;
     });
 
+    // 3c. VUGCOMSCANHOSTDESK (SR561): ignite Comscan's pump desk beside the
+    //     Console on the same bus (`comscan::host_desk`, THE composition: the
+    //     ws / tcp / serial opener, the device identity hook, the hello on so a
+    //     first bind commissions an unnamed grbl). No port opens until a
+    //     PumpStart: with nothing attached the desk idles silently. The machine
+    //     is undeclared until one is (owed VUG-COMSCAN-MACHINE-DECLARE); the
+    //     desk handle is the in-process arming seam. Kill("comscan") stops it
+    //     with the Console; the runtime's drop at the end of main ends it.
+    let (_pump_desk, _pump_handle) =
+        comscan::host_desk(synapse.clone(), comscan::pump::undeclared_machine());
+
     // 4. Shared app state (no cortex — just the anchored root).
     let default_state = bandy::state::AppState {
         absolute_workspace_root: absolute_workspace_root_arc.clone(),

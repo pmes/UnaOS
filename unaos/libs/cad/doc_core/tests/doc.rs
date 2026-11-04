@@ -714,3 +714,30 @@ fn an_unknown_library_refuses_by_name() {
     let r = doc_core::read_with(&part.replace("lib=shop-mill", "lib=shop-mill safe_z=3"), &shelf()).expect_err("x");
     assert_eq!(r.what, What::UnknownKey("safe_z".into()));
 }
+
+// VUGMAKEMACHINELIBHELD (SR556): a library part re-reads its own text from the library it holds, with no resolver.
+#[test]
+fn a_library_part_rereads_from_the_libraries_it_holds() {
+    use doc_core::Lib;
+    let (_, part) = split_a();
+    let d = doc_core::read_with(&part, &shelf()).unwrap();
+    let Some(Stmt::Machine(m)) = d.stmts.iter().find(|s| matches!(s, Stmt::Machine(_))) else { panic!("machine") };
+    let held = m.lib.as_ref().expect("the library is held");
+    // The KAT: the held library written as a library document reads back to the held statements.
+    let text = doc_core::HeldLib(&d).resolve("shop-mill").expect("the held library answers");
+    let lib = read(&text).unwrap_or_else(|r| panic!("library text: {r:?}\n{text}"));
+    let Some(Stmt::Machine(lm)) = lib.stmts.first() else { panic!("library machine:\n{text}") };
+    assert_eq!((lm.loaded, &lm.lib), (None, &None), "a library machine carries no loaded and no lib");
+    assert_eq!(doc_core::MachineStmt { id: m.id.clone(), loaded: m.loaded, lib: m.lib.clone(), ..lm.clone() }, *m);
+    assert_eq!(lib.stmts[1..], held.stmts[..], "the axes and tools as held");
+    assert_eq!(doc_core::HeldLib(&d).resolve("router"), None, "a name the Doc does not hold");
+    // The re-read of the part's own text needs no resolver and keeps the machine and its digest.
+    let s = write(&d);
+    assert!(matches!(read(&s), Err(r) if r.what == What::UnknownLib("shop-mill".into())), "plain read resolves nothing");
+    let d2 = d.reread(&s).unwrap_or_else(|r| panic!("reread: {r:?}"));
+    assert_eq!(d2, d);
+    assert_eq!(write(&d2), s);
+    let (a, b) = (doc_core::machine_of(&d).unwrap(), doc_core::machine_of(&d2).unwrap());
+    assert_eq!(b, a);
+    assert_eq!(b.digest(), a.digest(), "Machine::digest byte-equal");
+}
