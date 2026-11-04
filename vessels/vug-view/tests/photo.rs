@@ -1532,3 +1532,234 @@ fn escape_cancels_the_crop_and_writes_nothing() {
     assert_eq!(vw.title, "fixture.png");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---- VUGFACEPHOTOCROPKEYPREF (SR645): the crop key beside `:crop`, and the saved crop's frame over a stale pref (named tail block) ----
+
+/// VUGFACEPHOTOCROPKEYPREF (SR645): `r` arms the crop through the ONE arm fn `:crop` takes: two viewers on one photo, one
+/// `:crop` Return, the other `r`, read the same corner word and the same crop state; `R` arms too; the key's drag spans
+/// the rectangle and Escape cancels it by name; SHORTCUTS (the `--help` table) carries the `r` row naming `:crop`; with the
+/// `:` line open `r` is the line's text, never the crop (the key sits under the line's own gate).
+#[test]
+fn the_r_key_arms_the_crop_as_the_crop_line_does() {
+    let dir = crop_dir("key");
+    let (mut line, _) = crop_opened(&dir);
+    let (mut vw, path) = crop_opened(&dir);
+    crop_armed(&mut line);
+    assert!(!ph(&vw).crop.armed);
+    assert!(key(&mut vw, "r"), "`r` arms the crop");
+    let (a, b) = (&ph(&line).crop, &ph(&vw).crop);
+    assert!(b.armed, "`r` arms the drag");
+    assert_eq!((a.armed, a.from, a.to, a.dragging, a.reopen.clone()), (b.armed, b.from, b.to, b.dragging, b.reopen.clone()), "the same crop state as `:crop`");
+    assert_eq!(b.source.as_deref(), Some(path.as_path()), "the photo's file is kept");
+    assert_eq!(ph(&vw).note, ph(&line).note, "the same corner word as `:crop`");
+    let corner = ph(&vw).note.clone().unwrap_or_default();
+    eprintln!("photo: crop-key armed={} corner={corner}", b.armed);
+
+    assert!(key(&mut vw, "Escape"));
+    assert_eq!(ph(&vw).note.as_deref(), Some("crop cancelled"));
+    assert!(key(&mut vw, "R"), "`R` arms the crop too");
+    assert!(ph(&vw).crop.armed);
+    assert_eq!(ph(&vw).note.as_deref(), Some(corner.as_str()));
+    crop_drag(&mut vw, (40.0, 40.0), (600.0, 440.0));
+    assert!(photo::crop_rect(ph(&vw)).is_some(), "the key's drag spans a rectangle");
+    assert!(key(&mut vw, "Escape"));
+    assert!(!ph(&vw).crop.armed && photo::crop_rect(ph(&vw)).is_none());
+    assert_eq!(ph(&vw).note.as_deref(), Some("crop cancelled"));
+
+    assert!(vug_view::SHORTCUTS.iter().any(|(k, what)| *k == "r" && what.contains(":crop")), "SHORTCUTS carries the crop key's row");
+
+    assert!(key(&mut vw, ":"), "`:` opens over the photo");
+    key(&mut vw, "r");
+    assert_eq!(vw.view.entry.text, "r", "the open line takes `r` as text");
+    assert!(!ph(&vw).crop.armed, "the key does not arm under the open line");
+    assert!(key(&mut vw, "Escape"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// One open photo's measurement for the comparisons: its lens term and its outline.
+fn measured(p: &Photo) -> (Option<f64>, Vec<Vec2>) {
+    (p.first.as_ref().map(|m| m.k1), p.outline.clone())
+}
+
+/// VUGFACEPHOTOCROPKEYPREF (SR645): VUG-FACE-PHOTO-CROP-PREF closes by measurement: photo_core `principal_of` ranks the
+/// photo's own `vug:crop` frame over the pref, and the face's save always writes one. The lens photo (k1 -0.08: the
+/// principal point moves its measurement) opens under the pref `principal_px` 450,360 (the full frame's point, stale for
+/// any crop); `r`, the rectangle 200,40 700x560, Return: `follow` re-opens `lens.crop.png` with the stale pref still
+/// held, and it measures exactly as the saved bytes do with NO pref (the frame 200,40,900,720 states 250,320), while the
+/// meta-free crop under the same pref measures otherwise (the pref is live without the frame). A crop of the crop
+/// (`lens.crop.crop.png`, frame 210,50,900,720: SR640's composed offset) keeps the rank on its re-open.
+#[test]
+fn a_saved_crop_outranks_a_stale_principal_pref_on_reopen() {
+    let dir = crop_dir("pref");
+    let path = dir.join("lens.png");
+    let spec = photo_core::fixture::Spec::lens();
+    std::fs::write(&path, photo_core::fixture::png(&spec)).expect("the lens photo is written");
+    let full = photo_core::fixture::render(&spec);
+    let stale = Vec2::new(full.width as f64 * 0.5, full.height as f64 * 0.5);
+    let prefs = photo::PhotoPrefs { camera_mm: None, principal_px: Some(stale) };
+    let mut vw = Viewer::open_with(path.to_str().expect("a UTF-8 path"), (W, H), Preset::Una, prefs).expect("the lens photo opens by its path");
+
+    let keep = |vw: &mut Viewer, from: (f64, f64), to: (f64, f64)| {
+        assert!(key(vw, "r"), "`r` arms the crop");
+        let crop = &mut vw.view.photo.as_mut().expect("a photo is open").crop;
+        crop.from = Some(from);
+        crop.to = Some(to);
+        assert!(key(vw, "Return"));
+    };
+    keep(&mut vw, (200.0, 40.0), (900.0, 600.0));
+    let out = dir.join("lens.crop.png");
+    assert_eq!(vw.title, "lens.crop.png", "the face re-opened the saved crop");
+    assert_eq!(ph(&vw).prefs.principal_px, Some(stale), "the stale pref is still held");
+    let saved = std::fs::read(&out).expect("the crop is saved beside the photo");
+    let img = pixel_core::decode(&saved).expect("the saved crop decodes");
+    assert_eq!(photo_core::crop_frame(&img), Some([200, 40, full.width, full.height]));
+    let meta = photo_core::crop_principal(&img).expect("the saved crop states its principal point");
+    assert_eq!((meta.x, meta.y), (250.0, 320.0));
+    let (_, _, bare) = photo::open(&saved, photo::PITCH_MM).expect("the saved crop measures with no pref");
+    let reopened = measured(ph(&vw));
+    assert_eq!(reopened, measured(&bare), "the written frame outranks the stale pref");
+
+    let c = photo_core::fixture::crop(&full, 200, 40, 700, 560);
+    let free = pixel_core::png::encode::encode_rgba(c.width, c.height, &c.rgba).expect("the meta-free crop encodes");
+    let free_stale = photo::open_with(&free, photo::PITCH_MM, prefs).ok().map(|(_, _, p)| measured(&p));
+    assert_ne!(free_stale, Some(reopened.clone()), "with no frame the stale pref moves the measurement");
+    eprintln!(
+        "photo: crop-pref stale={},{} meta={},{} k1={:?} reopened_k1={:?} free_stale_k1={:?}",
+        stale.x, stale.y, meta.x, meta.y, measured(&bare).0, reopened.0, free_stale.as_ref().map(|m| m.0)
+    );
+
+    keep(&mut vw, (10.0, 10.0), (690.0, 550.0));
+    let out2 = dir.join("lens.crop.crop.png");
+    assert_eq!(vw.title, "lens.crop.crop.png", "the face re-opened the crop of the crop");
+    assert_eq!(ph(&vw).prefs.principal_px, Some(stale));
+    let saved2 = std::fs::read(&out2).expect("the crop of the crop is saved");
+    let img2 = pixel_core::decode(&saved2).expect("it decodes");
+    assert_eq!(photo_core::crop_frame(&img2), Some([210, 50, full.width, full.height]), "SR640's composed frame");
+    let (_, _, bare2) = photo::open(&saved2, photo::PITCH_MM).expect("the crop of the crop measures with no pref");
+    assert_eq!(measured(ph(&vw)), measured(&bare2), "the composed frame keeps the rank");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---- VUGFACEPHOTOCROPPREFFRAC (SR648): a meta-free photo's principal pref carried into its crop (named tail block) ----
+
+/// VUGFACEPHOTOCROPPREFFRAC (SR648): SR645's control case with the pref OFF the centre: the lens photo (no crop meta)
+/// opens under the pref `principal_px` (446.5, 357.25), the full frame's centre less (3.5, 2.75); `r`, the rectangle 200,40
+/// 700x560, Return: the saved pair carries the pref's point, `200,40,900,720,446.5,357.25`, read back as the pref less the
+/// offset (246.5, 317.25), and the face's re-open measures exactly as the meta-free crop under that point, not as it
+/// under the centre-derived (250, 320) a 4-field frame stated.
+#[test]
+fn a_meta_free_crop_carries_the_principal_pref_on_reopen() {
+    let dir = crop_dir("preffrac");
+    let path = dir.join("lens.png");
+    let spec = photo_core::fixture::Spec::lens();
+    std::fs::write(&path, photo_core::fixture::png(&spec)).expect("the lens photo is written");
+    let full = photo_core::fixture::render(&spec);
+    let pref = Vec2::new(full.width as f64 * 0.5 - 3.5, full.height as f64 * 0.5 - 2.75);
+    let prefs = photo::PhotoPrefs { camera_mm: None, principal_px: Some(pref) };
+    let mut vw = Viewer::open_with(path.to_str().expect("a UTF-8 path"), (W, H), Preset::Una, prefs).expect("the lens photo opens by its path");
+
+    assert!(key(&mut vw, "r"), "`r` arms the crop");
+    let crop = &mut vw.view.photo.as_mut().expect("a photo is open").crop;
+    crop.from = Some((200.0, 40.0));
+    crop.to = Some((900.0, 600.0));
+    assert!(key(&mut vw, "Return"));
+    let out = dir.join("lens.crop.png");
+    assert_eq!(vw.title, "lens.crop.png", "the face re-opened the saved crop");
+    let saved = std::fs::read(&out).expect("the crop is saved beside the photo");
+    let img = pixel_core::decode(&saved).expect("the saved crop decodes");
+    let pair = img.text.iter().find(|(k, _)| k == photo_core::CROP_KEY).map(|(_, v)| v.clone());
+    assert_eq!(pair, Some(format!("200,40,{},{},{},{}", full.width, full.height, pref.x, pref.y)), "the pref's point carried");
+    assert_eq!(photo_core::crop_frame(&img), Some([200, 40, full.width, full.height]));
+    let meta = photo_core::crop_principal(&img).expect("the saved crop states its principal point");
+    assert_eq!((meta.x, meta.y), (pref.x - 200.0, pref.y - 40.0));
+
+    let c = photo_core::fixture::crop(&full, 200, 40, 700, 560);
+    let free = pixel_core::png::encode::encode_rgba(c.width, c.height, &c.rgba).expect("the meta-free crop encodes");
+    let at = |pp: Vec2| photo::open_with(&free, photo::PITCH_MM, photo::PhotoPrefs { camera_mm: None, principal_px: Some(pp) }).ok().map(|(_, _, p)| measured(&p));
+    let reopened = measured(ph(&vw));
+    let carried = at(meta);
+    let centre = at(Vec2::new(full.width as f64 * 0.5 - 200.0, full.height as f64 * 0.5 - 40.0));
+    assert_eq!(Some(reopened.clone()), carried, "the re-open measures about the pref's point less the offset");
+    assert_ne!(Some(reopened.clone()), centre, "a 4-field frame's centre would measure otherwise");
+    eprintln!(
+        "photo: crop-pref-frac pref={},{} meta={},{} k1={:?} centre_k1={:?}",
+        pref.x, pref.y, meta.x, meta.y, reopened.0, centre.as_ref().map(|m| m.0)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---- VUGFACEPHOTOCROPDOC (SR649): the open document carried onto the cropped photo (named tail block) ----
+
+/// The fixture opened by its path, `:crop` dragged (40, 40) -> (600, 440), a 5 mm line sketched at the paper point under
+/// the crop's centre (H⁻¹ of its centre pixel) and recorded (the journal dirty), then Return: the viewer, the folder,
+/// the rectangle, the document and the photo as they were before the keep.
+fn crop_sketched(tag: &str) -> (Viewer, std::path::PathBuf, [u32; 4], doc_core::Doc, Photo, [Vec2; 2]) {
+    let dir = crop_dir(tag);
+    let (mut vw, _) = crop_opened(&dir);
+    crop_armed(&mut vw);
+    crop_drag(&mut vw, (40.0, 40.0), (600.0, 440.0));
+    let r = photo::crop_rect(ph(&vw)).expect("the drag spans a rectangle");
+    let Ok(inv) = photo_core::homography::invert(&ph(&vw).h) else { panic!("the photo's H inverts") };
+    let q0 = photo_core::homography::apply(&inv, Vec2::new(r[0] as f64 + r[2] as f64 * 0.5, r[1] as f64 + r[3] as f64 * 0.5)).expect("the crop's centre on the paper");
+    let q1 = Vec2::new(q0.x + 5.0, q0.y);
+    let mut sk = face(&vw).sketch.clone();
+    let (a, b) = (sk.add_point(q0.x, q0.y), sk.add_point(q1.x, q1.y));
+    sk.add_line(a, b).expect("a line");
+    {
+        let d = &mut vw.view.design;
+        d.face = Some(SketchFace::over(world_planes()[0].1, sk));
+        d.journal.record(d.face.as_ref(), None);
+    }
+    assert!(vw.view.design.journal.dirty(), "the sketched line is unsaved");
+    let doc = vw.view.design.journal.doc.clone();
+    let before = ph(&vw).clone();
+    assert!(key(&mut vw, "Return"));
+    (vw, dir, r, doc, before, [q0, q1])
+}
+
+/// VUGFACEPHOTOCROPDOC (SR649): a line sketched over the photo survives the crop at the same paper mm. The keep no longer
+/// refuses the unsaved document: the crop is saved (SR640's bytes), and the controller slides it under the KEPT face
+/// instead of re-opening: the document is the same (the line's statements included) and still dirty, `save_to` is still
+/// `fixture.vug`, the title names the crop with the unsaved mark, the outline is kept, and `Photo.h` is T(-x, -y) · H:
+/// the line's paper points land on the old pixel less the offset and the photo's colour under them is the same.
+#[test]
+fn a_sketched_line_survives_the_crop_at_the_same_paper_mm() {
+    let (vw, dir, [x, y, w, h], doc, before, line) = crop_sketched("doc");
+    let out = dir.join("fixture.crop.png");
+    let full = pixel_core::decode(&photo_core::fixture::photo_png()).expect("the fixture decodes");
+    assert_eq!(std::fs::read(&out).expect("the crop is saved beside the photo"), photo_core::fixture::crop_png(&full, x, y, w, h));
+    assert_eq!(vw.view.design.journal.doc, doc, "the document is carried, the line at the same paper mm");
+    assert!(vw.view.design.journal.dirty(), "the journal stays dirty");
+    assert_eq!(vw.title, "fixture.crop.png*", "the title names the crop, unsaved");
+    assert_eq!(vw.save_to.as_deref(), Some(dir.join("fixture.vug").as_path()), "the document's own file is kept");
+    assert_eq!(ph(&vw).note.as_deref(), Some("saved fixture.crop.png"));
+    assert_eq!(ph(&vw).crop.source.as_deref(), Some(out.as_path()));
+    assert_eq!((ph(&vw).image.width, ph(&vw).image.height), (w, h));
+    assert_eq!(ph(&vw).outline, before.outline, "the measurement is kept in the document's paper frame");
+    let mid = Vec2::new((line[0].x + line[1].x) * 0.5, (line[0].y + line[1].y) * 0.5);
+    for q in [line[0], line[1], mid] {
+        let p0 = photo_core::homography::apply(&before.h, q).expect("the old pixel");
+        let p1 = photo_core::homography::apply(&ph(&vw).h, q).expect("the new pixel");
+        assert!((p1.x - (p0.x - x as f64)).abs() < 1e-9 && (p1.y - (p0.y - y as f64)).abs() < 1e-9, "H moved by the offset: {p0:?} -> {p1:?}");
+        let (c0, c1) = (before.sample([q.x, q.y]).expect("on the old photo"), ph(&vw).sample([q.x, q.y]).expect("on the crop"));
+        assert!((0..3).all(|k| (c0[k] - c1[k]).abs() < 1e-3), "the same colour under the line: {c0:?} {c1:?}");
+    }
+    eprintln!("photo: crop-doc rect={x},{y},{w}x{h} carried stmts={} dirty=true saved=fixture.crop.png doc=fixture.vug", doc.stmts.len());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// VUGFACEPHOTOCROPDOC (SR649): the carried document then saves to its own file beside the ORIGINAL photo (the document
+/// names no photo: `s` writes doc_core's text to the kept `fixture.vug`), clean, the title the crop's name; no
+/// `fixture.crop.vug` is written and the original photo is untouched.
+#[test]
+fn the_carried_document_saves_beside_the_original_photo() {
+    let (mut vw, dir, _, doc, _, _) = crop_sketched("docsave");
+    assert!(key(&mut vw, "s"));
+    let saved = std::fs::read_to_string(dir.join("fixture.vug")).expect("the document is saved beside the original photo");
+    assert_eq!(saved, doc_core::write(&doc), "the carried document, the line's statements included");
+    assert!(!vw.view.design.journal.dirty(), "saved");
+    assert_eq!(vw.title, "fixture.crop.png");
+    assert!(!dir.join("fixture.crop.vug").exists(), "the crop's name never becomes the document's");
+    assert_eq!(std::fs::read(dir.join("fixture.png")).expect("the original reads"), photo_core::fixture::photo_png(), "the original is untouched");
+    let _ = std::fs::remove_dir_all(&dir);
+}
