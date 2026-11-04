@@ -1291,3 +1291,60 @@ fn xy(s: &str) -> Option<Vec2> {
     (x.is_finite() && y.is_finite()).then(|| Vec2::new(x, y))
 }
 
+
+// ---- VUGPHOTOCROPMETA (SR582): the photo's command road, writing the camera's datum to Principia's store (named tail block) ----
+
+/// The usage the photo's command road refuses with.
+pub const PREF_USAGE: &str = "usage: camera <mm> | pp <x> <y>";
+
+/// One line on the photo's command road in the standard store ([`command_in`] on `principia::default_prefs_path()`).
+pub fn command(view: &mut View, line: &str) -> Result<bool, String> {
+    command_in(view, &principia::default_prefs_path(), line)
+}
+
+/// One line on the photo's command road in the store folder `dir`: `camera <mm>` writes `vug.photo.camera_mm`, `pp <x>
+/// <y>` writes `vug.photo.principal_px` (`x,y`), through `principia::PrefStore::set` (the schema's check and clamp; the
+/// rows are operator-written and this is the host operator road, quartzite `chrome_rows::store_str`'s). The stored value
+/// is folded into the open photo's prefs by [`PhotoPrefs::from_prefs`]'s rules, so the next side read and open take it;
+/// the corner reads `pref camera=<mm> mm stored` / `pref pp=<x>,<y> stored` (` clamped` when the schema clamped it).
+/// Refused by name, nothing stored: [`PREF_USAGE`] (anything else, or a number that is not finite), `pref: <why>` (the
+/// store did not load or refused the value). True when stored.
+pub fn command_in(view: &mut View, dir: &std::path::Path, line: &str) -> Result<bool, String> {
+    let words: Vec<&str> = line.split_whitespace().collect();
+    let finite = |t: &str| t.parse::<f64>().ok().filter(|v| v.is_finite());
+    let (key, value) = match words.as_slice() {
+        ["camera", mm] => ("photo.camera_mm", bandy::PrefValue::Float(finite(*mm).ok_or(PREF_USAGE)?)),
+        ["pp", x, y] => {
+            let (x, y) = (finite(*x).ok_or(PREF_USAGE)?, finite(*y).ok_or(PREF_USAGE)?);
+            ("photo.principal_px", bandy::PrefValue::Str(format!("{},{}", num(x), num(y))))
+        }
+        _ => return Err(PREF_USAGE.to_string()),
+    };
+    let out = match principia::PrefStore::load(dir).and_then(|mut store| store.set(PREF_NS, key, value)) {
+        Ok(out) => out,
+        Err(e) => {
+            let text = format!("pref: {e}");
+            if let Some(ph) = view.photo.as_mut() {
+                ph.note = Some(format!("refused {text}"));
+            }
+            return Err(text);
+        }
+    };
+    let applied = PhotoPrefs::from_prefs(|k| (k == key).then(|| out.value.clone()));
+    let shown = match &out.value {
+        bandy::PrefValue::Float(f) => num(*f),
+        bandy::PrefValue::Str(s) => s.clone(),
+        v => format!("{v:?}"),
+    };
+    let clamped = if out.clamped { " clamped" } else { "" };
+    let text = if key == "photo.camera_mm" { format!("pref camera={shown} mm stored{clamped}") } else { format!("pref pp={shown} stored{clamped}") };
+    if let Some(ph) = view.photo.as_mut() {
+        if key == "photo.camera_mm" {
+            ph.prefs.camera_mm = applied.camera_mm;
+        } else {
+            ph.prefs.principal_px = applied.principal_px;
+        }
+        ph.note = Some(text);
+    }
+    Ok(true)
+}

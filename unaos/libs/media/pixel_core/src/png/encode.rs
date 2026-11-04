@@ -144,6 +144,9 @@ pub enum PngError {
     BadRowLength,
     /// More scanlines were pushed than the declared height, or `finish` came early.
     RowCountMismatch,
+    /// VUGPHOTOCROPMETA (SR582): a tEXt pair [`encode_rgba_text`] cannot write (PNG §11.3.3.2): a keyword not 1..=79
+    /// Latin-1 printable bytes with no leading, trailing or doubled space, or a value with a NUL or a char past U+00FF.
+    BadText,
 }
 
 /// Largest IDAT payload one emitted chunk carries.
@@ -814,4 +817,38 @@ pub fn zlib_compress(data: &[u8]) -> Result<Vec<u8>, PngError> {
     e.rows_pushed = 1;
     e.finish()?;
     Ok(core::mem::take(&mut e.pend))
+}
+
+// ---- VUGPHOTOCROPMETA (SR582): the tEXt writer (named tail block) ----
+
+/// VUGPHOTOCROPMETA (SR582): [`encode_rgba`] carrying `text` as one `tEXt` chunk per (keyword, value) pair, in order,
+/// right after IHDR (the signature and IHDR are the first 33 bytes of every encode), framed by the one [`push_chunk`].
+/// Both strings are written as Latin-1; a pair PNG cannot carry is [`PngError::BadText`] and nothing is written.
+pub fn encode_rgba_text(width: u32, height: u32, rgba: &[u8], text: &[(&str, &str)]) -> Result<Vec<u8>, PngError> {
+    let mut chunks = Vec::new();
+    for (k, v) in text {
+        let key = latin1(k).ok_or(PngError::BadText)?;
+        let ok_key = (1..=79).contains(&key.len())
+            && key.iter().all(|&b| (32..=126).contains(&b) || b >= 161)
+            && key[0] != b' '
+            && key[key.len() - 1] != b' '
+            && !key.windows(2).any(|w| w == b"  ");
+        let val = latin1(v).ok_or(PngError::BadText)?;
+        if !ok_key || val.contains(&0) {
+            return Err(PngError::BadText);
+        }
+        let mut data = key;
+        data.push(0);
+        data.extend_from_slice(&val);
+        push_chunk(&mut chunks, b"tEXt", &data);
+    }
+    let mut out = encode_rgba(width, height, rgba)?;
+    let at = SIGNATURE.len() + 25;
+    out.splice(at..at, chunks);
+    Ok(out)
+}
+
+/// `s` as Latin-1 bytes (each char at most U+00FF), else None.
+fn latin1(s: &str) -> Option<Vec<u8>> {
+    s.chars().map(|c| u8::try_from(u32::from(c)).ok()).collect()
 }

@@ -471,3 +471,31 @@ fn lens_term_about_the_principal_point() {
     assert!((w - PART_W).abs() < 0.1, "plate side {w} vs {PART_W}");
     assert!((h - PART_H).abs() < 0.1, "plate side {h} vs {PART_H}");
 }
+
+// ---- VUGPHOTOCROPMETA (SR582): the crop's principal point from the photo's own tEXt ----
+
+/// VUGPHOTOCROPMETA (SR582): SR576's cropped lens photo written by `fixture::crop_png` (the tEXt `vug:crop=200,40,900,720`)
+/// and decoded by pixel_core states its principal point (250, 320) itself: measured with NO principal point stated (the
+/// pref unset) it reads the plate within 0.1 mm, its k1 and outline bit-equal to the same crop measured with the point
+/// stated as SR576 did.
+#[test]
+fn a_cropped_png_carries_its_principal_point() {
+    let s = Spec::lens();
+    let full = fixture::render(&s);
+    let img = pixel_core::decode(&fixture::crop_png(&full, 200, 40, 700, 560)).expect("pixel_core decodes the crop PNG");
+    assert_eq!((img.width, img.height), (700, 560));
+    let pp = photo_core::crop_principal(&img).expect("the crop carries its meta");
+    assert_eq!(pp, Vec2::new(250.0, 320.0));
+    let m = measure(&img, PhotoParams::new(5.0), Tol::DEFAULT).expect("the crop measures from its own meta");
+    let stated = measure(&fixture::crop(&full, 200, 40, 700, 560), PhotoParams { principal_px: Some(pp), ..PhotoParams::new(5.0) }, Tol::DEFAULT)
+        .expect("the meta-free crop measures with its point stated");
+    let ls = lines(&m);
+    let (a50, b50) = nearest_len(&ls, PART_W);
+    let (a30, b30) = nearest_len(&ls, PART_H);
+    let (w, h) = (a50.dist(b50), a30.dist(b30));
+    eprintln!("photo: crop-meta pp={},{} plate={w:.3}x{h:.3} k1={:.4} stated_k1={:.4}", pp.x, pp.y, m.k1, stated.k1);
+    assert_eq!(m.k1, stated.k1);
+    assert_eq!(m.outline, stated.outline);
+    assert!((w - PART_W).abs() < 0.1, "plate side {w} vs {PART_W}");
+    assert!((h - PART_H).abs() < 0.1, "plate side {h} vs {PART_H}");
+}
