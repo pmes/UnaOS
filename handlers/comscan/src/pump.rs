@@ -244,6 +244,8 @@ pub struct PumpDesk {
     declared: Option<Declared>,
     /// VUGCOMSCANJOGPOSITION (SR612): the controller's last settled (Idle) machine position, polled outside a job, the poll's time and the once-per-link fallback word ([`Position`]).
     pos: Position,
+    /// VUGCOMSCANJOGTRAVELWIRE (SR618): the travel and position last posted as a `PumpEnvelope` ([`PumpDesk::envelope_due`]); `None`: nothing posted since the last start.
+    told: Option<Told>,
 }
 
 fn refused(why: impl Into<String>) -> Vec<PumpEvent> {
@@ -253,7 +255,7 @@ fn refused(why: impl Into<String>) -> Vec<PumpEvent> {
 impl PumpDesk {
     /// A desk for `machine`: every pass it arms must name this machine's identity (VUG-HELM-BIND-MACHINE).
     pub fn new(machine: Machine) -> PumpDesk {
-        PumpDesk { machine, armed: Vec::new(), running: None, identify: None, hello: None, envelope: true, read: None, declared: None, pos: Position::default() } // VUGCOMSCANMACHINEDECLARE (SR613): + declared
+        PumpDesk { machine, armed: Vec::new(), running: None, identify: None, hello: None, envelope: true, read: None, declared: None, pos: Position::default(), told: None } // VUGCOMSCANMACHINEDECLARE (SR613): + declared; VUGCOMSCANJOGTRAVELWIRE (SR618): + told
     }
 
     /// The machine this desk drives.
@@ -346,7 +348,7 @@ impl PumpDesk {
             }
             PumpEvent::PumpHome { .. } | PumpEvent::PumpJog { .. } => self.motion(ev), // VUGCOMSCANJOG (SR573)
             PumpEvent::PumpDeclare { .. } => self.declare(ev), // VUGCOMSCANMACHINEDECLARE (SR613)
-            PumpEvent::Squawk { .. } | PumpEvent::PumpRefused { .. } | PumpEvent::Commissioned { .. } => Vec::new(),
+            PumpEvent::Squawk { .. } | PumpEvent::PumpRefused { .. } | PumpEvent::Commissioned { .. } | PumpEvent::PumpEnvelope { .. } => Vec::new(), // VUGCOMSCANJOGTRAVELWIRE (SR618): + PumpEnvelope, an answer
         }
     }
 
@@ -356,9 +358,9 @@ impl PumpDesk {
             Some(Running { pump, link: Some(link), .. }) => pump.tick(&mut **link, now_us),
             _ => return Vec::new(),
         };
-        self.position_seen(&evs, now_us); // VUGCOMSCANJOGPOSITION (SR612): the reports' settled position; the idle `?` on a quiet tick too
+        self.position_seen(&evs, now_us); let told = self.envelope_due(); // VUGCOMSCANJOGPOSITION (SR612): the reports' settled position; the idle `?` on a quiet tick too; VUGCOMSCANJOGTRAVELWIRE (SR618): the travel and position typed, once per change
         if evs.is_empty() {
-            return Vec::new();
+            return told.into_iter().collect(); // VUGCOMSCANJOGTRAVELWIRE (SR618): a quiet tick still says a change
         }
         let (evs, moved) = self.motion_replies(evs); // VUGCOMSCANJOG (SR573): the home / jog answers by name
         let moved: Vec<String> = moved.into_iter().chain(self.unlock_after_banner(&evs)).collect(); // VUGCOMSCANALARMRESET (SR585): the unlock after the reset's banner
@@ -369,9 +371,9 @@ impl PumpDesk {
             evs.iter().filter_map(event_word).map(|w| if w == "link lost" { self.lost_word() } else { w }).collect();
         let named: Vec<String> = moved.into_iter().chain(named).collect(); // VUGCOMSCANJOG (SR573)
         if named.is_empty() {
-            return vec![self.squawk(None)];
+            return told.into_iter().chain(std::iter::once(self.squawk(None))).collect(); // VUGCOMSCANJOGTRAVELWIRE (SR618): the typed event first, the Squawk last
         }
-        named.into_iter().map(|w| self.squawk(Some(w))).collect()
+        told.into_iter().chain(named.into_iter().map(|w| self.squawk(Some(w)))).collect() // VUGCOMSCANJOGTRAVELWIRE (SR618): the typed event first, the Squawks last
     }
 }
 
@@ -842,7 +844,7 @@ impl PumpDesk {
             out.push(self.squawk(Some(format!("hello {h}")))); // printed once, at the first open (VUGCOMSCANJOG SR573: as the controller first said it)
         }
         self.read = env; // VUGCOMSCANENVELOPEBOUND (SR602): kept for the jog's bound (a hello-off start keeps None)
-        self.pos = Position::default(); // VUGCOMSCANJOGPOSITION (SR612): a new link knows no position yet
+        self.pos = Position::default(); self.told = None; // VUGCOMSCANJOGPOSITION (SR612): a new link knows no position yet; VUGCOMSCANJOGTRAVELWIRE (SR618): each start says its travel again on its first tick
         for w in self.envelope_words(env) {
             out.push(self.squawk(Some(w))); // VUGCOMSCANALARMIDLE (SR591): a travel that differs from the declared machine, said once
         }
@@ -1691,6 +1693,37 @@ impl PumpDesk {
     /// report on this link, and after a home or jog until the next one.
     pub fn position(&self) -> Option<[f64; 3]> {
         self.pos.at
+    }
+}
+
+// --- VUGCOMSCANJOGTRAVELWIRE (LEDGER SR618): the desk's travel and position typed on the bus for a face (named tail hunk) ---
+
+/// What a `PumpEnvelope` carries (one field, [`PumpDesk`]'s `told`, under the desk lock): the declared machine's
+/// travel per axis X / Y / Z (mm), the controller's read travel (`None` per axis: not read) and the settled position.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Told {
+    declared: Envelope,
+    read: Envelope,
+    position: Option<[f64; 3]>,
+}
+
+impl PumpDesk {
+    /// [`PumpDesk::tick`]'s typed travel: the declared travel through the one [`axis_travel`], the kept `read` and the
+    /// settled `pos.at`; the [`PumpEvent::PumpEnvelope`] only when that differs from the last one posted (`told`; a
+    /// start clears it), so the event follows a start, an accepted relink, a declare on a linked desk and every settled
+    /// or forgotten position by one tick. The Squawk words are unchanged: [`PumpDesk::envelope_words`] stays the sayer.
+    fn envelope_due(&mut self) -> Option<PumpEvent> {
+        use make_core::AxisId;
+        let now = Told {
+            declared: [AxisId::X, AxisId::Y, AxisId::Z].map(|id| axis_travel(&self.machine, id)),
+            read: self.read.unwrap_or([None; 3]),
+            position: self.pos.at,
+        };
+        if self.told == Some(now) {
+            return None;
+        }
+        self.told = Some(now);
+        Some(PumpEvent::PumpEnvelope { declared: now.declared, read: now.read, position: now.position })
     }
 }
 

@@ -1570,3 +1570,55 @@ fn a_declare_after_link_up_rebounds_the_next_jog_without_a_relink() {
     let (lines, _rt, _m) = fake.join().unwrap();
     assert_eq!(jogs_of(&lines), ["$J=G91 X150 Y0 Z0 F300", "$J=G91 X-50 Y0 Z0 F300"], "the second X150 and the X100 never reached the wire: {lines:?}");
 }
+
+// --- VUGCOMSCANJOGTRAVELWIRE (SR618): the desk's travel typed on the bus the tick after a start; the card folds it ---
+
+#[test]
+fn a_start_says_the_travel_typed_and_the_card_reads_it() {
+    let (m, path, _s) = pty();
+    let p = program();
+    let want = Pump::from_program(&p, GRBL).unwrap().lines().to_vec();
+    let mut desk = PumpDesk::new(machine());
+    desk.hello_within(comscan::tty::READY_WAIT);
+    let pass = Verdict::Pass { digest: p.digest(), machine: machine().digest() };
+    let digest = desk.arm(&pass, &p, GRBL).expect("armed by a pass");
+    let mut open = opener(Baud::B115200, Flow::None);
+    // The fake's `$$` says X 200 / Y 350 / Z 110 against the declared 350 / 350 / 110.
+    let fake = fake_grbl_as(m, true, want.len(), VER_A);
+    let start = PumpEvent::PumpStart {
+        principal: Origin::LocalUser("una".to_string()),
+        program: digest_hex(digest),
+        dialect: "grbl".to_string(),
+        port: path.to_str().unwrap().to_string(),
+    };
+    let out = desk.apply(&start, &mut *open);
+    assert!(!out.iter().any(|e| matches!(e, PumpEvent::PumpEnvelope { .. })), "the start's own answer keeps its shape: {out:?}");
+
+    let t0 = Instant::now();
+    let (mut done, mut told) = (false, Vec::new());
+    while !done && t0.elapsed() < Duration::from_secs(10) {
+        for s in desk.tick(t0.elapsed().as_micros() as u64) {
+            match &s {
+                PumpEvent::PumpEnvelope { .. } => told.push(s.clone()),
+                PumpEvent::Squawk { event: Some(e), .. } => done |= e == "done",
+                _ => {}
+            }
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+    assert!(done, "the run reached done");
+    let Some(PumpEvent::PumpEnvelope { declared, read, .. }) = told.first() else {
+        panic!("no PumpEnvelope after the start");
+    };
+    assert_eq!(*declared, [Some(350.0), Some(350.0), Some(110.0)], "the declared machine's travel");
+    assert_eq!(*read, [Some(200.0), Some(350.0), Some(110.0)], "the controller's read travel");
+
+    let mut card = comscan::PumpCard::new(Origin::LocalUser("una".to_string()));
+    card.hear(&told[0]);
+    let snap = card.snapshot();
+    assert_eq!(snap.declared, [Some(350.0), Some(350.0), Some(110.0)]);
+    assert_eq!(snap.read, [Some(200.0), Some(350.0), Some(110.0)]);
+    drop(desk);
+    let (lines, _m) = fake.join().unwrap();
+    assert_eq!(lines, want, "the typed travel is no program line");
+}
