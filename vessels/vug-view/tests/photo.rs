@@ -1271,3 +1271,113 @@ fn a_glyph_wider_than_the_sheet_keeps_its_anchor_x_and_the_corner_says_so() {
     let ink = raster::rgba(INK);
     assert!((30..40u32).any(|y| (6..46u32).any(|x| fr.pixel(x, y) == ink)), "the corner's second row paints INK");
 }
+
+// ---- VUGINTENTSETFACEPUSHFOOT (SR617): a down push past the sheet's bottom lifts above its obstacle; a glyph taller than the free band is clipped and the corner says so ----
+
+/// The rectangle's side drawn lowest on screen (left_side's shape, the largest screen y): its line entity and its
+/// midpoint's screen point. A leader rising from it runs inside the rectangle, clear of every sketch edge.
+fn low_side(vw: &Viewer) -> (u32, (f32, f32)) {
+    let f = face(vw);
+    let sk = &f.sketch;
+    (4..8u32)
+        .filter_map(|e| {
+            let Entity::Line { a, b } = sk.entity(EntityId(e))? else { return None };
+            let (p, q) = (sk.point(PointRef::Point(*a))?, sk.point(PointRef::Point(*b))?);
+            let (x, y) = f.to_screen(&vw.view, Vec2::new(0.5 * (p.x + q.x), 0.5 * (p.y + q.y)))?;
+            Some((e, (x as f32, y as f32)))
+        })
+        .max_by(|l, r| (l.1).1.partial_cmp(&(r.1).1).unwrap_or(core::cmp::Ordering::Equal))
+        .expect("the rectangle's sides are on screen")
+}
+
+/// SR601's rectangle face on a (W + `grow`, `h`) sheet with `n` listed singles (SR601's [`listed`]) then `k` singles
+/// anchored at the low side's midpoint (one why each, so no set forms; ids v20..), offered: the viewer, the anchored
+/// glyph's natural place (sx + 6, sy - 14) and the glyphs (the listed first). SR596 stacks the anchored ones down from
+/// the first: the j-th fits at y0 + 12 j while its 10 px glyph ends on the sheet.
+fn stacked(h: u32, grow: u32, n: usize, k: usize) -> (Viewer, (f32, f32), Vec<vug_view::photo::ProposalGlyph>) {
+    let mut vw = rectangle();
+    vw.view.resize(W + grow, h);
+    let (e, (sx, sy)) = low_side(&vw);
+    let mut ps = listed(n);
+    ps.extend((0..k).map(|j| datum(&format!("horizontal v{} sketch=s line=e{e}", 20 + j), &format!("the low side {j}"))));
+    assert!(photo::offer(&mut vw.view, ps));
+    let gs = photo::glyphs(&vw.view);
+    assert_eq!(gs.len(), n + k, "{n} listed and {k} anchored singles: {gs:?}");
+    (vw, (sx + 6.0, sy - 14.0), gs)
+}
+
+/// The singles that fit stacked from y0 on a sheet `h` tall (the j-th at y0 + 12 j, its glyph 10 px).
+fn fitting(h: u32, y0: f32) -> usize {
+    let f = ((h as f32 - 10.0 - y0) / 12.0).floor();
+    if f < 0.0 { 0 } else { f as usize + 1 }
+}
+
+/// On a half-height sheet: as many singles at the low side as fit stacked, plus one. The last one's SR596 push would
+/// carry it past the sheet's bottom, so it lifts over the stack to the first's top less its own height, x unmoved: its
+/// rect inside the sheet and clear of every other, its leader from its cross to the anchor painted INK, no corner word.
+#[test]
+fn a_glyph_pushed_past_the_bottom_lifts_above_its_obstacle() {
+    use vug_view::sketch::INK;
+    let h = H / 2;
+    let (_, (_, y0), _) = stacked(h, 200, 0, 1);
+    let m = fitting(h, y0);
+    assert!(m >= 1 && y0 - 12.0 >= 42.0, "the case exists on this sheet: y0 {y0}, {m} fit, the foot 42");
+    let (vw, natural, gs) = stacked(h, 200, 0, m + 1);
+    assert!(y0 + 12.0 * m as f32 + 10.0 > h as f32, "a drop under the stack passes the bottom: y0 {y0}, {m} fit, h {h}");
+    let g = &gs[m];
+    assert!((g.at.0 - natural.0).abs() < 1e-3 && (g.at.1 - (natural.1 - 12.0)).abs() < 1e-3, "above the stack, x unmoved: {:?} natural {natural:?}", g.at);
+    let r = photo::glyph_rect(g);
+    assert!(r.0 >= 0.0 && r.1 >= 0.0 && r.0 + r.2 <= (W + 200) as f32 && r.1 + r.3 <= h as f32, "the rect inside the sheet: {r:?}");
+    for o in &gs[..m] {
+        let q = photo::glyph_rect(o);
+        assert!(!(r.0 < q.0 + q.2 && q.0 < r.0 + r.2 && r.1 < q.1 + q.3 && q.1 < r.1 + r.3), "clear of {q:?}: {r:?}");
+    }
+    let (a, b) = photo::leader(&vw.view, g).expect("a lifted glyph has a leader");
+    assert_eq!(a, (g.at.0 - 6.0, g.at.1 + 14.0), "the leader starts at its cross");
+    let fr = raster::render(&vw.model, &vw.view);
+    let (mx, my) = ((0.5 * (a.0 + b.0)) as u32, (0.5 * (a.1 + b.1)) as u32);
+    let ink = raster::rgba(INK);
+    let xs = mx.saturating_sub(1)..=mx + 1;
+    assert!(xs.clone().any(|x| fr.pixel(x, my) == ink), "the leader's midpoint ({xs:?}, {my}) paints INK");
+    assert!(drawn(&fr, g));
+    assert_eq!(photo::wide_note(&vw.view), None, "a glyph the sheet holds is not named");
+}
+
+/// A listed column of `n` singles (its foot, the running row's, at 42 + 12 n) on a sheet 9 px taller than the foot, so
+/// the free band is shorter than a single's 10 px glyph; the low side's stack sits clear right of the column (the sheet
+/// grown until it does: x shifts by half the growth). The stack's last single, pushed past the bottom, lifts over the
+/// stack onto the column's foot, x unmoved, is clipped there, and the corner's second row says `glyph taller than the
+/// free band: <id>` in INK. (With nothing listed no case exists: on this face y0 = 0.616 h - 14, so for every sheet
+/// 43..51 px tall the drop lands at 36.5..41.4, above the corner foot 42, and the glyph stays at its drop y.)
+#[test]
+fn a_glyph_taller_than_the_free_band_is_clipped_and_the_corner_says_so() {
+    use vug_view::sketch::INK;
+    let mut tried = Vec::new();
+    let case = (1..=12usize).find_map(|n| {
+        let (foot, h) = (42.0 + 12.0 * n as f32, 51 + 12 * n as u32);
+        let mut grow = 200;
+        for _ in 0..4 {
+            let (_, natural, gs) = stacked(h, grow, n, 1);
+            let right = gs[..n].iter().map(|l| { let r = photo::glyph_rect(l); r.0 + r.2 }).fold(0.0f32, f32::max);
+            if right + 6.0 < natural.0 {
+                let m = fitting(h, natural.1);
+                tried.push((n, h, grow, natural.1, m));
+                return (natural.1 >= 0.0 && m >= 1 && natural.1 + 12.0 * m as f32 > foot).then_some((n, foot, h, grow, m));
+            }
+            grow += 2 * (right + 6.0 - natural.0).ceil() as u32 + 16;
+        }
+        None
+    });
+    let (n, foot, h, grow, m) = case.unwrap_or_else(|| panic!("a listed column holds the case: (n, h, grow, y0, fit) {tried:?}"));
+    let (vw, natural, gs) = stacked(h, grow, n, m + 1);
+    let col = gs[..n].iter().map(photo::glyph_rect).fold((f32::MAX, f32::MAX, f32::MIN, f32::MIN), |c, r| (c.0.min(r.0), c.1.min(r.1), c.2.max(r.0 + r.2), c.3.max(r.1 + r.3)));
+    assert!((col.3 - foot).abs() < 1e-3, "the column's foot: {col:?} foot {foot}");
+    let g = &gs[n + m];
+    assert!((g.at.0 - natural.0).abs() < 1e-3 && (g.at.1 - foot).abs() < 1e-3, "lifted onto the column's foot, x unmoved: {:?} natural {natural:?} foot {foot}", g.at);
+    let r = photo::glyph_rect(g);
+    assert!(r.1 + r.3 - 2.0 > h as f32, "clipped at the bottom: {r:?} h {h}");
+    assert_eq!(photo::wide_note(&vw.view).as_deref(), Some(format!("glyph taller than the free band: v{}", 20 + m).as_str()));
+    let fr = raster::render(&vw.model, &vw.view);
+    let ink = raster::rgba(INK);
+    assert!((30..40u32).any(|y| (6..46u32).any(|x| fr.pixel(x, y) == ink)), "the corner's second row paints INK");
+}

@@ -1549,6 +1549,7 @@ fn a_declare_after_link_up_rebounds_the_next_jog_without_a_relink() {
     let jog = |dx: f64| PumpEvent::PumpJog { principal: who(), dx, dy: 0.0, dz: 0.0, feed: 300.0 };
     assert_eq!(said_in(&desk.apply(&jog(150.0), &mut *open)), "jog sent: $J=G91 X150 Y0 Z0 F300");
     assert_eq!(drive_until(&mut desk, &mut *open, t0, &mut words, |e| e.starts_with("jog ")), "jog ok", "{words:?}");
+    settle_at(&mut desk, t0, [150.0, 0.0, 0.0]); // seat fold: wait for the post-jog `?` so the end bound below reads from 150, not from a race (found by SR620)
 
     // A declare on the live link: the next jog is bounded by the declared 120, on the same link.
     let declare = PumpEvent::PumpDeclare { principal: who(), name: "mill".to_string(), x: 120.0, y: 300.0, z: 100.0, dialect: None };
@@ -1569,4 +1570,197 @@ fn a_declare_after_link_up_rebounds_the_next_jog_without_a_relink() {
     drop(open);
     let (lines, _rt, _m) = fake.join().unwrap();
     assert_eq!(jogs_of(&lines), ["$J=G91 X150 Y0 Z0 F300", "$J=G91 X-50 Y0 Z0 F300"], "the second X150 and the X100 never reached the wire: {lines:?}");
+}
+
+// --- VUGCOMSCANJOGTRAVELWIRE (SR618): the desk's travel typed on the bus the tick after a start; the card folds it ---
+
+#[test]
+fn a_start_says_the_travel_typed_and_the_card_reads_it() {
+    let (m, path, _s) = pty();
+    let p = program();
+    let want = Pump::from_program(&p, GRBL).unwrap().lines().to_vec();
+    let mut desk = PumpDesk::new(machine());
+    desk.hello_within(comscan::tty::READY_WAIT);
+    let pass = Verdict::Pass { digest: p.digest(), machine: machine().digest() };
+    let digest = desk.arm(&pass, &p, GRBL).expect("armed by a pass");
+    let mut open = opener(Baud::B115200, Flow::None);
+    // The fake's `$$` says X 200 / Y 350 / Z 110 against the declared 350 / 350 / 110.
+    let fake = fake_grbl_as(m, true, want.len(), VER_A);
+    let start = PumpEvent::PumpStart {
+        principal: Origin::LocalUser("una".to_string()),
+        program: digest_hex(digest),
+        dialect: "grbl".to_string(),
+        port: path.to_str().unwrap().to_string(),
+    };
+    let out = desk.apply(&start, &mut *open);
+    assert!(!out.iter().any(|e| matches!(e, PumpEvent::PumpEnvelope { .. })), "the start's own answer keeps its shape: {out:?}");
+
+    let t0 = Instant::now();
+    let (mut done, mut told) = (false, Vec::new());
+    while !done && t0.elapsed() < Duration::from_secs(10) {
+        for s in desk.tick(t0.elapsed().as_micros() as u64) {
+            match &s {
+                PumpEvent::PumpEnvelope { .. } => told.push(s.clone()),
+                PumpEvent::Squawk { event: Some(e), .. } => done |= e == "done",
+                _ => {}
+            }
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+    assert!(done, "the run reached done");
+    let Some(PumpEvent::PumpEnvelope { declared, read, .. }) = told.first() else {
+        panic!("no PumpEnvelope after the start");
+    };
+    assert_eq!(*declared, [Some(350.0), Some(350.0), Some(110.0)], "the declared machine's travel");
+    assert_eq!(*read, [Some(200.0), Some(350.0), Some(110.0)], "the controller's read travel");
+
+    let mut card = comscan::PumpCard::new(Origin::LocalUser("una".to_string()));
+    card.hear(&told[0]);
+    let snap = card.snapshot();
+    assert_eq!(snap.declared, [Some(350.0), Some(350.0), Some(110.0)]);
+    assert_eq!(snap.read, [Some(200.0), Some(350.0), Some(110.0)]);
+    drop(desk);
+    let (lines, _m) = fake.join().unwrap();
+    assert_eq!(lines, want, "the typed travel is no program line");
+}
+
+// --- VUGCOMSCANMACHINEDECLAREPREFS (SR619): the declared machine kept in Principia's store, read back at the pump's start ---
+
+/// An opener that opens nothing: the bus tests below never start a job through `serve_pump`.
+fn no_opener() -> Box<Opener> {
+    Box::new(|_: &str, _: Dialect| -> Result<Box<dyn Transport + Send>, String> { Err("none".to_string()) })
+}
+
+/// The next bus message `pick` takes, within 5 s.
+async fn next_on<T>(rx: &mut tokio::sync::broadcast::Receiver<bandy::SMessage>, mut pick: impl FnMut(bandy::SMessage) -> Option<T>) -> T {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(t) = pick(rx.recv().await.expect("the bus is open")) {
+                return t;
+            }
+        }
+    })
+    .await
+    .expect("the message within 5 s")
+}
+
+#[tokio::test]
+async fn a_declare_writes_the_machine_into_principias_store() {
+    use bandy::{PrefValue, PrincipiaCommand, SMessage, Synapse};
+    let syn = Synapse::new();
+    let rx = syn.subscribe();
+    let mut watch = syn.subscribe();
+    let desk = std::sync::Arc::new(std::sync::Mutex::new(PumpDesk::new(machine())));
+    let task = tokio::spawn(comscan::pump::serve_pump(syn.clone(), rx, desk.clone(), no_opener(), Duration::from_millis(5)));
+    let who = || Origin::LocalUser("una".to_string());
+
+    // The start asks Principia once; nobody answers here, so the desk stays undeclared (silent).
+    let asked = next_on(&mut watch, |m| match m {
+        SMessage::Principia(PrincipiaCommand::PrefGet { ns, key }) => Some((ns, key)),
+        _ => None,
+    })
+    .await;
+    assert_eq!(asked, ("comscan".to_string(), "machine".to_string()));
+
+    // A refused declare writes nothing; the accepted one is followed by exactly its record.
+    let bad = comscan::pump::declare_request("machine declare mill x=0 y=300 z=100", who()).expect("the text form parses");
+    let good = comscan::pump::declare_request("machine declare mill x=120 y=300 z=100 dialect=grbl", who()).expect("the text form parses");
+    syn.fire(SMessage::Pump(bad));
+    syn.fire(SMessage::Pump(good));
+    let mut refusals = Vec::new();
+    let set = next_on(&mut watch, |m| match m {
+        SMessage::Pump(PumpEvent::PumpRefused { why }) => {
+            refusals.push(why);
+            None
+        }
+        SMessage::Principia(PrincipiaCommand::PrefSet { ns, key, value }) => Some((ns, key, value)),
+        _ => None,
+    })
+    .await;
+    assert_eq!(refusals, ["declare: x=0 is not a travel above zero"], "the refused declare came first and wrote nothing");
+    assert_eq!(set, ("comscan".to_string(), "machine".to_string(), PrefValue::Str("mill x=120 y=300 z=100 dialect=grbl".to_string())));
+    assert_eq!(desk.lock().unwrap().declared(), Some(("mill", Some(GRBL))));
+    assert_eq!(desk.lock().unwrap().declared_record(), Some("mill x=120 y=300 z=100 dialect=grbl"));
+    syn.fire(SMessage::Kill("comscan".to_string()));
+    tokio::time::timeout(Duration::from_secs(5), task).await.expect("stops on Kill").unwrap();
+}
+
+#[test]
+fn a_desk_reads_the_declared_machine_from_principia_at_start_and_bounds_the_jog() {
+    use bandy::{PrefValue, PrincipiaCommand, SMessage, Synapse};
+    let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+    let desk = std::sync::Arc::new(std::sync::Mutex::new(PumpDesk::new(machine())));
+    let (said, asked) = rt.block_on(async {
+        let syn = Synapse::new();
+        // The fake Principia: its store holds `comscan.machine`; it answers every PrefGet and counts them.
+        let mut prx = syn.subscribe();
+        let psyn = syn.clone();
+        let principia = tokio::spawn(async move {
+            let mut asked = 0;
+            loop {
+                match prx.recv().await {
+                    Ok(SMessage::Principia(PrincipiaCommand::PrefGet { ns, key })) => {
+                        asked += 1;
+                        let value = (ns == "comscan" && key == "machine").then(|| PrefValue::Str("mill x=120 y=300 z=100".to_string()));
+                        psyn.fire(SMessage::Principia(PrincipiaCommand::PrefValueIs { ns, key, value }));
+                    }
+                    Ok(SMessage::Kill(w)) if w == "comscan" => return asked,
+                    Ok(_) => {}
+                    Err(_) => return asked,
+                }
+            }
+        });
+        let rx = syn.subscribe();
+        let mut watch = syn.subscribe();
+        let task = tokio::spawn(comscan::pump::serve_pump(syn.clone(), rx, desk.clone(), no_opener(), Duration::from_millis(5)));
+        let said = next_on(&mut watch, |m| match m {
+            SMessage::Pump(PumpEvent::Squawk { event: Some(e), .. }) if e.starts_with("machine declared") => Some(e),
+            _ => None,
+        })
+        .await;
+        syn.fire(SMessage::Kill("comscan".to_string()));
+        tokio::time::timeout(Duration::from_secs(5), task).await.expect("stops on Kill").unwrap();
+        (said, principia.await.unwrap())
+    });
+    assert_eq!(said, "machine declared mill x=120 y=300 z=100 (from prefs)");
+    assert_eq!(asked, 1, "read once at the start, never after");
+    drop(rt);
+
+    // The same desk on a fake grbl, before any start: the machine from the store is the one in force.
+    let mut desk = std::sync::Arc::try_unwrap(desk).ok().expect("serve_pump let go of the desk").into_inner().unwrap();
+    assert_eq!(desk.declared(), Some(("mill", None)));
+    let (m, path, _s) = pty();
+    let fake = fake_grbl_alarm(m, usize::MAX);
+    let who = || Origin::LocalUser("una".to_string());
+    let p = program();
+    let before = Verdict::Pass { digest: p.digest(), machine: machine().digest() };
+    assert!(
+        matches!(desk.arm(&before, &p, GRBL), Err(comscan::pump::Refused::WrongMachine { .. })),
+        "a pass naming the machine at new does not arm: the store's machine is in force"
+    );
+    let pass = Verdict::Pass { digest: p.digest(), machine: desk.machine().digest() };
+    let digest = desk.arm(&pass, &p, GRBL).expect("armed by a pass naming the machine from the store");
+    let mut open = opener(Baud::B115200, Flow::None);
+    let start = PumpEvent::PumpStart { principal: who(), program: digest_hex(digest), dialect: "grbl".to_string(), port: path.to_str().unwrap().to_string() };
+    // serve_pump turned the hello on, so the start reads the controller's travel against the store's machine.
+    let said = words_in(&desk.apply(&start, &mut *open));
+    assert_eq!(said[0], "started", "{said:?}");
+    assert!(said.iter().any(|w| w == "envelope differs axis=X declared=120 controller=200"), "the store's X travel is the declared one: {said:?}");
+    let t0 = Instant::now();
+    let mut words = Vec::new();
+    assert_eq!(drive_until(&mut desk, &mut *open, t0, &mut words, |e| e == "done"), "done");
+
+    // The stored X travel is 120 (tighter than the controller's 200): from MPos 0, X150 refused before the wire, X100 goes out.
+    settle_at(&mut desk, t0, [0.0, 0.0, 0.0]);
+    let jog = |dx: f64| PumpEvent::PumpJog { principal: who(), dx, dy: 0.0, dz: 0.0, feed: 300.0 };
+    assert_eq!(refused_in(&desk.apply(&jog(150.0), &mut *open)), "jog: X150 from 0 ends past the declared X travel 120");
+    assert_eq!(said_in(&desk.apply(&jog(100.0), &mut *open)), "jog sent: $J=G91 X100 Y0 Z0 F300");
+    assert_eq!(drive_until(&mut desk, &mut *open, t0, &mut words, |e| e.starts_with("jog ")), "jog ok", "{words:?}");
+    let home = PumpEvent::PumpHome { principal: who() };
+    assert_eq!(said_in(&desk.apply(&home, &mut *open)), "home sent: $H");
+    assert_eq!(drive_until(&mut desk, &mut *open, t0, &mut words, |e| e.starts_with("home")), "home ok", "{words:?}");
+    drop(desk);
+    drop(open);
+    let (lines, _rt, _m) = fake.join().unwrap();
+    assert_eq!(jogs_of(&lines), ["$J=G91 X100 Y0 Z0 F300"], "the refused X150 never reached the wire: {lines:?}");
 }

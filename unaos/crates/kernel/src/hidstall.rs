@@ -1604,7 +1604,7 @@ fn hid_place_kat() {
 // gated off by `pass_begin`'s T0 swap before it takes and resets the gap's candidate ([`wait_who_gap`]); the minute's worst
 // gap keeps its own ([`wait_who_keep`]). The name is held in the ONE name record, [`MaskWho`] (its site word is this tail's
 // sample line, never printed). `who=<task>:<tid>`, `-` unless the minute reads WAIT-LONG, `?` when no tick sampled
-// (QEMU raspi4b: no tick IRQ; an idle core; F39HIDPUMPARM B1124 retired the aarch64 note). F39HIDPLACERENDER (B1118): both arches' tick sample through [`wait_tick`]. `:: HIDGAPSPLIT:` adds `who_ok=` (pure cases).
+// (`?notick` / `?idle` / `?`, F39HIDWHONOTICK B1180, file tail; F39HIDPUMPARM B1124 retired the aarch64 note). F39HIDPLACERENDER (B1118): both arches' tick sample through [`wait_tick`]. `:: HIDGAPSPLIT:` adds `who_ok=` (pure cases).
 
 /// F39HIDPLACESVC (B1109): the ended-or-running gap's majority candidate (tid 0 = none) and its Boyer-Moore count.
 static GAP_WHO: MaskWho = MaskWho::new();
@@ -1646,24 +1646,24 @@ pub fn wait_who_tick(name: &'static str, tid: u64) {
 }
 
 /// `pass_begin`, after its T0 swap (the tick's gate is shut): the ended gap's candidate, taken and reset.
-fn wait_who_gap() -> (MaskedBy, u64) {
+fn wait_who_gap() -> (MaskedBy, u64, bool) {
     let by = GAP_WHO.read(true);
     let tid = GAP_TID.swap(0, Relaxed);
     GAP_VOTES.store(0, Relaxed);
-    (by, tid)
+    (by, tid, GAP_IDLE.swap(false, Relaxed)) // F39HIDWHONOTICK (B1180): and whether an overdue tick found the pump core idle
 }
 
 /// `pass_begin`, on a won minute-worst: that gap's candidate becomes the minute's (none sampled = cleared).
-fn wait_who_keep(who: (MaskedBy, u64)) {
-    let (by, tid) = who;
+fn wait_who_keep(who: (MaskedBy, u64, bool)) {
+    let (by, tid, idle) = who; // F39HIDWHONOTICK (B1180): the gap's idle word rides the same keep
     match by.site() {
         Some(site) if tid != 0 => {
             MIN_WHO.note_at(by.name(), site, by.core);
-            MIN_TID.store(tid, Relaxed);
+            MIN_TID.store(tid, Relaxed); MIN_IDLE.store(false, Relaxed); // F39HIDWHONOTICK (B1180): a named gap has no idle word
         }
         _ => {
             let _ = MIN_WHO.read(true);
-            MIN_TID.store(0, Relaxed);
+            MIN_TID.store(0, Relaxed); MIN_IDLE.store(idle, Relaxed); // F39HIDWHONOTICK (B1180): the unnamed gap keeps its idle word
         }
     }
 }
@@ -1676,7 +1676,7 @@ impl core::fmt::Display for WaitWho {
             return f.write_str("-");
         }
         if self.1 == 0 || self.0.site().is_none() {
-            return f.write_str("?");
+            return f.write_str(wait_who_why()); // F39HIDWHONOTICK (B1180): `?notick` (no tick reaches the sampler) / `?idle` (only idle ticks) / `?` (file tail)
         }
         write!(f, "{}:{}", self.0.name().unwrap_or("?"), self.1)
     }
@@ -1698,7 +1698,7 @@ fn wait_who_kat() -> bool {
         && !wait_overdue(10, 20, 35)
         && !wait_overdue(30, 20, 100)
         && !wait_overdue(0, 0, 100);
-    majority && gate
+    majority && gate && who_why_kat() // F39HIDWHONOTICK (B1180): the `?` cause word's pure cases (file tail)
 }
 
 /// `:: HIDPLACE:`'s `svc_ok=` (x86): the scheduler's sibling tier, asked to skip the core it would pick, picks another or
@@ -1728,7 +1728,7 @@ fn svc_kat() -> Option<bool> {
 // `skip_b`. `:: HIDPLACE:` adds `render_ok=` (x86 SMP live, at least two siblings; `-` on aarch64 / fewer CPUs).
 // HID-WAIT-WHO-ARM: the pump-core gate is ONE fn, [`wait_tick`]; each arch's `timer_preempt` -> `hid_wait_tick` keeps only
 // its own `Task` read in the closure. aarch64's pass stamps [`pump_here`] / `pass_begin` since F39HIDPUMPARM (B1124, file
-// tail), so `who=` reads `?` only when no tick sampled (QEMU raspi4b: no tick IRQ).
+// tail), so `who=` reads `?` only when no tick sampled (its cause word since F39HIDWHONOTICK B1180, file tail).
 
 /// F39HIDPLACERENDER (B1118): the tick sampler's gate, shared by both arches' `sched::hid_wait_tick` (ISR, IF=0): on the
 /// hid pump's core only, `who` reads the interrupted task's name and id and [`wait_who_tick`] votes it.
@@ -2054,7 +2054,7 @@ fn lock_who_kat(lock: u64, ps2: u64) -> bool {
 // only caller is `video::lag`'s roll, compiled live only on x86 `wc` (`lag::ON`), so no aarch64 boot ever printed the census;
 // the Orin now rolls it from the pump's own sweep, every 240th (~60 s), through [`census_minute_on_pump`]. Owed: HID-CENSUS-PI
 // (the Pi's bracketed `usb_pump` / `input_service` pass has no roll either, so B1124's Pi-metal `who=` wire cannot print),
-// HID-WHO-ORIN (answered by F39HIDWHOORIN B1168: the flown image's c0 ticks (`bsptick`+`bsprun`, `run_bsp_tegra`) and votes through [`wait_tick`]; `who=?` only on a NOBSPTICK/NOBSPRUN image).
+// HID-WHO-ORIN (answered by F39HIDWHOORIN B1168: the flown image's c0 ticks (`bsptick`+`bsprun`, `run_bsp_tegra`) and votes through [`wait_tick`]; `who=?notick` on a NOBSPTICK/NOBSPRUN image, F39HIDWHONOTICK B1180).
 
 /// F39HIDPUMPORIN (B1152): [`census_minute`] printed from the hid pump's OWN task, mid-pass. aarch64's print is synchronous
 /// (byte by byte at 115200: the census's two lines are ~480 B, ~42 ms), and that print must not become the gap it reports:
@@ -2068,4 +2068,63 @@ pub fn census_minute_on_pump() {
         PASS_T0_MS.fetch_add(d / 1000, Relaxed);
         PH_LAST.fetch_add(d, Relaxed);
     }
+}
+
+// ── F39HIDWHONOTICK (rmbp-ledger B1180) — HID-WHO-NOTICK: the gap split's `who=?` names its cause. FILE-TAIL append. ─────
+// B1168 left `who=?` reasonless: a tickless image read the same as a tick that only found an idle core. Three causes, each
+// known at its own site: NOTICK — `sched::timer_preempt` returns at its first line while `SCHED_ACTIVE` is false (aarch64:
+// its three setters `start_aps` / `run_bsp_tegra` / virt_tick each come with the IRQ arm that calls `timer_preempt`, so
+// false means no tick reaches [`wait_tick`]: an Orin `UNAOS_NOBSPTICK` / `UNAOS_NOBSPRUN` image; x86 always ticks on the
+// pump core: the pump is a dispatched task, `SCHED_GO` is set with `SCHED_ACTIVE`, the LAPIC timer is the one tick and
+// `tickless::eligible` excludes [`pump_cpu`]); IDLE — `timer_preempt`'s null-current return (no idle task is named on
+// either arch) now calls [`wait_tick_idle`], which notes an overdue idle tick on the pump core into the gap (the same
+// pump-core and [`wait_overdue`] gates, one ISR writer, taken by `wait_who_gap`, kept by `wait_who_keep`); `?` — ticks
+// wired but none landed in the overdue window (QEMU raspi4b: no Group-1 timer IRQ; or the pump core masked across it).
+// The named arm and `-` are byte-identical; only `?` gains a word.
+
+/// F39HIDWHONOTICK (B1180): the running gap saw an overdue tick on an idle pump core (one writer: that core's ISR).
+static GAP_IDLE: AtomicBool = AtomicBool::new(false);
+/// F39HIDWHONOTICK (B1180): the minute's worst gap's idle word, written on every won minute-worst by `wait_who_keep`.
+static MIN_IDLE: AtomicBool = AtomicBool::new(false);
+
+/// F39HIDWHONOTICK (B1180): both arches' `timer_preempt`, at its null-current (idle) return (ISR, interrupts masked): on
+/// the hid pump's core, while the pass is overdue, the gap is marked as having ticked idle. Atomics only.
+#[inline]
+pub fn wait_tick_idle(cpu: usize) {
+    if cpu == pump_cpu() && wait_overdue(PASS_T0_MS.load(Relaxed), PASS_END_MS.load(Relaxed), crate::arch::ms()) {
+        GAP_IDLE.store(true, Relaxed);
+    }
+}
+
+/// F39HIDWHONOTICK (B1180): the `who=` word when no task was sampled: no tick wired, only idle ticks, else `?`. Pure.
+fn who_why(wired: bool, idle: bool) -> &'static str {
+    if !wired {
+        "?notick"
+    } else if idle {
+        "?idle"
+    } else {
+        "?"
+    }
+}
+
+/// F39HIDWHONOTICK (B1180): `wait_who_kat`'s cause-word cases. Pure.
+fn who_why_kat() -> bool {
+    who_why(false, false) == "?notick" && who_why(false, true) == "?notick" && who_why(true, true) == "?idle" && who_why(true, false) == "?"
+}
+
+/// F39HIDWHONOTICK (B1180): the live cause word for `WaitWho`'s `?` arm.
+fn wait_who_why() -> &'static str {
+    who_why(tick_wired(), MIN_IDLE.load(Relaxed))
+}
+
+/// F39HIDWHONOTICK (B1180): a tick reaches `timer_preempt` (and so [`wait_tick`]) on this boot.
+#[cfg(target_arch = "aarch64")]
+fn tick_wired() -> bool {
+    crate::arch::sched::preempt_wired()
+}
+
+/// F39HIDWHONOTICK (B1180): x86 always ticks on the pump core (see the block comment).
+#[cfg(not(target_arch = "aarch64"))]
+fn tick_wired() -> bool {
+    true
 }

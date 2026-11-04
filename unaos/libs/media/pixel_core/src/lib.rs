@@ -76,7 +76,7 @@ pub struct Image {
     /// EXIF orientation tag (1..=8) found in the file, 1 when absent. It is REPORTED, not applied:
     /// call [`Image::apply_orientation`] to rotate/flip the pixels (a browser applies it by default,
     /// CSS `image-orientation: from-image`).
-    pub orientation: u8, pub icc: Option<Vec<u8>>, pub text: Vec<(String, String)>, // VUGPHOTOCROPMETA (SR582): `text` is the PNG tEXt pairs (keyword, value) in file order, Latin-1 read as chars, empty (no allocation) when the file has none. PDFICC (SR358): `icc` is the embedded ICC profile as stored (PNG iCCP inflated, JPEG APP2 chunks joined in order, WebP ICCP), else None; REPORTED, not applied — `icc_core::apply_icc_to_srgb` converts
+    pub orientation: u8, pub icc: Option<Vec<u8>>, pub text: Vec<(String, String)>, // VUGPHOTOCROPMETA (SR582): `text` is the PNG tEXt pairs (keyword, value) in file order, Latin-1 read as chars (VUGPHOTOCROPMETAITXT SR614: and the zTXt pairs inflated, the iTXt pairs with their UTF-8 text, the JPEG COM `key NUL value` segments, one budget), empty (no allocation) when the file has none. PDFICC (SR358): `icc` is the embedded ICC profile as stored (PNG iCCP inflated, JPEG APP2 chunks joined in order, WebP ICCP), else None; REPORTED, not applied — `icc_core::apply_icc_to_srgb` converts
 }
 
 /// Why a decode failed. Every variant names a distinct falsifiable claim about the input.

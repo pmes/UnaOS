@@ -230,7 +230,8 @@ impl PumpCard {
 
 // --- VUGCOMSCANJOGFACEGTK (LEDGER SR616): the pump card's bus fold and snapshot, what a face's jog pad reads (named tail hunk) ---
 
-/// What the pad shows of the pump, folded from the bus by [`PumpCard::hear`] (the travel set by [`PumpCard::set_travel`]).
+/// What the pad shows of the pump, folded from the bus by [`PumpCard::hear`] (the travel and position from a
+/// `PumpEnvelope`, VUGCOMSCANJOGTRAVELWIRE SR618).
 #[derive(Debug, Clone, Default)]
 struct PadState {
     linked: bool,
@@ -238,11 +239,12 @@ struct PadState {
     squawk: Option<String>,
     declared: [Option<f64>; 3],
     read: [Option<f64>; 3],
+    position: Option<[f64; 3]>, // VUGCOMSCANJOGTRAVELWIRE (SR618): the desk's settled position, from the wire
 }
 
 /// A [`PumpCard`] as a face reads it: the link (up or not, and the pump's last state word), the travel per axis X / Y / Z
-/// in mm as declared and as read from the controller (`None`: not known to the card), the last position (`None` until
-/// VUG-COMSCAN-JOG-POSITION puts it on the wire), the last thing the pump said, and the pad's two fields.
+/// in mm as declared and as read from the controller (`None`: not known to the card), the last settled position (`None`
+/// until the desk's `PumpEnvelope` carries one, VUGCOMSCANJOGTRAVELWIRE SR618), the last thing the pump said, and the pad's two fields.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CardSnapshot {
     pub linked: bool,
@@ -259,7 +261,8 @@ impl PumpCard {
     /// Fold one pump answer into what the pad shows. A Squawk keeps its state word and its event; the link goes down on
     /// a `link lost` event, up on a `relinked on attempt` event (the state word stays `link-lost` after a relink while
     /// the link is up), else down on `idle` (nothing has started), unchanged on `link-lost`, up on any other state. A
-    /// refusal is said `refused: <why>`, a commission `commissioned <name>`. Requests are not answers: ignored.
+    /// refusal is said `refused: <why>`, a commission `commissioned <name>`; a `PumpEnvelope` sets the travel and the
+    /// position (VUGCOMSCANJOGTRAVELWIRE SR618: through [`PumpCard::set_travel`]). Requests are not answers: ignored.
     pub fn hear(&mut self, ev: &bandy::PumpEvent) {
         match ev {
             bandy::PumpEvent::Squawk { state, event, .. } => {
@@ -282,12 +285,16 @@ impl PumpCard {
             }
             bandy::PumpEvent::PumpRefused { why } => self.pad.squawk = Some(format!("refused: {why}")),
             bandy::PumpEvent::Commissioned { name, .. } => self.pad.squawk = Some(format!("commissioned {name}")),
+            bandy::PumpEvent::PumpEnvelope { declared, read, position } => {
+                self.set_travel(*declared, *read); // VUGCOMSCANJOGTRAVELWIRE (SR618): the fold's one call
+                self.pad.position = *position;
+            }
             _ => {}
         }
     }
 
-    /// Set the travel the pad shows, X / Y / Z in mm: the declared machine's and the controller's read (the desk holds
-    /// both; the bus does not carry them, VUG-COMSCAN-JOG-TRAVEL-WIRE owed).
+    /// Set the travel the pad shows, X / Y / Z in mm: the declared machine's and the controller's read. The fold's one
+    /// call: [`PumpCard::hear`] sets them from the desk's `PumpEnvelope` (VUGCOMSCANJOGTRAVELWIRE SR618).
     pub fn set_travel(&mut self, declared: [Option<f64>; 3], read: [Option<f64>; 3]) {
         self.pad.declared = declared;
         self.pad.read = read;
@@ -300,7 +307,7 @@ impl PumpCard {
             state: self.pad.state.clone(),
             declared: self.pad.declared,
             read: self.pad.read,
-            position: None,
+            position: self.pad.position, // VUGCOMSCANJOGTRAVELWIRE (SR618): from the wire
             squawk: self.pad.squawk.clone(),
             step: self.step,
             feed: self.feed,

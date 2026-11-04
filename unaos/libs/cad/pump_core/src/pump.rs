@@ -139,7 +139,7 @@ pub struct Pump {
     status_every_us: u64,
     timeout_us: u64,
     /// VUGCOMSCANRECONNECT (SR521): the `Program::digest` streamed (0 for a pump made from text).
-    digest: u64,
+    digest: u64, status_asked: bool, // VUGCOMSCANMARLINPOSITION (SR620): status_asked: a Marlin `M114` is out and its `ok` not yet read ([`Pump::status`])
 }
 
 fn is_grbl(d: Dialect) -> bool {
@@ -205,7 +205,7 @@ impl Pump {
             last: None,
             status_every_us: STATUS_EVERY_US,
             timeout_us: TIMEOUT_US,
-            digest: 0,
+            digest: 0, status_asked: false, // VUGCOMSCANMARLINPOSITION (SR620)
         })
     }
 
@@ -306,9 +306,10 @@ impl Pump {
         self.rt(t, Realtime::CycleStart)
     }
 
-    /// grbl `?`: one status report, answered as [`Event::Status`].
+    /// grbl `?`: one status report, answered as [`Event::Status`]. VUGCOMSCANMARLINPOSITION (SR620): Marlin `M114`, a line answered by
+    /// the position and `ok`, read into the same [`Event::Status`] (`Pump::marlin_status`); LinuxCNC is refused by name.
     pub fn status(&mut self, t: &mut dyn Transport) -> Result<(), PumpRefusal> {
-        self.grbl_only("status query")?;
+        if self.dialect == Dialect::Marlin { return self.marlin_status(t); } self.grbl_only("status query")?; // VUGCOMSCANMARLINPOSITION (SR620): Marlin asks M114 as a line
         self.rt(t, Realtime::StatusQuery)
     }
 
@@ -417,7 +418,7 @@ impl Pump {
             } else {
                 ev.push(Event::Message(String::from(s)));
             }
-        } else if s.starts_with("ok") {
+        } else if self.marlin_status_line(s, ev) {} else if s.starts_with("ok") { // VUGCOMSCANMARLINPOSITION (SR620): the M114 position line and its own `ok` first
             match self.pop() {
                 Some(line) => {
                     self.acked += 1;
@@ -629,7 +630,7 @@ impl Pump {
         self.tx.clear();
         self.rt_pending.clear();
         self.outstanding.clear();
-        self.rx.clear();
+        self.rx.clear(); self.status_asked = false; // VUGCOMSCANMARLINPOSITION (SR620): a lost link answers no M114
     }
 
     /// Resume after a loss: refused by name while lost (no byte); a re-armed pump starts streaming (no `~` byte).
@@ -875,9 +876,78 @@ fn marlin_xyz(seg: &str) -> [Option<f64>; 3] {
             Some('Z') => 2,
             _ => continue,
         };
-        if let Some(v) = c.as_str().parse::<f64>().ok().filter(|v| v.is_finite()) {
+        if let Some(v) = c.as_str().strip_prefix(':').unwrap_or(c.as_str()).parse::<f64>().ok().filter(|v| v.is_finite()) { // VUGCOMSCANMARLINPOSITION (SR620): + M114's `X:<n>`
             out[i] = Some(v);
         }
     }
     out
+}
+
+// --- VUGCOMSCANMARLINPOSITION (LEDGER SR620): Marlin's M114 as the status road (named tail hunk) ---
+
+/// The position in one Marlin `M114` answer line (`report_current_position`: `X:0.00 Y:0.00 Z:0.00 E:0.00 Count X:0 Y:0 Z:0`):
+/// the FIRST triple, the logical position (where the last planned move ends; after a jog's `ok`s, the jog's end), read
+/// through the one word reader [`marlin_xyz`]; the `Count` stepper triple after it is not read. `None`: not a position
+/// line, or X / Y / Z not each a finite number.
+pub fn marlin_position(s: &str) -> Option<[f64; 3]> {
+    if !s.starts_with("X:") {
+        return None;
+    }
+    let logical = s.split(" Count").next().unwrap_or(s);
+    let [Some(x), Some(y), Some(z)] = marlin_xyz(logical) else { return None };
+    Some([x, y, z])
+}
+
+impl Pump {
+    /// Marlin's status query: `M114` (no realtime byte: a line, answered by the position line and `ok`), written at once on
+    /// the realtime road. Refused by name while a line of a job is live or unanswered (its `ok` would answer the job's
+    /// line) and while halted by an alarm (a halted Marlin answers nothing until `M999`, whose `ok` an M114 left out would
+    /// take); at most one out at a time (a second ask while one is out writes nothing).
+    fn marlin_status(&mut self, t: &mut dyn Transport) -> Result<(), PumpRefusal> {
+        let halted = matches!(self.state, PumpState::Halted(Halt::Alarm { .. }));
+        if halted || matches!(self.state, PumpState::Streaming | PumpState::Stopping) || !self.outstanding.is_empty() {
+            return Err(PumpRefusal::NotInDialect { dialect: self.dialect, what: "status query while a line is unanswered" });
+        }
+        if self.status_asked {
+            return Ok(());
+        }
+        self.status_asked = true;
+        self.rt_pending.extend_from_slice(b"M114\n");
+        self.flush_rt(t)
+    }
+
+    /// One Marlin line read for the M114 road, ahead of `classify`'s `ok` arm: a position line ([`marlin_position`])
+    /// is [`Event::Status`] (`Idle` with no line of a job live or unanswered, Marlin's idle having no word of its own; else
+    /// `Run`), the position as `mpos`; an `ok` while an `M114` is out is that M114's own and is swallowed (it never reaches a
+    /// job's line or the caller's home / jog lines). `start` (the buffer is gone) and a halt forget the M114 and go on to
+    /// their own roads. `true`: the line was taken here.
+    fn marlin_status_line(&mut self, s: &str, ev: &mut Vec<Event>) -> bool {
+        if let Some(at) = marlin_position(s) {
+            let live = matches!(self.state, PumpState::Streaming | PumpState::Stopping) || !self.outstanding.is_empty();
+            let r = StatusReport {
+                state: if live { State::Run } else { State::Idle },
+                mpos: Some(at),
+                wpos: None,
+                wco: None,
+                buf: None,
+                line: None,
+                feed: None,
+                spindle: None,
+                ov: None,
+                pins: String::new(),
+                accessories: String::new(),
+            };
+            self.last = Some(r.clone());
+            ev.push(Event::Status(r));
+            return true;
+        }
+        if s.starts_with("ok") && self.status_asked {
+            self.status_asked = false;
+            return true;
+        }
+        if s == "start" || marlin_halted(s) {
+            self.status_asked = false;
+        }
+        false
+    }
 }

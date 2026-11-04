@@ -244,6 +244,8 @@ pub struct PumpDesk {
     declared: Option<Declared>,
     /// VUGCOMSCANJOGPOSITION (SR612): the controller's last settled (Idle) machine position, polled outside a job, the poll's time and the once-per-link fallback word ([`Position`]).
     pos: Position,
+    /// VUGCOMSCANJOGTRAVELWIRE (SR618): the travel and position last posted as a `PumpEnvelope` ([`PumpDesk::envelope_due`]); `None`: nothing posted since the last start.
+    told: Option<Told>,
 }
 
 fn refused(why: impl Into<String>) -> Vec<PumpEvent> {
@@ -253,7 +255,7 @@ fn refused(why: impl Into<String>) -> Vec<PumpEvent> {
 impl PumpDesk {
     /// A desk for `machine`: every pass it arms must name this machine's identity (VUG-HELM-BIND-MACHINE).
     pub fn new(machine: Machine) -> PumpDesk {
-        PumpDesk { machine, armed: Vec::new(), running: None, identify: None, hello: None, envelope: true, read: None, declared: None, pos: Position::default() } // VUGCOMSCANMACHINEDECLARE (SR613): + declared
+        PumpDesk { machine, armed: Vec::new(), running: None, identify: None, hello: None, envelope: true, read: None, declared: None, pos: Position::default(), told: None } // VUGCOMSCANMACHINEDECLARE (SR613): + declared; VUGCOMSCANJOGTRAVELWIRE (SR618): + told
     }
 
     /// The machine this desk drives.
@@ -346,7 +348,7 @@ impl PumpDesk {
             }
             PumpEvent::PumpHome { .. } | PumpEvent::PumpJog { .. } => self.motion(ev), // VUGCOMSCANJOG (SR573)
             PumpEvent::PumpDeclare { .. } => self.declare(ev), // VUGCOMSCANMACHINEDECLARE (SR613)
-            PumpEvent::Squawk { .. } | PumpEvent::PumpRefused { .. } | PumpEvent::Commissioned { .. } => Vec::new(),
+            PumpEvent::Squawk { .. } | PumpEvent::PumpRefused { .. } | PumpEvent::Commissioned { .. } | PumpEvent::PumpEnvelope { .. } => Vec::new(), // VUGCOMSCANJOGTRAVELWIRE (SR618): + PumpEnvelope, an answer
         }
     }
 
@@ -356,9 +358,9 @@ impl PumpDesk {
             Some(Running { pump, link: Some(link), .. }) => pump.tick(&mut **link, now_us),
             _ => return Vec::new(),
         };
-        self.position_seen(&evs, now_us); // VUGCOMSCANJOGPOSITION (SR612): the reports' settled position; the idle `?` on a quiet tick too
+        self.position_seen(&evs, now_us); let told = self.envelope_due(); // VUGCOMSCANJOGPOSITION (SR612): the reports' settled position; the idle `?` on a quiet tick too; VUGCOMSCANJOGTRAVELWIRE (SR618): the travel and position typed, once per change
         if evs.is_empty() {
-            return Vec::new();
+            return told.into_iter().collect(); // VUGCOMSCANJOGTRAVELWIRE (SR618): a quiet tick still says a change
         }
         let (evs, moved) = self.motion_replies(evs); // VUGCOMSCANJOG (SR573): the home / jog answers by name
         let moved: Vec<String> = moved.into_iter().chain(self.unlock_after_banner(&evs)).collect(); // VUGCOMSCANALARMRESET (SR585): the unlock after the reset's banner
@@ -369,9 +371,9 @@ impl PumpDesk {
             evs.iter().filter_map(event_word).map(|w| if w == "link lost" { self.lost_word() } else { w }).collect();
         let named: Vec<String> = moved.into_iter().chain(named).collect(); // VUGCOMSCANJOG (SR573)
         if named.is_empty() {
-            return vec![self.squawk(None)];
+            return told.into_iter().chain(std::iter::once(self.squawk(None))).collect(); // VUGCOMSCANJOGTRAVELWIRE (SR618): the typed event first, the Squawk last
         }
-        named.into_iter().map(|w| self.squawk(Some(w))).collect()
+        told.into_iter().chain(named.into_iter().map(|w| self.squawk(Some(w)))).collect() // VUGCOMSCANJOGTRAVELWIRE (SR618): the typed event first, the Squawks last
     }
 }
 
@@ -385,14 +387,14 @@ pub async fn serve_pump(
     mut open: Box<Opener>,
     every: Duration,
 ) {
-    hello_on(&desk); // VUGCOMSCANHELLOON (SR549): the bus turns the hello on (an explicit hello_within kept)
+    hello_on(&desk); machine_from_prefs(&synapse, &desk).await; // VUGCOMSCANHELLOON (SR549): the bus turns the hello on (an explicit hello_within kept); VUGCOMSCANMACHINEDECLAREPREFS (SR619): the declared machine read once from Principia's store
     let t0 = tokio::time::Instant::now();
     let mut iv = tokio::time::interval(every);
     loop {
         tokio::select! {
             m = rx.recv() => match m {
                 Ok(SMessage::Pump(ev)) if ev.is_request() => {
-                    let out = request(&desk, &ev, &mut open).await; // VUGCOMSCANHELLOON (SR549): PumpStart's open with the lock released; VUGCOMSCANHOSTDIALECT (SR566): off the worker
+                    let out = request(&desk, &ev, &mut open).await; declare_kept(&synapse, &desk, &ev, &out); // VUGCOMSCANMACHINEDECLAREPREFS (SR619): an accepted declare written to Principia's store; VUGCOMSCANHELLOON (SR549): PumpStart's open with the lock released; VUGCOMSCANHOSTDIALECT (SR566): off the worker
                     for o in out {
                         synapse.fire(SMessage::Pump(o));
                     }
@@ -842,7 +844,7 @@ impl PumpDesk {
             out.push(self.squawk(Some(format!("hello {h}")))); // printed once, at the first open (VUGCOMSCANJOG SR573: as the controller first said it)
         }
         self.read = env; // VUGCOMSCANENVELOPEBOUND (SR602): kept for the jog's bound (a hello-off start keeps None)
-        self.pos = Position::default(); // VUGCOMSCANJOGPOSITION (SR612): a new link knows no position yet
+        self.pos = Position::default(); self.told = None; // VUGCOMSCANJOGPOSITION (SR612): a new link knows no position yet; VUGCOMSCANJOGTRAVELWIRE (SR618): each start says its travel again on its first tick
         for w in self.envelope_words(env) {
             out.push(self.squawk(Some(w))); // VUGCOMSCANALARMIDLE (SR591): a travel that differs from the declared machine, said once
         }
@@ -1204,7 +1206,7 @@ impl PumpDesk {
             r.motion.push_back(Motion { word, last: k + 1 == lines.len(), failed: false });
         }
         r.jogged = word == "jog"; // VUGCOMSCANJOGFACE (SR579): set on a jog, cleared on a home
-        let first = self.position_moved(word == "jog", matches!(d, Dialect::Grbl { .. })); // VUGCOMSCANJOGPOSITION (SR612): the fallback word once per link; the axis moves, so the position is asked again
+        let first = self.position_moved(word == "jog", matches!(d, Dialect::Grbl { .. } | Dialect::Marlin)); // VUGCOMSCANJOGPOSITION (SR612): the fallback word once per link; the axis moves, so the position is asked again; VUGCOMSCANMARLINPOSITION (SR620): + Marlin (M114)
         first.into_iter().chain(std::iter::once(format!("{word} sent: {}", lines.join(" / ")))).map(|w| self.squawk(Some(w))).collect()
     }
 
@@ -1492,6 +1494,9 @@ fn bound(m: &Machine, read: Option<Envelope>, id: make_core::AxisId, i: usize) -
 struct Declared {
     name: String,
     dialect: Option<Dialect>,
+    /// VUGCOMSCANMACHINEDECLAREPREFS (SR619): the declare's own text `<name> x=.. y=.. z=..[ dialect=..]` (the said word's
+    /// tail), the value kept in Principia's `comscan.machine` and parsed back through [`declare_request`].
+    record: String,
 }
 
 /// `base` with its X / Y / Z travel declared (mm): an axis `base` has keeps its `min` and its feed / acceleration / rapid
@@ -1521,7 +1526,9 @@ impl PumpDesk {
     /// jog's bound, no relink; the controller's kept `read` still the tighter, SR602), the armings are dropped (their
     /// passes named the machine before, SR498) and said when there were any, and the declare is said back
     /// `machine declared <name> x=<x> y=<y> z=<z>[ dialect=<d>]`, then a kept read that differs, through [`PumpDesk::envelope_words`].
-    /// Per session: nothing keeps it past the pump (owed VUG-COMSCAN-MACHINE-DECLARE-PREFS).
+    /// VUGCOMSCANMACHINEDECLAREPREFS (SR619): kept past the pump in Principia's `comscan.machine` ([`declare_kept`]) and
+    /// read back once at [`serve_pump`]'s start ([`machine_from_prefs`]); a name holding `=` is refused (it would not parse
+    /// back through [`declare_request`]).
     fn declare(&mut self, ev: &PumpEvent) -> Vec<PumpEvent> {
         let PumpEvent::PumpDeclare { name, x, y, z, dialect, .. } = ev else { return Vec::new() };
         if self.busy() {
@@ -1529,6 +1536,9 @@ impl PumpDesk {
         }
         if name.is_empty() || name.chars().any(char::is_whitespace) {
             return refused(format!("declare: the machine name {name:?} is empty or holds a space"));
+        }
+        if name.contains('=') {
+            return refused(format!("declare: the machine name {name:?} holds '=' (it would not parse back)")); // VUGCOMSCANMACHINEDECLAREPREFS (SR619)
         }
         let travel = [*x, *y, *z];
         for (c, v) in ['x', 'y', 'z'].into_iter().zip(travel) {
@@ -1546,15 +1556,16 @@ impl PumpDesk {
         self.machine = declared_machine(&self.machine, travel);
         let dropped = self.armed.len();
         self.armed.clear();
-        self.declared = Some(Declared { name: name.clone(), dialect });
-        let mut word = format!("machine declared {name}");
+        let mut record = name.clone(); // VUGCOMSCANMACHINEDECLAREPREFS (SR619): the record first; the word is `machine declared <record>`
         for (c, v) in ['x', 'y', 'z'].into_iter().zip(travel) {
-            word.push_str(&format!(" {c}="));
-            make_core::gcode::num(&mut word, v);
+            record.push_str(&format!(" {c}="));
+            make_core::gcode::num(&mut record, v);
         }
         if let Some(d) = dialect {
-            word.push_str(&format!(" dialect={}", dialect_word(d)));
+            record.push_str(&format!(" dialect={}", dialect_word(d)));
         }
+        let word = format!("machine declared {record}");
+        self.declared = Some(Declared { name: name.clone(), dialect, record });
         let mut out = vec![self.squawk(Some(word))];
         if dropped > 0 {
             out.push(self.squawk(Some(format!("armed dropped: {dropped} (passed for the machine before)"))));
@@ -1653,13 +1664,17 @@ fn idle_mpos(r: &StatusReport) -> Option<[f64; 3]> {
 impl PumpDesk {
     /// [`PumpDesk::tick`]'s events and turn: a status report sets the settled position ([`idle_mpos`]: a moving or
     /// alarmed report forgets it), an alarm or reset forgets it, a lost link forgets it all (the fallback word is said
-    /// again on the next link); then on a grbl link that is up with no job live (a live job's pump polls itself) and no
-    /// settled position, `?` through the one writer ([`pump_core::Pump::status`]) at most every
-    /// `pump_core::pump::STATUS_EVERY_US`. A dead link is the next tick's `LinkLost`.
+    /// again on the next link); then on a link that is up with no job live (a live job's pump polls itself) and no
+    /// settled position, the dialect's ask through the one writer ([`pump_core::Pump::status`]: grbl `?`, Marlin `M114`)
+    /// at most every `pump_core::pump::STATUS_EVERY_US`. A dead link is the next tick's `LinkLost`.
+    /// VUGCOMSCANMARLINPOSITION (SR620): Marlin's idle has no word: no job live and every home / jog line answered (the
+    /// last line was `ok`), so Marlin is asked only with `motion` empty, and a Marlin report read while a home / jog line
+    /// is pending predates the move and settles nothing.
     fn position_seen(&mut self, evs: &[Event], now_us: u64) {
+        let settled = self.running.as_ref().is_none_or(|r| r.motion.is_empty() || matches!(r.pump.dialect(), Dialect::Grbl { .. })); // VUGCOMSCANMARLINPOSITION (SR620)
         for e in evs {
             match e {
-                Event::Status(r) => self.pos.at = idle_mpos(r),
+                Event::Status(r) => self.pos.at = idle_mpos(r).filter(|_| settled), // VUGCOMSCANMARLINPOSITION (SR620): + the Marlin idle rule
                 Event::Alarm { .. } | Event::Reset => self.pos.at = None,
                 Event::LinkLost => self.pos = Position::default(),
                 _ => {}
@@ -1669,7 +1684,7 @@ impl PumpDesk {
             return;
         }
         let Some(r) = self.running.as_mut() else { return };
-        if matches!(r.pump.state(), PumpState::Streaming | PumpState::Stopping) || !matches!(r.pump.dialect(), Dialect::Grbl { .. }) {
+        if matches!(r.pump.state(), PumpState::Streaming | PumpState::Stopping) || (!matches!(r.pump.dialect(), Dialect::Grbl { .. }) && !r.motion.is_empty()) { // VUGCOMSCANMARLINPOSITION (SR620): Marlin asks M114 with every home / jog line answered
             return;
         }
         let Some(link) = r.link.as_mut() else { return };
@@ -1677,10 +1692,11 @@ impl PumpDesk {
         let _ = r.pump.status(&mut **link);
     }
 
-    /// A home or jog was sent: the fallback word when it is a grbl jog bounded by its distance (no settled position)
-    /// and not yet said on this link; the axis moves, so the position is forgotten and asked again at the next tick.
-    fn position_moved(&mut self, jog: bool, grbl: bool) -> Option<String> {
-        let word = (jog && grbl && self.pos.at.is_none() && !self.pos.said).then(|| "jog bound=distance: no position report yet".to_string());
+    /// A home or jog was sent: the fallback word when it is a jog on a polled dialect (grbl; VUGCOMSCANMARLINPOSITION
+    /// SR620: and Marlin) bounded by its distance (no settled position) and not yet said on this link; the axis moves, so
+    /// the position is forgotten and asked again at the next tick.
+    fn position_moved(&mut self, jog: bool, polled: bool) -> Option<String> {
+        let word = (jog && polled && self.pos.at.is_none() && !self.pos.said).then(|| "jog bound=distance: no position report yet".to_string());
         self.pos.said |= word.is_some();
         self.pos.at = None;
         self.pos.asked_us = None;
@@ -1692,6 +1708,105 @@ impl PumpDesk {
     pub fn position(&self) -> Option<[f64; 3]> {
         self.pos.at
     }
+}
+
+// --- VUGCOMSCANJOGTRAVELWIRE (LEDGER SR618): the desk's travel and position typed on the bus for a face (named tail hunk) ---
+
+/// What a `PumpEnvelope` carries (one field, [`PumpDesk`]'s `told`, under the desk lock): the declared machine's
+/// travel per axis X / Y / Z (mm), the controller's read travel (`None` per axis: not read) and the settled position.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Told {
+    declared: Envelope,
+    read: Envelope,
+    position: Option<[f64; 3]>,
+}
+
+impl PumpDesk {
+    /// [`PumpDesk::tick`]'s typed travel: the declared travel through the one [`axis_travel`], the kept `read` and the
+    /// settled `pos.at`; the [`PumpEvent::PumpEnvelope`] only when that differs from the last one posted (`told`; a
+    /// start clears it), so the event follows a start, an accepted relink, a declare on a linked desk and every settled
+    /// or forgotten position by one tick. The Squawk words are unchanged: [`PumpDesk::envelope_words`] stays the sayer.
+    fn envelope_due(&mut self) -> Option<PumpEvent> {
+        use make_core::AxisId;
+        let now = Told {
+            declared: [AxisId::X, AxisId::Y, AxisId::Z].map(|id| axis_travel(&self.machine, id)),
+            read: self.read.unwrap_or([None; 3]),
+            position: self.pos.at,
+        };
+        if self.told == Some(now) {
+            return None;
+        }
+        self.told = Some(now);
+        Some(PumpEvent::PumpEnvelope { declared: now.declared, read: now.read, position: now.position })
+    }
+}
+
+// --- VUGCOMSCANMACHINEDECLAREPREFS (LEDGER SR619): the declared machine kept in Principia's store across a pump restart (named tail hunk) ---
+
+/// How long [`serve_pump`]'s start waits for Principia's answer to the one `comscan.machine` PrefGet; no answer in time
+/// (no Principia on the bus) is silence: the desk stays undeclared, as before SR619.
+pub const PREFS_WAIT: Duration = Duration::from_millis(250);
+
+impl PumpDesk {
+    /// The declared machine's record, the declare's own text `<name> x=.. y=.. z=..[ dialect=..]` (`None`: nothing
+    /// declared): the value [`declare_kept`] writes to Principia's `comscan.machine`.
+    pub fn declared_record(&self) -> Option<&str> {
+        self.declared.as_ref().map(|d| d.record.as_str())
+    }
+
+    /// The machine Principia's store kept (`record`, the declare's own text) declared again through the ONE parser
+    /// ([`declare_request`]) and the ONE validator ([`PumpDesk::declare`]); the first word or the refusal is said with
+    /// ` (from prefs)`. Nothing is written back.
+    pub fn declare_from_prefs(&mut self, record: &str) -> Vec<PumpEvent> {
+        let ev = match declare_request(&format!("machine declare {record}"), bandy::Origin::System("principia".to_string())) {
+            Ok(ev) => ev,
+            Err(why) => return refused(format!("{why} (from prefs)")),
+        };
+        let mut out = self.declare(&ev);
+        if let Some(PumpEvent::Squawk { event: Some(w), .. } | PumpEvent::PumpRefused { why: w }) = out.first_mut() {
+            w.push_str(" (from prefs)");
+        }
+        out
+    }
+}
+
+/// [`serve_pump`]'s start: ask Principia ONCE for `comscan.machine` on its own subscriber (so the loop's receiver keeps
+/// every bus request, served after this read), wait at most [`PREFS_WAIT`] for the answer, and declare a kept record
+/// ([`PumpDesk::declare_from_prefs`]), its words on the bus. Unset, not a string or unanswered: silent, undeclared.
+/// Never re-read after (PrefChanged is not heard).
+async fn machine_from_prefs(synapse: &Synapse, desk: &Arc<Mutex<PumpDesk>>) {
+    let mut rx = synapse.subscribe();
+    synapse.fire(SMessage::Principia(bandy::PrincipiaCommand::PrefGet { ns: "comscan".to_string(), key: "machine".to_string() }));
+    let answer = tokio::time::timeout(PREFS_WAIT, async {
+        loop {
+            match rx.recv().await {
+                Ok(SMessage::Principia(bandy::PrincipiaCommand::PrefValueIs { ns, key, value })) if ns == "comscan" && key == "machine" => {
+                    return value;
+                }
+                Ok(_) | Err(RecvError::Lagged(_)) => continue,
+                Err(RecvError::Closed) => return None,
+            }
+        }
+    })
+    .await;
+    let Ok(Some(bandy::PrefValue::Str(record))) = answer else { return };
+    let out = match desk.lock() {
+        Ok(mut d) => d.declare_from_prefs(&record),
+        Err(_) => return,
+    };
+    for o in out {
+        synapse.fire(SMessage::Pump(o));
+    }
+}
+
+/// [`serve_pump`]'s request arm: a PumpDeclare the desk accepted (no PumpRefused in its answers) is written to
+/// Principia's store as `comscan.machine` = the declared record, so the next pump start reads it back.
+fn declare_kept(synapse: &Synapse, desk: &Mutex<PumpDesk>, ev: &PumpEvent, out: &[PumpEvent]) {
+    if !matches!(ev, PumpEvent::PumpDeclare { .. }) || out.iter().any(|o| matches!(o, PumpEvent::PumpRefused { .. })) {
+        return;
+    }
+    let Some(record) = desk.lock().ok().and_then(|d| d.declared_record().map(str::to_string)) else { return };
+    synapse.fire(SMessage::Principia(bandy::PrincipiaCommand::PrefSet { ns: "comscan".to_string(), key: "machine".to_string(), value: bandy::PrefValue::Str(record) }));
 }
 
 #[cfg(test)]

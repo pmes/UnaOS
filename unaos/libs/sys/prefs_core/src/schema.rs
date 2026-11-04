@@ -158,6 +158,13 @@ pub static SCHEMA: &[Key] = &[
         writers: OP, reader: "quartzite GTK tab strip (`tab_strip::stored_layout`, at build and on change), aether `chrome::sidetabs::TabLayout`",
         doc: "Where the browser's tabs are drawn: the horizontal strip across the top (`top`) or the vertical side strip on the left (`side`, collapsible to an icon rail; for many tabs) (AETHERSIDETABS, SR140, R118).",
     },
+    // ── comscan — the IO bridge's pump desk (VUGCOMSCANMACHINEDECLAREPREFS SR619; read once at serve_pump's start) ──
+    Key {
+        ns: "comscan", key: "machine", kind: Kind::Str { max_len: 256, printable: false },
+        default: Default::Consumer("undeclared: the desk's machine at new"),
+        writers: OP, reader: "comscan serve_pump (`handlers/comscan/src/pump.rs` machine_from_prefs, once at start)",
+        doc: "The machine declared behind the pump desk's ports, as the declare's own text `<name> x=<mm> y=<mm> z=<mm>[ dialect=<d>]` (`comscan::pump::declare_request` parses it back; a name holding `=` or whitespace is refused at the declare); written by the desk on an accepted PumpDeclare (VUGCOMSCANMACHINEDECLAREPREFS, SR619).",
+    },
     // ── system — the kernel's namespace (kernel `src/prefs.rs` `mod key`; PREFS B300) ─────────────────
     // ── AETHERA11Y (SR119): the user's accessibility preferences — the web's `prefers-*` / `forced-colors` media
     //    features (css_core `media::set_user_preferences`), recorded by aether `a11y::prefs::A11yPrefs::from_prefs` ──

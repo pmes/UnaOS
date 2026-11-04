@@ -8349,7 +8349,7 @@ pub fn spawn_user_image_bg_argv(bytes: &[u8], argv: &[&str]) -> Result<(u64, u64
             });
         }
     };
-    let asid = mapped.ttbr0 >> 48; spawn_path_bind(asid, bytes, pipe, ring3); super::xwin::args_write(mapped.slot, argv); #[cfg(feature = "desktop_firmware")] crate::video::wm::spawn_focus_arm(asid); #[cfg(all(feature = "busreg", feature = "aarch64_el0"))] crate::bus_route::arm_early(asid as usize, early, ring3); #[cfg(not(all(feature = "busreg", feature = "aarch64_el0")))] let _ = early; /* BUSREG-ARM-EARLY (B1164) + BUSREG-ARM-EARLY-RING3 (B1172): the early path the CALLER chose (a kernel road its own argv[0], SYS_SPAWN_PATH its kernel-opened path, never ring-3 argv) armed for the bus check before the task can run; `ring3` is the road label only (bus_route tail) */ // FOCUSARM64 (SR180): every launch through this funnel arms its first window's focus token before the task can run, x86 `spawn_user_image_bg_inner`'s twin (aarch64 has no desktop-app exemption to make; LINE-NEUTRAL fold). ARMPIPE (A108): the pipe bound and the principal ruled BEFORE the task can run (fn at the FILE TAIL). RING3ABI2 M2
+    let asid = mapped.ttbr0 >> 48; spawn_path_bind(asid, bytes, pipe, ring3); super::xwin::args_write(mapped.slot, argv); #[cfg(feature = "desktop_firmware")] crate::video::wm::spawn_focus_arm(asid); crate::video::wm::app_mint_note(crate::video::wm::owner_of_launch(asid), Some(slot_gen(asid as usize))); /* ARMLATE-KNOBOFF (B1184): every mint, every build, notes the row's generation for the late arm's stamp (file tail) */ #[cfg(all(feature = "busreg", feature = "aarch64_el0"))] crate::bus_route::arm_early(asid as usize, early, ring3); #[cfg(not(all(feature = "busreg", feature = "aarch64_el0")))] let _ = early; /* BUSREG-ARM-EARLY (B1164) + BUSREG-ARM-EARLY-RING3 (B1172): the early path the CALLER chose (a kernel road its own argv[0], SYS_SPAWN_PATH its kernel-opened path, never ring-3 argv) armed for the bus check before the task can run; `ring3` is the road label only (bus_route tail) */ // FOCUSARM64 (SR180): every launch through this funnel arms its first window's focus token before the task can run, x86 `spawn_user_image_bg_inner`'s twin (aarch64 has no desktop-app exemption to make; LINE-NEUTRAL fold). ARMPIPE (A108): the pipe bound and the principal ruled BEFORE the task can run (fn at the FILE TAIL). RING3ABI2 M2
     // VUG-BG: mark the address space DETACHED before the task can be dispatched, so the program observes
     // the bit on its very first info-page read rather than racing the launcher. See `set_detached`.
     set_detached(asid, true);
@@ -25728,7 +25728,7 @@ fn busreg_has_room(row: usize) -> bool {
 }
 #[cfg(feature = "busreg")]
 fn busreg_gen(row: usize) -> u64 {
-    if row < ASID_GEN.len() { ASID_GEN[row].load(Ordering::Acquire) } else { u64::MAX }
+    slot_gen(row) // ARMLATE-KNOBOFF (B1184): the ONE generation read, unconditional (file tail)
 }
 #[cfg(feature = "busreg")]
 static BUSREG_OPS: crate::bus_route::Ops = crate::bus_route::Ops { push: busreg_push, has_room: busreg_has_room, rgen: busreg_gen };
@@ -27845,4 +27845,15 @@ pub fn end_bus_row(row: usize, rgen: u64) -> Option<(u64, usize, &'static str, b
         return Some((pid, windows, settle, gone));
     }
     None
+}
+
+// =================================================================================================
+// ARMLATE-KNOBOFF (rmbp-ledger B1184) — TAIL-APPENDED, every build. The row's generation (`ASID_GEN`, bumped at the
+// top of `clear_handle_row`) read by ONE fn: `busreg_gen` (the bus router's `Ops::rgen`) calls it, and wm's late-arm
+// stamp check (`wm::armlate_now`) and the spawn body's mint note (`wm::app_mint_note`, `spawn_user_image_bg_piped`)
+// read it in every build, so a stale late name never titles a recycled owner knob-off either. An atomic load; no lock.
+// =================================================================================================
+/// ARMLATE-KNOBOFF — `row`'s current generation (`u64::MAX` for a row outside the table, which no stamp equals).
+pub fn slot_gen(row: usize) -> u64 {
+    if row < ASID_GEN.len() { ASID_GEN[row].load(Ordering::Acquire) } else { u64::MAX }
 }

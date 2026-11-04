@@ -518,7 +518,7 @@ pub fn selftest(fx: &Fixture) {
     } else {
         serial_println!(":: BANDY3: registered={} relayed={} replied={} orphan={} w={:#05x}/{:#05x} verbs={}/{} -> FAIL ::", rg, rl, rp, or, w, ALL, vg, vl);
     }
-    tagid_selftest(fx); armearly_selftest(fx); unreadset_selftest(fx); /* RELAY-RESET-SET (B1169): the unread-mark legs (file tail). BUSREG-ARM-EARLY (B1164): the early-arm legs, after the BUSREG-TAGID line (file tail) */ armforget_selftest(fx); /* ARMFORGET-CHAIN (B1171): the teardown-forget legs (file tail) */ // BUSREG-TAG-IDENTITY (B1157): the identity legs, after the BANDY3 line
+    tagid_selftest(fx); armearly_selftest(fx); unreadset_selftest(fx); /* RELAY-RESET-SET (B1169): the unread-mark legs (file tail). BUSREG-ARM-EARLY (B1164): the early-arm legs, after the BUSREG-TAGID line (file tail) */ armforget_selftest(fx); /* ARMFORGET-CHAIN (B1171): the teardown-forget legs (file tail) */ crate::prefs_client::queued_selftest(); /* RELAY-QUEUED-SET (B1175): the queued-set legs (prefs_client.rs tail) */ armlate_selftest(fx); /* ARMFORGET-LATEARM (B1178): the late-arm stamp legs (file tail) */ // BUSREG-TAG-IDENTITY (B1157): the identity legs, after the BANDY3 line
 }
 
 /// HOLOCRON2 (rmbp-ledger B355): does `verb` have a registration right now? (Generation not checked: a row
@@ -738,23 +738,23 @@ fn tagid_selftest(fx: &Fixture) {
     if admitted && sent && enoent && unseen && lookup(fx.ops, get).is_none() {
         w |= 1 << 4;
     }
-    on_exit(fx.ops, f);
+    w |= appsfolder_legs(fx, f, owner_f) << 5; on_exit(fx.ops, f); // APPS-FOLDER-NS-LEG (B1183): L6/L7, the folder form admitted and the other folder refused (file tail)
     (fx.clear)(a);
     (fx.clear)(f);
     on_exit(fx.ops, a);
     crate::video::wm::app_name_forget(owner_f);
-    const ALL: u32 = (1 << 5) - 1;
+    const ALL: u32 = (1 << 7) - 1; // APPS-FOLDER-NS-LEG (B1183): two legs more
     let (rf, dr) = (TAGID_REFUSED.load(Ordering::Relaxed), TAGID_DROPPED.load(Ordering::Relaxed));
     if w == ALL {
-        serial_println!(":: BUSREG-TAGID: probe=refused unnamed=dropped prefs=admitted path=refused spelled=dropped relayed=1 refused={} dropped={} -> PASS ::", rf, dr);
+        serial_println!(":: BUSREG-TAGID: probe=refused unnamed=dropped prefs=admitted path=refused spelled=dropped folder=admitted folderother=refused relayed=1 refused={} dropped={} -> PASS ::", rf, dr);
     } else {
         serial_println!(
-            ":: BUSREG-TAGID: probe={} unnamed={} prefs={} path={} spelled={} relayed={} refused={} dropped={} w={:#x}/{:#x} -> FAIL ::",
+            ":: BUSREG-TAGID: probe={} unnamed={} prefs={} path={} spelled={} folder={} folderother={} relayed={} refused={} dropped={} w={:#x}/{:#x} -> FAIL ::",
             if w & 1 != 0 { "refused" } else { "OPEN" },
             if w & 2 != 0 { "dropped" } else { "KEPT" },
             if w & 4 != 0 { "admitted" } else { "REFUSED" },
             if w & 8 != 0 { "refused" } else { "OPEN" },
-            if w & 16 != 0 { "dropped" } else { "KEPT" },
+            if w & 16 != 0 { "dropped" } else { "KEPT" }, if w & 32 != 0 { "admitted" } else { "REFUSED" }, if w & 64 != 0 { "refused" } else { "OPEN" }, // APPS-FOLDER-NS-LEG (B1183)
             (w >> 2) & 1, rf, dr, w, ALL
         );
     }
@@ -839,11 +839,11 @@ fn tagpath_id(row: usize, img: &str, buf: &mut [u8; crate::video::wm::MAX_TITLE]
     (!name.is_empty() && name.eq_ignore_ascii_case(crate::video::wm::program_name(img))).then_some(TagId::Unnamed)
 }
 
-/// Is the loaded `path` the image `img` (`/apps/<LEAF>`)? The directory byte-exact, the leaf any case.
+/// Is the loaded `path` the image `img` (`/apps/<LEAF>`)? The directory byte-exact, the leaf any case; APPS-FOLDER-NS (B1183): or the folder form `/apps/<name>/<LEAF>` (file tail).
 pub fn path_names(path: &str, img: &str) -> bool {
     const DIR: &str = "/apps/";
     match (path.strip_prefix(DIR), img.strip_prefix(DIR)) {
-        (Some(leaf), Some(want)) => !leaf.is_empty() && leaf.eq_ignore_ascii_case(want),
+        (Some(leaf), Some(want)) => !leaf.is_empty() && (leaf.eq_ignore_ascii_case(want) || appsfolder_names(leaf, want)), // APPS-FOLDER-NS-JUDGE (B1183): the folder form, one `/`, the folder the image's name any case (file tail)
         _ => false,
     }
 }
@@ -867,7 +867,7 @@ pub static ARMEARLY_ARMED: AtomicU32 = AtomicU32::new(0);
 /// The arch spawn body's arm: `path` is the early path the body's CALLER chose (a kernel road's argv[0], the ring-3
 /// road's kernel-opened path; `None` = nothing armed); `ring3` labels the road only. Takes only wm's leaf lock.
 pub fn arm_early(row: usize, path: Option<&str>, ring3: bool) {
-    let Some(path) = path else { return };
+    let Some(path) = path else { return }; // ARMFORGET-LATEARM (B1178) + ARMLATE-KNOBOFF (B1184): the mint note (path or none) is the arch spawn line's own `wm::app_mint_note`, just before this call, in every build
     let rg = (crate::arch::syscall::busreg_ops().rgen)(row);
     let armed = crate::video::wm::app_name_arm_early(crate::video::wm::owner_of_launch(row as u64), rg, path);
     if armed {
@@ -1196,4 +1196,130 @@ fn armforget_selftest(fx: &Fixture) {
             forgot, w, ALL
         );
     }
+}
+
+// =================================================================================================
+// ARMFORGET-LATEARM (rmbp-ledger B1178) — TAIL-APPENDED. A child that exits and is torn down before its launcher's
+// late `app_name_arm` left a name and path on a dead owner that no teardown forget (B1171) could reach, and the slot's
+// next tenant inherited it (B1163's path rule PROMOTES it). Every mint now notes the row's generation in wm
+// (`wm::app_mint_note` on the arch spawn line, every build — ARMLATE-KNOBOFF B1184 retired `armlate_mint` onto it), the late arm stamps name and path with it, and wm's
+// readers answer only at the row's CURRENT generation (`wm::app_path_with`, `app_name_of`, `mint_title`), so
+// `tag_id` judges a stale late record as absent. The fixture cannot bump a row's generation (its `clear` drains the
+// mailbox only), so the leg stands in for the bump the way E3 (B1164) does: a mint note one generation back.
+// Witness: `tests bandy3` → `:: BUSREG-ARMLATE: … -> PASS ::`.
+// =================================================================================================
+
+/// `tests bandy3`' late-arm legs, on the fixture's fulfiller row `f`: L1 `f`'s tenant minted one generation ago
+/// (torn down since) is late-armed `/apps/PREFS.ELF` -> the record is present but stale: `tag_id` Unnamed,
+/// `app_name_of` none, no path; L2 a mint at the current generation and the next arm -> `Fulfiller` (the stale stamp
+/// replaced). SKIP as `armforget_selftest` does.
+fn armlate_selftest(fx: &Fixture) {
+    let (_, f) = fx.rows;
+    let owner_f = crate::video::wm::owner_of_launch(f as u64);
+    let (get, set) = (una_abi::BUS_VERB_R3PREF_GET, una_abi::BUS_VERB_R3PREF_SET);
+    if (get..=set).any(|v| lookup(fx.ops, v).is_some()) {
+        serial_println!(":: BUSREG-ARMLATE: SKIP (a live row holds Principia's tags) ::");
+        return;
+    }
+    let rg = (fx.ops.rgen)(f);
+    let mut nb = [0u8; crate::video::wm::MAX_TITLE];
+    if crate::video::wm::app_name_armed(owner_f)
+        || crate::video::wm::app_path_with(owner_f, |_| true).is_some()
+        || crate::video::wm::app_name_early_of(owner_f, rg, &mut nb) != 0
+    {
+        serial_println!(":: BUSREG-ARMLATE: SKIP (scratch row {} carries a name) ::", f);
+        return;
+    }
+    let mut w = 0u32;
+
+    // L1: minted at the generation before the current one (the teardown's bump came first), then the late arm.
+    let prev = crate::video::wm::app_mint_note(owner_f, Some(rg.wrapping_sub(1)));
+    let _ = crate::video::wm::app_name_arm(owner_f, "/apps/PREFS.ELF");
+    let unnamed = tag_id(set, f, &mut nb) == TagId::Unnamed;
+    let stale = unnamed
+        && crate::video::wm::app_name_of(owner_f, &mut nb) == 0
+        && crate::video::wm::app_path_with(owner_f, |_| true).is_none()
+        && crate::video::wm::app_name_armed(owner_f);
+    if stale {
+        w |= 1 << 0;
+    }
+    // L2: the next tenant's mint at the current generation, then its arm -> the fulfiller again.
+    let _ = crate::video::wm::app_mint_note(owner_f, Some(rg));
+    let _ = crate::video::wm::app_name_arm(owner_f, "/apps/PREFS.ELF");
+    let rearmed = tag_id(set, f, &mut nb) == TagId::Fulfiller && crate::video::wm::app_name_of(owner_f, &mut nb) != 0;
+    if rearmed {
+        w |= 1 << 1;
+    }
+    crate::video::wm::app_name_forget(owner_f);
+    let _ = crate::video::wm::app_mint_note(owner_f, prev);
+    const ALL: u32 = (1 << 2) - 1;
+    if w == ALL {
+        serial_println!(":: BUSREG-ARMLATE: late=stale-dropped rearm=fulfiller -> PASS ::");
+    } else {
+        serial_println!(
+            ":: BUSREG-ARMLATE: late={} rearm={} w={:#x}/{:#x} -> FAIL ::",
+            if w & 1 != 0 { "stale-dropped" } else { "KEPT" },
+            if w & 2 != 0 { "fulfiller" } else { "NOT-FULFILLER" },
+            w, ALL
+        );
+    }
+}
+
+// =================================================================================================
+// APPS-FOLDER-NS (rmbp-ledger B1183) — TAIL-APPENDED. B1163's `path_names` (the ONE judge of TAG_IMAGE's holder,
+// `tagpath_id`, and of PREFSCAP's namespace owner, `prefs::prefscap_path` / `prefscap_early`) admitted only the flat
+// `/apps/<NAME>.ELF`. The house layout is moving to one folder per app (`/apps/<name>/<NAME>.ELF`, BP-storage-15; B679's
+// uninstall already removes it), so the judge now admits BOTH spellings for one name: after the byte-exact `/apps/`
+// prefix, either the leaf any case, or exactly `<dir>/<file>` — `file` the leaf any case and `dir` the image's program
+// name any case (`wm::program_name`, the ONE derivation: `PREFS.ELF` -> `PREFS`). Nothing deeper (`/apps/prefs/sub/…`),
+// no other folder (`/apps/other/PREFS.ELF`), no empty part. A folder launch arms `program_name` = the flat name, so
+// PREFSCAP's derived image `/apps/<p>.ELF` needs no change. Pure, takes no lock (it runs under wm's leaf locks).
+// Witness: `tests bandy3` → `:: BUSREG-TAGID: … folder=admitted folderother=refused … -> PASS ::`.
+// =================================================================================================
+
+/// `path_names`' folder spelling: is `leaf` (the path after `/apps/`) `<name>/<want>`, `<name>` = `want`'s program name?
+fn appsfolder_names(leaf: &str, want: &str) -> bool {
+    if want.is_empty() || want.contains('/') {
+        return false;
+    }
+    match leaf.split_once('/') {
+        Some((dir, file)) => {
+            let name = crate::video::wm::program_name(want);
+            !dir.is_empty() && !name.is_empty() && !file.contains('/') && file.eq_ignore_ascii_case(want) && dir.eq_ignore_ascii_case(name)
+        }
+        None => false,
+    }
+}
+
+/// `tagid_selftest`'s folder legs on the scratch fulfiller row `f` (wm owner `owner_f`), run after L5. Bit 0 (L6): armed
+/// `/apps/prefs/PREFS.ELF`, REGISTER 130 -> 0 and `fulfiller_row(130)` = `f`. Bit 1 (L7): armed `/apps/other/PREFS.ELF`,
+/// REGISTER 130 -> -EACCES with no holder; and the judge refuses `/apps/prefs/sub/PREFS.ELF`, admits `/apps/PREFS/prefs.elf`.
+/// Leaves `f` unregistered; the caller's cleanup forgets the name.
+fn appsfolder_legs(fx: &Fixture, f: usize, owner_f: u64) -> u32 {
+    let set = una_abi::BUS_VERB_R3PREF_SET;
+    let parse = |b: &[u8]| crate::bus::frame_parse(b).ok();
+    let mut buf = [0u8; 128];
+    let mut w = 0u32;
+    on_exit(fx.ops, f);
+    (fx.clear)(f);
+    // L6: the folder form registers and holds Principia's tag.
+    let _ = crate::video::wm::app_name_arm(owner_f, "/apps/prefs/PREFS.ELF");
+    let n = crate::bus::build_request(BUS_VERB_REGISTER, 69, &[set], &mut buf);
+    let admitted = (fx.send)(f, &buf[..n]) == 0 && matches!((fx.pop)(f).as_deref().and_then(parse), Some(h) if h.status == 0 && h.corr == 69);
+    let holder = matches!(fulfiller_row(set), Some((r, _)) if r == f);
+    if admitted && holder {
+        w |= 1 << 0;
+    }
+    on_exit(fx.ops, f);
+    (fx.clear)(f);
+    // L7: another folder holding the same leaf is refused at REGISTER; a deeper path is not the image.
+    let _ = crate::video::wm::app_name_arm(owner_f, "/apps/other/PREFS.ELF");
+    let n = crate::bus::build_request(BUS_VERB_REGISTER, 70, &[set], &mut buf);
+    let refused = (fx.send)(f, &buf[..n]) == 0 && matches!((fx.pop)(f).as_deref().and_then(parse), Some(h) if h.status == EACCES as i32 && h.corr == 70);
+    let img = "/apps/PREFS.ELF";
+    let judged = !path_names("/apps/prefs/sub/PREFS.ELF", img) && path_names("/apps/PREFS/prefs.elf", img);
+    if refused && lookup(fx.ops, set).is_none() && judged {
+        w |= 1 << 1;
+    }
+    w
 }

@@ -1938,6 +1938,16 @@ kat!(
     }),
     r#"{"Pump":{"PumpDeclare":{"principal":{"LocalUser":"una"},"name":"mill","x":120.0,"y":300.0,"z":100.0,"dialect":"grbl"}}}"#
 );
+// VUGCOMSCANJOGTRAVELWIRE (SR618): the desk's travel (declared and read) and its settled position, typed for a face.
+kat!(
+    kat_pump_envelope,
+    SMessage::Pump(bandy::PumpEvent::PumpEnvelope {
+        declared: [Some(350.0), Some(350.0), Some(110.0)],
+        read: [Some(200.0), None, None],
+        position: Some([150.0, 0.0, -2.5]),
+    }),
+    r#"{"Pump":{"PumpEnvelope":{"declared":[350.0,350.0,110.0],"read":[200.0,null,null],"position":[150.0,0.0,-2.5]}}}"#
+);
 // VUG-VEIN-BUS (SR509): Vug's propose exchange with Vein; the photo rides as bytes and every answer echoes the request.
 kat!(
     kat_intent_propose,

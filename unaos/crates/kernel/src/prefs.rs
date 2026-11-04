@@ -1097,7 +1097,7 @@ pub fn retire(ns: &str) -> usize {
 #[cfg(any(feature = "aarch64_el0", target_arch = "x86_64"))]
 /// The stamped program name of wm `owner`, lowercased into `buf`; `None` = nothing armed.
 fn caller_name(owner: u64, buf: &mut [u8; crate::video::wm::MAX_TITLE]) -> Option<&str> {
-    let n = crate::video::wm::app_name_of(owner, buf);
+    let n = crate::video::wm::app_name_of(owner, buf); #[cfg(feature = "busreg")] let n = prefscap_early_name(owner, n, buf); // PREFSCAP-EARLY-NAME (rmbp-ledger B1182): no launcher-armed name -> wm's early record at the row's current generation, the cap road only (file tail). LINE-NEUTRAL fold, code first
     buf[..n].make_ascii_lowercase();
     core::str::from_utf8(&buf[..n]).ok().filter(|s| !s.is_empty())
 }
@@ -1685,7 +1685,7 @@ fn deleted_post(cleared: &[(String, String)]) {
     if cleared.is_empty() {
         return;
     }
-    let out: Vec<(String, String, Option<prefs_core::schema::Applied>)> = cleared.iter().map(|(ns, k)| (ns.clone(), k.clone(), default_applied(ns, k))).collect();
+    let out: Vec<(String, String, Option<prefs_core::schema::Applied>)> = cleared.iter().map(|(ns, k)| (ns.clone(), k.clone(), unset_posted(ns, k))).collect(); // UNSET-POST-ROADS (rmbp-ledger B1179): the delete road posts the one rule `unset_posted` (file tail). LINE-NEUTRAL fold, code first
     let unset = out.iter().filter(|c| c.2.is_none()).count();
     let sent = post_changes(&out);
     deleted_note(cleared.len(), sent);
@@ -1710,7 +1710,7 @@ fn reload_post(old: &PrefTree, t0: u64) -> usize {
         }
     }
     let n = out.len() + gone.len();
-    let unset = gone.iter().filter(|(ns, k)| { let a = default_applied(ns, k); let none = a.is_none(); out.push((ns.clone(), k.clone(), a)); none }).count();
+    let unset = gone.iter().filter(|(ns, k)| { let a = unset_posted(ns, k); let none = a.is_none(); out.push((ns.clone(), k.clone(), a)); none }).count(); // UNSET-POST-ROADS (rmbp-ledger B1179): the reload road posts the one rule `unset_posted` (file tail). LINE-NEUTRAL fold, code first
     let sent = post_changes(&out);
     serial_println!("[prefs] reload gen={} changed={} sent={} unsent={} unset={} ms={}", session_gen(), n, sent, n - sent, unset, crate::arch::ms().saturating_sub(t0)); // PREFSRELOAD (B763) + PREFSDELETED (B755) + PREFSUNSET (SR169): the ONE reload line
     n
@@ -1898,9 +1898,9 @@ pub(crate) fn store_read(p: &str) -> Option<Vec<u8>> {
 // The operator's `pref unset <ns.key>`: the key leaves the session store by THE ONE RULE the delete watch and the session
 // reload already keep — removed from the tree (never the default written into the user's file), its domain saved by the
 // same swap (`KernelPersist` -> `save_domain`, rolled back on a failed save), then ONE post through [`post_changes`] of
-// [`default_applied`]: the static or declared default as `Some`, SR169's unset form (`None`) only for a Consumer-default or
-// undeclared key; MACHINE-KEY-DEFAULT-PIN (B1173): a `MACHINE_KEYS` row posts the unset form ([`unset_posted`]), so the
-// mirror removes it (B1154's `=unset`). The bus unset is PREFS-UNSET-BUS (B1166, `store_unset` below). The
+// [`unset_posted`]: SR169's unset form (`None`) for EVERY key (MACHINE-KEY-DEFAULT-PIN B1173, UNSET-POST-ROADS B1179,
+// UNSET-POST-RULE B1185), so the mirror removes a machine key (B1154's `=unset`); [`default_applied`] answers the
+// operator's `reads <lit>` text only. The bus unset is PREFS-UNSET-BUS (B1166, `store_unset` below). The
 // writers column admits the operator for every key (`prefs_core::schema::Writer`), so there is no new check.
 // Wire: `[prefs] unset <ns>.<key> ok=1` (+ `[prefs] changed <ns>.<key>`), `ok=1 was=unset`, `ok=0 why=<e>`.
 
@@ -1950,8 +1950,8 @@ fn unset_verb(a: &str, out: &mut dyn FnMut(&str)) {
 }
 
 /// `tests prefs`' unset line (B1161): a fixture key leaves the tree and its file; a second unset writes nothing; a
-/// Consumer-default key posts the unset form; a static-default key is removed (never written as its default) and posts
-/// the default; a malformed address is refused. The tree and every domain file touched are restored byte for byte.
+/// Consumer-default key posts the unset form; a static-default key is removed (never written as its default) and reads
+/// the default (it posts the unset form, UNSET-POST-ROADS B1179); a malformed address is refused. The tree and every domain file touched are restored byte for byte.
 /// `:: PREFS-UNSET: removed=1 again=noop consumer=unset static=0 name=refused restored=1 -> PASS ::`.
 #[cfg(feature = "witness")]
 fn unset_selftest() {
@@ -2221,42 +2221,47 @@ fn unset_bus_legs() {
 // case); from any other path, or with no path (the spelling never promotes), it is `Caller::Anon` — an
 // impostor, not a program owed a namespace: the schema's ring-3 rows, no declare. `prefs_core` stays path-free
 // and untouched. Knob-off (no `busreg`): no path record exists, [`prefscap_path`] is the identity.
+// PREFSCAP-NS-PATH (rmbp-ledger B1177): the same verdict, generalised in place, binds EVERY stamped name to its image
+// `/apps/<NAME>.ELF` (a namespace's owner is named only by the caller's name: `cap`'s stanza, owner and declare arms),
+// so an image called VEIN.ELF from `/home` is `Anon` and may not SET `vein.*`; `prefs` is the general case.
 // Witness: `tests prefs` → `[prefs] set vein.endpoint ok=0 why=refused via=bus by=prefs path=foreign` and
 // `:: PREFSCAP-PATH: … -> PASS ::`.
 // =================================================================================================
 
-/// PREFSCAP-PATH — `c` as PREFSCAP may see it, and whether it was demoted. Takes only wm's leaf `APP_PATHS`
-/// (`bus_route::path_names` and `tag_image` take no lock).
+/// PREFSCAP-PATH — `c` as PREFSCAP may see it, and the stamped name it was demoted from (`None` = kept). Takes only
+/// wm's leaf `APP_PATHS` (then, with no late path, `APP_NAMES_EARLY`; `bus_route::path_names` takes no lock).
+/// PREFSCAP-NS-PATH (rmbp-ledger B1177): EVERY program, not only `prefs`, is its name only when its path is
+/// `/apps/<NAME>.ELF` (B1163's rule; `prefs` is the general case, its image TAG_IMAGE's `/apps/PREFS.ELF`), else `Anon`.
 #[cfg(all(feature = "busreg", any(feature = "aarch64_el0", target_arch = "x86_64")))]
-fn prefscap_path(owner: u64, c: prefs_core::cap::Caller<'_>) -> (prefs_core::cap::Caller<'_>, bool) {
+fn prefscap_path<'a>(owner: u64, c: prefs_core::cap::Caller<'a>) -> (prefs_core::cap::Caller<'a>, Option<&'a str>) {
     match c {
-        prefs_core::cap::Caller::Program(p) if p.eq_ignore_ascii_case(prefs_core::cap::PRINCIPIA) => {
-            let principia = crate::bus_route::tag_image(una_abi::BUS_VERB_R3PREF_SET)
-                .and_then(|img| crate::video::wm::app_path_with(owner, |path| crate::bus_route::path_names(path, img)))
+        prefs_core::cap::Caller::Program(p) => {
+            let img = alloc::format!("/apps/{}.ELF", p); // built before any leaf lock is taken
+            let bound = crate::video::wm::app_path_with(owner, |path| crate::bus_route::path_names(path, &img)).or_else(|| prefscap_early(owner, &img)) // PREFSCAP-ARM-EARLY (rmbp-ledger B1176): no late path -> wm's early record at the caller row's current generation, B1164's two-source rule as `tagpath_id` (file tail); rides PREFSCAP-NS-PATH's (B1177) per-name image. LINE-NEUTRAL fold, code first
                 == Some(true);
-            if principia {
-                (c, false)
+            if bound {
+                (c, None)
             } else {
-                (prefs_core::cap::Caller::Anon, true)
+                (prefs_core::cap::Caller::Anon, Some(p))
             }
         }
-        _ => (c, false),
+        _ => (c, None),
     }
 }
 
 /// PREFSCAP-PATH knob-off: no path record, nothing demoted (today's caller, unchanged).
 #[cfg(all(not(feature = "busreg"), any(feature = "aarch64_el0", target_arch = "x86_64")))]
 #[inline(always)]
-fn prefscap_path(_owner: u64, c: prefs_core::cap::Caller<'_>) -> (prefs_core::cap::Caller<'_>, bool) {
-    (c, false)
+fn prefscap_path<'a>(_owner: u64, c: prefs_core::cap::Caller<'a>) -> (prefs_core::cap::Caller<'a>, Option<&'a str>) {
+    (c, None)
 }
 
-/// PREFSCAP-PATH — a DEMOTED caller's SET is said with its stamped name and `path=foreign` (B1166's why words);
+/// PREFSCAP-PATH — a DEMOTED caller's SET is said with its stamped name (any program since B1177) and `path=foreign` (B1166's why words);
 /// every other verb or caller passes `st` through silently.
 #[cfg(any(feature = "aarch64_el0", target_arch = "x86_64"))]
 #[inline(always)]
-fn prefscap_set_note(verb: u8, body: &[u8], demoted: bool, st: i64) -> i64 {
-    if demoted && verb == prefs_core::wire::VERB_SET {
+fn prefscap_set_note(verb: u8, body: &[u8], demoted: Option<&str>, st: i64) -> i64 {
+    if let (Some(by), true) = (demoted, verb == prefs_core::wire::VERB_SET) {
         let ok = (st == 0) as u8;
         let why = match st {
             0 => "",
@@ -2266,9 +2271,9 @@ fn prefscap_set_note(verb: u8, body: &[u8], demoted: bool, st: i64) -> i64 {
         };
         match prefs_core::wire::parse_set(body) {
             Some((ns, k, _)) => {
-                serial_println!("[prefs] set {}.{} ok={}{} via=bus by={} path=foreign", ns, k, ok, why, prefs_core::cap::PRINCIPIA)
+                serial_println!("[prefs] set {}.{} ok={}{} via=bus by={} path=foreign", ns, k, ok, why, by)
             }
-            None => serial_println!("[prefs] set <malformed> ok={}{} via=bus by={} path=foreign", ok, why, prefs_core::cap::PRINCIPIA),
+            None => serial_println!("[prefs] set <malformed> ok={}{} via=bus by={} path=foreign", ok, why, by),
         }
     }
     st
@@ -2279,7 +2284,10 @@ fn prefscap_set_note(verb: u8, body: &[u8], demoted: bool, st: i64) -> i64 {
 /// ring-3 rows only, no declare: pure cap checks, nothing written); `/apps/PREFS.ELF` and `/apps/prefs.elf` keep
 /// Principia, `/APPS/PREFS.ELF` and a pathless `PREFS.ELF` are demoted, a non-prefs name is never touched. The
 /// scratch name and path are forgotten.
-/// `:: PREFSCAP-PATH: foreign=refused anon=held apps=admitted case=admitted upper=demoted pathless=demoted other=kept restored=1 -> PASS ::`.
+/// `:: PREFSCAP-PATH: foreign=refused anon=held apps=admitted case=admitted upper=demoted pathless=demoted early=admitted stale=demoted earlyname=admitted other=demoted ns=refused nsown=admitted restored=1 -> PASS ::`
+/// (`early=` / `stale=`: PREFSCAP-ARM-EARLY B1176, [`prefscap_early_legs`]; `earlyname=`: PREFSCAP-EARLY-NAME B1182, [`prefscap_earlyname_leg`]; `other=demoted` / `ns=` / `nsown=`: PREFSCAP-NS-PATH
+/// B1177 — a `/home/una/LUMEN.ELF` is demoted, a `/home/una/VEIN.ELF` SET of `vein.endpoint` is -EACCES with the value kept
+/// (`[prefs] set vein.endpoint ok=0 why=refused via=bus by=vein path=foreign`), `/apps/VEIN.ELF` keeps `vein.*` and only it).
 #[cfg(feature = "witness")]
 fn prefscap_path_selftest() {
     #[cfg(all(feature = "busreg", any(feature = "aarch64_el0", target_arch = "x86_64")))]
@@ -2307,7 +2315,7 @@ fn prefscap_path_legs() {
         let mut nb = [0u8; crate::video::wm::MAX_TITLE];
         caller_name(OWNER, &mut nb).map(|p| {
             let (c, d) = prefscap_path(OWNER, Caller::Program(p));
-            d == (c == Caller::Anon) && d
+            d.is_some() == (c == Caller::Anon) && d.is_some()
         })
     };
     // L1 + L2: the foreign PREFS — demoted, its SET refused on the wire, the value kept; Anon's rows only.
@@ -2328,15 +2336,31 @@ fn prefscap_path_legs() {
     let upper = demoted("/APPS/PREFS.ELF") == Some(true);
     // L4: a relative arm clears the path row: the spelling alone never promotes.
     let pathless = demoted("PREFS.ELF") == Some(true);
-    let other = demoted("/home/una/LUMEN.ELF") == Some(false);
-    crate::video::wm::app_name_forget(OWNER);
-    let restored = !crate::video::wm::app_name_armed(OWNER) && crate::video::wm::app_path_with(OWNER, |_| true).is_none();
-    let ok = foreign && anon && apps && case && upper && pathless && other && restored;
+    let (early, stale, early_gone) = prefscap_early_legs(OWNER, &demoted); // PREFSCAP-ARM-EARLY (rmbp-ledger B1176): the early record admits a pathless PREFS.ELF at the current generation only (file tail)
+    // L5 (PREFSCAP-NS-PATH B1177): every program is its name only from `/apps/<NAME>.ELF`: a non-prefs image from
+    // `/home` is demoted; VEIN from `/home` is refused its own namespace on the wire; `/apps/VEIN.ELF` owns `vein.*`.
+    let other = demoted("/home/una/LUMEN.ELF") == Some(true);
+    let ns_demoted = demoted("/home/una/VEIN.ELF") == Some(true);
+    let ep = get("vein", "endpoint");
+    o.clear();
+    let st = bus_fulfil_from(prefs_core::wire::VERB_SET, b"vein.endpoint\x00\"https://foreign.example/\"", true, OWNER, &mut o);
+    let ns = ns_demoted && st == prefs_core::wire::EACCES && get("vein", "endpoint") == ep;
+    let nsown = demoted("/apps/VEIN.ELF") == Some(false) && {
+        let mut nb = [0u8; crate::video::wm::MAX_TITLE];
+        caller_name(OWNER, &mut nb).is_some_and(|p| {
+            let (c, _) = prefscap_path(OWNER, Caller::Program(p));
+            c == Caller::Program("vein") && may_set(c, "vein", "x") && !may_set(c, "system", "login.items")
+        })
+    };
+    crate::video::wm::app_name_forget(OWNER); let earlyname = prefscap_earlyname_leg(OWNER); // PREFSCAP-EARLY-NAME (rmbp-ledger B1182): no late name, the early record names the caller `prefs` (file tail). Named in-place hunk
+    let restored = early_gone && !crate::video::wm::app_name_armed(OWNER) && crate::video::wm::app_path_with(OWNER, |_| true).is_none();
+    let ok = foreign && anon && apps && case && upper && pathless && early && stale && earlyname && other && ns && nsown && restored; // PREFSCAP-EARLY-NAME (rmbp-ledger B1182): `earlyname` (named in-place hunk)
     serial_println!(
-        ":: PREFSCAP-PATH: foreign={} anon={} apps={} case={} upper={} pathless={} other={} restored={} -> {} ::",
+        ":: PREFSCAP-PATH: foreign={} anon={} apps={} case={} upper={} pathless={} early={} stale={} earlyname={} other={} ns={} nsown={} restored={} -> {} ::",
         if foreign { "refused" } else { "ADMITTED" }, if anon { "held" } else { "FAIL" }, if apps { "admitted" } else { "DEMOTED" },
         if case { "admitted" } else { "DEMOTED" }, if upper { "demoted" } else { "ADMITTED" }, if pathless { "demoted" } else { "ADMITTED" },
-        if other { "kept" } else { "DEMOTED" }, restored as u8, if ok { "PASS" } else { "FAIL" }
+        if early { "admitted" } else { "DEMOTED" }, if stale { "demoted" } else { "ADMITTED" }, if earlyname { "admitted" } else { "DEMOTED" },
+        if other { "demoted" } else { "KEPT" }, if ns { "refused" } else { "ADMITTED" }, if nsown { "admitted" } else { "DEMOTED" }, restored as u8, if ok { "PASS" } else { "FAIL" }
     );
 }
 
@@ -2346,15 +2370,14 @@ fn prefscap_path_legs() {
 // (the kernel's `changes_drain`, ring 3's theme HINT) or falls back per key (`settings::a11y_load("machine")`) and takes
 // the static default from `prefs_core::schema` (B1160 pins it static), and no consumer reads the frame's value; so
 // `machine_mirror` removes the key from the machine copy by B1154's None arm instead of writing the default literal.
-// Every other key keeps [`default_applied`]. The delete watch and the reload still post `default_applied` (UNSET-POST-ROADS
-// owed). Wire: `[prefs] machine settings/<d> system.<k>=unset wrote=1`, `[prefs] unset <a> ok=1 posted=<unset|lit> via=bus …`.
+// UNSET-POST-ROADS (B1179): ONE rule on the three roads ([`unset`], the delete watch's [`deleted_post`], the reload's
+// [`reload_post`]), and a STATIC-default key (`schema::default_of` -> `Source::Default`) posts the unset form too, as the
+// host ring does. UNSET-POST-RULE (B1185): so do a Rule-default key (vein's provider rebuild re-reads on the namespace) and a declared
+// `app.*` key (no reader binds the value; the declarer holds its default): EVERY unset posts the unset form, [`default_applied`] answers reads only. Wire: `[prefs] machine settings/<d> system.<k>=unset wrote=1`, `[prefs] unset <a> ok=1 posted=unset via=bus …`.
 
-/// The PrefChanged value [`unset`] posts for `ns`/`k` (see the block above). Called with no prefs lock held.
+/// The PrefChanged value [`unset`], [`deleted_post`] and [`reload_post`] post for `ns`/`k` (see the block above). Called with no prefs lock held.
 fn unset_posted(ns: &str, k: &str) -> Option<prefs_core::schema::Applied> {
-    if ns == NS && MACHINE_KEYS.contains(&k) {
-        return None;
-    }
-    default_applied(ns, k)
+    let _ = (ns, k); None // UNSET-POST-RULE (rmbp-ledger B1185): every kind posts the unset form; B1173's machine arm and B1179's static line fold into it (the block above). Named in-place hunk
 }
 
 /// [`unset_bus_note`]'s `posted=` word: `unset`, or the literal [`unset_posted`] carried.
@@ -2370,7 +2393,7 @@ fn unset_posted_word(body: &[u8]) -> String {
 /// UNSET `system.accessibility.reduce_motion` (a ring-3 settable row) through [`bus_fulfil_from`]; the post is the unset
 /// form, the key is gone, and (in a session) the machine copy no longer holds it. The session domain file, the machine
 /// file, the tree and ON_DISK are restored byte for byte.
-/// `:: MACHINE-KEY-UNSET: set=1 unset=0 posted=unset mirror=<removed|nosession> restored=1 -> PASS ::`.
+/// `:: MACHINE-KEY-UNSET: set=1 unset=0 posted=unset roads=3 rule=unset app=unset mirror=<removed|nosession> restored=1 -> PASS ::`.
 #[cfg(all(feature = "witness", any(feature = "aarch64_el0", target_arch = "x86_64")))]
 fn machine_unset_leg(owner: u64) {
     use prefs_core::wire::{VERB_SET, VERB_UNSET};
@@ -2394,6 +2417,7 @@ fn machine_unset_leg(owner: u64) {
     } else {
         "removed"
     };
+    let (del, rel) = unset_roads_leg(&sp, &mp, session); let roads = (posted && mirror != "KEPT") as u8 + del as u8 + rel as u8; let (rule, app) = unset_rule_leg(); // UNSET-POST-ROADS (rmbp-ledger B1179): the delete and reload roads, before the restore below (file tail). Named in-place hunk UNSET-POST-RULE (rmbp-ledger B1185): the Rule-default and declared app.* legs (file tail).
     // Restore the files, the tree and ON_DISK.
     let mt = crate::shell::vfs_mount_table();
     for (p, b) in [(&sp, &s0), (&mp, &m0)] {
@@ -2409,9 +2433,165 @@ fn machine_unset_leg(owner: u64) {
     *TREE.lock() = tree0;
     *ON_DISK.lock() = on_disk0;
     let restored = read_all(&sp) == s0 && read_all(&mp) == m0;
-    let ok = set && st == 0 && posted && mirror != "KEPT" && restored;
+    let ok = set && st == 0 && posted && mirror != "KEPT" && restored && roads == 3 && rule && app; // UNSET-POST-ROADS (rmbp-ledger B1179): `roads=` (named in-place hunk). UNSET-POST-RULE (rmbp-ledger B1185): `rule=` `app=`
     serial_println!(
-        ":: MACHINE-KEY-UNSET: set={} unset={} posted={} mirror={} restored={} -> {} ::",
-        set as u8, st, if posted { "unset" } else { "VALUE" }, mirror, restored as u8, if ok { "PASS" } else { "FAIL" }
+        ":: MACHINE-KEY-UNSET: set={} unset={} posted={} roads={} rule={} app={} mirror={} restored={} -> {} ::",
+        set as u8, st, if posted { "unset" } else { "VALUE" }, roads, if rule { "unset" } else { "VALUE" }, if app { "unset" } else { "VALUE" }, mirror, restored as u8, if ok { "PASS" } else { "FAIL" }
     );
+}
+
+// =================================================================================================
+// PREFSCAP-ARM-EARLY (rmbp-ledger B1176) — TAIL-APPENDED, `busreg` only (knob-off: no symbol, no byte). B1170's
+// [`prefscap_path`] read only the LATE path (`wm::app_path_with`), so the real PREFS.ELF was demoted while it had a
+// name and no path: `wm::app_name_arm_launch` arms the name through `app_name_arm` (which clears the path, the name
+// being bare) and arms the path after it, and a relative late arm leaves that state for good. B1164 keeps the EARLY
+// record (`wm::app_path_early_of`: the arch spawn body's absolute argv[0] or SYS_SPAWN_PATH's kernel-opened path,
+// stamped with the row's bus generation at the mint). The verdict now reads the late path OR ELSE the early record at
+// the caller row's CURRENT generation: B1164's two-source rule, `bus_route::tagpath_id`'s order (a late path decides,
+// foreign stays foreign), so the cap verdict is the fulfiller verdict. The row is the owner's through
+// `wm::owner_of_launch`'s own offset (x86 slot + 1, aarch64 the asid), never an arch cfg here. Locks: wm's two leaves,
+// one at a time (`app_path_with`'s guard is gone before `or_else` runs); `rgen` is an atomic load.
+// Witness: `tests prefs` → `:: PREFSCAP-PATH: … pathless=demoted early=admitted stale=demoted … -> PASS ::`.
+// =================================================================================================
+
+/// PREFSCAP-ARM-EARLY — the bus generation of wm `owner`'s row now (`owner_of_launch(row) == owner`); `None` = an
+/// owner below every row's (x86 owner 0).
+#[cfg(all(feature = "busreg", any(feature = "aarch64_el0", target_arch = "x86_64")))]
+fn prefscap_gen(owner: u64) -> Option<u64> {
+    let row = owner.checked_sub(crate::video::wm::owner_of_launch(0))?;
+    Some((crate::arch::syscall::busreg_ops().rgen)(row as usize))
+}
+
+/// PREFSCAP-ARM-EARLY — is `owner`'s early path, at its row's current generation, the image `img`? `None` = no
+/// absolute early record at that generation (the verdict stays demoted). Takes only wm's leaf `APP_NAMES_EARLY`.
+#[cfg(all(feature = "busreg", any(feature = "aarch64_el0", target_arch = "x86_64")))]
+fn prefscap_early(owner: u64, img: &str) -> Option<bool> {
+    crate::video::wm::app_path_early_of(owner, prefscap_gen(owner)?, |p| crate::bus_route::path_names(p, img))
+}
+
+/// `prefscap_path_legs`' early legs on the scratch `owner` (name relative, so no late path): `/apps/PREFS.ELF`
+/// early-armed at [`prefscap_gen`] is admitted; the same record at the next generation (a dead tenant's) is demoted;
+/// the record is then forgotten. `(early, stale, gone)`.
+#[cfg(all(feature = "witness", feature = "busreg", any(feature = "aarch64_el0", target_arch = "x86_64")))]
+fn prefscap_early_legs(owner: u64, demoted: &dyn Fn(&str) -> Option<bool>) -> (bool, bool, bool) {
+    let Some(g) = prefscap_gen(owner) else { return (false, false, false) };
+    let _ = crate::video::wm::app_name_arm_early(owner, g, "/apps/PREFS.ELF");
+    let early = demoted("PREFS.ELF") == Some(false);
+    let _ = crate::video::wm::app_name_arm_early(owner, g.wrapping_add(1), "/apps/PREFS.ELF");
+    let stale = demoted("PREFS.ELF") == Some(true);
+    crate::video::wm::app_name_early_forget(owner);
+    let gone = crate::video::wm::app_path_early_of(owner, g, |_| true).is_none()
+        && crate::video::wm::app_path_early_of(owner, g.wrapping_add(1), |_| true).is_none();
+    (early, stale, gone)
+}
+
+// ── UNSET-POST-ROADS (rmbp-ledger B1179, BP-storage-11) — TAIL-APPENDED ────────────────────────────────────────────────
+// [`machine_unset_leg`]'s second and third roads for `system.accessibility.reduce_motion`, run before that leg's restore
+// (which puts the session domain file, the machine file, the tree and ON_DISK back byte for byte). The delete road: the
+// key is set, the session domain file holding it is deleted, [`watch_deleted`] clears the domain and [`deleted_post`]
+// posts [`unset_posted`]'s unset form, so the machine copy loses the key. The reload road: the key is set, the store is
+// saved without it while RAM still holds it, [`reload_session`] re-reads the store and [`reload_post`] posts the unset
+// form for the key that left. Each road passes when the key is gone and (in a session) the machine copy no longer holds it.
+// Wire: `[prefs] machine settings/general system.accessibility.reduce_motion=unset wrote=1` once per road, then
+// `[prefs] deleted -> changed … unset=<n>` / `[prefs] reload … changed=1 sent=1 unsent=0 unset=1 …`.
+
+/// The delete and reload roads (see the block above): `(delete_ok, reload_ok)`. `sp` = the session domain file, `mp` = the
+/// machine copy's file, `session` = a session home is mounted.
+#[cfg(all(feature = "witness", any(feature = "aarch64_el0", target_arch = "x86_64")))]
+fn unset_roads_leg(sp: &str, mp: &str, session: bool) -> (bool, bool) {
+    const K: &str = "accessibility.reduce_motion";
+    let d = prefs_core::files::domain_of(NS, K);
+    let kept = || read_all(mp).and_then(|b| String::from_utf8(b).ok()).and_then(|t| PrefTree::parse(&t).ok()).is_some_and(|t| t.get(NS, K).is_some());
+    let mt = crate::shell::vfs_mount_table();
+    // Road 2 — the delete watch: the session domain file holding the key is deleted.
+    let set2 = set(NS, K, PrefValue::Bool(true)).is_ok();
+    let _ = mt.unlink(sp, crate::fs::vfs::KERNEL_PRINCIPAL);
+    let _ = watch_deleted();
+    let del = set2 && !ON_DISK.lock().iter().any(|x| *x == d) && get(NS, K).is_none() && !(session && kept());
+    // Road 3 — the reload: RAM holds the key, the store does not.
+    let set3 = set(NS, K, PrefValue::Bool(true)).is_ok();
+    let old = TREE.lock().clone();
+    let _ = TREE.lock().remove(NS, K);
+    let saved = save_domain(&d).is_ok();
+    let _ = reload_session(&old);
+    let rel = set3 && saved && get(NS, K).is_none() && !(session && kept());
+    (del, rel)
+}
+
+// =================================================================================================
+// PREFSCAP-EARLY-NAME (rmbp-ledger B1182) — TAIL-APPENDED, `busreg` only (knob-off: no symbol, no byte). B1176 let
+// [`prefscap_path`] read wm's early PATH record, but [`caller_name`] named the caller from `wm::app_name_of` only, and
+// B1164 keeps the early record invisible to it by design (titles and NOTICE must not read it). So a ring-3
+// SYS_SPAWN_PATH launch of `/apps/PREFS.ELF` (early-armed at the mint, B1172) that REGISTERs and SETs before its
+// launcher's late arm, or with no late arm at all, was `Anon` before the path was asked. [`caller_name`]'s callers are
+// the cap road only ([`bus_fulfil_from`] and the PREFSCAP-PATH witness), so its ONE fold falls back to
+// `wm::app_name_early_of` at the row's CURRENT generation ([`prefscap_gen`], B1176's inverse, reused) when no late name
+// answers: `bus_route::row_name`'s own early fallback (`armearly_name`), mirrored. A late name always wins; a row with
+// neither record stays `Anon`; an early name from a non-`/apps` or relative argv[0] is named, then demoted by
+// [`prefscap_path`] (`path=foreign`); a record from another generation answers nothing. Locks: wm's leaf `APP_NAMES`
+// is dropped before `rgen` (an atomic load) and the leaf `APP_NAMES_EARLY`, taken alone; no prefs lock is held.
+// Witness: `tests prefs` → `:: PREFSCAP-PATH: … stale=demoted earlyname=admitted … -> PASS ::`.
+// =================================================================================================
+
+/// PREFSCAP-EARLY-NAME — `n` when a launcher-armed name exists, else the length of `owner`'s early program name at its
+/// row's current generation, copied into `buf` (0 = no record at that generation, or an owner below every row's).
+#[cfg(all(feature = "busreg", any(feature = "aarch64_el0", target_arch = "x86_64")))]
+fn prefscap_early_name(owner: u64, n: usize, buf: &mut [u8; crate::video::wm::MAX_TITLE]) -> usize {
+    if n != 0 {
+        return n;
+    }
+    prefscap_gen(owner).map_or(0, |g| crate::video::wm::app_name_early_of(owner, g, buf))
+}
+
+/// `prefscap_path_legs`' early-name leg on the scratch `owner` (no late name armed): `/apps/PREFS.ELF` early-armed at
+/// [`prefscap_gen`] makes [`caller_name`] `prefs`, [`prefscap_path`] keeps it (nothing demoted) and it may set
+/// `app.prefs.x` and declare `prefs` (pure cap checks, nothing written); the record forgotten, the row has neither
+/// record and [`caller_name`] answers none (`Anon`).
+#[cfg(all(feature = "witness", feature = "busreg", any(feature = "aarch64_el0", target_arch = "x86_64")))]
+fn prefscap_earlyname_leg(owner: u64) -> bool {
+    use prefs_core::cap::{may_declare, may_set, Caller};
+    let Some(g) = prefscap_gen(owner) else { return false };
+    if crate::video::wm::app_name_armed(owner) {
+        return false;
+    }
+    let _ = crate::video::wm::app_name_arm_early(owner, g, "/apps/PREFS.ELF");
+    let admitted = {
+        let mut nb = [0u8; crate::video::wm::MAX_TITLE];
+        caller_name(owner, &mut nb).is_some_and(|p| {
+            let (c, d) = prefscap_path(owner, Caller::Program(p));
+            p == "prefs" && d.is_none() && c == Caller::Program("prefs") && may_set(c, "app", "prefs.x") && may_declare(c, "prefs")
+        })
+    };
+    crate::video::wm::app_name_early_forget(owner);
+    let anon = {
+        let mut nb = [0u8; crate::video::wm::MAX_TITLE];
+        caller_name(owner, &mut nb).is_none()
+    };
+    let gone = crate::video::wm::app_path_early_of(owner, g, |_| true).is_none();
+    admitted && anon && gone
+}
+
+// ── UNSET-POST-RULE (rmbp-ledger B1185, BP-storage-11) — TAIL-APPENDED ─────────────────────────────────────────────────
+// [`machine_unset_leg`]'s `rule=` and `app=` words. A Rule-default key (`vein.embed.provider`: `schema::default_of` answers
+// `Source::Rule`, and under the kernel's [`StoreEnv`] the embedder rule always yields a value) and a declared `app.*` key
+// (a scratch `app.unsetrule.k`, declared through [`declare_kernel`] only when no `unsetrule` stanza is held, removed after)
+// each have a literal [`default_applied`] would answer, and [`unset_posted`] posts the unset form for both. No store write,
+// no tree change; TREE and DECLARED are taken one at a time, with no prefs lock held by the caller.
+
+/// The Rule-default and declared-app legs (see the block above): `(rule_ok, app_ok)`.
+#[cfg(all(feature = "witness", any(feature = "aarch64_el0", target_arch = "x86_64")))]
+fn unset_rule_leg() -> (bool, bool) {
+    const RK: &str = "embed.provider";
+    let rule = matches!(prefs_core::schema::default_of("vein", RK, &StoreEnv), Some((_, prefs_core::schema::Source::Rule(_))))
+        && default_applied("vein", RK).is_some()
+        && unset_posted("vein", RK).is_none();
+    let held = DECLARED.lock().contains_key("unsetrule");
+    let declared = !held && declare_kernel(b"unsetrule\x00k\tint:0:9\t4\tUNSET-POST-RULE scratch");
+    let app = declared
+        && default_applied(prefs_core::files::APP_NS, "unsetrule.k").map(|a| a.value) == Some(PrefValue::Int(4))
+        && unset_posted(prefs_core::files::APP_NS, "unsetrule.k").is_none();
+    if declared {
+        DECLARED.lock().remove("unsetrule");
+    }
+    (rule, app)
 }

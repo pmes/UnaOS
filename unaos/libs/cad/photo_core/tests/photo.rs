@@ -499,3 +499,127 @@ fn a_cropped_png_carries_its_principal_point() {
     assert!((w - PART_W).abs() < 0.1, "plate side {w} vs {PART_W}");
     assert!((h - PART_H).abs() < 0.1, "plate side {h} vs {PART_H}");
 }
+
+// ---- VUGPHOTOCROPMETAITXT (SR614): the crop meta in zTXt / iTXt and a JPEG COM (named tail block) ----
+
+/// A PNG chunk: length, kind, data, CRC-32 over kind + data (PNG §5.3).
+fn meta_chunk(kind: &[u8; 4], data: &[u8]) -> Vec<u8> {
+    let mut c = (data.len() as u32).to_be_bytes().to_vec();
+    c.extend_from_slice(kind);
+    c.extend_from_slice(data);
+    let crc = pixel_core::crc::crc32(&c[4..]);
+    c.extend_from_slice(&crc.to_be_bytes());
+    c
+}
+
+/// `png` (a `fixture::crop_png`, its one tEXt at byte 33 right after IHDR) with that tEXt swapped for `chunks`.
+fn meta_retext(png: &[u8], chunks: &[u8]) -> Vec<u8> {
+    assert_eq!(&png[37..41], b"tEXt", "crop_png writes its tEXt after IHDR");
+    let len = u32::from_be_bytes([png[33], png[34], png[35], png[36]]) as usize;
+    let mut out = png[..33].to_vec();
+    out.extend_from_slice(chunks);
+    out.extend_from_slice(&png[33 + 12 + len..]);
+    out
+}
+
+/// An iTXt chunk's data: keyword NUL flag method language NUL translated-keyword NUL text (zlib when `compressed`).
+fn meta_itxt(key: &str, value: &str, compressed: bool) -> Vec<u8> {
+    let mut d = key.as_bytes().to_vec();
+    d.extend_from_slice(&[0, compressed as u8, 0]);
+    d.extend_from_slice(b"en\0");
+    d.push(0);
+    if compressed {
+        d.extend_from_slice(&pixel_core::deflate::compress(value.as_bytes()).expect("zlib"));
+    } else {
+        d.extend_from_slice(value.as_bytes());
+    }
+    d
+}
+
+/// SR576's cropped lens photo through SR582's `crop_png` (tEXt `vug:crop=200,40,900,720`), decoded: the tEXt road.
+fn meta_crop() -> (Vec<u8>, pixel_core::Image) {
+    let full = fixture::render(&Spec::lens());
+    let png = fixture::crop_png(&full, 200, 40, 700, 560);
+    let img = pixel_core::decode(&png).expect("the tEXt crop decodes");
+    (png, img)
+}
+
+/// VUGPHOTOCROPMETAITXT (SR614): the crop meta in a zTXt (keyword NUL 0 zlib) decodes to the SAME image and pairs as the
+/// tEXt road, so the photo opens cropped: its principal point (250, 320), which `measure`'s `principal_of` takes first.
+#[test]
+fn a_ztxt_crop_opens_cropped() {
+    let (png, text_img) = meta_crop();
+    let mut d = photo_core::CROP_KEY.as_bytes().to_vec();
+    d.extend_from_slice(&[0, 0]);
+    d.extend_from_slice(&pixel_core::deflate::compress(b"200,40,900,720").expect("zlib"));
+    let img = pixel_core::decode(&meta_retext(&png, &meta_chunk(b"zTXt", &d))).expect("the zTXt crop decodes");
+    assert_eq!(img.text, text_img.text);
+    assert_eq!(img.rgba, text_img.rgba);
+    let pp = photo_core::crop_principal(&img).expect("the zTXt carries the crop");
+    assert_eq!(pp, Vec2::new(250.0, 320.0));
+    eprintln!("photo: crop-meta-itxt ztxt={},{}", pp.x, pp.y);
+}
+
+/// VUGPHOTOCROPMETAITXT (SR614): the crop meta in an iTXt, uncompressed (flag 0) and compressed (flag 1, the one
+/// inflater), opens cropped at (250, 320), the pairs the tEXt road's.
+#[test]
+fn an_itxt_crop_opens_cropped_plain_and_compressed() {
+    let (png, text_img) = meta_crop();
+    for compressed in [false, true] {
+        let c = meta_chunk(b"iTXt", &meta_itxt(photo_core::CROP_KEY, "200,40,900,720", compressed));
+        let img = pixel_core::decode(&meta_retext(&png, &c)).expect("the iTXt crop decodes");
+        assert_eq!(img.text, text_img.text, "compressed={compressed}");
+        assert_eq!(img.rgba, text_img.rgba);
+        let pp = photo_core::crop_principal(&img).expect("the iTXt carries the crop");
+        assert_eq!(pp, Vec2::new(250.0, 320.0), "compressed={compressed}");
+        eprintln!("photo: crop-meta-itxt itxt compressed={compressed} pp={},{}", pp.x, pp.y);
+    }
+}
+
+/// An 8 x 8 grey baseline JPEG built from bytes with `com` as a COM segment: SOI, COM, SOF0 (8-bit, 8 x 8, one
+/// component, table 0), SOS on the decoder's Annex K default tables (no DHT), one entropy byte 0x2B (DC category 0
+/// `00`, AC EOB `1010`, padded with 1s), EOI.
+fn meta_jpeg(com: &[u8]) -> Vec<u8> {
+    let mut j = vec![0xFF, 0xD8, 0xFF, 0xFE];
+    j.extend_from_slice(&((com.len() + 2) as u16).to_be_bytes());
+    j.extend_from_slice(com);
+    j.extend_from_slice(&[0xFF, 0xC0, 0, 11, 8, 0, 8, 0, 8, 1, 1, 0x11, 0]);
+    j.extend_from_slice(&[0xFF, 0xDA, 0, 8, 1, 1, 0x00, 0, 63, 0]);
+    j.extend_from_slice(&[0x2B, 0xFF, 0xD9]);
+    j
+}
+
+/// VUGPHOTOCROPMETAITXT (SR614): a JPEG whose COM carries the tEXt chunk's bytes (`vug:crop` NUL `200,40,900,720`) opens
+/// cropped at (250, 320); a plain comment (no NUL) surfaces no pair.
+#[test]
+fn a_jpeg_com_crop_opens_cropped() {
+    let img = pixel_core::decode(&meta_jpeg(b"vug:crop\x00200,40,900,720")).expect("the hand-built JPEG decodes");
+    assert_eq!((img.width, img.height), (8, 8));
+    let pp = photo_core::crop_principal(&img).expect("the COM carries the crop");
+    assert_eq!(pp, Vec2::new(250.0, 320.0));
+    let plain = pixel_core::decode(&meta_jpeg(b"made by a camera")).expect("the plain-comment JPEG decodes");
+    assert!(plain.text.is_empty());
+    assert_eq!(photo_core::crop_principal(&plain), None);
+    eprintln!("photo: crop-meta-itxt jpeg={},{}", pp.x, pp.y);
+}
+
+/// VUGPHOTOCROPMETAITXT (SR614): a PNG carrying the crop twice — the FIRST `vug:crop` in file order wins whatever chunk
+/// carries it (`crop_principal`'s `find` over the one `Image.text`): tEXt then iTXt reads the tEXt's (250, 320), iTXt then
+/// tEXt the iTXt's (350, 280).
+#[test]
+fn the_first_crop_in_the_file_wins_whatever_its_chunk() {
+    let (png, _) = meta_crop();
+    let mut t = photo_core::CROP_KEY.as_bytes().to_vec();
+    t.push(0);
+    t.extend_from_slice(b"200,40,900,720");
+    let text = meta_chunk(b"tEXt", &t);
+    let itxt = meta_chunk(b"iTXt", &meta_itxt(photo_core::CROP_KEY, "0,0,700,560", false));
+    let first_text = pixel_core::decode(&meta_retext(&png, &[text.clone(), itxt.clone()].concat())).expect("decodes");
+    let first_itxt = pixel_core::decode(&meta_retext(&png, &[itxt, text].concat())).expect("decodes");
+    assert_eq!(first_text.text.len(), 2);
+    let a = photo_core::crop_principal(&first_text).expect("crop");
+    let b = photo_core::crop_principal(&first_itxt).expect("crop");
+    assert_eq!(a, Vec2::new(250.0, 320.0));
+    assert_eq!(b, Vec2::new(350.0, 280.0));
+    eprintln!("photo: crop-meta-itxt first={},{}/{},{}", a.x, a.y, b.x, b.y);
+}

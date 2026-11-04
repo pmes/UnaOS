@@ -16996,7 +16996,7 @@ fn spawn_user_image_bg_inner(
 ) -> Result<(u64, u64, u64), &'static str> {
     let _ = no_autofocus; #[cfg(feature = "wc")] let app_t0 = crate::arch::now_cycles(); #[cfg(feature = "wc")] if oneinstance_gate(no_autofocus, argv, as_row, pipe.is_some()) { return Err(ONEINSTANCE_RAISED); } // APPLAUNCH (B678): the exec stamp, before the ELF load. ⚠ LINE-NEUTRAL fold. ONEINSTANCE (B734): a second launch of a running program by the user's verb raises it instead of spawning (file tail), BEFORE any slot exists; LINE-NEUTRAL fold, code before this line's first `//`. — // read only on `wc` builds — see `SLOT_NO_AUTOFOCUS`
     argv_fits(argv)?; // RING3ABI2 M2: refused BEFORE a slot exists
-    let (mapped, pi) = load_program_common(bytes)?; if let Some(i) = pipe { crate::pipe::bind(i, mapped.slot, pipe_gen(mapped.slot)); } super::memory::args_write(mapped.slot, argv); #[cfg(feature = "login")] slot_user_stamp(mapped.slot); #[cfg(feature = "login")] slot_user_inherit(mapped.slot, as_row); #[cfg(not(feature = "login"))] let _ = as_row; #[cfg(feature = "wc")] crate::procslot::launch::exec_stamp(mapped.slot, crate::video::wm::program_name(argv.first().copied().unwrap_or("-")), app_t0); /* APPLAUNCH (B678) */ #[cfg(feature = "busreg")] crate::bus_route::arm_early(mapped.slot, early, as_row.is_some()); #[cfg(not(feature = "busreg"))] let _ = early; /* BUSREG-ARM-EARLY (B1164) + BUSREG-ARM-EARLY-RING3 (B1172): the early path the CALLER chose (a kernel road its own argv[0], SYS_SPAWN_PATH its kernel-opened path, never ring-3 argv) armed for the bus check before the task can run; `as_row` is the road label only (bus_route tail) */ // LOGIN M1 — with a session open the slot runs AS THE USER (file tail); knob-off `#[cfg]`-erased. ⚠ LINE-NEUTRAL append.
+    let (mapped, pi) = load_program_common(bytes)?; if let Some(i) = pipe { crate::pipe::bind(i, mapped.slot, pipe_gen(mapped.slot)); } super::memory::args_write(mapped.slot, argv); #[cfg(feature = "login")] slot_user_stamp(mapped.slot); #[cfg(feature = "login")] slot_user_inherit(mapped.slot, as_row); #[cfg(not(feature = "login"))] let _ = as_row; #[cfg(feature = "wc")] crate::procslot::launch::exec_stamp(mapped.slot, crate::video::wm::program_name(argv.first().copied().unwrap_or("-")), app_t0); /* APPLAUNCH (B678) */ crate::video::wm::app_mint_note(crate::video::wm::owner_of_launch(mapped.slot as u64), Some(slot_gen(mapped.slot))); /* ARMLATE-KNOBOFF (B1184): every mint, every build, notes the row's generation for the late arm's stamp (file tail) */ #[cfg(feature = "busreg")] crate::bus_route::arm_early(mapped.slot, early, as_row.is_some()); #[cfg(not(feature = "busreg"))] let _ = early; /* BUSREG-ARM-EARLY (B1164) + BUSREG-ARM-EARLY-RING3 (B1172): the early path the CALLER chose (a kernel road its own argv[0], SYS_SPAWN_PATH its kernel-opened path, never ring-3 argv) armed for the bus check before the task can run; `as_row` is the road label only (bus_route tail) */ // LOGIN M1 — with a session open the slot runs AS THE USER (file tail); knob-off `#[cfg]`-erased. ⚠ LINE-NEUTRAL append.
     // PROCREAP: mark the row SCAVENGEABLE before the task can exist. This is the one launch path whose
     // reaper is a shell HANDLE (`BG_JOBS`) rather than a held index, so it is the one path whose row can
     // be orphaned by losing that handle — and therefore the only one BGRUN-SCAV may reclaim. See the
@@ -29816,7 +29816,7 @@ fn busreg_has_room(row: usize) -> bool {
 }
 #[cfg(feature = "busreg")]
 fn busreg_gen(row: usize) -> u64 {
-    if row < SLOT_GEN.len() { SLOT_GEN[row].load(Ordering::Acquire) } else { u64::MAX }
+    slot_gen(row) // ARMLATE-KNOBOFF (B1184): the ONE generation read, unconditional (file tail)
 }
 #[cfg(feature = "busreg")]
 static BUSREG_OPS: crate::bus_route::Ops = crate::bus_route::Ops { push: busreg_push, has_room: busreg_has_room, rgen: busreg_gen };
@@ -32598,4 +32598,15 @@ pub fn end_bus_row(row: usize, rgen: u64) -> Option<(u64, usize, &'static str, b
         return Some((pid, windows, settle, gone));
     }
     None
+}
+
+// =================================================================================================
+// ARMLATE-KNOBOFF (rmbp-ledger B1184) — TAIL-APPENDED, every build. The row's generation (`SLOT_GEN`, bumped at the
+// top of `clear_handle_row`) read by ONE fn: `busreg_gen` (the bus router's `Ops::rgen`) calls it, and wm's late-arm
+// stamp check (`wm::armlate_now`) and the spawn body's mint note (`wm::app_mint_note`, `spawn_user_image_bg_inner`)
+// read it in every build, so a stale late name never titles a recycled owner knob-off either. An atomic load; no lock.
+// =================================================================================================
+/// ARMLATE-KNOBOFF — `row`'s current generation (`u64::MAX` for a row outside the table, which no stamp equals).
+pub fn slot_gen(row: usize) -> u64 {
+    if row < SLOT_GEN.len() { SLOT_GEN[row].load(Ordering::Acquire) } else { u64::MAX }
 }

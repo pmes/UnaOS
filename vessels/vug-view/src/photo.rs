@@ -1516,13 +1516,24 @@ fn overlaps(a: (f32, f32, f32, f32), b: (f32, f32, f32, f32)) -> bool {
 /// (`view.size.0`), the glyph goes DOWN to the column's foot instead (x unmoved, [`drop_to`]); at most once per glyph
 /// (x and y only grow), then at most one SR596 push per earlier placed rect. A glyph wider than the sheet keeps its
 /// anchor x, is clipped, and the corner names it ([`wide_note`]).
+/// VUGINTENTSETFACEPUSHFOOT (SR617): when SR596's down push leaves the glyph past the sheet's bottom ([`past_bottom`]),
+/// it turns UP for good: over each placed rect it overlaps it rises to that rect's top less its own height (the nearest
+/// free y above the obstacle; over a stack, above the stack), through the same [`drop_to`], floored at the running row's
+/// foot (the listed column's bottom, else the corner's second row's foot 30 + [`CARD_ROW_PX`]); no rise left ends it.
+/// SR606's foot drop lands on that foot, so it passes the bottom only for a glyph taller than the free band below it:
+/// clipped at the foot, the corner says so ([`wide_note`]). Bound: the down phase as SR606's; after the turn y strictly
+/// falls per lift, never below the foot, never down again (the column cannot overlap at y >= foot); each lift clears one
+/// placed rect, which overlaps again only when the re-page grew the card (its rows only grow as it rises, at most its
+/// line count): at most 1 + |placed| + |placed| x (lines + 1) steps per glyph.
 fn unstack(view: &View, ph: &Photo, face: &SketchFace, mut out: Vec<ProposalGlyph>) -> Vec<ProposalGlyph> {
     let col = listed_column(view, ph, face, &out); // VUGINTENTSETFACELISTEDOVERLAP (SR601): the listed column's strip
+    let foot = band_top(col); // VUGINTENTSETFACEPUSHFOOT (SR617): the free band's top, the lift's floor
     let mut placed: Vec<(f32, f32, f32, f32)> = Vec::new();
     for g in &mut out {
         if anchor(face, ph.offers[g.offer].proposal.stmt.trim()).and_then(|q| face.to_screen(view, q)).is_none() {
             continue;
         }
+        let mut up = false; // VUGINTENTSETFACEPUSHFOOT (SR617): once a down push passes the bottom, the glyph only rises
         loop {
             let me = glyph_rect(g);
             if let Some(c) = col.filter(|c| overlaps(*c, me)) {
@@ -1531,7 +1542,18 @@ fn unstack(view: &View, ph: &Photo, face: &SketchFace, mut out: Vec<ProposalGlyp
                 continue;
             }
             let Some(r) = placed.iter().copied().find(|r| overlaps(*r, me)) else { break };
-            drop_to(view, ph, g, r.1 + r.3); // VUGINTENTSETFACEPUSHEDGE (SR606): SR596's down push through the one re-page
+            if !up {
+                drop_to(view, ph, g, r.1 + r.3); // VUGINTENTSETFACEPUSHEDGE (SR606): SR596's down push through the one re-page
+                up = past_bottom(view, glyph_rect(g)); // VUGINTENTSETFACEPUSHFOOT (SR617): past the sheet's bottom: turn up
+                if !up {
+                    continue;
+                }
+            }
+            let y = (r.1 - glyph_rect(g).3).max(foot); // VUGINTENTSETFACEPUSHFOOT (SR617): the nearest free y above the obstacle, floored at the foot
+            if y >= g.at.1 {
+                break;
+            }
+            drop_to(view, ph, g, y); // VUGINTENTSETFACEPUSHFOOT (SR617): the lift through the one re-page
         }
         placed.push(glyph_rect(g));
     }
@@ -1655,7 +1677,8 @@ fn paint_leader(view: &View, fr: &mut Raster, g: &ProposalGlyph) {
 // ---- VUGINTENTSETFACEPUSHEDGE (SR606): a right push past the sheet's edge goes down to the column's foot; the corner names a glyph wider than the sheet (named tail block) ----
 
 /// SR596's down push and SR606's foot push, ONE re-page: the glyph's head moves to `y` (x unmoved) and its card is
-/// re-paged at the new height from its head offer's page ([`paged`]).
+/// re-paged at the new height from its head offer's page ([`paged`]). VUGINTENTSETFACEPUSHFOOT (SR617): either
+/// direction: [`unstack`]'s lift moves the head UP through the same statements (no second re-page).
 fn drop_to(view: &View, ph: &Photo, g: &mut ProposalGlyph, y: f32) {
     g.at.1 = y;
     if let Some(c) = g.card.as_mut() {
@@ -1668,10 +1691,39 @@ fn drop_to(view: &View, ph: &Photo, g: &mut ProposalGlyph, y: f32) {
 /// <id>` for the first glyph in [`glyphs`]' output whose [`glyph_rect`] is wider than the sheet (`view.size.0`), which no
 /// push can hold and the raster clips; `<id>` is its statement's doc_core id (`<verb> <id>`), else `#<offer>`. Derived
 /// each frame (the pass stores nothing, so [`Photo::note`], the event roads' line, is never overwritten); said once.
+/// VUGINTENTSETFACEPUSHFOOT (SR617): ONE line for both words, the first glyph wins: else `glyph taller than the free
+/// band: <id>` for an anchored glyph [`past_bottom`] whose painted height passes the free band (the sheet's bottom less
+/// the running row's foot, [`band_top`]): the lift stopped at the foot and the raster clips it.
 pub fn wide_note(view: &View) -> Option<String> {
-    let ph = view.photo.as_ref()?;
-    let g = glyphs(view).into_iter().find(|g| glyph_rect(g).2 > view.size.0 as f32)?;
-    let stmt = ph.offers.get(g.offer).map(|o| o.proposal.stmt.as_str()).unwrap_or("");
-    let id = stmt.split_whitespace().nth(1).map_or_else(|| format!("#{}", g.offer), str::to_string);
-    Some(format!("glyph wider than the sheet: {id}"))
+    let (face, ph) = (view.design.face.as_ref()?, view.photo.as_ref()?);
+    let gs = glyphs(view);
+    let band = view.size.1 as f32 - band_top(listed_column(view, ph, face, &gs)); // VUGINTENTSETFACEPUSHFOOT (SR617): the free band
+    gs.iter().find_map(|g| {
+        let r = glyph_rect(g);
+        let anchored = || anchor(face, ph.offers[g.offer].proposal.stmt.trim()).and_then(|q| face.to_screen(view, q)).is_some();
+        let word = if r.2 > view.size.0 as f32 {
+            "wider than the sheet"
+        } else if past_bottom(view, r) && r.3 - (CARD_ROW_PX - GLYPH_PX) > band && anchored() {
+            "taller than the free band" // VUGINTENTSETFACEPUSHFOOT (SR617)
+        } else {
+            return None;
+        };
+        let stmt = ph.offers.get(g.offer).map(|o| o.proposal.stmt.as_str()).unwrap_or("");
+        let id = stmt.split_whitespace().nth(1).map_or_else(|| format!("#{}", g.offer), str::to_string);
+        Some(format!("glyph {word}: {id}"))
+    })
+}
+
+// ---- VUGINTENTSETFACEPUSHFOOT (SR617): a down push past the sheet's bottom lifts above its obstacle; the free band (named tail block) ----
+
+/// A rect past the sheet's bottom by [`paged`]'s own fit: its last row's glyph ([`GLYPH_PX`] of its [`CARD_ROW_PX`]
+/// pitch) ends below `view.size.1`.
+fn past_bottom(view: &View, r: (f32, f32, f32, f32)) -> bool {
+    r.1 + r.3 - (CARD_ROW_PX - GLYPH_PX) > view.size.1 as f32
+}
+
+/// The free band's top, the running row's foot: the listed column's bottom ([`listed_column`]), else the corner's
+/// second row's foot (30 + [`CARD_ROW_PX`], where SR589's first listed head sits).
+fn band_top(col: Option<(f32, f32, f32, f32)>) -> f32 {
+    col.map_or(30.0 + CARD_ROW_PX, |c| c.1 + c.3)
 }
