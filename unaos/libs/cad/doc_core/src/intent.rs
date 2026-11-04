@@ -86,6 +86,10 @@ pub enum Measurement {
     /// VUGINTENTSCAN (SR508): scan_core's detected shapes (SR497) copied as [`ShapeRef`]s, in the document's world
     /// frame; an angle counts `sigma_mm` per `sigma_deg` in the residual.
     Shapes { shapes: Vec<ShapeRef>, sigma_mm: f64, sigma_deg: f64 },
+    /// VUGINTENTTHICKNESS (SR557): a measured thickness `mm` (a side photo's, photo_core `Side.thickness_mm`) along
+    /// `along` (the extrusion direction, any length): the replayed solids' extent along it minus `mm`, judged by the
+    /// one band; a document with no solid pairs nothing (`UnmatchedShape` kind `thickness`).
+    Thickness { mm: f64, sigma_mm: f64, along: Vec3 },
 }
 
 impl Measurement {
@@ -97,7 +101,7 @@ impl Measurement {
     pub fn sigma_mm(&self) -> f64 {
         match self {
             Measurement::Outline { sigma_mm, .. } | Measurement::Points { sigma_mm, .. } => *sigma_mm,
-            Measurement::Shapes { sigma_mm, .. } => *sigma_mm, // VUGINTENTSCAN (SR508)
+            Measurement::Shapes { sigma_mm, .. } | Measurement::Thickness { sigma_mm, .. } => *sigma_mm, // VUGINTENTSCAN (SR508), VUGINTENTTHICKNESS (SR557)
         }
     }
 
@@ -106,6 +110,7 @@ impl Measurement {
             Measurement::Outline { loops, .. } => loops.iter().map(|l| l.len()).sum(),
             Measurement::Points { pts, .. } => pts.len(),
             Measurement::Shapes { shapes, .. } => shapes.len(), // VUGINTENTSCAN (SR508)
+            Measurement::Thickness { .. } => 1, // VUGINTENTTHICKNESS (SR557)
         }
     }
 
@@ -446,6 +451,8 @@ fn residual(r: &Replay, m: &Measurement, tol: Tol, base: Option<&Replay>) -> Res
         Measurement::Shapes { shapes, sigma_mm, sigma_deg } => {
             shape_residuals(r, base.unwrap_or(r), shapes, *sigma_mm, *sigma_deg, &mut d)? // VUGINTENTSETORDER (SR551)
         }
+        // VUGINTENTTHICKNESS (SR557): the solids' extent along the extrusion direction against the measured thickness.
+        Measurement::Thickness { mm, sigma_mm, along } => thickness_residual(r, *mm, *sigma_mm, *along, tol, &mut d)?,
     }
     Ok(fit(&d))
 }
@@ -788,6 +795,10 @@ pub fn measurements_text(m: &Measurement) -> String {
                 out.push_str(&format!("{} support={} rms={}\n", head, s.support, num(s.rms_mm, 3)));
             }
         }
+        // VUGINTENTTHICKNESS (SR557): one line.
+        Measurement::Thickness { mm, sigma_mm, along } => {
+            out.push_str(&format!("thickness: mm={} sigma={} along={}\n", num(*mm, 3), num(*sigma_mm, 3), v3(*along, 4)));
+        }
     }
     out
 }
@@ -1070,4 +1081,33 @@ impl Batch {
             return;
         }
     }
+}
+
+// ---- VUGINTENTTHICKNESS (SR557): the thickness residual (named tail block) ----
+
+/// The replayed solids' extent along `along` (normalised) minus `mm`, one distance into `d`: every solid tessellated
+/// once by [`solid_mesh`] at the Points chord (so a curved face counts, not only the vertices), the extent the max
+/// minus the min of each position's projection. A thickness that is not a finite positive number, or an `along` that
+/// does not normalise, is `BadMeasurement`; no solid is `UnmatchedShape` kind `thickness` (nothing pairs).
+fn thickness_residual(r: &Replay, mm: f64, sigma_mm: f64, along: Vec3, tol: Tol, d: &mut Vec<f64>) -> Result<(), Reason> {
+    if !(mm.is_finite() && mm > 0.0) {
+        return Err(Reason::BadMeasurement);
+    }
+    let Ok(u) = along.normalize() else { return Err(Reason::BadMeasurement) };
+    if r.solids.is_empty() {
+        return Err(Reason::UnmatchedShape { index: 0, kind: "thickness" });
+    }
+    let chord = (sigma_mm * 0.25).max(4.0 * tol.lin);
+    let mesh = solid_mesh(r, chord, tol)?;
+    let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+    for p in &mesh.positions {
+        let t = p.dot(u);
+        lo = lo.min(t);
+        hi = hi.max(t);
+    }
+    if !(hi >= lo) {
+        return Err(Reason::UnmatchedShape { index: 0, kind: "thickness" });
+    }
+    d.push((hi - lo - mm).abs());
+    Ok(())
 }
