@@ -189,6 +189,7 @@ fn event_word(e: &Event) -> Option<String> {
         Event::Done => "done".to_string(),
         Event::LinkLost => "link lost".to_string(),
         Event::AutoReport { on } => format!("autoreport={}", if *on { "on" } else { "unsupported" }), // VUGCOMSCANMARLINAUTOREPORT (SR625)
+        Event::AutoReportAbsent => "autoreport=absent".to_string(), // VUGCOMSCANAUTOREPORTCAPOFF (SR634): the hello carried no Cap:AUTOREPORT_POS:1
         Event::Ok(_) | Event::Status(_) | Event::Message(_) => return None,
     })
 }
@@ -1818,12 +1819,27 @@ impl PumpDesk {
     /// The running pump's position auto-report armed ([`pump_core::Pump::autoreport`], Marlin's `M154 S1` at its first
     /// tick) where the hello is on, as the travel read rides it (SR597): a hello-off desk sends program lines only. A grbl
     /// pump ignores it. Called at a start's handback and at a re-arm (the fresh pump of a relinked run: once per link).
+    /// VUGCOMSCANAUTOREPORTCAPOFF (SR634): asked only where the kept hello carries `Cap:AUTOREPORT_POS:1`
+    /// ([`pump_core::Pump::autoreport_hello`]); else `autoreport=absent`, said once.
     fn autoreport_due(&mut self) {
         if self.hello.is_none() {
             return;
         }
         if let Some(r) = self.running.as_mut() {
-            r.pump.autoreport(pump_core::pump::AUTOREPORT_S);
+            let said = r.hello.clone(); r.pump.autoreport_hello(said.as_deref()); // VUGCOMSCANAUTOREPORTCAPOFF (SR634): the cap gates the ask
+        }
+    }
+}
+
+// --- VUGCOMSCANAUTOREPORTCAPOFF (LEDGER SR634): the desk's own close turns Marlin's position auto-report off (named tail hunk) ---
+
+/// The desk's close of a link is its `Running` dropping (the next start replaces it, or the desk itself goes): a live link
+/// hears `M154 S0` when the report was turned on ([`pump_core::Pump::autoreport_off`]: one write, never a wait, an error
+/// dropped); a lost link (`link: None`) hears nothing. Stop and done keep the link (jog / home ride it), so they write none.
+impl Drop for Running {
+    fn drop(&mut self) {
+        if let Some(l) = self.link.as_mut() {
+            self.pump.autoreport_off(&mut **l);
         }
     }
 }

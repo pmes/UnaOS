@@ -110,6 +110,9 @@ pub enum Event {
     /// VUGCOMSCANMARLINAUTOREPORT (SR625): Marlin's answer to the link-up `M154 S<n>` ([`Pump::autoreport`]): `on` (an `ok`),
     /// else the build lacks AUTO_REPORT_POSITION (`echo:Unknown command`, then its `ok`). Said once per pump.
     AutoReport { on: bool },
+    /// VUGCOMSCANAUTOREPORTCAPOFF (SR634): the hello carried no `Cap:AUTOREPORT_POS:1` ([`Pump::autoreport_hello`]): the
+    /// M154 is never asked. Said once per pump, on its first tick.
+    AutoReportAbsent,
 }
 
 /// Lines sent (started) / acknowledged / total, the state and the last status report.
@@ -451,7 +454,7 @@ impl Pump {
     pub fn tick(&mut self, t: &mut dyn Transport, now_us: u64) -> Vec<Event> {
         let mut ev = Vec::new();
         if !self.started {
-            self.started = true; self.autoreport_due(); // VUGCOMSCANMARLINAUTOREPORT (SR625): the armed M154, once, ahead of the first line
+            self.started = true; self.autoreport_due(&mut ev); // VUGCOMSCANMARLINAUTOREPORT (SR625): the armed M154, once, ahead of the first line; VUGCOMSCANAUTOREPORTCAPOFF (SR634): or `absent` said once
             self.last_rx_us = now_us;
         }
         let mut buf = [0u8; 256];
@@ -674,7 +677,8 @@ pub enum HelloLine {
     End,
     /// The controller refused the verb (`error:N`, Marlin's `Error:` or unknown command).
     Refused,
-    /// Anything else (a push message, a `Cap:` line, an echo): not the identity.
+    /// Anything else (a push message, a `Cap:` line, an echo): not the identity. VUGCOMSCANAUTOREPORTCAPOFF (SR634): Marlin's
+    /// one [`AUTOREPORT_CAP`] line is kept, so the hello carries the position auto-report capability.
     Other,
 }
 
@@ -693,7 +697,7 @@ pub fn hello_line(d: Dialect, s: &str) -> HelloLine {
             }
         }
         Dialect::Marlin => {
-            if s.contains("FIRMWARE_NAME:") {
+            if s.contains("FIRMWARE_NAME:") || s == AUTOREPORT_CAP { // VUGCOMSCANAUTOREPORTCAPOFF (SR634): the one Cap line kept
                 HelloLine::Keep
             } else if s.starts_with("ok") {
                 HelloLine::End
@@ -962,13 +966,15 @@ impl Pump {
 pub const AUTOREPORT_S: u8 = 1;
 
 /// Where a pump's one `M154 S<n>` stands: not asked, armed for the first tick, out (and whether Marlin called it an
-/// unknown command), answered.
+/// unknown command), answered. VUGCOMSCANAUTOREPORTCAPOFF (SR634): `Absent` (the hello carried no cap: never asked,
+/// `absent` said on the first tick); `Answered { on }` (the report runs: the desk's close turns it off).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AutoAsk {
     Off,
     Due(u8),
+    Absent,
     Out { unknown: bool },
-    Answered,
+    Answered { on: bool },
 }
 
 impl Pump {
@@ -984,10 +990,18 @@ impl Pump {
     }
 
     /// The first tick: an armed `M154 S<s>` onto `rt_pending` (flushed this tick before the window writes a line).
-    fn autoreport_due(&mut self) {
-        if let AutoAsk::Due(s) = self.autoreport {
-            self.rt_pending.extend_from_slice(alloc::format!("M154 S{s}\n").as_bytes());
-            self.autoreport = AutoAsk::Out { unknown: false };
+    /// VUGCOMSCANAUTOREPORTCAPOFF (SR634): an `Absent` ask says [`Event::AutoReportAbsent`] once instead.
+    fn autoreport_due(&mut self, ev: &mut Vec<Event>) {
+        match self.autoreport {
+            AutoAsk::Due(s) => {
+                self.rt_pending.extend_from_slice(alloc::format!("M154 S{s}\n").as_bytes());
+                self.autoreport = AutoAsk::Out { unknown: false };
+            }
+            AutoAsk::Absent => {
+                self.autoreport = AutoAsk::Answered { on: false };
+                ev.push(Event::AutoReportAbsent);
+            }
+            _ => {}
         }
     }
 
@@ -1002,20 +1016,59 @@ impl Pump {
             return true;
         }
         if s.starts_with("ok") {
-            self.autoreport = AutoAsk::Answered;
+            self.autoreport = AutoAsk::Answered { on: !unknown };
             ev.push(Event::AutoReport { on: !unknown });
             return true;
         }
         if s == "start" || marlin_halted(s) {
-            self.autoreport = AutoAsk::Answered;
+            self.autoreport = AutoAsk::Answered { on: false };
         }
         false
     }
 
     /// A lost link answers no M154: an M154 out is forgotten, so a later home / jog line's `ok` is never swallowed.
+    /// VUGCOMSCANAUTOREPORTCAPOFF (SR634): a running report is forgotten too, so a lost link never hears `M154 S0`.
     fn autoreport_lost(&mut self) {
-        if matches!(self.autoreport, AutoAsk::Out { .. }) {
-            self.autoreport = AutoAsk::Answered;
+        if matches!(self.autoreport, AutoAsk::Out { .. } | AutoAsk::Answered { on: true }) {
+            self.autoreport = AutoAsk::Answered { on: false };
         }
+    }
+}
+
+// --- VUGCOMSCANAUTOREPORTCAPOFF (LEDGER SR634): the M154 asked only where M115 says the cap; `M154 S0` at the desk's close (named tail hunk) ---
+
+/// The one M115 capability line the hello keeps ([`hello_line`]): Marlin built with AUTO_REPORT_POSITION.
+pub const AUTOREPORT_CAP: &str = "Cap:AUTOREPORT_POS:1";
+
+/// The kept hello answer (`said`, the kept lines joined by one space) carries [`AUTOREPORT_CAP`].
+pub fn autoreport_cap(said: &str) -> bool {
+    said.split(' ').any(|w| w == AUTOREPORT_CAP)
+}
+
+impl Pump {
+    /// Arm the position auto-report from the link's hello: with [`AUTOREPORT_CAP`] in `said`, SR625's
+    /// [`Pump::autoreport`] at [`AUTOREPORT_S`]; without it (or no hello kept) the M154 is never asked and the first tick
+    /// says [`Event::AutoReportAbsent`] once. Marlin only; called before the first tick (a pump arms at most once).
+    pub fn autoreport_hello(&mut self, said: Option<&str>) {
+        if self.dialect != Dialect::Marlin || self.autoreport != AutoAsk::Off {
+            return;
+        }
+        if said.is_some_and(autoreport_cap) {
+            self.autoreport(AUTOREPORT_S);
+        } else {
+            self.autoreport = AutoAsk::Absent;
+        }
+    }
+
+    /// The desk's own close of a live link: `M154 S0` on the realtime road when the report was turned on (an `ok` to
+    /// the M154), so the controller is not left reporting into a dead line. One try, never a wait on its answer: a
+    /// short or failed write is dropped (the link is closing). Nothing after a loss (`autoreport_lost` forgot the on).
+    pub fn autoreport_off(&mut self, t: &mut dyn Transport) {
+        if self.autoreport != (AutoAsk::Answered { on: true }) {
+            return;
+        }
+        self.autoreport = AutoAsk::Answered { on: false };
+        self.rt_pending.extend_from_slice(b"M154 S0\n");
+        let _ = self.flush_rt(t);
     }
 }
