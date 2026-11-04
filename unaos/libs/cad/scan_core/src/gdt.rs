@@ -24,7 +24,8 @@
 //!    vertices to the plane `fit_plane` gives through them. Cylindricity (two coaxial cylinders, axis and radius free):
 //!    max − min of the radial residual about the cylinder `fit_cylinder` gives through them. The reference is least
 //!    squares after the RANSAC consensus; every form vertex counts in the band, the consensus only places the
-//!    reference. The min-zone (Chebyshev) value under it is owed (VUG-SCAN-GDT-MINZONE).
+//!    reference. The min-zone (Chebyshev) value under it, VUGSCANGDTMINZONE (SR554): [`flatness_minzone`] /
+//!    [`cylindricity_minzone`], the discrete Chebyshev band as its dual LP (`chebyshev_band`, the exchange method).
 //! 4. Position: the fitted axis against the nominal axis as a diameter zone, [`position_mm`]: twice the larger distance
 //!    of the measured axis from the nominal one at the feature's two axial ends. The frame is the design's after the
 //!    best-fit registration; a datum frame is owed (VUG-SCAN-GDT-DATUMS).
@@ -119,6 +120,8 @@ pub struct FaceGdt {
     pub band_mm: Option<f64>,
     pub axis: Option<Cylinder>,
     pub extent: (f64, f64),
+    pub minzone_flatness_mm: Option<MinZone>,
+    pub minzone_cylindricity_mm: Option<MinZone>,
 }
 
 impl FaceGdt {
@@ -268,6 +271,8 @@ pub fn gdt(scan: &ScanMesh, design: &Design, dev: &Deviation, margin_mm: f64, to
                 band_mm: None,
                 axis: None,
                 extent: (0.0, 0.0),
+                minzone_flatness_mm: None,
+                minzone_cylindricity_mm: None,
             };
             out.matched = dev.face_of_vertex.iter().zip(&dev.per_vertex).filter(|(f, d)| **f == Some(face) && d.is_some()).count() as u32;
             if nominal == Nominal::Other {
@@ -312,6 +317,7 @@ pub fn gdt(scan: &ScanMesh, design: &Design, dev: &Deviation, margin_mm: f64, to
                 Nominal::Plane(_) => {
                     if let Ok(f) = fit_plane(&pts, FIT_BAND) {
                         out.flatness_mm = spread(pts.iter().map(|&p| f.shape.signed_distance(p)));
+                        out.minzone_flatness_mm = Some(flatness_minzone(&pts, &f.shape, tol));
                     }
                 }
                 Nominal::Cylinder(nc) => {
@@ -323,6 +329,7 @@ pub fn gdt(scan: &ScanMesh, design: &Design, dev: &Deviation, margin_mm: f64, to
                         out.cylindricity_mm = spread(pts.iter().map(|&p| radial(&c, p).mag() - c.radius));
                         out.position_mm = Some(position_mm(&c, &nc, out.extent));
                         out.axis = Some(c);
+                        out.minzone_cylindricity_mm = Some(cylindricity_minzone(&pts, &c, tol));
                     }
                 }
                 Nominal::Other => {}
@@ -330,4 +337,293 @@ pub fn gdt(scan: &ScanMesh, design: &Design, dev: &Deviation, margin_mm: f64, to
             out
         })
         .collect()
+}
+
+// ---- VUGSCANGDTMINZONE (LEDGER SR554): the ISO 1101 minimum zone under the least-squares band ----
+//
+// ISO 1101's form zone is the MINIMUM zone (Chebyshev): the narrowest two parallel planes / two coaxial cylinders
+// holding every form vertex, never wider than the least-squares band above. Both forms are one problem: the residual
+// v_i - phi_i . p of a linear model whose band (max - min) is minimised over p, the discrete Chebyshev approximation.
+// [`chebyshev_band`] solves it as the dual of the LP  min w  s.t.  c <= v_i - phi_i . p <= c + w,  whose k + 2 rows
+// make the simplex basis the contact set (3 + 1 or 2 + 2 for a plane) and each pivot the exchange step (Stiefel).
+// Flatness is that LP in a frame about a reference normal, re-framed about the answer; cylindricity is that LP over
+// the linearised radial distance about the current axis, a step kept only when the EXACT radial band narrows
+// (successive LP, monotone from the least-squares axis). Pure, deterministic; `ls` names the fallback.
+
+use alloc::string::String;
+
+/// The most simplex pivots one `chebyshev_band` takes; past it the search has not converged.
+pub const MINZONE_PIVOTS: u32 = 4096;
+/// The most axis steps [`cylindricity_minzone`] takes before it is called not converged.
+pub const MINZONE_ROUNDS: u32 = 12;
+/// The most re-framings [`flatness_minzone`] takes.
+const MINZONE_FRAMES: u32 = 4;
+/// The most halvings of a cylinder step that did not narrow the band.
+const MINZONE_HALVINGS: u32 = 4;
+
+/// A minimum-zone value: `mm` the zone's width; `ls` when the search did not converge and `mm` IS the least-squares
+/// band (printed `<mm>|ls`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MinZone {
+    pub mm: f64,
+    pub ls: bool,
+}
+
+impl core::fmt::Display for MinZone {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        if self.ls { write!(f, "{:.3}|ls", self.mm) } else { write!(f, "{:.3}", self.mm) }
+    }
+}
+
+impl FaceGdt {
+    /// The `gdt:` line's min-zone token: ` minzone_flatness=<mm>` for a plane, ` minzone_cylindricity=<mm>` for a
+    /// cylinder (`|ls` on the fallback), empty when unmeasured.
+    pub fn minzone_tokens(&self) -> String {
+        match (self.nominal, self.minzone_flatness_mm, self.minzone_cylindricity_mm) {
+            (Nominal::Plane(_), Some(m), _) => alloc::format!(" minzone_flatness={m}"),
+            (Nominal::Cylinder(_), _, Some(m)) => alloc::format!(" minzone_cylindricity={m}"),
+            _ => String::new(),
+        }
+    }
+}
+
+/// One simplex pivot of the `m`-row tableau `t` (row stride `w`, the last entry of a row its right-hand side) and its
+/// objective row `obj` on row `r`, column `j`.
+fn mz_pivot(t: &mut [f64], obj: &mut [f64], w: usize, m: usize, r: usize, j: usize) {
+    let piv = t[r * w + j];
+    for x in &mut t[r * w..(r + 1) * w] {
+        *x /= piv;
+    }
+    for q in 0..m {
+        let f = t[q * w + j];
+        if q != r && f != 0.0 {
+            for c in 0..w {
+                t[q * w + c] -= f * t[r * w + c];
+            }
+        }
+    }
+    let f = obj[j];
+    if f != 0.0 {
+        for c in 0..w {
+            obj[c] -= f * t[r * w + c];
+        }
+    }
+}
+
+/// Maximise over the tableau: enter a column below `limit` with a reduced cost under `-tol.lin` (the most negative;
+/// Bland's first after a degenerate pivot), leave by the ratio test (ties to the smallest basic index). `false` when
+/// unbounded or past [`MINZONE_PIVOTS`].
+fn mz_run(t: &mut [f64], obj: &mut [f64], basis: &mut [usize], w: usize, limit: usize, tol: Tol, pivots: &mut u32) -> bool {
+    let m = basis.len();
+    let mut bland = false;
+    loop {
+        let mut enter: Option<usize> = None;
+        for j in 0..limit {
+            if obj[j] < -tol.lin && (enter.is_none() || (!bland && obj[j] < obj[enter.unwrap_or(j)])) {
+                enter = Some(j);
+                if bland {
+                    break;
+                }
+            }
+        }
+        let Some(j) = enter else { return true };
+        let mut leave: Option<(usize, f64)> = None;
+        for r in 0..m {
+            let a = t[r * w + j];
+            if a > tol.ang {
+                let ratio = t[r * w + w - 1].max(0.0) / a;
+                let better = match leave {
+                    None => true,
+                    Some((lr, lb)) => ratio < lb || (ratio == lb && basis[r] < basis[lr]),
+                };
+                if better {
+                    leave = Some((r, ratio));
+                }
+            }
+        }
+        let Some((r, ratio)) = leave else { return false };
+        if *pivots >= MINZONE_PIVOTS {
+            return false;
+        }
+        *pivots += 1;
+        if ratio <= 0.0 {
+            bland = true;
+        }
+        mz_pivot(t, obj, w, m, r, j);
+        basis[r] = j;
+    }
+}
+
+/// The `p` (length `k`) minimising max − min of `v_i − phi_i · p` (`phi` row-major n × k, entries normalised to
+/// about [-1, 1]), by the dual LP  max Σ v_i (ν_i − μ_i)  s.t.  Σ (ν_i − μ_i) phi_i = 0, Σ (ν_i − μ_i) = 0, Σ ν_i = 1,
+/// ν, μ ≥ 0: two phases over k + 2 artificials, the primal read from the reduced costs under the artificial columns
+/// (y = c_B B⁻¹: p, then the zone's lower edge, then its width). Zeros: a reduced cost (mm) against `tol.lin`, a pivot
+/// entry (dimensionless) against `tol.ang`. `None` past [`MINZONE_PIVOTS`] or on a short slice.
+fn chebyshev_band(phi: &[f64], v: &[f64], k: usize, tol: Tol) -> Option<Vec<f64>> {
+    let n = v.len();
+    if n == 0 || phi.len() < n * k {
+        return None;
+    }
+    let (m, ns) = (k + 2, 2 * n);
+    let cols = ns + m;
+    let w = cols + 1;
+    let mut t = alloc::vec![0.0f64; m * w];
+    for i in 0..n {
+        for r in 0..k {
+            t[r * w + i] = phi[i * k + r];
+            t[r * w + n + i] = -phi[i * k + r];
+        }
+        t[k * w + i] = 1.0;
+        t[k * w + n + i] = -1.0;
+        t[(k + 1) * w + i] = 1.0;
+    }
+    for r in 0..m {
+        t[r * w + ns + r] = 1.0;
+    }
+    t[(k + 1) * w + w - 1] = 1.0;
+    let mut basis: Vec<usize> = (ns..cols).collect();
+    let mut pivots = 0u32;
+    // Phase 1: maximise −Σ artificials.
+    let mut obj = alloc::vec![0.0f64; w];
+    for r in 0..m {
+        for c in 0..w {
+            if c < ns || c == w - 1 {
+                obj[c] -= t[r * w + c];
+            }
+        }
+    }
+    if !mz_run(&mut t, &mut obj, &mut basis, w, ns, tol, &mut pivots) || obj[w - 1] < -tol.lin {
+        return None;
+    }
+    // An artificial left basic at zero leaves on any structural column; none and the row is redundant.
+    for r in 0..m {
+        if basis[r] >= ns {
+            if let Some(j) = (0..ns).find(|&j| t[r * w + j].abs() > tol.ang) {
+                mz_pivot(&mut t, &mut obj, w, m, r, j);
+                basis[r] = j;
+            }
+        }
+    }
+    // Phase 2: the dual objective; artificials never re-enter.
+    let cost = |j: usize| if j < n { v[j] } else if j < ns { -v[j - n] } else { 0.0 };
+    for c in 0..w {
+        let cj = if c < cols { cost(c) } else { 0.0 };
+        obj[c] = (0..m).map(|r| cost(basis[r]) * t[r * w + c]).sum::<f64>() - cj;
+    }
+    if !mz_run(&mut t, &mut obj, &mut basis, w, ns, tol, &mut pivots) {
+        return None;
+    }
+    Some((0..k).map(|r| obj[ns + r]).collect())
+}
+
+/// ISO 1101 minimum-zone flatness of `points` from the least-squares plane `ls`: the band LP over (x, y) in the frame
+/// of the current normal (x, y over the half extent), the normal tilted by its answer, re-framed while the exact
+/// perpendicular band narrows by `tol.lin` or more, at most [`MINZONE_FRAMES`] times; never above the least-squares
+/// band (`spread` of the signed distance to `ls`, the `flatness_mm` expression), which is the `ls` fallback when the
+/// first LP refuses or the points are too few or flat in extent.
+pub fn flatness_minzone(points: &[Vec3], ls: &Plane, tol: Tol) -> MinZone {
+    let ls_mm = spread(points.iter().map(|&p| ls.signed_distance(p))).unwrap_or(0.0);
+    let fallback = MinZone { mm: ls_mm, ls: true };
+    if points.len() < 4 {
+        return fallback;
+    }
+    let Ok(mut n) = ls.normal.normalize() else { return fallback };
+    let c = points.iter().fold(Vec3::ZERO, |s, &p| s + p) * (1.0 / points.len() as f64);
+    let mut best = ls_mm;
+    for round in 0..MINZONE_FRAMES {
+        let Ok(u) = n.any_perpendicular() else { return fallback };
+        let v = n.cross(u);
+        let l = points.iter().map(|&p| u.dot(p - c).abs().max(v.dot(p - c).abs())).fold(0.0f64, f64::max);
+        if !(l > tol.lin) {
+            return fallback;
+        }
+        let (mut phi, mut z) = (Vec::with_capacity(2 * points.len()), Vec::with_capacity(points.len()));
+        for &p in points {
+            let d = p - c;
+            phi.push(u.dot(d) / l);
+            phi.push(v.dot(d) / l);
+            z.push(n.dot(d));
+        }
+        let Some(ab) = chebyshev_band(&phi, &z, 2, tol) else {
+            if round == 0 {
+                return fallback;
+            }
+            break;
+        };
+        let Ok(n2) = (n - u * (ab[0] / l) - v * (ab[1] / l)).normalize() else { break };
+        let w = spread(points.iter().map(|&p| n2.dot(p))).unwrap_or(f64::INFINITY);
+        if !(w < best - tol.lin) {
+            best = best.min(w);
+            break;
+        }
+        best = w;
+        n = n2;
+    }
+    MinZone { mm: best.min(ls_mm), ls: false }
+}
+
+/// ISO 1101 minimum-zone cylindricity of `points` from the least-squares cylinder `ls`: about the current axis (frame
+/// u, v, a at the points' mean along it, H the half extent), the band LP over phi = (cos, sin, z/H cos, z/H sin) with
+/// value the radial distance gives the axis step (dx, dy, tx, ty); the step, or its half down to [`MINZONE_HALVINGS`]
+/// halvings, is kept only when the EXACT radial band narrows. Converged when a kept step narrows it by under `tol.lin`
+/// or no step narrows it; not converged within [`MINZONE_ROUNDS`], an LP refusing, or too few points: the least-squares
+/// band (the `cylindricity_mm` expression) with `ls`.
+pub fn cylindricity_minzone(points: &[Vec3], ls: &Cylinder, tol: Tol) -> MinZone {
+    let band = |c: &Cylinder| spread(points.iter().map(|&p| radial(c, p).mag() - c.radius));
+    let ls_mm = band(ls).unwrap_or(0.0);
+    let fallback = MinZone { mm: ls_mm, ls: true };
+    if points.len() < 5 {
+        return fallback;
+    }
+    let (mut cur, mut best) = (*ls, ls_mm);
+    for _ in 0..MINZONE_ROUNDS {
+        let Ok(a) = cur.axis.normalize() else { return fallback };
+        let Ok(u) = a.any_perpendicular() else { return fallback };
+        let Ok(v) = a.cross(u).normalize() else { return fallback };
+        let t0 = points.iter().map(|&p| a.dot(p - cur.point)).sum::<f64>() / points.len() as f64;
+        let p0 = cur.point + a * t0;
+        let h = points.iter().map(|&p| a.dot(p - p0).abs()).fold(0.0f64, f64::max);
+        if !(h > tol.lin) {
+            return fallback;
+        }
+        let (mut phi, mut rho) = (Vec::with_capacity(4 * points.len()), Vec::with_capacity(points.len()));
+        for &p in points {
+            let d = p - p0;
+            let (x, y, z) = (u.dot(d), v.dot(d), a.dot(d) / h);
+            let r = libm::sqrt(x * x + y * y);
+            if r <= tol.lin {
+                continue;
+            }
+            let (cx, sy) = (x / r, y / r);
+            phi.extend_from_slice(&[cx, sy, z * cx, z * sy]);
+            rho.push(r);
+        }
+        if rho.len() < 5 {
+            return fallback;
+        }
+        let Some(s) = chebyshev_band(&phi, &rho, 4, tol) else { return fallback };
+        let mut kept = None;
+        let mut f = 1.0;
+        for _ in 0..=MINZONE_HALVINGS {
+            let axis = (a + u * (f * s[2] / h) + v * (f * s[3] / h)).normalize();
+            if let Ok(axis) = axis {
+                let cand = Cylinder { point: p0 + u * (f * s[0]) + v * (f * s[1]), axis, radius: cur.radius };
+                if let Some(w) = band(&cand) {
+                    if w < best {
+                        kept = Some((cand, w));
+                        break;
+                    }
+                }
+            }
+            f *= 0.5;
+        }
+        let Some((cand, w)) = kept else { return MinZone { mm: best, ls: false } };
+        let gain = best - w;
+        cur = cand;
+        best = w;
+        if gain < tol.lin {
+            return MinZone { mm: best, ls: false };
+        }
+    }
+    fallback
 }

@@ -941,7 +941,7 @@ fn gdt_road(a: &Args, sm: &ScanMesh, dev: Option<&(Deviation, Vec<String>, scan_
             }
             scan_core::Nominal::Other => {}
         }
-        for &(_, kind, tol) in calls.iter().filter(|c| c.0 == f.face as usize) {
+        r.push_str(&f.minzone_tokens()); for &(_, kind, tol) in calls.iter().filter(|c| c.0 == f.face as usize) { // VUGSCANGDTMINZONE (SR554): the min-zone token before the verdicts
             let v = match f.verdict(kind, tol) {
                 scan_core::Verdict::Pass { .. } => {
                     pass += 1;
