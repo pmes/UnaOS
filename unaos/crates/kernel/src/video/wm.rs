@@ -33765,3 +33765,77 @@ pub fn app_path_with(owner: u64, f: impl FnOnce(&str) -> bool) -> Option<bool> {
     let t = APP_PATHS.lock();
     t.iter().find(|e| e.0 == owner).map(|e| f(e.1.as_str()))
 }
+
+// =================================================================================================
+// BUSREG-ARM-EARLY (rmbp-ledger B1164) — TAIL-APPENDED, feature `busreg` only (knob-off: no symbol, no byte).
+// [`app_name_arm`] is RETROACTIVE (WINTITLE-LATE): every launcher arms after the spawn returned and the task is
+// runnable, because the arch spawn entry points take the image BYTES only — the launcher alone knows the path.
+// The one word that reaches the spawn body is argv[0], and on a KERNEL launch road (shell `bg`, Quarry, the dock,
+// Holocron at login) it is the kernel's own word: the path it read the image from, or a bare name. The arch body
+// arms it HERE, at the mint, before the task exists (`bus_route::arm_early`), stamped with the row's bus
+// GENERATION (bumped only at teardown), so a record never answers for the slot's next tenant. This record is the
+// bus check's ONLY: it is invisible to [`mint_title`], [`app_name_of`] and [`app_name_armed`] by construction, so
+// no window title, NOTICE or PREFSCAP wire moves, and the late arm stays the window-owner binding. The path is the
+// raw argv[0]; [`app_path_early_of`] answers only an ABSOLUTE one (BUSREG-TAG-PATH's rule: a bare name is a name,
+// never a path), and the name is [`program_name`] of it — the ONE derivation.
+// LOCK ORDER: a LEAF like [`APP_NAMES`] — taken alone, never across another lock, never under `bus_route`'s REGS.
+// =================================================================================================
+/// One early record: (owner, the row's generation at the mint, the raw argv[0]).
+#[cfg(feature = "busreg")]
+static APP_NAMES_EARLY: Mutex<alloc::vec::Vec<(u64, u64, alloc::string::String)>> = Mutex::new(alloc::vec::Vec::new());
+
+/// BUSREG-ARM-EARLY — record the kernel launcher's argv[0] `path` for `owner` at generation `gen`, before the task
+/// can run. Re-arms the owner's row in place (the slot's previous tenant is necessarily gone). `false` = owner 0
+/// or an empty name (nothing recorded; a row the owner held is dropped either way).
+#[cfg(feature = "busreg")]
+pub fn app_name_arm_early(owner: u64, gen: u64, path: &str) -> bool {
+    if owner == 0 {
+        return false;
+    }
+    let ok = !program_name(path).is_empty();
+    let mut t = APP_NAMES_EARLY.lock();
+    t.retain(|e| e.0 != owner);
+    if ok {
+        t.push((owner, gen, alloc::string::String::from(path)));
+    }
+    ok
+}
+
+/// BUSREG-ARM-EARLY — `owner`'s early program name at generation `gen`, copied into `out`; its length (0 = no
+/// record, or a record from another generation).
+#[cfg(feature = "busreg")]
+pub fn app_name_early_of(owner: u64, gen: u64, out: &mut [u8; MAX_TITLE]) -> usize {
+    if owner == 0 {
+        return 0;
+    }
+    let t = APP_NAMES_EARLY.lock();
+    match t.iter().find(|e| e.0 == owner && e.1 == gen) {
+        Some(e) => {
+            let name = program_name(e.2.as_str()).as_bytes();
+            let n = name.len().min(MAX_TITLE);
+            out[..n].copy_from_slice(&name[..n]);
+            n
+        }
+        None => 0,
+    }
+}
+
+/// BUSREG-ARM-EARLY — `f(path)` for `owner`'s early path at generation `gen`, [`app_path_with`]'s shape; `None` =
+/// no record at that generation, or its argv[0] is not absolute. `f` runs under the leaf lock and takes no lock.
+#[cfg(feature = "busreg")]
+pub fn app_path_early_of(owner: u64, gen: u64, f: impl FnOnce(&str) -> bool) -> Option<bool> {
+    if owner == 0 {
+        return None;
+    }
+    let t = APP_NAMES_EARLY.lock();
+    t.iter().find(|e| e.0 == owner && e.1 == gen && e.2.starts_with('/')).map(|e| f(e.2.as_str()))
+}
+
+/// BUSREG-ARM-EARLY — drop `owner`'s early record (the witness's cleanup; a teardown needs none: the generation moves).
+#[cfg(feature = "busreg")]
+pub fn app_name_early_forget(owner: u64) {
+    if owner == 0 {
+        return;
+    }
+    APP_NAMES_EARLY.lock().retain(|e| e.0 != owner);
+}

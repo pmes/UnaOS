@@ -8349,7 +8349,7 @@ pub fn spawn_user_image_bg_argv(bytes: &[u8], argv: &[&str]) -> Result<(u64, u64
             });
         }
     };
-    let asid = mapped.ttbr0 >> 48; spawn_path_bind(asid, bytes, pipe, ring3); super::xwin::args_write(mapped.slot, argv); #[cfg(feature = "desktop_firmware")] crate::video::wm::spawn_focus_arm(asid); // FOCUSARM64 (SR180): every launch through this funnel arms its first window's focus token before the task can run, x86 `spawn_user_image_bg_inner`'s twin (aarch64 has no desktop-app exemption to make; LINE-NEUTRAL fold). ARMPIPE (A108): the pipe bound and the principal ruled BEFORE the task can run (fn at the FILE TAIL). RING3ABI2 M2
+    let asid = mapped.ttbr0 >> 48; spawn_path_bind(asid, bytes, pipe, ring3); super::xwin::args_write(mapped.slot, argv); #[cfg(feature = "desktop_firmware")] crate::video::wm::spawn_focus_arm(asid); #[cfg(all(feature = "busreg", feature = "aarch64_el0"))] crate::bus_route::arm_early(asid as usize, if !ring3 { argv.first().copied() } else { None }); /* BUSREG-ARM-EARLY (B1164): the kernel launcher's own argv[0] (never ring-3 bytes) armed for the bus check before the task can run (bus_route tail) */ // FOCUSARM64 (SR180): every launch through this funnel arms its first window's focus token before the task can run, x86 `spawn_user_image_bg_inner`'s twin (aarch64 has no desktop-app exemption to make; LINE-NEUTRAL fold). ARMPIPE (A108): the pipe bound and the principal ruled BEFORE the task can run (fn at the FILE TAIL). RING3ABI2 M2
     // VUG-BG: mark the address space DETACHED before the task can be dispatched, so the program observes
     // the bit on its very first info-page read rather than racing the launcher. See `set_detached`.
     set_detached(asid, true);
