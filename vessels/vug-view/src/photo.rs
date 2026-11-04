@@ -1535,7 +1535,7 @@ fn unstack(view: &View, ph: &Photo, face: &SketchFace, mut out: Vec<ProposalGlyp
         if anchor(face, ph.offers[g.offer].proposal.stmt.trim()).and_then(|q| face.to_screen(view, q)).is_none() {
             continue;
         }
-        let mut up = false; // VUGINTENTSETFACEPUSHFOOT (SR617): once a down push passes the bottom, the glyph only rises
+        let (mut up, mut turn) = (false, 0.0f32); // VUGINTENTSETFACEPUSHFOOT (SR617): once a down push passes the bottom, the glyph only rises; VUGINTENTSETFACEPUSHFULL (SR629): turn, the y the down push turned at
         loop {
             let me = glyph_rect(g);
             if let Some(c) = col.filter(|c| overlaps(*c, me)) {
@@ -1546,14 +1546,14 @@ fn unstack(view: &View, ph: &Photo, face: &SketchFace, mut out: Vec<ProposalGlyp
             let Some(r) = placed.iter().copied().find(|r| overlaps(*r, me)) else { break };
             if !up {
                 drop_to(view, ph, g, r.1 + r.3); // VUGINTENTSETFACEPUSHEDGE (SR606): SR596's down push through the one re-page
-                up = past_bottom(view, glyph_rect(g)); // VUGINTENTSETFACEPUSHFOOT (SR617): past the sheet's bottom: turn up
+                up = past_bottom(view, glyph_rect(g)); turn = g.at.1; // VUGINTENTSETFACEPUSHFOOT (SR617): past the sheet's bottom: turn up
                 if !up {
                     continue;
                 }
             }
             let y = (r.1 - glyph_rect(g).3).max(foot); // VUGINTENTSETFACEPUSHFOOT (SR617): the nearest free y above the obstacle, floored at the foot
             if y >= g.at.1 {
-                break;
+                no_free_band(view, ph, g, turn, &placed); break; // VUGINTENTSETFACEPUSHFULL (SR629): on the foot and still overlapping: no free band, back to the walk's last free y
             }
             drop_to(view, ph, g, y); // VUGINTENTSETFACEPUSHFOOT (SR617): the lift through the one re-page
         }
@@ -1707,6 +1707,8 @@ pub fn wide_note(view: &View) -> Option<String> {
             "wider than the sheet"
         } else if past_bottom(view, r) && r.3 - (CARD_ROW_PX - GLYPH_PX) > band && anchored() {
             "taller than the free band" // VUGINTENTSETFACEPUSHFOOT (SR617)
+        } else if past_bottom(view, r) && pushed_down(view, g) {
+            "has no free band" // VUGINTENTSETFACEPUSHFULL (SR629)
         } else {
             return None;
         };
@@ -1728,6 +1730,32 @@ fn past_bottom(view: &View, r: (f32, f32, f32, f32)) -> bool {
 /// second row's foot (30 + [`CARD_ROW_PX`], where SR589's first listed head sits).
 fn band_top(col: Option<(f32, f32, f32, f32)>) -> f32 {
     col.map_or(30.0 + CARD_ROW_PX, |c| c.1 + c.3)
+}
+
+// ---- VUGINTENTSETFACEPUSHFULL (SR629): a band full of placed rects: the glyph goes back to the walk's last free y; the corner names it (named tail block) ----
+
+/// [`unstack`]'s lift ended on the foot ([`band_top`]) still overlapping a placed rect: no y between the foot and the
+/// obstacle is free, and the sheet has no overflow road (it is the window, `view.size`: it never pages or grows; only a
+/// card pages, [`paged`]). A glyph the free band holds goes back to the walk's last non-overlapping y, the turn
+/// (`turn`, where SR596's down push left it past the bottom), then down under each placed rect it still overlaps there
+/// (SR596's push through the one [`drop_to`]): never on a placed rect, x unmoved, clipped, and the corner says
+/// `glyph has no free band: <id>` ([`wide_note`]). A glyph taller than the free band (past the bottom on the foot)
+/// keeps SR617's foot and SR617's word. Bound: one more walk per glyph; y only grows, each push clears one placed rect
+/// for good (the card only shrinks as it falls, [`paged`]'s rows fall with y): at most 1 + |placed| more steps.
+fn no_free_band(view: &View, ph: &Photo, g: &mut ProposalGlyph, turn: f32, placed: &[(f32, f32, f32, f32)]) {
+    if past_bottom(view, glyph_rect(g)) {
+        return;
+    }
+    drop_to(view, ph, g, turn);
+    while let Some(r) = placed.iter().copied().find(|r| overlaps(*r, glyph_rect(g))) {
+        drop_to(view, ph, g, r.1 + r.3);
+    }
+}
+
+/// An anchored glyph whose cross sits BELOW its anchor ([`leader`]): a down push moved it. Past the bottom, only
+/// [`no_free_band`] leaves a glyph the free band holds there (a right push keeps y; an untouched glyph has no leader).
+fn pushed_down(view: &View, g: &ProposalGlyph) -> bool {
+    leader(view, g).is_some_and(|(c, a)| c.1 > a.1 + 0.5)
 }
 
 // ---- VUGFACEPHOTOCROPSAVE (SR640): the face's crop, its mask, its save beside the photo, the re-open (named tail block) ----

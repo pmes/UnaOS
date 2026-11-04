@@ -154,6 +154,7 @@ pub fn install_console_summon(window: &crate::NativeWindow, synapse: Synapse) {
 /// The jog pad under the Console's scrollback: comscan's `PumpCard` (the pad's state, folded from the bus) and the widgets
 /// painting `widgets::jog_rows` over its snapshot. A key fires the card's own request on the bus; the desk refuses by name
 /// what it cannot do, so the pad only greys (and says why) while no link is up.
+#[derive(Clone)] // VUGCOMSCANDECLARECONSOLEFACE (SR633): the declare entry's Enter holds a clone (Rc and GObject handles) to repaint
 struct JogPad {
     card: std::rc::Rc<std::cell::RefCell<comscan::PumpCard>>,
     link: Label,
@@ -171,7 +172,7 @@ fn pad_label() -> Label {
 
 /// Build the jog pad, append it to `container` and paint its first rows. Keys fire on `synapse` as the local user.
 fn jog_pad(container: &Box, synapse: Synapse) -> JogPad {
-    use crate::widgets::jog_rows::{key_verb, KEYS, STEPS_MM};
+    use crate::widgets::jog_rows::{declare_verb, key_verb, DECLARE_PLACEHOLDER, KEYS, STEPS_MM}; // VUGCOMSCANDECLARECONSOLEFACE (SR633): declare_verb, DECLARE_PLACEHOLDER
     let who = bandy::Origin::LocalUser(std::env::var("USER").unwrap_or_else(|_| "una".into()));
     let card = std::rc::Rc::new(std::cell::RefCell::new(comscan::PumpCard::new(who)));
 
@@ -202,6 +203,8 @@ fn jog_pad(container: &Box, synapse: Synapse) -> JogPad {
         steps.push(b);
     }
 
+    let declare = super::glyph::GlyphEntry::new(DECLARE_PLACEHOLDER); // VUGCOMSCANDECLARECONSOLEFACE (SR633): the house entry, under the squawk row
+
     let key_row = Box::new(Orientation::Horizontal, 4);
     let mut keys: Vec<gtk4::Button> = Vec::with_capacity(KEYS.len());
     for (k, label) in KEYS {
@@ -216,6 +219,7 @@ fn jog_pad(container: &Box, synapse: Synapse) -> JogPad {
     pad.append(&travel);
     pad.append(&position);
     pad.append(&squawk);
+    pad.append(&declare); // VUGCOMSCANDECLARECONSOLEFACE (SR633)
     pad.append(&step_row);
     pad.append(&key_row);
     pad.append(&why);
@@ -223,6 +227,19 @@ fn jog_pad(container: &Box, synapse: Synapse) -> JogPad {
 
     let p = JogPad { card, link, travel, position, squawk, why, steps, keys };
     p.render();
+    {
+        // VUGCOMSCANDECLARECONSOLEFACE (SR633): Enter fires the card's declare when the parser takes the line and clears the
+        // entry; a refused line stays for mending (the card says why in the squawk row); the pad repaints either way.
+        let (pc, syn) = (p.clone(), synapse.clone());
+        declare.connect_activate(move |e| {
+            let sent = declare_verb(&mut pc.card.borrow_mut(), &e.text());
+            if let Some(m) = sent {
+                syn.fire(m);
+                e.set_text("");
+            }
+            pc.render();
+        });
+    }
     p
 }
 

@@ -1383,6 +1383,40 @@ fn a_glyph_taller_than_the_free_band_is_clipped_and_the_corner_says_so() {
     assert!((30..40u32).any(|y| (6..46u32).any(|x| fr.pixel(x, y) == ink)), "the corner's second row paints INK");
 }
 
+// ---- VUGINTENTSETFACEPUSHFULL (SR629): a band full of placed rects: the glyph goes back to the walk's last free y and the corner says so ----
+
+/// No listed column (the foot, the corner's second row's, at 42) on a sheet short enough that the low side's stack
+/// starts within one row under the foot (30 < y0 < 54): every y from the foot down to the stack overlaps a placed
+/// single, and the sheet has no overflow road (it never pages or grows). The last single, pushed past the bottom, has
+/// no free band: it goes back to the walk's last free y (under the stack, where SR596's push turned it), x unmoved,
+/// clear of every placed rect, clipped, and the corner's second row says `glyph has no free band: <id>` in INK.
+#[test]
+fn a_glyph_in_a_full_band_stays_at_its_last_free_y_and_the_corner_says_so() {
+    use vug_view::sketch::INK;
+    let mut tried = Vec::new();
+    let case = (52..=200u32).find_map(|h| {
+        let (_, (_, y0), _) = stacked(h, 200, 0, 1);
+        let m = fitting(h, y0);
+        tried.push((h, y0, m));
+        (y0 > 30.0 && y0 < 54.0 && m >= 1).then_some((h, y0, m))
+    });
+    let (h, y0, m) = case.unwrap_or_else(|| panic!("a sheet holds the full band: (h, y0, fit) {tried:?}"));
+    let (vw, natural, gs) = stacked(h, 200, 0, m + 1);
+    let g = &gs[m];
+    let turn = y0 + 12.0 * m as f32;
+    assert!((g.at.0 - natural.0).abs() < 1e-3 && (g.at.1 - turn).abs() < 1e-3, "back under the stack, x unmoved: {:?} natural {natural:?} turn {turn}", g.at);
+    let r = photo::glyph_rect(g);
+    assert!(r.1 + r.3 - 2.0 > h as f32, "clipped at the bottom: {r:?} h {h}");
+    for o in &gs[..m] {
+        let q = photo::glyph_rect(o);
+        assert!(!(r.0 < q.0 + q.2 && q.0 < r.0 + r.2 && r.1 < q.1 + q.3 && q.1 < r.1 + r.3), "clear of {q:?}: {r:?}");
+    }
+    assert_eq!(photo::wide_note(&vw.view).as_deref(), Some(format!("glyph has no free band: v{}", 20 + m).as_str()));
+    let fr = raster::render(&vw.model, &vw.view);
+    let ink = raster::rgba(INK);
+    assert!((30..40u32).any(|y| (6..46u32).any(|x| fr.pixel(x, y) == ink)), "the corner's second row paints INK");
+}
+
 // ---- VUGFACEPHOTOCROPSAVE (SR640): the face's crop and its save beside the photo (named tail block) ----
 
 /// A fresh folder under the test target for one crop test.
