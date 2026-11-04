@@ -14,7 +14,8 @@ use comscan::pump::{Opener, PumpDesk, TCP_SCHEME, Verdict, by_scheme, digest_hex
 use comscan::tcp::{CONNECT_WAIT, Port, Refusal, opener, parse, refusal_of};
 use make_core::gcode::Dialect;
 use make_core::{
-    Aabb3, Axis, AxisId, Kinematics, Machine, MachineKind, Move, Power, PowerKind, Program, Tool, ToolKind, Units, Vec3,
+    Aabb3, Axis, AxisId, Coolant, Kinematics, Machine, MachineKind, Move, Power, PowerKind, Program, Spin, Tool, ToolKind, Units,
+    Vec3,
 };
 use pump_core::{LinkError, Pump, Transport};
 
@@ -301,6 +302,18 @@ fn fake_grbl_lost_after_as(l: TcpListener, n: usize, ver: &'static str) -> JoinH
     })
 }
 
+/// VUGCOMSCANRESUMEMODAL (SR656): what a resume at pump line `at` sends: the program's modal preamble (make_core's one
+/// `G21 G90 G17 G94` line, every group it sets, one line each), the `tool` words the lines before `at` set
+/// (VUGCOMSCANRESUMETOOL SR663) and then the lines from `at` on.
+fn modal_then(lines: &[String], at: usize, tool: &[&str]) -> Vec<String> {
+    lines[0]
+        .split_whitespace()
+        .map(str::to_string)
+        .chain(tool.iter().map(|w| w.to_string()))
+        .chain(lines[at..].iter().cloned())
+        .collect()
+}
+
 fn refused_why(out: &[PumpEvent]) -> String {
     match out {
         [PumpEvent::PumpRefused { why }] => why.clone(),
@@ -342,7 +355,9 @@ fn drive_until(
 fn a_lost_tcp_link_is_link_lost_at_its_line_redials_with_backoff_and_resumes_only_after_a_rearm() {
     let (l, port) = listener();
     let fake1 = fake_grbl_lost_after(l, 5);
-    let p = program();
+    let mut p = program();
+    p.moves.insert(1, Move::Spindle(Spin::Cw(1200.0))); // VUGCOMSCANRESUMETOOL (SR663): the spindle and the flood on before the cut
+    p.moves.insert(2, Move::Coolant(Coolant::Flood));
     let want = Pump::from_program(&p, GRBL).unwrap();
     let at = want.line_of(5).unwrap();
     let lines = want.lines().to_vec();
@@ -426,7 +441,7 @@ fn a_lost_tcp_link_is_link_lost_at_its_line_redials_with_backoff_and_resumes_onl
         other => panic!("{other:?}"),
     }
     drop(desk);
-    assert_eq!(fake2.join().unwrap(), lines[5..].to_vec(), "the second link ran only the lines from the lost one on");
+    assert_eq!(fake2.join().unwrap(), modal_then(&lines, 5, &["M3 S1200", "G4 P4", "M8"]), "the second link ran the modal and tool words set before the lost line (the spindle, its spin-up dwell, the flood), then the lines from it on");
 }
 
 // --- VUGCOMSCANHELLOID (SR546): the controller's own identity at the first open, a reopen onto another board refused ---
@@ -551,7 +566,7 @@ fn a_reopen_onto_another_board_is_refused_by_name_and_keeps_redialing_the_same_b
         other => panic!("{other:?}"),
     }
     drop(desk);
-    assert_eq!(fake_a.join().unwrap(), lines[5..].to_vec(), "the same board ran only the lines from the lost one on");
+    assert_eq!(fake_a.join().unwrap(), modal_then(&lines, 5, &[]), "the same board ran the modal words, then only the lines from the lost one on");
 }
 
 // --- VUGCOMSCANHOSTDESK (SR561): the first bind commissions an unnamed board once; a reopen compares the commissioned name ---
@@ -759,7 +774,7 @@ fn a_reopen_onto_a_board_answering_another_name_refuses_another_board() {
     }
     drop(desk);
     let (ran_a, writes_a) = fake_a.join().unwrap();
-    assert_eq!(ran_a, lines[5..].to_vec(), "the commissioned board ran only the lines from the lost one on");
+    assert_eq!(ran_a, modal_then(&lines, 5, &[]), "the commissioned board ran the modal words, then only the lines from the lost one on");
     assert!(writes_a.is_empty(), "a reopen never commissions");
 }
 
