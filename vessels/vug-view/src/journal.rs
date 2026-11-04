@@ -268,11 +268,13 @@ pub struct Journal {
     pub save_as: Option<SaveAs>,
     /// VUGFACEJOURNALSOLIDFAULT (SR572): the last regenerate's carried failures (no solid reads them), marked in the panel.
     pub faults: Vec<doc_core::Failure>,
+    /// VUGFACEJOURNALFAULTFIX (SR578): the faulted statement id whose offered fix Escape declined (cleared by a commit).
+    pub declined: Option<String>,
 }
 
 impl Default for Journal {
     fn default() -> Journal {
-        Journal { doc: Doc::new(Tol::DEFAULT), closed: 0, open: None, undo: Vec::new(), redo: Vec::new(), panel: false, cursor: 0, edit: None, note: None, saved: None, disk: None, save_as: None, faults: Vec::new() }
+        Journal { doc: Doc::new(Tol::DEFAULT), closed: 0, open: None, undo: Vec::new(), redo: Vec::new(), panel: false, cursor: 0, edit: None, note: None, saved: None, disk: None, save_as: None, faults: Vec::new(), declined: None }
     }
 }
 
@@ -327,7 +329,7 @@ impl Journal {
         }
         self.redo.clear();
         self.cursor = self.doc.stmts.len().saturating_sub(1);
-        self.note = None;
+        self.note = None; self.declined = None; // VUGFACEJOURNALFAULTFIX (SR578): a new document, the offers asked again
     }
 
     /// A history edit: regenerate `cand`, and only then make it the document (a snapshot). VUGINTENTUNDOSET (SR563): also
@@ -491,6 +493,11 @@ pub fn key(d: &mut Design, k: &str) -> Option<bool> {
             }
             "Delete" | "\u{f728}" => j.delete(j.cursor),
             _ if back => j.delete(j.cursor),
+            _ if enter && j.offered().is_some() => j.accept_fix(), // VUGFACEJOURNALFAULTFIX (SR578): Enter takes the fix offered on the faulted row
+            "Escape" | "\u{1b}" if j.offered().is_some() => {
+                j.decline_fix(); // VUGFACEJOURNALFAULTFIX (SR578): Escape declines it
+                return Some(true);
+            }
             _ if enter => {
                 match j.doc.stmts.get(j.cursor).and_then(value) {
                     Some(_) => {
@@ -524,7 +531,7 @@ pub fn overlay(view: &View, fr: &mut Raster) {
         return;
     }
     let (w, h) = (fr.width as f32, fr.height as f32);
-    let x0 = (w * 0.75).floor();
+    let x0 = panel_x0(fr.width); // VUGFACEJOURNALFAULTFIX (SR578): the one panel edge (deviation.rs corner_origin reads it)
     raster::tint(fr, &[vec![(x0, 0.0), (w, 0.0), (w, h), (x0, h)]], rgba(raster::BACKGROUND), 0.9);
     raster::line(fr, (x0, 0.0), (x0, h), rgba(INK));
     let rows = j.rows();
@@ -546,6 +553,7 @@ pub fn overlay(view: &View, fr: &mut Raster) {
         }
         raster::text(fr, &clip(&text), x0 + 4.0, y, col);
     }
+    fix_overlay(j, fr, x0, h, &clip); // VUGFACEJOURNALFAULTFIX (SR578): the offered fix above the note
     if let Some(n) = &j.note {
         let col = if n.starts_with("line ") { rgba(REFUSED) } else { rgba(INK) };
         raster::text(fr, &clip(&n.to_uppercase()), x0 + 4.0, h - ROW_PX, col);
@@ -793,4 +801,129 @@ impl Journal {
         self.edit = None;
         true
     }
+}
+
+// ---- VUGFACEJOURNALFAULTFIX (LEDGER SR578): a fix offered on the faulted line, entered only on the person's key ----
+// With the panel shown and its cursor on a row a carried failure names ([`Journal::faulted`]), [`Journal::offered`] is the
+// ONE unambiguous fix for that failure, computed on demand from the document, the carried failures and the undo
+// snapshots (nothing cached): `NoMachine` (an Op) offers the ONE distinct machine statement the undo snapshots hold (a
+// document with a NoMachine fault holds none: doc_core's `machine_of` reads the whole document and the reader refuses a
+// second machine and an orphan axis / tool), inserted as a statement (its held library with it) at the first Op's index;
+// `Conflicting` (a constraint of a sketch no feature names) offers removing the NEWEST `fix` among that sketch's
+// conflicting constraints, never the origin's (at [0 0]). Every other failure offers nothing (a choice: owed
+// VUG-FACE-JOURNAL-FAULT-FIX-MANY). Enter enters it through the journal's existing roads, [`Journal::adopt`] (the
+// insert) or [`Journal::delete`] (the removal), each ONE snapshot, so one `u` takes it back; Escape declines it until
+// the next commit. The photo road's Offer is not used: it needs an open photo and judges against its measurement.
+
+/// How an offered fix enters the document.
+#[derive(Clone, Debug, PartialEq)]
+pub enum FixRoad {
+    /// The statement inserted at this index, through [`Journal::adopt`].
+    Insert(usize, Stmt),
+    /// The statement at this index removed, through the panel's [`Journal::delete`].
+    Remove(usize),
+}
+
+/// A fix offered on a faulted row: the document line it is offered on, its text (the writer's line, or `remove <id>`)
+/// and its road.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Fix {
+    pub line: u32,
+    pub text: String,
+    pub road: FixRoad,
+}
+
+/// The panel's left edge on a frame `width` wide: the right quarter is the panel ([`overlay`]; deviation.rs
+/// `corner_origin` moves the corner left of it).
+pub fn panel_x0(width: u32) -> f32 {
+    (width as f32 * 0.75).floor()
+}
+
+/// One statement as the writer writes it (its line, the header dropped).
+fn stmt_text(s: &Stmt) -> String {
+    let mut d = Doc::new(Tol::DEFAULT);
+    d.stmts = vec![s.clone()];
+    doc_core::write(&d).lines().nth(1).unwrap_or_default().to_string()
+}
+
+impl Journal {
+    /// The one unambiguous fix for the carried failure on statement `i` (the table above); None for a row no failure
+    /// names, a failure with a choice, a history with no machine or with several.
+    pub fn fix_for(&self, i: usize) -> Option<Fix> {
+        let id = self.doc.stmts.get(i)?.id()?;
+        let f = self.faults.iter().find(|f| !f.id.is_empty() && f.id == id)?;
+        let line = self.doc.line(i);
+        match &f.fault {
+            Fault::NoMachine => {
+                let mut held: Vec<&Stmt> = Vec::new();
+                for d in self.undo.iter().rev() {
+                    for s in d.stmts.iter().filter(|s| matches!(s, Stmt::Machine(_))) {
+                        if !held.contains(&s) {
+                            held.push(s);
+                        }
+                    }
+                }
+                let [m] = held.as_slice() else { return None };
+                let m: &Stmt = m;
+                let at = self.doc.stmts.iter().position(|s| matches!(s, Stmt::Op { .. }))?;
+                Some(Fix { line, text: stmt_text(m), road: FixRoad::Insert(at, m.clone()) })
+            }
+            Fault::Conflicting => {
+                let Stmt::Constraint { sketch, .. } = &self.doc.stmts[i] else { return None };
+                let conflicting = |k: &str| self.faults.iter().any(|f| f.fault == Fault::Conflicting && f.id == k);
+                let k = (0..self.doc.stmts.len()).rev().find(|&k| {
+                    matches!(&self.doc.stmts[k], Stmt::Constraint { id: kid, sketch: s, c: Cons::Fix(_, at) }
+                        if s == sketch && !(at[0] == 0.0 && at[1] == 0.0) && conflicting(kid.as_str()))
+                })?;
+                let rid = self.doc.stmts[k].id()?;
+                Some(Fix { line, text: format!("remove {rid}"), road: FixRoad::Remove(k) })
+            }
+            _ => None,
+        }
+    }
+
+    /// The fix shown now: the panel shown, no row edit open, the cursor row's fix ([`Journal::fix_for`]) unless Escape
+    /// declined it.
+    pub fn offered(&self) -> Option<Fix> {
+        if !self.panel || self.edit.is_some() {
+            return None;
+        }
+        let id = self.doc.stmts.get(self.cursor)?.id()?;
+        if self.declined.as_deref() == Some(id) {
+            return None;
+        }
+        self.fix_for(self.cursor)
+    }
+
+    /// Enter on the offered fix: inserted through [`Journal::adopt`] or removed through [`Journal::delete`] (ONE
+    /// snapshot either way; a refusal names its line and nothing changes); the note `fixed line N: <text>`.
+    fn accept_fix(&mut self) -> Result<Regen, String> {
+        let f = self.offered().ok_or("no fix")?;
+        let r = match f.road {
+            FixRoad::Insert(at, s) => {
+                let mut cand = self.doc.clone();
+                cand.lines.clear();
+                cand.stmts.insert(at, s);
+                self.adopt(cand)?
+            }
+            FixRoad::Remove(k) => self.delete(k)?,
+        };
+        self.note = Some(format!("fixed line {}: {}", f.line, f.text));
+        Ok(r)
+    }
+
+    /// Escape on the offered fix: hidden for that statement until the next commit; the note `declined fix line N`.
+    fn decline_fix(&mut self) {
+        let Some(f) = self.offered() else { return };
+        self.declined = self.doc.stmts.get(self.cursor).and_then(Stmt::id).map(str::to_string);
+        self.note = Some(format!("declined fix line {}", f.line));
+    }
+}
+
+/// The offered fix in the panel: `FIX: <TEXT> (ENTER)` in the accent, on the note row (the row above it while a note is
+/// shown), clipped to the panel.
+fn fix_overlay(j: &Journal, fr: &mut Raster, x0: f32, h: f32, clip: &dyn Fn(&str) -> String) {
+    let Some(f) = j.offered() else { return };
+    let y = if j.note.is_some() { h - 2.0 * ROW_PX } else { h - ROW_PX };
+    raster::text(fr, &clip(&format!("FIX: {} (ENTER)", f.text.to_uppercase())), x0 + 4.0, y, rgba(ACTIVE));
 }
