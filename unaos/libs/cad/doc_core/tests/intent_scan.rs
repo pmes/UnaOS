@@ -7,6 +7,7 @@ use doc_core::{
     Class, Doc, Measurement, Proposal, Reason, ShapeParams, ShapeRef, Verdict, clearance_for, measurements_text,
     nearest_standard, read, replay, suggest, verify, verify_all,
 };
+use doc_core::{Lib, Stmt, What, apply, apply_with, read_with}; // VUGINTENTSETORDER (SR551)
 
 const SIGMA: f64 = 0.3;
 const SIGMA_DEG: f64 = 0.5;
@@ -488,28 +489,34 @@ fn a_boss_with_its_top_measured_is_accepted_as_one_set() {
     assert_eq!(set.len(), 4, "{:?}", stmts(&ps));
     assert!(set[0].why.contains("far-end plane #6"), "{}", set[0].why);
     assert!(set[3].stmt.ends_with("length=12"), "{}", set[3].stmt);
-    // The SR536 gap: the set's leading line alone is refused by the boss top no document face models.
-    assert!((residual_max(&verify(&d, set[0], &m, d.tol)) - 12.1).abs() < 1e-6);
+    // VUGINTENTSETORDER (SR551): the boss top no document face models within the band is left out of the leading
+    // line's residual (the SR536 gap closed: it was refused by Residual 12.1).
+    assert!(matches!(verify(&d, set[0], &m, d.tol), Verdict::Accept { .. }));
     let first = ps.len() - 4;
     let b = verify_all(&d, &ps, &m, d.tol);
     assert_eq!(b.sets.len(), 1, "{}", b.text());
     let (start, steps) = &b.sets[0];
     assert_eq!(*start, first);
     assert_eq!(steps.len(), 4);
-    assert!((residual_max(&steps[0]) - 12.1).abs() < 1e-6, "{:?}", steps[0]);
-    assert!(matches!(steps[3], Verdict::Accept { .. }), "{:?}", steps[3]);
+    assert!(steps.iter().all(|v| matches!(v, Verdict::Accept { .. })), "{:?}", steps);
     for (s, _, v) in &b.entries[first..] {
         match v {
             Verdict::Accept { max_mm, .. } => assert!(*max_mm <= 3.0 * SIGMA, "{s}: max {max_mm}"),
             v => panic!("{s}: the set refused: {v:?}\n{}", b.text()),
         }
     }
-    assert_eq!(b.accepted(), 4, "{}", b.text());
-    assert_eq!(b.doc.stmts.len(), d.stmts.len() + 4);
+    // VUGINTENTSETORDER (SR551): the plate's own single proposals AND the set.
+    assert_eq!(b.accepted(), ps.len(), "{}", b.text());
+    assert_eq!(b.doc.stmts.len(), d.stmts.len() + ps.len());
+    // The set's graph is the reader's: the extrude names its sketch and its circle.
+    let id = |p: &Proposal| p.stmt.split(' ').nth(1).unwrap().to_string();
+    let ex = b.doc.stmts.iter().find(|s| s.id() == Some(id(set[3]).as_str())).unwrap();
+    assert_eq!(ex.refs(), [id(set[0]), id(set[2])]);
+    assert!(matches!(ex, Stmt::Extrude { .. }));
     let t = b.text();
     let lines: Vec<&str> = t.lines().collect();
     let sk = lines.iter().find(|l| l.starts_with(&format!("accept {}", set[0].stmt))).unwrap();
-    assert!(sk.contains(" set=1 step=refuse residual max="), "{t}");
+    assert!(sk.ends_with(" set=1 step=accept"), "{t}");
     let ex = lines.iter().find(|l| l.starts_with(&format!("accept {}", set[3].stmt))).unwrap();
     assert!(ex.ends_with(" set=1 step=accept"), "{t}");
     assert_eq!(lines.iter().filter(|l| l.starts_with("accept ")).count(), b.accepted(), "{t}");
@@ -541,4 +548,42 @@ fn a_set_with_a_wrong_extrude_is_refused_whole_with_its_reason() {
     // Nothing of the set entered the document.
     assert!(b.doc.stmts.len() == d.stmts.len() + b.accepted() && b.accepted() + 4 <= n, "{}", b.text());
     assert!(!b.doc.stmts.iter().any(|s| s.id() == stmts(&ps)[n - 1].split(' ').nth(1)), "{}", b.text());
+}
+
+// ---- VUGINTENTSETORDER (SR551): a library part takes a proposal through apply_with ----
+
+/// A shelf of one machine library by name (the face's lookup beside the part, in memory).
+struct Shelf(&'static str, String);
+
+impl Lib for Shelf {
+    fn resolve(&self, name: &str) -> Option<String> {
+        (name == self.0).then(|| self.1.clone())
+    }
+}
+
+#[test]
+fn a_library_part_takes_a_proposal_through_apply_with() {
+    let lib = "vug-doc version=1 lin=1e-6 ang=1e-9
+machine mill name=\"Shop mill\" kind=mill3 kinematics=cartesian units=mm envelope=[[-50 -50 -60] [100 100 50]] safe_z=10 power=spindle power_max=24000 ask_above=20000
+axis axis=x min=-50 max=100 max_feed=5000 max_accel=500 rapid=8000
+axis axis=y min=-50 max=100 max_feed=5000 max_accel=500 rapid=8000
+axis axis=z min=-60 max=50 max_feed=2000 max_accel=300 rapid=4000
+tool number=1 kind=flat_end dc=6 lf=40 apmx=2 nof=2 sig=0
+";
+    let shelf = Shelf("shop-mill", lib.to_string());
+    let part = format!("{}machine mill lib=shop-mill loaded=1\n", plate(80.0, 60.0, 10.0));
+    let d = read_with(&part, &shelf).unwrap_or_else(|r| panic!("read_with: {r:?}"));
+    let prop = p("distance i1 sketch=s a=p1 b=p2 d=80");
+    // The plain road re-reads without the library and refuses it by name.
+    match apply(&d, &prop) {
+        Err(Reason::Lex(r)) => assert_eq!(r.what, What::UnknownLib("shop-mill".into())),
+        other => panic!("apply on a library part: {other:?}"),
+    }
+    let d2 = apply_with(&d, &prop, &shelf).unwrap_or_else(|r| panic!("apply_with: {}", r.text()));
+    assert_eq!(d2.stmts.len(), d.stmts.len() + 1);
+    assert!(matches!(d2.stmts.last(), Some(Stmt::Constraint { .. })));
+    assert_eq!(d2.stmts.last().unwrap().refs(), ["s", "p1", "p2"]);
+    let Some(Stmt::Machine(m)) = d2.stmts.iter().find(|s| matches!(s, Stmt::Machine(_))) else { panic!("machine") };
+    assert_eq!(m.lib.as_ref().map(|l| l.name.as_str()), Some("shop-mill"));
+    assert_eq!(m.loaded, Some(1));
 }
