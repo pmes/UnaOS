@@ -346,12 +346,7 @@ impl Viewer {
             self.view.design.journal.disk = Some(Err("save as: no path typed".to_string()));
             return;
         }
-        let mut p = std::path::PathBuf::from(typed);
-        if p.is_relative() {
-            if let Some(dir) = self.save_to.as_deref().and_then(|s| s.parent()) {
-                p = dir.join(p);
-            }
-        }
+        let mut p = journal::beside(self, typed); // VUGFACEPATHBESIDE (SR594): THE typed-path rule, the `:` line's `report open <path>` too
         if p.extension().is_none() {
             p.set_extension("vug");
         }

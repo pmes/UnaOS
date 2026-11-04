@@ -878,7 +878,7 @@ impl Viewer {
     /// One command on the map: `report` writes the report ([`Viewer::report_command`]); any other line is
     /// [`command`]'s. True when the map changed; refused by name, as each road refuses.
     pub fn map_command(&mut self, line: &str) -> Result<bool, String> {
-        if line.trim() == "report open" { return self.report_open().map(|_| true); } if let Some(p) = line.trim().strip_prefix("report open ") { return self.report_open_path(std::path::Path::new(p.trim())).map(|_| true); } if line.trim() == "report" { // VUGFACECOMMANDCARET (SR587): `report open <path>` reads any report file; VUGFACEGDTREPORTOPEN (SR581): `report open` shows the written report as a sheet
+        if line.trim() == "report open" { return self.report_open().map(|_| true); } if let Some(p) = line.trim().strip_prefix("report open ") { let p = crate::journal::beside(self, p.trim()); return self.report_open_path(&p).map(|_| true); } if line.trim() == "report" { // VUGFACEPATHBESIDE (SR594): the typed path through THE rule (journal.rs `beside`), where Save As puts it; VUGFACECOMMANDCARET (SR587): `report open <path>` reads any report file; VUGFACEGDTREPORTOPEN (SR581): `report open` shows the written report as a sheet
             return self.report_command().map(|_| true);
         }
         command(&mut self.view, &self.model, line)
@@ -1056,7 +1056,7 @@ pub fn line_overlay(view: &View, fr: &mut Frame) {
 
 // ---- VUGFACECOMMANDCARET (LEDGER SR587): any report file as the sheet, with or without a map ----
 // VUGFACEGDTREPORTOPEN (SR581) read only the map's own report. [`Viewer::report_open_path`] is THE sheet road: the
-// map's `report open` ([`Viewer::report_open`]), the typed `report open <path>` ([`Viewer::map_command`], the path as typed)
+// map's `report open` ([`Viewer::report_open`]), the typed `report open <path>` ([`Viewer::map_command`], beside the opened document: journal.rs `beside`, SR594)
 // and main.rs's `.vugreport` open ([`Viewer::open_report`], an empty document's face with no map) all read through it.
 // BP-vug-5: a printed verdict, nothing changes.
 
