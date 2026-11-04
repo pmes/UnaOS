@@ -346,7 +346,7 @@ impl View {
         // VUGFACE2 (SR485): the body replaces the drawn model; a bare left press is the sketch face's first.
         let shown = self.design.shown();
         let model = shown.as_deref().unwrap_or(model);
-        self.cursor = (x, y); if let Some(r) = crate::fillet::press(self, model, button, mods, x, y) { return r; } // VUGFACEFILLET (SR511): a click re-picks the edge
+        self.cursor = (x, y); if let Some(r) = crate::photo::press(self, button, x, y) { return r; } if let Some(r) = crate::fillet::press(self, model, button, mods, x, y) { return r; } // VUGINTENTSETFACELISTROWS (SR589): a click on a card's more line turns its page, photo first; VUGFACEFILLET (SR511): a click re-picks the edge
         if let Some(r) = crate::sketch::press(self, button, mods, x, y) {
             return r;
         }
@@ -415,7 +415,7 @@ impl View {
         if dy == 0.0 {
             return false;
         }
-        let target = self.zoom_target(model);
+        if let Some(r) = crate::photo::wheel(self, dy) { return r; } let target = self.zoom_target(model); // VUGINTENTSETFACELISTROWS (SR589): the wheel over a paged card turns its page, one per event
         self.dolly(target, ((dy as f32) * 0.01).exp().clamp(0.5, 2.0));
         true
     }

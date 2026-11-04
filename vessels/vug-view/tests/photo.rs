@@ -904,3 +904,71 @@ fn a_single_extrude_offered_before_a_panel_delete_enters_in_the_journal_names() 
     let x = vw.view.design.journal.doc.stmts.iter().find(|s| matches!(s, doc_core::Stmt::Extrude { .. })).expect("the extrude entered");
     assert!(matches!(x, doc_core::Stmt::Extrude { outer: o, .. } if *o == outer), "the journal's outer is the one offered: {x:?}");
 }
+
+// ---- VUGINTENTSETFACELISTROWS (SR589): the listed column reserves the paged height; the more line and the wheel page ----
+
+/// SR583's chain of six datum points (twelve lines, one why): one connected set, ONE card.
+fn chain() -> Vec<Proposal> {
+    let why = "a chain of datum points";
+    let mut set = Vec::new();
+    let mut prev = "e0".to_string();
+    for k in 0..6u32 {
+        let (pt, d) = (format!("v{}", 3 + 2 * k), format!("v{}", 4 + 2 * k));
+        set.push(datum(&format!("point {pt} sketch=s x={} y=0", 5 * (k + 1)), why));
+        set.push(datum(&format!("distance {d} sketch=s a={prev} b={pt} d=5"), why));
+        prev = pt;
+    }
+    set
+}
+
+/// The rectangle face on a sheet 148 px tall: the twelve-line card listed at y = 42 shows seven lines and the more line
+/// (eight rows), so the lone listed proposal after it sits at the PAGED height, 30 + 12 * (1 + 8 + 1) = 150, not at the
+/// twelve lines' 198.
+#[test]
+fn a_glyph_after_a_paged_card_sits_at_the_paged_height() {
+    let mut vw = rectangle();
+    vw.view.resize(W, 148);
+    let mut ps = chain();
+    ps.push(datum("point v40 sketch=s x=20 y=10", "a lone datum point"));
+    assert!(photo::offer(&mut vw.view, ps));
+    let gs = photo::glyphs(&vw.view);
+    assert_eq!(gs.len(), 2, "the card and the lone point: {gs:?}");
+    let c = gs[0].card.as_ref().expect("a card");
+    assert_eq!((c.lines.len(), c.fit, c.rows().len()), (12, 7, 8));
+    assert_eq!(gs[0].at, (6.0, 42.0));
+    assert_eq!(gs[1].at, (6.0, 150.0), "the list below moves by the shown rows");
+}
+
+/// The same card: a Left press on `... 5 MORE` (the eighth row, y 138..150 from x 14) turns the page as PageDown does
+/// (`... 5 BACK`); a press on the BACK line returns to the top (B1119: 0 from the last page). The wheel over the card
+/// turns one page per event and does not zoom; a press away from every more line is not photo's.
+#[test]
+fn a_click_on_the_more_line_turns_the_page() {
+    use vug_view::view::Button;
+    let mut vw = rectangle();
+    vw.view.resize(W, 148);
+    assert!(photo::offer(&mut vw.view, chain()));
+    let card = |vw: &Viewer| photo::glyphs(&vw.view)[0].card.clone().expect("a card");
+    assert_eq!(card(&vw).rows()[7], "... 5 MORE");
+    assert!(vw.view.press(&vw.model, Button::Left, 0, 16.0, 140.0));
+    let c = card(&vw);
+    assert_eq!(c.first, 5);
+    assert_eq!(c.rows()[7], "... 5 BACK");
+    assert_eq!(ph(&vw).focus, Some(0), "the card is focused");
+    assert!(vw.view.press(&vw.model, Button::Left, 0, 16.0, 140.0));
+    assert_eq!(card(&vw).first, 0, "back to the top");
+    // The wheel over the card: one page per notch, the camera untouched.
+    let cam = vw.view.camera;
+    vw.view.cursor = (16.0, 60.0);
+    assert!(vw.view.wheel(&vw.model, 1.0));
+    assert_eq!(card(&vw).first, 5);
+    assert!(vw.view.wheel(&vw.model, -1.0));
+    assert_eq!(card(&vw).first, 0);
+    assert_eq!(vw.view.camera, cam, "the wheel over a card does not zoom");
+    // Off the card the wheel zooms and a press is not photo's.
+    vw.view.cursor = (400.0, 20.0);
+    assert!(vw.view.wheel(&vw.model, 1.0));
+    assert_ne!(vw.view.camera, cam, "the wheel off the card zooms");
+    assert!(photo::press(&mut vw.view, Button::Left, 400.0, 20.0).is_none());
+    assert_eq!(card(&vw).first, 0);
+}
