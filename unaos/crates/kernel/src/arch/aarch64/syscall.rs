@@ -7702,7 +7702,7 @@ enum MapErr {
 /// W^X page permissions (PF_X -> RO+EL0-exec code pages; R/W -> EL0+EL1-RW/never-exec data pages). It
 /// stamps the IMAGE_SHA256 principal over the whole image. The bytes are UNTRUSTED — nothing is trusted
 /// beyond the size bound + per-page permissions; they run only under EL0 + the M6b fault-kill net.
-fn map_image_into_slot(bytes: &[u8]) -> Result<Mapped, MapErr> {
+fn map_image_into_slot(bytes: &[u8]) -> Result<Mapped, MapErr> { crate::prefs::stamp_machine_store(); // MACHINESTORESTAMPRING3 (rmbp-ledger B1162): the no-session settings folder laid and stamped ROOTACL `system` once per boot before the first ring-3 slot (prefs.rs tail; no-op until a native volume is mounted). LINE-NEUTRAL append, code first
     if bytes.is_empty() {
         return Err(MapErr::Empty);
     }

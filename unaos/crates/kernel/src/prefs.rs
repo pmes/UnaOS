@@ -2011,3 +2011,51 @@ fn unset_selftest() {
         restored as u8, if ok { "PASS" } else { "FAIL" }
     );
 }
+
+// ── MACHINESTORESTAMPRING3 (rmbp-ledger B1162, BP-storage-11) — TAIL-APPENDED ──────────────────────────────────────────
+// The no-session folder is laid and stamped ROOTACL `system` BEFORE the first ring-3 program runs, so a plant is refused
+// at CREATE (`rootacl::write_verdict` on the stamped folder) rather than read as content later (B1156's reader refusal
+// stays as the second net, and `load`'s lazy stamp stays). There is no single post-bind pre-spawn boot point (x86 binds
+// the root on a service-loop pass, aarch64 lazily), so the call rides each arch's ring-3 image mapper
+// (`map_image_into_slot`, every program's one road to a slot), gated on `unafs::mount_bound_handle()` — a masked read-only
+// peek that never runs the lazy bind or a survey walk (UNLOCKSTACK B1092): no native volume mounted = no-op, retried at
+// the next spawn; latched after the ONE attempt. No store read, no TREE, no SAVE_LOCK (create and stamp are idempotent).
+// Wire, once per boot: `[prefs] machine store dir=/settings owner=<system|none> made=<0|1> at=spawn` (ROOTACL's own
+// `[rootacl] store dir=/settings owner=system stamped=1` prints only on the boot that WRITES the row).
+
+/// Latched after the one boot attempt (a native volume was mounted at a spawn).
+static MACHINE_LAID: AtomicBool = AtomicBool::new(false);
+
+/// The ring-3 mapper's call: lay and stamp the machine store folder once per boot, before the first program's slot.
+pub fn stamp_machine_store() {
+    if MACHINE_LAID.load(Ordering::Acquire) {
+        return;
+    }
+    #[cfg(any(target_arch = "aarch64", feature = "unafs"))]
+    {
+        if crate::fs::unafs::mount_bound_handle().is_none() {
+            return;
+        }
+        if MACHINE_LAID.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let (made, stamped) = lay_machine_store(&store_mt());
+        serial_println!(
+            "[prefs] machine store dir=/{} owner={} made={} at=spawn",
+            prefs_core::files::DIR,
+            if stamped { crate::fs::rootacl::SYSTEM_OWNER } else { "none" },
+            made as u8
+        );
+    }
+}
+
+/// Lay `/settings` at kernel authority when absent and stamp it through `rootacl::stamp_store`; no I/O unless the folder
+/// resolves to the native volume. `(made, stamped)`. `tests rootacl`'s MACHINESTORE boot step drives it (no latch).
+pub(crate) fn lay_machine_store(mt: &crate::fs::vfs::MountTable) -> (bool, bool) {
+    let dir = alloc::format!("/{}", prefs_core::files::DIR);
+    if !mt.volume_name(&dir).map(|n| n == "native").unwrap_or(false) {
+        return (false, false);
+    }
+    let made = mt.stat(&dir).is_err() && mt.create(&dir, crate::fs::vfs::NodeKind::Dir, crate::fs::vfs::KERNEL_PRINCIPAL).is_ok();
+    (made, crate::fs::rootacl::stamp_store(mt, &dir))
+}
