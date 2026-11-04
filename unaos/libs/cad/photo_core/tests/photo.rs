@@ -3,9 +3,11 @@
 
 //! VUGPHOTOGRID (LEDGER SR503): photo_core against its synthetic fixture (`photo_core::fixture`) and the steps' KATs.
 
-use photo_core::fixture::{self, CORNER_R, HOLE_D, HOLES, PART_H, PART_W, Spec};
+use photo_core::fixture::{self, CORNER_R, HOLE_D, HOLES, PART_H, PART_T, PART_W, Spec};
 use photo_core::homography::{apply, dlt};
-use photo_core::{Measured, PhotoParams, Prim, Refusal, Tol, Vec2, contour, fit, measure, measure_lens, silhouette};
+use photo_core::{
+    Measured, PhotoParams, Prim, Refusal, Tol, Vec2, contour, fit, measure, measure_lens, measure_side, silhouette,
+};
 use sketch_core::{Constraint, Entity, EntityId, PointRef, dof, profiles, solve};
 
 fn run(s: &Spec) -> Result<Measured, Refusal> {
@@ -270,4 +272,31 @@ fn flat_photo_is_sr503() {
     assert_eq!(m.tilt_deg, f.tilt_deg);
     assert_eq!(m.lens_hint, f.lens_hint);
     assert_eq!(m.solved.dof, f.solved.dof);
+}
+
+/// VUGPHOTOSIDE (SR545): the 50 x 30 x 6 fixture photographed on its side: the side photo through the same lattice road
+/// reads the thickness 6.0 within 0.1 mm, its long dimension paired to the first outline's 50 extent.
+#[test]
+fn side_photo_gives_thickness() {
+    let first = run(&Spec::good()).expect("the good photo measures");
+    let img = pixel_core::decode(&fixture::side_png(&Spec::side(), PART_W, PART_T)).expect("pixel_core decodes the side PNG");
+    let s = measure_side(&first, &img, PhotoParams::new(5.0), Tol::DEFAULT).expect("the side photo measures");
+    eprintln!(
+        "photo: side thickness={:.3} sigma={:.4} length={:.3} paired={:.3} prims={:?}",
+        s.thickness_mm, s.sigma_mm, s.length_mm, s.paired_mm, s.side.shape.counts()
+    );
+    assert!((s.thickness_mm - PART_T).abs() < 0.1, "thickness {} vs {PART_T}", s.thickness_mm);
+    assert!((s.paired_mm - PART_W).abs() < 0.5, "paired {} vs {PART_W}", s.paired_mm);
+    assert!((s.length_mm - PART_W).abs() < 0.5, "length {} vs {PART_W}", s.length_mm);
+}
+
+/// VUGPHOTOSIDE (SR545): a side photo of another part (40 x 6) matches neither the 50 nor the 30 extent: refused by name.
+#[test]
+fn side_photo_of_another_part_refuses() {
+    let first = run(&Spec::good()).expect("the good photo measures");
+    let img = pixel_core::decode(&fixture::side_png(&Spec::side(), 40.0, PART_T)).expect("pixel_core decodes the side PNG");
+    match measure_side(&first, &img, PhotoParams::new(5.0), Tol::DEFAULT) {
+        Err(e) => assert_eq!(e.name(), "NoSideMatch", "{e:?}"),
+        Ok(s) => panic!("expected NoSideMatch, got length {} thickness {}", s.length_mm, s.thickness_mm),
+    }
 }

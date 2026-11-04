@@ -103,6 +103,9 @@ pub enum Refusal {
     Uncertain,
     /// sketch_core refused the inferred sketch.
     Sketch(sketch_core::Refusal),
+    /// VUG-PHOTO-SIDE (SR545): the side photo's long dimension `length_mm` matches no extent of the first outline:
+    /// `nearest_mm` the nearer extent, `band_mm` the 3 σ band it missed by more than.
+    NoSideMatch { length_mm: f64, nearest_mm: f64, band_mm: f64 },
 }
 
 impl Refusal {
@@ -119,6 +122,7 @@ impl Refusal {
             Refusal::PartClipped => "PartClipped",
             Refusal::Uncertain => "Uncertain",
             Refusal::Sketch(_) => "Sketch",
+            Refusal::NoSideMatch { .. } => "NoSideMatch",
         }
     }
 }
@@ -301,4 +305,95 @@ pub fn undistort_gray(g: &edges::Gray, k1: f64) -> edges::Gray {
         }
     }
     edges::Gray { w, h, v }
+}
+
+// VUG-PHOTO-SIDE (SR545): the thickness from a second photo of the part on its side. The side photo goes through the
+// one lattice road ([`measure`]); its outline's long dimension is paired with the first outline's matching extent by
+// length (within BAND_SIGMA x the two photos' σ in quadrature), and its short dimension is the thickness, carrying the
+// side photo's σ.
+
+/// A part's thickness measured from a photo of it on its side.
+#[derive(Clone, Debug)]
+pub struct Side {
+    /// The side outline's short dimension (mm).
+    pub thickness_mm: f64,
+    /// The side photo's σ (its lattice residual and rectified pixel in quadrature), the thickness's uncertainty (mm).
+    pub sigma_mm: f64,
+    /// The side outline's long dimension (mm).
+    pub length_mm: f64,
+    /// The first outline's extent the long dimension was paired with (mm).
+    pub paired_mm: f64,
+    /// The side photo's own measurement.
+    pub side: Measured,
+}
+
+/// An outline's (long, short) extents (mm) in the frame of its longest line (the paper's x when it has none): the box
+/// (`geom_core::Aabb2`) of its line ends, its arcs' ends and their extreme points on the frame's axes, and its circles'
+/// extreme points. `None` for an empty outline.
+pub fn extents(o: &fit::Outline) -> Option<(f64, f64)> {
+    let d = o
+        .outer
+        .iter()
+        .filter_map(|p| if let Prim::Line { a, b, .. } = *p { Some(b - a) } else { None })
+        .max_by(|x, y| x.mag_sq().total_cmp(&y.mag_sq()))
+        .and_then(|v| v.normalize().ok())
+        .unwrap_or(Vec2::X);
+    let n = d.perp();
+    let axes = [d, -d, n, -n];
+    let mut pts: Vec<Vec2> = Vec::new();
+    for p in &o.outer {
+        match *p {
+            Prim::Line { a, b, .. } => {
+                pts.push(a);
+                pts.push(b);
+            }
+            Prim::Arc { centre, r, from, to, ccw, .. } => {
+                pts.push(from);
+                pts.push(to);
+                for u in axes {
+                    let q = centre + u * r;
+                    if on_arc(centre, from, to, ccw, q) {
+                        pts.push(q);
+                    }
+                }
+            }
+            Prim::Circle { centre, r, .. } => {
+                for u in axes {
+                    pts.push(centre + u * r);
+                }
+            }
+        }
+    }
+    let local: Vec<Vec2> = pts.iter().map(|&p| Vec2::new(p.dot(d), p.dot(n))).collect();
+    let b = geom_core::Aabb2::from_points(&local).ok()?;
+    let (ex, ey) = (b.max.x - b.min.x, b.max.y - b.min.y);
+    Some((ex.max(ey), ex.min(ey)))
+}
+
+/// Whether `q` (on the circle about `c`) lies on the sweep from `from` to `to`, counterclockwise when `ccw`.
+fn on_arc(c: Vec2, from: Vec2, to: Vec2, ccw: bool, q: Vec2) -> bool {
+    let tau = 2.0 * core::f64::consts::PI;
+    let ang = |p: Vec2| libm::atan2(p.y - c.y, p.x - c.x);
+    let sign = if ccw { 1.0 } else { -1.0 };
+    let wrap = |v: f64| {
+        let m = v % tau;
+        if m < 0.0 { m + tau } else { m }
+    };
+    let total = wrap((ang(to) - ang(from)) * sign);
+    let at = wrap((ang(q) - ang(from)) * sign);
+    at <= total
+}
+
+/// Measure the thickness of the part `first` measured, from `side`, a photo of it lying on its side on the same
+/// graph paper. Refused by name when the side's long dimension matches no extent of the first outline within 3 σ.
+pub fn measure_side(first: &Measured, side: &Image, params: PhotoParams, tol: Tol) -> Result<Side, Refusal> {
+    let s = measure(side, params, tol)?;
+    let (length, thickness) = extents(&s.shape).ok_or(Refusal::Uncertain)?;
+    let (long, short) = extents(&first.shape).ok_or(Refusal::Uncertain)?;
+    let paired = if (length - long).abs() <= (length - short).abs() { long } else { short };
+    let band = fit::BAND_SIGMA * libm::hypot(first.sigma_mm, s.sigma_mm);
+    if !((length - paired).abs() <= band) {
+        return Err(Refusal::NoSideMatch { length_mm: length, nearest_mm: paired, band_mm: band });
+    }
+    Ok(Side { thickness_mm: thickness, sigma_mm: s.sigma_mm, length_mm: length, paired_mm: paired, side: s })
 }

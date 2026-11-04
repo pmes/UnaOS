@@ -11,6 +11,7 @@
 //! noise of `noise` luma (splitmix64 + Box-Muller, seeded). Pure: a value in, an `Image` (or PNG bytes) out.
 //! The lens (`k1`, VUG-PHOTO-LENS SR533) takes each sample through `homography::undistort` before the camera, so the
 //! measurement's own model renders the bowed grid exactly.
+//! The side view (VUG-PHOTO-SIDE SR545): [`render_side`] lays the part on its side, a [`PART_W`] x [`PART_T`] rectangle.
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -164,8 +165,8 @@ fn near_line(v: f64) -> bool {
     (v - PITCH * libm::round(v / PITCH)).abs() <= INK_MM * 0.5
 }
 
-fn colour(s: &Spec, p: Vec2) -> [f64; 3] {
-    if s.part && in_part(paper_to_part(s, p)) {
+fn colour(s: &Spec, inside: &dyn Fn(Vec2) -> bool, p: Vec2) -> [f64; 3] {
+    if s.part && inside(paper_to_part(s, p)) {
         PART
     } else if s.grid && (near_line(p.x) || near_line(p.y)) {
         INK
@@ -176,6 +177,11 @@ fn colour(s: &Spec, p: Vec2) -> [f64; 3] {
 
 /// Render the photo.
 pub fn render(s: &Spec) -> Image {
+    render_shape(s, &in_part)
+}
+
+/// Render the photo of the part whose part-frame region is `inside` (VUG-PHOTO-SIDE SR545: [`render`] is the plate).
+pub fn render_shape(s: &Spec, inside: &dyn Fn(Vec2) -> bool) -> Image {
     let (w, h) = (s.width as usize, s.height as usize);
     let hinv = invert(&homography(s)).unwrap_or([[0.0; 3]; 3]);
     let mut rgb = vec![0.0f64; w * h * 3];
@@ -186,7 +192,7 @@ pub fn render(s: &Spec) -> Image {
                 for a in 0..4 {
                     let q = Vec2::new(i as f64 + (a as f64 + 0.5) / 4.0, j as f64 + (b as f64 + 0.5) / 4.0);
                     let q = undistort(q, s.k1, w, h); // VUG-PHOTO-LENS (SR533): the identity at k1 = 0.0
-                    let c = apply(&hinv, q).map(|p| colour(s, p)).unwrap_or(PAPER);
+                    let c = apply(&hinv, q).map(|p| colour(s, inside, p)).unwrap_or(PAPER);
                     for k in 0..3 {
                         acc[k] += c[k];
                     }
@@ -235,4 +241,31 @@ pub fn png(s: &Spec) -> Vec<u8> {
 /// The measurable photo ([`Spec::good`]) as PNG bytes: the one fixture every consumer reads.
 pub fn photo_png() -> Vec<u8> {
     png(&Spec::good())
+}
+
+// VUG-PHOTO-SIDE (SR545): the same part photographed on its side, through the same renderer.
+/// The plate's thickness (mm): the fixture part is [`PART_W`] x [`PART_H`] x [`PART_T`].
+pub const PART_T: f64 = 6.0;
+
+/// Whether a part-frame point is in the side view: the rectangle `0..length_mm` x `0..thickness_mm`.
+pub fn in_side(q: Vec2, length_mm: f64, thickness_mm: f64) -> bool {
+    q.x >= 0.0 && q.y >= 0.0 && q.x <= length_mm && q.y <= thickness_mm
+}
+
+impl Spec {
+    /// The good camera over the part on its side, the strip centred under the optical axis.
+    pub fn side() -> Spec {
+        Spec { part_at: Vec2::new(27.3, 38.7), seed: 0x0545_51DE_0000_0001, ..Spec::good() }
+    }
+}
+
+/// Render the side photo of a `length_mm` x `thickness_mm` side.
+pub fn render_side(s: &Spec, length_mm: f64, thickness_mm: f64) -> Image {
+    render_shape(s, &|q: Vec2| in_side(q, length_mm, thickness_mm))
+}
+
+/// The side photo as PNG bytes (pixel_core's encoder).
+pub fn side_png(s: &Spec, length_mm: f64, thickness_mm: f64) -> Vec<u8> {
+    let img = render_side(s, length_mm, thickness_mm);
+    pixel_core::png::encode::encode_rgba(img.width, img.height, &img.rgba).unwrap_or_default()
 }
