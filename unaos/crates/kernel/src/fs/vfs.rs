@@ -621,22 +621,22 @@ impl MountTable {
     // --- write-side resolve-then-dispatch conveniences (VFS-2) ---
 
     pub fn create(&self, path: &str, kind: NodeKind, principal: &str) -> Result<Stat, VfsError> {
-        let (b, rel) = self.resolve(path)?;
+        let (b, rel) = self.resolve(path)?; self.machine_store_wall(b, rel, principal)?; // MACHINESTOREKERNELONLY (rmbp-ledger B1174): the machine store's path wall, before any I/O (file tail). LINE-NEUTRAL append, code first
         crate::fs::ns_bump(b.create(rel, kind, principal)) // NSGEN (SR3) — a new name IS a listing change; bump on success only. ⚠ FOLDED onto the dispatch line that was already here rather than added below it: this file is lexed into the knob-off `kernel8.img` and panic `Location`s embed line numbers (`fs/mod.rs::perf_op`'s rule).
     }
 
     pub fn write(&self, path: &str, offset: u64, data: &[u8], principal: &str) -> Result<usize, VfsError> {
-        let (b, rel) = self.resolve(path)?;
+        let (b, rel) = self.resolve(path)?; self.machine_store_wall(b, rel, principal)?; // MACHINESTOREKERNELONLY (rmbp-ledger B1174): the machine store's path wall, before any I/O (file tail). LINE-NEUTRAL append, code first
         crate::fs::ns_bump(b.write(rel, offset, data, principal)) // NSGEN (SR3) — a write that grows a file changes the SIZE a listing prints (`DirEnt::size`), so it is a listing change; same line-neutral fold.
     }
 
     pub fn truncate(&self, path: &str, size: u64, principal: &str) -> Result<(), VfsError> {
-        let (b, rel) = self.resolve(path)?;
+        let (b, rel) = self.resolve(path)?; self.machine_store_wall(b, rel, principal)?; // MACHINESTOREKERNELONLY (rmbp-ledger B1174): the machine store's path wall, before any I/O (file tail). LINE-NEUTRAL append, code first
         crate::fs::ns_bump(b.truncate(rel, size, principal)) // NSGEN (SR3) — same fact as `write`, stated by the verb that only ever changes the size; same line-neutral fold.
     }
 
     pub fn unlink(&self, path: &str, principal: &str) -> Result<(), VfsError> {
-        let (b, rel) = self.resolve(path)?;
+        let (b, rel) = self.resolve(path)?; self.machine_store_wall(b, rel, principal)?; // MACHINESTOREKERNELONLY (rmbp-ledger B1174): the machine store's path wall, before any I/O (file tail). LINE-NEUTRAL append, code first
         crate::fs::ns_bump(b.unlink(rel, principal)) // NSGEN (SR3) — a name that vanished is the case a stale cache reports as PRESENT, which is the worse direction; same line-neutral fold.
     }
 
@@ -667,8 +667,8 @@ impl MountTable {
     /// (copy-then-delete is a different operation and the operator asks for it by
     /// typing `cp` then `rm`).
     pub fn rename(&self, from: &str, to: &str, principal: &str) -> Result<(), VfsError> {
-        let (bf, relf) = self.resolve(from)?;
-        let (bt, relt) = self.resolve(to)?;
+        let (bf, relf) = self.resolve(from)?; self.machine_store_wall(bf, relf, principal)?; // MACHINESTOREKERNELONLY (rmbp-ledger B1174): the machine store's path wall, before any I/O (file tail). LINE-NEUTRAL append, code first
+        let (bt, relt) = self.resolve(to)?; self.machine_store_wall(bt, relt, principal)?; // MACHINESTOREKERNELONLY (rmbp-ledger B1174): the machine store's path wall, before any I/O (file tail). LINE-NEUTRAL append, code first
         if !same_storage(bf, bt) {
             return Err(VfsError::Unsupported);
         }
@@ -802,18 +802,18 @@ impl MountTable {
     }
 
     pub fn remove_dir(&self, path: &str, principal: &str) -> Result<(), VfsError> {
-        let (b, rel) = self.resolve(path)?;
+        let (b, rel) = self.resolve(path)?; self.machine_store_wall(b, rel, principal)?; // MACHINESTOREKERNELONLY (rmbp-ledger B1174): the machine store's path wall, before any I/O (file tail). LINE-NEUTRAL append, code first
         crate::fs::ns_bump(b.remove_dir(rel, principal)) // NSGEN (SR3) — RMDIR (SO18) is the capability that made this seam reachable at all, and SR3's row names it as the mutation Quarry could not see; same line-neutral fold.
     }
 
     pub fn remove_attr(&self, path: &str, key: &str, principal: &str) -> Result<(), VfsError> {
-        let (b, rel) = self.resolve(path)?;
+        let (b, rel) = self.resolve(path)?; self.machine_store_wall(b, rel, principal)?; // MACHINESTOREKERNELONLY (rmbp-ledger B1174): the machine store's path wall, before any I/O (file tail). LINE-NEUTRAL append, code first
         b.remove_attr(rel, key, principal)
     }
 
     /// ATTRSURF: resolve-then-dispatch for the attribute surface.
     pub fn set_attr(&self, path: &str, key: &str, value: AttrValue, principal: &str) -> Result<(), VfsError> {
-        let (b, rel) = self.resolve(path)?;
+        let (b, rel) = self.resolve(path)?; self.machine_store_wall(b, rel, principal)?; // MACHINESTOREKERNELONLY (rmbp-ledger B1174): the machine store's path wall, before any I/O (file tail). LINE-NEUTRAL append, code first
         b.set_attr(rel, key, value, principal)
     }
 
@@ -824,13 +824,13 @@ impl MountTable {
 
     /// ATTRCOLUMNS (B402): [`VfsBackend::set_attrs`] on the volume that holds `path` — one transaction.
     pub fn set_attrs(&self, path: &str, kv: &[(String, Option<AttrValue>)], principal: &str) -> Result<(), VfsError> {
-        let (b, rel) = self.resolve(path)?;
+        let (b, rel) = self.resolve(path)?; self.machine_store_wall(b, rel, principal)?; // MACHINESTOREKERNELONLY (rmbp-ledger B1174): the machine store's path wall, before any I/O (file tail). LINE-NEUTRAL append, code first
         b.set_attrs(rel, kv, principal)
     }
 
     /// BOOT80 (B350): [`VfsBackend::create_files_batch`] on the volume that holds directory `path`.
     pub fn create_files_batch(&self, path: &str, files: Vec<(String, Vec<(String, AttrValue)>)>, principal: &str) -> Result<usize, VfsError> {
-        let (b, rel) = self.resolve(path)?;
+        let (b, rel) = self.resolve(path)?; self.machine_store_wall(b, rel, principal)?; // MACHINESTOREKERNELONLY (rmbp-ledger B1174): the machine store's path wall, before any I/O (file tail). LINE-NEUTRAL append, code first
         b.create_files_batch(rel, files, principal)
     }
 
@@ -4074,5 +4074,43 @@ impl MountTable {
             off += got.len();
         }
         Ok(())
+    }
+}
+
+// ── MACHINESTOREKERNELONLY (rmbp-ledger B1174, BP-storage-11) — TAIL-APPENDED ─────────────────────────────────────────
+// The no-session settings folder (`/settings`, prefs' MACHINE store) is kernel-written on EVERY volume kind. ROOTACL's
+// `system` row walls it on a native root only once prefs has laid and stamped it (B1150/B1162/B1167), and a FAT carries
+// no rows at all; so the mutating `MountTable` verbs (create, write, truncate, unlink, rename both ends, remove_dir and
+// the attribute writers) ask this ONE path wall on their resolve line, before any I/O. It composes ROOTACL's own
+// predicates (`rootacl::machine_store_path`, B1160's folder test; `rootacl::admin_principal`, R100) and VOLID's
+// `same_storage`: a non-kernel, non-administrator write whose VOLUME path's first component is `settings` on the ROOT
+// volume (so the `/volumes/UnaOS/settings` alias too, never a stick's own `/settings`) is `Denied` (-EACCES). Reads are
+// not walled (no ring-3 program reads the store; prefs' `read_all` is kernel-side). Unconditional: the kernel principal
+// short-circuits first, and no ring-3 principal writes a FAT mount (every FAT mount is kernel-principal), so on FAT the
+// only change is the errno on a sacred root. Wire: `[vfs] machine store refused path=<p> principal=<p> (...)` (once).
+impl MountTable {
+    /// The machine store's path wall: `Err(Denied)` = a ring-3 principal other than the administrator mutating the
+    /// root volume's top-level `settings` folder (or the folder itself); `Ok` otherwise, with no I/O on the pure paths.
+    pub(crate) fn machine_store_wall(&self, b: &dyn VfsBackend, rel: &str, principal: &str) -> Result<(), VfsError> {
+        use core::sync::atomic::{AtomicBool, Ordering};
+        static SAID: AtomicBool = AtomicBool::new(false);
+        if principal == KERNEL_PRINCIPAL {
+            return Ok(());
+        }
+        let vol = b.on_volume(rel);
+        if !crate::fs::rootacl::machine_store_path(&vol) || crate::fs::rootacl::admin_principal(principal) {
+            return Ok(());
+        }
+        let on_root = match self.resolve("/") {
+            Ok((root, _)) => same_storage(root, b),
+            Err(_) => false,
+        };
+        if !on_root {
+            return Ok(());
+        }
+        if !SAID.swap(true, Ordering::AcqRel) {
+            serial_println!("[vfs] machine store refused path={} principal={} (B1174: the kernel and the administrator write the machine store, on every volume kind)", vol, principal);
+        }
+        Err(VfsError::Denied)
     }
 }
