@@ -1477,11 +1477,11 @@ pub fn gap_split(t0_prev: u64, end_prev: u64, now: u64) -> Option<(u64, u64)> {
 /// `ehci::hid_task`, before `service_ehci_hid`: stamp this pass's entry and split the gap that just ended.
 pub fn pass_begin() {
     let now = crate::arch::ms();
-    let t0 = PASS_T0_MS.swap(now, Relaxed);
+    let t0 = PASS_T0_MS.swap(now, Relaxed); let who = wait_who_gap(); // F39HIDPLACESVC (B1109) HID-WAIT-WHO: the T0 swap shut the tick's gate; take the ended gap's majority task (file tail). LINE-NEUTRAL fold, code first
     let Some((pass, wait)) = gap_split(t0, PASS_END_MS.load(Relaxed), now) else { return };
     let gap = pass.saturating_add(wait);
     let w = split_pack(gap, pass, wait);
-    SPLIT_WORST.fetch_max(w, Relaxed);
+    if SPLIT_WORST.fetch_max(w, Relaxed) < w { wait_who_keep(who); } // F39HIDPLACESVC (B1109): the minute's worst gap keeps its own `who`, as it keeps its own split
     SPLIT_BOOT.fetch_max(w, Relaxed);
     SPLIT_PASS_MAX.fetch_max(pass, Relaxed);
     SPLIT_WAIT_MAX.fetch_max(wait, Relaxed);
@@ -1509,8 +1509,8 @@ fn gap_split_minute() {
     let (g, p, w) = split_unpack(SPLIT_WORST.swap(0, Relaxed));
     let (pm, wm, over) = (SPLIT_PASS_MAX.swap(0, Relaxed), SPLIT_WAIT_MAX.swap(0, Relaxed), SPLIT_OVER.swap(0, Relaxed));
     serial_println!(
-        "[hid] gap split worst_ms={} pass_ms={} wait_ms={} pass_max_ms={} wait_max_ms={} over={} bound_ms={} pump_cpu=c{} -> {} (F39INPUTSTALL B1097: a HID gap = the previous pass's own length + the hid pump's wait to run again)",
-        g, p, w, pm, wm, over, HID_GAP_STALL_MS, CpuWord(pump_cpu()), SplitWord(g, p, w)
+        "[hid] gap split worst_ms={} pass_ms={} wait_ms={} pass_max_ms={} wait_max_ms={} over={} bound_ms={} pump_cpu=c{} who={} -> {} (F39INPUTSTALL B1097: a HID gap = the previous pass's own length + the hid pump's wait to run again; F39HIDPLACESVC B1109: who= the task the pump core's tick found running while the pass was overdue)",
+        g, p, w, pm, wm, over, HID_GAP_STALL_MS, CpuWord(pump_cpu()), WaitWho(MIN_WHO.read(true), MIN_TID.swap(0, Relaxed), g >= HID_GAP_STALL_MS && p < w), SplitWord(g, p, w)
     );
 }
 
@@ -1522,11 +1522,12 @@ fn gap_split_kat() {
     let flight39 = gap_split(1_000, 1_278, 5_840) == Some((278, 4_562));
     let packed = split_unpack(split_pack(4_840, 278, 4_562)) == (4_840, 278, 4_562)
         && split_unpack(split_pack(u64::MAX, 1, 2)) == (SPLIT_FIELD, 1, 2);
-    let ok = unset && unfinished && backwards && flight39 && packed;
+    let who_ok = wait_who_kat(); // F39HIDPLACESVC (B1109): the pure vote + overdue gate (file tail)
+    let ok = unset && unfinished && backwards && flight39 && packed && who_ok;
     let (g, p, w) = split_unpack(SPLIT_BOOT.load(Relaxed));
     serial_println!(
-        ":: HIDGAPSPLIT: kat_ok={} boot_worst_ms={} pass_ms={} wait_ms={} -> {} ::",
-        ok as u8, g, p, w, if ok { "PASS" } else { "FAIL" }
+        ":: HIDGAPSPLIT: kat_ok={} who_ok={} boot_worst_ms={} pass_ms={} wait_ms={} -> {} ::",
+        ok as u8, who_ok as u8, g, p, w, if ok { "PASS" } else { "FAIL" }
     );
 }
 
@@ -1583,9 +1584,139 @@ fn hid_place_kat() {
         && !tp(600, true, 0, 6, 0)
         && !tp(48, true, 1, 6, 0)
         && !tp(48, true, 0, 0, 6);
-    let ok = apart_ok && tap_ok;
+    let svc = svc_kat(); // F39HIDPLACESVC (B1109): the scheduler's sibling tier honours its skip (file tail; `None` = `-`)
+    let ok = apart_ok && tap_ok && svc != Some(false);
     serial_println!(
-        ":: HIDPLACE: kat_ok={} apart_ok={} tap_ok={} placed={} pump_cpu=c{} -> {} ::",
-        ok as u8, apart_ok as u8, tap_ok as u8, CpuWord(usb_pump_placed()), CpuWord(pump_cpu()), if ok { "PASS" } else { "FAIL" }
+        ":: HIDPLACE: kat_ok={} apart_ok={} tap_ok={} svc_ok={} placed={} pump_cpu=c{} -> {} ::",
+        ok as u8, apart_ok as u8, tap_ok as u8, OkWord(svc), CpuWord(usb_pump_placed()), CpuWord(pump_cpu()), if ok { "PASS" } else { "FAIL" }
     );
+}
+
+// ── F39HIDPLACESVC (rmbp-ledger B1109) — HID-PLACE-SVC + HID-WAIT-WHO. FILE-TAIL append. ─────────────────────────────────
+// HID-PLACE-SVC: `sessionwedge::pick_live_skip`'s fallback was `sched::sibling_online_cpu(dead)`'s ONE answer; when that was
+// the hid pump's core the skip pass read None and `apart`'s no-skip retry landed beside the hid pump while another sibling
+// existed. The scheduler's ladder now takes the skip itself (`sched::sibling_online_cpu_skip`, the old name delegating with
+// `usize::MAX`, every other caller unchanged); `:: HIDPLACE:` adds `svc_ok=` (x86 SMP live; `-` on aarch64 / one CPU).
+// HID-WAIT-WHO: on a WAIT-LONG minute the gap split names the task the hid pump's core ran instead of the pump. The sample is
+// the pump core's OWN tick (`sched::timer_preempt` -> `hid_wait_tick`, sched.rs tail; x86): the task it interrupted is
+// current there, a same-core read. While the wait since `pass_done` is at or over [`HID_GAP_STALL_MS`] and no pass runs
+// ([`wait_overdue`]), every tick votes its task into a Boyer-Moore majority ([`vote`]); ONE writer (the pump core's ISR),
+// gated off by `pass_begin`'s T0 swap before it takes and resets the gap's candidate ([`wait_who_gap`]); the minute's worst
+// gap keeps its own ([`wait_who_keep`]). The name is held in the ONE name record, [`MaskWho`] (its site word is this tail's
+// sample line, never printed). `who=<task>:<tid>`, `-` unless the minute reads WAIT-LONG, `?` when no tick sampled
+// (aarch64: HID-WAIT-WHO-ARM owed; an idle core). `:: HIDGAPSPLIT:` adds `who_ok=` (pure cases).
+
+/// F39HIDPLACESVC (B1109): the ended-or-running gap's majority candidate (tid 0 = none) and its Boyer-Moore count.
+static GAP_WHO: MaskWho = MaskWho::new();
+static GAP_TID: AtomicU64 = AtomicU64::new(0);
+static GAP_VOTES: AtomicU32 = AtomicU32::new(0);
+/// F39HIDPLACESVC (B1109): the minute's worst gap's candidate, taken by `gap_split_minute`.
+static MIN_WHO: MaskWho = MaskWho::new();
+static MIN_TID: AtomicU64 = AtomicU64::new(0);
+
+/// One Boyer-Moore step: candidate `cand` with count `n`, a tick that found task `t`. Pure.
+pub fn vote(cand: u64, n: u32, t: u64) -> (u64, u32) {
+    if n == 0 {
+        (t, 1)
+    } else if cand == t {
+        (cand, n.saturating_add(1))
+    } else {
+        (cand, n - 1)
+    }
+}
+
+/// The hid pump is overdue at `now`: a pass has finished (`end` set), none is running (`t0 <= end`), and the wait since its
+/// exit is at or over [`HID_GAP_STALL_MS`]. Pure.
+pub fn wait_overdue(t0: u64, end: u64, now: u64) -> bool {
+    end != 0 && t0 <= end && now.saturating_sub(end) >= HID_GAP_STALL_MS
+}
+
+/// The hid pump core's tick (`sched::hid_wait_tick`, ISR, IF=0): the task `name`/`tid` was running there. Atomics only.
+pub fn wait_who_tick(name: &'static str, tid: u64) {
+    if !wait_overdue(PASS_T0_MS.load(Relaxed), PASS_END_MS.load(Relaxed), crate::arch::ms()) {
+        return;
+    }
+    let cand = GAP_TID.load(Relaxed);
+    let (c, n) = vote(cand, GAP_VOTES.load(Relaxed), tid);
+    if c != cand || GAP_WHO.read(false).site().is_none() {
+        GAP_WHO.note_at(Some(name), core::panic::Location::caller(), pump_cpu());
+        GAP_TID.store(c, Relaxed);
+    }
+    GAP_VOTES.store(n, Relaxed);
+}
+
+/// `pass_begin`, after its T0 swap (the tick's gate is shut): the ended gap's candidate, taken and reset.
+fn wait_who_gap() -> (MaskedBy, u64) {
+    let by = GAP_WHO.read(true);
+    let tid = GAP_TID.swap(0, Relaxed);
+    GAP_VOTES.store(0, Relaxed);
+    (by, tid)
+}
+
+/// `pass_begin`, on a won minute-worst: that gap's candidate becomes the minute's (none sampled = cleared).
+fn wait_who_keep(who: (MaskedBy, u64)) {
+    let (by, tid) = who;
+    match by.site() {
+        Some(site) if tid != 0 => {
+            MIN_WHO.note_at(by.name(), site, by.core);
+            MIN_TID.store(tid, Relaxed);
+        }
+        _ => {
+            let _ = MIN_WHO.read(true);
+            MIN_TID.store(0, Relaxed);
+        }
+    }
+}
+
+/// The gap split's `who=`: `-` unless WAIT-LONG, `?` when no tick sampled, else `<task|?>:<tid>`.
+struct WaitWho(MaskedBy, u64, bool);
+impl core::fmt::Display for WaitWho {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        if !self.2 {
+            return f.write_str("-");
+        }
+        if self.1 == 0 || self.0.site().is_none() {
+            return f.write_str("?");
+        }
+        write!(f, "{}:{}", self.0.name().unwrap_or("?"), self.1)
+    }
+}
+
+/// `1` / `0` / `-` (no verdict on this box).
+struct OkWord(Option<bool>);
+impl core::fmt::Display for OkWord {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self.0 { Some(true) => "1", Some(false) => "0", None => "-" })
+    }
+}
+
+/// `:: HIDGAPSPLIT:`'s `who_ok=`: the majority vote and the overdue gate on synthetic cases. Pure.
+fn wait_who_kat() -> bool {
+    let run = |ts: &[u64]| ts.iter().fold((0u64, 0u32), |(c, n), &t| vote(c, n, t)).0;
+    let majority = run(&[7, 7, 9, 7]) == 7 && run(&[7, 9, 9]) == 9 && run(&[]) == 0;
+    let gate = wait_overdue(10, 20, 36)
+        && !wait_overdue(10, 20, 35)
+        && !wait_overdue(30, 20, 100)
+        && !wait_overdue(0, 0, 100);
+    majority && gate
+}
+
+/// `:: HIDPLACE:`'s `svc_ok=` (x86): the scheduler's sibling tier, asked to skip the core it would pick, picks another or
+/// falls back to the caller. `None` with one sibling-less CPU or masked interrupts.
+#[cfg(target_arch = "x86_64")]
+fn svc_kat() -> Option<bool> {
+    if crate::arch::irqs_masked() {
+        return None;
+    }
+    let me = crate::arch::percpu::this_cpu().cpu_index as usize;
+    let s = crate::arch::sched::sibling_online_cpu(me);
+    if s == me {
+        return None;
+    }
+    Some(crate::arch::sched::sibling_online_cpu_skip(me, s) != s)
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn svc_kat() -> Option<bool> {
+    None
 }
