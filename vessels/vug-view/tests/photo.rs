@@ -237,6 +237,7 @@ fn a_proposal_enters_through_apply_as_and_a_refused_one_never() {
     assert_eq!(face(&vw).sketch.params(), &before[..]);
     assert_eq!(ph(&vw).offers[1].state, State::Open);
     assert!(ph(&vw).note.as_deref().unwrap().starts_with("refused residual"));
+    assert!(key(&mut vw, "\r") && ph(&vw).offers[1].state == State::Open, "VUGFACEFIELDKEYSREST (SR605): the one-char Enter reaches the same refusal as Return");
     // Backspace rejects it; no glyph is left.
     assert!(key(&mut vw, "BackSpace"));
     assert_eq!(ph(&vw).offers[1].state, State::Rejected);

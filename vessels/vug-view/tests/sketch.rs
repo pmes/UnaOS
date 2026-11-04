@@ -199,6 +199,7 @@ fn a_click_with_the_line_tool_creates_nothing_and_esc_selects() {
     assert_eq!(face(&vw).sketch.entities().len(), n);
     assert!(vw.input(&SMessage::BrowserKey("Escape".into())));
     assert_eq!(face(&vw).tool, Tool::Select);
+    assert!(vw.input(&SMessage::BrowserText("l".into())) && vw.input(&SMessage::BrowserKey("\u{1b}".into())) && face(&vw).tool == Tool::Select, "VUGFACEFIELDKEYSREST (SR605): the one-char Esc selects as Escape does");
     // Outside a sketch `p` stays the preset key; inside it is the point tool.
     let mut bare = Viewer::new(cube(), "nav", (W, H), Preset::Una);
     assert!(bare.input(&SMessage::BrowserText("p".into())));
@@ -338,6 +339,7 @@ fn a_typed_pull_gives_the_box_volume() {
     assert!(typed(&mut vw, "e"));
     assert!(vw.view.design.pull.is_some(), "e starts a pull");
     assert!(typed(&mut vw, "10"));
+    assert!(key(&mut vw, "Backspace") && vw.view.design.pull_text == "1" && typed(&mut vw, "0"), "VUGFACEFIELDKEYSREST (SR605): typed_key's Backspace by the long name erases the last digit");
     let pull = vw.view.design.pull.as_ref().unwrap();
     assert_eq!(pull.distance, 10.0, "the typed distance drives the pull");
     assert!(pull.preview.is_some(), "a live preview at the typed distance");
@@ -346,4 +348,18 @@ fn a_typed_pull_gives_the_box_volume() {
     assert!(design.pull.is_none() && design.face.is_none(), "Enter commits the pull and closes the sketch");
     let vol = design.body.as_ref().expect("a body").volume().expect("volume");
     assert!((vol - 1600.0).abs() < 1e-4, "volume {vol}");
+}
+
+// ---- VUGFACEFIELDKEYSREST (LEDGER SR605): the sketch face's erase arm reads the one key-name table ----
+
+/// The Cocoa Delete (`\u{f728}`, a private-use char the macOS surface passes raw) reaches the erase arm as BackSpace /
+/// Delete do: the rectangle's (16, 0) corner under the cursor is removed.
+#[test]
+fn the_cocoa_delete_erases_as_backspace_does() {
+    let mut vw = rectangle();
+    let corner = screen(&vw, RECT[1]);
+    let _ = move_to(&mut vw, corner);
+    assert!(!face(&vw).sketch.entities().iter().any(|e| *e == Entity::Removed));
+    assert!(vw.input(&SMessage::BrowserKey("\u{f728}".into())), "the corner under the cursor is erased");
+    assert!(face(&vw).sketch.entities().iter().any(|e| *e == Entity::Removed), "an entity is removed");
 }

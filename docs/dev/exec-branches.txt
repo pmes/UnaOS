@@ -1461,3 +1461,9 @@ exec-rmbp-f39armforgetteardown e84b64a95 wave36 cut61
 exec-rmbp-f39busregarmearlyring3 e84b64a95 wave36 cut61
 exec-rmbp-f39prefsunsetwirepin e84b64a95 wave36 cut61
 exec-rmbp-f39machinestorekernelonly e84b64a95 wave36 cut61
+exec-rmbp-vugfacejournalholdrest 2f4c28e12 wave36 cut60
+exec-rmbp-vugcomscanjogposition 2f4c28e12 wave36 cut60
+exec-rmbp-vugcomscanmachinedeclare 2f4c28e12 wave36 cut60
+exec-rmbp-vugphotocropmetaitxt 2f4c28e12 wave36 cut60
+exec-rmbp-vugscandeviationcoarse 2f4c28e12 wave36 cut60
+exec-rmbp-vugcomscanjogfacegtk 2f4c28e12 wave36 cut60
