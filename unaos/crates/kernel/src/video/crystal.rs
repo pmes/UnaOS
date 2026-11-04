@@ -1930,7 +1930,7 @@ pub mod veil {
         /// The Una furniture (the menu bar, the dock plate): `surface.window` at the theme's VEIL alpha (72 % / 78 %).
         #[inline]
         pub fn una() -> Look {
-            Look { face: theme::surface_window(), a: theme::veil_a() }
+            Look { face: theme::surface_window(), a: theme::veil_a() }.reduced() // VEIL-REDUCE-FACE (B1134): Reduce transparency = `surface.window` at 100 % (crystal.rs tail)
         }
     }
 
@@ -2276,6 +2276,30 @@ pub fn login_reduce() -> bool {
 /// `settings::a11y_load`'s read of the row (the schema's default where unset): latch it, answer 1 when it moved.
 pub fn login_reduce_load() -> u8 {
     let on = crate::prefs_client::sys_flag(crate::prefs::key::A11Y_REDUCE_TRANSPARENCY).unwrap_or(false);
+    login_reduce_apply(on, "load") // VEIL-REDUCE-FACE (B1134): the one apply (file tail), shared with the Settings row
+}
+
+// ── VEIL-REDUCE-FACE (rmbp-ledger B1134, BP-video-11) — TAIL-APPENDED: Reduce transparency on every VEIL ──────────────
+// DESIGN-LANGUAGE §2.4: under Reduce transparency the VEIL is `surface.window` at 100 %. The ONE latch stays
+// [`LOGIN_REDUCE`] (B1128); every site's Look takes it through [`veil::Look::reduced`] (`Look::una` for the menu bar and
+// the dock plate, Softy's taskbar Look, and `Look::login`'s own read), so `veil::row` paints the plain fill with no
+// sample. A move is applied once by [`login_reduce_apply`]: the kept login field dropped, then the covering bump
+// (SHADOWDAMAGE B865's shape, as `a11yfilter::changed`): the epoch re-keys the bar and dock `VeilCache`s and re-seals
+// every strip, one damage-all and a full present. Doors: `settings::a11y_load` (the store, through
+// [`login_reduce_load`]) and Settings > Accessibility row 1's check (`settings::reduce_row_set`, through
+// [`login_reduce_set`]). Wire on a move: `[veil] login reduce_transparency=<0|1> a=<n>` and
+// `[veil] furniture reduce_transparency=<0|1> a=<n> via=<load|settings>`.
+
+impl veil::Look {
+    /// This Look under Reduce transparency: `a = 255` (the face kept, no VEIL sample) while it is on, else unchanged.
+    #[inline]
+    pub fn reduced(self) -> veil::Look {
+        if login_reduce() { veil::Look { face: self.face, a: 255 } } else { self }
+    }
+}
+
+/// Latch `on`; on a move re-lay every VEIL once and print the two lines. Answers 1 when it moved.
+fn login_reduce_apply(on: bool, via: &str) -> u8 {
     if LOGIN_REDUCE.swap(on, core::sync::atomic::Ordering::Relaxed) == on {
         return 0;
     }
@@ -2283,6 +2307,16 @@ pub fn login_reduce_load() -> u8 {
     {
         crate::video::wallpaper::veil_login_stale();
     }
+    crate::video::wm::desktop::shadows_covered(crate::video::theme::epoch().wrapping_add(1));
+    crate::video::theme::bump_epoch();
+    let _ = crate::video::wm::damage_intersecting(0, 0, 1 << 16, 1 << 16);
+    crate::video::screen::request_full_present();
     serial_println!("[veil] login reduce_transparency={} a={}", on as u8, veil::Look::login().a);
+    serial_println!("[veil] furniture reduce_transparency={} a={} via={}", on as u8, veil::Look::una().a, via);
     1
+}
+
+/// Settings > Accessibility row 1's check: apply `on` (the store write is the pane's latched bit). Answers 1 when it moved.
+pub fn login_reduce_set(on: bool) -> u8 {
+    login_reduce_apply(on, "settings")
 }
