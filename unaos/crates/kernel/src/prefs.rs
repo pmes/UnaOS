@@ -1825,14 +1825,14 @@ pub fn reload_session(old: &PrefTree) -> usize {
 // ([`post_changes`]) is mirrored into `/settings/<domain>` by [`machine_mirror`] — read, the one key set, rendered by the
 // same `prefs_core::files::render`, the render parsed, written by the same swap (`put_file_atomic`), under SAVE_LOCK; the
 // session TREE is never taken. No session (or no `login`: the store IS `/settings`) = nothing to mirror. A machine file
-// prefs_core refuses is never overwritten. Wire: `[prefs] machine settings/<d> system.<k>=<v> wrote=<0|1>`.
+// prefs_core refuses is never overwritten. Wire: `[prefs] machine settings/<d> system.<k>=<v> wrote=<0|1>` (MACHINE-UNSET B1154: `<v>` = `unset` when a None removed the key).
 
 /// The keys the boot screen reads before any login (the machine copy's whole content from the session side).
 pub const MACHINE_KEYS: &[&str] = prefs_core::files::MACHINE_KEYS; // VEIL-BOOT-STORE-R3 (rmbp-ledger B1146): the shared list (prefs_core), one for both rings; A11Y-BOOT-SET (rmbp-ledger B1147): the accessibility keys a boot-screen consumer reads (contrast, cursor, filter, shimmer and motion, the lens); `login::veil_reduce_boot` reads them all through `settings::a11y_load("machine")`. Named in-place hunk
 
 /// Mirror the session's committed `ns`/`k` = `v` into the no-session store's domain file (see the block above).
 fn machine_mirror(ns: &str, k: &str, v: Option<&PrefValue>) {
-    let Some(v) = v else { return };
+    let shown = v.map_or(String::from("unset"), |v| alloc::format!("{}", v)); // MACHINE-UNSET (rmbp-ledger B1154): None = the key left the session store with no value to carry; it leaves the machine copy by this same RMW. Named in-place hunk
     if ns != NS || !MACHINE_KEYS.contains(&k) {
         return;
     }
@@ -1854,11 +1854,11 @@ fn machine_mirror(ns: &str, k: &str, v: Option<&PrefValue>) {
         },
         None => PrefTree::new(),
     };
-    if t.get(ns, k) == Some(v) {
-        serial_println!("[prefs] machine settings/{} {}.{}={} wrote=0", d, ns, k, v);
+    if t.get(ns, k) == v {
+        serial_println!("[prefs] machine settings/{} {}.{}={} wrote=0", d, ns, k, shown);
         return;
     }
-    if t.set(ns, k, v.clone()).is_err() {
+    if match v { Some(v) => t.set(ns, k, v.clone()).is_err(), None => t.remove(ns, k).is_none() } {
         return;
     }
     let text = prefs_core::files::render(&d, &t, &now_iso(), "the session store's machine mirror (VEIL-REDUCE-BOOT-STORE)", &doc_of);
@@ -1871,5 +1871,5 @@ fn machine_mirror(ns: &str, k: &str, v: Option<&PrefValue>) {
         let _ = mt.create(&dir, crate::fs::vfs::NodeKind::Dir, crate::fs::vfs::KERNEL_PRINCIPAL);
     }
     crate::fs::rootacl::stamp_store(&mt, &dir); let ok = mt.put_file_atomic(&p, text.as_bytes(), crate::fs::vfs::KERNEL_PRINCIPAL).is_ok(); // MACHINESTOREACL (rmbp-ledger B1150): the machine folder is stamped ROOTACL `system` before its swap (fs/rootacl.rs tail). LINE-NEUTRAL append, code first
-    serial_println!("[prefs] machine settings/{} {}.{}={} wrote={}", d, ns, k, v, ok as u8);
+    serial_println!("[prefs] machine settings/{} {}.{}={} wrote={}", d, ns, k, shown, ok as u8);
 }
