@@ -9037,7 +9037,7 @@ fn sys_open(name_ptr: u64, name_len: u64, mode: u64) -> i64 {
         return EACCES;
     }
     // 2. Read-only lookups — nothing claimed yet, so each failure returns cleanly.
-    let vol = match crate::fs::vfs::el0_resolve(name) { Ok(v) => v, Err(e) => return el0_errno(e) }; // EL0HOME (SR184): the name through the mount table -> its path on the EL0 FAT volume (table built and dropped here, no lock held)
+    let vol = match crate::fs::vfs::el0_resolve(name) { Ok(v) => v, Err(e) => return el0_errno(e) }; if machine_store_open_refused(&vol, mode, &caller_ppid) { return EACCES; } // MACHINESTOREFATROOT (rmbp-ledger B1160): a RW/O_CREAT open in the machine store on the EL0 FAT is ROOTACL's refusal, before mount and any claim (file tail). LINE-NEUTRAL append, code first. EL0HOME (SR184): the name through the mount table -> its path on the EL0 FAT volume (table built and dropped here, no lock held)
     let fs = match crate::fs::fat::mount() {
         Ok(fs) => fs,
         Err(crate::fs::fat::FatError::NoDisk) => return ENODEV,
@@ -27793,4 +27793,26 @@ fn idle_focus_grant(asid: u64) {
 #[cfg(feature = "busreg")]
 pub fn pref_row_in_session(row: usize) -> bool {
     pref_caller_in_session(slot_ppid_of(row as u64))
+}
+
+// ── MACHINESTOREFATROOT (rmbp-ledger B1160, BP-storage-11) — TAIL-APPENDED ─────────────────────────────────────────────
+// DIRNS's default-on path open maps an absolute name through the mount table onto the EL0 FAT (`el0_resolve`), and
+// `owned_access_ok` admits an unowned (kernel-written) file to anyone, RW included: on a FAT root the machine store
+// `/settings/general` (the boot screen's copy; FAT has no owner rows for B1150's stamp) was ring 3's to overwrite or
+// plant. `sys_open` asks this on the on-volume path, before the mount and any claim: ROOTACL's shared verdict
+// (`rootacl::store_open_refused`, the kernel and the administrator write the store, a read-only open stays public).
+
+/// May the caller (persistent principal `ppid`) NOT open the on-volume path `vol` with `mode` (a RW/O_CREAT open of the
+/// machine store by anyone but the administrator)? An unprojectable principal is `anon`.
+fn machine_store_open_refused(vol: &str, mode: u64, ppid: &PrincipalRecord) -> bool {
+    let write = mode & (1 | O_CREAT) != 0;
+    if !write || !crate::fs::rootacl::machine_store_path(vol) {
+        return false;
+    }
+    let mut b = [0u8; K4_STR_MAX];
+    let who = match principal_native_string(ppid, &mut b) {
+        Some(n) if n > 0 => core::str::from_utf8(&b[..n]).unwrap_or("anon"),
+        _ => "anon",
+    };
+    crate::fs::rootacl::store_open_refused(vol, write, who)
 }

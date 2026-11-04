@@ -227,6 +227,14 @@ mod tests {
 
     // VEIL-BOOT-STORE-R3 (rmbp-ledger B1146): every machine key is a `system` schema row Settings writes, stored in a
     // system domain, listed once — a typo or a renamed schema key fails here instead of silently stopping the mirror.
+    // MACHINE-KEY-DEFAULT-PIN (rmbp-ledger B1160, named in-place hunk): and every machine key's schema default is STATIC
+    // (`Default::Int`/`Float`/`Bool`/`Str`). The boot screen reads a key ABSENT from the machine file as that one value
+    // (`settings::a11y_load("machine")`, `crystal::login_reduce_load`'s `unwrap_or`), so the mirror's `=unset` arm
+    // (`prefs::machine_mirror`'s `None`, MACHINE-UNSET B1154) and a written default literal mean the same boot. A
+    // `Consumer` default has no value to read and a `Rule` default depends on the session's environment: either would make
+    // an absent machine key ambiguous, so it fails here. PREFS-UNSET-VERB (rmbp-ledger B1161) rests on this pin: an
+    // operator unset of a machine key reaches the mirror as `None`, the key leaves the machine file, and boot 2 reads the
+    // same static default. (That a static default is admissible for its kind is `schema::tests`' well-formed table check.)
     #[test]
     fn machine_keys() {
         assert!(!MACHINE_KEYS.is_empty());
@@ -235,6 +243,7 @@ mod tests {
             assert!(row.writers.contains(&crate::schema::Writer::Settings), "system.{}", k);
             assert!(SYSTEM_DOMAINS.contains(&domain_of("system", k).as_str()), "system.{}", k);
             assert!(!MACHINE_KEYS[..i].contains(k), "system.{} listed twice", k);
+            assert!(matches!(row.default, crate::schema::Default::Int(_) | crate::schema::Default::Float(_) | crate::schema::Default::Bool(_) | crate::schema::Default::Str(_)), "system.{} default is {:?}: a machine key needs a static default", k, row.default); // MACHINE-KEY-DEFAULT-PIN (B1160)
         }
     }
 }
