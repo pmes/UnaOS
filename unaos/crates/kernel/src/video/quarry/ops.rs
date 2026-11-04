@@ -283,6 +283,12 @@ fn empty_armed() -> bool {
 struct Menu {
     x: usize,
     y: usize,
+    /// F39MENUSCROLL (B1119): the page's first item (a multiple of `menu_fit`'s rows; read through [`page_first`]).
+    first: usize,
+    /// F39MENUSCROLL (B1119): THE lit item (absolute index), written by the keys and by a pointer crossing.
+    sel: Option<usize>,
+    /// F39MENUSCROLL (B1119): the item the pointer was last over (a crossing is a change of it).
+    ptr: Option<usize>,
 }
 static MENU: crate::sync::Mutex<Option<Menu>> = crate::sync::Mutex::new(None);
 static MENU_UP: AtomicBool = AtomicBool::new(false);
@@ -316,8 +322,8 @@ fn menu_h(g: &Geom) -> usize {
 /// one hairline `<n> more…` row closes it. Every item when the whole menu fits the window's height; else the slots
 /// that fit less one, the last slot the more-row (it lights nothing; a press on it dismisses, like the band). The
 /// ONE geometry every site reads (paint, hover, press, the open road, the probe) through [`menu_h`] / [`menu_body`];
-/// `(0, _)` means nothing fits and the open road refuses. The menu never scrolls (BP-video-38: it is no pane;
-/// MENU-SCROLL owed).
+/// `(0, _)` means nothing fits and the open road refuses. The menu never scrolls (BP-video-38: it is no pane); the
+/// rows past the fit are a PAGE (F39MENUSCROLL B1119: `Menu.first`, [`page_turn`]).
 fn menu_fit(g: &Geom) -> (usize, bool) {
     let rh = g.row_h().max(1);
     let cap = g.h.saturating_sub(2 * crate::video::crystal::DROP_PADY() + crate::video::crystal::sheet::BAND()) / rh;
@@ -338,7 +344,7 @@ fn menu_body(g: &Geom) -> (usize, usize, usize) {
 /// MENUS2 (B652) — the item under the pointer, or `None`: the system cursor read through the input path's one door
 /// (`panel_info_nonblocking`, LOCKFIX), mapped by [`to_source`] (wm's `hit_test`/`info`, no Quarry lock taken), and
 /// tested against the BODY less its padding — the band and the padding light nothing.
-fn menu_hover(g: &Geom, x: usize, y: usize) -> Option<usize> {
+fn menu_hover(g: &Geom, x: usize, y: usize, first: usize) -> Option<usize> {
     let i = crate::video::panel_info_nonblocking()?;
     let (px, py) = crate::pal::cursor::pos(i.width as i32, i.height as i32);
     let (sx, sy) = to_source(px, py)?;
@@ -347,7 +353,9 @@ fn menu_hover(g: &Geom, x: usize, y: usize) -> Option<usize> {
         return None;
     }
     let k = (sy - y - pady) / g.row_h();
-    if k < menu_fit(g).0 { Some(k) } else { None } // QUARRYMENUFIT (B1107): the more-row lights nothing
+    let fit = menu_fit(g);
+    let i = page_first(first, fit) + k; // F39MENUSCROLL (B1119): the item on this page, absolute
+    if k < fit.0 && i < ITEMS.len() { Some(i) } else { None } // QUARRYMENUFIT (B1107): the more-row lights nothing
 }
 
 /// MENUS2 (B652) — **Quarry's file-ops menu on the sheet** (MENUSCRAFT §9), painted IN Quarry's own surface `px`
@@ -358,7 +366,7 @@ fn menu_hover(g: &Geom, x: usize, y: usize) -> Option<usize> {
 /// `text.primary` (`on_accent` on the pill), and `sheet::seal_row` over every row of the outer rect (no pure white:
 /// MENU-UNDER). MENUBANDONE (rmbp-ledger B1112, the seat's ink ruling): ONE band painter — the sheet's ink (the
 /// `elev.2` pair and, in Dark, the inner rim) is the house look; this menu keeps no shadow constants of its own.
-fn menu_paint(px: &mut [u32], g: &Geom, x: usize, y: usize, hover: Option<usize>) {
+fn menu_paint(px: &mut [u32], g: &Geom, x: usize, y: usize, first: usize, hover: Option<usize>) {
     use crate::video::crystal::sheet;
     let (w, h) = (menu_w(g), menu_h(g));
     let (bw, _, pady) = menu_body(g);
@@ -374,8 +382,9 @@ fn menu_paint(px: &mut [u32], g: &Geom, x: usize, y: usize, hover: Option<usize>
         }
     }
     let (rows, more) = menu_fit(g); // QUARRYMENUFIT (B1107)
-    for (i, it) in ITEMS.iter().enumerate().take(rows) {
-        let top = y + pady + i * rh;
+    let first = page_first(first, (rows, more)); // F39MENUSCROLL (B1119): the page; the sheet never moves
+    for (i, it) in ITEMS.iter().enumerate().skip(first).take(rows) {
+        let top = y + pady + (i - first) * rh;
         let hot = hover == Some(i);
         if hot {
             for r in top..top + rh {
@@ -386,7 +395,8 @@ fn menu_paint(px: &mut [u32], g: &Geom, x: usize, y: usize, hover: Option<usize>
         text(px, g, x + sheet::INSET() + PAD(), top + g.ts, it.label().as_bytes(), x + bw - sheet::INSET(), ink);
     }
     if more {
-        more_row(px, g, x, y + pady + rows * rh, bw, ITEMS.len() - rows); // QUARRYMENUFIT (B1107): the hidden tail
+        let back = first + rows >= ITEMS.len(); // F39MENUSCROLL (B1119): the last page's row reads `<first> back…`
+        more_row(px, g, x, y + pady + rows * rh, bw, back, if back { first } else { ITEMS.len() - first - rows }); // QUARRYMENUFIT (B1107): the hidden tail
     }
     for r in y..y + h {
         sheet::seal_row(&mut px[r * g.w + x..r * g.w + x + w]);
@@ -424,7 +434,7 @@ pub fn sheet_probe() -> (bool, bool) {
     let mut band_px = [0u32; 2];
     for (k, &f) in fills.iter().enumerate() {
         let mut px = alloc::vec![f; g.w * g.h];
-        menu_paint(&mut px, &g, 0, 0, Some(0));
+        menu_paint(&mut px, &g, 0, 0, 0, Some(0));
         let at = |x: usize, y: usize| px[y * g.w + x] & 0x00FF_FFFF;
         menu_ok &= at(bw / 2, bh / 2) == sheet::surface_overlay();
         menu_ok &= at(bw - sheet::INSET() - 2, pady + g.row_h() / 2) == sheet::accent_fill() && at(sheet::INSET() / 2, pady + g.row_h() / 2) != sheet::accent_fill();
@@ -438,7 +448,7 @@ pub fn sheet_probe() -> (bool, bool) {
         sheet::seal_row(&mut refrow);
         darker &= band_px[k] == refrow[bw + 1] & 0x00FF_FFFF;
     }
-    menu_ok &= fit_probe(&g); // QUARRYMENUFIT (B1107): the live fit rule, in a window shorter than the menu
+    menu_ok &= fit_probe(&g) && page_probe(&g); // QUARRYMENUFIT (B1107): the live fit rule, in a window shorter than the menu · F39MENUSCROLL (B1119): its second page
     (menu_ok, darker && band_px[0] != band_px[1])
 }
 
@@ -474,9 +484,14 @@ pub fn paint_overlay(m: &Model, px: &mut [u32]) {
         s.push(b'_');
         text(px, g, x + PAD(), y + g.ts, &s, x + w, theme::text_primary());
     }
-    let at = MENU.lock().as_ref().map(|mn| (mn.x, mn.y)); // MENUS2 (B652): the origin copied out, so the hover read below holds no Quarry UI lock
-    if let Some((mx, my)) = at {
-        menu_paint(px, g, mx, my, menu_hover(g, mx, my)); // MENUS2 (B652): the sheet (was a raised face, a keyline and flat rows)
+    let at = MENU.lock().as_ref().map(|mn| (mn.x, mn.y, mn.first)); // MENUS2 (B652): the origin copied out, so the hover read below holds no Quarry UI lock
+    if let Some((mx, my, first)) = at {
+        let hov = menu_hover(g, mx, my, first);
+        let lit = match MENU.lock().as_mut() { // F39MENUSCROLL (B1119): a pointer CROSSING writes the one sel; a still pointer leaves the keys' sel
+            Some(mn) => { if mn.ptr != hov { mn.ptr = hov; if hov.is_some() { mn.sel = hov; } } mn.sel }
+            None => None,
+        };
+        menu_paint(px, g, mx, my, first, lit); // MENUS2 (B652): the sheet (was a raised face, a keyline and flat rows)
     }
     super::getinfo::paint(m, px); // ATTRCOLUMNS (B402): the inspector
     super::openwith::paint(m, px); // FILETYPES (B423): Open With…
@@ -580,7 +595,7 @@ pub fn right_press(x: i32, y: i32) -> bool {
         }
         let mx = sx.min(g.w.saturating_sub(w));
         let my = sy.min(g.h.saturating_sub(h));
-        *MENU.lock() = Some(Menu { x: mx, y: my });
+        *MENU.lock() = Some(Menu { x: mx, y: my, first: 0, sel: None, ptr: None }); // F39MENUSCROLL (B1119): page 0, nothing lit
         MENU_UP.store(true, Ordering::Release);
     }
     serial_println!("[quarry] menu open at=({},{}) rows={}/{} more={}", sx, sy, fit.0, ITEMS.len(), fit.1 as u8); // QUARRYMENUFIT (B1107): rows= more=
@@ -625,32 +640,32 @@ pub fn menu_press(x: i32, y: i32) -> bool {
     if !MENU_UP.load(Ordering::Acquire) {
         return false;
     }
-    let mn = MENU.lock().take();
-    MENU_UP.store(false, Ordering::Release);
-    let Some(mn) = mn else { return false };
+    let peek = MENU.lock().as_ref().map(|mn| (mn.x, mn.y, mn.first)); // F39MENUSCROLL (B1119): peeked, not taken — the more-row turns the page and the menu stays
+    let Some((mx, my, first)) = peek else { MENU_UP.store(false, Ordering::Release); return false };
     let hit = to_source(x, y);
     let mut picked = None;
-    let origin = (mn.x, mn.y);
+    let origin = (mx, my);
     if let Some((sx, sy)) = hit {
-        let g = match MODEL.lock().as_ref() {
-            Some(m) => { let (bw, _, pady) = menu_body(&m.geom); (bw, m.geom.row_h(), pady, menu_fit(&m.geom).0) } // MENUS2 (B652): the BODY less its padding — a press on the band dismisses (MENUSCRAFT §2)
-            None => return true,
+        let (bw, rh, pady, fit) = match MODEL.lock().as_ref() {
+            Some(m) => { let (bw, _, pady) = menu_body(&m.geom); (bw, m.geom.row_h().max(1), pady, menu_fit(&m.geom)) } // MENUS2 (B652): the BODY less its padding — a press on the band dismisses (MENUSCRAFT §2)
+            None => { *MENU.lock() = None; MENU_UP.store(false, Ordering::Release); return true }
         };
-        if sx >= mn.x && sx < mn.x + g.0 && sy >= mn.y + g.2 {
-            let i = (sy - mn.y - g.2) / g.1;
-            if i < g.3 { // QUARRYMENUFIT (B1107): a press on the more-row dismisses
+        if sx >= mx && sx < mx + bw && sy >= my + pady {
+            let k = (sy - my - pady) / rh;
+            let i = page_first(first, fit) + k;
+            if fit.1 && k == fit.0 { // F39MENUSCROLL (B1119): a press on the more-row turns the page (was: dismiss)
+                page_go(fit, false, "press");
+                repaint();
+                return true;
+            }
+            if k < fit.0 && i < ITEMS.len() { // QUARRYMENUFIT (B1107): the page's rows only
                 picked = Some(ITEMS[i]);
             }
         }
     }
-    match picked {
-        Some(Item::OpenWith) => {
-            if let Some((_, path, false)) = selection() { super::openwith::open(&path, origin.0, origin.1); } // FILETYPES (B423)
-            repaint();
-        }
-        Some(it) => run_item(it),
-        None => repaint(),
-    }
+    *MENU.lock() = None; // the menu goes on every other press (an item, the band, outside)
+    MENU_UP.store(false, Ordering::Release);
+    menu_pick(picked, origin); // F39MENUSCROLL (B1119): the one pick tail, Return's too
     hit.is_some()
 }
 
@@ -972,9 +987,7 @@ pub fn key_pre(c: u8) -> bool {
         repaint();
         return true;
     }
-    if MENU_UP.load(Ordering::Acquire) && c == 0x1B {
-        *MENU.lock() = None;
-        MENU_UP.store(false, Ordering::Release);
+    if MENU_UP.load(Ordering::Acquire) && menu_key(c) { // F39MENUSCROLL (B1119): Up/Down/PgUp/PgDn/Return walk the menu; Escape dismisses (the arm that stood here)
         repaint();
         return true;
     }
@@ -1389,14 +1402,15 @@ pub(super) fn menu_probe(f: impl FnOnce() -> bool) -> bool {
 
 /// QUARRYMENUFIT (B1107) — the menu's closing `<n> more…` row at source row `top` (one item tall, body width `bw`):
 /// a `line.subtle` hairline on its first row (`sheet::separator`, inset from both sides) and the count in
-/// `text.secondary`. No pill: it is not an item.
-fn more_row(px: &mut [u32], g: &Geom, x: usize, top: usize, bw: usize, hidden: usize) {
+/// `text.secondary`. No pill: it is not an item. F39MENUSCROLL (B1119): `back` = the last page's row, `<n> back…`
+/// (`n` the items before the page); a press on either turns the page ([`page_turn`]).
+fn more_row(px: &mut [u32], g: &Geom, x: usize, top: usize, bw: usize, back: bool, hidden: usize) {
     use crate::video::crystal::sheet;
     if top >= g.h || x + bw > g.w {
         return;
     }
     sheet::separator(&mut px[top * g.w + x..top * g.w + x + bw], bw, 0, 0);
-    let label = alloc::format!("{} more\u{2026}", hidden);
+    let label = if back { alloc::format!("{} back\u{2026}", hidden) } else { alloc::format!("{} more\u{2026}", hidden) };
     text(px, g, x + sheet::INSET() + PAD(), top + g.ts, label.as_bytes(), x + bw - sheet::INSET(), sheet::text_secondary());
 }
 
@@ -1412,12 +1426,172 @@ fn fit_probe(g: &Geom) -> bool {
     let mut ok = rows > 0 && rows < ITEMS.len() && more && w <= s.w && h <= s.h;
     if ok {
         let mut px = alloc::vec![theme::surface_content() & 0x00FF_FFFF; s.w * s.h];
-        menu_paint(&mut px, &s, 0, 0, Some(0));
+        menu_paint(&mut px, &s, 0, 0, 0, Some(0));
         ok &= px[(bh / 2) * s.w + bw / 2] & 0x00FF_FFFF == sheet::surface_overlay();
         for r in 0..h {
             ok &= !px[r * s.w..r * s.w + w].iter().any(|&c| c & 0x00FF_FFFF == theme::pure_white());
         }
     }
     serial_println!("[menuscraft] quarry_fit surf={}x{} menu={}x{} rows={}/{} more={} -> {}", s.w, s.h, w, h, rows, ITEMS.len(), more as u8, if ok { "ok" } else { "BAD" });
+    ok
+}
+
+// ── F39MENUSCROLL (rmbp-ledger B1119): the menu's page and its keys ─────────────────────────────────────────────────
+// The rows past `menu_fit` are a PAGE, never a scroll (BP-video-38: the menu is no pane): `Menu.first` names the page's
+// first item (a multiple of the fit's rows), the sheet keeps its height and place, and the nav row at slot `rows`
+// (`<n> more…`, the last page's `<n> back…`) or PageDown turns it. The keys walk ONE `sel` — the pointer's crossing
+// writes the same field (`paint_overlay`) — lit by `menu_paint`'s one pill. Lock order MODEL -> MENU (as
+// `paint_overlay`): the fit is read under MODEL and dropped before MENU is taken; no lock is held across the pick.
+
+/// The page's first item under `fit`: `first` on its page boundary, or 0 when the menu re-fit under it (everything
+/// fits now, or the page is past the end).
+fn page_first(first: usize, fit: (usize, bool)) -> usize {
+    if !fit.1 || fit.0 == 0 || first >= ITEMS.len() { 0 } else { first - first % fit.0 }
+}
+
+/// The page holding item `i` (pages of `rows` items).
+fn page_of(i: usize, rows: usize) -> usize {
+    if rows == 0 { 0 } else { i - i % rows }
+}
+
+/// The page after `first`: the next `rows` items, or page 0 from the last page (the `<n> back…` row).
+fn page_turn(first: usize, fit: (usize, bool)) -> usize {
+    let f = page_first(first, fit);
+    if !fit.1 || f + fit.0 >= ITEMS.len() { 0 } else { f + fit.0 }
+}
+
+/// The page before `first` (PageUp), saturating at page 0.
+fn page_back(first: usize, fit: (usize, bool)) -> usize {
+    page_first(first, fit).saturating_sub(fit.0)
+}
+
+/// Move the open menu to the page `back ? page_back : page_turn` names: a keyboard sel moves to the page's first
+/// item, the pointer's last row is forgotten (the next crossing writes sel again). One `[quarry] menu page` line.
+fn page_go(fit: (usize, bool), back: bool, by: &str) {
+    let turned = match MENU.lock().as_mut() {
+        Some(mn) => {
+            let f = if back { page_back(mn.first, fit) } else { page_turn(mn.first, fit) };
+            mn.first = f;
+            mn.sel = mn.sel.map(|_| f);
+            mn.ptr = None;
+            Some(f)
+        }
+        None => None,
+    };
+    if let Some(f) = turned {
+        serial_println!("[quarry] menu page first={} rows={} by={}", f, fit.0, by);
+    }
+}
+
+/// One Up (`down` false) or Down step of the one sel: `(first, sel)` after it. ±1 modulo the items, the page following
+/// the sel (wraps inside a one-page menu, crosses a page at its edge, last <-> first across pages); with nothing lit,
+/// Down lights the page's first item and Up its last. Pure: the keys and `page_probe` share it.
+fn menu_step(first: usize, sel: Option<usize>, fit: (usize, bool), down: bool) -> (usize, usize) {
+    let n = ITEMS.len();
+    let rows = if fit.1 && fit.0 > 0 { fit.0 } else { n };
+    let f = page_first(first, fit);
+    let s = match sel {
+        Some(s) if s < n => if down { (s + 1) % n } else { (s + n - 1) % n },
+        _ => if down { f } else { (f + rows).min(n) - 1 },
+    };
+    (if fit.1 { page_of(s, rows) } else { 0 }, s)
+}
+
+/// A key while the menu is up (`key_pre`'s menu arm): `true` = consumed. Escape dismisses; Up/Down walk the sel;
+/// PageDown/PageUp turn the page; Return runs the lit item through [`menu_pick`] (nothing lit: consumed, nothing run,
+/// so the list behind the menu is not opened). Every other key falls through as before.
+fn menu_key(c: u8) -> bool {
+    if c == 0x1B {
+        *MENU.lock() = None;
+        MENU_UP.store(false, Ordering::Release);
+        return true;
+    }
+    if !matches!(c, 0x1E | 0x1F | b'\r' | b'\n' | una_abi::KEY_PGDN | una_abi::KEY_PGUP) {
+        return false;
+    }
+    let Some(fit) = MODEL.lock().as_ref().map(|m| menu_fit(&m.geom)) else { return false };
+    match c {
+        una_abi::KEY_PGDN => page_go(fit, false, "key"),
+        una_abi::KEY_PGUP => page_go(fit, true, "key"),
+        0x1E | 0x1F => {
+            let crossed = match MENU.lock().as_mut() {
+                Some(mn) => {
+                    let (f, s) = menu_step(mn.first, mn.sel, fit, c == 0x1E);
+                    let crossed = f != page_first(mn.first, fit);
+                    mn.first = f;
+                    mn.sel = Some(s);
+                    crossed.then_some(f)
+                }
+                None => None,
+            };
+            if let Some(f) = crossed {
+                serial_println!("[quarry] menu page first={} rows={} by=key", f, fit.0);
+            }
+        }
+        _ => {
+            let pick = {
+                let mut guard = MENU.lock();
+                match guard.as_ref().map(|mn| (mn.x, mn.y, mn.sel)) {
+                    Some((x, y, Some(i))) if i < ITEMS.len() => {
+                        *guard = None;
+                        Some((ITEMS[i], (x, y)))
+                    }
+                    _ => None,
+                }
+            };
+            if let Some((it, origin)) = pick {
+                MENU_UP.store(false, Ordering::Release);
+                menu_pick(Some(it), origin);
+            }
+        }
+    }
+    true
+}
+
+/// The one pick tail (the pointer's `menu_press` and the keys' Return): Open With… opens at the menu's origin, any
+/// other item runs, nothing picked repaints. The menu is already down; no Quarry UI lock is held.
+fn menu_pick(picked: Option<Item>, origin: (usize, usize)) {
+    match picked {
+        Some(Item::OpenWith) => {
+            if let Some((_, path, false)) = selection() { super::openwith::open(&path, origin.0, origin.1); } // FILETYPES (B423)
+            repaint();
+        }
+        Some(it) => run_item(it),
+        None => repaint(),
+    }
+}
+
+/// `sheet_probe`'s page leg: `fit_probe`'s short window (three rows less than the whole menu), its second page
+/// (`page_turn(0)`) painted by the live painter with that page's first item lit. Ok: more than one page, the body's
+/// centre `surface.overlay`, the pill on slot 0 (accent at the body's right inner edge), no pure white; the page
+/// arithmetic: the last page turns back to 0, a stale page clamps to 0, Down from the page's last item crosses to the
+/// next page, Up from item 0 wraps to the last item on the last page, Down from the last item wraps to (0, 0).
+/// One `[menuscraft] quarry_page` line.
+fn page_probe(g: &Geom) -> bool {
+    use crate::video::crystal::sheet;
+    let s = Geom { h: menu_h_all(g).saturating_sub(3 * g.row_h()), ..*g };
+    let fit = menu_fit(&s);
+    let (rows, n) = (fit.0, ITEMS.len());
+    let first = page_turn(0, fit);
+    let (w, h) = (menu_w(&s), menu_h(&s));
+    let (bw, bh, pady) = menu_body(&s);
+    let mut ok = fit.1 && rows > 1 && first == rows && first < n && w <= s.w && h <= s.h;
+    if ok {
+        let last = page_of(n - 1, rows);
+        ok &= page_turn(last, fit) == 0 && page_first(n + 5, fit) == 0 && page_back(first, fit) == 0;
+        ok &= menu_step(0, Some(rows - 1), fit, true) == (rows, rows);
+        ok &= menu_step(0, Some(0), fit, false) == (last, n - 1);
+        ok &= menu_step(last, Some(n - 1), fit, true) == (0, 0);
+        ok &= menu_step(0, None, fit, true) == (0, 0);
+        let mut px = alloc::vec![theme::surface_content() & 0x00FF_FFFF; s.w * s.h];
+        menu_paint(&mut px, &s, 0, 0, first, Some(first));
+        let at = |x: usize, y: usize| px[y * s.w + x] & 0x00FF_FFFF;
+        ok &= at(bw / 2, bh / 2) == sheet::surface_overlay();
+        ok &= at(bw - sheet::INSET() - 2, pady + s.row_h() / 2) == sheet::accent_fill();
+        for r in 0..h {
+            ok &= !px[r * s.w..r * s.w + w].iter().any(|&c| c & 0x00FF_FFFF == theme::pure_white());
+        }
+    }
+    serial_println!("[menuscraft] quarry_page first={} rows={} -> {}", first, rows, if ok { "ok" } else { "BAD" });
     ok
 }
