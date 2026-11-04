@@ -696,3 +696,30 @@ pub fn hello_line(d: Dialect, s: &str) -> HelloLine {
         Dialect::LinuxCnc => HelloLine::Other,
     }
 }
+
+// --- VUGCOMSCANHOSTDESK (LEDGER SR561): the controller's commissioned name, written once and read back (named tail hunk) ---
+
+/// The verb that commissions a controller's own name, sent once at the first bind of an unnamed board: grbl 1.1
+/// `$I=<name>` (system.c `settings_store_build_info`, answered `ok`; the line intake upper-cases a-z and drops bytes
+/// <= ' ', so a name is `[A-Z0-9-]`); Marlin's `M115` has no writable name and LinuxCNC no verb: `None`.
+pub fn name_verb(d: Dialect, name: &str) -> Option<String> {
+    match d {
+        Dialect::Grbl { .. } => Some(alloc::format!("$I={name}")),
+        Dialect::Marlin | Dialect::LinuxCnc => None,
+    }
+}
+
+/// The commissioned name inside a kept identity answer (`said`, the hello's kept lines joined by one space): grbl's
+/// `[VER:<version>.<date>:<user string>]` user string, `Some("")` for an uncommissioned board; `None` with no VER line
+/// or in a dialect without a name.
+pub fn hello_name(d: Dialect, said: &str) -> Option<&str> {
+    match d {
+        Dialect::Grbl { .. } => {
+            let at = said.find("[VER:")? + "[VER:".len();
+            let inner = &said[at..];
+            let inner = &inner[..inner.find(']')?];
+            Some(inner.split_once(':').map(|(_, name)| name).unwrap_or(""))
+        }
+        Dialect::Marlin | Dialect::LinuxCnc => None,
+    }
+}
