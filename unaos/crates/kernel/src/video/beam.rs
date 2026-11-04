@@ -607,3 +607,43 @@ pub fn sec_take() -> [u64; 6] {
 pub fn sec_take() -> [u64; 6] {
     [0; 6]
 }
+
+// ── F39SHIMMER (rmbp-ledger B1099) — TAIL-APPENDED so no line above moves: the rows a bracket would wait on ─────────
+//
+// FLIGHT 39: `:: VEILCOST: ratio_p99=0.89 shimmer_idle_us=2835 -> FAIL` — the shimmer's drain present spun in [`hold`] on
+// two or three of its ten boxes (`[beam] held_us/holds` = 1.13 ms per waited hold). The shimmer chooses its boxes, so it
+// asks this BEFORE it re-tints: which panel rows would a bracket opened within `ahead_us` from now spin on? The answer is
+// [`hold`]'s own zone, read from the same raster line with the same lead (`LEAD_MIN` + `FETCH_LINES` + span/3, the staged
+// path's): a box `[y0, y1)` no taller than `span_max` spins at some beam line `v'` in `[v, v + ahead]` iff
+// `y1 > v && y0 <= v + ahead + lead`, i.e. iff it meets rows `[v, v + ahead + lead + 1)` on the frame's circle. Returned as
+// at most two row bands (split at the wrap), each clamped to `panel_h` (lines at or past it are vblank: an empty band is
+// `(0, 0)`). The hold itself is unchanged and stays the net for a box that runs late.
+
+/// F39SHIMMER (B1099): the panel row bands `[y0, y1)` a bracket over a box of at most `span_max` rows, opened within
+/// `ahead_us` from now, would wait on. `None`: no raster source (every row is clear).
+#[cfg(feature = "beam")]
+pub fn busy_rows(panel_h: usize, span_max: usize, ahead_us: u64) -> Option<[(usize, usize); 2]> {
+    let (v, vt) = crate::arch::scanout_beam()?;
+    if vt == 0 || panel_h == 0 {
+        return None;
+    }
+    let v = v.min(vt - 1);
+    let ahead = (ahead_us.saturating_mul(vt as u64) / FRAME_US).min(vt as u64) as u32;
+    let lead = (span_max.min(panel_h) as u32) / 3 + LEAD_MIN + FETCH_LINES;
+    let len = ahead.saturating_add(lead).saturating_add(1).min(vt);
+    let end = v + len;
+    let clamp = |a: u32, b: u32| {
+        let (a, b) = ((a as usize).min(panel_h), (b as usize).min(panel_h));
+        if b > a { (a, b) } else { (0, 0) }
+    };
+    let first = clamp(v, end.min(vt));
+    let second = if end > vt { clamp(0, end - vt) } else { (0, 0) };
+    Some([first, second])
+}
+
+/// Off-knob [`busy_rows`]: no beam source exists, so no row is ever busy. Constant `None`.
+#[cfg(not(feature = "beam"))]
+#[inline(always)]
+pub fn busy_rows(_panel_h: usize, _span_max: usize, _ahead_us: u64) -> Option<[(usize, usize); 2]> {
+    None
+}
