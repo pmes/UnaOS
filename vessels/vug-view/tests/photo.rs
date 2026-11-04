@@ -1020,3 +1020,55 @@ fn a_camera_flag_line_sets_the_side_and_clear_returns_it_to_the_lattice() {
     assert_eq!(prefs, photo::PhotoPrefs::default());
     assert_eq!(ph(&vw).prefs, prefs);
 }
+
+// ---- VUGINTENTSETFACEANCHOREDOVERLAP (SR596): anchored cards stack; the more line's hover cue ----
+
+/// The rectangle face: two statement sets (two whys), each head naming the corner e0 first, so both cards are drawn at
+/// e0's anchor. The second is pushed down to the first's foot (head + two member rows = 36 px), x unmoved; the two
+/// painted rects are disjoint and both cards are drawn.
+#[test]
+fn two_anchored_cards_at_one_anchor_stack_without_overlap() {
+    let mut vw = rectangle();
+    let ps = vec![
+        datum("line v10 sketch=s a=e0 b=e1", "the bottom side"),
+        datum("horizontal v11 sketch=s line=v10", "the bottom side"),
+        datum("line v12 sketch=s a=e0 b=e3", "the left side"),
+        datum("vertical v13 sketch=s line=v12", "the left side"),
+    ];
+    assert!(photo::offer(&mut vw.view, ps));
+    let gs = photo::glyphs(&vw.view);
+    assert_eq!(gs.len(), 2, "two cards: {gs:?}");
+    let (a, b) = (gs[0].card.as_ref().expect("a card"), gs[1].card.as_ref().expect("a card"));
+    assert_eq!((a.rows().len(), b.rows().len()), (2, 2), "{a:?} {b:?}");
+    assert_ne!(gs[0].at.0, 6.0, "anchored, not listed: {:?}", gs[0].at);
+    assert_eq!(gs[1].at, (gs[0].at.0, gs[0].at.1 + 36.0), "the second card sits at the first's foot");
+    let (ra, rb) = (photo::glyph_rect(&gs[0]), photo::glyph_rect(&gs[1]));
+    let overlap = ra.0 < rb.0 + rb.2 && rb.0 < ra.0 + ra.2 && ra.1 < rb.1 + rb.3 && rb.1 < ra.1 + ra.3;
+    assert!(!overlap, "disjoint: {ra:?} {rb:?}");
+    let fr = raster::render(&vw.model, &vw.view);
+    assert!(drawn(&fr, &gs[0]) && drawn(&fr, &gs[1]));
+}
+
+/// SR589's chain on a 148 px sheet (the card focused, its `... 5 MORE` at x 14.., y 138..150): the pointer moving onto
+/// the more line asks for a frame and the line paints ACTIVE; moving within it asks none; moving off it asks for one
+/// frame and the line paints INK (not the focused card's ACTIVE), no ACTIVE pixel left in it.
+#[test]
+fn the_more_line_paints_active_under_the_cursor_and_ink_off_it() {
+    use vug_view::sketch::{ACTIVE, INK};
+    let mut vw = rectangle();
+    vw.view.resize(W, 148);
+    assert!(photo::offer(&mut vw.view, chain()));
+    assert_eq!(ph(&vw).focus, Some(0));
+    assert_eq!(photo::glyphs(&vw.view)[0].card.as_ref().expect("a card").rows()[7], "... 5 MORE");
+    let any = |fr: &raster::Frame, col: u32| (138..148u32).any(|y| (14..94u32).any(|x| fr.pixel(x, y) == raster::rgba(col)));
+    vw.view.motion(400.0, 20.0);
+    assert!(vw.view.motion(16.0, 140.0), "entering the more line asks for a frame");
+    let fr = raster::render(&vw.model, &vw.view);
+    assert!(any(&fr, ACTIVE), "the more line paints ACTIVE under the cursor");
+    assert!(!photo::hover(&mut vw.view, (16.0, 140.0), 18.0, 141.0), "moving within it asks no frame of photo");
+    assert!(photo::hover(&mut vw.view, (16.0, 140.0), 400.0, 20.0), "photo's hover sees the leave");
+    assert!(vw.view.motion(400.0, 20.0), "leaving the more line asks for a frame");
+    let fr = raster::render(&vw.model, &vw.view);
+    assert!(any(&fr, INK), "off the cursor the more line paints INK");
+    assert!(!any(&fr, ACTIVE), "and no ACTIVE pixel is left in it");
+}

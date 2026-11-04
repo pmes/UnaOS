@@ -535,21 +535,24 @@ pub fn glyphs(view: &View) -> Vec<ProposalGlyph> {
         };
         let card = paged(card, at.1, view.size.1); out.push(ProposalGlyph { offer: i, at, text: text.to_uppercase(), colour, card }); // VUGINTENTSETFACESCROLL (SR583): the card's page on the sheet; VUGINTENTSETFACE (SR570): card
     }
-    out
+    unstack(view, ph, face, out) // VUGINTENTSETFACEANCHOREDOVERLAP (SR596): an anchored glyph overlapping an earlier anchored one moves down to its foot
 }
 
-/// The focus follows the glyph under the cursor (within `FOCUS_PX` of its first character); true when it moved.
-pub fn hover(view: &mut View, x: f64, y: f64) -> bool {
+/// The focus follows the glyph under the cursor (within `FOCUS_PX` of its first character); true when it moved, or
+/// (VUGINTENTSETFACEANCHOREDOVERLAP SR596) when the more line under the cursor changed from `was` (the cursor before
+/// this motion): entering or leaving one asks for the frame its cue paints in.
+pub fn hover(view: &mut View, was: (f64, f64), x: f64, y: f64) -> bool {
+    let cue = more_at(view, was) != more_at(view, (x, y)); // VUGINTENTSETFACEANCHOREDOVERLAP (SR596): the more line's cue
     let near = glyphs(view)
         .into_iter()
         .map(|g| (g.offer, (g.at.0 as f64 + 3.0 - x).hypot(g.at.1 as f64 + 5.0 - y)))
         .filter(|(_, d)| *d <= FOCUS_PX)
         .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(core::cmp::Ordering::Equal));
-    let Some((i, _)) = near else { return false };
-    let Some(ph) = view.photo.as_mut() else { return false };
+    let Some((i, _)) = near else { return cue };
+    let Some(ph) = view.photo.as_mut() else { return cue };
     let moved = ph.focus != Some(i);
     ph.focus = Some(i);
-    moved
+    moved || cue
 }
 
 /// The proposal overlay, drawn after the sketch's (`View::overlay`): each glyph (a cross at its anchor's corner and
@@ -561,7 +564,7 @@ pub fn overlay(view: &View, fr: &mut Raster) {
         let (x, y) = (g.at.0 - 6.0, g.at.1 + 14.0);
         raster::line(fr, (x - 3.0, y - 3.0), (x + 3.0, y + 3.0), col);
         raster::line(fr, (x - 3.0, y + 3.0), (x + 3.0, y - 3.0), col);
-        raster::text(fr, &g.text, g.at.0, g.at.1, col); card_lines(fr, &g, col); // VUGINTENTSETFACE (SR570): the card's member lines under its head
+        raster::text(fr, &g.text, g.at.0, g.at.1, col); card_lines(fr, &g, col); more_cue(view, fr, &g); // VUGINTENTSETFACEANCHOREDOVERLAP (SR596): the more line INK, ACTIVE under the cursor; VUGINTENTSETFACE (SR570): the card's member lines under its head
     }
     if let Some(note) = &ph.note {
         let col = if note.starts_with("refused") || note.starts_with("Vein refused") { REFUSED } else { INK };
@@ -1451,9 +1454,7 @@ fn more_line(g: &ProposalGlyph) -> Option<(f32, f32, f32, f32)> {
 /// A paged card's whole rect (head to more line, the widest row): (x0, y0, w, h). None as [`more_line`].
 fn card_rect(g: &ProposalGlyph) -> Option<(f32, f32, f32, f32)> {
     more_line(g)?;
-    let rows = g.card.as_ref()?.rows();
-    let wide = rows.iter().map(|r| 8.0 + 8.0 * r.chars().count() as f32).fold(8.0 * g.text.chars().count() as f32, f32::max);
-    Some((g.at.0, g.at.1, wide, CARD_ROW_PX * (rows.len() + 1) as f32))
+    Some(glyph_rect(g)) // VUGINTENTSETFACEANCHOREDOVERLAP (SR596): the one glyph geometry
 }
 
 fn inside(r: (f32, f32, f32, f32), x: f64, y: f64) -> bool {
@@ -1487,6 +1488,57 @@ pub fn wheel(view: &mut View, dy: f64) -> Option<bool> {
     let (x, y) = view.cursor;
     let g = glyphs(view).into_iter().find(|g| card_rect(g).is_some_and(|r| inside(r, x, y)))?;
     Some(page_card(view, g.offer, if dy > 0.0 { "Page_Down" } else { "Page_Up" }).unwrap_or(false))
+}
+
+// ---- VUGINTENTSETFACEANCHOREDOVERLAP (SR596): anchored glyphs stack; the more line's hover cue (named tail block) ----
+
+/// Any glyph's painted rect: its head row and every row [`card_lines`] paints under it (a single is its head alone):
+/// (x0, y0, w, h), the bitmap's 8 px advance, the widest row, one [`CARD_ROW_PX`] pitch per row.
+pub fn glyph_rect(g: &ProposalGlyph) -> (f32, f32, f32, f32) {
+    let rows = g.card.as_ref().map(|c| c.rows()).unwrap_or_default();
+    let wide = rows.iter().map(|r| 8.0 + 8.0 * r.chars().count() as f32).fold(8.0 * g.text.chars().count() as f32, f32::max);
+    (g.at.0, g.at.1, wide, CARD_ROW_PX * (rows.len() + 1) as f32)
+}
+
+fn overlaps(a: (f32, f32, f32, f32), b: (f32, f32, f32, f32)) -> bool {
+    a.0 < b.0 + b.2 && b.0 < a.0 + a.2 && a.1 < b.1 + b.3 && b.1 < a.1 + a.3
+}
+
+/// SR596's rule, ONE pass over [`glyphs`]' output in offer (= anchor) order: an anchored glyph (its statement's
+/// [`anchor`] on screen, the predicate `glyphs` placed it by) whose [`glyph_rect`] overlaps an earlier anchored glyph's
+/// moves down to that glyph's foot (by the overlap), again while it overlaps one, its card re-paged at the new height
+/// from the head offer's page ([`paged`]). x never moves; a listed glyph keeps SR589's column. Nothing is stored.
+fn unstack(view: &View, ph: &Photo, face: &SketchFace, mut out: Vec<ProposalGlyph>) -> Vec<ProposalGlyph> {
+    let mut placed: Vec<(f32, f32, f32, f32)> = Vec::new();
+    for g in &mut out {
+        if anchor(face, ph.offers[g.offer].proposal.stmt.trim()).and_then(|q| face.to_screen(view, q)).is_none() {
+            continue;
+        }
+        while let Some(r) = { let me = glyph_rect(g); placed.iter().copied().find(|r| overlaps(*r, me)) } {
+            g.at.1 = r.1 + r.3;
+            if let Some(c) = g.card.as_mut() {
+                c.first = ph.offers[g.offer].page;
+            }
+            g.card = paged(g.card.take(), g.at.1, view.size.1);
+        }
+        placed.push(glyph_rect(g));
+    }
+    out
+}
+
+/// The offer whose paged card's more line ([`more_line`]) is under `p`; [`hover`] compares it before and after a
+/// motion, so entering, leaving or crossing to another card's more line asks for a frame.
+fn more_at(view: &View, p: (f64, f64)) -> Option<usize> {
+    glyphs(view).into_iter().find(|g| more_line(g).is_some_and(|r| inside(r, p.0, p.1))).map(|g| g.offer)
+}
+
+/// A paged card's more line repainted (the same string at [`card_lines`]' last row, so exactly its pixels): ACTIVE
+/// under the cursor, else INK (a control line, not a statement: the cue reads on a focused card too).
+fn more_cue(view: &View, fr: &mut Raster, g: &ProposalGlyph) {
+    let Some(r) = more_line(g) else { return };
+    let Some(last) = g.card.as_ref().and_then(|c| c.rows().pop()) else { return };
+    let (x, y) = view.cursor;
+    raster::text(fr, &last, r.0, r.1, rgba(if inside(r, x, y) { ACTIVE } else { INK }));
 }
 
 // ---- VUGPHOTOPREFFACEWIRE (SR588): clearing the camera's datum (named tail block) ----
