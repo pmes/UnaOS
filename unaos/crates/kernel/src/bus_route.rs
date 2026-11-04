@@ -719,7 +719,7 @@ fn tagid_selftest(fx: &Fixture) {
         w |= 1 << 2;
     }
     // BUSREG-TAG-PATH (B1163) L4: named PREFS, but loaded from a home path -> refused at REGISTER.
-    on_exit(fx.ops, f);
+    on_exit(fx.ops, f); (fx.clear)(a); // seat fold: L3's pending GET is reset into a's mailbox by this on_exit (found by B1164); drained so L5 reads its own reply
     (fx.clear)(f);
     let _ = crate::video::wm::app_name_arm(owner_f, "/home/una/PREFS.ELF");
     let n = crate::bus::build_request(BUS_VERB_REGISTER, 66, &[set], &mut buf);
