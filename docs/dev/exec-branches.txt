@@ -1413,9 +1413,9 @@ exec-rmbp-vugintentsetfacelistrows 8d44a76ca wave36 cut56
 exec-rmbp-vugfacejournalfaultfixref 8d44a76ca wave36 cut56
 exec-rmbp-vugcomscanalarmidle 8d44a76ca wave36 cut56
 exec-rmbp-vugfaceconfidencetint 8d44a76ca wave36 cut56
-exec-rmbp-f39arrowdocs a206e40a3 wave36 cut57
-exec-rmbp-f39veilbootstorer3 a206e40a3 wave36 cut57
-exec-rmbp-f39a11ybootset a206e40a3 wave36 cut57
-exec-rmbp-f39hidlockwho a206e40a3 wave36 cut57
-exec-rmbp-f39armsplitorin a206e40a3 wave36 cut57
-exec-rmbp-f39machinestoreacl a206e40a3 wave36 cut57
+exec-rmbp-f39arrowdocs 5bdcbf215 FOLDED (kernel batch B1145-B1150)
+exec-rmbp-f39veilbootstorer3 a206e40a3 FOLDED (kernel batch B1145-B1150)
+exec-rmbp-f39a11ybootset a206e40a3 FOLDED (kernel batch B1145-B1150)
+exec-rmbp-f39hidlockwho 9e65c60b3 FOLDED (kernel batch B1145-B1150)
+exec-rmbp-f39armsplitorin 43f2155f4 FOLDED (kernel batch B1145-B1150)
+exec-rmbp-f39machinestoreacl 4756b4866 FOLDED (kernel batch B1145-B1150)
