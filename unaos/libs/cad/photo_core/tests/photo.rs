@@ -1231,3 +1231,65 @@ fn a_thin_side_off_the_axes_is_parallel() {
     assert_eq!(parp, 0, "the plain plate carries a Parallel");
     eprintln!("photo: thin parallel plain thin={:?} parallel={parp} dof={}", mp.shape.thin, mp.solved.dof);
 }
+
+// ---- VUGPHOTOSIDETHINSPLIT (SR669): a thin side does not split through the fit at the photo's σ (named tail block) ----
+/// The shim's side lines of an outer loop (part frame through `to_part`: mid x < -1, at least SHIM_L / 4 long) as
+/// (upper, lower) prim indices, upper by mid y over SHIM_Y.
+fn split_sides(outer: &[Prim], to_part: &dyn Fn(Vec2) -> Vec2) -> (Vec<usize>, Vec<usize>) {
+    let (mut up, mut lo) = (Vec::new(), Vec::new());
+    for (k, p) in outer.iter().enumerate() {
+        let Prim::Line { a, b, .. } = *p else { continue };
+        let (pa, pb) = (to_part(a), to_part(b));
+        if (pa + pb).x * 0.5 < -1.0 && pa.dist(pb) >= fixture::SHIM_L * 0.25 {
+            if (pa + pb).y * 0.5 > fixture::SHIM_Y { up.push(k) } else { lo.push(k) }
+        }
+    }
+    (up, lo)
+}
+
+fn split_rms(p: &Prim) -> f64 {
+    match *p {
+        Prim::Line { rms, .. } => rms,
+        _ => f64::NAN,
+    }
+}
+
+#[test]
+fn a_thin_side_gap_does_not_split_it() {
+    let s = Spec { part_rot_deg: 5.0, ..Spec::good() };
+    // LOOP: SR661's 5° shim as the fit's own input (traced at 32 px / mm, no blur) with SHIM_GAP (2.5 σ deep at σ 0.125)
+    // on its upper side at mid-length: past DP's 2 σ but no >= CORNER_DEG corner survives, so segment_run's whole-run
+    // line_ok (3 σ) takes the side as ONE line; the gap shows only as that line's rms (measured 0.0467 vs ~0.009).
+    let to_part = |p: Vec2| fixture::paper_to_part(&s, p);
+    let o = fit::outline(&fixture::shim_loops(&s, 32.0, Some(fixture::SHIM_GAP)), 0.125, 5.0).expect("the gap loop fits");
+    let (up, lo) = split_sides(&o.outer, &to_part);
+    assert_eq!((up.len(), lo.len()), (1, 1), "the 2.5 σ gap split the shim's side: {:?}", o.outer);
+    let (ru, rl) = (split_rms(&o.outer[up[0]]), split_rms(&o.outer[lo[0]]));
+    assert!(ru > 3.0 * rl && ru <= fit::BAND_SIGMA * 0.125, "the gap is not absorbed into the side: rms {ru} vs {rl}");
+    assert_eq!(o.thin[0].len(), 1, "one thin pair on the gap loop: {:?}", o.thin);
+    let sk = photo_core::sketch::to_sketch(&o, Tol::DEFAULT).expect("the gap loop's sketch solves");
+    let cs: Vec<(sketch_core::ConstraintId, Constraint)> =
+        (0u32..).map(sketch_core::ConstraintId).map_while(|id| sk.sketch.constraint(id).map(|c| (id, *c))).collect();
+    let parl = par_parallels(&cs).len();
+    assert_eq!(parl, 1, "one Parallel on the gap loop");
+    eprintln!("photo: thin split case=loop2.5sigma lines={}/{} rms={ru:.4}/{rl:.4} thin={:?} parallel={parl}", up.len(), lo.len(), o.thin);
+
+    // PHOTO: the 1 px light gap (0.125 mm along, half the shim deep) on SR661's 5° photo shim: under the 3 x 3 blur and
+    // DP's 2 σ it leaves the side ONE line, the one pair and its one Parallel as SR661's.
+    let img = fixture::render_shape(&s, &|q: Vec2| fixture::in_part(q) || fixture::in_shim_gap(q, (0.125, 0.25)));
+    let m = measure(&img, PhotoParams::new(5.0), Tol::DEFAULT).expect("the 1 px gap photo measures");
+    let (upp, lop) = split_sides(&m.shape.outer, &|p: Vec2| par_part(&s, &m, p));
+    assert_eq!((upp.len(), lop.len()), (1, 1), "the 1 px gap split the photo shim's side: {:?}", m.shape.outer);
+    assert_eq!(m.shape.thin[0].len(), 1, "one thin pair on the 1 px gap photo: {:?}", m.shape.thin);
+    let parp = par_parallels(&par_cons(&m)).len();
+    assert_eq!(parp, 1, "one Parallel on the 1 px gap photo");
+    eprintln!(
+        "photo: thin split case=photo1px lines={}/{} rms={:.4}/{:.4} thin={:?} parallel={parp} dof={}",
+        upp.len(),
+        lop.len(),
+        split_rms(&m.shape.outer[upp[0]]),
+        split_rms(&m.shape.outer[lop[0]]),
+        m.shape.thin,
+        m.solved.dof
+    );
+}
