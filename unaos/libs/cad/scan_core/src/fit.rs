@@ -24,6 +24,10 @@
 //! scored by the points within the distance band AND the angle band, a curved candidate whose normals turn less than
 //! the angle band refused as a plane in disguise, the best candidate refit and cut to its largest connected component,
 //! accepted only at or above BOTH limits of a [`Floor`], its points removed, repeated; a cloud of noise yields nothing.
+//! VUGSCANSHAPESMERGE (LEDGER SR537): one shape per surface — the component cut leaves a surface's other components
+//! alive, so a shape accepted later with the same kind and the same parameters within the band (tested at the data,
+//! the normal's sign normalised) is a repeat and merges into the earlier shape (the union refit); skirts, a different
+//! kind from their neighbours, are kept.
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -698,8 +702,9 @@ fn uf_find(parent: &mut [usize], mut x: usize) -> usize {
     x
 }
 
-/// The largest 26-connected component of `idx` over the finest grid's cells (two pipes on one axis are two
-/// cylinders); ties go to the component holding the lowest index. Returned in ascending index order.
+/// The largest 26-connected component of `idx` over the finest grid's cells (the fit's guard: two pipes on one axis
+/// settle as two candidates, and `detect`'s merge (SR537) then makes them ONE cylinder, one surface in two patches);
+/// ties go to the component holding the lowest index. Returned in ascending index order.
 fn largest_component(points: &[Vec3], idx: &[usize], grid: &Grid) -> Vec<usize> {
     let mut cells: Vec<(u64, usize)> = idx.iter().map(|&i| (grid.key(points[i]), i)).collect();
     cells.sort_unstable();
@@ -806,8 +811,9 @@ fn settle(kind: Primitive, points: &[Vec3], unit: &[Vec3], live: &[u32], grid: &
 /// [`TRIALS_PER_ROUND`] local three-point samples (the first point uniform over the unexplained points, the other two
 /// from its cell at one of three levels), makes up to four candidates from each, estimates their support on a
 /// [`SUBSET`] of the unexplained points, settles the best (refit, largest connected component, the curvature test)
-/// and accepts the first that meets the floor; its points leave the pool; the loop ends when no candidate does or
-/// at [`MAX_SHAPES`]. Deterministic (a fixed seed). Fewer than three points, or a cloud of no extent, yields none.
+/// and accepts the first that meets the floor; its points leave the pool; a shape of the same kind as an earlier one
+/// with the same parameters within the band (`same_surface`: another component of that surface) merges into it, the
+/// union refit (`merged`), else it is pushed; the loop ends when no candidate does or at [`MAX_SHAPES`]. Deterministic (a fixed seed). Fewer than three points, or a cloud of no extent, yields none.
 pub fn detect(points: &[Vec3], normals: &[Vec3], band: Tol, floor: Floor) -> Result<Vec<Shape>, FitError> {
     let n = points.len();
     if normals.len() != n {
@@ -901,24 +907,88 @@ pub fn detect(points: &[Vec3], normals: &[Vec3], band: Tol, floor: Floor) -> Res
             }
         }
         let Some((k, idx)) = found else { break };
-        let (rms, mx, cnt) = residuals(idx.iter().filter_map(|&i| k.residual(points[i], unit[i], band)));
         for &i in &idx {
             alive[i] = false;
         }
-        let inliers: Vec<u32> = idx.iter().map(|&i| i as u32).collect();
-        let (spread_deg, _) = spread(&k, points, normals, &inliers); // VUGSCANSHAPESPREAD (SR526): the same inliers
-        out.push(Shape {
-            kind: k,
-            inliers,
-            support: cnt,
-            fraction: cnt as f64 / n as f64,
-            rms_mm: rms,
-            max_mm: mx,
-            spread_deg,
-        });
+        // VUGSCANSHAPESMERGE (SR537): a repeat of an earlier shape's surface merges into it (the union refit).
+        let repeat = out.iter().position(|s| same_surface(s, &k, &idx, points, band));
+        match repeat.and_then(|j| merged(&out[j], &idx, points, &unit, band).map(|m| (j, m))) {
+            Some((j, (mk, midx))) => out[j] = shape_of(mk, &midx, points, &unit, normals, band, n),
+            None => out.push(shape_of(k, &idx, points, &unit, normals, band, n)),
+        }
     }
     out.sort_by(|a, b| b.support.cmp(&a.support));
     Ok(out)
+}
+
+// ---- merge (VUGSCANSHAPESMERGE, LEDGER SR537) ----
+
+fn centroid_of(points: &[Vec3], idx: impl Iterator<Item = usize>) -> Vec3 {
+    let (mut c, mut k) = (Vec3::ZERO, 0usize);
+    for i in idx {
+        c = c + points[i];
+        k += 1;
+    }
+    if k == 0 { c } else { c * (1.0 / k as f64) }
+}
+
+/// One surface found twice: the same kind, the parameters within the band, tested at the data (each shape's inlier
+/// centroid against the other) so an offset from the origin cannot amplify an angle error; a plane's or a cylinder's
+/// direction compares by `|dot|` (the normal's sign normalised: `canonical` can flip it between two refits), a cone's
+/// axis signed (both point into the opening: the opposite nappe is another surface). Two parallel faces are not one.
+fn same_surface(a: &Shape, b: &Primitive, b_idx: &[usize], points: &[Vec3], band: Tol) -> bool {
+    let ca = centroid_of(points, a.inliers.iter().map(|&i| i as usize));
+    let cb = centroid_of(points, b_idx.iter().copied());
+    let cos_ang = libm::cos(band.ang);
+    match (&a.kind, b) {
+        (Primitive::Plane(p), Primitive::Plane(q)) => {
+            p.normal.dot(q.normal).abs() >= cos_ang
+                && p.signed_distance(cb).abs() <= band.lin
+                && q.signed_distance(ca).abs() <= band.lin
+        }
+        (Primitive::Cylinder(p), Primitive::Cylinder(q)) => {
+            let foot = |c: &Cylinder, x: Vec3| c.point + c.axis * c.axis.dot(x - c.point);
+            p.axis.dot(q.axis).abs() >= cos_ang
+                && (p.radius - q.radius).abs() <= band.lin
+                && radial(p, foot(q, cb)).mag() <= band.lin
+                && radial(q, foot(p, ca)).mag() <= band.lin
+        }
+        (Primitive::Sphere(p), Primitive::Sphere(q)) => {
+            (p.centre - q.centre).mag() <= band.lin && (p.radius - q.radius).abs() <= band.lin
+        }
+        (Primitive::Cone(p), Primitive::Cone(q)) => {
+            p.axis.dot(q.axis) >= cos_ang
+                && (p.apex - q.apex).mag() <= band.lin
+                && (p.half_angle - q.half_angle).abs() <= band.ang
+        }
+        _ => false,
+    }
+}
+
+/// The union of `a`'s inliers and the repeat's, refit by the existing `refit` from `a`'s primitive and re-selected by
+/// `inliers_of`; `None` (the repeat stays its own shape) when the refit is inadmissible, stops bending or keeps fewer
+/// points than the larger part.
+fn merged(a: &Shape, b_idx: &[usize], points: &[Vec3], unit: &[Vec3], band: Tol) -> Option<(Primitive, Vec<usize>)> {
+    let mut union: Vec<usize> = a.inliers.iter().map(|&i| i as usize).chain(b_idx.iter().copied()).collect();
+    union.sort_unstable();
+    union.dedup();
+    let k = a.kind.refit(points, unit, &union);
+    if !k.admissible(band) {
+        return None;
+    }
+    let idx = inliers_of(&k, points, unit, union.into_iter(), band);
+    if idx.len() < a.inliers.len().max(b_idx.len()) || !bends(&k, unit, idx.iter().copied(), band) {
+        return None;
+    }
+    Some((k, idx))
+}
+
+/// The one Shape construction (lifted from `detect`'s push): residuals and the normal spread over the kept inliers.
+fn shape_of(k: Primitive, idx: &[usize], points: &[Vec3], unit: &[Vec3], normals: &[Vec3], band: Tol, n: usize) -> Shape {
+    let (rms, mx, cnt) = residuals(idx.iter().filter_map(|&i| k.residual(points[i], unit[i], band)));
+    let inliers: Vec<u32> = idx.iter().map(|&i| i as u32).collect();
+    let (spread_deg, _) = spread(&k, points, normals, &inliers); // VUGSCANSHAPESPREAD (SR526): the same inliers
+    Shape { kind: k, inliers, support: cnt, fraction: cnt as f64 / n as f64, rms_mm: rms, max_mm: mx, spread_deg }
 }
 
 // ---- normal spread (VUGSCANSHAPESPREAD, LEDGER SR526) ----
