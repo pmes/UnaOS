@@ -525,7 +525,8 @@ fn a_close_frame_mid_program_is_link_lost_and_a_rearm_resumes_from_the_named_lin
     drop(desk); // the second link closes: the fake sees the socket end and returns
     let (first, second) = fake.join().unwrap();
     assert_eq!(&first[..5], &lines[..5]);
-    assert_eq!(second, lines[5..].to_vec(), "the second connection ran only the lines from the lost one on");
+    let modal = lines[0].split_whitespace().map(str::to_string); // VUGCOMSCANRESUMEMODAL (SR656): the preamble's modal words, one line each, first
+    assert_eq!(second, modal.chain(lines[5..].iter().cloned()).collect::<Vec<_>>(), "the second connection ran the modal words, then only the lines from the lost one on");
 }
 
 // --- VUGCOMSCANHELLOON (SR549): the ws fake answers `$I`; the bus turns the hello on and the first open keeps it ---

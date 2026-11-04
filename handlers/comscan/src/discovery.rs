@@ -25,10 +25,13 @@
 //!   question goes once per local IPv4 address from a socket BOUND to that address (Linux sends a multicast datagram
 //!   out of the device owning its bound source). [`walk`] reads AAAA beside A, one [`Found`] per address of the SRV
 //!   target; a link-local answer keeps the interface it arrived on ([`Found::scope`], [`Found::socket_addr`]). The
-//!   interface lists are Linux's `/proc/net/if_inet6` and `/proc/net/fib_trie` ([`link_scopes`], [`local_v4`]); where
-//!   they cannot be read (macOS has no /proc) each family asks once from the default socket, as SR632 did.
+//!   interface lists come from [`interfaces`], one list per OS (VUGCOMSCANMDNSIFMACOS, LEDGER SR658): Linux's
+//!   `/proc/net/if_inet6` and `/proc/net/fib_trie` ([`link_scopes`], [`local_v4`]), macOS's `getifaddrs`; where a
+//!   list is empty (any other OS) each family asks once from the default socket, as SR632 did. On the BSD road a
+//!   multicast send leaves by `IP_MULTICAST_IF`, not by its bound source, so `ask` names the source's link there.
 //!
-//! std only: no libc, no `unsafe`.
+//! std only but the BSD road: libc in TWO private fns, each with its SAFETY line — `ifaddrs_lists` (macOS, the
+//! `getifaddrs` walk) and `multicast_if_v4` (macOS / FreeBSD, one `IP_MULTICAST_IF` setsockopt).
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, UdpSocket};
@@ -314,9 +317,8 @@ pub fn local_v4(fib_trie: &str) -> Vec<Ipv4Addr> {
 /// Every (bind, destination) pair one [`discover`] asks from: per local IPv4 address -> [`MDNS_GROUP`], per IPv6 link
 /// -> `ff02::fb%<ifindex>`; a family whose list is empty or unreadable asks once from its default socket.
 pub fn targets() -> Vec<(SocketAddr, SocketAddr)> {
-    let read = |path: &str| std::fs::read_to_string(path).unwrap_or_default();
+    let (v6, v4) = interfaces(); // VUGCOMSCANMDNSIFMACOS (SR658): the one list per OS
     let mut out: Vec<(SocketAddr, SocketAddr)> = Vec::new();
-    let v4 = local_v4(&read("/proc/net/fib_trie"));
     if v4.is_empty() {
         out.push((SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)), SocketAddr::V4(MDNS_GROUP)));
     }
@@ -324,7 +326,6 @@ pub fn targets() -> Vec<(SocketAddr, SocketAddr)> {
         out.push((SocketAddr::V4(SocketAddrV4::new(a, 0)), SocketAddr::V4(MDNS_GROUP)));
     }
     let any6 = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0));
-    let v6 = link_scopes(&read("/proc/net/if_inet6"));
     if v6.is_empty() {
         out.push((any6, SocketAddr::V6(MDNS_GROUP_V6)));
     }
@@ -339,6 +340,10 @@ fn ask(bind: SocketAddr, dest: SocketAddr) -> Option<UdpSocket> {
     let sock = UdpSocket::bind(bind).ok()?;
     if dest.is_ipv4() {
         let _ = sock.set_multicast_ttl_v4(255);
+        #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+        {
+            multicast_if_v4(&sock, bind); // VUGCOMSCANMDNSIFMACOS (SR658): the BSD road leaves by IP_MULTICAST_IF
+        }
     }
     sock.send_to(&query(), dest).ok()?;
     Some(sock)
@@ -400,4 +405,106 @@ fn discover_from(pairs: &[(SocketAddr, SocketAddr)], wait: Duration) -> Vec<Foun
     });
     found.sort_by(|a, b| (a.service != Service::Telnet, &a.name).cmp(&(b.service != Service::Telnet, &b.name)));
     found
+}
+
+// --- VUGCOMSCANMDNSIFMACOS (LEDGER SR658): the lists per OS, the BSD multicast interface (named tail block) ---
+
+/// The two lists [`targets`] asks from: the interface indexes with a link-local (fe80::/10) IPv6 address and the
+/// host's own IPv4 addresses, loopback skipped, each once in the order first seen. Linux reads `/proc` through
+/// [`link_scopes`] and [`local_v4`]; macOS walks `getifaddrs` (down, loopback and non-multicast interfaces skipped);
+/// any other OS lists nothing, and [`targets`] asks once per family from the default socket.
+pub fn interfaces() -> (Vec<u32>, Vec<Ipv4Addr>) {
+    #[cfg(target_os = "linux")]
+    {
+        let read = |path: &str| std::fs::read_to_string(path).unwrap_or_default();
+        (link_scopes(&read("/proc/net/if_inet6")), local_v4(&read("/proc/net/fib_trie")))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        ifaddrs_lists()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        (Vec::new(), Vec::new())
+    }
+}
+
+/// macOS's lists from one `getifaddrs` walk. A link-local entry's index is its `sin6_scope_id`, or the interface's
+/// `if_nametoindex` when that is 0 (KAME's getifaddrs embeds the index in `s6_addr[2..4]` and may leave the scope id
+/// 0; the fe80::/10 test reads the first 10 bits only). The list is freed once, after a walk with no early exit.
+#[cfg(target_os = "macos")]
+fn ifaddrs_lists() -> (Vec<u32>, Vec<Ipv4Addr>) {
+    let mut links: Vec<u32> = Vec::new();
+    let mut v4: Vec<Ipv4Addr> = Vec::new();
+    let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: getifaddrs writes `head` only when it returns 0; on any other rc nothing was allocated and nothing is
+    // freed. Every node reached through `ifa_next`, and its `ifa_name` / `ifa_addr`, stays valid until the one
+    // `freeifaddrs(head)` below. `ifa_addr` is read as a sockaddr_in / sockaddr_in6 only after its `sa_family` names
+    // that family (the kernel sizes the sockaddr for it), by `read_unaligned` copies; only copied values leave the
+    // block. The walk holds no `?`, return or panicking index, so `freeifaddrs` runs on every path that allocated.
+    unsafe {
+        if libc::getifaddrs(&mut head) != 0 {
+            return (links, v4);
+        }
+        let mut node = head;
+        while !node.is_null() {
+            let ifa = &*node;
+            node = ifa.ifa_next;
+            let flags = ifa.ifa_flags;
+            let wanted = flags & libc::IFF_UP as libc::c_uint != 0
+                && flags & libc::IFF_MULTICAST as libc::c_uint != 0
+                && flags & libc::IFF_LOOPBACK as libc::c_uint == 0;
+            if ifa.ifa_addr.is_null() || !wanted {
+                continue;
+            }
+            let family = (*ifa.ifa_addr).sa_family;
+            if family == libc::AF_INET as libc::sa_family_t {
+                let sin = std::ptr::read_unaligned(ifa.ifa_addr as *const libc::sockaddr_in);
+                let a = Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr));
+                if !a.is_loopback() && !v4.contains(&a) {
+                    v4.push(a);
+                }
+            } else if family == libc::AF_INET6 as libc::sa_family_t {
+                let sin6 = std::ptr::read_unaligned(ifa.ifa_addr as *const libc::sockaddr_in6);
+                if Ipv6Addr::from(sin6.sin6_addr.s6_addr).is_unicast_link_local() {
+                    let idx = if sin6.sin6_scope_id != 0 {
+                        sin6.sin6_scope_id
+                    } else if ifa.ifa_name.is_null() {
+                        0
+                    } else {
+                        libc::if_nametoindex(ifa.ifa_name)
+                    };
+                    if idx != 0 && !links.contains(&idx) {
+                        links.push(idx);
+                    }
+                }
+            }
+        }
+        libc::freeifaddrs(head);
+    }
+    (links, v4)
+}
+
+/// Name the link a v4 multicast send leaves by: the BSD stack picks it by `IP_MULTICAST_IF` or the route to 224/4,
+/// never by the bound source (Linux's rule), so a socket bound to one local address sets that address as its
+/// multicast interface. One setsockopt per socket; an unspecified source or a refused option leaves the default.
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+fn multicast_if_v4(sock: &UdpSocket, bind: SocketAddr) {
+    use std::os::fd::AsRawFd;
+    let SocketAddr::V4(src) = bind else { return };
+    if src.ip().is_unspecified() {
+        return;
+    }
+    let addr = libc::in_addr { s_addr: u32::from(*src.ip()).to_be() };
+    // SAFETY: the fd is the open socket `sock` owns for the whole call; IP_MULTICAST_IF reads exactly
+    // size_of::<in_addr>() bytes from `addr`, a local that outlives the call, and writes nothing back.
+    let _ = unsafe {
+        libc::setsockopt(
+            sock.as_raw_fd(),
+            libc::IPPROTO_IP,
+            libc::IP_MULTICAST_IF,
+            &addr as *const libc::in_addr as *const libc::c_void,
+            std::mem::size_of::<libc::in_addr>() as libc::socklen_t,
+        )
+    };
 }
