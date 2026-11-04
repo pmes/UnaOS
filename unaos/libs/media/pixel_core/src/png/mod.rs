@@ -8,4 +8,4 @@ mod decode;
 pub mod encode;
 
 pub use decode::{decode, iccp_profile, unfilter_rows};
-pub(crate) use decode::{ApngStepper, Parsed, parse, text_chunk};
+pub(crate) use decode::{ApngStepper, Parsed, parse, text_chunk, xmp_packet}; pub use decode::XMP_KEY; // VUGPHOTOCROPMETAXMP (SR631): the XMP packet reader and its `Image.text` key

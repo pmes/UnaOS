@@ -5,7 +5,8 @@
 //! platform-neutral (std + bandy + comscan, no toolkit): the rows ([`jog_rows`]) and the verb a key fires ([`key_verb`],
 //! the card's own `press`, so nothing new rides the wire and the desk stays the one validator). The pad is greyed, with
 //! the reason said, while no link is up. `platforms/gtk/console_view.rs` paints them, and (VUGCOMSCANJOGFACEMACOS,
-//! SR622) so does the AppKit Console pane, `platforms/macos/console_view.rs` `jog_pad`.
+//! SR622) so does the AppKit Console pane, `platforms/macos/console_view.rs` `jog_pad`. VUGCOMSCANDECLARECONSOLEFACE (SR633):
+//! each pad's declare entry under the squawk row fires [`declare_verb`] (the card's own `declare`, the one parser).
 
 use bandy::SMessage;
 use comscan::{CardSnapshot, Pad, PumpCard};
@@ -77,6 +78,20 @@ pub fn jog_rows(s: &CardSnapshot) -> Vec<JogRow> {
 /// The verb a press of `pad` fires: the card's own request ([`PumpCard::press`]: PumpJog by the card's step at its feed).
 pub fn key_verb(card: &PumpCard, pad: Pad) -> SMessage {
     card.press(pad)
+}
+
+// --- VUGCOMSCANDECLARECONSOLEFACE (LEDGER SR633): the pad's declare entry, written once for both faces (named tail hunk) ---
+
+/// The placeholder of the pad's declare entry, under the squawk row.
+pub const DECLARE_PLACEHOLDER: &str = "machine declare <name> x=.. y=.. z=..";
+
+/// The verb Enter in the pad's declare entry fires: the card's own request ([`PumpCard::declare`]: the ONE parser with
+/// the card's principal; the desk stays the ONE validator and answers through [`PumpCard::hear`]). `Some`: the face fires
+/// it and clears the entry. `None`: the parser refused the line, the card already says `refused: <why>` in the squawk
+/// row, and the face keeps the text so the person can mend it. Either way the face repaints the rows; it never greys
+/// the entry (a declare with no link is typed by the desk's next tick, SR623) and never checks the line itself.
+pub fn declare_verb(card: &mut PumpCard, line: &str) -> Option<SMessage> {
+    card.declare(line)
 }
 
 #[cfg(test)]
@@ -165,5 +180,24 @@ mod tests {
         c.hear(&squawk("idle", None));
         assert_eq!(link(&c), JogRow::Link("no link".into()));
         assert_eq!(c.snapshot().squawk.as_deref(), Some("refused: jog: no axis moves"));
+    }
+
+    /// VUGCOMSCANDECLARECONSOLEFACE (SR633): the entry's verb is the card's declare. A whole line posts the card's
+    /// PumpDeclare with its principal and leaves the squawk row alone (the desk answers through `hear`); a line the parser
+    /// refuses posts nothing and the pad's squawk row says the parser's refusal verbatim.
+    #[test]
+    fn jog_rows_declare_kat() {
+        let mut c = card();
+        match declare_verb(&mut c, "machine declare bench x=120 y=200 z=80") {
+            Some(SMessage::Pump(PumpEvent::PumpDeclare { principal, name, x, y, z, dialect })) => {
+                assert_eq!(principal, Origin::LocalUser("una".into()));
+                assert_eq!((name.as_str(), x, y, z, dialect), ("bench", 120.0, 200.0, 80.0, None));
+            }
+            other => panic!("expected PumpDeclare, got {other:?}"),
+        }
+        assert!(!jog_rows(&c.snapshot()).iter().any(|r| matches!(r, JogRow::Squawk(_))));
+        assert!(declare_verb(&mut c, "machine declare bench x=120 y=200").is_none());
+        assert!(jog_rows(&c.snapshot()).contains(&JogRow::Squawk("refused: declare: x, y and z are each required".into())));
+        assert_eq!(DECLARE_PLACEHOLDER, "machine declare <name> x=.. y=.. z=..");
     }
 }

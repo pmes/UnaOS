@@ -1437,3 +1437,41 @@ fn unsetrelay_selftest(fx: &Fixture) {
         }
     }
 }
+
+// QUEUED-SET-PENDPIN (rmbp-ledger B1193) — TAIL-APPENDED. A queued kernel-client SET whose live holder stays silent is
+// released by `prefs_client`'s silent arm (B1187) after 70 s, but its relay `Pend` stayed in `PEND`: the client's
+// generation is `KCLIENT_GEN` (u64::MAX) forever, so `route_request`'s dead-caller reclaim never frees it, and at
+// `PEND_MAX_PER_CALLER` every later client SET was answered `-EAGAIN` and written by the kernel fulfiller, which the
+// holder's late commit of the old SET could overtake. `take_pending_by_corr` is the keyed form of `take_pending` (the ONE
+// taker: same `locked` + `PEND` lock, the same bounded scan), called by the silent arm, so the holder's late answer meets
+// `fulfiller_reply`'s no-Pend arm (-ENOENT, nothing delivered) and the next SET relays to the holder in its queue order.
+// A dead holder needs nothing here: `on_exit` already takes every Pend whose `ful_row` is the dying row.
+// Witness: `tests bandy3` -> `:: RELAY-QUEUED-SET: ... pendpin=reclaimed ... -> PASS ::` (prefs_client Q8).
+// =================================================================================================
+
+/// Take (drop) the pending relay of caller `caller_row` whose CALLER corr is `corr`. `true` = one was held.
+pub fn take_pending_by_corr(caller_row: usize, corr: u32) -> bool {
+    corr != 0 && take_pending(|p| p.caller_row == caller_row && p.caller_corr == corr).is_some()
+}
+
+/// Relays in flight for caller `(caller_row, caller_gen)` — the count `route_request` holds against
+/// `PEND_MAX_PER_CALLER` (read for the witness; the cap check keeps its own count under its held lock).
+pub fn caller_pending(caller_row: usize, caller_gen: u64) -> usize {
+    locked(|| PEND.lock().iter().flatten().filter(|p| p.caller_row == caller_row && p.caller_gen == caller_gen).count())
+}
+
+/// Selftest only (`prefs_client`'s Q8): put a kernel-client relay of `verb` for client corr `caller_corr`, held by
+/// `(ful_row, ful_gen)`, in a FREE slot (a live Pend is never evicted). Returns its relay id; `None` = the table is full.
+pub fn pendpin_plant(verb: u8, caller_corr: u32, ful_row: usize, ful_gen: u64) -> Option<u32> {
+    let mut relay = NEXT_RELAY.fetch_add(1, Ordering::Relaxed);
+    if relay == 0 {
+        relay = NEXT_RELAY.fetch_add(1, Ordering::Relaxed);
+    }
+    let p = Pend { relay, verb, caller_row: crate::prefs_client::KCLIENT_ROW, caller_gen: crate::prefs_client::KCLIENT_GEN, caller_corr, ful_row, ful_gen };
+    locked(|| {
+        let mut t = PEND.lock();
+        let i = t.iter().position(|s| s.is_none())?;
+        t[i] = Some(p);
+        Some(relay)
+    })
+}
