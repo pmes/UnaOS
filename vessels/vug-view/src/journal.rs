@@ -446,21 +446,17 @@ pub fn key(d: &mut Design, k: &str) -> Option<bool> {
     if gesturing(d) {
         return None;
     }
-    let enter = matches!(k, "Return" | "KP_Enter" | "\r" | "\n");
-    let back = matches!(k, "BackSpace" | "Backspace" | "\u{8}" | "\u{7f}");
-    let ch = {
-        let mut it = k.chars();
-        match (it.next(), it.next()) {
-            (Some(c), None) => Some(c),
-            _ => None,
-        }
-    };
+    use crate::sketch::FieldKey;
+    let fk = FieldKey::of(k); // VUGFACEFIELDKEYSREST (SR605): the one key-name table, read once
+    let enter = fk == Some(FieldKey::Enter);
+    let back = fk == Some(FieldKey::Backspace);
+    let ch = crate::sketch::field_char(k); // VUGFACEFIELDKEYSREST (SR605): the one typed char
     let j = &mut d.journal;
     let pair = matches!(j.doc.stmts.get(j.cursor), Some(Stmt::Chamfer { .. })); // VUGFACETREEEDITR (SR528): a chamfer row takes d1,d2
     let outcome: Result<Regen, String> = if let Some(buf) = j.edit.as_mut() {
         if enter {
             j.commit_value()
-        } else if matches!(k, "Escape" | "\u{1b}") {
+        } else if fk == Some(FieldKey::Escape) { // VUGFACEFIELDKEYSREST (SR605)
             j.edit = None;
             return Some(true);
         } else if type_pair(buf, ch, back, pair) {
@@ -483,20 +479,20 @@ pub fn key(d: &mut Design, k: &str) -> Option<bool> {
                 return Some(true);
             }
             _ if !j.panel => return None,
-            "Up" | "\u{f700}" => {
+            _ if fk == Some(FieldKey::Up) => { // VUGFACEFIELDKEYSREST (SR605): the table's Up / Down / Delete / Escape
                 let c = j.cursor;
                 j.cursor = c.saturating_sub(1);
                 return Some(c != j.cursor);
             }
-            "Down" | "\u{f701}" => {
+            _ if fk == Some(FieldKey::Down) => {
                 let c = j.cursor;
                 j.cursor = (c + 1).min(j.doc.stmts.len().saturating_sub(1));
                 return Some(c != j.cursor);
             }
-            "Delete" | "\u{f728}" => j.delete(j.cursor),
+            _ if fk == Some(FieldKey::Delete) => j.delete(j.cursor),
             _ if back => j.delete(j.cursor),
             _ if enter && j.offered().is_some() => j.accept_fix(), // VUGFACEJOURNALFAULTFIX (SR578): Enter takes the fix offered on the faulted row
-            "Escape" | "\u{1b}" if j.offered().is_some() => {
+            _ if fk == Some(FieldKey::Escape) && j.offered().is_some() => {
                 j.decline_fix(); // VUGFACEJOURNALFAULTFIX (SR578): Escape declines it
                 return Some(true);
             }

@@ -385,11 +385,11 @@ pub fn offer(view: &mut View, ps: Vec<Proposal>) -> bool {
 }
 
 fn is_enter(k: &str) -> bool {
-    matches!(k, "Return" | "KP_Enter" | "\r" | "\n")
+    crate::sketch::FieldKey::of(k) == Some(crate::sketch::FieldKey::Enter) // VUGFACEFIELDKEYSREST (SR605): the one key-name table
 }
 
 fn is_back(k: &str) -> bool {
-    matches!(k, "BackSpace" | "Backspace" | "\u{8}" | "\u{7f}")
+    crate::sketch::FieldKey::of(k) == Some(crate::sketch::FieldKey::Backspace) // VUGFACEFIELDKEYSREST (SR605)
 }
 
 /// The view's key, first: `i`, `Tab`, and Enter / Backspace on the focused proposal. `None` (the sketch face's keys)
@@ -421,7 +421,7 @@ pub fn key(view: &mut View, k: &str) -> Option<bool> {
             ph.focus = ph.offers.iter().position(|o| o.state == State::Open);
             Some(true)
         }
-        "Escape" | "\u{1b}" => focused.and_then(|i| reject_card(view, i)), "Page_Down" | "PageDown" | "Next" | "Page_Up" | "PageUp" | "Prior" => focused.and_then(|i| page_card(view, i, k)), // VUGINTENTSETFACESCROLL (SR583): PageDown / PageUp page a card taller than the sheet; VUGINTENTSETFACE (SR570): Escape refuses the whole card; off a card the sketch's Escape
+        _ if crate::sketch::FieldKey::of(k) == Some(crate::sketch::FieldKey::Escape) => focused.and_then(|i| reject_card(view, i)), "Page_Down" | "PageDown" | "Next" | "Page_Up" | "PageUp" | "Prior" => focused.and_then(|i| page_card(view, i, k)), // VUGINTENTSETFACESCROLL (SR583): PageDown / PageUp page a card taller than the sheet; VUGINTENTSETFACE (SR570): Escape refuses the whole card; off a card the sketch's Escape
         _ => None,
     }
 }
