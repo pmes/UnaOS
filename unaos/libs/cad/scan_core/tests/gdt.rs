@@ -12,9 +12,7 @@ use brep_core::primitives;
 use scan_core::fixture::{self, Noise, Scene};
 use scan_core::gdt::{cylindricity_minzone, flatness_minzone};
 use scan_core::{
-    AlignParams, Cylinder, DepthScale, Design, Deviation, FaceGdt, GDT_MIN_POINTS, Kind, Nominal, ScanMesh, Tol, Transform, Tsdf, Vec3, Verdict, design_of, extract,
-    fit_cylinder, fit_plane,
-    gdt, measure, nominal, position_mm,
+    AlignParams, Cylinder, DepthScale, Design, Deviation, FaceGdt, Frame, GDT_MIN_POINTS, GDT_NORMAL_DEG, Kind, Nominal, ScanMesh, Tol, Transform, Tsdf, Vec3, Verdict, design_of, extract, fit_cylinder, fit_plane, gdt, measure, nominal, position_mm, tsdf,
 };
 
 const DEG: f64 = PI / 180.0;
@@ -25,16 +23,23 @@ const BAND: f64 = 1.0;
 /// the edge margin `gdt` takes (the seat's ruling: read from the fuse, no second constant).
 fn fused() -> &'static (ScanMesh, f64) {
     static S: OnceLock<(ScanMesh, f64)> = OnceLock::new();
-    S.get_or_init(|| {
-        let (scene, intr, scale) = (Scene::bench(), fixture::bench_intrinsics(), DepthScale::D400_DEFAULT);
-        let mut t = Tsdf::new(4.0, 12.0, Tol::DEFAULT).expect("volume");
-        for k in 0..12u32 {
-            let p = fixture::orbit(CENTRE, 600.0, 40.0 * DEG, k as f64 * 2.0 * PI / 12.0);
-            let f = fixture::render_depth(&scene, &intr, scale, &p, &Noise::D435I, k as u64);
-            t.integrate(&f, scale, &intr, &p).expect("frame integrates");
-        }
-        (extract(&t).expect("surface"), t.trunc_mm())
-    })
+    S.get_or_init(|| fuse(&Noise::D435I, None))
+}
+
+/// VUGSCANTSDFOUTLIERS (SR555): the ONE fuse builder — the 12 orbit frames at `noise`, the volume's depth-edge guard at
+/// its default (`None`: off) or armed at `edge_mm` (`f64::INFINITY` = off); the surface and the volume's truncation.
+fn fuse(noise: &Noise, edge_mm: Option<f64>) -> (ScanMesh, f64) {
+    let (scene, intr, scale) = (Scene::bench(), fixture::bench_intrinsics(), DepthScale::D400_DEFAULT);
+    let mut t = Tsdf::new(4.0, 12.0, Tol::DEFAULT).expect("volume");
+    if let Some(e) = edge_mm {
+        t = t.with_edge_mm(e);
+    }
+    for k in 0..12u32 {
+        let p = pose(k);
+        let f = fixture::render_depth(&scene, &intr, scale, &p, noise, k as u64);
+        t.integrate(&f, scale, &intr, &p).expect("frame integrates");
+    }
+    (extract(&t).expect("surface"), t.trunc_mm())
 }
 
 fn scan() -> &'static ScanMesh {
@@ -46,23 +51,34 @@ fn scan() -> &'static ScanMesh {
 fn measured() -> &'static (Design, Vec<String>, Deviation) {
     static M: OnceLock<(Design, Vec<String>, Deviation)> = OnceLock::new();
     M.get_or_init(|| {
-        let tol = Tol::DEFAULT;
-        let (b, c) = (primitives::box_(300.0, 200.0, 100.0, tol).expect("box"), primitives::cylinder(40.0, 150.0, tol).expect("cylinder"));
-        let (mut d, names) = design_of([("box", &b), ("post", &c)], tol).expect("design");
-        let nbox = b.faces.len() as u32;
-        let mut at = vec![Vec3::ZERO; d.mesh.positions.len()];
-        for (tri, &f) in d.mesh.triangles.iter().zip(&d.face_of) {
-            let off = if f < nbox { Vec3::new(-230.0, -100.0, 0.0) } else { Vec3::new(160.0, 0.0, 0.0) };
-            for &v in tri {
-                at[v as usize] = off;
-            }
-        }
-        for (p, o) in d.mesh.positions.iter_mut().zip(&at) {
-            *p = *p + *o;
-        }
-        let dev = measure(scan(), &d, Transform::IDENTITY, &AlignParams::DEFAULT, BAND, tol).expect("aligns");
+        let (d, names) = design();
+        let dev = measure_of(scan(), &d);
         (d, names, dev)
     })
+}
+
+/// The scan measured against the design from the identity (VUGSCANTSDFOUTLIERS: one road for every fuse).
+fn measure_of(scan: &ScanMesh, d: &Design) -> Deviation {
+    measure(scan, d, Transform::IDENTITY, &AlignParams::DEFAULT, BAND, Tol::DEFAULT).expect("aligns")
+}
+
+/// The design, built once per call through `design_of` and moved into place.
+fn design() -> (Design, Vec<String>) {
+    let tol = Tol::DEFAULT;
+    let (b, c) = (primitives::box_(300.0, 200.0, 100.0, tol).expect("box"), primitives::cylinder(40.0, 150.0, tol).expect("cylinder"));
+    let (mut d, names) = design_of([("box", &b), ("post", &c)], tol).expect("design");
+    let nbox = b.faces.len() as u32;
+    let mut at = vec![Vec3::ZERO; d.mesh.positions.len()];
+    for (tri, &f) in d.mesh.triangles.iter().zip(&d.face_of) {
+        let off = if f < nbox { Vec3::new(-230.0, -100.0, 0.0) } else { Vec3::new(160.0, 0.0, 0.0) };
+        for &v in tri {
+            at[v as usize] = off;
+        }
+    }
+    for (p, o) in d.mesh.positions.iter_mut().zip(&at) {
+        *p = *p + *o;
+    }
+    (d, names)
 }
 
 fn faces() -> Vec<FaceGdt> {
@@ -328,4 +344,156 @@ fn a_missing_or_unseen_datum_face_refuses_by_name() {
     println!("gdt: the box bottom as A -> {unseen:?}");
     assert!(matches!(unseen, Err(DatumError::DatumFit { label: 'A', face, .. }) if face == bottom), "{unseen:?}");
     assert_eq!(at([top, mx, my]).err().map(|e| e.label()), None);
+}
+
+// VUGSCANTSDFOUTLIERS (SR555): the probe of the fused surface's outliers, kept. Per fuse (Noise::NONE and D435i, the
+// depth-edge guard off and on) the top's flatness and the post's cylindricity and position; for the noise-free fuses,
+// the 20 worst vertices of the top and of the post by |deviation − the face's median| (the seat's Q1 answer B: every
+// vertex `deviations` paired with the face, and again over the rows the KNOWN SCENE calls form vertices — at least one
+// truncation from the face's boundary, the TSDF normal within GDT_NORMAL_DEG of the nominal), each with what the
+// fixture's 12 cameras saw at it: `saw` (a valid depth, the vertex at most one truncation behind it), `edge` (of those,
+// the pixel a depth edge: `tsdf::depth_edge` at the truncation), `shadow` (the pixel's depth in front of the vertex by
+// more than the truncation: occluded) and the grazing angle (the ray against the nominal normal) over the cameras that
+// saw it.
+
+/// The fixture's camera `k` (tests/deviation.rs's orbit).
+fn pose(k: u32) -> Transform {
+    fixture::orbit(CENTRE, 600.0, 40.0 * DEG, k as f64 * 2.0 * PI / 12.0)
+}
+
+/// What the fixture's cameras saw at one point.
+struct Census {
+    saw: u32,
+    edge: u32,
+    shadow: u32,
+    graze: (f64, f64),
+}
+
+fn census(p: Vec3, n: Vec3, frames: &[(Transform, Frame)], trunc: f64) -> Census {
+    let (intr, scale) = (fixture::bench_intrinsics(), DepthScale::D400_DEFAULT);
+    let mut c = Census { saw: 0, edge: 0, shadow: 0, graze: (f64::INFINITY, f64::NEG_INFINITY) };
+    for (cam, f) in frames {
+        let Ok(inv) = cam.invert() else { continue };
+        let q = inv.apply_point(p);
+        if q.z <= 0.0 {
+            continue;
+        }
+        let Some(uv) = intr.project([(q.x / 1000.0) as f32, (q.y / 1000.0) as f32, (q.z / 1000.0) as f32]) else { continue };
+        if !(uv[0] >= 0.0 && uv[1] >= 0.0) {
+            continue;
+        }
+        let (px, py) = (uv[0] as u32, uv[1] as u32);
+        let Some(m) = f.u16_at(px, py).and_then(|raw| scale.metres(raw)) else { continue };
+        let dz = m as f64 * 1000.0 - q.z;
+        if dz < -trunc {
+            c.shadow += 1;
+            continue;
+        }
+        c.saw += 1;
+        if tsdf::depth_edge(f, scale, px, py, trunc) {
+            c.edge += 1;
+        }
+        if let Ok(ray) = (p - cam.trans).normalize() {
+            let a = ray.dot(n).abs().min(1.0).acos() / DEG;
+            c.graze = (c.graze.0.min(a), c.graze.1.max(a));
+        }
+    }
+    c
+}
+
+/// The known scene's oracle for a vertex of the top or the post: (the nominal normal there, the distance to the face's
+/// boundary). The top: +z, the distance to the box's top rectangle edges; the post: radial, the axial distance to a rim.
+fn oracle(f: &FaceGdt, p: Vec3) -> (Vec3, f64) {
+    match f.nominal {
+        Nominal::Plane(_) => (Vec3::Z, (p.x + 230.0).min(70.0 - p.x).min(p.y + 100.0).min(100.0 - p.y)),
+        Nominal::Cylinder(c) => {
+            let d = p - c.point;
+            let r = d - c.axis * c.axis.dot(d);
+            (r.normalize().unwrap_or(Vec3::ZERO), p.z.min(150.0 - p.z))
+        }
+        Nominal::Other => (Vec3::ZERO, 0.0),
+    }
+}
+
+/// The 20 worst rows of face `f` (all paired vertices, then the known-scene form vertices) and their summaries.
+fn probe_table(label: &str, f: &FaceGdt, s: &ScanMesh, dev: &Deviation, frames: &[(Transform, Frame)], trunc: f64) -> usize {
+    let mut rows: Vec<(usize, f64)> = dev
+        .face_of_vertex
+        .iter()
+        .zip(&dev.per_vertex)
+        .enumerate()
+        .filter_map(|(i, (fv, d))| if *fv == Some(f.face) { d.map(|d| (i, d)) } else { None })
+        .collect();
+    let mut ds: Vec<f64> = rows.iter().map(|r| r.1).collect();
+    ds.sort_by(|a, b| a.total_cmp(b));
+    let med = ds.get(ds.len() / 2).copied().unwrap_or(0.0);
+    rows.sort_by(|a, b| (b.1 - med).abs().total_cmp(&(a.1 - med).abs()));
+    let cos = GDT_NORMAL_DEG.to_radians().cos();
+    let mut printed = 0;
+    for (set, form_only) in [("all", false), ("form", true)] {
+        let (mut n, mut edge, mut shadow, mut graze) = (0, 0, 0, 0);
+        for &(i, d) in &rows {
+            if n == 20 {
+                break;
+            }
+            let p = s.mesh.positions[i];
+            let (nn, bdist) = oracle(f, p);
+            let sn = s.normals.get(i).copied().unwrap_or(Vec3::ZERO);
+            let nang = sn.normalize().map(|u| u.dot(nn).abs().min(1.0).acos() / DEG).unwrap_or(90.0);
+            let form = bdist >= trunc && sn.dot(nn).abs() >= cos * sn.mag() && sn.mag_sq() > 0.0;
+            if form_only && !form {
+                continue;
+            }
+            n += 1;
+            let c = census(p, nn, frames, trunc);
+            edge += (c.edge > 0) as u32;
+            shadow += (c.shadow > 0) as u32;
+            graze += (c.graze.1 > 75.0) as u32;
+            let g = ((p.x / 4.0).floor() as i64, (p.y / 4.0).floor() as i64, (p.z / 4.0).floor() as i64);
+            println!(
+                "tsdf-probe: {label} {set} {n:2} voxel=({},{},{}) at=({:.1},{:.1},{:.1}) dev={d:+.3} off_median={:+.3} boundary={bdist:.1} normal={nang:.1}deg saw={}/12 edge={} shadow={} graze={:.1}-{:.1}deg",
+                g.0, g.1, g.2, p.x, p.y, p.z, d - med, c.saw, c.edge, c.shadow, c.graze.0, c.graze.1
+            );
+        }
+        println!("tsdf-probe: {label} {set} worst{n} edge>0={edge} shadow>0={shadow} graze>75={graze} median={med:+.3}");
+        printed += n;
+    }
+    printed
+}
+
+#[test]
+fn tsdf_outliers_probe() {
+    let (d, _) = design();
+    let (scene, intr, scale) = (Scene::bench(), fixture::bench_intrinsics(), DepthScale::D400_DEFAULT);
+    let frames: Vec<(Transform, Frame)> =
+        (0..12u32).map(|k| (pose(k), fixture::render_depth(&scene, &intr, scale, &pose(k), &Noise::NONE, k as u64))).collect();
+    for (noise, nname) in [(Noise::NONE, "none"), (Noise::D435I, "d435i")] {
+        // The guard armed at the volume's own truncation (read from the fixture's fuse, no second constant).
+        for (edge, gname) in [(Some(f64::INFINITY), "off"), (Some(fused().1), "on")] {
+            let (s, trunc) = fuse(&noise, edge);
+            let dev = measure_of(&s, &d);
+            let g = gdt(&s, &d, &dev, trunc, Tol::DEFAULT);
+            let (t, p) = (top(&g), post(&g));
+            println!(
+                "tsdf-probe: noise={nname} guard={gname} verts={} top flatness={:?} n={}/{} post cylindricity={:?} position={:?} n={}/{} align_rms={:.3}",
+                s.mesh.positions.len(),
+                t.flatness_mm,
+                t.n,
+                t.matched,
+                p.cylindricity_mm,
+                p.position_mm,
+                p.n,
+                p.matched,
+                dev.stats.rms_mm
+            );
+            if gname == "on" {
+                assert!(t.flatness_mm.is_some_and(f64::is_finite) && p.cylindricity_mm.is_some_and(f64::is_finite), "guard-on values finite");
+            }
+            if nname == "none" {
+                let label = |f: &str| format!("guard={gname} {f}");
+                assert_eq!(probe_table(&label("top"), &t, &s, &dev, &frames, trunc), 40, "20 rows per set on the top");
+                assert_eq!(probe_table(&label("post"), &p, &s, &dev, &frames, trunc), 40, "20 rows per set on the post");
+            }
+        }
+    }
 }
