@@ -263,7 +263,7 @@ fn the_journal_measures_as_the_path_does() {
     let map = v.view.deviation.as_ref().unwrap();
     assert!(map.on, "the map opens on");
     let lines = corner(map);
-    assert_eq!(lines.last().map(String::as_str), Some("design=journal@0"), "{lines:?}");
+    assert_eq!(lines.last().map(String::as_str), Some("design=journal@0 solids=2"), "{lines:?}"); // VUGFACEDEVIATIONLIVE (SR558): the solid count
     assert!(corner(p.view.deviation.as_ref().unwrap()).iter().all(|l| !l.starts_with("design=")), "a path map has no source line");
     assert!(v.view.design.body.is_none(), "the scan is drawn while the map is on");
     assert!(v.key("d"), "d toggles the map");
@@ -295,7 +295,7 @@ fn a_journal_edit_re_measures() {
     let r1 = stats(&v).0;
     println!("rms gen0={r0} gen1={r1}");
     assert!((r1 - r0).abs() > 1e-6, "the post's top moved 10 mm: rms {r1} vs {r0}");
-    assert_eq!(corner(map).last().map(String::as_str), Some("design=journal@1"), "{:?}", corner(map));
+    assert_eq!(corner(map).last().map(String::as_str), Some("design=journal@1 solids=2"), "{:?}", corner(map)); // VUGFACEDEVIATIONLIVE (SR558)
     assert!(map.on && v.view.design.body.is_none(), "the re-measured scan is drawn");
     assert!(v.key("u"), "u undoes the edit");
     let src = v.view.deviation.as_ref().unwrap().source.as_ref().unwrap();
@@ -523,4 +523,101 @@ fn the_margin_argument_changes_n_kept() {
     println!("plate top n={}/{} at 12 mm, n={}/{} at 4 mm", n12.n, n12.matched, n4.n, n4.matched);
     assert_eq!(n4.matched, n12.matched, "the margin does not change the pairing");
     assert!(n4.n > n12.n, "a narrower margin keeps more form vertices: {} vs {}", n4.n, n12.n);
+}
+
+// VUGFACEDEVIATIONLIVE (LEDGER SR558): a filleted document is measured against the fillet's solid only (journal.rs
+// live_solids), and the journal map re-measures only when a statement replay feeds into a solid changes.
+
+#[test]
+fn a_filleted_document_measures_the_fillet_not_its_original() {
+    let mut doc = doc_core::read(DOC).expect("the document reads");
+    let rp = doc_core::replay(&doc, doc.tol);
+    let body = &rp.solids.iter().find(|s| s.id == "body").expect("the box").brep;
+    let near = |a: f64, x: f64| (a - x).abs() < 1e-6;
+    let edge = body
+        .edges
+        .iter()
+        .find(|e| e.v.iter().all(|&i| near(body.vertices[i as usize].p.y, -100.0) && near(body.vertices[i as usize].p.z, 100.0)))
+        .expect("the box's top front edge")
+        .name;
+    doc.stmts.push(doc_core::Stmt::Fillet { id: "f0".into(), on: "body".into(), edges: vec![edge], r: 20.0 });
+    let rp = doc_core::replay(&doc, doc.tol);
+    assert!(rp.failures.is_empty(), "{:?}", rp.failures);
+    assert_eq!(rp.solids.len(), 3, "replay keeps the box beside its fillet");
+    let v = Viewer::open_deviation(scan().clone(), &doc, "fixture", SIZE, Preset::Una).expect("the design builds");
+    let map = v.view.deviation.as_ref().unwrap();
+    assert!(map.names.iter().all(|n| !n.starts_with("body/")), "the filleted box is not measured: {:?}", map.names);
+    assert!(map.names.iter().any(|n| n.starts_with("f0/")) && map.names.iter().any(|n| n.starts_with("post/")), "{:?}", map.names);
+    let live = stats(&v).0;
+    let (all, _) = scan_core::design_of(rp.solids.iter().map(|s| (s.id.as_str(), &s.brep)), doc.tol).expect("every solid builds");
+    let every = scan_core::measure(scan(), &all, Transform::IDENTITY, &scan_core::AlignParams::DEFAULT, BAND_MM, Tol::DEFAULT)
+        .expect("aligned")
+        .stats
+        .rms_mm;
+    println!("live rms={live} every rms={every}");
+    assert!((live - every).abs() > 1e-6, "the live design measures apart from every solid: {live} vs {every}");
+}
+
+#[test]
+fn an_open_sketch_edit_keeps_the_generation_and_a_solid_edit_bumps_it() {
+    use doc_core::{Cons, PRef, Stmt};
+    let mut v = journal_viewer();
+    let r0 = stats(&v).0;
+    let seen = |v: &Viewer| {
+        let s = v.view.deviation.as_ref().unwrap().source.as_ref().expect("a journal map");
+        (s.generation, s.measured, s.refused.clone())
+    };
+    let last = |v: &Viewer| corner(v.view.deviation.as_ref().unwrap()).last().cloned().unwrap_or_default();
+
+    // A sketch no feature names, with a point and a fix: no solid statement moved.
+    let mut doc = v.view.design.journal.doc.clone();
+    doc.stmts.push(Stmt::Sketch { id: "s3".into(), o: [0.0, 0.0, 0.0], z: [0.0, 0.0, 1.0], x: [1.0, 0.0, 0.0] });
+    doc.stmts.push(Stmt::Point { id: "q1".into(), sketch: "s3".into(), at: [0.0, 0.0] });
+    doc.stmts.push(Stmt::Constraint { id: "q2".into(), sketch: "s3".into(), c: Cons::Fix(PRef::Point("q1".into()), [0.0, 0.0]) });
+    assert_eq!(vug_view::journal::solid_stmts(&doc), vug_view::journal::solid_stmts(&v.view.design.journal.doc));
+    v.view.design.journal.doc = doc.clone();
+    vug_view::deviation::follow(&mut v);
+    assert_eq!(seen(&v), (0, 0, None), "an open sketch does not re-measure");
+    assert!(v.view.deviation.as_ref().unwrap().source.as_ref().unwrap().doc == doc, "the document is seen");
+    assert_eq!(last(&v), "design=journal@0 solids=2");
+
+    // A constraint edit in that sketch: still no re-measure.
+    if let Some(Stmt::Constraint { c, .. }) = doc.stmts.last_mut() {
+        *c = Cons::Fix(PRef::Point("q1".into()), [5.0, 0.0]);
+    }
+    v.view.design.journal.doc = doc.clone();
+    vug_view::deviation::follow(&mut v);
+    assert_eq!(seen(&v), (0, 0, None), "a constraint no solid reads does not re-measure");
+    assert_eq!(stats(&v).0.to_bits(), r0.to_bits());
+    assert!(v.view.design.body.is_none(), "the scan stays drawn");
+
+    // The post's extrude 150 -> 140: a solid statement, re-measured.
+    for s in doc.stmts.iter_mut() {
+        if let Stmt::Extrude { id, length, .. } = s {
+            if *id == "post" {
+                *length = 140.0;
+            }
+        }
+    }
+    v.view.design.journal.doc = doc.clone();
+    vug_view::deviation::follow(&mut v);
+    assert_eq!(seen(&v), (1, 1, None), "an extrude edit re-measures");
+    let r1 = stats(&v).0;
+    assert!((r1 - r0).abs() > 1e-6, "the post's top moved 10 mm: {r1} vs {r0}");
+    assert_eq!(last(&v), "design=journal@1 solids=2");
+
+    // The post's radius 40 -> 45: a dimension in a sketch an extrude names moves the profile, re-measured.
+    for s in doc.stmts.iter_mut() {
+        if let Stmt::Constraint { id, c: Cons::Radius(_, r), .. } = s {
+            if *id == "r1" {
+                *r = 45.0;
+            }
+        }
+    }
+    v.view.design.journal.doc = doc.clone();
+    vug_view::deviation::follow(&mut v);
+    assert_eq!(seen(&v), (2, 2, None), "a dimension a solid reads re-measures");
+    let r2 = stats(&v).0;
+    println!("gen0 rms={r0} gen1={r1} gen2={r2}");
+    assert!((r2 - r1).abs() > 1e-6, "the post widened 5 mm: {r2} vs {r1}");
 }
