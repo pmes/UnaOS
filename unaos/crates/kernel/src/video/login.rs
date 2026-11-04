@@ -720,7 +720,7 @@ fn open_as(state: State) {
         crate::splash::hold_release("first-screen");
         return;
     }
-    WIN.store(id, Ordering::Relaxed); crate::boot::note_screen(true); #[cfg(feature = "facet")] { wm::desktop_repaint(); } wm::set_modal_top(id); PFOCUS.store(0, Ordering::Relaxed); /* VEIL-LOGIN (B1116): the backdrop turns to the VEIL, the whole desktop layer once */ // DIALOG2 (B404): the login Alert window is gone, so every row this opens is the screen. LOGINZ (B223): the screen and the alert are the ceiling — a later create or focus-raise cannot pass them (flight 15 §2: "the pw dialog got covered up")
+    WIN.store(id, Ordering::Relaxed); #[cfg(feature = "facet")] { crate::video::wallpaper::veil_login_raise(); } crate::boot::note_screen(true); #[cfg(feature = "facet")] { wm::desktop_repaint(); } wm::set_modal_top(id); PFOCUS.store(0, Ordering::Relaxed); /* VEIL-LOGIN (B1116): the backdrop turns to the VEIL, the whole desktop layer once; VEIL-LOGIN-HELD (B1128): a dropped field is rebuilt before the screen is up */ // DIALOG2 (B404): the login Alert window is gone, so every row this opens is the screen. LOGINZ (B223): the screen and the alert are the ceiling — a later create or focus-raise cannot pass them (flight 15 §2: "the pw dialog got covered up")
     wm::winid_register_holder(&WIN, "login");
     // Modal over the glass: the console keeps taking glyphs, serial keeps every line, but it stops
     // presenting until the session opens (instgui's rule and reason).
@@ -734,7 +734,7 @@ fn take_down() {
     LOCKED.store(false, Ordering::Relaxed); // SCREENLOCK: the locked mode ends with the row, whichever way it ends
     let id = WIN.swap(wm::WIN_NONE, Ordering::Relaxed);
     if id != wm::WIN_NONE {
-        crate::boot::note_screen(false); #[cfg(feature = "facet")] { wm::desktop_repaint(); } wm::clear_modal_top(id); wm::close(id); /* VEIL-LOGIN (B1116): the backdrop back to the picture, the whole desktop layer once */ // LOGINZ (B223): the ceiling goes with the row
+        crate::boot::note_screen(false); #[cfg(feature = "facet")] { crate::video::wallpaper::veil_login_down(); } #[cfg(feature = "facet")] { wm::desktop_repaint(); } wm::clear_modal_top(id); wm::close(id); /* VEIL-LOGIN (B1116): the backdrop back to the picture, the whole desktop layer once; VEIL-LOGIN-HELD (B1128): the field freed unless its rebuild is over the raise budget */ // LOGINZ (B223): the ceiling goes with the row
         fbcon::console_present_suspend(false);
     }
     let mut f = FORM.lock();

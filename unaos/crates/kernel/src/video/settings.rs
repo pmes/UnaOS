@@ -3411,7 +3411,7 @@ fn a11y_load(via: &str) {
     let zoom_owed = A11Y_PERSIST.load(Ordering::Acquire) & (3 << 6) != 0; if !zoom_owed { A11Y_ZOOM.store(zm, Ordering::Relaxed); } // crawl A 15: a chord's or a press's zoom write still owed is newer than the store, so the re-read leaves the lens alone
     if !zoom_owed { A11Y_FOLLOW.store(zf, Ordering::Relaxed); }
     if !zoom_owed { zoom_apply(); }
-    let moved = moved + shimmer_load(); // SHIMMERPREF (B1108): the starfield shimmer row (file tail)
+    let moved = moved + shimmer_load() + super::crystal::login_reduce_load(); // SHIMMERPREF (B1108): the starfield shimmer row (file tail). VEIL-REDUCE-ROW (B1128): Reduce transparency at the login backdrop (crystal.rs tail)
     if via == "login" || moved > 0 {
         serial_println!("[settings] accessibility loaded reduce_motion={} increase_contrast={} cursor_size=x{} text_size={} cvd={} invert={} moved={} via={} shimmer={}", rm as u8, ic as u8, a11y_cursor_str(cq), A11Y_TEXT_NAMES[ts as usize], af::NAMES[cvd], inv as u8, moved, via, shimmer_on() as u8);
         a11y_cost_line(if via == "login" { "load" } else { "change" });

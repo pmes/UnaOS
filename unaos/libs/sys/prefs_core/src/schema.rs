@@ -198,7 +198,7 @@ pub static SCHEMA: &[Key] = &[
         ns: "system", key: "accessibility.reduce_motion", kind: Kind::Bool, default: Default::Bool(false),
         writers: &[Writer::Settings, Writer::Program], reader: "kernel glass (`video/motion.rs` `reduced()` through `settings::reduce_motion`: every glide a one-frame cut), Settings > Accessibility; aether `a11y::prefs` (`A11yPrefs::from_prefs`), css_core `media` (`prefers-reduced-motion`)",
         doc: "Minimise non-essential motion: the glass's slides (the Settings pill, toggle knobs, segmented thumbs) become one-frame cuts (DESIGN-LANGUAGE §2.6, A11YPANE B655), and the `prefers-reduced-motion: reduce` media feature pages read (AETHERA11Y, SR119).",
-    },
+    }, Key { ns: "system", key: "accessibility.reduce_transparency", kind: Kind::Bool, default: Default::Bool(false), writers: OP, reader: "kernel login and lock backdrop (`video/crystal.rs` `Look::login` through `crystal::login_reduce`, latched by `settings::a11y_load`)", doc: "Reduce transparency (DESIGN-LANGUAGE §2.4): the login and lock backdrop is the plain scrim, black at 100 %, no VEIL sample (VEIL-REDUCE-ROW, B1128)." },
     Key {
         ns: "system", key: "accessibility.shimmer", kind: Kind::Bool, default: Default::Bool(true),
         writers: &[Writer::Settings], reader: "kernel desktop STARFIELD shimmer (`video/desktop.rs` `shimmer_live` and `shimmer_idle` through `settings::shimmer_on`, beside `settings::reduce_motion`), Settings > Accessibility",
