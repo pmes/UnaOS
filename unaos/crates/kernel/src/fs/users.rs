@@ -3037,12 +3037,12 @@ fn stage_witness(why: &str) {
     let users = user_count();
     let root_set = password_unset(ROOT_NAME).is_none(); // FIRSTUSER (R100): "root=locked" — root has no row, so no password
     let login = why == "store-has-users"; // LOGINFLOW2 M1 — boot 2: the store has root's password and users, so the LOGIN SCREEN is the boot session (R64/R65/R77), not root's desktop
-    let up = st == BootStage::Desktop && !login;
-    serial_println!(
+    let up = st == BootStage::Desktop && !login; let coh = (st == BootStage::Installer && root_set && users == 0 && !up) || (up && root_set && users > 0) || (login && st == BootStage::Desktop && root_set && users > 0) || (why == "no-store" && no_store_coherent(keyboot_was_held())); // CONTINUEREST (rmbp-ledger B1121): the verdict first, so a coherent line may fold on the session press (an incoherent one always prints). LINE-NEUTRAL, code first
+    if !coh || !crate::boot::session_fold() { serial_println!(
         ":: FIRSTBOOT: stage={} root={} users={} desktop_ignited={} why={} -> {} ::",
         if login { "login-screen" } else { st.word() }, if root_set { "locked" } else { "ROW" }, users, up, why,
-        if (st == BootStage::Installer && root_set && users == 0 && !up) || (up && root_set && users > 0) || (login && st == BootStage::Desktop && root_set && users > 0) || (why == "no-store" && no_store_coherent(keyboot_was_held())) { "coherent" } else { "incoherent" }
-    ); crate::bootpace::boot_line(); // QUIETBOOT M4 (R80): the boot's one measurement, after its first stage line.
+        if coh { "coherent" } else { "incoherent" }
+    ); } crate::bootpace::boot_line(); // QUIETBOOT M4 (R80): the boot's one measurement, after its first stage line.
 }
 
 fn stage_publish(st: BootStage, why: &str) {
@@ -3052,10 +3052,10 @@ fn stage_publish(st: BootStage, why: &str) {
     if prev == st as u8 {
         return;
     }
-    crate::fs::bootstep::witness("stage-witness"); serial_println!("[users] stage-resolve sub=stage-witness why={} at_ms={}", why, crate::arch::ms()); stage_witness(why); crate::fs::bootstep::witness("published"); serial_println!("[users] stage-resolve sub=published why={} at_ms={}", why, crate::arch::ms()); // RESOLVEHANG (B524): each sub-step its own wire line. SPLASHSTALL (B510)
+    crate::fs::bootstep::witness("stage-witness"); if !crate::boot::session_fold() { serial_println!("[users] stage-resolve sub=stage-witness why={} at_ms={}", why, crate::arch::ms()); } stage_witness(why); crate::fs::bootstep::witness("published"); if !crate::boot::session_fold() { serial_println!("[users] stage-resolve sub=published why={} at_ms={}", why, crate::arch::ms()); } // CONTINUEREST (B1121): both fold on the session press (boot.rs tail). RESOLVEHANG (B524): each sub-step its own wire line. SPLASHSTALL (B510)
     if why == "store-has-users" {
         serial_println!("[login] installer: stage=login-screen (R86: the login dialog only; the desktop ignites at the first login)"); // INSTALLBARE: was the stray `stage=desktop` at boot 2's login screen
-    } else {
+    } else if !crate::boot::session_fold() { // CONTINUEREST (rmbp-ledger B1121): the user-created `stage=desktop` line folds on the session press; at boot no fold is open
     serial_println!("[login] installer: stage={} (R77: {})", st.word(), match st {
         BootStage::Installer => "R100: no user — the first-user form is the whole glass (that user is the administrator; root is locked); no desktop, no programs, no fixtures",
         BootStage::Desktop => "the desktop ignites",
@@ -3067,7 +3067,7 @@ fn stage_publish(st: BootStage, why: &str) {
         // a window (the R86/R88 latch and sweep, and R92's unconditional enable, are gone). The Desktop stage asks for the
         // build (idempotent after `login ok` asked; the store-less Desktop's only ask); boot 2's login screen builds nothing.
         if st == BootStage::Desktop && why != "store-has-users" {
-            crate::fs::bootstep::witness("desktop-build"); serial_println!("[users] stage-resolve sub=desktop-build why={} at_ms={}", why, crate::arch::ms()); crate::video::desktopbuild::build("stage"); // RESOLVEHANG (B524). SPLASHSTALL (B510)
+            crate::fs::bootstep::witness("desktop-build"); if !crate::boot::session_fold() { serial_println!("[users] stage-resolve sub=desktop-build why={} at_ms={}", why, crate::arch::ms()); } crate::video::desktopbuild::build("stage"); // CONTINUEREST (B1121): folds on the session press. RESOLVEHANG (B524). SPLASHSTALL (B510)
         }
         if st == BootStage::Desktop && why != "store-has-users" { crate::splash::hold_release("first-screen"); } // RESOLVEHANG (B524): NOT on boot 2's login-screen resolution — that release ran on the device-service pass INSIDE stage-resolve, before any screen existed: it zeroed HOLD_WIN (muting the B510 watchdog's panel line and the 5 s bound) and ran `wm::close`'s drain + composite from the stepping task; boot 2's screen releases from `login::open_as` after its first paint like every other screen. SPLASH2 M3: the desktop is asked for above (DESKTOPBUILT) — hand the glass over; setter / login screens release from `login::open_as` AFTER their first paint (5 s `hold_service` bound stays)
     }
@@ -3076,7 +3076,7 @@ fn stage_publish(st: BootStage, why: &str) {
 /// Read the stage from the store and publish it; open the create-user form when that is the stage.
 /// Called once at the end of [`service`]'s load arm (after the `loginst` chain), and by the advance below.
 pub fn stage_resolve(why: &str) {
-    let st = stage_of_store(); crate::fs::bootstep::witness("store-read"); serial_println!("[users] stage-resolve sub=store-read why={} stage={} users={} at_ms={}", why, st.word(), user_count(), crate::arch::ms()); // RESOLVEHANG (B524): the hang names its sub-step on the wire (store-read, stage-witness, published, desktop-build, login-screen, create-user-form, done). SPLASHSTALL (B510): the OVER line's `last=` (stage-resolve's sub-stages, here and in `stage_publish`)
+    let st = stage_of_store(); crate::fs::bootstep::witness("store-read"); if !crate::boot::session_fold() { serial_println!("[users] stage-resolve sub=store-read why={} stage={} users={} at_ms={}", why, st.word(), user_count(), crate::arch::ms()); } // CONTINUEREST (B1121): folds on the session press. RESOLVEHANG (B524): the hang names its sub-step on the wire (store-read, stage-witness, published, desktop-build, login-screen, create-user-form, done). SPLASHSTALL (B510): the OVER line's `last=` (stage-resolve's sub-stages, here and in `stage_publish`)
     // LOGINFLOW2 M1 — BOOT 2: a store with root's password AND users resolves to the LOGIN SCREEN, over an empty desktop (R64/R65;
     // R77 "root is not the assumed login"). `user-created` is the installer's own advance (the form already logged that user in).
     let boot2 = st == BootStage::Desktop && why == "store-loaded" && user_count() > 0;
@@ -3097,7 +3097,7 @@ pub fn stage_resolve(why: &str) {
             CREATE_PENDING.store(true, core::sync::atomic::Ordering::Release);
             serial_println!("[login] installer: create-user form deferred to the glass (the setter's window needs the surface)");
         }
-    } serial_println!("[users] stage-resolve sub=done why={} at_ms={}", why, crate::arch::ms()); // RESOLVEHANG (B524)
+    } if !crate::boot::session_fold() { serial_println!("[users] stage-resolve sub=done why={} at_ms={}", why, crate::arch::ms()); } // CONTINUEREST (B1121): folds on the session press. RESOLVEHANG (B524)
 }
 
 /// The store could not be mounted after the bound: there is nothing to install into; the machine is a Desktop.
@@ -3522,11 +3522,11 @@ pub fn firstuser_witness(why: &str) {
     let want = match why { "first-user" => Some(1), "login-window" => Some(0), _ => None };
     let prompts_ok = want.map_or(prompts <= 1, |w| prompts == w);
     let ok = an.is_some() && root_locked && prompts_ok && lw_ok;
-    serial_println!(
+    if !ok || !crate::boot::session_fold() { serial_println!( // CONTINUEREST (rmbp-ledger B1121): an ok line folds on the session press; a FAIL always prints
         ":: FIRSTUSER: flow=mac first_user={} role={} root={} prompts={} login_window={} migrated={} at={} -> {} ::",
         an.map(|n| wire_name(&ab[..n])).unwrap_or("none"), if an.is_some() { "admin" } else { "NONE" }, if root_locked { "locked" } else { "ROW" },
         prompts, lw, FU_MIGRATED.load(core::sync::atomic::Ordering::Acquire) as u8, why, crate::tests::boot_word(ok) // SMALLFIX7 (B501): `tests firstuser` carries the verdict
-    );
+    ); }
 }
 
 fn firstuser_selftest() {

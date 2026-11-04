@@ -166,7 +166,7 @@ pub fn ignite(why: &'static str) {
 
 /// A session opened at a login screen / the create-user form (`login::close_into_session`).
 pub fn session_opened() {
-    ignite("session");
+    session_fold_open(); ignite("session"); // CONTINUEREST (rmbp-ledger B1121): the press's line fold opens with the session (file tail); `login::session_line` closes it with ONE `[session] opened` line. LINE-NEUTRAL, code first
 }
 
 /// LOGINFURN (R88): the desktop was released with NO furniture — the services do not wait for a shell that is not coming.
@@ -511,4 +511,82 @@ pub fn oldest() -> (&'static str, u16) {
         }
     }
     OLDEST
+}
+
+// ── CONTINUEREST (rmbp-ledger B1121) — SESSION-LINE: the press's report lines folded into one ───────────────────────
+// F39CONTINUEIGNITE (B1115) took the last card read off the Continue press; what the press still writes is about twenty
+// report lines (`[users] stage-resolve sub=…`, `:: FIRSTBOOT:`, `:: FIRSTUSER:`, `[jobs] scan pending`, the words sheet's
+// dismissal). While a session opens, a named call site that asks [`session_fold`] and gets `true` does not print: the
+// line is counted, and `login::session_line` prints ONE `[session] opened user= ms= deferred= from=` at the press's end
+// ([`session_fold_close`]). The scope is lock-free and bounded: it folds only on the cpu that opened it and only for
+// [`SF_BOUND_MS`], so a scope a road forgets to close stops folding after 2 s. A REQUIREd line never asks; an anomaly (an
+// incoherent FIRSTBOOT, a FAIL FIRSTUSER, an inline jobs scan) prints in place. Not `serial_line::fold_open`: that is a
+// global prefix catch on every core's lines and is off on census builds (the QEMU lanes). Without `login` the three are
+// const no-ops, so the always-compiled sites in `fs/` print as before.
+#[cfg(feature = "login")]
+static SF_AT: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "login")]
+static SF_CPU: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "login")]
+static SF_N: AtomicU32 = AtomicU32::new(0);
+/// CONTINUEREST: how long an open scope may fold (ms).
+#[cfg(feature = "login")]
+const SF_BOUND_MS: u64 = 2_000;
+
+/// CONTINUEREST: is the scope open on THIS cpu and inside its bound? Pure (atomics).
+#[cfg(feature = "login")]
+fn session_fold_live() -> bool {
+    let at = SF_AT.load(Ordering::Acquire);
+    at != 0 && SF_CPU.load(Ordering::Relaxed) == crate::arch::percpu::this_cpu().cpu_index as u64 && crate::arch::ms().saturating_sub(at) < SF_BOUND_MS
+}
+
+/// CONTINUEREST: open the press's fold (idempotent while it is live on this cpu: the words sheet's Continue opens it
+/// before `close_into_session`'s [`session_opened`] asks again).
+#[cfg(feature = "login")]
+pub fn session_fold_open() {
+    if session_fold_live() {
+        return;
+    }
+    SF_N.store(0, Ordering::Relaxed);
+    SF_CPU.store(crate::arch::percpu::this_cpu().cpu_index as u64, Ordering::Relaxed);
+    SF_AT.store(crate::arch::ms().max(1), Ordering::Release);
+}
+
+/// CONTINUEREST: `true` = the caller's line is folded (counted, not printed).
+#[cfg(feature = "login")]
+pub fn session_fold() -> bool {
+    if !session_fold_live() {
+        return false;
+    }
+    SF_N.fetch_add(1, Ordering::Relaxed);
+    true
+}
+
+/// CONTINUEREST: close the fold: `Some((deferred, open_age_ms))` when one was open (inside its bound or not), else `None`.
+#[cfg(feature = "login")]
+pub fn session_fold_close() -> Option<(u32, u64)> {
+    let at = SF_AT.swap(0, Ordering::AcqRel);
+    if at == 0 {
+        return None;
+    }
+    Some((SF_N.swap(0, Ordering::Relaxed), crate::arch::ms().saturating_sub(at)))
+}
+
+/// CONTINUEREST: no login screen, no fold.
+#[cfg(not(feature = "login"))]
+#[inline(always)]
+pub const fn session_fold_open() {}
+
+/// CONTINUEREST: no login screen, no fold.
+#[cfg(not(feature = "login"))]
+#[inline(always)]
+pub const fn session_fold() -> bool {
+    false
+}
+
+/// CONTINUEREST: no login screen, no fold.
+#[cfg(not(feature = "login"))]
+#[inline(always)]
+pub const fn session_fold_close() -> Option<(u32, u64)> {
+    None
 }

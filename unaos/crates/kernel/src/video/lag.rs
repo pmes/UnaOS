@@ -1555,3 +1555,20 @@ pub fn consumed() {
         }
     }
 }
+
+// CONTINUEREST (rmbp-ledger B1121) — TAIL-APPENDED. The session summary's `ms=` (`login::session_line`): the age of the
+// event being routed, read off the QUEUE ring-0 slot's route entry (`t[ISR]`, written by `advance(ISR, QUEUE)` in
+// [`route`]). One router runs at a time, so a QUEUE slot is the event being routed. `None` when no slot is timed (the
+// press coalesced). Pure (atomics); no stamp, no finish. x86 + `wc` only.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+pub fn route_age_us() -> Option<u64> {
+    for s in SLOTS.iter() {
+        if s.stage.load(Acquire) == QUEUE && s.ring.load(Relaxed) == 0 {
+            let t = s.t[ISR as usize].load(Relaxed);
+            if t != 0 {
+                return Some(now_us().saturating_sub(t));
+            }
+        }
+    }
+    None
+}
