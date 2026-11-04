@@ -22687,7 +22687,7 @@ fn bus_cat(asid: u64, agen: u64, ppid: PrincipalRecord, name: &str, text: &mut a
 /// persist runs AFTER the hold drops (the K5B discipline, exactly like sys_open). A successful
 /// cp's reply body is EMPTY (status 0 is the whole truth — the native error-reply symmetry).
 fn bus_cp(asid: u64, agen: u64, ppid: PrincipalRecord, src: &str, dst: &str) -> i64 {
-    if src.eq_ignore_ascii_case(ATR_NAME) || dst.eq_ignore_ascii_case(ATR_NAME) {
+    if asid != 0 && machine_store_open_refused(dst, O_CREAT, &ppid) { return EACCES; } if src.eq_ignore_ascii_case(ATR_NAME) || dst.eq_ignore_ascii_case(ATR_NAME) { // MACHINESTOREBUSLEAF (rmbp-ledger B1174): a ring-3 destination leaf in the machine store (`SETTINGS`, a squat before the kernel lays the folder) is ROOTACL's refusal through the shared SYS_OPEN verdict (file tail helper). LINE-NEUTRAL append, code first
         return EACCES;
     }
     let fs = match crate::fs::fat::mount() {
@@ -22781,7 +22781,7 @@ fn bus_cp(asid: u64, agen: u64, ppid: PrincipalRecord, src: &str, dst: &str) -> 
 /// invoker. A previously-owned file stays owned by its owner; a public file becomes private to the
 /// writer (the sys_open(O_CREAT) private policy, applied uniformly to create and truncate).
 fn bus_write(asid: u64, agen: u64, ppid: PrincipalRecord, name: &str, content: &[u8]) -> i64 {
-    if name.eq_ignore_ascii_case(ATR_NAME) {
+    if asid != 0 && machine_store_open_refused(name, O_CREAT, &ppid) { return EACCES; } if name.eq_ignore_ascii_case(ATR_NAME) { // MACHINESTOREBUSLEAF (rmbp-ledger B1174): a ring-3 destination leaf in the machine store (`SETTINGS`, a squat before the kernel lays the folder) is ROOTACL's refusal through the shared SYS_OPEN verdict (file tail helper). LINE-NEUTRAL append, code first
         return EACCES; // the kernel owns the ACL store — never a writable name
     }
     if content.len() > BUS_CP_MAX {
@@ -22975,7 +22975,7 @@ fn bus_rm(asid: u64, agen: u64, ppid: PrincipalRecord, name: &str) -> i64 {
 /// re-bind failure the stale-named row is cleared (fail-closed against the K1-F2 re-adoption class).
 /// Errnos: ATR deny / mount / -ENOENT (src) / -EISDIR / -EACCES / -EEXIST (dst) / -EINVAL (bad name).
 fn bus_mv(asid: u64, agen: u64, ppid: PrincipalRecord, src: &str, dst: &str) -> i64 {
-    if src.eq_ignore_ascii_case(ATR_NAME) || dst.eq_ignore_ascii_case(ATR_NAME) {
+    if asid != 0 && machine_store_open_refused(dst, O_CREAT, &ppid) { return EACCES; } if src.eq_ignore_ascii_case(ATR_NAME) || dst.eq_ignore_ascii_case(ATR_NAME) { // MACHINESTOREBUSLEAF (rmbp-ledger B1174): a ring-3 destination leaf in the machine store (`SETTINGS`, a squat before the kernel lays the folder) is ROOTACL's refusal through the shared SYS_OPEN verdict (file tail helper). LINE-NEUTRAL append, code first
         return EACCES;
     }
     let fs = match crate::fs::fat::mount() {
