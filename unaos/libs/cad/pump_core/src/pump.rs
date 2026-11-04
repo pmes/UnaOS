@@ -613,7 +613,7 @@ impl Pump {
         let Some(i) = self.src.iter().position(|&l| l == at_line) else {
             return Err(PumpRefusal::NoSuchLine { line: at_line });
         };
-        self.modal_prefix(i, at_line); self.next = i; // VUGCOMSCANRESUMEMODAL (SR656): the modal words the lines before at_line set go first, numbered at_line
+        self.modal_prefix(i, at_line)?; self.next = i; // VUGCOMSCANRESUMEMODAL (SR656): the modal words the lines before at_line set go first, numbered at_line
         self.acked = i;
         self.state = PumpState::Rearmed { at_line };
         Ok(self)
@@ -1180,6 +1180,7 @@ fn int_code(num: &[u8]) -> Option<u16> {
 pub struct Modal {
     last: [Option<(usize, &'static str)>; MODAL_GROUPS],
     tool: [Option<(usize, String)>; TOOL_GROUPS],
+    power: Option<Option<String>>, // VUGCOMSCANRESUMELASER (SR671): grbl laser mode's last M4 with its modal S, folded at a resume, never a prefix line
 }
 
 impl Modal {
@@ -1197,6 +1198,7 @@ impl Modal {
             });
             tool_fold(d, i, l, &mut m.tool, &mut run); // VUGCOMSCANRESUMETOOL (SR663): the valued words, below
         }
+        m.power = laser_power(d, &run); // VUGCOMSCANRESUMELASER (SR671): read from the one spindle fold, below
         m
     }
 
@@ -1222,12 +1224,15 @@ impl Pump {
     /// [`Pump::resume_at`]'s prefix: every group the lines before index `i` set, as lines at `i` numbered `at_line` (the
     /// controller that lost the link most often rebooted into its defaults; one that did not, or a jog between, may sit
     /// anywhere). An `ok`, an `error:N` or a loss inside the prefix names `at_line`, so a re-arm restores again.
-    fn modal_prefix(&mut self, i: usize, at_line: usize) {
-        let words = Modal::of(self.dialect, &self.lines[..i]).lines();
+    fn modal_prefix(&mut self, i: usize, at_line: usize) -> Result<(), PumpRefusal> {
+        let m = Modal::of(self.dialect, &self.lines[..i]);
+        let words = m.lines();
+        let n = words.len();
         for (k, w) in words.into_iter().enumerate() {
             self.lines.insert(i + k, w);
             self.src.insert(i + k, at_line);
         }
+        self.laser_fold(i + n, &m) // VUGCOMSCANRESUMELASER (SR671): grbl laser power onto the first resumed motion line, below
     }
 }
 
@@ -1272,9 +1277,10 @@ fn tool_fold(d: Dialect, i: usize, line: &str, tool: &mut [Option<(usize, String
 }
 
 /// grbl 1.1: the block's M3 / M4 / M5 with the modal `S` (`S12000 M3`, `M3 S1200`, or an `S` alone changing a running
-/// spindle), then the dwell; M7 / M8 each its own group, M9 both. In laser mode ($32=1) the power word is not
-/// restored (VUG-COMSCAN-RESUME-LASER owed: a beam on before the move burns a spot); the air assist is. `T` is not
-/// restored: grbl 1.1 acts on nothing for it and refuses M6.
+/// spindle), then the dwell; M7 / M8 each its own group, M9 both. In laser mode ($32=1) the power word is not a
+/// prefix line (a beam on before the move burns a spot): its M4 is folded onto the first resumed motion line
+/// (VUGCOMSCANRESUMELASER SR671, [`Pump::laser_fold`]); the air assist is a prefix line. `T` is not restored: grbl 1.1
+/// acts on nothing for it and refuses M6.
 fn grbl_tool(laser: bool, i: usize, line: &str, tool: &mut [Option<(usize, String)>; TOOL_GROUPS], run: &mut ToolRun) {
     let mut spin = None;
     let mut s: Option<String> = None;
@@ -1365,4 +1371,61 @@ fn spaced(rest: &[u8]) -> String {
 /// A Marlin heater command's target above 0 (its `S`, or the `R` that waits either way).
 fn heats(rest: &str) -> bool {
     rest.split(' ').any(|p| matches!(p.as_bytes().first(), Some(b'S' | b'R')) && p[1..].parse::<f64>().is_ok_and(|t| t > 0.0))
+}
+
+// --- VUGCOMSCANRESUMELASER (LEDGER SR671): a grbl laser resume folds its dynamic power onto the first resumed motion line (named tail hunk) ---
+
+/// The power a grbl laser-mode ($32=1) resume restores, read from [`Modal::of`]'s one spindle fold: `Some(s)` when the
+/// last spindle word before the resume line was `M4` (with its modal `S` as written, if any). gnea/grbl
+/// `doc/markdown/laser_mode.md`: `M4` is dynamic laser power, scaled by the current speed against the programmed rate,
+/// so zero at rest; `M3` is constant power whether the machine moves, accelerates or stands still. A recorded `M3` is
+/// therefore never restored (a static beam: restored with the head standing it would burn a spot); the resumed lines run
+/// unpowered until the program says its own power. `M5`, no word, grbl outside laser mode and Marlin restore nothing here.
+fn laser_power(d: Dialect, run: &ToolRun) -> Option<Option<String>> {
+    match (d, run.dir) {
+        (Dialect::Grbl { laser: true }, Some(4)) => Some(run.s.clone()),
+        _ => None,
+    }
+}
+
+impl Pump {
+    /// The restored laser power, folded in place onto the first resumed motion line from index `from` (the line after
+    /// the prefix): that line becomes `M4 <line>` plus ` S<power>` when neither it nor a resumed line before it said an
+    /// `S` (its own `S` is kept). No line is inserted, so the numbering is untouched. A `G0` or a line with no `G1` /
+    /// `G2` / `G3` word stays bare (grbl's laser mode runs rapids with the laser off); a resumed line that says `M3` /
+    /// `M4` / `M5` before any motion ends the scan with nothing folded (the program states its own power); no motion
+    /// after the resume line, nothing restored. A folded line past grbl's window is refused as [`PumpRefusal::LineTooLong`].
+    /// grbl needs no warm-up dwell: M4's power follows the motion.
+    fn laser_fold(&mut self, from: usize, m: &Modal) -> Result<(), PumpRefusal> {
+        let Some(power) = &m.power else { return Ok(()) };
+        let d = self.dialect;
+        let mut said_s = false;
+        for j in from..self.lines.len() {
+            let (mut spin, mut s, mut cut) = (false, false, false);
+            modal_words(d, &self.lines[j], |letter, num, _| match (letter, int_code(num)) {
+                (b'M', Some(3 | 4 | 5)) => spin = true,
+                (b'G', Some(1 | 2 | 3)) => cut = true,
+                (b'S', _) if !num.is_empty() => s = true,
+                _ => {}
+            });
+            if spin {
+                return Ok(());
+            }
+            said_s |= s;
+            if !cut {
+                continue;
+            }
+            let mut l = alloc::format!("M4 {}", self.lines[j]);
+            if let (false, Some(v)) = (said_s, power) {
+                l.push_str(" S");
+                l.push_str(v);
+            }
+            if l.len() + 1 > GRBL_RX {
+                return Err(PumpRefusal::LineTooLong { line: self.src[j], len: l.len() + 1 });
+            }
+            self.lines[j] = l;
+            return Ok(());
+        }
+        Ok(())
+    }
 }

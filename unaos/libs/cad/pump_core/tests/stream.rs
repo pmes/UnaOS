@@ -555,12 +555,15 @@ fn a_resume_restores_the_tool_state_set_before_its_line() {
     let p = Pump::new(GRBL, text).unwrap().resume_at(4).unwrap();
     assert_eq!(p.lines().to_vec(), with_prefix(&lines, 3, &["M5"]));
 
-    // grbl laser mode: the power word is not restored (VUG-COMSCAN-RESUME-LASER owed), the air assist is.
+    // grbl laser mode: the power word is no prefix line, the air assist is; the M4 is folded onto the first resumed
+    // motion line (VUGCOMSCANRESUMELASER SR671).
     let laser = Dialect::Grbl { laser: true };
     let text = "M4 S500\nM8\nG1 X1 F100\nG1 X2\n";
     let lines = Pump::new(laser, text).unwrap().lines().to_vec();
     let p = Pump::new(laser, text).unwrap().resume_at(4).unwrap();
-    assert_eq!(p.lines().to_vec(), with_prefix(&lines, 3, &["M8"]));
+    let mut want = with_prefix(&lines, 3, &["M8"]);
+    want[4] = String::from("M4 G1 X2 S500");
+    assert_eq!(p.lines().to_vec(), want);
 
     // Marlin: the bed and hotend targets restored as the blocking M190 / M109, then the tool and the fan, in the
     // program's order after its modal words.
@@ -581,4 +584,88 @@ fn a_resume_restores_the_tool_state_set_before_its_line() {
     let lines = Pump::new(Dialect::Marlin, text).unwrap().lines().to_vec();
     let p = Pump::new(Dialect::Marlin, text).unwrap().resume_at(2).unwrap();
     assert_eq!(p.lines().to_vec(), with_prefix(&lines, 1, &["M109 T1 S210"]));
+}
+
+// --- VUGCOMSCANRESUMELASER (SR671): a grbl laser resume folds its dynamic M4 power onto the first resumed motion line ---
+
+#[test]
+fn a_laser_resume_folds_dynamic_power_onto_the_first_resumed_motion() {
+    let laser = Dialect::Grbl { laser: true };
+    let fold = |text: &str, at: usize| Pump::new(laser, text).unwrap().resume_at(at).unwrap().lines().to_vec();
+    let bare = |text: &str| Pump::new(laser, text).unwrap().lines().to_vec();
+
+    // Lost at a G1: the prefix carries no M4 line; the first resumed G1 carries M4 and the recorded S; the next stays
+    // bare; the numbering is untouched.
+    let text = "G21 G90 G17 G94\nM4 S500\nM8\nG1 X1 F100\nG1 X2 F100\nG1 X3 F100\n";
+    let lines = bare(text);
+    let p = Pump::new(laser, text).unwrap().with_status_every(0).resume_at(5).unwrap();
+    let mut want = with_prefix(&lines, 4, &["G21", "G90", "G17", "G94", "M8"]);
+    want[9] = String::from("M4 G1 X2 F100 S500");
+    assert_eq!(p.lines().to_vec(), want);
+    assert_eq!(p.lines()[10], "G1 X3 F100", "only the first resumed motion line carries the power");
+    assert!(!p.lines()[4..9].iter().any(|l| l.starts_with("M4")), "no standalone M4 line");
+    assert_eq!((p.line_of(9), p.line_of(10)), (Some(5), Some(6)));
+    assert_eq!((p.progress().sent, p.progress().acked, p.progress().total), (4, 4, 11));
+
+    // A G0 first stays bare (grbl runs rapids with the laser off); the next G1 carries the power.
+    let text = "M4 S500\nG1 X1 F100\nG0 X5\nG1 X6 F100\n";
+    let mut want = bare(text);
+    want[3] = String::from("M4 G1 X6 F100 S500");
+    assert_eq!(fold(text, 3), want);
+
+    // A G1 with its own S keeps it; an S said on a resumed line before the G1 is kept too (the M4 alone is folded).
+    let text = "M4 S500\nG1 X1 F100\nG1 X2 F100 S300\nG1 X3\n";
+    let mut want = bare(text);
+    want[2] = String::from("M4 G1 X2 F100 S300");
+    assert_eq!(fold(text, 3), want);
+    let text = "M4 S500\nG1 X1 F100\nS300\nG1 X2 F100\n";
+    let mut want = bare(text);
+    want[3] = String::from("M4 G1 X2 F100");
+    assert_eq!(fold(text, 3), want);
+
+    // An M3 (constant power: a static beam) is never restored; an M5 before the line restores nothing.
+    let text = "M3 S500\nG1 X1 F100\nG1 X2\n";
+    assert_eq!(fold(text, 3), bare(text));
+    let text = "M4 S500\nG1 X1 F100\nM5\nG0 X0\nG1 X2 F100\n";
+    assert_eq!(fold(text, 4), bare(text));
+
+    // A program that states its own power before its next motion wins: nothing is folded.
+    let text = "M4 S500\nG1 X1 F100\nM5\nG1 X2 F100\n";
+    assert_eq!(fold(text, 3), bare(text));
+    let text = "M4 S500\nG1 X1 F100\nM4 S200\nG1 X2 F100\n";
+    assert_eq!(fold(text, 3), bare(text));
+
+    // No motion after the resume line: nothing is restored.
+    let text = "M4 S500\nG1 X1 F100\nG0 X0 Y0\nM2\n";
+    assert_eq!(fold(text, 3), bare(text));
+
+    // Outside laser mode the spindle is a prefix line with its dwell, and no line is folded.
+    let text = "M3 S1000\nG1 X1 F100\nG1 X2\n";
+    let lines = Pump::new(GRBL, text).unwrap().lines().to_vec();
+    let p = Pump::new(GRBL, text).unwrap().resume_at(3).unwrap();
+    assert_eq!(p.lines().to_vec(), with_prefix(&lines, 2, &["M3 S1000", "G4 P4"]));
+
+    // make_core's own laser text: the power on its own line, the motion lines bare; the resume folds the writer's S.
+    let mut prog = Program::new(Units::Mm);
+    prog.moves.push(Move::Rapid { to: Vec3::new(0.0, 0.0, 0.0) });
+    prog.moves.push(Move::Power { pct: 50.0 });
+    prog.moves.push(Move::Linear { to: Vec3::new(10.0, 0.0, 0.0), feed: 600.0 });
+    prog.moves.push(Move::Linear { to: Vec3::new(10.0, 10.0, 0.0), feed: 600.0 });
+    let lines = Pump::from_program(&prog, laser).unwrap().lines().to_vec();
+    assert!(lines[2].starts_with("M4 S"), "the writer says the power on its own line: {:?}", lines);
+    assert!(!lines[4].contains('S'), "the writer's motion lines carry no S");
+    let s = lines[2]["M4 S".len()..].to_string();
+    let p = Pump::from_program(&prog, laser).unwrap().resume_at(5).unwrap();
+    let mut want = with_prefix(&lines, 4, &["G21", "G90", "G17", "G94"]);
+    want[8] = format!("M4 {} S{}", lines[4], s);
+    assert_eq!(p.lines().to_vec(), want);
+
+    // A folded line past grbl's window is refused by name, never sent cut.
+    let long = format!("G1 X1.{} F100", "0".repeat(109));
+    assert_eq!(long.len() + 1, 121);
+    let text = format!("M4 S500\nG1 X1 F100\n{long}\n");
+    assert_eq!(
+        Pump::new(laser, &text).unwrap().resume_at(3).err(),
+        Some(PumpRefusal::LineTooLong { line: 3, len: long.len() + 1 + "M4 ".len() + " S500".len() })
+    );
 }
