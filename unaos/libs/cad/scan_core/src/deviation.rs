@@ -165,6 +165,8 @@ pub struct FaceReport {
 pub struct Deviation {
     pub aligned: Aligned,
     pub per_vertex: Vec<Option<f64>>,
+    /// The design face each scan vertex paired with (an index into `faces`); None where per_vertex is None. VUGFACEDEVIATIONPICK (SR543) + VUGSCANGDT (SR542).
+    pub face_of_vertex: Vec<Option<u32>>,
     pub stats: Stats,
     pub faces: Vec<FaceReport>,
 }
@@ -282,12 +284,13 @@ pub fn deviations(scan: &ScanMesh, design: &Design, bvh: &Bvh, aligned: Aligned,
     // Per face: n, sum, sum of squares, the signed worst.
     let mut acc: Vec<(u32, f64, f64, f64)> = vec![(0, 0.0, 0.0, 0.0); nf];
     let mut per_vertex = Vec::with_capacity(scan.mesh.positions.len());
+    let mut face_of_vertex = Vec::with_capacity(scan.mesh.positions.len());
     let mut abs: Vec<f64> = Vec::new();
     let mut sse = 0.0f64;
     for (i, &v) in scan.mesh.positions.iter().enumerate() {
         let q = aligned.pose.apply_point(v);
         let nq = aligned.pose.apply_vector(scan.normals.get(i).copied().unwrap_or(Vec3::ZERO));
-        let d = bvh.closest(&design.mesh, q, gate, tol).and_then(|near| {
+        let r: Option<(f64, u32)> = bvh.closest(&design.mesh, q, gate, tol).and_then(|near| {
             let n = *normals.get(near.tri as usize)?;
             if n.mag_sq() == 0.0 || nq.dot(n) < p.normal_cos {
                 return None;
@@ -303,13 +306,14 @@ pub fn deviations(scan: &ScanMesh, design: &Design, bvh: &Bvh, aligned: Aligned,
                     a.3 = d;
                 }
             }
-            Some(d)
+            Some((d, f as u32))
         });
-        if let Some(d) = d {
+        if let Some((d, _)) = r {
             abs.push(d.abs());
             sse += d * d;
         }
-        per_vertex.push(d);
+        per_vertex.push(r.map(|(d, _)| d));
+        face_of_vertex.push(r.map(|(_, f)| f));
     }
     let matched = abs.len();
     abs.sort_by(|a, b| a.total_cmp(b));
@@ -348,7 +352,7 @@ pub fn deviations(scan: &ScanMesh, design: &Design, bvh: &Bvh, aligned: Aligned,
         })
         .collect();
     faces.sort_by(|a, b| (b.n > 0).cmp(&(a.n > 0)).then(b.rms_mm.total_cmp(&a.rms_mm)).then(a.face.cmp(&b.face)));
-    Deviation { aligned, per_vertex, stats, faces }
+    Deviation { aligned, per_vertex, face_of_vertex, stats, faces }
 }
 
 /// [`align`] from `init`, then [`deviations`] with the band, over one BVH of the design.

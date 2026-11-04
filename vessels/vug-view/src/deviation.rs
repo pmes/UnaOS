@@ -21,8 +21,8 @@ use crate::raster::{self, Frame, rgba};
 use crate::view::View;
 use doc_core::Doc;
 use scan_core::{
-    AlignParams, Deviation, DeviationError, Design, Intrinsics, Mesh, ScanMesh, Tol, Transform, colour, design_of, measure, shade,
-};
+    AlignParams, Deviation, DeviationError, Design, Intrinsics, Mesh, ScanMesh, Shade, Tol, Transform, colour, design_of, measure, shade,
+}; // VUGFACEDEVIATIONPICK (SR543): Shade names the picked vertex's band
 
 /// The band (mm) the map classifies against: tools/scan's default `--band`.
 pub const BAND_MM: f64 = 3.0;
@@ -42,6 +42,8 @@ pub struct Map {
     pub result: Result<Deviation, DeviationError>,
     pub vertex: Vec<u32>,
     pub tri: Vec<u32>,
+    /// VUGFACEDEVIATIONPICK (SR543): the vertex a click on the map picked, held until the next click ([`pick`]).
+    pub pick: Option<Pick>,
 }
 
 /// A scan mesh read from a file (a PLY carries no normals, no confidence and no intrinsics): mesh_core's
@@ -98,7 +100,7 @@ pub fn open(scan: &ScanMesh, doc: &Doc, band_mm: f64) -> Result<(Model, Map), St
     };
     let model = Model::from_mesh(mesh)?;
     let on = result.is_ok();
-    Ok((model, Map { on, band_mm, names, result, vertex, tri }))
+    Ok((model, Map { on, band_mm, names, result, vertex, tri, pick: None })) // VUGFACEDEVIATIONPICK (SR543): no pick at open
 }
 
 /// The corner's lines: the statistics and the worst [`WORST`] faces (matched ones, by rms) with their signed mean, or
@@ -107,7 +109,8 @@ pub fn corner(map: &Map) -> Vec<String> {
     match &map.result {
         Ok(d) => {
             let s = &d.stats;
-            let mut out = vec![format!("deviation rms={:.3} max={:.3} inside={:.3} band={}", s.rms_mm, s.max_mm, s.inside, map.band_mm)];
+            let mut out: Vec<String> = pick_first(map); // VUGFACEDEVIATIONPICK (SR543): the pick's line first
+            out.push(format!("deviation rms={:.3} max={:.3} inside={:.3} band={}", s.rms_mm, s.max_mm, s.inside, map.band_mm));
             for f in d.faces.iter().filter(|f| f.n > 0).take(WORST) {
                 let name = map.names.get(f.face as usize).map(String::as_str).unwrap_or("?");
                 out.push(format!("{name} rms={:.3} mean={:+.3}", f.rms_mm, f.mean_mm));
@@ -156,5 +159,95 @@ pub fn overlay(view: &View, fr: &mut Frame) {
         let text = line.to_uppercase();
         let x = fr.width as f32 - 8.0 * text.chars().count() as f32 - 6.0;
         raster::text(fr, &text, x.max(0.0), 6.0 + LINE_PX * i as f32, col);
+    }
+    ring(view, m, fr); // VUGFACEDEVIATIONPICK (SR543): the ring at the picked vertex
+}
+
+// VUGFACEDEVIATIONPICK (LEDGER SR543): a click on the coloured scan names the vertex under it. `View::release`'s Pick
+// arm hands its ONE `hit` (the triangle and the point) to [`pick`]: the nearest of that triangle's three vertices to the
+// hit point is the pick, its signed deviation read from scan_core's `per_vertex` and its design face from scan_core's
+// `face_of_vertex` (the pairing's own face, never re-paired here). The corner's first line carries it
+// (`pick: <face> d=<+mm> <band>`) and a ring marks the vertex until the next click; a click on no triangle clears it.
+
+/// The ring's radius, surface pixels.
+pub const RING_PX: f32 = 5.0;
+
+/// The picked scan vertex: its index, its signed deviation (`None`: off the design), its design face and its
+/// position (the drawn model's, the aligned pose).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Pick {
+    pub vertex: u32,
+    pub d: Option<f64>,
+    pub face: Option<u32>,
+    pub at: [f64; 3],
+}
+
+/// The map is live for a pick: measured, on, and no body or pull replaces the scan (the condition [`albedo`] reads).
+fn active(view: &View) -> bool {
+    view.deviation.as_ref().is_some_and(|m| m.on && m.result.is_ok()) && view.design.body.is_none() && view.design.pull.is_none()
+}
+
+/// A click on the map: `hit` is the view's one hit of the click. On no triangle the pick clears; on triangle `t` the
+/// nearest of its three vertices to the hit point is picked. Nothing changes while the map is not live. True when the
+/// pick changed.
+pub fn pick(view: &mut View, model: &Model, hit: Option<(euclase::Vec3, u32)>) -> bool {
+    if !active(view) {
+        return false;
+    }
+    let next = hit.and_then(|(p, t)| {
+        let (pos, idx) = (model.positions(), model.indices());
+        let at = |v: u32| -> Option<[f64; 3]> {
+            let k = v as usize * 3;
+            Some([*pos.get(k)? as f64, *pos.get(k + 1)? as f64, *pos.get(k + 2)? as f64])
+        };
+        let q = [p.x as f64, p.y as f64, p.z as f64];
+        let dist2 = |a: [f64; 3]| (0..3).map(|k| (a[k] - q[k]) * (a[k] - q[k])).sum::<f64>();
+        let tri = idx.get(t as usize * 3..t as usize * 3 + 3)?;
+        let (v, a) = tri.iter().filter_map(|&v| at(v).map(|a| (v, a))).min_by(|x, y| dist2(x.1).total_cmp(&dist2(y.1)))?;
+        let m = view.deviation.as_ref()?;
+        let d = m.result.as_ref().ok()?;
+        Some(Pick { vertex: v, d: d.per_vertex.get(v as usize).copied().flatten(), face: d.face_of_vertex.get(v as usize).copied().flatten(), at: a })
+    });
+    let Some(m) = view.deviation.as_mut() else { return false };
+    let changed = m.pick != next;
+    m.pick = next;
+    changed
+}
+
+/// The pick's corner line: `pick: <face name, or -> d=<signed mm, or none> <inside | under k | over k | off>`.
+pub fn pick_line(map: &Map, p: &Pick) -> String {
+    let name = p.face.and_then(|f| map.names.get(f as usize)).map(String::as_str).unwrap_or("-");
+    let d = p.d.map_or_else(|| "none".to_string(), |d| format!("{d:+.3}"));
+    let band = match shade(p.d, map.band_mm) {
+        Shade::Inside => "inside".to_string(),
+        Shade::Under(k) => format!("under {k:.2}"),
+        Shade::Over(k) => format!("over {k:.2}"),
+        Shade::Off => "off".to_string(),
+    };
+    format!("pick: {name} d={d} {band}")
+}
+
+/// The corner's leading lines: the pick's line while the map is on and a pick is held, else none.
+fn pick_first(map: &Map) -> Vec<String> {
+    match (&map.pick, map.on) {
+        (Some(p), true) => vec![pick_line(map, p)],
+        _ => Vec::new(),
+    }
+}
+
+/// A ring of [`RING_PX`] at the picked vertex while the map is live (16 chords through `raster::line`).
+fn ring(view: &View, m: &Map, fr: &mut Frame) {
+    let Some(p) = m.pick.as_ref() else { return };
+    if !active(view) {
+        return;
+    }
+    let Some((cx, cy)) = view.project_f64(p.at) else { return };
+    let col = rgba(palette_core::TEXT_PRIMARY.1);
+    let pt = |i: u32| {
+        let a = i as f32 * core::f32::consts::TAU / 16.0;
+        (cx as f32 + RING_PX * a.cos(), cy as f32 + RING_PX * a.sin())
+    };
+    for i in 0..16 {
+        raster::line(fr, pt(i), pt(i + 1), col);
     }
 }
