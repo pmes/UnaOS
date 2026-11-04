@@ -1710,3 +1710,29 @@ fn a_four_frame_tracked_prb_opens_on_the_view_road() {
     let (track, _, part, truth0) = tracked_prb("vugscandeviationcoarseview", 4);
     opens_on_the_view_road("coarseview", &track, &part, truth0);
 }
+
+// ---- VUGSCANROADWORDMARGIN (LEDGER SR637): the road's one word; a fused scan's margin is its volume's truncation ----
+// The corner's `align=` and tools/scan's `road: ` lines spell scan_core's `Road::word` (the SR615 / SR626 / SR627 tests
+// read the same bytes). A .prb opened by path (`open_against`) or as the journal's scan (`open_scan`) carries the fused
+// volume's own `Tsdf::trunc_mm()` (scan_core `fuse::fuse_prb_volume`) as the map's gdt margin; no knob sets it today
+// (VOXEL_MM x TRUNC_VOXELS = 12), so it reads EQUAL to the `GDT_MARGIN_MM` fallback, said so.
+
+#[test]
+fn a_fused_scan_opens_at_its_volumes_truncation() {
+    use scan_core::deviation::Road;
+    assert_eq!(Road::Fine.word(), None);
+    assert_eq!(Road::CoarseFine { rms_mm: 1.25 }.word().as_deref(), Some("coarse+fine rms=1.250"));
+    assert_eq!(Road::CoarseRefused { rms_mm: 9.5 }.word().as_deref(), Some("coarse refused rms=9.500"));
+
+    let (_, one, part, _) = tracked_prb("vugscanroadwordmargin", 1);
+    let bytes = std::fs::read(&one).expect("the .prb reads");
+    let (_, tracked, trunc) = scan_core::fuse::fuse_prb_volume(&bytes, scan_core::tsdf::Knobs::OFF).expect("the .prb fuses");
+    assert!(!tracked, "one frame fuses at the identity");
+    let p = Viewer::open_against(&one, &part, SIZE, Preset::Una).expect("the .prb fuses and measures");
+    let j = Viewer::open_scan(&part, &one, SIZE, Preset::Una).expect("the part opens with the .prb");
+    let (pm, jm) = (p.view.deviation.as_ref().expect("a map"), j.view.deviation.as_ref().expect("a journal map"));
+    println!("margin: fused trunc={trunc:.3} fallback={:.3} path={:.3} journal={:.3} equal today", vug_view::deviation::GDT_MARGIN_MM, pm.margin_mm, jm.margin_mm);
+    assert_eq!(pm.margin_mm, trunc, "the path map's margin is the fused volume's truncation");
+    assert_eq!(jm.margin_mm, trunc, "the journal map's margin is the fused volume's truncation");
+    assert_eq!(trunc, vug_view::deviation::GDT_MARGIN_MM, "equal to the fallback today: no knob sets the face's truncation");
+}

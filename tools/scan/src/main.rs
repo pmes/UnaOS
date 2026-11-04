@@ -1041,11 +1041,8 @@ fn knobs_of(a: &Args) -> scan_core::tsdf::Knobs {
 // ---- VUGSCANDEVIATIONCOARSETOOLREPORT (LEDGER SR627): the coarse road in the stdout report ----
 // The report's `road:` line in the deviation section's place, the corner's words (vug-view deviation.rs `align_line`):
 // nothing without `--against`, on the identity road or `Road::Fine`; `road: coarse+fine rms=<mm>` (the coarse start's
-// trimmed rms) or `road: coarse refused rms=<mm>`. Every non-track report is byte-identical.
+// trimmed rms) or `road: coarse refused rms=<mm>`. Every non-track report is byte-identical. VUGSCANROADWORDMARGIN
+// (SR637): the word is scan_core's `Road::word`, the corner's own; the `road: ` prefix is the report's.
 fn road_report(road: Option<scan_core::deviation::Road>) -> String {
-    match road {
-        None | Some(scan_core::deviation::Road::Fine) => String::new(),
-        Some(scan_core::deviation::Road::CoarseFine { rms_mm }) => format!("road: coarse+fine rms={rms_mm:.3}\n"),
-        Some(scan_core::deviation::Road::CoarseRefused { rms_mm }) => format!("road: coarse refused rms={rms_mm:.3}\n"),
-    }
+    road.and_then(scan_core::deviation::Road::word).map_or(String::new(), |w| format!("road: {w}\n"))
 }
