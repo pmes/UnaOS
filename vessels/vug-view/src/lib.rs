@@ -211,7 +211,6 @@ impl Viewer {
         let lib = doc_host::DirLib::beside(std::path::Path::new(path)); // VUGMAKEMACHINELIBFACE (SR548): `lib=<name>` beside the part
         let doc = doc_core::read_with(&text, &lib).map_err(|r| format!("{path}: line {}: {:?}", r.line, r.what))?;
         let mut v = Viewer::open_doc(doc, title, size, preset).map_err(|e| format!("{path}: {e}"))?;
-        v.view.design.journal.lib = Some(lib); // VUGMAKEMACHINELIBFACE (SR548): the journal's re-read resolves the same shelf
         v.save_to = Some(std::path::PathBuf::from(path));
         v.claimed = true;
         Ok(v)

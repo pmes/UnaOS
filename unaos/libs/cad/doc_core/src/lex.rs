@@ -991,3 +991,34 @@ fn lib_machine(lv: &V, line: u32, lib: &dyn Lib) -> Result<MachineStmt, Refusal>
     }
     Ok(MachineStmt { lib: Some(MachineLib { name, stmts }), ..m })
 }
+
+// ---- VUGMAKEMACHINELIBHELD (SR556): a re-read from the libraries the Doc holds ----
+
+/// The resolver that answers from a document's own held libraries: `lib=<name>` resolves to the library the Doc's
+/// machine already carries (`MachineStmt.lib`), written by THE writer as a library document (the machine without
+/// `loaded`, then its axes / tools) and read back by THE reader in [`lib_machine`]; no file is opened (BP-vug-4).
+/// A name the Doc does not hold resolves None (`UnknownLib` by line).
+pub struct HeldLib<'a>(pub &'a Doc);
+
+impl Lib for HeldLib<'_> {
+    fn resolve(&self, name: &str) -> Option<String> {
+        self.0.stmts.iter().find_map(|s| match s {
+            Stmt::Machine(m) => m.lib.as_ref().filter(|l| l.name == name).map(|l| {
+                let mut stmts = Vec::with_capacity(l.stmts.len() + 1);
+                stmts.push(Stmt::Machine(MachineStmt { loaded: None, lib: None, ..m.clone() }));
+                stmts.extend(l.stmts.iter().cloned());
+                crate::write::write(&Doc { tol: self.0.tol, stmts, lines: Vec::new() })
+            }),
+            _ => None,
+        })
+    }
+}
+
+impl Doc {
+    /// THE reader over `text` resolving `machine <id> lib=<name>` from the libraries this Doc holds ([`HeldLib`]): a
+    /// re-read of the document's own text (an applied proposal, a deleted row) needs no filesystem and survives a
+    /// Save As to another directory.
+    pub fn reread(&self, text: &str) -> Result<Doc, Refusal> {
+        read_with(text, &HeldLib(self))
+    }
+}
