@@ -1210,6 +1210,11 @@ pub enum PumpEvent {
     /// Start the armed program whose `make_core::Program::digest` is `program` (16 hex digits), in `dialect`
     /// (`grbl`, `grbl-laser`, `marlin`), on `port` (the host opener's name for the link).
     PumpStart { principal: Origin, program: String, dialect: String, port: String },
+    /// VUGCOMSCANMDNSDIAL (SR638): link `port` (the host opener's name, e.g. `tcp://192.168.1.40:23`) in `dialect` (`grbl`,
+    /// `grbl-laser`, `marlin`) with no program: the desk opens it through the one open road (hello, travel read, commission
+    /// as a start) and streams only the empty program's modal lines, then home / jog / declare ride it as after a run.
+    /// Refused while a job streams or a link is up; answered `linked <port>`.
+    PumpLink { principal: Origin, port: String, dialect: String },
     /// grbl feed hold (`!`).
     PumpHold { principal: Origin },
     /// grbl cycle start (`~`).
@@ -1270,7 +1275,7 @@ impl PumpEvent {
         matches!(
             self,
             PumpEvent::PumpStart { .. } | PumpEvent::PumpHold { .. } | PumpEvent::PumpResume { .. } | PumpEvent::PumpStop { .. }
-                | PumpEvent::PumpHome { .. } | PumpEvent::PumpJog { .. } | PumpEvent::PumpDeclare { .. } // VUGCOMSCANJOG (SR573); VUGCOMSCANMACHINEDECLARE (SR613)
+                | PumpEvent::PumpHome { .. } | PumpEvent::PumpJog { .. } | PumpEvent::PumpDeclare { .. } | PumpEvent::PumpLink { .. } // VUGCOMSCANJOG (SR573); VUGCOMSCANMACHINEDECLARE (SR613); VUGCOMSCANMDNSDIAL (SR638)
         )
     }
 }
