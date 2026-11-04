@@ -118,8 +118,14 @@ fn fake_fluidnc(l: TcpListener) -> JoinHandle<Vec<String>> {
 }
 
 /// One fake FluidNC connection (the [`fake_fluidnc`] shape); with `close_after: Some(n)` it answers the n-th line,
-/// sends a close frame 1001 and answers nothing more. Returns the lines it saw.
-fn serve_fluidnc(mut s: TcpStream, close_after: Option<usize>) -> Vec<String> {
+/// sends a close frame 1001 and answers nothing more. Returns the lines it saw. It answers `$I` as build `VER_A`
+/// (VUGCOMSCANHELLOON, SR549).
+fn serve_fluidnc(s: TcpStream, close_after: Option<usize>) -> Vec<String> {
+    serve_fluidnc_as(s, close_after, VER_A)
+}
+
+/// [`serve_fluidnc`] answering `$I` as build `ver` in one BINARY frame (`$I` is neither recorded nor counted).
+fn serve_fluidnc_as(mut s: TcpStream, close_after: Option<usize>, ver: &'static str) -> Vec<String> {
     s.write_all(&encode_frame(true, OP_TEXT, b"CURRENT_ID:0", None)).unwrap();
     s.write_all(&encode_frame(true, OP_TEXT, b"Grbl 3.7 [FluidNC v3.7.8 (wifi) '$' for help]", None)).unwrap();
     let mut dec = FrameDecoder::new();
@@ -134,8 +140,12 @@ fn serve_fluidnc(mut s: TcpStream, close_after: Option<usize>) -> Vec<String> {
                     match b {
                         b'?' | b'!' | b'~' | 0x18 => {}
                         b'\n' => {
-                            got.push(String::from_utf8_lossy(&cur).trim().to_string());
+                            let line = String::from_utf8_lossy(&cur).trim().to_string();
                             cur.clear();
+                            if said_hello(&mut s, &line, ver) {
+                                continue;
+                            }
+                            got.push(line);
                             if !closing {
                                 let _ = s.write_all(&encode_frame(true, OP_BINARY, b"ok\r\n", None));
                                 if close_after == Some(got.len()) {
@@ -516,4 +526,78 @@ fn a_close_frame_mid_program_is_link_lost_and_a_rearm_resumes_from_the_named_lin
     let (first, second) = fake.join().unwrap();
     assert_eq!(&first[..5], &lines[..5]);
     assert_eq!(second, lines[5..].to_vec(), "the second connection ran only the lines from the lost one on");
+}
+
+// --- VUGCOMSCANHELLOON (SR549): the ws fake answers `$I`; the bus turns the hello on and the first open keeps it ---
+
+use std::sync::{Arc, Mutex};
+
+use bandy::{SMessage, Synapse};
+use comscan::pump::serve_pump;
+use tokio::sync::broadcast::error::RecvError;
+
+/// The fakes' default build (the tests/tcp.rs one).
+const VER_A: &str = "1.1h.20190825:mill-a";
+
+/// grbl 1.1's `$I` answer for build `ver` in one BINARY frame (the fake's `ok` shape), written when `line` is `$I`;
+/// true when it was.
+fn said_hello(s: &mut TcpStream, line: &str, ver: &str) -> bool {
+    if line != "$I" {
+        return false;
+    }
+    let answer = format!("[VER:{ver}]\r\n[OPT:V,15,128]\r\nok\r\n");
+    let _ = s.write_all(&encode_frame(true, OP_BINARY, answer.as_bytes(), None));
+    true
+}
+
+fn hello_of(ver: &str) -> String {
+    format!("[VER:{ver}] [OPT:V,15,128]")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_bus_turns_the_hello_on_and_the_first_ws_open_keeps_its_answer() {
+    let (l, port) = listener();
+    let fake = thread::spawn(move || serve_fluidnc_as(accept_ws(&l, "/"), None, VER_A));
+    let p = program();
+    let want = Pump::from_program(&p, GRBL).unwrap().lines().to_vec();
+    let desk = Arc::new(Mutex::new(PumpDesk::new(machine()))); // no hello_within: the bus turns it on
+    let pass = Verdict::Pass { digest: p.digest(), machine: machine().digest() };
+    let digest = desk.lock().unwrap().arm(&pass, &p, GRBL).expect("armed by a pass");
+    let open = with_ws(opener(GRBL, CONNECT_WAIT), by_scheme(refuse("serial"), refuse("tcp")));
+    let syn = Synapse::new();
+    let rx = syn.subscribe();
+    let mut watch = syn.subscribe();
+    let task = tokio::spawn(serve_pump(syn.clone(), rx, desk.clone(), open, Duration::from_millis(5)));
+    syn.fire(SMessage::Pump(PumpEvent::PumpStart {
+        principal: Origin::LocalUser("una".to_string()),
+        program: digest_hex(digest),
+        dialect: "grbl".to_string(),
+        port: url(port),
+    }));
+    let words = tokio::time::timeout(Duration::from_secs(10), async {
+        let mut words: Vec<String> = Vec::new();
+        loop {
+            match watch.recv().await {
+                Ok(SMessage::Pump(PumpEvent::Squawk { event: Some(e), .. })) => {
+                    let end = e == "done" || e.starts_with("link lost");
+                    words.push(e);
+                    if end {
+                        return words;
+                    }
+                }
+                Ok(SMessage::Pump(PumpEvent::PumpRefused { why })) => panic!("refused: {why}"),
+                Ok(_) | Err(RecvError::Lagged(_)) => {}
+                Err(RecvError::Closed) => return words,
+            }
+        }
+    })
+    .await
+    .expect("the run's squawks");
+    assert_eq!(&words[..2], &["started".to_string(), format!("hello {}", hello_of(VER_A))], "{words:?}");
+    assert_eq!(words.last().map(String::as_str), Some("done"), "{words:?}");
+    assert_eq!(desk.lock().unwrap().hello(), Some(hello_of(VER_A).as_str()), "the first open keeps the answer");
+    syn.fire(SMessage::Kill("comscan".to_string()));
+    tokio::time::timeout(Duration::from_secs(5), task).await.expect("stops on Kill").unwrap();
+    drop(desk); // the link closes: the fake sees the socket end and returns
+    assert_eq!(fake.join().unwrap(), want, "the hello is no program line");
 }

@@ -291,46 +291,15 @@ impl PumpDesk {
         open: &mut dyn FnMut(&str) -> Result<Box<dyn Transport + Send>, String>,
     ) -> Vec<PumpEvent> {
         match ev {
-            PumpEvent::PumpStart { program, dialect, port, .. } => {
-                if self.busy() {
-                    return refused("busy: a program is streaming (PumpStop first)");
+            // VUGCOMSCANHELLOON (SR549): the checks, the open + hello, the handback; the bus runs the middle with the desk
+            // lock released (`request` over `open_road`, the redial's road).
+            PumpEvent::PumpStart { .. } => match self.start_due(ev) {
+                Ok(u) => {
+                    let res = with_hello(open(&u.port), u.hello);
+                    self.started(ev, res)
                 }
-                let Some(d) = parse_dialect(dialect) else {
-                    return refused(format!("unknown dialect {dialect:?} (grbl, grbl-laser, marlin)"));
-                };
-                let Ok(digest) = u64::from_str_radix(program, 16) else {
-                    return refused(format!("program {program:?} is not a digest (16 hex digits)"));
-                };
-                let Some(i) = self.armed.iter().position(|a| a.digest == digest) else {
-                    return refused(format!(
-                        "program {} is not armed (only Helm's Verdict::Pass arms a program, in process)",
-                        digest_hex(digest)
-                    ));
-                };
-                if self.armed[i].dialect != d {
-                    return refused(format!(
-                        "dialect mismatch: {} was armed for {}, asked {}",
-                        digest_hex(digest),
-                        dialect_word(self.armed[i].dialect),
-                        dialect_word(d)
-                    ));
-                }
-                let mut link = match open(port) {
-                    Ok(l) => l,
-                    Err(e) => return refused(format!("port {port:?}: {e}")),
-                };
-                // One arming, one run: a FirstRun approval is per run, so a finished program must pass Helm again.
-                let a = self.armed.remove(i);
-                let identity = self.identify.as_ref().and_then(|f| f(port.as_str())); // VUGCOMSCANTTYUSBID (SR529)
-                let hello = self.hello_spec_for(a.dialect).and_then(|(d, w)| hello(&mut *link, d, w)); // VUGCOMSCANHELLOID (SR546)
-                self.running =
-                    Some(Running { pump: a.pump, link: Some(link), port: port.clone(), redial: None, identity, hello: hello.clone() });
-                let mut out = vec![self.squawk(Some("started".to_string()))];
-                if let Some(h) = hello {
-                    out.push(self.squawk(Some(format!("hello {h}")))); // printed once, at the first open
-                }
-                out
-            }
+                Err(out) => out,
+            },
             PumpEvent::PumpHold { .. } | PumpEvent::PumpResume { .. } | PumpEvent::PumpStop { .. } => {
                 let Some(r) = self.running.as_mut() else {
                     return refused("nothing is streaming");
@@ -388,16 +357,14 @@ pub async fn serve_pump(
     mut open: Box<Opener>,
     every: Duration,
 ) {
+    hello_on(&desk); // VUGCOMSCANHELLOON (SR549): the bus turns the hello on (an explicit hello_within kept)
     let t0 = tokio::time::Instant::now();
     let mut iv = tokio::time::interval(every);
     loop {
         tokio::select! {
             m = rx.recv() => match m {
                 Ok(SMessage::Pump(ev)) if ev.is_request() => {
-                    let out = match desk.lock() {
-                        Ok(mut d) => d.apply(&ev, &mut *open),
-                        Err(_) => refused("the pump desk is poisoned"),
-                    };
+                    let out = request(&desk, &ev, &mut *open); // VUGCOMSCANHELLOON (SR549): PumpStart's open with the lock released
                     for o in out {
                         synapse.fire(SMessage::Pump(o));
                     }
@@ -663,17 +630,14 @@ impl PumpDesk {
 /// with the lock RELEASED, and its answer is handed back under the lock to [`PumpDesk::relinked`].
 fn redial(synapse: &Synapse, desk: &Mutex<PumpDesk>, open: &mut Opener, t0: tokio::time::Instant) {
     let now = t0.elapsed().as_micros() as u64;
-    let (port, spec) = match desk.lock() {
-        Ok(d) => (d.redial_due(now), d.hello_spec()),
-        Err(_) => (None, None),
-    };
-    let Some(port) = port else { return };
-    let res = with_hello(open(&port), spec); // VUGCOMSCANHELLOID (SR546): the hello too, with the lock released
-    let now = t0.elapsed().as_micros() as u64;
-    let out = match desk.lock() {
-        Ok(mut d) => d.relinked_said(now, res),
-        Err(_) => Vec::new(),
-    };
+    // VUGCOMSCANHELLOON (SR549): the one open road (the hello too, with the lock released, SR546)
+    let out = open_road(
+        desk,
+        open,
+        |d| d.redial_due(now).map(|port| (port, d.hello_spec())).ok_or_else(Vec::new),
+        |d, res| d.relinked_said(t0.elapsed().as_micros() as u64, res),
+    )
+    .unwrap_or_default();
     for o in out {
         synapse.fire(SMessage::Pump(o));
     }
@@ -764,6 +728,122 @@ impl PumpDesk {
     /// The hello for a start in `d` (PumpStart: nothing is running yet).
     fn hello_spec_for(&self, d: Dialect) -> Option<(Dialect, Duration)> {
         self.hello.map(|w| (d, w))
+    }
+}
+
+// --- VUGCOMSCANHELLOON (LEDGER SR549): the first open on the redial road, the lock released; the bus turns the hello on (named tail hunk) ---
+
+/// The identity wait the bus turns on (VUG-COMSCAN-HELLO-ON): the network transports' banner wait, `crate::tcp::READY_WAIT`
+/// (the hello runs after the banner, so a serial board's reset-on-open boot is already over).
+pub const HELLO_WAIT: Duration = crate::tcp::READY_WAIT;
+
+/// What a PumpStart's checks found: the arming's index, the port to open and the hello to run on it.
+struct StartDue {
+    i: usize,
+    port: String,
+    hello: Option<(Dialect, Duration)>,
+}
+
+impl PumpDesk {
+    /// PumpStart's checks under the desk lock, nothing opened: the port and the hello, or the refusal by name.
+    fn start_due(&self, ev: &PumpEvent) -> Result<StartDue, Vec<PumpEvent>> {
+        let PumpEvent::PumpStart { program, dialect, port, .. } = ev else { return Err(Vec::new()) };
+        if self.busy() {
+            return Err(refused("busy: a program is streaming (PumpStop first)"));
+        }
+        let Some(d) = parse_dialect(dialect) else {
+            return Err(refused(format!("unknown dialect {dialect:?} (grbl, grbl-laser, marlin)")));
+        };
+        let Ok(digest) = u64::from_str_radix(program, 16) else {
+            return Err(refused(format!("program {program:?} is not a digest (16 hex digits)")));
+        };
+        let Some(i) = self.armed.iter().position(|a| a.digest == digest) else {
+            return Err(refused(format!(
+                "program {} is not armed (only Helm's Verdict::Pass arms a program, in process)",
+                digest_hex(digest)
+            )));
+        };
+        if self.armed[i].dialect != d {
+            return Err(refused(format!(
+                "dialect mismatch: {} was armed for {}, asked {}",
+                digest_hex(digest),
+                dialect_word(self.armed[i].dialect),
+                dialect_word(d)
+            )));
+        }
+        Ok(StartDue { i, port: port.clone(), hello: self.hello_spec_for(d) })
+    }
+
+    /// PumpStart's handback under the desk lock: the checks again (an arming may have moved while the lock was
+    /// released; a refusal drops the new link), then the open's answer: a refused open leaves the arming, a live link
+    /// starts the run and its hello is printed once.
+    fn started(
+        &mut self,
+        ev: &PumpEvent,
+        res: Result<(Box<dyn Transport + Send>, Option<String>), String>,
+    ) -> Vec<PumpEvent> {
+        let u = match self.start_due(ev) {
+            Ok(u) => u,
+            Err(out) => return out, // a live link in `res` is dropped here (a tty's exclusive fd released)
+        };
+        let port = u.port;
+        let (link, said) = match res {
+            Ok(x) => x,
+            Err(e) => return refused(format!("port {port:?}: {e}")),
+        };
+        // One arming, one run: a FirstRun approval is per run, so a finished program must pass Helm again.
+        let a = self.armed.remove(u.i);
+        let identity = self.identify.as_ref().and_then(|f| f(port.as_str())); // VUGCOMSCANTTYUSBID (SR529)
+        self.running = Some(Running { pump: a.pump, link: Some(link), port, redial: None, identity, hello: said.clone() });
+        let mut out = vec![self.squawk(Some("started".to_string()))];
+        if let Some(h) = said {
+            out.push(self.squawk(Some(format!("hello {h}")))); // printed once, at the first open
+        }
+        out
+    }
+}
+
+/// serve_pump's request: PumpStart takes the one open road (the checks under the desk lock, the opener and the hello
+/// with it RELEASED, the handback under it); every other request is applied under the lock.
+fn request(desk: &Mutex<PumpDesk>, ev: &PumpEvent, open: &mut Opener) -> Vec<PumpEvent> {
+    if !matches!(ev, PumpEvent::PumpStart { .. }) {
+        return match desk.lock() {
+            Ok(mut d) => d.apply(ev, &mut *open),
+            Err(_) => refused("the pump desk is poisoned"),
+        };
+    }
+    open_road(desk, open, |d| d.start_due(ev).map(|u| (u.port, u.hello)), |d, res| d.started(ev, res))
+        .unwrap_or_else(|| refused("the pump desk is poisoned"))
+}
+
+/// The one open road (PumpStart and the redial): `due` names the port and the hello under the desk lock (its `Err` the
+/// answers when nothing is to open), the opener (connect, handshake, banner wait) and the hello run with the lock
+/// RELEASED, and `back` takes the answer under the lock. `None`: the desk is poisoned.
+fn open_road(
+    desk: &Mutex<PumpDesk>,
+    open: &mut Opener,
+    due: impl FnOnce(&PumpDesk) -> Result<(String, Option<(Dialect, Duration)>), Vec<PumpEvent>>,
+    back: impl FnOnce(&mut PumpDesk, Result<(Box<dyn Transport + Send>, Option<String>), String>) -> Vec<PumpEvent>,
+) -> Option<Vec<PumpEvent>> {
+    let (port, spec) = {
+        let d = desk.lock().ok()?;
+        match due(&*d) {
+            Ok(x) => x,
+            Err(out) => return Some(out),
+        }
+    };
+    let res = with_hello(open(&port), spec); // the desk lock is released here
+    let mut d = desk.lock().ok()?;
+    Some(back(&mut *d, res))
+}
+
+/// The bus turns the hello on (VUG-COMSCAN-HELLO-ON): a desk whose hello is unset waits [`HELLO_WAIT`]; an explicit
+/// [`PumpDesk::hello_within`] is kept.
+fn hello_on(desk: &Mutex<PumpDesk>) {
+    if let Ok(mut d) = desk.lock() {
+        if d.hello.is_none() {
+            d.hello_within(HELLO_WAIT);
+        }
     }
 }
 
@@ -1018,5 +1098,67 @@ mod tests {
         assert_eq!(got, "nothing is streaming");
         syn.fire(SMessage::Kill("comscan".to_string()));
         tokio::time::timeout(Duration::from_secs(5), task).await.expect("stops on Kill").unwrap();
+    }
+
+    // --- VUGCOMSCANHELLOON (SR549): the bus's PumpStart opens and says hello with the desk lock released ---
+
+    /// Whether the desk's lock is free right now (`false`: held, or the desk is gone).
+    fn free_now(desk: &std::sync::Weak<Mutex<PumpDesk>>) -> bool {
+        match desk.upgrade() {
+            Some(d) => {
+                let free = d.try_lock().is_ok();
+                free
+            }
+            None => false,
+        }
+    }
+
+    /// The Shared mock, recording on every write whether the desk lock was free.
+    struct Probe {
+        link: Shared,
+        desk: std::sync::Weak<Mutex<PumpDesk>>,
+        seen: Arc<Mutex<Vec<bool>>>,
+    }
+
+    impl Transport for Probe {
+        fn write(&mut self, b: &[u8]) -> Result<usize, LinkError> {
+            let free = free_now(&self.desk);
+            self.seen.lock().unwrap().push(free);
+            self.link.write(b)
+        }
+        fn read(&mut self, b: &mut [u8]) -> Result<usize, LinkError> {
+            self.link.read(b)
+        }
+    }
+
+    #[test]
+    fn the_bus_start_opens_and_says_hello_with_the_desk_lock_released() {
+        let p = program();
+        let desk = Arc::new(Mutex::new(PumpDesk::new(machine())));
+        let digest = {
+            let mut d = desk.lock().unwrap();
+            d.hello_within(Duration::from_millis(50));
+            d.arm(&pass(&p), &p, GRBL).unwrap()
+        };
+        let seen: Arc<Mutex<Vec<bool>>> = Arc::new(Mutex::new(Vec::new()));
+        let mock = Shared(Arc::new(Mutex::new(MockGrbl::new(2))));
+        let (weak, probe_seen) = (Arc::downgrade(&desk), seen.clone());
+        let mut open: Box<Opener> = Box::new(move |_: &str| -> Result<Box<dyn Transport + Send>, String> {
+            probe_seen.lock().unwrap().push(free_now(&weak));
+            Ok(Box::new(Probe { link: mock.clone(), desk: weak.clone(), seen: probe_seen.clone() }))
+        });
+        let out = request(&desk, &start_msg(digest, "grbl"), &mut *open);
+        assert!(matches!(&out[..], [PumpEvent::Squawk { event: Some(e), .. }, ..] if e == "started"), "{out:?}");
+        let probed = seen.lock().unwrap().clone();
+        assert!(probed.len() >= 2, "the open and the hello's $I write were probed: {probed:?}");
+        assert!(probed.iter().all(|f| *f), "the desk lock was free across the open and the hello: {probed:?}");
+        assert!(desk.lock().unwrap().armed().is_empty(), "the handback took the arming under the lock");
+
+        // Control: the probe sees a held lock.
+        {
+            let _held = desk.lock().unwrap();
+            let _ = open("mock");
+        }
+        assert_eq!(seen.lock().unwrap().last(), Some(&false), "the probe reads a held lock as held");
     }
 }
