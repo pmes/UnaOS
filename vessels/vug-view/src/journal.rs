@@ -145,11 +145,11 @@ pub struct Regen {
 /// origin the point fixed at (0, 0), its dimensions re-placed beside their feet).
 pub fn regenerate(doc: &Doc) -> Result<Regen, String> {
     let rep = doc_core::replay(doc, doc.tol);
-    let (on_solid, faults) = crate::deviation::split_faults(doc, rep.failures.clone()); // VUGFACEJOURNALSOLIDFAULT (SR572): only a solid's failure refuses
+    let (on_solid, faults) = hold(crate::deviation::split_faults(doc, rep.failures.clone())); // VUGFACEJOURNALSOLIDFAULT (SR572): only a solid's failure refuses; VUGFACEJOURNALSOLIDFAULTFIX (SR598): ONE held solid fault joins the carried
     if let Some(f) = on_solid.first() {
         return Err(format!("line {}: {:?} {}", f.line, f.fault, f.id));
     }
-    let breps = live_breps(doc, &rep.solids); // VUGFACETREEFILLET (SR518): an edit's solid stands in its on solid's place
+    let breps = live_breps(&standing(doc, &faults), &rep.solids); // VUGFACETREEFILLET (SR518): an edit's solid stands in its on solid's place; VUGFACEJOURNALSOLIDFAULTFIX (SR598): the held chain dropped
     let body = if breps.is_empty() { None } else { Some(Body::from_breps(breps, doc.tol)?) };
     let Some(j) = open_sketch(doc) else {
         return Ok(Regen { face: None, body, open: None, closed: doc.stmts.len(), faults });
@@ -631,7 +631,7 @@ impl Journal {
     /// after the frozen features (an open sketch stays the tail) as a snapshot; the cursor moves to its row. Returns
     /// the id; None when the Body's solid is not the document's (a body set from outside) or `stmt` is no edit.
     pub fn record_edit(&mut self, brep: u32, stmt: Stmt) -> Option<String> {
-        let on = live_solids(&self.doc).get(brep as usize)?.clone();
+        let on = live_solids(&standing(&self.doc, &self.faults)).get(brep as usize)?.clone(); // VUGFACEJOURNALSOLIDFAULTFIX (SR598): the Body's index rule over the standing document
         let at = self.closed.min(self.doc.stmts.len());
         let mut stmts = self.doc.stmts.clone();
         let mut stmt = stmt;
@@ -885,6 +885,7 @@ impl Journal {
                 Some(vec![Fix { line, text: format!("remove {rid}"), road: FixRoad::Remove(k) }])
             }
             Fault::BadRef { id: bad, kind } => self.ref_fixes(i, bad, *kind, line), // VUGFACEJOURNALFAULTFIXREF (SR590): the live entities of the slot's kind
+            Fault::NoProfile { .. } | Fault::NoSuchEdge { .. } | Fault::AmbiguousEdge { .. } => self.solid_fixes(i, &f.fault, line), // VUGFACEJOURNALSOLIDFAULTFIX (SR598): the loops / the edge names
             _ => None,
         }
     }
@@ -1108,12 +1109,100 @@ impl Journal {
                 continue;
             }
             let new = crate::photo::renamed(&own, &[(bad.to_string(), id.to_string())]);
-            let mut all: Vec<&str> = lines.clone();
-            all[i + 1] = new.as_str();
-            let Ok(d) = self.doc.reread(&(all.join("\n") + "\n")) else { continue };
-            let Some(fixed) = d.stmts.get(i).filter(|_| d.stmts.len() == self.doc.stmts.len()).cloned() else { continue };
+            let Some(fixed) = self.retyped(i, &text, &new) else { continue }; // VUGFACEJOURNALSOLIDFAULTFIX (SR598): THE reread, lifted
             out.push(Fix { line, text: stmt_text(&fixed), road: FixRoad::Replace(i, fixed) });
         }
+        if out.is_empty() { None } else { Some(out) }
+    }
+}
+
+// ---- VUGFACEJOURNALSOLIDFAULTFIX (LEDGER SR598): ONE solid fault is held, its statement unapplied, its fix offered ----
+// doc_core's replay already skips a failed feature and keeps building: the failed solid is not built, whatever stands on
+// it fails `Upstream(<its id>)`, every other solid is built. SR572's refusal kept the painted Body from being a solid
+// stack with a hole nobody named; [`hold`] names it instead when the solid half is ONE root fault whose data a fix
+// chooses from (NoProfile: the closed loops; NoSuchEdge / AmbiguousEdge: the `on` solid's resolving edge names) and only
+// its `Upstream` chain: those failures join the carried ones (`Journal::faults`, the rows painted by `faulted`), and the
+// Body is the solids of the [`standing`] document (the held statements dropped, so a held fillet's `on` solid keeps its
+// slot and [`Journal::record_edit`]'s index rule matches the Body). Two roots, a Conflicting / Diverged / BadRef in a
+// named sketch, a Brep refusal (SR528's RadiusTooLarge) still refuse by the first line: one card restores ONE statement
+// in ONE snapshot. The hold is regenerate's, so load / adopt / step share it (an edit that newly breaks an edge name is
+// held with its card, not refused). The choices ride SR584's card and SR590's Replace road through [`Journal::retyped`].
+
+type Split = (Vec<doc_core::Failure>, Vec<doc_core::Failure>);
+
+/// deviation.rs `split_faults`'s (solid half, carried) with the solid half moved into the carried (re-sorted by line)
+/// when it is ONE root NoProfile / NoSuchEdge / AmbiguousEdge with an id and only `Upstream` failures chained from it
+/// in line order; anything else unchanged (the caller refuses on the solid half's first).
+fn hold((on_solid, mut carried): Split) -> Split {
+    let held = {
+        let mut roots = on_solid.iter().filter(|f| !matches!(f.fault, Fault::Upstream(_)));
+        match (roots.next(), roots.next()) {
+            (Some(root), None) if !root.id.is_empty() && matches!(root.fault, Fault::NoProfile { .. } | Fault::NoSuchEdge { .. } | Fault::AmbiguousEdge { .. }) => {
+                let mut chain: Vec<&str> = vec![root.id.as_str()];
+                on_solid.iter().filter(|f| matches!(f.fault, Fault::Upstream(_))).all(|f| match &f.fault {
+                    Fault::Upstream(u) if !f.id.is_empty() && chain.contains(&u.as_str()) => {
+                        chain.push(f.id.as_str());
+                        true
+                    }
+                    _ => false,
+                })
+            }
+            _ => false,
+        }
+    };
+    if !held {
+        return (on_solid, carried);
+    }
+    carried.extend(on_solid);
+    carried.sort_by_key(|f| f.line);
+    (Vec::new(), carried)
+}
+
+/// `doc` without the statements a failure names: the Body's solids ([`live_solids`]) once the held chain is dropped. A
+/// carried failure on a statement no solid reads (an Op, an unnamed sketch's) changes no live solid, so the whole list
+/// is used.
+pub(crate) fn standing(doc: &Doc, faults: &[doc_core::Failure]) -> Doc {
+    let named = |s: &Stmt| s.id().is_some_and(|id| faults.iter().any(|f| !f.id.is_empty() && f.id == id));
+    Doc { tol: doc.tol, stmts: doc.stmts.iter().filter(|s| !named(s)).cloned().collect(), lines: Vec::new() }
+}
+
+impl Journal {
+    /// THE fix reread: the writer's `text` with statement `i`'s line replaced by `new`, read back by `Doc::reread`;
+    /// statement `i` of the result, None when it does not read or the statement count moved. SR590's `ref_fixes` and
+    /// [`Journal::solid_fixes`] both enter here.
+    fn retyped(&self, i: usize, text: &str, new: &str) -> Option<Stmt> {
+        let mut all: Vec<&str> = text.lines().collect();
+        *all.get_mut(i + 1)? = new;
+        let d = self.doc.reread(&(all.join("\n") + "\n")).ok()?;
+        d.stmts.get(i).filter(|_| d.stmts.len() == self.doc.stmts.len()).cloned()
+    }
+
+    /// The fixes for a held solid fault on statement `i` (document line `line`): NoProfile one per closed loop (its
+    /// entity into `outer=`, photo.rs `renamed`), NoSuchEdge / AmbiguousEdge one per resolving edge name the statement
+    /// does not already name (`[<words>]` into the refused name's place on the writer's line); each a Replace.
+    fn solid_fixes(&self, i: usize, fault: &Fault, line: u32) -> Option<Vec<Fix>> {
+        let text = doc_core::write(&self.doc);
+        let own = text.lines().nth(i + 1)?.to_string();
+        let news: Vec<String> = match fault {
+            Fault::NoProfile { loops } => {
+                let (Stmt::Extrude { outer, .. } | Stmt::Revolve { outer, .. }) = self.doc.stmts.get(i)? else { return None };
+                loops.iter().filter(|l| *l != outer).map(|l| crate::photo::renamed(&own, &[(outer.clone(), l.clone())])).collect()
+            }
+            Fault::NoSuchEdge { name, edges } | Fault::AmbiguousEdge { name, edges } => {
+                let bad = format!("[{name}]");
+                if !own.contains(bad.as_str()) {
+                    return None;
+                }
+                edges.iter().filter(|e| !own.contains(format!("[{e}]").as_str())).map(|e| own.replacen(bad.as_str(), &format!("[{e}]"), 1)).collect()
+            }
+            _ => return None,
+        };
+        let out: Vec<Fix> = news
+            .iter()
+            .filter(|n| **n != own)
+            .filter_map(|n| self.retyped(i, &text, n))
+            .map(|s| Fix { line, text: stmt_text(&s), road: FixRoad::Replace(i, s) })
+            .collect();
         if out.is_empty() { None } else { Some(out) }
     }
 }
