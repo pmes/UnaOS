@@ -33,11 +33,11 @@ fn v(x: f64, y: f64, z: f64) -> Vec3 {
 }
 
 fn plane(n: Vec3, d: f64, support: u32, rms_mm: f64) -> ShapeRef {
-    ShapeRef { params: ShapeParams::Plane { normal: n, d }, support, rms_mm }
+    ShapeRef { params: ShapeParams::Plane { normal: n, d }, support, rms_mm, extent: None }
 }
 
 fn cyl(p: Vec3, r: f64, support: u32, rms_mm: f64) -> ShapeRef {
-    ShapeRef { params: ShapeParams::Cylinder { point: p, axis: v(0.0, 0.0, 1.0), radius: r }, support, rms_mm }
+    ShapeRef { params: ShapeParams::Cylinder { point: p, axis: v(0.0, 0.0, 1.0), radius: r }, support, rms_mm, extent: None }
 }
 
 /// The SR497 fixture's values: the top plane and the r 39.74 cylinder.
@@ -87,7 +87,7 @@ fn shapes_accept_the_round_diameter_and_refuse_a_wrong_one() {
 fn a_shape_with_no_face_of_its_kind_is_reported_not_refused() {
     let d = doc(HOLE_PLATE);
     let mut s = fixture_shapes();
-    s.push(ShapeRef { params: ShapeParams::Sphere { centre: v(60.0, 60.0, 30.0), radius: 5.0 }, support: 300, rms_mm: 0.2 });
+    s.push(ShapeRef { params: ShapeParams::Sphere { centre: v(60.0, 60.0, 30.0), radius: 5.0 }, support: 300, rms_mm: 0.2, extent: None });
     let m = shapes(s);
     match verify(&d, &p("diameter i1 sketch=s circle=c1 d=80"), &m, d.tol) {
         Verdict::Accept { max_mm, .. } => assert!((max_mm - 0.26).abs() < 1e-6, "max {}", max_mm),
@@ -113,7 +113,7 @@ fn a_shape_with_no_face_of_its_kind_is_reported_not_refused() {
 #[test]
 fn no_shape_with_a_face_of_its_kind_is_refused_by_name() {
     let d = doc(HOLE_PLATE);
-    let only = vec![ShapeRef { params: ShapeParams::Sphere { centre: v(60.0, 60.0, 30.0), radius: 5.0 }, support: 300, rms_mm: 0.2 }];
+    let only = vec![ShapeRef { params: ShapeParams::Sphere { centre: v(60.0, 60.0, 30.0), radius: 5.0 }, support: 300, rms_mm: 0.2, extent: None }];
     let why = match verify(&d, &p("diameter i1 sketch=s circle=c1 d=80"), &shapes(only), d.tol) {
         Verdict::Refuse { why } => why,
         v => panic!("accepted: {:?}", v),
@@ -138,6 +138,7 @@ fn the_measurement_table_is_deterministic() {
             params: ShapeParams::Cone { apex: v(0.0, 0.0, -0.0), axis: v(0.0, 0.0, 1.0), half_angle: core::f64::consts::FRAC_PI_4 },
             support: 10,
             rms_mm: 0.05,
+            extent: None,
         }],
         sigma_mm: 0.25,
         sigma_deg: 1.0,
@@ -671,4 +672,103 @@ fn a_residual_names_its_term() {
         Verdict::Refuse { why } => assert!(matches!(why, Reason::Residual { term: Term::Outline, .. }), "{why:?}"),
         v => panic!("d=86 not refused: {v:?}"),
     }
+}
+
+// ---- VUGINTENTFEATURESEXTENT (SR653): a cylinder that carries its support's axial extent ----
+
+/// The real boss is 8 tall (top at z = 18) on the 80 x 60 x 10 plate; its lower wall occluded, so the support centroid
+/// sits high (z = 15, t = 5) and the support spans z 10.4 .. 18.0 (extent [-4.6, 3.0] from the point).
+#[test]
+fn a_boss_carries_its_axial_extent() {
+    let d = doc(&plate(80.0, 60.0, 10.0));
+    let measured = ShapeRef { extent: Some([-4.6, 3.0]), ..cyl(v(40.0, 30.0, 15.0), 7.95, 900, 0.2) };
+    let inferred = cyl(v(40.0, 30.0, 15.0), 7.95, 900, 0.2);
+    // A: no boss-top plane. The SR536 road (no extent) reads the centroid as mid-extent: length=10; the extent: 8.
+    let mut s = box_planes(80.0, 60.0, 10.0);
+    s.push(inferred);
+    let ps = suggest(&d, &shapes(s));
+    let set = feature_set(&ps, "boss:");
+    assert_eq!(set.len(), 4, "{:?}", stmts(&ps));
+    assert!(set[3].stmt.ends_with("dir=[0 0 1] length=10"), "{}", set[3].stmt);
+    assert!(set[0].why.contains("the support centroid"), "{}", set[0].why);
+    let mut s = box_planes(80.0, 60.0, 10.0);
+    s.push(measured);
+    let m = shapes(s);
+    let ps = suggest(&d, &m);
+    let set = feature_set(&ps, "boss:");
+    assert_eq!(set.len(), 4, "{:?}", stmts(&ps));
+    assert!(set[0].stmt.ends_with("o=[40 30 10] z=[0 0 1] x=[1 0 0]"), "{}", set[0].stmt);
+    assert!(set[2].stmt.ends_with(" r=8"), "{}", set[2].stmt);
+    assert!(set[3].stmt.ends_with("dir=[0 0 1] length=8"), "{}", set[3].stmt);
+    assert!(set[0].why.contains("the support's axial extent (near end 0.400 mm off)"), "{}", set[0].why);
+    let bt = verify_all(&d, &ps, &m, d.tol);
+    assert_eq!(bt.accepted(), ps.len(), "{}", bt.text());
+    // B: the boss top measured at z = 18 (#6). The extent's far end meets it (e = 0): length=8 from the far-end plane;
+    // the SR536 road on the same shapes reads it as a plane crossing the span (e = |5 - 8/2| = 1 > 0.9, 8 < 10 - 1.8)
+    // and proposes no set.
+    let mut s = box_planes(80.0, 60.0, 10.0);
+    s.push(plane(v(0.0, 0.0, 1.0), 18.0, 700, 0.2));
+    s.push(measured);
+    let m = shapes(s);
+    let ps = suggest(&d, &m);
+    let set = feature_set(&ps, "boss:");
+    assert_eq!(set.len(), 4, "{:?}", stmts(&ps));
+    assert!(set[3].stmt.ends_with("dir=[0 0 1] length=8"), "{}", set[3].stmt);
+    assert!(set[0].why.contains("far-end plane #6 (near end 0.000 mm off)"), "{}", set[0].why);
+    let bt = verify_all(&d, &ps, &m, d.tol);
+    assert_eq!(bt.accepted(), ps.len(), "{}", bt.text());
+    let mut s = box_planes(80.0, 60.0, 10.0);
+    s.push(plane(v(0.0, 0.0, 1.0), 18.0, 700, 0.2));
+    s.push(inferred);
+    let ps = suggest(&d, &shapes(s));
+    assert!(feature_set(&ps, "boss:").is_empty() && feature_set(&ps, "pocket:").is_empty(), "{:?}", stmts(&ps));
+}
+
+// ---- VUGINTENTFEATURESEXTENTTABLE (SR665): the extent in the table Vein reads; a near end off the plane proposes nothing ----
+
+/// A shape that carries its axial extent prints ` len=<mm> ends=<a>,<b>` on its line; a shape without one prints the
+/// SR508 line byte for byte.
+#[test]
+fn the_measurement_table_carries_a_shapes_axial_extent() {
+    let m = shapes(vec![
+        plane(v(0.0, 0.0, 1.0), 10.0, 5000, 0.4),
+        ShapeRef { extent: Some([-4.6, 3.0]), ..cyl(v(40.0, 30.0, 15.0), 7.95, 900, 0.2) },
+        ShapeRef {
+            params: ShapeParams::Cone { apex: v(0.0, 0.0, 0.0), axis: v(0.0, 0.0, 1.0), half_angle: core::f64::consts::FRAC_PI_4 },
+            support: 10,
+            rms_mm: 0.05,
+            extent: Some([0.5, 4.25]),
+        },
+    ]);
+    assert_eq!(
+        measurements_text(&m),
+        "shapes: n=3 sigma=0.3 sigma_deg=0.5\n\
+         plane n=(0,0,1) d=10 support=5000 rms=0.4\n\
+         cylinder axis=(40,30,15) dir=(0,0,1) r=7.95 support=900 rms=0.2 len=7.6 ends=-4.6,3\n\
+         cone apex=(0,0,0) dir=(0,0,1) half_angle_deg=45 support=10 rms=0.05 len=3.75 ends=0.5,4.25\n"
+    );
+}
+
+/// The SR653 plate (80 x 60 x 10, top z = 10) at sigma 0.3: K_SIGMA x sigma = 0.9. A support whose near end sits 2 mm
+/// above the plate (point raised to z 17, t = 7, extent [-5, 1]: near 2.000, far 8.000) does not start at that plane and
+/// proposes no set; nor does one whose near end runs 2 mm through it (z 15, extent [-7, 3]: near -2); the control at
+/// near 0.850 (z 15, extent [-4.15, 3]) still proposes the boss, length=8.
+#[test]
+fn a_near_end_off_the_plane_proposes_no_feature() {
+    let d = doc(&plate(80.0, 60.0, 10.0));
+    let none = |p: Vec3, e: [f64; 2]| {
+        let mut s = box_planes(80.0, 60.0, 10.0);
+        s.push(ShapeRef { extent: Some(e), ..cyl(p, 7.95, 900, 0.2) });
+        let ps = suggest(&d, &shapes(s));
+        assert!(feature_set(&ps, "boss:").is_empty() && feature_set(&ps, "pocket:").is_empty(), "{:?}", stmts(&ps));
+    };
+    none(v(40.0, 30.0, 17.0), [-5.0, 1.0]);
+    none(v(40.0, 30.0, 15.0), [-7.0, 3.0]);
+    let mut s = box_planes(80.0, 60.0, 10.0);
+    s.push(ShapeRef { extent: Some([-4.15, 3.0]), ..cyl(v(40.0, 30.0, 15.0), 7.95, 900, 0.2) });
+    let ps = suggest(&d, &shapes(s));
+    let set = feature_set(&ps, "boss:");
+    assert_eq!(set.len(), 4, "{:?}", stmts(&ps));
+    assert!(set[3].stmt.ends_with("dir=[0 0 1] length=8"), "{}", set[3].stmt);
+    assert!(set[0].why.contains("the support's axial extent (near end 0.850 mm off)"), "{}", set[0].why);
 }

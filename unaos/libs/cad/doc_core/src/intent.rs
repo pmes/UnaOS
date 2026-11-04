@@ -611,6 +611,10 @@ pub struct ShapeRef {
     pub params: ShapeParams,
     pub support: u32,
     pub rms_mm: f64,
+    /// VUGINTENTFEATURESEXTENT (SR653): the support's [min, max] along the UNIT axis (mm), from the cylinder's `point`
+    /// or the cone's `apex` (into the opening); None for a plane or a sphere, or when the copy had no inlier points
+    /// (the feature rule then takes the support-centroid road, SR536).
+    pub extent: Option<[f64; 2]>,
 }
 
 impl ShapeRef {
@@ -794,7 +798,7 @@ pub fn measurements_text(m: &Measurement) -> String {
                         num(half_angle * DEG, 2)
                     ),
                 };
-                out.push_str(&format!("{} support={} rms={}\n", head, s.support, num(s.rms_mm, 3)));
+                out.push_str(&format!("{} support={} rms={}{}\n", head, s.support, num(s.rms_mm, 3), extent_cell(s.extent))); // VUGINTENTFEATURESEXTENTTABLE (SR665): ` len= ends=` when carried
             }
         }
         // VUGINTENTTHICKNESS (SR557): one line.
@@ -1149,5 +1153,17 @@ impl core::fmt::Display for Term {
             Term::Shapes => "shapes",
             Term::Thickness => "thickness",
         })
+    }
+}
+
+// ---- VUGINTENTFEATURESEXTENTTABLE (SR665): a shape's axial extent in the table Vein reads (named tail block) ----
+
+/// ` len=<mm> ends=<a>,<b>`: the support's length and its [min, max] along the unit axis from the cylinder's `point` or
+/// the cone's `apex` ([`ShapeRef::extent`], SR653), mm to 3 places, when the shape carries one; empty otherwise, so a
+/// shape with no extent prints the SR508 line byte for byte.
+fn extent_cell(extent: Option<[f64; 2]>) -> String {
+    match extent {
+        Some([a, b]) => format!(" len={} ends={},{}", num(b - a, 3), num(a, 3), num(b, 3)),
+        None => String::new(),
     }
 }
