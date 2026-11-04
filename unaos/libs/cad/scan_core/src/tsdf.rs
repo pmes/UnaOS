@@ -15,9 +15,9 @@
 //! than [`Tsdf::edge_mm`]) integrates nothing that frame — see [`depth_edge`]; off by default (the seat's ruling: at
 //! scan noise it costs more averaging than it removes).
 //!
-//! VUGSCANTSDFEDGEFAR (SR562): the default guard is the far-side one ([`Tsdf::edge_far_mm`], the truncation): at a
-//! depth-edge pixel a voxel integrates only when its own camera depth and the pixel's depth fall on the same side of
-//! the 3x3's mid depth, so a voxel whose pixel belongs to the other surface skips and every matched voxel keeps it.
+//! VUGSCANTSDFEDGEFAR (SR562): with [`Tsdf::with_edge_far_mm`] the far-side guard: at a depth-edge pixel a voxel
+//! integrates only when its own camera depth and the pixel's depth fall on the same side of the 3x3's mid depth.
+//! MEASURED, not a default (the seat's ruling: it fattened the post and reddened the tracking and closure tests).
 //!
 //! Sign: positive in front of the surface (free space, toward the camera), negative behind it (inside the solid).
 //! Voxel `g` (integer) sits at `g · voxel_mm` in the world. The pinhole model is probe_core's (`Intrinsics::project`,
@@ -43,7 +43,7 @@ pub const DEFAULT_BUDGET: usize = 65_536;
 /// One voxel: the fused signed distance (mm, within ±trunc) and its observation weight. The weight IS the voxel's
 /// confidence (BP-vug-5): uniform weight 1 per frame that observed it, capped at [`W_MAX`]; 0 = never observed. With the
 /// depth-edge guard on ([`Tsdf::with_edge_mm`]), a frame whose pixel at the voxel is a depth edge does not observe it;
-/// with the far-side guard (the default, [`Tsdf::edge_far_mm`]), only a voxel on the other surface's side of the edge.
+/// with the far-side guard ([`Tsdf::with_edge_far_mm`]), only a voxel on the other surface's side of the edge.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Voxel {
     pub sdf: f32,
@@ -73,8 +73,8 @@ pub struct Tsdf {
     /// VUGSCANTSDFOUTLIERS (SR555): the depth jump across a pixel's 3x3 neighbourhood above which it integrates nothing
     /// (`f64::INFINITY`, the default: the guard off).
     edge_mm: f64,
-    /// VUGSCANTSDFEDGEFAR (SR562): the depth jump above which the far-side guard holds (`trunc_mm`, the default;
-    /// `f64::INFINITY` off); `edge_mm`, when finite, takes precedence.
+    /// VUGSCANTSDFEDGEFAR (SR562): the depth jump above which the far-side guard holds (`f64::INFINITY`, the default:
+    /// off); `edge_mm`, when finite, takes precedence.
     edge_far_mm: f64,
     blocks: BTreeMap<Key, Box<[Voxel; BLOCK_VOXELS]>>,
     frames: u32,
@@ -109,7 +109,7 @@ impl Tsdf {
             tol,
             budget: DEFAULT_BUDGET,
             edge_mm: f64::INFINITY, // VUGSCANTSDFOUTLIERS: the depth-edge guard off unless `with_edge_mm` arms it
-            edge_far_mm: trunc_mm, // VUGSCANTSDFEDGEFAR: the far-side guard on at the truncation
+            edge_far_mm: f64::INFINITY, // VUGSCANTSDFEDGEFAR: the far-side guard off unless `with_edge_far_mm` arms it
             blocks: BTreeMap::new(),
             frames: 0,
             intrinsics: None,
@@ -337,8 +337,8 @@ impl Tsdf {
 // a default (SR555 RUN 1, the seat's ruling (a)): armed at the truncation it cut the noise-free post's cylindricity
 // 3.214 -> 2.775 mm but raised it 3.542 -> 4.016 at D435i noise (fewer frames averaged per voxel near a silhouette)
 // and left the box top's 1.217 mm unchanged (that is the fixture's depth quantisation, VUG-SCAN-FIXTURE-QUANT), so it
-// is off by default and `tests/gdt.rs` `tsdf_outliers_probe` arms it; the far-side-only guard (the default) is
-// VUGSCANTSDFEDGEFAR's, below.
+// is off by default and `tests/gdt.rs` `tsdf_outliers_probe` arms it; the far-side-only guard is VUGSCANTSDFEDGEFAR's,
+// below.
 impl Tsdf {
     /// The same volume with the depth-edge guard armed at the jump `mm` (`trunc_mm` is the measured setting);
     /// `f64::INFINITY` (the default) leaves it off.
@@ -375,17 +375,21 @@ fn depth_edges(frame: &Frame, scale: DepthScale, jump_mm: f64) -> alloc::vec::Ve
     out
 }
 
-// VUGSCANTSDFEDGEFAR (SR562): the far-side depth-edge guard, the default. At an edge pixel the 3x3 holds two depth
+// VUGSCANTSDFEDGEFAR (SR562): the far-side depth-edge guard. At an edge pixel the 3x3 holds two depth
 // populations split at their mid depth. The error SR555 measured is a voxel of the NEAR population whose floor pixel
 // holds the FAR depth (`far - q.z` well past the truncation: a free-space vote carving the near surface's band); the
 // opposite mismatch (a far voxel on a near pixel) is already skipped by the `sdf < -trunc` line whenever the jump
 // exceeds the truncation. So a voxel integrates when its own camera depth and its pixel's depth fall on the same side
 // of the mid, and skips when they do not: the matched voxels on both sides of the jump keep their observation, the
 // averaging SR555's both-sides rule (`with_edge_mm`, kept for the probe) gave up at scan noise. Measured by
-// `tests/gdt.rs` `tsdf_outliers_probe` (`guard=far`); the weight stays the observation count (BP-vug-5).
+// `tests/gdt.rs` `tsdf_outliers_probe` (`guard=far`); the weight stays the observation count (BP-vug-5). MEASURED, not
+// a default (SR562 RUN 1, the seat's ruling): armed at the truncation it took the post's cylindricity 3.214 -> 3.300 mm
+// noise-free and 3.542 -> 4.156 at D435i (it also skips the correct free-space votes of near-depth voxels just outside
+// the silhouette, which carve the outline) and reddened the pose and loop-closure tests, so it is off by default; a
+// lateral silhouette test is VUG-SCAN-TSDF-EDGE-LATERAL (owed).
 impl Tsdf {
-    /// The same volume with the far-side guard at the jump `mm` (`trunc_mm`, the default); `f64::INFINITY` leaves it
-    /// off. A finite [`Tsdf::edge_mm`] takes precedence (SR555's both-sides rule).
+    /// The same volume with the far-side guard armed at the jump `mm` (`trunc_mm` is the measured setting);
+    /// `f64::INFINITY` (the default) leaves it off. A finite [`Tsdf::edge_mm`] takes precedence (SR555's both-sides rule).
     pub fn with_edge_far_mm(mut self, mm: f64) -> Tsdf {
         self.edge_far_mm = mm;
         self

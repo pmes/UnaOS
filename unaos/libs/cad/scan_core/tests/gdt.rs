@@ -26,8 +26,8 @@ fn fused() -> &'static (ScanMesh, f64) {
     S.get_or_init(|| fuse(&Noise::D435I, Guard::Default, DepthScale::D400_DEFAULT, 0.0))
 }
 
-/// VUGSCANTSDFEDGEFAR (SR562): the volume's depth-edge guard for one fuse — its default (the far-side guard at the
-/// truncation), off, SR555's both-sides rule at the truncation, or the far-side guard armed explicitly.
+/// VUGSCANTSDFEDGEFAR (SR562): the volume's depth-edge guard for one fuse — its default (off), off explicitly, SR555's
+/// both-sides rule at the truncation, or SR562's far-side guard at the truncation.
 #[derive(Clone, Copy, PartialEq)]
 enum Guard {
     Default,
@@ -490,7 +490,7 @@ fn tsdf_outliers_probe() {
         (0..12u32).map(|k| (pose(k), fixture::render_depth(&scene, &intr, scale, &pose(k), &Noise::NONE, k as u64))).collect();
     for (noise, nname) in [(Noise::NONE, "none"), (Noise::D435I, "d435i")] {
         // The guards at the volume's own truncation (read from the volume, no second constant): off, SR555's
-        // both-sides rule, SR562's far-side rule (the default).
+        // both-sides rule, SR562's far-side rule.
         for (guard, gname) in [(Guard::Off, "off"), (Guard::Both, "both"), (Guard::Far, "far")] {
             let (s, trunc) = fuse(&noise, guard, scale, 0.0);
             let dev = measure_of(&s, &d);
@@ -519,7 +519,7 @@ fn tsdf_outliers_probe() {
         }
     }
     // VUGSCANTSDFEDGEFAR (SR562), VUG-SCAN-FIXTURE-QUANT: the top's reading split into fixture and fusion — the same
-    // noise-free fuse (the default guard) at the 1 mm scale and at the D400's 100 um depth units, on the symmetric
+    // noise-free fuse (the default: no guard) at the 1 mm scale and at the D400's 100 um depth units, on the symmetric
     // orbit and with a 7° phase per frame.
     for (um, phase_deg) in [(1000u32, 0.0f64), (100, 0.0), (1000, 7.0), (100, 7.0)] {
         let (s, trunc) = fuse(&Noise::NONE, Guard::Default, DepthScale::from_micrometres(um), phase_deg * DEG);
