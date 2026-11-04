@@ -18,7 +18,8 @@
 //!    sheet, so "perpendicular after H" cannot fail: the local affine's departure from a similarity can).
 //! 4. [`silhouette`]: the lattice rectified to paper millimetres, Otsu (1979), the ink suppressed by an opening at
 //!    the measured stroke width, open / close at pitch / 8, the largest component the part, its enclosed
-//!    components the holes.
+//!    components the holes; a stroke pair off every lattice line by more than the stroke width is a thin side of the
+//!    part, not ink, and its dark band connected to the part is put back ([`thin_sides`], VUGPHOTOSIDETHIN SR651).
 //! 5. [`contour`]: crack following (Pavlidis 1982), outer CCW / holes CW checked by geom_core's exact `is_ccw`,
 //!    Douglas-Peucker (1973) at 2 σ.
 //! 6. [`fit`]: corners, TLS lines and Pratt (1987) arcs / circles between them by their residual against σ, the
@@ -221,7 +222,7 @@ pub fn measure_lens(img: &Image, params: PhotoParams, tol: Tol, lens: bool) -> R
     }
     let r = libm::round(g.pitch_px / pitch).clamp(4.0, 20.0);
     let line_width_mm = g.width_px / lat.px_per_mm;
-    let sil = silhouette::extract(&gray, &lat, pitch, line_width_mm, r)?;
+    let sil = thin_sides(silhouette::extract(&gray, &lat, pitch, line_width_mm, r)?, &gray, &lat, &g.pairs, pitch, line_width_mm)?; // VUGPHOTOSIDETHIN (SR651): a pair off the lattice is a thin side
     let sigma_mm = libm::hypot(lat.residual_mm, 1.0 / r);
     let loops = contour::trace(&sil)?;
     let outline = contour::simplify(&loops.outer, 2.0 * sigma_mm);
@@ -672,4 +673,126 @@ pub fn crop_frame(img: &Image) -> Option<[u32; 4]> {
 pub fn crop_pair(img: &Image, x0: u32, y0: u32) -> (alloc::string::String, alloc::string::String) {
     let [x, y, w, h] = crop_frame(img).unwrap_or([0, 0, img.width, img.height]);
     (alloc::string::String::from(CROP_KEY), alloc::format!("{},{},{},{}", x.saturating_add(x0), y.saturating_add(y0), w, h))
+}
+
+// ---- VUGPHOTOSIDETHIN (SR651): a pair off the lattice is a thin side (named tail block) ----
+// An ink stroke lies ON the paper's lattice; a part thinner than MAX_STROKE_PX pairs like a stroke but lies off it. The
+// silhouette's openings (the stroke-width square, then pitch / 8) erase both, so the ONE rule is the pair's position in
+// lattice paper mm: a pair whose centre line keeps further than the stroke width from every lattice line parallel to it
+// is a thin side, and the dark pixels in its band that connect to the part are the part's again. No off pair: the
+// silhouette is returned untouched (the SR503 road bit for bit).
+
+/// The band's margin about a pair (photo px): the edge lines sit at the blurred edge's half height (the fixture's 3 px box).
+const BLUR_PX: f64 = 1.5;
+
+/// The pair's dense run along `dir`: the longest stretch of its sorted support with no gap wider than the pair's own
+/// `width_px`. Not its first / last edgel: `grid` refines each edge line over every agreeing edgel on the infinite line,
+/// so a short side's support carries stray collinear edgels from across the sheet (measured on the shim fixture: 396
+/// edgels spanning 95 mm for a 20 mm shim).
+fn pair_run(pair: &grid::GridLine) -> Option<(f64, f64)> {
+    let s = &pair.support;
+    let first = *s.first()?;
+    let (mut best, mut start, mut prev) = ((first, first), first, first);
+    for &t in &s[1..] {
+        if t - prev > pair.width_px {
+            start = t;
+        }
+        prev = t;
+        if prev - start > best.1 - best.0 {
+            best = (start, prev);
+        }
+    }
+    Some(best)
+}
+
+/// The pair's dense run's ends (photo px): `point + dir · t` at the run's first and last parameter.
+fn pair_ends(pair: &grid::GridLine) -> Option<(Vec2, Vec2)> {
+    let (t0, t1) = pair_run(pair)?;
+    Some((pair.point + pair.dir * t0, pair.point + pair.dir * t1))
+}
+
+/// Whether a stroke pair is off every lattice line by more than `width_mm`: its support ends through `h_inv` (photo px to
+/// lattice paper mm; the dense run's, `pair_run`), the coordinate across the nearer-parallel family, and no `k · pitch` in [min − width, max + width].
+pub fn off_lattice(pair: &grid::GridLine, h_inv: &homography::H, pitch: f64, width_mm: f64) -> bool {
+    let Some((e0, e1)) = pair_ends(pair) else { return false };
+    let (Some(p0), Some(p1)) = (homography::apply(h_inv, e0), homography::apply(h_inv, e1)) else { return false };
+    let d = p1 - p0;
+    let (c0, c1) = if d.x.abs() >= d.y.abs() { (p0.y, p1.y) } else { (p0.x, p1.x) };
+    let (lo, hi) = (c0.min(c1) - width_mm, c0.max(c1) + width_mm);
+    if !(lo.is_finite() && hi.is_finite()) {
+        return false;
+    }
+    libm::ceil(lo / pitch) > libm::floor(hi / pitch)
+}
+
+/// The silhouette with each off-lattice pair's dark band put back where it connects to the part: a rectified pixel that
+/// is dark (at or under the silhouette's Otsu threshold), in the photo with its 8 neighbours, off the border, not a hole,
+/// and within width / 2 + [`BLUR_PX`] of an off pair's centre line along its dense run widened by the pair's width at
+/// each end (a side's edges turn over its own width at a corner, so its edgels stop that far short of the body); kept when `silhouette::label`
+/// (8-connected) puts it in the part's component. [`Refusal::PartClipped`] when a kept pixel is on the border.
+pub fn thin_sides(
+    sil: silhouette::Silhouette,
+    gray: &edges::Gray,
+    lat: &homography::Lattice,
+    pairs: &[grid::GridLine],
+    pitch: f64,
+    width_mm: f64,
+) -> Result<silhouette::Silhouette, Refusal> {
+    let Ok(h_inv) = homography::invert(&lat.h) else { return Ok(sil) };
+    let off: Vec<&grid::GridLine> = pairs.iter().filter(|p| off_lattice(p, &h_inv, pitch, width_mm)).collect();
+    if off.is_empty() {
+        return Ok(sil);
+    }
+    let (w, h) = (sil.w, sil.h);
+    let photo = |u: i64, v: i64| -> Option<(Vec2, f32)> {
+        let p = sil.corner_mm(u as f64 + 0.5, v as f64 + 0.5);
+        let q = homography::apply(&lat.h, p)?;
+        gray.sample(q.x, q.y).map(|l| (q, l))
+    };
+    let in_band = |q: Vec2| -> bool {
+        off.iter().any(|pr| {
+            let Some((t0, t1)) = pair_run(pr) else { return false };
+            let d = q - pr.point;
+            let t = d.dot(pr.dir);
+            d.dot(pr.dir.perp()).abs() <= 0.5 * pr.width_px + BLUR_PX && t >= t0 - pr.width_px && t <= t1 + pr.width_px
+        })
+    };
+    let mut mask = sil.part.clone();
+    let mut cand = alloc::vec![false; w * h];
+    let mut any = false;
+    for v in 1..h.saturating_sub(1) {
+        for u in 1..w.saturating_sub(1) {
+            let i = v * w + u;
+            if sil.part[i] || sil.hole[i] != 0 {
+                continue;
+            }
+            let Some((q, l)) = photo(u as i64, v as i64) else { continue };
+            if (l.clamp(0.0, 255.0) as usize) > sil.threshold || !in_band(q) {
+                continue;
+            }
+            let inside = (-1i64..=1).all(|dv| (-1i64..=1).all(|du| photo(u as i64 + du, v as i64 + dv).is_some()));
+            if inside {
+                cand[i] = true;
+                mask[i] = true;
+                any = true;
+            }
+        }
+    }
+    if !any {
+        return Ok(sil);
+    }
+    let Some(seed) = sil.part.iter().position(|&p| p) else { return Ok(sil) };
+    let lab = silhouette::label(&mask, w, h, true);
+    let root = lab[seed];
+    let mut out = sil;
+    for i in 0..w * h {
+        if cand[i] && lab[i] == root {
+            let (u, v) = (i % w, i / w);
+            if u == 0 || v == 0 || u == w - 1 || v == h - 1 {
+                return Err(Refusal::PartClipped);
+            }
+            out.part[i] = true;
+        }
+    }
+    Ok(out)
 }

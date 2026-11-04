@@ -5,8 +5,9 @@
 //! is a corner. Between two corners the run is ONE line when its total-least-squares fit holds every point within
 //! 3 σ; otherwise lines grow from the DP segments at least a pitch long while the TLS fit holds, and each stretch left
 //! is an arc when Pratt's fit holds (else it is split at its middle DP vertex, a single DP segment being a line).
-//! The points within pitch / 8 of a corner (the morphology's rounding) are left out of the fits. A hole that is one
-//! circle within 3 σ is a circle. Pratt's circle (Pratt, "Direct least-squares fitting of algebraic surfaces",
+//! The points within pitch / 8 of a corner (the morphology's rounding) are left out of the fits; two corners closer
+//! than that are merged unless they end a thin side (the sides beyond them parallel and over 2 σ apart, SR655). A
+//! hole that is one circle within 3 σ is a circle. Pratt's circle (Pratt, "Direct least-squares fitting of algebraic surfaces",
 //! SIGGRAPH 1987) is solved by Chernov's Newton iteration on its characteristic polynomial (Chernov, "Circular and
 //! Linear Regression", 2010, §5), started at Kåsa's solution (x = 0; Kåsa, IEEE Trans. Instrum. Meas. 1976).
 //!
@@ -349,11 +350,12 @@ pub fn segment_loop(pts: &[Vec2], sigma: f64, pitch: f64) -> Result<Vec<Prim>, R
         .collect();
     let mut corners: Vec<usize> = (0..m).filter(|&k| turn[k] >= CORNER_DEG).collect();
     // Two corners closer than the morphology's rounding (pitch / 8) are ONE corner seen as two half turns (the crack
-    // midpoints cut a square corner's tip): keep the sharper.
+    // midpoints cut a square corner's tip): keep the sharper. VUGPHOTOSIDETHINFIT (SR655): unless the pair is a thin
+    // side's end (`thin_pair`: its outer sides parallel and further apart than 2 σ), which is a feature, not noise.
     let trim = pitch / 8.0;
     while corners.len() >= 2 {
         let nc = corners.len();
-        let Some(q) = (0..nc).find(|&q| pts[idx[corners[q]]].dist(pts[idx[corners[(q + 1) % nc]]]) < trim) else { break };
+        let Some(q) = (0..nc).find(|&q| pts[idx[corners[q]]].dist(pts[idx[corners[(q + 1) % nc]]]) < trim && !thin_pair(pts, &idx, &corners, q, sigma, band, trim)) else { break };
         let drop = if turn[corners[q]] >= turn[corners[(q + 1) % nc]] { (q + 1) % nc } else { q };
         corners.remove(drop);
     }
@@ -418,4 +420,30 @@ pub fn outline(loops: &Loops, sigma: f64, pitch: f64) -> Result<Outline, Refusal
         });
     }
     Ok(Outline { outer, holes, sigma_mm: sigma })
+}
+
+// ---- VUGPHOTOSIDETHINFIT (SR655): a close corner pair between parallel sides is a thin side (named tail block) ----
+// The corner merge above takes two corners closer than pitch / 8 for one corner seen as two half turns. A thin part
+// (a 0.5 mm shim) has its END that short: its two corners are real, and merging them turns the two parallel sides and
+// the end into a spike. The ONE rule reads the fit's own numbers: the pair is kept when the side before it and the side
+// after it (each from the neighbouring corner, at least `trim` long: real sides, not rounding slivers) run back
+// against each other (anti-parallel: a spike or notch, not a step), are parallel within the band over the shorter
+// side, and lie further apart than 2 σ (the DP's own tolerance: a thin side has an outline's width of evidence along
+// its run). A rounded corner split in two has perpendicular sides and still merges.
+
+/// Whether the close corner pair (`corners[q]`, `corners[q + 1]`) of the DP vertices `idx` into `pts` ends a thin side.
+fn thin_pair(pts: &[Vec2], idx: &[usize], corners: &[usize], q: usize, sigma: f64, band: f64, trim: f64) -> bool {
+    let nc = corners.len();
+    if nc < 4 {
+        return false;
+    }
+    let at = |k: usize| pts[idx[corners[k % nc]]];
+    let (p0, p1, q0, q1) = (at(q + nc - 1), at(q), at(q + 1), at(q + 2));
+    let (u, v) = (p1 - p0, q1 - q0);
+    let (lu, lv) = (u.mag(), v.mag());
+    if !(lu >= trim && lv >= trim) || u.dot(v) >= 0.0 {
+        return false;
+    }
+    let (uh, vh) = (u / lu, v / lv);
+    uh.cross(vh).abs() * lu.min(lv) <= band && (q0 - p1).cross(uh).abs() > 2.0 * sigma
 }
