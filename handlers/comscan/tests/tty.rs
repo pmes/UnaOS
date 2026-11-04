@@ -510,8 +510,13 @@ const VER_A: &str = "1.1h.20190825:mill-a";
 
 /// grbl 1.1's `$I` answer for build `ver`, written when `line` is `$I`; true when it was.
 fn said_hello(s: &mut impl Write, line: &str, ver: &str) -> bool {
+    said_hello_answering(s, line, ver, ENVELOPE_ANSWER) // VUGCOMSCANRELINKENVELOPE (SR607): the default travel answer
+}
+
+/// [`said_hello`] answering `$$` with `envelope` (VUGCOMSCANRELINKENVELOPE, SR607: a second board's own travel).
+fn said_hello_answering(s: &mut impl Write, line: &str, ver: &str, envelope: &[u8]) -> bool {
     if line == "$$" {
-        let _ = s.write_all(ENVELOPE_ANSWER); // VUGCOMSCANALARMIDLE (SR591); VUGCOMSCANENVELOPEREADON (SR597): heard wherever the hello is on
+        let _ = s.write_all(envelope); // VUGCOMSCANALARMIDLE (SR591); VUGCOMSCANENVELOPEREADON (SR597): heard wherever the hello is on
         return true;
     }
     if line != "$I" {
@@ -781,7 +786,12 @@ fn a_lost_grbl_homes_and_jogs_on_the_relinked_port() {
 /// hears `$H` after it) and every later G-code line `error:9` (grbl's G-code lock: the lines still on the wire when the
 /// alarm flushed its buffer). Records every line and every realtime byte (`?` `!` `~` 0x85); returns once `$H` was
 /// answered or 0x85 arrived.
-fn fake_grbl_alarm(mut m: File, alarm_at: usize) -> JoinHandle<(Vec<String>, Vec<u8>, File)> {
+fn fake_grbl_alarm(m: File, alarm_at: usize) -> JoinHandle<(Vec<String>, Vec<u8>, File)> {
+    fake_grbl_alarm_answering(m, alarm_at, ENVELOPE_ANSWER) // VUGCOMSCANRELINKENVELOPE (SR607): the default travel answer
+}
+
+/// [`fake_grbl_alarm`] answering `$$` with `envelope` (VUGCOMSCANRELINKENVELOPE, SR607).
+fn fake_grbl_alarm_answering(mut m: File, alarm_at: usize, envelope: &'static [u8]) -> JoinHandle<(Vec<String>, Vec<u8>, File)> {
     thread::spawn(move || {
         let (mut got, mut rt, mut cur) = (Vec::new(), Vec::new(), Vec::<u8>::new());
         let (mut stream, mut alarmed, mut over) = (0usize, false, false);
@@ -804,7 +814,7 @@ fn fake_grbl_alarm(mut m: File, alarm_at: usize) -> JoinHandle<(Vec<String>, Vec
                     b'\n' => {
                         let line = String::from_utf8_lossy(&cur).trim().to_string();
                         cur.clear();
-                        if said_hello(&mut m, &line, VER_A) {
+                        if said_hello_answering(&mut m, &line, VER_A, envelope) {
                             continue;
                         }
                         got.push(line.clone());
@@ -1234,17 +1244,120 @@ fn a_jog_is_bounded_by_the_tighter_of_the_declared_and_the_read_travel() {
     );
     let x150 = PumpEvent::PumpJog { principal: who(), dx: 150.0, dy: 0.0, dz: 0.0, feed: 300.0 };
     assert_eq!(refused_in(&desk.apply(&x150, &mut *open)), "jog: the link is down (reconnect attempt 1)");
-    let relinked =
-        drive_until(&mut desk, &mut *open, t0, &mut words, |e| e.starts_with("relinked") || e.contains("failed") || e.contains("refused"));
-    assert!(relinked.starts_with("relinked on attempt 1;"), "{words:?}");
+    // VUGCOMSCANRELINKENVELOPE (SR607): the relink's whole batch: the same travel (200) read again says nothing new.
+    let said = relink_batch(&mut desk, &mut *open, t0, &mut words);
+    assert_eq!(said.len(), 1, "{said:?}");
+    assert!(said[0].starts_with("relinked on attempt 1;"), "{said:?}");
 
-    // Relinked: the reopened board was not asked its travel, so the declared bound stands until the next start.
-    assert_eq!(said_in(&desk.apply(&x300, &mut *open)), "jog sent: $J=G91 X300 Y0 Z0 F300");
+    // Relinked: the reopened board is asked its travel again, so the controller's 200 still bounds the jog.
+    assert_eq!(
+        refused_in(&desk.apply(&x300, &mut *open)),
+        "jog: X300 is past the controller X travel 200 (the position is not polled outside a job: the jog's delta is bounded)"
+    );
+    assert_eq!(said_in(&desk.apply(&x150, &mut *open)), "jog sent: $J=G91 X150 Y0 Z0 F300");
     assert_eq!(drive_until(&mut desk, &mut *open, t0, &mut words, |e| e.starts_with("jog")), "jog ok", "{words:?}");
     assert_eq!(said_in(&desk.apply(&home, &mut *open)), "home sent: $H");
     assert_eq!(drive_until(&mut desk, &mut *open, t0, &mut words, |e| e.starts_with("home")), "home ok", "{words:?}");
     drop(desk);
     drop(open);
     let (lines, _rt, _m) = fake2.join().unwrap();
-    assert_eq!(lines, vec!["$J=G91 X300 Y0 Z0 F300".to_string(), "$H".to_string()], "no `$$` on the relink, the jog and the home only");
+    assert_eq!(lines, vec!["$J=G91 X150 Y0 Z0 F300".to_string(), "$H".to_string()], "the `$$` is not recorded: the jog and the home only");
+}
+
+// --- VUGCOMSCANRELINKENVELOPE (SR607): an accepted relink reads the controller's travel again ---
+
+/// VUGCOMSCANRELINKENVELOPE (SR607): the second board's tighter travel (X 150 against the first board's 200).
+const ENVELOPE_ANSWER_TIGHTER: &[u8] = b"$0=10\r\n$130=150.000\r\n$131=350.000\r\n$132=110.000\r\nok\r\n";
+
+/// Tick the desk until its redial is due, then run that one reopen and return the Squawk words of its WHOLE batch
+/// (`drive_until` stops at the first matching word and would drop the words after `relinked`).
+fn relink_batch(desk: &mut PumpDesk, open: &mut Opener, t0: Instant, words: &mut Vec<String>) -> Vec<String> {
+    let end = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < end {
+        let now = t0.elapsed().as_micros() as u64;
+        for s in desk.tick(now) {
+            if let PumpEvent::Squawk { event: Some(e), .. } = &s {
+                words.push(e.clone());
+            }
+        }
+        if let Some(port) = desk.redial_due(now) {
+            let res = open(&port, GRBL);
+            return desk
+                .relinked(t0.elapsed().as_micros() as u64, res)
+                .iter()
+                .filter_map(|s| match s { PumpEvent::Squawk { event: Some(e), .. } => Some(e.clone()), _ => None })
+                .collect();
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+    panic!("no redial came due: {words:?}");
+}
+
+#[test]
+fn a_relink_reads_the_controllers_travel_again_and_says_a_changed_one() {
+    let who = || Origin::LocalUser("una".to_string());
+    let root = fresh("comscan-relink-envelope");
+    let port = root.join("ttyACM0");
+    let (m1, slave1, s1) = pty();
+    std::os::unix::fs::symlink(&slave1, &port).unwrap();
+    let p = program();
+    let mut desk = PumpDesk::new(machine());
+    desk.hello_within(comscan::tty::READY_WAIT);
+    let pass = Verdict::Pass { digest: p.digest(), machine: machine().digest() };
+    let digest = desk.arm(&pass, &p, GRBL).expect("armed by a pass");
+    let mut open = opener(Baud::B115200, Flow::None);
+    let fake1 = fake_grbl(m1, true, 2);
+    let start = PumpEvent::PumpStart {
+        principal: who(),
+        program: digest_hex(digest),
+        dialect: "grbl".to_string(),
+        port: port.to_str().unwrap().to_string(),
+    };
+    let out = desk.apply(&start, &mut *open);
+    let said: Vec<String> =
+        out.iter().filter_map(|s| match s { PumpEvent::Squawk { event: Some(e), .. } => Some(e.clone()), _ => None }).collect();
+    assert_eq!(said, vec!["started".to_string(), format!("hello {}", hello_of(VER_A)), "envelope differs axis=X declared=350 controller=200".to_string()], "{out:?}");
+
+    // Two lines reach the first board, then it goes; the same board comes back on the same name answering a tighter X.
+    let t0 = Instant::now();
+    while !fake1.is_finished() && t0.elapsed() < Duration::from_secs(5) {
+        desk.tick(t0.elapsed().as_micros() as u64);
+        thread::sleep(Duration::from_millis(2));
+    }
+    for _ in 0..20 {
+        desk.tick(t0.elapsed().as_micros() as u64);
+        thread::sleep(Duration::from_millis(2));
+    }
+    let (_lines, m1) = fake1.join().unwrap();
+    let (m2, slave2, _s2) = pty();
+    std::fs::remove_file(&port).unwrap();
+    std::os::unix::fs::symlink(&slave2, &port).unwrap();
+    let fake2 = fake_grbl_alarm_answering(m2, usize::MAX, ENVELOPE_ANSWER_TIGHTER);
+    drop(m1);
+    drop(s1);
+
+    let mut words = Vec::new();
+    let lost = drive_until(&mut desk, &mut *open, t0, &mut words, |e| e.starts_with("link lost"));
+    assert!(lost.starts_with("link lost at line "), "{lost}");
+    let said = relink_batch(&mut desk, &mut *open, t0, &mut words);
+    assert_eq!(said.len(), 2, "{said:?}");
+    assert!(said[0].starts_with("relinked on attempt 1;"), "{said:?}");
+    assert_eq!(said[1], "envelope differs axis=X declared=350 controller=150", "the changed read is said once, after the relinked word");
+
+    // The reopen's 150 is now the bound: X180 refused by name, X120 goes out.
+    let x180 = PumpEvent::PumpJog { principal: who(), dx: 180.0, dy: 0.0, dz: 0.0, feed: 300.0 };
+    assert_eq!(
+        refused_in(&desk.apply(&x180, &mut *open)),
+        "jog: X180 is past the controller X travel 150 (the position is not polled outside a job: the jog's delta is bounded)"
+    );
+    let x120 = PumpEvent::PumpJog { principal: who(), dx: 120.0, dy: 0.0, dz: 0.0, feed: 300.0 };
+    assert_eq!(said_in(&desk.apply(&x120, &mut *open)), "jog sent: $J=G91 X120 Y0 Z0 F300");
+    assert_eq!(drive_until(&mut desk, &mut *open, t0, &mut words, |e| e.starts_with("jog")), "jog ok", "{words:?}");
+    let home = PumpEvent::PumpHome { principal: who() };
+    assert_eq!(said_in(&desk.apply(&home, &mut *open)), "home sent: $H");
+    assert_eq!(drive_until(&mut desk, &mut *open, t0, &mut words, |e| e.starts_with("home")), "home ok", "{words:?}");
+    drop(desk);
+    drop(open);
+    let (lines, _rt, _m) = fake2.join().unwrap();
+    assert_eq!(lines, vec!["$J=G91 X120 Y0 Z0 F300".to_string(), "$H".to_string()], "the `$$` is not recorded: the jog and the home only");
 }
