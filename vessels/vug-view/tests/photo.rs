@@ -541,3 +541,112 @@ fn a_set_enters_whole_and_undoes_in_one_step() {
     assert_eq!(vw.view.design.journal.depth(), (undo, 0));
     assert_eq!(face(&vw).sketch.entities().len(), ents + 1);
 }
+
+// ---- VUGINTENTSETFACE (SR570): a statement set is ONE card; re-verified in the journal's names after a panel delete ----
+
+fn datum(stmt: &str, why: &str) -> Proposal {
+    Proposal { stmt: stmt.into(), confidence: 0.9, why: why.into() }
+}
+
+/// The panel's delete of the row `id` (its dependants with it), the regenerated face and body swapped in (journal::key's road).
+fn delete_row(vw: &mut Viewer, id: &str) {
+    let d = &mut vw.view.design;
+    let i = d.journal.doc.stmts.iter().position(|s| s.id() == Some(id)).expect("the row");
+    let r = d.journal.delete(i).expect("the delete regenerates");
+    d.face = r.face;
+    d.body = r.body;
+}
+
+/// The rectangle face: a point and a distance naming it share one why (doc_core's one set) and are painted as ONE card
+/// (both statements listed, the term named); Tab stops on it once; ONE Escape rejects the whole; offered again, ONE
+/// Enter enters the whole.
+#[test]
+fn a_set_is_one_card_entered_by_one_enter_and_refused_by_one_escape() {
+    let mut vw = rectangle();
+    let set = || vec![datum("point v3 sketch=s x=10 y=0", "a datum point"), datum("distance v4 sketch=s a=e0 b=v3 d=10", "a datum point")];
+    let ents = face(&vw).sketch.entities().len();
+    assert!(photo::offer(&mut vw.view, set()));
+    assert!(ph(&vw).offers.iter().all(|o| o.set.is_some_and(|m| m.key == 0)), "{:?}", ph(&vw).offers);
+    let fr = raster::render(&vw.model, &vw.view);
+    let gs = photo::glyphs(&vw.view);
+    assert_eq!(gs.len(), 1, "one card: {gs:?}");
+    let card = gs[0].card.as_ref().expect("a card");
+    assert_eq!(card.lines.len(), 2);
+    assert!(card.lines[0].starts_with("POINT V3") && card.lines[1].starts_with("DISTANCE V4"), "{:?}", card.lines);
+    assert_eq!(card.term, "outline");
+    assert!(matches!(card.verdict, Verdict::Accept { .. }), "{:?}", card.verdict);
+    assert!(gs[0].text.starts_with("SET N=2 A DATUM POINT") && gs[0].text.ends_with("TERM=OUTLINE"), "{}", gs[0].text);
+    assert!(drawn(&fr, &gs[0]));
+    // Tab: the card is one stop.
+    assert_eq!(ph(&vw).focus, Some(0));
+    key(&mut vw, "Tab");
+    assert_eq!(ph(&vw).focus, Some(0), "a card is one stop");
+    // ONE Escape: the whole set rejected, nothing entered.
+    assert!(key(&mut vw, "Escape"));
+    assert!(ph(&vw).offers.iter().all(|o| o.state == State::Rejected), "{:?}", ph(&vw).offers);
+    assert!(ph(&vw).note.as_deref().unwrap_or("").starts_with("rejected set n=2 a datum point"), "{:?}", ph(&vw).note);
+    assert!(photo::glyphs(&vw.view).is_empty());
+    assert_eq!(face(&vw).sketch.entities().len(), ents);
+    // Offered again: ONE Enter enters both.
+    assert!(photo::offer(&mut vw.view, set()));
+    assert_eq!(ph(&vw).focus, Some(2));
+    assert!(key(&mut vw, "Return"));
+    assert!(ph(&vw).offers[2..].iter().all(|o| o.state == State::Applied), "{:?}", ph(&vw).note);
+    assert!(ph(&vw).note.as_deref().unwrap_or("").starts_with("applied set n=2"), "{:?}", ph(&vw).note);
+    assert_eq!(face(&vw).sketch.entities().len(), ents + 1, "the point is in the face");
+}
+
+/// A stray point e0 before the rectangle's corners e1..e4 (sides e5..e8), the journal recorded. Two sets are offered;
+/// the panel deletes e0, so the face's slots renumber (doc_of's e1 is now the (49.7, 0) corner) while the journal keeps
+/// its names: Enter on the first set still enters, re-verified in the journal's names (SR563 refused it by name). The
+/// panel then deletes e3, the corner the second set names: Enter refuses it by that name and nothing enters.
+#[test]
+fn a_set_verified_before_a_panel_delete_enters_in_the_journal_names() {
+    let mut vw = rectangle();
+    let mut sk = Sketch::new();
+    let _stray = sk.add_point(20.0, 10.0);
+    let c = [(0.0, 0.0), (49.7, 0.0), (49.7, 30.2), (0.0, 30.2)];
+    let p: Vec<EntityId> = c.iter().map(|&(x, y)| sk.add_point(x, y)).collect();
+    for i in 0..4 {
+        sk.add_line(p[i], p[(i + 1) % 4]).expect("a line");
+    }
+    vw.view.design.face = Some(SketchFace::over(world_planes()[0].1, sk));
+    {
+        let d = &mut vw.view.design;
+        d.journal.record(d.face.as_ref(), None);
+    }
+    assert!(photo::offer(
+        &mut vw.view,
+        vec![
+            datum("point v3 sketch=s x=12 y=0", "a datum point"),
+            datum("distance v4 sketch=s a=e1 b=v3 d=10", "a datum point"),
+            datum("point v5 sketch=s x=49.7 y=20", "a second datum"),
+            datum("distance v6 sketch=s a=e3 b=v5 d=10.2", "a second datum"),
+        ]
+    ));
+    assert!(ph(&vw).offers.iter().all(|o| o.set.is_some() && matches!(o.verdict, Verdict::Accept { .. })), "{:?}", ph(&vw).offers);
+    // The panel deletes the stray point: the journal keeps e1..e8, the face's dense slots read e0..e7 again.
+    delete_row(&mut vw, "e0");
+    assert!(vw.view.design.journal.doc.stmts.iter().all(|s| s.id() != Some("e0")));
+    assert!(photo::doc_of(face(&vw)).stmts.iter().any(|s| s.id() == Some("e0")), "the slots renumbered");
+    assert_eq!(ph(&vw).focus, Some(0));
+    assert!(key(&mut vw, "Return"));
+    assert!(ph(&vw).note.as_deref().unwrap_or("").starts_with("applied set n=2 a datum point"), "{:?}", ph(&vw).note);
+    assert!(ph(&vw).offers[..2].iter().all(|o| o.state == State::Applied));
+    assert!(ph(&vw).offers[2..].iter().all(|o| o.state == State::Open));
+    let v4 = vw.view.design.journal.doc.stmts.iter().find(|s| s.id() == Some("v4")).expect("v4 entered");
+    assert!(v4.refs().contains(&"e1"), "the distance names the journal's e1: {v4:?}");
+    // The new point is 10 from the (0, 0) corner (slot 0 after the delete), the slot the offer named.
+    let sk = &face(&vw).sketch;
+    let last = sk.entities().iter().rposition(|e| matches!(e, Entity::Point { .. })).expect("a point") as u32;
+    assert!((dist(sk, 0, last) - 10.0).abs() < 1e-6, "{}", dist(sk, 0, last));
+    // A true conflict: the panel deletes e3 (its sides go with it); Enter on the second set is refused by that name.
+    delete_row(&mut vw, "e3");
+    let before = vw.view.design.journal.doc.clone();
+    assert_eq!(ph(&vw).focus, Some(2));
+    assert!(key(&mut vw, "Return"));
+    let note = ph(&vw).note.clone().unwrap_or_default();
+    assert!(note.starts_with("refused lex") && note.contains("e3"), "{note}");
+    assert!(ph(&vw).offers[2..].iter().all(|o| o.state == State::Open));
+    assert_eq!(vw.view.design.journal.doc, before, "nothing entered");
+}

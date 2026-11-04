@@ -79,6 +79,11 @@ pub struct Offer {
     /// VUGFACESTREAM (SR535): the stream index of a preview of the live request (Enter waits for the terminal answer);
     /// `None` for a settled or hand-offered proposal.
     pub streaming: Option<u32>,
+    /// VUGINTENTSETFACE (SR570): the statement re-mapped into the journal's names when it was offered ([`mark`]): the
+    /// stable identity a panel delete does not move; `proposal.stmt` byte for byte when no name moved.
+    pub named: String,
+    /// VUGINTENTSETFACE (SR570): a member of one doc_core statement set, painted as ONE card ([`Member`]).
+    pub set: Option<Member>,
 }
 
 /// A proposal glyph as drawn: where, what, in which colour, and which offer.
@@ -88,6 +93,8 @@ pub struct ProposalGlyph {
     pub at: (f32, f32),
     pub text: String,
     pub colour: u32,
+    /// VUGINTENTSETFACE (SR570): a statement set's one card (its member lines drawn under `text`); None for a single.
+    pub card: Option<Card>,
 }
 
 /// The opened photo: the image, the paper-mm -> pixel homography, the measured outline and its sigma, the offers.
@@ -361,7 +368,7 @@ pub fn offer(view: &mut View, ps: Vec<Proposal>) -> bool {
     for p in ps {
         ph.offers.push(verified(&doc, &m, t.as_ref(), p, None)); // VUGFACESTREAM (SR535): the one verify road
     }
-    tally(ph, n); // VUGFACESTREAM (SR535): the one corner and focus rule
+    mark(ph, &view.design.journal, face); tally(ph, n); // VUGFACESTREAM (SR535): the one corner and focus rule; VUGINTENTSETFACE (SR570): the sets marked first
     n > 0
 }
 
@@ -386,7 +393,7 @@ pub fn key(view: &mut View, k: &str) -> Option<bool> {
         "Tab" | "\t" => {
             let n = ph.offers.len();
             let start = ph.focus.map(|i| i + 1).unwrap_or(0);
-            let next = (0..n).map(|j| (start + j) % n.max(1)).find(|&j| ph.offers[j].state == State::Open);
+            let next = (0..n).map(|j| (start + j) % n.max(1)).find(|&j| ph.offers[j].state == State::Open && !tail_member(ph, j)); // VUGINTENTSETFACE (SR570): a card is one stop
             let ph = view.photo.as_mut()?;
             let changed = ph.focus != next;
             ph.focus = next;
@@ -395,12 +402,14 @@ pub fn key(view: &mut View, k: &str) -> Option<bool> {
         _ if is_enter(k) => focused.map(|i| accept(view, i)),
         _ if is_back(k) => {
             let i = focused?;
+            if let Some(r) = reject_card(view, i) { return Some(r); } // VUGINTENTSETFACE (SR570): a card is rejected whole
             let ph = view.photo.as_mut()?;
             ph.offers[i].state = State::Rejected;
             ph.note = Some(format!("rejected {}", ph.offers[i].proposal.stmt.trim()));
             ph.focus = ph.offers.iter().position(|o| o.state == State::Open);
             Some(true)
         }
+        "Escape" | "\u{1b}" => focused.and_then(|i| reject_card(view, i)), // VUGINTENTSETFACE (SR570): Escape refuses the whole card; off a card the sketch's Escape
         _ => None,
     }
 }
@@ -484,8 +493,8 @@ pub fn glyphs(view: &View) -> Vec<ProposalGlyph> {
     let mut out = Vec::new();
     let mut row = 0;
     for (i, o) in ph.offers.iter().enumerate() {
-        if o.state != State::Open {
-            continue;
+        if o.state != State::Open || tail_member(ph, i) {
+            continue; // VUGINTENTSETFACE (SR570): a set's later members are lines of its one card
         }
         let stmt = o.proposal.stmt.trim();
         let (mut text, refused) = match &o.verdict {
@@ -495,11 +504,14 @@ pub fn glyphs(view: &View) -> Vec<ProposalGlyph> {
         if o.streaming.is_some() {
             text.push_str(" STREAMING"); // VUGFACESTREAM (SR535): the preview's mark
         }
+        let card = card_of(ph, i); if let Some(c) = &card { text = card_head(ph, i, c); } // VUGINTENTSETFACE (SR570): the set's one card
         let at = match anchor(face, stmt).and_then(|q| face.to_screen(view, q)) {
             Some((x, y)) => (x as f32 + 6.0, y as f32 - 14.0),
             None => {
                 row += 1;
-                (6.0, 30.0 + 12.0 * row as f32)
+                let y = 30.0 + 12.0 * row as f32;
+                row += card.as_ref().map_or(0, |c| c.lines.len()); // VUGINTENTSETFACE (SR570): the card's lines take their rows
+                (6.0, y)
             }
         };
         let colour = if ph.focus == Some(i) {
@@ -509,7 +521,7 @@ pub fn glyphs(view: &View) -> Vec<ProposalGlyph> {
         } else {
             PROPOSAL
         };
-        out.push(ProposalGlyph { offer: i, at, text: text.to_uppercase(), colour });
+        out.push(ProposalGlyph { offer: i, at, text: text.to_uppercase(), colour, card }); // VUGINTENTSETFACE (SR570): card
     }
     out
 }
@@ -537,7 +549,7 @@ pub fn overlay(view: &View, fr: &mut Raster) {
         let (x, y) = (g.at.0 - 6.0, g.at.1 + 14.0);
         raster::line(fr, (x - 3.0, y - 3.0), (x + 3.0, y + 3.0), col);
         raster::line(fr, (x - 3.0, y + 3.0), (x + 3.0, y - 3.0), col);
-        raster::text(fr, &g.text, g.at.0, g.at.1, col);
+        raster::text(fr, &g.text, g.at.0, g.at.1, col); card_lines(fr, &g, col); // VUGINTENTSETFACE (SR570): the card's member lines under its head
     }
     if let Some(note) = &ph.note {
         let col = if note.starts_with("refused") || note.starts_with("Vein refused") { REFUSED } else { INK };
@@ -613,7 +625,7 @@ pub fn answer(view: &mut View, ev: &IntentEvent) -> bool {
 /// The one verify road: `p` checked by `doc_core::verify` against the face's document and the measured outline, Open.
 fn verified(doc: &Doc, m: &Measurement, t: Option<&Measurement>, p: Proposal, streaming: Option<u32>) -> Offer {
     let verdict = judged(doc, &p, m, t); // VUGINTENTTHICKNESS (SR557): the held thickness beside the outline
-    Offer { proposal: p, verdict, state: State::Open, streaming }
+    Offer { proposal: p, verdict, state: State::Open, streaming, named: String::new(), set: None } // VUGINTENTSETFACE (SR570): named / set by `mark`
 }
 
 /// The one corner and focus rule after `n` proposals were offered: `intent: proposed=n acceptable=a refused=r` over the
@@ -675,7 +687,7 @@ fn settle(view: &mut View, ps: Vec<Proposal>) -> bool {
         }
     }
     withdraw(ph);
-    tally(ph, n);
+    mark(ph, &view.design.journal, face); tally(ph, n); // VUGINTENTSETFACE (SR570): the sets marked before the corner counts
     true
 }
 
@@ -873,35 +885,16 @@ fn judged(doc: &Doc, p: &Proposal, m: &Measurement, t: Option<&Measurement>) -> 
 /// accept enters through [`enter_set`].
 fn set_road(view: &mut View, i: usize) -> Option<bool> {
     let (face, ph) = (view.design.face.as_ref()?, view.photo.as_ref()?);
-    let why = ph.offers.get(i)?.proposal.why.clone();
-    let member = |o: &Offer| o.state == State::Open && o.streaming.is_none() && !why.is_empty() && o.proposal.why == why;
-    if !member(&ph.offers[i]) {
-        return None;
-    }
-    let lo = (0..i).rev().take_while(|&j| member(&ph.offers[j])).last().unwrap_or(i);
-    let hi = (i + 1..ph.offers.len()).take_while(|&j| member(&ph.offers[j])).last().unwrap_or(i);
-    if hi == lo {
-        return None;
-    }
-    let set: Vec<Proposal> = ph.offers[lo..=hi].iter().map(|o| o.proposal.clone()).collect();
-    let doc = doc_of(face);
-    let b = doc_core::verify_all(&doc, &set, &ph.measurement(), Tol::DEFAULT);
-    if !b.sets.first().is_some_and(|(start, steps)| *start == 0 && steps.len() == set.len()) {
-        return None;
-    }
-    let mut verdict = b.entries.first()?.2.clone();
-    if let (Verdict::Accept { residual_sigma: outline_sigma, .. }, Some(t)) = (verdict.clone(), ph.thickness.as_ref()) {
-        if b.doc.stmts.iter().any(|s| matches!(s, Stmt::Extrude { sketch, .. } if sketch == SKETCH_ID)) {
-            match &doc_core::verify_all(&doc, &set, t, Tol::DEFAULT).entries.first()?.2 {
-                Verdict::Accept { residual_sigma, .. } if *residual_sigma <= outline_sigma => {}
-                w => verdict = w.clone(),
-            }
-        }
-    }
+    let (lo, hi) = set_run(ph, i)?; // VUGINTENTSETFACE (SR570): the one run rule
+    let why = ph.offers[i].proposal.why.clone();
+    // VUGINTENTSETFACE (SR570): the set re-verified in the journal's CURRENT document, in the names captured at offer time.
+    let (doc, names) = journal_doc(&view.design.journal, face);
+    let set = named_set(ph, lo, hi, &names);
+    let (verdict, _, cand) = judge_set(&doc, &set, &ph.measurement(), ph.thickness.as_ref())?;
     let f = face.clone();
     let entered = match &verdict {
         Verdict::Refuse { why } => Err(format!("refused {}", why.text())),
-        Verdict::Accept { .. } => enter_set(&mut view.design, &f, &doc, b.doc).map_err(|e| format!("refused by the sketch {e}")),
+        Verdict::Accept { .. } => enter_set(&mut view.design, &f, &doc, cand).map_err(|e| format!("refused by the sketch {e}")),
     };
     let ph = view.photo.as_mut()?;
     for o in &mut ph.offers[lo..=hi] {
@@ -936,4 +929,226 @@ fn enter_set(d: &mut crate::sketch::Design, f: &SketchFace, doc: &Doc, cand: Doc
     d.pull = None;
     d.refusal = None;
     Ok(())
+}
+
+// ---- VUGINTENTSETFACE (SR570): the set as one card, re-verified in the journal's names (named tail block) ----
+
+/// An offer's place in one doc_core statement set: consecutive offers with one `key` (the first member's index when it
+/// was marked) are ONE card; `term` is the measurement its verdict was judged by ([`judge_set`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Member {
+    pub key: usize,
+    pub term: &'static str,
+}
+
+/// A statement set as drawn: its members' statements (upper-cased, the bitmap font's case), the term and the set's one
+/// verdict (every member carries it).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Card {
+    pub lines: Vec<String>,
+    pub term: &'static str,
+    pub verdict: Verdict,
+}
+
+/// The face's document in the JOURNAL's names, and the face-slot (PlainNames, [`doc_of`]) -> journal id pairs: a journal
+/// clone takes `Journal::record` of the face (enter_set's own move). When the journal document holds exactly doc_of's
+/// statements kind for kind (the photo's sketch alone), that document and the pairs; else doc_of and no pairs, so
+/// enter_set's SR563 refusal ("the document is not the photo's sketch") still names it. A panel delete renames the
+/// face's slots (regenerate re-densifies them) while the journal keeps its ids: the journal's name is the stable one.
+fn journal_doc(j: &crate::journal::Journal, face: &SketchFace) -> (Doc, Vec<(String, String)>) {
+    let doc = doc_of(face);
+    let mut jc = j.clone();
+    jc.record(Some(face), None);
+    let same = jc.doc.stmts.len() == doc.stmts.len()
+        && doc.stmts.iter().zip(&jc.doc.stmts).all(|(a, b)| std::mem::discriminant(a) == std::mem::discriminant(b));
+    if !same {
+        return (doc, Vec::new());
+    }
+    let names = doc.stmts.iter().zip(&jc.doc.stmts).filter_map(|(a, b)| Some((a.id()?.to_string(), b.id()?.to_string()))).collect();
+    (jc.doc, names)
+}
+
+/// `stmt` with its own id (the second word) and every `key=value` head (before a `.`) that `names` maps re-written to
+/// the mapped name; the input untouched when nothing maps.
+fn renamed(stmt: &str, names: &[(String, String)]) -> String {
+    let look = |n: &str| names.iter().find(|(a, b)| a == n && a != b).map(|(_, b)| b.clone());
+    let mut changed = false;
+    let words: Vec<String> = stmt
+        .split_whitespace()
+        .enumerate()
+        .map(|(k, w)| {
+            let new = if k == 1 {
+                look(w)
+            } else if let Some((key, v)) = w.split_once('=') {
+                let (head, tail) = v.split_once('.').map_or((v, None), |(h, t)| (h, Some(t)));
+                look(head).map(|n| match tail {
+                    Some(t) => format!("{key}={n}.{t}"),
+                    None => format!("{key}={n}"),
+                })
+            } else {
+                None
+            };
+            changed |= new.is_some();
+            new.unwrap_or_else(|| w.to_string())
+        })
+        .collect();
+    if changed { words.join(" ") } else { stmt.to_string() }
+}
+
+/// After offers are verified ([`offer`], [`settle`]): every offer not yet named takes its statement re-mapped into the
+/// journal's current names ([`journal_doc`], [`renamed`]) — a FRESH own id (no face slot named it) that the journal
+/// document already holds moves to the first free `<id>-<n>` (its references in the batch follow), so it never replaces
+/// a journal statement; then each run [`set_run`] finds with an unmarked member is judged once by [`judge_set`] in the
+/// journal document: one set -> every member marked ([`Member`]) and given the set's verdict, else its marks cleared.
+fn mark(ph: &mut Photo, j: &crate::journal::Journal, face: &SketchFace) {
+    let (doc, mut names) = journal_doc(j, face);
+    let held = |id: &str, names: &[(String, String)]| doc.stmts.iter().any(|s| s.id() == Some(id)) || names.iter().any(|(_, b)| b == id);
+    for o in ph.offers.iter().filter(|o| o.named.is_empty()) {
+        let Some(own) = o.proposal.stmt.split_whitespace().nth(1) else { continue };
+        if names.iter().any(|(a, _)| a == own) || !doc.stmts.iter().any(|s| s.id() == Some(own)) {
+            continue;
+        }
+        let free = (1u32..).map(|n| format!("{own}-{n}")).find(|f| !held(f.as_str(), &names)).unwrap_or_default();
+        names.push((own.to_string(), free));
+    }
+    for o in ph.offers.iter_mut().filter(|o| o.named.is_empty()) {
+        o.named = renamed(&o.proposal.stmt, &names);
+    }
+    let (m, t) = (ph.measurement(), ph.thickness.clone());
+    let mut i = 0;
+    while i < ph.offers.len() {
+        let Some((lo, hi)) = set_run(ph, i) else {
+            i += 1;
+            continue;
+        };
+        if ph.offers[lo..=hi].iter().any(|o| o.set.is_none()) {
+            match judge_set(&doc, &named_set(ph, lo, hi, &names), &m, t.as_ref()) {
+                Some((v, term, _)) => {
+                    for o in &mut ph.offers[lo..=hi] {
+                        o.verdict = v.clone();
+                        o.set = Some(Member { key: lo, term });
+                    }
+                }
+                None => {
+                    for o in &mut ph.offers[lo..=hi] {
+                        o.set = None;
+                    }
+                }
+            }
+        }
+        i = hi + 1;
+    }
+}
+
+/// SR563's run rule: the consecutive Open, settled offers around `i` sharing its non-empty `why`, as (first, last);
+/// None when `i` is not in a run of two or more.
+fn set_run(ph: &Photo, i: usize) -> Option<(usize, usize)> {
+    let why = &ph.offers.get(i)?.proposal.why;
+    let member = |o: &Offer| o.state == State::Open && o.streaming.is_none() && !why.is_empty() && o.proposal.why == *why;
+    if !member(&ph.offers[i]) {
+        return None;
+    }
+    let lo = (0..i).rev().take_while(|&j| member(&ph.offers[j])).last().unwrap_or(i);
+    let hi = (i + 1..ph.offers.len()).take_while(|&j| member(&ph.offers[j])).last().unwrap_or(i);
+    if hi == lo { None } else { Some((lo, hi)) }
+}
+
+/// The run's proposals in the journal's names: each offer's `named` (captured when it was offered), else its statement
+/// re-mapped now.
+fn named_set(ph: &Photo, lo: usize, hi: usize, names: &[(String, String)]) -> Vec<Proposal> {
+    ph.offers[lo..=hi]
+        .iter()
+        .map(|o| {
+            let stmt = if o.named.is_empty() { renamed(&o.proposal.stmt, names) } else { o.named.clone() };
+            Proposal { stmt, ..o.proposal.clone() }
+        })
+        .collect()
+}
+
+/// SR563's judging: doc_core's `verify_all` decides whether `set` is ONE set (`Batch.sets` from 0 over all of it) and
+/// gives its verdict, then [`judged`]'s thickness rule for a set that extrudes the photo's sketch. The verdict, its term
+/// (a Residual's own; else the thickness's when it decided; else `m`'s) and the document with the set applied.
+fn judge_set(doc: &Doc, set: &[Proposal], m: &Measurement, t: Option<&Measurement>) -> Option<(Verdict, &'static str, Doc)> {
+    let b = doc_core::verify_all(doc, set, m, Tol::DEFAULT);
+    if !b.sets.first().is_some_and(|(start, steps)| *start == 0 && steps.len() == set.len()) {
+        return None;
+    }
+    let mut verdict = b.entries.first()?.2.clone();
+    let mut term = m.term();
+    if let (Verdict::Accept { residual_sigma: outline_sigma, .. }, Some(t)) = (verdict.clone(), t) {
+        if b.doc.stmts.iter().any(|s| matches!(s, Stmt::Extrude { sketch, .. } if sketch == SKETCH_ID)) {
+            match &doc_core::verify_all(doc, set, t, Tol::DEFAULT).entries.first()?.2 {
+                Verdict::Accept { residual_sigma, .. } if *residual_sigma <= outline_sigma => {}
+                w => {
+                    verdict = w.clone();
+                    term = t.term();
+                }
+            }
+        }
+    }
+    if let Verdict::Refuse { why: doc_core::Reason::Residual { term: r, .. } } = &verdict {
+        term = *r;
+    }
+    Some((verdict, term, b.doc))
+}
+
+/// Offer `i` is a card's later member: the offer before it is an Open member of the same set.
+fn tail_member(ph: &Photo, i: usize) -> bool {
+    let Some(s) = ph.offers.get(i).and_then(|o| o.set) else { return false };
+    i > 0 && ph.offers[i - 1].state == State::Open && ph.offers[i - 1].set == Some(s)
+}
+
+/// The Open members of the set offer `i` belongs to, as (first, last); None when `i` is not a member.
+fn card_run(ph: &Photo, i: usize) -> Option<(usize, usize)> {
+    let s = ph.offers.get(i)?.set?;
+    let member = |j: usize| ph.offers[j].state == State::Open && ph.offers[j].set == Some(s);
+    if !member(i) {
+        return None;
+    }
+    let lo = (0..i).rev().take_while(|&j| member(j)).last().unwrap_or(i);
+    let hi = (i + 1..ph.offers.len()).take_while(|&j| member(j)).last().unwrap_or(i);
+    Some((lo, hi))
+}
+
+/// The card offer `i` heads: its members' statements, the term and the set's verdict.
+fn card_of(ph: &Photo, i: usize) -> Option<Card> {
+    let (lo, hi) = card_run(ph, i)?;
+    let term = ph.offers[i].set?.term;
+    let lines = ph.offers[lo..=hi].iter().map(|o| o.proposal.stmt.trim().to_uppercase()).collect();
+    Some(Card { lines, term, verdict: ph.offers[i].verdict.clone() })
+}
+
+/// The card's head line: `SET N=<n> <why> R=<rms> C=<least confidence> TERM=<term>`, or `... REFUSED <reason> TERM=`.
+fn card_head(ph: &Photo, i: usize, c: &Card) -> String {
+    let (lo, hi) = card_run(ph, i).unwrap_or((i, i));
+    let why = ph.offers[i].proposal.why.trim();
+    let n = c.lines.len();
+    match &c.verdict {
+        Verdict::Accept { residual_mm, .. } => {
+            let conf = ph.offers[lo..=hi].iter().map(|o| o.proposal.confidence).fold(f64::INFINITY, f64::min);
+            format!("SET N={n} {why} R={} C={} TERM={}", num(*residual_mm), num(conf), c.term)
+        }
+        Verdict::Refuse { why: r } => format!("SET N={n} {why} REFUSED {} TERM={}", r.text(), c.term),
+    }
+}
+
+/// The card's member statements, one row each under its head (the overlay's one loop).
+fn card_lines(fr: &mut Raster, g: &ProposalGlyph, col: [u8; 4]) {
+    let Some(c) = &g.card else { return };
+    for (k, l) in c.lines.iter().enumerate() {
+        raster::text(fr, l, g.at.0 + 8.0, g.at.1 + 12.0 * (k + 1) as f32, col);
+    }
+}
+
+/// Escape (or Backspace) on a card: every Open member Rejected at once, the corner `rejected set n=<n> <why>`, the focus
+/// to the first open offer. None when offer `i` is not a card's member (the single road's keys).
+fn reject_card(view: &mut View, i: usize) -> Option<bool> {
+    let ph = view.photo.as_mut()?;
+    let (lo, hi) = card_run(ph, i)?;
+    for o in &mut ph.offers[lo..=hi] {
+        o.state = State::Rejected;
+    }
+    ph.note = Some(format!("rejected set n={} {}", hi - lo + 1, ph.offers[lo].proposal.why.trim()));
+    ph.focus = ph.offers.iter().position(|o| o.state == State::Open);
+    Some(true)
 }
