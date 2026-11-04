@@ -585,30 +585,6 @@ tool number=1 kind=flat_end dc=6 lf=40 apmx=2 nof=2 sig=0
     assert_eq!(m.loaded, Some(1));
 }
 
-// ---- VUGMAKEMACHINELIBHELD (SR556): a library part through plain apply and verify_all ----
-
-#[test]
-fn a_library_part_takes_a_proposal_through_plain_apply_and_verify_all() {
-    let lib = "vug-doc version=1 lin=1e-6 ang=1e-9
-machine mill name=\"Shop mill\" kind=mill3 kinematics=cartesian units=mm envelope=[[-50 -50 -60] [100 100 50]] safe_z=10 power=spindle power_max=24000 ask_above=20000
-axis axis=x min=-50 max=100 max_feed=5000 max_accel=500 rapid=8000
-tool number=1 kind=flat_end dc=6 lf=40 apmx=2 nof=2 sig=0
-";
-    let shelf = Shelf("shop-mill", lib.to_string());
-    let d = read_with(&format!("{HOLE_PLATE}machine mill lib=shop-mill loaded=1\n"), &shelf).unwrap_or_else(|r| panic!("read_with: {r:?}"));
-    let plain = doc(HOLE_PLATE);
-    let ps = [p("diameter i1 sketch=s circle=c1 d=80")];
-    let m = shapes(fixture_shapes());
-    // verify takes the library part (no UnknownLib) and judges it as the plain plate.
-    assert_eq!(verify(&d, &ps[0], &m, d.tol), verify(&plain, &ps[0], &m, plain.tol));
-    let b = verify_all(&d, &ps, &m, d.tol);
-    assert_eq!(b.accepted(), 1, "{}", b.text());
-    assert_eq!(b.text(), verify_all(&plain, &ps, &m, plain.tol).text(), "the same batch as the plain plate");
-    assert_eq!(b.doc.stmts.len(), d.stmts.len() + 1);
-    let Some(Stmt::Machine(mm)) = b.doc.stmts.iter().find(|s| matches!(s, Stmt::Machine(_))) else { panic!("machine") };
-    assert_eq!(mm.lib.as_ref().map(|l| (l.name.as_str(), l.stmts.len())), Some(("shop-mill", 2)), "the library stays held");
-}
-
 // ---- VUGINTENTTHICKNESS (SR557): an extrude judged by a measured thickness ----
 
 /// The 80 x 60 plate's sketch with no extrude (a photo's sketch before its side photo).
@@ -651,6 +627,30 @@ fn a_thickness_with_no_solid_is_unmatched_and_tabled() {
         v => panic!("no solid not unmatched: {v:?}"),
     }
     assert_eq!(measurements_text(&m), "thickness: mm=10 sigma=0.3 along=(0,0,1)\n");
+}
+
+// ---- VUGMAKEMACHINELIBHELD (SR556): a library part through plain apply and verify_all ----
+
+#[test]
+fn a_library_part_takes_a_proposal_through_plain_apply_and_verify_all() {
+    let lib = "vug-doc version=1 lin=1e-6 ang=1e-9
+machine mill name=\"Shop mill\" kind=mill3 kinematics=cartesian units=mm envelope=[[-50 -50 -60] [100 100 50]] safe_z=10 power=spindle power_max=24000 ask_above=20000
+axis axis=x min=-50 max=100 max_feed=5000 max_accel=500 rapid=8000
+tool number=1 kind=flat_end dc=6 lf=40 apmx=2 nof=2 sig=0
+";
+    let shelf = Shelf("shop-mill", lib.to_string());
+    let d = read_with(&format!("{HOLE_PLATE}machine mill lib=shop-mill loaded=1\n"), &shelf).unwrap_or_else(|r| panic!("read_with: {r:?}"));
+    let plain = doc(HOLE_PLATE);
+    let ps = [p("diameter i1 sketch=s circle=c1 d=80")];
+    let m = shapes(fixture_shapes());
+    // verify takes the library part (no UnknownLib) and judges it as the plain plate.
+    assert_eq!(verify(&d, &ps[0], &m, d.tol), verify(&plain, &ps[0], &m, plain.tol));
+    let b = verify_all(&d, &ps, &m, d.tol);
+    assert_eq!(b.accepted(), 1, "{}", b.text());
+    assert_eq!(b.text(), verify_all(&plain, &ps, &m, plain.tol).text(), "the same batch as the plain plate");
+    assert_eq!(b.doc.stmts.len(), d.stmts.len() + 1);
+    let Some(Stmt::Machine(mm)) = b.doc.stmts.iter().find(|s| matches!(s, Stmt::Machine(_))) else { panic!("machine") };
+    assert_eq!(mm.lib.as_ref().map(|l| (l.name.as_str(), l.stmts.len())), Some(("shop-mill", 2)), "the library stays held");
 }
 
 // ---- VUGINTENTUNDOSET (SR563): a Residual names the measurement term of its max ----

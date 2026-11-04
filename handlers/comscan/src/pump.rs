@@ -295,7 +295,7 @@ impl PumpDesk {
             // lock released (`request` over `open_road`, the redial's road).
             PumpEvent::PumpStart { .. } => match self.start_due(ev) {
                 Ok(u) => {
-                    let res = with_hello(open(&u.port), u.hello);
+                    let res = with_hello_named(open(&u.port), u.hello, u.name); // VUGCOMSCANHOSTDESK (SR561)
                     self.started(ev, res)
                 }
                 Err(out) => out,
@@ -634,7 +634,7 @@ fn redial(synapse: &Synapse, desk: &Mutex<PumpDesk>, open: &mut Opener, t0: toki
     let out = open_road(
         desk,
         open,
-        |d| d.redial_due(now).map(|port| (port, d.hello_spec())).ok_or_else(Vec::new),
+        |d| d.redial_due(now).map(|port| (port, d.hello_spec(), None)).ok_or_else(Vec::new), // VUGCOMSCANHOSTDESK (SR561): a reopen never commissions
         |d, res| d.relinked_said(t0.elapsed().as_micros() as u64, res),
     )
     .unwrap_or_default();
@@ -665,16 +665,8 @@ impl PumpDesk {
 pub fn hello(link: &mut dyn Transport, dialect: Dialect, wait: Duration) -> Option<String> {
     use pump_core::pump::{HelloLine, hello_line, identity_verb};
     let verb = identity_verb(dialect)?;
-    let mut bytes = verb.as_bytes().to_vec();
-    bytes.push(b'\n');
-    let end = std::time::Instant::now() + wait;
-    let mut off = 0;
-    while off < bytes.len() {
-        match link.write(&bytes[off..]) {
-            Ok(n) if n > 0 => off += n,
-            Ok(_) if std::time::Instant::now() < end => std::thread::sleep(Duration::from_millis(10)),
-            Ok(_) | Err(_) => return None,
-        }
+    if !send_line(link, verb, wait) {
+        return None; // VUGCOMSCANHOSTDESK (SR561): the write loop lifted into send_line, shared with the commission
     }
     let mut kept: Vec<String> = Vec::new();
     let mut refused = false;
@@ -742,6 +734,8 @@ struct StartDue {
     i: usize,
     port: String,
     hello: Option<(Dialect, Duration)>,
+    /// VUGCOMSCANHOSTDESK (SR561): the name a first bind commissions on an unnamed board (none: no hello, no verb).
+    name: Option<String>,
 }
 
 impl PumpDesk {
@@ -771,7 +765,12 @@ impl PumpDesk {
                 dialect_word(d)
             )));
         }
-        Ok(StartDue { i, port: port.clone(), hello: self.hello_spec_for(d) })
+        let hello = self.hello_spec_for(d);
+        let name = match hello {
+            Some(_) if pump_core::pump::name_verb(d, "").is_some() => Some(self.name_for(port)), // VUGCOMSCANHOSTDESK (SR561)
+            _ => None,
+        };
+        Ok(StartDue { i, port: port.clone(), hello, name })
     }
 
     /// PumpStart's handback under the desk lock: the checks again (an arming may have moved while the lock was
@@ -812,7 +811,7 @@ fn request(desk: &Mutex<PumpDesk>, ev: &PumpEvent, open: &mut Opener) -> Vec<Pum
             Err(_) => refused("the pump desk is poisoned"),
         };
     }
-    open_road(desk, open, |d| d.start_due(ev).map(|u| (u.port, u.hello)), |d, res| d.started(ev, res))
+    open_road(desk, open, |d| d.start_due(ev).map(|u| (u.port, u.hello, u.name)), |d, res| d.started(ev, res)) // VUGCOMSCANHOSTDESK (SR561)
         .unwrap_or_else(|| refused("the pump desk is poisoned"))
 }
 
@@ -822,17 +821,17 @@ fn request(desk: &Mutex<PumpDesk>, ev: &PumpEvent, open: &mut Opener) -> Vec<Pum
 fn open_road(
     desk: &Mutex<PumpDesk>,
     open: &mut Opener,
-    due: impl FnOnce(&PumpDesk) -> Result<(String, Option<(Dialect, Duration)>), Vec<PumpEvent>>,
+    due: impl FnOnce(&PumpDesk) -> Result<(String, Option<(Dialect, Duration)>, Option<String>), Vec<PumpEvent>>, // VUGCOMSCANHOSTDESK (SR561): + the name
     back: impl FnOnce(&mut PumpDesk, Result<(Box<dyn Transport + Send>, Option<String>), String>) -> Vec<PumpEvent>,
 ) -> Option<Vec<PumpEvent>> {
-    let (port, spec) = {
+    let (port, spec, name) = {
         let d = desk.lock().ok()?;
         match due(&*d) {
             Ok(x) => x,
             Err(out) => return Some(out),
         }
     };
-    let res = with_hello(open(&port), spec); // the desk lock is released here
+    let res = with_hello_named(open(&port), spec, name); // the desk lock is released here (VUGCOMSCANHOSTDESK SR561: the commission too)
     let mut d = desk.lock().ok()?;
     Some(back(&mut *d, res))
 }
@@ -844,6 +843,183 @@ fn hello_on(desk: &Mutex<PumpDesk>) {
         if d.hello.is_none() {
             d.hello_within(HELLO_WAIT);
         }
+    }
+}
+
+// --- VUGCOMSCANHOSTDESK (LEDGER SR561): the one host composition and the commissioned name at a first bind (named tail hunk) ---
+
+/// Write `line` and its newline to the link within `wait` (the hello's and the commission's one writer); false when
+/// the link would not take it or closed.
+fn send_line(link: &mut dyn Transport, line: &str, wait: Duration) -> bool {
+    let mut bytes = line.as_bytes().to_vec();
+    bytes.push(b'\n');
+    let end = std::time::Instant::now() + wait;
+    let mut off = 0;
+    while off < bytes.len() {
+        match link.write(&bytes[off..]) {
+            Ok(n) if n > 0 => off += n,
+            Ok(_) if std::time::Instant::now() < end => std::thread::sleep(Duration::from_millis(10)),
+            Ok(_) | Err(_) => return false,
+        }
+    }
+    true
+}
+
+/// Commission the controller's own name: its dialect's name verb (`pump_core::pump::name_verb`: grbl `$I=<name>`)
+/// sent once, its `ok` read through the one line reader, then the hello asked again; the readback (what the
+/// controller stored: grbl upper-cases) or `None` (no verb, refused `error:N`, silent for `wait`, closed).
+pub fn commission(link: &mut dyn Transport, dialect: Dialect, name: &str, wait: Duration) -> Option<String> {
+    use pump_core::pump::{HelloLine, hello_line, name_verb};
+    let verb = name_verb(dialect, name)?;
+    if !send_line(link, &verb, wait) {
+        return None;
+    }
+    let mut refused = false;
+    let ended = lines_until(link, wait, |s| match hello_line(dialect, s) {
+        HelloLine::End => true,
+        HelloLine::Refused => {
+            refused = true;
+            true
+        }
+        HelloLine::Keep | HelloLine::Other => false,
+    });
+    match ended {
+        Ok(Some(_)) if !refused => hello(link, dialect, wait),
+        _ => None,
+    }
+}
+
+/// [`with_hello`], then at a first bind (`name` set) on a board whose answer carries no name
+/// (`pump_core::pump::hello_name` is `Some("")`) the commission, whose readback replaces the answer; a refused
+/// commission keeps the unnamed answer (the reopen then compares by the build, VUGCOMSCANHELLOID's behaviour).
+pub fn with_hello_named(
+    res: Result<Box<dyn Transport + Send>, String>,
+    spec: Option<(Dialect, Duration)>,
+    name: Option<String>,
+) -> Result<(Box<dyn Transport + Send>, Option<String>), String> {
+    let (mut l, said) = with_hello(res, spec)?;
+    let said = match (spec, name, said) {
+        (Some((d, w)), Some(n), Some(s)) if pump_core::pump::hello_name(d, &s) == Some("") => {
+            Some(commission(&mut *l, d, &n, w).unwrap_or(s))
+        }
+        (_, _, s) => s,
+    };
+    Ok((l, said))
+}
+
+/// The name a first bind commissions: `UNA-` and the last 8 letters / digits of the USB serial (upper-cased) when the
+/// device identity (`tty:usb:vvvv:pppp:serial`) carries at least 4, else 8 upper hex digits hashed from the port and
+/// `nonce` (a CH340 board, tcp and ws carry no serial; the nonce keeps two unnamed boards bound at one port apart).
+pub fn commission_name(identity: Option<&str>, port: &str, nonce: u64) -> String {
+    let serial: String = identity
+        .and_then(|id| id.splitn(5, ':').nth(4))
+        .unwrap_or("")
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_uppercase())
+        .collect();
+    let id = if serial.len() >= 4 {
+        serial[serial.len().saturating_sub(8)..].to_string()
+    } else {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        port.hash(&mut h);
+        nonce.hash(&mut h);
+        format!("{:08X}", h.finish() as u32)
+    };
+    format!("UNA-{id}")
+}
+
+/// A nonce per commission: the wall clock's nanoseconds and a process counter.
+fn name_nonce() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    nanos ^ COUNT.fetch_add(1, Ordering::Relaxed).rotate_left(32)
+}
+
+impl PumpDesk {
+    /// The name a first bind at `port` would commission (the identity hook's device, when set).
+    fn name_for(&self, port: &str) -> String {
+        let identity = self.identify.as_ref().and_then(|f| f(port));
+        commission_name(identity.as_deref(), port, name_nonce())
+    }
+}
+
+/// The dialect the host desk's openers wait for (tcp and ws are grbl-family links; owed VUG-COMSCAN-HOSTDIALECT).
+pub const HOST_DIALECT: Dialect = Dialect::Grbl { laser: false };
+
+/// The host desk's tick (the tests' serve_pump tick).
+pub const PUMP_TICK: Duration = Duration::from_millis(5);
+
+/// THE composition of a desk and its opener: `machine` behind the ports, the identity hook, the hello on at
+/// [`HELLO_WAIT`] (so a first bind commissions), and the opener routed ws / tcp / the rest
+/// (`with_ws(ws, by_scheme(serial, tcp))`).
+pub fn compose(
+    machine: Machine,
+    identify: Box<Identify>,
+    serial: Box<Opener>,
+    tcp: Box<Opener>,
+    ws: Box<Opener>,
+) -> (PumpDesk, Box<Opener>) {
+    let mut desk = PumpDesk::new(machine);
+    desk.identify_by(identify);
+    desk.hello_within(HELLO_WAIT);
+    (desk, with_ws(ws, by_scheme(serial, tcp)))
+}
+
+/// [`compose`] over the host's own links: `crate::tty::identify`, the serial port at grbl 1.1's default 115200 with
+/// no flow control, tcp and ws within their connect waits, every opener made ready for [`HOST_DIALECT`].
+pub fn host_parts(machine: Machine) -> (PumpDesk, Box<Opener>) {
+    compose(
+        machine,
+        host_identify(),
+        host_serial(),
+        crate::tcp::opener(HOST_DIALECT, crate::tcp::CONNECT_WAIT),
+        crate::ws::opener(HOST_DIALECT, crate::ws::CONNECT_WAIT),
+    )
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn host_identify() -> Box<Identify> {
+    crate::tty::identify()
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn host_identify() -> Box<Identify> {
+    Box::new(|_: &str| -> Option<String> { None })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn host_serial() -> Box<Opener> {
+    crate::tty::opener(crate::tty::Baud::B115200, crate::tty::Flow::None, HOST_DIALECT)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn host_serial() -> Box<Opener> {
+    Box::new(|port: &str| -> Result<Box<dyn Transport + Send>, String> { Err(format!("no serial ports on this host: {port}")) })
+}
+
+/// The machine a vessel's desk declares until one is declared (owed VUG-COMSCAN-MACHINE-DECLARE): no axes, no tools, a
+/// zero envelope. Nothing arms it in a vessel (arming is in process only), and a Helm pass for any real machine is
+/// refused `Refused::WrongMachine` by both identities.
+pub fn undeclared_machine() -> Machine {
+    use make_core::{Aabb3, Kinematics, MachineKind, Power, PowerKind, Units, Vec3};
+    Machine {
+        kind: MachineKind::Mill3,
+        kinematics: Kinematics::Cartesian,
+        axes: Vec::new(),
+        power: Power { kind: PowerKind::Spindle, max: 0.0, ask_above: 0.0 },
+        envelope: Aabb3 { min: Vec3::new(0.0, 0.0, 0.0), max: Vec3::new(0.0, 0.0, 0.0) },
+        safe_z: 0.0,
+        units: Units::Mm,
+        tools: Vec::new(),
+        stock: None,
+        fixtures: Vec::new(),
+        loaded: None,
     }
 }
 
@@ -1160,5 +1336,39 @@ mod tests {
             let _ = open("mock");
         }
         assert_eq!(seen.lock().unwrap().last(), Some(&false), "the probe reads a held lock as held");
+    }
+
+    // --- VUGCOMSCANHOSTDESK (SR561): host_parts is compose over the host's links; the commissioned name's shape ---
+
+    #[test]
+    fn host_parts_is_the_one_composition() {
+        let why = |r: Result<Box<dyn Transport + Send>, String>| r.err().unwrap_or_default();
+        let (desk, mut open) = host_parts(machine());
+        assert!(desk.identify.is_some(), "the identity hook is set");
+        assert_eq!(desk.hello_spec_for(GRBL), Some((GRBL, HELLO_WAIT)), "the hello is on, so a first bind commissions");
+        assert_eq!(desk.machine(), &machine());
+        assert!(why(open("wss://127.0.0.1:1/")).contains("VUG-COMSCAN-WSS"), "wss:// goes to the ws arm");
+        if cfg!(target_os = "linux") {
+            let e = why(open("/dev/comscan-hostdesk-no-such-port"));
+            assert!(e.starts_with("no such port"), "a /dev path goes to the tty arm: {e}");
+        }
+
+        let arm = |name: &'static str| -> Box<Opener> {
+            Box::new(move |port: &str| -> Result<Box<dyn Transport + Send>, String> { Err(format!("{name} {port}")) })
+        };
+        let (d, mut open) = compose(machine(), Box::new(|_: &str| -> Option<String> { None }), arm("serial"), arm("tcp"), arm("ws"));
+        assert_eq!(d.hello_spec_for(GRBL), desk.hello_spec_for(GRBL));
+        assert_eq!(why(open("ws://h:81/")), "ws ws://h:81/");
+        assert_eq!(why(open("wss://h:443/")), "ws wss://h:443/");
+        assert_eq!(why(open("tcp://h:23")), "tcp tcp://h:23");
+        assert_eq!(why(open("/dev/ttyUSB0")), "serial /dev/ttyUSB0");
+
+        assert_eq!(commission_name(Some("tty:usb:0403:6001:a50285bi"), "/dev/ttyUSB0", 1), "UNA-A50285BI");
+        assert_eq!(commission_name(Some("tty:usb:2341:0043:7573530303035161D0A1"), "/dev/ttyACM0", 1), "UNA-5161D0A1");
+        let a = commission_name(Some("tty:usb:1a86:7523"), "/dev/ttyUSB0", 1);
+        let b = commission_name(Some("tty:usb:1a86:7523"), "/dev/ttyUSB0", 2);
+        assert!(a.len() == 12 && a.starts_with("UNA-") && a != b, "{a} {b}");
+        assert!(a[4..].chars().all(|c| c.is_ascii_digit() || c.is_ascii_uppercase()), "{a}");
+        assert_ne!(undeclared_machine().digest(), machine().digest(), "the undeclared machine is no real machine");
     }
 }
