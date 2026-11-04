@@ -107,6 +107,7 @@ fn a_radius_too_large_is_named_at_the_edge_and_the_body_is_unchanged() {
     let b = body(&vw);
     assert_eq!(b.breps[0].faces.len(), 6);
     assert!((b.volume().unwrap() - 1000.0).abs() < 1e-9, "the body is unchanged");
+    assert!(key(&mut vw, "\u{7f}") && vw.view.fillet.as_ref().unwrap().buffer == "1", "VUGFACEFIELDKEYSREST (SR605): the one-char Backspace erases as BackSpace does");
     assert!(key(&mut vw, "Escape"));
     assert!(vw.view.fillet.is_none(), "Esc cancels");
 }

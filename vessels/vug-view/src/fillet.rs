@@ -145,22 +145,18 @@ pub fn key(view: &mut View, model: &Model, k: &str) -> Option<bool> {
         return Some(true);
     }
     let tool = view.fillet.as_mut()?;
-    if matches!(k, "Escape" | "\u{1b}") {
+    use crate::sketch::FieldKey;
+    let fk = FieldKey::of(k); // VUGFACEFIELDKEYSREST (SR605): the one key-name table, read once
+    if fk == Some(FieldKey::Escape) {
         view.fillet = None;
         return Some(true);
     }
-    if matches!(k, "Return" | "KP_Enter" | "\r" | "\n") {
+    if fk == Some(FieldKey::Enter) {
         commit(view);
         return Some(true);
     }
-    let back = matches!(k, "BackSpace" | "Backspace" | "\u{8}" | "\u{7f}");
-    let ch = {
-        let mut it = k.chars();
-        match (it.next(), it.next()) {
-            (Some(c), None) => Some(c),
-            _ => None,
-        }
-    };
+    let back = fk == Some(FieldKey::Backspace);
+    let ch = crate::sketch::field_char(k); // VUGFACEFIELDKEYSREST (SR605): the one typed char
     // VUGFACETREEEDITR (SR528): THE pair road (journal.rs `type_pair`, the panel's too); a `,` is always consumed here.
     if !crate::journal::type_pair(&mut tool.buffer, ch, back, tool.mode == Mode::Chamfer) && ch != Some(',') {
         return None;
