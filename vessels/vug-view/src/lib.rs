@@ -135,7 +135,7 @@ impl Viewer {
         let (title, mesh) = read_scan(scan)?; // VUGFACEDEVIATIONSOLIDFAULT (SR565): the one scan reader, shared with open_scan
         let text = std::fs::read_to_string(design).map_err(|e| format!("{design}: {e}"))?;
         let doc = doc_core::read_with(&text, &doc_host::DirLib::beside(std::path::Path::new(design))).map_err(|e| format!("{design}: {e:?}"))?; // VUGMAKEMACHINELIBFACE (SR548)
-        Viewer::open_deviation(deviation::scan_mesh(mesh), &doc, &title, size, preset, None).map_err(|e| format!("{design}: {e}")) // VUGFACEGDTREMEASURE (SR560): a PLY carries no truncation
+        Viewer::open_deviation(deviation::scan_mesh(mesh), &doc, &title, size, preset, None).map_err(|e| format!("{design}: {e}")).map(|mut v| { v.hold_names(Some(title.as_str()), Some(design)); v }) // VUGFACEGDTREPORTKEY (SR575): the scan's name and the design path held for the report; VUGFACEGDTREMEASURE (SR560): a PLY carries no truncation
     }
 
     /// VUGFACEDEVIATION (SR525): a scan measured against `doc` at `deviation::BAND_MM` (the test door): the model is the
@@ -390,9 +390,9 @@ impl Viewer {
             return Err(format!("{part}: --scan opens a .vug part"));
         }
         let title = p.file_name().and_then(|s| s.to_str()).unwrap_or("vug").to_string();
-        let (_, mesh) = read_scan(scan)?;
+        let (sname, mesh) = read_scan(scan)?; // VUGFACEGDTREPORTKEY (SR575): the scan's file name kept
         let mut v = Viewer::open_vug(part, &title, size, preset)?;
-        v.against_journal(deviation::scan_mesh(mesh)).map_err(|e| format!("{part}: {e}"))?;
+        v.against_journal(deviation::scan_mesh(mesh)).map_err(|e| format!("{part}: {e}"))?; v.hold_names(Some(sname.as_str()), None); // VUGFACEGDTREPORTKEY (SR575): the report header names the scan
         Ok(v)
     }
 }
