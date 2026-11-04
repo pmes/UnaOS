@@ -232,6 +232,8 @@ pub struct PumpDesk {
     identify: Option<Box<Identify>>,
     /// VUGCOMSCANHELLOID (SR546): the wait for the identity answer when the hello is on (`hello_within`); none: off.
     hello: Option<Duration>,
+    /// VUGCOMSCANALARMIDLE (SR591): the controller's travel is read at a first open (`envelope_read`); off by default.
+    envelope: bool,
 }
 
 fn refused(why: impl Into<String>) -> Vec<PumpEvent> {
@@ -241,7 +243,7 @@ fn refused(why: impl Into<String>) -> Vec<PumpEvent> {
 impl PumpDesk {
     /// A desk for `machine`: every pass it arms must name this machine's identity (VUG-HELM-BIND-MACHINE).
     pub fn new(machine: Machine) -> PumpDesk {
-        PumpDesk { machine, armed: Vec::new(), running: None, identify: None, hello: None }
+        PumpDesk { machine, armed: Vec::new(), running: None, identify: None, hello: None, envelope: false }
     }
 
     /// The machine this desk drives.
@@ -303,7 +305,7 @@ impl PumpDesk {
             // lock released (`request` over `open_road`, the redial's road).
             PumpEvent::PumpStart { .. } => match self.start_due(ev) {
                 Ok(u) => {
-                    let res = with_hello_named(open(&u.port, u.dialect), u.hello, u.name); // VUGCOMSCANHOSTDESK (SR561); VUGCOMSCANHOSTDIALECT (SR566)
+                    let res = with_envelope(with_hello_named(open(&u.port, u.dialect), u.hello, u.name), u.envelope); // VUGCOMSCANHOSTDESK (SR561); VUGCOMSCANHOSTDIALECT (SR566); VUGCOMSCANALARMIDLE (SR591)
                     self.started(ev, res)
                 }
                 Err(out) => out,
@@ -571,7 +573,7 @@ impl PumpDesk {
     /// run is still lost and link-less; otherwise the new link is dropped and nothing is said.
     pub fn relinked(&mut self, now_us: u64, res: Result<Box<dyn Transport + Send>, String>) -> Vec<PumpEvent> {
         let spec = self.hello_spec(); // VUGCOMSCANHELLOID (SR546): the reopened link says who it is first
-        self.relinked_said(now_us, with_hello(res, spec).map(|(l, s)| (l, s, None))) // VUGCOMSCANJOG (SR573): a reopen never commissions
+        self.relinked_said(now_us, with_hello(res, spec).map(|(l, s)| (l, s, None, None))) // VUGCOMSCANJOG (SR573): a reopen never commissions; VUGCOMSCANALARMIDLE (SR591): nor reads the envelope
     }
 
     /// [`PumpDesk::relinked`] with the reopened link's identity answer beside it (VUGCOMSCANHELLOID, SR546): an answer
@@ -588,7 +590,7 @@ impl PumpDesk {
             return Vec::new();
         }
         let word = match res {
-            Ok((link, now, _)) if r.hello.is_some() && now != r.hello => {
+            Ok((link, now, _, _)) if r.hello.is_some() && now != r.hello => {
                 drop(link); // another board: its link (a tty's exclusive fd) goes at once
                 let k = d.attempt();
                 d.failed(now_us);
@@ -596,7 +598,7 @@ impl PumpDesk {
                 let was = r.hello.clone().unwrap_or_default();
                 format!("reconnect attempt {k} refused: {:?}; attempt {} in {} ms", Refused::AnotherBoard { was, now }, d.attempt(), d.wait_us() / 1000)
             }
-            Ok((link, _, _)) => {
+            Ok((link, _, _, _)) => {
                 r.link = Some(link);
                 r.redial = None;
                 format!("relinked on attempt {}; re-arm to resume from line {at_line}", d.attempt())
@@ -644,7 +646,7 @@ async fn redial(synapse: &Synapse, desk: &Mutex<PumpDesk>, open: &mut Box<Opener
     let out = open_road(
         desk,
         open,
-        |d| d.redial_due(now).zip(d.running_dialect()).map(|(port, dl)| (port, dl, d.hello_spec(), None)).ok_or_else(Vec::new), // VUGCOMSCANHOSTDESK (SR561): a reopen never commissions; VUGCOMSCANHOSTDIALECT (SR566): the run's dialect
+        |d| d.redial_due(now).zip(d.running_dialect()).map(|(port, dl)| (port, dl, d.hello_spec(), None, None)).ok_or_else(Vec::new), // VUGCOMSCANHOSTDESK (SR561): a reopen never commissions (VUGCOMSCANALARMIDLE SR591: nor reads the envelope); VUGCOMSCANHOSTDIALECT (SR566): the run's dialect
         |d, res| d.relinked_said(t0.elapsed().as_micros() as u64, res),
     )
     .await
@@ -749,6 +751,8 @@ struct StartDue {
     name: Option<String>,
     /// VUGCOMSCANHOSTDIALECT (SR566): the PumpStart's dialect, handed to the opener (its banner key).
     dialect: Dialect,
+    /// VUGCOMSCANALARMIDLE (SR591): the travel read to run after the hello (none: the read is off).
+    envelope: Option<(Dialect, Duration)>,
 }
 
 impl PumpDesk {
@@ -783,7 +787,7 @@ impl PumpDesk {
             Some(_) if pump_core::pump::name_verb(d, "").is_some() => Some(self.name_for(port)), // VUGCOMSCANHOSTDESK (SR561)
             _ => None,
         };
-        Ok(StartDue { i, port: port.clone(), hello, name, dialect: d }) // VUGCOMSCANHOSTDIALECT (SR566)
+        Ok(StartDue { i, port: port.clone(), hello, name, dialect: d, envelope: self.envelope_spec_for(d) }) // VUGCOMSCANHOSTDIALECT (SR566); VUGCOMSCANALARMIDLE (SR591)
     }
 
     /// PumpStart's handback under the desk lock: the checks again (an arming may have moved while the lock was
@@ -799,7 +803,7 @@ impl PumpDesk {
             Err(out) => return out, // a live link in `res` is dropped here (a tty's exclusive fd released)
         };
         let port = u.port;
-        let (link, said, before) = match res {
+        let (link, said, before, env) = match res { // VUGCOMSCANALARMIDLE (SR591): + the travel read
             Ok(x) => x,
             Err(e) => return refused(format!("port {port:?}: {e}")),
         };
@@ -811,6 +815,9 @@ impl PumpDesk {
         let mut out = vec![self.squawk(Some("started".to_string()))];
         if let Some(h) = before.or(said) {
             out.push(self.squawk(Some(format!("hello {h}")))); // printed once, at the first open (VUGCOMSCANJOG SR573: as the controller first said it)
+        }
+        for w in self.envelope_words(env) {
+            out.push(self.squawk(Some(w))); // VUGCOMSCANALARMIDLE (SR591): a travel that differs from the declared machine, said once
         }
         if let Some(name) = commissioned {
             out.push(PumpEvent::Commissioned { port, name }); // VUGCOMSCANJOG (SR573): the EEPROM write, its own word, once
@@ -828,7 +835,7 @@ async fn request(desk: &Mutex<PumpDesk>, ev: &PumpEvent, open: &mut Box<Opener>)
             Err(_) => refused("the pump desk is poisoned"),
         };
     }
-    open_road(desk, open, |d| d.start_due(ev).map(|u| (u.port, u.dialect, u.hello, u.name)), |d, res| d.started(ev, res)) // VUGCOMSCANHOSTDESK (SR561); VUGCOMSCANHOSTDIALECT (SR566)
+    open_road(desk, open, |d| d.start_due(ev).map(|u| (u.port, u.dialect, u.hello, u.name, u.envelope)), |d, res| d.started(ev, res)) // VUGCOMSCANHOSTDESK (SR561); VUGCOMSCANHOSTDIALECT (SR566)
         .await
         .unwrap_or_else(|| refused("the pump desk is poisoned"))
 }
@@ -841,17 +848,17 @@ async fn request(desk: &Mutex<PumpDesk>, ev: &PumpEvent, open: &mut Box<Opener>)
 async fn open_road(
     desk: &Mutex<PumpDesk>,
     open: &mut Box<Opener>,
-    due: impl FnOnce(&PumpDesk) -> Result<(String, Dialect, Option<(Dialect, Duration)>, Option<String>), Vec<PumpEvent>>, // VUGCOMSCANHOSTDESK (SR561): + the name; VUGCOMSCANHOSTDIALECT (SR566): + the dialect
+    due: impl FnOnce(&PumpDesk) -> Result<(String, Dialect, Option<(Dialect, Duration)>, Option<String>, Option<(Dialect, Duration)>), Vec<PumpEvent>>, // VUGCOMSCANHOSTDESK (SR561): + the name; VUGCOMSCANHOSTDIALECT (SR566): + the dialect; VUGCOMSCANALARMIDLE (SR591): + the travel read
     back: impl FnOnce(&mut PumpDesk, Result<Opened, String>) -> Vec<PumpEvent>, // VUGCOMSCANJOG (SR573): Opened
 ) -> Option<Vec<PumpEvent>> {
-    let (port, dialect, spec, name) = {
+    let (port, dialect, spec, name, envelope) = {
         let d = desk.lock().ok()?;
         match due(&*d) {
             Ok(x) => x,
             Err(out) => return Some(out),
         }
     };
-    let res = open_blocking(open, port, dialect, spec, name).await; // the desk lock is released here (VUGCOMSCANHOSTDESK SR561: the commission too; VUGCOMSCANHOSTDIALECT (SR566): on the blocking pool)
+    let res = open_blocking(open, port, dialect, spec, name, envelope).await; // the desk lock is released here (VUGCOMSCANHOSTDESK SR561: the commission too; VUGCOMSCANHOSTDIALECT (SR566): on the blocking pool)
     let mut d = desk.lock().ok()?;
     Some(back(&mut *d, res))
 }
@@ -928,7 +935,7 @@ pub fn with_hello_named(
         }
         (_, _, s) => (s, None),
     };
-    Ok((l, said, before))
+    Ok((l, said, before, None)) // VUGCOMSCANALARMIDLE (SR591): the travel slot is filled by with_envelope
 }
 
 /// The name a first bind commissions: `UNA-` and the last 8 letters / digits of the USB serial (upper-cased) when the
@@ -1057,10 +1064,11 @@ async fn open_blocking(
     dialect: Dialect,
     spec: Option<(Dialect, Duration)>,
     name: Option<String>,
+    envelope: Option<(Dialect, Duration)>, // VUGCOMSCANALARMIDLE (SR591)
 ) -> Result<Opened, String> { // VUGCOMSCANJOG (SR573): Opened
     let mut op = std::mem::replace(open, opener_lost());
     let job = tokio::task::spawn_blocking(move || {
-        let res = with_hello_named(op(&port, dialect), spec, name);
+        let res = with_envelope(with_hello_named(op(&port, dialect), spec, name), envelope); // VUGCOMSCANALARMIDLE (SR591)
         (op, res)
     });
     match job.await {
@@ -1090,8 +1098,9 @@ impl PumpDesk {
 
 /// An opener's answer after the hello ([`with_hello_named`]): the link, the identity the run keeps (a commission's
 /// readback, else the answer) and the answer as the controller first said it, `Some` only when a commission acked and was
-/// read back.
-pub type Opened = (Box<dyn Transport + Send>, Option<String>, Option<String>);
+/// read back. VUGCOMSCANALARMIDLE (SR591): the fourth slot is the controller's travel ([`with_envelope`]), `Some` only when
+/// the read is on and answered.
+pub type Opened = (Box<dyn Transport + Send>, Option<String>, Option<String>, Option<Envelope>);
 
 /// The wait for the link to take one home / jog line (a few bytes; the answer is read by [`PumpDesk::tick`]).
 pub const MOTION_WAIT: Duration = Duration::from_millis(100);
@@ -1278,11 +1287,13 @@ impl PumpDesk {
         if let Err(e) = r.pump.stop(&mut **link) {
             return Some(refused(format!("reset: {e:?}")));
         }
-        r.unlock = pump_core::pump::unlock_line(r.pump.dialect()).is_some();
+        let grbl = matches!(r.pump.dialect(), Dialect::Grbl { .. }); // VUGCOMSCANALARMIDLE (SR591): only grbl's reset says a banner to wait on
+        r.unlock = grbl && pump_core::pump::unlock_line(r.pump.dialect()).is_some();
         r.jogged = false;
         r.motion.clear();
         r.redial = None;
-        Some(vec![self.squawk(Some("reset sent".to_string()))])
+        let word = if grbl { Some("reset sent".to_string()) } else { send_unlock(r) }; // VUGCOMSCANALARMIDLE (SR591): Marlin has no reset: its unlock at once
+        Some(vec![self.squawk(Some(word.unwrap_or_else(|| "stop".to_string())))])
     }
 
     /// [`PumpDesk::tick`]'s events after the alarm reset: the controller's banner ([`pump_core::pump::banner_key`] in a
@@ -1300,13 +1311,7 @@ impl PumpDesk {
             return None;
         }
         r.unlock = false;
-        let line = pump_core::pump::unlock_line(d)?;
-        let link = r.link.as_mut()?;
-        if !send_line(&mut **link, line, MOTION_WAIT) {
-            return Some(format!("unlock: the link would not take {line:?}"));
-        }
-        r.motion.push_back(Motion { word: "unlock", last: true, failed: false });
-        Some(format!("unlock sent: {line}"))
+        send_unlock(r) // VUGCOMSCANALARMIDLE (SR591): the one unlock writer
     }
 }
 
@@ -1320,10 +1325,9 @@ fn jog_past_travel(m: &Machine, delta: [f64; 3]) -> Option<String> {
         if v == 0.0 {
             continue;
         }
-        let Some(a) = m.axes.iter().find(|a| a.id == id) else {
+        let Some(travel) = axis_travel(m, id) else { // VUGCOMSCANALARMIDLE (SR591): the one travel
             return Some(format!("jog: {c}{v} on an axis the declared machine does not have"));
         };
-        let travel = a.max - a.min;
         if v.abs() > travel {
             return Some(format!(
                 "jog: {c}{v} is past the declared {c} travel {travel} (the position is not polled outside a job: the jog's delta is bounded)"
@@ -1331,6 +1335,102 @@ fn jog_past_travel(m: &Machine, delta: [f64; 3]) -> Option<String> {
         }
     }
     None
+}
+
+// --- VUGCOMSCANALARMIDLE (LEDGER SR591): the controller's travel read once at a first open and checked against the declared machine; the one unlock writer (named tail hunk) ---
+
+/// The controller's own travel, X / Y / Z in mm (grbl `$130`-`$132`); `None` for an axis the answer did not carry.
+pub type Envelope = [Option<f64>; 3];
+
+/// Ask the controller its travel: its dialect's verb (`pump_core::pump::envelope_verb`: grbl `$$`) sent once through
+/// [`send_line`], the answer read through the one line reader to its end (`pump_core::pump::hello_line`: `ok` / a refusal)
+/// and every `$130`-`$132` line kept (`pump_core::pump::envelope_setting`). `None`: no verb, the link would not take it,
+/// the controller refused it, went silent for `wait` or closed.
+pub fn envelope(link: &mut dyn Transport, dialect: Dialect, wait: Duration) -> Option<Envelope> {
+    use pump_core::pump::{HelloLine, envelope_setting, envelope_verb, hello_line};
+    let verb = envelope_verb(dialect)?;
+    if !send_line(link, verb, wait) {
+        return None;
+    }
+    let mut got: Envelope = [None; 3];
+    let mut refused = false;
+    let ended = lines_until(link, wait, |s| {
+        if let Some((i, v)) = envelope_setting(dialect, s) {
+            got[i] = Some(v);
+        }
+        match hello_line(dialect, s) {
+            HelloLine::End => true,
+            HelloLine::Refused => {
+                refused = true;
+                true
+            }
+            HelloLine::Keep | HelloLine::Other => false,
+        }
+    });
+    match ended {
+        Ok(Some(_)) if !refused => Some(got),
+        _ => None,
+    }
+}
+
+/// An opener's answer after the hello with the travel read run on its link when `read` (dialect, wait) is set (the
+/// fourth [`Opened`] slot); the slot `None` otherwise.
+pub fn with_envelope(res: Result<Opened, String>, read: Option<(Dialect, Duration)>) -> Result<Opened, String> {
+    res.map(|(mut l, said, before, _)| {
+        let env = read.and_then(|(d, w)| envelope(&mut *l, d, w));
+        (l, said, before, env)
+    })
+}
+
+impl PumpDesk {
+    /// Turn the travel read on (or off): every later PumpStart asks the controller its travel after the hello and says a
+    /// travel that differs from the declared machine's once (`envelope differs axis=<a> declared=<d> controller=<c>`); the
+    /// declared machine stays the jog's bound. Off by default (owed VUG-COMSCAN-ENVELOPE-READ-ON).
+    pub fn envelope_read(&mut self, on: bool) {
+        self.envelope = on;
+    }
+
+    /// The travel read for a start in `d`: the hello's wait, else [`HELLO_WAIT`]; `None` while the read is off.
+    fn envelope_spec_for(&self, d: Dialect) -> Option<(Dialect, Duration)> {
+        self.envelope.then(|| (d, self.hello.unwrap_or(HELLO_WAIT)))
+    }
+
+    /// One word per axis both declared and read whose travel differs at grbl's printed resolution (three decimals), the
+    /// numbers in make_core's one grammar (`make_core::gcode::num`).
+    fn envelope_words(&self, env: Option<Envelope>) -> Vec<String> {
+        use make_core::AxisId;
+        let Some(env) = env else { return Vec::new() };
+        let mut out = Vec::new();
+        for (i, (id, c)) in [(AxisId::X, 'X'), (AxisId::Y, 'Y'), (AxisId::Z, 'Z')].into_iter().enumerate() {
+            let (Some(declared), Some(controller)) = (axis_travel(&self.machine, id), env[i]) else { continue };
+            if format!("{declared:.3}") == format!("{controller:.3}") {
+                continue;
+            }
+            let (mut d, mut k) = (String::new(), String::new());
+            make_core::gcode::num(&mut d, declared);
+            make_core::gcode::num(&mut k, controller);
+            out.push(format!("envelope differs axis={c} declared={d} controller={k}"));
+        }
+        out
+    }
+}
+
+/// The one unlock writer: the dialect's unlock line ([`pump_core::pump::unlock_line`]) through [`send_line`], queued as the
+/// `unlock` verb so its `ok` is claimed by [`PumpDesk::motion_replies`] (said `unlocked`); said `unlock sent: <line>`.
+/// Called at grbl's banner after the reset and at once for Marlin (no reset). `None`: no unlock line or the link is down.
+fn send_unlock(r: &mut Running) -> Option<String> {
+    let line = pump_core::pump::unlock_line(r.pump.dialect())?;
+    let link = r.link.as_mut()?;
+    if !send_line(&mut **link, line, MOTION_WAIT) {
+        return Some(format!("unlock: the link would not take {line:?}"));
+    }
+    r.motion.push_back(Motion { word: "unlock", last: true, failed: false });
+    Some(format!("unlock sent: {line}"))
+}
+
+/// The declared machine's travel on axis `id` (`max - min`, the SR498 machine behind the desk); `None`: not declared.
+fn axis_travel(m: &Machine, id: make_core::AxisId) -> Option<f64> {
+    m.axes.iter().find(|a| a.id == id).map(|a| a.max - a.min)
 }
 
 #[cfg(test)]

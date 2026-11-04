@@ -1407,3 +1407,15 @@ exec-rmbp-f39veilheldarm c97597481 FOLDED (kernel batch B1139-B1144 (+B1136-B113
 exec-rmbp-f39hidphaselock c97597481 FOLDED (kernel batch B1139-B1144 (+B1136-B1138 carried))
 exec-rmbp-f39unafswarmsinceboot 1b9cd08a4 FOLDED (kernel batch B1139-B1144 (+B1136-B1138 carried))
 exec-rmbp-f39menuscraftdocs c97597481 FOLDED (kernel batch B1139-B1144 (+B1136-B1138 carried))
+exec-rmbp-vugfacecommandcaret 8d44a76ca wave36 cut56
+exec-rmbp-vugphotopreffacewire 8d44a76ca wave36 cut56
+exec-rmbp-vugintentsetfacelistrows 8d44a76ca wave36 cut56
+exec-rmbp-vugfacejournalfaultfixref 8d44a76ca wave36 cut56
+exec-rmbp-vugcomscanalarmidle 8d44a76ca wave36 cut56
+exec-rmbp-vugfaceconfidencetint 8d44a76ca wave36 cut56
+exec-rmbp-f39arrowdocs a206e40a3 wave36 cut57
+exec-rmbp-f39veilbootstorer3 a206e40a3 wave36 cut57
+exec-rmbp-f39a11ybootset a206e40a3 wave36 cut57
+exec-rmbp-f39hidlockwho a206e40a3 wave36 cut57
+exec-rmbp-f39armsplitorin a206e40a3 wave36 cut57
+exec-rmbp-f39machinestoreacl a206e40a3 wave36 cut57
