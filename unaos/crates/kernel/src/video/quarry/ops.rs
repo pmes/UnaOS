@@ -351,34 +351,27 @@ fn menu_hover(g: &Geom, x: usize, y: usize) -> Option<usize> {
 }
 
 /// MENUS2 (B652) — **Quarry's file-ops menu on the sheet** (MENUSCRAFT §9), painted IN Quarry's own surface `px`
-/// (source px, stride `g.w`) at `(x, y)` through the kit (`video::draw`): the `elev.2` lift as two `shadow_rrect`
-/// layers in `theme::shadow_soft()` (the mapped `elev.2` ink for an overlay outside crystal, MENUSCRAFT §7's toast ×
-/// row; the tight layer at two thirds of it, elev.2's own tight:wide ratio), the `surface.overlay` body at
-/// `radius.overlay` with all four corners round (a context menu floats), the `line.subtle` hairline, the hovered
-/// item's `sheet::pill`, the labels in `text.primary` (`on_accent` on the pill), and `sheet::seal_row` over every
-/// row of the outer rect (no pure white: MENU-UNDER). `sheet::row` is not used: its `Under` is a scene ESTIMATE in
-/// panel coordinates, and here the pixels beneath the band are Quarry's own, already in `px` — the shadow blends
-/// over the TRUE scene (MENUSCRAFT §4's exactness, where the owner holds the pixels).
+/// (source px, stride `g.w`) at `(x, y)`: the band is `sheet::row` itself, row by row over the outer rect, with
+/// `sheet::Under::own()` (the pixels beneath the band are Quarry's own, already in `px`, so the `elev.2` shadow blends
+/// over the TRUE scene — MENUSCRAFT §4's exactness, where the owner holds the pixels) and all four corners round (a
+/// context menu floats: dock `menu_box`'s call shape); then the hovered item's `sheet::pill`, the labels in
+/// `text.primary` (`on_accent` on the pill), and `sheet::seal_row` over every row of the outer rect (no pure white:
+/// MENU-UNDER). MENUBANDONE (rmbp-ledger B1112, the seat's ink ruling): ONE band painter — the sheet's ink (the
+/// `elev.2` pair and, in Dark, the inner rim) is the house look; this menu keeps no shadow constants of its own.
 fn menu_paint(px: &mut [u32], g: &Geom, x: usize, y: usize, hover: Option<usize>) {
-    use crate::video::{crystal::sheet, draw};
+    use crate::video::crystal::sheet;
     let (w, h) = (menu_w(g), menu_h(g));
-    let (bw, bh, pady) = menu_body(g);
+    let (bw, _, pady) = menu_body(g);
     let rh = g.row_h();
     if x + w > g.w || y + h > g.h || px.len() < g.w * g.h || bw <= 2 * sheet::INSET() {
         return;
     }
-    let rad = sheet::RADIUS().min(bw as i32 / 2).min(bh as i32 / 2).max(0);
     {
-        let mut s = draw::Surf::new(&mut px[..g.w * g.h], g.w);
-        let b = draw::Rect::new(x as i32, y as i32, bw as i32, bh as i32);
-        let band = sheet::BAND() as i32;
-        let drop = (crate::ui::px(3) as i32).min(band - 1).max(0);
-        let wide = theme::shadow_soft();
-        let tight = ((wide >> 24) * 2 / 3) << 24;
-        draw::shadow_rrect(&mut s, b.offset(0, drop), rad, (band - drop).max(1), wide);
-        draw::shadow_rrect(&mut s, b, rad, (crate::ui::px(2) as i32).min(band).max(1), tight);
-        draw::fill_rrect(&mut s, b, rad, sheet::surface_overlay());
-        draw::stroke_rrect(&mut s, b, rad, 1, draw::Ink::argb(sheet::line_subtle()));
+        let under = sheet::Under::own(); // MENUBANDONE (B1112): the band through the sheet's one painter
+        for j in 0..h {
+            let o = (y + j) * g.w + x;
+            sheet::row(&mut px[o..o + w], (x, y, w, h), j, &under, false);
+        }
     }
     let (rows, more) = menu_fit(g); // QUARRYMENUFIT (B1107)
     for (i, it) in ITEMS.iter().enumerate().take(rows) {
@@ -406,7 +399,11 @@ fn menu_paint(px: &mut [u32], g: &Geom, x: usize, y: usize, hover: Option<usize>
 /// different fills (`surface.content`, then the accent). Menu ok: the body's centre is `surface.overlay`, the pill
 /// sits inside the inset (accent at the body's right inner edge, the face outside the inset), no pure white in the
 /// outer rect. Band exact: the band pixel beside the body is darker than its own fill in BOTH surfaces and differs
-/// between them — the shadow blended over the true pixels beneath, not over an estimate.
+/// between them — the shadow blended over the true pixels beneath, not over an estimate — and (MENUBANDONE B1112) it
+/// equals the same pixel of a reference `sheet::row` row over the same fill (`Under::own`, sealed): the band IS the
+/// sheet's ink, so a second band painter reds it. The arithmetic at `(bw + 1, bh / 2)` (the straight edge, 6 quarter
+/// px outside): the wide layer's peak x 0.282 (light 46 -> 13, dark 115 -> 32), the tight layer's x 0.043 (light
+/// 31 -> 1, dark 77 -> 3), so the pixel is strictly darker than either fill and differs between them.
 pub fn sheet_probe() -> (bool, bool) {
     use crate::video::crystal::sheet;
     // MENUPROBESCALE (B1100): the probe's panel at the LIVE scale — a physical 1280x800 at s2=4 is a 640-logical panel
@@ -436,6 +433,10 @@ pub fn sheet_probe() -> (bool, bool) {
         }
         band_px[k] = at(bw + 1, bh / 2);
         darker &= luma(band_px[k]) < luma(f);
+        let mut refrow = alloc::vec![f; w]; // MENUBANDONE (B1112): the sheet's own row over the same fill
+        sheet::row(&mut refrow, (0, 0, w, h), bh / 2, &sheet::Under::own(), false);
+        sheet::seal_row(&mut refrow);
+        darker &= band_px[k] == refrow[bw + 1] & 0x00FF_FFFF;
     }
     menu_ok &= fit_probe(&g); // QUARRYMENUFIT (B1107): the live fit rule, in a window shorter than the menu
     (menu_ok, darker && band_px[0] != band_px[1])
