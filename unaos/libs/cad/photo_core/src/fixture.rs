@@ -14,6 +14,7 @@
 //! The side view (VUG-PHOTO-SIDE SR545): [`render_side`] lays the part on its side, a [`PART_W`] x [`PART_T`] rectangle.
 //! The raised side (VUG-PHOTO-SIDE-PARALLAX SR568): [`render_side_raised`] stands the part on that face, its top
 //! `standing_mm` above the paper, each ray from the [`camera`] centre tested against the box.
+//! The cropped frame (VUG-PHOTO-PP SR569): [`crop`] cuts a window of a render, its principal point off the centre.
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -337,4 +338,20 @@ pub fn render_side_raised(s: &Spec, length_mm: f64, thickness_mm: f64, standing_
 pub fn side_raised_png(s: &Spec, length_mm: f64, thickness_mm: f64, standing_mm: f64) -> Vec<u8> {
     let img = render_side_raised(s, length_mm, thickness_mm, standing_mm);
     pixel_core::png::encode::encode_rgba(img.width, img.height, &img.rgba).unwrap_or_default()
+}
+
+// VUG-PHOTO-PP (SR569): a cropped photo, the camera's principal point no longer the frame's centre.
+/// The `w` x `h` window of `img` at (`x0`, `y0`) (clamped to the image): the photo a crop of the render is, its
+/// principal point at the render's centre less (`x0`, `y0`).
+pub fn crop(img: &Image, x0: u32, y0: u32, w: u32, h: u32) -> Image {
+    let x0 = x0.min(img.width);
+    let y0 = y0.min(img.height);
+    let w = w.min(img.width - x0);
+    let h = h.min(img.height - y0);
+    let mut rgba = Vec::with_capacity(w as usize * h as usize * 4);
+    for j in y0..y0 + h {
+        let row = (j as usize * img.width as usize + x0 as usize) * 4;
+        rgba.extend_from_slice(&img.rgba[row..row + w as usize * 4]);
+    }
+    Image { width: w, height: h, rgba, frames: None, loop_count: None, orientation: 1, icc: None }
 }

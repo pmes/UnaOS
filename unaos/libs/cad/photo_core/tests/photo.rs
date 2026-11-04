@@ -390,3 +390,39 @@ fn side_parallax_square_camera_takes_camera_mm() {
         Ok(x) => panic!("a square camera with no camera_mm measured: thickness {}", x.thickness_mm),
     }
 }
+
+/// VUG-PHOTO-PP (SR569): the 400 mm raised side photo cropped to the 700 x 560 window at (200, 40): its principal point
+/// is (250, 320), not the frame's centre. Stated, the camera solve reads the uncropped thickness within 0.1 (and 6.0,
+/// the height within 1 %); left to the centre, the f solve is wrong and the photo refuses or reads more than 0.15 off.
+#[test]
+fn side_parallax_cropped_photo_takes_principal_point() {
+    let first = run(&Spec::good()).expect("the good photo measures");
+    let s = Spec::side_raised();
+    let full = fixture::render_side_raised(&s, PART_W, PART_T, PART_H);
+    let whole = measure_side_raised(&first, &full, PhotoParams::new(5.0), Tol::DEFAULT).expect("the uncropped photo measures");
+    let (x0, y0) = (200u32, 40u32);
+    let img = fixture::crop(&full, x0, y0, 700, 560);
+    assert_eq!((img.width, img.height), (700, 560));
+    let pp = Vec2::new(s.width as f64 * 0.5 - x0 as f64, s.height as f64 * 0.5 - y0 as f64);
+    let params = PhotoParams { principal_px: Some(pp), ..PhotoParams::new(5.0) };
+    let r = measure_side_raised(&first, &img, params, Tol::DEFAULT).expect("the cropped photo measures with its principal point");
+    let p = r.parallax.expect("the raised road reports its parallax");
+    let truth = fixture::camera(&s);
+    let centred = measure_side_raised(&first, &img, PhotoParams::new(5.0), Tol::DEFAULT);
+    eprintln!(
+        "photo: side-pp whole={:.3} cropped_pp={:.3} height={:.2} truth_height={:.2} focal={:?} centred={:?}",
+        whole.thickness_mm,
+        r.thickness_mm,
+        p.camera.height_mm,
+        truth.z,
+        p.camera.focal_px,
+        centred.as_ref().map(|c| (c.thickness_mm, c.parallax.map(|q| q.camera.height_mm))).map_err(|e| e.name())
+    );
+    assert!((r.thickness_mm - whole.thickness_mm).abs() < 0.1, "cropped {} vs uncropped {}", r.thickness_mm, whole.thickness_mm);
+    assert!((r.thickness_mm - PART_T).abs() < 0.1, "cropped thickness {} vs {PART_T}", r.thickness_mm);
+    assert!((p.camera.height_mm - truth.z).abs() < 0.01 * truth.z, "height {} vs {}", p.camera.height_mm, truth.z);
+    match centred {
+        Err(e) => assert_eq!(e.name(), "NoSideMatch", "{e:?}"),
+        Ok(c) => assert!((c.thickness_mm - PART_T).abs() > 0.15, "the centre assumption read the crop right: {}", c.thickness_mm),
+    }
+}

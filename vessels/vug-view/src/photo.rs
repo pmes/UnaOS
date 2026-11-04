@@ -717,16 +717,24 @@ pub fn side_path(view: &mut View, path: &str) -> Result<(), String> {
 /// largest profile, along the plane's normal) by `thickness_mm`, written by doc_core's writer; why names the side
 /// photo and its sigma, the confidence is the pairing margin inside measure_side's band. The corner reads
 /// `side <name>: thickness=<mm> sigma=<mm> paired=<mm>`. Refused by name (`NoFirstPhoto`, `image ..`, measure_side's
-/// refusal) in the corner and in the `Err`; nothing is offered then.
+/// refusal) in the corner and in the `Err`; nothing is offered then. VUGFACEPHOTOSIDEPARALLAX (SR569): the camera
+/// height self-calibrated from the side photo's lattice ([`side_camera`] with `None`).
 pub fn side(view: &mut View, bytes: &[u8], name: &str) -> Result<(), String> {
-    let (p, s) = match side_proposal(view, bytes, name) {
+    side_camera(view, bytes, name, None)
+}
+
+/// VUGFACEPHOTOSIDEPARALLAX (SR569): [`side`] through `photo_core::measure_side_raised` (the part stands on its side,
+/// its top raised): `camera_mm` the person's camera height (Principia's `photo.camera_mm`, VUG-FACE-PHOTO-CAMERA-PREF
+/// owed), `None` the lattice's own solve. The corner and why add `camera=<mm> mm lattice|set`.
+pub fn side_camera(view: &mut View, bytes: &[u8], name: &str, camera_mm: Option<f64>) -> Result<(), String> {
+    let (p, s) = match side_proposal(view, bytes, name, camera_mm) {
         Ok(v) => v,
         Err(e) => return side_refused(view, e),
     };
     hold_thickness(view, &s); // VUGINTENTTHICKNESS (SR557): held before the offer, so the extrude is judged by it
     offer(view, vec![p]);
     if let Some(ph) = view.photo.as_mut() {
-        ph.note = Some(format!("side {name}: thickness={} sigma={} paired={}", num(s.thickness_mm), num(s.sigma_mm), num(s.paired_mm)));
+        ph.note = Some(format!("side {name}: thickness={} sigma={} paired={} {}", num(s.thickness_mm), num(s.sigma_mm), num(s.paired_mm), camera_text(&s, camera_mm.is_some())));
     }
     Ok(())
 }
@@ -741,15 +749,17 @@ fn side_refused(view: &mut View, e: String) -> Result<(), String> {
 }
 
 /// The side photo measured and its extrude proposal built (nothing offered yet).
-fn side_proposal(view: &View, bytes: &[u8], name: &str) -> Result<(Proposal, photo_core::Side), String> {
+fn side_proposal(view: &View, bytes: &[u8], name: &str, camera_mm: Option<f64>) -> Result<(Proposal, photo_core::Side), String> {
     let (Some(face), Some(first)) = (view.design.face.as_ref(), view.photo.as_ref().and_then(|ph| ph.first.as_ref())) else {
         return Err("NoFirstPhoto".to_string());
     };
     let image = pixel_core::decode(bytes).map_err(|e| format!("image {e:?}"))?;
-    let s = photo_core::measure_side(first, &image, photo_core::PhotoParams::new(first.pitch_mm), Tol::DEFAULT).map_err(|e| match e {
+    let params = photo_core::PhotoParams { camera_mm, ..photo_core::PhotoParams::new(first.pitch_mm) }; // VUGFACEPHOTOSIDEPARALLAX (SR569)
+    let s = photo_core::measure_side_raised(first, &image, params, Tol::DEFAULT).map_err(|e| match e {
         photo_core::Refusal::NoSideMatch { length_mm, nearest_mm, band_mm } => {
             format!("NoSideMatch length={} nearest={} band={}", num(length_mm), num(nearest_mm), num(band_mm))
         }
+        photo_core::Refusal::NoCamera { tilt_deg } => format!("NoCamera tilt={}", num(tilt_deg)), // VUGFACEPHOTOSIDEPARALLAX (SR569)
         e => e.name().to_string(),
     })?;
     let outer = face
@@ -766,7 +776,7 @@ fn side_proposal(view: &View, bytes: &[u8], name: &str) -> Result<(Proposal, pho
     let stmt = doc_core::write(&doc).lines().last().unwrap_or("").to_string();
     let band = photo_core::fit::BAND_SIGMA * first.sigma_mm.hypot(s.sigma_mm);
     let confidence = if band > 0.0 { (1.0 - (s.length_mm - s.paired_mm).abs() / band).clamp(0.0, 1.0) } else { 0.0 };
-    let why = format!("side photo {name}: thickness {} sigma {}", num(s.thickness_mm), num(s.sigma_mm));
+    let why = format!("side photo {name}: thickness {} sigma {} {}", num(s.thickness_mm), num(s.sigma_mm), camera_text(&s, camera_mm.is_some()));
     Ok((Proposal { stmt, confidence, why }, s))
 }
 
@@ -936,4 +946,15 @@ fn enter_set(d: &mut crate::sketch::Design, f: &SketchFace, doc: &Doc, cand: Doc
     d.pull = None;
     d.refusal = None;
     Ok(())
+}
+
+// ---- VUGFACEPHOTOSIDEPARALLAX (SR569): the camera the side photo's parallax was corrected by (named tail block) ----
+
+/// `camera=<mm> mm lattice` (the side lattice's own solve) or `camera=<mm> mm set` (the person's `camera_mm`); empty
+/// on a side measured without the raised correction.
+fn camera_text(s: &photo_core::Side, set: bool) -> String {
+    match s.parallax {
+        Some(p) => format!("camera={} mm {}", num(p.camera.height_mm), if set { "set" } else { "lattice" }),
+        None => String::new(),
+    }
 }
