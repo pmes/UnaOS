@@ -654,9 +654,9 @@ pub fn retired_state() -> (Option<u64>, u32) {
 // / `take_down`: the login, unlock, words and lock screens) the desktop layer's two leaves, [`row`] and [`paint`], take
 // the backdrop from `wm::desktop::login_put` (the field kept per install, `Look::login` over the VEIL) instead of the
 // sharp picture. The field is composed once per [`install`] ([`veil_login_build`], on the installer's thread).
-// Wire: `[veil] login cost build_us=<n> blit_us=<n> panel=<w>x<h> bytes=<n> a=<n>` per install; once per build,
-// `:: VEILLOGIN: at=(<x>,<y>) sharp=#<rgb> glass=#<rgb> expect=#<rgb> a=<n> cached=<0|1> -> PASS|FAIL ::` at the first
-// flush after the backdrop's first painted pixel that differs from the sharp one (PASS: glass = the VEIL at `a`).
+// Wire: `[veil] login cost build_us=<n> blit_us=<n> panel=<w>x<h> bytes=<n> a=<n> kept=<yes|half|no>` per install; once,
+// `:: VEILLOGIN: at=(<x>,<y>) sharp=#<rgb> glass=#<rgb> expect=#<rgb> a=<n> cached=<0|1> err=<n> -> PASS|FAIL ::` at the first
+// flush after the first painted pixel that differs from the sharp one (PASS: glass = the VEIL at `a`, err <= 2 off x86: B1122).
 
 /// The witness latch: taken by the first painted pixel that differs from the picture's; `READY` once its values are in.
 static LV_LATCHED: AtomicBool = AtomicBool::new(false);
@@ -728,9 +728,9 @@ fn veil_login_build() {
     LV_SAID.store(false, Ordering::Relaxed);
     LV_LATCHED.store(false, Ordering::Release);
     serial_println!(
-        "[veil] login cost build_us={} blit_us={} panel={}x{} bytes={} a={}{}",
+        "[veil] login cost build_us={} blit_us={} panel={}x{} bytes={} a={} kept={}",
         build_us, blit_us, b.w, b.h, bytes, crate::video::theme::login_veil_a(),
-        if cfg!(target_arch = "x86_64") { "" } else { " live=1" }
+        if bytes == 0 { "no" } else if cfg!(target_arch = "x86_64") { "yes" } else { "half" } // VEIL-LOGIN-PI (B1122)
     );
 }
 
@@ -748,9 +748,17 @@ fn veil_login_witness() {
     let mut s = [0u32; 1];
     b.soft(&mut s, x, y);
     let expect = crate::video::draw::blend(s[0], 0, a as u32);
-    let ok = glass == expect && glass != sharp;
+    let err = veil_login_err(glass, expect); let tol = if cfg!(target_arch = "x86_64") { 0 } else { 2 }; let ok = err <= tol && glass != sharp; // VEIL-LOGIN-PI (B1122): the half field is exact to <= 2 LSB
     serial_println!(
-        ":: VEILLOGIN: at=({},{}) sharp=#{:06x} glass=#{:06x} expect=#{:06x} a={} cached={} -> {} ::",
-        x, y, sharp, glass, expect, a, LV_CACHED.load(Ordering::Relaxed) as u8, if ok { "PASS" } else { "FAIL" }
+        ":: VEILLOGIN: at=({},{}) sharp=#{:06x} glass=#{:06x} expect=#{:06x} a={} cached={} err={} -> {} ::",
+        x, y, sharp, glass, expect, a, LV_CACHED.load(Ordering::Relaxed) as u8, err, if ok { "PASS" } else { "FAIL" }
     );
+}
+
+// ── VEIL-LOGIN-PI (rmbp-ledger B1122, BP-video-11) — TAIL-APPENDED ─────────────────────────────────────────────────────
+/// The witness's error: the largest per-channel difference of two pixels (0 on x86's full field; <= 2 from aarch64's
+/// half field, `wm::desktop::login_half_put`).
+fn veil_login_err(a: u32, b: u32) -> u32 {
+    let d = |s: u32| ((a >> s) & 255).abs_diff((b >> s) & 255);
+    d(16).max(d(8)).max(d(0))
 }
