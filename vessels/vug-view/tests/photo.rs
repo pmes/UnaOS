@@ -1639,3 +1639,51 @@ fn a_saved_crop_outranks_a_stale_principal_pref_on_reopen() {
     assert_eq!(measured(ph(&vw)), measured(&bare2), "the composed frame keeps the rank");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---- VUGFACEPHOTOCROPPREFFRAC (SR648): a meta-free photo's principal pref carried into its crop (named tail block) ----
+
+/// VUGFACEPHOTOCROPPREFFRAC (SR648): SR645's control case with the pref OFF the centre: the lens photo (no crop meta)
+/// opens under the pref `principal_px` (446.5, 357.25), the full frame's centre less (3.5, 2.75); `r`, the rectangle 200,40
+/// 700x560, Return: the saved pair carries the pref's point, `200,40,900,720,446.5,357.25`, read back as the pref less the
+/// offset (246.5, 317.25), and the face's re-open measures exactly as the meta-free crop under that point, not as it
+/// under the centre-derived (250, 320) a 4-field frame stated.
+#[test]
+fn a_meta_free_crop_carries_the_principal_pref_on_reopen() {
+    let dir = crop_dir("preffrac");
+    let path = dir.join("lens.png");
+    let spec = photo_core::fixture::Spec::lens();
+    std::fs::write(&path, photo_core::fixture::png(&spec)).expect("the lens photo is written");
+    let full = photo_core::fixture::render(&spec);
+    let pref = Vec2::new(full.width as f64 * 0.5 - 3.5, full.height as f64 * 0.5 - 2.75);
+    let prefs = photo::PhotoPrefs { camera_mm: None, principal_px: Some(pref) };
+    let mut vw = Viewer::open_with(path.to_str().expect("a UTF-8 path"), (W, H), Preset::Una, prefs).expect("the lens photo opens by its path");
+
+    assert!(key(&mut vw, "r"), "`r` arms the crop");
+    let crop = &mut vw.view.photo.as_mut().expect("a photo is open").crop;
+    crop.from = Some((200.0, 40.0));
+    crop.to = Some((900.0, 600.0));
+    assert!(key(&mut vw, "Return"));
+    let out = dir.join("lens.crop.png");
+    assert_eq!(vw.title, "lens.crop.png", "the face re-opened the saved crop");
+    let saved = std::fs::read(&out).expect("the crop is saved beside the photo");
+    let img = pixel_core::decode(&saved).expect("the saved crop decodes");
+    let pair = img.text.iter().find(|(k, _)| k == photo_core::CROP_KEY).map(|(_, v)| v.clone());
+    assert_eq!(pair, Some(format!("200,40,{},{},{},{}", full.width, full.height, pref.x, pref.y)), "the pref's point carried");
+    assert_eq!(photo_core::crop_frame(&img), Some([200, 40, full.width, full.height]));
+    let meta = photo_core::crop_principal(&img).expect("the saved crop states its principal point");
+    assert_eq!((meta.x, meta.y), (pref.x - 200.0, pref.y - 40.0));
+
+    let c = photo_core::fixture::crop(&full, 200, 40, 700, 560);
+    let free = pixel_core::png::encode::encode_rgba(c.width, c.height, &c.rgba).expect("the meta-free crop encodes");
+    let at = |pp: Vec2| photo::open_with(&free, photo::PITCH_MM, photo::PhotoPrefs { camera_mm: None, principal_px: Some(pp) }).ok().map(|(_, _, p)| measured(&p));
+    let reopened = measured(ph(&vw));
+    let carried = at(meta);
+    let centre = at(Vec2::new(full.width as f64 * 0.5 - 200.0, full.height as f64 * 0.5 - 40.0));
+    assert_eq!(Some(reopened.clone()), carried, "the re-open measures about the pref's point less the offset");
+    assert_ne!(Some(reopened.clone()), centre, "a 4-field frame's centre would measure otherwise");
+    eprintln!(
+        "photo: crop-pref-frac pref={},{} meta={},{} k1={:?} centre_k1={:?}",
+        pref.x, pref.y, meta.x, meta.y, reopened.0, centre.as_ref().map(|m| m.0)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
