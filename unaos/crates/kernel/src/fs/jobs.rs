@@ -111,7 +111,7 @@ pub fn owe() {
     if let Some(cpu) = crate::arch::smp::worker_cpu(0) {
         crate::fs::assoc::take_to_worker();
         ON_WORKER.store(true, Relaxed);
-        serial_println!("[jobs] scan pending at=login on=worker cpu={}", cpu);
+        if !crate::boot::session_fold() { serial_println!("[jobs] scan pending at=login on=worker cpu={}", cpu); } // CONTINUEREST (rmbp-ledger B1121): folds on the session press into `[session] opened … deferred=` (boot.rs tail); the inline arm below always prints. LINE-NEUTRAL, code first
         crate::arch::sched::spawn("jobs-scan", worker, 0, cpu, crate::arch::sched::PRIO_NORMAL);
         return;
     }

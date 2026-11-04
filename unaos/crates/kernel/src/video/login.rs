@@ -1110,7 +1110,7 @@ fn apply_setpw(n: &[u8], login_after: bool, written: Result<(), &'static str>, s
         true => {
             LOGINS.fetch_add(1, Ordering::Relaxed);
             serial_println!("[login] session open user={} (first login: the password was chosen here)", who);
-            close_into_session();
+            close_into_session(); session_line(); // CONTINUEREST (rmbp-ledger B1121): the press's ONE `[session] opened` line (file tail). LINE-NEUTRAL, code first
         }
         false => {
             serial_println!("[login] password written but the session did not open — storage or slot refusal, NOT a credential refusal");
@@ -1157,7 +1157,7 @@ fn apply_create(n: &[u8], made: Result<(), &'static str>, session: bool) {
             LOGINS.fetch_add(1, Ordering::Relaxed);
             serial_println!("[login] session open user={} role=admin (R100: the first user is the administrator; root is locked)", who);
             if kb_words_pending(KB_AFTER_CREATE) { return; } close_into_session(); // KEYBOOT (B688): a root keyed by this password shows its 24 words first; Continue closes into the session
-            users::installer_desktop_ignite();
+            users::installer_desktop_ignite(); session_line(); // CONTINUEREST (rmbp-ledger B1121): the press's ONE `[session] opened` line (file tail). LINE-NEUTRAL, code first
         }
         false => {
             serial_println!("[login] installer: user created but the session did not open — storage or slot refusal");
@@ -1213,7 +1213,7 @@ fn apply_root(ok: bool) {
         }
         LOGINS.fetch_add(1, Ordering::Relaxed);
         serial_println!("[login] session open user=root");
-        close_into_session();
+        close_into_session(); session_line(); // CONTINUEREST (rmbp-ledger B1121): the press's ONE `[session] opened` line (file tail). LINE-NEUTRAL, code first
     }
 }
 
@@ -1265,7 +1265,7 @@ fn apply_user(n: &[u8], verified: bool, session: bool) {
         true => {
             LOGINS.fetch_add(1, Ordering::Relaxed);
             serial_println!("[login] session open user={}", core::str::from_utf8(n).unwrap_or("?"));
-            close_into_session();
+            close_into_session(); session_line(); // CONTINUEREST (rmbp-ledger B1121): the press's ONE `[session] opened` line (file tail). LINE-NEUTRAL, code first
         }
         false => {
             // The credential VERIFIED one line above and the session still did not open — a storage or
@@ -3469,10 +3469,10 @@ fn kb_continue() {
     #[cfg(any(target_arch = "aarch64", feature = "unafs"))]
     drop(KB_SHOWN.lock().take());
     let after = core::mem::replace(&mut KB.lock().after, 0);
-    serial_println!("[login] recovery words dismissed (Continue; nothing keeps them)");
+    if after == KB_AFTER_CREATE { crate::boot::session_fold_open(); } if !crate::boot::session_fold() { serial_println!("[login] recovery words dismissed (Continue; nothing keeps them)"); } // CONTINUEREST (rmbp-ledger B1121): the Continue into a session opens the press's line fold here (boot.rs tail) and this line is one it folds. LINE-NEUTRAL, code first
     if after == KB_AFTER_CREATE {
         close_into_session();
-        users::installer_desktop_ignite();
+        users::installer_desktop_ignite(); session_line(); // CONTINUEREST (rmbp-ledger B1121): the press's ONE `[session] opened` line (file tail). LINE-NEUTRAL, code first
     } else {
         take_down();
         FORM.lock().state = State::Closed;
@@ -4129,4 +4129,25 @@ pub fn words_key_leg() -> (u8, u8, u8, bool) {
         }
     }
     ((held_dwell && held_repeat) as u8, letter as u8, enter as u8, pin_released)
+}
+
+// CONTINUEREST (rmbp-ledger B1121) — TAIL-APPENDED. SESSION-LINE: the end of every road into a session closes the press's
+// line fold (`boot::session_fold_close`) and prints ONE line for the report lines it folded:
+// `[session] opened user=<u> ms=<n.n> deferred=<n> from=<route|open>`. `ms` is the routed event's age (`lag::route_age_us`,
+// x86 + `wc`: the route so far, `from=route`); with no timed slot (a coalesced press, or no lag) it is the fold's own age
+// from its open, said `from=open`, so a coalesced press never passes for a route time. No fold open: nothing printed.
+fn session_line() {
+    let Some((deferred, open_ms)) = crate::boot::session_fold_close() else { return };
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+    let route_us = crate::video::lag::route_age_us();
+    #[cfg(not(all(target_arch = "x86_64", feature = "wc")))]
+    let route_us: Option<u64> = None;
+    let (us, from) = match route_us { Some(us) => (us, "route"), None => (open_ms.saturating_mul(1000), "open") };
+    let mut nb = [0u8; users::NAME_MAX];
+    let who = match users::whoami(&mut nb) {
+        Some(n) if n > 0 && nb[..n].iter().all(|&b| (0x21..0x7f).contains(&b)) => core::str::from_utf8(&nb[..n]).unwrap_or("?"),
+        Some(_) => "?",
+        None => "none",
+    };
+    serial_println!("[session] opened user={} ms={}.{} deferred={} from={}", who, us / 1000, (us % 1000) / 100, deferred, from);
 }
