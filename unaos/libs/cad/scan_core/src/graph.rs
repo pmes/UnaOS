@@ -482,7 +482,7 @@ pub struct Candidate {
 /// like `t`, raycast there (`Tracker::refresh`), `new` tracked from `guess` (old⁻¹ ∘ new). Accepted under the
 /// closure gates of `prm`.
 pub fn match_keyframe(t: &Tsdf, prm: &LoopParams, old: Shot<'_>, new: Shot<'_>, guess: Transform) -> Result<Closed, Refused> {
-    let mut kt = Tsdf::new(t.voxel_mm(), t.trunc_mm(), t.tol()).map_err(Refused::Scan)?.with_budget(t.budget());
+    let mut kt = Tsdf::new(t.voxel_mm(), t.trunc_mm(), t.tol()).map_err(Refused::Scan)?.with_budget(t.budget()).with_knobs(t.knobs()); // VUGSCANTSDFEDGELATERAL: EDGE-CARRY
     kt.integrate(old.frame, old.scale, old.intr, &Transform::IDENTITY).map_err(Refused::Scan)?;
     let mut tr = Tracker::new(&kt, t.tol());
     tr.refresh(&kt, old.intr);
@@ -627,7 +627,7 @@ pub enum Reintegrate {
     Scan { frame: u32, error: ScanError },
 }
 
-/// A cleared volume shaped like `t` (voxel, band, tol, budget) with every frame of `poses` integrated at its pose.
+/// A cleared volume shaped like `t` (voxel, band, tol, budget, guard knobs: VUGSCANTSDFEDGELATERAL) with every frame of `poses` integrated at its pose.
 pub fn reintegrate<'a, F>(t: &Tsdf, poses: &[(u32, Transform)], mut shot: F) -> Result<Tsdf, Reintegrate>
 where
     F: FnMut(u32) -> Option<Shot<'a>>,
@@ -635,7 +635,8 @@ where
     let first = poses.first().map_or(0, |p| p.0);
     let mut out = Tsdf::new(t.voxel_mm(), t.trunc_mm(), t.tol())
         .map_err(|error| Reintegrate::Scan { frame: first, error })?
-        .with_budget(t.budget());
+        .with_budget(t.budget())
+        .with_knobs(t.knobs()); // VUGSCANTSDFEDGELATERAL (SR574): EDGE-CARRY
     for &(frame, pose) in poses {
         let Some(s) = shot(frame) else { return Err(Reintegrate::NoFrame { frame }) };
         out.integrate(s.frame, s.scale, s.intr, &pose).map_err(|error| Reintegrate::Scan { frame, error })?;

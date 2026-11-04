@@ -10,7 +10,7 @@
 //! scan <in.prb | in.csv | in.raw> -o <out.ply> [--report <out.txt>]
 //!      [--meta <x_Depth_metadata.csv>] [--width W --height H] [--csv-raw]
 //!      [--fx F --fy F --ppx F --ppy F] [--units-um N] [--frame N]
-//!      [--turntable DEG --radius MM | --poses <file> | --track] [--voxel MM] [--trunc MM] [--band MM]
+//!      [--turntable DEG --radius MM | --poses <file> | --track] [--voxel MM] [--trunc MM] [--band MM] [--edge MM] [--edge-far MM]
 //!      [--against <design.vugdoc>] [--intent [<doc.vug>]] [--gdt <face>=<kind>:<tol>]... [--datum A=<face> B=<face> C=<face>]
 //! ```
 //!
@@ -135,7 +135,7 @@ fn usage() -> ! {
     eprintln!("usage: scan <in.prb | in.csv | in.raw> -o <out.ply> [--report <out.txt>]");
     eprintln!("            [--meta <x_Depth_metadata.csv>] [--width W --height H] [--csv-raw]");
     eprintln!("            [--fx F --fy F --ppx F --ppy F] [--units-um N] [--frame N]");
-    eprintln!("            [--turntable DEG --radius MM | --poses <file> | --track] [--voxel MM] [--trunc MM] [--band MM]");
+    eprintln!("            [--turntable DEG --radius MM | --poses <file> | --track] [--voxel MM] [--trunc MM] [--band MM] [--edge MM] [--edge-far MM]");
     eprintln!("            [--against <design.vugdoc>] [--intent [<doc.vug>]] [--gdt <face>=<kind>:<tol>]... [--datum A=<face> B=<face> C=<face>]");
     std::process::exit(2)
 }
@@ -159,7 +159,7 @@ struct Args {
     voxel: f64,
     trunc: Option<f64>,
     band: f64,
-    against: Option<String>, intent: Option<Option<String>>, gdt: Vec<(String, scan_core::Kind, f64)>, datum: Option<[String; 3]>, // VUGSCANDEVIATION (SR510); VUGSCANGDT (SR542) gdt; VUGSCANGDTDATUMS (SR552) datum
+    against: Option<String>, intent: Option<Option<String>>, gdt: Vec<(String, scan_core::Kind, f64)>, datum: Option<[String; 3]>, edge: Option<f64>, edge_far: Option<f64>, // VUGSCANTSDFEDGELATERAL (SR574) edge / edge_far; VUGSCANDEVIATION (SR510); VUGSCANGDT (SR542) gdt; VUGSCANGDTDATUMS (SR552) datum
 }
 
 fn num<T: std::str::FromStr>(it: &mut impl Iterator<Item = String>) -> T {
@@ -190,7 +190,7 @@ fn parse_args() -> Args {
             "--voxel" => a.voxel = num(&mut it),
             "--trunc" => a.trunc = Some(num(&mut it)),
             "--band" => a.band = num(&mut it),
-            "--against" => a.against = Some(it.next().unwrap_or_else(|| usage())), "--intent" => a.intent = Some(intent_doc(&mut it)), "--gdt" => a.gdt.push(gdt_spec(&mut it)), "--datum" => a.datum = Some(datum_spec(&mut it)),
+            "--against" => a.against = Some(it.next().unwrap_or_else(|| usage())), "--intent" => a.intent = Some(intent_doc(&mut it)), "--gdt" => a.gdt.push(gdt_spec(&mut it)), "--datum" => a.datum = Some(datum_spec(&mut it)), "--edge" => a.edge = Some(num(&mut it)), "--edge-far" => a.edge_far = Some(num(&mut it)),
             _ if s.starts_with('-') => usage(),
             _ if a.input.is_none() => a.input = Some(s),
             _ => usage(),
@@ -516,7 +516,7 @@ fn run(a: &Args) -> Result<String, Refusal> {
         intr.push(i);
     }
     let trunc = a.trunc.unwrap_or(3.0 * a.voxel);
-    let mut t = Tsdf::new(a.voxel, trunc, Tol::DEFAULT).map_err(Refusal::Volume)?;
+    let mut t = Tsdf::new(a.voxel, trunc, Tol::DEFAULT).map_err(Refusal::Volume)?.with_knobs(knobs_of(&a)); // VUGSCANTSDFEDGELATERAL (SR574): EDGE-CARRY
     let track = if a.track {
         Some(fuse_tracked(&mut t, &frames, &intr)?)
     } else {
@@ -990,4 +990,13 @@ fn datum_road(a: &Args, sm: &ScanMesh, design: &scan_core::Design, d: &Deviation
     })?;
     scan_core::gdt::in_frame(g, &fr); // VUGFACEGDTREMEASURE (SR560): the loop lifted into scan_core, the face calls the same fn
     Ok(format!("gdt: frame A={} B={} C={} residual={:.3}\n", datum[0], datum[1], datum[2], fr.residual_mm))
+}
+
+// VUGSCANTSDFEDGELATERAL (SR574), VUG-SCAN-TSDF-EDGE-CARRY: `--edge MM` arms SR555's both-sides depth-edge guard and
+// `--edge-far MM` SR562's far-side guard (`--edge` takes precedence when both are given); neither flag leaves both off
+// (`Knobs::OFF`, scan_core's default). The volume carries them through `--track`'s keyframe matches and the
+// re-integration after a loop closure (graph.rs `match_keyframe` / `reintegrate` copy `Tsdf::knobs`).
+fn knobs_of(a: &Args) -> scan_core::tsdf::Knobs {
+    let off = scan_core::tsdf::Knobs::OFF;
+    scan_core::tsdf::Knobs { edge_mm: a.edge.unwrap_or(off.edge_mm), edge_far_mm: a.edge_far.unwrap_or(off.edge_far_mm) }
 }
