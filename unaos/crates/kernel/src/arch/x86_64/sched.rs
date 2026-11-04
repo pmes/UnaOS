@@ -5489,7 +5489,7 @@ pub fn timer_preempt() {
     let cpu = percpu::this_cpu().cpu_index as usize;
     let raw = SCHED[cpu].current.load(Ordering::Acquire) as *mut Task;
     if raw.is_null() {
-        return; // scheduler/idle context, or a CPU that is not dispatching yet
+        crate::hidstall::wait_tick_idle(cpu); return; // scheduler/idle context, or a CPU that is not dispatching yet. F39HIDWHONOTICK (B1180): the hid pump core's idle tick while its pass is overdue reads `who=?idle` (hidstall.rs tail). LINE-NEUTRAL fold, code first
     }
 
     // Tick down the quantum; arm the reschedule signal when it runs out.
