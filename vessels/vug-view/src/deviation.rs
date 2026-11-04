@@ -77,6 +77,9 @@ pub struct Map {
     /// VUGFACECONFIDENCETINT (SR592): the confidence floor `conf <w>` named on the map and the measurement before it
     /// ([`Conf`]); None: no floor, `result` as measured.
     pub conf: Option<Conf>,
+    /// VUGFACEDEVIATIONHELD (SR600): the statement journal.rs `hold` held (a solid's ONE root fault, its chain in
+    /// `faults`), the design built over the standing document; named on the corner `held=<id>` ([`held_line`]).
+    pub held: Option<String>,
 }
 
 /// A scan mesh read from a file (a PLY carries no normals, no confidence and no intrinsics): mesh_core's
@@ -92,18 +95,20 @@ pub fn scan_mesh(mesh: Mesh) -> ScanMesh {
 /// The design of `doc` as tools/scan builds it: doc_core `replay`, the first failure on a statement a solid reads
 /// (journal.rs solid_stmts) refused by line, no solid refused, every live solid (journal.rs live_solids) through
 /// scan_core's `design_of`; VUGFACEDEVIATIONSOLIDFAULT (SR565): every other failure (an Op, an unnamed sketch) is
-/// returned, counted on the corner ([`fault_lines`]), and the design still measures.
-pub fn design(doc: &Doc) -> Result<(Design, Vec<String>, Vec<doc_core::Failure>), String> {
+/// returned, counted on the corner ([`fault_lines`]), and the design still measures. VUGFACEDEVIATIONHELD (SR600): ONE
+/// held solid fault (journal.rs `hold`, regenerate's rule) is carried too, the design is the standing document's solids
+/// and the held root's id is returned.
+pub fn design(doc: &Doc) -> Result<(Design, Vec<String>, Vec<doc_core::Failure>, Option<String>), String> {
     let rp = doc_core::replay(doc, doc.tol);
-    let (on_solid, faults) = split_faults(doc, rp.failures);
+    let (on_solid, faults, held) = held_split(doc, rp.failures); // VUGFACEDEVIATIONHELD (SR600): split_faults then journal.rs hold
     if let Some(f) = on_solid.first() {
         return Err(fault_text(f));
     }
     if rp.solids.is_empty() {
         return Err("DesignEmpty".into());
     }
-    let (design, names) = design_of(live_of(doc, &rp.solids), doc.tol).map_err(|e| format!("{e:?}"))?; // VUGFACEDEVIATIONLIVE (SR558): the live solids only, never a fillet's on solid beside it
-    Ok((design, names, faults))
+    let (design, names) = design_of(live_of(&crate::journal::standing(doc, &faults), &rp.solids), doc.tol).map_err(|e| format!("{e:?}"))?; // VUGFACEDEVIATIONLIVE (SR558): the live solids only, never a fillet's on solid beside it; VUGFACEDEVIATIONHELD (SR600): over the standing document
+    Ok((design, names, faults, held))
 }
 
 /// The per-channel mean of three `0x00RRGGBB` colours.
@@ -119,7 +124,7 @@ fn mean3(a: u32, b: u32, c: u32) -> u32 {
 /// read on a refusal) and the map, its gdt read at the edge margin `margin_mm` (VUGFACEGDTREMEASURE SR560). A design
 /// that does not build refuses the whole open (`Err`); a registration refusal is the map's (`Map::result`), shown by name.
 pub fn open(scan: &ScanMesh, doc: &Doc, band_mm: f64, margin_mm: f64) -> Result<(Model, Map), String> {
-    let (design, names, faults) = design(doc)?; // VUGFACEDEVIATIONSOLIDFAULT (SR565): the faults no solid reads
+    let (design, names, faults, held) = design(doc)?; // VUGFACEDEVIATIONHELD (SR600): the held root; VUGFACEDEVIATIONSOLIDFAULT (SR565): the faults no solid reads
     let result = measure(scan, &design, Transform::IDENTITY, &AlignParams::DEFAULT, band_mm, Tol::DEFAULT);
     let (positions, vertex): (Vec<_>, Vec<u32>) = match &result {
         Ok(d) => (
@@ -137,7 +142,7 @@ pub fn open(scan: &ScanMesh, doc: &Doc, band_mm: f64, margin_mm: f64) -> Result<
     };
     let model = Model::from_mesh(mesh)?;
     let on = result.is_ok();
-    let mut map = Map { on, band_mm, names, gdt: Vec::new(), result, vertex, tri, pick: None, source: None, callouts: Vec::new(), margin_mm, basis: std::sync::Arc::new((scan.clone(), design)), datums: None, frame: None, chosen: [None; 3], lost: Vec::new(), faults, scan_name: None, design_path: None, reported: None, conf: None }; reframe(&mut map); Ok((model, map)) // VUGFACEDEVIATIONJOURNAL (SR550) + VUGFACEGDT (SR553): no source, no callouts yet; VUGFACEGDTREMEASURE (SR560): the gdt read once per build through reframe
+    let mut map = Map { on, band_mm, names, gdt: Vec::new(), result, vertex, tri, pick: None, source: None, callouts: Vec::new(), margin_mm, basis: std::sync::Arc::new((scan.clone(), design)), datums: None, frame: None, chosen: [None; 3], lost: Vec::new(), faults, scan_name: None, design_path: None, reported: None, conf: None, held }; reframe(&mut map); Ok((model, map)) // VUGFACEDEVIATIONJOURNAL (SR550) + VUGFACEGDT (SR553): no source, no callouts yet; VUGFACEGDTREMEASURE (SR560): the gdt read once per build through reframe
 }
 
 /// The corner's lines: the statistics and the worst [`WORST`] faces (matched ones, by rms) with their signed mean, or
@@ -334,7 +339,7 @@ fn show(view: &mut View) {
 fn source_line(map: &Map) -> Option<String> {
     let s = map.source.as_ref()?;
     Some(match &s.refused {
-        None => format!("design=journal@{} solids={}{}", s.generation, crate::journal::live_solids(&s.doc).len(), fault_count(map)), // VUGFACEDEVIATIONLIVE (SR558): the measured design's solid count; VUGFACEDEVIATIONSOLIDFAULT (SR565): ` faults=<m>` when any
+        None => format!("design=journal@{} solids={}{}", s.generation, crate::journal::live_solids(&crate::journal::standing(&s.doc, &map.faults)).len(), fault_count(map)), // VUGFACEDEVIATIONHELD (SR600): the standing document's solids, a held one not counted // VUGFACEDEVIATIONLIVE (SR558): the measured design's solid count; VUGFACEDEVIATIONSOLIDFAULT (SR565): ` faults=<m>` when any
         Some(why) => format!("design=journal@{} refused {why} map@{}", s.generation, s.measured),
     })
 }
@@ -704,7 +709,7 @@ fn fault_count(map: &Map) -> String {
 /// The corner's fault lines: `fault <line N: fault id>` for the first [`WORST`], then `faults=<m>` on a path map (a
 /// journal map carries the count on its source line). None without a failure.
 fn fault_lines(map: &Map) -> Vec<String> {
-    let mut out: Vec<String> = map.faults.iter().take(WORST).map(|f| format!("fault {}", fault_text(f))).collect();
+    let mut out: Vec<String> = held_line(map).into_iter().chain(map.faults.iter().take(WORST).map(|f| format!("fault {}", fault_text(f)))).collect(); // VUGFACEDEVIATIONHELD (SR600): `held=<id>` first
     if map.source.is_none() && !map.faults.is_empty() {
         out.push(format!("faults={}", map.faults.len()));
     }
@@ -716,7 +721,7 @@ fn fault_lines(map: &Map) -> Vec<String> {
 fn refault(view: &mut View) {
     let doc = &view.design.journal.doc;
     let Some(m) = view.deviation.as_mut() else { return };
-    m.faults = split_faults(doc, doc_core::replay(doc, doc.tol).failures).1;
+    let (_, faults, held) = held_split(doc, doc_core::replay(doc, doc.tol).failures); m.faults = faults; m.held = held; // VUGFACEDEVIATIONHELD (SR600): the held chain stays counted
 }
 
 /// The corner's partial frame line while datums are being picked: `frame A=<face|-> B=<face|-> C=<face|->`; none when
@@ -1167,4 +1172,27 @@ fn keep_conf(old: &Map, new: &mut Map) {
 /// The corner's floor line: `conf floor=<w> unpaired=<n>` while a floor is on.
 fn conf_line(map: &Map) -> Option<String> {
     map.conf.as_ref().map(|c| format!("conf floor={} unpaired={}", c.floor, c.unpaired))
+}
+
+// ---- VUGFACEDEVIATIONHELD (LEDGER SR600): the map opens beside a held statement ----
+// VUGFACEJOURNALSOLIDFAULTFIX (SR598) made journal.rs `regenerate` hold ONE solid root fault (`hold`) and paint the Body
+// from the `standing` document, but [`design`] ran its own replay through SR565's `split_faults` alone, so the map
+// refused the document the journal held (`against_journal`, `open_against`). [`held_split`] is the same pair regenerate
+// reads: the design is the standing document's solids, the held chain is carried in `Map::faults` (and [`refault`]
+// keeps it), the root named on the corner `held=<id>`. The fix's statement replace moves `solid_stmts`, so [`follow`]
+// re-measures and the held word, re-derived per build, is gone. Two roots and the rest still refuse by the first line.
+
+/// `failures` split by [`split_faults`] then journal.rs `hold`: (the solid half, the carried, the held root's id). The
+/// root is the solid half's first failure that is not `Upstream`, kept only when the hold emptied that half.
+fn held_split(doc: &Doc, failures: Vec<doc_core::Failure>) -> (Vec<doc_core::Failure>, Vec<doc_core::Failure>, Option<String>) {
+    let split = split_faults(doc, failures);
+    let root = split.0.iter().find(|f| !matches!(f.fault, doc_core::Fault::Upstream(_))).map(|f| f.id.clone());
+    let (on_solid, carried) = crate::journal::hold(split);
+    let held = if on_solid.is_empty() { root } else { None };
+    (on_solid, carried, held)
+}
+
+/// The corner's held line: `held=<id>` while the design stands beside a held statement.
+fn held_line(map: &Map) -> Option<String> {
+    map.held.as_ref().map(|id| format!("held={id}"))
 }
