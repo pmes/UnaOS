@@ -1345,3 +1345,72 @@ fn the_command_line_opens_over_a_sheet_with_no_map() {
     v.key(":");
     assert!(!v.view.entry.open, "no map and no sheet: `:` opens nothing");
 }
+
+// ---- VUGFACEDEVIATIONHELD (LEDGER SR600): the map opens beside a held statement and re-measures when its fix lands ----
+// SR598's shape on the SR510 part: the post's `outer` names its centre point (NoProfile, the solid half), so journal.rs
+// `regenerate` holds it with its card while deviation.rs `design` refused the whole document; now the design is the
+// standing document's (the box alone), the corner names `held=post`, and the card's Tab + Return replaces the statement,
+// `follow` re-measures against both solids and the held word is gone. Two roots still refuse by the first line.
+
+/// The SR510 document with the post's `outer` on the point `c0` and a second closed loop in s2 (a fixed circle away
+/// from the part, listed before c1), so the post's card offers two loops.
+fn held_doc() -> String {
+    DOC.replace(
+        "sketch s2 o=[0 0 0] z=[0 0 1] x=[1 0 0]\n",
+        "sketch s2 o=[0 0 0] z=[0 0 1] x=[1 0 0]\npoint c8 sketch=s2 x=-400 y=300\ncircle c9 sketch=s2 centre=c8 r=10\nfix g8 sketch=s2 p=c8 at=[-400 300]\nradius r9 sketch=s2 circle=c9 r=10\n",
+    )
+    .replace("extrude post sketch=s2 outer=c1 ", "extrude post sketch=s2 outer=c0 ")
+}
+
+#[test]
+fn a_held_document_opens_the_map_held_and_its_fix_re_measures() {
+    let text = held_doc();
+    let doc = doc_core::read(&text).expect("an outer on a point is geometry, not syntax: the document reads");
+    let mut v = Viewer::open_doc(doc.clone(), "fixture", SIZE, Preset::Una).expect("SR598: the journal holds the post");
+    v.against_journal(scan().clone()).expect("the map opens beside the held post");
+    let post = v.view.design.journal.doc.stmts.iter().position(|s| s.id() == Some("post")).expect("the post's row");
+    let line = v.view.design.journal.doc.line(post);
+    let map = v.view.deviation.as_ref().expect("a map");
+    let lines = corner(map);
+    println!("{}", lines.join("\n"));
+    assert_eq!(map.held.as_deref(), Some("post"));
+    assert!(lines.contains(&"held=post".to_string()), "{lines:?}");
+    assert!(lines.contains(&format!("fault line {line}: NoProfile post")), "{lines:?}");
+    assert_eq!(lines.last().map(String::as_str), Some("design=journal@0 solids=1 faults=1"), "{lines:?}");
+    assert!(!map.names.is_empty() && map.names.iter().all(|n| !n.starts_with("post/")), "the box alone: {:?}", map.names);
+    let rms0 = map.result.as_ref().map(|d| d.stats.rms_mm).map_err(|e| format!("{e:?}"));
+
+    // The path road opens the same held document.
+    let p = Viewer::open_deviation(scan().clone(), &doc, "fixture", SIZE, Preset::Una, None).expect("the path map opens held");
+    let pm = p.view.deviation.as_ref().expect("a map");
+    assert_eq!(pm.held.as_deref(), Some("post"));
+    assert!(corner(pm).contains(&"held=post".to_string()), "{:?}", corner(pm));
+
+    // The card: Tab to the post's own circle, Return replaces the statement and the map re-measures.
+    assert!(v.view.design.journal.select_line(line), "the post's line is a row");
+    let texts: Vec<String> = v.view.design.journal.fixes_for(post).into_iter().map(|f| f.text).collect();
+    assert_eq!(texts.len(), 2, "two closed loops: {texts:?}");
+    let want = texts.iter().position(|t| t.contains("outer=c1 ")).expect("c1 is offered");
+    for _ in 0..want {
+        assert!(v.key("Tab"), "Tab walks the card");
+    }
+    assert_eq!(v.view.design.journal.offered().map(|f| f.text), Some(texts[want].clone()));
+    assert!(v.key("Return"), "Return takes the pick");
+    assert!(v.view.design.journal.faults.is_empty(), "{:?}", v.view.design.journal.faults);
+    let map = v.view.deviation.as_ref().expect("a map");
+    let src = map.source.as_ref().expect("a journal map");
+    assert_eq!((src.generation, src.measured, src.refused.as_deref()), (1, 1, None), "the fix re-measured");
+    let lines = corner(map);
+    println!("{}", lines.join("\n"));
+    assert_eq!(map.held, None);
+    assert!(lines.iter().all(|l| !l.starts_with("held=")), "{lines:?}");
+    assert_eq!(lines.last().map(String::as_str), Some("design=journal@1 solids=2"), "{lines:?}");
+    assert!(map.names.iter().any(|n| n.starts_with("post/")), "the post joins the basis: {:?}", map.names);
+    let rms1 = map.result.as_ref().expect("both solids align").stats.rms_mm;
+    println!("deviationheld held=post solids=1->2 gen=1 rms0={rms0:?} rms1={rms1}");
+
+    // Two roots: the box's outer on a point too; the hold does not take it, the design refuses by the first line.
+    let two = doc_core::read(&text.replace("extrude body sketch=s1 outer=l1 ", "extrude body sketch=s1 outer=p1 ")).expect("reads");
+    let e = Viewer::open_deviation(scan().clone(), &two, "fixture", SIZE, Preset::Una, None).err().expect("two roots refuse");
+    assert!(e.starts_with("line ") && e.contains("NoProfile body"), "{e}");
+}
