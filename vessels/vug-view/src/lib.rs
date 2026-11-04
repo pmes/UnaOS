@@ -127,7 +127,7 @@ impl Viewer {
         }
         let mesh = model::read_mesh(scan)?;
         let text = std::fs::read_to_string(design).map_err(|e| format!("{design}: {e}"))?;
-        let doc = doc_core::read(&text).map_err(|e| format!("{design}: {e:?}"))?;
+        let doc = doc_core::read_with(&text, &doc_host::DirLib::beside(std::path::Path::new(design))).map_err(|e| format!("{design}: {e:?}"))?; // VUGMAKEMACHINELIBFACE (SR548)
         Viewer::open_deviation(deviation::scan_mesh(mesh), &doc, &title, size, preset).map_err(|e| format!("{design}: {e}"))
     }
 
@@ -208,8 +208,10 @@ impl Viewer {
     /// A .vug document: doc_core's reader (a refusal named by line), then [`Viewer::open_doc`]; `s` writes it back.
     fn open_vug(path: &str, title: &str, size: (u32, u32), preset: Preset) -> Result<Viewer, String> {
         let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
-        let doc = doc_core::read(&text).map_err(|r| format!("{path}: line {}: {:?}", r.line, r.what))?;
+        let lib = doc_host::DirLib::beside(std::path::Path::new(path)); // VUGMAKEMACHINELIBFACE (SR548): `lib=<name>` beside the part
+        let doc = doc_core::read_with(&text, &lib).map_err(|r| format!("{path}: line {}: {:?}", r.line, r.what))?;
         let mut v = Viewer::open_doc(doc, title, size, preset).map_err(|e| format!("{path}: {e}"))?;
+        v.view.design.journal.lib = Some(lib); // VUGMAKEMACHINELIBFACE (SR548): the journal's re-read resolves the same shelf
         v.save_to = Some(std::path::PathBuf::from(path));
         v.claimed = true;
         Ok(v)

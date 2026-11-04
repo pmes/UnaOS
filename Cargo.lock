@@ -1317,6 +1317,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "doc_host"
+version = "0.1.0"
+dependencies = [
+ "doc_core",
+]
+
+[[package]]
 name = "document-features"
 version = "0.2.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4394,6 +4401,7 @@ version = "0.1.0"
 dependencies = [
  "brep_core",
  "doc_core",
+ "doc_host",
  "mesh_core",
  "palette_core",
  "probe_core",
@@ -5465,6 +5473,7 @@ dependencies = [
  "bandy",
  "brep_core",
  "doc_core",
+ "doc_host",
  "euclase",
  "geom_core",
  "gneiss_pal",

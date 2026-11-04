@@ -430,3 +430,50 @@ fn the_intent_sigma_deg_is_the_largest_shape_spread() {
     let sigma: f64 = field(&report, "intent: shapes:", "sigma_deg").parse().unwrap();
     assert!((sigma - largest).abs() <= 0.0055 + 1e-9, "sigma_deg {sigma} vs the largest spread {largest}\n{report}");
 }
+
+/// VUGMAKEMACHINELIBFACE (SR548): a design naming its machine from a `.vugmachine` library beside it runs `--against`
+/// exactly as the same design with the machine written inline (same status, same report), and a library that is not
+/// beside it refuses by name (`DesignRead` carrying `UnknownLib`).
+#[test]
+fn an_against_design_with_a_library_machine_runs() {
+    const BOX: &str = "vug-doc version=1 lin=1e-6 ang=1e-9
+sketch s1 o=[0 0 0] z=[0 0 1] x=[1 0 0]
+point p1 sketch=s1 x=-230 y=-100
+point p2 sketch=s1 x=70 y=-100
+point p3 sketch=s1 x=70 y=100
+point p4 sketch=s1 x=-230 y=100
+line l1 sketch=s1 a=p1 b=p2
+line l2 sketch=s1 a=p2 b=p3
+line l3 sketch=s1 a=p3 b=p4
+line l4 sketch=s1 a=p4 b=p1
+fix f1 sketch=s1 p=p1 at=[-230 -100]
+fix f2 sketch=s1 p=p2 at=[70 -100]
+fix f3 sketch=s1 p=p3 at=[70 100]
+fix f4 sketch=s1 p=p4 at=[-230 100]
+extrude body sketch=s1 outer=l1 dir=[0 0 1] length=100
+";
+    const MACHINE: &str = "kind=mill3 kinematics=cartesian units=mm envelope=[[-50 -50 -60] [100 100 50]] safe_z=10 power=spindle power_max=24000 ask_above=20000";
+    const LINES: &str = "axis axis=x min=-50 max=100 max_feed=5000 max_accel=500 rapid=8000
+axis axis=y min=-50 max=100 max_feed=5000 max_accel=500 rapid=8000
+axis axis=z min=-60 max=50 max_feed=2000 max_accel=300 rapid=4000
+tool number=1 kind=flat_end dc=6 lf=40 apmx=2 nof=2 sig=0
+";
+    let d = dir("against-lib");
+    let (inp, ply) = (d.join("one.prb"), d.join("one.ply"));
+    prb(&inp, 1, true);
+    std::fs::write(d.join("shop.vugmachine"), format!("vug-doc version=1 lin=1e-6 ang=1e-9\nmachine shop name=\"Shop mill\" {MACHINE}\n{LINES}")).unwrap();
+    let (lib, inline, lost) = (d.join("lib.vugdoc"), d.join("inline.vugdoc"), d.join("lost.vugdoc"));
+    std::fs::write(&lib, format!("{BOX}machine mill lib=shop loaded=1\n")).unwrap();
+    std::fs::write(&inline, format!("{BOX}machine mill name=\"Shop mill\" {MACHINE} loaded=1\n{LINES}")).unwrap();
+    std::fs::write(&lost, format!("{BOX}machine mill lib=nosuch loaded=1\n")).unwrap();
+    let run = |doc: &PathBuf| scan(&[inp.to_str().unwrap(), "-o", ply.to_str().unwrap(), "--against", doc.to_str().unwrap()]);
+    let (a, b) = (run(&inline), run(&lib));
+    let err = String::from_utf8_lossy(&b.stderr).into_owned();
+    assert!(!err.contains("DesignRead"), "the library resolves beside the design: {err}");
+    assert_eq!(b.status.code(), a.status.code(), "stderr: {err}");
+    assert_eq!(String::from_utf8_lossy(&b.stdout), String::from_utf8_lossy(&a.stdout), "the library machine runs as the inline one");
+    let o = run(&lost);
+    assert_eq!(o.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&o.stderr).into_owned();
+    assert!(err.contains("DesignRead") && err.contains("UnknownLib(\"nosuch\")"), "{err}");
+}

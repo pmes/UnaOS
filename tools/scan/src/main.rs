@@ -667,7 +667,7 @@ fn shapes_report(r: &mut String, detected: &Result<Vec<Shape>, FitError>) {
 /// (named `<solid>/<op>.<role>.<a>.<b>:<kind>`), and the scan measured against it from the identity.
 fn against(path: &str, sm: &ScanMesh, band: f64) -> Result<(Deviation, Vec<String>), Refusal> {
     let text = String::from_utf8(read(path)?).map_err(|e| Refusal::Io { path: path.into(), error: e.to_string() })?;
-    let doc = doc_core::read(&text).map_err(Refusal::DesignRead)?;
+    let doc = doc_core::read_with(&text, &doc_host::DirLib::beside(std::path::Path::new(path))).map_err(Refusal::DesignRead)?; // VUGMAKEMACHINELIBFACE (SR548): `lib=<name>` beside the document
     let rp = doc_core::replay(&doc, doc.tol);
     if let Some(f) = rp.failures.first() {
         return Err(Refusal::Design { line: f.line, id: f.id.clone(), fault: f.fault.clone() });
@@ -833,7 +833,7 @@ fn intent_road(a: &Args, detected: &Result<Vec<Shape>, FitError>) -> Result<Stri
     }
     let Some(path) = doc_path else { return Ok(out) };
     let text = String::from_utf8(read(path)?).map_err(|e| Refusal::Io { path: path.clone(), error: e.to_string() })?;
-    let doc = doc_core::read(&text).map_err(Refusal::DesignRead)?;
+    let doc = doc_core::read_with(&text, &doc_host::DirLib::beside(std::path::Path::new(path))).map_err(Refusal::DesignRead)?; // VUGMAKEMACHINELIBFACE (SR548): `lib=<name>` beside the document
     let ps = doc_core::suggest(&doc, &m);
     out.push_str(&doc_core::verify_all(&doc, &ps, &m, doc.tol).text());
     Ok(out)

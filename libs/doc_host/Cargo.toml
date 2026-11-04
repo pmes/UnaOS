@@ -1,0 +1,10 @@
+[package]
+name = "doc_host"
+version = "0.1.0"
+edition = "2024"
+license = "LGPL-3.0-or-later"
+description = "VUGMAKEMACHINELIBFACE (SR548): the host side of Vug's doc_core: DirLib, the one directory lookup of a part's `.vugmachine` library (doc_core opens no file, BP-vug-4), shared by vug-view and tools/scan."
+
+# doc_core is the only dependency: the lookup is doc_core's `Lib` over std::fs, nothing else.
+[dependencies]
+doc_core = { path = "../../unaos/libs/cad/doc_core" }

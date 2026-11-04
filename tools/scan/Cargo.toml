@@ -20,5 +20,7 @@ mesh_core = { path = "../../unaos/libs/cad/mesh_core" }
 # VUGSCANDEVIATION (SR510): `--against <design.vugdoc>`: doc_core reads and replays the design, brep_core tessellates
 # its solids, palette_core gives the deviation map's colours.
 doc_core = { path = "../../unaos/libs/cad/doc_core" }
+# VUGMAKEMACHINELIBFACE (SR548): doc_host's DirLib resolves the design's `lib=<name>` beside it (--against, --intent).
+doc_host = { path = "../../libs/doc_host" }
 brep_core = { path = "../../unaos/libs/cad/brep_core" }
 palette_core = { path = "../../unaos/libs/sys/palette_core" }
