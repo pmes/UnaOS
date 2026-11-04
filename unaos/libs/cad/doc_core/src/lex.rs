@@ -246,7 +246,7 @@ pub fn read(text: &str) -> Result<Doc, Refusal> {
 /// VUGMAKEMACHINELIB (SR544): [`read`] with the caller's library lookup for `machine <id> lib=<name>`.
 pub fn read_with(text: &str, lib: &dyn Lib) -> Result<Doc, Refusal> {
     let mut doc: Option<Doc> = None;
-    let mut st = State { decls: BTreeMap::new(), machine: false, stock: false };
+    let mut st = State { decls: BTreeMap::new(), machine: false, stock: false, photo: false }; // VUGDOCPHOTOREF (SR652): photo
     for (n, raw) in text.split('\n').enumerate() {
         let line = n as u32 + 1;
         let raw = raw.strip_suffix('\r').unwrap_or(raw);
@@ -297,6 +297,8 @@ struct State {
     decls: BTreeMap<String, (Kind, Option<String>)>,
     machine: bool,
     stock: bool,
+    /// VUGDOCPHOTOREF (SR652): a `photo` statement was read (one per document).
+    photo: bool,
 }
 
 impl State {
@@ -741,6 +743,19 @@ fn statement(t: Toks, line: u32, st: &mut State, lib: &dyn Lib) -> Result<Stmt, 
             let confidence = f.f64("confidence")?;
             f.done()?;
             Stmt::Scan { id: st.declare(id, line, Kind::Scan, None)?, path, pose, confidence }
+        }
+        // VUGDOCPHOTOREF (SR652): `photo path="<file>" pitch=<mm>` — no id, no reference, one per document, on any line
+        // after the header (the face writes it first). An older build refuses the verb by name (`UnknownVerb`).
+        "photo" => {
+            no_id(&tid, line)?;
+            if st.photo {
+                return Err(Refusal { line, col: vcol, what: What::SecondPhoto });
+            }
+            let path = f.text("path")?;
+            let pitch_mm = f.f64("pitch")?;
+            f.done()?;
+            st.photo = true;
+            Stmt::Photo { path, pitch_mm }
         }
         _ => match constraint(&verb, &mut f, st)? {
             Some((sketch, c)) => {

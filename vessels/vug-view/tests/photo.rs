@@ -1748,18 +1748,111 @@ fn a_sketched_line_survives_the_crop_at_the_same_paper_mm() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// VUGFACEPHOTOCROPDOC (SR649): the carried document then saves to its own file beside the ORIGINAL photo (the document
-/// names no photo: `s` writes doc_core's text to the kept `fixture.vug`), clean, the title the crop's name; no
-/// `fixture.crop.vug` is written and the original photo is untouched.
+/// VUGFACEPHOTOCROPDOC (SR649): the carried document then saves to its own file beside the ORIGINAL photo (`s` writes
+/// doc_core's text to the kept `fixture.vug`; VUGDOCPHOTOREF (SR652): its `photo` line names the ORIGINAL
+/// `fixture.png`, whose measurement frames the document), clean, the title the crop's name; no `fixture.crop.vug` is
+/// written and the original photo is untouched.
 #[test]
 fn the_carried_document_saves_beside_the_original_photo() {
     let (mut vw, dir, _, doc, _, _) = crop_sketched("docsave");
     assert!(key(&mut vw, "s"));
     let saved = std::fs::read_to_string(dir.join("fixture.vug")).expect("the document is saved beside the original photo");
-    assert_eq!(saved, doc_core::write(&doc), "the carried document, the line's statements included");
+    assert_eq!(saved, with_photo(&doc, "fixture.png"), "the carried document, the line's statements included, over the original photo"); // VUGDOCPHOTOREF (SR652)
     assert!(!vw.view.design.journal.dirty(), "saved");
     assert_eq!(vw.title, "fixture.crop.png");
     assert!(!dir.join("fixture.crop.vug").exists(), "the crop's name never becomes the document's");
     assert_eq!(std::fs::read(dir.join("fixture.png")).expect("the original reads"), photo_core::fixture::photo_png(), "the original is untouched");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---- VUGDOCPHOTOREF (SR652): the document names its photo; a re-open lays the underlay (named tail block) ----
+
+/// The text `s` writes for `doc` drawn over the photo `path` (relative): doc_core's writer with the `photo` statement
+/// first, at the fixture's pitch.
+fn with_photo(doc: &doc_core::Doc, path: &str) -> String {
+    let mut stmts = vec![doc_core::Stmt::Photo { path: path.into(), pitch_mm: photo::PITCH_MM }];
+    stmts.extend(doc.stmts.iter().cloned());
+    doc_core::write(&doc_core::Doc { tol: doc.tol, stmts, lines: Vec::new() })
+}
+
+/// The fixture opened by its path in a fresh folder, a 5 mm line sketched at the paper point under the photo's centre
+/// and recorded, then `s`: the viewer, the folder, the photo's path, the document and the photo as saved.
+fn ref_saved(tag: &str) -> (Viewer, std::path::PathBuf, std::path::PathBuf, doc_core::Doc, Photo, [Vec2; 2]) {
+    let dir = crop_dir(tag);
+    let (mut vw, path) = crop_opened(&dir);
+    let (iw, ih) = (ph(&vw).image.width as f64, ph(&vw).image.height as f64);
+    let Ok(inv) = photo_core::homography::invert(&ph(&vw).h) else { panic!("the photo's H inverts") };
+    let q0 = photo_core::homography::apply(&inv, Vec2::new(iw * 0.5, ih * 0.5)).expect("the photo's centre on the paper");
+    let q1 = Vec2::new(q0.x + 5.0, q0.y);
+    let mut sk = face(&vw).sketch.clone();
+    let (a, b) = (sk.add_point(q0.x, q0.y), sk.add_point(q1.x, q1.y));
+    sk.add_line(a, b).expect("a line");
+    {
+        let d = &mut vw.view.design;
+        d.face = Some(SketchFace::over(world_planes()[0].1, sk));
+        d.journal.record(d.face.as_ref(), None);
+    }
+    assert!(key(&mut vw, "s"), "`s` saves");
+    assert!(!vw.view.design.journal.dirty(), "saved: {:?}", vw.view.design.journal.disk);
+    let doc = vw.view.design.journal.doc.clone();
+    let before = ph(&vw).clone();
+    (vw, dir, path, doc, before, [q0, q1])
+}
+
+/// VUGDOCPHOTOREF (SR652): a line sketched over a photo opened by its path saves as doc_core's text with `photo
+/// path="fixture.png" pitch=5` after the header (relative to the .vug's folder); `Viewer::open` of the .vug lays the
+/// photo again (THE photo road, the same bytes measured to the same H) under the SAME document (the line at the same
+/// paper mm, clean, the face the document's), the title the document's, the crop road on the photo's file, and the photo's
+/// colour under the line is the one it was drawn over; a re-save writes the same bytes.
+#[test]
+fn a_sketched_line_saved_over_a_photo_reopens_with_the_underlay_at_the_same_paper_mm() {
+    let (vw, dir, path, doc, before, line) = ref_saved("ref");
+    let vug = dir.join("fixture.vug");
+    let saved = std::fs::read_to_string(&vug).expect("the document is saved beside the photo");
+    assert_eq!(saved, with_photo(&doc, "fixture.png"), "the photo line after the header, the line's statements after it");
+    assert_eq!(saved.lines().nth(1), Some(format!("photo path=\"fixture.png\" pitch={}", doc_core::f64_text(photo::PITCH_MM)).as_str()));
+
+    let mut back = Viewer::open(vug.to_str().expect("a UTF-8 path"), (W, H), Preset::Una).unwrap_or_else(|e| panic!("the document opens: {e}"));
+    assert!(back.view.photo.is_some(), "the photo is laid under the document");
+    assert_eq!(back.view.design.journal.doc, doc, "the same document: the line at the same paper mm");
+    assert!(!back.view.design.journal.doc.stmts.iter().any(|s| matches!(s, doc_core::Stmt::Photo { .. })), "the photo line never enters the journal");
+    assert!(!back.view.design.journal.dirty(), "opened clean");
+    assert_eq!(back.title, "fixture.vug");
+    assert_eq!(back.save_to.as_deref(), Some(vug.as_path()));
+    assert_eq!(ph(&back).h, before.h, "the same bytes measure to the same paper frame");
+    assert_eq!(ph(&back).crop.source.as_deref(), Some(path.as_path()), "the crop road on the photo's file");
+    let mid = Vec2::new((line[0].x + line[1].x) * 0.5, (line[0].y + line[1].y) * 0.5);
+    for q in [line[0], line[1], mid] {
+        let (c0, c1) = (before.sample([q.x, q.y]).expect("on the photo"), ph(&back).sample([q.x, q.y]).expect("on the re-laid photo"));
+        assert_eq!(c0, c1, "the same colour under the line at {q:?}");
+    }
+    assert_eq!(face(&back).sketch.entities().len(), face(&vw).sketch.entities().len(), "the face is the document's sketch (the line included), not a fresh measurement");
+
+    back.save().expect("the re-save");
+    assert_eq!(std::fs::read_to_string(&vug).expect("re-saved"), saved, "a re-save writes the same bytes: the photo line relative again");
+    eprintln!("photo: doc-ref saved=fixture.vug photo=fixture.png pitch={} stmts={} h-equal=true", photo::PITCH_MM, doc.stmts.len());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// VUGDOCPHOTOREF (SR652): the photo gone from its path, the document still opens — bare (no photo), the same
+/// statements, clean — with one word in the corner, `photo: missing <path>`; never a refusal. The reference is kept:
+/// a save still writes the photo line.
+#[test]
+fn a_document_whose_photo_is_missing_opens_bare_and_names_it() {
+    let (_, dir, path, doc, _, _) = ref_saved("refmissing");
+    let vug = dir.join("fixture.vug");
+    let saved = std::fs::read_to_string(&vug).expect("saved");
+    std::fs::remove_file(&path).expect("the photo is removed");
+
+    let mut back = Viewer::open(vug.to_str().expect("a UTF-8 path"), (W, H), Preset::Una).unwrap_or_else(|e| panic!("a missing photo never refuses the document: {e}"));
+    assert!(back.view.photo.is_none(), "bare: no underlay");
+    assert_eq!(back.view.design.journal.doc, doc, "the same document");
+    assert!(!back.view.design.journal.dirty());
+    assert_eq!(back.view.design.journal.disk, Some(Ok(format!("photo: missing {}", path.display()))), "the one word in the corner");
+    assert_eq!(back.photo_doc.as_ref().map(|(p, _)| p.as_path()), Some(path.as_path()), "the reference is kept");
+
+    back.save().expect("the save");
+    assert_eq!(std::fs::read_to_string(&vug).expect("re-saved"), saved, "the photo line survives a save without the photo");
+    eprintln!("photo: doc-ref missing=fixture.png bare=true kept-on-save=true");
     let _ = std::fs::remove_dir_all(&dir);
 }

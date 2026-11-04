@@ -848,3 +848,135 @@ fn a_thin_side_off_the_lattice_is_kept() {
     let plain = run(&s).expect("the good photo measures");
     assert!(plain.loops[0].iter().all(|&p| to_part(&plain, p).x >= -1.0), "the plain plate has a vertex past its left side");
 }
+
+/// VUGPHOTOSIDETHINCROSS (SR654): a 0.5 mm shim lying ON the lattice line x = 45 refines into the line's ink pair (no pair of
+/// its own), so the tone tell keeps it: its stretch is darker than the sheet's ink by more than K spreads, no ink stretch
+/// trips, and its outline is in the loop at its width, centre and tip; the plate stays on the truth.
+#[test]
+fn a_thin_side_on_a_lattice_line_is_kept() {
+    use photo_core::{edges, grid, homography};
+    let s = Spec::good();
+    let truth_inv = homography::invert(&fixture::homography(&s)).expect("the true homography inverts");
+    let img = pixel_core::decode(&fixture::shim_on_line_png(&s)).expect("pixel_core decodes the on-line shim PNG");
+    // The rule through the public steps (the flat road: Spec::good has k1 = 0).
+    let gray = edges::luma(&img).expect("luma");
+    let el = edges::edgels(&gray);
+    let g = grid::find(&el, gray.w, gray.h).expect("grid");
+    let lat = homography::fit_lattice(&g, 5.0, gray.w, gray.h).expect("lattice");
+    let hi = homography::invert(&lat.h).expect("H inverts");
+    let wmm = g.width_px / lat.px_per_mm;
+    let r = (g.pitch_px / 5.0).round().clamp(4.0, 20.0);
+    let sil = silhouette::extract(&gray, &lat, 5.0, wmm, r).expect("silhouette");
+    let (ink, spread, cut) = photo_core::ink_cut(&g.pairs, &gray, &sil, &hi, 5.0, wmm).expect("the on-lattice pairs give an ink tone");
+    let min_px = 5.0 / 8.0 * lat.px_per_mm;
+    let plate_bottom = 23.7 + (fixture::SHIM_ON_X - 33.3) * 1.5f64.to_radians().tan();
+    let (mut stretches, mut on_shim, mut core) = (0usize, 0usize, Vec::new());
+    for p in g.pairs.iter().filter(|p| !photo_core::off_lattice(p, &hi, 5.0, wmm)) {
+        for (t0, t1) in photo_core::dark_pair(p, &gray, &sil, &hi, cut, min_px) {
+            stretches += 1;
+            let a = apply(&truth_inv, p.point + p.dir * t0).expect("the truth maps the stretch");
+            let b = apply(&truth_inv, p.point + p.dir * t1).expect("the truth maps the stretch");
+            eprintln!("diag stretch: paper ({:.2},{:.2})-({:.2},{:.2}) len_px={:.1}", a.x, a.y, b.x, b.y, t1 - t0);
+            let near = |q: Vec2| (q.x - fixture::SHIM_ON_X).abs() <= 1.5 && q.y >= fixture::SHIM_ON_TIP - 1.0 && q.y <= plate_bottom + 1.0;
+            assert!(near(a) && near(b), "an ink stretch tripped the tone tell: ({},{})-({},{})", a.x, a.y, b.x, b.y);
+            if (a.y - b.y).abs() > 5.0 {
+                on_shim += 1;
+                let n = (t1 - t0) as usize;
+                core.extend((0..=n).filter_map(|k| gray.sample((p.point + p.dir * (t0 + k as f64)).x, (p.point + p.dir * (t0 + k as f64)).y)).map(f64::from));
+            }
+        }
+    }
+    core.sort_by(|a, b| a.total_cmp(b));
+    let core = core.get(core.len() / 2).copied().unwrap_or(f64::NAN);
+    assert!(on_shim >= 1, "no dark stretch along the shim on x = {}", fixture::SHIM_ON_X);
+    assert!(core < cut && cut < ink, "core {core} cut {cut} ink {ink}");
+    let m = measure(&img, PhotoParams::new(5.0), Tol::DEFAULT).expect("the on-line shim photo measures");
+    let pts: Vec<Vec2> = m.loops[0]
+        .iter()
+        .map(|&p| apply(&truth_inv, apply(&m.h, p).expect("h maps the outline")).expect("the truth maps back"))
+        .collect();
+    let tab: Vec<Vec2> = pts.iter().copied().filter(|q| q.y < plate_bottom - 1.0).collect();
+    let band = fit::BAND_SIGMA * m.sigma_mm;
+    assert!(tab.len() >= 2, "no shim vertices in the loop: {pts:?}");
+    let (xlo, xhi) = tab.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |a, q| (a.0.min(q.x), a.1.max(q.x)));
+    let tip = tab.iter().map(|q| q.y).fold(f64::INFINITY, f64::min);
+    eprintln!(
+        "photo: shim-on-line ink={ink:.1} spread={spread:.2} cut={cut:.1} core={core:.1} otsu={} stretches={stretches} width={:.3} tip={tip:.3} x={:.3} sigma={:.4}",
+        sil.threshold,
+        xhi - xlo,
+        (xlo + xhi) * 0.5,
+        m.sigma_mm
+    );
+    assert!(((xhi - xlo) - fixture::SHIM_W).abs() <= band, "shim width {} vs {}", xhi - xlo, fixture::SHIM_W);
+    assert!(((xlo + xhi) * 0.5 - fixture::SHIM_ON_X).abs() <= band, "shim centre {}", (xlo + xhi) * 0.5);
+    assert!((tip - fixture::SHIM_ON_TIP).abs() <= band, "shim tip {tip} vs {}", fixture::SHIM_ON_TIP);
+    let worst = pts
+        .iter()
+        .filter(|q| q.y >= plate_bottom - 1.0 && (q.x - fixture::SHIM_ON_X).abs() > 1.0)
+        .map(|&q| fixture::outline_distance(fixture::paper_to_part(&s, q)))
+        .fold(0.0f64, f64::max);
+    assert!(worst < 0.5, "plate outline off the truth by {worst} mm");
+}
+
+// ---- VUGPHOTOSIDETHINFIT (SR655): the shim's two sides fit as two parallel lines and its end (named tail block) ----
+#[test]
+fn a_thin_side_fits_two_parallel_lines() {
+    let s = Spec::good();
+    let truth_inv = photo_core::homography::invert(&fixture::homography(&s)).expect("the true homography inverts");
+    let to_part = |m: &Measured, p: Vec2| -> Vec2 {
+        let q = apply(&m.h, p).expect("h maps the outline");
+        fixture::paper_to_part(&s, apply(&truth_inv, q).expect("the truth maps back"))
+    };
+    let img = pixel_core::decode(&fixture::shim_png(&s)).expect("pixel_core decodes the shim PNG");
+    let m = measure(&img, PhotoParams::new(5.0), Tol::DEFAULT).expect("the shim photo measures");
+    let band = fit::BAND_SIGMA * m.sigma_mm;
+    // Every outer line in paper mm and in part mm.
+    let ls: Vec<((Vec2, Vec2), (Vec2, Vec2))> = m
+        .shape
+        .outer
+        .iter()
+        .filter_map(|p| match *p {
+            Prim::Line { a, b, .. } => Some(((a, b), (to_part(&m, a), to_part(&m, b)))),
+            _ => None,
+        })
+        .collect();
+    eprintln!("photo: thin fit outer={:?}", ls.iter().map(|l| l.1).collect::<Vec<_>>());
+    let sides: Vec<&((Vec2, Vec2), (Vec2, Vec2))> =
+        ls.iter().filter(|l| (l.1.0 + l.1.1).x * 0.5 < -1.0 && l.1.0.dist(l.1.1) >= fixture::SHIM_L * 0.5).collect();
+    assert_eq!(sides.len(), 2, "the shim's sides: {:?}", ls.iter().map(|l| l.1).collect::<Vec<_>>());
+    let (s0, s1) = (sides[0].1, sides[1].1);
+    let (u, v) = (s0.1 - s0.0, s1.1 - s1.0);
+    assert!(u.dot(v) < 0.0, "the sides run back against each other: {u:?} {v:?}");
+    let (uh, vh) = (u / u.mag(), v / v.mag());
+    assert!(uh.cross(vh).abs() * u.mag().min(v.mag()) <= band, "the sides are not parallel within the band: {u:?} {v:?}");
+    let sep = ((s1.0 + s1.1) * 0.5 - s0.0).cross(uh).abs();
+    assert!((sep - fixture::SHIM_W).abs() <= 2.0 * m.sigma_mm, "side separation {sep} vs {}", fixture::SHIM_W);
+    let ends: Vec<(Vec2, Vec2)> =
+        ls.iter().map(|l| l.1).filter(|l| ((l.0 + l.1).x * 0.5 + fixture::SHIM_L).abs() <= band).collect();
+    assert_eq!(ends.len(), 1, "the shim's end: {ends:?}");
+    let end = ends[0].0.dist(ends[0].1);
+    assert!((end - fixture::SHIM_W).abs() <= band, "end length {end} vs {}", fixture::SHIM_W);
+    let tip = ends[0].0.x.min(ends[0].1.x);
+    // The spike: a line from the tip to the plate that is not one of the two parallel sides (the merged end's diagonal).
+    let spans = ls.iter().filter(|l| l.1.0.x.min(l.1.1.x) < -fixture::SHIM_L * 0.5 && l.1.0.x.max(l.1.1.x) > -1.0).count();
+    assert_eq!(spans, 2, "only the shim's two sides run from its tip to the plate (else the spike)");
+    // Both sides take the same axis constraint from the sketch writer (paper frame: Horizontal or Vertical within
+    // sketch::HV_DEG), which says they are parallel (on Spec::good the part's x runs along the paper's y: Vertical).
+    let axis = |side: &&((Vec2, Vec2), (Vec2, Vec2))| -> Option<bool> {
+        let d = side.0.1 - side.0.0;
+        let mut ang = d.y.atan2(d.x).to_degrees();
+        if ang < 0.0 {
+            ang += 180.0;
+        }
+        if ang.min(180.0 - ang) <= photo_core::sketch::HV_DEG {
+            Some(true)
+        } else if (ang - 90.0).abs() <= photo_core::sketch::HV_DEG {
+            Some(false)
+        } else {
+            None
+        }
+    };
+    let (a0, a1) = (axis(&sides[0]), axis(&sides[1]));
+    assert!(a0.is_some() && a0 == a1, "the shim's sides take different axis constraints: {a0:?} {a1:?}");
+    eprintln!("photo: thin fit sides={} sep={sep:.3} end={end:.3} tip={tip:.3} sigma={:.4}", sides.len(), m.sigma_mm);
+}

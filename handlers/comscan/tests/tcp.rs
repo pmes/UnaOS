@@ -301,6 +301,12 @@ fn fake_grbl_lost_after_as(l: TcpListener, n: usize, ver: &'static str) -> JoinH
     })
 }
 
+/// VUGCOMSCANRESUMEMODAL (SR656): what a resume at pump line `at` sends: the program's modal preamble (make_core's one
+/// `G21 G90 G17 G94` line, every group it sets, one line each) and then the lines from `at` on.
+fn modal_then(lines: &[String], at: usize) -> Vec<String> {
+    lines[0].split_whitespace().map(str::to_string).chain(lines[at..].iter().cloned()).collect()
+}
+
 fn refused_why(out: &[PumpEvent]) -> String {
     match out {
         [PumpEvent::PumpRefused { why }] => why.clone(),
@@ -426,7 +432,7 @@ fn a_lost_tcp_link_is_link_lost_at_its_line_redials_with_backoff_and_resumes_onl
         other => panic!("{other:?}"),
     }
     drop(desk);
-    assert_eq!(fake2.join().unwrap(), lines[5..].to_vec(), "the second link ran only the lines from the lost one on");
+    assert_eq!(fake2.join().unwrap(), modal_then(&lines, 5), "the second link ran the modal words set before the lost line, then the lines from it on");
 }
 
 // --- VUGCOMSCANHELLOID (SR546): the controller's own identity at the first open, a reopen onto another board refused ---
@@ -551,7 +557,7 @@ fn a_reopen_onto_another_board_is_refused_by_name_and_keeps_redialing_the_same_b
         other => panic!("{other:?}"),
     }
     drop(desk);
-    assert_eq!(fake_a.join().unwrap(), lines[5..].to_vec(), "the same board ran only the lines from the lost one on");
+    assert_eq!(fake_a.join().unwrap(), modal_then(&lines, 5), "the same board ran the modal words, then only the lines from the lost one on");
 }
 
 // --- VUGCOMSCANHOSTDESK (SR561): the first bind commissions an unnamed board once; a reopen compares the commissioned name ---
@@ -759,7 +765,7 @@ fn a_reopen_onto_a_board_answering_another_name_refuses_another_board() {
     }
     drop(desk);
     let (ran_a, writes_a) = fake_a.join().unwrap();
-    assert_eq!(ran_a, lines[5..].to_vec(), "the commissioned board ran only the lines from the lost one on");
+    assert_eq!(ran_a, modal_then(&lines, 5), "the commissioned board ran the modal words, then only the lines from the lost one on");
     assert!(writes_a.is_empty(), "a reopen never commissions");
 }
 
