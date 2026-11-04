@@ -27,6 +27,9 @@
 //!   concentric holes, bolt circles), every proposal still disposed by [`verify_all`].
 //! * VUGDOCFROMSKETCH (SR516): [`from_sketch`] — the ONE sketch_core sketch -> statements writer (replay's inverse;
 //!   names through [`SketchNames`], [`PlainNames`] the plain `s` / `e<slot>` / `k<id>`).
+//! * VUGMAKEMACHINELIB (SR544): a machine from a library — `machine <id> lib=<name>` resolved at [`read_with`] through
+//!   a caller's [`Lib`] (doc_core opens no file), held in the statement as [`MachineLib`], written back as `lib=`;
+//!   [`machine_of`] the ONE road from a document to make_core's `Machine`, the library's axes / tools folded in.
 //!
 //! The grammar: `<verb> <id>? <key>=<value>...`; `#` starts a comment (outside a string) that runs to the end of the
 //! line; the first statement is the header `vug-doc version=1 lin=<f64> ang=<f64>` (the format, its version and the
@@ -41,6 +44,7 @@
 
 extern crate alloc;
 
+use alloc::boxed::Box; // VUGMAKEMACHINELIB (SR544): What::BadLib
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -60,6 +64,8 @@ pub use intent::{ShapeParams, ShapeRef, measurements_text}; // VUGINTENTSCAN (SR
 pub use standards::{Class, METRIC, Standard, Thread, clearance_for, nearest_standard};
 pub use suggest::suggest;
 pub use lex::read;
+pub use lex::read_with; // VUGMAKEMACHINELIB (SR544)
+pub use replay::machine_of; // VUGMAKEMACHINELIB (SR544)
 pub use replay::{Failure, Fault, Replay, SketchOut, SolidOut, brep_profile, replay};
 pub use write::{escape, f64_text, write};
 
@@ -147,7 +153,8 @@ pub enum Pose {
 }
 
 /// The machine statement: make_core's `Machine` minus the lists the axis / tool / stock / fixture statements carry,
-/// plus its name (make_core's model has none; a library to resolve it against is VUG-DOC-MACHINELIB, owed).
+/// plus its name (make_core's model has none). VUGMAKEMACHINELIB (SR544): `lib` is Some when the line named a library
+/// (`machine <id> lib=<name>`): the fields above are then the library machine's, the id and `loaded` the part's.
 #[derive(Clone, Debug, PartialEq)]
 pub struct MachineStmt {
     pub id: String,
@@ -159,6 +166,23 @@ pub struct MachineStmt {
     pub safe_z: f64,
     pub power: Power,
     pub loaded: Option<u32>,
+    /// VUGMAKEMACHINELIB (SR544): the library this machine came from, None for an inline machine.
+    pub lib: Option<MachineLib>,
+}
+
+/// VUGMAKEMACHINELIB (SR544): a machine library resolved at read — its name (what the part writes back as `lib=`) and
+/// its axis / tool statements in order (never in `Doc::stmts`: [`machine_of`] folds them in at the machine's line).
+#[derive(Clone, Debug, PartialEq)]
+pub struct MachineLib {
+    pub name: String,
+    pub stmts: Vec<Stmt>,
+}
+
+/// VUGMAKEMACHINELIB (SR544): the caller's library lookup — the text of the `.vugmachine` document named `name` (a word
+/// of the id charset, so never a path), or None. doc_core opens no file (BP-vug-4); a tool or the face looks beside
+/// the part.
+pub trait Lib {
+    fn resolve(&self, name: &str) -> Option<String>;
 }
 
 /// One statement. Sketch geometry is plain `[f64; N]` (converted at replay); the Make holds make_core's own types.
@@ -286,6 +310,13 @@ pub enum What {
     Orphan,
     /// A token where `key=value` is expected.
     Trailing,
+    // VUGMAKEMACHINELIB (SR544): a machine from a library.
+    /// `machine <id> lib=<name>`: the resolver holds no library of this name.
+    UnknownLib(String),
+    /// The library `name` did not read; `at` is the refusal inside it (its own line and column).
+    BadLib { name: String, at: Box<Refusal> },
+    /// A library statement other than the one machine first (without `loaded`) and its axes / tools, or no machine.
+    NotLibrary,
 }
 
 // The word tables: one per enum, read by word and written by value (the ONE spelling of each).

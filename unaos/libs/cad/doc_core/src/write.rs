@@ -227,6 +227,16 @@ fn stmt(w: &mut W, s: &Stmt) {
             w.arr("axis_d", axis_d);
             w.f("angle", *angle);
         }
+        // VUGMAKEMACHINELIB (SR544): a machine from a library writes the library's name, never its statements.
+        Stmt::Machine(m) if m.lib.is_some() => {
+            w.head("machine", &m.id);
+            if let Some(l) = &m.lib {
+                w.w("lib", &l.name);
+            }
+            if let Some(t) = m.loaded {
+                w.u("loaded", t as u64);
+            }
+        }
         Stmt::Machine(m) => {
             w.head("machine", &m.id);
             w.s("name", &m.name);

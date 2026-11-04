@@ -605,3 +605,112 @@ fn diff_names_the_ramp_and_cc() {
     let cc = read(&with_tool1(" cc=yes")).unwrap();
     assert_eq!(doc_core::diff(&plain, &cc).text(), "~ tool tool:1 cc: (none) -> yes\n");
 }
+
+// VUGMAKEMACHINELIB (SR544): a machine from a library. DOC_A's machine, axes and tools move into a `.vugmachine`
+// document; the part names it by `machine mill lib=shop-mill loaded=1` and keeps its stock, fixture and Ops.
+const MACHINE_A: &str = "machine mill name=\"Shop mill \\\"A\\\"\" kind=mill3 kinematics=cartesian units=mm \
+     envelope=[[-50 -50 -60] [100 100 50]] safe_z=10 power=spindle power_max=24000 ask_above=20000";
+
+/// The library lines DOC_A carries inline (its axes and tools), each followed by its newline.
+fn lib_lines() -> Vec<&'static str> {
+    DOC_A.lines().filter(|l| l.starts_with("axis ") || l.starts_with("tool ")).collect()
+}
+
+/// (the library's text, the part's text): DOC_A split at its machine.
+fn split_a() -> (String, String) {
+    let mut lib = format!("vug-doc version=1 lin=1e-6 ang=1e-9\n# the shop's mill\n{MACHINE_A}\n");
+    for l in lib_lines() {
+        lib.push_str(l);
+        lib.push('\n');
+    }
+    let mut part = String::new();
+    for l in DOC_A.lines() {
+        if l.starts_with("machine ") {
+            assert_eq!(l, format!("{MACHINE_A} loaded=1"), "MACHINE_A is DOC_A's machine");
+            part.push_str("machine mill lib=shop-mill loaded=1\n");
+        } else if !(l.starts_with("axis ") || l.starts_with("tool ")) {
+            part.push_str(l);
+            part.push('\n');
+        }
+    }
+    (lib, part)
+}
+
+/// A shelf of libraries by name (the face's directory lookup, in memory).
+struct Shelf(Vec<(&'static str, String)>);
+
+impl doc_core::Lib for Shelf {
+    fn resolve(&self, name: &str) -> Option<String> {
+        self.0.iter().find(|(n, _)| *n == name).map(|(_, t)| t.clone())
+    }
+}
+
+fn shelf() -> Shelf {
+    Shelf(vec![("shop-mill", split_a().0)])
+}
+
+#[test]
+fn a_library_machine_replays_as_the_inline_machine() {
+    let (_, part) = split_a();
+    let inline = read(DOC_A).unwrap();
+    let d = doc_core::read_with(&part, &shelf()).unwrap_or_else(|r| panic!("read_with: {r:?}"));
+    assert_eq!(d.stmts.len(), inline.stmts.len() - lib_lines().len(), "the library's lines are not the part's");
+    let Some(Stmt::Machine(m)) = d.stmts.iter().find(|s| matches!(s, Stmt::Machine(_))) else { panic!("machine") };
+    assert_eq!((m.id.as_str(), m.name.as_str(), m.loaded), ("mill", "Shop mill \"A\"", Some(1)));
+    assert_eq!(m.lib.as_ref().map(|l| (l.name.as_str(), l.stmts.len())), Some(("shop-mill", 5)));
+    let (a, b) = (doc_core::machine_of(&inline).unwrap(), doc_core::machine_of(&d).unwrap());
+    assert_eq!(b, a, "the same make_core Machine");
+    assert_eq!(b.digest(), a.digest(), "Machine::digest byte-equal (the KAT)");
+    let tol = Tol { lin: 1e-6, ang: 1e-9 };
+    let (ri, rl) = (replay(&inline, tol), replay(&d, tol));
+    assert_eq!(rl.failures, ri.failures);
+    assert!(rl.failures.is_empty(), "{:?}", rl.failures);
+    assert!(ri.program.is_some(), "DOC_A's Ops generate");
+    assert_eq!(rl.program, ri.program, "the same Program");
+}
+
+#[test]
+fn a_library_machine_writes_back_its_name() {
+    let (_, part) = split_a();
+    let d = doc_core::read_with(&part, &shelf()).unwrap();
+    let s1 = write(&d);
+    assert!(s1.contains("\nmachine mill lib=shop-mill loaded=1\n"), "{s1}");
+    assert!(!s1.contains("\naxis ") && !s1.contains("\ntool "), "never the library's statements:\n{s1}");
+    let canon = write(&read(DOC_A).unwrap());
+    let keep = |t: &str| -> Vec<String> {
+        t.lines().filter(|l| !(l.starts_with("machine ") || l.starts_with("axis ") || l.starts_with("tool "))).map(String::from).collect()
+    };
+    assert_eq!(keep(&s1), keep(&canon), "every other line as the inline form writes it");
+    let d2 = doc_core::read_with(&s1, &shelf()).unwrap();
+    assert_eq!(d2, d);
+    assert_eq!(write(&d2), s1);
+    // A library swap is one changed field through the writer's text.
+    let mut other = shelf();
+    other.0.push(("router", split_a().0));
+    let e = doc_core::read_with(&part.replace("lib=shop-mill", "lib=router"), &other).unwrap();
+    assert_eq!(doc_core::diff(&d, &e).text(), "~ machine mill lib: shop-mill -> router\n");
+}
+
+#[test]
+fn an_unknown_library_refuses_by_name() {
+    let (lib, part) = split_a();
+    let line = part.lines().position(|l| l.starts_with("machine ")).unwrap() as u32 + 1;
+    let want = doc_core::Refusal { line, col: 18, what: What::UnknownLib("shop-mill".into()) };
+    assert_eq!(doc_core::read_with(&part, &Shelf(vec![])), Err(want.clone()));
+    assert_eq!(read(&part), Err(want), "plain read resolves nothing");
+    // A library holding more than the machine, its axes and tools is not a library.
+    let stocked = Shelf(vec![("shop-mill", format!("{lib}stock shape=box size=[1 1 1] origin=[0 0 0]\n"))]);
+    let r = doc_core::read_with(&part, &stocked).expect_err("refused");
+    let inner = doc_core::Refusal { line: lib.lines().count() as u32 + 1, col: 1, what: What::NotLibrary };
+    assert_eq!(r.what, What::BadLib { name: "shop-mill".into(), at: Box::new(inner) });
+    assert_eq!((r.line, r.col), (line, 18));
+    // A library's own lex refusal is named inside it; a path is never a library name.
+    let broken = Shelf(vec![("shop-mill", lib.replacen("kind=mill3", "kind=mill9", 1))]);
+    let r = doc_core::read_with(&part, &broken).expect_err("refused");
+    assert!(matches!(&r.what, What::BadLib { at, .. } if at.line == 3 && at.what == What::BadValue { key: "kind".into() }), "{r:?}");
+    let r = doc_core::read_with(&part.replace("lib=shop-mill", "lib=../x"), &shelf()).expect_err("refused");
+    assert_eq!(r.what, What::BadValue { key: "lib".into() });
+    // Beside lib= every other machine key is unknown.
+    let r = doc_core::read_with(&part.replace("lib=shop-mill", "lib=shop-mill safe_z=3"), &shelf()).expect_err("x");
+    assert_eq!(r.what, What::UnknownKey("safe_z".into()));
+}
