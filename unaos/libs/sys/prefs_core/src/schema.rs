@@ -277,7 +277,7 @@ pub static SCHEMA: &[Key] = &[
     },
     Key {
         ns: "system", key: "display.font_size", kind: Kind::Int { min: 9, max: 32 }, default: Default::Int(13),
-        writers: &[Writer::Program], reader: "kernel `video::text` (KERNELFONT)",
+        writers: &[Writer::Settings, Writer::Program], reader: "kernel `video::text` (KERNELFONT)",
         doc: "UI text size in CSS px; device px = size x the panel's ppi (EDID) / 96, capped by the 16 px text cell; captions keep the bar-derived size.",
     }, Key { ns: "system", key: "display.icc", kind: Kind::Str { max_len: 255, printable: true }, default: Default::Str(""), writers: OP, reader: "kernel `video::colour::latch` (DISPLAYICCFILE)", doc: "The absolute path of an installed display profile (ICC matrix/TRC) that wins over the EDID at the display transform's latch; empty = the EDID's own (DISPLAYICCFILE B972). No Settings row until DISPLAY-ICC-FACE: the operator writes it (`pref set system.display.icc <path>`)." }, // GATEREDS (rmbp-ledger B1096): the DISPLAYICCFILE key (B972) declared, OUT of prefs::key::ALL until DISPLAY-ICC-FACE gives it a Settings row; operator-written only. LINE-NEUTRAL append, code first
     Key {

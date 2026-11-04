@@ -34,7 +34,7 @@ pub const LEGACY: &str = ".config/unaos/preferences.toml";
 /// VEIL-BOOT-STORE-R3 (rmbp-ledger B1146): the `system` keys the boot login screen reads before any login — the ONE list
 /// the kernel's machine mirror (`prefs::machine_mirror`) copies into the no-session store. A relayed ring-3 SET (PREFS.ELF
 /// forwards to the kernel's verb 17) commits through the same mirror, so there is no second list to drift.
-pub const MACHINE_KEYS: &[&str] = &["accessibility.reduce_transparency", "accessibility.reduce_motion", "accessibility.increase_contrast", "accessibility.cursor_size", "accessibility.cvd", "accessibility.invert", "accessibility.shimmer", "accessibility.zoom", "accessibility.zoom_follow"]; // A11Y-BOOT-SET (rmbp-ledger B1147, composed at the seat fold): the nine accessibility keys a boot-screen consumer paints
+pub const MACHINE_KEYS: &[&str] = &["accessibility.reduce_transparency", "accessibility.reduce_motion", "accessibility.increase_contrast", "accessibility.cursor_size", "accessibility.cvd", "accessibility.invert", "accessibility.shimmer", "accessibility.zoom", "accessibility.zoom_follow", "display.font_size"]; // A11Y-BOOT-SET (rmbp-ledger B1147, composed at the seat fold): the nine accessibility keys a boot-screen consumer paints; A11Y-BOOT-TEXT (rmbp-ledger B1153): the login form's text size (`video::text`'s Ui face follows it, `text::follow_prefs`), the applied form of accessibility.text_size, which stays out (its mirror would arm settings' bit-3 write-back on a no-session read)
 
 /// PRINCIPIAFILES (B445): the `by` of a domain's `# auto-saved` line when no explicit writer is named — the pane
 /// that owns a system domain, else the program the domain belongs to. The kernel and Principia both stamp with it.
