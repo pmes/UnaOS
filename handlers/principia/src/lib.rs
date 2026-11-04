@@ -185,6 +185,7 @@ impl Principia {
             }
 
             PrincipiaCommand::PrefSet { ns, key, value } => Some(self.set_pref(ns, key, value)),
+            PrincipiaCommand::PrefUnset { ns, key } => Some(self.unset_pref(ns, key)), // PRINCIPIA-UNSET-SYNAPSE (SR603): file tail
 
             // Replies and broadcasts are not commands — Principia hears its own
             // output on the broadcast Synapse and must not act on it.
@@ -611,3 +612,86 @@ pub fn default_prefs_path() -> PathBuf {
         .join(prefs_core::files::DIR)
 }
 
+// ---- PRINCIPIA-UNSET-SYNAPSE (SR603): the typed unset arm (named tail block) ----
+// SR595 built the unset on the byte seam (`wire::unset`); the typed request table had no arm. This one enters the SAME
+// road with `(ns, key)` (`wire::unset_key`: one validation, one cap check, one `PrefStore::unset`, one `unset_body`).
+
+impl Principia {
+    /// Apply one unset in the SET arm's shape: on success the answer is the typed reading of the PREF_CHANGED unset
+    /// form the byte road posts (`prefs_core::wire::parse_changed(&unset_body)` -> `PrefValueIs { value: None }`, the
+    /// frozen "unset: the consumer's default" reply, inert to Principia's own arm); on refusal `PrefError` with the
+    /// road's words. The host Synapse is in-process, so its sender is the session's own (`in_session = true`).
+    fn unset_pref(&mut self, ns: &str, key: &str) -> SMessage {
+        match wire::unset_key(&mut self.prefs, ns, key, true) {
+            Ok(posted) => {
+                log::info!("[PRINCIPIA] :: unset {ns}.{key}");
+                let value = prefs_core::wire::parse_changed(&posted).and_then(|(_, _, v, _)| v).map(|v| prefs::from_core(&v));
+                SMessage::Principia(PrincipiaCommand::PrefValueIs { ns: ns.to_string(), key: key.to_string(), value })
+            }
+            Err((_, message)) => {
+                log::warn!("[PRINCIPIA] :: rejected unset {ns}.{key}: {message}");
+                SMessage::Principia(PrincipiaCommand::PrefError { ns: ns.to_string(), key: key.to_string(), message })
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod unset_synapse_tests {
+    use super::*;
+
+    fn reply(msg: Option<SMessage>) -> PrincipiaCommand {
+        match msg {
+            Some(SMessage::Principia(cmd)) => cmd,
+            other => panic!("expected a Principia reply, got {other:?}"),
+        }
+    }
+
+    fn unset(p: &mut Principia, ns: &str, key: &str) -> PrincipiaCommand {
+        reply(p.process_impulse(&SMessage::Principia(PrincipiaCommand::PrefUnset { ns: ns.into(), key: key.into() })))
+    }
+
+    /// PRINCIPIA-UNSET-SYNAPSE (SR603): `vug.photo.camera_mm` set through PrefSet; a PrefUnset with a dotted namespace
+    /// (`a.b` / `c`) refuses with the SET arm's name words and touches nothing; the PrefUnset answers PrefValueIs None,
+    /// the typed reading of SR169's unset form, the store and a reload read it unset; a second PrefUnset refuses
+    /// "unset already".
+    #[test]
+    fn a_typed_pref_unset_unsets_the_store_and_posts_the_unset_form() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut p = Principia::with_home(dir.path());
+        match reply(p.process_impulse(&SMessage::Principia(PrincipiaCommand::PrefSet {
+            ns: "vug".into(),
+            key: "photo.camera_mm".into(),
+            value: PrefValue::Float(400.0),
+        }))) {
+            PrincipiaCommand::PrefChanged { .. } => {}
+            other => panic!("expected PrefChanged, got {other:?}"),
+        }
+        assert!(p.prefs().get("vug", "photo.camera_mm").is_some());
+
+        match unset(&mut p, "a.b", "c") {
+            PrincipiaCommand::PrefError { ns, key, message } => {
+                assert_eq!((ns.as_str(), key.as_str()), ("a.b", "c"));
+                assert!(message.contains("invalid namespace"), "{message}");
+            }
+            other => panic!("expected PrefError, got {other:?}"),
+        }
+        assert!(p.prefs().get("vug", "photo.camera_mm").is_some(), "a refusal touches nothing");
+
+        match unset(&mut p, "vug", "photo.camera_mm") {
+            PrincipiaCommand::PrefValueIs { ns, key, value } => {
+                assert_eq!((ns.as_str(), key.as_str(), value), ("vug", "photo.camera_mm", None));
+                let posted = prefs_core::wire::unset_body("vug", "photo.camera_mm");
+                assert_eq!(prefs_core::wire::parse_changed(&posted), Some(("vug", "photo.camera_mm", None, false)));
+            }
+            other => panic!("expected PrefValueIs, got {other:?}"),
+        }
+        assert_eq!(p.prefs().get("vug", "photo.camera_mm"), None);
+        assert_eq!(PrefStore::load(p.prefs().path()).unwrap().get("vug", "photo.camera_mm"), None, "the file no longer holds it");
+
+        match unset(&mut p, "vug", "photo.camera_mm") {
+            PrincipiaCommand::PrefError { message, .. } => assert!(message.contains("unset already"), "{message}"),
+            other => panic!("expected PrefError, got {other:?}"),
+        }
+    }
+}

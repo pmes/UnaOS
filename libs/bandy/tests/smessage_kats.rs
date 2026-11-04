@@ -890,6 +890,16 @@ kat!(
     r#"{"Principia":{"PrefError":{"ns":"aether","key":"window..width","message":"empty key segment"}}}"#
 );
 
+// PRINCIPIA-UNSET-SYNAPSE (SR603): the typed unset request (answered by PrefValueIs { value: None } or PrefError).
+kat!(
+    kat_principia_pref_unset,
+    SMessage::Principia(PrincipiaCommand::PrefUnset {
+        ns: "vug".to_string(),
+        key: "photo.camera_mm".to_string(),
+    }),
+    r#"{"Principia":{"PrefUnset":{"ns":"vug","key":"photo.camera_mm"}}}"#
+);
+
 /// The typed value domain must not widen or coerce across the wire — a float
 /// that reads back as an int would silently retype a stored preference.
 #[test]
@@ -1606,6 +1616,7 @@ fn principia_variant_name(c: &PrincipiaCommand) -> &'static str {
         PrincipiaCommand::PrefGet { .. } => "PrefGet",
         PrincipiaCommand::PrefValueIs { .. } => "PrefValueIs",
         PrincipiaCommand::PrefSet { .. } => "PrefSet",
+        PrincipiaCommand::PrefUnset { .. } => "PrefUnset", // PRINCIPIA-UNSET-SYNAPSE (SR603)
         PrincipiaCommand::PrefList { .. } => "PrefList",
         PrincipiaCommand::PrefListIs { .. } => "PrefListIs",
         PrincipiaCommand::PrefChanged { .. } => "PrefChanged",
