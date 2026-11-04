@@ -2178,11 +2178,7 @@ pub fn selftest_users() {
 pub fn selftest_all() {
     selftest();
     selftest_users();
-<<<<<<< HEAD
-    selftest_prefsui(); resetfollow_leg(); // SETTINGS-RESET-FOLLOW (rmbp-ledger B1190): the unset-follow leg (file tail). LINE-NEUTRAL fold, code first
-=======
-    selftest_prefsui(); reset_word_leg();
->>>>>>> exec-rmbp-f39settingsresetbutton
+    selftest_prefsui(); resetfollow_leg(); reset_word_leg(); // SETTINGS-RESET-FOLLOW (rmbp-ledger B1190): the unset-follow leg (file tail). LINE-NEUTRAL fold, code first
 }
 
 // ── BRIGHTFLOOR (B312): the floor, the load clamp, safe mode ───────────────────────────────────
@@ -6334,7 +6330,6 @@ fn reset_at(tab: usize, row: usize) {
     }
 }
 
-<<<<<<< HEAD
 // =================================================================================================
 // SETTINGS-RESET-FOLLOW (rmbp-ledger B1190) — TAIL-APPENDED. After an unset (B1186's Delete, `pref unset`, the delete
 // watch, a reload) the store no longer holds the key and B1185's unset-form PrefChanged reaches `bus_changes_inner`, which
@@ -6393,7 +6388,9 @@ fn resetfollow_leg() {
     serial_println!(
         ":: SETTINGS-RESET-FOLLOW: key={}.{} stored={} shown={} unset={} after={} default={} resetfollow={} -> {} ::",
         NS, k, want, shown, unset as u8, after, def, if follows { "default" } else { "stale" }, if ok { "PASS" } else { "FAIL" }
-=======
+    );
+}
+
 /// [`reset_word_leg`]: paint `m`'s tab OFFSCREEN (`textscale::probe`'s shape) and answer whether a drawn run starts at
 /// the word's x on its row; `None` = no heap for the surface.
 #[cfg(feature = "witness")]
@@ -6458,6 +6455,5 @@ fn reset_word_leg() {
     serial_println!(
         ":: SETTINGS-RESET-BUTTON: set={} resetword={} press={} default={} resetword={} press={} off={} x={}..{} -> {} ::",
         name(set), word(s_paint), yn(s_hit), name(dflt), word(d_paint), yn(d_hit), yn(s_off), x0, x1, verdict
->>>>>>> exec-rmbp-f39settingsresetbutton
     );
 }
