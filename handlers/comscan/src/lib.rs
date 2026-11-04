@@ -82,6 +82,7 @@ pub async fn ignite(synapse: Synapse, cap: usize) {
 /// the ordinary entry; `serve` is the seam.
 pub async fn serve(synapse: Synapse, mut rx: Receiver<SMessage>, cap: usize) {
     let mut view = LogView::new(cap);
+    let mut card = PumpCard::new(bandy::Origin::System("comscan".to_string())); // VUGCOMSCANJOGFACE (SR579): what the Console says of the pump
 
     loop {
         match rx.recv().await {
@@ -97,6 +98,14 @@ pub async fn serve(synapse: Synapse, mut rx: Receiver<SMessage>, cap: usize) {
             Ok(SMessage::Logs(ev)) if !matches!(ev, LogEvent::LogTail { .. }) => {
                 if let Some(tail) = view.apply(&ev) {
                     synapse.fire(SMessage::Logs(tail));
+                }
+            }
+            // VUGCOMSCANJOGFACE (SR579): the pump's answers the Console says in its own feed (`commissioned <name>`, once).
+            Ok(SMessage::Pump(ev)) => {
+                if let Some(line) = card.on_pump(&ev) {
+                    if let Some(tail) = view.on_log("info", "comscan", line) {
+                        synapse.fire(SMessage::Logs(tail));
+                    }
                 }
             }
             Ok(SMessage::Kill(who)) if who == "comscan" => break,
@@ -128,4 +137,92 @@ pub fn host_desk(
     let rx = synapse.subscribe();
     let task = tokio::spawn(pump::serve_pump(synapse, rx, desk.clone(), open, pump::PUMP_TICK));
     (desk, task)
+}
+
+// --- VUGCOMSCANJOGFACE (LEDGER SR579): the Console's pump card, a pure core the vessel binds pixels to (named tail hunk) ---
+
+/// A button on the Console's pump card: home, or a jog of one axis by the card's step, plus or minus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pad {
+    Home,
+    XPlus,
+    XMinus,
+    YPlus,
+    YMinus,
+    ZPlus,
+    ZMinus,
+}
+
+/// The Console's pump card, in [`LogView`]'s shape (a pure core; the vessel draws it): the jog pad's two fields (the
+/// step in mm and the feed in mm/min) and its buttons as the bus requests the desk already serves
+/// ([`bandy::PumpEvent::PumpHome`] / [`bandy::PumpEvent::PumpJog`]; no new transport, and no second validator: the
+/// desk refuses a jog it cannot say by name), and what the Console says of the pump's answers: `commissioned <name>`
+/// the first time a port takes a name. [`serve`] holds one for what the Console says; a face holds one for its pad.
+pub struct PumpCard {
+    principal: bandy::Origin,
+    step: f64,
+    feed: f64,
+    said: Vec<(String, String)>,
+}
+
+impl PumpCard {
+    /// The step a fresh card jogs by, mm.
+    pub const STEP_MM: f64 = 1.0;
+    /// The feed a fresh card jogs at, mm/min.
+    pub const FEED_MM_MIN: f64 = 600.0;
+
+    /// A card whose requests carry `principal` (the message-security law), at [`PumpCard::STEP_MM`] and
+    /// [`PumpCard::FEED_MM_MIN`].
+    pub fn new(principal: bandy::Origin) -> PumpCard {
+        PumpCard { principal, step: Self::STEP_MM, feed: Self::FEED_MM_MIN, said: Vec::new() }
+    }
+
+    /// The step field, mm.
+    pub fn step(&self) -> f64 {
+        self.step
+    }
+
+    /// The feed field, mm/min.
+    pub fn feed(&self) -> f64 {
+        self.feed
+    }
+
+    /// Set the step field as typed (the desk names a jog it cannot say).
+    pub fn set_step(&mut self, mm: f64) {
+        self.step = mm;
+    }
+
+    /// Set the feed field as typed (the desk names a feed it refuses).
+    pub fn set_feed(&mut self, mm_per_min: f64) {
+        self.feed = mm_per_min;
+    }
+
+    /// The request a press of `pad` posts: [`Pad::Home`] the home, an axis a jog of that axis by plus or minus the
+    /// step at the feed.
+    pub fn press(&self, pad: Pad) -> SMessage {
+        let principal = self.principal.clone();
+        let s = self.step;
+        let (dx, dy, dz) = match pad {
+            Pad::Home => return SMessage::Pump(bandy::PumpEvent::PumpHome { principal }),
+            Pad::XPlus => (s, 0.0, 0.0),
+            Pad::XMinus => (-s, 0.0, 0.0),
+            Pad::YPlus => (0.0, s, 0.0),
+            Pad::YMinus => (0.0, -s, 0.0),
+            Pad::ZPlus => (0.0, 0.0, s),
+            Pad::ZMinus => (0.0, 0.0, -s),
+        };
+        SMessage::Pump(bandy::PumpEvent::PumpJog { principal, dx, dy, dz, feed: self.feed })
+    }
+
+    /// What the Console says of a pump answer: `commissioned <name>` the first time `(port, name)` arrives in a
+    /// [`bandy::PumpEvent::Commissioned`]; nothing for a repeat or any other answer.
+    pub fn on_pump(&mut self, ev: &bandy::PumpEvent) -> Option<String> {
+        let bandy::PumpEvent::Commissioned { port, name } = ev else { return None };
+        let key = (port.clone(), name.clone());
+        if self.said.contains(&key) {
+            return None;
+        }
+        self.said.push(key);
+        Some(format!("commissioned {name}"))
+    }
 }

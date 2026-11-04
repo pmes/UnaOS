@@ -255,3 +255,60 @@ fn handler_does_not_react_to_its_own_tail() {
     // And the ring is untouched by the echo.
     assert_eq!(v.len(), 1);
 }
+
+// --- VUGCOMSCANJOGFACE (SR579): the pump card's pad posts the desk's verbs; the Console says a commission once ---
+
+/// A press of the card's pad is the bus request the desk already serves (PumpJog at the card's step and feed, PumpHome),
+/// carrying the card's principal; and `serve` says `commissioned <name>` in the Console's feed once, however many times
+/// the same Commissioned arrives (a Log fired after both is the fence: by then both were folded).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_jog_pad_press_posts_the_verb_and_commissioned_shows_once() {
+    use bandy::{Origin, PumpEvent};
+    use comscan::{Pad, PumpCard};
+
+    let synapse = Synapse::new();
+    let mut observer = synapse.subscribe();
+    let handler_rx = synapse.subscribe();
+    let bus = synapse.clone();
+    tokio::spawn(async move {
+        comscan::serve(bus, handler_rx, 128).await;
+    });
+
+    let who = Origin::LocalUser("una".to_string());
+    let mut card = PumpCard::new(who.clone());
+    assert_eq!((card.step(), card.feed()), (PumpCard::STEP_MM, PumpCard::FEED_MM_MIN));
+    card.set_step(5.0);
+    card.set_feed(1200.0);
+    synapse.fire(card.press(Pad::XMinus));
+    synapse.fire(card.press(Pad::Home));
+
+    let got = timeout(Duration::from_secs(2), async {
+        let mut got = Vec::new();
+        while got.len() < 2 {
+            if let Ok(SMessage::Pump(ev)) = observer.recv().await {
+                got.push(ev);
+            }
+        }
+        got
+    })
+    .await
+    .expect("timed out waiting for the pad's requests");
+    match &got[0] {
+        PumpEvent::PumpJog { principal, dx, dy, dz, feed } => {
+            assert_eq!(principal, &who);
+            assert_eq!((*dx, *dy, *dz, *feed), (-5.0, 0.0, 0.0, 1200.0), "X minus at the card's step and feed");
+        }
+        other => panic!("expected PumpJog, got {other:?}"),
+    }
+    assert!(got[0].is_request());
+    assert!(matches!(&got[1], PumpEvent::PumpHome { principal } if principal == &who), "{:?}", got[1]);
+
+    let commissioned = PumpEvent::Commissioned { port: "/dev/ttyACM0".to_string(), name: "UNA-1a2b".to_string() };
+    synapse.fire(SMessage::Pump(commissioned.clone()));
+    synapse.fire(SMessage::Pump(commissioned));
+    synapse.fire(SMessage::Log { level: "info".into(), source: "test".into(), content: "fence".into() });
+    let lines = next_tail_where(&mut observer, |l| l.iter().any(|x| x.content == "fence")).await;
+    let said: Vec<&LogLine> = lines.iter().filter(|x| x.content == "commissioned UNA-1a2b").collect();
+    assert_eq!(said.len(), 1, "said once: {lines:?}");
+    assert_eq!((said[0].level.as_str(), said[0].source.as_str()), ("info", "comscan"));
+}
