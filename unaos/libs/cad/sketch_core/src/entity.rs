@@ -40,9 +40,45 @@ pub enum PointRef {
     End(EntityId),
 }
 
-/// A reference that names no entity of the right kind: the offending entity, refused by name.
+/// A reference that names no entity of the right kind: the offending entity, refused by name, and the kind its slot
+/// wanted (VUGSKETCHBADREFKIND, SR604: named at the one check site per slot, the `need_*`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct BadRef(pub EntityId);
+pub struct BadRef {
+    pub id: EntityId,
+    pub kind: RefKind,
+}
+
+// ---- VUGSKETCHBADREFKIND (LEDGER SR604): the kind a reference slot wants, named where it is checked ----
+
+/// The kind of sketch entity a reference slot wants (moved from doc_core's replay, SR590, which re-exports it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RefKind {
+    /// A point entity (a line's end, a circle's centre, `PointRef::Point`).
+    Point,
+    /// A line.
+    Line,
+    /// A circle or an arc (`PointRef::Centre`, a radius, a circle slot).
+    Round,
+    /// A line or an arc (`PointRef::Start` / `PointRef::End`).
+    Ends,
+    /// An arc (`Sketch::set_arc_angles`: a circle has no angles).
+    Arc,
+    /// Any live entity (`Sketch::remove_entity`: a tombstone or an unknown id).
+    Live,
+}
+
+/// A declaration of a sketch entity outside the sketch (doc_core's statements): whether it declares an entity of kind
+/// `k`. The declaring crate writes the table; [`RefKind::holds`] reads it.
+pub trait Declares {
+    fn declares(&self, k: RefKind) -> bool;
+}
+
+impl RefKind {
+    /// `d` declares an entity of this kind (the table is `d`'s [`Declares`]).
+    pub fn holds<D: Declares + ?Sized>(self, d: &D) -> bool {
+        d.declares(self)
+    }
+}
 
 /// Entities, constraints and the parameter vector. Ids are stable: a removed constraint leaves a hole, a removed
 /// entity leaves [`Entity::Removed`] (VUGSKETCHERASE, SR495).
@@ -144,14 +180,14 @@ impl Sketch {
     pub(crate) fn need_point(&self, id: EntityId) -> Result<usize, BadRef> {
         match self.entity(id) {
             Some(Entity::Point { x }) => Ok(*x),
-            _ => Err(BadRef(id)),
+            _ => Err(BadRef { id, kind: RefKind::Point }),
         }
     }
 
     pub(crate) fn need_line(&self, id: EntityId) -> Result<(EntityId, EntityId), BadRef> {
         match self.entity(id) {
             Some(Entity::Line { a, b }) => Ok((*a, *b)),
-            _ => Err(BadRef(id)),
+            _ => Err(BadRef { id, kind: RefKind::Line }),
         }
     }
 
@@ -160,7 +196,7 @@ impl Sketch {
         match self.entity(id) {
             Some(Entity::Circle { centre, r }) => Ok((*centre, *r, false)),
             Some(Entity::Arc { centre, r }) => Ok((*centre, *r, true)),
-            _ => Err(BadRef(id)),
+            _ => Err(BadRef { id, kind: RefKind::Round }),
         }
     }
 
@@ -170,7 +206,7 @@ impl Sketch {
             PointRef::Centre(id) => self.need_round(id).map(|_| ()),
             PointRef::Start(id) | PointRef::End(id) => match self.entity(id) {
                 Some(Entity::Line { .. }) | Some(Entity::Arc { .. }) => Ok(()),
-                _ => Err(BadRef(id)),
+                _ => Err(BadRef { id, kind: RefKind::Ends }),
             },
         }
     }
@@ -244,7 +280,7 @@ impl Sketch {
     /// `BadRef` when the id names no live entity.
     pub fn remove_entity(&mut self, id: EntityId) -> Result<Removed, BadRef> {
         match self.entity(id) {
-            None | Some(Entity::Removed) => return Err(BadRef(id)),
+            None | Some(Entity::Removed) => return Err(BadRef { id, kind: RefKind::Live }),
             Some(_) => {}
         }
         let mut entities = alloc::vec![id];
@@ -299,7 +335,7 @@ impl Sketch {
                 self.params[i + 2] = end;
                 Ok(())
             }
-            _ => Err(BadRef(id)),
+            _ => Err(BadRef { id, kind: RefKind::Arc }),
         }
     }
 }
