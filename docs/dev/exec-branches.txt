@@ -1467,12 +1467,12 @@ exec-rmbp-vugcomscanmachinedeclare 2f4c28e12 wave36 cut60
 exec-rmbp-vugphotocropmetaitxt 2f4c28e12 wave36 cut60
 exec-rmbp-vugscandeviationcoarse 2f4c28e12 wave36 cut60
 exec-rmbp-vugcomscanjogfacegtk 2f4c28e12 wave36 cut60
-exec-rmbp-f39relayqueuedsetlost 6afdafb45 wave36 cut62
-exec-rmbp-f39prefscaparmearly 6afdafb45 wave36 cut62
-exec-rmbp-f39prefscapnspath 6afdafb45 wave36 cut62
-exec-rmbp-f39armforgetlatearm 6afdafb45 wave36 cut62
-exec-rmbp-f39unsetpostroads 6afdafb45 wave36 cut62
-exec-rmbp-f39hidwhonotick 6afdafb45 wave36 cut62
+exec-rmbp-f39relayqueuedsetlost 7fd25eff0 FOLDED (kernel batch cut62 kernel batch B1175-B1180)
+exec-rmbp-f39prefscaparmearly c1762ea73 FOLDED (kernel batch cut62 kernel batch B1175-B1180)
+exec-rmbp-f39prefscapnspath 78a8ebcf1 FOLDED (kernel batch cut62 kernel batch B1175-B1180)
+exec-rmbp-f39armforgetlatearm d1a0dabe7 FOLDED (kernel batch cut62 kernel batch B1175-B1180)
+exec-rmbp-f39unsetpostroads 55ea1ca0e FOLDED (kernel batch cut62 kernel batch B1175-B1180)
+exec-rmbp-f39hidwhonotick b4cb36a81 FOLDED (kernel batch cut62 kernel batch B1175-B1180)
 exec-rmbp-vugintentsetfacepushfoot c17a94a54 wave36 cut61
 exec-rmbp-vugcomscanjogtravelwire c17a94a54 wave36 cut61
 exec-rmbp-vugcomscanmachinedeclareprefs c17a94a54 wave36 cut61
