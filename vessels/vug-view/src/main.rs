@@ -17,6 +17,7 @@
 //! vug-view scan.ply --against part.vugdoc --gdt "<face>=flatness:0.5" --out map.png  # a gdt callout (SR553)
 //! vug-view scan.ply --against part.vugdoc --datum A=<f> B=<f> C=<f> --gdt "<post>=position:1" --out map.png  # a datum frame (SR560)
 //! vug-view part.vug --scan scan.ply --out map.png                                  # the part as the journal, a scan measured against it (SR565)
+//! vug-view scan.ply --against part.vugdoc --gdt "<face>=flatness:0.5" --report     # the verdicts to part.vugreport beside the design (SR575)
 //! ```
 //! Key script: one character per shortcut; `{Name}` for a named key.
 
@@ -35,13 +36,14 @@ struct Cli {
     gdt: Vec<String>, // VUGFACEGDT (SR553): each `--gdt <face>=<kind>:<tol>`, a callout on the map
     datum: Option<String>, // VUGFACEGDTREMEASURE (SR560): `--datum A=<f> B=<f> C=<f>`, the three args as one `datum` command
     scan: Option<String>, // VUGFACEDEVIATIONSOLIDFAULT (SR565): `--scan <mesh>` after a .vug part: the scan measured against the part's journal
+    report: bool, // VUGFACEGDTREPORTKEY (SR575): `--report`, the map's `report` command after the open
 }
 
-const USAGE: &str = "usage: vug-view <file.stl|obj|ply|png|jpg> [--preset una|solidworks|fusion|blender|onshape] [--size WxH] [--keys SCRIPT] [--out shot.png] [--against design.vugdoc] [--side side.png] [--gdt face=kind:tol]... [--datum A=face B=face C=face] [--scan scan.ply (after a .vug part)]";
+const USAGE: &str = "usage: vug-view <file.stl|obj|ply|png|jpg> [--preset una|solidworks|fusion|blender|onshape] [--size WxH] [--keys SCRIPT] [--out shot.png] [--against design.vugdoc] [--side side.png] [--gdt face=kind:tol]... [--datum A=face B=face C=face] [--scan scan.ply (after a .vug part)] [--report]";
 
 fn cli() -> Cli {
     let mut a = std::env::args().skip(1);
-    let mut c = Cli { path: String::new(), size: (800, 600), preset: Preset::Una, keys: None, out: None, against: None, side: None, gdt: Vec::new(), datum: None, scan: None };
+    let mut c = Cli { path: String::new(), size: (800, 600), preset: Preset::Una, keys: None, out: None, against: None, side: None, gdt: Vec::new(), datum: None, scan: None, report: false };
     while let Some(arg) = a.next() {
         match arg.as_str() {
             "--size" => {
@@ -62,6 +64,7 @@ fn cli() -> Cli {
             "--side" => c.side = a.next(), // VUGFACEPHOTOSIDE (SR547)
             "--gdt" => c.gdt.extend(a.next()), // VUGFACEGDT (SR553): repeatable
             "--scan" => c.scan = a.next(), // VUGFACEDEVIATIONSOLIDFAULT (SR565)
+            "--report" => c.report = true, // VUGFACEGDTREPORTKEY (SR575)
             "--datum" => c.datum = Some(a.by_ref().take(3).collect::<Vec<_>>().join(" ")), // VUGFACEGDTREMEASURE (SR560): the grammar is deviation::command's
             "--help" | "-h" => {
                 eprintln!("{USAGE}");
@@ -124,6 +127,20 @@ fn main() {
         if let Err(e) = vug_view::deviation::command(&mut viewer.view, &viewer.model, &format!("datum {d}")) {
             eprintln!("vug-view: {e}");
             std::process::exit(1);
+        }
+    }
+    // VUGFACEGDTREPORTKEY (SR575): `--report` writes the verdicts through the map's `report` command (a refusal exits 1);
+    // with no window asked (no --out, no window backend) the run ends there, else the frame or the window follows.
+    if cli.report {
+        match viewer.report_command() {
+            Ok(p) => println!("report -> {}", p.display()),
+            Err(e) => {
+                eprintln!("vug-view: {e}");
+                std::process::exit(1);
+            }
+        }
+        if cli.out.is_none() && cfg!(not(target_os = "macos")) {
+            std::process::exit(0);
         }
     }
     #[allow(unused_variables)] // the window's title (macOS only); the headless witness prints `viewer.title`

@@ -67,6 +67,13 @@ pub struct Map {
     /// VUGFACEDEVIATIONSOLIDFAULT (SR565): the replay failures no solid reads (an Op, an unnamed sketch), counted and
     /// named on the corner ([`fault_lines`]); a failure a solid reads refuses the design instead ([`design`]).
     pub faults: Vec<doc_core::Failure>,
+    /// VUGFACEGDTREPORTKEY (SR575): the scan's file name (lib.rs `read_scan`), the report header's `scan=`; None reads
+    /// scan_core `gdt::scan_tag`.
+    pub scan_name: Option<String>,
+    /// VUGFACEGDTREPORTKEY (SR575): a path map's design document path (`Viewer::open_against`), its report written beside it.
+    pub design_path: Option<std::path::PathBuf>,
+    /// VUGFACEGDTREPORTKEY (SR575): the report the `report` command wrote, named on the corner until the next command.
+    pub reported: Option<std::path::PathBuf>,
 }
 
 /// A scan mesh read from a file (a PLY carries no normals, no confidence and no intrinsics): mesh_core's
@@ -127,7 +134,7 @@ pub fn open(scan: &ScanMesh, doc: &Doc, band_mm: f64, margin_mm: f64) -> Result<
     };
     let model = Model::from_mesh(mesh)?;
     let on = result.is_ok();
-    let mut map = Map { on, band_mm, names, gdt: Vec::new(), result, vertex, tri, pick: None, source: None, callouts: Vec::new(), margin_mm, basis: std::sync::Arc::new((scan.clone(), design)), datums: None, frame: None, chosen: [None; 3], lost: Vec::new(), faults }; reframe(&mut map); Ok((model, map)) // VUGFACEDEVIATIONJOURNAL (SR550) + VUGFACEGDT (SR553): no source, no callouts yet; VUGFACEGDTREMEASURE (SR560): the gdt read once per build through reframe
+    let mut map = Map { on, band_mm, names, gdt: Vec::new(), result, vertex, tri, pick: None, source: None, callouts: Vec::new(), margin_mm, basis: std::sync::Arc::new((scan.clone(), design)), datums: None, frame: None, chosen: [None; 3], lost: Vec::new(), faults, scan_name: None, design_path: None, reported: None }; reframe(&mut map); Ok((model, map)) // VUGFACEDEVIATIONJOURNAL (SR550) + VUGFACEGDT (SR553): no source, no callouts yet; VUGFACEGDTREMEASURE (SR560): the gdt read once per build through reframe
 }
 
 /// The corner's lines: the statistics and the worst [`WORST`] faces (matched ones, by rms) with their signed mean, or
@@ -147,7 +154,7 @@ fn measured(map: &Map) -> Vec<String> {
                 let name = map.names.get(f.face as usize).map(String::as_str).unwrap_or("?");
                 out.push(format!("{name} rms={:.3} mean={:+.3}", f.rms_mm, f.mean_mm));
             }
-            out.extend(report_lines(map)); out.extend(lost_lines(map)); out // VUGFACEGDTREPORT (SR571): the frame and callout lines the .vugreport writes; VUGFACEGDT (SR553): a line per callout after the faces; VUGFACEGDTREMEASURE (SR560): the frame line first
+            out.extend(report_lines(map)); out.extend(lost_lines(map)); out.extend(reported_line(map)); out // VUGFACEGDTREPORTKEY (SR575): `report <path>` after the lost lines; VUGFACEGDTREPORT (SR571): the frame and callout lines the .vugreport writes; VUGFACEGDT (SR553): a line per callout after the faces; VUGFACEGDTREMEASURE (SR560): the frame line first
         }
         Err(DeviationError::NoAlignment { rms_mm, pairs }) => vec![format!("refused NoAlignment rms={rms_mm:.3} pairs={pairs}")],
         Err(DeviationError::Unconstrained { level }) => vec![format!("refused Unconstrained level={level}")],
@@ -363,7 +370,7 @@ pub fn follow(v: &mut Viewer) {
         Ok((model, mut map)) => {
             map.on = m.on && map.result.is_ok();
             map.source = m.source.take().map(|s| Source { measured: generation, refused: None, ..s });
-            carry(m, &mut map, &model); // VUGFACEGDTREMEASURE (SR560): the callouts and the datums follow the re-measure, re-read and re-tinted
+            carry(m, &mut map, &model); keep_names(m, &mut map); // VUGFACEGDTREPORTKEY (SR575): the scan name and design path follow; VUGFACEGDTREMEASURE (SR560): the callouts and the datums follow the re-measure, re-read and re-tinted
             *m = map;
             v.model = model;
         }
@@ -444,7 +451,7 @@ pub fn verdict(map: &Map, c: &Callout) -> scan_core::Verdict {
 /// The callout's corner line: `<face> <kind>=<mm, or none> tol=<mm> PASS|FAIL|UNMEASURED`.
 pub fn gdt_line(map: &Map, c: &Callout) -> String {
     let name = map.names.get(c.face as usize).map(String::as_str).unwrap_or("?");
-    let kind = if c.kind == scan_core::Kind::Profile && map.gdt.get(c.face as usize).is_some_and(|f| f.profile_in_frame_mm.is_some()) { "profile_frame" } else { c.kind.name() }; // VUGSCANGDTPROFILEDATUM (SR567): tools/scan's token when read in the frame
+    let kind = scan_core::gdt::kind_token(c.kind, map.gdt.get(c.face as usize)); // VUGFACEGDTREPORTKEY (SR575): scan_core's one kind token (tools/scan's --vugreport calls it); VUGSCANGDTPROFILEDATUM (SR567): `profile_frame` when read in the frame
     scan_core::gdt::callout_line(name, kind, c.tol_mm, verdict(map, c)) // VUGFACEGDTREPORT (SR571): the one formatter tools/scan's --vugreport calls
 }
 
@@ -728,6 +735,7 @@ fn lost_lines(map: &Map) -> Vec<String> {
 fn forget(view: &mut View) {
     if let Some(m) = view.deviation.as_mut() {
         m.lost.clear();
+        m.reported = None; // VUGFACEGDTREPORTKEY (SR575): the report line is shown once
     }
 }
 
@@ -801,16 +809,14 @@ pub fn report_lines(map: &Map) -> Vec<String> {
 impl Viewer {
     /// Write the map's verdicts to `<part>.vugreport` beside the journal's part: the header (the part's file name, the
     /// generation the map shows, scan_core `gdt::scan_tag` of the scan) and [`report_lines`]. Refused by name, nothing
-    /// written: no map, a refused map, [`REPORT_NO_PATH`] (no journal source, or no `save_to`). The path written on success.
+    /// written: no map, a refused map, [`REPORT_NO_PATH`] (neither a saved journal part nor a path map's design: [`report_target`]). The path written on success.
     pub fn report(&self) -> Result<std::path::PathBuf, String> {
         let m = self.view.deviation.as_ref().ok_or("report: no map")?;
         if let Err(e) = &m.result {
             return Err(format!("report: refused map {e:?}"));
         }
-        let (Some(src), Some(part)) = (m.source.as_ref(), self.save_to.as_ref()) else { return Err(REPORT_NO_PATH.to_string()) };
-        let path = part.with_extension(REPORT_EXT);
-        let name = part.file_name().and_then(|s| s.to_str()).unwrap_or("vug");
-        let text = scan_core::gdt::report_text(name, src.measured, &scan_core::gdt::scan_tag(&m.basis.0), &report_lines(m));
+        let Some((path, name, generation)) = report_target(self, m) else { return Err(REPORT_NO_PATH.to_string()) }; // VUGFACEGDTREPORTKEY (SR575): a path map writes beside its design
+        let text = scan_core::gdt::report_text(&name, generation, &scan_label(m), &report_lines(m)); // VUGFACEGDTREPORTKEY (SR575): the scan's file name when held
         crate::write_atomic(&path, &text)?;
         Ok(path)
     }
@@ -827,3 +833,71 @@ impl Viewer {
 pub fn corner_origin(view: &View, width: u32) -> u32 {
     if view.design.journal.panel { crate::journal::panel_x0(width) as u32 } else { width }
 }
+
+// ---- VUGFACEGDTREPORTKEY (LEDGER SR575): the report on the map's command road, the names it is written under ----
+// VUGFACEGDTREPORT (SR571) left `Viewer::report` with no caller in the face: [`Viewer::map_command`] is the map's road
+// with `report` on it (every other line is [`command`]'s), [`Viewer::report_command`] writes and the corner reads
+// `report <path>` until the next command ([`forget`]); vug-view `--report` calls it. The Map holds the scan's file name
+// and a path map's design path (lib.rs `open_against` / `open_scan` through [`Viewer::hold_names`]): the header reads
+// `scan=<name>` (scan_core `gdt::scan_tag` without one) and a path map's report is written beside its design.
+// BP-vug-5: a printed verdict, nothing changes.
+
+/// Where the map's report goes and what it is headed: a journal map with a part path writes `<part>.vugreport` at the
+/// generation it shows; a path map with its design path writes `<design>.vugreport` beside the design at generation 0 (a
+/// document read once, as tools/scan's); else None ([`REPORT_NO_PATH`]).
+fn report_target(v: &Viewer, m: &Map) -> Option<(std::path::PathBuf, String, u64)> {
+    let (file, generation) = match (&m.source, v.save_to.as_ref(), m.design_path.as_ref()) {
+        (Some(src), Some(part), _) => (part, src.measured),
+        (None, _, Some(design)) => (design, 0),
+        _ => return None,
+    };
+    let name = file.file_name().and_then(|s| s.to_str()).unwrap_or("vug").to_string();
+    Some((file.with_extension(REPORT_EXT), name, generation))
+}
+
+/// The report header's scan: its file name when the map holds one, else scan_core `gdt::scan_tag` of its mesh.
+fn scan_label(m: &Map) -> String {
+    m.scan_name.clone().unwrap_or_else(|| scan_core::gdt::scan_tag(&m.basis.0))
+}
+
+/// The corner's report line: `report <path>` after the `report` command, until the next command.
+fn reported_line(m: &Map) -> Option<String> {
+    m.reported.as_ref().map(|p| format!("report {}", p.display()))
+}
+
+/// A re-measure ([`follow`]) keeps the names the old map was opened under.
+fn keep_names(old: &Map, new: &mut Map) {
+    new.scan_name = old.scan_name.clone();
+    new.design_path = old.design_path.clone();
+}
+
+impl Viewer {
+    /// One command on the map: `report` writes the report ([`Viewer::report_command`]); any other line is
+    /// [`command`]'s. True when the map changed; refused by name, as each road refuses.
+    pub fn map_command(&mut self, line: &str) -> Result<bool, String> {
+        if line.trim() == "report" {
+            return self.report_command().map(|_| true);
+        }
+        command(&mut self.view, &self.model, line)
+    }
+
+    /// Write the report ([`Viewer::report`]); on success the corner reads `report <path>` until the next command. The
+    /// path written, or the refusal by name (nothing written, the corner's report line cleared).
+    pub fn report_command(&mut self) -> Result<std::path::PathBuf, String> {
+        forget(&mut self.view);
+        let path = self.report()?;
+        if let Some(m) = self.view.deviation.as_mut() {
+            m.reported = Some(path.clone());
+        }
+        Ok(path)
+    }
+
+    /// Hold the scan's file name and a path map's design path on the map (lib.rs's open roads).
+    pub(crate) fn hold_names(&mut self, scan_name: Option<&str>, design: Option<&str>) {
+        if let Some(m) = self.view.deviation.as_mut() {
+            m.scan_name = scan_name.map(String::from);
+            m.design_path = design.map(std::path::PathBuf::from);
+        }
+    }
+}
+

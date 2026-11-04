@@ -987,3 +987,13 @@ pub fn report_text(part: &str, generation: u64, scan: &str, lines: &[String]) ->
     out
 }
 
+// ---- VUGFACEGDTREPORTKEY (LEDGER SR575): the kind token both callers read a callout under ----
+//
+// vug-view's corner (`deviation::gdt_line`) and tools/scan's `--vugreport` each computed the token [`callout_line`] reads a
+// value under with the same expression; [`kind_token`] is the one place, so the two files stay byte-equal.
+
+/// The token a callout of `kind` on `face` is read under: `profile_frame` for a profile located in the datum frame (the
+/// face's `profile_in_frame_mm`, set by [`in_frame`]), else the kind's [`Kind::name`].
+pub fn kind_token(kind: Kind, face: Option<&FaceGdt>) -> &'static str {
+    if kind == Kind::Profile && face.is_some_and(|f| f.profile_in_frame_mm.is_some()) { "profile_frame" } else { kind.name() }
+}

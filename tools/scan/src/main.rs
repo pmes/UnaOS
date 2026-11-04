@@ -1007,7 +1007,7 @@ fn vugreport_write(a: &Args, names: &[String], g: &[scan_core::FaceGdt], calls: 
     for &(i, kind, tol) in calls {
         let name = names.get(i).map(String::as_str).unwrap_or("?");
         let v = g.get(i).map_or(scan_core::Verdict::Unmeasured, |f| f.verdict(kind, tol));
-        let token = if kind == scan_core::Kind::Profile && g.get(i).is_some_and(|f| f.profile_in_frame_mm.is_some()) { "profile_frame" } else { kind.name() }; // seat fold (SR567 + SR571): the face's kind token, so the two files stay byte-equal (VUG-FACE-GDT-REPORT-KEY lifts it into scan_core)
+        let token = scan_core::gdt::kind_token(kind, g.get(i)); // VUGFACEGDTREPORTKEY (SR575): scan_core's one kind token, the face's gdt_line calls the same fn
         lines.push(scan_core::gdt::callout_line(name, token, tol, v));
     }
     let part = a.against.as_deref().and_then(|p| Path::new(p).file_name()).and_then(|s| s.to_str()).unwrap_or("design");
