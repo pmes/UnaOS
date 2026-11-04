@@ -32553,3 +32553,33 @@ fn focus_held_now(_owner: u64) -> bool { false }
 pub fn pref_row_in_session(row: usize) -> bool {
     pref_caller_in_session(row)
 }
+
+// =================================================================================================
+// PREFSELF-RELAUNCH (rmbp-ledger B1158) — TAIL-APPENDED. `bus_route::end_prelogin_fulfillers` ends one bus row
+// at the login commit through SECLOGIN M3's own road (`session_end_processes`' body for one row): the row's
+// windows first (`wm::close_owner`), then the close box's kill (`bg_kill`), counted gone only when the PROCS
+// row no longer names the pid. The generation is re-checked so a re-tenanted slot is never killed.
+// =================================================================================================
+/// End bus row `row` (generation `rgen`). `None` = no live process on that row at that generation; else
+/// `(pid, windows_closed, kill_settle, gone)`.
+#[cfg(all(feature = "busreg", feature = "login"))]
+pub fn end_bus_row(row: usize, rgen: u64) -> Option<(u64, usize, &'static str, bool)> {
+    if !row_known(row) || SLOT_GEN[row].load(Ordering::Acquire) != rgen {
+        return None;
+    }
+    let owner = row as u64 + 1; // `Proc::slot` and the wm owner key are `slot + 1`-biased
+    for pi in 0..procs_rows() {
+        if PROCS[pi].state.load(Ordering::Acquire) != PRUNNING || PROCS[pi].slot.load(Ordering::Acquire) as u64 != owner {
+            continue;
+        }
+        let pid = PROCS[pi].pid.load(Ordering::Acquire);
+        if pid == 0 {
+            return None; // mid-publish: not the fulfiller that registered
+        }
+        let windows = crate::video::wm::close_owner(owner);
+        let settle = bg_kill(pid, owner);
+        let gone = PROCS[pi].state.load(Ordering::Acquire) != PRUNNING || PROCS[pi].pid.load(Ordering::Acquire) != pid;
+        return Some((pid, windows, settle, gone));
+    }
+    None
+}

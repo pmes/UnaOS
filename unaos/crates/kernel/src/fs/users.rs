@@ -890,7 +890,7 @@ pub fn login(name: &[u8], password: &[u8]) -> Result<(), UsersError> {
         id,
         core::str::from_utf8(&nb[..name.len()]).unwrap_or("?"),
         id
-    );
+    ); #[cfg(all(feature = "busreg", any(target_arch = "x86_64", feature = "aarch64_el0")))] crate::bus_route::end_prelogin_fulfillers(); // PREFSELF-RELAUNCH (B1158): a Principia or Holocron fulfiller launched before login (not a program of this session) is ENDED here, never re-stamped; its teardown releases its tags, so the session's own `prefs` / HOLOCRON.ELF register (bus_route.rs tail). LINE-NEUTRAL fold.
     #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] crate::video::loginitems::post_login(); // PREFSUI (B389, R91): the user's login items launch after the desktop is built (`loginitems::service`)
     #[cfg(any(target_arch = "aarch64", feature = "unafs"))] crate::fs::nameindex::post_login(); // NAMEINDEX (B432): a volume without the name index builds it as a login task (R93), never at boot (R80)
     #[cfg(feature = "lumen")] crate::keyring::ring_login(name, password); #[cfg(feature = "lumen")] crate::keyring::after_login(name); // RINGLOGIN (B465): the ring key is derived ONCE from the verified password and posted for HOLOCRON.ELF before it starts. HOLOCRON2 (B355): the secrets handler starts with the session when the user has a ring
