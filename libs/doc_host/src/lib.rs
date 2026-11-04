@@ -9,7 +9,8 @@
 //! with `doc_core::read_with(text, &DirLib::beside(part))`, so `<name>.vugmachine` is looked up in the part's own
 //! directory and nowhere else. A name that is not a word of doc_core's id charset (ASCII alphanumerics, `_`, `-`) is
 //! refused by name before any path is built, so `../x`, `a/b` or an empty name never leave the directory; a missing or
-//! unreadable library resolves to None and doc_core names it `UnknownLib(name)` by line.
+//! unreadable library resolves to None and doc_core names it `UnknownLib(name)` by line. VUGFACEJOURNALFAULTFIXMANY
+//! (SR584): [`DirLib::machines`] lists the shelf (the names a `lib=` may take), for the face's NoMachine fix.
 
 use doc_core::Lib;
 use std::path::{Path, PathBuf};
@@ -48,6 +49,24 @@ impl DirLib {
             return None;
         }
         Some(self.dir.join(format!("{name}.{EXT}")))
+    }
+
+    /// VUGFACEJOURNALFAULTFIXMANY (SR584): the shelf's library names: every `<name>.vugmachine` in the directory whose name
+    /// is a word of the id charset, sorted; an unreadable directory lists none.
+    pub fn machines(&self) -> Vec<String> {
+        let Ok(rd) = std::fs::read_dir(&self.dir) else { return Vec::new() };
+        let mut names: Vec<String> = rd
+            .filter_map(|e| {
+                let p = e.ok()?.path();
+                if p.extension()?.to_str()? != EXT {
+                    return None;
+                }
+                let n = p.file_stem()?.to_str()?;
+                id_word(n).then(|| n.to_string())
+            })
+            .collect();
+        names.sort();
+        names
     }
 }
 

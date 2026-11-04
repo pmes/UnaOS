@@ -270,11 +270,16 @@ pub struct Journal {
     pub faults: Vec<doc_core::Failure>,
     /// VUGFACEJOURNALFAULTFIX (SR578): the faulted statement id whose offered fix Escape declined (cleared by a commit).
     pub declined: Option<String>,
+    /// VUGFACEJOURNALFAULTFIXMANY (SR584): the machines beside the part (lib.rs `open_vug` reads doc_host's shelf), offered
+    /// on a NoMachine fault when the undo history holds none; the journal opens no file.
+    pub shelf: Vec<Stmt>,
+    /// VUGFACEJOURNALFAULTFIXMANY (SR584): the faulted statement id and the choice Tab picked on its fix card (cleared by a commit).
+    pub pick: Option<(String, usize)>,
 }
 
 impl Default for Journal {
     fn default() -> Journal {
-        Journal { doc: Doc::new(Tol::DEFAULT), closed: 0, open: None, undo: Vec::new(), redo: Vec::new(), panel: false, cursor: 0, edit: None, note: None, saved: None, disk: None, save_as: None, faults: Vec::new(), declined: None }
+        Journal { doc: Doc::new(Tol::DEFAULT), closed: 0, open: None, undo: Vec::new(), redo: Vec::new(), panel: false, cursor: 0, edit: None, note: None, saved: None, disk: None, save_as: None, faults: Vec::new(), declined: None, shelf: Vec::new(), pick: None }
     }
 }
 
@@ -329,7 +334,7 @@ impl Journal {
         }
         self.redo.clear();
         self.cursor = self.doc.stmts.len().saturating_sub(1);
-        self.note = None; self.declined = None; // VUGFACEJOURNALFAULTFIX (SR578): a new document, the offers asked again
+        self.note = None; self.declined = None; self.pick = None; // VUGFACEJOURNALFAULTFIXMANY (SR584): the card's pick asked again; VUGFACEJOURNALFAULTFIX (SR578): a new document, the offers asked again
     }
 
     /// A history edit: regenerate `cand`, and only then make it the document (a snapshot). VUGINTENTUNDOSET (SR563): also
@@ -498,6 +503,7 @@ pub fn key(d: &mut Design, k: &str) -> Option<bool> {
                 j.decline_fix(); // VUGFACEJOURNALFAULTFIX (SR578): Escape declines it
                 return Some(true);
             }
+            "Tab" | "\t" if j.choosing_fix() => return Some(j.next_fix()), // VUGFACEJOURNALFAULTFIXMANY (SR584): Tab walks the fix card's choices
             _ if enter => {
                 match j.doc.stmts.get(j.cursor).and_then(value) {
                     Some(_) => {
@@ -847,9 +853,11 @@ fn stmt_text(s: &Stmt) -> String {
 }
 
 impl Journal {
-    /// The one unambiguous fix for the carried failure on statement `i` (the table above); None for a row no failure
-    /// names, a failure with a choice, a history with no machine or with several.
-    pub fn fix_for(&self, i: usize) -> Option<Fix> {
+    /// VUGFACEJOURNALFAULTFIXMANY (SR584): the fixes for the carried failure on statement `i` (the table above), several
+    /// when the failure has a choice: NoMachine every distinct machine the undo snapshots hold (newest first), else every
+    /// machine of the shelf beside the part ([`Journal::shelf`], its id made free); None for a row no failure names, a
+    /// failure with nothing to offer.
+    fn fix_choices(&self, i: usize) -> Option<Vec<Fix>> {
         let id = self.doc.stmts.get(i)?.id()?;
         let f = self.faults.iter().find(|f| !f.id.is_empty() && f.id == id)?;
         let line = self.doc.line(i);
@@ -863,10 +871,15 @@ impl Journal {
                         }
                     }
                 }
-                let [m] = held.as_slice() else { return None };
-                let m: &Stmt = m;
+                let mut held: Vec<Stmt> = held.into_iter().cloned().collect();
+                if held.is_empty() {
+                    held = self.shelf.iter().map(|s| self.shelf_id(s)).collect(); // VUGFACEJOURNALFAULTFIXMANY (SR584): the shelf when the history holds none
+                }
+                if held.is_empty() {
+                    return None;
+                }
                 let at = self.doc.stmts.iter().position(|s| matches!(s, Stmt::Op { .. }))?;
-                Some(Fix { line, text: stmt_text(m), road: FixRoad::Insert(at, m.clone()) })
+                Some(held.into_iter().map(|m| Fix { line, text: stmt_text(&m), road: FixRoad::Insert(at, m) }).collect())
             }
             Fault::Conflicting => {
                 let Stmt::Constraint { sketch, .. } = &self.doc.stmts[i] else { return None };
@@ -876,7 +889,7 @@ impl Journal {
                         if s == sketch && !(at[0] == 0.0 && at[1] == 0.0) && conflicting(kid.as_str()))
                 })?;
                 let rid = self.doc.stmts[k].id()?;
-                Some(Fix { line, text: format!("remove {rid}"), road: FixRoad::Remove(k) })
+                Some(vec![Fix { line, text: format!("remove {rid}"), road: FixRoad::Remove(k) }])
             }
             _ => None,
         }
@@ -925,5 +938,82 @@ impl Journal {
 fn fix_overlay(j: &Journal, fr: &mut Raster, x0: f32, h: f32, clip: &dyn Fn(&str) -> String) {
     let Some(f) = j.offered() else { return };
     let y = if j.note.is_some() { h - 2.0 * ROW_PX } else { h - ROW_PX };
+    let all = j.fixes_for(j.cursor); if all.len() > 1 { return fix_card(j, fr, x0, y, &all, &f, clip); } // VUGFACEJOURNALFAULTFIXMANY (SR584): a choice is a card
     raster::text(fr, &clip(&format!("FIX: {} (ENTER)", f.text.to_uppercase())), x0 + 4.0, y, rgba(ACTIVE));
+}
+
+// ---- VUGFACEJOURNALFAULTFIXMANY (LEDGER SR584): a fix with a choice, one card in the panel ----
+// SR578's road with several fixes: [`Journal::fix_choices`] lists them (NoMachine: every distinct machine of the undo
+// history, newest first, else the shelf beside the part), [`Journal::fix_for`] is the one Tab picked ([`Journal::pick`],
+// keyed on the faulted statement, 0 on any other row), and Enter takes it through the unchanged [`Journal::accept_fix`]
+// (ONE snapshot); Escape declines the whole card. photo.rs's card road is not used: a card there is a statement SET
+// entered whole and judged against a photo's measurement; a fix card is a CHOICE of one with no measurement. A Make
+// value has nothing to choose (the row's value is typed); BadRef / NoProfile / an edge reference are owed (the
+// failure carries no candidates: VUG-FACE-JOURNAL-FAULT-FIX-REF / -PROFILE / -EDGE).
+
+impl Journal {
+    /// Every fix for the carried failure on statement `i`, in card order (empty: nothing to offer).
+    pub fn fixes_for(&self, i: usize) -> Vec<Fix> {
+        self.fix_choices(i).unwrap_or_default()
+    }
+
+    /// The fix offered for statement `i`: the choice Tab picked (the first until then; one choice is SR578's one fix).
+    pub fn fix_for(&self, i: usize) -> Option<Fix> {
+        let all = self.fixes_for(i);
+        let k = self.pick_of(i, all.len());
+        all.into_iter().nth(k)
+    }
+
+    /// The picked index on statement `i`'s card of `n` choices.
+    fn pick_of(&self, i: usize, n: usize) -> usize {
+        let id = self.doc.stmts.get(i).and_then(Stmt::id);
+        match &self.pick {
+            Some((p, k)) if n > 0 && Some(p.as_str()) == id => k % n,
+            _ => 0,
+        }
+    }
+
+    /// A card is offered: the panel's offered fix has more than one choice.
+    pub fn choosing_fix(&self) -> bool {
+        self.offered().is_some() && self.fixes_for(self.cursor).len() > 1
+    }
+
+    /// Tab on the offered card: the next choice (wrapping); false when no card is offered.
+    fn next_fix(&mut self) -> bool {
+        if !self.choosing_fix() {
+            return false;
+        }
+        let n = self.fixes_for(self.cursor).len();
+        let k = (self.pick_of(self.cursor, n) + 1) % n;
+        let Some(id) = self.doc.stmts.get(self.cursor).and_then(Stmt::id).map(str::to_string) else { return false };
+        self.pick = Some((id, k));
+        true
+    }
+
+    /// A shelf machine with an id free in the document: its own (the library's name), else `<id><n>`.
+    fn shelf_id(&self, s: &Stmt) -> Stmt {
+        let Stmt::Machine(m) = s else { return s.clone() };
+        let id = free(&self.doc.stmts, |n| if n == 0 { m.id.clone() } else { format!("{}{n}", m.id) });
+        Stmt::Machine(doc_core::MachineStmt { id, ..m.clone() })
+    }
+}
+
+/// The panel offers a fix card (photo.rs yields Tab to it).
+pub fn choosing(d: &Design) -> bool {
+    d.journal.choosing_fix()
+}
+
+/// The fix card: a tinted block ending on the fix row `y`: the head `FIX: CHOOSE <k>/<n> (TAB, ENTER)`, then one row per
+/// choice, the picked one `> ` in the accent, the others in ink; clipped to the panel.
+fn fix_card(j: &Journal, fr: &mut Raster, x0: f32, y: f32, all: &[Fix], f: &Fix, clip: &dyn Fn(&str) -> String) {
+    let n = all.len();
+    let k = j.pick_of(j.cursor, n);
+    let top = y - n as f32 * ROW_PX;
+    let w = fr.width as f32;
+    raster::tint(fr, &[vec![(x0, top - 2.0), (w, top - 2.0), (w, y + ROW_PX - 2.0), (x0, y + ROW_PX - 2.0)]], rgba(raster::BACKGROUND), 0.9);
+    raster::text(fr, &clip(&format!("FIX: CHOOSE {}/{n} (TAB, ENTER)", k + 1)), x0 + 4.0, top, rgba(ACTIVE));
+    for (r, c) in all.iter().enumerate() {
+        let (mark, col) = if c == f { ("> ", rgba(ACTIVE)) } else { ("  ", rgba(INK)) };
+        raster::text(fr, &clip(&format!("{mark}{}", c.text.to_uppercase())), x0 + 4.0, top + (r + 1) as f32 * ROW_PX, col);
+    }
 }

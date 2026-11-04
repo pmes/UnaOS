@@ -48,7 +48,7 @@ pub const SHORTCUTS: &[(&str, &str)] = &[
     ("f / Shift+f", "fillet / chamfer the body edge under the cursor (a click re-picks): type r (chamfer d1,d2), Enter; Esc cancels"), // VUGFACEFILLET (SR511)
     // VUGFACEPHOTO (SR506): a photo on graph paper opens as its measured sketch over the dimmed photo.
     ("i", "ask Vein for design intent on the photo's sketch (over the bus; the corner shows the request, then the proposals or the refusal)"), // VUGFACEINTENTSEND (SR514)
-    ("Tab", "focus the next proposal"),
+    ("Tab", "focus the next proposal; on the panel's fix card, the next choice"),
     ("Enter / Backspace", "on the focused proposal: apply it (verified against the photo) / reject it"),
     ("Escape", "on a focused proposal set (one card): reject the whole set (Backspace too); off a card, the sketch's Esc"), // VUGINTENTSINGLERENAMED (SR577): VUG-FACE-KEYS-CARD
     ("PageDown / PageUp", "on a focused proposal card taller than the window: the next / previous page of its lines"), // VUGINTENTSETFACESCROLL (SR583): VUG-FACE-KEYS-PAGE
@@ -221,6 +221,7 @@ impl Viewer {
         let lib = doc_host::DirLib::beside(std::path::Path::new(path)); // VUGMAKEMACHINELIBFACE (SR548): `lib=<name>` beside the part
         let doc = doc_core::read_with(&text, &lib).map_err(|r| format!("{path}: line {}: {:?}", r.line, r.what))?;
         let mut v = Viewer::open_doc(doc, title, size, preset).map_err(|e| format!("{path}: {e}"))?;
+        v.view.design.journal.shelf = shelf(&lib); // VUGFACEJOURNALFAULTFIXMANY (SR584): the machines beside the part, for a NoMachine fix
         v.save_to = Some(std::path::PathBuf::from(path));
         v.claimed = true;
         Ok(v)
@@ -407,4 +408,16 @@ fn read_scan(scan: &str) -> Result<(String, scan_core::Mesh), String> {
         return Err(format!("{scan}: ScanPrb (fuse it first: `scan {scan} -o scan.ply`)"));
     }
     Ok((title, model::read_mesh(scan)?))
+}
+
+// ---- VUGFACEJOURNALFAULTFIXMANY (LEDGER SR584): the machine shelf beside the part, handed to the journal ----
+
+/// Every `.vugmachine` beside the part (doc_host `DirLib::machines`) as the statement `machine <name> lib=<name>` read by
+/// THE reader through the same shelf (its axes / tools held); a library that does not read is left off.
+fn shelf(lib: &doc_host::DirLib) -> Vec<doc_core::Stmt> {
+    let head = doc_core::write(&doc_core::Doc::new(doc_core::Tol::DEFAULT));
+    lib.machines()
+        .iter()
+        .filter_map(|n| doc_core::read_with(&format!("{}\nmachine {n} lib={n}\n", head.trim_end()), lib).ok()?.stmts.into_iter().next())
+        .collect()
 }

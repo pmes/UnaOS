@@ -502,3 +502,76 @@ fn a_no_machine_fault_offers_the_machine_and_enter_clears_it() {
     assert!(vw.view.design.journal.select_line(line));
     assert!(vw.view.design.journal.faulted(o1) && vw.view.design.journal.offered().is_none(), "no machine to offer");
 }
+
+// VUGFACEJOURNALFAULTFIXMANY (LEDGER SR584): a fix with a choice is one card. The shop part's machine re-named `bench`
+// (the same library) and then deleted: the drill's NoMachine offers both machines of the history, newest first; Tab
+// picks the second and Enter puts the opened document back as ONE snapshot. A part with no machine in its history
+// offers the one `.vugmachine` beside it.
+
+#[test]
+fn a_history_with_two_machines_offers_a_card_and_tab_picks_the_second() {
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("vugfacejournalfaultfixmany");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    std::fs::write(dir.join("shop.vugmachine"), format!("vug-doc version=1 lin=1e-6 ang=1e-9\n{SHOP_MACHINE}\n{SHOP_LINES}")).expect("library");
+    let part = dir.join("part.vug");
+    std::fs::write(&part, BOX_DRILL.replace("drill o1 ", "machine mill lib=shop loaded=1\ndrill o1 ")).expect("part");
+    let mut vw = Viewer::open(part.to_str().expect("utf-8 path"), (W, H), Preset::Una).unwrap_or_else(|e| panic!("open: {e}"));
+    let held = doc(&vw).clone();
+
+    // The machine re-named `bench` (one snapshot), then deleted: two machines in the history.
+    let m = index_of(&vw, |s| matches!(s, Stmt::Machine(_)));
+    let mut cand = held.clone();
+    cand.lines.clear();
+    let Stmt::Machine(mill) = &held.stmts[m] else { panic!("machine") };
+    cand.stmts[m] = Stmt::Machine(doc_core::MachineStmt { id: "bench".into(), ..mill.clone() });
+    vw.view.design.journal.adopt(cand).unwrap_or_else(|e| panic!("adopt: {e}"));
+    vw.view.design.journal.delete(m).unwrap_or_else(|e| panic!("delete: {e}"));
+    let o1 = index_of(&vw, |s| s.id() == Some("o1"));
+    let line = doc(&vw).line(o1);
+    assert!(vw.view.design.journal.select_line(line), "the drill's line is a row");
+
+    // The card: both machines, newest first; Tab picks the second.
+    let texts = vw.view.design.journal.fixes_for(o1).into_iter().map(|f| f.text).collect::<Vec<_>>();
+    assert_eq!(texts, ["machine bench lib=shop loaded=1", "machine mill lib=shop loaded=1"], "the history's two machines");
+    assert_eq!(vw.view.design.journal.offered().map(|f| f.text).as_deref(), Some("machine bench lib=shop loaded=1"));
+    assert!(key(&mut vw, "Tab"), "Tab walks the card");
+    let picked = vw.view.design.journal.offered().expect("a pick").text;
+    assert_eq!(picked, "machine mill lib=shop loaded=1", "Tab picked the second");
+    let depth = vw.view.design.journal.depth().0;
+
+    // Enter takes the pick: ONE snapshot, no fault, the opened document.
+    assert!(key(&mut vw, "Return"), "Enter takes the pick");
+    let j = &vw.view.design.journal;
+    println!("fix choices={} picked={picked} faults_after={}", texts.len(), j.faults.len());
+    assert!(j.faults.is_empty(), "{:?}", j.faults);
+    assert_eq!(*doc(&vw), held, "the opened document, the mill on its line");
+    assert_eq!(j.depth().0, depth + 1, "ONE snapshot");
+    assert!(j.offered().is_none(), "nothing left to fix");
+}
+
+#[test]
+fn a_part_with_one_machine_beside_it_offers_the_shelf() {
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("vugfacejournalfaultfixshelf");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    std::fs::write(dir.join("shop.vugmachine"), format!("vug-doc version=1 lin=1e-6 ang=1e-9\n{SHOP_MACHINE}\n{SHOP_LINES}")).expect("library");
+    let part = dir.join("part.vug");
+    std::fs::write(&part, BOX_DRILL).expect("part");
+    let mut vw = Viewer::open(part.to_str().expect("utf-8 path"), (W, H), Preset::Una).unwrap_or_else(|e| panic!("open: {e}"));
+    assert_eq!(vw.view.design.journal.depth().0, 0, "no history");
+    let o1 = index_of(&vw, |s| s.id() == Some("o1"));
+    let line = doc(&vw).line(o1);
+    assert!(vw.view.design.journal.faulted(o1), "the drill names no machine");
+    assert!(vw.view.design.journal.select_line(line), "the drill's line is a row");
+    assert_eq!(vw.view.design.journal.fixes_for(o1).len(), 1, "one machine on the shelf: no card");
+    let offered = vw.view.design.journal.offered().expect("the shelf's machine is offered").text;
+    assert_eq!(offered, "machine shop lib=shop");
+
+    assert!(key(&mut vw, "Return"), "Enter takes it");
+    let j = &vw.view.design.journal;
+    println!("shelf offered={offered} faults_after={} volume={}", j.faults.len(), volume(&vw));
+    assert!(j.faults.is_empty(), "{:?}", j.faults);
+    assert!((volume(&vw) - 1000.0).abs() < 1e-4, "the box unchanged: {}", volume(&vw));
+    assert!(doc_core::write(doc(&vw)).contains("\nmachine shop lib=shop\ndrill o1 "), "the shelf machine before the drill, by name");
+}
