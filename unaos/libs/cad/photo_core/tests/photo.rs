@@ -426,3 +426,48 @@ fn side_parallax_cropped_photo_takes_principal_point() {
         Ok(c) => assert!((c.thickness_mm - PART_T).abs() > 0.15, "the centre assumption read the crop right: {}", c.thickness_mm),
     }
 }
+
+/// VUGFACEPHOTOCAMERAPREF (SR576): the lens term about the principal point. The SR533 lens photo with the principal
+/// point stated at the centre measures bit for bit as with none; the lens render cropped to SR569's 700 x 560 window at
+/// (200, 40) (principal point (250, 320), the crop's centre (350, 280)) with its principal point stated reads the plate
+/// within 0.1 mm and k1 within 10 % of the frame's -0.08 x (half-diagonal of the crop / of the frame)².
+#[test]
+fn lens_term_about_the_principal_point() {
+    let s = Spec::lens();
+    let img = pixel_core::decode(&fixture::png(&s)).expect("pixel_core decodes the fixture PNG");
+    let none = measure(&img, PhotoParams::new(5.0), Tol::DEFAULT).expect("the lens photo measures");
+    let centre = Vec2::new(img.width as f64 * 0.5, img.height as f64 * 0.5);
+    let at = measure(&img, PhotoParams { principal_px: Some(centre), ..PhotoParams::new(5.0) }, Tol::DEFAULT).expect("the lens photo measures about its centre");
+    assert_eq!(at.k1, none.k1);
+    assert_eq!(at.h, none.h);
+    assert_eq!(at.outline, none.outline);
+    assert_eq!(at.loops, none.loops);
+    assert_eq!(at.residual_px, none.residual_px);
+    assert_eq!(at.residual_mm, none.residual_mm);
+    assert_eq!(at.sigma_mm, none.sigma_mm);
+
+    let full = fixture::render(&s);
+    let (x0, y0) = (200u32, 40u32);
+    let crop = fixture::crop(&full, x0, y0, 700, 560);
+    assert_eq!((crop.width, crop.height), (700, 560));
+    let pp = Vec2::new(s.width as f64 * 0.5 - x0 as f64, s.height as f64 * 0.5 - y0 as f64);
+    let m = measure(&crop, PhotoParams { principal_px: Some(pp), ..PhotoParams::new(5.0) }, Tol::DEFAULT).expect("the cropped lens photo measures with its principal point");
+    let plate = |m: &Measured| {
+        let ls = lines(m);
+        let (a50, b50) = nearest_len(&ls, PART_W);
+        let (a30, b30) = nearest_len(&ls, PART_H);
+        (a50.dist(b50), a30.dist(b30))
+    };
+    let ratio = (350.0f64.hypot(280.0) / 450.0f64.hypot(360.0)).powi(2);
+    let want = s.k1 * ratio;
+    let (w, h) = plate(&m);
+    let centred = measure(&crop, PhotoParams::new(5.0), Tol::DEFAULT);
+    eprintln!(
+        "photo: lens-pp centre_bits=same crop_pp plate={w:.3}x{h:.3} k1={:.4} want_k1={want:.4} crop_centred {:?}",
+        m.k1,
+        centred.as_ref().map(|c| (plate(c), c.k1)).map_err(|e| e.name())
+    );
+    assert!((m.k1 - want).abs() <= 0.1 * want.abs(), "k1 {} vs {want}", m.k1);
+    assert!((w - PART_W).abs() < 0.1, "plate side {w} vs {PART_W}");
+    assert!((h - PART_H).abs() < 0.1, "plate side {h} vs {PART_H}");
+}

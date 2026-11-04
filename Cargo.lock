@@ -5482,6 +5482,7 @@ dependencies = [
  "palette_core",
  "photo_core",
  "pixel_core",
+ "principia",
  "quartzite",
  "scan_core",
  "sketch_core",

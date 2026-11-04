@@ -544,6 +544,19 @@ pub static SCHEMA: &[Key] = &[
         writers: OP, reader: "gneiss_pal ProviderConfig",
         doc: "Sampling temperature.",
     },
+    // ── vug — the 3D handler's photo face (VUGFACEPHOTOCAMERAPREF SR576; read once at start by vug-view) ──────────
+    Key {
+        ns: "vug", key: "photo.camera_mm", kind: Kind::Float { min: 20.0, max: 10000.0 },
+        default: Default::Consumer("the side photo's own lattice solve (photo_core::camera_at)"),
+        writers: OP, reader: "vug-view PhotoPrefs (`vessels/vug-view/src/photo.rs`)",
+        doc: "The camera's height above the paper (mm), the once-per-setup datum the side photo's parallax correction takes when its lattice cannot calibrate the camera (a square camera).",
+    },
+    Key {
+        ns: "vug", key: "photo.principal_px", kind: Kind::Str { max_len: 32, printable: true },
+        default: Default::Consumer("the photo's centre"),
+        writers: OP, reader: "vug-view PhotoPrefs (`vessels/vug-view/src/photo.rs`)",
+        doc: "The camera's principal point in photo pixels, `x,y` (a cropped photo's: the uncropped centre less the crop's offset); the camera solve and the lens term are centred on it.",
+    },
 ];
 
 /// The declared row for `ns`/`key`.

@@ -80,8 +80,14 @@ impl Viewer {
 
     /// VUGFACEPHOTO (SR506): THE open road — a .png / .jpg / .jpeg (else any file pixel_core recognises that is not a
     /// mesh by extension) is a photo on graph paper measured at `photo::PITCH_MM`; anything else is a mesh
-    /// (`Model::open`). The title is the file name.
+    /// (`Model::open`). The title is the file name. No camera prefs ([`Viewer::open_with`]'s default).
     pub fn open(path: &str, size: (u32, u32), preset: Preset) -> Result<Viewer, String> {
+        Viewer::open_with(path, size, preset, photo::PhotoPrefs::default())
+    }
+
+    /// VUGFACEPHOTOCAMERAPREF (SR576): [`Viewer::open`] with the camera's prefs (main.rs reads them once from
+    /// Principia's store) handed to a photo's open road.
+    pub fn open_with(path: &str, size: (u32, u32), preset: Preset, prefs: photo::PhotoPrefs) -> Result<Viewer, String> {
         let p = std::path::Path::new(path);
         let title = p.file_name().and_then(|s| s.to_str()).unwrap_or("vug").to_string();
         let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
@@ -94,7 +100,7 @@ impl Viewer {
         if !mesh {
             let bytes = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
             if matches!(ext.as_str(), "png" | "jpg" | "jpeg") || pixel_core::sniff(&bytes).is_some() {
-                v = Some(Viewer::open_photo(&bytes, &title, size, preset, photo::PITCH_MM).map_err(|e| format!("{path}: {e}"))?);
+                v = Some(Viewer::open_photo_with(&bytes, &title, size, preset, photo::PITCH_MM, prefs).map_err(|e| format!("{path}: {e}"))?); // VUGFACEPHOTOCAMERAPREF (SR576)
             }
         }
         let mut v = match v {
@@ -106,9 +112,14 @@ impl Viewer {
     }
 
     /// VUGFACEPHOTO (SR506): a photo's bytes on `pitch_mm` graph paper: photo_core measures it, the paper is the drawn
-    /// model, the measured sketch is open (Select) on the XY plane, seen from the top.
+    /// model, the measured sketch is open (Select) on the XY plane, seen from the top. No camera prefs.
     pub fn open_photo(bytes: &[u8], title: &str, size: (u32, u32), preset: Preset, pitch_mm: f64) -> Result<Viewer, String> {
-        let (model, face, photo) = photo::open(bytes, pitch_mm)?;
+        Viewer::open_photo_with(bytes, title, size, preset, pitch_mm, photo::PhotoPrefs::default())
+    }
+
+    /// VUGFACEPHOTOCAMERAPREF (SR576): [`Viewer::open_photo`] under the camera's prefs (`photo::open_with`).
+    pub fn open_photo_with(bytes: &[u8], title: &str, size: (u32, u32), preset: Preset, pitch_mm: f64, prefs: photo::PhotoPrefs) -> Result<Viewer, String> {
+        let (model, face, photo) = photo::open_with(bytes, pitch_mm, prefs)?;
         let mut v = Viewer::new(model, title, size, preset);
         v.view.top(&v.model);
         v.view.design.face = Some(face);
