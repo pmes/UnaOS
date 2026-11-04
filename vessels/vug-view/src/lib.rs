@@ -128,13 +128,15 @@ impl Viewer {
         let mesh = model::read_mesh(scan)?;
         let text = std::fs::read_to_string(design).map_err(|e| format!("{design}: {e}"))?;
         let doc = doc_core::read_with(&text, &doc_host::DirLib::beside(std::path::Path::new(design))).map_err(|e| format!("{design}: {e:?}"))?; // VUGMAKEMACHINELIBFACE (SR548)
-        Viewer::open_deviation(deviation::scan_mesh(mesh), &doc, &title, size, preset).map_err(|e| format!("{design}: {e}"))
+        Viewer::open_deviation(deviation::scan_mesh(mesh), &doc, &title, size, preset, None).map_err(|e| format!("{design}: {e}")) // VUGFACEGDTREMEASURE (SR560): a PLY carries no truncation
     }
 
     /// VUGFACEDEVIATION (SR525): a scan measured against `doc` at `deviation::BAND_MM` (the test door): the model is the
-    /// scan at the aligned pose (as read on a refusal), the map the view's.
-    pub fn open_deviation(scan: scan_core::ScanMesh, doc: &doc_core::Doc, title: &str, size: (u32, u32), preset: Preset) -> Result<Viewer, String> {
-        let (model, map) = deviation::open(&scan, doc, deviation::BAND_MM)?;
+    /// scan at the aligned pose (as read on a refusal), the map the view's. VUGFACEGDTREMEASURE (SR560): `margin_mm` is
+    /// the gdt edge margin, the fused volume's own truncation when the caller fused the scan (`Tsdf::trunc_mm()`); None
+    /// is `deviation::GDT_MARGIN_MM`, the fallback, not the rule.
+    pub fn open_deviation(scan: scan_core::ScanMesh, doc: &doc_core::Doc, title: &str, size: (u32, u32), preset: Preset, margin_mm: Option<f64>) -> Result<Viewer, String> {
+        let (model, map) = deviation::open(&scan, doc, deviation::BAND_MM, margin_mm.unwrap_or(deviation::GDT_MARGIN_MM))?;
         let mut v = Viewer::new(model, title, size, preset);
         v.view.deviation = Some(map);
         Ok(v)
