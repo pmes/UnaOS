@@ -106,6 +106,10 @@ pub struct ScanMesh {
     pub confidence: Vec<f32>,
     pub intrinsics: Intrinsics,
     pub frames: u32,
+    /// VUGSCANCOARSEVIEWORIGIN (LEDGER SR643): the fused world's frame-0 camera centre (mm), read from the fuse's poses
+    /// (`fuse::camera`); None when the source carries none (`extract` alone, a mesh file): the view road's front test
+    /// reads it and a mesh without one is refused that road.
+    pub camera: Option<Vec3>,
 }
 
 /// Marching cubes over every allocated, observed cube of `t`.
@@ -124,5 +128,6 @@ pub fn extract(t: &Tsdf) -> Result<ScanMesh, ScanError> {
         confidence: s.weights,
         intrinsics,
         frames: t.frames(),
+        camera: None, // VUGSCANCOARSEVIEWORIGIN (SR643): a Tsdf carries no pose; the fuse's callers set it (fuse::camera)
     })
 }

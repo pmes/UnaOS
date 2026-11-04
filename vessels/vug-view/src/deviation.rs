@@ -93,7 +93,7 @@ pub struct Map {
 pub fn scan_mesh(mesh: Mesh) -> ScanMesh {
     let normals = mesh.normals_vertex(Tol::DEFAULT);
     let confidence = vec![1.0; mesh.positions.len()];
-    ScanMesh { mesh, normals, confidence, intrinsics: Intrinsics::from_rect_params(0, 0, [0.0; 4]), frames: 0 }
+    ScanMesh { mesh, normals, confidence, intrinsics: Intrinsics::from_rect_params(0, 0, [0.0; 4]), frames: 0, camera: None } // VUGSCANCOARSEVIEWORIGIN (SR643): a mesh file carries no camera
 }
 
 /// The design of `doc` as tools/scan builds it: doc_core `replay`, the first failure on a statement a solid reads

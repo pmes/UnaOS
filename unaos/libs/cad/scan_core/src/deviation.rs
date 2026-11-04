@@ -647,11 +647,13 @@ pub fn measure_coarse(scan: &ScanMesh, design: &Design, p: &AlignParams, band_mm
 // [`COARSE_KEEP`]); the best [`COARSE_VIEW_KEEP`] by the keep-[`COARSE_SELECT_KEEP`] score go into `measure_coarse`'s
 // own refine / select loop (the box-symmetric 180° turn ranks first on the start's score and is told apart there, as
 // SR615 measured). It runs only when SR615's floor refuses AND the scan is a view: at least [`COARSE_VIEW_FRONT`] of
-// the sampled vertices face the scan frame's origin ([`front`]; modelled 0.9975 for the 12-frame tracked scan, 0.855 /
-// 0.865 for SR615's carried orbit and its half fragment, which keep SR615's road). Cost: 2·STEPS × (SHIFTS + 2) ×
-// [`COARSE_POINTS`] `Bvh::closest` (≈ 344k) and COARSE_POINTS for the front, then SR615's budget unchanged.
+// the sampled vertices face the scan's carried camera ([`front`], `ScanMesh::camera`, VUGSCANCOARSEVIEWORIGIN SR643: a
+// mesh with none is refused this road; frame 0's camera, [0,0,0] in a tracked world; modelled 0.9975 for the 12-frame
+// tracked scan, 0.855 / 0.865 for SR615's carried orbit and its half fragment, which keep SR615's road). Cost:
+// 2·STEPS × (SHIFTS + 2) × [`COARSE_POINTS`] `Bvh::closest` (≈ 344k) and COARSE_POINTS for the front, then SR615's
+// budget unchanged.
 
-/// The least fraction of the sampled scan vertices whose normal faces the scan frame's origin for the view road.
+/// The least fraction of the sampled scan vertices whose normal faces the scan's carried camera for the view road.
 pub const COARSE_VIEW_FRONT: f64 = 0.95;
 /// The yaw steps of the sweep about the design's smallest axis (30°: the nearest within 15° of the truth).
 pub const COARSE_VIEW_STEPS: usize = 12;
@@ -660,9 +662,9 @@ pub const COARSE_VIEW_SHIFTS: usize = 5;
 /// The swept starts handed to `measure_coarse`'s refine / select loop (SR615's four-refine budget).
 pub const COARSE_VIEW_KEEP: usize = 4;
 
-/// The fraction of `sample`'s vertices whose normal faces the scan frame's origin (n·(0 − q) > 0); a vertex with no
-/// normal counts against it. 0.0 on an empty sample.
-fn front(scan: &ScanMesh, sample: &[usize]) -> f64 {
+/// The fraction of `sample`'s vertices whose normal faces `camera` (n·(c − q) > 0; VUGSCANCOARSEVIEWORIGIN SR643: the
+/// scan's carried camera, never an assumed origin); a vertex with no normal counts against it. 0.0 on an empty sample.
+fn front(scan: &ScanMesh, camera: Vec3, sample: &[usize]) -> f64 {
     if sample.is_empty() {
         return 0.0;
     }
@@ -671,7 +673,7 @@ fn front(scan: &ScanMesh, sample: &[usize]) -> f64 {
         .filter(|&&i| {
             let q = scan.mesh.positions[i];
             let n = scan.normals.get(i).copied().unwrap_or(Vec3::ZERO);
-            n.dot(q) < 0.0
+            n.dot(camera - q) > 0.0
         })
         .count();
     facing as f64 / sample.len() as f64
@@ -699,8 +701,9 @@ fn shift(scan: &ScanMesh, design: &Design, bvh: &Bvh, normals: &[Vec3], sample: 
     pose
 }
 
-/// The near-single-view starts (scan → design): None when the scan or design is empty, has zero area, or is not a view
-/// ([`front`] under [`COARSE_VIEW_FRONT`]); else the design frame (x, y, z = x × y from the principal axes) with z of
+/// The near-single-view starts (scan → design): None when the scan or design is empty, has zero area, carries no camera
+/// (`ScanMesh::camera` None, VUGSCANCOARSEVIEWORIGIN SR643), or is not a view ([`front`] under [`COARSE_VIEW_FRONT`]);
+/// else the design frame (x, y, z = x × y from the principal axes) with z of
 /// both signs, x swept about z in [`COARSE_VIEW_STEPS`] steps, onto the scan's frame as [`coarse`] builds it, each
 /// [`shift`]ed at `p.gate(0)`·[`COARSE_WIDEN`]; the best [`COARSE_VIEW_KEEP`] by [`trimmed`] at `p.gate(0)` over
 /// [`COARSE_SELECT_KEEP`] (the first on a tie), each carrying its start score ([`trimmed`] at `p.gate(0)`,
@@ -710,8 +713,9 @@ pub fn coarse_view(scan: &ScanMesh, design: &Design, bvh: &Bvh, p: &AlignParams,
     if nv == 0 || design.mesh.triangles.is_empty() {
         return None;
     }
+    let camera = scan.camera?; // VUGSCANCOARSEVIEWORIGIN (SR643): no carried camera, no view road
     let sample = coarse_sample(nv);
-    if !(front(scan, &sample) >= COARSE_VIEW_FRONT) {
+    if !(front(scan, camera, &sample) >= COARSE_VIEW_FRONT) {
         return None;
     }
     let (cs, xs, ys) = axes(&scan.mesh)?;

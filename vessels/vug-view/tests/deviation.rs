@@ -1506,7 +1506,7 @@ fn a_prb_opens_against_the_part_as_scan_core_fuses_it() {
     assert!(map.result.is_ok(), "the frame lies on the moved design: {:?}", map.result.as_ref().err());
     println!("prb: verts={} direct={}", map.basis.0.mesh.positions.len(), direct.mesh.positions.len());
     assert_eq!(map.basis.0.mesh.positions.len(), direct.mesh.positions.len(), "the vertex count");
-    assert!(map.basis.0 == direct, "the map's basis is scan_core's own fuse of the frame");
+    assert!(map.basis.0 == ScanMesh { camera: Some(Vec3::ZERO), ..direct.clone() }, "the map's basis is scan_core's own fuse of the frame"); // VUGSCANCOARSEVIEWORIGIN (SR643): the posed road carries frame 0's camera
 
     let face = map
         .gdt
@@ -1735,4 +1735,35 @@ fn a_fused_scan_opens_at_its_volumes_truncation() {
     assert_eq!(pm.margin_mm, trunc, "the path map's margin is the fused volume's truncation");
     assert_eq!(jm.margin_mm, trunc, "the journal map's margin is the fused volume's truncation");
     assert_eq!(trunc, vug_view::deviation::GDT_MARGIN_MM, "equal to the fallback today: no knob sets the face's truncation");
+}
+
+// ---- VUGSCANCOARSEVIEWORIGIN (LEDGER SR643): the view road's front test reads the carried camera ----
+// A tracked .prb's mesh carries frame 0's camera (scan_core `fuse::camera`, read from the loop's poses: [0,0,0] in the
+// tracked world) and keeps SR626's view road; the same mesh with its camera removed is refused that road (SR615's four
+// starts, their refusal), and a mesh file (`scan_mesh`) carries none.
+
+#[test]
+fn a_scan_without_a_camera_is_refused_the_view_road() {
+    use scan_core::deviation::{Road, coarse, coarse_view, measure_coarse};
+    let (track, _, part, _) = tracked_prb("vugscancoarsevieworigin", 4);
+    let p = Viewer::open_against(&track, &part, SIZE, Preset::Una).expect("the .prb fuses and measures");
+    let map = p.view.deviation.as_ref().expect("a map");
+    let (s, design) = &*map.basis;
+    assert_eq!(s.camera, Some(Vec3::ZERO), "the tracked world's frame-0 camera, read from the fuse's poses");
+    let kept = match map.road {
+        Road::CoarseFine { rms_mm } => rms_mm,
+        other => panic!("expected the view road kept with the camera carried, got {other:?}"),
+    };
+
+    let ap = scan_core::AlignParams::DEFAULT;
+    let bvh = mesh_core::bvh::Bvh::build(&design.mesh);
+    let none = ScanMesh { camera: None, ..s.clone() };
+    assert!(coarse_view(&none, design, &bvh, &ap, Tol::DEFAULT).is_none(), "no camera, no view road");
+    let least = coarse(&none, design, &bvh, &ap, Tol::DEFAULT).expect("four starts").iter().map(|x| x.1).fold(f64::INFINITY, f64::min);
+    let (road, r) = measure_coarse(&none, design, &ap, BAND_MM, Tol::DEFAULT);
+    println!("vieworigin: camera={:?} road=CoarseFine rms={kept:.3} | camera=None view=None road={road:?} least-four={least:.3}", s.camera);
+    assert_eq!(road, Road::CoarseRefused { rms_mm: least }, "SR615's road alone: its four starts' refusal");
+    assert!(matches!(r, Err(DeviationError::NoAlignment { .. })), "{:?}", r.as_ref().err());
+
+    assert_eq!(vug_view::deviation::scan_mesh(s.mesh.clone()).camera, None, "a mesh file carries no camera");
 }
