@@ -49,6 +49,7 @@ pub mod pump; // VUGCOMSCAN1 (SR476): the pump, whose only entry is Helm's Verdi
 #[cfg(any(target_os = "linux", target_os = "macos"))] pub mod tty; // VUGCOMSCANTTY (SR484): the host serial port (termios) as the pump's Transport
 pub mod tcp; // VUGCOMSCANTCP (SR487): grblHAL / FluidNC raw TCP (tcp://host:port) as the pump's Transport
 pub mod ws; // VUGCOMSCANWS (SR499): FluidNC / ESP3D WebSocket (ws://host:port/path) as the pump's Transport over gneiss_pal's RFC 6455 client
+pub mod discovery; // VUGCOMSCANMDNS (SR632): the networked controllers found by one mDNS question (found, never dialed)
 
 pub use logview::LogView;
 
@@ -331,5 +332,24 @@ impl PumpCard {
                 None
             }
         }
+    }
+}
+
+// --- VUGCOMSCANMDNS (LEDGER SR632): a person's discover from the Console's card, said through the squawk row (named tail hunk) ---
+
+impl PumpCard {
+    /// Ask the link who is there: [`discovery::discover`] for `wait` (one mDNS question, the answers collected, nothing
+    /// dialed), said through [`PumpCard::say_found`]. Blocks the caller for `wait`: a face calls it off its main thread.
+    pub fn discover(&mut self, wait: std::time::Duration) -> Vec<String> {
+        let found = discovery::discover(wait);
+        self.say_found(&found)
+    }
+
+    /// What the card says of a discover: [`discovery::words`] (`found: <name> <addr>:<port>` per answer, `found: none`
+    /// for silence), the last of them in the pad's squawk row. Posts nothing and connects nothing: the person picks.
+    pub fn say_found(&mut self, found: &[discovery::Found]) -> Vec<String> {
+        let said = discovery::words(found);
+        self.pad.squawk = said.last().cloned();
+        said
     }
 }
