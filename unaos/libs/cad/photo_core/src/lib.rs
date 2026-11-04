@@ -19,7 +19,9 @@
 //! 4. [`silhouette`]: the lattice rectified to paper millimetres, Otsu (1979), the ink suppressed by an opening at
 //!    the measured stroke width, open / close at pitch / 8, the largest component the part, its enclosed
 //!    components the holes; a stroke pair off every lattice line by more than the stroke width is a thin side of the
-//!    part, not ink, and its dark band connected to the part is put back ([`thin_sides`], VUGPHOTOSIDETHIN SR651).
+//!    part, not ink, and its dark band connected to the part is put back ([`thin_sides`], VUGPHOTOSIDETHIN SR651);
+//!    on a lattice line the stretch whose core is darker than the sheet's own ink tone is put back the same way
+//!    ([`dark_pair`], VUGPHOTOSIDETHINCROSS SR654).
 //! 5. [`contour`]: crack following (Pavlidis 1982), outer CCW / holes CW checked by geom_core's exact `is_ccw`,
 //!    Douglas-Peucker (1973) at 2 σ.
 //! 6. [`fit`]: corners, TLS lines and Pratt (1987) arcs / circles between them by their residual against σ, the
@@ -773,8 +775,19 @@ pub fn thin_sides(
     width_mm: f64,
 ) -> Result<silhouette::Silhouette, Refusal> {
     let Ok(h_inv) = homography::invert(&lat.h) else { return Ok(sil) };
-    let off: Vec<&grid::GridLine> = pairs.iter().filter(|p| off_lattice(p, &h_inv, pitch, width_mm)).collect();
-    if off.is_empty() {
+    let mut bands: Vec<(&grid::GridLine, f64, f64)> = pairs
+        .iter()
+        .filter(|p| off_lattice(p, &h_inv, pitch, width_mm))
+        .filter_map(|p| pair_run(p).map(|(t0, t1)| (p, t0, t1)))
+        .collect();
+    // VUGPHOTOSIDETHINCROSS (SR654): an on-lattice pair's stretch darker than the sheet's ink is a thin side lying on the line.
+    if let Some((_, _, cut)) = ink_cut(pairs, gray, &sil, &h_inv, pitch, width_mm) {
+        let min_px = pitch / 8.0 * lat.px_per_mm;
+        for p in pairs.iter().filter(|p| !off_lattice(p, &h_inv, pitch, width_mm)) {
+            bands.extend(dark_pair(p, gray, &sil, &h_inv, cut, min_px).into_iter().map(|(t0, t1)| (p, t0, t1)));
+        }
+    }
+    if bands.is_empty() {
         return Ok(sil);
     }
     let (w, h) = (sil.w, sil.h);
@@ -784,8 +797,7 @@ pub fn thin_sides(
         gray.sample(q.x, q.y).map(|l| (q, l))
     };
     let in_band = |q: Vec2| -> bool {
-        off.iter().any(|pr| {
-            let Some((t0, t1)) = pair_run(pr) else { return false };
+        bands.iter().any(|&(pr, t0, t1)| {
             let d = q - pr.point;
             let t = d.dot(pr.dir);
             d.dot(pr.dir.perp()).abs() <= 0.5 * pr.width_px + BLUR_PX && t >= t0 - pr.width_px && t <= t1 + pr.width_px
@@ -829,4 +841,124 @@ pub fn thin_sides(
         }
     }
     Ok(out)
+}
+
+// ---- VUGPHOTOSIDETHINCROSS (SR654): a pair ON a lattice line whose core is darker than ink (named tail block) ----
+// A thin part lying on (or crossing) a lattice line has no pair of its own: its edges sit within refine's band of the
+// ink's (a 0.5 mm shim on a 0.4 mm line: 0.4 px apart at ~8 px / mm), so its edgels refine INTO the line's pair and
+// `off_lattice`'s position rule keeps it ink. The tell is its tone, per step along the pair: the core (the darkest
+// pixel across the pair's own width) against the sheet's ink tone (the median core of the on-lattice pairs' dense runs)
+// and its spread (their pooled MAD). A stretch darker than ink by more than DARK_K spreads, at least pitch / 8 long,
+// is a band for `thin_sides`' one restore, which keeps only the Otsu-dark pixels connected to the part (the ink line's
+// own pixels sit above Otsu and stay ink).
+// VUGPHOTOSIDETHINEDGE (SR662): `dark_pair` reads a step whose cross-section touches the part on its half AWAY from the
+// part (`core_luma`'s split), so a thin side alongside the plate's edge inside the skip zone is seen by its tone.
+
+/// The tone tell's margin in spreads: ink to the part is ~40 spreads on the fixture (ink ~168, part ~40, MAD ~3).
+const DARK_K: f64 = 10.0;
+
+/// The pair's core luma at parameter `t`: the darkest bilinear sample across |s| <= width_px / 2. None when any point of
+/// the cross-section widened by 2 · [`BLUR_PX`] is off the photo or in the silhouette's part (a step under the part, or
+/// whose blur reach touches its edge, says nothing about the line: line / plate junctions, an edge alongside a line).
+/// VUGPHOTOSIDETHINEDGE (SR662): with `split`, a cross-section touching the part on ONE side only, and only past
+/// 2 · [`BLUR_PX`] from the centre, is read on its half away from the part (|s| in [0, width_px / 2] on that side, clear of
+/// the part by the same widening): a part sample within 2 · BLUR_PX of the centre, or on both sides, is still None.
+fn core_luma(pair: &grid::GridLine, gray: &edges::Gray, sil: &silhouette::Silhouette, h_inv: &homography::H, t: f64, split: bool) -> Option<f32> {
+    let c = pair.point + pair.dir * t;
+    let n = pair.dir.perp();
+    let half = 0.5 * pair.width_px;
+    let reach = half + 2.0 * BLUR_PX;
+    let k = libm::ceil(reach) as i64;
+    let (mut lo, mut hi) = (false, false); // VUGPHOTOSIDETHINEDGE (SR662): the part touched on the -n / +n side
+    for j in -k..=k {
+        let s = (j as f64).clamp(-reach, reach);
+        let q = c + n * s;
+        gray.sample(q.x, q.y)?;
+        let p = homography::apply(h_inv, q)?;
+        let (u, v) = (libm::floor((p.x - sil.x0) * sil.r), libm::floor((p.y - sil.y0) * sil.r));
+        if u >= 0.0 && v >= 0.0 && (u as usize) < sil.w && (v as usize) < sil.h && sil.part[v as usize * sil.w + u as usize] {
+            if !split || s.abs() <= 2.0 * BLUR_PX {
+                return None;
+            }
+            if s < 0.0 {
+                lo = true;
+            } else {
+                hi = true;
+            }
+        }
+    }
+    let (a, b) = match (lo, hi) {
+        (true, true) => return None,
+        (true, false) => (0.0, half),
+        (false, true) => (-half, 0.0),
+        (false, false) => (-half, half),
+    };
+    let m = libm::ceil(b - a).max(1.0) as usize;
+    let mut best = f32::INFINITY;
+    for j in 0..=m {
+        let q = c + n * (a + (b - a) * j as f64 / m as f64);
+        best = best.min(gray.sample(q.x, q.y)?);
+    }
+    Some(best)
+}
+
+/// The sheet's ink tone, its spread and the cut `(ink, spread, ink - DARK_K · spread)`: [`core_luma`] at 1 px steps along
+/// every on-lattice pair's dense run (`pair_run`), the median and the MAD of the pooled samples (the spread floored at one
+/// luma quantum). None with no sample.
+pub fn ink_cut(
+    pairs: &[grid::GridLine],
+    gray: &edges::Gray,
+    sil: &silhouette::Silhouette,
+    h_inv: &homography::H,
+    pitch: f64,
+    width_mm: f64,
+) -> Option<(f64, f64, f64)> {
+    let mut v: Vec<f64> = Vec::new();
+    for p in pairs.iter().filter(|p| !off_lattice(p, h_inv, pitch, width_mm)) {
+        let Some((t0, t1)) = pair_run(p) else { continue };
+        let n = libm::floor(t1 - t0) as usize;
+        v.extend((0..=n).filter_map(|k| core_luma(p, gray, sil, h_inv, t0 + k as f64, false)).map(f64::from)); // VUGPHOTOSIDETHINEDGE (SR662): whole clean cross-sections only
+    }
+    if v.is_empty() {
+        return None;
+    }
+    v.sort_by(|a, b| a.total_cmp(b));
+    let ink = v[v.len() / 2];
+    let mut dev: Vec<f64> = v.iter().map(|x| (x - ink).abs()).collect();
+    dev.sort_by(|a, b| a.total_cmp(b));
+    let spread = dev[dev.len() / 2].max(1.0);
+    Some((ink, spread, ink - DARK_K * spread))
+}
+
+/// The pair's dark stretches `(t0, t1)` (photo px along `dir`): over its WHOLE support span at 1 px, the runs of steps whose
+/// [`core_luma`] is under `cut` (a skipped or light step ends a run), kept when at least `min_px` long; the core read with
+/// its split (VUGPHOTOSIDETHINEDGE SR662: the half away from the part where the part touches one side only).
+pub fn dark_pair(
+    pair: &grid::GridLine,
+    gray: &edges::Gray,
+    sil: &silhouette::Silhouette,
+    h_inv: &homography::H,
+    cut: f64,
+    min_px: f64,
+) -> Vec<(f64, f64)> {
+    let mut out = Vec::new();
+    let (Some(&a), Some(&b)) = (pair.support.first(), pair.support.last()) else { return out };
+    let n = libm::floor(b - a) as usize;
+    let mut run: Option<(f64, f64)> = None;
+    for k in 0..=n {
+        let t = a + k as f64;
+        if core_luma(pair, gray, sil, h_inv, t, true).is_some_and(|l| (l as f64) < cut) {
+            run = Some(run.map_or((t, t), |(s, _)| (s, t)));
+        } else if let Some((s, e)) = run.take() {
+            if e - s >= min_px {
+                out.push((s, e));
+            }
+        }
+    }
+    if let Some((s, e)) = run {
+        if e - s >= min_px {
+            out.push((s, e));
+        }
+    }
+    out
 }
