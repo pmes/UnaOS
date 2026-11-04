@@ -563,8 +563,8 @@ pub fn fulfiller_row(verb: u8) -> Option<(usize, u64)> {
 // refuses a row NAMED as another program (-EACCES); the RELAY — by then the name is armed — refuses any holder
 // not named as the fulfiller (named otherwise, or still unnamed), drops its registration and answers the caller
 // -ENOENT, so no body ever reaches it. `fulfiller_row` (SYS_RINGKEY's trust, B1155's judge) takes the same
-// filter. Every other tag stays open. Residual (docs/SECURITY.md): the name is trusted by spelling, as
-// PREFSCAP's is. Witness: `tests bandy3` → `:: BUSREG-TAGID: … -> PASS ::`.
+// filter. Every other tag stays open. The spelling residual is closed by BUSREG-TAG-PATH (B1163, tail below:
+// the path the launcher loaded decides, the name only demotes). Witness: `tests bandy3` → `:: BUSREG-TAGID: … -> PASS ::`.
 // =================================================================================================
 /// (first tag, last tag, the image the kernel names as that range's fulfiller).
 const TAG_IMAGE: &[(u8, u8, &str)] = &[
@@ -603,7 +603,7 @@ fn row_name(row: usize, buf: &mut [u8; crate::video::wm::MAX_TITLE]) -> &str {
 
 /// Who `row` is for `verb`. Takes no lock but wm's leaf `APP_NAMES` — never called under `REGS`.
 fn tag_id(verb: u8, row: usize, buf: &mut [u8; crate::video::wm::MAX_TITLE]) -> TagId {
-    let Some(img) = tag_image(verb) else { return TagId::Open };
+    let Some(img) = tag_image(verb) else { return TagId::Open }; if let Some(id) = tagpath_id(row, img, buf) { return id; } // BUSREG-TAG-PATH (B1163): the loaded /apps/ path decides, the name only demotes (file tail)
     let name = row_name(row, buf);
     if name.is_empty() {
         TagId::Unnamed
@@ -718,21 +718,43 @@ fn tagid_selftest(fx: &Fixture) {
     if ok && sent && reached && holder {
         w |= 1 << 2;
     }
+    // BUSREG-TAG-PATH (B1163) L4: named PREFS, but loaded from a home path -> refused at REGISTER.
+    on_exit(fx.ops, f);
+    (fx.clear)(f);
+    let _ = crate::video::wm::app_name_arm(owner_f, "/home/una/PREFS.ELF");
+    let n = crate::bus::build_request(BUS_VERB_REGISTER, 66, &[set], &mut buf);
+    let path_refused = (fx.send)(f, &buf[..n]) == 0 && matches!((fx.pop)(f).as_deref().and_then(parse), Some(h) if h.status == EACCES as i32 && h.corr == 66);
+    if path_refused && lookup(fx.ops, set).is_none() {
+        w |= 1 << 3;
+    }
+    // L5: named PREFS by spelling alone (a relative literal arms no path) -> registers, but the relay drops it.
+    let _ = crate::video::wm::app_name_arm(owner_f, "PREFS.ELF");
+    let n = crate::bus::build_request(BUS_VERB_REGISTER, 67, &[get], &mut buf);
+    let admitted = (fx.send)(f, &buf[..n]) == 0 && matches!((fx.pop)(f).as_deref().and_then(parse), Some(h) if h.status == 0 && h.corr == 67);
+    let n = crate::bus::build_request(get, 68, b"ui.theme", &mut buf);
+    let sent = (fx.send)(a, &buf[..n]) == 0;
+    let enoent = matches!((fx.pop)(a).as_deref().and_then(parse), Some(h) if h.status == ENOENT as i32 && h.corr == 68 && h.principal[0] == PRIN_KERNEL_REPLY);
+    let unseen = (fx.pop)(f).is_none();
+    if admitted && sent && enoent && unseen && lookup(fx.ops, get).is_none() {
+        w |= 1 << 4;
+    }
     on_exit(fx.ops, f);
     (fx.clear)(a);
     (fx.clear)(f);
     on_exit(fx.ops, a);
     crate::video::wm::app_name_forget(owner_f);
-    const ALL: u32 = (1 << 3) - 1;
+    const ALL: u32 = (1 << 5) - 1;
     let (rf, dr) = (TAGID_REFUSED.load(Ordering::Relaxed), TAGID_DROPPED.load(Ordering::Relaxed));
     if w == ALL {
-        serial_println!(":: BUSREG-TAGID: probe=refused unnamed=dropped prefs=admitted relayed=1 refused={} dropped={} -> PASS ::", rf, dr);
+        serial_println!(":: BUSREG-TAGID: probe=refused unnamed=dropped prefs=admitted path=refused spelled=dropped relayed=1 refused={} dropped={} -> PASS ::", rf, dr);
     } else {
         serial_println!(
-            ":: BUSREG-TAGID: probe={} unnamed={} prefs={} relayed={} refused={} dropped={} w={:#x}/{:#x} -> FAIL ::",
+            ":: BUSREG-TAGID: probe={} unnamed={} prefs={} path={} spelled={} relayed={} refused={} dropped={} w={:#x}/{:#x} -> FAIL ::",
             if w & 1 != 0 { "refused" } else { "OPEN" },
             if w & 2 != 0 { "dropped" } else { "KEPT" },
             if w & 4 != 0 { "admitted" } else { "REFUSED" },
+            if w & 8 != 0 { "refused" } else { "OPEN" },
+            if w & 16 != 0 { "dropped" } else { "KEPT" },
             (w >> 2) & 1, rf, dr, w, ALL
         );
     }
@@ -792,4 +814,36 @@ pub fn end_prelogin_fulfillers() -> usize {
         }
     }
     ended
+}
+
+// =================================================================================================
+// BUSREG-TAG-PATH (rmbp-ledger B1163) — TAIL-APPENDED. B1157 judged a private tag's holder on the launcher-armed
+// NAME, so an image called PREFS.ELF launched from any path was Principia's fulfiller. The launcher also knows
+// the PATH it read the image from, and wm now keeps it beside the name (`wm::app_path_with`, armed by the same
+// `app_name_arm` / `app_name_arm_launch` every launch road calls). The rule: a row with a path armed is the
+// fulfiller iff that path IS `TAG_IMAGE`'s image — the `/apps/` prefix byte-exact (`/` is not a ROOTACL tree,
+// so `/APPS/…` could be planted on a case-sensitive root), the leaf case-insensitive (only `kernel` and the
+// administrator create anything under ROOTACL's `/apps`) — else it is `Other`. With no path armed, the
+// fulfiller's NAME alone is `Unnamed` (registers — the `app_name_arm_launch` gap between name and path — and is
+// dropped at the relay if still pathless): the spelling never promotes. Any other case is B1157's name logic.
+// =================================================================================================
+
+/// `tag_id`'s path key for `row` against the image `img`: `Some(verdict)` when the path decides (or the name
+/// alone would have promoted), `None` = fall through to the name. Takes only wm's leaf locks.
+fn tagpath_id(row: usize, img: &str, buf: &mut [u8; crate::video::wm::MAX_TITLE]) -> Option<TagId> {
+    let owner = crate::video::wm::owner_of_launch(row as u64);
+    if let Some(is) = crate::video::wm::app_path_with(owner, |p| path_names(p, img)) {
+        return Some(if is { TagId::Fulfiller } else { TagId::Other });
+    }
+    let name = row_name(row, buf);
+    (!name.is_empty() && name.eq_ignore_ascii_case(crate::video::wm::program_name(img))).then_some(TagId::Unnamed)
+}
+
+/// Is the loaded `path` the image `img` (`/apps/<LEAF>`)? The directory byte-exact, the leaf any case.
+fn path_names(path: &str, img: &str) -> bool {
+    const DIR: &str = "/apps/";
+    match (path.strip_prefix(DIR), img.strip_prefix(DIR)) {
+        (Some(leaf), Some(want)) => !leaf.is_empty() && leaf.eq_ignore_ascii_case(want),
+        _ => false,
+    }
 }
