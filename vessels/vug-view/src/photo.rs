@@ -570,6 +570,7 @@ pub fn overlay(view: &View, fr: &mut Raster) {
         let col = if note.starts_with("refused") || note.starts_with("Vein refused") { REFUSED } else { INK };
         raster::text(fr, &note.to_uppercase(), 6.0, 18.0, rgba(col));
     }
+    if let Some(w) = wide_note(view) { raster::text(fr, &w.to_uppercase(), 6.0, 30.0, rgba(INK)); } // VUGINTENTSETFACEPUSHEDGE (SR606): the corner's second row names a glyph wider than the sheet
 }
 
 // ---- VUGFACEINTENTSEND (SR514): the ask over the bus and its answer (named tail block) ----
@@ -1511,6 +1512,10 @@ fn overlaps(a: (f32, f32, f32, f32), b: (f32, f32, f32, f32)) -> bool {
 /// VUGINTENTSETFACELISTEDOVERLAP (SR601): first, an anchored glyph overlapping the listed column ([`listed_column`])
 /// moves RIGHT to the column's edge + 6 px (the only case x moves, at most once: x never comes back); both checks re-run
 /// after either push, so a right-pushed glyph still goes down under an earlier anchored one.
+/// VUGINTENTSETFACEPUSHEDGE (SR606): when the right push would carry the rect's right edge past the sheet
+/// (`view.size.0`), the glyph goes DOWN to the column's foot instead (x unmoved, [`drop_to`]); at most once per glyph
+/// (x and y only grow), then at most one SR596 push per earlier placed rect. A glyph wider than the sheet keeps its
+/// anchor x, is clipped, and the corner names it ([`wide_note`]).
 fn unstack(view: &View, ph: &Photo, face: &SketchFace, mut out: Vec<ProposalGlyph>) -> Vec<ProposalGlyph> {
     let col = listed_column(view, ph, face, &out); // VUGINTENTSETFACELISTEDOVERLAP (SR601): the listed column's strip
     let mut placed: Vec<(f32, f32, f32, f32)> = Vec::new();
@@ -1521,15 +1526,12 @@ fn unstack(view: &View, ph: &Photo, face: &SketchFace, mut out: Vec<ProposalGlyp
         loop {
             let me = glyph_rect(g);
             if let Some(c) = col.filter(|c| overlaps(*c, me)) {
+                if c.0 + c.2 + 6.0 + me.2 > view.size.0 as f32 { drop_to(view, ph, g, c.1 + c.3); continue; } // VUGINTENTSETFACEPUSHEDGE (SR606): a right push past the sheet's edge goes down to the column's foot, x unmoved
                 g.at.0 = c.0 + c.2 + 6.0; // VUGINTENTSETFACELISTEDOVERLAP (SR601): right to the column's edge + 6, y kept
                 continue;
             }
             let Some(r) = placed.iter().copied().find(|r| overlaps(*r, me)) else { break };
-            g.at.1 = r.1 + r.3;
-            if let Some(c) = g.card.as_mut() {
-                c.first = ph.offers[g.offer].page;
-            }
-            g.card = paged(g.card.take(), g.at.1, view.size.1);
+            drop_to(view, ph, g, r.1 + r.3); // VUGINTENTSETFACEPUSHEDGE (SR606): SR596's down push through the one re-page
         }
         placed.push(glyph_rect(g));
     }
@@ -1648,4 +1650,28 @@ fn paint_leader(view: &View, fr: &mut Raster, g: &ProposalGlyph) {
     if let Some((a, b)) = leader(view, g) {
         raster::line(fr, a, b, rgba(INK));
     }
+}
+
+// ---- VUGINTENTSETFACEPUSHEDGE (SR606): a right push past the sheet's edge goes down to the column's foot; the corner names a glyph wider than the sheet (named tail block) ----
+
+/// SR596's down push and SR606's foot push, ONE re-page: the glyph's head moves to `y` (x unmoved) and its card is
+/// re-paged at the new height from its head offer's page ([`paged`]).
+fn drop_to(view: &View, ph: &Photo, g: &mut ProposalGlyph, y: f32) {
+    g.at.1 = y;
+    if let Some(c) = g.card.as_mut() {
+        c.first = ph.offers[g.offer].page;
+    }
+    g.card = paged(g.card.take(), g.at.1, view.size.1);
+}
+
+/// The corner's second row ((6, 30), the row SR589's listed column skips under the note): `glyph wider than the sheet:
+/// <id>` for the first glyph in [`glyphs`]' output whose [`glyph_rect`] is wider than the sheet (`view.size.0`), which no
+/// push can hold and the raster clips; `<id>` is its statement's doc_core id (`<verb> <id>`), else `#<offer>`. Derived
+/// each frame (the pass stores nothing, so [`Photo::note`], the event roads' line, is never overwritten); said once.
+pub fn wide_note(view: &View) -> Option<String> {
+    let ph = view.photo.as_ref()?;
+    let g = glyphs(view).into_iter().find(|g| glyph_rect(g).2 > view.size.0 as f32)?;
+    let stmt = ph.offers.get(g.offer).map(|o| o.proposal.stmt.as_str()).unwrap_or("");
+    let id = stmt.split_whitespace().nth(1).map_or_else(|| format!("#{}", g.offer), str::to_string);
+    Some(format!("glyph wider than the sheet: {id}"))
 }
