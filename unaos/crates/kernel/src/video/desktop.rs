@@ -3999,3 +3999,33 @@ pub fn login_refill_rows(back: &Back, y0: usize, n: usize) -> Option<(usize, u64
     }
     Some((end, crate::video::blitter::cycles_to_us(crate::arch::now_cycles().saturating_sub(t0))))
 }
+
+// ── VEIL-HELD-ARM (rmbp-ledger B1141, BP-video-11) — TAIL-APPENDED: the kept HALF field recomposed in place on aarch64 ──
+// [`login_refill_rows`]' aarch64 arm, the same contract over B1122's half field: `y0`/`n`/`next_row` count HALF rows
+// (`h / 2 + 1` of them, `w / 2 + 1` wide), each recomposed straight into its kept slot through [`login_half_row`] at the
+// current `Look::login()` with `LOGIN_VEIL` held one row at a time, so `login_half_put`'s `try_lock` sees each row old or
+// new. Called by `wallpaper::veil_login_svc` from the one-shot `veil-rebuild` task (`sched::worker_cpu_apart`).
+
+/// Half rows `y0..y0 + n` of the kept login field recomposed in place at the current look. `Some((next_half_row, us))`;
+/// `None` when the kept field is not this picture's half field (re-keyed by an install, or dropped): nothing is written.
+#[cfg(all(target_arch = "aarch64", feature = "facet", feature = "desktop_firmware"))]
+pub fn login_refill_rows(back: &Back, y0: usize, n: usize) -> Option<(usize, u64)> {
+    let look = crate::video::crystal::veil::Look::login();
+    let (pw, ph) = (back.w, back.h);
+    if pw == 0 || ph == 0 {
+        return None;
+    }
+    let (hw, hh) = (pw / 2 + 1, ph / 2 + 1);
+    let k = veil_key(Some(back), (0, 0, pw, ph), 1);
+    let end = y0.saturating_add(n).min(hh);
+    let t0 = crate::arch::now_cycles();
+    for j in y0..end {
+        let mut c = LOGIN_VEIL.lock();
+        if c.key != Some(k) || c.w != hw || c.h != hh || c.rows.len() < (j + 1) * hw || c.have.len() <= j {
+            return None;
+        }
+        login_half_row(&mut c.rows[j * hw..(j + 1) * hw], j, back, look);
+        c.have[j] = true;
+    }
+    Some((end, crate::video::blitter::cycles_to_us(crate::arch::now_cycles().saturating_sub(t0))))
+}
