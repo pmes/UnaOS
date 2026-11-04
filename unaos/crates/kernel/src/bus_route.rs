@@ -518,7 +518,7 @@ pub fn selftest(fx: &Fixture) {
     } else {
         serial_println!(":: BANDY3: registered={} relayed={} replied={} orphan={} w={:#05x}/{:#05x} verbs={}/{} -> FAIL ::", rg, rl, rp, or, w, ALL, vg, vl);
     }
-    tagid_selftest(fx); armearly_selftest(fx); unreadset_selftest(fx); /* RELAY-RESET-SET (B1169): the unread-mark legs (file tail). BUSREG-ARM-EARLY (B1164): the early-arm legs, after the BUSREG-TAGID line (file tail) */ armforget_selftest(fx); /* ARMFORGET-CHAIN (B1171): the teardown-forget legs (file tail) */ crate::prefs_client::queued_selftest(); /* RELAY-QUEUED-SET (B1175): the queued-set legs (prefs_client.rs tail) */ armlate_selftest(fx); /* ARMFORGET-LATEARM (B1178): the late-arm stamp legs (file tail) */ // BUSREG-TAG-IDENTITY (B1157): the identity legs, after the BANDY3 line
+    tagid_selftest(fx); armearly_selftest(fx); unreadset_selftest(fx); /* RELAY-RESET-SET (B1169): the unread-mark legs (file tail). BUSREG-ARM-EARLY (B1164): the early-arm legs, after the BUSREG-TAGID line (file tail) */ armforget_selftest(fx); /* ARMFORGET-CHAIN (B1171): the teardown-forget legs (file tail) */ crate::prefs_client::queued_selftest(); /* RELAY-QUEUED-SET (B1175): the queued-set legs (prefs_client.rs tail) */ armlate_selftest(fx); /* ARMFORGET-LATEARM (B1178): the late-arm stamp legs (file tail) */ unsetrelay_selftest(fx); /* PREFS-UNSET-RELAY (B1186): the relayed-unset legs (file tail) */ // BUSREG-TAG-IDENTITY (B1157): the identity legs, after the BANDY3 line
 }
 
 /// HOLOCRON2 (rmbp-ledger B355): does `verb` have a registration right now? (Generation not checked: a row
@@ -535,7 +535,7 @@ const EACCES: i64 = -13;
 
 /// The PREF tags' caller gate: `Some(status)` = answered here, never relayed.
 pub fn pref_gate(verb: u8, caller_row: usize) -> Option<i64> {
-    (verb == una_abi::BUS_VERB_R3PREF_SET && caller_row != crate::prefs_client::KCLIENT_ROW).then_some(EACCES)
+    ((verb == una_abi::BUS_VERB_R3PREF_SET || verb == una_abi::BUS_VERB_R3PREF_UNSET) && caller_row != crate::prefs_client::KCLIENT_ROW).then_some(EACCES) // PREFS-UNSET-RELAY (B1186): 131 is the same deputy door
 }
 
 #[allow(dead_code)] // a no-witness build has no caller
@@ -543,7 +543,7 @@ pub fn pref_gate(verb: u8, caller_row: usize) -> Option<i64> {
 pub fn r3pref_set_refused() -> bool {
     pref_gate(una_abi::BUS_VERB_R3PREF_SET, 0) == Some(EACCES)
         && pref_gate(una_abi::BUS_VERB_R3PREF_SET, crate::prefs_client::KCLIENT_ROW).is_none()
-        && pref_gate(una_abi::BUS_VERB_R3PREF_GET, 0).is_none()
+        && pref_gate(una_abi::BUS_VERB_R3PREF_GET, 0).is_none() && pref_gate(una_abi::BUS_VERB_R3PREF_UNSET, 0) == Some(EACCES) // PREFS-UNSET-RELAY (B1186): a ring-3 R3PREF_UNSET too
 }
 /// RINGLOGIN (rmbp-ledger B465): the row registered for `verb` right now (SYS_RINGKEY hands the login's ring
 /// key only to the process holding Holocron's verbs). Tail append.
@@ -568,7 +568,7 @@ pub fn fulfiller_row(verb: u8) -> Option<(usize, u64)> {
 // =================================================================================================
 /// (first tag, last tag, the image the kernel names as that range's fulfiller).
 const TAG_IMAGE: &[(u8, u8, &str)] = &[
-    (una_abi::BUS_VERB_R3PREF_GET, una_abi::BUS_VERB_R3PREF_SET, "/apps/PREFS.ELF"),
+    (una_abi::BUS_VERB_R3PREF_GET, una_abi::BUS_VERB_R3PREF_UNSET, "/apps/PREFS.ELF"), // PREFS-UNSET-RELAY (B1186): 128..=131
     (una_abi::BUS_VERB_HOLOCRON_FIRST, una_abi::BUS_VERB_HOLOCRON_LAST, "/apps/HOLOCRON.ELF"),
 ];
 
@@ -1051,7 +1051,7 @@ fn take_unread(row: usize, relay: u32) -> bool {
 /// `on_exit`'s per-relay step: the mark is always consumed; a kernel-client SET (R3PREF_SET) whose frame was
 /// unread is handed to `prefs_client` by its CLIENT corr, before the -ECONNRESET is delivered.
 fn unread_handoff(row: usize, p: &Pend) {
-    if take_unread(row, p.relay) && p.verb == una_abi::BUS_VERB_R3PREF_SET && p.caller_row == crate::prefs_client::KCLIENT_ROW {
+    if take_unread(row, p.relay) && (p.verb == una_abi::BUS_VERB_R3PREF_SET || p.verb == una_abi::BUS_VERB_R3PREF_UNSET) && p.caller_row == crate::prefs_client::KCLIENT_ROW { // PREFS-UNSET-RELAY (B1186): an unread relayed UNSET is a write too
         crate::prefs_client::note_set_unread(p.caller_corr);
     }
 }
@@ -1322,4 +1322,102 @@ fn appsfolder_legs(fx: &Fixture, f: usize, owner_f: u64) -> u32 {
         w |= 1 << 1;
     }
     w
+}
+
+// PREFS-UNSET-RELAY (rmbp-ledger B1186) — TAIL-APPENDED. Principia's ring-3 UNSET tag R3PREF_UNSET (131) joins the
+// write road SET (130) already has: TAG_IMAGE's PREFS.ELF row runs 128..=131 (the holder is judged on its `/apps/` path,
+// B1157/B1163), `pref_gate` refuses 131 from every row but the kernel client (the confused deputy B1166 named: PREFS.ELF
+// forwards it under its own name), and `unread_handoff` hands an UNREAD kernel-client 131 to `prefs_client` exactly as a
+// SET (B1169: unread -> the kernel fulfiller applies, read -> -ECONNRESET final). `prefs_client::relay` maps PREF_UNSET
+// (29) to 131 (`r3_tag`) and takes it down the same B1155 gate, B1175 queue arm and B1169 unread road (`relayed_write`).
+// Witness: `tests bandy3` -> `:: PREFS-UNSET-RELAY: register=fulfiller deputy=refused relayed=holder unread=handed
+// reset=kernel-applied read=final queued=kernel-applied -> PASS ::`.
+// =================================================================================================
+
+/// `tests bandy3`' relayed-unset legs on the fixture's scratch rows (caller `a`, fulfiller `f`): R1 `f` armed as
+/// `/apps/PREFS.ELF` (B1178's mint note at its generation, then the late arm) registers 131 and is its fulfiller; R2 a
+/// ring-3 caller's 131 is answered -EACCES by the kernel and nothing reaches `f`; R3 the kernel client's 131 is relayed
+/// and `f` reads it with its body; R4 a second client 131 left UNREAD at the teardown is handed by its client corr
+/// exactly once (the read one is not). Then `prefs_client::unset_relay_legs` (P1-P3). SKIP as `armlate_selftest` does.
+fn unsetrelay_selftest(fx: &Fixture) {
+    let (a, f) = fx.rows;
+    let owner_f = crate::video::wm::owner_of_launch(f as u64);
+    let (get, unset) = (una_abi::BUS_VERB_R3PREF_GET, una_abi::BUS_VERB_R3PREF_UNSET);
+    if (get..=unset).any(|v| lookup(fx.ops, v).is_some()) {
+        serial_println!(":: PREFS-UNSET-RELAY: SKIP (a live row holds Principia's tags) ::");
+        return;
+    }
+    let rg = (fx.ops.rgen)(f);
+    let mut nb = [0u8; crate::video::wm::MAX_TITLE];
+    if crate::video::wm::app_name_armed(owner_f)
+        || crate::video::wm::app_path_with(owner_f, |_| true).is_some()
+        || crate::video::wm::app_name_early_of(owner_f, rg, &mut nb) != 0
+    {
+        serial_println!(":: PREFS-UNSET-RELAY: SKIP (scratch row {} carries a name) ::", f);
+        return;
+    }
+    (fx.clear)(a);
+    (fx.clear)(f);
+    let parse = |b: &[u8]| crate::bus::frame_parse(b).ok();
+    let mut buf = [0u8; 128];
+    let mut w = 0u32;
+    const BODY: &[u8] = b"system.display.idle_min";
+    let client = |corr: u32| {
+        let h = crate::bus::BusHdr { kind: crate::bus::BUS_KIND_REQUEST, verb: unset, corr, status: 0, principal: crate::prefs_client::principal(), body_len: BODY.len() as u32 };
+        matches!(route_request(fx.ops, crate::prefs_client::KCLIENT_ROW, crate::prefs_client::KCLIENT_GEN, crate::prefs_client::principal(), &h, BODY), Route::Relayed)
+    };
+
+    // R1: the fulfiller by path registers 131.
+    let prev = crate::video::wm::app_mint_note(owner_f, Some(rg));
+    let _ = crate::video::wm::app_name_arm(owner_f, "/apps/PREFS.ELF");
+    let n = crate::bus::build_request(BUS_VERB_REGISTER, 90, &[unset], &mut buf);
+    let registered = (fx.send)(f, &buf[..n]) == 0 && matches!((fx.pop)(f).as_deref().and_then(parse), Some(h) if h.status == 0 && h.corr == 90);
+    let named = tag_id(unset, f, &mut nb) == TagId::Fulfiller;
+    if registered && named {
+        w |= 1 << 0;
+    }
+    // R2: the deputy door — a ring-3 131 is the kernel's -EACCES, never relayed.
+    let n = crate::bus::build_request(unset, 91, BODY, &mut buf);
+    let sent = (fx.send)(a, &buf[..n]) == 0;
+    let refused = matches!((fx.pop)(a).as_deref().and_then(parse), Some(h) if h.status == EACCES as i32 && h.corr == 91 && h.principal[0] == PRIN_KERNEL_REPLY);
+    if sent && refused && (fx.pop)(f).is_none() {
+        w |= 1 << 1;
+    }
+    // R3: the kernel client's 131 reaches the holder with its body.
+    let (c1, c2) = (u32::MAX - 2, u32::MAX - 3); // never live client corrs (the client counts up from 1)
+    let relayed = client(c1);
+    let reached = matches!((fx.pop)(f), Some(fr) if matches!(parse(&fr[..]), Some(h) if h.kind == crate::bus::BUS_KIND_REQUEST && h.verb == unset) && fr.get(crate::bus::BUS_HDR_LEN..) == Some(BODY));
+    if relayed && reached {
+        w |= 1 << 2;
+    }
+    // R4: a second client 131 left unread at the teardown is handed once; the read one is not.
+    let relayed2 = client(c2);
+    (fx.clear)(f);
+    on_exit(fx.ops, f);
+    let handed = relayed2 && crate::prefs_client::set_unread_take(c2) && !crate::prefs_client::set_unread_take(c2) && !crate::prefs_client::set_unread_take(c1);
+    if handed {
+        w |= 1 << 3;
+    }
+    (fx.clear)(a);
+    (fx.clear)(f);
+    on_exit(fx.ops, a);
+    crate::video::wm::app_name_forget(owner_f);
+    let _ = crate::video::wm::app_mint_note(owner_f, prev);
+    const ALL: u32 = (1 << 4) - 1;
+    let p = crate::prefs_client::unset_relay_legs();
+    match p {
+        Ok((true, true, true)) if w == ALL => serial_println!(":: PREFS-UNSET-RELAY: register=fulfiller deputy=refused relayed=holder unread=handed reset=kernel-applied read=final queued=kernel-applied -> PASS ::"),
+        Err(why) if w == ALL => serial_println!(":: PREFS-UNSET-RELAY: register=fulfiller deputy=refused relayed=holder unread=handed reset=SKIP({}) -> PASS ::", why),
+        _ => {
+            let (p1, p2, p3) = p.unwrap_or((false, false, false));
+            serial_println!(
+                ":: PREFS-UNSET-RELAY: register={} deputy={} relayed={} unread={} map={} reset={} queued={} w={:#x}/{:#x} -> FAIL ::",
+                if w & 1 != 0 { "fulfiller" } else { "REFUSED" },
+                if w & 2 != 0 { "refused" } else { "OPEN" },
+                if w & 4 != 0 { "holder" } else { "LOST" },
+                if w & 8 != 0 { "handed" } else { "UNHANDED" },
+                p1 as u8, p2 as u8, p3 as u8, w, ALL
+            );
+        }
+    }
 }

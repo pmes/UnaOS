@@ -1771,7 +1771,7 @@ pub fn key_route(ev: crate::pal::Event) -> bool {
                     true
                 }
                 0x7F | b'd' if tab == 1 && !strip && is_root() => { users_key_delete(); true }
-                0x08 | 0x7F if tab == 0 && !strip && s == 5 => { CUR.lock().wall.pop(); repaint(); true }
+                0x08 | 0x7F if tab == 0 && !strip && s == 5 => { CUR.lock().wall.pop(); repaint(); true } 0x7F if !strip => { reset_row(tab); true } // PREFS-UNSET-RELAY (rmbp-ledger B1186): Delete on the pane's selected control unsets its MAP row's held keys (file tail). LINE-NEUTRAL fold
                 0x20..=0x7e if tab == 0 && !strip && s == 5 => {
                     { let mut c2 = CUR.lock(); if c2.wall.len() < WALL_MAX { c2.wall.push(c as char); } }
                     repaint();
@@ -6223,3 +6223,34 @@ fn reduce_hit(cx: usize) -> bool {
     cx >= TRACK_X && cx + 8 < TOG_X
 }
 
+
+// =================================================================================================
+// PREFS-UNSET-RELAY (rmbp-ledger B1186) — TAIL-APPENDED. "Reset to default" on a Settings row: Delete (0x7F) on the
+// pane's selected control (the row of the keyboard stop `kf`, `stop_in_row`'s arithmetic) unsets the keys of that row's
+// ONE `MAP` entry that the store holds (a GET answers 0), each through `prefs_client::pref_unset` (relayed to PREFS.ELF
+// as R3PREF_UNSET 131 while it holds the tag, else the kernel fulfiller), said `[settings] reset system.<k> ok=<0|1>
+// via=<kernel|prefs.elf>`. A row at its default (every key -ENOENT) or with no MAP entry does nothing and says nothing.
+// The Users tab keeps Delete (`users_key_delete`) and the Wallpaper field keeps it as Backspace (earlier arms). No pixel
+// moves; the painted reset button is owed (SETTINGS-RESET-BUTTON).
+// =================================================================================================
+/// Delete on the selected control of pane `tab`: unset its row's held keys (see the block above).
+fn reset_row(tab: usize) {
+    let row = {
+        let g = STATE.lock();
+        let Some(st) = g.as_ref() else { return };
+        let (p0, n) = stops(st);
+        if st.kf >= n {
+            return;
+        }
+        let h = st.hits[p0 + st.kf];
+        (h[1] as usize + h[3] as usize / 2).saturating_sub(TOP) / ROW_H()
+    };
+    let Some(r) = MAP.iter().find(|m| m.tab == tab && m.row == row) else { return };
+    for k in r.keys.iter() {
+        if crate::prefs_client::pref_get(crate::prefs::NS, k).is_err() {
+            continue; // at its default already: nothing to reset
+        }
+        let ok = crate::prefs_client::pref_unset(crate::prefs::NS, k).is_ok();
+        serial_println!("[settings] reset {}.{} ok={} via={}", crate::prefs::NS, k, ok as u8, crate::prefs_client::last_via());
+    }
+}

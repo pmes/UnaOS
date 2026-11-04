@@ -221,6 +221,7 @@ fn r3_tag(verb: u8) -> Option<u8> {
         una_abi::BUS_VERB_PREF_GET => Some(una_abi::BUS_VERB_R3PREF_GET),
         una_abi::BUS_VERB_PREF_LIST => Some(una_abi::BUS_VERB_R3PREF_LIST),
         una_abi::BUS_VERB_PREF_SET => Some(una_abi::BUS_VERB_R3PREF_SET),
+        una_abi::BUS_VERB_PREF_UNSET => Some(una_abi::BUS_VERB_R3PREF_UNSET), // PREFS-UNSET-RELAY (B1186): the unset relays as Principia's 131
         _ => None,
     }
 }
@@ -229,7 +230,7 @@ fn r3_tag(verb: u8) -> Option<u8> {
 /// registration, a refusal, or the wait ran out) — the kernel fulfiller answers instead.
 #[cfg(feature = "busreg")]
 fn relay(hdr: &crate::bus::BusHdr, body: &[u8]) -> Option<Answer> {
-    let tag = r3_tag(hdr.verb)?; if hdr.verb == una_abi::BUS_VERB_PREF_SET && !set_holder_in_session(tag, hdr.corr) { return None; } // PREFSELF-PRELOGIN (B1155): a SET whose fulfiller is not a program of the open session (a PREFS.ELF launched before login) is never relayed — the kernel fulfiller answers (file tail). LINE-NEUTRAL fold.
+    let tag = r3_tag(hdr.verb)?; if relayed_write(hdr.verb) && !set_holder_in_session(tag, hdr.corr) { return None; } // PREFS-UNSET-RELAY (B1186): a relayed WRITE is SET or UNSET (file tail). PREFSELF-PRELOGIN (B1155): a SET whose fulfiller is not a program of the open session (a PREFS.ELF launched before login) is never relayed — the kernel fulfiller answers (file tail). LINE-NEUTRAL fold.
     let ops = crate::arch::syscall::busreg_ops(); let held = crate::bus_route::fulfiller_row(tag); // RELAY-RESET-FALLBACK (B1165): the (row, rgen) the relay goes to, read back if a -ECONNRESET answers (file tail). LINE-NEUTRAL fold.
     let h3 = crate::bus::BusHdr { verb: tag, ..*hdr };
     match crate::bus_route::route_request(ops, KCLIENT_ROW, KCLIENT_GEN, principal(), &h3, body) {
@@ -249,7 +250,7 @@ fn relay(hdr: &crate::bus::BusHdr, body: &[u8]) -> Option<Answer> {
         spins += 1;
         if crate::arch::ms().saturating_sub(t0) >= RELAY_WAIT_MS || spins >= RELAY_SPIN_MAX {
             RELAY_TIMEOUT.fetch_add(1, Ordering::Relaxed);
-            if hdr.verb == una_abi::BUS_VERB_PREF_SET {
+            if relayed_write(hdr.verb) { // PREFS-UNSET-RELAY (B1186): a timed-out UNSET is queued like a SET (file tail)
                 // The frame is already in PREFS.ELF's mailbox and WILL land: a kernel write now could be
                 // overtaken by this queued one (set A times out, set B lands, A lands = A wins). One queue,
                 // one order — the set is accepted as in flight; its PrefChanged tells the window when it lands.
@@ -995,14 +996,14 @@ fn set_holder_in_session(tag: u8, corr: u32) -> bool {
 /// fulfiller answers (`relay` returns `None`).
 #[cfg(feature = "busreg")]
 fn reset_by_kernel(hdr: &crate::bus::BusHdr, tag: u8, held: Option<(usize, u64)>, status: i32) -> bool {
-    if status as i64 != una_abi::ECONNRESET || (hdr.verb == una_abi::BUS_VERB_PREF_SET && !set_unread_take(hdr.corr)) { // RELAY-RESET-SET (B1169): a SET passes only when on_exit marked its frame UNREAD (file tail)
+    if status as i64 != una_abi::ECONNRESET || (relayed_write(hdr.verb) && !set_unread_take(hdr.corr)) { // PREFS-UNSET-RELAY (B1186): an UNSET is a write (file tail). RELAY-RESET-SET (B1169): a SET passes only when on_exit marked its frame UNREAD (file tail)
         return false;
     }
     let Some((row, rgen)) = held else { return false };
     if (crate::arch::syscall::busreg_ops().rgen)(row) == rgen {
         return false; // the holder lives: its own -ECONNRESET is its answer
     }
-    serial_println!("[prefsbus] relay verb={} corr={} fulfiller gone{} — kernel fulfiller answers", tag, hdr.corr, if hdr.verb == una_abi::BUS_VERB_PREF_SET { " unread" } else { "" }); // RELAY-RESET-SET (B1169): GET / LIST bytes unchanged
+    serial_println!("[prefsbus] relay verb={} corr={} fulfiller gone{} — kernel fulfiller answers", tag, hdr.corr, if relayed_write(hdr.verb) { " unread" } else { "" }); // RELAY-RESET-SET (B1169): GET / LIST bytes unchanged. PREFS-UNSET-RELAY (B1186): an UNSET as a SET
     true
 }
 
@@ -1365,4 +1366,98 @@ fn lostreset_selftest(next: &dyn Fn() -> u32, body_of: &dyn Fn(i64) -> String, r
         serial_println!("[prefsbus] lostreset legs: kept={}/{} lost={}/{} graced4={} released4={} waited={}ms read4={} gone5={} read5={}", kept4 as u8, kept5 as u8, lost4 as u8, lost5 as u8, graced4 as u8, released4 as u8, waited, read4.unwrap_or(-1), gone5 as u8, read5.unwrap_or(-1));
     }
     (q4, q5)
+}
+
+// PREFS-UNSET-RELAY (rmbp-ledger B1186) — TAIL-APPENDED. The kernel client's UNSET (PREF_UNSET 29) relays to Principia's
+// ring-3 fulfiller as R3PREF_UNSET (131, `r3_tag`) and is a WRITE on every road a relayed SET takes ([`relayed_write`]):
+// B1155's gate (a holder not of the open session is skipped, the kernel fulfiller answers), B1175's queue arm (a timed-out
+// unset is kept in `QUEUED` and settled by `queued_drain`, whose `kernel` call is verb-generic; its lines say "set" for a
+// queued unset too, UNSET-QUEUED-WORD owed) and B1169's unread road (`bus_route::unread_handoff` marks an unread 131 ->
+// the kernel fulfiller applies it; one the holder READ stays -ECONNRESET). PREFS.ELF forwards 131 to PREF_UNSET under
+// its own stamped name: `wire::unset_as` checks `cap::may_set` for `prefs` (B1170/B1177 demote an image not at
+// `/apps/PREFS.ELF` to Anon). [`pref_unset`] is the sender (Settings' Delete on a row, `video/settings.rs`).
+// =================================================================================================
+/// A relayed WRITE (SET or UNSET): the verbs B1155's gate, B1175's queue and B1169's unread road apply to.
+#[cfg(feature = "busreg")]
+fn relayed_write(verb: u8) -> bool {
+    verb == una_abi::BUS_VERB_PREF_SET || verb == una_abi::BUS_VERB_PREF_UNSET
+}
+
+/// PrefUnset `ns.key` over the bus (the key reads its default again). `Ok` = a value left the store (its PrefChanged
+/// unset form follows); `Err(-ENOENT)` = it was unset already; other errnos as PREF_UNSET's. Relayed as 131 while
+/// PREFS.ELF holds it (busreg), else the kernel fulfiller answers.
+pub fn pref_unset(ns: &str, k: &str) -> Result<(), i64> {
+    let a = call(una_abi::BUS_VERB_PREF_UNSET, alloc::format!("{}.{}", ns, k).as_bytes());
+    serial_println!("[prefsbus] unset {}.{} via={} status={}", ns, k, last_via(), a.status);
+    if a.status == 0 { Ok(()) } else { Err(a.status) }
+}
+
+/// `bus_route::unsetrelay_selftest`'s client legs (`tests bandy3`), key `system.display.idle_min`, the operator's value
+/// restored: P1 `r3_tag` maps PREF_UNSET to 131 and it is a relayed write (GET is not); P2 a holder gone (the client row's
+/// own generation answers `u64::MAX`, never 0): with no unread mark the -ECONNRESET stays final, with the mark
+/// `reset_by_kernel` hands the UNSET to the kernel fulfiller, which unsets the key; P3 a QUEUED unset (B1175's timeout
+/// road) with the unread mark is applied by the next call's `queued_drain`. `Err` = SKIP (no session, home unwritable).
+#[cfg(feature = "busreg")]
+pub fn unset_relay_legs() -> Result<(bool, bool, bool), &'static str> {
+    use crate::prefs::key;
+    if crate::fs::vfs::home_unwritable(&crate::shell::vfs_mount_table(), &crate::prefs::path()).is_some() {
+        return Err("home-not-writable");
+    }
+    if !in_session() {
+        return Err("no-session");
+    }
+    let next = || {
+        let mut c = NEXT_CORR.fetch_add(1, Ordering::Relaxed);
+        if c == 0 {
+            c = NEXT_CORR.fetch_add(1, Ordering::Relaxed);
+        }
+        c
+    };
+    let hdr_of = |verb: u8, corr: u32, body: &[u8]| -> Option<crate::bus::BusHdr> {
+        let mut f = alloc::vec![0u8; BUS_HDR_LEN + body.len()];
+        let n = crate::bus::build_request(verb, corr, body, &mut f);
+        crate::bus::frame_parse(&f[..n]).ok()
+    };
+    let addr = alloc::format!("{}.{}", crate::prefs::NS, key::IDLE_MIN);
+    let seed = |lit: &str| {
+        let b = alloc::format!("{}\0{}", addr, lit);
+        hdr_of(una_abi::BUS_VERB_PREF_SET, next(), b.as_bytes()).is_some_and(|h| kernel(&h, b.as_bytes()).status == 0)
+    };
+    let held = Some((KCLIENT_ROW, 0u64));
+    let reset = una_abi::ECONNRESET as i32;
+    let orig = crate::prefs::get(crate::prefs::NS, key::IDLE_MIN);
+    // P1: the verb map and the write road.
+    let p1 = r3_tag(una_abi::BUS_VERB_PREF_UNSET) == Some(una_abi::BUS_VERB_R3PREF_UNSET) && relayed_write(una_abi::BUS_VERB_PREF_UNSET) && !relayed_write(una_abi::BUS_VERB_PREF_GET);
+    // P2: read -> final; unread -> the kernel fulfiller applies.
+    let seeded2 = seed(PrefValue::Int(7).to_literal().as_str());
+    let c2 = next();
+    let p2 = match hdr_of(una_abi::BUS_VERB_PREF_UNSET, c2, addr.as_bytes()) {
+        Some(h) => {
+            let fin = !reset_by_kernel(&h, una_abi::BUS_VERB_R3PREF_UNSET, held, reset) && crate::prefs::get(crate::prefs::NS, key::IDLE_MIN).is_some();
+            note_set_unread(c2);
+            let handed = reset_by_kernel(&h, una_abi::BUS_VERB_R3PREF_UNSET, held, reset);
+            let applied = handed && kernel(&h, addr.as_bytes()).status == 0 && crate::prefs::get(crate::prefs::NS, key::IDLE_MIN).is_none();
+            seeded2 && fin && applied
+        }
+        None => false,
+    };
+    // P3: a queued unset whose holder died with it unread is applied at the next call's drain.
+    let seeded3 = seed(PrefValue::Int(9).to_literal().as_str());
+    let c3 = next();
+    let kept = hdr_of(una_abi::BUS_VERB_PREF_UNSET, c3, addr.as_bytes()).is_some_and(|h| queued_keep(&h, addr.as_bytes()));
+    note_set_unread(c3);
+    let pushed = inbox_push(queued_reply(c3, reset));
+    let gone = pref_get(crate::prefs::NS, key::IDLE_MIN).is_err();
+    let p3 = seeded3 && kept && pushed && gone && queued_take(c3).is_none() && crate::prefs::get(crate::prefs::NS, key::IDLE_MIN).is_none();
+    let _ = queued_take(c3);
+    // Restore the operator's value through the same kernel fulfiller (or leave the key unset as it was).
+    match orig {
+        Some(v) => {
+            let _ = seed(v.to_literal().as_str());
+        }
+        None => {
+            let _ = crate::prefs::unset(crate::prefs::NS, key::IDLE_MIN);
+        }
+    }
+    Ok((p1, p2, p3))
 }
