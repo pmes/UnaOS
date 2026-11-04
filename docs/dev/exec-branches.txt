@@ -1549,3 +1549,12 @@ exec-rmbp-vugcomscanresumetool 750a1f0d8 wave36 cut68h
 exec-rmbp-vugcomscanmarlinjogmodal 750a1f0d8 wave36 cut68h
 exec-rmbp-vugintentfeaturesextenttable 750a1f0d8 wave36 cut68h
 exec-rmbp-vugintentfeaturesslot 750a1f0d8 wave36 cut68h
+exec-rmbp-vugscancoarsesymthreecost 7b12b1b82 wave36 cut69h
+exec-rmbp-vugphotosidethinedgemerge 7b12b1b82 wave36 cut69h
+exec-rmbp-vugphotosidethinsplit 7b12b1b82 wave36 cut69h
+exec-rmbp-vugphotooffaxis 7b12b1b82 wave36 cut69h
+exec-rmbp-vugcomscanresumelaser 7b12b1b82 wave36 cut69h
+exec-rmbp-vugcomscanresumetoolindex 7b12b1b82 wave36 cut69h
+exec-rmbp-vugintentfeaturesdeclined 7b12b1b82 wave36 cut69h
+exec-rmbp-vugintentsetsiblings 7b12b1b82 wave36 cut69h
+exec-rmbp-vugintentfeaturesslotconstrain 7b12b1b82 wave36 cut69h
