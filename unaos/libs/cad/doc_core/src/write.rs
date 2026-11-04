@@ -325,6 +325,12 @@ fn stmt(w: &mut W, s: &Stmt) {
             }
             w.f("confidence", *confidence);
         }
+        // VUGDOCPHOTOREF (SR652): the photo under the document, id-less like `stock`.
+        Stmt::Photo { path, pitch_mm } => {
+            w.out.push_str("photo");
+            w.s("path", path);
+            w.f("pitch", *pitch_mm);
+        }
     }
 }
 

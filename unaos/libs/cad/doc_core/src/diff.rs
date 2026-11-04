@@ -170,6 +170,7 @@ fn keys(doc: &Doc) -> Vec<String> {
                     fixtures += 1;
                     format!("fixture:{}", fixtures)
                 }
+                Stmt::Photo { .. } => "photo".to_string(), // VUGDOCPHOTOREF (SR652): its own pseudo-id, never `stock`
                 _ => "stock".to_string(),
             },
         };
