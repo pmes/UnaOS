@@ -5166,7 +5166,7 @@ fn input_service(_: usize) {
             // PIUSB-23: pump xHCI + bridge decoded HID keys into GUI_CHANNEL each cooperative pass
             // (QEMU raspi4b delivers no USB HID, so this is a cheap no-op there; on metal it consumes
             // the re-armed interrupt-IN completions the enumerate() pump no longer services).
-            unaos_kernel::hidstall::pump_here(); unaos_kernel::hidstall::pass_begin(); pump_usb_into_gui(); unaos_kernel::hidstall::pass_done(); // F39HIDPUMPARM (B1124): the QEMU raspi4b HID pass bracketed by the x86 pump's same three fns, so the gap split and the census's pump core read it (hidstall.rs tail). LINE-NEUTRAL fold, code first
+            unaos_kernel::hidstall::pump_here(); unaos_kernel::hidstall::pass_begin(); pump_usb_into_gui(); hid_census_roll(); unaos_kernel::hidstall::pass_done(); /* F39HIDCENSUSPI (B1159): once a minute the [hid] census rolls mid-pass through hidstall::census_minute_on_pump (main.rs tail) */ // F39HIDPUMPARM (B1124): the QEMU raspi4b HID pass bracketed by the x86 pump's same three fns, so the gap split and the census's pump core read it (hidstall.rs tail). LINE-NEUTRAL fold, code first
             unaos_kernel::arch::sched::yield_now();
         }
     }
@@ -5778,7 +5778,7 @@ fn usb_pump(_: usize) {
     loop {
         unaos_kernel::arch::sched::sleep_ticks(1); // ~4 ms at the 250 Hz per-core tick
         let t0 = unaos_kernel::arch::now_cycles();
-        unaos_kernel::hidstall::pump_here(); unaos_kernel::hidstall::pass_begin(); pump_usb_into_gui(); unaos_kernel::hidstall::pass_done(); // F39HIDPUMPARM (B1124): the metal HID pass bracketed by the x86 pump's same three fns, so the gap split, the pump core and B1118's tick sampler read it (hidstall.rs tail). LINE-NEUTRAL fold, code first
+        unaos_kernel::hidstall::pump_here(); unaos_kernel::hidstall::pass_begin(); pump_usb_into_gui(); hid_census_roll(); unaos_kernel::hidstall::pass_done(); /* F39HIDCENSUSPI (B1159): once a minute the [hid] census rolls mid-pass through hidstall::census_minute_on_pump (main.rs tail) */ // F39HIDPUMPARM (B1124): the metal HID pass bracketed by the x86 pump's same three fns, so the gap split, the pump core and B1118's tick sampler read it (hidstall.rs tail). LINE-NEUTRAL fold, code first
         let dt = unaos_kernel::arch::now_cycles().wrapping_sub(t0);
         // Rate-limit the cost line to once every ~5 s (this loop runs ~250×/s).
         let now = unaos_kernel::arch::ms();
@@ -10693,4 +10693,34 @@ fn rast_demo_armed_once() {}
 #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
 fn cursormove_span<R>(f: impl FnOnce() -> R) -> R {
     unaos_kernel::arch::sched::preemptoff::scoped(f)
+}
+
+// ── F39HIDCENSUSPI (rmbp-ledger B1159, BP-input-11) — HID-CENSUS-PI: the Pi's bracketed HID pass rolls the [hid] census. FILE-TAIL.
+// `hidstall::census_minute`'s only periodic caller is `video::lag`'s roll, live only on x86 `wc` (`lag::ON`), so the Pi's
+// pass (B1124: `usb_pump` on metal, c3; `input_service`'s poll-nap on QEMU raspi4b, exclusive on `timer::is_live()`) never
+// printed the census or B1124's `[hid] gap split`. Both bracket lines now call `hid_census_roll` mid-pass, before
+// `pass_done`, and it hands the minute to B1152's ONE pump-side road, `hidstall::census_minute_on_pump`, which moves the
+// pass stamps past its own synchronous ~42 ms print. The Pi loop has no sweep counter (the Orin's `% 240`), so the cadence
+// is the wall clock it already reads: `arch::ms()` (CNTVCT, live on metal and under raspi4b). One writer per boot, relaxed.
+// `who=` is live on metal (c3's 250 Hz tick votes through `hid_wait_tick`), `?` on raspi4b (no tick IRQ).
+
+/// F39HIDCENSUSPI (B1159): the last census roll's `arch::ms()`; 0 = not yet armed.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+static HID_CENSUS_ROLL_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// F39HIDCENSUSPI (B1159): called mid-pass by the Pi's hid pump. The first pass arms the stamp; every >= 60 s after it one
+/// `hidstall::census_minute_on_pump`. Cost per pass: one counter read and one relaxed load.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+fn hid_census_roll() {
+    use core::sync::atomic::Ordering::Relaxed;
+    let now = unaos_kernel::arch::ms();
+    let last = HID_CENSUS_ROLL_MS.load(Relaxed);
+    if last == 0 {
+        HID_CENSUS_ROLL_MS.store(now.max(1), Relaxed);
+        return;
+    }
+    if now.wrapping_sub(last) >= 60_000 {
+        HID_CENSUS_ROLL_MS.store(now.max(1), Relaxed);
+        unaos_kernel::hidstall::census_minute_on_pump();
+    }
 }
