@@ -436,9 +436,11 @@ fn a_rearmed_pump_resumes_from_the_named_line_and_runs_only_the_rest() {
     assert!(!m.realtime.contains(&b'~'), "the re-armed resume is not a cycle start byte");
     let ev = drive(&mut p, &mut m, 5_000, |ev| ev.contains(&Event::Done));
     assert!(ev.contains(&Event::Done));
-    assert_eq!(m.executed, lines[12..].to_vec());
+    let modal: Vec<String> = lines[0].split_whitespace().map(str::to_string).collect(); // VUGCOMSCANRESUMEMODAL (SR656): the preamble's groups, one line each, first
+    assert_eq!(m.executed, modal.iter().cloned().chain(lines[12..].iter().cloned()).collect::<Vec<_>>());
     let pr = p.progress();
-    assert_eq!((pr.sent, pr.acked, pr.total), (lines.len(), lines.len(), lines.len()));
+    let n = lines.len() + modal.len();
+    assert_eq!((pr.sent, pr.acked, pr.total), (n, n, n));
 }
 
 // --- VUGCOMSCANJOGFACE (SR579): grbl's jog cancel is the one realtime byte 0x85, never a feed hold ---
@@ -459,4 +461,71 @@ fn jog_cancel_is_0x85_on_the_wire_and_no_feed_hold() {
         marlin.jog_cancel(&mut m).err(),
         Some(PumpRefusal::NotInDialect { dialect: Dialect::Marlin, what: "jog cancel" })
     );
+}
+
+// --- VUGCOMSCANRESUMEMODAL (SR656): a resume restores the modal words the lines before its line set ---
+
+/// `lines` with `words` spliced in at index `i`.
+fn with_prefix(lines: &[String], i: usize, words: &[&str]) -> Vec<String> {
+    let mut v = lines[..i].to_vec();
+    v.extend(words.iter().map(|w| w.to_string()));
+    v.extend_from_slice(&lines[i..]);
+    v
+}
+
+#[test]
+fn a_resume_restores_the_modal_words_set_before_its_line() {
+    // grbl: every group the block set, the distance mode from its LAST word (G91.1 is the arc mode, not G91), program order.
+    let text = "G21 G90 G17 G94\nG91.1 G1 X1 F100\nG1 X2\nG91 G1 X3\nG1 X4\n";
+    let lines = Pump::new(GRBL, text).unwrap().lines().to_vec();
+    let p = Pump::new(GRBL, text).unwrap().with_status_every(0).resume_at(5).unwrap();
+    assert_eq!(p.lines().to_vec(), with_prefix(&lines, 4, &["G21", "G17", "G94", "G91"]));
+    assert_eq!((p.progress().sent, p.progress().acked), (4, 4), "the prefix is unsent");
+    assert!((4..9).all(|k| p.line_of(k) == Some(5)), "the prefix is numbered at the resume line");
+
+    // Marlin: one command per line (the M82 after G90 is never run), M83 then G90 in the program's order.
+    let text = "G21\nG91\nM83\nG1 X1 E1 F100\nG90 M82\nG1 X2 E2\nG1 X3 E3\n";
+    let lines = Pump::new(Dialect::Marlin, text).unwrap().lines().to_vec();
+    let p = Pump::new(Dialect::Marlin, text).unwrap().resume_at(7).unwrap();
+    assert_eq!(p.lines().to_vec(), with_prefix(&lines, 6, &["G21", "M83", "G90"]));
+
+    // No modal word before the line: nothing is added.
+    let text = "G1 X1 F100\nG1 X2\nG21\nG1 X3\n";
+    let lines = Pump::new(GRBL, text).unwrap().lines().to_vec();
+    let p = Pump::new(GRBL, text).unwrap().resume_at(2).unwrap();
+    assert_eq!(p.lines().to_vec(), lines);
+
+    // A loss inside the prefix is a loss at the resume line: the re-arm restores again.
+    struct Quiet;
+    impl Transport for Quiet {
+        fn write(&mut self, b: &[u8]) -> Result<usize, LinkError> {
+            Ok(b.len())
+        }
+        fn read(&mut self, _: &mut [u8]) -> Result<usize, LinkError> {
+            Ok(0)
+        }
+    }
+    struct Fin(Vec<u8>);
+    impl Transport for Fin {
+        fn write(&mut self, b: &[u8]) -> Result<usize, LinkError> {
+            Ok(b.len())
+        }
+        fn read(&mut self, b: &mut [u8]) -> Result<usize, LinkError> {
+            if self.0.is_empty() {
+                return Err(LinkError::Closed);
+            }
+            let n = b.len().min(self.0.len());
+            b[..n].copy_from_slice(&self.0[..n]);
+            self.0.drain(..n);
+            Ok(n)
+        }
+    }
+    let text = "G21 G90 G17 G94\nG91.1 G1 X1 F100\nG1 X2\nG91 G1 X3\nG1 X4\n";
+    let mut p = Pump::new(GRBL, text).unwrap().with_status_every(0).resume_at(5).unwrap();
+    p.resume(&mut Quiet).unwrap();
+    p.tick(&mut Quiet, 0);
+    assert_eq!(p.progress().sent, 9, "the prefix and the resume line went out");
+    let ev = p.tick(&mut Fin(b"ok\r\n".to_vec()), 1);
+    assert_eq!(ev, vec![Event::Ok(5), Event::LinkLost]);
+    assert_eq!(p.state(), PumpState::LinkLost { at_line: 5, program_digest: 0 });
 }

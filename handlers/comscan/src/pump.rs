@@ -2315,6 +2315,9 @@ impl PumpDesk {
     /// the running `Running` first (its drop then writes no `M154 S0` on the kept link), its hello rides the new run (so the
     /// auto-report arms from it) and is not said again, the travel read, the position and the identity are kept; said
     /// `started (on the live link)`. Under the desk lock; a start that no longer passes its checks is refused by them.
+    /// VUGCOMSCANLINKREUSEINFLIGHT (SR646): the arming's pump inherits the old pump's in-flight answers before the bind
+    /// ([`pump_core::Pump::inherit`]): an `M114` / `M154` `ok` still on the wire is swallowed, not read as a job line's, and
+    /// a report already on is not asked again.
     fn restarted(&mut self, ev: &PumpEvent) -> Vec<PumpEvent> {
         let u = match self.start_due(ev) {
             Ok(u) => u,
@@ -2325,7 +2328,7 @@ impl PumpDesk {
         else {
             return refused(format!("port {:?}: the live link went down", u.port));
         };
-        let a = self.armed.remove(u.i);
+        let mut a = self.armed.remove(u.i); if let Some(r) = self.running.as_ref() { a.pump.inherit(&r.pump); } // VUGCOMSCANLINKREUSEINFLIGHT (SR646): the old pump's M114 / M154 still on the wire (and a partial line) ride the new one
         let read = self.read;
         let out = self.bind(a.pump, u.port, (link, hello, None, read), "started (on the live link)".to_string(), true);
         if let Some(r) = self.running.as_mut() {
