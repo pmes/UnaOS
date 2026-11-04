@@ -71,6 +71,7 @@ pub struct PhotoParams {
     /// VUG-PHOTO-PP (SR569): the principal point in photo pixels; `None` is the photo centre. A cropped photo states it
     /// (the uncropped centre less the crop's offset) so [`camera_pose_at`] solves f and the pose about the right point.
     /// VUGFACEPHOTOCAMERAPREF (SR576): the lens term k1 is centred on it too ([`measure_lens`], [`undistort_gray_at`]).
+    /// VUGPHOTOCROPMETA (SR582): a photo carrying its own crop (the PNG tEXt [`CROP_KEY`], [`crop_principal`]) outranks it.
     pub principal_px: Option<Vec2>,
 }
 
@@ -213,7 +214,7 @@ pub fn measure_lens(img: &Image, params: PhotoParams, tol: Tol, lens: bool) -> R
     }
     // VUG-PHOTO-LENS (SR533): k1 from the lattice residual; the photo undistorted before the silhouette.
     let residual_flat_px = lat.residual_px;
-    let pp = params.principal_px.unwrap_or(Vec2::new(gray.w as f64 * 0.5, gray.h as f64 * 0.5)); // VUGFACEPHOTOCAMERAPREF (SR576): the lens about the principal point
+    let pp = principal_of(img, &params); // VUGFACEPHOTOCAMERAPREF (SR576): the lens about the principal point; VUGPHOTOCROPMETA (SR582): the file's crop meta, the pref, the centre
     let (gray, g, lat, k1) = if lens { lens_passes(gray, g, lat, pitch, pp)? } else { (gray, g, lat, 0.0) };
     if lat.tilt_deg > max_deg {
         return Err(Refusal::GridUnsquare { deg: lat.tilt_deg });
@@ -568,8 +569,7 @@ pub fn measure_side_raised(first: &Measured, side: &Image, params: PhotoParams, 
     let s = measure(side, params, tol)?;
     let (raw_length_mm, raw_thickness_mm) = extents(&s.shape).ok_or(Refusal::Uncertain)?;
     let (long, short) = extents(&first.shape).ok_or(Refusal::Uncertain)?;
-    let centre = Vec2::new(side.width as f64 * 0.5, side.height as f64 * 0.5);
-    let cam = camera_at(&s, params.principal_px.unwrap_or(centre), params.camera_mm)?; // VUG-PHOTO-PP (SR569)
+    let cam = camera_at(&s, principal_of(side, &params), params.camera_mm)?; // VUG-PHOTO-PP (SR569); VUGPHOTOCROPMETA (SR582): the one order
     let band = fit::BAND_SIGMA * libm::hypot(first.sigma_mm, s.sigma_mm);
     // (miss, length, thickness, paired, standing, k)
     let mut best: Option<(f64, f64, f64, f64, f64, f64)> = None;
@@ -592,4 +592,29 @@ pub fn measure_side_raised(first: &Measured, side: &Image, params: PhotoParams, 
     }
     let parallax = Parallax { camera: cam, standing_mm: standing, k, raw_length_mm, raw_thickness_mm };
     Ok(Side { thickness_mm: thickness, sigma_mm: s.sigma_mm, length_mm: length, paired_mm: paired, side: s, parallax: Some(parallax) })
+}
+
+// ---- VUGPHOTOCROPMETA (SR582): the principal point a cropped photo carries (named tail block) ----
+
+/// The PNG tEXt keyword a cropped photo carries its crop in: `<x>,<y>,<W>,<H>`, the crop's offset in the frame it was cut
+/// from and that frame's size (the principal point is the uncropped centre less the offset, so the frame's size travels
+/// with it; [`fixture::crop_png`] writes it).
+pub const CROP_KEY: &str = "vug:crop";
+
+/// The principal point the photo's own [`CROP_KEY`] pair states (the first one), `(W / 2 - x, H / 2 - y)`, else None
+/// (absent, or not four integers with W and H above 0).
+pub fn crop_principal(img: &Image) -> Option<Vec2> {
+    let (_, v) = img.text.iter().find(|(k, _)| k == CROP_KEY)?;
+    let mut n = v.split(',').map(|t| t.trim().parse::<u32>().ok());
+    let (x, y, w, h) = (n.next()??, n.next()??, n.next()??, n.next()??);
+    if n.next().is_some() || w == 0 || h == 0 {
+        return None;
+    }
+    Some(Vec2::new(w as f64 * 0.5 - x as f64, h as f64 * 0.5 - y as f64))
+}
+
+/// THE order for the principal point: the photo's crop meta ([`crop_principal`]), else `params.principal_px` (the
+/// person's pref), else the photo's centre.
+fn principal_of(img: &Image, params: &PhotoParams) -> Vec2 {
+    crop_principal(img).or(params.principal_px).unwrap_or(Vec2::new(img.width as f64 * 0.5, img.height as f64 * 0.5))
 }

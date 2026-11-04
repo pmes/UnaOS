@@ -33,6 +33,7 @@
 //! frame outside the canvas, or a frame that fails to decode ends the animation at the frames before
 //! it (a broken FIRST frame falls back to the default image).
 
+use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -105,7 +106,7 @@ pub fn decode(bytes: &[u8]) -> Result<Image, Error> {
             frames.push(Frame { delay_ms, rgba: snap });
         }
         if !frames.is_empty() {
-            let mut img = Image::still(p.h.width as u32, p.h.height as u32, frames[0].rgba.clone()).with_icc(p.icc.clone());
+            let mut img = Image::still(p.h.width as u32, p.h.height as u32, frames[0].rgba.clone()).with_icc(p.icc.clone()).with_text(p.text.clone()); // VUGPHOTOCROPMETA (SR582)
             if frames.len() > 1 {
                 img.frames = Some(frames);
                 img.loop_count = st.loop_count();
@@ -125,13 +126,14 @@ pub struct Parsed {
     actl: Option<u32>,
     default_is_frame: bool,
     afr: Vec<ApngFrame>, icc: Option<Vec<u8>>,
+    text: Vec<(String, String)>, // VUGPHOTOCROPMETA (SR582)
 }
 
 impl Parsed {
     /// The IDAT image (a still, or an APNG shown without its animation).
     pub fn still(&self) -> Result<Image, Error> {
         let rgba = decode_pixels(&self.h, &self.palette, &self.trns, &self.idat)?;
-        Ok(Image::still(self.h.width as u32, self.h.height as u32, rgba).with_icc(self.icc.clone()))
+        Ok(Image::still(self.h.width as u32, self.h.height as u32, rgba).with_icc(self.icc.clone()).with_text(self.text.clone())) // VUGPHOTOCROPMETA (SR582): the tEXt pairs
     }
     pub fn width(&self) -> u32 {
         self.h.width as u32
@@ -164,6 +166,7 @@ pub fn parse(bytes: &[u8]) -> Result<Parsed, Error> {
     let mut default_is_frame = false;
     let mut next_seq = 0u32;
     let mut anim_broken = false; let (mut icc, mut cicp) = (None, false);
+    let mut text: Vec<(String, String)> = Vec::new(); // VUGPHOTOCROPMETA (SR582): the tEXt pairs, empty (no allocation) when none
 
     while pos + 12 <= bytes.len() {
         let len = be32(bytes, pos) as usize;
@@ -296,7 +299,9 @@ pub fn parse(bytes: &[u8]) -> Result<Parsed, Error> {
                 seen_iend = true;
                 break;
             }
-            b"iCCP" | b"cICP" => icc_chunk(&mut icc, &mut cicp, kind, data), _ => {
+            b"iCCP" | b"cICP" => icc_chunk(&mut icc, &mut cicp, kind, data),
+            b"tEXt" => text_chunk(&mut text, data), // VUGPHOTOCROPMETA (SR582)
+            _ => {
                 if critical {
                     return Err(Error::Unsupported("unknown critical png chunk"));
                 }
@@ -312,7 +317,7 @@ pub fn parse(bytes: &[u8]) -> Result<Parsed, Error> {
         return Err(Error::Malformed("indexed image without PLTE"));
     }
 
-    Ok(Parsed { h, palette, trns, idat, actl, default_is_frame, afr, icc: if cicp { None } else { icc } })
+    Ok(Parsed { h, palette, trns, idat, actl, default_is_frame, afr, icc: if cicp { None } else { icc }, text })
 }
 
 /// Decode one image's zlib stream (the IDAT, or one APNG frame's fdAT data) at the size `h` states,
@@ -712,3 +717,26 @@ pub fn iccp_profile(data: &[u8]) -> Option<Vec<u8>> {
 /// The inflated iCCP cap: 1 MiB, not [`crate::ICC_MAX`], since `zlib_decompress` reserves its whole cap up front (an
 /// RGB / GRAY display profile is a few KB to a few hundred KB).
 const ICCP_MAX: usize = 1 << 20;
+
+// ---- VUGPHOTOCROPMETA (SR582): the tEXt chunk (named tail block) ----
+
+/// The most tEXt pairs one file surfaces; the rest are dropped (the file is attacker-shaped).
+const TEXT_MAX_PAIRS: usize = 64;
+/// The most tEXt bytes (keywords and values) one file surfaces in all; a chunk past it is dropped.
+const TEXT_MAX: usize = 64 << 10;
+
+/// VUGPHOTOCROPMETA (SR582): a `tEXt` (PNG §11.3.3.2: a keyword of 1..=79 bytes, NUL, the value, both Latin-1) appended
+/// to `text` as (keyword, value) with each byte read as its Latin-1 char; a chunk with no NUL in its first 80 bytes or an
+/// empty keyword is dropped, as any ancillary chunk error, and so is one past [`TEXT_MAX_PAIRS`] / [`TEXT_MAX`].
+fn text_chunk(text: &mut Vec<(String, String)>, data: &[u8]) {
+    let Some(nul) = data.iter().take(80).position(|&b| b == 0) else { return };
+    if nul == 0 || text.len() >= TEXT_MAX_PAIRS {
+        return;
+    }
+    let held: usize = text.iter().map(|(k, v)| k.len() + v.len()).sum();
+    if held + data.len() > TEXT_MAX {
+        return;
+    }
+    let latin1 = |b: &[u8]| b.iter().map(|&c| c as char).collect::<String>();
+    text.push((latin1(&data[..nul]), latin1(&data[nul + 1..])));
+}

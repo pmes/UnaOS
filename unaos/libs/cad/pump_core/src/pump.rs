@@ -14,7 +14,8 @@
 //! - an `ALARM:N`, a controller reset mid-stream or a Marlin resend halts the stream by name; a halted stream never
 //!   resumes sending (the remainder would start from the wrong place);
 //! - STOP is a feed hold, then a soft reset once a status report shows the hold complete (`Hold:0`) or `Idle`: grbl's
-//!   alarm 3 "Abort during cycle" is a reset during motion, which loses the position.
+//!   alarm 3 "Abort during cycle" is a reset during motion, which loses the position; a run halted by an alarm is the
+//!   soft reset at once (the controller reports `Alarm`, never `Idle`, and hears nothing else; VUGCOMSCANALARMRESET SR585).
 
 use alloc::{collections::VecDeque, string::String, vec::Vec};
 
@@ -325,6 +326,7 @@ impl Pump {
         if matches!(self.state, PumpState::Stopped | PumpState::Done) {
             return Ok(());
         }
+        if matches!(self.state, PumpState::Halted(Halt::Alarm { .. })) { return self.reset(t); } // VUGCOMSCANALARMRESET (SR585): an alarm reports `Alarm`, never Idle / Hold:0, and grbl hears only the soft reset
         if matches!(self.state, PumpState::LinkLost { .. } | PumpState::Rearmed { .. }) {
             self.state = PumpState::Stopped;
             return Ok(());
@@ -764,5 +766,26 @@ impl Pump {
     pub fn jog_cancel(&mut self, t: &mut dyn Transport) -> Result<(), PumpRefusal> {
         self.grbl_only("jog cancel")?;
         self.rt(t, Realtime::JogCancel)
+    }
+}
+
+// --- VUGCOMSCANALARMRESET (LEDGER SR585): the welcome banner's key and the unlock line per dialect (named tail hunk) ---
+
+/// The start of the line a controller says when it comes up (after a power-on, a reset-on-open or a soft reset): grbl
+/// `Grbl ` (`Grbl 1.1h ['$' for help]`), Marlin `start`; LinuxCNC is not streamed: `None`.
+pub fn banner_key(d: Dialect) -> Option<&'static str> {
+    match d {
+        Dialect::Grbl { .. } => Some("Grbl "),
+        Dialect::Marlin => Some("start"),
+        Dialect::LinuxCnc => None,
+    }
+}
+
+/// The line that clears a controller's alarm lock after the soft reset: grbl 1.1 `$X` (the kill-alarm-lock, answered
+/// `[MSG:Caution: Unlocked]` and `ok`); Marlin halts by kill() with no ALARM line here and LinuxCNC is not streamed: `None`.
+pub fn unlock_line(d: Dialect) -> Option<&'static str> {
+    match d {
+        Dialect::Grbl { .. } => Some("$X"),
+        Dialect::Marlin | Dialect::LinuxCnc => None,
     }
 }
