@@ -300,7 +300,7 @@ pub fn parse(bytes: &[u8]) -> Result<Parsed, Error> {
                 break;
             }
             b"iCCP" | b"cICP" => icc_chunk(&mut icc, &mut cicp, kind, data),
-            b"tEXt" => text_chunk(&mut text, data), // VUGPHOTOCROPMETA (SR582)
+            b"tEXt" => text_chunk(&mut text, data), b"zTXt" => ztxt_chunk(&mut text, data), b"iTXt" => itxt_chunk(&mut text, data), // VUGPHOTOCROPMETA (SR582); VUGPHOTOCROPMETAITXT (SR614): zTXt / iTXt
             _ => {
                 if critical {
                     return Err(Error::Unsupported("unknown critical png chunk"));
@@ -728,15 +728,86 @@ const TEXT_MAX: usize = 64 << 10;
 /// VUGPHOTOCROPMETA (SR582): a `tEXt` (PNG §11.3.3.2: a keyword of 1..=79 bytes, NUL, the value, both Latin-1) appended
 /// to `text` as (keyword, value) with each byte read as its Latin-1 char; a chunk with no NUL in its first 80 bytes or an
 /// empty keyword is dropped, as any ancillary chunk error, and so is one past [`TEXT_MAX_PAIRS`] / [`TEXT_MAX`].
-fn text_chunk(text: &mut Vec<(String, String)>, data: &[u8]) {
+pub(crate) fn text_chunk(text: &mut Vec<(String, String)>, data: &[u8]) {
     let Some(nul) = data.iter().take(80).position(|&b| b == 0) else { return };
-    if nul == 0 || text.len() >= TEXT_MAX_PAIRS {
+    if nul == 0 {
         return;
     }
-    let held: usize = text.iter().map(|(k, v)| k.len() + v.len()).sum();
-    if held + data.len() > TEXT_MAX {
+    let Some(room) = text_room(text) else { return }; // VUGPHOTOCROPMETAITXT (SR614): the one budget, shared by tEXt / zTXt / iTXt / JPEG COM
+    if data.len() > room {
         return;
     }
     let latin1 = |b: &[u8]| b.iter().map(|&c| c as char).collect::<String>();
     text.push((latin1(&data[..nul]), latin1(&data[nul + 1..])));
+}
+
+// ---- VUGPHOTOCROPMETAITXT (SR614): zTXt / iTXt (named tail block) ----
+
+/// VUGPHOTOCROPMETAITXT (SR614): the bytes `text` may still take under [`TEXT_MAX`] (saturating: a Latin-1 value can
+/// grow past it as UTF-8), or None once it holds [`TEXT_MAX_PAIRS`] pairs. [`text_chunk`] and the zTXt / iTXt readers
+/// share it, so one file surfaces at most one budget whatever chunks carry its text.
+fn text_room(text: &[(String, String)]) -> Option<usize> {
+    if text.len() >= TEXT_MAX_PAIRS {
+        return None;
+    }
+    let held: usize = text.iter().map(|(k, v)| k.len() + v.len()).sum();
+    Some(TEXT_MAX.saturating_sub(held))
+}
+
+/// VUGPHOTOCROPMETAITXT (SR614): a zlib stream inflated through the one inflater ([`crate::zlib_decompress`]) under
+/// `room` bytes, or None. `zlib_decompress`'s sink TRUNCATES silently at its cap (no error), so the cap is `room + 1`
+/// and a stream that fills it is refused: a truncated value never surfaces.
+fn text_inflate(z: &[u8], room: usize) -> Option<Vec<u8>> {
+    let out = crate::zlib_decompress(z, room + 1).ok()?;
+    if out.len() > room { None } else { Some(out) }
+}
+
+/// VUGPHOTOCROPMETAITXT (SR614): a `zTXt` (PNG §11.3.3.3: a keyword of 1..=79 bytes, NUL, compression method 0, a zlib
+/// stream of Latin-1 text) appended to `text` as [`text_chunk`] appends a tEXt; dropped, as any ancillary chunk error,
+/// on a missing NUL, an empty keyword, a method other than 0, a broken stream or one past the budget.
+fn ztxt_chunk(text: &mut Vec<(String, String)>, data: &[u8]) {
+    let Some(nul) = data.iter().take(80).position(|&b| b == 0) else { return };
+    if nul == 0 || data.get(nul + 1) != Some(&0) {
+        return;
+    }
+    let Some(room) = text_room(text) else { return };
+    let Some(v) = text_inflate(&data[nul + 2..], room.saturating_sub(nul)) else { return };
+    let latin1 = |b: &[u8]| b.iter().map(|&c| c as char).collect::<String>();
+    text.push((latin1(&data[..nul]), latin1(&v)));
+}
+
+/// VUGPHOTOCROPMETAITXT (SR614): an `iTXt` (PNG §11.3.3.4: a keyword of 1..=79 bytes, NUL, the compression flag 0|1, the
+/// compression method 0, a language tag, NUL, a translated keyword, NUL, the UTF-8 text, zlib-compressed when the flag
+/// is 1 through the same [`text_inflate`]) appended to `text` as (keyword read as Latin-1, the text); the language tag
+/// and the translated keyword are not surfaced. Dropped on any malformed field, a text that is not UTF-8, or one past
+/// the budget.
+fn itxt_chunk(text: &mut Vec<(String, String)>, data: &[u8]) {
+    let Some(nul) = data.iter().take(80).position(|&b| b == 0) else { return };
+    if nul == 0 || data.len() < nul + 3 {
+        return;
+    }
+    let (flag, method) = (data[nul + 1], data[nul + 2]);
+    if flag > 1 || method != 0 {
+        return;
+    }
+    let rest = &data[nul + 3..];
+    let Some(lang) = rest.iter().position(|&b| b == 0) else { return };
+    let rest = &rest[lang + 1..];
+    let Some(tkey) = rest.iter().position(|&b| b == 0) else { return };
+    let body = &rest[tkey + 1..];
+    let Some(room) = text_room(text) else { return };
+    let room = room.saturating_sub(nul);
+    let raw = if flag == 1 {
+        match text_inflate(body, room) {
+            Some(v) => v,
+            None => return,
+        }
+    } else {
+        if body.len() > room {
+            return;
+        }
+        body.to_vec()
+    };
+    let Ok(v) = String::from_utf8(raw) else { return };
+    text.push((data[..nul].iter().map(|&c| c as char).collect::<String>(), v));
 }
