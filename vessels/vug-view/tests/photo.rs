@@ -45,7 +45,7 @@ fn circles(sk: &Sketch) -> Vec<EntityId> {
 }
 
 fn proposal(stmt: String) -> Proposal {
-    Proposal { stmt, confidence: 0.9, why: "a round size".into() }
+    Proposal { stmt, confidence: 0.9, why: "a round size".into(), shapes: Vec::new() }
 }
 
 fn key(vw: &mut Viewer, k: &str) -> bool {
@@ -519,7 +519,7 @@ fn a_wrong_side_photo_refuses_the_extrude_by_its_thickness() {
 #[test]
 fn a_set_enters_whole_and_undoes_in_one_step() {
     let mut vw = rectangle();
-    let set = |stmt: &str| Proposal { stmt: stmt.into(), confidence: 0.9, why: "a datum point".into() };
+    let set = |stmt: &str| Proposal { stmt: stmt.into(), confidence: 0.9, why: "a datum point".into(), shapes: Vec::new() };
     let before = photo::doc_of(face(&vw));
     let ents = face(&vw).sketch.entities().len();
     assert!(photo::offer(&mut vw.view, vec![set("point v3 sketch=s x=10 y=0"), set("distance v4 sketch=s a=e0 b=v3 d=10")]));
@@ -585,7 +585,7 @@ fn a_raised_side_photo_reads_its_thickness_and_names_the_camera() {
 // ---- VUGINTENTSETFACE (SR570): a statement set is ONE card; re-verified in the journal's names after a panel delete ----
 
 fn datum(stmt: &str, why: &str) -> Proposal {
-    Proposal { stmt: stmt.into(), confidence: 0.9, why: why.into() }
+    Proposal { stmt: stmt.into(), confidence: 0.9, why: why.into(), shapes: Vec::new() }
 }
 
 /// The panel's delete of the row `id` (its dependants with it), the regenerated face and body swapped in (journal::key's road).

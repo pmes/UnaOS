@@ -665,7 +665,7 @@ fn refocus(ph: &mut Photo) {
 
 /// Vein's proposal as doc_core's.
 fn from_bus(q: &IntentProposal) -> Proposal {
-    Proposal { stmt: q.stmt.clone(), confidence: q.confidence, why: q.why.clone() }
+    Proposal { stmt: q.stmt.clone(), confidence: q.confidence, why: q.why.clone(), shapes: Vec::new() }
 }
 
 /// A streamed proposal for the live `request` at `index`: a preview at the same index is replaced and verified again,
@@ -811,7 +811,7 @@ fn side_proposal(view: &View, bytes: &[u8], name: &str, camera_mm: Option<f64>) 
     let band = photo_core::fit::BAND_SIGMA * first.sigma_mm.hypot(s.sigma_mm);
     let confidence = if band > 0.0 { (1.0 - (s.length_mm - s.paired_mm).abs() / band).clamp(0.0, 1.0) } else { 0.0 };
     let why = format!("side photo {name}: thickness {} sigma {} {}", num(s.thickness_mm), num(s.sigma_mm), camera_text(&s, camera_mm.is_some()));
-    Ok((Proposal { stmt, confidence, why }, s))
+    Ok((Proposal { stmt, confidence, why, shapes: Vec::new() }, s))
 }
 
 /// The statement a proposal appends, when it is an extrude of the photo's sketch: (outer, dir, length).
