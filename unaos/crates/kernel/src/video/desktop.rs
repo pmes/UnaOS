@@ -124,7 +124,7 @@ pub const CRAFT: Craft = Craft {
         // elev.1 raised (knobs, the segmented thumb): Light 0 1 2 @ 14 % + 0 0 1 @ 10 %; Dark 0 1 2 @ 40 %
         [[ly(1, 2, 36), ly(0, 1, 26)], [ly(1, 2, 102), NO_LAYER]],
         // elev.2 overlay (menus, popovers, toasts): 0 0 2 @ 12 % + 0 8 24 @ 18 %; Dark @ 30 % / 45 % (+ rim.dark)
-        [[ly(0, 2, 31), ly(8, 24, 46)], [ly(0, 2, 77), ly(8, 24, 115)]],
+        [[ly(0, 2, theme::ELEV2.0.0), ly(8, 24, theme::ELEV2.0.1)], [ly(0, 2, theme::ELEV2.1.0), ly(8, 24, theme::ELEV2.1.1)]], // ELEV-ONE (B1116): `theme::ELEV2`, held once
         // elev.3 window, focused: 0 0 2 @ 12 % + 0 16 40 @ 26 %; Dark @ 40 % / 55 % (+ the edge, `edge_ink`, both)
         [[ly(0, 2, 31), ly(16, 40, 66)], [ly(0, 2, 102), ly(16, 40, 140)]],
         // elev.3i window, unfocused: 0 0 2 @ 8 % + 0 8 20 @ 14 %; Dark @ 30 % / 35 %
@@ -3734,4 +3734,135 @@ fn shim_pref_leg(ms: u64) -> u32 {
         ticks, idle_ticks, restored as u8, if ticks == 0 && restored { "PASS" } else { "FAIL" }
     );
     ticks
+}
+
+// ── VEIL-LOGIN (rmbp-ledger B1116, BP-video-11) — the login and lock backdrop's kept field ─────────────────────────────
+// DESIGN-LANGUAGE §3.9 / §2.4 `elev.4`: behind the login card and the lock card the backdrop is the VEIL darkened 20 %
+// with the scrim (`crystal::veil::Look::login`, 113 light / 153 dark), not the sharp picture. A full-panel VEIL per frame
+// is 14 ns/px (VEILCOST's miss row on flight 39), so the whole panel is composed ONCE per wallpaper install
+// (`wallpaper::install` -> [`login_prefill`], off the frame path) into one `VeilCache` keyed by `veil_key` (the picture,
+// the install generation, the theme epoch: a Light/Dark change moves the scrim and re-keys it), and every frame copies
+// the kept row. `wallpaper::row` / `wallpaper::paint` select it while `boot::screen_is_up()`. x86 only: aarch64's
+// 48 MiB heap keeps no panel field and paints the same rows live (owed VEIL-LOGIN-PI).
+
+/// The login backdrop's field (try-locked by painters; the builder holds it one row at a time).
+#[cfg(target_arch = "x86_64")]
+static LOGIN_VEIL: crate::sync::Mutex<VeilCache> = crate::sync::Mutex::new(VeilCache::new());
+
+#[cfg(target_arch = "x86_64")]
+impl VeilCache {
+    /// Row `j` of the field keyed `key`: the kept row, composed by `paint` straight into its slot on a miss (no copy
+    /// out; `row`'s key check and `reset`). `None` when the field cannot be held: the caller paints uncached.
+    fn fill(&mut self, key: VeilKey, w: usize, h: usize, j: usize, paint: impl FnOnce(&mut [u32])) -> Option<&[u32]> {
+        if j >= h || ((self.key != Some(key) || self.w != w || self.h != h) && !self.reset(key, w, h)) {
+            return None;
+        }
+        let o = j * w;
+        if !self.have[j] {
+            paint(&mut self.rows[o..o + w]);
+            self.have[j] = true;
+        }
+        Some(&self.rows[o..o + w])
+    }
+}
+
+/// Columns `x..x + w` of the login backdrop's row `y` through `put(i, px)` (`i` counts from 0). x86: the kept row (a
+/// copy; a miss composes the row into the field first); a contended field paints the row live in 64-px chunks: the
+/// same painter, the same pixels, never the sharp picture and never a wait. Columns past the picture are left alone
+/// (the flat colour already there, as `wallpaper::row` does). `true` when the row came from the field.
+pub fn login_put(back: &Back, y: usize, x: usize, w: usize, mut put: impl FnMut(usize, u32)) -> bool {
+    if y >= back.h || x >= back.w {
+        return false;
+    }
+    let w = w.min(back.w - x);
+    let look = crate::video::crystal::veil::Look::login();
+    #[cfg(target_arch = "x86_64")]
+    {
+        if let Some(mut c) = LOGIN_VEIL.try_lock() {
+            let (pw, ph) = (back.w, back.h);
+            let k = veil_key(Some(back), (0, 0, pw, ph), 0);
+            if let Some(r) = c.fill(k, pw, ph, y, |o| crate::video::crystal::veil::row(o, 0, y, Some(back), look)) {
+                for (i, &p) in r[x..x + w].iter().enumerate() {
+                    put(i, p);
+                }
+                return true;
+            }
+        }
+    }
+    let mut t = [0u32; 64];
+    let mut i = 0;
+    while i < w {
+        let n = (w - i).min(t.len());
+        crate::video::crystal::veil::row(&mut t[..n], x + i, y, Some(back), look);
+        for (k, &p) in t[..n].iter().enumerate() {
+            put(i + k, p);
+        }
+        i += n;
+    }
+    false
+}
+
+/// Compose the whole login field once (the wallpaper install, off the frame path): every row through
+/// [`VeilCache::fill`] with the lock held one row at a time, so painters interleave; then one timed read of every kept
+/// row into a scratch row (the frame's blit floor). `(build_us, blit_us, bytes)`; `(0, 0, 0)` when the field refused
+/// its memory (painters then paint live).
+#[cfg(target_arch = "x86_64")]
+pub fn login_prefill(back: &Back) -> (u64, u64, usize) {
+    let look = crate::video::crystal::veil::Look::login();
+    let (pw, ph) = (back.w, back.h);
+    if pw == 0 || ph == 0 {
+        return (0, 0, 0);
+    }
+    let k = veil_key(Some(back), (0, 0, pw, ph), 0);
+    let t0 = crate::arch::now_cycles();
+    for y in 0..ph {
+        let mut c = LOGIN_VEIL.lock();
+        if c.fill(k, pw, ph, y, |o| crate::video::crystal::veil::row(o, 0, y, Some(back), look)).is_none() {
+            return (0, 0, 0);
+        }
+    }
+    let t1 = crate::arch::now_cycles();
+    let mut scratch: alloc::vec::Vec<u32> = alloc::vec::Vec::new();
+    let mut blit = 0u64;
+    if scratch.try_reserve_exact(pw).is_ok() {
+        scratch.resize(pw, 0);
+        let t2 = crate::arch::now_cycles();
+        for y in 0..ph {
+            let c = LOGIN_VEIL.lock();
+            if c.key == Some(k) && c.w == pw && c.h == ph {
+                scratch.copy_from_slice(&c.rows[y * pw..(y + 1) * pw]);
+            }
+            drop(c);
+            core::hint::black_box(&mut scratch);
+        }
+        blit = crate::video::blitter::cycles_to_us(crate::arch::now_cycles().saturating_sub(t2));
+    }
+    let bytes = LOGIN_VEIL.lock().bytes();
+    (crate::video::blitter::cycles_to_us(t1.saturating_sub(t0)), blit, bytes)
+}
+#[cfg(not(target_arch = "x86_64"))]
+pub fn login_prefill(_back: &Back) -> (u64, u64, usize) {
+    (0, 0, 0)
+}
+
+/// Free the login field (the picture went: `wallpaper off`).
+#[cfg(target_arch = "x86_64")]
+pub fn login_veil_drop() {
+    let old = {
+        let mut g = LOGIN_VEIL.lock();
+        core::mem::replace(&mut *g, VeilCache::new())
+    };
+    drop(old);
+}
+#[cfg(not(target_arch = "x86_64"))]
+pub fn login_veil_drop() {}
+
+/// The bytes the login field holds (0 while contended, and on aarch64).
+#[cfg(target_arch = "x86_64")]
+pub fn login_veil_bytes() -> usize {
+    LOGIN_VEIL.try_lock().map_or(0, |c| c.bytes())
+}
+#[cfg(not(target_arch = "x86_64"))]
+pub fn login_veil_bytes() -> usize {
+    0
 }
