@@ -35,12 +35,13 @@
 //! its verdict, a differing one is verified again, an extra preview is withdrawn); `Refused` withdraws every preview and
 //! names why with the count that arrived; a new ask withdraws the stale request's previews.
 
+use crate::extrude::Pull; // VUGFACEPHOTOSIDE (SR547): the committed pull the journal records
 use crate::model::Model;
 use crate::raster::{self, Frame as Raster, rgba};
 use crate::sketch::{ACTIVE, INK, REFUSED, SketchFace, world_planes};
 use crate::view::View;
 use bandy::{IntentEvent, IntentImage, IntentProposal, Origin};
-use doc_core::{Doc, Measurement, Proposal, Stmt, Verdict};
+use doc_core::{Doc, Measurement, PlainNames, Proposal, SketchNames, Stmt, Verdict}; // VUGFACEPHOTOSIDE (SR547): PlainNames, SketchNames
 use sketch_core::{Constraint, ConstraintId, Entity, EntityId, PointRef, Tol, Vec2};
 use std::fmt;
 
@@ -116,6 +117,9 @@ pub struct Photo {
     pub asked: Option<u64>,
     /// VUGFACEINTENTSEND (SR514): answers to any other id (stale, unknown, already answered), ignored and counted.
     pub ignored: u32,
+    /// VUGFACEPHOTOSIDE (SR547): the flat photo's measurement `photo_core::measure_side` pairs a side photo against;
+    /// None on a hand-built face.
+    pub first: Option<photo_core::Measured>,
 }
 
 impl fmt::Debug for Photo {
@@ -180,7 +184,8 @@ pub fn open(bytes: &[u8], pitch_mm: f64) -> Result<(Model, SketchFace, Photo), S
     let params = photo_core::PhotoParams::new(pitch_mm);
     let m = photo_core::measure(&image, params, Tol::DEFAULT).map_err(|e| format!("photo {e:?}"))?;
     let model = paper(&m.outline, pitch_mm)?;
-    let photo = Photo { image, h: m.h, outline: m.outline, loops: m.loops, sigma_mm: m.sigma_mm, band_mm: params.band.lin.max(m.sigma_mm), offers: Vec::new(), focus: None, note: None, outbox: Vec::new(), request: 0, asked: None, ignored: 0 };
+    let first = Some(m.clone()); // VUGFACEPHOTOSIDE (SR547): held for the side photo
+    let photo = Photo { image, h: m.h, outline: m.outline, loops: m.loops, sigma_mm: m.sigma_mm, band_mm: params.band.lin.max(m.sigma_mm), offers: Vec::new(), focus: None, note: None, outbox: Vec::new(), request: 0, asked: None, ignored: 0, first };
     let face = SketchFace::over(world_planes()[0].1, m.sketch);
     Ok((model, face, photo))
 }
@@ -413,6 +418,7 @@ fn accept(view: &mut View, i: usize) -> bool {
         ph.note = Some(format!("refused {}", why.text()));
         return true;
     }
+    if let Some(x) = extruded(&doc, &p) { return enter_extrude(view, i, x); } // VUGFACEPHOTOSIDE (SR547): an extrude enters by the journal's pull road
     let applied = match enter(face, &doc, &p) {
         Ok(()) => {
             ph.offers[i].state = State::Applied;
@@ -686,4 +692,137 @@ fn withdraw(ph: &mut Photo) -> usize {
 fn refused_note(why: &str, k: usize) -> String {
     let tail = format!(" after {k} proposals");
     if k == 0 || why.ends_with(&tail) { format!("Vein refused: {why}") } else { format!("Vein refused: {why}{tail}") }
+}
+
+// ---- VUGFACEPHOTOSIDE (SR547): the second photo's thickness (named tail block) ----
+
+/// `photo side <path>` (main.rs `--side`): [`side`] over the file's bytes, named by its file name; a read error is
+/// refused by name the same way.
+pub fn side_path(view: &mut View, path: &str) -> Result<(), String> {
+    let name = std::path::Path::new(path).file_name().and_then(|s| s.to_str()).unwrap_or(path).to_string();
+    match std::fs::read(path) {
+        Ok(bytes) => side(view, &bytes, &name),
+        Err(e) => side_refused(view, format!("{path}: {e}")),
+    }
+}
+
+/// A photo of the part on its side: `photo_core::measure_side` against the held flat measurement ([`Photo::first`]),
+/// and its thickness as ONE proposal through [`offer`] (the one verify road): the extrude of the face's sketch (the
+/// largest profile, along the plane's normal) by `thickness_mm`, written by doc_core's writer; why names the side
+/// photo and its sigma, the confidence is the pairing margin inside measure_side's band. The corner reads
+/// `side <name>: thickness=<mm> sigma=<mm> paired=<mm>`. Refused by name (`NoFirstPhoto`, `image ..`, measure_side's
+/// refusal) in the corner and in the `Err`; nothing is offered then.
+pub fn side(view: &mut View, bytes: &[u8], name: &str) -> Result<(), String> {
+    let (p, s) = match side_proposal(view, bytes, name) {
+        Ok(v) => v,
+        Err(e) => return side_refused(view, e),
+    };
+    offer(view, vec![p]);
+    if let Some(ph) = view.photo.as_mut() {
+        ph.note = Some(format!("side {name}: thickness={} sigma={} paired={}", num(s.thickness_mm), num(s.sigma_mm), num(s.paired_mm)));
+    }
+    Ok(())
+}
+
+/// A side refusal: `refused side <why>` in the corner (when a photo is open) and returned.
+fn side_refused(view: &mut View, e: String) -> Result<(), String> {
+    let text = format!("refused side {e}");
+    if let Some(ph) = view.photo.as_mut() {
+        ph.note = Some(text.clone());
+    }
+    Err(text)
+}
+
+/// The side photo measured and its extrude proposal built (nothing offered yet).
+fn side_proposal(view: &View, bytes: &[u8], name: &str) -> Result<(Proposal, photo_core::Side), String> {
+    let (Some(face), Some(first)) = (view.design.face.as_ref(), view.photo.as_ref().and_then(|ph| ph.first.as_ref())) else {
+        return Err("NoFirstPhoto".to_string());
+    };
+    let image = pixel_core::decode(bytes).map_err(|e| format!("image {e:?}"))?;
+    let s = photo_core::measure_side(first, &image, photo_core::PhotoParams::new(first.pitch_mm), Tol::DEFAULT).map_err(|e| match e {
+        photo_core::Refusal::NoSideMatch { length_mm, nearest_mm, band_mm } => {
+            format!("NoSideMatch length={} nearest={} band={}", num(length_mm), num(nearest_mm), num(band_mm))
+        }
+        e => e.name().to_string(),
+    })?;
+    let outer = face
+        .profiles
+        .iter()
+        .max_by(|a, b| a.outer.area.abs().total_cmp(&b.outer.area.abs()))
+        .and_then(|p| p.outer.edges.first())
+        .map(|e| PlainNames.entity(e.src()))
+        .ok_or("NoProfile")?;
+    let mut doc = doc_of(face);
+    let id = (0u32..).map(|n| format!("x{n}")).find(|id| !doc.stmts.iter().any(|st| st.id() == Some(id.as_str()))).unwrap_or_default();
+    let z = face.plane.z;
+    doc.stmts.push(Stmt::Extrude { id, sketch: SKETCH_ID.to_string(), outer, dir: [z.x, z.y, z.z], length: s.thickness_mm });
+    let stmt = doc_core::write(&doc).lines().last().unwrap_or("").to_string();
+    let band = photo_core::fit::BAND_SIGMA * first.sigma_mm.hypot(s.sigma_mm);
+    let confidence = if band > 0.0 { (1.0 - (s.length_mm - s.paired_mm).abs() / band).clamp(0.0, 1.0) } else { 0.0 };
+    let why = format!("side photo {name}: thickness {} sigma {}", num(s.thickness_mm), num(s.sigma_mm));
+    Ok((Proposal { stmt, confidence, why }, s))
+}
+
+/// The statement a proposal appends, when it is an extrude of the photo's sketch: (outer, dir, length).
+fn extruded(doc: &Doc, p: &Proposal) -> Option<(String, [f64; 3], f64)> {
+    let cand = doc_core::apply(doc, p).ok()?;
+    if cand.stmts.len() != doc.stmts.len() + 1 {
+        return None;
+    }
+    match cand.stmts.last()? {
+        Stmt::Extrude { sketch, outer, dir, length, .. } if sketch == SKETCH_ID => Some((outer.clone(), *dir, *length)),
+        _ => None,
+    }
+}
+
+/// Enter on an accepted extrude (offer `i`): [`extrude_road`]; Ok -> the journal, the face (closed: None) and the body
+/// it regenerated, the offer Applied; Err -> nothing changes and the corner names it.
+fn enter_extrude(view: &mut View, i: usize, x: (String, [f64; 3], f64)) -> bool {
+    let r = extrude_road(&view.design, x);
+    let Some(ph) = view.photo.as_mut() else { return false };
+    match r {
+        Ok((journal, regen)) => {
+            let stmt = ph.offers[i].proposal.stmt.trim().to_string();
+            ph.offers[i].state = State::Applied;
+            ph.note = Some(format!("applied {stmt}"));
+            ph.focus = ph.offers.iter().position(|o| o.state == State::Open);
+            view.design.journal = journal;
+            view.design.face = regen.face;
+            view.design.body = regen.body;
+            view.design.pull = None;
+            view.design.refusal = None;
+        }
+        Err(e) => ph.note = Some(format!("refused by the sketch {e}")),
+    }
+    true
+}
+
+/// The pull's own journal road: the profile `outer` names (PlainNames, the names the proposal was verified in) as a
+/// committed `Pull` along `dir` (the sketch normal, within `Tol::DEFAULT.ang`) by `length`, recorded on a COPY of the
+/// journal (`Journal::record`, which reads the pull's profile, plane and distance), then `journal::regenerate` (the
+/// history edit's road): the state `commit_pull` leaves, or a named refusal with the journal untouched.
+fn extrude_road(d: &crate::sketch::Design, x: (String, [f64; 3], f64)) -> Result<(crate::journal::Journal, crate::journal::Regen), String> {
+    let (outer, dir, length) = x;
+    let face = d.face.as_ref().ok_or("no open sketch")?;
+    let z = face.plane.z;
+    let dn = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]).sqrt();
+    let cross = [dir[1] * z.z - dir[2] * z.y, dir[2] * z.x - dir[0] * z.z, dir[0] * z.y - dir[1] * z.x];
+    let sin = (cross[0] * cross[0] + cross[1] * cross[1] + cross[2] * cross[2]).sqrt() / dn;
+    if !(dn > 0.0 && sin <= Tol::DEFAULT.ang) {
+        return Err(format!("dir {},{},{} is not the sketch normal", num(dir[0]), num(dir[1]), num(dir[2])));
+    }
+    let along = dir[0] * z.x + dir[1] * z.y + dir[2] * z.z;
+    let profile = face
+        .profiles
+        .iter()
+        .find(|p| p.outer.edges.first().map(|e| PlainNames.entity(e.src())).as_deref() == Some(outer.as_str()))
+        .cloned()
+        .ok_or_else(|| format!("outer {outer} names no profile"))?;
+    let o = face.plane.o;
+    let distance = if along < 0.0 { -length } else { length };
+    let pull = Pull { profile, plane: face.plane, centroid: [o.x, o.y, o.z], distance, start: (0.0, 0.0), preview: None };
+    let mut j = d.journal.clone();
+    j.record(Some(face), Some(&pull));
+    let r = crate::journal::regenerate(&j.doc)?;
+    Ok((j, r))
 }
