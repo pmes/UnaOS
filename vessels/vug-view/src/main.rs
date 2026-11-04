@@ -18,6 +18,7 @@
 //! vug-view scan.ply --against part.vugdoc --datum A=<f> B=<f> C=<f> --gdt "<post>=position:1" --out map.png  # a datum frame (SR560)
 //! vug-view part.vug --scan scan.ply --out map.png                                  # the part as the journal, a scan measured against it (SR565)
 //! vug-view scan.ply --against part.vugdoc --gdt "<face>=flatness:0.5" --report     # the verdicts to part.vugreport beside the design (SR575)
+//! vug-view flat.png --camera 400 --side square.png --out part.png                # the camera height to Principia's store, then the side (SR588; `--camera clear` / `--pp clear` unset)
 //! ```
 //! Key script: one character per shortcut; `{Name}` for a named key.
 
@@ -37,13 +38,14 @@ struct Cli {
     datum: Option<String>, // VUGFACEGDTREMEASURE (SR560): `--datum A=<f> B=<f> C=<f>`, the three args as one `datum` command
     scan: Option<String>, // VUGFACEDEVIATIONSOLIDFAULT (SR565): `--scan <mesh>` after a .vug part: the scan measured against the part's journal
     report: bool, // VUGFACEGDTREPORTKEY (SR575): `--report`, the map's `report` command after the open
+    pref: Vec<String>, // VUGPHOTOPREFFACEWIRE (SR588): each `--camera` / `--pp` as one photo::command line, in order
 }
 
-const USAGE: &str = "usage: vug-view <file.stl|obj|ply|png|jpg> [--preset una|solidworks|fusion|blender|onshape] [--size WxH] [--keys SCRIPT] [--out shot.png] [--against design.vugdoc] [--side side.png] [--gdt face=kind:tol]... [--datum A=face B=face C=face] [--scan scan.ply (after a .vug part)] [--report]";
+const USAGE: &str = "usage: vug-view <file.stl|obj|ply|png|jpg> [--preset una|solidworks|fusion|blender|onshape] [--size WxH] [--keys SCRIPT] [--out shot.png] [--against design.vugdoc] [--side side.png] [--gdt face=kind:tol]... [--datum A=face B=face C=face] [--scan scan.ply (after a .vug part)] [--report] [--camera mm|clear] [--pp x y|clear]";
 
 fn cli() -> Cli {
     let mut a = std::env::args().skip(1);
-    let mut c = Cli { path: String::new(), size: (800, 600), preset: Preset::Una, keys: None, out: None, against: None, side: None, gdt: Vec::new(), datum: None, scan: None, report: false };
+    let mut c = Cli { path: String::new(), size: (800, 600), preset: Preset::Una, keys: None, out: None, against: None, side: None, gdt: Vec::new(), datum: None, scan: None, report: false, pref: Vec::new() }; // VUGPHOTOPREFFACEWIRE (SR588): pref
     while let Some(arg) = a.next() {
         match arg.as_str() {
             "--size" => {
@@ -65,6 +67,8 @@ fn cli() -> Cli {
             "--gdt" => c.gdt.extend(a.next()), // VUGFACEGDT (SR553): repeatable
             "--scan" => c.scan = a.next(), // VUGFACEDEVIATIONSOLIDFAULT (SR565)
             "--report" => c.report = true, // VUGFACEGDTREPORTKEY (SR575)
+            "--camera" => c.pref.push(format!("camera {}", a.next().unwrap_or_default())), // VUGPHOTOPREFFACEWIRE (SR588): the grammar is photo::command's
+            "--pp" => c.pref.push(match a.next().unwrap_or_default() { v if v == "clear" => "pp clear".to_string(), x => format!("pp {x} {}", a.next().unwrap_or_default()) }), // VUGPHOTOPREFFACEWIRE (SR588): `x y` or `clear`
             "--datum" => c.datum = Some(a.by_ref().take(3).collect::<Vec<_>>().join(" ")), // VUGFACEGDTREMEASURE (SR560): the grammar is deviation::command's
             "--help" | "-h" => {
                 eprintln!("{USAGE}");
@@ -109,6 +113,13 @@ fn main() {
             std::process::exit(1);
         }
     };
+    // VUGPHOTOPREFFACEWIRE (SR588): each `--camera` / `--pp` line runs photo::command (Principia's store, the open photo's prefs) BEFORE `--side`, a refusal exits 1.
+    for l in &cli.pref {
+        if let Err(e) = vug_view::photo::command(&mut viewer.view, l) {
+            eprintln!("vug-view: {e}");
+            std::process::exit(1);
+        }
+    }
     // VUGFACEPHOTOSIDE (SR547): `--side <path>` measures the side photo against the opened one; a refusal is named.
     if let Some(p) = &cli.side {
         if let Err(e) = vug_view::photo::side_path(&mut viewer.view, p) {
