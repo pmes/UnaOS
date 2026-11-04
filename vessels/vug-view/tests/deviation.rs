@@ -1981,3 +1981,378 @@ fn a_scan_without_a_camera_is_refused_the_view_road() {
 
     assert_eq!(vug_view::deviation::scan_mesh(s.mesh.clone()).camera, None, "a mesh file carries no camera");
 }
+
+// ---- VUGSCANCOARSESYMTHREE (LEDGER SR657): a near-cube's 24 basins scored ----
+// A 200 x 210 x 220 box (z up) with ONE pin r15 h40 on its top at (55, 60) (off both centre lines: no box symmetry keeps
+// it): the design's three moments are near-equal (both adjacent ratios above scan_core's COARSE_SYM_RATIO 0.83), so
+// `pivot` is None and the road is SR615's four. The test scores the cube group's 24 basins (each a turn of the truth
+// about the box centre) at the start and after SR615's wide refine under three scores: (1) the trimmed rms at keep 0.3
+// (the start rank at gate(0), SR615's select at gate(2)), (2) the coverage of the design's surface points by the scan
+// within BAND_MM, (3) that coverage over the design's non-symmetric points (found from the design's own moment frame,
+// and with the box's frame as a hint for comparison); then the road's own candidates (`coarse_view` about each design
+// axis) through the refine and each select. Every score goes through scan_core's public `align` / `deviations`.
+// MEASURED (SR657, the refusal): every score ranks the true basin first at the basin and refined (trimmed 0.0543 against
+// 0.0599 mm, coverage 0.8378 against 0.8213), the mark region is not found without the hint (the moment frame 8-13° off
+// the box's), and the road's twelve kept starts hold the truth's three 180° twins but not the truth: the KEEP is owed
+// (VUG-SCAN-DEVIATION-COARSE-SYM-THREE-KEEP), not a start score.
+
+/// The near-cube and its pin, built to the scene's dimensions (the pin's sketch on the box's top).
+const CUBE_DOC: &str = r#"vug-doc version=1 lin=1e-6 ang=1e-9
+sketch s1 o=[0 0 0] z=[0 0 1] x=[1 0 0]
+point p1 sketch=s1 x=-100 y=-105
+point p2 sketch=s1 x=100 y=-105
+point p3 sketch=s1 x=100 y=105
+point p4 sketch=s1 x=-100 y=105
+line l1 sketch=s1 a=p1 b=p2
+line l2 sketch=s1 a=p2 b=p3
+line l3 sketch=s1 a=p3 b=p4
+line l4 sketch=s1 a=p4 b=p1
+fix f1 sketch=s1 p=p1 at=[-100 -105]
+fix f2 sketch=s1 p=p2 at=[100 -105]
+fix f3 sketch=s1 p=p3 at=[100 105]
+fix f4 sketch=s1 p=p4 at=[-100 105]
+sketch s2 o=[0 0 220] z=[0 0 1] x=[1 0 0]
+point c0 sketch=s2 x=55 y=60
+circle c1 sketch=s2 centre=c0 r=15
+fix g1 sketch=s2 p=c0 at=[55 60]
+radius r1 sketch=s2 circle=c1 r=15
+extrude body sketch=s1 outer=l1 dir=[0 0 1] length=220
+extrude pin sketch=s2 outer=c1 dir=[0 0 1] length=40
+"#;
+
+/// The near-cube's orbit scan (12 frames at 600 mm, 40° up, D435i noise), fused once in the design's world.
+fn cube_scan() -> &'static ScanMesh {
+    static S: OnceLock<ScanMesh> = OnceLock::new();
+    S.get_or_init(|| {
+        let scene = Scene {
+            ground_centre: Vec3::ZERO,
+            ground: [240.0, 200.0],
+            boxes: vec![fixture::BoxPrim { min: Vec3::new(-100.0, -105.0, 0.0), max: Vec3::new(100.0, 105.0, 220.0) }],
+            cylinders: vec![fixture::CylPrim { base: Vec3::new(55.0, 60.0, 220.0), radius: 15.0, height: 40.0 }],
+        };
+        let (intr, scale) = (fixture::bench_intrinsics(), DepthScale::D400_DEFAULT);
+        let mut t = Tsdf::new(4.0, 12.0, Tol::DEFAULT).expect("volume");
+        for k in 0..12u32 {
+            let p = fixture::orbit(Vec3::new(0.0, 0.0, 110.0), 600.0, 40.0 * DEG, k as f64 * 2.0 * PI / 12.0);
+            let f = fixture::render_depth(&scene, &intr, scale, &p, &Noise::D435I, k as u64);
+            t.integrate(&f, scale, &intr, &p).expect("frame integrates");
+        }
+        extract(&t).expect("surface")
+    })
+}
+
+/// The cube group: the 24 signed permutations of determinant +1 (the axis map k → s[k]·axis p[k]), the identity first.
+fn cube_group() -> Vec<([usize; 3], [f64; 3])> {
+    let perms: [([usize; 3], f64); 6] = [([0, 1, 2], 1.0), ([1, 2, 0], 1.0), ([2, 0, 1], 1.0), ([0, 2, 1], -1.0), ([2, 1, 0], -1.0), ([1, 0, 2], -1.0)];
+    let signs: [[f64; 3]; 8] = [
+        [1.0, 1.0, 1.0],
+        [1.0, -1.0, -1.0],
+        [-1.0, 1.0, -1.0],
+        [-1.0, -1.0, 1.0],
+        [-1.0, -1.0, -1.0],
+        [-1.0, 1.0, 1.0],
+        [1.0, -1.0, 1.0],
+        [1.0, 1.0, -1.0],
+    ];
+    let mut out = Vec::new();
+    for (p, parity) in perms {
+        for s in signs {
+            if parity * s[0] * s[1] * s[2] > 0.0 {
+                out.push((p, s));
+            }
+        }
+    }
+    out
+}
+
+/// The turn of the frame (`u` right-handed, at `c`) by the group element `g`: c + Σ x_k u_k → c + Σ x_k s_k u_{p[k]}.
+fn turn(u: [Vec3; 3], c: Vec3, g: ([usize; 3], [f64; 3])) -> Transform {
+    let (p, s) = g;
+    let f = fixture::from_axes(u[0], u[1], u[2], c);
+    let to = fixture::from_axes(u[p[0]] * s[0], u[p[1]] * s[1], u[p[2]] * s[2], c);
+    to.compose(f.invert().expect("a rigid frame"))
+}
+
+/// An area-stratified lattice over `mesh`'s triangles (m² cell centroids a triangle, m = ceil(√area / spacing)), each
+/// point with its triangle's normal, as a ScanMesh with no triangles; and each point's area weight.
+fn surface_points(mesh: &mesh_core::Mesh, spacing: f64, like: &ScanMesh) -> (ScanMesh, Vec<f64>) {
+    let normals = mesh.normals_face(Tol::DEFAULT);
+    let (mut pos, mut nrm, mut w) = (Vec::new(), Vec::new(), Vec::new());
+    for t in 0..mesh.triangles.len() {
+        let Some([a, b, c]) = mesh.corners(t) else { continue };
+        let n = normals[t];
+        let area = (b - a).cross(c - a).mag() * 0.5;
+        if !(area > 0.0) || n.mag_sq() == 0.0 {
+            continue;
+        }
+        let m = ((area.sqrt() / spacing).ceil() as usize).max(1);
+        let (mf, each) = (m as f64, area / (m * m) as f64);
+        for i in 0..m {
+            for j in 0..m - i {
+                for (d, ok) in [(1.0 / 3.0, true), (2.0 / 3.0, i + j + 1 < m)] {
+                    if !ok {
+                        continue;
+                    }
+                    let (u, v) = ((i as f64 + d) / mf, (j as f64 + d) / mf);
+                    pos.push(a + (b - a) * u + (c - a) * v);
+                    nrm.push(n);
+                    w.push(each);
+                }
+            }
+        }
+    }
+    let n = pos.len();
+    let mut s = like.clone();
+    s.mesh = mesh_core::Mesh { positions: pos, triangles: Vec::new() };
+    s.normals = nrm;
+    s.confidence = vec![1.0; n];
+    s.frames = 1;
+    s.camera = None;
+    (s, w)
+}
+
+/// Which of `pts` (carried by `to_target`) lie within BAND_MM of `target` with agreeing normals (cosine `cos`):
+/// scan_core `deviations` with the points as the scan.
+fn covered(pts: &ScanMesh, target: &scan_core::Design, tbvh: &mesh_core::bvh::Bvh, to_target: Transform, cos: f64) -> Vec<bool> {
+    let ap = scan_core::AlignParams { normal_cos: cos, ..scan_core::AlignParams::DEFAULT };
+    let a = scan_core::Aligned { pose: to_target, rms_mm: 0.0, pairs: 0, iters: 0 };
+    scan_core::deviations(pts, target, tbvh, a, &ap, BAND_MM, Tol::DEFAULT)
+        .per_vertex
+        .iter()
+        .map(|d| matches!(d, Some(x) if x.abs() <= BAND_MM))
+        .collect()
+}
+
+/// The area-weighted fraction of `hit` over `region` (all points when None); NaN on an empty region.
+fn frac(w: &[f64], hit: &[bool], region: Option<&[bool]>) -> f64 {
+    let (mut s, mut t) = (0.0, 0.0);
+    for k in 0..w.len() {
+        if region.map_or(true, |r| r[k]) {
+            t += w[k];
+            if hit[k] {
+                s += w[k];
+            }
+        }
+    }
+    if t > 0.0 { s / t } else { f64::NAN }
+}
+
+/// The trimmed rms of the scan at `pose` from `deviations` at `gate` (σ = gate / 6): an unpaired vertex at the gate,
+/// the RMS of the best ceil(`keep`·n).
+fn trim(scan: &ScanMesh, design: &scan_core::Design, bvh: &mesh_core::bvh::Bvh, pose: Transform, gate: f64, keep: f64) -> f64 {
+    let ap = scan_core::AlignParams { sigma_mm: gate / 6.0, ..scan_core::AlignParams::DEFAULT };
+    let a = scan_core::Aligned { pose, rms_mm: 0.0, pairs: 0, iters: 0 };
+    let mut r: Vec<f64> = scan_core::deviations(scan, design, bvh, a, &ap, BAND_MM, Tol::DEFAULT).per_vertex.iter().map(|d| d.map_or(gate, f64::abs)).collect();
+    if r.is_empty() {
+        return f64::INFINITY;
+    }
+    r.sort_by(|a, b| a.total_cmp(b));
+    let k = ((r.len() as f64 * keep).ceil() as usize).clamp(1, r.len());
+    (r[..k].iter().map(|x| x * x).sum::<f64>() / k as f64).sqrt()
+}
+
+/// The weighted principal frame of `pts` (x the largest axis, y the middle, x × y), its centroid and the eigenvalues
+/// ascending (geom_core `jacobi_sym`, the moment road's).
+fn frame_of(pts: &[Vec3], w: &[f64]) -> ([Vec3; 3], Vec3, [f64; 3]) {
+    let tw: f64 = w.iter().sum();
+    let mut c = Vec3::ZERO;
+    for (q, &wk) in pts.iter().zip(w) {
+        c = c + *q * (wk / tw);
+    }
+    let mut m = [0.0f64; 9];
+    for (q, &wk) in pts.iter().zip(w) {
+        let d = *q - c;
+        let x = [d.x, d.y, d.z];
+        for r in 0..3 {
+            for k in 0..3 {
+                m[r * 3 + k] += wk / tw * x[r] * x[k];
+            }
+        }
+    }
+    let (ev, v) = geom_core::linalg::jacobi_sym(&m, 3);
+    let col = |j: usize| Vec3::new(v[j], v[3 + j], v[6 + j]).normalize().unwrap_or(Vec3::ZERO);
+    let (x, y) = (col(2), col(1));
+    ([x, y, x.cross(y)], c, [ev[0], ev[1], ev[2]])
+}
+
+/// The design's non-symmetric points from the frame (`u`, `c`): every group element but the identity whose self-coverage
+/// f(R) (the design's points turned onto the design within the band) is at least 0.9 is a found symmetry; the region is
+/// the points some found symmetry leaves uncovered. None when no symmetry is found.
+fn mark_region(pts: &ScanMesh, w: &[f64], design: &scan_core::Design, bvh: &mesh_core::bvh::Bvh, u: [Vec3; 3], c: Vec3, tag: &str) -> Option<Vec<bool>> {
+    let mut region = vec![false; w.len()];
+    let (mut found, mut fs) = (0u32, Vec::new());
+    for (k, g) in cube_group().into_iter().enumerate().skip(1) {
+        let hit = covered(pts, design, bvh, turn(u, c, g), 0.5);
+        let f = frac(w, &hit, None);
+        fs.push(format!("{k}:{f:.3}"));
+        if f >= 0.9 {
+            found += 1;
+            for (r, h) in region.iter_mut().zip(&hit) {
+                if !*h {
+                    *r = true;
+                }
+            }
+        }
+    }
+    println!("coarsesymthree: self-symmetry {tag}: f(R)=[{}] found={found} region_area_frac={:.4}", fs.join(" "), frac(w, &region, None));
+    if found > 0 { Some(region) } else { None }
+}
+
+/// The scores of the scan at `pose` (scan → design), gate `gate`: [(1) trimmed keep 0.3, trimmed keep 1.0, (2) coverage
+/// cos 0.5, coverage unchecked, (3) mark coverage found, mark coverage hinted].
+fn cube_scores(scan: &ScanMesh, design: &scan_core::Design, bvh: &mesh_core::bvh::Bvh, pts: &ScanMesh, w: &[f64], target: &scan_core::Design, tbvh: &mesh_core::bvh::Bvh, found: Option<&[bool]>, hint: Option<&[bool]>, pose: Transform, gate: f64) -> [f64; 6] {
+    let inv = pose.invert().expect("a rigid pose");
+    let c5 = covered(pts, target, tbvh, inv, 0.5);
+    let cu = covered(pts, target, tbvh, inv, -2.0);
+    let m = |r: Option<&[bool]>| r.map_or(f64::NAN, |r| frac(w, &c5, Some(r)));
+    [trim(scan, design, bvh, pose, gate, 0.3), trim(scan, design, bvh, pose, gate, 1.0), frac(w, &c5, None), frac(w, &cu, None), m(found), m(hint)]
+}
+
+/// The true basin's (row 0) rank in column `col` (1 = best; lower or higher better), and the best other row's value.
+fn true_rank(rows: &[[f64; 12]], col: usize, lower: bool) -> (usize, f64) {
+    let v0 = rows[0][col];
+    let others = rows.iter().skip(1).map(|r| r[col]).filter(|x| x.is_finite());
+    let best = others.clone().fold(if lower { f64::INFINITY } else { f64::NEG_INFINITY }, |b, x| if lower { b.min(x) } else { b.max(x) });
+    if !v0.is_finite() {
+        return (rows.len(), best);
+    }
+    (1 + others.filter(|&x| if lower { x < v0 } else { x > v0 }).count(), best)
+}
+
+#[test]
+fn a_near_cube_s_basins_scored() {
+    let doc = doc_core::read(CUBE_DOC).expect("the document reads");
+    // SR615's known pose with a 35° turn about the box's z first.
+    let (s, c) = (35.0 * DEG).sin_cos();
+    let yaw = fixture::from_axes(Vec3::new(c, s, 0.0), Vec3::new(-s, c, 0.0), Vec3::new(0.0, 0.0, 1.0), Vec3::ZERO);
+    let p = known_pose().compose(yaw);
+    let moved = fragment(cube_scan(), |_| true, p);
+    let truth = p.invert().expect("a rigid pose");
+    let tol = Tol::DEFAULT;
+    let ang = |a: Transform, b: Transform| 2.0 * a.rot.dot(b.rot).abs().min(1.0).acos() / DEG;
+    let err = |pose: Transform| {
+        let back = pose.compose(p);
+        let mm = [Vec3::new(-100.0, -105.0, 0.0), Vec3::new(100.0, 105.0, 220.0), Vec3::new(55.0, 60.0, 260.0)]
+            .iter()
+            .map(|&x| (back.apply_point(x) - x).mag())
+            .fold(0.0, f64::max);
+        (ang(back, Transform::IDENTITY), mm)
+    };
+
+    let (_, home) = vug_view::deviation::open(cube_scan(), &doc, BAND_MM, vug_view::deviation::GDT_MARGIN_MM).expect("the design builds");
+    match home.result.as_ref() {
+        Ok(h) => println!("coarsesymthree: identity road rms={:.3} off_identity_deg={:.4}", h.aligned.rms_mm, ang(h.aligned.pose, Transform::IDENTITY)),
+        Err(e) => println!("coarsesymthree: identity road refused {e:?}"),
+    }
+    let (_, design) = &*home.basis;
+    let ap = scan_core::AlignParams::DEFAULT;
+    let wide = scan_core::AlignParams { sigma_mm: ap.sigma_mm * scan_core::deviation::COARSE_WIDEN, max_points: ap.max_points.min(scan_core::deviation::COARSE_POINTS), ..ap };
+    let bvh = mesh_core::bvh::Bvh::build(&design.mesh);
+    let (pts, w) = surface_points(&design.mesh, 4.0, &moved);
+    let target = scan_core::Design::new(moved.mesh.clone(), vec![0; moved.mesh.triangles.len()], 1).expect("the scan as a one-face design");
+    let tbvh = mesh_core::bvh::Bvh::build(&target.mesh);
+    let group = cube_group();
+    let ex = [Vec3::new(1.0, 0.0, 0.0), Vec3::new(0.0, 1.0, 0.0), Vec3::new(0.0, 0.0, 1.0)];
+    let centre = Vec3::new(0.0, 0.0, 110.0);
+
+    // The design is three-equal; its own moment frame against the box's.
+    let (mu, mc, mw) = frame_of(&pts.mesh.positions, &w);
+    let tilt: Vec<f64> = mu.iter().map(|a| ex.iter().map(|e| a.dot(*e).abs()).fold(0.0, f64::max).min(1.0).acos() / DEG).collect();
+    let ones = vec![1.0; moved.mesh.positions.len()];
+    let (_, _, sw) = frame_of(&moved.mesh.positions, &ones);
+    println!(
+        "coarsesymthree: design points={} eig={:.1?} ratios={:.3}/{:.3} axis_tilt_deg={tilt:.2?} centroid={:.2?} | scan vertices={} ratios={:.3}/{:.3}",
+        w.len(),
+        mw,
+        mw[0] / mw[1],
+        mw[1] / mw[2],
+        [mc.x, mc.y, mc.z],
+        moved.mesh.positions.len(),
+        sw[0] / sw[1],
+        sw[1] / sw[2]
+    );
+    let r = scan_core::deviation::COARSE_SYM_RATIO;
+    assert!(mw[0] >= r * mw[1] && mw[1] >= r * mw[2], "the near-cube is three-equal: {mw:?}");
+    assert_eq!(group.len(), 24, "the cube group");
+    let found = mark_region(&pts, &w, design, &bvh, mu, mc, "moment-frame");
+    let hint = mark_region(&pts, &w, design, &bvh, ex, centre, "box-hint");
+
+    // T1: the 24 basins, at the start and refined.
+    let basins: Vec<Transform> = group.iter().map(|&g| turn(ex, centre, g).compose(truth)).collect();
+    let mut rows: Vec<[f64; 12]> = Vec::new();
+    println!("coarsesymthree: T1 basin perm signs turn_deg | start: t30@g0 t100@g0 cov cov_unc mark_found mark_hint | refined: drift_deg t30@g2 t100@g2 cov cov_unc mark_found mark_hint");
+    for (k, (&g, &start)) in group.iter().zip(&basins).enumerate() {
+        let a = cube_scores(&moved, design, &bvh, &pts, &w, &target, &tbvh, found.as_deref(), hint.as_deref(), start, ap.gate(0));
+        let (b, drift) = match scan_core::align(&moved, design, &bvh, start, &wide, tol) {
+            Ok(x) => (cube_scores(&moved, design, &bvh, &pts, &w, &target, &tbvh, found.as_deref(), hint.as_deref(), x.pose, ap.gate(2)), ang(x.pose, start)),
+            Err(_) => ([f64::NAN; 6], f64::NAN),
+        };
+        println!(
+            "coarsesymthree: T1 {k:2} {:?} {:?} {:6.1} | {:7.3} {:7.3} {:.4} {:.4} {:.4} {:.4} | {:6.2} {:7.3} {:7.3} {:.4} {:.4} {:.4} {:.4}",
+            g.0,
+            g.1,
+            ang(basins[k], truth),
+            a[0], a[1], a[2], a[3], a[4], a[5],
+            drift,
+            b[0], b[1], b[2], b[3], b[4], b[5]
+        );
+        let mut row = [0.0; 12];
+        row[..6].copy_from_slice(&a);
+        row[6..].copy_from_slice(&b);
+        rows.push(row);
+    }
+    let names = ["start t30@g0", "start t100@g0", "start cov", "start cov_unc", "start mark_found", "start mark_hint", "refined t30@g2", "refined t100@g2", "refined cov", "refined cov_unc", "refined mark_found", "refined mark_hint"];
+    for (col, name) in names.iter().enumerate() {
+        let lower = col % 6 < 2;
+        let (rank, best) = true_rank(&rows, col, lower);
+        println!("coarsesymthree: true-rank {name}: {rank} of 24 (true {:.4}, best other {:.4})", rows[0][col], best);
+    }
+
+    // T2: the road's own candidates (each design axis on the scan's partner end), refined and selected.
+    let nearest = |t: Transform| basins.iter().enumerate().map(|(k, b)| (k, ang(t, *b))).fold((0usize, f64::INFINITY), |m, x| if x.1 < m.1 { x } else { m });
+    let mut refined: Vec<(Transform, [f64; 6])> = Vec::new();
+    for i in 0..3usize {
+        let starts = scan_core::deviation::coarse_view(&moved, design, &bvh, &ap, tol, scan_core::deviation::Sweep::About(i)).unwrap_or_default();
+        for (t, score) in starts {
+            let (k, a) = nearest(t);
+            match scan_core::align(&moved, design, &bvh, t, &wide, tol) {
+                Ok(x) => {
+                    let sc = cube_scores(&moved, design, &bvh, &pts, &w, &target, &tbvh, found.as_deref(), hint.as_deref(), x.pose, ap.gate(2));
+                    let (kr, ar) = nearest(x.pose);
+                    println!("coarsesymthree: T2 about={i} start basin={k} off={a:.1} score={score:.3} -> refined basin={kr} off={ar:.2} t30={:.3} t100={:.3} cov={:.4} cov_unc={:.4} mark_found={:.4} mark_hint={:.4}", sc[0], sc[1], sc[2], sc[3], sc[4], sc[5]);
+                    refined.push((x.pose, sc));
+                }
+                Err(e) => println!("coarsesymthree: T2 about={i} start basin={k} off={a:.1} score={score:.3} -> refused {e:?}"),
+            }
+        }
+    }
+    for (name, col, lower) in [("(1) t30@g2", 0usize, true), ("(2) cov", 2, false), ("(2u) cov_unc", 3, false), ("(3h) mark_hint", 5, false)] {
+        let mut best: Option<(Transform, f64)> = None;
+        for &(pose, sc) in &refined {
+            let v = sc[col];
+            if v.is_finite() && best.map_or(true, |(_, b)| if lower { v < b } else { v > b }) {
+                best = Some((pose, v));
+            }
+        }
+        match best {
+            Some((pose, v)) => match scan_core::align(&moved, design, &bvh, pose, &ap, tol) {
+                Ok(f) => {
+                    let (deg, mm) = err(f.pose);
+                    println!("coarsesymthree: T2 select {name}: value={v:.4} basin={} -> aligned rms={:.3} err_deg={deg:.3} err_mm={mm:.3}", nearest(pose).0, f.rms_mm);
+                }
+                Err(e) => println!("coarsesymthree: T2 select {name}: value={v:.4} basin={} -> refused {e:?}", nearest(pose).0),
+            },
+            None => println!("coarsesymthree: T2 select {name}: no candidate"),
+        }
+    }
+
+    // Today: SR615's four starts on the coarse road.
+    let (_, map) = vug_view::deviation::open_coarse(&moved, &doc, BAND_MM, vug_view::deviation::GDT_MARGIN_MM).expect("the design builds");
+    match map.result.as_ref() {
+        Ok(d) => {
+            let (deg, mm) = err(d.aligned.pose);
+            println!("coarsesymthree: today road={:?} aligned={:.3} err_deg={deg:.3} err_mm={mm:.3} basin={}", map.road, d.aligned.rms_mm, nearest(d.aligned.pose).0);
+        }
+        Err(e) => println!("coarsesymthree: today road={:?} refused {e:?}", map.road),
+    }
+}
