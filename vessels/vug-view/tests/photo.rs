@@ -618,7 +618,7 @@ fn a_set_verified_before_a_panel_delete_enters_in_the_journal_names() {
     assert!(photo::offer(
         &mut vw.view,
         vec![
-            datum("point v3 sketch=s x=12 y=0", "a datum point"),
+            datum("point v3 sketch=s x=10 y=0", "a datum point"),
             datum("distance v4 sketch=s a=e1 b=v3 d=10", "a datum point"),
             datum("point v5 sketch=s x=49.7 y=20", "a second datum"),
             datum("distance v6 sketch=s a=e3 b=v5 d=10.2", "a second datum"),
