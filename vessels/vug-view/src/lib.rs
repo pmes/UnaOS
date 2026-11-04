@@ -109,7 +109,7 @@ impl Viewer {
             Some(v) => v,
             None => Viewer::new(Model::open(path)?, &title, size, preset),
         };
-        v.save_to = Some(p.with_extension("vug")); // VUGFACESAVE (SR534): `<stem>.vug` beside a mesh / photo
+        v.save_to = Some(p.with_extension("vug")); if let Some(ph) = v.view.photo.as_mut() { ph.crop.source = Some(p.to_path_buf()); } // VUGFACESAVE (SR534): `<stem>.vug` beside a mesh / photo; VUGFACEPHOTOCROPSAVE (SR640): the photo's own file, where its crop is saved beside
         Ok(v)
     }
 
@@ -168,7 +168,7 @@ impl Viewer {
         } else {
             self.view.key(&self.model, k)
         };
-        deviation::follow(self); self.retitle(); // VUGFACEDEVIATIONJOURNAL (SR550): a journal map re-measures when the document moved
+        deviation::follow(self); photo::follow(self); self.retitle(); // VUGFACEDEVIATIONJOURNAL (SR550): a journal map re-measures when the document moved; VUGFACEPHOTOCROPSAVE (SR640): a saved crop re-opens through the open road
         r
     }
 
@@ -283,14 +283,14 @@ impl Viewer {
 
 /// `text` to `<path>.tmp` (created, written, synced), then renamed over `path`; a failed rename removes the .tmp.
 /// Either error names its file.
-fn write_atomic(path: &std::path::Path, text: &str) -> Result<(), String> {
+fn write_atomic(path: &std::path::Path, text: impl AsRef<[u8]>) -> Result<(), String> {
     use std::io::Write;
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".tmp");
     let tmp = std::path::PathBuf::from(tmp);
     let named = |p: &std::path::Path, e: std::io::Error| format!("{}: {e}", p.display());
     let mut f = std::fs::File::create(&tmp).map_err(|e| named(tmp.as_path(), e))?;
-    f.write_all(text.as_bytes()).and_then(|()| f.sync_all()).map_err(|e| {
+    f.write_all(text.as_ref()).and_then(|()| f.sync_all()).map_err(|e| { // VUGFACEPHOTOCROPSAVE (SR640): bytes, so a PNG takes the one atomic write
         let _ = std::fs::remove_file(&tmp);
         named(tmp.as_path(), e)
     })?;

@@ -362,6 +362,6 @@ pub fn crop(img: &Image, x0: u32, y0: u32, w: u32, h: u32) -> Image {
 /// [`crop`] used and `img`'s size), so the photo states its principal point ([`crate::crop_principal`]) with no pref.
 pub fn crop_png(img: &Image, x0: u32, y0: u32, w: u32, h: u32) -> Vec<u8> {
     let c = crop(img, x0, y0, w, h);
-    let meta = alloc::format!("{},{},{},{}", x0.min(img.width), y0.min(img.height), img.width, img.height);
-    pixel_core::png::encode::encode_rgba_text(c.width, c.height, &c.rgba, &[(crate::CROP_KEY, meta.as_str())]).unwrap_or_default()
+    let (key, meta) = crate::crop_pair(img, x0.min(img.width), y0.min(img.height)); // VUGFACEPHOTOCROPSAVE (SR640): the key written once
+    pixel_core::png::encode::encode_rgba_text(c.width, c.height, &c.rgba, &[(key.as_str(), meta.as_str())]).unwrap_or_default()
 }

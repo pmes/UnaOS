@@ -392,7 +392,7 @@ impl View {
 
     /// A release: a click picks (Pick) or would open the menu (Menu, owed); true when the frame changed.
     pub fn release(&mut self, model: &Model, x: f64, y: f64) -> bool {
-        self.cursor = (x, y);
+        self.cursor = (x, y); if let Some(r) = crate::photo::release(self, x, y) { return r; } // VUGFACEPHOTOCROPSAVE (SR640): a crop drag on the photo ends here
         // VUGFACE2 (SR485): with no navigation drag, the sketch face's release first.
         if self.drag.is_none() {
             if let Some(r) = crate::sketch::release(self, x, y) {

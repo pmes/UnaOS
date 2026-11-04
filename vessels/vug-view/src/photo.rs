@@ -136,6 +136,8 @@ pub struct Photo {
     /// VUGFACEPHOTOCAMERAPREF (SR576): the camera's datum from Principia's store (`vug.photo.*`, read once at start by
     /// main.rs); the default (none set) is the lattice's own camera solve about the photo's centre.
     pub prefs: PhotoPrefs,
+    /// VUGFACEPHOTOCROPSAVE (SR640): the face's crop road (`:crop`, the drag, Return saves beside the photo's file).
+    pub crop: Crop,
 }
 
 impl fmt::Debug for Photo {
@@ -207,7 +209,7 @@ pub fn open_with(bytes: &[u8], pitch_mm: f64, prefs: PhotoPrefs) -> Result<(Mode
     let m = photo_core::measure(&image, params, Tol::DEFAULT).map_err(|e| format!("photo {e:?}"))?;
     let model = paper(&m.outline, pitch_mm)?;
     let first = Some(m.clone()); // VUGFACEPHOTOSIDE (SR547): held for the side photo
-    let photo = Photo { image, h: m.h, outline: m.outline, loops: m.loops, sigma_mm: m.sigma_mm, band_mm: params.band.lin.max(m.sigma_mm), offers: Vec::new(), focus: None, note: None, outbox: Vec::new(), request: 0, asked: None, ignored: 0, first, thickness: None, prefs }; // VUGINTENTTHICKNESS (SR557): thickness; VUGFACEPHOTOCAMERAPREF (SR576): prefs
+    let photo = Photo { image, h: m.h, outline: m.outline, loops: m.loops, sigma_mm: m.sigma_mm, band_mm: params.band.lin.max(m.sigma_mm), offers: Vec::new(), focus: None, note: None, outbox: Vec::new(), request: 0, asked: None, ignored: 0, first, thickness: None, prefs, crop: Crop::default() }; // VUGINTENTTHICKNESS (SR557): thickness; VUGFACEPHOTOCAMERAPREF (SR576): prefs; VUGFACEPHOTOCROPSAVE (SR640): crop
     let face = SketchFace::over(world_planes()[0].1, m.sketch);
     Ok((model, face, photo))
 }
@@ -260,7 +262,7 @@ pub fn underlay(view: &View, fr: &mut Raster) {
             }
         }
     }
-    band(view, ph, fr);
+    band(view, ph, fr); crop_mask(view, ph, fr); // VUGFACEPHOTOCROPSAVE (SR640): the sheet outside an armed crop dims
 }
 
 /// The outline's uncertainty: the region between the outline offset by +sigma and by -sigma (vertex normals of the
@@ -395,7 +397,7 @@ fn is_back(k: &str) -> bool {
 /// The view's key, first: `i`, `Tab`, and Enter / Backspace on the focused proposal. `None` (the sketch face's keys)
 /// with no photo, while a pull or a dimension edit is open, and for Enter / Backspace with nothing focused.
 pub fn key(view: &mut View, k: &str) -> Option<bool> {
-    let ph = view.photo.as_ref()?;
+    if let Some(r) = crop_key(view, k) { return Some(r); } let ph = view.photo.as_ref()?; // VUGFACEPHOTOCROPSAVE (SR640): an armed crop takes Return / Escape first
     if view.design.pull.is_some() || view.design.face.as_ref().is_some_and(|f| f.edit.is_some()) {
         return None;
     }
@@ -542,7 +544,7 @@ pub fn glyphs(view: &View) -> Vec<ProposalGlyph> {
 /// (VUGINTENTSETFACEANCHOREDOVERLAP SR596) when the more line under the cursor changed from `was` (the cursor before
 /// this motion): entering or leaving one asks for the frame its cue paints in.
 pub fn hover(view: &mut View, was: (f64, f64), x: f64, y: f64) -> bool {
-    let cue = more_at(view, was) != more_at(view, (x, y)); // VUGINTENTSETFACEANCHOREDOVERLAP (SR596): the more line's cue
+    if crop_motion(view, x, y) { return true; } let cue = more_at(view, was) != more_at(view, (x, y)); // VUGFACEPHOTOCROPSAVE (SR640): a crop drag follows the cursor; VUGINTENTSETFACEANCHOREDOVERLAP (SR596): the more line's cue
     let near = glyphs(view)
         .into_iter()
         .map(|g| (g.offer, (g.at.0 as f64 + 3.0 - x).hypot(g.at.1 as f64 + 5.0 - y)))
@@ -1471,7 +1473,7 @@ pub fn press(view: &mut View, button: crate::view::Button, x: f64, y: f64) -> Op
     if button != crate::view::Button::Left || view.design.pull.is_some() || view.design.face.as_ref().is_some_and(|f| f.edit.is_some()) {
         return None;
     }
-    let g = glyphs(view).into_iter().find(|g| more_line(g).is_some_and(|r| inside(r, x, y)))?;
+    if let Some(r) = crop_press(view, x, y) { return Some(r); } let g = glyphs(view).into_iter().find(|g| more_line(g).is_some_and(|r| inside(r, x, y)))?; // VUGFACEPHOTOCROPSAVE (SR640): an armed crop takes the press first
     let moved = page_card(view, g.offer, MORE_CLICK).unwrap_or(false);
     let ph = view.photo.as_mut()?;
     let focus = ph.focus != Some(g.offer);
@@ -1630,7 +1632,7 @@ pub fn line_free(view: &View) -> bool {
 /// `view.entry.store`'s folder, or [`command`] (Principia's standard store) when it is None. With a photo and no map
 /// every line is the photo's, so a stray line refuses [`PREF_USAGE`] by name.
 pub fn line_command(view: &mut View, line: &str) -> Option<Result<bool, String>> {
-    view.photo.as_ref()?;
+    view.photo.as_ref()?; if line.trim() == "crop" { return Some(Ok(crop_arm(view))); } // VUGFACEPHOTOCROPSAVE (SR640): `:crop` arms the drag
     let verb = line.split_whitespace().next().is_some_and(|w| LINE_VERBS.contains(&w));
     if view.deviation.is_some() && !verb {
         return None;
@@ -1726,4 +1728,231 @@ fn past_bottom(view: &View, r: (f32, f32, f32, f32)) -> bool {
 /// second row's foot (30 + [`CARD_ROW_PX`], where SR589's first listed head sits).
 fn band_top(col: Option<(f32, f32, f32, f32)>) -> f32 {
     col.map_or(30.0 + CARD_ROW_PX, |c| c.1 + c.3)
+}
+
+// ---- VUGFACEPHOTOCROPSAVE (SR640): the face's crop, its mask, its save beside the photo, the re-open (named tail block) ----
+// VUG-PHOTO-CROP-META-WRITE stayed owed since SR588 measured that the face neither cropped nor saved the photo. `:crop`
+// (the photo's `:` line, [`line_command`]) arms; a Left drag on the photo spans the rectangle in photo pixels ([`press`],
+// [`hover`], [`release`]: the ray's paper-plane hit through `Photo.h`), [`crop_rect`] the ONE rule the mask and the save
+// read; the sheet outside the crop dims through `raster::tint` ([`crop_mask`]); Return keeps it ([`crop_keep`]): the
+// cropped pixels (photo_core `fixture::crop`) with photo_core's `crop_pair` as their tEXt pair through pixel_core's
+// `encode_rgba_text`, written by lib.rs `write_atomic` beside the photo as `<stem>.crop.png` (never over an existing file,
+// never over the original); the controller re-opens it through `Viewer::open_with` ([`follow`]). Escape cancels.
+
+/// The face's crop road on the open photo.
+#[derive(Clone, Debug, Default)]
+pub struct Crop {
+    /// The photo's file (lib.rs `Viewer::open_with` sets it); None for a photo opened from bytes (the save refuses by name).
+    pub source: Option<std::path::PathBuf>,
+    /// `:crop` armed the drag; Return keeps the rectangle, Escape cancels.
+    pub armed: bool,
+    /// The press corner, photo pixels (continuous: pixel i spans [i, i + 1)).
+    pub from: Option<(f64, f64)>,
+    /// The current corner, photo pixels.
+    pub to: Option<(f64, f64)>,
+    /// A Left press on the photo is held (view.rs `release` ends it through [`release`]).
+    pub dragging: bool,
+    /// The saved crop the controller re-opens ([`follow`], drained once).
+    pub reopen: Option<std::path::PathBuf>,
+}
+
+/// The corner while the crop is armed with no rectangle.
+const CROP_HINT: &str = "crop: drag a rectangle on the photo, Return keeps it, Esc cancels";
+
+/// `:crop` on the photo's line: arms the drag (a rectangle already dragged is dropped).
+fn crop_arm(view: &mut View) -> bool {
+    let Some(ph) = view.photo.as_mut() else { return false };
+    let source = ph.crop.source.take();
+    ph.crop = Crop { source, armed: true, ..Crop::default() };
+    ph.note = Some(CROP_HINT.to_string());
+    true
+}
+
+/// The photo pixel under surface point (x, y): the ray's hit on the paper plane (z = 0, as [`underlay`] samples it),
+/// through `Photo.h`; None when the ray misses the plane.
+fn px_at(view: &View, ph: &Photo, x: f64, y: f64) -> Option<(f64, f64)> {
+    let (o, d) = view.ray_f64(x, y);
+    if d[2].abs() < 1e-12 {
+        return None;
+    }
+    let t = -o[2] / d[2];
+    if !(t > 0.0) {
+        return None;
+    }
+    let p = photo_core::homography::apply(&ph.h, Vec2::new(o[0] + d[0] * t, o[1] + d[1] * t))?;
+    Some((p.x, p.y))
+}
+
+/// THE crop rectangle `[x, y, w, h]` in photo pixels: each corner clamped to the image and rounded to the nearest pixel
+/// edge; None with no rectangle or an empty one. [`crop_mask`] paints it, [`crop_keep`] cuts it.
+pub fn crop_rect(ph: &Photo) -> Option<[u32; 4]> {
+    let (a, b) = (ph.crop.from?, ph.crop.to?);
+    let (iw, ih) = (ph.image.width as f64, ph.image.height as f64);
+    let edge = |v: f64, hi: f64| v.clamp(0.0, hi).round() as u32;
+    let (x0, x1) = (edge(a.0.min(b.0), iw), edge(a.0.max(b.0), iw));
+    let (y0, y1) = (edge(a.1.min(b.1), ih), edge(a.1.max(b.1), ih));
+    if x1 <= x0 || y1 <= y0 {
+        return None;
+    }
+    Some([x0, y0, x1 - x0, y1 - y0])
+}
+
+/// [`press`] first while armed: a Left press on the photo starts the rectangle (both corners at the press); every press is
+/// the crop's while it is armed. None when not armed.
+fn crop_press(view: &mut View, x: f64, y: f64) -> Option<bool> {
+    let ph = view.photo.as_ref()?;
+    if !ph.crop.armed {
+        return None;
+    }
+    let p = px_at(view, ph, x, y);
+    let ph = view.photo.as_mut()?;
+    let Some(p) = p else { return Some(false) };
+    ph.crop.from = Some(p);
+    ph.crop.to = Some(p);
+    ph.crop.dragging = true;
+    Some(true)
+}
+
+/// [`hover`] first: while a crop drag is held its corner follows the cursor (true: a frame); false otherwise.
+fn crop_motion(view: &mut View, x: f64, y: f64) -> bool {
+    let Some(ph) = view.photo.as_ref() else { return false };
+    if !ph.crop.dragging {
+        return false;
+    }
+    let p = px_at(view, ph, x, y);
+    let Some(ph) = view.photo.as_mut() else { return false };
+    if let Some(p) = p {
+        ph.crop.to = Some(p);
+    }
+    true
+}
+
+/// The view's release, first (view.rs `release`): a held crop drag ends at (x, y) and the corner names the rectangle.
+/// None (the release goes on) when no crop drag is held.
+pub fn release(view: &mut View, x: f64, y: f64) -> Option<bool> {
+    let ph = view.photo.as_ref()?;
+    if !ph.crop.dragging {
+        return None;
+    }
+    let p = px_at(view, ph, x, y);
+    let ph = view.photo.as_mut()?;
+    if let Some(p) = p {
+        ph.crop.to = Some(p);
+    }
+    ph.crop.dragging = false;
+    ph.note = Some(match crop_rect(ph) {
+        Some([x0, y0, w, h]) => format!("crop {x0},{y0} {w}x{h} px: Return keeps it, Esc cancels"),
+        None => CROP_HINT.to_string(),
+    });
+    Some(true)
+}
+
+/// [`key`] first while armed (under its gate: no pull or dimension edit): Return keeps the crop ([`crop_keep`]), Escape
+/// cancels it; any other key goes on. None when not armed.
+fn crop_key(view: &mut View, k: &str) -> Option<bool> {
+    let ph = view.photo.as_ref()?;
+    if !ph.crop.armed || view.design.pull.is_some() || view.design.face.as_ref().is_some_and(|f| f.edit.is_some()) {
+        return None;
+    }
+    match crate::sketch::FieldKey::of(k) {
+        Some(crate::sketch::FieldKey::Enter) => Some(crop_keep(view)),
+        Some(crate::sketch::FieldKey::Escape) => {
+            let ph = view.photo.as_mut()?;
+            let source = ph.crop.source.take();
+            ph.crop = Crop { source, ..Crop::default() };
+            ph.note = Some("crop cancelled".to_string());
+            Some(true)
+        }
+        _ => None,
+    }
+}
+
+/// Return on an armed crop: refused by name (the corner, nothing written, still armed) with no rectangle, with the
+/// document unsaved (the re-open replaces the face), with no file, or when `<stem>.crop.png` exists; else the crop is
+/// written ([`crop_write`]) and queued for the controller's re-open ([`follow`]), the corner `saved <name>`.
+fn crop_keep(view: &mut View) -> bool {
+    let dirty = view.design.journal.dirty();
+    let Some(ph) = view.photo.as_mut() else { return false };
+    let out = match (crop_rect(ph), ph.crop.source.clone()) {
+        (None, _) => Err("refused crop: drag a rectangle on the photo".to_string()),
+        _ if dirty => Err("refused crop: the document is unsaved (s saves it)".to_string()),
+        (Some(_), None) => Err("refused crop: the photo has no file (open it by its path)".to_string()),
+        (Some(r), Some(src)) => crop_write(&ph.image, r, &src),
+    };
+    match out {
+        Ok(out) => {
+            let source = ph.crop.source.take();
+            ph.note = Some(format!("saved {}", file_name(&out)));
+            ph.crop = Crop { source, reopen: Some(out), ..Crop::default() };
+        }
+        Err(e) => ph.note = Some(e),
+    }
+    true
+}
+
+/// The crop `[x, y, w, h]` of `img` as PNG beside `src`: `<stem>.crop.png` (`Path::with_extension`: a .jpg / .webp / .png
+/// photo alike), refused when it exists; the cropped pixels carry photo_core's `crop_pair` as their one tEXt pair.
+fn crop_write(img: &pixel_core::Image, [x, y, w, h]: [u32; 4], src: &std::path::Path) -> Result<std::path::PathBuf, String> {
+    let out = src.with_extension("crop.png");
+    if out.exists() {
+        return Err(format!("refused crop: {} exists", file_name(&out)));
+    }
+    let c = photo_core::fixture::crop(img, x, y, w, h);
+    let (key, value) = photo_core::crop_pair(img, x, y);
+    let png = pixel_core::png::encode::encode_rgba_text(c.width, c.height, &c.rgba, &[(key.as_str(), value.as_str())]).map_err(|e| format!("refused crop: png {e:?}"))?;
+    crate::write_atomic(&out, &png).map_err(|e| format!("refused crop: {e}"))?;
+    Ok(out)
+}
+
+fn file_name(p: &std::path::Path) -> String {
+    p.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string()
+}
+
+/// The sheet outside an armed crop's rectangle dims toward the background once more (the underlay's own [`DIM`]):
+/// `raster::tint` even-odd over the sheet and the rectangle's quad (its photo corners through H⁻¹ onto the paper, then
+/// the view), its edge in `ACTIVE`. Nothing with no rectangle or a corner off the view.
+fn crop_mask(view: &View, ph: &Photo, fr: &mut Raster) {
+    if !ph.crop.armed {
+        return;
+    }
+    let Some([x, y, w, h]) = crop_rect(ph) else { return };
+    let Ok(inv) = photo_core::homography::invert(&ph.h) else { return };
+    let (x0, y0, x1, y1) = (x as f64, y as f64, (x + w) as f64, (y + h) as f64);
+    let quad: Option<Vec<(f32, f32)>> = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
+        .iter()
+        .map(|&(u, v)| {
+            let q = photo_core::homography::apply(&inv, Vec2::new(u, v))?;
+            view.project_f64([q.x, q.y, 0.0]).map(|(sx, sy)| (sx as f32, sy as f32))
+        })
+        .collect();
+    let Some(quad) = quad else { return };
+    let (fw, fh) = (fr.width as f32, fr.height as f32);
+    let sheet = vec![(0.0, 0.0), (fw, 0.0), (fw, fh), (0.0, fh)];
+    raster::tint(fr, &[sheet, quad.clone()], rgba(raster::BACKGROUND), 1.0 - DIM);
+    for i in 0..4 {
+        raster::line(fr, quad[i], quad[(i + 1) % 4], rgba(ACTIVE));
+    }
+}
+
+/// The controller's re-open of a saved crop (lib.rs `Viewer::key`'s last line, as `deviation::follow`): the saved file
+/// through THE open road `Viewer::open_with` (read back from disk, measured again under the photo's prefs), the `:` line
+/// carried over, the corner `saved <name>`; a saved crop that does not measure keeps the face and names why.
+pub fn follow(v: &mut crate::Viewer) {
+    let Some(path) = v.view.photo.as_mut().and_then(|ph| ph.crop.reopen.take()) else { return };
+    let prefs = v.view.photo.as_ref().map(|ph| ph.prefs).unwrap_or_default();
+    let name = file_name(&path);
+    match crate::Viewer::open_with(&path.to_string_lossy(), v.view.size, v.view.preset, prefs) {
+        Ok(mut next) => {
+            next.view.entry = std::mem::take(&mut v.view.entry);
+            if let Some(ph) = next.view.photo.as_mut() {
+                ph.note = Some(format!("saved {name}"));
+            }
+            *v = next;
+        }
+        Err(e) => {
+            if let Some(ph) = v.view.photo.as_mut() {
+                ph.note = Some(format!("refused the saved crop {e} (saved {name})"));
+            }
+        }
+    }
 }
