@@ -120,6 +120,9 @@ pub struct Photo {
     /// VUGFACEPHOTOSIDE (SR547): the flat photo's measurement `photo_core::measure_side` pairs a side photo against;
     /// None on a hand-built face.
     pub first: Option<photo_core::Measured>,
+    /// VUGINTENTTHICKNESS (SR557): the side photo's thickness as a doc_core `Measurement::Thickness`, set by [`side`];
+    /// an extrude of the sketch is judged by it beside the outline ([`judged`]). None until a side photo is measured.
+    pub thickness: Option<Measurement>,
 }
 
 impl fmt::Debug for Photo {
@@ -185,7 +188,7 @@ pub fn open(bytes: &[u8], pitch_mm: f64) -> Result<(Model, SketchFace, Photo), S
     let m = photo_core::measure(&image, params, Tol::DEFAULT).map_err(|e| format!("photo {e:?}"))?;
     let model = paper(&m.outline, pitch_mm)?;
     let first = Some(m.clone()); // VUGFACEPHOTOSIDE (SR547): held for the side photo
-    let photo = Photo { image, h: m.h, outline: m.outline, loops: m.loops, sigma_mm: m.sigma_mm, band_mm: params.band.lin.max(m.sigma_mm), offers: Vec::new(), focus: None, note: None, outbox: Vec::new(), request: 0, asked: None, ignored: 0, first };
+    let photo = Photo { image, h: m.h, outline: m.outline, loops: m.loops, sigma_mm: m.sigma_mm, band_mm: params.band.lin.max(m.sigma_mm), offers: Vec::new(), focus: None, note: None, outbox: Vec::new(), request: 0, asked: None, ignored: 0, first, thickness: None }; // VUGINTENTTHICKNESS (SR557): thickness
     let face = SketchFace::over(world_planes()[0].1, m.sketch);
     Ok((model, face, photo))
 }
@@ -353,9 +356,10 @@ pub fn offer(view: &mut View, ps: Vec<Proposal>) -> bool {
     let (Some(face), Some(ph)) = (view.design.face.as_ref(), view.photo.as_mut()) else { return false };
     let doc = doc_of(face);
     let m = ph.measurement();
+    let t = ph.thickness.clone(); // VUGINTENTTHICKNESS (SR557)
     let n = ps.len();
     for p in ps {
-        ph.offers.push(verified(&doc, &m, p, None)); // VUGFACESTREAM (SR535): the one verify road
+        ph.offers.push(verified(&doc, &m, t.as_ref(), p, None)); // VUGFACESTREAM (SR535): the one verify road
     }
     tally(ph, n); // VUGFACESTREAM (SR535): the one corner and focus rule
     n > 0
@@ -412,7 +416,7 @@ fn accept(view: &mut View, i: usize) -> bool {
     }
     let p = ph.offers[i].proposal.clone();
     let doc = doc_of(face);
-    let verdict = doc_core::verify(&doc, &p, &ph.measurement(), Tol::DEFAULT);
+    let verdict = judged(&doc, &p, &ph.measurement(), ph.thickness.as_ref()); // VUGINTENTTHICKNESS (SR557): outline and thickness
     ph.offers[i].verdict = verdict.clone();
     if let Verdict::Refuse { why } = &verdict {
         ph.note = Some(format!("refused {}", why.text()));
@@ -606,8 +610,8 @@ pub fn answer(view: &mut View, ev: &IntentEvent) -> bool {
 // ---- VUGFACESTREAM (SR535): the streamed preview (named tail block) ----
 
 /// The one verify road: `p` checked by `doc_core::verify` against the face's document and the measured outline, Open.
-fn verified(doc: &Doc, m: &Measurement, p: Proposal, streaming: Option<u32>) -> Offer {
-    let verdict = doc_core::verify(doc, &p, m, Tol::DEFAULT);
+fn verified(doc: &Doc, m: &Measurement, t: Option<&Measurement>, p: Proposal, streaming: Option<u32>) -> Offer {
+    let verdict = judged(doc, &p, m, t); // VUGINTENTTHICKNESS (SR557): the held thickness beside the outline
     Offer { proposal: p, verdict, state: State::Open, streaming }
 }
 
@@ -636,7 +640,7 @@ fn from_bus(q: &IntentProposal) -> Proposal {
 /// else a new preview is verified and offered; the corner counts the previews. True (the frame changed).
 fn preview(view: &mut View, request: u64, index: u32, p: Proposal) -> bool {
     let (Some(face), Some(ph)) = (view.design.face.as_ref(), view.photo.as_mut()) else { return false };
-    let o = verified(&doc_of(face), &ph.measurement(), p, Some(index));
+    let o = verified(&doc_of(face), &ph.measurement(), ph.thickness.as_ref(), p, Some(index)); // VUGINTENTTHICKNESS (SR557)
     match ph.offers.iter().position(|q| q.streaming == Some(index)) {
         Some(j) => {
             let state = ph.offers[j].state;
@@ -657,15 +661,16 @@ fn settle(view: &mut View, ps: Vec<Proposal>) -> bool {
     let (Some(face), Some(ph)) = (view.design.face.as_ref(), view.photo.as_mut()) else { return false };
     let doc = doc_of(face);
     let m = ph.measurement();
+    let t = ph.thickness.clone(); // VUGINTENTTHICKNESS (SR557)
     let n = ps.len();
     for (i, p) in ps.into_iter().enumerate() {
         match ph.offers.iter().position(|q| q.streaming == Some(i as u32)) {
             Some(j) if ph.offers[j].proposal == p => ph.offers[j].streaming = None,
             Some(j) => {
                 let state = ph.offers[j].state;
-                ph.offers[j] = Offer { state, ..verified(&doc, &m, p, None) };
+                ph.offers[j] = Offer { state, ..verified(&doc, &m, t.as_ref(), p, None) };
             }
-            None => ph.offers.push(verified(&doc, &m, p, None)),
+            None => ph.offers.push(verified(&doc, &m, t.as_ref(), p, None)),
         }
     }
     withdraw(ph);
@@ -717,6 +722,7 @@ pub fn side(view: &mut View, bytes: &[u8], name: &str) -> Result<(), String> {
         Ok(v) => v,
         Err(e) => return side_refused(view, e),
     };
+    hold_thickness(view, &s); // VUGINTENTTHICKNESS (SR557): held before the offer, so the extrude is judged by it
     offer(view, vec![p]);
     if let Some(ph) = view.photo.as_mut() {
         ph.note = Some(format!("side {name}: thickness={} sigma={} paired={}", num(s.thickness_mm), num(s.sigma_mm), num(s.paired_mm)));
@@ -825,4 +831,34 @@ fn extrude_road(d: &crate::sketch::Design, x: (String, [f64; 3], f64)) -> Result
     j.record(Some(face), Some(&pull));
     let r = crate::journal::regenerate(&j.doc)?;
     Ok((j, r))
+}
+
+// ---- VUGINTENTTHICKNESS (SR557): the extrude judged by the side photo's thickness (named tail block) ----
+
+/// The side photo's thickness held on the photo as `Measurement::Thickness`: `thickness_mm` along the open sketch's
+/// normal, checked at the band the outline is (`PhotoParams.band.lin` or the side photo's sigma, whichever is larger:
+/// [`Photo::band_mm`]'s rule). Nothing without an open sketch and a photo.
+fn hold_thickness(view: &mut View, s: &photo_core::Side) {
+    let Some(z) = view.design.face.as_ref().map(|f| f.plane.z) else { return };
+    let Some(ph) = view.photo.as_mut() else { return };
+    let pitch = ph.first.as_ref().map_or(PITCH_MM, |m| m.pitch_mm);
+    let sigma_mm = photo_core::PhotoParams::new(pitch).band.lin.max(s.sigma_mm);
+    ph.thickness = Some(Measurement::Thickness { mm: s.thickness_mm, sigma_mm, along: z });
+}
+
+/// The face's verdict on `p`: `doc_core::verify` against the outline `m`; when that accepts, a thickness `t` is held
+/// and `p` is an extrude of the photo's sketch ([`extruded`]), `doc_core::verify` against `t` too. The first refusal
+/// is the verdict (the outline's, then the thickness's), else the accept with the larger `residual_sigma`. A
+/// constraint proposal is never judged by the thickness.
+fn judged(doc: &Doc, p: &Proposal, m: &Measurement, t: Option<&Measurement>) -> Verdict {
+    let v = doc_core::verify(doc, p, m, Tol::DEFAULT);
+    let Verdict::Accept { residual_sigma: outline_sigma, .. } = v else { return v };
+    let Some(t) = t else { return v };
+    if extruded(doc, p).is_none() {
+        return v;
+    }
+    match doc_core::verify(doc, p, t, Tol::DEFAULT) {
+        Verdict::Accept { residual_sigma, .. } if residual_sigma <= outline_sigma => v,
+        w => w,
+    }
 }

@@ -30,6 +30,8 @@
 //! * VUGMAKEMACHINELIB (SR544): a machine from a library — `machine <id> lib=<name>` resolved at [`read_with`] through
 //!   a caller's [`Lib`] (doc_core opens no file), held in the statement as [`MachineLib`], written back as `lib=`;
 //!   [`machine_of`] the ONE road from a document to make_core's `Machine`, the library's axes / tools folded in.
+//! * VUGMAKEMACHINELIBHELD (SR556): [`HeldLib`] answers `lib=<name>` from the library the Doc already holds (THE writer
+//!   out, THE reader back); [`Doc::reread`] the re-read of a document's own text with no resolver and no file.
 //!
 //! The grammar: `<verb> <id>? <key>=<value>...`; `#` starts a comment (outside a string) that runs to the end of the
 //! line; the first statement is the header `vug-doc version=1 lin=<f64> ang=<f64>` (the format, its version and the
@@ -66,6 +68,7 @@ pub use standards::{Class, METRIC, Standard, Thread, clearance_for, nearest_stan
 pub use suggest::suggest;
 pub use lex::read;
 pub use lex::read_with; // VUGMAKEMACHINELIB (SR544)
+pub use lex::HeldLib; // VUGMAKEMACHINELIBHELD (SR556)
 pub use replay::machine_of; // VUGMAKEMACHINELIB (SR544)
 pub use replay::{Failure, Fault, Replay, SketchOut, SolidOut, brep_profile, replay};
 pub use write::{escape, f64_text, write};

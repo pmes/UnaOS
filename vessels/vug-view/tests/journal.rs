@@ -394,7 +394,8 @@ fn a_part_beside_its_library_opens_and_replays() {
     assert_eq!(b, a, "the same make_core Machine");
     assert_eq!(b.digest(), a.digest());
     assert!(doc_core::write(doc(&vw)).contains("\nmachine mill lib=shop loaded=1\n"), "the part writes back the name only");
-    // The journal's re-read resolves the same shelf: deleting the extrude row is not refused UnknownLib.
+    // VUGMAKEMACHINELIBHELD (SR556): the delete re-reads from the library the part holds: no file, no shelf.
+    std::fs::remove_file(dir.join("shop.vugmachine")).expect("library removed");
     let mut vw = vw;
     let x = index_of(&vw, |s| matches!(s, Stmt::Extrude { .. }));
     vw.view.design.journal.delete(x).unwrap_or_else(|e| panic!("delete: {e}"));

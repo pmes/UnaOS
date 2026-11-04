@@ -262,14 +262,11 @@ pub struct Journal {
     pub disk: Option<Result<String, String>>,
     /// VUGFACESAVEAS (SR539): the Save As field while it is open (Cmd+Shift+S; lib.rs `Viewer::save_as_key`).
     pub save_as: Option<SaveAs>,
-    /// VUGMAKEMACHINELIBFACE (SR548): the opened part's library shelf (lib.rs `open_vug`): [`Journal::reread`] resolves
-    /// `machine <id> lib=<name>` through it; None for a document not opened from a file.
-    pub lib: Option<doc_host::DirLib>,
 }
 
 impl Default for Journal {
     fn default() -> Journal {
-        Journal { doc: Doc::new(Tol::DEFAULT), closed: 0, open: None, undo: Vec::new(), redo: Vec::new(), panel: false, cursor: 0, edit: None, note: None, saved: None, disk: None, save_as: None, lib: None }
+        Journal { doc: Doc::new(Tol::DEFAULT), closed: 0, open: None, undo: Vec::new(), redo: Vec::new(), panel: false, cursor: 0, edit: None, note: None, saved: None, disk: None, save_as: None }
     }
 }
 
@@ -383,7 +380,7 @@ impl Journal {
         cand.lines.clear();
         cand.stmts.remove(i);
         for _ in 0..=self.doc.stmts.len() {
-            match self.reread(&doc_core::write(&cand)) { // VUGMAKEMACHINELIBFACE (SR548): the part's library resolves
+            match self.doc.reread(&doc_core::write(&cand)) { // VUGMAKEMACHINELIBHELD (SR556): the library the part holds resolves, no file
                 Err(r) if matches!(r.what, What::UnknownRef(_)) && r.line >= 2 && ((r.line - 2) as usize) < cand.stmts.len() => {
                     cand.stmts.remove((r.line - 2) as usize);
                     continue;
@@ -554,7 +551,7 @@ pub fn overlay(view: &View, fr: &mut Raster) {
 /// [`regenerate`] share. An extrude / revolve appends its id (the pull's brep is appended, its statement too); a
 /// fillet / chamfer replaces the id equal to its `on` in place (the face's edit replaces `breps[k]`; replay keeps the
 /// `on` solid and pushes the edit's at the end, so the order is the document's, not replay's).
-fn live_solids(doc: &Doc) -> Vec<String> {
+pub(crate) fn live_solids(doc: &Doc) -> Vec<String> {
     let mut ids: Vec<String> = Vec::new();
     for s in &doc.stmts {
         match s {
@@ -572,7 +569,44 @@ fn live_solids(doc: &Doc) -> Vec<String> {
 
 /// The replayed Breps in Body order ([`live_solids`]): each id's LAST solid (as replay's `edit_step` reads its `on`).
 fn live_breps(doc: &Doc, solids: &[doc_core::SolidOut]) -> Vec<brep_core::Brep> {
-    live_solids(doc).iter().filter_map(|id| solids.iter().rev().find(|o| o.id == *id).map(|o| o.brep.clone())).collect()
+    live_outs(doc, solids).into_iter().map(|o| o.brep.clone()).collect() // VUGFACEDEVIATIONLIVE (SR558): the lookup is live_outs'
+}
+
+// ---- VUGFACEDEVIATIONLIVE (SR558): the live solids and the solid statements, for the deviation map too ----
+
+/// The replayed solids in Body order ([`live_solids`]): each live id's LAST solid (as replay's `edit_step` reads its
+/// `on`). [`live_breps`] (the Body) and deviation.rs `design` (the measured design) both read it.
+pub(crate) fn live_outs<'a>(doc: &Doc, solids: &'a [doc_core::SolidOut]) -> Vec<&'a doc_core::SolidOut> {
+    live_solids(doc).iter().filter_map(|id| solids.iter().rev().find(|o| o.id == *id)).collect()
+}
+
+/// The statements doc_core's `replay` feeds into solids, in document order: every extrude / revolve and fillet /
+/// chamfer, and each sketch an extrude / revolve names with its entities and constraints (its solve, its profiles and
+/// its frame). An Op (replay feeds it to the Program only), the machine, a scan and a sketch no feature names are not:
+/// an edit of those changes no solid (deviation.rs `follow` re-measures only when this list, or the Tol, changes).
+pub fn solid_stmts(doc: &Doc) -> Vec<Stmt> {
+    let named: Vec<&str> = doc
+        .stmts
+        .iter()
+        .filter_map(|s| match s {
+            Stmt::Extrude { sketch, .. } | Stmt::Revolve { sketch, .. } => Some(sketch.as_str()),
+            _ => None,
+        })
+        .collect();
+    doc.stmts
+        .iter()
+        .filter(|s| match s {
+            Stmt::Extrude { .. } | Stmt::Revolve { .. } | Stmt::Fillet { .. } | Stmt::Chamfer { .. } => true,
+            Stmt::Sketch { id: sk, .. }
+            | Stmt::Point { sketch: sk, .. }
+            | Stmt::Line { sketch: sk, .. }
+            | Stmt::Circle { sketch: sk, .. }
+            | Stmt::Arc { sketch: sk, .. }
+            | Stmt::Constraint { sketch: sk, .. } => named.contains(&sk.as_str()),
+            _ => false,
+        })
+        .cloned()
+        .collect()
 }
 
 impl Journal {
@@ -726,17 +760,4 @@ fn save_as_overlay(view: &View, fr: &mut Raster) {
     let text: String = format!("SAVE AS: {}_", f.text.to_uppercase()).chars().take(cols).collect();
     let y = h - 2.0 * ROW_PX - if j.panel { ROW_PX } else { 0.0 };
     raster::text(fr, &text, 6.0, y, rgba(ACTIVE));
-}
-
-// ---- VUGMAKEMACHINELIBFACE (SR548): the journal's text re-read ----
-
-impl Journal {
-    /// doc_core's reader over `text` with the opened part's library shelf (`lib=<name>` beside the part), else the plain
-    /// reader (a document not opened from a file names no library the face could resolve).
-    pub fn reread(&self, text: &str) -> Result<Doc, doc_core::Refusal> {
-        match &self.lib {
-            Some(l) => doc_core::read_with(text, l),
-            None => doc_core::read(text),
-        }
-    }
 }

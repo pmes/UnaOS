@@ -6,7 +6,7 @@
 //!
 //! VUGSCANDEVIATION (SR510) measured the made part against its model in tools/scan; this is the same measurement in
 //! the face, built EXACTLY as tools/scan builds it: doc_core `replay` of the document (the first failing statement
-//! refuses by line, no solid refuses `DesignEmpty`), every replayed solid through scan_core's ONE builder `design_of`,
+//! refuses by line, no solid refuses `DesignEmpty`), every live solid (journal.rs live_solids) through scan_core's ONE builder `design_of`,
 //! `measure` from the identity with `AlignParams::DEFAULT` at [`BAND_MM`] (tools/scan's default `--band`). The model
 //! the face draws is the scan at the aligned pose (the design's frame); each scan vertex's colour is scan_core's ONE
 //! ramp `colour(shade(d, band))` (palette_core's status rows), and raster.rs paints each triangle on the per-channel
@@ -73,7 +73,7 @@ pub fn scan_mesh(mesh: Mesh) -> ScanMesh {
 }
 
 /// The design of `doc` as tools/scan builds it: doc_core `replay`, the first failure refused by line, no solid
-/// refused, every replayed solid through scan_core's `design_of`.
+/// refused, every live solid (journal.rs live_solids) through scan_core's `design_of`.
 pub fn design(doc: &Doc) -> Result<(Design, Vec<String>), String> {
     let rp = doc_core::replay(doc, doc.tol);
     if let Some(f) = rp.failures.first() {
@@ -82,7 +82,7 @@ pub fn design(doc: &Doc) -> Result<(Design, Vec<String>), String> {
     if rp.solids.is_empty() {
         return Err("DesignEmpty".into());
     }
-    design_of(rp.solids.iter().map(|s| (s.id.as_str(), &s.brep)), doc.tol).map_err(|e| format!("{e:?}"))
+    design_of(live_of(doc, &rp.solids), doc.tol).map_err(|e| format!("{e:?}")) // VUGFACEDEVIATIONLIVE (SR558): the live solids only, never a fillet's on solid beside it
 }
 
 /// The per-channel mean of three `0x00RRGGBB` colours.
@@ -313,7 +313,7 @@ fn show(view: &mut View) {
 fn source_line(map: &Map) -> Option<String> {
     let s = map.source.as_ref()?;
     Some(match &s.refused {
-        None => format!("design=journal@{}", s.generation),
+        None => format!("design=journal@{} solids={}", s.generation, crate::journal::live_solids(&s.doc).len()), // VUGFACEDEVIATIONLIVE (SR558): the measured design's solid count
         Some(why) => format!("design=journal@{} refused {why} map@{}", s.generation, s.measured),
     })
 }
@@ -340,8 +340,8 @@ impl Viewer {
 pub fn follow(v: &mut Viewer) {
     let Some(m) = v.view.deviation.as_mut() else { return };
     let Some(src) = m.source.as_mut() else { return };
-    if src.doc == v.view.design.journal.doc {
-        return;
+    if src.doc == v.view.design.journal.doc || same_solids(src, &v.view.design.journal.doc) {
+        return lazy(v); // VUGFACEDEVIATIONLIVE (SR558): no solid statement moved, no re-measure
     }
     let doc = v.view.design.journal.doc.clone();
     src.generation += 1;
@@ -584,4 +584,33 @@ fn frame_line(map: &Map) -> Option<String> {
         (Some(Err(why)), _) => Some(format!("frame refused {why}")),
         _ => None,
     }
+}
+
+// ---- VUGFACEDEVIATIONLIVE (LEDGER SR558): the live solids, re-measured only when a solid's statements change ----
+// [`design`] builds from journal.rs `live_outs` (THE body rule `live_solids`: a fillet / chamfer stands in its `on`
+// solid's place), so a filleted document is measured against the fillet's solid, not the original beside it.
+// [`follow`] re-measures only when journal.rs `solid_stmts` (what replay feeds into solids) or the Tol moved, or when
+// the map's newest document refused; any other change (a stroke in a sketch no feature names, an Op, the machine) is
+// taken as seen with the generation kept.
+
+/// The live solids of `doc` as (id, brep) for scan_core's `design_of`, in Body order.
+fn live_of<'a>(doc: &Doc, solids: &'a [doc_core::SolidOut]) -> Vec<(&'a str, &'a brep_core::Brep)> {
+    crate::journal::live_outs(doc, solids).into_iter().map(|o| (o.id.as_str(), &o.brep)).collect()
+}
+
+/// `doc` builds the same solids as the document the map last saw: its newest measured (no refusal), the same Tol and
+/// the same solid statements.
+fn same_solids(src: &Source, doc: &Doc) -> bool {
+    src.refused.is_none() && src.doc.tol == doc.tol && crate::journal::solid_stmts(&src.doc) == crate::journal::solid_stmts(doc)
+}
+
+/// A journal document that moves no solid: seen (the generation kept) and the body shown as the map's state says.
+fn lazy(v: &mut Viewer) {
+    let doc = &v.view.design.journal.doc;
+    let Some(src) = v.view.deviation.as_mut().and_then(|m| m.source.as_mut()) else { return };
+    if src.doc == *doc {
+        return;
+    }
+    src.doc = doc.clone();
+    show(&mut v.view);
 }
