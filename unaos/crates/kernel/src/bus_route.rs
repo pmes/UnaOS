@@ -550,3 +550,59 @@ pub fn r3pref_set_refused() -> bool {
 pub fn fulfiller_row(verb: u8) -> Option<(usize, u64)> {
     locked(|| REGS.lock().iter().flatten().find(|r| r.verb == verb).map(|r| (r.row, r.rgen)))
 }
+
+// =================================================================================================
+// PREFSELF-RELAUNCH (rmbp-ledger B1158) — TAIL-APPENDED. At the login commit (`fs::users::login`, after the
+// session is stamped and before the login items and Holocron start) every live row holding a relayed-private
+// tag that is NOT a program of the new session (a PREFS.ELF or HOLOCRON.ELF launched before login) is ENDED,
+// never re-stamped (THE PRINCIPAL RULE above). The end is SECLOGIN M3's own road per row (`end_bus_row` on each
+// arch: `wm::close_owner` + `bg_kill` + the gone re-read); the row's teardown runs `on_exit`, which releases its
+// tags and answers its relays -ECONNRESET, so the session's own launch registers cleanly.
+// =================================================================================================
+
+/// The relayed-private tags: Principia's three (128-130) and Holocron's range (144-151). BUSREG-TAG-IDENTITY
+/// (B1157) owns the table; until it folds this one line is the list (the seat swaps in B1157's table).
+#[cfg(feature = "login")]
+fn relayed_private(v: u8) -> bool {
+    matches!(v, una_abi::BUS_VERB_R3PREF_GET | una_abi::BUS_VERB_R3PREF_LIST | una_abi::BUS_VERB_R3PREF_SET) || (una_abi::BUS_VERB_HOLOCRON_FIRST..=una_abi::BUS_VERB_HOLOCRON_LAST).contains(&v)
+}
+
+/// End every live relayed-private fulfiller row that is not a program of the open session (B1155's judge,
+/// `pref_row_in_session`). REGS is copied out under its lock and released before any arch call. Returns how
+/// many rows ended (the kill confirmed).
+#[cfg(feature = "login")]
+pub fn end_prelogin_fulfillers() -> usize {
+    let ops = crate::arch::syscall::busreg_ops();
+    let mut rows = [(usize::MAX, 0u64, 0u32); REG_CAP];
+    let mut n = 0usize;
+    locked(|| {
+        for r in REGS.lock().iter().flatten() {
+            if !relayed_private(r.verb) || (ops.rgen)(r.row) != r.rgen {
+                continue;
+            }
+            if let Some(e) = rows[..n].iter_mut().find(|e| e.0 == r.row && e.1 == r.rgen) {
+                e.2 += 1;
+            } else if n < REG_CAP {
+                rows[n] = (r.row, r.rgen, 1);
+                n += 1;
+            }
+        }
+    });
+    let mut ended = 0usize;
+    for &(row, rgen, tags) in &rows[..n] {
+        if crate::arch::syscall::pref_row_in_session(row) {
+            continue;
+        }
+        match crate::arch::syscall::end_bus_row(row, rgen) {
+            Some((pid, windows, settle, true)) => {
+                ended += 1;
+                serial_println!("[prefsbus] fulfiller row={} ended at login: pre-login pid={} tags={} windows={} kill=\"{}\"", row, pid, tags, windows, settle);
+            }
+            Some((pid, windows, settle, false)) => {
+                serial_println!("[prefsbus] fulfiller row={} NOT ended at login: pre-login pid={} tags={} windows={} kill=\"{}\"", row, pid, tags, windows, settle);
+            }
+            None => serial_println!("[prefsbus] fulfiller row={} not ended at login: pre-login tags={} no live process", row, tags),
+        }
+    }
+    ended
+}

@@ -27816,3 +27816,33 @@ fn machine_store_open_refused(vol: &str, mode: u64, ppid: &PrincipalRecord) -> b
     };
     crate::fs::rootacl::store_open_refused(vol, write, who)
 }
+
+// =================================================================================================
+// PREFSELF-RELAUNCH (rmbp-ledger B1158) — TAIL-APPENDED. `bus_route::end_prelogin_fulfillers` ends one bus row
+// (an ASID) at the login commit through SECLOGIN M3's own road (`session_end_processes`' body for one row):
+// `wm::close_owner` first, then the ASID-scoped `bg_kill`, counted gone only when the PROCS row no longer
+// names the pid. The generation is re-checked so a re-tenanted ASID is never killed.
+// =================================================================================================
+/// End bus row `row` (ASID, generation `rgen`). `None` = no live process on that ASID at that generation;
+/// else `(pid, windows_closed, kill_settle, gone)`.
+#[cfg(all(feature = "busreg", feature = "login"))]
+pub fn end_bus_row(row: usize, rgen: u64) -> Option<(u64, usize, &'static str, bool)> {
+    if row == 0 || row >= ASID_GEN.len() || ASID_GEN[row].load(Ordering::Acquire) != rgen {
+        return None;
+    }
+    let asid = row as u64;
+    for pi in 0..procs_rows() {
+        if PROCS[pi].state.load(Ordering::Acquire) != PRUNNING || PROCS[pi].asid.load(Ordering::Acquire) != asid {
+            continue;
+        }
+        let pid = PROCS[pi].pid.load(Ordering::Acquire);
+        if pid == 0 {
+            return None;
+        }
+        let windows = crate::video::wm::close_owner(asid);
+        let settle = bg_kill(pid, asid);
+        let gone = PROCS[pi].state.load(Ordering::Acquire) != PRUNNING || PROCS[pi].pid.load(Ordering::Acquire) != pid;
+        return Some((pid, windows, settle, gone));
+    }
+    None
+}
