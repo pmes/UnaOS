@@ -964,8 +964,10 @@ impl Viewer {
         if self.view.design.journal.save_as.is_some() {
             return None;
         }
-        let esc = matches!(k, "Escape" | "\u{1b}");
-        let (up, down) = (matches!(k, "Up" | "\u{f700}"), matches!(k, "Down" | "\u{f701}"));
+        use crate::sketch::FieldKey;
+        let fk = FieldKey::of(k); // VUGFACEFIELDKEYS (SR599): the one key-name table, read once
+        let esc = fk == Some(FieldKey::Escape);
+        let (up, down) = (fk == Some(FieldKey::Up), fk == Some(FieldKey::Down));
         if self.view.entry.open {
             if esc {
                 let e = &mut self.view.entry;
@@ -975,7 +977,7 @@ impl Viewer {
                 e.refused = None;
                 return Some(true);
             }
-            if matches!(k, "Return" | "KP_Enter" | "\r" | "\n") {
+            if fk == Some(FieldKey::Enter) {
                 let line = self.view.entry.text.clone();
                 match crate::photo::line_command(&mut self.view, &line).unwrap_or_else(|| self.map_command(&line)) { // VUGFACEPHOTOPREFLINE (SR595): a photo's line runs the photo's command road, the rest the map's
                     Ok(_) => {
@@ -998,15 +1000,15 @@ impl Viewer {
                 e.refused = None;
                 return Some(true);
             }
-            if let Some(moved) = crate::sketch::caret_key(&e.text, &mut e.caret, k) {
+            if let Some(moved) = fk.and_then(|key| crate::sketch::caret_key(&e.text, &mut e.caret, key)) {
                 return Some(moved); // VUGFACECOMMANDCARET (SR587): Left / Right / Home / End move the caret, never typed
             }
-            let back = matches!(k, "BackSpace" | "Backspace" | "\u{8}" | "\u{7f}");
-            let del = matches!(k, "Delete" | "\u{f728}"); // VUGFACECOMMANDCARET (SR587): the char after the caret
+            let back = fk == Some(FieldKey::Backspace);
+            let del = fk == Some(FieldKey::Delete); // VUGFACECOMMANDCARET (SR587): the char after the caret
             let ch = {
                 let mut it = k.chars();
                 match (it.next(), it.next()) {
-                    (Some(c), None) => Some(c),
+                    (Some(c), None) if fk.is_none() => Some(c), // VUGFACEFIELDKEYS (SR599): a named key is never typed
                     _ => None,
                 }
             };
