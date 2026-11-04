@@ -875,7 +875,7 @@ impl Viewer {
     /// One command on the map: `report` writes the report ([`Viewer::report_command`]); any other line is
     /// [`command`]'s. True when the map changed; refused by name, as each road refuses.
     pub fn map_command(&mut self, line: &str) -> Result<bool, String> {
-        if line.trim() == "report open" { return self.report_open().map(|_| true); } if line.trim() == "report" { // VUGFACEGDTREPORTOPEN (SR581): `report open` shows the written report as a sheet
+        if line.trim() == "report open" { return self.report_open().map(|_| true); } if let Some(p) = line.trim().strip_prefix("report open ") { return self.report_open_path(std::path::Path::new(p.trim())).map(|_| true); } if line.trim() == "report" { // VUGFACECOMMANDCARET (SR587): `report open <path>` reads any report file; VUGFACEGDTREPORTOPEN (SR581): `report open` shows the written report as a sheet
             return self.report_command().map(|_| true);
         }
         command(&mut self.view, &self.model, line)
@@ -925,6 +925,8 @@ pub struct Entry {
     pub text: String,
     pub last: Option<String>,
     pub refused: Option<String>,
+    /// VUGFACECOMMANDCARET (SR587): the caret, in chars of `text` (sketch.rs `type_text_at` / `caret_key`).
+    pub caret: usize,
 }
 
 impl Viewer {
@@ -938,9 +940,7 @@ impl Viewer {
             return Err(format!("report open: refused map {e:?}"));
         }
         let Some((path, _, _)) = report_target(self, m) else { return Err(REPORT_NO_PATH.to_string()) };
-        let text = std::fs::read_to_string(&path).map_err(|e| format!("report open: {}: {e}", path.display()))?;
-        self.view.sheet = Some(Sheet { lines: text.lines().map(String::from).collect(), top: 0 });
-        Ok(path)
+        self.report_open_path(&path) // VUGFACECOMMANDCARET (SR587): the one sheet road
     }
 
     /// The command line's and the sheet's keys, before every other (lib.rs `Viewer::key`); None while the Save As field
@@ -959,6 +959,7 @@ impl Viewer {
                 let e = &mut self.view.entry;
                 e.open = false;
                 e.text.clear();
+                e.caret = 0; // VUGFACECOMMANDCARET (SR587)
                 e.refused = None;
                 return Some(true);
             }
@@ -969,6 +970,7 @@ impl Viewer {
                         let e = &mut self.view.entry;
                         e.last = Some(line);
                         e.text.clear();
+                        e.caret = 0; // VUGFACECOMMANDCARET (SR587)
                         e.open = false;
                         e.refused = None;
                     }
@@ -979,11 +981,16 @@ impl Viewer {
             let e = &mut self.view.entry;
             if up {
                 let Some(l) = e.last.clone() else { return Some(false) };
+                e.caret = l.chars().count(); // VUGFACECOMMANDCARET (SR587): the recalled line's end
                 e.text = l;
                 e.refused = None;
                 return Some(true);
             }
+            if let Some(moved) = crate::sketch::caret_key(&e.text, &mut e.caret, k) {
+                return Some(moved); // VUGFACECOMMANDCARET (SR587): Left / Right / Home / End move the caret, never typed
+            }
             let back = matches!(k, "BackSpace" | "Backspace" | "\u{8}" | "\u{7f}");
+            let del = matches!(k, "Delete" | "\u{f728}"); // VUGFACECOMMANDCARET (SR587): the char after the caret
             let ch = {
                 let mut it = k.chars();
                 match (it.next(), it.next()) {
@@ -991,7 +998,7 @@ impl Viewer {
                     _ => None,
                 }
             };
-            let typed = crate::sketch::type_text(&mut e.text, ch, back);
+            let typed = crate::sketch::type_text_at(&mut e.text, &mut e.caret, ch, back, del); // VUGFACECOMMANDCARET (SR587): at the caret
             if typed {
                 e.refused = None;
             }
@@ -1002,6 +1009,7 @@ impl Viewer {
             let e = &mut self.view.entry;
             e.open = true;
             e.text.clear();
+            e.caret = 0; // VUGFACECOMMANDCARET (SR587)
             e.refused = None;
             return Some(true);
         }
@@ -1033,7 +1041,7 @@ pub fn line_overlay(view: &View, fr: &mut Frame) {
         return;
     }
     let panel = view.design.journal.panel;
-    crate::journal::field_line(fr, ":", &e.text, panel);
+    crate::journal::field_line_at(fr, ":", &e.text, e.caret, panel); // VUGFACECOMMANDCARET (SR587): the caret where it is
     if let Some(r) = &e.refused {
         let (w, h) = (fr.width as f32, fr.height as f32);
         let cols = ((w - 12.0) / 8.0).floor().max(1.0) as usize;
@@ -1043,3 +1051,29 @@ pub fn line_overlay(view: &View, fr: &mut Frame) {
     }
 }
 
+// ---- VUGFACECOMMANDCARET (LEDGER SR587): any report file as the sheet, with or without a map ----
+// VUGFACEGDTREPORTOPEN (SR581) read only the map's own report. [`Viewer::report_open_path`] is THE sheet road: the
+// map's `report open` ([`Viewer::report_open`]), the typed `report open <path>` ([`Viewer::map_command`], the path as typed)
+// and main.rs's `.vugreport` open ([`Viewer::open_report`], an empty document's face with no map) all read through it.
+// BP-vug-5: a printed verdict, nothing changes.
+
+impl Viewer {
+    /// Read the report file at `path` into the sheet, shown in the panel until Escape (no map needed). Refused by name,
+    /// nothing shown: the read's error. The path read on success.
+    pub fn report_open_path(&mut self, path: &std::path::Path) -> Result<std::path::PathBuf, String> {
+        forget(&mut self.view);
+        let text = std::fs::read_to_string(path).map_err(|e| format!("report open: {}: {e}", path.display()))?;
+        self.view.sheet = Some(Sheet { lines: text.lines().map(String::from).collect(), top: 0 });
+        Ok(path.to_path_buf())
+    }
+
+    /// A report file opened on its own (main.rs: `vug-view x.vugreport`): an empty document's face (lib.rs
+    /// `Viewer::open_doc`, no map) titled by the file name, the file shown as the sheet ([`Viewer::report_open_path`]).
+    pub fn open_report(path: &str, size: (u32, u32), preset: crate::view::Preset) -> Result<Viewer, String> {
+        let p = std::path::Path::new(path);
+        let title = p.file_name().and_then(|s| s.to_str()).unwrap_or("vug").to_string();
+        let mut v = Viewer::open_doc(Doc::new(doc_core::Tol::DEFAULT), &title, size, preset)?;
+        v.report_open_path(p)?;
+        Ok(v)
+    }
+}

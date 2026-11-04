@@ -105,7 +105,7 @@ fn main() {
     let cli = cli();
     let prefs = vug_view::photo::PhotoPrefs::load(); // VUGFACEPHOTOCAMERAPREF (SR576): Principia's store, opened once at start (read-only)
     // VUGFACEPHOTO (SR506): the one open road — a mesh, or a photo on graph paper measured into a sketch.
-    let opened = match (&cli.against, &cli.scan) { (Some(d), None) => Viewer::open_against(&cli.path, d, cli.size, cli.preset), (None, Some(s)) => Viewer::open_scan(&cli.path, s, cli.size, cli.preset), (Some(_), Some(_)) => Err("--against and --scan are exclusive".to_string()), (None, None) => Viewer::open_with(&cli.path, cli.size, cli.preset, prefs) }; // VUGFACEDEVIATION (SR525): a scan against its design; VUGFACEDEVIATIONSOLIDFAULT (SR565): a .vug part with --scan opens as the journal
+    let opened = match (&cli.against, &cli.scan) { (Some(d), None) => Viewer::open_against(&cli.path, d, cli.size, cli.preset), (None, Some(s)) => Viewer::open_scan(&cli.path, s, cli.size, cli.preset), (Some(_), Some(_)) => Err("--against and --scan are exclusive".to_string()), (None, None) if std::path::Path::new(&cli.path).extension().is_some_and(|e| e.eq_ignore_ascii_case(vug_view::deviation::REPORT_EXT)) => Viewer::open_report(&cli.path, cli.size, cli.preset), (None, None) => Viewer::open_with(&cli.path, cli.size, cli.preset, prefs) }; // VUGFACEDEVIATION (SR525): a scan against its design; VUGFACEDEVIATIONSOLIDFAULT (SR565): a .vug part with --scan opens as the journal; VUGFACECOMMANDCARET (SR587): a .vugreport opens as the report sheet with no map
     let mut viewer = match opened {
         Ok(v) => v,
         Err(e) => {

@@ -1050,11 +1050,28 @@ pub(crate) fn paint_panel(fr: &mut Raster, rows: &[String], first: usize, style:
 /// THE field painter: `<LABEL> <TEXT>_` bottom left, one row above the corner line (one more while the panel's note
 /// row is shown), upper-cased (the font's case), clipped to the frame's width, in the active colour.
 pub(crate) fn field_line(fr: &mut Raster, label: &str, text: &str, panel: bool) {
+    field_line_at(fr, label, text, text.chars().count(), panel); // VUGFACECOMMANDCARET (SR587): the caret at the end
+}
+
+// ---- VUGFACECOMMANDCARET (LEDGER SR587): the field's caret ----
+
+/// [`field_line`] with the caret at char `caret` of `text`: `<LABEL> <TEXT>` and the field's `_` at the caret's column —
+/// on the text row at the end (the frame [`field_line`] always painted), one font row lower under the caret's char
+/// mid-text (the font's `_` shares the letters' bottom row). The column counts the upper-cased text before the caret; a
+/// column past the clip paints no caret.
+pub(crate) fn field_line_at(fr: &mut Raster, label: &str, text: &str, caret: usize, panel: bool) {
     let (w, h) = (fr.width as f32, fr.height as f32);
     let cols = ((w - 12.0) / 8.0).floor().max(1.0) as usize;
-    let line: String = format!("{label} {}_", text.to_uppercase()).chars().take(cols).collect();
+    let line: String = format!("{label} {}", text.to_uppercase()).chars().take(cols).collect();
     let y = h - 2.0 * ROW_PX - if panel { ROW_PX } else { 0.0 };
     raster::text(fr, &line, 6.0, y, rgba(ACTIVE));
+    let n = text.chars().count();
+    let before: String = text.chars().take(caret.min(n)).collect();
+    let col = label.chars().count() + 1 + before.to_uppercase().chars().count();
+    if col < cols {
+        let dy = if caret < n { 2.0 } else { 0.0 };
+        raster::text(fr, "_", 6.0 + 8.0 * col as f32, y + dy, rgba(ACTIVE));
+    }
 }
 
 // ---- VUGFACEJOURNALFAULTFIXREF (LEDGER SR590): a BadRef offers the live entities of the kind its slot wanted ----

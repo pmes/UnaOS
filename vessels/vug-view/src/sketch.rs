@@ -1046,15 +1046,61 @@ pub(crate) fn type_into(buf: &mut String, ch: Option<char>, back: bool) -> bool 
 /// VUGFACESAVEAS (SR539): a typed key into a free text (the Save As path): any non-control character, Backspace pops.
 /// False when the key is none of them (a key name such as `Shift_L`); the caller owns Enter and Esc, as with [`type_into`].
 pub(crate) fn type_text(buf: &mut String, ch: Option<char>, back: bool) -> bool {
+    let mut at = buf.chars().count(); // VUGFACECOMMANDCARET (SR587): the caret at the end, the one road below
+    type_text_at(buf, &mut at, ch, back, false)
+}
+
+// ---- VUGFACECOMMANDCARET (LEDGER SR587): the free text road with a caret ----
+// [`type_text`] is the caret-at-the-end caller of [`type_text_at`] (the Save As field rides it unchanged); the `:` command
+// line (deviation.rs `Viewer::line_key`) holds a caret and calls it directly, with [`caret_key`] for the moves.
+
+/// The byte offset of char `i` in `s` (its length past the last char).
+fn char_byte(s: &str, i: usize) -> usize {
+    s.char_indices().nth(i).map_or(s.len(), |(b, _)| b)
+}
+
+/// A typed key into a free text at the caret `at` (in chars, clamped to the text): a non-control character is inserted
+/// before the caret and the caret steps past it, Backspace removes the char before the caret, Delete (`del`) the char
+/// after it (each true even with nothing to remove, as [`type_text`]'s Backspace). False when the key is none of them.
+pub(crate) fn type_text_at(buf: &mut String, at: &mut usize, ch: Option<char>, back: bool, del: bool) -> bool {
+    let n = buf.chars().count();
+    *at = (*at).min(n);
     if back {
-        buf.pop();
+        if *at > 0 {
+            *at -= 1;
+            buf.remove(char_byte(buf, *at));
+        }
+        return true;
+    }
+    if del {
+        if *at < n {
+            buf.remove(char_byte(buf, *at));
+        }
         return true;
     }
     match ch {
-        Some(c) if !c.is_control() => buf.push(c),
+        Some(c) if !c.is_control() => {
+            buf.insert(char_byte(buf, *at), c);
+            *at += 1;
+        }
         _ => return false,
     }
     true
+}
+
+/// The caret's moves in a free text: Left / Right one char, Home / End to the ends (the named keys and their one-char
+/// Cocoa codes, never typed). Some(whether the caret moved), None for every other key.
+pub(crate) fn caret_key(buf: &str, at: &mut usize, k: &str) -> Option<bool> {
+    let n = buf.chars().count();
+    let was = (*at).min(n);
+    *at = match k {
+        "Left" | "\u{f702}" => was.saturating_sub(1),
+        "Right" | "\u{f703}" => (was + 1).min(n),
+        "Home" | "\u{f729}" => 0,
+        "End" | "\u{f72b}" => n,
+        _ => return None,
+    };
+    Some(*at != was)
 }
 
 impl Dim {

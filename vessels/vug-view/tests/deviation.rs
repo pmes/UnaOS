@@ -1126,3 +1126,104 @@ fn a_typed_command_line_runs_the_map_command() {
     assert!(!plain.view.entry.open, "no map: `:` opens nothing");
 }
 
+// VUGFACECOMMANDCARET (LEDGER SR587): the `:` line edits at a caret (sketch.rs `type_text_at` / `caret_key`, the Save As
+// field's road with the caret at the end), painted by journal.rs `field_line_at`; any report file opens as the sheet
+// (deviation.rs `Viewer::report_open_path`): `report open <path>` on the line, and `Viewer::open_report` with no map.
+
+#[test]
+fn the_command_line_edits_at_its_caret() {
+    let (mut v, _dir) = report_open_fixture("vugfacecommandcaret-caret");
+    assert!(v.key(":"));
+    assert!(v.input(&bandy::SMessage::BrowserText("abcd".to_string())));
+    assert_eq!((v.view.entry.text.as_str(), v.view.entry.caret), ("abcd", 4), "typing leaves the caret at the end");
+    let at_end = raster::render(&v.model, &v.view);
+    assert!(v.key("Left") && v.key("Left"), "Left moves the caret");
+    assert_eq!(v.view.entry.caret, 2);
+    let mid = raster::render(&v.model, &v.view);
+    assert_ne!(mid.rgba, at_end.rgba, "the painted caret follows the caret");
+    assert!(v.key("x"), "a char inserts at the caret");
+    assert_eq!((v.view.entry.text.as_str(), v.view.entry.caret), ("abxcd", 3));
+    assert!(v.key("Delete"), "Delete removes the char after the caret");
+    assert_eq!((v.view.entry.text.as_str(), v.view.entry.caret), ("abxd", 3));
+    println!("caret line {:?} at {}", v.view.entry.text, v.view.entry.caret);
+    assert!(v.key("Right"));
+    assert!(!v.key("Right"), "Right at the end does not move");
+    assert!(v.key("\u{f702}"), "the Cocoa Left moves");
+    assert_eq!((v.view.entry.text.as_str(), v.view.entry.caret), ("abxd", 3), "and is never typed");
+    assert!(v.key("Home"));
+    assert!(!v.key("Left"), "Left at the start does not move");
+    v.key("BackSpace");
+    assert_eq!((v.view.entry.text.as_str(), v.view.entry.caret), ("abxd", 0), "Backspace at the start removes nothing");
+    assert!(v.key("End"));
+    assert!(v.key("BackSpace"));
+    assert_eq!((v.view.entry.text.as_str(), v.view.entry.caret), ("abx", 3), "Backspace removes the char before the caret");
+
+    // A run line recalled by Up puts the caret at its end: a typed char appends.
+    while !v.view.entry.text.is_empty() {
+        assert!(v.key("BackSpace"));
+    }
+    let (_, name) = plate_top(v.view.deviation.as_ref().unwrap());
+    let line = format!("gdt {name}=flatness:0.05");
+    assert!(v.input(&bandy::SMessage::BrowserText(line.clone())));
+    assert!(v.key("Return"));
+    assert!(!v.view.entry.open, "the line ran");
+    assert!(v.key(":") && v.key("Up"));
+    assert_eq!(v.view.entry.caret, line.chars().count(), "the recalled line's caret is at its end");
+    assert!(v.key("9"));
+    assert_eq!(v.view.entry.text, format!("{line}9"));
+    assert!(v.key("Escape"));
+    assert_eq!((v.view.entry.text.as_str(), v.view.entry.caret), ("", 0), "Escape clears the line and its caret");
+}
+
+#[test]
+fn a_report_file_opens_as_the_sheet_with_no_map() {
+    let (mut m, dir) = report_open_fixture("vugfacecommandcaret-file");
+    let (_, top) = plate_top(m.view.deviation.as_ref().unwrap());
+    assert_eq!(m.map_command(&format!("gdt {top}=flatness:0.001")), Ok(true));
+    assert_eq!(m.map_command("report"), Ok(true), "SR571's road writes the file");
+    let path = dir.join("part.vugreport");
+    let text = std::fs::read_to_string(&path).expect("the report is written");
+    let lines: Vec<String> = text.lines().map(String::from).collect();
+    let ps = path.to_str().unwrap();
+
+    // Opened on its own: no map, the file's lines as the sheet, painted in the panel and nowhere else.
+    let mut v = Viewer::open_report(ps, SIZE, Preset::Una).expect("the report opens");
+    assert!(v.view.deviation.is_none(), "no map");
+    assert_eq!(v.title, "part.vugreport");
+    assert_eq!(v.view.sheet.as_ref().expect("the sheet is shown").lines, lines, "the sheet is the file's lines");
+    let shown = raster::render(&v.model, &v.view);
+    let mut closed_view = v.view.clone();
+    closed_view.sheet = None;
+    let closed = raster::render(&v.model, &closed_view);
+    let x0 = vug_view::journal::panel_x0(SIZE.0) as usize;
+    let (mut inside, mut outside) = (0usize, 0usize);
+    for (i, (a, b)) in shown.rgba.chunks(4).zip(closed.rgba.chunks(4)).enumerate() {
+        if a != b {
+            if i % SIZE.0 as usize >= x0 { inside += 1 } else { outside += 1 }
+        }
+    }
+    println!("report file {} lines, no map: {inside} panel pixels differ, {outside} outside", lines.len());
+    assert!(inside > 0, "the sheet is painted in the panel");
+    assert_eq!(outside, 0, "and nowhere else");
+    assert!(v.key("Escape"), "Escape closes the sheet");
+    assert!(v.view.sheet.is_none());
+    assert_eq!(v.map_command(&format!("report open {ps}")), Ok(true), "`report open <path>` needs no map");
+    assert_eq!(v.view.sheet.as_ref().map(|s| s.lines.clone()), Some(lines.clone()));
+
+    // On the map's face the typed line opens the file and closes.
+    assert!(m.view.sheet.is_none());
+    assert!(m.key(":"));
+    assert!(m.input(&bandy::SMessage::BrowserText(format!("report open {ps}"))));
+    assert!(m.key("Return"));
+    assert!(!m.view.entry.open, "the line ran");
+    assert_eq!(m.view.sheet.as_ref().map(|s| s.lines.clone()), Some(lines), "the typed path's file is the sheet");
+
+    // A missing file is refused by name, nothing shown.
+    let gone = dir.join("nosuch.vugreport");
+    let gs = gone.to_str().unwrap();
+    assert!(m.key("Escape"));
+    let err = m.map_command(&format!("report open {gs}")).expect_err("no such file");
+    assert!(err.starts_with("report open: "), "the read's refusal by name: {err}");
+    assert!(m.view.sheet.is_none(), "a refusal shows nothing");
+    assert!(Viewer::open_report(gs, SIZE, Preset::Una).is_err(), "open_report refuses it too");
+}
