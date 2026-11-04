@@ -387,14 +387,14 @@ pub async fn serve_pump(
     mut open: Box<Opener>,
     every: Duration,
 ) {
-    hello_on(&desk); // VUGCOMSCANHELLOON (SR549): the bus turns the hello on (an explicit hello_within kept)
+    hello_on(&desk); machine_from_prefs(&synapse, &desk).await; // VUGCOMSCANHELLOON (SR549): the bus turns the hello on (an explicit hello_within kept); VUGCOMSCANMACHINEDECLAREPREFS (SR619): the declared machine read once from Principia's store
     let t0 = tokio::time::Instant::now();
     let mut iv = tokio::time::interval(every);
     loop {
         tokio::select! {
             m = rx.recv() => match m {
                 Ok(SMessage::Pump(ev)) if ev.is_request() => {
-                    let out = request(&desk, &ev, &mut open).await; // VUGCOMSCANHELLOON (SR549): PumpStart's open with the lock released; VUGCOMSCANHOSTDIALECT (SR566): off the worker
+                    let out = request(&desk, &ev, &mut open).await; declare_kept(&synapse, &desk, &ev, &out); // VUGCOMSCANMACHINEDECLAREPREFS (SR619): an accepted declare written to Principia's store; VUGCOMSCANHELLOON (SR549): PumpStart's open with the lock released; VUGCOMSCANHOSTDIALECT (SR566): off the worker
                     for o in out {
                         synapse.fire(SMessage::Pump(o));
                     }
@@ -1494,6 +1494,9 @@ fn bound(m: &Machine, read: Option<Envelope>, id: make_core::AxisId, i: usize) -
 struct Declared {
     name: String,
     dialect: Option<Dialect>,
+    /// VUGCOMSCANMACHINEDECLAREPREFS (SR619): the declare's own text `<name> x=.. y=.. z=..[ dialect=..]` (the said word's
+    /// tail), the value kept in Principia's `comscan.machine` and parsed back through [`declare_request`].
+    record: String,
 }
 
 /// `base` with its X / Y / Z travel declared (mm): an axis `base` has keeps its `min` and its feed / acceleration / rapid
@@ -1523,7 +1526,9 @@ impl PumpDesk {
     /// jog's bound, no relink; the controller's kept `read` still the tighter, SR602), the armings are dropped (their
     /// passes named the machine before, SR498) and said when there were any, and the declare is said back
     /// `machine declared <name> x=<x> y=<y> z=<z>[ dialect=<d>]`, then a kept read that differs, through [`PumpDesk::envelope_words`].
-    /// Per session: nothing keeps it past the pump (owed VUG-COMSCAN-MACHINE-DECLARE-PREFS).
+    /// VUGCOMSCANMACHINEDECLAREPREFS (SR619): kept past the pump in Principia's `comscan.machine` ([`declare_kept`]) and
+    /// read back once at [`serve_pump`]'s start ([`machine_from_prefs`]); a name holding `=` is refused (it would not parse
+    /// back through [`declare_request`]).
     fn declare(&mut self, ev: &PumpEvent) -> Vec<PumpEvent> {
         let PumpEvent::PumpDeclare { name, x, y, z, dialect, .. } = ev else { return Vec::new() };
         if self.busy() {
@@ -1531,6 +1536,9 @@ impl PumpDesk {
         }
         if name.is_empty() || name.chars().any(char::is_whitespace) {
             return refused(format!("declare: the machine name {name:?} is empty or holds a space"));
+        }
+        if name.contains('=') {
+            return refused(format!("declare: the machine name {name:?} holds '=' (it would not parse back)")); // VUGCOMSCANMACHINEDECLAREPREFS (SR619)
         }
         let travel = [*x, *y, *z];
         for (c, v) in ['x', 'y', 'z'].into_iter().zip(travel) {
@@ -1548,15 +1556,16 @@ impl PumpDesk {
         self.machine = declared_machine(&self.machine, travel);
         let dropped = self.armed.len();
         self.armed.clear();
-        self.declared = Some(Declared { name: name.clone(), dialect });
-        let mut word = format!("machine declared {name}");
+        let mut record = name.clone(); // VUGCOMSCANMACHINEDECLAREPREFS (SR619): the record first; the word is `machine declared <record>`
         for (c, v) in ['x', 'y', 'z'].into_iter().zip(travel) {
-            word.push_str(&format!(" {c}="));
-            make_core::gcode::num(&mut word, v);
+            record.push_str(&format!(" {c}="));
+            make_core::gcode::num(&mut record, v);
         }
         if let Some(d) = dialect {
-            word.push_str(&format!(" dialect={}", dialect_word(d)));
+            record.push_str(&format!(" dialect={}", dialect_word(d)));
         }
+        let word = format!("machine declared {record}");
+        self.declared = Some(Declared { name: name.clone(), dialect, record });
         let mut out = vec![self.squawk(Some(word))];
         if dropped > 0 {
             out.push(self.squawk(Some(format!("armed dropped: {dropped} (passed for the machine before)"))));
@@ -1730,6 +1739,74 @@ impl PumpDesk {
         self.told = Some(now);
         Some(PumpEvent::PumpEnvelope { declared: now.declared, read: now.read, position: now.position })
     }
+}
+
+// --- VUGCOMSCANMACHINEDECLAREPREFS (LEDGER SR619): the declared machine kept in Principia's store across a pump restart (named tail hunk) ---
+
+/// How long [`serve_pump`]'s start waits for Principia's answer to the one `comscan.machine` PrefGet; no answer in time
+/// (no Principia on the bus) is silence: the desk stays undeclared, as before SR619.
+pub const PREFS_WAIT: Duration = Duration::from_millis(250);
+
+impl PumpDesk {
+    /// The declared machine's record, the declare's own text `<name> x=.. y=.. z=..[ dialect=..]` (`None`: nothing
+    /// declared): the value [`declare_kept`] writes to Principia's `comscan.machine`.
+    pub fn declared_record(&self) -> Option<&str> {
+        self.declared.as_ref().map(|d| d.record.as_str())
+    }
+
+    /// The machine Principia's store kept (`record`, the declare's own text) declared again through the ONE parser
+    /// ([`declare_request`]) and the ONE validator ([`PumpDesk::declare`]); the first word or the refusal is said with
+    /// ` (from prefs)`. Nothing is written back.
+    pub fn declare_from_prefs(&mut self, record: &str) -> Vec<PumpEvent> {
+        let ev = match declare_request(&format!("machine declare {record}"), bandy::Origin::System("principia".to_string())) {
+            Ok(ev) => ev,
+            Err(why) => return refused(format!("{why} (from prefs)")),
+        };
+        let mut out = self.declare(&ev);
+        if let Some(PumpEvent::Squawk { event: Some(w), .. } | PumpEvent::PumpRefused { why: w }) = out.first_mut() {
+            w.push_str(" (from prefs)");
+        }
+        out
+    }
+}
+
+/// [`serve_pump`]'s start: ask Principia ONCE for `comscan.machine` on its own subscriber (so the loop's receiver keeps
+/// every bus request, served after this read), wait at most [`PREFS_WAIT`] for the answer, and declare a kept record
+/// ([`PumpDesk::declare_from_prefs`]), its words on the bus. Unset, not a string or unanswered: silent, undeclared.
+/// Never re-read after (PrefChanged is not heard).
+async fn machine_from_prefs(synapse: &Synapse, desk: &Arc<Mutex<PumpDesk>>) {
+    let mut rx = synapse.subscribe();
+    synapse.fire(SMessage::Principia(bandy::PrincipiaCommand::PrefGet { ns: "comscan".to_string(), key: "machine".to_string() }));
+    let answer = tokio::time::timeout(PREFS_WAIT, async {
+        loop {
+            match rx.recv().await {
+                Ok(SMessage::Principia(bandy::PrincipiaCommand::PrefValueIs { ns, key, value })) if ns == "comscan" && key == "machine" => {
+                    return value;
+                }
+                Ok(_) | Err(RecvError::Lagged(_)) => continue,
+                Err(RecvError::Closed) => return None,
+            }
+        }
+    })
+    .await;
+    let Ok(Some(bandy::PrefValue::Str(record))) = answer else { return };
+    let out = match desk.lock() {
+        Ok(mut d) => d.declare_from_prefs(&record),
+        Err(_) => return,
+    };
+    for o in out {
+        synapse.fire(SMessage::Pump(o));
+    }
+}
+
+/// [`serve_pump`]'s request arm: a PumpDeclare the desk accepted (no PumpRefused in its answers) is written to
+/// Principia's store as `comscan.machine` = the declared record, so the next pump start reads it back.
+fn declare_kept(synapse: &Synapse, desk: &Mutex<PumpDesk>, ev: &PumpEvent, out: &[PumpEvent]) {
+    if !matches!(ev, PumpEvent::PumpDeclare { .. }) || out.iter().any(|o| matches!(o, PumpEvent::PumpRefused { .. })) {
+        return;
+    }
+    let Some(record) = desk.lock().ok().and_then(|d| d.declared_record().map(str::to_string)) else { return };
+    synapse.fire(SMessage::Principia(bandy::PrincipiaCommand::PrefSet { ns: "comscan".to_string(), key: "machine".to_string(), value: bandy::PrefValue::Str(record) }));
 }
 
 #[cfg(test)]
