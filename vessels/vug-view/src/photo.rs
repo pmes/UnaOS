@@ -413,6 +413,7 @@ pub fn key(view: &mut View, k: &str) -> Option<bool> {
             ph.focus = next;
             Some(changed)
         }
+        "r" | "R" if line_free(view) => Some(crop_arm(view)), // VUGFACEPHOTOCROPKEYPREF (SR645): the crop key, the arm `:crop` takes (line_free: the `:` line's gate)
         _ if is_enter(k) => focused.map(|i| accept(view, i)),
         _ if is_back(k) => {
             let i = focused?;
@@ -1788,6 +1789,7 @@ pub struct Crop {
 const CROP_HINT: &str = "crop: drag a rectangle on the photo, Return keeps it, Esc cancels";
 
 /// `:crop` on the photo's line: arms the drag (a rectangle already dragged is dropped).
+/// VUGFACEPHOTOCROPKEYPREF (SR645): `:crop` on the photo's line, or the `r` key ([`key`], under [`line_free`]).
 fn crop_arm(view: &mut View) -> bool {
     let Some(ph) = view.photo.as_mut() else { return false };
     let source = ph.crop.source.take();
