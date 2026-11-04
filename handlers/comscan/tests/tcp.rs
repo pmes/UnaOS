@@ -872,7 +872,7 @@ async fn serve_pump_leaves_the_worker_free_while_an_open_sleeps() {
 
 // --- VUGCOMSCANJOG (SR573): home and jog on the running link; a Marlin jog is G91 / G0 / G90 in order; the commission's own word ---
 
-use pump_core::pump::{home_lines, jog_lines};
+use pump_core::pump::{Modal, home_lines, jog_lines}; // VUGCOMSCANMARLINJOGMODAL (SR664): + Modal
 
 /// The `Commissioned { port, name }` words in `out`.
 fn commissioned(out: &[PumpEvent]) -> Vec<(String, String)> {
@@ -925,10 +925,10 @@ fn a_marlin_jog_is_g91_g0_g90_in_order_and_home_is_g28() {
     assert_eq!(home_lines(Dialect::Grbl { laser: true }), s(&["$H"]));
     assert_eq!(home_lines(Dialect::Marlin), s(&["G28"]));
     assert_eq!(home_lines(Dialect::LinuxCnc), None);
-    assert_eq!(jog_lines(GRBL, [1.0, -2.0, 0.5], 600.0), s(&["$J=G91 X1 Y-2 Z0.5 F600"]));
-    assert_eq!(jog_lines(Dialect::Marlin, [1.0, -2.0, 0.5], 600.0), s(&["G91", "G0 X1 Y-2 Z0.5 F600", "G90"]));
-    assert_eq!(jog_lines(GRBL, [0.00004, 0.0, -0.0], 1.25), s(&["$J=G91 X0 Y0 Z0 F1.25"]), "make_core's number grammar");
-    assert_eq!(jog_lines(Dialect::LinuxCnc, [1.0, 0.0, 0.0], 100.0), None);
+    assert_eq!(jog_lines(GRBL, [1.0, -2.0, 0.5], 600.0, Modal::default()), s(&["$J=G91 X1 Y-2 Z0.5 F600"]));
+    assert_eq!(jog_lines(Dialect::Marlin, [1.0, -2.0, 0.5], 600.0, Modal::default()), s(&["G91", "G0 X1 Y-2 Z0.5 F600", "G90"]));
+    assert_eq!(jog_lines(GRBL, [0.00004, 0.0, -0.0], 1.25, Modal::default()), s(&["$J=G91 X0 Y0 Z0 F1.25"]), "make_core's number grammar");
+    assert_eq!(jog_lines(Dialect::LinuxCnc, [1.0, 0.0, 0.0], 100.0, Modal::default()), None);
 
     let who = || Origin::LocalUser("una".to_string());
     let (l, port) = listener();
@@ -1479,4 +1479,54 @@ fn a_restart_after_autoreport_on_asks_no_second_m154() {
     drop(desk); // the desk's close: the carried on turns the report off
     let got = fake.join().unwrap();
     assert_eq!(got.iter().filter(|l| l.starts_with("M154")).collect::<Vec<_>>(), ["M154 S1", "M154 S0"], "one ask, one off: {got:?}");
+}
+
+// --- VUGCOMSCANMARLINJOGMODAL (SR664): a jog says mm under an inch run and closes with the run's own words ---
+
+#[test]
+fn a_jog_after_an_inch_run_says_mm_and_gives_the_units_back() {
+    let s = |v: &[&str]| -> Option<Vec<String>> { Some(v.iter().map(|x| x.to_string()).collect()) };
+    let modal = |d: Dialect, text: &str| Modal::of(d, &text.lines().map(str::to_string).collect::<Vec<_>>());
+    let inch = modal(GRBL, "G20 G90 G17 G94");
+    assert_eq!(jog_lines(GRBL, [1.0, 0.0, 0.0], 600.0, inch), s(&["$J=G21 G91 X1 Y0 Z0 F600"]), "grbl's jog-local G21");
+    assert_eq!(jog_lines(GRBL, [1.0, 0.0, 0.0], 600.0, modal(GRBL, "G21 G90")), s(&["$J=G91 X1 Y0 Z0 F600"]), "mm: unchanged");
+    let rel = modal(Dialect::Marlin, "G21\nG91\nG0 X1");
+    assert_eq!(jog_lines(Dialect::Marlin, [1.0, 0.0, 0.0], 600.0, rel), s(&["G91", "G0 X1 Y0 Z0 F600", "G91"]), "a relative run stays relative");
+
+    let who = || Origin::LocalUser("una".to_string());
+    let (l, port) = listener();
+    let fake = fake_marlin(l);
+    let mut p = program();
+    p.units = Units::Inch;
+    let lines = Pump::from_program(&p, Dialect::Marlin).unwrap().lines().to_vec();
+    assert_eq!(lines[0], "G20", "make_core says the inch run's units first");
+    let mut desk = PumpDesk::new(machine());
+    let mut open = by_scheme(no_serial(), opener(Duration::from_millis(500)));
+    let pass = Verdict::Pass { digest: p.digest(), machine: machine().digest() };
+    let digest = desk.arm(&pass, &p, Dialect::Marlin).expect("armed by a pass");
+    let start = PumpEvent::PumpStart {
+        principal: who(),
+        program: digest_hex(digest),
+        dialect: "marlin".to_string(),
+        port: format!("{TCP_SCHEME}127.0.0.1:{port}"),
+    };
+    let out = desk.apply(&start, &mut *open);
+    assert!(matches!(&out[..], [PumpEvent::Squawk { event: Some(e), .. }] if e == "started"), "{out:?}");
+    let t0 = Instant::now();
+    let mut words = Vec::new();
+    assert_eq!(word_of(drive_until(&mut desk, &mut *open, t0, &mut words, |e| e == "done" || e.starts_with("link lost"))), "done");
+
+    let jog = PumpEvent::PumpJog { principal: who(), dx: 1.0, dy: 0.0, dz: 0.0, feed: 600.0 };
+    let out = desk.apply(&jog, &mut *open);
+    assert_eq!(
+        squawk_words(&out),
+        ["jog bound=distance: no position report yet", "jog sent: G21 / G91 / G0 X1 Y0 Z0 F600 / G90 / G20"],
+        "{out:?}"
+    );
+    assert_eq!(word_of(drive_until(&mut desk, &mut *open, t0, &mut words, |e| e.starts_with("jog"))), "jog ok");
+    drop(desk);
+    let got: Vec<String> = fake.join().unwrap().into_iter().filter(|l| l != "M114").collect();
+    let mut want = lines;
+    want.extend(["G21", "G91", "G0 X1 Y0 Z0 F600", "G90", "G20"].iter().map(|x| x.to_string()));
+    assert_eq!(got, want, "the inch program, then the jog in mm bracketed by the run's own units");
 }

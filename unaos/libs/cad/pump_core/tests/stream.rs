@@ -582,3 +582,48 @@ fn a_resume_restores_the_tool_state_set_before_its_line() {
     let p = Pump::new(Dialect::Marlin, text).unwrap().resume_at(2).unwrap();
     assert_eq!(p.lines().to_vec(), with_prefix(&lines, 1, &["M109 T1 S210"]));
 }
+
+// --- VUGCOMSCANMARLINJOGMODAL (SR664): a jog reads the run's units and distance from the lines the pump sent ---
+
+use pump_core::pump::{Modal, jog_lines};
+
+#[test]
+fn a_jog_restores_the_runs_distance_and_says_mm_under_g20() {
+    let s = |v: &[&str]| -> Option<Vec<String>> { Some(v.iter().map(|x| x.to_string()).collect()) };
+    let text = "G20\nG91\nG1 X1 F100\nG90\nG1 X2\n";
+    let fresh = Pump::new(Dialect::Marlin, text).unwrap();
+    assert_eq!(fresh.sent_modal(), Modal::default(), "nothing sent, nothing recorded");
+    assert_eq!(
+        jog_lines(Dialect::Marlin, [1.0, 0.0, 0.0], 600.0, fresh.sent_modal()),
+        s(&["G91", "G0 X1 Y0 Z0 F600", "G90"]),
+        "no run: the board's default G90, the old three lines"
+    );
+
+    // Halted at line 3 (a resend): the board ran G20 / G91 / the move and never saw the G90.
+    let mut t = Marlin { got: Vec::new(), out: Vec::new(), max_outstanding: 0, pending: 0, resend_at: Some(3) };
+    let mut p = Pump::new(Dialect::Marlin, text).unwrap();
+    drive(&mut p, &mut t, 100, |_| false);
+    assert_eq!(p.state(), PumpState::Halted(Halt::Refused { line: 3 }));
+    let m = p.sent_modal();
+    assert_eq!((m.units(), m.distance()), (Some("G20"), Some("G91")), "only the lines sent count");
+    assert_eq!(
+        jog_lines(Dialect::Marlin, [1.0, -2.0, 0.5], 600.0, m),
+        s(&["G21", "G91", "G0 X1 Y-2 Z0.5 F600", "G91", "G20"]),
+        "mm for the jog, the run's relative mode and inches after"
+    );
+    assert_eq!(jog_lines(GRBL, [1.0, 0.0, 0.0], 600.0, Modal::of(GRBL, p.lines())), s(&["$J=G21 G91 X1 Y0 Z0 F600"]));
+
+    // Run to Done: the G90 after the move is the run's last distance word.
+    let mut t = Marlin { got: Vec::new(), out: Vec::new(), max_outstanding: 0, pending: 0, resend_at: None };
+    let mut p = Pump::new(Dialect::Marlin, text).unwrap();
+    let ev = drive(&mut p, &mut t, 100, |e| e.contains(&Event::Done));
+    assert!(ev.contains(&Event::Done));
+    let m = p.sent_modal();
+    assert_eq!((m.units(), m.distance()), (Some("G20"), Some("G90")));
+    assert_eq!(
+        jog_lines(Dialect::Marlin, [1.0, 0.0, 0.0], 600.0, m),
+        s(&["G21", "G91", "G0 X1 Y0 Z0 F600", "G90", "G20"])
+    );
+    let mm = Modal::of(GRBL, &[String::from("G21 G90")]);
+    assert_eq!(jog_lines(GRBL, [1.0, 0.0, 0.0], 600.0, mm), s(&["$J=G91 X1 Y0 Z0 F600"]), "mm: the jog line unchanged");
+}

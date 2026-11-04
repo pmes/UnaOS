@@ -1206,7 +1206,7 @@ impl PumpDesk {
                     return refused("jog: no axis moves");
                 }
                 if let Some(why) = jog_past_travel(&self.machine, self.read, self.pos.at, [*dx, *dy, *dz]) { return refused(why); } // VUGCOMSCANALARMRESET (SR585): VUG-COMSCAN-JOG-ENVELOPE; VUGCOMSCANENVELOPEBOUND (SR602): + the kept read
-                ("jog", pump_core::pump::jog_lines(d, [*dx, *dy, *dz], *feed))
+                ("jog", pump_core::pump::jog_lines(d, [*dx, *dy, *dz], *feed, r.pump.sent_modal())) // VUGCOMSCANMARLINJOGMODAL (SR664): the run's units and distance words, from the lines the pump sent
             }
             _ => return Vec::new(),
         };
