@@ -850,7 +850,7 @@ pub fn program_name(path: &str) -> &str {
 /// change at all. Late or early, the operator reads the program's name.
 pub fn app_name_arm(owner: u64, path: &str) -> bool {
     let name = program_name(path).as_bytes();
-    if owner == 0 || name.is_empty() {
+    if owner == 0 || name.is_empty() || armlate_foreign(owner, true) { // ARMLATE-SECOND-TENANT (B1192): a late arm from a task that did not mint the row's CURRENT tenant is refused before it writes (file tail) — ⚠ LINE-NEUTRAL fold
         return false;
     }
     { app_path_arm(owner, path); } let len = name.len().min(MAX_TITLE); // BUSREG-TAG-PATH (B1163): the path beside the name (file tail); ARMLATE-KNOBOFF (B1184): every build, the late arm's stamp rides it — ⚠ LINE-NEUTRAL fold
@@ -26935,7 +26935,7 @@ fn wintitle_selftest() {
     close(wl);
     app_name_forget(ASID_T); let stale_ok = wintitle_stale_leg(ASID_T, sa, len); // ARMLATE-ADOPT (B1188): the stale-owner leg (a back-dated mint note, a late arm over an open Unnamed window; body at this file's tail) — ⚠ LINE-NEUTRAL fold
 
-    let ok = pn_ok
+    armlate_secondtenant_leg(); let ok = pn_ok // ARMLATE-SECOND-TENANT (B1192): the two-tenant leg prints its own line (file tail) — ⚠ LINE-NEUTRAL fold
         && doc_ok
         && label_ok
         && prog_ok
@@ -33736,7 +33736,7 @@ static APP_PATHS: Mutex<alloc::vec::Vec<(u64, u64, alloc::string::String)>> = Mu
 /// BUSREG-TAG-PATH — record the path `owner`'s image was loaded from (absolute only; else clear the row).
 // ARMLATE-KNOBOFF (B1184): every build (the late-arm stamp rides this store)
 fn app_path_arm(owner: u64, path: &str) {
-    if owner == 0 {
+    if owner == 0 || armlate_foreign(owner, false) { // ARMLATE-SECOND-TENANT (B1192): a foreign late arm writes no path either (`app_name_arm_launch`'s second path arm; file tail)
         return;
     }
     let rg = armlate_stamp(owner); let mut t = APP_PATHS.lock(); // ARMFORGET-LATEARM (B1178): the stamp is taken before the leaf (file tail)
@@ -33891,7 +33891,7 @@ pub fn app_records_teardown(owner: u64) {
 // =================================================================================================
 /// One mint note per owner: (owner, the row's generation at its latest mint).
 #[cfg(any(target_arch = "x86_64", feature = "aarch64_el0"))] // ARMLATE-KNOBOFF (B1184): every build with an arch generation
-static APP_MINTS: Mutex<alloc::vec::Vec<(u64, u64)>> = Mutex::new(alloc::vec::Vec::new());
+static APP_MINTS: Mutex<alloc::vec::Vec<(u64, u64, u64)>> = Mutex::new(alloc::vec::Vec::new()); // ARMLATE-SECOND-TENANT (B1192): (owner, gen, the minting task)
 
 /// ARMFORGET-LATEARM — set (`Some(gen)`) or clear (`None`) `owner`'s mint note; returns the previous one (the
 /// witness restores it). Called by the arch spawn body at every mint (ARMLATE-KNOBOFF B1184, every build).
@@ -33904,7 +33904,7 @@ pub fn app_mint_note(owner: u64, rg: Option<u64>) -> Option<u64> {
     let prev = t.iter().find(|e| e.0 == owner).map(|e| e.1);
     t.retain(|e| e.0 != owner);
     if let Some(g) = rg {
-        t.push((owner, g));
+        t.push((owner, g, armlate_me())); // ARMLATE-SECOND-TENANT (B1192): the minter rides the note (file tail)
     }
     prev
 }
@@ -34011,4 +34011,100 @@ fn wintitle_stale_word(v: Option<bool>) -> &'static str {
         Some(false) => "adopted",
         None => "skip",
     }
+}
+
+// ARMLATE-SECOND-TENANT (rmbp-ledger B1192) — TAIL-APPENDED, every build with an arch generation.
+// ARMFORGET-LATEARM (B1178) stamps a late arm with the row's mint generation, so a launcher arming after its child's
+// teardown is stale. A SECOND tenant minted into the row inside that window takes its own mint's note, and the first
+// launcher's late arm then compared equal and re-named (and, through B1163's path rule, re-pathed) the wrong tenant.
+// The handle carries no generation (it is the slot/ASID index every launcher also indexes with), and a row-keyed
+// table holds only the latest mint (that is [`APP_MINTS`]). What tells the two arms apart is the launcher's TASK:
+// every launcher spawns and late-arms on one task, synchronously, so the task that minted the row's CURRENT tenant
+// is the only one whose late arm belongs to it. The mint note carries its minter ([`app_mint_note`]), and a late arm
+// from any other task while the note is at the row's current generation is refused before it writes anything (no
+// name, no path, no adopt). B1178's case (note older than the row) and never-minted owners are unchanged; fixture
+// back-dates from the test task are minted and armed by that task, so they read as their own.
+// Witness: `tests wm` → `:: WINTITLE-SECONDTENANT: … -> PASS ::`; `tests bandy3` → BUSREG-ARMLATE `secondtenant=closed`.
+// LOCK ORDER: APP_MINTS stays a leaf — copied out and dropped before any print; callers hold no lock at the guard.
+// =================================================================================================
+/// ARMLATE-SECOND-TENANT — the task this code runs on (0 outside a scheduled task: the boot core's sequential launches).
+#[cfg(any(target_arch = "x86_64", feature = "aarch64_el0"))]
+fn armlate_me() -> u64 {
+    crate::arch::sched::current_id().unwrap_or(0)
+}
+
+/// ARMLATE-SECOND-TENANT — is a late arm of `owner` from this task FOREIGN (the row's current tenant was minted by
+/// another task)? `say` prints the refusal (once per arm: the name road says it, the path road does not).
+#[cfg(any(target_arch = "x86_64", feature = "aarch64_el0"))]
+fn armlate_foreign(owner: u64, say: bool) -> bool {
+    if owner == 0 {
+        return false;
+    }
+    let now = armlate_now(owner);
+    let me = armlate_me();
+    let note = APP_MINTS.lock().iter().find(|e| e.0 == owner).map(|e| (e.1, e.2));
+    match note {
+        Some((g, by)) if g == now && by != me => {
+            if say {
+                serial_println!("[wm] late-arm refused owner={} gen={} minter={} by={} (the row's tenant was minted by another launcher)", owner, g, by, me);
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+/// ARMLATE-SECOND-TENANT — a build with no arch generation has no mint note: nothing is foreign.
+#[cfg(not(any(target_arch = "x86_64", feature = "aarch64_el0")))]
+fn armlate_foreign(_owner: u64, _say: bool) -> bool {
+    false
+}
+
+/// ARMLATE-SECOND-TENANT — witness only: rewrite `owner`'s mint note's minter (stands in for "another launcher
+/// minted this tenant", which one fixture task cannot be). No note, no change.
+#[cfg(any(target_arch = "x86_64", feature = "aarch64_el0"))]
+pub fn app_mint_minter_set(owner: u64, minter: u64) {
+    if let Some(e) = APP_MINTS.lock().iter_mut().find(|e| e.0 == owner) {
+        e.2 = minter;
+    }
+}
+
+/// ARMLATE-SECOND-TENANT — `tests wm`' two-tenant leg on a scratch owner beyond every row: the second tenant is minted
+/// by this task and its own late arm is live; then the note's minter is made another task's (this task now plays the
+/// first tenant's launcher) and its late arm, name and path, is refused with the second tenant's record kept.
+#[cfg(any(target_arch = "x86_64", feature = "aarch64_el0"))]
+fn armlate_secondtenant_leg() {
+    const O: u64 = u64::MAX - 0x5F5; // beyond every row on both arches (`slot_gen` answers u64::MAX)
+    const _: () = assert!(!is_kernel_owner(O));
+    if app_name_armed(O) {
+        serial_println!(":: WINTITLE-SECONDTENANT: SKIP (scratch owner carries a name) ::");
+        return;
+    }
+    let prev = app_mint_note(O, Some(armlate_now(O)));
+    let live = app_name_arm(O, "/apps/VUG.ELF");
+    app_mint_minter_set(O, u64::MAX);
+    let refused = !app_name_arm(O, "/apps/PREFS.ELF");
+    app_path_arm(O, "/apps/PREFS.ELF");
+    let mut nb = [0u8; MAX_TITLE];
+    let n = app_name_of(O, &mut nb);
+    let name_kept = nb[..n] == *b"VUG";
+    let path_kept = app_path_with(O, |p| p == "/apps/VUG.ELF") == Some(true);
+    app_name_forget(O);
+    let _ = app_mint_note(O, prev);
+    let ok = live && refused && name_kept && path_kept;
+    serial_println!(
+        ":: WINTITLE-SECONDTENANT: live={} foreign={} name={} path={} secondtenant={} -> {} ::",
+        if live { "armed" } else { "NOT-ARMED" },
+        if refused { "refused" } else { "ARMED" },
+        if name_kept { "kept" } else { "LOST" },
+        if path_kept { "kept" } else { "LOST" },
+        if ok { "closed" } else { "OPEN" },
+        if ok { "PASS" } else { "FAIL" }
+    );
+}
+
+/// ARMLATE-SECOND-TENANT — a build with no arch generation has no mint note to test.
+#[cfg(not(any(target_arch = "x86_64", feature = "aarch64_el0")))]
+fn armlate_secondtenant_leg() {
+    serial_println!(":: WINTITLE-SECONDTENANT: SKIP (no arch generation on this image) ::");
 }
