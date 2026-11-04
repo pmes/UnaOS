@@ -33893,20 +33893,12 @@ pub fn app_records_teardown(owner: u64) {
 #[cfg(any(target_arch = "x86_64", feature = "aarch64_el0"))] // ARMLATE-KNOBOFF (B1184): every build with an arch generation
 static APP_MINTS: Mutex<alloc::vec::Vec<(u64, u64, u64)>> = Mutex::new(alloc::vec::Vec::new()); // ARMLATE-SECOND-TENANT (B1192): (owner, gen, the minting task)
 
-/// ARMFORGET-LATEARM — set (`Some(gen)`) or clear (`None`) `owner`'s mint note; returns the previous one (the
-/// witness restores it). Called by the arch spawn body at every mint (ARMLATE-KNOBOFF B1184, every build).
+/// ARMFORGET-LATEARM — set (`Some(gen)`) or clear (`None`) `owner`'s mint note; returns the previous one WHOLE, (gen,
+/// minter) (ARMLATE-RESTORE-MINTER B1206: a witness restores it through [`app_mint_restore`], never through this fn).
+/// Called by the arch spawn body at every mint (ARMLATE-KNOBOFF B1184, every build).
 #[cfg(any(target_arch = "x86_64", feature = "aarch64_el0"))] // ARMLATE-KNOBOFF (B1184)
-pub fn app_mint_note(owner: u64, rg: Option<u64>) -> Option<u64> {
-    if owner == 0 {
-        return None;
-    }
-    let mut t = APP_MINTS.lock();
-    let prev = t.iter().find(|e| e.0 == owner).map(|e| e.1);
-    t.retain(|e| e.0 != owner);
-    if let Some(g) = rg {
-        t.push((owner, g, armlate_me())); // ARMLATE-SECOND-TENANT (B1192): the minter rides the note (file tail)
-    }
-    prev
+pub fn app_mint_note(owner: u64, rg: Option<u64>) -> Option<(u64, u64)> {
+    app_mint_restore(owner, rg.map(|g| (g, armlate_me()))) // ARMLATE-RESTORE-MINTER (B1206): a mint is a note minted by THIS task (ARMLATE-SECOND-TENANT B1192: the minter rides the note); the ONE body is at the file tail
 }
 
 /// ARMFORGET-LATEARM — the CURRENT generation of `owner`'s row (the row is [`owner_of_launch`]'s inverse: x86
@@ -33993,7 +33985,7 @@ fn wintitle_stale_leg(owner: u64, sa: usize, len: usize) -> Option<bool> {
     };
     close(w);
     app_name_forget(owner);
-    app_mint_note(owner, prev);
+    app_mint_restore(owner, prev); // ARMLATE-RESTORE-MINTER (B1206): the note back whole
     res
 }
 
@@ -34090,7 +34082,7 @@ fn armlate_secondtenant_leg() {
     let name_kept = nb[..n] == *b"VUG";
     let path_kept = app_path_with(O, |p| p == "/apps/VUG.ELF") == Some(true);
     app_name_forget(O);
-    let _ = app_mint_note(O, prev);
+    let _ = app_mint_restore(O, prev); // ARMLATE-RESTORE-MINTER (B1206): the note back whole
     let ok = live && refused && name_kept && path_kept;
     serial_println!(
         ":: WINTITLE-SECONDTENANT: live={} foreign={} name={} path={} secondtenant={} -> {} ::",
@@ -34107,4 +34099,30 @@ fn armlate_secondtenant_leg() {
 #[cfg(not(any(target_arch = "x86_64", feature = "aarch64_el0")))]
 fn armlate_secondtenant_leg() {
     serial_println!(":: WINTITLE-SECONDTENANT: SKIP (no arch generation on this image) ::");
+}
+
+// =================================================================================================
+// ARMLATE-RESTORE-MINTER (rmbp-ledger B1206) — TAIL-APPENDED, every build with an arch generation. ARMLATE-SECOND-TENANT
+// (B1192) put the minting task in the mint note, but [`app_mint_note`] returned only the previous GEN, so every witness
+// that plants a scratch note and restores it (`app_mint_note(owner, prev)`) re-pushed the gen with the TEST TASK as
+// minter: a real row's minter was overwritten by a scratch restore until the next real mint. The previous note now
+// returns whole, (gen, minter), and this fn puts a note back VERBATIM; it is the ONE body of the APP_MINTS write
+// ([`app_mint_note`] is this with a note minted by the current task). Witness: `tests bandy3` → BUSREG-ARMLATE
+// `minter=kept` (bus_route `armlate_selftest` L4).
+// LOCK ORDER: APP_MINTS stays a leaf — taken once and dropped before return; the minter is read by the caller first.
+// =================================================================================================
+/// ARMLATE-RESTORE-MINTER — set (`Some((gen, minter))`, verbatim) or clear (`None`) `owner`'s mint note; returns the
+/// previous one whole.
+#[cfg(any(target_arch = "x86_64", feature = "aarch64_el0"))]
+pub fn app_mint_restore(owner: u64, note: Option<(u64, u64)>) -> Option<(u64, u64)> {
+    if owner == 0 {
+        return None;
+    }
+    let mut t = APP_MINTS.lock();
+    let prev = t.iter().find(|e| e.0 == owner).map(|e| (e.1, e.2));
+    t.retain(|e| e.0 != owner);
+    if let Some((g, m)) = note {
+        t.push((owner, g, m));
+    }
+    prev
 }

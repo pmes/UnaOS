@@ -1265,17 +1265,31 @@ fn armlate_selftest(fx: &Fixture) {
     if other && refused && kept {
         w |= 1 << 2;
     }
+    // L4 ARMLATE-RESTORE-MINTER (B1206): a REAL row minted by a known other launcher `K`, then a scratch plant one
+    // generation back and its restore: the plant hands back the note whole and the restore puts `K` back, so the
+    // discriminator still refuses this task's arm at the current generation (go-red with a gen-only restore: the
+    // minter becomes this task, the arm is taken, `minter=LOST`).
+    const K: u64 = u64::MAX - 1; // never a live task id
+    let _ = crate::video::wm::app_mint_note(owner_f, Some(rg));
+    crate::video::wm::app_mint_minter_set(owner_f, K);
+    let inner = crate::video::wm::app_mint_note(owner_f, Some(rg.wrapping_sub(1)));
+    let _ = crate::video::wm::app_mint_restore(owner_f, inner);
+    let minter_kept = inner == Some((rg, K)) && !crate::video::wm::app_name_arm(owner_f, "/apps/PREFS.ELF");
+    if minter_kept {
+        w |= 1 << 3;
+    }
     crate::video::wm::app_name_forget(owner_f);
-    let _ = crate::video::wm::app_mint_note(owner_f, prev);
-    const ALL: u32 = (1 << 3) - 1;
+    let _ = crate::video::wm::app_mint_restore(owner_f, prev); // ARMLATE-RESTORE-MINTER (B1206): the note back whole, gen and minter
+    const ALL: u32 = (1 << 4) - 1;
     if w == ALL {
-        serial_println!(":: BUSREG-ARMLATE: late=stale-dropped rearm=fulfiller secondtenant=closed -> PASS ::");
+        serial_println!(":: BUSREG-ARMLATE: late=stale-dropped rearm=fulfiller secondtenant=closed minter=kept -> PASS ::");
     } else {
         serial_println!(
-            ":: BUSREG-ARMLATE: late={} rearm={} secondtenant={} w={:#x}/{:#x} -> FAIL ::",
+            ":: BUSREG-ARMLATE: late={} rearm={} secondtenant={} minter={} w={:#x}/{:#x} -> FAIL ::",
             if w & 1 != 0 { "stale-dropped" } else { "KEPT" },
             if w & 2 != 0 { "fulfiller" } else { "NOT-FULFILLER" },
             if w & 4 != 0 { "closed" } else { "OPEN" },
+            if w & 8 != 0 { "kept" } else { "LOST" },
             w, ALL
         );
     }
@@ -1418,7 +1432,7 @@ fn unsetrelay_selftest(fx: &Fixture) {
     (fx.clear)(f);
     on_exit(fx.ops, a);
     crate::video::wm::app_name_forget(owner_f);
-    let _ = crate::video::wm::app_mint_note(owner_f, prev);
+    let _ = crate::video::wm::app_mint_restore(owner_f, prev); // ARMLATE-RESTORE-MINTER (B1206): the note back whole, gen and minter
     const ALL: u32 = (1 << 4) - 1;
     let p = crate::prefs_client::unset_relay_legs();
     match p {
