@@ -73,7 +73,7 @@ fn shapes_accept_the_round_diameter_and_refuse_a_wrong_one() {
         v => panic!("d=80 refused: {:?}", v),
     }
     match verify(&d, &p("diameter i1 sketch=s circle=c1 d=70"), &m, d.tol) {
-        Verdict::Refuse { why: Reason::Residual { max_mm, limit_mm } } => {
+        Verdict::Refuse { why: Reason::Residual { max_mm, limit_mm, .. } } => {
             assert!((max_mm - 4.74).abs() < 1e-6, "max {}", max_mm);
             assert!((limit_mm - 0.9).abs() < 1e-12);
         }
@@ -634,7 +634,7 @@ fn a_thickness_accepts_the_measured_extrude_and_refuses_one_2mm_off() {
     }
     // The outline is the same either way: only the thickness tells 12 from 10.
     match verify(&d, &p("extrude e1 sketch=s outer=l1 dir=[0 0 1] length=12"), &m, d.tol) {
-        Verdict::Refuse { why: Reason::Residual { max_mm, limit_mm } } => {
+        Verdict::Refuse { why: Reason::Residual { max_mm, limit_mm, .. } } => {
             assert!((max_mm - 2.0).abs() < 1e-6, "max {max_mm}");
             assert!((limit_mm - 3.0 * SIGMA).abs() < 1e-12, "limit {limit_mm}");
         }
@@ -651,4 +651,24 @@ fn a_thickness_with_no_solid_is_unmatched_and_tabled() {
         v => panic!("no solid not unmatched: {v:?}"),
     }
     assert_eq!(measurements_text(&m), "thickness: mm=10 sigma=0.3 along=(0,0,1)\n");
+}
+
+// ---- VUGINTENTUNDOSET (SR563): a Residual names the measurement term of its max ----
+
+#[test]
+fn a_residual_names_its_term() {
+    let d = plate_sketch();
+    match verify(&d, &p("extrude e1 sketch=s outer=l1 dir=[0 0 1] length=12"), &thickness(10.0), d.tol) {
+        Verdict::Refuse { why } => {
+            assert!(matches!(why, Reason::Residual { term: "thickness", .. }), "{why:?}");
+            assert!(why.text().ends_with(" term=thickness"), "{}", why.text());
+        }
+        v => panic!("length=12 not refused: {v:?}"),
+    }
+    let pt = brep_core::geom_core::Vec2::new;
+    let outline = Measurement::outline(vec![pt(0.0, 0.0), pt(80.0, 0.0), pt(80.0, 60.0), pt(0.0, 60.0)], SIGMA);
+    match verify(&d, &p("distance i1 sketch=s a=p1 b=p2 d=86"), &outline, d.tol) {
+        Verdict::Refuse { why } => assert!(matches!(why, Reason::Residual { term: "outline", .. }), "{why:?}"),
+        v => panic!("d=86 not refused: {v:?}"),
+    }
 }
