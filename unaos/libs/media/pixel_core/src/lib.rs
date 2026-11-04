@@ -29,6 +29,7 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+use alloc::string::String;
 use alloc::vec::Vec;
 
 pub mod anim;
@@ -75,7 +76,7 @@ pub struct Image {
     /// EXIF orientation tag (1..=8) found in the file, 1 when absent. It is REPORTED, not applied:
     /// call [`Image::apply_orientation`] to rotate/flip the pixels (a browser applies it by default,
     /// CSS `image-orientation: from-image`).
-    pub orientation: u8, pub icc: Option<Vec<u8>>, // PDFICC (SR358): `icc` is the embedded ICC profile as stored (PNG iCCP inflated, JPEG APP2 chunks joined in order, WebP ICCP), else None; REPORTED, not applied — `icc_core::apply_icc_to_srgb` converts
+    pub orientation: u8, pub icc: Option<Vec<u8>>, pub text: Vec<(String, String)>, // VUGPHOTOCROPMETA (SR582): `text` is the PNG tEXt pairs (keyword, value) in file order, Latin-1 read as chars, empty (no allocation) when the file has none. PDFICC (SR358): `icc` is the embedded ICC profile as stored (PNG iCCP inflated, JPEG APP2 chunks joined in order, WebP ICCP), else None; REPORTED, not applied — `icc_core::apply_icc_to_srgb` converts
 }
 
 /// Why a decode failed. Every variant names a distinct falsifiable claim about the input.
@@ -198,7 +199,7 @@ pub fn decode_webp(bytes: &[u8]) -> Result<Image, Error> {
 impl Image {
     /// A still image.
     pub(crate) fn still(width: u32, height: u32, rgba: Vec<u8>) -> Self {
-        Image { width, height, rgba, frames: None, loop_count: None, orientation: 1, icc: None }
+        Image { width, height, rgba, frames: None, loop_count: None, orientation: 1, icc: None, text: Vec::new() }
     }
 
     /// Rotate/flip the pixels (and every frame) so the image displays upright per its EXIF
@@ -413,6 +414,16 @@ impl Image {
     /// PDFICC (SR358): the same image carrying the embedded profile `icc` (see [`Image::icc`]).
     pub(crate) fn with_icc(mut self, icc: Option<Vec<u8>>) -> Self {
         self.icc = icc;
+        self
+    }
+}
+
+// ---- VUGPHOTOCROPMETA (SR582): the PNG text chunks on the decoded image (named block) ----
+
+impl Image {
+    /// VUGPHOTOCROPMETA (SR582): the same image carrying the file's tEXt pairs `text` (see [`Image::text`]).
+    pub(crate) fn with_text(mut self, text: Vec<(String, String)>) -> Self {
+        self.text = text;
         self
     }
 }

@@ -770,3 +770,40 @@ fn a_stored_camera_height_sets_the_side_camera_with_no_argument() {
     assert!(e.contains("NoCamera"), "{e}");
 }
 
+
+// ---- VUGPHOTOCROPMETA (SR582): the photo's command road writes the camera's datum ----
+
+/// VUGPHOTOCROPMETA (SR582): `camera 400` on the photo's command road writes `vug.photo.camera_mm` through Principia's
+/// PrefStore (the store reads 400 back) and the open photo takes it: the square-camera side photo then reads 6.0 within
+/// 0.1 with the corner `camera=400 mm set`; `pp 250 320` stores `250,320`; `camera x` is the usage, nothing stored.
+#[test]
+fn a_camera_line_writes_the_store_and_the_next_side_reads_it() {
+    use photo_core::fixture::{PART_H, PART_T, PART_W, Spec, side_raised_png};
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("vug-photo-command-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut vw = opened();
+    assert_eq!(photo::command_in(&mut vw.view, &dir, "camera 400"), Ok(true));
+    let stored = ph(&vw).note.clone().unwrap_or_default();
+    assert_eq!(stored, "pref camera=400 mm stored");
+    assert_eq!(photo::PhotoPrefs::load_from(&dir).camera_mm, Some(400.0));
+    assert_eq!(photo::command_in(&mut vw.view, &dir, "camera x"), Err(photo::PREF_USAGE.to_string()));
+
+    // The next side read takes the stored height.
+    let square = side_raised_png(&Spec::side_square(), PART_W, PART_T, PART_H);
+    photo::side(&mut vw.view, &square, "square.png").expect("the square photo measures with the stored camera height");
+    let mm = match &ph(&vw).thickness {
+        Some(doc_core::Measurement::Thickness { mm, .. }) => *mm,
+        t => panic!("no thickness held: {t:?}"),
+    };
+    let note = ph(&vw).note.as_deref().unwrap_or("").to_string();
+    eprintln!("photo: pref-face {stored} | {note}");
+    assert!((mm - PART_T).abs() < 0.1, "held {mm} vs {PART_T}");
+    assert!(note.contains("camera=400 mm set"), "{note}");
+
+    assert_eq!(photo::command_in(&mut vw.view, &dir, "pp 250 320"), Ok(true));
+    assert_eq!(ph(&vw).note.as_deref(), Some("pref pp=250,320 stored"));
+    let prefs = photo::PhotoPrefs::load_from(&dir);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(prefs, photo::PhotoPrefs { camera_mm: Some(400.0), principal_px: Some(Vec2::new(250.0, 320.0)) });
+    assert_eq!(ph(&vw).prefs, prefs);
+}

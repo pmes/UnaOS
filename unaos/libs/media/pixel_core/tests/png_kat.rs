@@ -111,3 +111,30 @@ fn unfilter_rows_five_types() {
     let mut d = vec![5u8; 10];
     assert!(matches!(unfilter_rows(3, 10, &mut d), Err(pixel_core::Error::Malformed("png filter type"))));
 }
+
+// ---- VUGPHOTOCROPMETA (SR582): the tEXt chunk round trip ----
+
+/// VUGPHOTOCROPMETA (SR582): `encode_rgba_text` writes each pair as a tEXt chunk right after IHDR (the first at byte 33,
+/// its type at 37) and the decoder surfaces them on `Image::text` in order, Latin-1 as chars, the pixels the plain
+/// encode's; a plain encode decodes with `text` empty; the pairs PNG cannot carry are `BadText`.
+#[test]
+fn text_chunk_round_trips() {
+    use pixel_core::png::encode::{PngError, encode_rgba, encode_rgba_text};
+    let (w, h) = (3u32, 2u32);
+    let rgba: Vec<u8> = (0..w * h * 4).map(|i| (i * 37) as u8).collect();
+    let pairs = [("vug:crop", "200,40,900,720"), ("Comment", "caf\u{e9}")];
+    let file = encode_rgba_text(w, h, &rgba, &pairs).expect("the pairs are Latin-1");
+    assert_eq!(&file[37..41], b"tEXt", "the first tEXt follows IHDR");
+    let img = pixel_core::decode(&file).expect("the file decodes");
+    let want: Vec<(String, String)> = pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+    assert_eq!(img.text, want);
+    let plain = pixel_core::decode(&encode_rgba(w, h, &rgba).unwrap()).unwrap();
+    assert_eq!(img.rgba, plain.rgba);
+    assert_eq!(img.rgba, rgba);
+    assert!(plain.text.is_empty());
+    eprintln!("png: text {:?} plain_text={}", img.text, plain.text.len());
+    let long = "k".repeat(80);
+    for bad in [("", "v"), (long.as_str(), "v"), (" key", "v"), ("key ", "v"), ("a  b", "v"), ("key", "a\0b"), ("key", "\u{263a}"), ("k\u{263a}", "v")] {
+        assert_eq!(encode_rgba_text(w, h, &rgba, &[bad]), Err(PngError::BadText), "{bad:?}");
+    }
+}
