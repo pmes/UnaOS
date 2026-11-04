@@ -117,4 +117,3 @@
 - `docs/dev/OS/05_USER_EXPERIENCE/DESIGN-LANGUAGE.md` §2 (unit, type, colour, depth) and §3 (component catalogue).
 - `docs/dev/OS/05_USER_EXPERIENCE/DESKTOPCRAFT.md`, `docs/dev/OS/05_USER_EXPERIENCE/SOFTY.md`, `docs/dev/OS/05_USER_EXPERIENCE/STARFIELD.md`, `docs/dev/OS/05_USER_EXPERIENCE/GLASSKIT.md` (same directory).
 - `docs/dev/OS/08_VIDEO/PARITY.md` (per-chip desktop gates), `framebuffer.md`, `composite_blit_bracket.md`, `engine.md`.
-
