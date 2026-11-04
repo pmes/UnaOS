@@ -42,9 +42,11 @@
 //!
 //! # Not implemented (deliberately, this round)
 //!
-//! - **Reload on external change.** Principia is the writer of record; an edit
-//!   made to the file underneath a running Principia is not noticed until the
-//!   next load. A watcher is queued.
+//! - **Locking between writers.** Reload on external change is BUILT
+//!   (PRINCIPIA-TWO-WRITERS, SR635: [`serve`] polls the domain files' stamps each
+//!   second and reloads a changed one, posting `PrefChanged` per differing key);
+//!   two writers can still lose an update in the window between that reload and
+//!   their own rename (PRINCIPIA-TWO-WRITERS-LOCK, owed to prefs_core's swap).
 //! - **Policy levels.** The charter's law layer (the safety levels helm
 //!   enforces) rides this same store when the first drivable domain lands; the
 //!   store is the mechanism, the levels are not yet defined.
@@ -273,14 +275,12 @@ pub async fn serve(
         "[PRINCIPIA] :: Policy engine live; preferences at {}",
         principia.prefs.path().display()
     );
+    let mut watch = Watch::new(principia.prefs.path()); // PRINCIPIA-TWO-WRITERS (SR635): file tail
 
     loop {
-        match rx.recv().await {
-            Ok(msg) => {
-                if let Some(reply) = principia.process_impulse(&msg) {
-                    synapse.fire(reply);
-                }
-            }
+        let got = tokio::select! { r = rx.recv() => r, _ = watch.tick.tick() => { for m in principia.reload_changed(&mut watch) { synapse.fire(m); } continue; } }; // PRINCIPIA-TWO-WRITERS (SR635): file tail
+        match got {
+            Ok(msg) => principia.serve_impulse(&msg, &mut watch, &synapse), // PRINCIPIA-TWO-WRITERS (SR635): file tail
             Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                 // A dropped command is a lost setting change; say so rather
                 // than let it vanish.
@@ -696,6 +696,143 @@ mod unset_synapse_tests {
         match unset(&mut p, "vug", "photo.camera_mm") {
             PrincipiaCommand::PrefError { message, .. } => assert!(message.contains("unset already"), "{message}"),
             other => panic!("expected PrefError, got {other:?}"),
+        }
+    }
+}
+
+// ---- PRINCIPIA-TWO-WRITERS (SR635): the serve loop's watch on the settings folder (named tail block) ----
+// lumen and una each mount a Principia over the SAME ~/settings in separate processes; neither heard the other's
+// write. The write road is an atomic rename (`PrefStore::save_domain`: a new inode, mtime and length per write), so a
+// stamp poll at a slow cadence from the ONE serve task (tokio::select! beside the receiver, no second task, no
+// inotify) is the watch: a changed stamp reloads through THE load (`PrefStore::load`) and posts `PrefChanged` for
+// every key whose value differs (the unset form, `value: None`, for a key gone); a write of its own is remembered.
+
+/// How often [`serve`] looks at the settings folder's stamps.
+const WATCH_CADENCE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// What a domain file looked like at the last look: a rename gives a new inode (unix), mtime and usually length.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Stamp {
+    modified: Option<std::time::SystemTime>,
+    len: u64,
+    ino: u64,
+}
+
+impl Stamp {
+    fn of(md: &fs::Metadata) -> Self {
+        #[cfg(unix)]
+        let ino = std::os::unix::fs::MetadataExt::ino(md);
+        #[cfg(not(unix))]
+        let ino = 0;
+        Self { modified: md.modified().ok(), len: md.len(), ino }
+    }
+}
+
+/// The stamp of every domain file in `dir` (regular files whose name is a valid domain; a `<d>.new` swap is not
+/// one). A missing or unreadable folder is an empty map.
+fn stamps(dir: &Path) -> std::collections::BTreeMap<String, Stamp> {
+    let mut out = std::collections::BTreeMap::new();
+    let Ok(rd) = fs::read_dir(dir) else { return out };
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if !prefs_core::files::valid_domain(&name) {
+            continue;
+        }
+        if let Ok(md) = e.metadata() {
+            if md.is_file() {
+                out.insert(name, Stamp::of(&md));
+            }
+        }
+    }
+    out
+}
+
+/// The serve task's watch state: the stamps last seen and the cadence. Owned by value by the one serve task.
+struct Watch {
+    seen: std::collections::BTreeMap<String, Stamp>,
+    tick: tokio::time::Interval,
+}
+
+impl Watch {
+    /// Stamps taken at start (the load just read them); the first look is one cadence from now.
+    fn new(dir: &Path) -> Self {
+        let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + WATCH_CADENCE, WATCH_CADENCE);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        Self { seen: stamps(dir), tick }
+    }
+}
+
+impl Principia {
+    /// One look at the folder: unchanged stamps cost a listing and no parse. Changed ones reload the whole store
+    /// through [`PrefStore::load`] (the disk is the truth; own writes are already on it) and answer one
+    /// `PrefChanged` per key whose value differs between the old store and the fresh one (`value: None` for a key
+    /// gone); an unchanged key never posts. The stamps are taken BEFORE the load, so a write landing during it
+    /// differs again at the next look; a failed load keeps the old stamps, so the next look retries.
+    fn reload_changed(&mut self, w: &mut Watch) -> Vec<SMessage> {
+        let dir = self.prefs.path().to_path_buf();
+        let now = stamps(&dir);
+        if now == w.seen {
+            return Vec::new();
+        }
+        let fresh = match PrefStore::load(&dir) {
+            Ok(f) => f,
+            Err(e) => {
+                log::error!("[PRINCIPIA] :: reloading {} failed ({e:#}); the store stays as it was", dir.display());
+                return Vec::new();
+            }
+        };
+        w.seen = now;
+        let mut keys = std::collections::BTreeSet::new();
+        for store in [&self.prefs, &fresh] {
+            for ns in store.namespaces() {
+                for (k, _) in store.list(&ns) {
+                    keys.insert((ns.clone(), k));
+                }
+            }
+        }
+        let mut out = Vec::new();
+        for (ns, key) in keys {
+            let value = fresh.get(&ns, &key);
+            if value != self.prefs.get(&ns, &key) {
+                out.push(SMessage::Principia(PrincipiaCommand::PrefChanged { ns, key, value, clamped: false }));
+            }
+        }
+        self.prefs = fresh;
+        if !out.is_empty() {
+            log::info!("[PRINCIPIA] :: reloaded {}: {} changed by another writer", dir.display(), out.len());
+        }
+        out
+    }
+
+    /// [`serve`]'s one inbound message: a PrefSet / PrefUnset first reloads what another writer changed (so the
+    /// write starts from the disk, not a stale cache), then is processed; on its `PrefChanged` answer the written
+    /// domain's stamp is remembered (the self-write rule: the next look does not re-read its own write). Every
+    /// other message is processed and answered exactly as before.
+    fn serve_impulse(&mut self, msg: &SMessage, w: &mut Watch, synapse: &Synapse) {
+        let write = matches!(
+            msg,
+            SMessage::Principia(PrincipiaCommand::PrefSet { .. } | PrincipiaCommand::PrefUnset { .. })
+        );
+        if write {
+            for m in self.reload_changed(w) {
+                synapse.fire(m);
+            }
+        }
+        if let Some(reply) = self.process_impulse(msg) {
+            if write {
+                if let SMessage::Principia(PrincipiaCommand::PrefChanged { ns, key, .. }) = &reply {
+                    let domain = prefs_core::files::domain_of(ns, key);
+                    match fs::metadata(self.prefs.domain_path(&domain)) {
+                        Ok(md) => {
+                            w.seen.insert(domain, Stamp::of(&md));
+                        }
+                        Err(_) => {
+                            w.seen.remove(&domain);
+                        }
+                    }
+                }
+            }
+            synapse.fire(reply);
         }
     }
 }
