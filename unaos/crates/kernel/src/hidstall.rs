@@ -2045,3 +2045,27 @@ impl core::fmt::Display for LockBy {
 fn lock_who_kat(lock: u64, ps2: u64) -> bool {
     lock_named(7, 7) && !lock_named(9, 7) && !lock_named(0, 0) && !lock_named(7, 0) && lock_phase(lock) && !lock_phase(ps2) && !lock_phase(0)
 }
+
+// ── F39HIDPUMPORIN (rmbp-ledger B1152) — HID-PUMP-ORIN: the Orin's pass bracketed, its minute census rolled. FILE-TAIL append. ─
+// B1149 found the Orin's `jd2-console` pump (main.rs `jd2_console_pump`, c0) never stamped [`pump_here`] / [`pass_begin`] /
+// [`pass_done`], so [`pump_cpu`] read none there. Its pass is ONE iteration of the pump's loop (poll, drain, pointer frame,
+// the ~250 ms sweep), and the bracket sits on all three of its loops: phase 1, the legacy phase 2 and the `supstate` twin
+// `jd2_supstate_phase2` (the orinimage set's live loop), with B1137's aarch64 phases `poll` / `fwd` / `svc`. [`census_minute`]'s
+// only caller is `video::lag`'s roll, compiled live only on x86 `wc` (`lag::ON`), so no aarch64 boot ever printed the census;
+// the Orin now rolls it from the pump's own sweep, every 240th (~60 s), through [`census_minute_on_pump`]. Owed: HID-CENSUS-PI
+// (the Pi's bracketed `usb_pump` / `input_service` pass has no roll either, so B1124's Pi-metal `who=` wire cannot print),
+// HID-WHO-ORIN (c0 has no tick after the EL2 drop, so `who=?` there).
+
+/// F39HIDPUMPORIN (B1152): [`census_minute`] printed from the hid pump's OWN task, mid-pass. aarch64's print is synchronous
+/// (byte by byte at 115200: the census's two lines are ~480 B, ~42 ms), and that print must not become the gap it reports:
+/// while a pass is open its entry stamp (`PASS_T0_MS`) and its last phase mark (`PH_LAST`) move forward by the print's own
+/// span, so the next gap's `pass` and the pass's phases exclude it. One writer (the pump task), relaxed, no lock.
+pub fn census_minute_on_pump() {
+    let t = now_us();
+    census_minute();
+    let d = now_us().saturating_sub(t);
+    if PH_OPEN.load(Relaxed) {
+        PASS_T0_MS.fetch_add(d / 1000, Relaxed);
+        PH_LAST.fetch_add(d, Relaxed);
+    }
+}
