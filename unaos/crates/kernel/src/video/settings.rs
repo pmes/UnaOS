@@ -1190,7 +1190,7 @@ fn paint_once(st: &mut State, v: &Values) {
         t if t as usize == SEC_TAB => paint_security(st), t if t as usize == HW_TAB => paint_hardware(st), // AUTOLOCK (B712) · HWTAB (B737): the census list, its own tab. LINE-NEUTRAL fold
         _ => paint_about(st),
     }
-    if let Some((t, r)) = st.found { if t as usize == tab { found_ring(st, r as usize); } } // SETTINGSMAP (B673): the row the search opened
+    if let Some((t, r)) = st.found { if t as usize == tab { found_ring(st, r as usize); } } reset_words(st, tab); // SETTINGSMAP (B673): the row the search opened. RESETWORD (rmbp-ledger B1191): the `reset` word on a held row (file tail). LINE-NEUTRAL fold
     // SETTINGSFILES (B407, R98): the pane's file, as a link (the accent ink) that reveals `<home>/settings` in Quarry.
     if let Some((r, x, t)) = super::settingsfiles::footer(v.tab as usize, ROWS, CTRL_R, LABEL_X) {
         txt_ink(st, x, r, &t, theme::accent());
@@ -1937,7 +1937,7 @@ fn press_dispatch(cx: usize, cy: usize, key: bool) -> bool {
     if cy < TOP { repaint(); return true; }
     let row = (cy - TOP) / ROW_H();
     if row >= ROWS { repaint(); return true; }
-    if !STATE.lock().as_ref().is_some_and(|s| s.modes_open) && super::settingsfiles::press(cur_tab(), row, cx, ROWS, CTRL_R, LABEL_X) { return true; } // SETTINGSFILES (B407): the pane's `Stored in settings/<domain>` link
+    if !STATE.lock().as_ref().is_some_and(|s| s.modes_open) && super::settingsfiles::press(cur_tab(), row, cx, ROWS, CTRL_R, LABEL_X) { return true; } if reset_press(cur_tab(), row, cx) { return true; } // SETTINGSFILES (B407): the pane's `Stored in settings/<domain>` link. RESETWORD (B1191): a press on a held row's `reset` word (file tail). LINE-NEUTRAL fold
     match cur_tab() {
         0 => press_general(row, cx),
         1 => press_users(row, cx), #[cfg(all(target_arch = "x86_64", feature = "installdemo"))] 3 => sysimg::press(row, cx), // UPDATEUI (B726): About > System image. LINE-NEUTRAL fold
@@ -2178,7 +2178,7 @@ pub fn selftest_users() {
 pub fn selftest_all() {
     selftest();
     selftest_users();
-    selftest_prefsui();
+    selftest_prefsui(); reset_word_leg();
 }
 
 // ── BRIGHTFLOOR (B312): the floor, the load clamp, safe mode ───────────────────────────────────
@@ -6245,12 +6245,154 @@ fn reset_row(tab: usize) {
         let h = st.hits[p0 + st.kf];
         (h[1] as usize + h[3] as usize / 2).saturating_sub(TOP) / ROW_H()
     };
+    reset_at(tab, row); // RESETWORD (B1191): the unset loop, shared with the painted word's press (file tail)
+}
+
+
+// =================================================================================================
+// RESETWORD (rmbp-ledger B1191, BP-storage-11) — TAIL-APPENDED. SETTINGS-RESET-BUTTON, the pointer twin of B1186's
+// Delete: a small `reset` word in the secondary ink, right-aligned at the label zone's edge (`TRACK_X - 8`, the Users
+// rows' name clip) of every `MAP` row of the pane whose keys the store holds one of. The right edge is full on every
+// row (toggles TOG_X..CTRL_R, the Wallpaper field TRACK_X..CTRL_R), so the word sits in the gutter just before the
+// control it resets. ONE predicate, [`row_is_set`], decides the painter, the press and Delete's per-key skip: the
+// kernel store read (`prefs::get`, which IS the bus GET's kernel fulfiller, `KernelStore::get`), so the painter under
+// `STATE` never relays to PREFS.ELF or spins on its reply. The word is one TEXTSCALE run (a long label on its line is
+// clipped or stacked by the flush, as against any run) and pushes NO hit rect (no keyboard stop: the stop census does
+// not move); its press is hit-tested by the painter's own [`reset_word_x`] and runs B1186's loop ([`reset_at`],
+// moved verbatim out of `reset_row`), then repaints, said `[settings] resetword press tab=<name> row=<r>` before
+// B1186's `[settings] reset system.<k> ok=<0|1> via=<kernel|prefs.elf>`. No confirmation: an unset is one PrefChanged
+// away from being set again. Witness: `tests settings` `:: SETTINGS-RESET-BUTTON: ... -> PASS ::` ([`reset_word_leg`]).
+// =================================================================================================
+/// The painted reset control's word.
+const RESET_WORD: &str = "reset";
+
+/// The ONE "not at its default" test: the store holds one of `keys` (`system.<k>`). Shared by [`reset_words`],
+/// [`reset_hit`] and [`reset_at`] (there one key at a time).
+fn row_is_set(keys: &[&str]) -> bool {
+    keys.iter().any(|k| crate::prefs::get(crate::prefs::NS, k).is_some())
+}
+
+/// The word's logical x span on a row: right-aligned at the label zone's edge (`TRACK_X - 8`), in the UI face.
+fn reset_word_x() -> (usize, usize) {
+    let x1 = TRACK_X - 8;
+    let w = super::metrics::ladvance(RESET_WORD.as_bytes(), false, super::text::Face::Ui);
+    (x1.saturating_sub(w), x1)
+}
+
+/// `paint_once`'s fold: the word on every `MAP` row of pane `tab` the store holds a key of (never over the open
+/// Resolution popup, which flushes the rows' text before it paints).
+fn reset_words(st: &mut State, tab: usize) {
+    if st.modes_open {
+        return;
+    }
+    let (x0, _) = reset_word_x();
+    let face = super::text::Face::Ui;
+    let ch = super::metrics::lcell_h(face);
+    for m in MAP.iter().filter(|m| m.tab == tab && m.row < ROWS) {
+        if row_is_set(m.keys) {
+            text_at(st, x0, row_top(m.row) + (ROW_H() - ch) / 2, TRACK_X, RESET_WORD, theme::ink_secondary(), false, face);
+        }
+    }
+}
+
+/// A press at `cx` on `row` of pane `tab` that lands on a painted word: that `MAP` row (the painter's geometry and test).
+fn reset_hit(tab: usize, row: usize, cx: usize) -> Option<MapRow> {
+    let (x0, x1) = reset_word_x();
+    if cx < x0 || cx >= x1 {
+        return None;
+    }
+    MAP.iter().find(|m| m.tab == tab && m.row == row).copied().filter(|m| row_is_set(m.keys))
+}
+
+/// `press_dispatch`'s arm: a press on a painted word unsets its row's held keys and repaints (the word goes). No
+/// settings lock is held across the unset.
+fn reset_press(tab: usize, row: usize, cx: usize) -> bool {
+    if STATE.lock().as_ref().is_some_and(|s| s.modes_open) {
+        return false;
+    }
+    let Some(m) = reset_hit(tab, row, cx) else { return false };
+    serial_println!("[settings] resetword press tab={} row={}", TAB_NAMES[tab.min(TABS - 1)], m.row);
+    reset_at(tab, m.row);
+    repaint();
+    true
+}
+
+/// B1186's unset loop for row `row` of pane `tab` (moved verbatim out of `reset_row`; the per-key test is [`row_is_set`]):
+/// each held key through `prefs_client::pref_unset`; a row at its default or with no `MAP` entry does nothing.
+fn reset_at(tab: usize, row: usize) {
     let Some(r) = MAP.iter().find(|m| m.tab == tab && m.row == row) else { return };
     for k in r.keys.iter() {
-        if crate::prefs_client::pref_get(crate::prefs::NS, k).is_err() {
+        if !row_is_set(core::slice::from_ref(k)) {
             continue; // at its default already: nothing to reset
         }
         let ok = crate::prefs_client::pref_unset(crate::prefs::NS, k).is_ok();
         serial_println!("[settings] reset {}.{} ok={} via={}", crate::prefs::NS, k, ok as u8, crate::prefs_client::last_via());
     }
+}
+
+/// [`reset_word_leg`]: paint `m`'s tab OFFSCREEN (`textscale::probe`'s shape) and answer whether a drawn run starts at
+/// the word's x on its row; `None` = no heap for the surface.
+#[cfg(feature = "witness")]
+fn reset_word_painted(m: &MapRow) -> Option<bool> {
+    let (pw, ph) = (super::metrics::size(WIN_W), super::metrics::size(WIN_H()));
+    let mut buf: Vec<u32> = Vec::new();
+    if buf.try_reserve_exact(pw * ph).is_err() {
+        return None;
+    }
+    buf.resize(pw * ph, 0);
+    let mut v = CUR.lock().clone();
+    v.tab = m.tab as u8;
+    let mut st = State::new(WIN_W, WIN_H(), buf, 1, true, col_scrolled(0, m.tab, TABS));
+    paint(&mut st, &v);
+    let (x0, _) = reset_word_x();
+    let (y0, y1) = (row_top(m.row), row_top(m.row + 1));
+    Some(st.runs.as_ref().is_some_and(|q| q.drawn.iter().any(|d| d[0] as usize == x0 && (y0..y1).contains(&(d[1] as usize)))))
+}
+
+/// `tests settings`' RESETWORD leg: the first pane row the store holds a key of shows the word and a press at its centre
+/// hits it (a press at the track does not); the first row at its default shows none and a press there hits nothing.
+/// It presses nothing and writes nothing (`selftest` has just stored `system.idle_min`, so Display row 1 is held).
+#[cfg(feature = "witness")]
+fn reset_word_leg() {
+    let set = MAP.iter().find(|m| m.tab < TABS && m.row < ROWS && row_is_set(m.keys)).copied();
+    let dflt = MAP.iter().find(|m| m.tab < TABS && m.row < ROWS && !row_is_set(m.keys)).copied();
+    let (x0, x1) = reset_word_x();
+    let mid = (x0 + x1) / 2;
+    let name = |m: Option<MapRow>| m.map_or(String::from("na"), |m| alloc::format!("{}/{}(system.{})", m.tab, m.row, m.keys[0]));
+    let s_paint = set.map(|m| reset_word_painted(&m));
+    let d_paint = dflt.map(|m| reset_word_painted(&m));
+    let heap = s_paint != Some(None) && d_paint != Some(None);
+    let s_hit = set.map(|m| reset_hit(m.tab, m.row, mid).is_some());
+    let s_off = set.map(|m| reset_hit(m.tab, m.row, TRACK_X).is_some());
+    let d_hit = dflt.map(|m| reset_hit(m.tab, m.row, mid).is_some());
+    let word = |p: Option<Option<bool>>| -> &'static str {
+        match p {
+            Some(Some(true)) => "painted",
+            Some(Some(false)) => "hidden",
+            Some(None) => "heap",
+            None => "na",
+        }
+    };
+    let yn = |h: Option<bool>| -> &'static str {
+        match h {
+            Some(true) => "hit",
+            Some(false) => "none",
+            None => "na",
+        }
+    };
+    let ok = (set.is_none() || (s_paint == Some(Some(true)) && s_hit == Some(true) && s_off == Some(false)))
+        && (dflt.is_none() || (d_paint == Some(Some(false)) && d_hit == Some(false)));
+    let verdict = if !heap {
+        "SKIP reason=heap"
+    } else if set.is_none() && dflt.is_none() {
+        "SKIP reason=no-row"
+    } else if ok {
+        "PASS"
+    } else {
+        "FAIL"
+    };
+    serial_println!(
+        ":: SETTINGS-RESET-BUTTON: set={} resetword={} press={} default={} resetword={} press={} off={} x={}..{} -> {} ::",
+        name(set), word(s_paint), yn(s_hit), name(dflt), word(d_paint), yn(d_hit), yn(s_off), x0, x1, verdict
+    );
 }
