@@ -747,7 +747,7 @@ fn an_obround_pocket_proposes_one_slot_set() {
     let m = shapes(slot_pocket(true));
     let ps = suggest(&d, &m);
     let set = feature_set(&ps, "slot pocket:");
-    assert_eq!(set.len(), 12, "{:?}", stmts(&ps));
+    assert_eq!(set.len(), 21, "{:?}", stmts(&ps)); // VUGINTENTFEATURESSLOTCONSTRAIN (SR675): 12 + the nine constraints
     // The slot's cylinders are taken: no single pocket or boss, and no boss slot.
     assert!(feature_set(&ps, "pocket:").is_empty() && feature_set(&ps, "boss:").is_empty(), "{:?}", stmts(&ps));
     assert!(feature_set(&ps, "slot boss:").is_empty(), "{:?}", stmts(&ps));
@@ -757,7 +757,7 @@ fn an_obround_pocket_proposes_one_slot_set() {
     let (c1, c2, q1, q2, q3, q4, l1, k1, l2, k2, x) = (id(1), id(2), id(3), id(4), id(5), id(6), id(7), id(8), id(9), id(10), id(11));
     let got: Vec<&str> = set.iter().map(|p| p.stmt.as_str()).collect();
     assert_eq!(
-        vec![got[0], got[1], got[2], got[3], got[4], got[5], got[6], got[7], got[9], got[11]],
+        vec![got[0], got[1], got[2], got[3], got[4], got[5], got[6], got[7], got[9], got[20]], // SR675: the extrude stays last
         [
             format!("sketch {a} o=[40 30 10] z=[0 0 -1] x=[1 0 0]"),
             format!("point {c1} sketch={a} x=-10 y=0"),
@@ -774,6 +774,22 @@ fn an_obround_pocket_proposes_one_slot_set() {
     assert!(got[8].starts_with(&format!("arc {k1} sketch={a} centre={c2} r=5 start=-1.5707963")), "{}", got[8]);
     assert!(got[10].starts_with(&format!("arc {k2} sketch={a} centre={c1} r=5 start=1.5707963")), "{}", got[10]);
     assert!(got[10].contains(" end=4.712388"), "{}", got[10]);
+    // VUGINTENTFEATURESSLOTCONSTRAIN (SR675): the nine constraints between the second arc and the extrude, ids after x.
+    let t = |k: u32| id(11 + k);
+    assert_eq!(
+        got[11..20].to_vec(),
+        [
+            format!("coincident {} sketch={a} a={k1}.start b={q2}", t(1)),
+            format!("coincident {} sketch={a} a={k1}.end b={q3}", t(2)),
+            format!("coincident {} sketch={a} a={k2}.start b={q4}", t(3)),
+            format!("coincident {} sketch={a} a={k2}.end b={q1}", t(4)),
+            format!("tangent_line_circle {} sketch={a} line={l1} circle={k1}", t(5)),
+            format!("tangent_line_circle {} sketch={a} line={l2} circle={k1}", t(6)),
+            format!("tangent_line_circle {} sketch={a} line={l2} circle={k2}", t(7)),
+            format!("tangent_line_circle {} sketch={a} line={l1} circle={k2}", t(8)),
+            format!("parallel {} sketch={a} a={l1} b={l2}", t(9)),
+        ]
+    );
     assert!(set.iter().all(|p| p.why == set[0].why), "one set shares one why");
     let why = &set[0].why;
     assert!(why.contains("cylinders #9 and #10 on plane #1") && why.contains("walls #8 and #7"), "{why}");
@@ -781,7 +797,7 @@ fn an_obround_pocket_proposes_one_slot_set() {
     assert!(why.contains("far-end plane #6 (near end 0.000 mm off), height 5"), "{why}");
     assert!((set[0].confidence - 1.0).abs() < 1e-12, "{}", set[0].confidence);
     // The set comes after every sketch rule, and verify_all takes the plate's singles and the slot as one set.
-    assert_eq!(ps.iter().position(|p| p.why.starts_with("slot pocket:")).unwrap() + 12, ps.len());
+    assert_eq!(ps.iter().position(|p| p.why.starts_with("slot pocket:")).unwrap() + 21, ps.len()); // SR675: 21 statements
     let bt = verify_all(&d, &ps, &m, d.tol);
     assert_eq!(bt.accepted(), ps.len(), "{}", bt.text());
     assert_eq!(bt.sets.len(), 1, "{}", bt.text());
@@ -831,4 +847,79 @@ fn two_equal_bosses_stay_two_bosses() {
         }
     }
     assert_eq!(bt.accepted(), ps.len() - 8, "{}", bt.text());
+}
+
+// ---- VUGINTENTFEATURESSLOTCONSTRAIN (SR675): the slot set's constraints keep the obround under a drag ----
+
+/// The slot pocket's set replayed: dof 5 (3 in the plane, length, width) with no redundant row; a corner dragged 1 mm
+/// through sketch_core's own drag keeps both radii equal, each line tangent to each arc at its end, the lines parallel,
+/// and the profile one closed loop of four edges.
+#[test]
+fn a_dragged_slot_corner_keeps_the_obround() {
+    use sketch_core::{Entity, EntityId, PointRef, Vec2, drag, profiles};
+    let d = doc(&plate(80.0, 60.0, 10.0));
+    let ps = suggest(&d, &shapes(slot_pocket(true)));
+    let set = feature_set(&ps, "slot pocket:");
+    assert_eq!(set.len(), 21, "{:?}", stmts(&ps));
+    let mut c = d.clone();
+    for p in &set {
+        c = apply(&c, p).unwrap_or_else(|e| panic!("{}: {e:?}", p.stmt));
+    }
+    let r = replay(&c, c.tol);
+    assert!(r.failures.is_empty(), "{:?}", r.failures);
+    let sid = set[0].stmt.split(' ').nth(1).unwrap();
+    let so = r.sketches.iter().find(|s| s.id == sid).expect("the slot sketch");
+    assert_eq!(so.solved.dof, 5, "x, y, rotation, length and width");
+    assert!(so.solved.redundant.is_empty(), "{:?}", so.solved.redundant);
+    let mut sk = so.sketch.clone();
+    let mut lines: Vec<(EntityId, EntityId, EntityId)> = Vec::new();
+    let mut arcs: Vec<EntityId> = Vec::new();
+    for (i, e) in sk.entities().iter().enumerate() {
+        match *e {
+            Entity::Line { a, b } => lines.push((EntityId(i as u32), a, b)),
+            Entity::Arc { .. } => arcs.push(EntityId(i as u32)),
+            _ => {}
+        }
+    }
+    assert_eq!((lines.len(), arcs.len()), (2, 2));
+    // The corner q2: the first line's end (the first arc's start).
+    let corner = lines[0].2;
+    let at = sk.point(PointRef::Point(corner)).unwrap();
+    let to = Vec2::new(at.x + 0.6, at.y - 0.8);
+    drag(&mut sk, PointRef::Point(corner), to, c.tol).expect("the dragged slot solves");
+    let pt = |sk: &sketch_core::Sketch, p: PointRef| sk.point(p).unwrap();
+    let got = pt(&sk, PointRef::Point(corner));
+    assert!((got.x - to.x).abs() < 1e-6 && (got.y - to.y).abs() < 1e-6, "{got:?}");
+    let (r1, r2) = (sk.radius(arcs[0]).unwrap(), sk.radius(arcs[1]).unwrap());
+    assert!((r1 - r2).abs() < 1e-6, "radii {r1} {r2}");
+    // Each arc's centre is r from BOTH lines (tangent to each), and the lines are parallel.
+    let ends = |sk: &sketch_core::Sketch, l: &(EntityId, EntityId, EntityId)| (pt(sk, PointRef::Point(l.1)), pt(sk, PointRef::Point(l.2)));
+    let unit = |a: Vec2, b: Vec2| {
+        let (dx, dy) = (b.x - a.x, b.y - a.y);
+        let n = (dx * dx + dy * dy).sqrt();
+        (dx / n, dy / n)
+    };
+    let (a0, b0) = ends(&sk, &lines[0]);
+    let (a1, b1) = ends(&sk, &lines[1]);
+    let (u0, u1) = (unit(a0, b0), unit(a1, b1));
+    assert!((u0.0 * u1.1 - u0.1 * u1.0).abs() < 1e-6, "parallel {u0:?} {u1:?}");
+    for &k in &arcs {
+        let cc = pt(&sk, PointRef::Centre(k));
+        let rk = sk.radius(k).unwrap();
+        for (a, u) in [(a0, u0), (a1, u1)] {
+            let dist = (u.0 * (cc.y - a.y) - u.1 * (cc.x - a.x)).abs();
+            assert!((dist - rk).abs() < 1e-6, "centre {cc:?} {dist} from a line, r {rk}");
+        }
+    }
+    // Each arc end sits on a line end.
+    let line_ends = [a0, b0, a1, b1];
+    for &k in &arcs {
+        for p in [PointRef::Start(k), PointRef::End(k)] {
+            let e = pt(&sk, p);
+            assert!(line_ends.iter().any(|q| (q.x - e.x).abs() < 1e-6 && (q.y - e.y).abs() < 1e-6), "{p:?} at {e:?}");
+        }
+    }
+    let pr = profiles(&sk, c.tol);
+    assert_eq!(pr.len(), 1);
+    assert_eq!(pr[0].outer.edges.len(), 4);
 }

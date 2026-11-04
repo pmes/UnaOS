@@ -43,7 +43,12 @@
 //! sigma_deg, axis distance d > 2 sigma, with a measured wall at +r and at -r from the joining line, are ONE slot; both
 //! are taken (never also two bosses or pockets) and the midpoint is measured by the cylinder road's own [`stand`] (the
 //! plane, the extent rule, pocket or boss); the set is the obround in the replay's own form (six points, two lines, two
-//! arcs, no constraint) on the plane, its length d and width 2r round within sigma, extruded by the height.
+//! arcs) on the plane, its length d and width 2r round within sigma, extruded by the height.
+//! VUGINTENTFEATURESSLOTCONSTRAIN (LEDGER SR675): the obround carries its constraints, so a drag keeps it: each arc end
+//! `coincident` with its line end, each line `tangent_line_circle` to each arc there (sketch_core's end tangency: the
+//! radius perpendicular to the line at the shared end), the two lines `parallel`: dof 5 (3 in the plane, length, width),
+//! no redundant row; `equal_radius` is not emitted (beside Parallel it is redundant by rank: an arc tangent to both
+//! parallel lines has r = half their gap).
 //!
 //! VUGINTENTSETVERIFY (LEDGER SR541): a statement set is emitted as [`crate::verify_all`] disposes it WHOLE: contiguous,
 //! one `why` that no adjacent proposal shares (a feature's names its cylinder, a bolt circle its n and r, a midline its
@@ -1019,8 +1024,9 @@ fn slot_of(shapes: &[crate::intent::ShapeRef], planes: &[PlaneM], fits: &dyn Fn(
 
 /// The slot rule (module doc): per recognised slot, its two cylinders are TAKEN (the cylinder loop skips them, so a
 /// slot is never also two bosses or pockets) and, where `stand` measures the midpoint on a document face, ONE statement
-/// set: the obround as the replay's own form (six points, two lines, two arcs, no constraint) on the plane, extruded by
-/// the extent rule's height. No slot: nothing drawn from `ids`, nothing pushed.
+/// set: the obround as the replay's own form (six points, two lines, two arcs) on the plane, its nine constraints (SR675:
+/// four coincident ends, four end tangents, the lines parallel), extruded by the extent rule's height. No slot: nothing
+/// drawn from `ids`, nothing pushed.
 #[allow(clippy::too_many_arguments)]
 fn slots(
     doc: &Doc,
@@ -1096,6 +1102,7 @@ fn slots(
         let sk = ids.next();
         let (c1, c2, q1, q2, q3, q4) = (ids.next(), ids.next(), ids.next(), ids.next(), ids.next(), ids.next());
         let (l1, k1, l2, k2, ex) = (ids.next(), ids.next(), ids.next(), ids.next(), ids.next());
+        let cs: [String; 9] = core::array::from_fn(|_| ids.next()); // VUGINTENTFEATURESSLOTCONSTRAIN (SR675): drawn after ex, every SR666 id kept
         for stmt in [
             format!("sketch {} o=[{}] z=[{}] x=[{}]", sk, v3(foot), v3(z), v3(x)),
             format!("point {} sketch={} x={} y=0", c1, sk, nl),
@@ -1108,6 +1115,17 @@ fn slots(
             format!("arc {} sketch={} centre={} r={} start={} end={}", k1, sk, c2, hw, f64_text(-q), f64_text(q)),
             format!("line {} sketch={} a={} b={}", l2, sk, q3, q4),
             format!("arc {} sketch={} centre={} r={} start={} end={}", k2, sk, c1, hw, f64_text(q), f64_text(3.0 * q)),
+            // VUGINTENTFEATURESSLOTCONSTRAIN (SR675): each arc end on its line end, each line tangent there, the lines
+            // parallel (dof 5; EqualRadius is redundant beside Parallel by rank, so not emitted). The extrude stays last.
+            format!("coincident {} sketch={} a={}.start b={}", cs[0], sk, k1, q2),
+            format!("coincident {} sketch={} a={}.end b={}", cs[1], sk, k1, q3),
+            format!("coincident {} sketch={} a={}.start b={}", cs[2], sk, k2, q4),
+            format!("coincident {} sketch={} a={}.end b={}", cs[3], sk, k2, q1),
+            format!("tangent_line_circle {} sketch={} line={} circle={}", cs[4], sk, l1, k1),
+            format!("tangent_line_circle {} sketch={} line={} circle={}", cs[5], sk, l2, k1),
+            format!("tangent_line_circle {} sketch={} line={} circle={}", cs[6], sk, l2, k2),
+            format!("tangent_line_circle {} sketch={} line={} circle={}", cs[7], sk, l1, k2),
+            format!("parallel {} sketch={} a={} b={}", cs[8], sk, l1, l2),
             format!("extrude {} sketch={} outer={} dir=[{}] length={}", ex, sk, l1, v3(z), f64_text(hv)),
         ] {
             out.push(Proposal { stmt, confidence: conf, why: why.clone() });
