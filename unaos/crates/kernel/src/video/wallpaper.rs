@@ -837,8 +837,8 @@ pub fn veil_login_stale() {
 // for the whole build; a raise meanwhile blits whatever is kept (LV_OWED stays false: the raise does not build). A move
 // mid-rebuild bumps `gen` and the pass's CAS fails: the next slice restarts at row 0. The last slice reuses
 // `login_prefill` for the blit timing and bytes (every row a hit), stores the raise cost as [`veil_login_build`] does,
-// re-arms the witness and prints the cost line with `at=svc`. aarch64 (no `pace_service`), a field not held, or a
-// contended byte count keeps B1128's drop. Wire: `[veil] login cost … at=svc`; a field re-keyed or dropped under the
+// re-arms the witness and prints the cost line with `at=svc`. A field not held, or a contended byte count, keeps
+// B1128's drop; aarch64 (no `pace_service`) runs the same slices on a one-shot task (VEIL-HELD-ARM, file tail). Wire: `[veil] login cost … at=svc`; a field re-keyed or dropped under the
 // pass (an install, `wallpaper off`) leaves it idle: `[veil] login rebuild left at=svc row=<y>`.
 
 /// The owed in-place rebuild: `(gen << 32) | next_row`; row [`LV_RB_IDLE`] = nothing owed.
@@ -846,20 +846,29 @@ static LV_REBUILD: AtomicU64 = AtomicU64::new(LV_RB_IDLE as u64);
 /// The idle row sentinel.
 const LV_RB_IDLE: u32 = u32::MAX;
 /// The rebuild's accumulated compose time (the cost line's `build_us=`), written only by the pass.
-#[cfg(target_arch = "x86_64")]
 static LV_RB_US: AtomicU64 = AtomicU64::new(0);
 
-/// [`veil_login_stale`]'s head: on x86, a HELD field with bytes and nothing owed is kept and its rebuild owed to the
-/// pass (`true`); anything else answers `false` (B1128's drop).
+/// [`veil_login_stale`]'s head: a HELD field with bytes and nothing owed is kept and its rebuild owed to the pass (`true`):
+/// x86's `pace_service`, or on aarch64 (VEIL-HELD-ARM, B1141) ONE `veil-rebuild` task on `sched::worker_cpu_apart`,
+/// spawned only when the cell was idle (a runner already holds an owed cell); anything else, or no free core on
+/// aarch64, answers `false` (B1128's drop).
 fn veil_login_rebuild_defer() -> bool {
-    #[cfg(target_arch = "x86_64")]
+    if !(LV_HELD.load(Ordering::Acquire) && !LV_OWED.load(Ordering::Acquire) && crate::video::wm::desktop::login_veil_bytes() > 0) {
+        return false;
+    }
+    #[cfg(target_arch = "aarch64")]
+    let Some(cpu) = crate::arch::sched::worker_cpu_apart() else { return false };
+    let prev = match LV_REBUILD.fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| Some((((v >> 32) + 1) << 32) & !0xFFFF_FFFF)) {
+        Ok(v) | Err(v) => v,
+    };
+    #[cfg(target_arch = "aarch64")]
     {
-        if LV_HELD.load(Ordering::Acquire) && !LV_OWED.load(Ordering::Acquire) && crate::video::wm::desktop::login_veil_bytes() > 0 {
-            let _ = LV_REBUILD.fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| Some((((v >> 32) + 1) << 32) & !0xFFFF_FFFF));
-            return true;
+        if prev as u32 == LV_RB_IDLE {
+            let _ = crate::arch::sched::spawn("veil-rebuild", veil_rebuild_task, 0, cpu);
         }
     }
-    false
+    let _ = prev;
+    true
 }
 
 /// [`veil_login_build`]'s clear: an owed rebuild is moot after a build at the current look (the gen moves, so a slice
@@ -868,42 +877,44 @@ fn veil_login_rebuild_clear() {
     let _ = LV_REBUILD.fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| Some(((((v >> 32) + 1) << 32) & !0xFFFF_FFFF) | LV_RB_IDLE as u64));
 }
 
-/// `wm::pace_service`'s taker (x86 `wc`, after `close_owed_run`): one relaxed load when nothing is owed; else one
-/// bounded slice of the in-place rebuild, and on the last slice the cost line with `at=svc`.
-#[cfg(target_arch = "x86_64")]
-pub fn veil_login_svc() {
+/// `wm::pace_service`'s taker (x86 `wc`, after `close_owed_run`) and the aarch64 `veil-rebuild` task's body (VEIL-HELD-ARM,
+/// B1141): one relaxed load when nothing is owed; else one bounded slice of the in-place rebuild, and on the last slice
+/// the cost line with `at=svc`. Answers whether the cell is still owed (`false` only when it was idle or this call's own
+/// CAS left it idle), so the aarch64 runner loops to completion and a later owing finds an idle cell and spawns anew.
+pub fn veil_login_svc() -> bool {
     let v = LV_REBUILD.load(Ordering::Relaxed);
     if v as u32 == LV_RB_IDLE {
-        return;
+        return false;
     }
     let v = LV_REBUILD.load(Ordering::Acquire);
     let y0 = v as u32;
     if y0 == LV_RB_IDLE {
-        return;
+        return false;
     }
     let g0 = v & !0xFFFF_FFFF;
     let Some(b) = back() else {
-        let _ = LV_REBUILD.compare_exchange(v, g0 | LV_RB_IDLE as u64, Ordering::AcqRel, Ordering::Acquire);
-        return;
+        return LV_REBUILD.compare_exchange(v, g0 | LV_RB_IDLE as u64, Ordering::AcqRel, Ordering::Acquire).is_err();
     };
     if y0 == 0 {
         LV_RB_US.store(0, Ordering::Relaxed);
     }
-    let n = (131_072 / b.w.max(1)).max(1);
+    let (fw, fh) = if cfg!(target_arch = "x86_64") { (b.w, b.h) } else { (b.w / 2 + 1, b.h / 2 + 1) }; // VEIL-HELD-ARM (B1141): aarch64 keeps the half field (B1122)
+    let n = (131_072 / fw.max(1)).max(1);
     let Some((next, us)) = crate::video::wm::desktop::login_refill_rows(&b, y0 as usize, n) else {
         if LV_REBUILD.compare_exchange(v, g0 | LV_RB_IDLE as u64, Ordering::AcqRel, Ordering::Acquire).is_ok() {
             serial_println!("[veil] login rebuild left at=svc row={}", y0);
+            return false;
         }
-        return;
+        return true;
     };
     let build_us = LV_RB_US.load(Ordering::Relaxed).saturating_add(us);
     LV_RB_US.store(build_us, Ordering::Relaxed);
-    if next < b.h {
+    if next < fh {
         let _ = LV_REBUILD.compare_exchange(v, g0 | next as u64, Ordering::AcqRel, Ordering::Acquire);
-        return;
+        return true;
     }
     if LV_REBUILD.compare_exchange(v, g0 | LV_RB_IDLE as u64, Ordering::AcqRel, Ordering::Acquire).is_err() {
-        return; // the pref moved during the last slice: the next pass restarts at row 0
+        return true; // the pref moved during the last slice: the next pass restarts at row 0
     }
     let (_, blit_us, bytes) = crate::video::wm::desktop::login_prefill(&b);
     let raise_us = build_us.saturating_add(blit_us);
@@ -915,6 +926,22 @@ pub fn veil_login_svc() {
     serial_println!(
         "[veil] login cost build_us={} blit_us={} panel={}x{} bytes={} a={} kept={} held={} at=svc",
         build_us, blit_us, b.w, b.h, bytes, crate::video::crystal::veil::Look::login().a,
-        if bytes == 0 { "no" } else { "yes" }, if raise_us > RAISE_BUDGET_US { "yes" } else { "no" }
+        if bytes == 0 { "no" } else if cfg!(target_arch = "x86_64") { "yes" } else { "half" }, if raise_us > RAISE_BUDGET_US { "yes" } else { "no" }
     );
+    false
+}
+
+// ── VEIL-HELD-ARM (rmbp-ledger B1141, BP-video-11) — TAIL-APPENDED: aarch64's held half field recomposed off the raise ─
+// aarch64 has no `pace_service`, so B1135 kept B1128's drop there: a Reduce transparency move freed a HELD half field
+// and the next raise paid its whole build in the route. Now [`veil_login_rebuild_defer`] owes it to ONE `veil-rebuild`
+// task on `sched::worker_cpu_apart` (B1136's one-shot shape: c2 on the Pi, c1 on the Orin; no free core keeps the drop),
+// spawned only when [`LV_REBUILD`] was idle, whose body runs [`veil_login_svc`]'s slices to completion and exits. The
+// slices are half rows (`wm::desktop::login_refill_rows`' aarch64 arm, `LOGIN_VEIL` held one row at a time): 1920x1200
+// (961 x 601, 2,310,244 B) is 136 rows a slice, 5 slices; 640x480 is one slice and never held. No periodic pass
+// (ARM-PACE-PASS owed). Wire: `[veil] login cost … kept=half … at=svc` from that core.
+
+/// VEIL-HELD-ARM: the one-shot runner — the owed rebuild's slices until the cell is idle, then it exits.
+#[cfg(target_arch = "aarch64")]
+fn veil_rebuild_task(_: usize) {
+    while veil_login_svc() {}
 }
