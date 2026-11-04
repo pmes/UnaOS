@@ -1166,3 +1166,30 @@ pub const VEIL_A: (u8, u8) = (184, palette_core::softy::dark::VEIL_A);
 pub fn veil_a() -> u8 {
     if is_dark() { VEIL_A.1 } else { VEIL_A.0 }
 }
+
+// ── VEIL-LOGIN + ELEV-ONE (rmbp-ledger B1116, BP-video-11) — TAIL-APPENDED so no line above moves ─────────────────────
+// VEIL-LOGIN: the login and lock backdrop is the VEIL darkened 20 % (DESIGN-LANGUAGE §3.9) with §2.4 `elev.4`'s scrim
+// behind the form. Both are black over the blurred wallpaper, so they compose into ONE alpha the painter
+// (`crystal::veil::Look::login`) lays in one blend: 113 (44 %) light, 153 (60 %) dark. ELEV-ONE: `elev.2` was held
+// three times (`crystal::sheet::elev2`, `softy::palette::elev2`, `desktop::CRAFT.elev[1]`), the same numbers in each.
+
+/// §3.9: the login backdrop's dim, 20 % of 255.
+pub const LOGIN_DIM: u32 = 51;
+
+/// The login and lock backdrop's one black alpha: the §3.9 dim, then the scrim (`SCRIM_ALPHA`) over it, composed:
+/// `255 - round((255 - 51) * (255 - s) / 255)` = 113 light, 153 dark.
+#[inline]
+pub fn login_veil_a() -> u8 {
+    let s = if is_dark() { SCRIM_ALPHA.1 } else { SCRIM_ALPHA.0 };
+    (255 - ((255 - LOGIN_DIM) * (255 - s) + 127) / 255) as u8
+}
+
+/// `elev.2` (§2.4: menus, popovers, tooltips, toasts) as the two layers' peak alphas of 255, `(light, dark)`, each
+/// `(tight 0 0 2 pt, wide 0 8 24 pt)`: 12 % / 18 % light, 30 % / 45 % dark.
+pub const ELEV2: ((u32, u32), (u32, u32)) = ((31, 46), (77, 115));
+
+/// `elev.2` for the live set: `(tight, wide)`.
+#[inline]
+pub fn elev2() -> (u32, u32) {
+    if is_dark() { ELEV2.1 } else { ELEV2.0 }
+}

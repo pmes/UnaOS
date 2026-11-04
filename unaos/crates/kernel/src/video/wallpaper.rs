@@ -87,7 +87,7 @@ fn install(mut new: Option<Wall>) {
         SNAP.store(snap, Ordering::Release); #[cfg(target_arch = "x86_64")] crate::video::wm::desktop::veil_cache_invalidate();
         core::mem::replace(&mut *g, new)
     };
-    #[cfg(not(all(target_arch = "x86_64", feature = "wc")))] { *RETIRED.lock() = old; } #[cfg(all(target_arch = "x86_64", feature = "wc"))] { retire(old); } // RETIREDFREE (B845): the retire stamped and retagged in one RETIRED hold, freed by `wall-reap` after the grace. LINE-NEUTRAL fold, code first
+    #[cfg(not(all(target_arch = "x86_64", feature = "wc")))] { *RETIRED.lock() = old; } #[cfg(all(target_arch = "x86_64", feature = "wc"))] { retire(old); } veil_login_build(); // RETIREDFREE (B845): the retire stamped and retagged in one RETIRED hold, freed by `wall-reap` after the grace. LINE-NEUTRAL fold, code first
 }
 
 /// DESKTOPCRAFT (B631): the installed picture and its VEIL for the furniture painters (`None` = the flat colour).
@@ -187,7 +187,7 @@ pub fn active() -> bool {
 /// Compose the wallpaper row `py`, columns `x..x+w`, into `layer` (a one-row staging framebuffer,
 /// row 0). Columns the buffer cannot cover keep the flat colour already in the row.
 pub fn row(layer: &FrameBuffer, py: usize, x: usize, w: usize) {
-    let Some(g) = WALL.try_lock() else { return };
+    if veil_login_row(layer, py, x, w) { return; } let Some(g) = WALL.try_lock() else { return };
     let Some(wall) = g.as_ref() else { return };
     if py >= wall.h {
         return;
@@ -202,7 +202,7 @@ pub fn row(layer: &FrameBuffer, py: usize, x: usize, w: usize) {
 
 /// Blit the whole buffer into `fb` (the desktop layer's back buffer). Declines on a size mismatch.
 pub fn paint(fb: &FrameBuffer) {
-    let Some(g) = WALL.try_lock() else { return };
+    if veil_login_paint(fb) { return; } let Some(g) = WALL.try_lock() else { return };
     let Some(wall) = g.as_ref() else { return };
     if wall.w != fb.width() || wall.h != fb.height() {
         return;
@@ -218,7 +218,7 @@ pub fn paint(fb: &FrameBuffer) {
 /// `Screen::flush`'s hook: retry the default probe when due, and report (and clear) a pending
 /// repaint of the desktop layer.
 pub fn take_stale() -> bool {
-    regen_on_theme(); // MENUSCRAFT (B642): a theme or accent change redraws the generated default and its VEIL
+    regen_on_theme(); veil_login_witness(); // MENUSCRAFT (B642): a theme or accent change redraws the generated default and its VEIL
     poll();
     owns_backdrop() && STALE.swap(false, Ordering::AcqRel) // STARTSCENE (B662): from the splash on, not only after REALDESK's latch
 }
@@ -646,4 +646,111 @@ fn reap_task(_cpu: usize) {
 pub fn retired_state() -> (Option<u64>, u32) {
     let at = RETIRED_AT.load(Ordering::Acquire);
     (if at == 0 { None } else { Some((crate::arch::ms() as u64).saturating_sub(at)) }, RETIRED_FREED.load(Ordering::Relaxed))
+}
+
+// ── VEIL-LOGIN (rmbp-ledger B1116, BP-video-11) — TAIL-APPENDED: the login and lock backdrop is the VEIL ───────────────
+// DESIGN-LANGUAGE §3.9 ("Background: the VEIL of the wallpaper (blurred, darkened 20 %)") and §2.4 `elev.4` (the scrim
+// behind the login form). While the login card's row is up (`boot::screen_is_up`, set and cleared only by `login::open_as`
+// / `take_down`: the login, unlock, words and lock screens) the desktop layer's two leaves, [`row`] and [`paint`], take
+// the backdrop from `wm::desktop::login_put` (the field kept per install, `Look::login` over the VEIL) instead of the
+// sharp picture. The field is composed once per [`install`] ([`veil_login_build`], on the installer's thread).
+// Wire: `[veil] login cost build_us=<n> blit_us=<n> panel=<w>x<h> bytes=<n> a=<n>` per install; once per build,
+// `:: VEILLOGIN: at=(<x>,<y>) sharp=#<rgb> glass=#<rgb> expect=#<rgb> a=<n> cached=<0|1> -> PASS|FAIL ::` at the first
+// flush after the backdrop's first painted pixel that differs from the sharp one (PASS: glass = the VEIL at `a`).
+
+/// The witness latch: taken by the first painted pixel that differs from the picture's; `READY` once its values are in.
+static LV_LATCHED: AtomicBool = AtomicBool::new(false);
+static LV_READY: AtomicBool = AtomicBool::new(false);
+static LV_SAID: AtomicBool = AtomicBool::new(false);
+static LV_CACHED: AtomicBool = AtomicBool::new(false);
+/// `(x << 32) | y` and `(sharp << 32) | glass` of the latched pixel.
+static LV_AT: AtomicU64 = AtomicU64::new(0);
+static LV_PX: AtomicU64 = AtomicU64::new(0);
+
+/// Panel row `py`, columns `x..x + w`, of the login backdrop into `fb`'s row `fy`: `true` when the login backdrop owns
+/// the row (the screen is up and a picture is installed), so the sharp picture is not painted.
+fn veil_login_put(fb: &FrameBuffer, fy: usize, py: usize, x: usize, w: usize) -> bool {
+    if !crate::boot::screen_is_up() {
+        return false;
+    }
+    let Some(b) = back() else { return false };
+    let latch = !LV_LATCHED.load(Ordering::Relaxed);
+    let mut hit: Option<(usize, u32, u32)> = None;
+    let cached = crate::video::wm::desktop::login_put(&b, py, x, w, |i, p| {
+        fb.put_pixel(i, fy, p);
+        if latch && hit.is_none() {
+            let s = b.get(x + i, py);
+            if s != p {
+                hit = Some((x + i, s, p));
+            }
+        }
+    });
+    if let Some((hx, s, p)) = hit {
+        if !LV_LATCHED.swap(true, Ordering::AcqRel) {
+            LV_AT.store(((hx as u64) << 32) | py as u64, Ordering::Relaxed);
+            LV_PX.store(((s as u64) << 32) | p as u64, Ordering::Relaxed);
+            LV_CACHED.store(cached, Ordering::Relaxed);
+            LV_READY.store(true, Ordering::Release);
+        }
+    }
+    true
+}
+
+/// [`row`]'s login branch: the staged row is `layer`'s row 0.
+fn veil_login_row(layer: &FrameBuffer, py: usize, x: usize, w: usize) -> bool {
+    veil_login_put(layer, 0, py, x, w)
+}
+
+/// [`paint`]'s login branch: the whole back buffer, on a size match (as [`paint`] declines otherwise).
+fn veil_login_paint(fb: &FrameBuffer) -> bool {
+    if !crate::boot::screen_is_up() {
+        return false;
+    }
+    let Some(b) = back() else { return false };
+    if b.w != fb.width() || b.h != fb.height() {
+        return false;
+    }
+    for y in 0..b.h {
+        veil_login_put(fb, y, y, 0, b.w);
+    }
+    true
+}
+
+/// [`install`]'s tail: compose the login field for the new picture (or free it when the picture went), print its cost,
+/// and re-arm the witness.
+fn veil_login_build() {
+    let Some(b) = back() else {
+        crate::video::wm::desktop::login_veil_drop();
+        return;
+    };
+    let (build_us, blit_us, bytes) = crate::video::wm::desktop::login_prefill(&b);
+    LV_READY.store(false, Ordering::Relaxed);
+    LV_SAID.store(false, Ordering::Relaxed);
+    LV_LATCHED.store(false, Ordering::Release);
+    serial_println!(
+        "[veil] login cost build_us={} blit_us={} panel={}x{} bytes={} a={}{}",
+        build_us, blit_us, b.w, b.h, bytes, crate::video::theme::login_veil_a(),
+        if cfg!(target_arch = "x86_64") { "" } else { " live=1" }
+    );
+}
+
+/// [`take_stale`]'s tail (the flush, IRQs on): the latched pixel against the VEIL at the login alpha, once per build.
+fn veil_login_witness() {
+    if !LV_READY.load(Ordering::Acquire) || LV_SAID.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let Some(b) = back() else { return };
+    let at = LV_AT.load(Ordering::Relaxed);
+    let (x, y) = ((at >> 32) as usize, (at & 0xFFFF_FFFF) as usize);
+    let px = LV_PX.load(Ordering::Relaxed);
+    let (sharp, glass) = ((px >> 32) as u32, px as u32);
+    let a = crate::video::theme::login_veil_a();
+    let mut s = [0u32; 1];
+    b.soft(&mut s, x, y);
+    let expect = crate::video::draw::blend(s[0], 0, a as u32);
+    let ok = glass == expect && glass != sharp;
+    serial_println!(
+        ":: VEILLOGIN: at=({},{}) sharp=#{:06x} glass=#{:06x} expect=#{:06x} a={} cached={} -> {} ::",
+        x, y, sharp, glass, expect, a, LV_CACHED.load(Ordering::Relaxed) as u8, if ok { "PASS" } else { "FAIL" }
+    );
 }

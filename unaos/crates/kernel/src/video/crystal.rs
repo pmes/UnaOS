@@ -1657,11 +1657,11 @@ pub mod sheet {
         px(3) as i32
     }
 
-    /// `elev.2` (DESIGN-LANGUAGE §2.4): `0 0 2pt @ 12 %` + `0 8 24pt @ 18 %` (light), `@ 30 %` + `@ 45 %` (dark),
-    /// as `(tight, wide)` peak opacities of 255. The wide layer's blur is held to the band.
-    fn elev2() -> (u32, u32) {
-        if theme::is_dark() { (77, 115) } else { (31, 46) }
-    }
+    // ELEV-ONE (rmbp-ledger B1116): `elev.2` (DESIGN-LANGUAGE §2.4) is held once, `theme::ELEV2` / `theme::elev2()`:
+    // `0 0 2pt @ 12 %` + `0 8 24pt @ 18 %` (light), `@ 30 %` + `@ 45 %` (dark), as `(tight, wide)` peak opacities of
+    // 255; the wide layer's blur is held to the band. This sheet's own copy retired here; five comment lines keep
+    // every line below where it was.
+    //
     /// `rim.dark` (`#FFFFFF @ 8 %`): the dark sheet's inner rim, so its edge survives a dark wallpaper.
     const RIM_DARK: u32 = 20;
 
@@ -1780,7 +1780,7 @@ pub mod sheet {
         }
         let mut s = Surf::new(out, w);
         let b = Rect::new(0, -(j as i32), bw as i32, bh as i32);
-        let (tight, wide) = elev2();
+        let (tight, wide) = theme::elev2();
         let band = BAND() as i32;
         let drop = DROP().min(band - 1).max(0);
         draw::shadow_rrect(&mut s, b.offset(0, drop), rad, (band - drop).max(1), wide << 24);
@@ -1960,5 +1960,17 @@ pub mod veil {
         }
         let back = crate::video::wm::desktop::live_back();
         row(out, x0, y, back.as_ref(), look);
+    }
+}
+
+// ── VEIL-LOGIN (rmbp-ledger B1116, BP-video-11) — TAIL-APPENDED so no line inside `pub mod veil` moves ─────────────────
+// The login and lock backdrop's Look: the VEIL darkened 20 % (DESIGN-LANGUAGE §3.9) with the `elev.4` scrim behind the
+// form (§2.4), both black, laid in one blend (`theme::login_veil_a`: 113 light, 153 dark). No `surface.window` tint:
+// the login's white text sits on it. Painted by `veil::row`, kept by `desktop::LOGIN_VEIL` (wallpaper.rs selects it).
+impl veil::Look {
+    /// The login and lock backdrop: black at `theme::login_veil_a()` over the VEIL.
+    #[inline]
+    pub fn login() -> veil::Look {
+        veil::Look { face: 0x0000_0000, a: crate::video::theme::login_veil_a() }
     }
 }

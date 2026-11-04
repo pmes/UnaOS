@@ -272,7 +272,7 @@ pub const DESKTOP: u32 = crate::video::wm::DESKTOP_BG;
 /// DESIGN-LANGUAGE §2.4 `elev.2` as two `0xAARRGGBB` shadow inks `(near, far)`: `0 0 2 pt` and `0 8 24 pt`, black at
 /// 12 % / 18 % in light and 30 % / 45 % in dark. Black is `palette_core::softy::PRESS` (the table's own ink-black).
 pub fn elev2() -> (u32, u32) {
-    let (n, f) = if is_dark() { (77u32, 115u32) } else { (31, 46) };
+    let (n, f) = crate::video::theme::elev2(); // ELEV-ONE (B1116): `elev.2` held once, `theme::ELEV2`
     (light::PRESS | n << 24, light::PRESS | f << 24)
 }
 
