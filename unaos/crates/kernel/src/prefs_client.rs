@@ -987,20 +987,66 @@ fn set_holder_in_session(tag: u8, corr: u32) -> bool {
 // a live holder's own -ECONNRESET reply goes through the same `deliver` and is byte-identical. The key is the
 // row GENERATION both arches bump before `on_exit` (`clear_handle_row`): the reset is kernel-made when the
 // (row, rgen) the relay went to (`bus_route::fulfiller_row`, read before the route) is no longer live; a live
-// holder's own -ECONNRESET stays its final answer. A SET keeps -ECONNRESET final (an in-session holder may
-// have committed it; B1155 already keeps SETs off pre-login holders).
+// holder's own -ECONNRESET stays its final answer. A SET whose frame the holder READ keeps -ECONNRESET final
+// (committed-or-not is unknowable; B1155 already keeps SETs off pre-login holders); one it never read is
+// answered by the kernel fulfiller too (RELAY-RESET-SET B1169, below).
 // =================================================================================================
-/// Is `status` a kernel-made -ECONNRESET for a GET / LIST whose holder `held` has died? Then the kernel
+/// Is `status` a kernel-made -ECONNRESET for a GET / LIST (or an UNREAD SET) whose holder `held` has died? Then the kernel
 /// fulfiller answers (`relay` returns `None`).
 #[cfg(feature = "busreg")]
 fn reset_by_kernel(hdr: &crate::bus::BusHdr, tag: u8, held: Option<(usize, u64)>, status: i32) -> bool {
-    if status as i64 != una_abi::ECONNRESET || hdr.verb == una_abi::BUS_VERB_PREF_SET {
+    if status as i64 != una_abi::ECONNRESET || (hdr.verb == una_abi::BUS_VERB_PREF_SET && !set_unread_take(hdr.corr)) { // RELAY-RESET-SET (B1169): a SET passes only when on_exit marked its frame UNREAD (file tail)
         return false;
     }
     let Some((row, rgen)) = held else { return false };
     if (crate::arch::syscall::busreg_ops().rgen)(row) == rgen {
         return false; // the holder lives: its own -ECONNRESET is its answer
     }
-    serial_println!("[prefsbus] relay verb={} corr={} fulfiller gone — kernel fulfiller answers", tag, hdr.corr);
+    serial_println!("[prefsbus] relay verb={} corr={} fulfiller gone{} — kernel fulfiller answers", tag, hdr.corr, if hdr.verb == una_abi::BUS_VERB_PREF_SET { " unread" } else { "" }); // RELAY-RESET-SET (B1169): GET / LIST bytes unchanged
     true
+}
+
+// =================================================================================================
+// RELAY-RESET-SET (rmbp-ledger B1169) — TAIL-APPENDED. A relayed SET whose holder dies mid-relay has two
+// truths: the holder READ the frame (MRECV'd it: committed-or-not is unknowable, the -ECONNRESET stays final)
+// or the frame still sat UNREAD in its mailbox when the row was torn down (the holder never saw it: the
+// kernel fulfiller writes it, nothing can overtake it because the frame is destroyed). Only the arch mailbox
+// clear sees the difference; `bus_route::on_exit` hands the CLIENT corr of an unread SET here through
+// `note_set_unread` BEFORE it delivers the reset, and `reset_by_kernel` consumes the mark once. The mark is
+// kernel-side (ring 3 cannot reach it); the reply frame stays byte-identical. Ring of `Q_CAP`, 0 = empty
+// (corr 0 is PrefChanged's, never a call's); full = the oldest mark is overwritten (that SET stays -ECONNRESET).
+// =================================================================================================
+#[cfg(feature = "busreg")]
+static SET_UNREAD: crate::sync::Mutex<([u32; Q_CAP], usize)> = crate::sync::Mutex::new(([0u32; Q_CAP], 0));
+
+/// `bus_route::on_exit`: the SET relayed for client corr `corr` was never read by its (now dead) holder.
+#[cfg(feature = "busreg")]
+pub fn note_set_unread(corr: u32) {
+    if corr == 0 {
+        return;
+    }
+    locked(|| {
+        let mut u = SET_UNREAD.lock();
+        let i = u.1;
+        u.0[i] = corr;
+        u.1 = (i + 1) % Q_CAP;
+    });
+}
+
+/// Take (clear) the unread mark of client corr `corr`. `true` = on_exit marked that SET's frame unread.
+#[cfg(feature = "busreg")]
+pub fn set_unread_take(corr: u32) -> bool {
+    if corr == 0 {
+        return false;
+    }
+    locked(|| {
+        let mut u = SET_UNREAD.lock();
+        match u.0.iter().position(|&c| c == corr) {
+            Some(i) => {
+                u.0[i] = 0;
+                true
+            }
+            None => false,
+        }
+    })
 }
