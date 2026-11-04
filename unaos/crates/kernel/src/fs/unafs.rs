@@ -304,7 +304,7 @@ impl SectorDevice for SdSectorDevice {
                 buf.len()
             )));
         }
-        let r = handle_write(self.handle, lba, buf);
+        let r = handle_write(self.handle, lba, buf); #[cfg(all(target_arch = "x86_64", feature = "wc"))] { rawrote::warm_drop(lba, 1); }
         match &r { Ok(()) => self.ra.write_through(lba, buf), Err(_) => self.ra.invalidate() } // BOOT80: the window stays true to the medium
         match r {
             Ok(()) => Ok(()),
@@ -342,7 +342,7 @@ impl SectorDevice for SdSectorDevice {
             return Ok(());
         }
         let handle = self.handle;
-        let sectors = self.sectors;
+        let sectors = self.sectors; #[cfg(all(target_arch = "x86_64", feature = "wc"))] { if rawrote::warm_serve(handle, lba, buf) { return Ok(()); } }
         self.ra.read(lba, buf, sectors, |start, b| handle_read_multi(handle, start, b))
     }
 
@@ -350,7 +350,7 @@ impl SectorDevice for SdSectorDevice {
     /// medium like the single-sector path (the K8a ordering note on `flush` below holds unchanged);
     /// the read-ahead window is refreshed with what landed, and dropped if the write failed part-way.
     fn write_sectors(&mut self, lba: u64, buf: &[u8]) -> Result<(), SectorError> {
-        let r = handle_write_multi(self.handle, lba, buf);
+        let r = handle_write_multi(self.handle, lba, buf); #[cfg(all(target_arch = "x86_64", feature = "wc"))] { rawrote::warm_drop(lba, (buf.len() as u64).div_ceil(512)); }
         match &r {
             Ok(()) => self.ra.write_through(lba, buf),
             Err(_) => self.ra.invalidate(),
@@ -789,8 +789,8 @@ enum Attempt<R> {
 ///
 /// UNAFSTXN: `f` is `FnMut` rather than `FnOnce` because a transaction that dies on a transient
 /// `Busy` is RESTARTED — see [`with_unafs`]'s restart loop and [`TXN_BUSY_ATTEMPTS`].
-fn with_unafs_attempt<R>(f: &mut impl FnMut(&mut KernelUnaFS) -> R, arm: bool, #[cfg(all(target_arch = "x86_64", feature = "wc"))] took: &mut u64) -> Attempt<R> {
-    attempt_span(arm, || { #[cfg(all(target_arch = "x86_64", feature = "wc"))] { if !crate::video::renderwedge::wait_unlocked(&MOUNT, crate::video::renderwedge::W_UNAFS) { return Attempt::Settled(Err(MountError::Busy)); } } // RENDERWEDGE (B520): the RENDER task's acquire of the mount is bounded (MOUNT_BOUND_MS) — f28's wedge was this masked spin with no bound; past it `[render] wait-timeout what=unafs-mount` and a clean Busy (nothing was touched). Every other caller is unchanged. ⚠ SAME-LINE fold: line :794's `MOUNT.lock()` keeps its line and column (its `#[track_caller]` site)
+fn with_unafs_attempt<R>(f: &mut impl FnMut(&mut KernelUnaFS) -> R, arm: bool, #[cfg(all(target_arch = "x86_64", feature = "wc"))] took: &mut u64, #[cfg(all(target_arch = "x86_64", feature = "wc"))] rel: &mut u64) -> Attempt<R> {
+    attempt_span(arm, || { #[cfg(all(target_arch = "x86_64", feature = "wc"))] { if !crate::video::renderwedge::wait_unlocked(&MOUNT, crate::video::renderwedge::W_UNAFS) { return Attempt::Settled(Err(MountError::Busy)); } } #[cfg(all(target_arch = "x86_64", feature = "wc"))] let _rel = lockcensus::Release(&mut *rel); // RENDERWEDGE (B520): the RENDER task's acquire of the mount is bounded (MOUNT_BOUND_MS) — f28's wedge was this masked spin with no bound; past it `[render] wait-timeout what=unafs-mount` and a clean Busy (nothing was touched). Every other caller is unchanged. ⚠ SAME-LINE fold: line :794's `MOUNT.lock()` keeps its line and column (its `#[track_caller]` site)
         let mut guard = MOUNT.lock(); #[cfg(all(target_arch = "x86_64", feature = "wc"))] { *took = crate::hidstall::now_us(); } let _own = crate::lockowner::own(crate::lockowner::UNAFS); #[cfg(all(target_arch = "x86_64", feature = "wc"))] if splitwrite::ticket_foreign() { return Attempt::Restart; } #[cfg(target_arch = "x86_64")] mount_poison_check(&mut *guard); // POISON2 (B846) MOUNTPOISON: a dead holder's mark discards the in-RAM instance before anything reads it (file tail; LINE-NEUTRAL, before this comment). UNAFSWRITE (B825): another task's commit is writing with MOUNT released — leave MOUNT untouched and restart (LINE-NEUTRAL, before this comment). STACKGUARD2 (B403): the holder, released if it overflows mid-transaction
         // UNAFSTXN: open the attempt's contention window, INSIDE the hold. Clearing it before the
         // acquire would be an SMP bug: a core waiting on `MOUNT` would wipe the latch belonging to
@@ -897,7 +897,7 @@ fn with_unafs_attempt<R>(f: &mut impl FnMut(&mut KernelUnaFS) -> R, arm: bool, #
     let budget = crate::arch::hw_wait_budget();
     let mut restarts: u32 = 0;
     for _ in 0..TXN_BUSY_ATTEMPTS {
-        #[cfg(all(target_arch = "x86_64", feature = "wc"))] if !splitwrite::ticket_wait() { break; } if let Err(e) = prebind() { note_txn_restarts(restarts, true); return Err(e); } match { let t_mask = crate::hidstall::now_us(); #[cfg(all(target_arch = "x86_64", feature = "wc"))] let c0 = lockcensus::open(); #[cfg(all(target_arch = "x86_64", feature = "wc"))] let mut took = 0u64; let arm = attempt_arm(read); #[cfg(all(target_arch = "x86_64", feature = "wc"))] let a = with_unafs_attempt(&mut f, arm, &mut took); #[cfg(not(all(target_arch = "x86_64", feature = "wc")))] let a = with_unafs_attempt(&mut f, arm); note_attempt(arm, t_mask); #[cfg(all(target_arch = "x86_64", feature = "wc"))] { lockcensus::close(c0, t_mask, took); } a } { // HIDSTALL (B485): the attempt's IRQ-masked span, on the stall line as `masked_ms=`
+        #[cfg(all(target_arch = "x86_64", feature = "wc"))] if !splitwrite::ticket_wait() { break; } if let Err(e) = prebind() { note_txn_restarts(restarts, true); return Err(e); } match { let t_mask = crate::hidstall::now_us(); #[cfg(all(target_arch = "x86_64", feature = "wc"))] let c0 = lockcensus::open(); #[cfg(all(target_arch = "x86_64", feature = "wc"))] let mut took = 0u64; #[cfg(all(target_arch = "x86_64", feature = "wc"))] let mut rel = 0u64; let arm = attempt_arm(read); #[cfg(all(target_arch = "x86_64", feature = "wc"))] let a = with_unafs_attempt(&mut f, arm, &mut took, &mut rel); #[cfg(not(all(target_arch = "x86_64", feature = "wc")))] let a = with_unafs_attempt(&mut f, arm); note_attempt(arm, t_mask); #[cfg(all(target_arch = "x86_64", feature = "wc"))] { lockcensus::close(c0, t_mask, took, rel); } a } { // HIDSTALL (B485): the attempt's IRQ-masked span, on the stall line as `masked_ms=`
             Attempt::Settled(out) => {
                 if restarts > 0 {
                     note_txn_restarts(restarts, true);
@@ -3054,7 +3054,7 @@ pub mod splitread {
     pub fn note_bound(handle: block::BlockHandle) {
         let span = SPANS.lock().iter().find(|(h, _)| *h == handle).map(|e| e.1);
         let epoch = EPOCH.fetch_add(1, Ordering::Relaxed) + 1;
-        *BOUND.lock() = span.map(|span| Bound { epoch, handle, span }); super::readarm::note_bound(handle); // UNAFSREADUNMASKED (B1035): every install records whether its medium takes the read arm
+        *BOUND.lock() = span.map(|span| Bound { epoch, handle, span }); super::readarm::note_bound(handle); super::rawrote::warm_clear(); // UNAFSREADUNMASKED (B1035): every install records whether its medium takes the read arm
     }
 
     /// Why a split read returned no bytes (the caller maps these to its own error type).
@@ -5311,7 +5311,7 @@ pub mod lockhold {
         INJECT.store(1, Ordering::Relaxed);
         let (r, a) = super::splitread::read_with(path, 0, len);
         let a_same = r.is_ok_and(|d| same(&d[..]));
-        let retry = a_same && a.tries == 2 && a.how == "split" && a.chunks == 0;
+        let retry = a_same && a.tries == 2 && a.how == "split" && a.chunks == 0 && a.held_split_us <= KAT_HOLD_MAX_US; // F39UNAFSHOLDRELEASE (B1120): the plan hold right after a commit under the bound
         INJECT.store(TRIES + 1, Ordering::Relaxed);
         let (r, b) = super::splitread::read_with(path, 0, len);
         let b_same = r.is_ok_and(|d| same(&d[..]));
@@ -5321,10 +5321,10 @@ pub mod lockhold {
         INJECT_TID.store(0, Ordering::Relaxed);
         let _ = super::splitwrite::with_unafs_write(|fs| fs.resolve_path("/var").and_then(|var| fs.remove_attribute(var, KAT_ATTR)));
         serial_println!(
-            "[unafslock] kat retry tries={} how={} match={} -> {} · chunked tries={} how={} chunks={} restarts={} hold_max_us={} match={} left={} -> {}",
+            "[unafslock] kat retry tries={} how={} match={} split_hold_us={} -> {} · chunked tries={} how={} chunks={} restarts={} hold_max_us={} match={} left={} -> {}",
             a.tries,
             a.how,
-            a_same,
+            a_same, a.held_split_us,
             if retry { "ok" } else { "FAIL" },
             b.tries,
             b.how,
@@ -5695,13 +5695,26 @@ pub mod rawrote {
     struct Noting<'a> {
         dev: SdSectorDevice,
         spans: &'a mut Vec<(u64, u64)>,
+        /// F39UNAFSHOLDRELEASE (B1120) WARM: each span's written bytes, index-aligned with `spans` (empty past `WARM_SPAN_SECTORS`).
+        copies: &'a mut Vec<Vec<u8>>,
     }
 
     impl Noting<'_> {
-        fn note(&mut self, lba: u64, sectors: u64) {
+        fn note(&mut self, lba: u64, sectors: u64, buf: &[u8]) {
             match self.spans.last_mut() {
                 Some(l) if l.0.saturating_add(l.1) == lba => l.1 = l.1.saturating_add(sectors),
-                _ => self.spans.push((lba, sectors)),
+                _ => {
+                    self.spans.push((lba, sectors));
+                    self.copies.push(Vec::new());
+                }
+            }
+            let n = self.spans.last().map(|l| l.1).unwrap_or(0);
+            if let Some(c) = self.copies.last_mut() {
+                if n > WARM_SPAN_SECTORS {
+                    *c = Vec::new(); // file data, not the path's metadata: not kept
+                } else {
+                    c.extend_from_slice(buf);
+                }
             }
         }
     }
@@ -5711,7 +5724,7 @@ pub mod rawrote {
             self.dev.read_sector(lba, buf)
         }
         fn write_sector(&mut self, lba: u64, buf: &[u8]) -> Result<(), SectorError> {
-            self.note(lba, 1);
+            self.note(lba, 1, buf);
             self.dev.write_sector(lba, buf)
         }
         fn sector_count(&self) -> u64 {
@@ -5724,7 +5737,7 @@ pub mod rawrote {
             self.dev.read_sectors(lba, buf)
         }
         fn write_sectors(&mut self, lba: u64, buf: &[u8]) -> Result<(), SectorError> {
-            self.note(lba, (buf.len() as u64).div_ceil(512));
+            self.note(lba, (buf.len() as u64).div_ceil(512), buf);
             self.dev.write_sectors(lba, buf)
         }
     }
@@ -5733,7 +5746,12 @@ pub mod rawrote {
     /// `RA_GEN` the phase moves to) published before the caller moves it. A failed phase's issued spans are noted too.
     pub(super) fn write_noted(s: &::unafs::fs::StagedCommit, dev: SdSectorDevice, span: &PartitionSpan, tag: u64) -> bool {
         let mut spans: Vec<(u64, u64)> = Vec::new();
-        let ok = s.write_staged(&mut BlockAdapter::for_partition(Noting { dev, spans: &mut spans }, span)).is_ok();
+        let mut copies: Vec<Vec<u8>> = Vec::new();
+        let handle = dev.handle;
+        let ok = s.write_staged(&mut BlockAdapter::for_partition(Noting { dev, spans: &mut spans, copies: &mut copies }, span)).is_ok();
+        if ok {
+            warm_keep(handle, &spans, copies); // F39UNAFSHOLDRELEASE (B1120) WARM: a failed phase keeps nothing
+        }
         crate::arch::without_interrupts(|| {
             let mut w = WROTE.lock();
             let more: u64 = spans.iter().map(|e| e.1).sum();
@@ -5802,6 +5820,106 @@ pub mod rawrote {
         }
         Ok(out)
     }
+
+    // ── F39UNAFSHOLDRELEASE (rmbp-ledger B1120) WARM — the commit's own written blocks, served to the next plan hold from RAM.
+    // A split commit is CoW: its btree path nodes, inode and map leaves land at NEW LBAs in the write phase, which no window
+    // ever held, so the next `splitread` plan hold (`resolve_path` + `read_inode`) read each cold under MOUNT (one window fill
+    // each). Their bytes pass through `Noting`: a successful phase keeps its small spans (<= `WARM_SPAN_SECTORS`, the path's
+    // metadata; a longer span is file data) in `WARM`, at most `WARM_SECTORS_MAX` sectors, oldest dropped first. A copy is
+    // exactly the medium's bytes at its LBA: kept only after write_staged's flush barrier; every later write through ANY
+    // `SdSectorDevice` (:307/:353 folds) drops the entries it overlaps before a reader can run; every bind clears (:3057 fold).
+    // K8a, as `narrow`: past the mount device only the write phase writes. `WARM` is a LEAF lock taken masked (TICKET ⊃ MOUNT ⊃
+    // WARM, never with WROTE held, no ISR); no allocation under it (the merge runs outside, put back only if no drop moved
+    // `drops`). Served on the window path only (`SdSectorDevice::read_sectors` :345 fold); counted by `lockcensus::warm_hit`.
+
+    /// A span longer than this (one 32 KiB window) is file data: not kept.
+    const WARM_SPAN_SECTORS: u64 = 64;
+    /// Sectors kept in `WARM` (256 KiB); past it the oldest entries drop.
+    const WARM_SECTORS_MAX: u64 = 512;
+
+    struct Warm {
+        ents: Vec<(block::BlockHandle, u64, Vec<u8>)>,
+        /// Moves on every drop and clear: a merge built outside the lock is discarded if it moved meanwhile.
+        drops: u64,
+    }
+
+    static WARM: Mutex<Warm> = Mutex::new(Warm { ents: Vec::new(), drops: 0 });
+
+    /// `write_noted` (phase ok): keep the phase's small spans on `handle` (written in this order, newest last).
+    fn warm_keep(handle: block::BlockHandle, spans: &[(u64, u64)], copies: Vec<Vec<u8>>) {
+        let (mut ents, d0) = crate::arch::without_interrupts(|| {
+            let mut w = WARM.lock();
+            (core::mem::take(&mut w.ents), w.drops)
+        });
+        for (&(lba, n), c) in spans.iter().zip(copies) {
+            if n == 0 || n > WARM_SPAN_SECTORS || c.len() as u64 != n * 512 {
+                continue;
+            }
+            ents.retain(|e| e.1.saturating_add(e.2.len() as u64 / 512) <= lba || e.1 >= lba.saturating_add(n));
+            ents.push((handle, lba, c));
+        }
+        let mut total: u64 = ents.iter().map(|e| e.2.len() as u64 / 512).sum();
+        let mut cut = 0usize;
+        while total > WARM_SECTORS_MAX && cut < ents.len() {
+            total -= ents[cut].2.len() as u64 / 512;
+            cut += 1;
+        }
+        ents.drain(..cut).for_each(drop);
+        let stale = crate::arch::without_interrupts(|| {
+            let mut w = WARM.lock();
+            if w.drops == d0 {
+                core::mem::swap(&mut w.ents, &mut ents);
+            } else {
+                w.ents.clear(); // a write raced the merge: keep nothing rather than a stale copy
+            }
+            core::mem::take(&mut ents) // the displaced table, freed outside the lock
+        });
+        drop(stale);
+    }
+
+    /// :345 fold, under MOUNT: `buf` (whole sectors at `lba` on `handle`) from a kept copy. No allocation.
+    pub(super) fn warm_serve(handle: block::BlockHandle, lba: u64, buf: &mut [u8]) -> bool {
+        if buf.is_empty() || buf.len() % 512 != 0 {
+            return false;
+        }
+        let n = buf.len() as u64 / 512;
+        let hit = crate::arch::without_interrupts(|| {
+            let w = WARM.lock();
+            for (h, at, c) in w.ents.iter() {
+                if *h == handle && lba >= *at && lba.saturating_add(n) <= at.saturating_add(c.len() as u64 / 512) {
+                    let off = ((lba - *at) * 512) as usize;
+                    buf.copy_from_slice(&c[off..off + buf.len()]);
+                    return true;
+                }
+            }
+            false
+        });
+        if hit {
+            super::lockcensus::warm_hit();
+        }
+        hit
+    }
+
+    /// :307/:353 folds: a medium write to `[lba, lba + n)` drops every kept copy it overlaps (any handle). A drop frees under
+    /// the leaf lock (no allocation); with nothing kept it is one masked take.
+    pub(super) fn warm_drop(lba: u64, n: u64) {
+        let end = lba.saturating_add(n);
+        crate::arch::without_interrupts(|| {
+            let mut w = WARM.lock();
+            w.drops = w.drops.wrapping_add(1);
+            w.ents.retain(|e| !(e.1 < end && lba < e.1.saturating_add(e.2.len() as u64 / 512)));
+        });
+    }
+
+    /// :3057 fold — a bind (a new bound mount): no copy survives it.
+    pub(super) fn warm_clear() {
+        let old = crate::arch::without_interrupts(|| {
+            let mut w = WARM.lock();
+            w.drops = w.drops.wrapping_add(1);
+            core::mem::take(&mut w.ents)
+        });
+        drop(old);
+    }
 }
 
 // ── F39UNAFSCENSUS (rmbp-ledger B1106, BP-storage-8) — the MOUNT lock census. F39UNAFSLOCK (B1098) narrowed `ra_sync` to the
@@ -5851,6 +5969,20 @@ pub mod lockcensus {
     static RA_SLOTS: AtomicU64 = AtomicU64::new(0);
     static RA_DROPPED: AtomicU64 = AtomicU64::new(0);
     static RA_FULL: AtomicU64 = AtomicU64::new(0);
+    /// F39UNAFSHOLDRELEASE (B1120): block reads `rawrote::warm_serve` answered from a commit's own written bytes (no fill).
+    static WARM_HITS: AtomicU64 = AtomicU64::new(0);
+
+    /// F39UNAFSHOLDRELEASE (B1120): the MOUNT release stamp. `with_unafs_attempt` (:793) declares it BEFORE :794's guard, so it
+    /// drops right AFTER the guard unlocks MOUNT (reverse declaration order, early returns included) and before `attempt_span`'s
+    /// exit: `close`'s hold ends at the release, not after `note_attempt`.
+    pub struct Release<'a>(pub &'a mut u64);
+
+    impl Drop for Release<'_> {
+        #[inline(always)]
+        fn drop(&mut self) {
+            *self.0 = crate::hidstall::now_us();
+        }
+    }
 
     /// :899 fold — the attempt opens: the window fills so far.
     #[inline(always)]
@@ -5860,16 +5992,19 @@ pub mod lockcensus {
 
     /// :899 fold — the attempt (opened at `t0_us` with `f0` fills, MOUNT taken at `took_us`, 0 = never taken) ended, MOUNT
     /// released. Over `OVER_US` it is counted and, when among the worst, kept with its site (`with_unafs`'s caller), task, fills
-    /// and its wait / hold split (F39UNAFSTRUESPAN: no take, i.e. the RENDERWEDGE Busy return, is all wait).
+    /// and its wait / hold split (F39UNAFSTRUESPAN: no take, i.e. the RENDERWEDGE Busy return, is all wait). F39UNAFSHOLDRELEASE
+    /// (B1120): the hold runs from the take to the release (`rel_us`, the `Release` stamp); wait + hold <= span, the rest the
+    /// release epilogue. No release stamp (never expected past a take): the hold runs to `close` as before.
     #[track_caller]
     #[inline(always)]
-    pub fn close(f0: u64, t0_us: u64, took_us: u64) {
+    pub fn close(f0: u64, t0_us: u64, took_us: u64, rel_us: u64) {
         let us = crate::hidstall::now_us().saturating_sub(t0_us);
         if us <= OVER_US {
             return;
         }
         let wait = if took_us == 0 { us } else { took_us.saturating_sub(t0_us).min(us) };
-        keep(Location::caller(), tx_io().0.wrapping_sub(f0), us, wait, us - wait);
+        let hold = if took_us != 0 && rel_us >= took_us { rel_us.saturating_sub(took_us).min(us - wait) } else { us - wait };
+        keep(Location::caller(), tx_io().0.wrapping_sub(f0), us, wait, hold);
     }
 
     #[inline(never)]
@@ -5918,6 +6053,12 @@ pub mod lockcensus {
         }
     }
 
+    /// `rawrote::warm_serve` fold — one block read answered from a commit's own written bytes.
+    #[inline(always)]
+    pub fn warm_hit() {
+        WARM_HITS.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// hidstall.rs:439 fold — the desktop's minute roll.
     pub fn minute() {
         say("minute");
@@ -5944,9 +6085,10 @@ pub mod lockcensus {
         let slots = RA_SLOTS.swap(0, Ordering::Relaxed);
         let dropped = RA_DROPPED.swap(0, Ordering::Relaxed);
         let full = RA_FULL.swap(0, Ordering::Relaxed);
+        let warm = WARM_HITS.swap(0, Ordering::Relaxed);
         serial_println!(
-            "[unafslock] ra why={} syncs={} kept={} dropped={} full={}",
-            why, syncs, slots.saturating_sub(dropped), dropped, full
+            "[unafslock] ra why={} syncs={} kept={} dropped={} full={} warm={}",
+            why, syncs, slots.saturating_sub(dropped), dropped, full, warm
         );
     }
 }
