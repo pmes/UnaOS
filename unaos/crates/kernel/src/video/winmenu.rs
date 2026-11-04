@@ -1339,7 +1339,7 @@ fn republish_open_rect(pw: usize, ph: usize, s: &BarSnapshot) -> Option<strip::R
 // ---------------------------------------------------------------------------
 
 /// Drop title `k` (0-based) of the bar owner's tree.
-fn open_title(k: usize, s: &BarSnapshot) { crate::video::lag::menu_opened(); // GLASSLAG M1 (B370)
+fn open_title(k: usize, s: &BarSnapshot) { crate::video::lag::menu_opened(); WALK.reset(); // GLASSLAG M1 (B370) · F39MENUKEYSONE (B1123): the walk starts at page 0, nothing lit (LINE-NEUTRAL)
     let is_app = s.is_app_box(k);
     let is_win = s.is_win_box(k); // WINDOWLIST — rows are rebuilt from the live table at every open
     if is_win {
@@ -3095,7 +3095,7 @@ fn sheet_hover(s: &BarSnapshot, r: strip::Rect, pw: usize, ph: usize) -> usize {
         }
         _ => 0,
     }; #[cfg(all(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")), feature = "quarry"))] let hot = undo_hover(s, r, pw, ph, hot); // UNDOMOVE (B716): a live Undo/Redo row lights like any pickable row (LINE-NEUTRAL append)
-    HOVER.store(hot, Ordering::Relaxed);
+    let hot = walk_lit(hot); HOVER.store(hot, Ordering::Relaxed); // F39MENUKEYSONE (B1123): the walk's sel is the lit row (LINE-NEUTRAL)
     hot
 }
 
@@ -3171,4 +3171,73 @@ fn undo_hover(s: &BarSnapshot, r: strip::Rect, pw: usize, ph: usize, hot: usize)
         Some(i) if undo_row(&EDIT_MENU_DEFAULT[i]).is_some() => i + 1,
         _ => hot,
     }
+}
+
+// ── F39MENUKEYSONE (rmbp-ledger B1123): the window menus on THE menu key walker (`crystal::walk`) ─────────────────────
+
+/// F39MENUKEYSONE — the open dropdown's walk (lock-free: [`compose`] runs from the present tail).
+static WALK: crystal::walk::Cell = crystal::walk::Cell::new();
+
+/// F39MENUKEYSONE — the lit item (+1) after the pointer's item `hot` (+1, `0` = none): a CROSSING writes the walk's
+/// sel, a still pointer leaves the keys' sel.
+fn walk_lit(hot: usize) -> usize {
+    WALK.cross(hot.checked_sub(1)).map_or(0, |i| i + 1)
+}
+
+/// F39MENUKEYSONE — a key while a window menu is open: the walk's act. `true` = consumed. A busy snapshot consumes a
+/// menu key and moves nothing (PANEL V-3: the menu is modal while it is down). Return presses the lit item through
+/// [`press_at`] at the item's centre (the pick road a click takes, incl. a live Undo/Redo row). Task context only
+/// (the key seam), as [`drive`] is.
+pub fn key_walk(ev: crate::pal::Event) -> bool {
+    let crate::pal::Event::Key(c) = ev else { return false };
+    if !is_open() {
+        return false;
+    }
+    let walks = matches!(c, 0x1B | b'\r' | b'\n' | una_abi::KEY_DOWN | una_abi::KEY_UP | una_abi::KEY_PGDN | una_abi::KEY_PGUP);
+    let (pw, ph) = panel();
+    if pw == 0 {
+        return false;
+    }
+    let s = bar_boxes(pw, ph);
+    if s.busy || s.open == 0 {
+        return walks;
+    }
+    let items = match menu_of(&s, s.open - 1, "key") {
+        Menu::Found(items, _) => items,
+        Menu::Busy => return walks,
+        Menu::Absent => return false,
+    };
+    let n = items.len();
+    let ok = |i: usize| items[i].flags & FLAG_SEPARATOR == 0 && (items[i].flags & FLAG_DISABLED == 0 || walk_undo(&items[i]));
+    match WALK.update(n, (n, false), |w| w.key(c, &ok)) {
+        crystal::walk::Act::Pass => false,
+        crystal::walk::Act::Held => true,
+        crystal::walk::Act::Moved | crystal::walk::Act::Paged => {
+            drive(); // MENU-DRIVE: the lit item is in the dropdown's damage sig
+            true
+        }
+        crystal::walk::Act::Dismiss => {
+            dismiss("esc");
+            true
+        }
+        crystal::walk::Act::Press(i) => {
+            if let Some(r) = open_rect(pw, ph) {
+                let (mx, my, _, _) = crystal::sheet::body(r);
+                press_at((mx + BORDER + PADX() + 1) as i32, (my + item_top(items, i) + ITEM_H() / 2) as i32);
+            }
+            true
+        }
+    }
+}
+
+/// F39MENUKEYSONE — a `FLAG_DISABLED` row the walk may still light: a live WM Edit Undo/Redo row (UNDOMOVE B716).
+#[cfg(all(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")), feature = "quarry"))]
+fn walk_undo(it: &MenuItem) -> bool {
+    undo_row(it).is_some()
+}
+
+/// F39MENUKEYSONE — no file manager in this image: no live Undo/Redo row.
+#[cfg(not(all(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")), feature = "quarry")))]
+fn walk_undo(_it: &MenuItem) -> bool {
+    false
 }
