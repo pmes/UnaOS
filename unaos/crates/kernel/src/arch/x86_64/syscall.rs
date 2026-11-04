@@ -32543,3 +32543,13 @@ fn scroll_ring3_press_legs(win: crate::video::wm::WinId, id: u32, owner: u64, bu
 fn focus_held_now(owner: u64) -> bool { crate::video::wm::focussteal::held_now(owner) }
 #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
 fn focus_held_now(_owner: u64) -> bool { false }
+
+// =================================================================================================
+// PREFSELF-PRELOGIN (rmbp-ledger B1155) — TAIL-APPENDED. `prefs_client::relay` asks whether the row
+// holding Principia's SET tag may commit a SET, through this arch's ONE judge, verbatim.
+// =================================================================================================
+/// May bus row `row` SET a preference now (a program of the open session)? `pref_caller_in_session`'s answer.
+#[cfg(feature = "busreg")]
+pub fn pref_row_in_session(row: usize) -> bool {
+    pref_caller_in_session(row)
+}

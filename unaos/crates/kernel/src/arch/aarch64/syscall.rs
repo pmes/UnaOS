@@ -27784,3 +27784,13 @@ fn idle_focus_grant(asid: u64) {
     crate::video::wm::focus_changed(asid);
     serial_println!(":: wc-arm64: input focus -> asid {} (first window, shell was idle) ::", asid);
 }
+
+// =================================================================================================
+// PREFSELF-PRELOGIN (rmbp-ledger B1155) — TAIL-APPENDED. `prefs_client::relay` asks whether the row
+// holding Principia's SET tag may commit a SET, through this arch's ONE judge, verbatim.
+// =================================================================================================
+/// May bus row `row` SET a preference now (a program of the open session)? `pref_caller_in_session`'s answer.
+#[cfg(feature = "busreg")]
+pub fn pref_row_in_session(row: usize) -> bool {
+    pref_caller_in_session(slot_ppid_of(row as u64))
+}

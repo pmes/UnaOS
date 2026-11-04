@@ -229,7 +229,7 @@ fn r3_tag(verb: u8) -> Option<u8> {
 /// registration, a refusal, or the wait ran out) — the kernel fulfiller answers instead.
 #[cfg(feature = "busreg")]
 fn relay(hdr: &crate::bus::BusHdr, body: &[u8]) -> Option<Answer> {
-    let tag = r3_tag(hdr.verb)?;
+    let tag = r3_tag(hdr.verb)?; if hdr.verb == una_abi::BUS_VERB_PREF_SET && !set_holder_in_session(tag, hdr.corr) { return None; } // PREFSELF-PRELOGIN (B1155): a SET whose fulfiller is not a program of the open session (a PREFS.ELF launched before login) is never relayed — the kernel fulfiller answers (file tail). LINE-NEUTRAL fold.
     let ops = crate::arch::syscall::busreg_ops();
     let h3 = crate::bus::BusHdr { verb: tag, ..*hdr };
     match crate::bus_route::route_request(ops, KCLIENT_ROW, KCLIENT_GEN, principal(), &h3, body) {
@@ -957,4 +957,23 @@ mod ringkeep {
     pub(super) fn held() -> bool {
         HOLD.load(Ordering::Acquire)
     }
+}
+
+// =================================================================================================
+// PREFSELF-PRELOGIN (rmbp-ledger B1155) — TAIL-APPENDED. A PREFS.ELF launched before login stays
+// anonymous for the session (the boundary is the LAUNCH; a fulfiller never acts as its caller,
+// `bus_route`'s PRINCIPAL RULE), so its forward of a SET is refused -EACCES under its own row. The SET
+// is therefore not relayed to a holder that cannot commit it: `relay` answers `None` and the kernel
+// fulfiller writes, exactly as it does for -ENOENT / -EAGAIN / a timeout. GET and LIST still relay.
+// =================================================================================================
+/// May the row holding Principia's SET tag `tag` commit a SET now? No holder = `true` (the route answers
+/// -ENOENT as before); otherwise the arch's ONE SET judge (`pref_caller_in_session`) on that row.
+#[cfg(feature = "busreg")]
+fn set_holder_in_session(tag: u8, corr: u32) -> bool {
+    let Some((row, _)) = crate::bus_route::fulfiller_row(tag) else { return true };
+    if crate::arch::syscall::pref_row_in_session(row) {
+        return true;
+    }
+    serial_println!("[prefsbus] relay verb={} corr={} fulfiller=row:{} not in session — kernel fulfiller answers", tag, corr, row);
+    false
 }
