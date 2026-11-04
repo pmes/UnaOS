@@ -339,11 +339,12 @@ impl Pump {
     }
 
     fn halt(&mut self, h: Halt, t: &mut dyn Transport) {
-        if matches!(self.state, PumpState::Streaming | PumpState::Stopping) {
+        let live = matches!(self.state, PumpState::Streaming | PumpState::Stopping); // VUGCOMSCANJOGALARM (SR579): the error feed hold's reason (buffered lines running without the skipped one) exists only on a live stream
+        if live {
             self.state = PumpState::Halted(h);
         }
         self.tx.clear();
-        if is_grbl(self.dialect) && matches!(h, Halt::Error { .. }) {
+        if is_grbl(self.dialect) && matches!(h, Halt::Error { .. }) && live {
             let _ = self.rt(t, Realtime::FeedHold);
         }
     }
@@ -391,6 +392,7 @@ impl Pump {
             } else if let Some(n) = s.strip_prefix("ALARM:") {
                 let code = n.trim().parse::<u16>().unwrap_or(0);
                 ev.push(Event::Alarm { code, name: alarm_name(code) });
+                self.outstanding.clear(); // VUGCOMSCANJOGALARM (SR579): grbl flushes its receive buffer at every alarm, so no line of the window is answered after it
                 self.halt(Halt::Alarm { code }, t);
             } else if s.starts_with('<') {
                 match parse_status(s) {
@@ -751,5 +753,16 @@ pub fn jog_lines(d: Dialect, delta: [f64; 3], feed: f64) -> Option<Vec<String>> 
         Dialect::Grbl { .. } => Some(alloc::vec![alloc::format!("$J=G91{mv}")]),
         Dialect::Marlin => Some(alloc::vec![String::from("G91"), alloc::format!("G0{mv}"), String::from("G90")]),
         Dialect::LinuxCnc => None,
+    }
+}
+
+// --- VUGCOMSCANJOGFACE (LEDGER SR579): grbl's jog cancel on the realtime road (named tail hunk) ---
+
+impl Pump {
+    /// grbl 0x85: jog cancel, sent at once on the realtime road (as the feed hold is). grbl decelerates the running jog
+    /// and drops the jogs it holds; with no jog running it ignores the byte. Marlin has no realtime byte: refused by name.
+    pub fn jog_cancel(&mut self, t: &mut dyn Transport) -> Result<(), PumpRefusal> {
+        self.grbl_only("jog cancel")?;
+        self.rt(t, Realtime::JogCancel)
     }
 }

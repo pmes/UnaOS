@@ -753,3 +753,121 @@ fn a_lost_grbl_homes_and_jogs_on_the_relinked_port() {
     assert_eq!(wire, vec!["$H".to_string(), "$J=G91 X1 Y-2 Z0.5 F600".to_string()], "the home and the jog, nothing else");
     std::fs::remove_dir_all(&root).unwrap();
 }
+
+// --- VUGCOMSCANJOGFACE (SR579): an alarm mid-stream leaves no window, so `$H` homes; a Hold during a jog is 0x85 ---
+
+/// A fake grbl for the alarm and the jog cancel: silent until the soft reset, then its banner; answers `$I`, `ok` to
+/// `$H` and `$J=`; the stream line `alarm_at` (0-based) is answered `ALARM:5` (probe fail, a non-critical alarm: grbl
+/// hears `$H` after it) and every later G-code line `error:9` (grbl's G-code lock: the lines still on the wire when the
+/// alarm flushed its buffer). Records every line and every realtime byte (`?` `!` `~` 0x85); returns once `$H` was
+/// answered or 0x85 arrived.
+fn fake_grbl_alarm(mut m: File, alarm_at: usize) -> JoinHandle<(Vec<String>, Vec<u8>, File)> {
+    thread::spawn(move || {
+        let (mut got, mut rt, mut cur) = (Vec::new(), Vec::new(), Vec::<u8>::new());
+        let (mut stream, mut alarmed, mut over) = (0usize, false, false);
+        let mut buf = [0u8; 256];
+        while !over {
+            let n = match m.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            for &b in &buf[..n] {
+                match b {
+                    0x18 => {
+                        m.write_all(b"\r\n").unwrap();
+                        m.write_all(BANNER).unwrap();
+                    }
+                    b'?' | b'!' | b'~' | 0x85 => {
+                        rt.push(b);
+                        over |= b == 0x85;
+                    }
+                    b'\n' => {
+                        let line = String::from_utf8_lossy(&cur).trim().to_string();
+                        cur.clear();
+                        if said_hello(&mut m, &line, VER_A) {
+                            continue;
+                        }
+                        got.push(line.clone());
+                        if line == "$H" || line.starts_with("$J=") {
+                            m.write_all(b"ok\r\n").unwrap();
+                            over |= line == "$H";
+                        } else if alarmed {
+                            m.write_all(b"error:9\r\n").unwrap();
+                        } else if stream == alarm_at {
+                            alarmed = true;
+                            m.write_all(b"ALARM:5\r\n").unwrap();
+                        } else {
+                            stream += 1;
+                            m.write_all(b"ok\r\n").unwrap();
+                        }
+                    }
+                    _ => cur.push(b),
+                }
+            }
+        }
+        (got, rt, m)
+    })
+}
+
+/// A desk started on `path` (the tty opener, hello off) for [`program`].
+fn started_desk(path: &Path) -> (PumpDesk, Box<Opener>) {
+    let p = program();
+    let mut desk = PumpDesk::new(machine());
+    let pass = Verdict::Pass { digest: p.digest(), machine: machine().digest() };
+    let digest = desk.arm(&pass, &p, GRBL).expect("armed by a pass");
+    let mut open = opener(Baud::B115200, Flow::None);
+    let start = PumpEvent::PumpStart {
+        principal: Origin::LocalUser("una".to_string()),
+        program: digest_hex(digest),
+        dialect: "grbl".to_string(),
+        port: path.to_str().unwrap().to_string(),
+    };
+    assert_eq!(said_in(&desk.apply(&start, &mut *open)), "started");
+    (desk, open)
+}
+
+#[test]
+fn an_alarm_mid_stream_then_home_homes() {
+    let (m, path, _s) = pty();
+    let fake = fake_grbl_alarm(m, 2);
+    let (mut desk, mut open) = started_desk(&path);
+    let t0 = Instant::now();
+    let mut words = Vec::new();
+    assert_eq!(drive_until(&mut desk, &mut *open, t0, &mut words, |e| e.starts_with("alarm")), "alarm:5 Probe fail");
+    assert!(matches!(desk.state(), Some(PumpState::Halted(_))), "{:?}", desk.state());
+
+    // The alarm flushed grbl's buffer: the window is gone, so the home is not refused busy. Its answer is claimed past
+    // the stale error:9 answers (never a home's), and no feed hold followed them (the stream was no longer live).
+    let home = PumpEvent::PumpHome { principal: Origin::LocalUser("una".to_string()) };
+    assert_eq!(said_in(&desk.apply(&home, &mut *open)), "home sent: $H");
+    assert_eq!(drive_until(&mut desk, &mut *open, t0, &mut words, |e| e.starts_with("home")), "home ok", "{words:?}");
+    assert!(!words.iter().any(|w| w.starts_with("home error")), "a stale error:9 claimed as the home's: {words:?}");
+    drop(desk);
+    drop(open);
+    let (lines, rt, _m) = fake.join().unwrap();
+    assert_eq!(lines.last().map(String::as_str), Some("$H"), "{lines:?}");
+    assert!(!rt.contains(&b'!'), "no feed hold after the alarm: {rt:?}");
+}
+
+#[test]
+fn a_hold_during_a_jog_writes_jog_cancel() {
+    let (m, path, _s) = pty();
+    let fake = fake_grbl_alarm(m, usize::MAX);
+    let (mut desk, mut open) = started_desk(&path);
+    let t0 = Instant::now();
+    let mut words = Vec::new();
+    assert_eq!(drive_until(&mut desk, &mut *open, t0, &mut words, |e| e == "done"), "done");
+
+    let who = || Origin::LocalUser("una".to_string());
+    let jog = PumpEvent::PumpJog { principal: who(), dx: 2.0, dy: 0.0, dz: 0.0, feed: 300.0 };
+    assert!(said_in(&desk.apply(&jog, &mut *open)).starts_with("jog sent: $J=G91 X2"));
+    // grbl says `ok` when the jog is PLANNED: the axis still moves, and the Hold is its cancel.
+    assert_eq!(drive_until(&mut desk, &mut *open, t0, &mut words, |e| e.starts_with("jog")), "jog ok");
+    assert_eq!(said_in(&desk.apply(&PumpEvent::PumpHold { principal: who() }, &mut *open)), "jog cancelled");
+    drop(desk);
+    drop(open);
+    let (lines, rt, _m) = fake.join().unwrap();
+    assert!(lines.last().is_some_and(|l| l.starts_with("$J=G91 X2")), "{lines:?}");
+    assert_eq!(rt.last(), Some(&0x85u8), "the jog cancel byte on the wire: {rt:?}");
+    assert!(!rt.contains(&b'!'), "a jog cancel is not a feed hold: {rt:?}");
+}

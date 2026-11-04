@@ -440,3 +440,23 @@ fn a_rearmed_pump_resumes_from_the_named_line_and_runs_only_the_rest() {
     let pr = p.progress();
     assert_eq!((pr.sent, pr.acked, pr.total), (lines.len(), lines.len(), lines.len()));
 }
+
+// --- VUGCOMSCANJOGFACE (SR579): grbl's jog cancel is the one realtime byte 0x85, never a feed hold ---
+
+#[test]
+fn jog_cancel_is_0x85_on_the_wire_and_no_feed_hold() {
+    let mut m = MockGrbl::new(1);
+    let mut p = Pump::new(GRBL, &program(3)).unwrap();
+    let ev = drive(&mut p, &mut m, 2_000, |ev| ev.contains(&Event::Done));
+    assert!(ev.contains(&Event::Done));
+    let before = m.realtime.len();
+    p.jog_cancel(&mut m).unwrap();
+    assert_eq!(&m.realtime[before..], &[0x85u8], "the jog cancel byte, alone");
+    assert!(!m.realtime.contains(&b'!'), "a jog cancel is not a feed hold");
+    assert_eq!(p.state(), PumpState::Done, "the pump's own state is untouched");
+    let mut marlin = Pump::new(Dialect::Marlin, "G28\n").unwrap();
+    assert_eq!(
+        marlin.jog_cancel(&mut m).err(),
+        Some(PumpRefusal::NotInDialect { dialect: Dialect::Marlin, what: "jog cancel" })
+    );
+}

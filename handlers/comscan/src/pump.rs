@@ -214,6 +214,9 @@ struct Running {
     hello: Option<String>,
     /// VUGCOMSCANJOG (SR573): the home / jog lines sent on this link and not yet answered, oldest first.
     motion: std::collections::VecDeque<Motion>,
+    /// VUGCOMSCANJOGFACE (SR579): a jog was sent on this link and no home or jog cancel since (grbl answers `$J=` when
+    /// it is PLANNED, so `motion` empties while the axis still moves; Hold / Stop cancel on this, not on `motion`).
+    jogged: bool,
 }
 
 /// Comscan's pump desk: the machine it drives, the armed programs and the one running stream.
@@ -303,6 +306,7 @@ impl PumpDesk {
                 Err(out) => out,
             },
             PumpEvent::PumpHold { .. } | PumpEvent::PumpResume { .. } | PumpEvent::PumpStop { .. } => {
+                if let Some(out) = self.jog_cancel_due(ev) { return out; } // VUGCOMSCANJOGFACE (SR579): Hold / Stop while a grbl jog runs is grbl's jog cancel
                 let Some(r) = self.running.as_mut() else {
                     return refused("nothing is streaming");
                 };
@@ -802,7 +806,7 @@ impl PumpDesk {
         let a = self.armed.remove(u.i);
         let identity = self.identify.as_ref().and_then(|f| f(port.as_str())); // VUGCOMSCANTTYUSBID (SR529)
         let commissioned = commissioned_name(a.dialect, before.as_deref(), said.as_deref()); // VUGCOMSCANJOG (SR573)
-        self.running = Some(Running { pump: a.pump, link: Some(link), port: port.clone(), redial: None, identity, hello: said.clone(), motion: Default::default() });
+        self.running = Some(Running { pump: a.pump, link: Some(link), port: port.clone(), redial: None, identity, hello: said.clone(), motion: Default::default(), jogged: false });
         let mut out = vec![self.squawk(Some("started".to_string()))];
         if let Some(h) = before.or(said) {
             out.push(self.squawk(Some(format!("hello {h}")))); // printed once, at the first open (VUGCOMSCANJOG SR573: as the controller first said it)
@@ -1161,6 +1165,7 @@ impl PumpDesk {
             }
             r.motion.push_back(Motion { word, last: k + 1 == lines.len(), failed: false });
         }
+        r.jogged = word == "jog"; // VUGCOMSCANJOGFACE (SR579): set on a jog, cleared on a home
         vec![self.squawk(Some(format!("{word} sent: {}", lines.join(" / "))))]
     }
 
@@ -1180,7 +1185,7 @@ impl PumpDesk {
             let pending = !r.motion.is_empty();
             let claim = match &e {
                 Event::Message(s) if pending && s.starts_with("ok") => Claim::Ok,
-                Event::Error { code, name, .. } if pending => Claim::Refused(format!("error:{code} {name}")),
+                Event::Error { code, name, .. } if pending && *code != 9 => Claim::Refused(format!("error:{code} {name}")), // VUGCOMSCANJOGALARM (SR579): error:9 answers only a G-code line (a stream line's late answer after an alarm), never `$H` / `$J=`
                 Event::Refused { text, .. } if pending => Claim::Refused(format!("refused: {text}")),
                 Event::Alarm { .. } | Event::Reset | Event::LinkLost => Claim::Drop,
                 _ => Claim::Pass,
@@ -1216,6 +1221,39 @@ impl PumpDesk {
             }
         }
         (keep, words)
+    }
+}
+
+// --- VUGCOMSCANJOGFACE (LEDGER SR579): Hold / Stop while a grbl jog runs is grbl's jog cancel (named tail hunk) ---
+
+impl PumpDesk {
+    /// PumpHold / PumpStop on a grbl run that `jogged` with nothing of a job in flight (the motion guard's own test):
+    /// 0x85 through [`pump_core::Pump::jog_cancel`] (the realtime road), the pending home / jog lines dropped, `jogged`
+    /// cleared, answered `jog cancelled`; no feed hold and no stop follow (a jog runs only with no job in flight, so
+    /// there is nothing else to hold; grbl ignores 0x85 with no jog running). `None`: the request is not a cancel
+    /// (Resume, Marlin, no jog sent, a job in flight) and the Hold / Resume / Stop arm runs as before.
+    fn jog_cancel_due(&mut self, ev: &PumpEvent) -> Option<Vec<PumpEvent>> {
+        if !matches!(ev, PumpEvent::PumpHold { .. } | PumpEvent::PumpStop { .. }) {
+            return None;
+        }
+        let r = self.running.as_mut()?;
+        let st = r.pump.state();
+        if !r.jogged
+            || !matches!(r.pump.dialect(), Dialect::Grbl { .. })
+            || matches!(st, PumpState::Streaming | PumpState::Stopping | PumpState::Rearmed { .. })
+            || r.pump.in_flight() > 0
+        {
+            return None;
+        }
+        let Some(link) = r.link.as_mut() else {
+            return Some(refused("jog cancel: the link is down"));
+        };
+        if let Err(e) = r.pump.jog_cancel(&mut **link) {
+            return Some(refused(format!("jog cancel: {e:?}")));
+        }
+        r.jogged = false;
+        r.motion.clear();
+        Some(vec![self.squawk(Some("jog cancelled".to_string()))])
     }
 }
 
