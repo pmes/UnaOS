@@ -1290,17 +1290,19 @@ fn low_side(vw: &Viewer) -> (u32, (f32, f32)) {
         .expect("the rectangle's sides are on screen")
 }
 
-/// SR601's rectangle face on a (W + 200, `h`) sheet with nothing listed: the low side's midpoint, its glyph's natural
-/// place (sx + 6, sy - 14), and `k` singles anchored there (one why each, so no set forms; ids v20..), offered. SR596
-/// stacks them down from the first: the j-th fits at y0 + 12 j while its 10 px glyph ends on the sheet.
-fn stacked(h: u32, k: usize) -> (Viewer, (f32, f32), Vec<vug_view::photo::ProposalGlyph>) {
+/// SR601's rectangle face on a (W + `grow`, `h`) sheet with `n` listed singles (SR601's [`listed`]) then `k` singles
+/// anchored at the low side's midpoint (one why each, so no set forms; ids v20..), offered: the viewer, the anchored
+/// glyph's natural place (sx + 6, sy - 14) and the glyphs (the listed first). SR596 stacks the anchored ones down from
+/// the first: the j-th fits at y0 + 12 j while its 10 px glyph ends on the sheet.
+fn stacked(h: u32, grow: u32, n: usize, k: usize) -> (Viewer, (f32, f32), Vec<vug_view::photo::ProposalGlyph>) {
     let mut vw = rectangle();
-    vw.view.resize(W + 200, h);
+    vw.view.resize(W + grow, h);
     let (e, (sx, sy)) = low_side(&vw);
-    let ps = (0..k).map(|j| datum(&format!("horizontal v{} sketch=s line=e{e}", 20 + j), &format!("the low side {j}"))).collect();
+    let mut ps = listed(n);
+    ps.extend((0..k).map(|j| datum(&format!("horizontal v{} sketch=s line=e{e}", 20 + j), &format!("the low side {j}"))));
     assert!(photo::offer(&mut vw.view, ps));
     let gs = photo::glyphs(&vw.view);
-    assert_eq!(gs.len(), k, "{k} anchored singles: {gs:?}");
+    assert_eq!(gs.len(), n + k, "{n} listed and {k} anchored singles: {gs:?}");
     (vw, (sx + 6.0, sy - 14.0), gs)
 }
 
@@ -1317,10 +1319,10 @@ fn fitting(h: u32, y0: f32) -> usize {
 fn a_glyph_pushed_past_the_bottom_lifts_above_its_obstacle() {
     use vug_view::sketch::INK;
     let h = H / 2;
-    let (_, (_, y0), _) = stacked(h, 1);
+    let (_, (_, y0), _) = stacked(h, 200, 0, 1);
     let m = fitting(h, y0);
     assert!(m >= 1 && y0 - 12.0 >= 42.0, "the case exists on this sheet: y0 {y0}, {m} fit, the foot 42");
-    let (vw, natural, gs) = stacked(h, m + 1);
+    let (vw, natural, gs) = stacked(h, 200, 0, m + 1);
     assert!(y0 + 12.0 * m as f32 + 10.0 > h as f32, "a drop under the stack passes the bottom: y0 {y0}, {m} fit, h {h}");
     let g = &gs[m];
     assert!((g.at.0 - natural.0).abs() < 1e-3 && (g.at.1 - (natural.1 - 12.0)).abs() < 1e-3, "above the stack, x unmoved: {:?} natural {natural:?}", g.at);
@@ -1341,21 +1343,37 @@ fn a_glyph_pushed_past_the_bottom_lifts_above_its_obstacle() {
     assert_eq!(photo::wide_note(&vw.view), None, "a glyph the sheet holds is not named");
 }
 
-/// On a sheet whose free band under the corner's second row (foot 42) is shorter than a single's 10 px glyph: the
-/// stack's last single, pushed past the bottom, lifts only to the foot, is clipped there, and the corner's second row
-/// says `glyph taller than the free band: <id>`, in INK.
+/// A listed column of `n` singles (its foot, the running row's, at 42 + 12 n) on a sheet 9 px taller than the foot, so
+/// the free band is shorter than a single's 10 px glyph; the low side's stack sits clear right of the column (the sheet
+/// grown until it does: x shifts by half the growth). The stack's last single, pushed past the bottom, lifts over the
+/// stack onto the column's foot, x unmoved, is clipped there, and the corner's second row says `glyph taller than the
+/// free band: <id>` in INK. (With nothing listed no case exists: on this face y0 = 0.616 h - 14, so for every sheet
+/// 43..51 px tall the drop lands at 36.5..41.4, above the corner foot 42, and the glyph stays at its drop y.)
 #[test]
 fn a_glyph_taller_than_the_free_band_is_clipped_and_the_corner_says_so() {
     use vug_view::sketch::INK;
-    let case = (43..=51u32).rev().find_map(|h| {
-        let (_, (_, y0), _) = stacked(h, 1);
-        let m = fitting(h, y0);
-        (y0 >= 0.0 && m >= 1 && y0 + 12.0 * m as f32 > 42.0).then_some((h, m))
+    let mut tried = Vec::new();
+    let case = (1..=12usize).find_map(|n| {
+        let (foot, h) = (42.0 + 12.0 * n as f32, 51 + 12 * n as u32);
+        let mut grow = 200;
+        for _ in 0..4 {
+            let (_, natural, gs) = stacked(h, grow, n, 1);
+            let right = gs[..n].iter().map(|l| { let r = photo::glyph_rect(l); r.0 + r.2 }).fold(0.0f32, f32::max);
+            if right + 6.0 < natural.0 {
+                let m = fitting(h, natural.1);
+                tried.push((n, h, grow, natural.1, m));
+                return (natural.1 >= 0.0 && m >= 1 && natural.1 + 12.0 * m as f32 > foot).then_some((n, foot, h, grow, m));
+            }
+            grow += 2 * (right + 6.0 - natural.0).ceil() as u32 + 16;
+        }
+        None
     });
-    let (h, m) = case.expect("a sheet 43..=51 px tall holds the case");
-    let (vw, natural, gs) = stacked(h, m + 1);
-    let g = &gs[m];
-    assert!((g.at.0 - natural.0).abs() < 1e-3 && (g.at.1 - 42.0).abs() < 1e-3, "lifted to the foot, x unmoved: {:?} natural {natural:?}", g.at);
+    let (n, foot, h, grow, m) = case.unwrap_or_else(|| panic!("a listed column holds the case: (n, h, grow, y0, fit) {tried:?}"));
+    let (vw, natural, gs) = stacked(h, grow, n, m + 1);
+    let col = gs[..n].iter().map(photo::glyph_rect).fold((f32::MAX, f32::MAX, f32::MIN, f32::MIN), |c, r| (c.0.min(r.0), c.1.min(r.1), c.2.max(r.0 + r.2), c.3.max(r.1 + r.3)));
+    assert!((col.3 - foot).abs() < 1e-3, "the column's foot: {col:?} foot {foot}");
+    let g = &gs[n + m];
+    assert!((g.at.0 - natural.0).abs() < 1e-3 && (g.at.1 - foot).abs() < 1e-3, "lifted onto the column's foot, x unmoved: {:?} natural {natural:?} foot {foot}", g.at);
     let r = photo::glyph_rect(g);
     assert!(r.1 + r.3 - 2.0 > h as f32, "clipped at the bottom: {r:?} h {h}");
     assert_eq!(photo::wide_note(&vw.view).as_deref(), Some(format!("glyph taller than the free band: v{}", 20 + m).as_str()));
