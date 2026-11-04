@@ -25,7 +25,7 @@
 //!   2 x [`READY_WAIT`]), as tty's open and wait do. A LOST link (a reset or a FIN mid-stream) is reopened by the
 //!   desk through this same opener with the lock released (VUGCOMSCANRECONNECT, SR521: `PumpDesk::redial_due` /
 //!   `relinked`, 250 ms doubling to 4 s); the first open's wait under the lock stays owed.
-//! - No enumeration: discovery (mDNS `_telnet._tcp` / FluidNC's `.local` name) is owed as VUG-COMSCAN-MDNS.
+//! - Discovery is `crate::discovery` (VUGCOMSCANMDNS SR632: one mDNS question for `_telnet._tcp` / `_http._tcp`): it finds, the person dials.
 //!
 //! std only: no libc, no `unsafe`.
 
