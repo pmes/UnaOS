@@ -522,7 +522,7 @@ pub fn glyphs(view: &View) -> Vec<ProposalGlyph> {
             None => {
                 row += 1;
                 let y = 30.0 + 12.0 * row as f32;
-                row += card.as_ref().map_or(0, |c| c.lines.len()); // VUGINTENTSETFACE (SR570): the card's lines take their rows
+                row += paged(card.clone(), y, view.size.1).map_or(0, |c| c.rows().len()); // VUGINTENTSETFACELISTROWS (SR589): the PAGED card's rows (fit + the more line); VUGINTENTSETFACE (SR570): the card's lines take their rows
                 (6.0, y)
             }
         };
@@ -1400,7 +1400,7 @@ fn page_card(view: &mut View, i: usize, k: &str) -> Option<bool> {
     if c.fit >= n {
         return None;
     }
-    let first = if matches!(k, "Page_Down" | "PageDown" | "Next") { (c.first + c.fit).min(n - c.fit) } else { c.first.saturating_sub(c.fit) };
+    let first = if k == MORE_CLICK { if c.first + c.fit >= n { 0 } else { (c.first + c.fit).min(n - c.fit) } } else if matches!(k, "Page_Down" | "PageDown" | "Next") { (c.first + c.fit).min(n - c.fit) } else { c.first.saturating_sub(c.fit) }; // VUGINTENTSETFACELISTROWS (SR589): the more-line click is PageDown, 0 from the last page (B1119)
     let ph = view.photo.as_mut()?;
     let moved = ph.offers[lo].page != first;
     ph.offers[lo].page = first;
@@ -1428,4 +1428,62 @@ fn extrude_named(view: &mut View, i: usize, doc: &Doc, p: &Proposal, x: (String,
         return Some(true);
     };
     Some(enter_extrude(view, i, (slot, dir, length)))
+}
+
+// ---- VUGINTENTSETFACELISTROWS (SR589): the card's more line and the wheel over it (named tail block) ----
+
+/// The pseudo-key a click on a card's more line hands [`page_card`]: PageDown's step, 0 from the last page (B1119).
+const MORE_CLICK: &str = "vug.more-line";
+
+/// A paged card's more line as painted by [`card_lines`] (its last row): (x0, y0, w, h), the bitmap's 8 px advance and
+/// one row pitch tall. None for a single or a card the sheet shows whole.
+fn more_line(g: &ProposalGlyph) -> Option<(f32, f32, f32, f32)> {
+    let c = g.card.as_ref()?;
+    if c.fit >= c.lines.len() {
+        return None;
+    }
+    let rows = c.rows();
+    let last = rows.last()?;
+    Some((g.at.0 + 8.0, g.at.1 + CARD_ROW_PX * rows.len() as f32, 8.0 * last.chars().count() as f32, CARD_ROW_PX))
+}
+
+/// A paged card's whole rect (head to more line, the widest row): (x0, y0, w, h). None as [`more_line`].
+fn card_rect(g: &ProposalGlyph) -> Option<(f32, f32, f32, f32)> {
+    more_line(g)?;
+    let rows = g.card.as_ref()?.rows();
+    let wide = rows.iter().map(|r| 8.0 + 8.0 * r.chars().count() as f32).fold(8.0 * g.text.chars().count() as f32, f32::max);
+    Some((g.at.0, g.at.1, wide, CARD_ROW_PX * (rows.len() + 1) as f32))
+}
+
+fn inside(r: (f32, f32, f32, f32), x: f64, y: f64) -> bool {
+    let (x, y) = (x as f32, y as f32);
+    x >= r.0 && x < r.0 + r.2 && y >= r.1 && y < r.1 + r.3
+}
+
+/// The view's press, first: a Left press on a paged card's `... N MORE` / `... F BACK` line focuses that card and turns
+/// its page ([`page_card`] with [`MORE_CLICK`]). None (the press goes on) under `key`'s gate (no photo, a pull or a
+/// dimension edit open), for another button, and off every more line.
+pub fn press(view: &mut View, button: crate::view::Button, x: f64, y: f64) -> Option<bool> {
+    view.photo.as_ref()?;
+    if button != crate::view::Button::Left || view.design.pull.is_some() || view.design.face.as_ref().is_some_and(|f| f.edit.is_some()) {
+        return None;
+    }
+    let g = glyphs(view).into_iter().find(|g| more_line(g).is_some_and(|r| inside(r, x, y)))?;
+    let moved = page_card(view, g.offer, MORE_CLICK).unwrap_or(false);
+    let ph = view.photo.as_mut()?;
+    let focus = ph.focus != Some(g.offer);
+    ph.focus = Some(g.offer);
+    Some(moved || focus)
+}
+
+/// The view's wheel, first: with the cursor over a paged card, one page per event (dy > 0 PageDown, dy < 0 PageUp)
+/// through [`page_card`]; the event is consumed there (no zoom). None (the view zooms) elsewhere and under `key`'s gate.
+pub fn wheel(view: &mut View, dy: f64) -> Option<bool> {
+    view.photo.as_ref()?;
+    if dy == 0.0 || view.design.pull.is_some() || view.design.face.as_ref().is_some_and(|f| f.edit.is_some()) {
+        return None;
+    }
+    let (x, y) = view.cursor;
+    let g = glyphs(view).into_iter().find(|g| card_rect(g).is_some_and(|r| inside(r, x, y)))?;
+    Some(page_card(view, g.offer, if dy > 0.0 { "Page_Down" } else { "Page_Up" }).unwrap_or(false))
 }
