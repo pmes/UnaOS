@@ -1658,7 +1658,7 @@ impl prefs_core::rules::RuleEnv for StoreEnv {
 
 /// The value `ns`.`k` answers once it leaves the store, as the PrefChanged's `Applied` (never clamped). `None` = no
 /// preference-level default (the consumer computes it, or the key is undeclared).
-fn default_applied(ns: &str, k: &str) -> Option<prefs_core::schema::Applied> {
+pub(crate) fn default_applied(ns: &str, k: &str) -> Option<prefs_core::schema::Applied> {
     let value = if ns == prefs_core::files::APP_NS {
         prefs_core::declare::lookup(&DECLARED.lock(), k).map(|d| d.default.clone())
     } else {

@@ -2178,7 +2178,7 @@ pub fn selftest_users() {
 pub fn selftest_all() {
     selftest();
     selftest_users();
-    selftest_prefsui();
+    selftest_prefsui(); resetfollow_leg(); // SETTINGS-RESET-FOLLOW (rmbp-ledger B1190): the unset-follow leg (file tail). LINE-NEUTRAL fold, code first
 }
 
 // ── BRIGHTFLOOR (B312): the floor, the load clamp, safe mode ───────────────────────────────────
@@ -2277,7 +2277,7 @@ fn bus_changes_inner() -> (usize, usize, usize) {
     }
     let old = CUR.lock().clone();
     let mut fresh = old.clone();
-    let _ = from_prefs(&mut fresh);
+    let mask = from_prefs(&mut fresh).0; follow_unset(&mut fresh, mask, &keys); // SETTINGS-RESET-FOLLOW (rmbp-ledger B1190): a frame key the store no longer holds takes its schema default, not the old value (file tail). LINE-NEUTRAL fold, code first
     if BRIGHT_PERSIST_AT.load(Ordering::Acquire) != 0 { fresh.bright = old.bright; } // BRIGHTSLIDER M2: a slider move not yet stored is newer than the store
     use crate::prefs::key;
     let mut moved = 0usize;
@@ -6253,4 +6253,65 @@ fn reset_row(tab: usize) {
         let ok = crate::prefs_client::pref_unset(crate::prefs::NS, k).is_ok();
         serial_println!("[settings] reset {}.{} ok={} via={}", crate::prefs::NS, k, ok as u8, crate::prefs_client::last_via());
     }
+}
+
+// =================================================================================================
+// SETTINGS-RESET-FOLLOW (rmbp-ledger B1190) — TAIL-APPENDED. After an unset (B1186's Delete, `pref unset`, the delete
+// watch, a reload) the store no longer holds the key and B1185's unset-form PrefChanged reaches `bus_changes_inner`, which
+// rebuilt its values from the OLD ones through `from_prefs` (an absent key leaves the field as passed): a Volume, Mute,
+// Blank screen, Pointer or Wallpaper row kept its old value until the next login load. The follower now answers each
+// FRAME key that `from_prefs` found absent with its declared default through `prefs::default_applied` (the reader the
+// unset-post roads use: `prefs_core::schema::default_of` under the kernel's `StoreEnv`), with `from_prefs`'s own range
+// filters, so the follower's existing apply arms move the live state and the row at once. Brightness keeps the glass's
+// level (R89) and the tab is navigation (no MAP row): both untouched. `from_prefs`'s other callers (the login load, the
+// counts, the fixture) keep their semantics. The leg (`tests settings`):
+// `:: SETTINGS-RESET-FOLLOW: key=system.display.idle_min stored=<n> shown=<n> unset=<0|1> after=<n> default=<n> resetfollow=<default|stale> -> PASS|FAIL ::`
+// (`-> SKIP reason=no-load ::` before a session's load, `-> SKIP reason=set-refused ::` when the store takes no write).
+// =================================================================================================
+/// Fill `v`'s fields for the frame's `keys` that [`from_prefs`] found absent (`mask` bit clear) with their schema defaults.
+fn follow_unset(v: &mut Values, mask: u32, keys: &[&'static str]) {
+    use crate::prefs::{key, PrefValue};
+    let d = |k: &str| -> Option<PrefValue> { crate::prefs::default_applied(crate::prefs::NS, k).map(|a| a.value) };
+    for k in keys.iter() {
+        match *k {
+            key::VOLUME if mask & (1 << 1) == 0 => { if let Some(x) = d(*k).and_then(|p| p.as_int()).filter(|x| (0..=16).contains(x)) { v.vol = x as u8; } }
+            key::MUTE if mask & (1 << 2) == 0 => { if let Some(x) = d(*k).and_then(|p| p.as_bool()) { v.mute = x; } }
+            key::IDLE_MIN if mask & (1 << 3) == 0 => { if let Some(x) = d(*k).and_then(|p| p.as_int()).filter(|x| (0..=1440).contains(x)) { v.idle_min = x as u32; } }
+            key::POINTER if mask & (1 << 4) == 0 => { if let Some(x) = d(*k).and_then(|p| p.as_int()).filter(|x| (0..=2).contains(x)) { v.ptr = x as u8; } }
+            key::WALLPAPER if mask & (1 << 5) == 0 => { if let Some(x) = d(*k).and_then(|p| p.as_str().map(String::from)).filter(|w| w.len() <= WALL_MAX && w.bytes().all(|b| (0x20..=0x7e).contains(&b))) { v.wall = x; } }
+            _ => {}
+        }
+    }
+}
+
+/// The `tests settings` unset-follow leg (see the block above): a stored idle value, the key unset through the store, the
+/// follower run, the window's value at the schema default.
+#[cfg(feature = "witness")]
+fn resetfollow_leg() {
+    use crate::prefs::{key, PrefValue, NS};
+    let k = key::IDLE_MIN;
+    if !LOAD_DONE.load(Ordering::Acquire) {
+        serial_println!(":: SETTINGS-RESET-FOLLOW: key={}.{} -> SKIP reason=no-load ::", NS, k);
+        return;
+    }
+    let _ = bus_changes_idle(); // the queue subscribed and settled before the leg's own frames
+    let def = crate::prefs::default_applied(NS, k).and_then(|a| a.value.as_int()).unwrap_or(-1);
+    let was = crate::prefs::int(k, 0, 1440);
+    let want: i64 = if def == 15 { 30 } else { 15 };
+    if crate::prefs::set(NS, k, PrefValue::Int(want)).is_err() {
+        serial_println!(":: SETTINGS-RESET-FOLLOW: key={}.{} -> SKIP reason=set-refused ::", NS, k);
+        return;
+    }
+    let (_, _, shown) = bus_changes_idle();
+    let unset = matches!(crate::prefs::unset(NS, k), Ok(true));
+    let (_, _, after) = bus_changes_idle();
+    // Restore the operator's stored value (an unset key stays unset) and let the follower take it.
+    if let Some(v) = was { let _ = crate::prefs::set(NS, k, PrefValue::Int(v)); }
+    let _ = bus_changes_idle();
+    let follows = unset && after as i64 == def;
+    let ok = shown as i64 == want && follows;
+    serial_println!(
+        ":: SETTINGS-RESET-FOLLOW: key={}.{} stored={} shown={} unset={} after={} default={} resetfollow={} -> {} ::",
+        NS, k, want, shown, unset as u8, after, def, if follows { "default" } else { "stale" }, if ok { "PASS" } else { "FAIL" }
+    );
 }
