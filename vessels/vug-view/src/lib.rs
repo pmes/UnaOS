@@ -302,6 +302,8 @@ impl Viewer {
     /// remove the char before / after it (sketch.rs `type_text_at`, THE free text road), Esc or the chord again closes
     /// it with nothing written, Enter saves to the typed path, any other key does nothing. None when it is closed and the key is not the chord.
     pub fn save_as_key(&mut self, k: &str) -> Option<bool> {
+        use crate::sketch::FieldKey;
+        let fk = FieldKey::of(k); // VUGFACEFIELDKEYS (SR599): the one key-name table, read once
         let chord = matches!(k, "Meta+Shift+s" | "Meta+Shift+S");
         let j = &mut self.view.design.journal;
         let Some(f) = j.save_as.as_mut() else {
@@ -311,24 +313,24 @@ impl Viewer {
             }
             return None;
         };
-        if chord || matches!(k, "Escape" | "\u{1b}") {
+        if chord || fk == Some(FieldKey::Escape) {
             j.save_as = None;
             return Some(true);
         }
-        if matches!(k, "Return" | "KP_Enter" | "\r" | "\n") {
+        if fk == Some(FieldKey::Enter) {
             let (typed, armed) = (f.text.clone(), f.armed);
             self.save_as_enter(&typed, armed);
             return Some(true);
         }
-        if let Some(moved) = sketch::caret_key(&f.text, &mut f.caret, k) {
+        if let Some(moved) = fk.and_then(|key| sketch::caret_key(&f.text, &mut f.caret, key)) {
             return Some(moved); // VUGFACESAVEASCARET (SR593): a move never disarms (the text is the same)
         }
-        let back = matches!(k, "BackSpace" | "Backspace" | "\u{8}" | "\u{7f}");
-        let del = matches!(k, "Delete" | "\u{f728}"); // VUGFACESAVEASCARET (SR593): the char after the caret
+        let back = fk == Some(FieldKey::Backspace);
+        let del = fk == Some(FieldKey::Delete); // VUGFACESAVEASCARET (SR593): the char after the caret
         let ch = {
             let mut it = k.chars();
             match (it.next(), it.next()) {
-                (Some(c), None) => Some(c),
+                (Some(c), None) if fk.is_none() => Some(c), // VUGFACEFIELDKEYS (SR599): a named key is never typed
                 _ => None,
             }
         };
