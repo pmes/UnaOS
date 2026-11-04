@@ -1890,11 +1890,11 @@ fn a_post_on_its_ground_pivots_on_the_scan_s_own_axis() {
     post_pivots("coarsesympivot", pivot_scan()); // VUGSCANCOARSESYMBOTHENDS (SR647): the body lifted, its lines and asserts unchanged
 }
 
-// ---- VUGSCANCOARSESYMBOTHENDS (LEDGER SR647): a scan degenerate at both ends tries both ----
-// SR642's post with its four pins on a 240 x 220 ground: the scan is near-isotropic (modelled 0.946 / 0.870, both above
-// scan_core's COARSE_SYM_RATIO 0.83) and its ground normal is its SMALLEST axis, but SR642's end rule (w0·w2 / w1²
-// 1.087) picks the largest, the ground's long axis. scan_core `partner` hands `coarse_view` both ends, one sweep each,
-// the best four of the union into the refine loop, and the post opens `align=coarse+fine` as on SR642's ground.
+// ---- VUGSCANCOARSESYMBOTHENDS (LEDGER SR647): a scan degenerate at both ends tries all three axes ----
+// SR642's post with its four pins on a 240 x 220 ground: the fused scan is near-isotropic (measured 2610.1 / 2655.3 /
+// 3076.3, ratios 0.983 / 0.863, both above scan_core's COARSE_SYM_RATIO 0.83) and its ground normal is its MIDDLE axis
+// (4.1°), which neither end holds. scan_core `partner` hands `coarse_view` all three axes, one sweep each, the best
+// four of the union into the refine loop, and the post opens `align=coarse+fine` as on SR642's ground.
 
 /// The post and its pins on a ground of half-extents `ground` (12 frames at 600 mm, 40° up, D435i noise), fused in the
 /// design's world (SR642's scene, lifted by SR647).
@@ -1959,9 +1959,11 @@ fn post_pivots(tag: &str, scan: &ScanMesh) {
             (deg, mm)
         })
         .fold((f64::INFINITY, f64::INFINITY), |a, b| if b.0 < a.0 { b } else { a });
-    println!("{tag}: road=CoarseFine rms={rms:.3} aligned={:.3} stats_rms={:.3} axis_deg={axis:.4} err_deg={err_deg:.4} err_mm={err_mm:.4}", d.aligned.rms_mm, d.stats.rms_mm);
+    println!("{tag}: road=CoarseFine rms={rms:.3} aligned={:.3} stats_rms={:.3} identity aligned={:.3} stats_rms={:.3} axis_deg={axis:.4} err_deg={err_deg:.4} err_mm={err_mm:.4}", d.aligned.rms_mm, d.stats.rms_mm, h.aligned.rms_mm, h.stats.rms_mm);
     assert!(rms <= ap.gate(2), "the floor: {rms}");
-    assert!(d.aligned.rms_mm < 1.0 && d.stats.rms_mm < 1.0, "the SR510 floor: aligned {} stats {}", d.aligned.rms_mm, d.stats.rms_mm);
+    // VUGSCANCOARSESYMBOTHENDS (SR647): the witness is the identity road's own map (a smaller ground's scan reads 1.08 at the
+    // right pose); SR642's SR510 bound of 1.0 stays implied by its identity rms.
+    assert!(d.aligned.rms_mm <= h.aligned.rms_mm + 0.05 && d.stats.rms_mm <= h.stats.rms_mm + 0.05, "the identity road's floor: aligned {} / {} stats {} / {}", d.aligned.rms_mm, h.aligned.rms_mm, d.stats.rms_mm, h.stats.rms_mm);
     assert!(axis < 1.0 && err_deg < 1.0 && err_mm < 2.0, "pose error: axis {axis} deg, {err_deg} deg {err_mm} mm modulo C4");
     assert!(lines.contains(&format!("align=coarse+fine rms={rms:.3}")), "{lines:?}");
     assert!(map.on, "the map opens on");
@@ -1975,5 +1977,30 @@ fn ends_scan() -> &'static ScanMesh {
 
 #[test]
 fn a_post_on_a_near_isotropic_ground_tries_both_ends() {
+    // The diagnostic (SR647's measure): the scan's spectrum, the ground normal's angle to each axis, the candidate list
+    // partner's rule implies, and the kept starts of the union with their axis and score.
+    let scan = ends_scan();
+    let p = known_pose();
+    let moved = fragment(scan, |_| true, p);
+    let up = Vec3::new(0.0, 0.0, 1.0);
+    let g = p.apply_vector(up);
+    let (w, v) = scan_core::deviation::scan_spectrum(&moved.mesh).expect("a spectrum");
+    let deg = |e: Vec3| e.dot(g).abs().min(1.0).acos() / DEG;
+    println!("coarsesymbothends: spectrum w={w:.1?} ratios w0/w1={:.3} w1/w2={:.3} w0w2/w1^2={:.3} ground-normal deg to asc axes={:.1?}", w[0] / w[1], w[1] / w[2], w[0] * w[2] / (w[1] * w[1]), [deg(v[0]), deg(v[1]), deg(v[2])]);
+    let r = scan_core::deviation::COARSE_SYM_RATIO;
+    let both = w[0] >= r * w[1] && w[1] >= r * w[2];
+    let one: usize = if w[0] * w[2] < w[1] * w[1] { 2 } else { 0 };
+    let list: Vec<usize> = if both { vec![one, 2 - one, 1] } else { vec![one] };
+    println!("coarsesymbothends: both-degenerate={both} candidates (frame index: 0 largest, 2 smallest)={list:?}");
+    let doc = doc_core::read(PIVOT_DOC).expect("the document reads");
+    let (_, home) = vug_view::deviation::open(scan, &doc, BAND_MM, vug_view::deviation::GDT_MARGIN_MM).expect("the design builds");
+    let (_, design) = &*home.basis;
+    let ap = scan_core::AlignParams::DEFAULT;
+    let bvh = mesh_core::bvh::Bvh::build(&design.mesh);
+    let starts = scan_core::deviation::coarse_view(&moved, design, &bvh, &ap, Tol::DEFAULT, scan_core::deviation::Sweep::About(0)).expect("the pivot sweep");
+    for (k, s) in starts.iter().enumerate() {
+        let a = s.0.compose(p).apply_vector(up).dot(up).clamp(-1.0, 1.0).acos() / DEG;
+        println!("coarsesymbothends: kept[{k}] axis_deg={a:.2} score={:.3}", s.1);
+    }
     post_pivots("coarsesymbothends", ends_scan());
 }

@@ -856,8 +856,8 @@ fn sym_or(scan: &ScanMesh, design: &Design, bvh: &Bvh, p: &AlignParams, tol: Tol
 /// The scan-frame indices (0 the largest axis, 2 the smallest) that take the sweep's pivot, from the scan's ascending
 /// eigenvalues `w`: `Sweep::View` `[2]` (SR626's road); `Sweep::About(i)` the scan's unique end, 2 when w0/w1 < w1/w2
 /// (w0·w2 < w1²), 0 when greater, else (equal, or unordered) the design's pivot `i`; when both adjacent pairs are
-/// [`degenerate`] (VUGSCANCOARSESYMBOTHENDS SR647: no trustworthy end) that end first and then the other, `[2, 0]` /
-/// `[0, 2]`; else the list of one.
+/// [`degenerate`] (VUGSCANCOARSESYMBOTHENDS SR647: no trustworthy axis) all three, that end first, then the other end,
+/// then the middle, `[2, 0, 1]` / `[0, 2, 1]`; else the list of one.
 fn partner(w: [f64; 3], sweep: Sweep) -> &'static [usize] {
     match sweep {
         Sweep::View => &[2],
@@ -871,8 +871,8 @@ fn partner(w: [f64; 3], sweep: Sweep) -> &'static [usize] {
                 i.min(2)
             };
             match (one, degenerate(w[0], w[1]) && degenerate(w[1], w[2])) {
-                (2, true) => &[2, 0],
-                (0, true) => &[0, 2],
+                (2, true) => &[2, 0, 1],
+                (0, true) => &[0, 2, 1],
                 (0, _) => &[0],
                 (1, _) => &[1],
                 _ => &[2],
@@ -892,23 +892,33 @@ fn scan_frame(xs: Vec3, ys: Vec3, cs: Vec3, axis: usize, j: usize) -> Transform 
     crate::geom::from_axes(g[0], g[1], g[2], cs)
 }
 
-// ---- VUGSCANCOARSESYMBOTHENDS (LEDGER SR647): a scan degenerate at both ends tries both ----
+// ---- VUGSCANCOARSESYMBOTHENDS (LEDGER SR647): a scan degenerate at both ends tries all three axes ----
 // SR642's [`partner`] reads the scan's own unique end, but a scan near-isotropic ITSELF has none to trust: MEASURED (an
 // analytic model of the orbit scan's visible surfaces, SR642's calibrated: its fixture 1951.8 / 5978.4 / 7933.5 against
 // the run's 1949.6 / 5972.2 / 7924.0, the bare post on 240 x 220 0.957 / 0.896 exactly) SR642's post with its four pins
 // on a 240 x 220 ground has ratios 0.946 / 0.870 (w0·w2 / w1² 1.087): the ground normal is the SMALLEST axis but the
 // end rule picks the largest, the ground's long axis, and the sweep lays the post down. The rule: both adjacent ratios
-// [`degenerate`] (the design's own pair test, [`COARSE_SYM_RATIO`] 0.83, no new constant). Over the pinned post's
-// grounds 120 x 110 .. 480 x 440 the end rule is wrong at exactly 220 x 202 (0.882 / 0.977) and 240 x 220, and the rule
+// [`degenerate`] (the design's own pair test, [`COARSE_SYM_RATIO`] 0.83, no new constant). The fused scan itself
+// ([`scan_spectrum`], the test's diagnostic) reads 2610.1 / 2655.3 / 3076.3 (0.983 / 0.863) with the ground normal 4.1°
+// off the MIDDLE axis (85.9° / 89.7° off the ends: the model's smallest led its middle by 5%, and the scan's noise and
+// rim swap them), so both ends alone kept four starts ~90° off; the candidate list is therefore all three axes.
+// Over the pinned post's grounds 120 x 110 .. 480 x 440 the end rule is wrong at exactly 220 x 202 (0.882 / 0.977) and 240 x 220, and the rule
 // fires at exactly those two and at no ground where the end rule is right (200 x 183: 0.890 / 0.790; 260 x 238: 0.767 /
 // 0.861); a band on w0·w2 / w1² separates nothing (wrong at 0.903 / 1.087, right at 0.890 / 1.127). [`coarse_view`]
 // runs its sweep once per candidate (ONE loop over the list; the list of one is SR626's / SR636's / SR642's sweep float
 // for float) and the best [`COARSE_VIEW_KEEP`] of the union go into `measure_coarse`'s refine / select loop unchanged.
-// Cost: twice SR626's sweep (≈ 688k `Bvh::closest`) only for a scan degenerate at both ends. Limit: the bare post on
-// 240 x 220 carries its ground normal on the MIDDLE axis, which neither end holds (owed VUG-SCAN-DEVIATION-COARSE-SYM-MIDDLE).
+// Cost: three times SR626's sweep (3 x 24 starts, ≈ 1.03M `Bvh::closest`) only for a scan degenerate at both ends.
 
 /// Two adjacent ascending eigenvalues (lo ≤ hi) are a degenerate pair: lo ≥ [`COARSE_SYM_RATIO`]·hi (`pivot` on the
 /// design, `partner` on the scan).
 fn degenerate(lo: f64, hi: f64) -> bool {
     hi > 0.0 && lo >= COARSE_SYM_RATIO * hi
+}
+
+/// The scan's principal spectrum (VUGSCANCOARSESYMBOTHENDS SR647, the diagnostic seam): the three eigenvalues of its area
+/// moments ascending and their unit eigenvectors in the same order (the smallest x × y, the middle, the largest), as
+/// [`partner`] reads them. None: zero area.
+pub fn scan_spectrum(mesh: &Mesh) -> Option<([f64; 3], [Vec3; 3])> {
+    let (_, x, y, w) = axes(mesh)?;
+    Some((w, [x.cross(y), y, x]))
 }
