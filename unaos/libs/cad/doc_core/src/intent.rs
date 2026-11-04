@@ -43,7 +43,9 @@
 //! measured shape counts in a Shapes residual only when the document's own replay pairs it within the band (K_SIGMA x
 //! sigma) or the proposal's replay came closer to it than the document by more than the band; a face only a later set
 //! models no longer refuses the earlier single proposals. [`apply_with`] is [`apply`] through a caller's [`Lib`] (a
-//! library part, VUGMAKEMACHINELIB SR544), as [`crate::read_with`] is [`crate::read`].
+//! library part, VUGMAKEMACHINELIB SR544), as [`crate::read_with`] is [`crate::read`]. VUGMAKEMACHINELIBHELD (SR556):
+//! [`apply`] re-reads through [`Doc::reread`] (the libraries the Doc already holds), so [`verify`] / [`verify_all`] take
+//! a library part with no signature change; [`apply_with`] keeps the caller's explicit [`Lib`].
 //!
 //! The RMS's square root is geom_core's `Vec2::mag` (a hypot accumulation); libm (VUGINTENTSCAN, SR508, as ruled)
 //! gives the shape residual's angles (`atan2`, `atan`) and suggest's rounding (`round`).
@@ -57,7 +59,6 @@ use brep_core::geom_core::{Aabb3, Segment, Vec2, Vec3, closest_point_segment};
 use brep_core::mesh_core::{Bvh, Mesh}; // VUGINTENTPOINTS (SR523)
 use sketch_core::{Arc2, Edge, Loop, profiles};
 
-use crate::lex::read;
 use crate::lex::read_with; // VUGINTENTSETORDER (SR551)
 use crate::replay::{Failure, Fault, Replay, replay};
 use crate::write::{f64_text, write};
@@ -86,6 +87,10 @@ pub enum Measurement {
     /// VUGINTENTSCAN (SR508): scan_core's detected shapes (SR497) copied as [`ShapeRef`]s, in the document's world
     /// frame; an angle counts `sigma_mm` per `sigma_deg` in the residual.
     Shapes { shapes: Vec<ShapeRef>, sigma_mm: f64, sigma_deg: f64 },
+    /// VUGINTENTTHICKNESS (SR557): a measured thickness `mm` (a side photo's, photo_core `Side.thickness_mm`) along
+    /// `along` (the extrusion direction, any length): the replayed solids' extent along it minus `mm`, judged by the
+    /// one band; a document with no solid pairs nothing (`UnmatchedShape` kind `thickness`).
+    Thickness { mm: f64, sigma_mm: f64, along: Vec3 },
 }
 
 impl Measurement {
@@ -97,7 +102,7 @@ impl Measurement {
     pub fn sigma_mm(&self) -> f64 {
         match self {
             Measurement::Outline { sigma_mm, .. } | Measurement::Points { sigma_mm, .. } => *sigma_mm,
-            Measurement::Shapes { sigma_mm, .. } => *sigma_mm, // VUGINTENTSCAN (SR508)
+            Measurement::Shapes { sigma_mm, .. } | Measurement::Thickness { sigma_mm, .. } => *sigma_mm, // VUGINTENTSCAN (SR508), VUGINTENTTHICKNESS (SR557)
         }
     }
 
@@ -106,6 +111,7 @@ impl Measurement {
             Measurement::Outline { loops, .. } => loops.iter().map(|l| l.len()).sum(),
             Measurement::Points { pts, .. } => pts.len(),
             Measurement::Shapes { shapes, .. } => shapes.len(), // VUGINTENTSCAN (SR508)
+            Measurement::Thickness { .. } => 1, // VUGINTENTTHICKNESS (SR557)
         }
     }
 
@@ -202,7 +208,7 @@ pub enum Verdict {
 /// The document with a proposal in it: appended, or replacing the statement of the same id in place. The one road
 /// that changes a document; the person's accept calls it.
 pub fn apply(doc: &Doc, p: &Proposal) -> Result<Doc, Reason> {
-    applied(doc, p, &read).map(|(d, _)| d) // VUGINTENTSETORDER (SR551): the one body, `applied`
+    applied(doc, p, &|t: &str| doc.reread(t)).map(|(d, _)| d) // VUGINTENTSETORDER (SR551): the one body, `applied`; VUGMAKEMACHINELIBHELD (SR556): re-read from the libraries the Doc holds
 }
 
 /// VUGINTENTSETORDER (SR551): [`apply`] re-reading through the caller's [`Lib`], so a part whose machine names a
@@ -446,6 +452,8 @@ fn residual(r: &Replay, m: &Measurement, tol: Tol, base: Option<&Replay>) -> Res
         Measurement::Shapes { shapes, sigma_mm, sigma_deg } => {
             shape_residuals(r, base.unwrap_or(r), shapes, *sigma_mm, *sigma_deg, &mut d)? // VUGINTENTSETORDER (SR551)
         }
+        // VUGINTENTTHICKNESS (SR557): the solids' extent along the extrusion direction against the measured thickness.
+        Measurement::Thickness { mm, sigma_mm, along } => thickness_residual(r, *mm, *sigma_mm, *along, tol, &mut d)?,
     }
     Ok(fit(&d))
 }
@@ -788,6 +796,10 @@ pub fn measurements_text(m: &Measurement) -> String {
                 out.push_str(&format!("{} support={} rms={}\n", head, s.support, num(s.rms_mm, 3)));
             }
         }
+        // VUGINTENTTHICKNESS (SR557): one line.
+        Measurement::Thickness { mm, sigma_mm, along } => {
+            out.push_str(&format!("thickness: mm={} sigma={} along={}\n", num(*mm, 3), num(*sigma_mm, 3), v3(*along, 4)));
+        }
     }
     out
 }
@@ -995,7 +1007,7 @@ fn set_len(doc: &Doc, ps: &[Proposal]) -> usize {
     let mut ids: Vec<Option<String>> = Vec::new();
     let mut refs: Vec<Vec<String>> = Vec::new();
     for p in &ps[..run] {
-        let Ok((d, k)) = applied(&copy, p, &read) else { break };
+        let Ok((d, k)) = applied(&copy, p, &|t: &str| copy.reread(t)) else { break }; // VUGMAKEMACHINELIBHELD (SR556)
         let s = &d.stmts[k];
         ids.push(s.id().map(String::from));
         refs.push(s.refs().into_iter().map(String::from).collect());
@@ -1070,4 +1082,33 @@ impl Batch {
             return;
         }
     }
+}
+
+// ---- VUGINTENTTHICKNESS (SR557): the thickness residual (named tail block) ----
+
+/// The replayed solids' extent along `along` (normalised) minus `mm`, one distance into `d`: every solid tessellated
+/// once by [`solid_mesh`] at the Points chord (so a curved face counts, not only the vertices), the extent the max
+/// minus the min of each position's projection. A thickness that is not a finite positive number, or an `along` that
+/// does not normalise, is `BadMeasurement`; no solid is `UnmatchedShape` kind `thickness` (nothing pairs).
+fn thickness_residual(r: &Replay, mm: f64, sigma_mm: f64, along: Vec3, tol: Tol, d: &mut Vec<f64>) -> Result<(), Reason> {
+    if !(mm.is_finite() && mm > 0.0) {
+        return Err(Reason::BadMeasurement);
+    }
+    let Ok(u) = along.normalize() else { return Err(Reason::BadMeasurement) };
+    if r.solids.is_empty() {
+        return Err(Reason::UnmatchedShape { index: 0, kind: "thickness" });
+    }
+    let chord = (sigma_mm * 0.25).max(4.0 * tol.lin);
+    let mesh = solid_mesh(r, chord, tol)?;
+    let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+    for p in &mesh.positions {
+        let t = p.dot(u);
+        lo = lo.min(t);
+        hi = hi.max(t);
+    }
+    if !(hi >= lo) {
+        return Err(Reason::UnmatchedShape { index: 0, kind: "thickness" });
+    }
+    d.push((hi - lo - mm).abs());
+    Ok(())
 }

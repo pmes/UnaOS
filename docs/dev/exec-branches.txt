@@ -1352,3 +1352,16 @@ exec-rmbp-vugfacedeviationlive ae12b39c1 wave36 cut51
 exec-rmbp-vugscangdtspec ae12b39c1 wave36 cut51
 exec-rmbp-vugfacegdtremeasure ae12b39c1 wave36 cut51
 exec-rmbp-vugcomscanhostdesk ae12b39c1 wave36 cut51
+exec-rmbp-f39continueignite ae49d500c wave36 cut52
+exec-rmbp-f39veillogin ae49d500c wave36 cut52
+exec-rmbp-f39clickheld ae49d500c wave36 cut52
+exec-rmbp-f39hidplacerender ae49d500c wave36 cut52
+exec-rmbp-f39menuscroll ae49d500c wave36 cut52
+exec-rmbp-f39unafsholdrelease ae49d500c wave36 cut52
+exec-rmbp-vugscantsdfedgefar ae49d500c wave36 cut52
+exec-rmbp-vugintentundoset ae49d500c wave36 cut52
+exec-rmbp-vugfacegdtdatumspick ae49d500c wave36 cut52
+exec-rmbp-vugfacedeviationsolidfault ae49d500c wave36 cut52
+exec-rmbp-vugcomscanhostdialect ae49d500c wave36 cut52
+exec-rmbp-vugscangdtprofiledatum ae49d500c wave36 cut52
+exec-rmbp-vugphotosideparallax ae49d500c wave36 cut52
