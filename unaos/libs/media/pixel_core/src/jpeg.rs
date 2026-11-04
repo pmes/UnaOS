@@ -290,7 +290,7 @@ pub fn decode(data: &[u8]) -> Result<Image, Error> {
     let mut restart = 0usize;
     let mut adobe: Option<u8> = None;
     let mut jfif = false;
-    let mut orientation = 1u8; let mut icc: Vec<(u8, Vec<u8>)> = Vec::new();
+    let mut orientation = 1u8; let mut icc: Vec<(u8, Vec<u8>)> = Vec::new(); let mut text = Vec::new(); // VUGPHOTOCROPMETAITXT (SR614): the COM `key NUL value` pairs
     let mut pos = 2usize;
     let mut eoi = false;
 
@@ -404,13 +404,13 @@ pub fn decode(data: &[u8]) -> Result<Image, Error> {
                 pos = decode_scan(data, pos, seg, f, &dc_tabs, &ac_tabs, restart)?;
             }
             0xDC => return Err(Error::Unsupported("jpeg DNL")),
-            0xE2 => icc_part(&mut icc, seg), _ => {} // APPn, COM, JPGn: skipped.
+            0xE2 => icc_part(&mut icc, seg), 0xFE => crate::png::text_chunk(&mut text, seg), _ => {} // APPn, JPGn: skipped; VUGPHOTOCROPMETAITXT (SR614): a COM read by the tEXt rule (keyword NUL value), a plain comment dropped.
         }
     }
     let _ = eoi; // a missing EOI is tolerated once every scan has been read.
     let f = frame.ok_or(Error::Malformed("no SOF"))?;
     let mut img = reconstruct(&f, &qt, adobe, jfif)?;
-    img.orientation = orientation; img.icc = icc_join(icc);
+    img.orientation = orientation; img.icc = icc_join(icc); img.text = text; // VUGPHOTOCROPMETAITXT (SR614)
     Ok(img)
 }
 
