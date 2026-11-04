@@ -544,7 +544,7 @@ fn a_filleted_document_measures_the_fillet_not_its_original() {
     let rp = doc_core::replay(&doc, doc.tol);
     assert!(rp.failures.is_empty(), "{:?}", rp.failures);
     assert_eq!(rp.solids.len(), 3, "replay keeps the box beside its fillet");
-    let v = Viewer::open_deviation(scan().clone(), &doc, "fixture", SIZE, Preset::Una).expect("the design builds");
+    let v = Viewer::open_deviation(scan().clone(), &doc, "fixture", SIZE, Preset::Una, None).expect("the design builds"); // VUGFACEGDTDATUMSPICK (SR564): SR560's margin argument, the fallback
     let map = v.view.deviation.as_ref().unwrap();
     assert!(map.names.iter().all(|n| !n.starts_with("body/")), "the filleted box is not measured: {:?}", map.names);
     assert!(map.names.iter().any(|n| n.starts_with("f0/")) && map.names.iter().any(|n| n.starts_with("post/")), "{:?}", map.names);
