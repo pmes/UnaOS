@@ -1180,6 +1180,7 @@ fn int_code(num: &[u8]) -> Option<u16> {
 pub struct Modal {
     last: [Option<(usize, &'static str)>; MODAL_GROUPS],
     tool: [Option<(usize, String)>; TOOL_GROUPS],
+    ix: ToolIndex, // VUGCOMSCANRESUMETOOLINDEX (SR672): Marlin's hotend and fan words keyed by index, below
 }
 
 impl Modal {
@@ -1197,6 +1198,7 @@ impl Modal {
             });
             tool_fold(d, i, l, &mut m.tool, &mut run); // VUGCOMSCANRESUMETOOL (SR663): the valued words, below
         }
+        m.ix = run.ix; // VUGCOMSCANRESUMETOOLINDEX (SR672): the keyed hotends and fans the fold gathered
         m
     }
 
@@ -1205,14 +1207,16 @@ impl Modal {
     /// G90 / G91 also set E's mode or one whose do not. The same word at the same line is said once (an `M9` is the
     /// last word of both coolant groups).
     pub fn lines(&self) -> Vec<String> {
+        let keyed = self.ix.words(); // VUGCOMSCANRESUMETOOLINDEX (SR672): one line per (hotend | fan, index)
         let mut v: Vec<(usize, usize, &str)> = self
             .last
             .iter()
             .enumerate()
             .filter_map(|(g, x)| x.map(|(i, w)| (i, g, w)))
             .chain(self.tool.iter().enumerate().filter_map(|(g, x)| x.as_ref().map(|(i, w)| (*i, MODAL_GROUPS + g, w.as_str()))))
+            .chain(keyed.iter().map(|(i, g, w)| (*i, *g, w.as_str()))) // VUGCOMSCANRESUMETOOLINDEX (SR672)
             .collect();
-        v.sort_unstable();
+        v.sort_unstable_by(|a, b| (tool_rank(a.1), a.0, a.1, a.2).cmp(&(tool_rank(b.1), b.0, b.1, b.2))); // VUGCOMSCANRESUMETOOLINDEX (SR672): heaters, then T, then fans
         v.dedup_by(|a, b| a.0 == b.0 && a.2 == b.2);
         v.into_iter().map(|(_, _, w)| String::from(w)).collect()
     }
@@ -1260,13 +1264,14 @@ pub const GRBL_SPINUP_DWELL: &str = "G4 P4";
 struct ToolRun {
     dir: Option<u16>,
     s: Option<String>,
+    ix: ToolIndex, // VUGCOMSCANRESUMETOOLINDEX (SR672): Marlin's recorded T and its keyed hotend / fan words
 }
 
 /// Line `i`'s valued words into `tool`, in their resume form (LinuxCNC, not streamed, sets nothing).
 fn tool_fold(d: Dialect, i: usize, line: &str, tool: &mut [Option<(usize, String)>; TOOL_GROUPS], run: &mut ToolRun) {
     match d {
         Dialect::Grbl { laser } => grbl_tool(laser, i, line, tool, run),
-        Dialect::Marlin => marlin_tool(i, line, tool),
+        Dialect::Marlin => marlin_tool(i, line, tool, run), // VUGCOMSCANRESUMETOOLINDEX (SR672): the run carries the active tool
         Dialect::LinuxCnc => {}
     }
 }
@@ -1326,8 +1331,9 @@ fn grbl_tool(laser: bool, i: usize, line: &str, tool: &mut [Option<(usize, Strin
 /// Marlin 2: the line's one command with its parameters, re-spaced; a hotend / bed target above 0 set by `M104` /
 /// `M140` is restored as the blocking `M109` / `M190` (a resumed print must not extrude cold; `M109 S` waits only
 /// when heating), a recorded `M109` / `M190` stays, an `S0` stays non-blocking; `M106` / `M107` the fan, `T<n>` the
-/// tool, `M3` / `M4` / `M5` the spindle, `M7` / `M8` / `M9` the coolant.
-fn marlin_tool(i: usize, line: &str, tool: &mut [Option<(usize, String)>; TOOL_GROUPS]) {
+/// tool, `M3` / `M4` / `M5` the spindle, `M7` / `M8` / `M9` the coolant. VUGCOMSCANRESUMETOOLINDEX (SR672): the
+/// hotend and fan words are keyed by index into `run.ix` ([`ToolIndex`]), the `T` word records the active tool.
+fn marlin_tool(i: usize, line: &str, tool: &mut [Option<(usize, String)>; TOOL_GROUPS], run: &mut ToolRun) {
     modal_words(Dialect::Marlin, line, |letter, num, rest| {
         let rest = spaced(rest);
         let word = |c: &str| alloc::format!("{c}{rest}");
@@ -1340,11 +1346,14 @@ fn marlin_tool(i: usize, line: &str, tool: &mut [Option<(usize, String)>; TOOL_G
                 tool[MIST] = Some((i, String::from("M9")));
                 tool[FLOOD] = Some((i, String::from("M9")));
             }
-            (b'M', Some(c @ (104 | 109))) => tool[HOTEND] = Some((i, word(if c == 109 || heats(&rest) { "M109" } else { "M104" }))),
+            (b'M', Some(c @ (104 | 109))) => run.ix.set(i, HOTEND, if c == 109 || heats(&rest) { "M109" } else { "M104" }, b'T', &rest), // SR672: by index
             (b'M', Some(c @ (140 | 190))) => tool[BED] = Some((i, word(if c == 190 || heats(&rest) { "M190" } else { "M140" }))),
-            (b'M', Some(106)) => tool[FAN] = Some((i, word("M106"))),
-            (b'M', Some(107)) => tool[FAN] = Some((i, word("M107"))),
-            (b'T', Some(n)) => tool[TOOL] = Some((i, alloc::format!("T{n}"))),
+            (b'M', Some(106)) => run.ix.set(i, FAN, "M106", b'P', &rest), // SR672: by index
+            (b'M', Some(107)) => run.ix.set(i, FAN, "M107", b'P', &rest), // SR672: by index
+            (b'T', Some(n)) => {
+                tool[TOOL] = Some((i, alloc::format!("T{n}")));
+                run.ix.active = Some(n); // VUGCOMSCANRESUMETOOLINDEX (SR672): the active tool from here on
+            }
             _ => {}
         }
     });
@@ -1365,4 +1374,101 @@ fn spaced(rest: &[u8]) -> String {
 /// A Marlin heater command's target above 0 (its `S`, or the `R` that waits either way).
 fn heats(rest: &str) -> bool {
     rest.split(' ').any(|p| matches!(p.as_bytes().first(), Some(b'S' | b'R')) && p[1..].parse::<f64>().is_ok_and(|t| t > 0.0))
+}
+
+// --- VUGCOMSCANRESUMETOOLINDEX (LEDGER SR672): a resume restores every hotend and fan index the lines before its line set (named tail hunk) ---
+
+/// Marlin's per-index heater and fan words, one per (group, index), and the tool the program made active. The index is
+/// the word's own `T` (M104 / M109) or `P` (M106 / M107), else the ACTIVE tool at that line (none = 0, Marlin boots in
+/// T0): Marlin 2.1 `get_target_extruder_from_command` (gcode.cpp, "T<index> : Tool index. If omitted, applies to the
+/// active tool", M104_M109.cpp) and M106 / M107's `parser.byteval('P', _MIN(active_extruder, FAN_COUNT - 1))`
+/// (M106_M107.cpp; M106's `T` is EXTRA_FAN_SPEED's temporary speed, not an index). A Vec keyed by index, so no cap
+/// here: Marlin bounds EXTRUDERS at 8 (15 with an extendable MMU, SanityCheck.h) and FAN_COUNT at 12
+/// (Conditionals_post.h), and refuses an index past its build on the replay as it did the first time.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ToolIndex {
+    active: Option<u16>,
+    words: Vec<IxWord>,
+}
+
+/// One keyed word: its line, group ([`HOTEND`] or [`FAN`]), index, command, whether the line said its index, and its
+/// other parameters re-spaced (` S210`) with the index token taken out.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct IxWord {
+    i: usize,
+    group: usize,
+    index: u16,
+    cmd: &'static str,
+    said: bool,
+    rest: String,
+}
+
+impl ToolIndex {
+    /// Line `i`'s `cmd` with its re-spaced parameters `rest` into the key (`group`, the `letter` word's index or the
+    /// active tool's): a later word for the same key replaces it (an `M107` or an `S0` target clears that index only).
+    fn set(&mut self, i: usize, group: usize, cmd: &'static str, letter: u8, rest: &str) {
+        let (said, rest) = index_of(rest, letter);
+        let index = said.unwrap_or(self.active.unwrap_or(0));
+        let w = IxWord { i, group, index, cmd, said: said.is_some(), rest };
+        match self.words.iter_mut().find(|x| x.group == group && x.index == index) {
+            Some(x) => *x = w,
+            None => self.words.push(w),
+        }
+    }
+
+    /// Each key's word as (line, the [`Modal::lines`] group, the line a resume sends). A hotend says ` T<n>` first
+    /// whenever the program is multi-tool (a `T` was recorded, a hotend index past 0, or the line said its own): the
+    /// heaters run before the restored `T`, on a board whose active tool may be any; a single-tool program keeps its
+    /// bytes. A fan that said its `P` keeps it; an index-less fan set under the FINAL active tool stays index-less (it
+    /// runs after that `T` and Marlin resolves it to the same fan it drove, whatever FAN_COUNT); one set under another
+    /// tool says ` P<that tool>` (exact on a fan per tool; a board with fewer fans ignores it:
+    /// VUG-COMSCAN-RESUME-TOOL-FANCOUNT owed).
+    fn words(&self) -> Vec<(usize, usize, String)> {
+        let multi = self.active.is_some() || self.words.iter().any(|w| w.group == HOTEND && (w.index != 0 || w.said));
+        let fin = self.active.unwrap_or(0);
+        self.words
+            .iter()
+            .map(|w| {
+                let named = if w.group == HOTEND { multi || w.said } else { w.said || w.index != fin };
+                let letter = if w.group == HOTEND { 'T' } else { 'P' };
+                let line = if named {
+                    alloc::format!("{} {letter}{}{}", w.cmd, w.index, w.rest)
+                } else {
+                    alloc::format!("{}{}", w.cmd, w.rest)
+                };
+                (w.i, MODAL_GROUPS + w.group, line)
+            })
+            .collect()
+    }
+}
+
+/// The `letter` word's integer index out of re-spaced parameters (` T1 S210` -> (Some(1), ` S210`)); none, or one that
+/// is not an integer, leaves the parameters as they are.
+fn index_of(rest: &str, letter: u8) -> (Option<u16>, String) {
+    let mut index = None;
+    let mut o = String::new();
+    for p in rest.split(' ').filter(|p| !p.is_empty()) {
+        let b = p.as_bytes();
+        if index.is_none() && b[0] == letter {
+            if let Some(n) = int_code(&b[1..]) {
+                index = Some(n);
+                continue;
+            }
+        }
+        o.push(' ');
+        o.push_str(p);
+    }
+    (index, o)
+}
+
+/// [`Modal::lines`]'s order rank: every heater (rank 0, with the modal words, in program order) before the restored
+/// `T` (1), the fans after it (2) — an index-less fan resolves against the active tool.
+fn tool_rank(g: usize) -> u8 {
+    if g == MODAL_GROUPS + TOOL {
+        1
+    } else if g == MODAL_GROUPS + FAN {
+        2
+    } else {
+        0
+    }
 }
