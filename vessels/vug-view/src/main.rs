@@ -16,6 +16,7 @@
 //! vug-view flat.png --side side.png --keys "{Return}" --out part.png              # the side photo's thickness (SR547)
 //! vug-view scan.ply --against part.vugdoc --gdt "<face>=flatness:0.5" --out map.png  # a gdt callout (SR553)
 //! vug-view scan.ply --against part.vugdoc --datum A=<f> B=<f> C=<f> --gdt "<post>=position:1" --out map.png  # a datum frame (SR560)
+//! vug-view part.vug --scan scan.ply --out map.png                                  # the part as the journal, a scan measured against it (SR565)
 //! ```
 //! Key script: one character per shortcut; `{Name}` for a named key.
 
@@ -33,13 +34,14 @@ struct Cli {
     side: Option<String>, // VUGFACEPHOTOSIDE (SR547): a photo of the part on its side (the thickness proposal)
     gdt: Vec<String>, // VUGFACEGDT (SR553): each `--gdt <face>=<kind>:<tol>`, a callout on the map
     datum: Option<String>, // VUGFACEGDTREMEASURE (SR560): `--datum A=<f> B=<f> C=<f>`, the three args as one `datum` command
+    scan: Option<String>, // VUGFACEDEVIATIONSOLIDFAULT (SR565): `--scan <mesh>` after a .vug part: the scan measured against the part's journal
 }
 
-const USAGE: &str = "usage: vug-view <file.stl|obj|ply|png|jpg> [--preset una|solidworks|fusion|blender|onshape] [--size WxH] [--keys SCRIPT] [--out shot.png] [--against design.vugdoc] [--side side.png] [--gdt face=kind:tol]... [--datum A=face B=face C=face]";
+const USAGE: &str = "usage: vug-view <file.stl|obj|ply|png|jpg> [--preset una|solidworks|fusion|blender|onshape] [--size WxH] [--keys SCRIPT] [--out shot.png] [--against design.vugdoc] [--side side.png] [--gdt face=kind:tol]... [--datum A=face B=face C=face] [--scan scan.ply (after a .vug part)]";
 
 fn cli() -> Cli {
     let mut a = std::env::args().skip(1);
-    let mut c = Cli { path: String::new(), size: (800, 600), preset: Preset::Una, keys: None, out: None, against: None, side: None, gdt: Vec::new(), datum: None };
+    let mut c = Cli { path: String::new(), size: (800, 600), preset: Preset::Una, keys: None, out: None, against: None, side: None, gdt: Vec::new(), datum: None, scan: None };
     while let Some(arg) = a.next() {
         match arg.as_str() {
             "--size" => {
@@ -59,6 +61,7 @@ fn cli() -> Cli {
             "--against" => c.against = a.next(), // VUGFACEDEVIATION (SR525)
             "--side" => c.side = a.next(), // VUGFACEPHOTOSIDE (SR547)
             "--gdt" => c.gdt.extend(a.next()), // VUGFACEGDT (SR553): repeatable
+            "--scan" => c.scan = a.next(), // VUGFACEDEVIATIONSOLIDFAULT (SR565)
             "--datum" => c.datum = Some(a.by_ref().take(3).collect::<Vec<_>>().join(" ")), // VUGFACEGDTREMEASURE (SR560): the grammar is deviation::command's
             "--help" | "-h" => {
                 eprintln!("{USAGE}");
@@ -94,7 +97,7 @@ fn keys(script: &str) -> Vec<String> {
 fn main() {
     let cli = cli();
     // VUGFACEPHOTO (SR506): the one open road — a mesh, or a photo on graph paper measured into a sketch.
-    let opened = match &cli.against { Some(d) => Viewer::open_against(&cli.path, d, cli.size, cli.preset), None => Viewer::open(&cli.path, cli.size, cli.preset) }; // VUGFACEDEVIATION (SR525): a scan against its design
+    let opened = match (&cli.against, &cli.scan) { (Some(d), None) => Viewer::open_against(&cli.path, d, cli.size, cli.preset), (None, Some(s)) => Viewer::open_scan(&cli.path, s, cli.size, cli.preset), (Some(_), Some(_)) => Err("--against and --scan are exclusive".to_string()), (None, None) => Viewer::open(&cli.path, cli.size, cli.preset) }; // VUGFACEDEVIATION (SR525): a scan against its design; VUGFACEDEVIATIONSOLIDFAULT (SR565): a .vug part with --scan opens as the journal
     let mut viewer = match opened {
         Ok(v) => v,
         Err(e) => {

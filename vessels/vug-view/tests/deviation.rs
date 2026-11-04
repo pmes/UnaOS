@@ -487,6 +487,94 @@ fn an_open_sketch_edit_keeps_the_generation_and_a_solid_edit_bumps_it() {
     assert!((r2 - r1).abs() > 1e-6, "the post widened 5 mm: {r2} vs {r1}");
 }
 
+// VUGFACEDEVIATIONSOLIDFAULT (LEDGER SR565): a replay failure no solid reads (an Op with no machine, a conflicting
+// stroke in an unnamed sketch) is counted on the corner and the map still measures; a failure in a solid's sketch still
+// refuses by line. `Viewer::open_scan` (`vug-view part.vug --scan scan.ply`) opens the part as the journal.
+
+/// An Op on the post with no machine in the document: replay's `NoMachine`, no solid reads it.
+const DRILL: &str = "drill o1 on=post points=[[160 0]] top=150 depth=10 peck=0 tool=1 feed=300 plunge=100 rpm=10000\n";
+
+#[test]
+fn a_fault_no_solid_reads_still_measures() {
+    let clean = open(scan().clone());
+    let c0 = corner(clean.view.deviation.as_ref().unwrap());
+
+    // The Op with no machine: measured as the clean document, the fault named and counted.
+    let doc = doc_core::read(&format!("{DOC}{DRILL}")).expect("the document reads");
+    let rp = doc_core::replay(&doc, doc.tol);
+    assert_eq!(rp.failures.len(), 1, "{:?}", rp.failures);
+    assert_eq!((rp.failures[0].id.as_str(), &rp.failures[0].fault), ("o1", &doc_core::Fault::NoMachine));
+    let v = Viewer::open_deviation(scan().clone(), &doc, "fixture", SIZE, Preset::Una, None).expect("an Op fault does not refuse the design");
+    let map = v.view.deviation.as_ref().unwrap();
+    assert_eq!(map.faults, rp.failures);
+    assert_eq!(
+        (stats(&v).0.to_bits(), stats(&v).1.to_bits()),
+        (stats(&clean).0.to_bits(), stats(&clean).1.to_bits()),
+        "the design is the clean document's"
+    );
+    let lines = corner(map);
+    println!("{}", lines.join("\n"));
+    let line = rp.failures[0].line;
+    assert_eq!(lines[..c0.len()], c0[..], "the measured lines unchanged");
+    assert_eq!(lines[c0.len()..], [format!("fault line {line}: NoMachine o1"), "faults=1".to_string()]);
+
+    // A conflicting stroke in a sketch no feature names: measured, its faults named on that sketch.
+    let open_sketch = "sketch s3 o=[0 0 0] z=[0 0 1] x=[1 0 0]\npoint q1 sketch=s3 x=0 y=0\nfix q2 sketch=s3 p=q1 at=[0 0]\nfix q3 sketch=s3 p=q1 at=[5 0]\n";
+    let doc = doc_core::read(&format!("{DOC}{open_sketch}")).expect("the document reads");
+    let v = Viewer::open_deviation(scan().clone(), &doc, "fixture", SIZE, Preset::Una, None).expect("an unnamed sketch's fault does not refuse");
+    let map = v.view.deviation.as_ref().unwrap();
+    assert!(!map.faults.is_empty() && map.faults.iter().all(|f| ["s3", "q1", "q2", "q3"].contains(&f.id.as_str())), "{:?}", map.faults);
+    assert_eq!(corner(map).last().cloned(), Some(format!("faults={}", map.faults.len())));
+
+    // A conflicting radius in the post's sketch: a solid reads it, the design refuses by line as before.
+    let doc = doc_core::read(&DOC.replace("radius r1 sketch=s2 circle=c1 r=40\n", "radius r1 sketch=s2 circle=c1 r=40\nradius r2 sketch=s2 circle=c1 r=45\n")).expect("reads");
+    let e = Viewer::open_deviation(scan().clone(), &doc, "fixture", SIZE, Preset::Una, None).err().expect("a solid's fault refuses");
+    assert!(e.starts_with("line ") && e.contains("Conflicting"), "{e}");
+
+    // The journal: an Op enters the document, no solid statement moved: generation kept, the fault counted.
+    let mut j = journal_viewer();
+    let op = doc_core::read(&format!("{DOC}{DRILL}")).expect("reads").stmts.last().cloned().expect("the Op");
+    let mut doc = j.view.design.journal.doc.clone();
+    doc.stmts.push(op);
+    j.view.design.journal.doc = doc;
+    vug_view::deviation::follow(&mut j);
+    let map = j.view.deviation.as_ref().unwrap();
+    let src = map.source.as_ref().expect("a journal map");
+    assert_eq!((src.generation, src.measured, src.refused.as_deref()), (0, 0, None), "an Op does not re-measure");
+    let lines = corner(map);
+    println!("{}", lines.join("\n"));
+    assert!(lines.iter().any(|l| l.starts_with("fault line ") && l.ends_with(": NoMachine o1")), "{lines:?}");
+    assert_eq!(lines.last().map(String::as_str), Some("design=journal@0 solids=2 faults=1"), "{lines:?}");
+}
+
+#[test]
+fn scan_flag_opens_the_part_as_the_journal() {
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("vugfacedeviationsolidfault");
+    std::fs::create_dir_all(&dir).expect("the fixture dir");
+    let (part, ply) = (dir.join("part.vug"), dir.join("scan.ply"));
+    std::fs::write(&part, DOC).expect("the part is written");
+    std::fs::write(&ply, mesh_core::ply::write(&scan().mesh)).expect("the scan is written");
+    let (part, ply) = (part.to_str().unwrap(), ply.to_str().unwrap());
+
+    let j = Viewer::open_scan(part, ply, SIZE, Preset::Una).expect("the part opens as the journal with the scan measured");
+    let p = Viewer::open_against(ply, part, SIZE, Preset::Una).expect("the path road");
+    let map = j.view.deviation.as_ref().expect("a map");
+    let src = map.source.as_ref().expect("a journal map");
+    assert_eq!((src.generation, src.measured, src.refused.as_deref()), (0, 0, None));
+    assert_eq!(j.save_to.as_deref(), Some(std::path::Path::new(part)), "the part saves back over itself");
+    assert!(j.title.contains("part.vug"), "{}", j.title);
+    let (lj, lp) = (corner(map), corner(p.view.deviation.as_ref().unwrap()));
+    println!("{}", lj.join("\n"));
+    assert_eq!(lj.last().map(String::as_str), Some("design=journal@0 solids=2"), "{lj:?}");
+    assert_eq!(lj[..lj.len() - 1], lp[..], "the journal measures the scan as the path road does");
+
+    let prb = dir.join("scan.prb");
+    let e = Viewer::open_scan(part, prb.to_str().unwrap(), SIZE, Preset::Una).err().expect("a .prb refuses");
+    assert!(e.contains("ScanPrb"), "{e}");
+    let e = Viewer::open_scan(ply, ply, SIZE, Preset::Una).err().expect("a mesh is no part");
+    assert!(e.ends_with("--scan opens a .vug part"), "{e}");
+}
+
 // VUGFACEGDTDATUMSPICK (LEDGER SR564): with a pick held on the live map, `A` `B` `C` make the picked face that datum and
 // the third builds the frame through the `datum` command's own road (bit-equal to the command form); a set datum is
 // replaced; `D` clears (and toggles the map as before with no pick); lowercase `a` still opens a sketch. A re-measure
@@ -751,5 +839,6 @@ fn the_margin_argument_changes_n_kept() {
     assert_eq!(n4.matched, n12.matched, "the margin does not change the pairing");
     assert!(n4.n > n12.n, "a narrower margin keeps more form vertices: {} vs {}", n4.n, n12.n);
 }
+
 
 
