@@ -398,6 +398,7 @@ extrude boss sketch=b outer=c1 dir=[0 0 1] length=500
     assert_eq!(count(&report, "intent: cylinder "), 1, "one cylinder in the table\n{report}");
     let accepted: usize = field(&report, "intent: proposed=", "accepted").parse().unwrap();
     assert!(accepted >= 1 && count(&report, "accept ") == accepted, "an accepted proposal\n{report}");
+    assert_eq!(count(&report, "declined: "), 0, "the boss the document models is not declined\n{report}"); // VUGINTENTFEATURESDECLINED (SR673)
 
     // `--intent` with no document: the table alone.
     let o = scan(&[inp, "-o", ply, "--poses", poses, "--intent"]);
@@ -405,6 +406,18 @@ extrude boss sketch=b outer=c1 dir=[0 0 1] length=500
     assert!(o.status.success(), "stderr: {}", String::from_utf8_lossy(&o.stderr));
     assert!(count(&report, "intent: shapes: n=") == 1 && count(&report, "intent: cylinder ") == 1, "{report}");
     assert_eq!(count(&report, "intent: proposed="), 0, "{report}");
+
+    // VUGINTENTFEATURESDECLINED (SR673): a PLATE-ONLY document: the boss stands 30 mm off the plate top, so the feature
+    // rule declines it by name (near-end), one line after the proposals.
+    let plate: String = DOC.lines().take(11).map(|l| format!("{l}\n")).collect();
+    let plate_doc = d.join("plate.vug");
+    std::fs::write(&plate_doc, plate).unwrap();
+    let o = scan(&[inp, "-o", ply, "--poses", poses, "--intent", plate_doc.to_str().unwrap()]);
+    let report = String::from_utf8_lossy(&o.stdout).into_owned();
+    assert!(o.status.success(), "stderr: {}", String::from_utf8_lossy(&o.stderr));
+    println!("{report}");
+    assert_eq!(count(&report, "declined: "), 1, "{report}");
+    assert!(count(&report, "declined: near-end cylinder #") == 1 && count(&report, "intent: proposed=") == 1, "{report}");
 }
 
 /// VUGSCANSHAPESPREAD (SR526): every `shape:` line carries its measured `spread_deg=`, and `--intent` hands doc_core

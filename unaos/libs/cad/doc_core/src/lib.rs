@@ -67,6 +67,7 @@ pub use intent::apply_with; // VUGINTENTSETORDER (SR551)
 pub use intent::Term; // VUGINTENTTERMTYPE (SR577)
 pub use standards::{Class, METRIC, Standard, Thread, clearance_for, nearest_standard};
 pub use suggest::suggest;
+pub use suggest::{Declined, Suggested, suggested}; // VUGINTENTFEATURESDECLINED (SR673)
 pub use lex::read;
 pub use lex::read_with; // VUGMAKEMACHINELIB (SR544)
 pub use lex::HeldLib; // VUGMAKEMACHINELIBHELD (SR556)
