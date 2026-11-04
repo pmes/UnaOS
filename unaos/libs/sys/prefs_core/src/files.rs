@@ -31,6 +31,11 @@ pub const APP_NS: &str = "app";
 /// files and deleted, by the kernel at load and by Principia (the host's writer of record). Both rings name it here.
 pub const LEGACY: &str = ".config/unaos/preferences.toml";
 
+/// VEIL-BOOT-STORE-R3 (rmbp-ledger B1146): the `system` keys the boot login screen reads before any login — the ONE list
+/// the kernel's machine mirror (`prefs::machine_mirror`) copies into the no-session store. A relayed ring-3 SET (PREFS.ELF
+/// forwards to the kernel's verb 17) commits through the same mirror, so there is no second list to drift.
+pub const MACHINE_KEYS: &[&str] = &["accessibility.reduce_transparency"];
+
 /// PRINCIPIAFILES (B445): the `by` of a domain's `# auto-saved` line when no explicit writer is named — the pane
 /// that owns a system domain, else the program the domain belongs to. The kernel and Principia both stamp with it.
 pub fn writer_of(domain: &str) -> String {
@@ -218,5 +223,18 @@ mod tests {
         assert_eq!(clear(&mut c, "display").len(), 2);
         assert_eq!(c.get("system", "display.brightness"), None);
         assert_eq!(part(&c, "sound"), parts["sound"]);
+    }
+
+    // VEIL-BOOT-STORE-R3 (rmbp-ledger B1146): every machine key is a `system` schema row Settings writes, stored in a
+    // system domain, listed once — a typo or a renamed schema key fails here instead of silently stopping the mirror.
+    #[test]
+    fn machine_keys() {
+        assert!(!MACHINE_KEYS.is_empty());
+        for (i, k) in MACHINE_KEYS.iter().enumerate() {
+            let row = crate::schema::lookup("system", k).unwrap_or_else(|| panic!("system.{} is not a schema row", k));
+            assert!(row.writers.contains(&crate::schema::Writer::Settings), "system.{}", k);
+            assert!(SYSTEM_DOMAINS.contains(&domain_of("system", k).as_str()), "system.{}", k);
+            assert!(!MACHINE_KEYS[..i].contains(k), "system.{} listed twice", k);
+        }
     }
 }
