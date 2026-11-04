@@ -243,8 +243,8 @@ fn a_missing_port_refuses_no_such_port_by_name() {
         Err(r) => panic!("wrong refusal: {r}"),
         Ok(_) => panic!("opened a missing port"),
     }
-    let mut open = opener(Baud::B115200, Flow::None, GRBL);
-    match open("/dev/comscan-no-such-port") {
+    let mut open = opener(Baud::B115200, Flow::None);
+    match open("/dev/comscan-no-such-port", GRBL) {
         Err(why) => assert!(why.contains("no such port"), "{why}"),
         Ok(_) => panic!("opened a missing port"),
     }
@@ -346,8 +346,8 @@ fn two_boards_on_one_vid_pid_resolve_by_serial() {
     for bad in ["tty:usb:", "tty:usb:2341", "tty:usb:zz:0043", "tty:usb:12345:0043", "/dev/ttyACM0"] {
         assert_eq!(UsbId::parse(bad), Err(Refusal::BadUsbId { text: bad.to_string() }), "{bad}");
     }
-    let mut open = opener_in(sys.clone(), dev.clone(), Baud::B115200, Flow::None, GRBL);
-    match open("tty:usb:2341:0043:C3") {
+    let mut open = opener_in(sys.clone(), dev.clone(), Baud::B115200, Flow::None);
+    match open("tty:usb:2341:0043:C3", GRBL) {
         Err(why) => assert_eq!(why, "no such port: tty:usb:2341:0043:C3"),
         Ok(_) => panic!("opened an absent device"),
     }
@@ -415,7 +415,7 @@ fn drive_until(
         let now = t0.elapsed().as_micros() as u64;
         let mut out = desk.tick(now);
         if let Some(port) = desk.redial_due(now) {
-            let res = open(&port);
+            let res = open(&port, GRBL);
             out.extend(desk.relinked(t0.elapsed().as_micros() as u64, res));
         }
         for s in out {
@@ -446,7 +446,7 @@ fn the_redial_after_a_renamed_node_relinks_the_same_device() {
     desk.identify_by(identify_in(sys.clone()));
     let pass = Verdict::Pass { digest: p.digest(), machine: machine().digest() };
     let digest = desk.arm(&pass, &p, GRBL).expect("armed by a pass");
-    let mut open = opener_in(sys.clone(), dev.clone(), Baud::B115200, Flow::None, GRBL);
+    let mut open = opener_in(sys.clone(), dev.clone(), Baud::B115200, Flow::None);
     // Both fakes keep silent until the soft reset: open_flow's tcflush drops a banner said before the open, and the
     // desk opens and waits in one call, so only a banner on the reset is said after the port is open.
     let fake1 = fake_grbl(m1, true, 2);
@@ -530,7 +530,7 @@ fn the_first_tty_open_keeps_the_controllers_answer_to_the_hello() {
     desk.hello_within(comscan::tty::READY_WAIT);
     let pass = Verdict::Pass { digest: p.digest(), machine: machine().digest() };
     let digest = desk.arm(&pass, &p, GRBL).expect("armed by a pass");
-    let mut open = opener(Baud::B115200, Flow::None, GRBL);
+    let mut open = opener(Baud::B115200, Flow::None);
     // Silent until the soft reset: open_flow's tcflush drops a banner said before the open.
     let fake = fake_grbl_as(m, true, want.len(), VER_A);
     let start = PumpEvent::PumpStart {
@@ -561,4 +561,99 @@ fn the_first_tty_open_keeps_the_controllers_answer_to_the_hello() {
     drop(desk);
     let (lines, _m) = fake.join().unwrap();
     assert_eq!(lines, want, "the hello is no program line");
+}
+
+// --- VUGCOMSCANHOSTDIALECT (SR566): a Marlin PumpStart on the host composition, the opener handed the dialect ---
+
+const MARLIN: Dialect = Dialect::Marlin;
+const MARLIN_FIRMWARE: &str = "FIRMWARE_NAME:Marlin 2.1.2.1 (Jun  1 2023 12:00:00) SOURCE_CODE_URL:github.com/MarlinFirmware/Marlin PROTOCOL_VERSION:1.0 MACHINE_TYPE:3D Printer EXTRUDER_COUNT:1";
+
+/// A fake Marlin on the master: says `start` every 20 ms until its first line arrives (a booting board; a grbl wait
+/// never matches it), answers `M115` with its firmware line, a `Cap:` line and `ok`, then `ok` per line; returns the
+/// lines it executed and the master (kept open until the desk is done) once `lines` arrived (`M115` is neither recorded
+/// nor counted).
+fn fake_marlin(mut m: File, lines: usize) -> JoinHandle<(Vec<String>, File)> {
+    thread::spawn(move || {
+        let heard = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (mut w, h) = (m.try_clone().unwrap(), heard.clone());
+        let mut spam = Some(thread::spawn(move || {
+            while !h.load(std::sync::atomic::Ordering::SeqCst) {
+                let _ = w.write_all(b"start\r\n");
+                thread::sleep(Duration::from_millis(20));
+            }
+        }));
+        let mut got = Vec::new();
+        let mut cur: Vec<u8> = Vec::new();
+        let mut buf = [0u8; 256];
+        while got.len() < lines {
+            let n = match m.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            for &b in &buf[..n] {
+                if b != b'\n' {
+                    cur.push(b);
+                    continue;
+                }
+                let line = String::from_utf8_lossy(&cur).trim().to_string();
+                cur.clear();
+                if let Some(t) = spam.take() {
+                    heard.store(true, std::sync::atomic::Ordering::SeqCst);
+                    t.join().unwrap(); // no `start` after this: a mid-stream `start` is a reset to the pump
+                }
+                if line == "M115" {
+                    m.write_all(format!("{MARLIN_FIRMWARE}\r\nCap:SERIAL_XON_XOFF:0\r\nok\r\n").as_bytes()).unwrap();
+                } else {
+                    got.push(line);
+                    m.write_all(b"ok\r\n").unwrap();
+                }
+            }
+        }
+        heard.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(t) = spam.take() {
+            let _ = t.join();
+        }
+        (got, m)
+    })
+}
+
+#[test]
+fn a_marlin_start_on_the_host_composition_says_m115_and_streams() {
+    let (m, path, _s) = pty();
+    let p = program();
+    let want = Pump::from_program(&p, MARLIN).unwrap().lines().to_vec();
+    // THE host composition (tty at 115200, no flow, the hello on): no dialect bound, each open is handed its PumpStart's.
+    let (mut desk, mut open) = comscan::pump::host_parts(machine());
+    let pass = Verdict::Pass { digest: p.digest(), machine: machine().digest() };
+    let digest = desk.arm(&pass, &p, MARLIN).expect("armed by a pass");
+    let fake = fake_marlin(m, want.len());
+    let start = PumpEvent::PumpStart {
+        principal: Origin::LocalUser("una".to_string()),
+        program: digest_hex(digest),
+        dialect: "marlin".to_string(),
+        port: path.to_str().unwrap().to_string(),
+    };
+    let out = desk.apply(&start, &mut *open);
+    let words: Vec<String> =
+        out.iter().filter_map(|s| match s { PumpEvent::Squawk { event: Some(e), .. } => Some(e.clone()), _ => None }).collect();
+    // A grbl-bound opener waited for `Grbl `, reset and refused NoBanner here; no commission (Marlin has no name verb).
+    assert_eq!(words, vec!["started".to_string(), format!("hello {MARLIN_FIRMWARE}")], "{out:?}");
+    assert_eq!(desk.hello(), Some(MARLIN_FIRMWARE), "the M115 answer is the identity the reopen compares");
+
+    let t0 = Instant::now();
+    let mut done = false;
+    while !done && t0.elapsed() < Duration::from_secs(10) {
+        for s in desk.tick(t0.elapsed().as_micros() as u64) {
+            if let PumpEvent::Squawk { event: Some(e), .. } = &s {
+                assert!(!e.starts_with("link lost") && e != "controller reset", "{e}");
+                done |= e == "done";
+            }
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+    assert!(done, "the Marlin run reached done");
+    drop(desk);
+    drop(open);
+    let (lines, _m) = fake.join().unwrap();
+    assert_eq!(lines, want, "make_core's Marlin text, line for line, and M115 is no program line");
 }

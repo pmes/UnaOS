@@ -507,3 +507,37 @@ fn a_wrong_side_photo_refuses_the_extrude_by_its_thickness() {
     assert!(vw.view.design.body.is_none(), "no body");
     assert!(ph(&vw).note.as_deref().unwrap_or("").starts_with("refused residual"), "{:?}", ph(&vw).note);
 }
+
+// ---- VUGINTENTUNDOSET (SR563): an accepted statement set is ONE undo step ----
+
+/// The rectangle face: a point and a distance naming it share one why (doc_core's one set); Enter on the set enters
+/// both statements as ONE journal snapshot, one `u` puts the document back to the sketch before the set, one `U`
+/// brings both statements back.
+#[test]
+fn a_set_enters_whole_and_undoes_in_one_step() {
+    let mut vw = rectangle();
+    let set = |stmt: &str| Proposal { stmt: stmt.into(), confidence: 0.9, why: "a datum point".into() };
+    let before = photo::doc_of(face(&vw));
+    let ents = face(&vw).sketch.entities().len();
+    assert!(photo::offer(&mut vw.view, vec![set("point v3 sketch=s x=10 y=0"), set("distance v4 sketch=s a=e0 b=v3 d=10")]));
+    assert_eq!(ph(&vw).focus, Some(0));
+    assert!(key(&mut vw, "Return"));
+    assert!(ph(&vw).offers.iter().all(|o| o.state == State::Applied), "{:?}", ph(&vw).note);
+    assert!(ph(&vw).note.as_deref().unwrap_or("").starts_with("applied set n=2"), "{:?}", ph(&vw).note);
+    let j = &vw.view.design.journal;
+    assert_eq!(j.doc.stmts.len(), before.stmts.len() + 2, "both statements entered");
+    assert_eq!(j.doc.stmts[..before.stmts.len()], before.stmts[..], "behind the sketch");
+    let entered = j.doc.clone();
+    let (undo, _) = j.depth();
+    assert_eq!(face(&vw).sketch.entities().len(), ents + 1, "the point is in the face");
+    // ONE `u`: the whole set out.
+    assert!(key(&mut vw, "u"));
+    assert_eq!(vw.view.design.journal.doc, before, "one undo puts the document back to before the set");
+    assert_eq!(vw.view.design.journal.depth(), (undo - 1, 1));
+    assert_eq!(face(&vw).sketch.entities().len(), ents, "the point is out of the face");
+    // ONE `U`: the whole set back.
+    assert!(key(&mut vw, "U"));
+    assert_eq!(vw.view.design.journal.doc, entered, "one redo brings both statements back");
+    assert_eq!(vw.view.design.journal.depth(), (undo, 0));
+    assert_eq!(face(&vw).sketch.entities().len(), ents + 1);
+}
