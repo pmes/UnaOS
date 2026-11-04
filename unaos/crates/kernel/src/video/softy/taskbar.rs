@@ -439,7 +439,7 @@ pub(super) fn glyph_disk(s: &mut Surf, x: usize, y: usize, d: usize, ink: u32) {
 /// tint over the blurred wallpaper, DESIGN-LANGUAGE §2.4; flat in Light), then the hairline and the items.
 fn paint_row(out: &mut [u32], m: &Model, l: &Layout, r: strip::Rect, j: usize) {
     let w = r.2;
-    crate::video::crystal::veil::row_live({ let n = w.min(out.len()); &mut out[..n] }, r.0, r.1 + j, crate::video::crystal::veil::Look { face: k::SURFACE(), a: k::VEIL_A() }); // VEILONE (B1114): the one VEIL painter (crystal.rs tail); was `paint::veil_row`
+    crate::video::crystal::veil::row_live({ let n = w.min(out.len()); &mut out[..n] }, r.0, r.1 + j, crate::video::crystal::veil::Look { face: k::SURFACE(), a: k::VEIL_A() }.reduced()); // VEIL-REDUCE-FACE (B1134): Reduce transparency at 100 %. VEILONE (B1114): the one VEIL painter (crystal.rs tail); was `paint::veil_row`
     let mut s = Surf::row(out, w, j);
     p::hairline_h(&mut s, 0, 0, w, k::STROKE(), k::STROKE_A());
     // The tiles: Start, then the apps.

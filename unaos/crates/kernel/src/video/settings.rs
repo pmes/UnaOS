@@ -3320,7 +3320,7 @@ static A11Y_REDUCE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicB
 static A11Y_CONTRAST: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 static A11Y_CURSOR_Q: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(A11Y_CURSOR_MIN_Q);
 static A11Y_TEXT: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
-/// Store writes owed: bit k = row k (0 reduce motion, 1 contrast, 2 cursor size, 3 text size, 4 cvd, 5 invert, 6 zoom, 7 zoom follow, 8 show performance, 9 starfield shimmer: SHIMMERPREF B1108).
+/// Store writes owed: bit k = row k (0 reduce motion, 1 contrast, 2 cursor size, 3 text size, 4 cvd, 5 invert, 6 zoom, 7 zoom follow, 8 show performance, 9 starfield shimmer: SHIMMERPREF B1108, 10 reduce transparency: row 1's check, VEIL-REDUCE-FACE B1134).
 static A11Y_PERSIST: AtomicU32 = AtomicU32::new(0);
 /// ZOOM (B713): the magnifier's factor as stored (0 off, 2, 3, 4) and what it follows (0 the pointer, 1 the focus) —
 /// the rows' latch; the lens (`video/zoom.rs`, x86 `wc`) is handed both by [`zoom_apply`].
@@ -3447,7 +3447,7 @@ fn a11y_set(row: usize, val: usize, store: bool) {
         6 => { let z = a11y_zoom_of_seg(a11y_zoom_seg(val.min(4) as u8)); A11Y_ZOOM.store(z, Ordering::Relaxed); zoom_apply(); ("zoom", alloc::format!("{}", z), cfg!(all(target_arch = "x86_64", feature = "wc"))) } // ZOOM (B713)
         7 => { let f = val.min(A11Y_FOLLOW_NAMES.len() - 1); A11Y_FOLLOW.store(f as u8, Ordering::Relaxed); zoom_apply(); ("zoom_follow", alloc::format!("{}", A11Y_FOLLOW_NAMES[f]), cfg!(all(target_arch = "x86_64", feature = "wc"))) }
         8 => { let _ = super::perfhud::apply(val != 0, "settings", false); /* crawl A 24: the store write is this row's bit 8, not perfhud's OWED too */ ("show_performance", alloc::format!("{}", (val != 0) as u8), cfg!(all(target_arch = "x86_64", feature = "wc"))) } // PERFHUD (B710): applied where the compositor paints it
-        9 => shimmer_row_set(val != 0), // SHIMMERPREF (B1108)
+        9 => shimmer_row_set(val != 0), 10 => reduce_row_set(val != 0), // SHIMMERPREF (B1108). VEIL-REDUCE-FACE (B1134): id 10 = row 1's check (file tail)
         _ => return,
     };
     if store {
@@ -3507,7 +3507,7 @@ fn a11y_service() {
         set_sys(key::A11Y_ZOOM_FOLLOW, P::Str(String::from(A11Y_FOLLOW_NAMES[f])));
     }
     if owed & 256 != 0 { set_sys(key::A11Y_SHOW_PERF, P::Bool(super::perfhud::visible())); } // PERFHUD (B710), row 8
-    if owed & 512 != 0 { set_sys(key::A11Y_SHIMMER, P::Bool(shimmer_on())); } // SHIMMERPREF (B1108), row 9
+    if owed & 512 != 0 { set_sys(key::A11Y_SHIMMER, P::Bool(shimmer_on())); } if owed & 1024 != 0 { set_sys(key::A11Y_REDUCE_TRANSPARENCY, P::Bool(super::crystal::login_reduce())); } // SHIMMERPREF (B1108), row 9. VEIL-REDUCE-FACE (B1134): bit 10, Reduce transparency
 }
 
 fn paint_a11y(st: &mut State) {
@@ -3518,7 +3518,7 @@ fn paint_a11y(st: &mut State) {
     txt2(st, TRACK_X, 0, if rm { "Slides are cuts" } else { "Slides ease over 160 ms" });
     txt(st, LABEL_X, 1, "Increase contrast");
     tog(st, 1, TOG_X, ic, false);
-    txt2(st, TRACK_X, 1, if ic { "Secondary ink and lines at full strength" } else { "Standard contrast" });
+    paint_reduce_row(st); // VEIL-REDUCE-FACE (B1134): row 1's second control, the Reduce transparency check (file tail); was the contrast help text
     txt(st, LABEL_X, 2, "Cursor size");
     slider(st, 2, ((q - A11Y_CURSOR_MIN_Q) / 2) as usize, A11Y_CURSOR_STEPS, false);
     txt2(st, VAL_X, 2, &alloc::format!("x{} ({} blocks)", a11y_cursor_str(q), cursor_blocks(crate::ui::Metrics::panel().scale)));
@@ -3555,7 +3555,7 @@ const A11Y_CVD_SAY: [&str; 5] = ["Off", "Protanopia", "Deuteranopia", "Tritanopi
 fn press_a11y(row: usize, cx: usize) {
     match row {
         0 => a11y_set(0, (!reduce_motion()) as usize, true),
-        1 => a11y_set(1, (!increase_contrast()) as usize, true),
+        1 => if reduce_hit(cx) { a11y_set(10, (!super::crystal::login_reduce()) as usize, true) } else { a11y_set(1, (!increase_contrast()) as usize, true) }, // VEIL-REDUCE-FACE (B1134): the check and its label; the rest of the row flips contrast
         2 => { if cx + 6 >= TRACK_X && cx <= TRACK_X + TRACK_W + 6 { drag_begin(A11Y_CURSOR_CTRL, cx); } }
         3 => { if cx >= TRACK_X && cx < TRACK_X + TRACK_W { a11y_set(3, ((cx - TRACK_X) / (TRACK_W / A11Y_TEXT_NAMES.len())).min(A11Y_TEXT_NAMES.len() - 1), true); } }
         4 => { if cx >= TRACK_X && cx < TRACK_X + TRACK_W { a11y_set(4, ((cx - TRACK_X) / (TRACK_W / af::MODES)).min(af::MODES - 1), true); } }
@@ -3928,7 +3928,7 @@ pub const MAP: [MapRow; 46] = {
         mr(&[NOTIFY_DND_FROM, NOTIFY_DND_UNTIL], NP_TAB, 1, "Scheduled", NO_CTRL),
         // Accessibility
         mr(&[A11Y_REDUCE_MOTION], A11Y_TAB, 0, "Reduce motion", NO_CTRL),
-        mr(&[A11Y_INCREASE_CONTRAST], A11Y_TAB, 1, "Increase contrast", NO_CTRL),
+        mr(&[A11Y_INCREASE_CONTRAST, A11Y_REDUCE_TRANSPARENCY], A11Y_TAB, 1, "Increase contrast, reduce transparency", NO_CTRL), // VEIL-REDUCE-FACE (B1134): row 1 carries both
         mr(&[A11Y_CURSOR_SIZE], A11Y_TAB, 2, "Cursor size", NO_CTRL),
         mr(&[A11Y_TEXT_SIZE], A11Y_TAB, 3, "Text size", NO_CTRL),
         mr(&[A11Y_CVD], A11Y_TAB, 4, "Colour filter", NO_CTRL),
@@ -6078,4 +6078,30 @@ fn keys_table() -> (usize, usize, String) {
 #[cfg(not(feature = "witness"))]
 fn keys_table() -> (usize, usize, String) {
     (0, 0, String::from("skip(no-witness)"))
+}
+
+// ── VEIL-REDUCE-FACE (rmbp-ledger B1134, BP-video-11) — Settings > Accessibility row 1's second control ────────────
+// `system.accessibility.reduce_transparency` (bool, default off; PREFS-SCHEMA.md): the VEIL at 100 % under the menu bar,
+// the dock, Softy's taskbar and the login backdrop (DESIGN-LANGUAGE §2.4). The pane is full (`ROWS` = 10), so the row is
+// a check box beside Increase contrast on row 1, painted after the contrast switch (row 1's first stop stays the switch)
+// and pressed by `cx` (Notifications' shape; a key's press lands at the stop's centre). The applied state is the ONE
+// latch, `crystal::login_reduce` (B1128): set by `a11y_set` id 10 through `crystal::login_reduce_set`, stored through
+// `A11Y_PERSIST` bit 10 by `a11y_service`, read back by `a11y_load` through `crystal::login_reduce_load`. Wire:
+// `[settings] accessibility.reduce_transparency=<0|1> applied=1`.
+
+/// `a11y_set` id 10: apply the check; `(name, value, applied)` for its wire.
+fn reduce_row_set(on: bool) -> (&'static str, String, bool) {
+    let _ = super::crystal::login_reduce_set(on);
+    ("reduce_transparency", alloc::format!("{}", on as u8), true)
+}
+
+/// `paint_a11y` row 1: the check box at the track's start and its label.
+fn paint_reduce_row(st: &mut State) {
+    check(st, 1, TRACK_X, super::crystal::login_reduce());
+    txt(st, TRACK_X + draw::DIMS.check + 8, 1, "Reduce transparency");
+}
+
+/// A press on row 1 at `cx` meant for the check (the box and its label, short of the contrast switch).
+fn reduce_hit(cx: usize) -> bool {
+    cx >= TRACK_X && cx + 8 < TOG_X
 }
