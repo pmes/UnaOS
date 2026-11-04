@@ -84,6 +84,9 @@ pub struct Offer {
     pub named: String,
     /// VUGINTENTSETFACE (SR570): a member of one doc_core statement set, painted as ONE card ([`Member`]).
     pub set: Option<Member>,
+    /// VUGINTENTSETFACESCROLL (SR583): the first member line shown of the card this offer heads (0 = the top; PageDown /
+    /// PageUp move it, [`page_card`]); only a card's head offer's is read.
+    pub page: usize,
 }
 
 /// A proposal glyph as drawn: where, what, in which colour, and which offer.
@@ -418,7 +421,7 @@ pub fn key(view: &mut View, k: &str) -> Option<bool> {
             ph.focus = ph.offers.iter().position(|o| o.state == State::Open);
             Some(true)
         }
-        "Escape" | "\u{1b}" => focused.and_then(|i| reject_card(view, i)), // VUGINTENTSETFACE (SR570): Escape refuses the whole card; off a card the sketch's Escape
+        "Escape" | "\u{1b}" => focused.and_then(|i| reject_card(view, i)), "Page_Down" | "PageDown" | "Next" | "Page_Up" | "PageUp" | "Prior" => focused.and_then(|i| page_card(view, i, k)), // VUGINTENTSETFACESCROLL (SR583): PageDown / PageUp page a card taller than the sheet; VUGINTENTSETFACE (SR570): Escape refuses the whole card; off a card the sketch's Escape
         _ => None,
     }
 }
@@ -530,7 +533,7 @@ pub fn glyphs(view: &View) -> Vec<ProposalGlyph> {
         } else {
             PROPOSAL
         };
-        out.push(ProposalGlyph { offer: i, at, text: text.to_uppercase(), colour, card }); // VUGINTENTSETFACE (SR570): card
+        let card = paged(card, at.1, view.size.1); out.push(ProposalGlyph { offer: i, at, text: text.to_uppercase(), colour, card }); // VUGINTENTSETFACESCROLL (SR583): the card's page on the sheet; VUGINTENTSETFACE (SR570): card
     }
     out
 }
@@ -634,7 +637,7 @@ pub fn answer(view: &mut View, ev: &IntentEvent) -> bool {
 /// The one verify road: `p` checked by `doc_core::verify` against the face's document and the measured outline, Open.
 fn verified(doc: &Doc, m: &Measurement, t: Option<&Measurement>, p: Proposal, streaming: Option<u32>) -> Offer {
     let verdict = judged(doc, &p, m, t); // VUGINTENTTHICKNESS (SR557): the held thickness beside the outline
-    Offer { proposal: p, verdict, state: State::Open, streaming, named: String::new(), set: None } // VUGINTENTSETFACE (SR570): named / set by `mark`
+    Offer { proposal: p, verdict, state: State::Open, streaming, named: String::new(), set: None, page: 0 } // VUGINTENTSETFACE (SR570): named / set by `mark`
 }
 
 /// The one corner and focus rule after `n` proposals were offered: `intent: proposed=n acceptable=a refused=r` over the
@@ -981,6 +984,10 @@ pub struct Card {
     pub lines: Vec<String>,
     pub term: Term, // VUGINTENTTERMTYPE (SR577)
     pub verdict: Verdict,
+    /// VUGINTENTSETFACESCROLL (SR583): the first member line shown (the head offer's `page`, clamped by [`paged`]).
+    pub first: usize,
+    /// VUGINTENTSETFACESCROLL (SR583): the member lines the sheet shows under the head ([`paged`]); every line until measured.
+    pub fit: usize,
 }
 
 /// The face's document in the JOURNAL's names, and the face-slot (PlainNames, [`doc_of`]) -> journal id pairs: a journal
@@ -1147,8 +1154,8 @@ fn card_run(ph: &Photo, i: usize) -> Option<(usize, usize)> {
 fn card_of(ph: &Photo, i: usize) -> Option<Card> {
     let (lo, hi) = card_run(ph, i)?;
     let term = ph.offers[i].set?.term;
-    let lines = ph.offers[lo..=hi].iter().map(|o| o.proposal.stmt.trim().to_uppercase()).collect();
-    Some(Card { lines, term, verdict: ph.offers[i].verdict.clone() })
+    let lines: Vec<String> = ph.offers[lo..=hi].iter().map(|o| o.proposal.stmt.trim().to_uppercase()).collect();
+    Some(Card { first: ph.offers[i].page, fit: lines.len(), lines, term, verdict: ph.offers[i].verdict.clone() }) // VUGINTENTSETFACESCROLL (SR583): first / fit
 }
 
 /// The card's head line: `SET N=<n> <why> R=<rms> C=<least confidence> TERM=<term>`, or `... REFUSED <reason> TERM=`.
@@ -1168,7 +1175,7 @@ fn card_head(ph: &Photo, i: usize, c: &Card) -> String {
 /// The card's member statements, one row each under its head (the overlay's one loop).
 fn card_lines(fr: &mut Raster, g: &ProposalGlyph, col: [u8; 4]) {
     let Some(c) = &g.card else { return };
-    for (k, l) in c.lines.iter().enumerate() {
+    for (k, l) in c.rows().iter().enumerate() { // VUGINTENTSETFACESCROLL (SR583): the page's rows and its more line
         raster::text(fr, l, g.at.0 + 8.0, g.at.1 + 12.0 * (k + 1) as f32, col);
     }
 }
@@ -1205,8 +1212,8 @@ fn single_road(view: &mut View, i: usize) -> Option<bool> {
     if names.is_empty() || (names.iter().all(|(a, b)| a == b) && p.stmt == o.proposal.stmt) {
         return None;
     }
-    if extruded(&doc, &p).is_some() {
-        return None;
+    if let Some(x) = extruded(&doc, &p) {
+        return extrude_named(view, i, &doc, &p, x, &names); // VUGINTENTSETFACESCROLL (SR583): the extrude in the journal's names, SR547's apply
     }
     let stmt = o.proposal.stmt.trim().to_string();
     let verdict = judged(&doc, &p, &ph.measurement(), ph.thickness.as_ref());
@@ -1291,3 +1298,76 @@ fn xy(s: &str) -> Option<Vec2> {
     (x.is_finite() && y.is_finite()).then(|| Vec2::new(x, y))
 }
 
+// ---- VUGINTENTSETFACESCROLL (SR583): a card taller than the sheet pages; a single extrude in the journal's names (named tail block) ----
+
+/// A card's row pitch and the bitmap glyph's height (5 rows of 2 px), the painter's own geometry ([`card_lines`]).
+const CARD_ROW_PX: f32 = 12.0;
+const GLYPH_PX: f32 = 10.0;
+
+/// The card's page on a sheet `sheet_h` px tall with its head at `y` (B1119's rule, Quarry's menu): every member line
+/// when they fit under the head; else the rows that fit less one (at least one line), the last row the more line. The
+/// first shown line is clamped so the last page is full. No scroll model: the sheet never moves, the page turns.
+fn paged(card: Option<Card>, y: f32, sheet_h: u32) -> Option<Card> {
+    let mut c = card?;
+    let n = c.lines.len();
+    let rows = ((sheet_h as f32 - y - GLYPH_PX) / CARD_ROW_PX).floor().max(0.0) as usize;
+    c.fit = if n <= rows { n } else { rows.saturating_sub(1).max(1) };
+    c.first = c.first.min(n.saturating_sub(c.fit));
+    Some(c)
+}
+
+impl Card {
+    /// The rows painted under the head: the member lines `[first, first + fit)` and, when the card is paged, ONE more
+    /// line: `... <n> MORE` while lines remain below, else (the last page) `... <first> BACK` (B1119's `<first> back`).
+    pub fn rows(&self) -> Vec<String> {
+        let n = self.lines.len();
+        let first = self.first.min(n);
+        let end = first.saturating_add(self.fit).min(n);
+        let mut v = self.lines[first..end].to_vec();
+        if self.fit < n {
+            let below = n - end;
+            v.push(if below > 0 { format!("... {below} MORE") } else { format!("... {first} BACK") });
+        }
+        v
+    }
+}
+
+/// PageDown / PageUp on the focused card (offer `i`): its head's page moves by the fit the painter measured (the ONE
+/// geometry: the head's glyph from [`glyphs`]), PageDown to at most `n - fit`, PageUp to at least 0. None (the key falls
+/// through) off a card and on a card the sheet shows whole; true when the page moved.
+fn page_card(view: &mut View, i: usize, k: &str) -> Option<bool> {
+    let lo = card_run(view.photo.as_ref()?, i)?.0;
+    let c = glyphs(view).into_iter().find(|g| g.offer == lo)?.card?;
+    let n = c.lines.len();
+    if c.fit >= n {
+        return None;
+    }
+    let first = if matches!(k, "Page_Down" | "PageDown" | "Next") { (c.first + c.fit).min(n - c.fit) } else { c.first.saturating_sub(c.fit) };
+    let ph = view.photo.as_mut()?;
+    let moved = ph.offers[lo].page != first;
+    ph.offers[lo].page = first;
+    Some(moved)
+}
+
+/// Enter on a lone extrude once the journal's names are not the face's ([`single_road`]'s take-over rule): `p` (in the
+/// journal's names, `doc` the journal's current document) judged by [`judged`] (the outline and a held thickness); a
+/// refusal names itself and applies nothing; else the journal-named `outer` mapped back to the face's slot by the
+/// inverse of [`journal_doc`]'s pairs, and [`enter_extrude`] (SR547's pull road: `Journal::record` writes the slot's
+/// journal name back, the same `outer`).
+fn extrude_named(view: &mut View, i: usize, doc: &Doc, p: &Proposal, x: (String, [f64; 3], f64), names: &[(String, String)]) -> Option<bool> {
+    let ph = view.photo.as_ref()?;
+    let verdict = judged(doc, p, &ph.measurement(), ph.thickness.as_ref());
+    let (outer, dir, length) = x;
+    let slot = names.iter().find(|(_, b)| *b == outer).map(|(a, _)| a.clone());
+    let ph = view.photo.as_mut()?;
+    ph.offers[i].verdict = verdict.clone();
+    if let Verdict::Refuse { why } = &verdict {
+        ph.note = Some(format!("refused {}", why.text()));
+        return Some(true);
+    }
+    let Some(slot) = slot else {
+        ph.note = Some(format!("refused by the sketch outer {outer} names no face slot"));
+        return Some(true);
+    };
+    Some(enter_extrude(view, i, (slot, dir, length)))
+}
