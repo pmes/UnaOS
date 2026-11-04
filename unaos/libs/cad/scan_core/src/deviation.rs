@@ -711,6 +711,13 @@ fn shift(scan: &ScanMesh, design: &Design, bvh: &Bvh, normals: &[Vec3], sample: 
 /// over [`COARSE_SELECT_KEEP`] (the first on a tie), each carrying its start score ([`trimmed`] at `p.gate(0)`,
 /// [`COARSE_KEEP`]).
 pub fn coarse_view(scan: &ScanMesh, design: &Design, bvh: &Bvh, p: &AlignParams, tol: Tol, sweep: Sweep) -> Option<Vec<(Transform, f64)>> {
+    Some(swept(scan, design, bvh, p, tol, sweep)?.into_iter().take(COARSE_VIEW_KEEP).map(|(_, t, s)| (t, s)).collect()) // VUGSCANCOARSESYMTHREEKEEP (SR659): the sweep lifted into `swept`, the keep here
+}
+
+/// Every start of [`coarse_view`]'s sweep as (rank, start, score), sorted by the rank ([`trimmed`] at `p.gate(0)` over
+/// [`COARSE_SELECT_KEEP`], the first on a tie), the score [`trimmed`] at `p.gate(0)`, [`COARSE_KEEP`]; None as
+/// [`coarse_view`] (VUGSCANCOARSESYMTHREEKEEP SR659: [`three_or`] keeps by the rank, the diagnostic seam the test prints).
+pub fn swept(scan: &ScanMesh, design: &Design, bvh: &Bvh, p: &AlignParams, tol: Tol, sweep: Sweep) -> Option<Vec<(f64, Transform, f64)>> {
     let nv = scan.mesh.positions.len();
     if nv == 0 || design.mesh.triangles.is_empty() {
         return None;
@@ -752,7 +759,7 @@ pub fn coarse_view(scan: &ScanMesh, design: &Design, bvh: &Bvh, p: &AlignParams,
         }
     }
     scored.sort_by(|a, b| a.0.total_cmp(&b.0));
-    Some(scored.into_iter().take(COARSE_VIEW_KEEP).map(|(_, t, s)| (t, s)).collect())
+    Some(scored)
 }
 
 /// `measure_coarse`'s starts: SR615's four when their least score is inside `p.gate(2)`; else [`coarse_view`]'s when the
@@ -835,7 +842,7 @@ fn pivot(mesh: &Mesh) -> Option<usize> {
 fn sym_or(scan: &ScanMesh, design: &Design, bvh: &Bvh, p: &AlignParams, tol: Tol, starts: Vec<(Transform, f64)>) -> Vec<(Transform, f64)> {
     match pivot(&design.mesh).and_then(|axis| coarse_view(scan, design, bvh, p, tol, Sweep::About(axis))) {
         Some(sym) if !sym.is_empty() => sym,
-        _ => starts,
+        _ => three_or(scan, design, bvh, p, tol, starts), // VUGSCANCOARSESYMTHREEKEEP (SR659): a design three-equal keeps every near-tie start of the three sweeps
     }
 }
 
@@ -923,4 +930,48 @@ fn degenerate(lo: f64, hi: f64) -> bool {
 pub fn scan_spectrum(mesh: &Mesh) -> Option<([f64; 3], [Vec3; 3])> {
     let (_, x, y, w) = axes(mesh)?;
     Some((w, [x.cross(y), y, x]))
+}
+
+// ---- VUGSCANCOARSESYMTHREEKEEP (LEDGER SR659): a three-equal design keeps every near-tie start ----
+// A design whose three moments are near-equal (both adjacent ratios [`degenerate`]: [`pivot`] None) stayed on SR615's
+// four starts. MEASURED by SR657 (vug-view tests `a_near_cube_s_basins_scored`: a 200 x 210 x 220 box with one pin r15
+// h40, ratios 0.925 / 0.884): the trimmed keep 0.3 ranks the true basin 1st of the cube group's 24 at the basin and
+// after the wide refine (gate(2) 0.0543 against its three 180° twins' 0.0599 mm), but the sweep about each design axis
+// kept 4 a sweep and those 12 held the twins and dimension-swapped basins, not the truth: each swept start sits 12-15°
+// off its basin (the 30° step) and that offset, not the basin, sets its start rank, so the near-tie group and the
+// swapped basins interleave before the refine (basin 13 at 1.439 ahead of the twins at 1.513-1.709, keep 0.1). The
+// keep-0.3 ranks were not printed, so the near-tie window is the road's own fine floor, `p.gate(2)` (no new constant):
+// [`three_or`] runs [`swept`] about each design axis (`Sweep::About(0..3)`, [`partner`] as SR642 / SR647 read it) and
+// hands EVERY start whose rank is within `p.gate(2)` of the best into `measure_coarse`'s refine / select loop
+// unchanged, which tells the near-tie group apart (SR657's T1); a start that pairs nothing ranks toward `p.gate(0)` and
+// drops. Cost: the three sweeps (3 x 24 starts, ≈ 1.03M `Bvh::closest`), then N wide refines (≤ 3·iters·COARSE_POINTS
+// ≈ 123k each, ≤ 72 ≈ 8.9M) only for a three-equal design. Every other design's road is unchanged ([`three`] false).
+// MEASURED (SR659, the near-cube): the 72 ranks span 4.649 .. 13.438, all within best + 9, so every start is kept; the
+// truth's best start (rank 6.400, 16.2° off, 9th) refines and is selected: aligned 0.583, 0.006° / 0.031 mm.
+
+/// The design's three moments are near-equal: both adjacent ascending eigenvalue pairs [`degenerate`] (SR647's one test).
+fn three(mesh: &Mesh) -> bool {
+    axes(mesh).is_some_and(|(_, _, _, w)| degenerate(w[0], w[1]) && degenerate(w[1], w[2]))
+}
+
+/// `measure_coarse`'s starts for a [`three`]-equal design: every start of [`swept`] about each design axis whose rank is
+/// within `p.gate(2)` of the best rank of the union, in rank order, each with its start score; else (not three-equal,
+/// or no start) `starts` unchanged.
+fn three_or(scan: &ScanMesh, design: &Design, bvh: &Bvh, p: &AlignParams, tol: Tol, starts: Vec<(Transform, f64)>) -> Vec<(Transform, f64)> {
+    if !three(&design.mesh) {
+        return starts;
+    }
+    let mut all: Vec<(f64, Transform, f64)> = Vec::new();
+    for i in 0..3usize {
+        if let Some(s) = swept(scan, design, bvh, p, tol, Sweep::About(i)) {
+            all.extend(s);
+        }
+    }
+    let best = all.iter().map(|s| s.0).fold(f64::INFINITY, f64::min);
+    if !best.is_finite() {
+        return starts;
+    }
+    all.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let kept: Vec<(Transform, f64)> = all.into_iter().filter(|s| s.0 <= best + p.gate(2)).map(|(_, t, s)| (t, s)).collect();
+    if kept.is_empty() { starts } else { kept }
 }
