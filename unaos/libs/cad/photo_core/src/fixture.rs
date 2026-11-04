@@ -390,3 +390,46 @@ pub fn shim_png(s: &Spec) -> Vec<u8> {
     let img = render_shim(s);
     pixel_core::png::encode::encode_rgba(img.width, img.height, &img.rgba).unwrap_or_default()
 }
+
+// ---- VUGPHOTOSIDETHINSPLIT (SR669): the shim with a light gap on its side, and its dense loop (named tail block) ----
+/// The split probe's gap (mm): its length along the shim's side and its depth into the shim. The depth is 2.5 σ at the
+/// photo's σ 0.125: past DP's 2 σ, inside the 3 σ band, leaving a 0.1875 mm bridge. Measured (SR669): no corner survives
+/// and the fit absorbs it into the side's ONE line (its rms ~5 x the clean sides').
+pub const SHIM_GAP: (f64, f64) = (0.25, 0.3125);
+
+/// Whether a part-frame point is in the shim less a light gap `(along, depth)` centred at the side's mid-length
+/// (x = -SHIM_L / 2) on the shim's upper side (y = SHIM_Y + SHIM_W / 2).
+pub fn in_shim_gap(q: Vec2, gap: (f64, f64)) -> bool {
+    in_shim(q) && !((q.x + SHIM_L * 0.5).abs() <= gap.0 * 0.5 && q.y > SHIM_Y + SHIM_W * 0.5 - gap.1)
+}
+
+/// The dense outer loop (paper mm, CCW) of the plate with the shim (less `gap` when given) laid on the paper by `s`,
+/// traced at `r` px / mm by [`crate::contour::trace_region`] in contour::trace's y-up frame (crack midpoints at
+/// `x0 + x / r`): a pure contour, no blur, no holes (the plate's holes are not this fixture's subject).
+pub fn shim_loops(s: &Spec, r: f64, gap: Option<(f64, f64)>) -> crate::contour::Loops {
+    let corners = [
+        Vec2::new(-SHIM_L, 0.0),
+        Vec2::new(PART_W, 0.0),
+        Vec2::new(PART_W, PART_H),
+        Vec2::new(-SHIM_L, PART_H),
+    ];
+    let paper: Vec<Vec2> = corners.iter().map(|&q| part_to_paper(s, q)).collect();
+    let x0 = paper.iter().map(|p| p.x).fold(f64::INFINITY, f64::min) - 1.0;
+    let y0 = paper.iter().map(|p| p.y).fold(f64::INFINITY, f64::min) - 1.0;
+    let x1 = paper.iter().map(|p| p.x).fold(f64::NEG_INFINITY, f64::max) + 1.0;
+    let y1 = paper.iter().map(|p| p.y).fold(f64::NEG_INFINITY, f64::max) + 1.0;
+    let (w, h) = (libm::ceil((x1 - x0) * r) as usize, libm::ceil((y1 - y0) * r) as usize);
+    let inside = |u: i64, v: i64| -> bool {
+        if u < 0 || v < 0 || u as usize >= w || v as usize >= h {
+            return false;
+        }
+        let q = paper_to_part(s, Vec2::new(x0 + (u as f64 + 0.5) / r, y0 + (v as f64 + 0.5) / r));
+        in_part(q) || gap.map_or(in_shim(q), |g| in_shim_gap(q, g))
+    };
+    let outer = crate::contour::trace_region(&inside, w, h, true)
+        .iter()
+        .map(|l| l.iter().map(|&(x, y)| Vec2::new(x0 + x / r, y0 + y / r)).collect::<Vec<Vec2>>())
+        .max_by(|a, b| geom_core::area(a).total_cmp(&geom_core::area(b)))
+        .unwrap_or_default();
+    crate::contour::Loops { outer, holes: vec![] }
+}
