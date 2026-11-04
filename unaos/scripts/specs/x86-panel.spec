@@ -25,6 +25,7 @@ REQUIRE :: ZOOM: z=2 px_ok=3 present_us=\d+ -> PASS :: panel=2880x1800 smooth_us
 REQUIRE :: PERFHUD: visible=1 paint_us=\d+ fields=10 -> PASS :: .* scale=2\.0 rect=
 REQUIRE :: TEXTSCALE: steps=5 overlap=0 cap=\d+ -> PASS ::
 REQUIRE :: SHIMMERIDLE: idle_ms=\d+ ticks=\d+ max_us=\d+ reduce_motion_ticks=\d+ gate_steals=\d+ -> PASS ::
+REQUIRE :: SHIMMERIDLE: pref leg row=off ticks=0 idle_ticks=0 restored=1 -> PASS ::
 REQUIRE :: VEILCOST: ratio_p99=\d+\.\d+ shimmer_idle_us=\d+ -> PASS ::
 #
 # A SKIP at the metal shape certifies nothing (the leg exists to run them), and a FAIL is the default FORBID.

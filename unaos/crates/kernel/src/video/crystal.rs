@@ -1690,19 +1690,19 @@ pub mod sheet {
         n: usize,
         wins: [WinBox; UNDER_MAX],
         back: Option<wm::desktop::Back<'static>>,
-        title_h: usize,
+        title_h: usize, own: bool, // MENUBANDONE (B1112): `own` = the owner's true pixels are already in `out` ([`Under::own`])
     }
 
     impl Under {
         /// No windows, no wallpaper: the flat desktop colour (a fixture's row).
         pub fn none() -> Under {
-            Under { n: 0, wins: [WinBox::default(); UNDER_MAX], back: None, title_h: 0 }
+            Under { n: 0, wins: [WinBox::default(); UNDER_MAX], back: None, title_h: 0, own: false }
         }
 
         /// From the compositor's table snapshot (`wm::dock_scan`'s rows, the scan `compose` already ran for its
         /// CLOBBER-REPAIR test): every row on the panel, by `wm::info`, z-sorted. The highest `UNDER_MAX` win.
         pub fn scan(rows: &[wm::DockEntry]) -> Under {
-            let mut u = Under { n: 0, wins: [WinBox::default(); UNDER_MAX], back: wm::desktop::live_back(), title_h: wm::TITLE_H() };
+            let mut u = Under { n: 0, wins: [WinBox::default(); UNDER_MAX], back: wm::desktop::live_back(), title_h: wm::TITLE_H(), own: false };
             let b = wm::BORDER();
             for e in rows.iter().filter(|e| e.visible) {
                 let Some(i) = wm::info(e.id) else { continue };
@@ -1774,7 +1774,7 @@ pub mod sheet {
         let corner_row = j + ru >= bh || (!square_top && j < ru);
         let out = &mut out[..w];
         for (x, p) in out.iter_mut().enumerate() {
-            if j >= bh || x >= bw || corner_row {
+            if (j >= bh || x >= bw || corner_row) && !under.own { // MENUBANDONE (B1112): an owner's own scene is kept
                 *p = under.at(ox + x, oy + j);
             }
         }
@@ -1877,6 +1877,17 @@ pub mod sheet {
                 draw::stroke_rrect(&mut s, r, KEY_RADIUS().min(ch as i32 / 2), 1, edge);
                 text::draw_row(out, bw, &b[..n], x + KEY_PAD(), j - gtop, ink, bold, face);
             }
+        }
+    }
+
+    // ── MENUBANDONE (rmbp-ledger B1112): the scene the owner already holds ──────────────────────────────────────
+
+    impl Under {
+        /// MENUBANDONE (B1112) — **the owner's own scene**: the pixels beneath the band are already in `out` (a menu
+        /// painted in its owner's surface, Quarry's file-ops menu), so [`row`] leaves them and the `elev.2` band blends
+        /// over the TRUE scene (MENUSCRAFT §4's exactness where the owner holds the pixels). One band painter, one ink.
+        pub fn own() -> Under {
+            Under { n: 0, wins: [WinBox::default(); UNDER_MAX], back: None, title_h: 0, own: true }
         }
     }
 }
