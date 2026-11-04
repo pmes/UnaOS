@@ -438,9 +438,9 @@ static PANEL_HELD_WH: core::sync::atomic::AtomicU64 = core::sync::atomic::Atomic
 /// Settings' Resolution and Panel lines flickering to "panel busy").
 /// PANEL-HELD-ONE (rmbp-ledger B1110) — the ONE held panel read: the third field is `refused`, true when
 /// THIS call's try_lock was refused and the answer is the hold (a degenerate read also answers the hold,
-/// with `refused` false). Its readers: `settings::display_modes`, main.rs `ptrlag_panel_wh` (which
-/// charges `refused` to its `panel_busy=` count) and the aarch64 `click_pointer_pos`; their own copies
-/// (`PTRI_PANEL_WH`, the fn-local `GEOM`) are retired onto this door.
+/// with `refused` false). Its readers (DOOR-DOC, rmbp-ledger B1126): `video/settings.rs::display_modes`, `main.rs::ptrlag_panel_wh`
+/// (which charges `refused` to its `panel_busy=` count), and both arches' `click_pointer_pos` (`arch/aarch64/syscall.rs`, and
+/// `arch/x86_64/syscall.rs` since CLICK-X86-HELD B1117, whose `lockfix_b1_selftest` also reads it); `PTRI_PANEL_WH` and `GEOM` are retired.
 pub fn panel_wh_held() -> (u32, u32, bool) {
     let read = panel_info_nonblocking();
     let refused = read.is_none();
