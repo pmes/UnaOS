@@ -37,7 +37,7 @@
 //!   pending event is the one measured, the same proxy `rtwit` uses). Counted as `coalesced=`.
 //! * Stage attribution follows FIFO order, not identity: the first key to reach the router after the timed
 //!   key was pushed is taken to be that key. A ring-3 key's `app` stamp is exact (the ring sequence number).
-//! * A kernel surface that draws inside the router is charged one extra composite pass.
+//! * A kernel surface that composites inside its own route is finished at the route (LOGINCOMP B1104); one that only latches is charged the next composite pass.
 //! * x86 + `wc` only (the hooks live in the x86 router). Elsewhere every entry point is a no-op.
 
 use core::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering::{AcqRel, Acquire, Relaxed, Release}};
@@ -196,7 +196,7 @@ pub fn on_enqueue(ev: &Event) {
     if s.stage.compare_exchange(IDLE, ISR, AcqRel, Relaxed).is_ok() {
         s.kind.store(kind, Relaxed);
         s.ring.store(0, Relaxed);
-        s.req.store(0, Relaxed);
+        s.req.store(0, Relaxed); #[cfg(all(target_arch = "x86_64", feature = "wc"))] { rt_reset(c); } // LOGINCOMP (B1104): the slot's claim clears its in-route stamps (LINE-NEUTRAL, body at the tail)
         s.t[0].store(now, Release);
     } else {
         COALESCED.fetch_add(1, Relaxed);
@@ -229,7 +229,7 @@ impl Drop for RouteGuard {
     fn drop(&mut self) {
         let now = now_us();
         if let Some(c) = self.0 {
-            let _ = SLOTS[c].advance(QUEUE, APP, now); #[cfg(all(feature = "ftdirx", feature = "wc", target_arch = "x86_64"))] if crate::drivers::xhci::ftdi::ftdirx::origin_census().0 != ROUTE_DOOR0.load(Relaxed) && crate::serialdoor::route_word() == "headless" && SLOTS[c].advance(APP, COMP, now) && SLOTS[c].stage.compare_exchange(COMP, IDLE, AcqRel, Relaxed).is_ok() { SLOTS[c].t[5].store(now, Relaxed); finish(&SLOTS[c], None); } // QUEUEWEDGE (B533 SMALLFIX9) — ⚠ SAME-LINE fold, line-NEUTRAL: a door byte routed to the HEADLESS console (no shell window) has nothing to draw, and no composite pass runs on an idle desktop, so its timing ends HERE at the route (comp = present = 0) instead of being charged to `comp` until the 3 s timeout
+            let _ = SLOTS[c].advance(QUEUE, APP, now); #[cfg(all(feature = "ftdirx", feature = "wc", target_arch = "x86_64"))] if crate::drivers::xhci::ftdi::ftdirx::origin_census().0 != ROUTE_DOOR0.load(Relaxed) && crate::serialdoor::route_word() == "headless" && SLOTS[c].advance(APP, COMP, now) && SLOTS[c].stage.compare_exchange(COMP, IDLE, AcqRel, Relaxed).is_ok() { SLOTS[c].t[5].store(now, Relaxed); finish(&SLOTS[c], None); } #[cfg(all(target_arch = "x86_64", feature = "wc"))] { rt_finish(c, now); } // QUEUEWEDGE (B533 SMALLFIX9) — ⚠ SAME-LINE fold, line-NEUTRAL: a door byte routed to the HEADLESS console (no shell window) has nothing to draw, and no composite pass runs on an idle desktop, so its timing ends HERE at the route (comp = present = 0) instead of being charged to `comp` until the 3 s timeout; LOGINCOMP (B1104): `rt_finish` (file tail) ends a kernel surface's timing here too when its route presented and a composite pass carried that frame inside the route, QUEUEWEDGE's stamps (LINE-NEUTRAL, code before this comment)
         }
         if self.2 {
             render_route_done(self.1, now); // INPUTSTALL M1
@@ -352,7 +352,7 @@ impl Drop for PassGuard {
             return;
         }
         let now = now_us();
-        sec_pass(self.0, now, self.1); // INPUTSTALL M1
+        sec_pass(self.0, now, self.1); #[cfg(all(target_arch = "x86_64", feature = "wc"))] { rt_pass(self.0, now); } // INPUTSTALL M1. LOGINCOMP (B1104): a pass that began after a QUEUE slot's in-route present request carried its frame (LINE-NEUTRAL, body at the tail)
         for s in &SLOTS {
             if s.stage.compare_exchange(COMP, IDLE, AcqRel, Relaxed).is_ok() {
                 s.t[5].store(now, Relaxed);
@@ -683,7 +683,7 @@ pub fn present_req() {
     if !ON {
         return;
     }
-    let mut now = 0;
+    let mut now = 0; #[cfg(all(target_arch = "x86_64", feature = "wc"))] { rt_req(); } // LOGINCOMP (B1104): a request made INSIDE the route (the slot still QUEUE) is stamped for `rt_pass` (LINE-NEUTRAL, body at the tail)
     for s in &SLOTS {
         if s.stage.load(Acquire) == APP && s.ring.load(Relaxed) == 0 {
             if now == 0 {
@@ -848,9 +848,9 @@ fn sec_roll(now_ms: u64) {
         let n = BOOT_SUPPRESSED.load(Relaxed);
         let (h_ms, h_end) = (BOOT_H_US.load(Relaxed) / 1000, BOOT_H_END_MS.load(Relaxed));
         serial_println!(
-            "[lag] stall boot_suppressed={} worst_stage={} worst_ms={} handler_span_ms={}..{} overlaps={}",
+            "[lag] stall boot_suppressed={} worst_stage={} worst_ms={} handler_span_ms={}..{} overlaps={} inroute={}",
             n, if n == 0 { "none" } else { stage_word(BOOT_WORST_STAGE.load(Relaxed)) }, BOOT_WORST_MS.load(Relaxed),
-            h_end.saturating_sub(h_ms), h_end, crate::fs::bootstep::overlaps(h_end.saturating_sub(h_ms), h_end)
+            h_end.saturating_sub(h_ms), h_end, crate::fs::bootstep::overlaps(h_end.saturating_sub(h_ms), h_end), rt_fin()
         );
     }
     if stall && desk {
@@ -915,7 +915,7 @@ pub fn inputstall_selftest() {
         ":: INPUTSTALL: key_queue_max_ms={} comp_max_ms={} hid_gap_max_ms={} strand_pct={} bound={} -> {} :: events={} frames={} strands={} strand_bound_pct={} span={}s via=tests app_held={}",
         kq, cm, hg, pct, STALL_MS, if verdict(kq, cm, hg, pct) { "PASS" } else { "FAIL" },
         ev, fr, sd, STRAND_PCT_BOUND, crate::arch::ms().saturating_sub(MIN_T0_MS.load(Relaxed)) / 1000, APP_HELD.load(Relaxed)
-    );
+    ); #[cfg(all(target_arch = "x86_64", feature = "wc"))] { rt_kat(); } // LOGINCOMP (B1104): `[lag] inroute kat=<ok|FAIL> cases=4 finished=<n>` (LINE-NEUTRAL, body at the tail)
 }
 
 /// Stranded frames as a whole percent of the frames noted (0 for none). Pure.
@@ -1437,3 +1437,92 @@ pub fn abandon(ev: &Event) {
 // now starts no timing; it is counted `app_held=` on the `tests inputstall` line. `PEND` still counts it (the render
 // task does owe it a route when the command returns). A wedged command is the GUI watchdog's (`[gui] app-exit … wedged=true`).
 static APP_HELD: AtomicU32 = AtomicU32::new(0);
+
+// LOGINCOMP (rmbp-ledger B1104) — TAIL-APPENDED. Flight 39's `[lag] click→shown ms=2205.2 … comp=2189.3` (the recovery-words
+// sheet) and the first-user form's `key→echo … comp=197..1370` were no pass's cost (that second: `passes=2 pass_ms_max=29.1`).
+// A kernel surface that presents INSIDE its own route (`login::repaint` -> `wm::present` -> `present_banded`, which composites
+// at once for a pace-exempt kernel row; the key echo through `present_rows`) had its frame on the glass while the slot was
+// still QUEUE, so [`pass`] (APP slots only) never credited it, and the slot then waited for the NEXT composite — on the login
+// screen, with nothing else compositing, the user's next input. QUEUEWEDGE's route-end finish, extended: a ring-0 slot whose
+// route requested a present ([`present_req`] -> `rt_req`) and saw a composite pass that began at/after that request end
+// inside the route (`rt_pass`) is finished at the route (`rt_finish`): queue = to the router, wm = the route with its draw
+// and its pass, app = comp = present = 0. The pass-credit rule is `pass`'s own (any `wm::composite` entry is a pass; a
+// folded entry's damage rides the holder's re-run). One router runs at a time, so a QUEUE slot is the event being routed.
+// Relaxed atomics, no lock; stamps cleared at the slot's claim ([`on_enqueue`]). x86 + `wc` only; knob-off `inroute=0`.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+static RT_REQ: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+static RT_DREW: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+static RT_FIN: AtomicU32 = AtomicU32::new(0);
+
+/// LOGINCOMP: a composite pass that began at `pass_t0_us` carries a frame whose present was requested at `req_us`
+/// (0 = no request). Pure.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+pub fn drawn_in_route(req_us: u64, pass_t0_us: u64) -> bool {
+    req_us != 0 && pass_t0_us >= req_us
+}
+
+/// LOGINCOMP: the slot's claim — no in-route request, no in-route frame yet.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+fn rt_reset(c: usize) {
+    RT_REQ[c].store(0, Relaxed);
+    RT_DREW[c].store(0, Relaxed);
+}
+
+/// LOGINCOMP: `wm::present` (via [`present_req`]) while a ring-0 slot is still QUEUE — its route is drawing.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+fn rt_req() {
+    let mut now = 0;
+    for (c, s) in SLOTS.iter().enumerate() {
+        if s.stage.load(Acquire) == QUEUE && s.ring.load(Relaxed) == 0 {
+            if now == 0 {
+                now = now_us();
+            }
+            let _ = RT_REQ[c].compare_exchange(0, now, Relaxed, Relaxed);
+        }
+    }
+}
+
+/// LOGINCOMP: a composite pass ([`PassGuard`]'s drop) that began at `t0` ended at `now`: a QUEUE slot whose in-route
+/// request it carried has its frame on the glass.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+fn rt_pass(t0: u64, now: u64) {
+    for (c, s) in SLOTS.iter().enumerate() {
+        if s.stage.load(Acquire) == QUEUE && s.ring.load(Relaxed) == 0 && drawn_in_route(RT_REQ[c].load(Relaxed), t0) {
+            let _ = RT_DREW[c].compare_exchange(0, now, Relaxed, Relaxed);
+        }
+    }
+}
+
+/// LOGINCOMP: the route's guard dropped (the slot just moved QUEUE -> APP): an in-route frame ends the timing here,
+/// QUEUEWEDGE's stamps. A slot QUEUEWEDGE already finished is IDLE, so `advance` refuses and nothing is finished twice.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+fn rt_finish(c: usize, now: u64) {
+    let s = &SLOTS[c];
+    if RT_DREW[c].load(Relaxed) != 0 && s.advance(APP, COMP, now) && s.stage.compare_exchange(COMP, IDLE, AcqRel, Relaxed).is_ok() {
+        s.t[5].store(now, Relaxed);
+        finish(s, None);
+        RT_FIN.fetch_add(1, Relaxed);
+    }
+}
+
+/// LOGINCOMP: events finished at their route since boot (`inroute=` on the `[lag] stall boot_suppressed` line).
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+fn rt_fin() -> u32 {
+    RT_FIN.load(Relaxed)
+}
+
+/// LOGINCOMP: knob-off there is no in-route finish.
+#[cfg(not(all(target_arch = "x86_64", feature = "wc")))]
+fn rt_fin() -> u32 {
+    0
+}
+
+/// LOGINCOMP: `tests inputstall`'s second line — the pure rule's four cases and the live count.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+fn rt_kat() {
+    let cases: [(u64, u64, bool); 4] = [(0, 5, false), (10, 9, false), (10, 10, true), (10, 20, true)];
+    let ok = cases.iter().all(|&(r, t, want)| drawn_in_route(r, t) == want);
+    serial_println!("[lag] inroute kat={} cases={} finished={}", if ok { "ok" } else { "FAIL" }, cases.len(), RT_FIN.load(Relaxed));
+}
