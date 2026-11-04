@@ -1521,3 +1521,89 @@ fn a_prb_opens_against_the_part_as_scan_core_fuses_it() {
     assert_eq!(lp.last(), ld.last(), "the first callout reads the same");
     assert!(lp.last().is_some_and(|l| l.starts_with(face.as_str()) && l.ends_with("PASS")), "{lp:?}");
 }
+
+// ---- VUGSCANDEVIATIONCOARSE (LEDGER SR615): a scan with no starting pose opens through the coarse road ----
+
+/// The known pose the scan is carried by: a rigid transform with a rotation far outside the fine basin
+/// (scan_core `fixture::orbit`'s camera frame, off a centre the part is not on).
+fn known_pose() -> Transform {
+    fixture::orbit(Vec3::new(100.0, -50.0, 30.0), 400.0, 25.0 * DEG, 70.0 * DEG)
+}
+
+/// `s` with only the vertices `keep` holds (normals and confidence carried, the triangles whose three vertices are kept
+/// remapped), each carried by `pose`.
+fn fragment(s: &ScanMesh, keep: impl Fn(Vec3) -> bool, pose: Transform) -> ScanMesh {
+    let mut out = s.clone();
+    let mut index = vec![u32::MAX; s.mesh.positions.len()];
+    out.mesh.positions.clear();
+    out.normals.clear();
+    out.confidence.clear();
+    for (i, &p) in s.mesh.positions.iter().enumerate() {
+        if keep(p) {
+            index[i] = out.mesh.positions.len() as u32;
+            out.mesh.positions.push(pose.apply_point(p));
+            out.normals.push(pose.apply_vector(s.normals.get(i).copied().unwrap_or(Vec3::ZERO)));
+            out.confidence.push(s.confidence.get(i).copied().unwrap_or(1.0));
+        }
+    }
+    out.mesh.triangles = s
+        .mesh
+        .triangles
+        .iter()
+        .filter_map(|t| {
+            let m = [index[t[0] as usize], index[t[1] as usize], index[t[2] as usize]];
+            if m.contains(&u32::MAX) { None } else { Some(m) }
+        })
+        .collect();
+    out
+}
+
+#[test]
+fn a_rotated_orbit_scan_opens_through_coarse_and_fine() {
+    let doc = doc_core::read(DOC).expect("the document reads");
+    let p = known_pose();
+    let moved = fragment(scan(), |_| true, p);
+    let (_, fine) = vug_view::deviation::open(&moved, &doc, BAND_MM, vug_view::deviation::GDT_MARGIN_MM).expect("the design builds");
+    assert!(matches!(fine.result, Err(DeviationError::NoAlignment { .. })), "the identity road cannot reach it: {:?}", fine.result.as_ref().err());
+    let (_, map) = vug_view::deviation::open_coarse(&moved, &doc, BAND_MM, vug_view::deviation::GDT_MARGIN_MM).expect("the design builds");
+    let lines = corner(&map);
+    println!("{}", lines.join("\n"));
+    let trimmed = match map.road {
+        scan_core::deviation::Road::CoarseFine { rms_mm } => rms_mm,
+        other => panic!("expected the coarse start kept, got {other:?} ({:?})", map.result.as_ref().err()),
+    };
+    let d = map.result.as_ref().expect("coarse + fine aligns the rotated scan");
+    let (_, home) = vug_view::deviation::open(scan(), &doc, BAND_MM, vug_view::deviation::GDT_MARGIN_MM).expect("the design builds");
+    let h = home.result.as_ref().expect("the scan aligns from the identity");
+    // The recovered pose carried back through P is the identity road's pose.
+    let back = d.aligned.pose.compose(p);
+    let err_deg = 2.0 * back.rot.dot(h.aligned.pose.rot).abs().min(1.0).acos() / DEG;
+    let err_mm = [Vec3::new(-230.0, -100.0, 0.0), Vec3::new(70.0, 100.0, 100.0), Vec3::new(160.0, 0.0, 150.0)]
+        .iter()
+        .map(|&x| (back.apply_point(x) - h.aligned.pose.apply_point(x)).mag())
+        .fold(0.0, f64::max);
+    println!("coarse: rotated trimmed={trimmed:.3} rms={:.3} stats_rms={:.3} err_deg={err_deg:.4} err_mm={err_mm:.4}", d.aligned.rms_mm, d.stats.rms_mm);
+    assert!(d.aligned.rms_mm < 1.0 && d.stats.rms_mm < 1.0, "the SR510 floor: aligned {} stats {}", d.aligned.rms_mm, d.stats.rms_mm);
+    assert!(err_deg < 0.5 && err_mm < 1.0, "pose error {err_deg} deg {err_mm} mm");
+    assert!(lines.contains(&format!("align=coarse+fine rms={trimmed:.3}")), "{lines:?}");
+    assert!(map.on, "the map opens on");
+}
+
+#[test]
+fn a_half_scan_fragment_refuses_coarse() {
+    let doc = doc_core::read(DOC).expect("the document reads");
+    let half = fragment(scan(), |v| v.y > 0.0, known_pose());
+    let (_, map) = vug_view::deviation::open_coarse(&half, &doc, BAND_MM, vug_view::deviation::GDT_MARGIN_MM).expect("the design builds");
+    let lines = corner(&map);
+    println!("{}", lines.join("\n"));
+    let rms = match map.road {
+        scan_core::deviation::Road::CoarseRefused { rms_mm } => rms_mm,
+        other => panic!("expected the coarse start refused, got {other:?}"),
+    };
+    println!("coarse: fragment refused rms={rms:.3}");
+    assert!(rms > scan_core::AlignParams::DEFAULT.gate(2), "the floor: {rms}");
+    assert!(matches!(map.result, Err(DeviationError::NoAlignment { pairs: 0, .. })), "{:?}", map.result.as_ref().err());
+    assert!(!map.on && map.vertex.is_empty());
+    assert!(lines[0].starts_with("refused NoAlignment"), "{lines:?}");
+    assert!(lines.contains(&format!("align=coarse refused rms={rms:.3}")), "{lines:?}");
+}
