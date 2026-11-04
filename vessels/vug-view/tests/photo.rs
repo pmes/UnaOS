@@ -1122,3 +1122,71 @@ fn a_typed_camera_line_sets_the_pref_and_the_corner_reads_it() {
     let _ = std::fs::remove_dir_all(&dir);
     assert_eq!(prefs.camera_mm, None);
 }
+
+// ---- VUGINTENTSETFACELISTEDOVERLAP (SR601): an anchored glyph over the listed column moves right; its leader ----
+
+/// The rectangle's side drawn leftmost on screen: its line entity and its midpoint's screen point (photo's anchor of a
+/// statement naming that line). Its leader runs right through the listed text, clear of every sketch edge.
+fn left_side(vw: &Viewer) -> (u32, (f32, f32)) {
+    let f = face(vw);
+    let sk = &f.sketch;
+    (4..8u32)
+        .filter_map(|e| {
+            let Entity::Line { a, b } = sk.entity(EntityId(e))? else { return None };
+            let (p, q) = (sk.point(PointRef::Point(*a))?, sk.point(PointRef::Point(*b))?);
+            let (x, y) = f.to_screen(&vw.view, Vec2::new(0.5 * (p.x + q.x), 0.5 * (p.y + q.y)))?;
+            Some((e, (x as f32, y as f32)))
+        })
+        .min_by(|l, r| (l.1).0.partial_cmp(&(r.1).0).unwrap_or(core::cmp::Ordering::Equal))
+        .expect("the rectangle's sides are on screen")
+}
+
+/// `n` listed singles (no `e<n>` named, one why each).
+fn listed(n: usize) -> Vec<Proposal> {
+    (0..n).map(|j| datum(&format!("point v{} sketch=s x={} y=10", 40 + j, 10 + j), &format!("a lone datum point {j}"))).collect()
+}
+
+/// The rectangle face: enough listed singles that the column's rows pass the left side's midpoint, then one single
+/// anchored there. Its natural place overlaps the column, so it sits at the column's right edge + 6 px at its own
+/// height, and its leader runs from its cross back to the anchor, painted INK (the midpoint pixel, over the listed text
+/// it crosses); a listed glyph has no leader.
+#[test]
+fn an_anchored_glyph_over_the_listed_column_moves_right_with_a_leader() {
+    use vug_view::sketch::INK;
+    let mut vw = rectangle();
+    let (e, (sx, sy)) = left_side(&vw);
+    let natural = (sx + 6.0, sy - 14.0);
+    let n = ((natural.1 - 30.0) / 12.0).ceil().max(0.0) as usize + 1;
+    let mut ps = listed(n);
+    ps.push(datum(&format!("horizontal v12 sketch=s line=e{e}"), "the left side"));
+    assert!(photo::offer(&mut vw.view, ps));
+    let gs = photo::glyphs(&vw.view);
+    assert_eq!(gs.len(), n + 1, "{n} listed singles and the anchored one: {gs:?}");
+    let (list, g) = (&gs[..n], &gs[n]);
+    assert!(list.iter().all(|l| l.at.0 == 6.0), "listed: {list:?}");
+    let col = list.iter().map(photo::glyph_rect).fold((f32::MAX, f32::MAX, f32::MIN, f32::MIN), |c, r| (c.0.min(r.0), c.1.min(r.1), c.2.max(r.0 + r.2), c.3.max(r.1 + r.3)));
+    let r = photo::glyph_rect(g);
+    let before = (natural.0, natural.1, r.2, r.3);
+    assert!(before.0 < col.2 && col.0 < before.0 + before.2 && before.1 < col.3 && col.1 < before.1 + before.3, "the natural place overlaps the column: {before:?} column {col:?}");
+    assert!((g.at.0 - (col.2 + 6.0)).abs() < 1e-3 && (g.at.1 - natural.1).abs() < 1e-3, "right to the column's edge + 6, y kept: {:?} column {col:?}", g.at);
+    let (a, b) = photo::leader(&vw.view, g).expect("a pushed glyph has a leader");
+    assert_eq!((a, b), ((g.at.0 - 6.0, g.at.1 + 14.0), (sx, sy)), "from its cross to its anchor");
+    assert!(list.iter().all(|l| photo::leader(&vw.view, l).is_none()), "a listed glyph has no leader");
+    let fr = raster::render(&vw.model, &vw.view);
+    let (mx, my) = ((0.5 * (a.0 + b.0)) as u32, (0.5 * (a.1 + b.1)) as u32);
+    let ink = raster::rgba(INK);
+    let ys = my.saturating_sub(1)..=my + 1;
+    assert!(ys.clone().any(|y| fr.pixel(mx, y) == ink), "the leader's midpoint ({mx}, {ys:?}) paints INK");
+}
+
+/// The same anchored single offered alone: nothing to push, so it keeps its anchor's place and has no leader.
+#[test]
+fn a_glyph_not_moved_has_no_leader() {
+    let mut vw = rectangle();
+    let (e, (sx, sy)) = left_side(&vw);
+    assert!(photo::offer(&mut vw.view, vec![datum(&format!("horizontal v12 sketch=s line=e{e}"), "the left side")]));
+    let gs = photo::glyphs(&vw.view);
+    assert_eq!(gs.len(), 1, "{gs:?}");
+    assert_eq!(gs[0].at, (sx + 6.0, sy - 14.0), "nothing to push: its anchor's place");
+    assert_eq!(photo::leader(&vw.view, &gs[0]), None, "an unmoved glyph has no leader");
+}
