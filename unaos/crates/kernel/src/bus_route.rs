@@ -867,7 +867,7 @@ pub static ARMEARLY_ARMED: AtomicU32 = AtomicU32::new(0);
 /// The arch spawn body's arm: `path` is the early path the body's CALLER chose (a kernel road's argv[0], the ring-3
 /// road's kernel-opened path; `None` = nothing armed); `ring3` labels the road only. Takes only wm's leaf lock.
 pub fn arm_early(row: usize, path: Option<&str>, ring3: bool) {
-    armlate_mint(row); let Some(path) = path else { return }; // ARMFORGET-LATEARM (B1178): every mint, path or none, notes the row's generation for the late arm's stamp (file tail)
+    let Some(path) = path else { return }; // ARMFORGET-LATEARM (B1178) + ARMLATE-KNOBOFF (B1184): the mint note (path or none) is the arch spawn line's own `wm::app_mint_note`, just before this call, in every build
     let rg = (crate::arch::syscall::busreg_ops().rgen)(row);
     let armed = crate::video::wm::app_name_arm_early(crate::video::wm::owner_of_launch(row as u64), rg, path);
     if armed {
@@ -1202,18 +1202,12 @@ fn armforget_selftest(fx: &Fixture) {
 // ARMFORGET-LATEARM (rmbp-ledger B1178) — TAIL-APPENDED. A child that exits and is torn down before its launcher's
 // late `app_name_arm` left a name and path on a dead owner that no teardown forget (B1171) could reach, and the slot's
 // next tenant inherited it (B1163's path rule PROMOTES it). Every mint now notes the row's generation in wm
-// (`armlate_mint`, from `arm_early` before its early return), the late arm stamps name and path with it, and wm's
+// (`wm::app_mint_note` on the arch spawn line, every build — ARMLATE-KNOBOFF B1184 retired `armlate_mint` onto it), the late arm stamps name and path with it, and wm's
 // readers answer only at the row's CURRENT generation (`wm::app_path_with`, `app_name_of`, `mint_title`), so
 // `tag_id` judges a stale late record as absent. The fixture cannot bump a row's generation (its `clear` drains the
 // mailbox only), so the leg stands in for the bump the way E3 (B1164) does: a mint note one generation back.
 // Witness: `tests bandy3` → `:: BUSREG-ARMLATE: … -> PASS ::`.
 // =================================================================================================
-
-/// `arm_early`'s mint note: `row`'s current generation for its owner, every mint. Takes only wm's leaf lock.
-fn armlate_mint(row: usize) {
-    let rg = (crate::arch::syscall::busreg_ops().rgen)(row);
-    let _ = crate::video::wm::app_mint_note(crate::video::wm::owner_of_launch(row as u64), Some(rg));
-}
 
 /// `tests bandy3`' late-arm legs, on the fixture's fulfiller row `f`: L1 `f`'s tenant minted one generation ago
 /// (torn down since) is late-armed `/apps/PREFS.ELF` -> the record is present but stale: `tag_id` Unnamed,

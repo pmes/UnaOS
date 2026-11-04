@@ -853,7 +853,7 @@ pub fn app_name_arm(owner: u64, path: &str) -> bool {
     if owner == 0 || name.is_empty() {
         return false;
     }
-    #[cfg(feature = "busreg")] { app_path_arm(owner, path); } let len = name.len().min(MAX_TITLE); // BUSREG-TAG-PATH (B1163): the path beside the name (file tail) — ⚠ LINE-NEUTRAL fold
+    { app_path_arm(owner, path); } let len = name.len().min(MAX_TITLE); // BUSREG-TAG-PATH (B1163): the path beside the name (file tail); ARMLATE-KNOBOFF (B1184): every build, the late arm's stamp rides it — ⚠ LINE-NEUTRAL fold
     let mut t = APP_NAMES.lock();
     // Re-arm in place first: an owner already named must not occupy two rows, or `app_name_forget`
     // would clear one and leave the other to title the next tenant.
@@ -951,9 +951,9 @@ pub fn title_source_of(id: WinId) -> TitleSource {
 /// release only and before the slot is claimable, so it covers tenants no shell ever tracked. The
 /// residual is WINTITLE-LATE's: a late arm that lands after its child already tore down leaves a
 /// name on a dead owner; ARMFORGET-LATEARM (B1178) stamps it with the mint generation so it reads as
-/// absent (busreg), and the next `app_name_arm` for that owner or this shell reap clears it.
+/// absent (every build since ARMLATE-KNOBOFF B1184), and the next `app_name_arm` for that owner or this shell reap clears it.
 pub fn app_name_forget(owner: u64) {
-    #[cfg(feature = "busreg")] { app_path_forget(owner); } if owner == 0 { // BUSREG-TAG-PATH (B1163): the path goes with the name (file tail) — ⚠ LINE-NEUTRAL fold
+    { app_path_forget(owner); } if owner == 0 { // BUSREG-TAG-PATH (B1163): the path goes with the name (file tail); ARMLATE-KNOBOFF (B1184): every build — ⚠ LINE-NEUTRAL fold
         return;
     }
     let mut t = APP_NAMES.lock();
@@ -1024,7 +1024,7 @@ fn mint_title(owner_asid: u64, declared: &[u8], out: &mut [u8; MAX_TITLE]) -> (u
     // Clause 1 — a launcher armed this owner with the program's own name. Consulted first and
     // unconditionally: an armed owner IS a launched program, whatever its creator passed.
     {
-        #[cfg(feature = "busreg")] let owner_asid = app_record_owner(owner_asid); let t = APP_NAMES.lock(); // ARMFORGET-LATEARM (B1178): a stale late arm (stamped before its tenant's teardown) keys owner 0, which clause 1 never matches (file tail) — ⚠ LINE-NEUTRAL fold
+        let owner_asid = app_record_owner(owner_asid); let t = APP_NAMES.lock(); // ARMFORGET-LATEARM (B1178) + ARMLATE-KNOBOFF (B1184, every build): a stale late arm (stamped before its tenant's teardown) keys owner 0, which clause 1 never matches (file tail) — ⚠ LINE-NEUTRAL fold
         if let Some(e) = t.iter().find(|e| e.owner == owner_asid && e.owner != 0) {
             let len = (e.len as usize).min(MAX_TITLE);
             if len > 0 {
@@ -29371,7 +29371,7 @@ pub fn live_window_count() -> usize {
 /// NOTICE — the armed program name of `owner` copied into `out`; returns its length (0 = none armed).
 /// The bus verb's title: the app is named by the kernel-stamped owner, never by the caller.
 pub fn app_name_of(owner: u64, out: &mut [u8; MAX_TITLE]) -> usize {
-    #[cfg(feature = "busreg")] let owner = app_record_owner(owner); if owner == 0 { // ARMFORGET-LATEARM (B1178): a stale late arm answers as none armed (file tail) — ⚠ LINE-NEUTRAL fold
+    let owner = app_record_owner(owner); if owner == 0 { // ARMFORGET-LATEARM (B1178) + ARMLATE-KNOBOFF (B1184, every build): a stale late arm answers as none armed (file tail) — ⚠ LINE-NEUTRAL fold
         return 0;
     }
     let t = APP_NAMES.lock();
@@ -30508,7 +30508,7 @@ pub fn app_name_arm_launch(owner: u64, path: &str) -> bool {
         Some(n) => (n, "appres"),
         None => (alloc::string::String::from(program_name(path)), "path"),
     };
-    let armed = app_name_arm(owner, &name); #[cfg(feature = "busreg")] { app_path_arm(owner, path); } // BUSREG-TAG-PATH (B1163): the inner arm took the APPRES name, so the loaded path is armed after it (file tail) — ⚠ LINE-NEUTRAL fold
+    let armed = app_name_arm(owner, &name); { app_path_arm(owner, path); } // BUSREG-TAG-PATH (B1163): the inner arm took the APPRES name, so the loaded path is armed after it (file tail); ARMLATE-KNOBOFF (B1184): every build — ⚠ LINE-NEUTRAL fold
     serial_println!("[wm] launch-name owner={} path={} name={} via={} armed={}", owner, path, name, via, armed as u8);
     armed
 }
@@ -33720,7 +33720,7 @@ fn drain_shimtimed(fb: &super::FrameBuffer) -> bool {
 }
 
 // =================================================================================================
-// BUSREG-TAG-PATH (rmbp-ledger B1163) — TAIL-APPENDED, feature `busreg` only (knob-off: no symbol, no byte).
+// BUSREG-TAG-PATH (rmbp-ledger B1163) — TAIL-APPENDED, every build since ARMLATE-KNOBOFF (B1184; read by `bus_route` under busreg only).
 // [`APP_NAMES`] keeps the 16-byte basename, so a program called PREFS.ELF launched from any path was `prefs`
 // to `bus_route`'s tag check (BUSREG-TAG-IDENTITY B1157). Every launcher that can start a fulfiller arms
 // through [`app_name_arm`] / [`app_name_arm_launch`] with the path it read the image from, so the PATH is kept
@@ -33730,11 +33730,11 @@ fn drain_shimtimed(fb: &super::FrameBuffer) -> bool {
 // LOCK ORDER: a LEAF like [`APP_NAMES`] — armed before that mutex is taken, never held across another lock,
 // read by `bus_route::tag_id`, which is never called under its `REGS`.
 // =================================================================================================
-#[cfg(feature = "busreg")]
+// ARMLATE-KNOBOFF (B1184): every build (the late-arm stamp rides this store)
 static APP_PATHS: Mutex<alloc::vec::Vec<(u64, u64, alloc::string::String)>> = Mutex::new(alloc::vec::Vec::new()); // ARMFORGET-LATEARM (B1178): (owner, the stamp = the owner's mint generation, path; empty = a relative arm, name stamped, no path)
 
 /// BUSREG-TAG-PATH — record the path `owner`'s image was loaded from (absolute only; else clear the row).
-#[cfg(feature = "busreg")]
+// ARMLATE-KNOBOFF (B1184): every build (the late-arm stamp rides this store)
 fn app_path_arm(owner: u64, path: &str) {
     if owner == 0 {
         return;
@@ -33747,7 +33747,7 @@ fn app_path_arm(owner: u64, path: &str) {
 }
 
 /// BUSREG-TAG-PATH — drop `owner`'s path (with its name, [`app_name_forget`]).
-#[cfg(feature = "busreg")]
+// ARMLATE-KNOBOFF (B1184): every build (the late-arm stamp rides this store)
 fn app_path_forget(owner: u64) {
     if owner == 0 {
         return;
@@ -33757,7 +33757,7 @@ fn app_path_forget(owner: u64) {
 
 /// BUSREG-TAG-PATH — `f(path)` for `owner`'s armed path; `None` = no path armed. `f` runs under the leaf lock
 /// and must take no lock.
-#[cfg(feature = "busreg")]
+// ARMLATE-KNOBOFF (B1184): every build (the late-arm stamp rides this store)
 pub fn app_path_with(owner: u64, f: impl FnOnce(&str) -> bool) -> Option<bool> {
     if owner == 0 {
         return None;
@@ -33875,12 +33875,12 @@ pub fn app_records_teardown(owner: u64) {
 }
 
 // =================================================================================================
-// ARMFORGET-LATEARM (rmbp-ledger B1178) — TAIL-APPENDED, feature `busreg` only (knob-off: no symbol, no byte).
+// ARMFORGET-LATEARM (rmbp-ledger B1178) — TAIL-APPENDED, every build since ARMLATE-KNOBOFF (B1184: arch `slot_gen`).
 // [`app_name_arm`] is RETROACTIVE (WINTITLE-LATE): a child can run, exit and be torn down (B1171's forget at the
 // generation bump) BEFORE its launcher arms, and that late arm then leaves a name and path on a dead owner that the
 // slot's next tenant would inherit (B1163's path rule PROMOTES it). Stamping the generation read AT the arm closes
 // nothing — after the bump that is already the next tenant's. So every mint notes the row's generation here
-// ([`app_mint_note`], from `bus_route::arm_early`, path or none, before the task can run; teardown leaves it on
+// ([`app_mint_note`], from the arch spawn line (B1184; was `bus_route::arm_early`), path or none, before the task can run; teardown leaves it on
 // purpose), the late arm stamps name and path with it (the stamp rides the [`APP_PATHS`] row every busreg arm
 // writes), and [`app_path_with`], [`mint_title`] and [`app_name_of`] answer only while the stamp equals the row's
 // CURRENT generation: a stale record reads as absent until the next arm replaces it. A live tenant's stamp equals
@@ -33890,12 +33890,12 @@ pub fn app_records_teardown(owner: u64) {
 // LOCK ORDER: APP_MINTS is a LEAF like [`APP_PATHS`] — taken and dropped before that guard, never across another lock.
 // =================================================================================================
 /// One mint note per owner: (owner, the row's generation at its latest mint).
-#[cfg(all(feature = "busreg", any(target_arch = "x86_64", feature = "aarch64_el0")))]
+#[cfg(any(target_arch = "x86_64", feature = "aarch64_el0"))] // ARMLATE-KNOBOFF (B1184): every build with an arch generation
 static APP_MINTS: Mutex<alloc::vec::Vec<(u64, u64)>> = Mutex::new(alloc::vec::Vec::new());
 
 /// ARMFORGET-LATEARM — set (`Some(gen)`) or clear (`None`) `owner`'s mint note; returns the previous one (the
-/// witness restores it). Called by `bus_route::arm_early` at every mint.
-#[cfg(all(feature = "busreg", any(target_arch = "x86_64", feature = "aarch64_el0")))]
+/// witness restores it). Called by the arch spawn body at every mint (ARMLATE-KNOBOFF B1184, every build).
+#[cfg(any(target_arch = "x86_64", feature = "aarch64_el0"))] // ARMLATE-KNOBOFF (B1184)
 pub fn app_mint_note(owner: u64, rg: Option<u64>) -> Option<u64> {
     if owner == 0 {
         return None;
@@ -33911,25 +33911,25 @@ pub fn app_mint_note(owner: u64, rg: Option<u64>) -> Option<u64> {
 
 /// ARMFORGET-LATEARM — the CURRENT generation of `owner`'s row (the row is [`owner_of_launch`]'s inverse: x86
 /// owner - 1, aarch64 the ASID). An atomic load; no lock.
-#[cfg(all(feature = "busreg", any(target_arch = "x86_64", feature = "aarch64_el0")))]
+#[cfg(any(target_arch = "x86_64", feature = "aarch64_el0"))] // ARMLATE-KNOBOFF (B1184)
 fn armlate_now(owner: u64) -> u64 {
     #[cfg(target_arch = "x86_64")]
     let row = owner.wrapping_sub(1);
     #[cfg(not(target_arch = "x86_64"))]
     let row = owner;
-    (crate::arch::syscall::busreg_ops().rgen)(row as usize)
+    crate::arch::syscall::slot_gen(row as usize) // ARMLATE-KNOBOFF (B1184): the arch's ONE generation read, every build
 }
 
-/// ARMFORGET-LATEARM — a busreg build with no bus router (aarch64 without EL0) has no generation: every stamp is 0
+/// ARMFORGET-LATEARM — a build with no arch generation (aarch64 without EL0) has none: every stamp is 0
 /// and reads live.
-#[cfg(all(feature = "busreg", not(any(target_arch = "x86_64", feature = "aarch64_el0"))))]
+#[cfg(not(any(target_arch = "x86_64", feature = "aarch64_el0")))] // ARMLATE-KNOBOFF (B1184)
 fn armlate_now(_owner: u64) -> u64 {
     0
 }
 
 /// ARMFORGET-LATEARM — the stamp a late arm records: `owner`'s mint generation when one was noted, else the
 /// generation now (an owner no spawn minted).
-#[cfg(feature = "busreg")]
+// ARMLATE-KNOBOFF (B1184): every build (the late-arm stamp rides this store)
 fn armlate_stamp(owner: u64) -> u64 {
     #[cfg(any(target_arch = "x86_64", feature = "aarch64_el0"))]
     {
@@ -33943,7 +33943,7 @@ fn armlate_stamp(owner: u64) -> u64 {
 
 /// ARMFORGET-LATEARM — the name readers' key: `owner` when its stamp is the row's current generation (or it carries
 /// none), 0 when the record is stale. Takes only the APP_PATHS leaf, dropped before the caller takes APP_NAMES.
-#[cfg(feature = "busreg")]
+// ARMLATE-KNOBOFF (B1184): every build (the late-arm stamp rides this store)
 fn app_record_owner(owner: u64) -> u64 {
     if owner == 0 {
         return 0;
