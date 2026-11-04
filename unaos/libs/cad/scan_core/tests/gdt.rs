@@ -390,14 +390,15 @@ struct Census {
     graze: (f64, f64),
     /// VUGSCANTSDFEDGELATERAL (SR574) M1: (s < 0, all, zero gradient) over the cameras at which the vertex sits on an
     /// edge pixel holding a depth more than a truncation behind it (the known scene: the misassigned floor), and the
-    /// same for the free-space control one truncation out along the nominal normal.
-    mis: (u32, u32, u32),
-    free: (u32, u32, u32),
+    /// same for the free-space control one truncation out along the nominal normal. VUGSCANTSDFEDGESUBPIXEL (SR580) M1:
+    /// the fourth count is the line rule's near side (s' < 0, `lateral_tally`).
+    mis: (u32, u32, u32, u32),
+    free: (u32, u32, u32, u32),
 }
 
 fn census(p: Vec3, n: Vec3, frames: &[(Transform, Frame)], trunc: f64) -> Census {
     let (intr, scale) = (fixture::bench_intrinsics(), DepthScale::D400_DEFAULT);
-    let mut c = Census { saw: 0, edge: 0, shadow: 0, graze: (f64::INFINITY, f64::NEG_INFINITY), mis: (0, 0, 0), free: (0, 0, 0) };
+    let mut c = Census { saw: 0, edge: 0, shadow: 0, graze: (f64::INFINITY, f64::NEG_INFINITY), mis: (0, 0, 0, 0), free: (0, 0, 0, 0) };
     for (cam, f) in frames {
         let Ok(inv) = cam.invert() else { continue };
         lateral_tally(&mut c.mis, &inv, f, p, trunc); // VUGSCANTSDFEDGELATERAL (SR574) M1
@@ -432,8 +433,11 @@ fn census(p: Vec3, n: Vec3, frames: &[(Transform, Frame)], trunc: f64) -> Census
 /// VUGSCANTSDFEDGELATERAL (SR574) M1: one camera's lateral sample of point `p` into `t` = (s < 0, all, zero
 /// gradient): counted only when `p`'s floor pixel is a depth edge at the truncation and its depth lies more than a
 /// truncation behind `p` (a near point on a far pixel). `s` is `p`'s sub-pixel offset from that pixel's centre along
-/// the 3x3's Sobel depth gradient (near -> far); s < 0 is the near neighbour's side.
-fn lateral_tally(t: &mut (u32, u32, u32), inv: &Transform, f: &Frame, p: Vec3, trunc: f64) {
+/// the 3x3's Sobel depth gradient (near -> far); s < 0 is the near neighbour's side. VUGSCANTSDFEDGESUBPIXEL (SR580)
+/// M1, the line rule in `t.3`: the Sobel-weighted plane fit over the same 3x3 (d0 the 1-2-1 weighted mean, slope
+/// g = Sobel / 8 per pixel) crosses the 3x3's mid depth at t* = (mid - d0) / |g| along g; s' = offset . g_hat - t*,
+/// s' < 0 the near side of the fitted silhouette line (a far centre beside a near column: t* = -1/2, the boundary).
+fn lateral_tally(t: &mut (u32, u32, u32, u32), inv: &Transform, f: &Frame, p: Vec3, trunc: f64) {
     let (intr, scale) = (fixture::bench_intrinsics(), DepthScale::D400_DEFAULT);
     let q = inv.apply_point(p);
     if q.z <= 0.0 {
@@ -465,6 +469,25 @@ fn lateral_tally(t: &mut (u32, u32, u32), inv: &Transform, f: &Frame, p: Vec3, t
     }
     let s = (uv[0] as f64 - px as f64 - 0.5) * gx + (uv[1] as f64 - py as f64 - 0.5) * gy;
     t.0 += (s < 0.0) as u32;
+    t.3 += (subpixel_side(&d, uv, px, py, gx, gy) < 0.0) as u32; // VUGSCANTSDFEDGESUBPIXEL (SR580) M1
+}
+
+/// VUGSCANTSDFEDGESUBPIXEL (SR580) M1: the voxel's side s' of the silhouette line fitted through the 3x3 `d` (Sobel
+/// `gx`, `gy`, not both zero): the weighted mean d0, the mid (lo + hi) / 2 of the same nine depths (`depth_span`'s
+/// split), t* = (mid - d0) / |g| with g = Sobel / 8, s' = (uv - centre) . g_hat - t*.
+fn subpixel_side(d: &dyn Fn(i64, i64) -> f64, uv: [f32; 2], px: u32, py: u32, gx: f64, gy: f64) -> f64 {
+    let (mut lo, mut hi, mut d0) = (f64::INFINITY, f64::NEG_INFINITY, 0.0);
+    for dy in -1i64..=1 {
+        for dx in -1i64..=1 {
+            let v = d(dx, dy);
+            (lo, hi) = (lo.min(v), hi.max(v));
+            d0 += ((2 - dx.abs()) * (2 - dy.abs())) as f64 * v / 16.0;
+        }
+    }
+    let g = gx.hypot(gy) / 8.0;
+    let t_star = (0.5 * (lo + hi) - d0) / g;
+    let off = (uv[0] as f64 - px as f64 - 0.5) * gx + (uv[1] as f64 - py as f64 - 0.5) * gy;
+    off / (8.0 * g) - t_star
 }
 
 /// The known scene's oracle for a vertex of the top or the post: (the nominal normal there, the distance to the face's
@@ -498,9 +521,11 @@ fn probe_table(label: &str, f: &FaceGdt, s: &ScanMesh, dev: &Deviation, frames: 
     let mut printed = 0;
     for (set, form_only) in [("all", false), ("form", true)] {
         let (mut n, mut edge, mut shadow, mut graze) = (0, 0, 0, 0);
-        let (mut lat_mis, mut lat_free) = ((0u32, 0u32, 0u32), (0u32, 0u32, 0u32)); // VUGSCANTSDFEDGELATERAL (SR574) M1
+        let (mut lat_mis, mut lat_free) = ((0u32, 0u32, 0u32, 0u32), (0u32, 0u32, 0u32, 0u32)); // VUGSCANTSDFEDGELATERAL (SR574) M1
+        let wide = matches!(f.nominal, Nominal::Cylinder(_)); // VUGSCANTSDFEDGESUBPIXEL (SR580) M1: the post's every vertex
+        let (mut wide_mis, mut wide_free) = ((0u32, 0u32, 0u32, 0u32), (0u32, 0u32, 0u32, 0u32));
         for &(i, d) in &rows {
-            if n == 20 {
+            if n == 20 && !wide {
                 break;
             }
             let p = s.mesh.positions[i];
@@ -511,13 +536,21 @@ fn probe_table(label: &str, f: &FaceGdt, s: &ScanMesh, dev: &Deviation, frames: 
             if form_only && !form {
                 continue;
             }
-            n += 1;
             let c = census(p, nn, frames, trunc);
+            if wide {
+                for (acc, t) in [(&mut wide_mis, c.mis), (&mut wide_free, c.free)] {
+                    *acc = (acc.0 + t.0, acc.1 + t.1, acc.2 + t.2, acc.3 + t.3); // VUGSCANTSDFEDGESUBPIXEL (SR580) M1
+                }
+            }
+            if n == 20 {
+                continue;
+            }
+            n += 1;
             edge += (c.edge > 0) as u32;
             shadow += (c.shadow > 0) as u32;
             graze += (c.graze.1 > 75.0) as u32;
             for (acc, t) in [(&mut lat_mis, c.mis), (&mut lat_free, c.free)] {
-                (acc.0, acc.1, acc.2) = (acc.0 + t.0, acc.1 + t.1, acc.2 + t.2); // VUGSCANTSDFEDGELATERAL (SR574) M1
+                (acc.0, acc.1, acc.2, acc.3) = (acc.0 + t.0, acc.1 + t.1, acc.2 + t.2, acc.3 + t.3); // VUGSCANTSDFEDGELATERAL (SR574) M1
             }
             let g = ((p.x / 4.0).floor() as i64, (p.y / 4.0).floor() as i64, (p.z / 4.0).floor() as i64);
             println!(
@@ -530,6 +563,12 @@ fn probe_table(label: &str, f: &FaceGdt, s: &ScanMesh, dev: &Deviation, frames: 
             "tsdf-probe: {label} {set} lateral mis_near={}/{} free_near={}/{} zero_grad mis={} free={}",
             lat_mis.0, lat_mis.1, lat_free.0, lat_free.1, lat_mis.2, lat_free.2
         );
+        if wide {
+            println!(
+                "tsdf-probe: {label} {set} subpixel mis_near={}/{} free_near={}/{} centre mis_near={}/{} free_near={}/{} zero_grad mis={} free={}",
+                wide_mis.3, wide_mis.1, wide_free.3, wide_free.1, wide_mis.0, wide_mis.1, wide_free.0, wide_free.1, wide_mis.2, wide_free.2
+            ); // VUGSCANTSDFEDGESUBPIXEL (SR580) M1: the line rule and the centre rule over every post vertex of the set
+        }
         printed += n;
     }
     printed
