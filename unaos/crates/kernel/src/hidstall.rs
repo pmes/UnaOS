@@ -1584,11 +1584,11 @@ fn hid_place_kat() {
         && !tp(600, true, 0, 6, 0)
         && !tp(48, true, 1, 6, 0)
         && !tp(48, true, 0, 0, 6);
-    let svc = svc_kat(); // F39HIDPLACESVC (B1109): the scheduler's sibling tier honours its skip (file tail; `None` = `-`)
-    let ok = apart_ok && tap_ok && svc != Some(false);
+    let svc = svc_kat(); let render = render_kat(); // F39HIDPLACESVC (B1109): the scheduler's sibling tier honours its skip (file tail; `None` = `-`). F39HIDPLACERENDER (B1118): and its second skip, the render core's (file tail)
+    let ok = apart_ok && tap_ok && svc != Some(false) && render != Some(false);
     serial_println!(
-        ":: HIDPLACE: kat_ok={} apart_ok={} tap_ok={} svc_ok={} placed={} pump_cpu=c{} -> {} ::",
-        ok as u8, apart_ok as u8, tap_ok as u8, OkWord(svc), CpuWord(usb_pump_placed()), CpuWord(pump_cpu()), if ok { "PASS" } else { "FAIL" }
+        ":: HIDPLACE: kat_ok={} apart_ok={} tap_ok={} svc_ok={} render_ok={} placed={} pump_cpu=c{} -> {} ::",
+        ok as u8, apart_ok as u8, tap_ok as u8, OkWord(svc), OkWord(render), CpuWord(usb_pump_placed()), CpuWord(pump_cpu()), if ok { "PASS" } else { "FAIL" }
     );
 }
 
@@ -1604,7 +1604,7 @@ fn hid_place_kat() {
 // gated off by `pass_begin`'s T0 swap before it takes and resets the gap's candidate ([`wait_who_gap`]); the minute's worst
 // gap keeps its own ([`wait_who_keep`]). The name is held in the ONE name record, [`MaskWho`] (its site word is this tail's
 // sample line, never printed). `who=<task>:<tid>`, `-` unless the minute reads WAIT-LONG, `?` when no tick sampled
-// (aarch64: HID-WAIT-WHO-ARM owed; an idle core). `:: HIDGAPSPLIT:` adds `who_ok=` (pure cases).
+// (aarch64: no HID pass stamps the pump there yet, HID-PUMP-ARM owed; an idle core). F39HIDPLACERENDER (B1118): both arches' tick sample through [`wait_tick`]. `:: HIDGAPSPLIT:` adds `who_ok=` (pure cases).
 
 /// F39HIDPLACESVC (B1109): the ended-or-running gap's majority candidate (tid 0 = none) and its Boyer-Moore count.
 static GAP_WHO: MaskWho = MaskWho::new();
@@ -1631,7 +1631,7 @@ pub fn wait_overdue(t0: u64, end: u64, now: u64) -> bool {
     end != 0 && t0 <= end && now.saturating_sub(end) >= HID_GAP_STALL_MS
 }
 
-/// The hid pump core's tick (`sched::hid_wait_tick`, ISR, IF=0): the task `name`/`tid` was running there. Atomics only.
+/// The hid pump core's tick (both arches' `sched::hid_wait_tick` through [`wait_tick`], ISR, IF=0): the task `name`/`tid` was running there. Atomics only.
 pub fn wait_who_tick(name: &'static str, tid: u64) {
     if !wait_overdue(PASS_T0_MS.load(Relaxed), PASS_END_MS.load(Relaxed), crate::arch::ms()) {
         return;
@@ -1713,10 +1713,55 @@ fn svc_kat() -> Option<bool> {
     if s == me {
         return None;
     }
-    Some(crate::arch::sched::sibling_online_cpu_skip(me, s) != s)
+    Some(crate::arch::sched::sibling_online_cpu_skip(me, s, usize::MAX) != s)
 }
 
 #[cfg(not(target_arch = "x86_64"))]
 fn svc_kat() -> Option<bool> {
+    None
+}
+
+// ── F39HIDPLACERENDER (rmbp-ledger B1118) — HID-PLACE-RENDER + HID-WAIT-WHO-ARM. FILE-TAIL append. ──────────────────────────
+// HID-PLACE-RENDER: `sessionwedge::pick_live_skip`'s render guard read None whenever the scheduler's sibling tier answered the
+// render core, even with another sibling free. The ladder now takes a second skip (`sched::sibling_online_cpu_skip(caller,
+// skip, skip_b)`, widened in place; `sibling_online_cpu` passes none), and `pick_live_skip` passes the render core as
+// `skip_b`. `:: HIDPLACE:` adds `render_ok=` (x86 SMP live, at least two siblings; `-` on aarch64 / fewer CPUs).
+// HID-WAIT-WHO-ARM: the pump-core gate is ONE fn, [`wait_tick`]; each arch's `timer_preempt` -> `hid_wait_tick` keeps only
+// its own `Task` read in the closure. aarch64's tick is wired, but no aarch64 HID pass stamps [`pump_here`] /
+// `pass_begin` yet, so `who=` stays `?` there (HID-PUMP-ARM owed).
+
+/// F39HIDPLACERENDER (B1118): the tick sampler's gate, shared by both arches' `sched::hid_wait_tick` (ISR, IF=0): on the
+/// hid pump's core only, `who` reads the interrupted task's name and id and [`wait_who_tick`] votes it.
+#[inline]
+pub fn wait_tick(cpu: usize, who: impl FnOnce() -> (&'static str, u64)) {
+    if cpu != pump_cpu() {
+        return;
+    }
+    let (name, tid) = who();
+    wait_who_tick(name, tid);
+}
+
+/// `:: HIDPLACE:`'s `render_ok=` (x86): the sibling tier, asked to skip the two cores it would pick first, picks neither (a
+/// third sibling, or the caller as the fallback). `None` with interrupts masked or fewer than two siblings.
+#[cfg(target_arch = "x86_64")]
+fn render_kat() -> Option<bool> {
+    if crate::arch::irqs_masked() {
+        return None;
+    }
+    let me = crate::arch::percpu::this_cpu().cpu_index as usize;
+    let a = crate::arch::sched::sibling_online_cpu(me);
+    if a == me {
+        return None;
+    }
+    let b = crate::arch::sched::sibling_online_cpu_skip(me, a, usize::MAX);
+    if b == me {
+        return None;
+    }
+    let r = crate::arch::sched::sibling_online_cpu_skip(me, a, b);
+    Some(r != a && r != b)
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn render_kat() -> Option<bool> {
     None
 }

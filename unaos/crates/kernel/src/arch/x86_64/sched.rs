@@ -3072,7 +3072,7 @@ pub fn spawn_user_thread(
 /// context at IF possibly 1, so the whole scan is taken inside `without_interrupts` for the identical
 /// reason `pick_cpu` and `emit_load_witness` do — at most `MAX_CPUS` iterations, one run-queue lock
 /// at a time, never nested, no allocation and no UART inside.
-pub fn sibling_online_cpu(caller: usize) -> usize { sibling_online_cpu_skip(caller, usize::MAX) } pub fn sibling_online_cpu_skip(caller: usize, skip: usize) -> usize { // F39HIDPLACESVC (B1109) HID-PLACE-SVC: the ladder above with one more core to skip (`usize::MAX` = none: every old caller); `sessionwedge::pick_live_skip` passes the hid pump's core. LINE-NEUTRAL, in place
+pub fn sibling_online_cpu(caller: usize) -> usize { sibling_online_cpu_skip(caller, usize::MAX, usize::MAX) } pub fn sibling_online_cpu_skip(caller: usize, skip: usize, skip_b: usize) -> usize { // F39HIDPLACESVC (B1109) HID-PLACE-SVC: the ladder above with one more core to skip (`usize::MAX` = none: every old caller); `sessionwedge::pick_live_skip` passes the hid pump's core. F39HIDPLACERENDER (B1118) HID-PLACE-RENDER: and a second, `skip_b` (`pick_live_skip` passes the render core). LINE-NEUTRAL, in place
     let service = crate::arch::smp::service_cpu();
     let rot = AUTO_ROTATE.fetch_add(1, Ordering::Relaxed);
     // SPREADSETTLE: the same two repairs `pick_cpu` takes, and they belong here for a stronger
@@ -3090,7 +3090,7 @@ pub fn sibling_online_cpu(caller: usize) -> usize { sibling_online_cpu_skip(call
             let mut elig = [(0usize, 0usize, 0u32); MAX_CPUS]; // (cpu, load, pct)
             let mut n = 0usize;
             for c in 0..MAX_CPUS {
-                if c == caller || c == skip || is_dead_core(c) || SCHED[c].scheduler_rsp.load(Ordering::Acquire) == 0 { // GATESTEAL (B657): a core the steal declared dead is no sibling (same-line fold); F39HIDPLACESVC (B1109): nor the caller's `skip`
+                if c == caller || c == skip || c == skip_b || is_dead_core(c) || SCHED[c].scheduler_rsp.load(Ordering::Acquire) == 0 { // GATESTEAL (B657): a core the steal declared dead is no sibling (same-line fold); F39HIDPLACESVC (B1109): nor the caller's `skip`; F39HIDPLACERENDER (B1118): nor its `skip_b`
                     continue;
                 }
                 if tier < 1 && service == Some(c) {
@@ -10608,13 +10608,14 @@ pub fn stackhigh_selftest() {
 // FILE-TAIL append.
 
 /// F39HIDPLACESVC (B1109): the pump core's tick sample — one `PUMP_CPU` load and compare on every other core.
+/// F39HIDPLACERENDER (B1118): the gate is `hidstall::wait_tick`'s (shared with aarch64's tick); this keeps the `Task` read.
 #[inline]
 fn hid_wait_tick(cpu: usize, raw: *const Task) {
-    if cpu != crate::hidstall::pump_cpu() {
-        return;
-    }
-    // SAFETY: this core's own current task (non-null at the caller, `timer_preempt` :5490), read in its timer ISR (IF=0):
-    // nothing frees it while it is current, and only this core's scheduler reclaims it.
-    let t = unsafe { &*raw };
-    crate::hidstall::wait_who_tick(t.name, t.id);
+    crate::hidstall::wait_tick(cpu, || {
+        // SAFETY: this core's own current task (non-null at the caller, `timer_preempt` :5490), read in its timer ISR
+        // (IF=0), and only on the pump core (the closure runs past `wait_tick`'s gate): nothing frees it while it is
+        // current, and only this core's scheduler reclaims it.
+        let t = unsafe { &*raw };
+        (t.name, t.id)
+    });
 }
