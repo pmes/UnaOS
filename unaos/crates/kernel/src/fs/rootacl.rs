@@ -228,6 +228,15 @@ fn machine_store_leg(mt: &MountTable) -> bool {
         let _ = mt.unlink(&anon_new, KERNEL_PRINCIPAL);
     }
     let read = mt.open_read(&target, "anon").is_ok();
+    // MACHINESTOREPLANT (rmbp-ledger B1156): plant as `anon` before the stamp (the folder's row lifted at kernel authority),
+    // re-stamp, then prefs' ONE reader (`read_all` via `prefs::store_read`) must refuse the planted file. Named in-place hunk.
+    let plant = alloc::format!("{}/machinestore-plant", dir);
+    let _ = mt.unlink(&plant, KERNEL_PRINCIPAL);
+    let _ = mt.remove_attr(&dir, "owner", KERNEL_PRINCIPAL);
+    let pe = path_write_as(&plant, una_abi::PATH_W_TRUNC, 0, b"[system]\n", "anon");
+    let restamped = stamp_store(mt, &dir);
+    let plant_tok = if pe < 0 { "unplanted" } else if crate::prefs::store_read(&plant).is_none() { "refused" } else { "READ" };
+    let _ = mt.unlink(&plant, KERNEL_PRINCIPAL);
     if laid {
         let _ = mt.unlink(&target, KERNEL_PRINCIPAL);
     }
@@ -235,17 +244,46 @@ fn machine_store_leg(mt: &MountTable) -> bool {
         let _ = mt.remove_dir(&dir, KERNEL_PRINCIPAL);
     }
     let tok = |e: i64| if e == una_abi::EACCES { "refused" } else if e >= 0 { "ADMITTED" } else { "error" };
-    let pass = owned && we == una_abi::EACCES && ce == una_abi::EACCES && read;
+    let pass = owned && we == una_abi::EACCES && ce == una_abi::EACCES && read && restamped && plant_tok == "refused"; // MACHINESTOREPLANT (B1156): the plant leg joins this leg's PASS
     serial_println!(
-        ":: MACHINESTORE: owner={} write={} create={} read={} -> {} :: by=anon target={} errno={} made_dir={} ::",
+        ":: MACHINESTORE: owner={} write={} create={} read={} plant={} -> {} :: by=anon target={} errno={} made_dir={} ::",
         if owned { SYSTEM_OWNER } else { "none" },
         tok(we),
         tok(ce),
         if read { "ok" } else { "REFUSED" },
+        plant_tok,
         if pass { "PASS" } else { "FAIL" },
         if is_general { "general" } else { "scratch" },
         we,
         made_dir as u8,
     );
     pass
+}
+
+// ── MACHINESTOREPLANT (rmbp-ledger B1156, BP-storage-11) — TAIL-APPENDED ───────────────────────────────────────────────
+// A file a program planted in the machine store before the folder's first stamp keeps its OWN owner row (a ring-3 create
+// stamps `owner=<principal>`, fs/vfs.rs create; `owner` is reserved, so ring 3 cannot shed it), and `system_owned`
+// stops at the nearest row: the folder's `system` row never reaches it. prefs' one reader (`read_all`) asks
+// [`store_file_refused`] and reads a refused file as absent (the kernel's next swap of that domain replaces it).
+// Wire (said by prefs): `[prefs] machine settings/<d> refused: owner=<p>`.
+
+/// Is the machine-store file `path` NOT the kernel's? Its nearest owner row must be [`SYSTEM_OWNER`]: its own row
+/// `system`, or no row of its own in a [`stamped`] folder. `Some(owner)` = refuse (`none` for a row-less file in an
+/// unstamped folder); `None` = read it — also for a path not directly in the store, and for a volume with no attributes
+/// (a FAT root answers `Unsupported`: MACHINE-STORE-FATROOT stays owed).
+pub fn store_file_refused(mt: &MountTable, path: &str) -> Option<String> {
+    let dir = machine_store_dir();
+    let leaf = path.strip_prefix(dir.as_str()).and_then(|r| r.strip_prefix('/'))?;
+    if leaf.is_empty() || leaf.contains('/') {
+        return None;
+    }
+    match mt.get_attr(path, "owner", KERNEL_PRINCIPAL) {
+        Ok(AttrValue::Str(s)) if s == SYSTEM_OWNER => None,
+        Ok(AttrValue::Str(s)) => Some(s),
+        Ok(_) => Some(String::from("?")),
+        Err(VfsError::Backend("no-attr")) => {
+            if stamped(mt, &dir) { None } else { Some(String::from("none")) }
+        }
+        Err(_) => None,
+    }
 }
