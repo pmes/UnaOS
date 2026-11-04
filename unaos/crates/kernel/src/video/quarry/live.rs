@@ -2956,6 +2956,10 @@ pub fn hover_selftest() {
         return;
     }
     let id = WIN.load(Ordering::Relaxed);
+    // QUARRYHOVERRAISE (B1100): Quarry in front for the drive — `tests` runs from the shell, whose rows `focus_changed(0)`
+    // raised over Quarry (flight 39: `[wc-fv] focus shell z=80`, every put read `Hover::None`); the tail's
+    // `wm::focus_changed(saved_focus)` puts the saved owner back in front.
+    let raised = wm::raise_one(id);
     let (Some(info), Some(pi)) = (wm::info(id), crate::video::panel_info_nonblocking()) else {
         serial_println!(":: QUARRYHOVER: rows=FAIL sidebar=FAIL toolbar=FAIL repaints=0 wheel_panes=0 -> FAIL :: reason=no-geometry ::");
         return;
@@ -2984,20 +2988,26 @@ pub fn hover_selftest() {
         // `set_abs` maps `ax * w / 32767` (floored): round the report UP so the pointer lands on or 1 px past the target.
         let ax = ((px * 32767 + pw as i64 - 1) / pw as i64) as i32;
         let ay = ((py * 32767 + ph as i64 - 1) / ph as i64) as i32;
+        // QUARRYHOVERRAISE (B1100): what lies over the target before the poll (`q` Quarry, `o` another window, `-` none)
+        // and whether the pointer landed within 1 px of it — the witness names a covered target, not only its None.
+        let cover = match wm::hit_test(px as i32, py as i32) { Some((w, _, _)) if w == id => 'q', Some(_) => 'o', None => '-' };
         crate::pal::cursor::set_abs(ax, ay, pw, ph);
+        let (cx, cy) = crate::pal::cursor::pos(pw, ph);
+        let landed = (cx as i64 - px).abs() <= 1 && (cy as i64 - py).abs() <= 1;
         hover_poll();
+        (cover, landed)
     };
     let p0 = HOVER_PAINTS.load(Ordering::Relaxed);
     LAST_PTR.store(u64::MAX, Ordering::Relaxed);
-    put(tree_pt);
+    let c1 = put(tree_pt);
     let h1 = hover_now();
     let p1 = HOVER_PAINTS.load(Ordering::Relaxed);
     hover_poll(); // the pointer did not move: no repaint
     let p1b = HOVER_PAINTS.load(Ordering::Relaxed);
-    put(side_pt);
+    let c2 = put(side_pt);
     let h2 = hover_now();
     let p2 = HOVER_PAINTS.load(Ordering::Relaxed);
-    put(tool_pt);
+    let c3 = put(tool_pt);
     let h3 = hover_now();
     let p3 = HOVER_PAINTS.load(Ordering::Relaxed);
     let rows_ok = h1 == Hover::Tree(0) && p1 - p0 == 1 && p1b == p1;
@@ -3064,10 +3074,11 @@ pub fn hover_selftest() {
     wm::focus_changed(saved_focus);
     let ok = rows_ok && side_ok && tool_ok && wheel_panes == 5;
     let w = |b: bool| if b { "ok" } else { "FAIL" };
-    serial_println!("[quarryhover] seen tree={:?} sidebar={:?} toolbar={:?} paints={},{},{},{} idle_repaint={} wheel={}", h1, h2, h3, p0, p1, p2, p3, p1b - p1, wheel_hits);
+    let landed = [c1.1, c2.1, c3.1].iter().filter(|&&b| b).count(); // QUARRYHOVERRAISE (B1100)
+    serial_println!("[quarryhover] seen tree={:?} sidebar={:?} toolbar={:?} paints={},{},{},{} idle_repaint={} wheel={} drive=synthetic cover={}{}{} landed={}/3", h1, h2, h3, p0, p1, p2, p3, p1b - p1, wheel_hits, c1.0, c2.0, c3.0, landed);
     serial_println!(
-        ":: QUARRYHOVER: rows={} sidebar={} toolbar={} repaints={} wheel_panes={} -> {} ::",
-        w(rows_ok), w(side_ok), w(tool_ok), p3 - p0, wheel_panes, if ok { "PASS" } else { "FAIL" }
+        ":: QUARRYHOVER: rows={} sidebar={} toolbar={} repaints={} wheel_panes={} drive=synthetic raised={} -> {} ::",
+        w(rows_ok), w(side_ok), w(tool_ok), p3 - p0, wheel_panes, if raised { "ok" } else { "no" }, if ok { "PASS" } else { "FAIL" }
     );
 }
 
