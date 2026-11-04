@@ -69,8 +69,8 @@ fn removing_a_constraint_gives_back_its_dof() {
     assert_eq!(solve(&mut sk, T).expect("solves").dof, 1);
     assert!(!sk.remove(ConstraintId(6)), "a hole is removed once");
     sk.remove_entity(p[2]).expect("a live point");
-    assert_eq!(sk.remove_entity(p[2]), Err(BadRef(p[2])), "a tombstone is no live entity");
-    assert_eq!(sk.remove_entity(EntityId(99)), Err(BadRef(EntityId(99))));
+    assert_eq!(sk.remove_entity(p[2]), Err(BadRef { id: p[2], kind: RefKind::Live }), "a tombstone is no live entity");
+    assert_eq!(sk.remove_entity(EntityId(99)), Err(BadRef { id: EntityId(99), kind: RefKind::Live }));
 }
 
 #[test]
@@ -89,9 +89,9 @@ fn set_radius_then_solve_holds_a_radius_constraint() {
     assert!((sk.radius(circle).unwrap() - 5.0).abs() < 1e-6, "the Radius constraint holds");
     assert_eq!(sk.radius(free), Some(9.0), "nothing constrains it: the minimum move leaves it");
     let line = sk.add_line(c, c2).unwrap();
-    assert_eq!(sk.set_point(line, 0.0, 0.0), Err(BadRef(line)));
-    assert_eq!(sk.set_radius(line, 1.0), Err(BadRef(line)));
-    assert_eq!(sk.set_arc_angles(free, 0.0, 1.0), Err(BadRef(free)), "a circle has no angles");
+    assert_eq!(sk.set_point(line, 0.0, 0.0), Err(BadRef { id: line, kind: RefKind::Point }));
+    assert_eq!(sk.set_radius(line, 1.0), Err(BadRef { id: line, kind: RefKind::Round }));
+    assert_eq!(sk.set_arc_angles(free, 0.0, 1.0), Err(BadRef { id: free, kind: RefKind::Arc }), "a circle has no angles");
     sk.set_point(c2, 21.0, 1.0).unwrap();
     assert!(near(pt(&sk, c2), 21.0, 1.0, 0.0));
     let arc = sk.add_arc(c2, 2.0, 0.0, 1.0).unwrap();
@@ -111,8 +111,8 @@ fn ids_stay_stable_across_a_removal() {
     assert_eq!(r, Removed { entities: vec![p0, line], constraints: vec![c] });
     let p2 = sk.add_point(1.0, 1.0);
     assert_eq!(p2, EntityId(3), "ids are never reused");
-    assert_eq!(sk.add_line(p0, p1), Err(BadRef(p0)));
-    assert_eq!(sk.add(Constraint::Fix(PointRef::Point(p0), Vec2::new(0.0, 0.0))), Err(BadRef(p0)));
+    assert_eq!(sk.add_line(p0, p1), Err(BadRef { id: p0, kind: RefKind::Point }));
+    assert_eq!(sk.add(Constraint::Fix(PointRef::Point(p0), Vec2::new(0.0, 0.0))), Err(BadRef { id: p0, kind: RefKind::Point }));
     assert_eq!(sk.add(Constraint::Fix(PointRef::Point(p1), Vec2::new(5.0, 0.0))), Ok(ConstraintId(1)), "nor are constraint ids");
     assert!(sk.remove(ConstraintId(1)));
     assert_eq!(sk.params().len(), 6, "the frozen parameters stay in place");
