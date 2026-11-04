@@ -4149,7 +4149,7 @@ fn session_line() {
         Some(_) => "?",
         None => "none",
     };
-    serial_println!("[session] opened user={} ms={}.{} deferred={} from={}", who, us / 1000, (us % 1000) / 100, deferred, from);
+    serial_println!("[session] opened user={} ms={}.{} deferred={} from={} windowcap={}/{} diet={}", who, us / 1000, (us % 1000) / 100, deferred, from, crate::video::wincap::win_limit(), crate::video::wincap::proc_limit(), session_diet_per_min()); // SESSION-LINE-NUMBERS (B1135): the folded WINDOWCAP limit/procs and the diet rate, from their own statics (file tail)
 }
 
 // CONTINUE-CLOSE-DRAIN (rmbp-ledger B1129) — TAIL-APPENDED. The road into a session (`close_into_session`) takes the
@@ -4167,3 +4167,13 @@ fn close_or_owe(id: wm::WinId) {
     }
 }
 
+// SESSION-LINE-NUMBERS (rmbp-ledger B1135) — TAIL-APPENDED. SESSIONLINEFOREIGN (B1130) folded `:: WINDOWCAP:` and
+// `[flightring] diet` into `[session] opened`, so their numbers left the wire on a login build; [`session_line`] carries
+// them as `windowcap=<limit>/<procs>` (`wincap::win_limit` / `proc_limit`, armed by the ignition's witness before the
+// line) and `diet=<per_min>` (this fn: the statics `flightring::diet_line` reads, at the line's own moment).
+
+/// The wire's lines per minute so far: `serial_ring::SUBMITTED` over `arch::ms()` (`flightring::diet_line`'s `per_min=`).
+fn session_diet_per_min() -> u64 {
+    let lines = crate::serial_ring::SUBMITTED.load(Ordering::Relaxed);
+    lines.saturating_mul(60_000) / crate::arch::ms().max(1)
+}

@@ -728,7 +728,7 @@ fn veil_login_build() {
         serial_println!("[veil] login owed at=install"); // VEIL-LOGIN-HELD (B1128): dropped while no screen is up; the next raise builds
         return;
     }
-    LV_OWED.store(false, Ordering::Release);
+    LV_OWED.store(false, Ordering::Release); veil_login_rebuild_clear(); // VEIL-HELD-REPREF (B1135): this build composes at the current look, so an owed svc rebuild is moot
     let (build_us, blit_us, bytes) = crate::video::wm::desktop::login_prefill(&b);
     let raise_us = build_us.saturating_add(blit_us); // VEIL-LOGIN-HELD (B1128): what a rebuild at the raise costs
     LV_RAISE_US.store(raise_us, Ordering::Relaxed);
@@ -822,6 +822,99 @@ pub fn veil_login_raise() {
 
 /// The Reduce transparency pref moved (`crystal::login_reduce_load`): drop the field; the next raise rebuilds it.
 pub fn veil_login_stale() {
+    if veil_login_rebuild_defer() { return; } // VEIL-HELD-REPREF (B1135): a held field is kept and recomposed on the x86 device-service pass (file tail)
     crate::video::wm::desktop::login_veil_drop();
     LV_OWED.store(true, Ordering::Release);
+}
+
+// ── VEIL-HELD-REPREF (rmbp-ledger B1135, BP-video-11) — TAIL-APPENDED: a held field is recomposed off the raise ──────
+// VEIL-LOGIN-HELD (B1128) dropped even a HELD field on a Reduce transparency move, so the next raise paid the whole
+// build inside its route (x86 2880x1800 ~72.6 ms). Now, on x86, a held field with bytes and nothing owed is KEPT and
+// owed to the device-service pass (`wm::pace_service` -> [`veil_login_svc`], after B1129's `close_owed_run`): ONE cell,
+// [`LV_REBUILD`] = `(gen << 32) | next_row` (row `u32::MAX` = idle; one relaxed load when idle). The pass recomposes the
+// kept rows IN PLACE (`wm::desktop::login_refill_rows`, one row per `LOGIN_VEIL` hold, so a painter sees each row old or
+// new, never torn) in slices of `max(1, 131072 / w)` rows (2880 px: 45 rows ~1.8 ms), so the ~1 kHz lane is never held
+// for the whole build; a raise meanwhile blits whatever is kept (LV_OWED stays false: the raise does not build). A move
+// mid-rebuild bumps `gen` and the pass's CAS fails: the next slice restarts at row 0. The last slice reuses
+// `login_prefill` for the blit timing and bytes (every row a hit), stores the raise cost as [`veil_login_build`] does,
+// re-arms the witness and prints the cost line with `at=svc`. aarch64 (no `pace_service`), a field not held, or a
+// contended byte count keeps B1128's drop. Wire: `[veil] login cost … at=svc`; a field re-keyed or dropped under the
+// pass (an install, `wallpaper off`) leaves it idle: `[veil] login rebuild left at=svc row=<y>`.
+
+/// The owed in-place rebuild: `(gen << 32) | next_row`; row [`LV_RB_IDLE`] = nothing owed.
+static LV_REBUILD: AtomicU64 = AtomicU64::new(LV_RB_IDLE as u64);
+/// The idle row sentinel.
+const LV_RB_IDLE: u32 = u32::MAX;
+/// The rebuild's accumulated compose time (the cost line's `build_us=`), written only by the pass.
+#[cfg(target_arch = "x86_64")]
+static LV_RB_US: AtomicU64 = AtomicU64::new(0);
+
+/// [`veil_login_stale`]'s head: on x86, a HELD field with bytes and nothing owed is kept and its rebuild owed to the
+/// pass (`true`); anything else answers `false` (B1128's drop).
+fn veil_login_rebuild_defer() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if LV_HELD.load(Ordering::Acquire) && !LV_OWED.load(Ordering::Acquire) && crate::video::wm::desktop::login_veil_bytes() > 0 {
+            let _ = LV_REBUILD.fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| Some((((v >> 32) + 1) << 32) & !0xFFFF_FFFF));
+            return true;
+        }
+    }
+    false
+}
+
+/// [`veil_login_build`]'s clear: an owed rebuild is moot after a build at the current look (the gen moves, so a slice
+/// in flight fails its CAS).
+fn veil_login_rebuild_clear() {
+    let _ = LV_REBUILD.fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| Some(((((v >> 32) + 1) << 32) & !0xFFFF_FFFF) | LV_RB_IDLE as u64));
+}
+
+/// `wm::pace_service`'s taker (x86 `wc`, after `close_owed_run`): one relaxed load when nothing is owed; else one
+/// bounded slice of the in-place rebuild, and on the last slice the cost line with `at=svc`.
+#[cfg(target_arch = "x86_64")]
+pub fn veil_login_svc() {
+    let v = LV_REBUILD.load(Ordering::Relaxed);
+    if v as u32 == LV_RB_IDLE {
+        return;
+    }
+    let v = LV_REBUILD.load(Ordering::Acquire);
+    let y0 = v as u32;
+    if y0 == LV_RB_IDLE {
+        return;
+    }
+    let g0 = v & !0xFFFF_FFFF;
+    let Some(b) = back() else {
+        let _ = LV_REBUILD.compare_exchange(v, g0 | LV_RB_IDLE as u64, Ordering::AcqRel, Ordering::Acquire);
+        return;
+    };
+    if y0 == 0 {
+        LV_RB_US.store(0, Ordering::Relaxed);
+    }
+    let n = (131_072 / b.w.max(1)).max(1);
+    let Some((next, us)) = crate::video::wm::desktop::login_refill_rows(&b, y0 as usize, n) else {
+        if LV_REBUILD.compare_exchange(v, g0 | LV_RB_IDLE as u64, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+            serial_println!("[veil] login rebuild left at=svc row={}", y0);
+        }
+        return;
+    };
+    let build_us = LV_RB_US.load(Ordering::Relaxed).saturating_add(us);
+    LV_RB_US.store(build_us, Ordering::Relaxed);
+    if next < b.h {
+        let _ = LV_REBUILD.compare_exchange(v, g0 | next as u64, Ordering::AcqRel, Ordering::Acquire);
+        return;
+    }
+    if LV_REBUILD.compare_exchange(v, g0 | LV_RB_IDLE as u64, Ordering::AcqRel, Ordering::Acquire).is_err() {
+        return; // the pref moved during the last slice: the next pass restarts at row 0
+    }
+    let (_, blit_us, bytes) = crate::video::wm::desktop::login_prefill(&b);
+    let raise_us = build_us.saturating_add(blit_us);
+    LV_RAISE_US.store(raise_us, Ordering::Relaxed);
+    LV_HELD.store(raise_us > RAISE_BUDGET_US, Ordering::Release);
+    LV_READY.store(false, Ordering::Relaxed);
+    LV_SAID.store(false, Ordering::Relaxed);
+    LV_LATCHED.store(false, Ordering::Release);
+    serial_println!(
+        "[veil] login cost build_us={} blit_us={} panel={}x{} bytes={} a={} kept={} held={} at=svc",
+        build_us, blit_us, b.w, b.h, bytes, crate::video::crystal::veil::Look::login().a,
+        if bytes == 0 { "no" } else { "yes" }, if raise_us > RAISE_BUDGET_US { "yes" } else { "no" }
+    );
 }

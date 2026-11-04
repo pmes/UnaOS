@@ -3969,3 +3969,33 @@ fn login_half_bytes() -> usize {
 fn login_half_bytes() -> usize {
     0
 }
+
+// ── VEIL-HELD-REPREF (rmbp-ledger B1135, BP-video-11) — TAIL-APPENDED: the kept login field recomposed in place ───────
+// A Reduce transparency move leaves `veil_key` unchanged, so [`VeilCache::fill`] (which paints only a row not yet kept)
+// can never recompose a HELD field. `wallpaper::veil_login_svc` (the x86 device-service pass) calls this for one bounded
+// slice: each row is recomposed straight into its kept slot through `crystal::veil::row` at the current
+// `Look::login()`, with `LOGIN_VEIL` held one row at a time (B1122's builder discipline), so a painter's `try_lock`
+// sees the row old or new, never torn.
+
+/// Rows `y0..y0 + n` of the kept login field recomposed in place at the current look. `Some((next_row, us))`; `None`
+/// when the kept field is not this picture's (re-keyed by an install, or dropped): nothing is written.
+#[cfg(target_arch = "x86_64")]
+pub fn login_refill_rows(back: &Back, y0: usize, n: usize) -> Option<(usize, u64)> {
+    let look = crate::video::crystal::veil::Look::login();
+    let (pw, ph) = (back.w, back.h);
+    if pw == 0 || ph == 0 {
+        return None;
+    }
+    let k = veil_key(Some(back), (0, 0, pw, ph), 0);
+    let end = y0.saturating_add(n).min(ph);
+    let t0 = crate::arch::now_cycles();
+    for y in y0..end {
+        let mut c = LOGIN_VEIL.lock();
+        if c.key != Some(k) || c.w != pw || c.h != ph || c.rows.len() < (y + 1) * pw || c.have.len() <= y {
+            return None;
+        }
+        crate::video::crystal::veil::row(&mut c.rows[y * pw..(y + 1) * pw], 0, y, Some(back), look);
+        c.have[y] = true;
+    }
+    Some((end, crate::video::blitter::cycles_to_us(crate::arch::now_cycles().saturating_sub(t0))))
+}
