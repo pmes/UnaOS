@@ -578,12 +578,31 @@ mod tests {
             SMessage::Principia(PrincipiaCommand::PrefChanged {
                 ns: ns.into(),
                 key: "provider".into(),
-                value: PrefValue::Str("claude".into()),
+                value: Some(PrefValue::Str("claude".into())),
                 clamped: false,
             })
         };
         assert!(is_vein_pref_change(&mk("vein")));
         assert!(!is_vein_pref_change(&mk("stria")));
+    }
+
+    /// PRINCIPIA-UNSET-CHANGED (SR608): a typed PrefUnset in Vein's namespace answers the PrefChanged broadcast with
+    /// `value: None`, and the provider-rebuild filter takes it (the re-read lane sees the unset, no second arm).
+    #[test]
+    fn a_typed_unset_reaches_the_provider_rebuild() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut p = principia::Principia::with_home(dir.path());
+        let set = SMessage::Principia(PrincipiaCommand::PrefSet { ns: PREF_NS.into(), key: "claude.fallbacks".into(), value: PrefValue::Bool(false) });
+        assert!(p.process_impulse(&set).as_ref().is_some_and(is_vein_pref_change));
+        let reply = p
+            .process_impulse(&SMessage::Principia(PrincipiaCommand::PrefUnset { ns: PREF_NS.into(), key: "claude.fallbacks".into() }))
+            .expect("an unset answers");
+        match &reply {
+            SMessage::Principia(PrincipiaCommand::PrefChanged { key, value, .. }) => assert_eq!((key.as_str(), value), ("claude.fallbacks", &None)),
+            other => panic!("expected PrefChanged, got {other:?}"),
+        }
+        assert!(is_vein_pref_change(&reply), "the unset reaches the provider rebuild");
+        assert_eq!(p.prefs().get(PREF_NS, "claude.fallbacks"), None);
     }
 
     #[test]

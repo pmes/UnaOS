@@ -36,7 +36,8 @@
 //!
 //! All under [`SMessage::Principia`]:
 //! `PrefGet` → `PrefValueIs`, `PrefList` → `PrefListIs`, `PrefSet` →
-//! `PrefChanged` (broadcast, the live-update signal) or `PrefError`, and the
+//! `PrefChanged` (broadcast, the live-update signal) or `PrefError`, `PrefUnset` →
+//! `PrefChanged` with `value: None` (SR608) or `PrefError`, and the
 //! pre-existing `SetSystemRoot` → `SystemRootChanged`.
 //!
 //! # Not implemented (deliberately, this round)
@@ -211,7 +212,7 @@ impl Principia {
                 SMessage::Principia(PrincipiaCommand::PrefChanged {
                     ns: ns.to_string(),
                     key: key.to_string(),
-                    value: out.value,
+                    value: Some(out.value),
                     clamped: out.clamped,
                 })
             }
@@ -347,7 +348,7 @@ mod tests {
         match changed {
             PrincipiaCommand::PrefChanged { ns, key, value, .. } => {
                 assert_eq!((ns.as_str(), key.as_str()), ("aether", "window.width"));
-                assert_eq!(value, PrefValue::Int(1280));
+                assert_eq!(value, Some(PrefValue::Int(1280)));
             }
             other => panic!("a successful set must answer PrefChanged, got {other:?}"),
         }
@@ -451,20 +452,20 @@ mod tests {
         };
         match set(&mut p, "display.brightness", PrefValue::Int(0)) {
             PrincipiaCommand::PrefChanged { value, clamped, .. } => {
-                assert_eq!(value, PrefValue::Int(prefs_core::display::clamp_brightness(0)));
+                assert_eq!(value, Some(PrefValue::Int(prefs_core::display::clamp_brightness(0))));
                 assert!(clamped, "a dark brightness is clamped and said");
             }
             other => panic!("expected PrefChanged, got {other:?}"),
         }
         match set(&mut p, "audio.volume", PrefValue::Int(99)) {
             PrincipiaCommand::PrefChanged { value, clamped, .. } => {
-                assert_eq!((value, clamped), (PrefValue::Int(16), true));
+                assert_eq!((value, clamped), (Some(PrefValue::Int(16)), true));
             }
             other => panic!("expected PrefChanged, got {other:?}"),
         }
         match set(&mut p, "audio.volume", PrefValue::Int(9)) {
             PrincipiaCommand::PrefChanged { value, clamped, .. } => {
-                assert_eq!((value, clamped), (PrefValue::Int(9), false));
+                assert_eq!((value, clamped), (Some(PrefValue::Int(9)), false));
             }
             other => panic!("expected PrefChanged, got {other:?}"),
         }
@@ -489,7 +490,7 @@ mod tests {
             PrincipiaCommand::PrefChanged {
                 ns: "aether".into(),
                 key: "homepage".into(),
-                value: PrefValue::Str("x".into()),
+                value: Some(PrefValue::Str("x".into())),
                 clamped: false,
             },
             PrincipiaCommand::PrefValueIs {
@@ -576,7 +577,7 @@ mod tests {
         .expect("a set must broadcast PrefChanged");
         assert_eq!(changed.0, "aether");
         assert_eq!(changed.1, "homepage");
-        assert_eq!(changed.2, PrefValue::Str("https://una.os/".into()));
+        assert_eq!(changed.2, Some(PrefValue::Str("https://una.os/".into())));
 
         synapse.fire(SMessage::Principia(PrincipiaCommand::PrefGet {
             ns: "aether".into(),
@@ -618,15 +619,18 @@ pub fn default_prefs_path() -> PathBuf {
 
 impl Principia {
     /// Apply one unset in the SET arm's shape: on success the answer is the typed reading of the PREF_CHANGED unset
-    /// form the byte road posts (`prefs_core::wire::parse_changed(&unset_body)` -> `PrefValueIs { value: None }`, the
-    /// frozen "unset: the consumer's default" reply, inert to Principia's own arm); on refusal `PrefError` with the
-    /// road's words. The host Synapse is in-process, so its sender is the session's own (`in_session = true`).
+    /// form the byte road posts (`prefs_core::wire::parse_changed(&unset_body)` -> `PrefChanged { value: None }`,
+    /// PRINCIPIA-UNSET-CHANGED SR608: the broadcast every PrefChanged re-read lane already follows, inert to
+    /// Principia's own arm); on refusal `PrefError` with the road's words. The host Synapse is in-process, so its
+    /// sender is the session's own (`in_session = true`).
     fn unset_pref(&mut self, ns: &str, key: &str) -> SMessage {
         match wire::unset_key(&mut self.prefs, ns, key, true) {
             Ok(posted) => {
                 log::info!("[PRINCIPIA] :: unset {ns}.{key}");
-                let value = prefs_core::wire::parse_changed(&posted).and_then(|(_, _, v, _)| v).map(|v| prefs::from_core(&v));
-                SMessage::Principia(PrincipiaCommand::PrefValueIs { ns: ns.to_string(), key: key.to_string(), value })
+                let (value, clamped) = prefs_core::wire::parse_changed(&posted)
+                    .map(|(_, _, v, c)| (v.map(|v| prefs::from_core(&v)), c))
+                    .unwrap_or((None, false));
+                SMessage::Principia(PrincipiaCommand::PrefChanged { ns: ns.to_string(), key: key.to_string(), value, clamped })
             }
             Err((_, message)) => {
                 log::warn!("[PRINCIPIA] :: rejected unset {ns}.{key}: {message}");
@@ -652,8 +656,8 @@ mod unset_synapse_tests {
     }
 
     /// PRINCIPIA-UNSET-SYNAPSE (SR603): `vug.photo.camera_mm` set through PrefSet; a PrefUnset with a dotted namespace
-    /// (`a.b` / `c`) refuses with the SET arm's name words and touches nothing; the PrefUnset answers PrefValueIs None,
-    /// the typed reading of SR169's unset form, the store and a reload read it unset; a second PrefUnset refuses
+    /// (`a.b` / `c`) refuses with the SET arm's name words and touches nothing; the PrefUnset answers PrefChanged None
+    /// (SR608), the typed reading of SR169's unset form, the store and a reload read it unset; a second PrefUnset refuses
     /// "unset already".
     #[test]
     fn a_typed_pref_unset_unsets_the_store_and_posts_the_unset_form() {
@@ -679,12 +683,12 @@ mod unset_synapse_tests {
         assert!(p.prefs().get("vug", "photo.camera_mm").is_some(), "a refusal touches nothing");
 
         match unset(&mut p, "vug", "photo.camera_mm") {
-            PrincipiaCommand::PrefValueIs { ns, key, value } => {
-                assert_eq!((ns.as_str(), key.as_str(), value), ("vug", "photo.camera_mm", None));
+            PrincipiaCommand::PrefChanged { ns, key, value, clamped } => {
+                assert_eq!((ns.as_str(), key.as_str(), value, clamped), ("vug", "photo.camera_mm", None, false));
                 let posted = prefs_core::wire::unset_body("vug", "photo.camera_mm");
                 assert_eq!(prefs_core::wire::parse_changed(&posted), Some(("vug", "photo.camera_mm", None, false)));
             }
-            other => panic!("expected PrefValueIs, got {other:?}"),
+            other => panic!("expected PrefChanged, got {other:?}"),
         }
         assert_eq!(p.prefs().get("vug", "photo.camera_mm"), None);
         assert_eq!(PrefStore::load(p.prefs().path()).unwrap().get("vug", "photo.camera_mm"), None, "the file no longer holds it");
