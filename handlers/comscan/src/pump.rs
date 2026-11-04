@@ -90,7 +90,7 @@ pub fn start(v: &Verdict, p: &Program, d: Dialect, m: &Machine) -> Result<Pump, 
 }
 
 /// The host's opener: a port name to a live link.
-pub type Opener = dyn FnMut(&str) -> Result<Box<dyn Transport + Send>, String> + Send;
+pub type Opener = dyn FnMut(&str, Dialect) -> Result<Box<dyn Transport + Send>, String> + Send; VUGCOMSCANHOSTDIALECT (SR566): the dialect at call time
 
 /// A digest as the bus names it.
 pub fn digest_hex(d: u64) -> String {
@@ -288,14 +288,14 @@ impl PumpDesk {
     pub fn apply(
         &mut self,
         ev: &PumpEvent,
-        open: &mut dyn FnMut(&str) -> Result<Box<dyn Transport + Send>, String>,
+        open: &mut dyn FnMut(&str, Dialect) -> Result<Box<dyn Transport + Send>, String>, // VUGCOMSCANHOSTDIALECT (SR566)
     ) -> Vec<PumpEvent> {
         match ev {
             // VUGCOMSCANHELLOON (SR549): the checks, the open + hello, the handback; the bus runs the middle with the desk
             // lock released (`request` over `open_road`, the redial's road).
             PumpEvent::PumpStart { .. } => match self.start_due(ev) {
                 Ok(u) => {
-                    let res = with_hello_named(open(&u.port), u.hello, u.name); // VUGCOMSCANHOSTDESK (SR561)
+                    let res = with_hello_named(open(&u.port, u.dialect), u.hello, u.name); // VUGCOMSCANHOSTDESK (SR561); VUGCOMSCANHOSTDIALECT (SR566)
                     self.started(ev, res)
                 }
                 Err(out) => out,
@@ -364,7 +364,7 @@ pub async fn serve_pump(
         tokio::select! {
             m = rx.recv() => match m {
                 Ok(SMessage::Pump(ev)) if ev.is_request() => {
-                    let out = request(&desk, &ev, &mut *open); // VUGCOMSCANHELLOON (SR549): PumpStart's open with the lock released
+                    let out = request(&desk, &ev, &mut open).await; // VUGCOMSCANHELLOON (SR549): PumpStart's open with the lock released; VUGCOMSCANHOSTDIALECT (SR566): off the worker
                     for o in out {
                         synapse.fire(SMessage::Pump(o));
                     }
@@ -383,7 +383,7 @@ pub async fn serve_pump(
                 for o in out {
                     synapse.fire(SMessage::Pump(o));
                 }
-                redial(&synapse, &desk, &mut *open, t0); // VUGCOMSCANRECONNECT (SR521): the reopen, outside the lock
+                redial(&synapse, &desk, &mut open, t0).await; // VUGCOMSCANRECONNECT (SR521): the reopen, outside the lock; VUGCOMSCANHOSTDIALECT (SR566)
             }
         }
     }
@@ -397,8 +397,8 @@ pub const TCP_SCHEME: &str = "tcp://";
 /// The one opener [`serve_pump`] takes, routed by the port string: a name starting [`TCP_SCHEME`] goes to `net` whole
 /// (`crate::tcp::opener`), any other name (a `/dev` path) to `serial` (`crate::tty::opener`).
 pub fn by_scheme(mut serial: Box<Opener>, mut net: Box<Opener>) -> Box<Opener> {
-    Box::new(move |port: &str| -> Result<Box<dyn Transport + Send>, String> {
-        if port.starts_with(TCP_SCHEME) { net(port) } else { serial(port) }
+    Box::new(move |port: &str, d: Dialect| -> Result<Box<dyn Transport + Send>, String> {
+        if port.starts_with(TCP_SCHEME) { net(port, d) } else { serial(port, d) } // VUGCOMSCANHOSTDIALECT (SR566)
     })
 }
 
@@ -494,8 +494,8 @@ pub const WSS_SCHEME: &str = "wss://";
 /// other name to `rest` (the desk composes `with_ws(ws::opener(..), by_scheme(tty::opener(..), tcp::opener(..)))`;
 /// [`by_scheme`], `PumpDesk::apply` and [`serve_pump`] unchanged).
 pub fn with_ws(mut ws: Box<Opener>, mut rest: Box<Opener>) -> Box<Opener> {
-    Box::new(move |port: &str| -> Result<Box<dyn Transport + Send>, String> {
-        if port.starts_with(WS_SCHEME) || port.starts_with(WSS_SCHEME) { ws(port) } else { rest(port) }
+    Box::new(move |port: &str, d: Dialect| -> Result<Box<dyn Transport + Send>, String> {
+        if port.starts_with(WS_SCHEME) || port.starts_with(WSS_SCHEME) { ws(port, d) } else { rest(port, d) } // VUGCOMSCANHOSTDIALECT (SR566)
     })
 }
 
@@ -628,15 +628,16 @@ impl PumpDesk {
 
 /// serve_pump's reopen: the due port is taken under the desk lock, the opener (connect, handshake, banner wait) runs
 /// with the lock RELEASED, and its answer is handed back under the lock to [`PumpDesk::relinked`].
-fn redial(synapse: &Synapse, desk: &Mutex<PumpDesk>, open: &mut Opener, t0: tokio::time::Instant) {
+async fn redial(synapse: &Synapse, desk: &Mutex<PumpDesk>, open: &mut Box<Opener>, t0: tokio::time::Instant) { // VUGCOMSCANHOSTDIALECT (SR566): async, the open off the worker
     let now = t0.elapsed().as_micros() as u64;
     // VUGCOMSCANHELLOON (SR549): the one open road (the hello too, with the lock released, SR546)
     let out = open_road(
         desk,
         open,
-        |d| d.redial_due(now).map(|port| (port, d.hello_spec(), None)).ok_or_else(Vec::new), // VUGCOMSCANHOSTDESK (SR561): a reopen never commissions
+        |d| d.redial_due(now).zip(d.running_dialect()).map(|(port, dl)| (port, dl, d.hello_spec(), None)).ok_or_else(Vec::new), // VUGCOMSCANHOSTDESK (SR561): a reopen never commissions; VUGCOMSCANHOSTDIALECT (SR566): the run's dialect
         |d, res| d.relinked_said(t0.elapsed().as_micros() as u64, res),
     )
+    .await
     .unwrap_or_default();
     for o in out {
         synapse.fire(SMessage::Pump(o));
@@ -736,6 +737,8 @@ struct StartDue {
     hello: Option<(Dialect, Duration)>,
     /// VUGCOMSCANHOSTDESK (SR561): the name a first bind commissions on an unnamed board (none: no hello, no verb).
     name: Option<String>,
+    /// VUGCOMSCANHOSTDIALECT (SR566): the PumpStart's dialect, handed to the opener (its banner key).
+    dialect: Dialect,
 }
 
 impl PumpDesk {
@@ -770,7 +773,7 @@ impl PumpDesk {
             Some(_) if pump_core::pump::name_verb(d, "").is_some() => Some(self.name_for(port)), // VUGCOMSCANHOSTDESK (SR561)
             _ => None,
         };
-        Ok(StartDue { i, port: port.clone(), hello, name })
+        Ok(StartDue { i, port: port.clone(), hello, name, dialect: d }) // VUGCOMSCANHOSTDIALECT (SR566)
     }
 
     /// PumpStart's handback under the desk lock: the checks again (an arming may have moved while the lock was
@@ -804,34 +807,37 @@ impl PumpDesk {
 
 /// serve_pump's request: PumpStart takes the one open road (the checks under the desk lock, the opener and the hello
 /// with it RELEASED, the handback under it); every other request is applied under the lock.
-fn request(desk: &Mutex<PumpDesk>, ev: &PumpEvent, open: &mut Opener) -> Vec<PumpEvent> {
+async fn request(desk: &Mutex<PumpDesk>, ev: &PumpEvent, open: &mut Box<Opener>) -> Vec<PumpEvent> { // VUGCOMSCANHOSTDIALECT (SR566): async
     if !matches!(ev, PumpEvent::PumpStart { .. }) {
         return match desk.lock() {
-            Ok(mut d) => d.apply(ev, &mut *open),
+            Ok(mut d) => d.apply(ev, &mut **open),
             Err(_) => refused("the pump desk is poisoned"),
         };
     }
-    open_road(desk, open, |d| d.start_due(ev).map(|u| (u.port, u.hello, u.name)), |d, res| d.started(ev, res)) // VUGCOMSCANHOSTDESK (SR561)
+    open_road(desk, open, |d| d.start_due(ev).map(|u| (u.port, u.dialect, u.hello, u.name)), |d, res| d.started(ev, res)) // VUGCOMSCANHOSTDESK (SR561); VUGCOMSCANHOSTDIALECT (SR566)
+        .await
         .unwrap_or_else(|| refused("the pump desk is poisoned"))
 }
 
 /// The one open road (PumpStart and the redial): `due` names the port and the hello under the desk lock (its `Err` the
 /// answers when nothing is to open), the opener (connect, handshake, banner wait) and the hello run with the lock
-/// RELEASED, and `back` takes the answer under the lock. `None`: the desk is poisoned.
-fn open_road(
+/// RELEASED, and `back` takes the answer under the lock. `None`: the desk is poisoned. VUGCOMSCANHOSTDIALECT (SR566): `due`
+/// names the dialect the opener is handed, and the released section runs on tokio's blocking pool ([`open_blocking`]):
+/// the lock is not held across the await, and the handback re-takes it on the runtime thread.
+async fn open_road(
     desk: &Mutex<PumpDesk>,
-    open: &mut Opener,
-    due: impl FnOnce(&PumpDesk) -> Result<(String, Option<(Dialect, Duration)>, Option<String>), Vec<PumpEvent>>, // VUGCOMSCANHOSTDESK (SR561): + the name
+    open: &mut Box<Opener>,
+    due: impl FnOnce(&PumpDesk) -> Result<(String, Dialect, Option<(Dialect, Duration)>, Option<String>), Vec<PumpEvent>>, // VUGCOMSCANHOSTDESK (SR561): + the name; VUGCOMSCANHOSTDIALECT (SR566): + the dialect
     back: impl FnOnce(&mut PumpDesk, Result<(Box<dyn Transport + Send>, Option<String>), String>) -> Vec<PumpEvent>,
 ) -> Option<Vec<PumpEvent>> {
-    let (port, spec, name) = {
+    let (port, dialect, spec, name) = {
         let d = desk.lock().ok()?;
         match due(&*d) {
             Ok(x) => x,
             Err(out) => return Some(out),
         }
     };
-    let res = with_hello_named(open(&port), spec, name); // the desk lock is released here (VUGCOMSCANHOSTDESK SR561: the commission too)
+    let res = open_blocking(open, port, dialect, spec, name).await; // the desk lock is released here (VUGCOMSCANHOSTDESK SR561: the commission too; VUGCOMSCANHOSTDIALECT (SR566): on the blocking pool)
     let mut d = desk.lock().ok()?;
     Some(back(&mut *d, res))
 }
@@ -949,15 +955,12 @@ impl PumpDesk {
     }
 }
 
-/// The dialect the host desk's openers wait for (tcp and ws are grbl-family links; owed VUG-COMSCAN-HOSTDIALECT).
-pub const HOST_DIALECT: Dialect = Dialect::Grbl { laser: false };
-
 /// The host desk's tick (the tests' serve_pump tick).
 pub const PUMP_TICK: Duration = Duration::from_millis(5);
 
 /// THE composition of a desk and its opener: `machine` behind the ports, the identity hook, the hello on at
 /// [`HELLO_WAIT`] (so a first bind commissions), and the opener routed ws / tcp / the rest
-/// (`with_ws(ws, by_scheme(serial, tcp))`).
+/// (`with_ws(ws, by_scheme(serial, tcp))`); no dialect is bound: each open is handed its PumpStart's (VUGCOMSCANHOSTDIALECT, SR566).
 pub fn compose(
     machine: Machine,
     identify: Box<Identify>,
@@ -972,14 +975,15 @@ pub fn compose(
 }
 
 /// [`compose`] over the host's own links: `crate::tty::identify`, the serial port at grbl 1.1's default 115200 with
-/// no flow control, tcp and ws within their connect waits, every opener made ready for [`HOST_DIALECT`].
+/// no flow control, tcp and ws within their connect waits, every opener made ready for the dialect each open is handed
+/// (VUGCOMSCANHOSTDIALECT, SR566).
 pub fn host_parts(machine: Machine) -> (PumpDesk, Box<Opener>) {
     compose(
         machine,
         host_identify(),
         host_serial(),
-        crate::tcp::opener(HOST_DIALECT, crate::tcp::CONNECT_WAIT),
-        crate::ws::opener(HOST_DIALECT, crate::ws::CONNECT_WAIT),
+        crate::tcp::opener(crate::tcp::CONNECT_WAIT), // VUGCOMSCANHOSTDIALECT (SR566)
+        crate::ws::opener(crate::ws::CONNECT_WAIT), // VUGCOMSCANHOSTDIALECT (SR566)
     )
 }
 
@@ -995,12 +999,12 @@ fn host_identify() -> Box<Identify> {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn host_serial() -> Box<Opener> {
-    crate::tty::opener(crate::tty::Baud::B115200, crate::tty::Flow::None, HOST_DIALECT)
+    crate::tty::opener(crate::tty::Baud::B115200, crate::tty::Flow::None) // VUGCOMSCANHOSTDIALECT (SR566)
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn host_serial() -> Box<Opener> {
-    Box::new(|port: &str| -> Result<Box<dyn Transport + Send>, String> { Err(format!("no serial ports on this host: {port}")) })
+    Box::new(|port: &str, _: Dialect| -> Result<Box<dyn Transport + Send>, String> { Err(format!("no serial ports on this host: {port}")) })
 }
 
 /// The machine a vessel's desk declares until one is declared (owed VUG-COMSCAN-MACHINE-DECLARE): no axes, no tools, a
@@ -1020,6 +1024,47 @@ pub fn undeclared_machine() -> Machine {
         stock: None,
         fixtures: Vec::new(),
         loaded: None,
+    }
+}
+
+// --- VUGCOMSCANHOSTDIALECT (LEDGER SR566): the open road's released section on tokio's blocking pool (named tail hunk) ---
+
+/// The open road's released section off the runtime worker: the opener is MOVED into `tokio::task::spawn_blocking` (a
+/// placeholder that refuses by name stands in), called with the port and the dialect it is handed, the hello and the
+/// commission run on its link there, and the opener is moved back from the join. A panicked opener leaves the
+/// placeholder: every later open is refused by name, the arming kept (the handback's refusal).
+async fn open_blocking(
+    open: &mut Box<Opener>,
+    port: String,
+    dialect: Dialect,
+    spec: Option<(Dialect, Duration)>,
+    name: Option<String>,
+) -> Result<(Box<dyn Transport + Send>, Option<String>), String> {
+    let mut op = std::mem::replace(open, opener_lost());
+    let job = tokio::task::spawn_blocking(move || {
+        let res = with_hello_named(op(&port, dialect), spec, name);
+        (op, res)
+    });
+    match job.await {
+        Ok((op, res)) => {
+            *open = op;
+            res
+        }
+        Err(e) => Err(format!("the opener panicked: {e}")),
+    }
+}
+
+/// The opener that stands in while the real one is on the blocking pool, and for good after it panicked.
+fn opener_lost() -> Box<Opener> {
+    Box::new(|port: &str, _: Dialect| -> Result<Box<dyn Transport + Send>, String> {
+        Err(format!("the opener panicked; {port} not opened"))
+    })
+}
+
+impl PumpDesk {
+    /// The running pump's dialect (the redial hands it to the opener).
+    fn running_dialect(&self) -> Option<Dialect> {
+        self.running.as_ref().map(|r| r.pump.dialect())
     }
 }
 
@@ -1167,7 +1212,7 @@ mod tests {
         let p = program();
         let mock = Shared(Arc::new(Mutex::new(MockGrbl::new(2))));
         let m2 = mock.clone();
-        let mut open = move |port: &str| -> Result<Box<dyn Transport + Send>, String> {
+        let mut open = move |port: &str, _: Dialect| -> Result<Box<dyn Transport + Send>, String> {
             if port == "mock" { Ok(Box::new(m2.clone())) } else { Err("no such port".to_string()) }
         };
         let mut desk = PumpDesk::new(machine());
@@ -1222,7 +1267,7 @@ mod tests {
         let p = program();
         let mock = Shared(Arc::new(Mutex::new(MockGrbl::new(5))));
         let m2 = mock.clone();
-        let mut open = move |_: &str| -> Result<Box<dyn Transport + Send>, String> { Ok(Box::new(m2.clone())) };
+        let mut open = move |_: &str, _: Dialect| -> Result<Box<dyn Transport + Send>, String> { Ok(Box::new(m2.clone())) };
         let mut desk = PumpDesk::new(machine());
         assert_eq!(why(&desk.apply(&PumpEvent::PumpHold { principal: who() }, &mut open)), "nothing is streaming");
         let d = desk.arm(&pass(&p), &p, GRBL).unwrap();
@@ -1259,7 +1304,7 @@ mod tests {
         let rx = syn.subscribe();
         let mut watch = syn.subscribe();
         let desk = Arc::new(Mutex::new(PumpDesk::new(machine())));
-        let open: Box<Opener> = Box::new(|_: &str| -> Result<Box<dyn Transport + Send>, String> { Err("none".to_string()) });
+        let open: Box<Opener> = Box::new(|_: &str, _: Dialect| -> Result<Box<dyn Transport + Send>, String> { Err("none".to_string()) });
         let task = tokio::spawn(serve_pump(syn.clone(), rx, desk, open, Duration::from_millis(5)));
         syn.fire(SMessage::Pump(PumpEvent::PumpStop { principal: who() }));
         let got = tokio::time::timeout(Duration::from_secs(5), async {
@@ -1307,8 +1352,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn the_bus_start_opens_and_says_hello_with_the_desk_lock_released() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)] // VUGCOMSCANHOSTDIALECT (SR566): request is async
+    async fn the_bus_start_opens_and_says_hello_with_the_desk_lock_released() {
         let p = program();
         let desk = Arc::new(Mutex::new(PumpDesk::new(machine())));
         let digest = {
@@ -1319,11 +1364,11 @@ mod tests {
         let seen: Arc<Mutex<Vec<bool>>> = Arc::new(Mutex::new(Vec::new()));
         let mock = Shared(Arc::new(Mutex::new(MockGrbl::new(2))));
         let (weak, probe_seen) = (Arc::downgrade(&desk), seen.clone());
-        let mut open: Box<Opener> = Box::new(move |_: &str| -> Result<Box<dyn Transport + Send>, String> {
+        let mut open: Box<Opener> = Box::new(move |_: &str, _: Dialect| -> Result<Box<dyn Transport + Send>, String> {
             probe_seen.lock().unwrap().push(free_now(&weak));
             Ok(Box::new(Probe { link: mock.clone(), desk: weak.clone(), seen: probe_seen.clone() }))
         });
-        let out = request(&desk, &start_msg(digest, "grbl"), &mut *open);
+        let out = request(&desk, &start_msg(digest, "grbl"), &mut open).await; // the open on the blocking pool
         assert!(matches!(&out[..], [PumpEvent::Squawk { event: Some(e), .. }, ..] if e == "started"), "{out:?}");
         let probed = seen.lock().unwrap().clone();
         assert!(probed.len() >= 2, "the open and the hello's $I write were probed: {probed:?}");
@@ -1333,7 +1378,7 @@ mod tests {
         // Control: the probe sees a held lock.
         {
             let _held = desk.lock().unwrap();
-            let _ = open("mock");
+            let _ = open("mock", GRBL);
         }
         assert_eq!(seen.lock().unwrap().last(), Some(&false), "the probe reads a held lock as held");
     }
@@ -1347,21 +1392,21 @@ mod tests {
         assert!(desk.identify.is_some(), "the identity hook is set");
         assert_eq!(desk.hello_spec_for(GRBL), Some((GRBL, HELLO_WAIT)), "the hello is on, so a first bind commissions");
         assert_eq!(desk.machine(), &machine());
-        assert!(why(open("wss://127.0.0.1:1/")).contains("VUG-COMSCAN-WSS"), "wss:// goes to the ws arm");
+        assert!(why(open("wss://127.0.0.1:1/", GRBL)).contains("VUG-COMSCAN-WSS"), "wss:// goes to the ws arm");
         if cfg!(target_os = "linux") {
-            let e = why(open("/dev/comscan-hostdesk-no-such-port"));
+            let e = why(open("/dev/comscan-hostdesk-no-such-port", GRBL));
             assert!(e.starts_with("no such port"), "a /dev path goes to the tty arm: {e}");
         }
 
         let arm = |name: &'static str| -> Box<Opener> {
-            Box::new(move |port: &str| -> Result<Box<dyn Transport + Send>, String> { Err(format!("{name} {port}")) })
+            Box::new(move |port: &str, _: Dialect| -> Result<Box<dyn Transport + Send>, String> { Err(format!("{name} {port}")) })
         };
         let (d, mut open) = compose(machine(), Box::new(|_: &str| -> Option<String> { None }), arm("serial"), arm("tcp"), arm("ws"));
         assert_eq!(d.hello_spec_for(GRBL), desk.hello_spec_for(GRBL));
-        assert_eq!(why(open("ws://h:81/")), "ws ws://h:81/");
-        assert_eq!(why(open("wss://h:443/")), "ws wss://h:443/");
-        assert_eq!(why(open("tcp://h:23")), "tcp tcp://h:23");
-        assert_eq!(why(open("/dev/ttyUSB0")), "serial /dev/ttyUSB0");
+        assert_eq!(why(open("ws://h:81/", GRBL)), "ws ws://h:81/");
+        assert_eq!(why(open("wss://h:443/", GRBL)), "ws wss://h:443/");
+        assert_eq!(why(open("tcp://h:23", GRBL)), "tcp tcp://h:23");
+        assert_eq!(why(open("/dev/ttyUSB0", GRBL)), "serial /dev/ttyUSB0");
 
         assert_eq!(commission_name(Some("tty:usb:0403:6001:a50285bi"), "/dev/ttyUSB0", 1), "UNA-A50285BI");
         assert_eq!(commission_name(Some("tty:usb:2341:0043:7573530303035161D0A1"), "/dev/ttyACM0", 1), "UNA-5161D0A1");
