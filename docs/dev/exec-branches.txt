@@ -1389,12 +1389,12 @@ exec-rmbp-vugintentsinglerenamed 07d28b882 wave36 cut54
 exec-rmbp-vugfacejournalfaultfix 07d28b882 wave36 cut54
 exec-rmbp-vugcomscanjogface 07d28b882 wave36 cut54
 exec-rmbp-vugscantsdfedgesubpixel 07d28b882 wave36 cut54
-exec-rmbp-f39settingskeysprobe 853d303c4 wave36 cut55
-exec-rmbp-f39veilreduceface 853d303c4 wave36 cut55
-exec-rmbp-f39veilheldrepref 853d303c4 wave36 cut55
-exec-rmbp-f39jobsinlinearm 853d303c4 wave36 cut55
-exec-rmbp-f39shimbeampan 853d303c4 wave36 cut55
-exec-rmbp-f39unafsexecmeasure 853d303c4 wave36 cut55
+exec-rmbp-f39settingskeysprobe 734515b23 FOLDED (kernel batch B1133-B1138)
+exec-rmbp-f39veilreduceface 00c1c6a75 FOLDED (kernel batch B1133-B1138)
+exec-rmbp-f39veilheldrepref 853d303c4 wave36 cut55 FOLDED (kernel batch B1133-B1138)
+exec-rmbp-f39jobsinlinearm 8aaf81ec7 FOLDED (kernel batch B1133-B1138)
+exec-rmbp-f39shimbeampan dacec6e5e FOLDED (kernel batch B1133-B1138)
+exec-rmbp-f39unafsexecmeasure e7aa71e53 FOLDED (kernel batch B1133-B1138)
 exec-rmbp-vugphotocropmeta 421605443 wave36 cut55
 exec-rmbp-vugintentsetfacescroll 421605443 wave36 cut55
 exec-rmbp-vugfacejournalfaultfixmany 421605443 wave36 cut55
