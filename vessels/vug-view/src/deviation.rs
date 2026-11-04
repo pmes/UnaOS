@@ -60,6 +60,9 @@ pub struct Map {
     pub datums: Option<[u32; 3]>,
     /// VUGFACEGDTREMEASURE (SR560): the datum frame position reads in, or its refusal on a re-measure ([`reframe`]).
     pub frame: Option<Result<scan_core::gdt::DatumFrame, String>>,
+    /// VUGFACEDEVIATIONSOLIDFAULT (SR565): the replay failures no solid reads (an Op, an unnamed sketch), counted and
+    /// named on the corner ([`fault_lines`]); a failure a solid reads refuses the design instead ([`design`]).
+    pub faults: Vec<doc_core::Failure>,
 }
 
 /// A scan mesh read from a file (a PLY carries no normals, no confidence and no intrinsics): mesh_core's
@@ -72,17 +75,21 @@ pub fn scan_mesh(mesh: Mesh) -> ScanMesh {
     ScanMesh { mesh, normals, confidence, intrinsics: Intrinsics::from_rect_params(0, 0, [0.0; 4]), frames: 0 }
 }
 
-/// The design of `doc` as tools/scan builds it: doc_core `replay`, the first failure refused by line, no solid
-/// refused, every live solid (journal.rs live_solids) through scan_core's `design_of`.
-pub fn design(doc: &Doc) -> Result<(Design, Vec<String>), String> {
+/// The design of `doc` as tools/scan builds it: doc_core `replay`, the first failure on a statement a solid reads
+/// (journal.rs solid_stmts) refused by line, no solid refused, every live solid (journal.rs live_solids) through
+/// scan_core's `design_of`; VUGFACEDEVIATIONSOLIDFAULT (SR565): every other failure (an Op, an unnamed sketch) is
+/// returned, counted on the corner ([`fault_lines`]), and the design still measures.
+pub fn design(doc: &Doc) -> Result<(Design, Vec<String>, Vec<doc_core::Failure>), String> {
     let rp = doc_core::replay(doc, doc.tol);
-    if let Some(f) = rp.failures.first() {
-        return Err(format!("line {}: {:?} {}", f.line, f.fault, f.id));
+    let (on_solid, faults) = split_faults(doc, rp.failures);
+    if let Some(f) = on_solid.first() {
+        return Err(fault_text(f));
     }
     if rp.solids.is_empty() {
         return Err("DesignEmpty".into());
     }
-    design_of(live_of(doc, &rp.solids), doc.tol).map_err(|e| format!("{e:?}")) // VUGFACEDEVIATIONLIVE (SR558): the live solids only, never a fillet's on solid beside it
+    let (design, names) = design_of(live_of(doc, &rp.solids), doc.tol).map_err(|e| format!("{e:?}"))?; // VUGFACEDEVIATIONLIVE (SR558): the live solids only, never a fillet's on solid beside it
+    Ok((design, names, faults))
 }
 
 /// The per-channel mean of three `0x00RRGGBB` colours.
@@ -98,7 +105,7 @@ fn mean3(a: u32, b: u32, c: u32) -> u32 {
 /// read on a refusal) and the map, its gdt read at the edge margin `margin_mm` (VUGFACEGDTREMEASURE SR560). A design
 /// that does not build refuses the whole open (`Err`); a registration refusal is the map's (`Map::result`), shown by name.
 pub fn open(scan: &ScanMesh, doc: &Doc, band_mm: f64, margin_mm: f64) -> Result<(Model, Map), String> {
-    let (design, names) = design(doc)?;
+    let (design, names, faults) = design(doc)?; // VUGFACEDEVIATIONSOLIDFAULT (SR565): the faults no solid reads
     let result = measure(scan, &design, Transform::IDENTITY, &AlignParams::DEFAULT, band_mm, Tol::DEFAULT);
     let (positions, vertex): (Vec<_>, Vec<u32>) = match &result {
         Ok(d) => (
@@ -116,13 +123,13 @@ pub fn open(scan: &ScanMesh, doc: &Doc, band_mm: f64, margin_mm: f64) -> Result<
     };
     let model = Model::from_mesh(mesh)?;
     let on = result.is_ok();
-    let mut map = Map { on, band_mm, names, gdt: Vec::new(), result, vertex, tri, pick: None, source: None, callouts: Vec::new(), margin_mm, basis: std::sync::Arc::new((scan.clone(), design)), datums: None, frame: None }; reframe(&mut map); Ok((model, map)) // VUGFACEDEVIATIONJOURNAL (SR550) + VUGFACEGDT (SR553): no source, no callouts yet; VUGFACEGDTREMEASURE (SR560): the gdt read once per build through reframe
+    let mut map = Map { on, band_mm, names, gdt: Vec::new(), result, vertex, tri, pick: None, source: None, callouts: Vec::new(), margin_mm, basis: std::sync::Arc::new((scan.clone(), design)), datums: None, frame: None, faults }; reframe(&mut map); Ok((model, map)) // VUGFACEDEVIATIONJOURNAL (SR550) + VUGFACEGDT (SR553): no source, no callouts yet; VUGFACEGDTREMEASURE (SR560): the gdt read once per build through reframe
 }
 
 /// The corner's lines: the statistics and the worst [`WORST`] faces (matched ones, by rms) with their signed mean, or
 /// the refusal by name.
 pub fn corner(map: &Map) -> Vec<String> {
-    let mut out = measured(map); out.extend(source_line(map)); out // VUGFACEDEVIATIONJOURNAL (SR550): the journal's line last
+    let mut out = measured(map); out.extend(fault_lines(map)); out.extend(source_line(map)); out // VUGFACEDEVIATIONJOURNAL (SR550): the journal's line last; VUGFACEDEVIATIONSOLIDFAULT (SR565): the faults before it
 }
 
 /// The corner's measured lines: the pick's, the statistics and the worst faces, or the refusal by name.
@@ -313,7 +320,7 @@ fn show(view: &mut View) {
 fn source_line(map: &Map) -> Option<String> {
     let s = map.source.as_ref()?;
     Some(match &s.refused {
-        None => format!("design=journal@{} solids={}", s.generation, crate::journal::live_solids(&s.doc).len()), // VUGFACEDEVIATIONLIVE (SR558): the measured design's solid count
+        None => format!("design=journal@{} solids={}{}", s.generation, crate::journal::live_solids(&s.doc).len(), fault_count(map)), // VUGFACEDEVIATIONLIVE (SR558): the measured design's solid count; VUGFACEDEVIATIONSOLIDFAULT (SR565): ` faults=<m>` when any
         Some(why) => format!("design=journal@{} refused {why} map@{}", s.generation, s.measured),
     })
 }
@@ -500,7 +507,7 @@ fn lazy(v: &mut Viewer) {
         return;
     }
     src.doc = doc.clone();
-    show(&mut v.view);
+    refault(&mut v.view); show(&mut v.view); // VUGFACEDEVIATIONSOLIDFAULT (SR565): an Op or an unnamed sketch moves the fault count, never the measurement
 }
 
 // ---- VUGFACEGDTREMEASURE (LEDGER SR560): the callouts and the datum frame follow a re-measure ----
@@ -618,4 +625,46 @@ fn frame_line(map: &Map) -> Option<String> {
         (Some(Err(why)), _) => Some(format!("frame refused {why}")),
         _ => None,
     }
+}
+
+// ---- VUGFACEDEVIATIONSOLIDFAULT (LEDGER SR565): a replay failure no solid reads does not refuse the map ----
+// doc_core `replay` keeps going past a failure (each by line, every solid it could build kept). [`design`] refuses only
+// on a failure whose statement journal.rs `solid_stmts` holds (THE "feeds a solid" rule [`follow`] already reads): a
+// solid missing from the design would paint the scan's own surface as deviation, a broken document read as a bad part.
+// Every other failure is kept on the map, named on the corner (`fault line N: <fault> <id>`) and counted
+// (` faults=<m>` on the journal's line, a `faults=<m>` line on a path map); [`lazy`] recounts without a re-measure.
+
+/// `failures` split into (those on a statement a solid reads, the rest), each in replay's (line) order. A failure with
+/// no id counts as a solid's.
+fn split_faults(doc: &Doc, failures: Vec<doc_core::Failure>) -> (Vec<doc_core::Failure>, Vec<doc_core::Failure>) {
+    let solid = crate::journal::solid_stmts(doc);
+    failures.into_iter().partition(|f| f.id.is_empty() || solid.iter().any(|s| s.id() == Some(f.id.as_str())))
+}
+
+/// A failure as the refusal names it: `line N: <fault> <id>`.
+fn fault_text(f: &doc_core::Failure) -> String {
+    format!("line {}: {:?} {}", f.line, f.fault, f.id)
+}
+
+/// ` faults=<m>` when the map stood beside any failure, else nothing (the journal line's tail).
+fn fault_count(map: &Map) -> String {
+    if map.faults.is_empty() { String::new() } else { format!(" faults={}", map.faults.len()) }
+}
+
+/// The corner's fault lines: `fault <line N: fault id>` for the first [`WORST`], then `faults=<m>` on a path map (a
+/// journal map carries the count on its source line). None without a failure.
+fn fault_lines(map: &Map) -> Vec<String> {
+    let mut out: Vec<String> = map.faults.iter().take(WORST).map(|f| format!("fault {}", fault_text(f))).collect();
+    if map.source.is_none() && !map.faults.is_empty() {
+        out.push(format!("faults={}", map.faults.len()));
+    }
+    out
+}
+
+/// The journal map's faults re-read from the journal's document (one replay, no measurement): the failures no solid
+/// reads. Called by [`lazy`], where no solid statement moved.
+fn refault(view: &mut View) {
+    let doc = &view.design.journal.doc;
+    let Some(m) = view.deviation.as_mut() else { return };
+    m.faults = split_faults(doc, doc_core::replay(doc, doc.tol).failures).1;
 }
