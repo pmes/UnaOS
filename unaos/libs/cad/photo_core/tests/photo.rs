@@ -722,6 +722,66 @@ fn a_thin_side_off_the_lattice_is_kept() {
     let img = pixel_core::decode(&fixture::shim_png(&s)).expect("pixel_core decodes the shim PNG");
     let m = measure(&img, PhotoParams::new(5.0), Tol::DEFAULT).expect("the shim photo measures");
     let pts: Vec<Vec2> = m.loops[0].iter().map(|&p| to_part(&m, p)).collect();
+    // VUGPHOTOSIDETHIN (SR651) diagnostic: the grid the measurement sees, through the public steps (the flat road; k1 below).
+    {
+        use photo_core::{edges, grid, homography};
+        let gray = edges::luma(&img).expect("luma");
+        let el = edges::edgels(&gray);
+        let lines = grid::hough_lines(&el, gray.w, gray.h);
+        let g = grid::find(&el, gray.w, gray.h).expect("grid");
+        let lat = homography::fit_lattice(&g, 5.0, gray.w, gray.h).expect("lattice");
+        let hi = homography::invert(&lat.h).expect("H inverts");
+        let wmm = g.width_px / lat.px_per_mm;
+        let paper = |q: Vec2| apply(&hi, q).unwrap_or(Vec2::new(f64::NAN, f64::NAN));
+        let off = g.pairs.iter().filter(|p| photo_core::off_lattice(p, &hi, 5.0, wmm)).count();
+        eprintln!("diag: k1={:.4} edge_lines={} pairs={} off_pairs={} width_mm={:.3} min_votes={}", m.k1, lines.len(), g.pairs.len(), off, wmm, (gray.w.min(gray.h) / 8).max(8));
+        for p in &g.pairs {
+            let (t0, t1) = (p.support[0], p.support[p.support.len() - 1]);
+            let (a, b) = (paper(p.point + p.dir * t0), paper(p.point + p.dir * t1));
+            eprintln!("diag pair: paper ({:.2},{:.2})-({:.2},{:.2}) width_px={:.2} support={} off={}", a.x, a.y, b.x, b.y, p.width_px, p.support.len(), photo_core::off_lattice(p, &hi, 5.0, wmm));
+        }
+        let r = (g.pitch_px / 5.0).round().clamp(4.0, 20.0);
+        let sil = photo_core::silhouette::extract(&gray, &lat, 5.0, wmm, r).expect("silhouette");
+        let before = sil.part.iter().filter(|&&p| p).count();
+        let after = photo_core::thin_sides(sil.clone(), &gray, &lat, &g.pairs, 5.0, wmm).map(|t| t.part.iter().filter(|&&p| p).count());
+        eprintln!("diag sil: r={r} threshold={} part_before={before} part_after={after:?} w={} h={}", sil.threshold, sil.w, sil.h);
+        for pr in g.pairs.iter().filter(|p| photo_core::off_lattice(p, &hi, 5.0, wmm)) {
+            let n = pr.support.len();
+            eprintln!("diag off pair: point=({:.1},{:.1}) dir=({:.3},{:.3}) width_px={:.2} support q0={:.1} q25={:.1} q50={:.1} q75={:.1} q100={:.1}", pr.point.x, pr.point.y, pr.dir.x, pr.dir.y, pr.width_px, pr.support[0], pr.support[n / 4], pr.support[n / 2], pr.support[3 * n / 4], pr.support[n - 1]);
+            let gaps: Vec<String> = pr.support.windows(2).filter(|w| w[1] - w[0] > 2.0).map(|w| format!("{:.1}..{:.1}", w[0], w[1])).collect();
+            eprintln!("diag gaps>2px: {}", gaps.join(" "));
+            for k in 0..=24 {
+                let t = 108.0 + k as f64;
+                let q = pr.point + pr.dir * t;
+                let pp = paper(q);
+                let (u, v) = (((pp.x - sil.x0) * sil.r) as i64, ((pp.y - sil.y0) * sil.r) as i64);
+                let at = |du: i64, dv: i64| -> char {
+                    let (uu, vv) = (u + du, v + dv);
+                    if uu < 0 || vv < 0 || uu as usize >= sil.w || vv as usize >= sil.h { return '?' }
+                    let i = vv as usize * sil.w + uu as usize;
+                    if sil.part[i] { 'P' } else if sil.hole[i] != 0 { 'H' } else { '.' }
+                };
+                let nb: String = (-1..=1).flat_map(|dv| (-1..=1).map(move |du| (du, dv))).map(|(du, dv)| at(du, dv)).collect();
+                eprintln!("diag joint: t={t:.0} rect=({u},{v}) luma={:?} part3x3={nb}", gray.sample(q.x, q.y));
+            }
+            for k in 0..=24 {
+                let y = fixture::SHIM_Y - 1.5 + k as f64 * 0.125;
+                let q = apply(&fixture::homography(&s), fixture::part_to_paper(&s, Vec2::new(-10.0, y))).expect("q");
+                let pp = paper(q);
+                let (u, v) = (((pp.x - sil.x0) * sil.r) as i64, ((pp.y - sil.y0) * sil.r) as i64);
+                let part = u >= 0 && v >= 0 && (u as usize) < sil.w && (v as usize) < sil.h && sil.part[v as usize * sil.w + u as usize];
+                let d = q - pr.point;
+                eprintln!("diag x-sec: part_y={y:.3} px=({:.1},{:.1}) luma={:?} perp={:.2} t={:.1} rect=({u},{v}) part={part}", q.x, q.y, gray.sample(q.x, q.y), d.dot(pr.dir.perp()), d.dot(pr.dir));
+            }
+        }
+        let shim_px = (apply(&fixture::homography(&s), fixture::part_to_paper(&s, Vec2::new(-10.0, fixture::SHIM_Y))).expect("shim"), fixture::homography(&s));
+        for l in &lines {
+            let d = (l.n.dot(shim_px.0) - l.rho).abs();
+            if d < 25.0 {
+                eprintln!("diag line near shim: n=({:.3},{:.3}) rho={:.1} dist_px={:.2} support={}", l.n.x, l.n.y, l.rho, d, l.pts.len());
+            }
+        }
+    }
     let tab: Vec<Vec2> = pts.iter().copied().filter(|q| q.x < -1.0).collect();
     let band = fit::BAND_SIGMA * m.sigma_mm;
     assert!(tab.len() >= 2, "no shim vertices in the loop: {pts:?}");

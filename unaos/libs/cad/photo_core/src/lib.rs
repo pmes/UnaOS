@@ -667,14 +667,34 @@ pub fn xmp_crop(packet: &str) -> Option<alloc::string::String> {
 /// The band's margin about a pair (photo px): the edge lines sit at the blurred edge's half height (the fixture's 3 px box).
 const BLUR_PX: f64 = 1.5;
 
-/// The pair's support ends (photo px): `point + dir · t` at its first and last edge parameter.
+/// The pair's dense run along `dir`: the longest stretch of its sorted support with no gap wider than the pair's own
+/// `width_px`. Not its first / last edgel: `grid` refines each edge line over every agreeing edgel on the infinite line,
+/// so a short side's support carries stray collinear edgels from across the sheet (measured on the shim fixture: 396
+/// edgels spanning 95 mm for a 20 mm shim).
+fn pair_run(pair: &grid::GridLine) -> Option<(f64, f64)> {
+    let s = &pair.support;
+    let first = *s.first()?;
+    let (mut best, mut start, mut prev) = ((first, first), first, first);
+    for &t in &s[1..] {
+        if t - prev > pair.width_px {
+            start = t;
+        }
+        prev = t;
+        if prev - start > best.1 - best.0 {
+            best = (start, prev);
+        }
+    }
+    Some(best)
+}
+
+/// The pair's dense run's ends (photo px): `point + dir · t` at the run's first and last parameter.
 fn pair_ends(pair: &grid::GridLine) -> Option<(Vec2, Vec2)> {
-    let (t0, t1) = (*pair.support.first()?, *pair.support.last()?);
+    let (t0, t1) = pair_run(pair)?;
     Some((pair.point + pair.dir * t0, pair.point + pair.dir * t1))
 }
 
 /// Whether a stroke pair is off every lattice line by more than `width_mm`: its support ends through `h_inv` (photo px to
-/// lattice paper mm), the coordinate across the nearer-parallel family, and no `k · pitch` in [min − width, max + width].
+/// lattice paper mm; the dense run's, `pair_run`), the coordinate across the nearer-parallel family, and no `k · pitch` in [min − width, max + width].
 pub fn off_lattice(pair: &grid::GridLine, h_inv: &homography::H, pitch: f64, width_mm: f64) -> bool {
     let Some((e0, e1)) = pair_ends(pair) else { return false };
     let (Some(p0), Some(p1)) = (homography::apply(h_inv, e0), homography::apply(h_inv, e1)) else { return false };
@@ -689,7 +709,8 @@ pub fn off_lattice(pair: &grid::GridLine, h_inv: &homography::H, pitch: f64, wid
 
 /// The silhouette with each off-lattice pair's dark band put back where it connects to the part: a rectified pixel that
 /// is dark (at or under the silhouette's Otsu threshold), in the photo with its 8 neighbours, off the border, not a hole,
-/// and within width / 2 + [`BLUR_PX`] of an off pair's centre line along its support; kept when `silhouette::label`
+/// and within width / 2 + [`BLUR_PX`] of an off pair's centre line along its dense run widened by the pair's width at
+/// each end (a side's edges turn over its own width at a corner, so its edgels stop that far short of the body); kept when `silhouette::label`
 /// (8-connected) puts it in the part's component. [`Refusal::PartClipped`] when a kept pixel is on the border.
 pub fn thin_sides(
     sil: silhouette::Silhouette,
@@ -712,10 +733,10 @@ pub fn thin_sides(
     };
     let in_band = |q: Vec2| -> bool {
         off.iter().any(|pr| {
-            let (Some(&t0), Some(&t1)) = (pr.support.first(), pr.support.last()) else { return false };
+            let Some((t0, t1)) = pair_run(pr) else { return false };
             let d = q - pr.point;
             let t = d.dot(pr.dir);
-            d.dot(pr.dir.perp()).abs() <= 0.5 * pr.width_px + BLUR_PX && t >= t0 - BLUR_PX && t <= t1 + BLUR_PX
+            d.dot(pr.dir.perp()).abs() <= 0.5 * pr.width_px + BLUR_PX && t >= t0 - pr.width_px && t <= t1 + pr.width_px
         })
     };
     let mut mask = sil.part.clone();
