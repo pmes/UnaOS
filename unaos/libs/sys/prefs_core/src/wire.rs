@@ -14,6 +14,7 @@
 //! | GET 16 | `<ns>.<key>` | the value as a TOML literal; -ENOENT unset; -EINVAL malformed |
 //! | SET 17 | `<ns>.<key>` NUL `<literal>` | empty when stored as sent; `<stored literal>` NUL `clamped=true` when the schema clamped it; -EACCES outside the session; -EINVAL malformed or refused by the schema; -EIO collision / save failed or held |
 //! | LIST 18 | `<ns>` or empty (every namespace) | `<ns>.<key> = <literal>\n` lines, sorted; -E2BIG past [`BODY_MAX`] |
+//! | UNSET 29 | `<ns>.<key>` | [`unset_body`] when a value left the store; -ENOENT unset already; -EACCES outside the session or past SET's capability; -EINVAL malformed; -EIO the write (PREFS-UNSET-BUS, B1166) |
 //!
 //! The SET reply's clamp form is new with PRINCIPIA2: an unclamped SET still answers an EMPTY body, byte
 //! for byte the kernel's B300 reply, so a caller that ignores the body is unchanged. PREFSKERNEL (B345):
@@ -42,6 +43,8 @@ pub const VERB_LIST: u8 = 18;
 pub const VERB_CHANGED: u8 = 19;
 /// SETTINGSFILES (B407, R98): a program declares its `app.<name>.*` stanza (body: [`crate::declare::body`]).
 pub const VERB_DECLARE: u8 = 23; // merge17: 20..=22 are DIALOG2 verbs (una_abi::BUS_VERB_PREF_DECLARE)
+/// PREFS-UNSET-BUS (B1166): a key leaves the store (body: the GET address; una_abi::BUS_VERB_PREF_UNSET).
+pub const VERB_UNSET: u8 = 29;
 /// una-abi `BUS_BODY_MAX`: the reply ceiling.
 pub const BODY_MAX: usize = 4096;
 
@@ -78,6 +81,12 @@ pub trait Store {
     /// SETTINGSFILES (B407): adopt a program's declared stanza. A store with no `app` registry refuses.
     fn declare(&mut self, _name: &str, _keys: Vec<crate::declare::DeclKey>) -> i64 {
         EINVAL
+    }
+    /// PREFS-UNSET-BUS (B1166): remove `ns`/`key` and persist (`Ok(true)` = a value left the store, `Ok(false)` = unset
+    /// already, nothing written). The store's OWN removal only — the capability and the reply are [`unset_as`]'s. A store
+    /// with no removal refuses (-EIO).
+    fn unset(&mut self, _ns: &str, _key: &str) -> Result<bool, SetFail> {
+        Err(SetFail::Io)
     }
 }
 
@@ -245,7 +254,34 @@ pub fn fulfil_as(store: &mut dyn Store, verb: u8, body: &[u8], in_session: bool,
             Some(_) => EACCES,
             None => EINVAL,
         },
+        VERB_UNSET => match parse_get(body) {
+            Some((ns, k)) => match unset_as(store, ns, k, in_session, caller) {
+                Ok(b) => {
+                    out.extend_from_slice(&b);
+                    0
+                }
+                Err(st) => st,
+            },
+            None => EINVAL,
+        }, // PREFS-UNSET-BUS (B1166)
         _ => EINVAL,
+    }
+}
+
+/// PREFS-UNSET-BUS (B1166): THE unset after the address, both rings' (the UNSET arm of [`fulfil_as`], and Principia's
+/// typed `PrefUnset` road, which enters with `(ns, key)`). SET's gate first — -EACCES outside the session or past
+/// [`crate::cap::may_set`] (a caller unsets only what it may set), the store untouched — then [`Store::unset`]:
+/// `Ok(`[`unset_body`]`)` (the reply, and the PREF_CHANGED (19) body the store's transport posts) when a value left the
+/// store, -ENOENT unset already, -EIO a malformed name or the write.
+pub fn unset_as(store: &mut dyn Store, ns: &str, k: &str, in_session: bool, caller: Caller) -> Result<Vec<u8>, i64> {
+    if !in_session || !crate::cap::may_set(caller, ns, k) {
+        return Err(EACCES);
+    }
+    match store.unset(ns, k) {
+        Ok(true) => Ok(unset_body(ns, k)),
+        Ok(false) => Err(ENOENT),
+        Err(SetFail::Refused(_)) => Err(EINVAL),
+        Err(SetFail::Name(_)) | Err(SetFail::Io) => Err(EIO),
     }
 }
 
@@ -318,6 +354,10 @@ impl Store for TreeStore {
     }
     fn namespaces(&self) -> Vec<String> {
         self.0.namespaces().into_iter().map(String::from).collect()
+    }
+    /// PREFS-UNSET-BUS (B1166): the tree's own removal (a save that cannot fail).
+    fn unset(&mut self, ns: &str, key: &str) -> Result<bool, SetFail> {
+        Ok(self.0.remove(ns, key).is_some())
     }
 }
 
@@ -493,6 +533,35 @@ system.trackpad.three_finger_drag = false\n";
         assert_eq!(parse_changed(b"system.display.wallpaper\x00\"\""), Some(("system", "display.wallpaper", Some(PrefValue::Str("".into())), false)));
     }
 
+    /// PREFS-UNSET-BUS (B1166): the UNSET request — frozen bytes (the reply IS SR169's unset form), the statuses in SET's
+    /// order, and SET's capability: a program unsets its own stanza and is refused another's key, which stays.
+    #[test]
+    fn kat_unset_request() {
+        assert_eq!(VERB_UNSET, 29);
+        let mut s = TreeStore::default();
+        assert_eq!(run(&mut s, VERB_SET, b"system.display.brightness\x009", true), (0, Vec::new()));
+        assert_eq!(run(&mut s, VERB_UNSET, b"system.display.brightness", false), (EACCES, Vec::new()), "outside the session");
+        assert_eq!(run(&mut s, VERB_GET, b"system.display.brightness", true), (0, b"9".to_vec()), "a refusal touches nothing");
+        let (st, body) = run(&mut s, VERB_UNSET, b"system.display.brightness", true);
+        assert_eq!((st, body.as_slice()), (0, b"system.display.brightness\x00".as_slice()));
+        assert_eq!(body, unset_body("system", "display.brightness"));
+        assert_eq!(parse_changed(&body), Some(("system", "display.brightness", None, false)));
+        assert_eq!(run(&mut s, VERB_GET, b"system.display.brightness", true), (ENOENT, Vec::new()));
+        assert_eq!(run(&mut s, VERB_UNSET, b"system.display.brightness", true), (ENOENT, Vec::new()), "unset already");
+        assert_eq!(run(&mut s, VERB_UNSET, b"system", true), (EINVAL, Vec::new()), "a bare namespace");
+        assert_eq!(run(&mut s, VERB_UNSET, b"system.display.brightness\x009", true), (EINVAL, Vec::new()), "a SET body");
+        // SET's capability: lumen unsets its own stanza; vein's endpoint is refused and kept.
+        let l = Caller::Program("lumen");
+        let mut o = Vec::new();
+        assert_eq!(fulfil_as(&mut s, VERB_SET, b"app.lumen.window.frame\x00\"1,2,3,4\"", true, l, &mut o), 0);
+        assert_eq!(run(&mut s, VERB_SET, b"vein.endpoint\x00\"https://api.example/\"", true).0, 0);
+        assert_eq!(fulfil_as(&mut s, VERB_UNSET, b"vein.endpoint", true, l, &mut o), EACCES);
+        assert!(o.is_empty() && s.get("vein", "endpoint").is_some(), "a refusal touches nothing");
+        assert_eq!(fulfil_as(&mut s, VERB_UNSET, b"app.lumen.window.frame", true, l, &mut o), 0);
+        assert_eq!(o, b"app.lumen.window.frame\x00".to_vec());
+        assert_eq!(s.get("app", "lumen.window.frame"), None);
+    }
+
     #[test]
     fn kat_changed_body() {
         assert_eq!(changed_body("system", "display.brightness", &PrefValue::Int(1)), b"system.display.brightness\x001".to_vec());
@@ -528,6 +597,9 @@ mod secreview_fuzz {
         }
         fn declare(&mut self, name: &str, keys: Vec<declare::DeclKey>) -> i64 {
             declare::insert(&mut self.1, name, keys)
+        }
+        fn unset(&mut self, ns: &str, k: &str) -> Result<bool, SetFail> {
+            self.0.unset(ns, k) // PREFS-UNSET-BUS (B1166)
         }
     }
 

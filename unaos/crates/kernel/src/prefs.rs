@@ -201,9 +201,9 @@ fn ensure_dirs() {
     use crate::fs::vfs::NodeKind;
     let mt = store_mt();
     let d = path();
-    if mt.stat(&d).is_err() {
+    if lay_machine_dir(&mt, &d, "save").is_none() && mt.stat(&d).is_err() { // MACHINESTOREONELAY (rmbp-ledger B1167): the no-session folder is laid and stamped by the ONE lay (file tail; was MACHINESTOREACL B1150's own create + stamp); a home's folder keeps this create. Named in-place hunk
         let _ = mt.create(&d, NodeKind::Dir, crate::fs::vfs::KERNEL_PRINCIPAL);
-    } crate::fs::rootacl::stamp_store(&mt, &d); // MACHINESTOREACL (rmbp-ledger B1150): the no-session folder takes ROOTACL's `system` row (fs/rootacl.rs tail); a home's folder is left alone. LINE-NEUTRAL append, code first
+    }
 }
 
 // ── SETTINGSFILES state ─────────────────────────────────────────────────────────────────────────
@@ -796,7 +796,7 @@ impl prefs_core::wire::Store for KernelStore {
     }
     fn namespaces(&self) -> Vec<String> {
         namespaces()
-    }
+    } fn unset(&mut self, ns: &str, k: &str) -> Result<bool, prefs_core::wire::SetFail> { store_unset(ns, k) } // PREFS-UNSET-BUS (rmbp-ledger B1166): the bus UNSET's store arm is B1161's `unset` (file tail). LINE-NEUTRAL fold, code first
     /// SETTINGSFILES (B407): PrefDeclare — the program's stanza is held for its `app.<name>.*` writes and
     /// its descriptions head the keys in `settings/<name>`.
     fn declare(&mut self, name: &str, keys: Vec<prefs_core::declare::DeclKey>) -> i64 {
@@ -818,7 +818,7 @@ const _: () = assert!(
         && prefs_core::wire::VERB_GET == una_abi::BUS_VERB_PREF_GET
         && prefs_core::wire::VERB_SET == una_abi::BUS_VERB_PREF_SET
         && prefs_core::wire::VERB_LIST == una_abi::BUS_VERB_PREF_LIST
-        && prefs_core::wire::VERB_CHANGED == una_abi::BUS_VERB_PREF_CHANGED
+        && prefs_core::wire::VERB_CHANGED == una_abi::BUS_VERB_PREF_CHANGED && prefs_core::wire::VERB_UNSET == una_abi::BUS_VERB_PREF_UNSET // PREFS-UNSET-BUS (rmbp-ledger B1166): verb 29 pinned. LINE-NEUTRAL fold, code first
 );
 
 #[cfg(any(feature = "aarch64_el0", target_arch = "x86_64", all(target_arch = "aarch64", feature = "desktop_firmware")))] // the `crate::bus` cfg (lib.rs): no bus on this build, no bus fulfiller (merge9 fold); ARMNOEL0: widened with it so the aarch64 desktop without EL0 reads the store
@@ -985,7 +985,7 @@ pub fn selftest() {
         codec as u8, set_ok as u8, file_ok as u8, no_temp as u8, refused as u8, held as u8, restored as u8,
         loadclamp_ok as u8, clamp_ok as u8, if wire_ok { "shared" } else { "diverged" }, rows, if ok { "PASS" } else { "FAIL" }
     );
-    settingsfiles_selftest(); unset_selftest(); // PREFS-UNSET-VERB (rmbp-ledger B1161): the unset KAT (file tail). LINE-NEUTRAL fold, code first
+    settingsfiles_selftest(); unset_selftest(); unset_bus_selftest(); // PREFS-UNSET-VERB (rmbp-ledger B1161): the unset KAT (file tail). PREFS-UNSET-BUS (rmbp-ledger B1166): the bus UNSET KAT (file tail). LINE-NEUTRAL fold, code first
 }
 
 /// SETTINGSFILES (B407, R98) — `tests prefs`' second line (never at boot, R80): a program declares a stanza
@@ -1130,7 +1130,7 @@ pub fn bus_fulfil_from(verb: u8, body: &[u8], in_session: bool, owner: u64, text
             serial_println!("[prefs] set {}.{} refused: caller is not the session user", ns, k);
         }
     }
-    prefs_core::wire::fulfil_as(&mut KernelStore, verb, body, in_session, caller, text)
+    unset_bus_note(verb, body, caller, prefs_core::wire::fulfil_as(&mut KernelStore, verb, body, in_session, caller, text)) // PREFS-UNSET-BUS (rmbp-ledger B1166): a ring-3 UNSET is said with its caller (file tail). LINE-NEUTRAL fold, code first
 }
 
 #[cfg(any(feature = "aarch64_el0", target_arch = "x86_64"))]
@@ -1867,10 +1867,7 @@ fn machine_mirror(ns: &str, k: &str, v: Option<&PrefValue>) {
         _ => return,
     }
     let mt = store_mt();
-    if mt.stat(&dir).is_err() {
-        let _ = mt.create(&dir, crate::fs::vfs::NodeKind::Dir, crate::fs::vfs::KERNEL_PRINCIPAL);
-    }
-    crate::fs::rootacl::stamp_store(&mt, &dir); let ok = mt.put_file_atomic(&p, text.as_bytes(), crate::fs::vfs::KERNEL_PRINCIPAL).is_ok(); // MACHINESTOREACL (rmbp-ledger B1150): the machine folder is stamped ROOTACL `system` before its swap (fs/rootacl.rs tail). LINE-NEUTRAL append, code first
+    let _ = lay_machine_dir(&mt, &dir, "mirror"); let ok = mt.put_file_atomic(&p, text.as_bytes(), crate::fs::vfs::KERNEL_PRINCIPAL).is_ok(); // MACHINESTOREONELAY (rmbp-ledger B1167): the machine folder is laid and stamped ROOTACL `system` by the ONE lay before its swap (file tail; was MACHINESTOREACL B1150's own create + stamp). Named in-place hunk
     serial_println!("[prefs] machine settings/{} {}.{}={} wrote={}", d, ns, k, shown, ok as u8);
 }
 
@@ -2039,23 +2036,177 @@ pub fn stamp_machine_store() {
         if MACHINE_LAID.swap(true, Ordering::AcqRel) {
             return;
         }
-        let (made, stamped) = lay_machine_store(&store_mt());
-        serial_println!(
-            "[prefs] machine store dir=/{} owner={} made={} at=spawn",
-            prefs_core::files::DIR,
-            if stamped { crate::fs::rootacl::SYSTEM_OWNER } else { "none" },
-            made as u8
-        );
+        let _ = lay_native(&store_mt(), "spawn"); // MACHINESTOREONELAY (rmbp-ledger B1167): the once-per-boot wire is said by the ONE lay (file tail). Named in-place hunk
     }
 }
 
 /// Lay `/settings` at kernel authority when absent and stamp it through `rootacl::stamp_store`; no I/O unless the folder
 /// resolves to the native volume. `(made, stamped)`. `tests rootacl`'s MACHINESTORE boot step drives it (no latch).
 pub(crate) fn lay_machine_store(mt: &crate::fs::vfs::MountTable) -> (bool, bool) {
+    lay_native(mt, "tests") // MACHINESTOREONELAY (rmbp-ledger B1167): the body is the ONE lay behind B1162's native gate (file tail). Named in-place hunk
+}
+
+// ── MACHINESTOREONELAY (rmbp-ledger B1167, BP-storage-11) — TAIL-APPENDED ──────────────────────────────────────────────
+// The no-session folder `/settings` has ONE lay, [`lay_machine_dir`]: create-if-absent at kernel authority, then
+// `rootacl::stamp_store`. Three roads call it: `ensure_dirs` (the save road; `path()` is `<home>/settings` in a session,
+// whose create stays in the caller, and the lay answers `None` with no I/O for any dir but `/settings`),
+// `machine_mirror` (the session's machine copy) and the spawn road (`stamp_machine_store`, plus `tests rootacl`'s BOOT
+// step through `lay_machine_store`), the last two behind [`lay_native`], B1162's native-volume gate. The lay itself is
+// gate-free because a FAT root's `/settings` is still kernel-written (B1160 refuses only ring 3's SYS_OPEN there): the
+// save and mirror roads must lay it on any volume. `load`'s stamp (B1156) stays stamp-only: a read never creates.
+// MACHINE-STORE-PREB1150, measured and ACCEPTED: a ring-3 create carries `owner=<principal>` (fs/vfs.rs create) and is
+// refused by `rootacl::store_file_refused`; the residual is a kernel-created row-less file a pre-B1150 image let ring 3
+// rewrite in place. A write adds no row, native UnaFS keeps no mtime, and the `# auto-saved` header is content the
+// writer chose, so nothing on disk tells it apart; a rewrite from the session stores needs a session the boot screen
+// does not have. Bounded to volumes that ran a pre-B1150 image; the kernel's next swap of that domain replaces the file.
+// No lock (create and stamp are idempotent); callers keep SAVE_LOCK where they hold it.
+// Wire, once per boot from whichever road lays first:
+// `[prefs] machine store dir=/settings owner=<system|none> made=<0|1> at=<spawn|save|mirror|tests>`.
+
+/// The one-per-boot wire of [`lay_machine_dir`] was said.
+static MACHINE_SAID: AtomicBool = AtomicBool::new(false);
+
+/// B1162's spawn-road gate: lay the machine folder only when it resolves to the native volume. `(made, stamped)`.
+fn lay_native(mt: &crate::fs::vfs::MountTable, at: &str) -> (bool, bool) {
     let dir = alloc::format!("/{}", prefs_core::files::DIR);
     if !mt.volume_name(&dir).map(|n| n == "native").unwrap_or(false) {
         return (false, false);
     }
-    let made = mt.stat(&dir).is_err() && mt.create(&dir, crate::fs::vfs::NodeKind::Dir, crate::fs::vfs::KERNEL_PRINCIPAL).is_ok();
-    (made, crate::fs::rootacl::stamp_store(mt, &dir))
+    lay_machine_dir(mt, &dir, at).unwrap_or((false, false))
+}
+
+/// THE lay of the no-session folder: `None` (no I/O) unless `dir` is `/settings`; else create it at kernel authority when
+/// absent and stamp it through `rootacl::stamp_store`. `Some((made, stamped))`; the first lay per boot says the wire.
+fn lay_machine_dir(mt: &crate::fs::vfs::MountTable, dir: &str, at: &str) -> Option<(bool, bool)> {
+    if dir.strip_prefix('/') != Some(prefs_core::files::DIR) {
+        return None;
+    }
+    let made = mt.stat(dir).is_err() && mt.create(dir, crate::fs::vfs::NodeKind::Dir, crate::fs::vfs::KERNEL_PRINCIPAL).is_ok();
+    let stamped = crate::fs::rootacl::stamp_store(mt, dir);
+    if !MACHINE_SAID.swap(true, Ordering::AcqRel) {
+        serial_println!(
+            "[prefs] machine store dir={} owner={} made={} at={}",
+            dir,
+            if stamped { crate::fs::rootacl::SYSTEM_OWNER } else { "none" },
+            made as u8,
+            at
+        );
+    }
+    Some((made, stamped))
+}
+
+// ── PREFS-UNSET-BUS (rmbp-ledger B1166, BP-storage-11) — TAIL-APPENDED ─────────────────────────────────────────────────
+// The bus UNSET (una-abi `BUS_VERB_PREF_UNSET` 29): `prefs_core::wire::fulfil_as`'s UNSET arm (`wire::unset_as`: the GET
+// address, SET's gate — -EACCES outside the session or past `cap::may_set` for the caller `bus_fulfil_from` stamped — then
+// `Store::unset`) over `KernelStore`, whose arm is B1161's [`unset`]: the one rule (removed from the tree, its domain saved
+// by the same swap, rolled back on a failed save) and the ONE `post_changes(default_applied)`. Reply: 0 + SR169's unset
+// form, -ENOENT already unset, -EINVAL malformed, -EIO the write. Principia's host store answers the same verb through the
+// same `fulfil_as` (`PrefStore::unset`). No relay: R3PREF_UNSET is owed (PREFS-UNSET-RELAY). Wire, after B1161's
+// `[prefs] unset <ns>.<key> ok=1` + `[prefs] changed <ns>.<key>`: `[prefs] unset <ns>.<key> ok=1 via=bus by=<prog>`,
+// `ok=1 was=unset via=bus …`, `ok=0 why=<refused|malformed|io> via=bus …`.
+
+/// `KernelStore::unset`: B1161's [`unset`] in the wire's failure words.
+fn store_unset(ns: &str, k: &str) -> Result<bool, prefs_core::wire::SetFail> {
+    unset(ns, k).map_err(|e| match e {
+        SetError::Refused(r) => prefs_core::wire::SetFail::Refused(r),
+        SetError::Name(n) => prefs_core::wire::SetFail::Name(n),
+        SetError::Io(_) => prefs_core::wire::SetFail::Io,
+    })
+}
+
+#[cfg(any(feature = "aarch64_el0", target_arch = "x86_64"))]
+/// [`bus_fulfil_from`]'s note: a ring-3 UNSET is said with its outcome and the stamped caller. Returns `st` unchanged.
+fn unset_bus_note(verb: u8, body: &[u8], caller: prefs_core::cap::Caller<'_>, st: i64) -> i64 {
+    if verb == prefs_core::wire::VERB_UNSET {
+        let a = prefs_core::wire::parse_get(body).map(|_| core::str::from_utf8(body).unwrap_or("?")).unwrap_or("<malformed>");
+        let who = prefs_caller_text(caller);
+        if st == 0 {
+            serial_println!("[prefs] unset {} ok=1 via=bus by={}", a, who);
+        } else if st == prefs_core::wire::ENOENT {
+            serial_println!("[prefs] unset {} ok=1 was=unset via=bus by={}", a, who);
+        } else {
+            let why = if st == prefs_core::wire::EACCES {
+                "refused"
+            } else if st == prefs_core::wire::EINVAL {
+                "malformed"
+            } else {
+                "io"
+            };
+            serial_println!("[prefs] unset {} ok=0 why={} via=bus by={}", a, why, who);
+        }
+    }
+    st
+}
+
+/// `tests prefs`' bus UNSET line (B1166): a scratch wm owner named `pcaptest` SETs then UNSETs its own
+/// `app.pcaptest.level` through [`bus_fulfil_from`] (0 + the frozen unset form, the key gone), unsets it again
+/// (-ENOENT), is refused `vein.endpoint` (-EACCES, kept) and an unset outside the session (-EACCES, kept); a bare
+/// namespace is -EINVAL. The name, the tree, ON_DISK and `settings/pcaptest` are restored.
+/// `:: PREFS-UNSET-BUS: unset=0 body=frozen again=enoent foreign=refused outside=refused name=einval restored=1 -> PASS ::`.
+#[cfg(feature = "witness")]
+fn unset_bus_selftest() {
+    #[cfg(any(feature = "aarch64_el0", target_arch = "x86_64"))]
+    {
+        unset_bus_legs();
+    }
+    #[cfg(not(any(feature = "aarch64_el0", target_arch = "x86_64")))]
+    {
+        serial_println!(":: PREFS-UNSET-BUS: SKIP (no ring-3 bus on this build) ::");
+    }
+}
+
+#[cfg(all(feature = "witness", any(feature = "aarch64_el0", target_arch = "x86_64")))]
+fn unset_bus_legs() {
+    use prefs_core::wire::{EACCES, EINVAL, ENOENT, VERB_SET, VERB_UNSET};
+    const OWNER: u64 = u64::MAX - 0x5F5; // beside smallfix4's SCRATCH: no launcher hands out an owner this high
+    const KEY: &str = "pcaptest.level";
+    let app = prefs_core::files::APP_NS;
+    if let Some(k) = crate::fs::vfs::home_unwritable(&crate::shell::vfs_mount_table(), &path()) {
+        serial_println!(":: PREFS-UNSET-BUS: dir={} -> SKIP reason=home-not-writable({}) ::", path(), k);
+        return;
+    }
+    ensure_loaded();
+    if get(app, KEY).is_some() || crate::video::wm::app_name_armed(OWNER) {
+        serial_println!(":: PREFS-UNSET-BUS: SKIP (app.{} held or the scratch owner named) ::", KEY);
+        return;
+    }
+    let dp = domain_path(&prefs_core::files::domain_of(app, KEY));
+    let saved = read_all(&dp);
+    let on_disk0 = ON_DISK.lock().clone();
+    let _ = crate::video::wm::app_name_arm(OWNER, "/apps/PCAPTEST.ELF");
+    let call = |verb: u8, body: &[u8], sess: bool, o: &mut Vec<u8>| -> i64 {
+        o.clear();
+        bus_fulfil_from(verb, body, sess, OWNER, o)
+    };
+    let mut o = Vec::new();
+    let set = call(VERB_SET, b"app.pcaptest.level\x003", true, &mut o) == 0;
+    let unset_st = call(VERB_UNSET, b"app.pcaptest.level", true, &mut o);
+    let body = o == prefs_core::wire::unset_body(app, KEY) && o.as_slice() == b"app.pcaptest.level\x00" && get(app, KEY).is_none();
+    let again = call(VERB_UNSET, b"app.pcaptest.level", true, &mut o) == ENOENT;
+    let ep = get("vein", "endpoint");
+    let foreign = call(VERB_UNSET, b"vein.endpoint", true, &mut o) == EACCES && get("vein", "endpoint") == ep;
+    let outside = call(VERB_SET, b"app.pcaptest.level\x003", true, &mut o) == 0
+        && call(VERB_UNSET, b"app.pcaptest.level", false, &mut o) == EACCES
+        && get(app, KEY).is_some();
+    let name = call(VERB_UNSET, b"app", true, &mut o) == EINVAL;
+    // Restore the name, the tree, ON_DISK and the domain file.
+    crate::video::wm::app_name_forget(OWNER);
+    let _ = TREE.lock().remove(app, KEY);
+    let mt = crate::shell::vfs_mount_table();
+    match &saved {
+        Some(b) => {
+            let _ = write_all(&dp, b);
+        }
+        None => {
+            let _ = mt.unlink(&dp, crate::fs::vfs::KERNEL_PRINCIPAL);
+        }
+    }
+    *ON_DISK.lock() = on_disk0;
+    let restored = read_all(&dp) == saved && get(app, KEY).is_none() && !crate::video::wm::app_name_armed(OWNER);
+    let ok = set && unset_st == 0 && body && again && foreign && outside && name && restored;
+    serial_println!(
+        ":: PREFS-UNSET-BUS: unset={} body={} again={} foreign={} outside={} name={} restored={} -> {} ::",
+        unset_st, if body { "frozen" } else { "MOVED" }, if again { "enoent" } else { "FAIL" }, if foreign { "refused" } else { "UNSET" },
+        if outside { "refused" } else { "UNSET" }, if name { "einval" } else { "FAIL" }, restored as u8, if ok { "PASS" } else { "FAIL" }
+    );
 }

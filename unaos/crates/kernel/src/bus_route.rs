@@ -518,7 +518,7 @@ pub fn selftest(fx: &Fixture) {
     } else {
         serial_println!(":: BANDY3: registered={} relayed={} replied={} orphan={} w={:#05x}/{:#05x} verbs={}/{} -> FAIL ::", rg, rl, rp, or, w, ALL, vg, vl);
     }
-    tagid_selftest(fx); // BUSREG-TAG-IDENTITY (B1157): the identity legs, after the BANDY3 line
+    tagid_selftest(fx); armearly_selftest(fx); /* BUSREG-ARM-EARLY (B1164): the early-arm legs, after the BUSREG-TAGID line (file tail) */ // BUSREG-TAG-IDENTITY (B1157): the identity legs, after the BANDY3 line
 }
 
 /// HOLOCRON2 (rmbp-ledger B355): does `verb` have a registration right now? (Generation not checked: a row
@@ -563,8 +563,8 @@ pub fn fulfiller_row(verb: u8) -> Option<(usize, u64)> {
 // refuses a row NAMED as another program (-EACCES); the RELAY — by then the name is armed — refuses any holder
 // not named as the fulfiller (named otherwise, or still unnamed), drops its registration and answers the caller
 // -ENOENT, so no body ever reaches it. `fulfiller_row` (SYS_RINGKEY's trust, B1155's judge) takes the same
-// filter. Every other tag stays open. Residual (docs/SECURITY.md): the name is trusted by spelling, as
-// PREFSCAP's is. Witness: `tests bandy3` → `:: BUSREG-TAGID: … -> PASS ::`.
+// filter. Every other tag stays open. The spelling residual is closed by BUSREG-TAG-PATH (B1163, tail below:
+// the path the launcher loaded decides, the name only demotes). Witness: `tests bandy3` → `:: BUSREG-TAGID: … -> PASS ::`.
 // =================================================================================================
 /// (first tag, last tag, the image the kernel names as that range's fulfiller).
 const TAG_IMAGE: &[(u8, u8, &str)] = &[
@@ -596,14 +596,14 @@ enum TagId {
 /// `row`'s launcher-armed program name, lowercased into `buf` (`""` = none armed). The wm owner is
 /// `owner_of_launch(row)` — x86 row + 1, aarch64 the ASID — the key `prefs::bus_fulfil_from` uses.
 fn row_name(row: usize, buf: &mut [u8; crate::video::wm::MAX_TITLE]) -> &str {
-    let n = crate::video::wm::app_name_of(crate::video::wm::owner_of_launch(row as u64), buf);
+    let n = crate::video::wm::app_name_of(crate::video::wm::owner_of_launch(row as u64), buf); let n = armearly_name(row, n, buf); // BUSREG-ARM-EARLY (B1164): no launcher-armed name yet -> the one the arch spawn armed at the mint, at the row's CURRENT generation (file tail)
     buf[..n].make_ascii_lowercase();
     core::str::from_utf8(&buf[..n]).unwrap_or("")
 }
 
 /// Who `row` is for `verb`. Takes no lock but wm's leaf `APP_NAMES` — never called under `REGS`.
 fn tag_id(verb: u8, row: usize, buf: &mut [u8; crate::video::wm::MAX_TITLE]) -> TagId {
-    let Some(img) = tag_image(verb) else { return TagId::Open };
+    let Some(img) = tag_image(verb) else { return TagId::Open }; if let Some(id) = tagpath_id(row, img, buf) { return id; } // BUSREG-TAG-PATH (B1163): the loaded /apps/ path decides, the name only demotes (file tail)
     let name = row_name(row, buf);
     if name.is_empty() {
         TagId::Unnamed
@@ -718,21 +718,43 @@ fn tagid_selftest(fx: &Fixture) {
     if ok && sent && reached && holder {
         w |= 1 << 2;
     }
+    // BUSREG-TAG-PATH (B1163) L4: named PREFS, but loaded from a home path -> refused at REGISTER.
+    on_exit(fx.ops, f);
+    (fx.clear)(f);
+    let _ = crate::video::wm::app_name_arm(owner_f, "/home/una/PREFS.ELF");
+    let n = crate::bus::build_request(BUS_VERB_REGISTER, 66, &[set], &mut buf);
+    let path_refused = (fx.send)(f, &buf[..n]) == 0 && matches!((fx.pop)(f).as_deref().and_then(parse), Some(h) if h.status == EACCES as i32 && h.corr == 66);
+    if path_refused && lookup(fx.ops, set).is_none() {
+        w |= 1 << 3;
+    }
+    // L5: named PREFS by spelling alone (a relative literal arms no path) -> registers, but the relay drops it.
+    let _ = crate::video::wm::app_name_arm(owner_f, "PREFS.ELF");
+    let n = crate::bus::build_request(BUS_VERB_REGISTER, 67, &[get], &mut buf);
+    let admitted = (fx.send)(f, &buf[..n]) == 0 && matches!((fx.pop)(f).as_deref().and_then(parse), Some(h) if h.status == 0 && h.corr == 67);
+    let n = crate::bus::build_request(get, 68, b"ui.theme", &mut buf);
+    let sent = (fx.send)(a, &buf[..n]) == 0;
+    let enoent = matches!((fx.pop)(a).as_deref().and_then(parse), Some(h) if h.status == ENOENT as i32 && h.corr == 68 && h.principal[0] == PRIN_KERNEL_REPLY);
+    let unseen = (fx.pop)(f).is_none();
+    if admitted && sent && enoent && unseen && lookup(fx.ops, get).is_none() {
+        w |= 1 << 4;
+    }
     on_exit(fx.ops, f);
     (fx.clear)(a);
     (fx.clear)(f);
     on_exit(fx.ops, a);
     crate::video::wm::app_name_forget(owner_f);
-    const ALL: u32 = (1 << 3) - 1;
+    const ALL: u32 = (1 << 5) - 1;
     let (rf, dr) = (TAGID_REFUSED.load(Ordering::Relaxed), TAGID_DROPPED.load(Ordering::Relaxed));
     if w == ALL {
-        serial_println!(":: BUSREG-TAGID: probe=refused unnamed=dropped prefs=admitted relayed=1 refused={} dropped={} -> PASS ::", rf, dr);
+        serial_println!(":: BUSREG-TAGID: probe=refused unnamed=dropped prefs=admitted path=refused spelled=dropped relayed=1 refused={} dropped={} -> PASS ::", rf, dr);
     } else {
         serial_println!(
-            ":: BUSREG-TAGID: probe={} unnamed={} prefs={} relayed={} refused={} dropped={} w={:#x}/{:#x} -> FAIL ::",
+            ":: BUSREG-TAGID: probe={} unnamed={} prefs={} path={} spelled={} relayed={} refused={} dropped={} w={:#x}/{:#x} -> FAIL ::",
             if w & 1 != 0 { "refused" } else { "OPEN" },
             if w & 2 != 0 { "dropped" } else { "KEPT" },
             if w & 4 != 0 { "admitted" } else { "REFUSED" },
+            if w & 8 != 0 { "refused" } else { "OPEN" },
+            if w & 16 != 0 { "dropped" } else { "KEPT" },
             (w >> 2) & 1, rf, dr, w, ALL
         );
     }
@@ -792,4 +814,164 @@ pub fn end_prelogin_fulfillers() -> usize {
         }
     }
     ended
+}
+
+// =================================================================================================
+// BUSREG-TAG-PATH (rmbp-ledger B1163) — TAIL-APPENDED. B1157 judged a private tag's holder on the launcher-armed
+// NAME, so an image called PREFS.ELF launched from any path was Principia's fulfiller. The launcher also knows
+// the PATH it read the image from, and wm now keeps it beside the name (`wm::app_path_with`, armed by the same
+// `app_name_arm` / `app_name_arm_launch` every launch road calls). The rule: a row with a path armed is the
+// fulfiller iff that path IS `TAG_IMAGE`'s image — the `/apps/` prefix byte-exact (`/` is not a ROOTACL tree,
+// so `/APPS/…` could be planted on a case-sensitive root), the leaf case-insensitive (only `kernel` and the
+// administrator create anything under ROOTACL's `/apps`) — else it is `Other`. With no path armed, the
+// fulfiller's NAME alone is `Unnamed` (registers — the `app_name_arm_launch` gap between name and path — and is
+// dropped at the relay if still pathless): the spelling never promotes. Any other case is B1157's name logic.
+// =================================================================================================
+
+/// `tag_id`'s path key for `row` against the image `img`: `Some(verdict)` when the path decides (or the name
+/// alone would have promoted), `None` = fall through to the name. Takes only wm's leaf locks.
+fn tagpath_id(row: usize, img: &str, buf: &mut [u8; crate::video::wm::MAX_TITLE]) -> Option<TagId> {
+    let owner = crate::video::wm::owner_of_launch(row as u64);
+    if let Some(is) = crate::video::wm::app_path_with(owner, |p| path_names(p, img)).or_else(|| armearly_path(row, img)) { // BUSREG-ARM-EARLY (B1164): the path from APP_PATHS, else the early record at the row's current generation (file tail)
+        return Some(if is { TagId::Fulfiller } else { TagId::Other });
+    }
+    let name = row_name(row, buf);
+    (!name.is_empty() && name.eq_ignore_ascii_case(crate::video::wm::program_name(img))).then_some(TagId::Unnamed)
+}
+
+/// Is the loaded `path` the image `img` (`/apps/<LEAF>`)? The directory byte-exact, the leaf any case.
+fn path_names(path: &str, img: &str) -> bool {
+    const DIR: &str = "/apps/";
+    match (path.strip_prefix(DIR), img.strip_prefix(DIR)) {
+        (Some(leaf), Some(want)) => !leaf.is_empty() && leaf.eq_ignore_ascii_case(want),
+        _ => false,
+    }
+}
+
+// =================================================================================================
+// BUSREG-ARM-EARLY (rmbp-ledger B1164) — TAIL-APPENDED. B1157 applied the private-tag check twice because the
+// launcher arms a program's name only AFTER the spawn made the task runnable (WINTITLE-LATE), and PREFS.ELF
+// registers as its second syscall. The arch spawn bodies now arm the kernel launcher's own argv[0] at the mint,
+// before the task exists (x86 `spawn_user_image_bg_inner`, aarch64 `spawn_user_image_bg_piped`, one line each;
+// never on the ring-3 SYS_SPAWN_PATH road, whose argv is ring-3 bytes — BUSREG-ARM-EARLY-RING3, owed), into wm's
+// early record (`wm::app_name_arm_early`), stamped with the row's generation. `row_name` and `tagpath_id` read it
+// only when no launcher-armed name / path exists, and only at the row's CURRENT generation, so a launched
+// fulfiller is judged at REGISTER, a squatter early-named otherwise is refused there, and the relay gate stays
+// the belt for a holder with neither. Window titles never see the early record (wm keeps it apart).
+// Witness: `tests bandy3` → `:: BUSREG-ARMEARLY: … -> PASS ::`; every kernel-road launch says `[busreg] arm-early`.
+// =================================================================================================
+
+/// Early records armed since boot (monotonic).
+pub static ARMEARLY_ARMED: AtomicU32 = AtomicU32::new(0);
+
+/// The arch spawn body's arm: `path` is the kernel launcher's argv[0] (`None` on the ring-3 road or an argv-less
+/// launch: nothing armed). Called before the task is spawned; takes only wm's leaf lock.
+pub fn arm_early(row: usize, path: Option<&str>) {
+    let Some(path) = path else { return };
+    let gen = (crate::arch::syscall::busreg_ops().rgen)(row);
+    let armed = crate::video::wm::app_name_arm_early(crate::video::wm::owner_of_launch(row as u64), gen, path);
+    if armed {
+        ARMEARLY_ARMED.fetch_add(1, Ordering::Relaxed);
+    }
+    serial_println!(
+        "[busreg] arm-early row={} gen={} name={} path={} armed={}",
+        row, gen, crate::video::wm::program_name(path), if path.starts_with('/') { path } else { "-" }, armed as u8
+    );
+}
+
+/// `row_name`'s fallback: `n` when a launcher-armed name exists, else the early name of `row`'s current tenant.
+fn armearly_name(row: usize, n: usize, buf: &mut [u8; crate::video::wm::MAX_TITLE]) -> usize {
+    if n != 0 {
+        return n;
+    }
+    let gen = (crate::arch::syscall::busreg_ops().rgen)(row);
+    crate::video::wm::app_name_early_of(crate::video::wm::owner_of_launch(row as u64), gen, buf)
+}
+
+/// `tagpath_id`'s fallback: is the early path of `row`'s current tenant the image `img`? `None` = no absolute one.
+fn armearly_path(row: usize, img: &str) -> Option<bool> {
+    let gen = (crate::arch::syscall::busreg_ops().rgen)(row);
+    crate::video::wm::app_path_early_of(crate::video::wm::owner_of_launch(row as u64), gen, |p| path_names(p, img))
+}
+
+/// `tests bandy3`' early-arm legs, on the fixture's scratch rows (caller `a`, fulfiller `f`), with NO late arm:
+/// E1 `f` early-armed `/apps/PROBE.ELF` registers 130 -> -EACCES (REGISTER alone decides); E2 `f` early-armed
+/// `/apps/PREFS.ELF` registers 128+130 -> 0, the caller's GET 128 reaches `f` with its body, `fulfiller_row(130)`
+/// = `f`; E3 an early record at a DEAD generation answers as unnamed: registers 128 -> 0, the GET -> KERNEL
+/// -ENOENT, `f`'s mailbox empty, 128 dropped. SKIP as `tagid_selftest` does, and when `f` carries any name.
+fn armearly_selftest(fx: &Fixture) {
+    let (a, f) = fx.rows;
+    let owner_f = crate::video::wm::owner_of_launch(f as u64);
+    let (get, set) = (una_abi::BUS_VERB_R3PREF_GET, una_abi::BUS_VERB_R3PREF_SET);
+    if (get..=set).any(|v| lookup(fx.ops, v).is_some()) {
+        serial_println!(":: BUSREG-ARMEARLY: SKIP (a live row holds Principia's tags) ::");
+        return;
+    }
+    let gen = (fx.ops.rgen)(f);
+    let mut nb = [0u8; crate::video::wm::MAX_TITLE];
+    if crate::video::wm::app_name_armed(owner_f)
+        || crate::video::wm::app_path_with(owner_f, |_| true).is_some()
+        || crate::video::wm::app_name_early_of(owner_f, gen, &mut nb) != 0
+    {
+        serial_println!(":: BUSREG-ARMEARLY: SKIP (scratch row {} carries a name) ::", f);
+        return;
+    }
+    (fx.clear)(a);
+    (fx.clear)(f);
+    let parse = |b: &[u8]| crate::bus::frame_parse(b).ok();
+    let mut buf = [0u8; 128];
+    let mut w = 0u32;
+
+    // E1: early-named as another program (by its /apps/ path) -> refused at REGISTER, no late arm needed.
+    arm_early(f, Some("/apps/PROBE.ELF"));
+    let n = crate::bus::build_request(BUS_VERB_REGISTER, 71, &[set], &mut buf);
+    let refused = (fx.send)(f, &buf[..n]) == 0 && matches!((fx.pop)(f).as_deref().and_then(parse), Some(h) if h.status == EACCES as i32 && h.corr == 71);
+    if refused && lookup(fx.ops, set).is_none() {
+        w |= 1 << 0;
+    }
+    // E2: early-armed as the fulfiller's image, still no late arm -> registered AND relayed (B1157 dropped it).
+    arm_early(f, Some("/apps/PREFS.ELF"));
+    let n = crate::bus::build_request(BUS_VERB_REGISTER, 72, &[get, set], &mut buf);
+    let ok = (fx.send)(f, &buf[..n]) == 0 && matches!((fx.pop)(f).as_deref().and_then(parse), Some(h) if h.status == 0 && h.corr == 72);
+    let n = crate::bus::build_request(get, 73, b"ui.theme", &mut buf);
+    let sent = (fx.send)(a, &buf[..n]) == 0 && (fx.pop)(a).is_none();
+    let relayed = (fx.pop)(f);
+    let reached = matches!(relayed.as_deref().and_then(parse), Some(h) if h.kind == crate::bus::BUS_KIND_REQUEST && h.verb == get && h.corr != 73)
+        && relayed.as_deref().map(|b| &b[crate::bus::BUS_HDR_LEN..]) == Some(b"ui.theme".as_slice());
+    let holder = matches!(fulfiller_row(set), Some((r, _)) if r == f);
+    if ok && sent && reached && holder {
+        w |= 1 << 1;
+    }
+    on_exit(fx.ops, f);
+    (fx.clear)(a);
+    (fx.clear)(f);
+    // E3: the same record at a generation that is not the row's current one -> unnamed: the relay drops it.
+    let _ = crate::video::wm::app_name_arm_early(owner_f, gen.wrapping_add(1), "/apps/PREFS.ELF");
+    let n = crate::bus::build_request(BUS_VERB_REGISTER, 74, &[get], &mut buf);
+    let admitted = (fx.send)(f, &buf[..n]) == 0 && matches!((fx.pop)(f).as_deref().and_then(parse), Some(h) if h.status == 0 && h.corr == 74);
+    let n = crate::bus::build_request(get, 75, b"ui.theme", &mut buf);
+    let sent = (fx.send)(a, &buf[..n]) == 0;
+    let enoent = matches!((fx.pop)(a).as_deref().and_then(parse), Some(h) if h.status == ENOENT as i32 && h.corr == 75 && h.principal[0] == PRIN_KERNEL_REPLY);
+    let unseen = (fx.pop)(f).is_none();
+    if admitted && sent && enoent && unseen && lookup(fx.ops, get).is_none() {
+        w |= 1 << 2;
+    }
+    on_exit(fx.ops, f);
+    (fx.clear)(a);
+    (fx.clear)(f);
+    on_exit(fx.ops, a);
+    crate::video::wm::app_name_early_forget(owner_f);
+    const ALL: u32 = (1 << 3) - 1;
+    let armed = ARMEARLY_ARMED.load(Ordering::Relaxed);
+    if w == ALL {
+        serial_println!(":: BUSREG-ARMEARLY: probe=refused-at-register prefs=relayed-early stale=dropped armed={} -> PASS ::", armed);
+    } else {
+        serial_println!(
+            ":: BUSREG-ARMEARLY: probe={} prefs={} stale={} armed={} w={:#x}/{:#x} -> FAIL ::",
+            if w & 1 != 0 { "refused-at-register" } else { "OPEN" },
+            if w & 2 != 0 { "relayed-early" } else { "DROPPED" },
+            if w & 4 != 0 { "dropped" } else { "KEPT" },
+            armed, w, ALL
+        );
+    }
 }

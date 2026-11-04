@@ -853,7 +853,7 @@ pub fn app_name_arm(owner: u64, path: &str) -> bool {
     if owner == 0 || name.is_empty() {
         return false;
     }
-    let len = name.len().min(MAX_TITLE);
+    #[cfg(feature = "busreg")] { app_path_arm(owner, path); } let len = name.len().min(MAX_TITLE); // BUSREG-TAG-PATH (B1163): the path beside the name (file tail) — ⚠ LINE-NEUTRAL fold
     let mut t = APP_NAMES.lock();
     // Re-arm in place first: an owner already named must not occupy two rows, or `app_name_forget`
     // would clear one and leave the other to title the next tenant.
@@ -953,7 +953,7 @@ pub fn title_source_of(id: WinId) -> TitleSource {
 /// shell-launched program left, whose shell never reaped it" — which reads a stale NAME, never a
 /// wrong number, and is corrected by the next `app_name_arm` for that owner.
 pub fn app_name_forget(owner: u64) {
-    if owner == 0 {
+    #[cfg(feature = "busreg")] { app_path_forget(owner); } if owner == 0 { // BUSREG-TAG-PATH (B1163): the path goes with the name (file tail) — ⚠ LINE-NEUTRAL fold
         return;
     }
     let mut t = APP_NAMES.lock();
@@ -30508,7 +30508,7 @@ pub fn app_name_arm_launch(owner: u64, path: &str) -> bool {
         Some(n) => (n, "appres"),
         None => (alloc::string::String::from(program_name(path)), "path"),
     };
-    let armed = app_name_arm(owner, &name);
+    let armed = app_name_arm(owner, &name); #[cfg(feature = "busreg")] { app_path_arm(owner, path); } // BUSREG-TAG-PATH (B1163): the inner arm took the APPRES name, so the loaded path is armed after it (file tail) — ⚠ LINE-NEUTRAL fold
     serial_println!("[wm] launch-name owner={} path={} name={} via={} armed={}", owner, path, name, via, armed as u8);
     armed
 }
@@ -33717,4 +33717,125 @@ fn drain_shimtimed(fb: &super::FrameBuffer) -> bool {
 #[inline(always)]
 fn drain_shimtimed(fb: &super::FrameBuffer) -> bool {
     drain_deferred(fb)
+}
+
+// =================================================================================================
+// BUSREG-TAG-PATH (rmbp-ledger B1163) — TAIL-APPENDED, feature `busreg` only (knob-off: no symbol, no byte).
+// [`APP_NAMES`] keeps the 16-byte basename, so a program called PREFS.ELF launched from any path was `prefs`
+// to `bus_route`'s tag check (BUSREG-TAG-IDENTITY B1157). Every launcher that can start a fulfiller arms
+// through [`app_name_arm`] / [`app_name_arm_launch`] with the path it read the image from, so the PATH is kept
+// here, beside the name, armed by the same two calls and forgotten by [`app_name_forget`]. An ABSOLUTE path
+// is kept; anything else CLEARS the owner's row, so a recycled owner re-armed with a relative literal never
+// wears its predecessor's path. `bus_route` judges it (`tagpath_id`); this table only stores.
+// LOCK ORDER: a LEAF like [`APP_NAMES`] — armed before that mutex is taken, never held across another lock,
+// read by `bus_route::tag_id`, which is never called under its `REGS`.
+// =================================================================================================
+#[cfg(feature = "busreg")]
+static APP_PATHS: Mutex<alloc::vec::Vec<(u64, alloc::string::String)>> = Mutex::new(alloc::vec::Vec::new());
+
+/// BUSREG-TAG-PATH — record the path `owner`'s image was loaded from (absolute only; else clear the row).
+#[cfg(feature = "busreg")]
+fn app_path_arm(owner: u64, path: &str) {
+    if owner == 0 {
+        return;
+    }
+    let mut t = APP_PATHS.lock();
+    t.retain(|e| e.0 != owner);
+    if path.starts_with('/') {
+        t.push((owner, alloc::string::String::from(path)));
+    }
+}
+
+/// BUSREG-TAG-PATH — drop `owner`'s path (with its name, [`app_name_forget`]).
+#[cfg(feature = "busreg")]
+fn app_path_forget(owner: u64) {
+    if owner == 0 {
+        return;
+    }
+    APP_PATHS.lock().retain(|e| e.0 != owner);
+}
+
+/// BUSREG-TAG-PATH — `f(path)` for `owner`'s armed path; `None` = no path armed. `f` runs under the leaf lock
+/// and must take no lock.
+#[cfg(feature = "busreg")]
+pub fn app_path_with(owner: u64, f: impl FnOnce(&str) -> bool) -> Option<bool> {
+    if owner == 0 {
+        return None;
+    }
+    let t = APP_PATHS.lock();
+    t.iter().find(|e| e.0 == owner).map(|e| f(e.1.as_str()))
+}
+
+// =================================================================================================
+// BUSREG-ARM-EARLY (rmbp-ledger B1164) — TAIL-APPENDED, feature `busreg` only (knob-off: no symbol, no byte).
+// [`app_name_arm`] is RETROACTIVE (WINTITLE-LATE): every launcher arms after the spawn returned and the task is
+// runnable, because the arch spawn entry points take the image BYTES only — the launcher alone knows the path.
+// The one word that reaches the spawn body is argv[0], and on a KERNEL launch road (shell `bg`, Quarry, the dock,
+// Holocron at login) it is the kernel's own word: the path it read the image from, or a bare name. The arch body
+// arms it HERE, at the mint, before the task exists (`bus_route::arm_early`), stamped with the row's bus
+// GENERATION (bumped only at teardown), so a record never answers for the slot's next tenant. This record is the
+// bus check's ONLY: it is invisible to [`mint_title`], [`app_name_of`] and [`app_name_armed`] by construction, so
+// no window title, NOTICE or PREFSCAP wire moves, and the late arm stays the window-owner binding. The path is the
+// raw argv[0]; [`app_path_early_of`] answers only an ABSOLUTE one (BUSREG-TAG-PATH's rule: a bare name is a name,
+// never a path), and the name is [`program_name`] of it — the ONE derivation.
+// LOCK ORDER: a LEAF like [`APP_NAMES`] — taken alone, never across another lock, never under `bus_route`'s REGS.
+// =================================================================================================
+/// One early record: (owner, the row's generation at the mint, the raw argv[0]).
+#[cfg(feature = "busreg")]
+static APP_NAMES_EARLY: Mutex<alloc::vec::Vec<(u64, u64, alloc::string::String)>> = Mutex::new(alloc::vec::Vec::new());
+
+/// BUSREG-ARM-EARLY — record the kernel launcher's argv[0] `path` for `owner` at generation `gen`, before the task
+/// can run. Re-arms the owner's row in place (the slot's previous tenant is necessarily gone). `false` = owner 0
+/// or an empty name (nothing recorded; a row the owner held is dropped either way).
+#[cfg(feature = "busreg")]
+pub fn app_name_arm_early(owner: u64, gen: u64, path: &str) -> bool {
+    if owner == 0 {
+        return false;
+    }
+    let ok = !program_name(path).is_empty();
+    let mut t = APP_NAMES_EARLY.lock();
+    t.retain(|e| e.0 != owner);
+    if ok {
+        t.push((owner, gen, alloc::string::String::from(path)));
+    }
+    ok
+}
+
+/// BUSREG-ARM-EARLY — `owner`'s early program name at generation `gen`, copied into `out`; its length (0 = no
+/// record, or a record from another generation).
+#[cfg(feature = "busreg")]
+pub fn app_name_early_of(owner: u64, gen: u64, out: &mut [u8; MAX_TITLE]) -> usize {
+    if owner == 0 {
+        return 0;
+    }
+    let t = APP_NAMES_EARLY.lock();
+    match t.iter().find(|e| e.0 == owner && e.1 == gen) {
+        Some(e) => {
+            let name = program_name(e.2.as_str()).as_bytes();
+            let n = name.len().min(MAX_TITLE);
+            out[..n].copy_from_slice(&name[..n]);
+            n
+        }
+        None => 0,
+    }
+}
+
+/// BUSREG-ARM-EARLY — `f(path)` for `owner`'s early path at generation `gen`, [`app_path_with`]'s shape; `None` =
+/// no record at that generation, or its argv[0] is not absolute. `f` runs under the leaf lock and takes no lock.
+#[cfg(feature = "busreg")]
+pub fn app_path_early_of(owner: u64, gen: u64, f: impl FnOnce(&str) -> bool) -> Option<bool> {
+    if owner == 0 {
+        return None;
+    }
+    let t = APP_NAMES_EARLY.lock();
+    t.iter().find(|e| e.0 == owner && e.1 == gen && e.2.starts_with('/')).map(|e| f(e.2.as_str()))
+}
+
+/// BUSREG-ARM-EARLY — drop `owner`'s early record (the witness's cleanup; a teardown needs none: the generation moves).
+#[cfg(feature = "busreg")]
+pub fn app_name_early_forget(owner: u64) {
+    if owner == 0 {
+        return;
+    }
+    APP_NAMES_EARLY.lock().retain(|e| e.0 != owner);
 }
