@@ -1154,6 +1154,7 @@ fn listed(n: usize) -> Vec<Proposal> {
 fn an_anchored_glyph_over_the_listed_column_moves_right_with_a_leader() {
     use vug_view::sketch::INK;
     let mut vw = rectangle();
+    vw.view.resize(W + 96, H); // VUGINTENTSETFACEPUSHEDGE (SR606): a sheet wide enough that the right push fits (at W the push passes the edge, SR606's down case); x shifts by half the growth, so the left side stays over the column
     let (e, (sx, sy)) = left_side(&vw);
     let natural = (sx + 6.0, sy - 14.0);
     let n = ((natural.1 - 30.0) / 12.0).ceil().max(0.0) as usize + 1;
@@ -1226,7 +1227,10 @@ fn column_and_base() -> (usize, (f32, f32), f32) {
 fn a_wide_anchored_glyph_over_the_column_is_pushed_down_to_its_foot() {
     use vug_view::sketch::INK;
     let (n, natural, w0) = column_and_base();
-    let extra = ((W as f32 - natural.0 - w0) / 8.0).floor().max(0.0) as usize;
+    let guess = ((W as f32 - natural.0 - w0) / 8.0).floor().max(0.0) as usize;
+    let (_, g1, _) = anchored_over_column(&format!("v12{}", "a".repeat(guess)), n);
+    let excess = photo::glyph_rect(&g1).2 - (W as f32 - natural.0);
+    let extra = (guess as i64 - (excess / 8.0).ceil() as i64).max(0) as usize;
     let id = format!("v12{}", "a".repeat(extra));
     let (vw, g, col) = anchored_over_column(&id, n);
     let r = photo::glyph_rect(&g);
