@@ -796,7 +796,7 @@ impl prefs_core::wire::Store for KernelStore {
     }
     fn namespaces(&self) -> Vec<String> {
         namespaces()
-    }
+    } fn unset(&mut self, ns: &str, k: &str) -> Result<bool, prefs_core::wire::SetFail> { store_unset(ns, k) } // PREFS-UNSET-BUS (rmbp-ledger B1166): the bus UNSET's store arm is B1161's `unset` (file tail). LINE-NEUTRAL fold, code first
     /// SETTINGSFILES (B407): PrefDeclare — the program's stanza is held for its `app.<name>.*` writes and
     /// its descriptions head the keys in `settings/<name>`.
     fn declare(&mut self, name: &str, keys: Vec<prefs_core::declare::DeclKey>) -> i64 {
@@ -818,7 +818,7 @@ const _: () = assert!(
         && prefs_core::wire::VERB_GET == una_abi::BUS_VERB_PREF_GET
         && prefs_core::wire::VERB_SET == una_abi::BUS_VERB_PREF_SET
         && prefs_core::wire::VERB_LIST == una_abi::BUS_VERB_PREF_LIST
-        && prefs_core::wire::VERB_CHANGED == una_abi::BUS_VERB_PREF_CHANGED
+        && prefs_core::wire::VERB_CHANGED == una_abi::BUS_VERB_PREF_CHANGED && prefs_core::wire::VERB_UNSET == una_abi::BUS_VERB_PREF_UNSET // PREFS-UNSET-BUS (rmbp-ledger B1166): verb 29 pinned. LINE-NEUTRAL fold, code first
 );
 
 #[cfg(any(feature = "aarch64_el0", target_arch = "x86_64", all(target_arch = "aarch64", feature = "desktop_firmware")))] // the `crate::bus` cfg (lib.rs): no bus on this build, no bus fulfiller (merge9 fold); ARMNOEL0: widened with it so the aarch64 desktop without EL0 reads the store
@@ -985,7 +985,7 @@ pub fn selftest() {
         codec as u8, set_ok as u8, file_ok as u8, no_temp as u8, refused as u8, held as u8, restored as u8,
         loadclamp_ok as u8, clamp_ok as u8, if wire_ok { "shared" } else { "diverged" }, rows, if ok { "PASS" } else { "FAIL" }
     );
-    settingsfiles_selftest(); unset_selftest(); // PREFS-UNSET-VERB (rmbp-ledger B1161): the unset KAT (file tail). LINE-NEUTRAL fold, code first
+    settingsfiles_selftest(); unset_selftest(); unset_bus_selftest(); // PREFS-UNSET-VERB (rmbp-ledger B1161): the unset KAT (file tail). PREFS-UNSET-BUS (rmbp-ledger B1166): the bus UNSET KAT (file tail). LINE-NEUTRAL fold, code first
 }
 
 /// SETTINGSFILES (B407, R98) — `tests prefs`' second line (never at boot, R80): a program declares a stanza
@@ -1130,7 +1130,7 @@ pub fn bus_fulfil_from(verb: u8, body: &[u8], in_session: bool, owner: u64, text
             serial_println!("[prefs] set {}.{} refused: caller is not the session user", ns, k);
         }
     }
-    prefs_core::wire::fulfil_as(&mut KernelStore, verb, body, in_session, caller, text)
+    unset_bus_note(verb, body, caller, prefs_core::wire::fulfil_as(&mut KernelStore, verb, body, in_session, caller, text)) // PREFS-UNSET-BUS (rmbp-ledger B1166): a ring-3 UNSET is said with its caller (file tail). LINE-NEUTRAL fold, code first
 }
 
 #[cfg(any(feature = "aarch64_el0", target_arch = "x86_64"))]
@@ -2058,4 +2058,120 @@ pub(crate) fn lay_machine_store(mt: &crate::fs::vfs::MountTable) -> (bool, bool)
     }
     let made = mt.stat(&dir).is_err() && mt.create(&dir, crate::fs::vfs::NodeKind::Dir, crate::fs::vfs::KERNEL_PRINCIPAL).is_ok();
     (made, crate::fs::rootacl::stamp_store(mt, &dir))
+}
+
+// ── PREFS-UNSET-BUS (rmbp-ledger B1166, BP-storage-11) — TAIL-APPENDED ─────────────────────────────────────────────────
+// The bus UNSET (una-abi `BUS_VERB_PREF_UNSET` 29): `prefs_core::wire::fulfil_as`'s UNSET arm (`wire::unset_as`: the GET
+// address, SET's gate — -EACCES outside the session or past `cap::may_set` for the caller `bus_fulfil_from` stamped — then
+// `Store::unset`) over `KernelStore`, whose arm is B1161's [`unset`]: the one rule (removed from the tree, its domain saved
+// by the same swap, rolled back on a failed save) and the ONE `post_changes(default_applied)`. Reply: 0 + SR169's unset
+// form, -ENOENT already unset, -EINVAL malformed, -EIO the write. Principia's host store answers the same verb through the
+// same `fulfil_as` (`PrefStore::unset`). No relay: R3PREF_UNSET is owed (PREFS-UNSET-RELAY). Wire, after B1161's
+// `[prefs] unset <ns>.<key> ok=1` + `[prefs] changed <ns>.<key>`: `[prefs] unset <ns>.<key> ok=1 via=bus by=<prog>`,
+// `ok=1 was=unset via=bus …`, `ok=0 why=<refused|malformed|io> via=bus …`.
+
+/// `KernelStore::unset`: B1161's [`unset`] in the wire's failure words.
+fn store_unset(ns: &str, k: &str) -> Result<bool, prefs_core::wire::SetFail> {
+    unset(ns, k).map_err(|e| match e {
+        SetError::Refused(r) => prefs_core::wire::SetFail::Refused(r),
+        SetError::Name(n) => prefs_core::wire::SetFail::Name(n),
+        SetError::Io(_) => prefs_core::wire::SetFail::Io,
+    })
+}
+
+#[cfg(any(feature = "aarch64_el0", target_arch = "x86_64"))]
+/// [`bus_fulfil_from`]'s note: a ring-3 UNSET is said with its outcome and the stamped caller. Returns `st` unchanged.
+fn unset_bus_note(verb: u8, body: &[u8], caller: prefs_core::cap::Caller<'_>, st: i64) -> i64 {
+    if verb == prefs_core::wire::VERB_UNSET {
+        let a = prefs_core::wire::parse_get(body).map(|_| core::str::from_utf8(body).unwrap_or("?")).unwrap_or("<malformed>");
+        let who = prefs_caller_text(caller);
+        if st == 0 {
+            serial_println!("[prefs] unset {} ok=1 via=bus by={}", a, who);
+        } else if st == prefs_core::wire::ENOENT {
+            serial_println!("[prefs] unset {} ok=1 was=unset via=bus by={}", a, who);
+        } else {
+            let why = if st == prefs_core::wire::EACCES {
+                "refused"
+            } else if st == prefs_core::wire::EINVAL {
+                "malformed"
+            } else {
+                "io"
+            };
+            serial_println!("[prefs] unset {} ok=0 why={} via=bus by={}", a, why, who);
+        }
+    }
+    st
+}
+
+/// `tests prefs`' bus UNSET line (B1166): a scratch wm owner named `pcaptest` SETs then UNSETs its own
+/// `app.pcaptest.level` through [`bus_fulfil_from`] (0 + the frozen unset form, the key gone), unsets it again
+/// (-ENOENT), is refused `vein.endpoint` (-EACCES, kept) and an unset outside the session (-EACCES, kept); a bare
+/// namespace is -EINVAL. The name, the tree, ON_DISK and `settings/pcaptest` are restored.
+/// `:: PREFS-UNSET-BUS: unset=0 body=frozen again=enoent foreign=refused outside=refused name=einval restored=1 -> PASS ::`.
+#[cfg(feature = "witness")]
+fn unset_bus_selftest() {
+    #[cfg(any(feature = "aarch64_el0", target_arch = "x86_64"))]
+    {
+        unset_bus_legs();
+    }
+    #[cfg(not(any(feature = "aarch64_el0", target_arch = "x86_64")))]
+    {
+        serial_println!(":: PREFS-UNSET-BUS: SKIP (no ring-3 bus on this build) ::");
+    }
+}
+
+#[cfg(all(feature = "witness", any(feature = "aarch64_el0", target_arch = "x86_64")))]
+fn unset_bus_legs() {
+    use prefs_core::wire::{EACCES, EINVAL, ENOENT, VERB_SET, VERB_UNSET};
+    const OWNER: u64 = u64::MAX - 0x5F5; // beside smallfix4's SCRATCH: no launcher hands out an owner this high
+    const KEY: &str = "pcaptest.level";
+    let app = prefs_core::files::APP_NS;
+    if let Some(k) = crate::fs::vfs::home_unwritable(&crate::shell::vfs_mount_table(), &path()) {
+        serial_println!(":: PREFS-UNSET-BUS: dir={} -> SKIP reason=home-not-writable({}) ::", path(), k);
+        return;
+    }
+    ensure_loaded();
+    if get(app, KEY).is_some() || crate::video::wm::app_name_armed(OWNER) {
+        serial_println!(":: PREFS-UNSET-BUS: SKIP (app.{} held or the scratch owner named) ::", KEY);
+        return;
+    }
+    let dp = domain_path(&prefs_core::files::domain_of(app, KEY));
+    let saved = read_all(&dp);
+    let on_disk0 = ON_DISK.lock().clone();
+    let _ = crate::video::wm::app_name_arm(OWNER, "/apps/PCAPTEST.ELF");
+    let call = |verb: u8, body: &[u8], sess: bool, o: &mut Vec<u8>| -> i64 {
+        o.clear();
+        bus_fulfil_from(verb, body, sess, OWNER, o)
+    };
+    let mut o = Vec::new();
+    let set = call(VERB_SET, b"app.pcaptest.level\x003", true, &mut o) == 0;
+    let unset_st = call(VERB_UNSET, b"app.pcaptest.level", true, &mut o);
+    let body = o == prefs_core::wire::unset_body(app, KEY) && o.as_slice() == b"app.pcaptest.level\x00" && get(app, KEY).is_none();
+    let again = call(VERB_UNSET, b"app.pcaptest.level", true, &mut o) == ENOENT;
+    let ep = get("vein", "endpoint");
+    let foreign = call(VERB_UNSET, b"vein.endpoint", true, &mut o) == EACCES && get("vein", "endpoint") == ep;
+    let outside = call(VERB_SET, b"app.pcaptest.level\x003", true, &mut o) == 0
+        && call(VERB_UNSET, b"app.pcaptest.level", false, &mut o) == EACCES
+        && get(app, KEY).is_some();
+    let name = call(VERB_UNSET, b"app", true, &mut o) == EINVAL;
+    // Restore the name, the tree, ON_DISK and the domain file.
+    crate::video::wm::app_name_forget(OWNER);
+    let _ = TREE.lock().remove(app, KEY);
+    let mt = crate::shell::vfs_mount_table();
+    match &saved {
+        Some(b) => {
+            let _ = write_all(&dp, b);
+        }
+        None => {
+            let _ = mt.unlink(&dp, crate::fs::vfs::KERNEL_PRINCIPAL);
+        }
+    }
+    *ON_DISK.lock() = on_disk0;
+    let restored = read_all(&dp) == saved && get(app, KEY).is_none() && !crate::video::wm::app_name_armed(OWNER);
+    let ok = set && unset_st == 0 && body && again && foreign && outside && name && restored;
+    serial_println!(
+        ":: PREFS-UNSET-BUS: unset={} body={} again={} foreign={} outside={} name={} restored={} -> {} ::",
+        unset_st, if body { "frozen" } else { "MOVED" }, if again { "enoent" } else { "FAIL" }, if foreign { "refused" } else { "UNSET" },
+        if outside { "refused" } else { "UNSET" }, if name { "einval" } else { "FAIL" }, restored as u8, if ok { "PASS" } else { "FAIL" }
+    );
 }

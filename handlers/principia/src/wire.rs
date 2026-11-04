@@ -40,6 +40,15 @@ impl Store for PrefStore {
     fn namespaces(&self) -> Vec<String> {
         PrefStore::namespaces(self)
     }
+
+    /// PREFS-UNSET-BUS (rmbp-ledger B1166): the host store's removal under the shared UNSET arm
+    /// (`prefs_core::wire::unset_as`, which owns the capability and the reply) — SR588's [`PrefStore::unset`].
+    fn unset(&mut self, ns: &str, key: &str) -> Result<bool, SetFail> {
+        PrefStore::unset(self, ns, key).map_err(|e| {
+            log::warn!("[PRINCIPIA] :: wire unset {ns}.{key} failed: {e:#}");
+            SetFail::Io
+        })
+    }
 }
 
 /// One PREF verb in, `(status, reply body)` out — the kernel's `prefs::bus_fulfil` contract.
@@ -129,12 +138,10 @@ mod tests {
 /// caller ([`fulfil`]'s); then [`PrefStore::unset`]: `(0, unset_body)` when a value left the store (the PREF_CHANGED
 /// (19) body the transport posts), `(-ENOENT, [])` when it was unset already (nothing written), `(-EIO, [])` on a held
 /// domain or a failed write (the store rolled back).
+/// PREFS-UNSET-BUS (rmbp-ledger B1166): the byte request IS the una-abi verb now (`VERB_UNSET` 29) — the shared
+/// [`fulfil`], whose UNSET arm is `prefs_core::wire::unset_as` over this store's [`Store::unset`].
 pub fn unset(store: &mut PrefStore, body: &[u8], in_session: bool) -> (i64, Vec<u8>) {
-    let Some((ns, k)) = prefs_core::wire::parse_get(body) else { return (prefs_core::wire::EINVAL, Vec::new()) };
-    match unset_key(store, ns, k, in_session) {
-        Ok(posted) => (0, posted),
-        Err((st, _)) => (st, Vec::new()),
-    }
+    fulfil(store, prefs_core::wire::VERB_UNSET, body, in_session)
 }
 
 /// PRINCIPIA-UNSET-SYNAPSE (SR603): the ONE unset after the address, shared by the byte request ([`unset`]) and the
@@ -142,24 +149,23 @@ pub fn unset(store: &mut PrefStore, body: &[u8], in_session: bool) -> (i64, Vec<
 /// re-parsing would split a dotted namespace at its first dot). The refusals in SET's order, each with its words:
 /// -EINVAL the host store's own name words ([`crate::prefs::validate_ns`] / [`crate::prefs::validate_key`], the SET
 /// arm's); -EACCES outside the session or past [`prefs_core::cap::may_set`]; then [`PrefStore::unset`]: `Ok(unset_body)`
-/// when a value left the store, -ENOENT unset already, -EIO held or the write (the store's words, logged). The kernel's
-/// unset bus verb (F39PREFSUNSETBUS B1166, owed PREFS-UNSET-VERB) is the arm that will call this.
+/// when a value left the store, -ENOENT unset already, -EIO held or the write (the store's words, logged).
+/// PREFS-UNSET-BUS (rmbp-ledger B1166): after the host-word validation the road IS the shared one,
+/// `prefs_core::wire::unset_as` (the UNSET verb's arm: the capability, [`Store::unset`], `unset_body`), so the
+/// typed arm and the byte verb are one unset; the EIO words are the arm's, the store's own words are in the log.
 pub fn unset_key(store: &mut PrefStore, ns: &str, k: &str, in_session: bool) -> Result<Vec<u8>, (i64, String)> {
-    use prefs_core::wire::{Caller, EACCES, EINVAL, EIO, ENOENT};
+    use prefs_core::wire::{Caller, EACCES, EINVAL, ENOENT};
     if let Err(e) = crate::prefs::validate_ns(ns).and_then(|()| crate::prefs::validate_key(k)) {
         return Err((EINVAL, format!("{e:#}")));
     }
-    if !in_session || !prefs_core::cap::may_set(Caller::Kernel, ns, k) {
-        return Err((EACCES, format!("{ns}.{k}: not settable outside the session")));
-    }
-    match PrefStore::unset(store, ns, k) {
-        Ok(true) => Ok(prefs_core::wire::unset_body(ns, k)),
-        Ok(false) => Err((ENOENT, format!("{ns}.{k} is unset already"))),
-        Err(e) => {
-            log::warn!("[PRINCIPIA] :: wire unset {ns}.{k} failed: {e:#}");
-            Err((EIO, format!("{e:#}")))
-        }
-    }
+    prefs_core::wire::unset_as(store, ns, k, in_session, Caller::Kernel).map_err(|st| {
+        let words = match st {
+            EACCES => format!("{ns}.{k}: not settable outside the session"),
+            ENOENT => format!("{ns}.{k} is unset already"),
+            _ => format!("{ns}.{k}: the write failed (logged)"),
+        };
+        (st, words)
+    })
 }
 
 #[cfg(test)]
