@@ -408,6 +408,7 @@ pub fn key(view: &mut View, k: &str) -> Option<bool> {
 /// Enter on offer `i`: verified again against the sketch as it stands (an earlier accept may have changed it); a
 /// refusal is named in the corner and nothing is applied; an accepted one enters through `enter`.
 fn accept(view: &mut View, i: usize) -> bool {
+    if let Some(done) = set_road(view, i) { return done; } // VUGINTENTUNDOSET (SR563): a statement set enters whole, one journal step
     let (Some(face), Some(ph)) = (view.design.face.as_mut(), view.photo.as_mut()) else { return false };
     if ph.offers[i].streaming.is_some() {
         // VUGFACESTREAM (SR535): a preview enters only once the terminal answer has settled it.
@@ -861,4 +862,78 @@ fn judged(doc: &Doc, p: &Proposal, m: &Measurement, t: Option<&Measurement>) -> 
         Verdict::Accept { residual_sigma, .. } if residual_sigma <= outline_sigma => v,
         w => w,
     }
+}
+
+// ---- VUGINTENTUNDOSET (SR563): a statement set enters whole as one journal step (named tail block) ----
+
+/// Enter on offer `i` when it is a member of a doc_core statement set: the run is the consecutive Open, settled offers
+/// around `i` sharing its non-empty `why`; doc_core's `verify_all` decides whether the run is ONE set (`Batch.sets`
+/// from 0 over the whole run) and gives its one verdict, then [`judged`]'s thickness rule for a set that extrudes the
+/// photo's sketch. None (the single road) when the run is not one set. A refusal names itself and applies nothing; an
+/// accept enters through [`enter_set`].
+fn set_road(view: &mut View, i: usize) -> Option<bool> {
+    let (face, ph) = (view.design.face.as_ref()?, view.photo.as_ref()?);
+    let why = ph.offers.get(i)?.proposal.why.clone();
+    let member = |o: &Offer| o.state == State::Open && o.streaming.is_none() && !why.is_empty() && o.proposal.why == why;
+    if !member(&ph.offers[i]) {
+        return None;
+    }
+    let lo = (0..i).rev().take_while(|&j| member(&ph.offers[j])).last().unwrap_or(i);
+    let hi = (i + 1..ph.offers.len()).take_while(|&j| member(&ph.offers[j])).last().unwrap_or(i);
+    if hi == lo {
+        return None;
+    }
+    let set: Vec<Proposal> = ph.offers[lo..=hi].iter().map(|o| o.proposal.clone()).collect();
+    let doc = doc_of(face);
+    let b = doc_core::verify_all(&doc, &set, &ph.measurement(), Tol::DEFAULT);
+    if !b.sets.first().is_some_and(|(start, steps)| *start == 0 && steps.len() == set.len()) {
+        return None;
+    }
+    let mut verdict = b.entries.first()?.2.clone();
+    if let (Verdict::Accept { residual_sigma: outline_sigma, .. }, Some(t)) = (verdict.clone(), ph.thickness.as_ref()) {
+        if b.doc.stmts.iter().any(|s| matches!(s, Stmt::Extrude { sketch, .. } if sketch == SKETCH_ID)) {
+            match &doc_core::verify_all(&doc, &set, t, Tol::DEFAULT).entries.first()?.2 {
+                Verdict::Accept { residual_sigma, .. } if *residual_sigma <= outline_sigma => {}
+                w => verdict = w.clone(),
+            }
+        }
+    }
+    let f = face.clone();
+    let entered = match &verdict {
+        Verdict::Refuse { why } => Err(format!("refused {}", why.text())),
+        Verdict::Accept { .. } => enter_set(&mut view.design, &f, &doc, b.doc).map_err(|e| format!("refused by the sketch {e}")),
+    };
+    let ph = view.photo.as_mut()?;
+    for o in &mut ph.offers[lo..=hi] {
+        o.verdict = verdict.clone();
+    }
+    match entered {
+        Ok(()) => {
+            for o in &mut ph.offers[lo..=hi] {
+                o.state = State::Applied;
+            }
+            ph.note = Some(format!("applied set n={} {}", set.len(), why));
+            ph.focus = ph.offers.iter().position(|o| o.state == State::Open);
+        }
+        Err(e) => ph.note = Some(e),
+    }
+    Some(true)
+}
+
+/// The accepted set's document `cand` into the journal as ONE snapshot, on a copy (the journal untouched on a refusal,
+/// [`extrude_road`]'s shape): `Journal::record` makes the face's sketch the document before the set, which must be
+/// `doc` (the names the set was verified in), then `Journal::adopt(cand)`; the journal, face and body swapped in.
+fn enter_set(d: &mut crate::sketch::Design, f: &SketchFace, doc: &Doc, cand: Doc) -> Result<(), String> {
+    let mut j = d.journal.clone();
+    j.record(Some(f), None);
+    if j.doc != *doc {
+        return Err("the document is not the photo's sketch".to_string());
+    }
+    let r = j.adopt(cand)?;
+    d.journal = j;
+    d.face = r.face;
+    d.body = r.body;
+    d.pull = None;
+    d.refusal = None;
+    Ok(())
 }

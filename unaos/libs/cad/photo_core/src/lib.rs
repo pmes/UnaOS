@@ -65,12 +65,15 @@ pub struct PhotoParams {
     /// The measurement band: `lin` the outline acceptance the face shows (mm); `ang` the largest camera tilt off
     /// square accepted (radians) before [`Refusal::GridUnsquare`].
     pub band: Tol,
+    /// VUG-PHOTO-SIDE-PARALLAX (SR568): the camera's height above the paper (mm), the person's once-per-setup datum
+    /// for [`measure_side_raised`]; `None` self-calibrates it from the lattice homography ([`camera`]).
+    pub camera_mm: Option<f64>,
 }
 
 impl PhotoParams {
     /// `pitch_mm` with the default band: 0.5 mm, 20°.
     pub fn new(pitch_mm: f64) -> PhotoParams {
-        PhotoParams { pitch_mm, band: Tol { lin: 0.5, ang: 20.0 * core::f64::consts::PI / 180.0 } }
+        PhotoParams { pitch_mm, band: Tol { lin: 0.5, ang: 20.0 * core::f64::consts::PI / 180.0 }, camera_mm: None }
     }
 }
 
@@ -106,6 +109,11 @@ pub enum Refusal {
     /// VUG-PHOTO-SIDE (SR545): the side photo's long dimension `length_mm` matches no extent of the first outline:
     /// `nearest_mm` the nearer extent, `band_mm` the 3 σ band it missed by more than.
     NoSideMatch { length_mm: f64, nearest_mm: f64, band_mm: f64 },
+    /// VUG-PHOTO-SIDE-PARALLAX (SR568): the camera is tilted `tilt_deg` (under [`CALIB_MIN_DEG`]), too square to the
+    /// paper for the homography to give its height, and no `PhotoParams::camera_mm` was stated.
+    NoCamera { tilt_deg: f64 },
+    /// VUG-PHOTO-SIDE-PARALLAX (SR568): the camera (`height_mm`) is not above the standing part's top (`standing_mm`).
+    Parallax { height_mm: f64, standing_mm: f64 },
 }
 
 impl Refusal {
@@ -123,6 +131,8 @@ impl Refusal {
             Refusal::Uncertain => "Uncertain",
             Refusal::Sketch(_) => "Sketch",
             Refusal::NoSideMatch { .. } => "NoSideMatch",
+            Refusal::NoCamera { .. } => "NoCamera",
+            Refusal::Parallax { .. } => "Parallax",
         }
     }
 }
@@ -325,12 +335,23 @@ pub struct Side {
     pub paired_mm: f64,
     /// The side photo's own measurement.
     pub side: Measured,
+    /// VUG-PHOTO-SIDE-PARALLAX (SR568): the raised-edge correction [`measure_side_raised`] applied; `None` on the flat
+    /// road ([`measure_side`]).
+    pub parallax: Option<Parallax>,
 }
 
 /// An outline's (long, short) extents (mm) in the frame of its longest line (the paper's x when it has none): the box
 /// (`geom_core::Aabb2`) of its line ends, its arcs' ends and their extreme points on the frame's axes, and its circles'
 /// extreme points. `None` for an empty outline.
 pub fn extents(o: &fit::Outline) -> Option<(f64, f64)> {
+    let (_, b) = extents_box(o)?;
+    let (ex, ey) = (b.max.x - b.min.x, b.max.y - b.min.y);
+    Some((ex.max(ey), ex.min(ey)))
+}
+
+/// [`extents`]' frame and box: the longest line's direction `d` and the box of the outline's extreme points in the
+/// local `(p · d, p · d.perp())` coordinates (VUG-PHOTO-SIDE-PARALLAX SR568 corrects each side of it).
+pub fn extents_box(o: &fit::Outline) -> Option<(Vec2, geom_core::Aabb2)> {
     let d = o
         .outer
         .iter()
@@ -366,8 +387,7 @@ pub fn extents(o: &fit::Outline) -> Option<(f64, f64)> {
     }
     let local: Vec<Vec2> = pts.iter().map(|&p| Vec2::new(p.dot(d), p.dot(n))).collect();
     let b = geom_core::Aabb2::from_points(&local).ok()?;
-    let (ex, ey) = (b.max.x - b.min.x, b.max.y - b.min.y);
-    Some((ex.max(ey), ex.min(ey)))
+    Some((d, b))
 }
 
 /// Whether `q` (on the circle about `c`) lies on the sweep from `from` to `to`, counterclockwise when `ccw`.
@@ -395,5 +415,139 @@ pub fn measure_side(first: &Measured, side: &Image, params: PhotoParams, tol: To
     if !((length - paired).abs() <= band) {
         return Err(Refusal::NoSideMatch { length_mm: length, nearest_mm: paired, band_mm: band });
     }
-    Ok(Side { thickness_mm: thickness, sigma_mm: s.sigma_mm, length_mm: length, paired_mm: paired, side: s })
+    Ok(Side { thickness_mm: thickness, sigma_mm: s.sigma_mm, length_mm: length, paired_mm: paired, side: s, parallax: None })
+}
+
+// VUG-PHOTO-SIDE-PARALLAX (SR568): a part standing on its side rises above the paper by its STANDING dimension (the
+// first outline's extent the side photo is not paired with), so the camera, at height Hc over the paper point N (its
+// nadir), sees a point at height Z where the paper point N + k (p - N) is, k = Hc / (Hc - Z). The side silhouette is the
+// hull of the footprint and the top scaled by k about N; its support along any direction u is max(h_F(u), N.u + k (h_F(u)
+// - N.u)), which inverts per side exactly: a box side beyond the nadir has its offset divided by k, a near side is the
+// footprint's own. Hc and N come from the side photo's lattice homography (the principal point the photo centre, the
+// lens model's centre, square pixels: the two image-of-the-absolute-conic constraints give 1 / f², then K⁻¹ H = λ [r1 r2 t]
+// and the camera centre -(r1·t, r2·t, r3·t)) when the camera is tilted at least CALIB_MIN_DEG; a square camera knows only
+// f / Hc, so the person states Hc once per setup (`PhotoParams::camera_mm`) and N is the photo centre through H⁻¹.
+
+/// The least camera tilt (degrees) the homography self-calibrates the camera's height and nadir from.
+pub const CALIB_MIN_DEG: f64 = 6.0;
+
+/// The camera over the paper, in the lattice's paper millimetres.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Camera {
+    /// The paper point under the camera centre (mm).
+    pub nadir: Vec2,
+    /// The camera centre's height above the paper (mm).
+    pub height_mm: f64,
+    /// The self-calibrated focal length (px); `None` when the person stated the height.
+    pub focal_px: Option<f64>,
+}
+
+/// The raised-edge correction a side measurement took.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Parallax {
+    pub camera: Camera,
+    /// The standing part's height above the paper (mm): the first outline's unpaired extent.
+    pub standing_mm: f64,
+    /// The top's magnification about the nadir, Hc / (Hc - standing).
+    pub k: f64,
+    /// The side outline's (long, short) extents before the correction (mm).
+    pub raw_length_mm: f64,
+    pub raw_thickness_mm: f64,
+}
+
+/// The camera from a paper-to-photo homography `h` of a `w` x `h_px` photo (principal point the photo centre, square
+/// pixels); `None` when the perspective is too weak to give a positive finite 1 / f².
+pub fn camera_pose(h: &homography::H, w: f64, h_px: f64) -> Option<Camera> {
+    let (u0, v0) = (w * 0.5, h_px * 0.5);
+    let g = [
+        [h[0][0] - u0 * h[2][0], h[0][1] - u0 * h[2][1], h[0][2] - u0 * h[2][2]],
+        [h[1][0] - v0 * h[2][0], h[1][1] - v0 * h[2][1], h[1][2] - v0 * h[2][2]],
+        h[2],
+    ];
+    let a1 = g[0][0] * g[0][1] + g[1][0] * g[1][1];
+    let b1 = g[2][0] * g[2][1];
+    let a2 = g[0][0] * g[0][0] + g[1][0] * g[1][0] - g[0][1] * g[0][1] - g[1][1] * g[1][1];
+    let b2 = g[2][0] * g[2][0] - g[2][1] * g[2][1];
+    let x = -(a1 * b1 + a2 * b2) / (a1 * a1 + a2 * a2);
+    if !(x.is_finite() && x > 0.0) {
+        return None;
+    }
+    let f = 1.0 / libm::sqrt(x);
+    let col = |i: usize| geom_core::Vec3::new(g[0][i] / f, g[1][i] / f, g[2][i]);
+    let (m0, m1, m2) = (col(0), col(1), col(2));
+    let lam = 2.0 / (m0.mag() + m1.mag());
+    if !lam.is_finite() {
+        return None;
+    }
+    let (r1, r2, t) = (m0 * lam, m1 * lam, m2 * lam);
+    let r3 = r1.cross(r2);
+    let nadir = Vec2::new(-r1.dot(t), -r2.dot(t));
+    let height_mm = r3.dot(t).abs();
+    if !(nadir.is_finite() && height_mm.is_finite() && height_mm > 0.0) {
+        return None;
+    }
+    Some(Camera { nadir, height_mm, focal_px: Some(f) })
+}
+
+/// The camera over the photo `m` measured (`w` x `h_px` px): self-calibrated when its tilt is at least
+/// [`CALIB_MIN_DEG`] (the height replaced by `camera_mm` when the person stated one); else `camera_mm` with the nadir
+/// the photo centre through H⁻¹ (exact for a square camera); else [`Refusal::NoCamera`].
+pub fn camera(m: &Measured, w: f64, h_px: f64, camera_mm: Option<f64>) -> Result<Camera, Refusal> {
+    let pose = if m.tilt_deg >= CALIB_MIN_DEG { camera_pose(&m.h, w, h_px) } else { None };
+    match (pose, camera_mm) {
+        (Some(c), None) => Ok(c),
+        (Some(c), Some(hc)) => Ok(Camera { height_mm: hc, ..c }),
+        (None, Some(hc)) => {
+            let inv = homography::invert(&m.h).map_err(Refusal::Degenerate)?;
+            let nadir = homography::apply(&inv, Vec2::new(w * 0.5, h_px * 0.5)).ok_or(Refusal::Uncertain)?;
+            Ok(Camera { nadir, height_mm: hc, focal_px: None })
+        }
+        (None, None) => Err(Refusal::NoCamera { tilt_deg: m.tilt_deg }),
+    }
+}
+
+/// [`extents`] of a raised outline: each side of [`extents_box`] beyond the nadir's coordinate pulled back by `1 / k`.
+pub fn extents_raised(o: &fit::Outline, nadir: Vec2, k: f64) -> Option<(f64, f64)> {
+    let (d, b) = extents_box(o)?;
+    let c = Vec2::new(nadir.dot(d), nadir.dot(d.perp()));
+    let side = |lo: f64, hi: f64, c: f64| {
+        let hi = if hi > c { c + (hi - c) / k } else { hi };
+        let lo = if lo < c { c + (lo - c) / k } else { lo };
+        hi - lo
+    };
+    let (ex, ey) = (side(b.min.x, b.max.x, c.x), side(b.min.y, b.max.y, c.y));
+    Some((ex.max(ey), ex.min(ey)))
+}
+
+/// [`measure_side`] for a real photo: the part stands on its side, its top raised by the first outline's unpaired
+/// extent; the side outline's extents are corrected for the parallax ([`extents_raised`]) under both pairings (paired
+/// with the first's long extent, standing on its short one, and the converse), the smaller miss taken; outside the 3 σ
+/// band [`Refusal::NoSideMatch`] carries the corrected length. The camera is [`camera`]'s.
+pub fn measure_side_raised(first: &Measured, side: &Image, params: PhotoParams, tol: Tol) -> Result<Side, Refusal> {
+    let s = measure(side, params, tol)?;
+    let (raw_length_mm, raw_thickness_mm) = extents(&s.shape).ok_or(Refusal::Uncertain)?;
+    let (long, short) = extents(&first.shape).ok_or(Refusal::Uncertain)?;
+    let cam = camera(&s, side.width as f64, side.height as f64, params.camera_mm)?;
+    let band = fit::BAND_SIGMA * libm::hypot(first.sigma_mm, s.sigma_mm);
+    // (miss, length, thickness, paired, standing, k)
+    let mut best: Option<(f64, f64, f64, f64, f64, f64)> = None;
+    for (paired, standing) in [(long, short), (short, long)] {
+        if !(cam.height_mm > standing) {
+            continue;
+        }
+        let k = cam.height_mm / (cam.height_mm - standing);
+        let (length, thickness) = extents_raised(&s.shape, cam.nadir, k).ok_or(Refusal::Uncertain)?;
+        let miss = (length - paired).abs();
+        if best.map_or(true, |b| miss < b.0) {
+            best = Some((miss, length, thickness, paired, standing, k));
+        }
+    }
+    let Some((miss, length, thickness, paired, standing, k)) = best else {
+        return Err(Refusal::Parallax { height_mm: cam.height_mm, standing_mm: short });
+    };
+    if !(miss <= band) {
+        return Err(Refusal::NoSideMatch { length_mm: length, nearest_mm: paired, band_mm: band });
+    }
+    let parallax = Parallax { camera: cam, standing_mm: standing, k, raw_length_mm, raw_thickness_mm };
+    Ok(Side { thickness_mm: thickness, sigma_mm: s.sigma_mm, length_mm: length, paired_mm: paired, side: s, parallax: Some(parallax) })
 }
