@@ -63,6 +63,9 @@ pub use mesh::{Mesh, Topo};
 pub use pose::{ModelMap, Surfel, TrackError, TrackParams, Tracked, Tracker, raycast};
 pub use probe_core::{DepthScale, Frame, Intrinsics, PixelFormat};
 pub use tsdf::{Integrated, Tsdf, Voxel, integrate};
+// VUGSCANGDT (LEDGER SR542): the deviation read as ISO 1101 flatness / cylindricity / position per design face.
+pub mod gdt;
+pub use gdt::{FaceGdt, GDT_MIN_POINTS, GDT_NORMAL_DEG, Kind, Nominal, Verdict, gdt, nominal, position_mm};
 
 /// Why a frame, a volume or an extraction was refused. Every refusal leaves the volume as it was.
 #[derive(Clone, Copy, Debug, PartialEq)]
