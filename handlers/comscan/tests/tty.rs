@@ -871,3 +871,120 @@ fn a_hold_during_a_jog_writes_jog_cancel() {
     assert_eq!(rt.last(), Some(&0x85u8), "the jog cancel byte on the wire: {rt:?}");
     assert!(!rt.contains(&b'!'), "a jog cancel is not a feed hold: {rt:?}");
 }
+
+// --- VUGCOMSCANALARMRESET (SR585): Stop on a critical alarm is the soft reset at once, then `$X`; a jog past the declared travel is refused before the wire ---
+
+/// A fake grbl with a CRITICAL alarm: silent until the open's soft reset, then its banner; answers `$I`; the stream line
+/// `alarm_at` (0-based) is answered `ALARM:1` (hard limit), after which it answers no line at all and every `?` with
+/// `<Alarm|..>` (grbl hears only a soft reset); the soft reset after the alarm says the banner and
+/// `[MSG:'$H'|'$X' to unlock]`, and `$X` then says `[MSG:Caution: Unlocked]` and `ok` (Idle after). Returns the lines it
+/// took, every realtime byte (`?` `!` `~` 0x18 0x85) and whether it ended unlocked, once `$X` unlocked it.
+fn fake_grbl_locked(mut m: File, alarm_at: usize) -> JoinHandle<(Vec<String>, Vec<u8>, bool, File)> {
+    thread::spawn(move || {
+        let (mut got, mut rt, mut cur) = (Vec::new(), Vec::new(), Vec::<u8>::new());
+        let (mut stream, mut alarmed, mut reset_after, mut unlocked) = (0usize, false, false, false);
+        let mut buf = [0u8; 256];
+        while !unlocked {
+            let n = match m.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            for &b in &buf[..n] {
+                match b {
+                    0x18 => {
+                        rt.push(b);
+                        cur.clear();
+                        m.write_all(b"\r\n").unwrap();
+                        m.write_all(BANNER).unwrap();
+                        if alarmed {
+                            reset_after = true;
+                            m.write_all(b"[MSG:'$H'|'$X' to unlock]\r\n").unwrap();
+                        }
+                    }
+                    b'?' => {
+                        rt.push(b);
+                        let st = if alarmed { "Alarm" } else { "Idle" };
+                        m.write_all(format!("<{st}|MPos:0.000,0.000,0.000|FS:0,0>\r\n").as_bytes()).unwrap();
+                    }
+                    b'!' | b'~' | 0x85 => rt.push(b),
+                    b'\n' => {
+                        let line = String::from_utf8_lossy(&cur).trim().to_string();
+                        cur.clear();
+                        if alarmed && !reset_after {
+                            continue; // the critical alarm: nothing but a soft reset is heard
+                        }
+                        if said_hello(&mut m, &line, VER_A) {
+                            continue;
+                        }
+                        got.push(line.clone());
+                        if line == "$X" && alarmed {
+                            alarmed = false;
+                            unlocked = true;
+                            m.write_all(b"[MSG:Caution: Unlocked]\r\nok\r\n").unwrap();
+                        } else if stream == alarm_at && !alarmed && !reset_after {
+                            alarmed = true;
+                            m.write_all(b"ALARM:1\r\n").unwrap();
+                        } else {
+                            stream += 1;
+                            m.write_all(b"ok\r\n").unwrap();
+                        }
+                    }
+                    _ => cur.push(b),
+                }
+            }
+        }
+        (got, rt, unlocked, m)
+    })
+}
+
+#[test]
+fn a_hard_limit_alarm_then_stop_resets_and_unlocks() {
+    let (m, path, _s) = pty();
+    let fake = fake_grbl_locked(m, 2);
+    let (mut desk, mut open) = started_desk(&path);
+    let t0 = Instant::now();
+    let mut words = Vec::new();
+    assert_eq!(drive_until(&mut desk, &mut *open, t0, &mut words, |e| e.starts_with("alarm")), "alarm:1 Hard limit");
+    assert!(matches!(desk.state(), Some(PumpState::Halted(_))), "{:?}", desk.state());
+
+    // The controller reports Alarm, never Idle / Hold:0: Stop is the soft reset at once, not a feed hold that waits.
+    let stop = PumpEvent::PumpStop { principal: Origin::LocalUser("una".to_string()) };
+    assert_eq!(said_in(&desk.apply(&stop, &mut *open)), "reset sent");
+    assert_eq!(desk.state(), Some(PumpState::Stopped), "stopped, not stopping: nothing waits on a report");
+    assert_eq!(drive_until(&mut desk, &mut *open, t0, &mut words, |e| e == "unlocked"), "unlocked", "{words:?}");
+    assert!(words.iter().any(|w| w == "unlock sent: $X"), "{words:?}");
+    assert_eq!(desk.state(), Some(PumpState::Stopped));
+    drop(desk);
+    drop(open);
+    let (lines, rt, unlocked, _m) = fake.join().unwrap();
+    assert_eq!(lines.last().map(String::as_str), Some("$X"), "{lines:?}");
+    assert_eq!(rt.iter().filter(|&&b| b == 0x18).count(), 2, "the open's reset and the Stop's: {rt:?}");
+    assert!(!rt.contains(&b'!'), "no feed hold on an alarm halt: {rt:?}");
+    assert!(unlocked, "the controller is unlocked (Idle) after the `$X`");
+}
+
+#[test]
+fn a_jog_past_the_declared_travel_is_refused_with_nothing_on_the_wire() {
+    let (m, path, _s) = pty();
+    let fake = fake_grbl_alarm(m, usize::MAX);
+    let (mut desk, mut open) = started_desk(&path);
+    let t0 = Instant::now();
+    let mut words = Vec::new();
+    assert_eq!(drive_until(&mut desk, &mut *open, t0, &mut words, |e| e == "done"), "done");
+
+    // The declared X axis runs -50..300 (travel 350): a 400 mm jog cannot fit wherever the axis stands.
+    let who = || Origin::LocalUser("una".to_string());
+    let far = PumpEvent::PumpJog { principal: who(), dx: 400.0, dy: 0.0, dz: 0.0, feed: 300.0 };
+    assert_eq!(
+        refused_in(&desk.apply(&far, &mut *open)),
+        "jog: X400 is past the declared X travel 350 (the position is not polled outside a job: the jog's delta is bounded)"
+    );
+    let home = PumpEvent::PumpHome { principal: who() };
+    assert_eq!(said_in(&desk.apply(&home, &mut *open)), "home sent: $H");
+    assert_eq!(drive_until(&mut desk, &mut *open, t0, &mut words, |e| e.starts_with("home")), "home ok", "{words:?}");
+    drop(desk);
+    drop(open);
+    let (lines, _rt, _m) = fake.join().unwrap();
+    assert_eq!(lines.last().map(String::as_str), Some("$H"), "{lines:?}");
+    assert!(!lines.iter().any(|l| l.starts_with("$J=")), "the refused jog never reached the wire: {lines:?}");
+}
