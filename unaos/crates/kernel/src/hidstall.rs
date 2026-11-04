@@ -1833,7 +1833,7 @@ fn phase_open() {
     for a in PH_ACC.iter() {
         a.store(0, Relaxed);
     }
-    PH_LAST.store(now_us(), Relaxed);
+    PH_LAST.store(now_us(), Relaxed); #[cfg(all(target_arch = "x86_64", feature = "ehcihid"))] { lock_pass_clear(); } // F39HIDLOCKWHO (B1148): this pass's EHCI_HID holder cleared (file tail). LINE-NEUTRAL fold, code first
     PH_OPEN.store(true, Relaxed);
 }
 
@@ -1853,7 +1853,7 @@ fn phase_close() {
 
 /// [`pass_begin`]'s minute-worst win: that gap's pass's phase becomes the minute's.
 fn phase_keep_min() {
-    PH_MIN.store(PH_PASS.load(Relaxed), Relaxed);
+    PH_MIN.store(PH_PASS.load(Relaxed), Relaxed); #[cfg(all(target_arch = "x86_64", feature = "ehcihid"))] { lock_keep_min(); } // F39HIDLOCKWHO (B1148): and that pass's EHCI_HID holder, in the same keep (file tail). LINE-NEUTRAL fold, code first
 }
 
 /// [`pass_begin`]'s boot-worst win: that gap's pass's phase becomes the boot's.
@@ -1903,7 +1903,7 @@ impl core::fmt::Display for PhaseWord {
         if !self.1 || phase_unpack(self.0).is_none() {
             return Ok(());
         }
-        write!(f, " phase={}", PhaseName(self.0))
+        write!(f, " phase={}", PhaseName(self.0))?; #[cfg(all(target_arch = "x86_64", feature = "ehcihid"))] { if lock_phase(self.0) { write!(f, " lock_by={}", lock_by_min())?; } } Ok(()) // F39HIDLOCKWHO (B1148): ` lock_by=` only when the kept phase is `lock` (file tail). LINE-NEUTRAL fold
     }
 }
 
@@ -1913,7 +1913,7 @@ fn phase_kat() -> bool {
     let empty = phase_longest(&[0; PH_N]);
     let fwd = phase_longest(&[0, 0, 0, 0, 900, 4_200, 0, 0]);
     let lock = phase_longest(&[2_000, 0, 0, 0, 0, 0, 9_100, 400]); // F39HIDPHASELOCK (B1142): the EHCI_HID wait names the pass
-    let ps2 = phase_longest(&[2_000, 0, 0, 0, 0, 0, 400, 5_900]); // F39HIDPHASELOCK (B1142): the i8042/touchpad pumps name it
+    let ps2 = phase_longest(&[2_000, 0, 0, 0, 0, 0, 400, 5_900]); #[cfg(all(target_arch = "x86_64", feature = "ehcihid"))] { if !lock_who_kat(lock, ps2) { return false; } } // F39HIDLOCKWHO (B1148): the lock-who case (file tail). F39HIDPHASELOCK (B1142): the i8042/touchpad pumps name it
     phase_unpack(tie) == Some(("hub", 278))
         && empty == 0
         && phase_unpack(empty).is_none()
@@ -1929,4 +1929,119 @@ fn phase_kat() -> bool {
 // right after `EHCI_HID.lock()` (only atomic stamps run between `pass_begin` and the take, so `lock` is the wait) and
 // `ps2` right after `dwi2c::touchpad::pump()` (`pointerfeel::note_pass` + the two pumps); `svc` is then the controller
 // service alone. Two more names, [`PH_LOCK`] / [`PH_PS2`], in B1137's block above; [`phase_longest`] is unchanged.
-// aarch64 marks neither. Who held the lock is owed (HID-LOCK-WHO) until a flight reads `phase=lock`.
+// aarch64 marks neither. Who held the lock: F39HIDLOCKWHO (B1148) below.
+
+// ── F39HIDLOCKWHO (rmbp-ledger B1148) — HID-LOCK-WHO: a PASS-LONG minute whose kept phase is `lock` names the holder. ──
+// B1142's `phase=lock:<ms>` said the hid pump's pass waited on `EHCI_HID` but not on whom. LOCKREG already records every
+// `sync::Mutex`'s holder as `(tid, cpu)` (`Mutex::holder`), and no safe tid -> name lookup exists (`current_named_slab`
+// is own-core only), so each recorded taker names ITSELF into the ONE name record, [`MaskWho`] ([`lock_took`], right
+// after its guard: `sched::current_name()`, the take's own `Location` and core, plus its tid); lockowner is untouched
+// (it keeps a tid for release-on-death only). `ehci::service_ehci_hid`, BEFORE its take and only while the lock is held,
+// [`lock_peek`]s: the record names the holder only when its tid IS the registry's holder tid, else `?:<tid>` (an
+// unrecorded site: the hidboot KAT, the holocron fixture, the note's window), `-` with no tracked holder. The pass keeps
+// it ([`phase_open`] clears, [`phase_keep_min`] copies beside `PH_MIN`); `PhaseWord` prints ` lock_by=` only when the
+// kept phase is `lock`. Writers of the take record are serialised by `EHCI_HID` itself; the pass record has one writer,
+// the hid pump (as `PH_*`). The name is the holder AT THE PEEK: a lock handed between takers in one wait names the
+// first. No ISR takes `EHCI_HID` (ehci/mod.rs ISRARM). x86 + `ehcihid` only. Owed: HID-LOCK-WHO-KATSITES.
+
+/// F39HIDLOCKWHO (B1148): the last recorded `EHCI_HID` taker (name, site, core) and its tid.
+#[cfg(all(target_arch = "x86_64", feature = "ehcihid"))]
+static LOCK_WHO: MaskWho = MaskWho::new();
+#[cfg(all(target_arch = "x86_64", feature = "ehcihid"))]
+static LOCK_TID: AtomicU64 = AtomicU64::new(0);
+/// F39HIDLOCKWHO (B1148): the holder this pass waited on, and the minute's worst gap's pass's (tid 0 = none tracked).
+#[cfg(all(target_arch = "x86_64", feature = "ehcihid"))]
+static LOCK_PASS: MaskWho = MaskWho::new();
+#[cfg(all(target_arch = "x86_64", feature = "ehcihid"))]
+static LOCK_PASS_TID: AtomicU64 = AtomicU64::new(0);
+#[cfg(all(target_arch = "x86_64", feature = "ehcihid"))]
+static LOCK_MIN: MaskWho = MaskWho::new();
+#[cfg(all(target_arch = "x86_64", feature = "ehcihid"))]
+static LOCK_MIN_TID: AtomicU64 = AtomicU64::new(0);
+
+/// F39HIDLOCKWHO (B1148): an `EHCI_HID` take, right after its guard — the caller names itself (task, this site, core).
+#[cfg(all(target_arch = "x86_64", feature = "ehcihid"))]
+#[track_caller]
+pub fn lock_took() {
+    LOCK_WHO.note_at(crate::arch::sched::current_name(), core::panic::Location::caller(), crate::arch::percpu::this_cpu().cpu_index as usize);
+    LOCK_TID.store(crate::sync::here_tid(), Release);
+}
+
+/// F39HIDLOCKWHO (B1148): `service_ehci_hid`, before its take, the lock held by `holder` (the registry's `(tid, cpu)`).
+#[cfg(all(target_arch = "x86_64", feature = "ehcihid"))]
+pub fn lock_peek(holder: Option<(u64, usize)>) {
+    if !PH_OPEN.load(Relaxed) {
+        return;
+    }
+    let tid = holder.map_or(0, |h| h.0);
+    let rec = LOCK_TID.load(Acquire);
+    let by = LOCK_WHO.read(false);
+    lock_keep(&LOCK_PASS, &LOCK_PASS_TID, by, lock_named(rec, tid), tid);
+}
+
+/// Into `dst`: `by` when `named`, else cleared; `tid` beside it.
+#[cfg(all(target_arch = "x86_64", feature = "ehcihid"))]
+fn lock_keep(dst: &MaskWho, dst_tid: &AtomicU64, by: MaskedBy, named: bool, tid: u64) {
+    match by.site() {
+        Some(site) if named => dst.note_at(by.name(), site, by.core),
+        _ => {
+            let _ = dst.read(true);
+        }
+    }
+    dst_tid.store(tid, Relaxed);
+}
+
+/// [`phase_open`]: a new pass waited on nobody yet.
+#[cfg(all(target_arch = "x86_64", feature = "ehcihid"))]
+fn lock_pass_clear() {
+    let _ = LOCK_PASS.read(true);
+    LOCK_PASS_TID.store(0, Relaxed);
+}
+
+/// [`phase_keep_min`]: that gap's pass's holder becomes the minute's.
+#[cfg(all(target_arch = "x86_64", feature = "ehcihid"))]
+fn lock_keep_min() {
+    let by = LOCK_PASS.read(false);
+    let tid = LOCK_PASS_TID.load(Relaxed);
+    lock_keep(&LOCK_MIN, &LOCK_MIN_TID, by, by.site().is_some(), tid);
+}
+
+/// The minute's holder for the gap split ([`LOCK_MIN`] is written in the same keep as `PH_MIN`).
+#[cfg(all(target_arch = "x86_64", feature = "ehcihid"))]
+fn lock_by_min() -> LockBy {
+    LockBy(LOCK_MIN.read(false), LOCK_MIN_TID.load(Relaxed))
+}
+
+/// The record names the holder: the holder is tracked (`holder != 0`) and the recorded taker IS it. Pure.
+#[cfg(all(target_arch = "x86_64", feature = "ehcihid"))]
+pub fn lock_named(rec: u64, holder: u64) -> bool {
+    holder != 0 && rec == holder
+}
+
+/// The packed phase ([`phase_longest`]'s shape) is `lock`. Pure.
+#[cfg(all(target_arch = "x86_64", feature = "ehcihid"))]
+pub fn lock_phase(w: u64) -> bool {
+    (w >> 32) as usize == PH_LOCK + 1
+}
+
+/// `lock_by=`: `<task>@<file>:<line>@c<n>` named, `?:<tid>` tracked but unrecorded, `-` no tracked holder.
+#[cfg(all(target_arch = "x86_64", feature = "ehcihid"))]
+struct LockBy(MaskedBy, u64);
+#[cfg(all(target_arch = "x86_64", feature = "ehcihid"))]
+impl core::fmt::Display for LockBy {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        if self.1 == 0 {
+            return f.write_str("-");
+        }
+        if self.0.site().is_none() {
+            return write!(f, "?:{}", self.1);
+        }
+        write!(f, "{}", self.0)
+    }
+}
+
+/// `phase_kat`'s lock-who case: the name rule and the print gate on synthetic cases. Pure.
+#[cfg(all(target_arch = "x86_64", feature = "ehcihid"))]
+fn lock_who_kat(lock: u64, ps2: u64) -> bool {
+    lock_named(7, 7) && !lock_named(9, 7) && !lock_named(0, 0) && !lock_named(7, 0) && lock_phase(lock) && !lock_phase(ps2) && !lock_phase(0)
+}
