@@ -2410,3 +2410,72 @@ fn a_near_cube_s_basins_scored() {
         Err(e) => println!("coarsesymthree: today road={:?} refused {e:?}", map.road),
     }
 }
+
+// ---- VUGSCANCOARSESYMTHREEKEEP (LEDGER SR659): a near-cube keeps every near-tie start and aligns ----
+// SR657's near-cube, carried by SR657's pose (SR615's known pose after a 35° yaw), opened on the coarse road: the design
+// is three-equal, so `measure_coarse` takes scan_core's `three_or` (every start of the three About sweeps whose keep-0.3
+// rank is within gate(2) of the best). The test prints all 72 swept starts (pivot axis, rank, score, nearest cube-group
+// basin and its angle, kept), then the road; the decision rule, fixed before the run: the truth basin (0) has a kept
+// start and the road aligns within 1° and 2 mm of the truth.
+
+#[test]
+fn a_near_cube_aligns_on_the_three_equal_road() {
+    use scan_core::deviation::{Road, Sweep, swept};
+    let doc = doc_core::read(CUBE_DOC).expect("the document reads");
+    let (s, c) = (35.0 * DEG).sin_cos();
+    let yaw = fixture::from_axes(Vec3::new(c, s, 0.0), Vec3::new(-s, c, 0.0), Vec3::new(0.0, 0.0, 1.0), Vec3::ZERO);
+    let p = known_pose().compose(yaw);
+    let moved = fragment(cube_scan(), |_| true, p);
+    let truth = p.invert().expect("a rigid pose");
+    let ang = |a: Transform, b: Transform| 2.0 * a.rot.dot(b.rot).abs().min(1.0).acos() / DEG;
+    let err = |pose: Transform| {
+        let back = pose.compose(p);
+        let mm = [Vec3::new(-100.0, -105.0, 0.0), Vec3::new(100.0, 105.0, 220.0), Vec3::new(55.0, 60.0, 260.0)]
+            .iter()
+            .map(|&x| (back.apply_point(x) - x).mag())
+            .fold(0.0, f64::max);
+        (ang(back, Transform::IDENTITY), mm)
+    };
+    let ex = [Vec3::new(1.0, 0.0, 0.0), Vec3::new(0.0, 1.0, 0.0), Vec3::new(0.0, 0.0, 1.0)];
+    let basins: Vec<Transform> = cube_group().into_iter().map(|g| turn(ex, Vec3::new(0.0, 0.0, 110.0), g).compose(truth)).collect();
+    let nearest = |t: Transform| basins.iter().enumerate().map(|(k, b)| (k, ang(t, *b))).fold((0usize, f64::INFINITY), |m, x| if x.1 < m.1 { x } else { m });
+
+    // The diagnostic: the 72 swept starts and the near-tie window, as `three_or` reads them.
+    let (_, home) = vug_view::deviation::open(cube_scan(), &doc, BAND_MM, vug_view::deviation::GDT_MARGIN_MM).expect("the design builds");
+    let (_, design) = &*home.basis;
+    let ap = scan_core::AlignParams::DEFAULT;
+    let bvh = mesh_core::bvh::Bvh::build(&design.mesh);
+    let mut all: Vec<(usize, f64, Transform, f64)> = Vec::new();
+    for i in 0..3usize {
+        for (rank, t, score) in swept(&moved, design, &bvh, &ap, Tol::DEFAULT, Sweep::About(i)).unwrap_or_default() {
+            all.push((i, rank, t, score));
+        }
+    }
+    let best = all.iter().map(|s| s.1).fold(f64::INFINITY, f64::min);
+    let k = ap.gate(2);
+    let mut kept_truth = false;
+    let mut kept = 0usize;
+    for &(i, rank, t, score) in &all {
+        let (b, off) = nearest(t);
+        let keep = rank <= best + k;
+        kept += keep as usize;
+        kept_truth |= keep && b == 0;
+        println!("coarsesymthreekeep: start axis={i} rank={rank:.3} score={score:.3} basin={b} off={off:.1} kept={keep}");
+    }
+
+    // The road.
+    let (_, map) = vug_view::deviation::open_coarse(&moved, &doc, BAND_MM, vug_view::deviation::GDT_MARGIN_MM).expect("the design builds");
+    let d = map.result.as_ref().expect("the three-equal road aligns");
+    let (deg, mm) = err(d.aligned.pose);
+    println!(
+        "coarsesymthreekeep: kept={kept} of {} best={best:.3} K={k:.3} road={:?} aligned={:.3} err_deg={deg:.3} err_mm={mm:.3} basin={}",
+        all.len(),
+        map.road,
+        d.aligned.rms_mm,
+        nearest(d.aligned.pose).0
+    );
+    assert_eq!(all.len(), 72, "three sweeps of 2 x 12 starts");
+    assert!(kept_truth, "the truth basin has a kept start");
+    assert!(matches!(map.road, Road::CoarseFine { .. }), "{:?}", map.road);
+    assert!(deg <= 1.0 && mm <= 2.0, "pose error {deg} deg {mm} mm");
+}
