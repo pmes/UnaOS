@@ -63,8 +63,9 @@
 //! replays the document (a failing statement refuses `Design`, none built `DesignEmpty`); every solid is tessellated by
 //! scan_core's `design_of` at `DESIGN_CHORD_MM` into one design mesh with each triangle's face (VUGFACEDEVIATION, SR525:
 //! the ONE builder, vug-view's too); scan_core's `measure` registers the scan to
-//! it from the identity (the scan's world is the design's: a `--poses` / `--turntable` / one-frame scan; a coarse start
-//! for a `--track` scan is owed, VUG-SCAN-DEVIATION-COARSE) and measures each vertex's signed deviation (positive proud,
+//! it from the identity (the scan's world is the design's: a `--poses` / `--turntable` / one-frame scan; a `--track` scan,
+//! its world frame 0's camera, through scan_core's coarse start `measure_coarse`, VUGFACEDEVIATIONPRBPOSES SR621, the road
+//! named on stderr `deviation: road CoarseFine {..}` / `CoarseRefused {..}`) and measures each vertex's signed deviation (positive proud,
 //! negative short), the band being `--band`. The PLY then carries the ALIGNED positions (the design's frame), a
 //! `float deviation` (mm, NaN off the design) and `uchar red green blue` from scan_core's `shade` in palette_core's
 //! status colours (inside the band POSITIVE, short toward INFO, proud toward CRITICAL, off the design TEXT_SECONDARY).
@@ -526,7 +527,7 @@ fn run(a: &Args) -> Result<String, Refusal> {
 
     // VUGSCANDEVIATION (SR510): the made part against its model, before anything is written.
     let dev = match &a.against {
-        Some(p) => Some(against(p, &sm, a.band)?),
+        Some(p) => Some(against(p, &sm, a.band, a.track)?), // VUGFACEDEVIATIONPRBPOSES (SR621): a tracked scan starts coarse
         None => None,
     }; let intent = intent_road(a, &detected)?; let gdt = gdt_road(a, &sm, dev.as_ref(), t.trunc_mm())?; // VUGINTENTSCANWIRE (SR515): before anything is written; VUGSCANGDT (SR542) gdt_road too
 
@@ -654,7 +655,9 @@ fn shapes_report(r: &mut String, detected: &Result<Vec<Shape>, FitError>) {
 
 /// VUGSCANDEVIATION (SR510): the document replayed, every solid tessellated into one design with each triangle's face
 /// (named `<solid>/<op>.<role>.<a>.<b>:<kind>`), and the scan measured against it from the identity.
-fn against(path: &str, sm: &ScanMesh, band: f64) -> Result<(Deviation, Vec<String>, scan_core::Design), Refusal> {
+/// VUGFACEDEVIATIONPRBPOSES (SR621): `coarse` (a `--track` scan, its world frame 0's camera) through scan_core's
+/// `measure_coarse` instead, its road on stderr.
+fn against(path: &str, sm: &ScanMesh, band: f64, coarse: bool) -> Result<(Deviation, Vec<String>, scan_core::Design), Refusal> {
     let text = String::from_utf8(read(path)?).map_err(|e| Refusal::Io { path: path.into(), error: e.to_string() })?;
     let doc = doc_core::read_with(&text, &doc_host::DirLib::beside(std::path::Path::new(path))).map_err(Refusal::DesignRead)?; // VUGMAKEMACHINELIBFACE (SR548): `lib=<name>` beside the document
     let rp = doc_core::replay(&doc, doc.tol);
@@ -670,7 +673,14 @@ fn against(path: &str, sm: &ScanMesh, band: f64) -> Result<(Deviation, Vec<Strin
         DesignError::FaceId { solid, id } => Refusal::DesignFaceId { solid, id },
         DesignError::Design(e) => Refusal::Deviation(e),
     })?;
-    match measure(sm, &design, Transform::IDENTITY, &AlignParams::DEFAULT, band, Tol::DEFAULT) {
+    let measured = if coarse {
+        let (road, r) = scan_core::deviation::measure_coarse(sm, &design, &AlignParams::DEFAULT, band, Tol::DEFAULT);
+        eprintln!("deviation: road {road:?}");
+        r
+    } else {
+        measure(sm, &design, Transform::IDENTITY, &AlignParams::DEFAULT, band, Tol::DEFAULT)
+    };
+    match measured {
         Ok(d) => Ok((d, names, design)),
         Err(e) => {
             eprintln!("deviation: refused {e:?}");
