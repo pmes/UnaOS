@@ -758,15 +758,16 @@ extrude post sketch=s2 outer=c1 dir=[0 0 1] length=150
 
     let o = scan(&[inp.to_str().unwrap(), "-o", ply.to_str().unwrap(), "--track", "--against", doc.to_str().unwrap()]);
     let (report, err) = (String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
-    assert_eq!(o.status.code(), Some(1), "the refused coarse start is the run's refusal\n{report}\n{err}");
+    // VUGSCANDEVIATIONCOARSEVIEW (SR626, folded after this test was written): the view road now keeps this start, so the
+    // one expectation the SR627 comment named turns here (seat fold): exit 0, `road: coarse+fine`, `deviation: aligned` after it.
+    assert_eq!(o.status.code(), Some(0), "the view road keeps the start\n{report}\n{err}");
     let lines: Vec<&str> = report.lines().collect();
     let at = lines.iter().position(|l| l.starts_with("road: ")).unwrap_or_else(|| panic!("no road line in\n{report}\n{err}"));
     println!("{}", lines[at]);
-    assert!(lines[at].starts_with("road: coarse refused rms="), "{}", lines[at]);
+    assert!(lines[at].starts_with("road: coarse+fine rms="), "{}", lines[at]);
     assert!(lines[at - 1].starts_with("shape"), "the road line follows the shapes: {:?}", &lines[..=at]);
-    assert_eq!(at + 1, lines.len(), "the road line stands where `deviation: aligned` begins:\n{report}");
-    assert!(!report.contains("deviation: aligned"), "{report}");
-    assert!(err.contains("deviation: refused NoAlignment"), "{err}");
+    assert!(lines[at + 1].starts_with("deviation: aligned"), "the road line stands where `deviation: aligned` begins:\n{report}");
+    assert!(!err.contains("deviation: refused"), "{err}");
     assert!(!err.contains("deviation: road"), "the stderr road line is retired: {err}");
-    assert!(!ply.exists(), "a refusal writes no PLY");
+    assert!(ply.exists(), "an aligned run writes its PLY");
 }
