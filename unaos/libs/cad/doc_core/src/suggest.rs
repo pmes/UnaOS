@@ -70,12 +70,13 @@ use crate::standards::{Class, nearest_standard};
 use crate::write::f64_text;
 use crate::{Cons, Doc, PRef, Stmt};
 
-/// The offline proposals for `doc` against `m`'s sigma, in rule order per sketch.
-pub fn suggest(doc: &Doc, m: &Measurement) -> Vec<Proposal> {
+/// The offline proposals for `doc` against `m`'s sigma, in rule order per sketch, and the feature rules' declines
+/// (VUGINTENTFEATURESDECLINED SR673: [`Suggested`], file tail).
+pub fn suggested(doc: &Doc, m: &Measurement) -> Suggested {
     let sigma = m.sigma_mm();
-    let mut out = Vec::new();
+    let (mut out, mut declined) = (Vec::new(), Vec::new());
     if !(sigma.is_finite() && sigma > 0.0) {
-        return out;
+        return Suggested { proposals: out, declined };
     }
     let mut ids = Ids { taken: doc.stmts.iter().filter_map(|s| s.id().map(String::from)).collect(), n: 0 };
     for st in &doc.stmts {
@@ -83,8 +84,8 @@ pub fn suggest(doc: &Doc, m: &Measurement) -> Vec<Proposal> {
             sketch_rules(doc, id, sigma, &mut ids, &mut out);
         }
     }
-    features(doc, m, sigma, &mut ids, &mut out); // VUGINTENTFEATURES (SR536): bosses / pockets from shapes (file tail)
-    out
+    features(doc, m, sigma, &mut ids, &mut out, &mut declined); // VUGINTENTFEATURES (SR536): bosses / pockets from shapes (file tail)
+    Suggested { proposals: out, declined }
 }
 
 /// Fresh statement ids `i<n>` the document does not hold.
@@ -755,10 +756,10 @@ struct PlaneM {
 }
 
 /// The extent rule for the cylinder whose support centroid sits `t` off `planes[pk]`: (h, the far-end plane's (shape
-/// index, e) when one is measured); None when a measured parallel plane crosses the span (no end on the plane within
-/// 3 sigma). VUGINTENTFEATURESEXTENT (SR653): `reach` is the support's measured far end (ke = 1); None is the centroid
+/// index, e) when one is measured); Err((its shape index, |s|)) when a measured parallel plane crosses the span (no end
+/// on the plane within 3 sigma; VUGINTENTFEATURESDECLINED SR673 names it). VUGINTENTFEATURESEXTENT (SR653): `reach` is the support's measured far end (ke = 1); None is the centroid
 /// road h0 = 2|t| (ke = 2: a far end off by e moves the centroid by e / 2), bit-identical to SR536.
-fn extent(planes: &[PlaneM], pk: usize, t: f64, reach: Option<f64>, sigma: f64, sigma_deg: f64) -> Option<(f64, Option<(usize, f64)>)> {
+fn extent(planes: &[PlaneM], pk: usize, t: f64, reach: Option<f64>, sigma: f64, sigma_deg: f64) -> Result<(f64, Option<(usize, f64)>), (usize, f64)> {
     let p = &planes[pk];
     let (h0, ke) = reach.map_or((2.0 * t.abs(), 2.0), |f| (f, 1.0));
     let lim = K_SIGMA * sigma;
@@ -778,10 +779,10 @@ fn extent(planes: &[PlaneM], pk: usize, t: f64, reach: Option<f64>, sigma: f64, 
                 far = Some((q.i, e, s.abs()));
             }
         } else if s.abs() < h0 - ke * lim {
-            return None;
+            return Err((q.i, s.abs()));
         }
     }
-    Some(match far {
+    Ok(match far {
         Some((i, e, s)) => (s, Some((i, e))),
         None => (h0, None),
     })
@@ -789,7 +790,7 @@ fn extent(planes: &[PlaneM], pk: usize, t: f64, reach: Option<f64>, sigma: f64, 
 
 /// The feature rule (module doc): per measured cylinder in order, at most ONE statement set (judged whole by
 /// `verify_all`, VUGINTENTSETVERIFY SR541).
-fn features(doc: &Doc, m: &Measurement, sigma: f64, ids: &mut Ids, out: &mut Vec<Proposal>) {
+fn features(doc: &Doc, m: &Measurement, sigma: f64, ids: &mut Ids, out: &mut Vec<Proposal>, declined: &mut Vec<Declined>) {
     let Measurement::Shapes { shapes, sigma_deg, .. } = m else { return };
     let sigma_deg = *sigma_deg;
     if !(sigma_deg.is_finite() && sigma_deg > 0.0) {
@@ -819,13 +820,13 @@ fn features(doc: &Doc, m: &Measurement, sigma: f64, ids: &mut Ids, out: &mut Vec
         }
     }
     let on_doc: Vec<bool> = planes.iter().map(|p| fits(&shapes[p.i].params)).collect();
-    let taken = slots(doc, &r, shapes, &planes, &on_doc, &fits, sigma, sigma_deg, ids, out); // VUGINTENTFEATURESSLOT (SR666): slots first, their cylinders taken
+    let taken = slots(doc, &r, shapes, &planes, &on_doc, &fits, sigma, sigma_deg, ids, out, declined); // VUGINTENTFEATURESSLOT (SR666): slots first, their cylinders taken
     for (ci, s) in shapes.iter().enumerate() {
         let ShapeParams::Cylinder { point, axis, radius } = s.params else { continue };
         if fits(&s.params) || taken.contains(&ci) {
             continue;
         }
-        let Some(Stand { pk, t, ends, h, far, inside }) = stand(doc, &r, &planes, &on_doc, point, axis, s.extent, sigma, sigma_deg) else { continue }; // VUGINTENTFEATURESSLOT (SR666): the measurement lifted verbatim (file tail)
+        let Some(Stand { pk, t, ends, h, far, inside }) = stand(doc, &r, &planes, &on_doc, point, axis, s.extent, sigma, sigma_deg).map_err(|(rule, why)| declined.push(Declined { shape: ci, rule, why: format!("cylinder #{}: {}", ci, why) })).ok() else { continue }; // VUGINTENTFEATURESSLOT (SR666): the measurement lifted verbatim (file tail)
         let p = &planes[pk];
         let z = p.n * (if t > 0.0 { 1.0 } else { -1.0 });
         let z = Vec3::new(z.x + 0.0, z.y + 0.0, z.z + 0.0);
@@ -892,7 +893,8 @@ struct Stand {
 }
 
 /// `features`' per-cylinder measurement, lifted verbatim (SR536 + SR653): the support at `point` along `axis`, with
-/// `span` its carried axial extent; None where the feature rule proposes nothing. The cylinder road and the slot road
+/// `span` its carried axial extent; Err((rule, its numbers)) where the feature rule proposes nothing (the decline,
+/// VUGINTENTFEATURESDECLINED SR673; the caller names the shape). The cylinder road and the slot road
 /// both read it.
 #[allow(clippy::too_many_arguments)]
 fn stand(
@@ -905,7 +907,7 @@ fn stand(
     span: Option<[f64; 2]>,
     sigma: f64,
     sigma_deg: f64,
-) -> Option<Stand> {
+) -> Result<Stand, (&'static str, String)> {
     let lin = doc.tol.lin;
     // The plane it stands on: a document face, parallel, the least |t| (ties to the larger support, then earlier).
     let mut best: Option<(usize, f64)> = None;
@@ -924,7 +926,9 @@ fn stand(
             best = Some((k, t));
         }
     }
-    let Some((pk, t)) = best else { return None };
+    let Some((pk, t)) = best else {
+        return Err(("no-plane", format!("no document face within sigma_deg {} of its axis more than sigma {} mm off", mm(sigma_deg), mm(sigma))));
+    };
     // VUGINTENTFEATURESEXTENT (SR653): the carried extent's ends as offsets from the plane on the support side.
     let sg = if t > 0.0 { 1.0 } else { -1.0 };
     let ends = span.and_then(|[a0, a1]| {
@@ -932,11 +936,12 @@ fn stand(
         let (o0, o1) = (sg * (t + a0 * c), sg * (t + a1 * c));
         Some((o0.min(o1), o0.max(o1)))
     });
-    if ends.is_some_and(|(_, f)| !(f.is_finite() && f > sigma)) {
-        return None;
+    if let Some((_, f)) = ends.filter(|&(_, f)| !(f.is_finite() && f > sigma)) {
+        return Err(("far-end", format!("far end {} mm not above sigma {} mm on plane #{}", mm(f), mm(sigma), planes[pk].i)));
     }
-    if ends.is_some_and(|(n, _)| !(n.abs() <= K_SIGMA * sigma)) { return None; } // VUGINTENTFEATURESEXTENTTABLE (SR665): a near end off the plane past K_SIGMA x sigma (above it or through it): the support does not start there, no set
-    let Some((h, far)) = extent(&planes, pk, t, ends.map(|e| e.1), sigma, sigma_deg) else { return None };
+    if let Some((n, _)) = ends.filter(|&(n, _)| !(n.abs() <= K_SIGMA * sigma)) { return Err(("near-end", format!("near end {} mm off plane #{}, past {} x sigma {} mm", mm(n), planes[pk].i, f64_text(K_SIGMA), mm(sigma)))); } // VUGINTENTFEATURESEXTENTTABLE (SR665): a near end off the plane past K_SIGMA x sigma (above it or through it): the support does not start there, no set
+    let (h, far) = extent(&planes, pk, t, ends.map(|e| e.1), sigma, sigma_deg)
+        .map_err(|(qi, s)| ("crossing-plane", format!("plane #{} at {} mm crosses the span from plane #{}", qi, mm(s), planes[pk].i)))?;
     // Boss or pocket: the support centroid against the replayed solids.
     let (mut inside, mut unsure) = (false, false);
     for so in &r.solids {
@@ -947,9 +952,9 @@ fn stand(
         }
     }
     if unsure {
-        return None;
+        return Err(("unsure", String::from("inside or outside the replayed solids unsure at the support centroid")));
     }
-    Some(Stand { pk, t, ends, h, far, inside })
+    Ok(Stand { pk, t, ends, h, far, inside })
 }
 
 /// One recognised slot: the cylinders' shape indices (i < j), the walls' shape indices (+w side, -w side), the midpoint
@@ -1040,6 +1045,7 @@ fn slots(
     sigma_deg: f64,
     ids: &mut Ids,
     out: &mut Vec<Proposal>,
+    declined: &mut Vec<Declined>,
 ) -> BTreeSet<usize> {
     let mut taken = BTreeSet::new();
     for sl in slot_of(shapes, planes, fits, sigma, sigma_deg) {
@@ -1060,7 +1066,7 @@ fn slots(
             (Some(x), Some(y)) => Some([x[0].min(y[0]), x[1].max(y[1])]),
             _ => None,
         };
-        let Some(Stand { pk, t, ends, h, far, inside }) = stand(doc, r, planes, on_doc, sl.m, axis, span, sigma, sigma_deg) else {
+        let Some(Stand { pk, t, ends, h, far, inside }) = stand(doc, r, planes, on_doc, sl.m, axis, span, sigma, sigma_deg).map_err(|(rule, why)| declined.push(Declined { shape: sl.i, rule, why: format!("slot #{} and #{}: {}", sl.i, sl.j, why) })).ok() else {
             continue;
         };
         let p = &planes[pk];
@@ -1142,4 +1148,36 @@ fn slots(
 /// named (the document already models it).
 fn modelled(own: &[usize], far: Option<(usize, f64)>) -> Vec<usize> {
     own.iter().copied().chain(far.map(|(q, _)| q)).collect()
+}
+
+// ---- VUGINTENTFEATURESDECLINED (SR673): the feature rules' declines, named (named tail block) ----
+
+/// What [`suggested`] returns: the proposals ([`suggest`]'s value) and one [`Declined`] per measured support the
+/// feature rule refused. Not declines: a shape a document face models, a cylinder a slot took, a non-cylinder, and the
+/// document-level silences (no `Shapes` measurement, no replayed solid, a sigma that is not > 0).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Suggested {
+    pub proposals: Vec<Proposal>,
+    pub declined: Vec<Declined>,
+}
+
+/// One declined feature rule: the measured shape's index (a slot's first cylinder), the rule (`no-plane`, `far-end`,
+/// `near-end`, `crossing-plane`, `unsure`) and why with its numbers (`cylinder #k: ...` or `slot #i and #j: ...`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Declined {
+    pub shape: usize,
+    pub rule: &'static str,
+    pub why: String,
+}
+
+impl Declined {
+    /// `declined: <rule> <why>`, the report's line (tools/scan prints one per decline after the proposals).
+    pub fn line(&self) -> String {
+        format!("declined: {} {}", self.rule, self.why)
+    }
+}
+
+/// The offline proposals alone ([`suggested`]'s `proposals`): every existing reader's road, unchanged.
+pub fn suggest(doc: &Doc, m: &Measurement) -> Vec<Proposal> {
+    suggested(doc, m).proposals
 }

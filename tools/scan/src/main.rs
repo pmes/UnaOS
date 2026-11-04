@@ -844,7 +844,8 @@ fn intent_sigma(shapes: &[Shape]) -> (f64, f64) {
 /// `doc_core::measurements_text` with every line prefixed `intent: ` (its `shapes: n=` header is not the report's).
 /// With a document: doc_core reads it (`DesignRead` refuses), `suggest` proposes against the measurement's sigma,
 /// `verify_all` disposes each in order (BP-vug-7), and `Batch::text` is appended verbatim (`intent: proposed= accepted=
-/// refused=`, then one `accept` / `refuse` line per proposal). A detect refusal prints `intent: refused`. Without
+/// refused=`, then one `accept` / `refuse` line per proposal), then one `declined: <rule> <why>` line per feature rule
+/// `suggested` declined (VUGINTENTFEATURESDECLINED SR673). A detect refusal prints `intent: refused`. Without
 /// `--intent`, empty.
 fn intent_road(a: &Args, detected: &Result<Vec<Shape>, FitError>, points: &[Vec3]) -> Result<String, Refusal> {
     let Some(doc_path) = &a.intent else { return Ok(String::new()) };
@@ -861,8 +862,8 @@ fn intent_road(a: &Args, detected: &Result<Vec<Shape>, FitError>, points: &[Vec3
     let Some(path) = doc_path else { return Ok(out) };
     let text = String::from_utf8(read(path)?).map_err(|e| Refusal::Io { path: path.clone(), error: e.to_string() })?;
     let doc = doc_core::read_with(&text, &doc_host::DirLib::beside(std::path::Path::new(path))).map_err(Refusal::DesignRead)?; // VUGMAKEMACHINELIBFACE (SR548): `lib=<name>` beside the document
-    let ps = doc_core::suggest(&doc, &m);
-    out.push_str(&doc_core::verify_all(&doc, &ps, &m, doc.tol).text());
+    let doc_core::Suggested { proposals: ps, declined } = doc_core::suggested(&doc, &m); // VUGINTENTFEATURESDECLINED (SR673)
+    out.push_str(&doc_core::verify_all(&doc, &ps, &m, doc.tol).text()); for d in &declined { let _ = writeln!(out, "{}", d.line()); }
     Ok(out)
 }
 

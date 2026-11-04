@@ -994,3 +994,45 @@ fn a_dragged_slot_corner_keeps_the_obround() {
     assert_eq!(pr.len(), 1);
     assert_eq!(pr[0].outer.edges.len(), 4);
 }
+
+// ---- VUGINTENTFEATURESDECLINED (SR673): a declined feature rule named with its numbers ----
+
+/// SR665's plate (80 x 60 x 10, top #1 at z = 10, sigma 0.3): the support whose near end sits 2 mm above the plate
+/// is declined `near-end` by name with its numbers, the one running 2 mm through it reads -2.000, one whose far end
+/// does not clear sigma (z 15, extent [-5.1, -4.9]: far 0.100) is declined `far-end`; the 0.850 control and the boss
+/// a document models (SR541's boss, applied) decline nothing, and `suggest` is `suggested`'s proposals.
+#[test]
+fn a_near_end_off_the_plane_is_declined_by_name() {
+    let d = doc(&plate(80.0, 60.0, 10.0));
+    let one = |p: Vec3, e: [f64; 2]| {
+        let mut s = box_planes(80.0, 60.0, 10.0);
+        s.push(ShapeRef { extent: Some(e), ..cyl(p, 7.95, 900, 0.2) });
+        let sg = doc_core::suggested(&d, &shapes(s));
+        assert!(feature_set(&sg.proposals, "boss:").is_empty(), "{:?}", stmts(&sg.proposals));
+        assert_eq!(sg.declined.len(), 1, "{:?}", sg.declined);
+        assert_eq!(sg.declined[0].shape, 6);
+        (sg.declined[0].rule, sg.declined[0].line())
+    };
+    assert_eq!(
+        one(v(40.0, 30.0, 17.0), [-5.0, 1.0]),
+        ("near-end", String::from("declined: near-end cylinder #6: near end 2.000 mm off plane #1, past 3 x sigma 0.300 mm"))
+    );
+    assert_eq!(
+        one(v(40.0, 30.0, 15.0), [-7.0, 3.0]),
+        ("near-end", String::from("declined: near-end cylinder #6: near end -2.000 mm off plane #1, past 3 x sigma 0.300 mm"))
+    );
+    assert_eq!(
+        one(v(40.0, 30.0, 15.0), [-5.1, -4.9]),
+        ("far-end", String::from("declined: far-end cylinder #6: far end 0.100 mm not above sigma 0.300 mm on plane #1"))
+    );
+    let mut s = box_planes(80.0, 60.0, 10.0);
+    s.push(ShapeRef { extent: Some([-4.15, 3.0]), ..cyl(v(40.0, 30.0, 15.0), 7.95, 900, 0.2) });
+    let m = shapes(s);
+    let sg = doc_core::suggested(&d, &m);
+    assert!(sg.declined.is_empty(), "{:?}", sg.declined);
+    assert_eq!(sg.proposals, suggest(&d, &m));
+    let (d, m) = boss_with_top();
+    let b = verify_all(&d, &suggest(&d, &m), &m, d.tol);
+    let sg = doc_core::suggested(&b.doc, &m);
+    assert!(feature_set(&sg.proposals, "boss:").is_empty() && sg.declined.is_empty(), "{:?} {:?}", stmts(&sg.proposals), sg.declined);
+}
