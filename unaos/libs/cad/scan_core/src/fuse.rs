@@ -9,8 +9,9 @@
 //! vug-view fuse through ONE road. The tool keeps its report lines, formatted from the [`TrackLog`] this returns.
 //! [`fuse_prb`] is the face's road: a recording carries no pose, so one depth frame is fused at the identity and
 //! several through the tracker (tools/scan's `--track` road), at tools/scan's defaults ([`VOXEL_MM`],
-//! [`TRUNC_VOXELS`]). A tracked scan's world is frame 0's camera (a coarse start against a design is owed:
-//! VUG-SCAN-DEVIATION-COARSE).
+//! [`TRUNC_VOXELS`]). A tracked scan's world is frame 0's camera: [`fuse_prb_tracked`] says which road fused it, so the
+//! caller opens a tracked one through the coarse registration (`deviation::measure_coarse`, VUGSCANDEVIATIONCOARSE SR615;
+//! VUGFACEDEVIATIONPRBPOSES SR621).
 
 use alloc::vec::Vec;
 
@@ -168,6 +169,12 @@ pub enum PrbError {
 /// A `.prb` recording's bytes fused into the scan mesh: each depth record at its own units and intrinsics, one record
 /// at the identity and several through the tracker, at [`VOXEL_MM`] and [`TRUNC_VOXELS`] with `knobs`.
 pub fn fuse_prb(bytes: &[u8], knobs: Knobs) -> Result<ScanMesh, PrbError> {
+    fuse_prb_tracked(bytes, knobs).map(|(m, _)| m)
+}
+
+/// VUGFACEDEVIATIONPRBPOSES (LEDGER SR621): [`fuse_prb`] and whether the tracker fused it (`Fused::track` is Some):
+/// true means the mesh's world is frame 0's camera, not the design's.
+pub fn fuse_prb_tracked(bytes: &[u8], knobs: Knobs) -> Result<(ScanMesh, bool), PrbError> {
     let rec = recording::read(bytes).map_err(PrbError::Recording)?;
     let depth = prb_depth(&rec, None).map_err(|index| PrbError::NoDepthUnits { index })?;
     if depth.is_empty() {
@@ -181,5 +188,5 @@ pub fn fuse_prb(bytes: &[u8], knobs: Knobs) -> Result<ScanMesh, PrbError> {
     let identity = [Transform::IDENTITY];
     let road = if shots.len() == 1 { Road::Posed(&identity) } else { Road::Track };
     let f = fuse(&shots, road, VOXEL_MM, TRUNC_VOXELS * VOXEL_MM, knobs).map_err(PrbError::Fuse)?;
-    extract(&f.tsdf).map_err(PrbError::Extract)
+    extract(&f.tsdf).map(|m| (m, f.track.is_some())).map_err(PrbError::Extract)
 }

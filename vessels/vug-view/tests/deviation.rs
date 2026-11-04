@@ -1608,3 +1608,65 @@ fn a_half_scan_fragment_refuses_coarse() {
     assert!(lines[0].starts_with("refused NoAlignment"), "{lines:?}");
     assert!(lines.contains(&format!("align=coarse refused rms={rms:.3}")), "{lines:?}");
 }
+
+// ---- VUGFACEDEVIATIONPRBPOSES (LEDGER SR621): a tracked .prb opens on the coarse road ----
+// Twelve D435i frames of the bench from the orbit's azimuths 0°..11° (1° a frame: the tracker's regime and span, tools/scan
+// tests/scan.rs `a_tracked_prb_recording_fuses_without_poses`) written as a .prb through probe_core's writer: fuse_prb
+// tracks them, so the mesh's world is frame 0's camera, and the face opens it through `open_road`'s coarse road against
+// the UNMOVED document (the world frame). MEASURED: the near-single-view scan's best coarse start is above the floor
+// (four frames over 3° 18.668, twelve over 11° 19.144, gate(2) 9), so the road is taken and the corner names the refusal
+// (`align=coarse refused rms=`); the near-single-view start is owed (VUG-SCAN-DEVIATION-COARSE-VIEW). A one-frame .prb stays
+// on the identity road (no `align=` line).
+
+#[test]
+fn a_tracked_prb_opens_on_the_coarse_road() {
+    use scan_core::fuse::recording::{self, Record};
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("vugfacedeviationprbposes");
+    std::fs::create_dir_all(&dir).expect("the fixture dir");
+    let b = fixture::bench_intrinsics();
+    let k4 = [b.fx, b.fy, b.ppx, b.ppy];
+    let intr = scan_core::Intrinsics::from_rect_params(b.width, b.height, k4); // what the record reads back
+    let scale = DepthScale::from_micrometres(1000); // what the record's units read back
+    let truth = |k: u32| fixture::orbit(CENTRE, 600.0, 40.0 * DEG, k as f64 * DEG);
+    let rec = |k: u32| {
+        let f = fixture::render_depth(&Scene::bench(), &intr, scale, &truth(k), &Noise::D435I, k as u64);
+        Record::new(f, "replay:d435i", 1000, Some(k4)).expect("the record")
+    };
+    let (track, one, part) = (dir.join("track.prb"), dir.join("one.prb"), dir.join("part.vug"));
+    std::fs::write(&track, recording::write(&(0..12u32).map(&rec).collect::<Vec<_>>()).expect("the recording")).expect("the .prb is written");
+    std::fs::write(&one, recording::write(&[rec(0)]).expect("the recording")).expect("the .prb is written");
+    std::fs::write(&part, DOC).expect("the part is written");
+    let (track, one, part) = (track.to_str().unwrap(), one.to_str().unwrap(), part.to_str().unwrap());
+
+    // The tracked .prb: the coarse road, its start refused at the floor and named on the corner.
+    let p = Viewer::open_against(track, part, SIZE, Preset::Una).expect("the .prb fuses and measures");
+    let map = p.view.deviation.as_ref().expect("a map");
+    let lp = corner(map);
+    println!("{}", lp.join("\n"));
+    let rms = match map.road {
+        scan_core::deviation::Road::CoarseRefused { rms_mm } => rms_mm,
+        other => panic!("expected the coarse road refused at the floor, got {other:?} ({:?})", map.result.as_ref().err()),
+    };
+    println!("prbposes: road=CoarseRefused rms={rms:.3}");
+    assert!(rms > scan_core::AlignParams::DEFAULT.gate(2), "the floor: {rms}");
+    assert!(matches!(map.result, Err(DeviationError::NoAlignment { pairs: 0, .. })), "{:?}", map.result.as_ref().err());
+    assert!(!map.on && map.vertex.is_empty());
+    assert!(lp[0].starts_with("refused NoAlignment"), "{lp:?}");
+    assert!(lp.contains(&format!("align=coarse refused rms={rms:.3}")), "{lp:?}");
+
+    // The part opened as the journal with the tracked .prb: the same road, the same corner but the source line.
+    let j = Viewer::open_scan(part, track, SIZE, Preset::Una).expect("the part opens with the tracked scan on the coarse road");
+    let jm = j.view.deviation.as_ref().expect("a journal map");
+    assert!(matches!(jm.road, scan_core::deviation::Road::CoarseRefused { .. }), "{:?}", jm.road);
+    let lj = corner(jm);
+    assert_eq!(lj[..lj.len() - 1], lp[..], "the journal measures the tracked scan as the path road does");
+
+    // The one-frame .prb: the identity road, no align line (against the world-frame document it reads NoAlignment).
+    let o = Viewer::open_against(one, part, SIZE, Preset::Una).expect("the one-frame .prb fuses and measures");
+    let om = o.view.deviation.as_ref().expect("a map");
+    assert_eq!(om.road, scan_core::deviation::Road::Fine);
+    let lo = corner(om);
+    assert!(!lo.iter().any(|l| l.starts_with("align=")), "{lo:?}");
+    assert!(matches!(om.result, Err(DeviationError::NoAlignment { .. })), "{:?}", om.result.as_ref().err());
+    println!("prbposes: one-frame road=Fine");
+}

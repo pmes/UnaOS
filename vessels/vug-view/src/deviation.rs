@@ -128,7 +128,8 @@ fn mean3(a: u32, b: u32, c: u32) -> u32 {
 /// read on a refusal) and the map, its gdt read at the edge margin `margin_mm` (VUGFACEGDTREMEASURE SR560). A design
 /// that does not build refuses the whole open (`Err`); a registration refusal is the map's (`Map::result`), shown by name.
 /// VUGSCANDEVIATIONCOARSE (SR615): `coarse` starts from scan_core's principal axes instead ([`open_coarse`]).
-fn open_road(scan: &ScanMesh, doc: &Doc, band_mm: f64, margin_mm: f64, coarse: bool) -> Result<(Model, Map), String> {
+/// VUGFACEDEVIATIONPRBPOSES (SR621): pub(crate), so lib.rs opens a tracked .prb through the same switch.
+pub(crate) fn open_road(scan: &ScanMesh, doc: &Doc, band_mm: f64, margin_mm: f64, coarse: bool) -> Result<(Model, Map), String> {
     let (design, names, faults, held) = design(doc)?; // VUGFACEDEVIATIONHELD (SR600): the held root; VUGFACEDEVIATIONSOLIDFAULT (SR565): the faults no solid reads
     let (road, result) = road_measure(scan, &design, band_mm, coarse); // VUGSCANDEVIATIONCOARSE (SR615): the identity road or the coarse one
     let (positions, vertex): (Vec<_>, Vec<u32>) = match &result {
@@ -353,9 +354,15 @@ impl Viewer {
     /// Measure `scan` against the journal's document at [`BAND_MM`]: generation 0, the drawn model the aligned scan,
     /// the camera homed on it. A document with no body refuses [`JOURNAL_EMPTY`]; a refusal changes nothing.
     pub fn against_journal(&mut self, scan: ScanMesh) -> Result<(), String> {
+        self.against_journal_road(scan, false)
+    }
+
+    /// VUGFACEDEVIATIONPRBPOSES (SR621): [`Viewer::against_journal`] on [`open_road`]'s road: `coarse` for a scan with no
+    /// starting pose (a tracked .prb, its world frame 0's camera); [`follow`] keeps the road through `Map::road`.
+    pub(crate) fn against_journal_road(&mut self, scan: ScanMesh, coarse: bool) -> Result<(), String> {
         let doc = self.view.design.journal.doc.clone();
         journal_body(&doc)?;
-        let (model, mut map) = open(&scan, &doc, BAND_MM, GDT_MARGIN_MM)?; // VUGFACEGDTREMEASURE (SR560): a ScanMesh carries no truncation: the fallback
+        let (model, mut map) = open_road(&scan, &doc, BAND_MM, GDT_MARGIN_MM, coarse)?; // VUGFACEGDTREMEASURE (SR560): a ScanMesh carries no truncation: the fallback
         map.source = Some(Source { scan, doc, generation: 0, measured: 0, refused: None });
         self.model = model;
         self.view.deviation = Some(map);
