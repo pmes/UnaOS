@@ -7,6 +7,8 @@
 //! - a line meeting an arc: the line's point `Coincident` with the arc's Start / End, plus `TangentLineCircle` when
 //!   the junction was tangent within 3 σ; two arcs: their ends `Coincident`, plus `TangentCircles` when tangent;
 //! - a line within [`HV_DEG`] of the paper's x / y axis: `Horizontal` / `Vertical`;
+//! - a thin side's two lines (fit's `Outline.thin`, VUGPHOTOSIDETHINPARALLEL SR661): `Parallel`, unless both already
+//!   took `Horizontal` / `Vertical` (then Parallel is a redundant row);
 //! - circles and arcs whose radii agree within 3 σ: `EqualRadius` to the first of the class; whose centres agree
 //!   within 3 σ: Concentric, which sketch_core spells `Coincident(Centre(a), Centre(b))` (it has no Concentric).
 //!
@@ -60,6 +62,7 @@ fn bad<T>(_: T) -> Refusal {
 fn add_loop(
     sk: &mut Sketch,
     prims: &[Prim],
+    thin: &[(usize, usize)],
     cons: &mut Vec<Constraint>,
     rounds: &mut Vec<(EntityId, Vec2, f64)>,
 ) -> Result<(), Refusal> {
@@ -79,6 +82,7 @@ fn add_loop(
         }
     }
     let mut ids: Vec<EntityId> = Vec::with_capacity(np);
+    let mut axis = vec![false; np]; // VUGPHOTOSIDETHINPARALLEL (SR661): the line took Horizontal / Vertical
     for k in 0..np {
         match prims[k] {
             Prim::Line { a, b, .. } => {
@@ -92,8 +96,10 @@ fn add_loop(
                 }
                 if ang.min(180.0 - ang) <= HV_DEG {
                     cons.push(Constraint::Horizontal(e));
+                    axis[k] = true;
                 } else if (ang - 90.0).abs() <= HV_DEG {
                     cons.push(Constraint::Vertical(e));
+                    axis[k] = true;
                 }
                 ids.push(e);
             }
@@ -107,6 +113,12 @@ fn add_loop(
                 ids.push(e);
             }
             Prim::Circle { .. } => return Err(Refusal::Uncertain),
+        }
+    }
+    // VUGPHOTOSIDETHINPARALLEL (SR661): a thin side's two lines are Parallel unless both are already on an axis.
+    for &(i, j) in thin {
+        if i < np && j < np && is_line(&prims[i]) && is_line(&prims[j]) && !(axis[i] && axis[j]) {
+            cons.push(Constraint::Parallel(ids[i], ids[j]));
         }
     }
     for k in 0..np {
@@ -146,8 +158,8 @@ pub fn to_sketch(o: &Outline, tol: Tol) -> Result<Sketched, Refusal> {
     let mut sk = Sketch::new();
     let mut cons: Vec<Constraint> = Vec::new();
     let mut rounds: Vec<(EntityId, Vec2, f64)> = Vec::new();
-    for lp in core::iter::once(&o.outer).chain(o.holes.iter()) {
-        add_loop(&mut sk, lp, &mut cons, &mut rounds)?;
+    for (li, lp) in core::iter::once(&o.outer).chain(o.holes.iter()).enumerate() {
+        add_loop(&mut sk, lp, o.thin.get(li).map_or(&[][..], |t| t.as_slice()), &mut cons, &mut rounds)?;
     }
     for i in 0..rounds.len() {
         if let Some(j) = (0..i).find(|&j| (rounds[j].2 - rounds[i].2).abs() <= band) {

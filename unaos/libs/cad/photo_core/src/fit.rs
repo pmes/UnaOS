@@ -48,6 +48,9 @@ pub struct Outline {
     pub outer: Vec<Prim>,
     pub holes: Vec<Vec<Prim>>,
     pub sigma_mm: f64,
+    /// VUGPHOTOSIDETHINPARALLEL (SR661): per loop (the outer, then each hole), each thin side's (before, after) side-line
+    /// indices into that loop, from [`thin_lines`].
+    pub thin: Vec<Vec<(usize, usize)>>,
 }
 
 impl Outline {
@@ -419,7 +422,8 @@ pub fn outline(loops: &Loops, sigma: f64, pitch: f64) -> Result<Outline, Refusal
             None => segment_loop(h, sigma, pitch)?,
         });
     }
-    Ok(Outline { outer, holes, sigma_mm: sigma })
+    let thin = core::iter::once(&outer).chain(holes.iter()).map(|lp| thin_lines(lp, sigma, pitch)).collect(); // VUGPHOTOSIDETHINPARALLEL (SR661)
+    Ok(Outline { outer, holes, sigma_mm: sigma, thin })
 }
 
 // ---- VUGPHOTOSIDETHINFIT (SR655): a close corner pair between parallel sides is a thin side (named tail block) ----
@@ -446,4 +450,32 @@ fn thin_pair(pts: &[Vec2], idx: &[usize], corners: &[usize], q: usize, sigma: f6
     }
     let (uh, vh) = (u / lu, v / lv);
     uh.cross(vh).abs() * lu.min(lv) <= band && (q0 - p1).cross(uh).abs() > 2.0 * sigma
+}
+
+// ---- VUGPHOTOSIDETHINPARALLEL (SR661): a thin side's pair from the fitted lines (named tail block) ----
+// The sketch writer gives a thin side's two lines `Parallel` when they are off the paper's axes; the pair it reads comes
+// from here, by SR655's ONE rule: `thin_pair` called as is on the fitted lines, with `segment_loop`'s own band (3 σ) and
+// trim (pitch / 8). The end the corner merge kept is a line shorter than trim between two lines; the four points are the
+// side before's ends and the side after's ends, the same four the corner-level call reads (q = 1 of four corners).
+
+/// Each thin side of one loop as (before, after): the indices of its two side lines (each a `Prim::Line`).
+pub fn thin_lines(prims: &[Prim], sigma: f64, pitch: f64) -> Vec<(usize, usize)> {
+    let np = prims.len();
+    let (band, trim) = (BAND_SIGMA * sigma, pitch / 8.0);
+    let mut out = Vec::new();
+    if np < 4 {
+        return out;
+    }
+    for k in 0..np {
+        let (i, j) = ((k + np - 1) % np, (k + 1) % np);
+        let (Prim::Line { a: p0, b: p1, .. }, Prim::Line { a: e0, b: e1, .. }, Prim::Line { a: q0, b: q1, .. }) =
+            (prims[i], prims[k], prims[j])
+        else {
+            continue;
+        };
+        if e0.dist(e1) < trim && thin_pair(&[p0, p1, q0, q1], &[0, 1, 2, 3], &[0, 1, 2, 3], 1, sigma, band, trim) {
+            out.push((i, j));
+        }
+    }
+    out
 }

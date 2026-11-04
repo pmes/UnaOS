@@ -980,3 +980,115 @@ fn a_thin_side_fits_two_parallel_lines() {
     assert!(a0.is_some() && a0 == a1, "the shim's sides take different axis constraints: {a0:?} {a1:?}");
     eprintln!("photo: thin fit sides={} sep={sep:.3} end={end:.3} tip={tip:.3} sigma={:.4}", sides.len(), m.sigma_mm);
 }
+
+// ---- VUGPHOTOSIDETHINPARALLEL (SR661): a thin side off the paper's axes is Parallel in the sketch (named tail block) ----
+/// A paper-mm point of `m` in the part frame of `s` (through the measured H and the true one, as SR655's test reads).
+fn par_part(s: &Spec, m: &Measured, p: Vec2) -> Vec2 {
+    let truth_inv = photo_core::homography::invert(&fixture::homography(s)).expect("the true homography inverts");
+    let q = apply(&m.h, p).expect("h maps the outline");
+    fixture::paper_to_part(s, apply(&truth_inv, q).expect("the truth maps back"))
+}
+
+/// Every constraint of the measured sketch with its id (the photo sketch removes none).
+fn par_cons(m: &Measured) -> Vec<(sketch_core::ConstraintId, Constraint)> {
+    (0u32..).map(sketch_core::ConstraintId).map_while(|id| m.sketch.constraint(id).map(|c| (id, *c))).collect()
+}
+
+/// The sketch's Line entities that are the shim's sides (part frame: mid x < -1, at least half the shim long).
+fn par_shim_lines(s: &Spec, m: &Measured) -> Vec<EntityId> {
+    (0..m.sketch.entities().len() as u32)
+        .map(EntityId)
+        .filter(|&e| matches!(m.sketch.entity(e), Some(Entity::Line { .. })))
+        .filter(|&e| {
+            let a = par_part(s, m, m.sketch.point(PointRef::Start(e)).expect("a line has a start"));
+            let b = par_part(s, m, m.sketch.point(PointRef::End(e)).expect("a line has an end"));
+            (a + b).x * 0.5 < -1.0 && a.dist(b) >= fixture::SHIM_L * 0.5
+        })
+        .collect()
+}
+
+fn par_on_axis(cs: &[(sketch_core::ConstraintId, Constraint)], e: EntityId) -> bool {
+    cs.iter().any(|(_, c)| matches!(*c, Constraint::Horizontal(x) | Constraint::Vertical(x) if x == e))
+}
+
+fn par_parallels(cs: &[(sketch_core::ConstraintId, Constraint)]) -> Vec<(sketch_core::ConstraintId, EntityId, EntityId)> {
+    cs.iter()
+        .filter_map(|&(id, c)| match c {
+            Constraint::Parallel(a, b) => Some((id, a, b)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_thin_side_off_the_axes_is_parallel() {
+    // ROTATED: SR655's shim fixture turned to 5°, past HV_DEG of the paper's axes, the shim still inside its lattice cell
+    // (paper y 37.65 to 35.91 in the 35..40 cell). At 11.5° it crosses the y = 35 line for ~2.5 mm: SR654's crossing case.
+    let s = Spec { part_rot_deg: 5.0, ..Spec::good() };
+    let img = pixel_core::decode(&fixture::shim_png(&s)).expect("pixel_core decodes the turned shim PNG");
+    let m = measure(&img, PhotoParams::new(5.0), Tol::DEFAULT).expect("the turned shim photo measures");
+    let sides: Vec<usize> = m
+        .shape
+        .outer
+        .iter()
+        .enumerate()
+        .filter_map(|(k, p)| match *p {
+            Prim::Line { a, b, .. } => {
+                let (pa, pb) = (par_part(&s, &m, a), par_part(&s, &m, b));
+                ((pa + pb).x * 0.5 < -1.0 && pa.dist(pb) >= fixture::SHIM_L * 0.5).then_some(k)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(sides.len(), 2, "the turned shim's sides: {:?}", m.shape.outer);
+    assert_eq!(m.shape.thin.len(), 1 + m.shape.holes.len(), "one thin list per loop");
+    assert_eq!(m.shape.thin[0].len(), 1, "one thin pair on the outer loop: {:?}", m.shape.thin);
+    let (i, j) = m.shape.thin[0][0];
+    let mut pair = vec![i, j];
+    pair.sort_unstable();
+    assert_eq!(pair, sides, "the thin pair is the shim's two sides");
+    assert!(m.shape.thin[1..].iter().all(|t| t.is_empty()), "a hole carries a thin pair: {:?}", m.shape.thin);
+    let cs = par_cons(&m);
+    let par = par_parallels(&cs);
+    assert_eq!(par.len(), 1, "exactly one Parallel: {par:?}");
+    let (pid, ea, eb) = par[0];
+    let mut shim = par_shim_lines(&s, &m);
+    shim.sort_unstable();
+    let mut got = vec![ea, eb];
+    got.sort_unstable();
+    assert_eq!(got, shim, "the Parallel is on the shim's two side lines");
+    let hv = shim.iter().filter(|&&e| par_on_axis(&cs, e)).count();
+    assert_eq!(hv, 0, "a turned side took Horizontal / Vertical");
+    assert!(!m.solved.redundant.contains(&pid), "the Parallel is a redundant row: {:?}", m.solved.redundant);
+    eprintln!(
+        "photo: thin parallel rot={:.1} thin={:?} parallel={} hv_sides={hv} dof={}",
+        s.part_rot_deg,
+        m.shape.thin,
+        par.len(),
+        m.solved.dof
+    );
+
+    // UN-ROTATED: SR655's fixture as is; both sides on an axis, so nothing new.
+    let s0 = Spec::good();
+    let img0 = pixel_core::decode(&fixture::shim_png(&s0)).expect("pixel_core decodes the shim PNG");
+    let m0 = measure(&img0, PhotoParams::new(5.0), Tol::DEFAULT).expect("the shim photo measures");
+    assert_eq!(m0.shape.thin[0].len(), 1, "the shim's thin pair at 1.5°: {:?}", m0.shape.thin);
+    let cs0 = par_cons(&m0);
+    let shim0 = par_shim_lines(&s0, &m0);
+    assert_eq!(shim0.len(), 2, "the shim's side lines at 1.5°");
+    let hv0 = shim0.iter().filter(|&&e| par_on_axis(&cs0, e)).count();
+    assert_eq!(hv0, 2, "both sides take an axis constraint at 1.5°");
+    let par0 = par_parallels(&cs0).len();
+    assert_eq!(par0, 0, "a Parallel beside both sides' axis constraints");
+    eprintln!(
+        "photo: thin parallel rot={:.1} thin={:?} parallel={par0} hv_sides={hv0} dof={}",
+        s0.part_rot_deg, m0.shape.thin, m0.solved.dof
+    );
+
+    // PLAIN: the plate without the shim has no thin pair and no Parallel.
+    let mp = run(&Spec::good()).expect("the good photo measures");
+    assert!(mp.shape.thin.iter().all(|t| t.is_empty()), "the plain plate carries a thin pair: {:?}", mp.shape.thin);
+    let parp = par_parallels(&par_cons(&mp)).len();
+    assert_eq!(parp, 0, "the plain plate carries a Parallel");
+    eprintln!("photo: thin parallel plain thin={:?} parallel={parp} dof={}", mp.shape.thin, mp.solved.dof);
+}
