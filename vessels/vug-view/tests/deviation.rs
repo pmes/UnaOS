@@ -1028,3 +1028,101 @@ fn a_report_command_writes_beside_the_part_and_a_path_map_beside_its_design() {
     assert_eq!(scan_core::gdt::kind_token(scan_core::Kind::Profile, None), "profile");
 }
 
+// VUGFACEGDTREPORTOPEN (LEDGER SR581): `report open` (on Viewer::map_command's road) reads the file `report` wrote into
+// the View's sheet, painted in the panel by journal.rs's one painter; Escape closes it. `:` opens the command line when a
+// map is up: its keys are the first (a typed `s` is the line's, never the save), Enter runs the line through
+// map_command, a refusal keeps the line open by name, Up recalls the last line run, Escape closes.
+
+/// A saved part (`part.vug`) and its scan (`scan.ply`) in a fresh fixture dir, opened as `--scan` opens them.
+fn report_open_fixture(name: &str) -> (Viewer, std::path::PathBuf) {
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("the fixture dir");
+    let (part, ply) = (dir.join("part.vug"), dir.join("scan.ply"));
+    std::fs::write(&part, DOC).expect("the part is written");
+    std::fs::write(&ply, mesh_core::ply::write(&scan().mesh)).expect("the scan is written");
+    let v = Viewer::open_scan(part.to_str().unwrap(), ply.to_str().unwrap(), SIZE, Preset::Una).expect("the part opens with the scan measured");
+    (v, dir)
+}
+
+#[test]
+fn report_open_paints_the_file_in_the_panel_and_escape_closes() {
+    let (mut v, dir) = report_open_fixture("vugfacegdtreportopen-sheet");
+    let err = v.map_command("report open").expect_err("no report written yet");
+    assert!(err.starts_with("report open: "), "the read's refusal by name: {err}");
+    assert!(v.view.sheet.is_none(), "a refusal shows nothing");
+    let (_, top) = plate_top(v.view.deviation.as_ref().unwrap());
+    assert_eq!(v.map_command(&format!("gdt {top}=flatness:0.001")), Ok(true));
+    assert_eq!(v.map_command("report"), Ok(true));
+    assert_eq!(v.map_command("report open"), Ok(true));
+    let text = std::fs::read_to_string(dir.join("part.vugreport")).expect("the report is written");
+    let sheet = v.view.sheet.as_ref().expect("the sheet is shown");
+    assert_eq!(sheet.lines, text.lines().map(String::from).collect::<Vec<_>>(), "the sheet is the file's lines");
+    assert_eq!(sheet.lines[0], "# vugreport part.vug design=0 scan=scan.ply");
+    assert_eq!(sheet.top, 0);
+
+    // The panel paints the sheet: the shown frame differs from the same view without it only in the panel.
+    let shown = raster::render(&v.model, &v.view);
+    let mut closed_view = v.view.clone();
+    closed_view.sheet = None;
+    let closed = raster::render(&v.model, &closed_view);
+    let x0 = vug_view::journal::panel_x0(SIZE.0) as usize;
+    let (mut inside, mut outside) = (0usize, 0usize);
+    for (i, (a, b)) in shown.rgba.chunks(4).zip(closed.rgba.chunks(4)).enumerate() {
+        if a != b {
+            if i % SIZE.0 as usize >= x0 { inside += 1 } else { outside += 1 }
+        }
+    }
+    println!("sheet {} lines: {inside} panel pixels differ, {outside} outside", sheet.lines.len());
+    assert!(inside > 0, "the sheet is painted in the panel");
+    assert_eq!(outside, 0, "and nowhere else");
+
+    assert!(!v.key("Down"), "two lines fit: Down does not scroll");
+    assert!(v.key("Escape"), "Escape closes the sheet");
+    assert!(v.view.sheet.is_none());
+    assert_eq!(raster::render(&v.model, &v.view).rgba, closed.rgba, "the frame is the view's without the sheet");
+
+    // A map with no part and no design path is refused by name.
+    let mut p = open(scan().clone());
+    assert_eq!(p.map_command("report open"), Err(vug_view::deviation::REPORT_NO_PATH.to_string()));
+    assert!(p.view.sheet.is_none());
+}
+
+#[test]
+fn a_typed_command_line_runs_the_map_command() {
+    let (mut v, _dir) = report_open_fixture("vugfacegdtreportopen-line");
+    let (top, name) = plate_top(v.view.deviation.as_ref().unwrap());
+    let disk = v.view.design.journal.disk.clone();
+    assert!(v.key(":"), "`:` opens the line while a map is up");
+    assert!(v.view.entry.open && v.view.entry.text.is_empty(), "the `:` is not typed");
+    let line = format!("gdt {name}=flatness:0.05");
+    assert!(v.input(&bandy::SMessage::BrowserText(line.clone())));
+    assert_eq!(v.view.entry.text, line, "every key typed into the line");
+    assert_eq!(v.view.design.journal.disk, disk, "the typed `s` of flatness is the line's, never the save");
+    assert!(v.key("Return"), "Enter runs the line");
+    assert!(!v.view.entry.open, "a line run closes");
+    let m = v.view.deviation.as_ref().unwrap();
+    assert_eq!(m.callouts, vec![vug_view::deviation::Callout { face: top, kind: scan_core::Kind::Flatness, tol_mm: 0.05 }], "the command ran");
+
+    assert!(v.key(":"));
+    assert!(v.key("Up"), "Up recalls the last line");
+    assert_eq!(v.view.entry.text, line);
+    while !v.view.entry.text.is_empty() {
+        assert!(v.key("BackSpace"));
+    }
+    assert!(v.input(&bandy::SMessage::BrowserText("gdt nosuch=flatness:1".to_string())));
+    assert!(v.key("Return"));
+    assert!(v.view.entry.open, "a refused line stays open");
+    assert_eq!(v.view.entry.refused.as_deref(), Some("GdtFace nosuch"), "named by map_command's refusal");
+    assert!(v.key("x"));
+    assert!(v.view.entry.refused.is_none(), "an edit clears the refusal");
+    assert!(v.key("Escape"), "Escape closes the line");
+    assert!(!v.view.entry.open);
+    assert_eq!(v.view.deviation.as_ref().unwrap().callouts.len(), 1, "nothing else ran");
+
+    // The line opens only over a map.
+    let mut plain = Viewer::open_doc(doc_core::read(DOC).expect("the document reads"), "fixture", SIZE, Preset::Una).expect("the document opens");
+    plain.key(":");
+    assert!(!plain.view.entry.open, "no map: `:` opens nothing");
+}
+
