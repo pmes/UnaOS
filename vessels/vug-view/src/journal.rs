@@ -551,7 +551,7 @@ pub fn overlay(view: &View, fr: &mut Raster) {
         (text, col, i == j.cursor)
     });
     fix_overlay(j, fr, x0, h, &clip); // VUGFACEJOURNALFAULTFIX (SR578): the offered fix above the note
-    if let Some(n) = &j.note {
+    if let Some(n) = &j.note_row() { // VUGFACEJOURNALHOLDNOFIXWORD (SR630): the note row's one sayer (`held=<ids> no fix` when no held root has a fix)
         let col = if n.starts_with("line ") { rgba(REFUSED) } else { rgba(INK) };
         raster::text(fr, &clip(&n.to_uppercase()), x0 + 4.0, h - ROW_PX, col);
     }
@@ -931,7 +931,7 @@ impl Journal {
 /// shown), clipped to the panel.
 fn fix_overlay(j: &Journal, fr: &mut Raster, x0: f32, h: f32, clip: &dyn Fn(&str) -> String) {
     let Some(f) = j.offered() else { return };
-    let y = if j.note.is_some() { h - 2.0 * ROW_PX } else { h - ROW_PX };
+    let y = if j.note_row().is_some() { h - 2.0 * ROW_PX } else { h - ROW_PX }; // VUGFACEJOURNALHOLDNOFIXWORD (SR630): the fix one row above the word too
     let all = j.fixes_for(j.cursor); if all.len() > 1 { return fix_card(j, fr, x0, y, &all, &f, clip); } // VUGFACEJOURNALFAULTFIXMANY (SR584): a choice is a card
     raster::text(fr, &clip(&format!("FIX: {} (ENTER)", f.text.to_uppercase())), x0 + 4.0, y, rgba(ACTIVE));
 }
@@ -1262,5 +1262,29 @@ impl Journal {
         let Some(i) = self.doc.stmts.iter().position(|s| s.id() == Some(id)) else { return false };
         let Some(f) = self.faults.iter().find(|f| !f.id.is_empty() && f.id == id) else { return false };
         self.solid_fixes(i, &f.fault, self.doc.line(i)).is_some()
+    }
+}
+
+// ---- VUGFACEJOURNALHOLDNOFIXWORD (LEDGER SR630): the note row says when no held root has a fix ----
+// SR611 left a document whose held roots ALL offer nothing with marked rows, no card and no word why. The note row's
+// ONE sayer is [`Journal::note_row`]: the note ([`Journal::note`]) unchanged while nothing is held or any held root has
+// a fix ([`Journal::fixable`]), else the held list ([`held_roots`], line order, comma-joined as deviation.rs names it on
+// the map's corner) and `no fix`, after the note with one space or alone: `fixed line 7: ... held=round no fix`,
+// `held=round no fix`. `overlay` paints it in the note's style; `fix_overlay` puts a card one row above it. No field, no
+// cache, no second row; deviation.rs `held_split` / `held_line` untouched.
+
+impl Journal {
+    /// The panel's note row: [`Journal::note`], plus `held=<a>,<b> no fix` when roots are held and none has a fix
+    /// (VUGFACEJOURNALHOLDNOFIXWORD, SR630); None when there is neither.
+    pub fn note_row(&self) -> Option<String> {
+        let roots = held_roots(&self.faults);
+        if roots.is_empty() || roots.iter().any(|r| self.fixable(r)) {
+            return self.note.clone();
+        }
+        let word = format!("held={} no fix", roots.join(","));
+        Some(match &self.note {
+            Some(n) => format!("{n} {word}"),
+            None => word,
+        })
     }
 }

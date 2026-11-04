@@ -1507,3 +1507,9 @@ exec-rmbp-f39queuedsetpendpin 9a75ccd9d wave36 cut65
 exec-rmbp-f39queuedsetdeliverrace 9a75ccd9d wave36 cut65
 exec-rmbp-f39settingsresetrepaint 9a75ccd9d wave36 cut65
 exec-rmbp-f39queuedseteagerarm 9a75ccd9d wave36 cut65
+exec-rmbp-vugprincipiatwowriters 550b00ee2 wave36 cut64h
+exec-rmbp-vugscandeviationcoarsesym 550b00ee2 wave36 cut64h
+exec-rmbp-vugscanroadwordmargin 550b00ee2 wave36 cut64h
+exec-rmbp-vugcomscanmdnsdial 550b00ee2 wave36 cut64h
+exec-rmbp-vugcomscanmdnsv6 550b00ee2 wave36 cut64h
+exec-rmbp-vugfacephotocropsave 550b00ee2 wave36 cut64h
