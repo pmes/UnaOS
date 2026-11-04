@@ -601,14 +601,18 @@ pub fn measure_side_raised(first: &Measured, side: &Image, params: PhotoParams, 
 
 /// The PNG tEXt keyword a cropped photo carries its crop in: `<x>,<y>,<W>,<H>`, the crop's offset in the frame it was cut
 /// from and that frame's size (the principal point is the uncropped centre less the offset, so the frame's size travels
-/// with it; [`fixture::crop_png`] writes it).
+/// with it; [`fixture::crop_png`] writes it). VUGFACEPHOTOCROPPREFFRAC (SR648): an optional fifth and sixth field
+/// `,<px>,<py>` state the principal point in the ORIGINAL frame's pixels (fractional allowed), carried when the cropped
+/// photo was measured about a stated point rather than its centre ([`crop_pair_with`]); absent, the point is `(W/2, H/2)`.
 pub const CROP_KEY: &str = "vug:crop";
 
-/// The principal point the photo's own [`CROP_KEY`] pair states (the first one), `(W / 2 - x, H / 2 - y)`, else None
-/// (absent, or not four integers with W and H above 0).
+/// The principal point the photo's own [`CROP_KEY`] pair states (the first one), `(px - x, py - y)` with the carried
+/// point (VUGFACEPHOTOCROPPREFFRAC SR648), `(W / 2 - x, H / 2 - y)` without one, else None (absent, or not [`crop_meta`]'s
+/// four integers with W and H above 0 and an optional finite point).
 pub fn crop_principal(img: &Image) -> Option<Vec2> {
-    let [x, y, w, h] = crop_frame(img)?; // VUGFACEPHOTOCROPSAVE (SR640): the one parse, shared with crop_pair
-    Some(Vec2::new(w as f64 * 0.5 - x as f64, h as f64 * 0.5 - y as f64))
+    let ([x, y, w, h], p) = crop_meta(img)?; // VUGFACEPHOTOCROPSAVE (SR640): the one parse, shared with crop_pair; VUGFACEPHOTOCROPPREFFRAC (SR648): and the carried point
+    let p = p.unwrap_or(Vec2::new(w as f64 * 0.5, h as f64 * 0.5)); // VUGFACEPHOTOCROPPREFFRAC (SR648): the frame's centre when no point is carried (the 4-field pair, bit-identical)
+    Some(Vec2::new(p.x - x as f64, p.y - y as f64))
 }
 
 /// THE order for the principal point: the photo's crop meta ([`crop_principal`]), else `params.principal_px` (the
@@ -657,24 +661,54 @@ pub fn xmp_crop(packet: &str) -> Option<alloc::string::String> {
 // ---- VUGFACEPHOTOCROPSAVE (SR640): the crop frame read once and written once (named tail block) ----
 
 /// The photo's own crop frame `[x, y, W, H]` (the first [`CROP_KEY`] pair, or the one inside an XMP packet, first in file
-/// order), else None (absent, or not four integers with W and H above 0). THE parse of the key: [`crop_principal`] and
-/// [`crop_pair`] read it.
+/// order), else None: [`crop_meta`]'s frame (VUGFACEPHOTOCROPPREFFRAC SR648: the parse moved there with the point).
 pub fn crop_frame(img: &Image) -> Option<[u32; 4]> {
-    let v = img.text.iter().find_map(|(k, v)| crop_value(k, v))?; // VUGPHOTOCROPMETAXMP (SR631): the CROP_KEY pair, or the one inside an XMP packet, first in file order
-    let mut n = v.split(',').map(|t| t.trim().parse::<u32>().ok());
-    let (x, y, w, h) = (n.next()??, n.next()??, n.next()??, n.next()??);
-    if n.next().is_some() || w == 0 || h == 0 {
-        return None;
-    }
-    Some([x, y, w, h])
+    crop_meta(img).map(|(f, _)| f) // VUGFACEPHOTOCROPPREFFRAC (SR648): the one parse
 }
 
-/// THE writer of the key: the (keyword, value) pair a crop of `img` at offset (`x0`, `y0`) carries. The frame is `img`'s
-/// own when it states one ([`crop_frame`]: its offset grows by the crop's), else `img` itself, so the principal point
-/// [`crop_principal`] reads back from the crop is the one `img` had, less the offset.
+/// VUGFACEPHOTOCROPPREFFRAC (SR648): THE parse of the key: the frame `[x, y, W, H]` and the carried principal point
+/// `(px, py)` in the original frame's pixels when the pair has six fields, of the first [`CROP_KEY`] pair (or the one
+/// inside an XMP packet, first in file order); None when absent, or not four integers with W and H above 0 optionally
+/// followed by two finite numbers. [`crop_frame`], [`crop_principal`] and [`crop_pair_with`] read it.
+pub fn crop_meta(img: &Image) -> Option<([u32; 4], Option<Vec2>)> {
+    let v = img.text.iter().find_map(|(k, v)| crop_value(k, v))?; // VUGPHOTOCROPMETAXMP (SR631): the CROP_KEY pair, or the one inside an XMP packet, first in file order
+    let t: Vec<&str> = v.split(',').map(str::trim).collect();
+    if t.len() != 4 && t.len() != 6 {
+        return None;
+    }
+    let n = |i: usize| t[i].parse::<u32>().ok();
+    let (x, y, w, h) = (n(0)?, n(1)?, n(2)?, n(3)?);
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let p = if t.len() == 6 {
+        let f = |i: usize| t[i].parse::<f64>().ok().filter(|v| v.is_finite());
+        Some(Vec2::new(f(4)?, f(5)?))
+    } else {
+        None
+    };
+    Some(([x, y, w, h], p))
+}
+
+/// The (keyword, value) pair a crop of `img` at offset (`x0`, `y0`) carries with no principal point stated:
+/// [`crop_pair_with`] under None ([`fixture::crop_png`]'s road, byte-identical to SR640's 4-field pair).
 pub fn crop_pair(img: &Image, x0: u32, y0: u32) -> (alloc::string::String, alloc::string::String) {
-    let [x, y, w, h] = crop_frame(img).unwrap_or([0, 0, img.width, img.height]);
-    (alloc::string::String::from(CROP_KEY), alloc::format!("{},{},{},{}", x.saturating_add(x0), y.saturating_add(y0), w, h))
+    crop_pair_with(img, x0, y0, None) // VUGFACEPHOTOCROPPREFFRAC (SR648): the one writer
+}
+
+/// THE writer of the key (VUGFACEPHOTOCROPPREFFRAC SR648: moved from [`crop_pair`] with the point): the pair a crop of
+/// `img` at offset (`x0`, `y0`) carries. The frame is `img`'s own when it states one ([`crop_meta`]: its offset grows by
+/// the crop's, its carried point kept as is, since it is in the original's pixels; the meta outranks `principal_px` as
+/// `principal_of` ranks them), else `img` itself with `principal_px` (the person's pref the photo was measured about) as
+/// the point, so the principal point [`crop_principal`] reads back from the crop is the one `img` was measured about,
+/// less the offset. `,<px>,<py>` is written only for a finite point: no point, the 4-field pair.
+pub fn crop_pair_with(img: &Image, x0: u32, y0: u32, principal_px: Option<Vec2>) -> (alloc::string::String, alloc::string::String) {
+    let ([x, y, w, h], p) = crop_meta(img).unwrap_or(([0, 0, img.width, img.height], principal_px));
+    let mut v = alloc::format!("{},{},{},{}", x.saturating_add(x0), y.saturating_add(y0), w, h);
+    if let Some(p) = p.filter(|p| p.x.is_finite() && p.y.is_finite()) {
+        v.push_str(&alloc::format!(",{},{}", p.x, p.y));
+    }
+    (alloc::string::String::from(CROP_KEY), v)
 }
 
 // ---- VUGPHOTOSIDETHIN (SR651): a pair off the lattice is a thin side (named tail block) ----
