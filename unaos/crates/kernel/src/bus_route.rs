@@ -577,7 +577,7 @@ pub static TAGID_REFUSED: AtomicU32 = AtomicU32::new(0);
 pub static TAGID_DROPPED: AtomicU32 = AtomicU32::new(0);
 
 /// The image the kernel names for `verb`, `None` = an open tag.
-fn tag_image(verb: u8) -> Option<&'static str> {
+pub fn tag_image(verb: u8) -> Option<&'static str> {
     TAG_IMAGE.iter().find(|&&(lo, hi, _)| (lo..=hi).contains(&verb)).map(|&(_, _, img)| img)
 }
 
@@ -840,7 +840,7 @@ fn tagpath_id(row: usize, img: &str, buf: &mut [u8; crate::video::wm::MAX_TITLE]
 }
 
 /// Is the loaded `path` the image `img` (`/apps/<LEAF>`)? The directory byte-exact, the leaf any case.
-fn path_names(path: &str, img: &str) -> bool {
+pub fn path_names(path: &str, img: &str) -> bool {
     const DIR: &str = "/apps/";
     match (path.strip_prefix(DIR), img.strip_prefix(DIR)) {
         (Some(leaf), Some(want)) => !leaf.is_empty() && leaf.eq_ignore_ascii_case(want),
