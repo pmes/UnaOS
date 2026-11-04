@@ -789,9 +789,9 @@ enum Attempt<R> {
 ///
 /// UNAFSTXN: `f` is `FnMut` rather than `FnOnce` because a transaction that dies on a transient
 /// `Busy` is RESTARTED — see [`with_unafs`]'s restart loop and [`TXN_BUSY_ATTEMPTS`].
-fn with_unafs_attempt<R>(f: &mut impl FnMut(&mut KernelUnaFS) -> R, arm: bool) -> Attempt<R> {
+fn with_unafs_attempt<R>(f: &mut impl FnMut(&mut KernelUnaFS) -> R, arm: bool, #[cfg(all(target_arch = "x86_64", feature = "wc"))] took: &mut u64) -> Attempt<R> {
     attempt_span(arm, || { #[cfg(all(target_arch = "x86_64", feature = "wc"))] { if !crate::video::renderwedge::wait_unlocked(&MOUNT, crate::video::renderwedge::W_UNAFS) { return Attempt::Settled(Err(MountError::Busy)); } } // RENDERWEDGE (B520): the RENDER task's acquire of the mount is bounded (MOUNT_BOUND_MS) — f28's wedge was this masked spin with no bound; past it `[render] wait-timeout what=unafs-mount` and a clean Busy (nothing was touched). Every other caller is unchanged. ⚠ SAME-LINE fold: line :794's `MOUNT.lock()` keeps its line and column (its `#[track_caller]` site)
-        let mut guard = MOUNT.lock(); let _own = crate::lockowner::own(crate::lockowner::UNAFS); #[cfg(all(target_arch = "x86_64", feature = "wc"))] if splitwrite::ticket_foreign() { return Attempt::Restart; } #[cfg(target_arch = "x86_64")] mount_poison_check(&mut *guard); // POISON2 (B846) MOUNTPOISON: a dead holder's mark discards the in-RAM instance before anything reads it (file tail; LINE-NEUTRAL, before this comment). UNAFSWRITE (B825): another task's commit is writing with MOUNT released — leave MOUNT untouched and restart (LINE-NEUTRAL, before this comment). STACKGUARD2 (B403): the holder, released if it overflows mid-transaction
+        let mut guard = MOUNT.lock(); #[cfg(all(target_arch = "x86_64", feature = "wc"))] { *took = crate::hidstall::now_us(); } let _own = crate::lockowner::own(crate::lockowner::UNAFS); #[cfg(all(target_arch = "x86_64", feature = "wc"))] if splitwrite::ticket_foreign() { return Attempt::Restart; } #[cfg(target_arch = "x86_64")] mount_poison_check(&mut *guard); // POISON2 (B846) MOUNTPOISON: a dead holder's mark discards the in-RAM instance before anything reads it (file tail; LINE-NEUTRAL, before this comment). UNAFSWRITE (B825): another task's commit is writing with MOUNT released — leave MOUNT untouched and restart (LINE-NEUTRAL, before this comment). STACKGUARD2 (B403): the holder, released if it overflows mid-transaction
         // UNAFSTXN: open the attempt's contention window, INSIDE the hold. Clearing it before the
         // acquire would be an SMP bug: a core waiting on `MOUNT` would wipe the latch belonging to
         // the transaction currently running under it. Under the lock the flag is serialized with
@@ -897,7 +897,7 @@ fn with_unafs_attempt<R>(f: &mut impl FnMut(&mut KernelUnaFS) -> R, arm: bool) -
     let budget = crate::arch::hw_wait_budget();
     let mut restarts: u32 = 0;
     for _ in 0..TXN_BUSY_ATTEMPTS {
-        #[cfg(all(target_arch = "x86_64", feature = "wc"))] if !splitwrite::ticket_wait() { break; } if let Err(e) = prebind() { note_txn_restarts(restarts, true); return Err(e); } match { let t_mask = crate::hidstall::now_us(); #[cfg(all(target_arch = "x86_64", feature = "wc"))] let c0 = lockcensus::open(); let arm = attempt_arm(read); let a = with_unafs_attempt(&mut f, arm); note_attempt(arm, t_mask); #[cfg(all(target_arch = "x86_64", feature = "wc"))] { lockcensus::close(c0, t_mask); } a } { // HIDSTALL (B485): the attempt's IRQ-masked span, on the stall line as `masked_ms=`
+        #[cfg(all(target_arch = "x86_64", feature = "wc"))] if !splitwrite::ticket_wait() { break; } if let Err(e) = prebind() { note_txn_restarts(restarts, true); return Err(e); } match { let t_mask = crate::hidstall::now_us(); #[cfg(all(target_arch = "x86_64", feature = "wc"))] let c0 = lockcensus::open(); #[cfg(all(target_arch = "x86_64", feature = "wc"))] let mut took = 0u64; let arm = attempt_arm(read); #[cfg(all(target_arch = "x86_64", feature = "wc"))] let a = with_unafs_attempt(&mut f, arm, &mut took); #[cfg(not(all(target_arch = "x86_64", feature = "wc")))] let a = with_unafs_attempt(&mut f, arm); note_attempt(arm, t_mask); #[cfg(all(target_arch = "x86_64", feature = "wc"))] { lockcensus::close(c0, t_mask, took); } a } { // HIDSTALL (B485): the attempt's IRQ-masked span, on the stall line as `masked_ms=`
             Attempt::Settled(out) => {
                 if restarts > 0 {
                     note_txn_restarts(restarts, true);
@@ -5753,6 +5753,9 @@ pub mod rawrote {
     /// overlap are dropped, the rest kept. `false` = the spans since `ra.seen` are gone: the caller drops every window.
     pub(super) fn narrow(ra: &mut RaSet, g: u64) -> bool {
         let seen = ra.seen;
+        // F39UNAFSTRUESPAN (B1111) RA-RESIDENT: the live windows before the drops (an emptied slot stays in `slots`; a slot
+        // drops at most once, since `lookup` refuses an empty one), so the census's `kept=` counts residents only.
+        let live = ra.slots.iter().filter(|s| s.is_resident()).count();
         crate::arch::without_interrupts(|| {
             let mut w = WROTE.lock();
             let ok = seen >= w.pruned;
@@ -5775,7 +5778,7 @@ pub mod rawrote {
                 w.sectors = w.spans.iter().map(|e| e.2).sum();
                 w.pruned = w.pruned.max(g);
             }
-            super::lockcensus::ra_synced(ok, ra.slots.len()); ok
+            super::lockcensus::ra_synced(ok, live); ok
         })
     }
 
@@ -5806,10 +5809,13 @@ pub mod rawrote {
 // `with_unafs_arm`'s :899, which opens HIDSTALL's span (`t_mask`) and closes it with `note_attempt`: `open` notes the window
 // fills so far (`tx_io`, VFSTXCOST's counter) and `close` (after the attempt returned, MOUNT released) keeps an attempt over
 // `OVER_US` in a fixed table of the worst `WORST_MAX` — site (the `#[track_caller]` chain through `with_unafs`), task id, fills in
-// the span, span_us (the wait for MOUNT plus the hold: HIDSTALL's span, UNAFS-HOLD-TRUESPAN owed). `rawrote::narrow` counts its
-// syncs, the windows it drops and the full invalidates. `say` prints and resets both: from `hidstall::census_minute` (the
-// desktop's minute roll, hidstall.rs:439 fold) and on demand from `tests unafslock` (:3340 fold). `WORST` is a LEAF lock taken
-// masked, never under MOUNT; no allocation under it; the counters are relaxed atomics taken by swap. At the tail: no line moves.
+// the span, span_us (the wait for MOUNT plus the hold: HIDSTALL's span). F39UNAFSTRUESPAN (rmbp-ledger B1111): :794 stamps the
+// take into a per-attempt stack local of `with_unafs_arm` (:792/:900 folds, no static: the next holder would overwrite it before
+// this attempt's `close`), so `close` splits span_us into wait_us (to the take) and hold_us (the take to `close`). `rawrote::narrow`
+// counts its syncs, the RESIDENT windows they saw (`ReadAheadCache::is_resident`), the windows it drops and the full
+// invalidates. `say` prints and resets both: from `hidstall::census_minute` (the desktop's minute roll, hidstall.rs:439 fold)
+// and on demand from `tests unafslock` (:3340 fold). `WORST` is a LEAF lock taken masked, never under MOUNT; no allocation under
+// it; the counters are relaxed atomics taken by swap. At the tail: no line moves.
 #[cfg(all(target_arch = "x86_64", feature = "wc"))]
 pub mod lockcensus {
     use super::*;
@@ -5829,15 +5835,18 @@ pub mod lockcensus {
         tid: u64,
         fills: u32,
         span_us: u32,
+        /// F39UNAFSTRUESPAN: span_us split at the MOUNT take — the wait for MOUNT, then the hold (wait_us + hold_us = span_us).
+        wait_us: u32,
+        hold_us: u32,
     }
 
-    const EMPTY: Hold = Hold { site: None, tid: 0, fills: 0, span_us: 0 };
+    const EMPTY: Hold = Hold { site: None, tid: 0, fills: 0, span_us: 0, wait_us: 0, hold_us: 0 };
 
     /// The worst holds since the last census (`site: None` = a free slot).
     static WORST: Mutex<[Hold; WORST_MAX]> = Mutex::new([EMPTY; WORST_MAX]);
     /// Attempts over `OVER_US` since the last census (kept or not).
     static OVER_N: AtomicU64 = AtomicU64::new(0);
-    /// `rawrote::narrow` calls (a moved `RA_GEN`), the slots their narrowed syncs saw, the windows they dropped, the full invalidates.
+    /// `rawrote::narrow` calls (a moved `RA_GEN`), the resident windows their narrowed syncs saw, the windows they dropped, the full invalidates.
     static RA_SYNCS: AtomicU64 = AtomicU64::new(0);
     static RA_SLOTS: AtomicU64 = AtomicU64::new(0);
     static RA_DROPPED: AtomicU64 = AtomicU64::new(0);
@@ -5849,26 +5858,30 @@ pub mod lockcensus {
         tx_io().0
     }
 
-    /// :899 fold — the attempt (opened at `t0_us` with `f0` fills) ended, MOUNT released. Over `OVER_US` it is counted and,
-    /// when among the worst, kept with its site (`with_unafs`'s caller), task and fills.
+    /// :899 fold — the attempt (opened at `t0_us` with `f0` fills, MOUNT taken at `took_us`, 0 = never taken) ended, MOUNT
+    /// released. Over `OVER_US` it is counted and, when among the worst, kept with its site (`with_unafs`'s caller), task, fills
+    /// and its wait / hold split (F39UNAFSTRUESPAN: no take, i.e. the RENDERWEDGE Busy return, is all wait).
     #[track_caller]
     #[inline(always)]
-    pub fn close(f0: u64, t0_us: u64) {
+    pub fn close(f0: u64, t0_us: u64, took_us: u64) {
         let us = crate::hidstall::now_us().saturating_sub(t0_us);
         if us <= OVER_US {
             return;
         }
-        keep(Location::caller(), tx_io().0.wrapping_sub(f0), us);
+        let wait = if took_us == 0 { us } else { took_us.saturating_sub(t0_us).min(us) };
+        keep(Location::caller(), tx_io().0.wrapping_sub(f0), us, wait, us - wait);
     }
 
     #[inline(never)]
-    fn keep(site: &'static Location<'static>, fills: u64, us: u64) {
+    fn keep(site: &'static Location<'static>, fills: u64, us: u64, wait: u64, hold: u64) {
         OVER_N.fetch_add(1, Ordering::Relaxed);
         let h = Hold {
             site: Some(site),
             tid: crate::arch::sched::current_id().unwrap_or(0),
             fills: fills.min(u32::MAX as u64) as u32,
             span_us: us.min(u32::MAX as u64) as u32,
+            wait_us: wait.min(u32::MAX as u64) as u32,
+            hold_us: hold.min(u32::MAX as u64) as u32,
         };
         crate::arch::without_interrupts(|| {
             let mut w = WORST.lock();
@@ -5894,7 +5907,7 @@ pub mod lockcensus {
         RA_DROPPED.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// `rawrote::narrow` fold — a sync ended: narrowed over `slots` windows (`ok`), else the caller drops every window.
+    /// `rawrote::narrow` fold — a sync ended: narrowed over `slots` RESIDENT windows (`ok`), else the caller drops every window.
     #[inline(always)]
     pub fn ra_synced(ok: bool, slots: usize) {
         RA_SYNCS.fetch_add(1, Ordering::Relaxed);
@@ -5924,7 +5937,7 @@ pub mod lockcensus {
             let file = site.file().rsplit('/').next().unwrap_or(site.file());
             let _ = write!(line, " · {}:{} tid=", file, site.line());
             let _ = if h.tid == 0 { write!(line, "-") } else { write!(line, "{}", h.tid) };
-            let _ = write!(line, " fills={} span_us={}", h.fills, h.span_us);
+            let _ = write!(line, " fills={} span_us={} wait_us={} hold_us={}", h.fills, h.span_us, h.wait_us, h.hold_us);
         }
         serial_println!("{}", line);
         let syncs = RA_SYNCS.swap(0, Ordering::Relaxed);

@@ -82,6 +82,12 @@ impl ReadAheadCache {
         self.len = 0;
     }
 
+    /// F39UNAFSTRUESPAN (rmbp-ledger B1111): does this cache hold a live window? False when new, after
+    /// [`invalidate`](Self::invalidate) and after a failed fill.
+    pub fn is_resident(&self) -> bool {
+        self.len != 0
+    }
+
     /// Copy `[lba, lba + out.len()/512)` from the window if it is wholly cached.
     pub fn lookup(&self, lba: u64, out: &mut [u8]) -> bool {
         let n = out.len() as u64 / SECTOR_SIZE;
@@ -223,5 +229,23 @@ mod tests {
         let mut out = alloc::vec![0u8; 512];
         assert!(c.read(0, &mut out, 256, |_, _| Err(SectorError::Io("boom".into()))).is_err());
         assert!(!c.lookup(0, &mut out));
+    }
+
+    #[test]
+    fn resident_tracks_fill_and_invalidate() {
+        let disk = medium(256);
+        let mut c = ReadAheadCache::new(64);
+        assert!(!c.is_resident());
+        let mut out = alloc::vec![0u8; 512];
+        c.read(3, &mut out, 256, |s, b| {
+            b.copy_from_slice(&disk[(s * 512) as usize..(s * 512) as usize + b.len()]);
+            Ok(())
+        })
+        .unwrap();
+        assert!(c.is_resident());
+        c.invalidate();
+        assert!(!c.is_resident());
+        assert!(c.read(0, &mut out, 256, |_, _| Err(SectorError::Io("boom".into()))).is_err());
+        assert!(!c.is_resident());
     }
 }
