@@ -23,6 +23,7 @@ geom_core = { path = "../../unaos/libs/cad/geom_core" }
 # VUGFACEPHOTO (SR506): photo_core measures the photo (src/photo.rs), doc_core::intent verifies a proposal. Vein is NOT
 # linked: the provider, the key and the TLS road are handlers/vein's (the bus; VUG-VEIN-BUS owed).
 photo_core = { path = "../../unaos/libs/cad/photo_core" }
+principia = { path = "../../handlers/principia" } # VUGFACEPHOTOCAMERAPREF (SR576): photo.rs PhotoPrefs reads vug.photo.* read-only (the Vein / tabula shape)
 # VUGFACETREE (SR513): doc_core holds the face's document (src/journal.rs: record, replay, diff). VUGFACEPHOTO adds the
 # same line: the fold keeps one.
 doc_core = { path = "../../unaos/libs/cad/doc_core" }

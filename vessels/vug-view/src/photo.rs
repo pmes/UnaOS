@@ -130,6 +130,9 @@ pub struct Photo {
     /// VUGINTENTTHICKNESS (SR557): the side photo's thickness as a doc_core `Measurement::Thickness`, set by [`side`];
     /// an extrude of the sketch is judged by it beside the outline ([`judged`]). None until a side photo is measured.
     pub thickness: Option<Measurement>,
+    /// VUGFACEPHOTOCAMERAPREF (SR576): the camera's datum from Principia's store (`vug.photo.*`, read once at start by
+    /// main.rs); the default (none set) is the lattice's own camera solve about the photo's centre.
+    pub prefs: PhotoPrefs,
 }
 
 impl fmt::Debug for Photo {
@@ -188,14 +191,20 @@ impl Photo {
 }
 
 /// Open a photo on `pitch_mm` graph paper: decode, measure, the paper as the drawn model, the measured sketch as a
-/// face on the XY plane (paper millimetres are the plane's coordinates).
+/// face on the XY plane (paper millimetres are the plane's coordinates). No camera prefs ([`open_with`]'s default).
 pub fn open(bytes: &[u8], pitch_mm: f64) -> Result<(Model, SketchFace, Photo), String> {
+    open_with(bytes, pitch_mm, PhotoPrefs::default())
+}
+
+/// VUGFACEPHOTOCAMERAPREF (SR576): [`open`] under the camera's prefs: the lens term about `prefs.principal_px`, and the
+/// prefs held on the [`Photo`] for the side photo ([`side`]).
+pub fn open_with(bytes: &[u8], pitch_mm: f64, prefs: PhotoPrefs) -> Result<(Model, SketchFace, Photo), String> {
     let image = pixel_core::decode(bytes).map_err(|e| format!("image {e:?}"))?;
-    let params = photo_core::PhotoParams::new(pitch_mm);
+    let params = prefs.params(pitch_mm); // VUGFACEPHOTOCAMERAPREF (SR576)
     let m = photo_core::measure(&image, params, Tol::DEFAULT).map_err(|e| format!("photo {e:?}"))?;
     let model = paper(&m.outline, pitch_mm)?;
     let first = Some(m.clone()); // VUGFACEPHOTOSIDE (SR547): held for the side photo
-    let photo = Photo { image, h: m.h, outline: m.outline, loops: m.loops, sigma_mm: m.sigma_mm, band_mm: params.band.lin.max(m.sigma_mm), offers: Vec::new(), focus: None, note: None, outbox: Vec::new(), request: 0, asked: None, ignored: 0, first, thickness: None }; // VUGINTENTTHICKNESS (SR557): thickness
+    let photo = Photo { image, h: m.h, outline: m.outline, loops: m.loops, sigma_mm: m.sigma_mm, band_mm: params.band.lin.max(m.sigma_mm), offers: Vec::new(), focus: None, note: None, outbox: Vec::new(), request: 0, asked: None, ignored: 0, first, thickness: None, prefs }; // VUGINTENTTHICKNESS (SR557): thickness; VUGFACEPHOTOCAMERAPREF (SR576): prefs
     let face = SketchFace::over(world_planes()[0].1, m.sketch);
     Ok((model, face, photo))
 }
@@ -730,14 +739,16 @@ pub fn side_path(view: &mut View, path: &str) -> Result<(), String> {
 /// photo and its sigma, the confidence is the pairing margin inside measure_side's band. The corner reads
 /// `side <name>: thickness=<mm> sigma=<mm> paired=<mm>`. Refused by name (`NoFirstPhoto`, `image ..`, measure_side's
 /// refusal) in the corner and in the `Err`; nothing is offered then. VUGFACEPHOTOSIDEPARALLAX (SR569): the camera
-/// height self-calibrated from the side photo's lattice ([`side_camera`] with `None`).
+/// height self-calibrated from the side photo's lattice ([`side_camera`] with `None`). VUGFACEPHOTOCAMERAPREF (SR576):
+/// the camera height is the photo's `prefs.camera_mm` (Principia's `vug.photo.camera_mm`) when set.
 pub fn side(view: &mut View, bytes: &[u8], name: &str) -> Result<(), String> {
-    side_camera(view, bytes, name, None)
+    let camera_mm = view.photo.as_ref().and_then(|ph| ph.prefs.camera_mm);
+    side_camera(view, bytes, name, camera_mm)
 }
 
 /// VUGFACEPHOTOSIDEPARALLAX (SR569): [`side`] through `photo_core::measure_side_raised` (the part stands on its side,
-/// its top raised): `camera_mm` the person's camera height (Principia's `photo.camera_mm`, VUG-FACE-PHOTO-CAMERA-PREF
-/// owed), `None` the lattice's own solve. The corner and why add `camera=<mm> mm lattice|set`.
+/// its top raised): `camera_mm` the person's camera height (Principia's `vug.photo.camera_mm` through [`side`],
+/// VUGFACEPHOTOCAMERAPREF SR576), `None` the lattice's own solve. The corner and why add `camera=<mm> mm lattice|set`.
 pub fn side_camera(view: &mut View, bytes: &[u8], name: &str, camera_mm: Option<f64>) -> Result<(), String> {
     let (p, s) = match side_proposal(view, bytes, name, camera_mm) {
         Ok(v) => v,
@@ -766,7 +777,8 @@ fn side_proposal(view: &View, bytes: &[u8], name: &str, camera_mm: Option<f64>) 
         return Err("NoFirstPhoto".to_string());
     };
     let image = pixel_core::decode(bytes).map_err(|e| format!("image {e:?}"))?;
-    let params = photo_core::PhotoParams { camera_mm, ..photo_core::PhotoParams::new(first.pitch_mm) }; // VUGFACEPHOTOSIDEPARALLAX (SR569)
+    let principal_px = view.photo.as_ref().and_then(|ph| ph.prefs.principal_px); // VUGFACEPHOTOCAMERAPREF (SR576)
+    let params = photo_core::PhotoParams { camera_mm, principal_px, ..photo_core::PhotoParams::new(first.pitch_mm) }; // VUGFACEPHOTOSIDEPARALLAX (SR569)
     let s = photo_core::measure_side_raised(first, &image, params, Tol::DEFAULT).map_err(|e| match e {
         photo_core::Refusal::NoSideMatch { length_mm, nearest_mm, band_mm } => {
             format!("NoSideMatch length={} nearest={} band={}", num(length_mm), num(nearest_mm), num(band_mm))
@@ -1218,3 +1230,64 @@ fn single_road(view: &mut View, i: usize) -> Option<bool> {
     }
     Some(true)
 }
+
+// ---- VUGFACEPHOTOCAMERAPREF (SR576): the camera's datum from Principia's store (named tail block) ----
+
+/// The photo face's namespace in Principia's store (`vug.photo.camera_mm`, `vug.photo.principal_px`; declared in
+/// prefs_core's schema with consumer defaults, operator-written).
+pub const PREF_NS: &str = "vug";
+
+/// The camera's once-per-setup datum: its height above the paper and its principal point. `None` = unset: the
+/// lattice's own camera solve, the photo's centre.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct PhotoPrefs {
+    /// `vug.photo.camera_mm`: the camera height (mm) the side photo's parallax correction takes.
+    pub camera_mm: Option<f64>,
+    /// `vug.photo.principal_px` (`x,y`): the principal point in photo pixels (the camera solve and the lens term).
+    pub principal_px: Option<Vec2>,
+}
+
+impl PhotoPrefs {
+    /// The prefs from a lookup of `vug` keys (the store's `get` in [`PhotoPrefs::load_from`]): the camera height a
+    /// finite positive float (or a hand-written positive integer), the principal point `x,y` with both finite; anything
+    /// else is unset.
+    pub fn from_prefs(get: impl Fn(&str) -> Option<bandy::PrefValue>) -> PhotoPrefs {
+        let camera_mm = match get("photo.camera_mm") {
+            Some(bandy::PrefValue::Float(f)) if f.is_finite() && f > 0.0 => Some(f),
+            Some(bandy::PrefValue::Int(i)) if i > 0 => Some(i as f64),
+            _ => None,
+        };
+        let principal_px = match get("photo.principal_px") {
+            Some(bandy::PrefValue::Str(s)) => xy(&s),
+            _ => None,
+        };
+        PhotoPrefs { camera_mm, principal_px }
+    }
+
+    /// The prefs in the store folder `dir`, read-only (`principia::PrefStore::load`; Principia stays the writer of
+    /// record). An unreadable store is the defaults.
+    pub fn load_from(dir: &std::path::Path) -> PhotoPrefs {
+        match principia::PrefStore::load(dir) {
+            Ok(store) => PhotoPrefs::from_prefs(|k| store.get(PREF_NS, k)),
+            Err(_) => PhotoPrefs::default(),
+        }
+    }
+
+    /// The prefs in the standard store (`principia::default_prefs_path()`): main.rs calls it once at start.
+    pub fn load() -> PhotoPrefs {
+        PhotoPrefs::load_from(&principia::default_prefs_path())
+    }
+
+    /// photo_core's params on `pitch_mm` paper under these prefs.
+    pub fn params(&self, pitch_mm: f64) -> photo_core::PhotoParams {
+        photo_core::PhotoParams { camera_mm: self.camera_mm, principal_px: self.principal_px, ..photo_core::PhotoParams::new(pitch_mm) }
+    }
+}
+
+/// `x,y` as a point (both finite), else None.
+fn xy(s: &str) -> Option<Vec2> {
+    let (x, y) = s.split_once(',')?;
+    let (x, y) = (x.trim().parse::<f64>().ok()?, y.trim().parse::<f64>().ok()?);
+    (x.is_finite() && y.is_finite()).then(|| Vec2::new(x, y))
+}
+

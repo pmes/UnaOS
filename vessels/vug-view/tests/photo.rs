@@ -193,6 +193,7 @@ fn rectangle() -> Viewer {
         ignored: 0,
         first: None, // VUGFACEPHOTOSIDE (SR547)
         thickness: None, // VUGINTENTTHICKNESS (SR557)
+        prefs: Default::default(), // VUGFACEPHOTOCAMERAPREF (SR576)
     });
     vw
 }
@@ -736,3 +737,36 @@ fn a_single_verified_before_a_panel_delete_enters_in_the_journal_names() {
     assert_eq!(ph(&vw).offers[1].state, State::Open);
     assert_eq!(vw.view.design.journal.doc, before, "nothing entered");
 }
+
+// ---- VUGFACEPHOTOCAMERAPREF (SR576): the camera's datum from Principia's store ----
+
+/// A store holding `vug.photo.camera_mm = 400.0` (written through Principia's PrefStore, the schema's check): the face
+/// opened under it reads the square-camera side photo 6.0 within 0.1 with NO argument, the corner `camera=400 mm set`;
+/// the same photo under the default prefs still refuses NoCamera by name.
+#[test]
+fn a_stored_camera_height_sets_the_side_camera_with_no_argument() {
+    use photo_core::fixture::{PART_H, PART_T, PART_W, Spec, side_raised_png};
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("vug-photo-prefs-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    principia::PrefStore::empty(&dir).set(photo::PREF_NS, "photo.camera_mm", bandy::PrefValue::Float(400.0)).expect("the store takes the camera height");
+    let prefs = photo::PhotoPrefs::load_from(&dir);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(prefs, photo::PhotoPrefs { camera_mm: Some(400.0), principal_px: None });
+
+    let square = side_raised_png(&Spec::side_square(), PART_W, PART_T, PART_H);
+    let mut vw = Viewer::open_photo_with(&photo_core::fixture::photo_png(), "fixture", (W, H), Preset::Una, photo::PITCH_MM, prefs).expect("the fixture measures");
+    photo::side(&mut vw.view, &square, "square.png").expect("the square photo measures with the stored camera height");
+    let mm = match &ph(&vw).thickness {
+        Some(doc_core::Measurement::Thickness { mm, .. }) => *mm,
+        t => panic!("no thickness held: {t:?}"),
+    };
+    let note = ph(&vw).note.as_deref().unwrap_or("").to_string();
+    eprintln!("photo: pref {note}");
+    assert!((mm - PART_T).abs() < 0.1, "held {mm} vs {PART_T}");
+    assert!(note.contains("camera=400 mm set"), "{note}");
+
+    let mut vw = opened();
+    let e = photo::side(&mut vw.view, &square, "square.png").expect_err("no stored camera height");
+    assert!(e.contains("NoCamera"), "{e}");
+}
+

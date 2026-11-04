@@ -70,6 +70,7 @@ pub struct PhotoParams {
     pub camera_mm: Option<f64>,
     /// VUG-PHOTO-PP (SR569): the principal point in photo pixels; `None` is the photo centre. A cropped photo states it
     /// (the uncropped centre less the crop's offset) so [`camera_pose_at`] solves f and the pose about the right point.
+    /// VUGFACEPHOTOCAMERAPREF (SR576): the lens term k1 is centred on it too ([`measure_lens`], [`undistort_gray_at`]).
     pub principal_px: Option<Vec2>,
 }
 
@@ -166,9 +167,11 @@ pub struct Measured {
     /// The radial residual pattern LEFT after the lens term: k in e_radial = k (r / r_max)³ (px at the photo's corner).
     pub lens_hint: f64,
     /// VUG-PHOTO-LENS (SR533): the Brown radial term k1 (r_d = r (1 + k1 r²), r normalised by the half-diagonal, about
-    /// the photo's centre) the photo was undistorted by before the lattice and the silhouette; 0.0 when the refined
+    /// the principal point: `PhotoParams.principal_px`, else the photo's centre, VUGFACEPHOTOCAMERAPREF SR576; a crop's
+    /// k1 is the full frame's times (half-diagonal of the crop / of the frame)²) the photo was undistorted by before the lattice and the silhouette; 0.0 when the refined
     /// term did not halve the wide-band lattice residual (the SR503 road, bit-exact). When non-zero, `h` maps paper mm to UNDISTORTED px: a
-    /// consumer drawing over the raw photo composes `homography::distort(apply(h, p), k1, w, h)`.
+    /// consumer drawing over the raw photo composes `homography::distort(apply(h, p), k1, w, h)` (about the centre; about
+    /// a stated principal point pp: `distort(q + d, k1, w, h) - d` with d = centre - pp).
     pub k1: f64,
     /// The lattice residual (px) with no lens term (= `residual_px` when `k1` is 0.0).
     pub residual_flat_px: f64,
@@ -210,7 +213,8 @@ pub fn measure_lens(img: &Image, params: PhotoParams, tol: Tol, lens: bool) -> R
     }
     // VUG-PHOTO-LENS (SR533): k1 from the lattice residual; the photo undistorted before the silhouette.
     let residual_flat_px = lat.residual_px;
-    let (gray, g, lat, k1) = if lens { lens_passes(gray, g, lat, pitch)? } else { (gray, g, lat, 0.0) };
+    let pp = params.principal_px.unwrap_or(Vec2::new(gray.w as f64 * 0.5, gray.h as f64 * 0.5)); // VUGFACEPHOTOCAMERAPREF (SR576): the lens about the principal point
+    let (gray, g, lat, k1) = if lens { lens_passes(gray, g, lat, pitch, pp)? } else { (gray, g, lat, 0.0) };
     if lat.tilt_deg > max_deg {
         return Err(Refusal::GridUnsquare { deg: lat.tilt_deg });
     }
@@ -260,18 +264,23 @@ pub fn measure_lens(img: &Image, params: PhotoParams, tol: Tol, lens: bool) -> R
 // straight lines fitted to bowed strokes, a bias k1 cannot remove (measured on the k1 = -0.08 fixture: pass 0 alone
 // went 2.836 -> 1.791 px, ratio 0.632, with k1 already at -0.0758). The term is taken when the final undistorted
 // lattice's wide-band residual is at most LENS_GAIN x the flat one; otherwise, or when a refinement pass refuses,
-// the pass-0 values come back unchanged (the SR503 road, bit-exact).
+// the pass-0 values come back unchanged (the SR503 road, bit-exact). VUGFACEPHOTOCAMERAPREF (SR576): the model is
+// centred on the principal point `pp` by working in a translated frame: with d = centre - pp, the raw crossings are
+// shifted by +d into homography's centred model and the photo is undistorted by distort(p + d) - d; at pp = centre
+// d is (0.0, 0.0) and every step is the SR533 one bit for bit.
 fn lens_passes(
     gray0: edges::Gray,
     g0: grid::Grid,
     lat0: homography::Lattice,
     pitch: f64,
+    pp: Vec2,
 ) -> Result<(edges::Gray, grid::Grid, homography::Lattice, f64), Refusal> {
     let (w, h) = (gray0.w, gray0.h);
-    let Ok((paper, raw)) = homography::lens_set(&g0, pitch, &|q: Vec2| q) else { return Ok((gray0, g0, lat0, 0.0)) };
+    let d = lens_shift(w, h, pp);
+    let Ok((paper, raw)) = homography::lens_set(&g0, pitch, &|q: Vec2| q + d) else { return Ok((gray0, g0, lat0, 0.0)) };
     let rms0 = homography::lens_residual(&paper, &raw, 0.0, w, h);
     let k = homography::fit_k1(&paper, &raw, w, h).0;
-    match lens_refine(&gray0, k, pitch) {
+    match lens_refine(&gray0, k, pitch, pp) {
         Ok((gray, g, lat, k, rms_f)) if rms_f <= homography::LENS_GAIN * rms0 => Ok((gray, g, lat, k)),
         _ => Ok((gray0, g0, lat0, 0.0)),
     }
@@ -283,41 +292,57 @@ fn lens_refine(
     gray0: &edges::Gray,
     mut k: f64,
     pitch: f64,
+    pp: Vec2,
 ) -> Result<(edges::Gray, grid::Grid, homography::Lattice, f64, f64), Refusal> {
     let (w, h) = (gray0.w, gray0.h);
+    let d = lens_shift(w, h, pp);
     for _ in 0..homography::LENS_PASSES {
-        let (_, g) = lens_grid(gray0, k)?;
+        let (_, g) = lens_grid(gray0, k, pp)?;
         let kp = k;
-        let (paper, raw) = homography::lens_set(&g, pitch, &|q: Vec2| homography::distort(q, kp, w, h))?;
+        let (paper, raw) = homography::lens_set(&g, pitch, &|q: Vec2| homography::distort(q + d, kp, w, h))?;
         k = homography::fit_k1(&paper, &raw, w, h).0;
     }
-    let (gray, g) = lens_grid(gray0, k)?;
+    let (gray, g) = lens_grid(gray0, k, pp)?;
     let kf = k;
-    let (paper, raw) = homography::lens_set(&g, pitch, &|q: Vec2| homography::distort(q, kf, w, h))?;
+    let (paper, raw) = homography::lens_set(&g, pitch, &|q: Vec2| homography::distort(q + d, kf, w, h))?;
     let rms_f = homography::lens_residual(&paper, &raw, k, w, h);
     let lat = homography::fit_lattice(&g, pitch, w, h)?;
     Ok((gray, g, lat, k, rms_f))
 }
 
-fn lens_grid(gray0: &edges::Gray, k1: f64) -> Result<(edges::Gray, grid::Grid), Refusal> {
-    let gray = undistort_gray(gray0, k1);
+fn lens_grid(gray0: &edges::Gray, k1: f64, pp: Vec2) -> Result<(edges::Gray, grid::Grid), Refusal> {
+    let gray = undistort_gray_at(gray0, k1, pp);
     let g = grid::find(&edges::edgels(&gray), gray.w, gray.h)?;
     Ok((gray, g))
 }
 
 /// The photo undistorted by `k1`: every pixel is the raw luma (bilinear, `Gray::sample`) where the lens put it, the
-/// coordinates clamped to the pixel centres' hull.
+/// coordinates clamped to the pixel centres' hull. The lens about the photo's centre ([`undistort_gray_at`]'s wrapper).
 pub fn undistort_gray(g: &edges::Gray, k1: f64) -> edges::Gray {
+    undistort_gray_at(g, k1, Vec2::new(g.w as f64 * 0.5, g.h as f64 * 0.5))
+}
+
+/// VUGFACEPHOTOCAMERAPREF (SR576): [`undistort_gray`] with the lens centred on the principal point `pp` (photo px): the
+/// raw pixel of undistorted `p` is `distort(p + d) - d`, d = centre - pp (homography's centred model in a translated
+/// frame; the normaliser stays the photo's half-diagonal). At pp = centre it is [`undistort_gray`] bit for bit.
+pub fn undistort_gray_at(g: &edges::Gray, k1: f64, pp: Vec2) -> edges::Gray {
     let (w, h) = (g.w, g.h);
+    let d = lens_shift(w, h, pp);
     let (xmax, ymax) = (w as f64 - 0.5 - 1e-9, h as f64 - 0.5 - 1e-9);
     let mut v = Vec::with_capacity(w * h);
     for j in 0..h {
         for i in 0..w {
-            let q = homography::distort(Vec2::new(i as f64 + 0.5, j as f64 + 0.5), k1, w, h);
+            let q = homography::distort(Vec2::new(i as f64 + 0.5, j as f64 + 0.5) + d, k1, w, h) - d;
             v.push(g.sample(q.x.clamp(0.5, xmax), q.y.clamp(0.5, ymax)).unwrap_or(g.at(i, j)));
         }
     }
     edges::Gray { w, h, v }
+}
+
+/// VUGFACEPHOTOCAMERAPREF (SR576): d = the photo's centre - `pp`, the translation that puts the principal point on
+/// homography's lens centre ((0.0, 0.0) when `pp` is the centre).
+fn lens_shift(w: usize, h: usize, pp: Vec2) -> Vec2 {
+    Vec2::new(w as f64 * 0.5, h as f64 * 0.5) - pp
 }
 
 // VUG-PHOTO-SIDE (SR545): the thickness from a second photo of the part on its side. The side photo goes through the

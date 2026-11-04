@@ -14,7 +14,7 @@ PREFSCAP (B454): a ring-3 program's PREF_SET reaches only its own `app.<name>.*`
 after it, and the rows marked `yes` under `ring 3` (writer `program`); every other row is NOT settable
 from ring 3 (`prefs_core::cap`).
 
-Rows: 80.
+Rows: 82.
 
 | key | type | default | writers | ring 3 | reader | meaning |
 | :-- | :-- | :-- | :-- | :-- | :-- | :-- |
@@ -98,6 +98,8 @@ Rows: 80.
 | `vein.provider` | enum `claude \| gemini \| claudecode \| echo \| relay` | `"claude"` | operator | — | gneiss_pal ProviderConfig; user-vein (metal: echo | relay) | The chat provider (R81: Claude is the default; Gemini is a preference, never hardwired; claudecode = the installed Claude Code CLI on a subscription, host only, SR38). |
 | `vein.system_prompt` | string ≤2048 printable | consumer: unset: Lumen's built-in system prompt | operator | — | LUMEN.ELF (LUMEN2, SR121); a conversation's own `lumen:set system` block overrides it | The default system prompt for a new conversation. At most 2048 bytes (Lumen's SYS_CAP). |
 | `vein.temperature` | float `0.0..=2.0` | consumer: the provider's own | operator | — | gneiss_pal ProviderConfig | Sampling temperature. |
+| `vug.photo.camera_mm` | float `20.0..=10000.0` | consumer: the side photo's own lattice solve (photo_core::camera_at) | operator | — | vug-view PhotoPrefs (`vessels/vug-view/src/photo.rs`) | The camera's height above the paper (mm), the once-per-setup datum the side photo's parallax correction takes when its lattice cannot calibrate the camera (a square camera). |
+| `vug.photo.principal_px` | string ≤32 printable | consumer: the photo's centre | operator | — | vug-view PhotoPrefs (`vessels/vug-view/src/photo.rs`) | The camera's principal point in photo pixels, `x,y` (a cropped photo's: the uncropped centre less the crop's offset); the camera solve and the lens term are centred on it. |
 
 ## Decisions (REASK B681, R130 law 2)
 

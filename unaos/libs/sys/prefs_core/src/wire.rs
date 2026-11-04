@@ -639,4 +639,26 @@ mod secreview_fuzz {
             }
         }
     }
+
+    /// VUGFACEPHOTOCAMERAPREF (SR576): the two `vug.photo.*` rows (consumer defaults, so not in the system GOLDEN): set
+    /// and listed as frozen bytes; the camera height clamped into its row's range; a wrong type and an over-long
+    /// principal point refused, the stored values unchanged.
+    #[test]
+    fn kat_list_of_the_vug_photo_rows() {
+        fn run(s: &mut TreeStore, verb: u8, body: &[u8], in_session: bool) -> (i64, Vec<u8>) {
+            let mut out = Vec::new();
+            let st = fulfil(s, verb, body, in_session, &mut out);
+            (st, out)
+        }
+        let mut s = TreeStore::default();
+        assert_eq!(run(&mut s, VERB_SET, &set_body("vug", "photo.camera_mm", &PrefValue::Float(400.0)), true), (0, Vec::new()));
+        assert_eq!(run(&mut s, VERB_SET, &set_body("vug", "photo.principal_px", &PrefValue::Str("250,320".into())), true), (0, Vec::new()));
+        const VUG: &[u8] = b"vug.photo.camera_mm = 400.0\nvug.photo.principal_px = \"250,320\"\n";
+        assert_eq!(run(&mut s, VERB_LIST, b"vug", false), (0, VUG.to_vec()));
+        assert_eq!(run(&mut s, VERB_SET, b"vug.photo.camera_mm\x00\"high\"", true), (EINVAL, Vec::new()));
+        assert_eq!(run(&mut s, VERB_SET, &set_body("vug", "photo.principal_px", &PrefValue::Str("1".repeat(40))), true), (EINVAL, Vec::new()));
+        assert_eq!(run(&mut s, VERB_LIST, b"vug", false), (0, VUG.to_vec()));
+        assert_eq!(run(&mut s, VERB_SET, b"vug.photo.camera_mm\x001000000000.0", true), (0, b"10000.0\x00clamped=true".to_vec()));
+        assert_eq!(run(&mut s, VERB_GET, b"vug.photo.camera_mm", true), (0, b"10000.0".to_vec()));
+    }
 }
