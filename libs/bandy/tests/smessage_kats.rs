@@ -1925,6 +1925,19 @@ kat!(
     SMessage::Pump(bandy::PumpEvent::Commissioned { port: "tcp://127.0.0.1:23".to_string(), name: "UNA-A50285BI".to_string() }),
     r#"{"Pump":{"Commissioned":{"port":"tcp://127.0.0.1:23","name":"UNA-A50285BI"}}}"#
 );
+// VUGCOMSCANMACHINEDECLARE (SR613): the machine declared behind the desk's ports by name.
+kat!(
+    kat_pump_declare,
+    SMessage::Pump(bandy::PumpEvent::PumpDeclare {
+        principal: Origin::LocalUser("una".to_string()),
+        name: "mill".to_string(),
+        x: 120.0,
+        y: 300.0,
+        z: 100.0,
+        dialect: Some("grbl".to_string()),
+    }),
+    r#"{"Pump":{"PumpDeclare":{"principal":{"LocalUser":"una"},"name":"mill","x":120.0,"y":300.0,"z":100.0,"dialect":"grbl"}}}"#
+);
 // VUG-VEIN-BUS (SR509): Vug's propose exchange with Vein; the photo rides as bytes and every answer echoes the request.
 kat!(
     kat_intent_propose,
