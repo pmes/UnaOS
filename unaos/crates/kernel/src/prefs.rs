@@ -1828,7 +1828,7 @@ pub fn reload_session(old: &PrefTree) -> usize {
 // prefs_core refuses is never overwritten. Wire: `[prefs] machine settings/<d> system.<k>=<v> wrote=<0|1>`.
 
 /// The keys the boot screen reads before any login (the machine copy's whole content from the session side).
-const MACHINE_KEYS: &[&str] = prefs_core::files::MACHINE_KEYS; // VEIL-BOOT-STORE-R3 (rmbp-ledger B1146): the shared list (prefs_core), one for both rings
+pub const MACHINE_KEYS: &[&str] = prefs_core::files::MACHINE_KEYS; // VEIL-BOOT-STORE-R3 (rmbp-ledger B1146): the shared list (prefs_core), one for both rings; A11Y-BOOT-SET (rmbp-ledger B1147): the accessibility keys a boot-screen consumer reads (contrast, cursor, filter, shimmer and motion, the lens); `login::veil_reduce_boot` reads them all through `settings::a11y_load("machine")`. Named in-place hunk
 
 /// Mirror the session's committed `ns`/`k` = `v` into the no-session store's domain file (see the block above).
 fn machine_mirror(ns: &str, k: &str, v: Option<&PrefValue>) {
