@@ -1514,7 +1514,7 @@ exec-rmbp-vugcomscanmdnsdial 550b00ee2 wave36 cut64h
 exec-rmbp-vugcomscanmdnsv6 550b00ee2 wave36 cut64h
 exec-rmbp-vugfacephotocropsave 550b00ee2 wave36 cut64h
 exec-rmbp-f39relaytimeoutpendpin 1d0e4a381 FOLDED (kernel batch cut66 kernel batch B1197-B1201)
-exec-rmbp-f39queuedsetpendcap 0e0a0fd07 wave36 cut66
+exec-rmbp-f39queuedsetpendcap d58aa799e FOLDED (kernel batch cut66 kernel batch B1197-B1201)
 exec-rmbp-f39queuedsetkeeprace 0e0a0fd07 wave36 cut66
 exec-rmbp-f39prefsflushontoapplier 0e0a0fd07 wave36 cut66
 exec-rmbp-f39resetrepaintqueued 0e0a0fd07 wave36 cut66

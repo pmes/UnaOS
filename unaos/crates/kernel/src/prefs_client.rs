@@ -235,7 +235,7 @@ fn relay(hdr: &crate::bus::BusHdr, body: &[u8]) -> Option<Answer> {
     let h3 = crate::bus::BusHdr { verb: tag, ..*hdr };
     match crate::bus_route::route_request(ops, KCLIENT_ROW, KCLIENT_GEN, principal(), &h3, body) {
         crate::bus_route::Route::Relayed => {}
-        _ => return None,
+        r => return pendcap_refuse(hdr, tag, r), // QUEUED-SET-PENDCAP (rmbp-ledger B1198): a relayed WRITE refused -EAGAIN at the router while an unanswered queued entry's holder lives is answered -EAGAIN, never written by the kernel fulfiller ahead of that queue (file tail). Named in-place hunk
     }
     let t0 = crate::arch::ms();
     let mut spins = 0u32;
@@ -1613,7 +1613,7 @@ fn pendpin_release(corr: u32) {
 fn pendpin_selftest(next: &dyn Fn() -> u32, body_of: &dyn Fn(i64) -> String, read: &dyn Fn() -> Option<i64>, want: i64) -> bool {
     let ops = crate::arch::syscall::busreg_ops();
     let rg0 = (ops.rgen)(0);
-    let cap = crate::bus_route::PEND_MAX_PER_CALLER;
+    let cap = crate::bus_route::caller_cap(KCLIENT_ROW); // QUEUED-SET-PENDCAP (rmbp-ledger B1198): the kernel client's own cap. Named in-place hunk
     let n0 = crate::bus_route::caller_pending(KCLIENT_ROW, KCLIENT_GEN);
     let b8 = body_of(if want == 7 { 33 } else { 35 });
     let c8 = next();
@@ -1957,4 +1957,60 @@ fn timeoutpend_selftest(next: &dyn Fn() -> u32) -> bool {
         }
     }
     ok
+}
+
+// QUEUED-SET-PENDCAP (rmbp-ledger B1198, BP-storage-11) — TAIL-APPENDED. Inside B1187's 70 s silent window eight queued
+// SETs held `bus_route::PEND_MAX_PER_CALLER`, so the ninth was -EAGAIN at `route_request` and `relay`'s refusal arm fell to
+// the kernel fulfiller, a write ahead of the holder's queue that the holder's later commits overtake. The client's cap is
+// now its own bound ([`KCLIENT_PEND_MAX`] = `Q_CAP`: the one live wait plus the ring; `bus_route::caller_cap`), and the
+// refusal arm runs [`pendcap_refuse`]: a relayed WRITE refused -EAGAIN while an unanswered entry's holder lives (the 17th
+// SET, or the holder's 16-deep mailbox full) is answered -EAGAIN, as `queued_full` answers at the same depth; the ring
+// empty or every holder gone = `None`, the kernel fulfiller answers as before (nothing of ours can overtake it). A refused
+// SET is never kept with no Pend: no holder answer and no unread mark could ever settle it. `QUEUED` is read under its
+// leaf lock inside `locked`; the arch `rgen` is read with it released (as `queued_lost` does); the line prints lock-free.
+// Wire: `[prefsbus] relay verb=<t> corr=<c> refused -EAGAIN at the router — <n> set queued at the live holder, kernel
+// fulfiller does not write ahead`. Witness: `bus_route::pendcap_selftest` (`tests bandy3`).
+// =================================================================================================
+/// The kernel client's relays-in-flight bound in `bus_route` (the ring's depth).
+#[cfg(feature = "busreg")]
+pub const KCLIENT_PEND_MAX: usize = Q_CAP;
+
+/// Unanswered queued entries whose holder still lives (an entry with no recorded holder counts as live).
+#[cfg(feature = "busreg")]
+fn queued_ahead() -> usize {
+    let held: Vec<Option<(usize, u64)>> = locked(|| QUEUED.lock().iter().filter(|e| e.answered.is_none()).map(|e| e.held).collect());
+    let ops = crate::arch::syscall::busreg_ops();
+    held.iter().filter(|h| h.map_or(true, |(r, g)| (ops.rgen)(r) == g)).count()
+}
+
+/// `relay`'s router-refusal arm: `Some(-EAGAIN)` for a relayed write refused -EAGAIN while [`queued_ahead`] is non-zero;
+/// `None` = the kernel fulfiller answers (unchanged road).
+#[cfg(feature = "busreg")]
+fn pendcap_refuse(hdr: &crate::bus::BusHdr, tag: u8, r: crate::bus_route::Route) -> Option<Answer> {
+    if !relayed_write(hdr.verb) || !matches!(r, crate::bus_route::Route::Reply(e) if e == una_abi::EAGAIN) {
+        return None;
+    }
+    let n = queued_ahead();
+    if n == 0 {
+        return None;
+    }
+    serial_println!("[prefsbus] relay verb={} corr={} refused -EAGAIN at the router — {} {} queued at the live holder, kernel fulfiller does not write ahead", tag, hdr.corr, n, queued_word(tag));
+    Some(Answer { status: una_abi::EAGAIN, body: Vec::new() })
+}
+
+/// `bus_route::pendcap_selftest`'s guard leg, holder `(row, rgen)` live: (a SET refused at the router with an entry of
+/// that holder queued is answered -EAGAIN, the same refusal with the entry taken back is `None`). Nothing is written.
+#[cfg(feature = "busreg")]
+pub fn pendcap_guard_leg(row: usize, rgen: u64) -> (bool, bool) {
+    let mut c = NEXT_CORR.fetch_add(1, Ordering::Relaxed);
+    if c == 0 {
+        c = NEXT_CORR.fetch_add(1, Ordering::Relaxed);
+    }
+    let b = alloc::format!("{}.{}\0{}", crate::prefs::NS, crate::prefs::key::IDLE_MIN, PrefValue::Int(7).to_literal());
+    let Some(h) = queued_set_hdr(c, b.as_bytes()) else { return (false, false) };
+    let kept = queued_keep(&h, b.as_bytes(), Some((row, rgen)));
+    let refused = kept && pendcap_refuse(&h, una_abi::BUS_VERB_R3PREF_SET, crate::bus_route::Route::Reply(una_abi::EAGAIN)).is_some_and(|a| a.status == una_abi::EAGAIN);
+    let _ = queued_take(c);
+    let fell = pendcap_refuse(&h, una_abi::BUS_VERB_R3PREF_SET, crate::bus_route::Route::Reply(una_abi::EAGAIN)).is_none();
+    (refused, fell)
 }

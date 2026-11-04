@@ -238,7 +238,7 @@ pub fn route_request(ops: &Ops, caller_row: usize, caller_gen: u64, caller_prin:
     let ok = locked(|| {
         let mut t = PEND.lock();
         let mine = t.iter().flatten().filter(|p| p.caller_row == caller_row && p.caller_gen == caller_gen).count();
-        if mine >= PEND_MAX_PER_CALLER {
+        if mine >= caller_cap(caller_row) { // QUEUED-SET-PENDCAP (rmbp-ledger B1198): the kernel client's bound is the ring's (`prefs_client::KCLIENT_PEND_MAX`), a ring-3 caller keeps PEND_MAX_PER_CALLER (file tail). Named in-place hunk
             return false;
         }
         // A free slot, else one whose CALLER is gone (its answer would be discarded anyway).
@@ -518,7 +518,7 @@ pub fn selftest(fx: &Fixture) {
     } else {
         serial_println!(":: BANDY3: registered={} relayed={} replied={} orphan={} w={:#05x}/{:#05x} verbs={}/{} -> FAIL ::", rg, rl, rp, or, w, ALL, vg, vl);
     }
-    tagid_selftest(fx); armearly_selftest(fx); unreadset_selftest(fx); /* RELAY-RESET-SET (B1169): the unread-mark legs (file tail). BUSREG-ARM-EARLY (B1164): the early-arm legs, after the BUSREG-TAGID line (file tail) */ armforget_selftest(fx); /* ARMFORGET-CHAIN (B1171): the teardown-forget legs (file tail) */ crate::prefs_client::queued_selftest(); /* RELAY-QUEUED-SET (B1175): the queued-set legs (prefs_client.rs tail) */ armlate_selftest(fx); /* ARMFORGET-LATEARM (B1178): the late-arm stamp legs (file tail) */ unsetrelay_selftest(fx); /* PREFS-UNSET-RELAY (B1186): the relayed-unset legs (file tail) */ // BUSREG-TAG-IDENTITY (B1157): the identity legs, after the BANDY3 line
+    tagid_selftest(fx); armearly_selftest(fx); unreadset_selftest(fx); /* RELAY-RESET-SET (B1169): the unread-mark legs (file tail). BUSREG-ARM-EARLY (B1164): the early-arm legs, after the BUSREG-TAGID line (file tail) */ armforget_selftest(fx); /* ARMFORGET-CHAIN (B1171): the teardown-forget legs (file tail) */ crate::prefs_client::queued_selftest(); /* RELAY-QUEUED-SET (B1175): the queued-set legs (prefs_client.rs tail) */ armlate_selftest(fx); /* ARMFORGET-LATEARM (B1178): the late-arm stamp legs (file tail) */ unsetrelay_selftest(fx); /* PREFS-UNSET-RELAY (B1186): the relayed-unset legs (file tail) */ pendcap_selftest(fx); /* QUEUED-SET-PENDCAP (rmbp-ledger B1198): nine kernel-client relays under the cap, the refusal guard both ways (file tail) */ // BUSREG-TAG-IDENTITY (B1157): the identity legs, after the BANDY3 line
 }
 
 /// HOLOCRON2 (rmbp-ledger B355): does `verb` have a registration right now? (Generation not checked: a row
@@ -1520,4 +1520,67 @@ pub fn deliverrace_reply(cc: u32, status: i32) -> (i64, bool) {
     };
     let left = take_pending(|q| q.relay == relay).is_some();
     (rc, left)
+}
+
+// QUEUED-SET-PENDCAP (rmbp-ledger B1198) — TAIL-APPENDED. B1193 reclaimed a silent holder's kernel-client Pend after the
+// 70 s window, but inside that window eight queued SETs still held `PEND_MAX_PER_CALLER` (8): the ninth was -EAGAIN at
+// `route_request` and `prefs_client::relay` fell to the kernel fulfiller, which wrote ahead of the holder's queue. The
+// kernel client's Pends are bounded by its own ring (the one live wait in `relay` plus the queued entries, `Q_CAP` 16) and
+// the holder's mailbox is 16 deep on both arches, so its cap is that bound (`caller_cap`, `prefs_client::KCLIENT_PEND_MAX`);
+// a ring-3 caller keeps 8, and the assert keeps 16 slots of the 32 for two ring-3 callers at their full cap. A SET refused
+// anyway (the 17th, or a full mailbox) is answered -EAGAIN by `prefs_client::pendcap_refuse`, never written by the kernel
+// while a queued entry's holder lives. Not a no-Pend ring entry: nobody could answer or mark it (measured, design.md).
+// Witness: `tests bandy3` -> `:: QUEUED-SET-PENDCAP: relayed=9/9 cap=16 refused=eagain fell=kernel pendcap=raised -> PASS ::`.
+// =================================================================================================
+
+/// The relays-in-flight bound `route_request` holds caller `caller_row` to.
+pub fn caller_cap(caller_row: usize) -> usize {
+    if caller_row == crate::prefs_client::KCLIENT_ROW { crate::prefs_client::KCLIENT_PEND_MAX } else { PEND_MAX_PER_CALLER }
+}
+
+const _: () = assert!(crate::prefs_client::KCLIENT_PEND_MAX + PEND_MAX_PER_CALLER <= PEND_CAP);
+
+/// `tests bandy3`' cap leg, on the fixture's scratch rows (caller `a`, fulfiller `f`), open tag 254: P1 nine kernel-client
+/// requests through the real `route_request` are all relayed (at B1196 the ninth was -EAGAIN at the cap); P2 the refusal
+/// guard (`prefs_client::pendcap_guard_leg`): -EAGAIN while a queued entry's holder `f` lives, the kernel road once it is gone.
+fn pendcap_selftest(fx: &Fixture) {
+    let (a, f) = fx.rows;
+    let busy = locked(|| REGS.lock().iter().flatten().any(|r| (r.row == a || r.row == f) && (fx.ops.rgen)(r.row) == r.rgen));
+    if busy {
+        serial_println!(":: QUEUED-SET-PENDCAP: SKIP (scratch rows {}/{} hold a live registration) ::", a, f);
+        return;
+    }
+    let vg = 254u8;
+    let parse = |b: &[u8]| crate::bus::frame_parse(b).ok();
+    let mut buf = [0u8; 128];
+    (fx.clear)(a);
+    (fx.clear)(f);
+    let n = crate::bus::build_request(BUS_VERB_REGISTER, 96, &[vg], &mut buf);
+    let reg = (fx.send)(f, &buf[..n]) == 0 && matches!((fx.pop)(f).as_deref().and_then(parse), Some(h) if h.status == 0 && h.corr == 96);
+    const BODY: &[u8] = b"ui.theme";
+    const BASE: u32 = 0xFFFF_FF00; // never a live client corr in practice (the client counts up from 1)
+    let n0 = caller_pending(crate::prefs_client::KCLIENT_ROW, crate::prefs_client::KCLIENT_GEN);
+    let mut relayed = 0u32;
+    for i in 1..=9u32 {
+        let h = crate::bus::BusHdr { kind: crate::bus::BUS_KIND_REQUEST, verb: vg, corr: BASE + i, status: 0, principal: crate::prefs_client::principal(), body_len: BODY.len() as u32 };
+        if matches!(route_request(fx.ops, crate::prefs_client::KCLIENT_ROW, crate::prefs_client::KCLIENT_GEN, crate::prefs_client::principal(), &h, BODY), Route::Relayed) {
+            relayed += 1;
+        }
+    }
+    let grew = caller_pending(crate::prefs_client::KCLIENT_ROW, crate::prefs_client::KCLIENT_GEN).saturating_sub(n0);
+    let cap = caller_cap(crate::prefs_client::KCLIENT_ROW);
+    let (refused, fell) = crate::prefs_client::pendcap_guard_leg(f, (fx.ops.rgen)(f));
+    for i in 1..=9u32 {
+        let _ = take_pending_by_corr(crate::prefs_client::KCLIENT_ROW, BASE + i);
+    }
+    while (fx.pop)(f).is_some() {}
+    on_exit(fx.ops, f);
+    (fx.clear)(f);
+    (fx.clear)(a);
+    let p1 = reg && relayed == 9 && grew == 9 && cap == crate::prefs_client::KCLIENT_PEND_MAX && cap > PEND_MAX_PER_CALLER;
+    if p1 && refused && fell {
+        serial_println!(":: QUEUED-SET-PENDCAP: relayed={}/9 cap={} refused=eagain fell=kernel pendcap=raised -> PASS ::", relayed, cap);
+    } else {
+        serial_println!(":: QUEUED-SET-PENDCAP: relayed={}/9 grew={} n0={} cap={} reg={} refused={} fell={} -> FAIL ::", relayed, grew, n0, cap, reg as u8, refused as u8, fell as u8);
+    }
 }
