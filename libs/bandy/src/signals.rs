@@ -1221,6 +1221,15 @@ pub enum PumpEvent {
     },
     /// A refused request, with the reason by name.
     PumpRefused { why: String },
+    /// VUGCOMSCANJOG (SR573): home the machine on the running link (grbl `$H`, Marlin `G28`); allowed with nothing of a
+    /// job in flight, a lost run relinked included (a lost pump is homed without a start).
+    PumpHome { principal: Origin },
+    /// VUGCOMSCANJOG (SR573): jog by `dx` / `dy` / `dz` mm (relative) at `feed` mm/min (grbl `$J=G91 ..`, Marlin `G91`,
+    /// `G0 ..`, `G90`), under the same guard as [`PumpEvent::PumpHome`].
+    PumpJog { principal: Origin, dx: f64, dy: f64, dz: f64, feed: f64 },
+    /// VUGCOMSCANJOG (SR573): the controller at `port` took the commissioned `name` (its EEPROM write acked and read back),
+    /// said once at the first bind. An answer, inert as input.
+    Commissioned { port: String, name: String },
 }
 
 impl PumpEvent {
@@ -1229,6 +1238,7 @@ impl PumpEvent {
         matches!(
             self,
             PumpEvent::PumpStart { .. } | PumpEvent::PumpHold { .. } | PumpEvent::PumpResume { .. } | PumpEvent::PumpStop { .. }
+                | PumpEvent::PumpHome { .. } | PumpEvent::PumpJog { .. } // VUGCOMSCANJOG (SR573)
         )
     }
 }

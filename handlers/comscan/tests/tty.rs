@@ -657,3 +657,99 @@ fn a_marlin_start_on_the_host_composition_says_m115_and_streams() {
     let (lines, _m) = fake.join().unwrap();
     assert_eq!(lines, want, "make_core's Marlin text, line for line, and M115 is no program line");
 }
+
+// --- VUGCOMSCANJOG (SR573): a lost grbl pump homes and jogs on the relinked port, before any re-arm ---
+
+/// The one `PumpRefused` reason in `out`.
+fn refused_in(out: &[PumpEvent]) -> String {
+    match out {
+        [PumpEvent::PumpRefused { why }] => why.clone(),
+        other => panic!("expected one PumpRefused, got {other:?}"),
+    }
+}
+
+/// The one Squawk word in `out`.
+fn said_in(out: &[PumpEvent]) -> String {
+    match out {
+        [PumpEvent::Squawk { event: Some(e), .. }] => e.clone(),
+        other => panic!("expected one Squawk word, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_lost_grbl_homes_and_jogs_on_the_relinked_port() {
+    let root = fresh("comscan-jog-lost");
+    let (sys, dev) = (root.join("sys"), root.join("dev"));
+    std::fs::create_dir_all(&dev).unwrap();
+    let interface = usb_device(&sys, "1-1", "2341", "0043", Some("UNA0002"));
+    let (m1, slave1, s1) = pty();
+    std::os::unix::fs::symlink(&slave1, dev.join("ttyACM0")).unwrap();
+    tty_node(&sys, "ttyACM0", Some(&interface));
+
+    let p = program();
+    let mut desk = PumpDesk::new(machine());
+    desk.identify_by(identify_in(sys.clone()));
+    let pass = Verdict::Pass { digest: p.digest(), machine: machine().digest() };
+    let digest = desk.arm(&pass, &p, GRBL).expect("armed by a pass");
+    let mut open = opener_in(sys.clone(), dev.clone(), Baud::B115200, Flow::None);
+    // Silent until the soft reset (open_flow's tcflush drops a banner said before the open), as the renamed-node test.
+    let fake1 = fake_grbl(m1, true, 2);
+    let who = || Origin::LocalUser("una".to_string());
+    let home = PumpEvent::PumpHome { principal: who() };
+    let start = PumpEvent::PumpStart {
+        principal: who(),
+        program: digest_hex(digest),
+        dialect: "grbl".to_string(),
+        port: dev.join("ttyACM0").to_str().unwrap().to_string(),
+    };
+    assert_eq!(said_in(&desk.apply(&start, &mut *open)), "started");
+    let busy = refused_in(&desk.apply(&home, &mut *open));
+    assert!(busy.starts_with("busy: streaming"), "busy on a job refuses: {busy}");
+
+    // Two lines reach the first fake, then the board goes: the replug brings it back as ttyACM1.
+    let t0 = Instant::now();
+    while !fake1.is_finished() && t0.elapsed() < Duration::from_secs(5) {
+        desk.tick(t0.elapsed().as_micros() as u64);
+        thread::sleep(Duration::from_millis(2));
+    }
+    for _ in 0..20 {
+        desk.tick(t0.elapsed().as_micros() as u64);
+        thread::sleep(Duration::from_millis(2));
+    }
+    let (_lines, m1) = fake1.join().unwrap();
+    let (m2, slave2, _s2) = pty();
+    std::os::unix::fs::symlink(&slave2, dev.join("ttyACM1")).unwrap();
+    std::fs::remove_file(dev.join("ttyACM0")).unwrap();
+    std::fs::remove_dir_all(sys.join("class/tty/ttyACM0")).unwrap();
+    tty_node(&sys, "ttyACM1", Some(&interface));
+    let fake2 = fake_grbl(m2, true, 2);
+    drop(m1);
+    drop(s1);
+
+    let mut words = Vec::new();
+    let lost = drive_until(&mut desk, &mut *open, t0, &mut words, |e| e.starts_with("link lost"));
+    let at: usize = lost
+        .strip_prefix("link lost at line ")
+        .and_then(|r| r.split(';').next())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("{lost}"));
+    assert_eq!(refused_in(&desk.apply(&home, &mut *open)), "home: the link is down (reconnect attempt 1)");
+    let relinked =
+        drive_until(&mut desk, &mut *open, t0, &mut words, |e| e.starts_with("relinked") || e.contains("failed"));
+    assert_eq!(relinked, format!("relinked on attempt 1; re-arm to resume from line {at}"), "{words:?}");
+
+    // Lost and relinked, no start, no re-arm: the home and the jog go on the wire and their oks come back by name.
+    assert_eq!(said_in(&desk.apply(&home, &mut *open)), "home sent: $H");
+    assert_eq!(drive_until(&mut desk, &mut *open, t0, &mut words, |e| e.starts_with("home")), "home ok");
+    let jog = PumpEvent::PumpJog { principal: who(), dx: 1.0, dy: -2.0, dz: 0.5, feed: 600.0 };
+    assert!(jog.is_request());
+    assert_eq!(said_in(&desk.apply(&jog, &mut *open)), "jog sent: $J=G91 X1 Y-2 Z0.5 F600");
+    assert_eq!(drive_until(&mut desk, &mut *open, t0, &mut words, |e| e.starts_with("jog")), "jog ok");
+    assert!(matches!(desk.state(), Some(PumpState::LinkLost { at_line, .. }) if at_line == at), "the lost run is still lost");
+    assert_eq!(desk.rearm(&pass, &p, GRBL), Ok(at), "the home and the jog leave the lost run re-armable");
+    drop(desk);
+    drop(open);
+    let (wire, _m2) = fake2.join().unwrap();
+    assert_eq!(wire, vec!["$H".to_string(), "$J=G91 X1 Y-2 Z0.5 F600".to_string()], "the home and the jog, nothing else");
+    std::fs::remove_dir_all(&root).unwrap();
+}

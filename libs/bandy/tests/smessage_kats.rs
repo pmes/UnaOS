@@ -1880,6 +1880,28 @@ kat!(
     }),
     r#"{"Pump":{"Squawk":{"sent":12,"acked":9,"total":40,"state":"streaming"}}}"#
 );
+// VUGCOMSCANJOG (SR573): home and jog on the running link; the commissioned name as its own word.
+kat!(
+    kat_pump_home,
+    SMessage::Pump(bandy::PumpEvent::PumpHome { principal: Origin::LocalUser("una".to_string()) }),
+    r#"{"Pump":{"PumpHome":{"principal":{"LocalUser":"una"}}}}"#
+);
+kat!(
+    kat_pump_jog,
+    SMessage::Pump(bandy::PumpEvent::PumpJog {
+        principal: Origin::LocalUser("una".to_string()),
+        dx: 1.0,
+        dy: -2.0,
+        dz: 0.5,
+        feed: 600.0,
+    }),
+    r#"{"Pump":{"PumpJog":{"principal":{"LocalUser":"una"},"dx":1.0,"dy":-2.0,"dz":0.5,"feed":600.0}}}"#
+);
+kat!(
+    kat_pump_commissioned,
+    SMessage::Pump(bandy::PumpEvent::Commissioned { port: "tcp://127.0.0.1:23".to_string(), name: "UNA-A50285BI".to_string() }),
+    r#"{"Pump":{"Commissioned":{"port":"tcp://127.0.0.1:23","name":"UNA-A50285BI"}}}"#
+);
 // VUG-VEIN-BUS (SR509): Vug's propose exchange with Vein; the photo rides as bytes and every answer echoes the request.
 kat!(
     kat_intent_propose,

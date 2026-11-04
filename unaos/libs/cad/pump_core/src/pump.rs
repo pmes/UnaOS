@@ -723,3 +723,33 @@ pub fn hello_name(d: Dialect, said: &str) -> Option<&str> {
         Dialect::Marlin | Dialect::LinuxCnc => None,
     }
 }
+
+// --- VUGCOMSCANJOG (LEDGER SR573): the controller's home and jog lines per dialect (named tail hunk) ---
+
+/// The lines that home the machine, a controller action outside the program (make_core refuses grbl homing in a
+/// `Program`): grbl 1.1 `$H` (the homing cycle, answered `ok` when it is over; the way out of an alarm), Marlin `G28`;
+/// LinuxCNC is not streamed: `None`.
+pub fn home_lines(d: Dialect) -> Option<Vec<String>> {
+    match d {
+        Dialect::Grbl { .. } => Some(alloc::vec![String::from("$H")]),
+        Dialect::Marlin => Some(alloc::vec![String::from("G28")]),
+        Dialect::LinuxCnc => None,
+    }
+}
+
+/// The lines that jog by `delta` (mm, relative) at `feed` (mm/min), the numbers in make_core's one grammar
+/// (`make_core::gcode::num`): grbl 1.1 `$J=G91 X.. Y.. Z.. F..` (one jog line; the modal state is untouched), Marlin
+/// `G91`, `G0 X.. Y.. Z.. F..`, `G90` (relative for the one move, absolute again after); LinuxCNC: `None`.
+pub fn jog_lines(d: Dialect, delta: [f64; 3], feed: f64) -> Option<Vec<String>> {
+    let mut mv = String::new();
+    for (c, v) in [('X', delta[0]), ('Y', delta[1]), ('Z', delta[2]), ('F', feed)] {
+        mv.push(' ');
+        mv.push(c);
+        make_core::gcode::num(&mut mv, v);
+    }
+    match d {
+        Dialect::Grbl { .. } => Some(alloc::vec![alloc::format!("$J=G91{mv}")]),
+        Dialect::Marlin => Some(alloc::vec![String::from("G91"), alloc::format!("G0{mv}"), String::from("G90")]),
+        Dialect::LinuxCnc => None,
+    }
+}
