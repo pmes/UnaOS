@@ -1524,7 +1524,7 @@ exec-rmbp-vugscancoarsevieworigin 0e0a0fd07 wave36 cut65h
 exec-rmbp-vugprefsswaplock 0e0a0fd07 wave36 cut65h
 exec-rmbp-vugfacephotocropkeypref 0e0a0fd07 wave36 cut65h
 exec-rmbp-f39relaytagtimeoutpendpin c0f0d0fa5 FOLDED (kernel batch cut67 kernel batch B1202-B1204)
-exec-rmbp-f39prefsflushknoboff 761f4a343 wave36 cut67
+exec-rmbp-f39prefsflushknoboff 41bf680c8 FOLDED (kernel batch cut67 kernel batch B1202-B1204)
 exec-rmbp-f39changesdrainvalue 761f4a343 wave36 cut67
 exec-rmbp-vugcomscanlinkreuseinflight 761f4a343 wave36 cut66h
 exec-rmbp-vugscancoarsesymbothends 761f4a343 wave36 cut66h
