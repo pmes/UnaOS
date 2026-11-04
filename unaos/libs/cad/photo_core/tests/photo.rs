@@ -796,3 +796,66 @@ fn a_thin_side_off_the_lattice_is_kept() {
     let plain = run(&s).expect("the good photo measures");
     assert!(plain.loops[0].iter().all(|&p| to_part(&plain, p).x >= -1.0), "the plain plate has a vertex past its left side");
 }
+
+// ---- VUGPHOTOSIDETHINFIT (SR655): the shim's two sides fit as two parallel lines and its end (named tail block) ----
+#[test]
+fn a_thin_side_fits_two_parallel_lines() {
+    let s = Spec::good();
+    let truth_inv = photo_core::homography::invert(&fixture::homography(&s)).expect("the true homography inverts");
+    let to_part = |m: &Measured, p: Vec2| -> Vec2 {
+        let q = apply(&m.h, p).expect("h maps the outline");
+        fixture::paper_to_part(&s, apply(&truth_inv, q).expect("the truth maps back"))
+    };
+    let img = pixel_core::decode(&fixture::shim_png(&s)).expect("pixel_core decodes the shim PNG");
+    let m = measure(&img, PhotoParams::new(5.0), Tol::DEFAULT).expect("the shim photo measures");
+    let band = fit::BAND_SIGMA * m.sigma_mm;
+    // Every outer line in paper mm and in part mm.
+    let ls: Vec<((Vec2, Vec2), (Vec2, Vec2))> = m
+        .shape
+        .outer
+        .iter()
+        .filter_map(|p| match *p {
+            Prim::Line { a, b, .. } => Some(((a, b), (to_part(&m, a), to_part(&m, b)))),
+            _ => None,
+        })
+        .collect();
+    eprintln!("photo: thin fit outer={:?}", ls.iter().map(|l| l.1).collect::<Vec<_>>());
+    let sides: Vec<&((Vec2, Vec2), (Vec2, Vec2))> =
+        ls.iter().filter(|l| (l.1.0 + l.1.1).x * 0.5 < -1.0 && l.1.0.dist(l.1.1) >= fixture::SHIM_L * 0.5).collect();
+    assert_eq!(sides.len(), 2, "the shim's sides: {:?}", ls.iter().map(|l| l.1).collect::<Vec<_>>());
+    let (s0, s1) = (sides[0].1, sides[1].1);
+    let (u, v) = (s0.1 - s0.0, s1.1 - s1.0);
+    assert!(u.dot(v) < 0.0, "the sides run back against each other: {u:?} {v:?}");
+    let (uh, vh) = (u / u.mag(), v / v.mag());
+    assert!(uh.cross(vh).abs() * u.mag().min(v.mag()) <= band, "the sides are not parallel within the band: {u:?} {v:?}");
+    let sep = ((s1.0 + s1.1) * 0.5 - s0.0).cross(uh).abs();
+    assert!((sep - fixture::SHIM_W).abs() <= 2.0 * m.sigma_mm, "side separation {sep} vs {}", fixture::SHIM_W);
+    let ends: Vec<(Vec2, Vec2)> =
+        ls.iter().map(|l| l.1).filter(|l| ((l.0 + l.1).x * 0.5 + fixture::SHIM_L).abs() <= band).collect();
+    assert_eq!(ends.len(), 1, "the shim's end: {ends:?}");
+    let end = ends[0].0.dist(ends[0].1);
+    assert!((end - fixture::SHIM_W).abs() <= band, "end length {end} vs {}", fixture::SHIM_W);
+    let tip = ends[0].0.x.min(ends[0].1.x);
+    // The spike: a line from the tip to the plate that is not one of the two parallel sides (the merged end's diagonal).
+    let spans = ls.iter().filter(|l| l.1.0.x.min(l.1.1.x) < -fixture::SHIM_L * 0.5 && l.1.0.x.max(l.1.1.x) > -1.0).count();
+    assert_eq!(spans, 2, "only the shim's two sides run from its tip to the plate (else the spike)");
+    // Both sides take the same axis constraint from the sketch writer (paper frame: Horizontal or Vertical within
+    // sketch::HV_DEG), which says they are parallel (on Spec::good the part's x runs along the paper's y: Vertical).
+    let axis = |side: &&((Vec2, Vec2), (Vec2, Vec2))| -> Option<bool> {
+        let d = side.0.1 - side.0.0;
+        let mut ang = d.y.atan2(d.x).to_degrees();
+        if ang < 0.0 {
+            ang += 180.0;
+        }
+        if ang.min(180.0 - ang) <= photo_core::sketch::HV_DEG {
+            Some(true)
+        } else if (ang - 90.0).abs() <= photo_core::sketch::HV_DEG {
+            Some(false)
+        } else {
+            None
+        }
+    };
+    let (a0, a1) = (axis(&sides[0]), axis(&sides[1]));
+    assert!(a0.is_some() && a0 == a1, "the shim's sides take different axis constraints: {a0:?} {a1:?}");
+    eprintln!("photo: thin fit sides={} sep={sep:.3} end={end:.3} tip={tip:.3} sigma={:.4}", sides.len(), m.sigma_mm);
+}
