@@ -3630,6 +3630,7 @@ dependencies = [
  "libm",
  "pixel_core",
  "sketch_core",
+ "svg_core",
 ]
 
 [[package]]

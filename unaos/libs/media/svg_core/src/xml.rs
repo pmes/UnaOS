@@ -116,11 +116,12 @@ struct Parser {
     /// Namespace bindings in scope: (prefix, uri, depth-of-stack when bound).
     bindings: Vec<(String, String, usize)>,
     entities: BTreeMap<String, String>,
-    expanded: usize,
+    expanded: usize, qnames: bool, // VUGPHOTOCROPMETAXMP (SR631): `qnames` set by `Document::parse_qualified` alone
 }
 
 impl Document {
-    pub fn parse(bytes: &[u8]) -> Result<Document, Error> {
+    pub fn parse(bytes: &[u8]) -> Result<Document, Error> { Self::parse_with(bytes, false) } // VUGPHOTOCROPMETAXMP (SR631): the default parse, unchanged
+    fn parse_with(bytes: &[u8], qnames: bool) -> Result<Document, Error> {
         let bytes = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
         let s = core::str::from_utf8(bytes).map_err(|_| Error::NotUtf8)?;
         let mut p = Parser {
@@ -131,7 +132,7 @@ impl Document {
                 ("xlink".to_string(), NS_XLINK.to_string(), 0)
             ],
             entities: BTreeMap::new(),
-            expanded: 0,
+            expanded: 0, qnames, // VUGPHOTOCROPMETAXMP (SR631)
         };
         p.content(s, 0)?;
         let mut ids = BTreeMap::new();
@@ -276,7 +277,7 @@ impl Parser {
         let depth = self.stack.len();
         self.bindings.retain(|b| b.2 < depth);
         let top = self.stack.pop().unwrap();
-        self.nodes[top].attrs.retain(|a| !(a.ns == Ns::Other && a.name == "\u{0}qname"));
+        if !(self.qnames && matches!(self.nodes[top].kind, Kind::Element { ns: Ns::Other, .. })) { self.nodes[top].attrs.retain(|a| !(a.ns == Ns::Other && a.name == "\u{0}qname")); } // VUGPHOTOCROPMETAXMP (SR631): a foreign element of a qualified parse keeps its qname
     }
 
     fn doctype(&mut self, s: &str) -> Result<usize, Error> {
@@ -465,13 +466,13 @@ impl Parser {
             Some((p, l)) => (resolve(&self.bindings, p).ok_or(Error::Malformed("unbound prefix"))?, l),
             None => (resolve(&self.bindings, "").unwrap_or(Ns::None), qname),
         };
-        let mut attrs = Vec::with_capacity(raw_attrs.len() + 1);
+        let mut attrs = Vec::with_capacity(raw_attrs.len() + 1); let qnames = self.qnames; // VUGPHOTOCROPMETAXMP (SR631)
         for (n, v) in raw_attrs {
             if n == "xmlns" || n.starts_with("xmlns:") {
                 continue;
             }
             let (ans, an) = match n.split_once(':') {
-                Some((p, l)) => (resolve(&self.bindings, p).unwrap_or(Ns::Other), l.to_string()),
+                Some((p, l)) => { let ns = resolve(&self.bindings, p).unwrap_or(Ns::Other); let an = if qnames && ns == Ns::Other { n.clone() } else { l.to_string() }; (ns, an) } // VUGPHOTOCROPMETAXMP (SR631): a qualified parse names a foreign attribute by its qname
                 None => (Ns::None, n),
             };
             attrs.push(Attr { ns: ans, name: an, value: v });
@@ -623,5 +624,24 @@ mod tests {
         }
         s.push_str("]><s>&h;</s>");
         assert!(Document::parse(s.as_bytes()).is_err());
+    }
+}
+
+// ---- VUGPHOTOCROPMETAXMP (SR631): the qualified-name parse (named tail block) ----
+
+impl Document {
+    /// VUGPHOTOCROPMETAXMP (SR631): [`Document::parse`], except that a foreign-namespace ([`Ns::Other`]) attribute is
+    /// named by its qualified name (`vug:crop`, not `crop`) and a foreign element keeps its qualified name for
+    /// [`Node::qname`] — the prefix an XMP property is keyed by (photo_core's crop meta). `parse` is unchanged.
+    pub fn parse_qualified(bytes: &[u8]) -> Result<Document, Error> {
+        Self::parse_with(bytes, true)
+    }
+}
+
+impl Node {
+    /// VUGPHOTOCROPMETAXMP (SR631): a foreign element's qualified name as written, when the document came from
+    /// [`Document::parse_qualified`]; None otherwise.
+    pub fn qname(&self) -> Option<&str> {
+        self.attrs.iter().find(|a| a.ns == Ns::Other && a.name == "\u{0}qname").map(|a| a.value.as_str())
     }
 }

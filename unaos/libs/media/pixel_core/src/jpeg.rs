@@ -374,7 +374,7 @@ pub fn decode(data: &[u8]) -> Result<Image, Error> {
                     jfif = true;
                 }
             }
-            0xE1 => {
+            0xE1 => { crate::png::xmp_packet(&mut text, seg, true); // VUGPHOTOCROPMETAXMP (SR631): an XMP APP1 (`http://ns.adobe.com/xap/1.0/` NUL packet) read as ("XML:com.adobe.xmp", packet) into the one budget; an Exif APP1 below
                 if seg.starts_with(b"Exif\0\0") {
                     if let Some(o) = exif_orientation(&seg[6..]) {
                         orientation = o;

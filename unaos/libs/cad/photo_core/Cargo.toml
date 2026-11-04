@@ -16,6 +16,7 @@ geom_core = { path = "../geom_core", default-features = false }
 sketch_core = { path = "../sketch_core", default-features = false }
 pixel_core = { path = "../../media/pixel_core", default-features = false }
 libm = { version = "0.2", default-features = false }
+svg_core = { path = "../../media/svg_core", default-features = false } # VUGPHOTOCROPMETAXMP (SR631): the one XML reader, for the crop meta in an XMP packet (no_std; photo_core is host-linked only)
 
 [features]
 default = ["std"]

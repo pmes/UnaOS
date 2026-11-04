@@ -205,6 +205,7 @@ struct PadState {
     why: Retained<NSTextField>,
     steps: RefCell<Vec<(f64, Retained<NSView>)>>,
     keys: RefCell<Vec<Retained<NSView>>>,
+    declare: std::cell::OnceCell<Retained<super::text_field::UnaTextField>>, // VUGCOMSCANDECLARECONSOLEFACE (SR633): the declare entry, set once built (its Enter clears it)
 }
 
 /// The pad's handle the subscriber loop holds: Send (the loop runs on its own thread); every touch hops to the main
@@ -217,7 +218,7 @@ struct JogPad {
 /// user; the step picker is the filter row's ✓ convention (no segmented control in the house). Main thread only.
 fn jog_pad(root: &objc2_app_kit::NSStackView, synapse: Synapse, mtm: MainThreadMarker) -> JogPad {
     use super::meter::{ns_color, LABEL};
-    use crate::widgets::jog_rows::{key_verb, KEYS, STEPS_MM};
+    use crate::widgets::jog_rows::{declare_verb, key_verb, DECLARE_PLACEHOLDER, KEYS, STEPS_MM}; // VUGCOMSCANDECLARECONSOLEFACE (SR633): declare_verb, DECLARE_PLACEHOLDER
     let who = bandy::Origin::LocalUser(std::env::var("USER").unwrap_or_else(|_| "una".into()));
     let st = Rc::new(PadState {
         card: RefCell::new(comscan::PumpCard::new(who)),
@@ -228,6 +229,7 @@ fn jog_pad(root: &objc2_app_kit::NSStackView, synapse: Synapse, mtm: MainThreadM
         why: label(""),
         steps: RefCell::new(Vec::with_capacity(STEPS_MM.len())),
         keys: RefCell::new(Vec::with_capacity(KEYS.len())),
+        declare: std::cell::OnceCell::new(), // VUGCOMSCANDECLARECONSOLEFACE (SR633)
     });
     // dim-label's twin: the palette's legend colour.
     let _: () = unsafe { msg_send![&st.why, setTextColor: &*ns_color(LABEL)] };
@@ -261,6 +263,27 @@ fn jog_pad(root: &objc2_app_kit::NSStackView, synapse: Synapse, mtm: MainThreadM
     }
     hug(&key_row, 1);
 
+    // VUGCOMSCANDECLARECONSOLEFACE (SR633): the house text field under the squawk row. Enter fires the card's declare when
+    // the parser takes the line and clears the field; a refused line stays for mending (the card says why in the squawk
+    // row); the pad repaints either way. The closure holds the state weakly, so the field and the state hold no cycle.
+    let declare = {
+        let (w, syn) = (Rc::downgrade(&st), synapse.clone());
+        super::text_field::bootstrap_text_field_with(DECLARE_PLACEHOLDER, Box::new(move |line: String| {
+            if let Some(st) = w.upgrade() {
+                let sent = declare_verb(&mut st.card.borrow_mut(), &line);
+                if let Some(m) = sent {
+                    syn.fire(m);
+                    if let Some(f) = st.declare.get() {
+                        set_field(f, "");
+                    }
+                }
+                render_pad(&st);
+            }
+        }))
+    };
+    let _ = st.declare.set(declare.clone());
+    hug(&declare, 1);
+
     for l in [&st.link, &st.travel, &st.position, &st.squawk, &st.why] {
         hug(l, 1);
     }
@@ -272,6 +295,7 @@ fn jog_pad(root: &objc2_app_kit::NSStackView, synapse: Synapse, mtm: MainThreadM
         let _: () = msg_send![&pad, addArrangedSubview: &*st.travel];
         let _: () = msg_send![&pad, addArrangedSubview: &*st.position];
         let _: () = msg_send![&pad, addArrangedSubview: &*st.squawk];
+        let _: () = msg_send![&pad, addArrangedSubview: &*declare]; // VUGCOMSCANDECLARECONSOLEFACE (SR633)
         let _: () = msg_send![&pad, addArrangedSubview: &*step_row];
         let _: () = msg_send![&pad, addArrangedSubview: &*key_row];
         let _: () = msg_send![&pad, addArrangedSubview: &*st.why];
