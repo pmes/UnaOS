@@ -2054,7 +2054,7 @@ fn lock_who_kat(lock: u64, ps2: u64) -> bool {
 // only caller is `video::lag`'s roll, compiled live only on x86 `wc` (`lag::ON`), so no aarch64 boot ever printed the census;
 // the Orin now rolls it from the pump's own sweep, every 240th (~60 s), through [`census_minute_on_pump`]. Owed: HID-CENSUS-PI
 // (the Pi's bracketed `usb_pump` / `input_service` pass has no roll either, so B1124's Pi-metal `who=` wire cannot print),
-// HID-WHO-ORIN (c0 has no tick after the EL2 drop, so `who=?` there).
+// HID-WHO-ORIN (answered by F39HIDWHOORIN B1168: the flown image's c0 ticks (`bsptick`+`bsprun`, `run_bsp_tegra`) and votes through [`wait_tick`]; `who=?` only on a NOBSPTICK/NOBSPRUN image).
 
 /// F39HIDPUMPORIN (B1152): [`census_minute`] printed from the hid pump's OWN task, mid-pass. aarch64's print is synchronous
 /// (byte by byte at 115200: the census's two lines are ~480 B, ~42 ms), and that print must not become the gap it reports:
