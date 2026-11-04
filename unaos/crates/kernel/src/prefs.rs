@@ -182,7 +182,7 @@ pub fn legacy_path() -> String {
 
 fn read_all(p: &str) -> Option<Vec<u8>> {
     let mt = store_mt();
-    let st = mt.stat(p).ok()?;
+    let st = mt.stat(p).ok()?; if machine_refused(&mt, p) { return None; } // MACHINESTOREPLANT (rmbp-ledger B1156): a machine-store file whose nearest owner row is not ROOTACL's `system` is read as absent (file tail). LINE-NEUTRAL append, code first
     if st.size as usize > READ_MAX {
         return None;
     }
@@ -318,7 +318,7 @@ fn read_domain(d: &str) -> Result<Option<PrefTree>, ()> {
 
 /// Read every domain file into the tree (or migrate the old single file, once), then the private-store import.
 fn load() {
-    let mut tree = PrefTree::new();
+    let mut tree = PrefTree::new(); crate::fs::rootacl::stamp_store(&store_mt(), &path()); // MACHINESTOREPLANT (rmbp-ledger B1156): the no-session store's folder is stamped before its first read (a home's path is a no-I/O no-op). LINE-NEUTRAL append, code first
     let (mut held_v, mut disk) = (Vec::new(), Vec::new());
     for d in domains_on_volume() {
         match read_domain(&d) {
@@ -1872,4 +1872,27 @@ fn machine_mirror(ns: &str, k: &str, v: Option<&PrefValue>) {
     }
     crate::fs::rootacl::stamp_store(&mt, &dir); let ok = mt.put_file_atomic(&p, text.as_bytes(), crate::fs::vfs::KERNEL_PRINCIPAL).is_ok(); // MACHINESTOREACL (rmbp-ledger B1150): the machine folder is stamped ROOTACL `system` before its swap (fs/rootacl.rs tail). LINE-NEUTRAL append, code first
     serial_println!("[prefs] machine settings/{} {}.{}={} wrote={}", d, ns, k, v, ok as u8);
+}
+
+// ── MACHINESTOREPLANT (rmbp-ledger B1156, BP-storage-11) — TAIL-APPENDED ───────────────────────────────────────────────
+// A file planted in the no-session store before its folder's first stamp keeps its own owner row; [`read_all`] (the ONE
+// reader under `load`, `read_domain`'s `.new` adoption, [`machine_mirror`]'s read-modify-write and `domain_bytes`)
+// refuses it here through ROOTACL's owner read (`rootacl::store_file_refused`) and reads it as absent, so the boot
+// screen never takes it and the mirror never launders it; the kernel's next swap of that domain replaces it.
+// Wire: `[prefs] machine settings/<d> refused: owner=<p>`.
+
+/// Is `p` a machine-store file ROOTACL says is not the kernel's? Said once per refused read.
+fn machine_refused(mt: &crate::fs::vfs::MountTable, p: &str) -> bool {
+    match crate::fs::rootacl::store_file_refused(mt, p) {
+        Some(owner) => {
+            serial_println!("[prefs] machine settings/{} refused: owner={}", p.rsplit('/').next().unwrap_or(p), owner);
+            true
+        }
+        None => false,
+    }
+}
+
+/// `tests rootacl`'s MACHINESTORE plant leg reads through the one reader.
+pub(crate) fn store_read(p: &str) -> Option<Vec<u8>> {
+    read_all(p)
 }
