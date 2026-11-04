@@ -604,12 +604,7 @@ pub const CROP_KEY: &str = "vug:crop";
 /// The principal point the photo's own [`CROP_KEY`] pair states (the first one), `(W / 2 - x, H / 2 - y)`, else None
 /// (absent, or not four integers with W and H above 0).
 pub fn crop_principal(img: &Image) -> Option<Vec2> {
-    let v = img.text.iter().find_map(|(k, v)| crop_value(k, v))?; // VUGPHOTOCROPMETAXMP (SR631): the CROP_KEY pair, or the one inside an XMP packet, first in file order
-    let mut n = v.split(',').map(|t| t.trim().parse::<u32>().ok());
-    let (x, y, w, h) = (n.next()??, n.next()??, n.next()??, n.next()??);
-    if n.next().is_some() || w == 0 || h == 0 {
-        return None;
-    }
+    let [x, y, w, h] = crop_frame(img)?; // VUGFACEPHOTOCROPSAVE (SR640): the one parse, shared with crop_pair
     Some(Vec2::new(w as f64 * 0.5 - x as f64, h as f64 * 0.5 - y as f64))
 }
 
@@ -654,4 +649,27 @@ pub fn xmp_crop(packet: &str) -> Option<alloc::string::String> {
         }
     }
     None
+}
+
+// ---- VUGFACEPHOTOCROPSAVE (SR640): the crop frame read once and written once (named tail block) ----
+
+/// The photo's own crop frame `[x, y, W, H]` (the first [`CROP_KEY`] pair, or the one inside an XMP packet, first in file
+/// order), else None (absent, or not four integers with W and H above 0). THE parse of the key: [`crop_principal`] and
+/// [`crop_pair`] read it.
+pub fn crop_frame(img: &Image) -> Option<[u32; 4]> {
+    let v = img.text.iter().find_map(|(k, v)| crop_value(k, v))?; // VUGPHOTOCROPMETAXMP (SR631): the CROP_KEY pair, or the one inside an XMP packet, first in file order
+    let mut n = v.split(',').map(|t| t.trim().parse::<u32>().ok());
+    let (x, y, w, h) = (n.next()??, n.next()??, n.next()??, n.next()??);
+    if n.next().is_some() || w == 0 || h == 0 {
+        return None;
+    }
+    Some([x, y, w, h])
+}
+
+/// THE writer of the key: the (keyword, value) pair a crop of `img` at offset (`x0`, `y0`) carries. The frame is `img`'s
+/// own when it states one ([`crop_frame`]: its offset grows by the crop's), else `img` itself, so the principal point
+/// [`crop_principal`] reads back from the crop is the one `img` had, less the offset.
+pub fn crop_pair(img: &Image, x0: u32, y0: u32) -> (alloc::string::String, alloc::string::String) {
+    let [x, y, w, h] = crop_frame(img).unwrap_or([0, 0, img.width, img.height]);
+    (alloc::string::String::from(CROP_KEY), alloc::format!("{},{},{},{}", x.saturating_add(x0), y.saturating_add(y0), w, h))
 }

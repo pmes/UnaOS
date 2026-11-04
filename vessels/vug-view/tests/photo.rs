@@ -194,6 +194,7 @@ fn rectangle() -> Viewer {
         first: None, // VUGFACEPHOTOSIDE (SR547)
         thickness: None, // VUGINTENTTHICKNESS (SR557)
         prefs: Default::default(), // VUGFACEPHOTOCAMERAPREF (SR576)
+        crop: Default::default(), // VUGFACEPHOTOCROPSAVE (SR640)
     });
     vw
 }
@@ -1414,4 +1415,120 @@ fn a_glyph_in_a_full_band_stays_at_its_last_free_y_and_the_corner_says_so() {
     let fr = raster::render(&vw.model, &vw.view);
     let ink = raster::rgba(INK);
     assert!((30..40u32).any(|y| (6..46u32).any(|x| fr.pixel(x, y) == ink)), "the corner's second row paints INK");
+}
+
+// ---- VUGFACEPHOTOCROPSAVE (SR640): the face's crop and its save beside the photo (named tail block) ----
+
+/// A fresh folder under the test target for one crop test.
+fn crop_dir(tag: &str) -> std::path::PathBuf {
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("vug-photo-crop-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("the test folder is made");
+    dir
+}
+
+/// The fixture photo written as `fixture.png` in `dir` and opened by its path (the open road that knows the file).
+fn crop_opened(dir: &std::path::Path) -> (Viewer, std::path::PathBuf) {
+    let path = dir.join("fixture.png");
+    std::fs::write(&path, photo_core::fixture::photo_png()).expect("the fixture is written");
+    let vw = Viewer::open(path.to_str().expect("a UTF-8 path"), (W, H), Preset::Una).expect("the fixture opens by its path");
+    (vw, path)
+}
+
+/// `:crop` Return on the photo's line.
+fn crop_armed(vw: &mut Viewer) {
+    assert!(key(vw, ":"), "`:` opens over a photo");
+    typed(vw, "crop");
+    assert!(key(vw, "Return"));
+    assert!(!vw.view.entry.open, "a run line closes");
+    assert!(ph(vw).crop.armed, "`:crop` arms the drag");
+}
+
+/// A Left drag from `a` to `b` (surface pixels): press, one motion, release.
+fn crop_drag(vw: &mut Viewer, a: (f64, f64), b: (f64, f64)) {
+    vw.input(&SMessage::BrowserButton { down: true, x: a.0, y: a.1, mods: 0, surface: 0 });
+    vw.input(&SMessage::BrowserMouseMove(b.0, b.1, 0));
+    vw.input(&SMessage::BrowserButton { down: false, x: b.0, y: b.1, mods: 0, surface: 0 });
+}
+
+/// VUGFACEPHOTOCROPSAVE (SR640): `:crop`, a drag on the photo and Return save the CROPPED pixels beside the photo as
+/// `fixture.crop.png`, byte for byte photo_core's `fixture::crop_png` of the same rectangle (its tEXt `vug:crop` pair the
+/// frame `x,y,900,720`, read back by `crop_principal` as the uncropped centre less the offset); the original is untouched;
+/// the face re-opens the saved file through the open road (title and corner `saved fixture.crop.png`) and shows the
+/// cropped measurement (the outline `photo::open` measures on the saved bytes); a second keep onto an existing name is
+/// refused by name and writes nothing.
+#[test]
+fn a_dragged_crop_saves_beside_the_photo_and_reopens_measured() {
+    let dir = crop_dir("save");
+    let (mut vw, path) = crop_opened(&dir);
+    crop_armed(&mut vw);
+    crop_drag(&mut vw, (40.0, 40.0), (600.0, 440.0));
+    let [x, y, w, h] = photo::crop_rect(ph(&vw)).expect("the drag spans a rectangle");
+    assert_eq!(ph(&vw).note.clone().unwrap_or_default(), format!("crop {x},{y} {w}x{h} px: Return keeps it, Esc cancels"));
+    let full = pixel_core::decode(&photo_core::fixture::photo_png()).expect("the fixture decodes");
+    assert!((w, h) != (full.width, full.height), "the drag cuts the photo: {x},{y} {w}x{h}");
+
+    assert!(key(&mut vw, "Return"));
+    let out = dir.join("fixture.crop.png");
+    let saved = std::fs::read(&out).expect("the crop is saved beside the photo");
+    assert_eq!(saved, photo_core::fixture::crop_png(&full, x, y, w, h), "the cropped pixels with their crop pair, as PNG");
+    let img = pixel_core::decode(&saved).expect("the saved crop decodes");
+    assert_eq!((img.width, img.height), (w, h));
+    let pair = img.text.iter().find(|(k, _)| k == photo_core::CROP_KEY).map(|(_, v)| v.clone());
+    assert_eq!(pair, Some(format!("{x},{y},{},{}", full.width, full.height)));
+    let pp = photo_core::crop_principal(&img).expect("the saved crop states its principal point");
+    assert_eq!((pp.x, pp.y), (full.width as f64 * 0.5 - x as f64, full.height as f64 * 0.5 - y as f64));
+    assert_eq!(std::fs::read(&path).expect("the original reads"), photo_core::fixture::photo_png(), "the original is untouched");
+
+    assert_eq!(vw.title, "fixture.crop.png", "the face re-opened the saved crop");
+    assert_eq!(ph(&vw).note.as_deref(), Some("saved fixture.crop.png"));
+    assert!(!ph(&vw).crop.armed);
+    assert_eq!(ph(&vw).crop.source.as_deref(), Some(out.as_path()));
+    assert_eq!((ph(&vw).image.width, ph(&vw).image.height), (w, h));
+    let (_, _, direct) = photo::open(&saved, photo::PITCH_MM).expect("the saved crop measures");
+    assert_eq!(ph(&vw).outline, direct.outline, "the face shows the cropped measurement");
+    eprintln!("photo: crop-save rect={x},{y},{w}x{h} saved=fixture.crop.png principal=({},{}) outline={}", pp.x, pp.y, direct.outline.len());
+
+    // The next crop of the saved photo would be fixture.crop.crop.png: an existing file there is refused by name.
+    let taken = dir.join("fixture.crop.crop.png");
+    std::fs::write(&taken, b"not ours").expect("the blocker is written");
+    crop_armed(&mut vw);
+    crop_drag(&mut vw, (40.0, 40.0), (600.0, 440.0));
+    assert!(photo::crop_rect(ph(&vw)).is_some());
+    assert!(key(&mut vw, "Return"));
+    assert_eq!(ph(&vw).note.as_deref(), Some("refused crop: fixture.crop.crop.png exists"));
+    assert_eq!(std::fs::read(&taken).expect("the blocker reads"), b"not ours", "never written over");
+    assert!(ph(&vw).crop.armed, "a refusal keeps the crop armed");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// VUGFACEPHOTOCROPSAVE (SR640): while armed the dragged rectangle dims the sheet outside it (the house tint) and not its
+/// centre; Escape cancels: disarmed, no rectangle, the corner `crop cancelled`, the frame below the corner rows back to
+/// the pre-drag frame, and nothing written beside the photo (a later Return saves nothing).
+#[test]
+fn escape_cancels_the_crop_and_writes_nothing() {
+    let dir = crop_dir("cancel");
+    let (mut vw, _) = crop_opened(&dir);
+    crop_armed(&mut vw);
+    let (a, b) = ((40.0, 40.0), (600.0, 440.0));
+    vw.input(&SMessage::BrowserMouseMove(a.0, a.1, 0));
+    let before = raster::render(&vw.model, &vw.view);
+    crop_drag(&mut vw, a, b);
+    vw.input(&SMessage::BrowserMouseMove(a.0, a.1, 0));
+    assert!(photo::crop_rect(ph(&vw)).is_some(), "the drag spans a rectangle");
+    let changed = |f: &raster::Frame| (48..H).flat_map(|y| (0..W).map(move |x| (x, y))).filter(|&(x, y)| f.pixel(x, y) != before.pixel(x, y)).count();
+    let masked = raster::render(&vw.model, &vw.view);
+    assert!(changed(&masked) > 0, "the sheet outside the crop dims");
+    assert_eq!(masked.pixel(W / 2, H / 2), before.pixel(W / 2, H / 2), "the crop's centre is not masked");
+
+    assert!(key(&mut vw, "Escape"));
+    assert!(!ph(&vw).crop.armed && photo::crop_rect(ph(&vw)).is_none(), "Escape disarms and drops the rectangle");
+    assert_eq!(ph(&vw).note.as_deref(), Some("crop cancelled"));
+    let after = raster::render(&vw.model, &vw.view);
+    assert_eq!(changed(&after), 0, "the mask is gone");
+    key(&mut vw, "Return");
+    let names: Vec<_> = std::fs::read_dir(&dir).expect("the folder reads").filter_map(|e| e.ok()).map(|e| e.file_name()).collect();
+    assert_eq!(names, vec![std::ffi::OsString::from("fixture.png")], "nothing saved beside the photo");
+    assert_eq!(vw.title, "fixture.png");
+    let _ = std::fs::remove_dir_all(&dir);
 }
