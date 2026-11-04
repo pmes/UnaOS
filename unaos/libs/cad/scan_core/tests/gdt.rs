@@ -34,6 +34,9 @@ enum Guard {
     Off,
     Both,
     Far,
+    /// VUGFACECONFIDENCETINT (SR592): the depth-0 neighbour as an edge under the both-sides rule, emulated on the frame
+    /// ([`hole_guard`]); measured, not a volume knob.
+    Holes,
 }
 
 /// VUGSCANTSDFOUTLIERS (SR555) / VUGSCANTSDFEDGEFAR (SR562): the ONE fuse builder — the 12 orbit frames at `noise`
@@ -48,10 +51,12 @@ fn fuse(noise: &Noise, guard: Guard, scale: DepthScale, phase_rad: f64) -> (Scan
         Guard::Off => t.with_edge_far_mm(f64::INFINITY),
         Guard::Both => t.with_edge_mm(trunc),
         Guard::Far => t.with_edge_far_mm(trunc),
+        Guard::Holes => t,
     };
     for k in 0..12u32 {
         let p = if phase_rad == 0.0 { pose(k) } else { pose_phased(k, phase_rad) };
         let f = fixture::render_depth(&scene, &intr, scale, &p, noise, k as u64);
+        let f = if guard == Guard::Holes { hole_guard(&f) } else { f }; // VUGFACECONFIDENCETINT (SR592)
         t.integrate(&f, scale, &intr, &p).expect("frame integrates");
     }
     println!("tsdf-probe: fuse blocks={} voxel_bytes={} spread_bytes={}", t.blocks(), t.blocks() * 512 * 8, t.blocks() * 512 * 4); // VUGSCANTSDFCONFIDENCE (SR586) M1
@@ -948,4 +953,99 @@ fn the_confidence_floor_unpairs_only_under_it() {
         assert_eq!(half.face_of_vertex[i].is_some(), b.is_some(), "vertex {i}: face pairing follows");
     }
     assert_eq!(half.stats, dev.stats, "stats stay as measured");
+}
+
+// ---- VUGFACECONFIDENCETINT (LEDGER SR592): the D400 invalid band in the fixture and the hole leg ----
+// SR586 found a hole beside 0 of the post's 40 form rows: the fixture had no invalid band. `fixture::Noise::invalid_band_px`
+// now zeroes depth beside every silhouette; `tsdf_holes_probe` checks the band only zeroes, then fuses the banded frames
+// with the guard off and with the hole guard (SR562's legs, the post at both noise levels) and prints the hole census.
+// The hole guard is emulated on the frame (`hole_guard`: a valid pixel with a raw 0 in its 3x3 is zeroed, which
+// `integrate` skips exactly as `edge_skip` skips a both-sides edge pixel; only block activation differs, and a block of
+// weight-0 voxels marches nothing), so it is measured before any `tsdf::Knobs` field is built
+// (VUG-SCAN-TSDF-HOLES-KNOB owed on a gain at both noise levels). The band-0 baseline is `tsdf_outliers_probe`'s
+// `guard=off` lines.
+
+/// The band the probe renders with (the D400's band beside the post's silhouette rows).
+const BAND_PX: u32 = 2;
+
+/// `f` with every valid pixel that has a hole (raw 0) in its 3x3 zeroed (read from `f`, so the guard does not spread).
+fn hole_guard(f: &Frame) -> Frame {
+    let mut g = f.clone();
+    for y in 0..f.height {
+        for x in 0..f.width {
+            if f.u16_at(x, y).is_none_or(|r| r == 0) {
+                continue;
+            }
+            let near_hole = (-1i64..=1).any(|dy| {
+                (-1i64..=1).any(|dx| {
+                    let (nx, ny) = (x as i64 + dx, y as i64 + dy);
+                    nx >= 0 && ny >= 0 && f.u16_at(nx as u32, ny as u32) == Some(0)
+                })
+            });
+            if near_hole {
+                let o = y as usize * f.stride + x as usize * 2;
+                g.data[o..o + 2].copy_from_slice(&0u16.to_le_bytes());
+            }
+        }
+    }
+    g
+}
+
+#[test]
+fn tsdf_holes_probe() {
+    let (d, _) = design();
+    let (scene, intr, scale) = (Scene::bench(), fixture::bench_intrinsics(), DepthScale::D400_DEFAULT);
+    for (base, nname) in [(Noise::NONE, "none"), (Noise::D435I, "d435i")] {
+        let banded = Noise { invalid_band_px: BAND_PX, ..base };
+        let off = Noise { invalid_band_px: 0, ..base };
+        // The fixture: band 0 is the render as before; the band only zeroes, and zeroes on every frame.
+        let mut zeroed = 0usize;
+        let mut frames: Vec<(Transform, Frame)> = Vec::new();
+        for k in 0..12u32 {
+            let plain = fixture::render_depth(&scene, &intr, scale, &pose(k), &base, k as u64);
+            assert_eq!(fixture::render_depth(&scene, &intr, scale, &pose(k), &off, k as u64), plain, "band 0: the render as before");
+            let f = fixture::render_depth(&scene, &intr, scale, &pose(k), &banded, k as u64);
+            let mut n = 0usize;
+            for y in 0..f.height {
+                for x in 0..f.width {
+                    let (a, b) = (plain.u16_at(x, y), f.u16_at(x, y));
+                    assert!(a == b || b == Some(0), "frame {k} ({x},{y}): the band only zeroes");
+                    n += (a != b) as usize;
+                }
+            }
+            assert!(n > 0, "frame {k}: the band zeroes some pixels");
+            zeroed += n;
+            frames.push((pose(k), f));
+        }
+        println!("tsdf-probe: band={BAND_PX} noise={nname} zeroed={zeroed}");
+        for (guard, gname) in [(Guard::Off, "off"), (Guard::Holes, "holes")] {
+            let (s, trunc) = fuse(&banded, guard, scale, 0.0);
+            let dev = measure_of(&s, &d);
+            let g = gdt(&s, &d, &dev, trunc, Tol::DEFAULT);
+            let (t, p) = (top(&g), post(&g));
+            let (mut paired, mut near_hole) = (0u32, 0u32);
+            for (i, fv) in dev.face_of_vertex.iter().enumerate() {
+                if *fv == Some(p.face) {
+                    paired += 1;
+                    near_hole += (votes(s.mesh.positions[i], &frames, trunc).3 > 0) as u32;
+                }
+            }
+            println!(
+                "tsdf-probe: band={BAND_PX} noise={nname} guard={gname} verts={} top flatness={:?} n={}/{} post cylindricity={:?} position={:?} n={}/{} align_rms={:.3} hole post paired={paired} near_hole={near_hole}",
+                s.mesh.positions.len(),
+                t.flatness_mm,
+                t.n,
+                t.matched,
+                p.cylindricity_mm,
+                p.position_mm,
+                p.n,
+                p.matched,
+                dev.stats.rms_mm
+            );
+            assert!(t.flatness_mm.is_some_and(f64::is_finite) && p.cylindricity_mm.is_some_and(f64::is_finite), "band {nname} guard-{gname} values finite");
+            if nname == "none" {
+                probe_table(&format!("band={BAND_PX} guard={gname} post"), &p, &s, &dev, &frames, trunc);
+            }
+        }
+    }
 }

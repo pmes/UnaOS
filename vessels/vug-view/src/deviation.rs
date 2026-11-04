@@ -74,6 +74,9 @@ pub struct Map {
     pub design_path: Option<std::path::PathBuf>,
     /// VUGFACEGDTREPORTKEY (SR575): the report the `report` command wrote, named on the corner until the next command.
     pub reported: Option<std::path::PathBuf>,
+    /// VUGFACECONFIDENCETINT (SR592): the confidence floor `conf <w>` named on the map and the measurement before it
+    /// ([`Conf`]); None: no floor, `result` as measured.
+    pub conf: Option<Conf>,
 }
 
 /// A scan mesh read from a file (a PLY carries no normals, no confidence and no intrinsics): mesh_core's
@@ -134,13 +137,13 @@ pub fn open(scan: &ScanMesh, doc: &Doc, band_mm: f64, margin_mm: f64) -> Result<
     };
     let model = Model::from_mesh(mesh)?;
     let on = result.is_ok();
-    let mut map = Map { on, band_mm, names, gdt: Vec::new(), result, vertex, tri, pick: None, source: None, callouts: Vec::new(), margin_mm, basis: std::sync::Arc::new((scan.clone(), design)), datums: None, frame: None, chosen: [None; 3], lost: Vec::new(), faults, scan_name: None, design_path: None, reported: None }; reframe(&mut map); Ok((model, map)) // VUGFACEDEVIATIONJOURNAL (SR550) + VUGFACEGDT (SR553): no source, no callouts yet; VUGFACEGDTREMEASURE (SR560): the gdt read once per build through reframe
+    let mut map = Map { on, band_mm, names, gdt: Vec::new(), result, vertex, tri, pick: None, source: None, callouts: Vec::new(), margin_mm, basis: std::sync::Arc::new((scan.clone(), design)), datums: None, frame: None, chosen: [None; 3], lost: Vec::new(), faults, scan_name: None, design_path: None, reported: None, conf: None }; reframe(&mut map); Ok((model, map)) // VUGFACEDEVIATIONJOURNAL (SR550) + VUGFACEGDT (SR553): no source, no callouts yet; VUGFACEGDTREMEASURE (SR560): the gdt read once per build through reframe
 }
 
 /// The corner's lines: the statistics and the worst [`WORST`] faces (matched ones, by rms) with their signed mean, or
 /// the refusal by name.
 pub fn corner(map: &Map) -> Vec<String> {
-    let mut out = measured(map); out.extend(fault_lines(map)); out.extend(source_line(map)); out // VUGFACEDEVIATIONJOURNAL (SR550): the journal's line last; VUGFACEDEVIATIONSOLIDFAULT (SR565): the faults before it
+    let mut out = measured(map); out.extend(conf_line(map)); out.extend(fault_lines(map)); out.extend(source_line(map)); out // VUGFACEDEVIATIONJOURNAL (SR550): the journal's line last; VUGFACEDEVIATIONSOLIDFAULT (SR565): the faults before it
 }
 
 /// The corner's measured lines: the pick's, the statistics and the worst faces, or the refusal by name.
@@ -370,7 +373,7 @@ pub fn follow(v: &mut Viewer) {
         Ok((model, mut map)) => {
             map.on = m.on && map.result.is_ok();
             map.source = m.source.take().map(|s| Source { measured: generation, refused: None, ..s });
-            carry(m, &mut map, &model); keep_names(m, &mut map); // VUGFACEGDTREPORTKEY (SR575): the scan name and design path follow; VUGFACEGDTREMEASURE (SR560): the callouts and the datums follow the re-measure, re-read and re-tinted
+            keep_conf(m, &mut map); carry(m, &mut map, &model); keep_names(m, &mut map); // VUGFACEGDTREPORTKEY (SR575): the scan name and design path follow; VUGFACEGDTREMEASURE (SR560): the callouts and the datums follow the re-measure, re-read and re-tinted
             *m = map;
             v.model = model;
         }
@@ -416,7 +419,7 @@ pub fn gdt_of(scan: &ScanMesh, design: &Design, result: &Result<Deviation, Devia
 /// `GdtKind` (its surface does not take the kind), anything else the usage. True when the map changed.
 pub fn command(view: &mut View, model: &Model, line: &str) -> Result<bool, String> {
     const USAGE: &str = "usage: gdt <face>=<kind>:<tol> | gdt clear";
-    forget(view); if let Some(r) = datum_command(view, model, line) { return r; } // VUGFACEGDTREMEASURE (SR560): `datum ...` is the frame's command
+    forget(view); if let Some(r) = datum_command(view, model, line) { return r; } if let Some(r) = conf_command(view, model, line) { return r; } // VUGFACEGDTREMEASURE (SR560): `datum ...` is the frame's command
     let rest = line.trim().strip_prefix("gdt ").map(str::trim).ok_or(USAGE)?;
     let m = view.deviation.as_mut().ok_or("gdt: no map")?;
     if let Err(e) = &m.result {
@@ -1043,3 +1046,84 @@ pub fn line_overlay(view: &View, fr: &mut Frame) {
     }
 }
 
+
+// ---- VUGFACECONFIDENCETINT (LEDGER SR592): the confidence floor on the map, a low-weight vertex tinted unmeasured ----
+// VUGSCANTSDFCONFIDENCE (SR586) built scan_core's ONE floor rule `deviation::floored` (a paired vertex whose fused weight,
+// `ScanMesh::confidence`, is under the floor is unpaired; stats and faces stay as measured) and left the face without it.
+// `conf <w>` ([`conf_command`], on [`command`]'s road: the flags, `Viewer::map_command`, the `:` line) holds the floor on
+// the Map ([`Conf`]) and re-reads the measurement through `floored` ([`refloor`]), so `result` is the floored one and every
+// reader inherits it: [`reframe`] re-reads the gdt and the frame, [`retint`] paints an unpaired vertex `colour(Shade::Off)`,
+// the one unmeasured tint, instead of judging it against the band. The corner reads `conf floor=<w> unpaired=<n>`
+// ([`conf_line`]); `conf off` restores the measurement as taken. [`follow`] carries the floor into a re-measure
+// ([`keep_conf`], ahead of [`carry`]'s reframe and retint). BP-vug-5: a printed reading, the scan and the design unchanged.
+
+/// The floor named on the map: the weight under which a paired vertex is unpaired, the measurement before the floor (what
+/// `conf off` or a new floor re-reads from) and the count of paired vertices the floor unpaired.
+#[derive(Clone, Debug)]
+pub struct Conf {
+    pub floor: f32,
+    pub raw: Deviation,
+    pub unpaired: u32,
+}
+
+/// `conf <w>` names the floor (`w` finite and above 0), `conf off` removes it; any other line is not the floor's (None).
+/// Refused by name, nothing changed: no map, a refused map, anything else the usage. True when the map changed.
+fn conf_command(view: &mut View, model: &Model, line: &str) -> Option<Result<bool, String>> {
+    const USAGE: &str = "usage: conf <floor> | conf off";
+    let rest = line.trim().strip_prefix("conf")?;
+    if !(rest.is_empty() || rest.starts_with(' ')) {
+        return None;
+    }
+    let rest = rest.trim();
+    let Some(m) = view.deviation.as_mut() else { return Some(Err("conf: no map".to_string())) };
+    if let Err(e) = &m.result {
+        return Some(Err(format!("conf: refused map {e:?}")));
+    }
+    let floor = if rest == "off" {
+        None
+    } else {
+        match rest.parse::<f32>() {
+            Ok(w) if w.is_finite() && w > 0.0 => Some(w),
+            _ => return Some(Err(USAGE.to_string())),
+        }
+    };
+    let changed = m.conf.as_ref().map(|c| c.floor) != floor;
+    refloor(m, floor);
+    reframe(m);
+    retint(m, model);
+    Some(Ok(changed))
+}
+
+/// The map's measurement re-read at `floor`: the measurement as taken (held in [`Conf`] while a floor is on) through
+/// scan_core `deviation::floored`, the count it unpaired kept; None restores the measurement as taken. A refused map is
+/// left as it is. The caller re-reads the gdt and re-tints ([`reframe`], [`retint`]).
+fn refloor(map: &mut Map, floor: Option<f32>) {
+    let raw = match map.conf.take() {
+        Some(c) => c.raw,
+        None => match &map.result {
+            Ok(d) => d.clone(),
+            Err(_) => return,
+        },
+    };
+    let Some(w) = floor else {
+        map.result = Ok(raw);
+        return;
+    };
+    let d = scan_core::deviation::floored(&raw, &map.basis.0, w);
+    let unpaired = raw.per_vertex.iter().zip(&d.per_vertex).filter(|(a, b)| a.is_some() && b.is_none()).count() as u32;
+    map.result = Ok(d);
+    map.conf = Some(Conf { floor: w, raw, unpaired });
+}
+
+/// A re-measure ([`follow`]) keeps the old map's floor: the new measurement re-read at it, before [`carry`] re-reads the
+/// gdt and re-tints.
+fn keep_conf(old: &Map, new: &mut Map) {
+    if let Some(c) = &old.conf {
+        refloor(new, Some(c.floor));
+    }
+}
+
+/// The corner's floor line: `conf floor=<w> unpaired=<n>` while a floor is on.
+fn conf_line(map: &Map) -> Option<String> {
+    map.conf.as_ref().map(|c| format!("conf floor={} unpaired={}", c.floor, c.unpaired))
+}

@@ -1126,3 +1126,38 @@ fn a_typed_command_line_runs_the_map_command() {
     assert!(!plain.view.entry.open, "no map: `:` opens nothing");
 }
 
+
+// ---- VUGFACECONFIDENCETINT (LEDGER SR592): the confidence floor on the map's command road ----
+
+/// `conf 4` unpairs exactly the vertices paired in the measurement whose fused weight is under 4 (scan_core
+/// `deviation::floored`), paints them the unmeasured tint, names the count on the corner and keeps the statistics;
+/// `conf off` restores the measurement; a malformed floor is the usage.
+#[test]
+fn conf_floor_tints_the_low_weight_vertices_unmeasured() {
+    let mut v = open(scan().clone());
+    let raw = v.view.deviation.as_ref().expect("a map").result.clone().expect("the fixture aligns");
+    let paired = raw.per_vertex.iter().filter(|x| x.is_some()).count();
+    let low: Vec<usize> = (0..raw.per_vertex.len()).filter(|&i| raw.per_vertex[i].is_some() && scan().confidence[i] < 4.0).collect();
+    assert!(!low.is_empty() && low.len() < paired, "some but not all paired vertices sit under weight 4: {} of {paired}", low.len());
+    assert_eq!(v.map_command("conf 4"), Ok(true));
+    let map = v.view.deviation.as_ref().expect("a map");
+    let d = map.result.as_ref().expect("still measured");
+    for i in 0..raw.per_vertex.len() {
+        if low.contains(&i) {
+            assert_eq!(d.per_vertex[i], None, "vertex {i}: under the floor, unpaired");
+            assert_eq!(map.vertex[i], colour(Shade::Off), "vertex {i}: the unmeasured tint");
+        } else {
+            assert_eq!(d.per_vertex[i], raw.per_vertex[i], "vertex {i}: kept as measured");
+        }
+    }
+    assert_eq!(d.stats, raw.stats, "the statistics stay as measured");
+    let line = format!("conf floor=4 unpaired={}", low.len());
+    assert!(corner(map).contains(&line), "the corner names the floor: {:?}", corner(map));
+    assert_eq!(v.map_command("conf off"), Ok(true));
+    let map = v.view.deviation.as_ref().expect("a map");
+    assert_eq!(map.result.as_ref().expect("measured").per_vertex, raw.per_vertex, "conf off restores the measurement");
+    assert!(!corner(map).iter().any(|l| l.starts_with("conf ")), "no floor line after conf off");
+    for bad in ["conf", "conf -1", "conf x"] {
+        assert_eq!(v.map_command(bad), Err("usage: conf <floor> | conf off".to_string()), "{bad}: the usage");
+    }
+}
