@@ -65,6 +65,9 @@ pub enum Refused {
     NotTheLostProgram { lost: u64, program: u64 },
     /// VUGCOMSCANRECONNECT (SR521): a re-arm in `asked`, not the `lost` run's dialect.
     DialectChanged { lost: Dialect, asked: Dialect },
+    /// VUGCOMSCANHELLOID (SR546): the reopened link answered the identity verb `now` (`None`: silent or refused), not
+    /// `was`, the answer the first open kept: another board took the port; the link is dropped and the redial goes on.
+    AnotherBoard { was: String, now: Option<String> },
 }
 
 /// The only way Comscan makes a pump: a `Verdict::Pass` for `p` (VUG-HELM-BIND: by digest) on `m` (VUG-HELM-BIND-MACHINE:
@@ -206,6 +209,9 @@ struct Running {
     /// VUGCOMSCANTTYUSBID (SR529): the device the port was at the first open (`tty:usb:vvvv:pppp[:serial]`, from the
     /// desk's identify hook); when known the redial opens it by identity, wherever it came back.
     identity: Option<String>,
+    /// VUGCOMSCANHELLOID (SR546): the controller's answer to its dialect's identity verb at the first open (`None`: the
+    /// hello is off, the dialect has no verb, or the controller said nothing it keeps); a reopen must answer the same.
+    hello: Option<String>,
 }
 
 /// Comscan's pump desk: the machine it drives, the armed programs and the one running stream.
@@ -216,6 +222,8 @@ pub struct PumpDesk {
     running: Option<Running>,
     /// VUGCOMSCANTTYUSBID (SR529): a port name to its device identity (`crate::tty::identify`); none: redial by name.
     identify: Option<Box<Identify>>,
+    /// VUGCOMSCANHELLOID (SR546): the wait for the identity answer when the hello is on (`hello_within`); none: off.
+    hello: Option<Duration>,
 }
 
 fn refused(why: impl Into<String>) -> Vec<PumpEvent> {
@@ -225,7 +233,7 @@ fn refused(why: impl Into<String>) -> Vec<PumpEvent> {
 impl PumpDesk {
     /// A desk for `machine`: every pass it arms must name this machine's identity (VUG-HELM-BIND-MACHINE).
     pub fn new(machine: Machine) -> PumpDesk {
-        PumpDesk { machine, armed: Vec::new(), running: None, identify: None }
+        PumpDesk { machine, armed: Vec::new(), running: None, identify: None, hello: None }
     }
 
     /// The machine this desk drives.
@@ -307,16 +315,21 @@ impl PumpDesk {
                         dialect_word(d)
                     ));
                 }
-                let link = match open(port) {
+                let mut link = match open(port) {
                     Ok(l) => l,
                     Err(e) => return refused(format!("port {port:?}: {e}")),
                 };
                 // One arming, one run: a FirstRun approval is per run, so a finished program must pass Helm again.
                 let a = self.armed.remove(i);
                 let identity = self.identify.as_ref().and_then(|f| f(port.as_str())); // VUGCOMSCANTTYUSBID (SR529)
+                let hello = self.hello_spec_for(a.dialect).and_then(|(d, w)| hello(&mut *link, d, w)); // VUGCOMSCANHELLOID (SR546)
                 self.running =
-                    Some(Running { pump: a.pump, link: Some(link), port: port.clone(), redial: None, identity });
-                vec![self.squawk(Some("started".to_string()))]
+                    Some(Running { pump: a.pump, link: Some(link), port: port.clone(), redial: None, identity, hello: hello.clone() });
+                let mut out = vec![self.squawk(Some("started".to_string()))];
+                if let Some(h) = hello {
+                    out.push(self.squawk(Some(format!("hello {h}")))); // printed once, at the first open
+                }
+                out
             }
             PumpEvent::PumpHold { .. } | PumpEvent::PumpResume { .. } | PumpEvent::PumpStop { .. } => {
                 let Some(r) = self.running.as_mut() else {
@@ -467,6 +480,12 @@ pub fn ready(link: &mut dyn Transport, dialect: Dialect, wait: Duration) -> Resu
 
 /// Read lines until one starts with `key` (`Some`) or `wait` passes (`None`).
 fn banner(link: &mut dyn Transport, key: &str, wait: Duration) -> Result<Option<String>, Unready> {
+    lines_until(link, wait, |s| s.starts_with(key))
+}
+
+/// The one line reader (the banner wait and the identity hello): read trimmed lines until `f` takes one (`Some`) or
+/// `wait` passes (`None`).
+fn lines_until(link: &mut dyn Transport, wait: Duration, mut f: impl FnMut(&str) -> bool) -> Result<Option<String>, Unready> {
     let end = std::time::Instant::now() + wait;
     let mut line: Vec<u8> = Vec::new();
     let mut buf = [0u8; 64];
@@ -483,7 +502,7 @@ fn banner(link: &mut dyn Transport, key: &str, wait: Duration) -> Result<Option<
                     if b == b'\n' {
                         let s = String::from_utf8_lossy(&line).trim().to_string();
                         line.clear();
-                        if s.starts_with(key) {
+                        if f(&s) {
                             return Ok(Some(s));
                         }
                     } else {
@@ -574,6 +593,17 @@ impl PumpDesk {
     /// The opener's answer for a redial (the opener's own handshake and banner wait included). Taken only while the
     /// run is still lost and link-less; otherwise the new link is dropped and nothing is said.
     pub fn relinked(&mut self, now_us: u64, res: Result<Box<dyn Transport + Send>, String>) -> Vec<PumpEvent> {
+        let spec = self.hello_spec(); // VUGCOMSCANHELLOID (SR546): the reopened link says who it is first
+        self.relinked_said(now_us, with_hello(res, spec))
+    }
+
+    /// [`PumpDesk::relinked`] with the reopened link's identity answer beside it (VUGCOMSCANHELLOID, SR546): an answer
+    /// that differs from the one the first open kept refuses the relink by name and the redial goes on.
+    pub fn relinked_said(
+        &mut self,
+        now_us: u64,
+        res: Result<(Box<dyn Transport + Send>, Option<String>), String>,
+    ) -> Vec<PumpEvent> {
         let Some(r) = self.running.as_mut() else { return Vec::new() };
         let PumpState::LinkLost { at_line, .. } = r.pump.state() else { return Vec::new() };
         let Some(mut d) = r.redial else { return Vec::new() };
@@ -581,7 +611,15 @@ impl PumpDesk {
             return Vec::new();
         }
         let word = match res {
-            Ok(link) => {
+            Ok((link, now)) if r.hello.is_some() && now != r.hello => {
+                drop(link); // another board: its link (a tty's exclusive fd) goes at once
+                let k = d.attempt();
+                d.failed(now_us);
+                r.redial = Some(d);
+                let was = r.hello.clone().unwrap_or_default();
+                format!("reconnect attempt {k} refused: {:?}; attempt {} in {} ms", Refused::AnotherBoard { was, now }, d.attempt(), d.wait_us() / 1000)
+            }
+            Ok((link, _)) => {
                 r.link = Some(link);
                 r.redial = None;
                 format!("relinked on attempt {}; re-arm to resume from line {at_line}", d.attempt())
@@ -625,15 +663,15 @@ impl PumpDesk {
 /// with the lock RELEASED, and its answer is handed back under the lock to [`PumpDesk::relinked`].
 fn redial(synapse: &Synapse, desk: &Mutex<PumpDesk>, open: &mut Opener, t0: tokio::time::Instant) {
     let now = t0.elapsed().as_micros() as u64;
-    let port = match desk.lock() {
-        Ok(d) => d.redial_due(now),
-        Err(_) => None,
+    let (port, spec) = match desk.lock() {
+        Ok(d) => (d.redial_due(now), d.hello_spec()),
+        Err(_) => (None, None),
     };
     let Some(port) = port else { return };
-    let res = open(&port);
+    let res = with_hello(open(&port), spec); // VUGCOMSCANHELLOID (SR546): the hello too, with the lock released
     let now = t0.elapsed().as_micros() as u64;
     let out = match desk.lock() {
-        Ok(mut d) => d.relinked(now, res),
+        Ok(mut d) => d.relinked_said(now, res),
         Err(_) => Vec::new(),
     };
     for o in out {
@@ -651,6 +689,81 @@ impl PumpDesk {
     /// Set the identity hook every later PumpStart records beside its port name.
     pub fn identify_by(&mut self, f: Box<Identify>) {
         self.identify = Some(f);
+    }
+}
+
+// --- VUGCOMSCANHELLOID (LEDGER SR546): the controller's own identity, kept at the first open, checked at a reopen (named tail hunk) ---
+
+/// Ask the controller who it is: its dialect's identity verb (`pump_core::pump::identity_verb`: grbl `$I`, Marlin
+/// `M115`) sent once, the answer read through the one line reader and classified by `pump_core::pump::hello_line`; the
+/// kept lines joined by one space. `None`: no verb, the link would not take the verb, the controller refused it,
+/// kept nothing, went silent for `wait` or closed (the pump's next tick names a closed link).
+pub fn hello(link: &mut dyn Transport, dialect: Dialect, wait: Duration) -> Option<String> {
+    use pump_core::pump::{HelloLine, hello_line, identity_verb};
+    let verb = identity_verb(dialect)?;
+    let mut bytes = verb.as_bytes().to_vec();
+    bytes.push(b'\n');
+    let end = std::time::Instant::now() + wait;
+    let mut off = 0;
+    while off < bytes.len() {
+        match link.write(&bytes[off..]) {
+            Ok(n) if n > 0 => off += n,
+            Ok(_) if std::time::Instant::now() < end => std::thread::sleep(Duration::from_millis(10)),
+            Ok(_) | Err(_) => return None,
+        }
+    }
+    let mut kept: Vec<String> = Vec::new();
+    let mut refused = false;
+    let ended = lines_until(link, wait, |s| match hello_line(dialect, s) {
+        HelloLine::Keep => {
+            kept.push(s.to_string());
+            false
+        }
+        HelloLine::End => true,
+        HelloLine::Refused => {
+            refused = true;
+            true
+        }
+        HelloLine::Other => false,
+    });
+    match ended {
+        Ok(Some(_)) if !refused && !kept.is_empty() => Some(kept.join(" ")),
+        _ => None,
+    }
+}
+
+/// An opener's answer with the hello run on its link when `spec` (dialect, wait) is set; the answer `None` otherwise.
+pub fn with_hello(
+    res: Result<Box<dyn Transport + Send>, String>,
+    spec: Option<(Dialect, Duration)>,
+) -> Result<(Box<dyn Transport + Send>, Option<String>), String> {
+    res.map(|mut l| {
+        let said = spec.and_then(|(d, w)| hello(&mut *l, d, w));
+        (l, said)
+    })
+}
+
+impl PumpDesk {
+    /// Turn the hello on: every later PumpStart asks the controller its identity (waiting up to `wait`) and every
+    /// reopen must answer the same.
+    pub fn hello_within(&mut self, wait: Duration) {
+        self.hello = Some(wait);
+    }
+
+    /// The identity the running stream's first open kept.
+    pub fn hello(&self) -> Option<&str> {
+        self.running.as_ref().and_then(|r| r.hello.as_deref())
+    }
+
+    /// The hello a reopen runs: the running pump's dialect and the wait, when the hello is on.
+    pub fn hello_spec(&self) -> Option<(Dialect, Duration)> {
+        let r = self.running.as_ref()?;
+        self.hello_spec_for(r.pump.dialect())
+    }
+
+    /// The hello for a start in `d` (PumpStart: nothing is running yet).
+    fn hello_spec_for(&self, d: Dialect) -> Option<(Dialect, Duration)> {
+        self.hello.map(|w| (d, w))
     }
 }
 
