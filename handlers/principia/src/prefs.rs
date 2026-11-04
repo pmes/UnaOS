@@ -77,9 +77,9 @@ pub struct SetOutcome {
 /// The namespaced preference store, cached in memory and backed by the
 /// `<home>/settings/` folder of domain files.
 ///
-/// Reload-on-external-change is **not** implemented: the store is the writer of
-/// record, and an edit made to a file underneath a running Principia is not
-/// noticed until the next load. (Queued — see the README.)
+/// The store itself never watches the folder: reload on external change is the
+/// serve loop's (PRINCIPIA-TWO-WRITERS, SR635: a changed file stamp reloads the
+/// whole store through [`PrefStore::load`] and posts `PrefChanged` per differing key).
 pub struct PrefStore {
     dir: PathBuf,
     namespaces: BTreeMap<String, Namespace>,
