@@ -1,6 +1,6 @@
 //! Known-answer tests for geom_core's shared dense kernels (VUGGEOMLINALG, LEDGER SR520).
 
-use geom_core::linalg::{SplitMix64, cholesky_solve, jacobi_sym};
+use geom_core::linalg::{SplitMix64, cholesky_profile, cholesky_solve, cholesky_substitute, jacobi_sym};
 
 fn col(v: &[f64], n: usize, j: usize) -> Vec<f64> {
     (0..n).map(|r| v[r * n + j]).collect()
@@ -129,4 +129,69 @@ fn cholesky_solves_spd_and_refuses() {
     let mut short = [1.0, 0.0, 0.0];
     let mut bs = [1.0, 1.0];
     assert!(!cholesky_solve(&mut short, 2, &mut bs), "short slice");
+}
+
+/// VUGGEOMLINALGSCAN (SR540): the envelope Cholesky (SR522's `factor` / `substitute`, moved from scan_core graph.rs).
+/// NaN sentinels left of the envelope are never read (x is exact) and never written (still NaN); the all-zero profile
+/// is `cholesky_solve` bit for bit; the refusals are named `false`s.
+#[test]
+fn cholesky_profile_keeps_the_envelope() {
+    const M: usize = 6;
+    let first = [0usize, 0, 1, 1, 3, 2];
+    // A diagonally dominant SPD over the envelope: row i is non-zero only in columns first[i] ..= i (and by symmetry).
+    let mut a0 = [0.0f64; M * M];
+    for i in 0..M {
+        for k in first[i]..i {
+            let v = 0.5 + 0.25 * (i + k) as f64;
+            a0[i * M + k] = v;
+            a0[k * M + i] = v;
+        }
+    }
+    for i in 0..M {
+        let off: f64 = (0..M).filter(|&k| k != i).map(|k| a0[i * M + k]).sum();
+        a0[i * M + i] = off + 2.0 + i as f64;
+    }
+    let x = [1.0, -2.0, 3.0, -0.5, 0.25, 4.0];
+    let b0: Vec<f64> = (0..M).map(|i| (0..M).map(|k| a0[i * M + k] * x[k]).sum::<f64>()).collect();
+
+    // The envelope road with NaN left of the envelope in the lower triangle.
+    let mut a = a0;
+    for i in 0..M {
+        for k in 0..first[i] {
+            a[i * M + k] = f64::NAN;
+        }
+    }
+    let mut b = b0.clone();
+    assert!(cholesky_profile(&mut a, M, &first));
+    assert!(cholesky_substitute(&a, M, &first, &mut b));
+    for i in 0..M {
+        assert!((b[i] - x[i]).abs() <= 1e-12, "x[{i}] = {}", b[i]);
+        for k in 0..first[i] {
+            assert!(a[i * M + k].is_nan(), "a[{i}][{k}] outside the envelope was written");
+        }
+    }
+
+    // The all-zero profile is the dense solve, bit for bit.
+    let (mut ad, mut bd) = (a0, b0.clone());
+    assert!(cholesky_solve(&mut ad, M, &mut bd));
+    let (mut ap, mut bp) = (a0, b0.clone());
+    let zero = [0usize; M];
+    assert!(cholesky_profile(&mut ap, M, &zero));
+    assert!(cholesky_substitute(&ap, M, &zero, &mut bp));
+    for i in 0..M {
+        assert_eq!(bd[i].to_bits(), bp[i].to_bits(), "x[{i}]");
+    }
+    for k in 0..M * M {
+        assert_eq!(ad[k].to_bits(), ap[k].to_bits(), "L[{k}]");
+    }
+
+    // Refusals: short a / first / b, an indefinite pivot.
+    let mut short = [1.0, 0.0, 0.0];
+    assert!(!cholesky_profile(&mut short, 2, &[0, 0]), "short a");
+    let mut a2 = [4.0, 0.0, 0.0, 4.0];
+    assert!(!cholesky_profile(&mut a2, 2, &[0]), "short first");
+    let mut b1 = [1.0];
+    assert!(!cholesky_substitute(&a2, 2, &[0, 0], &mut b1), "short b");
+    let mut ind = [1.0, 2.0, 2.0, 1.0];
+    assert!(!cholesky_profile(&mut ind, 2, &[0, 0]), "indefinite");
 }

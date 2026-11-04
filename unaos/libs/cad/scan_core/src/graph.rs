@@ -33,6 +33,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use geom_core::Quat;
+use geom_core::linalg::{cholesky_profile, cholesky_solve as dense_solve, cholesky_substitute};
 use probe_core::{DepthScale, Frame, Intrinsics};
 
 use crate::ScanError;
@@ -425,64 +426,15 @@ fn dot6(a: &[f64; 6], b: &[f64; 6]) -> f64 {
 }
 
 /// The dense symmetric positive-definite solve `a·x = b` (`a` is `m` x `m` row-major; its lower triangle is read):
-/// Cholesky, then the two triangular solves. `None` on a pivot that is not positive. (pose.rs's `solve6` is the
-/// fixed 6x6 of the same loop; VUG-LINALG owes the one shared dense solve.) VUGSCANSUBMAP (SR522): `factor` +
-/// `substitute` with an all-zero profile, the same operations in the same order.
-fn cholesky_solve(m: usize, mut a: Vec<f64>, mut b: Vec<f64>) -> Option<Vec<f64>> {
-    let first = vec![0usize; m];
-    if !factor(m, &mut a, &first) {
+/// geom_core's `linalg::cholesky_solve`, the all-zero profile of the envelope Cholesky the submap interiors take
+/// (VUGGEOMLINALGSCAN SR540: SR522's `factor` / `substitute` moved to geom_core as `cholesky_profile` /
+/// `cholesky_substitute`, the same operations in the same order). `None` on a pivot that is not positive or a
+/// non-finite step.
+fn solved(m: usize, mut a: Vec<f64>, mut b: Vec<f64>) -> Option<Vec<f64>> {
+    if !dense_solve(&mut a, m, &mut b) {
         return None;
     }
-    substitute(m, &a, &first, &mut b);
     if b.iter().all(|x| x.is_finite()) { Some(b) } else { None }
-}
-
-/// VUGSCANSUBMAP (SR522): the Cholesky factor `L` of `a` (`m` x `m` row-major, lower triangle read) in place, over
-/// the envelope `first[row]` (the row's first structurally non-zero column; `L` keeps the envelope, so nothing left
-/// of it is read or written). False on a pivot that is not positive.
-fn factor(m: usize, a: &mut [f64], first: &[usize]) -> bool {
-    for j in 0..m {
-        let mut d = a[j * m + j];
-        for k in first[j]..j {
-            d -= a[j * m + k] * a[j * m + k];
-        }
-        if !(d > 0.0) || !d.is_finite() {
-            return false;
-        }
-        let l = libm::sqrt(d);
-        a[j * m + j] = l;
-        for i in j + 1..m {
-            if first[i] > j {
-                continue;
-            }
-            let mut s = a[i * m + j];
-            for k in first[i].max(first[j])..j {
-                s -= a[i * m + k] * a[j * m + k];
-            }
-            a[i * m + j] = s / l;
-        }
-    }
-    true
-}
-
-/// VUGSCANSUBMAP (SR522): `b` <- `(L·Lᵀ)⁻¹ b` for `factor`'s `L` over the same envelope (row-form substitutions).
-fn substitute(m: usize, a: &[f64], first: &[usize], b: &mut [f64]) {
-    for i in 0..m {
-        let mut s = b[i];
-        for k in first[i]..i {
-            s -= a[i * m + k] * b[k];
-        }
-        b[i] = s / a[i * m + i];
-    }
-    for i in (0..m).rev() {
-        let mut s = b[i];
-        for k in i + 1..m {
-            if first[k] <= i {
-                s -= a[k * m + i] * b[k];
-            }
-        }
-        b[i] = s / a[i * m + i];
-    }
 }
 
 /// One frame as the closure and the re-integration read it.
@@ -865,7 +817,7 @@ impl<'a> Normal<'a> {
                     a[i * m + i] *= 1.0 + lambda;
                 }
                 let b: Vec<f64> = g.iter().map(|x| -x).collect();
-                cholesky_solve(m, a, b)
+                solved(m, a, b)
             }
             Normal::Two { s, m, hss, gs, hkk, hks, gk } => {
                 let ns = 6 * s.seps.len();
@@ -883,18 +835,22 @@ impl<'a> Normal<'a> {
                     for i in 0..mk {
                         a[i * mk + i] *= 1.0 + lambda;
                     }
-                    if !factor(mk, &mut a, &run.first) {
+                    if !cholesky_profile(&mut a, mk, &run.first) {
                         return None;
                     }
                     let mut z: Vec<f64> = gk[r].iter().map(|x| -x).collect();
-                    substitute(mk, &a, &run.first, &mut z);
+                    if !cholesky_substitute(&a, mk, &run.first, &mut z) {
+                        return None;
+                    }
                     let mut y = vec![0.0f64; ck * mk]; // column c of H_kk⁻¹ H_ks at y[c·mk ..]
                     for c in 0..ck {
                         let col = &mut y[c * mk..(c + 1) * mk];
                         for i in 0..mk {
                             col[i] = hks[r][i * ck + c];
                         }
-                        substitute(mk, &a, &run.first, col);
+                        if !cholesky_substitute(&a, mk, &run.first, col) {
+                            return None;
+                        }
                     }
                     for (ci, &si) in run.adj.iter().enumerate() {
                         for u in 0..6 {
@@ -918,7 +874,7 @@ impl<'a> Normal<'a> {
                     }
                     parts.push((z, y));
                 }
-                let xs = cholesky_solve(ns, sm, rhs)?;
+                let xs = solved(ns, sm, rhs)?;
                 let mut x = vec![0.0f64; *m];
                 for (si, &node) in s.seps.iter().enumerate() {
                     x[6 * (node - 1)..6 * node].copy_from_slice(&xs[6 * si..6 * si + 6]);

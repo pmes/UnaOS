@@ -529,41 +529,12 @@ fn lookup(model: &ModelMap, intr: &Intrinsics, l: Vec3) -> Option<Surfel> {
     model.at(uv[0] as u32, uv[1] as u32) // floor: pixel x covers u in [x, x + 1), as tsdf.rs integrates
 }
 
-/// The 6x6 symmetric positive-definite solve `a·x = b` by Cholesky (sketch_core's `linalg::cholesky_solve` loop
-/// at a fixed size; that one is private to its crate). `None` on a pivot that is not positive: the pairs do not
-/// constrain all six directions.
+/// The 6x6 symmetric positive-definite solve `a·x = b` by Cholesky: geom_core's `linalg::cholesky_solve` on the
+/// array's row-major view (VUGGEOMLINALGSCAN SR540: no copy, no allocation; the loop and its flops are SR520's). `None`
+/// on a pivot that is not positive or a non-finite step: the pairs do not constrain all six directions.
 pub(crate) fn solve6(mut a: [[f64; 6]; 6], mut b: [f64; 6]) -> Option<[f64; 6]> {
-    for j in 0..6 {
-        let mut d = a[j][j];
-        for k in 0..j {
-            d -= a[j][k] * a[j][k];
-        }
-        if !(d > 0.0) || !d.is_finite() {
-            return None;
-        }
-        let l = libm::sqrt(d);
-        a[j][j] = l;
-        for i in j + 1..6 {
-            let mut s = a[i][j];
-            for k in 0..j {
-                s -= a[i][k] * a[j][k];
-            }
-            a[i][j] = s / l;
-        }
-    }
-    for i in 0..6 {
-        let mut s = b[i];
-        for k in 0..i {
-            s -= a[i][k] * b[k];
-        }
-        b[i] = s / a[i][i];
-    }
-    for i in (0..6).rev() {
-        let mut s = b[i];
-        for k in i + 1..6 {
-            s -= a[k][i] * b[k];
-        }
-        b[i] = s / a[i][i];
+    if !geom_core::linalg::cholesky_solve(a.as_flattened_mut(), 6, &mut b) {
+        return None;
     }
     if b.iter().all(|x| x.is_finite()) { Some(b) } else { None }
 }

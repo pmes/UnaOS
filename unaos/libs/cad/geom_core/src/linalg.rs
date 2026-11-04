@@ -6,7 +6,12 @@
 //!
 //! * [`jacobi_sym`]: cyclic Jacobi rotations (Numerical Recipes §11.1) on a small symmetric matrix (n <= 9 is the use:
 //!   scan_core's 3 x 3 covariances, photo_core's 9 x 9 DLT AᵀA), the eigenpairs sorted ascending by value.
-//! * [`cholesky_solve`]: `a x = b` for symmetric positive-definite `a` (sketch_core's damped normal equations).
+//! * [`cholesky_solve`]: `a x = b` for symmetric positive-definite `a` (sketch_core's damped normal equations, scan_core
+//!   pose.rs's 6x6 ICP step, graph.rs's dense pose graph and separator system).
+//! * [`cholesky_profile`] + [`cholesky_substitute`]: the same Cholesky over an envelope (row `i`'s first structurally
+//!   non-zero column), scan_core graph.rs's submap interiors (VUGGEOMLINALGSCAN, LEDGER SR540: VUGSCANSUBMAP SR522's
+//!   `factor` / `substitute` moved here). The dense solve IS the all-zero profile: one loop, the same flops in the
+//!   same order.
 //! * [`SplitMix64`]: Steele, Lea & Flood's splitmix64 (OOPSLA 2014; Vigna's splitmix64.c), the deterministic sampler and
 //!   noise source; each caller owns its seed, so a measurement is bit-reproducible.
 //!
@@ -98,14 +103,45 @@ pub fn jacobi_sym(a: &[f64], n: usize) -> (Vec<f64>, Vec<f64>) {
 
 /// Solve `a x = b` for symmetric positive-definite `a` (m x m, row-major, its lower triangle read and overwritten by its
 /// Cholesky factor); `b` becomes `x`. False when a pivot is not positive (the caller raises its damping) or a slice is
-/// shorter than `m · m` / `m`.
+/// shorter than `m · m` / `m`. The all-zero profile of [`cholesky_profile`] + [`cholesky_substitute`] (SR540).
 pub fn cholesky_solve(a: &mut [f64], m: usize, b: &mut [f64]) -> bool {
     if a.len() < m * m || b.len() < m {
         return false;
     }
+    if !factor_by(a, m, |_| 0) {
+        return false;
+    }
+    substitute_by(a, m, |_| 0, b);
+    true
+}
+
+/// The Cholesky factor `L` of the symmetric positive-definite `a` (m x m, row-major, lower triangle read) in place,
+/// over the envelope `first[row]` (the row's first structurally non-zero column, `first[i] <= i`; `L` keeps the
+/// envelope, so nothing left of it is read or written). False on a pivot that is not positive or a slice shorter
+/// than `m · m` / `m`. VUGGEOMLINALGSCAN (SR540): VUGSCANSUBMAP's (SR522) `factor`, moved from scan_core graph.rs.
+pub fn cholesky_profile(a: &mut [f64], m: usize, first: &[usize]) -> bool {
+    if a.len() < m * m || first.len() < m {
+        return false;
+    }
+    factor_by(a, m, |i| first[i])
+}
+
+/// `b` <- `(L·Lᵀ)⁻¹ b` for [`cholesky_profile`]'s `L` over the same envelope (row-form substitutions). False (and `b`
+/// untouched) when a slice is shorter than `m · m` / `m`. VUGGEOMLINALGSCAN (SR540): SR522's `substitute`, moved.
+pub fn cholesky_substitute(a: &[f64], m: usize, first: &[usize], b: &mut [f64]) -> bool {
+    if a.len() < m * m || first.len() < m || b.len() < m {
+        return false;
+    }
+    substitute_by(a, m, |i| first[i], b);
+    true
+}
+
+/// The one Cholesky loop (SR522's `factor`, the profile read through `first`): the dense call passes `|_| 0`, which
+/// skips nothing and starts every sum at column 0 (SR520's dense loop, flop for flop).
+fn factor_by(a: &mut [f64], m: usize, first: impl Fn(usize) -> usize) -> bool {
     for j in 0..m {
         let mut d = a[j * m + j];
-        for k in 0..j {
+        for k in first(j)..j {
             d -= a[j * m + k] * a[j * m + k];
         }
         if !(d > 0.0) || !d.is_finite() {
@@ -114,16 +150,24 @@ pub fn cholesky_solve(a: &mut [f64], m: usize, b: &mut [f64]) -> bool {
         let l = libm::sqrt(d);
         a[j * m + j] = l;
         for i in j + 1..m {
+            if first(i) > j {
+                continue;
+            }
             let mut s = a[i * m + j];
-            for k in 0..j {
+            for k in first(i).max(first(j))..j {
                 s -= a[i * m + k] * a[j * m + k];
             }
             a[i * m + j] = s / l;
         }
     }
+    true
+}
+
+/// The two triangular solves over `factor_by`'s `L` (SR522's `substitute`, the profile read through `first`).
+fn substitute_by(a: &[f64], m: usize, first: impl Fn(usize) -> usize, b: &mut [f64]) {
     for i in 0..m {
         let mut s = b[i];
-        for k in 0..i {
+        for k in first(i)..i {
             s -= a[i * m + k] * b[k];
         }
         b[i] = s / a[i * m + i];
@@ -131,11 +175,12 @@ pub fn cholesky_solve(a: &mut [f64], m: usize, b: &mut [f64]) -> bool {
     for i in (0..m).rev() {
         let mut s = b[i];
         for k in i + 1..m {
-            s -= a[k * m + i] * b[k];
+            if first(k) <= i {
+                s -= a[k * m + i] * b[k];
+            }
         }
         b[i] = s / a[i * m + i];
     }
-    true
 }
 
 /// splitmix64 (Steele, Lea & Flood 2014): the deterministic sampler and noise source of the CAD cores.
