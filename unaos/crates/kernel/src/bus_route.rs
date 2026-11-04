@@ -875,7 +875,7 @@ pub fn arm_early(row: usize, path: Option<&str>) {
     }
     serial_println!(
         "[busreg] arm-early row={} gen={} name={} path={} armed={}",
-        row, gen, crate::video::wm::program_name(path), if path.starts_with('/') { path } else { "-" }, armed as u8
+        row, rg, crate::video::wm::program_name(path), if path.starts_with('/') { path } else { "-" }, armed as u8
     );
 }
 
