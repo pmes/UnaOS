@@ -35,6 +35,15 @@
 //! normals are canonical, not outward), outside a BOSS; the set is `sketch` on the plane (z toward the support), the
 //! centre `point`, `circle` (a pocket's diameter through the standards table, else round; a boss's round), `extrude`
 //! along z by the height (round within sigma), ONE statement set sharing one why, confidence from the worst residual.
+//! VUGINTENTFEATURESEXTENT (LEDGER SR653): a cylinder that carries its support's axial extent (`ShapeRef::extent`) is
+//! measured, not inferred: h0 is its far end's offset from the plane (a far plane within 3 sigma of that end), not 2|t|.
+//! VUGINTENTFEATURESSLOT (LEDGER SR666): a SLOT (an obround pocket or boss) scans as two cylinders of one radius and
+//! two parallel plane walls (scan_core's detect keeps the walls two planes of one normal sign and the half-cylinders two
+//! cylinders). [`slots`] runs before the cylinder loop: two cylinders no face models, radii within sigma, axes within
+//! sigma_deg, axis distance d > 2 sigma, with a measured wall at +r and at -r from the joining line, are ONE slot; both
+//! are taken (never also two bosses or pockets) and the midpoint is measured by the cylinder road's own [`stand`] (the
+//! plane, the extent rule, pocket or boss); the set is the obround in the replay's own form (six points, two lines, two
+//! arcs, no constraint) on the plane, its length d and width 2r round within sigma, extruded by the height.
 //!
 //! VUGINTENTSETVERIFY (LEDGER SR541): a statement set is emitted as [`crate::verify_all`] disposes it WHOLE: contiguous,
 //! one `why` that no adjacent proposal shares (a feature's names its cylinder, a bolt circle its n and r, a midline its
@@ -742,10 +751,11 @@ struct PlaneM {
 
 /// The extent rule for the cylinder whose support centroid sits `t` off `planes[pk]`: (h, the far-end plane's (shape
 /// index, e) when one is measured); None when a measured parallel plane crosses the span (no end on the plane within
-/// 3 sigma).
-fn extent(planes: &[PlaneM], pk: usize, t: f64, sigma: f64, sigma_deg: f64) -> Option<(f64, Option<(usize, f64)>)> {
+/// 3 sigma). VUGINTENTFEATURESEXTENT (SR653): `reach` is the support's measured far end (ke = 1); None is the centroid
+/// road h0 = 2|t| (ke = 2: a far end off by e moves the centroid by e / 2), bit-identical to SR536.
+fn extent(planes: &[PlaneM], pk: usize, t: f64, reach: Option<f64>, sigma: f64, sigma_deg: f64) -> Option<(f64, Option<(usize, f64)>)> {
     let p = &planes[pk];
-    let h0 = 2.0 * t.abs();
+    let (h0, ke) = reach.map_or((2.0 * t.abs(), 2.0), |f| (f, 1.0));
     let lim = K_SIGMA * sigma;
     let mut far: Option<(usize, f64, f64)> = None;
     for (k, q) in planes.iter().enumerate() {
@@ -757,12 +767,12 @@ fn extent(planes: &[PlaneM], pk: usize, t: f64, sigma: f64, sigma_deg: f64) -> O
         if !(s * t > 0.0 && s.abs() > lim) {
             continue;
         }
-        let e = (t - s / 2.0).abs();
+        let e = (h0 - s.abs()).abs() / ke;
         if e <= lim {
             if far.is_none_or(|(_, b, _)| e < b) {
                 far = Some((q.i, e, s.abs()));
             }
-        } else if s.abs() < h0 - 2.0 * lim {
+        } else if s.abs() < h0 - ke * lim {
             return None;
         }
     }
@@ -804,43 +814,13 @@ fn features(doc: &Doc, m: &Measurement, sigma: f64, ids: &mut Ids, out: &mut Vec
         }
     }
     let on_doc: Vec<bool> = planes.iter().map(|p| fits(&shapes[p.i].params)).collect();
-    let lin = doc.tol.lin;
+    let taken = slots(doc, &r, shapes, &planes, &on_doc, &fits, sigma, sigma_deg, ids, out); // VUGINTENTFEATURESSLOT (SR666): slots first, their cylinders taken
     for (ci, s) in shapes.iter().enumerate() {
         let ShapeParams::Cylinder { point, axis, radius } = s.params else { continue };
-        if fits(&s.params) {
+        if fits(&s.params) || taken.contains(&ci) {
             continue;
         }
-        // The plane it stands on: a document face, parallel, the least |t| (ties to the larger support, then earlier).
-        let mut best: Option<(usize, f64)> = None;
-        for (k, p) in planes.iter().enumerate() {
-            if !on_doc[k] || axis_deg(axis, p.n) > sigma_deg {
-                continue;
-            }
-            let t = p.n.dot(point) - p.d;
-            if !(t.abs() > sigma) {
-                continue;
-            }
-            let better = best.is_none_or(|(b, bt)| {
-                t.abs() + lin < bt.abs() || ((t.abs() - bt.abs()).abs() <= lin && p.support > planes[b].support)
-            });
-            if better {
-                best = Some((k, t));
-            }
-        }
-        let Some((pk, t)) = best else { continue };
-        let Some((h, far)) = extent(&planes, pk, t, sigma, sigma_deg) else { continue };
-        // Boss or pocket: the support centroid against the replayed solids.
-        let (mut inside, mut unsure) = (false, false);
-        for so in &r.solids {
-            match point_in_solid(&so.brep, point, doc.tol) {
-                Ok(Where::Inside) => inside = true,
-                Ok(Where::Outside) => {}
-                _ => unsure = true,
-            }
-        }
-        if unsure {
-            continue;
-        }
+        let Some(Stand { pk, t, ends, h, far, inside }) = stand(doc, &r, &planes, &on_doc, point, axis, s.extent, sigma, sigma_deg) else { continue }; // VUGINTENTFEATURESSLOT (SR666): the measurement lifted verbatim (file tail)
         let p = &planes[pk];
         let z = p.n * (if t > 0.0 { 1.0 } else { -1.0 });
         let z = Vec3::new(z.x + 0.0, z.y + 0.0, z.z + 0.0);
@@ -861,9 +841,10 @@ fn features(doc: &Doc, m: &Measurement, sigma: f64, ids: &mut Ids, out: &mut Vec
             (radius, 0.0, format!("diameter {} mm as measured", mm(dm)))
         };
         let e = far.map_or(0.0, |(_, e)| e);
-        let src = match far {
-            Some((qi, e)) => format!("far-end plane #{} (near end {} mm off)", qi, mm(e)),
-            None => format!("the support centroid ({} mm off)", mm(t.abs())),
+        let src = match (far, ends) {
+            (Some((qi, e)), _) => format!("far-end plane #{} (near end {} mm off)", qi, mm(e)),
+            (None, Some((near, _))) => format!("the support's axial extent (near end {} mm off)", mm(near.abs())), // VUGINTENTFEATURESEXTENT (SR653)
+            (None, None) => format!("the support centroid ({} mm off)", mm(t.abs())),
         };
         let why = format!(
             "{}: cylinder #{} on plane #{} (a document face), extent {} mm from {}, height {}, {}, sigma {}",
@@ -889,4 +870,248 @@ fn features(doc: &Doc, m: &Measurement, sigma: f64, ids: &mut Ids, out: &mut Vec
             out.push(Proposal { stmt, confidence: conf, why: why.clone() });
         }
     }
+}
+
+// ---- VUGINTENTFEATURESSLOT (SR666): a slot (an obround pocket or boss) from two cylinders and their two walls ----
+
+/// What a support standing on a document face measures: the plane (`planes` index) and the support centroid's offset
+/// `t` from it, SR653's (near, far) ends, the extent rule's h with its far-end plane, and the centroid inside the
+/// replayed solids (a pocket) or not (a boss).
+struct Stand {
+    pk: usize,
+    t: f64,
+    ends: Option<(f64, f64)>,
+    h: f64,
+    far: Option<(usize, f64)>,
+    inside: bool,
+}
+
+/// `features`' per-cylinder measurement, lifted verbatim (SR536 + SR653): the support at `point` along `axis`, with
+/// `span` its carried axial extent; None where the feature rule proposes nothing. The cylinder road and the slot road
+/// both read it.
+#[allow(clippy::too_many_arguments)]
+fn stand(
+    doc: &Doc,
+    r: &crate::replay::Replay,
+    planes: &[PlaneM],
+    on_doc: &[bool],
+    point: Vec3,
+    axis: Vec3,
+    span: Option<[f64; 2]>,
+    sigma: f64,
+    sigma_deg: f64,
+) -> Option<Stand> {
+    let lin = doc.tol.lin;
+    // The plane it stands on: a document face, parallel, the least |t| (ties to the larger support, then earlier).
+    let mut best: Option<(usize, f64)> = None;
+    for (k, p) in planes.iter().enumerate() {
+        if !on_doc[k] || axis_deg(axis, p.n) > sigma_deg {
+            continue;
+        }
+        let t = p.n.dot(point) - p.d;
+        if !(t.abs() > sigma) {
+            continue;
+        }
+        let better = best.is_none_or(|(b, bt)| {
+            t.abs() + lin < bt.abs() || ((t.abs() - bt.abs()).abs() <= lin && p.support > planes[b].support)
+        });
+        if better {
+            best = Some((k, t));
+        }
+    }
+    let Some((pk, t)) = best else { return None };
+    // VUGINTENTFEATURESEXTENT (SR653): the carried extent's ends as offsets from the plane on the support side.
+    let sg = if t > 0.0 { 1.0 } else { -1.0 };
+    let ends = span.and_then(|[a0, a1]| {
+        let c = axis.normalize().ok()?.dot(planes[pk].n);
+        let (o0, o1) = (sg * (t + a0 * c), sg * (t + a1 * c));
+        Some((o0.min(o1), o0.max(o1)))
+    });
+    if ends.is_some_and(|(_, f)| !(f.is_finite() && f > sigma)) {
+        return None;
+    }
+    let Some((h, far)) = extent(&planes, pk, t, ends.map(|e| e.1), sigma, sigma_deg) else { return None };
+    // Boss or pocket: the support centroid against the replayed solids.
+    let (mut inside, mut unsure) = (false, false);
+    for so in &r.solids {
+        match point_in_solid(&so.brep, point, doc.tol) {
+            Ok(Where::Inside) => inside = true,
+            Ok(Where::Outside) => {}
+            _ => unsure = true,
+        }
+    }
+    if unsure {
+        return None;
+    }
+    Some(Stand { pk, t, ends, h, far, inside })
+}
+
+/// One recognised slot: the cylinders' shape indices (i < j), the walls' shape indices (+w side, -w side), the midpoint
+/// of the two axis points, the unit direction joining the axes (normal to them), the axis distance and the mean radius.
+struct Slot {
+    i: usize,
+    j: usize,
+    walls: [usize; 2],
+    m: Vec3,
+    u: Vec3,
+    d: f64,
+    r: f64,
+}
+
+/// The slot recogniser (module doc): for cylinders i < j in shape order that no document face models and no earlier
+/// slot took, radii within sigma, axes within sigma_deg, axis distance d > 2 sigma, and two measured planes parallel to
+/// the axes and to the joining line u (normal within sigma_deg of w = axis x u, compared unsigned: scan_core's
+/// `canonical` gives both walls one normal sign) at +r and -r along w from the axes' midpoint within K_SIGMA sigma (the
+/// nearest per side). The first j that pairs takes both (greedy, deterministic).
+fn slot_of(shapes: &[crate::intent::ShapeRef], planes: &[PlaneM], fits: &dyn Fn(&ShapeParams) -> bool, sigma: f64, sigma_deg: f64) -> Vec<Slot> {
+    let band = K_SIGMA * sigma;
+    let cyl = |k: usize| match shapes[k].params {
+        ShapeParams::Cylinder { point, axis, radius } if !fits(&shapes[k].params) => axis.normalize().ok().map(|a| (point, a, radius)),
+        _ => None,
+    };
+    let mut taken = alloc::vec![false; shapes.len()];
+    let mut out = Vec::new();
+    for i in 0..shapes.len() {
+        if taken[i] {
+            continue;
+        }
+        let Some((pi, ai, ri)) = cyl(i) else { continue };
+        for j in i + 1..shapes.len() {
+            if taken[j] {
+                continue;
+            }
+            let Some((pj, aj, rj)) = cyl(j) else { continue };
+            if (ri - rj).abs() > sigma || axis_deg(ai, aj) > sigma_deg {
+                continue;
+            }
+            let c = pj - pi;
+            let u = c - ai * ai.dot(c);
+            let d = u.mag();
+            if !(d > 2.0 * sigma) {
+                continue;
+            }
+            let u = u * (1.0 / d);
+            let w = ai.cross(u);
+            let m = (pi + pj) * 0.5;
+            let r = 0.5 * (ri + rj);
+            // The walls: the plane's offset from m along w (a flipped normal flips it), nearest to +r and to -r.
+            let mut side: [Option<(usize, f64)>; 2] = [None, None];
+            for q in planes {
+                if axis_deg(q.n, w) > sigma_deg {
+                    continue;
+                }
+                let o = (q.d - q.n.dot(m)) * (if q.n.dot(w) < 0.0 { -1.0 } else { 1.0 });
+                let k = if o > 0.0 { 0 } else { 1 };
+                let e = (o.abs() - r).abs();
+                if e <= band && side[k].is_none_or(|(_, b)| e < b) {
+                    side[k] = Some((q.i, e));
+                }
+            }
+            let [Some((wa, _)), Some((wb, _))] = side else { continue };
+            taken[i] = true;
+            taken[j] = true;
+            out.push(Slot { i, j, walls: [wa, wb], m, u, d, r });
+            break;
+        }
+    }
+    out
+}
+
+/// The slot rule (module doc): per recognised slot, its two cylinders are TAKEN (the cylinder loop skips them, so a
+/// slot is never also two bosses or pockets) and, where `stand` measures the midpoint on a document face, ONE statement
+/// set: the obround as the replay's own form (six points, two lines, two arcs, no constraint) on the plane, extruded by
+/// the extent rule's height. No slot: nothing drawn from `ids`, nothing pushed.
+#[allow(clippy::too_many_arguments)]
+fn slots(
+    doc: &Doc,
+    r: &crate::replay::Replay,
+    shapes: &[crate::intent::ShapeRef],
+    planes: &[PlaneM],
+    on_doc: &[bool],
+    fits: &dyn Fn(&ShapeParams) -> bool,
+    sigma: f64,
+    sigma_deg: f64,
+    ids: &mut Ids,
+    out: &mut Vec<Proposal>,
+) -> BTreeSet<usize> {
+    let mut taken = BTreeSet::new();
+    for sl in slot_of(shapes, planes, fits, sigma, sigma_deg) {
+        taken.insert(sl.i);
+        taken.insert(sl.j);
+        let ShapeParams::Cylinder { axis, .. } = shapes[sl.i].params else { continue };
+        let Ok(a) = axis.normalize() else { continue };
+        // Each carried extent about m along i's unit axis; the union, or None (the centroid road at m) when either is.
+        let along = |k: usize| -> Option<[f64; 2]> {
+            let ShapeParams::Cylinder { point, axis, .. } = shapes[k].params else { return None };
+            let [e0, e1] = shapes[k].extent?;
+            let sg = if axis.dot(a) < 0.0 { -1.0 } else { 1.0 };
+            let o = a.dot(point - sl.m);
+            let (x0, x1) = (o + sg * e0, o + sg * e1);
+            Some([x0.min(x1), x0.max(x1)])
+        };
+        let span = match (along(sl.i), along(sl.j)) {
+            (Some(x), Some(y)) => Some([x[0].min(y[0]), x[1].max(y[1])]),
+            _ => None,
+        };
+        let Some(Stand { pk, t, ends, h, far, inside }) = stand(doc, r, planes, on_doc, sl.m, axis, span, sigma, sigma_deg) else {
+            continue;
+        };
+        let p = &planes[pk];
+        let z = p.n * (if t > 0.0 { 1.0 } else { -1.0 });
+        let z = Vec3::new(z.x + 0.0, z.y + 0.0, z.z + 0.0);
+        let foot = sl.m - p.n * t;
+        let Ok(x) = (sl.u - p.n * p.n.dot(sl.u)).normalize() else { continue };
+        let x = Vec3::new(x.x + 0.0, x.y + 0.0, x.z + 0.0);
+        let (hv, hres) = round_within(h, sigma).unwrap_or((h, 0.0));
+        let (lv, lres) = round_within(sl.d, sigma).unwrap_or((sl.d, 0.0));
+        let (wv, wres) = round_within(2.0 * sl.r, sigma).unwrap_or((2.0 * sl.r, 0.0));
+        let e = far.map_or(0.0, |(_, e)| e);
+        let src = match (far, ends) {
+            (Some((qi, e)), _) => format!("far-end plane #{} (near end {} mm off)", qi, mm(e)),
+            (None, Some((near, _))) => format!("the support's axial extent (near end {} mm off)", mm(near.abs())),
+            (None, None) => format!("the support centroid ({} mm off)", mm(t.abs())),
+        };
+        let why = format!(
+            "slot {}: cylinders #{} and #{} on plane #{} (a document face), walls #{} and #{}, length {} from {} mm, width {} from {} mm, extent {} mm from {}, height {}, sigma {}",
+            if inside { "pocket" } else { "boss" },
+            sl.i,
+            sl.j,
+            p.i,
+            sl.walls[0],
+            sl.walls[1],
+            f64_text(lv),
+            mm(sl.d),
+            f64_text(wv),
+            mm(2.0 * sl.r),
+            mm(h),
+            src,
+            f64_text(hv),
+            mm(sigma)
+        );
+        let conf = confidence(e.max(hres).max(lres).max(wres), sigma);
+        let v3 = |v: Vec3| format!("{} {} {}", f64_text(v.x), f64_text(v.y), f64_text(v.z));
+        let (hl, hw) = (f64_text(lv / 2.0), f64_text(wv / 2.0));
+        let (nl, nw) = (f64_text(-lv / 2.0), f64_text(-wv / 2.0));
+        let q = core::f64::consts::FRAC_PI_2;
+        let sk = ids.next();
+        let (c1, c2, q1, q2, q3, q4) = (ids.next(), ids.next(), ids.next(), ids.next(), ids.next(), ids.next());
+        let (l1, k1, l2, k2, ex) = (ids.next(), ids.next(), ids.next(), ids.next(), ids.next());
+        for stmt in [
+            format!("sketch {} o=[{}] z=[{}] x=[{}]", sk, v3(foot), v3(z), v3(x)),
+            format!("point {} sketch={} x={} y=0", c1, sk, nl),
+            format!("point {} sketch={} x={} y=0", c2, sk, hl),
+            format!("point {} sketch={} x={} y={}", q1, sk, nl, nw),
+            format!("point {} sketch={} x={} y={}", q2, sk, hl, nw),
+            format!("point {} sketch={} x={} y={}", q3, sk, hl, hw),
+            format!("point {} sketch={} x={} y={}", q4, sk, nl, hw),
+            format!("line {} sketch={} a={} b={}", l1, sk, q1, q2),
+            format!("arc {} sketch={} centre={} r={} start={} end={}", k1, sk, c2, hw, f64_text(-q), f64_text(q)),
+            format!("line {} sketch={} a={} b={}", l2, sk, q3, q4),
+            format!("arc {} sketch={} centre={} r={} start={} end={}", k2, sk, c1, hw, f64_text(q), f64_text(3.0 * q)),
+            format!("extrude {} sketch={} outer={} dir=[{}] length={}", ex, sk, l1, v3(z), f64_text(hv)),
+        ] {
+            out.push(Proposal { stmt, confidence: conf, why: why.clone() });
+        }
+    }
+    taken
 }

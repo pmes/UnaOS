@@ -33,11 +33,11 @@ fn v(x: f64, y: f64, z: f64) -> Vec3 {
 }
 
 fn plane(n: Vec3, d: f64, support: u32, rms_mm: f64) -> ShapeRef {
-    ShapeRef { params: ShapeParams::Plane { normal: n, d }, support, rms_mm }
+    ShapeRef { params: ShapeParams::Plane { normal: n, d }, support, rms_mm, extent: None }
 }
 
 fn cyl(p: Vec3, r: f64, support: u32, rms_mm: f64) -> ShapeRef {
-    ShapeRef { params: ShapeParams::Cylinder { point: p, axis: v(0.0, 0.0, 1.0), radius: r }, support, rms_mm }
+    ShapeRef { params: ShapeParams::Cylinder { point: p, axis: v(0.0, 0.0, 1.0), radius: r }, support, rms_mm, extent: None }
 }
 
 /// The SR497 fixture's values: the top plane and the r 39.74 cylinder.
@@ -87,7 +87,7 @@ fn shapes_accept_the_round_diameter_and_refuse_a_wrong_one() {
 fn a_shape_with_no_face_of_its_kind_is_reported_not_refused() {
     let d = doc(HOLE_PLATE);
     let mut s = fixture_shapes();
-    s.push(ShapeRef { params: ShapeParams::Sphere { centre: v(60.0, 60.0, 30.0), radius: 5.0 }, support: 300, rms_mm: 0.2 });
+    s.push(ShapeRef { params: ShapeParams::Sphere { centre: v(60.0, 60.0, 30.0), radius: 5.0 }, support: 300, rms_mm: 0.2, extent: None });
     let m = shapes(s);
     match verify(&d, &p("diameter i1 sketch=s circle=c1 d=80"), &m, d.tol) {
         Verdict::Accept { max_mm, .. } => assert!((max_mm - 0.26).abs() < 1e-6, "max {}", max_mm),
@@ -113,7 +113,7 @@ fn a_shape_with_no_face_of_its_kind_is_reported_not_refused() {
 #[test]
 fn no_shape_with_a_face_of_its_kind_is_refused_by_name() {
     let d = doc(HOLE_PLATE);
-    let only = vec![ShapeRef { params: ShapeParams::Sphere { centre: v(60.0, 60.0, 30.0), radius: 5.0 }, support: 300, rms_mm: 0.2 }];
+    let only = vec![ShapeRef { params: ShapeParams::Sphere { centre: v(60.0, 60.0, 30.0), radius: 5.0 }, support: 300, rms_mm: 0.2, extent: None }];
     let why = match verify(&d, &p("diameter i1 sketch=s circle=c1 d=80"), &shapes(only), d.tol) {
         Verdict::Refuse { why } => why,
         v => panic!("accepted: {:?}", v),
@@ -138,6 +138,7 @@ fn the_measurement_table_is_deterministic() {
             params: ShapeParams::Cone { apex: v(0.0, 0.0, -0.0), axis: v(0.0, 0.0, 1.0), half_angle: core::f64::consts::FRAC_PI_4 },
             support: 10,
             rms_mm: 0.05,
+            extent: None,
         }],
         sigma_mm: 0.25,
         sigma_deg: 1.0,
@@ -671,4 +672,163 @@ fn a_residual_names_its_term() {
         Verdict::Refuse { why } => assert!(matches!(why, Reason::Residual { term: Term::Outline, .. }), "{why:?}"),
         v => panic!("d=86 not refused: {v:?}"),
     }
+}
+
+// ---- VUGINTENTFEATURESEXTENT (SR653): a cylinder that carries its support's axial extent ----
+
+/// The real boss is 8 tall (top at z = 18) on the 80 x 60 x 10 plate; its lower wall occluded, so the support centroid
+/// sits high (z = 15, t = 5) and the support spans z 10.4 .. 18.0 (extent [-4.6, 3.0] from the point).
+#[test]
+fn a_boss_carries_its_axial_extent() {
+    let d = doc(&plate(80.0, 60.0, 10.0));
+    let measured = ShapeRef { extent: Some([-4.6, 3.0]), ..cyl(v(40.0, 30.0, 15.0), 7.95, 900, 0.2) };
+    let inferred = cyl(v(40.0, 30.0, 15.0), 7.95, 900, 0.2);
+    // A: no boss-top plane. The SR536 road (no extent) reads the centroid as mid-extent: length=10; the extent: 8.
+    let mut s = box_planes(80.0, 60.0, 10.0);
+    s.push(inferred);
+    let ps = suggest(&d, &shapes(s));
+    let set = feature_set(&ps, "boss:");
+    assert_eq!(set.len(), 4, "{:?}", stmts(&ps));
+    assert!(set[3].stmt.ends_with("dir=[0 0 1] length=10"), "{}", set[3].stmt);
+    assert!(set[0].why.contains("the support centroid"), "{}", set[0].why);
+    let mut s = box_planes(80.0, 60.0, 10.0);
+    s.push(measured);
+    let m = shapes(s);
+    let ps = suggest(&d, &m);
+    let set = feature_set(&ps, "boss:");
+    assert_eq!(set.len(), 4, "{:?}", stmts(&ps));
+    assert!(set[0].stmt.ends_with("o=[40 30 10] z=[0 0 1] x=[1 0 0]"), "{}", set[0].stmt);
+    assert!(set[2].stmt.ends_with(" r=8"), "{}", set[2].stmt);
+    assert!(set[3].stmt.ends_with("dir=[0 0 1] length=8"), "{}", set[3].stmt);
+    assert!(set[0].why.contains("the support's axial extent (near end 0.400 mm off)"), "{}", set[0].why);
+    let bt = verify_all(&d, &ps, &m, d.tol);
+    assert_eq!(bt.accepted(), ps.len(), "{}", bt.text());
+    // B: the boss top measured at z = 18 (#6). The extent's far end meets it (e = 0): length=8 from the far-end plane;
+    // the SR536 road on the same shapes reads it as a plane crossing the span (e = |5 - 8/2| = 1 > 0.9, 8 < 10 - 1.8)
+    // and proposes no set.
+    let mut s = box_planes(80.0, 60.0, 10.0);
+    s.push(plane(v(0.0, 0.0, 1.0), 18.0, 700, 0.2));
+    s.push(measured);
+    let m = shapes(s);
+    let ps = suggest(&d, &m);
+    let set = feature_set(&ps, "boss:");
+    assert_eq!(set.len(), 4, "{:?}", stmts(&ps));
+    assert!(set[3].stmt.ends_with("dir=[0 0 1] length=8"), "{}", set[3].stmt);
+    assert!(set[0].why.contains("far-end plane #6 (near end 0.000 mm off)"), "{}", set[0].why);
+    let bt = verify_all(&d, &ps, &m, d.tol);
+    assert_eq!(bt.accepted(), ps.len(), "{}", bt.text());
+    let mut s = box_planes(80.0, 60.0, 10.0);
+    s.push(plane(v(0.0, 0.0, 1.0), 18.0, 700, 0.2));
+    s.push(inferred);
+    let ps = suggest(&d, &shapes(s));
+    assert!(feature_set(&ps, "boss:").is_empty() && feature_set(&ps, "pocket:").is_empty(), "{:?}", stmts(&ps));
+}
+
+// ---- VUGINTENTFEATURESSLOT (SR666): a slot from two cylinders and their two walls ----
+
+/// The 80 x 60 x 10 plate with a 30 x 10 obround pocket 5 deep at its centre, as scan_core's detect returns it: the
+/// box planes (#0-#5), the pocket floor at z = 5 (#6), the two walls of ONE normal sign (`canonical`) at y = 25 (#7) and
+/// y = 35 (#8), and the two half-cylinders r 5 (#9, #10) whose axis points sit 20 apart at mid-depth.
+fn slot_pocket(walls: bool) -> Vec<ShapeRef> {
+    let mut s = box_planes(80.0, 60.0, 10.0);
+    s.push(plane(v(0.0, 0.0, 1.0), 5.0, 600, 0.2));
+    if walls {
+        s.push(plane(v(0.0, 1.0, 0.0), 25.0, 400, 0.2));
+        s.push(plane(v(0.0, 1.0, 0.0), 35.0, 400, 0.2));
+    }
+    s.push(cyl(v(30.0, 30.0, 7.5), 5.0, 300, 0.2));
+    s.push(cyl(v(50.0, 30.0, 7.5), 5.0, 300, 0.2));
+    s
+}
+
+#[test]
+fn an_obround_pocket_proposes_one_slot_set() {
+    let d = doc(&plate(80.0, 60.0, 10.0));
+    let m = shapes(slot_pocket(true));
+    let ps = suggest(&d, &m);
+    let set = feature_set(&ps, "slot pocket:");
+    assert_eq!(set.len(), 12, "{:?}", stmts(&ps));
+    // The slot's cylinders are taken: no single pocket or boss, and no boss slot.
+    assert!(feature_set(&ps, "pocket:").is_empty() && feature_set(&ps, "boss:").is_empty(), "{:?}", stmts(&ps));
+    assert!(feature_set(&ps, "slot boss:").is_empty(), "{:?}", stmts(&ps));
+    let a = set[0].stmt.split(' ').nth(1).unwrap();
+    let n: u32 = a[1..].parse().unwrap();
+    let id = |k: u32| format!("i{}", n + k);
+    let (c1, c2, q1, q2, q3, q4, l1, k1, l2, k2, x) = (id(1), id(2), id(3), id(4), id(5), id(6), id(7), id(8), id(9), id(10), id(11));
+    let got: Vec<&str> = set.iter().map(|p| p.stmt.as_str()).collect();
+    assert_eq!(
+        vec![got[0], got[1], got[2], got[3], got[4], got[5], got[6], got[7], got[9], got[11]],
+        [
+            format!("sketch {a} o=[40 30 10] z=[0 0 -1] x=[1 0 0]"),
+            format!("point {c1} sketch={a} x=-10 y=0"),
+            format!("point {c2} sketch={a} x=10 y=0"),
+            format!("point {q1} sketch={a} x=-10 y=-5"),
+            format!("point {q2} sketch={a} x=10 y=-5"),
+            format!("point {q3} sketch={a} x=10 y=5"),
+            format!("point {q4} sketch={a} x=-10 y=5"),
+            format!("line {l1} sketch={a} a={q1} b={q2}"),
+            format!("line {l2} sketch={a} a={q3} b={q4}"),
+            format!("extrude {x} sketch={a} outer={l1} dir=[0 0 -1] length=5"),
+        ]
+    );
+    assert!(got[8].starts_with(&format!("arc {k1} sketch={a} centre={c2} r=5 start=-1.5707963")), "{}", got[8]);
+    assert!(got[10].starts_with(&format!("arc {k2} sketch={a} centre={c1} r=5 start=1.5707963")), "{}", got[10]);
+    assert!(got[10].contains(" end=4.712388"), "{}", got[10]);
+    assert!(set.iter().all(|p| p.why == set[0].why), "one set shares one why");
+    let why = &set[0].why;
+    assert!(why.contains("cylinders #9 and #10 on plane #1") && why.contains("walls #8 and #7"), "{why}");
+    assert!(why.contains("length 20 from 20.000 mm, width 10 from 10.000 mm"), "{why}");
+    assert!(why.contains("far-end plane #6 (near end 0.000 mm off), height 5"), "{why}");
+    assert!((set[0].confidence - 1.0).abs() < 1e-12, "{}", set[0].confidence);
+    // The set comes after every sketch rule, and verify_all takes the plate's singles and the slot as one set.
+    assert_eq!(ps.iter().position(|p| p.why.starts_with("slot pocket:")).unwrap() + 12, ps.len());
+    let bt = verify_all(&d, &ps, &m, d.tol);
+    assert_eq!(bt.accepted(), ps.len(), "{}", bt.text());
+    assert_eq!(bt.sets.len(), 1, "{}", bt.text());
+    // The walls discriminate: the same cylinders with no walls are two pockets, no slot.
+    let ps = suggest(&d, &shapes(slot_pocket(false)));
+    assert!(ps.iter().all(|p| !p.why.starts_with("slot ")), "{:?}", stmts(&ps));
+    assert_eq!(feature_set(&ps, "pocket:").len(), 8, "{:?}", stmts(&ps));
+}
+
+/// Two equal r 5 bosses 6 tall on the plate, axes parallel and 30 apart, no walls between them: the walls are what
+/// discriminates (equal radii, parallel axes and d > 2 sigma all hold), so they stay two bosses and no slot.
+#[test]
+fn two_equal_bosses_stay_two_bosses() {
+    let d = doc(&plate(80.0, 60.0, 10.0));
+    let mut s = box_planes(80.0, 60.0, 10.0);
+    s.push(cyl(v(25.0, 30.0, 13.0), 5.0, 400, 0.2));
+    s.push(cyl(v(55.0, 30.0, 13.0), 5.0, 400, 0.2));
+    let m = shapes(s);
+    let ps = suggest(&d, &m);
+    assert!(ps.iter().all(|p| !p.why.starts_with("slot ")), "{:?}", stmts(&ps));
+    assert!(feature_set(&ps, "pocket:").is_empty(), "{:?}", stmts(&ps));
+    let set = feature_set(&ps, "boss:");
+    assert_eq!(set.len(), 8, "{:?}", stmts(&ps));
+    assert!(set[0].why.contains("cylinder #6 on plane #1") && set[4].why.contains("cylinder #7 on plane #1"), "{}", set[0].why);
+    for (k, x0) in [(0, 25), (4, 55)] {
+        let a = set[k].stmt.split(' ').nth(1).unwrap();
+        let n: u32 = a[1..].parse().unwrap();
+        let (b, c, x) = (format!("i{}", n + 1), format!("i{}", n + 2), format!("i{}", n + 3));
+        assert_eq!(
+            set[k..k + 4].iter().map(|p| p.stmt.as_str()).collect::<Vec<_>>(),
+            [
+                format!("sketch {a} o=[{x0} 30 10] z=[0 0 1] x=[1 0 0]"),
+                format!("point {b} sketch={a} x=0 y=0"),
+                format!("circle {c} sketch={a} centre={b} r=5"),
+                format!("extrude {x} sketch={a} outer={c} dir=[0 0 1] length=6"),
+            ]
+        );
+    }
+    // VUG-INTENT-SET-SIBLINGS (owed): SR551's counting rule takes the other, still unmodelled boss into each set's
+    // residual (no cylinder face in the document, one 30 mm off in the set's replay), so each set is refused whole by
+    // Residual 30; the plate's own singles are accepted.
+    let bt = verify_all(&d, &ps, &m, d.tol);
+    assert_eq!(bt.sets.len(), 2, "{}", bt.text());
+    for (start, _) in &bt.sets {
+        for (st, _, v) in &bt.entries[*start..*start + 4] {
+            assert!((residual_max(v) - 30.0).abs() < 1e-6, "{st}: {v:?}");
+        }
+    }
+    assert_eq!(bt.accepted(), ps.len() - 8, "{}", bt.text());
 }
