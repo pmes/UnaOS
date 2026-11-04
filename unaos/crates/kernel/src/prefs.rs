@@ -1679,13 +1679,13 @@ fn post_changes(changes: &[(String, String, Option<prefs_core::schema::Applied>)
     changes.len()
 }
 
-/// `watch_deleted`'s keys, after its locks are dropped: each answers its default now (its declared default, else the
-/// unset form), said once per run.
+/// `watch_deleted`'s keys, after its locks are dropped: each posts SR169's unset form (the consumer re-reads its
+/// default), said once per run.
 fn deleted_post(cleared: &[(String, String)]) {
     if cleared.is_empty() {
         return;
     }
-    let out: Vec<(String, String, Option<prefs_core::schema::Applied>)> = cleared.iter().map(|(ns, k)| (ns.clone(), k.clone(), unset_posted(ns, k))).collect(); // UNSET-POST-ROADS (rmbp-ledger B1179): the delete road posts the one rule `unset_posted` (file tail). LINE-NEUTRAL fold, code first
+    let out: Vec<(String, String, Option<prefs_core::schema::Applied>)> = cleared.iter().map(|(ns, k)| (ns.clone(), k.clone(), None)).collect(); // UNSET-POST-ROADS (rmbp-ledger B1179) + UNSET-POSTED-INLINE (rmbp-ledger B1189): the delete road posts SR169's unset form on this line. LINE-NEUTRAL fold, code first
     let unset = out.iter().filter(|c| c.2.is_none()).count();
     let sent = post_changes(&out);
     deleted_note(cleared.len(), sent);
@@ -1710,7 +1710,7 @@ fn reload_post(old: &PrefTree, t0: u64) -> usize {
         }
     }
     let n = out.len() + gone.len();
-    let unset = gone.iter().filter(|(ns, k)| { let a = unset_posted(ns, k); let none = a.is_none(); out.push((ns.clone(), k.clone(), a)); none }).count(); // UNSET-POST-ROADS (rmbp-ledger B1179): the reload road posts the one rule `unset_posted` (file tail). LINE-NEUTRAL fold, code first
+    let unset = gone.len(); out.extend(gone.iter().map(|(ns, k)| (ns.clone(), k.clone(), None))); // UNSET-POST-ROADS (rmbp-ledger B1179) + UNSET-POSTED-INLINE (rmbp-ledger B1189): the reload road posts SR169's unset form on this line. LINE-NEUTRAL fold, code first
     let sent = post_changes(&out);
     serial_println!("[prefs] reload gen={} changed={} sent={} unsent={} unset={} ms={}", session_gen(), n, sent, n - sent, unset, crate::arch::ms().saturating_sub(t0)); // PREFSRELOAD (B763) + PREFSDELETED (B755) + PREFSUNSET (SR169): the ONE reload line
     n
@@ -1806,7 +1806,7 @@ pub fn deleted_counts() -> (usize, usize) {
 // the new store gave, and every key whose value differs is posted through [`changed`] — the same `[prefs] changed`
 // line and the same verb-19 frame (`prefs_client::on_changed`) a write sends — schema rows first in `SCHEMA` order, then
 // the keys no row declares in tree order. THE DIFF IS [`reload_post`] (PREFSDELETED's, the one that knows the unset form
-// of PREFSUNSET): a key the new store does not hold carries its declared default, else verb 19's unset body. One line per
+// of PREFSUNSET): a key the new store does not hold carries verb 19's unset body (UNSET-POST-RULE B1185). One line per
 // reload: `[prefs] reload gen=<SESSION_GEN> changed=<n> sent=<n> unsent=<n> unset=<n> ms=<n>`.
 
 /// `tests settingsmap`'s reload leg (B763): the session switch with `old` as the tree the previous session held — the
@@ -1898,7 +1898,7 @@ pub(crate) fn store_read(p: &str) -> Option<Vec<u8>> {
 // The operator's `pref unset <ns.key>`: the key leaves the session store by THE ONE RULE the delete watch and the session
 // reload already keep — removed from the tree (never the default written into the user's file), its domain saved by the
 // same swap (`KernelPersist` -> `save_domain`, rolled back on a failed save), then ONE post through [`post_changes`] of
-// [`unset_posted`]: SR169's unset form (`None`) for EVERY key (MACHINE-KEY-DEFAULT-PIN B1173, UNSET-POST-ROADS B1179,
+// SR169's unset form (`None`, on its own line, UNSET-POSTED-INLINE B1189) for EVERY key (MACHINE-KEY-DEFAULT-PIN B1173, UNSET-POST-ROADS B1179,
 // UNSET-POST-RULE B1185), so the mirror removes a machine key (B1154's `=unset`); [`default_applied`] answers the
 // operator's `reads <lit>` text only. The bus unset is PREFS-UNSET-BUS (B1166, `store_unset` below). The
 // writers column admits the operator for every key (`prefs_core::schema::Writer`), so there is no new check.
@@ -1926,7 +1926,7 @@ pub fn unset(ns: &str, k: &str) -> Result<bool, SetError> {
     }
     serial_println!("[prefs] unset {}.{} ok=1", ns, k);
     serial_println!("[prefs] changed {}.{}", ns, k);
-    let _ = post_changes(&[(String::from(ns), String::from(k), unset_posted(ns, k))]); // MACHINE-KEY-DEFAULT-PIN (rmbp-ledger B1173): a MACHINE_KEYS row posts SR169's unset form, every other key `default_applied` (file tail). LINE-NEUTRAL fold, code first
+    let _ = post_changes(&[(String::from(ns), String::from(k), None)]); // MACHINE-KEY-DEFAULT-PIN (rmbp-ledger B1173) + UNSET-POSTED-INLINE (rmbp-ledger B1189): SR169's unset form for every key, posted on this line. LINE-NEUTRAL fold, code first
     Ok(true)
 }
 
@@ -2099,7 +2099,7 @@ fn lay_machine_dir(mt: &crate::fs::vfs::MountTable, dir: &str, at: &str) -> Opti
 // The bus UNSET (una-abi `BUS_VERB_PREF_UNSET` 29): `prefs_core::wire::fulfil_as`'s UNSET arm (`wire::unset_as`: the GET
 // address, SET's gate — -EACCES outside the session or past `cap::may_set` for the caller `bus_fulfil_from` stamped — then
 // `Store::unset`) over `KernelStore`, whose arm is B1161's [`unset`]: the one rule (removed from the tree, its domain saved
-// by the same swap, rolled back on a failed save) and the ONE `post_changes(default_applied)`. Reply: 0 + SR169's unset
+// by the same swap, rolled back on a failed save) and the ONE `post_changes` of the unset form. Reply: 0 + SR169's unset
 // form, -ENOENT already unset, -EINVAL malformed, -EIO the write. Principia's host store answers the same verb through the
 // same `fulfil_as` (`PrefStore::unset`). No relay: R3PREF_UNSET is owed (PREFS-UNSET-RELAY). Wire, after B1161's
 // `[prefs] unset <ns>.<key> ok=1` + `[prefs] changed <ns>.<key>`: `[prefs] unset <ns>.<key> ok=1 via=bus by=<prog>`,
@@ -2121,7 +2121,7 @@ fn unset_bus_note(verb: u8, body: &[u8], caller: prefs_core::cap::Caller<'_>, st
         let a = prefs_core::wire::parse_get(body).map(|_| core::str::from_utf8(body).unwrap_or("?")).unwrap_or("<malformed>");
         let who = prefs_caller_text(caller);
         if st == 0 {
-            serial_println!("[prefs] unset {} ok=1 posted={} via=bus by={}", a, unset_posted_word(body), who); // MACHINE-KEY-DEFAULT-PIN (rmbp-ledger B1173): what the one post carried (file tail). Named in-place hunk
+            serial_println!("[prefs] unset {} ok=1 posted=unset via=bus by={}", a, who); // MACHINE-KEY-DEFAULT-PIN (rmbp-ledger B1173) + UNSET-POSTED-INLINE (rmbp-ledger B1189): the one post is the unset form, a literal. Named in-place hunk
         } else if st == prefs_core::wire::ENOENT {
             serial_println!("[prefs] unset {} ok=1 was=unset via=bus by={}", a, who);
         } else {
@@ -2374,20 +2374,7 @@ fn prefscap_path_legs() {
 // [`reload_post`]), and a STATIC-default key (`schema::default_of` -> `Source::Default`) posts the unset form too, as the
 // host ring does. UNSET-POST-RULE (B1185): so do a Rule-default key (vein's provider rebuild re-reads on the namespace) and a declared
 // `app.*` key (no reader binds the value; the declarer holds its default): EVERY unset posts the unset form, [`default_applied`] answers reads only. Wire: `[prefs] machine settings/<d> system.<k>=unset wrote=1`, `[prefs] unset <a> ok=1 posted=unset via=bus …`.
-
-/// The PrefChanged value [`unset`], [`deleted_post`] and [`reload_post`] post for `ns`/`k` (see the block above). Called with no prefs lock held.
-fn unset_posted(ns: &str, k: &str) -> Option<prefs_core::schema::Applied> {
-    let _ = (ns, k); None // UNSET-POST-RULE (rmbp-ledger B1185): every kind posts the unset form; B1173's machine arm and B1179's static line fold into it (the block above). Named in-place hunk
-}
-
-/// [`unset_bus_note`]'s `posted=` word: `unset`, or the literal [`unset_posted`] carried.
-#[cfg(any(feature = "aarch64_el0", target_arch = "x86_64"))]
-fn unset_posted_word(body: &[u8]) -> String {
-    match prefs_core::wire::parse_get(body).and_then(|(ns, k)| unset_posted(ns, k)) {
-        Some(a) => a.value.to_literal(),
-        None => String::from("unset"),
-    }
-}
+// UNSET-POSTED-INLINE (rmbp-ledger B1189): the constant `unset_posted` and its `posted=` word fn are retired; [`unset`], [`deleted_post`] and [`reload_post`] post `None` on their own lines and [`unset_bus_note`] says `posted=unset` as a literal.
 
 /// `tests prefs`' machine-key bus unset leg (B1173), from [`unset_bus_legs`] while its scratch owner is armed: SET then
 /// UNSET `system.accessibility.reduce_motion` (a ring-3 settable row) through [`bus_fulfil_from`]; the post is the unset
@@ -2407,7 +2394,7 @@ fn machine_unset_leg(owner: u64) {
     let set = bus_fulfil_from(VERB_SET, b"system.accessibility.reduce_motion\x00true", true, owner, &mut o) == 0;
     o.clear();
     let st = bus_fulfil_from(VERB_UNSET, b"system.accessibility.reduce_motion", true, owner, &mut o);
-    let posted = unset_posted(NS, K).is_none() && get(NS, K).is_none();
+    let posted = get(NS, K).is_none(); // UNSET-POSTED-INLINE (rmbp-ledger B1189): the post is the literal unset form; its effect is `mirror=removed` and `roads=3`. Named in-place hunk
     let session = home().is_some_and(|h| !h.is_empty());
     let held = read_all(&mp).and_then(|b| String::from_utf8(b).ok()).and_then(|t| PrefTree::parse(&t).ok()).is_some_and(|t| t.get(NS, K).is_some());
     let mirror = if !session {
@@ -2489,7 +2476,7 @@ fn prefscap_early_legs(owner: u64, demoted: &dyn Fn(&str) -> Option<bool>) -> (b
 // [`machine_unset_leg`]'s second and third roads for `system.accessibility.reduce_motion`, run before that leg's restore
 // (which puts the session domain file, the machine file, the tree and ON_DISK back byte for byte). The delete road: the
 // key is set, the session domain file holding it is deleted, [`watch_deleted`] clears the domain and [`deleted_post`]
-// posts [`unset_posted`]'s unset form, so the machine copy loses the key. The reload road: the key is set, the store is
+// posts SR169's unset form (`None`), so the machine copy loses the key. The reload road: the key is set, the store is
 // saved without it while RAM still holds it, [`reload_session`] re-reads the store and [`reload_post`] posts the unset
 // form for the key that left. Each road passes when the key is gone and (in a session) the machine copy no longer holds it.
 // Wire: `[prefs] machine settings/general system.accessibility.reduce_motion=unset wrote=1` once per road, then
@@ -2575,7 +2562,7 @@ fn prefscap_earlyname_leg(owner: u64) -> bool {
 // [`machine_unset_leg`]'s `rule=` and `app=` words. A Rule-default key (`vein.embed.provider`: `schema::default_of` answers
 // `Source::Rule`, and under the kernel's [`StoreEnv`] the embedder rule always yields a value) and a declared `app.*` key
 // (a scratch `app.unsetrule.k`, declared through [`declare_kernel`] only when no `unsetrule` stanza is held, removed after)
-// each have a literal [`default_applied`] would answer, and [`unset_posted`] posts the unset form for both. No store write,
+// each have a literal [`default_applied`] would answer (the premise: the roads' unset form is posted over a value, not for lack of one; UNSET-POSTED-INLINE B1189 retired `unset_posted`, the post is the literal `None` on each road's line). No store write,
 // no tree change; TREE and DECLARED are taken one at a time, with no prefs lock held by the caller.
 
 /// The Rule-default and declared-app legs (see the block above): `(rule_ok, app_ok)`.
@@ -2583,13 +2570,11 @@ fn prefscap_earlyname_leg(owner: u64) -> bool {
 fn unset_rule_leg() -> (bool, bool) {
     const RK: &str = "embed.provider";
     let rule = matches!(prefs_core::schema::default_of("vein", RK, &StoreEnv), Some((_, prefs_core::schema::Source::Rule(_))))
-        && default_applied("vein", RK).is_some()
-        && unset_posted("vein", RK).is_none();
+        && default_applied("vein", RK).is_some(); // UNSET-POSTED-INLINE (rmbp-ledger B1189): the premise only, the post is the sites' literal. Named in-place hunk
     let held = DECLARED.lock().contains_key("unsetrule");
     let declared = !held && declare_kernel(b"unsetrule\x00k\tint:0:9\t4\tUNSET-POST-RULE scratch");
     let app = declared
-        && default_applied(prefs_core::files::APP_NS, "unsetrule.k").map(|a| a.value) == Some(PrefValue::Int(4))
-        && unset_posted(prefs_core::files::APP_NS, "unsetrule.k").is_none();
+        && default_applied(prefs_core::files::APP_NS, "unsetrule.k").map(|a| a.value) == Some(PrefValue::Int(4)); // UNSET-POSTED-INLINE (rmbp-ledger B1189): the premise only. Named in-place hunk
     if declared {
         DECLARED.lock().remove("unsetrule");
     }

@@ -254,7 +254,7 @@ fn relay(hdr: &crate::bus::BusHdr, body: &[u8]) -> Option<Answer> {
                 // The frame is already in PREFS.ELF's mailbox and WILL land: a kernel write now could be
                 // overtaken by this queued one (set A times out, set B lands, A lands = A wins). One queue,
                 // one order — the set is accepted as in flight; its PrefChanged tells the window when it lands.
-                if !queued_keep(hdr, body, held) { return Some(queued_full(tag, hdr.corr)); } serial_println!("[prefsbus] relay verb={} corr={} timeout={}ms — set queued at prefs.elf", tag, hdr.corr, RELAY_WAIT_MS); // RELAY-QUEUED-SET (B1175): the queued set's body is kept per client corr (full = -EAGAIN, never a silent 0) so a holder that dies with it unread is answered by the kernel fulfiller (file tail). QUEUED-SET-LOSTRESET (B1181): the holder's (row, rgen) from B1165's `held` rides the entry. LINE-NEUTRAL fold, code first.
+                if !queued_keep(hdr, body, held) { return Some(queued_full(tag, hdr.corr)); } serial_println!("[prefsbus] relay verb={} corr={} timeout={}ms — {} queued at prefs.elf", tag, hdr.corr, RELAY_WAIT_MS, queued_word(hdr.verb)); // UNSET-QUEUED-WORD (rmbp-ledger B1189): the verb word (file tail). RELAY-QUEUED-SET (B1175): the queued set's body is kept per client corr (full = -EAGAIN, never a silent 0) so a holder that dies with it unread is answered by the kernel fulfiller (file tail). QUEUED-SET-LOSTRESET (B1181): the holder's (row, rgen) from B1165's `held` rides the entry. LINE-NEUTRAL fold, code first.
                 return Some(Answer { status: 0, body: Vec::new() });
             }
             serial_println!("[prefsbus] relay verb={} corr={} timeout={}ms — kernel fulfiller answers", tag, hdr.corr, RELAY_WAIT_MS);
@@ -1106,7 +1106,7 @@ fn queued_keep(hdr: &crate::bus::BusHdr, body: &[u8], held: Option<(usize, u64)>
 /// The full ring's honest answer: -EAGAIN (the frame may still land at the holder; it is not tracked).
 #[cfg(feature = "busreg")]
 fn queued_full(tag: u8, corr: u32) -> Answer {
-    serial_println!("[prefsbus] relay verb={} corr={} timeout={}ms — queue full ({}), set refused -EAGAIN", tag, corr, RELAY_WAIT_MS, Q_CAP);
+    serial_println!("[prefsbus] relay verb={} corr={} timeout={}ms — queue full ({}), {} refused -EAGAIN", tag, corr, RELAY_WAIT_MS, Q_CAP, queued_word(tag)); // UNSET-QUEUED-WORD (rmbp-ledger B1189): the queued write's verb word (file tail). Named in-place hunk
     Answer { status: una_abi::EAGAIN, body: Vec::new() }
 }
 
@@ -1163,18 +1163,18 @@ fn queued_drain() {
             let Some(e) = queued_take(c) else { continue };
             let a = kernel(&e.hdr, &e.body);
             if a.status == 0 {
-                serial_println!("[prefsbus] queued set corr={} holder gone unread — kernel fulfiller applied", c);
+                serial_println!("[prefsbus] queued {} corr={} holder gone unread — kernel fulfiller applied", queued_word(e.hdr.verb), c); // UNSET-QUEUED-WORD (rmbp-ledger B1189): the queued write's verb word (file tail). Named in-place hunk
             } else {
-                serial_println!("[prefsbus] queued set corr={} holder gone unread — kernel fulfiller refused status={}", c, a.status);
+                serial_println!("[prefsbus] queued {} corr={} holder gone unread — kernel fulfiller refused status={}", queued_word(e.hdr.verb), c, a.status); // UNSET-QUEUED-WORD (rmbp-ledger B1189): the queued write's verb word (file tail). Named in-place hunk
             }
         } else if let Some(st) = answered {
-            if queued_take(c).is_some() {
-                serial_println!("[prefsbus] queued set corr={} answered status={} — released", c, st);
+            if let Some(e) = queued_take(c) {
+                serial_println!("[prefsbus] queued {} corr={} answered status={} — released", queued_word(e.hdr.verb), c, st); // UNSET-QUEUED-WORD (rmbp-ledger B1189): the queued write's verb word (file tail). Named in-place hunk
             }
         } else if queued_lost(c) {
             // QUEUED-SET-LOSTRESET (B1181): the holder died having READ it and its reset was lost (full inbox).
-            if queued_take(c).is_some() {
-                serial_println!("[prefsbus] queued set corr={} holder gone, reset lost — released status={}", c, una_abi::ECONNRESET);
+            if let Some(e) = queued_take(c) {
+                serial_println!("[prefsbus] queued {} corr={} holder gone, reset lost — released status={}", queued_word(e.hdr.verb), c, una_abi::ECONNRESET); // UNSET-QUEUED-WORD (rmbp-ledger B1189): the queued write's verb word (file tail). Named in-place hunk
             }
         }
     }
@@ -1371,8 +1371,8 @@ fn lostreset_selftest(next: &dyn Fn() -> u32, body_of: &dyn Fn(i64) -> String, r
 // PREFS-UNSET-RELAY (rmbp-ledger B1186) — TAIL-APPENDED. The kernel client's UNSET (PREF_UNSET 29) relays to Principia's
 // ring-3 fulfiller as R3PREF_UNSET (131, `r3_tag`) and is a WRITE on every road a relayed SET takes ([`relayed_write`]):
 // B1155's gate (a holder not of the open session is skipped, the kernel fulfiller answers), B1175's queue arm (a timed-out
-// unset is kept in `QUEUED` and settled by `queued_drain`, whose `kernel` call is verb-generic; its lines say "set" for a
-// queued unset too, UNSET-QUEUED-WORD owed) and B1169's unread road (`bus_route::unread_handoff` marks an unread 131 ->
+// unset is kept in `QUEUED` and settled by `queued_drain`, whose `kernel` call is verb-generic; its lines name the
+// verb, `queued_word`, UNSET-QUEUED-WORD B1189) and B1169's unread road (`bus_route::unread_handoff` marks an unread 131 ->
 // the kernel fulfiller applies it; one the holder READ stays -ECONNRESET). PREFS.ELF forwards 131 to PREF_UNSET under
 // its own stamped name: `wire::unset_as` checks `cap::may_set` for `prefs` (B1170/B1177 demote an image not at
 // `/apps/PREFS.ELF` to Anon). [`pref_unset`] is the sender (Settings' Delete on a row, `video/settings.rs`).
@@ -1444,7 +1444,7 @@ pub fn unset_relay_legs() -> Result<(bool, bool, bool), &'static str> {
     // P3: a queued unset whose holder died with it unread is applied at the next call's drain.
     let seeded3 = seed(PrefValue::Int(9).to_literal().as_str());
     let c3 = next();
-    let kept = hdr_of(una_abi::BUS_VERB_PREF_UNSET, c3, addr.as_bytes()).is_some_and(|h| queued_keep(&h, addr.as_bytes()));
+    let kept = hdr_of(una_abi::BUS_VERB_PREF_UNSET, c3, addr.as_bytes()).is_some_and(|h| queued_keep(&h, addr.as_bytes(), None)); // UNSET-QUEUED-WORD (rmbp-ledger B1189): B1181's third argument (no lostreset road; the unread mark is asked first). Named in-place hunk
     note_set_unread(c3);
     let pushed = inbox_push(queued_reply(c3, reset));
     let gone = pref_get(crate::prefs::NS, key::IDLE_MIN).is_err();
@@ -1460,4 +1460,17 @@ pub fn unset_relay_legs() -> Result<(bool, bool, bool), &'static str> {
         }
     }
     Ok((p1, p2, p3))
+}
+
+// UNSET-QUEUED-WORD (rmbp-ledger B1189, BP-storage-11) — TAIL-APPENDED. The queued ring ([`QUEUED`], B1175/B1181) keeps
+// the client request header, so each entry already holds its verb (PREF_SET or PREF_UNSET, B1186's `relayed_write`);
+// its log lines name that verb instead of saying "set" for a queued unset. Words only: no state, no lock, no frame.
+// Wire: `[prefsbus] queued unset corr=<c> holder gone unread — kernel fulfiller applied` (and the `answered`,
+// `reset lost`, `queued at prefs.elf`, `queue full` lines the same); a queued SET's lines are unchanged.
+// =================================================================================================
+/// The word for a relayed write's verb: `unset` for PREF_UNSET (the client verb) or R3PREF_UNSET (its relay tag),
+/// else `set`.
+#[cfg(feature = "busreg")]
+fn queued_word(verb: u8) -> &'static str {
+    if verb == una_abi::BUS_VERB_PREF_UNSET || verb == una_abi::BUS_VERB_R3PREF_UNSET { "unset" } else { "set" }
 }
