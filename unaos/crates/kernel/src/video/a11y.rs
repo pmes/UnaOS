@@ -196,6 +196,15 @@ fn build() -> Tree {
                 t.push(id, A11Y_ROLE_TAB, f, nm.as_bytes(), (cx, cy, cw, ch), WIN_NONE);
             }
         }
+        if r.id == crate::video::quarry::live::win() && r.id != WIN_NONE {
+            // QUARRYMENUA11Y (rmbp-ledger B1126): Quarry's open context menu — its shown rows as MENU stops under the
+            // window, THE `sel` SELECTED (`ops::a11y_menu`, read after the table hold dropped; none while the menu is down).
+            let mut menu = Vec::new();
+            crate::video::quarry::live::ops::a11y_menu(&mut menu);
+            for (name, bx, cur) in menu.iter() {
+                t.push(id, A11Y_ROLE_MENU, if *cur { A11Y_F_SELECTED } else { 0 }, name.as_bytes(), *bx, WIN_NONE);
+            }
+        }
     }
     t
 }
@@ -291,6 +300,11 @@ pub fn selftest() {
     for (kind, c) in crate::video::settings::CENSUS_KINDS.iter().zip(census.iter()) {
         serial_println!("[a11y] census kind={} stops={} rung={}", kind, c[0], c[1]);
     }
+    // QUARRYMENUA11Y (rmbp-ledger B1126): the tree's Quarry menu stops (MENU children of Quarry's window node); informative, not in `ok`
+    let qwin = crate::video::quarry::live::win();
+    let qid = t.nodes.iter().position(|b| qwin != WIN_NONE && b.win == qwin).map_or(0, |k| k + 1);
+    let menu_stops = t.nodes.iter().filter(|b| qid != 0 && b.node.parent as usize == qid && b.node.role == A11Y_ROLE_MENU).count();
+    serial_println!("[a11y] census kind=menu stops={} up={}", menu_stops, crate::video::quarry::live::ops::a11y_menu_up() as u8);
     serial_println!(
         ":: A11YTREE: windows={} nodes={} unnamed={} focus={} ring_px={} s2={} stops={}/{} missed={} wire={} -> {} ::",
         windows, t.nodes.len(), unnamed, if focus_ok { "ok" } else { "FAIL" }, ring_px, crate::video::metrics::s2(), rung,

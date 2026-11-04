@@ -1595,3 +1595,37 @@ fn page_probe(g: &Geom) -> bool {
     serial_println!("[menuscraft] quarry_page first={} rows={} -> {}", first, rows, if ok { "ok" } else { "BAD" });
     ok
 }
+
+// ── QUARRYMENUA11Y (rmbp-ledger B1126): the open menu's rows as accessibility stops — TAIL-APPENDED ──────────────
+// `wm::a11y`'s walk (BP-video-20) reads the furniture's own tables; Quarry's context menu is one while it is up. The
+// rows are the page `menu_paint` shows (`menu_fit` / `page_first` / `menu_body` / `Item::label`, the one geometry), the
+// current THE `sel` (B1119: the keys and a pointer crossing write it). Lock order MODEL -> MENU (`paint_overlay`'s),
+// each copied out and dropped before `wm::info` takes TABLE; called after the walk's `table()` hold has dropped.
+
+/// QUARRYMENUA11Y (B1126) — push `(label, panel box, current)` per shown row of the open menu onto `out` and return
+/// the count; 0 and nothing pushed while the menu is down. The `<n> more…` / `<n> back…` row is no stop.
+pub fn a11y_menu(out: &mut Vec<(String, (usize, usize, usize, usize), bool)>) -> usize {
+    if !MENU_UP.load(Ordering::Acquire) {
+        return 0;
+    }
+    let Some(g) = MODEL.lock().as_ref().map(|m| m.geom) else { return 0 };
+    let Some((mx, my, first, sel)) = MENU.lock().as_ref().map(|mn| (mn.x, mn.y, mn.first, mn.sel)) else { return 0 };
+    let Some(info) = wm::info(WIN.load(Ordering::Relaxed)) else { return 0 };
+    let s = info.scale.max(1);
+    let (bw, _, pady) = menu_body(&g);
+    let rh = g.row_h();
+    let fit = menu_fit(&g);
+    let first = page_first(first, fit);
+    let mut n = 0;
+    for (i, it) in ITEMS.iter().enumerate().skip(first).take(fit.0) {
+        let top = my + pady + (i - first) * rh;
+        out.push((it.label(), (info.x + mx * s, info.y + top * s, bw * s, rh * s), sel == Some(i)));
+        n += 1;
+    }
+    n
+}
+
+/// QUARRYMENUA11Y (B1126) — is the context menu up (`[a11y] census kind=menu up=`)?
+pub fn a11y_menu_up() -> bool {
+    MENU_UP.load(Ordering::Acquire)
+}

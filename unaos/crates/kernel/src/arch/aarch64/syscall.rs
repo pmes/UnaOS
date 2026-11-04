@@ -14146,7 +14146,7 @@ fn wc_close_click(win: crate::video::wm::WinId, owner: u64) -> &'static str { //
 fn click_pointer_pos() -> (i32, i32) {
     // LOCKFIX — refused ⇒ the last geometry the door READ (PANEL-HELD-ONE B1110: `video::panel_wh_held`, the one held read; the fn-local `GEOM` copy is retired, and a degenerate read no longer overwrites the hold). PIWM: never (0, 0) into `pal::cursor::pos`, whose FIRST caller seeds the boot's pointer at (w/2, h/2) (pal.rs:527-528) — a refused read here, on the cascade's first focus arrival (`ptr_abs_arrival`, AETHERPTR2), pinned the pointer to the crystal's corner cell for the whole boot.
     let (w, h) = { let (w, h, _) = crate::video::panel_wh_held(); (w as i32, h as i32) }; // PANEL-HELD-ONE (B1110): one line out, one in
-    if w <= 0 || h <= 0 { return (0, 0); } // PIWM: no geometry has EVER been read — this one event keeps the old (0, 0) answer, but the shared pointer is NOT seeded with it. ⚠ LINE-NEUTRAL: 4 body lines out, 4 in.
+    // CLICK-ARM-GUARD (rmbp-ledger B1126): ONE guard, pal's — a 0x0 hold (no geometry ever read) reaches `pal::cursor::pos`, whose `None => (0, 0)` arm (pal.rs:535) answers (0, 0) and seeds nothing, the answer the retired `w <= 0 || h <= 0` return gave; a pointer another path already seeded answers its live position (PIWM's intent). ⚠ LINE-NEUTRAL: the return out, this comment in.
     crate::pal::cursor::pos(w, h)
 }
 
