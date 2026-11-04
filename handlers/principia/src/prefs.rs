@@ -41,9 +41,15 @@
 //! - **Defaults live with the consumer.** The store never invents a value;
 //!   [`PrefStore::get`] answers `Option`, and an unset key is simply unset.
 //! - **Every write is atomic, and touches one domain.** A set renders its
-//!   domain's file into `<domain>.new` (the kernel's swap name), fsyncs it,
-//!   reads it back (it must parse to the domain's tree), and `rename`s it over
-//!   the real one — a reader (or a crash) sees the old file or the new one.
+//!   domain's file into `<domain>.new.<tag>` (a per-writer swap name: the
+//!   kernel's `<domain>.new` plus this writer's tag), fsyncs it, reads it back
+//!   (it must parse to the domain's tree), and `rename`s it over the real one —
+//!   a reader (or a crash) sees the old file or the new one.
+//! - **Two host writers do not lose each other's keys** (PREFS-SWAP-LOCK,
+//!   SR644). A write holds the domain's advisory lock file `<domain>.lock`
+//!   (`create_new`; a lock older than [`LOCK_STALE`] is a dead holder's and is
+//!   broken, best-effort) and re-reads the domain from disk under it, applying
+//!   only its own key, so a key another process wrote since our load survives.
 //! - **A refused file is never overwritten.** A domain file outside the subset
 //!   is not adopted; its writes are HELD (the kernel's rule), so the user's
 //!   file survives until they fix or delete it.
@@ -91,6 +97,8 @@ pub struct PrefStore {
     clamped: usize,
     /// The `<iso>` of the auto-saved line (the UTC clock; a fixed one in tests).
     clock: fn() -> String,
+    /// PREFS-SWAP-LOCK (SR644): the domain the last set/unset wrote and its file's stamp as written ([`PrefStore::written`]).
+    wrote: Option<(String, fs::Metadata)>,
 }
 
 impl PrefStore {
@@ -158,6 +166,7 @@ impl PrefStore {
             migrate_from: None,
             clamped: 0,
             clock: now_iso,
+            wrote: None, // PREFS-SWAP-LOCK (SR644)
         }
     }
 
@@ -282,21 +291,25 @@ impl PrefStore {
         }
 
         let previous = entry.insert(key.to_string(), value);
-        if let Err(e) = self.save_domain(&domain) {
-            // Roll the cache back to the persisted truth.
-            let entry = self.namespaces.entry(ns.to_string()).or_default();
-            match previous {
-                Some(old) => {
-                    entry.insert(key.to_string(), old);
-                }
-                None => {
-                    entry.remove(key);
-                    if entry.is_empty() {
-                        self.namespaces.remove(ns);
+        self.wrote = None; // PREFS-SWAP-LOCK (SR644): the stamp of THIS write, or none
+        match self.save_domain(&domain, Some((ns, key))) {
+            Ok((_, md)) => self.wrote = md.map(|m| (domain.clone(), m)),
+            Err(e) => {
+                // Roll the cache back to the persisted truth.
+                let entry = self.namespaces.entry(ns.to_string()).or_default();
+                match previous {
+                    Some(old) => {
+                        entry.insert(key.to_string(), old);
+                    }
+                    None => {
+                        entry.remove(key);
+                        if entry.is_empty() {
+                            self.namespaces.remove(ns);
+                        }
                     }
                 }
+                return Err(e);
             }
-            return Err(e);
         }
         Ok(outcome)
     }
@@ -324,34 +337,66 @@ impl PrefStore {
         let mut n = 0;
         for d in files::split(&self.tree()).into_keys() {
             if !self.held.contains(&d) {
-                n += self.save_domain(&d)?;
+                n += self.save_domain(&d, None)?.0;
             }
         }
         Ok(n)
     }
 
-    /// Write ONE domain's file by the kernel's swap: `<d>.new` written and
-    /// fsynced, READ BACK and parsed (it must be the domain's tree), then
-    /// renamed over `<d>`. `Ok(keys written)`.
-    fn save_domain(&self, domain: &str) -> Result<usize> {
-        let part = files::part(&self.tree(), domain);
-        let text = files::render(domain, &part, &(self.clock)(), &files::writer_of(domain), &doc_of);
+    /// Write ONE domain's file by the kernel's swap, per writer (PREFS-SWAP-LOCK, SR644): under the domain's
+    /// lock file ([`DomainLock`]), `<d>.new.<tag>` written and fsynced, READ BACK and parsed (it must be the written
+    /// tree), then renamed over `<d>`. With `edit = Some((ns, key))` (a set / unset) the written tree is the domain
+    /// RE-READ FROM DISK under the lock with only that key changed to the cache's value (absent = removed), so a
+    /// key another writer saved since our load survives; with `None` (save_all: the migration, the clamp) it is the
+    /// cache's part. `Ok((keys written, stamp))`: the stamp is the swap file's own metadata (the renamed file's
+    /// inode, mtime and length), `None` when the written tree kept keys the cache does not hold (the watch posts them).
+    fn save_domain(&self, domain: &str, edit: Option<(&str, &str)>) -> Result<(usize, Option<fs::Metadata>)> {
         fs::create_dir_all(&self.dir).with_context(|| format!("creating {}", self.dir.display()))?;
+        let _lock = DomainLock::take(&self.dir, domain)?;
+        let mine = files::part(&self.tree(), domain);
+        let part = match edit {
+            None => mine.clone(),
+            Some((ns, key)) => {
+                let mut base = read_domain(&self.dir, domain)?.unwrap_or_default();
+                match self.get(ns, key) {
+                    Some(v) => {
+                        base.set(ns, key, to_core(&v))
+                            .map_err(|e| anyhow::anyhow!("`{ns}`.`{key}` collides on disk in settings/{domain}: {e:?}"))?;
+                    }
+                    None => {
+                        base.remove(ns, key);
+                    }
+                }
+                base
+            }
+        };
+        let foreign = part != mine && part.to_toml() != mine.to_toml();
+        let text = files::render(domain, &part, &(self.clock)(), &files::writer_of(domain), &doc_of);
         let path = self.domain_path(domain);
-        let tmp = self.dir.join(format!("{domain}.new"));
-        {
-            let mut f = fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
-            f.write_all(text.as_bytes()).with_context(|| format!("writing {}", tmp.display()))?;
-            f.sync_all().with_context(|| format!("syncing {}", tmp.display()))?;
+        let tmp = self.dir.join(files::swap_name(domain, Some(&swap_tag())));
+        let swapped = (|| -> Result<fs::Metadata> {
+            let md = {
+                let mut f = fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
+                f.write_all(text.as_bytes()).with_context(|| format!("writing {}", tmp.display()))?;
+                f.sync_all().with_context(|| format!("syncing {}", tmp.display()))?;
+                f.metadata().with_context(|| format!("stat {}", tmp.display()))?
+            };
+            let back = fs::read_to_string(&tmp).with_context(|| format!("reading back {}", tmp.display()))?;
+            match PrefTree::parse(&back) {
+                Ok(t) if back == text && (t == part || t.to_toml() == part.to_toml()) => {}
+                _ => bail!("read-back of {} is not the domain's tree", tmp.display()),
+            }
+            fs::rename(&tmp, &path)
+                .with_context(|| format!("renaming {} onto {}", tmp.display(), path.display()))?;
+            Ok(md)
+        })();
+        match swapped {
+            Ok(md) => Ok((part.len(), (!foreign).then_some(md))),
+            Err(e) => {
+                let _ = fs::remove_file(&tmp); // no tagged litter from a failed swap
+                Err(e)
+            }
         }
-        let back = fs::read_to_string(&tmp).with_context(|| format!("reading back {}", tmp.display()))?;
-        match PrefTree::parse(&back) {
-            Ok(t) if back == text && (t == part || t.to_toml() == part.to_toml()) => {}
-            _ => bail!("read-back of {} is not the domain's tree", tmp.display()),
-        }
-        fs::rename(&tmp, &path)
-            .with_context(|| format!("renaming {} onto {}", tmp.display(), path.display()))?;
-        Ok(part.len())
     }
 
     /// The whole store as ONE TOML document (`prefs_core`'s emission of the
@@ -377,7 +422,7 @@ pub fn legacy_of(dir: &Path) -> PathBuf {
     dir.parent().unwrap_or(Path::new("")).join(files::LEGACY)
 }
 
-/// The domains in `dir` (a `<d>.new` alone counts: its swap was interrupted).
+/// The domains in `dir` (a `<d>.new` or `<d>.new.<tag>` alone counts: its swap was interrupted).
 fn domains_in(dir: &Path) -> Result<Vec<String>> {
     let rd = match fs::read_dir(dir) {
         Ok(rd) => rd,
@@ -390,7 +435,7 @@ fn domains_in(dir: &Path) -> Result<Vec<String>> {
             continue;
         }
         let name = e.file_name().to_string_lossy().into_owned();
-        let d = name.strip_suffix(".new").unwrap_or(&name);
+        let d = files::swap_of(&name).unwrap_or(&name); // PREFS-SWAP-LOCK (SR644): every `<d>.new*` swap name
         if files::valid_domain(d) {
             v.insert(d.to_string());
         }
@@ -398,7 +443,8 @@ fn domains_in(dir: &Path) -> Result<Vec<String>> {
     Ok(v.into_iter().collect())
 }
 
-/// One domain file (or its orphaned `.new`): `Ok(None)` = absent, `Err` = refused.
+/// One domain file (or, when it is absent, its newest orphaned swap that parses: `<d>.new` or a writer's
+/// `<d>.new.<tag>`, PREFS-SWAP-LOCK SR644): `Ok(None)` = absent, `Err` = refused.
 fn read_domain(dir: &Path, d: &str) -> Result<Option<PrefTree>> {
     let parse = |p: &Path, text: &str| {
         PrefTree::parse(text).map_err(|e| anyhow::anyhow!("{} line {}: {}", p.display(), e.line, e.why))
@@ -409,14 +455,13 @@ fn read_domain(dir: &Path, d: &str) -> Result<Option<PrefTree>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e).with_context(|| format!("reading {}", p.display())),
     }
-    let tmp = dir.join(format!("{d}.new"));
-    match fs::read_to_string(&tmp).ok().map(|t| parse(&tmp, &t)) {
-        Some(Ok(t)) => {
+    for tmp in orphan_swaps(dir, d) {
+        if let Some(Ok(t)) = fs::read_to_string(&tmp).ok().map(|t| parse(&tmp, &t)) {
             log::info!("[PRINCIPIA] :: adopted {} (the swap was interrupted)", tmp.display());
-            Ok(Some(t))
+            return Ok(Some(t));
         }
-        _ => Ok(None),
     }
+    Ok(None)
 }
 
 /// UTC now as `YYYY-MM-DDTHH:MM:SSZ` (the kernel's `clock::iso8601_now` shape).
@@ -960,6 +1005,29 @@ mod tests {
         assert_eq!(s.get("system", "audio.volume"), Some(PrefValue::Int(5)));
     }
 
+    /// PREFS-SWAP-LOCK (SR644): a writer's interrupted per-writer swap (`<d>.new.<tag>` alone) is adopted too; with
+    /// several, the newest that parses wins; the lock file is not a domain; a domain file present ignores them all.
+    #[test]
+    fn a_tagged_orphan_swap_is_adopted() {
+        let dir = tempfile::tempdir().unwrap();
+        let sd = dir.path().join(files::DIR);
+        fs::create_dir_all(&sd).unwrap();
+        fs::write(sd.join("sound.new.1-0"), "[system]\naudio.volume = 3\n").unwrap();
+        fs::write(sd.join("sound.lock"), "1-0").unwrap();
+        let s = PrefStore::load(&sd).unwrap();
+        assert_eq!(s.get("system", "audio.volume"), Some(PrefValue::Int(3)));
+        assert_eq!(domains_in(&sd).unwrap(), ["sound"], "the lock file is no domain");
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::write(sd.join("sound.new.2-0"), "[system]\naudio.volume = 7\n").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::write(sd.join("sound.new.3-0"), "[system]\naudio.volume = [1]\n").unwrap(); // newest, refused: skipped
+        assert_eq!(PrefStore::load(&sd).unwrap().get("system", "audio.volume"), Some(PrefValue::Int(7)), "the newest that parses");
+
+        fs::write(sd.join("sound"), "[system]\naudio.volume = 9\n").unwrap();
+        assert_eq!(PrefStore::load(&sd).unwrap().get("system", "audio.volume"), Some(PrefValue::Int(9)), "the domain file wins");
+    }
+
     #[test]
     fn iso_is_the_civil_utc_date() {
         assert_eq!(iso_of(0), "1970-01-01T00:00:00Z");
@@ -991,10 +1059,14 @@ impl PrefStore {
         if entry.is_empty() {
             self.namespaces.remove(ns);
         }
-        if let Err(e) = self.save_domain(&domain) {
-            // Roll the cache back to the persisted truth.
-            self.namespaces.entry(ns.to_string()).or_default().insert(key.to_string(), old);
-            return Err(e);
+        self.wrote = None; // PREFS-SWAP-LOCK (SR644): the stamp of THIS write, or none
+        match self.save_domain(&domain, Some((ns, key))) {
+            Ok((_, md)) => self.wrote = md.map(|m| (domain.clone(), m)),
+            Err(e) => {
+                // Roll the cache back to the persisted truth.
+                self.namespaces.entry(ns.to_string()).or_default().insert(key.to_string(), old);
+                return Err(e);
+            }
         }
         Ok(true)
     }
@@ -1040,5 +1112,89 @@ mod unset_tests {
         assert_eq!(held.held(), ["vug"]);
         assert!(held.unset("vug", "photo.camera_mm").is_err(), "held");
         assert_eq!(fs::read_to_string(sd.join("vug")).unwrap(), bad, "the user's file is untouched");
+    }
+}
+
+// ---- PREFS-SWAP-LOCK (SR644): the host store's two-writer rule (named tail block) ----
+// lumen's and una's Principias write ONE `<home>/settings`. std::fs has no flock, so the lock is a FILE taken with
+// `create_new` (O_EXCL); its holder's critical section is one small render + fsync + rename. The kernel's road is a
+// separate one-writer road (its own SAVE_LOCK) and takes none of this.
+
+/// How long a writer waits for another writer's lock before its write fails (the cache then rolls back).
+pub const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+/// A lock file older than this belongs to a writer that died mid-write: it is removed and the take retried
+/// (best-effort: two writers breaking one stale lock at once may both proceed, once).
+pub const LOCK_STALE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// A per-writer swap tag, `<pid>-<n>`: unique across processes (the pid) and across stores in one process (n).
+fn swap_tag() -> String {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    format!("{}-{}", std::process::id(), N.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Every orphaned swap of `d` in `dir` (`<d>.new`, `<d>.new.<tag>`), newest mtime first (ties by name).
+fn orphan_swaps(dir: &Path, d: &str) -> Vec<PathBuf> {
+    let Ok(rd) = fs::read_dir(dir) else { return Vec::new() };
+    let mut v: Vec<(Option<std::time::SystemTime>, String)> = rd
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| files::swap_of(n) == Some(d))
+        .map(|n| (fs::metadata(dir.join(&n)).and_then(|m| m.modified()).ok(), n))
+        .collect();
+    v.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    v.into_iter().map(|(_, n)| dir.join(n)).collect()
+}
+
+/// The advisory lock on one domain's file: `<dir>/<d>.lock`, held while the guard lives, removed on drop.
+struct DomainLock {
+    path: PathBuf,
+}
+
+impl DomainLock {
+    /// Take `<d>.lock`: retry every 2 ms up to [`LOCK_WAIT`]; a lock older than [`LOCK_STALE`] is broken.
+    fn take(dir: &Path, domain: &str) -> Result<Self> {
+        let path = dir.join(files::lock_name(domain));
+        let start = std::time::Instant::now();
+        loop {
+            match fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(mut f) => {
+                    let _ = write!(f, "{}", std::process::id());
+                    return Ok(Self { path });
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let stale = fs::metadata(&path)
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .and_then(|t| t.elapsed().ok())
+                        .is_some_and(|age| age > LOCK_STALE);
+                    if stale {
+                        log::warn!("[PRINCIPIA] :: {} is older than {:?}: its writer died; broken", path.display(), LOCK_STALE);
+                        let _ = fs::remove_file(&path);
+                        continue;
+                    }
+                    if start.elapsed() > LOCK_WAIT {
+                        bail!("settings/{domain} is locked by another writer ({} held past {:?})", path.display(), LOCK_WAIT);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                Err(e) => return Err(e).with_context(|| format!("locking {}", path.display())),
+            }
+        }
+    }
+}
+
+impl Drop for DomainLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+impl PrefStore {
+    /// The stamp of `domain`'s file as the last set/unset wrote it (the swap file's own metadata: the renamed
+    /// file's inode, mtime and length), or `None` when that write kept another writer's keys the cache does not
+    /// hold, or wrote another domain, or failed. The serve loop's self-write rule records it (SR635's watch).
+    pub fn written(&self, domain: &str) -> Option<&fs::Metadata> {
+        self.wrote.as_ref().filter(|(d, _)| d == domain).map(|(_, m)| m)
     }
 }

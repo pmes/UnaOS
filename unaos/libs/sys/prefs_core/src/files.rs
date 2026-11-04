@@ -66,7 +66,8 @@ pub fn domain_of(ns: &str, key: &str) -> String {
     String::from(d)
 }
 
-/// A domain name is one key segment that does not collide with the swap's temp (`<d>.new`).
+/// A domain name is one key segment that does not collide with the swap's temp (`<d>.new`, the host's per-writer
+/// `<d>.new.<tag>`) or the host's lock file (`<d>.lock`): a segment carries no `.` (PREFS-SWAP-LOCK, SR644).
 pub fn valid_domain(d: &str) -> bool {
     crate::valid_segment(d)
 }
@@ -246,4 +247,31 @@ mod tests {
             assert!(matches!(row.default, crate::schema::Default::Int(_) | crate::schema::Default::Float(_) | crate::schema::Default::Bool(_) | crate::schema::Default::Str(_)), "system.{} default is {:?}: a machine key needs a static default", k, row.default); // MACHINE-KEY-DEFAULT-PIN (B1160)
         }
     }
+}
+
+// ---- PREFS-SWAP-LOCK (SR644): the swap and lock NAMES of a domain (named tail block) ----
+// Two host writers (lumen's and una's Principias) over ONE `<home>/settings` shared the swap name `<d>.new`: one
+// writer's rename could carry the other's half-written file. The host now writes `<d>.new.<tag>` (a per-writer tag)
+// under the advisory lock file `<d>.lock`. Only the NAMES live here (pure, no I/O); the kernel's one-writer road keeps
+// its own `<d>.new` literal and calls none of these.
+
+/// The swap file a writer renders `d` into: `<d>.new` (the kernel's) or, with a tag, `<d>.new.<tag>` (the host's).
+pub fn swap_name(d: &str, tag: Option<&str>) -> String {
+    match tag {
+        Some(t) => alloc::format!("{}.new.{}", d, t),
+        None => alloc::format!("{}.new", d),
+    }
+}
+
+/// The domain whose swap `name` is: `<d>.new` or `<d>.new.<tag>` with `d` a valid domain and `tag` one segment.
+/// Anything else (a domain file, `<d>.lock`, `<d>.new.`, `<d>.new.a.b`) is `None`.
+pub fn swap_of(name: &str) -> Option<&str> {
+    let (d, rest) = name.split_once('.')?;
+    let ok = rest == "new" || rest.strip_prefix("new.").is_some_and(crate::valid_segment);
+    (ok && valid_domain(d)).then_some(d)
+}
+
+/// The host's advisory lock file for `d`: `<d>.lock` (never a domain, never a swap).
+pub fn lock_name(d: &str) -> String {
+    alloc::format!("{}.lock", d)
 }

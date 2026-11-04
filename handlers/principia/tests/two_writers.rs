@@ -88,3 +88,41 @@ async fn two_principias_over_one_home_hear_each_others_writes() {
     );
     assert_eq!(changed(&mut obs_a, "vug", "photo.principal_px", wait).await, px, "A hears B's write");
 }
+
+/// PREFS-SWAP-LOCK (SR644): two writers over ONE settings folder (two stores, two threads, as lumen's and una's
+/// processes) set DIFFERENT keys of ONE domain in a tight loop. Each write holds `contend.lock` and re-reads the
+/// domain from disk, so neither whole-domain rename drops the other's keys: a fresh load holds all of them, and no
+/// lock file or per-writer swap is left behind.
+#[test]
+fn contended_writers_lose_no_key() {
+    const N: i64 = 60;
+    let home = tempfile::tempdir().unwrap();
+    let sd = home.path().join(prefs_core::files::DIR);
+    let writer = |who: &'static str| {
+        let sd = sd.clone();
+        std::thread::spawn(move || {
+            let mut s = principia::prefs::PrefStore::load(&sd).unwrap();
+            for i in 0..N {
+                s.set("contend", &format!("{who}.k{i}"), PrefValue::Int(i)).unwrap();
+            }
+        })
+    };
+    let (a, b) = (writer("a"), writer("b"));
+    a.join().unwrap();
+    b.join().unwrap();
+
+    let back = principia::prefs::PrefStore::load(&sd).unwrap();
+    for who in ["a", "b"] {
+        for i in 0..N {
+            assert_eq!(back.get("contend", &format!("{who}.k{i}")), Some(PrefValue::Int(i)), "{who}.k{i} lost");
+        }
+    }
+    assert_eq!(back.list("contend").len(), 2 * N as usize);
+    let left: Vec<String> = std::fs::read_dir(&sd)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n != "contend")
+        .collect();
+    assert!(left.is_empty(), "no lock or swap left: {left:?}");
+}

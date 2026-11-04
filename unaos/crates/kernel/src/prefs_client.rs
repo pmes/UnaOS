@@ -235,7 +235,7 @@ fn relay(hdr: &crate::bus::BusHdr, body: &[u8]) -> Option<Answer> {
     let h3 = crate::bus::BusHdr { verb: tag, ..*hdr };
     match crate::bus_route::route_request(ops, KCLIENT_ROW, KCLIENT_GEN, principal(), &h3, body) {
         crate::bus_route::Route::Relayed => {}
-        _ => return None,
+        r => return pendcap_refuse(hdr, tag, r), // QUEUED-SET-PENDCAP (rmbp-ledger B1198): a relayed WRITE refused -EAGAIN at the router while an unanswered queued entry's holder lives is answered -EAGAIN, never written by the kernel fulfiller ahead of that queue (file tail). Named in-place hunk
     }
     let t0 = crate::arch::ms();
     let mut spins = 0u32;
@@ -257,7 +257,7 @@ fn relay(hdr: &crate::bus::BusHdr, body: &[u8]) -> Option<Answer> {
                 if !queued_keep(hdr, body, held) { return Some(queued_full(tag, hdr.corr)); } serial_println!("[prefsbus] relay verb={} corr={} timeout={}ms — {} queued at prefs.elf", tag, hdr.corr, RELAY_WAIT_MS, queued_word(hdr.verb)); // UNSET-QUEUED-WORD (rmbp-ledger B1189): the verb word (file tail). RELAY-QUEUED-SET (B1175): the queued set's body is kept per client corr (full = -EAGAIN, never a silent 0) so a holder that dies with it unread is answered by the kernel fulfiller (file tail). QUEUED-SET-LOSTRESET (B1181): the holder's (row, rgen) from B1165's `held` rides the entry. LINE-NEUTRAL fold, code first.
                 return Some(Answer { status: 0, body: Vec::new() });
             }
-            serial_println!("[prefsbus] relay verb={} corr={} timeout={}ms — kernel fulfiller answers", tag, hdr.corr, RELAY_WAIT_MS);
+            timeoutpend_release(tag, hdr.corr); serial_println!("[prefsbus] relay verb={} corr={} timeout={}ms — kernel fulfiller answers", tag, hdr.corr, RELAY_WAIT_MS); // RELAY-TIMEOUT-PENDPIN (rmbp-ledger B1197): a timed-out GET / LIST takes its kernel-client relay Pend by client corr, so a silent holder never pins the per-caller cap; the late answer meets the no-Pend arm (file tail). LINE-NEUTRAL fold, code first.
             return None;
         }
         core::hint::spin_loop();
@@ -499,7 +499,7 @@ pub fn selftest() {
 // This is the seam, not `settings.rs`: every kernel `sys_set` caller on the render task is covered.
 
 static DEFERRED: crate::sync::Mutex<Vec<(String, PrefValue)>> = crate::sync::Mutex::new(Vec::new());
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", feature = "busreg"))]
 static FLUSHER: AtomicBool = AtomicBool::new(false);
 static DEFER_T0_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
@@ -520,7 +520,7 @@ fn defer_core() -> Option<usize> {
 
 /// Queue `system.<k> = v` for the worker; `Some(v)` back = the caller runs it inline.
 fn defer_set(k: &str, v: PrefValue) -> Option<PrefValue> {
-    let Some(cpu) = defer_core() else { return Some(v) };
+    #[cfg(feature = "busreg")] let Some(cpu) = flush_core() else { return Some(v) }; #[cfg(not(feature = "busreg"))] let Some(cpu) = defer_core() else { return Some(v) }; // PREFS-FLUSH-ONTO-APPLIER (rmbp-ledger B1200): on a busreg image the core pick is `flush_core` (x86 = defer_core, aarch64 = the render task on a worker core; file tail). LINE-NEUTRAL fold
     {
         let mut q = DEFERRED.lock();
         if q.is_empty() {
@@ -531,12 +531,12 @@ fn defer_set(k: &str, v: PrefValue) -> Option<PrefValue> {
             None => q.push((String::from(k), v)),
         }
     }
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", not(feature = "busreg")))]
     if !FLUSHER.swap(true, Ordering::AcqRel) {
         crate::arch::sched::spawn("prefs-flush", prefs_flush, 0, cpu, crate::arch::sched::PRIO_NORMAL);
     }
-    #[cfg(not(target_arch = "x86_64"))]
-    let _ = cpu;
+    #[cfg(any(not(target_arch = "x86_64"), feature = "busreg"))]
+    let _ = cpu; #[cfg(feature = "busreg")] flush_wake(); // PREFS-FLUSH-ONTO-APPLIER (rmbp-ledger B1200): the per-burst `prefs-flush` spawn is retired on a busreg image; the parked `prefs-apply` is woken instead (file tail). LINE-NEUTRAL fold
     None
 }
 
@@ -548,7 +548,7 @@ fn deferred_value(k: &str) -> Option<PrefValue> {
 
 /// `prefs-flush`: run every queued PrefSet (in order, latest value per key), then exit; a set queued while
 /// it was finishing re-arms it.
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", feature = "busreg"))]
 fn prefs_flush(_: usize) {
     loop {
         let (batch, t0) = {
@@ -1104,7 +1104,7 @@ fn queued_keep(hdr: &crate::bus::BusHdr, body: &[u8], held: Option<(usize, u64)>
         }
         q.push_back(Queued { hdr: h, body: b, answered: None, held, gone_ms: None, silent_at_ms });
         true
-    })
+    }) && keeprace_consult(hdr.corr) // QUEUED-SET-EAGER-KEEPRACE (rmbp-ledger B1199): a kept SET whose corr on_exit already marked unread (the holder died before the keep) wakes the applier now (file tail). Named in-place hunk
 }
 
 /// The full ring's honest answer: -EAGAIN (the frame may still land at the holder; it is not tracked).
@@ -1267,7 +1267,7 @@ pub fn queued_selftest() {
         let _ = queued_take(c);
     }
     let (q4, q5) = lostreset_selftest(&next, &body_of, &read, want); // QUEUED-SET-LOSTRESET (B1181): Q4 / Q5, the full-inbox legs (file tail)
-    let (q6, q7) = stucklive_selftest(&next, &body_of, &read, want); let q8 = pendpin_selftest(&next, &body_of, &read, want); /* QUEUED-SET-PENDPIN (B1193): Q8 the silent holder's Pend reclaimed (file tail) */ let q9 = deliverrace_selftest(&next, &body_of, &read, want); /* QUEUED-SET-DELIVER-RACE (rmbp-ledger B1194): Q9, the inbox filled between the room check and the deliver (file tail). Named in-place hunk */ let q10 = eager_selftest(&next, &body_of, want); // QUEUED-SET-STUCKLIVE (B1187): Q6 silent live holder, Q7 refused answer delivered (file tail)
+    let (q6, q7) = stucklive_selftest(&next, &body_of, &read, want); let q8 = pendpin_selftest(&next, &body_of, &read, want); /* QUEUED-SET-PENDPIN (B1193): Q8 the silent holder's Pend reclaimed (file tail) */ let q9 = deliverrace_selftest(&next, &body_of, &read, want); /* QUEUED-SET-DELIVER-RACE (rmbp-ledger B1194): Q9, the inbox filled between the room check and the deliver (file tail). Named in-place hunk */ let q10 = eager_selftest(&next, &body_of, want); let q12 = timeoutpend_selftest(&next); /* RELAY-TIMEOUT-PENDPIN (rmbp-ledger B1197): Q12, a timed-out GET / LIST's Pend reclaimed (file tail). Named in-place hunk */ let q11 = keeprace_selftest(&next, &body_of, want); /* QUEUED-SET-EAGER-KEEPRACE (rmbp-ledger B1199): Q11, the mark landed before the keep (file tail). Named in-place hunk */ let q13 = flush_selftest(&read, want); /* PREFS-FLUSH-ONTO-APPLIER (rmbp-ledger B1200): Q13, a render-task deferral flushed by `prefs-apply` (file tail). Named in-place hunk */ // QUEUED-SET-STUCKLIVE (B1187): Q6 silent live holder, Q7 refused answer delivered (file tail)
     // Restore the operator's value through the same kernel fulfiller (or leave the key unset as it was).
     match orig {
         Some(v) => {
@@ -1280,10 +1280,10 @@ pub fn queued_selftest() {
             let _ = crate::prefs::unset(crate::prefs::NS, key::IDLE_MIN);
         }
     }
-    if q1 && q2 && q3 && q4 && q5 && q6 && q7 && q8 && q9 && q10 {
-        serial_println!(":: RELAY-QUEUED-SET: unread=applied read=released full=eagain lostreset=released/applied stucklive=released refusedreply=redelivered pendpin=reclaimed deliverrace=closed eager=applied -> PASS ::");
+    if q1 && q2 && q3 && q4 && q5 && q6 && q7 && q8 && q9 && q10 && q11 && q12 && q13 { // RELAY-TIMEOUT-PENDPIN (rmbp-ledger B1197): Q12. Named in-place hunk
+        serial_println!(":: RELAY-QUEUED-SET: unread=applied read=released full=eagain lostreset=released/applied stucklive=released refusedreply=redelivered pendpin=reclaimed timeoutpend=reclaimed deliverrace=closed eager=applied keeprace=closed flush=applier -> PASS ::");
     } else {
-        serial_println!(":: RELAY-QUEUED-SET: q1={} q2={} q3={} q4={} q5={} q6={} q7={} q8={} q9={} q10={} (want={} read1={} read2={} kept={}/{} pushed={}/{}) -> FAIL ::", q1 as u8, q2 as u8, q3 as u8, q4 as u8, q5 as u8, q6 as u8, q7 as u8, q8 as u8, q9 as u8, q10 as u8, want, read1.unwrap_or(-1), read2.unwrap_or(-1), kept1 as u8, kept2 as u8, pushed1 as u8, pushed2 as u8);
+        serial_println!(":: RELAY-QUEUED-SET: q1={} q2={} q3={} q4={} q5={} q6={} q7={} q8={} q9={} q10={} q11={} q12={} q13={} (want={} read1={} read2={} kept={}/{} pushed={}/{}) -> FAIL ::", q1 as u8, q2 as u8, q3 as u8, q4 as u8, q5 as u8, q6 as u8, q7 as u8, q8 as u8, q9 as u8, q10 as u8, q11 as u8, q12 as u8, q13 as u8, want, read1.unwrap_or(-1), read2.unwrap_or(-1), kept1 as u8, kept2 as u8, pushed1 as u8, pushed2 as u8);
     }
 }
 
@@ -1613,7 +1613,7 @@ fn pendpin_release(corr: u32) {
 fn pendpin_selftest(next: &dyn Fn() -> u32, body_of: &dyn Fn(i64) -> String, read: &dyn Fn() -> Option<i64>, want: i64) -> bool {
     let ops = crate::arch::syscall::busreg_ops();
     let rg0 = (ops.rgen)(0);
-    let cap = crate::bus_route::PEND_MAX_PER_CALLER;
+    let cap = crate::bus_route::caller_cap(KCLIENT_ROW); // QUEUED-SET-PENDCAP (rmbp-ledger B1198): the kernel client's own cap. Named in-place hunk
     let n0 = crate::bus_route::caller_pending(KCLIENT_ROW, KCLIENT_GEN);
     let b8 = body_of(if want == 7 { 33 } else { 35 });
     let c8 = next();
@@ -1778,11 +1778,11 @@ fn applier_ensure() {
     }
     #[cfg(target_arch = "x86_64")]
     {
-        crate::arch::sched::spawn_stack("prefs-apply", prefs_apply, 0, crate::arch::sched::CPU_AUTO, crate::arch::sched::PRIO_NORMAL, APPLIER_STACK);
+        crate::arch::sched::spawn_stack("prefs-apply", prefs_apply, 0, applier_cpu(), crate::arch::sched::PRIO_NORMAL, APPLIER_STACK); // PREFS-FLUSH-ONTO-APPLIER (B1200): a worker core, never the render core (file tail). Named in-place hunk
     }
     #[cfg(target_arch = "aarch64")]
     {
-        let _ = crate::arch::sched::spawn_stack("prefs-apply", prefs_apply, 0, crate::arch::sched::CPU_AUTO, APPLIER_STACK);
+        let _ = crate::arch::sched::spawn_stack("prefs-apply", prefs_apply, 0, applier_cpu(), APPLIER_STACK); // PREFS-FLUSH-ONTO-APPLIER (B1200): a worker core, never the render core (file tail). Named in-place hunk
     }
 }
 
@@ -1796,7 +1796,7 @@ fn queued_corrs() -> Vec<u32> {
 #[cfg(feature = "busreg")]
 fn prefs_apply(_: usize) {
     locked(|| APPLY_SEM.init()); // masked: a teardown post on this core must never spin on a raw lock this task holds
-    loop {
+    loop { flush_deferred(); // PREFS-FLUSH-ONTO-APPLIER (rmbp-ledger B1200): the render-task deferrals, after the previous wake's ring settle, no drain gate held (file tail). Named in-place hunk
         if !APPLY_SEM.wait() {
             return; // off a scheduled task (never for a spawned task)
         }
@@ -1894,4 +1894,305 @@ fn eager_selftest(next: &dyn Fn() -> u32, body_of: &dyn Fn(i64) -> String, want:
         serial_println!("[prefsbus] eager leg: kept={} by_applier={} gone={} store={} waited={}ms pushed={}", kept10 as u8, by_applier as u8, gone10 as u8, store10.unwrap_or(-1), waited, pushed10 as u8);
     }
     q10
+}
+
+// =================================================================================================
+// RELAY-TIMEOUT-PENDPIN (rmbp-ledger B1197, BP-storage-11) — TAIL-APPENDED. A relayed GET or LIST that hits
+// `RELAY_WAIT_MS` is answered by the kernel fulfiller (`relay`'s read timeout arm returns `None`), but the relay's
+// kernel-client `Pend` stayed in `bus_route`'s table with the silent holder: KCLIENT_GEN never moves, so the dead-caller
+// reclaim never frees it, no ring entry exists for a read (the ring keeps SET / UNSET only), and eight timed-out reads
+// pinned the kernel client to the kernel fulfiller for good (every later relay -EAGAIN at the cap). The read arm now takes
+// that Pend by the client corr through B1193's `bus_route::take_pending_by_corr` (the keyed form of the one taker
+// `take_pending`). The holder's late answer meets `fulfiller_reply`'s no-Pend arm (-ENOENT, nothing delivered), which is
+// honest: the caller was already answered by the kernel fulfiller from the same store PREFS.ELF commits into, so the late
+// value is stale. An answer that lands between the timeout check and the take has already taken its Pend (`false` here)
+// and its frame is dropped as stale by `take_reply`. The write arm (B1175's ring road) is untouched. The serial line is
+// printed with no lock held (`PEND` released by the taker).
+// Wire: `[prefsbus] relay verb=<t> corr=<c> timeout — relay pend reclaimed` before the arm's `kernel fulfiller answers`;
+// `tests bandy3` -> `:: RELAY-QUEUED-SET: ... pendpin=reclaimed timeoutpend=reclaimed ... -> PASS ::` (Q12). Limit: Q12
+// drives this fn on a PLANTED Pend; `relay`'s arm itself is reached only with a registered silent holder, which
+// `queued_selftest` has no fixture for. Owed: RELAY-TAG-TIMEOUT-PENDPIN (`relay_tag`'s -ETIMEDOUT arm leaves its Pend on
+// the same client row).
+// =================================================================================================
+/// `relay`'s read timeout arm: drop the kernel-client relay Pend of client corr `corr` for ring-3 tag `tag`, if still held.
+#[cfg(feature = "busreg")]
+fn timeoutpend_release(tag: u8, corr: u32) {
+    if crate::bus_route::take_pending_by_corr(KCLIENT_ROW, corr) {
+        serial_println!("[prefsbus] relay verb={} corr={} timeout — relay pend reclaimed", tag, corr);
+    }
+}
+
+/// `queued_selftest`'s Q12 (B1197). For R3PREF_GET and R3PREF_LIST: a kernel-client Pend for a fresh client corr, held by
+/// row 0 at its CURRENT generation, is planted (the count rises by one); the read arm's own fn runs; the count is back;
+/// the holder's late answer through the real `fulfiller_reply` is -ENOENT with no inbox frame for that corr. Leftover
+/// Pends and any stray frame are taken back.
+#[cfg(feature = "busreg")]
+fn timeoutpend_selftest(next: &dyn Fn() -> u32) -> bool {
+    let ops = crate::arch::syscall::busreg_ops();
+    let rg0 = (ops.rgen)(0);
+    let mut ok = true;
+    for verb in [una_abi::BUS_VERB_R3PREF_GET, una_abi::BUS_VERB_R3PREF_LIST] {
+        let n0 = crate::bus_route::caller_pending(KCLIENT_ROW, KCLIENT_GEN);
+        let c = next();
+        let relay = crate::bus_route::pendpin_plant(verb, c, 0, rg0);
+        let planted = relay.is_some() && crate::bus_route::caller_pending(KCLIENT_ROW, KCLIENT_GEN) == n0 + 1;
+        timeoutpend_release(verb, c);
+        let freed = crate::bus_route::caller_pending(KCLIENT_ROW, KCLIENT_GEN) == n0;
+        let mut r = alloc::vec![0u8; BUS_HDR_LEN];
+        let rn = crate::bus::build_reply(verb, relay.unwrap_or(0), 0, [0u8; 32], &[], &mut r);
+        let late = match crate::bus::frame_parse(&r[..rn]) {
+            Ok(h) => crate::bus_route::fulfiller_reply(ops, 0, rg0, &h, &r[..rn]) == -2,
+            Err(_) => false,
+        };
+        let stray = locked(|| {
+            let mut q = REPLIES.lock();
+            let before = q.len();
+            q.retain(|f| !matches!(crate::bus::frame_parse(f), Ok(h) if h.corr == c));
+            q.len() != before
+        });
+        let _ = crate::bus_route::take_pending_by_corr(KCLIENT_ROW, c);
+        if !(planted && freed && late && !stray) {
+            serial_println!("[prefsbus] timeoutpend leg: verb={} planted={} freed={} late={} stray={} n0={}", verb, planted as u8, freed as u8, late as u8, stray as u8, n0);
+            ok = false;
+        }
+    }
+    ok
+}
+
+// QUEUED-SET-PENDCAP (rmbp-ledger B1198, BP-storage-11) — TAIL-APPENDED. Inside B1187's 70 s silent window eight queued
+// SETs held `bus_route::PEND_MAX_PER_CALLER`, so the ninth was -EAGAIN at `route_request` and `relay`'s refusal arm fell to
+// the kernel fulfiller, a write ahead of the holder's queue that the holder's later commits overtake. The client's cap is
+// now its own bound ([`KCLIENT_PEND_MAX`] = `Q_CAP`: the one live wait plus the ring; `bus_route::caller_cap`), and the
+// refusal arm runs [`pendcap_refuse`]: a relayed WRITE refused -EAGAIN while an unanswered entry's holder lives (the 17th
+// SET, or the holder's 16-deep mailbox full) is answered -EAGAIN, as `queued_full` answers at the same depth; the ring
+// empty or every holder gone = `None`, the kernel fulfiller answers as before (nothing of ours can overtake it). A refused
+// SET is never kept with no Pend: no holder answer and no unread mark could ever settle it. `QUEUED` is read under its
+// leaf lock inside `locked`; the arch `rgen` is read with it released (as `queued_lost` does); the line prints lock-free.
+// Wire: `[prefsbus] relay verb=<t> corr=<c> refused -EAGAIN at the router — <n> set queued at the live holder, kernel
+// fulfiller does not write ahead`. Witness: `bus_route::pendcap_selftest` (`tests bandy3`).
+// =================================================================================================
+/// The kernel client's relays-in-flight bound in `bus_route` (the ring's depth).
+#[cfg(feature = "busreg")]
+pub const KCLIENT_PEND_MAX: usize = Q_CAP;
+
+/// Unanswered queued entries whose holder still lives (an entry with no recorded holder counts as live).
+#[cfg(feature = "busreg")]
+fn queued_ahead() -> usize {
+    let held: Vec<Option<(usize, u64)>> = locked(|| QUEUED.lock().iter().filter(|e| e.answered.is_none()).map(|e| e.held).collect());
+    let ops = crate::arch::syscall::busreg_ops();
+    held.iter().filter(|h| h.map_or(true, |(r, g)| (ops.rgen)(r) == g)).count()
+}
+
+/// `relay`'s router-refusal arm: `Some(-EAGAIN)` for a relayed write refused -EAGAIN while [`queued_ahead`] is non-zero;
+/// `None` = the kernel fulfiller answers (unchanged road).
+#[cfg(feature = "busreg")]
+fn pendcap_refuse(hdr: &crate::bus::BusHdr, tag: u8, r: crate::bus_route::Route) -> Option<Answer> {
+    if !relayed_write(hdr.verb) || !matches!(r, crate::bus_route::Route::Reply(e) if e == una_abi::EAGAIN) {
+        return None;
+    }
+    let n = queued_ahead();
+    if n == 0 {
+        return None;
+    }
+    serial_println!("[prefsbus] relay verb={} corr={} refused -EAGAIN at the router — {} {} queued at the live holder, kernel fulfiller does not write ahead", tag, hdr.corr, n, queued_word(tag));
+    Some(Answer { status: una_abi::EAGAIN, body: Vec::new() })
+}
+
+/// `bus_route::pendcap_selftest`'s guard leg, holder `(row, rgen)` live: (a SET refused at the router with an entry of
+/// that holder queued is answered -EAGAIN, the same refusal with the entry taken back is `None`). Nothing is written.
+#[cfg(feature = "busreg")]
+pub fn pendcap_guard_leg(row: usize, rgen: u64) -> (bool, bool) {
+    let mut c = NEXT_CORR.fetch_add(1, Ordering::Relaxed);
+    if c == 0 {
+        c = NEXT_CORR.fetch_add(1, Ordering::Relaxed);
+    }
+    let b = alloc::format!("{}.{}\0{}", crate::prefs::NS, crate::prefs::key::IDLE_MIN, PrefValue::Int(7).to_literal());
+    let Some(h) = queued_set_hdr(c, b.as_bytes()) else { return (false, false) };
+    let kept = queued_keep(&h, b.as_bytes(), Some((row, rgen)));
+    let refused = kept && pendcap_refuse(&h, una_abi::BUS_VERB_R3PREF_SET, crate::bus_route::Route::Reply(una_abi::EAGAIN)).is_some_and(|a| a.status == una_abi::EAGAIN);
+    let _ = queued_take(c);
+    let fell = pendcap_refuse(&h, una_abi::BUS_VERB_R3PREF_SET, crate::bus_route::Route::Reply(una_abi::EAGAIN)).is_none();
+    (refused, fell)
+}
+
+// QUEUED-SET-EAGER-KEEPRACE (rmbp-ledger B1199) — TAIL-APPENDED. B1196's applier is woken by the on_exit handoff
+// (`note_set_unread` -> `queued_due`). A holder that dies between `relay`'s last poll and `queued_keep` is marked
+// BEFORE its entry exists: the wake finds the ring empty for that corr, the entry is kept after with no wake, and the
+// SET waited for the next client call. Measured at 0e0a0fd07: the B1169 mark already outlives a missing entry (every
+// clearer takes only its own corr; `queued_settle` visits only kept corrs; the applier's empty pass touches no mark),
+// so nothing changes in the mark. The keep now CONSULTS it, after the push and with `QUEUED` released
+// (`keeprace_consult`, a non-clearing peek through [`set_unread_marked`]), and finding its corr marked posts B1196's
+// one wake (`queued_due`); the drain's `set_unread_take` stays the one clearer and `queued_settle` the one apply path.
+// Order: keep pushes THEN peeks, on_exit marks THEN posts: either the peek sees the mark or on_exit's post follows the
+// entry; a `queued_due` that finds `QUEUED_DUE` already raised precedes the applier's `store(false)`, which precedes its
+// ring read, so the entry is seen. No second mark, no poll. This closes the QUEUED-SET-EAGER-KEEPRACE owed item of the
+// QUEUED-SET-EAGER-ARM block above.
+// Witness: `tests bandy3` -> `[prefsbus] queued set corr=<c> marked unread before keep — applier woken
+// (QUEUED-SET-EAGER-KEEPRACE)` and `:: RELAY-QUEUED-SET: ... eager=applied keeprace=closed -> PASS ::` (Q11).
+// =================================================================================================
+/// Is client corr `corr` marked unread (B1169's mark)? A peek: the mark is NOT cleared (the drain takes it).
+#[cfg(feature = "busreg")]
+fn set_unread_marked(corr: u32) -> bool {
+    corr != 0 && locked(|| SET_UNREAD.lock().0.contains(&corr))
+}
+
+/// `queued_keep`, after the push (`QUEUED` released): a corr already marked unread wakes `prefs-apply`. Always `true`.
+#[cfg(feature = "busreg")]
+fn keeprace_consult(corr: u32) -> bool {
+    if set_unread_marked(corr) {
+        serial_println!("[prefsbus] queued set corr={} marked unread before keep — applier woken (QUEUED-SET-EAGER-KEEPRACE)", corr);
+        queued_due();
+    }
+    true
+}
+
+/// `queued_selftest`'s Q11: on_exit's two steps (`note_set_unread`, then the -ECONNRESET into the inbox) land BEFORE
+/// the keep (the race); the leg lets the applier consume that wake on a ring without the entry, THEN keeps the SET for
+/// a dead holder and makes NO client call: it yields until `prefs-apply` has settled it and reads the STORE.
+#[cfg(feature = "busreg")]
+fn keeprace_selftest(next: &dyn Fn() -> u32, body_of: &dyn Fn(i64) -> String, want: i64) -> bool {
+    let stale = Some((0usize, (crate::arch::syscall::busreg_ops().rgen)(0).wrapping_add(1)));
+    let v11: i64 = if want == 7 { 31 } else { 33 };
+    let b11 = body_of(v11);
+    let c11 = next();
+    let Some(h11) = queued_set_hdr(c11, b11.as_bytes()) else { return false };
+    note_set_unread(c11);
+    let pushed11 = inbox_push(queued_reply(c11, una_abi::ECONNRESET as i32));
+    let yield_until = |done: &dyn Fn() -> bool| {
+        let t = crate::arch::ms();
+        let mut spins = 0u32;
+        while !done() && crate::arch::ms().saturating_sub(t) <= EAGER_WAIT_MS && spins < RELAY_SPIN_MAX.saturating_mul(16) {
+            spins += 1;
+            if crate::arch::irqs_masked() {
+                core::hint::spin_loop();
+            } else {
+                crate::arch::sched::yield_now();
+            }
+        }
+    };
+    yield_until(&|| !QUEUED_DUE.load(Ordering::Acquire));
+    let due_cleared = !QUEUED_DUE.load(Ordering::Acquire);
+    let kept11 = queued_keep(&h11, b11.as_bytes(), stale);
+    let t = crate::arch::ms();
+    if kept11 {
+        yield_until(&|| eager_settled(c11));
+    }
+    let waited = crate::arch::ms().saturating_sub(t);
+    let by_applier = eager_settled(c11);
+    let store11 = crate::prefs::get(crate::prefs::NS, crate::prefs::key::IDLE_MIN).and_then(|v| v.as_int());
+    let gone11 = queued_take(c11).is_none();
+    if !by_applier {
+        // The fixture's leftovers: the mark and the reset frame go with the entry.
+        let _ = set_unread_take(c11);
+        locked(|| REPLIES.lock().retain(|f| !matches!(crate::bus::frame_parse(f), Ok(h) if h.corr == c11)));
+    }
+    let q11 = kept11 && by_applier && gone11 && store11 == Some(v11);
+    if !q11 {
+        serial_println!("[prefsbus] keeprace leg: kept={} by_applier={} gone={} store={} due_cleared={} waited={}ms pushed={}", kept11 as u8, by_applier as u8, gone11 as u8, store11.unwrap_or(-1), due_cleared as u8, waited, pushed11 as u8);
+    }
+    q11
+}
+
+// PREFS-FLUSH-ONTO-APPLIER (rmbp-ledger B1200) — TAIL-APPENDED. INPUTSTALL M5's render-task PrefSet deferral (B375,
+// `defer_set` / `DEFERRED` / `prefs_flush`) spawned a `prefs-flush` task PER BURST and only on x86: aarch64's render
+// task (also named `render`) ran every Settings / Look / Quarry `sys_set` with the store's file I/O inline on the
+// render path. On a busreg image the deferred SETs now ride the parked `prefs-apply` task (B1196): `defer_set` picks
+// the core by [`flush_core`] (x86 = `defer_core`, aarch64 = the render task with a `sched::worker_cpu_apart` core),
+// pushes into B375's own queue unchanged (latest value per key, `sys_get` read-your-writes), and instead of spawning
+// calls [`flush_wake`] (`applier_ensure` + `queued_due`, the one APPLY_SEM edge post). `prefs_apply` runs
+// [`flush_deferred`] at the head of each loop pass, after the previous wake's ring settle with the drain gate dropped:
+// the ONE flush body `prefs_flush` (its cfg widened to busreg), whose every `pref_set` goes through `call`'s head
+// `queued_drain` (the gate taken there, so B1175's order holds: the ring settles before any newer SET). The applier is
+// spawned on [`applier_cpu`] (x86 `smp::worker_cpu(0)`, aarch64 `worker_cpu_apart`), never the render core (B375, R88).
+// Knob-off (no busreg) is unchanged: x86 spawns `prefs-flush` per burst, aarch64 runs inline (PREFS-FLUSH-KNOBOFF owed).
+// Witness: `[prefsbus] queued apply on=prefs-apply deferred=<n> ms=<ms> (PREFS-FLUSH-ONTO-APPLIER)`; `tests bandy3`
+// `:: RELAY-QUEUED-SET: ... flush=applier -> PASS ::` (Q13, `flush_selftest`).
+// =================================================================================================
+/// Q13's one-shot hook: the next `flush_core` defers as if called on the render task.
+#[cfg(feature = "busreg")]
+static FLUSH_FORCE: AtomicBool = AtomicBool::new(false);
+/// Deferred keys `prefs-apply` has flushed (`flush_deferred`).
+#[cfg(feature = "busreg")]
+static FLUSHED_N: AtomicU32 = AtomicU32::new(0);
+
+/// `defer_set`'s core pick on a busreg image: `Some` = queue for `prefs-apply`; `None` = the caller runs it inline.
+#[cfg(feature = "busreg")]
+fn flush_core() -> Option<usize> {
+    if FLUSH_FORCE.swap(false, Ordering::AcqRel) {
+        return Some(applier_cpu());
+    }
+    #[cfg(target_arch = "aarch64")]
+    if matches!(crate::arch::sched::current_name(), Some(n) if n.starts_with("render")) {
+        return crate::arch::sched::worker_cpu_apart();
+    }
+    defer_core()
+}
+
+/// `defer_set` (busreg): wake the parked applier (spawned at the first deferral) instead of spawning `prefs-flush`.
+#[cfg(feature = "busreg")]
+fn flush_wake() {
+    applier_ensure();
+    queued_due();
+}
+
+/// The core `prefs-apply` runs on: a worker core off the render task's, else the scheduler's pick.
+#[cfg(feature = "busreg")]
+fn applier_cpu() -> usize {
+    #[cfg(target_arch = "x86_64")]
+    {
+        crate::arch::smp::worker_cpu(0).unwrap_or(crate::arch::sched::CPU_AUTO)
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        crate::arch::sched::worker_cpu_apart().unwrap_or(crate::arch::sched::CPU_AUTO)
+    }
+}
+
+/// `prefs_apply`'s loop head: run every deferred PrefSet through the one flush body (no drain gate held).
+#[cfg(feature = "busreg")]
+fn flush_deferred() {
+    let n = DEFERRED.lock().len();
+    if n == 0 {
+        return;
+    }
+    let t0 = crate::arch::ms();
+    prefs_flush(0);
+    FLUSHED_N.fetch_add(n as u32, Ordering::AcqRel);
+    serial_println!("[prefsbus] queued apply on=prefs-apply deferred={} ms={} (PREFS-FLUSH-ONTO-APPLIER)", n, crate::arch::ms().saturating_sub(t0));
+}
+
+/// `queued_selftest`'s Q13: a `sys_set` deferred through the one-shot hook (as from the render task) returns at once
+/// with the key queued; the leg yields until `prefs-apply` has flushed it (no `prefs-flush` task exists on a busreg
+/// image) and reads it back through the client.
+#[cfg(feature = "busreg")]
+fn flush_selftest(read: &dyn Fn() -> Option<i64>, want: i64) -> bool {
+    let k = crate::prefs::key::IDLE_MIN;
+    let v13: i64 = if want == 7 { 21 } else { 23 };
+    let before = FLUSHED_N.load(Ordering::Acquire);
+    FLUSH_FORCE.store(true, Ordering::Release);
+    sys_set(k, PrefValue::Int(v13));
+    FLUSH_FORCE.store(false, Ordering::Release);
+    let t = crate::arch::ms();
+    let mut spins = 0u32;
+    let pending = || DEFERRED.lock().iter().any(|(key, _)| key == k);
+    while (pending() || FLUSHED_N.load(Ordering::Acquire) == before) && crate::arch::ms().saturating_sub(t) <= EAGER_WAIT_MS && spins < RELAY_SPIN_MAX.saturating_mul(16) {
+        spins += 1;
+        if crate::arch::irqs_masked() {
+            core::hint::spin_loop();
+        } else {
+            crate::arch::sched::yield_now();
+        }
+    }
+    let waited = crate::arch::ms().saturating_sub(t);
+    let flushed = FLUSHED_N.load(Ordering::Acquire) != before && !pending();
+    if !flushed {
+        // The fixture's leftover: never let it land after queued_selftest's restore.
+        DEFERRED.lock().retain(|(key, _)| key != k);
+    }
+    let got = read();
+    let q13 = flushed && got == Some(v13);
+    if !q13 {
+        serial_println!("[prefsbus] flush leg: flushed={} read={} waited={}ms", flushed as u8, got.unwrap_or(-1), waited);
+    }
+    q13
 }
