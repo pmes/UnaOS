@@ -13,6 +13,7 @@
 //! vug-view <file.stl|obj|ply> [--preset una|solidworks|fusion|blender|onshape]    # the window (macOS)
 //! vug-view <file> --size 320x240 --keys "17h" --out shot.png                      # headless witness
 //! vug-view scan.ply --against part.vugdoc --out map.png                              # the deviation map (SR525)
+//! vug-view flat.png --side side.png --keys "{Return}" --out part.png              # the side photo's thickness (SR547)
 //! ```
 //! Key script: one character per shortcut; `{Name}` for a named key.
 
@@ -27,13 +28,14 @@ struct Cli {
     keys: Option<String>,
     out: Option<String>,
     against: Option<String>, // VUGFACEDEVIATION (SR525): the design document a scan is measured against
+    side: Option<String>, // VUGFACEPHOTOSIDE (SR547): a photo of the part on its side (the thickness proposal)
 }
 
-const USAGE: &str = "usage: vug-view <file.stl|obj|ply|png|jpg> [--preset una|solidworks|fusion|blender|onshape] [--size WxH] [--keys SCRIPT] [--out shot.png] [--against design.vugdoc]";
+const USAGE: &str = "usage: vug-view <file.stl|obj|ply|png|jpg> [--preset una|solidworks|fusion|blender|onshape] [--size WxH] [--keys SCRIPT] [--out shot.png] [--against design.vugdoc] [--side side.png]";
 
 fn cli() -> Cli {
     let mut a = std::env::args().skip(1);
-    let mut c = Cli { path: String::new(), size: (800, 600), preset: Preset::Una, keys: None, out: None, against: None };
+    let mut c = Cli { path: String::new(), size: (800, 600), preset: Preset::Una, keys: None, out: None, against: None, side: None };
     while let Some(arg) = a.next() {
         match arg.as_str() {
             "--size" => {
@@ -51,6 +53,7 @@ fn cli() -> Cli {
             "--keys" => c.keys = a.next(),
             "--out" => c.out = a.next(),
             "--against" => c.against = a.next(), // VUGFACEDEVIATION (SR525)
+            "--side" => c.side = a.next(), // VUGFACEPHOTOSIDE (SR547)
             "--help" | "-h" => {
                 eprintln!("{USAGE}");
                 for (k, what) in vug_view::SHORTCUTS {
@@ -93,6 +96,12 @@ fn main() {
             std::process::exit(1);
         }
     };
+    // VUGFACEPHOTOSIDE (SR547): `--side <path>` measures the side photo against the opened one; a refusal is named.
+    if let Some(p) = &cli.side {
+        if let Err(e) = vug_view::photo::side_path(&mut viewer.view, p) {
+            eprintln!("vug-view: {e}");
+        }
+    }
     #[allow(unused_variables)] // the window's title (macOS only); the headless witness prints `viewer.title`
     let title = viewer.title.clone();
 

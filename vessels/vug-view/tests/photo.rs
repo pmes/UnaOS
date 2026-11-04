@@ -191,6 +191,7 @@ fn rectangle() -> Viewer {
         request: 0,
         asked: None,
         ignored: 0,
+        first: None, // VUGFACEPHOTOSIDE (SR547)
     });
     vw
 }
@@ -422,4 +423,49 @@ fn a_refusal_after_two_withdraws_both() {
     ask(&mut vw);
     assert!(ph(&vw).offers.is_empty(), "the stale preview went with its request");
     assert_eq!(ph(&vw).asked, Some(4));
+}
+
+// ---- VUGFACEPHOTOSIDE (SR547): the side photo's thickness as one extrude proposal ----
+
+/// The fixture part (50 x 30 x 6): the flat photo, then the side photo proposes the extrude of the measured sketch by
+/// 6.0 within 0.1 through the one verify road; Enter enters it by the journal's pull road and the journal records it.
+#[test]
+fn a_side_photo_proposes_the_extrude_and_the_journal_records_it() {
+    use photo_core::fixture::{PART_T, PART_W, Spec, side_png};
+    let mut vw = opened();
+    photo::side(&mut vw.view, &side_png(&Spec::side(), PART_W, PART_T), "side.png").expect("the side photo measures");
+    let p = ph(&vw);
+    assert_eq!(p.offers.len(), 1, "one proposal");
+    let o = &p.offers[0];
+    assert!(o.proposal.stmt.starts_with("extrude x0 sketch=s "), "{}", o.proposal.stmt);
+    assert!(o.proposal.why.contains("side.png"), "{}", o.proposal.why);
+    assert!(matches!(o.verdict, Verdict::Accept { .. }), "{:?}", o.verdict);
+    let note = p.note.as_deref().unwrap_or("");
+    assert!(note.contains("thickness=") && note.contains("sigma=") && note.contains("paired="), "{note}");
+    assert_eq!(p.focus, Some(0));
+    assert!(key(&mut vw, "Return"));
+    assert_eq!(ph(&vw).offers[0].state, State::Applied, "{:?}", ph(&vw).note);
+    assert!(vw.view.design.face.is_none(), "the sketch closed with its extrude");
+    assert!(vw.view.design.body.is_some(), "a body");
+    let length = vw
+        .view
+        .design
+        .journal
+        .doc
+        .stmts
+        .iter()
+        .find_map(|s| if let doc_core::Stmt::Extrude { length, .. } = s { Some(*length) } else { None })
+        .expect("the journal records the extrude");
+    assert!((length - PART_T).abs() < 0.1, "length {length} vs {PART_T}");
+}
+
+/// A side photo with no flat measurement held (a hand-built photo face) refuses by name and offers nothing.
+#[test]
+fn a_side_photo_with_no_first_photo_refuses_by_name() {
+    use photo_core::fixture::{PART_T, PART_W, Spec, side_png};
+    let mut vw = rectangle();
+    let e = photo::side(&mut vw.view, &side_png(&Spec::side(), PART_W, PART_T), "side.png").expect_err("no first photo");
+    assert!(e.contains("NoFirstPhoto"), "{e}");
+    assert!(ph(&vw).offers.is_empty());
+    assert!(ph(&vw).note.as_deref().unwrap_or("").starts_with("refused side NoFirstPhoto"), "{:?}", ph(&vw).note);
 }
