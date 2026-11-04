@@ -75,15 +75,19 @@ pub struct Viewer {
     claimed: bool,
     name: String,
     /// VUGDOCPHOTOREF (SR652): the photo whose measurement frames the document (its file, resolved, and its pitch, mm):
-    /// set when a photo opens by its path and from a .vug's `photo` statement; SR649's carry leaves it (the crop's frame
-    /// is the original's). `s` writes it as the document's `photo` line, relative to the .vug's folder.
+    /// set when a photo opens by its path and from a .vug's `photo` statement; SR649's carry names the crop on it, its frame
+    /// on `photo_frame` (VUGDOCPHOTOREFCROP SR660). `s` writes it as the document's `photo` line, relative to the .vug's folder.
     pub photo_doc: Option<(std::path::PathBuf, f64)>,
+    /// VUGDOCPHOTOREFCROP (SR660): the frame the document is drawn in when it is not the named photo's own measurement
+    /// (paper mm -> pixel of `photo_doc`'s file): set by SR649's carry (the crop named, its slid H) and from a .vug's
+    /// `photo ... h=[..]`; `s` writes it as the statement's `h`, a re-open lays the photo on it ([`photo::framed`]).
+    pub photo_frame: Option<[[f64; 3]; 3]>,
 }
 
 impl Viewer {
     pub fn new(model: Model, title: &str, size: (u32, u32), preset: Preset) -> Viewer {
         let view = View::new(&model, size, preset);
-        Viewer { model, view, title: title.to_string(), save_to: None, claimed: false, name: title.to_string(), photo_doc: None } // VUGDOCPHOTOREF (SR652): photo_doc
+        Viewer { model, view, title: title.to_string(), save_to: None, claimed: false, name: title.to_string(), photo_doc: None, photo_frame: None } // VUGDOCPHOTOREF (SR652): photo_doc; VUGDOCPHOTOREFCROP (SR660): photo_frame
     }
 
     /// VUGFACEPHOTO (SR506): THE open road — a .png / .jpg / .jpeg (else any file pixel_core recognises that is not a
@@ -233,12 +237,12 @@ impl Viewer {
         let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
         let lib = doc_host::DirLib::beside(std::path::Path::new(path)); // VUGMAKEMACHINELIBFACE (SR548): `lib=<name>` beside the part
         let doc = doc_core::read_with(&text, &lib).map_err(|r| format!("{path}: line {}: {:?}", r.line, r.what))?;
-        let (doc, photo_doc) = take_photo(doc, path); // VUGDOCPHOTOREF (SR652): the photo line kept on the Viewer, never in the journal
+        let (doc, photo_doc, photo_frame) = take_photo(doc, path); // VUGDOCPHOTOREF (SR652); VUGDOCPHOTOREFCROP (SR660): and its frame: the photo line kept on the Viewer, never in the journal
         let mut v = Viewer::open_doc(doc, title, size, preset).map_err(|e| format!("{path}: {e}"))?;
         v.view.design.journal.shelf = shelf(&lib); // VUGFACEJOURNALFAULTFIXMANY (SR584): the machines beside the part, for a NoMachine fix
         v.save_to = Some(std::path::PathBuf::from(path));
         v.claimed = true;
-        v.photo_doc = photo_doc; // VUGDOCPHOTOREF (SR652)
+        v.photo_doc = photo_doc; v.photo_frame = photo_frame; // VUGDOCPHOTOREF (SR652); VUGDOCPHOTOREFCROP (SR660)
         Ok(v)
     }
 
@@ -448,7 +452,7 @@ impl Viewer {
         let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
         let image = pixel_core::decode(&bytes).map_err(|e| format!("{}: image {e:?}", path.display()))?;
         let ph = self.view.photo.as_mut().ok_or("no photo is open")?;
-        photo::slid(ph, image, at, path.to_path_buf());
+        photo::slid(ph, image, at, path.to_path_buf()); let h = ph.h; self.refer_crop(path, h); // VUGDOCPHOTOREFCROP (SR660): the document names the crop in its slid frame
         self.name = path.file_name().and_then(|s| s.to_str()).unwrap_or("vug").to_string();
         self.retitle();
         Ok(())
@@ -506,14 +510,15 @@ impl Help {
 // the corner; the reference is kept, so a save still writes it.
 
 /// The document's first `photo` statement taken out (with its line), its path resolved against the .vug's folder.
-fn take_photo(mut doc: doc_core::Doc, vug: &str) -> (doc_core::Doc, Option<(std::path::PathBuf, f64)>) {
-    let Some(i) = doc.stmts.iter().position(|s| matches!(s, doc_core::Stmt::Photo { .. })) else { return (doc, None) };
-    let doc_core::Stmt::Photo { path, pitch_mm } = doc.stmts.remove(i) else { return (doc, None) };
+/// VUGDOCPHOTOREFCROP (SR660): and its frame (`h`, row-major), when the statement carries one.
+fn take_photo(mut doc: doc_core::Doc, vug: &str) -> (doc_core::Doc, Option<(std::path::PathBuf, f64)>, Option<[[f64; 3]; 3]>) {
+    let Some(i) = doc.stmts.iter().position(|s| matches!(s, doc_core::Stmt::Photo { .. })) else { return (doc, None, None) };
+    let doc_core::Stmt::Photo { path, pitch_mm, h } = doc.stmts.remove(i) else { return (doc, None, None) };
     if i < doc.lines.len() {
         doc.lines.remove(i);
     }
     let dir = std::path::Path::new(vug).parent().unwrap_or(std::path::Path::new(""));
-    (doc, Some((dir.join(path), pitch_mm)))
+    (doc, Some((dir.join(path), pitch_mm)), h.map(|h| [[h[0], h[1], h[2]], [h[3], h[4], h[5]], [h[6], h[7], h[8]]]))
 }
 
 /// `to` relative to the folder `dir` (`..` up from their common prefix, both made absolute first, symlinks unresolved):
@@ -548,7 +553,8 @@ impl Viewer {
         }
         let rel = relative(photo, path.parent().unwrap_or(std::path::Path::new(""))).to_string_lossy().into_owned();
         let mut stmts = Vec::with_capacity(doc.stmts.len() + 1);
-        stmts.push(doc_core::Stmt::Photo { path: rel, pitch_mm: *pitch_mm });
+        let h = self.photo_frame.map(|h| [h[0][0], h[0][1], h[0][2], h[1][0], h[1][1], h[1][2], h[2][0], h[2][1], h[2][2]]); // VUGDOCPHOTOREFCROP (SR660): the frame, row-major, when the document is drawn in one
+        stmts.push(doc_core::Stmt::Photo { path: rel, pitch_mm: *pitch_mm, h });
         stmts.extend(doc.stmts.iter().cloned());
         doc_core::write(&doc_core::Doc { tol: doc.tol, stmts, lines: Vec::new() })
     }
@@ -557,6 +563,8 @@ impl Viewer {
     /// missing <path>`; unmeasured, itself with `photo: refused <path>: <why>`; else THE photo road on its bytes and pitch
     /// under the camera's `prefs`, the document's design (journal, face, body) swapped in, `save_to` / `claimed` / the
     /// name / `photo_doc` carried, the crop road on the photo's file. Never a refusal of the document.
+    /// VUGDOCPHOTOREFCROP (SR660): a stated frame (`photo_frame`) lays the measured photo on it ([`photo::framed`]: the
+    /// outline and loops moved onto the document's paper frame through the pixels, H the stated one), carried along.
     fn under_photo(mut self, prefs: photo::PhotoPrefs) -> Viewer {
         let Some((path, pitch_mm)) = self.photo_doc.clone() else { return self };
         let bytes = match std::fs::read(&path) {
@@ -567,13 +575,13 @@ impl Viewer {
             }
         };
         let (size, preset) = (self.view.size, self.view.preset);
-        match Viewer::open_photo_with(&bytes, &self.name, size, preset, pitch_mm, prefs) {
+        match Viewer::open_photo_with(&bytes, &self.name, size, preset, pitch_mm, prefs).and_then(|n| n.framed_by(self.photo_frame, pitch_mm)) { // VUGDOCPHOTOREFCROP (SR660): onto the stated frame
             Ok(mut next) => {
                 std::mem::swap(&mut next.view.design, &mut self.view.design);
                 next.save_to = self.save_to.take();
                 next.claimed = self.claimed;
                 next.name = std::mem::take(&mut self.name);
-                next.photo_doc = self.photo_doc.take();
+                next.photo_doc = self.photo_doc.take(); next.photo_frame = self.photo_frame; // VUGDOCPHOTOREFCROP (SR660)
                 if let Some(ph) = next.view.photo.as_mut() {
                     ph.crop.source = Some(path);
                 }
@@ -587,3 +595,32 @@ impl Viewer {
         }
     }
 }
+
+// ---- VUGDOCPHOTOREFCROP (LEDGER SR660): the document names the cropped photo with the frame it is drawn in (named tail block) ----
+// After SR649's carry the document's frame is H' = T(-x, -y) · H on the crop's pixels. The crop alone cannot give it back:
+// its `vug:crop` meta holds the offset into the original (H' needs the original's H too) and a re-measure numbers each
+// lattice family from the first line in ITS image (photo_core grid.rs `index_family`), a whole-pitch shift or a flip
+// that moves the sketch. So the carry names the crop on `photo_doc` and keeps H' on `photo_frame`; `s` writes both
+// (`photo path="<crop>" pitch=<mm> h=[..]`), and a re-open measures the named file through THE photo road and lays it
+// on the stated frame (`framed_by`). A document whose photo was never carried writes no `h` (SR652's bytes).
+
+impl Viewer {
+    /// The carry's reference: a document naming a photo now names the crop at `path`, drawn in `h` (its slid frame).
+    /// Nothing for a face with no reference.
+    fn refer_crop(&mut self, path: &std::path::Path, h: [[f64; 3]; 3]) {
+        let Some((p, _)) = self.photo_doc.as_mut() else { return };
+        *p = path.to_path_buf();
+        self.photo_frame = Some(h);
+    }
+
+    /// The measured photo laid on the stated frame `h` (none: itself): [`photo::framed`] moves its measurement onto the
+    /// document's paper frame and gives the sheet, the camera re-homed on it; a frame that does not hold names why.
+    fn framed_by(mut self, h: Option<[[f64; 3]; 3]>, pitch_mm: f64) -> Result<Viewer, String> {
+        let Some(h) = h else { return Ok(self) };
+        let ph = self.view.photo.as_mut().ok_or("no photo")?;
+        self.model = photo::framed(ph, h, pitch_mm)?;
+        self.view.top(&self.model);
+        Ok(self)
+    }
+}
+

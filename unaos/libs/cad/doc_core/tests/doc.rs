@@ -784,14 +784,14 @@ fn a_photo_statement_round_trips_on_any_line_and_stands_alone() {
     let head = write(&Doc::new(Tol::DEFAULT));
     let text = format!("{head}photo path=\"../shots/part one.png\" pitch=5\n");
     let d = read(&text).unwrap_or_else(|r| panic!("photo: {r:?}"));
-    assert_eq!(d.stmts, vec![Stmt::Photo { path: "../shots/part one.png".into(), pitch_mm: 5.0 }]);
+    assert_eq!(d.stmts, vec![Stmt::Photo { path: "../shots/part one.png".into(), pitch_mm: 5.0, h: None }]);
     assert_eq!(write(&d), text, "byte for byte");
     assert_eq!(d.stmts[0].id(), None, "id-less");
     assert!(d.stmts[0].refs().is_empty(), "references nothing");
 
     let late = format!("{DOC_A}photo path=\"fixture.png\" pitch=2.5\n");
     let dl = read(&late).unwrap_or_else(|r| panic!("a photo after the sketch lines: {r:?}"));
-    assert_eq!(dl.stmts.last(), Some(&Stmt::Photo { path: "fixture.png".into(), pitch_mm: 2.5 }));
+    assert_eq!(dl.stmts.last(), Some(&Stmt::Photo { path: "fixture.png".into(), pitch_mm: 2.5, h: None }));
     assert_eq!(read(&write(&dl)).expect("re-reads"), dl);
 
     let n = text.lines().count() as u32;
@@ -808,4 +808,40 @@ fn a_photo_statement_round_trips_on_any_line_and_stands_alone() {
     assert_eq!(df.entries.len(), 1, "{df:?}");
     assert!(matches!(&df.entries[0], doc_core::Entry::Changed { id, verb, .. } if id == "photo" && verb == "photo"), "{df:?}");
     eprintln!("doc: photo-ref text={:?} late-line={} second=SecondPhoto diff={}", write(&d).lines().nth(1).unwrap_or(""), dl.line(dl.stmts.len() - 1), df.text().trim_end());
+}
+
+// ---- VUGDOCPHOTOREFCROP (LEDGER SR660): the photo statement carries the frame the document was drawn in (named tail block) ----
+
+/// VUGDOCPHOTOREFCROP (SR660): `photo path="<crop>" pitch=<mm> h=[9 numbers]` reads the frame bit for bit (row-major,
+/// the shortest round-trip digits `f64_text` writes) and writes back byte for byte, `h` after `pitch`; absent it is
+/// None and the SR652 line is unchanged; eight numbers are a bad value of `h`, a non-finite one is refused by name, and
+/// a key other than `h` is still unknown; `diff` sees a frame change as one Changed `photo` entry.
+#[test]
+fn a_photo_statement_carries_its_frame_and_round_trips() {
+    let head = write(&Doc::new(Tol::DEFAULT));
+    let h = [0.1 + 0.2, -12.5, 640.25, 1e-7, 13.000000000000002, -3.75e17, 2.5e-6, -1e-5, 1.0];
+    let words: Vec<String> = h.iter().map(|x| f64_text(*x)).collect();
+    let text = format!("{head}photo path=\"fixture.crop.png\" pitch=5 h=[{}]\n", words.join(" "));
+    let d = read(&text).unwrap_or_else(|r| panic!("photo with a frame: {r:?}"));
+    assert_eq!(d.stmts, vec![Stmt::Photo { path: "fixture.crop.png".into(), pitch_mm: 5.0, h: Some(h) }]);
+    let Stmt::Photo { h: Some(back), .. } = &d.stmts[0] else { panic!("the frame reads") };
+    assert!(back.iter().zip(&h).all(|(a, b)| a.to_bits() == b.to_bits()), "bit for bit: {back:?}");
+    assert_eq!(write(&d), text, "byte for byte, h after pitch");
+
+    let bare = format!("{head}photo path=\"fixture.png\" pitch=5\n");
+    let db = read(&bare).expect("no frame");
+    assert_eq!(db.stmts, vec![Stmt::Photo { path: "fixture.png".into(), pitch_mm: 5.0, h: None }]);
+    assert_eq!(write(&db), bare, "absent: the SR652 line, unchanged");
+
+    let eight = format!("{head}photo path=\"a.png\" pitch=5 h=[1 0 0 0 1 0 0 0]\n");
+    assert!(matches!(read(&eight), Err(r) if r.what == What::BadValue { key: "h".into() }), "nine numbers or none");
+    let nan = format!("{head}photo path=\"a.png\" pitch=5 h=[1 0 0 0 1 0 0 nan 1]\n");
+    assert!(matches!(read(&nan), Err(r) if r.what == What::NonFinite), "a finite frame");
+    let other = format!("{head}photo path=\"a.png\" pitch=5 frame=[1 0 0 0 1 0 0 0 1]\n");
+    assert!(matches!(read(&other), Err(r) if r.what == What::UnknownKey("frame".into())), "one key, `h`");
+
+    let df = doc_core::diff(&db, &read(&format!("{head}photo path=\"fixture.png\" pitch=5 h=[1 0 0 0 1 0 0 0 1]\n")).expect("framed"));
+    assert_eq!(df.entries.len(), 1, "{df:?}");
+    assert!(matches!(&df.entries[0], doc_core::Entry::Changed { id, verb, .. } if id == "photo" && verb == "photo"), "{df:?}");
+    eprintln!("doc: photo-ref-crop text={:?} bits-equal=true eight=BadValue(h) nan=NonFinite", write(&d).lines().nth(1).unwrap_or(""));
 }

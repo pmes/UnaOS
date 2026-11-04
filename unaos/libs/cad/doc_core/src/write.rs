@@ -326,10 +326,13 @@ fn stmt(w: &mut W, s: &Stmt) {
             w.f("confidence", *confidence);
         }
         // VUGDOCPHOTOREF (SR652): the photo under the document, id-less like `stock`.
-        Stmt::Photo { path, pitch_mm } => {
+        Stmt::Photo { path, pitch_mm, h } => {
             w.out.push_str("photo");
             w.s("path", path);
             w.f("pitch", *pitch_mm);
+            if let Some(h) = h {
+                w.arr("h", h); // VUGDOCPHOTOREFCROP (SR660): the frame, only when the document carries one
+            }
         }
     }
 }
