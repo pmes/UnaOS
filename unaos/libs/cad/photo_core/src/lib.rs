@@ -604,7 +604,7 @@ pub const CROP_KEY: &str = "vug:crop";
 /// The principal point the photo's own [`CROP_KEY`] pair states (the first one), `(W / 2 - x, H / 2 - y)`, else None
 /// (absent, or not four integers with W and H above 0).
 pub fn crop_principal(img: &Image) -> Option<Vec2> {
-    let (_, v) = img.text.iter().find(|(k, _)| k == CROP_KEY)?;
+    let v = img.text.iter().find_map(|(k, v)| crop_value(k, v))?; // VUGPHOTOCROPMETAXMP (SR631): the CROP_KEY pair, or the one inside an XMP packet, first in file order
     let mut n = v.split(',').map(|t| t.trim().parse::<u32>().ok());
     let (x, y, w, h) = (n.next()??, n.next()??, n.next()??, n.next()??);
     if n.next().is_some() || w == 0 || h == 0 {
@@ -617,4 +617,41 @@ pub fn crop_principal(img: &Image) -> Option<Vec2> {
 /// person's pref), else the photo's centre.
 fn principal_of(img: &Image, params: &PhotoParams) -> Vec2 {
     crop_principal(img).or(params.principal_px).unwrap_or(Vec2::new(img.width as f64 * 0.5, img.height as f64 * 0.5))
+}
+
+// ---- VUGPHOTOCROPMETAXMP (SR631): the crop meta inside an XMP packet (named tail block) ----
+
+/// VUGPHOTOCROPMETAXMP (SR631): one `Image.text` pair's crop value: a [`CROP_KEY`] pair's value, or the [`CROP_KEY`]
+/// property of an XMP packet (pixel_core's [`pixel_core::png::XMP_KEY`] pair: a PNG iTXt, a JPEG APP1 or a WebP `XMP `
+/// chunk), else None.
+fn crop_value(k: &str, v: &str) -> Option<alloc::string::String> {
+    if k == CROP_KEY {
+        return Some(alloc::string::String::from(v));
+    }
+    if k != pixel_core::png::XMP_KEY {
+        return None;
+    }
+    xmp_crop(v)
+}
+
+/// VUGPHOTOCROPMETAXMP (SR631): the [`CROP_KEY`] property of an XMP packet, read through svg_core's one XML reader
+/// (the qualified parse: XMP keys a property by its prefixed name): `vug:crop="…"` on an `rdf:Description`, or a
+/// `<vug:crop>…</vug:crop>` child of one (its text, trimmed) — both forms, since the house writes no XMP. The first in
+/// document order wins; None when the packet carries none or is not well-formed XML.
+pub fn xmp_crop(packet: &str) -> Option<alloc::string::String> {
+    use svg_core::xml::{Document, Kind, Ns};
+    let doc = Document::parse_qualified(packet.as_bytes()).ok()?;
+    for (i, n) in doc.nodes.iter().enumerate() {
+        if !matches!(&n.kind, Kind::Element { ns: Ns::Other, name } if name == "Description") {
+            continue;
+        }
+        if let Some(a) = n.attrs.iter().find(|a| a.ns == Ns::Other && a.name == CROP_KEY) {
+            return Some(a.value.clone());
+        }
+        if let Some(c) = doc.elements(i).find(|&c| doc.nodes[c].qname() == Some(CROP_KEY)) {
+            let t: alloc::string::String = doc.nodes[c].children.iter().filter_map(|&t| doc.nodes[t].text()).collect();
+            return Some(alloc::string::String::from(t.trim()));
+        }
+    }
+    None
 }

@@ -811,3 +811,35 @@ fn itxt_chunk(text: &mut Vec<(String, String)>, data: &[u8]) {
     let Ok(v) = String::from_utf8(raw) else { return };
     text.push((data[..nul].iter().map(|&c| c as char).collect::<String>(), v));
 }
+
+// ---- VUGPHOTOCROPMETAXMP (SR631): the XMP packet of a JPEG APP1 / WebP `XMP ` chunk (named tail block) ----
+
+/// VUGPHOTOCROPMETAXMP (SR631): the key an XMP packet carries in `Image.text` — PNG's own iTXt keyword for XMP (XMP
+/// Part 3 §1.1.4), which [`itxt_chunk`] already surfaces; a JPEG APP1 or WebP `XMP ` packet takes the same key, so one
+/// reader (photo_core's) serves the three formats.
+pub const XMP_KEY: &str = "XML:com.adobe.xmp";
+
+/// VUGPHOTOCROPMETAXMP (SR631): the JPEG APP1 XMP signature (XMP Part 3 §1.1.3): the namespace URI and a NUL, then the
+/// packet. An Exif APP1 or an extended-XMP APP1 (`http://ns.adobe.com/xmp/extension/`) does not carry it.
+const XMP_APP1: &[u8] = b"http://ns.adobe.com/xap/1.0/\0";
+
+/// VUGPHOTOCROPMETAXMP (SR631): an XMP packet appended to `text` as ([`XMP_KEY`], the packet's UTF-8) under the one
+/// budget ([`text_room`]). `app1`: `data` is a JPEG APP1 segment, read only when it opens with [`XMP_APP1`]; else
+/// `data` is the packet itself (WebP's `XMP ` chunk). Dropped, as any ancillary chunk error, when not UTF-8 or past
+/// the budget.
+pub(crate) fn xmp_packet(text: &mut Vec<(String, String)>, data: &[u8], app1: bool) {
+    let packet = if app1 {
+        match data.strip_prefix(XMP_APP1) {
+            Some(p) => p,
+            None => return,
+        }
+    } else {
+        data
+    };
+    let Some(room) = text_room(text) else { return };
+    if XMP_KEY.len() + packet.len() > room {
+        return;
+    }
+    let Ok(s) = core::str::from_utf8(packet) else { return };
+    text.push((String::from(XMP_KEY), String::from(s)));
+}
