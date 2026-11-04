@@ -44,6 +44,7 @@ pub const DEFAULT_BUDGET: usize = 65_536;
 /// confidence (BP-vug-5): uniform weight 1 per frame that observed it, capped at [`W_MAX`]; 0 = never observed. With the
 /// depth-edge guard on ([`Tsdf::with_edge_mm`]), a frame whose pixel at the voxel is a depth edge does not observe it;
 /// with the far-side guard ([`Tsdf::with_edge_far_mm`]), only a voxel on the other surface's side of the edge.
+/// VUGSCANTSDFCONFIDENCE (SR586): a spread accumulator (the votes' sum of squares) MEASURED and refused: +50% voxel memory, the post's worst-20 over its p90 ceiling at the 10% base rate, and the ceiling worsened the post at both noise levels.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Voxel {
     pub sdf: f32,

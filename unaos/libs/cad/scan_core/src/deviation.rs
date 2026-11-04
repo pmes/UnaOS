@@ -437,3 +437,24 @@ pub fn colour(s: Shade) -> u32 {
         Shade::Off => palette_core::TEXT_SECONDARY.1,
     }
 }
+
+// ---- VUGSCANTSDFCONFIDENCE (LEDGER SR586): the confidence floor, a READ rule on the mesh's per-vertex confidence ----
+// The scan's per-vertex confidence is the fused observation weight (`ScanMesh::confidence`, BP-vug-5). `floored`
+// unpairs every vertex under a floor, so every reader of the Deviation inherits it with no signature change: gdt's
+// form sets (`gdt`, `frame_of`, `in_frame`) skip it and `shade` reads it Off. MEASURED by tests/gdt.rs
+// `tsdf_outliers_probe` (`conf floor_w`): at the post form set's 10th percentile (weight 4.00) the post's
+// cylindricity read 3.542 -> 3.378 mm at D435i noise but 3.214 -> 3.259 noise-free, the top unchanged, so no caller
+// applies it by default (0.0, OFF). Not a volume knob: `tsdf::Knobs` is the integrate's. The second accumulator (the
+// votes' spread) was measured and refused (tsdf.rs `Voxel`).
+
+/// `dev` with every paired vertex whose `scan.confidence` is under `conf_floor` unpaired (`per_vertex` and
+/// `face_of_vertex` None); `stats` and `faces` stay as measured. A floor of 0.0 (or below) changes nothing.
+pub fn floored(dev: &Deviation, scan: &ScanMesh, conf_floor: f32) -> Deviation {
+    let mut out = dev.clone();
+    for (i, (pv, fv)) in out.per_vertex.iter_mut().zip(out.face_of_vertex.iter_mut()).enumerate() {
+        if pv.is_some() && scan.confidence.get(i).is_some_and(|w| *w < conf_floor) {
+            (*pv, *fv) = (None, None);
+        }
+    }
+    out
+}
