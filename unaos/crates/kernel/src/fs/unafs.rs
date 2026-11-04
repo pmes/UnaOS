@@ -3354,7 +3354,7 @@ pub mod splitread {
             fallbacks,
             if same { "yes" } else { "no" },
             if done { "yes" } else { "no" }, takes
-        );
+        ); super::lockcensus::death_leg(); // F39UNAFSWARMSINCEBOOT (rmbp-ledger B1143): the overflow path reached by a REAL guard death, after the verdict (`lockcensus` tail; LINE-NEUTRAL, before this comment)
     }
 }
 
@@ -5971,6 +5971,8 @@ pub mod lockcensus {
     static RA_FULL: AtomicU64 = AtomicU64::new(0);
     /// F39UNAFSHOLDRELEASE (B1120): block reads `rawrote::warm_serve` answered from a commit's own written bytes (no fill).
     static WARM_HITS: AtomicU64 = AtomicU64::new(0);
+    /// F39UNAFSWARMSINCEBOOT (rmbp-ledger B1143): the same hits since boot (never reset; `warm_hits()`), so a delta across a census is exact.
+    static WARM_TOTAL: AtomicU64 = AtomicU64::new(0);
 
     /// F39UNAFSLOCKONE (rmbp-ledger B1125): every MOUNT take closed through a `Take` since boot (any span; `takes()`).
     static TAKES: AtomicU64 = AtomicU64::new(0);
@@ -6150,11 +6152,13 @@ pub mod lockcensus {
     #[inline(always)]
     pub fn warm_hit() {
         WARM_HITS.fetch_add(1, Ordering::Relaxed);
+        WARM_TOTAL.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// F39UNAFSEXECMEASURE (rmbp-ledger B1138): `WARM_HITS` as it stands (a relaxed load, never a swap) — `execread::PlanHold`.
+    /// F39UNAFSEXECMEASURE (rmbp-ledger B1138): the `WARM` hits for `execread::PlanHold` (a relaxed load, never a swap).
+    /// F39UNAFSWARMSINCEBOOT (B1143): since boot (`WARM_TOTAL`, the shape of `tx_io().0`); the ra line keeps the per-census count.
     pub fn warm_hits() -> u64 {
-        WARM_HITS.load(Ordering::Relaxed)
+        WARM_TOTAL.load(Ordering::Relaxed)
     }
 
     /// hidstall.rs:439 fold — the desktop's minute roll.
@@ -6189,6 +6193,58 @@ pub mod lockcensus {
             why, syncs, slots.saturating_sub(dropped), dropped, full, warm
         );
     }
+
+    // ── F39UNAFSWARMSINCEBOOT (rmbp-ledger B1143): `tests unafslock`'s death leg — UNAFS-LOCK-DEATHPATH's witness. A 16 KiB
+    // `unafslock-death` task recurses into its guard page (`stackguard::scratch_deep`) INSIDE a `with_unafs` closure, so it
+    // dies holding MOUNT with its `lockowner::own(UNAFS)` recorded: `overflow_exit` -> `sync::release_task` ->
+    // `lockowner::release_dead` -> `lockowner_release` (:2880 `death()`). A REAL death, no stand-in call. The mount it took
+    // is leaked and poisoned and re-bound by the next `with_unafs` (STACKGUARD3 / POISON2, as `poison_leg` pays). Its
+    // attempt's `Take` never drops (the dead attempt is not in `takes=`). Runs after the `:: UNAFSLOCK:` verdict. ──
+
+    /// The death task's stack (sync.rs `GUARD_STACK`'s figure).
+    const DEATH_STACK: usize = 16 * 1024;
+    static DEATH_TOOK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    static DEATH_RET: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+    /// `unafslock-death`: take MOUNT through `with_unafs`, then the guard leg's recursion inside the hold.
+    fn death_task(_: usize) {
+        let r = with_unafs(|_| {
+            DEATH_TOOK.store(true, Ordering::Release);
+            crate::arch::stackguard::scratch_deep(0)
+        });
+        DEATH_RET.store(true, Ordering::Release);
+        serial_println!("[unafslock] death task returned ok={} (the guard did not fire)", r.is_ok());
+    }
+
+    /// `splitread::selftest` :3357 fold — the death leg: `[unafslock] death probe=<word> deaths=<d0>-><d1> rebind=<0|1>`,
+    /// then the census (`say("death")`: its holds line carries `deaths=`).
+    pub fn death_leg() {
+        if crate::arch::sched::current_id().is_none() || crate::arch::irqs_masked() {
+            serial_println!("[unafslock] death probe=skip(no-task) deaths={}", deaths());
+            return;
+        }
+        DEATH_TOOK.store(false, Ordering::Release);
+        DEATH_RET.store(false, Ordering::Release);
+        let d0 = deaths();
+        crate::arch::sched::spawn_stack("unafslock-death", death_task, 0, crate::arch::sched::CPU_AUTO, crate::arch::sched::PRIO_NORMAL, DEATH_STACK);
+        let t0 = crate::arch::ms();
+        while deaths() <= d0 && !DEATH_RET.load(Ordering::Acquire) && crate::arch::ms().saturating_sub(t0) <= 1000 {
+            crate::arch::sched::sleep_ms(1);
+        }
+        let d1 = deaths();
+        let word = if d1 > d0 {
+            "ok"
+        } else if DEATH_RET.load(Ordering::Acquire) {
+            "returned"
+        } else if DEATH_TOOK.load(Ordering::Acquire) {
+            "not-counted"
+        } else {
+            "no-task"
+        };
+        let rebind = with_unafs(|_| ()).is_ok();
+        serial_println!("[unafslock] death probe={} deaths={}->{} rebind={}", word, d0, d1, rebind as u8);
+        say("death");
+    }
 }
 
 // ── F39UNAFSLOCKDEATHPATH (rmbp-ledger B1131, BP-storage-8) — the exec read's card timing. UNAFS-READ-AHEAD measured: the
@@ -6203,6 +6259,8 @@ pub mod lockcensus {
 // `fills=<n> warm=<n>` (`PlanHold`: `tx_io().0` and `lockcensus::warm_hits()`, the two counters the census lines print,
 // snapshotted inside `try_split`'s plan hold at :3107 and closed to deltas at :3115; it rides `Plan` into :3149). No new
 // counter, no static, no lock: a census `say` inside the hold swaps `WARM_HITS` to 0, so `warm=` can only undercount.
+// F39UNAFSWARMSINCEBOOT (rmbp-ledger B1143): `warm_hits()` now reads `WARM_TOTAL` (since boot, beside the per-census
+// `WARM_HITS`), so `warm=` is exact across a census, as `fills=` already was (`TX_FILLS` is never reset).
 // Owed: UNAFS-EXEC-STREAM, UNAFS-WARM-SIZE (the bench sizes WARM from `warm=` beside `fills=`).
 #[cfg(all(target_arch = "x86_64", feature = "wc"))]
 /// CHARTER: fs-core — the split data road's per-run landing stamps for an exec image read (a stack local, no lock, no static).
@@ -6227,12 +6285,12 @@ pub mod execread {
             PlanHold { fills: super::tx_io().0, warm: super::lockcensus::warm_hits() }
         }
 
-        /// :3115 fold — the hold's plan is built: the deltas since `open` (warm saturates: `lockcensus::say` swaps it to 0).
+        /// :3115 fold — the hold's plan is built: the deltas since `open` (both since-boot totals: F39UNAFSWARMSINCEBOOT B1143).
         #[inline(always)]
         pub fn close(&self) -> Self {
             PlanHold {
                 fills: super::tx_io().0.wrapping_sub(self.fills),
-                warm: super::lockcensus::warm_hits().saturating_sub(self.warm),
+                warm: super::lockcensus::warm_hits().wrapping_sub(self.warm),
             }
         }
     }
