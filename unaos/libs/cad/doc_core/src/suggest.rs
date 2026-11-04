@@ -35,6 +35,8 @@
 //! normals are canonical, not outward), outside a BOSS; the set is `sketch` on the plane (z toward the support), the
 //! centre `point`, `circle` (a pocket's diameter through the standards table, else round; a boss's round), `extrude`
 //! along z by the height (round within sigma), ONE statement set sharing one why, confidence from the worst residual.
+//! VUGINTENTFEATURESEXTENT (LEDGER SR653): a cylinder that carries its support's axial extent (`ShapeRef::extent`) is
+//! measured, not inferred: h0 is its far end's offset from the plane (a far plane within 3 sigma of that end), not 2|t|.
 //!
 //! VUGINTENTSETVERIFY (LEDGER SR541): a statement set is emitted as [`crate::verify_all`] disposes it WHOLE: contiguous,
 //! one `why` that no adjacent proposal shares (a feature's names its cylinder, a bolt circle its n and r, a midline its
@@ -742,10 +744,11 @@ struct PlaneM {
 
 /// The extent rule for the cylinder whose support centroid sits `t` off `planes[pk]`: (h, the far-end plane's (shape
 /// index, e) when one is measured); None when a measured parallel plane crosses the span (no end on the plane within
-/// 3 sigma).
-fn extent(planes: &[PlaneM], pk: usize, t: f64, sigma: f64, sigma_deg: f64) -> Option<(f64, Option<(usize, f64)>)> {
+/// 3 sigma). VUGINTENTFEATURESEXTENT (SR653): `reach` is the support's measured far end (ke = 1); None is the centroid
+/// road h0 = 2|t| (ke = 2: a far end off by e moves the centroid by e / 2), bit-identical to SR536.
+fn extent(planes: &[PlaneM], pk: usize, t: f64, reach: Option<f64>, sigma: f64, sigma_deg: f64) -> Option<(f64, Option<(usize, f64)>)> {
     let p = &planes[pk];
-    let h0 = 2.0 * t.abs();
+    let (h0, ke) = reach.map_or((2.0 * t.abs(), 2.0), |f| (f, 1.0));
     let lim = K_SIGMA * sigma;
     let mut far: Option<(usize, f64, f64)> = None;
     for (k, q) in planes.iter().enumerate() {
@@ -757,12 +760,12 @@ fn extent(planes: &[PlaneM], pk: usize, t: f64, sigma: f64, sigma_deg: f64) -> O
         if !(s * t > 0.0 && s.abs() > lim) {
             continue;
         }
-        let e = (t - s / 2.0).abs();
+        let e = (h0 - s.abs()).abs() / ke;
         if e <= lim {
             if far.is_none_or(|(_, b, _)| e < b) {
                 far = Some((q.i, e, s.abs()));
             }
-        } else if s.abs() < h0 - 2.0 * lim {
+        } else if s.abs() < h0 - ke * lim {
             return None;
         }
     }
@@ -828,7 +831,17 @@ fn features(doc: &Doc, m: &Measurement, sigma: f64, ids: &mut Ids, out: &mut Vec
             }
         }
         let Some((pk, t)) = best else { continue };
-        let Some((h, far)) = extent(&planes, pk, t, sigma, sigma_deg) else { continue };
+        // VUGINTENTFEATURESEXTENT (SR653): the carried extent's ends as offsets from the plane on the support side.
+        let sg = if t > 0.0 { 1.0 } else { -1.0 };
+        let ends = s.extent.and_then(|[a0, a1]| {
+            let c = axis.normalize().ok()?.dot(planes[pk].n);
+            let (o0, o1) = (sg * (t + a0 * c), sg * (t + a1 * c));
+            Some((o0.min(o1), o0.max(o1)))
+        });
+        if ends.is_some_and(|(_, f)| !(f.is_finite() && f > sigma)) {
+            continue;
+        }
+        let Some((h, far)) = extent(&planes, pk, t, ends.map(|e| e.1), sigma, sigma_deg) else { continue };
         // Boss or pocket: the support centroid against the replayed solids.
         let (mut inside, mut unsure) = (false, false);
         for so in &r.solids {
@@ -861,9 +874,10 @@ fn features(doc: &Doc, m: &Measurement, sigma: f64, ids: &mut Ids, out: &mut Vec
             (radius, 0.0, format!("diameter {} mm as measured", mm(dm)))
         };
         let e = far.map_or(0.0, |(_, e)| e);
-        let src = match far {
-            Some((qi, e)) => format!("far-end plane #{} (near end {} mm off)", qi, mm(e)),
-            None => format!("the support centroid ({} mm off)", mm(t.abs())),
+        let src = match (far, ends) {
+            (Some((qi, e)), _) => format!("far-end plane #{} (near end {} mm off)", qi, mm(e)),
+            (None, Some((near, _))) => format!("the support's axial extent (near end {} mm off)", mm(near.abs())), // VUGINTENTFEATURESEXTENT (SR653)
+            (None, None) => format!("the support centroid ({} mm off)", mm(t.abs())),
         };
         let why = format!(
             "{}: cylinder #{} on plane #{} (a document face), extent {} mm from {}, height {}, {}, sigma {}",
