@@ -868,8 +868,8 @@ pub static ARMEARLY_ARMED: AtomicU32 = AtomicU32::new(0);
 /// launch: nothing armed). Called before the task is spawned; takes only wm's leaf lock.
 pub fn arm_early(row: usize, path: Option<&str>) {
     let Some(path) = path else { return };
-    let gen = (crate::arch::syscall::busreg_ops().rgen)(row);
-    let armed = crate::video::wm::app_name_arm_early(crate::video::wm::owner_of_launch(row as u64), gen, path);
+    let rg = (crate::arch::syscall::busreg_ops().rgen)(row);
+    let armed = crate::video::wm::app_name_arm_early(crate::video::wm::owner_of_launch(row as u64), rg, path);
     if armed {
         ARMEARLY_ARMED.fetch_add(1, Ordering::Relaxed);
     }
@@ -884,14 +884,14 @@ fn armearly_name(row: usize, n: usize, buf: &mut [u8; crate::video::wm::MAX_TITL
     if n != 0 {
         return n;
     }
-    let gen = (crate::arch::syscall::busreg_ops().rgen)(row);
-    crate::video::wm::app_name_early_of(crate::video::wm::owner_of_launch(row as u64), gen, buf)
+    let rg = (crate::arch::syscall::busreg_ops().rgen)(row);
+    crate::video::wm::app_name_early_of(crate::video::wm::owner_of_launch(row as u64), rg, buf)
 }
 
 /// `tagpath_id`'s fallback: is the early path of `row`'s current tenant the image `img`? `None` = no absolute one.
 fn armearly_path(row: usize, img: &str) -> Option<bool> {
-    let gen = (crate::arch::syscall::busreg_ops().rgen)(row);
-    crate::video::wm::app_path_early_of(crate::video::wm::owner_of_launch(row as u64), gen, |p| path_names(p, img))
+    let rg = (crate::arch::syscall::busreg_ops().rgen)(row);
+    crate::video::wm::app_path_early_of(crate::video::wm::owner_of_launch(row as u64), rg, |p| path_names(p, img))
 }
 
 /// `tests bandy3`' early-arm legs, on the fixture's scratch rows (caller `a`, fulfiller `f`), with NO late arm:
@@ -907,11 +907,11 @@ fn armearly_selftest(fx: &Fixture) {
         serial_println!(":: BUSREG-ARMEARLY: SKIP (a live row holds Principia's tags) ::");
         return;
     }
-    let gen = (fx.ops.rgen)(f);
+    let rg = (fx.ops.rgen)(f);
     let mut nb = [0u8; crate::video::wm::MAX_TITLE];
     if crate::video::wm::app_name_armed(owner_f)
         || crate::video::wm::app_path_with(owner_f, |_| true).is_some()
-        || crate::video::wm::app_name_early_of(owner_f, gen, &mut nb) != 0
+        || crate::video::wm::app_name_early_of(owner_f, rg, &mut nb) != 0
     {
         serial_println!(":: BUSREG-ARMEARLY: SKIP (scratch row {} carries a name) ::", f);
         return;
@@ -946,7 +946,7 @@ fn armearly_selftest(fx: &Fixture) {
     (fx.clear)(a);
     (fx.clear)(f);
     // E3: the same record at a generation that is not the row's current one -> unnamed: the relay drops it.
-    let _ = crate::video::wm::app_name_arm_early(owner_f, gen.wrapping_add(1), "/apps/PREFS.ELF");
+    let _ = crate::video::wm::app_name_arm_early(owner_f, rg.wrapping_add(1), "/apps/PREFS.ELF");
     let n = crate::bus::build_request(BUS_VERB_REGISTER, 74, &[get], &mut buf);
     let admitted = (fx.send)(f, &buf[..n]) == 0 && matches!((fx.pop)(f).as_deref().and_then(parse), Some(h) if h.status == 0 && h.corr == 74);
     let n = crate::bus::build_request(get, 75, b"ui.theme", &mut buf);

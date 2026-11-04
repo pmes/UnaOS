@@ -1455,3 +1455,9 @@ exec-rmbp-vugcomscanrelinkenvelope 44ace0a30 wave36 cut59
 exec-rmbp-vugprincipiaunsetchanged 44ace0a30 wave36 cut59
 exec-rmbp-vugfacejournalholdmany 44ace0a30 wave36 cut59
 exec-rmbp-vugfacedeviationprb 44ace0a30 wave36 cut59
+exec-rmbp-f39relayresetset e84b64a95 wave36 cut61
+exec-rmbp-f39prefscappath e84b64a95 wave36 cut61
+exec-rmbp-f39armforgetteardown e84b64a95 wave36 cut61
+exec-rmbp-f39busregarmearlyring3 e84b64a95 wave36 cut61
+exec-rmbp-f39prefsunsetwirepin e84b64a95 wave36 cut61
+exec-rmbp-f39machinestorekernelonly e84b64a95 wave36 cut61

@@ -33788,7 +33788,7 @@ static APP_NAMES_EARLY: Mutex<alloc::vec::Vec<(u64, u64, alloc::string::String)>
 /// can run. Re-arms the owner's row in place (the slot's previous tenant is necessarily gone). `false` = owner 0
 /// or an empty name (nothing recorded; a row the owner held is dropped either way).
 #[cfg(feature = "busreg")]
-pub fn app_name_arm_early(owner: u64, gen: u64, path: &str) -> bool {
+pub fn app_name_arm_early(owner: u64, rg: u64, path: &str) -> bool {
     if owner == 0 {
         return false;
     }
@@ -33796,20 +33796,20 @@ pub fn app_name_arm_early(owner: u64, gen: u64, path: &str) -> bool {
     let mut t = APP_NAMES_EARLY.lock();
     t.retain(|e| e.0 != owner);
     if ok {
-        t.push((owner, gen, alloc::string::String::from(path)));
+        t.push((owner, rg, alloc::string::String::from(path)));
     }
     ok
 }
 
-/// BUSREG-ARM-EARLY — `owner`'s early program name at generation `gen`, copied into `out`; its length (0 = no
+/// BUSREG-ARM-EARLY — `owner`'s early program name at generation `rg`, copied into `out`; its length (0 = no
 /// record, or a record from another generation).
 #[cfg(feature = "busreg")]
-pub fn app_name_early_of(owner: u64, gen: u64, out: &mut [u8; MAX_TITLE]) -> usize {
+pub fn app_name_early_of(owner: u64, rg: u64, out: &mut [u8; MAX_TITLE]) -> usize {
     if owner == 0 {
         return 0;
     }
     let t = APP_NAMES_EARLY.lock();
-    match t.iter().find(|e| e.0 == owner && e.1 == gen) {
+    match t.iter().find(|e| e.0 == owner && e.1 == rg) {
         Some(e) => {
             let name = program_name(e.2.as_str()).as_bytes();
             let n = name.len().min(MAX_TITLE);
@@ -33820,15 +33820,15 @@ pub fn app_name_early_of(owner: u64, gen: u64, out: &mut [u8; MAX_TITLE]) -> usi
     }
 }
 
-/// BUSREG-ARM-EARLY — `f(path)` for `owner`'s early path at generation `gen`, [`app_path_with`]'s shape; `None` =
+/// BUSREG-ARM-EARLY — `f(path)` for `owner`'s early path at generation `rg`, [`app_path_with`]'s shape; `None` =
 /// no record at that generation, or its argv[0] is not absolute. `f` runs under the leaf lock and takes no lock.
 #[cfg(feature = "busreg")]
-pub fn app_path_early_of(owner: u64, gen: u64, f: impl FnOnce(&str) -> bool) -> Option<bool> {
+pub fn app_path_early_of(owner: u64, rg: u64, f: impl FnOnce(&str) -> bool) -> Option<bool> {
     if owner == 0 {
         return None;
     }
     let t = APP_NAMES_EARLY.lock();
-    t.iter().find(|e| e.0 == owner && e.1 == gen && e.2.starts_with('/')).map(|e| f(e.2.as_str()))
+    t.iter().find(|e| e.0 == owner && e.1 == rg && e.2.starts_with('/')).map(|e| f(e.2.as_str()))
 }
 
 /// BUSREG-ARM-EARLY — drop `owner`'s early record (the witness's cleanup; a teardown needs none: the generation moves).
