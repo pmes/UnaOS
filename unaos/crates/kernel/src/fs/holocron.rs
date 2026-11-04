@@ -1284,7 +1284,7 @@ pub fn defer_bound_fixture_once() {
     let Some(_hid) = crate::drivers::ehci::EHCI_HID.try_lock() else {
         DONE.store(false, Ordering::Relaxed); // someone is mid-pass — not our turn, retry next pass
         return;
-    };
+    }; crate::hidstall::lock_took(); // F39HIDLOCKWHOKATSITES (B1151): this taker named for the hid pass's `lock_by=` (hidstall.rs tail), on the taken path only. LINE-NEUTRAL fold
     {
         let mut s = STORE.lock();
         s.dirty = true; // the flush must get past its first early-return to reach the guard
