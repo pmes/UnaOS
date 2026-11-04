@@ -61,6 +61,7 @@ pub use diff::{Diff, Entry, Field, HEADER_ID, diff};
 pub use from_sketch::{PlainNames, SketchNames, from_sketch, sketch_cons, sketch_pref}; // VUGDOCFROMSKETCH (SR516)
 pub use intent::{Batch, K_SIGMA, Measurement, Proposal, Reason, Verdict, apply, verify, verify_all};
 pub use intent::{ShapeParams, ShapeRef, measurements_text}; // VUGINTENTSCAN (SR508)
+pub use intent::apply_with; // VUGINTENTSETORDER (SR551)
 pub use standards::{Class, METRIC, Standard, Thread, clearance_for, nearest_standard};
 pub use suggest::suggest;
 pub use lex::read;
@@ -232,6 +233,59 @@ impl Stmt {
             | Stmt::Scan { id, .. } | Stmt::Fillet { id, .. } | Stmt::Chamfer { id, .. } => Some(id), // VUGFACEFILLET (SR511)
             Stmt::Machine(m) => Some(&m.id),
             Stmt::Axis(_) | Stmt::Tool(_) | Stmt::Stock(_) | Stmt::Fixture(_) => None,
+        }
+    }
+
+    /// VUGINTENTSETORDER (SR551): every id the statement references, in the reader's key order (`sketch=`, the entity
+    /// keys, `on=`; a point reference by its entity, `p1.centre` is `p1`): the one truth of the reference graph. A
+    /// sketch, the machine (its `lib=` is a library name, not an id), its axes / tools / stock / fixtures and a scan
+    /// reference none.
+    pub fn refs(&self) -> Vec<&str> {
+        fn p(r: &PRef) -> &str {
+            match r {
+                PRef::Point(i) | PRef::Centre(i) | PRef::Start(i) | PRef::End(i) => i,
+            }
+        }
+        match self {
+            Stmt::Point { sketch, .. } => alloc::vec![sketch.as_str()],
+            Stmt::Line { sketch, a, b, .. } => alloc::vec![sketch.as_str(), a.as_str(), b.as_str()],
+            Stmt::Circle { sketch, centre, .. } | Stmt::Arc { sketch, centre, .. } => {
+                alloc::vec![sketch.as_str(), centre.as_str()]
+            }
+            Stmt::Extrude { sketch, outer, .. } | Stmt::Revolve { sketch, outer, .. } => {
+                alloc::vec![sketch.as_str(), outer.as_str()]
+            }
+            Stmt::Constraint { sketch, c, .. } => {
+                let mut v: Vec<&str> = alloc::vec![sketch.as_str()];
+                match c {
+                    Cons::Coincident(a, b) | Cons::Distance(a, b, _) => v.extend([p(a), p(b)]),
+                    Cons::PointOnLine(a, e)
+                    | Cons::PointOnCircle(a, e)
+                    | Cons::DistancePointLine(a, e, _)
+                    | Cons::Midpoint(a, e) => v.extend([p(a), e.as_str()]),
+                    Cons::Horizontal(e) | Cons::Vertical(e) | Cons::Radius(e, _) | Cons::Diameter(e, _) => {
+                        v.push(e.as_str())
+                    }
+                    Cons::Parallel(a, b)
+                    | Cons::Perpendicular(a, b)
+                    | Cons::TangentLineCircle(a, b)
+                    | Cons::TangentCircles(a, b)
+                    | Cons::EqualLength(a, b)
+                    | Cons::EqualRadius(a, b)
+                    | Cons::Angle(a, b, _) => v.extend([a.as_str(), b.as_str()]),
+                    Cons::Fix(a, _) => v.push(p(a)),
+                    Cons::Symmetric(a, b, e) => v.extend([p(a), p(b), e.as_str()]),
+                }
+                v
+            }
+            Stmt::Op { on, .. } | Stmt::Fillet { on, .. } | Stmt::Chamfer { on, .. } => alloc::vec![on.as_str()],
+            Stmt::Sketch { .. }
+            | Stmt::Machine(_)
+            | Stmt::Axis(_)
+            | Stmt::Tool(_)
+            | Stmt::Stock(_)
+            | Stmt::Fixture(_)
+            | Stmt::Scan { .. } => Vec::new(),
         }
     }
 }

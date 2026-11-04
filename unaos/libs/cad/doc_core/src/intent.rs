@@ -38,6 +38,13 @@
 //! verdict on the copy so far is reported in [`Batch::sets`] and the set's lines, never a gate; a single proposal's line
 //! in [`Batch::text`] is byte-identical.
 //!
+//! VUGINTENTSETORDER (LEDGER SR551): a set's graph is the READER's — each member applied to a copy in order and its
+//! [`crate::Stmt::refs`] / [`crate::Stmt::id`] read off the statement it became (the key=value token scan is gone). A
+//! measured shape counts in a Shapes residual only when the document's own replay pairs it within the band (K_SIGMA x
+//! sigma) or the proposal's replay came closer to it than the document by more than the band; a face only a later set
+//! models no longer refuses the earlier single proposals. [`apply_with`] is [`apply`] through a caller's [`Lib`] (a
+//! library part, VUGMAKEMACHINELIB SR544), as [`crate::read_with`] is [`crate::read`].
+//!
 //! The RMS's square root is geom_core's `Vec2::mag` (a hypot accumulation); libm (VUGINTENTSCAN, SR508, as ruled)
 //! gives the shape residual's angles (`atan2`, `atan`) and suggest's rounding (`round`).
 
@@ -51,9 +58,10 @@ use brep_core::mesh_core::{Bvh, Mesh}; // VUGINTENTPOINTS (SR523)
 use sketch_core::{Arc2, Edge, Loop, profiles};
 
 use crate::lex::read;
+use crate::lex::read_with; // VUGINTENTSETORDER (SR551)
 use crate::replay::{Failure, Fault, Replay, replay};
 use crate::write::{f64_text, write};
-use crate::{Doc, Refusal, Tol, What};
+use crate::{Doc, Lib, Refusal, Tol, What};
 
 /// The acceptance band: a proposal's max residual must be within `K_SIGMA` x the measurement's sigma.
 pub const K_SIGMA: f64 = 3.0;
@@ -194,6 +202,18 @@ pub enum Verdict {
 /// The document with a proposal in it: appended, or replacing the statement of the same id in place. The one road
 /// that changes a document; the person's accept calls it.
 pub fn apply(doc: &Doc, p: &Proposal) -> Result<Doc, Reason> {
+    applied(doc, p, &read).map(|(d, _)| d) // VUGINTENTSETORDER (SR551): the one body, `applied`
+}
+
+/// VUGINTENTSETORDER (SR551): [`apply`] re-reading through the caller's [`Lib`], so a part whose machine names a
+/// library (`machine <id> lib=<name>`) takes a proposal.
+pub fn apply_with(doc: &Doc, p: &Proposal, lib: &dyn Lib) -> Result<Doc, Reason> {
+    applied(doc, p, &|t: &str| read_with(t, lib)).map(|(d, _)| d)
+}
+
+/// VUGINTENTSETORDER (SR551): the body of [`apply`] / [`apply_with`] over the reader `rd`, with the index of the
+/// statement the line became (appended: the last; a replaced id: its own place).
+fn applied(doc: &Doc, p: &Proposal, rd: &dyn Fn(&str) -> Result<Doc, Refusal>) -> Result<(Doc, usize), Reason> {
     let line = p.stmt.trim();
     if line.is_empty() || line.contains('\n') || line.contains('\r') {
         return Err(Reason::NotOneLine);
@@ -203,8 +223,8 @@ pub fn apply(doc: &Doc, p: &Proposal) -> Result<Doc, Reason> {
     let mut appended = base.clone();
     appended.push_str(line);
     appended.push('\n');
-    match read(&appended) {
-        Ok(d) if d.stmts.len() == doc.stmts.len() + 1 => Ok(d),
+    match rd(&appended) {
+        Ok(d) if d.stmts.len() == doc.stmts.len() + 1 => Ok((d, doc.stmts.len())),
         Ok(_) => Err(Reason::NotOneLine),
         Err(r) => {
             let dup = match &r.what {
@@ -220,8 +240,8 @@ pub fn apply(doc: &Doc, p: &Proposal) -> Result<Doc, Reason> {
                 out.push_str(if n == i + 1 { line } else { l });
                 out.push('\n');
             }
-            match read(&out) {
-                Ok(d) if d.stmts.len() == doc.stmts.len() => Ok(d),
+            match rd(&out) {
+                Ok(d) if d.stmts.len() == doc.stmts.len() => Ok((d, i)),
                 Ok(_) => Err(Reason::NotOneLine),
                 Err(r) => Err(Reason::Lex(r)),
             }
@@ -335,7 +355,7 @@ pub fn verify_all(doc: &Doc, ps: &[Proposal], m: &Measurement, tol: Tol) -> Batc
     let mut sets = Vec::new(); // VUGINTENTSETVERIFY (SR541)
     let mut i = 0;
     while i < ps.len() {
-        let n = set_len(&ps[i..]);
+        let n = set_len(&cur, &ps[i..]); // VUGINTENTSETORDER (SR551): the reader's graph on the copy so far
         if n > 1 {
             // VUGINTENTSETVERIFY (SR541): the set applied, replayed and judged once, entering whole or not at all.
             let (v, steps, next) = verify_set(&cur, &ps[i..i + n], m, tol);
@@ -424,7 +444,7 @@ fn residual(r: &Replay, m: &Measurement, tol: Tol, base: Option<&Replay>) -> Res
         }
         // VUGINTENTSCAN (SR508): each shape against its nearest replayed face of the same kind.
         Measurement::Shapes { shapes, sigma_mm, sigma_deg } => {
-            shape_residuals(r, shapes, *sigma_mm, *sigma_deg, &mut d)?
+            shape_residuals(r, base.unwrap_or(r), shapes, *sigma_mm, *sigma_deg, &mut d)? // VUGINTENTSETORDER (SR551)
         }
     }
     Ok(fit(&d))
@@ -641,9 +661,13 @@ fn has_partner(r: &Replay, s: &ShapeRef) -> bool {
 /// Every shape matched to the replayed face of its kind with the smallest `max(dist_mm, ang_deg * sigma_mm /
 /// sigma_deg)`; that value is the shape's residual (so judge's one `K_SIGMA * sigma_mm` limit holds both).
 /// VUG-INTENT-SCAN-UNMATCHED (SR515): a shape with no face of its kind (a TSDF-rounded corner read as a cone, an open
-/// rim as a sphere) is left out, and [`verify_all`] reports it; only when no shape matches is the proposal refused.
+/// rim as a sphere) is left out, and [`verify_all`] reports it; only when no shape counts is the proposal refused.
+/// VUGINTENTSETORDER (SR551): a shape counts only when `base` (the document's own replay; `r` itself for the
+/// document's baseline) pairs it within the band, or `r` came closer to it than `base` by more than the band (the
+/// proposal models it); a face only a later statement set models is left out of an earlier single's residual.
 fn shape_residuals(
     r: &Replay,
+    base: &Replay,
     shapes: &[ShapeRef],
     sigma_mm: f64,
     sigma_deg: f64,
@@ -656,18 +680,12 @@ fn shape_residuals(
         return Err(Reason::NoGeometry);
     }
     let per_deg = sigma_mm / sigma_deg;
+    let band = K_SIGMA * sigma_mm;
     let mut matched = 0usize;
     for s in shapes {
-        let mut best: Option<f64> = None;
-        for solid in &r.solids {
-            for face in &solid.brep.faces {
-                if let Some((mm, deg)) = pair(&s.params, &face.surface) {
-                    let v = mm.max(deg * per_deg);
-                    best = Some(best.map_or(v, |b: f64| b.min(v)));
-                }
-            }
-        }
-        if let Some(v) = best {
+        let Some(v) = nearest(r, s, per_deg) else { continue };
+        let b = nearest(base, s, per_deg).unwrap_or(f64::INFINITY);
+        if b <= band || v < b - band {
             d.push(v);
             matched += 1;
         }
@@ -676,6 +694,21 @@ fn shape_residuals(
         Some(s) if matched == 0 => Err(Reason::UnmatchedShape { index: 0, kind: s.kind() }),
         _ => Ok(()),
     }
+}
+
+/// VUGINTENTSETORDER (SR551): the smallest `max(dist_mm, ang_deg * per_deg)` over `r`'s faces of `s`'s kind, None
+/// when no face is of its kind (the one per-shape loop, run on the proposal's replay and on the document's).
+fn nearest(r: &Replay, s: &ShapeRef, per_deg: f64) -> Option<f64> {
+    let mut best: Option<f64> = None;
+    for solid in &r.solids {
+        for face in &solid.brep.faces {
+            if let Some((mm, deg)) = pair(&s.params, &face.surface) {
+                let v = mm.max(deg * per_deg);
+                best = Some(best.map_or(v, |b: f64| b.min(v)));
+            }
+        }
+    }
+    best
 }
 
 /// `v` to `places` decimals, trailing zeros, a bare point and a negative zero dropped.
@@ -944,19 +977,12 @@ fn box_dist_sq(p: Vec3, b: &Aabb3) -> f64 {
 
 // ---- VUGINTENTSETVERIFY (SR541): a statement set judged as one unit ----
 
-/// The statement's id: the line's second token when it carries no `=` (the reader's `<verb> <id>? key=value` shape).
-fn stmt_id(stmt: &str) -> Option<&str> {
-    stmt.split_whitespace().nth(1).filter(|t| !t.contains('='))
-}
-
-/// The values of the line's `key=value` tokens (a list's or a string's inner tokens never equal an id).
-fn stmt_refs(stmt: &str) -> Vec<&str> {
-    stmt.split_whitespace().skip(1).filter_map(|t| t.split_once('=').map(|(_, v)| v)).collect()
-}
-
-/// The length of the statement set at the head of `ps`: the run sharing the head's non-empty `why` when its reference
-/// graph is connected, else 1 (a single proposal); 0 for no proposals.
-fn set_len(ps: &[Proposal]) -> usize {
+/// The length of the statement set at the head of `ps` against `doc`: the run sharing the head's non-empty `why` when
+/// its reference graph is connected, else 1 (a single proposal); 0 for no proposals. VUGINTENTSETORDER (SR551): the
+/// graph is the reader's — the run's members applied to a copy in order, each one's [`crate::Stmt::id`] and
+/// [`crate::Stmt::refs`] read off the statement it became; the scan stops at the first member the reader refuses
+/// (it and the rest stay in a connected set, which [`verify_set`] refuses whole by that reason).
+fn set_len(doc: &Doc, ps: &[Proposal]) -> usize {
     let Some(h) = ps.first() else { return 0 };
     if h.why.is_empty() {
         return 1;
@@ -965,14 +991,26 @@ fn set_len(ps: &[Proposal]) -> usize {
     if run < 2 {
         return 1;
     }
-    let ids: Vec<Option<&str>> = ps[..run].iter().map(|p| stmt_id(&p.stmt)).collect();
-    let refs: Vec<Vec<&str>> = ps[..run].iter().map(|p| stmt_refs(&p.stmt)).collect();
-    let names = |a: usize, b: usize| ids[b].is_some_and(|id| refs[a].contains(&id));
-    let mut seen = alloc::vec![false; run];
+    let mut copy = doc.clone();
+    let mut ids: Vec<Option<String>> = Vec::new();
+    let mut refs: Vec<Vec<String>> = Vec::new();
+    for p in &ps[..run] {
+        let Ok((d, k)) = applied(&copy, p, &read) else { break };
+        let s = &d.stmts[k];
+        ids.push(s.id().map(String::from));
+        refs.push(s.refs().into_iter().map(String::from).collect());
+        copy = d;
+    }
+    let n = ids.len();
+    if n == 0 {
+        return 1;
+    }
+    let names = |a: usize, b: usize| ids[b].as_ref().is_some_and(|id| refs[a].iter().any(|r| r == id));
+    let mut seen = alloc::vec![false; n];
     seen[0] = true;
     let mut stack = alloc::vec![0usize];
     while let Some(a) = stack.pop() {
-        for b in 0..run {
+        for b in 0..n {
             if !seen[b] && (names(a, b) || names(b, a)) {
                 seen[b] = true;
                 stack.push(b);

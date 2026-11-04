@@ -232,3 +232,74 @@ fn a_click_off_the_scan_clears_the_pick() {
     assert!(map.pick.is_none());
     assert!(corner(map)[0].starts_with("deviation rms="), "{:?}", corner(map));
 }
+
+// VUGFACEDEVIATIONJOURNAL (LEDGER SR550): the scan measured against the document the tree holds reads as the same
+// document read from a path; an edit of the journal re-measures, and its undo measures as before.
+
+/// The SR510 document opened as the face's journal, the fixture scan measured against it.
+fn journal_viewer() -> Viewer {
+    let doc = doc_core::read(DOC).expect("the document reads");
+    let mut v = Viewer::open_doc(doc, "fixture", SIZE, Preset::Una).expect("the document opens");
+    v.against_journal(scan().clone()).expect("the journal measures");
+    v
+}
+
+/// (rms, max, inside) of the view's measurement.
+fn stats(v: &Viewer) -> (f64, f64, f64) {
+    let d = v.view.deviation.as_ref().expect("a map").result.as_ref().expect("aligned");
+    (d.stats.rms_mm, d.stats.max_mm, d.stats.inside)
+}
+
+#[test]
+fn the_journal_measures_as_the_path_does() {
+    let mut v = journal_viewer();
+    let path = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("vugfacedeviationjournal.vug");
+    std::fs::write(&path, doc_core::write(&v.view.design.journal.doc)).expect("the journal's document is written");
+    let doc = doc_core::read(&std::fs::read_to_string(&path).expect("read back")).expect("it reads");
+    let p = Viewer::open_deviation(scan().clone(), &doc, "fixture", SIZE, Preset::Una).expect("the design builds");
+    let (a, b) = (stats(&v), stats(&p));
+    println!("journal {a:?} path {b:?}");
+    assert_eq!((a.0.to_bits(), a.1.to_bits(), a.2.to_bits()), (b.0.to_bits(), b.1.to_bits(), b.2.to_bits()), "journal {a:?} vs path {b:?}");
+    let map = v.view.deviation.as_ref().unwrap();
+    assert!(map.on, "the map opens on");
+    let lines = corner(map);
+    assert_eq!(lines.last().map(String::as_str), Some("design=journal@0"), "{lines:?}");
+    assert!(corner(p.view.deviation.as_ref().unwrap()).iter().all(|l| !l.starts_with("design=")), "a path map has no source line");
+    assert!(v.view.design.body.is_none(), "the scan is drawn while the map is on");
+    assert!(v.key("d"), "d toggles the map");
+    assert!(v.view.design.body.is_some(), "map off: the journal's body is back");
+    let _ = v.frame();
+    let mut e = Viewer::open_doc(doc_core::Doc::new(doc_core::Tol::DEFAULT), "empty", SIZE, Preset::Una).expect("an empty document opens");
+    assert_eq!(e.against_journal(scan().clone()), Err(vug_view::deviation::JOURNAL_EMPTY.to_string()));
+    assert!(e.view.deviation.is_none(), "a refusal leaves no map");
+}
+
+#[test]
+fn a_journal_edit_re_measures() {
+    let mut v = journal_viewer();
+    let r0 = stats(&v).0;
+    let n = v.view.design.journal.doc.stmts.len();
+    assert_eq!(v.view.design.journal.cursor, n - 1, "the cursor opens on the post's extrude");
+    for k in ["t", "Return", "1", "4", "0", "Return"] {
+        v.key(k);
+    }
+    assert!(
+        matches!(v.view.design.journal.doc.stmts.last(), Some(doc_core::Stmt::Extrude { length, .. }) if *length == 140.0),
+        "the panel edit lands: {:?} note {:?}",
+        v.view.design.journal.doc.stmts.last(),
+        v.view.design.journal.note
+    );
+    let map = v.view.deviation.as_ref().unwrap();
+    let src = map.source.as_ref().expect("a journal map");
+    assert_eq!((src.generation, src.measured, src.refused.as_deref()), (1, 1, None));
+    let r1 = stats(&v).0;
+    println!("rms gen0={r0} gen1={r1}");
+    assert!((r1 - r0).abs() > 1e-6, "the post's top moved 10 mm: rms {r1} vs {r0}");
+    assert_eq!(corner(map).last().map(String::as_str), Some("design=journal@1"), "{:?}", corner(map));
+    assert!(map.on && v.view.design.body.is_none(), "the re-measured scan is drawn");
+    assert!(v.key("u"), "u undoes the edit");
+    let src = v.view.deviation.as_ref().unwrap().source.as_ref().unwrap();
+    assert_eq!((src.generation, src.measured), (2, 2));
+    let r2 = stats(&v).0;
+    assert_eq!(r2.to_bits(), r0.to_bits(), "the undone document measures as before: {r2} vs {r0}");
+}

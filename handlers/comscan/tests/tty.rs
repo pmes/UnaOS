@@ -55,8 +55,13 @@ fn pty() -> (File, PathBuf, OwnedFd) {
 
 /// A fake grbl on the master: says its banner at once (or only after a soft reset when `banner_on_reset`), answers
 /// `ok` per line, ignores the realtime bytes; returns the lines it executed and the master once `lines` lines arrived
-/// (and, with `banner_on_reset`, the reset was seen).
-fn fake_grbl(mut m: File, banner_on_reset: bool, lines: usize) -> JoinHandle<(Vec<String>, File)> {
+/// (and, with `banner_on_reset`, the reset was seen). It answers `$I` as build `VER_A` (VUGCOMSCANHELLOON, SR549).
+fn fake_grbl(m: File, banner_on_reset: bool, lines: usize) -> JoinHandle<(Vec<String>, File)> {
+    fake_grbl_as(m, banner_on_reset, lines, VER_A)
+}
+
+/// [`fake_grbl`] answering `$I` as build `ver` (`$I` is neither recorded nor counted as a line).
+fn fake_grbl_as(mut m: File, banner_on_reset: bool, lines: usize, ver: &'static str) -> JoinHandle<(Vec<String>, File)> {
     thread::spawn(move || {
         if !banner_on_reset {
             m.write_all(BANNER).unwrap();
@@ -79,9 +84,12 @@ fn fake_grbl(mut m: File, banner_on_reset: bool, lines: usize) -> JoinHandle<(Ve
                     }
                     b'?' | b'!' | b'~' => {}
                     b'\n' => {
-                        got.push(String::from_utf8_lossy(&cur).trim().to_string());
+                        let line = String::from_utf8_lossy(&cur).trim().to_string();
                         cur.clear();
-                        m.write_all(b"ok\r\n").unwrap();
+                        if !said_hello(&mut m, &line, ver) {
+                            got.push(line);
+                            m.write_all(b"ok\r\n").unwrap();
+                        }
                     }
                     _ => cur.push(b),
                 }
@@ -493,4 +501,64 @@ fn the_redial_after_a_renamed_node_relinks_the_same_device() {
     drop(open);
     let _ = fake2.join().unwrap();
     std::fs::remove_dir_all(&root).unwrap();
+}
+
+// --- VUGCOMSCANHELLOON (SR549): the tty fake answers `$I`; the first open keeps the controller's identity ---
+
+/// The fakes' default build: grbl 1.1h with the stored user string `mill-a` (the tests/tcp.rs one).
+const VER_A: &str = "1.1h.20190825:mill-a";
+
+/// grbl 1.1's `$I` answer for build `ver`, written when `line` is `$I`; true when it was.
+fn said_hello(s: &mut impl Write, line: &str, ver: &str) -> bool {
+    if line != "$I" {
+        return false;
+    }
+    let _ = s.write_all(format!("[VER:{ver}]\r\n[OPT:V,15,128]\r\nok\r\n").as_bytes());
+    true
+}
+
+fn hello_of(ver: &str) -> String {
+    format!("[VER:{ver}] [OPT:V,15,128]")
+}
+
+#[test]
+fn the_first_tty_open_keeps_the_controllers_answer_to_the_hello() {
+    let (m, path, _s) = pty();
+    let p = program();
+    let want = Pump::from_program(&p, GRBL).unwrap().lines().to_vec();
+    let mut desk = PumpDesk::new(machine());
+    desk.hello_within(comscan::tty::READY_WAIT);
+    let pass = Verdict::Pass { digest: p.digest(), machine: machine().digest() };
+    let digest = desk.arm(&pass, &p, GRBL).expect("armed by a pass");
+    let mut open = opener(Baud::B115200, Flow::None, GRBL);
+    // Silent until the soft reset: open_flow's tcflush drops a banner said before the open.
+    let fake = fake_grbl_as(m, true, want.len(), VER_A);
+    let start = PumpEvent::PumpStart {
+        principal: Origin::LocalUser("una".to_string()),
+        program: digest_hex(digest),
+        dialect: "grbl".to_string(),
+        port: path.to_str().unwrap().to_string(),
+    };
+    let out = desk.apply(&start, &mut *open);
+    let words: Vec<String> =
+        out.iter().filter_map(|s| match s { PumpEvent::Squawk { event: Some(e), .. } => Some(e.clone()), _ => None }).collect();
+    assert_eq!(words, vec!["started".to_string(), format!("hello {}", hello_of(VER_A))], "{out:?}");
+    assert_eq!(desk.hello(), Some(hello_of(VER_A).as_str()), "the first open keeps the answer");
+
+    let t0 = Instant::now();
+    let mut done = false;
+    while !done && t0.elapsed() < Duration::from_secs(10) {
+        for s in desk.tick(t0.elapsed().as_micros() as u64) {
+            if let PumpEvent::Squawk { event: Some(e), .. } = &s {
+                assert!(!e.starts_with("link lost"), "{e}");
+                done |= e == "done";
+            }
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+    assert!(done, "the run reached done");
+    assert_eq!(desk.hello(), Some(hello_of(VER_A).as_str()), "kept to the end of the run");
+    drop(desk);
+    let (lines, _m) = fake.join().unwrap();
+    assert_eq!(lines, want, "the hello is no program line");
 }
