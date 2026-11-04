@@ -974,7 +974,7 @@ fn datum_spec(it: &mut impl Iterator<Item = String>) -> [String; 3] {
 
 /// With `--datum`: the datum faces by name (an unknown one refused as `GdtDatumFace` by label and name), the frame
 /// scan_core `gdt::frame_of` builds (measured from the scan's datum faces at the aligned pose, nominal from the design;
-/// a refusal as `GdtDatum` with the datum's name), every cylinder face's position replaced by `gdt::position_in`, so
+/// a refusal as `GdtDatum` with the datum's name), every cylinder face's position replaced by `gdt::in_frame`, so
 /// `position=` and its verdict read in the frame; returns the `gdt: frame A= B= C= residual=` line. Without, nothing.
 fn datum_road(a: &Args, sm: &ScanMesh, design: &scan_core::Design, d: &Deviation, names: &[String], margin: f64, g: &mut [scan_core::FaceGdt]) -> Result<String, Refusal> {
     let Some(datum) = &a.datum else { return Ok(String::new()) };
@@ -988,10 +988,6 @@ fn datum_road(a: &Args, sm: &ScanMesh, design: &scan_core::Design, d: &Deviation
         let k = scan_core::gdt::DATUM_LABELS.iter().position(|&l| l == error.label()).unwrap_or(0);
         Refusal::GdtDatum { face: datum[k].clone(), error }
     })?;
-    for f in g.iter_mut() {
-        if let (scan_core::Nominal::Cylinder(nc), Some(axis)) = (f.nominal, f.axis) {
-            f.position_mm = Some(scan_core::gdt::position_in(&fr, &axis, &nc, f.extent));
-        }
-    }
+    scan_core::gdt::in_frame(g, &fr); // VUGFACEGDTREMEASURE (SR560): the loop lifted into scan_core, the face calls the same fn
     Ok(format!("gdt: frame A={} B={} C={} residual={:.3}\n", datum[0], datum[1], datum[2], fr.residual_mm))
 }

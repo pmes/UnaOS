@@ -827,3 +827,16 @@ impl core::fmt::Display for Callout {
         write!(f, "{}={}:{}", self.face, self.kind.name(), self.tol_mm)
     }
 }
+
+// ---- VUGFACEGDTREMEASURE (LEDGER SR560): the frame applied to a whole reading, one fn for tools/scan and the face ----
+
+/// Every cylinder face of `faces` (as [`gdt`] read them) with its `position_mm` re-read in `frame` through
+/// [`position_in`] (its fitted axis against its nominal over its extent); planes and unmeasured faces unchanged. The one
+/// place a datum frame reaches a reading: tools/scan's `--datum` and vug-view's `datum` command both call it.
+pub fn in_frame(faces: &mut [FaceGdt], frame: &DatumFrame) {
+    for f in faces.iter_mut() {
+        if let (Nominal::Cylinder(nc), Some(axis)) = (f.nominal, f.axis) {
+            f.position_mm = Some(position_in(frame, &axis, &nc, f.extent));
+        }
+    }
+}

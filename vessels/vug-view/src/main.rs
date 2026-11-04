@@ -15,6 +15,7 @@
 //! vug-view scan.ply --against part.vugdoc --out map.png                              # the deviation map (SR525)
 //! vug-view flat.png --side side.png --keys "{Return}" --out part.png              # the side photo's thickness (SR547)
 //! vug-view scan.ply --against part.vugdoc --gdt "<face>=flatness:0.5" --out map.png  # a gdt callout (SR553)
+//! vug-view scan.ply --against part.vugdoc --datum A=<f> B=<f> C=<f> --gdt "<post>=position:1" --out map.png  # a datum frame (SR560)
 //! ```
 //! Key script: one character per shortcut; `{Name}` for a named key.
 
@@ -31,13 +32,14 @@ struct Cli {
     against: Option<String>, // VUGFACEDEVIATION (SR525): the design document a scan is measured against
     side: Option<String>, // VUGFACEPHOTOSIDE (SR547): a photo of the part on its side (the thickness proposal)
     gdt: Vec<String>, // VUGFACEGDT (SR553): each `--gdt <face>=<kind>:<tol>`, a callout on the map
+    datum: Option<String>, // VUGFACEGDTREMEASURE (SR560): `--datum A=<f> B=<f> C=<f>`, the three args as one `datum` command
 }
 
-const USAGE: &str = "usage: vug-view <file.stl|obj|ply|png|jpg> [--preset una|solidworks|fusion|blender|onshape] [--size WxH] [--keys SCRIPT] [--out shot.png] [--against design.vugdoc] [--side side.png] [--gdt face=kind:tol]...";
+const USAGE: &str = "usage: vug-view <file.stl|obj|ply|png|jpg> [--preset una|solidworks|fusion|blender|onshape] [--size WxH] [--keys SCRIPT] [--out shot.png] [--against design.vugdoc] [--side side.png] [--gdt face=kind:tol]... [--datum A=face B=face C=face]";
 
 fn cli() -> Cli {
     let mut a = std::env::args().skip(1);
-    let mut c = Cli { path: String::new(), size: (800, 600), preset: Preset::Una, keys: None, out: None, against: None, side: None, gdt: Vec::new() };
+    let mut c = Cli { path: String::new(), size: (800, 600), preset: Preset::Una, keys: None, out: None, against: None, side: None, gdt: Vec::new(), datum: None };
     while let Some(arg) = a.next() {
         match arg.as_str() {
             "--size" => {
@@ -57,6 +59,7 @@ fn cli() -> Cli {
             "--against" => c.against = a.next(), // VUGFACEDEVIATION (SR525)
             "--side" => c.side = a.next(), // VUGFACEPHOTOSIDE (SR547)
             "--gdt" => c.gdt.extend(a.next()), // VUGFACEGDT (SR553): repeatable
+            "--datum" => c.datum = Some(a.by_ref().take(3).collect::<Vec<_>>().join(" ")), // VUGFACEGDTREMEASURE (SR560): the grammar is deviation::command's
             "--help" | "-h" => {
                 eprintln!("{USAGE}");
                 for (k, what) in vug_view::SHORTCUTS {
@@ -108,6 +111,13 @@ fn main() {
     // VUGFACEGDT (SR553): each `--gdt` names a callout on the map (deviation::command), a refusal named before any frame.
     for g in &cli.gdt {
         if let Err(e) = vug_view::deviation::command(&mut viewer.view, &viewer.model, &format!("gdt {g}")) {
+            eprintln!("vug-view: {e}");
+            std::process::exit(1);
+        }
+    }
+    // VUGFACEGDTREMEASURE (SR560): `--datum` names the frame position reads in (deviation::command), a refusal exits 1.
+    if let Some(d) = &cli.datum {
+        if let Err(e) = vug_view::deviation::command(&mut viewer.view, &viewer.model, &format!("datum {d}")) {
             eprintln!("vug-view: {e}");
             std::process::exit(1);
         }
