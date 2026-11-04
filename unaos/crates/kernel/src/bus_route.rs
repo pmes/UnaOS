@@ -173,6 +173,7 @@ pub fn register(ops: &Ops, row: usize, body: &[u8]) -> i64 {
     if body.iter().any(|&v| v < BUS_VERB_FULFIL_MIN) {
         return EEXIST; // the kernel already fulfils it — kernel fulfilment wins, in v1 always
     }
+    if let Some(st) = tagid_register_gate(ops, row, body) { return st; } // BUSREG-TAG-IDENTITY (B1157): a private tag is registered only by the image the kernel names for it (file tail)
     let rgen = (ops.rgen)(row);
     locked(|| {
         let mut t = REGS.lock();
@@ -224,6 +225,7 @@ pub fn route_request(ops: &Ops, caller_row: usize, caller_gen: u64, caller_prin:
     let Some((ful_row, ful_gen)) = lookup(ops, hdr.verb) else {
         return Route::Reply(ENOENT); // no fulfiller: an answer, never a hang
     };
+    if let Some(st) = tagid_relay_gate(hdr.verb, ful_row, ful_gen) { return Route::Reply(st); } // BUSREG-TAG-IDENTITY (B1157): no private body reaches a holder not named as the fulfiller (file tail)
     if !(ops.has_room)(ful_row) {
         return Route::Reply(EAGAIN);
     }
@@ -444,13 +446,10 @@ pub fn selftest(fx: &Fixture) {
         serial_println!(":: BANDY3: scratch rows {}/{} hold a live registration — fixture SKIP ::", a, f);
         return;
     }
-    // The verb pair: Principia's GET/LIST when no live fulfiller owns them (the normal case), else the
-    // top two registrable tags, so a running PREFS.ELF is never displaced by the fixture.
-    let (vg, vl) = if lookup(fx.ops, una_abi::BUS_VERB_R3PREF_GET).is_none() && lookup(fx.ops, una_abi::BUS_VERB_R3PREF_LIST).is_none() {
-        (una_abi::BUS_VERB_R3PREF_GET, una_abi::BUS_VERB_R3PREF_LIST)
-    } else {
-        (254u8, 255u8)
-    };
+    // The verb pair: the top two registrable tags, always OPEN. BUSREG-TAG-IDENTITY (B1157): Principia's
+    // GET/LIST are held only by a row named PREFS, and the scratch fulfiller is unnamed — its identity legs
+    // are `tagid_selftest`'s, below; a running PREFS.ELF is never displaced either way.
+    let (vg, vl) = (254u8, 255u8);
     (fx.clear)(a);
     (fx.clear)(f);
     let mut w = codec_kats(); // bits 0..3
@@ -519,6 +518,7 @@ pub fn selftest(fx: &Fixture) {
     } else {
         serial_println!(":: BANDY3: registered={} relayed={} replied={} orphan={} w={:#05x}/{:#05x} verbs={}/{} -> FAIL ::", rg, rl, rp, or, w, ALL, vg, vl);
     }
+    tagid_selftest(fx); // BUSREG-TAG-IDENTITY (B1157): the identity legs, after the BANDY3 line
 }
 
 /// HOLOCRON2 (rmbp-ledger B355): does `verb` have a registration right now? (Generation not checked: a row
@@ -549,6 +549,193 @@ pub fn r3pref_set_refused() -> bool {
 /// key only to the process holding Holocron's verbs). Tail append.
 pub fn fulfiller_row(verb: u8) -> Option<(usize, u64)> {
     locked(|| REGS.lock().iter().flatten().find(|r| r.verb == verb).map(|r| (r.row, r.rgen)))
+        .filter(|&(r, _)| matches!(tag_id(verb, r, &mut [0u8; crate::video::wm::MAX_TITLE]), TagId::Open | TagId::Fulfiller)) // BUSREG-TAG-IDENTITY (B1157): a private tag's holder counts only when NAMED its fulfiller (SYS_RINGKEY's trust, B1155's judge)
+}
+
+// =================================================================================================
+// BUSREG-TAG-IDENTITY (rmbp-ledger B1157) — TAIL-APPENDED. REGISTER was first-come for every tag, so a
+// program started before login could claim Principia's 128..=130 or Holocron's 144..=151 and read every
+// relayed body and the session principal in the relayed header. A tag the kernel relays PRIVATE bodies on is
+// now held only by the image the kernel names for it (`TAG_IMAGE`), judged on the ONE program name the kernel
+// already trusts: the launcher-armed name of the row's wm owner (`wm::app_name_of`, PREFSCAP's key — never the
+// body, never the principal, no capability table). The launcher arms AFTER the spawn returns (WINTITLE-LATE,
+// wm.rs `app_name_arm`), and PREFS.ELF registers as its second syscall, so the rule is applied twice: REGISTER
+// refuses a row NAMED as another program (-EACCES); the RELAY — by then the name is armed — refuses any holder
+// not named as the fulfiller (named otherwise, or still unnamed), drops its registration and answers the caller
+// -ENOENT, so no body ever reaches it. `fulfiller_row` (SYS_RINGKEY's trust, B1155's judge) takes the same
+// filter. Every other tag stays open. Residual (docs/SECURITY.md): the name is trusted by spelling, as
+// PREFSCAP's is. Witness: `tests bandy3` → `:: BUSREG-TAGID: … -> PASS ::`.
+// =================================================================================================
+/// (first tag, last tag, the image the kernel names as that range's fulfiller).
+const TAG_IMAGE: &[(u8, u8, &str)] = &[
+    (una_abi::BUS_VERB_R3PREF_GET, una_abi::BUS_VERB_R3PREF_SET, "/apps/PREFS.ELF"),
+    (una_abi::BUS_VERB_HOLOCRON_FIRST, una_abi::BUS_VERB_HOLOCRON_LAST, "/apps/HOLOCRON.ELF"),
+];
+
+/// Private-tag REGISTERs refused, and registrations dropped at the relay or evicted (monotonic since boot).
+pub static TAGID_REFUSED: AtomicU32 = AtomicU32::new(0);
+pub static TAGID_DROPPED: AtomicU32 = AtomicU32::new(0);
+
+/// The image the kernel names for `verb`, `None` = an open tag.
+fn tag_image(verb: u8) -> Option<&'static str> {
+    TAG_IMAGE.iter().find(|&&(lo, hi, _)| (lo..=hi).contains(&verb)).map(|&(_, _, img)| img)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TagId {
+    /// Not a private tag: first-come, as before.
+    Open,
+    /// The row is named as the tag's fulfiller.
+    Fulfiller,
+    /// The row is named as another program.
+    Other,
+    /// No name armed for the row (yet).
+    Unnamed,
+}
+
+/// `row`'s launcher-armed program name, lowercased into `buf` (`""` = none armed). The wm owner is
+/// `owner_of_launch(row)` — x86 row + 1, aarch64 the ASID — the key `prefs::bus_fulfil_from` uses.
+fn row_name(row: usize, buf: &mut [u8; crate::video::wm::MAX_TITLE]) -> &str {
+    let n = crate::video::wm::app_name_of(crate::video::wm::owner_of_launch(row as u64), buf);
+    buf[..n].make_ascii_lowercase();
+    core::str::from_utf8(&buf[..n]).unwrap_or("")
+}
+
+/// Who `row` is for `verb`. Takes no lock but wm's leaf `APP_NAMES` — never called under `REGS`.
+fn tag_id(verb: u8, row: usize, buf: &mut [u8; crate::video::wm::MAX_TITLE]) -> TagId {
+    let Some(img) = tag_image(verb) else { return TagId::Open };
+    let name = row_name(row, buf);
+    if name.is_empty() {
+        TagId::Unnamed
+    } else if name.eq_ignore_ascii_case(crate::video::wm::program_name(img)) {
+        TagId::Fulfiller
+    } else {
+        TagId::Other
+    }
+}
+
+/// Remove exactly the registration `(verb, row, rgen)` that was judged (a re-registration since is untouched).
+fn drop_reg(verb: u8, row: usize, rgen: u64) {
+    locked(|| {
+        for s in REGS.lock().iter_mut() {
+            if s.is_some_and(|r| r.verb == verb && r.row == row && r.rgen == rgen) {
+                *s = None;
+            }
+        }
+    });
+}
+
+/// `register`'s gate: a row named as another program registers no private tag (`Some(-EACCES)`). A private
+/// tag held by a row NAMED as another program (a squatter that registered while still unnamed) is evicted, so
+/// the real fulfiller's REGISTER is not answered -EEXIST by it.
+fn tagid_register_gate(ops: &Ops, row: usize, body: &[u8]) -> Option<i64> {
+    let mut nb = [0u8; crate::video::wm::MAX_TITLE];
+    for &v in body {
+        if tag_id(v, row, &mut nb) == TagId::Other {
+            serial_println!("[busreg] register tag={} by={} refused: not the fulfiller", v, row_name(row, &mut nb));
+            TAGID_REFUSED.fetch_add(1, Ordering::Relaxed);
+            return Some(EACCES);
+        }
+    }
+    for &v in body {
+        if let Some((hr, hg)) = lookup(ops, v) {
+            if hr != row && tag_id(v, hr, &mut nb) == TagId::Other {
+                serial_println!("[busreg] evict tag={} row={} by={}: not the fulfiller", v, hr, row_name(hr, &mut nb));
+                drop_reg(v, hr, hg);
+                TAGID_DROPPED.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+    None
+}
+
+/// `route_request`'s gate: a private tag's request is relayed only to a holder NAMED as its fulfiller; any
+/// other holder loses the registration and the caller is answered `-ENOENT` (no frame reaches the holder).
+fn tagid_relay_gate(verb: u8, ful_row: usize, ful_gen: u64) -> Option<i64> {
+    let mut nb = [0u8; crate::video::wm::MAX_TITLE];
+    let id = tag_id(verb, ful_row, &mut nb);
+    if matches!(id, TagId::Open | TagId::Fulfiller) {
+        return None;
+    }
+    let name = if id == TagId::Unnamed { "unnamed" } else { row_name(ful_row, &mut nb) };
+    serial_println!("[busreg] relay tag={} to=row:{} by={} refused: not the fulfiller — registration dropped", verb, ful_row, name);
+    drop_reg(verb, ful_row, ful_gen);
+    TAGID_DROPPED.fetch_add(1, Ordering::Relaxed);
+    Some(ENOENT)
+}
+
+/// `tests bandy3`' identity legs, on the fixture's scratch rows (caller `a`, fulfiller `f`):
+/// L1 `f` named PROBE registers 130 -> -EACCES; L2 `f` unnamed registers 128 -> 0, the caller's GET 128 ->
+/// KERNEL -ENOENT, `f`'s mailbox stays empty, 128 is dropped; L3 `f` named PREFS registers 128+130 -> 0, the
+/// caller's GET 128 reaches `f` with its body, `fulfiller_row(130)` = `f`. SKIP when a live row holds one of
+/// Principia's tags (a running PREFS.ELF is never disturbed) or `f`'s wm owner already carries a name.
+fn tagid_selftest(fx: &Fixture) {
+    let (a, f) = fx.rows;
+    let owner_f = crate::video::wm::owner_of_launch(f as u64);
+    let (get, set) = (una_abi::BUS_VERB_R3PREF_GET, una_abi::BUS_VERB_R3PREF_SET);
+    if (get..=set).any(|v| lookup(fx.ops, v).is_some()) {
+        serial_println!(":: BUSREG-TAGID: SKIP (a live row holds Principia's tags) ::");
+        return;
+    }
+    if crate::video::wm::app_name_armed(owner_f) {
+        serial_println!(":: BUSREG-TAGID: SKIP (scratch row {} carries a name) ::", f);
+        return;
+    }
+    (fx.clear)(a);
+    (fx.clear)(f);
+    let parse = |b: &[u8]| crate::bus::frame_parse(b).ok();
+    let mut buf = [0u8; 128];
+    let mut w = 0u32;
+
+    // L1: a row named as another program is refused at REGISTER.
+    let _ = crate::video::wm::app_name_arm(owner_f, "/apps/PROBE.ELF");
+    let n = crate::bus::build_request(BUS_VERB_REGISTER, 61, &[set], &mut buf);
+    let refused = (fx.send)(f, &buf[..n]) == 0 && matches!((fx.pop)(f).as_deref().and_then(parse), Some(h) if h.status == EACCES as i32 && h.corr == 61);
+    if refused && lookup(fx.ops, set).is_none() {
+        w |= 1 << 0;
+    }
+    // L2: an unnamed row (the WINTITLE-LATE window) registers, but its first relay drops it — no body.
+    crate::video::wm::app_name_forget(owner_f);
+    let n = crate::bus::build_request(BUS_VERB_REGISTER, 62, &[get], &mut buf);
+    let admitted = (fx.send)(f, &buf[..n]) == 0 && matches!((fx.pop)(f).as_deref().and_then(parse), Some(h) if h.status == 0 && h.corr == 62);
+    let n = crate::bus::build_request(get, 63, b"ui.theme", &mut buf);
+    let sent = (fx.send)(a, &buf[..n]) == 0;
+    let enoent = matches!((fx.pop)(a).as_deref().and_then(parse), Some(h) if h.status == ENOENT as i32 && h.corr == 63 && h.principal[0] == PRIN_KERNEL_REPLY);
+    let unseen = (fx.pop)(f).is_none();
+    if admitted && sent && enoent && unseen && lookup(fx.ops, get).is_none() {
+        w |= 1 << 1;
+    }
+    // L3: the row named PREFS registers and the relay reaches it with the caller's body.
+    let _ = crate::video::wm::app_name_arm(owner_f, "/apps/PREFS.ELF");
+    let n = crate::bus::build_request(BUS_VERB_REGISTER, 64, &[get, set], &mut buf);
+    let ok = (fx.send)(f, &buf[..n]) == 0 && matches!((fx.pop)(f).as_deref().and_then(parse), Some(h) if h.status == 0 && h.corr == 64);
+    let n = crate::bus::build_request(get, 65, b"ui.theme", &mut buf);
+    let sent = (fx.send)(a, &buf[..n]) == 0 && (fx.pop)(a).is_none();
+    let relayed = (fx.pop)(f);
+    let reached = matches!(relayed.as_deref().and_then(parse), Some(h) if h.kind == crate::bus::BUS_KIND_REQUEST && h.verb == get && h.corr != 65)
+        && relayed.as_deref().map(|b| &b[crate::bus::BUS_HDR_LEN..]) == Some(b"ui.theme".as_slice());
+    let holder = matches!(fulfiller_row(set), Some((r, _)) if r == f);
+    if ok && sent && reached && holder {
+        w |= 1 << 2;
+    }
+    on_exit(fx.ops, f);
+    (fx.clear)(a);
+    (fx.clear)(f);
+    on_exit(fx.ops, a);
+    crate::video::wm::app_name_forget(owner_f);
+    const ALL: u32 = (1 << 3) - 1;
+    let (rf, dr) = (TAGID_REFUSED.load(Ordering::Relaxed), TAGID_DROPPED.load(Ordering::Relaxed));
+    if w == ALL {
+        serial_println!(":: BUSREG-TAGID: probe=refused unnamed=dropped prefs=admitted relayed=1 refused={} dropped={} -> PASS ::", rf, dr);
+    } else {
+        serial_println!(
+            ":: BUSREG-TAGID: probe={} unnamed={} prefs={} relayed={} refused={} dropped={} w={:#x}/{:#x} -> FAIL ::",
+            if w & 1 != 0 { "refused" } else { "OPEN" },
+            if w & 2 != 0 { "dropped" } else { "KEPT" },
+            if w & 4 != 0 { "admitted" } else { "REFUSED" },
+            (w >> 2) & 1, rf, dr, w, ALL
+        );
+    }
 }
 
 // =================================================================================================
