@@ -723,14 +723,24 @@ fn veil_login_build() {
         crate::video::wm::desktop::login_veil_drop();
         return;
     };
+    let via = if LV_VIA.swap(0, Ordering::AcqRel) == 1 { "raise" } else { "install" }; // VEIL-LOGIN-HELD (B1128): who asked
+    if via == "install" && LV_OWED.load(Ordering::Acquire) && !crate::boot::screen_is_up() {
+        serial_println!("[veil] login owed at=install"); // VEIL-LOGIN-HELD (B1128): dropped while no screen is up; the next raise builds
+        return;
+    }
+    LV_OWED.store(false, Ordering::Release);
     let (build_us, blit_us, bytes) = crate::video::wm::desktop::login_prefill(&b);
+    let raise_us = build_us.saturating_add(blit_us); // VEIL-LOGIN-HELD (B1128): what a rebuild at the raise costs
+    LV_RAISE_US.store(raise_us, Ordering::Relaxed);
+    LV_HELD.store(raise_us > RAISE_BUDGET_US, Ordering::Release);
     LV_READY.store(false, Ordering::Relaxed);
     LV_SAID.store(false, Ordering::Relaxed);
     LV_LATCHED.store(false, Ordering::Release);
     serial_println!(
-        "[veil] login cost build_us={} blit_us={} panel={}x{} bytes={} a={} kept={}",
-        build_us, blit_us, b.w, b.h, bytes, crate::video::theme::login_veil_a(),
-        if bytes == 0 { "no" } else if cfg!(target_arch = "x86_64") { "yes" } else { "half" } // VEIL-LOGIN-PI (B1122)
+        "[veil] login cost build_us={} blit_us={} panel={}x{} bytes={} a={} kept={} held={} at={}",
+        build_us, blit_us, b.w, b.h, bytes, crate::video::crystal::veil::Look::login().a, // VEIL-REDUCE-ROW (B1128): the applied alpha
+        if bytes == 0 { "no" } else if cfg!(target_arch = "x86_64") { "yes" } else { "half" }, // VEIL-LOGIN-PI (B1122)
+        if raise_us > RAISE_BUDGET_US { "yes" } else { "no" }, via // VEIL-LOGIN-HELD (B1128)
     );
 }
 
@@ -744,7 +754,7 @@ fn veil_login_witness() {
     let (x, y) = ((at >> 32) as usize, (at & 0xFFFF_FFFF) as usize);
     let px = LV_PX.load(Ordering::Relaxed);
     let (sharp, glass) = ((px >> 32) as u32, px as u32);
-    let a = crate::video::theme::login_veil_a();
+    let a = crate::video::crystal::veil::Look::login().a; // VEIL-REDUCE-ROW (B1128): 255 under Reduce transparency
     let mut s = [0u32; 1];
     b.soft(&mut s, x, y);
     let expect = crate::video::draw::blend(s[0], 0, a as u32);
@@ -761,4 +771,57 @@ fn veil_login_witness() {
 fn veil_login_err(a: u32, b: u32) -> u32 {
     let d = |s: u32| ((a >> s) & 255).abs_diff((b >> s) & 255);
     d(16).max(d(8)).max(d(0))
+}
+
+// ── VEIL-LOGIN-HELD (rmbp-ledger B1128, BP-video-11) — TAIL-APPENDED: the login field is freed while no screen is up ──
+// The field (x86 full, aarch64 half) stays allocated only when its rebuild could not hide under the raise: each build
+// measures `build_us + blit_us` (the cost line's own numbers); above the 20 ms route budget the field is HELD through
+// a down (x86 2880x1800: ~72.6 ms by B1116's arithmetic), at or under it the field is dropped at `login::take_down`
+// ([`veil_login_down`]) and rebuilt by [`veil_login_build`] at `login::open_as` ([`veil_login_raise`]) before the
+// screen is marked up, so the raise's own paint copies the kept rows. A moved Reduce transparency pref drops it too
+// ([`veil_login_stale`]): the next build composes at the new alpha (`veil_key` is unchanged).
+// Wire: `[veil] login down held=<yes|no> bytes=<n> raise_us=<n> budget_us=20000` per down; the cost line's
+// ` held=<yes|no> at=<install|raise>`; `:: VEILLOGIN:` once per raise (re-armed at every raise).
+
+/// The route budget the raise's rebuild must fit (the 20 ms a key or press route is held to).
+const RAISE_BUDGET_US: u64 = 20_000;
+/// The last built field survives a down (its rebuild is over [`RAISE_BUDGET_US`]).
+static LV_HELD: AtomicBool = AtomicBool::new(true);
+/// The field was dropped (a down, a moved pref): the next raise rebuilds it.
+static LV_OWED: AtomicBool = AtomicBool::new(false);
+/// `build_us + blit_us` of the last build.
+static LV_RAISE_US: AtomicU64 = AtomicU64::new(0);
+/// Who calls [`veil_login_build`] next: 0 = `install`, 1 = the raise.
+static LV_VIA: AtomicU32 = AtomicU32::new(0);
+
+/// `login::take_down`, after the screen is marked down: free the field unless its rebuild would not fit the raise.
+pub fn veil_login_down() {
+    let bytes = crate::video::wm::desktop::login_veil_bytes();
+    let held = LV_HELD.load(Ordering::Acquire);
+    if !held && bytes > 0 {
+        crate::video::wm::desktop::login_veil_drop();
+        LV_OWED.store(true, Ordering::Release);
+    }
+    serial_println!(
+        "[veil] login down held={} bytes={} raise_us={} budget_us={}",
+        if held { "yes" } else { "no" }, bytes, LV_RAISE_US.load(Ordering::Relaxed), RAISE_BUDGET_US
+    );
+}
+
+/// `login::open_as`, before the screen is marked up: re-arm the witness, and rebuild a dropped field (the cost line
+/// printed again, `at=raise`) while no painter reads it.
+pub fn veil_login_raise() {
+    LV_READY.store(false, Ordering::Relaxed);
+    LV_SAID.store(false, Ordering::Relaxed);
+    LV_LATCHED.store(false, Ordering::Release);
+    if LV_OWED.load(Ordering::Acquire) {
+        LV_VIA.store(1, Ordering::Release);
+        veil_login_build();
+    }
+}
+
+/// The Reduce transparency pref moved (`crystal::login_reduce_load`): drop the field; the next raise rebuilds it.
+pub fn veil_login_stale() {
+    crate::video::wm::desktop::login_veil_drop();
+    LV_OWED.store(true, Ordering::Release);
 }

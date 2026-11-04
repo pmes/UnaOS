@@ -744,3 +744,4 @@ fn knobs_carry_through_reintegrate() {
     assert_eq!(t2.knobs(), k, "reintegrate carries the guard knobs, not Tsdf::new's defaults");
     assert_eq!((t2.frames(), t2.blocks()), (t.frames(), t.blocks()), "the same frames at the same poses fill the same blocks");
 }
+

@@ -1971,7 +1971,7 @@ impl veil::Look {
     /// The login and lock backdrop: black at `theme::login_veil_a()` over the VEIL.
     #[inline]
     pub fn login() -> veil::Look {
-        veil::Look { face: 0x0000_0000, a: crate::video::theme::login_veil_a() }
+        veil::Look { face: 0x0000_0000, a: if login_reduce() { 255 } else { crate::video::theme::login_veil_a() } } // VEIL-REDUCE-ROW (B1128): Reduce transparency = the plain scrim
     }
 }
 
@@ -2256,3 +2256,33 @@ pub mod walk {
     }
 }
 
+// ── VEIL-REDUCE-ROW (rmbp-ledger B1128, BP-video-11) — TAIL-APPENDED: Reduce transparency at the login backdrop ──────
+// `system.accessibility.reduce_transparency` (bool, default off; PREFS-SCHEMA.md, writer operator until a Settings row
+// exists) makes `veil::Look::login` the plain scrim: black at 255, `veil::row`'s fill with no VEIL sample
+// (DESIGN-LANGUAGE §2.4's Reduce transparency). Latched like SHIMMERPREF's row: read once by `settings::a11y_load`
+// ("login" and "prefchanged") through [`login_reduce_load`]; painters read the atomic. A move drops the kept login
+// field (`wallpaper::veil_login_stale`), so the next build composes at the new alpha. Wire: `[veil] login
+// reduce_transparency=<0|1> a=<n>` on a move.
+
+/// The applied pref (the schema's default: off).
+static LOGIN_REDUCE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Reduce transparency, as applied to the login and lock backdrop.
+#[inline]
+pub fn login_reduce() -> bool {
+    LOGIN_REDUCE.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// `settings::a11y_load`'s read of the row (the schema's default where unset): latch it, answer 1 when it moved.
+pub fn login_reduce_load() -> u8 {
+    let on = crate::prefs_client::sys_flag(crate::prefs::key::A11Y_REDUCE_TRANSPARENCY).unwrap_or(false);
+    if LOGIN_REDUCE.swap(on, core::sync::atomic::Ordering::Relaxed) == on {
+        return 0;
+    }
+    #[cfg(feature = "facet")]
+    {
+        crate::video::wallpaper::veil_login_stale();
+    }
+    serial_println!("[veil] login reduce_transparency={} a={}", on as u8, veil::Look::login().a);
+    1
+}

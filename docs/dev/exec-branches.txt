@@ -1377,9 +1377,15 @@ exec-rmbp-vugfacegdtreport 3d5151e40 wave36 cut53
 exec-rmbp-vugfacejournalsolidfault 3d5151e40 wave36 cut53
 exec-rmbp-vugcomscanjog 3d5151e40 wave36 cut53
 exec-rmbp-vugscantsdfedgelateral 3d5151e40 wave36 cut53
-exec-rmbp-f39settingsarrowsense be6016e00 wave36 cut54
-exec-rmbp-f39veilloginheld be6016e00 wave36 cut54
-exec-rmbp-f39continueclosedrain be6016e00 wave36 cut54
-exec-rmbp-f39sessionlineforeign be6016e00 wave36 cut54
-exec-rmbp-f39unafslockdeathpath be6016e00 wave36 cut54
-exec-rmbp-f39quarrymenua11ywitness be6016e00 wave36 cut54
+exec-rmbp-f39settingsarrowsense 4bbe5a309 FOLDED (kernel batch B1127-B1132)
+exec-rmbp-f39veilloginheld 4951f1b0d FOLDED (kernel batch B1127-B1132)
+exec-rmbp-f39continueclosedrain 092a1a9e2 FOLDED (kernel batch B1127-B1132)
+exec-rmbp-f39sessionlineforeign 6e900b25b FOLDED (kernel batch B1127-B1132)
+exec-rmbp-f39unafslockdeathpath 5e9de42ce FOLDED (kernel batch B1127-B1132)
+exec-rmbp-f39quarrymenua11ywitness e703f6baa FOLDED (kernel batch B1127-B1132)
+exec-rmbp-vugfacegdtreportkey 07d28b882 wave36 cut54
+exec-rmbp-vugfacephotocamerapref 07d28b882 wave36 cut54
+exec-rmbp-vugintentsinglerenamed 07d28b882 wave36 cut54
+exec-rmbp-vugfacejournalfaultfix 07d28b882 wave36 cut54
+exec-rmbp-vugcomscanjogface 07d28b882 wave36 cut54
+exec-rmbp-vugscantsdfedgesubpixel 07d28b882 wave36 cut54

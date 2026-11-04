@@ -209,6 +209,6 @@ pub fn flightring_selftest() {
 pub fn diet_line() {
     let lines = crate::serial_ring::SUBMITTED.load(core::sync::atomic::Ordering::Relaxed);
     let up_ms = crate::arch::ms().max(1);
-    serial_println!("[flightring] diet lines={} up_ms={} per_min={}", lines, up_ms, lines.saturating_mul(60_000) / up_ms);
+    if !crate::boot::session_fold() { serial_println!("[flightring] diet lines={} up_ms={} per_min={}", lines, up_ms, lines.saturating_mul(60_000) / up_ms); } // SESSIONLINEFOREIGN (rmbp-ledger B1130): folds on the session press into `[session] opened … deferred=` (boot.rs tail, B1121). LINE-NEUTRAL, code first
 }
 

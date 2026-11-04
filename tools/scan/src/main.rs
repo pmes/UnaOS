@@ -159,7 +159,7 @@ struct Args {
     voxel: f64,
     trunc: Option<f64>,
     band: f64,
-    against: Option<String>, intent: Option<Option<String>>, gdt: Vec<(String, scan_core::Kind, f64)>, datum: Option<[String; 3]>, vugreport: Option<String>, edge: Option<f64>, edge_far: Option<f64>, // VUGSCANTSDFEDGELATERAL (SR574) edge / edge_far; VUGSCANDEVIATION (SR510); VUGSCANGDT (SR542) gdt; VUGSCANGDTDATUMS (SR552) datum; VUGFACEGDTREPORT (SR571) vugreport
+    against: Option<String>, intent: Option<Option<String>>, gdt: Vec<(String, scan_core::Kind, f64)>, datum: Option<[String; 3]>, vugreport: Option<String>, edge: Option<f64>, edge_far: Option<f64>, // VUGSCANDEVIATION (SR510); VUGSCANGDT (SR542) gdt; VUGSCANGDTDATUMS (SR552) datum; VUGFACEGDTREPORT (SR571) vugreport; VUGSCANTSDFEDGELATERAL (SR574) edge / edge_far
 }
 
 fn num<T: std::str::FromStr>(it: &mut impl Iterator<Item = String>) -> T {
@@ -1023,3 +1023,4 @@ fn knobs_of(a: &Args) -> scan_core::tsdf::Knobs {
     let off = scan_core::tsdf::Knobs::OFF;
     scan_core::tsdf::Knobs { edge_mm: a.edge.unwrap_or(off.edge_mm), edge_far_mm: a.edge_far.unwrap_or(off.edge_far_mm) }
 }
+

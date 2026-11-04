@@ -144,7 +144,7 @@ pub fn expose_all(why: &str) -> usize {
             ok += painted(x, y, w, h) as usize;
         }
     }
-    serial_println!("[fbdirect] expose why={} rects={} px={} handed={} painted={}", why, n, px, HANDED.load(Relaxed), ok);
+    if !crate::boot::session_fold() { serial_println!("[fbdirect] expose why={} rects={} px={} handed={} painted={}", why, n, px, HANDED.load(Relaxed), ok); } // SESSIONLINEFOREIGN (rmbp-ledger B1130): `why=desktop-built` folds on the session press into `[session] opened … deferred=` (boot.rs tail, B1121); `why=screen-open` (no fold open) prints. LINE-NEUTRAL, code first
     n
 }
 
