@@ -3747,7 +3747,7 @@ pub fn menuscraft_selftest() {
     let glyphs_ok = seated_live > 0 && drawn_live == seated_live && inside && gap_ok;
 
     // ── leg 3 (MENUS2, B652): the context menus on the sheet, the wallpaper generation in the seal, the exact band ──
-    let dock_ok = super::dock::sheet_probe();
+    let dock_ok = super::dock::sheet_probe(); let winmenu_ok = winmenu_keys_leg(); // F39SETTINGSARROWSENSE (B1127): the window menu's key walk, offscreen (LINE-NEUTRAL; body at the file tail)
     #[cfg(feature = "quarry")]
     let (quarry_ok, band_exact) = super::quarry::live::ops::sheet_probe();
     #[cfg(not(feature = "quarry"))]
@@ -3755,7 +3755,7 @@ pub fn menuscraft_selftest() {
     let (e, g) = (theme::epoch(), strip::wall_gen());
     let wall_ok = strip::seal(1) == strip::seal_with(1, e, g) && strip::seal_with(1, e, g) != strip::seal_with(1, e, g ^ 1);
     let q = |b: bool| if !cfg!(feature = "quarry") { "n/a" } else if b { "ok" } else { "BAD" };
-    let ok = sheet_ok && glyphs_ok && dock_ok && quarry_ok && band_exact && wall_ok;
+    let ok = sheet_ok && glyphs_ok && dock_ok && quarry_ok && band_exact && wall_ok && winmenu_ok;
     serial_println!(
         ":: MENUSCRAFT: sheet={}x{} band={} corners={} face={} hairline={} shadow={}({}<{},{}) pill={} white={} glyphs={}/{} inside={} gap={}({}) dock_menu={} quarry_menu={} wallpaper_gen={} band_exact={} -> {} ::",
         w, h, band, if corners { "ok" } else { "BAD" }, if face_ok { "ok" } else { "BAD" }, if hairline { "ok" } else { "BAD" },
@@ -4020,4 +4020,19 @@ pub mod micdot {
         draw(&mut row, w, h, j, slot_at(w, 0));
         Some((on, row[cx], theme::accent()))
     }
+}
+
+// ── F39SETTINGSARROWSENSE (rmbp-ledger B1127): `tests menuscraft`'s window-menu key leg (WINMENU-PROBE-KEYS) ─────────
+
+/// F39SETTINGSARROWSENSE — the window menu's walk glue (`winmenu::walk_probe`: the fns `winmenu::key_walk` calls) on a
+/// synthetic [item, separator, disabled, item, item] menu: Down, Down, Return picks row 3, the separator and the
+/// disabled row skipped. One `[menuscraft] winmenu_keys` line; rides the `:: MENUSCRAFT:` verdict.
+fn winmenu_keys_leg() -> bool {
+    let (rows, picked) = super::winmenu::walk_probe();
+    let ok = rows == 5 && picked == Some(3);
+    match picked {
+        Some(i) => serial_println!("[menuscraft] winmenu_keys rows={} picked={} -> {}", rows, i, if ok { "ok" } else { "BAD" }),
+        None => serial_println!("[menuscraft] winmenu_keys rows={} picked=- -> BAD", rows),
+    }
+    ok
 }

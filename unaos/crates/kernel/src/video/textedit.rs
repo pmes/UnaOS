@@ -541,8 +541,8 @@ pub fn key_route(ev: crate::pal::Event) -> bool {
             0x20..=0x7e => run(Op::Type(c)),
             0x0A | 0x0D => run(Op::Type(b'\n')),
             0x08 | 0x7F => run(Op::Back),
-            0x1E => run(Op::Up),
-            0x1F => run(Op::Down),
+            una_abi::KEY_UP => run(Op::Up), // F39SETTINGSARROWSENSE (B1127): una_abi's KEY_UP is 0x1F (was 0x1E: Up moved the caret down)
+            una_abi::KEY_DOWN => run(Op::Down),
             // Left/Right bytes are typed alongside their resolved ACTION; the action moves the caret.
             0x1C | 0x1D => true,
             0x1B => run(Op::Deselect),

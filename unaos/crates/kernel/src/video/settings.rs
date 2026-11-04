@@ -1750,18 +1750,18 @@ pub fn key_route(ev: crate::pal::Event) -> bool {
                 // other key is the field's (`users_form_key`: typing, Backspace, Return to the next field, Escape).
                 let on_btn = STATE.lock().as_ref().is_some_and(|x| !x.strip && x.kf >= 3);
                 return match c {
-                    0x09 | 0x1F => { walk(tab, true); true }
-                    0x1E => { walk(tab, false); true }
+                    0x09 | una_abi::KEY_DOWN => { walk(tab, true); true }
+                    una_abi::KEY_UP => { walk(tab, false); true }
                     0x0A | 0x0D | 0x20 if on_btn => { key_act(tab, 0); true }
                     _ => users_form_key(c),
                 };
             }
             match c {
                 0x1C | 0x1D => true,
-                0x1E => { if strip { strip_step(tab, false); } else { walk(tab, false); } true } // Up: previous stop; from the first, the column
-                0x1F if strip => { strip_step(tab, true); true } // SETTINGSTABS: Down on the column, the next tab (SETTINGSCRAFT: of those the search lists)
+                una_abi::KEY_UP => { if strip { strip_step(tab, false); } else { walk(tab, false); } true } // Up: previous stop; from the first, the column. F39SETTINGSARROWSENSE (B1127): the arms name una_abi's KEY_UP (0x1F) / KEY_DOWN (0x1E); they read 0x1E as Up
+                una_abi::KEY_DOWN if strip => { strip_step(tab, true); true } // SETTINGSTABS: Down on the column, the next tab (SETTINGSCRAFT: of those the search lists)
                 0x09 if !strip => { if let Some(x) = STATE.lock().as_mut() { x.strip = true; x.pend = None; } repaint(); true } // SETTINGSTABS: Tab, pane -> column
-                0x1F | 0x09 => { walk(tab, true); true } // Tab from the column: the first stop; Down in the pane: the next
+                una_abi::KEY_DOWN | 0x09 => { walk(tab, true); true } // Tab from the column: the first stop; Down in the pane: the next
                 0x1B if tab == 2 && STATE.lock().as_ref().is_some_and(|x| x.modes_open) => { if let Some(x) = STATE.lock().as_mut() { x.modes_open = false; } repaint(); true } // PICKERKEYS: Escape closes the Resolution popup
                 0x1B if tab == 1 => { if let Some(x) = STATE.lock().as_mut() { x.u.confirm = None; } repaint(); true }
                 0x1B if !strip && STATE.lock().as_ref().is_some_and(|x| x.pend.is_some()) => { if let Some(x) = STATE.lock().as_mut() { x.pend = None; } repaint(); true } // PICKERKEYS: Escape drops a pending segment
@@ -1814,11 +1814,11 @@ fn search_key(ev: crate::pal::Event) -> bool {
         match c {
             0x08 | 0x7F => { x.query.pop(); }
             0x1B => { x.query.clear(); x.search = false; }
-            0x0A | 0x0D | 0x1F => {
+            0x0A | 0x0D | una_abi::KEY_DOWN => {
                 let (list, n) = col_list(&x.query);
                 x.search = false;
                 x.strip = true;
-                hit = if c == 0x1F { None } else { search_best(&x.query) };
+                hit = if c == una_abi::KEY_DOWN { None } else { search_best(&x.query) };
                 if hit.is_none() && n > 0 { pick = Some(list[0] as usize); }
                 x.col_top = 0;
             }
@@ -1862,8 +1862,8 @@ fn users_form_key(c: u8) -> bool {
         let u = &mut x.u;
         match c {
             0x1B => { u.form = false; }
-            0x09 | 0x1F => u.focus = (u.focus + 1) % 3,
-            0x1E => u.focus = (u.focus + 2) % 3,
+            0x09 | una_abi::KEY_DOWN => u.focus = (u.focus + 1) % 3,
+            una_abi::KEY_UP => u.focus = (u.focus + 2) % 3,
             0x0A | 0x0D => { if u.focus < 2 { u.focus += 1; } else { submit = true; } }
             0x08 | 0x7F => { match u.focus { 0 => { u.name.pop(); } 1 => { u.pw.pop(); } _ => { u.pw2.pop(); } } }
             0x20..=0x7e => {
