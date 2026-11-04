@@ -743,6 +743,11 @@ pub enum PrincipiaCommand {
         key: String,
         value: PrefValue,
     },
+    /// PRINCIPIA-UNSET-SYNAPSE (LEDGER SR603): unset one preference (the key leaves the store; every reader answers
+    /// the schema's or the consumer's default). On success Principia answers [`PrincipiaCommand::PrefValueIs`] with
+    /// `value: None` (the typed reading of the PREF_CHANGED unset form it posts, `prefs_core::wire::unset_body`); on
+    /// rejection (malformed name, unset already, a held domain or a failed write) [`PrincipiaCommand::PrefError`].
+    PrefUnset { ns: String, key: String },
     /// Ask for every set key in one namespace. Answered by
     /// [`PrincipiaCommand::PrefListIs`].
     PrefList { ns: String },

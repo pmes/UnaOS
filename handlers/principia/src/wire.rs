@@ -130,17 +130,34 @@ mod tests {
 /// (19) body the transport posts), `(-ENOENT, [])` when it was unset already (nothing written), `(-EIO, [])` on a held
 /// domain or a failed write (the store rolled back).
 pub fn unset(store: &mut PrefStore, body: &[u8], in_session: bool) -> (i64, Vec<u8>) {
+    let Some((ns, k)) = prefs_core::wire::parse_get(body) else { return (prefs_core::wire::EINVAL, Vec::new()) };
+    match unset_key(store, ns, k, in_session) {
+        Ok(posted) => (0, posted),
+        Err((st, _)) => (st, Vec::new()),
+    }
+}
+
+/// PRINCIPIA-UNSET-SYNAPSE (SR603): the ONE unset after the address, shared by the byte request ([`unset`]) and the
+/// typed `PrincipiaCommand::PrefUnset` arm (which enters with `(ns, key)`: re-joining them as `<ns>.<key>` and
+/// re-parsing would split a dotted namespace at its first dot). The refusals in SET's order, each with its words:
+/// -EINVAL the host store's own name words ([`crate::prefs::validate_ns`] / [`crate::prefs::validate_key`], the SET
+/// arm's); -EACCES outside the session or past [`prefs_core::cap::may_set`]; then [`PrefStore::unset`]: `Ok(unset_body)`
+/// when a value left the store, -ENOENT unset already, -EIO held or the write (the store's words, logged). The kernel's
+/// unset bus verb (F39PREFSUNSETBUS B1166, owed PREFS-UNSET-VERB) is the arm that will call this.
+pub fn unset_key(store: &mut PrefStore, ns: &str, k: &str, in_session: bool) -> Result<Vec<u8>, (i64, String)> {
     use prefs_core::wire::{Caller, EACCES, EINVAL, EIO, ENOENT};
-    let Some((ns, k)) = prefs_core::wire::parse_get(body) else { return (EINVAL, Vec::new()) };
+    if let Err(e) = crate::prefs::validate_ns(ns).and_then(|()| crate::prefs::validate_key(k)) {
+        return Err((EINVAL, format!("{e:#}")));
+    }
     if !in_session || !prefs_core::cap::may_set(Caller::Kernel, ns, k) {
-        return (EACCES, Vec::new());
+        return Err((EACCES, format!("{ns}.{k}: not settable outside the session")));
     }
     match PrefStore::unset(store, ns, k) {
-        Ok(true) => (0, prefs_core::wire::unset_body(ns, k)),
-        Ok(false) => (ENOENT, Vec::new()),
+        Ok(true) => Ok(prefs_core::wire::unset_body(ns, k)),
+        Ok(false) => Err((ENOENT, format!("{ns}.{k} is unset already"))),
         Err(e) => {
             log::warn!("[PRINCIPIA] :: wire unset {ns}.{k} failed: {e:#}");
-            (EIO, Vec::new())
+            Err((EIO, format!("{e:#}")))
         }
     }
 }
