@@ -9,7 +9,7 @@
 //! * **event codes** — `una_abi::INPUT_EV_ALL` unique and non-zero (DIALOG2's `INPUT_EV_DIALOG_ANSWER`, APPMENU2's
 //!   `INPUT_EV_CLOSE_REQ`);
 //! * **bus verbs** — the kernel's `BUS_VERB_ALL` (smallfix3's rule) AND the REGISTRABLE tags the kernel itself names
-//!   ([`REGISTRABLE`]: the R3PREF trio — PREFSCAP's deputy gate keys on SET), each `>= BUS_VERB_FULFIL_MIN`,
+//!   ([`REGISTRABLE`]: the R3PREF four — PREFSCAP's deputy gate keys on SET and UNSET, PREFS-UNSET-RELAY B1186), each `>= BUS_VERB_FULFIL_MIN`,
 //!   unique, and clear of the HOLOCRON band (a const assertion fails the build);
 //! * **shell verbs** — `midden_core::HOST_VERBS` names unique (GATE-VERBS lists them; two arcs adding one verb on
 //!   two branches would dispatch the first only);
@@ -20,8 +20,8 @@
 //! Witness: `:: SMALLFIX4: event_codes=unique bus_verbs=unique registrable=unique host_verbs=unique
 //! action_codes=unique launch_name=<name> -> PASS :: …`.
 
-/// The registrable bus tags the kernel names (`>= BUS_VERB_FULFIL_MIN`): the R3PREF trio.
-pub const REGISTRABLE: &[u8] = &[una_abi::BUS_VERB_R3PREF_GET, una_abi::BUS_VERB_R3PREF_LIST, una_abi::BUS_VERB_R3PREF_SET];
+/// The registrable bus tags the kernel names (`>= BUS_VERB_FULFIL_MIN`): the R3PREF four (PREFS-UNSET-RELAY B1186: + UNSET 131).
+pub const REGISTRABLE: &[u8] = &[una_abi::BUS_VERB_R3PREF_GET, una_abi::BUS_VERB_R3PREF_LIST, una_abi::BUS_VERB_R3PREF_SET, una_abi::BUS_VERB_R3PREF_UNSET];
 
 /// Every [`REGISTRABLE`] tag is registrable, unique, and outside the HOLOCRON band.
 pub const fn registrable_unique() -> bool {

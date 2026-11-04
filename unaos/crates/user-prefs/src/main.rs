@@ -25,13 +25,14 @@
 // `prefs_core` — by asking the kernel's store verbs (PREF_GET/SET/LIST 16..=18) under its OWN principal. The
 // kernel's Settings window is a bus client (`prefs_client.rs`) and reaches the store THROUGH this program
 // while it runs. `TABLE` is the fallback for its own demo keys. PrefChanged to ring 3 is OWED.
+// PREFS-UNSET-RELAY (B1186): it registers R3PREF_UNSET 131 too and forwards it to PREF_UNSET (29) under its own name.
 //
 // ---------------------------------------------------------------------------------------------
 // Syscall stubs — the user-pulse stubs verbatim (see that crate for the register-clobber contract).
 // ---------------------------------------------------------------------------------------------
 use una_abi::{
     BUS_FRAME_MAX, BUS_HDR_LEN, BUS_KIND_REPLY, BUS_KIND_REQUEST, BUS_MAGIC, BUS_VERB_LS, BUS_VERB_PREF_GET,
-    BUS_VERB_PREF_LIST, BUS_VERB_PREF_SET, BUS_VERB_R3PREF_GET, BUS_VERB_R3PREF_LIST, BUS_VERB_R3PREF_SET, BUS_VERB_REGISTER,
+    BUS_VERB_PREF_LIST, BUS_VERB_PREF_SET, BUS_VERB_PREF_UNSET, BUS_VERB_R3PREF_GET, BUS_VERB_R3PREF_LIST, BUS_VERB_R3PREF_SET, BUS_VERB_R3PREF_UNSET, BUS_VERB_REGISTER,
     BUS_VERSION, ENOENT, SYS_EXIT, SYS_MRECV, SYS_MSEND, SYS_WRITE,
 };
 
@@ -320,6 +321,15 @@ fn serve(h: &Hdr) -> i32 {
             },
         },
         BUS_VERB_R3PREF_SET => forward(BUS_VERB_PREF_SET, body).0,
+        // PREFS-UNSET-RELAY (B1186): the kernel client's unset, forwarded under THIS program's name; PREF_UNSET's own
+        // reply body (the unset form) is passed back, so the relayed answer is the kernel fulfiller's bytes.
+        BUS_VERB_R3PREF_UNSET => match forward(BUS_VERB_PREF_UNSET, body) {
+            (0, n) => {
+                len = n;
+                0
+            }
+            (s, _) => s,
+        },
         BUS_VERB_R3PREF_LIST => {
             // A namespace (no dot) or empty asks the store; a dotted prefix is the v1 table's form.
             if !body.contains(&b'.') {
@@ -445,7 +455,7 @@ pub extern "C" fn _start() -> ! {
     //    SYS_MSEND with -EINVAL, and the program says so and exits — nothing to serve.)
     let probe = ask(BUS_VERB_R3PREF_GET, 1, PROBE_KEY);
     // 2. register Principia's two read verbs.
-    let register = ask(BUS_VERB_REGISTER, 2, &[BUS_VERB_R3PREF_GET, BUS_VERB_R3PREF_LIST, BUS_VERB_R3PREF_SET]); // SETTINGSBUS: + the write tag
+    let register = ask(BUS_VERB_REGISTER, 2, &[BUS_VERB_R3PREF_GET, BUS_VERB_R3PREF_LIST, BUS_VERB_R3PREF_SET, BUS_VERB_R3PREF_UNSET]); // SETTINGSBUS: + the write tag. PREFS-UNSET-RELAY (B1186): + the unset tag
     // 3. a kernel-owned verb cannot be taken over.
     let kernel_tag = ask(BUS_VERB_REGISTER, 3, &[BUS_VERB_LS]);
     // 4. self_get: the relayed request arrives here with a kernel stamp; answer it; read the answer.

@@ -3644,3 +3644,16 @@ mod mailboxkeep_tests {
 /// Bus verb: unset one preference (the key reads its default again; session user only, SET's capability).
 pub const BUS_VERB_PREF_UNSET: u8 = 29;
 const _: () = assert!(BUS_VERB_PREF_UNSET > BUS_VERB_SCROLL_SET && BUS_VERB_PREF_UNSET < BUS_VERB_AUDIO_SOURCE_OPEN);
+
+// =================================================================================================
+// PREFS-UNSET-RELAY (rmbp-ledger B1186) — Principia's ring-3 UNSET tag beside R3PREF_SET (130). The kernel's preference
+// client (`prefs_client.rs`) offers every PREF_UNSET (29) to whoever holds this tag (PREFS.ELF, judged by
+// `bus_route`'s TAG_IMAGE) before the kernel fulfiller answers; PREFS.ELF forwards it to PREF_UNSET under its own
+// stamped name. Body = the GET address `<ns>.<key>`; reply = PREF_UNSET's. 131 from any row but the kernel client is
+// -EACCES (`bus_route::pref_gate`, the deputy door). Registrable range: not in BUS_VERB_ALL (130's precedent);
+// pinned unique by the kernel's `smallfix4::REGISTRABLE`. Appended at the file tail.
+// =================================================================================================
+
+/// Principia's ring-3 unset tag (the kernel client's relay of PREF_UNSET).
+pub const BUS_VERB_R3PREF_UNSET: u8 = 131;
+const _: () = assert!(BUS_VERB_R3PREF_UNSET == BUS_VERB_R3PREF_SET + 1 && BUS_VERB_R3PREF_UNSET < BUS_VERB_HOLOCRON_FIRST);
