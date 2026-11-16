@@ -1241,3 +1241,14 @@ pub fn open_line(i: &MediaInfo) -> String {
     let or_dash = |s: &str| if s.is_empty() { "-".to_string() } else { s.to_string() };
     format!("[STRIA] :: open: video={} audio={} size={}x{} duration_ns={} bitrate=\"{}\"", or_dash(&i.video), or_dash(&i.audio), i.width, i.height, i.duration_ns, i.bitrate)
 }
+
+// ---- STRIAINFOBITRATEFACE (LEDGER SR734): MediaOpened's one-line summary for a person (named tail block) ----
+// The open wire's twin for people: bandy `SMessage::MediaOpened.info`, filled by media_bus's two open sites. Built only from
+// MediaInfo's own strings (`video_profile` as gneiss_pal's profile_tokens wrote it, `bitrate` as `bitrate_of` filled it). Owed:
+// STRIA-INFO-FACE-HOST (no host player face reads MediaOpened; stria-view is the editor), STRIA-INFO-FACE-KERNEL, STRIA-INFO-REEL.
+
+/// `<video codec> <W>x<H> <profile tokens> <bit rate>`, empty parts dropped (an audio-only file: its `~` rate alone; none: "").
+pub fn summary_line(i: &MediaInfo) -> String {
+    let size = if i.width > 0 && i.height > 0 { format!("{}x{}", i.width, i.height) } else { String::new() };
+    [i.video.as_str(), size.as_str(), i.video_profile.as_str(), i.bitrate.as_str()].iter().filter(|s| !s.is_empty()).copied().collect::<Vec<&str>>().join(" ")
+}

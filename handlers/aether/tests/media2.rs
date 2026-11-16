@@ -79,7 +79,7 @@ fn frame(url: &str, pts_ns: i64) -> SMessage {
 }
 
 fn opened(url: &str, duration_ns: u64) -> SMessage {
-    SMessage::MediaOpened { url: url.into(), duration_ns, width: 160, height: 120, video: "utp1".into(), audio: String::new(), real_video: true, audio_clock: false }
+    SMessage::MediaOpened { url: url.into(), duration_ns, width: 160, height: 120, video: "utp1".into(), audio: String::new(), real_video: true, audio_clock: false, info: String::new() }
 }
 
 /// Rule (MSE §2.4.1, §3.2, §3.5): a MediaSource attached through `URL.createObjectURL` opens
@@ -235,7 +235,7 @@ var v = document.querySelector('video');
         "1|subtitles|English|en|showing|2|2|one|0.5|Second\nline two"
     );
     eval(&mut e, "tt.cues[0].onenter = function () { log.push('enter'); };");
-    e.on_media_message(&SMessage::MediaOpened { url: key.clone(), duration_ns: 4_000_000_000, width: 4, height: 4, video: "V_VP8".into(), audio: String::new(), real_video: true, audio_clock: false });
+    e.on_media_message(&SMessage::MediaOpened { url: key.clone(), duration_ns: 4_000_000_000, width: 4, height: 4, video: "V_VP8".into(), audio: String::new(), real_video: true, audio_clock: false, info: String::new() });
     e.on_media_message(&frame(&key, 600_000_000));
     settle(&mut e);
     assert_eq!(eval(&mut e, "log.join(' ')"), "enter cuechange:1 track-cuechange");
@@ -281,7 +281,7 @@ fn preload_auto_fires_progress_then_suspend() {
     let mut e = load("file:///page/pl.html", r#"<html><body><video src="a.webm" preload="auto"></video></body></html>"#);
     let a = node(&e, 0);
     let url = e.media_elements()[0].url.clone();
-    e.on_media_message(&SMessage::MediaOpened { url: url.clone(), duration_ns: 1_000_000_000, width: 4, height: 4, video: "V_VP9".into(), audio: String::new(), real_video: true, audio_clock: false });
+    e.on_media_message(&SMessage::MediaOpened { url: url.clone(), duration_ns: 1_000_000_000, width: 4, height: 4, video: "V_VP9".into(), audio: String::new(), real_video: true, audio_clock: false, info: String::new() });
     e.on_media_message(&frame(&url, 0));
     let ev = media::events(&a);
     assert!(ev.ends_with(&["canplaythrough", "progress", "suspend"]), "{ev:?}");
@@ -297,7 +297,7 @@ fn rate_range_video_frame_callback_and_refusals() {
     let mut e = load("file:///page/r.html", r#"<html><body><video src="a.webm"></video><script>window.log = []; var v = document.querySelector('video');</script></body></html>"#);
     let url = e.media_elements()[0].url.clone();
     let _ = e.take_media_requests();
-    e.on_media_message(&SMessage::MediaOpened { url: url.clone(), duration_ns: 1_000_000_000, width: 4, height: 4, video: "V_VP9".into(), audio: String::new(), real_video: true, audio_clock: false });
+    e.on_media_message(&SMessage::MediaOpened { url: url.clone(), duration_ns: 1_000_000_000, width: 4, height: 4, video: "V_VP9".into(), audio: String::new(), real_video: true, audio_clock: false, info: String::new() });
     assert_eq!(eval(&mut e, "v.playbackRate = 2; try { v.playbackRate = 20; 'no' } catch (x) { x.name + ' ' + v.playbackRate }"), "NotSupportedError 2");
     assert!(e.take_media_requests().iter().any(|m| matches!(m, SMessage::MediaRate { rate, .. } if *rate == 2.0)));
 

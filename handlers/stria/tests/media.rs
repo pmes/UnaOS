@@ -1912,3 +1912,64 @@ fn striainfobitrate_forms() {
     assert_eq!(bitrate_of(None, None, 0, 1_000_000_000), "");
     assert_eq!(bitrate_of(None, None, 125_000, 0), "");
 }
+
+// ---- STRIAINFOBITRATEFACE (LEDGER SR734): MediaOpened carries the one-line summary (named tail block) ----
+/// Open `file` through the bus (`MediaPoster`) and return its `MediaOpened.info`.
+fn striainfobitrateface_bus_info(name: &str, file: &[u8]) -> String {
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("striainfobitrateface");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(name);
+    std::fs::write(&path, file).unwrap();
+    let url = format!("file://{}", path.display());
+    let synapse = Synapse::new();
+    let mut rx = synapse.subscribe();
+    let svc = MediaService::spawn(synapse.clone(), 120, false);
+    synapse.fire(SMessage::MediaPoster { url: url.clone() });
+    let t0 = Instant::now();
+    let mut info = None;
+    while info.is_none() && t0.elapsed() < Duration::from_secs(20) {
+        match rx.try_recv() {
+            Ok(SMessage::MediaOpened { url: u, info: s, .. }) if u == url => info = Some(s),
+            Ok(SMessage::MediaError { url: u, error }) if u == url => panic!("{name}: {error}"),
+            Ok(_) => {}
+            Err(_) => std::thread::sleep(Duration::from_millis(2)),
+        }
+    }
+    drop(svc);
+    info.unwrap_or_else(|| panic!("{name}: no MediaOpened"))
+}
+
+/// STRIAINFOBITRATEFACE (SR734): SR728's CBR 400 + HRD export, opened through the bus, fires MediaOpened whose `info` is the
+/// codec, the size, the SPS's profile tokens and the bit rate (`summary_line` of the Player's own MediaInfo); its PCM WAV's is the
+/// measured `~` rate alone (no video codec, no size).
+#[test]
+fn striainfobitrateface_bus_cbr_hrd_and_wav() {
+    let enc = stria::nle_export::H264Encoder::new(26, 10).with_bitrate(400, 25, 1).with_hrd(true);
+    let (mp4, wav) = striainfobitrate_export("face_cbr_hrd", enc);
+    let avg = striainfobitrate_avg(&mp4) as u64;
+    let mp4_info = striainfobitrateface_bus_info("cbr_hrd.mp4", &mp4);
+    assert_eq!(mp4_info, format!("avc1 64x48 profile=Baseline level=1 {} kb/s (HRD 400)", (avg + 500) / 1000));
+    let p = Player::open(mp4, Arc::new(ManualTime::new()), None, 60).unwrap();
+    assert_eq!(mp4_info, stria::media::summary_line(p.info()));
+    let wav_info = striainfobitrateface_bus_info("audio.wav", &wav);
+    let p = Player::open(wav, Arc::new(ManualTime::new()), None, 60).unwrap();
+    assert!(wav_info.starts_with('~') && wav_info.ends_with(" kb/s"), "{wav_info}");
+    assert_eq!(wav_info, p.info().bitrate);
+    println!("striainfobitrateface: mp4=\"{mp4_info}\" wav=\"{wav_info}\"");
+}
+
+/// STRIAINFOBITRATEFACE (SR734): `summary_line` drops each empty part (from the Player's own MediaInfo, not a literal).
+#[test]
+fn striainfobitrateface_summary_drops_empty_parts() {
+    let (mp4, _) = striainfobitrate_export("face_parts", stria::nle_export::H264Encoder::new(26, 10));
+    let p = Player::open(mp4, Arc::new(ManualTime::new()), None, 60).unwrap();
+    let mut i = p.info().clone();
+    i.bitrate.clear();
+    assert_eq!(stria::media::summary_line(&i), "avc1 64x48 profile=Baseline level=1");
+    i.video_profile.clear();
+    assert_eq!(stria::media::summary_line(&i), "avc1 64x48");
+    i.width = 0;
+    assert_eq!(stria::media::summary_line(&i), "avc1");
+    i.video.clear();
+    assert_eq!(stria::media::summary_line(&i), "");
+}
