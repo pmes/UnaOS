@@ -113,6 +113,7 @@ impl layout_core::Host for ImgHost {
     type Gradient = ();
     type Shadow = ();
     fn img_intrinsic(node: &N) -> Option<(f32, f32)> { with_image(node, |i| (i.width as f32, i.height as f32)) } // AETHERIMAGEINPUTELF (SR683): an image input's decoded size, layout_core's img rule
+    fn img_state(node: &N) -> layout_core::ImgState { img_state_of(node) } // AETHERIMGALTELF (SR695): Loaded / Failed / Pending from the store, layout_core's alt rule
 }
 
 /// The box tree of the page.
@@ -265,12 +266,12 @@ pub fn compute(doc: &Document, vw: f32, vh: f32) -> Styled {
 /// the document they belong to (a tab's other page never reads them). ONE writer, main.rs `image_inputs` (once per page
 /// open, before `lay`, replacing the map so the old page's bitmaps drop); readers `ImgHost::img_intrinsic` (layout_core's
 /// img sizing rule) and paint.rs `image_blit`, through [`with_image`] only. Single-threaded program: net.rs `NET`'s idiom.
-static mut IMAGES: (usize, BTreeMap<usize, pixel_core::Image>) = (0, BTreeMap::new());
+static mut IMAGES: (usize, BTreeMap<usize, pixel_core::Image>, alloc::collections::BTreeSet<usize>) = (0, BTreeMap::new(), alloc::collections::BTreeSet::new()); // AETHERIMGALTELF (SR695): + the admitted nodes that got no bitmap
 
 /// AETHERIMAGEINPUTELF (SR683): the bitmaps of `doc`'s image inputs replace the store (an empty map on a page with none).
-pub fn set_images(doc: &Document, m: BTreeMap<usize, pixel_core::Image>) {
+pub fn set_images(doc: &Document, m: BTreeMap<usize, pixel_core::Image>, failed: alloc::collections::BTreeSet<usize>) { // AETHERIMGALTELF (SR695): the failed set beside the map
     // SAFETY: one thread; no reference into the store outlives a `with_image` call.
-    unsafe { *core::ptr::addr_of_mut!(IMAGES) = (doc as *const Document as usize, m) };
+    unsafe { *core::ptr::addr_of_mut!(IMAGES) = (doc as *const Document as usize, m, failed) };
 }
 
 /// AETHERIMAGEINPUTELF (SR683): `f` over `node`'s decoded bitmap, when the store holds one for its document.
@@ -298,4 +299,23 @@ pub fn img_like(node: &N) -> bool {
 pub fn img_fetched(node: &N) -> bool {
     let lazy = node.doc.element(node.id).is_some_and(|e| e.local == "img" && e.attr("loading").is_some_and(|v| v.trim().eq_ignore_ascii_case("lazy")));
     img_like(node) && !lazy
+}
+
+// ---- AETHERIMGALTELF (LEDGER SR695): an img's load state for layout_core's alt rule (named tail block) ----
+
+/// AETHERIMGALTELF (SR695): where `node`'s image stands for layout_core's ONE alt rule (`img_fallback_of`, SR681): Loaded
+/// when the store holds its bitmap, Failed when main.rs `image_inputs` admitted it and fetched or decoded nothing (no src,
+/// a data: src, a resolve / fetch / decode error), Pending otherwise (a `loading=lazy` img this ring never fetches, one
+/// past the 30-node cap: AETHER-IMG-ALT-ELF-CAP owed). The host's `img_state` rule (aether layout/mod.rs) on this ring.
+pub fn img_state_of(node: &N) -> layout_core::ImgState {
+    if with_image(node, |_| ()).is_some() {
+        return layout_core::ImgState::Loaded;
+    }
+    // SAFETY: one thread; the shared borrow ends with this read and no writer runs inside it.
+    let store = unsafe { &*core::ptr::addr_of!(IMAGES) };
+    if store.0 == node.doc as *const Document as usize && store.2.contains(&node.id.0) {
+        layout_core::ImgState::Failed
+    } else {
+        layout_core::ImgState::Pending
+    }
 }
