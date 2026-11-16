@@ -47,6 +47,8 @@ pub struct Layout {
     pub rows: usize,
     pub zoom: u32,
     pub t0: i64,
+    pub message_y: u32, // STRIAINFOREELSTRIP (SR747): the message row's top (0 with no row: [`Layout::with_message`])
+    pub message_h: u32, // STRIAINFOREELSTRIP (SR747): the message row's height (0: no row)
 }
 
 /// What a point on the canvas is.
@@ -68,7 +70,7 @@ impl Layout {
         let zoom = st.zoom.max(1);
         let per_page = (w / zoom).max(1) as i64;
         let t0 = st.playhead.max(0) / per_page * per_page;
-        Layout { w, h, preview_h, ruler_y: preview_h, tracks_y: preview_h + RULER_H, rows, zoom, t0 }
+        Layout { w, h, preview_h, ruler_y: preview_h, tracks_y: preview_h + RULER_H, rows, zoom, t0, message_y: 0, message_h: 0 }
     }
     /// The x of tick `t`'s left edge.
     pub fn x_of(&self, t: i64) -> i64 {
@@ -997,5 +999,90 @@ impl Drag {
             self.delta = t - e;
             self.guide = Some(t);
         }
+    }
+}
+
+// ---- STRIAINFOREELSTRIP (LEDGER SR747): the editor's message row — a band of its own between the preview and the ruler (named tail block) ----
+// `Layout::of` has no labels input (the labels are the painter's `Text` hook and the face's), so the row is a builder the face
+// calls once on the layout it paints: [`Layout::with_message`] takes [`MESSAGE_H`] px from the foot of the preview band. The ruler,
+// the tracks and every hit stay where they were (a click on the row is `Hit::None`, as anything above `ruler_y`); `paint_in`'s
+// BG fill already paints the row, so the painter is unchanged. Owed: NLE6-MESSAGE-KERNEL (the kernel Player paints Role::Tracks),
+// STRIA-INFO-REEL-STRIP-CLICK (a click on the row shows the full summary when clipped).
+
+/// STRIAINFOREELSTRIP (SR747): the message row's height (px); a preview band shorter than this gets no row.
+pub const MESSAGE_H: u32 = 14;
+
+impl Layout {
+    /// STRIAINFOREELSTRIP (SR747): this layout with the message row when `on` and the preview band holds it: the band shrinks by
+    /// [`MESSAGE_H`] and the row is `message_y..message_y + message_h` under it. Off, a band under [`MESSAGE_H`] (Role::Tracks has
+    /// none) or a row already cut: unchanged.
+    pub fn with_message(mut self, on: bool) -> Layout {
+        if on && self.message_h == 0 && self.preview_h >= MESSAGE_H {
+            self.preview_h -= MESSAGE_H;
+            self.message_y = self.preview_h;
+            self.message_h = MESSAGE_H;
+        }
+        self
+    }
+}
+
+#[cfg(test)]
+mod message_row_tests {
+    extern crate std;
+    use super::*;
+    use crate::{Clip, Timeline};
+
+    fn two_tracks() -> EditorState {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("ROWA", 40);
+        tl.add_track(Kind::Video);
+        tl.add_track(Kind::Audio);
+        for t in 0..2 {
+            tl.tracks[t].clips = alloc::vec![Clip::new(a, 0, 20, 0)];
+        }
+        EditorState::new(tl)
+    }
+
+    /// STRIAINFOREELSTRIP (SR747) M3: the row comes out of the preview band only (ruler, tracks, page unchanged); off, on the
+    /// tracks role and on a band under MESSAGE_H the layout is today's, field for field; Preview's row is at its foot; idempotent.
+    #[test]
+    fn message_row_is_taken_from_the_preview_band() {
+        let st = two_tracks();
+        let l = Layout::of(320, 160, &st);
+        assert_eq!((l.preview_h, l.ruler_y, l.tracks_y, l.message_y, l.message_h), (64, 64, 80, 0, 0));
+        let m = l.with_message(true);
+        assert_eq!((m.preview_h, m.message_y, m.message_h), (50, 50, MESSAGE_H));
+        assert_eq!((m.w, m.h, m.ruler_y, m.tracks_y, m.rows, m.zoom, m.t0), (l.w, l.h, l.ruler_y, l.tracks_y, l.rows, l.zoom, l.t0));
+        assert_eq!(m.with_message(true), m, "idempotent");
+        assert_eq!(l.with_message(false), l, "labels off: today's layout");
+        let t = Layout::of_role(Role::Tracks, 320, 96, &st);
+        assert_eq!(t.with_message(true), t, "the tracks role has no preview band");
+        assert_eq!((t.preview_h, t.ruler_y, t.tracks_y, t.message_y, t.message_h), (0, 0, RULER_H, 0, 0));
+        let small = Layout::of(320, 100, &st);
+        assert_eq!(small.with_message(true), small, "a band under MESSAGE_H");
+        let p = Layout::of_role(Role::Preview, 320, 90, &st).with_message(true);
+        assert_eq!((p.preview_h, p.message_y, p.message_h, p.ruler_y), (76, 76, MESSAGE_H, 90 + RULER_H));
+        std::println!("striainforeelstrip: layout whole+labels preview_h={} message={}+{} ruler_y={}", m.preview_h, m.message_y, m.message_h, m.ruler_y);
+    }
+
+    /// STRIAINFOREELSTRIP (SR747) M3: a click on the row is nothing; the painted row is the view's BG, the preview above it FIELD,
+    /// and everything from the ruler down is byte-identical to the row-less paint.
+    #[test]
+    fn message_row_paints_bg_and_hits_nothing() {
+        let st = two_tracks();
+        let l = Layout::of(320, 160, &st);
+        let m = l.with_message(true);
+        assert_eq!(m.hit(&st.timeline, 10.0, 55.0), Hit::None);
+        assert_eq!(m.hit(&st.timeline, 10.0, 70.0), l.hit(&st.timeline, 10.0, 70.0));
+        assert_eq!(m.hit(&st.timeline, 10.0, 100.0), l.hit(&st.timeline, 10.0, 100.0));
+        let (a, b) = (paint_in(&st, l, Order::Rgba, None, None), paint_in(&st, m, Order::Rgba, None, None));
+        let at = |px: &[u8], x: usize, y: usize| [px[(y * 320 + x) * 4], px[(y * 320 + x) * 4 + 1], px[(y * 320 + x) * 4 + 2], px[(y * 320 + x) * 4 + 3]];
+        assert_eq!(at(&b, 10, 49), FIELD);
+        assert_eq!(at(&b, 10, 50), BG);
+        assert_eq!(at(&b, 300, 63), BG);
+        assert_eq!(at(&a, 10, 50), FIELD, "row-less: the preview reaches the ruler");
+        let r = m.ruler_y as usize * 320 * 4;
+        assert_eq!(&a[r..], &b[r..], "the ruler and the tracks are unchanged");
+        assert_eq!(&a[..m.message_y as usize * 320 * 4], &b[..m.message_y as usize * 320 * 4]);
     }
 }
