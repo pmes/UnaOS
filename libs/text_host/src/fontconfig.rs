@@ -57,6 +57,8 @@ pub struct Config {
     pub hint_rules: Vec<HintRule>,
     /// The pattern-level `hintstyle` default, when a config sets one.
     pub default_hintstyle: Option<u8>,
+    /// AETHERFONTDBCACHE (SR684): where `FontDb::discover` keeps its persisted index (`crate::db_cache`); None = no cache.
+    pub cache_dir: Option<PathBuf>,
 }
 
 /// A minimal XML element tree: enough of XML 1.0 for fontconfig files (elements, attributes, character data,

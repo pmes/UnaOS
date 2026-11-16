@@ -40,7 +40,7 @@
 //!   bit budget, no row modulation); the floor of every rate-controlled QP is [`crate::Config::qp_min`] (None = [`QP_MIN`]),
 //!   read through [`crate::Config::qp_floor`].
 //!
-//! Owed (handlers.md §5 H264ENC-RC): two-pass, scene-cut IDRs, per-MB activity masking, HRD signalling.
+//! Owed (handlers.md §5 H264ENC-RC): two-pass, per-MB activity masking, HRD signalling (scene-cut IDRs: lib.rs, SR680).
 
 use alloc::vec::Vec;
 

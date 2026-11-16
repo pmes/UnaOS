@@ -35,6 +35,7 @@
 //! the tracks Surface under it) and the face splits over them (`Face::on_surfaces`); the window runs it, and the witness
 //! stamps tokens with the tracks Surface's number (`aux:<token>`: the preview's), its line ending
 //! `"presses":[...],"surfaces":2,"fnvs":["<preview>","<tracks>"]` (`w` / `h` / `fnv` are the tracks blit's).
+//! NLEHOSTSAVE (SR677): the face keeps the `<edl>` path (`Face::with_doc`); `save` (the Save button, `--do save`) writes it back through `edl::write`, and the JSON line carries `"dirty"` after `transition`.
 
 use bandy::{SMessage, Synapse};
 use quartzite::tetra::{SurfaceMap, TetraNode};
@@ -53,12 +54,13 @@ struct Cli {
     labels: bool,
     two: bool,
     split: bool,
+    mute: bool,
 }
 
 /// SURFACEID (SR332): the second Surface of `--two-surfaces` (no painter: a press on it must not reach the editor).
 const AUX_SURFACE: &str = "stria.nle.aux";
 
-const USAGE: &str = "usage: stria-view <edl> [--fps N] --src REEL=<media> ... | --synth  [--size WxH] [--do SCRIPT] [--out shot.rgba] [--labels] [--two-surfaces | --split]  (SCRIPT: verbs, at:T:ROW, ruler:T, press:X:Y, move:X:Y, release, key:NAME, wheel:N, marquee:X0:Y0:X1:Y1, shift:TOKEN, alt:TOKEN, transition:T:I, meters, aux:TOKEN)";
+const USAGE: &str = "usage: stria-view <edl> [--fps N] --src REEL=<media> ... | --synth  [--size WxH] [--do SCRIPT] [--out shot.rgba] [--labels] [--two-surfaces | --split] [--mute]  (SCRIPT: verbs, at:T:ROW, ruler:T, press:X:Y, move:X:Y, release, key:NAME, wheel:N, marquee:X0:Y0:X1:Y1, shift:TOKEN, alt:TOKEN, transition:T:I, meters, aux:TOKEN)";
 
 fn die(msg: String) -> ! {
     eprintln!("stria-view: {msg}");
@@ -66,7 +68,7 @@ fn die(msg: String) -> ! {
 }
 
 fn cli() -> Cli {
-    let mut c = Cli { edl: None, synth: false, fps: 25, srcs: Vec::new(), size: (960, 540), script: None, out: None, labels: false, two: false, split: false };
+    let mut c = Cli { edl: None, synth: false, fps: 25, srcs: Vec::new(), size: (960, 540), script: None, out: None, labels: false, two: false, split: false, mute: false };
     let mut a = std::env::args().skip(1);
     while let Some(arg) = a.next() {
         match arg.as_str() {
@@ -74,6 +76,7 @@ fn cli() -> Cli {
             "--labels" => c.labels = true,
             "--two-surfaces" => c.two = true,
             "--split" => c.split = true,
+            "--mute" => c.mute = true, // NLEPLAYAUDIO (SR676): the window plays no sound
             "--fps" => c.fps = a.next().and_then(|s| s.parse().ok()).unwrap_or_else(|| die(USAGE.into())),
             "--size" => {
                 let v = a.next().unwrap_or_default();
@@ -249,7 +252,7 @@ fn witness(c: &Cli, mut face: Face) -> i32 {
     let meters = meters_json(c, &face);
     let presses = presses_json(c, &presses);
     println!(
-        "{{\"playhead\":{},\"tracks\":{},\"clips\":{},\"selection\":{sel},\"clip\":{clip},\"playing\":{},\"rate\":{},\"undo\":{},\"zoom\":{},\"w\":{width},\"h\":{height},\"fnv\":\"{:016x}\",\"errors\":\"{err}\",\"set\":{},\"transition\":{}{meters}{presses}{fnvs}}}",
+        "{{\"playhead\":{},\"tracks\":{},\"clips\":{},\"selection\":{sel},\"clip\":{clip},\"playing\":{},\"rate\":{},\"undo\":{},\"zoom\":{},\"w\":{width},\"h\":{height},\"fnv\":\"{:016x}\",\"errors\":\"{err}\",\"set\":{},\"transition\":{},\"dirty\":{}{meters}{presses}{fnvs}{}}}",
         st.playhead,
         st.timeline.tracks.len(),
         clips,
@@ -259,7 +262,9 @@ fn witness(c: &Cli, mut face: Face) -> i32 {
         st.zoom,
         nle_face::fnv1a(&pixels),
         st.set.len(),
-        transition_json(&face)
+        transition_json(&face),
+        face.dirty(),
+        if c.mute { ",\"audio\":\"none\"" } else { "" } // NLEPLAYAUDIO (SR676): the witness opens no device
     );
     0
 }
@@ -282,16 +287,17 @@ fn main() {
     let (tl, sources) = load(&c);
     let windowed = cfg!(any(target_os = "macos", all(target_os = "linux", feature = "gtk")));
     if c.script.is_some() || c.out.is_some() || c.two || !windowed {
-        let face = route(&c, Face::new(EditorState::new(tl), sources, c.size, PixelOrder::Rgba, c.labels));
+        let face = route(&c, Face::new(EditorState::new(tl), sources, c.size, PixelOrder::Rgba, c.labels).with_doc(c.edl.as_deref().map(std::path::Path::new)));
         std::process::exit(witness(&c, face));
     }
 
     let title = c.edl.as_deref().and_then(|p| std::path::Path::new(p).file_name()).and_then(|s| s.to_str()).unwrap_or("synthetic").to_string();
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("tokio runtime");
     let synapse = Synapse::new();
+    let mut engine: Option<Box<dyn std::any::Any>> = None; // NLEPLAYAUDIO (SR676): the audio engine, held for the process life
     {
         let rx = synapse.subscribe();
-        let face = route(&c, Face::new(EditorState::new(tl), sources, c.size, PixelOrder::Rgba, true));
+        let face = play_audio(&c, &mut engine, route(&c, Face::new(EditorState::new(tl), sources, c.size, PixelOrder::Rgba, true).with_doc(c.edl.as_deref().map(std::path::Path::new))));
         rt.spawn(nle_face::serve(synapse.clone(), rx, face));
     }
     quartzite::Backend::new_tetra_vessel(
@@ -303,6 +309,7 @@ fn main() {
     )
     .run();
     drop(rt);
+    drop(engine);
 }
 
 #[cfg(test)]
@@ -412,7 +419,7 @@ mod tests {
         assert!(errors.is_empty(), "{errors:?}");
         assert_eq!(face.state.timeline, tl0.trim_in(0, 1, 3).unwrap());
         assert_eq!(presses, vec![(0, false), (1, true)]);
-        let c = Cli { edl: None, synth: true, fps: 25, srcs: Vec::new(), size: (320, 160), script: None, out: None, labels: false, two: true, split: false };
+        let c = Cli { edl: None, synth: true, fps: 25, srcs: Vec::new(), size: (320, 160), script: None, out: None, labels: false, two: true, split: false, mute: false };
         assert_eq!(presses_json(&c, &presses), r#","presses":[[0,false],[1,true]]"#);
         assert_eq!(presses_json(&Cli { two: false, ..c }, &presses), "");
     }
@@ -426,6 +433,30 @@ mod tests {
         let lv = face.meters().levels();
         assert_eq!(lv.iter().map(|m| m.track).collect::<Vec<_>>(), vec![Some(1), None]);
         assert!((lv[1].peak_db + 13.56).abs() < 0.01, "{}", lv[1].peak_db);
+    }
+
+    /// NLEHOSTSAVE M3: `save` is the verb's Input; with no document (the synth fixture) it refuses by name and the face
+    /// stays dirty after an edit; a path that cannot be written is refused naming the path.
+    #[test]
+    fn nlehostsave_witness_save_token() {
+        let (tl, src) = nle_face::synth_fixture();
+        let face0 = Face::new(EditorState::new(tl.clone()), src, (320, 160), PixelOrder::Rgba, false);
+        assert!(matches!(token(&face0, "save").as_deref(), Some([SMessage::Input { text, .. }]) if text == "save"));
+        let mut face = face0;
+        assert!(!face.dirty() && face.doc_path().is_none());
+        assert_eq!(drive(&mut face, "save"), vec!["save: no document path".to_string()]);
+        assert!(drive(&mut face, "at:12:0,split").is_empty());
+        assert!(face.dirty());
+        assert_eq!(drive(&mut face, "save"), vec!["save: no document path".to_string()]);
+        assert!(face.dirty(), "a refused save leaves the face dirty");
+        let (_, src) = nle_face::synth_fixture();
+        let bad = std::path::Path::new("/nonexistent-nlehostsave/x.edl");
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false).with_doc(Some(bad));
+        assert!(drive(&mut face, "at:12:0,split").is_empty());
+        let errors = drive(&mut face, "save");
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].starts_with("save: /nonexistent-nlehostsave/x.edl: "), "{errors:?}");
+        assert!(face.dirty() && !bad.exists());
     }
 }
 
@@ -478,6 +509,7 @@ fn transport() -> TetraNode {
         button("}", "Out +"),
         button("lift", "Lift"),
         button("size", "Size"), // NLESIZEPOLICYUI (SR402): cycles the selected clip's reel's size policy
+        button("save", "Save"), // NLEHOSTSAVE (SR677): writes the timeline to the document's path
     ])
 }
 
@@ -529,7 +561,7 @@ mod split_tests {
         let TetraNode::VStack(top) = split_tree() else { panic!("not a VStack") };
         let TetraNode::VStack(one) = editor_tree() else { panic!("not a VStack") };
         assert_eq!(format!("{:?}", top[1]), format!("{:?}", one[1]), "the one transport row");
-        let c = Cli { edl: None, synth: true, fps: 25, srcs: Vec::new(), size: (320, 160), script: None, out: None, labels: false, two: false, split: true };
+        let c = Cli { edl: None, synth: true, fps: 25, srcs: Vec::new(), size: (320, 160), script: None, out: None, labels: false, two: false, split: true, mute: false };
         let (tl, src) = nle_face::synth_fixture();
         let tl0 = tl.clone();
         let mut face = route(&c, Face::new(EditorState::new(tl), src, c.size, PixelOrder::Rgba, false));
@@ -545,5 +577,30 @@ mod split_tests {
         let j = blits_json(&c, &face.frames());
         assert!(j.starts_with(r#","surfaces":2,"fnvs":[""#) && j.len() == r#","surfaces":2,"fnvs":["","#.len() + 2 * 16 + 3, "{j}");
         assert_eq!(blits_json(&Cli { split: false, ..c }, &face.frames()), "");
+    }
+}
+
+// ---- NLEPLAYAUDIO (LEDGER SR676): the window's audio device (named tail block) ----
+
+/// The editor's audio rate: the device's and the render's (`Face::with_audio` sets the Sources' rate to it).
+const AUDIO_HZ: u32 = 48_000;
+
+/// The window's face with sound: `stria::media::resonance_out` at [`AUDIO_HZ`] installed by `Face::with_audio`, its engine
+/// held in `engine` (no resonance dependency here); `--mute` or no device leaves the face silent and says why.
+fn play_audio(c: &Cli, engine: &mut Option<Box<dyn std::any::Any>>, face: Face) -> Face {
+    if c.mute {
+        eprintln!("[STRIA] :: nle audio=none why=mute");
+        return face;
+    }
+    match stria::media::resonance_out(AUDIO_HZ) {
+        Some((e, feed)) => {
+            *engine = Some(Box::new(e));
+            eprintln!("[STRIA] :: nle audio={AUDIO_HZ}");
+            face.with_audio(Box::new(feed), AUDIO_HZ)
+        }
+        None => {
+            eprintln!("[STRIA] :: nle audio=none why=no-device");
+            face
+        }
     }
 }
