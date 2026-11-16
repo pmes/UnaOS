@@ -16,8 +16,8 @@
 //!   (Times, Helvetica, Courier, Apple Chancery, Papyrus, the SF system face), each a candidate list tried
 //!   through [`FontDb::resolve_family`].
 //! - Face selection inside a family: css-fonts-4 §5.2 (font-stretch, then font-style, then font-weight),
-//!   then synthesis as Blink decides it: bold when the wanted weight exceeds the face's by more than 200,
-//!   oblique when italic/oblique is wanted and the face is upright.
+//!   then synthesis as Blink's primary road decides it: bold when the wanted weight exceeds the face's by more than 200,
+//!   oblique when italic/oblique is wanted and the face is upright (the fallback and webfont roads: [`synthesis_threshold`]).
 //! - Per-character system fallback: the faces in the order fontconfig sorts `sans-serif` (its alias rules
 //!   applied in configuration order), which is the list `gfx::GetFontForCharacter` walks for a character
 //!   none of the CSS families covers.
@@ -211,7 +211,7 @@ pub fn match_style(cands: &[Style], want: Style) -> Option<usize> {
     r.or(Some(idx[0]))
 }
 
-/// Blink's synthesis decision for a chosen face: (synthetic bold, synthetic oblique).
+/// Blink's PRIMARY-road synthesis decision for a chosen face (font_cache_skia.cc `FontCache::CreateFontPlatformData`): (synthetic bold, synthetic oblique).
 pub fn synthesis(face: Style, want: Style) -> (bool, bool) {
     let bold = want.weight > face.weight + 200.0;
     let oblique = want.slant != Slant::Normal && face.slant == Slant::Normal;
@@ -1009,5 +1009,59 @@ impl FontDb {
     /// What the persisted index answered for this discovery: `off`, `hit`, `miss` or `stale`.
     pub fn discover_cache(&self) -> &'static str {
         self.cache.as_str()
+    }
+}
+
+// ---- AETHERFALLBACKSYNTHTHRESHOLD (LEDGER SR745): Blink's absolute bold threshold for the fallback and webfont roads (named tail block) ----
+
+/// Blink's `kBoldThreshold` (platform/fonts/font_selection_types.h): a request at or above it may be synthesized bold.
+pub const BOLD_THRESHOLD: f32 = 600.0;
+
+/// fontconfig's `FC_WEIGHT_BOLD` (200) as an OS/2 weight: gfx `IsFontBold` (ui/gfx/linux/fontconfig_util.cc) calls a face
+/// bold at or above it, so a 600 (`FC_WEIGHT_DEMIBOLD`) face is NOT bold on Blink's fallback road.
+pub const FC_BOLD_WEIGHT: f32 = 700.0;
+
+/// Blink's ABSOLUTE synthesis decision, the rule of its fallback road (font_cache_linux.cc: `!fallback_font.is_bold &&
+/// Weight() >= kBoldThreshold`; `bold_at` = [`FC_BOLD_WEIGHT`]) and of its webfont road (css_segmented_font_face.cc:
+/// `capabilities.weight.maximum < kBoldThreshold && request.weight >= kBoldThreshold`; `bold_at` = [`BOLD_THRESHOLD`]):
+/// (synthetic bold, synthetic oblique). Bold when the request is at least 600 and the face below `bold_at`; oblique is
+/// [`synthesis`]'s own clause (Blink maps `italic` and `oblique` to one slope on every road). The primary road keeps
+/// [`synthesis`]'s +200 rule (font_cache_skia.cc `FontCache::CreateFontPlatformData`).
+pub fn synthesis_threshold(face: Style, want: Style, bold_at: f32) -> (bool, bool) {
+    (want.weight >= BOLD_THRESHOLD && face.weight < bold_at, synthesis(face, want).1)
+}
+
+#[cfg(test)]
+mod synththreshold_tests {
+    use super::*;
+
+    fn st(weight: f32, slant: Slant) -> Style {
+        Style { weight, slant, stretch: 100.0 }
+    }
+
+    /// AETHERFALLBACKSYNTHTHRESHOLD (SR745): the three roads' bold boundaries and the one oblique clause.
+    #[test]
+    fn synththreshold_kat() {
+        let n = Slant::Normal;
+        let bold = |f: f32, w: f32| synthesis(st(f, n), st(w, n)).0;
+        let web = |f: f32, w: f32| synthesis_threshold(st(f, n), st(w, n), BOLD_THRESHOLD).0;
+        let fb = |f: f32, w: f32| synthesis_threshold(st(f, n), st(w, n), FC_BOLD_WEIGHT).0;
+        // primary road (font_cache_skia.cc): more than 200 over the face, unchanged
+        assert!(!bold(500.0, 700.0) && bold(499.0, 700.0) && !bold(400.0, 600.0), "primary: +200");
+        // webfont road (css_segmented_font_face.cc): >= 600 on a face below 600
+        for (f, w, want) in [(400.0, 600.0, true), (500.0, 700.0, true), (599.0, 600.0, true), (600.0, 700.0, false), (700.0, 900.0, false), (400.0, 599.0, false)] {
+            assert_eq!(web(f, w), want, "webfont {f} -> {w}");
+        }
+        // fallback road (font_cache_linux.cc + gfx IsFontBold): >= 600 on a face below fontconfig bold (700)
+        for (f, w, want) in [(400.0, 600.0, true), (600.0, 700.0, true), (699.0, 900.0, true), (700.0, 900.0, false), (400.0, 599.0, false)] {
+            assert_eq!(fb(f, w), want, "fallback {f} -> {w}");
+        }
+        // oblique on every road: a slanted request on an upright face only
+        for at in [BOLD_THRESHOLD, FC_BOLD_WEIGHT] {
+            let ob = |f: Slant, w: Slant| synthesis_threshold(st(400.0, f), st(400.0, w), at).1;
+            assert!(ob(n, Slant::Italic) && ob(n, Slant::Oblique), "roman face: synthetic oblique ({at})");
+            assert!(!ob(Slant::Italic, Slant::Oblique) && !ob(Slant::Oblique, Slant::Italic), "slanted face: none ({at})");
+            assert_eq!(synthesis_threshold(st(400.0, n), st(400.0, Slant::Italic), at).1, synthesis(st(400.0, n), st(400.0, Slant::Italic)).1);
+        }
     }
 }
