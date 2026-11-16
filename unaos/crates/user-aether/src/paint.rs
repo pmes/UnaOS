@@ -639,7 +639,7 @@ fn image_alt(cv: &mut Canvas, cx: &Cx, id: NodeId, ink: &Ink, x: f32, y: f32) {
                 cv.fill(x0, y0 + 1, 1, y1 - y0 - 2, c);
                 cv.fill(x1 - 1, y0 + 1, 1, y1 - y0 - 2, c);
             }
-            if icon { broken_icon(cv, bx, by, bw, bh); } // AETHERIMGBROKENICON (SR702): the icon in its slot
+            if icon { let o = if frame { 0.0 } else { 2.0 }; broken_icon(cv, bx - o, by - o, bw + 2.0 * o, bh + 2.0 * o); } // AETHERIMGBROKENICON (SR702): the icon in its slot
             if frame { (text, bx + 2.0 + 16.0, by + 2.0, 1.0) } else { (text, bx, by, 0.0) }
         }
     };
@@ -689,18 +689,18 @@ fn image_alt_lines(cv: &mut Canvas, cx: &Cx, id: NodeId, ink: &Ink, alt: &str, b
         return;
     }
     let Ok(l) = cx.tree.taffy.layout(id) else { return };
-    let text = <ImgHost as layout_core::Host>::transform_text(alt, ink.tt);
+    let text = <ImgHost as layout_core::Host>::transform_text(alt, ink.tt); broken_icon(cv, bx - 2.0, by - 2.0, 20.0, 20.0);
     let edges = l.border.left + l.padding.left + l.border.right + l.padding.right;
     let wrap = (cx.tree.taffy.unrounded_layout(id).size.width.max(l.size.width) - edges).max(0.0) + 0.01;
     let adv = layout_core::Adv::new(ink.sel, ink.size, 0.0);
-    let lines = layout_core::Fonts::break_lines(cx.fonts, &text, &layout_core::TextMode::default(), &adv, wrap.max(1.0), 0.0, false);
+    let lines = layout_core::Fonts::break_lines(cx.fonts, &text, &layout_core::TextMode::default(), &adv, wrap.max(1.0), layout_core::INLINE_ICON_ADVANCE, false);
     let lead = layout_core::Fonts::baseline_offset(cx.fonts, ink.sel, ink.size, ink.lh);
     let lh = layout_core::Fonts::line_height(cx.fonts, ink.sel, ink.size, ink.lh);
     let (px0, py0, px1, py1) = (bx, by, bx + bw, by + bh);
     let color = ink.color;
     for (i, line) in lines.iter().enumerate() {
         let base = font_core::fmath::round(by + i as f32 * lh + lead);
-        cx.fonts.0.borrow_mut().draw(bx, base, &line.text, ink.sel, ink.size, color, &mut |gx, gy, cov| {
+        cx.fonts.0.borrow_mut().draw(bx + if i == 0 { layout_core::INLINE_ICON_ADVANCE } else { 0.0 }, base, &line.text, ink.sel, ink.size, color, &mut |gx, gy, cov| {
             let (fx, fy) = (gx as f32, gy as f32);
             if fx >= px0 && fx < px1 && fy >= py0 && fy < py1 {
                 cv.blend(gx, gy, color, cov);

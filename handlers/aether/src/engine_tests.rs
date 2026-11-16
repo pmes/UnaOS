@@ -4431,12 +4431,12 @@ mod tests {
         engine.render_frame();
         let (_, _, sw, _) = imgalt_rect(&mut engine, "s");
         let (l, t, w, h) = imgalt_rect(&mut engine, "i");
-        assert!(sw > 10.0 && (w - sw).abs() <= 1.0, "i: the box is the alt text's width ({w} vs the span's {sw})");
+        assert!(sw > 10.0 && (w - sw - layout_core::INLINE_ICON_ADVANCE as f64).abs() <= 1.0, "i: the box is the alt text's width + the icon ({w} vs the span's {sw})"); // AETHERIMGALTINLINEICON (SR726): the icon before the text
         assert!(h > 8.0 && h < 40.0, "i: one line tall ({h})");
         let ink = imgalt_ink(&engine, l.floor() as usize, (l + w).ceil() as usize, t.floor() as usize, (t + h).ceil() as usize);
         assert!(ink > 0, "i: the alt text paints");
         let (_, _, zw, zh) = imgalt_rect(&mut engine, "z");
-        assert!((zw - sw).abs() <= 1.0 && zh < 40.0, "z: a standards-mode sized img with alt is inline text, not 200x100 ({zw}x{zh})");
+        assert!((zw - sw - layout_core::INLINE_ICON_ADVANCE as f64).abs() <= 1.0 && zh < 40.0, "z: a standards-mode sized img with alt is inline text, not 200x100 ({zw}x{zh})");
     }
 
     /// AETHERIMGALT (SR681): in quirks mode a sized failed img is a box of its size (TreatImageAsReplaced) with the 1px
@@ -4666,5 +4666,98 @@ mod tests {
         assert_eq!(js.eval_string("document.getElementById('m2').value").unwrap(), "C:\\fakepath\\a.txt");
         assert_eq!(js.eval_string("document.getElementById('on').value").unwrap(), "");
         assert_eq!(js.eval_string("String(document.getElementById('m2').files.length)").unwrap(), "2");
+    }
+
+    // ---- AETHERIMGALTICONONLY (LEDGER SR714): an unsized failed img with no alt is the icon alone (named tail block) ----
+
+    /// AETHERIMGALTICONONLY (SR714): a failed, unsized img with a src and no alt or title shows Chromium's broken-image
+    /// icon ALONE (HTMLImageFallbackHelper's represents-text arm): a 16x16 box, the icon at its (0, 0) (the page outline
+    /// grey at icon pixel (1, 5)), no silver frame, nothing right of it; an img with neither src nor alt represents
+    /// nothing. (alt="" stays nothing: `img_empty_alt_paints_nothing`.)
+    #[test]
+    fn img_alt_icon_only_when_no_alt() {
+        let html = r#"<!doctype html><html><body style="margin:0;font:16px sans-serif">
+            <div><img id="o" src="missing.png"></div>
+            <div><img id="x"></div>
+        </body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 300));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        let (l, t, w, h) = imgalt_rect(&mut engine, "o");
+        assert!((w - 16.0).abs() <= 0.5 && (h - 16.0).abs() <= 0.5, "o: the icon box is 16x16 ({w}x{h})");
+        let (l, t) = (l.round() as usize, t.round() as usize);
+        assert!(imgalt_painted(&engine, l, l + 16, t, t + 16) > 0, "o: the icon paints");
+        assert_eq!(imgalt_px(&engine, l + 1, t + 5), (128, 128, 128), "o: the icon's page outline at the box's (1, 5)");
+        assert_eq!(imgalt_px(&engine, l, t), (255, 255, 255), "o: no frame");
+        assert_eq!(imgalt_painted(&engine, l + 16, 400, t, t + 16), 0, "o: nothing paints right of the icon");
+        let (_, _, xw, _) = imgalt_rect(&mut engine, "x");
+        assert!(xw <= 0.5, "x: no src and no alt takes no width ({xw})");
+    }
+
+    // ---- AETHERIMGALTINLINEICON (LEDGER SR726): the broken-image icon before inline alt text (named tail block) ----
+
+    /// AETHERIMGALTINLINEICON (SR726): a failed, unsized img with alt="Hello" shows Chromium's 16x16 broken-image icon
+    /// before its text (HTMLImageFallbackHelper's represents-text arm: the icon floats left with margin 0): the box is
+    /// the span's width + 16, the icon's page outline grey sits at the box's (1, 5), no text ink lies under the icon and
+    /// the text paints after it; in a 120px column only the first line is indented (line 2 carries ink left of x + 16).
+    #[test]
+    fn img_alt_inline_icon_before_text() {
+        let alt = "one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty";
+        let html = format!(
+            r#"<!doctype html><html><body style="margin:0;font:16px sans-serif">
+            <div><img id="i" src="missing.png" alt="Hello"></div>
+            <div><span id="s">Hello</span></div>
+            <div style="width:120px"><img id="w" src="missing.png" alt="{alt}"></div>
+        </body></html>"#
+        );
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 600));
+        engine.load_html("https://example.com/", &html, true);
+        engine.render_frame();
+        let adv = layout_core::INLINE_ICON_ADVANCE as f64;
+        let (_, _, sw, sh) = imgalt_rect(&mut engine, "s");
+        let (l, t, w, h) = imgalt_rect(&mut engine, "i");
+        assert!(sw > 10.0 && (w - sw - adv).abs() <= 1.0, "i: the box is the text's width + the icon ({w} vs {sw} + {adv})");
+        let (li, ti) = (l.round() as usize, t.round() as usize);
+        assert!(imgalt_painted(&engine, li, li + 16, ti, ti + 16) > 0, "i: the icon paints");
+        assert_eq!(imgalt_px(&engine, li + 1, ti + 5), (128, 128, 128), "i: the icon's page outline at the box's (1, 5)");
+        let (y0, y1) = (t.floor() as usize, (t + h).ceil() as usize);
+        assert_eq!(imgalt_ink(&engine, li, li + 16, y0, y1), 0, "i: no text under the icon");
+        assert!(imgalt_ink(&engine, li + 16, (l + w).ceil() as usize, y0, y1) > 0, "i: the text paints after the icon");
+        let (l, t, w, h) = imgalt_rect(&mut engine, "w");
+        assert!(w <= 120.5 && h > sh * 1.5, "w: wraps inside the column ({w}x{h})");
+        let lw = l.round() as usize;
+        assert_eq!(imgalt_ink(&engine, lw, lw + 16, t.floor() as usize, (t + sh).floor() as usize), 0, "w: line 1 starts after the icon");
+        assert!(imgalt_ink(&engine, lw, lw + 16, (t + sh).ceil() as usize, (t + 2.0 * sh).floor() as usize) > 0, "w: line 2 is not indented");
+    }
+
+    // ---- AETHERIMGALTBASELINE (LEDGER SR730): an InlineAlt img sits on the line's text baseline (named tail block) ----
+
+    /// AETHERIMGALTBASELINE (SR730): a failed, unsized img with alt="Hello" beside a span "Hello" on one line: Chromium
+    /// lays the alt as ordinary inline text, so both words paint on ONE baseline (the bottom ink row of each "Hello", which
+    /// has no descender, is the same row), the img box's top is the span's top, and the line is one text line tall (the
+    /// replaced-element bottom-edge rule put the alt's baseline a descent above the span's and grew the line by it).
+    #[test]
+    fn img_alt_inline_on_the_text_baseline() {
+        let html = r#"<!doctype html><html><body style="margin:0;font:16px sans-serif">
+            <div id="d"><span id="s">Hello</span> <img id="i" src="missing.png" alt="Hello"></div>
+        </body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 300));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        let (sl, st, sw, sh) = imgalt_rect(&mut engine, "s");
+        let (il, it, iw, ih) = imgalt_rect(&mut engine, "i");
+        let (_, _, _, dh) = imgalt_rect(&mut engine, "d");
+        assert!(sw > 10.0 && iw > sw && il >= sl + sw, "the img follows the span on the line ({sl}+{sw} then {il}+{iw})");
+        assert!((it - st).abs() <= 2.0, "the img box's top is the span's top ({it} vs {st})");
+        assert!(dh < 24.0 && dh <= sh.max(ih) + 1.0, "one text line tall ({dh} vs span {sh} / img {ih})");
+        let y1 = (st.max(it) + sh.max(ih)).ceil() as usize + 4;
+        let bottom_ink = |e: &crate::AetherEngine, x0: usize, x1: usize| (0..y1).rev().find(|&y| imgalt_ink(e, x0, x1, y, y + 1) > 0);
+        let sb = bottom_ink(&engine, sl.floor() as usize, (sl + sw).ceil() as usize).expect("the span paints");
+        let ix0 = (il + layout_core::INLINE_ICON_ADVANCE as f64).ceil() as usize + 1;
+        let ib = bottom_ink(&engine, ix0, (il + iw).ceil() as usize).expect("the img's alt paints");
+        assert!((sb as i64 - ib as i64).abs() <= 1, "both Hellos sit on one baseline (bottom ink rows {sb} vs {ib})");
     }
 }
