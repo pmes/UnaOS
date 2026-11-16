@@ -252,7 +252,7 @@ fn witness(c: &Cli, mut face: Face) -> i32 {
     let clip = st.selected().map(|c| format!("\"{}:{}:{}\"", c.at, c.src_in, c.src_out)).unwrap_or_else(|| "null".into());
     let err = errors.join("; ").replace('"', "'");
     let meters = meters_json(c, &face);
-    let presses = presses_json(c, &presses); let export = export_json(&face) + &range_json(&face); // NLEFACEEXPORT (SR694): the running export's reading (file tail); NLE5DEXPORTRANGE (SR717): the marks' range (file tail)
+    let presses = presses_json(c, &presses); let export = export_json(&face) + &range_json(&face) + &reel_json(&face); // NLEFACEEXPORT (SR694): the running export's reading (file tail); NLE5DEXPORTRANGE (SR717): the marks' range (file tail); STRIAINFOREEL (SR743): the selected reel (file tail)
     println!(
         "{{\"playhead\":{},\"tracks\":{},\"clips\":{},\"selection\":{sel},\"clip\":{clip},\"playing\":{},\"rate\":{},\"undo\":{},\"zoom\":{},\"w\":{width},\"h\":{height},\"fnv\":\"{:016x}\",\"errors\":\"{err}\",\"set\":{},\"transition\":{},\"dirty\":{}{meters}{presses}{fnvs}{export}{}}}",
         st.playhead,
@@ -668,5 +668,31 @@ mod transitionface_tests {
         assert!(json.contains(r#""kind":"W021","ease":"linear""#), "{json}");
         assert_eq!(face.state.undo_depth(), 4);
         assert_eq!(drive(&mut face, "kind:W008"), vec![format!("kind W008: {}", timeline_core::EditError::Transition)]);
+    }
+}
+
+// ---- STRIAINFOREEL (LEDGER SR743): the witness's selected reel (named tail block) ----
+/// The witness's `"reel"` field, only while a clip is selected: the face's message idle text (`Face::reel_line`,
+/// `<reel>: <codec> <W>x<H> <profile> <bit rate>`); the default line is unchanged.
+fn reel_json(face: &Face) -> String {
+    face.reel_line().map(|s| format!(",\"reel\":\"{}\"", s.replace('"', "'"))).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod striainforeel_tests {
+    use super::*;
+
+    /// STRIAINFOREEL M3: `at:12:0` selects reel B's clip on V1 and the witness's field names it; with nothing selected it is
+    /// absent (the default line unchanged).
+    #[test]
+    fn reel_field_only_while_a_clip_is_selected() {
+        let (tl, src) = nle_face::synth_fixture();
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        assert_eq!(reel_json(&face), "");
+        let errors = drive(&mut face, "at:12:0");
+        assert!(errors.is_empty(), "{errors:?}");
+        let j = reel_json(&face);
+        assert!(j.starts_with(",\"reel\":\"B: utp1 64x48 ~") && j.ends_with(" kb/s\""), "{j}");
+        println!("striainforeel witness: {j}");
     }
 }

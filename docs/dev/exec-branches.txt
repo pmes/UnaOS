@@ -1643,3 +1643,7 @@ refs/remotes/origin/exec-rmbp-seclogin     86f33c93 IN-FLIGHT      rmbp         
 refs/remotes/origin/exec-rmbp-termsel2     b0dccdc1 IN-FLIGHT      rmbp                      2026-09-23
 refs/remotes/origin/exec-rmbp-vfsowned     9081402e IN-FLIGHT      rmbp                      2026-09-23
 refs/remotes/origin/exec-rmbp-wcdmem       c3fd3970 IN-FLIGHT      rmbp                      2026-09-23
+nle5dkeyshelpbutton|exec-rmbp-nle5dkeyshelpbutton|/home/user/exec/nle5dkeyshelpbutton|cut cac1ec898|wave36 cut88h
+h264enctwopassqblurcli|exec-rmbp-h264enctwopassqblurcli|/home/user/exec/h264enctwopassqblurcli|cut cac1ec898|wave36 cut88h
+aetherfontdbcachekeyed|exec-rmbp-aetherfontdbcachekeyed|/home/user/exec/aetherfontdbcachekeyed|cut cac1ec898|wave36 cut88h
+hevcconcealweightedbimixed|exec-rmbp-hevcconcealweightedbimixed|/home/user/exec/hevcconcealweightedbimixed|cut cac1ec898|wave36 cut88h
